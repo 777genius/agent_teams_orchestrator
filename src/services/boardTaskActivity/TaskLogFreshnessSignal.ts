@@ -1,0 +1,208 @@
+import { createHash } from 'crypto'
+import { mkdir, writeFile } from 'fs/promises'
+import { basename, join, relative, sep } from 'path'
+
+import { type Entry } from '../../types/logs.js'
+import { getProjectsDir } from '../../utils/sessionStoragePortable.js'
+import { getTeamName } from '../../utils/teammate.js'
+import { getTeamDir } from '../../utils/swarm/teamHelpers.js'
+
+export const BOARD_TASK_LOG_FRESHNESS_DIRNAME = '.board-task-log-freshness'
+export const TEAM_TASK_LOG_FRESHNESS_DIRNAME = 'task-log-freshness'
+const BOARD_TASK_LOG_FRESHNESS_FILE_SUFFIX = '.json'
+const MAX_TASK_ID_ARTIFACT_SEGMENT_LENGTH = 120
+
+function asCanonicalTaskId(value: unknown): string | null {
+  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : null
+}
+
+function collectCanonicalTaskIdsFromEntry(entry: Entry): string[] {
+  if (!('boardTaskLinks' in entry) || !Array.isArray(entry.boardTaskLinks)) {
+    return []
+  }
+
+  const taskIds = new Set<string>()
+  for (const link of entry.boardTaskLinks) {
+    const canonicalId =
+      asCanonicalTaskId(link?.task?.canonicalId) ??
+      (link?.task?.refKind === 'canonical' ? asCanonicalTaskId(link?.task?.ref) : null)
+    if (canonicalId) {
+      taskIds.add(canonicalId)
+    }
+  }
+  return [...taskIds]
+}
+
+export function collectBoardTaskCanonicalIdsFromEntries(entries: readonly Entry[]): string[] {
+  const taskIds = new Set<string>()
+  for (const entry of entries) {
+    for (const taskId of collectCanonicalTaskIdsFromEntry(entry)) {
+      taskIds.add(taskId)
+    }
+  }
+  return [...taskIds]
+}
+
+export function getBoardTaskLogFreshnessDir(projectDir: string): string {
+  return join(projectDir, BOARD_TASK_LOG_FRESHNESS_DIRNAME)
+}
+
+export function getTeamTaskLogFreshnessDir(teamName: string): string {
+  return join(getTeamDir(teamName), TEAM_TASK_LOG_FRESHNESS_DIRNAME)
+}
+
+function isWindowsReservedArtifactSegment(segment: string): boolean {
+  const stem = segment.split('.')[0]?.toUpperCase() ?? ''
+  return (
+    !segment ||
+    stem === 'CON' ||
+    stem === 'PRN' ||
+    stem === 'AUX' ||
+    stem === 'NUL' ||
+    /^COM[1-9]$/.test(stem) ||
+    /^LPT[1-9]$/.test(stem)
+  )
+}
+
+function isOpaqueSafeTaskIdSegment(segment: string): boolean {
+  return /^task-id-[0-9a-f]{32}$/.test(segment)
+}
+
+export function encodeBoardTaskLogFreshnessTaskId(taskId: string): string {
+  const encoded = encodeURIComponent(taskId)
+  return isWindowsReservedArtifactSegment(encoded) ||
+    encoded.length > MAX_TASK_ID_ARTIFACT_SEGMENT_LENGTH
+    ? `task-id-${createHash('sha256').update(taskId).digest('hex').slice(0, 32)}`
+    : encoded
+}
+
+export function decodeBoardTaskLogFreshnessTaskId(fileName: string): string | null {
+  if (!fileName.endsWith(BOARD_TASK_LOG_FRESHNESS_FILE_SUFFIX)) {
+    return null
+  }
+  const encodedTaskId = fileName.slice(0, -BOARD_TASK_LOG_FRESHNESS_FILE_SUFFIX.length)
+  if (!encodedTaskId) {
+    return null
+  }
+  if (isOpaqueSafeTaskIdSegment(encodedTaskId)) {
+    return null
+  }
+  try {
+    const decodedTaskId = decodeURIComponent(encodedTaskId)
+    return decodedTaskId.trim().length > 0 ? decodedTaskId : null
+  } catch {
+    return null
+  }
+}
+
+export function getBoardTaskLogFreshnessSignalFilePath(
+  projectDir: string,
+  taskId: string,
+): string {
+  return join(
+    getBoardTaskLogFreshnessDir(projectDir),
+    `${encodeBoardTaskLogFreshnessTaskId(taskId)}${BOARD_TASK_LOG_FRESHNESS_FILE_SUFFIX}`,
+  )
+}
+
+export function getTeamTaskLogFreshnessSignalFilePath(
+  teamName: string,
+  taskId: string,
+): string {
+  return join(
+    getTeamTaskLogFreshnessDir(teamName),
+    `${encodeBoardTaskLogFreshnessTaskId(taskId)}${BOARD_TASK_LOG_FRESHNESS_FILE_SUFFIX}`,
+  )
+}
+
+export function deriveBoardTaskLogFreshnessProjectDirFromTranscriptPath(
+  transcriptPath: string,
+  projectsDir: string = getProjectsDir(),
+): string | null {
+  const relativePath = relative(projectsDir, transcriptPath)
+  if (
+    !relativePath ||
+    relativePath.startsWith(`..${sep}`) ||
+    relativePath === '..' ||
+    relativePath.startsWith('..')
+  ) {
+    return null
+  }
+
+  const [projectId] = relativePath.split(sep)
+  if (!projectId) {
+    return null
+  }
+  return join(projectsDir, projectId)
+}
+
+export async function touchBoardTaskLogFreshnessSignals(params: {
+  transcriptPath: string
+  entries: readonly Entry[]
+}): Promise<void> {
+  const taskIds = collectBoardTaskCanonicalIdsFromEntries(params.entries)
+  if (taskIds.length === 0) {
+    return
+  }
+
+  const teamName = getTeamName()
+  const projectDir = teamName
+    ? null
+    : deriveBoardTaskLogFreshnessProjectDirFromTranscriptPath(params.transcriptPath)
+  if (!teamName && !projectDir) return
+
+  const freshnessDir = teamName
+    ? getTeamTaskLogFreshnessDir(teamName)
+    : getBoardTaskLogFreshnessDir(projectDir!)
+  await mkdir(freshnessDir, { recursive: true, mode: 0o700 })
+
+  const updatedAt = new Date().toISOString()
+  await Promise.all(
+    taskIds.map(taskId =>
+      writeFile(
+        teamName
+          ? getTeamTaskLogFreshnessSignalFilePath(teamName, taskId)
+          : getBoardTaskLogFreshnessSignalFilePath(projectDir!, taskId),
+        JSON.stringify({
+          taskId,
+          ...(teamName ? { teamName } : {}),
+          updatedAt,
+          transcriptFile: basename(params.transcriptPath),
+        }),
+        { encoding: 'utf8', mode: 0o600 },
+      ),
+    ),
+  )
+}
+
+export async function touchBoardTaskLogFreshnessSignal(params: {
+  projectDir: string
+  taskId: string
+  teamName?: string
+  provider?: string
+  source?: string
+}): Promise<void> {
+  const taskId = params.taskId.trim()
+  if (!taskId) {
+    return
+  }
+
+  const freshnessDir = params.teamName
+    ? getTeamTaskLogFreshnessDir(params.teamName)
+    : getBoardTaskLogFreshnessDir(params.projectDir)
+  await mkdir(freshnessDir, { recursive: true, mode: 0o700 })
+
+  await writeFile(
+    params.teamName
+      ? getTeamTaskLogFreshnessSignalFilePath(params.teamName, taskId)
+      : getBoardTaskLogFreshnessSignalFilePath(params.projectDir, taskId),
+    JSON.stringify({
+      taskId,
+      ...(params.teamName ? { teamName: params.teamName } : {}),
+      ...(params.provider ? { provider: params.provider } : {}),
+      ...(params.source ? { source: params.source } : {}),
+      updatedAt: new Date().toISOString(),
+    }),
+    { encoding: 'utf8', mode: 0o600 },
+  )
+}

@@ -1,0 +1,98 @@
+import type { AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS } from '../../services/analytics/index.js'
+import { hasExplicitAnthropicConnectionMode } from '../anthropicConnectionMode.js'
+import { isEnvTruthy } from '../envUtils.js'
+
+export type APIProvider =
+  | 'firstParty'
+  | 'bedrock'
+  | 'vertex'
+  | 'foundry'
+  | 'openai'
+  | 'gemini'
+
+function getEntryProviderOverride():
+  | 'firstParty'
+  | 'bedrock'
+  | 'vertex'
+  | 'foundry'
+  | 'openai'
+  | 'gemini'
+  | null {
+  const raw = process.env.CLAUDE_CODE_ENTRY_PROVIDER?.trim().toLowerCase()
+  switch (raw) {
+    case 'anthropic':
+      return hasExplicitAnthropicConnectionMode()
+        ? 'firstParty'
+        : getAnthropicProviderFromEnv() ?? 'firstParty'
+    case 'codex':
+    case 'openai':
+      return 'openai'
+    case 'gemini':
+      return 'gemini'
+    case 'bedrock':
+      return 'bedrock'
+    case 'vertex':
+      return 'vertex'
+    case 'foundry':
+      return 'foundry'
+    case 'claude-platform-aws':
+      return 'firstParty'
+    default:
+      return null
+  }
+}
+
+function getAnthropicProviderFromEnv(): Extract<
+  APIProvider,
+  'bedrock' | 'vertex' | 'foundry'
+> | null {
+  return isEnvTruthy(process.env.CLAUDE_CODE_USE_BEDROCK)
+    ? 'bedrock'
+    : isEnvTruthy(process.env.CLAUDE_CODE_USE_VERTEX)
+      ? 'vertex'
+      : isEnvTruthy(process.env.CLAUDE_CODE_USE_FOUNDRY)
+        ? 'foundry'
+        : null
+}
+
+export function getAPIProvider(): APIProvider {
+  const entryProviderOverride = getEntryProviderOverride()
+  if (entryProviderOverride) {
+    return entryProviderOverride
+  }
+
+  return (
+    getAnthropicProviderFromEnv() ??
+    (isEnvTruthy(process.env.CLAUDE_CODE_USE_OPENAI)
+      ? 'openai'
+      : isEnvTruthy(process.env.CLAUDE_CODE_USE_GEMINI)
+        ? 'gemini'
+        : 'firstParty')
+  )
+}
+
+export function getAPIProviderForStatsig(): AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS {
+  return getAPIProvider() as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS
+}
+
+/**
+ * Check if ANTHROPIC_BASE_URL is a first-party Anthropic API URL.
+ * Returns true if not set (default API) or points to api.anthropic.com
+ * (or api-staging.anthropic.com for ant users).
+ */
+export function isFirstPartyAnthropicBaseUrl(): boolean {
+  const baseUrl = process.env.ANTHROPIC_BASE_URL
+  if (!baseUrl) {
+    return true
+  }
+  try {
+    const host = new URL(baseUrl).host
+    const allowedHosts = ['api.anthropic.com']
+    if (process.env.USER_TYPE === 'ant') {
+      allowedHosts.push('api-staging.anthropic.com')
+    }
+    return allowedHosts.includes(host)
+  } catch {
+    return false
+  }
+}

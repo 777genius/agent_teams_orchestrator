@@ -1,0 +1,599 @@
+name: Release Runtime
+run-name: runtime ${{ inputs.runtime_version || github.ref_name }} -> ${{ inputs.target_release_repo || '777genius/agent_teams_orchestrator_binaries' }}@${{ inputs.target_release_tag || format('runtime-{0}', github.ref_name) }}
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Git ref to build, for example main or v2.1.87
+        required: false
+        type: string
+      runtime_version:
+        description: Runtime version label, for example 2.1.87
+        required: false
+        type: string
+      publish_release:
+        description: Publish the verified draft after explicit owner approval for this version
+        required: false
+        default: false
+        type: boolean
+      target_release_repo:
+        description: Public repository that should receive the runtime assets
+        required: false
+        default: 777genius/agent_teams_orchestrator_binaries
+        type: string
+      target_release_tag:
+        description: Namespaced release tag in the public repo, for example runtime-v0.0.65
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: runtime-release-${{ inputs.runtime_version || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  DEFAULT_TARGET_RELEASE_REPO: 777genius/agent_teams_orchestrator_binaries
+  # --version reports the Fable 5.1 compatibility workaround, not the 0.0.x release label.
+  # Keep this aligned with scripts/build.ts: https://github.com/777genius/agent-teams-ai/issues/569
+  EXPECTED_CLAUDE_CODE_VERSION: '2.1.251'
+
+jobs:
+  prepare-release:
+    name: Prepare target release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    outputs:
+      target_repo: ${{ steps.meta.outputs.target_repo }}
+      target_tag: ${{ steps.meta.outputs.target_tag }}
+      runtime_version: ${{ steps.meta.outputs.runtime_version }}
+      source_ref: ${{ steps.meta.outputs.source_ref }}
+      source_commit: ${{ steps.meta.outputs.source_commit }}
+      already_published: ${{ steps.release-state.outputs.already_published }}
+      draft_release_id: ${{ steps.release-state.outputs.draft_release_id }}
+
+    steps:
+      - name: Checkout source ref
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.source_ref || github.ref }}
+
+      - name: Resolve publish metadata
+        id: meta
+        shell: bash
+        env:
+          INPUT_SOURCE_REF: ${{ github.event.inputs.source_ref }}
+          INPUT_TARGET_RELEASE_REPO: ${{ github.event.inputs.target_release_repo }}
+          INPUT_TARGET_RELEASE_TAG: ${{ github.event.inputs.target_release_tag }}
+          INPUT_RUNTIME_VERSION: ${{ github.event.inputs.runtime_version }}
+        run: |
+          set -euo pipefail
+          source_ref="${INPUT_SOURCE_REF:-${GITHUB_REF_NAME}}"
+          source_commit="$(git rev-parse HEAD)"
+          target_repo="${INPUT_TARGET_RELEASE_REPO:-${DEFAULT_TARGET_RELEASE_REPO}}"
+          runtime_version="${INPUT_RUNTIME_VERSION:-${GITHUB_REF_NAME}}"
+          runtime_version="${runtime_version#v}"
+          target_tag="${INPUT_TARGET_RELEASE_TAG:-runtime-v${runtime_version}}"
+
+          if [[ "$source_ref" != "v${runtime_version}" ]]; then
+            echo "Source ref must match runtime version: expected v${runtime_version}, got ${source_ref}" >&2
+            exit 1
+          fi
+          if [[ "$target_repo" != "$DEFAULT_TARGET_RELEASE_REPO" ]]; then
+            echo "Runtime assets must be published to ${DEFAULT_TARGET_RELEASE_REPO}, got ${target_repo}" >&2
+            exit 1
+          fi
+          if [[ "$target_tag" != "runtime-v${runtime_version}" ]]; then
+            echo "Public runtime tag must be runtime-v${runtime_version}, got ${target_tag}" >&2
+            exit 1
+          fi
+          package_version="$(jq -er '.version' package.json)"
+          if [[ "$package_version" != "$runtime_version" ]]; then
+            echo "Runtime package version mismatch: expected $runtime_version, got $package_version" >&2
+            exit 1
+          fi
+
+          {
+            echo "source_ref=$source_ref"
+            echo "source_commit=$source_commit"
+            echo "target_repo=$target_repo"
+            echo "target_tag=$target_tag"
+            echo "runtime_version=$runtime_version"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Prepare atomic target release
+        id: release-state
+        env:
+          GH_TOKEN: ${{ secrets.BINARIES_PUBLISH_TOKEN }}
+          TARGET_RELEASE_REPO: ${{ steps.meta.outputs.target_repo }}
+          TARGET_RELEASE_TAG: ${{ steps.meta.outputs.target_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          releases_json="$(gh api "repos/${TARGET_RELEASE_REPO}/releases?per_page=100")"
+          matches="$(jq --arg tag "$TARGET_RELEASE_TAG" '[.[] | select(.tag_name == $tag)]' <<<"$releases_json")"
+          match_count="$(jq 'length' <<<"$matches")"
+          if [[ "$match_count" -gt 1 ]]; then
+            echo "Found multiple releases for $TARGET_RELEASE_REPO@$TARGET_RELEASE_TAG" >&2
+            exit 1
+          fi
+
+          if [[ "$match_count" -eq 0 ]]; then
+            {
+              echo "already_published=false"
+              echo "draft_release_id="
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          release_id="$(jq -r '.[0].id' <<<"$matches")"
+          if [[ "$(jq -r '.[0].draft' <<<"$matches")" == "true" ]]; then
+            echo "Continuing existing draft release ID $release_id"
+            {
+              echo "already_published=false"
+              echo "draft_release_id=$release_id"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Release $TARGET_RELEASE_REPO@$TARGET_RELEASE_TAG is already published; build will be skipped"
+          {
+            echo "already_published=true"
+            echo "draft_release_id="
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.platform }}
+    needs: prepare-release
+    if: needs.prepare-release.outputs.already_published != 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux-x64
+            archive_name: agent-teams-runtime-linux-x64.tar.gz
+            binary_name: claude-multimodel
+          - runner: windows-2022
+            platform: win32-x64
+            archive_name: agent-teams-runtime-win32-x64.zip
+            binary_name: claude-multimodel.exe
+          - runner: ubuntu-24.04
+            platform: win32-arm64
+            archive_name: agent-teams-runtime-win32-arm64.zip
+            binary_name: claude-multimodel.exe
+            compile_target: bun-windows-arm64
+          - runner: macos-14
+            platform: darwin-arm64
+            archive_name: agent-teams-runtime-darwin-arm64.tar.gz
+            binary_name: claude-multimodel
+          - runner: macos-15-intel
+            platform: darwin-x64
+            archive_name: agent-teams-runtime-darwin-x64.tar.gz
+            binary_name: claude-multimodel
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare-release.outputs.source_commit }}
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+
+      - name: Install dependencies
+        if: matrix.platform != 'win32-arm64'
+        run: bun install --frozen-lockfile
+
+      - name: Install Windows ARM64 dependencies
+        if: matrix.platform == 'win32-arm64'
+        run: bun install --frozen-lockfile --os=win32 --cpu=arm64
+
+      - name: Compile runtime
+        env:
+          BUN_COMPILE_TARGET: ${{ matrix.compile_target }}
+        run: bun run compile
+
+      - name: Verify compiled runtime
+        if: runner.os != 'Windows' && matrix.platform != 'win32-arm64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual_version="$(./dist/cli --version | awk '{print $1}')"
+          if [[ "$actual_version" != "$EXPECTED_CLAUDE_CODE_VERSION" ]]; then
+            echo "Compiled Claude Code version mismatch: expected $EXPECTED_CLAUDE_CODE_VERSION, got $actual_version" >&2
+            exit 1
+          fi
+          ./dist/cli --version
+
+      # The shared executable smoke uses Node's built-in SQLite fixture writer.
+      - name: Setup Node for Windows executable smoke
+        if: runner.os == 'Windows' && matrix.platform == 'win32-x64'
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Verify compiled runtime (Windows)
+        timeout-minutes: 12
+        if: runner.os == 'Windows' && matrix.platform == 'win32-x64'
+        shell: pwsh
+        run: |
+          $actualVersion = (& .\dist\cli.exe --version).Split(" ")[0]
+          if ($LASTEXITCODE -ne 0) {
+            throw "Compiled runtime --version failed with exit code $LASTEXITCODE"
+          }
+          if ($actualVersion -ne $env:EXPECTED_CLAUDE_CODE_VERSION) {
+            throw "Compiled Claude Code version mismatch: expected $env:EXPECTED_CLAUDE_CODE_VERSION, got $actualVersion"
+          }
+          .\dist\cli.exe --version
+          $env:BACKFILL_RUNTIME_SOURCE_COMMIT = git rev-parse HEAD
+          $env:BACKFILL_RUNTIME_HARNESS_COMMIT = $env:BACKFILL_RUNTIME_SOURCE_COMMIT
+          $env:BACKFILL_RUNTIME_BUN_VERSION = bun --version
+          node .\scripts\smoke\windows-runtime-opencode-provider-json.mjs .\dist\cli.exe .\backfill-runtime-evidence.json
+          if ($LASTEXITCODE -ne 0) { throw 'Packaged Windows smoke failed; see captured evidence' }
+
+      - name: Upload Windows executable regression evidence
+        if: always() && runner.os == 'Windows' && matrix.platform == 'win32-x64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-packaged-backfill-release-${{ matrix.platform }}
+          path: backfill-runtime-evidence.json
+          if-no-files-found: warn
+
+      - name: Verify compiled Windows architecture
+        if: matrix.platform == 'win32-x64'
+        env:
+          EXPECTED_PLATFORM: ${{ matrix.platform }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $binary = @("dist/cli.exe", "dist/cli") | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $binary) {
+            throw "Compiled runtime binary not found"
+          }
+
+          $bytes = [System.IO.File]::ReadAllBytes($binary)
+          $peOffset = [System.BitConverter]::ToInt32($bytes, 0x3c)
+          $machine = [System.BitConverter]::ToUInt16($bytes, $peOffset + 4)
+          $expectedMachine = if ($env:EXPECTED_PLATFORM -eq "win32-arm64") { 0xaa64 } else { 0x8664 }
+          if ($machine -ne $expectedMachine) {
+            throw "Compiled runtime architecture mismatch: expected 0x$($expectedMachine.ToString('x4')), got 0x$($machine.ToString('x4'))"
+          }
+
+      - name: Verify cross-compiled Windows ARM64 architecture
+        if: matrix.platform == 'win32-arm64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary_metadata="$(file dist/cli.exe)"
+          echo "$binary_metadata"
+          grep -Fq 'Aarch64' <<<"$binary_metadata"
+
+      - name: Package runtime archive
+        if: runner.os != 'Windows' && matrix.platform != 'win32-arm64'
+        env:
+          RAW_RUNTIME_VERSION: ${{ needs.prepare-release.outputs.runtime_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          runtime_version="${RAW_RUNTIME_VERSION#v}"
+          src=""
+          for candidate in dist/cli dist/cli.exe; do
+            if [[ -f "$candidate" ]]; then
+              src="$candidate"
+              break
+            fi
+          done
+          [[ -n "$src" ]] || { echo "Compiled runtime binary not found"; exit 1; }
+          runtime_commit="$(git rev-parse HEAD)"
+
+          rm -rf release
+          mkdir -p release/runtime
+          cp "$src" "release/runtime/${{ matrix.binary_name }}"
+          chmod +x "release/runtime/${{ matrix.binary_name }}"
+          printf '%s\n' "$runtime_version" > release/runtime/VERSION
+          printf '%s\n' "$runtime_commit" > release/runtime/COMMIT_SHA
+          # The managed Cursor assets are resolved beside the installed binary.
+          # Leaving them out of the archive turns automatic discovery into a
+          # manual staging step nobody performs on a real install.
+          [[ -d dist/cursor-managed ]] || { echo "Managed Cursor assets missing"; exit 1; }
+          cp -R dist/cursor-managed release/runtime/cursor-managed
+          tar -czf "release/${{ matrix.archive_name }}" -C release runtime
+
+      - name: Package cross-compiled Windows ARM64 runtime archive
+        if: matrix.platform == 'win32-arm64'
+        env:
+          RAW_RUNTIME_VERSION: ${{ needs.prepare-release.outputs.runtime_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          runtime_version="${RAW_RUNTIME_VERSION#v}"
+          runtime_commit="$(git rev-parse HEAD)"
+
+          rm -rf release
+          mkdir -p release/runtime
+          cp dist/cli.exe "release/runtime/${{ matrix.binary_name }}"
+          printf '%s\n' "$runtime_version" > release/runtime/VERSION
+          printf '%s\n' "$runtime_commit" > release/runtime/COMMIT_SHA
+          # The managed Cursor assets are resolved beside the installed binary.
+          # Leaving them out of the archive turns automatic discovery into a
+          # manual staging step nobody performs on a real install.
+          [[ -d dist/cursor-managed ]] || { echo "Managed Cursor assets missing"; exit 1; }
+          cp -R dist/cursor-managed release/runtime/cursor-managed
+          (cd release && zip -qr "${{ matrix.archive_name }}" runtime)
+
+      - name: Package runtime archive (Windows)
+        if: runner.os == 'Windows'
+        env:
+          RAW_RUNTIME_VERSION: ${{ needs.prepare-release.outputs.runtime_version }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $runtimeVersion = $env:RAW_RUNTIME_VERSION
+          if ($runtimeVersion.StartsWith("v")) {
+            $runtimeVersion = $runtimeVersion.Substring(1)
+          }
+          $source = @("dist/cli.exe", "dist/cli") | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $source) {
+            throw "Compiled runtime binary not found"
+          }
+          $runtimeCommit = git rev-parse HEAD
+
+          Remove-Item release -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path release/runtime | Out-Null
+          Copy-Item $source "release/runtime/${{ matrix.binary_name }}"
+          Set-Content -Path release/runtime/VERSION -Value $runtimeVersion
+          Set-Content -Path release/runtime/COMMIT_SHA -Value $runtimeCommit
+          # Resolved beside the installed binary; see the bash packaging step.
+          if (-not (Test-Path dist/cursor-managed)) { throw "Managed Cursor assets missing" }
+          Copy-Item dist/cursor-managed release/runtime/cursor-managed -Recurse
+          Compress-Archive -Path release/runtime -DestinationPath "release/${{ matrix.archive_name }}" -Force
+
+      - name: Rename archive to versioned asset name
+        id: versioned-archive
+        env:
+          RUNTIME_VERSION: ${{ needs.prepare-release.outputs.runtime_version }}
+          ARCHIVE_NAME: ${{ matrix.archive_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          versioned_archive_name="$ARCHIVE_NAME"
+          case "$versioned_archive_name" in
+            *.tar.gz)
+              versioned_archive_name="${versioned_archive_name%.tar.gz}-v${RUNTIME_VERSION}.tar.gz"
+              ;;
+            *.zip)
+              versioned_archive_name="${versioned_archive_name%.zip}-v${RUNTIME_VERSION}.zip"
+              ;;
+            *)
+              echo "Unsupported archive extension: $versioned_archive_name" >&2
+              exit 1
+              ;;
+          esac
+          mv "release/$ARCHIVE_NAME" "release/$versioned_archive_name"
+          echo "archive_name=$versioned_archive_name" >> "$GITHUB_OUTPUT"
+
+      - name: Stage runtime archive for atomic publication
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-${{ matrix.platform }}
+          path: release/${{ steps.versioned-archive.outputs.archive_name }}
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish runtime assets
+    runs-on: ubuntu-latest
+    needs: [prepare-release, build]
+    if: needs.prepare-release.outputs.already_published != 'true'
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare-release.outputs.source_commit }}
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+
+      - name: Download staged runtime archives
+        uses: actions/download-artifact@v8
+        with:
+          pattern: runtime-*
+          path: release-flat
+          merge-multiple: true
+
+      - name: Generate manifest and checksums
+        env:
+          TARGET_RELEASE_TAG: ${{ needs.prepare-release.outputs.target_tag }}
+          RUNTIME_VERSION: ${{ needs.prepare-release.outputs.runtime_version }}
+          RUNTIME_SOURCE_REF: ${{ needs.prepare-release.outputs.source_ref }}
+          RUNTIME_SOURCE_COMMIT: ${{ needs.prepare-release.outputs.source_commit }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun run ./scripts/generate-release-manifest.ts
+
+      - name: Upload by release ID and publish atomically
+        env:
+          GH_TOKEN: ${{ secrets.BINARIES_PUBLISH_TOKEN }}
+          TARGET_RELEASE_REPO: ${{ needs.prepare-release.outputs.target_repo }}
+          TARGET_RELEASE_TAG: ${{ needs.prepare-release.outputs.target_tag }}
+          EXISTING_DRAFT_RELEASE_ID: ${{ needs.prepare-release.outputs.draft_release_id }}
+          PUBLISH_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release || false }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          find release-flat -maxdepth 1 -type f -name 'agent-teams-runtime-*' -printf '%f\n' \
+            | sort > expected-assets.txt
+          if [[ "$(wc -l < expected-assets.txt)" -ne 7 ]]; then
+            echo "Expected exactly seven runtime release assets" >&2
+            cat expected-assets.txt >&2
+            exit 1
+          fi
+
+          release_id="$EXISTING_DRAFT_RELEASE_ID"
+          if [[ -n "$release_id" ]]; then
+            # Recreate the draft instead of deleting large assets one-by-one.
+            # GitHub often returns 500 when deleting those zips in place.
+            status="$(curl --silent --show-error \
+              --output /tmp/delete-runtime-draft-body \
+              --write-out '%{http_code}' \
+              --request DELETE \
+              --header "Authorization: Bearer ${GH_TOKEN}" \
+              --header 'Accept: application/vnd.github+json' \
+              --header 'X-GitHub-Api-Version: 2022-11-28' \
+              "https://api.github.com/repos/${TARGET_RELEASE_REPO}/releases/${release_id}")"
+            if [[ "$status" != "204" && "$status" != "404" ]]; then
+              echo "Failed to delete runtime draft ${release_id}: HTTP ${status}" >&2
+              cat /tmp/delete-runtime-draft-body >&2
+              exit 1
+            fi
+            release_id=""
+          fi
+
+          release_json="$(gh api \
+            --method POST \
+            "repos/${TARGET_RELEASE_REPO}/releases" \
+            -f tag_name="$TARGET_RELEASE_TAG" \
+            -f name="$TARGET_RELEASE_TAG" \
+            -f body="Runtime assets for $TARGET_RELEASE_TAG" \
+            -F draft=true \
+            -F prerelease=false \
+            -f make_latest=false)"
+          release_id="$(jq -r '.id' <<<"$release_json")"
+
+          if [[ ! "$release_id" =~ ^[0-9]+$ ]]; then
+            echo "Invalid draft release ID: ${release_id:-<empty>}" >&2
+            exit 1
+          fi
+
+          while IFS= read -r asset_name; do
+            asset_path="release-flat/$asset_name"
+            upload_json=""
+            for upload_attempt in $(seq 1 5); do
+              upload_json="$(curl --silent --show-error \
+                --request POST \
+                --header "Authorization: Bearer $GH_TOKEN" \
+                --header 'Accept: application/vnd.github+json' \
+                --header 'Content-Type: application/octet-stream' \
+                --header 'X-GitHub-Api-Version: 2022-11-28' \
+                --data-binary "@$asset_path" \
+                "https://uploads.github.com/repos/${TARGET_RELEASE_REPO}/releases/${release_id}/assets?name=${asset_name}" \
+                || true)"
+              if [[ "$(jq -r '.state // empty' <<<"$upload_json")" == "uploaded" ]]; then
+                break
+              fi
+              if [[ "$upload_attempt" -eq 5 ]]; then
+                echo "Runtime asset upload was not committed: $asset_name" >&2
+                echo "$upload_json" >&2
+                exit 1
+              fi
+              sleep $((upload_attempt * 3))
+            done
+          done < expected-assets.txt
+
+          for attempt in $(seq 1 10); do
+            gh api "repos/${TARGET_RELEASE_REPO}/releases?per_page=100" \
+              --jq ".[] | select(.id == ${release_id}) | .assets[].name" \
+              | sort > actual-assets.txt
+            if diff -u expected-assets.txt actual-assets.txt; then
+              break
+            fi
+            if [[ "$attempt" -eq 10 ]]; then
+              echo "Timed out waiting for the complete draft asset set" >&2
+              exit 1
+            fi
+            sleep 2
+          done
+
+          if [[ "$PUBLISH_RELEASE" != "true" ]]; then
+            echo "Runtime draft ${TARGET_RELEASE_TAG} is complete; publication requires explicit approval."
+            exit 0
+          fi
+
+          gh api \
+            --method PATCH \
+            "repos/${TARGET_RELEASE_REPO}/releases/${release_id}" \
+            -F draft=false \
+            -F prerelease=false \
+            -f make_latest=false \
+            >/dev/null
+
+  verify-public-release:
+    name: Verify public anonymous downloads
+    runs-on: ubuntu-latest
+    needs: [prepare-release, build, publish]
+    if: >-
+      always() &&
+      needs.prepare-release.result == 'success' &&
+      (needs.prepare-release.outputs.already_published == 'true' ||
+       (inputs.publish_release == true && needs.publish.result == 'success'))
+
+    steps:
+      - name: Verify exact public release assets
+        env:
+          TARGET_RELEASE_REPO: ${{ needs.prepare-release.outputs.target_repo }}
+          TARGET_RELEASE_TAG: ${{ needs.prepare-release.outputs.target_tag }}
+          RUNTIME_VERSION: ${{ needs.prepare-release.outputs.runtime_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          repository_json="$(curl --fail --silent --show-error \
+            --header 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/${TARGET_RELEASE_REPO}")"
+          if [[ "$(jq -r '.private' <<<"$repository_json")" != "false" ]]; then
+            echo "Runtime release repository must be publicly accessible: ${TARGET_RELEASE_REPO}" >&2
+            exit 1
+          fi
+
+          release_json="$(curl --fail --silent --show-error \
+            --header 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/${TARGET_RELEASE_REPO}/releases/tags/${TARGET_RELEASE_TAG}")"
+          if [[ "$(jq -r '.draft' <<<"$release_json")" != "false" ]]; then
+            echo "Runtime release is not public: ${TARGET_RELEASE_REPO}@${TARGET_RELEASE_TAG}" >&2
+            exit 1
+          fi
+
+          cat > expected-assets.txt <<EOF
+          agent-teams-runtime-SHA256SUMS-v${RUNTIME_VERSION}
+          agent-teams-runtime-darwin-arm64-v${RUNTIME_VERSION}.tar.gz
+          agent-teams-runtime-darwin-x64-v${RUNTIME_VERSION}.tar.gz
+          agent-teams-runtime-linux-x64-v${RUNTIME_VERSION}.tar.gz
+          agent-teams-runtime-manifest-v${RUNTIME_VERSION}.json
+          agent-teams-runtime-win32-arm64-v${RUNTIME_VERSION}.zip
+          agent-teams-runtime-win32-x64-v${RUNTIME_VERSION}.zip
+          EOF
+          jq -r '.assets[].name' <<<"$release_json" | sort > actual-assets.txt
+          sort -o expected-assets.txt expected-assets.txt
+          diff -u expected-assets.txt actual-assets.txt
+
+          while IFS= read -r asset; do
+            [[ -n "$asset" ]] || continue
+            url="https://github.com/${TARGET_RELEASE_REPO}/releases/download/${TARGET_RELEASE_TAG}/${asset}"
+            echo "Verifying anonymous download: $url"
+            status="$(curl --fail --silent --show-error --location \
+              --range 0-0 --output /dev/null --write-out '%{http_code}' \
+              --retry 5 --retry-all-errors --retry-delay 2 \
+              "$url")"
+            if [[ "$status" != "200" && "$status" != "206" ]]; then
+              echo "Anonymous download returned HTTP $status: $url" >&2
+              exit 1
+            fi
+          done < expected-assets.txt

@@ -1,0 +1,102 @@
+export type IncomingPromptSubmissionKind =
+  | 'bootstrap'
+  | 'runtime_delivery'
+  | 'mailbox'
+  | 'task'
+  | 'tick'
+  | 'work_sync_continuation'
+
+export type IncomingPromptQueryGuardStatus =
+  | 'idle'
+  | 'dispatching'
+  | 'running'
+
+export type IncomingPromptRejectionReason =
+  | 'bootstrap_pending'
+  | 'query_active'
+  | 'command_queue_busy'
+
+export type IncomingPromptAdmissionDecision =
+  | { accepted: true }
+  | {
+      accepted: false
+      rejectionReason: IncomingPromptRejectionReason
+      retryable: true
+    }
+
+const BLOCKING_QUEUE_MODES = new Set(['prompt', 'bash'])
+
+export function getBlockingIncomingPromptQueueModes(
+  queueModes: readonly string[],
+): string[] {
+  return [...new Set(queueModes.filter(mode => BLOCKING_QUEUE_MODES.has(mode)))]
+}
+
+export function decideIncomingPromptAdmission({
+  submissionKind,
+  bootstrapAdmissionPending,
+  queryGuardStatus,
+  blockingQueueModes,
+}: {
+  submissionKind: IncomingPromptSubmissionKind
+  bootstrapAdmissionPending: boolean
+  queryGuardStatus: IncomingPromptQueryGuardStatus
+  blockingQueueModes: readonly string[]
+}): IncomingPromptAdmissionDecision {
+  if (bootstrapAdmissionPending && submissionKind !== 'bootstrap') {
+    return {
+      accepted: false,
+      rejectionReason: 'bootstrap_pending',
+      retryable: true,
+    }
+  }
+
+  if (submissionKind === 'work_sync_continuation') {
+    if (queryGuardStatus !== 'dispatching') {
+      return {
+        accepted: false,
+        rejectionReason: 'query_active',
+        retryable: true,
+      }
+    }
+    if (blockingQueueModes.length > 0) {
+      return {
+        accepted: false,
+        rejectionReason: 'command_queue_busy',
+        retryable: true,
+      }
+    }
+    return { accepted: true }
+  }
+
+  if (queryGuardStatus !== 'idle') {
+    return {
+      accepted: false,
+      rejectionReason: 'query_active',
+      retryable: true,
+    }
+  }
+
+  if (submissionKind !== 'bootstrap' && blockingQueueModes.length > 0) {
+    return {
+      accepted: false,
+      rejectionReason: 'command_queue_busy',
+      retryable: true,
+    }
+  }
+
+  return { accepted: true }
+}
+
+export function startQueryForIncomingKind(input: {
+  incomingKind: IncomingPromptSubmissionKind | undefined
+  continuationTicket: unknown | null
+  startReservedContinuation: () => { ok: true; generation: number } | { ok: false }
+  tryStart: () => number | null
+}): number | null {
+  if (input.incomingKind === 'work_sync_continuation' && input.continuationTicket) {
+    const started = input.startReservedContinuation()
+    return started.ok ? started.generation : null
+  }
+  return input.tryStart()
+}

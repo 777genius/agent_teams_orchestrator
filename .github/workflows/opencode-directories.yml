@@ -1,0 +1,35 @@
+name: OpenCode directory compatibility
+
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - 'src/services/opencode/ensureOpenCodeDirectory*'
+      - 'src/services/opencode/OpenCodeProfileManager.ts'
+      - '.github/workflows/opencode-directories.yml'
+  pull_request:
+    paths:
+      - 'src/services/opencode/ensureOpenCodeDirectory*'
+      - 'src/services/opencode/OpenCodeProfileManager.ts'
+      - '.github/workflows/opencode-directories.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  directory-compatibility:
+    name: Directory compatibility (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+      # Builtin-only tests intentionally cover the Bun version embedded in 2.14.2.
+      - name: Test directory compatibility
+        run: bun test src/services/opencode/ensureOpenCodeDirectory.test.ts

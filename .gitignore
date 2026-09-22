@@ -1,0 +1,18 @@
+node_modules/
+dist/
+/cli
+/cli.cmd
+/cli-dev
+/cli-dev.cmd
+openclaw/
+.serena/
+.claude/settings.local.json
+
+# Competitor directories are local upstream clones used for research only.
+# Do not track new clone contents or local edits there.
+/competitors/*
+!/competitors/README.md
+!/competitors/AGENTS.md
+
+# Local release operator notes
+/ORCHESTRATOR_RELEASE_RUNBOOK.local.md

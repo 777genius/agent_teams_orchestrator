@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
+TARGET="$SCRIPT_DIR/src/entrypoints/cli.tsx"
+
+augment_launcher_path() {
+  local bun_dir=""
+  if [[ -n "${BUN_INSTALL:-}" ]]; then
+    bun_dir="$BUN_INSTALL/bin"
+  elif [[ -n "${HOME:-}" ]]; then
+    bun_dir="$HOME/.bun/bin"
+  fi
+
+  if [[ -n "$bun_dir" ]]; then
+    export PATH="$bun_dir:/opt/homebrew/bin:/usr/local/bin:$PATH"
+  else
+    export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+  fi
+}
+
+normalize_source_node_env() {
+  if [[ "${CLAUDE_TEAM_SOURCE_LAUNCHER_PRESERVE_NODE_ENV:-}" == "1" ]]; then
+    return 0
+  fi
+
+  if [[ -z "${NODE_ENV:-}" || "${NODE_ENV:-}" == "production" ]]; then
+    export NODE_ENV="development"
+  fi
+}
+
+resolve_bun() {
+  if [[ -n "${BUN_INSTALL:-}" && -x "$BUN_INSTALL/bin/bun" ]]; then
+    printf '%s\n' "$BUN_INSTALL/bin/bun"
+    return 0
+  fi
+
+  if [[ -x "${HOME:-}/.bun/bin/bun" ]]; then
+    printf '%s\n' "${HOME:-}/.bun/bin/bun"
+    return 0
+  fi
+
+  if command -v bun >/dev/null 2>&1; then
+    command -v bun
+    return 0
+  fi
+
+  for candidate in /opt/homebrew/bin/bun /usr/local/bin/bun; do
+    if [[ -x "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  echo "Bun runtime was not found. Install Bun or add it to PATH before running this launcher." >&2
+  return 127
+}
+
+augment_launcher_path
+normalize_source_node_env
+BUN_BIN="$(resolve_bun)" || exit $?
+
+if [[ "${1-}" == "runtime" && "${2-}" == "status" ]]; then
+  for arg in "$@"; do
+    if [[ "$arg" == "--json" ]]; then
+      RAW_OUTPUT="$(
+        "$BUN_BIN" run "$TARGET" "$@" 2> >(cat >&2)
+      )"
+      RAW_OUTPUT="$RAW_OUTPUT" node <<'EOF'
+const raw = process.env.RAW_OUTPUT ?? ''
+const start = raw.indexOf('{')
+const end = raw.lastIndexOf('}')
+if (start < 0 || end <= start) {
+  process.stderr.write(raw)
+  process.exit(1)
+}
+const prefix = raw.slice(0, start).trim()
+if (prefix.length > 0) {
+  process.stderr.write(prefix + '\n')
+}
+process.stdout.write(raw.slice(start, end + 1) + '\n')
+EOF
+      exit $?
+    fi
+  done
+fi
+
+if [[ "${1-}" == "runtime" && "${2-}" == "opencode-command" ]]; then
+  exec "$BUN_BIN" "$SCRIPT_DIR/src/entrypoints/opencodeCommand.ts" "${@:3}"
+fi
+
+exec "$BUN_BIN" run "$TARGET" "$@"
