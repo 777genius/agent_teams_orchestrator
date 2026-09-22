@@ -92,6 +92,66 @@ test('Windows atomic publication refuses a namespace without an owner-only ACL r
   await expect(fs.readFile(target, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
 })
 
+test('Windows establishes an ACL only for its newly-created namespace, then validates it without repair', async () => {
+  const dir = await createTempDir()
+  const calls: Array<{ directory: string, establish: boolean }> = []
+  const secureWindowsNamespace = (directory: string, establish: boolean) => {
+    calls.push({ directory, establish })
+    return true
+  }
+  const first = path.join(dir, 'windows-owned-first.json')
+  await writeFileAtomic(first, 'first', {
+    deps: { platform: 'win32', secureWindowsNamespace },
+  })
+  const namespace = path.join(dir, '.atomic-write-tombstones')
+  expect(calls).toEqual([
+    { directory: namespace, establish: true },
+    { directory: namespace, establish: false },
+    { directory: namespace, establish: false },
+  ])
+
+  calls.length = 0
+  await writeFileAtomic(path.join(dir, 'windows-owned-second.json'), 'second', {
+    deps: { platform: 'win32', secureWindowsNamespace },
+  })
+  expect(calls).toEqual([
+    { directory: namespace, establish: false },
+    { directory: namespace, establish: false },
+    { directory: namespace, establish: false },
+  ])
+})
+
+test('Windows rejects a reparse tombstone namespace before any ACL establishment', async () => {
+  const dir = await createTempDir()
+  const namespace = path.join(dir, '.atomic-write-tombstones')
+  const redirected = path.join(dir, 'redirected')
+  await fs.mkdir(redirected, { mode: 0o700 })
+  await fs.symlink(redirected, namespace, 'dir')
+  await expect(writeFileAtomic(path.join(dir, 'windows-reparse.json'), 'published', {
+    deps: {
+      platform: 'win32',
+      secureWindowsNamespace: () => { throw new Error('ACL setup must not follow a reparse point') },
+    },
+  })).rejects.toThrow('tombstone namespace is not private')
+})
+
+test('Windows rejects an existing public namespace instead of repairing it', async () => {
+  const dir = await createTempDir()
+  const namespace = path.join(dir, '.atomic-write-tombstones')
+  await fs.mkdir(namespace, { mode: 0o777 })
+  let establish: boolean | undefined
+  await expect(writeFileAtomic(path.join(dir, 'windows-public.json'), 'published', {
+    deps: {
+      platform: 'win32',
+      secureWindowsNamespace: (_directory, created) => {
+        establish = created
+        return false
+      },
+    },
+  })).rejects.toThrow('tombstone namespace is not private')
+  expect(establish).toBe(false)
+})
+
 test.skipIf(process.platform === 'win32')('POSIX rejects synthesized permissive namespace mode bits', async () => {
   const dir = await createTempDir()
   const synthesizeWindowsMode = ((source: Parameters<typeof lstatSync>[0], options?: Parameters<typeof lstatSync>[1]) => {

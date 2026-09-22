@@ -57,8 +57,9 @@ type AtomicWriteDeps = {
   randomId: () => string
   getRetryDelayMs: (attemptIndex: number) => number
   syncDirectory: (path: string) => void
-  /** Windows DACL receipt for the private source-name namespace. */
-  secureWindowsNamespace: (path: string) => boolean
+  /** Windows DACL receipt for the private source-name namespace. `establish`
+   * is true only for the directory created by this publication attempt. */
+  secureWindowsNamespace: (path: string, establish: boolean) => boolean
 }
 
 /** Authority carried by publication callers. Every externally-visible effect
@@ -341,14 +342,15 @@ function isPrivateTombstoneNamespace(
   stats: ReturnType<typeof lstatSync>,
   platform: NodeJS.Platform,
 ): boolean {
-  return stats.isDirectory() && (platform === 'win32' || (Number(stats.mode) & 0o077) === 0)
+  return stats.isDirectory() && !stats.isSymbolicLink()
+    && (platform === 'win32' || (Number(stats.mode) & 0o077) === 0)
 }
 
 /** Node synthesizes Windows mode bits and cannot answer effective ACL rights.
  * Establish and then verify an owner-only protected DACL before a temp name is
  * trusted as the source of an atomic rename. This is deliberately synchronous
  * because writeFileAtomicSync has the same source-name security boundary. */
-function secureWindowsAtomicNamespace(directory: string): boolean {
+function secureWindowsAtomicNamespace(directory: string, establish: boolean): boolean {
   // Tests may model a Windows target on a non-Windows host; a real receipt is
   // required whenever the process can actually inspect a Windows DACL.
   if (process.platform !== 'win32') return true
@@ -356,16 +358,24 @@ function secureWindowsAtomicNamespace(directory: string): boolean {
   const program = [
     "$ErrorActionPreference='Stop'",
     `$p='${literal}'`,
-    '$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User',
+    '$identity=[Security.Principal.WindowsIdentity]::GetCurrent()',
+    '$sid=$identity.User',
+    '$ownerSid=if($identity.Owner){$identity.Owner}else{$sid}',
     '$acl=Get-Acl -LiteralPath $p',
-    'if($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $sid.Value){exit 61}',
-    '$acl.SetAccessRuleProtection($true,$false)',
-    'foreach($rule in @($acl.Access)){[void]$acl.RemoveAccessRuleAll($rule)}',
-    "$rule=New-Object Security.AccessControl.FileSystemAccessRule($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow')",
-    '$acl.AddAccessRule($rule)',
-    'Set-Acl -LiteralPath $p -AclObject $acl',
+    // A process running elevated may create files owned by its token owner
+    // (for example Administrators) rather than its user SID. That is still
+    // this newly-created process namespace, but it must never authorize an
+    // ACL repair of an already-existing namespace.
+    'if($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $ownerSid.Value){exit 61}',
+    ...(establish ? [
+      '$acl.SetAccessRuleProtection($true,$false)',
+      'foreach($rule in @($acl.Access)){[void]$acl.RemoveAccessRuleAll($rule)}',
+      "$rule=New-Object Security.AccessControl.FileSystemAccessRule($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow')",
+      '$acl.AddAccessRule($rule)',
+      'Set-Acl -LiteralPath $p -AclObject $acl',
+    ] : []),
     '$after=Get-Acl -LiteralPath $p',
-    'if(-not $after.AreAccessRulesProtected -or $after.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $sid.Value){exit 62}',
+    'if(-not $after.AreAccessRulesProtected -or $after.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $ownerSid.Value){exit 62}',
     '$rules=@($after.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]))',
     'if($rules.Count -ne 1 -or $rules[0].IdentityReference.Value -ne $sid.Value -or $rules[0].AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or (($rules[0].FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -ne [Security.AccessControl.FileSystemRights]::FullControl)){exit 63}',
   ].join(';')
@@ -384,10 +394,23 @@ function secureWindowsAtomicNamespace(directory: string): boolean {
  */
 async function ensureTombstoneNamespace(destination: string, deps: AtomicWriteDeps): Promise<string> {
   const directory = tombstoneDirectoryFor(destination)
-  await deps.mkdir(directory, { recursive: true, mode: 0o700 })
-  // mkdir does not repair an existing permissive directory. This is a
-  // security boundary, therefore fail closed instead of publishing from it.
-  if (deps.platform === 'win32' && !deps.secureWindowsNamespace(directory)) {
+  let created = false
+  try {
+    // The destination parent is established before this helper runs. A
+    // non-recursive create gives the DACL setup a real provenance boundary:
+    // only this call may establish a new Windows namespace.
+    await deps.mkdir(directory, { mode: 0o700 })
+    created = true
+  } catch (error) {
+    if (getErrorCode(error) !== 'EEXIST') throw error
+  }
+  const initialStats = deps.lstatSync(directory)
+  if (!isPrivateTombstoneNamespace(initialStats, deps.platform)) {
+    throw new Error(`atomic publication tombstone namespace is not private: ${directory}`)
+  }
+  // An existing namespace is validation-only. In particular, do not repair a
+  // foreign/public/reparse namespace merely because its path has our name.
+  if (deps.platform === 'win32' && !deps.secureWindowsNamespace(directory, created)) {
     throw new Error(`atomic publication tombstone namespace is not private: ${directory}`)
   }
   const stats = deps.lstatSync(directory)
@@ -437,7 +460,7 @@ function scavengeAtomicWriteTombstonesSync(
     throw error
   }
   const namespace = deps.lstatSync(directory)
-  if (deps.platform === 'win32' && !deps.secureWindowsNamespace(directory)) {
+  if (deps.platform === 'win32' && !deps.secureWindowsNamespace(directory, false)) {
     throw new Error(`atomic publication tombstone namespace is not private: ${directory}`)
   }
   if (!isPrivateTombstoneNamespace(namespace, deps.platform)) {
@@ -745,7 +768,7 @@ async function moveFileIntoPlace(
   // Keep the descriptor as the authority for the prepared inode.  A path is
   // only a name: validate it immediately before rename so a replacement made
   // after open cannot be published under this transaction's receipt.
-  if (deps.platform === 'win32' && !deps.secureWindowsNamespace(dirname(tempPath))) {
+  if (deps.platform === 'win32' && !deps.secureWindowsNamespace(dirname(tempPath), false)) {
     throw new Error(`atomic publication tombstone namespace is not private: ${dirname(tempPath)}`)
   }
   const prepared = await committedHandle.stat({ bigint: true })
@@ -891,8 +914,18 @@ export function writeFileAtomicSync(
   try {
     mkdirSync(dirname(filePath), { recursive: true })
     namespace = tombstoneDirectoryFor(filePath)
-    mkdirSync(namespace, { recursive: true, mode: 0o700 })
-    if (deps.platform === 'win32' && !deps.secureWindowsNamespace(namespace)) {
+    let namespaceCreated = false
+    try {
+      mkdirSync(namespace, { mode: 0o700 })
+      namespaceCreated = true
+    } catch (error) {
+      if (getErrorCode(error) !== 'EEXIST') throw error
+    }
+    const initialNamespaceStats = deps.lstatSync(namespace)
+    if (!isPrivateTombstoneNamespace(initialNamespaceStats, deps.platform)) {
+      throw new Error(`atomic publication tombstone namespace is not private: ${namespace}`)
+    }
+    if (deps.platform === 'win32' && !deps.secureWindowsNamespace(namespace, namespaceCreated)) {
       throw new Error(`atomic publication tombstone namespace is not private: ${namespace}`)
     }
     const namespaceStats = deps.lstatSync(namespace)
@@ -928,7 +961,7 @@ export function writeFileAtomicSync(
       if (options.mode !== undefined) chmodSync(tempPath, options.mode)
       fsyncSync(fd)
       const descriptor = deps.fstatSync(fd, { bigint: true })
-      if (deps.platform === 'win32' && !deps.secureWindowsNamespace(namespace)) {
+      if (deps.platform === 'win32' && !deps.secureWindowsNamespace(namespace, false)) {
         throw new Error(`atomic publication tombstone namespace is not private: ${namespace}`)
       }
       const named = deps.lstatSync(tempPath)

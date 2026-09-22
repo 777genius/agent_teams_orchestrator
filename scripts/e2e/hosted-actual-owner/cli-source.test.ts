@@ -394,6 +394,12 @@ describe('hosted actual-owner source launcher black box', () => {
     // cannot fall back to an ambient/default model or touch a host endpoint.
     const admittedProvider = admitFixtureProviderModel('fixture/fixture-model')
     const password = 'actual-owner-fixture-password'
+    // This isolated fixture has no sibling agent-teams checkout. Supply the
+    // same explicit local-MCP contract production supports, so profile
+    // preparation validates dynamic attach configuration rather than ambient
+    // workspace discovery.
+    const mcpEntry = join(root, 'agent-teams-mcp-fixture.js')
+    await writeFile(mcpEntry, "throw new Error('hosted actual-owner fixture MCP must not execute')\n", { mode: 0o500 })
     const providerSource = join(root, 'provider.ts')
     await writeFile(providerSource, `
 const port = Number(process.argv[process.argv.indexOf('--port') + 1])
@@ -425,6 +431,7 @@ await new Promise(() => {})
       HOME: home, XDG_DATA_HOME: join(home, 'xdg-data'),
       CLAUDE_MULTIMODEL_DATA_HOME: data, CLAUDE_MULTIMODEL_CACHE_HOME: cache,
       CLAUDE_MULTIMODEL_OPENCODE_SCOPE_CONFIG_CONTENT: JSON.stringify(scopedRuntimeConfig),
+      CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY: mcpEntry,
       OPENCODE_SERVER_PASSWORD: password,
     })
     const cleanup = new CleanupStack()
@@ -451,6 +458,10 @@ await new Promise(() => {})
     const profile = JSON.parse((await execFileAsync(bunExecutable, ['-e', profileSource], {
       encoding: 'utf8', env: fixtureEnvironment, maxBuffer: 16 * 1024 * 1024,
     })).stdout) as Record<string, any>
+    const preparedConfig = profile.managedConfig as {
+      mcp?: Record<string, { command?: string[] }>
+    }
+    expect(preparedConfig.mcp?.['agent-teams']?.command).toEqual([Bun.which('node'), mcpEntry])
     await Promise.all(getOpenCodeManagedSubscriptionPluginPackages().map(async packageSpec => {
       const packageRoot = join(profile.xdgCacheHome, 'opencode', 'packages', packageSpec)
       await mkdir(packageRoot, { recursive: true, mode: 0o700 })
