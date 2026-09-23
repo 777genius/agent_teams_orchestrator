@@ -46,13 +46,19 @@ export function buildAnthropicRuntimeStatus(params: {
     params.modelCatalog.status,
     backend,
   )
+  const compatibleBackendVerified =
+    (backend?.id === 'ollama' || backend?.id === 'anthropic-compatible') &&
+    params.auth.authenticated &&
+    params.modelCatalog.source === 'anthropic-compatible-api' &&
+    params.modelCatalog.status === 'ready' &&
+    params.modelCatalog.models.length > 0
   return {
     providerId: 'anthropic',
     displayName: 'Anthropic',
     supported: true,
     authenticated: params.auth.authenticated,
     authMethod: params.auth.authMethod,
-    verificationState: backend ? 'unknown' : 'verified',
+    verificationState: compatibleBackendVerified || !backend ? 'verified' : 'unknown',
     canLoginFromUi: backend ? false : true,
     capabilities: {
       teamLaunch: true,
