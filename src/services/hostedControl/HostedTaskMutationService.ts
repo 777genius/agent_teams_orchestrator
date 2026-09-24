@@ -37,6 +37,36 @@ export class HostedTaskMutationService {
     this.#validateOwner = options.validateOwner ?? (() => true)
   }
 
+  /** Canonical, coordinated Owner board read for one immutable hosted member. */
+  async readTaskForMember(input: Readonly<{ teamId: string; taskId: string; memberId: string }>): Promise<Readonly<{
+    teamId: string; taskId: string; ownerId: string; status: 'pending' | 'in_progress' | 'completed'
+    sourceGeneration: string; revision: string; task: Readonly<Record<string, unknown>>
+  }> | null> {
+    if (input.teamId !== this.options.authority.teamId || !/^task_[0-9a-f]{32}$/.test(input.taskId) ||
+      !/^member_[0-9a-f]{32}$/.test(input.memberId)) return null
+    try {
+      return await withTaskMutationCoordination(this.options.legacyKey, async () => {
+        if (!(await this.#validateOwner()) || (await this.options.wal.listAmbiguous()).length !== 0) return null
+        const members = await this.#activeMembers()
+        if (members.get(input.memberId) !== input.memberId) return null
+        const state = await this.#readBoardState(await this.#readSourceState())
+        const record = state.tasks.get(input.taskId)
+        if (!record || record.value.owner !== input.memberId ||
+          !TASK_STATUSES.includes(record.value.status as typeof TASK_STATUSES[number])) return null
+        const revision = await this.#revision(state.sourceGeneration, state.allTaskTexts, state.kanbanText, state.roster)
+        const final = await this.#readBoardState(await this.#readSourceState())
+        if (final.sourceGeneration !== state.sourceGeneration ||
+          (await this.#revision(final.sourceGeneration, final.allTaskTexts, final.kanbanText, final.roster)) !== revision ||
+          final.tasks.get(input.taskId)?.text !== record.text ||
+          (await this.#activeMembers()).get(input.memberId) !== input.memberId ||
+          !(await this.#validateOwner())) return null
+        return { teamId: input.teamId, taskId: input.taskId, ownerId: input.memberId,
+          status: record.value.status as 'pending' | 'in_progress' | 'completed',
+          sourceGeneration: state.sourceGeneration, revision, task: { ...record.value } }
+      }, { claudeRoot: this.options.claudeRoot })
+    } catch { return null }
+  }
+
   async recover(): Promise<boolean> {
     try { return await withTaskMutationCoordination(this.options.legacyKey, async () => {
       if (!(await this.#validateOwner())) return false
