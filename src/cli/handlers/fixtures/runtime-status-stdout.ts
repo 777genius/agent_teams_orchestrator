@@ -38,7 +38,11 @@ if (command === 'verify') {
 }
 if (command === 'verify-model') {
   mock.module(dependency('../../services/opencode/OpenCodeExecutionProbe.js'), () => ({
-    openCodeExecutionProbe: { probeModel: async () => ({ outcome: 'success', diagnostics: [] }) },
+    openCodeExecutionProbe: { probeModel: () => {
+      if (scenario === 'startup-throw') throw new Error('offline startup failure: sk-12345678901234567890')
+      if (scenario === 'startup-reject') return Promise.reject(new Error('offline startup failure'))
+      return Promise.resolve({ outcome: 'success', diagnostics: [] })
+    } },
   }))
 }
 if (command === 'providers-view' || command === 'providers-reject') {
@@ -87,7 +91,7 @@ if (scenario === 'write-error') {
     return false
   }) as typeof process.stdout.write
 }
-if (scenario === 'write-no-callback') {
+if (scenario === 'write-no-callback' || process.argv.includes('--stall-stdout')) {
   process.stdout.write = (() => false) as typeof process.stdout.write
 }
 
@@ -121,7 +125,10 @@ switch (command) {
     void runtime.runtimeVerify({ provider: 'opencode', json: true })
     break
   case 'verify-model':
-    void runtime.runtimeVerifyModel({ provider: 'opencode', model: 'offline/model', json: true })
+    void runtime.runtimeVerifyModel({
+      provider: 'opencode', model: 'offline/model', json: true,
+      text: process.argv.includes('--text'),
+    })
     break
   case 'providers-view':
   case 'providers-reject':

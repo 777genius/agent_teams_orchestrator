@@ -136,6 +136,49 @@ describe('runtime status subprocess stdout contract (offline)', () => {
   }
 })
 
+describe('runtime verify-model subprocess stdout contract (offline)', () => {
+  test('startup rejection exits nonzero with one JSON error and no model result', async () => {
+    const response = await runStatus('startup-reject', ['--command=verify-model'])
+    expect(response.exitCode).toBe(1)
+    expect(response.stderr).toBe('')
+    expect(JSON.parse(response.stdout)).toEqual({
+      schemaVersion: 1,
+      providerId: 'opencode',
+      error: {
+        code: 'runtime-unhealthy',
+        message: 'Runtime model verification failed: offline startup failure',
+        recoverable: true,
+      },
+    })
+    expect(response.stdout.endsWith('\n')).toBe(true)
+  })
+
+  test('startup throw redacts secrets and exits nonzero even with a retained handle', async () => {
+    const response = await runStatus('startup-throw', ['--command=verify-model', '--retain-handle'])
+    expect(response.exitCode).toBe(1)
+    expect(response.elapsedMs).toBeLessThan(5_000)
+    expect(response.stderr).toBe('')
+    expect(JSON.parse(response.stdout).error.message).toBe(
+      'Runtime model verification failed: offline startup failure: sk-...redacted',
+    )
+  }, 7_000)
+
+  test('startup rejection cannot exit zero when stdout never calls back', async () => {
+    const response = await runStatus('startup-reject', ['--command=verify-model', '--stall-stdout'])
+    expect(response.exitCode).toBe(1)
+    expect(response.stdout).toBe('')
+    expect(response.stderr).toBe('')
+    expect(response.elapsedMs).toBeLessThan(5_000)
+  })
+
+  test('text startup rejection exits nonzero with a diagnostic', async () => {
+    const response = await runStatus('startup-reject', ['--command=verify-model', '--text'])
+    expect(response.exitCode).toBe(1)
+    expect(response.stdout).toBe('')
+    expect(response.stderr).toBe('Runtime model verification failed: offline startup failure\n')
+  })
+})
+
 // Python must own the kernel pipe: Bun.spawn eagerly consumes child streams.
 // This test is explicitly part of the focused suite on Linux with Python 3.
 const python = Bun.which('python3')
