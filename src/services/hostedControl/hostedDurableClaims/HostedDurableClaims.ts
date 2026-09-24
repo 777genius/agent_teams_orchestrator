@@ -129,14 +129,16 @@ function laneInput(input: { key: string; fingerprint: string }): void {
 }
 
 function binding(input: HostedContainerLaneBinding): void {
+  const legacyIds = /^run_[0-9a-f]{64}$/.test(input.runId) &&
+    /^team_[0-9a-f]{64}$/.test(input.teamId) && /^lane_[0-9a-f]{64}$/.test(input.laneId)
+  const canonicalIds = /^run_[0-9a-f]{32}$/.test(input.runId) &&
+    /^team_[0-9a-f]{32}$/.test(input.teamId) && /^lane_[0-9a-f]{32}$/.test(input.laneId)
   if (!exact(input, ['key', 'fingerprint', 'operationId', 'runId', 'teamId', 'laneId',
     'memberId', 'memberName', 'model', 'promptSha256']) ||
     !HEX.test(input.key) || !HEX.test(input.fingerprint) || !HEX.test(input.promptSha256) ||
     !/^start_[0-9a-f]{64}$/.test(input.operationId) ||
     !/^member_[0-9a-f]{32}$/.test(input.memberId) ||
-    !/^run_[0-9a-f]{64}$/.test(input.runId) ||
-    !/^team_[0-9a-f]{64}$/.test(input.teamId) ||
-    !/^lane_[0-9a-f]{64}$/.test(input.laneId) ||
+    (!legacyIds && !canonicalIds) ||
     typeof input.memberName !== 'string' || !input.memberName || input.memberName.length > 128 ||
     typeof input.model !== 'string' || !input.model || input.model.length > 256) {
     throw new TypeError('Invalid hosted container binding')

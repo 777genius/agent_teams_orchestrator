@@ -1,11 +1,13 @@
 import { describe, expect, test } from 'bun:test'
+import { createHash } from 'node:crypto'
 import os from 'node:os'
 import path from 'node:path'
 
 import type { HostedOpenCodeContainerSupervisor } from '../hostedControl/container/HostedOpenCodeContainerSupervisor.js'
 import { HostedMemberSessionBridge, type HostedMemberAttempt } from '../hostedControl/hostedLaneSession/HostedMemberSessionBridge.js'
 import { DurableTeamLifecycleExecution } from './DurableTeamLifecycleExecution.js'
-import { HostedContainerOpenCodeLane, type HostedContainerAttemptClaims } from './HostedContainerOpenCodeLane.js'
+import { HostedContainerOpenCodeLane, type HostedCanonicalLaneIdentity,
+  type HostedContainerAttemptClaims } from './HostedContainerOpenCodeLane.js'
 import type { TeamLifecycleLaneInput } from './OpenCodeTeamLifecycleLane.js'
 
 const HANDLE = `opencode_${'a'.repeat(32)}`
@@ -27,13 +29,13 @@ function SESSIONS() {
     readDelivery: async () => null,
   })
 }
-function READY_SESSIONS(blockedMember = '') {
+function READY_SESSIONS(blockedMember = '', started?: HostedMemberAttempt[]) {
   const receipt = (attempt: HostedMemberAttempt) => ({ ...attempt,
     state: attempt.memberName === blockedMember ? 'launching' : 'ready',
     sessionId: `ses_${attempt.memberId.slice(-12)}`, initialMessageId: 'msg_initial12345',
     observedInitialMessageId: 'msg_initial12345' })
   return new HostedMemberSessionBridge({
-    start: async attempt => receipt(attempt), observe: async attempt => receipt(attempt),
+    start: async attempt => { started?.push(attempt); return receipt(attempt) }, observe: async attempt => receipt(attempt),
     post: async () => null, observeDelivery: async () => null, observeReply: async () => null,
   }, {
     claimStart: async attempt => ({ created: true, fingerprint: attempt.planFingerprint }),
@@ -48,6 +50,23 @@ function input(): TeamLifecycleLaneInput & { runId: string } {
     runId: 'run_one12345',
     lane: { kind: 'opencode', provider: 'opencode', laneId: 'lane-one', selectedModel: 'qwen/test',
       members: [{ name: 'coder', prompt: 'Test prompt', model: 'qwen/test' }] },
+  }
+}
+
+function canonicalInput(): ReturnType<typeof input> {
+  const plan = input()
+  return { ...plan, planTeamId: `team_${'a'.repeat(32)}`, runId: `run_${'b'.repeat(32)}`,
+    lane: { ...plan.lane, laneId: `lane_${'e'.repeat(32)}` } }
+}
+
+function canonicalIdentity(plan: ReturnType<typeof input>): HostedCanonicalLaneIdentity {
+  return {
+    operationId: `promotion_${'c'.repeat(32)}`, planSha256: 'd'.repeat(64),
+    teamId: plan.planTeamId, runId: plan.runId,
+    laneOrdinal: 0, laneId: `lane_${'e'.repeat(32)}`,
+    members: [{ memberOrdinal: 0, memberId: `member_${'f'.repeat(32)}`,
+      name: 'coder', model: 'qwen/test',
+      promptSha256: createHash('sha256').update(plan.lane.members[0].prompt).digest('hex') }],
   }
 }
 
@@ -229,6 +248,90 @@ describe('hosted disposable OpenCode lifecycle lane', () => {
     const substituted = new HostedContainerOpenCodeLane(supervisor, async () => `lease_${'c'.repeat(32)}`,
       READY, attempts, async () => `member_${'e'.repeat(32)}`, SESSIONS())
     await expect(substituted.launch(input())).rejects.toThrow('plan changed')
+    expect(supervisor.starts).toHaveLength(1)
+  })
+
+  test('trusted Product roster IDs flow unchanged through claims, Start, and session transport', async () => {
+    const plan = canonicalInput()
+    const identity = canonicalIdentity(plan)
+    const supervisor = new FakeSupervisor()
+    supervisor.startStatus = 'started'
+    supervisor.effectEnabled = true
+    const attempts = new FakeAttempts()
+    const sessions: HostedMemberAttempt[] = []
+    const leased: unknown[] = []
+    const lane = new HostedContainerOpenCodeLane(supervisor, async binding => {
+      leased.push(binding)
+      return `lease_${'c'.repeat(32)}`
+    }, READY, attempts, undefined, READY_SESSIONS('', sessions), async () => identity)
+    expect(await lane.launch(plan)).toEqual({ phase: 'running', recoverable: false })
+    expect(leased[0]).toMatchObject({
+      teamId: plan.planTeamId, runId: plan.runId, laneId: identity.laneId,
+      memberId: identity.members[0].memberId,
+    })
+    expect(supervisor.starts[0]).toMatchObject({
+      teamId: plan.planTeamId, runId: plan.runId, laneId: identity.laneId,
+      memberId: identity.members[0].memberId,
+    })
+    expect(sessions[0]).toMatchObject({
+      teamId: plan.planTeamId, runId: plan.runId, laneId: identity.laneId,
+      memberId: identity.members[0].memberId,
+    })
+    expect([...attempts.claimed.values()]).toEqual([(leased[0] as { fingerprint: string }).fingerprint])
+  })
+
+  test('trusted roster mismatch fails admission before any claim or effect', async () => {
+    const plan = canonicalInput()
+    const base = canonicalIdentity(plan)
+    for (const changed of [
+      { ...base, members: [{ ...base.members[0], memberId: 'member_invalid' }] },
+      { ...base, members: [{ ...base.members[0], memberOrdinal: 1 }] },
+      { ...base, members: [{ ...base.members[0], name: 'reviewer' }] },
+      { ...base, members: [{ ...base.members[0], model: 'qwen/other' }] },
+      { ...base, members: [{ ...base.members[0], promptSha256: '0'.repeat(64) }] },
+      { ...base, planSha256: 'bad' },
+      { ...base, laneId: `lane_${'0'.repeat(32)}` },
+      { ...base, teamId: `team_${'0'.repeat(32)}` },
+      { ...base, runId: `run_${'0'.repeat(32)}` },
+    ]) {
+      const supervisor = new FakeSupervisor()
+      const attempts = new FakeAttempts()
+      const lane = new HostedContainerOpenCodeLane(supervisor, async () => `lease_${'c'.repeat(32)}`,
+        READY, attempts, undefined, READY_SESSIONS(), async () => changed)
+      await expect(lane.launch(plan)).rejects.toThrow('member admission unavailable')
+      expect(attempts.lanes.size).toBe(0)
+      expect(supervisor.starts).toHaveLength(0)
+    }
+  })
+
+  test('trusted admission rejects competing legacy identity and noncanonical run scope', async () => {
+    const plan = canonicalInput()
+    const identity = canonicalIdentity(plan)
+    const supervisor = new FakeSupervisor()
+    const attempts = new FakeAttempts()
+    const conflicting = new HostedContainerOpenCodeLane(supervisor, async () => `lease_${'c'.repeat(32)}`,
+      READY, attempts, RESOLVE, READY_SESSIONS(), async () => identity)
+    expect(conflicting.supports('launch')).toBe(false)
+    await expect(conflicting.launch(plan)).rejects.toThrow('member admission unavailable')
+    const noncanonical = new HostedContainerOpenCodeLane(supervisor, async () => `lease_${'c'.repeat(32)}`,
+      READY, attempts, undefined, READY_SESSIONS(), async () => identity)
+    await expect(noncanonical.launch({ ...plan, runId: 'run_legacy' })).rejects.toThrow('member admission unavailable')
+    expect(attempts.lanes.size).toBe(0)
+    expect(supervisor.starts).toHaveLength(0)
+  })
+
+  test('changed trusted canonical member on replay cannot bypass durable lane claim', async () => {
+    const plan = canonicalInput()
+    const attempts = new FakeAttempts()
+    const supervisor = new FakeSupervisor()
+    const original = canonicalIdentity(plan)
+    const first = new HostedContainerOpenCodeLane(supervisor, async () => `lease_${'c'.repeat(32)}`,
+      READY, attempts, undefined, SESSIONS(), async () => original)
+    expect(await first.launch(plan)).toEqual({ phase: 'failed', recoverable: true })
+    const substituted = { ...original, members: [{ ...original.members[0], memberId: `member_${'1'.repeat(32)}` }] }
+    const restarted = new HostedContainerOpenCodeLane(supervisor, async () => `lease_${'c'.repeat(32)}`,
+      READY, attempts, undefined, SESSIONS(), async () => substituted)
+    await expect(restarted.launch(plan)).rejects.toThrow('plan changed')
     expect(supervisor.starts).toHaveLength(1)
   })
 

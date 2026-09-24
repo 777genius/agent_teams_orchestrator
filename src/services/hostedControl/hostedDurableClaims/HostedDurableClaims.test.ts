@@ -37,6 +37,29 @@ const deliveryFingerprint = (input: HostedMemberDelivery) => createHash('sha256'
 ])).digest('hex')
 
 describe('durable hosted claims', () => {
+  test('canonical Product IDs durably claim two distinct members and reject mixed legacy scope', async () => {
+    const path = await root()
+    const store = new HostedDurableContainerAttemptClaims(path)
+    const canonical = {
+      ...binding,
+      runId: `run_${'d'.repeat(32)}`, teamId: `team_${'e'.repeat(32)}`,
+      laneId: `lane_${'f'.repeat(32)}`,
+    }
+    const second = { ...canonical, key: hex('4'), fingerprint: hex('5'),
+      operationId: `start_${hex('6')}`, memberId: `member_${'b'.repeat(32)}` }
+    expect(await store.claimLane({ key: hex('7'), fingerprint: hex('8') })).toEqual({
+      created: true, fingerprint: hex('8'),
+    })
+    expect(await store.claim(canonical)).toEqual({ created: true, fingerprint: canonical.fingerprint })
+    expect(await store.claim(second)).toEqual({ created: true, fingerprint: second.fingerprint })
+    const restarted = new HostedDurableContainerAttemptClaims(path)
+    expect(await restarted.read(canonical)).toEqual({ state: 'claimed', fingerprint: canonical.fingerprint })
+    expect(await restarted.read(second)).toEqual({ state: 'claimed', fingerprint: second.fingerprint })
+    expect(await restarted.claim(second)).toEqual({ created: false, fingerprint: second.fingerprint })
+    await expect(restarted.claim({ ...canonical, laneId: binding.laneId }))
+      .rejects.toThrow('Invalid hosted container binding')
+  })
+
   test('concurrent lane claims and process recreation permit one launch only', async () => {
     const path = await root()
     const stores = Array.from({ length: 12 }, () => new HostedDurableContainerAttemptClaims(path))

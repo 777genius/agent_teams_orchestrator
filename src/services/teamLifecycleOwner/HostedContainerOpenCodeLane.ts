@@ -38,6 +38,26 @@ type Container = Readonly<{ fingerprint: string; handle: string; generation: str
 type Members = ReadonlyArray<{ binding: Binding; prompt: string }>
 type PendingLaunch = { fingerprint: string; cancelRequested: boolean; result: Promise<TeamLifecycleLaneObservation> }
 
+/** Trusted Product roster pins for one frozen lane, supplied only by hosted composition. */
+export type HostedCanonicalLaneIdentity = Readonly<{
+  operationId: string
+  planSha256: string
+  teamId: string
+  runId: string
+  laneOrdinal: number
+  laneId: string
+  members: ReadonlyArray<Readonly<{
+    memberOrdinal: number
+    memberId: string
+    name: string
+    model: string
+    promptSha256: string
+  }>>
+}>
+
+export type HostedCanonicalLaneIdentityResolver =
+  (input: RunningInput) => Promise<HostedCanonicalLaneIdentity | null>
+
 export type HostedContainerLaneReadiness = Readonly<{
   endpoint: boolean
   fd3Handoff: boolean
@@ -67,6 +87,11 @@ export interface HostedContainerAttemptClaims {
 const ID = /^[a-z0-9][a-z0-9_-]{7,95}$/
 const HANDLE = /^opencode_[0-9a-f]{32}$/
 const GENERATION = /^[0-9a-f]{32}$/
+const CANONICAL_TEAM = /^team_[0-9a-f]{32}$/
+const CANONICAL_RUN = /^run_[0-9a-f]{32}$/
+const CANONICAL_LANE = /^lane_[0-9a-f]{32}$/
+const CANONICAL_MEMBER = /^member_[0-9a-f]{32}$/
+const SHA256 = /^[0-9a-f]{64}$/
 const FAILED: TeamLifecycleLaneObservation = { phase: 'failed', recoverable: true }
 const IDLE: TeamLifecycleLaneObservation = { phase: 'idle', recoverable: false }
 
@@ -102,18 +127,28 @@ function planFingerprint(input: RunningInput): string {
   })
 }
 
-function binding(input: RunningInput, memberId: string, member: TeamLifecycleLaunchMember): Binding {
+function binding(
+  input: RunningInput,
+  memberId: string,
+  member: TeamLifecycleLaunchMember,
+  canonical?: HostedCanonicalLaneIdentity,
+  memberOrdinal?: number,
+): Binding {
   if (input.lane.kind !== 'opencode') throw new Error('Hosted OpenCode lane requires an OpenCode plan')
   const lane = input.lane
   // The durable claim key cannot change if admission substitutes an ID for the
   // same planned member name. The original fingerprint then rejects the change.
   const key = hash([input.planTeamId, input.runId, lane.laneId, member.name.toLowerCase()])
-  const fingerprint = hash([planFingerprint(input), memberId])
+  const fingerprint = hash(canonical
+    ? [planFingerprint(input), canonical.operationId, canonical.planSha256,
+      canonical.laneOrdinal, canonical.laneId, memberOrdinal, memberId, member.name,
+      member.model ?? lane.selectedModel, createHash('sha256').update(member.prompt).digest('hex')]
+    : [planFingerprint(input), memberId])
   return {
     key, fingerprint, operationId: `start_${hash([fingerprint, memberId])}`,
-    runId: `run_${hash(input.runId)}`,
-    teamId: `team_${hash(input.planTeamId)}`,
-    laneId: `lane_${hash([input.planTeamId, lane.laneId])}`,
+    runId: canonical ? input.runId : `run_${hash(input.runId)}`,
+    teamId: canonical ? input.planTeamId : `team_${hash(input.planTeamId)}`,
+    laneId: canonical ? canonical.laneId : `lane_${hash([input.planTeamId, lane.laneId])}`,
     memberId, memberName: member.name,
     model: member.model ?? lane.selectedModel,
     promptSha256: createHash('sha256').update(member.prompt).digest('hex'),
@@ -142,6 +177,7 @@ export class HostedContainerOpenCodeLane implements TeamLifecycleLaneEffectPort 
     private readonly attempts?: HostedContainerAttemptClaims,
     private readonly resolveMemberId?: (input: RunningInput, memberName: string) => Promise<string | null>,
     private readonly sessions?: HostedMemberSessionBridge,
+    private readonly resolveCanonicalLaneIdentity?: HostedCanonicalLaneIdentityResolver,
   ) {}
 
   supports(action: 'launch' | 'cancel' | 'stop' | 'recover'): boolean {
@@ -150,7 +186,8 @@ export class HostedContainerOpenCodeLane implements TeamLifecycleLaneEffectPort 
   }
 
   #capabilityReady(): boolean {
-    if (!this.attempts || !this.resolveMemberId || !this.sessions) return false
+    if (!this.attempts || (!this.resolveMemberId && !this.resolveCanonicalLaneIdentity) ||
+      (this.resolveMemberId && this.resolveCanonicalLaneIdentity) || !this.sessions) return false
     try {
       const ready = this.readiness()
       return ready.endpoint === true && ready.fd3Handoff === true &&
@@ -346,7 +383,34 @@ export class HostedContainerOpenCodeLane implements TeamLifecycleLaneEffectPort 
   }
 
   async #members(input: RunningInput): Promise<Members | null> {
-    if (input.lane.kind !== 'opencode' || !this.resolveMemberId) return null
+    if (input.lane.kind !== 'opencode') return null
+    if (this.resolveCanonicalLaneIdentity) {
+      if (this.resolveMemberId) return null
+      const canonical = await this.resolveCanonicalLaneIdentity(input)
+      if (!canonical || !CANONICAL_TEAM.test(input.planTeamId) ||
+        !CANONICAL_RUN.test(input.runId) || !CANONICAL_LANE.test(canonical.laneId) ||
+        canonical.teamId !== input.planTeamId || canonical.runId !== input.runId ||
+        canonical.laneId !== input.lane.laneId ||
+        !SHA256.test(canonical.planSha256) || !/^promotion_[0-9a-f]{32}$/.test(canonical.operationId) ||
+        !Number.isSafeInteger(canonical.laneOrdinal) || canonical.laneOrdinal < 0 ||
+        canonical.laneOrdinal >= 32 || !Array.isArray(canonical.members) ||
+        canonical.members.length !== input.lane.members.length ||
+        canonical.members.length === 0 || canonical.members.length > 32) return null
+      const ids = new Set<string>()
+      const members: Array<{ binding: Binding; prompt: string }> = []
+      for (const [ordinal, member] of input.lane.members.entries()) {
+        const pinned = canonical.members[ordinal]
+        const promptSha256 = createHash('sha256').update(member.prompt).digest('hex')
+        if (!pinned || pinned.memberOrdinal !== ordinal || !CANONICAL_MEMBER.test(pinned.memberId) ||
+          ids.has(pinned.memberId) || pinned.name !== member.name ||
+          pinned.model !== (member.model ?? input.lane.selectedModel) ||
+          pinned.promptSha256 !== promptSha256) return null
+        ids.add(pinned.memberId)
+        members.push({ binding: binding(input, pinned.memberId, member, canonical, ordinal), prompt: member.prompt })
+      }
+      return members
+    }
+    if (!this.resolveMemberId) return null
     const members: Array<{ binding: Binding; prompt: string }> = []
     const ids = new Set<string>()
     for (const member of input.lane.members) {
