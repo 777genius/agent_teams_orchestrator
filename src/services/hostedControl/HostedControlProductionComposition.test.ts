@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import type { HostedLifecycleAuthority } from './HostedControlDispatcher.js'
-import { OpenCodeTeamLifecycleLane } from '../teamLifecycleOwner/OpenCodeTeamLifecycleLane.js'
+import type { TeamLifecycleLaneEffectPort } from '../teamLifecycleOwner/OpenCodeTeamLifecycleLane.js'
 import {
   createHostedControlProductionPortFactory,
   createHostedControlProductionPorts,
@@ -84,7 +84,7 @@ describe('createHostedControlProductionPorts', () => {
     await writePlan(teamRoot, 'opencode')
     const ports = await createHostedControlProductionPorts(context(teamRoot))
     expect(ports.approvals).toBeUndefined()
-    expect((await ports.lifecycle.dispatch(controlStateInput())).payload.kind).toBe('control_state')
+    expect((await ports.lifecycle.dispatch(controlStateInput())).payload.kind).toBe('unavailable')
   })
 
   test('does not treat an ambient legacy admission file as activation authority', async () => {
@@ -105,9 +105,9 @@ describe('createHostedControlProductionPorts', () => {
     expect(ports.approvals).toBeUndefined()
 
     const state = await ports.lifecycle.dispatch(controlStateInput())
-    expect(state.payload).toMatchObject({
-      kind: 'control_state',
-      availableActions: ['launch'],
+    expect(state.payload).toMatchObject({ kind: 'unavailable' })
+    expect((await ports.lifecycle.dispatch(launchAuthorizeInput())).payload).toMatchObject({
+      kind: 'unavailable',
     })
 
     const persisted = await ports.messages.dispatch({
@@ -138,13 +138,63 @@ describe('createHostedControlProductionPorts', () => {
     expect(await readdir(teamRoot)).not.toContain(HOSTED_LIFECYCLE_PLAN_FILE)
   })
 
-  test('keeps an admitted OpenCode plan unavailable when its live owner capability is absent', async () => {
-    const teamRoot = await makeTeamRoot('hosted-production-opencode-unavailable-')
+  test('does not dispatch Launch to an injected isolated lane before its own capability is ready', async () => {
+    const teamRoot = await makeTeamRoot('hosted-production-isolated-unready-')
     await writePlan(teamRoot, 'opencode')
-    await writeApprovalAdmission(teamRoot)
-    const createPorts = createHostedControlProductionPortFactory(() => new OpenCodeTeamLifecycleLane())
+    let launches = 0
+    const lane: TeamLifecycleLaneEffectPort = {
+      kind: 'opencode',
+      supports: () => false,
+      inspect: async () => ({ phase: 'idle', recoverable: false }),
+      launch: async () => {
+        launches += 1
+        throw new Error('unready isolated lane must not launch')
+      },
+      cancel: async () => ({ phase: 'idle', recoverable: false }),
+      stop: async () => ({ phase: 'idle', recoverable: false }),
+      recover: async () => ({ phase: 'idle', recoverable: false }),
+    }
+    const createPorts = createHostedControlProductionPortFactory(async received => {
+      expect(received.teamRoot).toBe(teamRoot)
+      expect(received.authority.teamId).toBe(teamId)
+      return lane
+    })
     const ports = await createPorts(context(teamRoot))
     expect((await ports.lifecycle.dispatch(controlStateInput())).payload.kind).toBe('unavailable')
+    expect((await ports.lifecycle.dispatch(launchAuthorizeInput())).payload.kind).toBe('unavailable')
+    expect(launches).toBe(0)
+    expect(await readdir(teamRoot)).not.toContain(HOSTED_LIFECYCLE_EXECUTION_STATE_FILE)
+    await ports.close()
+  })
+
+  test('does not recover or wake the host-local inbox executor for a persisted hosted message', async () => {
+    const teamRoot = await makeTeamRoot('hosted-production-inbox-disabled-')
+    await writePlan(teamRoot, 'opencode')
+    const oldPumpRoot = join(teamRoot, 'hosted-team-lead-inbox-pump')
+    await mkdir(oldPumpRoot, { mode: 0o700 })
+    const oldIntent = join(oldPumpRoot, 'persisted-intent.json')
+    await writeFile(oldIntent, 'previous runtime intent\n', { mode: 0o600 })
+
+    const ports = await createHostedControlProductionPorts(context(teamRoot))
+    expect(ports.onReadinessLease).toBeUndefined()
+    ports.onReadinessLease?.()
+    const authority = { actorId: 'actor-a', ...stableAuthority }
+    const text = 'A durable hosted message.'
+    const persisted = await ports.messages.dispatch({
+      operation: 'message_persist', authority,
+      payload: { schemaVersion: 1, teamId, clientMessageId: 'client_message_inbox-disabled', text },
+    })
+    expect(persisted.kind).toBe('persisted')
+    const receipt = persisted.receipt as { messageId: string }
+    const delivered = await ports.messages.dispatch({
+      operation: 'message_deliver', authority,
+      payload: { teamId, messageId: receipt.messageId,
+        clientMessageId: 'client_message_inbox-disabled', text },
+    })
+    expect(delivered.kind).toBe('delivered')
+    expect(await readdir(oldPumpRoot)).toEqual(['persisted-intent.json'])
+    expect(await readFile(oldIntent, 'utf8')).toBe('previous runtime intent\n')
+    await ports.close()
   })
 
   test('composes one stable fail-closed port and exact activation-v2 session from authenticated context', async () => {
@@ -298,6 +348,27 @@ function controlStateInput() {
       authority: lifecycleAuthority,
     },
     authority: lifecycleAuthority,
+  }
+}
+
+function launchAuthorizeInput() {
+  const query = controlStateInput()
+  return {
+    operation: 'authorize' as const,
+    authority: lifecycleAuthority,
+    payload: {
+      context: { ...query.payload.context,
+        authorizedScope: 'scope_hosted-lifecycle-authorize' },
+      command: {
+        schemaVersion: 1,
+        action: 'launch',
+        commandId: 'lifecycle-command_test-launch',
+        idempotencyKey: 'idempotency_test-launch',
+        workspaceId: stableAuthority.workspaceId,
+        teamId,
+        expectedRevision: `revision_${'a'.repeat(64)}`,
+      },
+    },
   }
 }
 
