@@ -2881,14 +2881,26 @@ async function handleSpawnNativeProcess(
     },
   )
 
+  // Arm while the cross-backend claim still has its spawn:pending identity.
+  // The process reservation below replaces that identity with process:pending,
+  // so arming afterward would always fail. An interrupted launch remains
+  // blocked for explicit recovery once a process may have been created.
+  if (
+    !input.spawnClaimToken ||
+    !await armTeamMemberSpawnClaim(teamName, teammateId, input.spawnClaimToken)
+  ) {
+    throw new Error(`Teammate "${sanitizedName}" lost its durable spawn claim before process launch.`)
+  }
+
   let reservationOwned = false
   const reservationResult = await updateTeamFileAsync(teamName, teamFile => {
     const concurrent = teamFile.members.find(member =>
       member.agentId === teammateId || sanitizeAgentName(member.name) === sanitizedName,
     )
     if (
-      concurrent?.spawnClaimToken &&
-      concurrent.spawnClaimToken !== input.spawnClaimToken
+      concurrent?.spawnClaimToken !== input.spawnClaimToken ||
+      concurrent?.tmuxPaneId !== `spawn:pending:${input.spawnClaimToken}` ||
+      concurrent.spawnClaimRuntimeMayExist !== true
     ) {
       return { changed: false, teamFile }
     }
@@ -3047,13 +3059,6 @@ async function handleSpawnNativeProcess(
       )
     })
 
-    if (
-      !input.spawnClaimToken ||
-      !await armTeamMemberSpawnClaim(teamName, teammateId, input.spawnClaimToken)
-    ) {
-      throw new Error(`Teammate "${sanitizedName}" lost its durable spawn claim before process launch.`)
-    }
-
     const exactSpawn = buildExactProcessTreeSpawn(command, argv, {
       cwd: workingDir,
       env: {
@@ -3075,6 +3080,20 @@ async function handleSpawnNativeProcess(
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
     })
+    await spawnMultiAgentDepsForTests?.beforeNativeProcessLaunch?.({ teamName, agentId: teammateId })
+    let launchOwned = false
+    await updateTeamFileAsync(teamName, teamFile => {
+      const owned = teamFile.members.find(member => member.agentId === teammateId)
+      launchOwned = owned?.spawnClaimToken === input.spawnClaimToken &&
+        owned.processOwnerToken === processOwnerToken &&
+        owned.processRunId === processRunId &&
+        owned.tmuxPaneId === pendingPaneId &&
+        owned.spawnClaimRuntimeMayExist === true
+      return { changed: false, teamFile }
+    })
+    if (!launchOwned) {
+      throw new Error(`Teammate "${sanitizedName}" lost its durable spawn claim before process launch.`)
+    }
     child = spawn(exactSpawn.command, exactSpawn.args, exactSpawn.options)
 
     if (!child.pid) {
@@ -4010,6 +4029,7 @@ type SpawnMultiAgentDepsForTests = {
   isInProcessEnabled?: typeof isInProcessEnabled
   finalizeTeamMemberSpawnClaim?: typeof finalizeTeamMemberSpawnClaim
   beforeHandleSpawn?: (params: { teamName: string; agentId: string; claimToken: string }) => Promise<void>
+  beforeNativeProcessLaunch?: (params: { teamName: string; agentId: string }) => Promise<void>
   createTeammatePaneInSwarmView?: typeof createTeammatePaneInSwarmView
   ensureSession?: typeof ensureSession
   createSeparateWindow?: typeof execFileNoThrow

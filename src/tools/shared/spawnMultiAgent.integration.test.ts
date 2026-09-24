@@ -10,7 +10,14 @@ import {
 import type { ToolUseContext } from '../../Tool.js'
 import type { AppState } from '../../state/AppState.js'
 import { getEmptyToolPermissionContext } from '../../Tool.js'
-import { getTeamDir, writeTeamFileAsync } from '../../utils/swarm/teamHelpers.js'
+import {
+  claimTeamMemberForSpawn,
+  getTeamDir,
+  readTeamFileAsync,
+  type TeamMember,
+  updateTeamFileAsync,
+  writeTeamFileAsync,
+} from '../../utils/swarm/teamHelpers.js'
 
 describe('spawnTeammate partial in-process spawn cleanup', () => {
   const IN_PROCESS_CLEANUP_E2E_TIMEOUT_MS = 60_000
@@ -168,6 +175,126 @@ describe('spawnTeammate partial in-process spawn cleanup', () => {
         tmuxPaneId: expect.stringContaining('spawn:pending:'),
       })
       expect(observedClaim?.spawnClaimRuntimeMayExist).toBeUndefined()
+    } finally {
+      __setSpawnMultiAgentDepsForTests(null)
+    }
+  })
+
+  it('arms an owned claim before replacing it with a native process reservation', async () => {
+    const teamName = 'atlas-hq'
+    const agentId = 'alice@atlas-hq'
+    const claimToken = 'process-claim-a'
+    await mkdir(getTeamDir(teamName), { recursive: true })
+    await writeTeamFileAsync(teamName, {
+      name: teamName, createdAt: 0, leadAgentId: 'team-lead@atlas-hq', members: [],
+    })
+    expect(await claimTeamMemberForSpawn(teamName, {
+      agentId, name: 'alice', joinedAt: Date.now(),
+      tmuxPaneId: `spawn:pending:${claimToken}`,
+      cwd: tempConfigDir, subscriptions: [],
+      spawnClaimToken: claimToken, spawnClaimRunId: 'process-run-a',
+      spawnClaimOwnerPid: process.pid,
+    })).toBe(true)
+
+    const { __handleSpawnNativeProcessForTests, __setSpawnMultiAgentDepsForTests } =
+      await import(new URL(`./spawnMultiAgent.ts?processClaimTest=${Date.now()}`, import.meta.url).href)
+    let reservationAtLaunch: TeamMember | undefined
+    __setSpawnMultiAgentDepsForTests({
+      beforeNativeProcessLaunch: async () => {
+        reservationAtLaunch = (await readTeamFileAsync(teamName))?.members.find(member => member.agentId === agentId)
+        throw new Error('stop before fixture process launch')
+      },
+    })
+    let appState = {
+      tasks: {}, mainLoopModel: null, teamContext: undefined,
+      toolPermissionContext: getEmptyToolPermissionContext(),
+    } as unknown as AppState
+    const context = {
+      getAppState: () => appState,
+      setAppState: (updater: (previous: AppState) => AppState) => {
+        appState = updater(appState)
+      },
+    } as unknown as ToolUseContext
+
+    try {
+      await expect(__handleSpawnNativeProcessForTests({
+        name: 'alice', prompt: 'fixture', team_name: teamName,
+        cwd: tempConfigDir, provider: 'codex',
+        bootstrapRunId: 'process-run-a', spawnClaimToken: claimToken,
+      }, context)).rejects.toThrow('stop before fixture process launch')
+      expect(reservationAtLaunch).toMatchObject({
+        agentId, spawnClaimToken: claimToken,
+        spawnClaimRuntimeMayExist: true,
+        backendType: 'process',
+        tmuxPaneId: expect.stringContaining('process:pending:'),
+        processOwnerToken: expect.any(String),
+      })
+      expect((await readTeamFileAsync(teamName))?.members).toHaveLength(0)
+    } finally {
+      __setSpawnMultiAgentDepsForTests(null)
+    }
+  })
+
+  it('does not launch a native process after another owner replaces its reservation', async () => {
+    const teamName = 'atlas-hq'
+    const agentId = 'alice@atlas-hq'
+    const claimToken = 'process-claim-a'
+    await mkdir(getTeamDir(teamName), { recursive: true })
+    await writeTeamFileAsync(teamName, {
+      name: teamName, createdAt: 0, leadAgentId: 'team-lead@atlas-hq', members: [],
+    })
+    expect(await claimTeamMemberForSpawn(teamName, {
+      agentId, name: 'alice', joinedAt: Date.now(),
+      tmuxPaneId: `spawn:pending:${claimToken}`,
+      cwd: tempConfigDir, subscriptions: [],
+      spawnClaimToken: claimToken, spawnClaimRunId: 'process-run-a',
+      spawnClaimOwnerPid: process.pid,
+    })).toBe(true)
+
+    const { __handleSpawnNativeProcessForTests, __setSpawnMultiAgentDepsForTests } =
+      await import(new URL(`./spawnMultiAgent.ts?processOwnerLossTest=${Date.now()}`, import.meta.url).href)
+    let replacedAtLaunch = false
+    __setSpawnMultiAgentDepsForTests({
+      beforeNativeProcessLaunch: async () => {
+        await updateTeamFileAsync(teamName, teamFile => ({
+          changed: true,
+          teamFile: {
+            ...teamFile,
+            members: teamFile.members.map(member => member.agentId === agentId ? {
+              ...member,
+              tmuxPaneId: 'process:pending:successor-owner',
+              processOwnerToken: 'successor-owner',
+              processRunId: 'successor-run',
+              spawnClaimToken: 'successor-claim',
+            } : member),
+          },
+        }))
+        replacedAtLaunch = true
+      },
+    })
+    let appState = {
+      tasks: {}, mainLoopModel: null, teamContext: undefined,
+      toolPermissionContext: getEmptyToolPermissionContext(),
+    } as unknown as AppState
+    const context = {
+      getAppState: () => appState,
+      setAppState: (updater: (previous: AppState) => AppState) => {
+        appState = updater(appState)
+      },
+    } as unknown as ToolUseContext
+
+    try {
+      await expect(__handleSpawnNativeProcessForTests({
+        name: 'alice', prompt: 'fixture', team_name: teamName,
+        cwd: tempConfigDir, provider: 'codex',
+        bootstrapRunId: 'process-run-a', spawnClaimToken: claimToken,
+      }, context)).rejects.toThrow('lost its durable spawn claim before process launch')
+      expect(replacedAtLaunch).toBe(true)
+      expect((await readTeamFileAsync(teamName))?.members[0]).toMatchObject({
+        agentId, spawnClaimToken: 'successor-claim',
+        processOwnerToken: 'successor-owner',
+        tmuxPaneId: 'process:pending:successor-owner',
+      })
     } finally {
       __setSpawnMultiAgentDepsForTests(null)
     }
