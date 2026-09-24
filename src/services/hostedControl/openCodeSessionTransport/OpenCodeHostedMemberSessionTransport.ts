@@ -19,6 +19,8 @@ export type OpenCodeEndpointProof = Readonly<{
   endpoint: string
   username: string
   password: string
+  expiresAt: number
+  signal: AbortSignal
 }>
 
 /**
@@ -145,25 +147,36 @@ export class OpenCodeHostedMemberSessionTransport implements AuthenticatedHosted
         Number(proof.endpoint.slice(proof.endpoint.lastIndexOf(':') + 1)) > 65535 ||
         typeof proof.username !== 'string' || !/^[A-Za-z0-9_.-]{1,64}$/.test(proof.username) ||
         typeof proof.password !== 'string' || proof.password.length < 32 || proof.password.length > 256 ||
-        /[\x00-\x1f\x7f]/.test(proof.password)) {
+        /[\x00-\x1f\x7f]/.test(proof.password) ||
+        !Number.isSafeInteger(proof.expiresAt) || !(proof.signal instanceof AbortSignal)) {
         throw new Error('hosted-opencode-endpoint-proof-invalid')
       }
-      return work(proof)
+      assertLease(proof)
+      const result = await work(proof)
+      assertLease(proof)
+      return result
     })
   }
 
   private async request(proof: OpenCodeEndpointProof, method: 'GET' | 'POST', path: string,
     body?: object): Promise<unknown> {
-    const signal = AbortSignal.timeout(REQUEST_TIMEOUT_MS)
-    const response = await this.http(`${proof.endpoint}${path}`, {
+    assertLease(proof)
+    const signal = AbortSignal.any([proof.signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)])
+    let response: Response
+    try { response = await this.http(`${proof.endpoint}${path}`, {
       method, signal, redirect: 'error',
       headers: { authorization: `Basic ${Buffer.from(`${proof.username}:${proof.password}`).toString('base64')}`,
         ...(body ? { 'content-type': 'application/json' } : {}) },
       ...(body ? { body: JSON.stringify(body) } : {}),
-    })
+    }) } catch { throw new Error('hosted-opencode-http-failed') }
+    assertLease(proof)
     if (!response.ok) throw new Error('hosted-opencode-http-failed')
     if (response.status === 204) return null
-    return boundedJson(response)
+    try {
+      const value = await boundedJson(response)
+      assertLease(proof)
+      return value
+    } catch { throw new Error('hosted-opencode-response-invalid') }
   }
 
   private async findSession(proof: OpenCodeEndpointProof, title: string): Promise<{ id: string } | null> {
@@ -188,13 +201,20 @@ export class OpenCodeHostedMemberSessionTransport implements AuthenticatedHosted
     messageId: string): Promise<WireMessage | null> {
     // Official endpoint returns 404 for a missing message; unlike writes this
     // read may use a direct scoped lookup without scanning another session.
-    const response = await this.http(`${proof.endpoint}/session/${sessionId}/message/${messageId}`, {
-      method: 'GET', signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS), redirect: 'error',
+    assertLease(proof)
+    let response: Response
+    try { response = await this.http(`${proof.endpoint}/session/${sessionId}/message/${messageId}`, {
+      method: 'GET', signal: AbortSignal.any([proof.signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]), redirect: 'error',
       headers: { authorization: `Basic ${Buffer.from(`${proof.username}:${proof.password}`).toString('base64')}` },
-    })
+    }) } catch { throw new Error('hosted-opencode-message-read-failed') }
+    assertLease(proof)
     if (response.status === 404) return null
     if (!response.ok) throw new Error('hosted-opencode-message-read-failed')
-    return wireMessage(await boundedJson(response))
+    try {
+      const value = wireMessage(await boundedJson(response))
+      assertLease(proof)
+      return value
+    } catch { throw new Error('hosted-opencode-message-read-failed') }
   }
 
   private async sendPrompt(proof: OpenCodeEndpointProof, sessionId: string,
@@ -205,6 +225,12 @@ export class OpenCodeHostedMemberSessionTransport implements AuthenticatedHosted
       messageID: messageId, model: { providerID: model.slice(0, slash), modelID: model.slice(slash + 1) },
       parts: [{ type: 'text', text }],
     })
+  }
+}
+
+function assertLease(proof: OpenCodeEndpointProof): void {
+  if (proof.signal.aborted || Date.now() >= proof.expiresAt) {
+    throw new Error('hosted-opencode-endpoint-lease-expired')
   }
 }
 

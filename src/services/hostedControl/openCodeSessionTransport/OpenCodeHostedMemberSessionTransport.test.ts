@@ -10,6 +10,7 @@ const prompt = 'Inspect the test workspace.'
 const proof: OpenCodeEndpointProof = {
   handle: `opencode_${'a'.repeat(32)}`, generation: 'b'.repeat(32),
   endpoint: 'http://127.0.0.1:49152', username: 'opencode', password: 'p'.repeat(48),
+  expiresAt: Number.MAX_SAFE_INTEGER, signal: new AbortController().signal,
 }
 const attempt = hostedMemberAttempt({
   teamId: 'team_1', runId: 'run_1', laneId: 'lane_1', memberId: `member_${'c'.repeat(32)}`,
@@ -166,5 +167,26 @@ describe('official OpenCode hosted session transport', () => {
     await expect(transport(fake, { ...proof, endpoint: 'http://example.com:49152' }).start(attempt, prompt))
       .rejects.toThrow('endpoint-proof-invalid')
     expect(fake.calls).toHaveLength(0)
+  })
+
+  test('lease revocation between official requests blocks the next write and receipt', async () => {
+    const fake = new FakeOpenCode()
+    const controller = new AbortController()
+    const http = async (input: RequestInfo | URL, init?: RequestInit) => {
+      const response = await fake.fetch(input, init)
+      if (init?.method === 'POST' && new URL(String(input)).pathname === '/session') controller.abort()
+      return response
+    }
+    const authority: OpenCodeEndpointAuthority = {
+      withAttestedEndpoint: async (_handle, _generation, operation) => operation({ ...proof,
+        expiresAt: Date.now() + 30_000, signal: controller.signal }),
+    }
+    const port = new OpenCodeHostedMemberSessionTransport(authority, http as typeof fetch)
+    await expect(port.start(attempt, prompt)).rejects.toThrow('endpoint-lease-expired')
+    expect(fake.sessions).toHaveLength(1)
+    expect(fake.promptPosts).toBe(0)
+    expect(fake.calls).toHaveLength(2)
+    expect(fake.calls[0]?.path.startsWith('/session?search=')).toBe(true)
+    expect(fake.calls[1]?.path).toBe('/session')
   })
 })
