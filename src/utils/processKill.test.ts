@@ -328,13 +328,21 @@ describe('processKill', () => {
   })
 
   it('refuses to signal a process whose start identity does not match', async () => {
-    const startedAtMs = await readProcessStartTimeMs(process.pid)
+    // A cold PowerShell query can exceed the production budget on Windows CI.
+    const queryTimeoutMs = process.platform === 'win32' ? 20_000 : undefined
+    const startedAtMs = await readProcessStartTimeMs(process.pid, process.platform, queryTimeoutMs)
     expect(startedAtMs).not.toBeNull()
+    const signalExpectedProcess = mock(async () => true)
     await expect(killProcessTreeAndWait(process.pid, 'SIGTERM', {
       expectedStartedAtMs: startedAtMs! + 1,
+      dependencies: {
+        readProcessStartTimeMs: pid => readProcessStartTimeMs(pid, process.platform, queryTimeoutMs),
+        signalExpectedProcess,
+      },
     })).resolves.toBe(false)
+    expect(signalExpectedProcess).not.toHaveBeenCalled()
     expect(isProcessAlive(process.pid)).toBe(true)
-  })
+  }, process.platform === 'win32' ? 45_000 : 5_000)
 
   it('does not spawn an identity query for an invalid pid', async () => {
     const spawn = spyOn(childProcess, 'spawn').mockImplementation(() => {

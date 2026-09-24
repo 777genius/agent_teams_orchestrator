@@ -91,7 +91,7 @@ if (require.main === module) {
   const args = process.argv.slice(2);
   const fs = require('node:fs');
   const logPath = require('node:path').join(__dirname, 'fake-opencode-invocations.jsonl');
-  fs.appendFileSync(logPath, JSON.stringify({ pid: process.pid, ppid: process.ppid, execPath: process.execPath, argv: process.argv, cwd: process.cwd() }) + '\n');
+  fs.appendFileSync(logPath, JSON.stringify({ startedAt: new Date().toISOString(), pid: process.pid, ppid: process.ppid, execPath: process.execPath, argv: process.argv, cwd: process.cwd() }) + '\n');
   const write = value => process.stdout.write(value + '\n');
 
   if (args[0] === '--version') {

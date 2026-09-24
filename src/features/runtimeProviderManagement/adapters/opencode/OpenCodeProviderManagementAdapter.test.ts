@@ -554,8 +554,9 @@ describe('OpenCodeProviderManagementAdapter', () => {
     ])
     expect(releasedHosts).toEqual(['host-key', 'host-key', 'host-key'])
     expect(retainedHostLeases).toHaveLength(2)
-    expect(releasedHostLeases).toEqual(retainedHostLeases)
-    expect(new Set(retainedHostLeases.map(({ lease }) => lease.memberName)).size).toBe(2)
+    expect(retainedHostLeases[1]).toEqual(retainedHostLeases[0])
+    expect(releasedHostLeases).toEqual([retainedHostLeases[0]])
+    expect(new Set(retainedHostLeases.map(({ lease }) => lease.memberName)).size).toBe(1)
     expect(
       retainedHostLeases.every(
         ({ hostKey, lease }) =>
@@ -566,22 +567,14 @@ describe('OpenCodeProviderManagementAdapter', () => {
           lease.sessionId === null,
       ),
     ).toBe(true)
-    expect(reconcileCalls).toHaveLength(1)
-    expect(
-      reconcileCalls.every(
-        options =>
-          options.reason === 'provider-management-idle-eviction' &&
-          options.staleAgeMs === 10 * 60_000 &&
-          options.leaseStaleAgeMs === null &&
-          options.preflightLeaseStaleAgeMs === 2 * 60 * 60_000,
-      ),
-    ).toBe(true)
+    expect(reconcileCalls).toHaveLength(0)
   })
 
   test('does not leave a provider-management lease behind when idle eviction fails', async () => {
     const retained: OpenCodeHostLeaseInput[] = []
     const released: OpenCodeHostLeaseInput[] = []
     const releasedHosts: string[] = []
+    const reconcileCalls: OpenCodePersistentHostReconcileOptions[] = []
     const adapter = new OpenCodeProviderManagementAdapter({
       inventoryService: {
         probe: async () => inventory(),
@@ -597,7 +590,8 @@ describe('OpenCodeProviderManagementAdapter', () => {
         releaseHostLease: async (_hostKey, lease) => {
           released.push(lease)
         },
-        reconcilePersistentHosts: async () => {
+        reconcilePersistentHosts: async options => {
+          reconcileCalls.push(options)
           throw new Error('registry temporarily unavailable')
         },
         releaseHost: async hostKey => {
@@ -613,11 +607,26 @@ describe('OpenCodeProviderManagementAdapter', () => {
       },
     })
 
-    const result = await adapter.loadView('opencode')
+    const result = await adapter.loadDirectory({
+      runtimeId: 'opencode',
+      query: null,
+      filter: 'all',
+      limit: 50,
+      cursor: null,
+      refresh: false,
+    })
 
     expect(result.ok).toBe(true)
-    expect(retained).toHaveLength(1)
-    expect(released).toEqual(retained)
+    expect(reconcileCalls).toEqual([{
+      mode: 'stale',
+      reason: 'provider-management-idle-eviction',
+      staleAgeMs: 10 * 60_000,
+      leaseStaleAgeMs: null,
+      preflightLeaseStaleAgeMs: 2 * 60 * 60_000,
+    }])
+    expect(retained).toHaveLength(2)
+    expect(retained[1]).toEqual(retained[0])
+    expect(released).toEqual([retained[0]])
     expect(releasedHosts).toEqual(['host-key'])
   })
 

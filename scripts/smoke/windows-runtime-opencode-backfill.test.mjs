@@ -316,6 +316,25 @@ test('readiness rejects a degraded host even with a successful envelope', () => 
   assert.throws(() => assertReadinessHost({ ...payload, data: {} }));
 });
 
+test('fake provider records a timestamp for each isolated probe', () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'provider-probe-timestamp-'));
+  try {
+    const script = path.join(root, 'fake-opencode.cjs');
+    writeFileSync(script, readFileSync(new URL('./windows-runtime-opencode-fixture.cjs', import.meta.url)));
+    const env = sandboxEnvironment(root, path.join(root, 'opencode.cmd'));
+    const before = Date.now();
+    const result = spawnSync(process.execPath, [script, '--version'],
+      { cwd: root, env, encoding: 'utf8', timeout: 3000 });
+    const after = Date.now();
+    assert.ifError(result.error);
+    assert.equal(result.status, 0, result.stderr);
+    const [probe] = readFileSync(path.join(root, 'fake-opencode-invocations.jsonl'), 'utf8')
+      .trim().split('\n').map(line => JSON.parse(line));
+    assert.ok(Date.parse(probe.startedAt) >= before && Date.parse(probe.startedAt) <= after);
+    assert.equal('env' in probe, false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test('combined evidence runs all provider checks after backfill or provider failure', () => {
   // Exercise the real provider harness with injected process results, including
   // file output. No packaged binary, provider process or Windows simulation claim.
@@ -324,13 +343,15 @@ test('combined evidence runs all provider checks after backfill or provider fail
     const report = {};
     const labels = ['providers-view', 'handshake-file', 'handshake-stdout', 'readiness-stdout'];
     let calls = 0;
+    const timeouts = [];
     runSmokeGroups(report, {
       backfill: group => {
         if (failedGroup === 'backfill') throw new Error('forced backfill failure');
         group.passed = true;
       },
       provider: (group, flush) => runProviderSmoke('/fixture/runtime.exe', group, flush, {
-        spawn: (executable, argv) => {
+        spawn: (executable, argv, options) => {
+          timeouts.push(options.timeout);
           const label = labels[calls++];
           const payload = label === 'providers-view'
             ? { runtimeId: 'opencode', view: { providers: [{ providerId: 'opencode' }] } }
@@ -357,6 +378,7 @@ test('combined evidence runs all provider checks after backfill or provider fail
       }),
     }, () => snapshots.push(structuredClone(report)));
     assert.equal(calls, 4);
+    assert.deepEqual(timeouts, [90_000, 45_000, 45_000, 45_000]);
     assert.equal(report.passed, failedGroup === 'none');
     assert.equal(snapshots.at(-1).passed, report.passed);
     assert.equal(report.groups.provider.cases.length, 4);
@@ -370,6 +392,10 @@ test('combined evidence runs all provider checks after backfill or provider fail
       assert.equal(item.executable, '/fixture/runtime.exe');
       assert.equal(item.argv[0], 'runtime');
       assert.equal(typeof item.stdout, 'string');
+      assert.equal(item.state, 'finished');
+      assert.equal(item.timeoutMs, item.label === 'providers-view' ? 90_000 : 45_000);
+      assert.ok(Date.parse(item.finishedAt) >= Date.parse(item.startedAt));
+      assert.ok(Number.isFinite(item.elapsedMs) && item.elapsedMs >= 0);
       assert.equal('env' in item, false);
       assert.equal(item.passed, item.label !== failedGroup);
       if (item.label === failedGroup) {
@@ -391,6 +417,9 @@ test('spawn timeout records argv and stderr and fails the provider check', () =>
   assert.equal(validated, false);
   assert.equal(item.passed, false);
   assert.equal(item.stderr, 'before timeout');
+  assert.equal(item.timeoutMs, 45_000);
+  assert.equal(item.state, 'finished');
+  assert.ok(Number.isFinite(item.elapsedMs) && item.elapsedMs >= 0);
   assert.deepEqual(item.argv, ['runtime']);
   assert.match(item.error, /ETIMEDOUT/);
 });
