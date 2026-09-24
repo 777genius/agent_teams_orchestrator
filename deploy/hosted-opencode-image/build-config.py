@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Emit one deterministic, credential-free OpenCode config for inert attestation."""
+"""Emit one deterministic, credential-free OpenCode config for an admitted mode."""
 import argparse
 from contextlib import ExitStack
 import hashlib
@@ -10,12 +10,29 @@ import stat
 
 SPEC = {'schemaVersion': 1, 'mode': 'deny-all-inert'}
 CONFIG = {'plugin': [], 'permission': {'*': 'deny'}, 'share': 'disabled'}
+OWNER_PLUGIN_SHA = '805df9de2239792c47bb040961110ae44f9bbbd4afd6bb821dcf497be4357f4c'
+OWNER_PLUGIN_URL = 'file:///usr/local/lib/agentteams/hosted-owner-plugin.mjs'
+OWNER_SPEC = {'schemaVersion': 1, 'mode': 'owner-fd3-tools', 'pluginSha256': OWNER_PLUGIN_SHA}
+OWNER_TOOLS = ('hosted_task_get', 'hosted_task_start', 'hosted_task_complete',
+               'hosted_task_add_comment', 'hosted_message_send')
+OWNER_CONFIG = {'plugin': [OWNER_PLUGIN_URL],
+                'permission': {'*': 'deny', **{name: 'allow' for name in OWNER_TOOLS}},
+                'share': 'disabled'}
 
 
 def render(spec):
-    if type(spec) is not dict or spec != SPEC:
-        raise ValueError('hosted-opencode-inert-config-spec-invalid')
-    return (json.dumps(CONFIG, sort_keys=True, separators=(',', ':'), ensure_ascii=False) + '\n').encode()
+    if type(spec) is not dict:
+        raise ValueError('hosted-opencode-config-spec-invalid')
+    if spec == SPEC:
+        selected = CONFIG
+    elif spec == OWNER_SPEC:
+        lock = json.loads((Path(__file__).resolve().parent / 'artifact-lock.json').read_text())
+        if lock.get('pluginSha256') != OWNER_PLUGIN_SHA or lock.get('status') != 'reviewed':
+            raise ValueError('hosted-opencode-owner-plugin-lock-invalid')
+        selected = OWNER_CONFIG
+    else:
+        raise ValueError('hosted-opencode-config-spec-invalid')
+    return (json.dumps(selected, sort_keys=True, separators=(',', ':'), ensure_ascii=False) + '\n').encode()
 
 
 DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC

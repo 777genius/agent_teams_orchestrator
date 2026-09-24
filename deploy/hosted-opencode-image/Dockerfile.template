@@ -6,10 +6,12 @@ LABEL org.opencontainers.image.source="https://github.com/anomalyco/opencode" \
       org.agentteams.hosted-opencode.base-image-sha256="008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3" \
       org.agentteams.hosted-opencode.archive-sha256="3046e0404fdc60fb80307e7a47824ba07477364178a4d09baa8548496dd6d43b" \
       org.agentteams.hosted-opencode.binary-sha256="513f500a1a5ea1dc7d865547ac87b32a8936334e8d5abd5b3ff585c45a170080" \
-      org.agentteams.hosted-opencode.bootstrap-sha256="@BOOTSTRAP_SHA256@"
+      org.agentteams.hosted-opencode.bootstrap-sha256="@BOOTSTRAP_SHA256@" \
+      org.agentteams.hosted-opencode.plugin-sha256="@PLUGIN_SHA256@"
 
 COPY --chown=0:0 --chmod=0555 opencode /usr/local/bin/opencode
 COPY --chown=0:0 --chmod=0555 hosted-opencode-fd3-bootstrap /usr/local/bin/hosted-opencode-fd3-bootstrap
+COPY --chown=0:0 --chmod=0444 hosted-owner-plugin.mjs /usr/local/lib/agentteams/hosted-owner-plugin.mjs
 
 USER 1000:1000
 WORKDIR /sandbox/workspace

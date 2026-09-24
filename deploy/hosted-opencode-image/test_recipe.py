@@ -1,10 +1,15 @@
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
+import stat
+import subprocess
+import tarfile
 import tempfile
 import unittest
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 
@@ -18,6 +23,7 @@ def module(name, file):
 
 config = module('hosted_inert_config', 'build-config.py')
 image = module('hosted_image_context', 'prepare-context.py')
+plugin = module('hosted_owner_plugin_build', 'build-plugin.py')
 
 
 class ImageAndConfigContractTest(unittest.TestCase):
@@ -35,6 +41,74 @@ class ImageAndConfigContractTest(unittest.TestCase):
             with self.subTest(extra=extra):
                 with self.assertRaisesRegex(ValueError, 'spec-invalid'):
                     config.render({'schemaVersion': 1, 'mode': 'deny-all-inert', **extra})
+
+    def test_owner_config_references_only_locked_plugin_and_five_allowed_tools(self):
+        spec = json.loads((HERE / 'owner-plugin-config-spec.json').read_text())
+        rendered = config.render(spec)
+        parsed = json.loads(rendered)
+        self.assertEqual(parsed['plugin'], [config.OWNER_PLUGIN_URL])
+        self.assertEqual(parsed['share'], 'disabled')
+        self.assertEqual(parsed['permission'], {
+            '*': 'deny', **{name: 'allow' for name in config.OWNER_TOOLS},
+        })
+        self.assertEqual(set(parsed), {'plugin', 'permission', 'share'})
+        self.assertEqual(spec['pluginSha256'], image.approved_lock()['pluginSha256'])
+        self.assertEqual(rendered, config.render(dict(reversed(list(spec.items())))))
+        for extra in ({'provider': {'local': {}}}, {'pluginSha256': '0' * 64},
+                      {'plugin': ['npm:unreviewed']}):
+            with self.subTest(extra=extra), self.assertRaisesRegex(ValueError, 'spec-invalid'):
+                config.render({**spec, **extra})
+
+    def test_plugin_bundle_is_exact_and_loads_only_five_hooks_without_fd3(self):
+        with tempfile.TemporaryDirectory(prefix='hosted-plugin-build-test-') as root:
+            artifact = Path(root, 'hosted-owner-plugin.mjs')
+            receipt = plugin.build(str(artifact))
+            self.assertEqual(receipt['pluginSha256'], image.approved_lock()['pluginSha256'])
+            self.assertEqual(stat.S_IMODE(artifact.stat().st_mode), 0o444)
+            script = '''const { default: plugin } = await import(process.argv[1]);
+const hooks = await plugin();
+console.log(JSON.stringify(Object.keys(hooks.tool).sort()));
+'''
+            result = subprocess.run(['bun', '-e', script, artifact.as_uri()],
+                                    capture_output=True, text=True, check=True)
+            self.assertEqual(json.loads(result.stdout), sorted(config.OWNER_TOOLS))
+
+    def test_image_context_copies_exact_plugin_read_only_and_rejects_tampering(self):
+        with tempfile.TemporaryDirectory(prefix='hosted-plugin-context-test-') as root:
+            root = Path(root)
+            archive = root / 'opencode-linux-x64.tar.gz'
+            binary = b'\x7fELFsynthetic-official-test-binary'
+            with tarfile.open(archive, 'w:gz') as tar:
+                member = tarfile.TarInfo('opencode')
+                member.size = len(binary)
+                tar.addfile(member, io.BytesIO(binary))
+            bootstrap = root / 'bootstrap'
+            bootstrap.write_bytes(b'\x7fELFsynthetic-reviewed-bootstrap')
+            artifact = root / 'hosted-owner-plugin.mjs'
+            plugin.build(str(artifact))
+            lock = image.approved_lock()
+            lock.update({
+                'archiveSha256': hashlib.sha256(archive.read_bytes()).hexdigest(),
+                'binarySha256': hashlib.sha256(binary).hexdigest(),
+                'bootstrapSha256': hashlib.sha256(bootstrap.read_bytes()).hexdigest(),
+            })
+            lock_path = root / 'lock.json'
+            lock_path.write_text(json.dumps(lock))
+            output = root / 'context'
+            with patch.object(image, 'ARCHIVE_SHA', lock['archiveSha256']), \
+                 patch.object(image, 'BINARY_SHA', lock['binarySha256']):
+                receipt = image.prepare(str(archive), str(bootstrap), str(artifact), str(output), lock_path)
+                copied = output / 'hosted-owner-plugin.mjs'
+                self.assertEqual(copied.read_bytes(), artifact.read_bytes())
+                self.assertEqual(stat.S_IMODE(copied.stat().st_mode), 0o444)
+                self.assertEqual(receipt['pluginSha256'], lock['pluginSha256'])
+                self.assertIn(lock['pluginSha256'], (output / 'Dockerfile').read_text())
+                tampered = root / 'tampered.mjs'
+                tampered.write_bytes(artifact.read_bytes() + b'\n')
+                with self.assertRaisesRegex(ValueError, 'plugin-digest-mismatch'):
+                    image.prepare(str(archive), str(bootstrap), str(tampered),
+                                  str(root / 'tampered-context'), lock_path)
+                self.assertFalse((root / 'tampered-context').exists())
 
     def test_config_parent_walk_rejects_mutable_or_symlinked_ancestor(self):
         with tempfile.TemporaryDirectory(prefix='hosted-config-parent-test-') as root:
@@ -88,13 +162,18 @@ class ImageAndConfigContractTest(unittest.TestCase):
             archive.write_bytes(b'not-an-official-archive')
             bootstrap.write_bytes(b'not-a-reviewed-bootstrap')
             with self.assertRaisesRegex(ValueError, 'lock-not-reviewed'):
-                image.prepare(str(archive), str(bootstrap), str(output), lock_path)
+                image.prepare(str(archive), str(bootstrap), str(bootstrap), str(output), lock_path)
             self.assertFalse(output.exists())
 
     def test_image_lock_accepts_only_reviewed_current_bootstrap_digest(self):
         lock = image.approved_lock()
         self.assertEqual(lock['bootstrapSha256'],
                          'af0644070946ef34bef205c1940b02bd76a09ffcef4b5cffb8b072ae04ca32e6')
+        self.assertEqual(lock['pluginSha256'], plugin.EXPECTED_SHA)
+        dockerfile = (HERE / 'Dockerfile.template').read_text()
+        self.assertIn('COPY --chown=0:0 --chmod=0444 hosted-owner-plugin.mjs ' +
+                      '/usr/local/lib/agentteams/hosted-owner-plugin.mjs', dockerfile)
+        self.assertEqual(dockerfile.count('@PLUGIN_SHA256@'), 1)
 
     def test_image_lock_rejects_archive_or_base_drift(self):
         lock = json.loads((HERE / 'artifact-lock.json').read_text())
@@ -103,6 +182,7 @@ class ImageAndConfigContractTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='hosted-image-lock-test-') as root:
             path = Path(root, 'lock.json')
             for field, value in [('archiveSha256', 'b' * 64),
+                                 ('pluginSha256', 'd' * 64),
                                  ('baseImage', 'ubuntu:latest'),
                                  ('sourceCommit', 'c' * 40)]:
                 with self.subTest(field=field):

@@ -3,15 +3,17 @@
 The one selected sandbox model is `local-llama/qwen3-8b`, served by the
 host-local OpenAI-compatible endpoint `127.0.0.1:18993/v1`. This profile is
 **inactive**: no Qwen config artifact is emitted and no model call is allowed
-by this recipe. The inert deny-all config remains the only buildable config.
+by this recipe. The inert and FD3 Owner plugin configs contain no model or
+provider; neither activates the selected Qwen profile.
 
 The later profile must be a separate root-built, canonical, SHA-256-attested
 `opencode.json`, mounted read-only at `/sandbox/config` under the same
-one-file/0555-directory/0444-file contract as the inert config. Its provider
-ID and model ID must be fixed to `local-llama` and `qwen3-8b`; its `baseURL`
+one-file/0555-directory/0444-file contract as the inert and Owner plugin
+configs. Its provider ID and model ID must be fixed to `local-llama` and
+`qwen3-8b`; its `baseURL`
 must be a literal address of a per-lease root-owned gateway on the Docker
-bridge, ending in `/v1`. It must keep `plugin: []`, `share: disabled`, and an
-explicit tool permission policy selected by the Owner effect contract. It
+bridge, ending in `/v1`. It must keep only the locked FD3 Owner plugin,
+`share: disabled`, and the exact five reviewed tool permissions. It
 must contain no user API keys, inherited environment, or public endpoint.
 The existing test-only provider shape uses `npm: '@ai-sdk/openai-compatible'`
 and `tool_call: true`. Official OpenCode v1.18.32 pins that adapter at
