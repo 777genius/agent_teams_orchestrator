@@ -1,5 +1,5 @@
 import { execFile, spawn } from 'node:child_process'
-import { createHash } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { constants } from 'node:fs'
 import { lstat, open, unlink } from 'node:fs/promises'
 import path from 'node:path'
@@ -10,6 +10,7 @@ const SHA = /^[0-9a-f]{64}$/
 const GENERATION = /^[0-9a-f]{32}$/
 const IPV4 = /^(?:\d{1,3}\.){3}\d{1,3}$/
 const LABEL = 'org.agentteams.hosted-opencode.generation'
+const COMMAND_OUTPUT_LIMIT = 1024 * 1024
 
 function object(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('hosted-qwen-inspect-invalid')
@@ -22,47 +23,95 @@ function ipv4(value: unknown): value is string {
 
 function hash(value: string): string { return createHash('sha256').update(value).digest('hex') }
 
+function commandFailureKind(stderr: string): string {
+  if (/permission denied|operation not permitted/i.test(stderr)) return 'permission'
+  if (/device or resource busy|resource temporarily unavailable/i.test(stderr)) return 'busy'
+  if (/operation not supported|not supported/i.test(stderr)) return 'unsupported'
+  if (/file exists/i.test(stderr)) return 'exists'
+  if (/no such file or directory/i.test(stderr)) return 'missing'
+  if (/syntax error|parse error/i.test(stderr)) return 'syntax'
+  if (/invalid argument/i.test(stderr)) return 'invalid-argument'
+  return 'unknown'
+}
+
+/** nft requires a regular input file; Node's default child stdin is a socket. */
+export async function withHostedQwenRegularInput<T>(
+  directory: string, input: string, execute: (fd: number) => Promise<T>,
+): Promise<T> {
+  const filename = path.join(directory, `.nft-input-${randomBytes(16).toString('hex')}`)
+  let created = false
+  try {
+    const writer = await open(filename,
+      constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600)
+    created = true
+    try { await writer.writeFile(input) } finally { await writer.close() }
+    const reader = await open(filename, constants.O_RDONLY | constants.O_NOFOLLOW)
+    try {
+      await unlink(filename)
+      created = false
+      return await execute(reader.fd)
+    } finally { await reader.close() }
+  } finally {
+    if (created) await unlink(filename)
+  }
+}
+
 export interface HostedQwenCommandRunner {
   run(executable: string, args: readonly string[], input?: string): Promise<string>
 }
 
 /** Absolute binaries, bounded output and environment, no shell interpolation. */
 export class HostedQwenSystemCommandRunner implements HostedQwenCommandRunner {
+  constructor(private readonly stateDirectory: string) {}
+
   async run(executable: string, args: readonly string[], input?: string): Promise<string> {
     if (!['/usr/sbin/nft', '/usr/sbin/iptables', '/usr/bin/docker', '/usr/sbin/ip'].includes(executable)) {
       throw new Error('hosted-qwen-executable-invalid')
     }
     if (input === undefined) {
       const result = await execFileAsync(executable, [...args], {
-        timeout: 5000, maxBuffer: 1024 * 1024, windowsHide: true,
+        timeout: 5000, maxBuffer: COMMAND_OUTPUT_LIMIT, windowsHide: true,
         env: { PATH: '/usr/sbin:/usr/bin:/bin', HOME: '/root', DOCKER_HOST: 'unix:///var/run/docker.sock' },
       })
       return result.stdout.trim()
     }
-    return await new Promise<string>((resolve, reject) => {
+    return await withHostedQwenRegularInput(this.stateDirectory, input, fd => new Promise<string>((resolve, reject) => {
+      const operation = executable === '/usr/sbin/nft' && args[0] === '-f' && args[1] === '-' ?
+        'nft-load' : 'input-command'
       const child = spawn(executable, [...args], {
-        stdio: ['pipe', 'pipe', 'pipe'],
+        stdio: [fd, 'pipe', 'pipe'],
         env: { PATH: '/usr/sbin:/usr/bin:/bin', HOME: '/root', DOCKER_HOST: 'unix:///var/run/docker.sock' },
       })
       let stdout = ''
       let stderr = ''
-      const timer = setTimeout(() => child.kill('SIGKILL'), 5000)
-      child.stdout.setEncoding('utf8').on('data', chunk => {
-        stdout += chunk
-        if (stdout.length > 1024 * 1024) child.kill('SIGKILL')
+      let timedOut = false
+      let outputExceeded = false
+      const timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL') }, 5000)
+      child.stdout!.setEncoding('utf8').on('data', chunk => {
+        stdout = (stdout + chunk).slice(0, COMMAND_OUTPUT_LIMIT + 1)
+        if (stdout.length > COMMAND_OUTPUT_LIMIT) { outputExceeded = true; child.kill('SIGKILL') }
       })
-      child.stderr.setEncoding('utf8').on('data', chunk => {
-        stderr += chunk
-        if (stderr.length > 1024 * 1024) child.kill('SIGKILL')
+      child.stderr!.setEncoding('utf8').on('data', chunk => {
+        stderr = (stderr + chunk).slice(0, COMMAND_OUTPUT_LIMIT + 1)
+        if (stderr.length > COMMAND_OUTPUT_LIMIT) { outputExceeded = true; child.kill('SIGKILL') }
       })
-      child.on('error', reject)
-      child.on('close', code => {
+      child.on('error', error => {
+        const code = (error as NodeJS.ErrnoException).code
+        const kind = code === 'ENOENT' ? 'missing' : code === 'EACCES' || code === 'EPERM' ? 'permission' : 'spawn'
+        reject(new Error(`hosted-qwen-command-failed:${operation}:${kind}:spawn`))
+      })
+      child.on('close', (code, signal) => {
         clearTimeout(timer)
-        if (code === 0) resolve(stdout.trim())
-        else reject(new Error('hosted-qwen-command-failed'))
+        if (code === 0 && !timedOut && !outputExceeded) resolve(stdout.trim())
+        else {
+          const stderrKind = commandFailureKind(stderr)
+          const kind = timedOut ? 'timeout' : outputExceeded ? 'output-limit' : stderrKind
+          const status = Number.isInteger(code) && code !== null ? `exit-${code}` :
+            signal === 'SIGKILL' ? 'signal-kill' : 'signal-other'
+          reject(new Error(`hosted-qwen-command-failed:${operation}:${kind}:${status}`))
+        }
       })
-      child.stdin.end(input)
-    })
+    }))
   }
 }
 
@@ -104,7 +153,7 @@ export class HostedQwenNetworkPolicy {
     } else if (process.platform !== 'linux' || process.getuid?.() !== 0 || options.runner) {
       throw new Error('hosted-qwen-policy-root-required')
     }
-    this.runner = options.runner ?? new HostedQwenSystemCommandRunner()
+    this.runner = options.runner ?? new HostedQwenSystemCommandRunner(options.stateDirectory)
     this.table = `hqw_${options.generation}`
     this.claimPath = path.join(options.stateDirectory, `qwen-${options.networkId}.claim`)
   }

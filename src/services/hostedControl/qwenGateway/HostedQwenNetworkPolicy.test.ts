@@ -1,9 +1,11 @@
 import { afterEach, expect, test } from 'bun:test'
+import { fstatSync, readSync } from 'node:fs'
 import { chmod, mkdtemp, readdir, rm } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
-import { HostedQwenNetworkPolicy, type HostedQwenCommandRunner } from './HostedQwenNetworkPolicy.js'
+import { HostedQwenNetworkPolicy, withHostedQwenRegularInput,
+  type HostedQwenCommandRunner } from './HostedQwenNetworkPolicy.js'
 
 const networkId = '8a2f1f6db803d38c68a65ac64b4884198396a1829a9463754bd904934e0fdd71'
 const containerId = 'a'.repeat(64)
@@ -63,6 +65,26 @@ async function setup() {
     stateDirectory: dir, runner, testOnlyAllowNonRoot: true })
   return { dir, runner, policy }
 }
+
+test('nft input is a private regular file and is removed after execution', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'hosted-qwen-input-'))
+  scratch.push(dir)
+  const input = 'table inet qwen_test {}\n'
+  await withHostedQwenRegularInput(dir, input, async fd => {
+    const stat = fstatSync(fd)
+    expect(stat.isFile()).toBe(true)
+    expect(stat.mode & 0o777).toBe(0o600)
+    const content = Buffer.alloc(input.length)
+    expect(readSync(fd, content, 0, content.length, 0)).toBe(input.length)
+    expect(content.toString()).toBe(input)
+    expect(await readdir(dir)).toEqual([])
+  })
+  expect(await readdir(dir)).toEqual([])
+  await expect(withHostedQwenRegularInput(dir, input, async () => {
+    throw new Error('diagnostic-failure')
+  })).rejects.toThrow('diagnostic-failure')
+  expect(await readdir(dir)).toEqual([])
+})
 
 test('deny is installed before one exact container can be admitted; drift fails closed', async () => {
   const { runner, policy } = await setup()
