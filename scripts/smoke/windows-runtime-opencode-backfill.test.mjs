@@ -353,6 +353,10 @@ test('combined evidence runs all provider checks after backfill or provider fail
         spawn: (executable, argv, options) => {
           timeouts.push(options.timeout);
           const label = labels[calls++];
+          if (label === 'readiness-stdout') {
+            const inputPath = argv[argv.indexOf('--input') + 1];
+            assert.equal(JSON.parse(readFileSync(inputPath, 'utf8')).timeoutMs, 45_000);
+          }
           const payload = label === 'providers-view'
             ? { runtimeId: 'opencode', view: { providers: [{ providerId: 'opencode' }] } }
             : label === 'readiness-stdout'
@@ -378,7 +382,7 @@ test('combined evidence runs all provider checks after backfill or provider fail
       }),
     }, () => snapshots.push(structuredClone(report)));
     assert.equal(calls, 4);
-    assert.deepEqual(timeouts, [90_000, 45_000, 45_000, 45_000]);
+    assert.deepEqual(timeouts, [90_000, 45_000, 45_000, 90_000]);
     assert.equal(report.passed, failedGroup === 'none');
     assert.equal(snapshots.at(-1).passed, report.passed);
     assert.equal(report.groups.provider.cases.length, 4);
@@ -393,7 +397,7 @@ test('combined evidence runs all provider checks after backfill or provider fail
       assert.equal(item.argv[0], 'runtime');
       assert.equal(typeof item.stdout, 'string');
       assert.equal(item.state, 'finished');
-      assert.equal(item.timeoutMs, item.label === 'providers-view' ? 90_000 : 45_000);
+      assert.equal(item.timeoutMs, ['providers-view', 'readiness-stdout'].includes(item.label) ? 90_000 : 45_000);
       assert.ok(Date.parse(item.finishedAt) >= Date.parse(item.startedAt));
       assert.ok(Number.isFinite(item.elapsedMs) && item.elapsedMs >= 0);
       assert.equal('env' in item, false);

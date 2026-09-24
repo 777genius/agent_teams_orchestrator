@@ -199,7 +199,9 @@ export function runProviderSmoke(runtimeBinary, report, flush, { spawn = spawnSy
       'utf8',
     );
 
-    check('readiness-stdout', ['runtime', 'opencode-command', '--json', '--input', readinessInputPath], assertReadinessHost);
+    // Host startup on a cold Windows runner can exceed the harness default.
+    check('readiness-stdout', ['runtime', 'opencode-command', '--json', '--input', readinessInputPath],
+      assertReadinessHost, undefined, 90_000);
   } catch (error) { report.error = error.stack || String(error); }
   finally {
     try {
