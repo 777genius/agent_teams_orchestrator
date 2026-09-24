@@ -7,19 +7,24 @@ import type { HostedOpenCodeContainerSupervisor } from './HostedOpenCodeContaine
 
 const VERSION = 1
 const MAX_FRAME = 4096
-const DEADLINE_MS = 5000
+const HANDSHAKE_DEADLINE_MS = 5000
 const NONCE = /^[0-9a-f]{64}$/
 const PROOF = /^[0-9a-f]{64}$/
 const ID = /^[a-z0-9][a-z0-9_-]{7,95}$/
 const GENERATION = /^[0-9a-f]{32}$/
 const DOMAIN = 'agent-teams.hosted-opencode-supervisor/v1'
 
-type Operation = 'start' | 'lookupStart' | 'observe' | 'stop' | 'reconcile'
+type Operation = 'start' | 'lookupStart' | 'observe' | 'stop' | 'reconcile' | 'beginEndpointUse' | 'endEndpointUse'
+const COMMAND_DEADLINE_MS: Readonly<Record<Operation, number>> = {
+  start: 120_000, lookupStart: 15_000, observe: 30_000, stop: 60_000,
+  reconcile: 60_000, beginEndpointUse: 30_000, endEndpointUse: 15_000,
+}
 type Start = Parameters<HostedOpenCodeContainerSupervisor['start']>[0]
 type Handle = Parameters<HostedOpenCodeContainerSupervisor['stop']>[0]
-type Command = Readonly<{ operation: Operation; payload: Start | Handle }>
+type EndpointEnd = Parameters<HostedOpenCodeContainerSupervisor['endEndpointUse']>[0]
+type Command = Readonly<{ operation: Operation; payload: Start | Handle | EndpointEnd }>
 type SupervisorPort = Pick<HostedOpenCodeContainerSupervisor,
-  'start' | 'lookupStart' | 'observe' | 'stop' | 'reconcile'>
+  'start' | 'lookupStart' | 'observe' | 'stop' | 'reconcile' | 'beginEndpointUse' | 'endEndpointUse'>
 
 function exactKeys(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value) &&
@@ -37,14 +42,24 @@ function verify(secret: Uint8Array, direction: 'request' | 'response', unsigned:
 
 function validCommand(operation: unknown, payload: unknown): operation is Operation {
   if (operation === 'start' || operation === 'lookupStart') {
-    return exactKeys(payload, ['operationId', 'leaseId', 'runId', 'teamId', 'laneId', 'memberId']) &&
-      Object.values(payload).every(value => typeof value === 'string' && ID.test(value))
+    const channel = payload && typeof payload === 'object' && 'ownerChannel' in payload
+      ? Reflect.get(payload, 'ownerChannel') : undefined
+    return exactKeys(payload, ['operationId', 'leaseId', 'runId', 'teamId', 'laneId', 'memberId',
+      ...(channel === undefined ? [] : ['ownerChannel'])]) &&
+      ['operationId', 'leaseId', 'runId', 'teamId', 'laneId', 'memberId']
+        .every(key => typeof payload[key] === 'string' && ID.test(payload[key])) &&
+      (channel === undefined || exactKeys(channel, ['socketPath', 'challenge']) &&
+        typeof channel.socketPath === 'string' && path.isAbsolute(channel.socketPath) &&
+        typeof channel.challenge === 'string' && NONCE.test(channel.challenge))
   }
-  if (operation === 'observe' || operation === 'stop' || operation === 'reconcile') {
-    return exactKeys(payload, ['operationId', 'handle', 'generation']) &&
+  if (operation === 'observe' || operation === 'stop' || operation === 'reconcile' ||
+    operation === 'beginEndpointUse' || operation === 'endEndpointUse') {
+    const ending = operation === 'endEndpointUse'
+    return exactKeys(payload, ['operationId', 'handle', 'generation', ...(ending ? ['token'] : [])]) &&
       typeof payload.operationId === 'string' && ID.test(payload.operationId) &&
       typeof payload.handle === 'string' && /^opencode_[0-9a-f]{32}$/.test(payload.handle) &&
-      typeof payload.generation === 'string' && GENERATION.test(payload.generation)
+      typeof payload.generation === 'string' && GENERATION.test(payload.generation) &&
+      (!ending || typeof payload.token === 'string' && GENERATION.test(payload.token))
   }
   return false
 }
@@ -138,10 +153,14 @@ export class HostedOpenCodeSupervisorRpcServer {
     supervisor: SupervisorPort
     /** Inert fixture only. Production is root-owned. */
     testOnlyAllowNonRoot?: boolean
+    testOnlyCommandDeadlineMs?: number
   }) {
     if (options.secret.length !== 32 || !Number.isSafeInteger(options.ownerGid) || options.ownerGid < 0 ||
       options.testOnlyAllowNonRoot && process.env.NODE_ENV !== 'test' ||
-      !options.testOnlyAllowNonRoot && (process.platform !== 'linux' || process.getuid?.() !== 0)) {
+      !options.testOnlyAllowNonRoot && (process.platform !== 'linux' || process.getuid?.() !== 0) ||
+      options.testOnlyCommandDeadlineMs !== undefined &&
+        (!options.testOnlyAllowNonRoot || !Number.isSafeInteger(options.testOnlyCommandDeadlineMs) ||
+          options.testOnlyCommandDeadlineMs < 10 || options.testOnlyCommandDeadlineMs > 5000)) {
       throw new Error('hosted-supervisor-server-policy-invalid')
     }
   }
@@ -198,11 +217,14 @@ export class HostedOpenCodeSupervisorRpcServer {
   }
 
   private async handle(socket: Socket): Promise<void> {
-    socket.setTimeout(DEADLINE_MS, () => socket.destroy())
+    socket.setTimeout(HANDSHAKE_DEADLINE_MS, () => socket.destroy())
     try {
       const challenge = randomBytes(32).toString('hex')
       socket.write(frame({ schemaVersion: VERSION, challenge }))
-      const row = await readFrame(socket)
+      // Bun closes an AF_UNIX peer when the caller half-closes, even with allowHalfOpen.
+      // The length prefix is sufficient; keep the request side open until the reply.
+      const row = await readFrame(socket, false)
+      socket.on('data', () => socket.destroy())
       if (!exactKeys(row, ['schemaVersion', 'challenge', 'operation', 'nonce', 'payload', 'proof']) ||
         row.schemaVersion !== VERSION || typeof row.nonce !== 'string' || !NONCE.test(row.nonce) ||
         row.challenge !== challenge || !validCommand(row.operation, row.payload)) throw new Error('request-invalid')
@@ -211,6 +233,8 @@ export class HostedOpenCodeSupervisorRpcServer {
       if (!verify(this.options.secret, 'request', unsigned, row.proof)) throw new Error('request-unauthenticated')
       // A dropped or uncertain reply never authorizes another Start: supervisor persists its exact operation claim.
       const command = row as unknown as Command & { nonce: string }
+      socket.setTimeout(this.options.testOnlyCommandDeadlineMs ?? COMMAND_DEADLINE_MS[command.operation],
+        () => socket.destroy())
       let result: unknown
       switch (command.operation) {
         case 'start': result = await this.options.supervisor.start(command.payload as Start); break
@@ -218,6 +242,8 @@ export class HostedOpenCodeSupervisorRpcServer {
         case 'observe': result = await this.options.supervisor.observe(command.payload as Handle); break
         case 'stop': result = await this.options.supervisor.stop(command.payload as Handle); break
         case 'reconcile': result = await this.options.supervisor.reconcile(command.payload as Handle); break
+        case 'beginEndpointUse': result = await this.options.supervisor.beginEndpointUse(command.payload as Handle); break
+        case 'endEndpointUse': result = await this.options.supervisor.endEndpointUse(command.payload as EndpointEnd); break
       }
       const response = { schemaVersion: VERSION, challenge, nonce: command.nonce, operation: command.operation,
         ok: true, result }
@@ -228,9 +254,14 @@ export class HostedOpenCodeSupervisorRpcServer {
 
 export class HostedOpenCodeSupervisorRpcClient {
   constructor(private readonly options: { socketPath: string; secret: Uint8Array; ownerGid: number;
-    testOnlyAllowNonRoot?: boolean }) {
+    testOnlyAllowNonRoot?: boolean; testOnlyCommandDeadlineMs?: number;
+    testOnlyAfterConnectPathStat?: typeof lstat }) {
     if (options.secret.length !== 32 || !Number.isSafeInteger(options.ownerGid) || options.ownerGid < 0 ||
-      options.testOnlyAllowNonRoot && process.env.NODE_ENV !== 'test') {
+      options.testOnlyAllowNonRoot && process.env.NODE_ENV !== 'test' ||
+      options.testOnlyCommandDeadlineMs !== undefined &&
+        (!options.testOnlyAllowNonRoot || !Number.isSafeInteger(options.testOnlyCommandDeadlineMs) ||
+          options.testOnlyCommandDeadlineMs < 10 || options.testOnlyCommandDeadlineMs > 5000) ||
+      options.testOnlyAfterConnectPathStat !== undefined && !options.testOnlyAllowNonRoot) {
       throw new Error('hosted-supervisor-client-policy-invalid')
     }
   }
@@ -255,6 +286,14 @@ export class HostedOpenCodeSupervisorRpcClient {
     return this.command({ operation: 'reconcile', payload: request })
   }
 
+  beginEndpointUse(request: Handle): ReturnType<HostedOpenCodeContainerSupervisor['beginEndpointUse']> {
+    return this.command({ operation: 'beginEndpointUse', payload: request })
+  }
+
+  endEndpointUse(request: EndpointEnd): ReturnType<HostedOpenCodeContainerSupervisor['endEndpointUse']> {
+    return this.command({ operation: 'endEndpointUse', payload: request })
+  }
+
   async command<T>(command: Command): Promise<T> {
     if (!validCommand(command.operation, command.payload)) throw new Error('hosted-supervisor-command-invalid')
     const uid = this.options.testOnlyAllowNonRoot ? process.getuid!() : 0
@@ -268,14 +307,20 @@ export class HostedOpenCodeSupervisorRpcClient {
     }
     const nonce = randomBytes(32).toString('hex')
     const socket = connect(this.options.socketPath)
-    socket.setTimeout(DEADLINE_MS, () => socket.destroy())
+    socket.setTimeout(HANDSHAKE_DEADLINE_MS, () => socket.destroy())
+    // Attach before Connect can deliver the server's immediate challenge.
+    const greetingFrame = readFrame(socket, false)
+    // The peer can close while Connect/path identity is still being awaited.
+    // Observe an early rejection immediately; the original promise still rejects when awaited below.
+    void greetingFrame.catch(() => undefined)
+    let submitted = false
     try {
       await new Promise<void>((resolve, reject) => {
         socket.once('connect', resolve); socket.once('error', reject)
       })
-      const current = await lstat(this.options.socketPath)
+      const current = await (this.options.testOnlyAfterConnectPathStat ?? lstat)(this.options.socketPath)
       if (current.dev !== stat.dev || current.ino !== stat.ino) throw new Error('hosted-supervisor-socket-substituted')
-      const greeting = await readFrame(socket, false)
+      const greeting = await greetingFrame
       if (!exactKeys(greeting, ['schemaVersion', 'challenge']) || greeting.schemaVersion !== VERSION ||
         typeof greeting.challenge !== 'string' || !NONCE.test(greeting.challenge)) {
         throw new Error('hosted-supervisor-challenge-invalid')
@@ -283,7 +328,10 @@ export class HostedOpenCodeSupervisorRpcClient {
       const signedRequest = { schemaVersion: VERSION, challenge: greeting.challenge,
         operation: command.operation, nonce, payload: command.payload }
       const response = readFrame(socket)
-      socket.end(frame({ ...signedRequest, proof: proof(this.options.secret, 'request', signedRequest) }))
+      socket.setTimeout(this.options.testOnlyCommandDeadlineMs ?? COMMAND_DEADLINE_MS[command.operation],
+        () => socket.destroy())
+      submitted = true
+      socket.write(frame({ ...signedRequest, proof: proof(this.options.secret, 'request', signedRequest) }))
       const row = await response
       if (!exactKeys(row, ['schemaVersion', 'challenge', 'nonce', 'operation', 'ok', 'result', 'proof']) ||
         row.schemaVersion !== VERSION || row.challenge !== greeting.challenge || row.nonce !== nonce ||
@@ -294,6 +342,9 @@ export class HostedOpenCodeSupervisorRpcClient {
         throw new Error('hosted-supervisor-response-unauthenticated')
       }
       return row.result as T
+    } catch (error) {
+      if (submitted) throw new Error('hosted-supervisor-result-uncertain', { cause: error })
+      throw error
     } finally { socket.destroy() }
   }
 }

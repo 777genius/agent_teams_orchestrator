@@ -1,17 +1,19 @@
 import { execFile } from 'node:child_process'
-import { createHash, randomBytes } from 'node:crypto'
+import { createHash, createHmac, randomBytes } from 'node:crypto'
 import { constants } from 'node:fs'
 import { link, lstat, open, readFile, readdir, readlink, realpath, rename, unlink } from 'node:fs/promises'
 import path from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
 
 import { resolveExecutingOpenCodeArtifactDigest } from '../../opencode/OpenCodeArtifactDigest.js'
+import { HostedOpenCodeFd3Handoff, type HostedFd3HandoffRunner, type PendingOwnerChannel } from './HostedOpenCodeFd3Handoff.js'
 
 const SHA = /^[0-9a-f]{64}$/
 const IMAGE = /^[a-z0-9][a-z0-9._:/-]*@sha256:[0-9a-f]{64}$/
 const ID = /^[a-z0-9][a-z0-9_-]{7,95}$/
 const CONTAINER_ID = /^[0-9a-f]{64}$/
 const OFFICIAL_BINARY_SHA = '513f500a1a5ea1dc7d865547ac87b32a8936334e8d5abd5b3ff585c45a170080'
+const OFFICIAL_BOOTSTRAP_SHA = 'af0644070946ef34bef205c1940b02bd76a09ffcef4b5cffb8b072ae04ca32e6'
 const GENERATION_LABEL = 'org.agentteams.hosted-opencode.generation'
 const BOOTSTRAP_SHA_LABEL = 'org.agentteams.hosted-opencode.bootstrap-sha256'
 const CONTAINER_PORT = '4096/tcp'
@@ -21,6 +23,7 @@ export class HostedContainerNotFound extends Error {}
 
 export interface HostedDockerRunner {
   run(...args: string[]): Promise<string>
+  runWithEnvironment?(environment: Readonly<Record<string, string>>, ...args: string[]): Promise<string>
 }
 
 /** This process must be isolated from Owner. It alone may access Docker. */
@@ -30,12 +33,24 @@ export class HostedDockerCliRunner implements HostedDockerRunner {
   }
 
   async run(...args: string[]): Promise<string> {
+    return this.execute({}, args)
+  }
+
+  async runWithEnvironment(environment: Readonly<Record<string, string>>, ...args: string[]): Promise<string> {
+    if (Object.keys(environment).sort().join(',') !== 'OPENCODE_SERVER_PASSWORD' ||
+      !/^[0-9a-f]{64}$/.test(environment.OPENCODE_SERVER_PASSWORD)) {
+      throw new Error('hosted-container-docker-environment-invalid')
+    }
+    return this.execute(environment, args)
+  }
+
+  private async execute(environment: Readonly<Record<string, string>>, args: string[]): Promise<string> {
     return new Promise((resolve, reject) => {
       execFile(this.executable, args, {
         timeout: 30_000,
         maxBuffer: 1024 * 1024,
         windowsHide: true,
-        env: { PATH: '/usr/bin:/bin', HOME: '/root', DOCKER_HOST: 'unix:///var/run/docker.sock' },
+        env: { PATH: '/usr/bin:/bin', HOME: '/root', DOCKER_HOST: 'unix:///var/run/docker.sock', ...environment },
       }, (error, stdout, stderr) => {
         if (!error) return resolve(stdout.trim())
         if (args[0] === 'inspect' && /no such (?:object|container):/i.test(String(stderr).slice(-300))) {
@@ -73,8 +88,11 @@ type ContainerRecord = {
   createIssued: boolean
   stopped: boolean
 }
-type StartResult = { handle: string; generation: string; status: 'started' | 'unresolved'; effectEnabled: false }
-type StartRequest = { operationId: string; leaseId: string; runId: string; teamId: string; laneId: string; memberId: string }
+type StartResult = { handle: string; generation: string; status: 'started' | 'unresolved'; effectEnabled: boolean;
+}
+type StartRequest = { operationId: string; leaseId: string; runId: string; teamId: string; laneId: string; memberId: string;
+  ownerChannel?: PendingOwnerChannel }
+type ProcessEvidence = { pid: number; startTicks: string; pidNamespace: string; netns: string }
 
 export interface HostedOpenCodeContainerSupervisorOptions {
   readonly image: string
@@ -88,7 +106,16 @@ export interface HostedOpenCodeContainerSupervisorOptions {
   readonly seccompPath: string
   readonly seccompSha256: string
   readonly apparmorProfile: string
+  readonly handoffHelperPath?: string
+  readonly handoffHelperSha256?: string
+  readonly handoffPythonSha256?: string
+  readonly ownerSocketDirectory?: string
+  readonly ownerUid?: number
+  readonly serverPasswordKey?: Uint8Array
   readonly docker?: HostedDockerRunner
+  /** Inert fixtures only; production cannot inject either trust gate. */
+  readonly testOnlyHandoff?: HostedFd3HandoffRunner
+  readonly testOnlyProcessEvidence?: (pid: number, phase: 'bootstrap' | 'official') => Promise<ProcessEvidence>
   /** Test-only injection. Production always requires root and the real Docker runner. */
   readonly testOnlyAllowNonRoot?: boolean
 }
@@ -132,11 +159,23 @@ export class HostedOpenCodeContainerSupervisor {
   private readonly pendingStarts = new Map<string, { request: string; result: Promise<StartResult> }>()
   private readonly busy = new Set<string>()
   private readonly docker: HostedDockerRunner
+  private readonly handoff: HostedFd3HandoffRunner | null
+  private readonly active = new Map<string, ProcessEvidence>()
+  private readonly endpointUses = new Map<string, { token: string; generation: string;
+    timer: ReturnType<typeof setTimeout> }>()
+  private readonly pendingStop = new Set<string>()
   private seccomp!: unknown
   private imageId!: string
 
   private constructor(private readonly options: HostedOpenCodeContainerSupervisorOptions) {
     this.docker = options.docker ?? new HostedDockerCliRunner()
+    this.handoff = options.testOnlyHandoff ?? (options.handoffHelperPath && options.handoffHelperSha256 &&
+      options.handoffPythonSha256 &&
+      options.ownerSocketDirectory && options.ownerUid !== undefined
+      ? new HostedOpenCodeFd3Handoff({ helperPath: options.handoffHelperPath,
+        helperSha256: options.handoffHelperSha256, pythonSha256: options.handoffPythonSha256,
+        ownerSocketDirectory: options.ownerSocketDirectory,
+        ownerUid: options.ownerUid }) : null)
   }
 
   static async create(options: HostedOpenCodeContainerSupervisorOptions): Promise<HostedOpenCodeContainerSupervisor> {
@@ -146,12 +185,24 @@ export class HostedOpenCodeContainerSupervisor {
     if (options.testOnlyAllowNonRoot && (!options.docker || process.env.NODE_ENV !== 'test')) {
       throw new Error('hosted-container-test-runner-required')
     }
+    if (!options.testOnlyAllowNonRoot && (options.testOnlyHandoff || options.testOnlyProcessEvidence)) {
+      throw new Error('hosted-container-test-injection-forbidden')
+    }
+    if (!options.testOnlyAllowNonRoot && (!options.serverPasswordKey || options.serverPasswordKey.length !== 32 ||
+      !options.handoffHelperPath || !options.handoffHelperSha256 ||
+      !options.handoffPythonSha256 ||
+      !options.ownerSocketDirectory || options.ownerUid === undefined)) {
+      throw new Error('hosted-container-handoff-policy-required')
+    }
     if (!options.testOnlyAllowNonRoot && (process.getuid?.() !== 0 || options.docker)) {
       throw new Error('hosted-container-root-supervisor-required')
     }
     if (!IMAGE.test(options.image) || !SHA.test(options.bootstrapSha256) || !CONTAINER_ID.test(options.networkId) ||
       !SHA.test(options.seccompSha256) || !/^[A-Za-z0-9_.-]{1,80}$/.test(options.apparmorProfile)) {
       throw new Error('hosted-container-policy-invalid')
+    }
+    if (!options.testOnlyAllowNonRoot && options.bootstrapSha256 !== OFFICIAL_BOOTSTRAP_SHA) {
+      throw new Error('hosted-container-bootstrap-version-invalid')
     }
     const supervisor = new HostedOpenCodeContainerSupervisor(options)
     await supervisor.initialize()
@@ -199,6 +250,7 @@ export class HostedOpenCodeContainerSupervisor {
       throw new Error('hosted-container-image-unverified')
     }
     this.imageId = image.Id
+    if (this.handoff instanceof HostedOpenCodeFd3Handoff) await this.handoff.verify()
     await this.networkContainers()
   }
 
@@ -221,8 +273,18 @@ export class HostedOpenCodeContainerSupervisor {
   private async assertNetworkOwned(record: ContainerRecord): Promise<void> {
     const containers = await this.networkContainers()
     const ids = Object.keys(containers)
-    if (ids.length > 1 || ids.length === 1 && (ids[0] !== record.containerId ||
-      object(containers[ids[0]]).Name !== record.handle)) {
+    if (ids.length !== 1 || ids[0] !== record.containerId ||
+      object(containers[ids[0]]).Name !== record.handle) {
+      throw new Error('hosted-container-network-foreign-occupant')
+    }
+  }
+
+  /** Docker may omit a created or stopped container from network inspect's live endpoint map. */
+  private async assertNetworkPrepared(record: ContainerRecord): Promise<void> {
+    const containers = await this.networkContainers()
+    const ids = Object.keys(containers)
+    if (ids.length > 1 || ids.length === 1 &&
+      (ids[0] !== record.containerId || object(containers[ids[0]]).Name !== record.handle)) {
       throw new Error('hosted-container-network-foreign-occupant')
     }
   }
@@ -267,6 +329,12 @@ export class HostedOpenCodeContainerSupervisor {
       digest(await readFile(this.options.seccompPath)) !== this.options.seccompSha256) {
       throw new Error('hosted-container-seccomp-substituted')
     }
+  }
+
+  private serverPassword(generation: string): string {
+    const key = this.options.serverPasswordKey
+    if (!key || key.length !== 32) throw new Error('hosted-container-server-password-key-required')
+    return createHmac('sha256', key).update(`agent-teams.hosted-opencode-server/v1\0${generation}`).digest('hex')
   }
 
   private async checkedDirectory(value: string, parent: string, owner: number, mode = 0o700): Promise<FileIdentity> {
@@ -431,7 +499,8 @@ export class HostedOpenCodeContainerSupervisor {
       }
       const row = object(JSON.parse(await file.readFile('utf8')))
       if (!exactKeys(row, ['request', 'record']) ||
-        !exactKeys(row.request, ['operationId', 'leaseId', 'runId', 'teamId', 'laneId', 'memberId']) ||
+        !exactKeys(row.request, ['operationId', 'leaseId', 'runId', 'teamId', 'laneId', 'memberId',
+          ...(request.ownerChannel ? ['ownerChannel'] : [])]) ||
         !exactKeys(row.record, ['handle', 'generation', 'operationId', 'creator', 'lease', 'containerId', 'createIssued', 'stopped'])) {
         throw new Error('hosted-container-start-claim-invalid')
       }
@@ -476,10 +545,13 @@ export class HostedOpenCodeContainerSupervisor {
 
   /** Recovery is conservative: a claimed Start never authorizes a second create or effects. */
   async lookupStart(request: StartRequest): Promise<StartResult | null> {
-    if (!exactKeys(request, ['operationId', 'leaseId', 'runId', 'teamId', 'laneId', 'memberId'])) {
+    if (!exactKeys(request, ['operationId', 'leaseId', 'runId', 'teamId', 'laneId', 'memberId',
+      ...(request.ownerChannel ? ['ownerChannel'] : [])])) {
       throw new Error('hosted-container-start-request-invalid')
     }
-    for (const id of Object.values(request)) boundedId(id)
+    for (const id of [request.operationId, request.leaseId, request.runId, request.teamId, request.laneId,
+      request.memberId]) boundedId(id)
+    this.validateOwnerChannel(request.ownerChannel)
     return this.startClaim(request)
   }
 
@@ -618,6 +690,7 @@ export class HostedOpenCodeContainerSupervisor {
       ['OPENCODE_CONFIG_DIR', '/sandbox/config'],
       ['OPENCODE_DISABLE_PROJECT_CONFIG', '1'],
       ['OPENCODE_DISABLE_CLAUDE_CODE', '1'],
+      ['OPENCODE_SERVER_PASSWORD', this.serverPassword(record.generation)],
     ])
     const allowedEnv = new Set([...requiredEnv.keys(), 'PATH', 'LANG', 'TZ'])
     const actualEnv = Array.isArray(config.Env) ? config.Env : []
@@ -691,47 +764,54 @@ export class HostedOpenCodeContainerSupervisor {
     return startTicks !== record.creator.startTicks
   }
 
-  private async processEvidence(inspected: Record<string, unknown>): Promise<{ pid: number; startTicks: string; pidNamespace: string }> {
+  private async processEvidence(inspected: Record<string, unknown>, phase: 'bootstrap' | 'official'): Promise<ProcessEvidence> {
     const state = object(inspected.State)
     const pid = state.Pid
-    if (state.Running !== true || !Number.isSafeInteger(pid) || Number(pid) < 1 ||
-      resolveExecutingOpenCodeArtifactDigest(Number(pid)) !== `sha256:${OFFICIAL_BINARY_SHA}`) {
+    if (state.Running !== true || !Number.isSafeInteger(pid) || Number(pid) < 1) {
+      throw new Error('hosted-container-executable-unverified')
+    }
+    if (this.options.testOnlyProcessEvidence) return this.options.testOnlyProcessEvidence(Number(pid), phase)
+    const expected = `sha256:${phase === 'bootstrap' ? this.options.bootstrapSha256 : OFFICIAL_BINARY_SHA}`
+    if (resolveExecutingOpenCodeArtifactDigest(Number(pid)) !== expected) {
       throw new Error('hosted-container-executable-unverified')
     }
     const stat = await readFile(`/proc/${pid}/stat`, 'utf8')
     const fields = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/)
     const startTicks = fields[19]
     const pidNamespace = await readlink(`/proc/${pid}/ns/pid`)
+    const netns = await readlink(`/proc/${pid}/ns/net`)
     const mountInfo = await readFile(`/proc/${pid}/mountinfo`, 'utf8')
     const systemConfigMount = mountInfo.split('\n').find(line => line.split(' ')[4] === '/etc/opencode')
     const mountParts = systemConfigMount?.split(' - ')
     const mountOptions = systemConfigMount?.split(' ')[5]?.split(',') ?? []
     const secondStat = await readFile(`/proc/${pid}/stat`, 'utf8')
     const secondStartTicks = secondStat.slice(secondStat.lastIndexOf(')') + 2).trim().split(/\s+/)[19]
-    if (!/^\d+$/.test(startTicks) || !/^pid:\[\d+\]$/.test(pidNamespace)) {
+    if (!/^\d+$/.test(startTicks) || !/^pid:\[\d+\]$/.test(pidNamespace) ||
+      !/^net:\[[1-9]\d*\]$/.test(netns)) {
       throw new Error('hosted-container-process-identity-invalid')
     }
     if (secondStartTicks !== startTicks ||
-      resolveExecutingOpenCodeArtifactDigest(Number(pid)) !== `sha256:${OFFICIAL_BINARY_SHA}` ||
+      resolveExecutingOpenCodeArtifactDigest(Number(pid)) !== expected ||
       mountParts?.[1]?.split(' ')[0] !== 'tmpfs' ||
       !['ro', 'nosuid', 'nodev', 'noexec'].every(option => mountOptions.includes(option))) {
       throw new Error('hosted-container-process-policy-unverified')
     }
-    return { pid: Number(pid), startTicks, pidNamespace }
+    return { pid: Number(pid), startTicks, pidNamespace, netns }
   }
 
   /**
-   * Inactive staging seam. Release order: create/inspect, start/bootstrap attestation,
-   * trusted FD3 handoff, post-exec official digest, then ready. No handoff exists here,
-   * so this class never enables Owner effects or claims a usable runtime.
+   * Exact one-shot order: create, bootstrap proof, pending Owner handshake,
+   * durable handoff claim, FD3 transfer, independent official proof. A lost result never replays.
    */
   async start(request: StartRequest): Promise<StartResult> {
-    if (!exactKeys(request, ['operationId', 'leaseId', 'runId', 'teamId', 'laneId', 'memberId'])) {
+    if (!exactKeys(request, ['operationId', 'leaseId', 'runId', 'teamId', 'laneId', 'memberId',
+      ...(request.ownerChannel ? ['ownerChannel'] : [])])) {
       throw new Error('hosted-container-start-request-invalid')
     }
     boundedId(request.operationId)
     boundedId(request.leaseId)
     for (const id of [request.runId, request.teamId, request.laneId, request.memberId]) boundedId(id)
+    this.validateOwnerChannel(request.ownerChannel)
     const requestKey = JSON.stringify(request)
     const previous = this.operations.get(request.operationId)
     if (previous) {
@@ -758,6 +838,15 @@ export class HostedOpenCodeContainerSupervisor {
     return this.startReserved(request, requestKey)
   }
 
+  private validateOwnerChannel(channel: PendingOwnerChannel | undefined): void {
+    if (channel === undefined) return
+    if (!exactKeys(channel, ['socketPath', 'challenge']) ||
+      typeof channel.socketPath !== 'string' || !path.isAbsolute(channel.socketPath) ||
+      typeof channel.challenge !== 'string' || !SHA.test(channel.challenge)) {
+      throw new Error('hosted-container-owner-channel-invalid')
+    }
+  }
+
   private async startReserved(request: StartRequest, requestKey: string): Promise<StartResult> {
     const lease = await this.checkedLease(request.leaseId, true)
     if (lease.runId !== request.runId || lease.teamId !== request.teamId || lease.laneId !== request.laneId ||
@@ -781,8 +870,8 @@ export class HostedOpenCodeContainerSupervisor {
     this.busy.add(record.handle)
     try { await this.persist(record) }
     catch (error) { this.busy.delete(record.handle); throw error }
-    const result = (status: 'started' | 'unresolved') => ({ handle: record.handle,
-      generation: record.generation, status, effectEnabled: false as const })
+    const result = (status: 'started' | 'unresolved', effectEnabled = false): StartResult => ({ handle: record.handle,
+      generation: record.generation, status, effectEnabled })
     try {
       await this.checkedLeaseIdentityWithoutFreshness(lease)
       await this.assertSeccompUnchanged()
@@ -793,7 +882,9 @@ export class HostedOpenCodeContainerSupervisor {
         { handle: record.handle, generation: record.generation })
       record.createIssued = true
       await this.persist(record)
-      const created = await this.docker.run('create', '--name', record.handle, '--label', `${GENERATION_LABEL}=${record.generation}`,
+      if (!this.docker.runWithEnvironment) throw new Error('hosted-container-secret-docker-runner-required')
+      const created = await this.docker.runWithEnvironment({ OPENCODE_SERVER_PASSWORD: this.serverPassword(record.generation) },
+        'create', '--name', record.handle, '--label', `${GENERATION_LABEL}=${record.generation}`,
         '--user', '1000:1000', '--read-only', '--network', this.options.networkId,
         '--ipc', 'private', '--cap-drop', 'ALL',
         '--security-opt', 'no-new-privileges:true', '--security-opt', `seccomp=${this.options.seccompPath}`,
@@ -808,28 +899,56 @@ export class HostedOpenCodeContainerSupervisor {
         '--env', 'XDG_STATE_HOME=/sandbox/profile/state',
         '--env', 'TMPDIR=/sandbox/profile/tmp',
         '--env', 'OPENCODE_CONFIG_DIR=/sandbox/config', '--env', 'OPENCODE_DISABLE_PROJECT_CONFIG=1',
-        '--env', 'OPENCODE_DISABLE_CLAUDE_CODE=1', '--entrypoint', BOOTSTRAP_PATH,
+        '--env', 'OPENCODE_DISABLE_CLAUDE_CODE=1', '--env', 'OPENCODE_SERVER_PASSWORD', '--entrypoint', BOOTSTRAP_PATH,
         this.options.image, '--socket-name', `fd3-${record.generation}`, '--sender-uid', '0')
       if (!CONTAINER_ID.test(created)) throw new Error('hosted-container-create-id-invalid')
       record.containerId = created
       await this.persist(record)
       this.assertEffective(await this.inspect(record), record)
-      await this.assertNetworkOwned(record)
+      await this.assertNetworkPrepared(record)
       await this.checkedLeaseIdentityWithoutFreshness(lease)
       await this.docker.run('start', created)
       const inspected = await this.inspect(record)
       this.assertEffective(inspected, record)
       await this.assertNetworkOwned(record)
       this.endpoint(inspected)
-      await this.processEvidence(inspected)
-      const started = result('started')
+      if (!request.ownerChannel || !this.handoff || !record.containerId) {
+        throw new Error('hosted-container-pending-owner-channel-required')
+      }
+      const bootstrap = await this.processEvidence(inspected, 'bootstrap')
+      await this.durableClaim(`handoff-${request.operationId}.json`, {
+        handle: record.handle, generation: record.generation, containerId: record.containerId,
+        pid: bootstrap.pid, startTicks: bootstrap.startTicks,
+      })
+      await this.handoff.run({ operationId: request.operationId, containerId: record.containerId,
+        handle: record.handle, generation: record.generation, networkId: this.options.networkId,
+        pid: bootstrap.pid, startTicks: bootstrap.startTicks, netns: bootstrap.netns,
+        ownerChannel: request.ownerChannel })
+      await this.durableClaim(`handoff-result-${request.operationId}.json`, {
+        handle: record.handle, generation: record.generation, status: 'helper-verified',
+      })
+      const post = await this.inspect(record)
+      this.assertEffective(post, record)
+      await this.assertNetworkOwned(record)
+      await this.checkedLeaseIdentityWithoutFreshness(lease)
+      this.endpoint(post)
+      const official = await this.processEvidence(post, 'official')
+      if (!isDeepStrictEqual(official, bootstrap)) throw new Error('hosted-container-generation-changed-after-handoff')
+      if (this.pendingStop.has(record.handle)) throw new Error('hosted-container-stop-requested-during-start')
+      this.active.set(record.handle, official)
+      const started = result('started', true)
       this.operations.set(request.operationId, { request: requestKey, result: started })
       return started
     } catch {
       const unresolved = result('unresolved')
       this.operations.set(request.operationId, { request: requestKey, result: unresolved })
+      this.active.delete(record.handle)
+      if (request.ownerChannel) this.pendingStop.add(record.handle)
       return unresolved
-    } finally { this.busy.delete(record.handle) }
+    } finally {
+      this.busy.delete(record.handle)
+      await this.drainPendingStop(record)
+    }
   }
 
   private async checkedLeaseIdentityWithoutFreshness(lease: Lease): Promise<void> {
@@ -850,23 +969,89 @@ export class HostedOpenCodeContainerSupervisor {
   }
 
   async observe(request: { operationId: string; handle: string; generation: string }): Promise<{
-    status: 'running' | 'stopped'; handle: string; generation: string; effectEnabled: false;
-    endpoint?: string; process?: { pid: number; startTicks: string; pidNamespace: string }
+    status: 'running' | 'stopped'; handle: string; generation: string; effectEnabled: boolean;
+    endpoint?: string; process?: ProcessEvidence
   }> {
     boundedId(request.operationId)
     const record = await this.load(request.handle, request.generation)
     const inspected = await this.inspect(record)
     await this.assertNetworkClaim(record)
-    await this.assertNetworkOwned(record)
     this.assertEffective(inspected, record)
     const state = object(inspected.State)
     if (state.Running !== true) {
       if (state.Running !== false || state.Pid !== 0) throw new Error('hosted-container-state-invalid')
+      await this.assertNetworkPrepared(record)
       return { status: 'stopped', handle: record.handle, generation: record.generation, effectEnabled: false }
     }
+    await this.assertNetworkOwned(record)
     await this.checkedLeaseIdentityWithoutFreshness(record.lease)
+    const process = await this.processEvidence(inspected, 'official')
+    const enabled = isDeepStrictEqual(this.active.get(record.handle), process)
     return { status: 'running', handle: record.handle, generation: record.generation,
-      endpoint: this.endpoint(inspected), process: await this.processEvidence(inspected), effectEnabled: false }
+      endpoint: this.endpoint(inspected), process, effectEnabled: enabled }
+  }
+
+  /** A bounded exclusive use keeps Stop from reassigning the published port during one HTTP operation. */
+  async beginEndpointUse(request: { operationId: string; handle: string; generation: string }): Promise<{
+    token: string; handle: string; generation: string; endpoint: string;
+    username: 'opencode'; password: string; expiresAt: number
+  }> {
+    boundedId(request.operationId)
+    const record = await this.load(request.handle, request.generation)
+    if (this.busy.has(record.handle) || this.endpointUses.has(record.handle) ||
+      this.pendingStop.has(record.handle) || !this.active.has(record.handle)) {
+      throw new Error('hosted-container-endpoint-unavailable')
+    }
+    this.busy.add(record.handle)
+    try {
+      const observed = await this.observe(request)
+      if (observed.status !== 'running' || !observed.effectEnabled || !observed.endpoint ||
+        this.pendingStop.has(record.handle)) throw new Error('hosted-container-endpoint-unverified')
+      const token = hexName()
+      const expiresAt = Date.now() + 30_000
+      const timer = setTimeout(() => { void this.expireEndpointUse(record) }, 30_000)
+      this.endpointUses.set(record.handle, { token, generation: record.generation, timer })
+      return { token, handle: record.handle, generation: record.generation,
+        endpoint: observed.endpoint, username: 'opencode',
+        password: this.serverPassword(record.generation), expiresAt }
+    } catch (error) {
+      this.busy.delete(record.handle)
+      await this.drainPendingStop(record)
+      throw error
+    }
+  }
+
+  async endEndpointUse(request: { operationId: string; handle: string; generation: string; token: string }): Promise<{
+    released: boolean
+  }> {
+    boundedId(request.operationId)
+    const record = await this.load(request.handle, request.generation)
+    const use = this.endpointUses.get(record.handle)
+    if (!use || use.generation !== record.generation || use.token !== request.token) {
+      return { released: false }
+    }
+    clearTimeout(use.timer)
+    this.endpointUses.delete(record.handle)
+    this.busy.delete(record.handle)
+    await this.drainPendingStop(record)
+    return { released: true }
+  }
+
+  private async expireEndpointUse(record: ContainerRecord): Promise<void> {
+    const use = this.endpointUses.get(record.handle)
+    if (!use || use.generation !== record.generation) return
+    this.active.delete(record.handle)
+    this.pendingStop.add(record.handle)
+    this.endpointUses.delete(record.handle)
+    this.busy.delete(record.handle)
+    await this.drainPendingStop(record)
+  }
+
+  private async drainPendingStop(record: ContainerRecord): Promise<void> {
+    if (!this.pendingStop.has(record.handle) || this.busy.has(record.handle) ||
+      this.endpointUses.has(record.handle)) return
+    await this.stop({ operationId: `deferred_${hexName()}`, handle: record.handle,
+      generation: record.generation }).catch(() => undefined)
   }
 
   async stop(request: { operationId: string; handle: string; generation: string }): Promise<{
@@ -874,7 +1059,11 @@ export class HostedOpenCodeContainerSupervisor {
   }> {
     boundedId(request.operationId)
     const record = await this.load(request.handle, request.generation)
-    if (this.busy.has(record.handle)) throw new Error('hosted-container-operation-busy')
+    this.active.delete(record.handle)
+    if (this.busy.has(record.handle)) {
+      this.pendingStop.add(record.handle)
+      return { handle: record.handle, generation: record.generation, stopped: false, unresolved: true }
+    }
     this.busy.add(record.handle)
     try {
       if (record.stopped) {
@@ -899,16 +1088,19 @@ export class HostedOpenCodeContainerSupervisor {
         }
       }
       await this.assertNetworkClaim(record)
-      await this.assertNetworkOwned(record)
       const state = object(inspected.State)
       if (state.Running === true) {
+        await this.assertNetworkOwned(record)
         await this.docker.run('stop', '--time', '2', record.containerId!).catch(() => undefined)
         inspected = await this.inspect(record)
+      } else {
+        await this.assertNetworkPrepared(record)
       }
       const stoppedState = object(inspected.State)
       if (stoppedState.Running !== false || stoppedState.Pid !== 0) {
         return { handle: record.handle, generation: record.generation, stopped: false, unresolved: true }
       }
+      await this.assertNetworkPrepared(record)
       await this.docker.run('rm', record.containerId!).catch(() => undefined)
       try { await this.inspect(record); return { handle: record.handle, generation: record.generation, stopped: false, unresolved: true } }
       catch (error) {
@@ -916,6 +1108,7 @@ export class HostedOpenCodeContainerSupervisor {
       }
       await this.assertNetworkEmpty()
       record.stopped = true; await this.persist(record)
+      this.pendingStop.delete(record.handle)
       return { handle: record.handle, generation: record.generation, stopped: true, unresolved: false }
     } finally { this.busy.delete(record.handle) }
   }

@@ -42,7 +42,14 @@ class FakeDocker implements HostedDockerRunner {
   createFailure = false
   uncertainStop = false
   networkOccupied = false
+  occupyAfterCreate = false
   networkInternal = true
+  serverPassword = ''
+
+  async runWithEnvironment(environment: Readonly<Record<string, string>>, ...args: string[]): Promise<string> {
+    this.serverPassword = environment.OPENCODE_SERVER_PASSWORD
+    return this.run(...args)
+  }
 
   async run(...args: string[]): Promise<string> {
     this.calls.push(args)
@@ -50,11 +57,12 @@ class FakeDocker implements HostedDockerRunner {
       Config: { Labels: { 'org.agentteams.hosted-opencode.bootstrap-sha256': BOOTSTRAP_SHA } } })
     if (args[0] === 'network') return JSON.stringify({ Id: NETWORK_ID, Driver: 'bridge', Scope: 'local',
       Internal: this.networkInternal,
-      Containers: this.networkOccupied ? { foreign: { Name: 'foreign' } } : this.exists
+      Containers: this.networkOccupied ? { foreign: { Name: 'foreign' } } : this.exists && this.running
         ? { [CONTAINER_ID]: { Name: this.created![this.created!.indexOf('--name') + 1] } } : {} })
     if (args[0] === 'create') {
       this.created = args
       this.exists = true
+      if (this.occupyAfterCreate) this.networkOccupied = true
       if (this.createFailure) throw new Error('reply lost')
       return CONTAINER_ID
     }
@@ -73,7 +81,8 @@ class FakeDocker implements HostedDockerRunner {
         Id: CONTAINER_ID, Image: IMAGE_ID, Name: `/${value('--name')}`,
         AppArmorProfile: 'agent-teams-test',
         Config: { Image: IMAGE, User: '1000:1000', Entrypoint: ['/usr/local/bin/hosted-opencode-fd3-bootstrap'],
-          Cmd: created.slice(created.indexOf(IMAGE) + 1), Env: ENV,
+          Cmd: created.slice(created.indexOf(IMAGE) + 1), Env: [...ENV,
+            `OPENCODE_SERVER_PASSWORD=${this.serverPassword}`],
           Labels: { 'org.agentteams.hosted-opencode.generation': value('--label').split('=')[1] } },
         HostConfig: { ReadonlyRootfs: true, Privileged: false, NetworkMode: NETWORK_ID,
           PidMode: '', IpcMode: 'private', CapDrop: ['ALL'], CapAdd: [],
@@ -94,7 +103,7 @@ class FakeDocker implements HostedDockerRunner {
   }
 }
 
-async function fixture() {
+async function fixture(overrides: Record<string, unknown> = {}) {
   const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'hosted-container-supervisor-')))
   const parents = ['workspace', 'profile', 'config', 'state'].map(name => path.join(root, name))
   for (const parent of parents) await mkdir(parent, { mode: 0o700 })
@@ -116,7 +125,7 @@ async function fixture() {
   const options = {
     image: IMAGE, bootstrapSha256: BOOTSTRAP_SHA, networkId: NETWORK_ID, workspaceParent, profileParent, configParent,
     stateDirectory, seccompPath, seccompSha256: sha(seccomp), apparmorProfile: 'agent-teams-test',
-    docker, testOnlyAllowNonRoot: true,
+    docker, serverPasswordKey: Buffer.alloc(32, 7), testOnlyAllowNonRoot: true, ...overrides,
   }
   const supervisor = await HostedOpenCodeContainerSupervisor.create(options)
   const leaseId = await supervisor.issueLease({ runId: 'run_12345678', teamId: 'team_12345678',
@@ -149,6 +158,160 @@ async function resetProfile(profile: string): Promise<void> {
 }
 
 describe('disposable hosted OpenCode container supervisor', () => {
+  test('one pending Owner generation becomes ready only after FD3 and independent official proof', async () => {
+    const phases: string[] = []
+    const evidence = { pid: 99999, startTicks: '123', pidNamespace: 'pid:[456]', netns: 'net:[789]' }
+    const f = await fixture({
+      testOnlyProcessEvidence: async (_pid: number, phase: string) => { phases.push(phase); return evidence },
+      testOnlyHandoff: { run: async () => { phases.push('handoff') } },
+    })
+    const ownerChannel = { socketPath: '/tmp/pending-owner-test.sock', challenge: 'a'.repeat(64) }
+    try {
+      const started = await f.supervisor.start({ operationId: 'start_12345678', leaseId: f.leaseId,
+        runId: 'run_12345678', teamId: 'team_12345678', laneId: 'lane_12345678',
+        memberId: 'member_12345678', ownerChannel })
+      expect(started).toMatchObject({ status: 'started', effectEnabled: true })
+      expect(started).not.toHaveProperty('serverPassword')
+      expect(phases.slice(0, 3)).toEqual(['bootstrap', 'handoff', 'official'])
+      expect(await readFile(path.join(f.options.stateDirectory, 'handoff-start_12345678.json'), 'utf8'))
+        .toContain(started.generation)
+      expect(await f.supervisor.observe({ operationId: 'observe_12345678', handle: started.handle,
+        generation: started.generation })).toMatchObject({ status: 'running', effectEnabled: true })
+      const use = await f.supervisor.beginEndpointUse({ operationId: 'use_12345678', handle: started.handle,
+        generation: started.generation })
+      expect(use.password).toMatch(/^[0-9a-f]{64}$/)
+      expect(f.docker.created!.join(' ')).not.toContain(use.password)
+      expect(await f.supervisor.endEndpointUse({ operationId: 'end_12345678', handle: started.handle,
+        generation: started.generation, token: use.token })).toEqual({ released: true })
+      const restarted = await HostedOpenCodeContainerSupervisor.create(f.options)
+      expect(await restarted.observe({ operationId: 'observe_87654321', handle: started.handle,
+        generation: started.generation })).toMatchObject({ effectEnabled: false })
+    } finally { await f.cleanup() }
+  })
+
+  test('Stop fences effects and waits for an exact endpoint use before removing the port', async () => {
+    const evidence = { pid: 99999, startTicks: '123', pidNamespace: 'pid:[456]', netns: 'net:[789]' }
+    const f = await fixture({ testOnlyProcessEvidence: async () => evidence,
+      testOnlyHandoff: { run: async () => undefined } })
+    try {
+      const started = await f.supervisor.start({ operationId: 'start_12345678', leaseId: f.leaseId,
+        runId: 'run_12345678', teamId: 'team_12345678', laneId: 'lane_12345678',
+        memberId: 'member_12345678', ownerChannel: {
+          socketPath: '/tmp/pending-owner-test.sock', challenge: 'a'.repeat(64),
+        } })
+      const use = await f.supervisor.beginEndpointUse({ operationId: 'use_12345678', handle: started.handle,
+        generation: started.generation })
+      expect(await f.supervisor.stop({ operationId: 'stop_12345678', handle: started.handle,
+        generation: started.generation })).toMatchObject({ stopped: false, unresolved: true })
+      expect(f.docker.calls.filter(call => call[0] === 'stop')).toHaveLength(0)
+      expect(await f.supervisor.observe({ operationId: 'observe_12345678', handle: started.handle,
+        generation: started.generation })).toMatchObject({ effectEnabled: false })
+      expect(await f.supervisor.endEndpointUse({ operationId: 'end_12345678', handle: started.handle,
+        generation: started.generation, token: use.token })).toEqual({ released: true })
+      expect(f.docker.calls.filter(call => call[0] === 'stop')).toHaveLength(1)
+      expect(f.docker.calls.filter(call => call[0] === 'rm')).toHaveLength(1)
+    } finally { await f.cleanup() }
+  })
+
+  test('Stop racing a blocked endpoint proof drains after Begin rejects', async () => {
+    const evidence = { pid: 99999, startTicks: '123', pidNamespace: 'pid:[456]', netns: 'net:[789]' }
+    let releaseProof!: () => void
+    let proofEntered!: () => void
+    const blocked = new Promise<void>(resolve => { releaseProof = resolve })
+    const entered = new Promise<void>(resolve => { proofEntered = resolve })
+    let official = 0
+    const f = await fixture({ testOnlyProcessEvidence: async (_pid: number, phase: string) => {
+      if (phase === 'official' && ++official === 2) { proofEntered(); await blocked }
+      return evidence
+    }, testOnlyHandoff: { run: async () => undefined } })
+    try {
+      const started = await f.supervisor.start({ operationId: 'start_12345678', leaseId: f.leaseId,
+        runId: 'run_12345678', teamId: 'team_12345678', laneId: 'lane_12345678',
+        memberId: 'member_12345678', ownerChannel: {
+          socketPath: '/tmp/pending-owner-test.sock', challenge: 'a'.repeat(64),
+        } })
+      const pending = f.supervisor.beginEndpointUse({ operationId: 'use_12345678', handle: started.handle,
+        generation: started.generation })
+      await entered
+      expect(await f.supervisor.stop({ operationId: 'stop_12345678', handle: started.handle,
+        generation: started.generation })).toMatchObject({ stopped: false, unresolved: true })
+      releaseProof()
+      await expect(pending).rejects.toThrow('endpoint-unverified')
+      expect(f.docker.calls.filter(call => call[0] === 'stop')).toHaveLength(1)
+      expect(f.docker.calls.filter(call => call[0] === 'rm')).toHaveLength(1)
+    } finally { releaseProof(); await f.cleanup() }
+  })
+
+  test('Stop racing FD3 handoff cannot leave a newly activated container running', async () => {
+    const evidence = { pid: 99999, startTicks: '123', pidNamespace: 'pid:[456]', netns: 'net:[789]' }
+    let releaseHandoff!: () => void
+    let handoffEntered!: () => void
+    const blocked = new Promise<void>(resolve => { releaseHandoff = resolve })
+    const entered = new Promise<void>(resolve => { handoffEntered = resolve })
+    const f = await fixture({ testOnlyProcessEvidence: async () => evidence,
+      testOnlyHandoff: { run: async () => { handoffEntered(); await blocked } } })
+    try {
+      const pending = f.supervisor.start({ operationId: 'start_12345678', leaseId: f.leaseId,
+        runId: 'run_12345678', teamId: 'team_12345678', laneId: 'lane_12345678',
+        memberId: 'member_12345678', ownerChannel: {
+          socketPath: '/tmp/pending-owner-test.sock', challenge: 'a'.repeat(64),
+        } })
+      await entered
+      const claimed = await f.supervisor.lookupStart({ operationId: 'start_12345678', leaseId: f.leaseId,
+        runId: 'run_12345678', teamId: 'team_12345678', laneId: 'lane_12345678',
+        memberId: 'member_12345678', ownerChannel: {
+          socketPath: '/tmp/pending-owner-test.sock', challenge: 'a'.repeat(64),
+        } })
+      expect(claimed).not.toBeNull()
+      expect(await f.supervisor.stop({ operationId: 'stop_12345678', handle: claimed!.handle,
+        generation: claimed!.generation })).toMatchObject({ stopped: false, unresolved: true })
+      releaseHandoff()
+      expect(await pending).toMatchObject({ status: 'unresolved', effectEnabled: false })
+      expect(f.docker.calls.filter(call => call[0] === 'stop')).toHaveLength(1)
+    } finally { releaseHandoff(); await f.cleanup() }
+  })
+
+  test('uncertain FD3 helper result revokes exact generation and never retries', async () => {
+    let attempts = 0
+    const f = await fixture({
+      testOnlyProcessEvidence: async () => ({ pid: 99999, startTicks: '123',
+        pidNamespace: 'pid:[456]', netns: 'net:[789]' }),
+      testOnlyHandoff: { run: async () => { attempts++; throw new Error('uncertain-send') } },
+    })
+    const request = { operationId: 'start_12345678', leaseId: f.leaseId,
+      runId: 'run_12345678', teamId: 'team_12345678', laneId: 'lane_12345678',
+      memberId: 'member_12345678', ownerChannel: {
+        socketPath: '/tmp/pending-owner-test.sock', challenge: 'a'.repeat(64),
+      } }
+    try {
+      const first = await f.supervisor.start(request)
+      expect(first).toMatchObject({ status: 'unresolved', effectEnabled: false })
+      expect(await f.supervisor.start(request)).toEqual(first)
+      expect(attempts).toBe(1)
+      expect(f.docker.calls.filter(call => call[0] === 'stop')).toHaveLength(1)
+      expect(f.docker.calls.filter(call => call[0] === 'rm')).toHaveLength(1)
+    } finally { await f.cleanup() }
+  })
+
+  test('helper success cannot enable effects after a generation process swap', async () => {
+    let handoffs = 0
+    const f = await fixture({
+      testOnlyProcessEvidence: async (_pid: number, phase: string) => ({ pid: 99999,
+        startTicks: phase === 'bootstrap' ? '123' : '124',
+        pidNamespace: 'pid:[456]', netns: 'net:[789]' }),
+      testOnlyHandoff: { run: async () => { handoffs++ } },
+    })
+    try {
+      const result = await f.supervisor.start({ operationId: 'start_12345678', leaseId: f.leaseId,
+        runId: 'run_12345678', teamId: 'team_12345678', laneId: 'lane_12345678',
+        memberId: 'member_12345678', ownerChannel: {
+          socketPath: '/tmp/pending-owner-test.sock', challenge: 'a'.repeat(64),
+        } })
+      expect(result).toMatchObject({ status: 'unresolved', effectEnabled: false })
+      expect(handoffs).toBe(1)
+      expect(f.docker.calls.filter(call => call[0] === 'stop')).toHaveLength(1)
+    } finally { await f.cleanup() }
+  })
   test('recognizes lowercase Docker missing-object diagnostic', async () => {
     if (process.platform === 'win32') return
     const root = await mkdtemp(path.join(os.tmpdir(), 'hosted-docker-stub-'))
@@ -237,6 +400,15 @@ describe('disposable hosted OpenCode container supervisor', () => {
       f.docker.networkOccupied = true
       expect(await f.start()).toMatchObject({ status: 'unresolved', effectEnabled: false })
       expect(f.docker.calls.some(call => call[0] === 'create')).toBe(false)
+    } finally { await f.cleanup() }
+  })
+
+  test('created-container phase still rejects a foreign network endpoint before Start', async () => {
+    const f = await fixture()
+    try {
+      f.docker.occupyAfterCreate = true
+      expect(await f.start()).toMatchObject({ status: 'unresolved', effectEnabled: false })
+      expect(f.docker.calls.some(call => call[0] === 'start')).toBe(false)
     } finally { await f.cleanup() }
   })
 
