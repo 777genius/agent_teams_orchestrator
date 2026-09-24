@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -11,6 +11,7 @@ import {
   HostedOpenCodeContainerSupervisor,
   type HostedDockerRunner,
 } from './HostedOpenCodeContainerSupervisor.js'
+import { HostedOpenCodeSupervisorRpcClient, HostedOpenCodeSupervisorRpcServer } from './HostedOpenCodeSupervisorRpc.js'
 
 const IMAGE = `example.invalid/opencode@sha256:${'a'.repeat(64)}`
 const IMAGE_ID = `sha256:${'b'.repeat(64)}`
@@ -23,6 +24,8 @@ const ENV = [
   'XDG_CONFIG_HOME=/sandbox/profile/config',
   'XDG_DATA_HOME=/sandbox/profile/data',
   'XDG_CACHE_HOME=/sandbox/profile/cache',
+  'XDG_STATE_HOME=/sandbox/profile/state',
+  'TMPDIR=/sandbox/profile/tmp',
   'OPENCODE_CONFIG_DIR=/sandbox/config',
   'OPENCODE_DISABLE_PROJECT_CONFIG=1',
   'OPENCODE_DISABLE_CLAUDE_CODE=1',
@@ -100,7 +103,7 @@ async function fixture() {
   const profile = path.join(profileParent, '2'.repeat(24))
   const config = path.join(configParent, '3'.repeat(24))
   await mkdir(workspace, { mode: 0o700 })
-  await mkdir(profile, { mode: 0o700 })
+  await prepareProfile(profile)
   await mkdir(config, { mode: 0o700 })
   await writeFile(path.join(config, 'opencode.json'), CONFIG_BYTES, { mode: 0o444 })
   await chmod(config, 0o555)
@@ -117,16 +120,32 @@ async function fixture() {
   }
   const supervisor = await HostedOpenCodeContainerSupervisor.create(options)
   const leaseId = await supervisor.issueLease({ runId: 'run_12345678', teamId: 'team_12345678',
-    laneId: 'lane_12345678', workspace, profile, config, configSha256: sha(CONFIG_BYTES) })
+    laneId: 'lane_12345678', memberId: 'member_12345678', workspace, profile, config, configSha256: sha(CONFIG_BYTES) })
   const start = (operationId = 'start_12345678') => supervisor.start({ operationId, leaseId,
-    runId: 'run_12345678', teamId: 'team_12345678', laneId: 'lane_12345678' })
+    runId: 'run_12345678', teamId: 'team_12345678', laneId: 'lane_12345678', memberId: 'member_12345678' })
   const cleanup = async () => {
     if (previousNodeEnv === undefined) delete process.env.NODE_ENV
     else process.env.NODE_ENV = previousNodeEnv
     await chmod(config, 0o700)
+    await resetProfile(profile)
     await rm(root, { recursive: true, force: true })
   }
   return { root, workspace, profile, config, docker, supervisor, options, leaseId, start, cleanup }
+}
+
+async function prepareProfile(profile: string): Promise<void> {
+  await mkdir(profile, { mode: 0o700 })
+  await mkdir(path.join(profile, 'home'), { mode: 0o555 })
+  await mkdir(path.join(profile, 'config'), { mode: 0o700 })
+  await mkdir(path.join(profile, 'config', 'opencode'), { mode: 0o555 })
+  await chmod(path.join(profile, 'config'), 0o555)
+  for (const name of ['data', 'cache', 'state', 'tmp']) await mkdir(path.join(profile, name), { mode: 0o700 })
+  await chmod(profile, 0o555)
+}
+
+async function resetProfile(profile: string): Promise<void> {
+  await chmod(profile, 0o700)
+  await chmod(path.join(profile, 'config'), 0o700)
 }
 
 describe('disposable hosted OpenCode container supervisor', () => {
@@ -186,11 +205,30 @@ describe('disposable hosted OpenCode container supervisor', () => {
   test('rejects a nonfresh profile before issuing a new lease', async () => {
     const f = await fixture()
     try {
-      await writeFile(path.join(f.profile, 'inherited-secret'), 'secret')
+      await writeFile(path.join(f.profile, 'data', 'inherited-secret'), 'secret')
       await expect(f.supervisor.issueLease({ runId: 'run_87654321', teamId: 'team_87654321',
-        laneId: 'lane_87654321', workspace: f.workspace, profile: f.profile,
+        laneId: 'lane_87654321', memberId: 'member_87654321', workspace: f.workspace, profile: f.profile,
         config: f.config, configSha256: sha(CONFIG_BYTES) })).rejects.toThrow('profile-not-fresh')
     } finally { await f.cleanup() }
+  })
+
+  test('rejects writable global config and replaced profile child before Docker create', async () => {
+    const writable = await fixture()
+    try {
+      await chmod(path.join(writable.profile, 'config', 'opencode'), 0o755)
+      await expect(writable.start()).rejects.toThrow('profile-invalid')
+      expect(writable.docker.calls.some(call => call[0] === 'create')).toBe(false)
+    } finally { await writable.cleanup() }
+
+    const replaced = await fixture()
+    try {
+      await chmod(replaced.profile, 0o700)
+      await rename(path.join(replaced.profile, 'data'), path.join(replaced.root, 'retired-data'))
+      await mkdir(path.join(replaced.profile, 'data'), { mode: 0o700 })
+      await chmod(replaced.profile, 0o555)
+      await expect(replaced.start()).rejects.toThrow('lease-substituted')
+      expect(replaced.docker.calls.some(call => call[0] === 'create')).toBe(false)
+    } finally { await replaced.cleanup() }
   })
 
   test('rejects a container that joined the private network after supervisor initialization', async () => {
@@ -218,11 +256,11 @@ describe('disposable hosted OpenCode container supervisor', () => {
     const config = path.join(f.options.configParent, '6'.repeat(24))
     try {
       await mkdir(workspace, { mode: 0o700 })
-      await mkdir(profile, { mode: 0o700 })
+      await prepareProfile(profile)
       await mkdir(config, { mode: 0o700 })
       await writeFile(path.join(config, 'opencode.json'), CONFIG_BYTES, { mode: 0o444 })
       await chmod(config, 0o555)
-      const input = { runId: 'run_87654321', teamId: 'team_87654321', laneId: 'lane_87654321',
+      const input = { runId: 'run_87654321', teamId: 'team_87654321', laneId: 'lane_87654321', memberId: 'member_87654321',
         workspace, profile, config, configSha256: sha(CONFIG_BYTES) }
       const second = await HostedOpenCodeContainerSupervisor.create(f.options)
       const results = await Promise.allSettled([f.supervisor.issueLease(input), second.issueLease(input)])
@@ -230,7 +268,7 @@ describe('disposable hosted OpenCode container supervisor', () => {
       expect(results.filter(result => result.status === 'rejected')).toHaveLength(1)
       const restarted = await HostedOpenCodeContainerSupervisor.create(f.options)
       await expect(restarted.issueLease(input)).rejects.toThrow('claim-already-issued')
-    } finally { await chmod(config, 0o700).catch(() => undefined); await f.cleanup() }
+    } finally { await chmod(config, 0o700).catch(() => undefined); await resetProfile(profile).catch(() => undefined); await f.cleanup() }
   })
 
   test('restarts with its exact owned network occupant and rejects a foreign occupant', async () => {
@@ -259,6 +297,82 @@ describe('disposable hosted OpenCode container supervisor', () => {
     } finally { await f.cleanup() }
   })
 
+  test('restart recovers exact member-bound Start claim without another Docker create', async () => {
+    const f = await fixture()
+    try {
+      const first = await f.start()
+      const restarted = await HostedOpenCodeContainerSupervisor.create(f.options)
+      const request = { operationId: 'start_12345678', leaseId: f.leaseId,
+        runId: 'run_12345678', teamId: 'team_12345678', laneId: 'lane_12345678', memberId: 'member_12345678' }
+      expect(await restarted.lookupStart(request)).toEqual({ ...first, status: 'unresolved' })
+      expect(await restarted.start(request)).toEqual({ ...first, status: 'unresolved' })
+      expect(f.docker.calls.filter(call => call[0] === 'create')).toHaveLength(1)
+      await expect(restarted.lookupStart({ ...request, memberId: 'member_87654321' }))
+        .rejects.toThrow('operation-replay-conflict')
+      await rm(path.join(f.options.stateDirectory, `${first.handle}.json`))
+      const recovered = await HostedOpenCodeContainerSupervisor.create(f.options)
+      expect(await recovered.lookupStart(request)).toEqual({ ...first, status: 'unresolved' })
+      expect(await recovered.reconcile({ operationId: 'reconcile_12345678',
+        handle: first.handle, generation: first.generation })).toMatchObject({ stopped: true, unresolved: false })
+    } finally { await f.cleanup() }
+  })
+
+  test('dead creator permits pre-create absence reconciliation but never uncertain Docker create', async () => {
+    if (process.platform !== 'linux') return
+    for (const createIssued of [false, true]) {
+      const f = await fixture()
+      try {
+        if (createIssued) f.docker.createFailure = true
+        else f.docker.networkOccupied = true
+        const started = await f.start()
+        f.docker.networkOccupied = false
+        f.docker.exists = false
+        const recordPath = path.join(f.options.stateDirectory, `${started.handle}.json`)
+        const record = JSON.parse(await readFile(recordPath, 'utf8')) as Record<string, unknown>
+        record.creator = { pid: 99_999_999, startTicks: '1' }
+        await writeFile(recordPath, JSON.stringify(record))
+        const restarted = await HostedOpenCodeContainerSupervisor.create(f.options)
+        const result = await restarted.reconcile({ operationId: 'reconcile_12345678',
+          handle: started.handle, generation: started.generation })
+        expect(result).toMatchObject(createIssued
+          ? { stopped: false, unresolved: true }
+          : { stopped: true, unresolved: false })
+        expect(f.docker.calls.filter(call => call[0] === 'create')).toHaveLength(createIssued ? 1 : 0)
+      } finally { await f.cleanup() }
+    }
+  })
+
+  test('authenticated local RPC accepts only a member-bound command and signed reply', async () => {
+    // Bun 1.3.11 crashes in its macOS Unix listener; the production daemon is Linux-only.
+    if (process.platform !== 'linux') return
+    const f = await fixture()
+    const socketRoot = await realpath(await mkdtemp('/tmp/hcr-'))
+    await chmod(socketRoot, 0o700)
+    const socketPath = path.join(socketRoot, 's.sock')
+    const secret = Buffer.alloc(32, 7)
+    const server = new HostedOpenCodeSupervisorRpcServer({ socketPath, secret,
+      ownerGid: process.getgid!(), supervisor: f.supervisor, testOnlyAllowNonRoot: true })
+    try {
+      await server.start()
+      const request = { operationId: 'start_12345678', leaseId: f.leaseId,
+        runId: 'run_12345678', teamId: 'team_12345678', laneId: 'lane_12345678', memberId: 'member_12345678' }
+      const client = new HostedOpenCodeSupervisorRpcClient({ socketPath, secret,
+        ownerGid: process.getgid!(), testOnlyAllowNonRoot: true })
+      const wrong = new HostedOpenCodeSupervisorRpcClient({ socketPath, secret: Buffer.alloc(32, 8),
+        ownerGid: process.getgid!(), testOnlyAllowNonRoot: true })
+      await expect(wrong.command({ operation: 'start', payload: request })).rejects.toThrow()
+      expect(f.docker.calls.some(call => call[0] === 'create')).toBe(false)
+      const first = await client.command<Awaited<ReturnType<typeof f.start>>>({ operation: 'start', payload: request })
+      expect(first).toMatchObject({ status: 'unresolved', effectEnabled: false })
+      expect(await client.lookupStart(request))
+        .toEqual({ ...first, status: 'unresolved' })
+      expect(f.docker.calls.filter(call => call[0] === 'create')).toHaveLength(1)
+      await expect(client.command({ operation: 'start', payload: { ...request, memberId: 'member_87654321' } }))
+        .rejects.toThrow()
+      expect(f.docker.calls.filter(call => call[0] === 'create')).toHaveLength(1)
+    } finally { await server.close(); await rm(socketRoot, { recursive: true, force: true }); await f.cleanup() }
+  })
+
   test('durable network claim allows only one Start across distinct leases', async () => {
     const f = await fixture()
     const workspace = path.join(f.options.workspaceParent, '7'.repeat(24))
@@ -266,23 +380,23 @@ describe('disposable hosted OpenCode container supervisor', () => {
     const config = path.join(f.options.configParent, '9'.repeat(24))
     try {
       await mkdir(workspace, { mode: 0o700 })
-      await mkdir(profile, { mode: 0o700 })
+      await prepareProfile(profile)
       await mkdir(config, { mode: 0o700 })
       await writeFile(path.join(config, 'opencode.json'), CONFIG_BYTES, { mode: 0o444 })
       await chmod(config, 0o555)
       const leaseId = await f.supervisor.issueLease({ runId: 'run_87654321', teamId: 'team_87654321',
-        laneId: 'lane_87654321', workspace, profile, config, configSha256: sha(CONFIG_BYTES) })
+        laneId: 'lane_87654321', memberId: 'member_87654321', workspace, profile, config, configSha256: sha(CONFIG_BYTES) })
       const [first, second] = await Promise.all([f.start(), f.supervisor.start({
         operationId: 'start_87654321', leaseId, runId: 'run_87654321',
-        teamId: 'team_87654321', laneId: 'lane_87654321',
+        teamId: 'team_87654321', laneId: 'lane_87654321', memberId: 'member_87654321',
       })])
       expect([first.status, second.status]).toEqual(['unresolved', 'unresolved'])
       expect(f.docker.calls.filter(call => call[0] === 'create')).toHaveLength(1)
       const restarted = await HostedOpenCodeContainerSupervisor.create(f.options)
       await expect(restarted.issueLease({ runId: 'run_87654321', teamId: 'team_87654321',
-        laneId: 'lane_87654321', workspace, profile, config, configSha256: sha(CONFIG_BYTES) }))
+        laneId: 'lane_87654321', memberId: 'member_87654321', workspace, profile, config, configSha256: sha(CONFIG_BYTES) }))
         .rejects.toThrow('claim-already-issued')
-    } finally { await chmod(config, 0o700).catch(() => undefined); await f.cleanup() }
+    } finally { await chmod(config, 0o700).catch(() => undefined); await resetProfile(profile).catch(() => undefined); await f.cleanup() }
   })
 
   test('rejects effective privilege, mount, and environment drift before start', async () => {

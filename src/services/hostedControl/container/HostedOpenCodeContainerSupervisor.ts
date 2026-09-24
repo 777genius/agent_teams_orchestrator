@@ -3,11 +3,10 @@ import { createHash, randomBytes } from 'node:crypto'
 import { constants } from 'node:fs'
 import { link, lstat, open, readFile, readdir, readlink, realpath, rename, unlink } from 'node:fs/promises'
 import path from 'node:path'
-import { isDeepStrictEqual, promisify } from 'node:util'
+import { isDeepStrictEqual } from 'node:util'
 
 import { resolveExecutingOpenCodeArtifactDigest } from '../../opencode/OpenCodeArtifactDigest.js'
 
-const execFileAsync = promisify(execFile)
 const SHA = /^[0-9a-f]{64}$/
 const IMAGE = /^[a-z0-9][a-z0-9._:/-]*@sha256:[0-9a-f]{64}$/
 const ID = /^[a-z0-9][a-z0-9_-]{7,95}$/
@@ -31,47 +30,51 @@ export class HostedDockerCliRunner implements HostedDockerRunner {
   }
 
   async run(...args: string[]): Promise<string> {
-    try {
-      const result = await execFileAsync(this.executable, args, {
+    return new Promise((resolve, reject) => {
+      execFile(this.executable, args, {
         timeout: 30_000,
         maxBuffer: 1024 * 1024,
         windowsHide: true,
         env: { PATH: '/usr/bin:/bin', HOME: '/root', DOCKER_HOST: 'unix:///var/run/docker.sock' },
+      }, (error, stdout, stderr) => {
+        if (!error) return resolve(stdout.trim())
+        if (args[0] === 'inspect' && /no such (?:object|container):/i.test(String(stderr).slice(-300))) {
+          return reject(new HostedContainerNotFound('hosted-container-not-found'))
+        }
+        reject(new Error('hosted-container-docker-command-failed'))
       })
-      return result.stdout.trim()
-    } catch (error) {
-      const stderr = error && typeof error === 'object' && 'stderr' in error
-        ? String(error.stderr).slice(-300) : ''
-      if (args[0] === 'inspect' && /no such (?:object|container):/i.test(stderr)) {
-        throw new HostedContainerNotFound('hosted-container-not-found')
-      }
-      throw new Error('hosted-container-docker-command-failed')
-    }
+    })
   }
 }
 
 type FileIdentity = Readonly<{ device: string; inode: string }>
+type ProfileLayout = Readonly<Record<'home' | 'config' | 'opencode' | 'data' | 'cache' | 'state' | 'tmp', FileIdentity>>
 type Lease = Readonly<{
   runId: string
   teamId: string
   laneId: string
+  memberId: string
   workspace: string
   profile: string
   config: string
   configSha256: string
   workspaceIdentity: FileIdentity
   profileIdentity: FileIdentity
+  profileLayout: ProfileLayout
   configIdentity: FileIdentity
 }>
 type ContainerRecord = {
   handle: string
   generation: string
   operationId: string
+  creator: { pid: number; startTicks: string }
   lease: Lease
   containerId: string | null
+  createIssued: boolean
   stopped: boolean
 }
 type StartResult = { handle: string; generation: string; status: 'started' | 'unresolved'; effectEnabled: false }
+type StartRequest = { operationId: string; leaseId: string; runId: string; teamId: string; laneId: string; memberId: string }
 
 export interface HostedOpenCodeContainerSupervisorOptions {
   readonly image: string
@@ -294,24 +297,57 @@ export class HostedOpenCodeContainerSupervisor {
     }
   }
 
+  private async checkedProfile(profile: string, fresh: boolean): Promise<{
+    root: FileIdentity; layout: ProfileLayout
+  }> {
+    const rootOwner = this.options.testOnlyAllowNonRoot ? process.getuid!() : 0
+    const writableOwner = this.options.testOnlyAllowNonRoot ? process.getuid!() : 1000
+    const root = await this.checkedDirectory(profile, this.options.profileParent, rootOwner, 0o555)
+    const names = await readdir(profile)
+    if (!isDeepStrictEqual(names.sort(), ['cache', 'config', 'data', 'home', 'state', 'tmp'])) {
+      throw new Error('hosted-container-profile-not-fresh')
+    }
+    const layout = {} as Record<keyof ProfileLayout, FileIdentity>
+    for (const [name, directory, owner, mode, expectedChildren] of [
+      ['home', path.join(profile, 'home'), rootOwner, 0o555, []],
+      ['config', path.join(profile, 'config'), rootOwner, 0o555, ['opencode']],
+      ['opencode', path.join(profile, 'config', 'opencode'), rootOwner, 0o555, []],
+      ['data', path.join(profile, 'data'), writableOwner, 0o700, []],
+      ['cache', path.join(profile, 'cache'), writableOwner, 0o700, []],
+      ['state', path.join(profile, 'state'), writableOwner, 0o700, []],
+      ['tmp', path.join(profile, 'tmp'), writableOwner, 0o700, []],
+    ] as const) {
+      const stat = await lstat(directory)
+      if (!stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== owner ||
+        (stat.mode & 0o777) !== mode || stat.dev !== Number(root.device) ||
+        await realpath(directory) !== directory) {
+        throw new Error('hosted-container-profile-invalid')
+      }
+      const contents = await readdir(directory)
+      if (name === 'home' || name === 'config' || name === 'opencode' || fresh) {
+        if (!isDeepStrictEqual(contents.sort(), [...expectedChildren])) {
+          throw new Error('hosted-container-profile-not-fresh')
+        }
+      }
+      layout[name] = identity(stat)
+    }
+    return { root, layout }
+  }
+
   /** Root-only provisioning API. An Owner-facing RPC must accept opaque lease IDs, never paths. */
-  async issueLease(input: { runId: string; teamId: string; laneId: string;
+  async issueLease(input: { runId: string; teamId: string; laneId: string; memberId: string;
     workspace: string; profile: string; config: string; configSha256: string }): Promise<string> {
-    for (const id of [input.runId, input.teamId, input.laneId]) boundedId(id)
+    for (const id of [input.runId, input.teamId, input.laneId, input.memberId]) boundedId(id)
     if (!SHA.test(input.configSha256)) throw new Error('hosted-container-config-digest-invalid')
-    const [workspaceIdentity, profileIdentity, configIdentity] = await Promise.all([
+    const [workspaceIdentity, profile, configIdentity] = await Promise.all([
       this.checkedDirectory(input.workspace, this.options.workspaceParent,
         this.options.testOnlyAllowNonRoot ? process.getuid!() : 1000),
-      this.checkedDirectory(input.profile, this.options.profileParent,
-        this.options.testOnlyAllowNonRoot ? process.getuid!() : 1000),
+      this.checkedProfile(input.profile, true),
       this.checkedDirectory(input.config, this.options.configParent,
         this.options.testOnlyAllowNonRoot ? process.getuid!() : 0, 0o555),
     ])
     if ((await readdir(input.workspace)).length !== 0) {
       throw new Error('hosted-container-workspace-not-fresh')
-    }
-    if ((await readdir(input.profile)).length !== 0) {
-      throw new Error('hosted-container-profile-not-fresh')
     }
     if ([...this.leases.values()].some(lease => lease.workspace === input.workspace ||
       lease.profile === input.profile || lease.config === input.config)) {
@@ -323,7 +359,8 @@ export class HostedOpenCodeContainerSupervisor {
       ['config', input.config]] as const) {
       await this.durableClaim(`root-${kind}-${digest(Buffer.from(root))}.json`, { leaseId, root })
     }
-    this.leases.set(leaseId, { ...input, workspaceIdentity, profileIdentity, configIdentity })
+    this.leases.set(leaseId, { ...input, workspaceIdentity,
+      profileIdentity: profile.root, profileLayout: profile.layout, configIdentity })
     return leaseId
   }
 
@@ -334,12 +371,13 @@ export class HostedOpenCodeContainerSupervisor {
     const [workspace, profile, config] = await Promise.all([
       this.checkedDirectory(lease.workspace, this.options.workspaceParent,
         this.options.testOnlyAllowNonRoot ? process.getuid!() : 1000),
-      this.checkedDirectory(lease.profile, this.options.profileParent,
-        this.options.testOnlyAllowNonRoot ? process.getuid!() : 1000),
+      this.checkedProfile(lease.profile, false),
       this.checkedDirectory(lease.config, this.options.configParent,
         this.options.testOnlyAllowNonRoot ? process.getuid!() : 0, 0o555),
     ])
-    if (!sameIdentity(workspace, lease.workspaceIdentity) || !sameIdentity(profile, lease.profileIdentity) ||
+    if (!sameIdentity(workspace, lease.workspaceIdentity) || !sameIdentity(profile.root, lease.profileIdentity) ||
+      Object.keys(lease.profileLayout).some(name =>
+        !sameIdentity(profile.layout[name as keyof ProfileLayout], lease.profileLayout[name as keyof ProfileLayout])) ||
       !sameIdentity(config, lease.configIdentity)) {
       throw new Error('hosted-container-lease-substituted')
     }
@@ -348,6 +386,102 @@ export class HostedOpenCodeContainerSupervisor {
   }
 
   private recordPath(handle: string): string { return path.join(this.options.stateDirectory, `${handle}.json`) }
+
+  private async creationMarker(record: Pick<ContainerRecord, 'operationId' | 'handle' | 'generation'>): Promise<boolean> {
+    const marker = path.join(this.options.stateDirectory, `create-${record.operationId}.json`)
+    let file
+    try { file = await open(marker, constants.O_RDONLY | constants.O_NOFOLLOW) }
+    catch (error) {
+      if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') return false
+      throw error
+    }
+    try {
+      const stat = await file.stat()
+      if (!stat.isFile() || stat.nlink !== 1 || stat.size > 256 || (stat.mode & 0o777) !== 0o600 ||
+        stat.uid !== (this.options.testOnlyAllowNonRoot ? process.getuid?.() : 0)) {
+        throw new Error('hosted-container-create-marker-invalid')
+      }
+      const row = object(JSON.parse(await file.readFile('utf8')))
+      if (!exactKeys(row, ['handle', 'generation']) || row.handle !== record.handle ||
+        row.generation !== record.generation) throw new Error('hosted-container-create-marker-invalid')
+      return true
+    } finally { await file.close() }
+  }
+
+  private async refreshCreateMarker(record: ContainerRecord): Promise<void> {
+    if (!record.createIssued && await this.creationMarker(record)) {
+      record.createIssued = true
+      await this.persist(record)
+    }
+  }
+
+  private async startClaim(request: StartRequest): Promise<StartResult | null> {
+    const claimPath = path.join(this.options.stateDirectory, `start-${request.operationId}.json`)
+    let file
+    try { file = await open(claimPath, constants.O_RDONLY | constants.O_NOFOLLOW) }
+    catch (error) {
+      if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') return null
+      throw error
+    }
+    try {
+      const stat = await file.stat()
+      if (!stat.isFile() || stat.nlink !== 1 || stat.size > 8192 || (stat.mode & 0o777) !== 0o600 ||
+        stat.uid !== (this.options.testOnlyAllowNonRoot ? process.getuid?.() : 0)) {
+        throw new Error('hosted-container-start-claim-invalid')
+      }
+      const row = object(JSON.parse(await file.readFile('utf8')))
+      if (!exactKeys(row, ['request', 'record']) ||
+        !exactKeys(row.request, ['operationId', 'leaseId', 'runId', 'teamId', 'laneId', 'memberId']) ||
+        !exactKeys(row.record, ['handle', 'generation', 'operationId', 'creator', 'lease', 'containerId', 'createIssued', 'stopped'])) {
+        throw new Error('hosted-container-start-claim-invalid')
+      }
+      if (!isDeepStrictEqual(row.request, request)) throw new Error('hosted-container-operation-replay-conflict')
+      const claimed = object(row.record)
+      const creator = object(claimed.creator)
+      if (typeof claimed.handle !== 'string' || !/^opencode_[0-9a-f]{32}$/.test(claimed.handle) ||
+        typeof claimed.generation !== 'string' || !/^[0-9a-f]{32}$/.test(claimed.generation) ||
+        claimed.operationId !== request.operationId || claimed.containerId !== null ||
+        !exactKeys(creator, ['pid', 'startTicks']) ||
+        !Number.isSafeInteger(creator.pid) || Number(creator.pid) < 1 ||
+        typeof creator.startTicks !== 'string' || !/^\d+$/.test(creator.startTicks) ||
+        claimed.createIssued !== false || claimed.stopped !== false ||
+        !exactKeys(claimed.lease, ['runId', 'teamId', 'laneId', 'memberId', 'workspace', 'profile', 'config',
+          'configSha256', 'workspaceIdentity', 'profileIdentity', 'profileLayout', 'configIdentity']) ||
+        ['runId', 'teamId', 'laneId', 'memberId'].some(key =>
+          (claimed.lease as Record<string, unknown>)[key] !== request[key as keyof StartRequest])) {
+        throw new Error('hosted-container-start-claim-invalid')
+      }
+      let recovered: ContainerRecord
+      try { recovered = await this.load(claimed.handle, claimed.generation) }
+      catch (error) {
+        if (!error || typeof error !== 'object' || !('code' in error) || error.code !== 'ENOENT') throw error
+        const recovery = { ...claimed, createIssued: await this.creationMarker({
+          operationId: request.operationId, handle: claimed.handle, generation: claimed.generation,
+        }) } as unknown as ContainerRecord
+        try { await this.persist(recovery) }
+        catch (persistError) {
+          if (!persistError || typeof persistError !== 'object' || !('code' in persistError) ||
+            persistError.code !== 'EEXIST') throw persistError
+        }
+        recovered = await this.load(claimed.handle, claimed.generation)
+      }
+      if (recovered.operationId !== request.operationId ||
+        ['runId', 'teamId', 'laneId', 'memberId'].some(key =>
+          recovered.lease[key as keyof Lease] !== request[key as keyof StartRequest])) {
+        throw new Error('hosted-container-start-claim-invalid')
+      }
+      return { handle: claimed.handle, generation: claimed.generation, status: 'unresolved', effectEnabled: false }
+    } finally { await file.close() }
+  }
+
+  /** Recovery is conservative: a claimed Start never authorizes a second create or effects. */
+  async lookupStart(request: StartRequest): Promise<StartResult | null> {
+    if (!exactKeys(request, ['operationId', 'leaseId', 'runId', 'teamId', 'laneId', 'memberId'])) {
+      throw new Error('hosted-container-start-request-invalid')
+    }
+    for (const id of Object.values(request)) boundedId(id)
+    return this.startClaim(request)
+  }
 
   private async persist(record: ContainerRecord): Promise<void> {
     const destination = this.recordPath(record.handle)
@@ -378,6 +512,7 @@ export class HostedOpenCodeContainerSupervisor {
     const cached = this.records.get(handle)
     if (cached) {
       if (cached.generation !== generation) throw new Error('hosted-container-generation-invalid')
+      await this.refreshCreateMarker(cached)
       return cached
     }
     const file = await open(this.recordPath(handle), constants.O_RDONLY | constants.O_NOFOLLOW)
@@ -391,19 +526,26 @@ export class HostedOpenCodeContainerSupervisor {
       raw = await file.readFile('utf8')
     } finally { await file.close() }
     const row = object(JSON.parse(raw))
-    if (!exactKeys(row, ['handle', 'generation', 'operationId', 'lease', 'containerId', 'stopped']) ||
+    if (!exactKeys(row, ['handle', 'generation', 'operationId', 'creator', 'lease', 'containerId', 'createIssued', 'stopped']) ||
       row.handle !== handle || row.generation !== generation || typeof row.stopped !== 'boolean' ||
+      typeof row.createIssued !== 'boolean' ||
       row.containerId !== null && (typeof row.containerId !== 'string' || !CONTAINER_ID.test(row.containerId))) {
+      throw new Error('hosted-container-record-invalid')
+    }
+    const creator = object(row.creator)
+    if (!exactKeys(creator, ['pid', 'startTicks']) ||
+      !Number.isSafeInteger(creator.pid) || Number(creator.pid) < 1 ||
+      typeof creator.startTicks !== 'string' || !/^\d+$/.test(creator.startTicks)) {
       throw new Error('hosted-container-record-invalid')
     }
     boundedId(row.operationId)
     const lease = object(row.lease)
-    if (!exactKeys(lease, ['runId', 'teamId', 'laneId', 'workspace', 'profile', 'config',
-      'configSha256', 'workspaceIdentity', 'profileIdentity', 'configIdentity']) ||
+    if (!exactKeys(lease, ['runId', 'teamId', 'laneId', 'memberId', 'workspace', 'profile', 'config',
+      'configSha256', 'workspaceIdentity', 'profileIdentity', 'profileLayout', 'configIdentity']) ||
       typeof lease.configSha256 !== 'string' || !SHA.test(lease.configSha256)) {
       throw new Error('hosted-container-record-lease-invalid')
     }
-    for (const key of ['runId', 'teamId', 'laneId']) boundedId(lease[key])
+    for (const key of ['runId', 'teamId', 'laneId', 'memberId']) boundedId(lease[key])
     for (const [key, parent] of [['workspace', this.options.workspaceParent],
       ['profile', this.options.profileParent], ['config', this.options.configParent]] as const) {
       if (typeof lease[key] !== 'string' || path.dirname(lease[key]) !== parent ||
@@ -411,8 +553,13 @@ export class HostedOpenCodeContainerSupervisor {
         throw new Error('hosted-container-record-lease-invalid')
       }
     }
-    for (const key of ['workspaceIdentity', 'profileIdentity', 'configIdentity']) {
-      const fileIdentity = object(lease[key])
+    const profileLayout = object(lease.profileLayout)
+    if (!exactKeys(profileLayout, ['home', 'config', 'opencode', 'data', 'cache', 'state', 'tmp'])) {
+      throw new Error('hosted-container-record-lease-invalid')
+    }
+    for (const value of [lease.workspaceIdentity, lease.profileIdentity, lease.configIdentity,
+      ...Object.values(profileLayout)]) {
+      const fileIdentity = object(value)
       if (!exactKeys(fileIdentity, ['device', 'inode']) ||
         typeof fileIdentity.device !== 'string' || !/^\d+$/.test(fileIdentity.device) ||
         typeof fileIdentity.inode !== 'string' || !/^\d+$/.test(fileIdentity.inode)) {
@@ -422,6 +569,7 @@ export class HostedOpenCodeContainerSupervisor {
     const record = row as unknown as ContainerRecord
     this.records.set(handle, record)
     this.persistedRecords.add(handle)
+    await this.refreshCreateMarker(record)
     return record
   }
 
@@ -465,6 +613,8 @@ export class HostedOpenCodeContainerSupervisor {
       ['XDG_CONFIG_HOME', '/sandbox/profile/config'],
       ['XDG_DATA_HOME', '/sandbox/profile/data'],
       ['XDG_CACHE_HOME', '/sandbox/profile/cache'],
+      ['XDG_STATE_HOME', '/sandbox/profile/state'],
+      ['TMPDIR', '/sandbox/profile/tmp'],
       ['OPENCODE_CONFIG_DIR', '/sandbox/config'],
       ['OPENCODE_DISABLE_PROJECT_CONFIG', '1'],
       ['OPENCODE_DISABLE_CLAUDE_CODE', '1'],
@@ -518,6 +668,29 @@ export class HostedOpenCodeContainerSupervisor {
     return `http://127.0.0.1:${port}`
   }
 
+  private async currentCreator(): Promise<{ pid: number; startTicks: string }> {
+    if (this.options.testOnlyAllowNonRoot && process.platform !== 'linux') {
+      return { pid: process.pid, startTicks: '0' }
+    }
+    const stat = await readFile('/proc/self/stat', 'utf8')
+    const startTicks = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/)[19]
+    if (!/^\d+$/.test(startTicks)) throw new Error('hosted-container-creator-identity-invalid')
+    return { pid: process.pid, startTicks }
+  }
+
+  private async creatorIsDead(record: ContainerRecord): Promise<boolean> {
+    if (this.options.testOnlyAllowNonRoot && process.platform !== 'linux') return false
+    let stat: string
+    try { stat = await readFile(`/proc/${record.creator.pid}/stat`, 'utf8') }
+    catch (error) {
+      if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') return true
+      throw error
+    }
+    const startTicks = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/)[19]
+    if (!/^\d+$/.test(startTicks)) throw new Error('hosted-container-creator-identity-invalid')
+    return startTicks !== record.creator.startTicks
+  }
+
   private async processEvidence(inspected: Record<string, unknown>): Promise<{ pid: number; startTicks: string; pidNamespace: string }> {
     const state = object(inspected.State)
     const pid = state.Pid
@@ -552,10 +725,13 @@ export class HostedOpenCodeContainerSupervisor {
    * trusted FD3 handoff, post-exec official digest, then ready. No handoff exists here,
    * so this class never enables Owner effects or claims a usable runtime.
    */
-  async start(request: { operationId: string; leaseId: string; runId: string; teamId: string; laneId: string }): Promise<StartResult> {
+  async start(request: StartRequest): Promise<StartResult> {
+    if (!exactKeys(request, ['operationId', 'leaseId', 'runId', 'teamId', 'laneId', 'memberId'])) {
+      throw new Error('hosted-container-start-request-invalid')
+    }
     boundedId(request.operationId)
     boundedId(request.leaseId)
-    for (const id of [request.runId, request.teamId, request.laneId]) boundedId(id)
+    for (const id of [request.runId, request.teamId, request.laneId, request.memberId]) boundedId(id)
     const requestKey = JSON.stringify(request)
     const previous = this.operations.get(request.operationId)
     if (previous) {
@@ -567,23 +743,40 @@ export class HostedOpenCodeContainerSupervisor {
       if (pending.request !== requestKey) throw new Error('hosted-container-operation-replay-conflict')
       return pending.result
     }
-    if (!this.leases.has(request.leaseId) || this.consumed.has(request.leaseId)) {
-      throw new Error('hosted-container-lease-unavailable')
-    }
-    this.consumed.add(request.leaseId)
-    const result = this.startReserved(request, requestKey)
+    const result = this.startOnce(request, requestKey)
     this.pendingStarts.set(request.operationId, { request: requestKey, result })
     try { return await result } finally { this.pendingStarts.delete(request.operationId) }
   }
 
-  private async startReserved(request: { operationId: string; leaseId: string; runId: string;
-    teamId: string; laneId: string }, requestKey: string): Promise<StartResult> {
+  private async startOnce(request: StartRequest, requestKey: string): Promise<StartResult> {
+    const claimed = await this.startClaim(request)
+    if (claimed) return claimed
+    if (!this.leases.has(request.leaseId) || this.consumed.has(request.leaseId)) {
+      throw new Error('hosted-container-lease-unavailable')
+    }
+    this.consumed.add(request.leaseId)
+    return this.startReserved(request, requestKey)
+  }
+
+  private async startReserved(request: StartRequest, requestKey: string): Promise<StartResult> {
     const lease = await this.checkedLease(request.leaseId, true)
-    if (lease.runId !== request.runId || lease.teamId !== request.teamId || lease.laneId !== request.laneId) {
+    if (lease.runId !== request.runId || lease.teamId !== request.teamId || lease.laneId !== request.laneId ||
+      lease.memberId !== request.memberId) {
       throw new Error('hosted-container-lease-binding-invalid')
     }
     const record: ContainerRecord = { handle: `opencode_${hexName()}`, generation: hexName(),
-      operationId: request.operationId, lease, containerId: null, stopped: false }
+      operationId: request.operationId, creator: await this.currentCreator(),
+      lease, containerId: null, createIssued: false, stopped: false }
+    try {
+      await this.durableClaim(`start-${request.operationId}.json`,
+        { request, record })
+    } catch (error) {
+      if (error instanceof Error && error.message === 'hosted-container-claim-already-issued') {
+        const prior = await this.startClaim(request)
+        if (prior) return prior
+      }
+      throw error
+    }
     this.records.set(record.handle, record)
     this.busy.add(record.handle)
     try { await this.persist(record) }
@@ -596,6 +789,10 @@ export class HostedOpenCodeContainerSupervisor {
       await this.durableClaim(`network-${this.options.networkId}.json`,
         { handle: record.handle, generation: record.generation })
       await this.assertNetworkEmpty()
+      await this.durableClaim(`create-${request.operationId}.json`,
+        { handle: record.handle, generation: record.generation })
+      record.createIssued = true
+      await this.persist(record)
       const created = await this.docker.run('create', '--name', record.handle, '--label', `${GENERATION_LABEL}=${record.generation}`,
         '--user', '1000:1000', '--read-only', '--network', this.options.networkId,
         '--ipc', 'private', '--cap-drop', 'ALL',
@@ -608,6 +805,8 @@ export class HostedOpenCodeContainerSupervisor {
         '--publish', '127.0.0.1::4096', '--workdir', '/sandbox/workspace',
         '--env', 'HOME=/sandbox/profile/home', '--env', 'XDG_CONFIG_HOME=/sandbox/profile/config',
         '--env', 'XDG_DATA_HOME=/sandbox/profile/data', '--env', 'XDG_CACHE_HOME=/sandbox/profile/cache',
+        '--env', 'XDG_STATE_HOME=/sandbox/profile/state',
+        '--env', 'TMPDIR=/sandbox/profile/tmp',
         '--env', 'OPENCODE_CONFIG_DIR=/sandbox/config', '--env', 'OPENCODE_DISABLE_PROJECT_CONFIG=1',
         '--env', 'OPENCODE_DISABLE_CLAUDE_CODE=1', '--entrypoint', BOOTSTRAP_PATH,
         this.options.image, '--socket-name', `fd3-${record.generation}`, '--sender-uid', '0')
@@ -637,12 +836,13 @@ export class HostedOpenCodeContainerSupervisor {
     const [workspace, profile, config] = await Promise.all([
       this.checkedDirectory(lease.workspace, this.options.workspaceParent,
         this.options.testOnlyAllowNonRoot ? process.getuid!() : 1000),
-      this.checkedDirectory(lease.profile, this.options.profileParent,
-        this.options.testOnlyAllowNonRoot ? process.getuid!() : 1000),
+      this.checkedProfile(lease.profile, false),
       this.checkedDirectory(lease.config, this.options.configParent,
         this.options.testOnlyAllowNonRoot ? process.getuid!() : 0, 0o555),
     ])
-    if (!sameIdentity(workspace, lease.workspaceIdentity) || !sameIdentity(profile, lease.profileIdentity) ||
+    if (!sameIdentity(workspace, lease.workspaceIdentity) || !sameIdentity(profile.root, lease.profileIdentity) ||
+      Object.keys(lease.profileLayout).some(name =>
+        !sameIdentity(profile.layout[name as keyof ProfileLayout], lease.profileLayout[name as keyof ProfileLayout])) ||
       !sameIdentity(config, lease.configIdentity)) {
       throw new Error('hosted-container-lease-substituted')
     }
@@ -678,20 +878,21 @@ export class HostedOpenCodeContainerSupervisor {
     this.busy.add(record.handle)
     try {
       if (record.stopped) {
-        await this.assertNetworkClaim(record)
+        if (record.createIssued) await this.assertNetworkClaim(record)
         await this.assertNetworkEmpty()
         return { handle: record.handle, generation: record.generation, stopped: true, unresolved: false }
       }
       let inspected: Record<string, unknown>
       try { inspected = await this.inspect(record) }
       catch (error) {
-        if (!(error instanceof HostedContainerNotFound) || record.containerId === null) {
+        if (!(error instanceof HostedContainerNotFound) || record.containerId === null &&
+          (record.createIssued || !(await this.creatorIsDead(record)))) {
           return { handle: record.handle, generation: record.generation, stopped: false, unresolved: true }
         }
         try { await this.inspect(record); throw new Error('hosted-container-stop-state-changed') }
         catch (again) {
           if (!(again instanceof HostedContainerNotFound)) throw again
-          await this.assertNetworkClaim(record)
+          if (record.createIssued) await this.assertNetworkClaim(record)
           await this.assertNetworkEmpty()
           record.stopped = true; await this.persist(record)
           return { handle: record.handle, generation: record.generation, stopped: true, unresolved: false }
