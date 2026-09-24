@@ -14,17 +14,22 @@ const ID = /^[a-z0-9][a-z0-9_-]{7,95}$/
 const GENERATION = /^[0-9a-f]{32}$/
 const DOMAIN = 'agent-teams.hosted-opencode-supervisor/v1'
 
-type Operation = 'start' | 'lookupStart' | 'observe' | 'stop' | 'reconcile' | 'beginEndpointUse' | 'endEndpointUse'
+type Operation = 'prepareMember' | 'startPrepared' | 'start' | 'lookupStart' | 'observe' | 'stop' |
+  'reconcile' | 'beginEndpointUse' | 'endEndpointUse'
 const COMMAND_DEADLINE_MS: Readonly<Record<Operation, number>> = {
+  prepareMember: 30_000, startPrepared: 120_000,
   start: 120_000, lookupStart: 15_000, observe: 30_000, stop: 60_000,
   reconcile: 60_000, beginEndpointUse: 30_000, endEndpointUse: 15_000,
 }
 type Start = Parameters<HostedOpenCodeContainerSupervisor['start']>[0]
 type Handle = Parameters<HostedOpenCodeContainerSupervisor['stop']>[0]
 type EndpointEnd = Parameters<HostedOpenCodeContainerSupervisor['endEndpointUse']>[0]
-type Command = Readonly<{ operation: Operation; payload: Start | Handle | EndpointEnd }>
+type Prepare = Parameters<HostedOpenCodeContainerSupervisor['prepareMember']>[0]
+type PreparedStart = Parameters<HostedOpenCodeContainerSupervisor['startPrepared']>[0]
+type Command = Readonly<{ operation: Operation; payload: Start | Handle | EndpointEnd | Prepare | PreparedStart }>
 type SupervisorPort = Pick<HostedOpenCodeContainerSupervisor,
-  'start' | 'lookupStart' | 'observe' | 'stop' | 'reconcile' | 'beginEndpointUse' | 'endEndpointUse'>
+  'prepareMember' | 'startPrepared' | 'start' | 'lookupStart' | 'observe' | 'stop' | 'reconcile' |
+  'beginEndpointUse' | 'endEndpointUse'>
 
 function exactKeys(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value) &&
@@ -41,6 +46,15 @@ function verify(secret: Uint8Array, direction: 'request' | 'response', unsigned:
 }
 
 function validCommand(operation: unknown, payload: unknown): operation is Operation {
+  if (operation === 'prepareMember') {
+    return exactKeys(payload, ['operationId']) && typeof payload.operationId === 'string' &&
+      ID.test(payload.operationId)
+  }
+  if (operation === 'startPrepared') {
+    return exactKeys(payload, ['operationId', 'receiptId']) &&
+      typeof payload.operationId === 'string' && ID.test(payload.operationId) &&
+      typeof payload.receiptId === 'string' && GENERATION.test(payload.receiptId)
+  }
   if (operation === 'start' || operation === 'lookupStart') {
     const channel = payload && typeof payload === 'object' && 'ownerChannel' in payload
       ? Reflect.get(payload, 'ownerChannel') : undefined
@@ -237,6 +251,8 @@ export class HostedOpenCodeSupervisorRpcServer {
         () => socket.destroy())
       let result: unknown
       switch (command.operation) {
+        case 'prepareMember': result = await this.options.supervisor.prepareMember(command.payload as Prepare); break
+        case 'startPrepared': result = await this.options.supervisor.startPrepared(command.payload as PreparedStart); break
         case 'start': result = await this.options.supervisor.start(command.payload as Start); break
         case 'lookupStart': result = await this.options.supervisor.lookupStart(command.payload as Start); break
         case 'observe': result = await this.options.supervisor.observe(command.payload as Handle); break
@@ -255,7 +271,7 @@ export class HostedOpenCodeSupervisorRpcServer {
 export class HostedOpenCodeSupervisorRpcClient {
   constructor(private readonly options: { socketPath: string; secret: Uint8Array; ownerGid: number;
     testOnlyAllowNonRoot?: boolean; testOnlyCommandDeadlineMs?: number;
-    testOnlyAfterConnectPathStat?: typeof lstat }) {
+    testOnlyAfterConnectPathStat?: (socketPath: string) => Promise<{ dev: number; ino: number }> }) {
     if (options.secret.length !== 32 || !Number.isSafeInteger(options.ownerGid) || options.ownerGid < 0 ||
       options.testOnlyAllowNonRoot && process.env.NODE_ENV !== 'test' ||
       options.testOnlyCommandDeadlineMs !== undefined &&
@@ -268,6 +284,14 @@ export class HostedOpenCodeSupervisorRpcClient {
 
   start(request: Start): ReturnType<HostedOpenCodeContainerSupervisor['start']> {
     return this.command({ operation: 'start', payload: request })
+  }
+
+  prepareMember(request: Prepare): ReturnType<HostedOpenCodeContainerSupervisor['prepareMember']> {
+    return this.command({ operation: 'prepareMember', payload: request })
+  }
+
+  startPrepared(request: PreparedStart): ReturnType<HostedOpenCodeContainerSupervisor['startPrepared']> {
+    return this.command({ operation: 'startPrepared', payload: request })
   }
 
   lookupStart(request: Start): ReturnType<HostedOpenCodeContainerSupervisor['lookupStart']> {

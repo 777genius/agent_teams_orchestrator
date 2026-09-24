@@ -54,9 +54,15 @@ test('Linux supervisor RPC binds commands to a fresh server challenge without ex
   const socketPath = path.join(root, 's.sock')
   const secret = Buffer.alloc(32, 7)
   let starts = 0
+  let prepares = 0
+  let preparedStarts = 0
   let lookups = 0
   let stops = 0
   const supervisor = {
+    prepareMember: async () => { prepares++; return { operationId: START.operationId,
+      receiptId: 'c'.repeat(32), handle: HANDLE.handle, generation: HANDLE.generation,
+      connector: { pid: 123, startTicks: '456' } } },
+    startPrepared: async () => { preparedStarts++; return { ...HANDLE, status: 'unresolved', effectEnabled: false } },
     start: async () => { starts++; return { ...HANDLE, status: 'unresolved', effectEnabled: false } },
     lookupStart: async () => { lookups++; return null },
     observe: async () => ({ ...HANDLE, status: 'stopped', effectEnabled: false }),
@@ -64,7 +70,8 @@ test('Linux supervisor RPC binds commands to a fresh server challenge without ex
     reconcile: async () => ({ ...HANDLE, stopped: true, unresolved: false }),
     beginEndpointUse: async () => { throw new Error('inactive-fixture') },
     endEndpointUse: async () => ({ released: false }),
-  } as unknown as Pick<HostedOpenCodeContainerSupervisor, 'start' | 'lookupStart' | 'observe' |
+  } as unknown as Pick<HostedOpenCodeContainerSupervisor, 'prepareMember' | 'startPrepared' |
+    'start' | 'lookupStart' | 'observe' |
     'stop' | 'reconcile' | 'beginEndpointUse' | 'endEndpointUse'>
   const serverOptions = { socketPath, secret, ownerGid: process.getgid!(), supervisor,
     testOnlyAllowNonRoot: true }
@@ -77,6 +84,17 @@ test('Linux supervisor RPC binds commands to a fresh server challenge without ex
       ownerGid: process.getgid!(), testOnlyAllowNonRoot: true })
     await expect(wrong.start(START)).rejects.toThrow()
     expect(starts).toBe(0)
+    await expect(client.command({ operation: 'prepareMember', payload: { ...START } }))
+      .rejects.toThrow('command-invalid')
+    await expect(client.command({ operation: 'startPrepared', payload: {
+      operationId: START.operationId, receiptId: 'c'.repeat(32), generation: 'd'.repeat(32),
+    } })).rejects.toThrow('command-invalid')
+    expect(await client.prepareMember({ operationId: START.operationId }))
+      .toMatchObject({ generation: HANDLE.generation, connector: { pid: 123, startTicks: '456' } })
+    expect(await client.startPrepared({ operationId: START.operationId, receiptId: 'c'.repeat(32) }))
+      .toMatchObject({ status: 'unresolved' })
+    expect(prepares).toBe(1)
+    expect(preparedStarts).toBe(1)
     expect(await client.start(START)).toMatchObject({ effectEnabled: false, status: 'unresolved' })
     for (let index = 0; index < 4097; index++) {
       await client.lookupStart({ ...START, operationId: `lookup_${String(index).padStart(8, '0')}` })
@@ -121,6 +139,8 @@ test('Linux slow Start times out as uncertain and is recovered by lookup without
   const finished = new Promise<void>(resolve => { finish = resolve })
   const claimed = { ...HANDLE, status: 'unresolved' as const, effectEnabled: false }
   const supervisor = {
+    prepareMember: async () => { throw new Error('inactive-fixture') },
+    startPrepared: async () => { throw new Error('inactive-fixture') },
     start: async () => { starts++; await new Promise(resolve => setTimeout(resolve, 90)); finish(); return claimed },
     lookupStart: async () => starts ? claimed : null,
     observe: async () => ({ ...HANDLE, status: 'stopped', effectEnabled: false }),
@@ -128,7 +148,8 @@ test('Linux slow Start times out as uncertain and is recovered by lookup without
     reconcile: async () => ({ ...HANDLE, stopped: true, unresolved: false }),
     beginEndpointUse: async () => { throw new Error('inactive-fixture') },
     endEndpointUse: async () => ({ released: false }),
-  } as unknown as Pick<HostedOpenCodeContainerSupervisor, 'start' | 'lookupStart' | 'observe' |
+  } as unknown as Pick<HostedOpenCodeContainerSupervisor, 'prepareMember' | 'startPrepared' |
+    'start' | 'lookupStart' | 'observe' |
     'stop' | 'reconcile' | 'beginEndpointUse' | 'endEndpointUse'>
   const server = new HostedOpenCodeSupervisorRpcServer({ socketPath, secret, ownerGid: process.getgid!(),
     supervisor, testOnlyAllowNonRoot: true, testOnlyCommandDeadlineMs: 1000 })

@@ -92,6 +92,10 @@ type StartResult = { handle: string; generation: string; status: 'started' | 'un
 }
 type StartRequest = { operationId: string; leaseId: string; runId: string; teamId: string; laneId: string; memberId: string;
   ownerChannel?: PendingOwnerChannel }
+type ConnectorIdentity = { pid: number; startTicks: string }
+type PreparedMember = { operationId: string; receiptId: string; handle: string; generation: string;
+  connector: ConnectorIdentity }
+type PrepareClaim = { request: StartRequest; receipt: PreparedMember }
 type ProcessEvidence = { pid: number; startTicks: string; pidNamespace: string; netns: string }
 
 export interface HostedOpenCodeContainerSupervisorOptions {
@@ -118,6 +122,9 @@ export interface HostedOpenCodeContainerSupervisorOptions {
   readonly testOnlyProcessEvidence?: (pid: number, phase: 'bootstrap' | 'official') => Promise<ProcessEvidence>
   /** Test-only injection. Production always requires root and the real Docker runner. */
   readonly testOnlyAllowNonRoot?: boolean
+  /** Inert fixture for an eventual independent root authority. Never supplied by the daemon. */
+  readonly testOnlyTrustedMember?: (operationId: string) => Promise<{ request: StartRequest;
+    connector: ConnectorIdentity }>
 }
 
 function digest(value: Buffer): string {
@@ -157,6 +164,7 @@ export class HostedOpenCodeContainerSupervisor {
   private readonly persistedRecords = new Set<string>()
   private readonly operations = new Map<string, { request: string; result: unknown }>()
   private readonly pendingStarts = new Map<string, { request: string; result: Promise<StartResult> }>()
+  private readonly pendingPrepares = new Map<string, Promise<PreparedMember>>()
   private readonly busy = new Set<string>()
   private readonly docker: HostedDockerRunner
   private readonly handoff: HostedFd3HandoffRunner | null
@@ -185,7 +193,8 @@ export class HostedOpenCodeContainerSupervisor {
     if (options.testOnlyAllowNonRoot && (!options.docker || process.env.NODE_ENV !== 'test')) {
       throw new Error('hosted-container-test-runner-required')
     }
-    if (!options.testOnlyAllowNonRoot && (options.testOnlyHandoff || options.testOnlyProcessEvidence)) {
+    if (!options.testOnlyAllowNonRoot && (options.testOnlyHandoff || options.testOnlyProcessEvidence ||
+      options.testOnlyTrustedMember)) {
       throw new Error('hosted-container-test-injection-forbidden')
     }
     if (!options.testOnlyAllowNonRoot && (!options.serverPasswordKey || options.serverPasswordKey.length !== 32 ||
@@ -543,6 +552,139 @@ export class HostedOpenCodeContainerSupervisor {
     } finally { await file.close() }
   }
 
+  private async preparedClaim(operationId: string): Promise<PrepareClaim | null> {
+    const name = path.join(this.options.stateDirectory, `prepare-${operationId}.json`)
+    let file
+    try { file = await open(name, constants.O_RDONLY | constants.O_NOFOLLOW) }
+    catch (error) {
+      if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') return null
+      throw error
+    }
+    try {
+      const stat = await file.stat()
+      if (!stat.isFile() || stat.nlink !== 1 || stat.size < 1 || stat.size > 4096 ||
+        (stat.mode & 0o777) !== 0o600 ||
+        stat.uid !== (this.options.testOnlyAllowNonRoot ? process.getuid?.() : 0)) {
+        throw new Error('hosted-container-prepare-claim-invalid')
+      }
+      const claim = object(JSON.parse(await file.readFile('utf8')))
+      const receipt = object(claim.receipt)
+      const connector = object(receipt.connector)
+      if (!exactKeys(claim, ['request', 'receipt']) ||
+        !exactKeys(claim.request, ['operationId', 'leaseId', 'runId', 'teamId', 'laneId', 'memberId',
+          ...(object(claim.request).ownerChannel === undefined ? [] : ['ownerChannel'])]) ||
+        !exactKeys(receipt, ['operationId', 'receiptId', 'handle', 'generation', 'connector']) ||
+        receipt.operationId !== operationId || object(claim.request).operationId !== operationId ||
+        typeof receipt.receiptId !== 'string' || !/^[0-9a-f]{32}$/.test(receipt.receiptId) ||
+        typeof receipt.handle !== 'string' || !/^opencode_[0-9a-f]{32}$/.test(receipt.handle) ||
+        typeof receipt.generation !== 'string' || !/^[0-9a-f]{32}$/.test(receipt.generation) ||
+        !exactKeys(connector, ['pid', 'startTicks']) || !Number.isSafeInteger(connector.pid) ||
+        Number(connector.pid) < 1 || typeof connector.startTicks !== 'string' ||
+        !/^\d+$/.test(connector.startTicks)) {
+        throw new Error('hosted-container-prepare-claim-invalid')
+      }
+      return claim as PrepareClaim
+    } finally { await file.close() }
+  }
+
+  private async trustedMember(operationId: string): Promise<{ request: StartRequest;
+    connector: ConnectorIdentity }> {
+    const authority = this.options.testOnlyTrustedMember
+    if (!this.options.testOnlyAllowNonRoot || !authority) {
+      throw new Error('hosted-container-independent-root-authority-unavailable')
+    }
+    const binding = await authority(operationId)
+    const { request, connector } = binding
+    if (!request || !exactKeys(request, ['operationId', 'leaseId', 'runId', 'teamId', 'laneId', 'memberId',
+      ...(request.ownerChannel === undefined ? [] : ['ownerChannel'])]) ||
+      request.operationId !== operationId ||
+      !connector || !exactKeys(connector, ['pid', 'startTicks']) ||
+      !Number.isSafeInteger(connector.pid) || connector.pid < 1 ||
+      typeof connector.startTicks !== 'string' || !/^\d+$/.test(connector.startTicks)) {
+      throw new Error('hosted-container-root-authority-invalid')
+    }
+    for (const id of [request.operationId, request.leaseId, request.runId, request.teamId,
+      request.laneId, request.memberId]) boundedId(id)
+    this.validateOwnerChannel(request.ownerChannel)
+    return binding
+  }
+
+  /** Owner supplies only an operation ID; root derives and persists every launch attribute. */
+  async prepareMember(input: { operationId: string }): Promise<PreparedMember> {
+    if (!exactKeys(input, ['operationId'])) throw new Error('hosted-container-prepare-request-invalid')
+    boundedId(input.operationId)
+    const pending = this.pendingPrepares.get(input.operationId)
+    if (pending) return pending
+    const work = this.prepareMemberOnce(input.operationId)
+    this.pendingPrepares.set(input.operationId, work)
+    try { return await work } finally { this.pendingPrepares.delete(input.operationId) }
+  }
+
+  private async prepareMemberOnce(operationId: string): Promise<PreparedMember> {
+    const trusted = await this.trustedMember(operationId)
+    const prior = await this.preparedClaim(operationId)
+    if (prior) {
+      if (!isDeepStrictEqual(prior.request, trusted.request) ||
+        !isDeepStrictEqual(prior.receipt.connector, trusted.connector)) {
+        throw new Error('hosted-container-prepare-replay-conflict')
+      }
+      return prior.receipt
+    }
+    const lease = await this.checkedLease(trusted.request.leaseId)
+    if ([lease.runId, lease.teamId, lease.laneId, lease.memberId].some((id, index) =>
+      id !== [trusted.request.runId, trusted.request.teamId, trusted.request.laneId,
+        trusted.request.memberId][index])) throw new Error('hosted-container-lease-binding-invalid')
+    // Reserve the lease before the receipt. A crash between these claims is safely retryable
+    // for the same operation, while another operation can never mint a second receipt.
+    try { await this.durableClaim(`prepare-lease-${trusted.request.leaseId}.json`, { operationId }) }
+    catch (error) {
+      if (!(error instanceof Error) || error.message !== 'hosted-container-claim-already-issued') throw error
+      const file = await open(path.join(this.options.stateDirectory,
+        `prepare-lease-${trusted.request.leaseId}.json`), constants.O_RDONLY | constants.O_NOFOLLOW)
+      try {
+        const stat = await file.stat()
+        if (!stat.isFile() || stat.nlink !== 1 || stat.size > 128 || (stat.mode & 0o777) !== 0o600 ||
+          stat.uid !== (this.options.testOnlyAllowNonRoot ? process.getuid?.() : 0) ||
+          !isDeepStrictEqual(JSON.parse(await file.readFile('utf8')), { operationId })) {
+          throw new Error('hosted-container-prepare-lease-conflict')
+        }
+      } finally { await file.close() }
+    }
+    const receipt: PreparedMember = { operationId, receiptId: hexName(), handle: `opencode_${hexName()}`,
+      generation: hexName(), connector: trusted.connector }
+    try { await this.durableClaim(`prepare-${operationId}.json`, { request: trusted.request, receipt }) }
+    catch (error) {
+      if (error instanceof Error && error.message === 'hosted-container-claim-already-issued') {
+        const winner = await this.preparedClaim(operationId)
+        if (winner && isDeepStrictEqual(winner.request, trusted.request) &&
+          isDeepStrictEqual(winner.receipt.connector, trusted.connector)) return winner.receipt
+      }
+      throw error
+    }
+    return receipt
+  }
+
+  async startPrepared(input: { operationId: string; receiptId: string }): Promise<StartResult> {
+    if (!exactKeys(input, ['operationId', 'receiptId'])) throw new Error('hosted-container-prepared-start-invalid')
+    boundedId(input.operationId)
+    if (typeof input.receiptId !== 'string' || !/^[0-9a-f]{32}$/.test(input.receiptId)) {
+      throw new Error('hosted-container-prepared-start-invalid')
+    }
+    const claim = await this.preparedClaim(input.operationId)
+    if (!claim || claim.receipt.receiptId !== input.receiptId) {
+      throw new Error('hosted-container-prepare-receipt-invalid')
+    }
+    const trusted = await this.trustedMember(input.operationId)
+    if (!isDeepStrictEqual(claim.request, trusted.request) ||
+      !isDeepStrictEqual(claim.receipt.connector, trusted.connector)) {
+      throw new Error('hosted-container-prepare-replay-conflict')
+    }
+    if (!claim.request.ownerChannel) {
+      throw new Error('hosted-container-pending-owner-channel-required')
+    }
+    return this.startWithReservation(claim.request, claim.receipt)
+  }
+
   /** Recovery is conservative: a claimed Start never authorizes a second create or effects. */
   async lookupStart(request: StartRequest): Promise<StartResult | null> {
     if (!exactKeys(request, ['operationId', 'leaseId', 'runId', 'teamId', 'laneId', 'memberId',
@@ -804,6 +946,19 @@ export class HostedOpenCodeContainerSupervisor {
    * durable handoff claim, FD3 transfer, independent official proof. A lost result never replays.
    */
   async start(request: StartRequest): Promise<StartResult> {
+    // The legacy direct Start exists for inert fixtures only. Production needs an independent
+    // root authority and per-member network before any Docker effect can be admitted.
+    if (!this.options.testOnlyAllowNonRoot) {
+      throw new Error('hosted-container-independent-root-authority-unavailable')
+    }
+    boundedId(request.operationId)
+    if (await this.preparedClaim(request.operationId)) {
+      throw new Error('hosted-container-prepared-start-required')
+    }
+    return this.startWithReservation(request)
+  }
+
+  private async startWithReservation(request: StartRequest, prepared?: PreparedMember): Promise<StartResult> {
     if (!exactKeys(request, ['operationId', 'leaseId', 'runId', 'teamId', 'laneId', 'memberId',
       ...(request.ownerChannel ? ['ownerChannel'] : [])])) {
       throw new Error('hosted-container-start-request-invalid')
@@ -823,19 +978,25 @@ export class HostedOpenCodeContainerSupervisor {
       if (pending.request !== requestKey) throw new Error('hosted-container-operation-replay-conflict')
       return pending.result
     }
-    const result = this.startOnce(request, requestKey)
+    const result = this.startOnce(request, requestKey, prepared)
     this.pendingStarts.set(request.operationId, { request: requestKey, result })
     try { return await result } finally { this.pendingStarts.delete(request.operationId) }
   }
 
-  private async startOnce(request: StartRequest, requestKey: string): Promise<StartResult> {
+  private async startOnce(request: StartRequest, requestKey: string,
+    prepared?: PreparedMember): Promise<StartResult> {
     const claimed = await this.startClaim(request)
-    if (claimed) return claimed
+    if (claimed) {
+      if (prepared && (claimed.handle !== prepared.handle || claimed.generation !== prepared.generation)) {
+        throw new Error('hosted-container-prepare-start-claim-conflict')
+      }
+      return claimed
+    }
     if (!this.leases.has(request.leaseId) || this.consumed.has(request.leaseId)) {
       throw new Error('hosted-container-lease-unavailable')
     }
     this.consumed.add(request.leaseId)
-    return this.startReserved(request, requestKey)
+    return this.startReserved(request, requestKey, prepared)
   }
 
   private validateOwnerChannel(channel: PendingOwnerChannel | undefined): void {
@@ -847,13 +1008,15 @@ export class HostedOpenCodeContainerSupervisor {
     }
   }
 
-  private async startReserved(request: StartRequest, requestKey: string): Promise<StartResult> {
+  private async startReserved(request: StartRequest, requestKey: string,
+    prepared?: PreparedMember): Promise<StartResult> {
     const lease = await this.checkedLease(request.leaseId, true)
     if (lease.runId !== request.runId || lease.teamId !== request.teamId || lease.laneId !== request.laneId ||
       lease.memberId !== request.memberId) {
       throw new Error('hosted-container-lease-binding-invalid')
     }
-    const record: ContainerRecord = { handle: `opencode_${hexName()}`, generation: hexName(),
+    const record: ContainerRecord = { handle: prepared?.handle ?? `opencode_${hexName()}`,
+      generation: prepared?.generation ?? hexName(),
       operationId: request.operationId, creator: await this.currentCreator(),
       lease, containerId: null, createIssued: false, stopped: false }
     try {
@@ -862,7 +1025,12 @@ export class HostedOpenCodeContainerSupervisor {
     } catch (error) {
       if (error instanceof Error && error.message === 'hosted-container-claim-already-issued') {
         const prior = await this.startClaim(request)
-        if (prior) return prior
+        if (prior) {
+          if (prepared && (prior.handle !== prepared.handle || prior.generation !== prepared.generation)) {
+            throw new Error('hosted-container-prepare-start-claim-conflict')
+          }
+          return prior
+        }
       }
       throw error
     }

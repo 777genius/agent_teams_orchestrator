@@ -489,6 +489,74 @@ describe('disposable hosted OpenCode container supervisor', () => {
     } finally { await f.cleanup() }
   })
 
+  test('root-issued prepare receipt binds authority and permits only one prepared Start', async () => {
+    let leaseId = ''
+    let memberId = 'member_12345678'
+    let startTicks = '12345'
+    const operationId = 'start_12345678'
+    const authority = async (id: string) => ({ request: { operationId: id, leaseId,
+      runId: 'run_12345678', teamId: 'team_12345678', laneId: 'lane_12345678', memberId,
+      ownerChannel: { socketPath: '/tmp/test-pending-owner.sock', challenge: 'a'.repeat(64) } },
+      connector: { pid: 99999, startTicks } })
+    const f = await fixture({ testOnlyTrustedMember: authority })
+    leaseId = f.leaseId
+    try {
+      const receipt = await f.supervisor.prepareMember({ operationId })
+      expect(receipt).toMatchObject({ operationId, connector: { pid: 99999, startTicks } })
+      expect(receipt.handle).toMatch(/^opencode_[0-9a-f]{32}$/)
+      expect(receipt.generation).toMatch(/^[0-9a-f]{32}$/)
+      expect(await f.supervisor.prepareMember({ operationId })).toEqual(receipt)
+      expect(f.docker.calls.filter(call => call[0] === 'create')).toHaveLength(0)
+      await expect(f.supervisor.prepareMember({ operationId: 'start_87654321' }))
+        .rejects.toThrow('prepare-lease-conflict')
+      const beforeStartRestart = await HostedOpenCodeContainerSupervisor.create(f.options)
+      expect(await beforeStartRestart.prepareMember({ operationId })).toEqual(receipt)
+      await expect(beforeStartRestart.startPrepared({ operationId, receiptId: receipt.receiptId }))
+        .rejects.toThrow('lease-unavailable')
+      expect(f.docker.calls.filter(call => call[0] === 'create')).toHaveLength(0)
+      memberId = 'member_87654321'
+      await expect(f.supervisor.prepareMember({ operationId })).rejects.toThrow('prepare-replay-conflict')
+      await expect(f.supervisor.startPrepared({ operationId, receiptId: receipt.receiptId }))
+        .rejects.toThrow('prepare-replay-conflict')
+      memberId = 'member_12345678'
+      startTicks = '99999'
+      await expect(f.supervisor.startPrepared({ operationId, receiptId: receipt.receiptId }))
+        .rejects.toThrow('prepare-replay-conflict')
+      startTicks = '12345'
+      await expect(f.supervisor.startPrepared({ operationId, receiptId: '0'.repeat(32) }))
+        .rejects.toThrow('prepare-receipt-invalid')
+      await expect(f.start()).rejects.toThrow('prepared-start-required')
+      const first = await f.supervisor.startPrepared({ operationId, receiptId: receipt.receiptId })
+      expect(first).toMatchObject({ handle: receipt.handle, generation: receipt.generation,
+        effectEnabled: false, status: 'unresolved' })
+      expect(await f.supervisor.startPrepared({ operationId, receiptId: receipt.receiptId })).toEqual(first)
+      expect(f.docker.calls.filter(call => call[0] === 'create')).toHaveLength(1)
+      expect(f.docker.calls.filter(call => call[0] === 'start')).toHaveLength(1)
+      const restarted = await HostedOpenCodeContainerSupervisor.create(f.options)
+      expect(await restarted.startPrepared({ operationId, receiptId: receipt.receiptId }))
+        .toEqual({ ...first, status: 'unresolved', effectEnabled: false })
+      expect(f.docker.calls.filter(call => call[0] === 'create')).toHaveLength(1)
+      expect(f.docker.calls.filter(call => call[0] === 'start')).toHaveLength(1)
+    } finally { await f.cleanup() }
+  })
+
+  test('prepared Start without a pending Owner channel has no Docker effect', async () => {
+    let leaseId = ''
+    const operationId = 'start_12345678'
+    const f = await fixture({ testOnlyTrustedMember: async () => ({
+      request: { operationId, leaseId, runId: 'run_12345678', teamId: 'team_12345678',
+        laneId: 'lane_12345678', memberId: 'member_12345678' },
+      connector: { pid: 99999, startTicks: '12345' },
+    }) })
+    leaseId = f.leaseId
+    try {
+      const receipt = await f.supervisor.prepareMember({ operationId })
+      await expect(f.supervisor.startPrepared({ operationId, receiptId: receipt.receiptId }))
+        .rejects.toThrow('pending-owner-channel-required')
+      expect(f.docker.calls.filter(call => call[0] === 'create')).toHaveLength(0)
+    } finally { await f.cleanup() }
+  })
+
   test('dead creator permits pre-create absence reconciliation but never uncertain Docker create', async () => {
     if (process.platform !== 'linux') return
     for (const createIssued of [false, true]) {
