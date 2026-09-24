@@ -133,14 +133,15 @@ describe('HostedMemberNetworkProvisioner', () => {
     expect(f.docker.createCalls).toBe(1)
   })
 
-  test('admission drift blocks recovery and cleanup before Docker mutation', async () => {
+  test('revoked admission blocks recovery but permits exact claimed cleanup and replay', async () => {
     let admitted = true
     const f = await fixture(async () => admitted)
     await f.provisioner.provision(REQUEST)
     admitted = false
     await expect(f.provisioner.reconcile(REQUEST)).rejects.toThrow('hosted-network-member-not-admitted')
-    await expect(f.provisioner.cleanup(REQUEST)).rejects.toThrow('hosted-network-member-not-admitted')
-    expect(f.docker.removed).toEqual([])
+    await f.provisioner.cleanup(REQUEST)
+    await f.provisioner.cleanup(REQUEST)
+    expect(f.docker.removed).toEqual([ID])
   })
 
   test('admission withdrawn after claim prevents Docker create', async () => {
@@ -159,6 +160,47 @@ describe('HostedMemberNetworkProvisioner', () => {
     f.docker.network!.Labels = { [MARKER]: 'c'.repeat(64) }
     await expect(f.provisioner.reconcile(REQUEST)).rejects.toThrow('hosted-network-unverified')
     expect(f.docker.removed).toEqual([])
+  })
+
+  test('revoked cleanup refuses a foreign endpoint and changed network ID', async () => {
+    let admitted = true
+    const f = await fixture(async () => admitted)
+    await f.provisioner.provision(REQUEST)
+    admitted = false
+    f.docker.network!.Containers = { foreign: { Name: 'foreign' } }
+    await expect(f.provisioner.cleanup(REQUEST)).rejects.toThrow('hosted-network-unverified')
+    f.docker.network!.Containers = {}
+    f.docker.network!.Id = 'c'.repeat(64)
+    await expect(f.provisioner.cleanup(REQUEST)).rejects.toThrow('hosted-network-unresolved')
+    expect(f.docker.removed).toEqual([])
+    expect(await readdir(f.stateDirectory)).not.toContain(`network-cleanup-intent-${REQUEST.operationId}.json`)
+  })
+
+  test('revoked cleanup cannot replay a claim with another member identity', async () => {
+    let admitted = true
+    const f = await fixture(async () => admitted)
+    await f.provisioner.provision(REQUEST)
+    admitted = false
+    await expect(f.provisioner.cleanup({ ...REQUEST, memberId: 'member002' })).rejects.toThrow()
+    await expect(f.provisioner.cleanup({ ...REQUEST, laneId: 'lane00002' }))
+      .rejects.toThrow('hosted-network-claim-invalid')
+    expect(f.docker.removed).toEqual([])
+    await f.provisioner.cleanup(REQUEST)
+    expect(f.docker.removed).toEqual([ID])
+  })
+
+  test('missing durable result after crash remains residue under revoked admission', async () => {
+    let admitted = true
+    const f = await fixture(async () => admitted, async kind => {
+      if (kind === 'result') throw new Error('simulated-crash-before-result-publication')
+    })
+    await expect(f.provisioner.provision(REQUEST))
+      .rejects.toThrow('simulated-crash-before-result-publication')
+    admitted = false
+    await expect(f.provisioner.cleanup(REQUEST)).rejects.toThrow('hosted-network-cleanup-id-unresolved')
+    expect(f.docker.network?.Id).toBe(ID)
+    expect(f.docker.removed).toEqual([])
+    expect(await readdir(f.stateDirectory)).not.toContain(`network-cleanup-intent-${REQUEST.operationId}.json`)
   })
 
   test('an IPv6 or masquerading policy drift cannot be returned as a usable network', async () => {

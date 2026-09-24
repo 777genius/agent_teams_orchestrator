@@ -124,7 +124,7 @@ async function assertTrustedAncestors(directory: string): Promise<void> {
 
 export type HostedMemberNetworkProvisionerOptions = Readonly<{
   stateDirectory: string
-  /** Independent trusted plan authority, checked again on every recovery or cleanup. */
+  /** Independent trusted plan authority, checked again on provision and reconcile. */
   admitMember(request: HostedMemberNetworkRequest): Promise<boolean>
   /** Inert fixture only; production always uses root-owned Docker CLI. */
   testOnlyDocker?: HostedMemberNetworkDockerPort
@@ -350,11 +350,16 @@ export class HostedMemberNetworkProvisioner {
     return id
   }
 
-  /** Removes only an empty network with the claim's exact name, marker and durable ID. */
+  /** Removes only an empty network with the claim's exact name, marker and durable ID.
+   * Cleanup remains possible after admission is revoked. The root-only caller must
+   * establish stop/cleanup authority before calling this method. A claim without
+   * a published result ID is ambiguous residue, never authority to choose an ID.
+   */
   async cleanup(request: HostedMemberNetworkRequest): Promise<void> {
-    await this.admitted(request)
+    validRequest(request)
     const claim = await this.readClaim(request)
-    const id = await this.readDurableId('result', request.operationId) ?? await this.reconcile(request)
+    const id = await this.readDurableId('result', request.operationId)
+    if (!id) throw new Error('hosted-network-cleanup-id-unresolved')
     await this.writeDurableId('result', request.operationId, id)
     const intent = await this.readDurableId('cleanup-intent', request.operationId)
     const terminal = await this.readDurableId('cleanup-terminal', request.operationId)
@@ -370,19 +375,15 @@ export class HostedMemberNetworkProvisioner {
     const inspected = await this.docker.inspect(id)
     if (!inspected) {
       if (!intent || !await this.exactAbsent(claim, id)) throw new Error('hosted-network-unresolved')
-      await this.admitted(request)
       await this.writeDurableId('cleanup-terminal', request.operationId, id)
       return
     }
     this.verified(inspected, claim, id)
-    await this.admitted(request)
     await this.writeDurableId('cleanup-intent', request.operationId, id)
-    await this.admitted(request)
     await this.assertStateDirectory()
     try { await this.docker.remove(id) }
     catch (error) { if (!await this.exactAbsent(claim, id)) throw error }
     if (!await this.exactAbsent(claim, id)) throw new Error('hosted-network-cleanup-unresolved')
-    await this.admitted(request)
     await this.writeDurableId('cleanup-terminal', request.operationId, id)
   }
 
