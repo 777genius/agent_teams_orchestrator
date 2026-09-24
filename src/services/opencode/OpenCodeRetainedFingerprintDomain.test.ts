@@ -125,10 +125,24 @@ test('fresh selected sessions retain the managed fingerprint domain', async () =
     expect(JSON.parse(await readFile(registryPath, 'utf8')).hosts[record.hostKey].resolvedConfigFingerprint)
       .toBe('f'.repeat(64))
     expect(children).toHaveLength(1)
-    // The same stale record with an actually dead, fixture-owned PID must be replaced.
+    // A dead root alone cannot prove that its process tree has stopped. Keep
+    // the original fingerprint evidence until terminal recovery retires it.
     const oldChild = children[0]
     await stopFixtureChild(oldChild)
-    const fresh = await probeFor(managers()).probeRetainingHost(project, { selectedModel })
+    const blocked = await probeFor(managers()).probeRetainingHost(project, { selectedModel })
+    expect(blocked.snapshot.hostHealthy).toBe(false)
+    expect(children).toHaveLength(1)
+    const beforeRecovery = JSON.parse(await readFile(registryPath, 'utf8'))
+    expect(beforeRecovery.hosts[record.hostKey].resolvedConfigFingerprint).toBe('f'.repeat(64))
+    const recovery = managers()
+    expect(await recovery.withConfirmedAbsentHostAuthority({ hostKey: record.hostKey,
+      runtimePid: record.runtimePid, expectedProcessStartedAtMs: beforeRecovery.hosts[record.hostKey].processStartedAtMs,
+    }, async () => true)).toBe(true)
+    const tombstoned = JSON.parse(await readFile(registryPath, 'utf8'))
+    expect(tombstoned.hosts[record.hostKey]).toBeUndefined()
+    expect(Object.values(tombstoned.recoveryTrees).some((tree: any) =>
+      tree.pid === record.runtimePid && tree.resolvedConfigFingerprint === 'f'.repeat(64))).toBe(true)
+    const fresh = await probeFor(recovery).probeRetainingHost(project, { selectedModel })
     expect(fresh.snapshot.hostHealthy).toBe(true)
     expect(fresh.host?.pid).not.toBe(record.runtimePid!)
     expect(fresh.host?.resolvedConfigFingerprint).toBe(profile.managedConfigFingerprint)
@@ -141,6 +155,15 @@ test('fresh selected sessions retain the managed fingerprint domain', async () =
     expect(children).toHaveLength(2)
     await cached.release(true)
     await stopFixtureChild(children[1])
+    const blockedCached = await probeFor(cachedManager).probeRetainingHost(project, { selectedModel })
+    expect(blockedCached.snapshot.hostHealthy).toBe(false)
+    expect(children).toHaveLength(2)
+    const oldGeneration = JSON.parse(await readFile(registryPath, 'utf8')).hosts[record.hostKey]
+    expect(await cachedManager.withConfirmedAbsentHostAuthority({ hostKey: record.hostKey,
+      runtimePid: cached.host!.pid, expectedProcessStartedAtMs: oldGeneration.processStartedAtMs,
+    }, async () => true)).toBe(true)
+    const retainedTrees = Object.values(JSON.parse(await readFile(registryPath, 'utf8')).recoveryTrees) as Array<{ pid: number }>
+    expect(retainedTrees.map(tree => tree.pid)).toContain(cached.host!.pid)
     const recovered = await probeFor(cachedManager).probeRetainingHost(project, { selectedModel })
     expect(recovered.snapshot.hostHealthy).toBe(true)
     expect(recovered.host?.pid).not.toBe(cached.host?.pid)

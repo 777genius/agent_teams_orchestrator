@@ -269,9 +269,18 @@ test('provider fixture supplies an isolated MCP entry to the production resolver
           assert.equal(env[key], undefined, 'Fixture must not use an inherited MCP override');
         }
         const resolver = fileURLToPath(new URL('../../src/services/opencode/OpenCodeMcpManager.ts', import.meta.url));
+        const portableResolver = fileURLToPath(new URL('../../src/utils/portableCli.ts', import.meta.url));
         const program = `
           import assert from 'node:assert/strict';
           const { resolveOpenCodeAppMcpLaunchConfig } = await import(${JSON.stringify(resolver)});
+          const { resolveDirectWindowsLauncher } = await import(${JSON.stringify(portableResolver)});
+          const originalPlatform = process.platform;
+          Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+          try {
+            assert.deepEqual(resolveDirectWindowsLauncher(process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH), {
+              command: 'node', argsPrefix: [${JSON.stringify(path.join(root, 'fake-opencode.cjs'))}],
+            });
+          } finally { Object.defineProperty(process, 'platform', { value: originalPlatform, configurable: true }); }
           const resolved = await resolveOpenCodeAppMcpLaunchConfig({
             pathExists: async () => { throw new Error('Fixture must not discover a sibling app'); },
           });
