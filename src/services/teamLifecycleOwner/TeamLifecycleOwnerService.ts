@@ -7,7 +7,11 @@ import type {
   HostedLifecycleScope,
 } from '../hostedControl/HostedLifecycleProviderRegistry.js'
 import type { HostedLifecycleAction, HostedLifecycleProviderSnapshot } from '../hostedControl/HostedLifecycleSnapshot.js'
-import type { TeamLifecycleLaunchPlan, TeamLifecycleLaunchPlanStore } from './TeamLifecycleLaunchPlan.js'
+import type {
+  TeamLifecycleLaunchPlan,
+  TeamLifecycleLaunchPlanAdmission,
+  TeamLifecycleLaunchPlanStore,
+} from './TeamLifecycleLaunchPlan.js'
 
 export type TeamLifecycleOwnerState = HostedLifecycleProviderSnapshot
 
@@ -44,6 +48,10 @@ export type TeamLifecycleOwnerServiceOptions = {
   effectGuard?: () => boolean | Promise<boolean>
 }
 
+export type TeamLifecycleExactPlanAdmission =
+  | { kind: 'admitted'; workspaceId: string; teamId: string; planGeneration: string }
+  | { kind: 'not_found' | 'unavailable' }
+
 /** A narrow hosted registry adapter; it never accepts plans from a caller or browser. */
 export class TeamLifecycleOwnerService implements HostedLifecycleProviderAdapter {
   readonly providerId: string
@@ -53,6 +61,35 @@ export class TeamLifecycleOwnerService implements HostedLifecycleProviderAdapter
     this.providerId = options.providerId ?? 'team-lifecycle-owner'
   }
 
+  /** Read-only owner admission for the exact plan privately published under the team root. */
+  async admitLaunchPlan(input: {
+    scope: HostedLifecycleScope
+    workspaceRoot: string
+    expectedPlanGeneration: string
+  }): Promise<TeamLifecycleExactPlanAdmission> {
+    return this.#serialized(input.scope, async () => {
+      if (!/^plan-generation_[0-9a-f]{64}$/.test(input.expectedPlanGeneration)) {
+        return { kind: 'unavailable' }
+      }
+      let admission: TeamLifecycleLaunchPlanAdmission | null
+      try {
+        admission = await this.options.planStore.load(input.scope)
+      } catch {
+        return { kind: 'unavailable' }
+      }
+      if (!admission) return { kind: 'not_found' }
+      if (admission.plan.workspaceId !== input.scope.workspaceId ||
+        admission.plan.teamId !== input.scope.teamId ||
+        admission.plan.workspaceRoot !== input.workspaceRoot ||
+        admission.planGeneration !== input.expectedPlanGeneration ||
+        !(await this.#admissionCurrent(admission))) {
+        return { kind: 'unavailable' }
+      }
+      return { kind: 'admitted', workspaceId: input.scope.workspaceId,
+        teamId: input.scope.teamId, planGeneration: admission.planGeneration }
+    })
+  }
+
   async inspect(scope: HostedLifecycleScope): Promise<HostedLifecycleProviderInspection> {
     return this.#serialized(scope, async () => {
       const plan = await this.options.planStore.load(scope)
@@ -60,7 +97,8 @@ export class TeamLifecycleOwnerService implements HostedLifecycleProviderAdapter
       const observed = await this.options.execution.inspect(plan.plan)
       if (!observed || !this.#validSnapshot(observed)) return { kind: 'unavailable' }
       const snapshot = bindPlanGeneration(observed, plan.planGeneration)
-      if (!(await this.#capabilityCurrent(plan.plan, snapshot))) {
+      if (!(await this.#capabilityCurrent(plan.plan, snapshot)) ||
+        !(await this.#admissionCurrent(plan))) {
         return { kind: 'unavailable' }
       }
       return { kind: 'owned', snapshot }
@@ -84,25 +122,27 @@ export class TeamLifecycleOwnerService implements HostedLifecycleProviderAdapter
         !actionAllowed(before, input.action, input.runId)) {
         return { kind: 'unavailable' }
       }
-      if (!(await this.#supportsSafeClosure(admission.plan, input.action)) || !(await admission.isCurrent())) {
+      if (!(await this.#supportsSafeClosure(admission.plan, input.action)) ||
+        !(await this.#admissionCurrent(admission))) {
         return { kind: 'unavailable' }
       }
-      if (this.options.effectGuard && !(await this.options.effectGuard())) return { kind: 'unavailable' }
+      const effectGuard = () => this.#admissionCurrent(admission)
+      if (!(await effectGuard())) return { kind: 'unavailable' }
       let rawAfter: TeamLifecycleOwnerState
       const effectInput: TeamLifecycleOwnerEffectInput = {
         plan: admission.plan,
         commandId: input.commandId,
         runId: input.runId,
         expectedProviderGeneration: rawBefore.providerGeneration,
-        effectGuard: this.options.effectGuard,
+        effectGuard,
       }
       try {
-        if (this.options.effectGuard && !(await this.options.effectGuard())) return { kind: 'unavailable' }
+        if (!(await effectGuard())) return { kind: 'unavailable' }
         rawAfter = await this.options.execution[input.action](effectInput)
       } catch {
         return { kind: 'unavailable' }
       }
-      if (!this.#validSnapshot(rawAfter) || this.options.effectGuard && !(await this.options.effectGuard())) return { kind: 'unavailable' }
+      if (!this.#validSnapshot(rawAfter) || !(await effectGuard())) return { kind: 'unavailable' }
       const after = bindPlanGeneration(rawAfter, admission.planGeneration)
       if (!this.#validTransition(before, after, input.action, input.runId) ||
         !(await this.#capabilityCurrent(admission.plan, after))) return { kind: 'unavailable' }
@@ -110,11 +150,20 @@ export class TeamLifecycleOwnerService implements HostedLifecycleProviderAdapter
       if (!rawConfirmed || !this.#validSnapshot(rawConfirmed)) return { kind: 'unavailable' }
       const confirmed = bindPlanGeneration(rawConfirmed, admission.planGeneration)
       if (!this.#validConfirmation(after, confirmed, input.action, input.runId) ||
-        !(await this.#capabilityCurrent(admission.plan, confirmed)) || !(await admission.isCurrent())) {
+        !(await this.#capabilityCurrent(admission.plan, confirmed)) || !(await effectGuard())) {
         return { kind: 'unavailable' }
       }
       return { kind: 'applied', snapshot: confirmed }
     })
+  }
+
+  async #admissionCurrent(admission: TeamLifecycleLaunchPlanAdmission): Promise<boolean> {
+    try {
+      return await admission.isCurrent() &&
+        (!this.options.effectGuard || await this.options.effectGuard())
+    } catch {
+      return false
+    }
   }
 
   #validSnapshot(snapshot: TeamLifecycleOwnerState): boolean {

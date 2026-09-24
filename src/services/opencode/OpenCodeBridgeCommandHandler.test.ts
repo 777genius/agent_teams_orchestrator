@@ -9,6 +9,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import {
   __getAppMcpPreflightTimeoutMsForTests,
   __resetAppMcpToolProofCacheForTests,
+  createOwnedOpenCodeHostedInboxExecutor,
   executeOpenCodeBridgeCommandEnvelope,
 } from './OpenCodeBridgeCommandHandler.js'
 import { openCodeCommandOutcomeStore } from './OpenCodeCommandOutcomeStore.js'
@@ -1301,6 +1302,42 @@ describe('OpenCodeBridgeCommandHandler', () => {
       ...body, expectedCapabilitySnapshotId: handshake.runtime.capabilitySnapshotId,
     }) }
   }
+
+  test('hosted inbox executor rechecks owner after selected send preflight', async () => {
+    const { record, state, envelope } = await setupSelectedDeliveryRegression('opencode.sendMessage')
+    const selectedRunId = 'run_1'
+    state.records = [{ ...record, runId: selectedRunId }]
+    const entered = createDeferred<void>()
+    const resume = createDeferred<void>()
+    const ensureMcp = openCodeSessionBridge.ensureSessionAppMcpReady
+    openCodeSessionBridge.ensureSessionAppMcpReady = async (...args) => {
+      entered.resolve()
+      await resume.promise
+      return ensureMcp(...args)
+    }
+    openCodeSessionBridge.promptAsyncUntilAccepted = async (_record, params) => {
+      await params.onPromptSubmitting?.({ sessionId: record.opencodeSessionId,
+        runtimePromptMessageId: 'msg-hosted-test', baseUrl: 'http://127.0.0.1:4096' })
+      await params.beforePromptTransport?.()
+      state.prompts++
+      return { runtimePromptMessageId: 'msg-hosted-test', hookDiagnostics: [] }
+    }
+    let current = true
+    const execute = createOwnedOpenCodeHostedInboxExecutor()
+    const pending = execute({
+      command: 'send', requestId: 'hosted-inbox-guard-test', teamId: record.teamId,
+      laneId: record.laneId!, memberName: record.memberName, runId: selectedRunId,
+      projectPath: record.projectPath, sessionId: record.opencodeSessionId,
+      capabilitySnapshotId: String(envelope.body.expectedCapabilitySnapshotId),
+      messageId: `message_${'a'.repeat(32)}`, payloadHash: 'b'.repeat(64), text: 'hello',
+    }, async () => current)
+    await waitForCommandStage(entered.promise, pending, 'hosted send preflight')
+    current = false
+    resume.resolve()
+    const result = await pending
+    expect(result.ok).toBe(false)
+    expect(state.prompts).toBe(0)
+  })
 
   for (const command of ['opencode.sendMessage', 'opencode.observeMessageDelivery']) {
     for (const change of ['replacement run', 'session', 'host', 'PID', 'scope', 'stopped', 'missing member']) {

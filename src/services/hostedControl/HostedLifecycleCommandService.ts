@@ -134,12 +134,21 @@ export interface HostedLifecycleAuthorityGuard {
   isCurrent(authority: HostedLifecycleAuthority): boolean | Promise<boolean>
 }
 
+export interface HostedLifecyclePlanAdmissionPort {
+  admitLaunchPlan(input: {
+    scope: { workspaceId: string; teamId: string }
+    workspaceRoot: string
+    expectedPlanGeneration: string
+  }): Promise<{ kind: 'admitted' | 'not_found' | 'unavailable' }>
+}
+
 /** Strict hosted-wire adapter. It deliberately cannot construct a desktop lifecycle owner. */
 export class HostedLifecycleCommandService implements HostedLifecycleCommandPort {
   constructor(
     private readonly effects: HostedLifecycleAuthorityEffectPort,
     private readonly guard: HostedLifecycleAuthorityGuard,
     private readonly now: () => number = Date.now,
+    private readonly planAdmission?: HostedLifecyclePlanAdmissionPort,
   ) {
     for (const method of ['getControlState', 'authorize', 'revalidate', 'execute', 'release'] as const) {
       if (typeof effects[method] !== 'function') {
@@ -158,6 +167,26 @@ export class HostedLifecycleCommandService implements HostedLifecycleCommandPort
       return unavailable(input.operation)
     }
     if (isQueryOperation(input.operation)) {
+      if (input.operation === 'admit_launch_plan') {
+        const request = launchPlanAdmissionRequest(input.payload.request, input.authority)
+        const decision = this.planAdmission
+          ? await this.planAdmission.admitLaunchPlan({
+            scope: { workspaceId: request.workspaceId, teamId: request.teamId },
+            workspaceRoot: request.workspaceRoot,
+            expectedPlanGeneration: request.expectedPlanGeneration,
+          })
+          : { kind: 'unavailable' as const }
+        if (!(await this.#requestCurrent(context, input.authority))) return unavailable(input.operation)
+        return {
+          payload: decision.kind === 'admitted'
+            ? { schemaVersion: 1, kind: 'admitted', workspaceId: request.workspaceId,
+              teamId: request.teamId, planGeneration: request.expectedPlanGeneration }
+            : decision.kind === 'not_found'
+              ? { schemaVersion: 1, kind: 'not_found' }
+              : { schemaVersion: 1, kind: 'unavailable', retryAfterMs: null },
+          resourceRevision: null,
+        }
+      }
       const request = controlStateRequest(input.payload.request, input.authority)
       const method = input.operation === 'control_state' ? this.effects.getControlState :
         input.operation === 'prepare' || input.operation === 'prepare_provisioning' ? this.effects.prepareProvisioning :
@@ -232,7 +261,7 @@ function unavailable(operation: HostedLifecycleOperation): { payload: Record<str
 }
 
 function isQueryOperation(operation: HostedLifecycleOperation): boolean {
-  return operation === 'control_state' || operation === 'prepare' || operation === 'get_status' ||
+  return operation === 'control_state' || operation === 'admit_launch_plan' || operation === 'prepare' || operation === 'get_status' ||
     operation === 'prepare_provisioning' || operation === 'get_provisioning_status'
 }
 
@@ -278,6 +307,25 @@ function controlStateRequest(value: unknown, authority: HostedLifecycleAuthority
     throw new TypeError('Invalid hosted lifecycle control state scope')
   }
   return { schemaVersion: 1 as const, workspaceId: authority.workspaceId, teamId: authority.teamId }
+}
+
+function launchPlanAdmissionRequest(value: unknown, authority: HostedLifecycleAuthority) {
+  const record = exactRecord(value,
+    ['schemaVersion', 'workspaceId', 'teamId', 'workspaceRoot', 'expectedPlanGeneration'],
+    'launch plan admission request')
+  if (record.schemaVersion !== 1 || record.workspaceId !== authority.workspaceId ||
+    record.teamId !== authority.teamId || typeof record.workspaceRoot !== 'string' ||
+    !record.workspaceRoot.startsWith('/') || record.workspaceRoot.includes('\0') ||
+    typeof record.expectedPlanGeneration !== 'string' ||
+    !/^plan-generation_[0-9a-f]{64}$/.test(record.expectedPlanGeneration)) {
+    throw new TypeError('Invalid hosted lifecycle launch plan admission request')
+  }
+  return {
+    workspaceId: authority.workspaceId,
+    teamId: authority.teamId,
+    workspaceRoot: record.workspaceRoot,
+    expectedPlanGeneration: record.expectedPlanGeneration,
+  }
 }
 
 function lifecycleCommand(value: unknown, authority: HostedLifecycleAuthority): LifecycleCommand {

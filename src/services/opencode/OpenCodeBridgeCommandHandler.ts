@@ -5019,6 +5019,7 @@ async function runStop(
 async function runSendMessage(
   envelope: BridgeEnvelope,
   authority?: Awaited<ReturnType<typeof probeStoredLaneAuthority>>,
+  hostedInboxEffectGuard?: () => Promise<boolean>,
 ): Promise<{
   snapshot: OpenCodeProvisioningSnapshot
   deliveryRuntime?: ReturnType<typeof createRuntimeSnapshot>
@@ -5066,6 +5067,9 @@ async function runSendMessage(
       error: `No stored OpenCode session record for ${teamId}/${laneId}/${memberName}`,
     })
     throw new Error(`No stored OpenCode session record for ${teamId}/${laneId}/${memberName}`)
+  }
+  if (asString(body.expectedSessionId) && record.opencodeSessionId !== body.expectedSessionId) {
+    throw new Error('OpenCode selected delivery session changed before prompt submission')
   }
   await assertStoredDeliveryAuthority(record, authority)
   let deliveryRecord = record
@@ -5136,6 +5140,9 @@ async function runSendMessage(
     runId,
     diagnostics: mcpDiagnostics,
   })
+  if (asString(body.expectedSessionId) && deliveryRecord.opencodeSessionId !== body.expectedSessionId) {
+    throw new Error('OpenCode selected delivery session was replaced before prompt submission')
+  }
   snapshot = authoritySnapshot ?? buildSendMessageStoredSessionSnapshot(projectPath, deliveryRecord)
   await markSendMessageOutcome(outcomeBase, {
     status: 'session_resolved',
@@ -5377,6 +5384,9 @@ async function runSendMessage(
         parts: fileParts,
         agent: deliveryAgent,
         noReply: false,
+        ...(hostedInboxEffectGuard ? { beforePromptTransport: async () => {
+          if (!(await hostedInboxEffectGuard())) throw new Error('Hosted inbox authority changed before prompt transport')
+        } } : {}),
         onPromptDefinitelyUnsubmitted,
         onPromptSubmitting: async ({ sessionId, runtimePromptMessageId }) => {
           await markSendMessageOutcome(outcomeBase, {
@@ -5682,6 +5692,9 @@ async function runObserveMessageDelivery(
   const record = await openCodeSessionStore.get(teamId, laneId, memberName)
   if (!record) {
     throw new Error(`No stored OpenCode session record for ${teamId}/${laneId}/${memberName}`)
+  }
+  if (requestedSessionId && record.opencodeSessionId !== requestedSessionId) {
+    throw new Error('OpenCode selected delivery observation session changed')
   }
   await assertStoredDeliveryAuthority(record, authority)
   const projectPath = asString(body.projectPath) ?? envelope.cwd
@@ -6164,6 +6177,7 @@ async function handleEnvelope(
   runtimeDeadline?: OpenCodeRuntimeDeadline,
   externalSignal?: AbortSignal,
   lifecycleOwner = false,
+  hostedInboxEffectGuard?: () => Promise<boolean>,
 ) {
   switch (envelope.command) {
     case 'opencode.handshake': {
@@ -6296,7 +6310,7 @@ async function handleEnvelope(
       if (expectedCapabilitySnapshotId(envelope.body)) {
         if (!runtimeDeadline) throw new Error('OpenCode delivery authority deadline was not initialized')
         return withStoredLaneAuthority(envelope, envelope.command, runtimeDeadline, externalSignal,
-          retained => runSendMessage(envelope, retained))
+          retained => runSendMessage(envelope, retained, hostedInboxEffectGuard))
       }
       return runSendMessage(envelope)
     case 'opencode.observeMessageDelivery': {
@@ -6372,9 +6386,75 @@ export function createOwnedOpenCodeLifecycleCommandExecutor() {
   }
 }
 
+/** The hosted inbox can submit only a selected teammate prompt and inspect that exact attempt. */
+export function createOwnedOpenCodeHostedInboxExecutor() {
+  return async (input: {
+    command: 'send' | 'status' | 'observe'
+    requestId: string
+    teamId: string
+    laneId: string
+    memberName: string
+    runId: string
+    projectPath: string
+    sessionId: string
+    capabilitySnapshotId: string
+    messageId: string
+    payloadHash: string
+    text?: string
+    runtimePromptMessageId?: string
+  }, effectGuard: () => Promise<boolean>, signal?: AbortSignal) => {
+    if (!/^run_[A-Za-z0-9][A-Za-z0-9._-]{0,250}$/.test(input.runId)
+      || !/^opencode:[a-f0-9]{32}$/.test(input.capabilitySnapshotId)
+      || !/^message_[0-9a-f]{32}$/.test(input.messageId)
+      || !/^[0-9a-f]{64}$/.test(input.payloadHash)
+      || !input.sessionId || !input.teamId || !input.laneId || !input.memberName) {
+      throw new TypeError('Invalid hosted inbox selected OpenCode authority')
+    }
+    if (input.command === 'send' && !input.text) throw new TypeError('Hosted inbox text is required')
+    signal?.throwIfAborted()
+    if (!(await effectGuard())) throw new Error('Hosted inbox authority is no longer current')
+    const command = input.command === 'send' ? 'opencode.sendMessage'
+      : input.command === 'observe' ? 'opencode.observeMessageDelivery' : 'opencode.commandStatus'
+    const body: Record<string, unknown> = {
+      teamId: input.teamId,
+      teamName: input.teamId,
+      laneId: input.laneId,
+      memberName: input.memberName,
+      runId: input.runId,
+      projectPath: input.projectPath,
+      sessionId: input.sessionId,
+      expectedSessionId: input.sessionId,
+      expectedCapabilitySnapshotId: input.capabilitySnapshotId,
+      messageId: input.messageId,
+      payloadHash: input.payloadHash,
+      deliveryAttemptId: input.requestId,
+      ...(input.command === 'send' ? { text: input.text, settlementMode: 'acceptance' } : {}),
+      ...(input.command === 'observe' && input.runtimePromptMessageId
+        ? { runtimePromptMessageId: input.runtimePromptMessageId } : {}),
+      ...(input.command === 'status' ? { originalRequestId: input.requestId } : {}),
+    }
+    return executeOpenCodeBridgeCommandEnvelopeInternal({
+      schemaVersion: 1,
+      requestId: input.command === 'send' ? input.requestId : `${input.requestId}-${input.command}`,
+      command,
+      cwd: input.projectPath,
+      startedAt: nowIso(),
+      timeoutMs: input.command === 'send' ? 120_000 : 30_000,
+      body,
+    }, { signal, hostedInboxEffectGuard: input.command === 'send'
+      ? async () => {
+        signal?.throwIfAborted()
+        const current = await effectGuard()
+        signal?.throwIfAborted()
+        return current
+      }
+      : undefined })
+  }
+}
+
 async function executeOpenCodeBridgeCommandEnvelopeInternal(
   input: unknown,
-  options: { signal?: AbortSignal } = {},
+  options: { signal?: AbortSignal; hostedInboxEffectGuard?: () => Promise<boolean> } = {},
   ownerCapability?: typeof HOSTED_LIFECYCLE_OWNER_CAPABILITY,
 ) {
   const startedAtMs = Date.now()
@@ -6421,6 +6501,7 @@ async function executeOpenCodeBridgeCommandEnvelopeInternal(
       runtimeDeadline,
       options.signal,
       ownerCapability === HOSTED_LIFECYCLE_OWNER_CAPABILITY,
+      options.hostedInboxEffectGuard,
     )
     if (envelope.command === 'opencode.readiness') {
       runtimeDeadline?.throwIfExpired()

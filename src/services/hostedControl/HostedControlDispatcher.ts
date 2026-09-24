@@ -22,6 +22,7 @@ import {
 
 const LIFECYCLE_OPERATIONS = [
   'control_state',
+  'admit_launch_plan',
   'prepare',
   'get_status',
   // Compatibility spellings used by the first hosted-controller prototype.
@@ -281,6 +282,18 @@ function decodeLifecyclePayload(
         : ['command', 'authorization', 'durableCommand', 'context', 'authority']
   exactKeys(payload, expectedKeys, 'lifecycle payload')
   record(payload[queryOperation ? 'request' : 'command'], 'lifecycle command')
+  if (operation === 'admit_launch_plan') {
+    const request = record(payload.request, 'lifecycle plan admission request')
+    exactKeys(request, ['schemaVersion', 'workspaceId', 'teamId', 'workspaceRoot', 'expectedPlanGeneration'],
+      'lifecycle plan admission request')
+    if (request.schemaVersion !== 1 || request.workspaceId !== expected.workspaceId ||
+      request.teamId !== expected.teamId || typeof request.workspaceRoot !== 'string' ||
+      !request.workspaceRoot.startsWith('/') || request.workspaceRoot.includes('\0') ||
+      typeof request.expectedPlanGeneration !== 'string' ||
+      !/^plan-generation_[0-9a-f]{64}$/.test(request.expectedPlanGeneration)) {
+      throw new Error('Invalid lifecycle plan admission request')
+    }
+  }
   if (!queryOperation && operation !== 'authorize') {
     record(payload.authorization, 'lifecycle authorization')
   }
@@ -491,6 +504,16 @@ function decodeLifecycleResponsePayload(
       exactKeys(payload, ['schemaVersion', 'kind'], 'lifecycle not found response')
       return payload
     }
+    if (operation === 'admit_launch_plan') {
+      exactKeys(payload, ['schemaVersion', 'kind', 'workspaceId', 'teamId', 'planGeneration'],
+        'lifecycle plan admission response')
+      if (payload.kind !== 'admitted' || payload.workspaceId !== request.authority.workspaceId ||
+        payload.teamId !== request.authority.teamId ||
+        payload.planGeneration !== record(request.request, 'plan admission request').expectedPlanGeneration) {
+        throw new Error('Invalid lifecycle plan admission response')
+      }
+      return payload
+    }
     const expectedKind = operation === 'control_state' ? 'control_state' :
       operation === 'prepare' || operation === 'prepare_provisioning' ? 'prepared' :
         operation === 'get_status' ? 'status' : 'provisioning_status'
@@ -670,6 +693,7 @@ function lifecycleResponseRevision(
   payload: Record<string, unknown>,
 ): string | null {
   if (payload.kind === 'not_found' || payload.kind === 'unavailable') return null
+  if (operation === 'admit_launch_plan') return null
   if (payload.kind === 'control_state' || payload.kind === 'prepared' || payload.kind === 'status' ||
     payload.kind === 'provisioning_status') return nullableRevision(payload.resourceRevision)
   if (operation === 'release') return nullableRevision(record(payload.authorization, 'lifecycle authorization').resourceRevision)
@@ -819,7 +843,7 @@ function isLifecycleOperation(value: unknown): value is HostedLifecycleOperation
   return LIFECYCLE_OPERATIONS.includes(value as HostedLifecycleOperation)
 }
 function isLifecycleQueryOperation(operation: HostedLifecycleOperation): boolean {
-  return operation === 'control_state' || operation === 'prepare' || operation === 'get_status' ||
+  return operation === 'control_state' || operation === 'admit_launch_plan' || operation === 'prepare' || operation === 'get_status' ||
     operation === 'prepare_provisioning' || operation === 'get_provisioning_status'
 }
 function isMessageOperation(value: unknown): value is HostedTeamMessageOperation {

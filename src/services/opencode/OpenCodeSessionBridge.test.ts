@@ -3399,6 +3399,36 @@ describe('OpenCodeSessionBridge', () => {
     ])
   })
 
+  test('checks hosted authority after prompt arming and before prompt transport', async () => {
+    let promptCalls = 0
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
+      hostManager: { ensureHost: async () => host, releaseHost: async () => {} },
+      clientFactory: { create: () => ({
+        getConfig: async () => { throw new Error('not used') },
+        getConfigProviders: async () => { throw new Error('not used') },
+        getProviders: async () => { throw new Error('not used') },
+        getProviderAuth: async () => { throw new Error('not used') },
+        listAgents: async () => { throw new Error('not used') },
+        getMcp: async () => { throw new Error('not used') },
+        createSession: async () => ({ id: 'session-new' }),
+        getSession: async () => ({ id: 'session-1' }),
+        getSessionStatus: async () => ({}),
+        getSessionMessages: async () => [],
+        getPermissions: async () => [],
+        sendSessionMessage: async () => ({ info: {}, parts: [] }),
+        promptSessionAsync: async () => { promptCalls++ },
+        abortSession: async () => true,
+      }) },
+    })
+    await expect(bridge.promptAsyncUntilAccepted(buildRecord(), {
+      text: 'Must remain unsubmitted',
+      onPromptSubmitting: async () => {},
+      beforePromptTransport: async () => { throw new Error('hosted owner revoked') },
+    })).rejects.toThrow('hosted owner revoked')
+    expect(promptCalls).toBe(0)
+  })
+
   test('allocates prompt_async message ids after latest canonical OpenCode message id', async () => {
     const latestAssistantMessageId = buildOpenCodeRuntimePromptMessageId({
       timestampMs: Date.now(),

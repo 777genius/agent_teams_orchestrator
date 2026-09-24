@@ -19,6 +19,35 @@ afterEach(async () => {
 })
 
 describe('HostedControlServer', () => {
+  test('notifies advisory recovery only after authenticated readiness retains the sole lease', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'hosted-readiness-recovery-'))
+    roots.push(root)
+    const socketPath = join(root, 'private', 'control.sock')
+    const secret = Buffer.alloc(32, 9)
+    const fixture = hostedControlGoldenRequestFixture()
+    const { socketIdentity: _, ...ownerIdentity } = fixture.ownerBinding
+    let callbacks = 0
+    let leaseCurrent: Promise<boolean> | null = null
+    const server = new HostedControlServer({
+      socketPath, secret, ownerIdentity, authority: fixture.authority,
+      service: { mutate: async () => ({ kind: 'unavailable' as const }) },
+      dispatchCoexistingOperation: async () => null,
+      onReadinessLease: () => { callbacks++; leaseCurrent = server.hasActiveLease() },
+    })
+    servers.push(server)
+    await server.start()
+    expect(await exchange(socketPath, `${JSON.stringify({ schemaVersion: 2, operation: 'readiness',
+      capability: 'hosted-lifecycle-command', socketIdentity: server.ownerBinding!.socketIdentity,
+      challenge: 'f'.repeat(64), ownerProof: '0'.repeat(64) })}\n`)).toBe('')
+    expect(callbacks).toBe(0)
+    const lease = await openReadiness(socketPath, server.ownerBinding!)
+    expect(await leaseCurrent).toBe(true)
+    expect(callbacks).toBe(1)
+    expect(await exchange(socketPath, legacyReadinessLine(server.ownerBinding!))).toBe('')
+    expect(callbacks).toBe(1)
+    lease.socket.destroy()
+  })
+
   test('enforces descriptor-v2 exact binding and legacy string-config readiness policy', () => {
     const secret = Buffer.alloc(32, 9)
     const fixture = hostedControlGoldenRequestFixture()

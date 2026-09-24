@@ -92,6 +92,78 @@ describe('pending native OAuth session authority', () => {
   })
   afterEach(async () => { await rm(root, { recursive: true, force: true }) })
 
+  test.each(['same session', 'replaced session'])
+    ('final hosted guard rejection settles an armed OAuth receipt without submitting a prompt: %s', async scenario => {
+    const { buildOpenCodeExpectedBehaviorEvidence } = await import('./OpenCodeExpectedBehaviorFingerprint.js')
+    const { effectiveAgentsFixture } = await import('./OpenCodeEffectiveAgents.test-support.js')
+    const savedEnv = { ...process.env }
+    Object.assign(process.env, env)
+    const hosts = new OpenCodeHostManager({ persistentRegistryPath: registryPath })
+    const restores: Array<{ mockRestore(): void }> = []
+    let posts = 0
+    let checks = 0
+    const receiptPath = `${global}.agent-teams-xai-oauth-save.json`
+    try {
+      owner.record = { ...owner.record, toolApprovalMode: 'auto', opencodeVersion: 'TEST',
+        expectedBehaviorFingerprint: (await buildOpenCodeExpectedBehaviorEvidence({ profile,
+          fullModelId: owner.record.selectedModel,
+          effectiveConfigFingerprint: profile.managedConfigFingerprint })).expectedBehaviorFingerprint,
+        resolvedBehaviorFingerprint: profile.managedConfigFingerprint }
+      await sessionStore.upsert(owner.record)
+      restores.push(spyOn(hosts, 'ensureHost').mockImplementation(async input => ({
+        hostKey: owner.record.hostKey, profileRootKey: profile.profileRootKey, projectPath: project,
+        projectBehaviorFingerprint: profile.projectBehaviorFingerprint, baseUrl: owner.baseUrl, port: 43210,
+        pid: process.pid, processStartedAtMs: owner.processStartedAtMs, version: 'TEST', state: 'healthy',
+        profile: input.preparedProfile!, resolvedConfigFingerprint: profile.managedConfigFingerprint, diagnostics: [],
+      })))
+      restores.push(spyOn(hosts, 'releaseHost').mockImplementation(async () => {}))
+      const mcp = { 'agent-teams': { status: 'connected' } }
+      const promptBridge = new OpenCodeSessionBridge({ hostManager: hosts, sessionStore,
+        prepareProfile: async () => profile,
+        mcpManager: { ensureAppMcp: async () => ({ mcp,
+          summary: { status: 'present', connected: true, matchedServerName: 'agent-teams', diagnostics: [] } }) } as never,
+        clientFactory: { create: () => ({
+          getMcp: async () => mcp,
+          getConfig: async () => JSON.parse(JSON.stringify(profile.managedConfig)
+            .replace(/\{env:([^}]+)\}/g, (_match, name) => profile.env[name] || '')),
+          listAgents: async () => effectiveAgentsFixture(profile.managedConfig, profile.xdgDataHome),
+          getSessionStatus: async () => ({}),
+          getSessionMessages: async () => [],
+          promptSessionAsync: async () => { posts++ },
+        }) as never },
+      })
+      let unsubmitted = 0
+      await expect(promptBridge.promptAsyncUntilAccepted(owner.record, {
+        text: 'TEST guarded message',
+        beforePromptTransport: async () => {
+          checks++
+          if (checks === 2) {
+            expect(await Bun.file(receiptPath).exists()).toBe(true)
+            if (scenario === 'replaced session') {
+              expect(await sessionStore.deleteIfSession(owner.record)).toBe(true)
+              await sessionStore.upsert({ ...owner.record, runId: 'run-replaced',
+                opencodeSessionId: 'replacement-session' })
+            }
+            throw new Error('TEST hosted owner revoked after arm')
+          }
+        },
+        onPromptDefinitelyUnsubmitted: async () => { unsubmitted++ },
+      })).rejects.toThrow('TEST hosted owner revoked after arm')
+      expect(checks).toBe(2)
+      expect(unsubmitted).toBe(1)
+      expect(posts).toBe(0)
+      expect(await Bun.file(receiptPath).exists()).toBe(false)
+      expect(await readSaved()).toEqual(c0)
+      if (scenario === 'replaced session') {
+        expect((await sessionStore.get('TEST', 'primary', 'owner'))?.opencodeSessionId).toBe('replacement-session')
+      }
+    } finally {
+      for (const restore of restores.reverse()) restore.mockRestore()
+      for (const key of Object.keys(process.env)) if (!(key in savedEnv)) delete process.env[key]
+      Object.assign(process.env, savedEnv)
+    }
+  })
+
   test('relay recovery observes both owned sessions while the shared OAuth writer is pending', async () => {
     // The selected members share the native host and one saved-publication slot.
     const other = { ...owner.record, memberName: 'other', runId: 'run-2', opencodeSessionId: 'other-session' }

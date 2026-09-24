@@ -94,6 +94,36 @@ function effects(overrides: Partial<HostedLifecycleAuthorityEffectPort> = {}) {
 }
 
 describe('HostedLifecycleCommandService', () => {
+  test('admits an exact plan only while the authenticated owner authority is current', async () => {
+    const fixture = effects()
+    const expectedPlanGeneration = `plan-generation_${'a'.repeat(64)}`
+    const input = {
+      operation: 'admit_launch_plan' as const,
+      payload: { request: { schemaVersion: 1, workspaceId: authority.workspaceId,
+        teamId: authority.teamId, workspaceRoot: '/sandbox/workspace', expectedPlanGeneration },
+        context, authority },
+      authority,
+    }
+    let admissions = 0
+    const service = new HostedLifecycleCommandService(fixture.value, { isCurrent: () => true }, () => 1, {
+      admitLaunchPlan: async () => { admissions++; return { kind: 'admitted' } },
+    })
+    await expect(service.dispatch(input)).resolves.toEqual({
+      payload: { schemaVersion: 1, kind: 'admitted', workspaceId: authority.workspaceId,
+        teamId: authority.teamId, planGeneration: expectedPlanGeneration },
+      resourceRevision: null,
+    })
+    expect(admissions).toBe(1)
+    const denied = new HostedLifecycleCommandService(fixture.value, { isCurrent: () => false }, () => 1, {
+      admitLaunchPlan: async () => { admissions++; return { kind: 'admitted' } },
+    })
+    await expect(denied.dispatch(input)).resolves.toMatchObject({ payload: { kind: 'unavailable' } })
+    expect(admissions).toBe(1)
+    await expect(service.dispatch({ ...input, payload: { ...input.payload,
+      request: { ...input.payload.request, teamId: 'team_other' } } })).rejects.toThrow('admission request')
+    expect(admissions).toBe(1)
+  })
+
   test('preserves a fail-closed unavailable control state without requiring a revision', async () => {
     const fixture = effects({
       getControlState: async () => ({ schemaVersion: 2, kind: 'unavailable', retryAfterMs: null }),

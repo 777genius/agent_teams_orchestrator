@@ -69,6 +69,8 @@ export type HostedControlServerOptions = {
     phase: 'owner_ready' | 'ready', socket: Socket,
   ) => void | Promise<void>
   dispatchCoexistingOperation?: (message: Record<string, unknown>, rawLine: string) => Promise<Record<string, unknown> | null>
+  /** Advisory callback after a signed readiness request retains the owner lease. */
+  onReadinessLease?: () => void
   /** Optional one-use approval activation transport. Lifecycle readiness remains independent. */
   activationSessionFactory?: HostedApprovalActivationSessionFactory
 }
@@ -665,11 +667,13 @@ export class HostedControlServer {
     if (admission.protocol === 'legacy') {
       const unsigned = { schemaVersion: 2 as const, kind: 'ready' as const, capability: 'hosted-lifecycle-command' as const, challenge: admission.challenge, ownerBinding }
       socket.write(`${JSON.stringify({ ...unsigned, ownerProof: createHostedDomainProof(this.#options.secret, HOSTED_LIFECYCLE_PROOF_DOMAIN, 'readiness', unsigned) })}\n`)
+      try { this.#options.onReadinessLease?.() } catch { /* readiness owns the lease regardless of advisory recovery */ }
       return
     }
     const unsigned = { schemaVersion: 2 as const, kind: 'ready' as const, capability: 'hosted-lifecycle-command' as const, challenge: admission.challenge, bootstrapDigest: admission.bootstrapDigest, ownerBinding }
     const response = { ...unsigned, ownerProof: createHostedRawDomainProof(this.#options.secret, HOSTED_LIFECYCLE_PROOF_DOMAIN, 'readiness', JSON.stringify(unsigned)) }
     socket.write(`${JSON.stringify(response)}\n`)
+    try { this.#options.onReadinessLease?.() } catch { /* readiness owns the lease regardless of advisory recovery */ }
   }
 
   async #hasCurrentSocketIdentity(): Promise<boolean> {

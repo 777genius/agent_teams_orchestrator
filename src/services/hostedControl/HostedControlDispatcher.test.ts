@@ -60,6 +60,24 @@ const lifecycleAuthorization = {
 }
 
 describe('HostedControlDispatcher response decoding', () => {
+  test('accepts exact signed launch-plan admission and rejects extra request or response fields', async () => {
+    const planGeneration = `plan-generation_${'a'.repeat(64)}`
+    const response = {
+      payload: { schemaVersion: 1, kind: 'admitted', workspaceId: authority.workspaceId,
+        teamId: authority.teamId, planGeneration },
+      resourceRevision: null,
+    }
+    const valid = signedPlanAdmissionRequest(planGeneration)
+    await expect(lifecycleDispatcher(response).dispatch(valid)).resolves.toMatchObject({
+      operation: 'admit_launch_plan', payload: { kind: 'admitted', planGeneration },
+    })
+    const extended = signedPlanAdmissionRequest(planGeneration, { planJson: '{}' })
+    await expect(lifecycleDispatcher(response).dispatch(extended)).rejects.toThrow('keys')
+    await expect(lifecycleDispatcher({
+      payload: { ...response.payload, planJson: '{}' }, resourceRevision: null,
+    }).dispatch(valid)).rejects.toThrow('keys')
+  })
+
   test('rejects lifecycle extension fields before creating a response proof', async () => {
     const dispatcher = new HostedControlDispatcher({
       secret,
@@ -372,6 +390,28 @@ function signedLifecycleRequest(operation: 'control_state' | 'prepare' | 'get_st
     },
   }
   return rawSigned(unsigned)
+}
+
+function signedPlanAdmissionRequest(
+  expectedPlanGeneration: string,
+  extraRequest: Record<string, unknown> = {},
+): Record<string, unknown> {
+  const operation = 'admit_launch_plan'
+  const exchangeId = `lifecycle-request_${'d'.repeat(32)}`
+  return rawSigned({
+    schemaVersion: 2,
+    exchangeId,
+    operation,
+    provenance: provenance(exchangeId, operation),
+    ownerBinding,
+    ownerEffectFence: lifecycleAuthority.ownerEffectFence,
+    payload: {
+      request: { schemaVersion: 1, workspaceId: authority.workspaceId, teamId: authority.teamId,
+        workspaceRoot: '/sandbox/workspace', expectedPlanGeneration, ...extraRequest },
+      context: lifecycleContext,
+      authority: { ...lifecycleAuthority, resourceRevision: null },
+    },
+  })
 }
 
 function signedExecuteRequest(action: 'launch' | 'recover'): Record<string, unknown> {

@@ -3056,6 +3056,7 @@ export class OpenCodeProfileManager {
     operation: (armNativeSession: (owner: OpenCodeOAuthNativeSessionOwner) => Promise<void>,
       armNativeProbe: (owner: OpenCodeOAuthNativeProbeOwner) => Promise<void>) => Promise<T>
     isNativeSettled?: (value: T) => boolean
+    isNativeDefinitelyUnsubmitted?: (value: T) => boolean
     allowNativeContinuation?: boolean
     abortSignal?: AbortSignal
   }): Promise<T> {
@@ -3159,6 +3160,7 @@ export class OpenCodeProfileManager {
         await armSession({ ...native, sessionAuthorities })
       }, armProbe),
       isNativeSettled: input.isNativeSettled,
+      isNativeDefinitelyUnsubmitted: input.isNativeDefinitelyUnsubmitted,
       allowNativeContinuation: input.allowNativeContinuation,
       recoveryOwner: authority.scope.purpose === 'catalog' ? undefined : {
         projectPath: authority.snapshot.projectPath, purpose: authority.scope.purpose,

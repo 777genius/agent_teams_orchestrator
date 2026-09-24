@@ -5,6 +5,8 @@ import * as path from 'node:path'
 
 import type { HostedLifecycleProviderSnapshot } from '../hostedControl/HostedLifecycleSnapshot.js'
 import type { HostedLifecycleAction } from '../hostedControl/HostedLifecycleSnapshot.js'
+import { DurableTeamLifecycleExecution } from './DurableTeamLifecycleExecution.js'
+import type { TeamLifecycleLaneEffectPort, TeamLifecycleLaneObservation } from './OpenCodeTeamLifecycleLane.js'
 import {
   PrivateFileTeamLifecycleLaunchPlanStore,
   parseTeamLifecycleLaunchPlan,
@@ -79,6 +81,112 @@ class FakeExecution implements TeamLifecycleExecutionPort {
 }
 
 describe('TeamLifecycleOwnerService', () => {
+  test('admits only the exact private plan generation, scope, and workspace root', async () => {
+    const temporaryDir = await fs.mkdtemp(path.join(os.tmpdir(), 'team-lifecycle-exact-plan-'))
+    try {
+      const dir = await fs.realpath(temporaryDir)
+      const file = path.join(dir, 'hosted-lifecycle-plan.v1.json')
+      await fs.writeFile(file, JSON.stringify(plan), { mode: 0o600 })
+      const store = new PrivateFileTeamLifecycleLaunchPlanStore(file)
+      const expectedPlanGeneration = (await store.load(scope))!.planGeneration
+      const execution = new FakeExecution()
+      const owner = new TeamLifecycleOwnerService({ planStore: store, execution })
+      const request = { scope, workspaceRoot: plan.workspaceRoot, expectedPlanGeneration }
+
+      expect(await owner.admitLaunchPlan(request)).toEqual({ kind: 'admitted', ...scope,
+        planGeneration: expectedPlanGeneration })
+      expect(await owner.admitLaunchPlan({ ...request, expectedPlanGeneration: `plan-generation_${'0'.repeat(64)}` }))
+        .toEqual({ kind: 'unavailable' })
+      expect(await owner.admitLaunchPlan({ ...request, workspaceRoot: '/tmp/other-workspace' }))
+        .toEqual({ kind: 'unavailable' })
+      expect(await owner.admitLaunchPlan({ ...request, scope: { ...scope, teamId: 'team_other' } }))
+        .toEqual({ kind: 'not_found' })
+      expect(await owner.admitLaunchPlan({ ...request, scope: { ...scope, workspaceId: 'workspace_other' } }))
+        .toEqual({ kind: 'not_found' })
+      expect(execution.calls).toEqual([])
+
+      const replacement = path.join(dir, 'replacement.json')
+      await fs.writeFile(replacement, `${JSON.stringify(plan)}\n`, { mode: 0o600 })
+      await fs.rename(replacement, file)
+      expect(await owner.admitLaunchPlan(request)).toEqual({ kind: 'unavailable' })
+    } finally {
+      await fs.rm(temporaryDir, { recursive: true, force: true })
+    }
+  })
+
+  test('a replaced plan stops an already accepted asynchronous launch before lane effects', async () => {
+    const temporaryDir = await fs.mkdtemp(path.join(os.tmpdir(), 'team-lifecycle-async-plan-'))
+    const dir = await fs.realpath(temporaryDir)
+    const file = path.join(dir, 'hosted-lifecycle-plan.v1.json')
+    const singleLanePlan: TeamLifecycleLaunchPlan = {
+      ...plan,
+      lanes: [{
+        laneId: 'opencode_lane', kind: 'opencode', provider: 'opencode', selectedModel: 'provider/model',
+        members: [{ name: 'worker', prompt: 'Test fixture only.' }],
+      }],
+    }
+    await fs.writeFile(file, JSON.stringify(singleLanePlan), { mode: 0o600 })
+    const privateStore = new PrivateFileTeamLifecycleLaunchPlanStore(file)
+    let releaseLaneGuard!: () => void
+    const laneGuardGate = new Promise<void>(resolve => { releaseLaneGuard = resolve })
+    let enteredLaneGuard!: () => void
+    const laneGuardEntered = new Promise<void>(resolve => { enteredLaneGuard = resolve })
+    let checks = 0
+    const gatedStore: TeamLifecycleLaunchPlanStore = {
+      load: async input => {
+        const admission = await privateStore.load(input)
+        if (!admission) return null
+        return {
+          ...admission,
+          isCurrent: async () => {
+            if (++checks === 5) {
+              enteredLaneGuard()
+              await laneGuardGate
+            }
+            return admission.isCurrent()
+          },
+        }
+      },
+    }
+    let laneEffects = 0
+    const lane: TeamLifecycleLaneEffectPort = {
+      kind: 'opencode',
+      supports: () => true,
+      inspect: async () => ({ phase: 'idle', recoverable: false }),
+      launch: async (): Promise<TeamLifecycleLaneObservation> => {
+        laneEffects++
+        return { phase: 'running', recoverable: false }
+      },
+      cancel: async () => ({ phase: 'idle', recoverable: false }),
+      stop: async () => ({ phase: 'idle', recoverable: false }),
+      recover: async () => ({ phase: 'idle', recoverable: false }),
+    }
+    const execution = new DurableTeamLifecycleExecution(path.join(dir, 'execution.json'), [lane])
+    try {
+      const owner = new TeamLifecycleOwnerService({ planStore: gatedStore, execution })
+      const inspected = await owner.inspect(scope)
+      if (inspected.kind !== 'owned') throw new Error('expected owner')
+      const accepted = owner.execute({
+        scope, action: 'launch', commandId: 'command_async', runId: null,
+        expectedProviderGeneration: inspected.snapshot.providerGeneration,
+      })
+      await laneGuardEntered
+      expect(await accepted).toMatchObject({ kind: 'applied', snapshot: { phase: 'launching' } })
+      expect(laneEffects).toBe(0)
+
+      const replacement = path.join(dir, 'replacement.json')
+      await fs.writeFile(replacement, `${JSON.stringify(singleLanePlan)}\n`, { mode: 0o600 })
+      await fs.rename(replacement, file)
+      releaseLaneGuard()
+      await execution.close()
+      expect(laneEffects).toBe(0)
+    } finally {
+      releaseLaneGuard()
+      await execution.close()
+      await fs.rm(temporaryDir, { recursive: true, force: true })
+    }
+  })
+
   test('owns a strict private plan covering Anthropic, Codex, Gemini and OpenCode through one composite port', async () => {
     const execution = new FakeExecution()
     const service = new TeamLifecycleOwnerService({ planStore: new MemoryPlanStore(), execution })

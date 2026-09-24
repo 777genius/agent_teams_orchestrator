@@ -45,6 +45,8 @@ export type HostedControlRuntimePorts = {
   activationSessionFactory?: HostedApprovalActivationSessionFactory
   /** Synchronously fences the stable approval port; returned work is cleanup only. */
   revoke?(): Promise<void>
+  /** Triggered after authenticated readiness retains the active owner lease. */
+  onReadinessLease?(): void
   close(): Promise<void>
 }
 
@@ -225,6 +227,7 @@ export class HostedControlRuntime {
         bootstrapBinding: descriptorAdmission?.bootstrapBinding,
         dispatchCoexistingOperation: (message, rawLine) => dispatcher.dispatch(message, rawLine),
         activationSessionFactory: ports.activationSessionFactory,
+        onReadinessLease: () => ports?.onReadinessLease?.(),
       })
       dispatcher = new HostedControlDispatcher({
         secret,

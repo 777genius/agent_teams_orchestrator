@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { chmod, mkdir, mkdtemp, readdir, realpath, rm, writeFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -52,6 +53,32 @@ afterEach(async () => {
 })
 
 describe('createHostedControlProductionPorts', () => {
+  test('read-only plan admission uses the canonical private team-root file and exact digest', async () => {
+    const teamRoot = await makeTeamRoot('hosted-production-plan-admission-')
+    await writePlan(teamRoot, 'opencode')
+    const ports = await createHostedControlProductionPorts(context(teamRoot))
+    const raw = await readFile(join(teamRoot, HOSTED_LIFECYCLE_PLAN_FILE))
+    const expectedPlanGeneration = `plan-generation_${createHash('sha256').update(raw).digest('hex')}`
+    const input = controlStateInput()
+    const planRequest = {
+      ...input,
+      operation: 'admit_launch_plan' as const,
+      payload: { ...input.payload, request: {
+        schemaVersion: 1, workspaceId: stableAuthority.workspaceId, teamId,
+        workspaceRoot: join(teamRoot, 'sandbox-workspace'), expectedPlanGeneration,
+      } },
+    }
+    await expect(ports.lifecycle.dispatch(planRequest)).resolves.toEqual({
+      payload: { schemaVersion: 1, kind: 'admitted', workspaceId: stableAuthority.workspaceId,
+        teamId, planGeneration: expectedPlanGeneration },
+      resourceRevision: null,
+    })
+    await expect(ports.lifecycle.dispatch({ ...planRequest, payload: { ...planRequest.payload,
+      request: { ...planRequest.payload.request, workspaceRoot: join(teamRoot, 'other-workspace') } } }))
+      .resolves.toMatchObject({ payload: { kind: 'unavailable' } })
+    expect(await readdir(teamRoot)).not.toContain(HOSTED_LIFECYCLE_EXECUTION_STATE_FILE)
+  })
+
   test('normal production composition starts capability-false until trusted approval authority is published', async () => {
     const teamRoot = await makeTeamRoot('hosted-production-missing-approval-admission-')
     await writePlan(teamRoot, 'opencode')

@@ -674,6 +674,7 @@ export async function withOpenCodeOwnedOAuthRefresh<T>(input: {
   operation: (armNativeSession: (owner: OpenCodeOAuthNativeSessionOwner) => Promise<void>,
     armNativeProbe: (owner: OpenCodeOAuthNativeProbeOwner) => Promise<void>) => Promise<T>
   isNativeSettled?: (value: T) => boolean
+  isNativeDefinitelyUnsubmitted?: (value: T) => boolean
   allowNativeContinuation?: boolean
   recoveryOwner?: OpenCodeOAuthSaveOwner
   abortSignal?: AbortSignal
@@ -805,6 +806,20 @@ export async function withOpenCodeOwnedOAuthRefresh<T>(input: {
     let publicationAttempt: OpenCodeOAuthSuccessorAuthority | undefined
     try {
       const value = await input.operation(armNativeSession, armNativeProbe)
+      if (nativeReceipt && input.isNativeDefinitelyUnsubmitted?.(value)) {
+        // The caller proved that transport was never invoked after this exact
+        // arm. Retire its receipt only while the predecessor is still intact;
+        // a changed credential needs normal recovery rather than this shortcut.
+        const managedAfter = await readOpenCodeAuthCredential({ authPath: input.managedAuthPath, providerId })
+        const sourcesAfter = await Promise.all(sourceAuthPaths.map(readOpenCodeAuthStore))
+        if (!isDeepStrictEqual(managedAfter, predecessor)
+          || sourcesAfter.some((store, index) => !isDeepStrictEqual(store[providerId], before[index][providerId]))) {
+          throw new Error('OpenCode definitely unsubmitted OAuth predecessor changed')
+        }
+        await rm(oauthSaveReceiptPath(input.globalAuthPath))
+        nativeReceipt = null
+        return value
+      }
       if (input.isNativeSettled && !input.isNativeSettled(value)) {
         if (nativeReceipt && input.allowNativeContinuation) {
           if (input.abortSignal?.aborted) throwOpenCodeAbortReason(input.abortSignal)

@@ -14,6 +14,7 @@ import type {
 } from './HostedControlRuntime.js'
 import { HostedLifecycleAuthorityWal } from './HostedLifecycleAuthorityWal.js'
 import { HostedTeamLeadMessageDelivery } from './HostedTeamLeadMessageDelivery.js'
+import { HostedTeamLeadInboxPump } from './HostedTeamLeadInboxPump.js'
 import { HostedApprovalOwnerWal } from './HostedApprovalOwnerWal.js'
 import { HostedApprovalOwnerStore } from './HostedApprovalOwnerStore.js'
 import { HostedApprovalOwnerService } from './HostedApprovalOwnerService.js'
@@ -43,6 +44,9 @@ export function createHostedControlProductionPortFactory(
   createOpenCodeLane: () => TeamLifecycleLaneEffectPort = createProductionOpenCodeTeamLifecycleLane,
 ): HostedControlRuntimePortFactory {
   return async (context: HostedControlRuntimePortFactoryContext) => {
+    const planStore = new PrivateFileTeamLifecycleLaunchPlanStore(
+      join(context.teamRoot, HOSTED_LIFECYCLE_PLAN_FILE),
+    )
     const execution = new DurableTeamLifecycleExecution(
       join(context.teamRoot, HOSTED_LIFECYCLE_EXECUTION_STATE_FILE),
       [createOpenCodeLane()],
@@ -57,9 +61,7 @@ export function createHostedControlProductionPortFactory(
         context.teamRoot,
         context.authority.teamId,
       ),
-      planStore: new PrivateFileTeamLifecycleLaunchPlanStore(
-        join(context.teamRoot, HOSTED_LIFECYCLE_PLAN_FILE),
-      ),
+      planStore,
       execution,
       effectGuard: () => context.isCurrentAuthority({ actorId: 'hosted-lifecycle-owner', ...context.authority }),
     })
@@ -71,13 +73,35 @@ export function createHostedControlProductionPortFactory(
       authority: context.authority,
       guard: authorityGuard,
     })
+    const inboxPump = new HostedTeamLeadInboxPump({
+      canonicalTeamRoot: context.teamRoot,
+      legacyKey: context.legacyKey,
+      authority: context.authority,
+      guard: authorityGuard,
+      planStore,
+      execution,
+    })
     const services = createHostedControlEffectServices({
       messageDirectory: join(context.teamRoot, HOSTED_MESSAGE_DIRECTORY),
       teamId: context.authority.teamId,
       lifecycleGuard: authorityGuard,
       messageGuard: authorityGuard,
-      messageDelivery,
+      messageDelivery: {
+        deliver: async (message, authority) => {
+          const decision = await messageDelivery.deliver(message, authority)
+          if (decision.kind === 'delivered') {
+            void inboxPump.wake(message, authority).catch(() => undefined)
+          }
+          return decision
+        },
+      },
       lifecycleEffects: lifecycle.authority,
+      planAdmission: {
+        admitLaunchPlan: async input => {
+          const decision = await lifecycle.owner.admitLaunchPlan(input)
+          return { kind: decision.kind }
+        },
+      },
     })
     const activation = context.activationV2
     const approvals = activation ? new HostedApprovalActivatablePort() : undefined
@@ -128,11 +152,16 @@ export function createHostedControlProductionPortFactory(
       ...(approvals ? { approvals } : {}),
       ...(activationSessionFactory ? { activationSessionFactory } : {}),
       revoke,
+      onReadinessLease: () => {
+        void inboxPump.recover().catch(() => undefined)
+        inboxPump.start()
+      },
       close: async () => {
         // Calling revoke fences the delegate synchronously; all awaited work is
         // cleanup and therefore precedes lifecycle/authority resource release.
         await revoke().catch(() => undefined)
-        await Promise.all([messageDelivery.close(), execution.shutdown()])
+        await Promise.all([messageDelivery.close(), inboxPump.close()])
+        await execution.shutdown()
       },
     }
   }
