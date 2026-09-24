@@ -12,6 +12,10 @@ import {
 } from './HostedLifecycleProviderRegistry.js'
 import { createHostedLifecycleSnapshot, type HostedLifecycleProviderSnapshot } from './HostedLifecycleSnapshot.js'
 import type { HostedLifecycleAuthority } from './HostedControlDispatcher.js'
+import { HostedControlDispatcher } from './HostedControlDispatcher.js'
+import { HostedLifecycleCommandService } from './HostedLifecycleCommandService.js'
+import { HOSTED_LIFECYCLE_PROOF_DOMAIN } from './HostedControlServer.js'
+import { createHostedRawDomainProof } from './ownerProof.js'
 
 const roots: string[] = []
 afterEach(async () => { await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true }))) })
@@ -22,8 +26,11 @@ const incarnation = {
 }
 const context = {
   actorId: 'actor-a', sessionId: 'session-a', deploymentId: 'deployment-a', bootId: 'boot-a',
-  requestId: 'request-a', authorizedScope: 'scope_team-lifecycle.write', deadlineAtMs: 10_000,
+  requestId: 'request-a', authorizedScope: 'scope_hosted-lifecycle-command', deadlineAtMs: 10_000,
 }
+const queryContext = { ...context, authorizedScope: 'scope_hosted-lifecycle-control-state' }
+const commandContext = context
+const legacyContext = { ...context, authorizedScope: 'scope_team-lifecycle.write' }
 const ownerEffectFence = { grantRevision: '1'.repeat(64), identityChecksum: '2'.repeat(64) }
 
 class MutableProvider implements HostedLifecycleProviderAdapter {
@@ -103,22 +110,109 @@ function durableCommand(command: HostedLifecycleDurableCommand, authorization: {
 }
 
 describe('HostedLifecycleAuthorityService', () => {
+  test('accepts exact Product query and command scopes and rejects crossed scopes', async () => {
+    const { service, provider } = await fixture()
+    const currentAuthority = authority(provider)
+    const request = { schemaVersion: 1 as const, workspaceId: incarnation.workspaceId, teamId }
+    const command = launchCommand(provider)
+
+    await expect(service.getControlState({ request, context: queryContext, authority: currentAuthority }))
+      .resolves.toMatchObject({ kind: 'control_state', availableActions: ['launch'] })
+    await expect(service.prepareProvisioning({ request, context: queryContext, authority: currentAuthority }))
+      .resolves.toMatchObject({ kind: 'prepared' })
+    await expect(service.getProvisioningStatus({ request, context: queryContext, authority: currentAuthority }))
+      .resolves.toMatchObject({ kind: 'provisioning_status' })
+    await expect(service.getControlState({ request, context: commandContext, authority: currentAuthority }))
+      .resolves.toEqual({ schemaVersion: 1, kind: 'unavailable', retryAfterMs: null })
+    await expect(service.authorize({ command, context: queryContext, authority: currentAuthority }))
+      .resolves.toEqual({ kind: 'unavailable', retryAfterMs: null })
+    await expect(service.authorize({ command, context: legacyContext, authority: currentAuthority }))
+      .resolves.toEqual({ kind: 'unavailable', retryAfterMs: null })
+    await expect(service.authorize({ command, context: commandContext, authority: currentAuthority }))
+      .resolves.toMatchObject({ kind: 'authorized' })
+    expect(provider.executions).toBe(0)
+  })
+
+  test('signed lifecycle wire admits the Product query and command scopes only for their operations', async () => {
+    const { service, provider } = await fixture()
+    const secret = Buffer.alloc(32, 3)
+    const ownerBinding = {
+      ownerAuthority: 'owner-authority_scope-test', ownerGeneration: 1,
+      ownerSessionId: 'owner-session_scope-test',
+      socketIdentity: { device: '1', inode: '2', uid: 501, gid: 20, mode: 0o600 },
+    }
+    const dispatcher = new HostedControlDispatcher({
+      secret,
+      authority: {
+        ...incarnation,
+        mountBinding: { mountGeneration: 1, declaredRootHash: 'a'.repeat(64) },
+      },
+      getOwnerBinding: () => ownerBinding,
+      lifecycle: new HostedLifecycleCommandService(service, { isCurrent: () => true }, () => 0),
+      messages: { dispatch: async () => ({ schemaVersion: 2, kind: 'not_found' }) },
+    })
+    const currentAuthority = authority(provider)
+    const signed = (
+      operation: 'control_state' | 'authorize',
+      authorizedScope: string,
+      exchangeId: string,
+    ) => {
+      const activeContext = { ...context, authorizedScope }
+      const unsigned = {
+        schemaVersion: 2,
+        exchangeId: `lifecycle-request_${exchangeId.repeat(32)}`,
+        operation,
+        provenance: {
+          from: { kind: 'controller', deploymentId: incarnation.deploymentId, bootId: incarnation.bootId,
+            actorId: activeContext.actorId, sessionId: activeContext.sessionId },
+          to: { kind: 'owner', ownerAuthority: ownerBinding.ownerAuthority,
+            ownerGeneration: ownerBinding.ownerGeneration, ownerSessionId: ownerBinding.ownerSessionId },
+          target: { capability: 'hosted-lifecycle-command', exchangeId: `lifecycle-request_${exchangeId.repeat(32)}`,
+            operation, workspaceId: incarnation.workspaceId, teamId },
+        },
+        ownerBinding,
+        ownerEffectFence,
+        payload: {
+          ...(operation === 'control_state'
+            ? { request: { schemaVersion: 1, workspaceId: incarnation.workspaceId, teamId } }
+            : { command: launchCommand(provider) }),
+          context: activeContext,
+          authority: currentAuthority,
+        },
+      }
+      return {
+        ...unsigned,
+        ownerProof: createHostedRawDomainProof(secret, HOSTED_LIFECYCLE_PROOF_DOMAIN, 'request', JSON.stringify(unsigned)),
+      }
+    }
+
+    await expect(dispatcher.dispatch(signed('control_state', queryContext.authorizedScope, 'a')))
+      .resolves.toMatchObject({ payload: { kind: 'control_state', availableActions: ['launch'] } })
+    await expect(dispatcher.dispatch(signed('control_state', commandContext.authorizedScope, 'b')))
+      .resolves.toMatchObject({ payload: { kind: 'unavailable' } })
+    await expect(dispatcher.dispatch(signed('authorize', queryContext.authorizedScope, 'c')))
+      .resolves.toMatchObject({ payload: { kind: 'unavailable' } })
+    await expect(dispatcher.dispatch(signed('authorize', commandContext.authorizedScope, 'd')))
+      .resolves.toMatchObject({ payload: { kind: 'authorized' } })
+    expect(provider.executions).toBe(0)
+  })
+
   test('computes a canonical revision and exposes only phase-valid actions', async () => {
     const { service, provider } = await fixture()
     await expect(service.getControlState({
-      request: { schemaVersion: 1, workspaceId: incarnation.workspaceId, teamId }, context, authority: authority(provider),
+      request: { schemaVersion: 1, workspaceId: incarnation.workspaceId, teamId }, context: queryContext, authority: authority(provider),
     })).resolves.toEqual({
       schemaVersion: 1, kind: 'control_state', workspaceId: incarnation.workspaceId, teamId,
       deploymentId: incarnation.deploymentId, bootId: incarnation.bootId, runId: null,
       resourceRevision: expectedRevision(provider), availableActions: ['launch'],
     })
     await expect(service.prepareProvisioning({
-      request: { schemaVersion: 1, workspaceId: incarnation.workspaceId, teamId }, context, authority: authority(provider),
+      request: { schemaVersion: 1, workspaceId: incarnation.workspaceId, teamId }, context: queryContext, authority: authority(provider),
     })).resolves.toMatchObject({
       kind: 'prepared', lanes: [{ laneKey: `owner:${teamId}`, backend: 'opencode', status: 'ready' }],
     })
     await expect(service.getProvisioningStatus({
-      request: { schemaVersion: 1, workspaceId: incarnation.workspaceId, teamId }, context, authority: authority(provider),
+      request: { schemaVersion: 1, workspaceId: incarnation.workspaceId, teamId }, context: queryContext, authority: authority(provider),
     })).resolves.toMatchObject({ kind: 'provisioning_status', recentCommands: [] })
   })
 
@@ -174,7 +268,7 @@ describe('HostedLifecycleAuthorityService', () => {
     expect(executed.result.resourceRevision).toBe(admitted.authorization.resourceRevision)
     await expect(service.getControlState({
       request: { schemaVersion: 1, workspaceId: incarnation.workspaceId, teamId },
-      context,
+      context: queryContext,
       authority: authority(provider),
     })).resolves.toMatchObject({
       kind: 'control_state',
@@ -222,7 +316,7 @@ describe('HostedLifecycleAuthorityService', () => {
     })
     const status = await service.getProvisioningStatus({
       request: { schemaVersion: 1, workspaceId: incarnation.workspaceId, teamId },
-      context, authority: authority(provider),
+      context: queryContext, authority: authority(provider),
     })
     expect(status.recentCommands).toEqual([
       { action: 'stop', commandId: stop.commandId, result: {
@@ -255,7 +349,7 @@ describe('HostedLifecycleAuthorityService', () => {
     }) as Awaited<ReturnType<typeof wal.load>>
     const status = await service.getProvisioningStatus({
       request: { schemaVersion: 1, workspaceId: incarnation.workspaceId, teamId },
-      context, authority: authority(provider),
+      context: queryContext, authority: authority(provider),
     })
     expect(status.recentCommands).toHaveLength(16)
     expect((status.recentCommands as Array<{ commandId: string }>).map(entry => entry.commandId))
@@ -291,7 +385,7 @@ describe('HostedLifecycleAuthorityService', () => {
     })
     const status = await restarted.getProvisioningStatus({
       request: { schemaVersion: 1, workspaceId: incarnation.workspaceId, teamId },
-      context, authority: authority(provider),
+      context: queryContext, authority: authority(provider),
     })
     expect(status.recentCommands).toEqual([
       { action: 'stop', commandId: stop.commandId, result: stopped.result },
@@ -340,7 +434,7 @@ describe('HostedLifecycleAuthorityService', () => {
     })
     await expect(service.getControlState({
       request: { schemaVersion: 1, workspaceId: incarnation.workspaceId, teamId },
-      context,
+      context: queryContext,
       authority: authority(provider),
     })).resolves.toMatchObject({
       kind: 'control_state',
@@ -423,10 +517,10 @@ describe('HostedLifecycleAuthorityService', () => {
     await expect(restarted.release({ command, authorization: authorized.authorization, context, authority: originalAuthority }))
       .resolves.toEqual({ kind: 'operator_required', authorization: authorized.authorization })
     await expect(restarted.getControlState({
-      request: { schemaVersion: 1, workspaceId: incarnation.workspaceId, teamId }, context, authority: originalAuthority,
+      request: { schemaVersion: 1, workspaceId: incarnation.workspaceId, teamId }, context: queryContext, authority: originalAuthority,
     })).resolves.toEqual({ schemaVersion: 1, kind: 'unavailable', retryAfterMs: null })
     await expect(restarted.getProvisioningStatus({
-      request: { schemaVersion: 1, workspaceId: incarnation.workspaceId, teamId }, context, authority: originalAuthority,
+      request: { schemaVersion: 1, workspaceId: incarnation.workspaceId, teamId }, context: queryContext, authority: originalAuthority,
     })).resolves.toMatchObject({
       kind: 'provisioning_status', availableActions: [],
       recentCommands: [{ action: 'launch', commandId: command.commandId, result: {

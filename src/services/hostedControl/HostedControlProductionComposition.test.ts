@@ -292,7 +292,7 @@ function controlStateInput() {
         deploymentId: stableAuthority.deploymentId,
         bootId: stableAuthority.bootId,
         requestId: 'request-a',
-        authorizedScope: 'scope_team-lifecycle.write',
+        authorizedScope: 'scope_hosted-lifecycle-control-state',
         deadlineAtMs: Date.now() + 10_000,
       },
       authority: lifecycleAuthority,

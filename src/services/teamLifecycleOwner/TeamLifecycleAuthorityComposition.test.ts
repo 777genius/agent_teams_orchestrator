@@ -132,7 +132,7 @@ describe('createTeamLifecycleAuthorityComposition', () => {
       request: { schemaVersion: 1, workspaceId: plan.workspaceId, teamId },
       context: {
         actorId: 'actor-a', sessionId: 'session-a', deploymentId: 'deployment-a', bootId: 'boot-a',
-        requestId: 'request-a', authorizedScope: 'scope_team-lifecycle.write', deadlineAtMs: Date.now() + 1_000,
+        requestId: 'request-a', authorizedScope: 'scope_hosted-lifecycle-control-state', deadlineAtMs: Date.now() + 1_000,
       },
       authority,
     })
@@ -158,14 +158,16 @@ describe('createTeamLifecycleAuthorityComposition', () => {
     })
     const context = {
       actorId: 'actor-a', sessionId: 'session-a', deploymentId: 'deployment-a', bootId: 'boot-a',
-      requestId: 'request-a', authorizedScope: 'scope_team-lifecycle.write', deadlineAtMs: Date.now() + 10_000,
+      requestId: 'request-a', authorizedScope: 'scope_hosted-lifecycle-command', deadlineAtMs: Date.now() + 10_000,
     }
     const initialAuthority: HostedLifecycleAuthority = {
       actorId: 'actor-a', workspaceId: plan.workspaceId, teamId, deploymentId: 'deployment-a', bootId: 'boot-a',
       restoreGeneration: 1, mountGeneration: 1, resourceRevision: 'revision-before-read', ownerEffectFence,
     }
     const state = await service.getControlState({
-      request: { schemaVersion: 1, workspaceId: plan.workspaceId, teamId }, context, authority: initialAuthority,
+      request: { schemaVersion: 1, workspaceId: plan.workspaceId, teamId },
+      context: { ...context, authorizedScope: 'scope_hosted-lifecycle-control-state' },
+      authority: initialAuthority,
     })
     if (typeof state.resourceRevision !== 'string') throw new Error('expected lifecycle revision')
     const currentAuthority = { ...initialAuthority, resourceRevision: state.resourceRevision }

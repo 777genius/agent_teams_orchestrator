@@ -34,6 +34,8 @@ type LifecycleContext = {
 }
 type LifecycleCommand = HostedLifecycleDurableCommand
 type LifecycleAuthorization = HostedLifecycleDurableAuthorization
+const QUERY_SCOPE = 'scope_hosted-lifecycle-control-state'
+const COMMAND_SCOPE = 'scope_hosted-lifecycle-command'
 
 export type HostedLifecycleAuthorityServiceOptions = {
   workspaceId: string
@@ -41,7 +43,7 @@ export type HostedLifecycleAuthorityServiceOptions = {
   deploymentId: string
   bootId: string
   restoreGeneration: number
-  requiredScope?: string
+  requiredScope?: typeof COMMAND_SCOPE
   wal: HostedLifecycleAuthorityWal
   providers: HostedLifecycleProviderRegistry
   createId?: () => string
@@ -52,11 +54,12 @@ export type HostedLifecycleAuthorityServiceOptions = {
  * durable team lock; provider adapters cannot be selected by callers.
  */
 export class HostedLifecycleAuthorityService implements HostedLifecycleAuthorityEffectPort {
-  readonly #requiredScope: string
   readonly #createId: () => string
 
   constructor(private readonly options: HostedLifecycleAuthorityServiceOptions) {
-    this.#requiredScope = options.requiredScope ?? 'scope_team-lifecycle.write'
+    if (options.requiredScope !== undefined && options.requiredScope !== COMMAND_SCOPE) {
+      throw new TypeError('Invalid hosted lifecycle command scope')
+    }
     this.#createId = options.createId ?? (() => randomUUID().replaceAll('-', ''))
   }
 
@@ -65,7 +68,7 @@ export class HostedLifecycleAuthorityService implements HostedLifecycleAuthority
     context: LifecycleContext
     authority: HostedLifecycleAuthority
   }): Promise<Record<string, unknown>> {
-    if (!this.#bindingCurrent(input.context, input.authority)) return unavailablePublic()
+    if (!this.#bindingCurrent(input.context, input.authority, QUERY_SCOPE)) return unavailablePublic()
     return (await this.#locked(state => this.getControlStateUnlocked(state))) ?? unavailablePublic()
   }
 
@@ -88,7 +91,7 @@ export class HostedLifecycleAuthorityService implements HostedLifecycleAuthority
     context: LifecycleContext
     authority: HostedLifecycleAuthority
   }): Promise<Record<string, unknown>> {
-    if (!this.#bindingCurrent(input.context, input.authority)) return unavailablePublic()
+    if (!this.#bindingCurrent(input.context, input.authority, QUERY_SCOPE)) return unavailablePublic()
     return (await this.#locked(async state => {
       const owner = await this.options.providers.resolve(this.#scope())
       if (owner.kind === 'not_found') return { schemaVersion: 1, kind: 'not_found' }
@@ -132,7 +135,7 @@ export class HostedLifecycleAuthorityService implements HostedLifecycleAuthority
     context: LifecycleContext
     authority: HostedLifecycleAuthority
   }): Promise<HostedLifecycleAuthorizationDecision> {
-    if (!this.#bindingCurrent(input.context, input.authority)) return unavailableDecision()
+    if (!this.#bindingCurrent(input.context, input.authority, COMMAND_SCOPE)) return unavailableDecision()
     const fingerprint = fingerprintCommand(input.command, this.#binding(input.context, input.authority))
     return (await this.#locked(async state => {
       await this.#retireStaleGrants(state, input.authority)
@@ -211,7 +214,7 @@ export class HostedLifecycleAuthorityService implements HostedLifecycleAuthority
     context: LifecycleContext
     authority: HostedLifecycleAuthority
   }): Promise<HostedLifecycleRevalidationDecision> {
-    if (!this.#bindingCurrent(input.context, input.authority)) return unavailableDecision()
+    if (!this.#bindingCurrent(input.context, input.authority, COMMAND_SCOPE)) return unavailableDecision()
     const fingerprint = fingerprintCommand(input.command, this.#binding(input.context, input.authority))
     return (await this.#locked(async state => {
       const grant = state.grants.get(input.authorization.grantId)
@@ -243,7 +246,7 @@ export class HostedLifecycleAuthorityService implements HostedLifecycleAuthority
     context: LifecycleContext
     authority: HostedLifecycleAuthority
   }): Promise<HostedLifecycleExecutionDecision> {
-    if (!this.#bindingCurrent(input.context, input.authority)) return unavailableDecision()
+    if (!this.#bindingCurrent(input.context, input.authority, COMMAND_SCOPE)) return unavailableDecision()
     const fingerprint = durableFingerprint(input.durableCommand, input.command, input.authorization)
     const grantFingerprint = fingerprintCommand(input.command, this.#binding(input.context, input.authority))
     return (await this.#locked(async state => {
@@ -327,7 +330,7 @@ export class HostedLifecycleAuthorityService implements HostedLifecycleAuthority
     context: LifecycleContext
     authority: HostedLifecycleAuthority
   }): Promise<HostedLifecycleExecutionDecision> {
-    if (!this.#bindingCurrent(input.context, input.authority)) return unavailableDecision()
+    if (!this.#bindingCurrent(input.context, input.authority, COMMAND_SCOPE)) return unavailableDecision()
     const fingerprint = durableFingerprint(input.durableCommand, input.command, input.authorization)
     return (await this.#locked(async state => {
       const entry = state.commands.get(commandStateKey(input.command, input.authorization))
@@ -348,7 +351,7 @@ export class HostedLifecycleAuthorityService implements HostedLifecycleAuthority
     context: LifecycleContext
     authority: HostedLifecycleAuthority
   }): Promise<HostedLifecycleReleaseDecision> {
-    if (!this.#bindingCurrent(input.context, input.authority)) return unavailableDecision()
+    if (!this.#bindingCurrent(input.context, input.authority, COMMAND_SCOPE)) return unavailableDecision()
     const decision = await this.#locked(async state => {
       const grant = state.grants.get(input.authorization.grantId)
       const fingerprint = fingerprintCommand(input.command, this.#binding(input.context, input.authority))
@@ -433,13 +436,13 @@ export class HostedLifecycleAuthorityService implements HostedLifecycleAuthority
       ownerEffectFence: authority.ownerEffectFence,
     }
   }
-  #bindingCurrent(context: LifecycleContext, authority: HostedLifecycleAuthority): boolean {
+  #bindingCurrent(context: LifecycleContext, authority: HostedLifecycleAuthority, requiredScope: typeof QUERY_SCOPE | typeof COMMAND_SCOPE): boolean {
     return authority.workspaceId === this.options.workspaceId && authority.teamId === this.options.teamId &&
       authority.deploymentId === this.options.deploymentId && authority.bootId === this.options.bootId &&
       authority.restoreGeneration === this.options.restoreGeneration && context.actorId === authority.actorId &&
       authority.mountGeneration >= 1 &&
       context.deploymentId === authority.deploymentId && context.bootId === authority.bootId &&
-      context.authorizedScope === this.#requiredScope
+      context.authorizedScope === requiredScope
   }
 }
 
