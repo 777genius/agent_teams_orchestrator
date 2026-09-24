@@ -19,6 +19,7 @@ class FakeRunner implements HostedQwenCommandRunner {
   occupied = false
   running = true
   ip = '172.18.0.2'
+  endpointGateway = '172.18.0.1'
   ifindex = 42
   nft = ''
   ufw = false
@@ -36,7 +37,7 @@ class FakeRunner implements HostedQwenCommandRunner {
       Id: containerId, HostConfig: { NetworkMode: networkId },
       Config: { Labels: { 'org.agentteams.hosted-opencode.generation': generation } },
       State: { Running: this.running, Pid: 1234 },
-      NetworkSettings: { Networks: { private: { NetworkID: networkId, IPAddress: this.ip, Gateway: '172.18.0.1' } } },
+      NetworkSettings: { Networks: { private: { NetworkID: networkId, IPAddress: this.ip, Gateway: this.endpointGateway } } },
     })
     if (executable === '/usr/sbin/ip') return JSON.stringify([{
       ifname: bridge, ifindex: this.ifindex, addr_info: [{ family: 'inet', local: '172.18.0.1' }],
@@ -99,6 +100,26 @@ test('deny is installed before one exact container can be admitted; drift fails 
   await policy.attest()
   runner.ifindex++
   await expect(policy.attest()).rejects.toThrow('hosted-qwen-policy-drift')
+})
+
+test('internal endpoint with no default gateway admits only the verified bridge IP', async () => {
+  const { runner, policy } = await setup()
+  runner.endpointGateway = ''
+  await policy.prepare()
+  runner.occupied = true
+  expect(await policy.admitContainer(containerId)).toBe(runner.ip)
+  await policy.attest()
+  expect(runner.nft).toContain(`ip saddr ${runner.ip} ip daddr 172.18.0.1 tcp dport 19443`)
+})
+
+test('unexpected endpoint gateway fails closed before installing a grant', async () => {
+  const { runner, policy } = await setup()
+  runner.endpointGateway = '172.18.0.254'
+  await policy.prepare()
+  runner.occupied = true
+  await expect(policy.admitContainer(containerId)).rejects.toThrow('hosted-qwen-container-endpoint-invalid')
+  expect(runner.ufw).toBe(false)
+  expect(runner.nft).not.toContain('insert rule')
 })
 
 test('network claim remains while container exists; cleanup removes grant before deny', async () => {

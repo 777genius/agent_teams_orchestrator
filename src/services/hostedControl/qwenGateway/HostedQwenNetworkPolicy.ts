@@ -274,8 +274,11 @@ export class HostedQwenNetworkPolicy {
       throw new Error('hosted-qwen-container-invalid')
     }
     const endpoint = object(attached[0])
+    // Docker reports an empty endpoint gateway for an --internal network because
+    // the container has no default route. The bridge still has the IPAM gateway
+    // verified by network() and can serve the explicitly granted host port.
     if (endpoint.NetworkID !== this.options.networkId || !ipv4(endpoint.IPAddress) ||
-      endpoint.Gateway !== this.bridge?.gateway) {
+      endpoint.Gateway !== '' && endpoint.Gateway !== this.bridge?.gateway) {
       throw new Error('hosted-qwen-container-endpoint-invalid')
     }
     return endpoint.IPAddress
