@@ -20,6 +20,7 @@ export type HostedAgentToolBinding = {
   planGeneration: string
   runId: string
   laneId: string
+  memberId: string
   memberName: string
   sessionID: string
 }
@@ -257,7 +258,7 @@ export function fingerprintHostedAgentToolCall(
   return sha(JSON.stringify([
     'agent-teams.hosted-agent-tool-fingerprint/v1',
     binding.workspaceId, binding.teamId, binding.workspaceRoot, binding.planGeneration,
-    binding.runId, binding.laneId, binding.memberName, binding.sessionID,
+    binding.runId, binding.laneId, binding.memberId, binding.memberName, binding.sessionID,
     request.context.messageID,
     request.context.callID, request.tool, request.args,
   ]))
@@ -278,10 +279,11 @@ function decodeRecord(value: unknown): RecordState {
   const binding = record.binding
   if (!binding || typeof binding !== 'object' || Array.isArray(binding)) throw new Error('Invalid hosted agent tool WAL binding')
   const b = binding as Record<string, unknown>
-  const bindingKeys = ['workspaceId', 'teamId', 'workspaceRoot', 'planGeneration', 'runId', 'laneId', 'memberName', 'sessionID']
+  const bindingKeys = ['workspaceId', 'teamId', 'workspaceRoot', 'planGeneration', 'runId', 'laneId', 'memberId', 'memberName', 'sessionID']
   if (Object.keys(b).length !== bindingKeys.length || Object.keys(b).some(key => !bindingKeys.includes(key)) ||
     bindingKeys.some(key => typeof b[key] !== 'string') || !isAbsolute(b.workspaceRoot as string) ||
-    !/^plan-generation_[0-9a-f]{64}$/.test(b.planGeneration as string)) {
+    !/^plan-generation_[0-9a-f]{64}$/.test(b.planGeneration as string) ||
+    !/^member_[0-9a-f]{32}$/.test(b.memberId as string)) {
     throw new Error('Invalid hosted agent tool WAL binding')
   }
   return record as RecordState
@@ -290,7 +292,7 @@ function decodeRecord(value: unknown): RecordState {
 function sameBinding(left: HostedAgentToolBinding, right: HostedAgentToolBinding): boolean {
   return left.workspaceId === right.workspaceId && left.teamId === right.teamId &&
     left.workspaceRoot === right.workspaceRoot && left.planGeneration === right.planGeneration &&
-    left.runId === right.runId && left.laneId === right.laneId &&
+    left.runId === right.runId && left.laneId === right.laneId && left.memberId === right.memberId &&
     left.memberName === right.memberName && left.sessionID === right.sessionID
 }
 

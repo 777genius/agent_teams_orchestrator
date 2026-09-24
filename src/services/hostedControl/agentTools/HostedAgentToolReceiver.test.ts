@@ -71,7 +71,7 @@ async function fixture(input: {
   const binding: HostedAgentToolBinding = {
     workspaceId: 'workspace_test', teamId: `team_${'a'.repeat(32)}`,
     workspaceRoot: root, planGeneration: `plan-generation_${'b'.repeat(64)}`,
-    runId: 'run_1', laneId: 'lane_1', memberName: 'worker', sessionID: 'session_1',
+    runId: 'run_1', laneId: 'lane_1', memberId: `member_${'c'.repeat(32)}`, memberName: 'worker', sessionID: 'session_1',
   }
   const gate = new HostedAgentToolEffectGate()
   const effects: string[] = []

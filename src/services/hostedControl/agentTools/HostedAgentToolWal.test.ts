@@ -12,7 +12,7 @@ afterEach(async () => Promise.all(roots.splice(0).map(root => rm(root, { recursi
 const binding: HostedAgentToolBinding = {
   workspaceId: 'workspace_test', teamId: `team_${'a'.repeat(32)}`,
   workspaceRoot: '/sandbox/workspace', planGeneration: `plan-generation_${'b'.repeat(64)}`,
-  runId: 'run_test', laneId: 'lane_primary', memberName: 'worker', sessionID: 'session_1',
+  runId: 'run_test', laneId: 'lane_primary', memberId: `member_${'c'.repeat(32)}`, memberName: 'worker', sessionID: 'session_1',
 }
 const request = decodeHostedAgentToolRequest(JSON.stringify({
   version: 1, type: 'request', requestId: 'request_1', tool: 'hosted_task_start',
@@ -42,6 +42,8 @@ describe('HostedAgentToolWal', () => {
     const changedArgs = { ...request, args: { taskId: `task_${'d'.repeat(32)}` } }
     expect(await wal.begin({ binding, request: changedArgs })).toEqual({ kind: 'conflict' })
     expect(await wal.begin({ binding: { ...binding, runId: 'run_other' }, request })).toEqual({ kind: 'conflict' })
+    expect(await wal.begin({ binding: { ...binding, memberId: `member_${'e'.repeat(32)}` }, request }))
+      .toEqual({ kind: 'conflict' })
     await expect(wal.begin({ binding: { ...binding, sessionID: 'session_other' }, request })).rejects.toThrow()
   })
 
