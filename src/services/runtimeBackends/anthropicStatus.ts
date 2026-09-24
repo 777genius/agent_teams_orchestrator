@@ -5,6 +5,8 @@ import type {
   RuntimeProviderModelCatalog,
   RuntimeProviderSubscriptionRateLimitSnapshot,
   RuntimeProviderStatus,
+  RuntimeStatusCheckErrorCode,
+  RuntimeStatusCheckOutcome,
 } from './types.js'
 
 type AnthropicAuthenticatedState = {
@@ -40,13 +42,23 @@ export function buildAnthropicRuntimeStatus(params: {
   backend?: AnthropicRuntimeBackendInfo | null
 }): RuntimeProviderStatus {
   const backend = params.backend ?? null
+  const statusCheck = getAnthropicStatusCheckContract(
+    params.modelCatalog.status,
+    backend,
+  )
+  const compatibleBackendVerified =
+    (backend?.id === 'ollama' || backend?.id === 'anthropic-compatible') &&
+    params.auth.authenticated &&
+    params.modelCatalog.source === 'anthropic-compatible-api' &&
+    params.modelCatalog.status === 'ready' &&
+    params.modelCatalog.models.length > 0
   return {
     providerId: 'anthropic',
     displayName: 'Anthropic',
     supported: true,
     authenticated: params.auth.authenticated,
     authMethod: params.auth.authMethod,
-    verificationState: backend ? 'unknown' : 'verified',
+    verificationState: compatibleBackendVerified || !backend ? 'verified' : 'unknown',
     canLoginFromUi: backend ? false : true,
     capabilities: {
       teamLaunch: true,
@@ -89,5 +101,37 @@ export function buildAnthropicRuntimeStatus(params: {
           authMethodDetail: backend.authMethodDetail,
         }
       : null,
+    ...statusCheck,
   }
+}
+
+export function getAnthropicStatusCheckContract(
+  catalogStatus: RuntimeProviderModelCatalog['status'] | null,
+  backend: AnthropicRuntimeBackendInfo | null,
+): {
+  statusCheckOutcome: RuntimeStatusCheckOutcome
+  statusCheckErrorCode: RuntimeStatusCheckErrorCode | null
+} {
+  if (
+    backend?.authMethodDetail?.includes('transport_unavailable') ||
+    backend?.authMethodDetail?.includes('configuration_incomplete')
+  ) {
+    return {
+      statusCheckOutcome: 'transient_error',
+      statusCheckErrorCode: 'unavailable',
+    }
+  }
+  if (catalogStatus === 'unavailable') {
+    return {
+      statusCheckOutcome: 'transient_error',
+      statusCheckErrorCode: 'unavailable',
+    }
+  }
+  if (catalogStatus === 'stale' || catalogStatus === 'degraded') {
+    return {
+      statusCheckOutcome: 'pending',
+      statusCheckErrorCode: 'partial_response',
+    }
+  }
+  return { statusCheckOutcome: 'authoritative', statusCheckErrorCode: null }
 }

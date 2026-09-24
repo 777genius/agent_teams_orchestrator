@@ -4,6 +4,10 @@ import {
   parseOpenCodeProviderScopedModelRef,
 } from './OpenCodeModelRef.js'
 import { isOpenCodeBuiltinFreeModelId } from './OpenCodeInventoryService.js'
+import {
+  isLiteralLoopbackOpenCodeUrl,
+  isLocalInexactOpenCodeLaunchProviderId,
+} from './OpenCodeProviderIdentity.js'
 
 import type {
   OpenCodeConfigProvidersResponse,
@@ -85,6 +89,25 @@ export function isKnownAuthlessOpenCodeProviderId(providerId: string | null | un
   return normalized ? KNOWN_AUTHLESS_OPEN_CODE_PROVIDER_IDS.has(normalized) : false
 }
 
+const OPEN_CODE_CLOUD_MODEL_TAG = /:cloud\b/i
+
+export function requiresExactOpenCodeLaunchOutput(
+  selectedModel: string,
+  catalog?: OpenCodeModelAccessCatalog | null,
+): boolean {
+  const parsed = parseOpenCodeProviderScopedModelRef(selectedModel)
+  if (!parsed) return true
+  if (OPEN_CODE_CLOUD_MODEL_TAG.test(parsed.modelId)) return true
+  if (!isLocalInexactOpenCodeLaunchProviderId(parsed.providerId)) return true
+  const entries = catalog ? findProviderEntries(catalog, parsed.providerId) : []
+  if (entries.length > 0) {
+    return !entries.some(entry => isLiteralLoopbackOpenCodeUrl(getProviderEntryBaseUrl(entry)))
+  }
+  // vLLM is often a remote OpenAI-compatible server. Without a loopback URL,
+  // keep the STRICT nonce instead of accepting PONG from an untrusted host.
+  return parsed.providerId === 'vllm'
+}
+
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
@@ -117,25 +140,6 @@ function getProviderEntryBaseUrl(entry: OpenCodeProviderListEntry): string | nul
   return asString(options?.baseURL) ?? asString(options?.baseUrl)
 }
 
-function isLoopbackOpenCodeBaseUrl(value: string | null): boolean {
-  if (!value) {
-    return false
-  }
-  try {
-    const url = new URL(value)
-    const hostname = url.hostname.toLowerCase()
-    return (
-      hostname === 'localhost'
-      || hostname === '0.0.0.0'
-      || hostname === '::1'
-      || hostname === '[::1]'
-      || hostname.startsWith('127.')
-    )
-  } catch {
-    return false
-  }
-}
-
 function isOpenAiCompatibleProviderEntry(entry: OpenCodeProviderListEntry): boolean {
   const record = asRecord(entry)
   return asString(record?.npm) === '@ai-sdk/openai-compatible'
@@ -147,7 +151,7 @@ function isAuthlessCapableProviderEntry(entry: OpenCodeProviderListEntry): boole
     return true
   }
   return isOpenAiCompatibleProviderEntry(entry)
-    && isLoopbackOpenCodeBaseUrl(getProviderEntryBaseUrl(entry))
+    && isLiteralLoopbackOpenCodeUrl(getProviderEntryBaseUrl(entry))
 }
 
 function findProviderEntries(

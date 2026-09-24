@@ -6,6 +6,7 @@ import {
   readdir,
   rm,
   symlink,
+  writeFile,
 } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import path from 'node:path'
@@ -81,6 +82,8 @@ export type CodexNativeAppServerRunnerOptions = {
   apiKey?: string | null
   forcedLoginMethod?: CodexForcedLoginMethod | null
   configOverrides?: string[]
+  extraEnv?: NodeJS.ProcessEnv
+  loopbackOverlayToml?: string | null
   disabledFeatures?: string[]
   abortSignal?: AbortSignal
   idleTimeoutMs?: number | null
@@ -122,6 +125,15 @@ const DEFAULT_APP_SERVER_REQUEST_TIMEOUT_MS = 120_000
 const CODEX_CONFIG_FILE_NAME = 'config.toml'
 const CODEX_APP_SERVER_HOME_PREFIX = 'codex-app-server-home-'
 const REQUIRED_CODEX_HOME_OVERLAY_ENTRIES = new Set(['accounts', 'auth.json'])
+const SKIP_CODEX_HOME_OVERLAY_ENTRIES = new Set([
+  CODEX_CONFIG_FILE_NAME,
+  'sessions',
+  'session_index.json',
+  'history.jsonl',
+  'logs',
+  'tmp',
+  '.tmp',
+])
 
 function defaultResolveVersion(executablePath: string): string | null {
   try {
@@ -224,7 +236,7 @@ async function createCodexAppServerHomeOverlay(
     }
 
     for (const entry of entries) {
-      if (entry.name === CODEX_CONFIG_FILE_NAME) {
+      if (SKIP_CODEX_HOME_OVERLAY_ENTRIES.has(entry.name)) {
         continue
       }
       await linkCodexHomeEntry(
@@ -448,12 +460,10 @@ function mapNotificationToEvents(
       const threadId = extractThreadId(params)
       return threadId ? [{ type: 'thread_started', threadId }] : []
     }
-    case 'turn/started':
-      return [{ type: 'turn_started' }]
-    case 'item/agentMessage/delta': {
-      const itemId = stringValue(params.itemId) ?? 'agent-message'
-      const text = stringValue(params.delta)
-      return text ? [{ type: 'assistant_text', itemId, text }] : []
+    case 'turn/started': {
+      const turnId =
+        stringValue(params.turnId) ?? stringValue(asRecord(params.turn).id)
+      return [{ type: 'turn_started', ...(turnId ? { turnId } : {}) }]
     }
     case 'thread/tokenUsage/updated': {
       const event = mapTokenUsageNotification(params)
@@ -479,7 +489,13 @@ function mapNotificationToEvents(
           : status === 'interrupted'
             ? 'Codex app-server turn was interrupted.'
             : null)
-      return [{ type: 'turn_completed', errorMessage }]
+      return [{
+        type: 'turn_completed',
+        ...(stringValue(params.turnId) ?? stringValue(turn.id)
+          ? { turnId: stringValue(params.turnId) ?? stringValue(turn.id) }
+          : {}),
+        errorMessage,
+      }]
     }
     case 'warning':
     case 'error': {
@@ -492,6 +508,74 @@ function mapNotificationToEvents(
     default:
       return []
   }
+}
+
+/** Normalize app-server deltas to the same complete-item contract as exec JSONL. */
+export function createCodexAppServerNotificationMapper(): {
+  (method: string, params: Record<string, unknown>): CodexNativeNormalizedEvent[]
+  flushPending(): CodexNativeNormalizedEvent[]
+} {
+  const textByItem = new Map<string, { scope: string; itemId: string; text: string }>()
+  const completedItems = new Set<string>()
+  const deferredUsage = new Map<string, CodexNativeNormalizedEvent[]>()
+  const flushPending = (scope?: string): CodexNativeNormalizedEvent[] => {
+    const events: CodexNativeNormalizedEvent[] = []
+    for (const [key, pending] of textByItem) {
+      if (scope !== undefined && pending.scope !== scope) continue
+      events.push({ type: 'assistant_text', itemId: pending.itemId, text: pending.text })
+      textByItem.delete(key)
+      completedItems.add(key)
+    }
+    for (const [pendingScope, usage] of deferredUsage) {
+      if (scope !== undefined && pendingScope !== scope) continue
+      events.push(...usage)
+      deferredUsage.delete(pendingScope)
+    }
+    return events
+  }
+  const map = (method: string, params: Record<string, unknown>): CodexNativeNormalizedEvent[] => {
+    const scope = JSON.stringify([
+      stringValue(params.threadId),
+      stringValue(params.turnId) ?? stringValue(asRecord(params.turn).id),
+    ])
+    const item = asRecord(params.item)
+    const itemId = stringValue(params.itemId) ?? stringValue(item.id) ?? 'agent-message'
+    const key = JSON.stringify([scope, itemId])
+    if (method === 'item/agentMessage/delta') {
+      if (typeof params.delta === 'string' && !completedItems.has(key)) {
+        const previous = textByItem.get(key)?.text ?? ''
+        textByItem.set(key, { scope, itemId, text: previous + params.delta })
+      }
+      return []
+    }
+
+    const events: CodexNativeNormalizedEvent[] = []
+    if (method === 'item/completed' && item.type === 'agentMessage') {
+      if (completedItems.has(key)) return []
+      const text = typeof item.text === 'string' ? item.text : textByItem.get(key)?.text
+      textByItem.delete(key)
+      completedItems.add(key)
+      if (text !== undefined) events.push({ type: 'assistant_text', itemId, text })
+    } else if (method === 'turn/completed') {
+      // Retain a delta-only completion fallback when no item snapshot arrives.
+      events.push(...flushPending(scope))
+    } else {
+      const mapped = mapNotificationToEvents(method, params)
+      if (mapped.some(event => event.type === 'usage_updated')
+        && [...textByItem.values()].some(pending => pending.scope === scope)) {
+        deferredUsage.set(scope, [...(deferredUsage.get(scope) ?? []), ...mapped])
+        return []
+      }
+      return mapped
+    }
+    if (![...textByItem.values()].some(pending => pending.scope === scope)) {
+      events.push(...(deferredUsage.get(scope) ?? []))
+      deferredUsage.delete(scope)
+    }
+    if (method === 'turn/completed') events.push(...mapNotificationToEvents(method, params))
+    return events
+  }
+  return Object.assign(map, { flushPending: () => flushPending() })
 }
 
 export async function* runCodexNativeAppServer(
@@ -509,7 +593,7 @@ export async function* runCodexNativeAppServer(
     version: (deps.resolveVersion ?? defaultResolveVersion)(executablePath),
   }
 
-  const env: NodeJS.ProcessEnv = { ...process.env }
+  const env: NodeJS.ProcessEnv = { ...process.env, ...options.extraEnv }
   if (options.forcedLoginMethod === 'chatgpt') {
     delete env.OPENAI_API_KEY
     delete env.CODEX_API_KEY
@@ -525,6 +609,13 @@ export async function* runCodexNativeAppServer(
   }
 
   const codexHomeOverlay = await createCodexAppServerHomeOverlay(env)
+  if (options.loopbackOverlayToml && codexHomeOverlay.env.CODEX_HOME) {
+    await writeFile(
+      path.join(codexHomeOverlay.env.CODEX_HOME, CODEX_CONFIG_FILE_NAME),
+      options.loopbackOverlayToml,
+      { mode: 0o600 },
+    )
+  }
   let child: SpawnedCodexAppServerProcess
   try {
     child =
@@ -564,6 +655,8 @@ export async function* runCodexNativeAppServer(
   let threadId: string | null = null
   let completed = false
   let cleanupStarted = false
+  const mapNotification = createCodexAppServerNotificationMapper()
+  let refreshIdleDeadline = (): void => {}
 
   const enqueueEvent = (event: CodexNativeNormalizedEvent): void => {
     if (event.type === 'thread_started') {
@@ -694,7 +787,9 @@ export async function* runCodexNativeAppServer(
     }
 
     if (typeof message.method === 'string') {
-      for (const event of mapNotificationToEvents(
+      // Buffered text deltas are still activity even before their item completes.
+      refreshIdleDeadline()
+      for (const event of mapNotification(
         message.method,
         asRecord(message.params),
       )) {
@@ -777,6 +872,7 @@ export async function* runCodexNativeAppServer(
         })
       }, idleTimeoutMs)
     }
+    refreshIdleDeadline = resetIdleTimeout
     if (absoluteTimeoutMs) {
       absoluteTimeoutHandle = setTimeout(() => {
         observations.push({
@@ -816,10 +912,16 @@ export async function* runCodexNativeAppServer(
         }
       }
     } finally {
+      refreshIdleDeadline = (): void => {}
       if (idleTimeoutHandle) clearTimeout(idleTimeoutHandle)
       if (absoluteTimeoutHandle) clearTimeout(absoluteTimeoutHandle)
     }
   } catch (error) {
+    // Preserve already-received partial output without manufacturing turn success.
+    cleanup()
+    for (const event of mapNotification.flushPending()) {
+      yield { type: 'normalized_event', event }
+    }
     const classified = classifyCodexAppServerApprovalFailure(error)
     if (classified.unsupported) {
       throw new Error(classified.message)

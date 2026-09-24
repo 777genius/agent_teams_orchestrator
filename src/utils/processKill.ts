@@ -3,7 +3,8 @@ import { randomUUID } from 'node:crypto'
 import { readFile, readdir } from 'node:fs/promises'
 import { join } from 'node:path'
 
-const PROCESS_QUERY_TIMEOUT_MS = 2_500
+const PROCESS_START_TIME_QUERY_TIMEOUT_MS = 2_500
+const WINDOWS_PROCESS_START_TIME_QUERY_TIMEOUT_MS = 5_000
 const PROCESS_START_TIME_OUTPUT_LIMIT_BYTES = 64 * 1024
 const PROCESS_COMMAND_OUTPUT_LIMIT_BYTES = 256 * 1024
 
@@ -824,10 +825,23 @@ function parseProcessStartTime(value: string): number | null {
   return Number.isFinite(parsed) ? parsed : null
 }
 
+export function parseDarwinProcessStartTime(value: string): number | null {
+  return parseProcessStartTime(value)
+}
+
+export function parseLinuxProcessStartTicks(value: string): number | null {
+  const close = value.lastIndexOf(')')
+  if (close < 0) return null
+  const fieldsAfterComm = value.slice(close + 1).trim().split(/\s+/)
+  const ticks = Number(fieldsAfterComm[19])
+  return Number.isSafeInteger(ticks) && ticks >= 0 ? ticks : null
+}
+
 function readProcessQueryOutput(
   command: string,
   args: string[],
   outputLimitBytes: number,
+  timeoutMs = PROCESS_START_TIME_QUERY_TIMEOUT_MS,
 ): Promise<string | null> {
   return new Promise(resolve => {
     let settled = false
@@ -846,7 +860,7 @@ function readProcessQueryOutput(
         // Best-effort query cleanup.
       }
       finish(null)
-    }, PROCESS_QUERY_TIMEOUT_MS)
+    }, timeoutMs)
     timeout.unref?.()
 
     try {
@@ -866,31 +880,26 @@ function readProcessQueryOutput(
   })
 }
 
-/** Read the OS creation time. PID-only ownership is unsafe because PIDs are reused. */
+/**
+ * Read the operating-system process creation time using a bounded query.
+ * A PID alone is not an ownership token: after a process exits the OS may reuse
+ * it for an unrelated process, so persistent registries must compare both.
+ */
 export async function readProcessStartTimeMs(
   pid: number,
   platform: NodeJS.Platform = process.platform,
+  timeoutMs?: number,
 ): Promise<number | null> {
-  const normalizedPid = Math.trunc(pid)
-  if (!Number.isFinite(normalizedPid) || normalizedPid <= 0) return null
+  if (!Number.isSafeInteger(pid) || pid <= 0 || (platform === 'win32' && pid > 0x7fffffff)) {
+    return null
+  }
+  const normalizedPid = pid
 
   if (platform === 'linux') {
-    try {
-      // /proc stat field 22 is the kernel start-time tick count. Unlike ps
-      // lstart it does not collapse same-second process incarnations.
-      const stat = await readFile(`/proc/${normalizedPid}/stat`, 'utf8')
-      const commandEnd = stat.lastIndexOf(')')
-      if (commandEnd < 0) return null
-      const fieldsAfterCommand = stat.slice(commandEnd + 2).trim().split(/\s+/)
-      const startTicks = Number(fieldsAfterCommand[19])
-      return Number.isSafeInteger(startTicks) && startTicks >= 0 ? startTicks : null
-    } catch {
-      return null
-    }
+    const stat = await readFile(`/proc/${normalizedPid}/stat`, 'utf8').catch(() => null)
+    return stat === null ? null : parseLinuxProcessStartTicks(stat)
   }
 
-  // proc_bsdinfo carries the kernel-recorded start timeval at microsecond
-  // resolution. Unlike `ps lstart`, this distinguishes same-second reuse.
   if (platform === 'darwin') {
     return readDarwinProcessStartTimeMicros(normalizedPid)
   }
@@ -898,23 +907,28 @@ export async function readProcessStartTimeMs(
   if (platform !== 'win32') return null
 
   const command = 'powershell.exe'
+  // Get-Process can hang during module autoimport in an isolated Windows home.
+  // Read the same .NET StartTime directly and release the process handle even
+  // when the process exits or access is denied. Emit only after cleanup succeeds.
   const args = [
-        '-NoProfile',
-        '-NonInteractive',
-        '-ExecutionPolicy',
-        'Bypass',
-        '-Command',
-        [
-          '$ErrorActionPreference = "Stop"',
-          `$process = Get-Process -Id ${normalizedPid} -ErrorAction Stop`,
-          '$process.StartTime.ToUniversalTime().ToString("o")',
-        ].join('; '),
-      ]
+    '-NoProfile',
+    '-NonInteractive',
+    '-ExecutionPolicy',
+    'Bypass',
+    '-Command',
+    [
+      '$ErrorActionPreference = "Stop"',
+      '$process = $null',
+      `try { $process = [System.Diagnostics.Process]::GetProcessById(${normalizedPid}); $startedAt = $process.StartTime.ToUniversalTime().ToString("o") } catch { exit 1 } finally { if ($null -ne $process) { $process.Dispose() } }`,
+      '[Console]::Out.WriteLine($startedAt)',
+    ].join('; '),
+  ]
 
   const output = await readProcessQueryOutput(
     command,
     args,
     PROCESS_START_TIME_OUTPUT_LIMIT_BYTES,
+    timeoutMs ?? WINDOWS_PROCESS_START_TIME_QUERY_TIMEOUT_MS,
   )
   return output === null ? null : parseProcessStartTime(output)
 }
@@ -922,6 +936,7 @@ export async function readProcessStartTimeMs(
 export async function readProcessCommandLine(
   pid: number,
   platform: NodeJS.Platform = process.platform,
+  timeoutMs?: number,
 ): Promise<string | null> {
   const normalizedPid = Math.trunc(pid)
   if (!Number.isFinite(normalizedPid) || normalizedPid <= 0) return null
@@ -941,7 +956,7 @@ export async function readProcessCommandLine(
         ].join('; '),
       ]
     : ['-p', String(normalizedPid), '-o', 'command=']
-  const output = await readProcessQueryOutput(command, args, PROCESS_COMMAND_OUTPUT_LIMIT_BYTES)
+  const output = await readProcessQueryOutput(command, args, PROCESS_COMMAND_OUTPUT_LIMIT_BYTES, timeoutMs)
   const normalized = output?.trim()
   return normalized ? normalized : null
 }
@@ -1126,4 +1141,114 @@ export async function killProcessTreeAndWait(
   }
   const finalIdentity = await inspectExpectedProcessIdentity(pid, expectedStartTime, deps)
   return exactContainment && (finalIdentity === 'gone' || finalIdentity === 'changed')
+}
+
+
+export type StartupProcessTermination = {
+  helperTerminated: boolean
+  rootGone: boolean
+  treeKillSucceeded: boolean
+}
+
+// Retain the entire destructive operation, including awaited identity checks
+// before dispatch and fallback. Helper close alone does not drain a fallback.
+const startupTaskkills = new Map<number, Promise<void>>()
+export function pendingStartupTaskkill(pid: number): Promise<void> | undefined {
+  return startupTaskkills.get(pid)
+}
+
+export async function drainStartupTaskkills(): Promise<void> {
+  while (startupTaskkills.size > 0) {
+    await Promise.all(startupTaskkills.values())
+  }
+}
+
+export function pendingStartupTaskkillPids(): number[] {
+  return [...startupTaskkills.keys()]
+}
+
+export function hasPendingStartupTaskkill(pid: number): boolean {
+  return startupTaskkills.has(pid)
+}
+
+export async function killProcessTreeForStartup(
+  pid: number,
+  expectedStartedAtMs: number,
+  budget: { cap(ms: number): number; assertAvailable(reserveMs?: number): void },
+  deps: {
+    readIdentity?: (pid: number, timeoutMs: number) => Promise<number | null>
+    alive?: (pid: number) => boolean
+    signal?: (pid: number) => void
+  } = {},
+): Promise<StartupProcessTermination> {
+  if (!Number.isSafeInteger(pid) || pid <= 0 || pid > 0x7fffffff
+    || typeof expectedStartedAtMs !== 'number' || !Number.isFinite(expectedStartedAtMs)) {
+    throw new Error('Startup termination requires a valid PID and process birth identity')
+  }
+  const alive = deps.alive ?? isProcessAlive
+  const failed = (helperTerminated = true): StartupProcessTermination => ({
+    helperTerminated, rootGone: !alive(pid), treeKillSucceeded: false,
+  })
+  if (startupTaskkills.has(pid)) return failed(false)
+  let release!: () => void
+  const drained = new Promise<void>(resolve => { release = resolve })
+  startupTaskkills.set(pid, drained)
+  const finishOperation = () => { startupTaskkills.delete(pid); release() }
+  let observingLiveHelper = false
+  try {
+    const identity = deps.readIdentity ?? ((target, timeout) => readProcessStartTimeMs(target, 'win32', timeout))
+    budget.assertAvailable(1_000)
+    if (await identity(pid, budget.cap(6_000)) !== expectedStartedAtMs) return failed()
+    budget.assertAvailable(1_000)
+    const timeoutMs = Math.min(2_500, budget.cap(3_500) - 1_000)
+    // A clock tick between the reserve check and cap must not become a zero or
+    // negative timer, which Node would normalize to a fresh one-millisecond job.
+    if (timeoutMs <= 0) throw new Error('Startup cleanup termination reserve exhausted')
+    let child: ReturnType<typeof spawn> | undefined
+    let timedOut = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const operation = new Promise<StartupProcessTermination>(resolve => {
+      const finish = (success: boolean) => {
+        if (timer) clearTimeout(timer)
+        resolve({ helperTerminated: true, rootGone: !alive(pid), treeKillSucceeded: success && !timedOut })
+      }
+      try {
+        const { command, args } = buildWindowsTaskkillInvocation(pid)
+        child = spawn(command, args, { stdio: 'ignore', windowsHide: true })
+        // Failed spawn has no helper. Errors from a running child do not prove exit.
+        child.once('error', () => { if (!child?.pid) finish(false) })
+        child.once('close', code => finish(code === 0))
+        timer = setTimeout(() => {
+          timedOut = true
+          try { child?.kill('SIGKILL') } catch { /* Keep observing the captured helper. */ }
+        }, timeoutMs)
+      } catch { finish(false) }
+    })
+    let observationTimer: ReturnType<typeof setTimeout> | undefined
+    const outcome = await Promise.race([
+      operation,
+      new Promise<StartupProcessTermination>(resolve => {
+        observationTimer = setTimeout(() => resolve(failed(false)), timeoutMs + 1_000)
+      }),
+    ])
+    if (observationTimer) clearTimeout(observationTimer)
+    if (!outcome.helperTerminated) {
+      observingLiveHelper = true
+      void operation.then(finishOperation)
+      return outcome
+    }
+    if (outcome.rootGone) return outcome
+    // Direct fallback is fresh-identity checked, even after taskkill failed. A
+    // successful root signal cannot erase a failed tree operation.
+    try {
+      budget.assertAvailable()
+      if (await identity(pid, budget.cap(6_000)) !== expectedStartedAtMs) return outcome
+      budget.assertAvailable()
+      const signal = deps.signal ?? (target => process.kill(target, 'SIGKILL'))
+      signal(pid)
+    } catch { /* Explicit partial result; no further destructive continuation. */ }
+    return { ...outcome, rootGone: !alive(pid) }
+  } finally {
+    if (!observingLiveHelper) finishOperation()
+  }
 }

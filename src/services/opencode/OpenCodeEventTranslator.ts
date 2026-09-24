@@ -44,6 +44,23 @@ export function hasCompletedOpenCodeAssistantTurn(
   return message.toolCalls.some(toolCall => toolCall.status === 'completed' || toolCall.status === 'errored')
 }
 
+export function hasTerminalOpenCodeAssistantResponse(
+  message: OpenCodeCanonicalMessage,
+): boolean {
+  if (message.role !== 'assistant') {
+    return false
+  }
+  if (message.hasError) {
+    return true
+  }
+  // OpenCode completes each model step before continuing its tool loop.
+  // Tool execution is probe evidence, but cannot override a busy session.
+  if (message.toolCalls.length > 0 || message.finishReason === 'tool-calls' || message.finishReason === 'unknown') {
+    return false
+  }
+  return hasCompletedOpenCodeAssistantTurn(message)
+}
+
 function isAssistantResponseEvidencePartType(type: string): boolean {
   return type !== 'unknown' && type !== 'step-start' && type !== 'step_start'
 }
@@ -96,11 +113,13 @@ function hasCompletedAssistantResponseForLatestUser(
     return false
   }
 
-  return hasAssistantResponseAfterUser(
-    messages,
-    latestUserIndex,
-    hasCompletedOpenCodeAssistantTurn,
-  )
+  for (let index = messages.length - 1; index > latestUserIndex; index -= 1) {
+    const message = messages[index]
+    if (message.role === 'assistant') {
+      return hasTerminalOpenCodeAssistantResponse(message)
+    }
+  }
+  return false
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -113,7 +132,7 @@ function asString(value: unknown): string | null {
   return typeof value === 'string' && value.trim().length > 0 ? value.trim() : null
 }
 
-function normalizeOpenCodeSessionStatus(
+export function normalizeOpenCodeSessionStatus(
   rawStatus: OpenCodeSessionStatusInput | null,
 ): {
   status: OpenCodeSessionStatus | null

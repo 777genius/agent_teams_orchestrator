@@ -330,6 +330,7 @@ export type RuntimeProviderModelsView = {
   models: readonly RuntimeProviderModel[]
   defaultModelId: string | null
   diagnostics: readonly string[]
+  catalogState: 'fresh' | 'stale'
 }
 
 export type ProjectScopedProviderManagementInput = {
@@ -374,6 +375,10 @@ export type SetDefaultModelInput = {
   modelId: string
   probe?: boolean
   scope?: RuntimeProviderDefaultScope
+} & ProjectScopedProviderManagementInput
+
+export type ClearProjectDefaultModelInput = {
+  runtimeId: ProviderManagementRuntimeId
 } & ProjectScopedProviderManagementInput
 
 export type TestProviderModelInput = {

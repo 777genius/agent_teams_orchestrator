@@ -10,6 +10,8 @@ import {
   type OpenCodeSseFetch,
 } from './OpenCodeSseEventStream.js'
 import { buildOpenCodeRuntimePromptMessageId } from './OpenCodeMessageIds.js'
+import { hasTerminalOpenCodeAssistantResponse } from './OpenCodeEventTranslator.js'
+import { openCodeTranscriptProjector } from './OpenCodeTranscriptProjector.js'
 import type { OpenCodeRuntimeTurnSettledOutcome } from './OpenCodeRuntimeTurnSettledEmitter.js'
 import type { OpenCodeMessage, OpenCodeSseEvent } from './types.js'
 
@@ -75,6 +77,7 @@ type ObservationState = {
 type TranscriptResponseProof = {
   promptPersisted: boolean
   assistantMessageId: string | null
+  assistantHasError?: boolean
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -149,11 +152,30 @@ function hasTranscriptAssistantActivity(message: OpenCodeMessage): boolean {
 function findTranscriptResponseForPrompt(
   messages: OpenCodeMessage[],
   runtimePromptMessageId: string,
+  requireTerminal = false,
 ): TranscriptResponseProof {
   const promptIndex = messages.findIndex(message =>
     getTranscriptMessageRole(message) === 'user' &&
     getTranscriptMessageId(message) === runtimePromptMessageId
   )
+  if (requireTerminal) {
+    const following = promptIndex >= 0 ? messages.slice(promptIndex + 1) : messages
+    const nextUserIndex = following.findIndex(message => getTranscriptMessageRole(message) === 'user')
+    const candidates = promptIndex >= 0
+      ? following.slice(0, nextUserIndex >= 0 ? nextUserIndex : undefined)
+      : following.filter(message => getTranscriptMessageParentId(message) === runtimePromptMessageId)
+    const latestAssistant = candidates.findLast(message => getTranscriptMessageRole(message) === 'assistant')
+    const canonical = latestAssistant && Array.isArray(latestAssistant.parts)
+      ? openCodeTranscriptProjector.projectSessionMessages({
+        sessionId: '', messages: [latestAssistant],
+      }).messages[0]
+      : null
+    return {
+      promptPersisted: promptIndex >= 0 || Boolean(latestAssistant),
+      assistantMessageId: canonical && hasTerminalOpenCodeAssistantResponse(canonical) ? canonical.id : null,
+      assistantHasError: canonical?.hasError,
+    }
+  }
   const parentMatchedAssistant = messages.find(message =>
     getTranscriptMessageRole(message) === 'assistant' &&
     getTranscriptMessageParentId(message) === runtimePromptMessageId &&
@@ -279,7 +301,7 @@ export class OpenCodeTurnSettledObserver {
       clearIdleTimer()
       idleTimer = setTimeout(() => {
         if (state.promptState === 'accepted' && state.assistantActivityCount > 0) {
-          settle('success', `OpenCode turn settled after ${idleTimeoutMs}ms without new events`)
+          reconcileTranscriptAfterIdle('event silence')
         }
       }, idleTimeoutMs)
     }
@@ -314,7 +336,7 @@ export class OpenCodeTurnSettledObserver {
       )
     }
 
-    const fetchTranscriptResponseProof = async (): Promise<TranscriptResponseProof | null> => {
+    const fetchTranscriptResponseProof = async (requireTerminal: boolean): Promise<TranscriptResponseProof | null> => {
       const fetchImpl = this.deps.fetchImpl ?? fetch
       const path =
         `/session/${encodeURIComponent(params.sessionId)}/message?limit=${DEFAULT_TURN_SETTLED_TRANSCRIPT_LIMIT}`
@@ -359,19 +381,24 @@ export class OpenCodeTurnSettledObserver {
         return null
       }
 
-      return findTranscriptResponseForPrompt(raw as OpenCodeMessage[], runtimePromptMessageId)
+      return findTranscriptResponseForPrompt(raw as OpenCodeMessage[], runtimePromptMessageId, requireTerminal)
     }
 
-    const reconcileTranscriptAfterIdle = (source: 'session.idle' | 'session.status idle') => {
+    const reconcileTranscriptAfterIdle = (source: 'session.idle' | 'session.status idle' | 'event silence') => {
       if (state.terminal || state.disposed || idleTranscriptProbeInFlight) {
         return
       }
 
       idleTranscriptProbeInFlight = true
+      const matchedEventCount = state.matchedEventCount
       void (async () => {
         try {
-          const proof = await fetchTranscriptResponseProof()
+          const proof = await fetchTranscriptResponseProof(source === 'event silence')
           if (!proof || state.terminal || state.disposed) {
+            return
+          }
+          if (source === 'event silence' && state.matchedEventCount !== matchedEventCount) {
+            resetIdleTimer()
             return
           }
           if (proof.promptPersisted) {
@@ -387,7 +414,10 @@ export class OpenCodeTurnSettledObserver {
           state.assistantMessageObserved = true
           state.assistantActivityCount = Math.max(state.assistantActivityCount, 1)
           state.latestAssistantMessageId = proof.assistantMessageId
-          settle('success', `OpenCode transcript reconcile after ${source} observed assistant activity`)
+          settle(
+            proof.assistantHasError ? 'error' : 'success',
+            `OpenCode transcript reconcile after ${source} observed ${source === 'event silence' ? 'a terminal assistant response' : 'assistant activity'}`,
+          )
         } finally {
           idleTranscriptProbeInFlight = false
         }

@@ -174,6 +174,7 @@ import { parseSettingSourcesFlag } from 'src/utils/settings/constants.js';
 import { plural } from 'src/utils/stringUtils.js';
 import { TEAMMATE_BOOTSTRAP_RUN_ID_ENV, writeTeammateRuntimeEvent } from './utils/swarm/teammateRuntimeEvents.js';
 import { resolveStartupMcpConfig } from './services/teamBootstrap/headlessStartupMcpConfig.js';
+import { resolveTeamBootstrapSpecPath } from './services/teamBootstrap/teamBootstrapStartupGuards.js';
 import { type ChannelEntry, getInitialMainLoopModel, getIsNonInteractiveSession, getSdkBetas, getSessionId, getUserMsgOptIn, setAllowedChannels, setAllowedSettingSources, setChromeFlagOverride, setClientType, setCwdState, setDirectConnectServerUrl, setFlagSettingsInline, setFlagSettingsPath, setInitialMainLoopModel, setInlinePlugins, setIsInteractive, setKairosActive, setOriginalCwd, setQuestionPreviewFormat, setSdkBetas, setSessionBypassPermissionsMode, setSessionPersistenceDisabled, setSessionSource, setStrictMcpConfig, setUserMsgOptIn, switchSession } from './bootstrap/state.js';
 
 const TEAMMATE_RUNTIME_ENV = 'CLAUDE_CODE_TEAMMATE_RUNTIME';
@@ -2896,9 +2897,12 @@ async function run(): Promise<CommanderCommand> {
           return connectMcpBatch(dedupedClaudeAi, 'claudeai');
         });
         let claudeaiTimer: ReturnType<typeof setTimeout> | undefined;
-        const claudeaiTimedOut = await Promise.race([claudeaiConnect.then(() => false), new Promise<boolean>(resolve => {
-          claudeaiTimer = setTimeout(r => r(true), CLAUDE_AI_MCP_TIMEOUT_MS, resolve);
-        })]);
+        const claudeaiTimedOut = await Promise.race([
+          claudeaiConnect.then(() => false),
+          new Promise<boolean>(resolve => {
+            claudeaiTimer = setTimeout(() => resolve(true), CLAUDE_AI_MCP_TIMEOUT_MS);
+          }),
+        ]);
         if (claudeaiTimer) clearTimeout(claudeaiTimer);
         if (claudeaiTimedOut) {
           logForDebugging(`[MCP] claude.ai connectors not ready after ${CLAUDE_AI_MCP_TIMEOUT_MS}ms — proceeding; background connection continues`);
@@ -2913,7 +2917,13 @@ async function run(): Promise<CommanderCommand> {
         }
         logSessionTelemetry();
       };
-      if (!options.teamBootstrapSpec) {
+      const teamBootstrapSpecPath = resolveTeamBootstrapSpecPath(
+        (options as { teamBootstrapSpec?: string }).teamBootstrapSpec,
+      );
+      logForDebugging(
+        `[team-bootstrap] print-mode spec option=${String((options as { teamBootstrapSpec?: string }).teamBootstrapSpec)} resolved=${String(teamBootstrapSpecPath)}`,
+      );
+      if (!teamBootstrapSpecPath) {
         await prepareHeadlessConversationContext();
       }
       profileCheckpoint('before_print_import');
@@ -2949,9 +2959,9 @@ async function run(): Promise<CommanderCommand> {
         enableAuthStatus: options.enableAuthStatus,
         agent: agentCli,
         workload: options.workload,
-        teamBootstrapSpecPath: options.teamBootstrapSpec,
+        teamBootstrapSpecPath,
         teamBootstrapUserPromptFile: options.teamBootstrapUserPromptFile,
-        ...(options.teamBootstrapSpec ? {
+        ...(teamBootstrapSpecPath ? {
           bootstrapContext: {
             commands: commandsHeadless,
             tools,
@@ -4417,6 +4427,17 @@ async function run(): Promise<CommanderCommand> {
       runtimeProvidersSetDefault
     } = await import('./cli/handlers/runtime.js');
     await runtimeProvidersSetDefault(opts);
+  });
+  runtimeProviders.command('clear-project-default').description('Clear the project OpenCode default and inherit the next available default').addOption(new Option('--runtime <runtime>', 'Runtime to manage').choices(['opencode'])).requiredOption('--project-path <path>', 'Project path whose OpenCode profile should be managed').option('--compact', 'Omit unavailable manual-only providers').option('--json', 'Output as JSON (default)').action(async (opts: {
+    runtime?: 'opencode';
+    projectPath: string;
+    compact?: boolean;
+    json?: boolean;
+  }) => {
+    const {
+      runtimeProvidersClearProjectDefault
+    } = await import('./cli/handlers/runtime.js');
+    await runtimeProvidersClearProjectDefault(opts);
   });
   runtimeProviders.command('configure-model-limits').description('Save and verify app-managed context limits for a configured local OpenCode model').addOption(new Option('--runtime <runtime>', 'Runtime to manage').choices(['opencode'])).requiredOption('--provider <providerId>', 'Nested provider identifier').requiredOption('--model <providerModelId>', 'Provider-scoped model identifier').requiredOption('--context-tokens <count>', 'Model context window', Number).requiredOption('--output-tokens <count>', 'Maximum model output', Number).option('--project-path <path>', 'Project path whose OpenCode profile should be managed').option('--json', 'Output as JSON (default)').action(async (opts: {
     runtime?: 'opencode';

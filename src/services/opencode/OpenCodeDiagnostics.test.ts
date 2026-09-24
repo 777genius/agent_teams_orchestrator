@@ -10,6 +10,9 @@ import type { OpenCodeInventorySnapshot, OpenCodePreparedProfile } from './types
 
 const profile: OpenCodePreparedProfile = {
   projectPath: '/tmp/project',
+  canonicalProjectPath: '/tmp/project',
+  workingDirectoryPath: '/tmp/project',
+  scopeToken: null,
   profileRootKey: 'profile-root',
   profileRootPath: '/tmp/profile-root',
   projectBehaviorFingerprint: 'behavior-fingerprint-123456',

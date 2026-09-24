@@ -15,6 +15,7 @@ export type GeminiBackendStatus = {
   endpointLabel: string
   message?: string
   hint?: string
+  validationError?: 'invalid_credentials' | 'operational'
 }
 
 export type GeminiNormalizedPart =

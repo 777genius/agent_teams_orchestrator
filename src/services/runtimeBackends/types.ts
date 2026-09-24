@@ -96,6 +96,7 @@ export type RuntimeProviderModelCatalogItem = {
     limits?: unknown | null
     free?: boolean
     releaseDate?: string | null
+    recentlyReleased?: boolean
     opencode?: OpenCodeModelRouteMetadata | null
   } | null
 }
@@ -168,6 +169,18 @@ export type ExternalRuntimeDiagnostic = {
   detailMessage: string | null
 }
 
+export type RuntimeStatusCheckOutcome =
+  | 'authoritative'
+  | 'pending'
+  | 'transient_error'
+  | 'model_only'
+
+export type RuntimeStatusCheckErrorCode =
+  | 'timeout'
+  | 'unavailable'
+  | 'runtime_missing'
+  | 'partial_response'
+
 export type RuntimeProviderStatus = {
   providerId: RuntimeProviderId
   displayName: string
@@ -199,6 +212,9 @@ export type RuntimeProviderStatus = {
     authMethodDetail?: string | null
   } | null
   capabilitiesInfo?: RuntimeCapabilityInfo[]
+  /** Additive wire contract; consumers must treat missing legacy values conservatively. */
+  statusCheckOutcome?: RuntimeStatusCheckOutcome
+  statusCheckErrorCode?: RuntimeStatusCheckErrorCode | null
 }
 
 export type RuntimeStatusPayload = {

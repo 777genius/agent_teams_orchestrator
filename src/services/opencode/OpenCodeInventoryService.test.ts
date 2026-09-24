@@ -6,13 +6,16 @@ import path from 'node:path'
 
 import {
   collectOpenCodeInventoryCommandResults,
+  deriveOpenCodeProfileConnectedProviders,
   createOpenCodeInventoryProbeProgressTracker,
   execOpenCodePortableCommand,
   filterOpenCodeConnectedProvidersForRuntime,
+  getOpenCodeInventoryCommandTimeoutMs,
   getOpenCodeRefreshModelsArgs,
   getOpenCodeVerboseModelsArgs,
   OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS,
   OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS,
+  OPEN_CODE_MODEL_LIST_TIMEOUT_MS,
   OPEN_CODE_PROBE_TIMEOUT_MS,
   isOpenCodeBuiltinFreeModelId,
   isOpenCodeInventoryTimeoutSnapshot,
@@ -27,6 +30,28 @@ import {
 } from './OpenCodeInventoryService.js'
 
 import type { OpenCodeInventorySnapshot, OpenCodePreparedProfile } from './types.js'
+
+function scopedProfile(
+  providerId: string,
+  identity: 'absent' | 'error' | `known:${string}`,
+): OpenCodePreparedProfile {
+  const profileScope = {
+    purpose: 'launch_runtime' as const,
+    providerId,
+    configFingerprint: 'config-fingerprint',
+    selectedAuthIdentity: identity,
+    scopeToken: `scope-${providerId}`,
+  }
+  return {
+    profileScope,
+    scopeToken: profileScope.scopeToken,
+    selectedSourceAuthIdentity: identity,
+    selectedManagedAuthIdentity: identity,
+    globalAuthPath: '/poison/global-auth.json',
+    sourceAuthPath: '/poison/source-auth.json',
+    managedAuthPath: '/poison/managed-auth.json',
+  } as unknown as OpenCodePreparedProfile
+}
 
 async function waitForFile(filePath: string, timeoutMs = 1_000): Promise<void> {
   const deadline = Date.now() + timeoutMs
@@ -111,6 +136,9 @@ describe('OpenCodeInventoryService parsers', () => {
   })
 
   test('keeps the full inventory timeout aligned with sequential OpenCode probes', () => {
+    expect(OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS).toBeGreaterThanOrEqual(
+      OPEN_CODE_PROBE_TIMEOUT_MS * 3,
+    )
     expect(OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS).toBeGreaterThan(
       OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS,
     )
@@ -122,6 +150,27 @@ describe('OpenCodeInventoryService parsers', () => {
   test('queries the full OpenCode model inventory, not only the opencode provider', () => {
     expect(getOpenCodeVerboseModelsArgs()).toEqual(['models', '--verbose'])
     expect(getOpenCodeRefreshModelsArgs()).toEqual(['models', 'opencode', '--refresh'])
+  })
+
+  test('gives primary and fallback model-list commands the bounded model-list timeout', () => {
+    expect(getOpenCodeInventoryCommandTimeoutMs(getOpenCodeVerboseModelsArgs())).toBe(
+      OPEN_CODE_MODEL_LIST_TIMEOUT_MS,
+    )
+    expect(getOpenCodeInventoryCommandTimeoutMs(['models'])).toBe(
+      OPEN_CODE_MODEL_LIST_TIMEOUT_MS,
+    )
+  })
+
+  test('keeps non-model inventory commands on the standard probe timeout', () => {
+    expect(getOpenCodeInventoryCommandTimeoutMs(['--version'])).toBe(
+      OPEN_CODE_PROBE_TIMEOUT_MS,
+    )
+    expect(getOpenCodeInventoryCommandTimeoutMs(['providers', 'list'])).toBe(
+      OPEN_CODE_PROBE_TIMEOUT_MS,
+    )
+    expect(getOpenCodeInventoryCommandTimeoutMs(['agent', 'list'])).toBe(
+      OPEN_CODE_PROBE_TIMEOUT_MS,
+    )
   })
 
   test('forces OpenCode to refresh models instead of reusing a prewarmed catalog result', async () => {
@@ -272,6 +321,60 @@ describe('OpenCodeInventoryService parsers', () => {
     expect(result.providersResult.stdout).toBe('')
     expect(result.modelsResult.stdout).toBe('')
     expect(result.agentsResult.stdout).toBe('')
+  })
+
+  test('profile auth inventory uses only the selected DeepInfra or custom identity', async () => {
+    for (const providerId of ['deepinfra', 'my-custom-provider']) {
+      const profile = scopedProfile(providerId, 'known:selected-auth')
+      const summaryReads: string[] = []
+      const result = deriveOpenCodeProfileConnectedProviders({
+        profileScope: profile.profileScope!,
+        profile,
+        readAuthProviderSummaries: async authPath => {
+          summaryReads.push(authPath)
+          throw new Error('all-provider auth summary reader invoked')
+        },
+      })
+      expect(summaryReads).toEqual([])
+      expect(result).toEqual({
+        providers: [{ id: providerId, authHint: null, source: 'credentials' }],
+        profileScopeError: false,
+      })
+    }
+  })
+
+  test('profile auth inventory accepts explicit selected identity absence', async () => {
+    const profile = scopedProfile('opencode', 'absent')
+    expect(deriveOpenCodeProfileConnectedProviders({
+      profileScope: profile.profileScope!,
+      profile,
+    })).toEqual({ providers: [], profileScopeError: false })
+  })
+
+  test('profile auth inventory fails closed on missing, error, or mismatched evidence', async () => {
+    const missingPreparedScope = scopedProfile('deepinfra', 'known:auth')
+    missingPreparedScope.profileScope = null
+    const errorIdentity = scopedProfile('deepinfra', 'error')
+    const providerMismatch = scopedProfile('deepinfra', 'known:auth')
+    providerMismatch.profileScope = { ...providerMismatch.profileScope!, providerId: 'cursor' }
+    const missingIdentity = scopedProfile('deepinfra', 'known:auth')
+    missingIdentity.selectedSourceAuthIdentity = undefined
+    const identityMismatch = scopedProfile('deepinfra', 'known:auth')
+    identityMismatch.selectedManagedAuthIdentity = 'known:different'
+    const cases = [
+      { profile: missingPreparedScope, scope: scopedProfile('deepinfra', 'known:auth').profileScope },
+      { profile: errorIdentity, scope: errorIdentity.profileScope },
+      { profile: providerMismatch, scope: scopedProfile('deepinfra', 'known:auth').profileScope },
+      { profile: missingIdentity, scope: missingIdentity.profileScope },
+      { profile: identityMismatch, scope: identityMismatch.profileScope },
+      { profile: scopedProfile('deepinfra', 'known:auth'), scope: undefined },
+    ]
+    for (const { profile, scope } of cases) {
+      expect(deriveOpenCodeProfileConnectedProviders({
+        profileScope: scope ?? undefined,
+        profile,
+      })).toEqual({ providers: [], profileScopeError: true })
+    }
   })
 
   test('portable inventory command runner captures stdout and stderr', async () => {

@@ -24,6 +24,7 @@ type FakeModelPage = {
 function createFakeCodexAppServerSpawn(options: {
   pages?: FakeModelPage[]
   modelListError?: { code: number; message: string }
+  ignoreMethod?: 'initialize' | 'model/list'
 } = {}): {
   calls: FakeSpawnCall[]
   spawnCli: (binaryPath: string, args: string[], spawnOptions: SpawnOptions) => ChildProcess
@@ -41,6 +42,9 @@ function createFakeCodexAppServerSpawn(options: {
           additionalSpeedTiers: ['fast'],
           inputModalities: ['text', 'image'],
           isDefault: true,
+          availabilityNux: {
+            message: '  Newly available in Codex  ',
+          },
         },
       ],
       nextCursor: 'page-2',
@@ -54,6 +58,7 @@ function createFakeCodexAppServerSpawn(options: {
           supportedReasoningEfforts: ['low', 'medium', 'high', 'xhigh'],
           defaultReasoningEffort: 'high',
           inputModalities: ['text', 'image'],
+          availabilityNux: { message: 42 },
         },
       ],
       nextCursor: null,
@@ -93,6 +98,7 @@ function createFakeCodexAppServerSpawn(options: {
       if (typeof message.id !== 'number') {
         return
       }
+      if (message.method === options.ignoreMethod) return
       if (message.method === 'initialize') {
         stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id: message.id, result: {} })}\n`)
         return
@@ -125,6 +131,25 @@ afterEach(() => {
 })
 
 describe('Codex app-server model catalog loader', () => {
+  test('classifies initialize, model/list and total deadlines as settled timeouts', async () => {
+    for (const phase of ['initialize', 'model/list', 'total'] as const) {
+      clearCodexRuntimeModelCatalogCacheForTesting()
+      const fake = createFakeCodexAppServerSpawn({
+        ignoreMethod: phase === 'total' ? 'initialize' : phase,
+      })
+      const result = await getCodexRuntimeModelCatalog({
+        env: { CODEX_CLI_PATH: '/test/codex' },
+        which: () => '/test/codex',
+        spawnCli: fake.spawnCli,
+        initializeTimeoutMs: phase === 'total' ? 100 : 10,
+        requestTimeoutMs: 10,
+        totalTimeoutMs: phase === 'total' ? 10 : 100,
+      })
+      expect(result.status).toBe('degraded')
+      expect(result.diagnostics).toMatchObject({ appServerState: 'degraded', code: 'timeout' })
+    }
+  })
+
   test('reads paginated model/list results from the configured Codex binary', async () => {
     const fake = createFakeCodexAppServerSpawn()
     const catalog = await getCodexRuntimeModelCatalog({
@@ -144,7 +169,15 @@ describe('Codex app-server model catalog loader', () => {
     expect(catalog.status).toBe('ready')
     expect(catalog.models.map(model => model.launchModel)).toEqual(['gpt-5.4', 'gpt-5.5'])
     expect(catalog.defaultLaunchModel).toBe('gpt-5.4')
-    expect(catalog.models.find(model => model.id === 'gpt-5.5')?.displayName).toBe('GPT-5.5')
+    expect(catalog.models.find(model => model.id === 'gpt-5.4')).toMatchObject({
+      statusMessage: 'Newly available in Codex',
+      metadata: { recentlyReleased: true },
+    })
+    expect(catalog.models.find(model => model.id === 'gpt-5.5')).toMatchObject({
+      displayName: 'GPT-5.5',
+      statusMessage: null,
+      metadata: null,
+    })
   })
 
   test('falls back to the static catalog when the binary is missing', async () => {

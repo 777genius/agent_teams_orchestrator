@@ -16,18 +16,37 @@ export type OpenCodeToolApprovalMode = 'auto' | 'manual'
 
 export type OpenCodePrepareProfileOptions = {
   abortSignal?: AbortSignal
+  /** Fixed preparation labels only; never include paths, config, or credentials. */
+  progress?: { enterStep(label: string): () => void }
   modelOutputLimitOverrides?: readonly OpenCodeModelOutputLimitOverride[]
   includeAppMcp?: boolean
   includeManagedSubscriptionPlugins?: boolean
   toolApprovalMode?: OpenCodeToolApprovalMode
+  profileScope?: OpenCodeProfileScope
+}
+
+export type OpenCodeProfilePurpose = 'catalog' | 'execution_probe' | 'launch_runtime'
+
+export type OpenCodeProfileScope = {
+  purpose: OpenCodeProfilePurpose
+  providerId: string
+  configFingerprint: string
+  selectedAuthIdentity: 'absent' | 'error' | `known:${string}`
+  scopeToken: string
 }
 
 export type OpenCodePreparedProfile = {
   projectPath: string
+  canonicalProjectPath: string
+  workingDirectoryPath: string
+  scopeToken: string | null
   profileRootKey: string
   profileRootPath: string
+  profileScope?: OpenCodeProfileScope | null
+  appMcpLaunchSource?: OpenCodeAppMcpLaunchSource | null
   projectDefaultModelId?: string | null
   allProjectsDefaultModelId?: string | null
+  importedConfigDefaultModelId?: string | null
   effectiveManagedDefaultModelId?: string | null
   effectiveManagedDefaultSource?: 'project' | 'all_projects' | null
   projectBehaviorFingerprint: string
@@ -46,6 +65,9 @@ export type OpenCodePreparedProfile = {
   sourceAuthSources?: Array<{ path: string; fingerprint: string | null }>
   sourceAuthFingerprint: string | null
   managedAuthFingerprint: string | null
+  selectedSourceAuthIdentity?: 'absent' | 'error' | `known:${string}`
+  selectedManagedAuthIdentity?: 'absent' | 'error' | `known:${string}`
+  authoritySourceFingerprint?: string | null
   authState: OpenCodeAuthState
   env: NodeJS.ProcessEnv
 }
@@ -61,6 +83,8 @@ export type OpenCodeHostHandle = {
   port: number
   pid: number
   processStartedAtMs?: number | null
+  /** Joins this host to the attribution records its process tree writes. */
+  attributionId?: string | null
   version: string | null
   state: OpenCodeHostState
   profile: OpenCodePreparedProfile
@@ -573,6 +597,8 @@ export type OpenCodeExecutionProbeOutcome =
 export type OpenCodeExecutionProbeResult = {
   providerId: 'opencode'
   modelId: string
+  observedProviderId?: string
+  observedModelId?: string
   probePrompt: string
   expectedOutput: string
   outcome: OpenCodeExecutionProbeOutcome
@@ -591,6 +617,16 @@ export type OpenCodeExecutionProbeResult = {
 
 export type OpenCodeExecutionProofCredentialMode = 'api' | 'oauth' | 'none' | 'unknown'
 
+export type OpenCodeExpectedBehaviorEvidence = {
+  canonicalProjectPathFingerprint: string
+  modelProviderId: string
+  fullModelId: string
+  projectBehaviorFingerprint: string
+  effectiveConfigFingerprint: string
+  effectiveSelectedAuthFingerprint: string
+  expectedBehaviorFingerprint: string
+}
+
 export type OpenCodeExecutionProof = {
   schemaVersion: 1
   providerId: 'opencode'
@@ -606,6 +642,7 @@ export type OpenCodeExecutionProof = {
   capabilitySnapshotId: string | null
   credentialMode: OpenCodeExecutionProofCredentialMode
   reusable: boolean
+  expectedBehaviorEvidence: OpenCodeExpectedBehaviorEvidence
   verifiedAt: string
   expiresAt: string
   proofHash: string
@@ -650,8 +687,21 @@ export type OpenCodeSessionPreviewSummary = {
   diagnostics: string[]
 }
 
+export type OpenCodeSessionStopAuthority = {
+  runtime: {
+    providerId: 'opencode'
+    binaryPath: string | null
+    binaryFingerprint: string | null
+    version: string | null
+    capabilitySnapshotId: string
+  }
+  expectedBehaviorFingerprint: string
+}
+
 export type OpenCodeSessionRecord = {
   teamId: string
+  stoppedAt?: string
+  stopAuthority?: OpenCodeSessionStopAuthority
   laneId?: string
   /** Durable lifecycle incarnation; absent only on legacy persisted records. */
   runId?: string | null
@@ -664,6 +714,7 @@ export type OpenCodeSessionRecord = {
   hostKey: string
   /** Exact OpenCode executable bytes bound when this session was created. */
   openCodeArtifactDigest?: `sha256:${string}` | null
+  profileScope?: OpenCodeProfileScope | null
   toolApprovalMode?: OpenCodeToolApprovalMode
   runtimePid?: number
   resolvedBehaviorFingerprint: string | null
@@ -675,6 +726,9 @@ export type OpenCodeSessionRecord = {
   managedAuthFingerprint: string | null
   projectBehaviorFingerprint: string
   managedConfigFingerprint?: string
+  /** Per-section fingerprints, so a stale session can name what changed. */
+  managedConfigSectionFingerprints?: Record<string, string>
+  expectedBehaviorFingerprint?: string
   opencodeVersion?: string
   bootstrapMode?: OpenCodeBootstrapMode
   bootstrapEvidenceSource?: OpenCodeBootstrapEvidenceSource

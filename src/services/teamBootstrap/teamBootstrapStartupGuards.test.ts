@@ -1,6 +1,9 @@
 import { describe, expect, test } from 'bun:test'
 
-import { validateTeamBootstrapStartupOptions } from './teamBootstrapStartupGuards.js'
+import {
+  resolveTeamBootstrapSpecPath,
+  validateTeamBootstrapStartupOptions,
+} from './teamBootstrapStartupGuards.js'
 
 describe('team bootstrap startup guards', () => {
   test('allows normal headless startup when no bootstrap spec is present', () => {
@@ -59,6 +62,26 @@ describe('team bootstrap startup guards', () => {
         inputPrompt: 'do the work',
       }),
     ).toContain('inline prompt')
+  })
+
+  test('resolves the bootstrap spec from argv when commander omitted it', () => {
+    expect(
+      resolveTeamBootstrapSpecPath(undefined, [
+        'bun',
+        'cli.tsx',
+        '--print',
+        '--team-bootstrap-spec',
+        '/tmp/spec.json',
+      ]),
+    ).toBe('/tmp/spec.json')
+    expect(
+      resolveTeamBootstrapSpecPath('  /tmp/from-options.json  ', [
+        'bun',
+        'cli.tsx',
+        '--team-bootstrap-spec',
+        '/tmp/spec.json',
+      ]),
+    ).toBe('/tmp/from-options.json')
   })
 
   test('allows stream input objects when bootstrap spec is present', () => {

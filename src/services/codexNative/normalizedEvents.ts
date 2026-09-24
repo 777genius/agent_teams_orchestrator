@@ -7,6 +7,7 @@ export type CodexNativeNormalizedEvent =
     }
   | {
       type: 'turn_started'
+      turnId?: string
     }
   | {
       type: 'assistant_text'
@@ -45,6 +46,7 @@ export type CodexNativeNormalizedEvent =
     }
   | {
       type: 'turn_completed'
+      turnId?: string
       errorMessage?: string | null
     }
   | {

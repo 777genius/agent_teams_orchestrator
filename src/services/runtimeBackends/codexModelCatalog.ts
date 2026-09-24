@@ -47,6 +47,9 @@ type CodexAppServerModel = {
   supportsPersonality?: boolean
   isDefault?: boolean
   upgrade?: unknown
+  availabilityNux?: {
+    message?: unknown
+  } | null
 }
 
 type CodexAppServerListModelsResponse = {
@@ -296,6 +299,11 @@ function normalizeCodexAppServerModels(models: readonly CodexAppServerModel[] | 
     seenLaunchModels.add(launchModel)
 
     const supportedReasoningEfforts = normalizeEfforts(model)
+    const rawAvailabilityNuxMessage = model.availabilityNux?.message
+    const availabilityNuxMessage =
+      typeof rawAvailabilityNuxMessage === 'string'
+        ? rawAvailabilityNuxMessage.trim() || null
+        : null
     normalizedModels.push({
       id,
       launchModel,
@@ -313,7 +321,8 @@ function normalizeCodexAppServerModels(models: readonly CodexAppServerModel[] | 
       upgrade: Boolean(model.upgrade),
       source: 'app-server',
       badgeLabel: id.replace(/^gpt-/, ''),
-      statusMessage: null,
+      statusMessage: availabilityNuxMessage,
+      metadata: availabilityNuxMessage ? { recentlyReleased: true } : null,
     })
   }
 
@@ -494,6 +503,13 @@ function classifyCatalogFailure(error: unknown): {
   const message = error instanceof Error ? error.message : String(error)
   const lower = message.toLowerCase()
   const code = error instanceof JsonRpcRequestError && error.code !== null ? String(error.code) : null
+  if (
+    !(error instanceof JsonRpcRequestError) &&
+    (message.startsWith('JSON-RPC request timed out:') ||
+      message.startsWith('codex app-server model/list timed out after'))
+  ) {
+    return { appServerState: 'degraded', message, code: 'timeout' }
+  }
   if (
     code === '-32601' ||
     lower.includes('method not found') ||

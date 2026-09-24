@@ -3,7 +3,8 @@ import { feature } from 'bun:bundle'
 // Define MACRO global for development (normally injected by bun build --define)
 if (typeof MACRO === 'undefined') {
   ;(globalThis as any).MACRO = {
-    VERSION: '2.1.87-dev',
+    // Match the build-time Fable 5.1 workaround: https://github.com/777genius/agent-teams-ai/issues/569
+    VERSION: '2.1.251-dev',
     BUILD_TIME: new Date().toISOString(),
     PACKAGE_URL: 'claude-code-source-snapshot',
     FEEDBACK_CHANNEL: 'github',
@@ -139,6 +140,7 @@ async function runRuntimeProvidersFastPath(args: string[]): Promise<boolean> {
   const provider = readOption(providerArgs, '--provider') ?? ''
   const model = readOption(providerArgs, '--model') ?? ''
   const {
+    runtimeProvidersClearProjectDefault,
     runtimeProvidersConnect,
     runtimeProvidersConnectApiKey,
     runtimeProvidersDirectory,
@@ -218,6 +220,12 @@ async function runRuntimeProvidersFastPath(args: string[]): Promise<boolean> {
         model,
         scope: readOption(providerArgs, '--scope') as 'project' | 'all-projects' | undefined,
         probe: hasOption(providerArgs, '--probe'),
+        compact: hasOption(providerArgs, '--compact'),
+      })
+      return true
+    case 'clear-project-default':
+      await runtimeProvidersClearProjectDefault({
+        ...common,
         compact: hasOption(providerArgs, '--compact'),
       })
       return true

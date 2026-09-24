@@ -20,6 +20,7 @@ import {
 } from './OpenCodeCuratedSubscriptionCatalog.js'
 import {
   areOpenCodeManagedPluginCachesReady,
+  canonicalizeOpenCodeProjectPath,
   openCodeProfileManager,
   repairEmptyOpenCodeManagedPluginCaches,
 } from './OpenCodeProfileManager.js'
@@ -36,6 +37,7 @@ import type {
   OpenCodeInventorySnapshot,
   OpenCodeModelMetadata,
   OpenCodePreparedProfile,
+  OpenCodeProfileScope,
   OpenCodeToolApprovalMode,
 } from './types.js'
 
@@ -78,9 +80,11 @@ export function filterOpenCodeConnectedProvidersForRuntime(input: {
 }
 
 export const OPEN_CODE_PROBE_TIMEOUT_MS = 10_000
-export const OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS = 8_000
+// Summary still prepares the profile and runs sequential version/auth probes.
+// Allow profile I/O plus both per-command budgets without starting a model host.
+export const OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS = OPEN_CODE_PROBE_TIMEOUT_MS * 3
 export const OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS = OPEN_CODE_PROBE_TIMEOUT_MS * 6
-const OPEN_CODE_MODEL_REFRESH_TIMEOUT_MS = 30_000
+export const OPEN_CODE_MODEL_LIST_TIMEOUT_MS = 30_000
 const OPEN_CODE_MODEL_REFRESH_OUTPUT_PROVIDER = 'opencode'
 const OPEN_CODE_CACHE_TTL_MS = 10_000
 const OPEN_CODE_INVENTORY_TIMEOUT_MESSAGE_PREFIX = 'OpenCode inventory probe timed out'
@@ -142,6 +146,7 @@ type OpenCodeInventoryProbeOptions = {
   toolApprovalMode?: OpenCodeToolApprovalMode
   abortSignal?: AbortSignal
   progress?: OpenCodeInventoryProbeProgressTracker
+  profileScope?: OpenCodeProfileScope
 }
 
 export type OpenCodeCommandResult = {
@@ -274,6 +279,12 @@ export function getOpenCodeRefreshModelsArgs(): string[] {
   // provider filter. Filtering stdout keeps an explicit UI refresh fast and
   // bounded instead of serializing every model from every provider.
   return ['models', OPEN_CODE_MODEL_REFRESH_OUTPUT_PROVIDER, '--refresh']
+}
+
+export function getOpenCodeInventoryCommandTimeoutMs(args: readonly string[]): number {
+  return args[0] === 'models'
+    ? OPEN_CODE_MODEL_LIST_TIMEOUT_MS
+    : OPEN_CODE_PROBE_TIMEOUT_MS
 }
 
 function getOpenCodeCatalogRefreshProfile(
@@ -882,6 +893,35 @@ function mergeConnectedProviders(
   })
 }
 
+export function deriveOpenCodeProfileConnectedProviders(input: {
+  profileScope?: OpenCodeProfileScope
+  profile: OpenCodePreparedProfile
+  readAuthProviderSummaries?: typeof readOpenCodeAuthProviderSummaries
+}): { providers: OpenCodeConnectedProvider[]; profileScopeError: boolean } {
+  const requestedScope = input.profileScope
+  const preparedScope = input.profile.profileScope
+  const sourceIdentity = input.profile.selectedSourceAuthIdentity
+  const managedIdentity = input.profile.selectedManagedAuthIdentity
+  const valid = Boolean(
+    requestedScope
+    && preparedScope
+    && JSON.stringify(preparedScope) === JSON.stringify(requestedScope)
+    && input.profile.scopeToken === requestedScope.scopeToken
+    && sourceIdentity !== undefined
+    && sourceIdentity !== 'error'
+    && managedIdentity !== undefined
+    && managedIdentity !== 'error'
+    && sourceIdentity === managedIdentity
+    && sourceIdentity === requestedScope.selectedAuthIdentity,
+  )
+  return {
+    providers: valid && sourceIdentity !== 'absent'
+      ? [{ id: requestedScope!.providerId, authHint: null, source: 'credentials' }]
+      : [],
+    profileScopeError: !valid,
+  }
+}
+
 export function parseOpenCodeAgentListOutput(output: string): OpenCodeAgentSummary[] {
   const agents: OpenCodeAgentSummary[] = []
 
@@ -935,7 +975,7 @@ export class OpenCodeInventoryService {
         args,
         profile,
         abortSignal: options.abortSignal,
-        timeoutMs: options.timeoutMs ?? OPEN_CODE_PROBE_TIMEOUT_MS,
+        timeoutMs: options.timeoutMs ?? getOpenCodeInventoryCommandTimeoutMs(args),
       })
     } finally {
       leaveStep?.()
@@ -947,9 +987,10 @@ export class OpenCodeInventoryService {
     options: OpenCodeInventoryProbeOptions = {},
   ): Promise<OpenCodeInventorySnapshot> {
     const mode = options.mode ?? 'full'
-    const resolvedProjectPath = path.resolve(projectPath?.trim() || getCwd())
+    const resolvedProjectPath = await canonicalizeOpenCodeProjectPath(projectPath)
     const toolApprovalMode = options.toolApprovalMode ?? 'auto'
-    const cacheKey = `${resolvedProjectPath}\0${mode}\0${options.includeAppMcp === false ? 'without-app-mcp' : 'with-app-mcp'}\0${toolApprovalMode}`
+    const scopeKey = options.profileScope ? JSON.stringify(options.profileScope) : 'legacy'
+    const cacheKey = `${resolvedProjectPath}\0${mode}\0${options.includeAppMcp === false ? 'without-app-mcp' : 'with-app-mcp'}\0${toolApprovalMode}\0${scopeKey}`
     const cached = this.cache.get(cacheKey)
     const cacheEnabled = mode === 'full' && !options.bypassCache
     if (cacheEnabled && cached && cached.expiresAt > Date.now()) {
@@ -982,19 +1023,17 @@ export class OpenCodeInventoryService {
       return missingSnapshot
     }
 
-    const leaveProfileStep = options.progress?.enterStep('prepare managed OpenCode profile')
     const profile = await raceOpenCodeAbortSignal(
       openCodeProfileManager.prepareProfile(resolvedProjectPath, {
         abortSignal: options.abortSignal,
+        progress: options.progress,
         includeAppMcp: options.includeAppMcp !== false,
         includeManagedSubscriptionPlugins: mode !== 'summary',
         toolApprovalMode,
+        profileScope: options.profileScope,
       }),
       options.abortSignal,
     )
-      .finally(() => {
-        leaveProfileStep?.()
-      })
     return withOpenCodeInventoryCommandLock(profile, () =>
       this.probePreparedProfile({
         mode,
@@ -1055,7 +1094,7 @@ export class OpenCodeInventoryService {
               abortSignal: options.abortSignal,
               progress: options.progress,
               ...(options.refreshModels && args[0] === 'models'
-                ? { timeoutMs: OPEN_CODE_MODEL_REFRESH_TIMEOUT_MS }
+                ? { timeoutMs: OPEN_CODE_MODEL_LIST_TIMEOUT_MS }
                 : {}),
             },
           ),
@@ -1066,18 +1105,18 @@ export class OpenCodeInventoryService {
     const version = versionResult.code === 0 ? versionResult.stdout.trim() || null : null
     const providerParse = parseOpenCodeProvidersOutput(providersResult.stdout)
     const globalAuthProviderIds = new Set(
-      (profile.globalAuthPath
-        ? await readOpenCodeAuthProviderSummaries(profile.globalAuthPath, ['managed']).catch(
+      mode === 'profile' || !profile.globalAuthPath
+        ? []
+        : (await readOpenCodeAuthProviderSummaries(profile.globalAuthPath, ['managed']).catch(
             () => [],
-          )
-        : []
-      ).map(provider => provider.id),
+          )).map(provider => provider.id),
     )
     const sourceAuthProviderIds = new Set(
-      (profile.sourceAuthPath
-        ? await readOpenCodeAuthProviderSummaries(profile.sourceAuthPath, ['local']).catch(() => [])
-        : []
-      ).map(provider => provider.id),
+      mode === 'profile' || !profile.sourceAuthPath
+        ? []
+        : (await readOpenCodeAuthProviderSummaries(profile.sourceAuthPath, ['local']).catch(
+            () => [],
+          )).map(provider => provider.id),
     )
     const credentialScopesForProvider = (providerId: string): Array<'managed' | 'local'> => {
       const scopes: Array<'managed' | 'local'> = []
@@ -1085,30 +1124,27 @@ export class OpenCodeInventoryService {
       if (sourceAuthProviderIds.has(providerId)) scopes.push('local')
       return scopes.length > 0 ? scopes : ['managed']
     }
-    const managedAuthProviders = (
-      await readOpenCodeAuthProviderSummaries(profile.managedAuthPath, ['managed']).catch(() => [])
-    ).map(provider => ({
-      ...provider,
-      credentialScopes: credentialScopesForProvider(provider.id),
-    }))
-    const cliConnectedProviders = providerParse.connectedProviders.map(provider => {
-      if (provider.source !== 'credentials') {
-        return provider
-      }
-      return {
-        ...provider,
-        credentialScopes: credentialScopesForProvider(provider.id),
-      }
-    })
-    const discoveredConnectedProviders = mergeConnectedProviders([
-      ...cliConnectedProviders,
-      ...managedAuthProviders,
-    ])
+    const discovered = mode === 'profile'
+      ? deriveOpenCodeProfileConnectedProviders({ profileScope: options.profileScope, profile })
+      : {
+          providers: mergeConnectedProviders([
+            ...providerParse.connectedProviders.map(provider => provider.source === 'credentials'
+              ? { ...provider, credentialScopes: credentialScopesForProvider(provider.id) }
+              : provider),
+            ...(await readOpenCodeAuthProviderSummaries(profile.managedAuthPath, ['managed'])
+              .catch(() => []))
+              .map(provider => ({
+                ...provider,
+                credentialScopes: credentialScopesForProvider(provider.id),
+              })),
+          ]),
+          profileScopeError: false,
+        }
     const {
       connectedProviders,
       unsupportedSuperGrokOAuth,
     } = filterOpenCodeConnectedProvidersForRuntime({
-      providers: discoveredConnectedProviders,
+      providers: discovered.providers,
       version,
     })
     const verboseModels =
@@ -1152,6 +1188,9 @@ export class OpenCodeInventoryService {
     const diagnostics: string[] = []
     if (profile.authState === 'stale') {
       diagnostics.push('Managed OpenCode auth differs from the source auth store')
+    }
+    if (discovered.profileScopeError) {
+      diagnostics.push('OpenCode profile scope auth evidence is invalid')
     }
     if (unsupportedSuperGrokOAuth) {
       diagnostics.push(

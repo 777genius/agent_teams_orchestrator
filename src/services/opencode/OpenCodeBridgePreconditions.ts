@@ -26,10 +26,23 @@ export type OpenCodeBridgeCommandEvidence = {
   }
 }
 
+export function requireOpenCodeExpectedBehaviorFingerprint(
+  preconditions: OpenCodeBridgeCommandPreconditions | null,
+): string {
+  const value = preconditions?.expectedBehaviorFingerprint
+  if (typeof value !== 'string' || !/^[a-f0-9]{64}$/.test(value)) {
+    throw new Error(
+      'OpenCode strict launch expectedBehaviorFingerprint must be lowercase SHA-256',
+    )
+  }
+  return value
+}
+
 type ValidationInput = {
   body: Record<string, unknown>
   runtime: OpenCodeBridgePreconditionRuntime
   allowCapabilitySnapshotRecovery?: boolean
+  requireActiveRunAuthority?: boolean
 }
 
 export function validateOpenCodeBridgeStateChangingPreconditions(
@@ -49,7 +62,7 @@ export function validateOpenCodeBridgeStateChangingPreconditions(
 
   if (
     expectedRunId &&
-    input.runtime.activeRunId &&
+    (input.requireActiveRunAuthority || input.runtime.activeRunId) &&
     input.runtime.activeRunId !== expectedRunId
   ) {
     throw new Error('OpenCode bridge active run precondition is stale')
@@ -83,24 +96,25 @@ export function validateOpenCodeBridgeStateChangingPreconditions(
     }
   }
 
-  const bodyManifestHighWatermark = asOptionalNullableNumber(
+  const bodyManifestHighWatermark = parseOptionalOpenCodeManifestHighWatermark(
     input.body.manifestHighWatermark,
     'manifestHighWatermark',
   )
+  // The expected manifest high watermark counts committed batches in the app's
+  // own runtime store. The bridge keeps no such store, so it has nothing to
+  // compare the value against: it is opaque app-owned evidence that the command
+  // carries and the reply echoes unchanged for correlation. This is not
+  // independent runtime freshness evidence and does not prevent command effects.
+  // When no watermark is supplied the runtime value is echoed instead.
   const expectedManifestHighWatermark =
     preconditions?.expectedManifestHighWatermark ?? bodyManifestHighWatermark ?? null
-  if (
-    expectedManifestHighWatermark !== null &&
-    input.runtime.runtimeStoreManifestHighWatermark !== null &&
-    input.runtime.runtimeStoreManifestHighWatermark < expectedManifestHighWatermark
-  ) {
-    throw new Error('OpenCode bridge runtime manifest high watermark precondition is stale')
-  }
+  const echoedManifestHighWatermark =
+    expectedManifestHighWatermark ?? input.runtime.runtimeStoreManifestHighWatermark
 
   return {
     ...(preconditions ? { idempotencyKey: preconditions.idempotencyKey } : {}),
-    manifestHighWatermark: input.runtime.runtimeStoreManifestHighWatermark,
-    runtimeStoreManifestHighWatermark: input.runtime.runtimeStoreManifestHighWatermark,
+    manifestHighWatermark: echoedManifestHighWatermark,
+    runtimeStoreManifestHighWatermark: echoedManifestHighWatermark,
     ...(capabilitySnapshotRecovery ? { capabilitySnapshotRecovery } : {}),
   }
 }
@@ -124,7 +138,7 @@ export function parseOpenCodeBridgePreconditions(
       record.expectedCapabilitySnapshotId,
       'expectedCapabilitySnapshotId',
     ),
-    expectedBehaviorFingerprint: requireNullableString(
+    expectedBehaviorFingerprint: requireNullableExactString(
       record.expectedBehaviorFingerprint,
       'expectedBehaviorFingerprint',
     ),
@@ -157,7 +171,7 @@ function asOptionalNullableString(value: unknown, field: string): string | null 
   return requireNullableString(value, field)
 }
 
-function asOptionalNullableNumber(value: unknown, field: string): number | null | undefined {
+export function parseOptionalOpenCodeManifestHighWatermark(value: unknown, field: string): number | null | undefined {
   if (value === undefined) {
     return undefined
   }
@@ -178,12 +192,25 @@ function requireNullableString(value: unknown, field: string): string | null {
   return requireString(value, field)
 }
 
+function requireNullableExactString(value: unknown, field: string): string | null {
+  if (value === null) return null
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new Error(`OpenCode bridge precondition ${field} must be a non-empty string`)
+  }
+  return value
+}
+
 function requireNullableNumber(value: unknown, field: string): number | null {
   if (value === null) {
     return null
   }
-  if (!Number.isInteger(value) || value < 0) {
-    throw new Error(`OpenCode bridge precondition ${field} must be a non-negative integer or null`)
+  // A supplied watermark is echoed back into durable Stop data, whose own
+  // validator requires a safe integer, so anything larger would be accepted here
+  // and then rejected by the store after the stop effects had already run.
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+    throw new Error(
+      `OpenCode bridge precondition ${field} must be a non-negative safe integer or null`,
+    )
   }
   return value
 }

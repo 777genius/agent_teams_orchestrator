@@ -1,4 +1,5 @@
-import { describe, expect, test } from 'bun:test'
+import { createServer } from 'node:http'
+import { describe, expect, spyOn, test } from 'bun:test'
 
 import { canonicalHostedApprovalDigest, OpenCodeClientFactory } from './OpenCodeClientFactory.js'
 
@@ -19,6 +20,71 @@ const hostedClient = (factory: OpenCodeClientFactory) =>
   factory.create('http://127.0.0.1:4096', {}, hostedAuth)
 
 describe('OpenCodeClientFactory permissions API', () => {
+  for (const cancellation of ['request', 'caller']) {
+  test(`keeps ${cancellation} cancellation active while reading a stalled HTTP response body`, async () => {
+    const sockets = new Set<import('node:net').Socket>()
+    const server = createServer((_request, response) => {
+      response.writeHead(200, { 'content-type': 'application/json' })
+      response.write('{')
+    })
+    server.on('connection', socket => {
+      sockets.add(socket)
+      socket.on('close', () => sockets.delete(socket))
+    })
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+    const address = server.address()
+    if (!address || typeof address === 'string') throw new Error('missing test server port')
+    let watchdog: ReturnType<typeof setTimeout> | undefined
+    const caller = new AbortController()
+    const callerTimer = cancellation === 'caller'
+      ? setTimeout(() => caller.abort(new Error('settings deadline expired')), 30)
+      : undefined
+    try {
+      const result = await Promise.race([
+        new OpenCodeClientFactory().create(`http://127.0.0.1:${address.port}`, {
+          remainingMs: () => cancellation === 'request' ? 30 : 5_000,
+          signal: caller.signal,
+        }).getProviders().then(() => 'unexpected success', error => String(error)),
+        new Promise<string>(resolve => { watchdog = setTimeout(() => resolve('watchdog expired'), 300) }),
+      ])
+      expect(result).toContain(cancellation === 'request'
+        ? 'OpenCode request timed out after 30ms for /provider'
+        : 'settings deadline expired')
+    } finally {
+      if (watchdog) clearTimeout(watchdog)
+      if (callerTimer) clearTimeout(callerTimer)
+      for (const socket of sockets) socket.destroy()
+      await new Promise<void>(resolve => server.close(() => resolve()))
+    }
+  })
+
+  }
+
+  test('only explicit instance initialization receives the startup transport budget', async () => {
+    const requests: string[] = []
+    const factory = new OpenCodeClientFactory({
+      fetchImpl: async input => {
+        requests.push(String(input))
+        return new Response('{}')
+      },
+    })
+    const timers = spyOn(globalThis, 'setTimeout')
+    try {
+      const client = factory.create('http://127.0.0.1:4096')
+      await client.getConfigProviders({ initializeInstance: true })
+      await client.getProviders()
+      await client.getConfigProviders()
+      await factory.create('http://127.0.0.1:4096', { remainingMs: () => 5_000 })
+        .getConfigProviders({ initializeInstance: true })
+      expect(timers.mock.calls.map(call => call[1])).toEqual([30_000, 15_000, 15_000, 5_000])
+      expect(requests).toEqual([
+        'http://127.0.0.1:4096/config/providers',
+        'http://127.0.0.1:4096/provider',
+        'http://127.0.0.1:4096/config/providers',
+        'http://127.0.0.1:4096/config/providers',
+      ])
+    } finally { timers.mockRestore() }
+  })
   test('delegates generic provider OAuth authorization and callback to OpenCode', async () => {
     const requests: Array<{
       url: string
@@ -443,6 +509,42 @@ describe('OpenCodeClientFactory permissions API', () => {
 })
 
 describe('OpenCodeClientFactory request context', () => {
+  for (const cancellation of ['request', 'caller']) {
+    for (const body of ['', '{}']) {
+      test(`rejects ${cancellation} cancellation when body consumption resolves ${JSON.stringify(body)} after abort`, async () => {
+        const caller = new AbortController()
+        const callerReason = new Error('settings deadline expired during body consumption')
+        let bodyReadStarted = false
+        const factory = new OpenCodeClientFactory({
+          fetchImpl: async (_input, init) => {
+            const signal = init?.signal as AbortSignal
+            const response = new Response(body)
+            response.text = async () => {
+              bodyReadStarted = true
+              return await new Promise<string>(resolve => {
+                signal.addEventListener('abort', () => resolve(body), { once: true })
+                if (cancellation === 'caller') caller.abort(callerReason)
+              })
+            }
+            return response
+          },
+        })
+
+        const request = factory.create('http://127.0.0.1:4096', {
+          signal: caller.signal,
+          remainingMs: () => cancellation === 'request' ? 10 : 5_000,
+        }).getProviders()
+
+        if (cancellation === 'caller') {
+          await expect(request).rejects.toBe(callerReason)
+        } else {
+          await expect(request).rejects.toThrow('OpenCode request timed out after 10ms for /provider')
+        }
+        expect(bodyReadStarted).toBe(true)
+      })
+    }
+  }
+
   test('limits an endpoint request to the remaining runtime budget', async () => {
     const requestSignals: AbortSignal[] = []
     const factory = new OpenCodeClientFactory({

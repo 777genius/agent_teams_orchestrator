@@ -11,6 +11,7 @@ import {
   mergeOpenCodeAuthStores,
   mergeOpenCodeAuthStoresWithFreshestOAuth,
   mergeOpenCodeManagedAuthSources,
+  materializeOpenCodeSelectedAuthCredential,
   readOpenCodeAuthProviderSummaries,
   readOpenCodeAuthCredential,
   reconcileOpenCodeManagedAuthStore,
@@ -32,6 +33,49 @@ describe('OpenCodeAuthStore', () => {
   afterEach(async () => {
     await rm(tempDir, { recursive: true, force: true })
   })
+
+  for (const operationName of ['upsert', 'remove', 'materialize'] as const) {
+    test(`cancels a queued ${operationName} without writing after the lock is released`, async () => {
+      const authPath = path.join(tempDir, 'cancelled-auth.json')
+      const original = { type: 'api', key: 'original-test-key' }
+      await upsertOpenCodeAuthCredential({ authPath, providerId: 'test', credential: original })
+      let release!: () => void
+      let acquired!: () => void
+      const ready = new Promise<void>(resolve => { acquired = resolve })
+      const holder = withOpenCodeOAuthRefreshLock({
+        authPath,
+        providerId: 'test',
+        operation: () => new Promise<void>(resolve => {
+          release = resolve
+          acquired()
+        }),
+      })
+      await ready
+      const controller = new AbortController()
+      const input = { authPath, providerId: 'test', abortSignal: controller.signal }
+      const pending = operationName === 'remove'
+        ? removeOpenCodeAuthCredential(input)
+        : operationName === 'materialize'
+          ? materializeOpenCodeSelectedAuthCredential({ ...input, credential: null })
+          : upsertOpenCodeAuthCredential({ ...input, credential: { type: 'api', key: 'late-write' } })
+      const outcome = pending.then(() => 'written', error => error)
+      try {
+        await new Promise(resolve => setTimeout(resolve, 30))
+        const reason = new Error('test profile preparation cancelled')
+        controller.abort(reason)
+        // The waiter must settle before the holder releases its lease.
+        expect(await Promise.race([
+          outcome,
+          new Promise(resolve => setTimeout(() => resolve('still waiting'), 250)),
+        ])).toBe(reason)
+      } finally {
+        release()
+        await holder
+        await outcome
+      }
+      expect(await readOpenCodeAuthCredential({ authPath, providerId: 'test' })).toEqual(original)
+    })
+  }
 
   test('merges local source credentials without dropping app-managed providers', async () => {
     const sourceAuthPath = path.join(tempDir, 'source-auth.json')

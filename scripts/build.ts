@@ -23,6 +23,7 @@ import { createHash } from 'crypto'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'path'
 import { fileURLToPath } from 'url'
 import { dlopen, FFIType } from 'bun:ffi'
+import { stageCursorManagedAssets } from './cursor-plugin/stage.js'
 
 const repositoryRoot = realpathSync(resolve(dirname(fileURLToPath(import.meta.url)), '..'))
 process.chdir(repositoryRoot)
@@ -1171,7 +1172,9 @@ const bundleOutdir = dev ? './dist/local-cli-dev' : './dist/local-cli'
 const bundleEntrypoint = `${bundleOutdir}/cli.js`
 const hostedActualOwnerOutfile = `./${hostedActualOwnerWrapperRelativePath}`
 const buildTime = dev ? new Date().toISOString() : '1970-01-01T00:00:00.000Z'
-const version = dev ? getDevVersion(pkg.version) : pkg.version
+// Compatibility workaround for Anthropic Fable 5.1; this is not an upstream upgrade.
+// https://github.com/777genius/agent-teams-ai/issues/569
+const version = dev ? getDevVersion('2.1.251') : '2.1.251'
 
 const outfileDir = dirname(outfile)
 if (outfileDir !== '.') {
@@ -1229,6 +1232,9 @@ const defines = {
   'process.env.CLAUDE_CODE_VERIFY_PLAN': JSON.stringify('false'),
   'process.env.CCR_FORCE_BUNDLE': JSON.stringify('true'),
   'MACRO.VERSION': JSON.stringify(version),
+  // The runtime's own package version. MACRO.VERSION above is the Claude Code
+  // compatibility version and says nothing about which runtime build is running.
+  'MACRO.RUNTIME_VERSION': JSON.stringify(pkg.version),
   'MACRO.BUILD_TIME': JSON.stringify(buildTime),
   'MACRO.PACKAGE_URL': JSON.stringify(pkg.name),
   'MACRO.NATIVE_PACKAGE_URL': 'undefined',
@@ -1972,3 +1978,10 @@ if (compile) {
     unlinkIfPresent(hostedActualOwnerWrapperStaging)
   }
 }
+
+// Ship the reviewed Cursor plugin next to the built runtime. Without this the
+// managed path only works for someone who staged assets by hand, which is not a
+// delivery mechanism.
+const cursorManagedRoot = `${compile ? './dist' : bundleOutdir}/cursor-managed`
+await stageCursorManagedAssets(cursorManagedRoot)
+console.log(`Staged Cursor managed assets -> ${cursorManagedRoot}`)

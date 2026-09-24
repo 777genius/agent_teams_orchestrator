@@ -3,6 +3,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   decideIncomingPromptAdmission,
   getBlockingIncomingPromptQueueModes,
+  startQueryForIncomingKind,
 } from './incomingPromptAdmission.js'
 
 describe('incoming prompt admission', () => {
@@ -75,6 +76,32 @@ describe('incoming prompt admission', () => {
     }
   })
 
+  test('accepts a matching work-sync continuation while dispatching', () => {
+    expect(
+      decideIncomingPromptAdmission({
+        submissionKind: 'work_sync_continuation',
+        bootstrapAdmissionPending: false,
+        queryGuardStatus: 'dispatching',
+        blockingQueueModes: [],
+      }),
+    ).toEqual({ accepted: true })
+  })
+
+  test('rejects a work-sync continuation while idle so it cannot use tryStart', () => {
+    expect(
+      decideIncomingPromptAdmission({
+        submissionKind: 'work_sync_continuation',
+        bootstrapAdmissionPending: false,
+        queryGuardStatus: 'idle',
+        blockingQueueModes: [],
+      }),
+    ).toEqual({
+      accepted: false,
+      rejectionReason: 'query_active',
+      retryable: true,
+    })
+  })
+
   test('accepts normal runtime prompts when idle and no blocking queue modes exist', () => {
     expect(
       decideIncomingPromptAdmission({
@@ -127,5 +154,29 @@ describe('incoming prompt admission', () => {
       rejectionReason: 'bootstrap_pending',
       retryable: true,
     })
+  })
+})
+
+describe('startQueryForIncomingKind', () => {
+  test('starts a reserved continuation when the ticket is still held', () => {
+    expect(
+      startQueryForIncomingKind({
+        incomingKind: 'work_sync_continuation',
+        continuationTicket: { intentId: 'intent-c1' },
+        startReservedContinuation: () => ({ ok: true, generation: 4 }),
+        tryStart: () => 99,
+      }),
+    ).toBe(4)
+  })
+
+  test('falls back to ordinary tryStart when a leftover continuation kind has no ticket', () => {
+    expect(
+      startQueryForIncomingKind({
+        incomingKind: 'work_sync_continuation',
+        continuationTicket: null,
+        startReservedContinuation: () => ({ ok: false }),
+        tryStart: () => 7,
+      }),
+    ).toBe(7)
   })
 })

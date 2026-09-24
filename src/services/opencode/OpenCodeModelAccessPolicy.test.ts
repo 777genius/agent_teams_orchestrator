@@ -3,6 +3,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   buildOpenCodeModelRouteMetadata,
   evaluateOpenCodeModelAccess,
+  requiresExactOpenCodeLaunchOutput,
 } from './OpenCodeModelAccessPolicy.js'
 
 import type { OpenCodeModelMetadata } from './types.js'
@@ -33,6 +34,55 @@ function catalog(overrides: Partial<Catalog> = {}): Catalog {
 }
 
 describe('OpenCodeModelAccessPolicy', () => {
+  test('keeps exact launch output for cloud tags and credentialed models', () => {
+    expect(requiresExactOpenCodeLaunchOutput('ollama/kimi-k2.6:cloud')).toBe(true)
+    expect(requiresExactOpenCodeLaunchOutput('deepinfra/chosen')).toBe(true)
+    expect(requiresExactOpenCodeLaunchOutput('cursor-acp/auto')).toBe(true)
+    expect(requiresExactOpenCodeLaunchOutput('vllm/meta-llama/Llama-3-70b')).toBe(true)
+  })
+
+  test('does not treat cloudflare-style local ids as cloud routes', () => {
+    expect(requiresExactOpenCodeLaunchOutput('lmstudio/cloudflare-local')).toBe(false)
+    expect(requiresExactOpenCodeLaunchOutput('ollama/qwen-cloudsonnet')).toBe(false)
+  })
+
+  test('accepts non-exact launch output for local Ollama models', () => {
+    expect(requiresExactOpenCodeLaunchOutput('ollama/qwen2.5-coder:1.5b')).toBe(false)
+    expect(requiresExactOpenCodeLaunchOutput('ollama/qwen2.5-coder:0.5b')).toBe(false)
+    expect(requiresExactOpenCodeLaunchOutput('lmstudio/local-model')).toBe(false)
+  })
+
+  test('requires exact launch output for remote Ollama and accepts loopback vLLM', () => {
+    const remoteOllama = catalog({
+      configProviders: {
+        providers: [
+          {
+            id: 'ollama',
+            npm: '@ai-sdk/openai-compatible',
+            options: { baseURL: 'https://ollama.example.internal/v1' },
+            models: { 'qwen2.5-coder:1.5b': {} },
+          },
+        ],
+        default: {},
+      },
+    })
+    const loopbackVllm = catalog({
+      configProviders: {
+        providers: [
+          {
+            id: 'vllm',
+            npm: '@ai-sdk/openai-compatible',
+            options: { baseURL: 'http://127.0.0.1:8000/v1' },
+            models: { 'local-llama': {} },
+          },
+        ],
+        default: {},
+      },
+    })
+    expect(requiresExactOpenCodeLaunchOutput('ollama/qwen2.5-coder:1.5b', remoteOllama)).toBe(true)
+    expect(requiresExactOpenCodeLaunchOutput('vllm/local-llama', loopbackVllm)).toBe(false)
+  })
+
   test('allows connected providers without an execution proof', () => {
     const access = evaluateOpenCodeModelAccess({
       selectedModel: 'openrouter/moonshotai/kimi-k2',
@@ -53,6 +103,20 @@ describe('OpenCodeModelAccessPolicy', () => {
       catalog: catalog({
         models: ['opencode/big-pickle'],
         modelMetadata: [modelMetadata('opencode/big-pickle')],
+      }),
+    })
+
+    expect(access.kind).toBe('builtin_free')
+    expect(access.launchAllowed).toBe(true)
+    expect(access.requiresExecutionProof).toBe(false)
+  })
+
+  test('continues allowing every catalog-confirmed built-in free OpenCode model', () => {
+    const access = evaluateOpenCodeModelAccess({
+      selectedModel: 'opencode/catalog-free-model',
+      catalog: catalog({
+        models: ['opencode/catalog-free-model'],
+        modelMetadata: [modelMetadata('opencode/catalog-free-model')],
       }),
     })
 
@@ -231,6 +295,59 @@ describe('OpenCodeModelAccessPolicy', () => {
     expect(access.kind).toBe('not_authenticated')
     expect(access.launchAllowed).toBe(false)
     expect(access.requiresExecutionProof).toBe(false)
+  })
+
+  test.each([
+    'http://127.attacker.example/v1',
+    'http://127.0.0.1.attacker.example/v1',
+    'http://attacker.example@127.0.0.1/v1',
+    'http://2130706433/v1',
+    'http://192.168.1.10/v1',
+    'not a URL',
+  ])('does not treat nonliteral loopback confusion as authless: %s', baseURL => {
+    const access = evaluateOpenCodeModelAccess({
+      selectedModel: 'custom/exact-model',
+      catalog: catalog({
+        configProviders: {
+          providers: [{
+            id: 'custom',
+            npm: '@ai-sdk/openai-compatible',
+            options: { baseURL },
+            models: { 'exact-model': {} },
+          }],
+          default: {},
+        },
+      }),
+    })
+
+    expect(access.kind).toBe('not_authenticated')
+    expect(access.launchAllowed).toBe(false)
+    expect(access.requiresExecutionProof).toBe(false)
+  })
+
+  test.each([
+    'http://127.0.0.1:8080/v1',
+    'http://127.1.2.3:8080/v1',
+    'http://[::1]:8080/v1',
+  ])('requires proof for a literal loopback authority: %s', baseURL => {
+    const access = evaluateOpenCodeModelAccess({
+      selectedModel: 'custom/exact-model',
+      catalog: catalog({
+        configProviders: {
+          providers: [{
+            id: 'custom',
+            npm: '@ai-sdk/openai-compatible',
+            options: { baseURL },
+            models: { 'exact-model': {} },
+          }],
+          default: {},
+        },
+      }),
+    })
+
+    expect(access.kind).toBe('configured_authless')
+    expect(access.launchAllowed).toBe(false)
+    expect(access.requiresExecutionProof).toBe(true)
   })
 
   test('requires execution proof for known local provider models discovered only from inventory', () => {

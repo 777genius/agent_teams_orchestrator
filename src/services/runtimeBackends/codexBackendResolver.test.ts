@@ -195,7 +195,7 @@ describe('codexBackendResolver', () => {
     })
   })
 
-  test('resolves to codex-native when host forces chatgpt mode and login state is unknown (app-server may own session)', () => {
+  test('fails closed when host forces chatgpt mode and login state is unknown', () => {
     const result = resolveCodexRuntimeSelection({
       env: {},
       nativeBinaryDetected: true,
@@ -211,11 +211,12 @@ describe('codexBackendResolver', () => {
 
     expect(result).toMatchObject({
       selectedBackendId: 'codex-native',
-      resolvedBackendId: 'codex-native',
-      authenticated: true,
-      authMethod: 'oauth_token',
+      resolvedBackendId: null,
+      authenticated: false,
+      authMethod: null,
+      authCheckIndeterminate: true,
       canLoginFromUi: false,
-      statusMessage: 'Codex native runtime ready',
+      statusMessage: 'Codex native runtime unavailable',
     })
   })
 
@@ -289,6 +290,27 @@ describe('codexBackendResolver', () => {
       canLoginFromUi: false,
       statusMessage: 'Codex native runtime ready',
       detailMessage: 'Codex native runtime is ready through the local codex exec seam.',
+    })
+  })
+
+  test('does not report API fallback authenticated while ChatGPT login is unknown', () => {
+    const result = resolveCodexRuntimeSelection({
+      env: {},
+      nativeBinaryDetected: true,
+      oauthAuthenticated: true,
+      apiKeyConfigured: true,
+      nativeApiKeyConfigured: true,
+      chatgptLoginState: 'unknown',
+    })
+
+    expect(result).toMatchObject({
+      selectedBackendId: 'codex-native',
+      resolvedBackendId: null,
+      authCheckIndeterminate: true,
+      authenticated: false,
+      authMethod: null,
+      statusMessage: 'Codex native runtime degraded',
+      detailMessage: 'Codex native runtime is not ready.',
     })
   })
 

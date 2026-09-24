@@ -1,5 +1,6 @@
 declare const MACRO: {
   VERSION: string
+  RUNTIME_VERSION?: string
   BUILD_TIME: string
   PACKAGE_URL?: string
   NATIVE_PACKAGE_URL?: string

@@ -2,21 +2,36 @@ import { createHash, randomUUID } from 'node:crypto'
 import { type ChildProcess, type SpawnOptions } from 'node:child_process'
 import type { Dirent } from 'node:fs'
 import net from 'node:net'
-import { mkdir, readlink, readdir, readFile, realpath, rm, stat, unlink, writeFile } from 'node:fs/promises'
+import { mkdir, readdir, readFile, realpath, rm, stat, unlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
+import { isDeepStrictEqual } from 'node:util'
 
 import * as lockfile from '../../utils/lockfile.js'
 import { writeJsonFileAtomic } from '../../utils/atomicWrite.js'
 import { errorMessage } from '../../utils/errors.js'
 import { sleep } from '../../utils/sleep.js'
 import {
+  hasPendingStartupTaskkill,
+  pendingStartupTaskkill,
+  pendingStartupTaskkillPids,
+  killProcessTreeForStartup,
+  killProcessTree,
   killProcessTreeAndWait,
   readProcessCommandLine,
   readProcessStartTimeMs,
   signalExpectedProcessStable,
 } from '../../utils/processKill.js'
+import { OpenCodeStartupCleanupBudget } from './OpenCodeStartupCleanupBudget.js'
+import { reapCursorAgents, parseCursorAgentReapInput, type CursorAgentReapResult } from './OpenCodeCursorAgentAtomicReap.js'
+import type { CursorAgentNativePorts } from './OpenCodeCursorAgentTreeKill.js'
+import { readAttributionRecords } from './OpenCodeProcessAttributionStore.js'
 import { spawnPortableCli } from '../../utils/portableCli.js'
+import { OPEN_CODE_MANAGED_HOST_CONFIG_GENERATION, buildOpenCodeHostTransportIdentity, resolveOpenCodeBinaryHostIdentity } from './OpenCodeHostIdentity.js'
+export { resolveOpenCodeBinaryHostIdentity } from './OpenCodeHostIdentity.js'
 import { resolveOpenCodeBinaryPath } from './OpenCodeBinaryResolver.js'
+import { buildOpenCodeLaunchProviderContract } from './OpenCodeLaunchProviderContract.js'
+import { buildExpectedOpenCodeAgentPolicies, assertOpenCodeEffectiveAgentPolicies } from './OpenCodeEffectiveAgentPolicyContract.js'
+import { OPEN_CODE_APP_MCP_SERVER_NAME } from './OpenCodeMcpManager.js'
 import {
   prepareExecutingOpenCodeArtifactDigestToken,
   resolveOpenCodeArtifactDigest,
@@ -24,8 +39,21 @@ import {
   type OpenCodeArtifactDigest,
 } from './OpenCodeArtifactDigest.js'
 import { prewarmOpenCodeManagedSubscriptionPlugins } from './OpenCodeInventoryService.js'
-import { openCodeProfileManager } from './OpenCodeProfileManager.js'
+import {
+  assertOpenCodePreparedProfileScope,
+  buildManagedConfigFingerprint,
+  openCodeProfileManager,
+} from './OpenCodeProfileManager.js'
 import { resolveClaudeMultimodelPaths } from './OpenCodeManagedPaths.js'
+import {
+  buildProcessAttributionSpawnEnv,
+  mintProcessAttributionId,
+  pruneStaleAttributionRecords,
+  resolveProcessAttributionDirectory,
+  retireHostAttributionRecords,
+  writeHostAttributionRecord,
+  type OpenCodeHostAttributionOwner,
+} from './OpenCodeProcessAttributionStore.js'
 import {
   raceOpenCodeAbortSignal,
   throwOpenCodeAbortReason,
@@ -49,7 +77,6 @@ const OPEN_CODE_HOST_PROCESS_TERM_TIMEOUT_MS = 750
 const OPEN_CODE_HOST_PROCESS_KILL_TIMEOUT_MS = 2_500
 const OPEN_CODE_HOST_PROCESS_IDENTITY_CAPTURE_ATTEMPTS = 5
 const OPEN_CODE_HOST_PROCESS_IDENTITY_CAPTURE_RETRY_MS = 50
-const OPEN_CODE_MANAGED_HOST_CONFIG_GENERATION = 'provider-plugins-v1'
 const OPEN_CODE_STALE_TEMP_DYLIB_AGE_MS = 24 * 60 * 60 * 1000
 export const OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID = '__opencode_preflight__'
 const OPEN_CODE_PREFLIGHT_HOST_LEASE_LANE_ID = 'preflight'
@@ -60,23 +87,6 @@ const OPENTUI_TEMP_DYLIB_RE = /^\.b[0-9a-f]+-[0-9a-f]+\.dylib$/i
 
 export type OpenCodeHostLifetime = 'persistent' | 'process'
 
-export async function resolveOpenCodeBinaryHostIdentity(binaryPath: string): Promise<string> {
-  let resolvedPath = path.resolve(binaryPath)
-  try {
-    const target = await readlink(resolvedPath)
-    resolvedPath = path.resolve(path.dirname(resolvedPath), target)
-  } catch {
-    // The executable is not a symlink or cannot be resolved. Its absolute path
-    // remains a stable part of the identity.
-  }
-  const metadata = await stat(resolvedPath).catch(() => null)
-  const source = [
-    resolvedPath,
-    metadata?.size ?? 'unknown-size',
-    metadata?.mtimeMs ?? 'unknown-mtime',
-  ].join('\0')
-  return createHash('sha256').update(source).digest('hex').slice(0, 16)
-}
 
 const PERSISTENT_REGISTRY_LOCK_OPTIONS = {
   retries: {
@@ -93,6 +103,18 @@ const PERSISTENT_HOST_STARTUP_LOCK_OPTIONS = {
 const PERSISTENT_HOST_STARTUP_LOCK_RETRIES = 120
 const PERSISTENT_HOST_STARTUP_LOCK_MIN_RETRY_MS = 100
 const PERSISTENT_HOST_STARTUP_LOCK_MAX_RETRY_MS = 500
+
+export function shouldRetryPersistentHostStartupLock(
+  error: unknown,
+  attempt: number,
+  hasAbortSignal: boolean,
+): boolean {
+  const code = error && typeof error === 'object' && 'code' in error
+    ? (error as { code?: unknown }).code
+    : undefined
+  return code === 'ELOCKED'
+    && (hasAbortSignal || attempt < PERSISTENT_HOST_STARTUP_LOCK_RETRIES)
+}
 
 type ManagedHostEntry = {
   handle: OpenCodeHostHandle
@@ -117,14 +139,17 @@ type OpenCodeHostManagerDeps = {
   spawnHostProcess?: (profile: OpenCodePreparedProfile, port: number) => ChildProcess
   sleepMs?: (ms: number) => Promise<void>
   isProcessAlive?: (pid: number) => boolean
-  readProcessCommandLine?: (pid: number) => Promise<string | null>
-  readProcessStartTimeMs?: (pid: number) => Promise<number | null>
+  inspectProcessLiveness?: (pid: number) => Promise<'alive' | 'gone' | 'unknown'>
+  readProcessCommandLine?: (pid: number, timeoutMs?: number) => Promise<string | null>
+  readProcessStartTimeMs?: (pid: number, timeoutMs?: number) => Promise<number | null>
   killProcess?: (pid: number, signal: NodeJS.Signals) => void
   killProcessTreeAndWait?: typeof killProcessTreeAndWait
   now?: () => Date
   persistentRegistryPath?: string | null
   beforeTempOwnershipMarkerPublish?: () => Promise<void>
   resolveOpenCodeArtifactDigest?: (binaryPath: string) => OpenCodeArtifactDigest | null
+  processAttributionDirectory?: string | null
+  cursorAgentNativePorts?: Partial<CursorAgentNativePorts>
 }
 
 export type OpenCodeHostLeaseInput = {
@@ -147,6 +172,7 @@ type PersistentHostLeaseRecord = {
 }
 
 type PersistentHostRegistryRecord = {
+  cursorAgentReapContractVersion?: 1
   hostKey: string
   profileRootKey: string
   projectPath: string
@@ -156,6 +182,7 @@ type PersistentHostRegistryRecord = {
   port: number
   pid: number
   processStartedAtMs?: number | null
+  attributionId?: string | null
   version: string | null
   resolvedConfigFingerprint: string | null
   updatedAt: string
@@ -164,6 +191,7 @@ type PersistentHostRegistryRecord = {
 
 type PersistentHostRegistryShape = {
   schemaVersion: 1
+  processIdentityFormat?: 'platform-native-v2'
   hosts: Record<string, PersistentHostRegistryRecord>
 }
 
@@ -173,6 +201,7 @@ type PersistentHostProcessIdentity = {
 }
 
 export type OpenCodePersistentHostReconcileOptions = {
+  startupBudget?: OpenCodeStartupCleanupBudget
   mode?: 'stale' | 'force'
   reason?: 'startup' | 'shutdown' | 'manual' | string
   projectPath?: string | null
@@ -182,6 +211,11 @@ export type OpenCodePersistentHostReconcileOptions = {
 }
 
 export type OpenCodePersistentHostReconcileResult = {
+  startupCleanup?: {
+    completion: 'drained' | 'unknown'
+    coverage: 'complete' | 'partial'
+    survivingPids: number[]
+  }
   cleaned: number
   remaining: number
   hosts: Array<{
@@ -193,6 +227,7 @@ export type OpenCodePersistentHostReconcileResult = {
       | 'disposed'
       | 'removed_dead'
       | 'kept_active'
+      | 'kept_pending_oauth'
       | 'kept_leased'
       | 'kept_recent'
       | 'kept_filtered'
@@ -234,9 +269,11 @@ function normalizeResolvedFingerprintValue(
   if (Array.isArray(value)) {
     const normalized = value.map(item => normalizeResolvedFingerprintValue(item, scope))
     if (scope === 'configProviders' || scope === 'agents') {
-      return normalized.sort((left, right) =>
-        JSON.stringify(left).localeCompare(JSON.stringify(right)),
-      )
+      return normalized.sort((left, right) => {
+        const leftJson = JSON.stringify(left)
+        const rightJson = JSON.stringify(right)
+        return leftJson < rightJson ? -1 : leftJson > rightJson ? 1 : 0
+      })
     }
     return normalized
   }
@@ -257,6 +294,55 @@ function normalizeResolvedFingerprintValue(
       acc[key] = normalizeResolvedFingerprintValue(record[key], scope)
       return acc
     }, {})
+}
+
+function selectedConfigForEffect(config: Record<string, unknown>): Record<string, unknown> {
+  const agents = config.agent
+  const normalizedAgents = agents && typeof agents === 'object' && !Array.isArray(agents)
+    ? Object.fromEntries(Object.entries(agents).map(([name, value]) => {
+        if (!value || typeof value !== 'object' || Array.isArray(value)) return [name, value]
+        const agent = value as Record<string, unknown>
+        return [name, agent.options === undefined ? { ...agent, options: {} } : agent]
+      }))
+    : agents ?? null
+  const mcp = config.mcp as Record<string, unknown> | undefined
+  return {
+    model: config.model ?? null,
+    small_model: config.small_model ?? null,
+    plugin: config.plugin ?? null,
+    agent: normalizedAgents,
+    default_agent: config.default_agent ?? null,
+    permission: config.permission ?? null,
+    command: config.command === undefined ? {} : config.command,
+    share: config.share ?? null,
+    snapshot: config.snapshot ?? null,
+    autoupdate: config.autoupdate ?? null,
+    mcp: { [OPEN_CODE_APP_MCP_SERVER_NAME]: mcp?.[OPEN_CODE_APP_MCP_SERVER_NAME] ?? null },
+  }
+}
+
+export function matchesSelectedEffectConfig(
+  profile: OpenCodePreparedProfile,
+  liveConfig: unknown,
+  liveAgents: unknown,
+): boolean {
+  const providerId = profile.profileScope?.providerId
+  if (profile.profileScope?.purpose !== 'launch_runtime' || !providerId ||
+    !liveConfig || typeof liveConfig !== 'object' || Array.isArray(liveConfig)) return false
+  try {
+    if (buildManagedConfigFingerprint(profile.managedConfig, profile.env) !== profile.managedConfigFingerprint) return false
+    const expected = JSON.parse(JSON.stringify(profile.managedConfig)
+      .replace(/\{env:([^}]+)\}/g, (_match, name: string) => profile.env[name] || '')) as Record<string, unknown>
+    const live = liveConfig as Record<string, unknown>
+    if (!isDeepStrictEqual(
+      buildOpenCodeLaunchProviderContract(expected, providerId),
+      buildOpenCodeLaunchProviderContract(live, providerId),
+    ) || !isDeepStrictEqual(selectedConfigForEffect(expected), selectedConfigForEffect(live))) return false
+    assertOpenCodeEffectiveAgentPolicies(
+      buildExpectedOpenCodeAgentPolicies(expected, profile.env.XDG_DATA_HOME), liveAgents,
+    )
+    return true
+  } catch { return false }
 }
 
 async function allocateLoopbackPort(): Promise<number> {
@@ -424,19 +510,73 @@ export function shouldUnrefOpenCodeHostProcess(
 export function buildOpenCodeHostSpawnOptions(
   profile: OpenCodePreparedProfile,
   platform: NodeJS.Platform = process.platform,
-  options: { lifetime?: OpenCodeHostLifetime } = {},
+  options: {
+    lifetime?: OpenCodeHostLifetime
+    attributionId?: string | null
+    attributionDirectory?: string | null
+  } = {},
 ): SpawnOptions {
   const lifetime = options.lifetime ?? 'persistent'
+  // Attribution belongs to this spawn, not to the profile: the host key is
+  // derived from profile.env, so a per-spawn value there would fork the key.
+  const attributionEnv = options.attributionId
+    ? buildProcessAttributionSpawnEnv({
+      directory: options.attributionDirectory ?? null,
+      attributionId: options.attributionId,
+    })
+    : {}
   return {
-    cwd: profile.projectPath,
-    env: profile.env,
+    cwd: profile.workingDirectoryPath ?? profile.projectPath,
+    env: Object.keys(attributionEnv).length > 0
+      ? { ...profile.env, ...attributionEnv }
+      : profile.env,
     detached: lifetime === 'persistent' || platform !== 'win32',
     stdio: 'ignore',
     windowsHide: true,
   }
 }
 
-function normalizePersistentHostLeases(value: unknown): Record<string, PersistentHostLeaseRecord> {
+/**
+ * A caller-supplied host key skips key derivation entirely, so every identity the
+ * derived key encodes has to be re-checked here. Readiness is the one that moves
+ * on its own: the account can sign out while the host keeps running.
+ */
+export function assertOpenCodeHostReuseIdentity(
+  explicitHostKey: string | undefined,
+  profile: OpenCodePreparedProfile,
+): void {
+  if (!explicitHostKey) return
+  if (profile.scopeToken && !explicitHostKey.includes(`::scope:${profile.scopeToken}::`)) {
+    throw new Error('OpenCode host reuse rejected because the profile scope token changed')
+  }
+  const readiness = profile.env.AGENT_TEAMS_CURSOR_READINESS?.trim() || 'absent'
+  const retainedReadiness = /::readiness:([^:]*)$/.exec(explicitHostKey)?.[1] || 'absent'
+  if (readiness !== retainedReadiness) {
+    throw new Error('OpenCode host reuse rejected because Cursor readiness changed')
+  }
+}
+
+export function buildOpenCodeHostProfileIdentity(
+  profile: OpenCodePreparedProfile,
+  binaryHostIdentity: string,
+): string {
+  const authIdentity = profile.profileScope?.selectedAuthIdentity
+    ?? profile.managedAuthFingerprint
+    ?? 'absent'
+  // Capability fingerprints intentionally omit MCP URLs/environment. Host reuse
+  // must still bind to the current transport, including the app-instance marker.
+  const transportIdentity = buildOpenCodeHostTransportIdentity(profile.managedConfig)
+  // Cursor readiness is a live identity: the signed-in account, the real binary,
+  // the staged assets and the retained proxy port. A running host outlives all of
+  // them, so it has to be part of reuse or a signed-out account keeps serving.
+  const readiness = profile.env.AGENT_TEAMS_CURSOR_READINESS ?? 'absent'
+  return `${profile.projectPath}::${profile.profileRootKey}::${profile.projectBehaviorFingerprint}::${profile.managedConfigFingerprint}::auth:${authIdentity}::scope:${profile.scopeToken ?? 'unscoped'}::${OPEN_CODE_MANAGED_HOST_CONFIG_GENERATION}::binary:${binaryHostIdentity}::mcp:${transportIdentity}::readiness:${readiness}`
+}
+
+function normalizePersistentHostLeases(
+  value: unknown,
+  migrateLegacyKeys = false,
+): Record<string, PersistentHostLeaseRecord> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     return {}
   }
@@ -456,16 +596,27 @@ function normalizePersistentHostLeases(value: unknown): Record<string, Persisten
     ) {
       continue
     }
-    const leaseKey =
+    const storedKey =
       typeof lease.leaseKey === 'string' && lease.leaseKey.trim() ? lease.leaseKey : key
+    const runId = typeof lease.runId === 'string' && lease.runId.trim() ? lease.runId : null
+    const sessionId = typeof lease.sessionId === 'string' && lease.sessionId.trim() ? lease.sessionId : null
+    const legacyKey = `${lease.teamId}::${lease.laneId}::${lease.memberName}`
+    // Schema 1 originally keyed leases only by member. Migrate solely an exact
+    // legacy key with a persisted run/session identity; keep ambiguous records
+    // and operation pins as vetoes instead of granting another owner authority.
+    const qualifiedKey = migrateLegacyKeys && storedKey === key && key === legacyKey && (runId || sessionId)
+      ? buildLeaseKey({ teamId: lease.teamId, laneId: lease.laneId,
+          memberName: lease.memberName, runId, sessionId })
+      : storedKey
+    const leaseKey = Object.prototype.hasOwnProperty.call(value, qualifiedKey) && qualifiedKey !== key
+      ? key : qualifiedKey
     leases[leaseKey] = {
       leaseKey,
       teamId: lease.teamId,
       laneId: lease.laneId,
       memberName: lease.memberName,
-      runId: typeof lease.runId === 'string' && lease.runId.trim() ? lease.runId : null,
-      sessionId:
-        typeof lease.sessionId === 'string' && lease.sessionId.trim() ? lease.sessionId : null,
+      runId,
+      sessionId,
       createdAt: lease.createdAt,
       updatedAt: lease.updatedAt,
     }
@@ -474,6 +625,12 @@ function normalizePersistentHostLeases(value: unknown): Record<string, Persisten
 }
 
 export class OpenCodeHostManager {
+  private readonly startupLockReleases = new Set<Promise<void>>()
+
+  async drainStartupCleanupLockReleases(): Promise<void> {
+    await Promise.all(this.startupLockReleases)
+  }
+
   private readonly hosts = new Map<string, ManagedHostEntry>()
   private readonly pendingHosts = new Map<string, Promise<OpenCodeHostHandle>>()
   private readonly pendingRefCounts = new Map<string, number>()
@@ -544,6 +701,82 @@ export class OpenCodeHostManager {
       : this.deps.persistentRegistryPath
   }
 
+  /**
+   * The runtime advertises resolveProcessAttributionDirectory() to the app as
+   * the place it writes its records, so the process entry point resolves that
+   * once and injects it rather than repeating the resolution here. A caller
+   * that pins its own registry and no directory keeps its records beside that
+   * registry, where only that caller prunes them.
+   */
+  private get processAttributionDirectory(): string | null {
+    if (this.deps.processAttributionDirectory !== undefined) {
+      return this.deps.processAttributionDirectory
+    }
+    const registryPath = this.persistentRegistryPath
+    if (!registryPath) {
+      return null
+    }
+    return path.join(path.dirname(registryPath), 'process-attribution')
+  }
+
+  private buildHostAttributionOwners(
+    leases: Record<string, PersistentHostLeaseRecord>,
+  ): OpenCodeHostAttributionOwner[] {
+    return Object.values(leases).map(lease => ({
+      teamId: lease.teamId,
+      laneId: lease.laneId,
+      memberName: lease.memberName,
+      runId: lease.runId,
+      sessionId: lease.sessionId,
+      createdAt: lease.createdAt,
+      updatedAt: lease.updatedAt,
+    }))
+  }
+
+  /**
+   * Attribution is evidence about a process tree, never authority over it: a
+   * failed write leaves the app exactly as blind as it is today, so it must not
+   * fail the operation that produced it.
+   */
+  private async syncHostAttributionRecord(
+    record: PersistentHostRegistryRecord,
+    leases: Record<string, PersistentHostLeaseRecord>,
+  ): Promise<void> {
+    const directory = this.processAttributionDirectory
+    if (!directory || !record.attributionId) {
+      return
+    }
+    await writeHostAttributionRecord({
+      directory,
+      attributionId: record.attributionId,
+      hostPid: record.pid,
+      hostStartedAtNative: record.processStartedAtMs ?? null,
+      projectPath: record.projectPath,
+      owners: this.buildHostAttributionOwners(leases),
+      now: () => this.now(),
+    }).catch(() => undefined)
+  }
+
+  /**
+   * A host leaving the registry retires its records rather than deleting them:
+   * the agent trees it spawned may outlive it, and their records - and the
+   * host record naming the teams behind them - stay until the last of them is
+   * gone. Only dead agent records go here.
+   */
+  private async retireHostAttributionRecords(
+    attributionId: string | null | undefined,
+  ): Promise<void> {
+    const directory = this.processAttributionDirectory
+    if (!directory || !attributionId) {
+      return
+    }
+    await retireHostAttributionRecords(directory, attributionId, {
+      now: () => this.now().getTime(),
+      isProcessAlive: pid => this.isProcessAlive(pid),
+      readProcessStartTimeMs: pid => this.readProcessStartTimeMs(pid),
+    }).catch(() => undefined)
+  }
+
   private getPersistentProfileTmpPath(profileRootKey: string): string {
     const registryPath = this.persistentRegistryPath
     return registryPath
@@ -555,18 +788,26 @@ export class OpenCodeHostManager {
     return (this.deps.isProcessAlive ?? isProcessAlive)(pid)
   }
 
-  private async readProcessStartTimeMs(pid: number): Promise<number | null> {
-    if (this.deps.readProcessStartTimeMs) {
-      return this.deps.readProcessStartTimeMs(pid)
+  private killProcess(pid: number, signal: NodeJS.Signals): void {
+    if (this.deps.killProcess) {
+      this.deps.killProcess(pid, signal)
+      return
     }
-    return readProcessStartTimeMs(pid)
+    killProcessTree(pid, signal)
   }
 
-  private async readProcessCommandLine(pid: number): Promise<string | null> {
-    if (this.deps.readProcessCommandLine) {
-      return this.deps.readProcessCommandLine(pid)
+  private async readProcessStartTimeMs(pid: number, budget?: OpenCodeStartupCleanupBudget): Promise<number | null> {
+    if (this.deps.readProcessStartTimeMs) {
+      return this.deps.readProcessStartTimeMs(pid, budget?.cap(6_000))
     }
-    return readProcessCommandLine(pid)
+    return readProcessStartTimeMs(pid, process.platform, budget?.cap(6_000))
+  }
+
+  private async readProcessCommandLine(pid: number, budget?: OpenCodeStartupCleanupBudget): Promise<string | null> {
+    if (this.deps.readProcessCommandLine) {
+      return this.deps.readProcessCommandLine(pid, budget?.cap(6_000))
+    }
+    return readProcessCommandLine(pid, process.platform, budget?.cap(6_000))
   }
 
   private async captureProcessStartTimeMs(
@@ -604,15 +845,16 @@ export class OpenCodeHostManager {
   private async verifyLegacyPersistentHostIdentity(
     record: PersistentHostRegistryRecord,
     startedAtMs: number | null,
+    budget?: OpenCodeStartupCleanupBudget,
   ): Promise<number> {
     if (!Number.isFinite(startedAtMs) || startedAtMs === null) {
       throw new Error(`OpenCode host pid ${record.pid} has no verifiable process start time`)
     }
-    const startedAtMsBeforeProbe = await this.readProcessStartTimeMs(record.pid).catch(() => null)
+    const startedAtMsBeforeProbe = await this.readProcessStartTimeMs(record.pid, budget).catch(() => null)
     if (startedAtMsBeforeProbe !== startedAtMs) {
       throw new Error(`OpenCode host pid ${record.pid} identity changed before legacy migration`)
     }
-    const command = await this.readProcessCommandLine(record.pid).catch(() => null)
+    const command = await this.readProcessCommandLine(record.pid, budget).catch(() => null)
     if (!command || !isExpectedPersistentOpenCodeHostCommand(command, record)) {
       throw new Error(
         `OpenCode host pid ${record.pid} command does not match the registered serve endpoint`,
@@ -623,13 +865,13 @@ export class OpenCodeHostManager {
         `OpenCode host pid ${record.pid} has no resolved config fingerprint for safe migration`,
       )
     }
-    const currentFingerprint = await this.getResolvedConfigFingerprint(record.baseUrl)
+    const currentFingerprint = await this.getResolvedConfigFingerprint(record.baseUrl, budget)
     if (!currentFingerprint || currentFingerprint !== record.resolvedConfigFingerprint) {
       throw new Error(
         `OpenCode host pid ${record.pid} resolved config fingerprint changed during migration`,
       )
     }
-    const startedAtMsAfterProbe = await this.readProcessStartTimeMs(record.pid).catch(() => null)
+    const startedAtMsAfterProbe = await this.readProcessStartTimeMs(record.pid, budget).catch(() => null)
     if (startedAtMsAfterProbe !== startedAtMs) {
       throw new Error(`OpenCode host pid ${record.pid} identity changed during legacy migration`)
     }
@@ -638,12 +880,13 @@ export class OpenCodeHostManager {
 
   private async inspectPersistentHostProcessIdentity(
     record: PersistentHostRegistryRecord,
+    budget?: OpenCodeStartupCleanupBudget,
   ): Promise<PersistentHostProcessIdentity> {
     if (!this.isProcessAlive(record.pid)) {
       return { state: 'gone', startedAtMs: null }
     }
 
-    const startedAtMs = await this.readProcessStartTimeMs(record.pid).catch(() => null)
+    const startedAtMs = await this.readProcessStartTimeMs(record.pid, budget).catch(() => null)
     if (!Number.isFinite(startedAtMs) || startedAtMs === null) {
       if (!this.isProcessAlive(record.pid)) {
         return { state: 'gone', startedAtMs: null }
@@ -877,12 +1120,29 @@ export class OpenCodeHostManager {
             hostKey,
             {
               ...record,
+              // Before Linux switched to /proc start ticks, this field held
+              // ps lstart epoch milliseconds. Treat that old value as a
+              // legacy PID-only identity so command, health, fingerprint and
+              // stable tick checks can migrate it without orphaning the host.
+              ...(process.platform === 'linux'
+                && parsed.processIdentityFormat !== 'platform-native-v2'
+                && Number(record.processStartedAtMs) > 1_000_000_000_000
+                ? { processStartedAtMs: undefined } : {}),
+              // Normalization must never manufacture destructive cleanup authority.
+              cursorAgentReapContractVersion:
+                parsed.processIdentityFormat === 'platform-native-v2'
+                && record.cursorAgentReapContractVersion === 1
+                && record.leases !== null && typeof record.leases === 'object'
+                && !Array.isArray(record.leases)
+                && Object.keys(record.leases).every(key =>
+                  Object.prototype.hasOwnProperty.call(normalizePersistentHostLeases(record.leases), key))
+                  ? 1 : undefined,
               leases: normalizePersistentHostLeases(record.leases),
             },
           ],
         ),
       )
-      return { schemaVersion: 1, hosts }
+      return { schemaVersion: 1, processIdentityFormat: parsed.processIdentityFormat, hosts }
     } catch {
       return { schemaVersion: 1, hosts: {} }
     }
@@ -895,14 +1155,23 @@ export class OpenCodeHostManager {
     if (!registryPath) {
       return
     }
-    await writeJsonFileAtomic(registryPath, registry, { indent: 2 })
+    await writeJsonFileAtomic(registryPath, {
+      ...registry,
+      processIdentityFormat: 'platform-native-v2',
+    }, { indent: 2 })
   }
 
   private buildPersistentHostRecord(
     handle: OpenCodeHostHandle,
     previous?: PersistentHostRegistryRecord,
+    newGeneration = false,
   ): PersistentHostRegistryRecord {
+    const sameGeneration = previous?.pid === handle.pid
+      && previous?.processStartedAtMs === handle.processStartedAtMs
+      && previous?.attributionId === handle.attributionId
     return {
+      ...(newGeneration || (sameGeneration && previous?.cursorAgentReapContractVersion === 1)
+        ? { cursorAgentReapContractVersion: 1 as const } : {}),
       hostKey: handle.hostKey,
       profileRootKey: handle.profileRootKey,
       projectPath: handle.projectPath,
@@ -912,10 +1181,11 @@ export class OpenCodeHostManager {
       port: handle.port,
       pid: handle.pid,
       processStartedAtMs: handle.processStartedAtMs,
+      attributionId: handle.attributionId ?? previous?.attributionId ?? null,
       version: handle.version,
       resolvedConfigFingerprint: handle.resolvedConfigFingerprint,
       updatedAt: this.nowIso(),
-      leases: normalizePersistentHostLeases(previous?.leases),
+      leases: normalizePersistentHostLeases(previous?.leases, true),
     }
   }
 
@@ -930,7 +1200,7 @@ export class OpenCodeHostManager {
     return lockPath
   }
 
-  private async withPersistentRegistryLock<T>(callback: () => Promise<T>): Promise<T> {
+  private async withPersistentRegistryLock<T>(callback: () => Promise<T>, onCompromised?: (error: Error) => void): Promise<T> {
     const lockPath = await this.ensurePersistentRegistryLockFile()
     if (!lockPath) {
       return callback()
@@ -938,7 +1208,9 @@ export class OpenCodeHostManager {
 
     let release: (() => Promise<void>) | undefined
     try {
-      release = await lockfile.lock(lockPath, PERSISTENT_REGISTRY_LOCK_OPTIONS)
+      release = await lockfile.lock(lockPath, onCompromised
+        ? { ...PERSISTENT_REGISTRY_LOCK_OPTIONS, onCompromised }
+        : PERSISTENT_REGISTRY_LOCK_OPTIONS)
       return await callback()
     } finally {
       if (release) {
@@ -988,10 +1260,7 @@ export class OpenCodeHostManager {
       try {
         return await lockfile.lock(lockPath, PERSISTENT_HOST_STARTUP_LOCK_OPTIONS)
       } catch (error) {
-        const code = error && typeof error === 'object' && 'code' in error
-          ? (error as { code?: unknown }).code
-          : undefined
-        if (code !== 'ELOCKED' || attempt >= PERSISTENT_HOST_STARTUP_LOCK_RETRIES) {
+        if (!shouldRetryPersistentHostStartupLock(error, attempt, Boolean(abortSignal))) {
           throw error
         }
       }
@@ -1003,7 +1272,26 @@ export class OpenCodeHostManager {
     }
   }
 
-  private async upsertPersistentHost(handle: OpenCodeHostHandle): Promise<void> {
+  private async tryAcquirePersistentHostStartupLock(
+    hostKey: string,
+  ): Promise<(() => Promise<void>) | null> {
+    const registryPath = this.persistentRegistryPath
+    if (!registryPath) return async () => {}
+    const lockDir = path.join(path.dirname(registryPath), 'host-startup-locks')
+    await mkdir(lockDir, { recursive: true })
+    const lockPath = path.join(lockDir, `${hashText(hostKey)}.lock`)
+    await writeFile(lockPath, '', { flag: 'a' })
+    try {
+      return await lockfile.lock(lockPath, PERSISTENT_HOST_STARTUP_LOCK_OPTIONS)
+    } catch (error) {
+      const code = error && typeof error === 'object' && 'code' in error
+        ? (error as { code?: unknown }).code : undefined
+      if (code === 'ELOCKED') return null
+      throw error
+    }
+  }
+
+  private async upsertPersistentHost(handle: OpenCodeHostHandle, newGeneration = false): Promise<void> {
     const registryPath = this.persistentRegistryPath
     if (!registryPath || handle.pid <= 0) {
       return
@@ -1011,8 +1299,15 @@ export class OpenCodeHostManager {
     await this.withPersistentRegistryLock(async () => {
       const registry = await this.readPersistentRegistryUnlocked()
       const previous = registry.hosts[handle.hostKey]
-      registry.hosts[handle.hostKey] = this.buildPersistentHostRecord(handle, previous)
+      if (previous && await this.hasPendingOAuthHost(handle.hostKey)
+        && (previous.pid !== handle.pid || previous.processStartedAtMs !== handle.processStartedAtMs)) {
+        throw new Error('OpenCode host owns a pending OAuth publication')
+      }
+      if (!previous && !newGeneration) throw new Error('OpenCode persistent host record disappeared')
+      const record = this.buildPersistentHostRecord(handle, previous, newGeneration)
+      registry.hosts[handle.hostKey] = record
       await this.writePersistentRegistryUnlocked(registry)
+      await this.syncHostAttributionRecord(record, normalizePersistentHostLeases(record.leases))
     })
   }
 
@@ -1024,7 +1319,13 @@ export class OpenCodeHostManager {
     await this.withPersistentRegistryLock(async () => {
       const registry = await this.readPersistentRegistryUnlocked()
       const previous = registry.hosts[handle.hostKey]
-      const record = this.buildPersistentHostRecord(handle, previous)
+      if (previous && await this.hasPendingOAuthHost(handle.hostKey)
+        && (previous.pid !== handle.pid || previous.processStartedAtMs !== handle.processStartedAtMs)) {
+        throw new Error('OpenCode host owns a pending OAuth publication')
+      }
+      const newGeneration = !previous || previous.pid !== handle.pid
+        || previous.processStartedAtMs !== handle.processStartedAtMs
+      const record = this.buildPersistentHostRecord(handle, previous, newGeneration)
       const now = this.nowIso()
       const leaseKey = buildLeaseKey(lease)
       record.leases[leaseKey] = {
@@ -1039,20 +1340,55 @@ export class OpenCodeHostManager {
       }
       registry.hosts[handle.hostKey] = { ...record, updatedAt: now }
       await this.writePersistentRegistryUnlocked(registry)
+      await this.syncHostAttributionRecord(registry.hosts[handle.hostKey], normalizePersistentHostLeases(record.leases))
     })
   }
 
-  private async removePersistentHost(hostKey: string): Promise<void> {
+  // Registry lifetime follows the admitted OAuth operation, including ordinary
+  // child exit and stale cleanup. This preserves evidence; it never grants
+  // recovery authority when birth/run/session/lease comparisons fail.
+  private async hasPendingOAuthHost(hostKey: string, lease?: OpenCodeHostLeaseInput): Promise<boolean> {
+    if (!this.persistentRegistryPath) return false
+    try {
+      const receipt = JSON.parse(await readFile(path.join(path.dirname(this.persistentRegistryPath),
+        'auth.json.agent-teams-xai-oauth-save.json'), 'utf8'))
+      if (receipt?.version !== 1 || typeof receipt.operationId !== 'string'
+        || !receipt.owner || !('successor' in receipt)) {
+        throw new Error('OpenCode pending OAuth cleanup owner is invalid')
+      }
+      if (lease) {
+        const owner = receipt.nativeSession?.record
+        return owner?.hostKey === hostKey && owner.teamId === lease.teamId
+          && owner.laneId === (lease.laneId?.trim() || 'primary') && owner.memberName === lease.memberName
+          && owner.runId === lease.runId && owner.opencodeSessionId === lease.sessionId
+      }
+      return receipt.nativeSession?.record?.hostKey === hostKey
+        || receipt.nativeProbe?.hostKey === hostKey
+    } catch (error) {
+      if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') return false
+      throw error // Corrupt/unreadable ownership must not authorize cleanup.
+    }
+  }
+
+  private async removePersistentHost(
+    hostKey: string,
+    expectedIdentity?: { pid: number; startedAtMs: number | null | undefined },
+  ): Promise<void> {
     const registryPath = this.persistentRegistryPath
     if (!registryPath) {
       return
     }
     await this.withPersistentRegistryLock(async () => {
       const registry = await this.readPersistentRegistryUnlocked()
-      if (!registry.hosts[hostKey]) {
+      const record = registry.hosts[hostKey]
+      if (!record
+        || (expectedIdentity && (record.pid !== expectedIdentity.pid
+          || record.processStartedAtMs !== expectedIdentity.startedAtMs))) {
         return
       }
+      if (await this.hasPendingOAuthHost(hostKey)) return
       delete registry.hosts[hostKey]
+      await this.retireHostAttributionRecords(record.attributionId)
       if (Object.keys(registry.hosts).length === 0) {
         await unlink(registryPath).catch(() => undefined)
         return
@@ -1061,52 +1397,186 @@ export class OpenCodeHostManager {
     })
   }
 
-  async retainHostLease(hostKey: string, input: OpenCodeHostLeaseInput): Promise<void> {
+  /** Cleanup resolves only an existing exact lease. No profile, status probe,
+   * asset verification, host spawn, or arbitrary caller-supplied endpoint. */
+  async resolveOwnedSessionEndpoint(
+    hostKey: string,
+    input: OpenCodeHostLeaseInput & { projectPath: string; expectedProcessStartedAtMs?: number },
+    abortSignal?: AbortSignal,
+  ): Promise<{ baseUrl: string; pid: number }> {
+    if (abortSignal?.aborted) throwOpenCodeAbortReason(abortSignal)
+    if (!input.runId || !input.sessionId) throw new Error('OpenCode cleanup requires exact run and session')
+    return this.withPersistentRegistryLock(async () => {
+      const record = (await this.readPersistentRegistryUnlocked()).hosts[hostKey]
+      const lease = record && normalizePersistentHostLeases(record.leases, true)[buildLeaseKey(input)]
+      if (!record || record.hostKey !== hostKey || record.projectPath !== input.projectPath
+        || (input.expectedProcessStartedAtMs !== undefined
+          && (!Number.isFinite(input.expectedProcessStartedAtMs) || input.expectedProcessStartedAtMs <= 0
+            || record.processStartedAtMs !== input.expectedProcessStartedAtMs))
+        || !lease || lease.teamId !== input.teamId
+        || lease.laneId !== (input.laneId?.trim() || 'primary')
+        || lease.memberName !== input.memberName
+        || lease.runId !== input.runId || lease.sessionId !== input.sessionId) {
+        throw new Error('OpenCode cleanup host ownership is unavailable')
+      }
+      // Registry metadata is not permission to contact a remote/arbitrary URL.
+      if (!Number.isSafeInteger(record.port) || record.port <= 0 || record.port > 65535
+        || record.baseUrl !== `http://127.0.0.1:${record.port}`) {
+        throw new Error('OpenCode cleanup endpoint is invalid')
+      }
+      if ((await this.inspectPersistentHostProcessIdentity(record)).state !== 'confirmed') {
+        throw new Error('OpenCode cleanup host process ownership is unavailable')
+      }
+      if (abortSignal?.aborted) throwOpenCodeAbortReason(abortSignal)
+      return { baseUrl: record.baseUrl, pid: record.pid }
+    })
+  }
+
+  async reapUnleasedCursorAgentTrees(body: unknown): Promise<CursorAgentReapResult> {
+    const input = parseCursorAgentReapInput(body)
+    const result: CursorAgentReapResult = { contractVersion: 1, status: 'kept', killedPids: [], diagnostics: [] }
     const registryPath = this.persistentRegistryPath
-    if (!registryPath) {
-      return
+    const directory = this.processAttributionDirectory
+    if (!registryPath || !directory) {
+      result.diagnostics.push('Persistent registry or attribution directory unavailable')
+      return result
     }
+    const deadline = Date.now() + 10_000
+    let compromised: Error | undefined
+    const guard = () => {
+      if (compromised) throw new Error(`Registry lock compromised: ${compromised.message}`)
+      if (Date.now() >= deadline) throw new Error('Cursor reap deadline exhausted')
+    }
+    try {
+      await this.withPersistentRegistryLock(async () => {
+        guard()
+        let raw: unknown
+        try { raw = JSON.parse(await readFile(registryPath, 'utf8')) }
+        catch { result.diagnostics.push('Registry missing, unreadable or corrupt'); return }
+        guard()
+        const records = await readAttributionRecords(directory)
+        guard()
+        await reapCursorAgents(input, raw, records, {
+          deadline, guard, profileScope: process.env.CLAUDE_TEAM_APP_PROFILE_SCOPE,
+          pendingOAuth: key => this.hasPendingOAuthHost(key),
+          processLifetime: key => this.hosts.get(key)?.lifetime === 'process',
+          native: this.deps.cursorAgentNativePorts,
+        }, result)
+        guard()
+      }, error => { compromised = error })
+    } catch (error) {
+      result.status = 'incomplete'
+      result.diagnostics.push(error instanceof Error ? error.message : String(error))
+    }
+    return result
+  }
+
+  /** A distinct durable lease protects delayed callbacks without inventing UI owners.
+   * Pins use ordinary lease fields so existing normalizers and raw reapers retain
+   * their veto. Only this wrapper removes pins, under the registry gate.
+   */
+  async withHostOperation<T>(
+    host: Pick<OpenCodeHostHandle, 'hostKey' | 'pid' | 'processStartedAtMs' | 'baseUrl'>,
+    owner: OpenCodeHostLeaseInput | null,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    if (this.hosts.get(host.hostKey)?.lifetime === 'process') return operation()
+    if (!this.persistentRegistryPath) throw new Error('OpenCode operation registry is unavailable')
+    const identity = { ...host }
+    const input = owner ? { ...owner } : createOpenCodePreflightHostLeaseInput('operation')
+    const ownerKey = buildLeaseKey(input)
+    const pinKey = `${ownerKey}::operation:${randomUUID()}`
+    const matchesHost = (record: PersistentHostRegistryRecord) =>
+      record.hostKey === identity.hostKey && record.pid === identity.pid
+      && record.processStartedAtMs === identity.processStartedAtMs
+      && record.baseUrl === identity.baseUrl
+    let original: PersistentHostLeaseRecord | undefined
+    await this.withPersistentRegistryLock(async () => {
+      const registry = await this.readPersistentRegistryUnlocked()
+      const record = registry.hosts[identity.hostKey]
+      if (!record || !matchesHost(record)) throw new Error('OpenCode operation host generation is unavailable')
+      const leases = normalizePersistentHostLeases(record.leases, true)
+      original = leases[ownerKey]
+      if (owner && (!original || original.teamId !== input.teamId.trim()
+        || original.laneId !== (input.laneId?.trim() || 'primary')
+        || original.memberName !== input.memberName.trim()
+        || original.runId !== (input.runId?.trim() || null)
+        || original.sessionId !== (input.sessionId?.trim() || null))) {
+        throw new Error('OpenCode operation session lease is unavailable')
+      }
+      const now = this.nowIso()
+      leases[pinKey] = {
+        leaseKey: pinKey, teamId: input.teamId.trim(),
+        laneId: input.laneId?.trim() || 'primary', memberName: input.memberName.trim(),
+        runId: input.runId?.trim() || null, sessionId: input.sessionId?.trim() || null,
+        createdAt: now, updatedAt: now,
+      }
+      record.leases = leases
+      await this.writePersistentRegistryUnlocked(registry)
+    })
+    let failed = true
+    try {
+      const result = await operation()
+      failed = false
+      return result
+    } finally {
+      await this.withPersistentRegistryLock(async () => {
+        const registry = await this.readPersistentRegistryUnlocked()
+        const record = registry.hosts[identity.hostKey]
+        // Missing/unreadable evidence cannot establish successful pin removal.
+        if (!record) throw new Error('OpenCode operation completion registry is unavailable')
+        const leases = normalizePersistentHostLeases(record.leases, true)
+        const current = leases[ownerKey]
+        const uncertain = failed || !matchesHost(record) || !leases[pinKey]
+          || Boolean(owner && (!current || current.createdAt !== original?.createdAt
+            || current.runId !== original?.runId || current.sessionId !== original?.sessionId))
+        if (uncertain) {
+          delete record.cursorAgentReapContractVersion
+          // Persist revocation first. A failed second write leaves a vetoing pin.
+          await this.writePersistentRegistryUnlocked(registry)
+        }
+        delete leases[pinKey]
+        record.leases = leases
+        await this.writePersistentRegistryUnlocked(registry)
+      })
+    }
+  }
+
+  async retainHostLease(hostKey: string, input: OpenCodeHostLeaseInput): Promise<void> {
     if (this.hosts.get(hostKey)?.lifetime === 'process') return
+    const registryPath = this.persistentRegistryPath
+    if (!registryPath) throw new Error('OpenCode persistent lease registry is unavailable')
 
     await this.withPersistentRegistryLock(async () => {
       const leaseKey = buildLeaseKey(input)
       const registry = await this.readPersistentRegistryUnlocked()
-      let record = registry.hosts[hostKey]
-      if (!record) {
-        const entry = this.hosts.get(hostKey)
-        if (!entry) {
-          throw new Error(`OpenCode host ${hostKey} is unavailable for lease publication`)
-        }
-        if (entry.lifetime !== 'persistent') {
-          return
-        }
-        const identity = await this.inspectPersistentHostProcessIdentity({
-          ...this.buildPersistentHostRecord(entry.handle),
-          processStartedAtMs: entry.handle.processStartedAtMs,
-        })
-        if (identity.state !== 'confirmed') {
-          throw new Error(
-            `OpenCode host ${hostKey} cannot publish a lease because its process identity is ${identity.state}`,
-          )
-        }
-        record = this.buildPersistentHostRecord(entry.handle)
-        registry.hosts[hostKey] = record
+      const record = registry.hosts[hostKey]
+      if (!record || record.hostKey !== hostKey) {
+        throw new Error('OpenCode persistent host lease requires an existing registry record')
       }
 
       const nowDate = this.now()
       const now = nowDate.toISOString()
       const nowMs = nowDate.getTime()
-      const leases = normalizePersistentHostLeases(record.leases)
+      const leases = normalizePersistentHostLeases(record.leases, true)
       const previous = leases[leaseKey]
-      const runId = input.runId?.trim() || previous?.runId || null
-      const sessionId = input.sessionId?.trim() || previous?.sessionId || null
+      const requestedRunId = input.runId?.trim() || null
+      const requestedSessionId = input.sessionId?.trim() || null
+      if ((previous?.runId && requestedRunId && previous.runId !== requestedRunId)
+        || (previous?.sessionId && requestedSessionId
+          && previous.sessionId !== requestedSessionId)) {
+        throw new Error('OpenCode host lease belongs to a different run or session')
+      }
+      const runId = requestedRunId || previous?.runId || null
+      const sessionId = requestedSessionId || previous?.sessionId || null
       const previousUpdatedAtMs = previous ? Date.parse(previous.updatedAt) : 0
       if (
         previous &&
         previous.runId === runId &&
         previous.sessionId === sessionId &&
         Number.isFinite(previousUpdatedAtMs) &&
-        nowMs - previousUpdatedAtMs < OPEN_CODE_HOST_LEASE_REFRESH_INTERVAL_MS
+        nowMs - previousUpdatedAtMs < OPEN_CODE_HOST_LEASE_REFRESH_INTERVAL_MS &&
+        Object.prototype.hasOwnProperty.call(record.leases, leaseKey)
       ) {
         return
       }
@@ -1120,47 +1590,80 @@ export class OpenCodeHostManager {
         createdAt: previous?.createdAt ?? now,
         updatedAt: now,
       }
-      registry.hosts[hostKey] = {
-        ...record,
-        leases,
-        updatedAt: now,
-      }
+      const updated = { ...record, leases, updatedAt: now }
+      registry.hosts[hostKey] = updated
       await this.writePersistentRegistryUnlocked(registry)
+      await this.syncHostAttributionRecord(updated, leases)
     })
   }
 
   async releaseHostLease(hostKey: string, input: OpenCodeHostLeaseInput): Promise<void> {
+    await this.releaseHostLeaseExact(hostKey, input, false)
+  }
+
+  async releaseHostLeaseStrict(hostKey: string, input: OpenCodeHostLeaseInput): Promise<boolean> {
+    return this.releaseHostLeaseExact(hostKey, input, true)
+  }
+
+  private async releaseHostLeaseExact(
+    hostKey: string,
+    input: OpenCodeHostLeaseInput,
+    strict: boolean,
+  ): Promise<boolean> {
     const registryPath = this.persistentRegistryPath
     if (!registryPath) {
-      return
+      return false
     }
 
-    await this.withPersistentRegistryLock(async () => {
+    return this.withPersistentRegistryLock(async () => {
       const leaseKey = buildLeaseKey(input)
       const registry = await this.readPersistentRegistryUnlocked()
       const record = registry.hosts[hostKey]
       if (!record) {
-        return
+        return false
       }
-      const leases = normalizePersistentHostLeases(record.leases)
-      if (!leases[leaseKey]) {
-        return
+      const legacyKey = `${input.teamId.trim()}::${input.laneId?.trim() || 'primary'}::${input.memberName.trim()}`
+      // A registry containing both schemas for one owner is ambiguous. Removing
+      // the qualified entry would otherwise promote the old entry on next read.
+      if (leaseKey !== legacyKey && record.leases && Object.prototype.hasOwnProperty.call(record.leases, legacyKey)
+        && Object.prototype.hasOwnProperty.call(record.leases, leaseKey)) return false
+      const leases = normalizePersistentHostLeases(record.leases, true)
+      const lease = leases[leaseKey]
+      if (!lease) return false
+      const expectedRunId = input.runId?.trim()
+      const expectedSessionId = input.sessionId?.trim()
+      if (strict && (!expectedRunId || !expectedSessionId
+        || lease.runId !== expectedRunId || lease.sessionId !== expectedSessionId)) return false
+      // Every persisted identity field must be qualified independently. A
+      // caller supplying only one identity cannot release a lease qualified by both.
+      if ((lease.runId && (!expectedRunId || lease.runId !== expectedRunId))
+        || (lease.sessionId && (!expectedSessionId || lease.sessionId !== expectedSessionId))) return false
+      if (await this.hasPendingOAuthHost(hostKey, input)) return false
+      // Releasing and then restoring an identical session must not erase the
+      // fact that Stop overlapped a delayed operation. Revocation is monotonic.
+      if (Object.keys(leases).some(key => key.startsWith(`${leaseKey}::operation:`))) {
+        delete record.cursorAgentReapContractVersion
       }
       delete leases[leaseKey]
-      registry.hosts[hostKey] = {
-        ...record,
-        leases,
-        updatedAt: this.nowIso(),
-      }
+      const updated = { ...record, leases, updatedAt: this.nowIso() }
+      registry.hosts[hostKey] = updated
       await this.writePersistentRegistryUnlocked(registry)
+      // Releasing the last lease leaves the host process running and registered
+      // - preflight probes retain and release a lease around every run - so the
+      // record is rewritten rather than deleted: the released lease moves to
+      // its released owners, which is what still names the team behind an
+      // agent tree that outlives the lane. Only a host leaving the registry
+      // retires its records, and even that keeps them while such a tree lives.
+      await this.syncHostAttributionRecord(updated, leases)
+      return true
     })
   }
 
-  private async checkHealthyHostOnce(baseUrl: string): Promise<{ version: string | null } | null> {
+  private async checkHealthyHostOnce(baseUrl: string, budget?: OpenCodeStartupCleanupBudget): Promise<{ version: string | null } | null> {
     try {
       const result = await this.fetchJsonWithTimeout(
         `${baseUrl}/global/health`,
-        OPEN_CODE_HOST_HEALTH_REQUEST_TIMEOUT_MS,
+        budget?.cap(OPEN_CODE_HOST_HEALTH_REQUEST_TIMEOUT_MS) ?? OPEN_CODE_HOST_HEALTH_REQUEST_TIMEOUT_MS,
       )
       const data = result.data as { healthy?: boolean; version?: string }
       if (result.status === 200 && data?.healthy === true) {
@@ -1189,6 +1692,7 @@ export class OpenCodeHostManager {
           if (!candidate) return null
           const now = this.nowIso()
           const leaseKey = buildLeaseKey(lease)
+          candidate.leases = normalizePersistentHostLeases(candidate.leases, true)
           candidate.leases[leaseKey] = {
             leaseKey,
             teamId: lease.teamId.trim(),
@@ -1268,6 +1772,7 @@ export class OpenCodeHostManager {
       port: record.port,
       pid: record.pid,
       processStartedAtMs,
+      attributionId: record.attributionId ?? null,
       version: health.version ?? record.version,
       state: 'healthy',
       profile,
@@ -1336,24 +1841,28 @@ export class OpenCodeHostManager {
     throw new Error(`OpenCode host did not become healthy within ${healthTimeoutMs}ms`)
   }
 
-  private async getResolvedConfigFingerprint(baseUrl: string): Promise<string | null> {
+  private async observeResolvedConfig(baseUrl: string, budget?: OpenCodeStartupCleanupBudget): Promise<{
+    fingerprint: string
+    config: unknown
+    agents: unknown
+  } | null> {
     try {
       const [config, configProviders, agents, mcp] = await Promise.all([
         this.fetchJsonWithTimeout(
           `${baseUrl}/config`,
-          OPEN_CODE_RESOLVED_CONFIG_FINGERPRINT_REQUEST_TIMEOUT_MS,
+          budget?.cap(OPEN_CODE_RESOLVED_CONFIG_FINGERPRINT_REQUEST_TIMEOUT_MS) ?? OPEN_CODE_RESOLVED_CONFIG_FINGERPRINT_REQUEST_TIMEOUT_MS,
         ),
         this.fetchJsonWithTimeout(
           `${baseUrl}/config/providers`,
-          OPEN_CODE_RESOLVED_CONFIG_FINGERPRINT_REQUEST_TIMEOUT_MS,
+          budget?.cap(OPEN_CODE_RESOLVED_CONFIG_FINGERPRINT_REQUEST_TIMEOUT_MS) ?? OPEN_CODE_RESOLVED_CONFIG_FINGERPRINT_REQUEST_TIMEOUT_MS,
         ),
         this.fetchJsonWithTimeout(
           `${baseUrl}/agent`,
-          OPEN_CODE_RESOLVED_CONFIG_FINGERPRINT_REQUEST_TIMEOUT_MS,
+          budget?.cap(OPEN_CODE_RESOLVED_CONFIG_FINGERPRINT_REQUEST_TIMEOUT_MS) ?? OPEN_CODE_RESOLVED_CONFIG_FINGERPRINT_REQUEST_TIMEOUT_MS,
         ),
         this.fetchJsonWithTimeout(
           `${baseUrl}/mcp`,
-          OPEN_CODE_RESOLVED_CONFIG_FINGERPRINT_REQUEST_TIMEOUT_MS,
+          budget?.cap(OPEN_CODE_RESOLVED_CONFIG_FINGERPRINT_REQUEST_TIMEOUT_MS) ?? OPEN_CODE_RESOLVED_CONFIG_FINGERPRINT_REQUEST_TIMEOUT_MS,
         ),
       ])
 
@@ -1370,23 +1879,28 @@ export class OpenCodeHostManager {
       }
 
       if (
-        fingerprintSource.config === null &&
-        fingerprintSource.configProviders === null &&
-        fingerprintSource.agents === null &&
+        fingerprintSource.config === null ||
+        fingerprintSource.configProviders === null ||
+        fingerprintSource.agents === null ||
         fingerprintSource.mcp === null
       ) {
         return null
       }
-      return hashJson(fingerprintSource)
+      return { fingerprint: hashJson(fingerprintSource), config: config.data, agents: agents.data }
     } catch {
       return null
     }
+  }
+
+  private async getResolvedConfigFingerprint(baseUrl: string, budget?: OpenCodeStartupCleanupBudget): Promise<string | null> {
+    return (await this.observeResolvedConfig(baseUrl, budget))?.fingerprint ?? null
   }
 
   private spawnHost(
     profile: OpenCodePreparedProfile,
     port: number,
     lifetime: OpenCodeHostLifetime,
+    attributionId: string | null,
   ): ChildProcess {
     if (this.deps.spawnHostProcess) {
       return this.deps.spawnHostProcess(profile, port)
@@ -1395,7 +1909,11 @@ export class OpenCodeHostManager {
     return spawnPortableCli(
       resolveOpenCodeBinaryPath() ?? 'opencode',
       ['serve', '--hostname', '127.0.0.1', '--port', String(port)],
-      buildOpenCodeHostSpawnOptions(profile, process.platform, { lifetime }),
+      buildOpenCodeHostSpawnOptions(profile, process.platform, {
+        lifetime,
+        attributionId,
+        attributionDirectory: this.processAttributionDirectory,
+      }),
     )
   }
 
@@ -1428,7 +1946,10 @@ export class OpenCodeHostManager {
 
       this.hosts.delete(hostKey)
       this.pendingHosts.delete(hostKey)
-      void this.removePersistentHost(hostKey).catch(() => undefined)
+      void this.removePersistentHost(hostKey, {
+        pid: entry.handle.pid,
+        startedAtMs: entry.handle.processStartedAtMs,
+      }).catch(() => undefined)
       void this.cleanupOpenTuiTempArtifactsIfUnused(
         entry.handle.profile.tmpPath,
         entry.handle.pid,
@@ -1485,13 +2006,14 @@ export class OpenCodeHostManager {
   ): Promise<OpenCodeHostHandle> {
     const port = await this.allocateLoopbackPort()
     const baseUrl = `http://127.0.0.1:${port}`
+    const attributionId = mintProcessAttributionId()
     const diagnostics: string[] = []
     let child: ChildProcess | null = null
     try {
       // Sweep and spawn use the same cross-process lock, so no OpenTUI dylib
       // can be removed between process creation and ownership publication.
       child = await this.withTempOwnershipLock(profile.tmpPath, async () => {
-        child = this.spawnHost(profile, port, lifetime)
+        child = this.spawnHost(profile, port, lifetime, attributionId)
         await this.deps.beforeTempOwnershipMarkerPublish?.()
         await this.publishTempOwnershipMarkerUnlocked(profile.tmpPath, child.pid ?? -1)
         return child
@@ -1563,6 +2085,7 @@ export class OpenCodeHostManager {
       baseUrl,
       port,
       pid: child.pid ?? -1,
+      attributionId,
       version: null,
       state: 'starting',
       profile,
@@ -1608,7 +2131,7 @@ export class OpenCodeHostManager {
       }
       if (lifetime === 'persistent') {
         if (lease) await this.upsertPersistentHostWithLease(handle, lease)
-        else await this.upsertPersistentHost(handle)
+        else await this.upsertPersistentHost(handle, true)
       }
       return handle
     } catch (error) {
@@ -1636,6 +2159,164 @@ export class OpenCodeHostManager {
     }
   }
 
+  // A new launch can retire an orphaned record only while startup of its old
+  // exact host is excluded. A matching dead registry entry is removed only after
+  // terminal CAS evidence; absence is never inferred from health or registry errors.
+  async withConfirmedAbsentHostAuthority<T>(
+    record: { hostKey: string; runtimePid?: number | null; expectedProcessStartedAtMs?: number
+      expectedSession?: OpenCodeHostLeaseInput & { projectPath: string } },
+    operation: () => Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    const registryPath = this.persistentRegistryPath
+    if (!registryPath || !record.hostKey.trim()
+      || !Number.isSafeInteger(record.runtimePid) || (record.runtimePid ?? 0) <= 0) {
+      throw new Error('OpenCode dead runtime recovery requires exact host and process authority')
+    }
+    return this.withPersistentHostStartupLock(record.hostKey, async () => {
+      return this.withPersistentRegistryLock(async () => {
+        let registry: PersistentHostRegistryShape = { schemaVersion: 1, hosts: {} }
+        let hosts: Record<string, unknown> = registry.hosts
+        try {
+          const parsed = JSON.parse(await readFile(registryPath, 'utf8'))
+          if (parsed?.schemaVersion !== 1 || !parsed.hosts
+            || typeof parsed.hosts !== 'object' || Array.isArray(parsed.hosts)) {
+            throw new Error('OpenCode dead runtime recovery registry is invalid')
+          }
+          registry = parsed
+          hosts = parsed.hosts
+        } catch (error) {
+          if (!error || typeof error !== 'object' || !('code' in error) || error.code !== 'ENOENT') throw error
+        }
+        const registered = hosts[record.hostKey]
+        if (record.expectedProcessStartedAtMs !== undefined && (!registered || typeof registered !== 'object'
+          || !('processStartedAtMs' in registered) || registered.processStartedAtMs !== record.expectedProcessStartedAtMs)) {
+          throw new Error('OpenCode dead runtime recovery original process birth differs')
+        }
+        if (record.expectedSession) {
+          const expected = record.expectedSession
+          const host = registry.hosts[record.hostKey]
+          const lease = host && normalizePersistentHostLeases(host.leases, true)[buildLeaseKey(expected)]
+          if (!expected.runId || !expected.sessionId || host?.projectPath !== expected.projectPath
+            || !lease || lease.teamId !== expected.teamId || lease.laneId !== (expected.laneId?.trim() || 'primary')
+            || lease.memberName !== expected.memberName || lease.runId !== expected.runId || lease.sessionId !== expected.sessionId) {
+            throw new Error('OpenCode dead runtime recovery session lease changed')
+          }
+        }
+        if (Object.hasOwn(hosts, record.hostKey) && (!registered || typeof registered !== 'object'
+          || !('pid' in registered) || registered.pid !== record.runtimePid
+          || !('hostKey' in registered) || registered.hostKey !== record.hostKey
+          || !('processStartedAtMs' in registered) || typeof registered.processStartedAtMs !== 'number'
+          || !Number.isFinite(registered.processStartedAtMs) || registered.processStartedAtMs <= 0)) {
+          throw new Error('OpenCode dead runtime recovery registry process identity differs or is unverified')
+        }
+        const assertAbsent = () => {
+          if (this.hosts.has(record.hostKey)
+            || this.pendingHosts.has(record.hostKey)) {
+            throw new Error('OpenCode dead runtime recovery found existing host authority')
+          }
+        }
+        assertAbsent()
+        const inspect = async (): Promise<'alive' | 'gone' | 'unknown'> => {
+          if (this.deps.inspectProcessLiveness) return this.deps.inspectProcessLiveness(record.runtimePid!)
+          try {
+            process.kill(record.runtimePid!, 0)
+            return 'alive'
+          } catch (error) {
+            return error && typeof error === 'object' && 'code' in error && error.code === 'ESRCH'
+              ? 'gone' : 'unknown'
+          }
+        }
+        const liveness = await raceOpenCodeAbortSignal(inspect(), signal)
+        if (liveness !== 'gone') throw new Error('OpenCode old runtime process is alive or unverified')
+        assertAbsent()
+        if (signal?.aborted) throwOpenCodeAbortReason(signal)
+        const result = await operation()
+        // The callback returns terminal CAS evidence. A rejected CAS leaves the
+        // exact dead registry record and its leases intact for the winner.
+        if (registered && result != null && result !== false && !await this.hasPendingOAuthHost(record.hostKey)) {
+          delete registry.hosts[record.hostKey]
+          await writeJsonFileAtomic(registryPath, registry, { indent: 2 })
+        }
+        return result
+      })
+    }, signal)
+  }
+
+  // Stop may retain an exact existing authority, but must never create, migrate,
+  // dispose, or remove a host as a side effect of discovering that authority.
+  private async retainExistingHost(
+    hostKey: string,
+    profile: OpenCodePreparedProfile,
+    abortSignal?: AbortSignal,
+  ): Promise<OpenCodeHostHandle> {
+    return this.withPersistentHostStartupLock(hostKey, async () => {
+      const cached = this.hosts.get(hostKey)
+      const record = cached
+        ? this.buildPersistentHostRecord(cached.handle)
+        : (await this.readPersistentRegistry()).hosts[hostKey]
+      if (!record || record.hostKey !== hostKey
+        || record.projectPath !== profile.projectPath
+        || record.profileRootKey !== profile.profileRootKey
+        || record.projectBehaviorFingerprint !== profile.projectBehaviorFingerprint
+        || record.managedConfigFingerprint !== profile.managedConfigFingerprint
+        || record.resolvedConfigFingerprint !== profile.managedConfigFingerprint
+        || !Number.isFinite(record.processStartedAtMs)
+        || record.processStartedAtMs == null
+        || (cached && cached.handle.state !== 'healthy')) {
+        throw new Error('OpenCode existing host authority is unavailable or changed')
+      }
+      const before = await raceOpenCodeAbortSignal(this.inspectPersistentHostProcessIdentity(record), abortSignal)
+      if (before.state !== 'confirmed' || before.startedAtMs !== record.processStartedAtMs) {
+        throw new Error('OpenCode existing host process identity is unavailable or changed')
+      }
+      const health = await raceOpenCodeAbortSignal(this.checkHealthyHostOnce(record.baseUrl), abortSignal)
+      const after = await raceOpenCodeAbortSignal(this.inspectPersistentHostProcessIdentity(record), abortSignal)
+      if (!health || after.state !== 'confirmed' || after.startedAtMs !== record.processStartedAtMs) {
+        throw new Error('OpenCode existing host is unhealthy or its process identity changed')
+      }
+      const binaryPath = resolveOpenCodeBinaryPath()
+      // This path bypasses ordinary adoption. Re-read installed bytes rather
+      // than trusting the manager's startup cache, then bind them to /proc/exe.
+      const installedDigest = binaryPath && !this.deps.spawnHostProcess && process.platform === 'linux'
+        ? (this.deps.resolveOpenCodeArtifactDigest ?? resolveOpenCodeArtifactDigest)(binaryPath)
+        : null
+      const openCodeArtifactDigest = installedDigest &&
+        resolveExecutingOpenCodeArtifactDigest(record.pid) === installedDigest
+          ? installedDigest : null
+      if (abortSignal?.aborted) throwOpenCodeAbortReason(abortSignal)
+      if (cached) {
+        // Another holder may release the entry while the bounded health probe runs.
+        if (this.hosts.get(hostKey) !== cached || cached.handle.state !== 'healthy') {
+          throw new Error('OpenCode existing host authority changed during acquisition')
+        }
+        cached.handle.openCodeArtifactDigest = openCodeArtifactDigest
+        cached.refCount += 1
+        return cached.handle
+      }
+      const handle: OpenCodeHostHandle = {
+        hostKey,
+        profileRootKey: record.profileRootKey,
+        projectPath: record.projectPath,
+        projectBehaviorFingerprint: record.projectBehaviorFingerprint,
+        openCodeArtifactDigest,
+        baseUrl: record.baseUrl,
+        port: record.port,
+        pid: record.pid,
+        processStartedAtMs: record.processStartedAtMs,
+        version: health.version ?? record.version,
+        state: 'healthy',
+        profile,
+        resolvedConfigFingerprint: record.resolvedConfigFingerprint,
+        diagnostics: [`retained existing OpenCode host pid=${record.pid}`],
+      }
+      this.hosts.set(hostKey, {
+        handle, child: null, refCount: 1, ownedByProcess: false, lifetime: 'persistent',
+      })
+      return handle
+    }, abortSignal)
+  }
+
   async ensureHost(
     params: {
       projectPath?: string | null
@@ -1645,6 +2326,8 @@ export class OpenCodeHostManager {
       healthTimeoutMs?: number | null
       hostLifetime?: OpenCodeHostLifetime
       resolveConfigFingerprint?: boolean
+      prewarmManagedSubscriptionPlugins?: boolean
+      existingOnly?: boolean
       abortSignal?: AbortSignal
       lease?: OpenCodeHostLeaseInput
     } = {},
@@ -1659,11 +2342,29 @@ export class OpenCodeHostManager {
       }),
       params.abortSignal,
     )
+    await assertOpenCodePreparedProfileScope(profile, params.projectPath)
+    if (params.existingOnly) {
+      const hostKey = params.hostKey?.trim()
+      if (!hostKey || (profile.scopeToken && !hostKey.includes(`::scope:${profile.scopeToken}::`))) {
+        throw new Error('OpenCode existing host requires an exact matching scoped host key')
+      }
+      return this.retainExistingHost(hostKey, profile, params.abortSignal)
+    }
     const binaryPath = resolveOpenCodeBinaryPath()
-    // Test/custom process factories do not prove which executable they run;
-    // only the production resolver/spawn path may publish artifact identity.
+    // Custom process factories cannot prove executed binary bytes.
     const openCodeArtifactDigest = this.resolveInstalledArtifact(binaryPath)
-    if (binaryPath) {
+    const preparedBinaryIdentity = profile.env.AGENT_TEAMS_CURSOR_HOST_BINARY_IDENTITY
+    const needsBinaryIdentity = Boolean(preparedBinaryIdentity) || !params.hostKey?.trim()
+    const binaryHostIdentity = binaryPath && needsBinaryIdentity
+      ? await raceOpenCodeAbortSignal(
+          resolveOpenCodeBinaryHostIdentity(binaryPath),
+          params.abortSignal,
+        )
+      : 'missing-binary'
+    if (preparedBinaryIdentity && preparedBinaryIdentity !== binaryHostIdentity) {
+      throw new Error('OpenCode binary changed after Cursor port generation preparation')
+    }
+    if (binaryPath && params.prewarmManagedSubscriptionPlugins !== false) {
       const pluginPrewarm = await prewarmOpenCodeManagedSubscriptionPlugins({
         binaryPath,
         profile,
@@ -1680,20 +2381,30 @@ export class OpenCodeHostManager {
     const hostLifetime = params.hostLifetime ?? 'persistent'
     const explicitHostKey = params.hostKey?.trim()
     const hostKey = explicitHostKey || await (async () => {
-      const binaryHostIdentity = openCodeArtifactDigest ?? (binaryPath
-        ? await raceOpenCodeAbortSignal(
-            resolveOpenCodeBinaryHostIdentity(binaryPath),
-            params.abortSignal,
-          )
-        : 'missing-binary')
-      const baseHostKey = `${profile.projectPath}::${profile.profileRootKey}::${profile.projectBehaviorFingerprint}::${profile.managedConfigFingerprint}::auth:${profile.managedAuthFingerprint}::${OPEN_CODE_MANAGED_HOST_CONFIG_GENERATION}::binary:${binaryHostIdentity}`
+      const baseHostKey = buildOpenCodeHostProfileIdentity(profile, binaryHostIdentity)
       return hostLifetime === 'process'
         ? `${baseHostKey}::process:${process.pid}:${randomUUID()}`
         : baseHostKey
     })()
+    assertOpenCodeHostReuseIdentity(explicitHostKey, profile)
     const healthTimeoutMs = normalizeOpenCodeHostHealthTimeoutMs(params.healthTimeoutMs)
     const resolveConfigFingerprint = params.resolveConfigFingerprint !== false
+    if (params.abortSignal?.aborted) {
+      throwOpenCodeAbortReason(params.abortSignal)
+    }
     const existing = this.hosts.get(hostKey)
+    if (existing && !existing.ownedByProcess && (
+      existing.handle.state === 'degraded'
+      || (existing.handle.state === 'healthy' && !this.isProcessAlive(existing.handle.pid))
+    )) {
+      existing.handle.state = 'degraded'
+      // Releases identify hosts by key, so old holders must drain before a
+      // replacement can occupy that key and receive their late releases.
+      if (existing.refCount > 0) {
+        throw new Error(`OpenCode host pid ${existing.handle.pid} terminated while retained; release existing host references before retrying`)
+      }
+      this.hosts.delete(hostKey)
+    }
     if (existing && existing.handle.state === 'healthy') {
       existing.refCount += 1
       if (params.lease) {
@@ -1785,10 +2496,8 @@ export class OpenCodeHostManager {
     }
 
     const fingerprint = await this.getResolvedConfigFingerprint(entry.handle.baseUrl)
-    if (fingerprint) {
-      entry.handle.resolvedConfigFingerprint = fingerprint
-    }
-    return entry.handle.resolvedConfigFingerprint
+    entry.handle.resolvedConfigFingerprint = fingerprint
+    return fingerprint
   }
 
   /**
@@ -1806,15 +2515,23 @@ export class OpenCodeHostManager {
   }): Promise<boolean> {
     const entry = this.hosts.get(input.hostKey)
     if (!entry || entry.handle.pid !== input.pid || input.processStartedAtMs === null ||
-      input.resolvedConfigFingerprint === null || !this.isProcessAlive(input.pid)) return false
+      input.resolvedConfigFingerprint === null ||
+      entry.handle.resolvedConfigFingerprint !== input.resolvedConfigFingerprint ||
+      !this.isProcessAlive(input.pid)) return false
     if (!input.openCodeArtifactDigest || process.platform !== 'linux' ||
       entry.handle.openCodeArtifactDigest !== input.openCodeArtifactDigest ||
       resolveExecutingOpenCodeArtifactDigest(input.pid) !== input.openCodeArtifactDigest) return false
     const startedBefore = await this.readProcessStartTimeMs(input.pid).catch(() => null)
     if (startedBefore !== input.processStartedAtMs) return false
     if (!(await this.checkHealthyHostOnce(entry.handle.baseUrl))) return false
-    const fingerprint = await this.getResolvedConfigFingerprint(entry.handle.baseUrl)
-    if (!fingerprint || fingerprint !== input.resolvedConfigFingerprint) return false
+    const observation = await this.observeResolvedConfig(entry.handle.baseUrl)
+    if (!observation) return false
+    // Selected sessions seal the managed profile fingerprint. The broad HTTP
+    // inventory hash is a different domain, so compare the selected fields and
+    // effective agent policy from this final complete live observation.
+    if (input.resolvedConfigFingerprint === entry.handle.profile.managedConfigFingerprint) {
+      if (!matchesSelectedEffectConfig(entry.handle.profile, observation.config, observation.agents)) return false
+    } else if (observation.fingerprint !== input.resolvedConfigFingerprint) return false
     const startedAfter = await this.readProcessStartTimeMs(input.pid).catch(() => null)
     return startedAfter === input.processStartedAtMs && this.isProcessAlive(input.pid)
   }
@@ -1858,7 +2575,7 @@ export class OpenCodeHostManager {
 
   private async terminatePersistentHostRecord(
     record: PersistentHostRegistryRecord,
-    options: { force: boolean },
+    options: { force: boolean; startupBudget?: OpenCodeStartupCleanupBudget },
   ): Promise<void> {
     const entry = this.hosts.get(record.hostKey)
     const pid = entry?.handle.pid ?? record.pid
@@ -1867,7 +2584,8 @@ export class OpenCodeHostManager {
     const processIdentity = await this.inspectPersistentHostProcessIdentity({
       ...record,
       processStartedAtMs: entry?.handle.processStartedAtMs ?? record.processStartedAtMs,
-    })
+    }, options.startupBudget)
+    options.startupBudget?.assertAvailable()
     if (processIdentity.state === 'gone') {
       terminated = true
     } else if (processIdentity.state !== 'confirmed') {
@@ -1876,6 +2594,19 @@ export class OpenCodeHostManager {
           ? `OpenCode host pid ${pid} identity changed; refusing to terminate a reused pid`
           : `OpenCode host pid ${pid} identity could not be verified; refusing unsafe termination`,
       )
+    }
+
+    if (options.startupBudget && !terminated) {
+      const result = await killProcessTreeForStartup(pid, processIdentity.startedAtMs!, options.startupBudget, {
+        readIdentity: (target, timeoutMs) => this.deps.readProcessStartTimeMs
+          ? this.deps.readProcessStartTimeMs(target, timeoutMs)
+          : readProcessStartTimeMs(target, 'win32', timeoutMs),
+        alive: target => this.isProcessAlive(target),
+      })
+      if (!result.helperTerminated || !result.rootGone || !result.treeKillSucceeded) {
+        throw new Error(`Startup termination incomplete: helperTerminated=${result.helperTerminated}, rootGone=${result.rootGone}, treeKillSucceeded=${result.treeKillSucceeded}`)
+      }
+      terminated = true
     }
 
     // Do not call /global/dispose: loopback port ownership can change between
@@ -1947,43 +2678,44 @@ export class OpenCodeHostManager {
       return false
     }
 
-    const dispose = async (): Promise<boolean> => {
-      const registered = (await this.readPersistentRegistryUnlocked()).hosts[hostKey]
-      if (registered && Object.keys(normalizePersistentHostLeases(registered.leases)).length > 0) {
-        return false
-      }
-      try {
-        await this.terminatePersistentHostRecord(
-          {
-            hostKey,
-            profileRootKey: entry.handle.profileRootKey,
-            projectPath: entry.handle.projectPath,
-            projectBehaviorFingerprint: entry.handle.projectBehaviorFingerprint,
-            baseUrl: entry.handle.baseUrl,
-            port: entry.handle.port,
-            pid: entry.handle.pid,
-            processStartedAtMs: entry.handle.processStartedAtMs,
-            version: entry.handle.version,
-            resolvedConfigFingerprint: entry.handle.resolvedConfigFingerprint,
-            updatedAt: this.nowIso(),
-            leases: {},
-          },
-          { force: true },
-        )
-      } catch (error) {
-        entry.handle.state = 'degraded'
-        throw error
-      }
-      const registry = await this.readPersistentRegistryUnlocked()
-      if (registry.hosts[hostKey]) {
-        delete registry.hosts[hostKey]
-        await this.writePersistentRegistryUnlocked(registry)
-      }
-      return true
-    }
-    return this.persistentRegistryPath
-      ? this.withPersistentRegistryLock(dispose)
-      : dispose()
+    return this.withPersistentHostStartupLock(hostKey, async () => {
+      return this.withPersistentRegistryLock(async () => {
+        const registry = await this.readPersistentRegistryUnlocked()
+        const persisted = registry.hosts[hostKey] ?? null
+        if (persisted && Object.keys(normalizePersistentHostLeases(persisted.leases)).length > 0) {
+          return false
+        }
+        const record = persisted ?? {
+          hostKey,
+          profileRootKey: entry.handle.profileRootKey,
+          projectPath: entry.handle.projectPath,
+          projectBehaviorFingerprint: entry.handle.projectBehaviorFingerprint,
+          baseUrl: entry.handle.baseUrl,
+          port: entry.handle.port,
+          pid: entry.handle.pid,
+          processStartedAtMs: entry.handle.processStartedAtMs,
+          version: entry.handle.version,
+          resolvedConfigFingerprint: entry.handle.resolvedConfigFingerprint,
+          updatedAt: this.nowIso(),
+          leases: {},
+        }
+        await this.terminatePersistentHostRecord(record, { force: true })
+        // Delete only the exact record we terminated; a concurrent startup or
+        // registry writer must not have its replacement removed.
+        const current = (await this.readPersistentRegistryUnlocked()).hosts[hostKey]
+        if (current && !await this.hasPendingOAuthHost(hostKey) && current.pid === record.pid
+          && current.processStartedAtMs === record.processStartedAtMs) {
+          const latest = await this.readPersistentRegistryUnlocked()
+          delete latest.hosts[hostKey]
+          if (Object.keys(latest.hosts).length === 0) {
+            await unlink(this.persistentRegistryPath!).catch(() => undefined)
+          } else {
+            await this.writePersistentRegistryUnlocked(latest)
+          }
+        }
+        return true
+      })
+    })
   }
 
   async disposeUnregisteredOwnedHosts(): Promise<{
@@ -2021,6 +2753,8 @@ export class OpenCodeHostManager {
   async reconcilePersistentHosts(
     options: OpenCodePersistentHostReconcileOptions = {},
   ): Promise<OpenCodePersistentHostReconcileResult> {
+    const budget = options.startupBudget
+    budget?.assertAvailable()
     const registryPath = this.persistentRegistryPath
     if (!registryPath) {
       return {
@@ -2028,6 +2762,10 @@ export class OpenCodeHostManager {
         remaining: 0,
         hosts: [],
         diagnostics: ['OpenCode host registry is disabled'],
+        ...(budget ? { startupCleanup: {
+          completion: pendingStartupTaskkillPids().length ? 'unknown' as const : 'drained' as const,
+          coverage: 'partial' as const, survivingPids: pendingStartupTaskkillPids(),
+        } } : {}),
       }
     }
 
@@ -2045,14 +2783,29 @@ export class OpenCodeHostManager {
         ? await normalizeProjectPathForComparison(projectPathFilter)
         : null
 
+      const skipStartupRecord = (record: PersistentHostRegistryRecord, reserveMs = 0): boolean => {
+        if (!budget) return false
+        const reason = hasPendingStartupTaskkill(record.pid)
+          ? 'Startup termination is still pending; retry must observe the existing operation'
+          : budget.remaining() <= reserveMs ? 'Startup cleanup deadline exhausted' : null
+        if (!reason) return false
+        diagnostics.push(`Startup cleanup skipped ${record.hostKey}: ${reason}`)
+        hosts.push({ hostKey: record.hostKey, projectPath: record.projectPath, pid: record.pid, port: record.port,
+          action: 'failed', reason, leaseCount: Object.keys(record.leases ?? {}).length })
+        return true
+      }
+
       for (const [hostKey, record] of Object.entries(registry.hosts)) {
+        if (skipStartupRecord(record, 1_000)) continue
+        const pendingOAuth = await this.hasPendingOAuthHost(hostKey)
+        if (skipStartupRecord(record)) continue
         const leases = normalizePersistentHostLeases(record.leases)
         let droppedStaleLeaseCount = 0
         const dropStaleLeases = (
           staleAgeMs: number | null | undefined,
           predicate: (lease: PersistentHostLeaseRecord) => boolean,
         ): number => {
-          if (force || typeof staleAgeMs !== 'number' || staleAgeMs <= 0) {
+          if (pendingOAuth || force || typeof staleAgeMs !== 'number' || staleAgeMs <= 0) {
             return 0
           }
           let dropped = 0
@@ -2080,10 +2833,12 @@ export class OpenCodeHostManager {
         droppedStaleLeaseCount = preflightDropped + genericDropped
 
         if (droppedStaleLeaseCount > 0) {
+          // Age-based reconciliation is not an explicit release by the owner.
+          delete record.cursorAgentReapContractVersion
           registry.hosts[hostKey] = {
             ...record,
             leases,
-            updatedAt: this.nowIso(),
+            updatedAt: budget ? record.updatedAt : this.nowIso(),
           }
           record.leases = leases
           changed = true
@@ -2096,6 +2851,7 @@ export class OpenCodeHostManager {
         const normalizedRecordProjectPath = normalizedProjectPathFilter
           ? await normalizeProjectPathForComparison(record.projectPath)
           : null
+        if (skipStartupRecord(record)) continue
         if (
           normalizedProjectPathFilter
           && normalizedRecordProjectPath !== normalizedProjectPathFilter
@@ -2112,169 +2868,223 @@ export class OpenCodeHostManager {
           continue
         }
 
-        if (!this.isProcessAlive(record.pid)) {
-          delete registry.hosts[hostKey]
-          cleaned += 1
-          changed = true
-          await this.cleanupOpenTuiTempArtifactsIfUnused(
-            this.getPersistentProfileTmpPath(record.profileRootKey),
-            record.pid,
-          )
-          hosts.push({
-            hostKey,
-            projectPath: record.projectPath,
-            pid: record.pid,
-            port: record.port,
-            action: 'removed_dead',
-            reason: 'registered host process is not alive',
-            leaseCount,
-          })
-          continue
-        }
-
-        const processIdentity = await this.inspectPersistentHostProcessIdentity(record)
-        if (processIdentity.state === 'gone' || processIdentity.state === 'changed') {
-          delete registry.hosts[hostKey]
-          cleaned += 1
-          changed = true
-          await this.cleanupOpenTuiTempArtifactsIfUnused(
-            this.getPersistentProfileTmpPath(record.profileRootKey),
-            record.pid,
-          )
-          hosts.push({
-            hostKey,
-            projectPath: record.projectPath,
-            pid: record.pid,
-            port: record.port,
-            action: 'removed_dead',
-            reason: processIdentity.state === 'changed'
-              ? 'registered pid was reused by a different process'
-              : 'registered host process exited during identity verification',
-            leaseCount,
-          })
-          continue
-        }
-        if (processIdentity.state === 'unverified') {
-          const health = await this.checkHealthyHostOnce(record.baseUrl)
-          if (!health) {
-            const reason =
-              `OpenCode host pid ${record.pid} is unhealthy and its legacy identity ` +
-              'could not be verified'
-            diagnostics.push(`Failed to verify OpenCode host ${hostKey}: ${reason}`)
-            hosts.push({
-              hostKey,
-              projectPath: record.projectPath,
-              pid: record.pid,
-              port: record.port,
-              action: 'failed',
-              reason,
-              leaseCount,
-            })
-            continue
-          }
-          try {
-            const processStartedAtMs = await this.verifyLegacyPersistentHostIdentity(
-              record,
-              processIdentity.startedAtMs,
-            )
-            record.processStartedAtMs = processStartedAtMs
-            registry.hosts[hostKey] = record
-            changed = true
-            diagnostics.push(`Upgraded legacy OpenCode host process identity for ${hostKey}`)
-          } catch (error) {
-            const reason = error instanceof Error ? error.message : String(error)
-            diagnostics.push(`Failed to verify OpenCode host ${hostKey}: ${reason}`)
-            hosts.push({
-              hostKey,
-              projectPath: record.projectPath,
-              pid: record.pid,
-              port: record.port,
-              action: 'failed',
-              reason,
-              leaseCount,
-            })
-            continue
-          }
-        }
-
-        if (!force && entry && entry.refCount > 0) {
+        const releaseStartupLock = await this.tryAcquirePersistentHostStartupLock(hostKey)
+        if (!releaseStartupLock) {
           hosts.push({
             hostKey,
             projectPath: record.projectPath,
             pid: record.pid,
             port: record.port,
             action: 'kept_active',
-            reason: `host has active in-process refCount=${entry.refCount}`,
+            reason: 'host startup or adoption is in progress',
             leaseCount,
           })
           continue
         }
 
-        if (!force && leaseCount > 0) {
-          hosts.push({
-            hostKey,
-            projectPath: record.projectPath,
-            pid: record.pid,
-            port: record.port,
-            action: 'kept_leased',
-            reason: `host has ${leaseCount} active lease${leaseCount === 1 ? '' : 's'}`,
-            leaseCount,
-          })
-          continue
-        }
-
-        if (
-          !force &&
-          droppedStaleLeaseCount === 0 &&
-          typeof options.staleAgeMs === 'number' &&
-          options.staleAgeMs > 0
-        ) {
-          const updatedAtMs = Date.parse(record.updatedAt)
-          const ageMs = Number.isFinite(updatedAtMs)
-            ? nowMs - updatedAtMs
-            : Number.POSITIVE_INFINITY
-          if (ageMs < options.staleAgeMs) {
+        try {
+          if (skipStartupRecord(record)) continue
+          if (pendingOAuth) {
+            // Retention is evidence lifetime, never a liveness assertion or a
+            // veto of an explicit Stop. The normal identity-checked terminator
+            // still refuses a reused/unverified PID; keep the original record
+            // and leases even after a successful force stop.
+            let reason = 'pending OAuth publication retains exact owner evidence; liveness not asserted'
+            if (force) {
+              try {
+                await this.terminatePersistentHostRecord(record, { force: true, startupBudget: budget })
+                reason = 'owned process stopped; pending OAuth publication retains exact owner evidence'
+              } catch (error) {
+                const message = error instanceof Error ? error.message : String(error)
+                diagnostics.push(`Failed to stop pending OpenCode host ${hostKey}: ${message}`)
+                hosts.push({ hostKey, projectPath: record.projectPath, pid: record.pid, port: record.port,
+                  action: 'failed', reason: message, leaseCount })
+                continue
+              }
+            }
+            hosts.push({ hostKey, projectPath: record.projectPath, pid: record.pid, port: record.port,
+              action: 'kept_pending_oauth', reason, leaseCount })
+            continue
+          }
+          if (!this.isProcessAlive(record.pid)) {
+            delete registry.hosts[hostKey]
+            await this.retireHostAttributionRecords(record.attributionId)
+            cleaned += 1
+            changed = true
+            if (!budget) await this.cleanupOpenTuiTempArtifactsIfUnused(
+              this.getPersistentProfileTmpPath(record.profileRootKey),
+              record.pid,
+            )
             hosts.push({
               hostKey,
               projectPath: record.projectPath,
               pid: record.pid,
               port: record.port,
-              action: 'kept_recent',
-              reason: `host updated ${Math.max(0, ageMs)}ms ago`,
+              action: 'removed_dead',
+              reason: 'registered host process is not alive',
               leaseCount,
             })
             continue
           }
-        }
 
-        try {
-          await this.terminatePersistentHostRecord(record, { force })
-          delete registry.hosts[hostKey]
-          cleaned += 1
-          changed = true
-          hosts.push({
-            hostKey,
-            projectPath: record.projectPath,
-            pid: record.pid,
-            port: record.port,
-            action: 'disposed',
-            reason: force
-              ? `force cleanup during ${options.reason ?? 'manual'}`
-              : `stale host has no active leases during ${options.reason ?? 'manual'}`,
-            leaseCount,
-          })
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error)
-          diagnostics.push(`Failed to dispose OpenCode host ${hostKey}: ${message}`)
-          hosts.push({
-            hostKey,
-            projectPath: record.projectPath,
-            pid: record.pid,
-            port: record.port,
-            action: 'failed',
-            reason: message,
-            leaseCount,
-          })
+          const processIdentity = await this.inspectPersistentHostProcessIdentity(record, budget)
+          if (skipStartupRecord(record)) continue
+          if (processIdentity.state === 'gone' || processIdentity.state === 'changed') {
+            delete registry.hosts[hostKey]
+            await this.retireHostAttributionRecords(record.attributionId)
+            cleaned += 1
+            changed = true
+            if (!budget) await this.cleanupOpenTuiTempArtifactsIfUnused(
+              this.getPersistentProfileTmpPath(record.profileRootKey),
+              record.pid,
+            )
+            hosts.push({
+              hostKey,
+              projectPath: record.projectPath,
+              pid: record.pid,
+              port: record.port,
+              action: 'removed_dead',
+              reason: processIdentity.state === 'changed'
+                ? 'registered pid was reused by a different process'
+                : 'registered host process exited during identity verification',
+              leaseCount,
+            })
+            continue
+          }
+          if (processIdentity.state === 'unverified') {
+            const health = await this.checkHealthyHostOnce(record.baseUrl, budget)
+            if (!health) {
+              const reason =
+                `OpenCode host pid ${record.pid} is unhealthy and its legacy identity ` +
+                'could not be verified'
+              diagnostics.push(`Failed to verify OpenCode host ${hostKey}: ${reason}`)
+              hosts.push({
+                hostKey,
+                projectPath: record.projectPath,
+                pid: record.pid,
+                port: record.port,
+                action: 'failed',
+                reason,
+                leaseCount,
+              })
+              continue
+            }
+            try {
+              const processStartedAtMs = await this.verifyLegacyPersistentHostIdentity(
+                record,
+                processIdentity.startedAtMs,
+                budget,
+              )
+              if (skipStartupRecord(record)) continue
+              record.processStartedAtMs = processStartedAtMs
+              registry.hosts[hostKey] = record
+              changed = true
+              diagnostics.push(`Upgraded legacy OpenCode host process identity for ${hostKey}`)
+            } catch (error) {
+              const reason = error instanceof Error ? error.message : String(error)
+              diagnostics.push(`Failed to verify OpenCode host ${hostKey}: ${reason}`)
+              hosts.push({
+                hostKey,
+                projectPath: record.projectPath,
+                pid: record.pid,
+                port: record.port,
+                action: 'failed',
+                reason,
+                leaseCount,
+              })
+              continue
+            }
+          }
+
+          if (!force && entry && entry.refCount > 0) {
+            hosts.push({
+              hostKey,
+              projectPath: record.projectPath,
+              pid: record.pid,
+              port: record.port,
+              action: 'kept_active',
+              reason: `host has active in-process refCount=${entry.refCount}`,
+              leaseCount,
+            })
+            continue
+          }
+
+          if (!force && leaseCount > 0) {
+            hosts.push({
+              hostKey,
+              projectPath: record.projectPath,
+              pid: record.pid,
+              port: record.port,
+              action: 'kept_leased',
+              reason: `host has ${leaseCount} active lease${leaseCount === 1 ? '' : 's'}`,
+              leaseCount,
+            })
+            continue
+          }
+
+          if (
+            !force &&
+            droppedStaleLeaseCount === 0 &&
+            typeof options.staleAgeMs === 'number' &&
+            options.staleAgeMs > 0
+          ) {
+            const updatedAtMs = Date.parse(record.updatedAt)
+            const ageMs = Number.isFinite(updatedAtMs)
+              ? nowMs - updatedAtMs
+              : Number.POSITIVE_INFINITY
+            if (ageMs < options.staleAgeMs) {
+              hosts.push({
+                hostKey,
+                projectPath: record.projectPath,
+                pid: record.pid,
+                port: record.port,
+                action: 'kept_recent',
+                reason: `host updated ${Math.max(0, ageMs)}ms ago`,
+                leaseCount,
+              })
+              continue
+            }
+          }
+
+          try {
+            await this.terminatePersistentHostRecord(record, { force, startupBudget: budget })
+            delete registry.hosts[hostKey]
+            await this.retireHostAttributionRecords(record.attributionId)
+            cleaned += 1
+            changed = true
+            hosts.push({
+              hostKey,
+              projectPath: record.projectPath,
+              pid: record.pid,
+              port: record.port,
+              action: 'disposed',
+              reason: force
+                ? `force cleanup during ${options.reason ?? 'manual'}`
+                : `stale host has no active leases during ${options.reason ?? 'manual'}`,
+              leaseCount,
+            })
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error)
+            diagnostics.push(`Failed to dispose OpenCode host ${hostKey}: ${message}`)
+            hosts.push({
+              hostKey,
+              projectPath: record.projectPath,
+              pid: record.pid,
+              port: record.port,
+              action: 'failed',
+              reason: message,
+              leaseCount,
+            })
+          }
+        } finally {
+          const pending = budget && pendingStartupTaskkill(record.pid)
+          if (pending) {
+            const release = pending.then(() => releaseStartupLock()).catch(() => undefined)
+            this.startupLockReleases.add(release)
+            void release.then(() => this.startupLockReleases.delete(release))
+          } else {
+            await releaseStartupLock().catch(() => undefined)
+          }
         }
       }
 
@@ -2286,7 +3096,7 @@ export class OpenCodeHostManager {
         }
       }
 
-      if (options.reason === 'startup') {
+      if (options.reason === 'startup' && !budget) {
         const activeProfileRootKeys = new Set(
           Object.values(registry.hosts)
             .filter(record => this.isProcessAlive(record.pid))
@@ -2307,6 +3117,30 @@ export class OpenCodeHostManager {
             `Removed ${tempCleanup.removed} stale OpenCode profile temp dylib(s) (${tempCleanup.bytes} bytes)`,
           )
         }
+
+        const attributionDirectory = this.processAttributionDirectory
+        if (attributionDirectory) {
+          // A crashed or SIGKILLed process leaves its record behind. It is
+          // identity, never liveness, so the runtime reaps what it wrote.
+          const pruned = await pruneStaleAttributionRecords(attributionDirectory, {
+            now: () => this.nowMs(),
+            isProcessAlive: pid => this.isProcessAlive(pid),
+            readProcessStartTimeMs: pid => this.readProcessStartTimeMs(pid),
+          }).catch(error => {
+            diagnostics.push(
+              `Failed to prune OpenCode process attribution records: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            )
+            return null
+          })
+          if (pruned && (pruned.prunedHosts > 0 || pruned.prunedAgents > 0 || pruned.prunedCorrupt > 0)) {
+            diagnostics.push(
+              `Pruned OpenCode process attribution records (hosts=${pruned.prunedHosts}, `
+              + `agents=${pruned.prunedAgents}, corrupt=${pruned.prunedCorrupt})`,
+            )
+          }
+        }
       }
 
       return {
@@ -2314,6 +3148,13 @@ export class OpenCodeHostManager {
         remaining: Object.keys(registry.hosts).length,
         hosts,
         diagnostics,
+        ...(budget ? { startupCleanup: {
+          completion: pendingStartupTaskkillPids().length > 0
+            ? 'unknown' as const : 'drained' as const,
+          coverage: hosts.some(host => host.action === 'failed' || host.action === 'kept_active')
+            ? 'partial' as const : 'complete' as const,
+          survivingPids: [...new Set([...Object.values(registry.hosts).map(record => record.pid), ...pendingStartupTaskkillPids()])],
+        } } : {}),
       }
     })
   }
@@ -2347,4 +3188,9 @@ export class OpenCodeHostManager {
   }
 }
 
-export const openCodeHostManager = new OpenCodeHostManager()
+export const openCodeHostManager = new OpenCodeHostManager({
+  // The bridge advertises this same resolution to the app in its runtime
+  // precondition snapshot; resolving it once here keeps the directory the
+  // runtime writes to and the directory the app reads identical.
+  processAttributionDirectory: resolveProcessAttributionDirectory(),
+})

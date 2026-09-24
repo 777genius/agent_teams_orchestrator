@@ -45,6 +45,7 @@ const defaultGatewayModels: Record<string, unknown>[] = [
 
 function createAnthropicCompatibleServer(
   models: Record<string, unknown>[] = defaultGatewayModels,
+  status = 200,
 ): {
   baseUrl: string
   requests: CapturedRequest[]
@@ -65,6 +66,10 @@ function createAnthropicCompatibleServer(
 
       if (url.pathname !== '/v1/models') {
         return new Response('not found', { status: 404 })
+      }
+
+      if (status !== 200) {
+        return new Response('model listing failed', { status })
       }
 
       return Response.json({
@@ -139,6 +144,13 @@ describe('Anthropic-compatible runtime integration', () => {
 
     try {
       await withAnthropicCompatibleEnv(server.baseUrl, async () => {
+        const summary = await getUnifiedRuntimeStatusPayload(
+          'anthropic', undefined, { detailLevel: 'summary' },
+        )
+        expect(summary.providers.anthropic?.verificationState).toBe('unknown')
+        expect(summary.providers.anthropic?.statusCheckOutcome).toBe('authoritative')
+        expect(server.requests).toHaveLength(0)
+
         const modelList = await getProviderModels('anthropic')
         expect(modelList.defaultModel).toBe('qwen3.6')
         expect(modelList.models).toEqual([
@@ -157,6 +169,7 @@ describe('Anthropic-compatible runtime integration', () => {
         const anthropic = statusPayload.providers.anthropic
         expect(rateLimitRefreshCalls).toBe(0)
         expect(anthropic?.authenticated).toBe(true)
+        expect(anthropic?.verificationState).toBe('verified')
         expect(anthropic?.authMethod).toBe('ollama_token')
         expect(anthropic?.selectedBackendId).toBe('ollama')
         expect(anthropic?.resolvedBackendId).toBe('ollama')
@@ -184,6 +197,72 @@ describe('Anthropic-compatible runtime integration', () => {
             request.customHeader === 'yes',
         ),
       ).toBe(true)
+    } finally {
+      server.stop()
+    }
+  })
+
+  test('verifies a generic Anthropic-compatible backend after model discovery', async () => {
+    const server = createAnthropicCompatibleServer()
+
+    try {
+      await withAnthropicCompatibleEnv(server.baseUrl, async () => {
+        process.env.ANTHROPIC_AUTH_TOKEN = 'gateway-test-token'
+        const payload = await getUnifiedRuntimeStatusPayload('anthropic')
+        expect(payload.providers.anthropic?.selectedBackendId).toBe('anthropic-compatible')
+        expect(payload.providers.anthropic?.verificationState).toBe('verified')
+      })
+      expect(server.requests.map(request => request.path)).toEqual(['/v1/models'])
+    } finally {
+      server.stop()
+    }
+  })
+
+  test.each([
+    ['unauthorized', 401, defaultGatewayModels],
+    ['missing endpoint', 404, defaultGatewayModels],
+    ['empty catalog', 200, []],
+  ] as const)(
+    'does not verify a compatible backend with %s',
+    async (_case, status, models) => {
+      const server = createAnthropicCompatibleServer([...models], status)
+
+      try {
+        await withAnthropicCompatibleEnv(server.baseUrl, async () => {
+          const payload = await getUnifiedRuntimeStatusPayload('anthropic')
+          expect(payload.providers.anthropic?.verificationState).toBe('unknown')
+        })
+        expect(server.requests.length).toBeGreaterThan(0)
+        expect(server.requests.every(request => request.path === '/v1/models')).toBe(true)
+      } finally {
+        server.stop()
+      }
+    },
+  )
+
+  test('does not verify a compatible backend when model discovery cannot connect', async () => {
+    const server = createAnthropicCompatibleServer()
+    const baseUrl = server.baseUrl
+    server.stop()
+
+    await withAnthropicCompatibleEnv(baseUrl, async () => {
+      const payload = await getUnifiedRuntimeStatusPayload('anthropic')
+      expect(payload.providers.anthropic?.verificationState).toBe('unknown')
+    })
+  })
+
+  test('does not verify a compatible backend without configured auth', async () => {
+    const server = createAnthropicCompatibleServer()
+
+    try {
+      await withAnthropicCompatibleEnv(server.baseUrl, async () => {
+        delete process.env.ANTHROPIC_AUTH_TOKEN
+        delete process.env.ANTHROPIC_CUSTOM_HEADERS
+        const payload = await getUnifiedRuntimeStatusPayload('anthropic')
+        expect(payload.providers.anthropic?.authenticated).toBe(false)
+        expect(payload.providers.anthropic?.modelCatalog?.status).toBe('ready')
+        expect(payload.providers.anthropic?.verificationState).toBe('unknown')
+      })
     } finally {
       server.stop()
     }

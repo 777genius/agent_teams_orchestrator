@@ -40,6 +40,11 @@ import {
 import { runCodexNativeAppServer } from './appServerRunner.js'
 import { buildCodexNativeCustomProviderConfigOverrides } from './customProviderConfigOverrides.js'
 import { buildCodexNativeLaunchConfigOverrides } from './launchConfigOverrides.js'
+import {
+  buildCodexNativeUserLoopbackProviderConfigOverrides,
+  resolveCodexNativeUserLoopbackLaunchConfig,
+  type CodexNativeUserLoopbackLaunchConfig,
+} from './userLoopbackProviderConfigOverrides.js'
 import { buildCodexNativeMcpConfigOverrides } from './mcpConfigBridge.js'
 import { buildCodexNativeWorkspaceTrustConfigOverrides } from './workspaceTrustConfigOverrides.js'
 import {
@@ -49,6 +54,11 @@ import {
   type CodexNativeTurnSettledEmitterPort,
   type CodexNativeTurnSettledOutcome,
 } from './runtimeTurnSettledEmitter.js'
+import {
+  isWorkSyncTurnSettledOwnerGateBound,
+  stageWorkSyncTurnSettledEvent,
+} from '../../utils/workSyncTurnSettledOwnerGate.js'
+import { readWorkSyncActiveQueryIdentity } from '../../utils/workSyncActiveQueryIdentity.js'
 import {
   createCodexNativeExecutionSummaryMessage,
   createCodexNativeThreadStatusMessage,
@@ -96,6 +106,30 @@ type ExecuteCodexNativeTurnDeps = {
   recordTranscript?: typeof recordTranscript
   flushSessionStorage?: typeof flushSessionStorage
   runtimeTurnSettledEmitter?: CodexNativeTurnSettledEmitterPort
+  buildUserLoopbackProviderConfigOverrides?: typeof buildCodexNativeUserLoopbackProviderConfigOverrides
+  resolveUserLoopbackLaunchConfig?: typeof resolveCodexNativeUserLoopbackLaunchConfig
+}
+
+const EMPTY_LOOPBACK_LAUNCH_CONFIG: CodexNativeUserLoopbackLaunchConfig = {
+  configOverrides: [],
+  secretEnv: {},
+  overlayToml: null,
+}
+
+function resolveLoopbackLaunchConfig(
+  deps: ExecuteCodexNativeTurnDeps,
+): CodexNativeUserLoopbackLaunchConfig {
+  if (deps.resolveUserLoopbackLaunchConfig) {
+    return deps.resolveUserLoopbackLaunchConfig()
+  }
+  if (deps.buildUserLoopbackProviderConfigOverrides) {
+    return {
+      configOverrides: deps.buildUserLoopbackProviderConfigOverrides(),
+      secretEnv: {},
+      overlayToml: null,
+    }
+  }
+  return resolveCodexNativeUserLoopbackLaunchConfig()
 }
 
 const DEFAULT_CODEX_NATIVE_MAILBOX_IDLE_TIMEOUT_MS = 900_000
@@ -508,6 +542,8 @@ export async function* executeCodexNativeTurn(
   const recordTranscriptImpl = deps.recordTranscript ?? recordTranscript
   const flushSessionStorageImpl =
     deps.flushSessionStorage ?? flushSessionStorage
+  const capturedQueryIdentity = readWorkSyncActiveQueryIdentity()
+  let capturedTurnId: string | null = null
   const emitRuntimeTurnSettled = async (input: {
     outcome: CodexNativeTurnSettledOutcome
     threadId?: string | null
@@ -517,10 +553,17 @@ export async function* executeCodexNativeTurn(
       cwd: params.cwd,
       outcome: input.outcome,
       threadId: input.threadId,
+      turnId: capturedTurnId,
+      runtimeInstanceId: capturedQueryIdentity?.runtimeInstanceId,
+      completedGeneration: capturedQueryIdentity?.completedGeneration,
       detail: input.detail,
       identity: resolveTurnSettledIdentityFromAppState(params.initialAppState),
     })
     if (!event) {
+      return
+    }
+    if (isWorkSyncTurnSettledOwnerGateBound()) {
+      stageWorkSyncTurnSettledEvent(event)
       return
     }
     await emitCodexNativeTurnSettledBestEffort(
@@ -600,6 +643,11 @@ export async function* executeCodexNativeTurn(
     const launchPolicy = resolveCodexNativeApprovalLaunchPolicy(
       params.permissionMode,
     )
+    const customProviderConfigOverrides = buildCodexNativeCustomProviderConfigOverrides()
+    const loopbackLaunch =
+      customProviderConfigOverrides.length === 0
+        ? resolveLoopbackLaunchConfig(deps)
+        : EMPTY_LOOPBACK_LAUNCH_CONFIG
     const commonOptions = {
       prompt: resolvedPrompt.text,
       imagePaths: resolvedPrompt.imagePaths,
@@ -612,8 +660,10 @@ export async function* executeCodexNativeTurn(
       ephemeral: shouldUseEphemeralCodexNativeThread(),
       apiKey,
       forcedLoginMethod,
+      extraEnv: loopbackLaunch.secretEnv,
       configOverrides: [
-        ...buildCodexNativeCustomProviderConfigOverrides(),
+        ...customProviderConfigOverrides,
+        ...loopbackLaunch.configOverrides,
         ...buildCodexNativeMcpConfigOverrides({
           strictMcpConfig: getStrictMcpConfig(),
         }),
@@ -632,6 +682,7 @@ export async function* executeCodexNativeTurn(
       launchPolicy.transport === 'app-server'
         ? runAppServer({
             ...commonOptions,
+            loopbackOverlayToml: loopbackLaunch.overlayToml,
             requestApproval:
               params.requestApproval ??
               (async () => {
@@ -664,6 +715,14 @@ export async function* executeCodexNativeTurn(
       }
 
       const projection = projector.apply(next.value.event)
+      if (
+        (next.value.event.type === 'turn_started' ||
+          next.value.event.type === 'turn_completed') &&
+        next.value.event.turnId &&
+        !capturedTurnId
+      ) {
+        capturedTurnId = next.value.event.turnId
+      }
 
       for (const message of projection.appendedMessages) {
         await appendProjectedMessage({
