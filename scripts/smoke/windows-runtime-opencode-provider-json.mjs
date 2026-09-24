@@ -189,7 +189,7 @@ export function runProviderSmoke(runtimeBinary, report, flush, { spawn = spawnSy
         command: 'opencode.readiness',
         cwd: projectPath,
         startedAt: new Date().toISOString(),
-        timeoutMs: 45_000,
+        timeoutMs: 90_000,
         body: {
           projectPath,
           selectedModel: 'opencode/big-pickle',
@@ -199,9 +199,9 @@ export function runProviderSmoke(runtimeBinary, report, flush, { spawn = spawnSy
       'utf8',
     );
 
-    // Host startup on a cold Windows runner can exceed the harness default.
+    // Host startup and MCP attach on a cold Windows runner can exceed 45 seconds.
     check('readiness-stdout', ['runtime', 'opencode-command', '--json', '--input', readinessInputPath],
-      assertReadinessHost, undefined, 90_000);
+      assertReadinessHost, undefined, 120_000);
   } catch (error) { report.error = error.stack || String(error); }
   finally {
     try {
