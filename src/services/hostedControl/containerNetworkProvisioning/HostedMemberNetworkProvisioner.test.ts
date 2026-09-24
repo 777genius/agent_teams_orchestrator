@@ -3,7 +3,7 @@ import { mkdtemp, chmod, mkdir, readFile, readdir, realpath, rename, rm, symlink
 import os from 'node:os'
 import path from 'node:path'
 
-import { HostedMemberNetworkProvisioner, type HostedMemberNetworkDockerPort,
+import { HostedMemberNetworkProvisioner, isExactDockerNetworkNotFound, type HostedMemberNetworkDockerPort,
   type HostedMemberNetworkRequest } from './HostedMemberNetworkProvisioner.js'
 
 const ID = 'a'.repeat(64)
@@ -77,6 +77,19 @@ async function fixture(admit = async () => true,
 }
 
 describe('HostedMemberNetworkProvisioner', () => {
+  test('Docker 29 exact missing-network stderr is absence only for the inspected ID or name', () => {
+    const otherId = 'c'.repeat(64)
+    const name = `hat-member-${'d'.repeat(32)}`
+    expect(isExactDockerNetworkNotFound(`Error response from daemon: network ${ID} not found\n`, ID)).toBe(true)
+    expect(isExactDockerNetworkNotFound(`network ${name} not found`, name)).toBe(true)
+    expect(isExactDockerNetworkNotFound(`Error: No such network: ${ID}`, ID)).toBe(true)
+    expect(isExactDockerNetworkNotFound(`Error response from daemon: network ${otherId} not found`, ID)).toBe(false)
+    expect(isExactDockerNetworkNotFound(`Error response from daemon: network ${ID} not found\npermission denied`, ID))
+      .toBe(false)
+    expect(isExactDockerNetworkNotFound(`Error response from daemon: network ${ID} has active endpoints`, ID))
+      .toBe(false)
+  })
+
   test('issues an exact Docker ID for a fresh internal IPv4 network', async () => {
     const f = await fixture()
     expect(await f.provisioner.provision(REQUEST)).toBe(ID)

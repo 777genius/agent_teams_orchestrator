@@ -29,6 +29,16 @@ export interface HostedMemberNetworkDockerPort {
   remove(id: string): Promise<void>
 }
 
+/** Docker 29 reports an absent network differently from earlier Docker CLI versions. */
+export function isExactDockerNetworkNotFound(stderr: string, reference: string): boolean {
+  if (!NETWORK_ID.test(reference) && !/^hat-member-[0-9a-f]{32}$/.test(reference)) return false
+  const message = stderr.trim()
+  return message === `Error: No such network: ${reference}` ||
+    message === `Error response from daemon: network ${reference} not found` ||
+    message === `Error: network ${reference} not found` ||
+    message === `network ${reference} not found`
+}
+
 /** Root-only Docker surface. Owner supplies no Docker arguments, names, or labels. */
 class DockerCliNetworkPort implements HostedMemberNetworkDockerPort {
   private run(...args: string[]): Promise<string | null> {
@@ -38,8 +48,8 @@ class DockerCliNetworkPort implements HostedMemberNetworkDockerPort {
         env: { PATH: '/usr/bin:/bin', HOME: '/root', DOCKER_HOST: 'unix:///var/run/docker.sock' },
       }, (error, stdout, stderr) => {
         if (!error) return resolve(stdout.trim())
-        if (args[0] === 'network' && args[1] === 'inspect' &&
-          /no such network:/i.test(String(stderr).slice(-300))) return resolve(null)
+        if (args[0] === 'network' && args[1] === 'inspect' && error.code === 1 && !error.killed &&
+          isExactDockerNetworkNotFound(String(stderr), args[4] ?? '')) return resolve(null)
         reject(new Error('hosted-network-docker-command-failed'))
       })
     })
