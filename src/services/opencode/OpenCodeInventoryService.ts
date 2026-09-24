@@ -14,6 +14,7 @@ import {
 import { canonicalizeOpenCodeProviderId } from './OpenCodeProviderIdentity.js'
 import { readOpenCodeAuthProviderSummaries } from './OpenCodeAuthStore.js'
 import { resolveOpenCodeBinaryPath } from './OpenCodeBinaryResolver.js'
+import { assertHostedOfficialOpenCodeArtifact } from './OpenCodeHostedOfficialArtifact.js'
 import {
   getOpenCodeManagedSubscriptionPluginPackages,
   isOpenCodeCuratedSubscriptionProviderId,
@@ -402,6 +403,7 @@ export function execOpenCodePortableCommand(input: {
     input.abortSignal?.addEventListener('abort', abort, { once: true })
 
     try {
+      assertHostedOfficialOpenCodeArtifact(input.binaryPath)
       child = spawnPortableCli(input.binaryPath, input.args, {
         cwd: input.profile.projectPath,
         env: input.profile.env,

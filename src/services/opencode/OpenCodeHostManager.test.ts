@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events'
 import type { ChildProcess } from 'node:child_process'
-import { access, mkdir, mkdtemp, readFile, readdir, rm, symlink, utimes, writeFile } from 'node:fs/promises'
+import { access, chmod, mkdir, mkdtemp, readFile, readdir, rm, symlink, utimes, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { PassThrough } from 'node:stream'
@@ -56,6 +56,36 @@ const baseProfile: OpenCodePreparedProfile = {
   managedAuthFingerprint: 'managed-auth',
   authState: 'ok',
   env: {},
+}
+
+if (process.platform === 'linux') {
+  test('hosted official mode rejects an unpinned artifact before profile preparation or spawn', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'hosted-official-opencode-'))
+    const binaryPath = path.join(root, 'opencode')
+    const priorMode = process.env.HOSTED_OPENCODE_RUNTIME_MODE
+    const priorPath = process.env.HOSTED_OPENCODE_BIN_PATH
+    try {
+      await writeFile(binaryPath, '#!/bin/sh\nexit 0\n')
+      await chmod(binaryPath, 0o755)
+      process.env.HOSTED_OPENCODE_RUNTIME_MODE = 'official-v1.18.32'
+      process.env.HOSTED_OPENCODE_BIN_PATH = binaryPath
+      let prepared = false
+      const manager = new OpenCodeHostManager({
+        persistentRegistryPath: null,
+        prepareProfile: async () => { prepared = true; return baseProfile },
+      })
+      await expect(manager.ensureHost({ projectPath: root })).rejects.toThrow(
+        'does not match v1.18.32 linux-x64 SHA-256',
+      )
+      expect(prepared).toBe(false)
+    } finally {
+      if (priorMode === undefined) delete process.env.HOSTED_OPENCODE_RUNTIME_MODE
+      else process.env.HOSTED_OPENCODE_RUNTIME_MODE = priorMode
+      if (priorPath === undefined) delete process.env.HOSTED_OPENCODE_BIN_PATH
+      else process.env.HOSTED_OPENCODE_BIN_PATH = priorPath
+      await rm(root, { recursive: true, force: true })
+    }
+  })
 }
 
 test('final selected effect check rejects config drift after initial authority', () => {

@@ -30,6 +30,7 @@ import { resolveDirectWindowsLauncher, spawnPortableCli } from '../../utils/port
 import { OPEN_CODE_MANAGED_HOST_CONFIG_GENERATION, buildOpenCodeHostTransportIdentity, resolveOpenCodeBinaryHostIdentity } from './OpenCodeHostIdentity.js'
 export { resolveOpenCodeBinaryHostIdentity } from './OpenCodeHostIdentity.js'
 import { resolveOpenCodeBinaryPath } from './OpenCodeBinaryResolver.js'
+import { assertHostedOfficialOpenCodeArtifact } from './OpenCodeHostedOfficialArtifact.js'
 import { buildOpenCodeLaunchProviderContract } from './OpenCodeLaunchProviderContract.js'
 import { buildExpectedOpenCodeAgentPolicies, assertOpenCodeEffectiveAgentPolicies } from './OpenCodeEffectiveAgentPolicyContract.js'
 import { OPEN_CODE_APP_MCP_SERVER_NAME } from './OpenCodeMcpManager.js'
@@ -669,6 +670,21 @@ export class OpenCodeHostManager {
   private installedArtifact: { binaryPath: string; digest: OpenCodeArtifactDigest | null } | null = null
 
   constructor(private readonly deps: OpenCodeHostManagerDeps = {}) {}
+
+  private assertHostedOfficialArtifact(binaryPath: string | null): OpenCodeArtifactDigest | null {
+    const digest = assertHostedOfficialOpenCodeArtifact(binaryPath)
+    if (digest && this.deps.spawnHostProcess) {
+      throw new Error('Hosted official OpenCode requires the production host launcher')
+    }
+    return digest
+  }
+
+  private assertHostedExecutingArtifact(pid: number, digest: OpenCodeArtifactDigest | null): void {
+    if (process.env.HOSTED_OPENCODE_RUNTIME_MODE === undefined) return
+    if (!digest || resolveExecutingOpenCodeArtifactDigest(pid) !== digest) {
+      throw new Error(`Hosted official OpenCode pid ${pid} does not execute the pinned artifact`)
+    }
+  }
 
   private resolveInstalledArtifact(binaryPath: string | null): OpenCodeArtifactDigest | null {
     if (!binaryPath || this.deps.spawnHostProcess || process.platform !== 'linux') return null
@@ -1779,6 +1795,7 @@ export class OpenCodeHostManager {
       await this.retireStoppedPersistentHost(record, termination)
       return null
     }
+    this.assertHostedExecutingArtifact(record.pid, openCodeArtifactDigest)
     if (processIdentity.state === 'changed') {
       throw new Error(`OpenCode host ${hostKey} process identity changed; retaining recovery state`)
     }
@@ -1819,6 +1836,9 @@ export class OpenCodeHostManager {
       : processIdentity.startedAtMs ?? record.processStartedAtMs
     const executingArtifactMatches = !!openCodeArtifactDigest && process.platform === 'linux' &&
       resolveExecutingOpenCodeArtifactDigest(record.pid) === openCodeArtifactDigest
+    if (process.env.HOSTED_OPENCODE_RUNTIME_MODE !== undefined && !executingArtifactMatches) {
+      throw new Error(`Hosted official OpenCode pid ${record.pid} changed during adoption`)
+    }
 
     const handle: OpenCodeHostHandle = {
       hostKey,
@@ -1965,6 +1985,7 @@ export class OpenCodeHostManager {
       return { child: this.deps.spawnHostProcess(profile, port), processTreeIdentityHint: null }
     }
     const binaryPath = resolveOpenCodeBinaryPath() ?? 'opencode'
+    this.assertHostedOfficialArtifact(binaryPath)
     const launcher = resolveDirectWindowsLauncher(binaryPath)
     if (process.platform === 'win32' && /\.(?:cmd|bat)$/i.test(binaryPath) && !launcher) {
       throw new Error('OpenCode Windows launcher cannot be bound to a named process Job')
@@ -2209,6 +2230,7 @@ export class OpenCodeHostManager {
       }
       if (!openCodeArtifactDigest || this.deps.spawnHostProcess || process.platform !== 'linux' ||
         resolveExecutingOpenCodeArtifactDigest(handle.pid) !== openCodeArtifactDigest) {
+        this.assertHostedExecutingArtifact(handle.pid, openCodeArtifactDigest)
         // Ordinary startup remains available, but only a direct Linux executable
         // whose installed and executed immutable bytes match publishes authority.
         handle.openCodeArtifactDigest = null
@@ -2359,6 +2381,7 @@ export class OpenCodeHostManager {
     hostKey: string,
     profile: OpenCodePreparedProfile,
     abortSignal?: AbortSignal,
+    hostedDigest: OpenCodeArtifactDigest | null = null,
   ): Promise<OpenCodeHostHandle> {
     return this.withPersistentHostStartupLock(hostKey, async () => {
       const cached = this.hosts.get(hostKey)
@@ -2376,6 +2399,7 @@ export class OpenCodeHostManager {
         || (cached && cached.handle.state !== 'healthy')) {
         throw new Error('OpenCode existing host authority is unavailable or changed')
       }
+      this.assertHostedExecutingArtifact(record.pid, hostedDigest)
       const before = await raceOpenCodeAbortSignal(this.inspectPersistentHostProcessIdentity(record), abortSignal)
       if (before.state !== 'confirmed' || before.startedAtMs !== record.processStartedAtMs) {
         throw new Error('OpenCode existing host process identity is unavailable or changed')
@@ -2388,12 +2412,15 @@ export class OpenCodeHostManager {
       const binaryPath = resolveOpenCodeBinaryPath()
       // This path bypasses ordinary adoption. Re-read installed bytes rather
       // than trusting the manager's startup cache, then bind them to /proc/exe.
-      const installedDigest = binaryPath && !this.deps.spawnHostProcess && process.platform === 'linux'
+      const installedDigest = hostedDigest ?? (binaryPath && !this.deps.spawnHostProcess && process.platform === 'linux'
         ? (this.deps.resolveOpenCodeArtifactDigest ?? resolveOpenCodeArtifactDigest)(binaryPath)
-        : null
+        : null)
       const openCodeArtifactDigest = installedDigest &&
         resolveExecutingOpenCodeArtifactDigest(record.pid) === installedDigest
           ? installedDigest : null
+      if (process.env.HOSTED_OPENCODE_RUNTIME_MODE !== undefined && !openCodeArtifactDigest) {
+        throw new Error(`Hosted official OpenCode pid ${record.pid} changed during retention`)
+      }
       if (abortSignal?.aborted) throwOpenCodeAbortReason(abortSignal)
       if (cached) {
         // Another holder may release the entry while the bounded health probe runs.
@@ -2446,6 +2473,9 @@ export class OpenCodeHostManager {
     if (params.abortSignal?.aborted) {
       throwOpenCodeAbortReason(params.abortSignal)
     }
+    const hostedBinaryPath = process.env.HOSTED_OPENCODE_RUNTIME_MODE === undefined
+      ? null : resolveOpenCodeBinaryPath()
+    const hostedDigest = this.assertHostedOfficialArtifact(hostedBinaryPath)
     const profile = params.preparedProfile ?? await raceOpenCodeAbortSignal(
       this.prepareProfile(params.projectPath, {
         ...params.profileOptions,
@@ -2459,11 +2489,11 @@ export class OpenCodeHostManager {
       if (!hostKey || (profile.scopeToken && !hostKey.includes(`::scope:${profile.scopeToken}::`))) {
         throw new Error('OpenCode existing host requires an exact matching scoped host key')
       }
-      return this.retainExistingHost(hostKey, profile, params.abortSignal)
+      return this.retainExistingHost(hostKey, profile, params.abortSignal, hostedDigest)
     }
     const binaryPath = resolveOpenCodeBinaryPath()
     // Custom process factories cannot prove executed binary bytes.
-    const openCodeArtifactDigest = this.resolveInstalledArtifact(binaryPath)
+    const openCodeArtifactDigest = hostedDigest ?? this.resolveInstalledArtifact(binaryPath)
     const preparedBinaryIdentity = profile.env.AGENT_TEAMS_CURSOR_HOST_BINARY_IDENTITY
     const needsBinaryIdentity = Boolean(preparedBinaryIdentity) || !params.hostKey?.trim()
     const binaryHostIdentity = binaryPath && needsBinaryIdentity
@@ -2517,6 +2547,7 @@ export class OpenCodeHostManager {
       this.hosts.delete(hostKey)
     }
     if (existing && existing.handle.state === 'healthy') {
+      this.assertHostedExecutingArtifact(existing.handle.pid, hostedDigest)
       existing.refCount += 1
       if (params.lease) {
         try {
@@ -2538,6 +2569,7 @@ export class OpenCodeHostManager {
         Math.max(this.pendingHostHealthTimeoutMs.get(hostKey) ?? 0, healthTimeoutMs),
       )
       const handle = await raceOpenCodeAbortSignal(pending, params.abortSignal)
+      this.assertHostedExecutingArtifact(handle.pid, hostedDigest)
       const pendingEntry = this.hosts.get(hostKey)
       if (pendingEntry) {
         pendingEntry.refCount += 1

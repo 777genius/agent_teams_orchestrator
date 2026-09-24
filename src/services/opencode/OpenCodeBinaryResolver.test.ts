@@ -11,6 +11,8 @@ describe('OpenCodeBinaryResolver', () => {
   let originalOpenCodePath: string | undefined
   let originalAppData: string | undefined
   let originalWhich: typeof Bun.which
+  let originalHostedMode: string | undefined
+  let originalHostedBinaryPath: string | undefined
 
   beforeEach(async () => {
     tempRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-bin-resolver-'))
@@ -18,6 +20,10 @@ describe('OpenCodeBinaryResolver', () => {
     originalOpenCodePath = process.env.OPENCODE_BIN_PATH
     originalAppData = process.env.APPDATA
     originalWhich = Bun.which
+    originalHostedMode = process.env.HOSTED_OPENCODE_RUNTIME_MODE
+    originalHostedBinaryPath = process.env.HOSTED_OPENCODE_BIN_PATH
+    delete process.env.HOSTED_OPENCODE_RUNTIME_MODE
+    delete process.env.HOSTED_OPENCODE_BIN_PATH
   })
 
   afterEach(async () => {
@@ -37,6 +43,10 @@ describe('OpenCodeBinaryResolver', () => {
       process.env.APPDATA = originalAppData
     }
     Bun.which = originalWhich
+    if (originalHostedMode === undefined) delete process.env.HOSTED_OPENCODE_RUNTIME_MODE
+    else process.env.HOSTED_OPENCODE_RUNTIME_MODE = originalHostedMode
+    if (originalHostedBinaryPath === undefined) delete process.env.HOSTED_OPENCODE_BIN_PATH
+    else process.env.HOSTED_OPENCODE_BIN_PATH = originalHostedBinaryPath
     await rm(tempRoot, { recursive: true, force: true })
   })
 
@@ -91,5 +101,21 @@ describe('OpenCodeBinaryResolver', () => {
     Bun.which = (() => null) as typeof Bun.which
 
     expect(resolveOpenCodeBinaryPath()).toBe(binaryPath)
+  })
+
+  test('hosted mode requires its explicit absolute path without PATH fallback', async () => {
+    const binaryPath = path.join(tempRoot, 'hosted-opencode')
+    await writeFile(binaryPath, 'test fixture')
+    process.env.HOSTED_OPENCODE_RUNTIME_MODE = 'official-v1.18.32'
+    process.env.OPENCODE_BIN_PATH = binaryPath
+    Bun.which = (() => binaryPath) as typeof Bun.which
+
+    expect(() => resolveOpenCodeBinaryPath()).toThrow('HOSTED_OPENCODE_BIN_PATH')
+    process.env.HOSTED_OPENCODE_BIN_PATH = 'relative/opencode'
+    expect(() => resolveOpenCodeBinaryPath()).toThrow('HOSTED_OPENCODE_BIN_PATH')
+    process.env.HOSTED_OPENCODE_BIN_PATH = binaryPath
+    expect(resolveOpenCodeBinaryPath()).toBe(binaryPath)
+    process.env.HOSTED_OPENCODE_RUNTIME_MODE = 'fork-v1.18.32'
+    expect(() => resolveOpenCodeBinaryPath()).toThrow('Unsupported hosted OpenCode runtime mode')
   })
 })

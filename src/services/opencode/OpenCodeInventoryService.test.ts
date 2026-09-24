@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import type { ChildProcess } from 'node:child_process'
-import { access, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
+import { access, chmod, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
@@ -414,6 +414,30 @@ describe('OpenCodeInventoryService parsers', () => {
       })
       expect(result.stderr).toBe('inventory warning')
     } finally {
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('hosted mode rejects an unpinned inventory binary before execution', async () => {
+    const tempDir = await mkdtemp(path.join(tmpdir(), 'opencode-hosted-inventory-'))
+    const binaryPath = path.join(tempDir, 'opencode')
+    const markerPath = path.join(tempDir, 'executed')
+    const previousMode = process.env.HOSTED_OPENCODE_RUNTIME_MODE
+    try {
+      await writeFile(binaryPath, `#!/bin/sh\ntouch '${markerPath}'\n`)
+      await chmod(binaryPath, 0o755)
+      process.env.HOSTED_OPENCODE_RUNTIME_MODE = 'official-v1.18.32'
+      const result = await execOpenCodePortableCommand({
+        binaryPath,
+        args: ['--version'],
+        profile: { projectPath: tempDir, env: process.env } as OpenCodePreparedProfile,
+      })
+      expect(result.code).toBe(1)
+      expect(result.error).toContain('Hosted official OpenCode')
+      await expect(access(markerPath)).rejects.toThrow()
+    } finally {
+      if (previousMode === undefined) delete process.env.HOSTED_OPENCODE_RUNTIME_MODE
+      else process.env.HOSTED_OPENCODE_RUNTIME_MODE = previousMode
       await rm(tempDir, { recursive: true, force: true })
     }
   })

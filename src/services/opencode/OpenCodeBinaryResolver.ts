@@ -17,6 +17,17 @@ function isExecutableCandidate(value: string | null | undefined): value is strin
 }
 
 export function resolveOpenCodeBinaryPath(): string | null {
+  const hostedMode = process.env.HOSTED_OPENCODE_RUNTIME_MODE
+  if (hostedMode !== undefined) {
+    if (hostedMode !== 'official-v1.18.32') {
+      throw new Error(`Unsupported hosted OpenCode runtime mode: ${hostedMode || '<empty>'}`)
+    }
+    const hostedPath = process.env.HOSTED_OPENCODE_BIN_PATH?.trim()
+    if (!hostedPath || !path.isAbsolute(hostedPath) || !isExecutableCandidate(hostedPath)) {
+      throw new Error('Hosted OpenCode requires an existing absolute HOSTED_OPENCODE_BIN_PATH')
+    }
+    return hostedPath
+  }
   const envCandidates = [
     process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH,
     process.env.OPENCODE_BIN_PATH,
