@@ -22,6 +22,15 @@ const authority: HostedControlStableAuthority = {
   mountBinding: { mountGeneration: 1, declaredRootHash: 'a'.repeat(64) },
   teamId: `team_${'b'.repeat(32)}`,
 }
+const publishedTeamIdentity = {
+  schemaVersion: 1,
+  teamId: authority.teamId,
+  createdAt: '2026-09-24T00:00:00.000Z',
+  originDeploymentId: authority.deploymentId,
+}
+const publishedIdentityChecksum = createHash('sha256')
+  .update(`${JSON.stringify(publishedTeamIdentity, null, 2)}\n`)
+  .digest('hex')
 const lifecycleAuthority = {
   actorId: 'actor-a',
   workspaceId: authority.workspaceId,
@@ -33,7 +42,7 @@ const lifecycleAuthority = {
   mountGeneration: authority.mountBinding.mountGeneration,
   ownerEffectFence: {
     grantRevision: '1'.repeat(64),
-    identityChecksum: createHostedLifecycleOwnerIdentityChecksum(ownerBinding, authority),
+    identityChecksum: publishedIdentityChecksum,
   },
 }
 const lifecycleContext = {
@@ -60,6 +69,15 @@ const lifecycleAuthorization = {
 }
 
 describe('HostedControlDispatcher response decoding', () => {
+  test('accepts the Product published canonical TeamIdentity checksum as the signed lifecycle fence', async () => {
+    expect(publishedIdentityChecksum).not.toBe(createHostedLifecycleOwnerIdentityChecksum(ownerBinding, authority))
+    await expect(lifecycleDispatcher({
+      payload: { schemaVersion: 1, kind: 'not_found' }, resourceRevision: null,
+    }).dispatch(signedLifecycleRequest())).resolves.toMatchObject({
+      ownerEffectFence: { identityChecksum: publishedIdentityChecksum },
+    })
+  })
+
   test('accepts exact signed launch-plan admission and rejects extra request or response fields', async () => {
     const planGeneration = `plan-generation_${'a'.repeat(64)}`
     const response = {
@@ -236,14 +254,45 @@ describe('HostedControlDispatcher response decoding', () => {
     }
   })
 
-  test('rejects a signed owner fence whose identity checksum is not the active external owner', async () => {
+  test('rejects a signed identity fence that differs from the lifecycle authority', async () => {
     const request = signedLifecycleRequest()
     const unsigned = { ...request, ownerEffectFence: { ...lifecycleAuthority.ownerEffectFence, identityChecksum: '0'.repeat(64) } }
     delete (unsigned as Record<string, unknown>).ownerProof
     const forged = rawSigned(unsigned)
     await expect(lifecycleDispatcher({
       payload: { schemaVersion: 1, kind: 'not_found' }, resourceRevision: null,
-    }).dispatch(forged)).rejects.toThrow('owner effect identity')
+    }).dispatch(forged)).rejects.toThrow('authority')
+  })
+
+  test('rejects a signed grant revision that differs from the lifecycle authority', async () => {
+    const request = signedLifecycleRequest()
+    const unsigned = { ...request, ownerEffectFence: { ...lifecycleAuthority.ownerEffectFence, grantRevision: '0'.repeat(64) } }
+    delete (unsigned as Record<string, unknown>).ownerProof
+    await expect(lifecycleDispatcher({
+      payload: { schemaVersion: 1, kind: 'not_found' }, resourceRevision: null,
+    }).dispatch(rawSigned(unsigned))).rejects.toThrow('authority')
+  })
+
+  test('rejects a signed lifecycle request after active Owner binding changes', async () => {
+    const dispatcher = new HostedControlDispatcher({
+      secret,
+      authority,
+      getOwnerBinding: () => ({ ...ownerBinding, ownerGeneration: ownerBinding.ownerGeneration + 1 }),
+      lifecycle: { dispatch: async () => ({ payload: { schemaVersion: 1, kind: 'not_found' }, resourceRevision: null }) },
+      messages: { dispatch: async () => ({ schemaVersion: 2, kind: 'not_found' }) },
+    })
+    await expect(dispatcher.dispatch(signedLifecycleRequest())).rejects.toThrow('owner binding')
+  })
+
+  test('rejects a stale identity even when its envelope and authority agree if the proof is stale', async () => {
+    const request = signedLifecycleRequest()
+    const staleFence = { ...lifecycleAuthority.ownerEffectFence, identityChecksum: '0'.repeat(64) }
+    request.ownerEffectFence = staleFence
+    const payload = request.payload as Record<string, unknown>
+    payload.authority = { ...(payload.authority as Record<string, unknown>), ownerEffectFence: staleFence }
+    await expect(lifecycleDispatcher({
+      payload: { schemaVersion: 1, kind: 'not_found' }, resourceRevision: null,
+    }).dispatch(request)).rejects.toThrow('proof')
   })
 
   test('preserves the durable expected revision across execute and replay lookup decisions', async () => {

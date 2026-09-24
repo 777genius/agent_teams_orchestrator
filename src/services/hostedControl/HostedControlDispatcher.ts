@@ -131,10 +131,6 @@ export class HostedControlDispatcher {
       throw new Error('Invalid hosted lifecycle owner binding')
     }
     const ownerEffectFence = decodeOwnerEffectFence(message.ownerEffectFence)
-    const expectedIdentityChecksum = createHostedLifecycleOwnerIdentityChecksum(activeOwner, this.options.authority)
-    if (ownerEffectFence.identityChecksum !== expectedIdentityChecksum) {
-      throw new Error('Invalid hosted lifecycle owner effect identity')
-    }
     const payload = decodeLifecyclePayload(operation, message.payload, this.options.authority, ownerEffectFence)
     const provenance = decodeLifecycleRequestProvenance(
       message.provenance,
