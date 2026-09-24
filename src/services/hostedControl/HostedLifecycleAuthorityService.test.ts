@@ -37,6 +37,7 @@ class MutableProvider implements HostedLifecycleProviderAdapter {
   readonly providerId = 'test-provider'
   executions = 0
   expectedProviderGenerations: string[] = []
+  commandBindings: Array<{ commandId: string; idempotencyKey?: string }> = []
   failAfterEffect = false
   effectSnapshot: HostedLifecycleProviderSnapshot | null = null
   snapshot: HostedLifecycleProviderSnapshot = {
@@ -45,10 +46,13 @@ class MutableProvider implements HostedLifecycleProviderAdapter {
   async inspect() { return { kind: 'owned' as const, snapshot: this.snapshot } }
   async execute(input: {
     action: 'launch' | 'cancel' | 'stop' | 'recover'
+    commandId: string
+    idempotencyKey?: string
     expectedProviderGeneration: string
   }): Promise<HostedLifecycleProviderEffectResult> {
     this.executions += 1
     this.expectedProviderGenerations.push(input.expectedProviderGeneration)
+    this.commandBindings.push({ commandId: input.commandId, idempotencyKey: input.idempotencyKey })
     this.snapshot = this.effectSnapshot ?? (input.action === 'launch'
       ? { ...this.snapshot, providerGeneration: `generation-${this.executions + 1}`, phase: 'running', runId: 'run_test01' }
       : { ...this.snapshot, providerGeneration: `generation-${this.executions + 1}`, phase: 'idle', runId: null })
@@ -246,6 +250,9 @@ describe('HostedLifecycleAuthorityService', () => {
       .resolves.toEqual(replay)
     expect(provider.executions).toBe(1)
     expect(provider.expectedProviderGenerations).toEqual(['generation-1'])
+    expect(provider.commandBindings).toEqual([{
+      commandId: command.commandId, idempotencyKey: command.idempotencyKey,
+    }])
   })
 
   test('keeps the remote execute receipt at the admitted revision while control state advances', async () => {

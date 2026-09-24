@@ -1,10 +1,13 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import type { HostedLifecycleAction } from '../hostedControl/HostedLifecycleSnapshot.js'
-import { DurableTeamLifecycleExecution } from './DurableTeamLifecycleExecution.js'
+import {
+  DurableTeamLifecycleExecution,
+  type TeamLifecycleRunReservation,
+} from './DurableTeamLifecycleExecution.js'
 import {
   OpenCodeTeamLifecycleLane,
   type TeamLifecycleLaneEffectPort,
@@ -66,6 +69,193 @@ class FakeLane implements TeamLifecycleLaneEffectPort {
 }
 
 describe('DurableTeamLifecycleExecution', () => {
+  test('drops a delayed trusted reservation after authority loss without writing intent or effects', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'team-owner-reservation-authority-'))
+    roots.push(root)
+    const statePath = join(root, 'state.json')
+    const lane = new FakeLane()
+    let resolveReservation!: (reservation: TeamLifecycleRunReservation) => void
+    let admittedBinding!: Omit<TeamLifecycleRunReservation, 'runId'>
+    let enteredReservation!: () => void
+    const entered = new Promise<void>(resolve => { enteredReservation = resolve })
+    const pending = new Promise<TeamLifecycleRunReservation>(resolve => { resolveReservation = resolve })
+    let authority = true
+    const execution = new DurableTeamLifecycleExecution(statePath, [lane], undefined, {
+      requireRunReservation: true,
+      runReservation: async binding => {
+        admittedBinding = binding
+        enteredReservation()
+        return pending
+      },
+    })
+    const idle = await execution.inspect(plan)
+    const launching = execution.launch({
+      plan, commandId: 'command-delayed', idempotencyKey: 'idem-delayed', runId: null,
+      expectedProviderGeneration: idle.providerGeneration, effectGuard: () => authority,
+    })
+    await entered
+    authority = false
+    resolveReservation({ ...admittedBinding, runId: `run_${'b'.repeat(32)}` })
+    await expect(launching).rejects.toThrow('authority changed')
+    expect(lane.actions).toEqual([])
+    await expect(readFile(statePath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  test('close aborts and releases a hung reservation even when its port ignores the signal', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'team-owner-reservation-close-'))
+    roots.push(root)
+    const statePath = join(root, 'state.json')
+    const lane = new FakeLane()
+    let entered!: () => void
+    const portEntered = new Promise<void>(resolve => { entered = resolve })
+    let release!: (value: TeamLifecycleRunReservation) => void
+    const pending = new Promise<TeamLifecycleRunReservation>(resolve => { release = resolve })
+    let portSignal!: AbortSignal
+    let binding!: Omit<TeamLifecycleRunReservation, 'runId'>
+    const execution = new DurableTeamLifecycleExecution(statePath, [lane], undefined, {
+      requireRunReservation: true,
+      runReservation: async (input, signal) => {
+        binding = input
+        portSignal = signal
+        entered()
+        return pending
+      },
+    })
+    const idle = await execution.inspect(plan)
+    const launching = execution.launch({
+      plan, commandId: 'command-hung', idempotencyKey: 'idem-hung', runId: null,
+      expectedProviderGeneration: idle.providerGeneration,
+    })
+    await portEntered
+    await execution.close()
+    expect(portSignal.aborted).toBe(true)
+    await expect(launching).rejects.toThrow('closed')
+    release({ ...binding, runId: `run_${'b'.repeat(32)}` })
+    await Bun.sleep(0)
+    expect(lane.actions).toEqual([])
+    await expect(readFile(statePath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  test('reservation deadline releases serialization and rejects a late result', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'team-owner-reservation-timeout-'))
+    roots.push(root)
+    const statePath = join(root, 'state.json')
+    const lane = new FakeLane()
+    let release!: (value: TeamLifecycleRunReservation) => void
+    const pending = new Promise<TeamLifecycleRunReservation>(resolve => { release = resolve })
+    let binding!: Omit<TeamLifecycleRunReservation, 'runId'>
+    const execution = new DurableTeamLifecycleExecution(statePath, [lane], undefined, {
+      reservationTimeoutMs: 10,
+      runReservation: async input => { binding = input; return pending },
+    })
+    const idle = await execution.inspect(plan)
+    await expect(execution.launch({
+      plan, commandId: 'command-timeout', idempotencyKey: 'idem-timeout', runId: null,
+      expectedProviderGeneration: idle.providerGeneration,
+    })).rejects.toThrow('timed out')
+    release({ ...binding, runId: `run_${'b'.repeat(32)}` })
+    await execution.close()
+    expect(lane.actions).toEqual([])
+    await expect(readFile(statePath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  test('replays an identical trusted reservation without allocating another run or lane effect', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'team-owner-reservation-replay-'))
+    roots.push(root)
+    const lane = new FakeLane()
+    const runId = `run_${'b'.repeat(32)}`
+    const bindings: TeamLifecycleRunReservation[] = []
+    const execution = new DurableTeamLifecycleExecution(join(root, 'state.json'), [lane], undefined, {
+      requireRunReservation: true,
+      runReservation: async binding => {
+        const reservation = { ...binding, runId }
+        bindings.push(reservation)
+        return reservation
+      },
+    })
+    const idle = await execution.inspect(plan)
+    const input = {
+      plan, commandId: 'command-replay', idempotencyKey: 'idem-replay', runId: null,
+      expectedProviderGeneration: idle.providerGeneration,
+    }
+    const launched = await execution.launch(input)
+    await waitForPhase(execution, 'running')
+    const replayed = await execution.launch(input)
+    expect(launched.runId).toBe(runId)
+    expect(replayed).toMatchObject({ phase: 'running', runId })
+    expect(bindings).toHaveLength(2)
+    expect(bindings[0]).toEqual(bindings[1])
+    expect(lane.actions).toEqual(['launch'])
+  })
+
+  test('rejects a trusted reservation bound to a changed plan or command', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'team-owner-reservation-plan-'))
+    roots.push(root)
+    const lane = new FakeLane()
+    let original: TeamLifecycleRunReservation | null = null
+    const execution = new DurableTeamLifecycleExecution(join(root, 'state.json'), [lane], undefined, {
+      requireRunReservation: true,
+      runReservation: async binding => original ??= { ...binding, runId: `run_${'b'.repeat(32)}` },
+    })
+    const idle = await execution.inspect(plan)
+    const input = {
+      plan, commandId: 'command-original', idempotencyKey: 'idem-original', runId: null,
+      expectedProviderGeneration: idle.providerGeneration,
+    }
+    const launched = await execution.launch(input)
+    await waitForPhase(execution, 'running')
+    await expect(execution.launch({ ...input, commandId: 'command-changed' }))
+      .rejects.toThrow('reservation changed')
+    await expect(execution.launch({ ...input, idempotencyKey: 'idem-changed' }))
+      .rejects.toThrow('reservation changed')
+    const changedPlan: TeamLifecycleLaunchPlan = { ...plan, workspaceRoot: '/sandbox/changed-project' }
+    await expect(execution.launch({ ...input, plan: changedPlan }))
+      .rejects.toThrow('Active team lifecycle plan changed')
+    expect(launched.runId).toBe(`run_${'b'.repeat(32)}`)
+    expect(lane.actions).toEqual(['launch'])
+  })
+
+  test('fails closed when a required trusted reservation is absent', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'team-owner-reservation-absent-'))
+    roots.push(root)
+    const lane = new FakeLane()
+    const statePath = join(root, 'state.json')
+    const idleExecution = new DurableTeamLifecycleExecution(statePath, [lane])
+    const idle = await idleExecution.inspect(plan)
+    const input = {
+      plan, commandId: 'command-absent', idempotencyKey: 'idem-absent', runId: null,
+      expectedProviderGeneration: idle.providerGeneration,
+    }
+    const unconfigured = new DurableTeamLifecycleExecution(statePath, [lane], undefined, {
+      requireRunReservation: true,
+    })
+    await expect(unconfigured.launch(input)).rejects.toThrow('reservation is required')
+    const unavailable = new DurableTeamLifecycleExecution(statePath, [lane], undefined, {
+      runReservation: async () => null,
+    })
+    await expect(unavailable.launch(input)).rejects.toThrow('reservation changed or unavailable')
+    await expect(unavailable.launch({ ...input, idempotencyKey: undefined }))
+      .rejects.toThrow('idempotency key is required')
+    expect(lane.actions).toEqual([])
+  })
+
+  test('does not reserve a run for a stale idle generation', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'team-owner-reservation-generation-'))
+    roots.push(root)
+    let reservations = 0
+    const execution = new DurableTeamLifecycleExecution(join(root, 'state.json'), [new FakeLane()], undefined, {
+      runReservation: async binding => {
+        reservations++
+        return { ...binding, runId: `run_${'b'.repeat(32)}` }
+      },
+    })
+    await expect(execution.launch({
+      plan, commandId: 'command-stale', idempotencyKey: 'idem-stale', runId: null,
+      expectedProviderGeneration: 'generation_stale',
+    })).rejects.toThrow('provider generation changed')
+    expect(reservations).toBe(0)
+  })
+
   test('publishes launching before effects, confirms running, then confirms stop to idle', async () => {
     const root = await mkdtemp(join(tmpdir(), 'team-owner-execution-'))
     roots.push(root)

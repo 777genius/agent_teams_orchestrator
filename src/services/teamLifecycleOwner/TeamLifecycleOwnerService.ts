@@ -18,6 +18,10 @@ export type TeamLifecycleOwnerState = HostedLifecycleProviderSnapshot
 export type TeamLifecycleOwnerEffectInput = {
   plan: TeamLifecycleLaunchPlan
   commandId: string
+  /** Required by a trusted hosted run-reservation port; desktop execution does not use it. */
+  idempotencyKey?: string
+  /** Stable bound generation supplied by the hosted command for reservation replay. */
+  reservationExpectedProviderGeneration?: string
   runId: string | null
   expectedProviderGeneration: string
   /** Revalidated immediately before each lane adapter performs an effect. */
@@ -36,6 +40,8 @@ export interface TeamLifecycleExecutionPort {
   supports(plan: TeamLifecycleLaunchPlan, action: HostedLifecycleAction): boolean | Promise<boolean>
   inspect(plan: TeamLifecycleLaunchPlan): Promise<TeamLifecycleOwnerState | null>
   launch(input: TeamLifecycleOwnerEffectInput): Promise<TeamLifecycleOwnerState>
+  /** Read-only replay: must never publish a new run or invoke lane effects. */
+  replayLaunch?(input: TeamLifecycleOwnerEffectInput): Promise<TeamLifecycleOwnerState>
   cancel(input: TeamLifecycleOwnerEffectInput): Promise<TeamLifecycleOwnerState>
   stop(input: TeamLifecycleOwnerEffectInput): Promise<TeamLifecycleOwnerState>
   recover(input: TeamLifecycleOwnerEffectInput): Promise<TeamLifecycleOwnerState>
@@ -109,6 +115,7 @@ export class TeamLifecycleOwnerService implements HostedLifecycleProviderAdapter
     scope: HostedLifecycleScope
     action: HostedLifecycleAction
     commandId: string
+    idempotencyKey?: string
     runId: string | null
     expectedProviderGeneration: string
   }): Promise<HostedLifecycleProviderEffectResult> {
@@ -118,8 +125,12 @@ export class TeamLifecycleOwnerService implements HostedLifecycleProviderAdapter
       const rawBefore = await this.options.execution.inspect(admission.plan)
       if (!rawBefore || !this.#validSnapshot(rawBefore)) return { kind: 'unavailable' }
       const before = bindPlanGeneration(rawBefore, admission.planGeneration)
-      if (input.expectedProviderGeneration !== before.providerGeneration ||
-        !actionAllowed(before, input.action, input.runId)) {
+      const replayLaunch = input.action === 'launch' && !!input.idempotencyKey &&
+        input.expectedProviderGeneration !== before.providerGeneration &&
+        (before.phase === 'launching' || before.phase === 'running') &&
+        this.options.execution.replayLaunch !== undefined
+      if (!replayLaunch && (input.expectedProviderGeneration !== before.providerGeneration ||
+        !actionAllowed(before, input.action, input.runId))) {
         return { kind: 'unavailable' }
       }
       if (!(await this.#supportsSafeClosure(admission.plan, input.action)) ||
@@ -132,24 +143,34 @@ export class TeamLifecycleOwnerService implements HostedLifecycleProviderAdapter
       const effectInput: TeamLifecycleOwnerEffectInput = {
         plan: admission.plan,
         commandId: input.commandId,
+        idempotencyKey: input.idempotencyKey,
+        reservationExpectedProviderGeneration: input.expectedProviderGeneration,
         runId: input.runId,
         expectedProviderGeneration: rawBefore.providerGeneration,
         effectGuard,
       }
       try {
         if (!(await effectGuard())) return { kind: 'unavailable' }
-        rawAfter = await this.options.execution[input.action](effectInput)
+        rawAfter = replayLaunch
+          ? await this.options.execution.replayLaunch!(effectInput)
+          : await this.options.execution[input.action](effectInput)
       } catch {
         return { kind: 'unavailable' }
       }
       if (!this.#validSnapshot(rawAfter) || !(await effectGuard())) return { kind: 'unavailable' }
       const after = bindPlanGeneration(rawAfter, admission.planGeneration)
-      if (!this.#validTransition(before, after, input.action, input.runId) ||
+      if ((replayLaunch
+        ? (after.runId !== before.runId || !after.runId ||
+          (after.phase !== 'launching' && after.phase !== 'running'))
+        : !this.#validTransition(before, after, input.action, input.runId)) ||
         !(await this.#capabilityCurrent(admission.plan, after))) return { kind: 'unavailable' }
       const rawConfirmed = await this.options.execution.inspect(admission.plan)
       if (!rawConfirmed || !this.#validSnapshot(rawConfirmed)) return { kind: 'unavailable' }
       const confirmed = bindPlanGeneration(rawConfirmed, admission.planGeneration)
-      if (!this.#validConfirmation(after, confirmed, input.action, input.runId) ||
+      if ((replayLaunch
+        ? (confirmed.runId !== before.runId ||
+          (confirmed.phase !== 'launching' && confirmed.phase !== 'running'))
+        : !this.#validConfirmation(after, confirmed, input.action, input.runId)) ||
         !(await this.#capabilityCurrent(admission.plan, confirmed)) || !(await effectGuard())) {
         return { kind: 'unavailable' }
       }

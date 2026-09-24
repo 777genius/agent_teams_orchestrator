@@ -37,6 +37,27 @@ type LaneInput = {
 type EffectGuard = NonNullable<TeamLifecycleOwnerEffectInput['effectGuard']>
 const EFFECT_ALLOWED: EffectGuard = () => true
 
+export type TeamLifecycleRunReservation = {
+  planFingerprint: string
+  expectedProviderGeneration: string
+  commandId: string
+  idempotencyKey: string
+  runId: string
+}
+
+/** Implementations must durably return the same run for an identical binding and reject conflicts. */
+export type TeamLifecycleRunReservationPort = (
+  binding: Omit<TeamLifecycleRunReservation, 'runId'>,
+  signal: AbortSignal,
+) => Promise<TeamLifecycleRunReservation | null>
+
+export type DurableTeamLifecycleExecutionOptions = {
+  runReservation?: TeamLifecycleRunReservationPort
+  /** Hosted composition can require the port before accepting any launch. */
+  requireRunReservation?: boolean
+  reservationTimeoutMs?: number
+}
+
 /**
  * Provider-independent sole lifecycle owner. It durably records intent before effects and
  * confirms every terminal transition through the lane adapters before publishing it.
@@ -46,6 +67,7 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
   readonly #jobs = new Map<string, Promise<void>>()
   readonly #ownedRuns = new Set<string>()
   readonly #knownPlans = new Map<string, TeamLifecycleLaunchPlan>()
+  readonly #reservationAbort = new AbortController()
   #acceptingEffects = true
   #closePromise: Promise<void> | null = null
   #shutdownPromise: Promise<void> | null = null
@@ -55,9 +77,14 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
     private readonly statePath: string,
     adapters: readonly TeamLifecycleLaneEffectPort[],
     private readonly providerId = 'team-lifecycle-owner',
+    private readonly options: DurableTeamLifecycleExecutionOptions = {},
   ) {
     if (!isAbsolute(statePath) || statePath.includes('\0')) {
       throw new TypeError('Team lifecycle state path must be absolute')
+    }
+    if (options.reservationTimeoutMs !== undefined &&
+      (!Number.isSafeInteger(options.reservationTimeoutMs) || options.reservationTimeoutMs < 1)) {
+      throw new TypeError('Invalid team lifecycle run reservation timeout')
     }
     const entries = adapters.map(adapter => [adapter.kind, adapter] as const)
     if (new Set(entries.map(([kind]) => kind)).size !== entries.length) {
@@ -96,14 +123,76 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
   }
 
   launch(input: TeamLifecycleOwnerEffectInput): Promise<HostedLifecycleProviderSnapshot> {
+    return this.#launch(input, false)
+  }
+
+  replayLaunch(input: TeamLifecycleOwnerEffectInput): Promise<HostedLifecycleProviderSnapshot> {
+    return this.#launch(input, true)
+  }
+
+  #launch(input: TeamLifecycleOwnerEffectInput, replayOnly: boolean): Promise<HostedLifecycleProviderSnapshot> {
     this.#rememberPlan(input.plan)
     return this.#serialized(async () => {
       this.#assertAcceptingEffects()
       this.#assertSupported(input.plan, 'launch')
-      const before = await this.#read(input.plan)
-      this.#assertGeneration(before, input.expectedProviderGeneration)
-      if (before.phase !== 'idle') throw new Error('Team lifecycle owner is not idle')
-      const runId = `run_${randomUUID().replaceAll('-', '')}`
+      let before = await this.#read(input.plan)
+      const reservationRequired = this.options.requireRunReservation || !!this.options.runReservation
+      if (reservationRequired && !this.options.runReservation) {
+        throw new Error('Team lifecycle run reservation is required')
+      }
+      if (reservationRequired && !input.idempotencyKey) {
+        throw new Error('Team lifecycle idempotency key is required for run reservation')
+      }
+      if (replayOnly && (!this.options.runReservation || before.phase === 'idle')) {
+        throw new Error('Team lifecycle run replay is unavailable')
+      }
+      if (before.phase === 'idle' || !reservationRequired) {
+        this.#assertGeneration(before, input.expectedProviderGeneration)
+      }
+      if (before.phase !== 'idle' && !reservationRequired) throw new Error('Team lifecycle owner is not idle')
+      let runId: string
+      if (this.options.runReservation) {
+        const binding = {
+          planFingerprint: planFingerprint(input.plan),
+          expectedProviderGeneration: input.reservationExpectedProviderGeneration ?? input.expectedProviderGeneration,
+          commandId: input.commandId,
+          idempotencyKey: input.idempotencyKey!,
+        }
+        const reservation = await this.#resolveReservation(binding)
+        if (!reservation || reservation.planFingerprint !== binding.planFingerprint ||
+          reservation.expectedProviderGeneration !== binding.expectedProviderGeneration ||
+          reservation.commandId !== binding.commandId ||
+          reservation.idempotencyKey !== binding.idempotencyKey ||
+          !/^run_[0-9a-f]{32}$/.test(reservation.runId)) {
+          throw new Error('Team lifecycle run reservation changed or unavailable')
+        }
+        // The reservation can await remote durability. Recheck authority and local state
+        // before publishing intent; no lane job is started on a stale response.
+        this.#assertAcceptingEffects()
+        this.#assertSupported(input.plan, 'launch')
+        if (!await (input.effectGuard ?? EFFECT_ALLOWED)()) {
+          throw new Error('Team lifecycle effect authority changed')
+        }
+        const current = await this.#read(input.plan)
+        this.#assertAcceptingEffects()
+        if (current.phase !== 'idle') {
+          if (current.runId === reservation.runId &&
+            (current.phase === 'launching' || current.phase === 'running')) {
+            return snapshot(this.providerId, current)
+          }
+          throw new Error('Team lifecycle owner is not idle')
+        }
+        if (replayOnly) throw new Error('Team lifecycle run replay is stale')
+        this.#assertGeneration(current, input.expectedProviderGeneration)
+        if (!await (input.effectGuard ?? EFFECT_ALLOWED)()) {
+          throw new Error('Team lifecycle effect authority changed')
+        }
+        this.#assertAcceptingEffects()
+        before = current
+        runId = reservation.runId
+      } else {
+        runId = `run_${randomUUID().replaceAll('-', '')}`
+      }
       const launching = await this.#write({ ...before, phase: 'launching', runId, recoverable: false }, input.plan)
       this.#ownedRuns.add(runId)
       this.#trackJob(runId, this.#completeLaunch(input.plan, runId, input.effectGuard ?? EFFECT_ALLOWED))
@@ -170,6 +259,7 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
 
   async #close(): Promise<void> {
     this.#acceptingEffects = false
+    this.#reservationAbort.abort(new Error('Team lifecycle execution is closed'))
     // Cross the serialization barrier so a launch already admitted has registered its job.
     await this.#serialized(async () => {})
     while (this.#jobs.size > 0) {
@@ -351,6 +441,31 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
 
   #assertGeneration(state: DurableState, expected: string): void {
     if (generation(state) !== expected) throw new Error('Team lifecycle provider generation changed')
+  }
+
+  async #resolveReservation(
+    binding: Omit<TeamLifecycleRunReservation, 'runId'>,
+  ): Promise<TeamLifecycleRunReservation | null> {
+    const reserve = this.options.runReservation!
+    const controller = new AbortController()
+    const onClose = () => controller.abort(new Error('Team lifecycle execution is closed'))
+    this.#reservationAbort.signal.addEventListener('abort', onClose, { once: true })
+    if (this.#reservationAbort.signal.aborted) onClose()
+    const timeout = setTimeout(() => controller.abort(new Error('Team lifecycle run reservation timed out')),
+      this.options.reservationTimeoutMs ?? 30_000)
+    let onAbort: (() => void) | undefined
+    try {
+      if (controller.signal.aborted) throw controller.signal.reason
+      const aborted = new Promise<never>((_resolve, reject) => {
+        onAbort = () => reject(controller.signal.reason)
+        controller.signal.addEventListener('abort', onAbort, { once: true })
+      })
+      return await Promise.race([reserve(binding, controller.signal), aborted])
+    } finally {
+      clearTimeout(timeout)
+      if (onAbort) controller.signal.removeEventListener('abort', onAbort)
+      this.#reservationAbort.signal.removeEventListener('abort', onClose)
+    }
   }
 
   async #read(plan: TeamLifecycleLaunchPlan): Promise<DurableState> {

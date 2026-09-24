@@ -5,7 +5,7 @@ import * as path from 'node:path'
 
 import type { HostedLifecycleProviderSnapshot } from '../hostedControl/HostedLifecycleSnapshot.js'
 import type { HostedLifecycleAction } from '../hostedControl/HostedLifecycleSnapshot.js'
-import { DurableTeamLifecycleExecution } from './DurableTeamLifecycleExecution.js'
+import { DurableTeamLifecycleExecution, type TeamLifecycleRunReservation } from './DurableTeamLifecycleExecution.js'
 import type { TeamLifecycleLaneEffectPort, TeamLifecycleLaneObservation } from './OpenCodeTeamLifecycleLane.js'
 import {
   PrivateFileTeamLifecycleLaunchPlanStore,
@@ -47,6 +47,7 @@ class MemoryPlanStore implements TeamLifecycleLaunchPlanStore {
 
 class FakeExecution implements TeamLifecycleExecutionPort {
   calls: Array<{ action: string; expected: string; providers: string[] }> = []
+  commandBindings: Array<{ commandId: string; idempotencyKey?: string }> = []
   concurrent = 0
   maxConcurrent = 0
   state: HostedLifecycleProviderSnapshot = snapshot('generation_1', 'idle', null)
@@ -73,6 +74,7 @@ class FakeExecution implements TeamLifecycleExecutionPort {
     this.concurrent += 1
     this.maxConcurrent = Math.max(this.maxConcurrent, this.concurrent)
     await Promise.resolve()
+    this.commandBindings.push({ commandId: input.commandId, idempotencyKey: input.idempotencyKey })
     this.calls.push({ action, expected: input.expectedProviderGeneration, providers: input.plan.lanes.map(lane => lane.provider) })
     this.concurrent -= 1
     if (this.confirm) this.state = next
@@ -198,7 +200,7 @@ describe('TeamLifecycleOwnerService', () => {
       providerGeneration: expect.stringMatching(/^generation_[0-9a-f]{64}$/),
     })
     const applied = await service.execute({
-      scope, action: 'launch', commandId: 'command_1', runId: null,
+      scope, action: 'launch', commandId: 'command_1', idempotencyKey: 'idempotency_1', runId: null,
       expectedProviderGeneration: inspection.snapshot.providerGeneration,
     })
     expect(applied.kind).toBe('applied')
@@ -211,6 +213,60 @@ describe('TeamLifecycleOwnerService', () => {
       action: 'launch', expected: 'generation_1',
       providers: ['anthropic', 'codex', 'gemini', 'opencode'],
     }])
+    expect(execution.commandBindings).toEqual([{
+      commandId: 'command_1', idempotencyKey: 'idempotency_1',
+    }])
+  })
+
+  test('replays the exact hosted launch through the trusted reservation without another lane effect', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'team-owner-hosted-replay-'))
+    try {
+      const singleLanePlan: TeamLifecycleLaunchPlan = {
+        ...plan,
+        lanes: [{ laneId: 'opencode_lane', kind: 'opencode', provider: 'opencode',
+          selectedModel: 'provider/model', members: [{ name: 'worker', prompt: 'Test fixture.' }] }],
+      }
+      let laneLaunches = 0
+      const lane: TeamLifecycleLaneEffectPort = {
+        kind: 'opencode',
+        supports: () => true,
+        inspect: async input => ({ phase: input.runId ? 'running' : 'idle', recoverable: false }),
+        launch: async () => { laneLaunches++; return { phase: 'running', recoverable: false } },
+        cancel: async () => ({ phase: 'idle', recoverable: false }),
+        stop: async () => ({ phase: 'idle', recoverable: false }),
+        recover: async () => ({ phase: 'idle', recoverable: false }),
+      }
+      const bindings: Array<{ commandId: string; idempotencyKey: string; expectedProviderGeneration: string }> = []
+      let originalReservation: TeamLifecycleRunReservation | null = null
+      const execution = new DurableTeamLifecycleExecution(path.join(root, 'state.json'), [lane], undefined, {
+        requireRunReservation: true,
+        runReservation: async binding => {
+          bindings.push(binding)
+          return originalReservation ??= { ...binding, runId: `run_${'b'.repeat(32)}` }
+        },
+      })
+      const owner = new TeamLifecycleOwnerService({ planStore: new MemoryPlanStore(singleLanePlan), execution })
+      const inspected = await owner.inspect(scope)
+      if (inspected.kind !== 'owned') throw new Error('expected owner')
+      const command = {
+        scope, action: 'launch' as const, commandId: 'command_replay',
+        idempotencyKey: 'idem_replay', runId: null,
+        expectedProviderGeneration: inspected.snapshot.providerGeneration,
+      }
+      const first = await owner.execute(command)
+      expect(first).toMatchObject({ kind: 'applied', snapshot: { runId: `run_${'b'.repeat(32)}` } })
+      const second = await owner.execute(command)
+      expect(second).toMatchObject({ kind: 'applied', snapshot: { runId: `run_${'b'.repeat(32)}` } })
+      expect(laneLaunches).toBe(1)
+      expect(bindings).toHaveLength(2)
+      expect(bindings[0]).toEqual(bindings[1])
+      await expect(owner.execute({ ...command, idempotencyKey: 'idem_changed' }))
+        .resolves.toEqual({ kind: 'unavailable' })
+      expect(laneLaunches).toBe(1)
+      await execution.close()
+    } finally {
+      await fs.rm(root, { recursive: true, force: true })
+    }
   })
 
   test('serializes effects per team and rechecks the generation before the second command', async () => {

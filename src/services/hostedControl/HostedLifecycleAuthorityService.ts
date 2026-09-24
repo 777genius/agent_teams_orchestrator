@@ -284,6 +284,7 @@ export class HostedLifecycleAuthorityService implements HostedLifecycleAuthority
           scope: this.#scope(),
           action: input.command.action,
           commandId: input.command.commandId,
+          idempotencyKey: input.command.idempotencyKey,
           runId: input.command.runId ?? null,
           expectedProviderGeneration: before.providerGeneration,
         })

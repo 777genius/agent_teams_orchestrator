@@ -19,6 +19,7 @@ export interface HostedLifecycleProviderAdapter {
     scope: HostedLifecycleScope
     action: HostedLifecycleAction
     commandId: string
+    idempotencyKey?: string
     runId: string | null
     expectedProviderGeneration: string
   }): Promise<HostedLifecycleProviderEffectResult>
