@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createHostedControlProof, createHostedDomainProof, createHostedRawDomainProof, verifyHostedControlProof } from './ownerProof.js'
 import { hostedControlGoldenRequestFixture, type HostedTaskMutationResponse } from './protocol.js'
+import { HostedControlDispatcher } from './HostedControlDispatcher.js'
 import { admitHostedReadiness, HOSTED_LIFECYCLE_PROOF_DOMAIN, HostedControlServer, type HostedTaskMutationPort } from './HostedControlServer.js'
 import type { HostedControlBootstrapBinding } from './HostedControlBootstrap.js'
 import type { HostedApprovalActivationConnection } from './HostedApprovalActivationSession.js'
@@ -128,6 +129,103 @@ describe('HostedControlServer', () => {
     const response = JSON.parse(line) as HostedTaskMutationResponse
     expect(response.payload).toEqual({ kind: 'unavailable' })
     expect(verifyHostedControlProof(secret, 'response', response)).toBe(true)
+  })
+
+  test('returns a signed lifecycle response through the broker after write and dispatches one frame per socket', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'hosted-lifecycle-write-'))
+    roots.push(root)
+    const socketPath = join(root, 'private', 'control.sock')
+    const secret = Buffer.alloc(32, 9)
+    const fixture = hostedControlGoldenRequestFixture()
+    const { socketIdentity: _, ...ownerIdentity } = fixture.ownerBinding
+    const planGeneration = `plan-generation_${'a'.repeat(64)}`
+    const ownerEffectFence = { grantRevision: '1'.repeat(64), identityChecksum: '2'.repeat(64) }
+    let dispatches = 0
+    let releaseSecond!: () => void
+    let markSecondStarted!: () => void
+    const secondGate = new Promise<void>(resolve => { releaseSecond = resolve })
+    const secondStarted = new Promise<void>(resolve => { markSecondStarted = resolve })
+    let server!: HostedControlServer
+    const dispatcher = new HostedControlDispatcher({
+      secret, authority: fixture.authority, getOwnerBinding: () => server.ownerBinding,
+      lifecycle: { dispatch: async () => {
+        dispatches += 1
+        if (dispatches === 2) { markSecondStarted(); await secondGate }
+        return { payload: { schemaVersion: 1, kind: 'admitted', workspaceId: fixture.authority.workspaceId,
+          teamId: fixture.authority.teamId, planGeneration }, resourceRevision: null }
+      } },
+      messages: { dispatch: async () => ({ schemaVersion: 2, kind: 'not_found' }) },
+    })
+    server = new HostedControlServer({
+      socketPath, secret, ownerIdentity, authority: fixture.authority,
+      service: { mutate: async () => ({ kind: 'unavailable' as const }) },
+      dispatchCoexistingOperation: (message, rawLine) => dispatcher.dispatch(message, rawLine),
+    })
+    servers.push(server)
+    await server.start()
+    const ownerBinding = server.ownerBinding!
+    const lease = await openReadiness(socketPath, ownerBinding)
+    const frame = (exchangeSuffix: string) => {
+      const exchangeId = `lifecycle-request_${exchangeSuffix.repeat(32)}`
+      const operation = 'admit_launch_plan'
+      const actorId = 'actor-a'
+      const sessionId = 'session-a'
+      const authority = {
+        actorId, workspaceId: fixture.authority.workspaceId, teamId: fixture.authority.teamId,
+        deploymentId: fixture.authority.deploymentId, bootId: fixture.authority.bootId,
+        restoreGeneration: fixture.authority.restoreGeneration,
+        mountGeneration: fixture.authority.mountBinding.mountGeneration,
+        resourceRevision: null, ownerEffectFence,
+      }
+      const unsigned = {
+        schemaVersion: 2, exchangeId, operation,
+        provenance: {
+          from: { kind: 'controller', deploymentId: authority.deploymentId, bootId: authority.bootId,
+            actorId, sessionId },
+          to: { kind: 'owner', ownerAuthority: ownerBinding.ownerAuthority,
+            ownerGeneration: ownerBinding.ownerGeneration, ownerSessionId: ownerBinding.ownerSessionId },
+          target: { capability: 'hosted-lifecycle-command', exchangeId, operation,
+            workspaceId: authority.workspaceId, teamId: authority.teamId },
+        },
+        ownerBinding, ownerEffectFence,
+        payload: {
+          request: { schemaVersion: 1, workspaceId: authority.workspaceId, teamId: authority.teamId,
+            workspaceRoot: '/sandbox/workspace', expectedPlanGeneration: planGeneration },
+          context: { actorId, sessionId, deploymentId: authority.deploymentId, bootId: authority.bootId,
+            requestId: `request-${exchangeSuffix}`, authorizedScope: 'owner', deadlineAtMs: 1 },
+          authority,
+        },
+      }
+      return `${JSON.stringify({ ...unsigned, ownerProof: createHostedRawDomainProof(
+        secret, HOSTED_LIFECYCLE_PROOF_DOMAIN, 'request', JSON.stringify(unsigned),
+      ) })}\n`
+    }
+
+    // exchange() uses socket.write(), leaving the request's write side open while Owner responds.
+    const response = JSON.parse(await exchange(socketPath, frame('a'))) as Record<string, unknown>
+    const { ownerProof, ...unsignedResponse } = response
+    expect(response.payload).toMatchObject({ kind: 'admitted', planGeneration })
+    expect(ownerProof).toBe(createHostedRawDomainProof(secret, HOSTED_LIFECYCLE_PROOF_DOMAIN,
+      'response', JSON.stringify(unsignedResponse)))
+    expect(dispatches).toBe(1)
+
+    const second = connect(socketPath)
+    const secondClosed = new Promise<void>((resolve, reject) => {
+      second.once('close', resolve)
+      second.once('error', reject)
+    })
+    try {
+      await new Promise<void>(resolve => second.once('connect', resolve))
+      second.write(frame('b'))
+      await secondStarted
+      second.write(frame('c'))
+      await secondClosed
+      expect(dispatches).toBe(2)
+    } finally {
+      releaseSecond()
+      second.destroy()
+      lease.socket.destroy()
+    }
   })
 
   test('binds canonical readiness to bootstrap, controller, active owner and mount generation', async () => {
