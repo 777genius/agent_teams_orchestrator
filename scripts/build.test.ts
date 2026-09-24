@@ -83,7 +83,7 @@ describe('release build feature plan', () => {
   test('builds the CLI only after verifying the owner and embeds that exact digest', async () => {
     const source = await readFile(buildScript, 'utf8')
     const verified = source.indexOf("'launcher after wrapper build'")
-    const embedded = source.indexOf('HOSTED_CONTROL_BUILD_OWNER_ARTIFACT_DIGEST=')
+    const embedded = source.indexOf('HOSTED_CONTROL_BUILD_OWNER_EXECUTABLE_DIGEST=')
     expect(verified).toBeGreaterThan(0)
     expect(embedded).toBeGreaterThan(verified)
     expect(source).toContain('if (!buildHostedActualOwner) runBuild(cliBuild)')
@@ -1464,7 +1464,7 @@ async function runBuiltCliWithForgedInBandOwnerPin(
       stdio: ['ignore', 'ignore', 'pipe', leaseFd, sockets[0]!, 'pipe'],
       env: {
         ...process.env,
-        HOSTED_CONTROL_BUILD_OWNER_ARTIFACT_DIGEST: forgedOwnerPin,
+        HOSTED_CONTROL_BUILD_OWNER_EXECUTABLE_DIGEST: forgedOwnerPin,
       },
     })
     closeSync(sockets[0]!)

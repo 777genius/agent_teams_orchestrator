@@ -196,7 +196,7 @@ export class HostedControlRuntime {
         authority,
         legacyKey: config.legacyKey,
         teamRoot: ownerScope.canonicalTeamRoot,
-        ...(descriptorAdmission ? {
+        ...(descriptorAdmission?.approvalActivationV2 ? {
           activationV2: Object.freeze({
             proofKey: secret,
             expectation: Object.freeze({

@@ -1948,7 +1948,7 @@ if (compile) {
         ...cliBuild,
         `--feature=${hostedControlBuiltOwnerPinFeature}`,
         '--define',
-        `HOSTED_CONTROL_BUILD_OWNER_ARTIFACT_DIGEST=${JSON.stringify(`sha256:${launcherIdentity.sha256}`)}`,
+        `HOSTED_CONTROL_BUILD_OWNER_EXECUTABLE_DIGEST=${JSON.stringify(`sha256:${launcherIdentity.sha256}`)}`,
       ])
       unlinkIfPresent(hostedActualOwnerMetafile)
       unlinkIfPresent(trustedBunSnapshot)

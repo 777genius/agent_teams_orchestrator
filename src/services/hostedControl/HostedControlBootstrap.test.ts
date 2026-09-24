@@ -12,6 +12,7 @@ import {
   HOSTED_CONTROL_LAUNCHER_LEASE_FORMAT,
   HOSTED_CONTROL_LAUNCHER_LEASE_MAX_BYTES,
   type HostedControlBootstrapHeader,
+  type HostedApprovalActivationV2BootstrapExpectation,
   type HostedControlLauncherLeaseV1,
 } from './HostedControlBootstrap.js'
 
@@ -34,9 +35,40 @@ afterEach(async () => {
 })
 
 describe('hosted control inherited-descriptor bootstrap', () => {
+  test('admits Core lifecycle with distinct executable and OCI digests and no approval activation', async () => {
+    const fixture = await launchFixture(10_000, { core: true })
+    fixture.bootstrap.end(frame(fixture.header, fixture.secret))
+    expect(await fixture.lines.next()).toEqual({
+      kind: 'admitted', fd5Closed: true, secretBytes: 32,
+      fd3Retained: true, fd4Retained: true,
+      declaredRootHash: fixture.header.declaredRootHash,
+      bootstrapBinding: fixture.header.bootstrapBinding,
+      expectedOwnerArtifactDigest: fixture.header.bootstrapBinding.ownerArtifactDigest,
+      approvalActivationV2Present: false,
+    })
+    fixture.liveness.end()
+    expect(await fixture.lines.next()).toEqual({
+      kind: 'lost', secretZeroed: true, fd3Closed: true, fd4Closed: true,
+    })
+    expect(await exitCode(fixture.child)).toBe(0)
+  }, 30_000)
+
+  test('Core rejects executable pin and OCI binding cross-splices', async () => {
+    await Promise.all([
+      expectRejected(await launchFixture(10_000, { core: true,
+        expectedOwnerExecutableDigest: `sha256:${'f'.repeat(64)}` })),
+      expectRejected(await launchFixture(10_000, { core: true,
+        leaseStatement: lease => ({ ...lease, ownerArtifactDigest: `sha256:${'b'.repeat(64)}` }) })),
+      expectRejected(await launchFixture(10_000, { core: true,
+        leaseStatement: lease => ({ ...lease, ownerExecutableDigest: `sha256:${'b'.repeat(64)}` }) })),
+      expectRejected(await launchFixture(10_000, { core: true,
+        header: header => ({ ...header, approvalActivationV2: {} as HostedApprovalActivationV2BootstrapExpectation }) })),
+    ])
+  }, 30_000)
+
   test('admits exact canonical bytes, closes FD5, retains FD3, and loses authority on FD4 EOF', async () => {
     const fixture = await launchFixture(10_000, {
-      expectedOwnerArtifactDigest: `sha256:${createHash('sha256').update('running-owner').digest('hex')}`,
+      expectedOwnerExecutableDigest: `sha256:${createHash('sha256').update('running-owner').digest('hex')}`,
     })
     fixture.bootstrap.write(frame(fixture.header, fixture.secret))
     fixture.bootstrap.end()
@@ -192,7 +224,7 @@ describe('hosted control inherited-descriptor bootstrap', () => {
       ...mutations.map(async leaseStatement =>
         expectRejected(await launchFixture(10_000, { leaseStatement }))),
       (async () => expectRejected(await launchFixture(10_000, {
-        expectedOwnerArtifactDigest: `sha256:${'8'.repeat(64)}`,
+        expectedOwnerExecutableDigest: `sha256:${'8'.repeat(64)}`,
       })))(),
     ])
   }, 30_000)
@@ -200,7 +232,7 @@ describe('hosted control inherited-descriptor bootstrap', () => {
   test('rejects an omitted independent owner artifact pin even when every in-band digest agrees', async () => {
     const attackerDigest = `sha256:${'8'.repeat(64)}` as const
     await expectRejected(await launchFixture(10_000, {
-      omitExpectedOwnerArtifactDigest: true,
+      omitExpectedOwnerExecutableDigest: true,
       leaseStatement: lease => ({ ...lease, ownerArtifactDigest: attackerDigest }),
       header: header => ({
         ...header,
@@ -252,33 +284,35 @@ async function expectRejected(fixture: Awaited<ReturnType<typeof launchFixture>>
 }
 
 type FixtureOptions = {
+  core?: boolean
   leaseStatement?: (lease: HostedControlLauncherLeaseV1) => HostedControlLauncherLeaseV1
   leaseBytes?: (canonical: Buffer) => Buffer
   leaseSeals?: number
   leaseMode?: number
   header?: (header: HostedControlBootstrapHeader) => HostedControlBootstrapHeader
-  expectedOwnerArtifactDigest?: string
-  omitExpectedOwnerArtifactDigest?: boolean
+  expectedOwnerExecutableDigest?: string
+  omitExpectedOwnerExecutableDigest?: boolean
   rejectAfterGuardCreated?: boolean
 }
 
 async function launchFixture(deadlineMs = 1_000, options: FixtureOptions = {}) {
   const secret = Buffer.alloc(32, 0xa5)
-  const baseLeaseStatement = makeLeaseStatement(secret)
+  const baseLeaseStatement = makeLeaseStatement(secret, options.core)
   const leaseStatement = options.leaseStatement?.(baseLeaseStatement) ?? baseLeaseStatement
   const canonical = Buffer.from(JSON.stringify(leaseStatement))
   const artifact = options.leaseBytes?.(canonical) ?? canonical
   const lease = createMemfd(artifact, options.leaseSeals, options.leaseMode)
   const stat = fstatSync(lease.fd)
   const digest = createHash('sha256').update(artifact).digest('hex')
-  const baseHeader = makeHeader(stat, digest)
+  const baseHeader = options.core ? makeCoreHeader(stat, digest) : makeHeader(stat, digest)
   const header = options.header?.(baseHeader) ?? baseHeader
-  const expectedOwnerArtifactDigest = options.omitExpectedOwnerArtifactDigest
+  const expectedOwnerExecutableDigest = options.omitExpectedOwnerExecutableDigest
     ? ''
-    : options.expectedOwnerArtifactDigest ?? `sha256:${createHash('sha256').update('running-owner').digest('hex')}`
+    : options.expectedOwnerExecutableDigest ?? `sha256:${createHash('sha256').update('running-owner').digest('hex')}`
   const child = spawn(process.execPath, [
-    childFixture(), String(deadlineMs), expectedOwnerArtifactDigest,
+    childFixture(), String(deadlineMs), expectedOwnerExecutableDigest,
     options.rejectAfterGuardCreated ? 'reject-after-guard' : '',
+    options.core ? 'core' : '',
   ], {
     stdio: ['ignore', 'pipe', 'pipe', lease.fd, 'pipe', 'pipe'],
   })
@@ -297,7 +331,9 @@ async function launchFixture(deadlineMs = 1_000, options: FixtureOptions = {}) {
   }
 }
 
-function makeHeader(stat: Stats, digest: string): HostedControlBootstrapHeader {
+function makeHeader(stat: Stats, digest: string): HostedControlBootstrapHeader & {
+  approvalActivationV2: HostedApprovalActivationV2BootstrapExpectation
+} {
   const ownerArtifactDigest = createHash('sha256').update('running-owner').digest('hex')
   return {
     format: HOSTED_CONTROL_BOOTSTRAP_FORMAT,
@@ -334,11 +370,36 @@ function makeHeader(stat: Stats, digest: string): HostedControlBootstrapHeader {
   }
 }
 
-function makeLeaseStatement(secret: Buffer): HostedControlLauncherLeaseV1 {
+function makeCoreHeader(stat: Stats, digest: string): HostedControlBootstrapHeader {
+  const approval = makeHeader(stat, digest)
+  return {
+    format: HOSTED_CONTROL_BOOTSTRAP_FORMAT,
+    admissionKind: 'core-lifecycle-v1',
+    restoreGeneration: approval.restoreGeneration,
+    teamId: approval.teamId,
+    declaredRootHash: approval.declaredRootHash,
+    ownerAuthority: approval.ownerAuthority,
+    ownerGeneration: approval.ownerGeneration,
+    ownerSessionId: approval.ownerSessionId,
+    claudeRoot: approval.claudeRoot,
+    socketPath: approval.socketPath,
+    legacyKey: approval.legacyKey,
+    bootstrapBinding: {
+      ...approval.bootstrapBinding,
+      ownerArtifactDigest: `sha256:${'a'.repeat(64)}`,
+    },
+    leaseEvidence: approval.leaseEvidence,
+  }
+}
+
+function makeLeaseStatement(secret: Buffer, core = false): HostedControlLauncherLeaseV1 {
   return {
     format: HOSTED_CONTROL_LAUNCHER_LEASE_FORMAT,
     launcherLeaseId: 'launcher-lease-test',
-    ownerArtifactDigest: `sha256:${createHash('sha256').update('running-owner').digest('hex')}`,
+    ownerArtifactDigest: core
+      ? `sha256:${'a'.repeat(64)}`
+      : `sha256:${createHash('sha256').update('running-owner').digest('hex')}`,
+    ...(core ? { ownerExecutableDigest: `sha256:${createHash('sha256').update('running-owner').digest('hex')}` as const } : {}),
     bootstrapDigest: 'c'.repeat(64),
     proofKeyId: createHash('sha256').update(secret).digest('hex'),
     ownerGeneration: 11,

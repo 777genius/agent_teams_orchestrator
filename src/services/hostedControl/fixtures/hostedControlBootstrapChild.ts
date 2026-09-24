@@ -2,10 +2,10 @@ import { closeSync, fstat, fstatSync, openSync } from 'node:fs'
 import { readHostedControlBootstrap } from '../HostedControlBootstrap.js'
 
 try {
-  const expectedOwnerArtifactDigest = process.argv[3] as `sha256:${string}`
+  const expectedOwnerExecutableDigest = process.argv[3] as `sha256:${string}`
   const admission = await readHostedControlBootstrap({
     deadlineMs: Number(process.argv[2] ?? 5_000),
-    expectedOwnerArtifactDigest,
+    expectedOwnerExecutableDigest,
     afterGuardCreated: process.argv[4] === 'reject-after-guard'
       ? () => { throw new Error('injected rejection after guard creation') }
       : undefined,
@@ -22,6 +22,7 @@ try {
     declaredRootHash: admission.config.declaredRootHash,
     bootstrapBinding: admission.bootstrapBinding,
     expectedOwnerArtifactDigest: admission.expectedOwnerArtifactDigest,
+    ...(process.argv[5] ? { approvalActivationV2Present: !!admission.approvalActivationV2 } : {}),
   })}\n`)
   await admission.guard.lost
   admission.secret.fill(0)

@@ -4,21 +4,21 @@ import {
   type HostedControlBootstrapAdmission,
 } from './HostedControlBootstrap.js'
 
-declare const HOSTED_CONTROL_BUILD_OWNER_ARTIFACT_DIGEST: string | undefined
+declare const HOSTED_CONTROL_BUILD_OWNER_EXECUTABLE_DIGEST: string | undefined
 
 export type HostedControlMainDependencies = {
-  expectedOwnerArtifactDigest: unknown
+  expectedOwnerExecutableDigest: unknown
   readBootstrap(options: {
-    expectedOwnerArtifactDigest: `sha256:${string}`
+    expectedOwnerExecutableDigest: `sha256:${string}`
   }): Promise<HostedControlBootstrapAdmission>
   runAdmission(admission: HostedControlBootstrapAdmission): Promise<void>
 }
 
 export async function runHostedControlFromDescriptors(): Promise<void> {
   await runHostedControlFromDescriptorsWithDependencies({
-    expectedOwnerArtifactDigest: feature('HOSTED_CONTROL_BUILT_OWNER_PIN') &&
-      typeof HOSTED_CONTROL_BUILD_OWNER_ARTIFACT_DIGEST === 'string'
-      ? HOSTED_CONTROL_BUILD_OWNER_ARTIFACT_DIGEST
+    expectedOwnerExecutableDigest: feature('HOSTED_CONTROL_BUILT_OWNER_PIN') &&
+      typeof HOSTED_CONTROL_BUILD_OWNER_EXECUTABLE_DIGEST === 'string'
+      ? HOSTED_CONTROL_BUILD_OWNER_EXECUTABLE_DIGEST
       : undefined,
     readBootstrap: readHostedControlBootstrap,
     runAdmission: runHostedControlAdmission,
@@ -28,14 +28,14 @@ export async function runHostedControlFromDescriptors(): Promise<void> {
 export async function runHostedControlFromDescriptorsWithDependencies(
   dependencies: HostedControlMainDependencies,
 ): Promise<void> {
-  const { expectedOwnerArtifactDigest } = dependencies
-  if (typeof expectedOwnerArtifactDigest !== 'string' ||
-    expectedOwnerArtifactDigest.length !== 71 ||
-    !/^sha256:[0-9a-f]{64}$/.test(expectedOwnerArtifactDigest)) {
-    throw new Error('Hosted control owner artifact digest pin was rejected')
+  const { expectedOwnerExecutableDigest } = dependencies
+  if (typeof expectedOwnerExecutableDigest !== 'string' ||
+    expectedOwnerExecutableDigest.length !== 71 ||
+    !/^sha256:[0-9a-f]{64}$/.test(expectedOwnerExecutableDigest)) {
+    throw new Error('Hosted control owner executable digest pin was rejected')
   }
   const admission = await dependencies.readBootstrap({
-    expectedOwnerArtifactDigest: expectedOwnerArtifactDigest as `sha256:${string}`,
+    expectedOwnerExecutableDigest: expectedOwnerExecutableDigest as `sha256:${string}`,
   })
   await dependencies.runAdmission(admission)
 }

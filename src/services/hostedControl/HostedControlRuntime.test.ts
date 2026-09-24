@@ -212,7 +212,7 @@ describe('HostedControlRuntime', () => {
     expect(actions).toEqual(['approval-fenced', 'exact-run-stop', 'drained'])
   })
 
-  test('retains descriptor authority through runtime lifetime and zeroes the admitted key on stop', async () => {
+  test('Core lifecycle omits approval activation, retains descriptor authority, and zeroes key on stop', async () => {
     const root = await realpath(await mkdtemp('/tmp/hosted-control-descriptor-'))
     roots.push(root)
     const claudeRoot = join(root, 'claude')
@@ -224,6 +224,7 @@ describe('HostedControlRuntime', () => {
     let currentChecks = 0
     let guardCloses = 0
     let portCloses = 0
+    let activationPresent = true
     const admission: HostedControlBootstrapAdmission = {
       config: {
         socketPath: join(runtimeRoot, 'control.sock'), claudeRoot,
@@ -239,7 +240,6 @@ describe('HostedControlRuntime', () => {
         ownerArtifactDigest: `sha256:${'e'.repeat(64)}`,
         proofKeyId: 'f'.repeat(64),
       },
-      approvalActivationV2: activationBootstrapExpectation(`sha256:${'e'.repeat(64)}`),
       expectedOwnerArtifactDigest: `sha256:${'e'.repeat(64)}`,
       secret,
       guard: {
@@ -248,13 +248,17 @@ describe('HostedControlRuntime', () => {
         close: async () => { guardCloses += 1 },
       },
     }
-    const runtime = new HostedControlRuntime(admission, () => ({
-      lifecycle: { dispatch: async () => ({ payload: {}, resourceRevision: null }) },
-      messages: { dispatch: async () => ({}) },
-      close: async () => { portCloses += 1 },
-    }))
+    const runtime = new HostedControlRuntime(admission, context => {
+      activationPresent = context.activationV2 !== undefined
+      return {
+        lifecycle: { dispatch: async () => ({ payload: {}, resourceRevision: null }) },
+        messages: { dispatch: async () => ({}) },
+        close: async () => { portCloses += 1 },
+      }
+    })
     runtimes.push(runtime)
     await runtime.start()
+    expect(activationPresent).toBe(false)
     expect(currentChecks).toBeGreaterThanOrEqual(4)
     expect(secret.every(byte => byte === 0xa5)).toBe(true)
     await runtime.stop()

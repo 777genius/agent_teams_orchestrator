@@ -12,35 +12,35 @@ const admission = {} as HostedControlBootstrapAdmission
 describe('hosted control production descriptor fast path', () => {
   test('source execution rejects a forged build-pin global before bootstrap', async () => {
     const globals = globalThis as typeof globalThis & {
-      HOSTED_CONTROL_BUILD_OWNER_ARTIFACT_DIGEST?: string
+      HOSTED_CONTROL_BUILD_OWNER_EXECUTABLE_DIGEST?: string
     }
-    globals.HOSTED_CONTROL_BUILD_OWNER_ARTIFACT_DIGEST = digest
+    globals.HOSTED_CONTROL_BUILD_OWNER_EXECUTABLE_DIGEST = digest
     try {
       await expect(runHostedControlFromDescriptors()).rejects.toThrow(
-        'Hosted control owner artifact digest pin was rejected',
+        'Hosted control owner executable digest pin was rejected',
       )
     } finally {
-      delete globals.HOSTED_CONTROL_BUILD_OWNER_ARTIFACT_DIGEST
+      delete globals.HOSTED_CONTROL_BUILD_OWNER_EXECUTABLE_DIGEST
     }
   })
 
-  test('passes the independently pinned owner artifact digest to bootstrap', async () => {
+  test('passes the independently pinned owner executable digest to bootstrap', async () => {
     const calls: unknown[] = []
     await runHostedControlFromDescriptorsWithDependencies(dependencies({
-      expectedOwnerArtifactDigest: digest,
+      expectedOwnerExecutableDigest: digest,
       readBootstrap: async options => { calls.push(options); return admission },
       runAdmission: async value => { calls.push(value) },
     }))
 
-    expect(calls).toEqual([{ expectedOwnerArtifactDigest: digest }, admission])
+    expect(calls).toEqual([{ expectedOwnerExecutableDigest: digest }, admission])
   })
 
   test('rejects a missing independent pin before bootstrap', async () => {
     let called = false
     await expect(runHostedControlFromDescriptorsWithDependencies(dependencies({
-      expectedOwnerArtifactDigest: undefined,
+      expectedOwnerExecutableDigest: undefined,
       readBootstrap: async () => { called = true; return admission },
-    }))).rejects.toThrow('Hosted control owner artifact digest pin was rejected')
+    }))).rejects.toThrow('Hosted control owner executable digest pin was rejected')
     expect(called).toBe(false)
   })
 
@@ -51,9 +51,9 @@ describe('hosted control production descriptor fast path', () => {
     ]) {
       let called = false
       await expect(runHostedControlFromDescriptorsWithDependencies(dependencies({
-        expectedOwnerArtifactDigest: wrong,
+        expectedOwnerExecutableDigest: wrong,
         readBootstrap: async () => { called = true; return admission },
-      }))).rejects.toThrow('Hosted control owner artifact digest pin was rejected')
+      }))).rejects.toThrow('Hosted control owner executable digest pin was rejected')
       expect(called).toBe(false)
     }
   })
@@ -62,9 +62,9 @@ describe('hosted control production descriptor fast path', () => {
     const wrong = `sha256:${'b'.repeat(64)}` as `sha256:${string}`
     let ranAdmission = false
     await expect(runHostedControlFromDescriptorsWithDependencies(dependencies({
-      expectedOwnerArtifactDigest: wrong,
+      expectedOwnerExecutableDigest: wrong,
       readBootstrap: async options => {
-        expect(options).toEqual({ expectedOwnerArtifactDigest: wrong })
+        expect(options).toEqual({ expectedOwnerExecutableDigest: wrong })
         throw new Error('bootstrap pin mismatch')
       },
       runAdmission: async () => { ranAdmission = true },
@@ -77,7 +77,7 @@ function dependencies(
   overrides: Partial<HostedControlMainDependencies>,
 ): HostedControlMainDependencies {
   return {
-    expectedOwnerArtifactDigest: undefined,
+    expectedOwnerExecutableDigest: undefined,
     readBootstrap: async () => admission,
     runAdmission: async () => undefined,
     ...overrides,

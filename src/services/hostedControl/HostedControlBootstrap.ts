@@ -44,6 +44,8 @@ export type HostedControlLauncherLeaseV1 = {
   format: typeof HOSTED_CONTROL_LAUNCHER_LEASE_FORMAT
   launcherLeaseId: string
   ownerArtifactDigest: `sha256:${string}`
+  /** Present only for Core lifecycle admission; SHA256 of the compiled owner launcher. */
+  ownerExecutableDigest?: `sha256:${string}`
   bootstrapDigest: string
   proofKeyId: string
   ownerGeneration: number
@@ -75,7 +77,7 @@ export type HostedApprovalActivationV2BootstrapExpectation = {
   }
 }
 
-export type HostedControlBootstrapHeader = {
+type HostedControlBootstrapHeaderBase = {
   format: typeof HOSTED_CONTROL_BOOTSTRAP_FORMAT
   restoreGeneration: number
   teamId: string
@@ -86,9 +88,13 @@ export type HostedControlBootstrapHeader = {
   claudeRoot: string
   socketPath: string
   legacyKey: string
-  approvalActivationV2: HostedApprovalActivationV2BootstrapExpectation
   bootstrapBinding: HostedControlBootstrapBinding
   leaseEvidence: HostedControlLeaseEvidence
+}
+
+export type HostedControlBootstrapHeader = HostedControlBootstrapHeaderBase & {
+  admissionKind?: 'core-lifecycle-v1'
+  approvalActivationV2?: HostedApprovalActivationV2BootstrapExpectation
 }
 
 export type HostedControlDescriptorGuard = {
@@ -100,7 +106,7 @@ export type HostedControlDescriptorGuard = {
 export type HostedControlBootstrapAdmission = {
   config: Omit<HostedControlRuntimeConfig, 'secretFile'>
   bootstrapBinding: HostedControlBootstrapBinding
-  approvalActivationV2: HostedApprovalActivationV2BootstrapExpectation
+  approvalActivationV2?: HostedApprovalActivationV2BootstrapExpectation
   expectedOwnerArtifactDigest: `sha256:${string}`
   secret: Buffer
   guard: HostedControlDescriptorGuard
@@ -110,6 +116,11 @@ const HEADER_KEYS = [
   'format', 'restoreGeneration', 'teamId', 'declaredRootHash', 'ownerAuthority',
   'ownerGeneration', 'ownerSessionId', 'claudeRoot', 'socketPath', 'legacyKey',
   'approvalActivationV2', 'bootstrapBinding', 'leaseEvidence',
+] as const
+const CORE_HEADER_KEYS = [
+  'format', 'admissionKind', 'restoreGeneration', 'teamId', 'declaredRootHash',
+  'ownerAuthority', 'ownerGeneration', 'ownerSessionId', 'claudeRoot', 'socketPath',
+  'legacyKey', 'bootstrapBinding', 'leaseEvidence',
 ] as const
 const BINDING_KEYS = [
   'deploymentId', 'bootId', 'workspaceId', 'mountGeneration', 'bootstrapDigest',
@@ -131,6 +142,10 @@ const LEASE_KEYS = [
   'format', 'launcherLeaseId', 'ownerArtifactDigest', 'bootstrapDigest',
   'proofKeyId', 'ownerGeneration', 'ownerSessionId',
 ] as const
+const CORE_LEASE_KEYS = [
+  'format', 'launcherLeaseId', 'ownerArtifactDigest', 'ownerExecutableDigest',
+  'bootstrapDigest', 'proofKeyId', 'ownerGeneration', 'ownerSessionId',
+] as const
 
 /**
  * Admits the fixed inherited-descriptor bootstrap. FD 5 is unconditionally
@@ -138,7 +153,7 @@ const LEASE_KEYS = [
  * filesystem/runtime effects after the returned admission is available.
  */
 export async function readHostedControlBootstrap(options: {
-  expectedOwnerArtifactDigest: `sha256:${string}`
+  expectedOwnerExecutableDigest: `sha256:${string}`
   bootstrapFd?: number
   launcherLeaseFd?: number
   livenessFd?: number
@@ -185,7 +200,7 @@ export async function readHostedControlBootstrap(options: {
       launcherLeaseFd, descriptorStats[0], header.leaseEvidence,
     )
     validateBootstrapBinding(
-      header, lease, secret, options.expectedOwnerArtifactDigest,
+      header, lease, secret, options.expectedOwnerExecutableDigest,
     )
     ensureBeforeDeadline(deadlineAt)
     if (!(await descriptorHasLiveWriter(livenessFd))) fail()
@@ -210,7 +225,7 @@ export async function readHostedControlBootstrap(options: {
     const result = {
       config,
       bootstrapBinding: header.bootstrapBinding,
-      approvalActivationV2: header.approvalActivationV2,
+      ...(header.approvalActivationV2 ? { approvalActivationV2: header.approvalActivationV2 } : {}),
       expectedOwnerArtifactDigest: lease.ownerArtifactDigest,
       secret,
       guard,
@@ -241,11 +256,13 @@ function decodeCanonicalHeader(bytes: Buffer): HostedControlBootstrapHeader {
   try { text = new TextDecoder('utf-8', { fatal: true }).decode(bytes) } catch { fail() }
   let unknown: unknown
   try { unknown = JSON.parse(text) } catch { fail() }
-  const raw = exactRecord(unknown, HEADER_KEYS)
+  const isCore = !!unknown && typeof unknown === 'object' && !Array.isArray(unknown) &&
+    (unknown as Record<string, unknown>).admissionKind === 'core-lifecycle-v1'
+  const raw = exactRecord(unknown, isCore ? CORE_HEADER_KEYS : HEADER_KEYS)
   if (JSON.stringify(raw) !== text) fail()
   const binding = exactRecord(raw.bootstrapBinding, BINDING_KEYS)
-  const activation = exactRecord(raw.approvalActivationV2, ACTIVATION_KEYS)
-  const signedManifest = exactRecord(activation.signedManifest, SIGNED_MANIFEST_KEYS)
+  const activation = isCore ? null : exactRecord(raw.approvalActivationV2, ACTIVATION_KEYS)
+  const signedManifest = activation ? exactRecord(activation.signedManifest, SIGNED_MANIFEST_KEYS) : null
   const evidence = exactRecord(raw.leaseEvidence, EVIDENCE_KEYS)
   const header: HostedControlBootstrapHeader = {
     format: exactString(raw.format, /^agent-teams\.hosted-control\.bootstrap\/v1$/) as typeof HOSTED_CONTROL_BOOTSTRAP_FORMAT,
@@ -258,7 +275,7 @@ function decodeCanonicalHeader(bytes: Buffer): HostedControlBootstrapHeader {
     claudeRoot: absoluteCanonicalPath(raw.claudeRoot),
     socketPath: absoluteCanonicalPath(raw.socketPath, 103),
     legacyKey: exactString(raw.legacyKey, /^[A-Za-z0-9_-]{1,128}$/),
-    approvalActivationV2: {
+    ...(isCore ? { admissionKind: exactString(raw.admissionKind, /^core-lifecycle-v1$/) as 'core-lifecycle-v1' } : { approvalActivationV2: {
       approvalGeneration: integer(activation.approvalGeneration, 1),
       admissionOwnerGeneration: integer(activation.admissionOwnerGeneration, 1),
       approvalDigest: exactString(activation.approvalDigest, /^sha256:[0-9a-f]{64}$/) as `sha256:${string}`,
@@ -266,12 +283,12 @@ function decodeCanonicalHeader(bytes: Buffer): HostedControlBootstrapHeader {
       ownerArtifactDigest: exactString(activation.ownerArtifactDigest, /^sha256:[0-9a-f]{64}$/) as `sha256:${string}`,
       wireCapabilityDigest: exactString(activation.wireCapabilityDigest, /^sha256:[0-9a-f]{64}$/) as `sha256:${string}`,
       signedManifest: {
-        format: exactString(signedManifest.format, /^agent-teams\.hosted-lifecycle-owner-admission\/v4$/) as 'agent-teams.hosted-lifecycle-owner-admission/v4',
-        manifestDigest: exactString(signedManifest.manifestDigest, /^sha256:[0-9a-f]{64}$/) as `sha256:${string}`,
-        releasePinDigest: exactString(signedManifest.releasePinDigest, /^sha256:[0-9a-f]{64}$/) as `sha256:${string}`,
-        launcherKeyId: exactString(signedManifest.launcherKeyId, /^[0-9a-f]{64}$/),
+        format: exactString(signedManifest!.format, /^agent-teams\.hosted-lifecycle-owner-admission\/v4$/) as 'agent-teams.hosted-lifecycle-owner-admission/v4',
+        manifestDigest: exactString(signedManifest!.manifestDigest, /^sha256:[0-9a-f]{64}$/) as `sha256:${string}`,
+        releasePinDigest: exactString(signedManifest!.releasePinDigest, /^sha256:[0-9a-f]{64}$/) as `sha256:${string}`,
+        launcherKeyId: exactString(signedManifest!.launcherKeyId, /^[0-9a-f]{64}$/),
       },
-    },
+    } }),
     bootstrapBinding: {
       deploymentId: exactString(binding.deploymentId, ID),
       bootId: exactString(binding.bootId, ID),
@@ -298,18 +315,23 @@ function validateBootstrapBinding(
   header: HostedControlBootstrapHeader,
   lease: HostedControlLauncherLeaseV1,
   secret: Buffer,
-  expectedOwnerArtifactDigest: unknown,
+  expectedOwnerExecutableDigest: unknown,
 ): void {
   const { bootstrapBinding: binding, approvalActivationV2: activation } = header
-  if (exactString(expectedOwnerArtifactDigest, /^sha256:[0-9a-f]{64}$/) !== lease.ownerArtifactDigest) fail()
+  if ((header.admissionKind === 'core-lifecycle-v1') !==
+    (lease.ownerExecutableDigest !== undefined)) fail()
+  if (header.admissionKind === 'core-lifecycle-v1') {
+    if (exactString(expectedOwnerExecutableDigest, /^sha256:[0-9a-f]{64}$/) !== lease.ownerExecutableDigest ||
+      lease.ownerExecutableDigest === lease.ownerArtifactDigest) fail()
+  } else if (exactString(expectedOwnerExecutableDigest, /^sha256:[0-9a-f]{64}$/) !== lease.ownerArtifactDigest) fail()
   if (lease.launcherLeaseId !== header.leaseEvidence.launcherLeaseId ||
     lease.ownerArtifactDigest !== binding.ownerArtifactDigest ||
-    lease.ownerArtifactDigest !== activation.ownerArtifactDigest ||
+    (activation && lease.ownerArtifactDigest !== activation.ownerArtifactDigest) ||
     lease.bootstrapDigest !== binding.bootstrapDigest ||
     lease.proofKeyId !== binding.proofKeyId ||
     lease.proofKeyId !== createHash('sha256').update(secret).digest('hex') ||
     lease.ownerGeneration !== header.ownerGeneration ||
-    lease.ownerGeneration !== activation.admissionOwnerGeneration ||
+    (activation && lease.ownerGeneration !== activation.admissionOwnerGeneration) ||
     lease.ownerSessionId !== header.ownerSessionId) fail()
 }
 
@@ -399,12 +421,15 @@ function decodeCanonicalLease(bytes: Buffer): HostedControlLauncherLeaseV1 {
   try { text = new TextDecoder('utf-8', { fatal: true }).decode(bytes) } catch { fail() }
   let unknown: unknown
   try { unknown = JSON.parse(text) } catch { fail() }
-  const raw = exactRecord(unknown, LEASE_KEYS)
+  const isCore = !!unknown && typeof unknown === 'object' && !Array.isArray(unknown) &&
+    Object.hasOwn(unknown, 'ownerExecutableDigest')
+  const raw = exactRecord(unknown, isCore ? CORE_LEASE_KEYS : LEASE_KEYS)
   if (JSON.stringify(raw) !== text) fail()
   return {
     format: exactString(raw.format, /^agent-teams\.hosted-control\.launcher-lease\/v1$/) as typeof HOSTED_CONTROL_LAUNCHER_LEASE_FORMAT,
     launcherLeaseId: exactString(raw.launcherLeaseId, ID),
     ownerArtifactDigest: exactString(raw.ownerArtifactDigest, /^sha256:[0-9a-f]{64}$/) as `sha256:${string}`,
+    ...(isCore ? { ownerExecutableDigest: exactString(raw.ownerExecutableDigest, /^sha256:[0-9a-f]{64}$/) as `sha256:${string}` } : {}),
     bootstrapDigest: exactString(raw.bootstrapDigest, /^[0-9a-f]{64}$/),
     proofKeyId: exactString(raw.proofKeyId, /^[0-9a-f]{64}$/),
     ownerGeneration: integer(raw.ownerGeneration, 1),
