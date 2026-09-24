@@ -609,7 +609,8 @@ describe('OpenCodeHostManager', () => {
       killProcessTreeAndWait: async (pid, _signal, options) => {
         expect(pid).toBe(43141)
         expect(options.expectedStartedAtMs).toBe(1_000)
-        expect(options.dependencies?.signalExpectedProcess).toBeFunction()
+        expect(options.expectedOsIdentity).toBeNull()
+        expect(options.dependencies?.signalExpectedProcess).toBeUndefined()
         return false
       },
       sleepMs: async () => {},
@@ -627,6 +628,222 @@ describe('OpenCodeHostManager', () => {
       manager.ensureHost({ hostKey: handle.hostKey, hostLifetime: 'process' }),
     ).rejects.toThrow('retained recovery state')
     expect(spawnCount).toBe(1)
+  })
+
+  test('queued disposal cannot terminate a replacement host generation', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-stale-dispose-'))
+    const registryPath = path.join(root, 'registry.json')
+    const hostKey = 'queued-dispose'
+    const oldHandle: OpenCodeHostHandle = {
+      hostKey, profileRootKey: baseProfile.profileRootKey, projectPath: baseProfile.projectPath,
+      projectBehaviorFingerprint: baseProfile.projectBehaviorFingerprint,
+      baseUrl: 'http://127.0.0.1:43140', port: 43140, pid: 43140,
+      processStartedAtMs: 1_000, version: 'fixture', state: 'degraded', profile: baseProfile,
+      resolvedConfigFingerprint: baseProfile.managedConfigFingerprint, diagnostics: [],
+    }
+    const registryRecord = {
+      hostKey, profileRootKey: oldHandle.profileRootKey, projectPath: oldHandle.projectPath,
+      projectBehaviorFingerprint: oldHandle.projectBehaviorFingerprint,
+      managedConfigFingerprint: baseProfile.managedConfigFingerprint,
+      baseUrl: oldHandle.baseUrl, port: oldHandle.port, pid: oldHandle.pid,
+      processStartedAtMs: oldHandle.processStartedAtMs, version: oldHandle.version,
+      resolvedConfigFingerprint: oldHandle.resolvedConfigFingerprint,
+      updatedAt: new Date().toISOString(), leases: {},
+    }
+    const manager = new OpenCodeHostManager({
+      persistentRegistryPath: registryPath,
+      isProcessAlive: () => true,
+      killProcessTreeAndWait: async () => { throw new Error('stale disposal signaled a process') },
+    })
+    type TestEntry = { handle: OpenCodeHostHandle; child: null; refCount: number;
+      ownedByProcess: boolean; lifetime: 'persistent' }
+    const entries = (manager as unknown as { hosts: Map<string, TestEntry> }).hosts
+    const oldEntry: TestEntry = { handle: oldHandle, child: null, refCount: 0,
+      ownedByProcess: false, lifetime: 'persistent' }
+    entries.set(hostKey, oldEntry)
+    const locked = createDeferred()
+    const unlock = createDeferred()
+    const withStartupLock = (manager as unknown as { withPersistentHostStartupLock:
+      (key: string, callback: () => Promise<void>) => Promise<void> }).withPersistentHostStartupLock.bind(manager)
+    let holder: Promise<void> | undefined
+    try {
+      await writeFile(registryPath, JSON.stringify({ schemaVersion: 1,
+        processIdentityFormat: 'platform-native-v2', hosts: { [hostKey]: registryRecord } }))
+      holder = withStartupLock(hostKey, async () => { locked.resolve(); await unlock.promise })
+      await locked.promise
+      const staleDispose = manager.disposeHost(hostKey)
+      // Another generation wins while the stale caller waits for startup lock.
+      const replacement: OpenCodeHostHandle = { ...oldHandle, pid: 43141,
+        port: 43141, baseUrl: 'http://127.0.0.1:43141', processStartedAtMs: 2_000,
+        state: 'healthy' }
+      entries.set(hostKey, { ...oldEntry, handle: replacement })
+      await writeFile(registryPath, JSON.stringify({ schemaVersion: 1,
+        processIdentityFormat: 'platform-native-v2', hosts: { [hostKey]: {
+          ...registryRecord, pid: replacement.pid, port: replacement.port,
+          baseUrl: replacement.baseUrl, processStartedAtMs: replacement.processStartedAtMs,
+        } } }))
+      unlock.resolve()
+      expect(await staleDispose).toBe(false)
+      expect(manager.getHost(hostKey)).toBe(replacement)
+      const persisted = JSON.parse(await readFile(registryPath, 'utf8')) as {
+        hosts: Record<string, { pid: number; processStartedAtMs: number }>
+      }
+      expect(persisted.hosts[hostKey]).toMatchObject({ pid: 43141, processStartedAtMs: 2_000 })
+    } finally {
+      unlock.resolve()
+      await holder?.catch(() => undefined)
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test('ordinary root stop frees active key but retains a tree recovery tombstone', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-unconfirmed-tree-'))
+    const registryPath = path.join(root, 'registry.json')
+    const spawned = createMockChildProcess(43145)
+    let rootAlive = true
+    const signals: NodeJS.Signals[] = []
+    try {
+      const manager = new OpenCodeHostManager({
+        prepareProfile: async () => baseProfile,
+        allocateLoopbackPort: async () => 43145,
+        spawnHostProcess: () => spawned.child,
+        fetchJson: async url => url.endsWith('/global/health')
+          ? { status: 200, data: { healthy: true, version: 'fixture' } }
+          : { status: 200, data: { ok: true } },
+        isProcessAlive: pid => pid === 43145 && rootAlive,
+        readProcessStartTimeMs: async () => rootAlive ? 1_000 : null,
+        killProcessTreeAndWait: async (_pid, signal) => {
+          signals.push(signal)
+          rootAlive = false
+          return false
+        },
+        persistentRegistryPath: registryPath,
+      })
+      const handle = await manager.ensureHost({ hostKey: 'host-key', resolveConfigFingerprint: false })
+      await manager.releaseHost('host-key')
+      expect(signals).toEqual(['SIGTERM', 'SIGKILL'])
+      expect(handle.state).toBe('disposed')
+      expect(manager.getHost('host-key')).toBeNull()
+      const registry = JSON.parse(await readFile(registryPath, 'utf8')) as {
+        hosts: Record<string, { pid: number }>
+        recoveryTrees: Record<string, { pid: number; processStartedAtMs: number }>
+      }
+      expect(registry.hosts['host-key']).toBeUndefined()
+      expect(Object.values(registry.recoveryTrees)).toMatchObject([{
+        pid: 43145, processStartedAtMs: 1_000,
+      }])
+      const sweep = await manager.reconcilePersistentHosts({ reason: 'manual' })
+      expect(sweep.cleaned).toBe(0)
+      expect(sweep.remaining).toBe(1)
+      expect(sweep.hosts[0]?.action).toBe('root_stopped')
+      spawned.child.emit('exit', null, 'SIGTERM')
+      await new Promise(resolve => setTimeout(resolve, 10))
+      expect(Object.values((JSON.parse(await readFile(registryPath, 'utf8')) as {
+        recoveryTrees: Record<string, unknown>
+      }).recoveryTrees)).toHaveLength(1)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test('restores persisted process-tree identity for stable host cleanup', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-tree-identity-'))
+    const registryPath = path.join(root, 'registry.json')
+    const pid = 43144
+    const processTreeIdentity = process.platform === 'win32'
+      ? 'win32-job:fixture-host' : process.platform === 'darwin'
+        ? 'darwin-audit:fixture-host' : `unix-pgid:${pid}`
+    let alive = true
+    const signals: NodeJS.Signals[] = []
+    try {
+      await writeFile(registryPath, JSON.stringify({ schemaVersion: 1,
+        processIdentityFormat: 'platform-native-v2', hosts: { 'host-key': {
+          hostKey: 'host-key', profileRootKey: baseProfile.profileRootKey,
+          projectPath: baseProfile.projectPath,
+          projectBehaviorFingerprint: baseProfile.projectBehaviorFingerprint,
+          managedConfigFingerprint: baseProfile.managedConfigFingerprint,
+          baseUrl: 'http://127.0.0.1:43144', port: 43144, pid,
+          processStartedAtMs: 1_000, processTreeIdentity, version: 'fixture',
+          resolvedConfigFingerprint: baseProfile.managedConfigFingerprint,
+          updatedAt: new Date().toISOString(), leases: {},
+        } } }))
+      const manager = new OpenCodeHostManager({
+        prepareProfile: async () => baseProfile,
+        persistentRegistryPath: registryPath,
+        fetchJson: async () => ({ status: 200, data: { healthy: true, version: 'fixture' } }),
+        isProcessAlive: target => target === pid && alive,
+        readProcessStartTimeMs: async () => 1_000,
+        killProcessTreeAndWait: async (target, signal, options) => {
+          expect(target).toBe(pid)
+          expect(options.expectedStartedAtMs).toBe(1_000)
+          expect(options.expectedOsIdentity).toBe(processTreeIdentity)
+          signals.push(signal)
+          alive = false
+          return true
+        },
+      })
+      const retained = await manager.ensureHost({ hostKey: 'host-key', existingOnly: true })
+      expect(retained.processTreeIdentity).toBe(processTreeIdentity)
+      expect(await manager.disposeHost('host-key')).toBe(true)
+      expect(signals).toEqual(['SIGTERM'])
+    } finally { await rm(root, { recursive: true, force: true }) }
+  })
+
+  test('terminal dead-run CAS preserves old tree evidence beside a new host generation', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-dead-tree-tombstone-'))
+    const registryPath = path.join(root, 'registry.json')
+    const oldRecord = {
+      hostKey: 'host-key', profileRootKey: baseProfile.profileRootKey,
+      projectPath: baseProfile.projectPath,
+      projectBehaviorFingerprint: baseProfile.projectBehaviorFingerprint,
+      managedConfigFingerprint: baseProfile.managedConfigFingerprint,
+      baseUrl: 'http://127.0.0.1:43146', port: 43146, pid: 43146,
+      processStartedAtMs: 1_000, processTreeIdentity: 'unix-pgid:43146',
+      attributionId: 'old-attribution', version: 'fixture',
+      resolvedConfigFingerprint: baseProfile.managedConfigFingerprint,
+      updatedAt: new Date().toISOString(), leases: {},
+    }
+    try {
+      await writeFile(registryPath, JSON.stringify({ schemaVersion: 1,
+        processIdentityFormat: 'platform-native-v2', hosts: { 'host-key': oldRecord } }))
+      const manager = new OpenCodeHostManager({
+        prepareProfile: async () => baseProfile,
+        inspectProcessLiveness: async () => 'gone',
+        allocateLoopbackPort: async () => 43147,
+        spawnHostProcess: () => createMockChildProcess(43147).child,
+        isProcessAlive: pid => pid === 43147,
+        readProcessStartTimeMs: async pid => pid === 43147 ? 2_000 : null,
+        fetchJson: async url => url.endsWith('/global/health')
+          ? { status: 200, data: { healthy: true, version: 'fixture' } }
+          : { status: 200, data: { ok: true } },
+        persistentRegistryPath: registryPath,
+      })
+      expect(await manager.withConfirmedAbsentHostAuthority({
+        hostKey: 'host-key', runtimePid: 43146, expectedProcessStartedAtMs: 1_000,
+      }, async () => true)).toBe(true)
+      const afterCas = JSON.parse(await readFile(registryPath, 'utf8')) as {
+        hosts: Record<string, unknown>; recoveryTrees: Record<string, typeof oldRecord>
+      }
+      expect(afterCas.hosts['host-key']).toBeUndefined()
+      expect(Object.values(afterCas.recoveryTrees)).toEqual([oldRecord])
+      const replacement = await manager.ensureHost({ hostKey: 'host-key', resolveConfigFingerprint: false })
+      expect(replacement.pid).toBe(43147)
+      const afterLaunch = JSON.parse(await readFile(registryPath, 'utf8')) as {
+        hosts: Record<string, { pid: number }>; recoveryTrees: Record<string, typeof oldRecord>
+      }
+      expect(afterLaunch.hosts['host-key']?.pid).toBe(43147)
+      expect(Object.values(afterLaunch.recoveryTrees)).toEqual([oldRecord])
+      const sweep = await manager.reconcilePersistentHosts({ reason: 'startup' })
+      expect(sweep.hosts.some(host => host.pid === 43146 && host.action === 'root_stopped')).toBe(true)
+      expect(manager.getHost('host-key')).toBe(replacement)
+      const afterSweep = JSON.parse(await readFile(registryPath, 'utf8')) as {
+        hosts: Record<string, { pid: number }>; recoveryTrees: Record<string, typeof oldRecord>
+      }
+      expect(afterSweep.hosts['host-key']?.pid).toBe(43147)
+      expect(Object.values(afterSweep.recoveryTrees)).toEqual([oldRecord])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
   })
 
   test('does not send an unfenced HTTP dispose request during owned host cleanup', async () => {
@@ -1055,6 +1272,8 @@ describe('OpenCodeHostManager', () => {
         throw new Error(`Unexpected URL ${url}`)
       },
       sleepMs: async () => {},
+      readProcessStartTimeMs: async () => 1_000,
+      killProcessTreeAndWait: async () => true,
       persistentRegistryPath: null,
     })
 
@@ -1101,7 +1320,7 @@ describe('OpenCodeHostManager', () => {
     expect(handle.resolvedConfigFingerprint).toBeNull()
   })
 
-  test('drops a host from the registry when the child exits unexpectedly', async () => {
+  test('retains degraded host recovery state when the child exits unexpectedly', async () => {
     const spawned = createMockChildProcess()
 
     const manager = new OpenCodeHostManager({
@@ -1155,7 +1374,7 @@ describe('OpenCodeHostManager', () => {
     expect(handle.diagnostics.some(message => message.includes('process exited with code 1'))).toBe(
       true,
     )
-    expect(manager.getHost('host-key')).toBeNull()
+    expect(manager.getHost('host-key')).toBe(handle)
   })
 
   test('does not let a delayed old child exit delete a replacement process identity', async () => {
@@ -1333,7 +1552,11 @@ describe('OpenCodeHostManager', () => {
           return alive
         },
         readProcessStartTimeMs: async pid => pid === oldPid ? state.startedAtMs : 3_000,
-        killProcess: pid => { killedPids.push(pid) },
+        killProcessTreeAndWait: async pid => {
+          if (pid === oldPid && !state.alive && !state.reuseAfterDeath) return true
+          killedPids.push(pid)
+          return false
+        },
         allocateLoopbackPort: async () => 43115,
         spawnHostProcess: () => { state.spawnCount++; return createMockChildProcess(43115).child },
         fetchJson: async () => {
@@ -1364,6 +1587,17 @@ describe('OpenCodeHostManager', () => {
       await manager.releaseHost('host-key', { keepPersistentAlive: true })
       state.alive = false
       state.reuseAfterDeath = reuseAfterDeath
+      if (reuseAfterDeath) {
+        const outcomes = await Promise.allSettled([
+          manager.ensureHost({ hostKey: 'host-key', resolveConfigFingerprint: false }),
+          manager.ensureHost({ hostKey: 'host-key', resolveConfigFingerprint: false }),
+        ])
+        expect(outcomes.every(outcome => outcome.status === 'rejected')).toBe(true)
+        expect(state.spawnCount).toBe(0)
+        expect(killedPids).toEqual([])
+        expect(JSON.parse(await readFile(registryPath, 'utf8')).hosts['host-key'].pid).toBe(oldPid)
+        return
+      }
       const [first, second] = await Promise.all([
         manager.ensureHost({ hostKey: 'host-key', resolveConfigFingerprint: false }),
         manager.ensureHost({ hostKey: 'host-key', resolveConfigFingerprint: false }),
@@ -1396,8 +1630,9 @@ describe('OpenCodeHostManager', () => {
       expect(killedPids).toEqual([])
       expect(await readFile(registryPath, 'utf8')).toBe(before)
       await manager.releaseHost('host-key', { keepPersistentAlive: true })
-      expect((await manager.ensureHost({ hostKey: 'host-key' })).state).toBe('healthy')
-      expect(state.spawnCount).toBe(1)
+      await expect(manager.ensureHost({ hostKey: 'host-key' }))
+        .rejects.toThrow('process identity changed; retaining recovery state')
+      expect(state.spawnCount).toBe(0)
       expect(killedPids).toEqual([])
     })
   })
@@ -1422,7 +1657,7 @@ describe('OpenCodeHostManager', () => {
     })
   })
 
-  test('removes a reused registry pid without disposing or signaling the unrelated process', async () => {
+  test('retains a reused registry pid without signaling the unrelated process', async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-host-registry-'))
     const registryPath = path.join(tempDir, 'host-registry.json')
     const fetchUrls: string[] = []
@@ -1471,14 +1706,15 @@ describe('OpenCodeHostManager', () => {
         mode: 'force',
       })
 
-      expect(result.cleaned).toBe(1)
+      expect(result.cleaned).toBe(0)
       expect(result.hosts[0]).toMatchObject({
-        action: 'removed_dead',
-        reason: 'registered pid was reused by a different process',
+        action: 'failed',
+        reason: 'registered pid was reused; process tree termination is unconfirmed',
       })
       expect(fetchUrls).toEqual([])
       expect(killedSignals).toEqual([])
-      await expect(readFile(registryPath, 'utf8')).rejects.toThrow()
+      expect((JSON.parse(await readFile(registryPath, 'utf8')) as { hosts: Record<string, unknown> })
+        .hosts['host-key']).toBeDefined()
     } finally {
       await rm(tempDir, { recursive: true, force: true })
     }
@@ -1597,10 +1833,11 @@ describe('OpenCodeHostManager', () => {
       })
 
       await expect(manager.ensureHost({ hostKey: 'host-key' })).rejects.toThrow(
-        'fresh host requested after pid reuse',
+        'process identity changed; retaining recovery state',
       )
       expect(fetchUrls).toEqual(['http://127.0.0.1:43114/global/health'])
-      await expect(readFile(registryPath, 'utf8')).rejects.toThrow()
+      expect((JSON.parse(await readFile(registryPath, 'utf8')) as { hosts: Record<string, unknown> })
+        .hosts['host-key']).toBeDefined()
     } finally {
       await rm(tempDir, { recursive: true, force: true })
     }
@@ -2465,16 +2702,20 @@ describe('OpenCodeHostManager', () => {
         fetchJson: async url => {
           if (url.endsWith('/global/health')) return { status: 200, data: { healthy: true, version: '1.4.0' } }
           if (url.endsWith('/config')) return { status: 200, data: { server: { port: 43138 } } }
-          if (url.endsWith('/global/dispose') && replaceRegistryOnDispose) {
-            const registry = JSON.parse(await readFile(registryPath, 'utf8')) as { hosts: Record<string, Record<string, unknown>> }
-            registry.hosts['host-key'] = { ...registry.hosts['host-key']!, pid: 53138, processStartedAtMs: 2_000, leases: {} }
-            await writeFile(registryPath, JSON.stringify(registry))
-          }
           return { status: 200, data: { ok: true } }
         },
         isProcessAlive: pid => pid === spawned.child.pid && oldProcessAlive,
         readProcessStartTimeMs: async pid => pid === spawned.child.pid ? 1_000 : 2_000,
-        killProcess: (pid, signal) => { killedSignals.push({ pid, signal }); oldProcessAlive = false },
+        killProcessTreeAndWait: async (pid, signal) => {
+          killedSignals.push({ pid, signal })
+          if (replaceRegistryOnDispose) {
+            const registry = JSON.parse(await readFile(registryPath, 'utf8')) as { hosts: Record<string, Record<string, unknown>> }
+            registry.hosts['host-key'] = { ...registry.hosts['host-key']!, pid: 53138, processStartedAtMs: 2_000, leases: {} }
+            await writeFile(registryPath, JSON.stringify(registry))
+          }
+          oldProcessAlive = false
+          return true
+        },
         sleepMs: async () => {}, persistentRegistryPath: registryPath,
       })
       await manager.ensureHost({ hostKey: 'host-key' })
@@ -2760,7 +3001,7 @@ describe('OpenCodeHostManager', () => {
     }
   })
 
-  test('startup cleanup removes temp dylibs left by a dead registered host', async () => {
+  test('startup cleanup retains temp dylibs for a dead root with unconfirmed descendants', async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-host-registry-'))
     const registryPath = path.join(tempDir, 'host-registry.json')
     const profileTmpPath = path.join(tempDir, 'profiles', 'profile-root', 'tmp')
@@ -2800,8 +3041,8 @@ describe('OpenCodeHostManager', () => {
 
       const result = await manager.reconcilePersistentHosts({ reason: 'startup' })
 
-      expect(result.hosts[0]?.action).toBe('removed_dead')
-      expect(await pathExists(dylibPath)).toBe(false)
+      expect(result.hosts[0]?.action).toBe('root_stopped')
+      expect(await pathExists(dylibPath)).toBe(true)
       expect(await pathExists(keepPath)).toBe(true)
     } finally {
       await rm(tempDir, { recursive: true, force: true })
@@ -3711,7 +3952,7 @@ describe('OpenCodeHostManager process attribution', () => {
         hostKey: 'host-key',
         resolveConfigFingerprint: false,
       })
-      await manager.retainHostLease('host-key', { teamId: 'team-1', memberName: 'alice' })
+      await manager.retainHostLease('host-key', { teamId: 'team-1', memberName: 'alice', runId: 'run-1' })
 
       // A crashed agent leaves its own record behind; only the runtime that
       // wrote it can decide it is stale.
@@ -3728,7 +3969,7 @@ describe('OpenCodeHostManager process attribution', () => {
     }
   })
 
-  test('removes the attribution records of a host that is gone', async () => {
+  test('retains attribution records when host root is gone but tree cleanup is unconfirmed', async () => {
     const { tempDir, registryPath, attributionDirectory } = await createAttributionFixture()
     const spawned = createMockChildProcess(43202)
     try {
@@ -3758,15 +3999,15 @@ describe('OpenCodeHostManager process attribution', () => {
       hostAlive = false
       const reconciliation = await manager.reconcilePersistentHosts({ reason: 'manual' })
 
-      expect(reconciliation.hosts[0]).toMatchObject({ action: 'removed_dead' })
+      expect(reconciliation.hosts[0]).toMatchObject({ action: 'root_stopped' })
       const remaining = await readAttributionRecords(attributionDirectory)
-      expect(remaining.hosts).toEqual([])
-      expect(remaining.agents).toEqual([])
-      expect(await pathExists(agentRecordPath)).toBe(false)
+      expect(remaining.hosts).toHaveLength(1)
+      expect(remaining.agents).toHaveLength(1)
+      expect(await pathExists(agentRecordPath)).toBe(true)
       expect(await pathExists(processAttributionAgentDirectoryPath(
         attributionDirectory,
         handle.attributionId ?? '',
-      ))).toBe(false)
+      ))).toBe(true)
     } finally {
       await rm(tempDir, { recursive: true, force: true })
     }
@@ -3832,7 +4073,7 @@ describe('OpenCodeHostManager process attribution', () => {
     }
   })
 
-  test('keeps a dead host record and the live agent under it when reconcile drops the host', async () => {
+  test('keeps host attribution and registry evidence when dead-root tree cleanup is unconfirmed', async () => {
     const { tempDir, registryPath, attributionDirectory } = await createAttributionFixture()
     const spawned = createMockChildProcess(43207)
     try {
@@ -3863,26 +4104,67 @@ describe('OpenCodeHostManager process attribution', () => {
       const livePath = await writeAgentAttributionRecord(attributionDirectory, attributionId, 999_006)
       const deadPath = await writeAgentAttributionRecord(attributionDirectory, attributionId, 999_007)
 
-      // The host died under a live lead: the registry drops the host, the dead
-      // agent record goes, and the host record stays to name the team the
-      // surviving tree was started for.
+      // The root died under a live lead. The tree boundary is still unproved,
+      // so startup pruning must retain the host ownership evidence.
       hostAlive = false
-      const reconciliation = await manager.reconcilePersistentHosts({ reason: 'manual' })
+      const reconciliation = await manager.reconcilePersistentHosts({ reason: 'startup' })
 
-      expect(reconciliation.hosts[0]).toMatchObject({ action: 'removed_dead' })
+      expect(reconciliation.hosts[0]).toMatchObject({ action: 'failed' })
       const remaining = await readAttributionRecords(attributionDirectory)
       expect(remaining.hosts.map(host => host.record.owners.map(owner => owner.teamId)))
         .toEqual([['team-1']])
-      expect(remaining.agents.map(agent => agent.record.pid)).toEqual([999_006])
+      expect(remaining.agents.map(agent => agent.record.pid).sort()).toEqual([999_006, 999_007])
       expect(await pathExists(livePath)).toBe(true)
-      expect(await pathExists(deadPath)).toBe(false)
-      expect(await pathExists(registryPath)).toBe(false)
+      expect(await pathExists(deadPath)).toBe(true)
+      expect(await pathExists(registryPath)).toBe(true)
     } finally {
       await rm(tempDir, { recursive: true, force: true })
     }
   })
 
-  test('removes the attribution records of a host it unregisters during adoption', async () => {
+  test('startup prune preserves tombstone attribution after terminal dead-run CAS', async () => {
+    const { tempDir, registryPath, attributionDirectory } = await createAttributionFixture()
+    try {
+      const spawned = createMockChildProcess(43208)
+      const original = new OpenCodeHostManager({
+        prepareProfile: async () => baseProfile,
+        allocateLoopbackPort: async () => 43208,
+        spawnHostProcess: () => spawned.child,
+        fetchJson: attributionFetchJson,
+        isProcessAlive: pid => pid === 43208,
+        readProcessStartTimeMs: async () => 7_000,
+        persistentRegistryPath: registryPath,
+        processAttributionDirectory: attributionDirectory,
+      })
+      const handle = await original.ensureHost({ hostKey: 'host-key', resolveConfigFingerprint: false })
+      const attributionId = handle.attributionId ?? ''
+      const agentPath = await writeAgentAttributionRecord(attributionDirectory, attributionId, 999_008)
+      const recovery = new OpenCodeHostManager({
+        persistentRegistryPath: registryPath,
+        processAttributionDirectory: attributionDirectory,
+        inspectProcessLiveness: async () => 'gone',
+        isProcessAlive: () => false,
+        readProcessStartTimeMs: async () => null,
+      })
+      expect(await recovery.withConfirmedAbsentHostAuthority({
+        hostKey: 'host-key', runtimePid: 43208, expectedProcessStartedAtMs: 7_000,
+      }, async () => true)).toBe(true)
+      const sweep = await recovery.reconcilePersistentHosts({ reason: 'startup' })
+      expect(sweep.hosts.some(host => host.pid === 43208 && host.action === 'root_stopped')).toBe(true)
+      const records = await readAttributionRecords(attributionDirectory)
+      expect(records.hosts.map(host => host.record.attributionId)).toContain(attributionId)
+      expect(records.agents.map(agent => agent.record.pid)).toContain(999_008)
+      expect(await pathExists(agentPath)).toBe(true)
+      const registry = JSON.parse(await readFile(registryPath, 'utf8')) as {
+        recoveryTrees: Record<string, { attributionId: string }>
+      }
+      expect(Object.values(registry.recoveryTrees).map(tree => tree.attributionId)).toEqual([attributionId])
+    } finally {
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('retains attribution when adoption finds an unconfirmed dead-root tree', async () => {
     const { tempDir, registryPath, attributionDirectory } = await createAttributionFixture()
     const spawned = createMockChildProcess(43205)
     try {
@@ -3908,8 +4190,8 @@ describe('OpenCodeHostManager process attribution', () => {
         999_003,
       )
 
-      // A later process finds the registered host dead: unregistering it is
-      // what retires its evidence, and no replacement host is available here.
+      // A later process finds the registered root dead, but its descendant
+      // tree has not been proved empty.
       const restarted = new OpenCodeHostManager({
         prepareProfile: async () => baseProfile,
         allocateLoopbackPort: async () => 43206,
@@ -3924,12 +4206,13 @@ describe('OpenCodeHostManager process attribution', () => {
       await expect(restarted.ensureHost({
         hostKey: 'host-key',
         resolveConfigFingerprint: false,
-      })).rejects.toThrow('no replacement host in this test')
+      })).rejects.toThrow('root stopped but process tree proof is pending')
 
       const remaining = await readAttributionRecords(attributionDirectory)
-      expect(remaining.hosts.map(host => host.record.attributionId)).not.toContain(attributionId)
-      expect(remaining.agents).toEqual([])
-      expect(await pathExists(agentRecordPath)).toBe(false)
+      expect(remaining.hosts.map(host => host.record.attributionId)).toContain(attributionId)
+      expect(remaining.agents).toHaveLength(1)
+      expect(await pathExists(agentRecordPath)).toBe(true)
+      expect(await pathExists(registryPath)).toBe(true)
     } finally {
       await rm(tempDir, { recursive: true, force: true })
     }

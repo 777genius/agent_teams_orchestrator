@@ -47,7 +47,7 @@ test('startup exhausted after awaited identity cannot mutate; every unprocessed 
   })
 })
 
-test('startup multiple candidates share repeated four-second identity budget and never POST or spawn a host', async () => {
+test('startup shares the identity budget but retains taskkill-only trees', async () => {
   await fixture(async path => {
     let now = 0
     const origin = 1_700_000_000_000
@@ -64,14 +64,22 @@ test('startup multiple candidates share repeated four-second identity budget and
     })
     const manager = new OpenCodeHostManager({ persistentRegistryPath: path, isProcessAlive: pid => alive.has(pid),
       readProcessStartTimeMs: async (_pid, timeout) => { queryCaps.push(timeout!); now += 4_000; return 1000 },
+      killProcessTreeAndWait: async () => false,
       fetchJson,
       spawnHostProcess: () => { throw new Error('unexpected host') } })
     const result = await manager.reconcilePersistentHosts({ startupBudget: budget, reason: 'startup' })
-    expect(result.cleaned).toBe(1)
-    expect(result.startupCleanup).toEqual({ completion: 'drained', coverage: 'partial', survivingPids: [41002] })
+    expect(result.cleaned).toBe(0)
+    expect(result.hosts.map(host => host.action)).toEqual(['root_stopped', 'failed'])
+    expect(result.startupCleanup).toMatchObject({ completion: 'drained', coverage: 'partial' })
+    expect(result.startupCleanup?.survivingPids.sort()).toEqual([41001, 41002])
     expect(fetchJson).not.toHaveBeenCalled()
     expect(queryCaps).toEqual([6000, 6000, 6000, 6000, 2000])
     expect(spawn).toHaveBeenCalledTimes(1)
+    const persisted = JSON.parse(await readFile(path, 'utf8')) as {
+      hosts: Record<string, unknown>; recoveryTrees: Record<string, { pid: number }>
+    }
+    expect(Object.keys(persisted.hosts)).toEqual(['host-41002'])
+    expect(Object.values(persisted.recoveryTrees).map(tree => tree.pid)).toEqual([41001])
   })
 })
 
@@ -157,7 +165,8 @@ test('CLI publishes drained partial evidence only after original late helper clo
       return nativeTimeout(fn, ms, ...args)
     }) as typeof setTimeout)
     const manager = new OpenCodeHostManager({ persistentRegistryPath: path,
-      isProcessAlive: () => true, readProcessStartTimeMs: async () => 1000, killProcess: signal })
+      isProcessAlive: () => true, readProcessStartTimeMs: async () => 1000,
+      killProcessTreeAndWait: async () => false })
     const reconcile = spyOn(openCodeHostManager, 'reconcilePersistentHosts')
       .mockImplementation(opts => manager.reconcilePersistentHosts(opts))
     spyOn(openCodeHostManager, 'drainStartupCleanupLockReleases').mockImplementation(async () => {

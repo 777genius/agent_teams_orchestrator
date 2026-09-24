@@ -2465,7 +2465,9 @@ export class OpenCodeSessionBridge {
     } = { phase: 'not_started' }
     try {
       return await this.withSessionHost(record, async ({ baseUrl, profile, host }) => {
-      if (record.profileScope?.purpose === 'launch_runtime') {
+      // A run-bound legacy session still has durable ownership even without a
+      // sealed launch scope. Recheck it after host acquisition, before POST.
+      if (record.runId || record.profileScope?.purpose === 'launch_runtime') {
         await this.assertExactSessionAuthority(record)
       }
       if (params.authorizeObservation &&

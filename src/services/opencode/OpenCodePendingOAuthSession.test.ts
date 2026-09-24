@@ -20,6 +20,8 @@ const terminalMessages = (messageId: string) => [
   { info: { id: messageId, role: 'user' }, parts: [] },
   { info: { id: 'assistant', role: 'assistant', parentID: messageId, providerID: 'xai', modelID: 'grok-4.3', time: { completed: 1 } }, parts: [] },
 ]
+const leaseKeyFor = (record: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName' | 'opencodeSessionId'>) =>
+  `${record.teamId}::${record.laneId}::${record.memberName}::session:${record.opencodeSessionId}`
 
 describe('pending native OAuth session authority', () => {
   let root: string, project: string, global: string, registryPath: string, sessionPath: string
@@ -69,7 +71,7 @@ describe('pending native OAuth session authority', () => {
     expect(birth).toBeGreaterThan(0)
     owner = { record, baseUrl: 'http://127.0.0.1:43210', pid: process.pid, processStartedAtMs: birth!,
       messageId: 'msg-TEST', noReply: false }
-    const leaseKey = 'TEST::primary::owner'
+    const leaseKey = leaseKeyFor(record)
     registry = { schemaVersion: 1, processIdentityFormat: 'platform-native-v2', hosts: { [record.hostKey]: {
       ...record, baseUrl: owner.baseUrl, port: 43210, pid: owner.pid, processStartedAtMs: birth,
       version: 'TEST', resolvedConfigFingerprint: profile.managedConfigFingerprint,
@@ -95,8 +97,8 @@ describe('pending native OAuth session authority', () => {
     const other = { ...owner.record, memberName: 'other', runId: 'run-2', opencodeSessionId: 'other-session' }
     await sessionStore.upsert(other)
     const leases = registry.hosts[owner.record.hostKey].leases
-    leases['TEST::primary::other'] = { ...leases['TEST::primary::owner'],
-      leaseKey: 'TEST::primary::other', memberName: other.memberName, runId: other.runId, sessionId: other.opencodeSessionId }
+    leases[leaseKeyFor(other)] = { ...leases[leaseKeyFor(owner.record)],
+      leaseKey: leaseKeyFor(other), memberName: other.memberName, runId: other.runId, sessionId: other.opencodeSessionId }
     await saveRegistry()
     await arm()
     status = { type: 'busy' }
@@ -199,7 +201,7 @@ describe('pending native OAuth session authority', () => {
       const other = { ...owner.record, memberName: 'other', opencodeSessionId: 'other-session' }
       await sessionStore.upsert(other)
       const leases = registry.hosts[owner.record.hostKey].leases
-      leases['TEST::primary::other'] = { ...leases['TEST::primary::owner'], leaseKey: 'TEST::primary::other',
+      leases[leaseKeyFor(other)] = { ...leases[leaseKeyFor(owner.record)], leaseKey: leaseKeyFor(other),
         memberName: 'other', sessionId: other.opencodeSessionId }
       await saveRegistry()
       const hosts = new OpenCodeHostManager({ persistentRegistryPath: registryPath })
@@ -357,7 +359,7 @@ describe('pending native OAuth session authority', () => {
           }
           await writeFile(sessionPath, JSON.stringify(stored))
           if (scenario === 'rotated-peer') {
-            registry.hosts[owner.record.hostKey].leases['TEST::primary::other'].runId = 'newer-run'
+            registry.hosts[owner.record.hostKey].leases[leaseKeyFor(other)].runId = 'newer-run'
             await saveRegistry()
             expect(await manager.readCompletedSessionOAuthRotation((await sessionStore.get('TEST', 'primary', 'other'))!, env)).toBeNull()
             expect((await call('opencode.sendMessage', 'other', { runId: 'newer-run' })).ok).toBe(false)
@@ -570,10 +572,10 @@ describe('pending native OAuth session authority', () => {
     // Only the synthetic canonical native transport is mocked in the fresh child.
     // Default ProfileManager recovery constructs real HostManager and SessionStore
     // from the captured data root and reads the live parent process birth.
-    const script = `import { mock } from 'bun:test';
-      mock.module(${JSON.stringify(path.join(import.meta.dir, 'OpenCodeClientFactory.ts'))}, () => ({
-        openCodeClientFactory: { create: () => ({ getSessionStatus: async () => ({ 'native-session': 'idle' }),
-          getSessionMessages: async () => ${JSON.stringify(terminalMessages(owner.messageId))} }) } }));
+    const script = `import { spyOn } from 'bun:test';
+      const { openCodeClientFactory } = await import(${JSON.stringify(path.join(import.meta.dir, 'OpenCodeClientFactory.ts'))});
+      spyOn(openCodeClientFactory, 'create').mockImplementation(() => ({ getSessionStatus: async () => ({ 'native-session': 'idle' }),
+        getSessionMessages: async () => ${JSON.stringify(terminalMessages(owner.messageId))} }));
       const { resolveOpenCodeProfileScope, OpenCodeProfileManager } = await import(${JSON.stringify(path.join(import.meta.dir, 'OpenCodeProfileManager.ts'))});
       const scope = await resolveOpenCodeProfileScope({ projectPath: process.argv[1], selectedModel: 'xai/grok-4.3', purpose: 'launch_runtime' });
       const manager = new OpenCodeProfileManager();
@@ -617,8 +619,8 @@ describe('pending native OAuth session authority', () => {
     await writeFile(profile.managedAuthPath, JSON.stringify({ xai: c1 }))
     messages = terminalMessages(owner.messageId)
     const host = registry.hosts[owner.record.hostKey]
-    if (mutation === 'lease-run') host.leases['TEST::primary::owner'].runId = 'foreign'
-    if (mutation === 'lease-session') host.leases['TEST::primary::owner'].sessionId = 'foreign'
+    if (mutation === 'lease-run') host.leases[leaseKeyFor(owner.record)].runId = 'foreign'
+    if (mutation === 'lease-session') host.leases[leaseKeyFor(owner.record)].sessionId = 'foreign'
     if (mutation === 'birth') host.processStartedAtMs += 1
     if (mutation === 'endpoint') host.baseUrl = 'https://example.invalid'
     if (mutation === 'proof') await sessionStore.upsert({ ...owner.record, expectedBehaviorFingerprint: 'foreign' })
@@ -944,7 +946,7 @@ describe('pending native OAuth session authority', () => {
     const replacement = { ...c1, refresh: 'NEW-SAVED-SUCCESSOR' }
     if (mutation === 'new-saved-successor') onAbort = () => writeFile(global, JSON.stringify({ xai: replacement }))
     await expect(bridge.releaseSession(owner.record, { strictLeaseRelease: true })).rejects.toThrow()
-    expect(JSON.parse(await readFile(registryPath, 'utf8')).hosts[owner.record.hostKey].leases['TEST::primary::owner']).toBeDefined()
+    expect(JSON.parse(await readFile(registryPath, 'utf8')).hosts[owner.record.hostKey].leases[leaseKeyFor(owner.record)]).toBeDefined()
     expect((await sessionStore.get('TEST', 'primary', 'owner'))?.stoppedAt).toBeUndefined()
     expect(await readSaved()).toEqual(mutation === 'new-saved-successor' ? replacement : c0)
   })
@@ -954,8 +956,8 @@ describe('pending native OAuth session authority', () => {
     await writeFile(profile.managedAuthPath, JSON.stringify({ xai: c1 }))
     const peer = { ...owner.record, memberName: 'peer', runId: 'peer-run', opencodeSessionId: 'peer-session' }
     await sessionStore.upsert(peer)
-    registry.hosts[owner.record.hostKey].leases['TEST::primary::peer'] = {
-      ...registry.hosts[owner.record.hostKey].leases['TEST::primary::owner'], leaseKey: 'TEST::primary::peer',
+    registry.hosts[owner.record.hostKey].leases[leaseKeyFor(peer)] = {
+      ...registry.hosts[owner.record.hostKey].leases[leaseKeyFor(owner.record)], leaseKey: leaseKeyFor(peer),
       memberName: 'peer', runId: peer.runId, sessionId: peer.opencodeSessionId,
     }
     await saveRegistry()
@@ -964,16 +966,16 @@ describe('pending native OAuth session authority', () => {
     expect(abortCalls).toBe(0)
     expect(await readFile(`${global}.agent-teams-xai-oauth-save.json`, 'utf8')).toBe(before)
     expect(await readSaved()).toEqual(c0)
-    expect(JSON.parse(await readFile(registryPath, 'utf8')).hosts[owner.record.hostKey].leases['TEST::primary::owner']).toBeDefined()
+    expect(JSON.parse(await readFile(registryPath, 'utf8')).hosts[owner.record.hostKey].leases[leaseKeyFor(owner.record)]).toBeDefined()
   })
 
   test('fresh-process Stop saves owned C1 before revoking its lease and new resolution reuses C1', async () => {
     await arm()
     await writeFile(profile.managedAuthPath, JSON.stringify({ xai: c1 }))
-    const script = `import { mock } from 'bun:test';
-      mock.module(${JSON.stringify(path.join(import.meta.dir, 'OpenCodeClientFactory.ts'))}, () => ({
-        openCodeClientFactory: { create: () => ({ getSessionStatus: async () => ({ 'native-session': 'idle' }),
-          getSessionMessages: async () => ${JSON.stringify(terminalMessages(owner.messageId).slice(0, 1))}, abortSession: async () => true }) } }));
+    const script = `import { spyOn } from 'bun:test';
+      const { openCodeClientFactory } = await import(${JSON.stringify(path.join(import.meta.dir, 'OpenCodeClientFactory.ts'))});
+      spyOn(openCodeClientFactory, 'create').mockImplementation(() => ({ getSessionStatus: async () => ({ 'native-session': 'idle' }),
+        getSessionMessages: async () => ${JSON.stringify(terminalMessages(owner.messageId).slice(0, 1))}, abortSession: async () => true }));
       const { OpenCodeSessionBridge } = await import(${JSON.stringify(path.join(import.meta.dir, 'OpenCodeSessionBridge.ts'))});
       const { openCodeSessionStore } = await import(${JSON.stringify(path.join(import.meta.dir, 'OpenCodeSessionStore.ts'))});
       const { resolveOpenCodeProfileScope, OpenCodeProfileManager } = await import(${JSON.stringify(path.join(import.meta.dir, 'OpenCodeProfileManager.ts'))});
@@ -987,7 +989,7 @@ describe('pending native OAuth session authority', () => {
     const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited])
     expect(stderr).toBe(''); expect(code).toBe(0); expect(stdout).toBe(c1.refresh)
     expect((await sessionStore.get('TEST', 'primary', 'owner'))?.stoppedAt).toBeDefined()
-    expect(JSON.parse(await readFile(registryPath, 'utf8')).hosts[owner.record.hostKey].leases['TEST::primary::owner']).toBeUndefined()
+    expect(JSON.parse(await readFile(registryPath, 'utf8')).hosts[owner.record.hostKey].leases[leaseKeyFor(owner.record)]).toBeUndefined()
   })
 
   test('uncertain HTTP failure leaves native ownership available for later terminal recovery', async () => {

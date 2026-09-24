@@ -346,11 +346,13 @@ describe('OpenCodeSessionBridge', () => {
   test('authorizes permission only after prepareProfile and ensureHost, immediately before provider POST', async () => {
     const order: string[] = []
     let releaseHost!: () => void
+    let signalHostStarted!: () => void
+    const hostStarted = new Promise<void>(resolve => { signalHostStarted = resolve })
     const delayedHost = new Promise<void>(resolve => { releaseHost = resolve })
     const bridge = new OpenCodeSessionBridge({
       prepareProfile: async () => { order.push('profile'); return profile },
       hostManager: {
-        ensureHost: async () => { order.push('host-start'); await delayedHost; order.push('host-ready'); return { ...host, processStartedAtMs: 1000 } },
+        ensureHost: async () => { order.push('host-start'); signalHostStarted(); await delayedHost; order.push('host-ready'); return { ...host, processStartedAtMs: 1000 } },
         releaseHost: async () => {},
         retainHostLease: async () => {},
       },
@@ -367,7 +369,8 @@ describe('OpenCodeSessionBridge', () => {
         return false
       },
     })
-    await Promise.resolve(); expect(order).toContain('profile')
+    await hostStarted
+    expect(order).toEqual(['profile', 'host-start'])
     releaseHost()
     await expect(pending).rejects.toBeInstanceOf(OpenCodePermissionEffectNotAuthorizedError)
     expect(order).toEqual(['profile', 'host-start', 'host-ready', 'authorize:123:1000'])
@@ -2598,7 +2601,7 @@ describe('OpenCodeSessionBridge', () => {
   })
 
   test('rejects permission dispatch when the session is replaced during host acquisition', async () => {
-    const record = buildRecord()
+    const record = buildRecord({ runId: 'original-run' })
     let current = record
     let answers = 0
     const bridge = new OpenCodeSessionBridge({
@@ -2618,7 +2621,9 @@ describe('OpenCodeSessionBridge', () => {
     })
     await expect(bridge.answerPermission(record, {
       requestId: 'perm-1', decision: 'allow',
-    })).rejects.toThrow('no longer active')
+    })).rejects.toMatchObject({
+      cause: expect.objectContaining({ message: expect.stringContaining('no longer active') }),
+    })
     expect(answers).toBe(0)
   })
 

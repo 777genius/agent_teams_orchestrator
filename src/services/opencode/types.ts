@@ -83,6 +83,8 @@ export type OpenCodeHostHandle = {
   port: number
   pid: number
   processStartedAtMs?: number | null
+  /** Captured OS process-tree boundary for stable, incarnation-bound cleanup. */
+  processTreeIdentity?: string | null
   /** Joins this host to the attribution records its process tree writes. */
   attributionId?: string | null
   version: string | null

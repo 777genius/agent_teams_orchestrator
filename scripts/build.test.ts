@@ -36,6 +36,14 @@ import { superviseTrustedBuilds } from './process-group-supervisor.js'
 
 const repoRoot = resolve(import.meta.dir, '..')
 const buildScript = resolve(repoRoot, 'scripts/build.ts')
+async function copyBuildScriptFixture(root: string): Promise<void> {
+  const scripts = join(root, 'scripts')
+  const cursorPlugin = join(scripts, 'cursor-plugin')
+  await mkdir(cursorPlugin, { recursive: true })
+  await cp(buildScript, join(scripts, 'build.ts'))
+  await cp(join(repoRoot, 'scripts/cursor-plugin/stage.ts'), join(cursorPlugin, 'stage.ts'))
+  await cp(join(repoRoot, 'scripts/cursor-plugin/build.ts'), join(cursorPlugin, 'build.ts'))
+}
 const hostedControlFixtureLibc = dlopen('libc.so.6', {
   memfd_create: { args: [FFIType.ptr, FFIType.u32], returns: FFIType.i32 },
   fcntl: { args: [FFIType.i32, FFIType.i32, FFIType.i32], returns: FFIType.i32 },
@@ -185,8 +193,7 @@ describe('release build feature plan', () => {
   test('publishes a portable CLI bundle without deleting a preinstalled owner pair', async () => {
     const root = await mkdtemp(join(tmpdir(), 'portable-cli-publication-'))
     fixtureRoots.push(root)
-    await mkdir(join(root, 'scripts'), { recursive: true })
-    await cp(buildScript, join(root, 'scripts', 'build.ts'))
+    await copyBuildScriptFixture(root)
     await writeFile(join(root, 'package.json'), JSON.stringify({
       name: 'portable-cli-publication-fixture', version: '1.0.0',
     }))
@@ -341,8 +348,7 @@ int main(void) {
   test('derives trusted source bytes from the immutable commit, not a raceable worktree', async () => {
     const root = await mkdtemp(join(tmpdir(), 'hosted-owner-provenance-race-'))
     fixtureRoots.push(root)
-    await mkdir(join(root, 'scripts'), { recursive: true })
-    await cp(buildScript, join(root, 'scripts', 'build.ts'))
+    await copyBuildScriptFixture(root)
     await writeFile(join(root, 'package.json'), JSON.stringify({
       name: 'provenance-race-fixture', version: '1.0.0',
     }))
@@ -367,8 +373,7 @@ int main(void) {
   test('seals copied writable dependencies without mutating or escaping the installed tree', async () => {
     const root = await mkdtemp(join(tmpdir(), 'hosted-owner-dependency-snapshot-'))
     fixtureRoots.push(root)
-    await mkdir(join(root, 'scripts'), { recursive: true })
-    await cp(buildScript, join(root, 'scripts', 'build.ts'))
+    await copyBuildScriptFixture(root)
     await writeFile(join(root, 'package.json'), JSON.stringify({
       name: 'dependency-snapshot-fixture', version: '1.0.0',
     }))
@@ -416,8 +421,7 @@ int main(void) {
   test('fails closed beneath an intermediate symlink in the dependency snapshot', async () => {
     const root = await mkdtemp(join(tmpdir(), 'hosted-owner-dependency-traversal-'))
     fixtureRoots.push(root)
-    await mkdir(join(root, 'scripts'), { recursive: true })
-    await cp(buildScript, join(root, 'scripts', 'build.ts'))
+    await copyBuildScriptFixture(root)
     await writeFile(join(root, 'package.json'), JSON.stringify({
       name: 'dependency-traversal-fixture', version: '1.0.0',
     }))
@@ -453,8 +457,7 @@ int main(void) {
   test('converges identical publishers and truthfully installs a later distinct generation', async () => {
     const root = await mkdtemp(join(tmpdir(), 'hosted-owner-publication-winner-'))
     fixtureRoots.push(root)
-    await mkdir(join(root, 'scripts'), { recursive: true })
-    await cp(buildScript, join(root, 'scripts', 'build.ts'))
+    await copyBuildScriptFixture(root)
     await writeFile(join(root, 'package.json'), JSON.stringify({
       name: 'publication-winner-fixture', version: '1.0.0',
     }))
@@ -1589,8 +1592,7 @@ describe('packaged hosted actual-owner build', () => {
   test('removes every staging output when a build child fails', async () => {
     const brokenRoot = await mkdtemp(join(tmpdir(), 'hosted-owner-failed-build-'))
     fixtureRoots.push(brokenRoot)
-    await mkdir(join(brokenRoot, 'scripts'), { recursive: true })
-    await cp(buildScript, join(brokenRoot, 'scripts', 'build.ts'))
+    await copyBuildScriptFixture(brokenRoot)
     await writeFile(join(brokenRoot, 'package.json'), JSON.stringify({
       name: 'failed-build-fixture', version: '0.0.0',
     }))
@@ -2099,10 +2101,13 @@ int main(int argc, char **argv) {
       ))
       expect(concurrentResults.map(result => result.status),
         JSON.stringify(concurrentResults)).toEqual([0, 0])
-      const reportedPublications = concurrentResults.map(result =>
-        result.stdout.match(/\(([0-9a-f]{64})\)$/)?.[1])
-      expect(reportedPublications[0]).toMatch(/^[0-9a-f]{64}$/)
-      expect(reportedPublications[1]).toMatch(/^[0-9a-f]{64}$/)
+      const publicationReports = concurrentResults.map(result =>
+        [...result.stdout.matchAll(
+          /^Built \.\/cli -> \.\/dist\/local-cli\/cli\.js and \.\/bin\/hosted-actual-owner-acceptance -> content-addressed owner \(([0-9a-f]{64})\)$/gm,
+        )].map(match => match[1]),
+      )
+      expect(publicationReports.map(reports => reports.length)).toEqual([1, 1])
+      const reportedPublications = publicationReports.map(reports => reports[0]!)
 
       expect(await readFile(unrelated, 'utf8')).toBe('preserve-me')
       const finalOwnerNames = (await readdir(join(buildRoot, 'dist', 'local-cli'))).filter(name =>

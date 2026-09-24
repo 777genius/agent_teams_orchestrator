@@ -3,7 +3,7 @@ import { Database } from 'bun:sqlite'
 import { mkdtemp, realpath, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { isProcessAlive, readProcessStartTimeMs } from '../../utils/processKill.js'
+import { buildExactProcessTreeSpawn, captureProcessTreeIdentity, isProcessAlive, readProcessStartTimeMs } from '../../utils/processKill.js'
 import { OpenCodeProfileManager, resolveOpenCodeProfileScope } from './OpenCodeProfileManager.js'
 import { OpenCodeSessionBridge } from './OpenCodeSessionBridge.js'
 import { OpenCodeExecutionProbe } from './OpenCodeExecutionProbe.js'
@@ -70,7 +70,7 @@ describe('pending native OAuth session authority', () => {
     expect(birth).toBeGreaterThan(0)
     owner = { record, baseUrl: 'http://127.0.0.1:43210', pid: process.pid, processStartedAtMs: birth!,
       messageId: 'msg-TEST', noReply: false }
-    const leaseKey = 'TEST::primary::owner'
+    const leaseKey = `${record.teamId}::${record.laneId}::${record.memberName}::session:${record.opencodeSessionId}`
     registry = { schemaVersion: 1, processIdentityFormat: 'platform-native-v2', hosts: { [record.hostKey]: {
       ...record, baseUrl: owner.baseUrl, port: 43210, pid: owner.pid, processStartedAtMs: birth,
       version: 'TEST', resolvedConfigFingerprint: profile.managedConfigFingerprint,
@@ -93,7 +93,11 @@ describe('pending native OAuth session authority', () => {
   test.each(['retained-control', 'exit-listener', 'force-stop', 'force-stop-exit-after-reconcile'])('owned child exit preserves recovery lease evidence: %s', async mode => {
     const cleanup = mode !== 'retained-control'
     const { spawn } = await import('node:child_process')
-    const child = spawn(process.execPath, ['-e', 'await Bun.stdin.text()'], { stdio: ['pipe', 'ignore', 'ignore'] })
+    const releasePath = path.join(root, 'release-child')
+    const command = buildExactProcessTreeSpawn(process.execPath,
+      ['-e', 'while (!(await Bun.file(process.argv[1]).exists())) await Bun.sleep(20)', releasePath],
+      { stdio: ['ignore', 'ignore', 'ignore'] })
+    const child = spawn(command.command, command.args, command.options)
     const exited = new Promise<number | null>(resolve => child.once('exit', resolve))
     let removed: Promise<void> | undefined
     let releaseRemoval!: () => void
@@ -101,9 +105,12 @@ describe('pending native OAuth session authority', () => {
     try {
       const birth = await readProcessStartTimeMs(child.pid!)
       expect(birth).toBeGreaterThan(0)
+      const processTreeIdentity = command.osIdentity === 'unix-pgid:pending'
+        ? await captureProcessTreeIdentity(child.pid!) : command.osIdentity
+      expect(processTreeIdentity).toBeTruthy()
       owner = { ...owner, pid: child.pid!, processStartedAtMs: birth!, record: { ...owner.record, runtimePid: child.pid! } }
       await sessionStore.upsert(owner.record)
-      Object.assign(registry.hosts[owner.record.hostKey], { pid: child.pid, processStartedAtMs: birth })
+      Object.assign(registry.hosts[owner.record.hostKey], { pid: child.pid, processStartedAtMs: birth, processTreeIdentity })
       await saveRegistry()
       await arm() // Successfully returns a pending admitted operation; no throw or crash before submission.
       await writeFile(profile.managedAuthPath, JSON.stringify({ xai: c1 }))
@@ -139,7 +146,8 @@ describe('pending native OAuth session authority', () => {
         }
         hostManager.cleanupOpenTuiTempArtifactsIfUnused = async () => {}
         const entry = { child, handle: { hostKey: owner.record.hostKey, state: 'healthy', diagnostics: [],
-          pid: child.pid, processStartedAtMs: birth, profile, baseUrl: owner.baseUrl }, lifetime: 'persistent', ownedByProcess: true, refCount: 1 }
+          pid: child.pid, processStartedAtMs: birth, processTreeIdentity, profile, baseUrl: owner.baseUrl },
+          lifetime: 'persistent', ownedByProcess: true, refCount: 1 }
         hostManager.hosts.set(owner.record.hostKey, entry)
         hostManager.bindHostLifecycle(owner.record.hostKey, entry)
         if (mode === 'force-stop-exit-after-reconcile') {
@@ -161,10 +169,9 @@ describe('pending native OAuth session authority', () => {
         expect(stopped.hosts[0].action).toBe('kept_pending_oauth')
         expect(stopped.hosts[0].reason).toContain('owned process stopped')
         const exitCode = await exited
-        // Windows kills the tree with taskkill /T /F, which reports an exit
-        // code rather than a POSIX signal. Stdin is still open here: only the
-        // owned force-stop may end this child, and its death must be observed.
-        expect(child.stdin.writableEnded).toBe(false)
+        // The sentinel is absent: only the owned force-stop may end this
+        // child, and its death must be observed.
+        expect(await Bun.file(releasePath).exists()).toBe(false)
         expect(isProcessAlive(child.pid!)).toBe(false)
         if (process.platform === 'win32') {
           expect(child.signalCode).toBeNull()
@@ -184,7 +191,7 @@ describe('pending native OAuth session authority', () => {
           expect(removalCalls).toEqual([])
         }
       } else {
-        child.stdin.end()
+        await writeFile(releasePath, '')
         expect(await exited).toBe(0)
       }
       if (mode === 'exit-listener') {
@@ -221,6 +228,6 @@ describe('pending native OAuth session authority', () => {
         await lifecycleManager.reconcilePersistentHosts({ mode: 'stale' })
         expect(await Bun.file(registryPath).exists()).toBe(false)
       }
-    } finally { releaseRemoval(); child.stdin.end(); await exited; await removed }
+    } finally { releaseRemoval(); await writeFile(releasePath, ''); await exited; await removed }
   })
 })
