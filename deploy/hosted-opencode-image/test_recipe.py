@@ -75,16 +75,26 @@ class ImageAndConfigContractTest(unittest.TestCase):
             finally:
                 os.close(anchor_fd)
 
-    def test_image_context_is_inactive_until_bootstrap_sha_is_reviewed(self):
+    def test_image_context_rejects_unreviewed_bootstrap_lock(self):
         with tempfile.TemporaryDirectory(prefix='hosted-image-recipe-test-') as root:
             archive = Path(root, 'archive')
             bootstrap = Path(root, 'bootstrap')
             output = Path(root, 'context')
+            lock_path = Path(root, 'lock.json')
+            lock = json.loads((HERE / 'artifact-lock.json').read_text())
+            lock['status'] = 'inactive-pending-bootstrap-review'
+            lock['bootstrapSha256'] = None
+            lock_path.write_text(json.dumps(lock))
             archive.write_bytes(b'not-an-official-archive')
             bootstrap.write_bytes(b'not-a-reviewed-bootstrap')
             with self.assertRaisesRegex(ValueError, 'lock-not-reviewed'):
-                image.prepare(str(archive), str(bootstrap), str(output))
+                image.prepare(str(archive), str(bootstrap), str(output), lock_path)
             self.assertFalse(output.exists())
+
+    def test_image_lock_accepts_only_reviewed_current_bootstrap_digest(self):
+        lock = image.approved_lock()
+        self.assertEqual(lock['bootstrapSha256'],
+                         'af0644070946ef34bef205c1940b02bd76a09ffcef4b5cffb8b072ae04ca32e6')
 
     def test_image_lock_rejects_archive_or_base_drift(self):
         lock = json.loads((HERE / 'artifact-lock.json').read_text())

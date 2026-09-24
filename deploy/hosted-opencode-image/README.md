@@ -1,9 +1,9 @@
-# Hosted OpenCode image recipe (inactive)
+# Hosted OpenCode image recipe (runtime inactive)
 
 This directory defines a release artifact for official Linux x64 OpenCode
-v1.18.32. It is **not** a launch path. `prepare-context.py` refuses to emit a
-Docker build context while `artifact-lock.json` remains
-`inactive-pending-bootstrap-review`.
+v1.18.32. It is **not** a launch path. `prepare-context.py` emits a build
+context only for an exact reviewed artifact lock; building the image does not
+activate Owner model or agent effects.
 
 ## Artifact boundaries
 
@@ -12,10 +12,9 @@ Docker build context while `artifact-lock.json` remains
   must independently match the binary SHA-256. The exact source revision and
   Ubuntu base image digest are pinned there too. No build step downloads from
   a mutable tag or runs a package installer.
-- The FD3 bootstrap is supplied as an absolute path to a reviewed ELF file.
-  After its source and build are reviewed, the release operator must record
-  its **actual** SHA-256 in the lock and change status to `reviewed`. The image
-  labels that digest. Until then, the recipe is intentionally unusable.
+- The FD3 bootstrap is supplied as an absolute path to the reviewed static
+  ELF file. Its exact target-host build SHA-256 is recorded in the reviewed
+  artifact lock and image label. A different build is rejected.
 - The resulting image must be published and deployed by its immutable
   `repo@sha256:<manifest-digest>` reference. That digest is recorded in the
   root-owned release lease and checked against Docker's `RepoDigests` and
@@ -27,8 +26,8 @@ Docker build context while `artifact-lock.json` remains
   exact socket name and sender UID command. No credentials, user home,
   runtime package cache, provider config, or writable image layer is copied.
 
-After bootstrap review, prepare a build context in a **new disposable**
-directory outside the repository:
+Prepare a build context in a **new disposable** directory outside the
+repository:
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 deploy/hosted-opencode-image/prepare-context.py \
