@@ -251,6 +251,30 @@ export class HostedQwenNetworkPolicy {
     return { digest: hash(JSON.stringify(normalized)), grantedIp }
   }
 
+  /** Listing tables distinguishes a confirmed deletion from a failed table read. */
+  private async tablePresent(): Promise<boolean> {
+    const row = object(JSON.parse(await this.run('/usr/sbin/nft', ['-j', 'list', 'tables'])))
+    if (!Array.isArray(row.nftables)) throw new Error('hosted-qwen-policy-drift')
+    let present = false
+    for (const entry of row.nftables) {
+      const item = object(entry)
+      if (item.metainfo !== undefined) {
+        object(item.metainfo)
+        if (Object.keys(item).length !== 1) throw new Error('hosted-qwen-policy-drift')
+        continue
+      }
+      const table = object(item.table)
+      if (typeof table.family !== 'string' || typeof table.name !== 'string') {
+        throw new Error('hosted-qwen-policy-drift')
+      }
+      if (table.family === 'inet' && table.name === this.table) {
+        if (present) throw new Error('hosted-qwen-policy-drift')
+        present = true
+      }
+    }
+    return present
+  }
+
   async prepare(): Promise<Readonly<{ gateway: string; bridge: string }>> {
     if (this.bridge || this.claimIdentity || this.sourceRevoking) throw new Error('hosted-qwen-already-prepared')
     // Docker 26+ includes the fix for embedded-DNS forwarding from --internal
@@ -326,6 +350,13 @@ export class HostedQwenNetworkPolicy {
       throw new Error('hosted-qwen-container-endpoint-invalid')
     }
     return endpoint.IPAddress
+  }
+
+  private async assertContainerRemoved(): Promise<void> {
+    if (!this.containerId) return
+    const listed = await this.run('/usr/bin/docker', ['container', 'ls', '--all', '--no-trunc',
+      '--filter', `id=${this.containerId}`, '--format', '{{.ID}}'])
+    if (listed.trim()) throw new Error('hosted-qwen-container-still-present')
   }
 
   async admitContainer(id: string): Promise<string> {
@@ -443,17 +474,26 @@ export class HostedQwenNetworkPolicy {
     this.beginSourceRevocation()
     await this.assertClaim()
     await this.network(true)
-    const rules = await this.snapshotRules()
-    if (rules.digest !== this.ruleDigest ||
-      rules.grantedIp !== (this.revoked ? null : this.containerIp)) {
-      throw new Error('hosted-qwen-policy-drift')
-    }
-    if (this.containerIp) {
-      if (await this.ufwGrantPresent()) {
-        await this.run('/usr/sbin/iptables', ['-w', '2', '-D', 'ufw-user-input', ...this.grantArgs()])
+    await this.assertContainerRemoved()
+    const tablePresent = await this.tablePresent()
+    if (tablePresent) {
+      const rules = await this.snapshotRules()
+      if (rules.digest !== this.ruleDigest ||
+        rules.grantedIp !== (this.revoked ? null : this.containerIp)) {
+        throw new Error('hosted-qwen-policy-drift')
       }
     }
-    await this.run('/usr/sbin/nft', ['delete', 'table', 'inet', this.table])
+    if (await this.ufwGrantPresent()) {
+      await this.run('/usr/sbin/iptables', ['-w', '2', '-D', 'ufw-user-input', ...this.grantArgs()])
+    }
+    if (await this.ufwGrantPresent()) throw new Error('hosted-qwen-ufw-drift')
+    if (tablePresent) await this.run('/usr/sbin/nft', ['delete', 'table', 'inet', this.table])
+    if (await this.tablePresent()) throw new Error('hosted-qwen-policy-drift')
+    // Recheck the network and exact grants before releasing the root claim.
+    await this.network(true)
+    await this.assertContainerRemoved()
+    await this.assertClaim()
+    if (await this.ufwGrantPresent()) throw new Error('hosted-qwen-ufw-drift')
     await unlink(this.claimPath)
     this.bridge = null
     this.ruleDigest = null

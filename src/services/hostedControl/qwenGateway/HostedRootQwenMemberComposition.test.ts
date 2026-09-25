@@ -43,6 +43,9 @@ class FirewallFixture implements HostedQwenCommandRunner {
       IPAM: { Config: [{ Gateway: this.gateway }] },
       Containers: this.occupied ? { [this.containerId]: {} } : {},
     })
+    if (executable === '/usr/bin/docker' && args[0] === 'container' && args[1] === 'ls') {
+      return this.occupied ? this.containerId : ''
+    }
     if (executable === '/usr/bin/docker' && args[0] === 'inspect') return JSON.stringify({
       Id: this.containerId, HostConfig: { NetworkMode: this.networkId },
       Config: { Labels: { 'org.agentteams.hosted-opencode.generation': this.generation } },
@@ -56,6 +59,10 @@ class FirewallFixture implements HostedQwenCommandRunner {
     }])
     if (executable === '/usr/sbin/nft') {
       if (args[0] === '-f') { this.nft = input ?? ''; return '' }
+      if (args[0] === '-j' && args[1] === 'list' && args[2] === 'tables') return JSON.stringify({ nftables: [
+        { metainfo: { version: '1.0.0' } },
+        ...(this.nft ? [{ table: { family: 'inet', name: `hqw_${this.generation}` } }] : []),
+      ] })
       if (args[0] === '-j') return JSON.stringify({ nftables: [
         { table: { name: `hqw_${this.generation}`, rules: this.nft } },
         { set: { name: 'granted', table: `hqw_${this.generation}`, family: 'inet',

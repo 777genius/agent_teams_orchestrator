@@ -17,6 +17,7 @@ afterEach(async () => { for (const dir of scratch.splice(0)) await rm(dir, { rec
 class FakeRunner implements HostedQwenCommandRunner {
   version = '29.8.1'
   occupied = false
+  detachedContainerExists = false
   running = true
   ip = '172.18.0.2'
   endpointGateway = '172.18.0.1'
@@ -26,6 +27,8 @@ class FakeRunner implements HostedQwenCommandRunner {
   grantIp: string | null = null
   ufw = false
   throwAfterNftDelete = false
+  throwAfterNftTableDelete = false
+  throwBeforeUfwDelete = false
   calls: string[] = []
 
   async run(executable: string, args: readonly string[], input?: string): Promise<string> {
@@ -36,6 +39,9 @@ class FakeRunner implements HostedQwenCommandRunner {
       Ingress: false, Options: {}, IPAM: { Config: [{ Subnet: '172.18.0.0/16', Gateway: '172.18.0.1' }] },
       Containers: this.occupied ? { [containerId]: { Name: 'hosted-test' } } : {},
     })
+    if (executable === '/usr/bin/docker' && args[0] === 'container' && args[1] === 'ls') {
+      return this.occupied || this.detachedContainerExists ? containerId : ''
+    }
     if (executable === '/usr/bin/docker' && args[0] === 'inspect') return JSON.stringify({
       Id: containerId, HostConfig: { NetworkMode: networkId },
       Config: { Labels: { 'org.agentteams.hosted-opencode.generation': this.labelGeneration } },
@@ -58,17 +64,38 @@ class FakeRunner implements HostedQwenCommandRunner {
         if (this.throwAfterNftDelete) { this.throwAfterNftDelete = false; throw new Error('ambiguous-delete') }
         return ''
       }
-      if (args[0] === '-j') return JSON.stringify({ nftables: [
-        { table: { name: `hqw_${generation}`, rules: this.nft } },
-        { set: { name: 'granted', table: `hqw_${generation}`, family: 'inet', type: 'ipv4_addr',
-          elem: this.grantIp ? [this.grantIp] : [] } },
+      if (args[0] === '-j' && args[1] === 'list' && args[2] === 'tables') return JSON.stringify({ nftables: [
+        { metainfo: { version: '1.0.0' } },
+        ...(this.nft ? [{ table: { family: 'inet', name: `hqw_${generation}` } }] : []),
       ] })
-      if (args[0] === 'delete') { this.nft = ''; this.grantIp = null; return '' }
+      if (args[0] === '-j') {
+        if (!this.nft) throw new Error('table-missing')
+        return JSON.stringify({ nftables: [
+          { table: { name: `hqw_${generation}`, rules: this.nft } },
+          { set: { name: 'granted', table: `hqw_${generation}`, family: 'inet', type: 'ipv4_addr',
+            elem: this.grantIp ? [this.grantIp] : [] } },
+        ] })
+      }
+      if (args[0] === 'delete') {
+        this.nft = ''; this.grantIp = null
+        if (this.throwAfterNftTableDelete) {
+          this.throwAfterNftTableDelete = false
+          throw new Error('ambiguous-table-delete')
+        }
+        return ''
+      }
     }
     if (executable === '/usr/sbin/iptables') {
       if (args.includes('-I')) { this.ufw = true; return '' }
       if (args.includes('-C')) { if (!this.ufw) throw new Error('missing'); return '' }
-      if (args.includes('-D')) { this.ufw = false; return '' }
+      if (args.includes('-D')) {
+        if (this.throwBeforeUfwDelete) {
+          this.throwBeforeUfwDelete = false
+          throw new Error('ufw-delete-unconfirmed')
+        }
+        this.ufw = false
+        return ''
+      }
       if (args.includes('-S')) return this.ufw ?
         `-A ufw-user-input --comment "hqw_${generation}" -j ACCEPT` : ''
     }
@@ -156,6 +183,10 @@ test('network claim remains while container exists; cleanup removes grant before
   await expect(prematureClose).rejects.toThrow('hosted-qwen-network-occupancy-invalid')
   expect((await readdir(dir)).length).toBe(1)
   runner.occupied = false
+  runner.detachedContainerExists = true
+  await expect(policy.close()).rejects.toThrow('hosted-qwen-container-still-present')
+  expect(await readdir(dir)).toHaveLength(1)
+  runner.detachedContainerExists = false
   await policy.close()
   expect(notices).toBe(1)
   expect(runner.ufw).toBe(false)
@@ -165,6 +196,33 @@ test('network claim remains while container exists; cleanup removes grant before
   const deleteDeny = runner.calls.findIndex(call => call.includes('nft delete table'))
   expect(deleteGrant).toBeGreaterThan(-1)
   expect(deleteDeny).toBeGreaterThan(deleteGrant)
+})
+
+test('close retries after nft table deletion with lost response and keeps the claim until both grants are absent', async () => {
+  const { dir, runner, policy } = await setup()
+  await policy.prepare()
+  runner.occupied = true
+  await policy.admitContainer(containerId)
+  runner.occupied = false
+  runner.throwAfterNftTableDelete = true
+  await expect(policy.close()).rejects.toThrow('ambiguous-table-delete')
+  expect(runner.nft).toBe('')
+  expect(runner.ufw).toBe(false)
+  expect(await readdir(dir)).toHaveLength(1)
+
+  runner.ufw = true
+  runner.throwBeforeUfwDelete = true
+  await expect(policy.close()).rejects.toThrow('ufw-delete-unconfirmed')
+  expect(await readdir(dir)).toHaveLength(1)
+  expect(runner.ufw).toBe(true)
+  runner.occupied = true
+  await expect(policy.close()).rejects.toThrow('hosted-qwen-network-occupancy-invalid')
+  expect(await readdir(dir)).toHaveLength(1)
+  runner.occupied = false
+  await policy.close()
+  expect(runner.ufw).toBe(false)
+  expect(await readdir(dir)).toEqual([])
+  await policy.close()
 })
 
 test('bridge bind requires the exact prepared address, port and generation', async () => {
