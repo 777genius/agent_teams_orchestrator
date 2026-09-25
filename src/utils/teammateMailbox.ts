@@ -509,6 +509,62 @@ export async function writeToMailboxAtCanonicalTeamRootVerified(input: {
   }
 }
 
+export type ExplicitRootMailboxReadMarkResult =
+  | 'marked'
+  | 'already_read'
+  | 'missing'
+  | 'conflict'
+
+/**
+ * Hosted-control-only counterpart of markMessagesAsRead: marks exactly one
+ * verified row read in an explicit canonical team root. The row must still
+ * carry the delivered from/text/timestamp, otherwise nothing is written.
+ */
+export async function markMailboxMessageReadAtCanonicalTeamRoot(input: {
+  canonicalTeamRoot: string
+  recipientName: string
+  message: Pick<TeammateMessage, 'messageId' | 'from' | 'text' | 'timestamp'>
+}): Promise<ExplicitRootMailboxReadMarkResult> {
+  if (
+    !isAbsolute(input.canonicalTeamRoot) ||
+    (await realpath(input.canonicalTeamRoot)) !== input.canonicalTeamRoot
+  ) {
+    throw new Error('Mailbox team root must be canonical and absolute')
+  }
+  await assertPrivateDirectory(input.canonicalTeamRoot)
+  if (sanitizePathComponent(input.recipientName) !== input.recipientName)
+    throw new Error('Unsafe mailbox recipient')
+  const inboxDir = join(input.canonicalTeamRoot, 'inboxes')
+  const inboxDirIdentity = await assertPrivateDirectory(inboxDir)
+  const inboxPath = join(inboxDir, `${input.recipientName}.json`)
+  await assertPrivateRegularFile(inboxPath)
+  const release = await lockfile.lock(inboxPath, {
+    lockfilePath: `${inboxPath}.lock`,
+    realpath: false,
+    ...LOCK_OPTIONS,
+  })
+  try {
+    await assertSamePrivateDirectory(inboxDir, inboxDirIdentity)
+    await assertPrivateRegularFile(inboxPath)
+    const messages = await readMailboxPathStrict(inboxPath)
+    const rows = messages.filter(row => row.messageId === input.message.messageId)
+    if (rows.length === 0) return 'missing'
+    if (rows.length !== 1 || !hasVerifiedMailboxMessage(rows, input.message))
+      return 'conflict'
+    if (rows[0]!.read) return 'already_read'
+    rows[0]!.read = true
+    await writeFileAtomic(inboxPath, jsonStringify(messages, null, 2), {
+      mode: 0o600,
+    })
+    await assertSamePrivateDirectory(inboxDir, inboxDirIdentity)
+    await assertPrivateRegularFile(inboxPath)
+    await fsyncFileAndParentDirectory(inboxPath)
+    return 'marked'
+  } finally {
+    await release()
+  }
+}
+
 async function readMailboxPathStrict(
   inboxPath: string,
 ): Promise<TeammateMessage[]> {

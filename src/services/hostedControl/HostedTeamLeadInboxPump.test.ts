@@ -10,6 +10,7 @@ import {
   HostedTeamLeadInboxPump,
   type HostedTeamLeadInboxPumpOptions,
 } from './HostedTeamLeadInboxPump.js'
+import { HostedTeamRecipientRoster } from './HostedTeamRecipientRoster.js'
 import type { HostedControlAuthority } from './protocol.js'
 
 const roots: string[] = []
@@ -30,7 +31,7 @@ const capabilitySnapshotId = `opencode:${'e'.repeat(32)}`
 const verifiedObservation = {
   state: 'responded_plain_text', deliveredUserMessageId: 'prompt-1', assistantMessageId: 'assistant-1',
 }
-type TestBridge = (input: { command: string }, guard: () => Promise<boolean>, signal: AbortSignal) =>
+type TestBridge = (input: { command: string; memberName?: string; text?: string }, guard: () => Promise<boolean>, signal: AbortSignal) =>
   Promise<{ ok: boolean; data?: Record<string, unknown> }>
 
 async function fixture() {
@@ -49,7 +50,9 @@ async function fixture() {
     schemaVersion: 2, workspaceId: authority.workspaceId, teamId,
     workspaceRoot: workspace, toolApprovalMode: 'manual', lanes: [{
       laneId: 'lead-lane', kind: 'opencode', provider: 'opencode',
-      selectedModel: 'openai/gpt-6-sol', members: [{ name: 'team-lead', prompt: 'Lead the team.' }],
+      selectedModel: 'openai/gpt-6-sol', members: [
+        { name: 'team-lead', prompt: 'Lead the team.' }, { name: 'alice', prompt: 'Build it.' },
+      ],
     }],
   }
   let active = true
@@ -77,8 +80,8 @@ async function fixture() {
     execution: { inspect: async () => ({ providerId: 'team-lifecycle-owner', providerGeneration: 'generation-a',
       phase: active ? 'running' : 'stopping', runId, recoverable: false }) },
     readActiveRun: async () => ({ phase: active ? 'running' : 'stopping', runId }),
-    getSession: async () => { await sessionReadHook(); return ({
-      teamId: 'legacy', laneId: 'lead-lane', memberName: 'team-lead', runId,
+    getSession: async (_teamId, _laneId, memberName) => { await sessionReadHook(); return ({
+      teamId: 'legacy', laneId: 'lead-lane', memberName, runId,
       opencodeSessionId: selectedSession, projectPath: workspace,
       selectedModel: 'openai/gpt-6-sol', staleReason: null,
       profileScope: { purpose: 'launch_runtime' },
@@ -94,6 +97,8 @@ async function fixture() {
     replacePlan: () => { planGeneration = 'plan-generation_second' },
     onSessionRead: (hook: typeof sessionReadHook) => { sessionReadHook = hook },
     onCapabilityRead: (hook: typeof capabilityReadHook) => { capabilityReadHook = hook },
+    useNativeLane: () => { plan = { ...plan, lanes: [{ laneId: 'native-lane', kind: 'native',
+      provider: 'anthropic', members: [{ name: 'team-lead', prompt: 'Lead.' }, { name: 'alice', prompt: 'Build.' }] }] } },
     removeLead: () => { plan = { ...plan, lanes: [{ ...plan.lanes[0]!,
       members: [{ name: 'worker', prompt: 'Work.' }] }] } }
   }
@@ -358,5 +363,59 @@ describe('HostedTeamLeadInboxPump', () => {
     await closing
     expect(closed).toBe(true)
     expect(f.calls).toEqual(['send'])
+  })
+
+  test('prompts the addressed teammate with the delivery contract and marks its inbox row read', async () => {
+    const f = await fixture()
+    await writeFile(join(f.root, 'config.json'), JSON.stringify({
+      members: [{ name: 'team-lead', agentType: 'team-lead' }, { name: 'alice' }],
+    }), { mode: 0o600 })
+    const dm = { ...message, messageId: `message_${'f'.repeat(32)}`,
+      clientMessageId: 'client_message_inbox-pump-dm', text: 'Alice, check the build.', recipient: 'alice' }
+    expect(await new HostedTeamLeadMessageDelivery({
+      canonicalTeamRoot: f.root, legacyKey: 'legacy', authority, guard: { isCurrent: async () => true },
+      recipients: new HostedTeamRecipientRoster(f.root),
+    }).deliver(dm, authority)).toEqual({ kind: 'delivered' })
+    const sent: Array<{ memberName?: string; text?: string }> = []
+    f.setBridge(async input => {
+      f.calls.push(input.command)
+      if (input.command === 'send') sent.push({ memberName: input.memberName, text: input.text })
+      return { ok: true, data: { accepted: true, sessionId, runtimePromptMessageId: 'prompt-1' } }
+    })
+
+    expect(await f.build().wake(dm, authority)).toEqual({ kind: 'accepted' })
+    expect(sent).toHaveLength(1)
+    expect(sent[0]!.memberName).toBe('alice')
+    expect(sent[0]!.text).toStartWith('<opencode_app_message_delivery>')
+    // Agents know their team by the admitted directory name, not the hosted team id.
+    expect(sent[0]!.text).toContain('{"teamName":"legacy","to":"user"')
+    expect(sent[0]!.text).toContain(`"to":"user","from":"alice","source":"runtime_delivery","relayOfMessageId":"${dm.messageId}"`)
+    expect(sent[0]!.text).toEndWith(`<opencode_inbound_app_message>\n${dm.text}\n</opencode_inbound_app_message>`)
+    const rows = JSON.parse(await readFile(join(f.root, 'inboxes', 'alice.json'), 'utf8'))
+    expect(rows).toEqual([expect.objectContaining({ messageId: dm.messageId, read: true })])
+    const lead = JSON.parse(await readFile(join(f.root, 'inboxes', 'team-lead.json'), 'utf8'))
+    expect(lead).toEqual([expect.objectContaining({ messageId: message.messageId, read: false })])
+
+    // A replayed wake is idempotent: no second prompt, the read commit is durable.
+    expect(await f.build().wake(dm, authority)).toEqual({ kind: 'accepted' })
+    expect(sent).toHaveLength(1)
+    const intents = await Promise.all((await readdir(join(f.root, 'hosted-team-lead-inbox-pump')))
+      .map(async name => JSON.parse(await readFile(join(f.root, 'hosted-team-lead-inbox-pump', name), 'utf8'))))
+    expect(intents).toEqual([expect.objectContaining({
+      message: dm, status: 'accepted', inboxReadCommitted: true,
+    })])
+  })
+
+  test('treats a native lane recipient as delivered to its inbox and never polls it again', async () => {
+    const f = await fixture()
+    f.useNativeLane()
+    const pump = f.build()
+    expect(await pump.wake(message, authority)).toEqual({ kind: 'native_inbox' })
+    expect(await pump.recover()).toEqual([{ kind: 'native_inbox' }])
+    expect(await f.build().wake(message, authority)).toEqual({ kind: 'native_inbox' })
+    expect(f.calls).toEqual([])
+    const lead = JSON.parse(await readFile(join(f.root, 'inboxes', 'team-lead.json'), 'utf8'))
+    // The native process marks its own rows read.
+    expect(lead).toEqual([expect.objectContaining({ messageId: message.messageId, read: false })])
   })
 })

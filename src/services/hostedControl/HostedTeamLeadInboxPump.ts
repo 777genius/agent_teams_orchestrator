@@ -6,8 +6,10 @@ import { isDeepStrictEqual } from 'node:util'
 import { writeFileAtomic } from '../../utils/atomicWrite.js'
 import * as lockfile from '../../utils/lockfile.js'
 import { TEAM_LEAD_NAME } from '../../utils/swarm/constants.js'
+import { markMailboxMessageReadAtCanonicalTeamRoot } from '../../utils/teammateMailbox.js'
 import { createOwnedOpenCodeHostedInboxExecutor } from '../opencode/OpenCodeBridgeCommandHandler.js'
 import { readOpenCodeLegacyStopCapability } from '../opencode/OpenCodeLegacyStopAuthority.js'
+import { buildOpenCodeRuntimeMessageText } from '../opencode/OpenCodeRuntimeMessageText.js'
 import { isOpenCodeSessionStopped, openCodeSessionStore } from '../opencode/OpenCodeSessionStore.js'
 import type { OpenCodeSessionRecord } from '../opencode/types.js'
 import type { TeamLifecycleExecutionPort } from '../teamLifecycleOwner/TeamLifecycleOwnerService.js'
@@ -15,6 +17,7 @@ import type { TeamLifecycleLaunchPlan, TeamLifecycleLaunchPlanStore } from '../t
 import type { HostedControlAuthority, HostedControlStableAuthority } from './protocol.js'
 import type { HostedMessageAuthorityGuard, HostedPersistedMessage } from './HostedTeamMessageService.js'
 import { fsyncFileAndParent } from './HostedTaskMutationWal.js'
+import { isHostedMessageRecipientName } from './HostedTeamRecipientRoster.js'
 
 const DIRECTORY = 'hosted-team-lead-inbox-pump'
 const DELIVERY_DIRECTORY = 'hosted-message-delivery-operations'
@@ -41,6 +44,16 @@ type Intent = {
   status: 'intent' | 'accepted' | 'observed' | 'operator_required'
   reconcileChecks?: number
   runtimePromptMessageId?: string
+  /** Set once the recipient's inbox row is marked read after the runtime accepted the prompt. */
+  inboxReadCommitted?: true
+}
+/** Terminal for the pump: a native process reads its own inbox, so the append is the delivery. */
+type NativeInboxRecord = {
+  schemaVersion: 1
+  authority: HostedControlAuthority
+  message: HostedPersistedMessage
+  textSha256: string
+  status: 'native_inbox'
 }
 type BridgeInput = {
   command: 'send' | 'status' | 'observe'
@@ -58,7 +71,9 @@ type BridgeInput = {
   runtimePromptMessageId?: string
 }
 type BridgeResponse = { ok: boolean; data?: Record<string, unknown>; error?: { message?: string } }
-export type InboxPumpDecision = { kind: 'observed' | 'accepted' | 'pending' | 'operator_required' | 'unavailable' }
+export type InboxPumpDecision = {
+  kind: 'observed' | 'accepted' | 'pending' | 'operator_required' | 'unavailable' | 'native_inbox'
+}
 
 export type HostedTeamLeadInboxPumpOptions = {
   canonicalTeamRoot: string
@@ -74,7 +89,11 @@ export type HostedTeamLeadInboxPumpOptions = {
   executeBridge?: (input: BridgeInput, effectGuard: () => Promise<boolean>, signal: AbortSignal) => Promise<BridgeResponse>
 }
 
-/** Consumes only a verified, durable hosted team-lead inbox row for its admitted OpenCode run. */
+/**
+ * Consumes only a verified, durable hosted inbox row for its admitted OpenCode run.
+ * The recipient is the message's persisted recipient, team-lead when it has none;
+ * it prompts that member's session and marks the row read once the prompt is accepted.
+ */
 export class HostedTeamLeadInboxPump {
   readonly #root: string
   readonly #legacyKey: string
@@ -159,10 +178,15 @@ export class HostedTeamLeadInboxPump {
         const record = asRecord(receipt)
         const message = asRecord(record?.binding)
         const authority = asRecord(record?.authority)
+        const recipient = record?.recipient
         if (record?.status !== 'delivered' || !message || !authority ||
           !sameAuthority(authority as HostedControlAuthority, this.#authority) ||
           record.canonicalTeamRoot !== this.#root || record.legacyKey !== this.#legacyKey) continue
-        const inbox = await this.#readInbox()
+        if (!isInboxRecipient(recipient)) {
+          results.push({ kind: 'operator_required' })
+          continue
+        }
+        const inbox = await this.#readInbox(recipient)
         const row = inbox.find(candidate => candidate.messageId === message.messageId && candidate.from === 'user')
         if (!row || typeof row.text !== 'string' || typeof row.timestamp !== 'string' ||
           sha256(row.text) !== message.textSha256) {
@@ -172,6 +196,7 @@ export class HostedTeamLeadInboxPump {
         results.push(await this.wake({
           teamId: String(message.teamId), messageId: String(message.messageId),
           clientMessageId: String(message.clientMessageId), text: row.text, createdAt: row.timestamp,
+          ...(recipient === TEAM_LEAD_NAME ? {} : { recipient }),
         }, authority as HostedControlAuthority))
       } catch { results.push({ kind: 'operator_required' }) }
     }
@@ -193,27 +218,45 @@ export class HostedTeamLeadInboxPump {
       !/^client_message_[A-Za-z0-9][A-Za-z0-9._-]{7,127}$/.test(message.clientMessageId)) {
       return { kind: 'operator_required' }
     }
+    const recipient = message.recipient ?? TEAM_LEAD_NAME
+    if (message.recipient !== undefined && !isHostedMessageRecipientName(message.recipient)) {
+      return { kind: 'operator_required' }
+    }
     if (!(await this.#guard.isCurrent(authority))) return { kind: 'unavailable' }
     try {
       await this.#assertPrivateRoot()
-      if (!(await this.#hasDurableInboxRow(message)) ||
-        !(await this.#hasDurableDeliveryReceipt(message, authority))) return { kind: 'operator_required' }
+      if (!(await this.#hasDurableInboxRow(message, recipient)) ||
+        !(await this.#hasDurableDeliveryReceipt(message, recipient, authority))) return { kind: 'operator_required' }
       await this.#prepareDirectory()
-      const path = join(this.#root, DIRECTORY, `${sha256(`agent-teams.hosted-inbox/v1\0${authority.teamId}\0${message.messageId}`)}.json`)
+      const path = join(this.#root, DIRECTORY, `${intentDigest(authority.teamId, recipient, message.messageId)}.json`)
       const release = await lockfile.lock(path, LOCK_OPTIONS)
       try {
-        let intent = await readPrivateJson(path) as Intent | null
+        const stored = await readPrivateJson(path) as Intent | NativeInboxRecord | null
+        if (stored?.status === 'native_inbox') {
+          return validNativeInboxRecord(stored) && sameAuthority(stored.authority, authority) &&
+            stored.authority.actorId === authority.actorId && isDeepStrictEqual(stored.message, message) &&
+            stored.textSha256 === sha256(message.text)
+            ? { kind: 'native_inbox' }
+            : { kind: 'operator_required' }
+        }
+        let intent = stored
         if (intent) {
           if (!validIntent(intent) || !sameAuthority(intent.authority, authority) ||
             intent.authority.actorId !== authority.actorId ||
             !isDeepStrictEqual(intent.message, message) || intent.textSha256 !== sha256(message.text)) {
             return { kind: 'operator_required' }
           }
-          if (intent.status === 'observed') return { kind: 'observed' }
           if (intent.status === 'operator_required') return { kind: 'operator_required' }
-          return this.#reconcile(path, intent)
+          const decision = intent.status === 'observed' ? { kind: 'observed' as const } : await this.#reconcile(path, intent)
+          return await this.#commitInboxRead(path, decision)
         }
-        const selected = await this.#select(authority)
+        if (await this.#isNativeRecipient(authority, recipient)) {
+          const record: NativeInboxRecord = { schemaVersion: 1, authority, message,
+            textSha256: sha256(message.text), status: 'native_inbox' }
+          await writeIntent(path, record)
+          return { kind: 'native_inbox' }
+        }
+        const selected = await this.#select(authority, recipient)
         if (!selected) return { kind: 'unavailable' }
         const requestId = `hosted-inbox-${sha256(`${authority.teamId}\0${message.messageId}\0${selected.planGeneration}\0${selected.runId}\0${selected.sessionId}`)}`
         intent = { schemaVersion: 1, authority, message, textSha256: sha256(message.text),
@@ -223,15 +266,16 @@ export class HostedTeamLeadInboxPump {
         let result: BridgeResponse
         try { result = await this.#executeBridge(this.#bridgeInput(intent, 'send'),
           () => this.#stillSelected(intent), this.#abort.signal) }
-        catch { return this.#reconcile(path, intent) }
+        catch { return await this.#reconcile(path, intent) }
         if (result.ok && result.data?.accepted === true && result.data.sessionId === selected.sessionId) {
           const promptId = result.data.runtimePromptMessageId
           intent = { ...intent, status: 'accepted', reconcileChecks: 0,
             ...(typeof promptId === 'string' ? { runtimePromptMessageId: promptId } : {}) }
           await writeIntent(path, intent)
-          return { kind: 'accepted' }
+          return await this.#commitInboxRead(path, { kind: 'accepted' })
         }
-        return this.#reconcile(path, intent)
+        // Awaited so the reconcile and read commit finish while this intent lock is held.
+        return await this.#commitInboxRead(path, await this.#reconcile(path, intent))
       } finally { await release() }
     } catch { return { kind: 'operator_required' } }
   }
@@ -292,20 +336,53 @@ export class HostedTeamLeadInboxPump {
   }
 
   #bridgeInput(intent: Intent, command: BridgeInput['command']): BridgeInput {
+    const memberName = intent.message.recipient ?? TEAM_LEAD_NAME
     return { command, requestId: intent.requestId, teamId: this.#legacyKey,
-      laneId: intent.selected.laneId, memberName: TEAM_LEAD_NAME,
+      laneId: intent.selected.laneId, memberName,
       runId: intent.selected.runId, projectPath: intent.selected.projectPath,
       sessionId: intent.selected.sessionId, capabilitySnapshotId: intent.selected.capabilitySnapshotId,
+      // The hash names the durable inbox row; the prompt wrapper is derived from it.
       messageId: intent.message.messageId, payloadHash: intent.textSha256,
-      ...(command === 'send' ? { text: intent.message.text } : {}),
+      ...(command === 'send'
+        ? {
+          // Same delivery contract as desktop: the recipient learns it was the
+          // user and answers through message_send with relayOfMessageId.
+          text: buildOpenCodeRuntimeMessageText({
+            runId: intent.selected.runId,
+            // Agents address their team by the admitted directory name, as the bridge does.
+            teamName: this.#legacyKey,
+            laneId: intent.selected.laneId,
+            memberName,
+            text: intent.message.text,
+            messageId: intent.message.messageId,
+            replyRecipient: 'user',
+          }),
+        }
+        : {}),
       ...(intent.runtimePromptMessageId ? { runtimePromptMessageId: intent.runtimePromptMessageId } : {}) }
   }
 
-  async #select(authority: HostedControlAuthority, readOnly = false): Promise<Selected | null> {
+  /**
+   * A native lane member (Claude Code or Codex lead or process teammate) reads its
+   * inbox file itself; prompting it through OpenCode would be wrong and retrying
+   * would poll forever.
+   */
+  async #isNativeRecipient(authority: HostedControlAuthority, recipient: string): Promise<boolean> {
+    const admission = await this.#planStore.load({ workspaceId: authority.workspaceId, teamId: authority.teamId })
+    if (!admission || !(await admission.isCurrent())) return false
+    const lanes = admission.plan.lanes.filter(lane => lane.members.some(member => member.name === recipient))
+    return lanes.length === 1 && lanes[0]!.kind === 'native' && await admission.isCurrent()
+  }
+
+  async #select(
+    authority: HostedControlAuthority,
+    recipient: string,
+    readOnly = false,
+  ): Promise<Selected | null> {
     const admission = await this.#planStore.load({ workspaceId: authority.workspaceId, teamId: authority.teamId })
     if (!admission || !(await admission.isCurrent())) return null
     const lanes = admission.plan.lanes.filter(lane =>
-      lane.members.some(member => member.name === TEAM_LEAD_NAME))
+      lane.members.some(member => member.name === recipient))
     if (lanes.length !== 1 || admission.plan.workspaceRoot !== await realpath(admission.plan.workspaceRoot)) return null
     const state = readOnly
       ? await this.#readActiveRun(admission.plan)
@@ -315,10 +392,10 @@ export class HostedTeamLeadInboxPump {
     if (lane.kind !== 'opencode') return null
     // Host-local lanes register the runtime team under the admitted legacy key,
     // which is also the canonical team directory name.
-    const session = await this.#getSession(this.#legacyKey, lane.laneId, TEAM_LEAD_NAME)
+    const session = await this.#getSession(this.#legacyKey, lane.laneId, recipient)
     if (!session || isOpenCodeSessionStopped(session) || session.staleReason ||
       session.teamId !== this.#legacyKey || session.runId !== state.runId || session.laneId !== lane.laneId ||
-      session.memberName !== TEAM_LEAD_NAME || session.projectPath !== admission.plan.workspaceRoot ||
+      session.memberName !== recipient || session.projectPath !== admission.plan.workspaceRoot ||
       session.profileScope?.purpose !== 'launch_runtime' ||
       session.selectedModel !== lane.selectedModel ||
       !session.opencodeSessionId) return null
@@ -338,7 +415,7 @@ export class HostedTeamLeadInboxPump {
 
   async #stillSelected(intent: Intent): Promise<boolean> {
     if (!this.#accepting || !(await this.#guard.isCurrent(intent.authority))) return false
-    const selected = await this.#select(intent.authority, true)
+    const selected = await this.#select(intent.authority, intent.message.recipient ?? TEAM_LEAD_NAME, true)
     if (!this.#accepting || this.#abort.signal.aborted || !selected ||
       !isDeepStrictEqual(selected, intent.selected)) return false
     const leaseCurrent = await this.#guard.isCurrent(intent.authority)
@@ -356,8 +433,28 @@ export class HostedTeamLeadInboxPump {
     return { phase: state.phase, runId: state.runId }
   }
 
-  async #hasDurableInboxRow(message: HostedPersistedMessage): Promise<boolean> {
-    const rows = await this.#readInbox()
+  /** Desktop parity: once the runtime accepted the prompt, the inbox row is read. */
+  async #commitInboxRead(path: string, decision: InboxPumpDecision): Promise<InboxPumpDecision> {
+    if (decision.kind !== 'accepted' && decision.kind !== 'observed') return decision
+    try {
+      const intent = await readPrivateJson(path) as Intent | null
+      if (!intent || !validIntent(intent) || intent.inboxReadCommitted ||
+        (intent.status !== 'accepted' && intent.status !== 'observed')) return decision
+      const marked = await markMailboxMessageReadAtCanonicalTeamRoot({
+        canonicalTeamRoot: this.#root,
+        recipientName: intent.message.recipient ?? TEAM_LEAD_NAME,
+        message: { messageId: intent.message.messageId, from: 'user',
+          text: intent.message.text, timestamp: intent.message.createdAt },
+      })
+      if (marked === 'marked' || marked === 'already_read') {
+        await writeIntent(path, { ...intent, inboxReadCommitted: true })
+      }
+    } catch { /* The prompt is accepted; recovery retries the read commit. */ }
+    return decision
+  }
+
+  async #hasDurableInboxRow(message: HostedPersistedMessage, recipient: string): Promise<boolean> {
+    const rows = await this.#readInbox(recipient)
     const matches = rows.filter(row => row.messageId === message.messageId)
     return matches.length === 1 && matches[0]?.from === 'user' &&
       matches[0].text === message.text && matches[0].timestamp === message.createdAt
@@ -365,6 +462,7 @@ export class HostedTeamLeadInboxPump {
 
   async #hasDurableDeliveryReceipt(
     message: HostedPersistedMessage,
+    recipient: string,
     authority: HostedControlAuthority,
   ): Promise<boolean> {
     const key = { actorId: authority.actorId, workspaceId: authority.workspaceId,
@@ -376,17 +474,18 @@ export class HostedTeamLeadInboxPump {
       `${digest}.delivery.v1.json`)))
     const binding = asRecord(record?.binding)
     return record?.schemaVersion === 1 && record.canonicalTeamRoot === this.#root &&
-      record.legacyKey === this.#legacyKey && record.recipient === TEAM_LEAD_NAME &&
+      record.legacyKey === this.#legacyKey && record.recipient === recipient &&
       record.status === 'delivered' && sameAuthority(record.authority as HostedControlAuthority, authority) &&
       binding?.actorId === authority.actorId && binding.workspaceId === authority.workspaceId &&
       binding.teamId === authority.teamId && binding.clientMessageId === message.clientMessageId &&
       binding.messageId === message.messageId && binding.textSha256 === sha256(message.text)
   }
 
-  async #readInbox(): Promise<Array<Record<string, unknown>>> {
-    const value = await readPrivateJson(join(this.#root, 'inboxes', 'team-lead.json'), MAX_INBOX_BYTES)
+  async #readInbox(recipient: string): Promise<Array<Record<string, unknown>>> {
+    if (!isInboxRecipient(recipient)) throw new Error('Invalid hosted inbox recipient')
+    const value = await readPrivateJson(join(this.#root, 'inboxes', `${recipient}.json`), MAX_INBOX_BYTES)
     if (!Array.isArray(value) || value.length > 10_000 || value.some(row => !asRecord(row))) {
-      throw new Error('Invalid hosted team-lead inbox')
+      throw new Error('Invalid hosted inbox')
     }
     return value as Array<Record<string, unknown>>
   }
@@ -414,6 +513,15 @@ export class HostedTeamLeadInboxPump {
 }
 
 function sha256(text: string): string { return createHash('sha256').update(text).digest('hex') }
+function isInboxRecipient(value: unknown): value is string {
+  return value === TEAM_LEAD_NAME || isHostedMessageRecipientName(value)
+}
+/** The lead keeps its original key so intents written before recipients existed still resolve. */
+function intentDigest(teamId: string, recipient: string, messageId: string): string {
+  return recipient === TEAM_LEAD_NAME
+    ? sha256(`agent-teams.hosted-inbox/v1\0${teamId}\0${messageId}`)
+    : sha256(`agent-teams.hosted-inbox/v2\0${teamId}\0${recipient}\0${messageId}`)
+}
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null
 }
@@ -442,7 +550,11 @@ function isTerminalResponseObservation(value: unknown, promptId: string): boolea
       observation.state === 'responded_tool_call' ||
       observation.state === 'responded_non_visible_tool')
 }
-async function writeIntent(path: string, intent: Intent): Promise<void> {
+function validNativeInboxRecord(value: NativeInboxRecord): boolean {
+  return value.schemaVersion === 1 && asRecord(value.authority) !== null &&
+    asRecord(value.message) !== null && /^[0-9a-f]{64}$/.test(value.textSha256)
+}
+async function writeIntent(path: string, intent: Intent | NativeInboxRecord): Promise<void> {
   await writeFileAtomic(path, `${JSON.stringify(intent)}\n`, { mode: 0o600 })
   await fsyncFileAndParent(path)
 }

@@ -103,10 +103,10 @@ function createHostedTeamLeadInboxPumpPort(
 ): HostedTeamInboxPumpPort {
   const pump = new HostedTeamLeadInboxPump(options)
   return Object.freeze({
-    // The current pump prompts only the lead session; other recipients stay pending.
-    wake: async ({ recipient, message, authority }) => recipient === TEAM_LEAD_NAME
+    // The pump derives the member from the persisted message; a mismatched port call is a bug.
+    wake: async ({ recipient, message, authority }) => recipient === (message.recipient ?? TEAM_LEAD_NAME)
       ? pump.wake(message, authority)
-      : { kind: 'unavailable' as const },
+      : { kind: 'operator_required' as const },
     recover: () => pump.recover(),
     start: () => pump.start(),
     close: () => pump.close(),
