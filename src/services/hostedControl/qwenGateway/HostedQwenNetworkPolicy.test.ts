@@ -20,9 +20,12 @@ class FakeRunner implements HostedQwenCommandRunner {
   running = true
   ip = '172.18.0.2'
   endpointGateway = '172.18.0.1'
+  labelGeneration = generation
   ifindex = 42
   nft = ''
+  grantIp: string | null = null
   ufw = false
+  throwAfterNftDelete = false
   calls: string[] = []
 
   async run(executable: string, args: readonly string[], input?: string): Promise<string> {
@@ -35,7 +38,7 @@ class FakeRunner implements HostedQwenCommandRunner {
     })
     if (executable === '/usr/bin/docker' && args[0] === 'inspect') return JSON.stringify({
       Id: containerId, HostConfig: { NetworkMode: networkId },
-      Config: { Labels: { 'org.agentteams.hosted-opencode.generation': generation } },
+      Config: { Labels: { 'org.agentteams.hosted-opencode.generation': this.labelGeneration } },
       State: { Running: this.running, Pid: 1234 },
       NetworkSettings: { Networks: { private: { NetworkID: networkId, IPAddress: this.ip, Gateway: this.endpointGateway } } },
     })
@@ -44,14 +47,30 @@ class FakeRunner implements HostedQwenCommandRunner {
     }])
     if (executable === '/usr/sbin/nft') {
       if (args[0] === '-f') { this.nft = input ?? ''; return '' }
-      if (args[0] === 'insert') { this.nft += `\n${args.join(' ')}`; return '' }
-      if (args[0] === '-j') return this.nft
-      if (args[0] === 'delete') { this.nft = ''; return '' }
+      if (args[0] === 'add' && args[1] === 'element') {
+        if (this.grantIp) throw new Error('element-exists')
+        this.grantIp = String(args[5]).replace(/[{} ]/g, '')
+        return ''
+      }
+      if (args[0] === 'delete' && args[1] === 'element') {
+        if (!this.grantIp) throw new Error('element-missing')
+        this.grantIp = null
+        if (this.throwAfterNftDelete) { this.throwAfterNftDelete = false; throw new Error('ambiguous-delete') }
+        return ''
+      }
+      if (args[0] === '-j') return JSON.stringify({ nftables: [
+        { table: { name: `hqw_${generation}`, rules: this.nft } },
+        { set: { name: 'granted', table: `hqw_${generation}`, family: 'inet', type: 'ipv4_addr',
+          elem: this.grantIp ? [this.grantIp] : [] } },
+      ] })
+      if (args[0] === 'delete') { this.nft = ''; this.grantIp = null; return '' }
     }
     if (executable === '/usr/sbin/iptables') {
       if (args.includes('-I')) { this.ufw = true; return '' }
       if (args.includes('-C')) { if (!this.ufw) throw new Error('missing'); return '' }
       if (args.includes('-D')) { this.ufw = false; return '' }
+      if (args.includes('-S')) return this.ufw ?
+        `-A ufw-user-input --comment "hqw_${generation}" -j ACCEPT` : ''
     }
     throw new Error(`unexpected command: ${executable} ${args.join(' ')}`)
   }
@@ -92,11 +111,14 @@ test('deny is installed before one exact container can be admitted; drift fails 
   expect(await policy.prepare()).toEqual({ gateway: '172.18.0.1', bridge })
   expect(runner.nft).toContain(`iifname "${bridge}" drop`)
   expect(runner.nft).toContain(`oifname "${bridge}" drop`)
+  expect(runner.nft).not.toContain('ct state established,related accept')
   expect(runner.ufw).toBe(false)
   runner.occupied = true
   expect(await policy.admitContainer(containerId)).toBe('172.18.0.2')
   expect(runner.ufw).toBe(true)
-  expect(runner.nft).toContain(`ip saddr 172.18.0.2 ip daddr 172.18.0.1 tcp dport 19443`)
+  expect(runner.nft).toContain(`ip saddr @granted ip daddr 172.18.0.1 tcp dport 19443`)
+  expect(runner.nft).toContain('ct state new,established accept')
+  expect(runner.grantIp).toBe('172.18.0.2')
   await policy.attest()
   runner.ifindex++
   await expect(policy.attest()).rejects.toThrow('hosted-qwen-policy-drift')
@@ -109,7 +131,7 @@ test('internal endpoint with no default gateway admits only the verified bridge 
   runner.occupied = true
   expect(await policy.admitContainer(containerId)).toBe(runner.ip)
   await policy.attest()
-  expect(runner.nft).toContain(`ip saddr ${runner.ip} ip daddr 172.18.0.1 tcp dport 19443`)
+  expect(runner.grantIp).toBe(runner.ip)
 })
 
 test('unexpected endpoint gateway fails closed before installing a grant', async () => {
@@ -119,7 +141,7 @@ test('unexpected endpoint gateway fails closed before installing a grant', async
   runner.occupied = true
   await expect(policy.admitContainer(containerId)).rejects.toThrow('hosted-qwen-container-endpoint-invalid')
   expect(runner.ufw).toBe(false)
-  expect(runner.nft).not.toContain('insert rule')
+  expect(runner.grantIp).toBeNull()
 })
 
 test('network claim remains while container exists; cleanup removes grant before deny', async () => {
@@ -138,6 +160,82 @@ test('network claim remains while container exists; cleanup removes grant before
   const deleteDeny = runner.calls.findIndex(call => call.includes('nft delete table'))
   expect(deleteGrant).toBeGreaterThan(-1)
   expect(deleteDeny).toBeGreaterThan(deleteGrant)
+})
+
+test('bridge bind requires the exact prepared address, port and generation', async () => {
+  const { policy } = await setup()
+  await policy.prepare()
+  await policy.assertBridgeBind('172.18.0.1', 19443, generation)
+  await expect(policy.assertBridgeBind('0.0.0.0', 19443, generation)).rejects.toThrow('hosted-qwen-bind-mismatch')
+  await expect(policy.assertBridgeBind('172.18.0.1', 19444, generation)).rejects.toThrow('hosted-qwen-bind-mismatch')
+  await expect(policy.assertBridgeBind('172.18.0.1', 19443, 'c'.repeat(32))).rejects.toThrow('hosted-qwen-bind-mismatch')
+})
+
+test('source admission belongs to the same exact network and generation lease', async () => {
+  const { runner, policy } = await setup()
+  await policy.prepare()
+  runner.occupied = true
+  await policy.admitContainer(containerId)
+  policy.assertContainerSource(networkId, containerId, '172.18.0.2', generation)
+  expect(() => policy.assertContainerSource('c'.repeat(64), containerId, '172.18.0.2', generation))
+    .toThrow('hosted-qwen-source-mismatch')
+  expect(() => policy.assertContainerSource(networkId, 'd'.repeat(64), '172.18.0.2', generation))
+    .toThrow('hosted-qwen-source-mismatch')
+  expect(() => policy.assertContainerSource(networkId, containerId, '172.18.0.3', generation))
+    .toThrow('hosted-qwen-source-mismatch')
+  expect(() => policy.assertContainerSource(networkId, containerId, '172.18.0.2', 'c'.repeat(32)))
+    .toThrow('hosted-qwen-source-mismatch')
+  await policy.revokeContainer()
+  expect(() => policy.assertContainerSource(networkId, containerId, '172.18.0.2', generation))
+    .toThrow('hosted-qwen-source-mismatch')
+})
+
+test('revocation denies a live container before deleting its tagged UFW grant and can retry ambiguity', async () => {
+  const { runner, policy } = await setup()
+  await policy.prepare()
+  runner.occupied = true
+  await policy.admitContainer(containerId)
+  runner.throwAfterNftDelete = true
+  await expect(policy.revokeContainer()).rejects.toThrow('ambiguous-delete')
+  expect(runner.grantIp).toBeNull()
+  expect(runner.ufw).toBe(true)
+  await policy.revokeContainer()
+  expect(runner.ufw).toBe(false)
+  await policy.revokeContainer()
+  await policy.attest()
+  const nftDelete = runner.calls.findIndex(call => call.includes('nft delete element'))
+  const ufwDelete = runner.calls.findIndex(call => call.includes('iptables -w 2 -D'))
+  expect(nftDelete).toBeGreaterThan(-1)
+  expect(ufwDelete).toBeGreaterThan(nftDelete)
+  runner.occupied = false
+  await policy.close()
+})
+
+test('revocation refuses changed source IP or container generation before touching the grant', async () => {
+  const { runner, policy } = await setup()
+  await policy.prepare()
+  runner.occupied = true
+  await policy.admitContainer(containerId)
+  runner.ip = '172.18.0.3'
+  await expect(policy.revokeContainer()).rejects.toThrow('hosted-qwen-policy-drift')
+  runner.ip = '172.18.0.2'
+  runner.labelGeneration = 'c'.repeat(32)
+  await expect(policy.revokeContainer()).rejects.toThrow('hosted-qwen-container-invalid')
+  expect(runner.grantIp).toBe('172.18.0.2')
+  expect(runner.ufw).toBe(true)
+})
+
+test('foreign firewall changes are left for reconciliation without deleting another rule', async () => {
+  const { runner, policy } = await setup()
+  await policy.prepare()
+  runner.occupied = true
+  await policy.admitContainer(containerId)
+  runner.nft += '\nforeign-rule'
+  const before = runner.calls.length
+  await expect(policy.revokeContainer()).rejects.toThrow('hosted-qwen-policy-drift')
+  expect(runner.calls.slice(before).some(call => call.includes('delete element') ||
+    call.includes('iptables -w 2 -D'))).toBe(false)
+  expect(runner.grantIp).toBe('172.18.0.2')
 })
 
 test('vulnerable Docker DNS versions never install a lease', async () => {

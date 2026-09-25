@@ -46,6 +46,8 @@ test('only the admitted client and exact OpenAI routes reach the fixed loopback 
   close.push(() => gateway.stop())
 
   expect((await raw(port, 'GET', '/v1/models')).status).toBe(403)
+  gateway.admitClient('127.0.0.2')
+  expect((await raw(port, 'GET', '/v1/models')).status).toBe(403)
   gateway.admitClient('127.0.0.1')
   expect(await raw(port, 'GET', '/v1/models')).toEqual({ status: 200, body: '{"ok":true}' })
   expect(await raw(port, 'POST', '/v1/chat/completions', '{"model":"qwen3-8b"}')).toEqual(
@@ -55,6 +57,60 @@ test('only the admitted client and exact OpenAI routes reach the fixed loopback 
   expect(calls).toEqual(['GET /v1/models', 'POST /v1/chat/completions'])
   gateway.revokeClient()
   expect((await raw(port, 'GET', '/v1/models')).status).toBe(403)
+})
+
+test('a stalled request body loses its lease before any upstream dispatch', async () => {
+  let calls = 0
+  const upstream = createServer((_req, res) => { calls++; res.end('{}') })
+  await new Promise<void>(resolve => upstream.listen(0, '127.0.0.1', resolve))
+  close.push(() => new Promise(resolve => upstream.close(() => resolve())))
+  const port = await freePort()
+  const gateway = new HostedQwenGateway({ bindAddress: '127.0.0.1', port,
+    upstreamPort: (upstream.address() as AddressInfo).port, timeoutMs: 1000,
+    testOnlyAllowNonRoot: true })
+  await gateway.start()
+  close.push(() => gateway.stop())
+  gateway.admitClient('127.0.0.1')
+
+  const client = createConnection({ host: '127.0.0.1', port })
+  client.on('error', () => undefined)
+  try {
+    await new Promise<void>(resolve => client.once('connect', resolve))
+    const closed = new Promise<void>(resolve => client.once('close', () => resolve()))
+    client.write('POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n1\r\n{\r\n')
+    await Promise.race([closed, new Promise<never>((_, reject) => {
+      setTimeout(() => reject(new Error('stalled request was not closed')), 2500)
+    })])
+    expect(calls).toBe(0)
+  } finally { client.destroy() }
+})
+
+test('listener opens only while the prepared bridge lease attests its address and generation', async () => {
+  const port = await freePort()
+  expect(() => new HostedQwenGateway({ bindAddress: '127.0.0.1', port,
+    maxConcurrent: 2, testOnlyAllowNonRoot: true })).toThrow('hosted-qwen-bounds-invalid')
+  const checks: string[] = []
+  const bridgeAuthority = {
+    async assertBridgeBind(address: string, checkedPort: number, checkedGeneration: string) {
+      checks.push(`${address}:${checkedPort}:${checkedGeneration}`)
+      if (address !== '127.0.0.1' || checkedPort !== port || checkedGeneration !== 'b'.repeat(32)) {
+        throw new Error('hosted-qwen-bind-mismatch')
+      }
+    },
+    assertContainerSource() { throw new Error('not admitted in this listener test') },
+  }
+  const rejected = new HostedQwenGateway({ bindAddress: '127.0.0.1', port,
+    generation: 'c'.repeat(32), bridgeAuthority, testOnlyAllowNonRoot: true })
+  await expect(rejected.start()).rejects.toThrow('hosted-qwen-bind-mismatch')
+  const gateway = new HostedQwenGateway({ bindAddress: '127.0.0.1', port,
+    generation: 'b'.repeat(32), bridgeAuthority, testOnlyAllowNonRoot: true })
+  await gateway.start()
+  close.push(() => gateway.stop())
+  expect(checks).toEqual([
+    `127.0.0.1:${port}:${'c'.repeat(32)}`,
+    `127.0.0.1:${port}:${'b'.repeat(32)}`,
+    `127.0.0.1:${port}:${'b'.repeat(32)}`,
+  ])
 })
 
 test('oversize body is rejected before any upstream request, and redirects are blocked', async () => {
@@ -196,7 +252,7 @@ const productAdmission: HostedQwenAdmission = {
   },
   container: { containerId: 'container-1', networkId: 'network-1', containerGeneration: 1,
     containerIp: '127.0.0.1' },
-  model: 'qwen/qwen3-8b',
+  model: 'local-llama/qwen3-8b',
 }
 
 function fakeAuthority(): { authority: HostedQwenGatewayDispatchAuthority;
@@ -227,6 +283,8 @@ test('Product admission denies changed container generation, IP, and model befor
     dispatchAuthority: fixture.authority })
   await gateway.start()
   close.push(() => gateway.stop())
+  expect(() => gateway.admitClient({ ...productAdmission, model: 'qwen/other' }))
+    .toThrow('hosted-qwen-admission-invalid')
   gateway.admitClient(productAdmission)
   fixture.setContainer({ ...productAdmission.container, containerGeneration: 2 })
   expect((await raw(port, 'GET', '/v1/models')).status).toBe(502)
@@ -234,11 +292,48 @@ test('Product admission denies changed container generation, IP, and model befor
   expect((await raw(port, 'GET', '/v1/models')).status).toBe(502)
   fixture.setContainer(productAdmission.container)
   fixture.setModel('qwen/changed')
-  expect((await raw(port, 'POST', '/v1/chat/completions', '{"model":"qwen/qwen3-8b"}')).status).toBe(502)
+  expect((await raw(port, 'POST', '/v1/chat/completions', '{"model":"qwen3-8b"}')).status).toBe(502)
   expect(calls).toBe(0)
   fixture.setModel(productAdmission.model)
   expect((await raw(port, 'POST', '/v1/chat/completions', '{"model":"qwen/other"}')).status).toBe(403)
   expect(calls).toBe(0)
+  expect((await raw(port, 'POST', '/v1/chat/completions', '{"model":"local-llama/qwen3-8b"}')).status).toBe(403)
+  expect((await raw(port, 'POST', '/v1/chat/completions', '{"model":"qwen3-8b"}')).status).toBe(200)
+  expect(calls).toBe(1)
+})
+
+test('Product admission cannot borrow a different firewall source lease', async () => {
+  let calls = 0
+  const upstream = createServer((_req, res) => { calls++; res.end('{}') })
+  await new Promise<void>(resolve => upstream.listen(0, '127.0.0.1', resolve))
+  close.push(() => new Promise(resolve => upstream.close(() => resolve())))
+  const port = await freePort()
+  const generation = 'e'.repeat(32)
+  const bridgeAuthority = {
+    async assertBridgeBind(_address: string, _port: number, checkedGeneration: string) {
+      if (checkedGeneration !== generation) throw new Error('hosted-qwen-bind-mismatch')
+    },
+    assertContainerSource(networkId: string, containerId: string, containerIp: string,
+      checkedGeneration: string) {
+      if (networkId !== productAdmission.container.networkId ||
+        containerId !== productAdmission.container.containerId ||
+        containerIp !== productAdmission.container.containerIp || checkedGeneration !== generation) {
+        throw new Error('hosted-qwen-source-mismatch')
+      }
+    },
+  }
+  const gateway = new HostedQwenGateway({ bindAddress: '127.0.0.1', port,
+    upstreamPort: (upstream.address() as AddressInfo).port, generation, bridgeAuthority,
+    dispatchAuthority: fakeAuthority().authority, testOnlyAllowNonRoot: true })
+  await gateway.start()
+  close.push(() => gateway.stop())
+  gateway.admitClient(productAdmission)
+  expect((await raw(port, 'GET', '/v1/models')).status).toBe(200)
+  expect(() => gateway.admitClient({ ...productAdmission,
+    container: { ...productAdmission.container, networkId: 'foreign-network' } }))
+    .toThrow('hosted-qwen-source-mismatch')
+  expect((await raw(port, 'GET', '/v1/models')).status).toBe(403)
+  expect(calls).toBe(1)
 })
 
 test('Product revoke before body completion causes zero upstream requests', async () => {

@@ -6,6 +6,8 @@ import { connectPinnedQwen, PinnedQwenResponseParser, qwenHttpFrame, writePinned
 
 const IPV4 = /^(?:\d{1,3}\.){3}\d{1,3}$/
 const MAX_GATEWAY_REQUEST_BYTES = 64 * 1024
+const PRODUCT_MODEL = 'local-llama/qwen3-8b'
+const WIRE_MODEL = 'qwen3-8b'
 
 function ipv4(value: string): boolean {
   return IPV4.test(value) && value.split('.').every(octet => Number(octet) <= 255)
@@ -34,6 +36,13 @@ export interface HostedQwenGatewayDispatchAuthority {
 export interface HostedQwenGatewayOptions {
   readonly bindAddress: string
   readonly port: number
+  /** A prepared root firewall lease must attest the literal Docker bridge bind. */
+  readonly bridgeAuthority?: Readonly<{
+    assertBridgeBind(address: string, port: number, generation: string): Promise<void>
+    assertContainerSource(networkId: string, containerId: string, containerIp: string,
+      generation: string): void
+  }>
+  readonly generation?: string
   readonly upstreamPort?: number
   readonly maxRequestBytes?: number
   readonly maxResponseBytes?: number
@@ -64,7 +73,9 @@ export class HostedQwenGateway {
         throw new Error('hosted-qwen-test-mode-invalid')
       }
     } else if (process.platform !== 'linux' || process.getuid?.() !== 0 ||
-      !ipv4(options.bindAddress) || options.bindAddress.startsWith('127.')) {
+      !ipv4(options.bindAddress) || options.bindAddress === '0.0.0.0' ||
+      options.bindAddress.startsWith('127.') || !options.bridgeAuthority ||
+      !/^[a-f0-9]{32}$/.test(options.generation ?? '')) {
       throw new Error('hosted-qwen-root-bridge-required')
     }
     if (!Number.isInteger(options.port) || options.port < 1024 || options.port > 65535 ||
@@ -74,12 +85,12 @@ export class HostedQwenGateway {
     this.maxRequestBytes = options.maxRequestBytes ?? MAX_GATEWAY_REQUEST_BYTES
     this.maxResponseBytes = options.maxResponseBytes ?? 32 * 1024 * 1024
     this.timeoutMs = options.timeoutMs ?? 300_000
-    this.maxConcurrent = options.maxConcurrent ?? 4
+    this.maxConcurrent = options.maxConcurrent ?? 1
     if (!Number.isSafeInteger(this.maxRequestBytes) || this.maxRequestBytes < 1 ||
       this.maxRequestBytes > MAX_GATEWAY_REQUEST_BYTES ||
       !Number.isSafeInteger(this.maxResponseBytes) || this.maxResponseBytes < 1 || this.maxResponseBytes > 128 * 1024 * 1024 ||
       !Number.isSafeInteger(this.timeoutMs) || this.timeoutMs < 1000 || this.timeoutMs > 600_000 ||
-      !Number.isSafeInteger(this.maxConcurrent) || this.maxConcurrent < 1 || this.maxConcurrent > 8) {
+      this.maxConcurrent !== 1) {
       throw new Error('hosted-qwen-bounds-invalid')
     }
     this.server = createServer((req, res) => {
@@ -100,6 +111,10 @@ export class HostedQwenGateway {
 
   async start(): Promise<void> {
     if (this.started) throw new Error('hosted-qwen-already-started')
+    if (this.options.bridgeAuthority) {
+      await this.options.bridgeAuthority.assertBridgeBind(
+        this.options.bindAddress, this.options.port, this.options.generation ?? '')
+    }
     await new Promise<void>((resolve, reject) => {
       this.server.once('error', reject)
       this.server.listen(this.options.port, this.options.bindAddress, () => {
@@ -108,7 +123,16 @@ export class HostedQwenGateway {
       })
     })
     this.started = true
-    this.attest()
+    try {
+      this.attest()
+      if (this.options.bridgeAuthority) {
+        await this.options.bridgeAuthority.assertBridgeBind(
+          this.options.bindAddress, this.options.port, this.options.generation ?? '')
+      }
+    } catch (error) {
+      await this.stop()
+      throw error
+    }
   }
 
   /** Root calls this only after the exact container IP is admitted by network policy. */
@@ -120,13 +144,15 @@ export class HostedQwenGateway {
       this.admitted = admission
       return
     }
+    this.revokeClient()
     if (!this.options.dispatchAuthority || !admission?.member || !admission.container ||
       !ipv4(admission.container.containerIp) || !admission.container.containerId || !admission.container.networkId ||
       !Number.isSafeInteger(admission.container.containerGeneration) || admission.container.containerGeneration < 1 ||
-      typeof admission.model !== 'string' || !admission.model || admission.model.length > 256) {
+      admission.model !== PRODUCT_MODEL) {
       throw new Error('hosted-qwen-admission-invalid')
     }
-    this.revokeClient()
+    this.options.bridgeAuthority?.assertContainerSource(admission.container.networkId,
+      admission.container.containerId, admission.container.containerIp, this.options.generation ?? '')
     this.admitted = Object.freeze({
       member: Object.freeze({ ...admission.member }),
       container: Object.freeze({ ...admission.container }),
@@ -247,6 +273,10 @@ export class HostedQwenGateway {
       },
     }
     this.active.add(exchange)
+    // Start the deadline before reading a potentially stalled request body. The
+    // timeout covers body receipt, loopback connect, dispatch and response.
+    deadline = setTimeout(() => exchange.cancel(), this.timeoutMs)
+    deadline.unref()
     req.once('aborted', onAbort)
     req.socket.once('close', onAbort)
     req.socket.once('end', onAbort)
@@ -285,7 +315,7 @@ export class HostedQwenGateway {
       try {
         const json: unknown = JSON.parse(body.toString('utf8'))
         if (!json || typeof json !== 'object' || Array.isArray(json) ||
-          (json as Record<string, unknown>).model !== admission.model) throw new Error('model-mismatch')
+          (json as Record<string, unknown>).model !== WIRE_MODEL) throw new Error('model-mismatch')
       } catch {
         res.writeHead(403).end()
         finish()
@@ -328,8 +358,6 @@ export class HostedQwenGateway {
         else res.writeHead(502, { connection: 'close' }).end()
       }
     }
-    deadline = setTimeout(fail, this.timeoutMs)
-    deadline.unref()
     socket.on('error', fail)
     socket.on('close', () => {
       if (finished) return

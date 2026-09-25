@@ -141,6 +141,7 @@ export class HostedQwenNetworkPolicy {
   private containerId: string | null = null
   private containerIp: string | null = null
   private claimIdentity: string | null = null
+  private revoked = false
 
   constructor(private readonly options: HostedQwenNetworkPolicyOptions) {
     if (!SHA.test(options.networkId) || !GENERATION.test(options.generation) ||
@@ -160,6 +161,25 @@ export class HostedQwenNetworkPolicy {
 
   private run(executable: string, args: readonly string[], input?: string): Promise<string> {
     return this.runner.run(executable, args, input)
+  }
+
+  private comment(): string { return `hqw_${this.options.generation}` }
+
+  private grantArgs(): string[] {
+    if (!this.bridge || !this.containerIp) throw new Error('hosted-qwen-admission-invalid')
+    return ['-i', this.bridge.name, '-s', this.containerIp, '-d', this.bridge.gateway,
+      '-p', 'tcp', '--dport', String(this.options.gatewayPort),
+      '-m', 'comment', '--comment', this.comment(), '-j', 'ACCEPT']
+  }
+
+  private async ufwGrantPresent(): Promise<boolean> {
+    const rules = await this.run('/usr/sbin/iptables', ['-w', '2', '-S', 'ufw-user-input'])
+    const tagged = rules.split('\n').filter(line =>
+      new RegExp(`--comment "?${this.comment()}"?(?: |$)`).test(line))
+    if (tagged.length > 1) throw new Error('hosted-qwen-ufw-drift')
+    if (!tagged.length) return false
+    await this.run('/usr/sbin/iptables', ['-w', '2', '-C', 'ufw-user-input', ...this.grantArgs()])
+    return true
   }
 
   private async network(empty: boolean): Promise<BridgeIdentity> {
@@ -206,8 +226,27 @@ export class HostedQwenNetworkPolicy {
     }
   }
 
-  private async snapshotRules(): Promise<string> {
-    return hash(await this.run('/usr/sbin/nft', ['-j', 'list', 'table', 'inet', this.table]))
+  private async snapshotRules(): Promise<Readonly<{ digest: string; grantedIp: string | null }>> {
+    const row = object(JSON.parse(await this.run('/usr/sbin/nft', ['-j', 'list', 'table', 'inet', this.table])))
+    if (!Array.isArray(row.nftables)) throw new Error('hosted-qwen-policy-drift')
+    let grantSeen = false
+    let grantedIp: string | null = null
+    const normalized = row.nftables.map((entry: unknown) => {
+      const item = object(entry)
+      if (!item.set) return item
+      const set = object(item.set)
+      if (set.name !== 'granted' || set.table !== this.table || set.family !== 'inet') return item
+      if (grantSeen || set.type !== 'ipv4_addr') throw new Error('hosted-qwen-policy-drift')
+      grantSeen = true
+      const elements = set.elem ?? []
+      if (!Array.isArray(elements) || elements.length > 1 ||
+        elements.length === 1 && !ipv4(elements[0])) throw new Error('hosted-qwen-policy-drift')
+      grantedIp = elements.length ? elements[0] as string : null
+      const { elem: _elements, ...structure } = set
+      return { set: structure }
+    })
+    if (!grantSeen) throw new Error('hosted-qwen-policy-drift')
+    return { digest: hash(JSON.stringify(normalized)), grantedIp }
   }
 
   async prepare(): Promise<Readonly<{ gateway: string; bridge: string }>> {
@@ -238,8 +277,9 @@ export class HostedQwenNetworkPolicy {
     // An independent base chain runs before Docker/UFW. accept here does not
     // bypass UFW's later default drop; a separate exact UFW grant is required.
     const rules = `table inet ${this.table} {\n` +
+      ` set granted { type ipv4_addr; }\n` +
       ` chain inbound { type filter hook input priority -151; policy accept;\n` +
-      `  iifname "${b}" ct state established,related accept\n` +
+      `  iifname "${b}" ip saddr @granted ip daddr ${gateway} tcp dport ${port} ct state new,established accept\n` +
       `  iifname "${b}" drop\n` +
       `  ip daddr ${gateway} tcp dport ${port} drop\n` +
       ` }\n` +
@@ -250,7 +290,9 @@ export class HostedQwenNetworkPolicy {
     try {
       await this.run('/usr/sbin/nft', ['-f', '-'], rules)
       this.bridge = bridge
-      this.ruleDigest = await this.snapshotRules()
+      const snapshot = await this.snapshotRules()
+      if (snapshot.grantedIp !== null) throw new Error('hosted-qwen-policy-drift')
+      this.ruleDigest = snapshot.digest
       await this.attest()
       return { gateway, bridge: b }
     } catch (error) {
@@ -289,7 +331,8 @@ export class HostedQwenNetworkPolicy {
       throw new Error('hosted-qwen-admission-invalid')
     }
     await this.assertClaim()
-    if (await this.snapshotRules() !== this.ruleDigest) throw new Error('hosted-qwen-policy-drift')
+    const before = await this.snapshotRules()
+    if (before.digest !== this.ruleDigest || before.grantedIp !== null) throw new Error('hosted-qwen-policy-drift')
     const ip = await this.inspectContainer(id)
     this.containerId = id
     this.containerIp = ip
@@ -297,13 +340,10 @@ export class HostedQwenNetworkPolicy {
       const current = await this.network(false)
       if (current.name !== this.bridge.name || current.ifindex !== this.bridge.ifindex ||
         current.gateway !== this.bridge.gateway) throw new Error('hosted-qwen-policy-drift')
-      const exact = ['-i', this.bridge.name, '-s', ip, '-d', this.bridge.gateway,
-        '-p', 'tcp', '--dport', String(this.options.gatewayPort), '-j', 'ACCEPT']
-      await this.run('/usr/sbin/nft', ['insert', 'rule', 'inet', this.table, 'inbound',
-        'iifname', this.bridge.name, 'ip', 'saddr', ip, 'ip', 'daddr', this.bridge.gateway,
-        'tcp', 'dport', String(this.options.gatewayPort), 'ct', 'state', 'new', 'accept'])
-      this.ruleDigest = await this.snapshotRules()
-      await this.run('/usr/sbin/iptables', ['-w', '2', '-I', 'ufw-user-input', '1', ...exact])
+      await this.run('/usr/sbin/nft', ['add', 'element', 'inet', this.table, 'granted', `{ ${ip} }`])
+      const granted = await this.snapshotRules()
+      if (granted.digest !== this.ruleDigest || granted.grantedIp !== ip) throw new Error('hosted-qwen-policy-drift')
+      await this.run('/usr/sbin/iptables', ['-w', '2', '-I', 'ufw-user-input', '1', ...this.grantArgs()])
       await this.attest()
       return ip
     } catch (error) {
@@ -316,18 +356,66 @@ export class HostedQwenNetworkPolicy {
     if (!this.bridge || !this.ruleDigest) throw new Error('hosted-qwen-policy-unprepared')
     await this.assertClaim()
     const current = await this.network(this.containerId === null)
+    const rules = await this.snapshotRules()
     if (current.name !== this.bridge.name || current.ifindex !== this.bridge.ifindex ||
-      current.gateway !== this.bridge.gateway || await this.snapshotRules() !== this.ruleDigest) {
+      current.gateway !== this.bridge.gateway || rules.digest !== this.ruleDigest ||
+      rules.grantedIp !== (this.revoked ? null : this.containerIp)) {
       throw new Error('hosted-qwen-policy-drift')
     }
     if (this.containerId && this.containerIp) {
       if (await this.inspectContainer(this.containerId) !== this.containerIp) {
         throw new Error('hosted-qwen-container-drift')
       }
-      await this.run('/usr/sbin/iptables', ['-w', '2', '-C', 'ufw-user-input',
-        '-i', this.bridge.name, '-s', this.containerIp, '-d', this.bridge.gateway,
-        '-p', 'tcp', '--dport', String(this.options.gatewayPort), '-j', 'ACCEPT'])
+      if (await this.ufwGrantPresent() === this.revoked) throw new Error('hosted-qwen-ufw-drift')
     }
+  }
+
+  /** The listener may bind only to this lease's live bridge IP and port. */
+  async assertBridgeBind(address: string, port: number, generation: string): Promise<void> {
+    if (address !== this.bridge?.gateway || port !== this.options.gatewayPort ||
+      generation !== this.options.generation) throw new Error('hosted-qwen-bind-mismatch')
+    await this.attest()
+  }
+
+  /** Root may admit only the source pinned by this exact network lease. */
+  assertContainerSource(networkId: string, containerId: string, containerIp: string,
+    generation: string): void {
+    if (!this.bridge || this.revoked || networkId !== this.options.networkId ||
+      containerId !== this.containerId || containerIp !== this.containerIp ||
+      generation !== this.options.generation) throw new Error('hosted-qwen-source-mismatch')
+  }
+
+  /** Remove the kernel grant while the exact container still exists. Safe to retry after an uncertain command result. */
+  async revokeContainer(): Promise<void> {
+    if (!this.bridge || !this.containerId || !this.containerIp || !this.ruleDigest) {
+      throw new Error('hosted-qwen-admission-invalid')
+    }
+    await this.assertClaim()
+    const current = await this.network(false)
+    if (current.name !== this.bridge.name || current.ifindex !== this.bridge.ifindex ||
+      current.gateway !== this.bridge.gateway ||
+      await this.inspectContainer(this.containerId) !== this.containerIp) {
+      throw new Error('hosted-qwen-policy-drift')
+    }
+    const before = await this.snapshotRules()
+    if (before.digest !== this.ruleDigest ||
+      before.grantedIp !== null && before.grantedIp !== this.containerIp) {
+      throw new Error('hosted-qwen-policy-drift')
+    }
+    if (before.grantedIp) {
+      await this.run('/usr/sbin/nft', ['delete', 'element', 'inet', this.table,
+        'granted', `{ ${this.containerIp} }`])
+    }
+    const denied = await this.snapshotRules()
+    if (denied.digest !== this.ruleDigest || denied.grantedIp !== null) {
+      throw new Error('hosted-qwen-policy-drift')
+    }
+    if (await this.ufwGrantPresent()) {
+      await this.run('/usr/sbin/iptables', ['-w', '2', '-D', 'ufw-user-input', ...this.grantArgs()])
+    }
+    if (await this.ufwGrantPresent()) throw new Error('hosted-qwen-ufw-drift')
+    this.revoked = true
+    await this.attest()
   }
 
   /** Caller must stop and remove the container first. Unknown cleanup retains the claim. */
@@ -335,14 +423,15 @@ export class HostedQwenNetworkPolicy {
     if (!this.bridge) return
     await this.assertClaim()
     await this.network(true)
-    if (await this.snapshotRules() !== this.ruleDigest) throw new Error('hosted-qwen-policy-drift')
+    const rules = await this.snapshotRules()
+    if (rules.digest !== this.ruleDigest ||
+      rules.grantedIp !== (this.revoked ? null : this.containerIp)) {
+      throw new Error('hosted-qwen-policy-drift')
+    }
     if (this.containerIp) {
-      await this.run('/usr/sbin/iptables', ['-w', '2', '-C', 'ufw-user-input',
-        '-i', this.bridge.name, '-s', this.containerIp, '-d', this.bridge.gateway,
-        '-p', 'tcp', '--dport', String(this.options.gatewayPort), '-j', 'ACCEPT'])
-      await this.run('/usr/sbin/iptables', ['-w', '2', '-D', 'ufw-user-input',
-        '-i', this.bridge.name, '-s', this.containerIp, '-d', this.bridge.gateway,
-        '-p', 'tcp', '--dport', String(this.options.gatewayPort), '-j', 'ACCEPT'])
+      if (await this.ufwGrantPresent()) {
+        await this.run('/usr/sbin/iptables', ['-w', '2', '-D', 'ufw-user-input', ...this.grantArgs()])
+      }
     }
     await this.run('/usr/sbin/nft', ['delete', 'table', 'inet', this.table])
     await unlink(this.claimPath)
@@ -351,5 +440,6 @@ export class HostedQwenNetworkPolicy {
     this.containerId = null
     this.containerIp = null
     this.claimIdentity = null
+    this.revoked = false
   }
 }
