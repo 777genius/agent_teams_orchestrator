@@ -3,9 +3,10 @@ import { closeSync, constants, fstatSync, lstatSync, openSync, statSync } from '
 import { lstat, open } from 'node:fs/promises'
 import { isAbsolute, join, parse, resolve, sep } from 'node:path'
 
-export const HOSTED_MEMBER_ADMISSION_FORMAT = 'agent-teams.hosted-opencode-member-admission/v1'
+export const HOSTED_MEMBER_ADMISSION_V1_FORMAT = 'agent-teams.hosted-opencode-member-admission/v1'
+export const HOSTED_MEMBER_ADMISSION_FORMAT = 'agent-teams.hosted-opencode-member-admission/v2'
 export const HOSTED_MEMBER_ADMISSION_POLICY_ID = 'hosted-opencode-member-v1'
-const DOMAIN = Buffer.from(`${HOSTED_MEMBER_ADMISSION_FORMAT}\0`, 'utf8')
+const START_DOMAIN = 'agent-teams.hosted-opencode-member-start/v1\0'
 const HEX32 = /^[0-9a-f]{32}$/
 const HEX64 = /^[0-9a-f]{64}$/
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/
@@ -13,25 +14,32 @@ const GRANT = /^grant_[A-Za-z0-9][A-Za-z0-9._-]{7,127}$/
 const AUTH_GENERATION = /^authorization-generation_[A-Za-z0-9][A-Za-z0-9._-]{7,127}$/
 const OWNER_SESSION = /^owner-session_[A-Za-z0-9][A-Za-z0-9._-]{7,127}$/
 const MODEL = /^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,255}$/
+const RUN = /^run_[0-9a-f]{32}$/
+const MEMBER = /^member_[0-9a-f]{32}$/
+const TEAM = /^team_[0-9a-f]{32}$/
+const WORKSPACE = /^workspace_[0-9a-f]{32}$/
+const LANE = /^lane_[0-9a-f]{32}$/
 const MAX_WIRE_BYTES = 8_192
 const MAX_RECORD_BYTES = 512
 const CLOCK_SKEW_MS = 5_000
 
-const PAYLOAD_KEYS = [
+const V1_PAYLOAD_KEYS = [
   'admissionId', 'authorizationGeneration', 'bootId', 'deploymentId', 'expiresAtMs',
   'format', 'grantId', 'grantRevision', 'issuedAtMs', 'laneId', 'memberId',
   'memberName', 'memberOrdinal', 'model', 'mountGeneration', 'operationId',
   'ownerGeneration', 'ownerSessionId', 'planGeneration', 'planSha256', 'policyId',
   'promptSha256', 'restoreGeneration', 'runId', 'teamId', 'workspaceId',
 ] as const
+const V2_PAYLOAD_KEYS = V1_PAYLOAD_KEYS.filter(key =>
+  key !== 'authorizationGeneration' && key !== 'grantId')
 
-export type HostedMemberAdmissionPayload = Readonly<{
+export type HostedMemberAdmissionV1Payload = Readonly<{
   admissionId: string
   authorizationGeneration: string
   bootId: string
   deploymentId: string
   expiresAtMs: number
-  format: typeof HOSTED_MEMBER_ADMISSION_FORMAT
+  format: typeof HOSTED_MEMBER_ADMISSION_V1_FORMAT
   grantId: string
   grantRevision: string
   issuedAtMs: number
@@ -53,9 +61,12 @@ export type HostedMemberAdmissionPayload = Readonly<{
   teamId: string
   workspaceId: string
 }>
+export type HostedMemberAdmissionV2Payload = Readonly<Omit<HostedMemberAdmissionV1Payload,
+  'format' | 'grantId' | 'authorizationGeneration'> & { format: typeof HOSTED_MEMBER_ADMISSION_FORMAT }>
+export type HostedMemberAdmissionPayload = HostedMemberAdmissionV1Payload | HostedMemberAdmissionV2Payload
 
 /** A separate root-owned Product/launcher channel must supply these exact current pins. */
-export type LiveProductMemberAuthority = Readonly<Omit<HostedMemberAdmissionPayload,
+export type LiveProductMemberAuthority = Readonly<Omit<HostedMemberAdmissionV2Payload,
   'format' | 'admissionId' | 'issuedAtMs' | 'expiresAtMs'>>
 
 export type VerifiedHostedMemberAdmission = Readonly<{
@@ -106,14 +117,20 @@ function validName(value: unknown): value is string {
     Buffer.byteLength(value, 'utf8') <= 256 && !/[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/u.test(value)
 }
 
+function startOperationId(runId: string, memberId: string, planSha256: string): string {
+  return `start_${sha(Buffer.from(START_DOMAIN + JSON.stringify([runId, memberId, planSha256]), 'utf8'))}`
+}
+
 function parsePayload(value: unknown): HostedMemberAdmissionPayload {
-  if (!exact(value, PAYLOAD_KEYS) || value.format !== HOSTED_MEMBER_ADMISSION_FORMAT ||
+  const v1 = object(value) && value.format === HOSTED_MEMBER_ADMISSION_V1_FORMAT
+  const v2 = object(value) && value.format === HOSTED_MEMBER_ADMISSION_FORMAT
+  if ((!v1 && !v2) || !exact(value, v1 ? V1_PAYLOAD_KEYS : V2_PAYLOAD_KEYS) ||
     typeof value.admissionId !== 'string' || !HEX32.test(value.admissionId) ||
     typeof value.grantRevision !== 'string' || !HEX64.test(value.grantRevision) ||
     typeof value.planSha256 !== 'string' || !HEX64.test(value.planSha256) ||
     typeof value.promptSha256 !== 'string' || !HEX64.test(value.promptSha256) ||
-    typeof value.grantId !== 'string' || !GRANT.test(value.grantId) ||
-    typeof value.authorizationGeneration !== 'string' || !AUTH_GENERATION.test(value.authorizationGeneration) ||
+    (v1 && (typeof value.grantId !== 'string' || !GRANT.test(value.grantId) ||
+      typeof value.authorizationGeneration !== 'string' || !AUTH_GENERATION.test(value.authorizationGeneration))) ||
     typeof value.ownerSessionId !== 'string' || !OWNER_SESSION.test(value.ownerSessionId) ||
     value.planGeneration !== `plan-generation_${value.planSha256}` ||
     !positiveInteger(value.issuedAtMs) || !positiveInteger(value.expiresAtMs) ||
@@ -123,7 +140,14 @@ function parsePayload(value: unknown): HostedMemberAdmissionPayload {
     !validName(value.memberName) || typeof value.model !== 'string' || !MODEL.test(value.model) ||
     !['bootId', 'deploymentId', 'laneId', 'memberId', 'operationId',
       'policyId', 'runId', 'teamId', 'workspaceId'].every(key =>
-      typeof value[key] === 'string' && ID.test(value[key]))) invalid()
+      typeof value[key] === 'string' && ID.test(value[key])) ||
+    (v2 && (typeof value.runId !== 'string' || !RUN.test(value.runId) ||
+      typeof value.memberId !== 'string' || !MEMBER.test(value.memberId) ||
+      typeof value.teamId !== 'string' || !TEAM.test(value.teamId) ||
+      typeof value.workspaceId !== 'string' || !WORKSPACE.test(value.workspaceId) ||
+      typeof value.laneId !== 'string' || !LANE.test(value.laneId) ||
+      value.operationId !== startOperationId(value.runId as string, value.memberId as string,
+        value.planSha256 as string)))) invalid()
   return Object.freeze(value) as HostedMemberAdmissionPayload
 }
 
@@ -277,9 +301,10 @@ export class HostedMemberAdmissionVerifier {
   }
 
   private verifySigned(raw: Uint8Array, checkTime: boolean): VerifiedHostedMemberAdmission {
-    if (!this.key || !this.readLiveProductAuthority) unavailable()
+    if (!this.key) unavailable()
     const { payload, signature } = readCanonicalEnvelope(raw)
-    const signed = Buffer.concat([DOMAIN, Buffer.from(canonical(payload as Record<string, unknown>), 'utf8')])
+    const signed = Buffer.concat([Buffer.from(`${payload.format}\0`, 'utf8'),
+      Buffer.from(canonical(payload as Record<string, unknown>), 'utf8')])
     if (!verify(null, signed, this.key, signature)) invalid()
     if (payload.policyId !== HOSTED_MEMBER_ADMISSION_POLICY_ID) invalid()
     if (checkTime) this.assertTime(payload)
@@ -292,11 +317,11 @@ export class HostedMemberAdmissionVerifier {
       payload.expiresAtMs <= now) invalid()
   }
 
-  private async assertLive(payload: HostedMemberAdmissionPayload): Promise<void> {
+  private async assertLive(payload: HostedMemberAdmissionV2Payload): Promise<void> {
     const read = this.readLiveProductAuthority
     if (!read) unavailable()
     const authority = await read()
-    if (!authority || !exact(authority, PAYLOAD_KEYS.filter(key =>
+    if (!authority || !exact(authority, V2_PAYLOAD_KEYS.filter(key =>
       !['format', 'admissionId', 'issuedAtMs', 'expiresAtMs'].includes(key)))) unavailable()
     for (const key of Object.keys(authority) as (keyof LiveProductMemberAuthority)[]) {
       if (authority[key] !== payload[key]) unavailable()
@@ -307,6 +332,7 @@ export class HostedMemberAdmissionVerifier {
   /** Creates durable one-shot markers before any prepare or external effect. No retry after an ambiguous crash. */
   async claim(raw: Uint8Array): Promise<HostedMemberAdmissionClaim> {
     const admission = this.verify(raw)
+    if (admission.payload.format !== HOSTED_MEMBER_ADMISSION_FORMAT) unavailable()
     await this.assertLive(admission.payload)
     const { admissionId, operationId, teamId, runId, laneId, memberId } = admission.payload
     const scope = sha(Buffer.from(JSON.stringify([operationId, teamId, runId, laneId, memberId])))
@@ -326,9 +352,10 @@ export class HostedMemberAdmissionVerifier {
   }
 
   /** Must be called immediately before prepare and again at every external effect boundary. */
-  async assertCurrent(raw: Uint8Array, claim: HostedMemberAdmissionClaim): Promise<HostedMemberAdmissionPayload> {
+  async assertCurrent(raw: Uint8Array, claim: HostedMemberAdmissionClaim): Promise<HostedMemberAdmissionV2Payload> {
     if (!this.liveClaims.has(claim)) unavailable()
     const admission = this.verify(raw)
+    if (admission.payload.format !== HOSTED_MEMBER_ADMISSION_FORMAT) unavailable()
     if (claim.admissionId !== admission.payload.admissionId ||
       claim.envelopeSha256 !== admission.envelopeSha256) unavailable()
     await this.assertLive(admission.payload)
