@@ -1,18 +1,20 @@
 import { createHash } from 'node:crypto'
 import { fstatSync, writeSync } from 'node:fs'
-import { connect, type Socket } from 'node:net'
+import type { Socket } from 'node:net'
 
 import type { RootOpenCodeHttpRequest, RootOpenCodeHttpWire } from './RootOpenCodeHttpProxy.js'
 
-const ENDPOINT = /^http:\/\/127\.0\.0\.1:([1-9][0-9]{3,4})$/
 const PASSWORD = /^[0-9a-f]{64}$/
 const MAX_RESPONSE = 96 * 1024
 const MAX_HEADER = 16 * 1024
 
-/** Root-only source. It must attest this live container generation before revealing its password. */
+/** Root-only authority connects and attests the exact peer while holding the lifecycle/network lease. */
 export interface RootOpenCodeLoopbackEndpointAuthority {
-  resolve(handle: string, generation: string): Promise<{
-    handle: string; generation: string; endpoint: string; password: string
+  acquireConnected(handle: string, generation: string): Promise<{
+    handle: string; generation: string; socket: Socket; password: string
+    /** Synchronous final check inside the Product write transaction. */
+    assertCurrentSync(): void
+    release(): Promise<void>
   }>
 }
 
@@ -57,7 +59,7 @@ function requestBytes(request: RootOpenCodeHttpRequest, password: string): Buffe
   }
   const auth = Buffer.from(`opencode:${password}`).toString('base64')
   return Buffer.concat([Buffer.from(`${request.method} ${request.path} HTTP/1.1\r\n` +
-    'Host: 127.0.0.1\r\nConnection: close\r\nAccept: application/json\r\n' +
+    'Host: opencode\r\nConnection: close\r\nAccept: application/json\r\n' +
     `Authorization: Basic ${auth}\r\nContent-Type: application/json\r\n` +
     `Content-Length: ${body.length}\r\n\r\n`, 'ascii'), body])
 }
@@ -169,38 +171,45 @@ function readResponse(socket: Socket, timeoutMs: number): Promise<{ statusCode: 
 export class RootOpenCodeLoopbackWire implements RootOpenCodeHttpWire {
   constructor(private readonly authority: RootOpenCodeLoopbackEndpointAuthority,
     private readonly timeoutMs = 10_000) {
-    if (!authority || typeof authority.resolve !== 'function' || !Number.isSafeInteger(timeoutMs) ||
+    if (!authority || typeof authority.acquireConnected !== 'function' || !Number.isSafeInteger(timeoutMs) ||
       timeoutMs < 1 || timeoutMs > 30_000) throw new Error('root-opencode-wire-policy-invalid')
   }
 
   async prepare(handle: string, generation: string) {
-    const proof = await this.authority.resolve(handle, generation)
-    const match = ENDPOINT.exec(proof.endpoint)
-    if (proof.handle !== handle || proof.generation !== generation || !match ||
-      Number(match[1]) > 65535 || !PASSWORD.test(proof.password)) {
+    const proof = await this.authority.acquireConnected(handle, generation)
+    const socket = proof.socket
+    try {
+    if (proof.handle !== handle || proof.generation !== generation || !PASSWORD.test(proof.password) ||
+      !socket || socket.destroyed || socket.connecting ||
+      typeof proof.assertCurrentSync !== 'function' || typeof proof.release !== 'function') {
       throw new Error('root-opencode-endpoint-proof-invalid')
     }
-    const socket = await new Promise<Socket>((resolve, reject) => {
-      const pending = connect({ host: '127.0.0.1', port: Number(match[1]) })
-      const timer = setTimeout(() => { pending.destroy(); reject(new Error('root-opencode-connect-timeout')) },
-        this.timeoutMs)
-      pending.once('connect', () => { clearTimeout(timer); pending.off('error', onError); resolve(pending) })
-      const onError = () => { clearTimeout(timer); pending.destroy(); reject(new Error('root-opencode-connect-failed')) }
-      pending.once('error', onError)
-    })
-    const fd = pinnedFd(socket)
-    const response = readResponse(socket, this.timeoutMs)
+    const connected = socket
+    const fd = pinnedFd(connected)
+    const response = readResponse(connected, this.timeoutMs)
     let emitted = false
+    let closed = false
     return {
       emitSync(request: RootOpenCodeHttpRequest) {
-        if (emitted || socket.destroyed || pinnedFd(socket) !== fd) {
+        if (emitted || connected.destroyed || pinnedFd(connected) !== fd) {
           throw new Error('root-opencode-wire-unavailable')
         }
+        proof.assertCurrentSync()
         emitted = true
         writeComplete(fd, requestBytes(request, proof.password))
       },
       response,
-      close() { socket.destroy() },
+      async close() {
+        if (closed) return
+        closed = true
+        connected.destroy()
+        await proof.release()
+      },
+    }
+    } catch (error) {
+      socket?.destroy()
+      if (typeof proof.release === 'function') await proof.release().catch(() => undefined)
+      throw error
     }
   }
 }

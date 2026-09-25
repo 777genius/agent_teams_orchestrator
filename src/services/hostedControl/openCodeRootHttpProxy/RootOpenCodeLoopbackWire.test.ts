@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { createServer } from 'node:net'
+import { connect, createServer, type Socket } from 'node:net'
 
 import { RootOpenCodeLoopbackWire } from './RootOpenCodeLoopbackWire.js'
 
@@ -10,6 +10,14 @@ const password = 'c'.repeat(64)
 const body = JSON.stringify({ title: `hosted-member-attempt:member_attempt_${'d'.repeat(64)}` })
 const request = { method: 'POST' as const, path: '/session', body,
   contentSha256: createHash('sha256').update(body).digest('hex') }
+
+function connected(port: number): Promise<Socket> {
+  return new Promise((resolve, reject) => {
+    const socket = connect({ host: '127.0.0.1', port })
+    socket.once('connect', () => resolve(socket))
+    socket.once('error', reject)
+  })
+}
 
 test('root loopback wire emits one exact HTTP request and never returns Basic credential', async () => {
   let captured = ''
@@ -26,8 +34,10 @@ test('root loopback wire emits one exact HTTP request and never returns Basic cr
   try {
     const address = server.address()
     if (!address || typeof address === 'string') throw new Error('test-port-missing')
-    const wire = new RootOpenCodeLoopbackWire({ async resolve() {
-      return { handle, generation, endpoint: `http://127.0.0.1:${address.port}`, password }
+    const wire = new RootOpenCodeLoopbackWire({ async acquireConnected() {
+      const socket = await connected(address.port)
+      return { handle, generation, socket, password,
+        assertCurrentSync() {}, async release() {} }
     } })
     const connection = await wire.prepare(handle, generation)
     connection.emitSync(request)
@@ -35,15 +45,14 @@ test('root loopback wire emits one exact HTTP request and never returns Basic cr
     expect(captured).toContain(`Authorization: Basic ${Buffer.from(`opencode:${password}`).toString('base64')}`)
     expect(captured).toContain(`POST /session HTTP/1.1`)
     expect(() => connection.emitSync(request)).toThrow('wire-unavailable')
-    connection.close()
+    await connection.close()
   } finally { server.close() }
 })
 
-test('root loopback wire rejects an arbitrary route and unverified endpoint', async () => {
-  const wire = new RootOpenCodeLoopbackWire({ async resolve() {
-    return { handle, generation, endpoint: 'http://evil.invalid:8080', password }
-  } })
-  await expect(wire.prepare(handle, generation)).rejects.toThrow('proof-invalid')
+test('root wire cannot be constructed with a port resolver instead of a held connected lease', () => {
+  expect(() => new RootOpenCodeLoopbackWire({ resolve: async () => ({
+    handle, generation, endpoint: 'http://127.0.0.1:8080', password,
+  }) } as never)).toThrow('policy-invalid')
 })
 
 test('root loopback wire rejects a forged POST body before sending bytes', async () => {
@@ -53,14 +62,16 @@ test('root loopback wire rejects a forged POST body before sending bytes', async
   try {
     const address = server.address()
     if (!address || typeof address === 'string') throw new Error('test-port-missing')
-    const wire = new RootOpenCodeLoopbackWire({ async resolve() {
-      return { handle, generation, endpoint: `http://127.0.0.1:${address.port}`, password }
+    const wire = new RootOpenCodeLoopbackWire({ async acquireConnected() {
+      const socket = await connected(address.port)
+      return { handle, generation, socket, password,
+        assertCurrentSync() {}, async release() {} }
     } })
     const connection = await wire.prepare(handle, generation)
     const forged = JSON.stringify({ title: 'arbitrary' })
     expect(() => connection.emitSync({ ...request, body: forged,
       contentSha256: createHash('sha256').update(forged).digest('hex') })).toThrow('request-invalid')
-    connection.close()
+    await connection.close()
     await connection.response.catch(() => undefined)
     expect(received).toBe(0)
   } finally { server.close() }

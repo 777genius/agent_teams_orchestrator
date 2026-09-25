@@ -31,8 +31,15 @@ export type RootOpenCodeAction = Readonly<{
 }>
 
 export type RootOpenCodeActionResult = Readonly<
-  | { outcome: 'responded'; statusCode: number; body: unknown }
-  | { outcome: 'already_claimed' | 'claim_conflict' | 'uncertain'; reason?: string }
+  | { outcome: 'responded'; kind: 'session_create'; sessionId: string }
+  | { outcome: 'responded'; kind: 'initial_prompt' | 'task_delivery' | 'peer_delivery'; accepted: true }
+  | { outcome: 'responded'; kind: 'session_observe'; sessionId: string | null;
+    observedInitialMessageId: string | null }
+  | { outcome: 'responded'; kind: 'delivery_observe'; observedUserMessageId: string | null }
+  | { outcome: 'responded'; kind: 'reply_observe'; reply: Readonly<{
+    assistantMessageId: string; parentUserMessageId: string; text: string
+  }> | null }
+  | { outcome: 'already_claimed' | 'claim_conflict' | 'uncertain' | 'unavailable'; reason?: string }
 >
 
 /** All fields come from root-verifiable Product/launcher state, never the Owner request. */
@@ -74,7 +81,7 @@ export interface RootOpenCodeHttpWire {
   prepare(handle: string, generation: string): Promise<{
     emitSync(request: RootOpenCodeHttpRequest): void
     response: Promise<{ statusCode: number; body: unknown }>
-    close(): void
+    close(): void | Promise<void>
   }>
 }
 
@@ -132,12 +139,16 @@ function route(action: RootOpenCodeAction, canonical: RootOpenCodeCanonicalActio
         ? `/session/${session}/message/${message}`
         : (() => { throw new Error('root-opencode-canonical-action-invalid') })()
   } else if (action.kind === 'reply_observe') {
-    if (!SESSION.test(String(session)) || !MESSAGE.test(String(message)) || canonical.text !== null) {
+    if (!SESSION.test(String(session)) || !MESSAGE.test(String(message)) ||
+      typeof canonical.text !== 'string' || !canonical.text.trim() ||
+      Buffer.byteLength(canonical.text) > MAX_TEXT) {
       throw new Error('root-opencode-canonical-action-invalid')
     }
     path = `/session/${session}/message?limit=100`
   } else if (action.kind === 'delivery_observe') {
-    if (!SESSION.test(String(session)) || !MESSAGE.test(String(message)) || canonical.text !== null) {
+    if (!SESSION.test(String(session)) || !MESSAGE.test(String(message)) ||
+      typeof canonical.text !== 'string' || !canonical.text.trim() ||
+      Buffer.byteLength(canonical.text) > MAX_TEXT) {
       throw new Error('root-opencode-canonical-action-invalid')
     }
     path = `/session/${session}/message/${message}`
@@ -155,6 +166,100 @@ function route(action: RootOpenCodeAction, canonical: RootOpenCodeCanonicalActio
     }, parts: [{ type: 'text', text: canonical.text }] })
   }
   return Object.freeze({ method, path, body, contentSha256: sha(body ?? '') })
+}
+
+function message(value: unknown): { info: Record<string, unknown>; parts: Record<string, unknown>[] } | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const candidate = value as Record<string, unknown>
+  if (!candidate.info || typeof candidate.info !== 'object' || Array.isArray(candidate.info) ||
+    !Array.isArray(candidate.parts) || !candidate.parts.every(part =>
+      !!part && typeof part === 'object' && !Array.isArray(part))) return null
+  return candidate as { info: Record<string, unknown>; parts: Record<string, unknown>[] }
+}
+
+function observedUser(value: unknown, sessionId: string, messageId: string, textHash: string): boolean {
+  const found = message(value)
+  return !!found && found.info.role === 'user' && found.info.sessionID === sessionId &&
+    found.info.id === messageId && found.parts.length === 1 && found.parts[0]?.type === 'text' &&
+    typeof found.parts[0]?.text === 'string' && sha(found.parts[0].text) === textHash
+}
+
+/** Reduces an OpenCode response to an exact, small receipt before it reaches the 4096-byte RPC frame. */
+function typedResult(action: RootOpenCodeAction, canonical: RootOpenCodeCanonicalAction,
+  statusCode: number, body: unknown): RootOpenCodeActionResult {
+  if (!Number.isSafeInteger(statusCode) || statusCode < 100 || statusCode > 599) {
+    return { outcome: 'uncertain', reason: 'invalid-status' }
+  }
+  if (statusCode < 200 || statusCode >= 300) {
+    if (statusCode !== 404 || action.kind === 'session_create' || action.kind === 'initial_prompt' ||
+      action.kind === 'task_delivery' || action.kind === 'peer_delivery') {
+      return { outcome: 'uncertain', reason: 'http-status' }
+    }
+  }
+  if (action.kind === 'session_create') {
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      return { outcome: 'uncertain', reason: 'session-create-invalid' }
+    }
+    const created = body as Record<string, unknown>
+    return SESSION.test(String(created.id)) && created.title === `hosted-member-attempt:${action.attemptId}`
+      ? { outcome: 'responded', kind: action.kind, sessionId: created.id as string }
+      : { outcome: 'uncertain', reason: 'session-create-invalid' }
+  }
+  if (action.kind === 'initial_prompt' || action.kind === 'task_delivery' || action.kind === 'peer_delivery') {
+    return { outcome: 'responded', kind: action.kind, accepted: true }
+  }
+  const sessionId = canonical.sessionId
+  const messageId = canonical.messageId
+  if (action.kind === 'session_observe') {
+    if (sessionId === null && messageId === null) {
+      if (!Array.isArray(body) || body.length > 100) return { outcome: 'uncertain', reason: 'session-list-invalid' }
+      const matches = body.filter(item => !!item && typeof item === 'object' && !Array.isArray(item) &&
+        (item as Record<string, unknown>).title === `hosted-member-attempt:${action.attemptId}` &&
+        SESSION.test(String((item as Record<string, unknown>).id)))
+      if (matches.length > 1) return { outcome: 'unavailable', reason: 'session-ambiguous' }
+      return { outcome: 'responded', kind: action.kind,
+        sessionId: matches.length ? (matches[0] as { id: string }).id : null,
+        observedInitialMessageId: null }
+    }
+    if (!sessionId || !messageId) return { outcome: 'uncertain', reason: 'session-binding-invalid' }
+    return { outcome: 'responded', kind: action.kind, sessionId,
+      observedInitialMessageId: statusCode === 404 ||
+        !observedUser(body, sessionId, messageId, canonical.promptSha256) ? null : messageId }
+  }
+  if (!sessionId || !messageId || typeof canonical.text !== 'string') {
+    return { outcome: 'uncertain', reason: 'delivery-binding-invalid' }
+  }
+  const deliveryText = canonical.text
+  if (action.kind === 'delivery_observe') {
+    return { outcome: 'responded', kind: action.kind,
+      observedUserMessageId: statusCode === 404 ||
+        !observedUser(body, sessionId, messageId, sha(deliveryText)) ? null : messageId }
+  }
+  if (!Array.isArray(body) || body.length > 100) return { outcome: 'uncertain', reason: 'reply-list-invalid' }
+  if (!body.some(item => observedUser(item, sessionId, messageId, sha(deliveryText)))) {
+    return { outcome: 'responded', kind: 'reply_observe', reply: null }
+  }
+  const candidates = body.map(message).filter((item): item is NonNullable<typeof item> => !!item &&
+    item.info.role === 'assistant' && item.info.sessionID === sessionId &&
+    item.info.parentID === messageId && MESSAGE.test(String(item.info.id)) &&
+    typeof item.info.finish === 'string' && !['tool-calls', 'unknown', 'content-filter']
+      .includes(item.info.finish) && !item.info.error &&
+    !!item.info.time && typeof item.info.time === 'object' &&
+    typeof (item.info.time as Record<string, unknown>).completed === 'number' &&
+    (item.info.time as { completed: number }).completed > 0 &&
+    !item.parts.some(part => part.type === 'tool'))
+  if (candidates.length > 1) return { outcome: 'unavailable', reason: 'reply-ambiguous' }
+  if (candidates.length === 0) return { outcome: 'responded', kind: 'reply_observe', reply: null }
+  const candidate = candidates[0]!
+  const text = candidate.parts.filter(part => part.type === 'text' && typeof part.text === 'string')
+    .map(part => part.text as string).join('\n')
+  if (!text.trim()) return { outcome: 'responded', kind: 'reply_observe', reply: null }
+  if (Buffer.byteLength(text, 'utf8') > 2048) {
+    return { outcome: 'unavailable', reason: 'reply-too-large-for-rpc' }
+  }
+  return { outcome: 'responded', kind: 'reply_observe', reply: {
+    assistantMessageId: candidate.info.id as string, parentUserMessageId: messageId, text,
+  } }
 }
 
 /** The default is closed. Composition needs a root-verified source, Product fence, durable claims, and root wire. */
@@ -185,40 +290,36 @@ export class RootOpenCodeHttpProxy {
       if (canonical.model !== current.model || canonical.promptSha256 !== current.promptSha256) {
         throw new Error('root-opencode-product-source-mismatch')
       }
-      return route(action, canonical)
+      return { canonical, request: route(action, canonical) }
     }
     const expected = await decision.withCurrentMemberDecision(binding, 'observe', resolve)
     const connection = await wire.prepare(action.containerHandle, action.containerGeneration)
     void connection.response.catch(() => undefined)
     try {
       const result = await decision.withCurrentMemberDecision(binding,
-        expected.method === 'POST' ? 'start' : 'observe', current => {
+        expected.request.method === 'POST' ? 'start' : 'observe', current => {
           const actual = resolve(current)
           if (JSON.stringify(actual) !== JSON.stringify(expected)) {
             throw new Error('root-opencode-action-changed')
           }
-          if (actual.method === 'POST') {
+          if (actual.request.method === 'POST') {
             const claimId = `opencode_${sha(JSON.stringify([action.kind, action.attemptId,
               action.sourceRef])).slice(0, 64)}`
-            const fingerprint = sha(JSON.stringify([action, actual]))
+            const fingerprint = sha(JSON.stringify([action, actual.request]))
             const claim = claims.claim(claimId, fingerprint)
             if (claim !== 'created') return claim
           }
-          connection.emitSync(actual)
+          connection.emitSync(actual.request)
           return 'issued'
         })
       if (result !== 'issued') return { outcome: result }
       const response = await connection.response
-      if (!Number.isSafeInteger(response.statusCode) || response.statusCode < 100 ||
-        response.statusCode > 599 || Buffer.byteLength(JSON.stringify(response.body ?? null)) > 96 * 1024) {
+      if (Buffer.byteLength(JSON.stringify(response.body ?? null)) > 96 * 1024) {
         return { outcome: 'uncertain', reason: 'invalid-response' }
       }
-      if (expected.method === 'POST' && (response.statusCode < 200 || response.statusCode >= 300)) {
-        return { outcome: 'uncertain', reason: `http-status-${response.statusCode}` }
-      }
-      return { outcome: 'responded', statusCode: response.statusCode, body: response.body }
+      return typedResult(action, expected.canonical, response.statusCode, response.body)
     } catch {
       return { outcome: 'uncertain', reason: 'dispatch-failed' }
-    } finally { connection.close() }
+    } finally { await connection.close() }
   }
 }

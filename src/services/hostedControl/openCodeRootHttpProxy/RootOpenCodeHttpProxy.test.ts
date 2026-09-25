@@ -26,7 +26,8 @@ function fixture(overrides: Partial<ConstructorParameters<typeof RootOpenCodeHtt
   const writes: RootOpenCodeHttpRequest[] = []
   const claims = new Map<string, string>()
   let resolved: RootOpenCodeCanonicalAction = canonical
-  let response = { statusCode: 201, body: { id: `ses${'f'.repeat(12)}` } }
+  let response: { statusCode: number; body: unknown } = { statusCode: 201,
+    body: { id: `ses${'f'.repeat(12)}`, title: `hosted-member-attempt:${action.attemptId}` } }
   const proxy = new RootOpenCodeHttpProxy({ binding,
     decision: { async withCurrentMemberDecision(_binding, _kind, callback) {
       events.push('product'); return callback(current)
@@ -88,8 +89,8 @@ test('Product revocation after socket preparation makes no claim and sends no by
 
 test('session create uses fixed official route and claims durably before one write', async () => {
   const f = fixture()
-  expect(await f.proxy.dispatch(action)).toEqual({ outcome: 'responded', statusCode: 201,
-    body: { id: `ses${'f'.repeat(12)}` } })
+  expect(await f.proxy.dispatch(action)).toEqual({ outcome: 'responded', kind: 'session_create',
+    sessionId: `ses${'f'.repeat(12)}` })
   expect(f.writes).toEqual([{ method: 'POST', path: '/session',
     body: JSON.stringify({ title: `hosted-member-attempt:${action.attemptId}` }),
     contentSha256: hash(JSON.stringify({ title: `hosted-member-attempt:${action.attemptId}` })) }])
@@ -103,9 +104,12 @@ test('session create uses fixed official route and claims durably before one wri
 test('GET observation recovers an uncertain write without another POST', async () => {
   const f = fixture()
   f.setResponse({ statusCode: 503, body: { id: `ses${'f'.repeat(12)}` } })
-  expect(await f.proxy.dispatch(action)).toEqual({ outcome: 'uncertain', reason: 'http-status-503' })
+  expect(await f.proxy.dispatch(action)).toEqual({ outcome: 'uncertain', reason: 'http-status' })
   const observed = { ...action, kind: 'session_observe' as const, operationId: 'observe_12345678' }
-  expect((await f.proxy.dispatch(observed)).outcome).toBe('responded')
+  f.setResponse({ statusCode: 200, body: [{ id: `ses${'f'.repeat(12)}`,
+    title: `hosted-member-attempt:${action.attemptId}` }] })
+  expect(await f.proxy.dispatch(observed)).toEqual({ outcome: 'responded', kind: 'session_observe',
+    sessionId: `ses${'f'.repeat(12)}`, observedInitialMessageId: null })
   expect(f.writes.map(write => [write.method, write.path])).toEqual([
     ['POST', '/session'], ['GET', `/session?search=${encodeURIComponent(`hosted-member-attempt:${action.attemptId}`)}&limit=101`],
   ])
@@ -122,7 +126,49 @@ test('prompt text must match Product hash; delivery requires canonical text and 
   const delivery = { ...action, kind: 'task_delivery' as const, sourceRef: 'task_12345678' }
   f.setCanonical({ ...canonical, sessionId: `ses${'1'.repeat(12)}`, messageId: `msg${'2'.repeat(12)}`,
     sourceRef: delivery.sourceRef, text: 'canonical task text' })
-  expect((await f.proxy.dispatch(delivery)).outcome).toBe('responded')
+  expect(await f.proxy.dispatch(delivery)).toEqual({ outcome: 'responded',
+    kind: 'task_delivery', accepted: true })
   expect(f.writes[0]?.path).toBe(`/session/ses${'1'.repeat(12)}/prompt_async`)
   expect(JSON.parse(f.writes[0]?.body ?? '{}').parts).toEqual([{ type: 'text', text: 'canonical task text' }])
+})
+
+test('large OpenCode list is reduced to a bounded typed session receipt', async () => {
+  const f = fixture()
+  f.setResponse({ statusCode: 200, body: [{ id: `ses${'f'.repeat(12)}`,
+    title: `hosted-member-attempt:${action.attemptId}`, unrelated: 'x'.repeat(12_000) }] })
+  const result = await f.proxy.dispatch({ ...action, kind: 'session_observe' })
+  expect(result).toEqual({ outcome: 'responded', kind: 'session_observe',
+    sessionId: `ses${'f'.repeat(12)}`, observedInitialMessageId: null })
+  expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThan(512)
+})
+
+test('oversized assistant reply returns a bounded unavailable receipt instead of breaking RPC framing', async () => {
+  const f = fixture()
+  const sessionId = `ses${'1'.repeat(12)}`
+  const messageId = `msg${'2'.repeat(12)}`
+  const delivery = { ...action, kind: 'reply_observe' as const, sourceRef: 'message_12345678' }
+  f.setCanonical({ ...canonical, sessionId, messageId, sourceRef: delivery.sourceRef,
+    text: 'canonical delivery' })
+  f.setResponse({ statusCode: 200, body: [
+    { info: { role: 'user', sessionID: sessionId, id: messageId },
+      parts: [{ type: 'text', text: 'canonical delivery' }] },
+    { info: { role: 'assistant', sessionID: sessionId, id: `msg${'3'.repeat(12)}`,
+      parentID: messageId, finish: 'stop', time: { completed: 123 } },
+      parts: [{ type: 'text', text: 'r'.repeat(8_000) }] },
+  ] })
+  const result = await f.proxy.dispatch(delivery)
+  expect(result).toEqual({ outcome: 'unavailable', reason: 'reply-too-large-for-rpc' })
+  expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThan(512)
+  f.setResponse({ statusCode: 200, body: [
+    { info: { role: 'user', sessionID: sessionId, id: messageId },
+      parts: [{ type: 'text', text: 'canonical delivery' }] },
+    { info: { role: 'assistant', sessionID: sessionId, id: `msg${'3'.repeat(12)}`,
+      parentID: messageId, finish: 'stop', time: { completed: 123 } },
+      parts: [{ type: 'text', text: 'r'.repeat(2048) }] },
+  ] })
+  const bounded = await f.proxy.dispatch(delivery)
+  expect(bounded.outcome).toBe('responded')
+  const signedEnvelope = { schemaVersion: 1, challenge: 'a'.repeat(64), nonce: 'b'.repeat(64),
+    operation: 'sessionAction', ok: true, result: bounded, proof: 'c'.repeat(64) }
+  expect(Buffer.byteLength(JSON.stringify(signedEnvelope))).toBeLessThan(4096)
 })
