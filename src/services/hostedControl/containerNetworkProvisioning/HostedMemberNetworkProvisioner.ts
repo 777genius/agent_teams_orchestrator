@@ -1,4 +1,3 @@
-import { execFile } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
 import { constants } from 'node:fs'
 import { link, lstat, open, realpath, unlink } from 'node:fs/promises'
@@ -23,66 +22,19 @@ type Claim = Readonly<{ requestSha256: string; name: string; nonce: string }>
 type Network = Record<string, unknown>
 
 export interface HostedMemberNetworkDockerPort {
-  assertCompatible(): Promise<void>
-  create(name: string, marker: string): Promise<string>
-  inspect(nameOrId: string): Promise<Network | null>
-  remove(id: string): Promise<void>
+  assertCompatible(request: HostedMemberNetworkRequest): Promise<void>
+  create(name: string, marker: string, request: HostedMemberNetworkRequest): Promise<string>
+  inspect(nameOrId: string, request: HostedMemberNetworkRequest): Promise<Network | null>
+  remove(id: string, request: HostedMemberNetworkRequest): Promise<void>
 }
 
-/** Docker 29 reports an absent network differently from earlier Docker CLI versions. */
-export function isExactDockerNetworkNotFound(stderr: string, reference: string): boolean {
-  if (!NETWORK_ID.test(reference) && !/^hat-member-[0-9a-f]{32}$/.test(reference)) return false
-  const message = stderr.trim()
-  return message === `Error: No such network: ${reference}` ||
-    message === `Error response from daemon: network ${reference} not found` ||
-    message === `Error: network ${reference} not found` ||
-    message === `network ${reference} not found`
-}
-
-/** Root-only Docker surface. Owner supplies no Docker arguments, names, or labels. */
-class DockerCliNetworkPort implements HostedMemberNetworkDockerPort {
-  private run(...args: string[]): Promise<string | null> {
-    return new Promise((resolve, reject) => {
-      execFile('/usr/bin/docker', args, {
-        timeout: 30_000, maxBuffer: 1024 * 1024, windowsHide: true,
-        env: { PATH: '/usr/bin:/bin', HOME: '/root', DOCKER_HOST: 'unix:///var/run/docker.sock' },
-      }, (error, stdout, stderr) => {
-        if (!error) return resolve(stdout.trim())
-        if (args[0] === 'network' && args[1] === 'inspect' && error.code === 1 && !error.killed &&
-          isExactDockerNetworkNotFound(String(stderr), args[4] ?? '')) return resolve(null)
-        reject(new Error('hosted-network-docker-command-failed'))
-      })
-    })
-  }
-
-  async assertCompatible(): Promise<void> {
-    const versions = await this.run('version', '--format', '{{.Client.Version}} {{.Server.Version}}')
-    const parts = versions?.split(/\s+/)
-    if (!parts || parts.length !== 2 || parts.some(version => {
-      const major = /^(\d+)\./.exec(version)?.[1]
-      return !major || Number(major) < 28
-    })) throw new Error('hosted-network-docker-v28-required')
-  }
-
-  async create(name: string, marker: string): Promise<string> {
-    const id = await this.run('network', 'create', '--driver', 'bridge', '--internal',
-      '--ipv4=true', '--ipv6=false', '--opt', 'com.docker.network.bridge.enable_ip_masquerade=false',
-      '--label', `${MARKER}=${marker}`, name)
-    if (!id || !NETWORK_ID.test(id)) throw new Error('hosted-network-create-result-invalid')
-    return id
-  }
-
-  async inspect(nameOrId: string): Promise<Network | null> {
-    const result = await this.run('network', 'inspect', '--format', '{{json .}}', nameOrId)
-    if (result === null) return null
-    try { return object(JSON.parse(result)) }
-    catch { throw new Error('hosted-network-inspect-invalid') }
-  }
-
-  async remove(id: string): Promise<void> {
-    await this.run('network', 'rm', id)
-  }
-}
+/** Root daemon uses this until every network route has an exact Product-fenced dispatcher. */
+export const DENIED_HOSTED_MEMBER_NETWORK_DOCKER_PORT: HostedMemberNetworkDockerPort = Object.freeze({
+  async assertCompatible() { throw new Error('hosted-network-root-dispatch-unavailable') },
+  async create() { throw new Error('hosted-network-root-dispatch-unavailable') },
+  async inspect() { throw new Error('hosted-network-root-dispatch-unavailable') },
+  async remove() { throw new Error('hosted-network-root-dispatch-unavailable') },
+})
 
 function object(value: unknown): Network {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -126,7 +78,9 @@ export type HostedMemberNetworkProvisionerOptions = Readonly<{
   stateDirectory: string
   /** Independent trusted plan authority, checked again on provision and reconcile. */
   admitMember(request: HostedMemberNetworkRequest): Promise<boolean>
-  /** Inert fixture only; production always uses root-owned Docker CLI. */
+  /** Root-owned exact-effect port; no production Docker CLI fallback exists. */
+  rootDocker?: HostedMemberNetworkDockerPort
+  /** Inert fixture only. */
   testOnlyDocker?: HostedMemberNetworkDockerPort
   testOnlyAllowNonRoot?: boolean
   /** Simulates a crash between a durable staging write and atomic publication. */
@@ -140,15 +94,20 @@ export class HostedMemberNetworkProvisioner {
 
   private constructor(private readonly options: HostedMemberNetworkProvisionerOptions,
     private readonly stateIdentity: Readonly<{ dev: number; ino: number }>) {
-    this.docker = options.testOnlyDocker ?? new DockerCliNetworkPort()
+    this.docker = options.testOnlyDocker ?? options.rootDocker!
     this.uid = process.getuid!()
   }
 
   static async create(options: HostedMemberNetworkProvisionerOptions): Promise<HostedMemberNetworkProvisioner> {
     if (options.testOnlyAllowNonRoot) {
-      if (process.env.NODE_ENV !== 'test' || !options.testOnlyDocker) {
+      if (process.env.NODE_ENV !== 'test' || !options.testOnlyDocker || options.rootDocker) {
         throw new Error('hosted-network-test-mode-forbidden')
       }
+    } else if (!options.rootDocker || typeof options.rootDocker.create !== 'function' ||
+      typeof options.rootDocker.inspect !== 'function' ||
+      typeof options.rootDocker.remove !== 'function' ||
+      typeof options.rootDocker.assertCompatible !== 'function') {
+      throw new Error('hosted-network-root-dispatch-required')
     } else if (process.platform !== 'linux' || process.getuid?.() !== 0 || options.testOnlyDocker ||
       options.testOnlyBeforePublish) {
       throw new Error('hosted-network-root-required')
@@ -297,7 +256,7 @@ export class HostedMemberNetworkProvisioner {
   /** Creates one fresh, unoccupied internal bridge and returns its exact Docker ID. */
   async provision(request: HostedMemberNetworkRequest): Promise<string> {
     await this.admitted(request)
-    await this.docker.assertCompatible()
+    await this.docker.assertCompatible(request)
     await this.assertStateDirectory()
     const claim: Claim = {
       requestSha256: requestDigest(request),
@@ -326,9 +285,9 @@ export class HostedMemberNetworkProvisioner {
     await this.syncStateDirectory()
     await this.admitted(request)
     await this.assertStateDirectory()
-    const returnedId = await this.docker.create(claim.name, claim.nonce)
+    const returnedId = await this.docker.create(claim.name, claim.nonce, request)
     if (!NETWORK_ID.test(returnedId)) throw new Error('hosted-network-create-result-invalid')
-    const inspected = await this.docker.inspect(returnedId)
+    const inspected = await this.docker.inspect(returnedId, request)
     if (!inspected) throw new Error('hosted-network-create-unresolved')
     const id = this.verified(inspected, claim, returnedId)
     await this.admitted(request)
@@ -342,7 +301,7 @@ export class HostedMemberNetworkProvisioner {
     const claim = await this.readClaim(request)
     const expectedId = await this.readDurableId('result', request.operationId)
     await this.assertStateDirectory()
-    const inspected = await this.docker.inspect(claim.name)
+    const inspected = await this.docker.inspect(claim.name, request)
     if (!inspected) throw new Error('hosted-network-unresolved')
     const id = this.verified(inspected, claim, expectedId ?? undefined)
     await this.admitted(request)
@@ -368,28 +327,30 @@ export class HostedMemberNetworkProvisioner {
     }
     if (intent) await this.writeDurableId('cleanup-intent', request.operationId, id)
     if (terminal) {
-      if (!await this.exactAbsent(claim, id)) throw new Error('hosted-network-cleanup-terminal-conflict')
+      if (!await this.exactAbsent(claim, id, request)) throw new Error('hosted-network-cleanup-terminal-conflict')
       await this.writeDurableId('cleanup-terminal', request.operationId, id)
       return
     }
-    const inspected = await this.docker.inspect(id)
+    const inspected = await this.docker.inspect(id, request)
     if (!inspected) {
-      if (!intent || !await this.exactAbsent(claim, id)) throw new Error('hosted-network-unresolved')
+      if (!intent || !await this.exactAbsent(claim, id, request)) throw new Error('hosted-network-unresolved')
       await this.writeDurableId('cleanup-terminal', request.operationId, id)
       return
     }
     this.verified(inspected, claim, id)
     await this.writeDurableId('cleanup-intent', request.operationId, id)
     await this.assertStateDirectory()
-    try { await this.docker.remove(id) }
-    catch (error) { if (!await this.exactAbsent(claim, id)) throw error }
-    if (!await this.exactAbsent(claim, id)) throw new Error('hosted-network-cleanup-unresolved')
+    try { await this.docker.remove(id, request) }
+    catch (error) { if (!await this.exactAbsent(claim, id, request)) throw error }
+    if (!await this.exactAbsent(claim, id, request)) throw new Error('hosted-network-cleanup-unresolved')
     await this.writeDurableId('cleanup-terminal', request.operationId, id)
   }
 
-  private async exactAbsent(claim: Claim, id: string): Promise<boolean> {
+  private async exactAbsent(claim: Claim, id: string, request: HostedMemberNetworkRequest): Promise<boolean> {
     await this.assertStateDirectory()
-    const [byId, byName] = await Promise.all([this.docker.inspect(id), this.docker.inspect(claim.name)])
+    const [byId, byName] = await Promise.all([
+      this.docker.inspect(id, request), this.docker.inspect(claim.name, request),
+    ])
     return byId === null && byName === null
   }
 }

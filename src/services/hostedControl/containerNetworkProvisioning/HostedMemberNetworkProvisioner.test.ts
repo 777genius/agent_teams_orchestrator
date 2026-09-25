@@ -3,7 +3,7 @@ import { mkdtemp, chmod, mkdir, readFile, readdir, realpath, rename, rm, symlink
 import os from 'node:os'
 import path from 'node:path'
 
-import { HostedMemberNetworkProvisioner, isExactDockerNetworkNotFound, type HostedMemberNetworkDockerPort,
+import { HostedMemberNetworkProvisioner, type HostedMemberNetworkDockerPort,
   type HostedMemberNetworkRequest } from './HostedMemberNetworkProvisioner.js'
 
 const ID = 'a'.repeat(64)
@@ -77,19 +77,6 @@ async function fixture(admit = async () => true,
 }
 
 describe('HostedMemberNetworkProvisioner', () => {
-  test('Docker 29 exact missing-network stderr is absence only for the inspected ID or name', () => {
-    const otherId = 'c'.repeat(64)
-    const name = `hat-member-${'d'.repeat(32)}`
-    expect(isExactDockerNetworkNotFound(`Error response from daemon: network ${ID} not found\n`, ID)).toBe(true)
-    expect(isExactDockerNetworkNotFound(`network ${name} not found`, name)).toBe(true)
-    expect(isExactDockerNetworkNotFound(`Error: No such network: ${ID}`, ID)).toBe(true)
-    expect(isExactDockerNetworkNotFound(`Error response from daemon: network ${otherId} not found`, ID)).toBe(false)
-    expect(isExactDockerNetworkNotFound(`Error response from daemon: network ${ID} not found\npermission denied`, ID))
-      .toBe(false)
-    expect(isExactDockerNetworkNotFound(`Error response from daemon: network ${ID} has active endpoints`, ID))
-      .toBe(false)
-  })
-
   test('issues an exact Docker ID for a fresh internal IPv4 network', async () => {
     const f = await fixture()
     expect(await f.provisioner.provision(REQUEST)).toBe(ID)
@@ -267,11 +254,14 @@ describe('HostedMemberNetworkProvisioner', () => {
     expect(f.docker.createCalls).toBe(0)
   })
 
-  test('production cannot inject Docker and admission is mandatory', async () => {
+  test('production has no Docker CLI fallback and admission is mandatory', async () => {
     const f = await fixture()
     await expect(HostedMemberNetworkProvisioner.create({
       stateDirectory: f.stateDirectory, admitMember: async () => true, testOnlyDocker: f.docker,
-    })).rejects.toThrow('hosted-network-root-required')
+    })).rejects.toThrow('hosted-network-root-dispatch-required')
+    await expect(HostedMemberNetworkProvisioner.create({
+      stateDirectory: f.stateDirectory, admitMember: async () => true,
+    })).rejects.toThrow('hosted-network-root-dispatch-required')
     await expect(HostedMemberNetworkProvisioner.create({
       stateDirectory: f.stateDirectory, admitMember: undefined as never,
       testOnlyDocker: f.docker, testOnlyAllowNonRoot: true,

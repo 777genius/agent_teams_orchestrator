@@ -26,7 +26,7 @@ export interface HostedDockerRunner {
   runWithEnvironment?(environment: Readonly<Record<string, string>>, ...args: string[]): Promise<string>
 }
 
-/** This process must be isolated from Owner. It alone may access Docker. */
+/** Legacy diagnostic runner. Production supervisor composition never selects it. */
 export class HostedDockerCliRunner implements HostedDockerRunner {
   constructor(private readonly executable = '/usr/bin/docker') {
     if (!path.isAbsolute(executable)) throw new Error('hosted-container-docker-path-invalid')
@@ -61,6 +61,11 @@ export class HostedDockerCliRunner implements HostedDockerRunner {
     })
   }
 }
+
+const DENIED_DOCKER_RUNNER: HostedDockerRunner = Object.freeze({
+  async run() { throw new Error('hosted-container-root-dispatch-unavailable') },
+  async runWithEnvironment() { throw new Error('hosted-container-root-dispatch-unavailable') },
+})
 
 type FileIdentity = Readonly<{ device: string; inode: string }>
 type ProfileLayout = Readonly<Record<'home' | 'config' | 'opencode' | 'data' | 'cache' | 'state' | 'tmp', FileIdentity>>
@@ -176,7 +181,7 @@ export class HostedOpenCodeContainerSupervisor {
   private imageId!: string
 
   private constructor(private readonly options: HostedOpenCodeContainerSupervisorOptions) {
-    this.docker = options.docker ?? new HostedDockerCliRunner()
+    this.docker = options.docker ?? DENIED_DOCKER_RUNNER
     this.handoff = options.testOnlyHandoff ?? (options.handoffHelperPath && options.handoffHelperSha256 &&
       options.handoffPythonSha256 &&
       options.ownerSocketDirectory && options.ownerUid !== undefined

@@ -94,6 +94,12 @@ export class HostedRootSingleMemberAuthority {
       request.memberId === binding.memberId
   }
 
+  /** Exact selector only; a dispatcher must still call withCurrentMemberDecision at effect time. */
+  bindingForManagedRequest(request: HostedMemberNetworkRequest): HostedProductMemberBinding {
+    if (!this.matchesManagedRequest(request)) throw new Error('hosted-root-member-selector-denied')
+    return this.pins.binding
+  }
+
   /** A synchronous callback may claim and write one exact kernel effect under Product BEGIN IMMEDIATE. */
   async withCurrentMemberDecision<T>(binding: HostedProductMemberBinding, kind: HostedProductDecisionKind,
     callback: (current: HostedProductCurrentMember) => T): Promise<T> {

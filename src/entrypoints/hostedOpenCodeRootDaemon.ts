@@ -4,7 +4,8 @@ import path from 'node:path'
 
 import { HostedOpenCodeMemberSupervisorManager } from '../services/hostedControl/container/HostedOpenCodeMemberSupervisorManager.js'
 import { HostedOpenCodeSupervisorRpcServer } from '../services/hostedControl/container/HostedOpenCodeSupervisorRpc.js'
-import { HostedMemberNetworkProvisioner } from '../services/hostedControl/containerNetworkProvisioning/HostedMemberNetworkProvisioner.js'
+import { DENIED_HOSTED_MEMBER_NETWORK_DOCKER_PORT, HostedMemberNetworkProvisioner } from
+  '../services/hostedControl/containerNetworkProvisioning/HostedMemberNetworkProvisioner.js'
 
 const SHA = /^[0-9a-f]{64}$/
 
@@ -71,6 +72,7 @@ async function main(): Promise<void> {
   const denyProductAuthority = async () => false
   const network = await HostedMemberNetworkProvisioner.create({
     stateDirectory: string(config.memberNetworkStateDirectory), admitMember: denyProductAuthority,
+    rootDocker: DENIED_HOSTED_MEMBER_NETWORK_DOCKER_PORT,
   })
   const manager = await HostedOpenCodeMemberSupervisorManager.create({
     stateDirectory: string(config.memberManagerStateDirectory), network,
