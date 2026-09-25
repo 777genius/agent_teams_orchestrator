@@ -7,7 +7,10 @@ import {
 } from '../../utils/model/gemini.js'
 import { getAPIProvider } from '../../utils/model/providers.js'
 import { openCodeInventoryService } from '../../services/opencode/OpenCodeInventoryService.js'
-import { filterOpenCodeAgentModels } from '../../services/opencode/OpenCodeAgentModelCompatibility.js'
+import {
+  filterOpenCodeAgentModels,
+  selectOpenCodeDefaultAgentModel,
+} from '../../services/opencode/OpenCodeAgentModelCompatibility.js'
 import { getAnthropicRuntimeModelCatalog } from '../../services/runtimeBackends/anthropicCatalog.js'
 import { getCodexRuntimeModelCatalog } from '../../services/runtimeBackends/codexModelCatalog.js'
 import { jsonStringify } from '../../utils/slowOperations.js'
@@ -85,7 +88,7 @@ export async function getProviderModels(
       )()
       const models = filterOpenCodeAgentModels(snapshot.models, snapshot.modelMetadata)
       return {
-        defaultModel: models[0] ?? '',
+        defaultModel: selectOpenCodeDefaultAgentModel(models) ?? '',
         displayName: 'OpenCode',
         models: models.map(model => ({
           id: model,
