@@ -10,8 +10,10 @@ import {
   __getAppMcpPreflightTimeoutMsForTests,
   __resetAppMcpToolProofCacheForTests,
   createOwnedOpenCodeHostedInboxExecutor,
+  createOwnedOpenCodeLifecycleCommandExecutor,
   executeOpenCodeBridgeCommandEnvelope,
 } from './OpenCodeBridgeCommandHandler.js'
+import { OpenCodeTeamLifecycleLane } from '../teamLifecycleOwner/OpenCodeTeamLifecycleLane.js'
 import { openCodeCommandOutcomeStore } from './OpenCodeCommandOutcomeStore.js'
 import { openCodeExecutionProbe } from './OpenCodeExecutionProbe.js'
 import { openCodeHostManager } from './OpenCodeHostManager.js'
@@ -4061,6 +4063,59 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(secondResult.ok).toBe(true)
     expect(connectCalls).toBe(1)
     expect(listToolsCalls).toBe(1)
+  })
+
+  test('hosted lifecycle lane passes readiness and strict launch through the real bridge', async () => {
+    openCodeProvisioningProbe.probe = async () => snapshot
+    // Only the sessions this launch commits; never the developer's real store.
+    const stored = new Map<string, OpenCodeSessionRecord>()
+    openCodeSessionStore.upsert = (async (record: OpenCodeSessionRecord) => {
+      stored.set(`${record.teamId}\0${record.laneId}\0${record.memberName}`, structuredClone(record))
+      return 'updated'
+    }) as typeof openCodeSessionStore.upsert
+    openCodeSessionStore.list = async () => [...stored.values()].map(record => structuredClone(record))
+    const ensured: string[] = []
+    openCodeSessionBridge.ensureSession = (async input => {
+      ensured.push(input.memberName)
+      return {
+        ...buildRecord({
+          laneId: input.laneId, memberName: input.memberName,
+          selectedModel: input.selectedModel, opencodeSessionId: `session-${input.memberName}`,
+        }),
+        // Like the real bridge, a launched session keeps its launch-runtime scope.
+        profileScope: input.preparedProfile?.profileScope,
+        toolApprovalMode: input.toolApprovalMode,
+      }
+    }) as typeof openCodeSessionBridge.ensureSession
+    openCodeSessionBridge.promptAsync = (async () => {}) as typeof openCodeSessionBridge.promptAsync
+    openCodeSessionBridge.reconcileSession = (async record => ({
+      summary: buildReconcileSummary({ sessionId: record.opencodeSessionId }),
+    })) as typeof openCodeSessionBridge.reconcileSession
+    // The production owner executor, not a fake: the bridge enforces every
+    // strict launch precondition the lane must provide.
+    const lane = new OpenCodeTeamLifecycleLane(
+      createOwnedOpenCodeLifecycleCommandExecutor(), 30_000, () => true, async () => null)
+    const input = {
+      planTeamId: 'team-a', workspaceRoot: '/tmp/project', toolApprovalMode: 'auto' as const, runId: 'run-1',
+      lane: {
+        laneId: 'secondary:opencode:alice', kind: 'opencode' as const, provider: 'opencode' as const,
+        selectedModel: 'openrouter/minimax-m2.5-free',
+        members: [{ name: 'alice', prompt: 'Join the team' }],
+      },
+    }
+    const observation = await lane.launch(input)
+    expect(['launching', 'running']).toContain(observation.phase)
+    expect(ensured).toEqual(['alice'])
+    // Reconcile must reuse the run's own host by its committed capability; a
+    // broad probe would start another host and try to evict it on every inspect.
+    const retainedHosts: Array<string | undefined> = []
+    const retaining = openCodeProvisioningProbe.probeRetainingHost
+    openCodeProvisioningProbe.probeRetainingHost = (async (projectPath, options) => {
+      retainedHosts.push(options.existingHostKey)
+      return retaining(projectPath, options)
+    }) as typeof openCodeProvisioningProbe.probeRetainingHost
+    await expect(lane.inspect(input)).resolves.toMatchObject({ recoverable: false })
+    expect(retainedHosts).toEqual(['host-key'])
   })
 
   test('launches only the addressed lane and forwards laneId into ensureSession', async () => {
