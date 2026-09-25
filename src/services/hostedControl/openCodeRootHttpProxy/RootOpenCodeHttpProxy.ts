@@ -213,6 +213,9 @@ export class RootOpenCodeHttpProxy {
         response.statusCode > 599 || Buffer.byteLength(JSON.stringify(response.body ?? null)) > 96 * 1024) {
         return { outcome: 'uncertain', reason: 'invalid-response' }
       }
+      if (expected.method === 'POST' && (response.statusCode < 200 || response.statusCode >= 300)) {
+        return { outcome: 'uncertain', reason: `http-status-${response.statusCode}` }
+      }
       return { outcome: 'responded', statusCode: response.statusCode, body: response.body }
     } catch {
       return { outcome: 'uncertain', reason: 'dispatch-failed' }

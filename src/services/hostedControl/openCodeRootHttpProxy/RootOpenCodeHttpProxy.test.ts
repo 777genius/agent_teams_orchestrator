@@ -103,7 +103,7 @@ test('session create uses fixed official route and claims durably before one wri
 test('GET observation recovers an uncertain write without another POST', async () => {
   const f = fixture()
   f.setResponse({ statusCode: 503, body: { id: `ses${'f'.repeat(12)}` } })
-  expect((await f.proxy.dispatch(action)).outcome).toBe('responded')
+  expect(await f.proxy.dispatch(action)).toEqual({ outcome: 'uncertain', reason: 'http-status-503' })
   const observed = { ...action, kind: 'session_observe' as const, operationId: 'observe_12345678' }
   expect((await f.proxy.dispatch(observed)).outcome).toBe('responded')
   expect(f.writes.map(write => [write.method, write.path])).toEqual([
