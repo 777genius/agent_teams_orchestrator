@@ -98,6 +98,8 @@ async function fixture(index: number, failListener = false) {
   const events: string[] = []
   let admission: unknown = null
   let current: HostedQwenContainerBinding | null = null
+  let failContainerStopOnce = false
+  let failListenerStopOnce = false
   const container: HostedQwenContainerBinding = Object.freeze({ containerId: firewall.containerId,
     networkId: firewall.networkId, containerGeneration: index, containerIp: firewall.ip })
   const authority: HostedRootQwenMemberAuthority = {
@@ -125,6 +127,10 @@ async function fixture(index: number, failListener = false) {
         expect(firewall.grant).toBeNull()
         expect(firewall.ufw).toBe(false)
         events.push('container-stop')
+        if (failContainerStopOnce) {
+          failContainerStopOnce = false
+          throw new Error('synthetic-container-stop-failure')
+        }
         firewall.occupied = false
         current = null
       },
@@ -141,11 +147,19 @@ async function fixture(index: number, failListener = false) {
         admission = value
       },
       revokeClient() { events.push('gateway-revoke'); admission = null },
-      async stop() { events.push('listener-stop') },
+      async stop() {
+        events.push('listener-stop')
+        if (failListenerStopOnce) {
+          failListenerStopOnce = false
+          throw new Error('synthetic-listener-stop-failure')
+        }
+      },
       }
     } },
   })
-  return { composition, firewall, dir, events, admitted: () => admission }
+  return { composition, firewall, dir, events, admitted: () => admission,
+    failNextContainerStop: () => { failContainerStopOnce = true },
+    failNextListenerStop: () => { failListenerStopOnce = true } }
 }
 
 test('deny precedes Docker start, and only exact proof grants one member until revoke', async () => {
@@ -186,5 +200,49 @@ test('partial firewall grant is revoked before container cleanup', async () => {
   expect(h.events).not.toContain('gateway-admit')
   expect(h.firewall.grant).toBeNull()
   expect(h.firewall.nft).toBe('')
+  expect(await readdir(h.dir)).toEqual([])
+})
+
+test('start failure keeps cleanup retryable when Docker removal fails once', async () => {
+  const h = await fixture(5)
+  h.firewall.failUfwInsert = true
+  h.failNextContainerStop()
+  await expect(h.composition.start()).rejects.toThrow('hosted-root-qwen-cleanup-unresolved')
+  expect(h.firewall.occupied).toBe(true)
+  expect(h.firewall.grant).toBeNull()
+  expect(h.firewall.nft).toContain(' drop')
+  expect((await readdir(h.dir)).some(name => name.endsWith('.claim'))).toBe(true)
+  await h.composition.stop()
+  expect(h.firewall.occupied).toBe(false)
+  expect(h.firewall.nft).toBe('')
+  expect(await readdir(h.dir)).toEqual([])
+  expect(h.events.filter(event => event === 'container-stop')).toHaveLength(2)
+})
+
+test('normal stop retries Docker removal without repeating proven firewall revocation', async () => {
+  const h = await fixture(6)
+  await h.composition.start()
+  h.failNextContainerStop()
+  await expect(h.composition.stop()).rejects.toThrow('synthetic-container-stop-failure')
+  expect(h.firewall.occupied).toBe(true)
+  expect(h.firewall.grant).toBeNull()
+  expect(h.firewall.ufw).toBe(false)
+  const revokeCount = h.firewall.calls.filter(call => call.includes('nft delete element')).length
+  await h.composition.stop()
+  expect(h.firewall.calls.filter(call => call.includes('nft delete element'))).toHaveLength(revokeCount)
+  expect(h.firewall.occupied).toBe(false)
+  expect(await readdir(h.dir)).toEqual([])
+})
+
+test('listener stop retry does not remove the container twice', async () => {
+  const h = await fixture(7)
+  await h.composition.start()
+  h.failNextListenerStop()
+  await expect(h.composition.stop()).rejects.toThrow('synthetic-listener-stop-failure')
+  expect(h.firewall.occupied).toBe(false)
+  expect(h.firewall.nft).toContain(' drop')
+  await h.composition.stop()
+  expect(h.events.filter(event => event === 'container-stop')).toHaveLength(1)
+  expect(h.events.filter(event => event === 'listener-stop')).toHaveLength(2)
   expect(await readdir(h.dir)).toEqual([])
 })

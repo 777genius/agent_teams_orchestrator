@@ -12,6 +12,7 @@ const BINDING_KEYS = ['runId', 'memberId', 'teamId', 'laneId', 'deploymentId',
   'mountGeneration'] as const
 
 type Gateway = Pick<HostedQwenGateway, 'start' | 'admitClient' | 'revokeClient' | 'stop'>
+type CleanupPhase = 'client' | 'revoke' | 'container' | 'listener' | 'policy'
 
 export interface HostedRootQwenMemberAuthority extends HostedQwenGatewayDispatchAuthority {
   withCurrentMemberDecision<T>(binding: HostedProductMemberBinding, kind: 'start' | 'observe',
@@ -59,7 +60,8 @@ export class HostedRootQwenMemberComposition {
   private readonly member: HostedProductMemberBinding
   private gateway: Gateway | null = null
   private containerId: string | null = null
-  private state: 'new' | 'starting' | 'active' | 'stopping' | 'closed' = 'new'
+  private cleanup: { id: string | null; grantAttempted: boolean; phase: CleanupPhase } | null = null
+  private state: 'new' | 'starting' | 'active' | 'stopping' | 'cleanup-pending' | 'closed' = 'new'
 
   constructor(private readonly options: HostedRootQwenMemberOptions) {
     if (!options.member || !SHA.test(options.networkId) || !GENERATION.test(options.generation) ||
@@ -84,19 +86,40 @@ export class HostedRootQwenMemberComposition {
     if (!allowed) throw new Error('hosted-root-qwen-member-not-current')
   }
 
-  private async cleanupAfterFailure(id: string | null, grantAttempted: boolean): Promise<void> {
-    this.gateway?.revokeClient()
-    await this.gateway?.stop()
-    // An ambiguous grant may have reached nft or UFW. Keep the container and
-    // claim for reconciliation if exact revocation cannot be proven.
-    if (grantAttempted) {
-      try { await this.policy.revokeContainer() }
-      catch (error) {
-        if (!(error instanceof Error) || error.message !== 'hosted-qwen-admission-invalid') throw error
-      }
+  private beginCleanup(id: string | null, grantAttempted: boolean): void {
+    this.cleanup = { id, grantAttempted, phase: 'client' }
+  }
+
+  private async continueCleanup(): Promise<void> {
+    const cleanup = this.cleanup
+    if (!cleanup) throw new Error('hosted-root-qwen-state-invalid')
+    // Advance only after each effect is proven. A failed Docker removal must
+    // not replay revocation after the container has disappeared on a later try.
+    if (cleanup.phase === 'client') {
+      this.gateway?.revokeClient()
+      cleanup.phase = 'revoke'
     }
-    if (id) await this.options.container.stopAndRemove(id)
-    await this.policy.close()
+    if (cleanup.phase === 'revoke') {
+      if (cleanup.grantAttempted) {
+        try { await this.policy.revokeContainer() }
+        catch (error) {
+          if (!(error instanceof Error) || error.message !== 'hosted-qwen-admission-invalid') throw error
+        }
+      }
+      cleanup.phase = 'container'
+    }
+    if (cleanup.phase === 'container') {
+      if (cleanup.id) await this.options.container.stopAndRemove(cleanup.id)
+      cleanup.phase = 'listener'
+    }
+    if (cleanup.phase === 'listener') {
+      await this.gateway?.stop()
+      cleanup.phase = 'policy'
+    }
+    if (cleanup.phase === 'policy') await this.policy.close()
+    this.cleanup = null
+    this.containerId = null
+    this.state = 'closed'
   }
 
   async start(): Promise<HostedQwenAdmission> {
@@ -138,9 +161,11 @@ export class HostedRootQwenMemberComposition {
       return admission
     } catch (error) {
       if (prepared) {
-        try { await this.cleanupAfterFailure(id, grantAttempted) }
+        this.beginCleanup(id, grantAttempted)
+        this.state = 'stopping'
+        try { await this.continueCleanup() }
         catch (cleanupError) {
-          this.state = 'closed'
+          this.state = 'cleanup-pending'
           throw new AggregateError([error, cleanupError], 'hosted-root-qwen-cleanup-unresolved')
         }
       }
@@ -150,21 +175,19 @@ export class HostedRootQwenMemberComposition {
   }
 
   async stop(): Promise<void> {
-    if (this.state !== 'active' || !this.containerId) throw new Error('hosted-root-qwen-state-invalid')
+    if (this.state === 'active' && this.containerId) {
+      this.beginCleanup(this.containerId, true)
+    } else if (this.state !== 'cleanup-pending') {
+      throw new Error('hosted-root-qwen-state-invalid')
+    }
     this.state = 'stopping'
-    this.gateway?.revokeClient()
     try {
       // Revoke and attest the exact source while it still exists. Never remove
       // the container first or delete the deny rule before the grant is gone.
-      await this.policy.revokeContainer()
-      await this.options.container.stopAndRemove(this.containerId)
-      await this.gateway?.stop()
-      await this.policy.close()
-      this.state = 'closed'
+      await this.continueCleanup()
     } catch (error) {
-      await this.gateway?.stop()
       // Retain the root claim on uncertainty; the caller must reconcile it.
-      this.state = 'closed'
+      this.state = 'cleanup-pending'
       throw error
     }
   }
