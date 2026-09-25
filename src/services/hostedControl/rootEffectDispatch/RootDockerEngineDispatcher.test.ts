@@ -63,7 +63,7 @@ function dispatcher(f: SyntheticFixture, decision: RootCurrentMemberDecision<{ k
     testOnlyAllowNonRoot: true })
 }
 
-test('revoke first leaves a durable claim and sends no Docker bytes', async () => {
+test('Product revocation before the transaction callback makes no claim and sends no Docker bytes', async () => {
   const f = await fixture()
   let called = false
   const dispatch = dispatcher(f, { async withCurrentMemberDecision(_binding, _kind, callback) {
@@ -74,8 +74,8 @@ test('revoke first leaves a durable claim and sends no Docker bytes', async () =
   f.canonical.set(input.operationId, input)
   expect(await dispatch.dispatch(input, { key: 'member' })).toEqual({ outcome: 'uncertain', reason: 'product-revoked' })
   expect(called).toBe(true)
-  expect(readdirSync(path.join(f.directory, 'claims'))).toHaveLength(1)
-  expect(await dispatch.dispatch(input, { key: 'member' })).toEqual({ outcome: 'already_claimed' })
+  expect(readdirSync(path.join(f.directory, 'claims'))).toHaveLength(0)
+  expect(await dispatch.dispatch(input, { key: 'member' })).toEqual({ outcome: 'uncertain', reason: 'product-revoked' })
   await new Promise(resolve => setTimeout(resolve, 10))
   expect(f.receivedBytes()).toBe(0)
   expect(f.requests).toHaveLength(0)
@@ -91,6 +91,7 @@ test('dispatch first writes exact finite request while Product callback is activ
     try { return callback({}) } finally { active = false }
   } }, (_binding, _current, operationId) => {
     expect(active).toBe(true)
+    if (policyCount === 0) expect(readdirSync(path.join(f.directory, 'claims'))).toHaveLength(0)
     policyCount++
     return f.canonical.get(operationId)!
   })
@@ -102,6 +103,31 @@ test('dispatch first writes exact finite request while Product callback is activ
   expect(f.requests).toHaveLength(1)
   expect(f.requests[0].toString()).toStartWith('POST /v1.47/networks/create HTTP/1.1\r\n')
   expect(f.requests[0].toString()).toEndWith(input.body)
+  expect(await dispatch.dispatch(input, { key: 'member' })).toEqual({ outcome: 'already_claimed' })
+  expect(f.requests).toHaveLength(1)
+})
+
+test('one-shot claim is durable inside the Product decision before the kernel socket write', async () => {
+  const f = await fixture()
+  let active = false
+  let decisionCalls = 0
+  const input = operation('operation_claim_under_product')
+  f.canonical.set(input.operationId, input)
+  const dispatch = dispatcher(f, { async withCurrentMemberDecision(_binding, _kind, callback) {
+    decisionCalls++
+    if (decisionCalls === 1) expect(readdirSync(path.join(f.directory, 'claims'))).toHaveLength(0)
+    active = true
+    try {
+      const result = callback({})
+      expect(readdirSync(path.join(f.directory, 'claims'))).toHaveLength(1)
+      return result
+    } finally { active = false }
+  } }, (_binding, _current, operationId) => {
+    expect(active).toBe(true)
+    return f.canonical.get(operationId)!
+  })
+  expect((await dispatch.dispatch(input, { key: 'member' })).outcome).toBe('responded')
+  expect(decisionCalls).toBe(1)
   expect(await dispatch.dispatch(input, { key: 'member' })).toEqual({ outcome: 'already_claimed' })
   expect(f.requests).toHaveLength(1)
 })
@@ -118,7 +144,7 @@ test('ambiguous server drop is never resent and operation binding conflicts fail
   expect(await dispatch.dispatch(input, { key: 'member' })).toEqual({ outcome: 'already_claimed' })
   expect(await dispatch.dispatch(input, { key: 'other-member' })).toEqual({ outcome: 'claim_conflict' })
   expect(await dispatch.dispatch(operation(input.operationId, '{"Name":"other"}'), { key: 'member' }))
-    .toEqual({ outcome: 'claim_conflict' })
+    .toEqual({ outcome: 'uncertain', reason: 'root-docker-operation-not-authorized' })
   expect(f.requests).toHaveLength(1)
   const claim = readFileSync(path.join(f.directory, 'claims', readdirSync(path.join(f.directory, 'claims'))[0]), 'utf8')
   expect(JSON.parse(claim).bodySha256).toBe(input.bodySha256)
@@ -178,11 +204,14 @@ test('root claim and state path reject hardlink or symlink substitution', async 
   const claimsDir = path.join(f.directory, 'claims')
   const claim = path.join(claimsDir, readdirSync(claimsDir)[0])
   linkSync(claim, path.join(claimsDir, 'alias.claim'))
-  expect(dispatch.dispatch(input, { key: 'member' })).rejects.toThrow('root-docker-claim-substituted')
+  expect(await dispatch.dispatch(input, { key: 'member' }))
+    .toEqual({ outcome: 'uncertain', reason: 'root-docker-claim-substituted' })
   renameSync(claimsDir, path.join(f.directory, 'moved-claims'))
   symlinkSync(path.join(f.directory, 'moved-claims'), claimsDir)
-  expect(dispatch.dispatch(operation('operation_path_attack'), { key: 'member' }))
-    .rejects.toThrow('root-docker-state-dir-substituted')
+  const pathAttack = operation('operation_path_attack')
+  f.canonical.set(pathAttack.operationId, pathAttack)
+  expect(await dispatch.dispatch(pathAttack, { key: 'member' }))
+    .toEqual({ outcome: 'uncertain', reason: 'root-docker-state-dir-substituted' })
 })
 
 test('synchronous partial write completes now; no drain or delayed write is accepted', () => {

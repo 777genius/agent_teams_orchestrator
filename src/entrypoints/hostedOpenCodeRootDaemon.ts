@@ -63,8 +63,11 @@ async function main(): Promise<void> {
   if (!SHA.test(secretHex) || !SHA.test(passwordKeyHex) || secretHex === passwordKeyHex) {
     throw new Error('hosted-root-secret-invalid')
   }
-  // The independent Product roster and effect fence have no production adapter yet.
-  // Do not treat a signed Owner RPC or root-owned config as admission evidence.
+  // Product v33 reservations alone do not prove the current boot, Owner generation,
+  // Owner session, or run retirement. The manager and network provisioner still
+  // use Docker CLI after async checks, outside a Product write transaction.
+  // Keep every effect route denied until those independent authorities and the
+  // synchronous exact Docker dispatch are composed together.
   const denyProductAuthority = async () => false
   const network = await HostedMemberNetworkProvisioner.create({
     stateDirectory: string(config.memberNetworkStateDirectory), admitMember: denyProductAuthority,

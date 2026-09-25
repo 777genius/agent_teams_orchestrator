@@ -349,16 +349,15 @@ export class RootDockerEngineDispatcher<Binding extends object> {
     const stableOperation = boundedSnapshot(operation, MAX_BODY + 4096) as RootDockerOperation
     const stableBinding = boundedSnapshot(binding, 16 * 1024) as Binding
     const target = route(stableOperation)
-    const claim = this.claim(stableOperation, stableBinding, target)
-    if (claim) return claim
     let socket: Socket | undefined
     try {
       socket = await connectedSocket(this.socketPath, this.timeoutMs)
       const fd = pinnedFd(socket)
       const response = responseFrom(socket, this.timeoutMs)
       void response.catch(() => {}) // A rejected guard still closes the socket without awaiting its response.
-      // The Product callback is synchronous. No socket write is scheduled after this callback returns.
-      await this.decision.withCurrentMemberDecision(stableBinding, target.decision, current => {
+      // The Product callback is synchronous. Claim publication and the only kernel
+      // socket write both occur while its BEGIN IMMEDIATE still fences revokers.
+      const claim = await this.decision.withCurrentMemberDecision(stableBinding, target.decision, current => {
         const resolved: unknown = this.resolveAuthorizedOperation(stableBinding, current,
           stableOperation.operationId)
         if (resolved && typeof resolved === 'object' && 'then' in resolved) {
@@ -368,8 +367,12 @@ export class RootDockerEngineDispatcher<Binding extends object> {
         route(authorized)
         if (!sameOperation(stableOperation, authorized)) throw new Error('root-docker-operation-not-authorized')
         if (pinnedFd(socket!) !== fd) throw new Error('root-docker-socket-substituted')
+        const prior = this.claim(stableOperation, stableBinding, target)
+        if (prior) return prior
         writeCompleteSync(fd, requestBytes(target))
+        return null
       })
+      if (claim) return claim
       const parsed = parseResponse(await response)
       if (!target.successStatus.includes(parsed.statusCode)) {
         return { outcome: 'uncertain', reason: `docker-status-${parsed.statusCode}` }
