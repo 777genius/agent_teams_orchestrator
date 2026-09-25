@@ -85,6 +85,7 @@ async function fixture() {
   const requests: string[] = []
   let networkMarker = marker
   let masquerade = 'false'
+  let subnet = '10.250.0.0/28'
   const server = createServer(socket => {
     const chunks: Buffer[] = []
     socket.on('data', chunk => {
@@ -101,7 +102,7 @@ async function fixture() {
           Internal: true, EnableIPv4: true, EnableIPv6: false, Ingress: false,
           Attachable: false, Containers: {},
           Options: { 'com.docker.network.bridge.enable_ip_masquerade': masquerade },
-          IPAM: { Config: [{ Subnet: '10.250.0.0/28' }] }, Labels: {
+          IPAM: { Config: [{ Subnet: subnet }] }, Labels: {
             'org.agentteams.hosted-opencode.member-network-claim': networkMarker } })
       socket.end(`HTTP/1.1 200 OK\r\nContent-Length: ${Buffer.byteLength(response)}\r\n` +
         `Connection: close\r\n\r\n${response}`)
@@ -126,7 +127,8 @@ async function fixture() {
   return { db, configPath, config, metadata, operationId, requests, resultPath,
     claimPath, memberClaimPath,
     setNetworkMarker: (value: string) => { networkMarker = value },
-    setMasquerade: (value: string) => { masquerade = value } }
+    setMasquerade: (value: string) => { masquerade = value },
+    setSubnet: (value: string) => { subnet = value } }
 }
 
 test('root config composes only read-only proofs and keeps typed effect ports private', async () => {
@@ -139,7 +141,22 @@ test('root config composes only read-only proofs and keeps typed effect ports pr
       networkId, imageId, effectEnabled: false })
     expect(f.requests).toHaveLength(2)
     expect(f.requests.every(value => value.startsWith('GET '))).toBe(true)
+    expect(Object.getOwnPropertyNames(assembly)).toEqual([])
   } finally { assembly.close(); f.db.close() }
+})
+
+test('invalid or public Docker IPAM subnet denies read-only ownership proof', async () => {
+  for (const subnet of ['999.999.999.999/99', '8.8.8.0/24', '10.250.0.1/28']) {
+    const f = await fixture()
+    const assembly = await HostedRootInactiveDockerAssembly.load(f.configPath,
+      { testOnlyAllowNonRoot: true, now: () => f.metadata.now })
+    try {
+      f.setSubnet(subnet)
+      await expect(assembly.provePreparedMember(f.metadata.memberId))
+        .rejects.toThrow('network-ownership-invalid')
+      expect(f.requests.every(value => value.startsWith('GET '))).toBe(true)
+    } finally { assembly.close(); f.db.close() }
+  }
 })
 
 test('unbound manager result and wrong network marker deny before any destructive route', async () => {

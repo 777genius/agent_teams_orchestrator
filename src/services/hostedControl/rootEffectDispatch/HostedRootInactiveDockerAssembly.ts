@@ -116,13 +116,91 @@ function memberKey(request: HostedMemberNetworkRequest): string {
   return sha(`${request.runId}\0${request.teamId}\0${request.memberId}`)
 }
 
+function privateSubnet(value: unknown): boolean {
+  if (typeof value !== 'string') return false
+  const match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\/(\d{1,2})$/.exec(value)
+  if (!match) return false
+  const octets = match.slice(1, 5).map(Number)
+  const prefix = Number(match[5])
+  if (octets.some(octet => octet > 255) || prefix < 16 || prefix > 30) return false
+  const address = octets.reduce((acc, octet) => (acc << 8) | octet, 0) >>> 0
+  const mask = (0xffffffff << (32 - prefix)) >>> 0
+  if ((address & mask) !== address) return false
+  const private10 = octets[0] === 10
+  const private172 = octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31
+  const private192 = octets[0] === 192 && octets[1] === 168
+  return private10 || private172 || private192
+}
+
+function validIpam(value: unknown): boolean {
+  if (!Array.isArray(value) || value.length !== 1) return false
+  const entry = object(value[0])
+  if (!Object.keys(entry).every(key => key === 'Subnet' || key === 'Gateway') ||
+    !privateSubnet(entry.Subnet)) return false
+  if (entry.Gateway === undefined) return true
+  if (typeof entry.Gateway !== 'string') return false
+  const subnet = (entry.Subnet as string).split('/')
+  const prefix = Number(subnet[1])
+  const subnetAddress = subnet[0].split('.').map(Number)
+    .reduce((acc, octet) => (acc << 8) | octet, 0) >>> 0
+  const parts = entry.Gateway.split('.')
+  if (parts.length !== 4 || parts.some(part => !/^\d{1,3}$/.test(part) || Number(part) > 255)) return false
+  const gateway = parts.map(Number).reduce((acc, octet) => (acc << 8) | octet, 0) >>> 0
+  const mask = (0xffffffff << (32 - prefix)) >>> 0
+  return (gateway & mask) === subnetAddress && gateway !== subnetAddress &&
+    gateway !== ((subnetAddress | ~mask) >>> 0)
+}
+
 /** Root-owned config and prepared-resource binding. No effect port escapes this inactive adapter. */
 export class HostedRootInactiveDockerAssembly {
-  private readonly bundles = new Map<string, InactiveBundle>()
+  readonly #bundles = new Map<string, InactiveBundle>()
+  readonly #config: Config
+  readonly #product: HostedRootSandboxMemberComposition
+  readonly #uid: number
+  readonly #test: boolean
 
-  private constructor(private readonly config: Config,
-    private readonly product: HostedRootSandboxMemberComposition,
-    private readonly uid: number, private readonly test: boolean) {}
+  private constructor(config: Config, product: HostedRootSandboxMemberComposition,
+    uid: number, test: boolean) {
+    this.#config = config
+    this.#product = product
+    this.#uid = uid
+    this.#test = test
+  }
+
+  assertRuntimePins(expected: Readonly<{ image: string; bootstrapSha256: string;
+    workspaceParent: string; profileParent: string; configParent: string;
+    managerStateDirectory: string; networkStateDirectory: string;
+    serverPasswordKeyPath: string }>): void {
+    const actual = this.#config
+    if (!expected || Object.keys(expected).sort().join(',') !== [
+      'image', 'bootstrapSha256', 'workspaceParent', 'profileParent', 'configParent',
+      'managerStateDirectory', 'networkStateDirectory', 'serverPasswordKeyPath',
+    ].sort().join(',') || Object.keys(expected).some(key =>
+      expected[key as keyof typeof expected] !== actual[key as keyof Config])) {
+      throw new Error('hosted-root-assembly-runtime-pins-conflict')
+    }
+  }
+
+  async prepareMember(memberId: string): Promise<Readonly<{ memberId: string;
+    operationId: string; effectEnabled: false }>> {
+    const member = this.#product.member(memberId)
+    await this.#product.prepareProof(memberId)
+    return Object.freeze({ memberId, operationId: member.request.operationId, effectEnabled: false })
+  }
+
+  async observeMember(memberId: string): Promise<Readonly<{ memberId: string;
+    operationId: string; effectEnabled: false }>> {
+    const member = this.#product.member(memberId)
+    await this.#product.observe(memberId)
+    return Object.freeze({ memberId, operationId: member.request.operationId, effectEnabled: false })
+  }
+
+  async observeConfiguredMembers(): Promise<readonly Readonly<{ memberId: string;
+    operationId: string; effectEnabled: false }>[]> {
+    const results = []
+    for (const memberId of this.#config.memberIds) results.push(await this.observeMember(memberId))
+    return Object.freeze(results)
+  }
 
   static async load(configPath: string, options: { testOnlyAllowNonRoot?: boolean; now?: () => number } = {}):
     Promise<HostedRootInactiveDockerAssembly> {
@@ -178,21 +256,21 @@ export class HostedRootInactiveDockerAssembly {
 
   private preparedNetwork(memberId: string): Readonly<{ networkId: string; marker: string; name: string;
     supervisorDirectory: string }> {
-    const member = this.product.member(memberId)
+    const member = this.#product.member(memberId)
     const request = member.request
-    const operation = rootRecord(this.config.managerStateDirectory,
-      `operation-${request.operationId}.json`, 2048, this.uid, this.test)
+    const operation = rootRecord(this.#config.managerStateDirectory,
+      `operation-${request.operationId}.json`, 2048, this.#uid, this.#test)
     const expectedOperation = { request, directoryName: `supervisor-${request.operationId}` }
     if (JSON.stringify(operation) !== JSON.stringify(expectedOperation)) {
       throw new Error('hosted-root-assembly-manager-operation-unbound')
     }
-    const managerMember = rootRecord(this.config.managerStateDirectory,
-      `member-${memberKey(request)}.json`, 2048, this.uid, this.test)
+    const managerMember = rootRecord(this.#config.managerStateDirectory,
+      `member-${memberKey(request)}.json`, 2048, this.#uid, this.#test)
     if (JSON.stringify(managerMember) !== JSON.stringify(expectedOperation)) {
       throw new Error('hosted-root-assembly-manager-member-unbound')
     }
-    const result = rootRecord(this.config.managerStateDirectory,
-      `network-result-${request.operationId}.json`, 2048, this.uid, this.test)
+    const result = rootRecord(this.#config.managerStateDirectory,
+      `network-result-${request.operationId}.json`, 2048, this.#uid, this.#test)
     if (!exact(result, ['operationId', 'networkId']) ||
       (result as Record<string, unknown>).operationId !== request.operationId ||
       typeof (result as Record<string, unknown>).networkId !== 'string' ||
@@ -200,18 +278,18 @@ export class HostedRootInactiveDockerAssembly {
       throw new Error('hosted-root-assembly-network-result-invalid')
     }
     const networkId = (result as { networkId: string }).networkId
-    const index = rootRecord(this.config.managerStateDirectory,
-      `network-id-${networkId}.json`, 2048, this.uid, this.test)
+    const index = rootRecord(this.#config.managerStateDirectory,
+      `network-id-${networkId}.json`, 2048, this.#uid, this.#test)
     if (JSON.stringify(index) !== JSON.stringify(result)) {
       throw new Error('hosted-root-assembly-network-index-unbound')
     }
-    const networkOperation = rootRecord(this.config.networkStateDirectory,
-      `network-operation-${request.operationId}.json`, 256, this.uid, this.test, 2)
-    const networkMember = rootRecord(this.config.networkStateDirectory,
-      `network-member-${memberKey(request)}.json`, 256, this.uid, this.test, 2)
-    const networkOperationFile = lstatSync(path.join(this.config.networkStateDirectory,
+    const networkOperation = rootRecord(this.#config.networkStateDirectory,
+      `network-operation-${request.operationId}.json`, 256, this.#uid, this.#test, 2)
+    const networkMember = rootRecord(this.#config.networkStateDirectory,
+      `network-member-${memberKey(request)}.json`, 256, this.#uid, this.#test, 2)
+    const networkOperationFile = lstatSync(path.join(this.#config.networkStateDirectory,
       `network-operation-${request.operationId}.json`))
-    const networkMemberFile = lstatSync(path.join(this.config.networkStateDirectory,
+    const networkMemberFile = lstatSync(path.join(this.#config.networkStateDirectory,
       `network-member-${memberKey(request)}.json`))
     if (JSON.stringify(networkMember) !== JSON.stringify(networkOperation) ||
       networkOperationFile.dev !== networkMemberFile.dev ||
@@ -225,9 +303,9 @@ export class HostedRootInactiveDockerAssembly {
       typeof claim.nonce !== 'string' || !SHA.test(claim.nonce)) {
       throw new Error('hosted-root-assembly-network-claim-unbound')
     }
-    const supervisorDirectory = path.join(this.config.managerStateDirectory,
+    const supervisorDirectory = path.join(this.#config.managerStateDirectory,
       `supervisor-${request.operationId}`)
-    trustedDirectory(supervisorDirectory, this.uid, this.test)
+    trustedDirectory(supervisorDirectory, this.#uid, this.#test)
     return { networkId, marker: claim.nonce as string, name: claim.name as string,
       supervisorDirectory }
   }
@@ -235,16 +313,16 @@ export class HostedRootInactiveDockerAssembly {
   /** Read-only proof, then private construction. Returns no effect capability or credential. */
   async provePreparedMember(memberId: string): Promise<Readonly<{ memberId: string;
     operationId: string; networkId: string; imageId: string; effectEnabled: false }>> {
-    const member = this.product.member(memberId)
-    await this.product.prepareProof(memberId)
+    const member = this.#product.member(memberId)
+    await this.#product.prepareProof(memberId)
     const network = this.preparedNetwork(memberId)
     const proof = RootDockerReadOnlyProofPort.create({
-      effectClaimDirectory: this.config.effectClaimDirectory,
-      socketPath: this.config.dockerSocketPath,
+      effectClaimDirectory: this.#config.effectClaimDirectory,
+      socketPath: this.#config.dockerSocketPath,
       authority: member.authority, binding: member.binding,
-      image: this.config.image, imageId: this.config.imageId,
-      bootstrapSha256: this.config.bootstrapSha256, networkId: network.networkId,
-      testOnlyAllowNonRoot: this.test,
+      image: this.#config.image, imageId: this.#config.imageId,
+      bootstrapSha256: this.#config.bootstrapSha256, networkId: network.networkId,
+      testOnlyAllowNonRoot: this.#test,
     })
     await proof.inspectImage()
     const observedNetwork = await proof.inspectNetwork()
@@ -257,50 +335,48 @@ export class HostedRootInactiveDockerAssembly {
       observedNetwork.EnableIPv4 !== true || observedNetwork.Ingress === true ||
       observedNetwork.Attachable === true ||
       options['com.docker.network.bridge.enable_ip_masquerade'] !== 'false' ||
-      !Array.isArray(ipamConfig) || ipamConfig.length !== 1 ||
-      typeof object(ipamConfig[0]).Subnet !== 'string' ||
-      !/^\d{1,3}(?:\.\d{1,3}){3}\/\d{1,2}$/.test(object(ipamConfig[0]).Subnet as string)) {
+      !validIpam(ipamConfig)) {
       throw new Error('hosted-root-assembly-network-ownership-invalid')
     }
-    const keyHex = trustedFile(this.config.serverPasswordKeyPath, this.uid, this.test, 64)
+    const keyHex = trustedFile(this.#config.serverPasswordKeyPath, this.#uid, this.#test, 64)
       .toString('ascii').trim()
     if (!SHA.test(keyHex)) throw new Error('hosted-root-assembly-password-key-invalid')
     const key = Buffer.from(keyHex, 'hex')
     try {
       const claimWriter = RootDockerContainerClaimWriter.create({
         stateDirectory: network.supervisorDirectory, authority: member.authority,
-        binding: member.binding, image: this.config.image, networkId: network.networkId,
-        workspaceParent: this.config.workspaceParent, profileParent: this.config.profileParent,
-        configParent: this.config.configParent, testOnlyAllowNonRoot: this.test,
+        binding: member.binding, image: this.#config.image, networkId: network.networkId,
+        workspaceParent: this.#config.workspaceParent, profileParent: this.#config.profileParent,
+        configParent: this.#config.configParent, testOnlyAllowNonRoot: this.#test,
       })
       const containerPort = RootDockerContainerPort.create({
         stateDirectory: network.supervisorDirectory,
-        effectClaimDirectory: this.config.effectClaimDirectory,
-        socketPath: this.config.dockerSocketPath, authority: member.authority,
-        binding: member.binding, image: this.config.image, networkId: network.networkId,
-        serverPasswordKey: key, readOnlyProof: proof, testOnlyAllowNonRoot: this.test,
+        effectClaimDirectory: this.#config.effectClaimDirectory,
+        socketPath: this.#config.dockerSocketPath, authority: member.authority,
+        binding: member.binding, image: this.#config.image, networkId: network.networkId,
+        serverPasswordKey: key, readOnlyProof: proof, testOnlyAllowNonRoot: this.#test,
       })
       const cleanupPort = RootDockerExactCleanupPort.create({
         stateDirectory: network.supervisorDirectory,
-        effectClaimDirectory: this.config.effectClaimDirectory,
-        socketPath: this.config.dockerSocketPath, binding: member.binding,
-        image: this.config.image, imageId: this.config.imageId,
-        networkId: network.networkId, workspaceParent: this.config.workspaceParent,
-        profileParent: this.config.profileParent, configParent: this.config.configParent,
-        testOnlyAllowNonRoot: this.test,
+        effectClaimDirectory: this.#config.effectClaimDirectory,
+        socketPath: this.#config.dockerSocketPath, binding: member.binding,
+        image: this.#config.image, imageId: this.#config.imageId,
+        networkId: network.networkId, workspaceParent: this.#config.workspaceParent,
+        profileParent: this.#config.profileParent, configParent: this.#config.configParent,
+        testOnlyAllowNonRoot: this.#test,
       })
       const networkCreate = RootDockerNetworkCreatePort.create({
-        stateDirectory: this.config.networkStateDirectory,
-        effectClaimDirectory: this.config.effectClaimDirectory,
-        socketPath: this.config.dockerSocketPath, authority: member.authority,
-        assertDockerApiCompatible: async () => false, testOnlyAllowNonRoot: this.test,
+        stateDirectory: this.#config.networkStateDirectory,
+        effectClaimDirectory: this.#config.effectClaimDirectory,
+        socketPath: this.#config.dockerSocketPath, authority: member.authority,
+        assertDockerApiCompatible: async () => false, testOnlyAllowNonRoot: this.#test,
       })
-      this.bundles.set(memberId, Object.freeze({ networkCreate, imageNetworkProof: proof,
+      this.#bundles.set(memberId, Object.freeze({ networkCreate, imageNetworkProof: proof,
         claimWriter, containerPort, cleanupPort }))
       return Object.freeze({ memberId, operationId: member.request.operationId,
-        networkId: network.networkId, imageId: this.config.imageId, effectEnabled: false })
+        networkId: network.networkId, imageId: this.#config.imageId, effectEnabled: false })
     } finally { key.fill(0) }
   }
 
-  close(): void { this.bundles.clear(); this.product.close() }
+  close(): void { this.#bundles.clear(); this.#product.close() }
 }
