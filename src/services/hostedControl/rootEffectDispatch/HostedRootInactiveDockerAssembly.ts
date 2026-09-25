@@ -122,13 +122,13 @@ function privateSubnet(value: unknown): boolean {
   if (!match) return false
   const octets = match.slice(1, 5).map(Number)
   const prefix = Number(match[5])
-  if (octets.some(octet => octet > 255) || prefix < 16 || prefix > 30) return false
+  if (octets.some(octet => octet > 255) || prefix < 8 || prefix > 30) return false
   const address = octets.reduce((acc, octet) => (acc << 8) | octet, 0) >>> 0
   const mask = (0xffffffff << (32 - prefix)) >>> 0
-  if ((address & mask) !== address) return false
-  const private10 = octets[0] === 10
-  const private172 = octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31
-  const private192 = octets[0] === 192 && octets[1] === 168
+  if (((address & mask) >>> 0) !== address) return false
+  const private10 = prefix >= 8 && octets[0] === 10
+  const private172 = prefix >= 12 && octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31
+  const private192 = prefix >= 16 && octets[0] === 192 && octets[1] === 168
   return private10 || private172 || private192
 }
 
@@ -147,7 +147,7 @@ function validIpam(value: unknown): boolean {
   if (parts.length !== 4 || parts.some(part => !/^\d{1,3}$/.test(part) || Number(part) > 255)) return false
   const gateway = parts.map(Number).reduce((acc, octet) => (acc << 8) | octet, 0) >>> 0
   const mask = (0xffffffff << (32 - prefix)) >>> 0
-  return (gateway & mask) === subnetAddress && gateway !== subnetAddress &&
+  return ((gateway & mask) >>> 0) === subnetAddress && gateway !== subnetAddress &&
     gateway !== ((subnetAddress | ~mask) >>> 0)
 }
 

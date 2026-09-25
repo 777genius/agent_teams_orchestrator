@@ -86,6 +86,7 @@ async function fixture() {
   let networkMarker = marker
   let masquerade = 'false'
   let subnet = '10.250.0.0/28'
+  let gateway: string | undefined
   const server = createServer(socket => {
     const chunks: Buffer[] = []
     socket.on('data', chunk => {
@@ -102,7 +103,7 @@ async function fixture() {
           Internal: true, EnableIPv4: true, EnableIPv6: false, Ingress: false,
           Attachable: false, Containers: {},
           Options: { 'com.docker.network.bridge.enable_ip_masquerade': masquerade },
-          IPAM: { Config: [{ Subnet: subnet }] }, Labels: {
+          IPAM: { Config: [{ Subnet: subnet, ...(gateway === undefined ? {} : { Gateway: gateway }) }] }, Labels: {
             'org.agentteams.hosted-opencode.member-network-claim': networkMarker } })
       socket.end(`HTTP/1.1 200 OK\r\nContent-Length: ${Buffer.byteLength(response)}\r\n` +
         `Connection: close\r\n\r\n${response}`)
@@ -128,7 +129,8 @@ async function fixture() {
     claimPath, memberClaimPath,
     setNetworkMarker: (value: string) => { networkMarker = value },
     setMasquerade: (value: string) => { masquerade = value },
-    setSubnet: (value: string) => { subnet = value } }
+    setSubnet: (value: string) => { subnet = value },
+    setGateway: (value: string) => { gateway = value } }
 }
 
 test('root config composes only read-only proofs and keeps typed effect ports private', async () => {
@@ -146,7 +148,8 @@ test('root config composes only read-only proofs and keeps typed effect ports pr
 })
 
 test('invalid or public Docker IPAM subnet denies read-only ownership proof', async () => {
-  for (const subnet of ['999.999.999.999/99', '8.8.8.0/24', '10.250.0.1/28']) {
+  for (const subnet of ['999.999.999.999/99', '8.8.8.0/24', '10.250.0.1/28',
+    '172.15.0.0/12', '172.16.0.0/11', '192.168.0.0/15']) {
     const f = await fixture()
     const assembly = await HostedRootInactiveDockerAssembly.load(f.configPath,
       { testOnlyAllowNonRoot: true, now: () => f.metadata.now })
@@ -154,6 +157,23 @@ test('invalid or public Docker IPAM subnet denies read-only ownership proof', as
       f.setSubnet(subnet)
       await expect(assembly.provePreparedMember(f.metadata.memberId))
         .rejects.toThrow('network-ownership-invalid')
+      expect(f.requests.every(value => value.startsWith('GET '))).toBe(true)
+    } finally { assembly.close(); f.db.close() }
+  }
+})
+
+test('private Docker CIDR and gateway above signed IPv4 boundary pass ownership proof', async () => {
+  for (const [subnet, gateway] of [
+    ['172.16.0.0/12', '172.16.0.1'],
+    ['192.168.0.0/16', '192.168.0.1'],
+  ]) {
+    const f = await fixture()
+    const assembly = await HostedRootInactiveDockerAssembly.load(f.configPath,
+      { testOnlyAllowNonRoot: true, now: () => f.metadata.now })
+    try {
+      f.setSubnet(subnet)
+      f.setGateway(gateway)
+      expect((await assembly.provePreparedMember(f.metadata.memberId)).effectEnabled).toBe(false)
       expect(f.requests.every(value => value.startsWith('GET '))).toBe(true)
     } finally { assembly.close(); f.db.close() }
   }
