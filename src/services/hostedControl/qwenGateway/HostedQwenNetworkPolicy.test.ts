@@ -149,10 +149,15 @@ test('network claim remains while container exists; cleanup removes grant before
   await policy.prepare()
   runner.occupied = true
   await policy.admitContainer(containerId)
-  await expect(policy.close()).rejects.toThrow('hosted-qwen-network-occupancy-invalid')
+  let notices = 0
+  policy.onSourceRevoked(() => { notices++ })
+  const prematureClose = policy.close()
+  expect(notices).toBe(1)
+  await expect(prematureClose).rejects.toThrow('hosted-qwen-network-occupancy-invalid')
   expect((await readdir(dir)).length).toBe(1)
   runner.occupied = false
   await policy.close()
+  expect(notices).toBe(1)
   expect(runner.ufw).toBe(false)
   expect(runner.nft).toBe('')
   expect(await readdir(dir)).toEqual([])
