@@ -275,11 +275,11 @@ function decisionResult(
 ): { payload: Record<string, unknown>; resourceRevision: string | null } {
   const payload = { schemaVersion: 2, ...decision } as Record<string, unknown>
   const authorization = 'authorization' in decision ? decision.authorization : null
+  const currentRevision = 'currentRevision' in decision ? decision.currentRevision : undefined
   const resourceRevision = authorization && typeof authorization === 'object' && 'resourceRevision' in authorization ?
     authorization.resourceRevision as string :
-    ('currentRevision' in decision &&
-      (typeof decision.currentRevision === 'string' || decision.currentRevision === null)
-      ? decision.currentRevision : durableDecisionRevision(decision))
+    (typeof currentRevision === 'string' || currentRevision === null
+      ? currentRevision : durableDecisionRevision(decision))
   return { payload, resourceRevision }
 }
 

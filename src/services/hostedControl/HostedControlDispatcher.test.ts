@@ -225,12 +225,15 @@ describe('HostedControlDispatcher response decoding', () => {
   test('rejects operator_required as a settled execute or replay result', async () => {
     for (const operation of ['execute', 'replay_lookup'] as const) {
       const response = lifecycleExecutionResponse()
-      response.payload.result = {
-        schemaVersion: 1, kind: 'operator_required', action: 'launch',
-        commandId: 'lifecycle-command_command01', workspaceId: lifecycleAuthority.workspaceId,
-        teamId: lifecycleAuthority.teamId,
+      const payload = {
+        ...response.payload,
+        result: {
+          schemaVersion: 1, kind: 'operator_required', action: 'launch',
+          commandId: 'lifecycle-command_command01', workspaceId: lifecycleAuthority.workspaceId,
+          teamId: lifecycleAuthority.teamId,
+        },
       }
-      await expect(lifecycleDispatcher(response)
+      await expect(lifecycleDispatcher({ ...response, payload })
         .dispatch(signedDurableRequest(operation))).rejects.toThrow('result kind')
     }
   })
