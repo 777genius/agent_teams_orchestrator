@@ -158,6 +158,23 @@ async function resetProfile(profile: string): Promise<void> {
 }
 
 describe('disposable hosted OpenCode container supervisor', () => {
+  test('credential handoff is unavailable outside the isolated fake-Docker test mode', async () => {
+    const evidence = { pid: 99999, startTicks: '123', pidNamespace: 'pid:[456]', netns: 'net:[789]' }
+    const f = await fixture({ testOnlyProcessEvidence: async () => evidence,
+      testOnlyHandoff: { run: async () => undefined } })
+    try {
+      const started = await f.supervisor.start({ operationId: 'start_12345678', leaseId: f.leaseId,
+        runId: 'run_12345678', teamId: 'team_12345678', laneId: 'lane_12345678',
+        memberId: 'member_12345678', ownerChannel: {
+          socketPath: '/tmp/pending-owner-test.sock', challenge: 'a'.repeat(64),
+        } })
+      process.env.NODE_ENV = 'production'
+      await expect(f.supervisor.beginEndpointUse({ operationId: 'use_12345678', handle: started.handle,
+        generation: started.generation })).rejects.toThrow('hosted-container-owner-http-credential-disabled')
+      expect(f.docker.calls.filter(call => call[0] === 'stop')).toHaveLength(0)
+    } finally { await f.cleanup() }
+  })
+
   test('one pending Owner generation becomes ready only after FD3 and independent official proof', async () => {
     const phases: string[] = []
     const evidence = { pid: 99999, startTicks: '123', pidNamespace: 'pid:[456]', netns: 'net:[789]' }

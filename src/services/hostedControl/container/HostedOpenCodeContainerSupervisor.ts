@@ -1159,12 +1159,17 @@ export class HostedOpenCodeContainerSupervisor {
       endpoint: this.endpoint(inspected), process, effectEnabled: enabled }
   }
 
-  /** A bounded exclusive use keeps Stop from reassigning the published port during one HTTP operation. */
+  /** Test-only credential handoff. Production needs a root-mediated, exact-action HTTP proxy. */
   async beginEndpointUse(request: { operationId: string; handle: string; generation: string }): Promise<{
     token: string; handle: string; generation: string; endpoint: string;
     username: 'opencode'; password: string; expiresAt: number
   }> {
     boundedId(request.operationId)
+    // A time-bounded lease cannot revoke a copied OpenCode Basic password.
+    // Never disclose the reusable credential to the untrusted Owner process.
+    if (!this.options.testOnlyAllowNonRoot || process.env.NODE_ENV !== 'test') {
+      throw new Error('hosted-container-owner-http-credential-disabled')
+    }
     const record = await this.load(request.handle, request.generation)
     if (this.busy.has(record.handle) || this.endpointUses.has(record.handle) ||
       this.pendingStop.has(record.handle) || !this.active.has(record.handle)) {

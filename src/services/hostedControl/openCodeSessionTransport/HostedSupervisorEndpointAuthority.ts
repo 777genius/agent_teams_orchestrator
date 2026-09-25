@@ -13,16 +13,20 @@ const DEADLINE_MARGIN_MS = 1_000
 
 type EndpointRpc = Pick<HostedOpenCodeSupervisorRpcClient, 'beginEndpointUse' | 'endEndpointUse'>
 
-/** Inactive Owner adapter. The authenticated RPC is the only source of endpoint credentials. */
+/** Test-only Owner adapter. Production HTTP effects require a root-mediated exact-action proxy. */
 export class HostedSupervisorEndpointAuthority implements OpenCodeEndpointAuthority {
   private readonly inUse = new Set<string>()
 
-  constructor(private readonly rpc: EndpointRpc, private readonly shutdownSignal?: AbortSignal) {}
+  constructor(private readonly rpc: EndpointRpc, private readonly shutdownSignal?: AbortSignal,
+    private readonly testOnlyAllowCredentialHandoff = false) {}
 
   async withAttestedEndpoint<T>(handle: string, generation: string,
     operation: (proof: OpenCodeEndpointProof) => Promise<T>): Promise<T> {
     if (!HANDLE.test(handle) || !GENERATION.test(generation) || typeof operation !== 'function') {
       throw new Error('hosted-opencode-endpoint-request-invalid')
+    }
+    if (!this.testOnlyAllowCredentialHandoff || process.env.NODE_ENV !== 'test') {
+      throw new Error('hosted-opencode-owner-http-credential-disabled')
     }
     if (this.shutdownSignal?.aborted) throw new Error('hosted-opencode-endpoint-aborted')
     if (this.inUse.has(handle)) throw new Error('hosted-opencode-endpoint-overlapping')

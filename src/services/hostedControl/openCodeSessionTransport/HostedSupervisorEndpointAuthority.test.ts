@@ -21,9 +21,36 @@ function fakeRpc(overrides: Partial<Rpc> = {}) {
 }
 
 describe('inactive hosted supervisor endpoint authority', () => {
+  test('production adapter never asks root for a reusable HTTP password', async () => {
+    let begins = 0
+    const { rpc } = fakeRpc({ beginEndpointUse: async () => { begins++; return lease() } })
+    const authority = new HostedSupervisorEndpointAuthority(rpc)
+    let called = false
+    await expect(authority.withAttestedEndpoint(handle, generation, async () => { called = true }))
+      .rejects.toThrow('hosted-opencode-owner-http-credential-disabled')
+    expect(begins).toBe(0)
+    expect(called).toBe(false)
+  })
+
+  test('test credential override cannot reach root in a production process', async () => {
+    let begins = 0
+    const { rpc } = fakeRpc({ beginEndpointUse: async () => { begins++; return lease() } })
+    const authority = new HostedSupervisorEndpointAuthority(rpc, undefined, true)
+    const prior = process.env.NODE_ENV
+    try {
+      process.env.NODE_ENV = 'production'
+      await expect(authority.withAttestedEndpoint(handle, generation, async () => 'unexpected'))
+        .rejects.toThrow('hosted-opencode-owner-http-credential-disabled')
+      expect(begins).toBe(0)
+    } finally {
+      if (prior === undefined) delete process.env.NODE_ENV
+      else process.env.NODE_ENV = prior
+    }
+  })
+
   test('binds exact handle and generation, passes one finite proof, and releases after callback', async () => {
     const { rpc, ends } = fakeRpc()
-    const authority = new HostedSupervisorEndpointAuthority(rpc)
+    const authority = new HostedSupervisorEndpointAuthority(rpc, undefined, true)
     const value = await authority.withAttestedEndpoint(handle, generation, async proof => {
       expect(proof.handle).toBe(handle)
       expect(proof.generation).toBe(generation)
@@ -49,7 +76,7 @@ describe('inactive hosted supervisor endpoint authority', () => {
   ])('rejects forged %s and releases any valid token', async (_field, replacement) => {
     const { rpc, ends } = fakeRpc({ beginEndpointUse: async () => ({ ...lease(), ...replacement }) as ReturnType<
       Rpc['beginEndpointUse']> extends Promise<infer T> ? T : never })
-    const authority = new HostedSupervisorEndpointAuthority(rpc)
+    const authority = new HostedSupervisorEndpointAuthority(rpc, undefined, true)
     let called = false
     await expect(authority.withAttestedEndpoint(handle, generation, async () => { called = true }))
       .rejects.toThrow('hosted-opencode-endpoint-use-failed')
@@ -59,7 +86,7 @@ describe('inactive hosted supervisor endpoint authority', () => {
 
   test('redacts callback failure and releases in finally', async () => {
     const { rpc, ends } = fakeRpc()
-    const authority = new HostedSupervisorEndpointAuthority(rpc)
+    const authority = new HostedSupervisorEndpointAuthority(rpc, undefined, true)
     await expect(authority.withAttestedEndpoint(handle, generation, async () => {
       throw new Error(`Authorization: Basic ${password}`)
     })).rejects.toThrow('hosted-opencode-endpoint-use-failed')
@@ -71,7 +98,7 @@ describe('inactive hosted supervisor endpoint authority', () => {
       throw new Error(password)
     }]) {
       const { rpc } = fakeRpc({ endEndpointUse })
-      const authority = new HostedSupervisorEndpointAuthority(rpc)
+      const authority = new HostedSupervisorEndpointAuthority(rpc, undefined, true)
       await expect(authority.withAttestedEndpoint(handle, generation, async () => 'receipt'))
         .rejects.toThrow('hosted-opencode-endpoint-release-unconfirmed')
     }
@@ -80,7 +107,7 @@ describe('inactive hosted supervisor endpoint authority', () => {
   test('shutdown aborts active proof, rejects receipt and releases', async () => {
     const shutdown = new AbortController()
     const { rpc, ends } = fakeRpc()
-    const authority = new HostedSupervisorEndpointAuthority(rpc, shutdown.signal)
+    const authority = new HostedSupervisorEndpointAuthority(rpc, shutdown.signal, true)
     await expect(authority.withAttestedEndpoint(handle, generation, async proof => {
       shutdown.abort()
       expect(proof.signal.aborted).toBe(true)
@@ -95,14 +122,14 @@ describe('inactive hosted supervisor endpoint authority', () => {
       shutdown.abort()
       return { released: true }
     } })
-    const authority = new HostedSupervisorEndpointAuthority(rpc, shutdown.signal)
+    const authority = new HostedSupervisorEndpointAuthority(rpc, shutdown.signal, true)
     await expect(authority.withAttestedEndpoint(handle, generation, async () => 'receipt'))
       .rejects.toThrow('hosted-opencode-endpoint-use-failed')
   })
 
   test('prevents overlapping uses of one handle and releases after the first finishes', async () => {
     const { rpc, ends } = fakeRpc()
-    const authority = new HostedSupervisorEndpointAuthority(rpc)
+    const authority = new HostedSupervisorEndpointAuthority(rpc, undefined, true)
     let finish!: () => void
     const hold = new Promise<void>(resolve => { finish = resolve })
     const first = authority.withAttestedEndpoint(handle, generation, async () => { await hold })
@@ -115,7 +142,7 @@ describe('inactive hosted supervisor endpoint authority', () => {
 
   test('a short forged deadline never invokes callback', async () => {
     const { rpc, ends } = fakeRpc({ beginEndpointUse: async () => ({ ...lease(), expiresAt: Date.now() + 100 }) })
-    const authority = new HostedSupervisorEndpointAuthority(rpc)
+    const authority = new HostedSupervisorEndpointAuthority(rpc, undefined, true)
     let called = false
     await expect(authority.withAttestedEndpoint(handle, generation, async () => { called = true }))
       .rejects.toThrow('hosted-opencode-endpoint-use-failed')
@@ -126,7 +153,7 @@ describe('inactive hosted supervisor endpoint authority', () => {
   test('deadline aborts an unfinished callback before the supervisor lease expires', async () => {
     const { rpc, ends } = fakeRpc({ beginEndpointUse: async () => ({ ...lease(),
       expiresAt: Date.now() + 1_100 }) })
-    const authority = new HostedSupervisorEndpointAuthority(rpc)
+    const authority = new HostedSupervisorEndpointAuthority(rpc, undefined, true)
     let callbackSignal: AbortSignal | undefined
     await expect(authority.withAttestedEndpoint(handle, generation, async proof => {
       callbackSignal = proof.signal
@@ -139,7 +166,7 @@ describe('inactive hosted supervisor endpoint authority', () => {
 
   test('supervisor loss during begin never exposes a proof', async () => {
     const { rpc, ends } = fakeRpc({ beginEndpointUse: async () => { throw new Error(password) } })
-    const authority = new HostedSupervisorEndpointAuthority(rpc)
+    const authority = new HostedSupervisorEndpointAuthority(rpc, undefined, true)
     let called = false
     await expect(authority.withAttestedEndpoint(handle, generation, async () => { called = true }))
       .rejects.toThrow('hosted-opencode-endpoint-use-failed')

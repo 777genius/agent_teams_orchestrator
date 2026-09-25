@@ -27,7 +27,8 @@ export type OpenCodeEndpointProof = Readonly<{
  * Implemented by the supervisor boundary. It must attest the exact running
  * container/generation, hold its endpoint binding for the callback lifetime,
  * and supply the per-container server credential without exposing Docker to Owner.
- * HTTP Basic auth authenticates transport only; it grants no hosted Owner effects.
+ * The Basic credential grants reusable HTTP effect authority, so production
+ * must mediate exact actions in root instead of composing this direct adapter.
  */
 export interface OpenCodeEndpointAuthority {
   withAttestedEndpoint<T>(handle: string, generation: string,
