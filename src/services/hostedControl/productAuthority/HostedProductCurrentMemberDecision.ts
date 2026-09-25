@@ -18,6 +18,10 @@ const IDEMPOTENCY = /^idempotency_[A-Za-z0-9][A-Za-z0-9._-]{7,127}$/
 const PROMOTION = /^promotion_[a-f0-9]{32}$/
 const ADOPTION = /^adoption_[a-f0-9]{32}$/
 const MAX_CALLBACK_MS = 1000
+const BINDING_FIELDS = [
+  'runId', 'memberId', 'teamId', 'laneId', 'deploymentId', 'runtimeWorkspaceId',
+  'planSha256', 'rosterBindingSha256', 'restoreGeneration', 'mountGeneration',
+] as const
 
 export type HostedProductMemberBinding = Readonly<{
   runId: string
@@ -75,10 +79,8 @@ function sha(text: string): string { return createHash('sha256').update(text).di
 function same(left: unknown, right: unknown): boolean { return left === right }
 
 function bindingValid(value: HostedProductMemberBinding): boolean {
-  return !!value && Object.keys(value).sort().join(',') === [
-    'runId', 'memberId', 'teamId', 'laneId', 'deploymentId', 'runtimeWorkspaceId',
-    'planSha256', 'rosterBindingSha256', 'restoreGeneration', 'mountGeneration',
-  ].sort().join(',') && RUN.test(value.runId) && MEMBER.test(value.memberId) &&
+  return !!value && Object.keys(value).sort().join(',') === [...BINDING_FIELDS].sort().join(',') &&
+    RUN.test(value.runId) && MEMBER.test(value.memberId) &&
     [value.teamId, value.laneId, value.runtimeWorkspaceId]
       .every(id => typeof id === 'string' && ID.test(id)) &&
     typeof value.deploymentId === 'string' && value.deploymentId.length <= 128 &&
@@ -86,6 +88,34 @@ function bindingValid(value: HostedProductMemberBinding): boolean {
     SHA.test(value.planSha256) && SHA.test(value.rosterBindingSha256) &&
     Number.isSafeInteger(value.restoreGeneration) && value.restoreGeneration >= 0 &&
     Number.isSafeInteger(value.mountGeneration) && value.mountGeneration >= 1
+}
+
+function stableBinding(value: HostedProductMemberBinding): HostedProductMemberBinding {
+  const keys = value && typeof value === 'object' ? Reflect.ownKeys(value) : []
+  if (!value || typeof value !== 'object' || Array.isArray(value) ||
+    ![Object.prototype, null].includes(Object.getPrototypeOf(value)) ||
+    keys.some(key => typeof key !== 'string') ||
+    (keys as string[]).sort().join(',') !== [...BINDING_FIELDS].sort().join(',')) {
+    throw new Error('hosted-product-decision-input-invalid')
+  }
+  const copy: Record<string, unknown> = Object.create(null) as Record<string, unknown>
+  for (const key of BINDING_FIELDS) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key)
+    if (!descriptor || !descriptor.enumerable || !('value' in descriptor)) {
+      throw new Error('hosted-product-decision-input-invalid')
+    }
+    copy[key] = descriptor.value
+  }
+  const binding = Object.freeze(copy) as HostedProductMemberBinding
+  if (!bindingValid(binding)) throw new Error('hosted-product-decision-input-invalid')
+  return binding
+}
+
+function samePeerEpoch(sender: HostedProductMemberBinding, recipient: HostedProductMemberBinding): boolean {
+  return sender.memberId !== recipient.memberId &&
+    (['runId', 'teamId', 'deploymentId', 'runtimeWorkspaceId', 'planSha256',
+      'rosterBindingSha256', 'restoreGeneration', 'mountGeneration'] as const)
+      .every(key => sender[key] === recipient[key])
 }
 
 function actorId(userId: string): string {
@@ -356,8 +386,49 @@ export class HostedProductCurrentMemberDecision {
    */
   async withCurrentMemberDecision<T>(binding: HostedProductMemberBinding, decisionKind: HostedProductDecisionKind,
     callback: (current: HostedProductCurrentMember) => T): Promise<T> {
-    if (!bindingValid(binding) || !['prepare', 'start', 'observe', 'stop'].includes(decisionKind) ||
-      typeof callback !== 'function') throw new Error('hosted-product-decision-input-invalid')
+    const stable = stableBinding(binding)
+    if (!['prepare', 'start', 'observe', 'stop'].includes(decisionKind) || typeof callback !== 'function') {
+      throw new Error('hosted-product-decision-input-invalid')
+    }
+    return this.withTransaction(() => {
+      const current = this.current(stable)
+      if (!current) throw new Error('hosted-product-member-not-current')
+      return this.synchronousCallback(() => callback(current))
+    })
+  }
+
+  /** Sender and recipient are checked in one Product write transaction. The callback is the final peer append. */
+  async withCurrentPeerAppendDecision<T>(senderBinding: HostedProductMemberBinding,
+    recipientBinding: HostedProductMemberBinding,
+    callback: (sender: HostedProductCurrentMember, recipient: HostedProductCurrentMember) => T): Promise<T> {
+    const sender = stableBinding(senderBinding)
+    const recipient = stableBinding(recipientBinding)
+    if (!samePeerEpoch(sender, recipient) || typeof callback !== 'function') {
+      throw new Error('hosted-product-peer-decision-input-invalid')
+    }
+    return this.withTransaction(() => {
+      const currentSender = this.current(sender)
+      const currentRecipient = this.current(recipient)
+      if (!currentSender || !currentRecipient ||
+        (['workspaceId', 'actorId', 'bootId', 'promotionOperationId', 'admittedWorkspaceRoot',
+          'grantRevision', 'grantGeneration'] as const)
+          .some(key => currentSender[key] !== currentRecipient[key])) {
+        throw new Error('hosted-product-peer-not-current')
+      }
+      return this.synchronousCallback(() => callback(currentSender, currentRecipient))
+    })
+  }
+
+  private synchronousCallback<T>(callback: () => T): T {
+    const started = performance.now()
+    const result = callback()
+    if (result && typeof result === 'object' && 'then' in result &&
+      typeof result.then === 'function') throw new Error('hosted-product-async-effect-forbidden')
+    if (performance.now() - started > MAX_CALLBACK_MS) throw new Error('hosted-product-decision-timeout')
+    return result
+  }
+
+  private async withTransaction<T>(decision: () => T): Promise<T> {
     if (this.busy || this.database.inTransaction) throw new Error('hosted-product-decision-nested')
     this.busy = true
     let transaction = false
@@ -366,13 +437,7 @@ export class HostedProductCurrentMemberDecision {
       this.database.exec('BEGIN IMMEDIATE')
       transaction = true
       this.assertSchema()
-      const current = this.current(binding)
-      if (!current) throw new Error('hosted-product-member-not-current')
-      const started = performance.now()
-      const result = callback(current)
-      if (result && typeof result === 'object' && 'then' in result &&
-        typeof result.then === 'function') throw new Error('hosted-product-async-effect-forbidden')
-      if (performance.now() - started > MAX_CALLBACK_MS) throw new Error('hosted-product-decision-timeout')
+      const result = decision()
       await this.assertFileIdentity()
       this.database.exec('COMMIT')
       transaction = false

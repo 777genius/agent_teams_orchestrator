@@ -1,4 +1,6 @@
 import { spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
+import { appendFileSync, readFileSync as readFileSyncNode } from 'node:fs'
 import { chmod, mkdtemp, readFile, realpath, rename, rm, unlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { gunzipSync } from 'node:zlib'
@@ -10,6 +12,8 @@ import { PRODUCT_V30_V33_SCHEMA } from './ProductV30V33Schema.js'
 
 type Fixture = { directory: string; databasePath: string; db: Database;
   reader: HostedProductCurrentMemberDecision; binding: HostedProductMemberBinding; expectedName: string }
+
+const digest = (value: string) => createHash('sha256').update(value).digest('hex')
 
 async function fixture(): Promise<Fixture> {
   const directory = await realpath(await mkdtemp('/tmp/hosted-product-v35-member-'))
@@ -52,6 +56,134 @@ async function close(f: Fixture): Promise<void> {
   f.db.close()
   await rm(f.directory, { recursive: true, force: true })
 }
+
+async function peerFixture(): Promise<Fixture & { peer: HostedProductMemberBinding }> {
+  const f = await fixture()
+  const peerId = `member_${'f'.repeat(32)}`
+  const promotionRow = f.db.query('SELECT record_json FROM hosted_team_configuration_promotions').get() as {
+    record_json: string }
+  const rosterRow = f.db.query('SELECT binding_json FROM hosted_promotion_roster_bindings').get() as {
+    binding_json: string }
+  const reservationRow = f.db.query('SELECT record_json FROM hosted_lifecycle_run_reservations').get() as {
+    record_json: string }
+  const promotion = JSON.parse(promotionRow.record_json) as Record<string, unknown>
+  const draft = JSON.parse(promotion.frozenDraftJson as string) as {
+    members: Array<{ name: string }>; configuration: { lanes: Array<{ members: Array<{ name: string; prompt: string }> }> } }
+  const frozenRoster = JSON.parse(promotion.frozenRosterJson as string) as typeof draft
+  const plan = JSON.parse(promotion.planJson as string) as {
+    lanes: Array<{ members: Array<{ name: string; prompt: string }> }> }
+  const roster = JSON.parse(rosterRow.binding_json) as {
+    planSha256: string; lanes: Array<{ members: Array<Record<string, unknown>> }> }
+  const reservation = JSON.parse(reservationRow.record_json) as Record<string, unknown>
+  const peer = { name: 'reviewer', prompt: 'Review.' }
+  draft.members.push({ name: peer.name })
+  frozenRoster.members.push({ name: peer.name })
+  draft.configuration.lanes[0].members.push(peer)
+  frozenRoster.configuration.lanes[0].members.push(peer)
+  plan.lanes[0].members.push(peer)
+  const planJson = JSON.stringify(plan)
+  const planSha256 = digest(planJson)
+  roster.planSha256 = planSha256
+  roster.lanes[0].members.push({ memberOrdinal: 1, memberId: peerId,
+    name: peer.name, model: 'openai/gpt-6', promptSha256: digest(peer.prompt) })
+  const rosterBindingSha256 = digest(JSON.stringify(roster))
+  Object.assign(promotion, { frozenDraftJson: JSON.stringify(draft),
+    frozenRosterJson: JSON.stringify(frozenRoster), planJson, planSha256,
+    planGeneration: `plan-generation_${planSha256}` })
+  Object.assign(reservation, { expectedPlanGeneration: `plan-generation_${planSha256}`,
+    planSha256, rosterBindingSha256 })
+  const triggers = f.db.query(`SELECT name, sql FROM sqlite_schema WHERE type = 'trigger'
+    AND tbl_name IN ('hosted_team_configuration_promotions',
+      'hosted_promotion_roster_bindings', 'hosted_lifecycle_run_reservations')`).all() as
+    Array<{ name: string; sql: string }>
+  for (const trigger of triggers) f.db.exec(`DROP TRIGGER ${trigger.name}`)
+  try {
+    f.db.query('UPDATE hosted_team_configuration_promotions SET record_json = ?')
+      .run(JSON.stringify(promotion))
+    f.db.query('UPDATE hosted_promotion_roster_bindings SET plan_sha256 = ?, binding_json = ?')
+      .run(planSha256, JSON.stringify(roster))
+    f.db.query('UPDATE hosted_lifecycle_run_reservations SET record_json = ?')
+      .run(JSON.stringify(reservation))
+  } finally { for (const trigger of triggers) f.db.exec(trigger.sql) }
+  const binding = { ...f.binding, planSha256, rosterBindingSha256 }
+  return { ...f, binding, peer: { ...binding, memberId: peerId } }
+}
+
+test('peer append checks both distinct current members in one Product transaction', async () => {
+  const f = await peerFixture()
+  try {
+    let appended = 0
+    const mutablePeer = { ...f.peer }
+    const pending = f.reader.withCurrentPeerAppendDecision(f.binding, mutablePeer, (sender, recipient) => {
+      expect(sender.memberId).toBe(f.binding.memberId)
+      expect(recipient.memberId).toBe(f.peer.memberId)
+      expect(sender.runId).toBe(recipient.runId)
+      appended++
+      return 'written'
+    })
+    mutablePeer.memberId = `member_${'e'.repeat(32)}`
+    expect(await pending).toBe('written')
+    expect(appended).toBe(1)
+    await expect(f.reader.withCurrentPeerAppendDecision(f.binding, f.peer, async () => true))
+      .rejects.toThrow('async-effect-forbidden')
+  } finally { await close(f) }
+})
+
+test('peer append rejects either retired member, pending run, and mismatched incarnation', async () => {
+  for (const retire of [
+    (f: Fixture & { peer: HostedProductMemberBinding }) => f.db.query(`INSERT INTO hosted_lifecycle_retired_members
+      (run_id, member_id) VALUES (?, ?)`).run(f.binding.runId, f.binding.memberId),
+    (f: Fixture & { peer: HostedProductMemberBinding }) => f.db.query(`INSERT INTO hosted_lifecycle_retired_members
+      (run_id, member_id) VALUES (?, ?)`).run(f.peer.runId, f.peer.memberId),
+    (f: Fixture & { peer: HostedProductMemberBinding }) => f.db.query(`UPDATE hosted_lifecycle_current_runs
+      SET state = 'cleanup_pending' WHERE run_id = ?`).run(f.binding.runId),
+  ]) {
+    const f = await peerFixture()
+    try {
+      retire(f)
+      let appended = 0
+      await expect(f.reader.withCurrentPeerAppendDecision(f.binding, f.peer, () => {
+        appended++
+      })).rejects.toThrow('peer-not-current')
+      expect(appended).toBe(0)
+    } finally { await close(f) }
+  }
+  const f = await peerFixture()
+  try {
+    for (const forged of [
+      { ...f.peer, memberId: f.binding.memberId },
+      { ...f.peer, runId: `run_${'f'.repeat(32)}` },
+      { ...f.peer, restoreGeneration: f.peer.restoreGeneration + 1 },
+    ]) {
+      await expect(f.reader.withCurrentPeerAppendDecision(f.binding, forged, () => true))
+        .rejects.toThrow('peer-decision-input-invalid')
+    }
+  } finally { await close(f) }
+})
+
+test('peer final append holds the Product writer lock across both checks and callback', async () => {
+  const f = await peerFixture()
+  try {
+    const inbox = path.join(f.directory, 'peer-inbox.txt')
+    await f.reader.withCurrentPeerAppendDecision(f.binding, f.peer, () => {
+      const child = spawnSync(process.execPath, ['-e', `import { Database } from 'bun:sqlite';
+        const db = new Database(${JSON.stringify(f.databasePath)}, {create:false,readwrite:true});
+        db.exec('PRAGMA busy_timeout = 50');
+        try { db.query('INSERT INTO hosted_lifecycle_retired_members (run_id, member_id) VALUES (?, ?)')
+          .run(${JSON.stringify(f.peer.runId)}, ${JSON.stringify(f.peer.memberId)}); process.exit(2) }
+        catch { process.exit(0) }`], { timeout: 500, encoding: 'utf8' })
+      expect(child.status).toBe(0)
+      appendFileSync(inbox, `${f.binding.memberId}->${f.peer.memberId}\n`)
+    })
+    expect(readFileSyncNode(inbox, 'utf8')).toBe(`${f.binding.memberId}->${f.peer.memberId}\n`)
+    f.db.query('INSERT INTO hosted_lifecycle_retired_members (run_id, member_id) VALUES (?, ?)')
+      .run(f.peer.runId, f.peer.memberId)
+    await expect(f.reader.withCurrentPeerAppendDecision(f.binding, f.peer, () => {
+      appendFileSync(inbox, 'forbidden\n')
+    })).rejects.toThrow('peer-not-current')
+    expect(readFileSyncNode(inbox, 'utf8')).not.toContain('forbidden')
+  } finally { await close(f) }
+})
 
 test('Product v35 current member is admitted, forged bindings and revoked grant/session are denied', async () => {
   const f = await fixture()
