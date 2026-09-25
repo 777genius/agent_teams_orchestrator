@@ -272,12 +272,28 @@ describe('hosted disposable OpenCode lifecycle lane', () => {
     expect(supervisor.starts[0]).toMatchObject({
       teamId: plan.planTeamId, runId: plan.runId, laneId: identity.laneId,
       memberId: identity.members[0].memberId,
+      operationId: 'start_89fca1ff37e680c24c36381ab6a78ba1da0ee332c520cff5625c74720bd90459',
     })
     expect(sessions[0]).toMatchObject({
       teamId: plan.planTeamId, runId: plan.runId, laneId: identity.laneId,
       memberId: identity.members[0].memberId,
     })
     expect([...attempts.claimed.values()]).toEqual([(leased[0] as { fingerprint: string }).fingerprint])
+  })
+
+  test('trusted Start identity ignores renewed promotion while the frozen plan and member stay fixed', async () => {
+    const plan = canonicalInput()
+    const supervisor = new FakeSupervisor()
+    const original = canonicalIdentity(plan)
+    const renewal = { ...original, operationId: `promotion_${'1'.repeat(32)}` }
+    const first = new HostedContainerOpenCodeLane(supervisor, async () => `lease_${'c'.repeat(32)}`,
+      READY, new FakeAttempts(), undefined, SESSIONS(), async () => original)
+    const second = new HostedContainerOpenCodeLane(supervisor, async () => `lease_${'c'.repeat(32)}`,
+      READY, new FakeAttempts(), undefined, SESSIONS(), async () => renewal)
+    expect(await first.launch(plan)).toEqual({ phase: 'failed', recoverable: true })
+    expect(await second.launch(plan)).toEqual({ phase: 'failed', recoverable: true })
+    expect(supervisor.starts).toHaveLength(2)
+    expect(supervisor.starts[0].operationId).toBe(supervisor.starts[1].operationId)
   })
 
   test('trusted roster mismatch fails admission before any claim or effect', async () => {

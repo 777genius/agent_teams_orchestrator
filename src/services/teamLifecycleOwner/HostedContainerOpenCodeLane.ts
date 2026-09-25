@@ -8,6 +8,7 @@ import type {
   TeamLifecycleLaneObservation,
 } from './OpenCodeTeamLifecycleLane.js'
 import type { TeamLifecycleLaunchMember } from './TeamLifecycleLaunchPlan.js'
+import { hostedMemberStartOperationId } from './HostedMemberStartOperationId.js'
 
 type RunningInput = TeamLifecycleLaneInput & { runId: string }
 type ScopedInput = TeamLifecycleLaneInput & { runId: string | null }
@@ -145,7 +146,9 @@ function binding(
       member.model ?? lane.selectedModel, createHash('sha256').update(member.prompt).digest('hex')]
     : [planFingerprint(input), memberId])
   return {
-    key, fingerprint, operationId: `start_${hash([fingerprint, memberId])}`,
+    key, fingerprint, operationId: canonical
+      ? hostedMemberStartOperationId(input.runId, memberId, canonical.planSha256)
+      : `start_${hash([fingerprint, memberId])}`,
     runId: canonical ? input.runId : `run_${hash(input.runId)}`,
     teamId: canonical ? input.planTeamId : `team_${hash(input.planTeamId)}`,
     laneId: canonical ? canonical.laneId : `lane_${hash([input.planTeamId, lane.laneId])}`,
