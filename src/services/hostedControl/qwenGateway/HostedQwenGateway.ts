@@ -171,13 +171,15 @@ export class HostedQwenGateway {
       container.containerGeneration === expected.containerGeneration && container.containerIp === expected.containerIp
   }
 
-  private async current(admission: HostedQwenAdmission | string, epoch: number, remote: string): Promise<boolean> {
-    if (!this.sameAdmission(admission, epoch, remote)) return false
-    if (typeof admission === 'string') return true // synthetic test fixture only
+  private async responseEffect<T>(admission: HostedQwenAdmission | string, epoch: number,
+    remote: string, effect: () => T): Promise<{ allowed: true; value: T } | { allowed: false }> {
+    if (!this.sameAdmission(admission, epoch, remote)) return { allowed: false }
+    if (typeof admission === 'string') return { allowed: true, value: effect() } // synthetic test fixture only
     try {
       return await this.options.dispatchAuthority!.withCurrentMemberDecision(admission.member, 'observe', current =>
-        this.sameAdmission(admission, epoch, remote) && this.matchesCurrent(admission, current))
-    } catch { return false }
+        this.sameAdmission(admission, epoch, remote) && this.matchesCurrent(admission, current)
+          ? { allowed: true as const, value: effect() } : { allowed: false as const })
+    } catch { return { allowed: false } }
   }
 
   private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -292,7 +294,11 @@ export class HostedQwenGateway {
     }
     try {
       upstream = await connectPinnedQwen(this.options.upstreamPort ?? 18993, this.timeoutMs)
-      if (!this.sameAdmission(admission, epoch, remote) || cancelled) { exchange.cancel(); return }
+      if (!this.sameAdmission(admission, epoch, remote) || cancelled) {
+        upstream.destroy()
+        exchange.cancel()
+        return
+      }
       const frame = qwenHttpFrame(method as 'GET' | 'POST', target!, body)
       if (frame.length > MAX_GATEWAY_REQUEST_BYTES + 256) throw new Error('hosted-qwen-frame-limit')
       if (typeof admission === 'string') {
@@ -328,8 +334,11 @@ export class HostedQwenGateway {
       if (finished) return
       try { parser.ended() } catch { fail(); return }
       void (async () => {
-        if (!await this.current(admission, epoch, remote)) { fail(); return }
-        if (finish() && !res.destroyed) res.end()
+        const result = await this.responseEffect(admission, epoch, remote, () => {
+          if (!res.destroyed) res.end()
+        })
+        if (!result.allowed) { fail(); return }
+        finish()
       })()
     })
     socket.on('data', chunk => {
@@ -338,15 +347,20 @@ export class HostedQwenGateway {
         try {
           const pieces = parser.feed(Buffer.from(chunk))
           if (parser.headers && !res.headersSent) {
-            if (!await this.current(admission, epoch, remote) || finished || cancelled) { fail(); return }
-            res.writeHead(parser.headers.status, {
-              'content-type': parser.headers.contentType,
-              'cache-control': 'no-store',
+            const result = await this.responseEffect(admission, epoch, remote, () => {
+              if (finished || cancelled || res.destroyed) return
+              res.writeHead(parser.headers!.status, {
+                'content-type': parser.headers!.contentType,
+                'cache-control': 'no-store',
+              })
             })
+            if (!result.allowed || finished || cancelled) { fail(); return }
           }
           for (const piece of pieces) {
-            if (!await this.current(admission, epoch, remote) || finished || cancelled) { fail(); return }
-            if (!res.write(piece)) await new Promise<void>(resolve => {
+            const result = await this.responseEffect(admission, epoch, remote, () =>
+              !finished && !cancelled && !res.destroyed ? res.write(piece) : false)
+            if (!result.allowed || finished || cancelled) { fail(); return }
+            if (!result.value) await new Promise<void>(resolve => {
               const done = () => { res.off('drain', done); res.off('close', done); resolve() }
               res.once('drain', done)
               res.once('close', done)
@@ -354,8 +368,11 @@ export class HostedQwenGateway {
             if (finished || cancelled) return
           }
           if (parser.done) {
-            if (!await this.current(admission, epoch, remote) || finished || cancelled) { fail(); return }
-            if (finish() && !res.destroyed) res.end()
+            const result = await this.responseEffect(admission, epoch, remote, () => {
+              if (!finished && !cancelled && !res.destroyed) res.end()
+            })
+            if (!result.allowed) { fail(); return }
+            finish()
             socket.destroy()
           } else socket.resume()
         } catch { fail() }

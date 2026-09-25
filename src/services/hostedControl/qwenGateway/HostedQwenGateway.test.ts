@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test'
-import { createServer, request } from 'node:http'
+import { createServer, request, ServerResponse } from 'node:http'
 import { createConnection, type AddressInfo } from 'node:net'
 
 import { HostedQwenGateway } from './HostedQwenGateway.js'
@@ -354,4 +354,37 @@ test('streaming stops before forwarding a chunk after Product revocation', async
   })
   expect(received.startsWith('first')).toBe(true)
   expect(received).not.toContain('second')
+})
+
+test('response body write executes inside the synchronous Product decision callback', async () => {
+  const upstream = createServer((_req, res) => res.end('SECRET'))
+  await new Promise<void>(resolve => upstream.listen(0, '127.0.0.1', resolve))
+  close.push(() => new Promise(resolve => upstream.close(() => resolve())))
+  let inDecision = false
+  let protectedWrite: boolean | null = null
+  const originalWrite = ServerResponse.prototype.write
+  ServerResponse.prototype.write = function(chunk: unknown, ...args: unknown[]) {
+    if (Buffer.isBuffer(chunk) && chunk.toString() === 'SECRET') protectedWrite = inDecision
+    return Reflect.apply(originalWrite, this, [chunk, ...args])
+  } as typeof ServerResponse.prototype.write
+  try {
+    const authority: HostedQwenGatewayDispatchAuthority = {
+      async withCurrentMemberDecision(_binding, _kind, callback) {
+        inDecision = true
+        try {
+          return callback({ ...productAdmission.member, model: productAdmission.model } as HostedProductCurrentMember)
+        } finally { inDecision = false }
+      },
+      currentContainer: () => productAdmission.container,
+    }
+    const port = await freePort()
+    const gateway = new HostedQwenGateway({ bindAddress: '127.0.0.1', port,
+      upstreamPort: (upstream.address() as AddressInfo).port, testOnlyAllowNonRoot: true,
+      dispatchAuthority: authority })
+    await gateway.start()
+    close.push(() => gateway.stop())
+    gateway.admitClient(productAdmission)
+    expect((await raw(port, 'GET', '/v1/models')).body).toBe('SECRET')
+    expect(protectedWrite).toBe(true)
+  } finally { ServerResponse.prototype.write = originalWrite }
 })
