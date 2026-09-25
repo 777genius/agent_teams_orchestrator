@@ -65,10 +65,13 @@ test('root-only v35 composition derives one exact member from immutable roster a
   } finally { composed.close(); f.db.close() }
 })
 
-test('retired current run or member cannot pass root observe after historical reservation remains', async () => {
+test('cleanup-pending or retired run and retired member cannot pass root observe', async () => {
   const f = await fixture()
   const composed = await HostedRootSandboxMemberComposition.create(f.pins)
   try {
+    f.db.query("UPDATE hosted_lifecycle_current_runs SET state = 'cleanup_pending' WHERE run_id = ?")
+      .run(f.metadata.runId)
+    await expect(composed.observe(f.metadata.memberId)).rejects.toThrow('member-not-current')
     f.db.query("UPDATE hosted_lifecycle_current_runs SET state = 'retired' WHERE run_id = ?")
       .run(f.metadata.runId)
     await expect(composed.observe(f.metadata.memberId)).rejects.toThrow('member-not-current')
