@@ -293,7 +293,7 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
   }
 
   /**
-   * Drains admitted work, then stops every running run recorded in this state file. The state file
+   * Drains admitted work, then stops every run recorded in this state file. The state file
    * sits under the team root this process exclusively leases, so a run left by a crashed earlier
    * owner and adopted here (its detached host survives) is this process's to stop as well.
    */
@@ -307,13 +307,15 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
     const admitted = await this.options.loadAdmittedPlan?.().catch(() => null)
     if (admitted) this.#rememberPlan(admitted)
     // Runtime authority loss is a teardown boundary, not a new commanded
-    // effect. Stop each recorded running run with its exact plan/run tuple
-    // before allowing the hosted runtime to finish closing.
+    // effect. Stop each recorded run with its exact plan/run tuple before
+    // allowing the hosted runtime to finish closing. After close() no job is
+    // left, so a failed, launching or stopping run may still have live lane
+    // processes (a permission-blocked launch, a crash) and is stopped as well.
     for (const plan of this.#knownPlans.values()) {
       await this.#serialized(async () => {
         // A superseded remembered plan must not abort teardown of the current one.
         const current = await this.#read(plan).catch(() => null)
-        if (current?.phase !== 'running' || !current.runId) return
+        if (!current?.runId) return
         let stopped = false
         let failure: TeamLifecycleLaneFailure | undefined
         try {
@@ -323,15 +325,17 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
         } catch (error) {
           failure = laneFailureFromError('teardown', error)
         }
-        await this.#write({
-          ...current,
-          phase: stopped ? 'idle' : 'failed',
-          runId: stopped ? null : current.runId,
-          recoverable: !stopped,
-          ...(failure ? { failure } : {}),
-        }, plan)
+        if (stopped) {
+          await this.#write({ ...current, phase: 'idle', runId: null, recoverable: false }, plan)
+          this.#ownedRuns.delete(current.runId)
+          return
+        }
+        // Keep the first recorded cause: a run that is already failed, launching or stopping
+        // stays as it is and the teardown failure is only reported.
+        if (current.phase === 'running') {
+          await this.#write({ ...current, phase: 'failed', recoverable: true, failure }, plan)
+        }
         if (failure) this.#reportLaneFailure(failure, current.runId, plan)
-        if (stopped) this.#ownedRuns.delete(current.runId)
       })
     }
   }

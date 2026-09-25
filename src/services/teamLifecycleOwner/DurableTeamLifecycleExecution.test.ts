@@ -518,6 +518,49 @@ describe('DurableTeamLifecycleExecution', () => {
       .resolves.toMatchObject({ phase: 'idle', runId: null })
   })
 
+  test('shutdown stops a failed run and keeps its first cause when the stop fails', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'team-owner-failed-shutdown-'))
+    roots.push(root)
+    const statePath = join(root, 'state.json')
+    const lane = new FakeLane()
+    lane.launchResult = { phase: 'failed', recoverable: true }
+    const failedRun = async () => {
+      const execution = new DurableTeamLifecycleExecution(statePath, [lane])
+      const launching = await execution.launch({
+        plan, commandId: `command-launch-${lane.launched.length}`, runId: null,
+        expectedProviderGeneration: (await execution.inspect(plan)).providerGeneration,
+      })
+      await waitForPhase(execution, 'failed')
+      await execution.close()
+      return launching.runId!
+    }
+    const firstCause = async () => JSON.parse(await readFile(statePath, 'utf8')).failure
+
+    // A failed launch can leave live lane processes; a graceful shutdown stops it to idle.
+    const stoppedRun = await failedRun()
+    await new DurableTeamLifecycleExecution(statePath, [lane], 'team-lifecycle-owner', {
+      loadAdmittedPlan: async () => plan,
+    }).shutdown()
+    expect(lane.stoppedRunIds).toEqual([stoppedRun])
+    await expect(new DurableTeamLifecycleExecution(statePath, [lane]).inspect(plan))
+      .resolves.toMatchObject({ phase: 'idle', runId: null })
+
+    // An unconfirmed teardown only reports; the recorded launch failure stays the cause.
+    const keptRun = await failedRun()
+    const cause = await firstCause()
+    expect(cause).toMatchObject({ action: 'launch' })
+    lane.stop = async () => { throw new Error('bridge unavailable') }
+    const reports: unknown[] = []
+    await new DurableTeamLifecycleExecution(statePath, [lane], 'team-lifecycle-owner', {
+      loadAdmittedPlan: async () => plan,
+      reportLaneFailure: report => reports.push(report),
+    }).shutdown()
+    expect(await firstCause()).toEqual(cause)
+    expect(reports).toEqual([expect.objectContaining({ action: 'teardown', runId: keptRun })])
+    await expect(new DurableTeamLifecycleExecution(statePath, [lane]).inspect(plan))
+      .resolves.toMatchObject({ phase: 'failed', runId: keptRun, recoverable: true })
+  })
+
   test('keeps an in-process launch authoritative until its effect job commits', async () => {
     const root = await mkdtemp(join(tmpdir(), 'team-owner-inflight-'))
     roots.push(root)
