@@ -692,9 +692,7 @@ export class HostedControlServer {
       try { this.#options.onReadinessLease?.() } catch { /* readiness owns the lease regardless of advisory recovery */ }
       return
     }
-    const unsigned = { schemaVersion: 2 as const, kind: 'ready' as const, capability: 'hosted-lifecycle-command' as const, challenge: admission.challenge, bootstrapDigest: admission.bootstrapDigest, ownerBinding }
-    const response = { ...unsigned, ownerProof: createHostedRawDomainProof(this.#options.secret, HOSTED_LIFECYCLE_PROOF_DOMAIN, 'readiness', JSON.stringify(unsigned)) }
-    socket.write(`${JSON.stringify(response)}\n`)
+    socket.write(createHostedCanonicalReadinessResponseLine(this.#options.secret, admission, ownerBinding))
     try { this.#options.onReadinessLease?.() } catch { /* readiness owns the lease regardless of advisory recovery */ }
   }
 
@@ -813,6 +811,17 @@ export function decodeHostedReadinessRequest(input: {
     challenge: input.message.challenge,
     bootstrapDigest: (bootstrap as Record<string, unknown>).bootstrapDigest as string,
   }
+}
+
+/** The canonical ready frame; Product authenticates these exact bytes with its trust anchor. */
+export function createHostedCanonicalReadinessResponseLine(
+  secret: Uint8Array,
+  admission: Extract<HostedReadinessAdmission, { protocol: 'canonical' }>,
+  ownerBinding: HostedControlOwnerBinding,
+): string {
+  const unsigned = { schemaVersion: 2 as const, kind: 'ready' as const, capability: 'hosted-lifecycle-command' as const, challenge: admission.challenge, bootstrapDigest: admission.bootstrapDigest, ownerBinding }
+  const response = { ...unsigned, ownerProof: createHostedRawDomainProof(secret, HOSTED_LIFECYCLE_PROOF_DOMAIN, 'readiness', JSON.stringify(unsigned)) }
+  return `${JSON.stringify(response)}\n`
 }
 
 export function admitHostedReadiness(input: {
