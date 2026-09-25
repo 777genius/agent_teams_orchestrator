@@ -176,10 +176,11 @@ describe('Product task_mutate envelope', () => {
     } finally {
       process.stderr.write = write
     }
-    expect(lines).toEqual([
-      'Hosted owner-bound request rejected: operation=task_mutate reason=authority:mountBinding.declaredRootHash,restoreGeneration\n',
-      'Hosted owner-bound request rejected: operation=message_persist reason=team identity fence:identity-checksum-mismatch\n',
+    expect(lines.map(line => JSON.parse(line))).toEqual([
+      { event: 'hosted_owner_bound', operation: 'task_mutate', stage: 'rejected', reason: 'authority:mountBinding.declaredRootHash,restoreGeneration' },
+      { event: 'hosted_owner_bound', operation: 'message_persist', stage: 'rejected', reason: 'team identity fence:identity-checksum-mismatch' },
     ])
+    expect(lines.join('')).not.toContain('99')
   })
 
   test('leaves the legacy control envelope on its own route', () => {

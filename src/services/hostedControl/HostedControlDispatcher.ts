@@ -27,6 +27,7 @@ import {
   type ProductOwnerEffectFence,
   type ProductOwnerEffectFenceDecision,
 } from './HostedProductOwnerBoundEnvelope.js'
+import { reportHostedOwnerBoundStage } from './HostedOwnerBoundDiagnostics.js'
 import {
   HostedApprovalWireDispatcher,
   isHostedApprovalOperation,
@@ -130,10 +131,11 @@ export class HostedControlDispatcher {
       return await this.#dispatchProductOwnerBoundUnlogged(message)
     } catch (error) {
       // The only Owner-side trace of a failed Product exchange: the peer sees a closed socket.
-      const reason = error instanceof ProductOwnerBoundRejection
-        ? error.reason
-        : `dispatch-failed:${error instanceof Error ? error.name : 'unknown'}`
-      process.stderr.write(`Hosted owner-bound request rejected: operation=${String(message.operation).slice(0, 32)} reason=${reason}\n`)
+      reportHostedOwnerBoundStage(message.operation, 'rejected', {
+        reason: error instanceof ProductOwnerBoundRejection
+          ? error.reason
+          : `dispatch-failed:${error instanceof Error ? error.name : 'unknown'}`,
+      })
       throw error
     }
   }
@@ -149,6 +151,7 @@ export class HostedControlDispatcher {
       activeOwner: this.options.getOwnerBinding(),
       verifyOwnerEffectFence,
     })
+    reportHostedOwnerBoundStage(request.operation, 'decoded')
     if (request.operation === 'task_mutate') {
       if (!this.options.tasks) throw new Error('Hosted Product task writer is unavailable')
       return dispatchProductTaskMutation({

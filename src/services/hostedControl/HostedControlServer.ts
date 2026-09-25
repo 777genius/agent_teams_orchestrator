@@ -15,6 +15,7 @@ import {
 } from './ownerProof.js'
 import type { HostedControlBootstrapBinding } from './HostedControlBootstrap.js'
 import { isProductOwnerBoundEnvelope } from './HostedProductOwnerBoundEnvelope.js'
+import { reportHostedOwnerBoundStage } from './HostedOwnerBoundDiagnostics.js'
 import { HOSTED_CONTROL_SOCKET_BROKER_FLAG } from './HostedControlSocketBroker.js'
 import {
   HOSTED_APPROVAL_ACTIVATION_PREPARE_MAX_BYTES,
@@ -593,9 +594,12 @@ export class HostedControlServer {
       const leaseSocket = this.#leaseSocket
       const ownerBinding = this.#ownerBinding
       const productEnvelope = isProductOwnerBoundEnvelope(message)
+      if (productEnvelope) {
+        reportHostedOwnerBoundStage(message.operation, 'received', { writable: socket.writable, peerEnded: socket.readableEnded })
+      }
       if (!leaseSocket || leaseSocket.destroyed || !(await this.#hasCurrentSocketIdentity()) ||
         !ownerBinding || !this.#options.dispatchCoexistingOperation) {
-        if (productEnvelope) logOwnerBoundRejection(message, 'owner-lease-unavailable')
+        if (productEnvelope) reportHostedOwnerBoundStage(message.operation, 'rejected', { reason: 'owner-lease-unavailable' })
         socket.destroy()
         return
       }
@@ -605,11 +609,19 @@ export class HostedControlServer {
       )
       if (!response || this.#leaseSocket !== leaseSocket || leaseSocket.destroyed ||
         !(await this.#hasCurrentSocketIdentity()) || !isDeepStrictEqual(ownerBinding, this.#ownerBinding)) {
-        if (productEnvelope) logOwnerBoundRejection(message, response ? 'owner-lease-lost' : 'no-response')
+        if (productEnvelope) {
+          reportHostedOwnerBoundStage(message.operation, 'rejected', { reason: response ? 'owner-lease-lost' : 'no-response' })
+        }
         socket.destroy()
         return
       }
-      writeBoundedResponse(socket, response)
+      if (productEnvelope) {
+        const writable = socket.writable; const peerEnded = socket.readableEnded
+        const bytes = writeBoundedResponse(socket, response)
+        reportHostedOwnerBoundStage(message.operation, 'replied', { bytes, writable, peerEnded })
+      } else {
+        writeBoundedResponse(socket, response)
+      }
       return
     }
     const leaseSocket = this.#leaseSocket
@@ -887,11 +899,7 @@ function taskResultMatchesRequest(
     result.receipt.sourceGeneration === command.expectedSourceGeneration
 }
 
-function logOwnerBoundRejection(message: Record<string, unknown>, reason: string): void {
-  process.stderr.write(`Hosted owner-bound request rejected: operation=${String(message.operation).slice(0, 32)} reason=${reason}\n`)
-}
-
-function writeBoundedResponse(socket: Socket, value: Record<string, unknown>): void {
+function writeBoundedResponse(socket: Socket, value: Record<string, unknown>): number {
   const line = `${JSON.stringify(value)}\n`
   const maximum = isApprovalOperation(value.operation)
     ? HOSTED_CONTROL_MAX_LINE_BYTES
@@ -900,6 +908,7 @@ function writeBoundedResponse(socket: Socket, value: Record<string, unknown>): v
     throw new Error('Hosted control response exceeds maximum line size')
   }
   socket.end(line)
+  return Buffer.byteLength(line)
 }
 
 function sameStableAuthority(
