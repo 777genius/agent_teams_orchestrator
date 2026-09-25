@@ -8,7 +8,7 @@ import { join } from 'node:path'
 import { createHostedDomainProof, createHostedRawDomainProof } from './ownerProof.js'
 import { hostedControlGoldenRequestFixture } from './protocol.js'
 import { HostedControlDispatcher } from './HostedControlDispatcher.js'
-import { admitHostedReadiness, HOSTED_LIFECYCLE_PROOF_DOMAIN, HostedControlServer } from './HostedControlServer.js'
+import { admitHostedReadiness, HOSTED_CONTROL_STANDARD_MAX_LINE_BYTES, HOSTED_LIFECYCLE_PROOF_DOMAIN, HostedControlServer } from './HostedControlServer.js'
 import type { HostedControlBootstrapBinding } from './HostedControlBootstrap.js'
 import type { HostedApprovalActivationConnection } from './HostedApprovalActivationSession.js'
 
@@ -498,6 +498,36 @@ describe('HostedControlServer', () => {
     await exchange(socketPath, `${JSON.stringify(message)}\n`)
     expect(dispatched).toBe('team_message')
     lease.socket.destroy()
+  })
+
+  test('bounds every frame at 64 KiB while reading unless an approval port is composed', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'hosted-server-frame-cap-')); roots.push(root)
+    const secret = Buffer.alloc(32, 9); const unsigned = hostedControlGoldenRequestFixture()
+    const { socketIdentity: _, ...ownerIdentity } = unsigned.ownerBinding
+    const dispatched: string[] = []
+    const start = async (name: string, approvalFrames: boolean) => {
+      const socketPath = join(root, name, 'control.sock')
+      const server = new HostedControlServer({
+        socketPath, secret, ownerIdentity, authority: unsigned.authority, readDeadlineMs: 60_000, approvalFrames,
+        dispatchCoexistingOperation: async message => { dispatched.push(`${name}:${String(message.operation)}`); return { kind: 'ok' } },
+      })
+      servers.push(server); await server.start()
+      return { socketPath, lease: await openReadiness(socketPath, server.ownerBinding!) }
+    }
+    const oversized = `${JSON.stringify({ operation: 'approval_ingress_claim', padding: 'x'.repeat(HOSTED_CONTROL_STANDARD_MAX_LINE_BYTES) })}\n`
+
+    const standard = await start('standard', false)
+    // The read loop closes an unterminated oversized frame long before the 60 s read deadline.
+    const unterminated = await openStreamingSocket(standard.socketPath)
+    const closed = new Promise<void>(resolve => unterminated.socket.once('close', () => resolve()))
+    unterminated.socket.write('y'.repeat(HOSTED_CONTROL_STANDARD_MAX_LINE_BYTES + 1))
+    await withinMs(closed, 5_000)
+    expect(await exchange(standard.socketPath, oversized)).toBe('')
+
+    const approval = await start('approval', true)
+    expect(await exchange(approval.socketPath, oversized)).toBe('{"kind":"ok"}')
+    expect(dispatched).toEqual(['approval:approval_ingress_claim'])
+    standard.lease.socket.destroy(); approval.lease.socket.destroy()
   })
 
   test('forwards the admitted raw JSON bytes to dispatch unchanged', async () => {

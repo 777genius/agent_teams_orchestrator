@@ -234,6 +234,7 @@ export class HostedControlRuntime {
         bootstrapBinding: descriptorAdmission?.bootstrapBinding,
         dispatchCoexistingOperation: (message, rawLine) => dispatcher.dispatch(message, rawLine),
         activationSessionFactory: ports.activationSessionFactory,
+        approvalFrames: ports.approvals !== undefined,
         onReadinessLease: () => ports?.onReadinessLease?.(),
       })
       dispatcher = new HostedControlDispatcher({

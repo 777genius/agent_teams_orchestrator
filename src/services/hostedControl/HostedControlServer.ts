@@ -61,6 +61,11 @@ export type HostedControlServerOptions = {
   onReadinessLease?: () => void
   /** Optional one-use approval activation transport. Lifecycle readiness remains independent. */
   activationSessionFactory?: HostedApprovalActivationSessionFactory
+  /**
+   * Admit frames up to HOSTED_CONTROL_MAX_LINE_BYTES for the approval wire. Without a composed
+   * approval port every frame is bounded by HOSTED_CONTROL_STANDARD_MAX_LINE_BYTES while it is read.
+   */
+  approvalFrames?: boolean
 }
 
 type ActivationPhase =
@@ -265,6 +270,9 @@ export class HostedControlServer {
     let chunks: Buffer[] = []
     let bytes = 0
     let finished = false
+    const maxLineBytes = this.#options.approvalFrames === true
+      ? HOSTED_CONTROL_MAX_LINE_BYTES
+      : HOSTED_CONTROL_STANDARD_MAX_LINE_BYTES
 
     const failClosed = (cause: unknown = new Error('Hosted control connection failed closed')) => {
       finished = true
@@ -310,7 +318,7 @@ export class HostedControlServer {
         return
       }
       bytes += chunk.byteLength
-      if (bytes > HOSTED_CONTROL_MAX_LINE_BYTES) {
+      if (bytes > maxLineBytes) {
         failClosed()
         return
       }
