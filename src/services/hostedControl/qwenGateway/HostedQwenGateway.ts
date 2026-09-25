@@ -1,10 +1,34 @@
-import { createServer, request as httpRequest, type ClientRequest, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
-import type { AddressInfo } from 'node:net'
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
+import { type AddressInfo, type Socket } from 'node:net'
+
+import type { HostedProductCurrentMember, HostedProductMemberBinding } from '../productAuthority/HostedProductCurrentMemberDecision.js'
+import { connectPinnedQwen, PinnedQwenResponseParser, qwenHttpFrame, writePinnedQwen } from './PinnedQwenHttpExchange.js'
 
 const IPV4 = /^(?:\d{1,3}\.){3}\d{1,3}$/
+const MAX_GATEWAY_REQUEST_BYTES = 64 * 1024
 
 function ipv4(value: string): boolean {
   return IPV4.test(value) && value.split('.').every(octet => Number(octet) <= 255)
+}
+
+export type HostedQwenContainerBinding = Readonly<{
+  containerId: string
+  networkId: string
+  containerGeneration: number
+  containerIp: string
+}>
+
+export type HostedQwenAdmission = Readonly<{
+  member: HostedProductMemberBinding
+  container: HostedQwenContainerBinding
+  model: string
+}>
+
+export interface HostedQwenGatewayDispatchAuthority {
+  withCurrentMemberDecision<T>(binding: HostedProductMemberBinding, kind: 'observe',
+    callback: (current: HostedProductCurrentMember) => T): Promise<T>
+  /** Root-owned, synchronous view of current Docker identity. */
+  currentContainer(): HostedQwenContainerBinding | null
 }
 
 export interface HostedQwenGatewayOptions {
@@ -17,12 +41,14 @@ export interface HostedQwenGatewayOptions {
   readonly timeoutMs?: number
   /** Allows an inert loopback fixture in tests only. Production requires root and a bridge address. */
   readonly testOnlyAllowNonRoot?: boolean
+  /** Omission keeps production dispatch closed. */
+  readonly dispatchAuthority?: HostedQwenGatewayDispatchAuthority
 }
 
-/** Fixed-destination HTTP gateway. It never resolves a name or consults proxy variables. */
+/** Fixed-destination HTTP gateway. All request bytes cross the kernel under Product's SQLite lock. */
 export class HostedQwenGateway {
   private readonly server: Server
-  private admittedIp: string | null = null
+  private admitted: HostedQwenAdmission | string | null = null
   private admissionEpoch = 0
   private readonly active = new Set<{ cancel(): void }>()
   private started = false
@@ -33,7 +59,8 @@ export class HostedQwenGateway {
 
   constructor(private readonly options: HostedQwenGatewayOptions) {
     if (options.testOnlyAllowNonRoot) {
-      if (process.env.NODE_ENV !== 'test' || options.bindAddress !== '127.0.0.1') {
+      if (process.env.NODE_ENV !== 'test' || process.getuid?.() === 0 ||
+        options.bindAddress !== '127.0.0.1') {
         throw new Error('hosted-qwen-test-mode-invalid')
       }
     } else if (process.platform !== 'linux' || process.getuid?.() !== 0 ||
@@ -44,11 +71,12 @@ export class HostedQwenGateway {
       options.upstreamPort !== undefined && options.upstreamPort !== 18993 && !options.testOnlyAllowNonRoot) {
       throw new Error('hosted-qwen-port-invalid')
     }
-    this.maxRequestBytes = options.maxRequestBytes ?? 8 * 1024 * 1024
+    this.maxRequestBytes = options.maxRequestBytes ?? MAX_GATEWAY_REQUEST_BYTES
     this.maxResponseBytes = options.maxResponseBytes ?? 32 * 1024 * 1024
     this.timeoutMs = options.timeoutMs ?? 300_000
     this.maxConcurrent = options.maxConcurrent ?? 4
-    if (!Number.isSafeInteger(this.maxRequestBytes) || this.maxRequestBytes < 1 || this.maxRequestBytes > 32 * 1024 * 1024 ||
+    if (!Number.isSafeInteger(this.maxRequestBytes) || this.maxRequestBytes < 1 ||
+      this.maxRequestBytes > MAX_GATEWAY_REQUEST_BYTES ||
       !Number.isSafeInteger(this.maxResponseBytes) || this.maxResponseBytes < 1 || this.maxResponseBytes > 128 * 1024 * 1024 ||
       !Number.isSafeInteger(this.timeoutMs) || this.timeoutMs < 1000 || this.timeoutMs > 600_000 ||
       !Number.isSafeInteger(this.maxConcurrent) || this.maxConcurrent < 1 || this.maxConcurrent > 8) {
@@ -83,16 +111,31 @@ export class HostedQwenGateway {
     this.attest()
   }
 
-  /** Call only after the root network policy has admitted this exact container IP. */
-  admitClient(ip: string): void {
-    if (!this.started || !ipv4(ip)) throw new Error('hosted-qwen-client-invalid')
+  /** Root calls this only after the exact container IP is admitted by network policy. */
+  admitClient(admission: HostedQwenAdmission | string): void {
+    if (!this.started) throw new Error('hosted-qwen-client-invalid')
+    if (typeof admission === 'string') {
+      if (!this.options.testOnlyAllowNonRoot || !ipv4(admission)) throw new Error('hosted-qwen-client-invalid')
+      this.revokeClient()
+      this.admitted = admission
+      return
+    }
+    if (!this.options.dispatchAuthority || !admission?.member || !admission.container ||
+      !ipv4(admission.container.containerIp) || !admission.container.containerId || !admission.container.networkId ||
+      !Number.isSafeInteger(admission.container.containerGeneration) || admission.container.containerGeneration < 1 ||
+      typeof admission.model !== 'string' || !admission.model || admission.model.length > 256) {
+      throw new Error('hosted-qwen-admission-invalid')
+    }
     this.revokeClient()
-    this.admittedIp = ip
-    this.admissionEpoch++
+    this.admitted = Object.freeze({
+      member: Object.freeze({ ...admission.member }),
+      container: Object.freeze({ ...admission.container }),
+      model: admission.model,
+    })
   }
 
   revokeClient(): void {
-    this.admittedIp = null
+    this.admitted = null
     this.admissionEpoch++
     for (const exchange of [...this.active]) exchange.cancel()
   }
@@ -114,21 +157,46 @@ export class HostedQwenGateway {
     await closed
   }
 
+  private sameAdmission(admission: HostedQwenAdmission | string, epoch: number, remote: string): boolean {
+    return this.started && this.admissionEpoch === epoch && this.admitted === admission &&
+      (typeof admission === 'string' ? admission : admission.container.containerIp) === remote
+  }
+
+  private matchesCurrent(admission: HostedQwenAdmission, current: HostedProductCurrentMember): boolean {
+    const container = this.options.dispatchAuthority?.currentContainer()
+    const expected = admission.container
+    return current.runId === admission.member.runId && current.memberId === admission.member.memberId &&
+      current.model === admission.model && !!container &&
+      container.containerId === expected.containerId && container.networkId === expected.networkId &&
+      container.containerGeneration === expected.containerGeneration && container.containerIp === expected.containerIp
+  }
+
+  private async current(admission: HostedQwenAdmission | string, epoch: number, remote: string): Promise<boolean> {
+    if (!this.sameAdmission(admission, epoch, remote)) return false
+    if (typeof admission === 'string') return true // synthetic test fixture only
+    try {
+      return await this.options.dispatchAuthority!.withCurrentMemberDecision(admission.member, 'observe', current =>
+        this.sameAdmission(admission, epoch, remote) && this.matchesCurrent(admission, current))
+    } catch { return false }
+  }
+
   private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    const remote = req.socket.remoteAddress
-    if (!this.started || !this.admittedIp || remote !== this.admittedIp) {
+    const remote = req.socket.remoteAddress ?? ''
+    const admission = this.admitted
+    if (!admission || !this.sameAdmission(admission, this.admissionEpoch, remote)) {
       res.writeHead(403).end()
       return
     }
     const target = req.url
-    const allowed = target === '/v1/models' && req.method === 'GET' ||
-      target === '/v1/chat/completions' && req.method === 'POST'
+    const method = req.method
+    const allowed = target === '/v1/models' && method === 'GET' ||
+      target === '/v1/chat/completions' && method === 'POST'
     if (!allowed || req.headers.upgrade || req.headers['proxy-authorization'] ||
       req.rawHeaders.filter((_, i) => i % 2 === 0).filter(k => k.toLowerCase() === 'host').length !== 1) {
       res.writeHead(400).end()
       return
     }
-    if (req.method === 'POST' && !/^application\/json(?:;|$)/i.test(req.headers['content-type'] ?? '')) {
+    if (method === 'POST' && !/^application\/json(?:;|$)/i.test(req.headers['content-type'] ?? '')) {
       res.writeHead(415).end()
       return
     }
@@ -142,12 +210,10 @@ export class HostedQwenGateway {
       return
     }
     const epoch = this.admissionEpoch
-    let upstream: ClientRequest | null = null
+    let upstream: Socket | null = null
     let deadline: ReturnType<typeof setTimeout> | null = null
-    let drainListener: (() => void) | null = null
     let cancelled = false
     let finished = false
-    const onAbort = () => exchange.cancel()
     const cleanup = () => {
       if (deadline) clearTimeout(deadline)
       this.active.delete(exchange)
@@ -156,7 +222,6 @@ export class HostedQwenGateway {
       req.socket.off('end', onAbort)
       req.socket.off('error', onAbort)
       res.off('close', onResponseClose)
-      if (drainListener) res.off('drain', drainListener)
     }
     const finish = () => {
       if (finished) return false
@@ -164,6 +229,7 @@ export class HostedQwenGateway {
       cleanup()
       return true
     }
+    const onAbort = () => exchange.cancel()
     const onResponseClose = () => {
       cancelled = true
       if (finish()) upstream?.destroy()
@@ -192,83 +258,108 @@ export class HostedQwenGateway {
         bodyBytes += bytes.length
         if (bodyBytes > this.maxRequestBytes) {
           res.writeHead(413).end()
+          finish()
           return
         }
         chunks.push(bytes)
       }
     } catch {
       if (!cancelled && !res.destroyed && !res.headersSent) res.writeHead(400).end()
+      finish()
       return
     }
-    if (cancelled || !this.started || this.admissionEpoch !== epoch ||
-      this.admittedIp !== remote || res.destroyed) {
+    if (cancelled || !this.sameAdmission(admission, epoch, remote) || res.destroyed) {
       exchange.cancel()
       return
     }
-    if (req.method === 'GET' && bodyBytes !== 0) {
+    if (method === 'GET' && bodyBytes !== 0 ||
+      req.headers['content-length'] !== undefined && bodyBytes !== length) {
       res.writeHead(400).end()
+      finish()
       return
     }
-    upstream = httpRequest({
-      host: '127.0.0.1', port: this.options.upstreamPort ?? 18993,
-      path: target, method: req.method,
-      agent: false, timeout: this.timeoutMs,
-      headers: {
-        host: '127.0.0.1',
-        ...(req.method === 'POST' ? { 'content-type': req.headers['content-type'] } : {}),
-        ...(req.headers.accept ? { accept: req.headers.accept } : {}),
-      },
-    }, upstreamResponse => {
-      if (finished) { upstreamResponse.destroy(); return }
-      const upstreamLength = Number(upstreamResponse.headers['content-length'] ?? 0)
-      if ((upstreamResponse.statusCode ?? 500) >= 300 && (upstreamResponse.statusCode ?? 500) < 400 ||
-        upstreamResponse.headers['content-length'] !== undefined &&
-          (!Number.isSafeInteger(upstreamLength) || upstreamLength > this.maxResponseBytes)) {
-        if (!finish()) return
-        upstreamResponse.destroy()
-        if (!res.headersSent) res.writeHead(502).end()
+    const body = Buffer.concat(chunks, bodyBytes)
+    if (method === 'POST' && typeof admission !== 'string') {
+      try {
+        const json: unknown = JSON.parse(body.toString('utf8'))
+        if (!json || typeof json !== 'object' || Array.isArray(json) ||
+          (json as Record<string, unknown>).model !== admission.model) throw new Error('model-mismatch')
+      } catch {
+        res.writeHead(403).end()
+        finish()
         return
       }
-      res.writeHead(upstreamResponse.statusCode ?? 502, {
-        'content-type': upstreamResponse.headers['content-type'] ?? 'application/json',
-        'cache-control': 'no-store',
-      })
-      let received = 0
-      upstreamResponse.on('data', (chunk: Buffer) => {
-        if (finished) return
-        received += chunk.length
-        if (received > this.maxResponseBytes) {
-          if (!finish()) return
-          upstreamResponse.destroy()
-          res.destroy(new Error('hosted-qwen-response-limit'))
-        } else if (!res.write(chunk)) upstreamResponse.pause()
-      })
-      drainListener = () => upstreamResponse.resume()
-      res.on('drain', drainListener)
-      upstreamResponse.on('end', () => { if (finish() && !res.destroyed) res.end() })
-      upstreamResponse.on('error', () => { if (finish() && !res.destroyed) res.destroy() })
-    })
-    deadline = setTimeout(() => {
-      if (!finish()) return
-      upstream?.destroy(new Error('hosted-qwen-absolute-timeout'))
-      if (!res.destroyed) {
-        if (!res.headersSent) res.writeHead(502, { connection: 'close' }).end()
-        else res.destroy()
+    }
+    try {
+      upstream = await connectPinnedQwen(this.options.upstreamPort ?? 18993, this.timeoutMs)
+      if (!this.sameAdmission(admission, epoch, remote) || cancelled) { exchange.cancel(); return }
+      const frame = qwenHttpFrame(method as 'GET' | 'POST', target!, body)
+      if (frame.length > MAX_GATEWAY_REQUEST_BYTES + 256) throw new Error('hosted-qwen-frame-limit')
+      if (typeof admission === 'string') {
+        writePinnedQwen(upstream, frame)
+      } else {
+        await this.options.dispatchAuthority!.withCurrentMemberDecision(admission.member, 'observe', current => {
+          if (!this.sameAdmission(admission, epoch, remote) || !this.matchesCurrent(admission, current)) {
+            throw new Error('hosted-qwen-binding-not-current')
+          }
+          writePinnedQwen(upstream!, frame)
+        })
       }
-    }, this.timeoutMs)
+      if (!this.sameAdmission(admission, epoch, remote) || cancelled) { exchange.cancel(); return }
+    } catch {
+      upstream?.destroy()
+      if (finish() && !res.destroyed) res.writeHead(502, { connection: 'close' }).end()
+      return
+    }
+    const socket = upstream
+    const parser = new PinnedQwenResponseParser(this.maxResponseBytes)
+    const fail = () => {
+      if (!finish()) return
+      socket.destroy()
+      if (!res.destroyed) {
+        if (res.headersSent) res.destroy()
+        else res.writeHead(502, { connection: 'close' }).end()
+      }
+    }
+    deadline = setTimeout(fail, this.timeoutMs)
     deadline.unref()
-    upstream.on('timeout', () => {
-      if (!finish()) return
-      upstream?.destroy(new Error('hosted-qwen-upstream-timeout'))
-      if (!res.destroyed) {
-        if (!res.headersSent) res.writeHead(502, { connection: 'close' }).end()
-        else res.destroy()
-      }
+    socket.on('error', fail)
+    socket.on('close', () => {
+      if (finished) return
+      try { parser.ended() } catch { fail(); return }
+      void (async () => {
+        if (!await this.current(admission, epoch, remote)) { fail(); return }
+        if (finish() && !res.destroyed) res.end()
+      })()
     })
-    upstream.on('error', () => {
-      if (!finish()) return
-      if (!res.headersSent) res.writeHead(502, { connection: 'close' }).end(); else res.destroy()
+    socket.on('data', chunk => {
+      socket.pause()
+      void (async () => {
+        try {
+          const pieces = parser.feed(Buffer.from(chunk))
+          if (parser.headers && !res.headersSent) {
+            if (!await this.current(admission, epoch, remote) || finished || cancelled) { fail(); return }
+            res.writeHead(parser.headers.status, {
+              'content-type': parser.headers.contentType,
+              'cache-control': 'no-store',
+            })
+          }
+          for (const piece of pieces) {
+            if (!await this.current(admission, epoch, remote) || finished || cancelled) { fail(); return }
+            if (!res.write(piece)) await new Promise<void>(resolve => {
+              const done = () => { res.off('drain', done); res.off('close', done); resolve() }
+              res.once('drain', done)
+              res.once('close', done)
+            })
+            if (finished || cancelled) return
+          }
+          if (parser.done) {
+            if (!await this.current(admission, epoch, remote) || finished || cancelled) { fail(); return }
+            if (finish() && !res.destroyed) res.end()
+            socket.destroy()
+          } else socket.resume()
+        } catch { fail() }
+      })()
     })
-    upstream.end(Buffer.concat(chunks, bodyBytes))
   }
 }

@@ -3,6 +3,8 @@ import { createServer, request } from 'node:http'
 import { createConnection, type AddressInfo } from 'node:net'
 
 import { HostedQwenGateway } from './HostedQwenGateway.js'
+import type { HostedQwenAdmission, HostedQwenContainerBinding, HostedQwenGatewayDispatchAuthority } from './HostedQwenGateway.js'
+import type { HostedProductCurrentMember } from '../productAuthority/HostedProductCurrentMemberDecision.js'
 
 const close: Array<() => Promise<void>> = []
 afterEach(async () => { for (const stop of close.splice(0).reverse()) await stop() })
@@ -183,4 +185,173 @@ test('a disconnected held upstream expires and releases finite capacity', async 
   expect(closed).toBe(1)
   expect((await raw(port, 'GET', '/v1/models')).status).toBe(200)
   expect(calls).toBe(2)
+})
+
+const productAdmission: HostedQwenAdmission = {
+  member: {
+    runId: `run_${'a'.repeat(32)}`, memberId: `member_${'b'.repeat(32)}`,
+    teamId: 'team_12345678', laneId: 'lane_12345678', deploymentId: 'deployment_12345678',
+    runtimeWorkspaceId: 'workspace_12345678', planSha256: 'c'.repeat(64),
+    rosterBindingSha256: 'd'.repeat(64), restoreGeneration: 0, mountGeneration: 1,
+  },
+  container: { containerId: 'container-1', networkId: 'network-1', containerGeneration: 1,
+    containerIp: '127.0.0.1' },
+  model: 'qwen/qwen3-8b',
+}
+
+function fakeAuthority(): { authority: HostedQwenGatewayDispatchAuthority;
+  setModel(model: string): void; setContainer(container: HostedQwenContainerBinding): void } {
+  let model = productAdmission.model
+  let container = productAdmission.container
+  return {
+    authority: {
+      async withCurrentMemberDecision(_binding, _kind, callback) {
+        return callback({ ...productAdmission.member, model } as HostedProductCurrentMember)
+      },
+      currentContainer: () => container,
+    },
+    setModel: next => { model = next },
+    setContainer: next => { container = next },
+  }
+}
+
+test('Product admission denies changed container generation, IP, and model before upstream bytes', async () => {
+  let calls = 0
+  const upstream = createServer((_req, res) => { calls++; res.end('{}') })
+  await new Promise<void>(resolve => upstream.listen(0, '127.0.0.1', resolve))
+  close.push(() => new Promise(resolve => upstream.close(() => resolve())))
+  const fixture = fakeAuthority()
+  const port = await freePort()
+  const gateway = new HostedQwenGateway({ bindAddress: '127.0.0.1', port,
+    upstreamPort: (upstream.address() as AddressInfo).port, testOnlyAllowNonRoot: true,
+    dispatchAuthority: fixture.authority })
+  await gateway.start()
+  close.push(() => gateway.stop())
+  gateway.admitClient(productAdmission)
+  fixture.setContainer({ ...productAdmission.container, containerGeneration: 2 })
+  expect((await raw(port, 'GET', '/v1/models')).status).toBe(502)
+  fixture.setContainer({ ...productAdmission.container, containerIp: '127.0.0.2' })
+  expect((await raw(port, 'GET', '/v1/models')).status).toBe(502)
+  fixture.setContainer(productAdmission.container)
+  fixture.setModel('qwen/changed')
+  expect((await raw(port, 'POST', '/v1/chat/completions', '{"model":"qwen/qwen3-8b"}')).status).toBe(502)
+  expect(calls).toBe(0)
+  fixture.setModel(productAdmission.model)
+  expect((await raw(port, 'POST', '/v1/chat/completions', '{"model":"qwen/other"}')).status).toBe(403)
+  expect(calls).toBe(0)
+})
+
+test('Product revoke before body completion causes zero upstream requests', async () => {
+  let calls = 0
+  const upstream = createServer((_req, res) => { calls++; res.end('{}') })
+  await new Promise<void>(resolve => upstream.listen(0, '127.0.0.1', resolve))
+  close.push(() => new Promise(resolve => upstream.close(() => resolve())))
+  const port = await freePort()
+  const gateway = new HostedQwenGateway({ bindAddress: '127.0.0.1', port,
+    upstreamPort: (upstream.address() as AddressInfo).port, testOnlyAllowNonRoot: true,
+    dispatchAuthority: fakeAuthority().authority })
+  await gateway.start()
+  close.push(() => gateway.stop())
+  gateway.admitClient(productAdmission)
+  const client = request({ host: '127.0.0.1', port, method: 'POST', path: '/v1/chat/completions',
+    headers: { 'content-type': 'application/json', 'transfer-encoding': 'chunked' } })
+  client.on('error', () => undefined)
+  client.flushHeaders()
+  await new Promise<void>(resolve => client.write('{', () => resolve()))
+  gateway.revokeClient()
+  client.end('}')
+  await new Promise(resolve => setTimeout(resolve, 40))
+  expect(calls).toBe(0)
+})
+
+test('a revoker queued during the Product callback runs after the dispatch write', async () => {
+  const events: string[] = []
+  let calls = 0
+  const upstream = createServer((_req, res) => { calls++; res.end('{}') })
+  await new Promise<void>(resolve => upstream.listen(0, '127.0.0.1', resolve))
+  close.push(() => new Promise(resolve => upstream.close(() => resolve())))
+  let gateway: HostedQwenGateway
+  const authority: HostedQwenGatewayDispatchAuthority = {
+    async withCurrentMemberDecision(_binding, _kind, callback) {
+      events.push('decision-enter')
+      if (events.filter(event => event === 'decision-enter').length === 1) {
+        queueMicrotask(() => { events.push('revoke'); gateway.revokeClient() })
+      }
+      const result = callback({ ...productAdmission.member, model: productAdmission.model } as HostedProductCurrentMember)
+      events.push('decision-exit')
+      return result
+    },
+    currentContainer: () => productAdmission.container,
+  }
+  const port = await freePort()
+  gateway = new HostedQwenGateway({ bindAddress: '127.0.0.1', port,
+    upstreamPort: (upstream.address() as AddressInfo).port, testOnlyAllowNonRoot: true,
+    dispatchAuthority: authority })
+  await gateway.start()
+  close.push(() => gateway.stop())
+  gateway.admitClient(productAdmission)
+  await raw(port, 'GET', '/v1/models').catch(() => undefined)
+  expect(events).toEqual(['decision-enter', 'decision-exit', 'revoke'])
+  expect(calls).toBe(1)
+})
+
+test('late Product model change aborts held upstream response', async () => {
+  let started: (() => void) | null = null
+  let release: (() => void) | null = null
+  const began = new Promise<void>(resolve => { started = resolve })
+  const upstream = createServer((_req, res) => {
+    started?.()
+    release = () => res.end('{"ok":true}')
+  })
+  await new Promise<void>(resolve => upstream.listen(0, '127.0.0.1', resolve))
+  close.push(() => new Promise(resolve => { upstream.closeAllConnections(); upstream.close(() => resolve()) }))
+  const fixture = fakeAuthority()
+  const port = await freePort()
+  const gateway = new HostedQwenGateway({ bindAddress: '127.0.0.1', port,
+    upstreamPort: (upstream.address() as AddressInfo).port, testOnlyAllowNonRoot: true,
+    dispatchAuthority: fixture.authority })
+  await gateway.start()
+  close.push(() => gateway.stop())
+  gateway.admitClient(productAdmission)
+  const response = raw(port, 'GET', '/v1/models')
+  await began
+  fixture.setModel('qwen/changed')
+  release?.()
+  expect((await response).status).toBe(502)
+})
+
+test('streaming stops before forwarding a chunk after Product revocation', async () => {
+  let release: (() => void) | null = null
+  const upstream = createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' })
+    res.write('first')
+    release = () => res.end('second')
+  })
+  await new Promise<void>(resolve => upstream.listen(0, '127.0.0.1', resolve))
+  close.push(() => new Promise(resolve => { upstream.closeAllConnections(); upstream.close(() => resolve()) }))
+  const fixture = fakeAuthority()
+  const port = await freePort()
+  const gateway = new HostedQwenGateway({ bindAddress: '127.0.0.1', port,
+    upstreamPort: (upstream.address() as AddressInfo).port, testOnlyAllowNonRoot: true,
+    dispatchAuthority: fixture.authority })
+  await gateway.start()
+  close.push(() => gateway.stop())
+  gateway.admitClient(productAdmission)
+  const received = await new Promise<string>(resolve => {
+    const client = request({ host: '127.0.0.1', port, path: '/v1/models' }, res => {
+      let text = ''
+      res.on('data', (chunk: Buffer) => {
+        text += chunk.toString()
+        if (text.startsWith('first')) {
+          fixture.setModel('qwen/revoked')
+          release?.()
+        }
+      })
+      res.on('close', () => resolve(text))
+    })
+    client.on('error', () => resolve(''))
+    client.end()
+  })
+  expect(received.startsWith('first')).toBe(true)
+  expect(received).not.toContain('second')
 })
