@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { lstat, mkdir, mkdtemp, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { getAgentStatuses, getTask, listTasks } from '../../utils/tasks.js'
@@ -324,10 +325,10 @@ describe('HostedTaskMutationService', () => {
     const created = await runCommand(service, authority, { schemaVersion: 1, kind: 'create_task', commandId: 'command_config_owner', idempotencyKey: 'config-owner', teamId, expectedSourceGeneration: 'generation_stale', expectedRevision: 'revision_stale', subject: 'Owned', description: null, status: 'pending', ownerId: memberId, column: 'todo', order: 0 })
     expect(created.result.kind).toBe('committed'); if (created.result.kind !== 'committed') return
     const createdRawId = `hosted-${createHash('sha256').update(JSON.stringify({ commandId: 'command_config_owner' })).digest('hex').slice(0, 40)}`; const createdPath = join(root, 'tasks', 'legacy', `${createdRawId}.json`)
-    expect(JSON.parse(await readFile(createdPath, 'utf8')).owner).toBe(memberId)
+    expect(JSON.parse(await readFile(createdPath, 'utf8')).owner).toBe(memberName)
     await writeFile(join(root, 'teams', 'legacy', 'members.meta.json'), JSON.stringify({ version: 1, members: [{ name: 'canonical', memberId: explicitId }] }))
     const explicit = await runCommand(service, authority, { schemaVersion: 1, kind: 'update_owner', commandId: 'command_explicit_owner', idempotencyKey: 'explicit-owner', teamId, expectedSourceGeneration: created.command.expectedSourceGeneration, expectedRevision: 'revision_stale', taskId: created.result.receipt.affectedTaskIds[0]!, ownerId: explicitId })
-    expect(explicit.result.kind).toBe('committed'); expect(JSON.parse(await readFile(createdPath, 'utf8')).owner).toBe(explicitId)
+    expect(explicit.result.kind).toBe('committed'); expect(JSON.parse(await readFile(createdPath, 'utf8')).owner).toBe('canonical')
     await writeFile(join(root, 'teams', 'legacy', 'members.meta.json'), JSON.stringify({ version: 1, members: [] }))
     const ignoredConfig = await runCommand(service, authority, { schemaVersion: 1, kind: 'update_owner', commandId: 'command_ignored_config', idempotencyKey: 'ignored-config', teamId, expectedSourceGeneration: created.command.expectedSourceGeneration, expectedRevision: 'revision_stale', taskId: created.result.receipt.affectedTaskIds[0]!, ownerId: memberId })
     expect(ignoredConfig.result.kind).toBe('conflict')
@@ -335,11 +336,11 @@ describe('HostedTaskMutationService', () => {
     const joinedId = `member_${createHash('sha256').update(JSON.stringify({ domain: 'hosted-task-board-member/v1', teamId, rawMemberName: joinedIdentity })).digest('hex').slice(0, 32)}`
     await writeFile(join(root, 'teams', 'legacy', 'members.meta.json'), JSON.stringify({ version: 1, members: [{ name: 'joined', joinedAt: 0 }] }))
     const joined = await runCommand(service, authority, { schemaVersion: 1, kind: 'update_owner', commandId: 'command_joined_owner', idempotencyKey: 'joined-owner', teamId, expectedSourceGeneration: created.command.expectedSourceGeneration, expectedRevision: 'revision_stale', taskId: created.result.receipt.affectedTaskIds[0]!, ownerId: joinedId })
-    expect(joined.result.kind).toBe('committed'); expect(JSON.parse(await readFile(createdPath, 'utf8')).owner).toBe(joinedId)
+    expect(joined.result.kind).toBe('committed'); expect(JSON.parse(await readFile(createdPath, 'utf8')).owner).toBe('joined')
     const agentId = `member_${createHash('sha256').update(JSON.stringify({ domain: 'hosted-task-board-member/v1', teamId, rawMemberName: 'agent-immutable' })).digest('hex').slice(0, 32)}`
     await writeFile(join(root, 'teams', 'legacy', 'members.meta.json'), JSON.stringify({ version: 1, members: [{ name: 'agent-backed', agentId: 'agent-immutable' }] }))
     const agent = await runCommand(service, authority, { schemaVersion: 1, kind: 'update_owner', commandId: 'command_agent_owner', idempotencyKey: 'agent-owner', teamId, expectedSourceGeneration: created.command.expectedSourceGeneration, expectedRevision: 'revision_stale', taskId: created.result.receipt.affectedTaskIds[0]!, ownerId: agentId })
-    expect(agent.result.kind).toBe('committed'); expect(JSON.parse(await readFile(createdPath, 'utf8')).owner).toBe(agentId)
+    expect(agent.result.kind).toBe('committed'); expect(JSON.parse(await readFile(createdPath, 'utf8')).owner).toBe('agent-backed')
     await writeFile(join(root, 'teams', 'legacy', 'members.meta.json'), JSON.stringify({ version: 1, members: [{ name: 'canonical', memberId: explicitId, removedAt: 0 }] }))
     const cleared = await runCommand(service, authority, { schemaVersion: 1, kind: 'update_owner', commandId: 'command_clear_owner', idempotencyKey: 'clear-owner', teamId, expectedSourceGeneration: created.command.expectedSourceGeneration, expectedRevision: 'revision_stale', taskId: created.result.receipt.affectedTaskIds[0]!, ownerId: null })
     expect(cleared.result.kind).toBe('committed'); expect(Object.hasOwn(JSON.parse(await readFile(createdPath, 'utf8')), 'owner')).toBe(false)
@@ -348,9 +349,47 @@ describe('HostedTaskMutationService', () => {
     const replacementId = `member_${createHash('sha256').update(JSON.stringify({ domain: 'hosted-task-board-member/v1', teamId, rawMemberName: `canonical\0${2}` })).digest('hex').slice(0, 32)}`
     await writeFile(join(root, 'teams', 'legacy', 'members.meta.json'), JSON.stringify({ version: 1, members: [{ name: 'canonical', memberId: explicitId, joinedAt: 1, removedAt: 2 }, { name: 'canonical', memberId: replacementId, joinedAt: 2 }] }))
     const replacement = await runCommand(service, authority, { schemaVersion: 1, kind: 'update_owner', commandId: 'command_replacement_owner', idempotencyKey: 'replacement-owner', teamId, expectedSourceGeneration: created.command.expectedSourceGeneration, expectedRevision: 'revision_stale', taskId: created.result.receipt.affectedTaskIds[0]!, ownerId: replacementId })
-    expect(replacement.result.kind).toBe('committed'); expect(JSON.parse(await readFile(createdPath, 'utf8')).owner).toBe(replacementId)
+    expect(replacement.result.kind).toBe('committed'); expect(JSON.parse(await readFile(createdPath, 'utf8')).owner).toBe('canonical')
     const oldOwner = await runCommand(service, authority, { schemaVersion: 1, kind: 'update_owner', commandId: 'command_old_owner', idempotencyKey: 'old-owner', teamId, expectedSourceGeneration: created.command.expectedSourceGeneration, expectedRevision: 'revision_stale', taskId: created.result.receipt.affectedTaskIds[0]!, ownerId: explicitId })
-    expect(oldOwner.result.kind).toBe('conflict'); expect(JSON.parse(await readFile(createdPath, 'utf8')).owner).toBe(replacementId)
+    expect(oldOwner.result.kind).toBe('conflict'); expect(JSON.parse(await readFile(createdPath, 'utf8')).owner).toBe('canonical')
+  })
+
+  test('assigns tasks by member name so the MCP controller lets that member start them', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'hosted-service-owner-name-')); roots.push(root)
+    await mkdir(join(root, 'teams', 'legacy'), { recursive: true }); await mkdir(join(root, 'tasks', 'legacy'), { recursive: true })
+    const teamId = `team_${'5'.repeat(32)}`; const authority = authorityFor(teamId)
+    const idFor = (identity: string) => `member_${createHash('sha256').update(JSON.stringify({ domain: 'hosted-task-board-member/v1', teamId, rawMemberName: identity })).digest('hex').slice(0, 32)}`
+    await writeFile(join(root, 'teams', 'legacy', 'config.json'), JSON.stringify({ name: 'legacy', members: [
+      { name: 'team-lead', agentType: 'team-lead', joinedAt: 1 }, { name: 'worker', joinedAt: 2 },
+    ] }))
+    const workerId = idFor('worker\u00002'); const leadId = idFor('team-lead\u00001')
+    const { isSameTaskMember } = createRequire(import.meta.url)('./fixtures/agentTeamsController/taskOwnership.cjs') as { isSameTaskMember(left: unknown, right: unknown, lead: unknown): boolean }
+    const service = new HostedTaskMutationService({ claudeRoot: root, legacyKey: 'legacy', authority, wal: new HostedTaskMutationWal(join(root, 'teams', 'legacy'), teamId) })
+    const created = await runCommand(service, authority, { schemaVersion: 1, kind: 'create_task', commandId: 'command_named_owner', idempotencyKey: 'named-owner', teamId, expectedSourceGeneration: 'generation_stale', expectedRevision: 'revision_stale', subject: 'Named', description: null, status: 'pending', ownerId: null, column: 'todo', order: 0 })
+    if (created.result.kind !== 'committed') throw new Error('expected committed create')
+    const taskId = created.result.receipt.affectedTaskIds[0]!
+    const rawId = `hosted-${createHash('sha256').update(JSON.stringify({ commandId: 'command_named_owner' })).digest('hex').slice(0, 40)}`
+    const taskPath = join(root, 'tasks', 'legacy', `${rawId}.json`)
+
+    // The browser assigns by memberId; the task file names the member, as on desktop.
+    const assigned = await runCommand(service, authority, { schemaVersion: 1, kind: 'update_owner', commandId: 'command_named_assign', idempotencyKey: 'named-assign', teamId, expectedSourceGeneration: created.command.expectedSourceGeneration, expectedRevision: 'revision_stale', taskId, ownerId: workerId })
+    expect(assigned.result.kind).toBe('committed')
+    const owner = JSON.parse(await readFile(taskPath, 'utf8')).owner
+    expect(owner).toBe('worker')
+    expect(isSameTaskMember(owner, 'worker', 'team-lead')).toBe(true)
+    expect(isSameTaskMember(owner, 'team-lead', 'team-lead')).toBe(false)
+    expect(await service.readTaskForMember({ teamId, taskId, memberId: workerId })).toMatchObject({ ownerId: workerId, task: { owner: 'worker' } })
+    expect(await service.readTaskForMember({ teamId, taskId, memberId: leadId })).toBeNull()
+
+    // A document an earlier Owner wrote with the memberId still reads for that member.
+    await writeFile(taskPath, JSON.stringify({ ...JSON.parse(await readFile(taskPath, 'utf8')), owner: workerId }))
+    expect(await service.readTaskForMember({ teamId, taskId, memberId: workerId })).toMatchObject({ ownerId: workerId })
+
+    const reassigned = await runCommand(service, authority, { schemaVersion: 1, kind: 'update_owner', commandId: 'command_named_lead', idempotencyKey: 'named-lead', teamId, expectedSourceGeneration: created.command.expectedSourceGeneration, expectedRevision: 'revision_stale', taskId, ownerId: leadId })
+    expect(reassigned.result.kind).toBe('committed')
+    expect(JSON.parse(await readFile(taskPath, 'utf8')).owner).toBe('team-lead')
+    const unknown = await runCommand(service, authority, { schemaVersion: 1, kind: 'update_owner', commandId: 'command_named_unknown', idempotencyKey: 'named-unknown', teamId, expectedSourceGeneration: created.command.expectedSourceGeneration, expectedRevision: 'revision_stale', taskId, ownerId: `member_${'0'.repeat(32)}` })
+    expect(unknown.result.kind).toBe('conflict')
   })
 
   test('lets the team lead own tasks like any runtime member', async () => {
@@ -365,10 +404,10 @@ describe('HostedTaskMutationService', () => {
     const created = await runCommand(service, authority, { schemaVersion: 1, kind: 'create_task', commandId: 'command_lead_owner', idempotencyKey: 'lead-owner', teamId, expectedSourceGeneration: 'generation_stale', expectedRevision: 'revision_stale', subject: 'Lead task', description: null, status: 'pending', ownerId: leadId, column: 'todo', order: 0 })
     expect(created.result.kind).toBe('committed'); if (created.result.kind !== 'committed') return
     const rawId = `hosted-${createHash('sha256').update(JSON.stringify({ commandId: 'command_lead_owner' })).digest('hex').slice(0, 40)}`
-    expect(JSON.parse(await readFile(join(root, 'tasks', 'legacy', `${rawId}.json`), 'utf8')).owner).toBe(leadId)
+    expect(JSON.parse(await readFile(join(root, 'tasks', 'legacy', `${rawId}.json`), 'utf8')).owner).toBe('team-lead')
   })
 
-  test('persists immutable member owners while legacy readers and recovery preserve the exact postimage', async () => {
+  test('persists member-name owners while legacy readers and recovery preserve the exact postimage', async () => {
     const root = await mkdtemp(join(tmpdir(), 'hosted-service-owner-compatibility-')); roots.push(root)
     await mkdir(join(root, 'teams', 'legacy'), { recursive: true }); await mkdir(join(root, 'tasks', 'legacy'), { recursive: true })
     const teamId = `team_${'6'.repeat(32)}`; const authority = authorityFor(teamId); const agentId = 'agent-worker'; const memberName = 'worker'
@@ -380,11 +419,11 @@ describe('HostedTaskMutationService', () => {
     const prepared = await runCommand(crashing, authority, { schemaVersion: 1, kind: 'create_task', commandId: 'command_owner_compatibility', idempotencyKey: 'owner-compatibility', teamId, expectedSourceGeneration: 'generation_stale', expectedRevision: 'revision_stale', subject: 'Owned task', description: null, status: 'pending', ownerId: memberId, column: 'todo', order: 0 })
     expect(prepared.result.kind).toBe('unavailable')
     const rawId = `hosted-${createHash('sha256').update(JSON.stringify({ commandId: 'command_owner_compatibility' })).digest('hex').slice(0, 40)}`
-    expect(JSON.parse(await readFile(join(root, 'tasks', 'legacy', `${rawId}.json`), 'utf8')).owner).toBe(memberId)
+    expect(JSON.parse(await readFile(join(root, 'tasks', 'legacy', `${rawId}.json`), 'utf8')).owner).toBe(memberName)
     const scope = { teamId, sourceGeneration: prepared.command.expectedSourceGeneration, idempotencyKey: prepared.command.idempotencyKey }
     const ambiguous = await wal.lookup(scope); expect(ambiguous.kind).toBe('ambiguous'); if (ambiguous.kind !== 'ambiguous') return
     const taskWrite = ambiguous.intent.writes.find(write => write.target === `task:${rawId}.json`); expect(taskWrite).toBeDefined()
-    expect(JSON.parse(Buffer.from(taskWrite!.after.contentBase64!, 'base64').toString('utf8')).owner).toBe(memberId)
+    expect(JSON.parse(Buffer.from(taskWrite!.after.contentBase64!, 'base64').toString('utf8')).owner).toBe(memberName)
     const service = new HostedTaskMutationService({ claudeRoot: root, legacyKey: 'legacy', authority, wal })
     expect(await service.recover()).toBe(true)
     const replay = await service.mutate(requestFor(authority, prepared.command)); expect(replay.kind).toBe('idempotent_replay')
@@ -396,8 +435,8 @@ describe('HostedTaskMutationService', () => {
 
     const previousConfigDir = process.env.CLAUDE_CONFIG_DIR; process.env.CLAUDE_CONFIG_DIR = root
     try {
-      expect((await getTask('legacy', rawId))?.owner).toBe(memberId)
-      expect((await listTasks('legacy')).find(task => task.id === rawId)?.owner).toBe(memberId)
+      expect((await getTask('legacy', rawId))?.owner).toBe(memberName)
+      expect((await listTasks('legacy')).find(task => task.id === rawId)?.owner).toBe(memberName)
       expect(await getAgentStatuses('legacy')).toEqual([{ agentId, name: memberName, agentType: undefined, status: 'busy', currentTasks: [rawId] }])
     } finally {
       if (previousConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR

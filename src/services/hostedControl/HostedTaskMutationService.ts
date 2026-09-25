@@ -53,18 +53,19 @@ export class HostedTaskMutationService {
     try {
       return await withTaskMutationCoordination(this.options.legacyKey, async () => {
         if (!(await this.#validateOwner()) || (await this.options.wal.listAmbiguous()).length !== 0) return null
-        const members = await this.#activeMembers()
-        if (members.get(input.memberId) !== input.memberId) return null
+        const memberName = (await this.#activeMembers()).get(input.memberId)
+        if (memberName === undefined) return null
         const state = await this.#readBoardState(await this.#readSourceState())
         const record = state.tasks.get(input.taskId)
-        if (!record || record.value.owner !== input.memberId ||
+        // Earlier Owner writers stored the memberId; keep reading those documents.
+        if (!record || (record.value.owner !== memberName && record.value.owner !== input.memberId) ||
           !TASK_STATUSES.includes(record.value.status as typeof TASK_STATUSES[number])) return null
         const revision = await this.#revision(state.sourceGeneration, state.allTaskTexts, state.kanbanText, state.roster)
         const final = await this.#readBoardState(await this.#readSourceState())
         if (final.sourceGeneration !== state.sourceGeneration ||
           (await this.#revision(final.sourceGeneration, final.allTaskTexts, final.kanbanText, final.roster)) !== revision ||
           final.tasks.get(input.taskId)?.text !== record.text ||
-          (await this.#activeMembers()).get(input.memberId) !== input.memberId ||
+          (await this.#activeMembers()).get(input.memberId) !== memberName ||
           !(await this.#validateOwner())) return null
         return { teamId: input.teamId, taskId: input.taskId, ownerId: input.memberId,
           status: record.value.status as 'pending' | 'in_progress' | 'completed',
@@ -331,9 +332,10 @@ export class HostedTaskMutationService {
       if (member.removedAt === undefined) {
         activeNames.add(nameKey)
         if (result.has(id)) throw new Error('Ambiguous hosted roster member id')
-        // The task document owner is the immutable hosted identity. A display-name
-        // postimage would let a same-name replacement inherit the prior owner's work.
-        result.set(id, id)
+        // Task documents name their owner by member name, as on desktop: agents' MCP controller
+        // and the lead address members by name. Only active members resolve, and active names are
+        // unique, so the wire memberId maps to exactly one current name.
+        result.set(id, name)
       }
     }
     return result
