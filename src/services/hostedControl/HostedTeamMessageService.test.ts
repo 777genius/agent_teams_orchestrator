@@ -185,4 +185,30 @@ describe('HostedTeamMessageService', () => {
       authority,
     })).resolves.toEqual({ schemaVersion: 2, kind: 'unavailable', retryAfterMs: 250 })
   })
+
+  test('admits a teammate recipient only from the current roster and fails closed without one', async () => {
+    const payload = { ...command, recipient: 'alice' }
+    const persisted: unknown[] = []
+    const f = fixture({ persist: async input => { persisted.push(input); return { kind: 'persisted', receipt } } })
+    const roster = { isActiveRecipient: async (name: string) => name === 'alice' }
+    const service = new HostedTeamMessageService(f.persistence, f.delivery, { isCurrent: () => true }, roster)
+
+    await expect(service.dispatch({
+      operation: 'message_persist', payload: { ...command, recipient: 'mallory' }, authority,
+    })).resolves.toEqual({ schemaVersion: 2, kind: 'invalid_recipient' })
+    expect(persisted).toEqual([])
+    await expect(service.dispatch({ operation: 'message_persist', payload, authority }))
+      .resolves.toMatchObject({ schemaVersion: 2, kind: 'persisted' })
+    expect(persisted).toEqual([payload])
+
+    for (const recipient of ['team-lead', 'user', '../alice', '']) {
+      await expect(service.dispatch({
+        operation: 'message_persist', payload: { ...command, recipient }, authority,
+      })).rejects.toThrow('Invalid hosted message recipient')
+    }
+    const withoutRoster = new HostedTeamMessageService(f.persistence, f.delivery, { isCurrent: () => true })
+    await expect(withoutRoster.dispatch({ operation: 'message_persist', payload, authority }))
+      .resolves.toEqual({ schemaVersion: 2, kind: 'unavailable', retryAfterMs: null })
+    expect(persisted).toEqual([payload])
+  })
 })

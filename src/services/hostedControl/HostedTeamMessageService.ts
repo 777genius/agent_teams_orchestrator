@@ -1,15 +1,27 @@
 import type { HostedControlAuthority } from './protocol.js'
 import type { HostedTeamMessageOperation, HostedTeamMessagePort } from './HostedControlDispatcher.js'
+import {
+  isHostedMessageRecipientName,
+  type HostedMessageRecipientRoster,
+} from './HostedTeamRecipientRoster.js'
 
-type PersistCommand = { schemaVersion: 1; teamId: string; clientMessageId: string; text: string }
+/** An absent recipient addresses the team lead, exactly as before recipients existed. */
+type PersistCommand = {
+  schemaVersion: 1
+  teamId: string
+  clientMessageId: string
+  text: string
+  recipient?: string
+}
 type DeliveryRequest = { teamId: string; messageId: string; clientMessageId: string; text: string }
-export type HostedPersistedMessage = DeliveryRequest & { createdAt: string }
+export type HostedPersistedMessage = DeliveryRequest & { createdAt: string; recipient?: string }
 type PersistenceReceipt = {
   schemaVersion: 1
   teamId: string
   messageId: string
   clientMessageId: string
   persistence: 'durable'
+  recipient?: string
 }
 
 export type HostedMessagePersistenceDecision =
@@ -44,6 +56,8 @@ export class HostedTeamMessageService implements HostedTeamMessagePort {
     private readonly persistence: HostedMessageDurablePersistencePort,
     private readonly delivery: HostedMessageDeliveryEffectPort,
     private readonly guard: HostedMessageAuthorityGuard,
+    /** Without a roster only lead messages are admitted. */
+    private readonly recipients: HostedMessageRecipientRoster | null = null,
   ) {
     if (typeof persistence.persist !== 'function' || typeof persistence.find !== 'function') {
       throw new TypeError('Hosted durable message persistence is not installed')
@@ -61,6 +75,17 @@ export class HostedTeamMessageService implements HostedTeamMessagePort {
     if (!(await this.guard.isCurrent(input.authority))) return unavailable()
     if (input.operation === 'message_persist') {
       const command = persistCommand(input.payload, input.authority)
+      if (command.recipient !== undefined) {
+        if (!this.recipients) return unavailable()
+        let admitted: boolean
+        try {
+          admitted = await this.recipients.isActiveRecipient(command.recipient)
+        } catch {
+          return unavailable()
+        }
+        if (!(await this.guard.isCurrent(input.authority))) return unavailable()
+        if (!admitted) return { schemaVersion: 2, kind: 'invalid_recipient' }
+      }
       const decision = await this.persistence.persist(command, input.authority)
       if (!(await this.guard.isCurrent(input.authority))) return unavailable()
       return persistencePayload(decision)
@@ -89,13 +114,19 @@ export class FailClosedHostedMessageDelivery implements HostedMessageDeliveryEff
 }
 
 function persistCommand(value: unknown, authority: HostedControlAuthority): PersistCommand {
-  const record = exactRecord(value, ['schemaVersion', 'teamId', 'clientMessageId', 'text'], 'persist payload')
+  const keys = ['schemaVersion', 'teamId', 'clientMessageId', 'text']
+  const hasRecipient = !!value && typeof value === 'object' && Object.hasOwn(value, 'recipient')
+  const record = exactRecord(value, hasRecipient ? [...keys, 'recipient'] : keys, 'persist payload')
   if (record.schemaVersion !== 1 || record.teamId !== authority.teamId) throw new TypeError('Invalid hosted message team')
+  if (hasRecipient && !isHostedMessageRecipientName(record.recipient)) {
+    throw new TypeError('Invalid hosted message recipient')
+  }
   return {
     schemaVersion: 1,
     teamId: authority.teamId,
     clientMessageId: pattern(record.clientMessageId, /^client_message_[A-Za-z0-9][A-Za-z0-9._-]{7,127}$/, 'clientMessageId'),
     text: messageText(record.text),
+    ...(hasRecipient ? { recipient: record.recipient as string } : {}),
   }
 }
 

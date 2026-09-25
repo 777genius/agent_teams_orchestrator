@@ -14,6 +14,7 @@ import {
   type HostedMessageAuthorityGuard,
   type HostedMessageDeliveryEffectPort,
 } from './HostedTeamMessageService.js'
+import type { HostedMessageRecipientRoster } from './HostedTeamRecipientRoster.js'
 
 export type HostedControlEffectServicesOptions = {
   messageDirectory: string
@@ -23,6 +24,8 @@ export type HostedControlEffectServicesOptions = {
   lifecycleEffects?: HostedLifecycleAuthorityEffectPort
   planAdmission?: HostedLifecyclePlanAdmissionPort
   messageDelivery?: HostedMessageDeliveryEffectPort
+  /** Admits teammate recipients; without it only lead messages are persisted. */
+  messageRecipients?: HostedMessageRecipientRoster
 }
 
 /** Creates the two concrete effect-backed ports consumed by HostedControlRuntime. */
@@ -36,6 +39,7 @@ export function createHostedControlEffectServices(options: HostedControlEffectSe
   return {
     lifecycle: new HostedLifecycleCommandService(lifecycleEffects, options.lifecycleGuard, Date.now,
       options.planAdmission),
-    messages: new HostedTeamMessageService(messagePersistence, messageDelivery, options.messageGuard),
+    messages: new HostedTeamMessageService(messagePersistence, messageDelivery, options.messageGuard,
+      options.messageRecipients ?? null),
   }
 }

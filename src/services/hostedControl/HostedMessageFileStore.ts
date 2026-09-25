@@ -5,6 +5,7 @@ import { isDeepStrictEqual } from 'node:util'
 import * as lockfile from '../../utils/lockfile.js'
 import { writeFileAtomic } from '../../utils/atomicWrite.js'
 import { fsyncFileAndParent } from './HostedTaskMutationWal.js'
+import { isHostedMessageRecipientName } from './HostedTeamRecipientRoster.js'
 import type { HostedControlAuthority } from './protocol.js'
 import type {
   HostedMessageDurablePersistencePort,
@@ -24,6 +25,7 @@ type PersistCommand = {
   teamId: string
   clientMessageId: string
   text: string
+  recipient?: string
 }
 type DeliveryRequest = {
   teamId: string
@@ -37,6 +39,7 @@ type PersistenceReceipt = {
   messageId: string
   clientMessageId: string
   persistence: 'durable'
+  recipient?: string
 }
 type StoredRecord = {
   schemaVersion: 1
@@ -77,7 +80,8 @@ export class HostedMessageFileStore implements HostedMessageDurablePersistencePo
       if (existing) {
         if (!isDeepStrictEqual(existing.scope, scope) ||
           existing.message.clientMessageId !== command.clientMessageId ||
-          existing.message.teamId !== command.teamId || existing.message.text !== command.text) {
+          existing.message.teamId !== command.teamId || existing.message.text !== command.text ||
+          existing.message.recipient !== command.recipient) {
           return { kind: 'conflict', reason: 'idempotency_mismatch' }
         }
         return { kind: 'idempotent_replay', receipt: existing.receipt }
@@ -86,12 +90,15 @@ export class HostedMessageFileStore implements HostedMessageDurablePersistencePo
       const messageId = this.createMessageId()
       if (!/^message_[0-9a-f]{32}$/.test(messageId)) throw new Error('Invalid generated hosted message id')
       const createdAt = this.now().toISOString()
+      // Lead records keep their original shape: no recipient key at all.
+      const recipient = command.recipient === undefined ? {} : { recipient: command.recipient }
       const message: HostedPersistedMessage = {
         teamId: command.teamId,
         messageId,
         clientMessageId: command.clientMessageId,
         text: command.text,
         createdAt,
+        ...recipient,
       }
       const receipt: PersistenceReceipt = {
         schemaVersion: 1,
@@ -99,6 +106,7 @@ export class HostedMessageFileStore implements HostedMessageDurablePersistencePo
         messageId,
         clientMessageId: command.clientMessageId,
         persistence: 'durable',
+        ...recipient,
       }
       const record: StoredRecord = { schemaVersion: 1, scope, message, receipt }
       await writeFileAtomic(path, `${JSON.stringify(record)}\n`, { mode: 0o600 })
@@ -220,16 +228,22 @@ function decodeRecord(value: unknown, teamId: string): StoredRecord {
   if (scope.actorId.length === 0 || scope.deploymentId.length === 0 || scope.bootId.length === 0 || scope.workspaceId.length === 0 || scope.teamId !== teamId) {
     throw new Error('Invalid hosted message record scope')
   }
+  const hasRecipient = isRecordWithKey(record.message, 'recipient')
+  const optionalRecipient = hasRecipient ? ['recipient'] : []
   const messageRecord = exactRecord(
     record.message,
-    ['teamId', 'messageId', 'clientMessageId', 'text', 'createdAt'],
+    ['teamId', 'messageId', 'clientMessageId', 'text', 'createdAt', ...optionalRecipient],
     'message',
   )
   const receiptRecord = exactRecord(
     record.receipt,
-    ['schemaVersion', 'teamId', 'messageId', 'clientMessageId', 'persistence'],
+    ['schemaVersion', 'teamId', 'messageId', 'clientMessageId', 'persistence', ...optionalRecipient],
     'receipt',
   )
+  if (hasRecipient && !isHostedMessageRecipientName(messageRecord.recipient)) {
+    throw new Error('Invalid hosted message recipient')
+  }
+  const recipient = hasRecipient ? { recipient: messageRecord.recipient as string } : {}
   const message: HostedPersistedMessage = {
     teamId: exactString(messageRecord.teamId, /^team_[0-9a-f]{32}$/, 'teamId'),
     messageId: exactString(messageRecord.messageId, /^message_[0-9a-f]{32}$/, 'messageId'),
@@ -240,6 +254,7 @@ function decodeRecord(value: unknown, teamId: string): StoredRecord {
     ),
     text: exactString(messageRecord.text, undefined, 'text'),
     createdAt: exactString(messageRecord.createdAt, undefined, 'createdAt'),
+    ...recipient,
   }
   if (message.teamId !== teamId || message.text.length < 1 || message.text.length > 4_000 ||
     !Number.isFinite(Date.parse(message.createdAt))) throw new Error('Invalid hosted message record value')
@@ -255,6 +270,7 @@ function decodeRecord(value: unknown, teamId: string): StoredRecord {
     persistence: receiptRecord.persistence === 'durable'
       ? 'durable'
       : (() => { throw new Error('Invalid hosted message persistence') })(),
+    ...(hasRecipient ? { recipient: exactString(receiptRecord.recipient, undefined, 'receipt.recipient') } : {}),
   }
   if (!isDeepStrictEqual(receipt, {
     schemaVersion: 1,
@@ -262,8 +278,13 @@ function decodeRecord(value: unknown, teamId: string): StoredRecord {
     messageId: message.messageId,
     clientMessageId: message.clientMessageId,
     persistence: 'durable',
+    ...recipient,
   })) throw new Error('Hosted message receipt mismatch')
   return { schemaVersion: 1, scope, message, receipt }
+}
+
+function isRecordWithKey(value: unknown, key: string): boolean {
+  return !!value && typeof value === 'object' && !Array.isArray(value) && Object.hasOwn(value, key)
 }
 
 function exactRecord(value: unknown, keys: string[], name: string): Record<string, unknown> {

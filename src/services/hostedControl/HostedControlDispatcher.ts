@@ -787,8 +787,11 @@ function decodeMessageResponsePayload(
   if (payload.kind === 'persisted' || payload.kind === 'idempotent_replay') {
     exactKeys(payload, ['schemaVersion', 'kind', 'receipt'], 'message persistence response')
     const receipt = record(payload.receipt, 'message persistence receipt')
-    exactKeys(receipt, ['schemaVersion', 'teamId', 'messageId', 'clientMessageId', 'persistence'], 'message persistence receipt')
+    const receiptKeys = ['schemaVersion', 'teamId', 'messageId', 'clientMessageId', 'persistence']
+    exactKeys(receipt, Object.hasOwn(request, 'recipient') ? [...receiptKeys, 'recipient'] : receiptKeys,
+      'message persistence receipt')
     if (receipt.schemaVersion !== 1 || receipt.persistence !== 'durable') throw new Error('Invalid message persistence receipt')
+    if (receipt.recipient !== request.recipient) throw new Error('Invalid message persistence recipient')
     nonEmptyString(receipt.teamId, 'receipt.teamId')
     patternString(receipt.messageId, /^message_[0-9a-f]{32}$/, 'receipt.messageId')
     patternString(receipt.clientMessageId, /^client_message_[A-Za-z0-9][A-Za-z0-9._-]{7,127}$/, 'receipt.clientMessageId')
@@ -804,6 +807,10 @@ function decodeMessageResponsePayload(
   }
   if (payload.kind === 'not_found') {
     exactKeys(payload, ['schemaVersion', 'kind'], 'message not found response')
+    return payload
+  }
+  if (payload.kind === 'invalid_recipient' && Object.hasOwn(request, 'recipient')) {
+    exactKeys(payload, ['schemaVersion', 'kind'], 'message invalid recipient response')
     return payload
   }
   throw new Error('Invalid message persistence response')

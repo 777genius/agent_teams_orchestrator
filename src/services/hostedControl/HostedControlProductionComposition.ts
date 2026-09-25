@@ -17,6 +17,7 @@ import type {
   InboxPumpDecision,
 } from './HostedTeamLeadInboxPump.js'
 import type { HostedPersistedMessage } from './HostedTeamMessageService.js'
+import { HostedTeamRecipientRoster } from './HostedTeamRecipientRoster.js'
 import type { HostedControlAuthority } from './protocol.js'
 import { HostedApprovalOwnerWal } from './HostedApprovalOwnerWal.js'
 import { HostedApprovalOwnerStore } from './HostedApprovalOwnerStore.js'
@@ -132,11 +133,13 @@ export function createHostedControlPortFactory(
     })
 
     const authorityGuard = { isCurrent: context.isCurrentAuthority }
+    const messageRecipients = new HostedTeamRecipientRoster(context.teamRoot)
     const messageDelivery = new HostedTeamLeadMessageDelivery({
       canonicalTeamRoot: context.teamRoot,
       legacyKey: context.legacyKey,
       authority: context.authority,
       guard: authorityGuard,
+      recipients: messageRecipients,
     })
     const inboxPump = effects.createInboxPump
       ? effects.createInboxPump({
@@ -158,14 +161,15 @@ export function createHostedControlPortFactory(
           deliver: async (message, authority) => {
             const decision = await messageDelivery.deliver(message, authority)
             if (decision.kind === 'delivered') {
-              // HostedTeamLeadMessageDelivery only ever delivers to the lead.
-              void inboxPump.wake({ recipient: TEAM_LEAD_NAME, message, authority })
+              // Wake the inbox the message was appended to: team-lead unless it names a teammate.
+              void inboxPump.wake({ recipient: message.recipient ?? TEAM_LEAD_NAME, message, authority })
                 .catch(() => undefined)
             }
             return decision
           },
         }
         : messageDelivery,
+      messageRecipients,
       lifecycleEffects: lifecycle.authority,
       planAdmission: {
         admitLaunchPlan: async input => {

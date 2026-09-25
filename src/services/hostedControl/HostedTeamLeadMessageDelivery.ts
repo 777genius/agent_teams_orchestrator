@@ -11,6 +11,7 @@ import {
 } from '../../utils/teammateMailbox.js'
 import { TEAM_LEAD_NAME } from '../../utils/swarm/constants.js'
 import { fsyncFileAndParent } from './HostedTaskMutationWal.js'
+import type { HostedMessageRecipientRoster } from './HostedTeamRecipientRoster.js'
 import type {
   HostedMessageAuthorityGuard,
   HostedMessageDeliveryEffectPort,
@@ -44,7 +45,7 @@ type DeliveryMarker = {
   legacyKey: string
   authority: HostedControlAuthority
   binding: DeliveryBinding
-  recipient: typeof TEAM_LEAD_NAME
+  recipient: string
   status: MarkerStatus
 }
 type MailboxWriter = (input: {
@@ -58,15 +59,22 @@ export type HostedTeamLeadMessageDeliveryOptions = {
   legacyKey: string
   authority: Readonly<HostedControlStableAuthority>
   guard: HostedMessageAuthorityGuard
+  /** Without a roster only lead messages are delivered. */
+  recipients?: HostedMessageRecipientRoster
   writeMailbox?: MailboxWriter
 }
 
-/** Owns the one production effect that appends hosted v1 messages to team-lead's inbox. */
+/**
+ * Owns the one production effect that appends a hosted v1 message to its
+ * recipient's inbox: team-lead when the message has no recipient, otherwise
+ * the named teammate, re-checked against the current roster.
+ */
 export class HostedTeamLeadMessageDelivery implements HostedMessageDeliveryEffectPort {
   readonly #root: string
   readonly #legacyKey: string
   readonly #authority: Readonly<HostedControlStableAuthority>
   readonly #guard: HostedMessageAuthorityGuard
+  readonly #recipients: HostedMessageRecipientRoster | null
   readonly #writeMailbox: MailboxWriter
   readonly #markerDirectory: string
   readonly #declaredLegacyRoot: string
@@ -92,6 +100,7 @@ export class HostedTeamLeadMessageDelivery implements HostedMessageDeliveryEffec
       mountBinding: Object.freeze({ ...options.authority.mountBinding }),
     })
     this.#guard = options.guard
+    this.#recipients = options.recipients ?? null
     this.#writeMailbox =
       options.writeMailbox ?? writeToMailboxAtCanonicalTeamRootVerified
     this.#markerDirectory = join(this.#root, MARKER_DIRECTORY)
@@ -133,7 +142,7 @@ export class HostedTeamLeadMessageDelivery implements HostedMessageDeliveryEffec
     }
     if (!(await this.#guard.isCurrent(authority)))
       return { kind: 'unavailable' }
-
+    const recipient = message.recipient ?? TEAM_LEAD_NAME
     const binding = deliveryBinding(message, authority)
     let intentPersisted = false
     try {
@@ -151,7 +160,10 @@ export class HostedTeamLeadMessageDelivery implements HostedMessageDeliveryEffec
           if (!isMarkerStatus(existing.status))
             return { kind: 'operator_required' }
           if (
-            !isDeepStrictEqual(existing, this.#marker(binding, existing.status))
+            !isDeepStrictEqual(
+              existing,
+              this.#marker(binding, recipient, existing.status),
+            )
           ) {
             return { kind: 'operator_required' }
           }
@@ -162,7 +174,16 @@ export class HostedTeamLeadMessageDelivery implements HostedMessageDeliveryEffec
             : { kind: 'operator_required' }
         }
 
-        await this.#writeMarker(path, this.#marker(binding, 'intent'))
+        // A teammate removed after persistence must not receive the message.
+        // Nothing is written yet, so both outcomes are side-effect free.
+        if (message.recipient !== undefined) {
+          const admitted = await this.#isActiveRecipient(message.recipient)
+          if (admitted !== true) return { kind: admitted }
+        }
+        await this.#writeMarker(
+          path,
+          this.#marker(binding, recipient, 'intent'),
+        )
         intentPersisted = true
         if (!(await this.#guard.isCurrent(authority)))
           return { kind: 'operator_required' }
@@ -170,7 +191,7 @@ export class HostedTeamLeadMessageDelivery implements HostedMessageDeliveryEffec
         try {
           write = await this.#writeMailbox({
             canonicalTeamRoot: this.#root,
-            recipientName: TEAM_LEAD_NAME,
+            recipientName: recipient,
             message: {
               messageId: message.messageId,
               from: 'user',
@@ -188,11 +209,14 @@ export class HostedTeamLeadMessageDelivery implements HostedMessageDeliveryEffec
         if (write.kind === 'conflict') {
           await this.#writeMarker(
             path,
-            this.#marker(binding, 'operator_required'),
+            this.#marker(binding, recipient, 'operator_required'),
           )
           return { kind: 'operator_required' }
         }
-        await this.#writeMarker(path, this.#marker(binding, 'delivered'))
+        await this.#writeMarker(
+          path,
+          this.#marker(binding, recipient, 'delivered'),
+        )
         if (!currentAfterEffect) return { kind: 'unavailable' }
         return { kind: 'delivered' }
       } finally {
@@ -202,6 +226,19 @@ export class HostedTeamLeadMessageDelivery implements HostedMessageDeliveryEffec
       return intentPersisted
         ? { kind: 'operator_required' }
         : { kind: 'unavailable' }
+    }
+  }
+
+  async #isActiveRecipient(
+    name: string,
+  ): Promise<true | 'operator_required' | 'unavailable'> {
+    if (!this.#recipients) return 'unavailable'
+    try {
+      return (await this.#recipients.isActiveRecipient(name))
+        ? true
+        : 'operator_required'
+    } catch {
+      return 'unavailable'
     }
   }
 
@@ -219,14 +256,18 @@ export class HostedTeamLeadMessageDelivery implements HostedMessageDeliveryEffec
     )
   }
 
-  #marker(binding: DeliveryBinding, status: MarkerStatus): DeliveryMarker {
+  #marker(
+    binding: DeliveryBinding,
+    recipient: string,
+    status: MarkerStatus,
+  ): DeliveryMarker {
     return {
       schemaVersion: 1,
       canonicalTeamRoot: this.#root,
       legacyKey: this.#legacyKey,
       authority: { actorId: binding.actorId, ...this.#authority },
       binding,
-      recipient: TEAM_LEAD_NAME,
+      recipient,
       status,
     }
   }

@@ -15,6 +15,7 @@ import { join } from 'node:path'
 
 import { writeToMailboxAtCanonicalTeamRootVerified } from '../../utils/teammateMailbox.js'
 import { HostedTeamLeadMessageDelivery } from './HostedTeamLeadMessageDelivery.js'
+import { HostedTeamRecipientRoster } from './HostedTeamRecipientRoster.js'
 import type { HostedPersistedMessage } from './HostedTeamMessageService.js'
 import type { HostedControlAuthority } from './protocol.js'
 
@@ -267,6 +268,37 @@ describe('HostedTeamLeadMessageDelivery', () => {
       await readFile(join(teamRoot, 'inboxes', 'team-lead.json'), 'utf8'),
     )
     expect(rows).toHaveLength(1)
+  })
+
+  test('appends a teammate DM to its own inbox and never to a removed teammate', async () => {
+    const teamRoot = await makeTeamRoot()
+    const writeRoster = (members: unknown[]) =>
+      writeFile(join(teamRoot, 'config.json'), JSON.stringify({ name: 'legacy', members }), { mode: 0o600 })
+    await writeRoster([{ name: 'team-lead', agentType: 'team-lead' }, { name: 'alice' }, { name: 'bob' }])
+    const delivery = new HostedTeamLeadMessageDelivery({
+      canonicalTeamRoot: teamRoot,
+      legacyKey: 'legacy',
+      authority,
+      guard: { isCurrent: async () => true },
+      recipients: new HostedTeamRecipientRoster(teamRoot),
+    })
+
+    expect(await delivery.deliver({ ...message, recipient: 'alice' }, authority))
+      .toEqual({ kind: 'delivered' })
+    expect(JSON.parse(await readFile(join(teamRoot, 'inboxes', 'alice.json'), 'utf8'))).toEqual([{
+      messageId: message.messageId, from: 'user', text: message.text, timestamp: message.createdAt, read: false,
+    }])
+    await expect(lstat(join(teamRoot, 'inboxes', 'team-lead.json'))).rejects.toThrow()
+    const [markerFile] = await readdir(join(teamRoot, 'hosted-message-delivery-operations'))
+    const marker = JSON.parse(await readFile(
+      join(teamRoot, 'hosted-message-delivery-operations', markerFile!), 'utf8'))
+    expect({ recipient: marker.recipient, status: marker.status }).toEqual({ recipient: 'alice', status: 'delivered' })
+
+    await writeRoster([{ name: 'team-lead', agentType: 'team-lead' }, { name: 'alice' }, { name: 'bob', removedAt: 1 }])
+    const toRemoved = { ...message, clientMessageId: 'client_message_removed-bob', recipient: 'bob' }
+    expect(await delivery.deliver(toRemoved, authority)).toEqual({ kind: 'operator_required' })
+    await expect(lstat(join(teamRoot, 'inboxes', 'bob.json'))).rejects.toThrow()
+    expect(await readdir(join(teamRoot, 'hosted-message-delivery-operations'))).toHaveLength(1)
   })
 })
 

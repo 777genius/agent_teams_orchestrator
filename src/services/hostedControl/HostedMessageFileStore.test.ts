@@ -201,4 +201,26 @@ describe('HostedMessageFileStore', () => {
     await chmod(directory, 0o770)
     await expect(store.persist(command, authority)).rejects.toThrow('Unsafe hosted message store directory')
   })
+
+  test('binds a teammate recipient into the record and rejects a replay that retargets it', async () => {
+    const { directory } = await fixture()
+    const store = new HostedMessageFileStore(directory, teamId, undefined, () => `message_${'d'.repeat(32)}`)
+    const dm = { ...command, recipient: 'alice' }
+    const persisted = await store.persist(dm, authority)
+    if (persisted.kind !== 'persisted') throw new Error('expected persisted message')
+    expect(persisted.receipt.recipient).toBe('alice')
+
+    const restarted = new HostedMessageFileStore(directory, teamId)
+    await expect(restarted.persist(dm, authority)).resolves.toEqual({
+      kind: 'idempotent_replay',
+      receipt: persisted.receipt,
+    })
+    await expect(restarted.persist({ ...dm, recipient: 'bob' }, authority))
+      .resolves.toEqual({ kind: 'conflict', reason: 'idempotency_mismatch' })
+    await expect(restarted.persist(command, authority))
+      .resolves.toEqual({ kind: 'conflict', reason: 'idempotency_mismatch' })
+    await expect(restarted.find({
+      teamId, messageId: `message_${'d'.repeat(32)}`, clientMessageId: dm.clientMessageId, text: dm.text,
+    }, authority)).resolves.toMatchObject({ kind: 'found', message: { recipient: 'alice' } })
+  })
 })

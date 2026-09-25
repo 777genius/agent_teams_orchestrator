@@ -125,6 +125,34 @@ describe('HostedControlDispatcher response decoding', () => {
     await expect(dispatcher.dispatch(signedMessageRequest())).rejects.toThrow('keys')
   })
 
+  test('binds the persistence receipt and invalid_recipient to the requested recipient', async () => {
+    const receipt = {
+      schemaVersion: 1, teamId: authority.teamId, messageId: `message_${'e'.repeat(32)}`,
+      clientMessageId: 'client_message_dispatcher', persistence: 'durable',
+    }
+    const respond = (payload: Record<string, unknown>) => new HostedControlDispatcher({
+      secret,
+      authority,
+      getOwnerBinding: () => ownerBinding,
+      lifecycle: { dispatch: async () => ({ payload: { schemaVersion: 1, kind: 'not_found' }, resourceRevision: null }) },
+      messages: { dispatch: async () => payload },
+    })
+    const persisted = (extra: Record<string, unknown>) =>
+      ({ schemaVersion: 2, kind: 'persisted', receipt: { ...receipt, ...extra } })
+
+    await expect(respond(persisted({ recipient: 'alice' })).dispatch(signedMessageRequest('alice')))
+      .resolves.toMatchObject({ payload: { receipt: { recipient: 'alice' } } })
+    await expect(respond(persisted({})).dispatch(signedMessageRequest('alice'))).rejects.toThrow('keys')
+    await expect(respond(persisted({ recipient: 'bob' })).dispatch(signedMessageRequest('alice')))
+      .rejects.toThrow('recipient')
+    await expect(respond(persisted({ recipient: 'alice' })).dispatch(signedMessageRequest())).rejects.toThrow('keys')
+
+    const invalid = { schemaVersion: 2, kind: 'invalid_recipient' }
+    await expect(respond(invalid).dispatch(signedMessageRequest('alice')))
+      .resolves.toMatchObject({ payload: invalid })
+    await expect(respond(invalid).dispatch(signedMessageRequest())).rejects.toThrow('Invalid message persistence response')
+  })
+
   test('rejects substituted lifecycle receipt revisions and response authorizations', async () => {
     for (const response of [
       lifecycleExecutionResponse({ resultRevision: 'revision_substituted' }),
@@ -535,7 +563,7 @@ function rawSigned(unsigned: Record<string, unknown>): Record<string, unknown> {
   return { ...unsigned, ownerProof: createHostedRawDomainProof(secret, HOSTED_LIFECYCLE_PROOF_DOMAIN, 'request', serialized) }
 }
 
-function signedMessageRequest(): Record<string, unknown> {
+function signedMessageRequest(recipient?: string): Record<string, unknown> {
   const messageAuthority = { actorId: 'actor-a', ...authority }
   const unsigned = {
     schemaVersion: 2,
@@ -548,6 +576,7 @@ function signedMessageRequest(): Record<string, unknown> {
       teamId: authority.teamId,
       clientMessageId: 'client_message_dispatcher',
       text: 'hello',
+      ...(recipient === undefined ? {} : { recipient }),
     },
   }
   return { ...unsigned, ownerProof: createHostedDomainProof(secret, HOSTED_TEAM_MESSAGE_PROOF_DOMAIN, 'request', unsigned) }
