@@ -145,8 +145,8 @@ export class HostedControlServer {
     const listenPath = socketPublicationPath(this.#options.socketPath)
     const brokerToken = randomBytes(32)
     let publicationProbe: PublicationProbe | null = null
-    // Product's owner-bound client ends its write side after the request frame; the reply must
-    // still flow back on the same connection.
+    // A peer that ends its write side after the request frame must still receive the reply.
+    // Effective from Bun 1.4; the pinned Bun 1.3.11 ignores it, so Product does not half-close.
     const server = createServer({ allowHalfOpen: true }, socket => this.#admitBrokerConnection(socket, brokerToken, (admitted, initialData) => {
       if (publicationProbe) consumePublicationProbe(admitted, publicationProbe, initialData)
       else this.#handleConnection(admitted, initialData)

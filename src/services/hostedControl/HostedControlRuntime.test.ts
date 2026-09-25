@@ -537,7 +537,7 @@ describe('HostedControlRuntime', () => {
     })}\n`
     const fencedAuthority = { ...taskUnsigned.authority, ownerEffectFence: { grantRevision: '2'.repeat(64), identityChecksum } }
     const productTaskUnsigned = { ...taskUnsigned, exchangeId: `task-request_${'a'.repeat(32)}`, authority: fencedAuthority }
-    const productTaskLine = await exchangeHalfClosed(socketPath, productLine(productTaskUnsigned))
+    const productTaskLine = await exchangeProductFrame(socketPath, productLine(productTaskUnsigned))
     expect(productTaskLine.endsWith('\n')).toBe(true)
     expect(productTaskLine.indexOf('\n')).toBe(productTaskLine.length - 1)
     expect(JSON.parse(productTaskLine).payload).toEqual({ schemaVersion: 1, kind: 'unavailable', retryAfterMs: null })
@@ -545,7 +545,7 @@ describe('HostedControlRuntime', () => {
       ...productTaskUnsigned,
       authority: { ...fencedAuthority, ownerEffectFence: { grantRevision: '2'.repeat(64), identityChecksum: '3'.repeat(64) } },
     }))).toBe('')
-    const productMessageLine = await exchangeHalfClosed(socketPath, productLine({
+    const productMessageLine = await exchangeProductFrame(socketPath, productLine({
       ...messageUnsigned,
       exchangeId: `message-request_${'a'.repeat(32)}`,
       authority: { ...messageAuthority, ownerEffectFence: fencedAuthority.ownerEffectFence },
@@ -668,13 +668,13 @@ function openReadiness(
   })
 }
 
-/** Product's owner-bound client: one frame, then write-side EOF, then read the reply. */
-function exchangeHalfClosed(socketPath: string, input: string): Promise<string> {
+/** Product's owner-bound client: one frame, no write-side EOF, then the reply up to the Owner's end. */
+function exchangeProductFrame(socketPath: string, input: string): Promise<string> {
   return new Promise((resolve, reject) => {
-    const socket = connect({ path: socketPath, allowHalfOpen: true })
+    const socket = connect(socketPath)
     let output = ''
     socket.setEncoding('utf8')
-    socket.once('connect', () => socket.end(input))
+    socket.once('connect', () => socket.write(input))
     socket.on('data', chunk => { output += chunk })
     socket.once('end', () => { socket.destroy(); resolve(output) })
     socket.once('close', () => resolve(output))

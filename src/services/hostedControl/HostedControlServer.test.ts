@@ -336,6 +336,33 @@ describe('HostedControlServer', () => {
     expect(await exchange(socketPath, `${JSON.stringify(request)}\n{}\n`)).toBe('')
   })
 
+  test('admits one Product owner-bound line and never replies once trailing bytes follow it', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'hosted-server-product-trailing-')); roots.push(root)
+    const socketPath = join(root, 'private', 'control.sock'); const secret = Buffer.alloc(32, 9); const unsigned = hostedControlGoldenRequestFixture()
+    const { socketIdentity: _, ...ownerIdentity } = unsigned.ownerBinding
+    let dispatched = 0; let release!: () => void; let markStarted!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve }); const started = new Promise<void>(resolve => { markStarted = resolve })
+    const server = new HostedControlServer({ socketPath, secret, ownerIdentity, authority: unsigned.authority, service: { mutate: async () => ({ kind: 'unavailable' as const }) },
+      dispatchCoexistingOperation: async message => { dispatched += 1; markStarted(); await gate; return { schemaVersion: 2, operation: message.operation, payload: { schemaVersion: 2, kind: 'delivered' } } } })
+    servers.push(server); await server.start()
+    await openReadiness(socketPath, server.ownerBinding!)
+    const frame = `${JSON.stringify({ schemaVersion: 2, exchangeId: `message-request_${'9'.repeat(32)}`, operation: 'message_deliver', ownerBinding: server.ownerBinding, authority: { ...unsigned.authority, actorId: 'actor', ownerEffectFence: { grantRevision: 'd'.repeat(64), identityChecksum: 'e'.repeat(64) } }, payload: {}, ownerProof: '0'.repeat(64) })}\n`
+
+    expect(await exchange(socketPath, `${frame}x`)).toBe('')
+    expect(dispatched).toBe(0)
+
+    const socket = connect(socketPath); let output = ''
+    socket.setEncoding('utf8'); socket.on('data', chunk => { output += chunk })
+    const closed = new Promise<void>(resolve => socket.once('close', () => resolve()))
+    socket.once('connect', () => socket.write(frame))
+    await started
+    socket.write('x')
+    await closed
+    release()
+    expect(output).toBe('')
+    expect(dispatched).toBe(1)
+  })
+
   test('rejects malformed UTF-8 without conflating it with a literal replacement character', async () => {
     const root = await mkdtemp(join(tmpdir(), 'hosted-server-utf8-')); roots.push(root)
     const socketPath = join(root, 'private', 'control.sock'); const unsigned = hostedControlGoldenRequestFixture()
