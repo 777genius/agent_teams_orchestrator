@@ -1,5 +1,7 @@
 # Hosted OpenCode container isolation contract
 
+Status: post-v1 hostile-runtime profile. v1 uses the `trusted_process` host-local lane per owner decision 2026-09-25 (Product `docs/hosted-web-core-v1-scope-lock.md`, "Owner decisions 2026-09-25"). This design is not a v1 release gate.
+
 Status: design only. No Owner runtime path is activated by this document.
 
 ## Current incompatibility

@@ -1,5 +1,9 @@
 # Hosted OpenCode FD3 handoff helper (inactive)
 
+Status: post-v1 hostile-runtime profile, together with the root daemon. v1 uses
+the `trusted_process` host-local lane per owner decision 2026-09-25 (Product
+`docs/hosted-web-core-v1-scope-lock.md`, "Owner decisions 2026-09-25").
+
 `handoff.py` is an isolated Linux root helper for the already reviewed image
 bootstrap. It is not wired into the root supervisor or Owner lane. Its only
 effect is one descriptor transfer to an attested bootstrap, followed by

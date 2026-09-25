@@ -1,5 +1,9 @@
 # Hosted OpenCode root daemon package (inactive)
 
+Status: post-v1 hostile-runtime profile. v1 uses the `trusted_process`
+host-local lane per owner decision 2026-09-25 (Product
+`docs/hosted-web-core-v1-scope-lock.md`, "Owner decisions 2026-09-25").
+
 `package.py` compiles `src/entrypoints/hostedOpenCodeRootDaemon.ts` on Linux x64
 for Linux x64 with Bun 1.4.2 and emits an inert release directory. It does not install,
 start, configure, or admit the daemon. The ordinary `scripts/build.ts` CLI build
@@ -53,4 +57,6 @@ Production activation additionally needs an independently reviewed immutable
 lease and config, admitted Docker/network policy, exact official executable
 attestation, secret provisioning, and the Owner RPC generation gate. The root
 daemon may then read only its installed root-owned config; no Owner-supplied
-path or host-local OpenCode fallback is an acceptable activation path.
+path or host-local OpenCode fallback is an acceptable activation path for this
+daemon. That rule applies to the post-v1 container profile only; it does not
+apply to v1, whose runtime is the host-local lane.
