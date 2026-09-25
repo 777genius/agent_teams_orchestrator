@@ -17,6 +17,9 @@ BINARY_SHA = '513f500a1a5ea1dc7d865547ac87b32a8936334e8d5abd5b3ff585c45a170080'
 PLUGIN_SHA = '805df9de2239792c47bb040961110ae44f9bbbd4afd6bb821dcf497be4357f4c'
 BASE_IMAGE = 'docker.io/library/ubuntu@sha256:008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3'
 SOURCE_COMMIT = '545f51d26cc39a907d2867492d498d9607ea5fa4'
+PLUGIN_DIRECTORY_INSTRUCTION = 'RUN install -d -o 0 -g 0 -m 0755 /usr/local/lib/agentteams'
+PLUGIN_COPY_INSTRUCTION = ('COPY --chown=0:0 --chmod=0444 hosted-owner-plugin.mjs '
+                           '/usr/local/lib/agentteams/hosted-owner-plugin.mjs')
 SHA = re.compile(r'^[0-9a-f]{64}$')
 MAX_BINARY_BYTES = 256 * 1024 * 1024
 
@@ -123,7 +126,10 @@ def prepare(archive_path, bootstrap_path, plugin_path, output_dir, lock_path=LOC
     if digest_file(target_plugin) != lock['pluginSha256']:
         raise ValueError('hosted-opencode-plugin-copy-mismatch')
     template = (HERE / 'Dockerfile.template').read_text()
-    if template.count('@BOOTSTRAP_SHA256@') != 1 or template.count('@PLUGIN_SHA256@') != 1:
+    if (template.count('@BOOTSTRAP_SHA256@') != 1 or template.count('@PLUGIN_SHA256@') != 1 or
+            template.count(PLUGIN_DIRECTORY_INSTRUCTION) != 1 or
+            template.count(PLUGIN_COPY_INSTRUCTION) != 1 or
+            template.index(PLUGIN_DIRECTORY_INSTRUCTION) > template.index(PLUGIN_COPY_INSTRUCTION)):
         raise ValueError('hosted-opencode-dockerfile-template-invalid')
     dockerfile = (template.replace('@BOOTSTRAP_SHA256@', lock['bootstrapSha256'])
                   .replace('@PLUGIN_SHA256@', lock['pluginSha256']))

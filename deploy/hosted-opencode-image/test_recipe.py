@@ -4,6 +4,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import subprocess
 import tarfile
@@ -221,6 +222,37 @@ console.log(JSON.stringify(Object.keys(hooks.tool).sort()));
         self.assertIn('COPY --chown=0:0 --chmod=0444 hosted-owner-plugin.mjs ' +
                       '/usr/local/lib/agentteams/hosted-owner-plugin.mjs', dockerfile)
         self.assertEqual(dockerfile.count('@PLUGIN_SHA256@'), 1)
+
+    def test_image_recipe_precreates_root_owned_searchable_plugin_directory(self):
+        dockerfile = (HERE / 'Dockerfile.template').read_text()
+        self.assertEqual(dockerfile.count(image.PLUGIN_DIRECTORY_INSTRUCTION), 1)
+        self.assertEqual(dockerfile.count(image.PLUGIN_COPY_INSTRUCTION), 1)
+        self.assertLess(dockerfile.index(image.PLUGIN_DIRECTORY_INSTRUCTION),
+                        dockerfile.index(image.PLUGIN_COPY_INSTRUCTION))
+        self.assertIn('USER 1000:1000', dockerfile)
+
+    def test_built_image_uid_1000_can_read_pinned_plugin(self):
+        image_ref = os.environ.get('HOSTED_OPENCODE_IMAGE_REF')
+        if not image_ref:
+            self.skipTest('Set HOSTED_OPENCODE_IMAGE_REF to the exact image ID or repo digest')
+        if not re.fullmatch(r'(?:sha256:[0-9a-f]{64}|[^\s]+@sha256:[0-9a-f]{64})', image_ref):
+            self.fail('HOSTED_OPENCODE_IMAGE_REF must be an immutable image ID or repo digest')
+        script = '''set -eu
+test "$(id -u)" = 1000
+test -r /usr/local/lib/agentteams/hosted-owner-plugin.mjs
+stat -c '%u:%g %a' /usr/local/lib/agentteams
+stat -c '%u:%g %a' /usr/local/lib/agentteams/hosted-owner-plugin.mjs
+sha256sum /usr/local/lib/agentteams/hosted-owner-plugin.mjs
+'''
+        result = subprocess.run([
+            'docker', 'run', '--rm', '--pull=never', '--network', 'none', '--read-only',
+            '--cap-drop=ALL', '--security-opt=no-new-privileges', '--pids-limit', '32',
+            '--entrypoint', '/bin/sh', image_ref, '-ec', script,
+        ], capture_output=True, text=True, check=True)
+        directory, plugin_mode, plugin_digest = result.stdout.splitlines()
+        self.assertEqual(directory, '0:0 755')
+        self.assertEqual(plugin_mode, '0:0 444')
+        self.assertEqual(plugin_digest.split()[0], image.approved_lock()['pluginSha256'])
 
     def test_image_lock_rejects_archive_or_base_drift(self):
         lock = json.loads((HERE / 'artifact-lock.json').read_text())

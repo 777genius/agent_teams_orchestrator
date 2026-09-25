@@ -11,6 +11,7 @@ LABEL org.opencontainers.image.source="https://github.com/anomalyco/opencode" \
 
 COPY --chown=0:0 --chmod=0555 opencode /usr/local/bin/opencode
 COPY --chown=0:0 --chmod=0555 hosted-opencode-fd3-bootstrap /usr/local/bin/hosted-opencode-fd3-bootstrap
+RUN install -d -o 0 -g 0 -m 0755 /usr/local/lib/agentteams
 COPY --chown=0:0 --chmod=0444 hosted-owner-plugin.mjs /usr/local/lib/agentteams/hosted-owner-plugin.mjs
 
 USER 1000:1000

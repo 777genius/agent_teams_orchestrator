@@ -27,8 +27,9 @@ activate Owner model or agent effects.
   digest because adding the label changes the digest.
 - The image contains two pinned executables and one pinned plugin artifact
   above the pinned base. The executables are root-owned mode 0555; the plugin
-  is root-owned mode 0444. The default user is UID/GID 1000. The bootstrap is
-  the entrypoint; the trusted supervisor supplies the exact socket name and
+  is root-owned mode 0444 under a root-owned mode 0755 directory, so UID 1000
+  can traverse the path and read the plugin. The default user is UID/GID 1000.
+  The bootstrap is the entrypoint; the trusted supervisor supplies the socket and
   sender UID command. No credentials, user home, runtime package cache,
   provider config, or writable image layer is copied.
 
