@@ -36,6 +36,7 @@ export function createTeamLifecycleAuthorityComposition(
     execution: options.execution,
     providerId: options.providerId,
     effectGuard: options.effectGuard,
+    reportInspectUnavailable: options.reportQueryUnavailable,
   })
   const providers = new HostedLifecycleProviderRegistry([owner])
   const authority = new HostedLifecycleAuthorityService({
@@ -48,6 +49,7 @@ export function createTeamLifecycleAuthorityComposition(
     wal: options.wal,
     createId: options.createId,
     requireRunReservation: options.requireRunReservation,
+    reportQueryUnavailable: options.reportQueryUnavailable,
     providers,
   })
   return { authority, owner, providers }

@@ -90,6 +90,8 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
   #closePromise: Promise<void> | null = null
   #shutdownPromise: Promise<void> | null = null
   #tail: Promise<void> = Promise.resolve()
+  /** Latest queued or running inspection that no later operation was queued behind. */
+  #inspection: { planFingerprint: string; snapshot: Promise<HostedLifecycleProviderSnapshot> } | null = null
 
   constructor(
     private readonly statePath: string,
@@ -120,6 +122,18 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
 
   inspect(plan: TeamLifecycleLaunchPlan): Promise<HostedLifecycleProviderSnapshot> {
     this.#rememberPlan(plan)
+    // Lifecycle queries and the inbox pump inspect concurrently; they share one
+    // lane reconcile instead of queueing one each.
+    const fingerprint = planFingerprint(plan)
+    if (this.#inspection?.planFingerprint === fingerprint) return this.#inspection.snapshot
+    const inspection = { planFingerprint: fingerprint, snapshot: this.#inspectSerialized(plan) }
+    this.#inspection = inspection
+    const settle = () => { if (this.#inspection === inspection) this.#inspection = null }
+    inspection.snapshot.then(settle, settle)
+    return inspection.snapshot
+  }
+
+  #inspectSerialized(plan: TeamLifecycleLaunchPlan): Promise<HostedLifecycleProviderSnapshot> {
     return this.#serialized(async () => {
       let state = await this.#read(plan)
       if (state.phase === 'launching' && state.runId && !this.#jobs.has(state.runId)) {
@@ -586,6 +600,8 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
   }
 
   async #serialized<T>(operation: () => Promise<T>): Promise<T> {
+    // An operation queued after an inspection must not be observed through it.
+    this.#inspection = null
     const prior = this.#tail
     let release!: () => void
     this.#tail = new Promise<void>(resolve => { release = resolve })

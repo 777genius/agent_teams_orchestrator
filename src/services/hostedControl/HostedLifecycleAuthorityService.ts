@@ -19,7 +19,9 @@ import {
 } from './HostedLifecycleAuthorityWal.js'
 import {
   HostedLifecycleProviderRegistry,
+  redactedErrorName,
   type HostedLifecycleOwnerResolution,
+  type HostedLifecycleQueryUnavailableReport,
 } from './HostedLifecycleProviderRegistry.js'
 import { createHostedLifecycleSnapshot, type HostedLifecycleProviderSnapshot } from './HostedLifecycleSnapshot.js'
 import type { HostedLifecycleRunReservation } from './HostedLifecycleRunReservation.js'
@@ -50,6 +52,7 @@ export type HostedLifecycleAuthorityServiceOptions = {
   createId?: () => string
   /** Production composition rejects missing Product pre-reservation before WAL starts an effect. */
   requireRunReservation?: boolean
+  reportQueryUnavailable?: (report: HostedLifecycleQueryUnavailableReport) => void
 }
 
 /**
@@ -72,7 +75,8 @@ export class HostedLifecycleAuthorityService implements HostedLifecycleAuthority
     authority: HostedLifecycleAuthority
   }): Promise<Record<string, unknown>> {
     if (!this.#bindingCurrent(input.context, input.authority, QUERY_SCOPE)) return unavailablePublic()
-    return (await this.#locked(state => this.getControlStateUnlocked(state))) ?? unavailablePublic()
+    const owner = await this.#resolveForQuery()
+    return this.#query(state => this.getControlStateUnlocked(state, owner))
   }
 
   async prepareProvisioning(input: {
@@ -95,10 +99,10 @@ export class HostedLifecycleAuthorityService implements HostedLifecycleAuthority
     authority: HostedLifecycleAuthority
   }): Promise<Record<string, unknown>> {
     if (!this.#bindingCurrent(input.context, input.authority, QUERY_SCOPE)) return unavailablePublic()
-    return (await this.#locked(async state => {
-      const owner = await this.options.providers.resolve(this.#scope())
+    const owner = await this.#resolveForQuery()
+    return this.#query(async state => {
       if (owner.kind === 'not_found') return { schemaVersion: 1, kind: 'not_found' }
-      if (owner.kind === 'unavailable') return unavailablePublic()
+      if (owner.kind === 'unavailable') return this.#queryUnavailable({ stage: owner.reason })
       const snapshot = this.#snapshot(owner)
       const seenCommandIds = new Set<string>()
       const recentCommands = [...state.commands.values()].reverse().filter(entry => {
@@ -130,7 +134,7 @@ export class HostedLifecycleAuthorityService implements HostedLifecycleAuthority
         availableActions: hasAmbiguousCommand(state) ? [] : snapshot.availableActions,
         recentCommands,
       }
-    })) ?? unavailablePublic()
+    })
   }
 
   async authorize(input: {
@@ -397,11 +401,44 @@ export class HostedLifecycleAuthorityService implements HostedLifecycleAuthority
       return undefined
     }
   }
-  private async getControlStateUnlocked(state: HostedLifecycleWalState): Promise<Record<string, unknown>> {
-    if (hasAmbiguousCommand(state)) return unavailablePublic()
-    const owner = await this.options.providers.resolve(this.#scope())
+  /**
+   * Queries inspect outside the WAL writer lock: inspecting a running lane can
+   * reconcile with its runtime for seconds, and holding the lock meanwhile made
+   * every concurrent query give up on it and answer unavailable. A query pairs
+   * this snapshot with the WAL it reads next; commands still re-inspect under
+   * the lock and fence on the revision.
+   */
+  async #resolveForQuery(): Promise<HostedLifecycleOwnerResolution> {
+    try { return await this.options.providers.resolve(this.#scope()) } catch (error) {
+      this.#reportQuery({ stage: 'resolve_error', error: redactedErrorName(error) })
+      return { kind: 'unavailable', reason: 'provider_unavailable' }
+    }
+  }
+  async #query(
+    operation: (state: HostedLifecycleWalState) => Promise<Record<string, unknown>>,
+  ): Promise<Record<string, unknown>> {
+    let result: Record<string, unknown> | undefined
+    try {
+      result = await this.options.wal.withLock(async () => operation(await this.options.wal.load()))
+    } catch (error) {
+      return this.#queryUnavailable({ stage: 'wal_error', error: redactedErrorName(error) })
+    }
+    return result ?? this.#queryUnavailable({ stage: 'wal_lock_busy' })
+  }
+  #queryUnavailable(report: HostedLifecycleQueryUnavailableReport): Record<string, unknown> {
+    this.#reportQuery(report)
+    return unavailablePublic()
+  }
+  #reportQuery(report: HostedLifecycleQueryUnavailableReport): void {
+    try { this.options.reportQueryUnavailable?.(report) } catch { /* diagnostics never change a decision */ }
+  }
+  private async getControlStateUnlocked(
+    state: HostedLifecycleWalState,
+    owner: HostedLifecycleOwnerResolution,
+  ): Promise<Record<string, unknown>> {
+    if (hasAmbiguousCommand(state)) return this.#queryUnavailable({ stage: 'ambiguous_command' })
     if (owner.kind === 'not_found') return { schemaVersion: 1, kind: 'not_found' }
-    if (owner.kind === 'unavailable') return unavailablePublic()
+    if (owner.kind === 'unavailable') return this.#queryUnavailable({ stage: owner.reason })
     const snapshot = this.#snapshot(owner)
     return {
       schemaVersion: 1,

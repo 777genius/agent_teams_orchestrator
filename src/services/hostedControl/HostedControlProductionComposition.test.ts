@@ -287,6 +287,35 @@ describe('createHostedControlProductionPorts', () => {
     }
   })
 
+  test('concurrent control states of a running team share a slow lane inspection instead of timing out', async () => {
+    const teamRoot = await makeTeamRoot('hosted-production-slow-inspect-')
+    await writePlan(teamRoot, 'opencode')
+    let slow = false
+    let inspections = 0
+    const lane = fakeLane({
+      inspect: async input => {
+        if (slow && input.runId) {
+          inspections += 1
+          // A running OpenCode lane reconciles with its runtime; this outlasts
+          // the lifecycle WAL lock retries (about 0.6 s).
+          await Bun.sleep(1_500)
+        }
+        return { phase: input.runId ? 'running' : 'idle', recoverable: false }
+      },
+    })
+    const ports = await createHostedControlProductionPortFactory(async () => lane)(context(teamRoot))
+    const { request, runId } = await reservedLaunchRequest(ports, teamRoot)
+    expect((await ports.lifecycle.dispatch(request)).payload.kind).toBe('settled')
+    slow = true
+    const states = await Promise.all([0, 1, 2].map(() => ports.lifecycle.dispatch(controlStateInput())))
+    for (const state of states) {
+      expect(state.payload).toMatchObject({ kind: 'control_state', runId, availableActions: ['stop'] })
+    }
+    expect(inspections).toBe(1)
+    slow = false
+    await ports.close()
+  })
+
   test('starts and replays only the exact Product reserved run in production', async () => {
     const teamRoot = await makeTeamRoot('hosted-production-reserved-run-')
     await writePlan(teamRoot, 'opencode')

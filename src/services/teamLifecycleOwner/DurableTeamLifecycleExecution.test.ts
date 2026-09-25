@@ -478,6 +478,43 @@ describe('DurableTeamLifecycleExecution', () => {
     await expect(execution.inspect(plan)).resolves.toMatchObject({ phase: 'idle', runId: null })
   })
 
+  test('concurrent inspections share one lane inspection, but never across a later operation', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'team-owner-shared-inspect-'))
+    roots.push(root)
+    const lane = new FakeLane()
+    const execution = new DurableTeamLifecycleExecution(join(root, 'state.json'), [lane])
+    await execution.launch({
+      plan, commandId: 'command-launch', runId: null,
+      expectedProviderGeneration: (await execution.inspect(plan)).providerGeneration,
+    })
+    const running = await waitForPhase(execution, 'running')
+    let laneInspections = 0
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const inspect = lane.inspect.bind(lane)
+    lane.inspect = async input => {
+      laneInspections += 1
+      await gate
+      return inspect(input)
+    }
+
+    const first = execution.inspect(plan)
+    expect(execution.inspect(plan)).toBe(first)
+    // A stop queued after the shared inspection is observed only by a new one.
+    const stopped = execution.stop({
+      plan, commandId: 'command-stop', runId: running.runId,
+      expectedProviderGeneration: running.providerGeneration,
+    })
+    const afterStop = execution.inspect(plan)
+    expect(afterStop).not.toBe(first)
+    release()
+    await expect(first).resolves.toMatchObject({ phase: 'running', runId: running.runId })
+    await stopped
+    await expect(afterStop).resolves.not.toMatchObject({ phase: 'running' })
+    expect(laneInspections).toBe(1)
+    await execution.close()
+  })
+
   test('shutdown stops a run adopted from a crashed owner, inspected or not', async () => {
     const root = await mkdtemp(join(tmpdir(), 'team-owner-adopted-shutdown-'))
     roots.push(root)

@@ -1,11 +1,13 @@
 import { createHash } from 'node:crypto'
 import type { HostedLifecycleRunReservation } from '../hostedControl/HostedLifecycleRunReservation.js'
 
-import type {
-  HostedLifecycleProviderAdapter,
-  HostedLifecycleProviderEffectResult,
-  HostedLifecycleProviderInspection,
-  HostedLifecycleScope,
+import {
+  redactedErrorName,
+  type HostedLifecycleProviderAdapter,
+  type HostedLifecycleProviderEffectResult,
+  type HostedLifecycleProviderInspection,
+  type HostedLifecycleQueryUnavailableReport,
+  type HostedLifecycleScope,
 } from '../hostedControl/HostedLifecycleProviderRegistry.js'
 import type { HostedLifecycleAction, HostedLifecycleProviderSnapshot } from '../hostedControl/HostedLifecycleSnapshot.js'
 import type {
@@ -63,6 +65,8 @@ export type TeamLifecycleOwnerServiceOptions = {
   execution: TeamLifecycleExecutionPort
   providerId?: string
   effectGuard?: () => boolean | Promise<boolean>
+  /** Why an inspection answered unavailable; redacted, diagnostics only. */
+  reportInspectUnavailable?: (report: HostedLifecycleQueryUnavailableReport) => void
 }
 
 export type TeamLifecycleExactPlanAdmission =
@@ -73,6 +77,8 @@ export type TeamLifecycleExactPlanAdmission =
 export class TeamLifecycleOwnerService implements HostedLifecycleProviderAdapter {
   readonly providerId: string
   readonly #queues = new Map<string, Promise<void>>()
+  /** Latest inspection per scope that no later operation was queued behind. */
+  readonly #inspections = new Map<string, Promise<HostedLifecycleProviderInspection>>()
 
   constructor(private readonly options: TeamLifecycleOwnerServiceOptions) {
     this.providerId = options.providerId ?? 'team-lifecycle-owner'
@@ -107,17 +113,40 @@ export class TeamLifecycleOwnerService implements HostedLifecycleProviderAdapter
     })
   }
 
-  async inspect(scope: HostedLifecycleScope): Promise<HostedLifecycleProviderInspection> {
+  inspect(scope: HostedLifecycleScope): Promise<HostedLifecycleProviderInspection> {
+    // Concurrent queries share one inspection: a running lane's inspection can
+    // reconcile with its runtime, and queueing one per poll only adds latency.
+    const key = scopeKey(scope)
+    const pending = this.#inspections.get(key)
+    if (pending) return pending
+    const inspection = this.#inspect(scope)
+    this.#inspections.set(key, inspection)
+    const settle = () => { if (this.#inspections.get(key) === inspection) this.#inspections.delete(key) }
+    inspection.then(settle, settle)
+    return inspection
+  }
+
+  async #inspect(scope: HostedLifecycleScope): Promise<HostedLifecycleProviderInspection> {
     return this.#serialized(scope, async () => {
-      const plan = await this.options.planStore.load(scope)
-      if (!plan) return { kind: 'not_owned' }
-      const observed = await this.options.execution.inspect(plan.plan)
-      if (!observed || !this.#validSnapshot(observed)) return { kind: 'unavailable' }
-      const snapshot = bindPlanGeneration(observed, plan.planGeneration)
-      if (!(await this.#capabilityCurrent(plan.plan, snapshot)) ||
-        !(await this.#admissionCurrent(plan))) {
-        return { kind: 'unavailable' }
+      const unavailable = (report: HostedLifecycleQueryUnavailableReport) => {
+        try { this.options.reportInspectUnavailable?.(report) } catch { /* diagnostics only */ }
+        return { kind: 'unavailable' as const }
       }
+      let plan: TeamLifecycleLaunchPlanAdmission | null
+      try { plan = await this.options.planStore.load(scope) } catch (error) {
+        unavailable({ stage: 'plan_load_error', error: redactedErrorName(error) })
+        throw error
+      }
+      if (!plan) return { kind: 'not_owned' }
+      let observed: TeamLifecycleOwnerState | null
+      try { observed = await this.options.execution.inspect(plan.plan) } catch (error) {
+        unavailable({ stage: 'inspect_error', error: redactedErrorName(error) })
+        throw error
+      }
+      if (!observed || !this.#validSnapshot(observed)) return unavailable({ stage: 'invalid_snapshot' })
+      const snapshot = bindPlanGeneration(observed, plan.planGeneration)
+      if (!(await this.#capabilityCurrent(plan.plan, snapshot))) return unavailable({ stage: 'capability_not_current' })
+      if (!(await this.#admissionCurrent(plan))) return unavailable({ stage: 'admission_not_current' })
       return { kind: 'owned', snapshot }
     })
   }
@@ -268,7 +297,9 @@ export class TeamLifecycleOwnerService implements HostedLifecycleProviderAdapter
   }
 
   async #serialized<T>(scope: HostedLifecycleScope, operation: () => Promise<T>): Promise<T> {
-    const key = `${scope.workspaceId}\0${scope.teamId}`
+    const key = scopeKey(scope)
+    // An operation queued after an inspection must not be observed through it.
+    this.#inspections.delete(key)
     const prior = this.#queues.get(key) ?? Promise.resolve()
     let release!: () => void
     const current = new Promise<void>(resolve => { release = resolve })
@@ -280,6 +311,10 @@ export class TeamLifecycleOwnerService implements HostedLifecycleProviderAdapter
       if (this.#queues.get(key) === tail) this.#queues.delete(key)
     }
   }
+}
+
+function scopeKey(scope: HostedLifecycleScope): string {
+  return `${scope.workspaceId}\0${scope.teamId}`
 }
 
 function bindPlanGeneration(

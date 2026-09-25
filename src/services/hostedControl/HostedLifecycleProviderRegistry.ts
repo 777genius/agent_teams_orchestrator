@@ -33,6 +33,25 @@ export type HostedLifecycleOwnerResolution =
   | { kind: 'not_found' }
   | { kind: 'unavailable'; reason: 'provider_unavailable' | 'ambiguous_owner' }
 
+/**
+ * Why a lifecycle query answered unavailable, for one redacted stderr line.
+ * `error` is only an error name or errno code, never a message or path.
+ */
+export type HostedLifecycleQueryUnavailableReport = {
+  stage:
+    | 'wal_lock_busy' | 'wal_error' | 'resolve_error' | 'ambiguous_command'
+    | 'provider_unavailable' | 'ambiguous_owner'
+    | 'plan_load_error' | 'inspect_error' | 'invalid_snapshot'
+    | 'capability_not_current' | 'admission_not_current'
+  error?: string
+}
+
+export function redactedErrorName(error: unknown): string {
+  const code = (error as NodeJS.ErrnoException | null)?.code
+  if (typeof code === 'string' && /^[A-Z][A-Z0-9_]{1,31}$/.test(code)) return code
+  return error instanceof Error && /^[A-Za-z][A-Za-z0-9]{0,63}$/.test(error.name) ? error.name : 'unknown'
+}
+
 export class HostedLifecycleProviderRegistry {
   readonly #adapters: readonly HostedLifecycleProviderAdapter[]
 

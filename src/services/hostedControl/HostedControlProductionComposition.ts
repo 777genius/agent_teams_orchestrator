@@ -125,6 +125,12 @@ export function createHostedControlPortFactory(
       execution,
       requireRunReservation: true,
       effectGuard: () => context.isCurrentAuthority({ actorId: 'hosted-lifecycle-owner', ...context.authority }),
+      // One redacted JSON line per lifecycle query that answered unavailable.
+      reportQueryUnavailable: report => {
+        process.stderr.write(`${JSON.stringify({
+          kind: 'hosted-lifecycle-query-unavailable', teamId: context.authority.teamId, ...report,
+        })}\n`)
+      },
     })
 
     const authorityGuard = { isCurrent: context.isCurrentAuthority }
