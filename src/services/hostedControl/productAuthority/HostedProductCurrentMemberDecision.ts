@@ -257,16 +257,16 @@ const PRODUCT_V35_SCHEMA = {
       owner_session_id TEXT NOT NULL,
       restore_generation INTEGER NOT NULL,
       mount_generation INTEGER NOT NULL,
-      state TEXT NOT NULL CHECK (state IN ('eligible', 'retired')),
+      state TEXT NOT NULL CHECK (state IN ('eligible', 'cleanup_pending', 'retired')),
       FOREIGN KEY (run_id) REFERENCES hosted_lifecycle_run_reservations(run_id)
         ON DELETE RESTRICT ON UPDATE RESTRICT
     )`,
-    `CREATE UNIQUE INDEX hosted_lifecycle_one_eligible_run_per_team
-      ON hosted_lifecycle_current_runs (deployment_id, team_id) WHERE state = 'eligible'`,
+    `CREATE UNIQUE INDEX hosted_lifecycle_one_unretired_run_per_team
+      ON hosted_lifecycle_current_runs (deployment_id, team_id) WHERE state != 'retired'`,
     `CREATE TRIGGER hosted_lifecycle_current_runs_no_replace BEFORE INSERT ON hosted_lifecycle_current_runs
       WHEN EXISTS (SELECT 1 FROM hosted_lifecycle_current_runs r
         WHERE r.rowid = NEW.rowid OR r.run_id = NEW.run_id OR
-          (r.deployment_id = NEW.deployment_id AND r.team_id = NEW.team_id AND r.state = 'eligible'))
+          (r.deployment_id = NEW.deployment_id AND r.team_id = NEW.team_id AND r.state != 'retired'))
         OR NOT EXISTS (SELECT 1 FROM hosted_lifecycle_deployment_authorities a
           WHERE a.deployment_id = NEW.deployment_id AND a.boot_id = NEW.boot_id
             AND a.owner_authority = NEW.owner_authority AND a.owner_generation = NEW.owner_generation
@@ -278,7 +278,9 @@ const PRODUCT_V35_SCHEMA = {
             AND r.boot_id = NEW.boot_id AND r.team_id = NEW.team_id)
       BEGIN SELECT RAISE(ABORT, 'hosted lifecycle current run binding invalid'); END`,
     `CREATE TRIGGER hosted_lifecycle_current_runs_guard_update BEFORE UPDATE ON hosted_lifecycle_current_runs
-      WHEN OLD.state != 'eligible' OR NEW.state != 'retired' OR NEW.run_id != OLD.run_id
+      WHEN NOT ((OLD.state = 'eligible' AND NEW.state = 'cleanup_pending')
+        OR (OLD.state = 'cleanup_pending' AND NEW.state = 'retired'))
+        OR NEW.run_id != OLD.run_id
         OR NEW.deployment_id != OLD.deployment_id OR NEW.boot_id != OLD.boot_id
         OR NEW.team_id != OLD.team_id OR NEW.owner_authority != OLD.owner_authority
         OR NEW.owner_generation != OLD.owner_generation OR NEW.owner_session_id != OLD.owner_session_id
@@ -479,7 +481,7 @@ export class HostedProductCurrentMemberDecision {
             name.startsWith('hosted_lifecycle_authorities_') ||
             name.startsWith('hosted_lifecycle_current_runs_') ||
             name.startsWith('hosted_lifecycle_retired_members_') ||
-            name === 'hosted_lifecycle_one_eligible_run_per_team' ||
+            name === 'hosted_lifecycle_one_unretired_run_per_team' ||
             v35Tables.some(table => name.startsWith(`sqlite_autoindex_${table}_`)))
       })
     const actualV35 = v35Records('main')

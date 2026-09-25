@@ -100,12 +100,18 @@ test('old boot and Owner session cannot authorize a member after an epoch change
   }
 })
 
-test('committed authority, run and member retirement each deny later effects', async () => {
+test('committed authority, pending cleanup, run and member retirement each deny later effects', async () => {
   for (const retire of [
     (f: Fixture) => f.db.query(`UPDATE hosted_lifecycle_deployment_authorities
       SET state = 'retired', revision = revision + 1`).run(),
     (f: Fixture) => f.db.query(`UPDATE hosted_lifecycle_current_runs
-      SET state = 'retired' WHERE run_id = ?`).run(f.binding.runId),
+      SET state = 'cleanup_pending' WHERE run_id = ?`).run(f.binding.runId),
+    (f: Fixture) => {
+      f.db.query(`UPDATE hosted_lifecycle_current_runs
+        SET state = 'cleanup_pending' WHERE run_id = ?`).run(f.binding.runId)
+      f.db.query(`UPDATE hosted_lifecycle_current_runs
+        SET state = 'retired' WHERE run_id = ?`).run(f.binding.runId)
+    },
     (f: Fixture) => f.db.query(`INSERT INTO hosted_lifecycle_retired_members
       (run_id, member_id) VALUES (?, ?)`).run(f.binding.runId, f.binding.memberId),
   ]) {
