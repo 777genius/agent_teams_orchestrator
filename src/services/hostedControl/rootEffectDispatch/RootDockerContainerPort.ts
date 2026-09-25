@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from 'node:crypto'
+import { createHash, createHmac, randomBytes } from 'node:crypto'
 import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, realpathSync } from 'node:fs'
 import path from 'node:path'
 
@@ -78,16 +78,20 @@ export class RootDockerContainerPort {
   private readonly identity: Readonly<{ dev: number; ino: number }>
   private readonly uid: number
   private readonly binding: HostedProductMemberBinding
+  private readonly passwordKey: Buffer
 
   private constructor(private readonly stateDirectory: string,
     authority: HostedRootSingleMemberAuthority,
     binding: HostedProductMemberBinding,
     private readonly options: { effectClaimDirectory: string; socketPath: string; image: string;
+      serverPasswordKey: Uint8Array;
       networkId: string; testOnlyAllowNonRoot?: boolean }) {
     if (!path.isAbsolute(stateDirectory) || path.normalize(stateDirectory) !== stateDirectory ||
-      !IMAGE.test(options.image) || !SHA.test(options.networkId)) {
+      !IMAGE.test(options.image) || !SHA.test(options.networkId) ||
+      !options.serverPasswordKey || options.serverPasswordKey.length !== 32) {
       throw new Error('root-container-port-state-invalid')
     }
+    this.passwordKey = Buffer.from(options.serverPasswordKey)
     this.uid = process.getuid?.() ?? -1
     const stat = lstatSync(stateDirectory)
     if (!stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== this.uid ||
@@ -104,7 +108,7 @@ export class RootDockerContainerPort {
 
   static create(options: { stateDirectory: string; effectClaimDirectory: string; socketPath: string;
     authority: HostedRootSingleMemberAuthority; binding: HostedProductMemberBinding;
-    image: string; networkId: string;
+    image: string; networkId: string; serverPasswordKey: Uint8Array;
     testOnlyAllowNonRoot?: boolean }): RootDockerContainerPort {
     return new RootDockerContainerPort(options.stateDirectory, options.authority,
       options.binding, options)
@@ -149,15 +153,27 @@ export class RootDockerContainerPort {
     const row = spec as Record<string, unknown>
     const labels = row?.Labels as Record<string, unknown> | undefined
     const host = row?.HostConfig as Record<string, unknown> | undefined
+    const env = row?.Env
     if (!row || typeof row !== 'object' || Array.isArray(row) ||
       row.Image !== this.options.image || !labels || typeof labels !== 'object' ||
       labels[GENERATION_LABEL] !== target.generation || !host || typeof host !== 'object' ||
       host.NetworkMode !== this.options.networkId || host.ReadonlyRootfs !== true ||
       host.Privileged !== false || !Array.isArray(host.CapDrop) ||
-      host.CapDrop.length !== 1 || host.CapDrop[0] !== 'ALL') {
+      host.CapDrop.length !== 1 || host.CapDrop[0] !== 'ALL' || !Array.isArray(env) ||
+      env.filter(value => value === 'OPENCODE_SERVER_PASSWORD').length !== 1 ||
+      env.some(value => typeof value !== 'string' || value.startsWith('OPENCODE_SERVER_PASSWORD='))) {
       throw new Error('root-container-port-manifest-invalid')
     }
     return value
+  }
+
+  private createBody(manifest: Manifest): string {
+    const spec = JSON.parse(manifest.body) as Record<string, unknown>
+    const password = createHmac('sha256', this.passwordKey)
+      .update(`agent-teams.hosted-opencode-server/v1\0${manifest.generation}`).digest('hex')
+    spec.Env = (spec.Env as string[]).map(value => value === 'OPENCODE_SERVER_PASSWORD'
+      ? `OPENCODE_SERVER_PASSWORD=${password}` : value)
+    return JSON.stringify(spec)
   }
 
   private target(memberOperationId: string): RootContainerTarget {
@@ -185,7 +201,8 @@ export class RootDockerContainerPort {
     const target = effect === 'create' ? this.manifest(memberOperationId) : this.target(memberOperationId)
     const { body: _body, ...resolvedTarget } = target as Manifest
     if (!sameTarget(original, resolvedTarget)) throw new Error('root-container-port-target-changed')
-    const candidate = operation(effect, target, effect === 'create' ? (target as Manifest).body : '', probe)
+    const candidate = operation(effect, target,
+      effect === 'create' ? this.createBody(target as Manifest) : '', probe)
     if (candidate.operationId !== id) throw new Error('root-container-port-operation-unbound')
     return candidate
   }
@@ -210,7 +227,7 @@ export class RootDockerContainerPort {
     this.assertCaller(stableTarget, withId)
     const probe = effect === 'inspect' ? randomBytes(16).toString('hex') : ''
     const manifest = effect === 'create' ? this.manifest(stableTarget.memberOperationId) : undefined
-    const op = operation(effect, stableTarget, manifest?.body ?? '', probe)
+    const op = operation(effect, stableTarget, manifest ? this.createBody(manifest) : '', probe)
     if (this.operationTargets.has(op.operationId)) throw new Error('root-container-port-operation-busy')
     this.operationTargets.set(op.operationId, stableTarget)
     if (effect === 'inspect') this.inspectProbes.set(op.operationId, probe)

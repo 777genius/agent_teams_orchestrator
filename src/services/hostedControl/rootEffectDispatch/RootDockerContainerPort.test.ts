@@ -39,7 +39,7 @@ async function fixture() {
   await mkdir(effectClaimDirectory, { mode: 0o700 })
   await chmod(stateDirectory, 0o700)
   await chmod(effectClaimDirectory, 0o700)
-  const body = JSON.stringify({ Image: image, Labels: {
+  const body = JSON.stringify({ Image: image, Env: ['OPENCODE_SERVER_PASSWORD'], Labels: {
     'org.agentteams.hosted-opencode.generation': target.generation },
   HostConfig: { NetworkMode: target.networkId, ReadonlyRootfs: true,
     Privileged: false, CapDrop: ['ALL'] } })
@@ -88,7 +88,8 @@ async function fixture() {
     ownerSessionId: 'owner-session_fixture1234' }, row => ({ runId: row.runId,
     bootId: row.bootId, ownerGeneration: 1, ownerSessionId: 'owner-session_fixture1234', state: 'active' }))
   const port = RootDockerContainerPort.create({ stateDirectory, effectClaimDirectory, socketPath,
-    authority, binding, image, networkId: target.networkId, testOnlyAllowNonRoot: true })
+    authority, binding, image, networkId: target.networkId,
+    serverPasswordKey: Buffer.alloc(32, 7), testOnlyAllowNonRoot: true })
   return { port, waiting, release: () => release!(), revoke: () => { admitted = false },
     requests, target: { ...target, containerId }, stateDirectory, effectClaimDirectory }
 }
@@ -112,6 +113,10 @@ test('typed create/start/inspect/stop use only the exact root-owned target', asy
     .rejects.toThrow('target-unbound')
   expect(f.requests).toHaveLength(0)
   expect(await f.port.createContainer(target)).toBe(containerId)
+  const stored = await readFile(path.join(f.stateDirectory,
+    `container-create-${target.memberOperationId}.json`), 'utf8')
+  expect(stored).not.toContain('OPENCODE_SERVER_PASSWORD=')
+  expect(f.requests[0].toString()).toContain('OPENCODE_SERVER_PASSWORD=')
   await f.port.startContainer(f.target)
   expect(await f.port.inspectContainer(f.target)).toEqual({ Id: containerId })
   await f.port.stopCurrentContainer(f.target)

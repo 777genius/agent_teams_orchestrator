@@ -7,6 +7,8 @@ import { isDeepStrictEqual } from 'node:util'
 
 import { resolveExecutingOpenCodeArtifactDigest } from '../../opencode/OpenCodeArtifactDigest.js'
 import { HostedOpenCodeFd3Handoff, type HostedFd3HandoffRunner, type PendingOwnerChannel } from './HostedOpenCodeFd3Handoff.js'
+import type { RootDockerContainerClaimWriter } from '../rootEffectDispatch/RootDockerContainerClaimWriter.js'
+import type { RootDockerContainerPort, RootContainerTarget } from '../rootEffectDispatch/RootDockerContainerPort.js'
 
 const SHA = /^[0-9a-f]{64}$/
 const IMAGE = /^[a-z0-9][a-z0-9._:/-]*@sha256:[0-9a-f]{64}$/
@@ -126,6 +128,9 @@ export interface HostedOpenCodeContainerSupervisorOptions {
   readonly ownerUid?: number
   readonly serverPasswordKey?: Uint8Array
   readonly docker?: HostedDockerRunner
+  /** Paired root-owned typed port and durable claim writer; never supplied by Owner RPC. */
+  readonly rootDocker?: RootDockerContainerPort
+  readonly rootDockerClaims?: RootDockerContainerClaimWriter
   /** Root-owned exact Product/member resolver. The daemon leaves this unset until activation. */
   readonly rootTrustedMember?: HostedRootTrustedMemberPort
   /** Inert fixtures only; production cannot inject either trust gate. */
@@ -178,6 +183,8 @@ export class HostedOpenCodeContainerSupervisor {
   private readonly pendingPrepares = new Map<string, Promise<PreparedMember>>()
   private readonly busy = new Set<string>()
   private readonly docker: HostedDockerRunner
+  private readonly rootDocker: RootDockerContainerPort | null
+  private readonly rootDockerClaims: RootDockerContainerClaimWriter | null
   private readonly handoff: HostedFd3HandoffRunner | null
   private readonly active = new Map<string, ProcessEvidence>()
   private readonly endpointUses = new Map<string, { token: string; generation: string;
@@ -188,6 +195,8 @@ export class HostedOpenCodeContainerSupervisor {
 
   private constructor(private readonly options: HostedOpenCodeContainerSupervisorOptions) {
     this.docker = options.docker ?? DENIED_DOCKER_RUNNER
+    this.rootDocker = options.rootDocker ?? null
+    this.rootDockerClaims = options.rootDockerClaims ?? null
     this.handoff = options.testOnlyHandoff ?? (options.handoffHelperPath && options.handoffHelperSha256 &&
       options.handoffPythonSha256 &&
       options.ownerSocketDirectory && options.ownerUid !== undefined
@@ -203,6 +212,18 @@ export class HostedOpenCodeContainerSupervisor {
     }
     if (options.testOnlyAllowNonRoot && (!options.docker || process.env.NODE_ENV !== 'test')) {
       throw new Error('hosted-container-test-runner-required')
+    }
+    if (Boolean(options.rootDocker) !== Boolean(options.rootDockerClaims) ||
+      options.rootDocker && (typeof options.rootDocker.createContainer !== 'function' ||
+        typeof options.rootDocker.startContainer !== 'function' ||
+        typeof options.rootDocker.inspectContainer !== 'function' ||
+        typeof options.rootDocker.stopCurrentContainer !== 'function' ||
+        typeof options.rootDocker.inspectImage !== 'function' ||
+        typeof options.rootDocker.inspectNetwork !== 'function' ||
+        typeof options.rootDocker.removeContainer !== 'function') ||
+      options.rootDockerClaims && (typeof options.rootDockerClaims.writeCreate !== 'function' ||
+        typeof options.rootDockerClaims.writeTarget !== 'function')) {
+      throw new Error('hosted-container-root-docker-composition-incomplete')
     }
     if (options.rootTrustedMember && typeof options.rootTrustedMember.resolveCurrent !== 'function') {
       throw new Error('hosted-container-root-authority-invalid')
@@ -269,7 +290,8 @@ export class HostedOpenCodeContainerSupervisor {
       throw new Error('hosted-container-seccomp-not-deny-default')
     }
     this.seccomp = profile
-    const image = object(JSON.parse(await this.docker.run('image', 'inspect', '--format', '{{json .}}', this.options.image)))
+    const image = object(this.rootDocker ? await this.rootDocker.inspectImage() :
+      JSON.parse(await this.docker.run('image', 'inspect', '--format', '{{json .}}', this.options.image)))
     if (typeof image.Id !== 'string' || !/^sha256:[0-9a-f]{64}$/.test(image.Id) ||
       !Array.isArray(image.RepoDigests) || !image.RepoDigests.includes(this.options.image) ||
       object(object(image.Config).Labels)[BOOTSTRAP_SHA_LABEL] !== this.options.bootstrapSha256) {
@@ -281,7 +303,8 @@ export class HostedOpenCodeContainerSupervisor {
   }
 
   private async networkContainers(): Promise<Record<string, unknown>> {
-    const network = object(JSON.parse(await this.docker.run('network', 'inspect', '--format', '{{json .}}', this.options.networkId)))
+    const network = object(this.rootDocker ? await this.rootDocker.inspectNetwork() :
+      JSON.parse(await this.docker.run('network', 'inspect', '--format', '{{json .}}', this.options.networkId)))
     // Provider egress requires a separately reviewed Qwen-only gateway. This checkpoint has none.
     if (network.Id !== this.options.networkId || network.Driver !== 'bridge' || network.Scope !== 'local' ||
       network.Internal !== true || network.Ingress === true) {
@@ -806,7 +829,9 @@ export class HostedOpenCodeContainerSupervisor {
   }
 
   private async inspect(record: ContainerRecord): Promise<Record<string, unknown>> {
-    const inspected = object(JSON.parse(await this.docker.run('inspect', '--format', '{{json .}}', record.containerId ?? record.handle)))
+    if (this.rootDocker && !record.containerId) throw new Error('hosted-container-root-target-unresolved')
+    const inspected = object(this.rootDocker ? await this.rootDocker.inspectContainer(this.rootTarget(record, true)) :
+      JSON.parse(await this.docker.run('inspect', '--format', '{{json .}}', record.containerId ?? record.handle)))
     const labels = object(object(inspected.Config).Labels)
     if (typeof inspected.Id !== 'string' || !CONTAINER_ID.test(inspected.Id) ||
       record.containerId !== null && inspected.Id !== record.containerId ||
@@ -815,6 +840,13 @@ export class HostedOpenCodeContainerSupervisor {
     }
     if (record.containerId === null) { record.containerId = inspected.Id; await this.persist(record) }
     return inspected
+  }
+
+  private rootTarget(record: ContainerRecord, withId: boolean): RootContainerTarget {
+    return withId ? { memberOperationId: record.operationId, handle: record.handle,
+      generation: record.generation, networkId: this.options.networkId, containerId: record.containerId! } :
+      { memberOperationId: record.operationId, handle: record.handle,
+        generation: record.generation, networkId: this.options.networkId }
   }
 
   private assertEffective(inspected: Record<string, unknown>, record: ContainerRecord): void {
@@ -1068,8 +1100,16 @@ export class HostedOpenCodeContainerSupervisor {
         { handle: record.handle, generation: record.generation })
       record.createIssued = true
       await this.persist(record)
-      if (!this.docker.runWithEnvironment) throw new Error('hosted-container-secret-docker-runner-required')
-      const created = await this.docker.runWithEnvironment({ OPENCODE_SERVER_PASSWORD: this.serverPassword(record.generation) },
+      if (this.rootDocker && this.rootDockerClaims) {
+        await this.rootDockerClaims.writeCreate({ target: this.rootTarget(record, false),
+          workspace: lease.workspace, profile: lease.profile, config: lease.config,
+          seccomp: this.seccomp as Record<string, unknown>, apparmorProfile: this.options.apparmorProfile })
+      }
+      if (!this.rootDocker && !this.docker.runWithEnvironment) {
+        throw new Error('hosted-container-secret-docker-runner-required')
+      }
+      const created = this.rootDocker ? await this.rootDocker.createContainer(this.rootTarget(record, false)) :
+        await this.docker.runWithEnvironment!({ OPENCODE_SERVER_PASSWORD: this.serverPassword(record.generation) },
         'create', '--name', record.handle, '--label', `${GENERATION_LABEL}=${record.generation}`,
         '--user', '1000:1000', '--read-only', '--network', this.options.networkId,
         '--ipc', 'private', '--cap-drop', 'ALL',
@@ -1090,10 +1130,12 @@ export class HostedOpenCodeContainerSupervisor {
       if (!CONTAINER_ID.test(created)) throw new Error('hosted-container-create-id-invalid')
       record.containerId = created
       await this.persist(record)
+      if (this.rootDockerClaims) this.rootDockerClaims.writeTarget(this.rootTarget(record, true))
       this.assertEffective(await this.inspect(record), record)
       await this.assertNetworkPrepared(record)
       await this.checkedLeaseIdentityWithoutFreshness(lease)
-      await this.docker.run('start', created)
+      if (this.rootDocker) await this.rootDocker.startContainer(this.rootTarget(record, true))
+      else await this.docker.run('start', created)
       const inspected = await this.inspect(record)
       this.assertEffective(inspected, record)
       await this.assertNetworkOwned(record)
@@ -1282,7 +1324,9 @@ export class HostedOpenCodeContainerSupervisor {
       const state = object(inspected.State)
       if (state.Running === true) {
         await this.assertNetworkOwned(record)
-        await this.docker.run('stop', '--time', '2', record.containerId!).catch(() => undefined)
+        if (this.rootDocker) await this.rootDocker.stopCurrentContainer(this.rootTarget(record, true))
+          .catch(() => undefined)
+        else await this.docker.run('stop', '--time', '2', record.containerId!).catch(() => undefined)
         inspected = await this.inspect(record)
       } else {
         await this.assertNetworkPrepared(record)
@@ -1292,7 +1336,8 @@ export class HostedOpenCodeContainerSupervisor {
         return { handle: record.handle, generation: record.generation, stopped: false, unresolved: true }
       }
       await this.assertNetworkPrepared(record)
-      await this.docker.run('rm', record.containerId!).catch(() => undefined)
+      if (this.rootDocker) await this.rootDocker.removeContainer().catch(() => undefined)
+      else await this.docker.run('rm', record.containerId!).catch(() => undefined)
       try { await this.inspect(record); return { handle: record.handle, generation: record.generation, stopped: false, unresolved: true } }
       catch (error) {
         if (!(error instanceof HostedContainerNotFound)) throw error

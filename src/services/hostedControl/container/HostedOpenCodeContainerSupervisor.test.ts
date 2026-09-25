@@ -584,6 +584,22 @@ describe('disposable hosted OpenCode container supervisor', () => {
     } finally { await f.cleanup() }
   })
 
+  test('typed root Docker composition denies image proof without falling back to CLI', async () => {
+    const f = await fixture()
+    try {
+      const before = f.docker.calls.length
+      const denied = async () => { throw new Error('typed-root-image-proof-unavailable') }
+      const rootDocker = { createContainer: denied, startContainer: denied,
+        inspectContainer: denied, stopCurrentContainer: denied, inspectImage: denied,
+        inspectNetwork: denied, removeContainer: denied }
+      const rootDockerClaims = { writeCreate: denied, writeTarget: denied }
+      await expect(HostedOpenCodeContainerSupervisor.create({ ...f.options,
+        rootDocker: rootDocker as never, rootDockerClaims: rootDockerClaims as never }))
+        .rejects.toThrow('typed-root-image-proof-unavailable')
+      expect(f.docker.calls).toHaveLength(before)
+    } finally { await f.cleanup() }
+  })
+
   test('prepared Start without a pending Owner channel has no Docker effect', async () => {
     let leaseId = ''
     const operationId = 'start_12345678'
