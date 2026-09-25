@@ -9,6 +9,7 @@ const MAX_RESPONSE = 1024 * 1024
 const MAX_WRITE_MS = 500
 const OPERATION_ID = /^[a-z][a-z0-9_-]{7,127}$/
 const DOCKER_ID = /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/
+const IMAGE_REF = /^[a-z0-9][a-z0-9._:/-]*@sha256:[a-f0-9]{64}$/
 const SHA = /^[a-f0-9]{64}$/
 const sha = (data: string | Buffer): string => createHash('sha256').update(data).digest('hex')
 
@@ -20,6 +21,7 @@ export type RootDockerOperation = Readonly<{
   | { kind: 'create_container'; containerName: string; body: string }
   | { kind: 'start_container' | 'inspect_container' | 'stop_container'; containerId: string }
   | { kind: 'inspect_network'; networkId: string }
+  | { kind: 'inspect_image'; imageRef: string }
 )>
 
 export type RootDockerDispatchResult =
@@ -110,6 +112,7 @@ function route(operation: RootDockerOperation): Route {
     inspect_container: ['operationId', 'bodySha256', 'kind', 'containerId'],
     stop_container: ['operationId', 'bodySha256', 'kind', 'containerId'],
     inspect_network: ['operationId', 'bodySha256', 'kind', 'networkId'],
+    inspect_image: ['operationId', 'bodySha256', 'kind', 'imageRef'],
   }
   if (!Object.hasOwn(expectedFields, operation.kind) ||
     Object.keys(operation).sort().join(',') !== [...expectedFields[operation.kind]].sort().join(',')) {
@@ -151,6 +154,12 @@ function route(operation: RootDockerOperation): Route {
         throw new Error('root-docker-target-invalid')
       }
       uri = `${API}/networks/${operation.networkId}`
+      method = 'GET'; decision = 'observe'; successStatus = [200]
+      break
+    case 'inspect_image':
+      if (typeof operation.imageRef !== 'string' || operation.imageRef.length > 256 ||
+        !IMAGE_REF.test(operation.imageRef)) throw new Error('root-docker-target-invalid')
+      uri = `${API}/images/${encodeURIComponent(operation.imageRef)}/json`
       method = 'GET'; decision = 'observe'; successStatus = [200]
       break
     default:

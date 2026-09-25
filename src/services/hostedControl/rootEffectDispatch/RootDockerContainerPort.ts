@@ -6,6 +6,7 @@ import { hostedMemberStartOperationId } from '../../teamLifecycleOwner/HostedMem
 import type { HostedProductMemberBinding } from '../productAuthority/HostedProductCurrentMemberDecision.js'
 import { HostedRootSingleMemberAuthority } from './HostedRootSingleMemberAuthority.js'
 import { RootDockerEngineDispatcher, type RootDockerOperation } from './RootDockerEngineDispatcher.js'
+import type { RootDockerReadOnlyProofPort } from './RootDockerReadOnlyProofPort.js'
 
 const SHA = /^[a-f0-9]{64}$/
 const GENERATION = /^[a-f0-9]{32}$/
@@ -85,7 +86,8 @@ export class RootDockerContainerPort {
     binding: HostedProductMemberBinding,
     private readonly options: { effectClaimDirectory: string; socketPath: string; image: string;
       serverPasswordKey: Uint8Array;
-      networkId: string; testOnlyAllowNonRoot?: boolean }) {
+      networkId: string; readOnlyProof?: RootDockerReadOnlyProofPort;
+      testOnlyAllowNonRoot?: boolean }) {
     if (!path.isAbsolute(stateDirectory) || path.normalize(stateDirectory) !== stateDirectory ||
       !IMAGE.test(options.image) || !SHA.test(options.networkId) ||
       !options.serverPasswordKey || options.serverPasswordKey.length !== 32) {
@@ -109,6 +111,7 @@ export class RootDockerContainerPort {
   static create(options: { stateDirectory: string; effectClaimDirectory: string; socketPath: string;
     authority: HostedRootSingleMemberAuthority; binding: HostedProductMemberBinding;
     image: string; networkId: string; serverPasswordKey: Uint8Array;
+    readOnlyProof?: RootDockerReadOnlyProofPort;
     testOnlyAllowNonRoot?: boolean }): RootDockerContainerPort {
     return new RootDockerContainerPort(options.stateDirectory, options.authority,
       options.binding, options)
@@ -263,7 +266,13 @@ export class RootDockerContainerPort {
     return value as Record<string, unknown>
   }
   async stopCurrentContainer(target: RootContainerTarget): Promise<void> { await this.send('stop', target) }
-  async inspectImage(): Promise<never> { throw new Error('root-container-port-image-inspect-unavailable') }
-  async inspectNetwork(): Promise<never> { throw new Error('root-container-port-network-inspect-unavailable') }
+  async inspectImage(): Promise<Record<string, unknown>> {
+    if (!this.options.readOnlyProof) throw new Error('root-container-port-image-inspect-unavailable')
+    return this.options.readOnlyProof.inspectImage()
+  }
+  async inspectNetwork(): Promise<Record<string, unknown>> {
+    if (!this.options.readOnlyProof) throw new Error('root-container-port-network-inspect-unavailable')
+    return this.options.readOnlyProof.inspectNetwork()
+  }
   async removeContainer(): Promise<never> { throw new Error('root-container-port-remove-unavailable') }
 }
