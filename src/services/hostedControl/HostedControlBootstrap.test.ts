@@ -47,6 +47,7 @@ describe('hosted control inherited-descriptor bootstrap', () => {
       approvalActivationV2Present: false,
       admissionKind: 'core-lifecycle-v1',
       appMcp: null,
+      nativeProviders: null,
     })
     fixture.liveness.end()
     expect(await fixture.lines.next()).toEqual({
@@ -81,6 +82,42 @@ describe('hosted control inherited-descriptor bootstrap', () => {
       expectRejected(await launchFixture(10_000, { core: true, header: header => ({ ...header, appMcp }) })),
       expectRejected(await launchFixture(10_000, { core: true, header: header =>
         ({ ...personal(header), appMcp: { ...appMcp, entry: 'relative/index.js' } }) })),
+    ])
+  }, 30_000)
+
+  test('admits native provider paths only on personal host, after appMcp, outside the Claude root', async () => {
+    const appMcp = {
+      command: '/opt/issuer/agent-teams-mcp/node', commandSha256: '1'.repeat(64),
+      entry: '/opt/issuer/agent-teams-mcp/index.js', entrySha256: '2'.repeat(64),
+    }
+    const nativeProviders = {
+      anthropic: { oauthTokenFile: '/etc/agent-teams/claude-oauth-token' },
+      codex: { codexHome: '/home/agent/.codex', codexCliPath: '/usr/local/bin/codex' },
+    }
+    const personal = (extra: Record<string, unknown>) => (header: HostedControlBootstrapHeader) =>
+      ({ ...header, admissionKind: 'core-lifecycle-personal-host-v1', ...extra }) as HostedControlBootstrapHeader
+    for (const [transform, expected] of [
+      [personal({ appMcp, nativeProviders }), { appMcp, nativeProviders }],
+      [personal({ nativeProviders: { codex: nativeProviders.codex } }),
+        { appMcp: null, nativeProviders: { codex: nativeProviders.codex } }],
+    ] as const) {
+      const fixture = await launchFixture(10_000, { core: true, header: transform })
+      fixture.bootstrap.end(frame(fixture.header, fixture.secret))
+      expect(await fixture.lines.next()).toMatchObject({ kind: 'admitted', ...expected })
+      fixture.liveness.end()
+      expect(await fixture.lines.next()).toMatchObject({ kind: 'lost' })
+      expect(await exitCode(fixture.child)).toBe(0)
+    }
+    await Promise.all([
+      // Only personal host; fixed trailing order; no empty encoding of absence;
+      // provider order inside the object; credentials outside the agent-writable root.
+      expectRejected(await launchFixture(10_000, { core: true, header: header => ({ ...header, nativeProviders }) })),
+      expectRejected(await launchFixture(10_000, { core: true, header: personal({ nativeProviders, appMcp }) })),
+      expectRejected(await launchFixture(10_000, { core: true, header: personal({ nativeProviders: {} }) })),
+      expectRejected(await launchFixture(10_000, { core: true, header: personal({ nativeProviders: {
+        codex: nativeProviders.codex, anthropic: nativeProviders.anthropic } }) })),
+      expectRejected(await launchFixture(10_000, { core: true, header: header => personal({ nativeProviders: {
+        anthropic: { oauthTokenFile: `${header.claudeRoot}/token` } } })(header) })),
     ])
   }, 30_000)
 

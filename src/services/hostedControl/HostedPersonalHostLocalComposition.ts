@@ -24,6 +24,7 @@ import type {
   HostedControlRuntimePortFactory,
   HostedControlRuntimePortFactoryContext,
 } from './HostedControlRuntime.js'
+import type { HostedNativeHostLocalConfig } from './HostedNativeHostLocalLane.js'
 import {
   HostedTeamLeadInboxPump,
   type HostedTeamLeadInboxPumpOptions,
@@ -53,6 +54,8 @@ export const createHostLocalOpenCodeLane: HostedHostLocalLaneFactory = (_context
 export type HostedPersonalHostLocalConfig = Readonly<{
   /** From the authenticated personal-host bootstrap; never from env or files. */
   appMcp: HostedAppMcpDescriptor | null
+  /** From the same bootstrap; absent means no native lane may be installed. */
+  native?: HostedNativeHostLocalConfig | null
   lanes?: readonly HostedHostLocalLaneFactory[]
   createInboxPump?(options: HostedTeamLeadInboxPumpOptions): HostedTeamInboxPumpPort
 }>

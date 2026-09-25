@@ -5,6 +5,7 @@ import { createReadStream } from 'node:fs'
 import type { BigIntStats } from 'node:fs'
 import { promisify } from 'node:util'
 import type { HostedAppMcpDescriptor } from '../opencode/OpenCodeMcpManager.js'
+import type { HostedNativeHostLocalConfig } from './HostedNativeHostLocalLane.js'
 import type { HostedControlRuntimeConfig } from './HostedControlRuntimeConfig.js'
 
 export const HOSTED_CONTROL_BOOTSTRAP_FORMAT = 'agent-teams.hosted-control.bootstrap/v1'
@@ -106,6 +107,8 @@ export type HostedControlBootstrapHeader = HostedControlBootstrapHeaderBase & {
   approvalActivationV2?: HostedApprovalActivationV2BootstrapExpectation
   /** Personal-host only; absent when the issuer did not prepare the MCP artifact. */
   appMcp?: HostedAppMcpDescriptor
+  /** Personal-host only; credential and CLI paths, never secrets. Absent means no native lane. */
+  nativeProviders?: HostedNativeHostLocalConfig
 }
 
 export type HostedControlDescriptorGuard = {
@@ -121,6 +124,7 @@ export type HostedControlBootstrapAdmission = {
   /** Present only for authenticated Core headers; selects the lifecycle composition. */
   admissionKind?: HostedControlAdmissionKind
   appMcp?: HostedAppMcpDescriptor
+  nativeProviders?: HostedNativeHostLocalConfig
   expectedOwnerArtifactDigest: `sha256:${string}`
   secret: Buffer
   guard: HostedControlDescriptorGuard
@@ -136,7 +140,11 @@ const CORE_HEADER_KEYS = [
   'ownerAuthority', 'ownerGeneration', 'ownerSessionId', 'claudeRoot', 'socketPath',
   'legacyKey', 'bootstrapBinding', 'leaseEvidence',
 ] as const
-const PERSONAL_HOST_APP_MCP_HEADER_KEYS = [...CORE_HEADER_KEYS, 'appMcp'] as const
+// Personal-host optional trailing keys, in this order: appMcp, then nativeProviders.
+const PERSONAL_HOST_OPTIONAL_KEYS = ['appMcp', 'nativeProviders'] as const
+const NATIVE_PROVIDER_KEYS = ['anthropic', 'codex'] as const
+const ANTHROPIC_PROVIDER_KEYS = ['oauthTokenFile'] as const
+const CODEX_PROVIDER_KEYS = ['codexHome', 'codexCliPath'] as const
 const APP_MCP_KEYS = ['command', 'commandSha256', 'entry', 'entrySha256'] as const
 const CORE_ADMISSION_KINDS: readonly string[] = [
   'core-lifecycle-v1', HOSTED_CONTROL_PERSONAL_HOST_ADMISSION_KIND,
@@ -247,6 +255,7 @@ export async function readHostedControlBootstrap(options: {
       ...(header.approvalActivationV2 ? { approvalActivationV2: header.approvalActivationV2 } : {}),
       ...(header.admissionKind ? { admissionKind: header.admissionKind } : {}),
       ...(header.appMcp ? { appMcp: header.appMcp } : {}),
+      ...(header.nativeProviders ? { nativeProviders: header.nativeProviders } : {}),
       expectedOwnerArtifactDigest: lease.ownerArtifactDigest,
       secret,
       guard,
@@ -282,10 +291,10 @@ function decodeCanonicalHeader(bytes: Buffer): HostedControlBootstrapHeader {
     : undefined
   // An unknown kind falls through to the approval key set and is rejected there.
   const isCore = typeof kind === 'string' && CORE_ADMISSION_KINDS.includes(kind)
-  const hasAppMcp = kind === HOSTED_CONTROL_PERSONAL_HOST_ADMISSION_KIND &&
-    Object.hasOwn(unknown as object, 'appMcp')
-  const raw = exactRecord(unknown, !isCore ? HEADER_KEYS
-    : hasAppMcp ? PERSONAL_HOST_APP_MCP_HEADER_KEYS : CORE_HEADER_KEYS)
+  const optional = kind === HOSTED_CONTROL_PERSONAL_HOST_ADMISSION_KIND
+    ? PERSONAL_HOST_OPTIONAL_KEYS.filter(key => Object.hasOwn(unknown as object, key))
+    : []
+  const raw = exactRecord(unknown, !isCore ? HEADER_KEYS : [...CORE_HEADER_KEYS, ...optional])
   if (JSON.stringify(raw) !== text) fail()
   const binding = exactRecord(raw.bootstrapBinding, BINDING_KEYS)
   const activation = isCore ? null : exactRecord(raw.approvalActivationV2, ACTIVATION_KEYS)
@@ -302,7 +311,10 @@ function decodeCanonicalHeader(bytes: Buffer): HostedControlBootstrapHeader {
     claudeRoot: absoluteCanonicalPath(raw.claudeRoot),
     socketPath: absoluteCanonicalPath(raw.socketPath, 103),
     legacyKey: exactString(raw.legacyKey, /^[A-Za-z0-9_-]{1,128}$/),
-    ...(hasAppMcp ? { appMcp: decodeAppMcp(raw.appMcp) } : {}),
+    ...(optional.includes('appMcp') ? { appMcp: decodeAppMcp(raw.appMcp) } : {}),
+    ...(optional.includes('nativeProviders') ? {
+      nativeProviders: decodeNativeProviders(raw.nativeProviders, absoluteCanonicalPath(raw.claudeRoot)),
+    } : {}),
     ...(isCore ? { admissionKind: exactString(raw.admissionKind, /^core-lifecycle(?:-personal-host)?-v1$/) as HostedControlAdmissionKind } : { approvalActivationV2: {
       approvalGeneration: integer(activation.approvalGeneration, 1),
       admissionOwnerGeneration: integer(activation.admissionOwnerGeneration, 1),
@@ -364,6 +376,30 @@ function validateBootstrapBinding(
 }
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/
+
+/** Present providers only, in fixed order; an empty object would be a second encoding of absence. */
+function decodeNativeProviders(value: unknown, claudeRoot: string): HostedNativeHostLocalConfig {
+  const present = !!value && typeof value === 'object' && !Array.isArray(value)
+    ? NATIVE_PROVIDER_KEYS.filter(key => Object.hasOwn(value, key))
+    : []
+  if (present.length === 0) fail()
+  const raw = exactRecord(value, present)
+  // Credentials must not live where agents of this team can write.
+  const credentialPath = (candidate: unknown): string => {
+    const path = absoluteCanonicalPath(candidate)
+    if (path === claudeRoot || path.startsWith(`${claudeRoot}/`)) fail()
+    return path
+  }
+  const anthropic = raw.anthropic === undefined ? null : exactRecord(raw.anthropic, ANTHROPIC_PROVIDER_KEYS)
+  const codex = raw.codex === undefined ? null : exactRecord(raw.codex, CODEX_PROVIDER_KEYS)
+  return {
+    ...(anthropic ? { anthropic: { oauthTokenFile: credentialPath(anthropic.oauthTokenFile) } } : {}),
+    ...(codex ? { codex: {
+      codexHome: credentialPath(codex.codexHome),
+      codexCliPath: credentialPath(codex.codexCliPath),
+    } } : {}),
+  }
+}
 
 function decodeAppMcp(value: unknown): HostedAppMcpDescriptor {
   const raw = exactRecord(value, APP_MCP_KEYS)

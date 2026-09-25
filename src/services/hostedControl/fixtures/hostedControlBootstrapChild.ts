@@ -26,6 +26,7 @@ try {
       approvalActivationV2Present: !!admission.approvalActivationV2,
       admissionKind: admission.admissionKind ?? null,
       appMcp: admission.appMcp ?? null,
+      nativeProviders: admission.nativeProviders ?? null,
     } : {}),
   })}\n`)
   await admission.guard.lost

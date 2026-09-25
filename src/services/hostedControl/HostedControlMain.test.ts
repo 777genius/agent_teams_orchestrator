@@ -94,7 +94,14 @@ describe('hosted control admission kind', () => {
       { admissionKind: 'core-lifecycle-personal-host-v1', appMcp }, factories)).toBe(personalFactory)
     expect(selectHostedControlPortFactory(
       { admissionKind: 'core-lifecycle-personal-host-v1' }, factories)).toBe(personalFactory)
-    expect(configs).toEqual([{ appMcp }, { appMcp: null }])
+    const nativeProviders = { codex: { codexHome: '/home/agent/.codex', codexCliPath: '/usr/bin/codex' } }
+    expect(selectHostedControlPortFactory({ admissionKind: 'core-lifecycle-v1', nativeProviders }, factories))
+      .toBe(standard)
+    expect(selectHostedControlPortFactory(
+      { admissionKind: 'core-lifecycle-personal-host-v1', nativeProviders }, factories)).toBe(personalFactory)
+    expect(configs).toEqual([
+      { appMcp, native: null }, { appMcp: null, native: null }, { appMcp: null, native: nativeProviders },
+    ])
   })
 
   test('drops ambient MCP wiring and pins the config root only for personal host', () => {

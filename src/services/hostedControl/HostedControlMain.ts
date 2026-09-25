@@ -51,11 +51,14 @@ export type HostedControlPortFactories = Readonly<{
 
 /** The admission kind is the only switch between no lanes and host-local lanes. */
 export function selectHostedControlPortFactory(
-  admission: Pick<HostedControlBootstrapAdmission, 'admissionKind' | 'appMcp'>,
+  admission: Pick<HostedControlBootstrapAdmission, 'admissionKind' | 'appMcp' | 'nativeProviders'>,
   factories: HostedControlPortFactories,
 ): HostedControlRuntimePortFactory {
   return admission.admissionKind === HOSTED_CONTROL_PERSONAL_HOST_ADMISSION_KIND
-    ? factories.personalHost({ appMcp: admission.appMcp ?? null })
+    ? factories.personalHost({
+      appMcp: admission.appMcp ?? null,
+      native: admission.nativeProviders ?? null,
+    })
     : factories.standard
 }
 
