@@ -7,7 +7,7 @@ import { dirname, join } from 'node:path'
 import type { HostedLifecycleAuthority } from './HostedControlDispatcher.js'
 import type { TeamLifecycleLaneEffectPort } from '../teamLifecycleOwner/OpenCodeTeamLifecycleLane.js'
 import { TEAM_LEAD_NAME } from '../../utils/swarm/constants.js'
-import type { HostedControlRuntimePorts } from './HostedControlRuntime.js'
+import type { HostedControlRuntimePortFactory, HostedControlRuntimePorts } from './HostedControlRuntime.js'
 import { createHostedPersonalHostLocalPortFactory } from './HostedPersonalHostLocalComposition.js'
 import {
   createHostedControlProductionPortFactory,
@@ -466,6 +466,25 @@ describe('createHostedPersonalHostLocalPortFactory', () => {
       await ports.close()
       expect(launches).toEqual([])
     }
+  })
+
+  test('lane plan admission survives composition, and without personal-host no lane exists', async () => {
+    const teamRoot = await makeTeamRoot('hosted-personal-plan-admission-')
+    const workspace = join(teamRoot, 'sandbox-workspace')
+    await mkdir(workspace, { mode: 0o700 })
+    await writePlan(teamRoot, 'native', workspace)
+    const state = async (factory: HostedControlRuntimePortFactory) => {
+      const ports = await factory(personalContext(teamRoot, workspace))
+      try {
+        return (await ports.lifecycle.dispatch(controlStateInput())).payload
+      } finally { await ports.close() }
+    }
+    const nativeLane = (admitted: boolean) => () => fakeLane({ kind: 'native', supportsPlan: () => admitted })
+    expect(await state(createHostedPersonalHostLocalPortFactory({ appMcp: null, lanes: [nativeLane(true)] })))
+      .toMatchObject({ kind: 'control_state', availableActions: ['launch'] })
+    expect((await state(createHostedPersonalHostLocalPortFactory({ appMcp: null, lanes: [nativeLane(false)] }))).kind)
+      .toBe('unavailable')
+    expect((await state(createHostedControlProductionPorts)).kind).toBe('unavailable')
   })
 
   test('the production OpenCode lane is launchable only with a verified pinned MCP artifact', async () => {

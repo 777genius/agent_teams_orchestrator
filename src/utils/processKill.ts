@@ -369,6 +369,31 @@ async function listLinuxProcessGroupMembers(pgid: number): Promise<number[] | nu
   }
 }
 
+/**
+ * Read-only observation that no live member of a Unix process group remains.
+ * Linux ignores zombies through /proc; other Unix platforms use kill(-pgid, 0).
+ * Returns null when the group cannot be observed, which callers must treat as
+ * "not proven empty".
+ */
+export async function isProcessGroupEmpty(
+  pgid: number,
+  platform: NodeJS.Platform = process.platform,
+): Promise<boolean | null> {
+  if (!Number.isSafeInteger(pgid) || pgid <= 1 || platform === 'win32') return null
+  if (platform === 'linux') {
+    const members = await listLinuxProcessGroupMembers(pgid)
+    return members === null ? null : members.length === 0
+  }
+  try {
+    process.kill(-pgid, 0)
+    return false
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === 'ESRCH') return true
+    return code === 'EPERM' ? false : null
+  }
+}
+
 async function terminateWindowsJobStable(
   expectedOsIdentity: string | undefined,
   options: ExactProcessTreeTerminationOptions,

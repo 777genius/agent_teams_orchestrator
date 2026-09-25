@@ -351,6 +351,7 @@ import {
 } from '../utils/teammateMailbox.js'
 import { readTeamFileAsync, removeTeammateFromTeamFileIfIdentityMatches } from '../utils/swarm/teamHelpers.js'
 import { killProcessBackendRuntime } from '../utils/swarm/processBackend.js'
+import { shouldTeamLeadPollInbox } from '../utils/swarm/hostedLeadInboxPoll.js'
 import { ensureBackendsRegistered, getBackendByType } from '../utils/swarm/backends/registry.js'
 import { isInsideTmux } from '../utils/swarm/backends/detection.js'
 import { isPaneBackend } from '../utils/swarm/backends/types.js'
@@ -2649,7 +2650,13 @@ function runHeadlessStreaming(
             (refreshedState.teamContext &&
               Object.keys(refreshedState.teamContext.teammates).length > 0)
 
-          if (!hasActiveTeammates) {
+          if (
+            !shouldTeamLeadPollInbox({
+              hasActiveTeammates: Boolean(hasActiveTeammates),
+              hasTeamContext: Boolean(refreshedState.teamContext),
+              inputClosed,
+            })
+          ) {
             logForDebugging(
               '[print.ts] No more active teammates, stopping poll',
             )

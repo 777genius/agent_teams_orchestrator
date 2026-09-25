@@ -95,8 +95,10 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
   }
 
   supports(plan: TeamLifecycleLaunchPlan, action: HostedLifecycleAction): boolean {
-    return this.#acceptingEffects &&
-      plan.lanes.every(lane => this.#adapters.get(lane.kind)?.supports(action) === true)
+    return this.#acceptingEffects && plan.lanes.every(lane => {
+      const adapter = this.#adapters.get(lane.kind)
+      return adapter?.supports(action) === true && (adapter.supportsPlan?.(plan) ?? true)
+    })
   }
 
   inspect(plan: TeamLifecycleLaunchPlan): Promise<HostedLifecycleProviderSnapshot> {

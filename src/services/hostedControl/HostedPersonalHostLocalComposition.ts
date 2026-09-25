@@ -13,6 +13,7 @@ import {
   type TeamLifecycleLaneEffectPort,
   type TeamLifecycleLaneInput,
 } from '../teamLifecycleOwner/OpenCodeTeamLifecycleLane.js'
+import type { TeamLifecycleLaunchPlan } from '../teamLifecycleOwner/TeamLifecycleLaunchPlan.js'
 import { TEAM_LEAD_NAME } from '../../utils/swarm/constants.js'
 import {
   createHostedControlPortFactory,
@@ -124,6 +125,8 @@ function withAdmittedWorkspaceRoot(
   return Object.freeze({
     kind: lane.kind,
     supports: (action: Parameters<TeamLifecycleLaneEffectPort['supports']>[0]) => lane.supports(action),
+    // Plan admission (for example native topology limits) must survive the wrapper.
+    ...(lane.supportsPlan ? { supportsPlan: (plan: TeamLifecycleLaunchPlan) => lane.supportsPlan!(plan) } : {}),
     inspect: async (input: TeamLifecycleLaneInput & { runId: string | null }) => {
       admit(input.workspaceRoot)
       return lane.inspect(input)

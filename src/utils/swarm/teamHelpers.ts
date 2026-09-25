@@ -21,7 +21,7 @@ import {
   buildProcessBackendPaneId,
   killProcessBackendRuntime,
 } from './processBackend.js'
-import { safeWindowsPathSegment } from '../windowsReservedNames.js'
+import { sanitizeName } from './teamNameSanitizer.js'
 
 export const inputSchema = lazySchema(() =>
   z.strictObject({
@@ -174,13 +174,7 @@ export type Input = z.infer<ReturnType<typeof inputSchema>>
 // Export SpawnTeamOutput as Output for backward compatibility
 export type Output = SpawnTeamOutput
 
-/**
- * Sanitizes a name for use in tmux window names, worktree paths, and file paths.
- * Replaces all non-alphanumeric characters with hyphens and lowercases.
- */
-export function sanitizeName(name: string): string {
-  return safeWindowsPathSegment(name.replace(/[^a-zA-Z0-9]/g, '-').toLowerCase())
-}
+export { sanitizeName }
 
 /**
  * Sanitizes an agent name for use in deterministic agent IDs.

@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 
 import { createOwnedOpenCodeLifecycleCommandExecutor } from '../opencode/OpenCodeBridgeCommandHandler.js'
-import type { TeamLifecycleLaunchLane } from './TeamLifecycleLaunchPlan.js'
+import type { TeamLifecycleLaunchLane, TeamLifecycleLaunchPlan } from './TeamLifecycleLaunchPlan.js'
 
 export type TeamLifecycleLanePhase = 'idle' | 'launching' | 'running' | 'failed'
 
@@ -13,6 +13,8 @@ export type TeamLifecycleLaneObservation = {
 export interface TeamLifecycleLaneEffectPort {
   readonly kind: TeamLifecycleLaunchLane['kind']
   supports(action: 'launch' | 'cancel' | 'stop' | 'recover'): boolean
+  /** Optional whole-plan topology admission; absent admits every plan containing this lane kind. */
+  supportsPlan?(plan: TeamLifecycleLaunchPlan): boolean
   inspect(input: TeamLifecycleLaneInput & { runId: string | null }): Promise<TeamLifecycleLaneObservation>
   launch(input: TeamLifecycleLaneInput & { runId: string }): Promise<TeamLifecycleLaneObservation>
   cancel(input: TeamLifecycleLaneInput & { runId: string }): Promise<TeamLifecycleLaneObservation>
