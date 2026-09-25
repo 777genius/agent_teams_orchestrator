@@ -72,6 +72,15 @@ export class OpenCodeTeamLifecycleLane implements TeamLifecycleLaneEffectPort {
 
   supports(): boolean { return this.hasLiveCapability() }
 
+  /**
+   * Capability the bridge reported when this process launched the run.
+   * Non-Cursor session records carry no stop authority, so delivery to the
+   * run's retained host has no other source for it.
+   */
+  launchedCapability(input: { teamId: string; laneId: string; runId: string }): string | null {
+    return this.#launchedCapabilities.get(runKey(input.teamId, input.laneId, input.runId)) ?? null
+  }
+
   async inspect(input: {
     planTeamId: string
     workspaceRoot: string

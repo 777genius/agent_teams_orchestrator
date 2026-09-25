@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto'
 import { realpathSync } from 'node:fs'
-import { isAbsolute, join } from 'node:path'
+import { dirname, isAbsolute, join } from 'node:path'
 
+import { readOpenCodeLegacyStopCapability } from '../opencode/OpenCodeLegacyStopAuthority.js'
 import {
   buildHostedAppMcpLaunchConfig,
   verifyHostedAppMcpDescriptor,
@@ -10,6 +11,7 @@ import {
 } from '../opencode/OpenCodeMcpManager.js'
 import {
   createProductionOpenCodeTeamLifecycleLane,
+  OpenCodeTeamLifecycleLane,
   type TeamLifecycleLaneEffectPort,
   type TeamLifecycleLaneInput,
 } from '../teamLifecycleOwner/OpenCodeTeamLifecycleLane.js'
@@ -88,6 +90,7 @@ export function createHostedPersonalHostLocalPortFactory(
       : null
     const host: HostedHostLocalLaneHost = Object.freeze({ appMcp })
     const lanes: TeamLifecycleLaneEffectPort[] = []
+    let openCodeLane: OpenCodeTeamLifecycleLane | null = null
     for (const createLane of laneFactories) {
       const lane = await createLane(context, host)
       if (!lane) continue
@@ -95,13 +98,31 @@ export function createHostedPersonalHostLocalPortFactory(
         lanes.some(existing => existing.kind === lane.kind)) {
         throw new TypeError('Hosted host-local lanes must have distinct supported kinds')
       }
+      if (lane instanceof OpenCodeTeamLifecycleLane) openCodeLane = lane
       lanes.push(bindHostLocalLane(lane, context))
     }
+    if (!lanes.some(lane => lane.kind === 'opencode')) return { lanes }
+    const launched = openCodeLane
     return {
       lanes,
-      ...(lanes.some(lane => lane.kind === 'opencode') ? { createInboxPump } : {}),
+      createInboxPump: launched
+        ? options => createInboxPump({ ...options, getCapability: withLaunchedCapability(launched, options) })
+        : createInboxPump,
     }
   })
+}
+
+/**
+ * Hosted runs have no Product-written legacy manifest, so the pump takes the
+ * capability this lane committed at launch; the legacy manifest stays the
+ * fallback. The lane is keyed by the legacy key, as is the pump.
+ */
+function withLaunchedCapability(
+  lane: OpenCodeTeamLifecycleLane,
+  options: HostedTeamLeadInboxPumpOptions,
+): NonNullable<HostedTeamLeadInboxPumpOptions['getCapability']> {
+  return async input => lane.launchedCapability(input) ??
+    readOpenCodeLegacyStopCapability({ teamsPath: dirname(options.canonicalTeamRoot), ...input })
 }
 
 function createHostedTeamLeadInboxPumpPort(

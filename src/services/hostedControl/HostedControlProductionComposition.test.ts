@@ -5,10 +5,14 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 
 import type { HostedLifecycleAuthority } from './HostedControlDispatcher.js'
-import type { TeamLifecycleLaneEffectPort } from '../teamLifecycleOwner/OpenCodeTeamLifecycleLane.js'
+import {
+  OpenCodeTeamLifecycleLane,
+  type TeamLifecycleLaneEffectPort,
+} from '../teamLifecycleOwner/OpenCodeTeamLifecycleLane.js'
 import { TEAM_LEAD_NAME } from '../../utils/swarm/constants.js'
 import type { HostedControlRuntimePortFactory, HostedControlRuntimePorts } from './HostedControlRuntime.js'
 import { createHostedPersonalHostLocalPortFactory } from './HostedPersonalHostLocalComposition.js'
+import type { HostedTeamLeadInboxPumpOptions } from './HostedTeamLeadInboxPump.js'
 import {
   createHostedControlProductionPortFactory,
   createHostedControlProductionPorts,
@@ -496,6 +500,43 @@ describe('createHostedPersonalHostLocalPortFactory', () => {
     expect(events).toEqual(['recover', 'start', 'pump-close', 'lane-stop'])
     // The runtime team is the signed legacy key: the canonical team directory name.
     expect(runtimeTeams).toEqual(['legacy', 'legacy'])
+  })
+
+  test('the inbox pump selects the capability the host-local OpenCode lane launched with', async () => {
+    const teamRoot = await makePersonalTeamRoot('hosted-personal-capability-')
+    const workspace = await writeAdmittedPlan(teamRoot)
+    const launchedCapability = `opencode:${'e'.repeat(32)}`
+    const execute = (async (input: unknown) => {
+      const { command } = input as { command: string }
+      return {
+        ok: true,
+        runtime: { capabilitySnapshotId: launchedCapability },
+        data: command === 'opencode.readiness'
+          ? { state: 'ready', launchAllowed: true, missing: [],
+              expectedBehaviorEvidence: { expectedBehaviorFingerprint: 'f'.repeat(64) } }
+          : command === 'opencode.stopTeam' ? { stopped: true } : { teamLaunchState: 'ready' },
+      }
+    }) as never
+    const pumpOptions: HostedTeamLeadInboxPumpOptions[] = []
+    const ports = await createHostedPersonalHostLocalPortFactory({
+      appMcp: null,
+      // Non-Cursor session records carry no stop authority and hosted runs have no legacy manifest.
+      lanes: [() => new OpenCodeTeamLifecycleLane(execute, 10_000, () => true, async () => null)],
+      createInboxPump: options => {
+        pumpOptions.push(options)
+        return { wake: async () => ({ kind: 'observed' }), recover: async () => [],
+          start: () => undefined, close: async () => undefined }
+      },
+    })(personalContext(teamRoot, workspace))
+    const { request, runId } = await reservedLaunchRequest(ports, teamRoot)
+    expect((await ports.lifecycle.dispatch(request)).payload.kind).toBe('settled')
+
+    expect(pumpOptions).toHaveLength(1)
+    const getCapability = pumpOptions[0]!.getCapability!
+    const run = { teamId: 'legacy', laneId: 'opencode-primary', runId }
+    expect(await getCapability(run)).toBe(launchedCapability)
+    await expect(getCapability({ ...run, runId: `run_${'d'.repeat(32)}` })).rejects.toThrow()
+    await ports.close()
   })
 
   test('refuses host-local lanes when the process config root is not the admitted Claude root', async () => {
