@@ -36,11 +36,15 @@ function ready(attempt: HostedMemberAttempt, sessionId: string, messageId: strin
 }
 
 function sourceRef(delivery: HostedMemberDelivery): string {
+  // Root's current selector binds only taskId. Two committed task revisions
+  // would alias the same canonical message and produce a false receipt.
+  // Keep this action closed until Root can attest taskRevision and deliveryId.
+  if (delivery.kind === 'task') throw new Error('hosted-root-session-task-revision-unbound')
   // The committed peer wake is named wake_<canonical message id> by the tool broker.
-  const ref = delivery.kind === 'task' ? delivery.taskId :
-    delivery.deliveryId.startsWith('wake_') ? delivery.deliveryId.slice(5) : delivery.deliveryId
-  if (typeof ref !== 'string' || !SOURCE.test(ref) ||
-    !ref.startsWith(delivery.kind === 'task' ? 'task_' : 'message_')) {
+  const ref = typeof delivery.deliveryId === 'string' && delivery.deliveryId.startsWith('wake_')
+    ? delivery.deliveryId.slice(5) : ''
+  if (!SOURCE.test(ref) ||
+    !ref.startsWith('message_')) {
     throw new Error('hosted-root-session-source-invalid')
   }
   return ref
@@ -109,9 +113,9 @@ export class RootMediatedOpenCodeMemberSessionPort implements AuthenticatedHoste
   }
 
   async post(delivery: HostedMemberDelivery, sessionId: string): Promise<HostedMemberDeliveryReceipt> {
-    await this.assertSession(delivery.attempt, sessionId)
     const ref = sourceRef(delivery)
-    const kind = delivery.kind === 'task' ? 'task_delivery' : 'peer_delivery'
+    await this.assertSession(delivery.attempt, sessionId)
+    const kind = 'peer_delivery'
     const result = await this.action(delivery.attempt, kind, ref)
     if (result.outcome !== 'responded' || result.kind !== kind || result.accepted !== true) {
       throw new Error('hosted-root-session-delivery-unconfirmed')
@@ -123,8 +127,9 @@ export class RootMediatedOpenCodeMemberSessionPort implements AuthenticatedHoste
 
   async observeDelivery(delivery: HostedMemberDelivery,
     sessionId: string): Promise<HostedMemberDeliveryReceipt | null> {
+    const ref = sourceRef(delivery)
     await this.assertSession(delivery.attempt, sessionId)
-    const result = await this.action(delivery.attempt, 'delivery_observe', sourceRef(delivery))
+    const result = await this.action(delivery.attempt, 'delivery_observe', ref)
     if (result.outcome !== 'responded' || result.kind !== 'delivery_observe' ||
       (result.observedUserMessageId !== null && !MESSAGE.test(result.observedUserMessageId))) {
       throw new Error('hosted-root-session-delivery-observe-unconfirmed')

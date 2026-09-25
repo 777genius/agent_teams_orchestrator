@@ -76,7 +76,7 @@ test('bad prompt, swapped session and uncommitted peer source send no write sele
   expect(kinds).toEqual(['session_observe'])
   await expect(port.post({ ...delivery, deliveryId: 'delivery_uncommitted' }, sessionId))
     .rejects.toThrow('source-invalid')
-  expect(kinds).toEqual(['session_observe', 'session_observe'])
+  expect(kinds).toEqual(['session_observe'])
 })
 
 test('ambiguous root write does not get a success receipt or retry', async () => {
@@ -90,4 +90,28 @@ test('ambiguous root write does not get a success receipt or retry', async () =>
   } })
   await expect(port.createSession(attempt)).rejects.toThrow('create-unconfirmed')
   expect(kinds).toEqual(['session_observe', 'session_create'])
+})
+
+test('two revisions of one task cannot inherit the same delivery receipt', async () => {
+  const actions: RootOpenCodeAction[] = []
+  const port = new RootMediatedOpenCodeMemberSessionPort({ async sessionAction(action) {
+    actions.push(action)
+    // This would falsely acknowledge both revisions if the port used taskId
+    // alone as its source selector.
+    return action.kind === 'delivery_observe'
+      ? { outcome: 'responded' as const, kind: 'delivery_observe' as const,
+        observedUserMessageId: deliveryMessageId }
+      : { outcome: 'responded' as const, kind: 'session_observe' as const,
+        sessionId, observedInitialMessageId: initialMessageId }
+  } })
+  const task = { ...delivery, kind: 'task' as const, taskId: `task_${'5'.repeat(16)}`,
+    deliveryId: 'delivery_task_12345678', taskRevision: 'revision_11111111' }
+  const revised = { ...task, taskRevision: 'revision_22222222' }
+  for (const version of [task, revised]) {
+    await expect(port.post(version, sessionId)).rejects.toThrow('task-revision-unbound')
+    await expect(port.observeDelivery(version, sessionId)).rejects.toThrow('task-revision-unbound')
+    await expect(port.observeReply(version, sessionId, deliveryMessageId))
+      .rejects.toThrow('task-revision-unbound')
+  }
+  expect(actions).toEqual([])
 })
