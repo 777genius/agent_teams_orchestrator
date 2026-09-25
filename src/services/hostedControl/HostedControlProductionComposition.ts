@@ -19,17 +19,8 @@ import type {
 import type { HostedPersistedMessage } from './HostedTeamMessageService.js'
 import { HostedTeamRecipientRoster } from './HostedTeamRecipientRoster.js'
 import type { HostedControlAuthority } from './protocol.js'
-import { HostedApprovalOwnerWal } from './HostedApprovalOwnerWal.js'
-import { HostedApprovalOwnerStore } from './HostedApprovalOwnerStore.js'
-import { HostedApprovalOwnerService } from './HostedApprovalOwnerService.js'
-import { OpenCodeHostedApprovalRuntimeAdapter } from './OpenCodeHostedApprovalRuntimeAdapter.js'
-import { HostedApprovalActivatablePort } from './HostedApprovalActivatablePort.js'
-import {
-  HostedApprovalActivationSession,
-  type HostedApprovalActivationConnection,
-} from './HostedApprovalActivationSession.js'
-import { createHostedManagedOpenCodeLane,
-  type HostedManagedOpenCodeLaneDependencies } from './isolatedLane/HostedManagedOpenCodeLane.js'
+import type { HostedApprovalActivationConnection } from './HostedApprovalActivationSession.js'
+import type { HostedManagedOpenCodeLaneDependencies } from './isolatedLane/HostedManagedOpenCodeLane.js'
 
 export const HOSTED_LIFECYCLE_PLAN_FILE = 'hosted-lifecycle-plan.v1.json'
 export const HOSTED_LIFECYCLE_EXECUTION_STATE_FILE =
@@ -178,11 +169,13 @@ export function createHostedControlPortFactory(
       },
     })
     const activation = context.activationV2
-    const approvals = activation ? new HostedApprovalActivatablePort() : undefined
+    // Approval modules load only for a signed activation; no other profile composes them.
+    const approvalModules = activation ? await loadHostedApprovalModules() : undefined
+    const approvals = approvalModules ? new approvalModules.HostedApprovalActivatablePort() : undefined
     const rawAdmissionPath = join(context.teamRoot, HOSTED_APPROVAL_RUNTIME_ADMISSION_FILE)
-    const activationSessionFactory = activation && approvals
+    const activationSessionFactory = activation && approvalModules && approvals
       ? (connection: HostedApprovalActivationConnection) =>
-        HostedApprovalActivationSession.production({
+        approvalModules.HostedApprovalActivationSession.production({
           proofKey: activation.proofKey,
           authority: {
             snapshot: () => ({
@@ -199,12 +192,12 @@ export function createHostedControlPortFactory(
             if (!OPEN_CODE_HOSTED_APPROVAL_ATOMIC_REPLY_SUPPORTED) {
               throw new Error('hosted_approval_runtime_production_gate_closed')
             }
-            const owner = new HostedApprovalOwnerService({
-              store: new HostedApprovalOwnerStore(new HostedApprovalOwnerWal(
+            const owner = new approvalModules.HostedApprovalOwnerService({
+              store: new approvalModules.HostedApprovalOwnerStore(new approvalModules.HostedApprovalOwnerWal(
                 join(context.teamRoot, HOSTED_APPROVAL_OWNER_WAL_FILE),
               )),
               admission: approvalAdmission,
-              runtime: new OpenCodeHostedApprovalRuntimeAdapter(),
+              runtime: new approvalModules.OpenCodeHostedApprovalRuntimeAdapter(),
               isCurrentOuterAuthority: () => context.isCurrentAuthority({
                 actorId: 'hosted-approval-owner', ...context.authority,
               }),
@@ -265,6 +258,27 @@ export const createHostedControlProductionPorts = createHostedControlProductionP
 export function createHostedManagedOpenCodeProductionPortFactory(
   dependencies: HostedManagedOpenCodeLaneDependencies,
 ): HostedControlRuntimePortFactory {
-  return createHostedControlProductionPortFactory(context =>
-    createHostedManagedOpenCodeLane(context, dependencies))
+  return createHostedControlProductionPortFactory(async context => {
+    const { createHostedManagedOpenCodeLane } = await import('./isolatedLane/HostedManagedOpenCodeLane.js')
+    return createHostedManagedOpenCodeLane(context, dependencies)
+  })
+}
+
+async function loadHostedApprovalModules() {
+  const [wal, store, service, adapter, port, session] = await Promise.all([
+    import('./HostedApprovalOwnerWal.js'),
+    import('./HostedApprovalOwnerStore.js'),
+    import('./HostedApprovalOwnerService.js'),
+    import('./OpenCodeHostedApprovalRuntimeAdapter.js'),
+    import('./HostedApprovalActivatablePort.js'),
+    import('./HostedApprovalActivationSession.js'),
+  ])
+  return {
+    HostedApprovalOwnerWal: wal.HostedApprovalOwnerWal,
+    HostedApprovalOwnerStore: store.HostedApprovalOwnerStore,
+    HostedApprovalOwnerService: service.HostedApprovalOwnerService,
+    OpenCodeHostedApprovalRuntimeAdapter: adapter.OpenCodeHostedApprovalRuntimeAdapter,
+    HostedApprovalActivatablePort: port.HostedApprovalActivatablePort,
+    HostedApprovalActivationSession: session.HostedApprovalActivationSession,
+  }
 }

@@ -456,6 +456,16 @@ describe('createHostedControlProductionPorts', () => {
     expect((ports.approvals as HostedApprovalActivatablePort).lifecycle.status).toBe('revoked')
     await revocation
   })
+
+  test('keeps approval and isolated-lane modules out of the static production import graph', async () => {
+    // Only a signed activation or the explicit isolated-profile factory loads them, lazily.
+    const source = await readFile(new URL('./HostedControlProductionComposition.ts', import.meta.url), 'utf8')
+    const valueImports = [...source.matchAll(/^import\s+(?!type\b)[\s\S]*?from\s+'([^']+)'/gm)]
+      .map(match => match[1])
+    expect(valueImports.length).toBeGreaterThan(0)
+    expect(valueImports.filter(path => /HostedApproval|OpenCodeHostedApproval|isolatedLane\//.test(path)))
+      .toEqual([])
+  })
 })
 
 describe('createHostedPersonalHostLocalPortFactory', () => {
