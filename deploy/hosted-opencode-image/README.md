@@ -53,11 +53,15 @@ prove the live process: the supervisor must also check the executing
 
 ## Inert configuration
 
-`build-config.py` accepts two exact specs. `inert-config-spec.json` emits a
+`build-config.py` accepts three exact specs. `inert-config-spec.json` emits a
 deny-all, no-plugin config for image attestation. `owner-plugin-config-spec.json`
 emits a config containing only the locked image `file://` plugin, allows the
 five reviewed `hosted_*` tools, denies all other tools, and disables sharing.
-Neither spec includes a provider or credentials. The builder requires root and
+`owner-local-qwen-config-spec.json` additionally selects only
+`local-llama/qwen3-8b` with observed context 8192 and tiny-canary output cap
+128. It requires `--gateway-base-url http://<admitted-private-bridge-ip>:<lease-port>/v1`;
+the builder rejects loopback, public addresses, credentials, and URL suffixes.
+The first two specs include no provider. None includes credentials. The builder requires root and
 a new output directory below an entirely root-owned, non-writable,
 symlink-free ancestry. Every component is
 opened from `/` with directory file descriptors; creation and chmod stay bound
@@ -65,9 +69,10 @@ to those descriptors. It emits a 0555 directory with one root-owned 0444 file
 plus its SHA-256 receipt. The supervisor mounts the directory
 read-only at `/sandbox/config`. It must still isolate HOME/XDG directories,
 disable project and Claude Code config, and mount an empty `/etc/opencode`.
-Both configs require a separately admitted model/gateway and Owner effect
-lease before a model request or agent command. The inert config remains the
-only config for capability and image attestation.
+The Owner configs require a separately admitted gateway and Owner effect lease
+before a model request or agent command. The inert config remains the only
+config for capability and image attestation. See `SELECTED_LOCAL_QWEN.md` for
+the inactive local-model profile and gateway admission requirements.
 
 Official OpenCode v1.18.32 also scans global config and `HOME/.opencode`
 plugin paths even with `OPENCODE_DISABLE_PROJECT_CONFIG=1`. Before enabling

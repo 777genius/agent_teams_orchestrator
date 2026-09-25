@@ -3,9 +3,11 @@
 import argparse
 from contextlib import ExitStack
 import hashlib
+import ipaddress
 import json
 import os
 from pathlib import Path
+import re
 import stat
 
 SPEC = {'schemaVersion': 1, 'mode': 'deny-all-inert'}
@@ -13,23 +15,67 @@ CONFIG = {'plugin': [], 'permission': {'*': 'deny'}, 'share': 'disabled'}
 OWNER_PLUGIN_SHA = '805df9de2239792c47bb040961110ae44f9bbbd4afd6bb821dcf497be4357f4c'
 OWNER_PLUGIN_URL = 'file:///usr/local/lib/agentteams/hosted-owner-plugin.mjs'
 OWNER_SPEC = {'schemaVersion': 1, 'mode': 'owner-fd3-tools', 'pluginSha256': OWNER_PLUGIN_SHA}
+QWEN_SPEC = {'schemaVersion': 1, 'mode': 'owner-local-qwen', 'pluginSha256': OWNER_PLUGIN_SHA}
 OWNER_TOOLS = ('hosted_task_get', 'hosted_task_start', 'hosted_task_complete',
                'hosted_task_add_comment', 'hosted_message_send')
 OWNER_CONFIG = {'plugin': [OWNER_PLUGIN_URL],
                 'permission': {'*': 'deny', **{name: 'allow' for name in OWNER_TOOLS}},
                 'share': 'disabled'}
+GATEWAY_URL = re.compile(r'^http://([0-9]{1,3}(?:\.[0-9]{1,3}){3}):([0-9]{1,5})/v1$')
+PRIVATE_BRIDGE_RANGES = tuple(ipaddress.IPv4Network(cidr) for cidr in
+                              ('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16'))
 
 
-def render(spec):
+def checked_gateway_url(value):
+    if type(value) is not str:
+        raise ValueError('hosted-opencode-gateway-url-invalid')
+    match = GATEWAY_URL.fullmatch(value)
+    if not match:
+        raise ValueError('hosted-opencode-gateway-url-invalid')
+    try:
+        address = ipaddress.IPv4Address(match.group(1))
+    except ipaddress.AddressValueError as error:
+        raise ValueError('hosted-opencode-gateway-url-invalid') from error
+    port = int(match.group(2))
+    if (not any(address in network for network in PRIVATE_BRIDGE_RANGES) or
+            not 1024 <= port <= 65535 or
+            str(address) != match.group(1) or str(port) != match.group(2)):
+        raise ValueError('hosted-opencode-gateway-url-invalid')
+    return value
+
+
+def render(spec, gateway_url=None):
     if type(spec) is not dict:
         raise ValueError('hosted-opencode-config-spec-invalid')
     if spec == SPEC:
+        if gateway_url is not None:
+            raise ValueError('hosted-opencode-gateway-url-unexpected')
         selected = CONFIG
-    elif spec == OWNER_SPEC:
+    elif spec == OWNER_SPEC or spec == QWEN_SPEC:
         lock = json.loads((Path(__file__).resolve().parent / 'artifact-lock.json').read_text())
         if lock.get('pluginSha256') != OWNER_PLUGIN_SHA or lock.get('status') != 'reviewed':
             raise ValueError('hosted-opencode-owner-plugin-lock-invalid')
-        selected = OWNER_CONFIG
+        if spec == OWNER_SPEC:
+            if gateway_url is not None:
+                raise ValueError('hosted-opencode-gateway-url-unexpected')
+            selected = OWNER_CONFIG
+        else:
+            selected = {
+                **OWNER_CONFIG,
+                'autoupdate': False,
+                'snapshot': False,
+                'enabled_providers': ['local-llama'],
+                'model': 'local-llama/qwen3-8b',
+                'provider': {'local-llama': {
+                    'npm': '@ai-sdk/openai-compatible',
+                    'name': 'Lease-local Qwen',
+                    'options': {'baseURL': checked_gateway_url(gateway_url)},
+                    'models': {'qwen3-8b': {
+                        'name': 'Qwen3 8B', 'tool_call': True,
+                        'limit': {'context': 8192, 'output': 128},
+                    }},
+                }},
+            }
     else:
         raise ValueError('hosted-opencode-config-spec-invalid')
     return (json.dumps(selected, sort_keys=True, separators=(',', ':'), ensure_ascii=False) + '\n').encode()
@@ -67,7 +113,7 @@ def descend_trusted(anchor_fd, components, uid=0, gid=0):
         raise
 
 
-def build(spec_path, output_dir):
+def build(spec_path, output_dir, gateway_url=None):
     if os.geteuid() != 0:
         raise PermissionError('hosted-opencode-config-builder-requires-root')
     source = Path(spec_path)
@@ -86,7 +132,7 @@ def build(spec_path, output_dir):
     finally:
         if source_fd >= 0:
             os.close(source_fd)
-    content = render(spec)
+    content = render(spec, gateway_url)
     with ExitStack() as stack:
         root_fd = os.open('/', DIRECTORY_FLAGS)
         stack.callback(os.close, root_fd)
@@ -125,5 +171,6 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--spec', required=True)
     parser.add_argument('--output-dir', required=True)
+    parser.add_argument('--gateway-base-url')
     args = parser.parse_args()
-    print(json.dumps(build(args.spec, args.output_dir), sort_keys=True, separators=(',', ':')))
+    print(json.dumps(build(args.spec, args.output_dir, args.gateway_base_url), sort_keys=True, separators=(',', ':')))

@@ -59,6 +59,53 @@ class ImageAndConfigContractTest(unittest.TestCase):
             with self.subTest(extra=extra), self.assertRaisesRegex(ValueError, 'spec-invalid'):
                 config.render({**spec, **extra})
 
+    def test_local_qwen_config_pins_one_model_bounded_output_and_owner_tools(self):
+        spec = json.loads((HERE / 'owner-local-qwen-config-spec.json').read_text())
+        gateway = 'http://172.27.0.1:19017/v1'
+        rendered = config.render(spec, gateway)
+        self.assertEqual(rendered, config.render(dict(reversed(list(spec.items()))), gateway))
+        parsed = json.loads(rendered)
+        self.assertEqual(parsed, {
+            **config.OWNER_CONFIG,
+            'autoupdate': False,
+            'snapshot': False,
+            'enabled_providers': ['local-llama'],
+            'model': 'local-llama/qwen3-8b',
+            'provider': {'local-llama': {
+                'npm': '@ai-sdk/openai-compatible',
+                'name': 'Lease-local Qwen',
+                'options': {'baseURL': gateway},
+                'models': {'qwen3-8b': {
+                    'name': 'Qwen3 8B', 'tool_call': True,
+                    'limit': {'context': 8192, 'output': 128},
+                }},
+            }},
+        })
+        self.assertEqual(spec['pluginSha256'], image.approved_lock()['pluginSha256'])
+        self.assertEqual(parsed['permission'], {
+            '*': 'deny', **{name: 'allow' for name in config.OWNER_TOOLS},
+        })
+        self.assertTrue(0 < parsed['provider']['local-llama']['models']['qwen3-8b']['limit']['output'] < 8192)
+        self.assertNotIn('apiKey', rendered.decode())
+
+    def test_local_qwen_config_rejects_unclaimed_or_mutable_endpoint(self):
+        spec = json.loads((HERE / 'owner-local-qwen-config-spec.json').read_text())
+        with self.assertRaisesRegex(ValueError, 'gateway-url-invalid'):
+            config.render(spec)
+        for gateway in (
+            'http://127.0.0.1:18993/v1', 'http://169.254.1.1:19017/v1',
+            'http://8.8.8.8:19017/v1', 'https://172.27.0.1:19017/v1',
+            'http://172.27.0.1:19017/v1?apiKey=secret',
+            'http://user@172.27.0.1:19017/v1', 'http://172.27.0.1:0/v1',
+            'http://172.27.0.1:19017/v1/extra', 'http://172.027.0.1:19017/v1',
+        ):
+            with self.subTest(gateway=gateway), self.assertRaisesRegex(ValueError, 'gateway-url-invalid'):
+                config.render(spec, gateway)
+        with self.assertRaisesRegex(ValueError, 'gateway-url-unexpected'):
+            config.render(config.OWNER_SPEC, 'http://172.27.0.1:19017/v1')
+        with self.assertRaisesRegex(ValueError, 'spec-invalid'):
+            config.render({**spec, 'output': 8192}, 'http://172.27.0.1:19017/v1')
+
     def test_plugin_bundle_is_exact_and_loads_only_five_hooks_without_fd3(self):
         with tempfile.TemporaryDirectory(prefix='hosted-plugin-build-test-') as root:
             artifact = Path(root, 'hosted-owner-plugin.mjs')
