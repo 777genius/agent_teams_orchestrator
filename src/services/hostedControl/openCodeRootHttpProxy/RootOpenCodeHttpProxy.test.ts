@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto'
 import type { HostedProductCurrentMember, HostedProductMemberBinding } from
   '../productAuthority/HostedProductCurrentMemberDecision.js'
 import { RootOpenCodeHttpProxy, type RootOpenCodeAction, type RootOpenCodeCanonicalAction,
-  type RootOpenCodeHttpRequest } from './RootOpenCodeHttpProxy.js'
+  type RootOpenCodeCommittedDelivery, type RootOpenCodeHttpRequest } from './RootOpenCodeHttpProxy.js'
 
 const hash = (value: string) => createHash('sha256').update(value).digest('hex')
 const action: RootOpenCodeAction = {
@@ -20,12 +20,28 @@ const canonical: RootOpenCodeCanonicalAction = {
   promptSha256: current.promptSha256, sessionId: null, messageId: null,
   sourceRef: null, text: null,
 }
+const revision = `revision_${'4'.repeat(64)}`
+function deliveryAction(kind: 'task_delivery' | 'peer_delivery' | 'delivery_observe' | 'reply_observe',
+  sourceRef: string, version = revision): RootOpenCodeAction {
+  const sourceKind = sourceRef.startsWith('task_') ? 'task' : 'peer'
+  return { ...action, kind, sourceRef,
+    operationId: `action_${hash(JSON.stringify([
+      'hosted-product-delivery/v1', action.attemptId, sourceKind, sourceRef, version, kind,
+    ]))}` }
+}
+function committed(action: RootOpenCodeAction, text: string, version = revision): RootOpenCodeCommittedDelivery {
+  return { kind: action.sourceRef!.startsWith('task_') ? 'task' : 'peer', sourceRef: action.sourceRef!,
+    revision: version, runId: action.runId, memberId: action.memberId,
+    attemptId: action.attemptId, containerHandle: action.containerHandle,
+    containerGeneration: action.containerGeneration, text }
+}
 
 function fixture(overrides: Partial<ConstructorParameters<typeof RootOpenCodeHttpProxy>[0]> = {}) {
   const events: string[] = []
   const writes: RootOpenCodeHttpRequest[] = []
   const claims = new Map<string, string>()
   let resolved: RootOpenCodeCanonicalAction = canonical
+  let delivery: RootOpenCodeCommittedDelivery | null = null
   let response: { statusCode: number; body: unknown } = { statusCode: 201,
     body: { id: `ses${'f'.repeat(12)}`, title: `hosted-member-attempt:${action.attemptId}` } }
   const proxy = new RootOpenCodeHttpProxy({ binding,
@@ -33,6 +49,7 @@ function fixture(overrides: Partial<ConstructorParameters<typeof RootOpenCodeHtt
       events.push('product'); return callback(current)
     } },
     source: { resolve() { events.push('source'); return resolved } },
+    deliverySource: { resolve() { events.push('product-delivery'); return delivery } },
     claims: { claim(id, fingerprint) {
       events.push('claim')
       const prior = claims.get(id)
@@ -49,6 +66,7 @@ function fixture(overrides: Partial<ConstructorParameters<typeof RootOpenCodeHtt
     } }, ...overrides })
   return { proxy, events, writes, claims,
     setCanonical(value: RootOpenCodeCanonicalAction) { resolved = value },
+    setDelivery(value: RootOpenCodeCommittedDelivery | null) { delivery = value },
     setResponse(value: typeof response) { response = value },
   }
 }
@@ -123,13 +141,102 @@ test('prompt text must match Product hash; delivery requires canonical text and 
     text: 'owner-controlled prompt' })
   await expect(f.proxy.dispatch(prompt)).rejects.toThrow('canonical-action-invalid')
   expect(f.writes).toHaveLength(0)
-  const delivery = { ...action, kind: 'task_delivery' as const, sourceRef: 'task_12345678' }
+  const delivery = deliveryAction('task_delivery', 'task_12345678')
   f.setCanonical({ ...canonical, sessionId: `ses${'1'.repeat(12)}`, messageId: `msg${'2'.repeat(12)}`,
     sourceRef: delivery.sourceRef, text: 'canonical task text' })
+  f.setDelivery(committed(delivery, 'canonical task text'))
   expect(await f.proxy.dispatch(delivery)).toEqual({ outcome: 'responded',
     kind: 'task_delivery', accepted: true })
   expect(f.writes[0]?.path).toBe(`/session/ses${'1'.repeat(12)}/prompt_async`)
   expect(JSON.parse(f.writes[0]?.body ?? '{}').parts).toEqual([{ type: 'text', text: 'canonical task text' }])
+})
+
+test('delivery has no effect without a root Product committed source', async () => {
+  const delivery = deliveryAction('task_delivery', 'task_12345678')
+  const f = fixture({ deliverySource: undefined })
+  await expect(f.proxy.dispatch(delivery)).rejects.toThrow('delivery-source-inactive')
+  expect(f.events).toEqual(['product'])
+  expect(f.claims.size).toBe(0)
+  expect(f.writes).toHaveLength(0)
+})
+
+test('forged revision or operation ID cannot claim or write a delivery', async () => {
+  const delivery = deliveryAction('task_delivery', 'task_12345678')
+  const f = fixture()
+  f.setDelivery(committed(delivery, 'Product task'))
+  f.setCanonical({ ...canonical, sourceRef: delivery.sourceRef,
+    sessionId: `ses${'1'.repeat(12)}`, messageId: `msg${'2'.repeat(12)}`, text: 'Product task' })
+  await expect(f.proxy.dispatch({ ...delivery, operationId: 'action_12345678' }))
+    .rejects.toThrow('delivery-operation-invalid')
+  const stale = deliveryAction('task_delivery', delivery.sourceRef!, `revision_${'5'.repeat(64)}`)
+  await expect(f.proxy.dispatch(stale)).rejects.toThrow('delivery-operation-invalid')
+  expect(f.events.includes('prepare')).toBe(false)
+  expect(f.claims.size).toBe(0)
+  expect(f.writes).toHaveLength(0)
+})
+
+test('swapped recipient and changed canonical text cannot claim or write', async () => {
+  const delivery = deliveryAction('peer_delivery', 'message_12345678')
+  const f = fixture()
+  f.setDelivery({ ...committed(delivery, 'Product message'), memberId: `member_${'9'.repeat(32)}` })
+  f.setCanonical({ ...canonical, sourceRef: delivery.sourceRef,
+    sessionId: `ses${'1'.repeat(12)}`, messageId: `msg${'2'.repeat(12)}`, text: 'Product message' })
+  await expect(f.proxy.dispatch(delivery)).rejects.toThrow('product-delivery-invalid')
+  f.setDelivery(committed(delivery, 'Product message'))
+  f.setCanonical({ ...canonical, sourceRef: delivery.sourceRef,
+    sessionId: `ses${'1'.repeat(12)}`, messageId: `msg${'2'.repeat(12)}`, text: 'Owner changed message' })
+  await expect(f.proxy.dispatch(delivery)).rejects.toThrow('product-source-mismatch')
+  expect(f.events.includes('prepare')).toBe(false)
+  expect(f.claims.size).toBe(0)
+  expect(f.writes).toHaveLength(0)
+})
+
+test('Product model remains authoritative for initial prompt and delivery', async () => {
+  const f = fixture()
+  f.setCanonical({ ...canonical, model: 'attacker/other',
+    sessionId: `ses${'1'.repeat(12)}`, messageId: `msg${'2'.repeat(12)}`,
+    text: 'canonical prompt' })
+  await expect(f.proxy.dispatch({ ...action, kind: 'initial_prompt' }))
+    .rejects.toThrow('product-source-mismatch')
+  expect(f.claims.size).toBe(0)
+  expect(f.writes).toHaveLength(0)
+})
+
+test('Product revision change between preparation and write sends no bytes', async () => {
+  const delivery = deliveryAction('task_delivery', 'task_12345678')
+  let revisionReads = 0
+  const source = { resolve() {
+    revisionReads++
+    return committed(delivery, 'Product task', revisionReads === 1
+      ? revision : `revision_${'5'.repeat(64)}`)
+  } }
+  const guarded = fixture({ deliverySource: source })
+  guarded.setCanonical({ ...canonical, sourceRef: delivery.sourceRef,
+    sessionId: `ses${'1'.repeat(12)}`, messageId: `msg${'2'.repeat(12)}`,
+    text: 'Product task' })
+  expect(await guarded.proxy.dispatch(delivery)).toEqual({ outcome: 'uncertain', reason: 'dispatch-failed' })
+  expect(guarded.claims.size).toBe(0)
+  expect(guarded.writes).toHaveLength(0)
+})
+
+test('exact replay is one-shot while a new Product revision gets a new claim', async () => {
+  const delivery = deliveryAction('task_delivery', 'task_12345678')
+  const f = fixture()
+  f.setDelivery(committed(delivery, 'Product task v1'))
+  f.setCanonical({ ...canonical, sourceRef: delivery.sourceRef,
+    sessionId: `ses${'1'.repeat(12)}`, messageId: `msg${'2'.repeat(12)}`, text: 'Product task v1' })
+  expect(await f.proxy.dispatch(delivery)).toEqual({ outcome: 'responded',
+    kind: 'task_delivery', accepted: true })
+  expect(await f.proxy.dispatch(delivery)).toEqual({ outcome: 'already_claimed' })
+  const updated = deliveryAction('task_delivery', delivery.sourceRef!, `revision_${'5'.repeat(64)}`)
+  f.setDelivery(committed(updated, 'Product task v2', `revision_${'5'.repeat(64)}`))
+  f.setCanonical({ ...canonical, sourceRef: delivery.sourceRef,
+    sessionId: `ses${'1'.repeat(12)}`, messageId: `msg${'3'.repeat(12)}`, text: 'Product task v2' })
+  await expect(f.proxy.dispatch(delivery)).rejects.toThrow('delivery-operation-invalid')
+  expect(await f.proxy.dispatch(updated)).toEqual({ outcome: 'responded',
+    kind: 'task_delivery', accepted: true })
+  expect(f.claims.size).toBe(2)
+  expect(f.writes).toHaveLength(2)
 })
 
 test('large OpenCode list is reduced to a bounded typed session receipt', async () => {
@@ -159,9 +266,10 @@ test('oversized assistant reply returns a bounded unavailable receipt instead of
   const f = fixture()
   const sessionId = `ses${'1'.repeat(12)}`
   const messageId = `msg${'2'.repeat(12)}`
-  const delivery = { ...action, kind: 'reply_observe' as const, sourceRef: 'message_12345678' }
+  const delivery = deliveryAction('reply_observe', 'message_12345678')
   f.setCanonical({ ...canonical, sessionId, messageId, sourceRef: delivery.sourceRef,
     text: 'canonical delivery' })
+  f.setDelivery(committed(delivery, 'canonical delivery'))
   f.setResponse({ statusCode: 200, body: [
     { info: { role: 'user', sessionID: sessionId, id: messageId },
       parts: [{ type: 'text', text: 'canonical delivery' }] },

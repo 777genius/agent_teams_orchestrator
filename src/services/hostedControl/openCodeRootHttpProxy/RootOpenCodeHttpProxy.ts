@@ -65,8 +65,32 @@ export type RootOpenCodeHttpRequest = Readonly<{
 }>
 
 export interface RootOpenCodeCanonicalSource {
-  resolve(action: RootOpenCodeAction, current: HostedProductCurrentMember): RootOpenCodeCanonicalAction
+  resolve(action: RootOpenCodeAction, current: HostedProductCurrentMember,
+    delivery: RootOpenCodeCommittedDelivery | null): RootOpenCodeCanonicalAction
 }
+
+/**
+ * Root-only Product reader. Resolve the current committed version and recipient
+ * inside the Product member decision; never populate this port from Owner state.
+ * A missing, superseded, or revoked source returns null. This port has no live
+ * composition until a Product-backed implementation can provide the exact text.
+ */
+export interface RootOpenCodeCommittedDeliverySource {
+  resolve(ref: Readonly<{ kind: 'task' | 'peer'; sourceRef: string }>,
+    current: HostedProductCurrentMember): RootOpenCodeCommittedDelivery | null
+}
+
+export type RootOpenCodeCommittedDelivery = Readonly<{
+  kind: 'task' | 'peer'
+  sourceRef: string
+  revision: string
+  runId: string
+  memberId: string
+  attemptId: string
+  containerHandle: string
+  containerGeneration: string
+  text: string
+}>
 
 export interface RootOpenCodeDecision {
   withCurrentMemberDecision<T>(binding: HostedProductMemberBinding, kind: 'start' | 'observe',
@@ -91,6 +115,35 @@ function sha(value: string): string { return createHash('sha256').update(value).
 function exact(value: unknown, fields: readonly string[]): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value) &&
     Object.keys(value).sort().join(',') === [...fields].sort().join(',')
+}
+
+function verifiedDelivery(action: RootOpenCodeAction, current: HostedProductCurrentMember,
+  source: RootOpenCodeCommittedDeliverySource | undefined): RootOpenCodeCommittedDelivery | null {
+  if (action.kind !== 'task_delivery' && action.kind !== 'peer_delivery' &&
+    action.kind !== 'delivery_observe' && action.kind !== 'reply_observe') return null
+  if (!source) throw new Error('root-opencode-delivery-source-inactive')
+  const kind = action.kind === 'task_delivery' ? 'task' : action.kind === 'peer_delivery'
+    ? 'peer' : action.sourceRef?.startsWith('task_') ? 'task' : 'peer'
+  const committed = source.resolve({ kind, sourceRef: action.sourceRef! }, current)
+  if (!exact(committed, ['kind', 'sourceRef', 'revision', 'runId', 'memberId',
+    'attemptId', 'containerHandle', 'containerGeneration', 'text']) ||
+    committed.kind !== kind || committed.sourceRef !== action.sourceRef ||
+    typeof committed.revision !== 'string' ||
+    !/^[a-z0-9][a-z0-9_-]{7,127}$/.test(committed.revision) ||
+    committed.runId !== current.runId || committed.memberId !== current.memberId ||
+    committed.attemptId !== action.attemptId ||
+    committed.containerHandle !== action.containerHandle ||
+    committed.containerGeneration !== action.containerGeneration ||
+    typeof committed.text !== 'string' || !committed.text.trim() ||
+    Buffer.byteLength(committed.text) > MAX_TEXT) {
+    throw new Error('root-opencode-product-delivery-invalid')
+  }
+  const operationId = `action_${sha(JSON.stringify([
+    'hosted-product-delivery/v1', action.attemptId, kind,
+    committed.sourceRef, committed.revision, action.kind,
+  ]))}`
+  if (action.operationId !== operationId) throw new Error('root-opencode-delivery-operation-invalid')
+  return committed as RootOpenCodeCommittedDelivery
 }
 
 export function validateRootOpenCodeAction(value: unknown): RootOpenCodeAction {
@@ -280,13 +333,14 @@ export class RootOpenCodeHttpProxy {
     binding?: HostedProductMemberBinding
     decision?: RootOpenCodeDecision
     source?: RootOpenCodeCanonicalSource
+    deliverySource?: RootOpenCodeCommittedDeliverySource
     claims?: RootOpenCodeWriteClaims
     wire?: RootOpenCodeHttpWire
   } = {}) {}
 
   async dispatch(input: RootOpenCodeAction): Promise<RootOpenCodeActionResult> {
     const action = validateRootOpenCodeAction(input)
-    const { binding, decision, source, claims, wire } = this.options
+    const { binding, decision, source, deliverySource, claims, wire } = this.options
     if (!binding || !decision || !source || !claims || !wire) {
       throw new Error('root-opencode-http-proxy-inactive')
     }
@@ -298,11 +352,15 @@ export class RootOpenCodeHttpProxy {
         typeof current.model !== 'string' || !SHA.test(current.promptSha256)) {
         throw new Error('root-opencode-product-member-invalid')
       }
-      const canonical = source.resolve(action, current)
+      const delivery = verifiedDelivery(action, current, deliverySource)
+      const canonical = source.resolve(action, current, delivery)
       if (canonical.model !== current.model || canonical.promptSha256 !== current.promptSha256) {
         throw new Error('root-opencode-product-source-mismatch')
       }
-      return { canonical, request: route(action, canonical) }
+      if (delivery && canonical.text !== delivery.text) {
+        throw new Error('root-opencode-product-source-mismatch')
+      }
+      return { canonical, delivery, request: route(action, canonical) }
     }
     const expected = await decision.withCurrentMemberDecision(binding, 'observe', resolve)
     const connection = await wire.prepare(action.containerHandle, action.containerGeneration)
@@ -316,7 +374,7 @@ export class RootOpenCodeHttpProxy {
           }
           if (actual.request.method === 'POST') {
             const claimId = `opencode_${sha(JSON.stringify([action.kind, action.attemptId,
-              action.sourceRef])).slice(0, 64)}`
+              action.sourceRef, actual.delivery?.revision ?? null])).slice(0, 64)}`
             const fingerprint = sha(JSON.stringify([action, actual.request]))
             const claim = claims.claim(claimId, fingerprint)
             if (claim !== 'created') return claim
