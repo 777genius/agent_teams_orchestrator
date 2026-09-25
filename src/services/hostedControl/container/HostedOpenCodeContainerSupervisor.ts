@@ -98,6 +98,10 @@ type StartResult = { handle: string; generation: string; status: 'started' | 'un
 type StartRequest = { operationId: string; leaseId: string; runId: string; teamId: string; laneId: string; memberId: string;
   ownerChannel?: PendingOwnerChannel }
 type ConnectorIdentity = { pid: number; startTicks: string }
+export interface HostedRootTrustedMemberPort {
+  resolveCurrent(operationId: string, action: 'prepare' | 'start'): Promise<{
+    request: StartRequest; connector: ConnectorIdentity }>
+}
 type PreparedMember = { operationId: string; receiptId: string; handle: string; generation: string;
   connector: ConnectorIdentity }
 type PrepareClaim = { request: StartRequest; receipt: PreparedMember }
@@ -122,10 +126,12 @@ export interface HostedOpenCodeContainerSupervisorOptions {
   readonly ownerUid?: number
   readonly serverPasswordKey?: Uint8Array
   readonly docker?: HostedDockerRunner
+  /** Root-owned exact Product/member resolver. The daemon leaves this unset until activation. */
+  readonly rootTrustedMember?: HostedRootTrustedMemberPort
   /** Inert fixtures only; production cannot inject either trust gate. */
   readonly testOnlyHandoff?: HostedFd3HandoffRunner
   readonly testOnlyProcessEvidence?: (pid: number, phase: 'bootstrap' | 'official') => Promise<ProcessEvidence>
-  /** Test-only injection. Production always requires root and the real Docker runner. */
+  /** Test-only injection. Production uses the root-owned Docker port when installed. */
   readonly testOnlyAllowNonRoot?: boolean
   /** Inert fixture for an eventual independent root authority. Never supplied by the daemon. */
   readonly testOnlyTrustedMember?: (operationId: string) => Promise<{ request: StartRequest;
@@ -197,6 +203,12 @@ export class HostedOpenCodeContainerSupervisor {
     }
     if (options.testOnlyAllowNonRoot && (!options.docker || process.env.NODE_ENV !== 'test')) {
       throw new Error('hosted-container-test-runner-required')
+    }
+    if (options.rootTrustedMember && typeof options.rootTrustedMember.resolveCurrent !== 'function') {
+      throw new Error('hosted-container-root-authority-invalid')
+    }
+    if (options.rootTrustedMember && options.testOnlyTrustedMember) {
+      throw new Error('hosted-container-root-authority-conflict')
     }
     if (!options.testOnlyAllowNonRoot && (options.testOnlyHandoff || options.testOnlyProcessEvidence ||
       options.testOnlyTrustedMember)) {
@@ -592,13 +604,14 @@ export class HostedOpenCodeContainerSupervisor {
     } finally { await file.close() }
   }
 
-  private async trustedMember(operationId: string): Promise<{ request: StartRequest;
+  private async trustedMember(operationId: string, action: 'prepare' | 'start'): Promise<{ request: StartRequest;
     connector: ConnectorIdentity }> {
-    const authority = this.options.testOnlyTrustedMember
-    if (!this.options.testOnlyAllowNonRoot || !authority) {
+    const authority = this.options.rootTrustedMember
+    const testAuthority = this.options.testOnlyAllowNonRoot ? this.options.testOnlyTrustedMember : undefined
+    if (!authority && !testAuthority) {
       throw new Error('hosted-container-independent-root-authority-unavailable')
     }
-    const binding = await authority(operationId)
+    const binding = authority ? await authority.resolveCurrent(operationId, action) : await testAuthority!(operationId)
     const { request, connector } = binding
     if (!request || !exactKeys(request, ['operationId', 'leaseId', 'runId', 'teamId', 'laneId', 'memberId',
       ...(request.ownerChannel === undefined ? [] : ['ownerChannel'])]) ||
@@ -626,7 +639,7 @@ export class HostedOpenCodeContainerSupervisor {
   }
 
   private async prepareMemberOnce(operationId: string): Promise<PreparedMember> {
-    const trusted = await this.trustedMember(operationId)
+    const trusted = await this.trustedMember(operationId, 'prepare')
     const prior = await this.preparedClaim(operationId)
     if (prior) {
       if (!isDeepStrictEqual(prior.request, trusted.request) ||
@@ -679,7 +692,7 @@ export class HostedOpenCodeContainerSupervisor {
     if (!claim || claim.receipt.receiptId !== input.receiptId) {
       throw new Error('hosted-container-prepare-receipt-invalid')
     }
-    const trusted = await this.trustedMember(input.operationId)
+    const trusted = await this.trustedMember(input.operationId, 'start')
     if (!isDeepStrictEqual(claim.request, trusted.request) ||
       !isDeepStrictEqual(claim.receipt.connector, trusted.connector)) {
       throw new Error('hosted-container-prepare-replay-conflict')

@@ -557,6 +557,33 @@ describe('disposable hosted OpenCode container supervisor', () => {
     } finally { await f.cleanup() }
   })
 
+  test('root member resolver is rechecked at prepared Start before any Docker create', async () => {
+    let leaseId = ''
+    let current = true
+    const calls: string[] = []
+    const operationId = 'start_12345678'
+    const f = await fixture({ rootTrustedMember: {
+      async resolveCurrent(id: string, action: 'prepare' | 'start') {
+        calls.push(action)
+        if (!current) throw new Error('product-member-revoked')
+        return { request: { operationId: id, leaseId,
+          runId: 'run_12345678', teamId: 'team_12345678', laneId: 'lane_12345678',
+          memberId: 'member_12345678', ownerChannel: {
+            socketPath: '/tmp/test-pending-owner.sock', challenge: 'a'.repeat(64),
+          } }, connector: { pid: 99999, startTicks: '12345' } }
+      },
+    } })
+    leaseId = f.leaseId
+    try {
+      const receipt = await f.supervisor.prepareMember({ operationId })
+      current = false
+      await expect(f.supervisor.startPrepared({ operationId, receiptId: receipt.receiptId }))
+        .rejects.toThrow('product-member-revoked')
+      expect(calls).toEqual(['prepare', 'start'])
+      expect(f.docker.calls.filter(call => call[0] === 'create')).toHaveLength(0)
+    } finally { await f.cleanup() }
+  })
+
   test('prepared Start without a pending Owner channel has no Docker effect', async () => {
     let leaseId = ''
     const operationId = 'start_12345678'
