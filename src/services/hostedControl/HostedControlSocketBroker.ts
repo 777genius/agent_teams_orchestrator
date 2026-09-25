@@ -48,7 +48,8 @@ export async function runHostedControlSocketBroker(args: string[]): Promise<neve
   process.once('unhandledRejection', terminate)
 
   process.umask(0o177)
-  const server = createServer(client => {
+  // A client FIN is forwarded upstream but must not close the reply path back to the client.
+  const server = createServer({ allowHalfOpen: true }, client => {
     if (shuttingDown) { client.destroy(); return }
     const upstream = connect({ host: '127.0.0.1', port: targetPort })
     peers.add(client)

@@ -537,13 +537,15 @@ describe('HostedControlRuntime', () => {
     })}\n`
     const fencedAuthority = { ...taskUnsigned.authority, ownerEffectFence: { grantRevision: '2'.repeat(64), identityChecksum } }
     const productTaskUnsigned = { ...taskUnsigned, exchangeId: `task-request_${'a'.repeat(32)}`, authority: fencedAuthority }
-    const productTaskLine = await exchange(socketPath, productLine(productTaskUnsigned))
+    const productTaskLine = await exchangeHalfClosed(socketPath, productLine(productTaskUnsigned))
+    expect(productTaskLine.endsWith('\n')).toBe(true)
+    expect(productTaskLine.indexOf('\n')).toBe(productTaskLine.length - 1)
     expect(JSON.parse(productTaskLine).payload).toEqual({ schemaVersion: 1, kind: 'unavailable', retryAfterMs: null })
     expect(await exchange(socketPath, productLine({
       ...productTaskUnsigned,
       authority: { ...fencedAuthority, ownerEffectFence: { grantRevision: '2'.repeat(64), identityChecksum: '3'.repeat(64) } },
     }))).toBe('')
-    const productMessageLine = await exchange(socketPath, productLine({
+    const productMessageLine = await exchangeHalfClosed(socketPath, productLine({
       ...messageUnsigned,
       exchangeId: `message-request_${'a'.repeat(32)}`,
       authority: { ...messageAuthority, ownerEffectFence: fencedAuthority.ownerEffectFence },
@@ -662,6 +664,20 @@ function openReadiness(
       output += chunk
       if (output.includes('\n')) resolve({ socket, line: output.trim() })
     })
+    socket.once('error', reject)
+  })
+}
+
+/** Product's owner-bound client: one frame, then write-side EOF, then read the reply. */
+function exchangeHalfClosed(socketPath: string, input: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const socket = connect({ path: socketPath, allowHalfOpen: true })
+    let output = ''
+    socket.setEncoding('utf8')
+    socket.once('connect', () => socket.end(input))
+    socket.on('data', chunk => { output += chunk })
+    socket.once('end', () => { socket.destroy(); resolve(output) })
+    socket.once('close', () => resolve(output))
     socket.once('error', reject)
   })
 }

@@ -145,7 +145,9 @@ export class HostedControlServer {
     const listenPath = socketPublicationPath(this.#options.socketPath)
     const brokerToken = randomBytes(32)
     let publicationProbe: PublicationProbe | null = null
-    const server = createServer(socket => this.#admitBrokerConnection(socket, brokerToken, (admitted, initialData) => {
+    // Product's owner-bound client ends its write side after the request frame; the reply must
+    // still flow back on the same connection.
+    const server = createServer({ allowHalfOpen: true }, socket => this.#admitBrokerConnection(socket, brokerToken, (admitted, initialData) => {
       if (publicationProbe) consumePublicationProbe(admitted, publicationProbe, initialData)
       else this.#handleConnection(admitted, initialData)
     }))
