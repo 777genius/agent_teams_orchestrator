@@ -196,10 +196,17 @@ test('revocation denies a live container before deleting its tagged UFW grant an
   runner.occupied = true
   await policy.admitContainer(containerId)
   runner.throwAfterNftDelete = true
-  await expect(policy.revokeContainer()).rejects.toThrow('ambiguous-delete')
+  let notices = 0
+  policy.onSourceRevoked(() => { notices++ })
+  const firstRevoke = policy.revokeContainer()
+  expect(notices).toBe(1)
+  expect(() => policy.assertContainerSource(networkId, containerId, '172.18.0.2', generation))
+    .toThrow('hosted-qwen-source-mismatch')
+  await expect(firstRevoke).rejects.toThrow('ambiguous-delete')
   expect(runner.grantIp).toBeNull()
   expect(runner.ufw).toBe(true)
   await policy.revokeContainer()
+  expect(notices).toBe(1)
   expect(runner.ufw).toBe(false)
   await policy.revokeContainer()
   await policy.attest()

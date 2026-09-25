@@ -142,6 +142,8 @@ export class HostedQwenNetworkPolicy {
   private containerIp: string | null = null
   private claimIdentity: string | null = null
   private revoked = false
+  private sourceRevoking = false
+  private readonly revocationListeners = new Set<() => void>()
 
   constructor(private readonly options: HostedQwenNetworkPolicyOptions) {
     if (!SHA.test(options.networkId) || !GENERATION.test(options.generation) ||
@@ -250,7 +252,7 @@ export class HostedQwenNetworkPolicy {
   }
 
   async prepare(): Promise<Readonly<{ gateway: string; bridge: string }>> {
-    if (this.bridge || this.claimIdentity) throw new Error('hosted-qwen-already-prepared')
+    if (this.bridge || this.claimIdentity || this.sourceRevoking) throw new Error('hosted-qwen-already-prepared')
     // Docker 26+ includes the fix for embedded-DNS forwarding from --internal
     // networks (GHSA-mq39-4gv4-mvpx). A later inert DNS-negative canary is still
     // required before enabling agent effects.
@@ -372,15 +374,31 @@ export class HostedQwenNetworkPolicy {
 
   /** The listener may bind only to this lease's live bridge IP and port. */
   async assertBridgeBind(address: string, port: number, generation: string): Promise<void> {
-    if (address !== this.bridge?.gateway || port !== this.options.gatewayPort ||
+    if (this.sourceRevoking || address !== this.bridge?.gateway || port !== this.options.gatewayPort ||
       generation !== this.options.generation) throw new Error('hosted-qwen-bind-mismatch')
     await this.attest()
+  }
+
+  /** Subscribe before listener activation so revocation tears down held host responses. */
+  onSourceRevoked(listener: () => void): () => void {
+    if (this.sourceRevoking) listener()
+    else this.revocationListeners.add(listener)
+    return () => { this.revocationListeners.delete(listener) }
+  }
+
+  private beginSourceRevocation(): void {
+    if (this.sourceRevoking) return
+    this.sourceRevoking = true
+    for (const listener of [...this.revocationListeners]) {
+      try { listener() } catch { /* Other listeners must still revoke. */ }
+    }
+    this.revocationListeners.clear()
   }
 
   /** Root may admit only the source pinned by this exact network lease. */
   assertContainerSource(networkId: string, containerId: string, containerIp: string,
     generation: string): void {
-    if (!this.bridge || this.revoked || networkId !== this.options.networkId ||
+    if (!this.bridge || this.sourceRevoking || this.revoked || networkId !== this.options.networkId ||
       containerId !== this.containerId || containerIp !== this.containerIp ||
       generation !== this.options.generation) throw new Error('hosted-qwen-source-mismatch')
   }
@@ -390,6 +408,7 @@ export class HostedQwenNetworkPolicy {
     if (!this.bridge || !this.containerId || !this.containerIp || !this.ruleDigest) {
       throw new Error('hosted-qwen-admission-invalid')
     }
+    this.beginSourceRevocation()
     await this.assertClaim()
     const current = await this.network(false)
     if (current.name !== this.bridge.name || current.ifindex !== this.bridge.ifindex ||
@@ -421,6 +440,7 @@ export class HostedQwenNetworkPolicy {
   /** Caller must stop and remove the container first. Unknown cleanup retains the claim. */
   async close(): Promise<void> {
     if (!this.bridge) return
+    this.beginSourceRevocation()
     await this.assertClaim()
     await this.network(true)
     const rules = await this.snapshotRules()

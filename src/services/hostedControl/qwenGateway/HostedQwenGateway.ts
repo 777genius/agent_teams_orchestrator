@@ -41,6 +41,7 @@ export interface HostedQwenGatewayOptions {
     assertBridgeBind(address: string, port: number, generation: string): Promise<void>
     assertContainerSource(networkId: string, containerId: string, containerIp: string,
       generation: string): void
+    onSourceRevoked(listener: () => void): () => void
   }>
   readonly generation?: string
   readonly upstreamPort?: number
@@ -61,6 +62,7 @@ export class HostedQwenGateway {
   private admissionEpoch = 0
   private readonly active = new Set<{ cancel(): void }>()
   private started = false
+  private detachBridgeRevocation: (() => void) | null = null
   private readonly maxRequestBytes: number
   private readonly maxResponseBytes: number
   private readonly timeoutMs: number
@@ -111,19 +113,21 @@ export class HostedQwenGateway {
 
   async start(): Promise<void> {
     if (this.started) throw new Error('hosted-qwen-already-started')
-    if (this.options.bridgeAuthority) {
-      await this.options.bridgeAuthority.assertBridgeBind(
-        this.options.bindAddress, this.options.port, this.options.generation ?? '')
-    }
-    await new Promise<void>((resolve, reject) => {
-      this.server.once('error', reject)
-      this.server.listen(this.options.port, this.options.bindAddress, () => {
-        this.server.off('error', reject)
-        resolve()
-      })
-    })
-    this.started = true
+    this.detachBridgeRevocation = this.options.bridgeAuthority?.onSourceRevoked(
+      () => this.revokeClient()) ?? null
     try {
+      if (this.options.bridgeAuthority) {
+        await this.options.bridgeAuthority.assertBridgeBind(
+          this.options.bindAddress, this.options.port, this.options.generation ?? '')
+      }
+      await new Promise<void>((resolve, reject) => {
+        this.server.once('error', reject)
+        this.server.listen(this.options.port, this.options.bindAddress, () => {
+          this.server.off('error', reject)
+          resolve()
+        })
+      })
+      this.started = true
       this.attest()
       if (this.options.bridgeAuthority) {
         await this.options.bridgeAuthority.assertBridgeBind(
@@ -176,6 +180,8 @@ export class HostedQwenGateway {
 
   async stop(): Promise<void> {
     this.revokeClient()
+    this.detachBridgeRevocation?.()
+    this.detachBridgeRevocation = null
     if (!this.started) return
     this.started = false
     const closed = new Promise<void>(resolve => this.server.close(() => resolve()))
@@ -197,13 +203,22 @@ export class HostedQwenGateway {
       container.containerGeneration === expected.containerGeneration && container.containerIp === expected.containerIp
   }
 
+  private sourceCurrent(admission: HostedQwenAdmission): boolean {
+    try {
+      this.options.bridgeAuthority?.assertContainerSource(admission.container.networkId,
+        admission.container.containerId, admission.container.containerIp, this.options.generation ?? '')
+      return true
+    } catch { return false }
+  }
+
   private async responseEffect<T>(admission: HostedQwenAdmission | string, epoch: number,
     remote: string, effect: () => T): Promise<{ allowed: true; value: T } | { allowed: false }> {
     if (!this.sameAdmission(admission, epoch, remote)) return { allowed: false }
     if (typeof admission === 'string') return { allowed: true, value: effect() } // synthetic test fixture only
     try {
       return await this.options.dispatchAuthority!.withCurrentMemberDecision(admission.member, 'observe', current =>
-        this.sameAdmission(admission, epoch, remote) && this.matchesCurrent(admission, current)
+        this.sameAdmission(admission, epoch, remote) && this.matchesCurrent(admission, current) &&
+          this.sourceCurrent(admission)
           ? { allowed: true as const, value: effect() } : { allowed: false as const })
     } catch { return { allowed: false } }
   }
@@ -335,7 +350,8 @@ export class HostedQwenGateway {
         writePinnedQwen(upstream, frame)
       } else {
         await this.options.dispatchAuthority!.withCurrentMemberDecision(admission.member, 'observe', current => {
-          if (!this.sameAdmission(admission, epoch, remote) || !this.matchesCurrent(admission, current)) {
+          if (!this.sameAdmission(admission, epoch, remote) || !this.matchesCurrent(admission, current) ||
+            !this.sourceCurrent(admission)) {
             throw new Error('hosted-qwen-binding-not-current')
           }
           writePinnedQwen(upstream!, frame)

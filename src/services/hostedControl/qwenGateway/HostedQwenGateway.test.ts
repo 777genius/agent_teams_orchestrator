@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from 'bun:test'
 import { createServer, request, ServerResponse } from 'node:http'
-import { createConnection, type AddressInfo } from 'node:net'
+import { createConnection, createServer as createNetServer, type AddressInfo, type Socket } from 'node:net'
 
 import { HostedQwenGateway } from './HostedQwenGateway.js'
 import type { HostedQwenAdmission, HostedQwenContainerBinding, HostedQwenGatewayDispatchAuthority } from './HostedQwenGateway.js'
@@ -98,6 +98,7 @@ test('listener opens only while the prepared bridge lease attests its address an
       }
     },
     assertContainerSource() { throw new Error('not admitted in this listener test') },
+    onSourceRevoked() { return () => undefined },
   }
   const rejected = new HostedQwenGateway({ bindAddress: '127.0.0.1', port,
     generation: 'c'.repeat(32), bridgeAuthority, testOnlyAllowNonRoot: true })
@@ -321,6 +322,7 @@ test('Product admission cannot borrow a different firewall source lease', async 
         throw new Error('hosted-qwen-source-mismatch')
       }
     },
+    onSourceRevoked() { return () => undefined },
   }
   const gateway = new HostedQwenGateway({ bindAddress: '127.0.0.1', port,
     upstreamPort: (upstream.address() as AddressInfo).port, generation, bridgeAuthority,
@@ -334,6 +336,81 @@ test('Product admission cannot borrow a different firewall source lease', async 
     .toThrow('hosted-qwen-source-mismatch')
   expect((await raw(port, 'GET', '/v1/models')).status).toBe(403)
   expect(calls).toBe(1)
+})
+
+test('a revoked bridge lease cannot commit a delayed upstream response', async () => {
+  let started: (() => void) | null = null
+  let release: (() => void) | null = null
+  const began = new Promise<void>(resolve => { started = resolve })
+  const upstream = createServer((_req, res) => {
+    started?.()
+    release = () => res.end('AFTER_LEASE_REVOKE')
+  })
+  await new Promise<void>(resolve => upstream.listen(0, '127.0.0.1', resolve))
+  close.push(() => new Promise(resolve => { upstream.closeAllConnections(); upstream.close(() => resolve()) }))
+  let revoked = false
+  let sourceChecks = 0
+  const bridgeAuthority = {
+    async assertBridgeBind() { if (revoked) throw new Error('revoked') },
+    assertContainerSource() { sourceChecks++; if (revoked) throw new Error('revoked') },
+    onSourceRevoked() { return () => undefined },
+  }
+  const port = await freePort()
+  const gateway = new HostedQwenGateway({ bindAddress: '127.0.0.1', port,
+    upstreamPort: (upstream.address() as AddressInfo).port, testOnlyAllowNonRoot: true,
+    generation: 'e'.repeat(32), bridgeAuthority, dispatchAuthority: fakeAuthority().authority })
+  await gateway.start()
+  close.push(() => gateway.stop())
+  gateway.admitClient(productAdmission)
+  const response = raw(port, 'GET', '/v1/models')
+  await began
+  revoked = true
+  release?.()
+  expect(await response).toEqual({ status: 502, body: '' })
+  expect(sourceChecks).toBeGreaterThan(1)
+})
+
+test('bridge revocation tears down a held upstream socket before it can answer', async () => {
+  let started: (() => void) | null = null
+  let release: (() => void) | null = null
+  const began = new Promise<void>(resolve => { started = resolve })
+  let upstreamSocket: Socket | null = null
+  const upstream = createNetServer(socket => {
+    upstreamSocket = socket
+    socket.on('error', () => undefined)
+    socket.once('data', () => {
+      started?.()
+      release = () => socket.end('HTTP/1.1 200 OK\r\nContent-Length: 18\r\n\r\nAFTER_LEASE_REVOKE')
+    })
+  })
+  await new Promise<void>(resolve => upstream.listen(0, '127.0.0.1', resolve))
+  close.push(() => new Promise(resolve => { upstreamSocket?.destroy(); upstream.close(() => resolve()) }))
+  let revoked = false
+  let listener: (() => void) | null = null
+  const bridgeAuthority = {
+    async assertBridgeBind() { if (revoked) throw new Error('revoked') },
+    assertContainerSource() { if (revoked) throw new Error('revoked') },
+    onSourceRevoked(callback: () => void) {
+      listener = callback
+      return () => { listener = null }
+    },
+  }
+  const port = await freePort()
+  const gateway = new HostedQwenGateway({ bindAddress: '127.0.0.1', port,
+    upstreamPort: (upstream.address() as AddressInfo).port, testOnlyAllowNonRoot: true,
+    generation: 'e'.repeat(32), bridgeAuthority, dispatchAuthority: fakeAuthority().authority })
+  await gateway.start()
+  close.push(() => gateway.stop())
+  gateway.admitClient(productAdmission)
+  const response = raw(port, 'GET', '/v1/models').catch(() => ({ status: 0, body: '' }))
+  await began
+  revoked = true
+  listener?.()
+  const result = await Promise.race([response, new Promise<never>((_, reject) => {
+    setTimeout(() => reject(new Error('held exchange survived revocation')), 1000)
+  })])
+  release?.()
+  expect(result.body).toBe('')
 })
 
 test('Product revoke before body completion causes zero upstream requests', async () => {
