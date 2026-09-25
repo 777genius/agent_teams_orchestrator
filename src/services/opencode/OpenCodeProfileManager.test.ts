@@ -629,9 +629,21 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       'opencode/nemotron-3.5-lightning-free',
       'launch_runtime',
     )
-    await expect(resolve('opencode/BIG-PICKLE', 'execution_probe'))
+    const spaceBunnyProbe = await resolve('opencode/space-bunny-free', 'execution_probe')
+    const spaceBunnyLaunch = await resolve('opencode/space-bunny-free', 'launch_runtime')
+    // A Zen free model released after this build must not need a runtime
+    // release to launch; the live catalog in the access policy decides it.
+    const futureFreeLaunch = await resolve('opencode/some-future-free-model', 'launch_runtime')
+    // Exact-model binding: a case variant gets its own scope and can never reuse
+    // big-pickle's. The access policy rejects it as absent from the catalog.
+    const caseVariant = await resolve('opencode/BIG-PICKLE', 'execution_probe')
+    await expect(resolve('opencode/', 'execution_probe'))
       .rejects.toThrow('requires explicit selected authentication')
-    await expect(resolve('opencode/BIG-PICKLE', 'launch_runtime'))
+    // Zen and Go share model ids across catalogs (Space Bunny Free exists in
+    // both); a Go route always needs its subscription key.
+    await expect(resolve('opencode-go/space-bunny-free', 'execution_probe'))
+      .rejects.toThrow('requires explicit selected authentication')
+    await expect(resolve('opencode-go/space-bunny-free', 'launch_runtime'))
       .rejects.toThrow('requires explicit selected authentication')
     const ollama = await resolve('ollama/qwen3:8b', 'execution_probe')
     const ollamaOtherModel = await resolve('ollama/llama3.2:3b', 'execution_probe')
@@ -653,6 +665,14 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     expect(builtinSame).toEqual(builtin)
     expect(builtin.selectedAuthIdentity).toBe('absent')
     expect(currentBuiltinLaunch.selectedAuthIdentity).toBe('absent')
+    expect(spaceBunnyProbe.selectedAuthIdentity).toBe('absent')
+    expect(spaceBunnyLaunch.selectedAuthIdentity).toBe('absent')
+    expect(spaceBunnyProbe.scopeToken).not.toBe(builtin.scopeToken)
+    expect(spaceBunnyProbe.configFingerprint).not.toBe(builtin.configFingerprint)
+    expect(futureFreeLaunch.selectedAuthIdentity).toBe('absent')
+    expect(caseVariant.selectedAuthIdentity).toBe('absent')
+    expect(caseVariant.scopeToken).not.toBe(builtin.scopeToken)
+    expect(caseVariant.configFingerprint).not.toBe(builtin.configFingerprint)
     expect(ollama.selectedAuthIdentity).toBe('absent')
     expect(loopback.selectedAuthIdentity).toBe('absent')
     expect(ollamaOtherModel.configFingerprint).not.toBe(ollama.configFingerprint)
@@ -678,8 +698,6 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     })
 
     await expect(resolve('deepinfra/model'))
-      .rejects.toThrow('requires explicit selected authentication')
-    await expect(resolve('opencode/not-a-catalog-model-free'))
       .rejects.toThrow('requires explicit selected authentication')
     await writeFile(authPath, JSON.stringify({
       opencode: { type: 'api', key: '' },
