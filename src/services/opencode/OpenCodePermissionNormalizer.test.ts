@@ -26,6 +26,20 @@ describe('OpenCodePermissionNormalizer', () => {
     })
   })
 
+  it('reads the tool name from the OpenCode 1.18 permission field', () => {
+    const normalized = normalizeOpenCodePermission({
+      id: 'per_1',
+      sessionID: 'session-1',
+      permission: 'bash',
+      patterns: ['git status'],
+      always: ['git status *'],
+      tool: { messageID: 'msg_1', callID: 'call_1' },
+    })
+    expect(normalized?.requestId).toBe('per_1')
+    expect(normalized?.sessionId).toBe('session-1')
+    expect(normalized?.tool).toBe('bash')
+  })
+
   it('normalizes id/sessionId drift and drops malformed permissions', () => {
     expect(normalizeOpenCodePermissions([
       {

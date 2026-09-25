@@ -66,6 +66,7 @@ export type OpenCodeModelRouteMetadata = {
   proofState: OpenCodeModelProofState
   requiresExecutionProof: boolean
   reason: string | null
+  failureCode?: 'free_tier_restricted'
 }
 
 const KNOWN_AUTHLESS_OPEN_CODE_PROVIDER_IDS = new Set([
@@ -386,7 +387,7 @@ function getOpenCodeModelProofState(input: {
 export function buildOpenCodeModelRouteMetadata(input: {
   selectedModel: string | null | undefined
   catalog: OpenCodeModelAccessCatalog
-  executionOutcome?: Pick<OpenCodeExecutionProbeResult, 'outcome' | 'reason'> | null
+  executionOutcome?: Pick<OpenCodeExecutionProbeResult, 'outcome' | 'reason' | 'failureCode'> | null
   sourceLabel?: string | null
 }): OpenCodeModelRouteMetadata {
   const selectedModel = input.selectedModel?.trim() ?? ''
@@ -414,6 +415,9 @@ export function buildOpenCodeModelRouteMetadata(input: {
     }),
     requiresExecutionProof: access.requiresExecutionProof,
     reason: access.reason,
+    ...(input.executionOutcome?.failureCode === 'free_tier_restricted'
+      ? { failureCode: 'free_tier_restricted' as const }
+      : {}),
   }
 }
 

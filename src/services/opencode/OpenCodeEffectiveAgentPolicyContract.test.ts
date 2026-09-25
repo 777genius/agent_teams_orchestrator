@@ -30,6 +30,21 @@ describe('effective managed agent policy', () => {
     })
   }
 
+  test('OpenCode Zen auto probe carries the teammate tool set behind ask, manual stays tool-less', () => {
+    const probeRules = (mode: 'auto' | 'manual') => buildExpectedOpenCodeAgentPolicies(
+      buildManagedConfig(null, { managedProviderId: 'opencode', toolApprovalMode: mode }),
+      dataHome,
+    ).find(agent => agent.name === 'teammate-model-probe')?.rules
+    const mcpNames = ['agent-teams_*', 'agent_teams_*', 'mcp__agent-teams__*', 'mcp__agent_teams__*']
+    expect(probeRules('auto')).toEqual([
+      r('*', 'deny'),
+      ...['read', 'glob', 'grep', 'list', 'lsp', 'todoread', 'todowrite', 'edit', 'write', 'bash'].map(name => r(name, 'ask')),
+      r('task', 'deny'), r('external_directory', 'deny'), r('doom_loop', 'deny'),
+      ...mcpNames.map(name => r(name, 'ask')), truncate,
+    ])
+    expect(probeRules('manual')).toEqual([r('*', 'deny'), truncate])
+  })
+
   test('accepts arbitrary valid shadowed prefix including earlier universal resets', () => {
     const live = intended('auto')
     for (const agent of live) agent.permission.unshift(r('*', 'allow'), r('unknown_plugin', 'allow', '/private/*'))

@@ -1336,6 +1336,52 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     })
   })
 
+  test('gives only the auto-mode OpenCode Zen probe the teammate tool set, behind ask', () => {
+    const probeOf = (options: Parameters<typeof buildManagedConfig>[1]) =>
+      (buildManagedConfig(null, options).agent as Record<string, Record<string, unknown>>)['teammate-model-probe']
+    const toolLess = {
+      mode: 'primary',
+      description: 'Minimal model execution probe agent with tools disabled.',
+      tools: { '*': false },
+      permission: { '*': 'deny' },
+    }
+
+    // Zen gates free-tier requests on the standard tool set, so its probe carries it.
+    const zen = probeOf({ managedProviderId: 'opencode' })
+    expect(zen).not.toHaveProperty('tools')
+    expect(zen.permission).toEqual({
+      '*': 'deny',
+      read: 'ask',
+      glob: 'ask',
+      grep: 'ask',
+      list: 'ask',
+      lsp: 'ask',
+      todoread: 'ask',
+      todowrite: 'ask',
+      edit: 'ask',
+      write: 'ask',
+      bash: 'ask',
+      task: { '*': 'deny' },
+      external_directory: 'deny',
+      doom_loop: 'deny',
+      'agent-teams_*': 'ask',
+      'agent_teams_*': 'ask',
+      'mcp__agent-teams__*': 'ask',
+      'mcp__agent_teams__*': 'ask',
+    })
+    // Nothing in the probe may be "allow"; "question" and every unlisted tool stay denied.
+    expect(JSON.stringify(zen.permission)).not.toContain('"allow"')
+    expect((zen.permission as Record<string, unknown>).question).toBeUndefined()
+    expect((zen.permission as Record<string, unknown>)['*']).toBe('deny')
+
+    // Manual-mode hosts can hold per-instance "always" approvals, so they keep the tool-less probe.
+    expect(probeOf({ managedProviderId: 'opencode', toolApprovalMode: 'manual' })).toEqual(toolLess)
+    // Other providers and unscoped profiles keep the small tool-less probe.
+    expect(probeOf({ managedProviderId: 'deepinfra' })).toEqual(toolLess)
+    expect(probeOf({ managedProviderId: 'opencode-go' })).toEqual(toolLess)
+    expect(probeOf({})).toEqual(toolLess)
+  })
+
   test('can build a manual approval teammate profile while keeping app MCP allowed', () => {
     const managedConfig = buildManagedConfig(null, { toolApprovalMode: 'manual' })
 
