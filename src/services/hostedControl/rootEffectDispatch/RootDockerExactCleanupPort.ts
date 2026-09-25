@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto'
-import { constants, closeSync, fstatSync, lstatSync, openSync, readFileSync, realpathSync } from 'node:fs'
+import { constants, closeSync, fstatSync, fsyncSync, lstatSync, openSync, readFileSync,
+  realpathSync, writeSync } from 'node:fs'
 import path from 'node:path'
 
 import { hostedMemberStartOperationId } from '../../teamLifecycleOwner/HostedMemberStartOperationId.js'
@@ -64,6 +65,14 @@ function file(directory: string, name: string, maxBytes: number, uid: number): u
     if (bytes.length !== stat.size) throw new Error('root-container-cleanup-claim-invalid')
     return JSON.parse(bytes.toString('utf8')) as unknown
   } finally { closeSync(fd) }
+}
+
+function exists(directory: string, name: string): boolean {
+  try { lstatSync(path.join(directory, name)); return true }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+    throw error
+  }
 }
 
 function boundPath(value: unknown, parent: string): value is string {
@@ -244,16 +253,82 @@ export class RootDockerExactCleanupPort {
     return inspected
   }
 
+  private stopReceiptName(owned: Owned): string {
+    return `cleanup-stop-responded-${owned.memberOperationId}.json`
+  }
+
+  private assertStopResolved(owned: Owned): void {
+    this.assertDirectories()
+    const stop = operation('stop_container', owned)
+    const claimName = `${sha(stop.operationId)}.claim`
+    const receiptName = this.stopReceiptName(owned)
+    const claimed = exists(this.options.effectClaimDirectory, claimName)
+    const acknowledged = exists(this.options.stateDirectory, receiptName)
+    if (!claimed && !acknowledged) return
+    if (!claimed || !acknowledged) throw new Error('root-container-cleanup-stop-unresolved')
+    const claim = file(this.options.effectClaimDirectory, claimName, 2048, this.uid)
+    const receipt = file(this.options.stateDirectory, receiptName, 512, this.uid)
+    if (!exact(claim, ['operationId', 'kind', 'method', 'uri', 'bodySha256', 'bindingSha256']) ||
+      !exact(receipt, ['operationId', 'containerId', 'generation', 'memberOperationId'])) {
+      throw new Error('root-container-cleanup-stop-unresolved')
+    }
+    const c = claim as Record<string, unknown>
+    const r = receipt as Record<string, unknown>
+    if (c.operationId !== stop.operationId || c.kind !== 'stop_container' || c.method !== 'POST' ||
+      c.uri !== `/v1.47/containers/${owned.containerId}/stop` || c.bodySha256 !== sha('') ||
+      c.bindingSha256 !== sha(JSON.stringify(this.options.binding)) ||
+      r.operationId !== stop.operationId || r.containerId !== owned.containerId ||
+      r.generation !== owned.generation || r.memberOperationId !== owned.memberOperationId) {
+      throw new Error('root-container-cleanup-stop-unresolved')
+    }
+    this.assertDirectories()
+  }
+
+  private recordStopped(owned: Owned): void {
+    this.assertDirectories()
+    const payload = Buffer.from(JSON.stringify({ operationId: operation('stop_container', owned).operationId,
+      containerId: owned.containerId, generation: owned.generation,
+      memberOperationId: owned.memberOperationId }))
+    const fd = openSync(path.join(this.options.stateDirectory, this.stopReceiptName(owned)),
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600)
+    try {
+      let offset = 0
+      while (offset < payload.length) {
+        const count = writeSync(fd, payload, offset, payload.length - offset)
+        if (count < 1) throw new Error('root-container-cleanup-stop-receipt-unresolved')
+        offset += count
+      }
+      fsyncSync(fd)
+      const stat = fstatSync(fd)
+      if (!stat.isFile() || stat.nlink !== 1 || stat.uid !== this.uid ||
+        (stat.mode & 0o777) !== 0o600 || stat.size !== payload.length) {
+        throw new Error('root-container-cleanup-stop-receipt-unresolved')
+      }
+    } finally { closeSync(fd) }
+    const dir = openSync(this.options.stateDirectory, constants.O_RDONLY | constants.O_NOFOLLOW)
+    try {
+      const stat = fstatSync(dir)
+      if (stat.dev !== this.stateDirectories[0].dev || stat.ino !== this.stateDirectories[0].ino) {
+        throw new Error('root-container-cleanup-directory-substituted')
+      }
+      fsyncSync(dir)
+    } finally { closeSync(dir) }
+    this.assertStopResolved(owned)
+  }
+
   /** No Owner target, no search, no retry. Ambiguous outcomes require operator reconciliation. */
   async cleanup(): Promise<'removed'> {
     const owned = this.readOwnership()
     return withRootDockerContainerOperationLock(owned.memberOperationId, async () => {
+      this.assertStopResolved(owned)
       const first = await this.inspect(owned)
       if (object(first.State).Running === true) {
         await this.send('stop_container', owned)
+        this.recordStopped(owned)
       }
       const stopped = await this.inspect(owned)
       if (object(stopped.State).Running !== false) throw new Error('root-container-cleanup-still-running')
+      this.assertStopResolved(owned)
       await this.send('remove_container', owned)
       await this.send('inspect_container_absence', owned)
       return 'removed' as const

@@ -33,7 +33,8 @@ afterEach(async () => {
   for (const directory of dirs.splice(0)) await rm(directory, { recursive: true, force: true })
 })
 
-async function fixture(mode: 'valid' | 'foreign' | 'reused' | 'drop-stop' = 'valid') {
+async function fixture(mode: 'valid' | 'foreign' | 'reused' | 'drop-stop' |
+  'drop-stop-after-effect' = 'valid') {
   const dir = await realpath(await mkdtemp(path.join(os.tmpdir(), 'root-exact-cleanup-')))
   dirs.push(dir)
   const [stateDirectory, effectClaimDirectory, workspaceParent, profileParent, configParent] =
@@ -81,7 +82,11 @@ async function fixture(mode: 'valid' | 'foreign' | 'reused' | 'drop-stop' = 'val
       if (split < 0) return
       const line = bytes.toString('utf8', 0, bytes.indexOf('\r\n'))
       requests.push(line)
-      if (mode === 'drop-stop' && line.includes('/stop ')) { socket.destroy(); return }
+      if ((mode === 'drop-stop' || mode === 'drop-stop-after-effect') && line.includes('/stop ')) {
+        if (mode === 'drop-stop-after-effect') running = false
+        socket.destroy()
+        return
+      }
       if (line.startsWith('POST ') && line.includes('/stop ')) running = false
       const remove = line.startsWith('DELETE ')
       const inspect = line.startsWith('GET ')
@@ -158,7 +163,17 @@ test('uncertain Stop never replays or proceeds to Remove', async () => {
   await expect(f.port.cleanup()).rejects.toThrow('unresolved')
   expect(f.requests.filter(value => value.startsWith('POST '))).toHaveLength(1)
   expect(f.requests.some(value => value.startsWith('DELETE '))).toBe(false)
-  expect((await readdir(f.effectClaimDirectory)).filter(value => value.endsWith('.claim'))).toHaveLength(4)
+  expect((await readdir(f.effectClaimDirectory)).filter(value => value.endsWith('.claim'))).toHaveLength(3)
+})
+
+test('effectful Stop with a lost response remains unresolved even when Docker now reports stopped', async () => {
+  const f = await fixture('drop-stop-after-effect')
+  await expect(f.port.cleanup()).rejects.toThrow('root-container-cleanup-unresolved')
+  const afterFirst = [...f.requests]
+  await expect(f.port.cleanup()).rejects.toThrow('root-container-cleanup-stop-unresolved')
+  expect(f.requests).toEqual(afterFirst)
+  expect(f.requests.filter(value => value.startsWith('POST '))).toHaveLength(1)
+  expect(f.requests.some(value => value.startsWith('DELETE '))).toBe(false)
 })
 
 test('root container lock excludes a second member while cleanup owns the daemon', async () => {
