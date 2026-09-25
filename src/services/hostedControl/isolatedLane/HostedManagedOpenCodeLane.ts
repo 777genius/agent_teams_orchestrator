@@ -7,8 +7,10 @@ import type { HostedOpenCodeSupervisorRpcClient } from '../container/HostedOpenC
 import { HostedDurableContainerAttemptClaims,
   HostedDurableMemberSessionClaims } from '../hostedDurableClaims/HostedDurableClaims.js'
 import { HostedMemberSessionBridge } from '../hostedLaneSession/HostedMemberSessionBridge.js'
+import type { HostedMemberAttempt } from '../hostedLaneSession/HostedMemberSessionBridge.js'
 import { OpenCodeHostedMemberSessionTransport } from '../openCodeSessionTransport/OpenCodeHostedMemberSessionTransport.js'
 import { HostedSupervisorEndpointAuthority } from '../openCodeSessionTransport/HostedSupervisorEndpointAuthority.js'
+import type { HostedAgentToolBroker, HostedAgentToolPostExecProof } from '../isolatedAgentTools/HostedAgentToolBroker.js'
 import type { HostedControlRuntimePortFactoryContext } from '../HostedControlRuntime.js'
 
 type RunningInput = TeamLifecycleLaneInput & { runId: string }
@@ -18,6 +20,7 @@ type ManagedRoot = Pick<HostedOpenCodeSupervisorRpcClient,
 type Preparation = Awaited<ReturnType<ManagedRoot['prepareManagedMember']>>
 type Start = Parameters<HostedOpenCodeSupervisorRpcClient['start']>[0]
 type Handle = Parameters<HostedOpenCodeSupervisorRpcClient['stop']>[0]
+type ToolBrokerPort = Pick<HostedAgentToolBroker, 'waitForPeer' | 'bindSession' | 'activate' | 'revoke'>
 
 const ID = /^[a-z0-9][a-z0-9_-]{7,95}$/
 const SHA = /^[a-f0-9]{64}$/
@@ -36,9 +39,34 @@ export type HostedManagedOpenCodeLaneDependencies = Readonly<{
   resolveCanonicalLaneIdentity: HostedCanonicalLaneIdentityResolver
   preparationRequest(binding: HostedContainerLaneBinding): Promise<HostedMemberNetworkRequest | null>
   assertCurrentProduct(input: RunningInput): Promise<boolean>
+  /** Broker must exist before Start; this resolves its exact root post-exec proof. */
+  toolActivation(attempt: HostedMemberAttempt, sessionId: string): Promise<{
+    broker: ToolBrokerPort; proof: HostedAgentToolPostExecProof
+  }>
   /** Must include independent root FD3, gateway and provider policy evidence. */
   readiness(): HostedContainerLaneReadiness & Readonly<{ gateway: boolean; product: boolean; root: boolean }>
 }>
+
+export async function activateHostedMemberTools(
+  attempt: HostedMemberAttempt,
+  sessionId: string,
+  resolve: HostedManagedOpenCodeLaneDependencies['toolActivation'],
+): Promise<void> {
+  const { broker, proof } = await resolve(attempt, sessionId)
+  if (!broker || !proof || proof.containerGeneration !== attempt.containerGeneration ||
+    proof.runId !== attempt.runId || proof.laneId !== attempt.laneId ||
+    proof.memberId !== attempt.memberId || proof.sessionID !== sessionId) {
+    throw new Error('hosted-managed-tool-proof-mismatch')
+  }
+  try {
+    await broker.waitForPeer()
+    broker.bindSession(sessionId)
+    await broker.activate(proof)
+  } catch {
+    await broker.revoke().catch(() => undefined)
+    throw new Error('hosted-managed-tool-activation-failed')
+  }
+}
 
 /**
  * Maps the root manager's durable prepare receipt to the existing hosted lane.
@@ -112,13 +140,15 @@ export function createHostedManagedOpenCodeLane(
   dependencies: HostedManagedOpenCodeLaneDependencies,
 ): TeamLifecycleLaneEffectPort {
   if (!dependencies || !dependencies.root || !dependencies.resolveCanonicalLaneIdentity ||
-    !dependencies.preparationRequest || !dependencies.assertCurrentProduct || !dependencies.readiness) {
+    !dependencies.preparationRequest || !dependencies.assertCurrentProduct ||
+    !dependencies.toolActivation || !dependencies.readiness) {
     throw new Error('hosted-managed-lane-dependencies-incomplete')
   }
   const root = new ManagedRootLaneAdapter(dependencies.root, dependencies.preparationRequest)
   const sessions = new HostedMemberSessionBridge(
     new OpenCodeHostedMemberSessionTransport(new HostedSupervisorEndpointAuthority(dependencies.root)),
     new HostedDurableMemberSessionClaims(context.teamRoot),
+    (attempt, sessionId) => activateHostedMemberTools(attempt, sessionId, dependencies.toolActivation),
   )
   const ready = (): HostedContainerLaneReadiness => {
     try {
@@ -141,7 +171,13 @@ export function createHostedManagedOpenCodeLane(
     supports: action => action === 'launch'
       ? Object.values(ready()).every(value => value === true) && lane.supports(action)
       : lane.supports(action),
-    inspect: input => lane.inspect(input),
+    async inspect(input) {
+      if (!input.runId) return lane.inspect(input)
+      if (!Object.values(ready()).every(value => value === true) ||
+        !await context.isCurrentAuthority({ actorId: 'hosted-lifecycle-owner', ...context.authority }) ||
+        !await dependencies.assertCurrentProduct(input as RunningInput)) return FAILED
+      return lane.inspect(input)
+    },
     async launch(input) {
       if (!Object.values(ready()).every(value => value === true) ||
         !await context.isCurrentAuthority({ actorId: 'hosted-lifecycle-owner', ...context.authority }) ||

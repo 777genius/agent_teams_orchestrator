@@ -34,6 +34,8 @@ class FakeClaims implements HostedMemberSessionClaims {
 }
 
 class FakePort implements AuthenticatedHostedMemberSessionPort {
+  createSession?: (member: HostedMemberAttempt) => Promise<unknown>
+  submitInitial?: (member: HostedMemberAttempt, sessionId: string, prompt: string) => Promise<unknown>
   starts = 0
   posts = 0
   startReceipt: unknown = ready()
@@ -90,6 +92,45 @@ describe('hosted member session bridge', () => {
     expect(await bridge.start(attempt, 'Test prompt')).toBe('ready')
     expect(port.starts).toBe(1)
     await expect(bridge.start(attempt, 'Changed prompt')).rejects.toThrow('does not match admitted plan')
+  })
+
+  test('binds and activates the exact session before the first-turn tool can run', async () => {
+    const events: string[] = []
+    let active = false
+    const port = new FakePort()
+    port.createSession = async () => { events.push('create'); return { ...attempt,
+      state: 'created', sessionId: 'ses_test12345', initialMessageId: null, observedInitialMessageId: null } }
+    port.submitInitial = async (_attempt, sessionId, text) => {
+      events.push('prompt')
+      expect(sessionId).toBe('ses_test12345')
+      expect(text).toBe('Test prompt')
+      // Fake first-turn tool arrives synchronously with the prompt.
+      expect(active).toBe(true)
+      events.push('first-tool')
+      return ready()
+    }
+    const bridge = new HostedMemberSessionBridge(port, new FakeClaims(), async (_member, sessionId) => {
+      expect(sessionId).toBe('ses_test12345')
+      events.push('bind')
+      active = true
+      events.push('activate')
+    })
+    expect(await bridge.start(attempt, 'Test prompt')).toBe('ready')
+    expect(events).toEqual(['create', 'bind', 'activate', 'prompt', 'first-tool'])
+    expect(port.starts).toBe(0)
+  })
+
+  test('failed broker activation cannot submit the first prompt', async () => {
+    const port = new FakePort()
+    let prompts = 0
+    port.createSession = async () => ({ ...attempt, state: 'created',
+      sessionId: 'ses_test12345', initialMessageId: null, observedInitialMessageId: null })
+    port.submitInitial = async () => { prompts++; return ready() }
+    const bridge = new HostedMemberSessionBridge(port, new FakeClaims(), async () => {
+      throw new Error('broker unavailable')
+    })
+    expect(await bridge.start(attempt, 'Test prompt')).toBe('failed')
+    expect(prompts).toBe(0)
   })
 
   test('delivery observes a durable claim after an ambiguous post instead of posting again', async () => {

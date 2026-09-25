@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import { expect, test } from 'bun:test'
 
 import type { HostedControlRuntimePortFactoryContext } from '../HostedControlRuntime.js'
-import { createHostedManagedOpenCodeLane,
+import { activateHostedMemberTools, createHostedManagedOpenCodeLane,
   type HostedManagedOpenCodeLaneDependencies } from './HostedManagedOpenCodeLane.js'
 
 const input = {
@@ -36,6 +36,7 @@ async function fixture() {
     resolveCanonicalLaneIdentity: async () => null,
     preparationRequest: async () => null,
     assertCurrentProduct: async () => { productCalls++; return false },
+    toolActivation: async () => { throw new Error('unexpected tool activation') },
     readiness: () => ({ endpoint: true, fd3Handoff: true, providerConfig: true,
       memberSessions: true, gateway: false, product: true, root: true }),
   } satisfies HostedManagedOpenCodeLaneDependencies
@@ -70,4 +71,24 @@ test('current Product denial stops before managed root preparation', async () =>
     expect(await lane.launch(input as never)).toEqual({ phase: 'failed', recoverable: true })
     expect(f.calls()).toEqual({ rootCalls: 0, productCalls: 1, ownerCalls: 1 })
   } finally { await f.cleanup() }
+})
+
+test('binds broker session and waits for post-exec activation before prompt dispatch', async () => {
+  const events: string[] = []
+  const attempt = { runId: 'run_test12345', laneId: 'lane_test12345',
+    memberId: `member_${'a'.repeat(32)}`, containerGeneration: 'b'.repeat(32) } as never
+  const proof = { operationId: 'start_test12345', runId: 'run_test12345',
+    laneId: 'lane_test12345', memberId: `member_${'a'.repeat(32)}`,
+    containerGeneration: 'b'.repeat(32), sessionID: 'ses_test12345' }
+  const broker = { waitForPeer: async () => { events.push('peer') },
+    bindSession: (id: string) => { expect(id).toBe(proof.sessionID); events.push('bind') },
+    activate: async () => { events.push('activate') },
+    revoke: async () => { events.push('revoke') } }
+  await activateHostedMemberTools(attempt, proof.sessionID,
+    async () => ({ broker: broker as never, proof }))
+  events.push('prompt')
+  expect(events).toEqual(['peer', 'bind', 'activate', 'prompt'])
+  await expect(activateHostedMemberTools(attempt, 'ses_wrong12345',
+    async () => ({ broker: broker as never, proof }))).rejects.toThrow('proof-mismatch')
+  expect(events).toEqual(['peer', 'bind', 'activate', 'prompt'])
 })

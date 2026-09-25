@@ -42,24 +42,49 @@ type WireMessage = { info: Record<string, unknown>; parts: Record<string, unknow
  * /session HTTP transport. All uncertain writes are observed, never retried.
  */
 export class OpenCodeHostedMemberSessionTransport implements AuthenticatedHostedMemberSessionPort {
+  readonly #createIssued = new Set<string>()
+  readonly #initialIssued = new Set<string>()
   constructor(private readonly authority: OpenCodeEndpointAuthority,
     private readonly http: typeof fetch = fetch) {}
 
-  async start(attempt: HostedMemberAttempt, prompt: string): Promise<HostedMemberSessionReceipt> {
+  /** Compatibility method cannot submit a first prompt without an activated broker. */
+  start(attempt: HostedMemberAttempt): Promise<HostedMemberSessionReceipt> {
+    return this.createSession(attempt)
+  }
+
+  async createSession(attempt: HostedMemberAttempt): Promise<HostedMemberSessionReceipt> {
     checkAttempt(attempt)
-    if (!boundedText(prompt, 64 * 1024) || sha(prompt) !== attempt.promptSha256) {
-      throw new TypeError('hosted-opencode-initial-prompt-invalid')
-    }
     return this.withEndpoint(attempt, async proof => {
       const title = titleFor(attempt)
-      // A prior ambiguous create is never followed by a second create or prompt.
+      // A prior ambiguous create is observed, never retried.
       if (await this.findSession(proof, title)) throw new Error('hosted-opencode-start-already-issued')
+      if (this.#createIssued.has(attempt.attemptId)) throw new Error('hosted-opencode-start-already-issued')
+      this.#createIssued.add(attempt.attemptId)
       const created = await this.request(proof, 'POST', '/session', { title })
       if (!object(created) || !SESSION.test(String(created.id ?? '')) || created.title !== title) {
         throw new Error('hosted-opencode-created-session-invalid')
       }
-      const sessionId = created.id as string
+      return createdReceipt(attempt, created.id as string)
+    })
+  }
+
+  /** Call only after the exact session is bound to an activated FD3 broker. */
+  async submitInitial(attempt: HostedMemberAttempt, sessionId: string,
+    prompt: string): Promise<HostedMemberSessionReceipt> {
+    checkAttempt(attempt)
+    if (!SESSION.test(sessionId) || !boundedText(prompt, 64 * 1024) || sha(prompt) !== attempt.promptSha256) {
+      throw new TypeError('hosted-opencode-initial-prompt-invalid')
+    }
+    return this.withEndpoint(attempt, async proof => {
+      const found = await this.findSession(proof, titleFor(attempt))
+      if (found?.id !== sessionId) throw new Error('hosted-opencode-session-binding-invalid')
       const initialMessageId = initialId(attempt)
+      if (await this.getMessage(proof, sessionId, initialMessageId)) {
+        throw new Error('hosted-opencode-initial-prompt-already-issued')
+      }
+      const key = `${attempt.attemptId}:${sessionId}`
+      if (this.#initialIssued.has(key)) throw new Error('hosted-opencode-initial-prompt-already-issued')
+      this.#initialIssued.add(key)
       await this.sendPrompt(proof, sessionId, initialMessageId, prompt, attempt.model)
       const observed = await this.getMessage(proof, sessionId, initialMessageId)
       if (!isUserText(observed, sessionId, initialMessageId, prompt)) {
@@ -77,6 +102,7 @@ export class OpenCodeHostedMemberSessionTransport implements AuthenticatedHosted
         initialMessageId: null, observedInitialMessageId: null }
       const id = initialId(attempt)
       const observed = await this.getMessage(proof, session.id, id)
+      if (observed === null) return createdReceipt(attempt, session.id)
       if (!isUserHash(observed, session.id, id, attempt.promptSha256)) {
         return { ...attempt, state: 'failed', sessionId: null,
           initialMessageId: null, observedInitialMessageId: null }
@@ -239,6 +265,11 @@ function sessionReceipt(attempt: HostedMemberAttempt, sessionId: string,
   initialMessageId: string): HostedMemberSessionReceipt {
   return { ...attempt, state: 'ready', sessionId, initialMessageId,
     observedInitialMessageId: initialMessageId }
+}
+
+function createdReceipt(attempt: HostedMemberAttempt, sessionId: string): HostedMemberSessionReceipt {
+  return { ...attempt, state: 'created', sessionId, initialMessageId: null,
+    observedInitialMessageId: null }
 }
 
 function deliveryReceipt(delivery: HostedMemberDelivery, sessionId: string,

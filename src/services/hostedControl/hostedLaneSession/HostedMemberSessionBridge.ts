@@ -22,7 +22,7 @@ export type HostedMemberAttempt = Readonly<{
 }>
 
 export type HostedMemberSessionReceipt = HostedMemberAttempt & Readonly<{
-  state: 'launching' | 'ready' | 'failed'
+  state: 'created' | 'launching' | 'ready' | 'failed'
   sessionId: string | null
   initialMessageId: string | null
   observedInitialMessageId: string | null
@@ -54,6 +54,10 @@ export type HostedMemberReplyReceipt = HostedMemberDeliveryReceipt & Readonly<{
 /** The implementation must authenticate its peer and bind every call to the exact container generation. */
 export interface AuthenticatedHostedMemberSessionPort {
   start(attempt: HostedMemberAttempt, prompt: string): Promise<unknown>
+  /** Session creation must have no model/prompt effect. */
+  createSession?(attempt: HostedMemberAttempt): Promise<unknown>
+  /** Caller must bind and activate FD3 before invoking this first prompt. */
+  submitInitial?(attempt: HostedMemberAttempt, sessionId: string, prompt: string): Promise<unknown>
   observe(attempt: HostedMemberAttempt): Promise<unknown>
   post(delivery: HostedMemberDelivery, sessionId: string): Promise<unknown>
   observeDelivery(delivery: HostedMemberDelivery, sessionId: string): Promise<unknown>
@@ -101,6 +105,7 @@ export class HostedMemberSessionBridge {
   constructor(
     private readonly port: AuthenticatedHostedMemberSessionPort,
     private readonly claims: HostedMemberSessionClaims,
+    private readonly activateBeforePrompt?: (attempt: HostedMemberAttempt, sessionId: string) => Promise<void>,
   ) {}
 
   async start(attempt: HostedMemberAttempt, prompt: string): Promise<'ready' | 'launching' | 'failed'> {
@@ -113,6 +118,18 @@ export class HostedMemberSessionBridge {
     if (claim.fingerprint !== exact.planFingerprint) return 'failed'
     if (!claim.created) return this.observe(exact)
     try {
+      if (this.activateBeforePrompt) {
+        if (!this.port.createSession || !this.port.submitInitial) return 'failed'
+        const created = createdSessionId(await this.port.createSession(exact), exact)
+        if (!created) return 'failed'
+        await this.activateBeforePrompt(exact, created)
+        const initial = initialPromptDelivery(exact, prompt)
+        const fingerprint = deliveryFingerprint(initial)
+        const promptClaim = await this.claims.claimDelivery(initial, fingerprint)
+        if (promptClaim.fingerprint !== fingerprint) return 'failed'
+        if (!promptClaim.created) return this.observe(exact)
+        return receiptState(await this.port.submitInitial(exact, created, prompt), exact)
+      }
       return receiptState(await this.port.start(exact, prompt), exact)
     } catch {
       // A failed RPC may have created the session or submitted the first prompt.
@@ -183,10 +200,28 @@ function receiptState(value: unknown, attempt: HostedMemberAttempt): 'ready' | '
     if (receipt[key] !== attempt[key]) return 'failed'
   }
   if (receipt.state === 'launching') return 'launching'
+  if (receipt.state === 'created') return createdSessionId(receipt, attempt) ? 'launching' : 'failed'
   if (receipt.state !== 'ready' || !SESSION.test(receipt.sessionId ?? '') ||
     !MESSAGE.test(receipt.initialMessageId ?? '') ||
     receipt.observedInitialMessageId !== receipt.initialMessageId) return 'failed'
   return 'ready'
+}
+
+function createdSessionId(value: unknown, attempt: HostedMemberAttempt): string | null {
+  if (!record(value)) return null
+  const receipt = value as Partial<HostedMemberSessionReceipt>
+  for (const key of ['teamId', 'runId', 'laneId', 'memberId', 'memberName', 'model', 'promptSha256',
+    'planFingerprint', 'containerHandle', 'containerGeneration', 'attemptId'] as const) {
+    if (receipt[key] !== attempt[key]) return null
+  }
+  return receipt.state === 'created' && SESSION.test(receipt.sessionId ?? '') &&
+    receipt.initialMessageId === null && receipt.observedInitialMessageId === null
+    ? receipt.sessionId! : null
+}
+
+function initialPromptDelivery(attempt: HostedMemberAttempt, prompt: string): HostedMemberDelivery {
+  return { attempt, deliveryId: `initial_${sha(attempt.attemptId)}`, kind: 'message',
+    text: prompt, taskId: null, taskRevision: null }
 }
 
 function validateDelivery(delivery: HostedMemberDelivery): HostedMemberDelivery {

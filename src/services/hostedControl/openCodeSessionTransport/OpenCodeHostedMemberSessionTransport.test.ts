@@ -83,11 +83,21 @@ function transport(fake: FakeOpenCode, endpointProof = proof) {
   return new OpenCodeHostedMemberSessionTransport(authority, fake.fetch as typeof fetch)
 }
 
+async function createdAndPrompted(port: OpenCodeHostedMemberSessionTransport) {
+  const created = await port.createSession(attempt)
+  expect(created.state).toBe('created')
+  expect(created.sessionId).toBe(sessionId)
+  return port.submitInitial(attempt, sessionId, prompt)
+}
+
 describe('official OpenCode hosted session transport', () => {
   test('observes the exact initial user prompt and later delivery before issuing receipts', async () => {
     const fake = new FakeOpenCode()
     const port = transport(fake)
-    const started = await port.start(attempt, prompt)
+    const created = await port.createSession(attempt)
+    expect(created.state).toBe('created')
+    expect(fake.promptPosts).toBe(0)
+    const started = await port.submitInitial(attempt, sessionId, prompt)
     expect(started.state).toBe('ready')
     expect(started.sessionId).toBe(sessionId)
     expect(started.initialMessageId).toBe(started.observedInitialMessageId)
@@ -103,16 +113,17 @@ describe('official OpenCode hosted session transport', () => {
     const fake = new FakeOpenCode()
     fake.acceptPrompt = false
     const port = transport(fake)
-    await expect(port.start(attempt, prompt)).rejects.toThrow('unobserved')
-    await expect(port.start(attempt, prompt)).rejects.toThrow('already-issued')
+    await port.createSession(attempt)
+    await expect(port.submitInitial(attempt, sessionId, prompt)).rejects.toThrow('unobserved')
+    await expect(port.submitInitial(attempt, sessionId, prompt)).rejects.toThrow('already-issued')
     expect(fake.promptPosts).toBe(1)
-    expect((await port.observe(attempt)).state).toBe('failed')
+    expect((await port.observe(attempt)).state).toBe('created')
   })
 
   test('reply must be a completed assistant message parented to the exact delivered user prompt', async () => {
     const fake = new FakeOpenCode()
     const port = transport(fake)
-    await port.start(attempt, prompt)
+    await createdAndPrompted(port)
     const posted = await port.post(delivery, sessionId)
     fake.replyParent = 'msg_unrelated1234'
     expect(await port.observeReply(delivery, sessionId, posted.observedUserMessageId)).toBeNull()
@@ -127,7 +138,7 @@ describe('official OpenCode hosted session transport', () => {
   test('tool-call turns are not terminal replies, including provider stop with a pending tool', async () => {
     const fake = new FakeOpenCode()
     const port = transport(fake)
-    await port.start(attempt, prompt)
+    await createdAndPrompted(port)
     const posted = await port.post(delivery, sessionId)
     const parentID = posted.observedUserMessageId
     fake.assistantTurns.push({ info: { id: 'msg_toolcalls1234', role: 'assistant',
@@ -150,7 +161,7 @@ describe('official OpenCode hosted session transport', () => {
   test('finish persisted before time.completed is not a reply receipt', async () => {
     const fake = new FakeOpenCode()
     const port = transport(fake)
-    await port.start(attempt, prompt)
+    await createdAndPrompted(port)
     const posted = await port.post(delivery, sessionId)
     const parentID = posted.observedUserMessageId
     const early = { info: { id: 'msg_early1234', role: 'assistant',
@@ -164,7 +175,7 @@ describe('official OpenCode hosted session transport', () => {
 
   test('rejects endpoint substitution before any HTTP call', async () => {
     const fake = new FakeOpenCode()
-    await expect(transport(fake, { ...proof, endpoint: 'http://example.com:49152' }).start(attempt, prompt))
+    await expect(transport(fake, { ...proof, endpoint: 'http://example.com:49152' }).start(attempt))
       .rejects.toThrow('endpoint-proof-invalid')
     expect(fake.calls).toHaveLength(0)
   })
@@ -182,7 +193,7 @@ describe('official OpenCode hosted session transport', () => {
         expiresAt: Date.now() + 30_000, signal: controller.signal }),
     }
     const port = new OpenCodeHostedMemberSessionTransport(authority, http as typeof fetch)
-    await expect(port.start(attempt, prompt)).rejects.toThrow('endpoint-lease-expired')
+    await expect(port.start(attempt)).rejects.toThrow('endpoint-lease-expired')
     expect(fake.sessions).toHaveLength(1)
     expect(fake.promptPosts).toBe(0)
     expect(fake.calls).toHaveLength(2)
