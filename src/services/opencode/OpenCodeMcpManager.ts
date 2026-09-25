@@ -37,6 +37,15 @@ const OPEN_CODE_MCP_ENV_JSON_ENV = 'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENV_JSON'
 const OPEN_CODE_MCP_URL_ENV = 'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL'
 const AGENT_TEAMS_MCP_CLAUDE_DIR_ENV = 'AGENT_TEAMS_MCP_CLAUDE_DIR'
 const CLAUDE_TEAM_CONTROL_URL_ENV = 'CLAUDE_TEAM_CONTROL_URL'
+/** Explicit selection the Product MCP honours only together with its Claude root. */
+const AGENT_TEAMS_MCP_TRUST_MODE_ENV = 'AGENT_TEAMS_MCP_TRUST_MODE'
+const AGENT_TEAMS_MCP_PERSONAL_HOST_TRUST_MODE = 'personal-host-trusted-process'
+/**
+ * Owner-process markers the MCP child would inherit through `opencode serve`
+ * (OpenCode spawns it with `{...process.env, ...environment}`) and read as
+ * container Hosted mode. Blank values override them.
+ */
+const HOSTED_AGENT_TOOL_MODE_ENV_KEYS = ['HOSTED_OPENCODE_RUNTIME_MODE', 'AUTH_MODE'] as const
 const OPEN_CODE_MCP_ENVIRONMENT_ALLOWLIST = [
   'PATH',
   'HOME',
@@ -448,8 +457,13 @@ export function buildHostedAppMcpLaunchConfig(
     config: {
       type: 'local',
       command: [descriptor.command, descriptor.entry],
-      // Only the hosted Claude root; no control URL and nothing forwarded from env.
-      environment: { [AGENT_TEAMS_MCP_CLAUDE_DIR_ENV]: claudeRoot },
+      // Only the hosted Claude root and the personal-host trust mode; no control
+      // URL and nothing forwarded from env.
+      environment: {
+        [AGENT_TEAMS_MCP_CLAUDE_DIR_ENV]: claudeRoot,
+        [AGENT_TEAMS_MCP_TRUST_MODE_ENV]: AGENT_TEAMS_MCP_PERSONAL_HOST_TRUST_MODE,
+        ...Object.fromEntries(HOSTED_AGENT_TOOL_MODE_ENV_KEYS.map(key => [key, ''])),
+      },
       enabled: true,
       timeout: OPEN_CODE_APP_MCP_TIMEOUT_MS,
     },
