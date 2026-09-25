@@ -7,6 +7,8 @@ import type { HostedOpenCodeContainerSupervisor } from './HostedOpenCodeContaine
 import type { HostedOpenCodeMemberSupervisorManager } from './HostedOpenCodeMemberSupervisorManager.js'
 import type { ManagedMemberLookup } from './HostedOpenCodeMemberSupervisorManager.js'
 import type { HostedMemberNetworkRequest } from '../containerNetworkProvisioning/HostedMemberNetworkProvisioner.js'
+import { validateRootOpenCodeAction, type RootOpenCodeAction, type RootOpenCodeActionResult } from
+  '../openCodeRootHttpProxy/RootOpenCodeHttpProxy.js'
 
 const VERSION = 1
 const MAX_FRAME = 4096
@@ -19,13 +21,14 @@ const DOMAIN = 'agent-teams.hosted-opencode-supervisor/v1'
 
 type Operation = 'prepareMember' | 'startPrepared' | 'start' | 'lookupStart' | 'observe' | 'stop' |
   'reconcile' | 'beginEndpointUse' | 'endEndpointUse' | 'prepareManagedMember' |
-  'startManagedMember' | 'lookupManagedMember' | 'observeManagedMember' | 'stopManagedMember'
+  'startManagedMember' | 'lookupManagedMember' | 'observeManagedMember' | 'stopManagedMember' | 'sessionAction'
 const COMMAND_DEADLINE_MS: Readonly<Record<Operation, number>> = {
   prepareMember: 30_000, startPrepared: 120_000,
   start: 120_000, lookupStart: 15_000, observe: 30_000, stop: 60_000,
   reconcile: 60_000, beginEndpointUse: 30_000, endEndpointUse: 15_000,
   prepareManagedMember: 30_000, startManagedMember: 120_000,
   lookupManagedMember: 15_000, observeManagedMember: 30_000, stopManagedMember: 60_000,
+  sessionAction: 30_000,
 }
 type Start = Parameters<HostedOpenCodeContainerSupervisor['start']>[0]
 type Handle = Parameters<HostedOpenCodeContainerSupervisor['stop']>[0]
@@ -34,7 +37,7 @@ type Prepare = Parameters<HostedOpenCodeContainerSupervisor['prepareMember']>[0]
 type PreparedStart = Parameters<HostedOpenCodeContainerSupervisor['startPrepared']>[0]
 type ManagedHandle = Parameters<HostedOpenCodeMemberSupervisorManager['stop']>[0]
 type Command = Readonly<{ operation: Operation; payload: Start | Handle | EndpointEnd | Prepare |
-  PreparedStart | HostedMemberNetworkRequest | ManagedMemberLookup | ManagedHandle }>
+  PreparedStart | HostedMemberNetworkRequest | ManagedMemberLookup | ManagedHandle | RootOpenCodeAction }>
 type SupervisorPort = Pick<HostedOpenCodeContainerSupervisor,
   'prepareMember' | 'startPrepared' | 'start' | 'lookupStart' | 'observe' | 'stop' | 'reconcile' |
   'beginEndpointUse' | 'endEndpointUse'>
@@ -56,6 +59,10 @@ function verify(secret: Uint8Array, direction: 'request' | 'response', unsigned:
 }
 
 function validCommand(operation: unknown, payload: unknown): operation is Operation {
+  if (operation === 'sessionAction') {
+    try { validateRootOpenCodeAction(payload); return true }
+    catch { return false }
+  }
   if (operation === 'prepareManagedMember') {
     return exactKeys(payload, ['operationId', 'planTeamId', 'planFingerprint', 'runId', 'teamId',
       'laneId', 'memberId']) &&
@@ -202,6 +209,7 @@ export class HostedOpenCodeSupervisorRpcServer {
     ownerGid: number
     supervisor?: SupervisorPort
     manager?: ManagerPort
+    sessionAction?: (request: RootOpenCodeAction) => Promise<RootOpenCodeActionResult>
     /** Inert fixture only. Production is root-owned. */
     testOnlyAllowNonRoot?: boolean
     testOnlyCommandDeadlineMs?: number
@@ -308,6 +316,7 @@ export class HostedOpenCodeSupervisorRpcServer {
         case 'reconcile': result = await this.options.supervisor?.reconcile(command.payload as Handle); break
         case 'beginEndpointUse': result = await this.options.supervisor?.beginEndpointUse(command.payload as Handle); break
         case 'endEndpointUse': result = await this.options.supervisor?.endEndpointUse(command.payload as EndpointEnd); break
+        case 'sessionAction': result = await this.options.sessionAction?.(command.payload as RootOpenCodeAction); break
       }
       if (result === undefined) throw new Error('hosted-supervisor-operation-unavailable')
       const response = { schemaVersion: VERSION, challenge, nonce: command.nonce, operation: command.operation,
@@ -385,6 +394,10 @@ export class HostedOpenCodeSupervisorRpcClient {
 
   endEndpointUse(request: EndpointEnd): ReturnType<HostedOpenCodeContainerSupervisor['endEndpointUse']> {
     return this.command({ operation: 'endEndpointUse', payload: request })
+  }
+
+  sessionAction(request: RootOpenCodeAction): Promise<RootOpenCodeActionResult> {
+    return this.command({ operation: 'sessionAction', payload: request })
   }
 
   async command<T>(command: Command): Promise<T> {

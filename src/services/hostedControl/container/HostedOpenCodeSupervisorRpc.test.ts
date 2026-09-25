@@ -8,6 +8,7 @@ import { expect, test } from 'bun:test'
 import type { HostedOpenCodeContainerSupervisor } from './HostedOpenCodeContainerSupervisor.js'
 import type { HostedOpenCodeMemberSupervisorManager } from './HostedOpenCodeMemberSupervisorManager.js'
 import { HostedOpenCodeSupervisorRpcClient, HostedOpenCodeSupervisorRpcServer } from './HostedOpenCodeSupervisorRpc.js'
+import type { RootOpenCodeAction } from '../openCodeRootHttpProxy/RootOpenCodeHttpProxy.js'
 
 const START = { operationId: 'start_12345678', leaseId: 'lease_12345678', runId: 'run_12345678',
   teamId: 'team_12345678', laneId: 'lane_12345678', memberId: 'member_12345678' }
@@ -16,6 +17,19 @@ const HANDLE = { operationId: 'stop_12345678', handle: `opencode_${'a'.repeat(32
 const MEMBER = { operationId: 'member_12345678', planTeamId: 'plan_12345678',
   planFingerprint: 'd'.repeat(64), runId: START.runId, teamId: START.teamId,
   laneId: START.laneId, memberId: START.memberId }
+
+test('typed session RPC refuses HTTP fields before opening the socket', async () => {
+  const client = new HostedOpenCodeSupervisorRpcClient({ socketPath: '/does-not-exist/socket',
+    secret: Buffer.alloc(32, 7), ownerGid: process.getgid!(), testOnlyAllowNonRoot: true })
+  const action: RootOpenCodeAction = { operationId: 'action_12345678', kind: 'session_create',
+    runId: `run_${'a'.repeat(32)}`, memberId: `member_${'b'.repeat(32)}`,
+    attemptId: `member_attempt_${'c'.repeat(64)}`,
+    containerHandle: `opencode_${'d'.repeat(32)}`, containerGeneration: 'e'.repeat(32), sourceRef: null }
+  await expect(client.sessionAction({ ...action, url: 'http://evil.invalid' } as RootOpenCodeAction))
+    .rejects.toThrow('command-invalid')
+  await expect(client.sessionAction({ ...action, kind: 'arbitrary_http' } as RootOpenCodeAction))
+    .rejects.toThrow('command-invalid')
+})
 
 function packet(value: object): Buffer {
   const bytes = Buffer.from(JSON.stringify(value))

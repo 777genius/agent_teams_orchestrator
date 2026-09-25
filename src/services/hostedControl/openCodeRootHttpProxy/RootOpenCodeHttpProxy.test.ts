@@ -1,0 +1,128 @@
+import { expect, test } from 'bun:test'
+import { createHash } from 'node:crypto'
+
+import type { HostedProductCurrentMember, HostedProductMemberBinding } from
+  '../productAuthority/HostedProductCurrentMemberDecision.js'
+import { RootOpenCodeHttpProxy, type RootOpenCodeAction, type RootOpenCodeCanonicalAction,
+  type RootOpenCodeHttpRequest } from './RootOpenCodeHttpProxy.js'
+
+const hash = (value: string) => createHash('sha256').update(value).digest('hex')
+const action: RootOpenCodeAction = {
+  operationId: 'operation_12345678', kind: 'session_create', runId: `run_${'a'.repeat(32)}`,
+  memberId: `member_${'b'.repeat(32)}`, attemptId: `member_attempt_${'c'.repeat(64)}`,
+  containerHandle: `opencode_${'d'.repeat(32)}`, containerGeneration: 'e'.repeat(32), sourceRef: null,
+}
+const binding = { runId: action.runId, memberId: action.memberId } as HostedProductMemberBinding
+const current = { ...binding, model: 'openai/gpt-5', promptSha256: hash('canonical prompt') } as HostedProductCurrentMember
+const canonical: RootOpenCodeCanonicalAction = {
+  attemptId: action.attemptId, containerHandle: action.containerHandle,
+  containerGeneration: action.containerGeneration, model: current.model,
+  promptSha256: current.promptSha256, sessionId: null, messageId: null,
+  sourceRef: null, text: null,
+}
+
+function fixture(overrides: Partial<ConstructorParameters<typeof RootOpenCodeHttpProxy>[0]> = {}) {
+  const events: string[] = []
+  const writes: RootOpenCodeHttpRequest[] = []
+  const claims = new Map<string, string>()
+  let resolved: RootOpenCodeCanonicalAction = canonical
+  let response = { statusCode: 201, body: { id: `ses${'f'.repeat(12)}` } }
+  const proxy = new RootOpenCodeHttpProxy({ binding,
+    decision: { async withCurrentMemberDecision(_binding, _kind, callback) {
+      events.push('product'); return callback(current)
+    } },
+    source: { resolve() { events.push('source'); return resolved } },
+    claims: { claim(id, fingerprint) {
+      events.push('claim')
+      const prior = claims.get(id)
+      if (prior) return prior === fingerprint ? 'already_claimed' : 'claim_conflict'
+      claims.set(id, fingerprint)
+      return 'created'
+    } },
+    wire: { async prepare(handle, generation) {
+      events.push('prepare')
+      expect(handle).toBe(action.containerHandle)
+      expect(generation).toBe(action.containerGeneration)
+      return { emitSync(request) { events.push('write'); writes.push(request) },
+        response: Promise.resolve(response), close() { events.push('close') } }
+    } }, ...overrides })
+  return { proxy, events, writes, claims,
+    setCanonical(value: RootOpenCodeCanonicalAction) { resolved = value },
+    setResponse(value: typeof response) { response = value },
+  }
+}
+
+test('proxy is inert without a Product source, claim and root wire', async () => {
+  await expect(new RootOpenCodeHttpProxy().dispatch(action)).rejects.toThrow('inactive')
+})
+
+test('Owner cannot add URL, method, body, or reusable Basic credential', async () => {
+  const f = fixture()
+  for (const field of ['url', 'method', 'body', 'password']) {
+    await expect(f.proxy.dispatch({ ...action, [field]: 'http://evil.invalid' } as RootOpenCodeAction))
+      .rejects.toThrow('action-invalid')
+  }
+  expect(f.events).toEqual([])
+})
+
+test('Product denial and missing canonical source produce zero HTTP bytes', async () => {
+  const f = fixture({ decision: { async withCurrentMemberDecision() { throw new Error('revoked') } } })
+  await expect(f.proxy.dispatch(action)).rejects.toThrow('revoked')
+  expect(f.events).toEqual([])
+  const missing = fixture({ source: { resolve() { throw new Error('missing-canonical-prompt') } } })
+  await expect(missing.proxy.dispatch(action)).rejects.toThrow('missing-canonical-prompt')
+  expect(missing.writes).toEqual([])
+})
+
+test('Product revocation after socket preparation makes no claim and sends no bytes', async () => {
+  let decisions = 0
+  const f = fixture({ decision: { async withCurrentMemberDecision(_binding, _kind, callback) {
+    decisions++
+    if (decisions === 2) throw new Error('revoked-before-write')
+    return callback(current)
+  } } })
+  expect(await f.proxy.dispatch(action)).toEqual({ outcome: 'uncertain', reason: 'dispatch-failed' })
+  expect(f.claims.size).toBe(0)
+  expect(f.writes).toHaveLength(0)
+})
+
+test('session create uses fixed official route and claims durably before one write', async () => {
+  const f = fixture()
+  expect(await f.proxy.dispatch(action)).toEqual({ outcome: 'responded', statusCode: 201,
+    body: { id: `ses${'f'.repeat(12)}` } })
+  expect(f.writes).toEqual([{ method: 'POST', path: '/session',
+    body: JSON.stringify({ title: `hosted-member-attempt:${action.attemptId}` }),
+    contentSha256: hash(JSON.stringify({ title: `hosted-member-attempt:${action.attemptId}` })) }])
+  expect(f.events.indexOf('claim')).toBeLessThan(f.events.indexOf('write'))
+  expect(await f.proxy.dispatch(action)).toEqual({ outcome: 'already_claimed' })
+  expect(await f.proxy.dispatch({ ...action, operationId: 'operation_87654321' }))
+    .toEqual({ outcome: 'claim_conflict' })
+  expect(f.writes).toHaveLength(1)
+})
+
+test('GET observation recovers an uncertain write without another POST', async () => {
+  const f = fixture()
+  f.setResponse({ statusCode: 503, body: { id: `ses${'f'.repeat(12)}` } })
+  expect((await f.proxy.dispatch(action)).outcome).toBe('responded')
+  const observed = { ...action, kind: 'session_observe' as const, operationId: 'observe_12345678' }
+  expect((await f.proxy.dispatch(observed)).outcome).toBe('responded')
+  expect(f.writes.map(write => [write.method, write.path])).toEqual([
+    ['POST', '/session'], ['GET', `/session?search=${encodeURIComponent(`hosted-member-attempt:${action.attemptId}`)}&limit=101`],
+  ])
+  expect(f.claims.size).toBe(1)
+})
+
+test('prompt text must match Product hash; delivery requires canonical text and fixed route', async () => {
+  const f = fixture()
+  const prompt = { ...action, kind: 'initial_prompt' as const }
+  f.setCanonical({ ...canonical, sessionId: `ses${'1'.repeat(12)}`, messageId: `msg${'2'.repeat(12)}`,
+    text: 'owner-controlled prompt' })
+  await expect(f.proxy.dispatch(prompt)).rejects.toThrow('canonical-action-invalid')
+  expect(f.writes).toHaveLength(0)
+  const delivery = { ...action, kind: 'task_delivery' as const, sourceRef: 'task_12345678' }
+  f.setCanonical({ ...canonical, sessionId: `ses${'1'.repeat(12)}`, messageId: `msg${'2'.repeat(12)}`,
+    sourceRef: delivery.sourceRef, text: 'canonical task text' })
+  expect((await f.proxy.dispatch(delivery)).outcome).toBe('responded')
+  expect(f.writes[0]?.path).toBe(`/session/ses${'1'.repeat(12)}/prompt_async`)
+  expect(JSON.parse(f.writes[0]?.body ?? '{}').parts).toEqual([{ type: 'text', text: 'canonical task text' }])
+})
