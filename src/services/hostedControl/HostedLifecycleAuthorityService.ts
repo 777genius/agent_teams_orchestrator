@@ -21,7 +21,7 @@ import {
   HostedLifecycleProviderRegistry,
   type HostedLifecycleOwnerResolution,
 } from './HostedLifecycleProviderRegistry.js'
-import { createHostedLifecycleSnapshot } from './HostedLifecycleSnapshot.js'
+import { createHostedLifecycleSnapshot, type HostedLifecycleProviderSnapshot } from './HostedLifecycleSnapshot.js'
 import type { HostedLifecycleRunReservation } from './HostedLifecycleRunReservation.js'
 
 type LifecycleContext = {
