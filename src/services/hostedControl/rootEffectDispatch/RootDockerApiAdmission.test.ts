@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from 'bun:test'
 import { chmod, mkdtemp, realpath, rm } from 'node:fs/promises'
-import { createServer, type Server } from 'node:net'
+import { createServer, type Server, type Socket } from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -18,15 +18,18 @@ afterEach(async () => {
   for (const directory of directories.splice(0)) await rm(directory, { recursive: true, force: true })
 })
 
-async function fixture(responses: Record<string, { status?: number; body: unknown }> = {}) {
+async function fixture(responses: Record<string, { status?: number; body: unknown }> = {},
+  unfinishedError = false) {
   const directory = await realpath(await mkdtemp(path.join(os.tmpdir(), 'root-docker-api-')))
   directories.push(directory)
   const socketPath = path.join(directory, 'docker.sock')
   const requests: string[] = []
+  const connections: Socket[] = []
   const version = { Version: pins.serverVersion, ApiVersion: pins.apiVersion,
     MinAPIVersion: pins.minApiVersion }
   const info = { ID: pins.daemonId, ServerVersion: pins.serverVersion, OSType: 'linux' }
   const server = createServer(socket => {
+    connections.push(socket)
     let bytes = ''
     socket.on('data', chunk => {
       bytes += chunk.toString('latin1')
@@ -34,6 +37,10 @@ async function fixture(responses: Record<string, { status?: number; body: unknow
       const line = bytes.split('\r\n', 1)[0]
       requests.push(line)
       const uri = line.split(' ')[1]
+      if (unfinishedError && uri === '/v1.47/version') {
+        socket.write('HTTP/1.1 500 Error\r\nContent-Length: 1000\r\nConnection: keep-alive\r\n\r\n')
+        return
+      }
       const reply = responses[uri] ?? { body: uri === '/v1.47/version' ? version : info }
       const body = JSON.stringify(reply.body)
       socket.end(`HTTP/1.1 ${reply.status ?? 200} ${reply.status ? 'Error' : 'OK'}\r\n` +
@@ -43,7 +50,7 @@ async function fixture(responses: Record<string, { status?: number; body: unknow
   servers.push(server)
   await new Promise<void>(resolve => server.listen(socketPath, resolve))
   await chmod(socketPath, 0o660)
-  return { socketPath, requests }
+  return { socketPath, requests, connections }
 }
 
 test('exact pinned Docker 29 API and daemon identity admit using only Unix socket GETs', async () => {
@@ -85,4 +92,18 @@ test('untrusted socket and failed read-only probe never admit', async () => {
   await chmod(f.socketPath, 0o666)
   expect(await admission.assertDockerApiCompatible()).toBe(false)
   expect(f.requests).toHaveLength(1)
+})
+
+test('unfinished error response closes its Unix socket after rejection', async () => {
+  const f = await fixture({}, true)
+  try {
+    const admission = RootDockerApiAdmission.create({ socketPath: f.socketPath, pins,
+      timeoutMs: 100, testOnlyAllowNonRoot: true })
+    expect(await admission.assertDockerApiCompatible()).toBe(false)
+    expect(f.requests).toEqual(['GET /v1.47/version HTTP/1.1'])
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(f.connections[0]?.destroyed).toBe(true)
+  } finally {
+    for (const socket of f.connections) socket.destroy()
+  }
 })

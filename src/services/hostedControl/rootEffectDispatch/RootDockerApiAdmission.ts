@@ -87,30 +87,43 @@ export class RootDockerApiAdmission {
   private async getJson(uri: '/v1.47/version' | '/v1.47/info'): Promise<unknown> {
     return new Promise((resolve, reject) => {
       let timer: ReturnType<typeof setTimeout>
-      const fail = (error: Error) => { clearTimeout(timer); reject(error) }
+      let socket: { destroy(): void } | undefined
+      let responseStream: { destroy(): void } | undefined
+      let settled = false
+      const finish = (error?: Error, value?: unknown) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        // Closing the underlying socket is required even if the server never finishes its body.
+        responseStream?.destroy()
+        socket?.destroy()
+        req.destroy()
+        if (error) reject(error)
+        else resolve(value)
+      }
       const req = request({ socketPath: this.socketPath, path: uri, method: 'GET', agent: false,
         headers: { Host: 'docker', Connection: 'close', Accept: 'application/json' } }, response => {
+        responseStream = response
         if (response.statusCode !== 200) {
-          response.resume()
-          fail(new Error('root-docker-api-response-invalid'))
+          finish(new Error('root-docker-api-response-invalid'))
           return
         }
         const chunks: Buffer[] = []
         let length = 0
         response.on('data', (chunk: Buffer) => {
           length += chunk.length
-          if (length > MAX_RESPONSE) req.destroy(new Error('root-docker-api-response-too-large'))
+          if (length > MAX_RESPONSE) finish(new Error('root-docker-api-response-too-large'))
           else chunks.push(chunk)
         })
         response.once('end', () => {
-          clearTimeout(timer)
-          try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')) as unknown) }
-          catch { reject(new Error('root-docker-api-response-invalid')) }
+          try { finish(undefined, JSON.parse(Buffer.concat(chunks).toString('utf8')) as unknown) }
+          catch { finish(new Error('root-docker-api-response-invalid')) }
         })
-        response.once('error', fail)
+        response.once('error', finish)
       })
-      timer = setTimeout(() => req.destroy(new Error('root-docker-api-timeout')), this.timeoutMs)
-      req.once('error', fail)
+      timer = setTimeout(() => finish(new Error('root-docker-api-timeout')), this.timeoutMs)
+      req.once('socket', attached => { socket = attached; if (settled) attached.destroy() })
+      req.once('error', finish)
       req.end()
     })
   }
