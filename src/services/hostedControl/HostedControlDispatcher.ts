@@ -22,8 +22,10 @@ import {
 import {
   isProductOwnerBoundEnvelope,
   openProductOwnerBoundRequest,
+  ProductOwnerBoundRejection,
   sealProductOwnerBoundResponse,
   type ProductOwnerEffectFence,
+  type ProductOwnerEffectFenceDecision,
 } from './HostedProductOwnerBoundEnvelope.js'
 import {
   HostedApprovalWireDispatcher,
@@ -92,7 +94,7 @@ export type HostedControlDispatcherOptions = {
   /** Product-envelope task_mutate; the Owner writer itself decides whether local writes are admitted. */
   tasks?: HostedProductTaskMutationPort
   /** Checks Product's owner effect fence against the published team identity; absent closes Product envelopes. */
-  verifyOwnerEffectFence?: (fence: ProductOwnerEffectFence) => Promise<boolean>
+  verifyOwnerEffectFence?: (fence: ProductOwnerEffectFence) => Promise<ProductOwnerEffectFenceDecision>
   /** Absent until a single durable approval runtime owner is composed. */
   approvals?: HostedApprovalWirePort
 }
@@ -124,6 +126,19 @@ export class HostedControlDispatcher {
   }
 
   async #dispatchProductOwnerBound(message: Record<string, unknown>): Promise<Record<string, unknown>> {
+    try {
+      return await this.#dispatchProductOwnerBoundUnlogged(message)
+    } catch (error) {
+      // The only Owner-side trace of a failed Product exchange: the peer sees a closed socket.
+      const reason = error instanceof ProductOwnerBoundRejection
+        ? error.reason
+        : `dispatch-failed:${error instanceof Error ? error.name : 'unknown'}`
+      process.stderr.write(`Hosted owner-bound request rejected: operation=${String(message.operation).slice(0, 32)} reason=${reason}\n`)
+      throw error
+    }
+  }
+
+  async #dispatchProductOwnerBoundUnlogged(message: Record<string, unknown>): Promise<Record<string, unknown>> {
     const verifyOwnerEffectFence = this.options.verifyOwnerEffectFence
     if (!verifyOwnerEffectFence) throw new Error('Hosted Product owner effect fence verifier is unavailable')
     const request = await openProductOwnerBoundRequest({

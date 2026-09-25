@@ -163,6 +163,25 @@ describe('Product task_mutate envelope', () => {
     expect(await readdir(join(root, 'tasks', 'legacy'))).toEqual([])
   })
 
+  test('logs why a request was rejected with field names and codes only', async () => {
+    const { dispatcher } = await fixture({ denyOwnerLocalWrites: false })
+    const lines: string[] = []
+    const write = process.stderr.write
+    process.stderr.write = ((chunk: string | Uint8Array) => { lines.push(String(chunk)); return true }) as typeof process.stderr.write
+    try {
+      const { ownerProof: _, ...unsigned } = taskRequest(createCommand())
+      const foreign = { ...unsigned, authority: { ...unsigned.authority, restoreGeneration: 99, mountBinding: { ...unsigned.authority.mountBinding, declaredRootHash: 'b'.repeat(64) } } }
+      await expect(dispatcher.dispatch({ ...foreign, ownerProof: productProof('task_mutate', 'request', foreign) })).rejects.toThrow('authority')
+      await expect(dispatcher.dispatch(productRequest('message_persist', { schemaVersion: 1 }, { grantRevision: 'd'.repeat(64), identityChecksum: 'e'.repeat(64) }))).rejects.toThrow('team identity')
+    } finally {
+      process.stderr.write = write
+    }
+    expect(lines).toEqual([
+      'Hosted owner-bound request rejected: operation=task_mutate reason=authority:mountBinding.declaredRootHash,restoreGeneration\n',
+      'Hosted owner-bound request rejected: operation=message_persist reason=team identity fence:identity-checksum-mismatch\n',
+    ])
+  })
+
   test('leaves the legacy control envelope on its own route', () => {
     const legacy = taskRequest(createCommand())
     const { ownerEffectFence: _, ...authority } = legacy.authority

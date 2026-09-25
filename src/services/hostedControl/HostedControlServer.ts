@@ -592,8 +592,10 @@ export class HostedControlServer {
     if (message.operation !== HOSTED_CONTROL_OPERATION || isProductOwnerBoundEnvelope(message)) {
       const leaseSocket = this.#leaseSocket
       const ownerBinding = this.#ownerBinding
+      const productEnvelope = isProductOwnerBoundEnvelope(message)
       if (!leaseSocket || leaseSocket.destroyed || !(await this.#hasCurrentSocketIdentity()) ||
         !ownerBinding || !this.#options.dispatchCoexistingOperation) {
+        if (productEnvelope) logOwnerBoundRejection(message, 'owner-lease-unavailable')
         socket.destroy()
         return
       }
@@ -603,6 +605,7 @@ export class HostedControlServer {
       )
       if (!response || this.#leaseSocket !== leaseSocket || leaseSocket.destroyed ||
         !(await this.#hasCurrentSocketIdentity()) || !isDeepStrictEqual(ownerBinding, this.#ownerBinding)) {
+        if (productEnvelope) logOwnerBoundRejection(message, response ? 'owner-lease-lost' : 'no-response')
         socket.destroy()
         return
       }
@@ -882,6 +885,10 @@ function taskResultMatchesRequest(
     result.receipt.commandId === command.commandId &&
     result.receipt.teamId === command.teamId &&
     result.receipt.sourceGeneration === command.expectedSourceGeneration
+}
+
+function logOwnerBoundRejection(message: Record<string, unknown>, reason: string): void {
+  process.stderr.write(`Hosted owner-bound request rejected: operation=${String(message.operation).slice(0, 32)} reason=${reason}\n`)
 }
 
 function writeBoundedResponse(socket: Socket, value: Record<string, unknown>): void {
