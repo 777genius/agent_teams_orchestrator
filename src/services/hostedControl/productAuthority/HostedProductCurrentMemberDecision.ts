@@ -215,7 +215,97 @@ function frozenSnapshot(promotion: Row): { lanes: Row[] } {
   return { lanes }
 }
 
-/** Root process reads the Product v33 writer DB. This is a current decision, never a launch permit. */
+// Exact Product v35 DDL snapshot for cross-process schema admission.
+const PRODUCT_V35_SCHEMA = {
+  version: 35,
+  statements: [
+    `CREATE TABLE hosted_lifecycle_deployment_authorities (
+      deployment_id TEXT PRIMARY KEY,
+      boot_id TEXT NOT NULL,
+      owner_authority TEXT NOT NULL,
+      owner_generation INTEGER NOT NULL CHECK (owner_generation > 0),
+      owner_session_id TEXT NOT NULL,
+      restore_generation INTEGER NOT NULL CHECK (restore_generation >= 0),
+      mount_generation INTEGER NOT NULL CHECK (mount_generation > 0),
+      revision INTEGER NOT NULL CHECK (revision > 0),
+      state TEXT NOT NULL CHECK (state IN ('active', 'retired'))
+    )`,
+    `CREATE TRIGGER hosted_lifecycle_authorities_no_replace BEFORE INSERT ON hosted_lifecycle_deployment_authorities
+      WHEN EXISTS (SELECT 1 FROM hosted_lifecycle_deployment_authorities a
+        WHERE a.rowid = NEW.rowid OR a.deployment_id = NEW.deployment_id)
+      BEGIN SELECT RAISE(ABORT, 'hosted lifecycle authority is retained'); END`,
+    `CREATE TRIGGER hosted_lifecycle_authorities_no_delete BEFORE DELETE ON hosted_lifecycle_deployment_authorities
+      BEGIN SELECT RAISE(ABORT, 'hosted lifecycle authority is retained'); END`,
+    `CREATE TRIGGER hosted_lifecycle_authorities_guard_update BEFORE UPDATE ON hosted_lifecycle_deployment_authorities
+      WHEN NEW.deployment_id != OLD.deployment_id OR NEW.revision != OLD.revision + 1
+        OR NEW.owner_generation < OLD.owner_generation
+        OR NEW.owner_authority != OLD.owner_authority
+        OR (NEW.owner_generation = OLD.owner_generation AND
+          (NEW.boot_id != OLD.boot_id OR NEW.owner_authority != OLD.owner_authority OR
+           NEW.owner_session_id != OLD.owner_session_id OR
+           NEW.restore_generation != OLD.restore_generation OR
+           NEW.mount_generation != OLD.mount_generation))
+        OR (OLD.state = 'retired' AND NEW.owner_generation = OLD.owner_generation)
+      BEGIN SELECT RAISE(ABORT, 'hosted lifecycle authority transition invalid'); END`,
+    `CREATE TABLE hosted_lifecycle_current_runs (
+      run_id TEXT PRIMARY KEY,
+      deployment_id TEXT NOT NULL,
+      boot_id TEXT NOT NULL,
+      team_id TEXT NOT NULL,
+      owner_authority TEXT NOT NULL,
+      owner_generation INTEGER NOT NULL,
+      owner_session_id TEXT NOT NULL,
+      restore_generation INTEGER NOT NULL,
+      mount_generation INTEGER NOT NULL,
+      state TEXT NOT NULL CHECK (state IN ('eligible', 'retired')),
+      FOREIGN KEY (run_id) REFERENCES hosted_lifecycle_run_reservations(run_id)
+        ON DELETE RESTRICT ON UPDATE RESTRICT
+    )`,
+    `CREATE UNIQUE INDEX hosted_lifecycle_one_eligible_run_per_team
+      ON hosted_lifecycle_current_runs (deployment_id, team_id) WHERE state = 'eligible'`,
+    `CREATE TRIGGER hosted_lifecycle_current_runs_no_replace BEFORE INSERT ON hosted_lifecycle_current_runs
+      WHEN EXISTS (SELECT 1 FROM hosted_lifecycle_current_runs r
+        WHERE r.rowid = NEW.rowid OR r.run_id = NEW.run_id OR
+          (r.deployment_id = NEW.deployment_id AND r.team_id = NEW.team_id AND r.state = 'eligible'))
+        OR NOT EXISTS (SELECT 1 FROM hosted_lifecycle_deployment_authorities a
+          WHERE a.deployment_id = NEW.deployment_id AND a.boot_id = NEW.boot_id
+            AND a.owner_authority = NEW.owner_authority AND a.owner_generation = NEW.owner_generation
+            AND a.owner_session_id = NEW.owner_session_id
+            AND a.restore_generation = NEW.restore_generation
+            AND a.mount_generation = NEW.mount_generation AND a.state = 'active')
+        OR NOT EXISTS (SELECT 1 FROM hosted_lifecycle_run_reservations r
+          WHERE r.run_id = NEW.run_id AND r.deployment_id = NEW.deployment_id
+            AND r.boot_id = NEW.boot_id AND r.team_id = NEW.team_id)
+      BEGIN SELECT RAISE(ABORT, 'hosted lifecycle current run binding invalid'); END`,
+    `CREATE TRIGGER hosted_lifecycle_current_runs_guard_update BEFORE UPDATE ON hosted_lifecycle_current_runs
+      WHEN OLD.state != 'eligible' OR NEW.state != 'retired' OR NEW.run_id != OLD.run_id
+        OR NEW.deployment_id != OLD.deployment_id OR NEW.boot_id != OLD.boot_id
+        OR NEW.team_id != OLD.team_id OR NEW.owner_authority != OLD.owner_authority
+        OR NEW.owner_generation != OLD.owner_generation OR NEW.owner_session_id != OLD.owner_session_id
+        OR NEW.restore_generation != OLD.restore_generation OR NEW.mount_generation != OLD.mount_generation
+      BEGIN SELECT RAISE(ABORT, 'hosted lifecycle run transition invalid'); END`,
+    `CREATE TRIGGER hosted_lifecycle_current_runs_no_delete BEFORE DELETE ON hosted_lifecycle_current_runs
+      BEGIN SELECT RAISE(ABORT, 'hosted lifecycle run is retained'); END`,
+    `CREATE TABLE hosted_lifecycle_retired_members (
+      run_id TEXT NOT NULL,
+      member_id TEXT NOT NULL,
+      PRIMARY KEY (run_id, member_id),
+      FOREIGN KEY (run_id) REFERENCES hosted_lifecycle_current_runs(run_id)
+        ON DELETE RESTRICT ON UPDATE RESTRICT
+    )`,
+    `CREATE TRIGGER hosted_lifecycle_retired_members_no_replace BEFORE INSERT ON hosted_lifecycle_retired_members
+      WHEN EXISTS (SELECT 1 FROM hosted_lifecycle_retired_members m
+        WHERE m.rowid = NEW.rowid OR (m.run_id = NEW.run_id AND m.member_id = NEW.member_id))
+      BEGIN SELECT RAISE(ABORT, 'hosted lifecycle member retirement is immutable'); END`,
+    `CREATE TRIGGER hosted_lifecycle_retired_members_no_update BEFORE UPDATE ON hosted_lifecycle_retired_members
+      BEGIN SELECT RAISE(ABORT, 'hosted lifecycle member retirement is immutable'); END`,
+    `CREATE TRIGGER hosted_lifecycle_retired_members_no_delete BEFORE DELETE ON hosted_lifecycle_retired_members
+      BEGIN SELECT RAISE(ABORT, 'hosted lifecycle member retirement is retained'); END`,
+  ],
+} as const
+
+
+/** Root process reads the Product v35 writer DB. This is a current decision, never a launch permit. */
 export class HostedProductCurrentMemberDecision {
   private busy = false
 
@@ -302,7 +392,7 @@ export class HostedProductCurrentMemberDecision {
 
   private assertSchema(): void {
     const db = this.database
-    if ((db.query('PRAGMA user_version').get() as Row | null)?.user_version !== 33 ||
+    if ((db.query('PRAGMA user_version').get() as Row | null)?.user_version !== 35 ||
       (db.query('PRAGMA journal_mode').get() as Row | null)?.journal_mode !== 'wal') {
       throw new Error('hosted-product-schema-incompatible')
     }
@@ -320,6 +410,12 @@ export class HostedProductCurrentMemberDecision {
       hosted_workspaces: ['runtime_workspace_id', 'public_workspace_id', 'status'],
       users: ['user_id', 'status'],
       hosted_auth_configuration: ['singleton', 'auth_mode'],
+      hosted_lifecycle_deployment_authorities: ['deployment_id', 'boot_id', 'owner_authority',
+        'owner_generation', 'owner_session_id', 'restore_generation', 'mount_generation', 'revision', 'state'],
+      hosted_lifecycle_current_runs: ['run_id', 'deployment_id', 'boot_id', 'team_id',
+        'owner_authority', 'owner_generation', 'owner_session_id', 'restore_generation',
+        'mount_generation', 'state'],
+      hosted_lifecycle_retired_members: ['run_id', 'member_id'],
     }
     for (const [table, columns] of Object.entries(required)) {
       const schema = db.query('SELECT type FROM main.sqlite_schema WHERE name = ?').get(table) as Row | null
@@ -359,6 +455,38 @@ export class HostedProductCurrentMemberDecision {
           row.name === wanted.name && row.tableName === wanted.tableName && row.sql === wanted.sql))) {
         throw new Error('hosted-product-schema-incompatible')
       }
+    }
+    const v35Tables = ['hosted_lifecycle_deployment_authorities',
+      'hosted_lifecycle_current_runs', 'hosted_lifecycle_retired_members'] as const
+    const v35Expected: Array<{ type: string; name: string; tableName: string; sql: string | null }> =
+      PRODUCT_V35_SCHEMA.statements.map(sql => {
+        const match = /^CREATE (TABLE|TRIGGER|UNIQUE INDEX) ([a-z_]+)/u.exec(sql)
+        const type = match?.[1] === 'UNIQUE INDEX' ? 'index' : match?.[1]?.toLowerCase()
+        const tableName = type === 'table' ? match?.[2] : / ON ([a-z_]+)/u.exec(sql)?.[1]
+        if (!match || !type || !tableName) throw new Error('hosted-product-schema-contract-invalid')
+        return { type, name: match[2], tableName, sql }
+      })
+    for (const table of v35Tables) {
+      v35Expected.push({ type: 'index', name: `sqlite_autoindex_${table}_1`,
+        tableName: table, sql: null })
+    }
+    const v35Records = (schema: 'main' | 'temp') => (db.query(
+      `SELECT type, name, tbl_name AS tableName, sql FROM ${schema}.sqlite_schema`).all() as Row[])
+      .filter(row => {
+        const name = row.name
+        return v35Tables.includes(row.tableName as typeof v35Tables[number]) ||
+          typeof name === 'string' && (
+            name.startsWith('hosted_lifecycle_authorities_') ||
+            name.startsWith('hosted_lifecycle_current_runs_') ||
+            name.startsWith('hosted_lifecycle_retired_members_') ||
+            name === 'hosted_lifecycle_one_eligible_run_per_team' ||
+            v35Tables.some(table => name.startsWith(`sqlite_autoindex_${table}_`)))
+      })
+    const actualV35 = v35Records('main')
+    if (v35Records('temp').length || actualV35.length !== v35Expected.length ||
+      v35Expected.some(wanted => !actualV35.some(row => row.type === wanted.type &&
+        row.name === wanted.name && row.tableName === wanted.tableName && row.sql === wanted.sql))) {
+      throw new Error('hosted-product-schema-incompatible')
     }
     if ((db.query('PRAGMA ignore_check_constraints').get() as Row | null)?.ignore_check_constraints !== 0 ||
       (db.query('PRAGMA main.foreign_key_check').all() as Row[]).length !== 0 ||
@@ -414,6 +542,7 @@ export class HostedProductCurrentMemberDecision {
       reservation.restoreGeneration !== binding.restoreGeneration ||
       reservation.mountGeneration !== binding.mountGeneration ||
       reservation.expectedPlanGeneration !== `plan-generation_${binding.planSha256}`) return null
+    if (!this.currentLifecycleEpoch(reservation, binding)) return null
     const evidence = exact(reservation.authorityEvidence, ['userId', 'sessionId', 'grantGeneration'])
     const fence = exact(reservation.ownerEffectFence, ['grantRevision', 'identityChecksum'])
     if (typeof evidence.userId !== 'string' || !ID.test(evidence.userId) ||
@@ -523,6 +652,29 @@ export class HostedProductCurrentMemberDecision {
       admittedWorkspaceRoot: promotion.admittedWorkspaceRoot as string,
       grantRevision: fence.grantRevision as string, grantGeneration: evidence.grantGeneration as number,
       laneOrdinal: lane.laneOrdinal as number, memberOrdinal: member.memberOrdinal as number })
+  }
+
+  /** Called only inside the caller's BEGIN IMMEDIATE, serializing with Product retire writes. */
+  private currentLifecycleEpoch(reservation: Row, binding: HostedProductMemberBinding): boolean {
+    const current = this.database.query(`SELECT 1 FROM main.hosted_lifecycle_deployment_authorities authority
+      JOIN main.hosted_lifecycle_current_runs run ON run.deployment_id = authority.deployment_id
+      WHERE authority.deployment_id = ? AND authority.state = 'active'
+        AND authority.boot_id = ? AND authority.owner_authority = ?
+        AND authority.owner_generation = ? AND authority.owner_session_id = ?
+        AND authority.restore_generation = ? AND authority.mount_generation = ?
+        AND run.run_id = ? AND run.team_id = ? AND run.state = 'eligible'
+        AND run.boot_id = authority.boot_id AND run.owner_authority = authority.owner_authority
+        AND run.owner_generation = authority.owner_generation
+        AND run.owner_session_id = authority.owner_session_id
+        AND run.restore_generation = authority.restore_generation
+        AND run.mount_generation = authority.mount_generation
+        AND NOT EXISTS (SELECT 1 FROM main.hosted_lifecycle_retired_members retired
+          WHERE retired.run_id = run.run_id AND retired.member_id = ?)
+      LIMIT 1`).get(binding.deploymentId, reservation.bootId as string,
+      reservation.ownerAuthority as string, reservation.ownerGeneration as number,
+      reservation.ownerSessionId as string, binding.restoreGeneration,
+      binding.mountGeneration, binding.runId, binding.teamId, binding.memberId)
+    return current !== null
   }
 
   private currentGrantAndSession(reservation: Row, evidence: Row, fence: Row): boolean {

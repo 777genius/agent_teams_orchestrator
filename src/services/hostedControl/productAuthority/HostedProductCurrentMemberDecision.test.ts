@@ -12,21 +12,39 @@ type Fixture = { directory: string; databasePath: string; db: Database;
   reader: HostedProductCurrentMemberDecision; binding: HostedProductMemberBinding; expectedName: string }
 
 async function fixture(): Promise<Fixture> {
-  const directory = await realpath(await mkdtemp('/tmp/hosted-product-v33-member-'))
+  const directory = await realpath(await mkdtemp('/tmp/hosted-product-v35-member-'))
   await chmod(directory, 0o700)
   const databasePath = path.join(directory, 'product.sqlite')
-  // Product ec14cd7145: WorkerCore created/promoted/reserved/adopted this test member;
-  // HostedCurrentMemberAdmissionOps.resolve accepted it under the real v33 schema.
-  const compressed = await readFile(path.join(import.meta.dir, 'fixtures/product-v33-current-member.sqlite.gz'))
+  // Product WorkerCore created, promoted, reserved, adopted and activated this test member.
+  const compressed = await readFile(path.join(import.meta.dir, 'fixtures/product-v35-current-member.sqlite.gz'))
   await writeFile(databasePath, gunzipSync(compressed), { mode: 0o600 })
   const metadata = JSON.parse(await readFile(path.join(import.meta.dir,
-    'fixtures/product-v33-current-member.binding.json'), 'utf8')) as
-    HostedProductMemberBinding & { expectedName: string; now: number }
-  const { expectedName, now, ...binding } = metadata
+    'fixtures/product-v35-current-member.metadata.json'), 'utf8')) as {
+      now: number; expectedName: string; runId: string; memberId: string; runtimeWorkspaceId: string;
+      binding: { deploymentId: string; restoreGeneration: number; mountGeneration: number }
+    }
   const db = new Database(databasePath, { create: false, readwrite: true })
+  const reservationRow = db.query('SELECT record_json FROM hosted_lifecycle_run_reservations WHERE run_id = ?')
+    .get(metadata.runId) as { record_json: string }
+  const reservation = JSON.parse(reservationRow.record_json) as {
+    teamId: string; promotionOperationId: string; planSha256: string; rosterBindingSha256: string }
+  const rosterRow = db.query('SELECT binding_json FROM hosted_promotion_roster_bindings WHERE operation_id = ?')
+    .get(reservation.promotionOperationId) as { binding_json: string }
+  const roster = JSON.parse(rosterRow.binding_json) as {
+    lanes: Array<{ laneId: string; members: Array<{ memberId: string }> }> }
+  const lane = roster.lanes.find(entry => entry.members.some(member => member.memberId === metadata.memberId))
+  if (!lane) throw new Error('fixture-member-missing')
+  const binding: HostedProductMemberBinding = {
+    runId: metadata.runId, memberId: metadata.memberId, teamId: reservation.teamId,
+    laneId: lane.laneId, deploymentId: metadata.binding.deploymentId,
+    runtimeWorkspaceId: metadata.runtimeWorkspaceId, planSha256: reservation.planSha256,
+    rosterBindingSha256: reservation.rosterBindingSha256,
+    restoreGeneration: metadata.binding.restoreGeneration,
+    mountGeneration: metadata.binding.mountGeneration,
+  }
   const reader = await HostedProductCurrentMemberDecision.create({ databasePath,
-    expectedUid: process.getuid!(), now: () => now, testOnlyAllowNonRoot: true })
-  return { directory, databasePath, db, reader, binding, expectedName }
+    expectedUid: process.getuid!(), now: () => metadata.now, testOnlyAllowNonRoot: true })
+  return { directory, databasePath, db, reader, binding, expectedName: metadata.expectedName }
 }
 
 async function close(f: Fixture): Promise<void> {
@@ -35,7 +53,7 @@ async function close(f: Fixture): Promise<void> {
   await rm(f.directory, { recursive: true, force: true })
 }
 
-test('Product v33 current member is admitted, forged bindings and revoked grant/session are denied', async () => {
+test('Product v35 current member is admitted, forged bindings and revoked grant/session are denied', async () => {
   const f = await fixture()
   try {
     expect(await f.reader.withCurrentMemberDecision(f.binding, 'prepare', current => current.memberName))
@@ -62,6 +80,48 @@ test('Product v33 current member is admitted, forged bindings and revoked grant/
   } finally { await close(f) }
 })
 
+test('old boot and Owner session cannot authorize a member after an epoch change', async () => {
+  for (const [column, next] of [
+    ['boot_id', 'boot_new-epoch'],
+    ['owner_session_id', 'owner-session_new-epoch'],
+  ] as const) {
+    const f = await fixture()
+    try {
+      let effects = 0
+      await f.reader.withCurrentMemberDecision(f.binding, 'prepare', () => { effects++; return true })
+      f.db.query(`UPDATE hosted_lifecycle_deployment_authorities
+        SET ${column} = ?, owner_generation = owner_generation + 1, revision = revision + 1`)
+        .run(next)
+      await expect(f.reader.withCurrentMemberDecision(f.binding, 'start', () => {
+        effects++; return true
+      })).rejects.toThrow('member-not-current')
+      expect(effects).toBe(1)
+    } finally { await close(f) }
+  }
+})
+
+test('committed authority, run and member retirement each deny later effects', async () => {
+  for (const retire of [
+    (f: Fixture) => f.db.query(`UPDATE hosted_lifecycle_deployment_authorities
+      SET state = 'retired', revision = revision + 1`).run(),
+    (f: Fixture) => f.db.query(`UPDATE hosted_lifecycle_current_runs
+      SET state = 'retired' WHERE run_id = ?`).run(f.binding.runId),
+    (f: Fixture) => f.db.query(`INSERT INTO hosted_lifecycle_retired_members
+      (run_id, member_id) VALUES (?, ?)`).run(f.binding.runId, f.binding.memberId),
+  ]) {
+    const f = await fixture()
+    try {
+      let effects = 0
+      await f.reader.withCurrentMemberDecision(f.binding, 'start', () => { effects++; return true })
+      retire(f)
+      await expect(f.reader.withCurrentMemberDecision(f.binding, 'start', () => {
+        effects++; return true
+      })).rejects.toThrow('member-not-current')
+      expect(effects).toBe(1)
+    } finally { await close(f) }
+  }
+})
+
 test('missing or replaced Product database is refused before callback', async () => {
   const f = await fixture()
   try {
@@ -74,7 +134,7 @@ test('missing or replaced Product database is refused before callback', async ()
     await rename(g.databasePath, moved)
     const replacementPath = path.join(g.directory, 'replacement.sqlite')
     const replacement = new Database(replacementPath)
-    replacement.exec('PRAGMA user_version = 33')
+    replacement.exec('PRAGMA user_version = 35')
     replacement.close()
     await rename(replacementPath, g.databasePath)
     await chmod(g.databasePath, 0o600)
@@ -83,7 +143,7 @@ test('missing or replaced Product database is refused before callback', async ()
   } finally { await close(g) }
 })
 
-test('Product v32 marker and altered v30-v33 immutable schema objects fail closed', async () => {
+test('Product v33 marker and altered immutable schema objects fail closed', async () => {
   const f = await fixture()
   try {
     f.db.exec('DROP TRIGGER hosted_promotions_no_update')
@@ -96,16 +156,32 @@ test('Product v32 marker and altered v30-v33 immutable schema objects fail close
     await expect(g.reader.withCurrentMemberDecision(g.binding, 'observe', () => true))
       .rejects.toThrow('schema-incompatible')
   } finally { await close(g) }
+  const v35 = await fixture()
+  try {
+    v35.db.exec('DROP TRIGGER hosted_lifecycle_current_runs_guard_update')
+    await expect(v35.reader.withCurrentMemberDecision(v35.binding, 'observe', () => true))
+      .rejects.toThrow('schema-incompatible')
+  } finally { await close(v35) }
   const h = await fixture()
   try {
     h.reader.close()
-    h.db.exec('PRAGMA user_version = 32')
+    h.db.exec('PRAGMA user_version = 33')
     await expect(HostedProductCurrentMemberDecision.create({ databasePath: h.databasePath,
       expectedUid: process.getuid!(), testOnlyAllowNonRoot: true }))
       .rejects.toThrow('schema-incompatible')
     h.db.close()
     await rm(h.directory, { recursive: true, force: true })
   } catch (error) { h.db.close(); await rm(h.directory, { recursive: true, force: true }); throw error }
+  const directory = await realpath(await mkdtemp('/tmp/hosted-product-historical-v33-'))
+  try {
+    const databasePath = path.join(directory, 'product.sqlite')
+    const historical = await readFile(path.join(import.meta.dir,
+      'fixtures/product-v33-current-member.sqlite.gz'))
+    await writeFile(databasePath, gunzipSync(historical), { mode: 0o600 })
+    await expect(HostedProductCurrentMemberDecision.create({ databasePath,
+      expectedUid: process.getuid!(), testOnlyAllowNonRoot: true }))
+      .rejects.toThrow('schema-incompatible')
+  } finally { await rm(directory, { recursive: true, force: true }) }
 })
 
 test('tampered frozen mount or plan fails despite a current grant', async () => {
