@@ -30,6 +30,44 @@ async function raw(port: number, method: string, path: string, body = ''): Promi
   })
 }
 
+async function rawWire(port: number, onData?: (wire: string) => void): Promise<string> {
+  return await new Promise((resolve, reject) => {
+    const client = createConnection({ host: '127.0.0.1', port })
+    let wire = ''
+    const timeout = setTimeout(() => { client.destroy(); reject(new Error('raw gateway response stalled')) }, 2500)
+    client.on('error', error => { clearTimeout(timeout); reject(error) })
+    client.on('data', chunk => { wire += chunk.toString(); onData?.(wire) })
+    client.on('close', () => { clearTimeout(timeout); resolve(wire) })
+    client.on('connect', () => client.write('GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n'))
+  })
+}
+
+function parseRawWire(wire: string): { status: number; complete: boolean } {
+  const boundary = wire.indexOf('\r\n\r\n')
+  if (boundary < 0) return { status: 0, complete: false }
+  const head = wire.slice(0, boundary)
+  const status = Number(/^HTTP\/1\.1 (\d{3})/.exec(head)?.[1] ?? 0)
+  const body = wire.slice(boundary + 4)
+  const length = /^content-length:\s*(\d+)\s*$/im.exec(head)
+  if (length) return { status, complete: Buffer.byteLength(body) === Number(length[1]) }
+  if (!/^transfer-encoding:\s*chunked\s*$/im.test(head)) return { status, complete: true }
+  let cursor = 0
+  while (cursor < body.length) {
+    const lineEnd = body.indexOf('\r\n', cursor)
+    if (lineEnd < 0) return { status, complete: false }
+    const hex = body.slice(cursor, lineEnd)
+    if (!/^[0-9a-f]+$/i.test(hex)) return { status, complete: false }
+    const size = Number.parseInt(hex, 16)
+    cursor = lineEnd + 2
+    if (size === 0) return { status, complete: body.slice(cursor) === '\r\n' }
+    if (body.slice(cursor + size, cursor + size + 2) !== '\r\n') {
+      return { status, complete: false }
+    }
+    cursor += size + 2
+  }
+  return { status, complete: false }
+}
+
 test('only the admitted client and exact OpenAI routes reach the fixed loopback upstream', async () => {
   const calls: string[] = []
   const upstream = createServer((req, res) => {
@@ -52,9 +90,10 @@ test('only the admitted client and exact OpenAI routes reach the fixed loopback 
   expect(await raw(port, 'GET', '/v1/models')).toEqual({ status: 200, body: '{"ok":true}' })
   expect(await raw(port, 'POST', '/v1/chat/completions', '{"model":"qwen3-8b"}')).toEqual(
     { status: 200, body: '{"ok":true}' })
+  expect(parseRawWire(await rawWire(port))).toEqual({ status: 200, complete: true })
   expect((await raw(port, 'GET', '/v1/other')).status).toBe(400)
   expect((await raw(port, 'POST', '/v1/models', '{}')).status).toBe(400)
-  expect(calls).toEqual(['GET /v1/models', 'POST /v1/chat/completions'])
+  expect(calls).toEqual(['GET /v1/models', 'POST /v1/chat/completions', 'GET /v1/models'])
   gateway.revokeClient()
   expect((await raw(port, 'GET', '/v1/models')).status).toBe(403)
 })
@@ -402,15 +441,57 @@ test('bridge revocation tears down a held upstream socket before it can answer',
   await gateway.start()
   close.push(() => gateway.stop())
   gateway.admitClient(productAdmission)
-  const response = raw(port, 'GET', '/v1/models').catch(() => ({ status: 0, body: '' }))
+  const response = rawWire(port)
   await began
   revoked = true
   listener?.()
-  const result = await Promise.race([response, new Promise<never>((_, reject) => {
+  const wire = await Promise.race([response, new Promise<never>((_, reject) => {
     setTimeout(() => reject(new Error('held exchange survived revocation')), 1000)
   })])
   release?.()
-  expect(result.body).toBe('')
+  expect(parseRawWire(wire)).toEqual({ status: 403, complete: true })
+  expect(wire).not.toContain('AFTER_LEASE_REVOKE')
+})
+
+test('revoking a streamed response leaves raw HTTP framing incomplete', async () => {
+  let upstreamSocket: Socket | null = null
+  const upstream = createNetServer(socket => {
+    upstreamSocket = socket
+    socket.on('error', () => undefined)
+    socket.once('data', () => socket.write(
+      'HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n' +
+      '5\r\nfirst\r\n'))
+  })
+  await new Promise<void>(resolve => upstream.listen(0, '127.0.0.1', resolve))
+  close.push(() => new Promise(resolve => { upstreamSocket?.destroy(); upstream.close(() => resolve()) }))
+  let revoked = false
+  let listener: (() => void) | null = null
+  const bridgeAuthority = {
+    async assertBridgeBind() { if (revoked) throw new Error('revoked') },
+    assertContainerSource() { if (revoked) throw new Error('revoked') },
+    onSourceRevoked(callback: () => void) {
+      listener = callback
+      return () => { listener = null }
+    },
+  }
+  const port = await freePort()
+  const gateway = new HostedQwenGateway({ bindAddress: '127.0.0.1', port,
+    upstreamPort: (upstream.address() as AddressInfo).port, testOnlyAllowNonRoot: true,
+    generation: 'e'.repeat(32), bridgeAuthority, dispatchAuthority: fakeAuthority().authority })
+  await gateway.start()
+  close.push(() => gateway.stop())
+  gateway.admitClient(productAdmission)
+  const wire = await rawWire(port, received => {
+    if (!revoked && received.includes('first')) {
+      revoked = true
+      listener?.()
+      upstreamSocket?.write('6\r\nsecond\r\n0\r\n\r\n')
+    }
+  })
+  expect(parseRawWire(wire)).toEqual({ status: 200, complete: false })
+  expect(wire).toContain('first')
+  expect(wire).not.toContain('second')
+  expect(wire).not.toMatch(/\r\n0\r\n\r\n$/)
 })
 
 test('Product revoke before body completion causes zero upstream requests', async () => {

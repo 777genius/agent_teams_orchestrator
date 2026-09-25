@@ -60,7 +60,7 @@ export class HostedQwenGateway {
   private readonly server: Server
   private admitted: HostedQwenAdmission | string | null = null
   private admissionEpoch = 0
-  private readonly active = new Set<{ cancel(): void }>()
+  private readonly active = new Set<{ cancel(denied?: boolean): void }>()
   private started = false
   private detachBridgeRevocation: (() => void) | null = null
   private readonly maxRequestBytes: number
@@ -99,7 +99,7 @@ export class HostedQwenGateway {
       void this.handle(req, res).catch(() => {
         if (res.destroyed) return
         if (!res.headersSent) res.writeHead(502).end()
-        else res.destroy()
+        else { req.destroy(); res.destroy() }
       })
     })
     this.server.on('connect', (_req, socket) => socket.destroy())
@@ -167,7 +167,7 @@ export class HostedQwenGateway {
   revokeClient(): void {
     this.admitted = null
     this.admissionEpoch++
-    for (const exchange of [...this.active]) exchange.cancel()
+    for (const exchange of [...this.active]) exchange.cancel(true)
   }
 
   attest(): void {
@@ -278,13 +278,19 @@ export class HostedQwenGateway {
       if (finish()) upstream?.destroy()
     }
     const exchange = {
-      cancel: () => {
+      cancel: (denied = false) => {
         if (cancelled) return
         cancelled = true
         if (!finish()) return
         upstream?.destroy()
-        req.destroy()
-        res.destroy()
+        if (!res.headersSent && !res.destroyed) {
+          res.writeHead(denied ? 403 : 504,
+            { 'content-length': '0', connection: 'close' }).end()
+          req.socket.end()
+        } else {
+          req.destroy()
+          res.destroy()
+        }
       },
     }
     this.active.add(exchange)
@@ -370,7 +376,7 @@ export class HostedQwenGateway {
       if (!finish()) return
       socket.destroy()
       if (!res.destroyed) {
-        if (res.headersSent) res.destroy()
+        if (res.headersSent) { req.destroy(); res.destroy() }
         else res.writeHead(502, { connection: 'close' }).end()
       }
     }
@@ -397,6 +403,7 @@ export class HostedQwenGateway {
               res.writeHead(parser.headers!.status, {
                 'content-type': parser.headers!.contentType,
                 'cache-control': 'no-store',
+                'transfer-encoding': 'chunked',
               })
             })
             if (!result.allowed || finished || cancelled) { fail(); return }
