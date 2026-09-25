@@ -2827,9 +2827,7 @@ async function runReadiness(
   }
   if (qualifiedSelectedModel) {
     let retained: Awaited<ReturnType<typeof openCodeProvisioningProbe.probeRetainingHost>> | null = null
-    // Only the final success return below can set launchAllowed true; every
-    // earlier return in this try forces it false, so this is the sole path
-    // that keeps the verified persistent host alive for the next launch.
+    // Launch adopts this verified host; disposing it on Linux cannot confirm tree termination and strands the hostKey.
     let keepVerifiedHost = false
     try {
       retained = await runtimeDeadline.runPhase('host_start', context =>

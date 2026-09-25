@@ -2675,7 +2675,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
   })
 
   test('selected readiness uses one retained launch host and releases it without broad fallback', async () => {
-    let released = 0
+    const releases: Array<boolean | undefined> = []
     let provenHost: string | null = null
     let observedProviderId = 'deepinfra'
     const selected = parseOpenCodeProviderScopedModelRef('deepinfra/chosen')!
@@ -2700,7 +2700,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
       snapshot: { ...snapshot, models: [selected.raw], host: retainedHost,
         profile: retainedHost.profile },
       host: retainedHost,
-      release: async () => { released += 1 },
+      release: async keepAlive => { releases.push(keepAlive) },
     })) as typeof openCodeProvisioningProbe.probeRetainingHost
     openCodeExecutionProbe.probeModel = (async () => {
       throw new Error('separate execution host poison path must not run')
@@ -2723,7 +2723,8 @@ describe('OpenCodeBridgeCommandHandler', () => {
 
     expect(result.ok).toBe(true)
     expect(provenHost).toBe('host-key')
-    expect(released).toBe(1)
+    // Only a launch-allowed result may keep the verified host for adoption.
+    expect(releases).toEqual([true])
     if (result.ok) expect(result.data.expectedBehaviorEvidence.fullModelId).toBe(selected.raw)
 
     observedProviderId = 'other'
@@ -2735,6 +2736,20 @@ describe('OpenCodeBridgeCommandHandler', () => {
       expect(mismatch.data.launchAllowed).toBe(false)
       expect(mismatch.data.executionProof).toBeUndefined()
     }
+    expect(releases).toEqual([true, false])
+
+    const unprobed = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.readiness', {
+      projectPath: '/tmp/project', selectedModel: selected.raw,
+    }))
+    expect(unprobed).toMatchObject({ ok: true, data: { launchAllowed: false } })
+    expect(releases).toEqual([true, false, false])
+
+    openCodeProvisioningProbe.refreshSelectedProfileAuthority = async () => null
+    const rejected = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.readiness', {
+      projectPath: '/tmp/project', selectedModel: selected.raw, requireExecutionProbe: true,
+    }))
+    expect(rejected.ok).toBe(false)
+    expect(releases).toEqual([true, false, false, false])
   })
 
   test('selected readiness reports bounded authority diagnostics before and after execution', async () => {
