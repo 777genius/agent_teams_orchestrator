@@ -272,8 +272,12 @@ export class HostedLifecycleAuthorityWal {
 
 function applyEntry(state: HostedLifecycleWalState, entry: HostedLifecycleWalEntry): void {
   if (entry.kind === 'grant') {
-    if (state.grants.has(entry.authorization.grantId) || [...state.grants.values()].some(existing =>
-      walCommandKey(existing.command, existing.authorization) === walCommandKey(entry.command, entry.authorization))) {
+    const key = walCommandKey(entry.command, entry.authorization)
+    const prior = [...state.grants.values()].filter(existing =>
+      walCommandKey(existing.command, existing.authorization) === key)
+    if (state.grants.has(entry.authorization.grantId) || state.commands.has(key) ||
+      prior.some(existing => !state.released.has(existing.authorization.grantId) ||
+        existing.fingerprint !== entry.fingerprint || !isDeepStrictEqual(existing.command, entry.command))) {
       throw new Error('Invalid duplicate hosted lifecycle WAL grant')
     }
     state.grants.set(entry.authorization.grantId, entry)

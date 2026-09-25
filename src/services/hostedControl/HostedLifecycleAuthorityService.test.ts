@@ -22,7 +22,7 @@ afterEach(async () => { await Promise.all(roots.splice(0).map(root => rm(root, {
 
 const teamId = `team_${'a'.repeat(32)}`
 const incarnation = {
-  workspaceId: 'workspace-a', teamId, deploymentId: 'deployment-a', bootId: 'boot-a', restoreGeneration: 3,
+  workspaceId: `workspace_${'b'.repeat(32)}`, teamId, deploymentId: 'deployment-a', bootId: 'boot-a', restoreGeneration: 3,
 }
 const context = {
   actorId: 'actor-a', sessionId: 'session-a', deploymentId: 'deployment-a', bootId: 'boot-a',
@@ -100,18 +100,19 @@ function launchCommand(provider: MutableProvider, patch: Record<string, unknown>
 function durableCommand(command: HostedLifecycleDurableCommand, authorization: {
   deploymentId: string; actorId: string; bootId: string; restoreGeneration: number; mountGeneration: number
   ownerEffectFence: typeof ownerEffectFence
-}) {
+}, reservedRunId: string | null = null) {
+  const runId = command.action === 'launch' ? reservedRunId : (command as { runId?: string }).runId
   const digest = createHash('sha256').update(JSON.stringify([
     'agent-teams.hosted-lifecycle-command/v1', command.schemaVersion, command.action,
     command.commandId, command.idempotencyKey, command.workspaceId, command.teamId,
-    command.expectedRevision, command.action === 'launch' ? null : (command as { runId?: string }).runId,
+    command.expectedRevision, runId,
     authorization.ownerEffectFence.grantRevision, authorization.ownerEffectFence.identityChecksum,
   ])).digest('hex')
   return {
     schemaVersion: 1,
     commandFingerprint: { algorithm: 'sha256', version: 1, digest },
     idempotency: { deploymentId: authorization.deploymentId, actorId: authorization.actorId, action: command.action, idempotencyKey: command.idempotencyKey },
-    resource: { bootId: authorization.bootId, workspaceId: command.workspaceId, teamId: command.teamId, runId: command.action === 'launch' ? null : (command as { runId?: string }).runId, expectedRevision: command.expectedRevision, restoreGeneration: authorization.restoreGeneration, mountGeneration: authorization.mountGeneration, ownerEffectFence: authorization.ownerEffectFence },
+    resource: { bootId: authorization.bootId, workspaceId: command.workspaceId, teamId: command.teamId, runId, expectedRevision: command.expectedRevision, restoreGeneration: authorization.restoreGeneration, mountGeneration: authorization.mountGeneration, ownerEffectFence: authorization.ownerEffectFence },
   }
 }
 
@@ -255,6 +256,114 @@ describe('HostedLifecycleAuthorityService', () => {
     expect(provider.commandBindings).toEqual([{
       commandId: command.commandId, idempotencyKey: command.idempotencyKey,
     }])
+  })
+
+  test('reissues the original command only after a released grant with no started effect', async () => {
+    const { service, provider, wal } = await fixture()
+    const originalAuthority = authority(provider)
+    const command = launchCommand(provider)
+    const first = await service.authorize({ command, context, authority: originalAuthority })
+    if (first.kind !== 'authorized') throw new Error('expected first grant')
+    const durable = durableCommand(command, first.authorization)
+    await expect(service.replayLookup({ command, authorization: first.authorization,
+      durableCommand: durable, context, authority: originalAuthority }))
+      .resolves.toMatchObject({ kind: 'not_started' })
+    await expect(service.release({ command, authorization: first.authorization,
+      context, authority: originalAuthority })).resolves.toMatchObject({ kind: 'released' })
+    const second = await service.authorize({ command, context: { ...context, requestId: 'request-retry',
+      deadlineAtMs: 20_000 }, authority: originalAuthority })
+    expect(second.kind).toBe('authorized')
+    if (second.kind !== 'authorized') throw new Error('expected second grant')
+    expect(second.authorization.grantId).not.toBe(first.authorization.grantId)
+    expect((await wal.load()).commands.size).toBe(0)
+    const executed = await service.execute({ command, authorization: second.authorization,
+      durableCommand: durableCommand(command, second.authorization), context,
+      authority: originalAuthority })
+    expect(executed.kind).toBe('settled')
+    expect(provider.executions).toBe(1)
+  })
+
+  test('does not reissue a released command to another session or after started ambiguity', async () => {
+    const { service, provider } = await fixture()
+    const originalAuthority = authority(provider)
+    const command = launchCommand(provider)
+    const first = await service.authorize({ command, context, authority: originalAuthority })
+    if (first.kind !== 'authorized') throw new Error('expected first grant')
+    await service.release({ command, authorization: first.authorization, context, authority: originalAuthority })
+    await expect(service.authorize({ command, context: { ...context, sessionId: 'session-other' },
+      authority: originalAuthority })).resolves.toMatchObject({ kind: 'conflict', reason: 'idempotency_mismatch' })
+    const second = await service.authorize({ command, context, authority: originalAuthority })
+    if (second.kind !== 'authorized') throw new Error('expected second grant')
+    provider.failAfterEffect = true
+    await service.execute({ command, authorization: second.authorization,
+      durableCommand: durableCommand(command, second.authorization), context,
+      authority: originalAuthority })
+    await expect(service.release({ command, authorization: second.authorization,
+      context, authority: originalAuthority })).resolves.toMatchObject({ kind: 'operator_required' })
+    await expect(service.authorize({ command, context, authority: originalAuthority }))
+      .resolves.toMatchObject({ kind: 'unavailable' })
+    expect(provider.executions).toBe(1)
+  })
+
+  test('changed Owner generation denies a reissued launch before WAL starts', async () => {
+    const { service, provider, wal } = await fixture()
+    const originalAuthority = authority(provider)
+    const command = launchCommand(provider)
+    const first = await service.authorize({ command, context, authority: originalAuthority })
+    if (first.kind !== 'authorized') throw new Error('expected first grant')
+    await service.release({ command, authorization: first.authorization, context, authority: originalAuthority })
+    const second = await service.authorize({ command, context, authority: originalAuthority })
+    if (second.kind !== 'authorized') throw new Error('expected reissued grant')
+    const oldOwner = { ownerAuthority: 'owner-authority_scope-test', ownerGeneration: 1,
+      ownerSessionId: 'owner-session_scope-test',
+      socketIdentity: { device: '1', inode: '2', uid: 501, gid: 20, mode: 0o600 } }
+    const activeOwner = { ...oldOwner, ownerGeneration: 2 }
+    const runId = `run_${'c'.repeat(32)}`
+    const planSha256 = 'd'.repeat(64)
+    const runReservation = {
+      schemaVersion: 1, workspaceId: `workspace_${'e'.repeat(32)}`,
+      runtimeWorkspaceId: incarnation.workspaceId, teamId,
+      actorId: originalAuthority.actorId, deploymentId: incarnation.deploymentId,
+      bootId: incarnation.bootId, commandId: command.commandId,
+      idempotencyKey: command.idempotencyKey, expectedRevision: command.expectedRevision,
+      expectedPlanGeneration: `plan-generation_${planSha256}`,
+      ownerAuthority: oldOwner.ownerAuthority, ownerGeneration: oldOwner.ownerGeneration,
+      ownerSessionId: oldOwner.ownerSessionId,
+      restoreGeneration: incarnation.restoreGeneration, mountGeneration: 1,
+      ownerEffectFence,
+      authorityEvidence: { userId: 'user_test-user', sessionId: 'session_test-user', grantGeneration: 3 },
+      runId, promotionOperationId: `promotion_${'f'.repeat(32)}`,
+      planSha256, rosterBindingSha256: '9'.repeat(64), createdAtMs: 1000,
+    }
+    const secret = Buffer.alloc(32, 3)
+    const dispatcher = new HostedControlDispatcher({
+      secret,
+      authority: { ...incarnation, mountBinding: { mountGeneration: 1, declaredRootHash: 'a'.repeat(64) } },
+      getOwnerBinding: () => activeOwner,
+      lifecycle: new HostedLifecycleCommandService(service, { isCurrent: () => true }, () => 0),
+      messages: { dispatch: async () => ({ schemaVersion: 2, kind: 'not_found' }) },
+    })
+    const exchangeId = `lifecycle-request_${'a'.repeat(32)}`
+    const unsigned = {
+      schemaVersion: 2, exchangeId, operation: 'execute',
+      provenance: {
+        from: { kind: 'controller', deploymentId: incarnation.deploymentId, bootId: incarnation.bootId,
+          actorId: context.actorId, sessionId: context.sessionId },
+        to: { kind: 'owner', ownerAuthority: activeOwner.ownerAuthority,
+          ownerGeneration: activeOwner.ownerGeneration, ownerSessionId: activeOwner.ownerSessionId },
+        target: { capability: 'hosted-lifecycle-command', exchangeId, operation: 'execute',
+          workspaceId: incarnation.workspaceId, teamId },
+      },
+      ownerBinding: activeOwner, ownerEffectFence,
+      payload: { command, authorization: second.authorization,
+        durableCommand: durableCommand(command, second.authorization, runId),
+        runReservation, context, authority: originalAuthority },
+    }
+    await expect(dispatcher.dispatch({ ...unsigned, ownerProof: createHostedRawDomainProof(
+      secret, HOSTED_LIFECYCLE_PROOF_DOMAIN, 'request', JSON.stringify(unsigned),
+    ) })).rejects.toThrow('run reservation')
+    expect((await wal.load()).commands.size).toBe(0)
+    expect(provider.executions).toBe(0)
   })
 
   test('keeps the remote execute receipt at the admitted revision while control state advances', async () => {
@@ -590,8 +699,10 @@ describe('HostedLifecycleAuthorityService', () => {
       .resolves.toEqual({ kind: 'already_released', authorization: authorized.authorization })
     await expect(service.revalidate({ command, authorization: authorized.authorization, context, authority: currentAuthority }))
       .resolves.toMatchObject({ kind: 'conflict', reason: 'grant_revoked' })
-    await expect(service.authorize({ command, context, authority: currentAuthority }))
-      .resolves.toMatchObject({ kind: 'conflict', reason: 'grant_revoked' })
+    const renewed = await service.authorize({ command, context, authority: currentAuthority })
+    expect(renewed.kind).toBe('authorized')
+    if (renewed.kind !== 'authorized') throw new Error('expected renewed grant')
+    expect(renewed.authorization.grantId).not.toBe(authorized.authorization.grantId)
     expect(provider.executions).toBe(0)
   })
 

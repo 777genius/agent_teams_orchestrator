@@ -157,16 +157,19 @@ export class HostedLifecycleAuthorityService implements HostedLifecycleAuthority
         if (prior.kind === 'started') return unavailableDecision()
         return { kind: 'authorized', authorization: prior.authorization }
       }
-      const priorGrant = [...state.grants.values()].find(grant =>
+      const priorGrants = [...state.grants.values()].filter(grant =>
         commandStateKey(grant.command, grant.authorization) === key)
-      if (priorGrant) {
-        if (priorGrant.fingerprint !== fingerprint) {
+      if (priorGrants.length > 0) {
+        if (priorGrants.some(grant => grant.fingerprint !== fingerprint ||
+          !isDeepStrictEqual(grant.command, input.command))) {
           return conflict('idempotency_mismatch', input.command.expectedRevision)
         }
-        if (state.released.has(priorGrant.authorization.grantId)) {
-          return conflict('grant_revoked', input.command.expectedRevision)
+        const liveGrant = priorGrants.find(grant => !state.released.has(grant.authorization.grantId))
+        if (liveGrant) {
+          return { kind: 'authorized', authorization: liveGrant.authorization }
         }
-        return { kind: 'authorized', authorization: priorGrant.authorization }
+        // Every previous attempt is proved released without a started/settled command.
+        // Continue under this WAL lock and issue a fresh grant for the exact binding.
       }
       const existingGrant = [...state.grants.values()].find(grant =>
         !state.released.has(grant.authorization.grantId) &&
