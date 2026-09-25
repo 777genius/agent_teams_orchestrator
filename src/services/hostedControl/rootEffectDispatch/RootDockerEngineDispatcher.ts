@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { constants, closeSync, fsyncSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, writeSync } from 'node:fs'
+import { constants, closeSync, fsyncSync, fstatSync, lstatSync, openSync, readFileSync, realpathSync, writeSync } from 'node:fs'
 import { connect, type Socket } from 'node:net'
 import path from 'node:path'
 
@@ -33,8 +33,66 @@ export interface RootCurrentMemberDecision<Binding> {
     callback: (current: unknown) => T): Promise<T>
 }
 
-export type RootDockerSpecPolicy<Binding> = (operation: RootDockerOperation, binding: Binding,
-  current: unknown) => void
+/** Resolve the exact operation from root-owned state, using no caller-supplied body or Docker target. */
+export type RootDockerOperationResolver<Binding> = (binding: Readonly<Binding>, current: unknown,
+  operationId: string) => RootDockerOperation
+
+function boundedSnapshot<T extends object>(value: T, maxBytes: number): Readonly<T> {
+  const seen = new WeakSet<object>()
+  let remaining = maxBytes
+  let nodes = 0
+  const charge = (text: string) => {
+    remaining -= Buffer.byteLength(text)
+    if (remaining < 0) throw new Error('root-docker-snapshot-too-large')
+  }
+  const copy = (input: unknown, depth: number): unknown => {
+    if (depth > 8 || ++nodes > 256) throw new Error('root-docker-snapshot-too-complex')
+    if (typeof input === 'string') { charge(input); return input }
+    if (input === null || typeof input === 'boolean') return input
+    if (typeof input === 'number' && Number.isFinite(input)) return input
+    if (!input || typeof input !== 'object' || seen.has(input)) {
+      throw new Error('root-docker-snapshot-invalid')
+    }
+    seen.add(input)
+    if (Array.isArray(input)) {
+      if (input.length > 128 || Reflect.ownKeys(input).length !== input.length + 1) {
+        throw new Error('root-docker-snapshot-invalid')
+      }
+      const output: unknown[] = []
+      for (let index = 0; index < input.length; index++) {
+        const descriptor = Object.getOwnPropertyDescriptor(input, String(index))
+        if (!descriptor || !descriptor.enumerable || !('value' in descriptor)) {
+          throw new Error('root-docker-snapshot-invalid')
+        }
+        output.push(copy(descriptor.value, depth + 1))
+      }
+      return Object.freeze(output)
+    }
+    const prototype = Object.getPrototypeOf(input)
+    if (prototype !== Object.prototype && prototype !== null) throw new Error('root-docker-snapshot-invalid')
+    const output: Record<string, unknown> = Object.create(null) as Record<string, unknown>
+    const keys = Reflect.ownKeys(input)
+    if (keys.length > 128 || keys.some(key => typeof key !== 'string')) {
+      throw new Error('root-docker-snapshot-invalid')
+    }
+    for (const key of keys as string[]) {
+      const descriptor = Object.getOwnPropertyDescriptor(input, key)
+      if (!descriptor || !descriptor.enumerable || !('value' in descriptor)) {
+        throw new Error('root-docker-snapshot-invalid')
+      }
+      charge(key)
+      output[key] = copy(descriptor.value, depth + 1)
+    }
+    return Object.freeze(output)
+  }
+  return copy(value, 0) as Readonly<T>
+}
+
+function sameOperation(left: RootDockerOperation, right: RootDockerOperation): boolean {
+  const serialize = (operation: RootDockerOperation) => JSON.stringify(Object.keys(operation).sort()
+    .map(key => [key, (operation as unknown as Record<string, unknown>)[key]]))
+  return serialize(left) === serialize(right)
+}
 
 type Route = Readonly<{ method: 'GET' | 'POST'; uri: string; decision: 'prepare' | 'start' | 'observe' | 'stop';
   body: Buffer; successStatus: readonly number[] }>
@@ -230,21 +288,22 @@ function responseFrom(socket: Socket, timeoutMs: number): Promise<Buffer> {
   })
 }
 
-/** Inactive until a trusted Product binding and create-spec validator are composed into production. */
+/** Inactive until a trusted Product binding and root-owned operation resolver are composed into production. */
 export class RootDockerEngineDispatcher<Binding extends object> {
   private constructor(private readonly stateDir: string, private readonly socketPath: string,
     private readonly decision: RootCurrentMemberDecision<Binding>,
-    private readonly specPolicy: RootDockerSpecPolicy<Binding>, private readonly timeoutMs: number,
+    private readonly resolveAuthorizedOperation: RootDockerOperationResolver<Binding>, private readonly timeoutMs: number,
     private readonly ownerUid: number, private readonly directoryIdentity: Readonly<{ dev: number; ino: number }>) {}
 
   static create<Binding extends object>(options: { stateDir: string; socketPath: string;
-    decision: RootCurrentMemberDecision<Binding>; specPolicy: RootDockerSpecPolicy<Binding>;
+    decision: RootCurrentMemberDecision<Binding>;
+    resolveAuthorizedOperation: RootDockerOperationResolver<Binding>;
     timeoutMs?: number; testOnlyAllowNonRoot?: boolean }): RootDockerEngineDispatcher<Binding> {
     const test = options.testOnlyAllowNonRoot === true && process.env.NODE_ENV === 'test'
     if (!test && (process.platform !== 'linux' || process.getuid?.() !== 0 ||
       !['/var/run/docker.sock', '/run/docker.sock'].includes(options.socketPath)) ||
       !path.isAbsolute(options.stateDir) || path.normalize(options.stateDir) !== options.stateDir ||
-      !path.isAbsolute(options.socketPath) || typeof options.specPolicy !== 'function' ||
+      !path.isAbsolute(options.socketPath) || typeof options.resolveAuthorizedOperation !== 'function' ||
       typeof options.decision?.withCurrentMemberDecision !== 'function') {
       throw new Error('root-docker-dispatch-policy-invalid')
     }
@@ -266,20 +325,31 @@ export class RootDockerEngineDispatcher<Binding extends object> {
         ancestor = parent
       }
     }
-    try { mkdirSync(options.stateDir, { recursive: false, mode: 0o700 }) }
-    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error }
+    // State must pre-exist; sync its metadata and parent entry before any effect can be claimed.
     const state = lstatSync(options.stateDir)
     if (!state.isDirectory() || state.isSymbolicLink() || state.uid !== ownerUid ||
       (state.mode & 0o077) !== 0 || realpathSync(options.stateDir) !== options.stateDir) {
       throw new Error('root-docker-state-dir-invalid')
     }
+    const stateFd = openSync(options.stateDir, constants.O_RDONLY | constants.O_NOFOLLOW)
+    try {
+      const opened = fstatSync(stateFd)
+      if (opened.dev !== state.dev || opened.ino !== state.ino) {
+        throw new Error('root-docker-state-dir-substituted')
+      }
+      fsyncSync(stateFd)
+    } finally { closeSync(stateFd) }
+    const parentFd = openSync(path.dirname(options.stateDir), constants.O_RDONLY | constants.O_NOFOLLOW)
+    try { fsyncSync(parentFd) } finally { closeSync(parentFd) }
     return new RootDockerEngineDispatcher(options.stateDir, options.socketPath, options.decision,
-      options.specPolicy, timeoutMs, ownerUid, { dev: state.dev, ino: state.ino })
+      options.resolveAuthorizedOperation, timeoutMs, ownerUid, { dev: state.dev, ino: state.ino })
   }
 
   async dispatch(operation: RootDockerOperation, binding: Binding): Promise<RootDockerDispatchResult> {
-    const target = route(operation)
-    const claim = this.claim(operation, binding, target)
+    const stableOperation = boundedSnapshot(operation, MAX_BODY + 4096) as RootDockerOperation
+    const stableBinding = boundedSnapshot(binding, 16 * 1024) as Binding
+    const target = route(stableOperation)
+    const claim = this.claim(stableOperation, stableBinding, target)
     if (claim) return claim
     let socket: Socket | undefined
     try {
@@ -288,13 +358,15 @@ export class RootDockerEngineDispatcher<Binding extends object> {
       const response = responseFrom(socket, this.timeoutMs)
       void response.catch(() => {}) // A rejected guard still closes the socket without awaiting its response.
       // The Product callback is synchronous. No socket write is scheduled after this callback returns.
-      await this.decision.withCurrentMemberDecision(binding, target.decision, current => {
-        if (operation.kind === 'create_network' || operation.kind === 'create_container') {
-          const policyResult: unknown = this.specPolicy(operation, binding, current)
-          if (policyResult && typeof policyResult === 'object' && 'then' in policyResult) {
-            throw new Error('root-docker-async-spec-policy-forbidden')
-          }
+      await this.decision.withCurrentMemberDecision(stableBinding, target.decision, current => {
+        const resolved: unknown = this.resolveAuthorizedOperation(stableBinding, current,
+          stableOperation.operationId)
+        if (resolved && typeof resolved === 'object' && 'then' in resolved) {
+          throw new Error('root-docker-async-operation-resolver-forbidden')
         }
+        const authorized = boundedSnapshot(resolved as RootDockerOperation, MAX_BODY + 4096) as RootDockerOperation
+        route(authorized)
+        if (!sameOperation(stableOperation, authorized)) throw new Error('root-docker-operation-not-authorized')
         if (pinnedFd(socket!) !== fd) throw new Error('root-docker-socket-substituted')
         writeCompleteSync(fd, requestBytes(target))
       })
