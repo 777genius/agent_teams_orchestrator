@@ -6385,7 +6385,9 @@ export function createOwnedOpenCodeLifecycleCommandExecutor() {
       throw new Error('OpenCode lifecycle owner capability is invalid')
     }
     const envelope = validateEnvelope(input)
-    if (!['opencode.launchTeam', 'opencode.reconcileTeam', 'opencode.stopTeam'].includes(envelope.command)) {
+    // Readiness is the read-only attestation that strict launch requires first.
+    if (!['opencode.readiness', 'opencode.launchTeam', 'opencode.reconcileTeam', 'opencode.stopTeam']
+      .includes(envelope.command)) {
       throw new Error('OpenCode lifecycle owner only accepts lifecycle commands')
     }
     return executeOpenCodeBridgeCommandEnvelopeInternal(envelope, {}, HOSTED_LIFECYCLE_OWNER_CAPABILITY)

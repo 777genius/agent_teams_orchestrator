@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 
 import { createOwnedOpenCodeLifecycleCommandExecutor } from '../opencode/OpenCodeBridgeCommandHandler.js'
+import { openCodeSessionStore } from '../opencode/OpenCodeSessionStore.js'
 import type { TeamLifecycleLaunchLane, TeamLifecycleLaunchPlan } from './TeamLifecycleLaunchPlan.js'
 
 export type TeamLifecycleLanePhase = 'idle' | 'launching' | 'running' | 'failed'
@@ -31,6 +32,23 @@ export type TeamLifecycleLaneInput = {
 
 type ExecuteBridge = ReturnType<typeof createOwnedOpenCodeLifecycleCommandExecutor>
 
+/**
+ * The in-process owner has no separate bridge handshake; the bridge only
+ * requires a non-empty identity and never compares it.
+ */
+const LIFECYCLE_OWNER_HANDSHAKE_IDENTITY = 'hosted-lifecycle-owner/v1'
+
+/** Capability the bridge committed for this exact run, or null before any session record exists. */
+export type ReadLaunchedCapability = (input: { teamId: string; laneId: string; runId: string }) => Promise<string | null>
+
+const readLaunchedCapability: ReadLaunchedCapability = async ({ teamId, laneId, runId }) => {
+  const ids = new Set((await openCodeSessionStore.list())
+    .filter(record => record.teamId === teamId && (record.laneId ?? 'primary') === laneId && record.runId === runId)
+    .map(record => record.stopAuthority?.runtime.capabilitySnapshotId))
+  const [only] = ids
+  return ids.size === 1 && typeof only === 'string' && /^opencode:[a-f0-9]{32}$/.test(only) ? only : null
+}
+
 export function createProductionOpenCodeTeamLifecycleLane(
   hasLiveCapability: () => boolean = () => true,
 ): OpenCodeTeamLifecycleLane {
@@ -42,11 +60,14 @@ export function createProductionOpenCodeTeamLifecycleLane(
 export class OpenCodeTeamLifecycleLane implements TeamLifecycleLaneEffectPort {
   readonly kind = 'opencode' as const
   readonly #queues = new Map<string, Promise<void>>()
+  /** Capability the bridge reported for each run this process launched. */
+  readonly #launchedCapabilities = new Map<string, string>()
 
   constructor(
     private readonly executeBridge: ExecuteBridge = createOwnedOpenCodeLifecycleCommandExecutor(),
     private readonly timeoutMs = 300_000,
     private readonly hasLiveCapability: () => boolean = () => false,
+    private readonly readCapability: ReadLaunchedCapability = readLaunchedCapability,
   ) {}
 
   supports(): boolean { return this.hasLiveCapability() }
@@ -59,11 +80,30 @@ export class OpenCodeTeamLifecycleLane implements TeamLifecycleLaneEffectPort {
     runId: string | null
   }): Promise<TeamLifecycleLaneObservation> {
     if (input.lane.kind !== 'opencode' || !input.runId) return idle()
+    const runId = input.runId
     return this.#serialized(input, async () => {
+      // With a committed capability the bridge reconciles on the run's own
+      // retained host; without it only a generic probe is possible, which may
+      // evict that host.
+      const capabilitySnapshotId = this.#launchedCapabilities.get(runKey(input.planTeamId, input.lane.laneId, runId))
+        ?? await this.readCapability({ teamId: input.planTeamId, laneId: input.lane.laneId, runId })
       const data = await this.#execute('opencode.reconcileTeam', input.workspaceRoot, {
-        runId: input.runId,
+        runId,
         laneId: input.lane.laneId,
         teamId: input.planTeamId,
+        ...(capabilitySnapshotId ? {
+          expectedCapabilitySnapshotId: capabilitySnapshotId,
+          preconditions: {
+            handshakeIdentityHash: LIFECYCLE_OWNER_HANDSHAKE_IDENTITY,
+            laneId: input.lane.laneId,
+            expectedRunId: runId,
+            expectedCapabilitySnapshotId: capabilitySnapshotId,
+            expectedBehaviorFingerprint: null,
+            expectedManifestHighWatermark: null,
+            commandLeaseId: null,
+            idempotencyKey: `hosted-reconcile:${input.planTeamId}:${input.lane.laneId}:${runId}:${randomUUID()}`,
+          },
+        } : {}),
         expectedMembers: input.lane.members.map(member => ({
           name: member.name,
           ...(member.model ? { model: member.model } : {}),
@@ -83,7 +123,10 @@ export class OpenCodeTeamLifecycleLane implements TeamLifecycleLaneEffectPort {
     if (input.lane.kind !== 'opencode') throw new Error('OpenCode lane received a native plan')
     const lane = input.lane
     return this.#serialized(input, async () => {
-      const data = await this.#execute('opencode.launchTeam', input.workspaceRoot, {
+      // Strict launch only accepts the behavior fingerprint that a selected
+      // execution-proof readiness attested for this project, model and host.
+      const expectedBehaviorFingerprint = await this.#attestLaunchBehavior(input.workspaceRoot, lane.selectedModel)
+      const response = await this.#executeCommand('opencode.launchTeam', input.workspaceRoot, {
         runId: input.runId,
         laneId: lane.laneId,
         teamId: input.planTeamId,
@@ -98,9 +141,47 @@ export class OpenCodeTeamLifecycleLane implements TeamLifecycleLaneEffectPort {
           ...(member.model ? { model: member.model } : {}),
           ...(member.effort ? { effort: member.effort } : {}),
         })),
+        preconditions: {
+          handshakeIdentityHash: LIFECYCLE_OWNER_HANDSHAKE_IDENTITY,
+          laneId: lane.laneId,
+          expectedRunId: input.runId,
+          expectedCapabilitySnapshotId: null,
+          expectedBehaviorFingerprint,
+          expectedManifestHighWatermark: null,
+          // Caller-owned host lease for this single launch attempt.
+          commandLeaseId: `hosted-launch-lease_${randomUUID()}`,
+          idempotencyKey: `hosted-launch:${input.planTeamId}:${lane.laneId}:${input.runId}`,
+        },
       })
-      return launchObservation(data)
+      const runtime = response.runtime
+      const capability = runtime && typeof runtime === 'object'
+        ? (runtime as Record<string, unknown>).capabilitySnapshotId
+        : undefined
+      if (typeof capability === 'string' && /^opencode:[a-f0-9]{32}$/.test(capability)) {
+        this.#launchedCapabilities.set(runKey(input.planTeamId, lane.laneId, input.runId), capability)
+      }
+      return launchObservation(asRecord(response.data))
     })
+  }
+
+  async #attestLaunchBehavior(workspaceRoot: string, selectedModel: string): Promise<string> {
+    const readiness = await this.#execute('opencode.readiness', workspaceRoot, {
+      projectPath: workspaceRoot,
+      selectedModel,
+      requireExecutionProbe: true,
+    })
+    if (readiness.launchAllowed !== true) {
+      const state = typeof readiness.state === 'string' ? readiness.state : 'unknown'
+      const missing = Array.isArray(readiness.missing)
+        ? readiness.missing.filter((item): item is string => typeof item === 'string')
+        : []
+      throw new Error(`OpenCode readiness does not allow launch (${state})${missing.length ? `: ${missing.join('; ')}` : ''}`)
+    }
+    const fingerprint = asRecord(readiness.expectedBehaviorEvidence).expectedBehaviorFingerprint
+    if (typeof fingerprint !== 'string' || !/^[a-f0-9]{64}$/.test(fingerprint)) {
+      throw new Error('OpenCode readiness did not attest an expected behavior fingerprint')
+    }
+    return fingerprint
   }
 
   cancel(input: {
@@ -148,11 +229,20 @@ export class OpenCodeTeamLifecycleLane implements TeamLifecycleLaneEffectPort {
       teamId: input.planTeamId,
     })
     if (data.stopped !== true) throw new Error('OpenCode bridge did not confirm lane stop')
+    this.#launchedCapabilities.delete(runKey(input.planTeamId, input.lane.laneId, input.runId))
     return idle()
   }
 
   async #execute(
-    command: 'opencode.launchTeam' | 'opencode.reconcileTeam' | 'opencode.stopTeam',
+    command: 'opencode.readiness' | 'opencode.launchTeam' | 'opencode.reconcileTeam' | 'opencode.stopTeam',
+    cwd: string,
+    body: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    return asRecord((await this.#executeCommand(command, cwd, body)).data)
+  }
+
+  async #executeCommand(
+    command: 'opencode.readiness' | 'opencode.launchTeam' | 'opencode.reconcileTeam' | 'opencode.stopTeam',
     cwd: string,
     body: Record<string, unknown>,
   ): Promise<Record<string, unknown>> {
@@ -171,7 +261,7 @@ export class OpenCodeTeamLifecycleLane implements TeamLifecycleLaneEffectPort {
       const error = asRecord(record.error)
       throw new Error(typeof error.message === 'string' ? error.message : 'OpenCode bridge command failed')
     }
-    return asRecord(record.data)
+    return record
   }
 
   async #serialized<T>(
@@ -202,6 +292,10 @@ function launchObservation(data: Record<string, unknown>): TeamLifecycleLaneObse
     case 'failed': return { phase: 'failed', recoverable: true }
     default: throw new Error('OpenCode bridge returned an invalid team launch state')
   }
+}
+
+function runKey(teamId: string, laneId: string, runId: string): string {
+  return JSON.stringify([teamId, laneId, runId])
 }
 
 function idle(): TeamLifecycleLaneObservation {

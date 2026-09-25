@@ -615,13 +615,72 @@ describe('DurableTeamLifecycleExecution', () => {
   })
 })
 
+const attestedFingerprint = 'f'.repeat(64)
+const readyReadiness = {
+  state: 'ready', launchAllowed: true, missing: [],
+  expectedBehaviorEvidence: { expectedBehaviorFingerprint: attestedFingerprint },
+}
+
 describe('OpenCodeTeamLifecycleLane', () => {
+  test('attests readiness, then launches with strict preconditions bound to that fingerprint', async () => {
+    const calls: Array<{ command: string; body: Record<string, unknown> }> = []
+    let readiness: Record<string, unknown> = readyReadiness
+    const execute = (async (input: unknown) => {
+      const request = input as { command: string; body: Record<string, unknown> }
+      calls.push(request)
+      return {
+        ok: true,
+        runtime: { capabilitySnapshotId: launchedCapability },
+        data: request.command === 'opencode.readiness' ? readiness : { teamLaunchState: 'ready' },
+      }
+    }) as never
+    const launchedCapability = `opencode:${'d'.repeat(32)}`
+    // Session records carry no stop authority while a run is still bootstrapping.
+    const lane = new OpenCodeTeamLifecycleLane(execute, 10_000, () => true, async () => null)
+    const input = {
+      planTeamId: 'draft-team', workspaceRoot: plan.workspaceRoot, toolApprovalMode: plan.toolApprovalMode,
+      lane: plan.lanes[0]!, runId: 'run_strict',
+    }
+    await expect(lane.launch(input)).resolves.toEqual({ phase: 'running', recoverable: false })
+    await lane.launch(input)
+    expect(calls.map(call => call.command)).toEqual([
+      'opencode.readiness', 'opencode.launchTeam', 'opencode.readiness', 'opencode.launchTeam',
+    ])
+    expect(calls[0]!.body).toEqual({
+      projectPath: plan.workspaceRoot, selectedModel: 'provider/model', requireExecutionProbe: true,
+    })
+    const [first, second] = [calls[1]!.body.preconditions, calls[3]!.body.preconditions] as Array<Record<string, unknown>>
+    expect(first).toMatchObject({
+      laneId: 'opencode-lane', expectedRunId: 'run_strict', expectedBehaviorFingerprint: attestedFingerprint,
+      expectedCapabilitySnapshotId: null, expectedManifestHighWatermark: null,
+      idempotencyKey: 'hosted-launch:draft-team:opencode-lane:run_strict',
+    })
+    expect(typeof first!.handshakeIdentityHash).toBe('string')
+    // The idempotency key is stable per run; each attempt owns a fresh host lease.
+    expect(second!.idempotencyKey).toBe(first!.idempotencyKey)
+    expect(second!.commandLeaseId).not.toBe(first!.commandLeaseId)
+    // Reconcile reuses the run's launched host instead of a generic probe that could evict it.
+    await lane.inspect(input)
+    expect(calls.at(-1)).toMatchObject({ command: 'opencode.reconcileTeam',
+      body: { expectedCapabilitySnapshotId: launchedCapability,
+        preconditions: { expectedCapabilitySnapshotId: launchedCapability, expectedRunId: 'run_strict' } } })
+
+    calls.length = 0
+    readiness = { state: 'model_unavailable', launchAllowed: false, missing: ['Selected model is unavailable'] }
+    await expect(lane.launch(input)).rejects.toThrow(
+      'OpenCode readiness does not allow launch (model_unavailable): Selected model is unavailable')
+    readiness = { ...readyReadiness, expectedBehaviorEvidence: {} }
+    await expect(lane.launch(input)).rejects.toThrow('did not attest an expected behavior fingerprint')
+    expect(calls.map(call => call.command)).toEqual(['opencode.readiness', 'opencode.readiness'])
+  })
+
   test('maps admitted launch data and requires positive bridge confirmations', async () => {
     const calls: Array<Record<string, unknown>> = []
     const execute = (async (input: unknown) => {
       const request = input as Record<string, unknown>
-      calls.push(request)
       const command = request.command
+      if (command === 'opencode.readiness') return { ok: true, data: readyReadiness }
+      calls.push(request)
       return {
         ok: true,
         data: command === 'opencode.stopTeam'
@@ -629,7 +688,8 @@ describe('OpenCodeTeamLifecycleLane', () => {
           : { teamLaunchState: command === 'opencode.launchTeam' ? 'permission_blocked' : 'ready' },
       }
     }) as never
-    const lane = new OpenCodeTeamLifecycleLane(execute, 10_000, () => true)
+    const capability = `opencode:${'c'.repeat(32)}`
+    const lane = new OpenCodeTeamLifecycleLane(execute, 10_000, () => true, async () => capability)
     const admittedLane = plan.lanes[0]!
     const input = {
       planTeamId: plan.teamId,
@@ -648,6 +708,11 @@ describe('OpenCodeTeamLifecycleLane', () => {
       { name: 'worker', prompt: 'Implement the fixture.', effort: 'high' },
     ])
     expect(calls[0]!.body).toMatchObject({ toolApprovalMode: 'manual', skipPermissions: false })
+    // Reconcile binds to the run's committed capability so the bridge reuses its host.
+    expect(calls[1]!.body).toMatchObject({
+      expectedCapabilitySnapshotId: capability,
+      preconditions: { expectedRunId: 'run_test1234', expectedCapabilitySnapshotId: capability },
+    })
   })
 
   test('waits for an in-flight launch before stopping the same lane', async () => {
@@ -656,6 +721,7 @@ describe('OpenCodeTeamLifecycleLane', () => {
     const calls: string[] = []
     const execute = (async (input: unknown) => {
       const command = String((input as Record<string, unknown>).command)
+      if (command === 'opencode.readiness') return { ok: true, data: readyReadiness }
       calls.push(command)
       if (command === 'opencode.launchTeam') await launchGate
       return {
@@ -691,7 +757,9 @@ describe('OpenCodeTeamLifecycleLane', () => {
   test('maps an admitted auto plan to explicit automatic wire semantics', async () => {
     let launchBody: Record<string, unknown> | null = null
     const execute = (async (input: unknown) => {
-      launchBody = (input as { body: Record<string, unknown> }).body
+      const request = input as { command: string; body: Record<string, unknown> }
+      if (request.command === 'opencode.readiness') return { ok: true, data: readyReadiness }
+      launchBody = request.body
       return { ok: true, data: { teamLaunchState: 'ready' } }
     }) as never
     const lane = new OpenCodeTeamLifecycleLane(execute, 10_000, () => true)
