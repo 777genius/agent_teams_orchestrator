@@ -18,6 +18,7 @@ import {
   type HostedApprovalActivationSessionFactory,
 } from './HostedControlServer.js'
 import { HostedTaskMutationService } from './HostedTaskMutationService.js'
+import { createHostedTeamIdentityFenceVerifier } from './HostedTeamIdentityFence.js'
 import { HostedTaskMutationWal } from './HostedTaskMutationWal.js'
 import { HostedRootOwnerLease } from './HostedRootOwnerLease.js'
 import {
@@ -243,6 +244,11 @@ export class HostedControlRuntime {
         lifecycle: ports.lifecycle,
         messages: ports.messages,
         tasks: taskService,
+        verifyOwnerEffectFence: createHostedTeamIdentityFenceVerifier({
+          claudeRoot: ownerScope.canonicalClaudeRoot,
+          legacyKey: config.legacyKey,
+          teamId: config.teamId,
+        }),
         approvals: ports.approvals,
       })
       if (this.#descriptorGuard && !(await this.#descriptorGuard.assertCurrent())) {

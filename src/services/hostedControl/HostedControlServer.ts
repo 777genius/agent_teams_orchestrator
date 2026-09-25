@@ -14,7 +14,7 @@ import {
   verifyHostedControlProof,
 } from './ownerProof.js'
 import type { HostedControlBootstrapBinding } from './HostedControlBootstrap.js'
-import { isProductTaskMutationEnvelope } from './HostedProductTaskMutationWire.js'
+import { isProductOwnerBoundEnvelope } from './HostedProductOwnerBoundEnvelope.js'
 import { HOSTED_CONTROL_SOCKET_BROKER_FLAG } from './HostedControlSocketBroker.js'
 import {
   HOSTED_APPROVAL_ACTIVATION_PREPARE_MAX_BYTES,
@@ -583,7 +583,7 @@ export class HostedControlServer {
       return
     }
     if (message.operation === 'readiness') { await this.#handleReadiness(socket, line, message); return }
-    if (message.operation !== HOSTED_CONTROL_OPERATION || isProductTaskMutationEnvelope(message)) {
+    if (message.operation !== HOSTED_CONTROL_OPERATION || isProductOwnerBoundEnvelope(message)) {
       const leaseSocket = this.#leaseSocket
       const ownerBinding = this.#ownerBinding
       if (!leaseSocket || leaseSocket.destroyed || !(await this.#hasCurrentSocketIdentity()) ||

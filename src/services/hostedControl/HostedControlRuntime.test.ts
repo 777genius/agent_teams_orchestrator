@@ -332,6 +332,9 @@ describe('HostedControlRuntime', () => {
     await mkdir(join(claudeRoot, 'tasks', 'legacy'), { recursive: true, mode: 0o700 })
     await mkdir(runtimeRoot, { recursive: true, mode: 0o700 })
     await writeFile(secretFile, secret.toString('hex'), { mode: 0o600 })
+    const teamIdentityBytes = `${JSON.stringify({ schemaVersion: 1, teamId, createdAt: '2026-09-25T00:00:00.000Z' }, null, 2)}\n`
+    await writeFile(join(claudeRoot, 'teams', 'legacy', 'team.identity.json'), teamIdentityBytes, { mode: 0o600 })
+    const identityChecksum = createHash('sha256').update(teamIdentityBytes).digest('hex')
     await writeFile(configPath, JSON.stringify({
       socketPath,
       secretFile,
@@ -528,18 +531,26 @@ describe('HostedControlRuntime', () => {
     expect(JSON.parse(taskLine).payload.kind).toBe('unavailable')
     // Product's envelope (fenced authority, operation-bound proof) reaches the task writer through
     // the coexisting dispatcher; a config-file owner is not personal-host, so it stays read-only.
-    const productTaskUnsigned = {
-      ...taskUnsigned,
-      exchangeId: `task-request_${'a'.repeat(32)}`,
-      authority: { ...taskUnsigned.authority, ownerEffectFence: { grantRevision: '2'.repeat(64), identityChecksum: '3'.repeat(64) } },
-    }
-    const productTaskLine = await exchange(socketPath, `${JSON.stringify({
-      ...productTaskUnsigned,
-      ownerProof: createHmac('sha256', secret).update(`${HOSTED_TEAM_MESSAGE_PROOF_DOMAIN}\u0000task_mutate\u0000request\u0000${JSON.stringify(productTaskUnsigned)}`).digest('hex'),
-    })}\n`)
+    const productLine = (unsigned: Record<string, unknown>) => `${JSON.stringify({
+      ...unsigned,
+      ownerProof: createHmac('sha256', secret).update(`${HOSTED_TEAM_MESSAGE_PROOF_DOMAIN}\u0000${String(unsigned.operation)}\u0000request\u0000${JSON.stringify(unsigned)}`).digest('hex'),
+    })}\n`
+    const fencedAuthority = { ...taskUnsigned.authority, ownerEffectFence: { grantRevision: '2'.repeat(64), identityChecksum } }
+    const productTaskUnsigned = { ...taskUnsigned, exchangeId: `task-request_${'a'.repeat(32)}`, authority: fencedAuthority }
+    const productTaskLine = await exchange(socketPath, productLine(productTaskUnsigned))
     expect(JSON.parse(productTaskLine).payload).toEqual({ schemaVersion: 1, kind: 'unavailable', retryAfterMs: null })
+    expect(await exchange(socketPath, productLine({
+      ...productTaskUnsigned,
+      authority: { ...fencedAuthority, ownerEffectFence: { grantRevision: '2'.repeat(64), identityChecksum: '3'.repeat(64) } },
+    }))).toBe('')
+    const productMessageLine = await exchange(socketPath, productLine({
+      ...messageUnsigned,
+      exchangeId: `message-request_${'a'.repeat(32)}`,
+      authority: { ...messageAuthority, ownerEffectFence: fencedAuthority.ownerEffectFence },
+    }))
+    expect(JSON.parse(productMessageLine).payload.kind).toBe('persisted')
     expect(lifecycleCalls).toBe(1)
-    expect(messageCalls).toBe(1)
+    expect(messageCalls).toBe(2)
 
     lease.socket.destroy()
     for (let attempt = 0; attempt < 100 && await server.hasActiveLease(); attempt += 1) {
@@ -562,7 +573,7 @@ describe('HostedControlRuntime', () => {
       ownerProof: createHostedControlProof(secret, 'request', taskUnsigned),
     })}\n`)).toBe('')
     expect(lifecycleCalls).toBe(1)
-    expect(messageCalls).toBe(1)
+    expect(messageCalls).toBe(2)
 
     let stopped = false
     const stopping = runtime.stop().then(() => { stopped = true })

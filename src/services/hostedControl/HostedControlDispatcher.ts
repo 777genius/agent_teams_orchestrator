@@ -17,9 +17,14 @@ import {
 } from './HostedControlServer.js'
 import {
   dispatchProductTaskMutation,
-  isProductTaskMutationEnvelope,
   type HostedProductTaskMutationPort,
 } from './HostedProductTaskMutationWire.js'
+import {
+  isProductOwnerBoundEnvelope,
+  openProductOwnerBoundRequest,
+  sealProductOwnerBoundResponse,
+  type ProductOwnerEffectFence,
+} from './HostedProductOwnerBoundEnvelope.js'
 import {
   HostedApprovalWireDispatcher,
   isHostedApprovalOperation,
@@ -86,6 +91,8 @@ export type HostedControlDispatcherOptions = {
   messages: HostedTeamMessagePort
   /** Product-envelope task_mutate; the Owner writer itself decides whether local writes are admitted. */
   tasks?: HostedProductTaskMutationPort
+  /** Checks Product's owner effect fence against the published team identity; absent closes Product envelopes. */
+  verifyOwnerEffectFence?: (fence: ProductOwnerEffectFence) => Promise<boolean>
   /** Absent until a single durable approval runtime owner is composed. */
   approvals?: HostedApprovalWirePort
 }
@@ -107,21 +114,49 @@ export class HostedControlDispatcher {
     if (isLifecycleOperation(message.operation)) {
       return this.#dispatchLifecycle(message, rawLine ?? JSON.stringify(message))
     }
+    if (isProductOwnerBoundEnvelope(message)) {
+      return this.#dispatchProductOwnerBound(message)
+    }
     if (isMessageOperation(message.operation)) {
       return this.#dispatchMessage(message)
     }
-    if (isProductTaskMutationEnvelope(message)) {
+    return null
+  }
+
+  async #dispatchProductOwnerBound(message: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const verifyOwnerEffectFence = this.options.verifyOwnerEffectFence
+    if (!verifyOwnerEffectFence) throw new Error('Hosted Product owner effect fence verifier is unavailable')
+    const request = await openProductOwnerBoundRequest({
+      message,
+      secret: this.options.secret,
+      proofDomain: HOSTED_TEAM_MESSAGE_PROOF_DOMAIN,
+      authority: this.options.authority,
+      activeOwner: this.options.getOwnerBinding(),
+      verifyOwnerEffectFence,
+    })
+    if (request.operation === 'task_mutate') {
       if (!this.options.tasks) throw new Error('Hosted Product task writer is unavailable')
       return dispatchProductTaskMutation({
-        message,
+        request,
         secret: this.options.secret,
         proofDomain: HOSTED_TEAM_MESSAGE_PROOF_DOMAIN,
-        authority: this.options.authority,
-        activeOwner: this.options.getOwnerBinding(),
         tasks: this.options.tasks,
       })
     }
-    return null
+    const responsePayload = decodeMessageResponsePayload(request.operation, record(
+      await this.options.messages.dispatch({
+        operation: request.operation,
+        payload: request.payload,
+        authority: request.authority,
+      }),
+      'message response payload',
+    ), request.payload, request.authority)
+    return sealProductOwnerBoundResponse({
+      request,
+      payload: responsePayload,
+      secret: this.options.secret,
+      proofDomain: HOSTED_TEAM_MESSAGE_PROOF_DOMAIN,
+    })
   }
 
   async #dispatchLifecycle(message: Record<string, unknown>, rawLine: string): Promise<Record<string, unknown>> {
