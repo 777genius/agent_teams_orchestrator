@@ -140,7 +140,11 @@ async function readTeammateProcessClaims(
   let parsed: unknown
   try { parsed = JSON.parse(raw) } catch { return null }
   const record = parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : null
-  if (!record || record.name !== teamName || !Array.isArray(record.members)) return null
+  if (!record || record.name !== teamName) return null
+  // The hosted draft placeholder ({name, pendingCreate}) has no members yet,
+  // so it records no process teammate either.
+  if (record.members === undefined) return []
+  if (!Array.isArray(record.members)) return null
   const claims: TeammateProcessClaim[] = []
   for (const value of record.members) {
     const member = value && typeof value === 'object' ? value as Record<string, unknown> : null

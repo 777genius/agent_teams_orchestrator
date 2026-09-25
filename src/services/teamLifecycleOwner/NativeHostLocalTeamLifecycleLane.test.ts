@@ -8,7 +8,11 @@ import { join } from 'node:path'
 import { isProcessAlive } from '../../utils/processKill.js'
 import { DurableTeamLifecycleExecution } from './DurableTeamLifecycleExecution.js'
 import { NativeHostLocalLaneError } from './NativeHostLocalLanePlan.js'
-import { createProductionNativeProcessPort, type NativeHostLocalProcessPort } from './NativeHostLocalLaneProcesses.js'
+import {
+  createProductionNativeProcessPort,
+  sweepNativeTeamProcesses,
+  type NativeHostLocalProcessPort,
+} from './NativeHostLocalLaneProcesses.js'
 import {
   NATIVE_LANE_RUNTIME_RECORD_FILE,
   nativeLaneTeamRuntimeKey,
@@ -362,6 +366,23 @@ describe('NativeHostLocalTeamLifecycleLane admission and typed failures', () => 
     expect(execution.supports(plan([nativeLane]), 'launch')).toBe(true)
     expect(execution.supports(plan([nativeLane, openCodeLane]), 'launch')).toBe(false)
     expect(execution.supports(plan([openCodeLane]), 'launch')).toBe(true)
+  })
+})
+
+describe('sweepNativeTeamProcesses team config trust', () => {
+  test('a hosted draft placeholder records no teammates, a malformed member list fails closed', async () => {
+    const harness = await createHarness()
+    const sweep = () => sweepNativeTeamProcesses({
+      port: emptyProcessPort(), teamRoot: harness.teamRoot, teamName: harness.team,
+      leadSpecPrefix: `${harness.runtimeRoot}/`,
+    })
+    const config = join(harness.teamRoot, 'config.json')
+    await writeFile(config, `${JSON.stringify({ name: harness.team, pendingCreate: true }, null, 2)}\n`)
+    expect(await sweep()).toBe(true)
+    await writeFile(config, JSON.stringify({ name: harness.team, members: 'corrupt' }))
+    expect(await sweep()).toBe(false)
+    await writeFile(config, JSON.stringify({ name: 'another-team', members: [] }))
+    expect(await sweep()).toBe(false)
   })
 })
 
