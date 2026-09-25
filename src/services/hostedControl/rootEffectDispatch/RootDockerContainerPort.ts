@@ -34,6 +34,30 @@ function validTarget(target: RootContainerTarget, withId: boolean): boolean {
     (!withId || typeof target.containerId === 'string' && SHA.test(target.containerId))
 }
 
+function snapshotTarget(input: RootContainerTarget, withId: boolean): RootContainerTarget {
+  if (!input || Object.getPrototypeOf(input) !== Object.prototype ||
+    Reflect.ownKeys(input).some(key => typeof key !== 'string')) {
+    throw new Error('root-container-port-target-invalid')
+  }
+  const copy: Record<string, unknown> = {}
+  for (const key of Reflect.ownKeys(input) as string[]) {
+    const descriptor = Object.getOwnPropertyDescriptor(input, key)
+    if (!descriptor || !descriptor.enumerable || !('value' in descriptor)) {
+      throw new Error('root-container-port-target-invalid')
+    }
+    copy[key] = descriptor.value
+  }
+  if (!validTarget(copy as RootContainerTarget, withId)) {
+    throw new Error('root-container-port-target-invalid')
+  }
+  return Object.freeze(copy) as RootContainerTarget
+}
+
+function sameTarget(left: RootContainerTarget, right: RootContainerTarget): boolean {
+  return Object.keys(left).length === Object.keys(right).length &&
+    (Object.keys(left) as Array<keyof RootContainerTarget>).every(key => left[key] === right[key])
+}
+
 function operationId(effect: Effect, memberOperationId: string, probe = ''): string {
   return `container_${effect}_${sha(`${memberOperationId}\0${probe}`)}`
 }
@@ -152,19 +176,22 @@ export class RootDockerContainerPort {
     // No general Docker proxy: only an operation derived from this root-owned claim can be dispatched.
     const name = /^container_(create|start|stop|inspect)_([a-f0-9]{64})$/.exec(id)
     if (!name) throw new Error('root-container-port-operation-invalid')
-    const memberOperationId = this.operationMembers.get(id)
-    if (!memberOperationId) throw new Error('root-container-port-operation-invalid')
+    const original = this.operationTargets.get(id)
+    if (!original) throw new Error('root-container-port-operation-invalid')
+    const memberOperationId = original.memberOperationId
     const effect = name[1] as Effect
     const probe = effect === 'inspect' ? this.inspectProbes.get(id) : ''
     if (effect === 'inspect' && !probe) throw new Error('root-container-port-probe-invalid')
     const target = effect === 'create' ? this.manifest(memberOperationId) : this.target(memberOperationId)
+    const { body: _body, ...resolvedTarget } = target as Manifest
+    if (!sameTarget(original, resolvedTarget)) throw new Error('root-container-port-target-changed')
     const candidate = operation(effect, target, effect === 'create' ? (target as Manifest).body : '', probe)
     if (candidate.operationId !== id) throw new Error('root-container-port-operation-unbound')
     return candidate
   }
 
   private readonly inspectProbes = new Map<string, string>()
-  private readonly operationMembers = new Map<string, string>()
+  private readonly operationTargets = new Map<string, RootContainerTarget>()
 
   private assertCaller(target: RootContainerTarget, withId: boolean): void {
     if (!validTarget(target, withId)) throw new Error('root-container-port-target-invalid')
@@ -179,19 +206,20 @@ export class RootDockerContainerPort {
 
   private async send(effect: Effect, target: RootContainerTarget): Promise<Buffer> {
     const withId = effect !== 'create'
-    this.assertCaller(target, withId)
+    const stableTarget = snapshotTarget(target, withId)
+    this.assertCaller(stableTarget, withId)
     const probe = effect === 'inspect' ? randomBytes(16).toString('hex') : ''
-    const manifest = effect === 'create' ? this.manifest(target.memberOperationId) : undefined
-    const op = operation(effect, target, manifest?.body ?? '', probe)
-    if (this.operationMembers.has(op.operationId)) throw new Error('root-container-port-operation-busy')
-    this.operationMembers.set(op.operationId, target.memberOperationId)
+    const manifest = effect === 'create' ? this.manifest(stableTarget.memberOperationId) : undefined
+    const op = operation(effect, stableTarget, manifest?.body ?? '', probe)
+    if (this.operationTargets.has(op.operationId)) throw new Error('root-container-port-operation-busy')
+    this.operationTargets.set(op.operationId, stableTarget)
     if (effect === 'inspect') this.inspectProbes.set(op.operationId, probe)
     try {
       const result = await this.dispatcher.dispatch(op, this.binding)
       if (result.outcome !== 'responded') throw new Error(`root-container-port-${effect}-unresolved`)
       return result.body
     } finally {
-      this.operationMembers.delete(op.operationId)
+      this.operationTargets.delete(op.operationId)
       if (effect === 'inspect') this.inspectProbes.delete(op.operationId)
     }
   }

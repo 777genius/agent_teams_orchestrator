@@ -1,4 +1,4 @@
-import { chmod, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
 import { createServer, type Server } from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
@@ -90,7 +90,7 @@ async function fixture() {
   const port = RootDockerContainerPort.create({ stateDirectory, effectClaimDirectory, socketPath,
     authority, binding, image, networkId: target.networkId, testOnlyAllowNonRoot: true })
   return { port, waiting, release: () => release!(), revoke: () => { admitted = false },
-    requests, target: { ...target, containerId }, stateDirectory }
+    requests, target: { ...target, containerId }, stateDirectory, effectClaimDirectory }
 }
 
 test('revocation before exact create callback leaves no Docker bytes or effect', async () => {
@@ -135,4 +135,23 @@ test('target substitution while Product admission waits sends no Start bytes', a
   f.release()
   await expect(pending).rejects.toThrow('start-unresolved')
   expect(f.requests).toHaveLength(0)
+  expect(await readdir(f.effectClaimDirectory)).toEqual([])
+})
+
+test('same container ID with changed generation while Product waits sends no Start bytes', async () => {
+  const f = await fixture()
+  const pending = f.port.startContainer(f.target)
+  await f.waiting
+  const generation = 'f'.repeat(32)
+  const manifestPath = path.join(f.stateDirectory, `container-create-${target.memberOperationId}.json`)
+  const manifest = JSON.parse(await readFile(manifestPath, 'utf8')) as Record<string, unknown>
+  const body = JSON.parse(manifest.body as string) as Record<string, unknown>
+  ;(body.Labels as Record<string, unknown>)['org.agentteams.hosted-opencode.generation'] = generation
+  await writeFile(manifestPath, JSON.stringify({ ...manifest, generation, body: JSON.stringify(body) }), { mode: 0o600 })
+  await writeFile(path.join(f.stateDirectory, `container-target-${target.memberOperationId}.json`),
+    JSON.stringify({ ...target, generation, containerId }), { mode: 0o600 })
+  f.release()
+  await expect(pending).rejects.toThrow('start-unresolved')
+  expect(f.requests).toHaveLength(0)
+  expect(await readdir(f.effectClaimDirectory)).toEqual([])
 })
