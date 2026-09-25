@@ -1,5 +1,4 @@
 import { mkdir, open, readdir, readFile, rm, unlink, writeFile } from 'fs/promises'
-import { createHash } from 'node:crypto'
 import { join } from 'path'
 import { z } from 'zod/v4'
 import { getIsNonInteractiveSession, getSessionId } from '../bootstrap/state.js'
@@ -17,6 +16,7 @@ import { getTeamName } from './teammate.js'
 import { getTeammateContext } from './teammateContext.js'
 import { safeWindowsPathSegment } from './windowsReservedNames.js'
 import { withTaskMutationCoordination } from './taskMutationCoordinator.js'
+import { hostedRosterMemberId } from './hostedRosterMemberId.js'
 
 // Listeners for task list updates (used for immediate UI refresh in same process)
 const tasksUpdated = createSignal()
@@ -821,7 +821,7 @@ async function readTeamMembers(
       members: members
         .filter(m => m.removedAt === undefined)
         .map(m => {
-          const ownerId = hostedOwnerId(trustedIdentity, m)
+          const ownerId = hostedRosterMemberId(trustedIdentity, m)
           return {
             agentId: m.agentId,
             name: m.name,
@@ -936,17 +936,6 @@ function resolveAuthoritativeRosterMembers(
     })
   }
   return resolved
-}
-
-function hostedOwnerId(teamId: string | null, member: HostedRosterMember): string | null {
-  if (typeof member.memberId === 'string' && /^member_[0-9a-f]{32}$/.test(member.memberId)) return member.memberId
-  if (!teamId || typeof member.name !== 'string' || member.name.length === 0) return null
-  const immutableIdentity = Number.isSafeInteger(member.joinedAt) && (member.joinedAt as number) >= 0
-    ? `${member.name}\0${member.joinedAt as number}`
-    : typeof member.agentId === 'string' && member.agentId.length > 0
-      ? member.agentId
-      : member.name
-  return `member_${createHash('sha256').update(JSON.stringify({ domain: 'hosted-task-board-member/v1', teamId, rawMemberName: immutableIdentity })).digest('hex').slice(0, 32)}`
 }
 
 /**

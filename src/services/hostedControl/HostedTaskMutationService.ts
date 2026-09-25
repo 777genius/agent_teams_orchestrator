@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import { constants, link, lstat, mkdir, open, readdir, realpath, unlink } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
+import { hostedRosterMemberId } from '../../utils/hostedRosterMemberId.js'
 import { TaskMutationLockUnavailableError, withTaskMutationCoordination } from '../../utils/taskMutationCoordinator.js'
 import { fingerprintHostedTaskCommand } from './protocol.js'
 import { hostedTaskBoardRevision, hostedTaskBoardSourceGeneration, hostedTaskBoardTaskId } from './HostedTaskBoardIdentity.js'
@@ -321,10 +322,11 @@ export class HostedTaskMutationService {
     for (const member of parsed) {
       const name = member.name as string
       // The lead owns tasks like any member, as on desktop. Product's hosted task board roster
-      // derives the same IDs from the same records; keep both rules identical.
+      // derives the same IDs from the same records; docs/hosted-roster-identity-golden.json pins them.
       if (name.toLowerCase() === 'user') continue
       const immutableIdentity = typeof member.joinedAt === 'number' ? `${name}\0${member.joinedAt}` : typeof member.agentId === 'string' ? member.agentId : name
-      const id = typeof member.memberId === 'string' ? member.memberId : `member_${sha(JSON.stringify({ domain: 'hosted-task-board-member/v1', teamId: this.options.authority.teamId, rawMemberName: immutableIdentity })).slice(0, 32)}`
+      const id = hostedRosterMemberId(this.options.authority.teamId, member)
+      if (id === null) throw new Error('Invalid hosted roster member')
       const identityKey = typeof member.memberId === 'string' ? `member:${id}` : `identity:${immutableIdentity}`
       const nameKey = name.toLowerCase()
       if (identities.has(identityKey) || (member.removedAt === undefined && activeNames.has(nameKey))) throw new Error('Ambiguous hosted roster identity')
