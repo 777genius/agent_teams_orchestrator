@@ -5,23 +5,18 @@ import { assertOpenCodeEffectiveAgentPolicies, buildExpectedOpenCodeAgentPolicie
 
 const dataHome = '/sandbox/isolated-data'
 const r = (permission: string, action: 'allow' | 'deny' | 'ask', pattern = '*') => ({ permission, pattern, action })
-const mcpNames = ['agent-teams_*', 'agent_teams_*', 'mcp__agent-teams__*', 'mcp__agent_teams__*']
-const mcp = mcpNames.map(name => r(name, 'allow'))
+const mcp = ['agent-teams_*', 'agent_teams_*', 'mcp__agent-teams__*', 'mcp__agent_teams__*'].map(name => r(name, 'allow'))
 const truncate = r('external_directory', 'allow', path.join(dataHome, 'opencode', 'tool-output', '*'))
 // Independent intent fixtures, deliberately not produced by the contract's flattening code.
-// The probe carries exactly the teammate tool set, but every tool the teammate may run is "ask".
-function teammateRules(mode: 'auto' | 'manual', grant: 'allow' | 'ask') {
-  return [
-    r('*', mode === 'auto' ? 'deny' : 'ask'),
-    ...(mode === 'auto' ? ['read', 'glob', 'grep', 'list', 'lsp', 'todoread', 'todowrite', 'edit', 'write', 'bash'].map(name => r(name, grant)) : []),
-    r('task', 'deny'), r('external_directory', 'deny'), r('doom_loop', 'deny'), ...mcpNames.map(name => r(name, grant)), truncate,
-  ]
-}
 function intended(mode: 'auto' | 'manual') {
   return [
-    { name: 'teammate', permission: teammateRules(mode, 'allow') },
+    { name: 'teammate', permission: [
+      r('*', mode === 'auto' ? 'deny' : 'ask'),
+      ...(mode === 'auto' ? ['read', 'glob', 'grep', 'list', 'lsp', 'todoread', 'todowrite', 'edit', 'write', 'bash'].map(name => r(name, 'allow')) : []),
+      r('task', 'deny'), r('external_directory', 'deny'), r('doom_loop', 'deny'), ...mcp, truncate,
+    ] },
     { name: 'teammate-bootstrap', permission: [r('*', 'deny'), ...mcp, truncate] },
-    { name: 'teammate-model-probe', permission: teammateRules(mode, 'ask') },
+    { name: 'teammate-model-probe', permission: [r('*', 'deny'), truncate] },
   ].map(value => structuredClone(value))
 }
 const error = 'Invalid OpenCode effective agent policy contract'
@@ -34,6 +29,21 @@ describe('effective managed agent policy', () => {
       expect(() => assertOpenCodeEffectiveAgentPolicies(snapshot, intended(mode))).not.toThrow()
     })
   }
+
+  test('OpenCode Zen auto probe carries the teammate tool set behind ask, manual stays tool-less', () => {
+    const probeRules = (mode: 'auto' | 'manual') => buildExpectedOpenCodeAgentPolicies(
+      buildManagedConfig(null, { managedProviderId: 'opencode', toolApprovalMode: mode }),
+      dataHome,
+    ).find(agent => agent.name === 'teammate-model-probe')?.rules
+    const mcpNames = ['agent-teams_*', 'agent_teams_*', 'mcp__agent-teams__*', 'mcp__agent_teams__*']
+    expect(probeRules('auto')).toEqual([
+      r('*', 'deny'),
+      ...['read', 'glob', 'grep', 'list', 'lsp', 'todoread', 'todowrite', 'edit', 'write', 'bash'].map(name => r(name, 'ask')),
+      r('task', 'deny'), r('external_directory', 'deny'), r('doom_loop', 'deny'),
+      ...mcpNames.map(name => r(name, 'ask')), truncate,
+    ])
+    expect(probeRules('manual')).toEqual([r('*', 'deny'), truncate])
+  })
 
   test('accepts arbitrary valid shadowed prefix including earlier universal resets', () => {
     const live = intended('auto')

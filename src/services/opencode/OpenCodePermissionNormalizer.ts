@@ -56,7 +56,16 @@ export function normalizeOpenCodePermission(
       nested?.sessionID,
       nested?.sessionId,
     ),
-    tool: firstString(record.tool, record.toolName, record.name, nested?.tool, nested?.toolName),
+    // OpenCode 1.18 sends the tool name in the string `permission` field and uses `tool`
+    // for the {messageID, callID} reference, which firstString skips as a non-string.
+    tool: firstString(
+      record.tool,
+      record.toolName,
+      record.name,
+      typeof record.permission === 'string' ? record.permission : null,
+      nested?.tool,
+      nested?.toolName,
+    ),
     title: firstString(record.title, record.description, nested?.title, nested?.description),
     kind: firstString(record.kind, record.type, nested?.kind, nested?.type),
     raw: permission,

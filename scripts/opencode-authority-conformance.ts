@@ -27,22 +27,13 @@ export function managedAgentFixtures(mode: 'auto' | 'manual'): Config {
     : { '*': 'deny', read: 'allow', glob: 'allow', grep: 'allow', list: 'allow', lsp: 'allow',
       todoread: 'allow', todowrite: 'allow', edit: 'allow', write: 'allow', bash: 'allow', task: { '*': 'deny' },
       external_directory: 'deny', doom_loop: 'deny', ...mcpAllow }
-  // The probe carries the teammate tool set, but every tool the teammate may run is "ask".
-  const mcpAsk = { 'agent-teams_*': 'ask', 'agent_teams_*': 'ask',
-    'mcp__agent-teams__*': 'ask', 'mcp__agent_teams__*': 'ask' }
-  const probePermission = mode === 'manual'
-    ? { '*': 'ask', task: { '*': 'deny' }, external_directory: 'deny', doom_loop: 'deny', ...mcpAsk }
-    : { '*': 'deny', read: 'ask', glob: 'ask', grep: 'ask', list: 'ask', lsp: 'ask',
-      todoread: 'ask', todowrite: 'ask', edit: 'ask', write: 'ask', bash: 'ask', task: { '*': 'deny' },
-      external_directory: 'deny', doom_loop: 'deny', ...mcpAsk }
   return {
     teammate: { mode: 'primary', description: 'Managed teammate agent for claude-multimodel runtime orchestration.', permission },
     'teammate-bootstrap': { mode: 'primary', description: 'Silent launch bootstrap agent restricted to Agent Teams MCP attach tools.',
       tools: { '*': false, 'agent-teams_*': true, 'agent_teams_*': true, 'mcp__agent-teams__*': true, 'mcp__agent_teams__*': true },
       permission: { '*': 'deny', ...mcpAllow } },
-    'teammate-model-probe': { mode: 'primary',
-      description: 'Model execution probe agent that carries the teammate tool set but cannot run any of it.',
-      permission: probePermission },
+    'teammate-model-probe': { mode: 'primary', description: 'Minimal model execution probe agent with tools disabled.',
+      tools: { '*': false }, permission: { '*': 'deny' } },
   }
 }
 

@@ -348,14 +348,39 @@ function downgradeAllowToAsk(value: unknown): unknown {
   )
 }
 
-// The probe sends the teammate's own tool set so it verifies the request a teammate will
-// actually make: OpenCode's free tier answers tool-less requests with a 403 FreeTierError
-// (anomalyco/opencode#49580) while the real teammate passes. Nothing may run during a probe,
-// so every "allow" becomes "ask" and the probe rejects each permission request it sees.
-function buildOpenCodeModelProbePermission(
-  toolApprovalMode: OpenCodeToolApprovalMode = 'auto',
-): Record<string, unknown> {
-  return downgradeAllowToAsk(buildOpenCodeTeammatePermission(toolApprovalMode)) as Record<string, unknown>
+const OPEN_CODE_TOOL_LESS_MODEL_PROBE_AGENT = {
+  mode: 'primary',
+  description: 'Minimal model execution probe agent with tools disabled.',
+  tools: {
+    '*': false,
+  },
+  permission: {
+    '*': 'deny',
+  },
+} as const
+
+// OpenCode Zen answers free-tier requests that carry no standard tool set with a 403
+// FreeTierError (anomalyco/opencode#49580), while the real teammate passes. Only for Zen does
+// the probe send the auto-mode teammate tool set, every "allow" downgraded to "ask" so any
+// call surfaces as a permission request the probe rejects. Manual-mode hosts keep the
+// tool-less probe: OpenCode stores "always" approvals per instance and they override "ask",
+// so a tool the user approved for a teammate there could otherwise run during a probe.
+// Every other provider keeps the tool-less probe as well, so its prompt stays small.
+function buildOpenCodeModelProbeAgent(input: {
+  managedProviderId: string | null | undefined
+  toolApprovalMode: OpenCodeToolApprovalMode | undefined
+}): Record<string, unknown> {
+  const providerId = input.managedProviderId
+    ? canonicalizeOpenCodeProviderId(input.managedProviderId)
+    : null
+  if (providerId !== 'opencode' || (input.toolApprovalMode ?? 'auto') !== 'auto') {
+    return structuredClone(OPEN_CODE_TOOL_LESS_MODEL_PROBE_AGENT) as Record<string, unknown>
+  }
+  return {
+    mode: 'primary',
+    description: 'Model execution probe agent that carries the teammate tool set but cannot run any of it.',
+    permission: downgradeAllowToAsk(buildOpenCodeTeammatePermission('auto')),
+  }
 }
 
 function parseProviderScopedModelId(value: string): {
@@ -808,11 +833,10 @@ export function buildManagedConfig(
           'mcp__agent_teams__*': 'allow',
         },
       },
-      [OPEN_CODE_MODEL_PROBE_AGENT_NAME]: {
-        mode: 'primary',
-        description: 'Model execution probe agent that carries the teammate tool set but cannot run any of it.',
-        permission: buildOpenCodeModelProbePermission(options.toolApprovalMode),
-      },
+      [OPEN_CODE_MODEL_PROBE_AGENT_NAME]: buildOpenCodeModelProbeAgent({
+        managedProviderId: selectedManagedProviderId,
+        toolApprovalMode: options.toolApprovalMode,
+      }),
     },
     // Keep project/global plugin config untouched. OpenCode merges inline config as overrides,
     // so setting plugin here would shadow user and project extension points.
@@ -1999,11 +2023,14 @@ function resolveOpenCodeAuthlessAuthorityMode(input: {
   const modelId = separatorIndex > 0 ? selectedModel.slice(separatorIndex + 1) : ''
   if (input.providerId === 'opencode' && modelId.length > 0) {
     // Only binds "no credential" to this exact model; it does not authorize the
-    // model. OpenCodeModelAccessPolicy decides access from the live Zen catalog
-    // (assertOpenCodeSelectedModelLaunchAccess runs before any session exists),
-    // so a paid or unknown Zen model without a key is still refused there. A
-    // static list here went stale every time Zen added a free model. The mode
-    // string stays 'builtin_free' so existing scope fingerprints do not rotate.
+    // model. OpenCodeModelAccessPolicy decides access from the live Zen catalog:
+    // launchTeam runs assertOpenCodeSelectedModelLaunchAccess before creating any
+    // session, so a paid or unknown Zen model without a key is refused there.
+    // Later session recreation (e.g. stale records in sendMessage) only reuses a
+    // model that already passed that gate, and an authless scope holds no
+    // credential to leak. A static list here went stale every time Zen added a
+    // free model. The mode string stays 'builtin_free' so existing scope
+    // fingerprints do not rotate.
     return 'builtin_free'
   }
 

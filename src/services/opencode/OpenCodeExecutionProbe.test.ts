@@ -8,6 +8,7 @@ import {
   classifyProbeFailure,
   OpenCodeExecutionProbe,
   probeOutputMatchesExpected,
+  OPEN_CODE_PROBE_PERMISSION_REJECT_MESSAGE,
   rejectProbeSessionPermissions,
   resolveOpenCodeExecutionProbeContextTokens,
 } from './OpenCodeExecutionProbe.js'
@@ -2988,18 +2989,97 @@ describe('OpenCodeExecutionProbe', () => {
     }
   })
 
+  const rejectedToolTurnCases: Array<[string, { created: number; completed?: number }, 'error' | 'pending']> = [
+    ['a completed tool-only turn', { created: 101, completed: 110 }, 'error'],
+    // Safety net: a tool part left pending with the session idle never completes by itself.
+    ['a stuck tool call on an idle session', { created: 101 }, 'pending'],
+  ]
+  test.each(rejectedToolTurnCases)('ends a probe right away when a rejected tool call leaves %s without text', async (_label, messageTime, toolStatus) => {
+    let statusCalls = 0
+    let permissionCalls = 0
+    const answers: Array<{ requestId: string; sessionId?: string | null; decision: string; message?: string }> = []
+    const probe = new OpenCodeExecutionProbe({
+      probeTimeoutMs: 60_000, pollIntervalMs: 1,
+      hostManager: { ensureHost: async () => host, releaseHost: async () => {} },
+      clientFactory: {
+        create: () => ({
+          getServerDoc: async () => { throw new Error('not used') },
+          authorizeProviderOAuth: async () => { throw new Error('not used') },
+          completeProviderOAuth: async () => { throw new Error('not used') },
+          setProviderAuth: async () => { throw new Error('not used') },
+          deleteProviderAuth: async () => { throw new Error('not used') },
+          listExperimentalToolIds: async () => { throw new Error('not used') },
+          listExperimentalTools: async () => { throw new Error('not used') },
+          answerPermission: async body => { answers.push(body) },
+          getConfig: async () => { throw new Error('not used') },
+          getConfigProviders: async () => { throw new Error('not used') },
+          getProviders: async () => { throw new Error('not used') },
+          getProviderAuth: async () => { throw new Error('not used') },
+          listAgents: async () => { throw new Error('not used') },
+          getMcp: async () => { throw new Error('not used') },
+          createSession: async () => ({ id: 'session-1' }),
+          getSession: async () => ({ id: 'session-1' }),
+          // Busy while the tool call waits for permission, then idle once the turn stops.
+          getSessionStatus: async () => ({ 'session-1': { type: (statusCalls += 1) <= 6 ? 'busy' : 'idle' } }),
+          getSessionMessages: async () => [
+            {
+              info: {
+                id: 'msg-assistant-tool',
+                role: 'assistant',
+                sessionID: 'session-1',
+                time: messageTime,
+              },
+              parts: [
+                { type: 'tool', tool: 'bash', callID: 'call-1', state: { status: toolStatus, ...(toolStatus === 'error' ? { error: 'rejected' } : {}) } },
+              ],
+            },
+          ],
+          getPermissions: async () => (permissionCalls += 1) === 1
+            ? [{ id: 'perm-1', sessionID: 'session-1', permission: 'bash', patterns: ['ls'], tool: { messageID: 'msg-assistant-tool', callID: 'call-1' } }]
+            : [],
+          sendSessionMessage: async () => ({ info: { id: 'msg-assistant-tool' }, parts: [] }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => true,
+        }),
+      },
+    })
+
+    const startedAt = Date.now()
+    const result = await probe.probeModel({
+      selectedModel: 'opencode/big-pickle',
+      projectPath: '/tmp/project',
+    })
+
+    expect(answers).toEqual([{
+      requestId: 'perm-1', sessionId: 'session-1', decision: 'reject', message: OPEN_CODE_PROBE_PERMISSION_REJECT_MESSAGE,
+    }])
+    expect(result.outcome).toBe('unknown')
+    expect(result.reason).toBe('OpenCode model verification ended after the model tried to use a tool instead of answering')
+    expect(result.failureCode).toBeUndefined()
+    // Well before the 60 s probe deadline: it does not wait for a reply that cannot come.
+    expect(Date.now() - startedAt).toBeLessThan(10_000)
+  })
+
   test('rejects only the probe session permission requests and never approves one', async () => {
-    const answers: Array<{ requestId: string; sessionId?: string | null; decision: string }> = []
+    const answers: Array<{ requestId: string; sessionId?: string | null; decision: string; message?: string }> = []
     const diagnostics = new Set<string>()
-    await rejectProbeSessionPermissions({
+    // OpenCode 1.18 request shape: the tool name is in `permission`, `tool` is the call reference.
+    const rejected = await rejectProbeSessionPermissions({
       getPermissions: async () => [
-        { id: 'perm-probe', sessionID: 'session-1', tool: 'bash' },
-        { id: 'perm-other', sessionID: 'other-session', tool: 'edit' },
+        { id: 'perm-probe', sessionID: 'session-1', permission: 'bash', patterns: ['ls'], tool: { messageID: 'msg-1', callID: 'call-1' } },
+        { id: 'perm-other', sessionID: 'other-session', permission: 'edit', patterns: ['*'], tool: { messageID: 'msg-2', callID: 'call-2' } },
       ],
       answerPermission: async body => { answers.push(body) },
     }, 'session-1', diagnostics)
 
-    expect(answers).toEqual([{ requestId: 'perm-probe', sessionId: 'session-1', decision: 'reject' }])
+    expect(rejected).toBe(1)
+    // A reject with a message becomes feedback for the model instead of blocking the turn.
+    expect(answers).toEqual([{
+      requestId: 'perm-probe',
+      sessionId: 'session-1',
+      decision: 'reject',
+      message: OPEN_CODE_PROBE_PERMISSION_REJECT_MESSAGE,
+    }])
     expect(Array.from(diagnostics)).toEqual(['OpenCode probe rejected a bash permission request'])
   })
 
