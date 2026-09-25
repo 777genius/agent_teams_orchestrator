@@ -211,6 +211,11 @@ export class HostedTeamLeadInboxPump {
           results.push({ kind: 'operator_required' })
           continue
         }
+        const terminal = await this.#terminalDecision(recipient, message, authority as HostedControlAuthority)
+        if (terminal) {
+          results.push(terminal)
+          continue
+        }
         const inbox = await this.#readInbox(recipient)
         const row = inbox.find(candidate => candidate.messageId === message.messageId && candidate.from === 'user')
         if (!row || typeof row.text !== 'string' || typeof row.timestamp !== 'string' ||
@@ -226,6 +231,30 @@ export class HostedTeamLeadInboxPump {
       } catch { results.push({ kind: 'operator_required' }) }
     }
     return results
+  }
+
+  /**
+   * A native append, an operator_required intent and an observed prompt whose inbox row is marked
+   * read never change again, so recovery answers them without rereading the inbox or waking the
+   * message. Anything else, or any doubt about the stored record, takes the full wake path.
+   */
+  async #terminalDecision(
+    recipient: string,
+    binding: Record<string, unknown>,
+    authority: HostedControlAuthority,
+  ): Promise<InboxPumpDecision | null> {
+    try {
+      const messageId = String(binding.messageId)
+      const stored = await readPrivateJson(join(this.#root, DIRECTORY,
+        `${intentDigest(authority.teamId, recipient, messageId)}.json`)) as Intent | NativeInboxRecord | null
+      if (!stored || !sameAuthority(stored.authority, authority) ||
+        stored.authority.actorId !== authority.actorId ||
+        stored.message?.messageId !== messageId || stored.textSha256 !== binding.textSha256) return null
+      if (stored.status === 'native_inbox') return validNativeInboxRecord(stored) ? { kind: 'native_inbox' } : null
+      if (!validIntent(stored)) return null
+      if (stored.status === 'operator_required') return { kind: 'operator_required' }
+      return stored.status === 'observed' && stored.inboxReadCommitted === true ? { kind: 'observed' } : null
+    } catch { return null }
   }
 
   async close(): Promise<void> {

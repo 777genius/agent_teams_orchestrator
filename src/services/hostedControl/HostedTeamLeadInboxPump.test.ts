@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -234,6 +234,45 @@ describe('HostedTeamLeadInboxPump', () => {
     expect(await f.build().recover()).toEqual([{ kind: 'operator_required' }])
     expect(f.calls).toEqual(['status'])
     expect(JSON.parse(await readFile(path, 'utf8')).status).toBe('operator_required')
+  })
+
+  test('recovery answers a terminal intent without rereading the inbox or the bridge', async () => {
+    const f = await fixture()
+    expect(await f.build().wake(message, authority)).toEqual({ kind: 'accepted' })
+    expect(await f.build().wake(message, authority)).toEqual({ kind: 'observed' })
+    const [name] = await readdir(join(f.root, 'hosted-team-lead-inbox-pump'))
+    const path = join(f.root, 'hosted-team-lead-inbox-pump', name!)
+    const observed = JSON.parse(await readFile(path, 'utf8'))
+    expect(observed).toMatchObject({ status: 'observed', inboxReadCommitted: true })
+    // An unsafe inbox fails every path that reads it, so a skipped read is observable.
+    const inbox = join(f.root, 'inboxes', 'team-lead.json')
+    await chmod(inbox, 0o644)
+    f.calls.length = 0
+    expect(await f.build().recover()).toEqual([{ kind: 'observed' }])
+    expect(await f.build().wake(message, authority)).toEqual({ kind: 'operator_required' })
+    await writeFile(path, `${JSON.stringify({ ...observed, status: 'operator_required' })}\n`, { mode: 0o600 })
+    expect(await f.build().recover()).toEqual([{ kind: 'operator_required' }])
+    expect(f.calls).toEqual([])
+
+    // A record for another actor is not trusted as terminal and takes the full wake path.
+    await writeFile(path, `${JSON.stringify({ ...observed,
+      authority: { ...observed.authority, actorId: 'actor-b' } })}\n`, { mode: 0o600 })
+    expect(await f.build().recover()).toEqual([{ kind: 'operator_required' }])
+    await chmod(inbox, 0o600)
+    expect(await f.build().recover()).toEqual([{ kind: 'operator_required' }])
+    expect(JSON.parse(await readFile(path, 'utf8')).authority.actorId).toBe('actor-b')
+  })
+
+  test('recovery still commits the inbox read of an observed prompt', async () => {
+    const f = await fixture()
+    expect(await f.build().wake(message, authority)).toEqual({ kind: 'accepted' })
+    expect(await f.build().wake(message, authority)).toEqual({ kind: 'observed' })
+    const [name] = await readdir(join(f.root, 'hosted-team-lead-inbox-pump'))
+    const path = join(f.root, 'hosted-team-lead-inbox-pump', name!)
+    const { inboxReadCommitted: _, ...uncommitted } = JSON.parse(await readFile(path, 'utf8'))
+    await writeFile(path, `${JSON.stringify(uncommitted)}\n`, { mode: 0o600 })
+    expect(await f.build().recover()).toEqual([{ kind: 'observed' }])
+    expect(JSON.parse(await readFile(path, 'utf8'))).toMatchObject({ status: 'observed', inboxReadCommitted: true })
   })
 
   test('periodic recovery submits a queued row when the selected run becomes active', async () => {
