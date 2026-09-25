@@ -563,7 +563,7 @@ export type OpenCodeExecutionProbeResult = {
   toolCallCount: number
   errorCount: number
   diagnostics: string[]
-  failureCode?: 'prompt_start_failed' | 'execution_timeout'
+  failureCode?: 'prompt_start_failed' | 'execution_timeout' | 'free_tier_restricted'
   verifiedAt?: string
 }
 

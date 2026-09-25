@@ -1307,15 +1307,34 @@ describe('OpenCodeProfileManager project behavior contract', () => {
           },
         },
         'teammate-model-probe': {
-          tools: {
-            '*': false,
-          },
           permission: {
             '*': 'deny',
+            read: 'ask',
+            glob: 'ask',
+            grep: 'ask',
+            list: 'ask',
+            lsp: 'ask',
+            todoread: 'ask',
+            todowrite: 'ask',
+            edit: 'ask',
+            write: 'ask',
+            bash: 'ask',
+            task: {
+              '*': 'deny',
+            },
+            external_directory: 'deny',
+            doom_loop: 'deny',
+            'agent-teams_*': 'ask',
+            'agent_teams_*': 'ask',
+            'mcp__agent-teams__*': 'ask',
+            'mcp__agent_teams__*': 'ask',
           },
         },
       },
     })
+    // The probe must send the teammate tool set, so it may not strip tools from the request.
+    expect((managedConfig.agent as Record<string, Record<string, unknown>>)['teammate-model-probe'])
+      .not.toHaveProperty('tools')
   })
 
   test('can build a manual approval teammate profile while keeping app MCP allowed', () => {

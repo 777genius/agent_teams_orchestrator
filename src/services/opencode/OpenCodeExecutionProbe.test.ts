@@ -8,8 +8,10 @@ import {
   classifyProbeFailure,
   OpenCodeExecutionProbe,
   probeOutputMatchesExpected,
+  rejectProbeSessionPermissions,
   resolveOpenCodeExecutionProbeContextTokens,
 } from './OpenCodeExecutionProbe.js'
+import { OPEN_CODE_FREE_TIER_RESTRICTED_REASON } from './OpenCodeFreeTierFailure.js'
 import { OPEN_CODE_MODEL_PROBE_AGENT_NAME } from './OpenCodeProfileManager.js'
 import {
   fanOutOpenCodeOAuthCredential,
@@ -2902,6 +2904,103 @@ describe('OpenCodeExecutionProbe', () => {
     expect(result.outcome).toBe(outcome)
     expect(result.reason).toBe(outcome === 'not_authenticated' ? `HTTP ${statusCode}: ${message}` : message)
     expect(result.durableState).toBe('retrying')
+  })
+
+  // Payload shape captured from a real Zen free-tier refusal (opencode 1.18.4).
+  const freeTierApiError = {
+    name: 'APIError',
+    data: {
+      message: "Error from provider (Console): OpenCode's free tier can only be used from within OpenCode",
+      statusCode: 403,
+      isRetryable: false,
+      responseBody: JSON.stringify({
+        type: 'error',
+        error: {
+          type: 'FreeTierError',
+          message: "Error from provider (Console): OpenCode's free tier can only be used from within OpenCode",
+        },
+      }),
+      metadata: { url: 'https://opencode.ai/zen/v1/chat/completions' },
+    },
+  }
+
+  test.each([
+    ['a free-tier refusal', freeTierApiError, 'unavailable', 'free_tier_restricted'],
+    [
+      'a plain 403',
+      { name: 'APIError', data: { statusCode: 403, message: 'Forbidden', responseBody: '{"error":{"type":"AuthError"}}' } },
+      'not_authenticated',
+      undefined,
+    ],
+    ['a 401', { name: 'APIError', data: { statusCode: 401, message: 'Invalid API key' } }, 'not_authenticated', undefined],
+  ] as const)('classifies %s structurally, not by its HTTP status alone', async (_label, error, outcome, failureCode) => {
+    const probe = new OpenCodeExecutionProbe({
+      probeTimeoutMs: 10, pollIntervalMs: 1,
+      hostManager: { ensureHost: async () => host, releaseHost: async () => {} },
+      clientFactory: {
+        create: () => ({
+          getServerDoc: async () => { throw new Error('not used') },
+          authorizeProviderOAuth: async () => { throw new Error('not used') },
+          completeProviderOAuth: async () => { throw new Error('not used') },
+          setProviderAuth: async () => { throw new Error('not used') },
+          deleteProviderAuth: async () => { throw new Error('not used') },
+          listExperimentalToolIds: async () => { throw new Error('not used') },
+          listExperimentalTools: async () => { throw new Error('not used') },
+          answerPermission: async () => { throw new Error('not used') },
+          getConfig: async () => { throw new Error('not used') },
+          getConfigProviders: async () => { throw new Error('not used') },
+          getProviders: async () => { throw new Error('not used') },
+          getProviderAuth: async () => { throw new Error('not used') },
+          listAgents: async () => { throw new Error('not used') },
+          getMcp: async () => { throw new Error('not used') },
+          createSession: async () => ({ id: 'session-1' }),
+          getSession: async () => ({ id: 'session-1' }),
+          getSessionStatus: async () => ({ 'session-1': { type: 'idle' } }),
+          getSessionMessages: async () => [
+            {
+              info: {
+                id: 'msg-assistant-error',
+                role: 'assistant',
+                sessionID: 'session-1',
+                time: { created: 101, completed: 110 },
+                error,
+              },
+              parts: [],
+            },
+          ],
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: { id: 'msg-assistant-error' }, parts: [] }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => true,
+        }),
+      },
+    })
+
+    const result = await probe.probeModel({
+      selectedModel: 'opencode/big-pickle',
+      projectPath: '/tmp/project',
+    })
+
+    expect(result.outcome).toBe(outcome)
+    expect(result.failureCode).toBe(failureCode)
+    if (failureCode) {
+      expect(result.reason).toBe(OPEN_CODE_FREE_TIER_RESTRICTED_REASON)
+    }
+  })
+
+  test('rejects only the probe session permission requests and never approves one', async () => {
+    const answers: Array<{ requestId: string; sessionId?: string | null; decision: string }> = []
+    const diagnostics = new Set<string>()
+    await rejectProbeSessionPermissions({
+      getPermissions: async () => [
+        { id: 'perm-probe', sessionID: 'session-1', tool: 'bash' },
+        { id: 'perm-other', sessionID: 'other-session', tool: 'edit' },
+      ],
+      answerPermission: async body => { answers.push(body) },
+    }, 'session-1', diagnostics)
+
+    expect(answers).toEqual([{ requestId: 'perm-probe', sessionId: 'session-1', decision: 'reject' }])
+    expect(Array.from(diagnostics)).toEqual(['OpenCode probe rejected a bash permission request'])
   })
 
   test('runs every generic execution proof fresh, including concurrent requests', async () => {

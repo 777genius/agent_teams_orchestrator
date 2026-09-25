@@ -2056,6 +2056,10 @@ function matchAppMcpTools(observedTools: string[], route: string): AppMcpToolPro
   }
 }
 
+export function __readinessDataForTests(...args: Parameters<typeof readinessData>) {
+  return readinessData(...args)
+}
+
 function readinessData(
   snapshot: OpenCodeProvisioningSnapshot,
   selectedModel: string | null,
@@ -2088,6 +2092,7 @@ function readinessData(
   let state: string = 'ready'
   let launchAllowed = true
   const missing: string[] = []
+  const freeTierRestricted = executionOutcome?.failureCode === 'free_tier_restricted'
 
   if (!snapshot.detected) {
     state = 'not_installed'
@@ -2103,6 +2108,11 @@ function readinessData(
     missing.push(
       executionOutcome.reason ?? 'OpenCode provider authentication failed for the selected model',
     )
+  } else if (freeTierRestricted) {
+    // Before the MCP branch: a missing MCP contract must not mask the provider's refusal.
+    state = 'model_unavailable'
+    launchAllowed = false
+    missing.push(executionOutcome?.reason ?? 'OpenCode rejected this free-tier request')
   } else if (
     executionOutcome
     && executionOutcome.outcome !== 'available'
@@ -2168,6 +2178,7 @@ function readinessData(
     supportLevel: launchAllowed ? 'production_supported' : null,
     missing,
     diagnostics,
+    ...(freeTierRestricted ? { failureCode: 'free_tier_restricted' } : {}),
     evidence: {
       capabilitiesReady: true,
       mcpToolProofRoute: toolProof.route,

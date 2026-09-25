@@ -125,6 +125,28 @@ describe('OpenCodeModelAccessPolicy', () => {
     expect(access.requiresExecutionProof).toBe(false)
   })
 
+  test('carries the free-tier refusal code and never reports it as a missing key', () => {
+    const zen = catalog({
+      models: ['opencode/big-pickle'],
+      modelMetadata: [modelMetadata('opencode/big-pickle')],
+    })
+    const refused = buildOpenCodeModelRouteMetadata({
+      selectedModel: 'opencode/big-pickle',
+      catalog: zen,
+      executionOutcome: { outcome: 'unavailable', reason: 'refused', failureCode: 'free_tier_restricted' },
+    })
+    expect(refused.failureCode).toBe('free_tier_restricted')
+    expect(refused.accessKind).not.toBe('not_authenticated')
+
+    const unauthenticated = buildOpenCodeModelRouteMetadata({
+      selectedModel: 'opencode/big-pickle',
+      catalog: zen,
+      executionOutcome: { outcome: 'not_authenticated', reason: 'HTTP 401' },
+    })
+    expect(unauthenticated.accessKind).toBe('not_authenticated')
+    expect(unauthenticated).not.toHaveProperty('failureCode')
+  })
+
   test('requires execution proof for configured authless local providers', () => {
     const access = evaluateOpenCodeModelAccess({
       selectedModel: 'llama.cpp/qwen-test:0.5b',

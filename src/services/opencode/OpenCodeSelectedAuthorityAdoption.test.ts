@@ -97,7 +97,13 @@ test('selected persistent host adopts through real HTTP authority and remains st
         ...['task', 'external_directory', 'doom_loop'].map(permission => rule(permission, 'deny')),
         ...mcpRules, truncate] },
       { name: 'teammate-bootstrap', mode: 'primary', permission: [rule('*', 'deny'), ...mcpRules, truncate] },
-      { name: 'teammate-model-probe', mode: 'primary', permission: [rule('*', 'deny'), truncate] },
+      { name: 'teammate-model-probe', mode: 'primary', permission: [rule('*', 'deny'),
+        ...['read', 'glob', 'grep', 'list', 'lsp', 'todoread', 'todowrite', 'edit', 'write', 'bash']
+          .map(permission => rule(permission, 'ask')),
+        ...['task', 'external_directory', 'doom_loop'].map(permission => rule(permission, 'deny')),
+        ...['agent-teams_*', 'agent_teams_*', 'mcp__agent-teams__*', 'mcp__agent_teams__*']
+          .map(permission => rule(permission, 'ask')),
+        truncate] },
     ]
     // Model /config encoding loss while /agent preserves the executable order.
     const configAgents = config.agent as Record<string, Record<string, unknown>>

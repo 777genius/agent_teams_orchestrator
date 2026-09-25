@@ -340,6 +340,24 @@ function buildOpenCodeTeammatePermission(
   }
 }
 
+function downgradeAllowToAsk(value: unknown): unknown {
+  if (value === 'allow') return 'ask'
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>).map(([key, entry]) => [key, downgradeAllowToAsk(entry)]),
+  )
+}
+
+// The probe sends the teammate's own tool set so it verifies the request a teammate will
+// actually make: OpenCode's free tier answers tool-less requests with a 403 FreeTierError
+// (anomalyco/opencode#49580) while the real teammate passes. Nothing may run during a probe,
+// so every "allow" becomes "ask" and the probe rejects each permission request it sees.
+function buildOpenCodeModelProbePermission(
+  toolApprovalMode: OpenCodeToolApprovalMode = 'auto',
+): Record<string, unknown> {
+  return downgradeAllowToAsk(buildOpenCodeTeammatePermission(toolApprovalMode)) as Record<string, unknown>
+}
+
 function parseProviderScopedModelId(value: string): {
   providerId: string
   modelId: string
@@ -792,13 +810,8 @@ export function buildManagedConfig(
       },
       [OPEN_CODE_MODEL_PROBE_AGENT_NAME]: {
         mode: 'primary',
-        description: 'Minimal model execution probe agent with tools disabled.',
-        tools: {
-          '*': false,
-        },
-        permission: {
-          '*': 'deny',
-        },
+        description: 'Model execution probe agent that carries the teammate tool set but cannot run any of it.',
+        permission: buildOpenCodeModelProbePermission(options.toolApprovalMode),
       },
     },
     // Keep project/global plugin config untouched. OpenCode merges inline config as overrides,
