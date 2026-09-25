@@ -498,7 +498,7 @@ describe('createHostedPersonalHostLocalPortFactory', () => {
   })
 
   test('lane plan admission survives composition, and without personal-host no lane exists', async () => {
-    const teamRoot = await makeTeamRoot('hosted-personal-plan-admission-')
+    const teamRoot = await makePersonalTeamRoot('hosted-personal-plan-admission-')
     const workspace = join(teamRoot, 'sandbox-workspace')
     await mkdir(workspace, { mode: 0o700 })
     await writePlan(teamRoot, 'native', workspace)
