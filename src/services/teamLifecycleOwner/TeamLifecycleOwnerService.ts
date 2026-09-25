@@ -31,6 +31,12 @@ export type TeamLifecycleOwnerEffectInput = {
   expectedProviderGeneration: string
   /** Revalidated immediately before each lane adapter performs an effect. */
   effectGuard?: () => boolean | Promise<boolean>
+  /**
+   * Owner authority that must still hold when a started lane effect returns.
+   * Unlike effectGuard it carries no request deadline: a long launch may
+   * outlive its command, never the owner epoch. Defaults to effectGuard.
+   */
+  effectAuthorityGuard?: () => boolean | Promise<boolean>
 }
 
 /**
@@ -159,6 +165,7 @@ export class TeamLifecycleOwnerService implements HostedLifecycleProviderAdapter
         reservationPlanGeneration: admission.planGeneration,
         reservationDeadlineAtMs: input.deadlineAtMs,
         effectGuard,
+        effectAuthorityGuard: () => this.#admissionCurrent(admission),
       }
       try {
         if (!(await effectGuard())) return { kind: 'unavailable' }

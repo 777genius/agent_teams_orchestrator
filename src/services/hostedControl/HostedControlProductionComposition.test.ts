@@ -230,6 +230,46 @@ describe('createHostedControlProductionPorts', () => {
     await ports.close()
   })
 
+  test('a launch outlives its command deadline but not the owner authority that admitted it', async () => {
+    for (const ownerLost of [false, true]) {
+      const teamRoot = await makeTeamRoot(`hosted-production-long-launch-${ownerLost}-`)
+      await writePlan(teamRoot, 'opencode')
+      let ownerCurrent = true
+      const actions: string[] = []
+      const lane = fakeLane({
+        launch: async () => {
+          actions.push('launch')
+          // Readiness plus launch take longer than the command's deadline;
+          // the owner may also lose its epoch meanwhile.
+          await Bun.sleep(300)
+          if (ownerLost) ownerCurrent = false
+          return { phase: 'running', recoverable: false }
+        },
+        stop: async () => { actions.push('stop'); return { phase: 'idle', recoverable: false } },
+      })
+      const ports = await createHostedControlProductionPortFactory(async () => lane)({
+        ...context(teamRoot),
+        isCurrentAuthority: async () => ownerCurrent,
+      })
+      const { request } = await reservedLaunchRequest(ports, teamRoot)
+      const expiring = { ...request, payload: { ...request.payload,
+        context: { ...request.payload.context, deadlineAtMs: Date.now() + 150 } } }
+      expect((await ports.lifecycle.dispatch(expiring)).payload.kind).toBe('settled')
+      await Bun.sleep(600)
+      const state = JSON.parse(await readFile(join(teamRoot, HOSTED_LIFECYCLE_EXECUTION_STATE_FILE), 'utf8'))
+      if (ownerLost) {
+        expect(state).toMatchObject({ phase: 'failed',
+          failure: { action: 'launch', message: 'Team lifecycle effect authority changed' } })
+        expect(actions).toEqual(['launch', 'stop'])
+      } else {
+        expect(state.phase).toBe('running')
+        expect(actions).toEqual(['launch'])
+      }
+      ownerCurrent = true
+      await ports.close()
+    }
+  })
+
   test('starts and replays only the exact Product reserved run in production', async () => {
     const teamRoot = await makeTeamRoot('hosted-production-reserved-run-')
     await writePlan(teamRoot, 'opencode')

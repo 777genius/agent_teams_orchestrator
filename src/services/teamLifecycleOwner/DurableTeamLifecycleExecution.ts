@@ -43,6 +43,8 @@ type LaneInput = {
 }
 
 type EffectGuard = NonNullable<TeamLifecycleOwnerEffectInput['effectGuard']>
+/** `start` gates beginning a lane effect; `authority` must still hold when it returns. */
+type EffectGuards = Readonly<{ start: EffectGuard; authority: EffectGuard }>
 const EFFECT_ALLOWED: EffectGuard = () => true
 
 export type TeamLifecycleRunReservation = {
@@ -220,7 +222,7 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
       }
       const launching = await this.#write({ ...before, phase: 'launching', runId, recoverable: false }, input.plan)
       this.#ownedRuns.add(runId)
-      this.#trackJob(runId, this.#completeLaunch(input.plan, runId, input.effectGuard ?? EFFECT_ALLOWED))
+      this.#trackJob(runId, this.#completeLaunch(input.plan, runId, effectGuards(input)))
       return snapshot(this.providerId, launching)
     })
   }
@@ -238,7 +240,7 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
       this.#assertGeneration(before, input.expectedProviderGeneration)
       if (before.phase !== 'running' || before.runId !== input.runId) throw new Error('Team lifecycle run is stale')
       const stopping = await this.#write({ ...before, phase: 'stopping', recoverable: false }, input.plan)
-      this.#trackJob(before.runId, this.#completeStop(input.plan, before.runId, input.effectGuard ?? EFFECT_ALLOWED))
+      this.#trackJob(before.runId, this.#completeStop(input.plan, before.runId, effectGuards(input)))
       return snapshot(this.providerId, stopping)
     })
   }
@@ -265,7 +267,7 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
         input.plan,
         before.runId,
         action,
-        input.effectGuard ?? EFFECT_ALLOWED,
+        effectGuards(input),
       )
       if (!observations.every(observation => observation.phase === 'idle')) {
         throw new Error(`Team lifecycle ${action} was not confirmed`)
@@ -340,11 +342,11 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
     }
   }
 
-  async #completeLaunch(plan: TeamLifecycleLaunchPlan, runId: string, effectGuard: EffectGuard): Promise<void> {
+  async #completeLaunch(plan: TeamLifecycleLaunchPlan, runId: string, guards: EffectGuards): Promise<void> {
     let observations: TeamLifecycleLaneObservation[]
     let failure: TeamLifecycleLaneFailure | undefined
     try {
-      observations = await this.#applyLanes(plan, runId, 'launch', effectGuard)
+      observations = await this.#applyLanes(plan, runId, 'launch', guards)
     } catch (error) {
       observations = [{ phase: 'failed', recoverable: true }]
       failure = laneFailureFromError('launch', error)
@@ -353,7 +355,9 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
       const current = await this.#read(plan)
       if (current.runId === runId && current.phase === 'running') return
       if (current.runId !== runId || current.phase !== 'launching') {
-        await this.#applyLanes(plan, runId, 'stop', effectGuard).catch(() => [])
+        // Compensation for a superseded launch is not a new commanded effect.
+        await this.#applyLanes(plan, runId, 'stop', { start: guards.authority, authority: guards.authority })
+          .catch(() => [])
         return
       }
       const next = launchCompletion(observations)
@@ -369,11 +373,11 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
     })
   }
 
-  async #completeStop(plan: TeamLifecycleLaunchPlan, runId: string, effectGuard: EffectGuard): Promise<void> {
+  async #completeStop(plan: TeamLifecycleLaunchPlan, runId: string, guards: EffectGuards): Promise<void> {
     let stopped = false
     let failure: TeamLifecycleLaneFailure | undefined
     try {
-      stopped = (await this.#applyLanes(plan, runId, 'stop', effectGuard))
+      stopped = (await this.#applyLanes(plan, runId, 'stop', guards))
         .every(observation => observation.phase === 'idle')
       if (!stopped) failure = stopNotConfirmed('stop')
     } catch (error) {
@@ -443,7 +447,7 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
     plan: TeamLifecycleLaunchPlan,
     runId: string,
     action: 'launch' | 'cancel' | 'stop' | 'recover',
-    effectGuard: EffectGuard,
+    guards: EffectGuards,
   ): Promise<TeamLifecycleLaneObservation[]> {
     return Promise.all(plan.lanes.map(async lane => {
       const adapter = this.#adapter(lane.kind)
@@ -456,9 +460,11 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
       }
       // No asynchronous boundary may exist between the authority comparison and
       // invoking the provider adapter: a queued launch can outlive its request.
-      if (!(await effectGuard())) throw new Error('Team lifecycle effect authority changed')
+      if (!(await guards.start())) throw new Error('Team lifecycle effect authority changed')
       const observation = await adapter[action](laneInput)
-      if (!(await effectGuard())) {
+      // A started effect may outlast its command deadline (launch attests
+      // readiness first), but never the owner authority that admitted it.
+      if (!(await guards.authority())) {
         // A successful launch is already an external effect. Losing authority
         // while it awaited must synchronously compensate that exact run before
         // the job can settle or close() can declare the owner drained.
@@ -586,6 +592,11 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
     await prior
     try { return await operation() } finally { release() }
   }
+}
+
+function effectGuards(input: TeamLifecycleOwnerEffectInput): EffectGuards {
+  const start = input.effectGuard ?? EFFECT_ALLOWED
+  return Object.freeze({ start, authority: input.effectAuthorityGuard ?? start })
 }
 
 function initialState(plan: TeamLifecycleLaunchPlan): DurableState {
