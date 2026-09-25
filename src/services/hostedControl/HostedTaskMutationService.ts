@@ -284,7 +284,9 @@ export class HostedTaskMutationService {
     const parsed = parseRoster(meta, config); const result = new Map<string, string>(); const identities = new Set<string>(); const activeNames = new Set<string>()
     for (const member of parsed) {
       const name = member.name as string
-      if (['team-lead', 'user'].includes(name.toLowerCase()) || ['lead', 'orchestrator', 'team-lead'].includes(String(member.agentType ?? ''))) continue
+      // The lead owns tasks like any member, as on desktop. Product's hosted task board roster
+      // derives the same IDs from the same records; keep both rules identical.
+      if (name.toLowerCase() === 'user') continue
       const immutableIdentity = typeof member.joinedAt === 'number' ? `${name}\0${member.joinedAt}` : typeof member.agentId === 'string' ? member.agentId : name
       const id = typeof member.memberId === 'string' ? member.memberId : `member_${sha(JSON.stringify({ domain: 'hosted-task-board-member/v1', teamId: this.options.authority.teamId, rawMemberName: immutableIdentity })).slice(0, 32)}`
       const identityKey = typeof member.memberId === 'string' ? `member:${id}` : `identity:${immutableIdentity}`

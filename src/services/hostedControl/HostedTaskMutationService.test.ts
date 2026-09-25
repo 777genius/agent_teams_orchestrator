@@ -240,6 +240,21 @@ describe('HostedTaskMutationService', () => {
     expect(oldOwner.result.kind).toBe('conflict'); expect(JSON.parse(await readFile(createdPath, 'utf8')).owner).toBe(replacementId)
   })
 
+  test('lets the team lead own tasks like any runtime member', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'hosted-service-lead-')); roots.push(root)
+    await mkdir(join(root, 'teams', 'legacy'), { recursive: true }); await mkdir(join(root, 'tasks', 'legacy'), { recursive: true })
+    const teamId = `team_${'3'.repeat(32)}`; const authority = authorityFor(teamId)
+    const leadId = `member_${createHash('sha256').update(JSON.stringify({ domain: 'hosted-task-board-member/v1', teamId, rawMemberName: `team-lead\0${5}` })).digest('hex').slice(0, 32)}`
+    await writeFile(join(root, 'teams', 'legacy', 'config.json'), JSON.stringify({ name: 'legacy', members: [
+      { name: 'team-lead', agentType: 'team-lead', agentId: 'team-lead@legacy', joinedAt: 5 }, { name: 'user', agentType: 'user' },
+    ] }))
+    const service = new HostedTaskMutationService({ claudeRoot: root, legacyKey: 'legacy', authority, wal: new HostedTaskMutationWal(join(root, 'teams', 'legacy'), teamId) })
+    const created = await runCommand(service, authority, { schemaVersion: 1, kind: 'create_task', commandId: 'command_lead_owner', idempotencyKey: 'lead-owner', teamId, expectedSourceGeneration: 'generation_stale', expectedRevision: 'revision_stale', subject: 'Lead task', description: null, status: 'pending', ownerId: leadId, column: 'todo', order: 0 })
+    expect(created.result.kind).toBe('committed'); if (created.result.kind !== 'committed') return
+    const rawId = `hosted-${createHash('sha256').update(JSON.stringify({ commandId: 'command_lead_owner' })).digest('hex').slice(0, 40)}`
+    expect(JSON.parse(await readFile(join(root, 'tasks', 'legacy', `${rawId}.json`), 'utf8')).owner).toBe(leadId)
+  })
+
   test('persists immutable member owners while legacy readers and recovery preserve the exact postimage', async () => {
     const root = await mkdtemp(join(tmpdir(), 'hosted-service-owner-compatibility-')); roots.push(root)
     await mkdir(join(root, 'teams', 'legacy'), { recursive: true }); await mkdir(join(root, 'tasks', 'legacy'), { recursive: true })
