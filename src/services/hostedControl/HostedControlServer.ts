@@ -300,7 +300,11 @@ export class HostedControlServer {
       const activation = this.#activation
       if (activation?.socket === socket) {
         void this.#revokeActivation(activation, new Error('Hosted approval activation lease ended'))
+        return
       }
+      // Half-open sockets no longer close on FIN; a peer that ends before a complete frame
+      // will never send a request, so do not keep it until the read deadline.
+      if (!finished) failClosed()
     })
     socket.once('close', () => {
       const activation = this.#activation

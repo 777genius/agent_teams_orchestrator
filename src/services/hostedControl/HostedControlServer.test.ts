@@ -387,6 +387,40 @@ describe('HostedControlServer', () => {
     expect(originalLeaseStillValid).toBe(false)
   })
 
+  test('drops the readiness lease when the controller half-closes it', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'hosted-server-lease-fin-')); roots.push(root)
+    const socketPath = join(root, 'private', 'control.sock'); const secret = Buffer.alloc(32, 9); const unsigned = hostedControlGoldenRequestFixture()
+    const { socketIdentity: _, ...ownerIdentity } = unsigned.ownerBinding
+    const server = new HostedControlServer({ socketPath, secret, ownerIdentity, authority: unsigned.authority, service: { mutate: async () => ({ kind: 'unavailable' as const }) }, dispatchCoexistingOperation: async () => ({ schemaVersion: 2, operation: 'control_state' }), readDeadlineMs: 60_000 })
+    servers.push(server); await server.start()
+    const lease = await openReadiness(socketPath, server.ownerBinding!)
+    expect(await server.hasActiveLease()).toBe(true)
+    const leaseClosed = new Promise<void>(resolve => lease.socket.once('close', () => resolve()))
+    lease.socket.end()
+    for (let attempt = 0; attempt < 250 && await server.hasActiveLease(); attempt += 1) await Bun.sleep(2)
+    expect(await server.hasActiveLease()).toBe(false)
+    await withinMs(leaseClosed, 1_000)
+    expect(await exchange(socketPath, `${JSON.stringify({ operation: 'control_state' })}\n`)).toBe('')
+  })
+
+  test('closes a half-closed connection that sent no complete frame without waiting for the read deadline', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'hosted-server-half-closed-')); roots.push(root)
+    const socketPath = join(root, 'private', 'control.sock'); const secret = Buffer.alloc(32, 9); const unsigned = hostedControlGoldenRequestFixture()
+    const { socketIdentity: _, ...ownerIdentity } = unsigned.ownerBinding
+    let dispatched = 0
+    const server = new HostedControlServer({ socketPath, secret, ownerIdentity, authority: unsigned.authority, service: { mutate: async () => ({ kind: 'unavailable' as const }) }, dispatchCoexistingOperation: async () => { dispatched += 1; return null }, readDeadlineMs: 60_000 })
+    servers.push(server); await server.start()
+    for (const bytes of ['', '{"operation":"control_state"', '{not json\n']) {
+      const socket = connect({ path: socketPath, allowHalfOpen: true }); let output = ''
+      socket.setEncoding('utf8'); socket.on('data', chunk => { output += chunk })
+      const closed = new Promise<void>(resolve => socket.once('close', () => resolve()))
+      socket.once('connect', () => socket.end(bytes))
+      await withinMs(closed, 1_000)
+      expect(output).toBe('')
+    }
+    expect(dispatched).toBe(0)
+  })
+
   test('does not sign a committed task result substituted by the injected mutation port', async () => {
     const root = await mkdtemp('/tmp/hc-task-correlation-'); roots.push(root)
     const socketPath = join(root, 'private', 'control.sock')
@@ -1177,6 +1211,10 @@ async function waitFor(predicate: () => boolean): Promise<void> {
     await Bun.sleep(2)
   }
   throw new Error('condition was not reached')
+}
+
+function withinMs(promise: Promise<void>, ms: number): Promise<void> {
+  return Promise.race([promise, new Promise<void>((_, reject) => setTimeout(() => reject(new Error(`not settled within ${ms}ms`)), ms))])
 }
 
 function openReadiness(socketPath: string, ownerBinding: NonNullable<HostedControlServer['ownerBinding']>): Promise<{ socket: ReturnType<typeof connect>; line: string }> {
