@@ -319,9 +319,14 @@ export class HostedOpenCodeSupervisorRpcServer {
         case 'sessionAction': result = await this.options.sessionAction?.(command.payload as RootOpenCodeAction); break
       }
       if (result === undefined) throw new Error('hosted-supervisor-operation-unavailable')
-      const response = { schemaVersion: VERSION, challenge, nonce: command.nonce, operation: command.operation,
+      let response = { schemaVersion: VERSION, challenge, nonce: command.nonce, operation: command.operation,
         ok: true, result }
-      socket.end(frame({ ...response, proof: proof(this.options.secret, 'response', response) }))
+      let signed = { ...response, proof: proof(this.options.secret, 'response', response) }
+      if (command.operation === 'sessionAction' && Buffer.byteLength(JSON.stringify(signed)) > MAX_FRAME) {
+        response = { ...response, result: { outcome: 'unavailable', reason: 'rpc-frame-too-large' } }
+        signed = { ...response, proof: proof(this.options.secret, 'response', response) }
+      }
+      socket.end(frame(signed))
     } catch { socket.destroy() }
   }
 }

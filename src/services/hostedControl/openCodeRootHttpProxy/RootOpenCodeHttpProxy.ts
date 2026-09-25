@@ -14,6 +14,8 @@ const MESSAGE = /^msg[A-Za-z0-9_-]{8,120}$/
 const SHA = /^[0-9a-f]{64}$/
 const SOURCE = /^(?:task|message)_[a-z0-9_-]{8,95}$/
 const MAX_TEXT = 64 * 1024
+// Leaves room for the signed supervisor RPC envelope, including its two nonces and HMAC.
+const MAX_RPC_RESULT_JSON_BYTES = 3000
 
 export type RootOpenCodeActionKind = 'session_create' | 'initial_prompt' | 'session_observe' |
   'task_delivery' | 'peer_delivery' | 'delivery_observe' | 'reply_observe'
@@ -97,8 +99,8 @@ export function validateRootOpenCodeAction(value: unknown): RootOpenCodeAction {
   const kind = value.kind
   const delivery = kind === 'task_delivery' || kind === 'peer_delivery' ||
     kind === 'delivery_observe' || kind === 'reply_observe'
-  if (!['session_create', 'initial_prompt', 'session_observe', 'task_delivery',
-    'peer_delivery', 'delivery_observe', 'reply_observe'].includes(String(kind)) ||
+  if (typeof kind !== 'string' || !['session_create', 'initial_prompt', 'session_observe', 'task_delivery',
+    'peer_delivery', 'delivery_observe', 'reply_observe'].includes(kind) ||
     typeof value.operationId !== 'string' || !ID.test(value.operationId) ||
     typeof value.runId !== 'string' || !RUN.test(value.runId) ||
     typeof value.memberId !== 'string' || !MEMBER.test(value.memberId) ||
@@ -135,25 +137,29 @@ function route(action: RootOpenCodeAction, canonical: RootOpenCodeCanonicalActio
     if (canonical.text !== null) throw new Error('root-opencode-canonical-action-invalid')
     path = session === null && message === null
       ? `/session?search=${encodeURIComponent(title)}&limit=101`
-      : SESSION.test(String(session)) && MESSAGE.test(String(message))
+      : typeof session === 'string' && SESSION.test(session) &&
+        typeof message === 'string' && MESSAGE.test(message)
         ? `/session/${session}/message/${message}`
         : (() => { throw new Error('root-opencode-canonical-action-invalid') })()
   } else if (action.kind === 'reply_observe') {
-    if (!SESSION.test(String(session)) || !MESSAGE.test(String(message)) ||
+    if (typeof session !== 'string' || !SESSION.test(session) ||
+      typeof message !== 'string' || !MESSAGE.test(message) ||
       typeof canonical.text !== 'string' || !canonical.text.trim() ||
       Buffer.byteLength(canonical.text) > MAX_TEXT) {
       throw new Error('root-opencode-canonical-action-invalid')
     }
     path = `/session/${session}/message?limit=100`
   } else if (action.kind === 'delivery_observe') {
-    if (!SESSION.test(String(session)) || !MESSAGE.test(String(message)) ||
+    if (typeof session !== 'string' || !SESSION.test(session) ||
+      typeof message !== 'string' || !MESSAGE.test(message) ||
       typeof canonical.text !== 'string' || !canonical.text.trim() ||
       Buffer.byteLength(canonical.text) > MAX_TEXT) {
       throw new Error('root-opencode-canonical-action-invalid')
     }
     path = `/session/${session}/message/${message}`
   } else {
-    if (!SESSION.test(String(session)) || !MESSAGE.test(String(message)) ||
+    if (typeof session !== 'string' || !SESSION.test(session) ||
+      typeof message !== 'string' || !MESSAGE.test(message) ||
       typeof canonical.text !== 'string' || !canonical.text.trim() ||
       Buffer.byteLength(canonical.text) > MAX_TEXT ||
       (action.kind === 'initial_prompt' && sha(canonical.text) !== canonical.promptSha256)) {
@@ -201,7 +207,8 @@ function typedResult(action: RootOpenCodeAction, canonical: RootOpenCodeCanonica
       return { outcome: 'uncertain', reason: 'session-create-invalid' }
     }
     const created = body as Record<string, unknown>
-    return SESSION.test(String(created.id)) && created.title === `hosted-member-attempt:${action.attemptId}`
+    return typeof created.id === 'string' && SESSION.test(created.id) &&
+      created.title === `hosted-member-attempt:${action.attemptId}`
       ? { outcome: 'responded', kind: action.kind, sessionId: created.id as string }
       : { outcome: 'uncertain', reason: 'session-create-invalid' }
   }
@@ -213,9 +220,13 @@ function typedResult(action: RootOpenCodeAction, canonical: RootOpenCodeCanonica
   if (action.kind === 'session_observe') {
     if (sessionId === null && messageId === null) {
       if (!Array.isArray(body) || body.length > 100) return { outcome: 'uncertain', reason: 'session-list-invalid' }
-      const matches = body.filter(item => !!item && typeof item === 'object' && !Array.isArray(item) &&
-        (item as Record<string, unknown>).title === `hosted-member-attempt:${action.attemptId}` &&
-        SESSION.test(String((item as Record<string, unknown>).id)))
+      const titled = body.filter(item => !!item && typeof item === 'object' && !Array.isArray(item) &&
+        (item as Record<string, unknown>).title === `hosted-member-attempt:${action.attemptId}`)
+      if (titled.some(item => typeof (item as Record<string, unknown>).id !== 'string' ||
+        !SESSION.test((item as { id: string }).id))) {
+        return { outcome: 'uncertain', reason: 'session-list-invalid' }
+      }
+      const matches = titled
       if (matches.length > 1) return { outcome: 'unavailable', reason: 'session-ambiguous' }
       return { outcome: 'responded', kind: action.kind,
         sessionId: matches.length ? (matches[0] as { id: string }).id : null,
@@ -241,7 +252,8 @@ function typedResult(action: RootOpenCodeAction, canonical: RootOpenCodeCanonica
   }
   const candidates = body.map(message).filter((item): item is NonNullable<typeof item> => !!item &&
     item.info.role === 'assistant' && item.info.sessionID === sessionId &&
-    item.info.parentID === messageId && MESSAGE.test(String(item.info.id)) &&
+    item.info.parentID === messageId && typeof item.info.id === 'string' &&
+    MESSAGE.test(item.info.id) &&
     typeof item.info.finish === 'string' && !['tool-calls', 'unknown', 'content-filter']
       .includes(item.info.finish) && !item.info.error &&
     !!item.info.time && typeof item.info.time === 'object' &&
@@ -317,7 +329,9 @@ export class RootOpenCodeHttpProxy {
       if (Buffer.byteLength(JSON.stringify(response.body ?? null)) > 96 * 1024) {
         return { outcome: 'uncertain', reason: 'invalid-response' }
       }
-      return typedResult(action, expected.canonical, response.statusCode, response.body)
+      const receipt = typedResult(action, expected.canonical, response.statusCode, response.body)
+      return Buffer.byteLength(JSON.stringify(receipt)) <= MAX_RPC_RESULT_JSON_BYTES
+        ? receipt : { outcome: 'unavailable', reason: 'reply-too-large-for-rpc' }
     } catch {
       return { outcome: 'uncertain', reason: 'dispatch-failed' }
     } finally { await connection.close() }

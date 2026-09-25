@@ -31,6 +31,37 @@ test('typed session RPC refuses HTTP fields before opening the socket', async ()
     .rejects.toThrow('command-invalid')
 })
 
+test('Linux session RPC returns a signed bounded failure for an oversized escaped receipt', async () => {
+  if (process.platform !== 'linux') return
+  const root = await realpath(await mkdtemp('/tmp/hosted-session-rpc-'))
+  await chmod(root, 0o700)
+  const socketPath = path.join(root, 's.sock')
+  const secret = Buffer.alloc(32, 6)
+  const server = new HostedOpenCodeSupervisorRpcServer({ socketPath, secret, ownerGid: process.getgid!(),
+    testOnlyAllowNonRoot: true,
+    supervisor: { observe: async () => ({}) } as unknown as Pick<HostedOpenCodeContainerSupervisor,
+      'prepareMember' | 'startPrepared' | 'start' | 'lookupStart' | 'observe' | 'stop' | 'reconcile' |
+      'beginEndpointUse' | 'endEndpointUse'>,
+    sessionAction: async () => ({ outcome: 'responded', kind: 'reply_observe', reply: {
+      assistantMessageId: `msg${'a'.repeat(12)}`, parentUserMessageId: `msg${'b'.repeat(12)}`,
+      text: '\\'.repeat(2048),
+    } }),
+  })
+  try {
+    await server.start()
+    const client = new HostedOpenCodeSupervisorRpcClient({ socketPath, secret,
+      ownerGid: process.getgid!(), testOnlyAllowNonRoot: true })
+    expect(await client.sessionAction({ operationId: 'action_12345678', kind: 'reply_observe',
+      runId: `run_${'a'.repeat(32)}`, memberId: `member_${'b'.repeat(32)}`,
+      attemptId: `member_attempt_${'c'.repeat(64)}`,
+      containerHandle: `opencode_${'d'.repeat(32)}`, containerGeneration: 'e'.repeat(32),
+      sourceRef: 'message_12345678' })).toEqual({ outcome: 'unavailable', reason: 'rpc-frame-too-large' })
+  } finally {
+    await server.close().catch(() => undefined)
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 function packet(value: object): Buffer {
   const bytes = Buffer.from(JSON.stringify(value))
   const output = Buffer.alloc(bytes.length + 4)

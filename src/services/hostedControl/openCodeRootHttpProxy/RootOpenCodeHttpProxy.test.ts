@@ -142,6 +142,19 @@ test('large OpenCode list is reduced to a bounded typed session receipt', async 
   expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThan(512)
 })
 
+test('nested array IDs from OpenCode are rejected before casting to typed receipts', async () => {
+  const f = fixture()
+  let nested: unknown = `ses${'f'.repeat(12)}`
+  for (let index = 0; index < 2000; index++) nested = [nested]
+  f.setResponse({ statusCode: 201, body: { id: nested,
+    title: `hosted-member-attempt:${action.attemptId}` } })
+  expect(await f.proxy.dispatch(action)).toEqual({ outcome: 'uncertain', reason: 'session-create-invalid' })
+  const observed = { ...action, kind: 'session_observe' as const }
+  f.setResponse({ statusCode: 200, body: [{ id: nested,
+    title: `hosted-member-attempt:${action.attemptId}` }] })
+  expect(await f.proxy.dispatch(observed)).toEqual({ outcome: 'uncertain', reason: 'session-list-invalid' })
+})
+
 test('oversized assistant reply returns a bounded unavailable receipt instead of breaking RPC framing', async () => {
   const f = fixture()
   const sessionId = `ses${'1'.repeat(12)}`
@@ -171,4 +184,16 @@ test('oversized assistant reply returns a bounded unavailable receipt instead of
   const signedEnvelope = { schemaVersion: 1, challenge: 'a'.repeat(64), nonce: 'b'.repeat(64),
     operation: 'sessionAction', ok: true, result: bounded, proof: 'c'.repeat(64) }
   expect(Buffer.byteLength(JSON.stringify(signedEnvelope))).toBeLessThan(4096)
+  for (const escaped of ['\\'.repeat(2048), '"'.repeat(2048), '\u0000'.repeat(2048)]) {
+    f.setResponse({ statusCode: 200, body: [
+      { info: { role: 'user', sessionID: sessionId, id: messageId },
+        parts: [{ type: 'text', text: 'canonical delivery' }] },
+      { info: { role: 'assistant', sessionID: sessionId, id: `msg${'3'.repeat(12)}`,
+        parentID: messageId, finish: 'stop', time: { completed: 123 } },
+        parts: [{ type: 'text', text: escaped }] },
+    ] })
+    const escapedResult = await f.proxy.dispatch(delivery)
+    expect(escapedResult).toEqual({ outcome: 'unavailable', reason: 'reply-too-large-for-rpc' })
+    expect(Buffer.byteLength(JSON.stringify({ ...signedEnvelope, result: escapedResult }))).toBeLessThan(4096)
+  }
 })
