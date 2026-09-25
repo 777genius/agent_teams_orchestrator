@@ -90,6 +90,12 @@ export function createHostedControlPortFactory(
       'team-lifecycle-owner',
       {
         requireRunReservation: true,
+        // One redacted JSON line per lane failure; the launcher captures owner stderr.
+        reportLaneFailure: report => {
+          process.stderr.write(`${JSON.stringify({
+            kind: 'hosted-lifecycle-lane-failure', teamId: context.authority.teamId, ...report,
+          })}\n`)
+        },
         runReservation: async (binding, signal, input) => {
           const receipt = input.runReservation
           if (signal.aborted || !receipt || !input.reservationPlanGeneration ||

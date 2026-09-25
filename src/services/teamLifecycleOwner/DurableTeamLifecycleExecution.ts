@@ -15,6 +15,12 @@ import type {
   TeamLifecycleLaneEffectPort,
   TeamLifecycleLaneObservation,
 } from './OpenCodeTeamLifecycleLane.js'
+import {
+  decodeLaneFailure,
+  laneFailureFromError,
+  type TeamLifecycleLaneFailure,
+  type TeamLifecycleLaneFailureReport,
+} from './TeamLifecycleLaneFailure.js'
 
 type DurableState = {
   schemaVersion: 2
@@ -24,6 +30,8 @@ type DurableState = {
   phase: HostedLifecycleProviderSnapshot['phase']
   runId: string | null
   recoverable: boolean
+  /** Present only with phase `failed` when a lane effect caused it. */
+  failure?: TeamLifecycleLaneFailure
 }
 
 type LaneInput = {
@@ -57,6 +65,8 @@ export type DurableTeamLifecycleExecutionOptions = {
   /** Hosted composition can require the port before accepting any launch. */
   requireRunReservation?: boolean
   reservationTimeoutMs?: number
+  /** Operator diagnostics for a lane failure; the durable state carries the same reason. */
+  reportLaneFailure?: (report: TeamLifecycleLaneFailureReport) => void
 }
 
 /**
@@ -116,9 +126,16 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
         // Stop completion is only authoritative while its local job is still owned.
         state = await this.#write({ ...state, phase: 'failed', recoverable: true }, plan)
       } else if (state.phase === 'running' && state.runId) {
-        const observations = await this.#inspectLanes(plan, state.runId)
+        const runId = state.runId
+        const observations = await this.#inspectLanes(plan, runId).catch((error: unknown) => {
+          // A failed inspect leaves the durable phase unchanged; only report why.
+          this.#reportLaneFailure(laneFailureFromError('inspect', error), runId, plan)
+          throw error
+        })
         if (observations.some(observation => observation.phase === 'failed' || observation.phase === 'idle')) {
-          state = await this.#write({ ...state, phase: 'failed', recoverable: true }, plan)
+          const failure = reportedFailure('inspect', observations)
+          state = await this.#write({ ...state, phase: 'failed', recoverable: true, failure }, plan)
+          this.#reportLaneFailure(failure, runId, plan)
         }
       }
       return snapshot(this.providerId, state)
@@ -286,16 +303,22 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
         const current = await this.#read(plan)
         if (current.phase !== 'running' || !current.runId || !this.#ownedRuns.has(current.runId)) return
         let stopped = false
+        let failure: TeamLifecycleLaneFailure | undefined
         try {
           stopped = (await this.#applyLanesForTeardown(plan, current.runId))
             .every(observation => observation.phase === 'idle')
-        } catch {}
+          if (!stopped) failure = stopNotConfirmed('teardown')
+        } catch (error) {
+          failure = laneFailureFromError('teardown', error)
+        }
         await this.#write({
           ...current,
           phase: stopped ? 'idle' : 'failed',
           runId: stopped ? null : current.runId,
           recoverable: !stopped,
+          ...(failure ? { failure } : {}),
         }, plan)
+        if (failure) this.#reportLaneFailure(failure, current.runId, plan)
         if (stopped) this.#ownedRuns.delete(current.runId)
       })
     }
@@ -303,10 +326,12 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
 
   async #completeLaunch(plan: TeamLifecycleLaunchPlan, runId: string, effectGuard: EffectGuard): Promise<void> {
     let observations: TeamLifecycleLaneObservation[]
+    let failure: TeamLifecycleLaneFailure | undefined
     try {
       observations = await this.#applyLanes(plan, runId, 'launch', effectGuard)
-    } catch {
+    } catch (error) {
       observations = [{ phase: 'failed', recoverable: true }]
+      failure = laneFailureFromError('launch', error)
     }
     await this.#serialized(async () => {
       const current = await this.#read(plan)
@@ -317,20 +342,27 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
       }
       const next = launchCompletion(observations)
       if (next.phase === 'launching') return
+      const reason = next.phase === 'failed' ? failure ?? reportedFailure('launch', observations) : undefined
       await this.#write({
         ...current,
         phase: next.phase,
         recoverable: next.recoverable,
+        ...(reason ? { failure: reason } : {}),
       }, plan)
+      if (reason) this.#reportLaneFailure(reason, runId, plan)
     })
   }
 
   async #completeStop(plan: TeamLifecycleLaunchPlan, runId: string, effectGuard: EffectGuard): Promise<void> {
     let stopped = false
+    let failure: TeamLifecycleLaneFailure | undefined
     try {
       stopped = (await this.#applyLanes(plan, runId, 'stop', effectGuard))
         .every(observation => observation.phase === 'idle')
-    } catch {}
+      if (!stopped) failure = stopNotConfirmed('stop')
+    } catch (error) {
+      failure = laneFailureFromError('stop', error)
+    }
     await this.#serialized(async () => {
       const current = await this.#read(plan)
       if (current.runId !== runId || current.phase !== 'stopping') return
@@ -339,21 +371,36 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
         phase: stopped ? 'idle' : 'failed',
         runId: stopped ? null : runId,
         recoverable: !stopped,
+        ...(failure ? { failure } : {}),
       }, plan)
+      if (failure) this.#reportLaneFailure(failure, runId, plan)
       if (stopped) this.#ownedRuns.delete(runId)
     })
   }
 
   async #reconcileLaunching(plan: TeamLifecycleLaunchPlan, state: DurableState): Promise<DurableState> {
     let observations: TeamLifecycleLaneObservation[]
+    let failure: TeamLifecycleLaneFailure | undefined
     try {
       observations = await this.#inspectLanes(plan, state.runId!)
-    } catch {
+    } catch (error) {
       observations = [{ phase: 'failed', recoverable: true }]
+      failure = laneFailureFromError('inspect', error)
     }
     const next = launchCompletion(observations)
     if (next.phase === 'launching') return state
-    return this.#write({ ...state, phase: next.phase, recoverable: next.recoverable }, plan)
+    const reason = next.phase === 'failed' ? failure ?? reportedFailure('inspect', observations) : undefined
+    const written = await this.#write({
+      ...state, phase: next.phase, recoverable: next.recoverable, ...(reason ? { failure: reason } : {}),
+    }, plan)
+    if (reason) this.#reportLaneFailure(reason, state.runId!, plan)
+    return written
+  }
+
+  #reportLaneFailure(failure: TeamLifecycleLaneFailure, runId: string, plan: TeamLifecycleLaunchPlan): void {
+    try {
+      this.options.reportLaneFailure?.({ ...failure, runId, laneKinds: plan.lanes.map(lane => lane.kind) })
+    } catch { /* diagnostics never change lifecycle state */ }
   }
 
   #trackJob(runId: string, operation: Promise<void>): void {
@@ -501,8 +548,11 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
   }
 
   async #write(input: DurableState, plan: TeamLifecycleLaunchPlan): Promise<DurableState> {
+    // A failure reason describes the current failed phase only; any other transition drops it.
+    const { failure, ...rest } = input
     const state: DurableState = {
-      ...input,
+      ...rest,
+      ...(rest.phase === 'failed' && failure ? { failure } : {}),
       schemaVersion: 2,
       toolApprovalMode: plan.toolApprovalMode,
       revision: input.revision + 1,
@@ -532,6 +582,18 @@ function initialState(plan: TeamLifecycleLaunchPlan): DurableState {
     runId: null,
     recoverable: false,
   }
+}
+
+function stopNotConfirmed(action: 'stop' | 'teardown'): TeamLifecycleLaneFailure {
+  return { action, code: 'stop_not_confirmed', message: 'A lane did not confirm the run stopped' }
+}
+
+function reportedFailure(
+  action: 'launch' | 'inspect',
+  observations: readonly TeamLifecycleLaneObservation[],
+): TeamLifecycleLaneFailure {
+  const phase = observations.some(observation => observation.phase === 'failed') ? 'failed' : 'idle'
+  return { action, code: `lane_reported_${phase}`, message: `A lane reported ${phase} for the run` }
 }
 
 function launchCompletion(
@@ -569,8 +631,10 @@ function planFingerprint(plan: TeamLifecycleLaunchPlan): string {
 function decodeState(value: unknown): DurableState {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid team lifecycle state')
   const record = value as Record<string, unknown>
-  const keys = ['schemaVersion', 'revision', 'planFingerprint', 'toolApprovalMode', 'phase', 'runId', 'recoverable']
+  const keys = ['schemaVersion', 'revision', 'planFingerprint', 'toolApprovalMode', 'phase', 'runId', 'recoverable',
+    ...(Object.hasOwn(record, 'failure') ? ['failure'] : [])]
   if (Object.keys(record).length !== keys.length || Object.keys(record).some(key => !keys.includes(key)) ||
+    (record.failure !== undefined && record.phase !== 'failed') ||
     record.schemaVersion !== 2 || !Number.isSafeInteger(record.revision) || (record.revision as number) < 0 ||
     typeof record.planFingerprint !== 'string' || !/^[0-9a-f]{64}$/.test(record.planFingerprint) ||
     !['idle', 'launching', 'running', 'stopping', 'failed'].includes(String(record.phase)) ||
@@ -580,5 +644,6 @@ function decodeState(value: unknown): DurableState {
   if (record.phase === 'idle' ? record.runId !== null : record.runId === null) {
     throw new Error('Invalid team lifecycle state/run binding')
   }
+  if (record.failure !== undefined) decodeLaneFailure(record.failure)
   return record as DurableState
 }

@@ -309,6 +309,41 @@ describe('DurableTeamLifecycleExecution', () => {
     expect(lane.actions).toEqual(['launch', 'recover'])
   })
 
+  test('records and reports why a lane launch threw, redacted, and drops the reason on recovery', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'team-owner-failure-reason-'))
+    roots.push(root)
+    const statePath = join(root, 'state.json')
+    const lane = new FakeLane()
+    lane.launch = async () => {
+      throw new Error('OpenCode strict launch expectedBehaviorFingerprint must be lowercase SHA-256 token=abc123secret')
+    }
+    const reports: unknown[] = []
+    const execution = new DurableTeamLifecycleExecution(statePath, [lane], 'team-lifecycle-owner', {
+      reportLaneFailure: report => reports.push(report),
+    })
+    const idle = await execution.inspect(plan)
+    const launching = await execution.launch({
+      plan, commandId: 'command-launch', runId: null,
+      expectedProviderGeneration: idle.providerGeneration,
+    })
+    const failed = await waitForPhase(execution, 'failed')
+    const failure = {
+      action: 'launch', code: 'lane_exception',
+      message: 'OpenCode strict launch expectedBehaviorFingerprint must be lowercase SHA-256 token=[redacted]',
+    }
+    expect(JSON.parse(await readFile(statePath, 'utf8')).failure).toEqual(failure)
+    expect(reports).toEqual([{ ...failure, runId: launching.runId, laneKinds: ['opencode'] }])
+
+    // A restarted owner reads the reason back; a confirmed recovery clears it.
+    const restarted = new DurableTeamLifecycleExecution(statePath, [lane])
+    expect((await restarted.inspect(plan)).phase).toBe('failed')
+    await restarted.recover({
+      plan, commandId: 'command-recover', runId: launching.runId,
+      expectedProviderGeneration: failed.providerGeneration,
+    })
+    expect(JSON.parse(await readFile(statePath, 'utf8'))).not.toHaveProperty('failure')
+  })
+
   test('keeps an asynchronously admitted launch durable until inspect confirms running', async () => {
     const root = await mkdtemp(join(tmpdir(), 'team-owner-async-launch-'))
     roots.push(root)
