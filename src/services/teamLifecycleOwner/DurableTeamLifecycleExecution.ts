@@ -67,6 +67,11 @@ export type DurableTeamLifecycleExecutionOptions = {
   reservationTimeoutMs?: number
   /** Operator diagnostics for a lane failure; the durable state carries the same reason. */
   reportLaneFailure?: (report: TeamLifecycleLaneFailureReport) => void
+  /**
+   * The admitted plan, so shutdown can stop a run recorded by an earlier process even when this
+   * process never inspected it. Null when no plan is admitted.
+   */
+  loadAdmittedPlan?: () => Promise<TeamLifecycleLaunchPlan | null>
 }
 
 /**
@@ -287,7 +292,11 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
     }
   }
 
-  /** Drains admitted work, then compensates every exact run owned by this process. */
+  /**
+   * Drains admitted work, then stops every running run recorded in this state file. The state file
+   * sits under the team root this process exclusively leases, so a run left by a crashed earlier
+   * owner and adopted here (its detached host survives) is this process's to stop as well.
+   */
   shutdown(): Promise<void> {
     this.#shutdownPromise ??= this.#shutdown()
     return this.#shutdownPromise
@@ -295,13 +304,16 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
 
   async #shutdown(): Promise<void> {
     await this.close()
+    const admitted = await this.options.loadAdmittedPlan?.().catch(() => null)
+    if (admitted) this.#rememberPlan(admitted)
     // Runtime authority loss is a teardown boundary, not a new commanded
-    // effect. Stop only runs durably owned by this process, using their exact
-    // plan/run tuple, before allowing the hosted runtime to finish closing.
+    // effect. Stop each recorded running run with its exact plan/run tuple
+    // before allowing the hosted runtime to finish closing.
     for (const plan of this.#knownPlans.values()) {
       await this.#serialized(async () => {
-        const current = await this.#read(plan)
-        if (current.phase !== 'running' || !current.runId || !this.#ownedRuns.has(current.runId)) return
+        // A superseded remembered plan must not abort teardown of the current one.
+        const current = await this.#read(plan).catch(() => null)
+        if (current?.phase !== 'running' || !current.runId) return
         let stopped = false
         let failure: TeamLifecycleLaneFailure | undefined
         try {

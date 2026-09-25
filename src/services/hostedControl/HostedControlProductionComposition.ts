@@ -91,6 +91,10 @@ export function createHostedControlPortFactory(
       'team-lifecycle-owner',
       {
         requireRunReservation: true,
+        loadAdmittedPlan: async () => (await planStore.load({
+          workspaceId: context.authority.workspaceId,
+          teamId: context.authority.teamId,
+        }))?.plan ?? null,
         // One redacted JSON line per lane failure; the launcher captures owner stderr.
         reportLaneFailure: report => {
           process.stderr.write(`${JSON.stringify({

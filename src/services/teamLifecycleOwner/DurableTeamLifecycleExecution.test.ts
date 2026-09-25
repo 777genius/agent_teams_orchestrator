@@ -478,6 +478,46 @@ describe('DurableTeamLifecycleExecution', () => {
     await expect(execution.inspect(plan)).resolves.toMatchObject({ phase: 'idle', runId: null })
   })
 
+  test('shutdown stops a run adopted from a crashed owner, inspected or not', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'team-owner-adopted-shutdown-'))
+    roots.push(root)
+    const statePath = join(root, 'state.json')
+    const lane = new FakeLane()
+    const crashed = new DurableTeamLifecycleExecution(statePath, [lane])
+    const idle = await crashed.inspect(plan)
+    await crashed.launch({
+      plan, commandId: 'command-launch', runId: null,
+      expectedProviderGeneration: idle.providerGeneration,
+    })
+    const running = await waitForPhase(crashed, 'running')
+    // close() without shutdown leaves the run recorded, as a crash does; its detached host lives on.
+    await crashed.close()
+
+    // The next owner adopts the run on its first inspect, then shuts down gracefully.
+    const adopting = new DurableTeamLifecycleExecution(statePath, [lane])
+    await expect(adopting.inspect(plan)).resolves.toMatchObject({ phase: 'running', runId: running.runId })
+    await adopting.shutdown()
+    expect(lane.stoppedRunIds).toEqual([running.runId])
+    await expect(new DurableTeamLifecycleExecution(statePath, [lane]).inspect(plan))
+      .resolves.toMatchObject({ phase: 'idle', runId: null })
+
+    // An owner that never inspected the run still stops it through the admitted plan.
+    const relaunching = new DurableTeamLifecycleExecution(statePath, [lane])
+    const relaunched = await relaunching.launch({
+      plan, commandId: 'command-relaunch', runId: null,
+      expectedProviderGeneration: (await relaunching.inspect(plan)).providerGeneration,
+    })
+    await waitForPhase(relaunching, 'running')
+    await relaunching.close()
+    const unaware = new DurableTeamLifecycleExecution(statePath, [lane], 'team-lifecycle-owner', {
+      loadAdmittedPlan: async () => plan,
+    })
+    await unaware.shutdown()
+    expect(lane.stoppedRunIds).toEqual([running.runId, relaunched.runId])
+    await expect(new DurableTeamLifecycleExecution(statePath, [lane]).inspect(plan))
+      .resolves.toMatchObject({ phase: 'idle', runId: null })
+  })
+
   test('keeps an in-process launch authoritative until its effect job commits', async () => {
     const root = await mkdtemp(join(tmpdir(), 'team-owner-inflight-'))
     roots.push(root)
