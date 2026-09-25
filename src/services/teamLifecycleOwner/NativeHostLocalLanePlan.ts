@@ -14,7 +14,6 @@ type NativeLane = Extract<TeamLifecycleLaunchLane, { kind: 'native' }>
 
 export type NativeHostLocalLaneErrorCode =
   | 'native_lane_mixed_with_opencode'
-  | 'native_lane_multiple_lanes'
   | 'native_lane_lead_missing'
   | 'native_lane_member_name_invalid'
   | 'native_lane_too_many_members'
@@ -60,11 +59,18 @@ export type NativeHostLocalCredentials =
   | Readonly<{ provider: 'anthropic'; oauthToken: string }>
   | Readonly<{ provider: 'codex'; codexHome: string; codexCliPath: string }>
 
+export type NativeHostLocalTeammate = TeamLifecycleLaunchMember & Readonly<{ provider: NativeHostLocalProvider }>
+
+/**
+ * One native team, possibly spread over one lane per provider. The lane with
+ * team-lead launches the lead; every other native lane only contributes members.
+ */
 export type NativeHostLocalLaunchShape = Readonly<{
-  lane: NativeLane
-  provider: NativeHostLocalProvider
+  leadLane: NativeLane
+  leadProvider: NativeHostLocalProvider
+  providers: ReadonlySet<NativeHostLocalProvider>
   lead: TeamLifecycleLaunchMember
-  teammates: readonly TeamLifecycleLaunchMember[]
+  teammates: readonly NativeHostLocalTeammate[]
 }>
 
 type NativeLaneClassifyOptions = {
@@ -73,36 +79,43 @@ type NativeLaneClassifyOptions = {
   platform?: NodeJS.Platform
 }
 
-/**
- * MVP topology: one native lane of one provider with team-lead inside it.
- * Mixed native+OpenCode and multi-provider native teams are typed rejections,
- * not silent partial launches. Per-member providers are the next slice.
- */
 export function classifyNativeHostLocalPlan(
   plan: TeamLifecycleLaunchPlan,
   options: NativeLaneClassifyOptions,
 ): NativeHostLocalLaunchShape | NativeHostLocalLaneErrorCode {
-  const native = plan.lanes.filter((lane): lane is NativeLane => lane.kind === 'native')
-  if (native.length === 0) return 'native_lane_lead_missing'
-  if (native.length !== plan.lanes.length) return 'native_lane_mixed_with_opencode'
-  if (native.length !== 1) return 'native_lane_multiple_lanes'
-  return classifyNativeHostLocalLane(native[0]!, plan.toolApprovalMode, options)
+  return classifyNativeHostLocalLanes(plan.lanes, plan.toolApprovalMode, options)
 }
 
-export function classifyNativeHostLocalLane(
-  lane: TeamLifecycleLaunchLane,
+/**
+ * Desktop parity for native teams: a Claude or Codex lead with members of
+ * either provider, spawned by the lead from one bootstrap (desktop
+ * `primary_only`). Mixed native+OpenCode teams are still a typed rejection.
+ */
+export function classifyNativeHostLocalLanes(
+  lanes: readonly TeamLifecycleLaunchLane[],
   toolApprovalMode: TeamLifecycleLaunchPlan['toolApprovalMode'],
   options: NativeLaneClassifyOptions,
 ): NativeHostLocalLaunchShape | NativeHostLocalLaneErrorCode {
   if (!isNativeHostLocalPlatform(options.platform)) return 'native_lane_platform_unsupported'
-  if (lane.kind !== 'native') return 'native_lane_mixed_with_opencode'
-  if (lane.provider !== 'anthropic' && lane.provider !== 'codex') return 'native_lane_provider_unsupported'
-  if (!options.configuredProviders.has(lane.provider)) return 'native_lane_provider_not_configured'
+  const native = lanes.filter((lane): lane is NativeLane => lane.kind === 'native')
+  if (native.length === 0) return 'native_lane_lead_missing'
+  if (native.length !== lanes.length) return 'native_lane_mixed_with_opencode'
+  const providers = new Set<NativeHostLocalProvider>()
+  for (const lane of native) {
+    if (lane.provider !== 'anthropic' && lane.provider !== 'codex') return 'native_lane_provider_unsupported'
+    if (!options.configuredProviders.has(lane.provider)) return 'native_lane_provider_not_configured'
+    providers.add(lane.provider)
+  }
   if (toolApprovalMode !== 'auto') return 'native_lane_manual_approval_unsupported'
   if (sanitizeName(options.teamName) !== options.teamName) return 'native_lane_team_name_not_canonical'
-  const lead = lane.members.find(member => member.name === TEAM_LEAD_NAME)
-  if (!lead) return 'native_lane_lead_missing'
-  const teammates = lane.members.filter(member => member !== lead)
+  const leadLanes = native.filter(lane => lane.members.some(member => member.name === TEAM_LEAD_NAME))
+  if (leadLanes.length === 0) return 'native_lane_lead_missing'
+  if (leadLanes.length !== 1) return 'native_lane_member_name_invalid'
+  const leadLane = leadLanes[0]!
+  const lead = leadLane.members.find(member => member.name === TEAM_LEAD_NAME)!
+  const teammates = native.flatMap(lane => lane.members
+    .filter(member => member !== lead)
+    .map(member => ({ ...member, provider: lane.provider as NativeHostLocalProvider })))
   if (teammates.length > MAX_BOOTSTRAP_TEAMMATES) return 'native_lane_too_many_members'
   const normalized = new Set<string>()
   for (const member of teammates) {
@@ -113,7 +126,7 @@ export function classifyNativeHostLocalLane(
     }
     normalized.add(key)
   }
-  return { lane, provider: lane.provider, lead, teammates }
+  return { leadLane, leadProvider: leadLane.provider as NativeHostLocalProvider, providers, lead, teammates }
 }
 
 /** Process-group ownership primitives exist only on Linux and macOS. */
@@ -152,7 +165,7 @@ export function buildNativeBootstrapSpec(input: {
       name: member.name,
       workflow: member.prompt,
       cwd: input.workspaceRoot,
-      provider: input.shape.provider,
+      provider: member.provider,
       ...(member.model ? { model: member.model } : {}),
       ...(member.effort ? { effort: member.effort } : {}),
     })),
@@ -209,13 +222,16 @@ export function buildNativeLeadArgs(input: {
 
 /**
  * Builds the complete lead env from an empty base. Process teammates inherit
- * this env, so the provider credential reaches them without touching CLAUDE_DIR,
- * which is shared with the internet-facing Product container.
+ * this env, so every provider credential of the team reaches the teammate that
+ * needs it without touching CLAUDE_DIR, which is shared with the Product
+ * container. Like desktop, a non-Anthropic lead still carries the Anthropic
+ * connection mode as inert metadata for Claude teammates it spawns.
  */
 export function buildNativeLeadEnv(input: {
   hostEnv: NodeJS.ProcessEnv
   claudeRoot: string
-  credentials: NativeHostLocalCredentials
+  leadProvider: NativeHostLocalProvider
+  credentials: readonly NativeHostLocalCredentials[]
 }): Record<string, string> {
   const env: Record<string, string> = {}
   for (const key of NATIVE_LANE_BASE_ENV_ALLOWLIST) {
@@ -227,17 +243,19 @@ export function buildNativeLeadEnv(input: {
     CLAUDE_ENABLE_DETERMINISTIC_TEAM_BOOTSTRAP: '1',
     CLAUDE_TEAM_FORCE_PROCESS_TEAMMATES: '1',
     CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST: '1',
-    CLAUDE_CODE_ENTRY_PROVIDER: input.credentials.provider,
+    CLAUDE_CODE_ENTRY_PROVIDER: input.leadProvider,
     [HOSTED_LEAD_INBOX_POLL_ENV]: '1',
   })
-  if (input.credentials.provider === 'anthropic') {
-    env.CLAUDE_CODE_OAUTH_TOKEN = input.credentials.oauthToken
-    env.AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE = 'subscription'
-  } else {
-    env.CODEX_HOME = input.credentials.codexHome
-    env.CODEX_CLI_PATH = input.credentials.codexCliPath
-    env.CLAUDE_CODE_CODEX_BACKEND = 'codex-native'
-    env.CLAUDE_CODE_CODEX_FORCED_LOGIN_METHOD = 'chatgpt'
+  for (const credentials of input.credentials) {
+    if (credentials.provider === 'anthropic') {
+      env.CLAUDE_CODE_OAUTH_TOKEN = credentials.oauthToken
+      env.AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE = 'subscription'
+    } else {
+      env.CODEX_HOME = credentials.codexHome
+      env.CODEX_CLI_PATH = credentials.codexCliPath
+      env.CLAUDE_CODE_CODEX_BACKEND = 'codex-native'
+      env.CLAUDE_CODE_CODEX_FORCED_LOGIN_METHOD = 'chatgpt'
+    }
   }
   return env
 }

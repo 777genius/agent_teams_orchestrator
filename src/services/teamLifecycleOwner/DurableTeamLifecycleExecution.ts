@@ -39,6 +39,7 @@ type LaneInput = {
   workspaceRoot: string
   toolApprovalMode: TeamLifecycleLaunchPlan['toolApprovalMode']
   lane: TeamLifecycleLaunchPlan['lanes'][number]
+  planLanes: TeamLifecycleLaunchPlan['lanes']
   runId: string
 }
 
@@ -452,6 +453,7 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
         workspaceRoot: plan.workspaceRoot,
         toolApprovalMode: plan.toolApprovalMode,
         lane,
+        planLanes: plan.lanes,
         runId,
       })
     }))
@@ -470,6 +472,7 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
         workspaceRoot: plan.workspaceRoot,
         toolApprovalMode: plan.toolApprovalMode,
         lane,
+        planLanes: plan.lanes,
         runId,
       }
       // No asynchronous boundary may exist between the authority comparison and
@@ -503,6 +506,7 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
       workspaceRoot: plan.workspaceRoot,
       toolApprovalMode: plan.toolApprovalMode,
       lane,
+      planLanes: plan.lanes,
       runId,
     })))
   }

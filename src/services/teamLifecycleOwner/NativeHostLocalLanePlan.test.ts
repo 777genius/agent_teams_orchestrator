@@ -37,7 +37,12 @@ describe('classifyNativeHostLocalPlan', () => {
       laneId: 'lane_claude', kind: 'native', provider: 'anthropic', members: [{ name: 'worker', prompt: 'Work.' }],
     }
     expect(classifyNativeHostLocalPlan(plan([codexLane, openCode]), options)).toBe('native_lane_mixed_with_opencode')
-    expect(classifyNativeHostLocalPlan(plan([codexLane, claudeWorker]), options)).toBe('native_lane_multiple_lanes')
+    expect(classifyNativeHostLocalPlan(plan([codexLane, { ...claudeWorker, members: [
+      { name: 'team-lead', prompt: 'Second lead.' }] }]), options)).toBe('native_lane_member_name_invalid')
+    expect(classifyNativeHostLocalPlan(plan([codexLane, { ...claudeWorker, members: [
+      { name: 'Reviewer', prompt: 'Same name, other lane.' }] }]), options)).toBe('native_lane_member_name_invalid')
+    expect(classifyNativeHostLocalPlan(plan([codexLane, claudeWorker]),
+      { ...options, configuredProviders: new Set(['codex'] as const) })).toBe('native_lane_provider_not_configured')
     expect(classifyNativeHostLocalPlan(plan([{ ...codexLane, provider: 'gemini' }]), options))
       .toBe('native_lane_provider_unsupported')
     expect(classifyNativeHostLocalPlan(plan([codexLane]), { ...options, configuredProviders: new Set(['anthropic'] as const) }))
@@ -55,7 +60,8 @@ describe('classifyNativeHostLocalPlan', () => {
   test('splits the lead from its teammates', () => {
     const shape = classifyNativeHostLocalPlan(plan([codexLane]), options)
     if (typeof shape === 'string') throw new Error(shape)
-    expect(shape.provider).toBe('codex')
+    expect(shape.leadProvider).toBe('codex')
+    expect([...shape.providers]).toEqual(['codex'])
     expect(shape.lead.name).toBe('team-lead')
     expect(shape.teammates.map(member => member.name)).toEqual(['reviewer'])
     const spec = buildNativeBootstrapSpec({
@@ -65,6 +71,52 @@ describe('classifyNativeHostLocalPlan', () => {
       name: 'reviewer', workflow: 'Review changes.', cwd: '/work', provider: 'codex', effort: 'medium',
     }])
     expect(spec.launch).toEqual({ bootstrapTimeoutMs: 120_000, continueOnPartialFailure: true })
+  })
+})
+
+describe('mixed native providers (desktop primary_only)', () => {
+  test('a Codex lead spawns a Claude teammate from one bootstrap and vice versa', () => {
+    const options = { teamName: 'hosted-team', configuredProviders: both, platform: 'linux' as const }
+    const claudeLane: TeamLifecycleLaunchLane = {
+      laneId: 'lane_claude', kind: 'native', provider: 'anthropic',
+      members: [{ name: 'writer', prompt: 'Write docs.', model: 'claude-sonnet-5' }],
+    }
+    const codexLed = classifyNativeHostLocalPlan(plan([claudeLane, codexLane]), options)
+    if (typeof codexLed === 'string') throw new Error(codexLed)
+    expect(codexLed.leadLane.laneId).toBe('lane_codex')
+    expect(codexLed.leadProvider).toBe('codex')
+    expect([...codexLed.providers].sort()).toEqual(['anthropic', 'codex'])
+    expect(buildNativeBootstrapSpec({
+      runId: 'run_1', teamName: 'hosted-team', workspaceRoot: '/work', mode: 'create', shape: codexLed,
+    }).members).toEqual([
+      { name: 'writer', workflow: 'Write docs.', cwd: '/work', provider: 'anthropic', model: 'claude-sonnet-5' },
+      { name: 'reviewer', workflow: 'Review changes.', cwd: '/work', provider: 'codex', effort: 'medium' },
+    ])
+    const claudeLed = classifyNativeHostLocalPlan(plan([
+      { ...claudeLane, members: [{ name: 'team-lead', prompt: 'Lead.' }, ...claudeLane.members] },
+      { ...codexLane, members: codexLane.members.filter(member => member.name !== 'team-lead') },
+    ]), options)
+    if (typeof claudeLed === 'string') throw new Error(claudeLed)
+    expect(claudeLed.leadProvider).toBe('anthropic')
+    expect(claudeLed.teammates.map(member => [member.name, member.provider]))
+      .toEqual([['writer', 'anthropic'], ['reviewer', 'codex']])
+  })
+
+  test('the lead env carries every team provider and routes the lead to its own', () => {
+    const env = buildNativeLeadEnv({
+      hostEnv: { HOME: '/home/op', OPENAI_API_KEY: 'leak' },
+      claudeRoot: '/srv/claude',
+      leadProvider: 'anthropic',
+      credentials: [
+        { provider: 'anthropic', oauthToken: 'operator-token' },
+        { provider: 'codex', codexHome: '/home/op/.codex', codexCliPath: '/opt/codex/bin/codex' },
+      ],
+    })
+    expect(env.CLAUDE_CODE_ENTRY_PROVIDER).toBe('anthropic')
+    expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe('operator-token')
+    expect(env.CODEX_HOME).toBe('/home/op/.codex')
+    expect(env.CLAUDE_CODE_CODEX_FORCED_LOGIN_METHOD).toBe('chatgpt')
+    expect(Object.values(env)).not.toContain('leak')
   })
 })
 
@@ -79,7 +131,8 @@ describe('buildNativeLeadEnv', () => {
     const env = buildNativeLeadEnv({
       hostEnv,
       claudeRoot: '/srv/claude',
-      credentials: { provider: 'codex', codexHome: '/home/op/.codex', codexCliPath: '/opt/codex/bin/codex' },
+      leadProvider: 'codex',
+      credentials: [{ provider: 'codex', codexHome: '/home/op/.codex', codexCliPath: '/opt/codex/bin/codex' }],
     })
     expect(env).toEqual({
       HOME: '/home/op', PATH: '/usr/bin', LANG: 'C.UTF-8',

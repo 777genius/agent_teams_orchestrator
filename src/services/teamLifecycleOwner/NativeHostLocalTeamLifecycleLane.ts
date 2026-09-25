@@ -25,7 +25,7 @@ import {
   buildNativeLeadArgs,
   buildNativeLeadEnv,
   buildNativeMcpConfig,
-  classifyNativeHostLocalLane,
+  classifyNativeHostLocalLanes,
   classifyNativeHostLocalPlan,
   isNativeHostLocalPlatform,
   nativeBootstrapTimeoutMs,
@@ -201,8 +201,15 @@ export class NativeHostLocalTeamLifecycleLane implements TeamLifecycleLaneEffect
   }
 
   async #launch(input: RunInput): Promise<TeamLifecycleLaneObservation> {
-    const shape = classifyNativeHostLocalLane(input.lane, input.toolApprovalMode, this.#classifyOptions())
+    const shape = classifyNativeHostLocalLanes(
+      input.planLanes ?? [input.lane], input.toolApprovalMode, this.#classifyOptions())
     if (typeof shape === 'string') throw new NativeHostLocalLaneError(shape)
+    if (input.lane.laneId !== shape.leadLane.laneId) {
+      // A members-only native lane is started by the lead's bootstrap and
+      // reports the lead's state; before the lead lane ran it is launching.
+      const observed = await this.#inspect(input.runId)
+      return observed.phase === 'idle' ? { phase: 'launching', recoverable: false } : observed
+    }
     if (this.#owned.has(input.runId)) return this.#inspect(input.runId)
     const previous = await readNativeLaneRecord(this.#recordPath)
     if (previous?.runId === input.runId) {
@@ -214,16 +221,21 @@ export class NativeHostLocalTeamLifecycleLane implements TeamLifecycleLaneEffect
     const runtimeRoot = await this.#privateRuntimeRoot()
     await rm(runtimeRoot, { recursive: true, force: true })
 
-    const credentials = await this.#credentials(shape.provider)
-    const env = buildNativeLeadEnv({ hostEnv: this.#hostEnv, claudeRoot: this.#claudeRoot, credentials })
-    await this.#preflight({
-      provider: shape.provider,
-      command: this.#command,
-      commandArgs: this.#commandArgs,
-      cwd: input.workspaceRoot,
-      env,
+    const credentials = await Promise.all([...shape.providers].map(provider => this.#credentials(provider)))
+    const env = buildNativeLeadEnv({
+      hostEnv: this.#hostEnv, claudeRoot: this.#claudeRoot, leadProvider: shape.leadProvider, credentials,
     })
-    if (shape.provider === 'anthropic') await this.#ensureWorkspaceTrust(this.#claudeRoot, input.workspaceRoot)
+    for (const provider of shape.providers) {
+      await this.#preflight({
+        provider,
+        command: this.#command,
+        commandArgs: this.#commandArgs,
+        cwd: input.workspaceRoot,
+        env,
+      })
+    }
+    // Headless Claude teammates, and a Claude lead, need the workspace trusted.
+    if (shape.providers.has('anthropic')) await this.#ensureWorkspaceTrust(this.#claudeRoot, input.workspaceRoot)
 
     const runtimeDir = join(runtimeRoot, input.runId)
     const files = await this.#materialize(input, shape, runtimeDir)
@@ -402,10 +414,11 @@ export class NativeHostLocalTeamLifecycleLane implements TeamLifecycleLaneEffect
   }
 
   async #serialized<T>(
-    input: { planTeamId: string; lane: { laneId: string } },
+    input: { planTeamId: string },
     operation: () => Promise<T>,
   ): Promise<T> {
-    const key = `${input.planTeamId}\0${input.lane.laneId}`
+    // One queue per team: every native lane of a team shares one lead process.
+    const key = input.planTeamId
     const prior = this.#queues.get(key) ?? Promise.resolve()
     let release!: () => void
     const current = new Promise<void>(resolve => { release = resolve })

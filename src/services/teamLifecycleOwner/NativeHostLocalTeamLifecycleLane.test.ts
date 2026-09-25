@@ -76,18 +76,26 @@ async function createHarness() {
       return child
     },
   }
-  const createLane = (overrides: NativeHostLocalLaneDependencies = {}) => new NativeHostLocalTeamLifecycleLane(
+  const codexHome = join(base, 'operator', 'codex-home')
+  const codexCliPath = join(base, 'operator', 'codex-cli')
+  await mkdir(codexHome, { mode: 0o700 })
+  await writeFile(codexCliPath, '#!/bin/sh\n', { mode: 0o700 })
+  const createLane = (
+    overrides: NativeHostLocalLaneDependencies = {},
+    withCodex = false,
+  ) => new NativeHostLocalTeamLifecycleLane(
     { claudeRoot, teamRoot, legacyKey: team },
     {
       ownerCommand: { command: process.execPath, args: [FIXTURE] },
       anthropic: { oauthTokenFile: tokenFile },
+      ...(withCodex ? { codex: { codexHome, codexCliPath } } : {}),
       resolveMcpServer: async () => ({ command: '/usr/bin/env', args: ['agent-teams-mcp'] }),
       privateRuntimeParent: privateParent,
     },
     { ...dependencies, ...overrides },
   )
   const runtimeRoot = join(privateParent, `agent-teams-native-lane-${process.getuid!()}`, nativeLaneTeamRuntimeKey(teamRoot))
-  const harness = { base, team, runtimeRoot, claudeRoot, teamRoot, workspaceRoot, tokenFile, spawned, children, createLane }
+  const harness = { base, team, codexHome, runtimeRoot, claudeRoot, teamRoot, workspaceRoot, tokenFile, spawned, children, createLane }
   cleanups.push(async () => {
     await createLane().stop(input('run_cleanup')).catch(() => undefined)
     for (const child of children) child.kill('SIGKILL')
@@ -185,6 +193,41 @@ describe.skipIf(!supportedOnHost)('NativeHostLocalTeamLifecycleLane process life
     expect(spec.mode).toBe('create')
     expect(spec.team.name).toBe(harness.team)
     await lane.stop(laneInput(harness, 'run_draft'))
+  }, 30_000)
+
+  test('a Claude lead lane launches Codex members of another native lane from one bootstrap', async () => {
+    const harness = await createHarness()
+    const lane = harness.createLane({}, true)
+    const codexMembers: TeamLifecycleLaunchLane = {
+      laneId: 'lane_codex', kind: 'native', provider: 'codex',
+      members: [{ name: 'coder', prompt: 'Write the code.', model: 'gpt-5.6-sol' }],
+    }
+    const planLanes = [nativeLane, codexMembers]
+    const leadRun = { ...laneInput(harness, 'run_mixed'), planLanes }
+    const memberRun = { ...laneInput(harness, 'run_mixed', codexMembers), planLanes }
+    // The durable owner starts every lane of the plan concurrently.
+    const [memberLaunch, leadLaunch] = await Promise.all([lane.launch(memberRun), lane.launch(leadRun)])
+    expect(memberLaunch).toEqual({ phase: 'launching', recoverable: false })
+    expect(leadLaunch).toEqual({ phase: 'launching', recoverable: false })
+    expect(harness.spawned).toHaveLength(1)
+    const env = harness.spawned[0]!.env
+    expect(env.CLAUDE_CODE_ENTRY_PROVIDER).toBe('anthropic')
+    expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe(TOKEN)
+    expect(env.CODEX_HOME).toBe(harness.codexHome)
+    expect(env.CLAUDE_CODE_CODEX_BACKEND).toBe('codex-native')
+    const record = JSON.parse(await readFile(join(harness.teamRoot, NATIVE_LANE_RUNTIME_RECORD_FILE), 'utf8'))
+    expect(record.laneId).toBe(nativeLane.laneId)
+    const spec = JSON.parse(await readFile(join(record.runtimeDir, 'bootstrap-spec.json'), 'utf8'))
+    expect(spec.members.map((member: { name: string; provider: string }) => [member.name, member.provider]))
+      .toEqual([['worker', 'anthropic'], ['coder', 'codex']])
+
+    expect(await eventually(() => lane.inspect(memberRun), observed => observed.phase === 'running'))
+      .toEqual({ phase: 'running', recoverable: false })
+    expect(await lane.inspect(leadRun)).toEqual({ phase: 'running', recoverable: false })
+    const [memberStop, leadStop] = await Promise.all([lane.stop(memberRun), lane.stop(leadRun)])
+    expect([memberStop, leadStop]).toEqual([{ phase: 'idle', recoverable: false }, { phase: 'idle', recoverable: false }])
+    expect(isProcessAlive(record.pid)).toBe(false)
+    expect(await livePidsForTeam(harness.team)).toEqual([])
   }, 30_000)
 
   test('builds the lead env from an allowlist and only the configured credential', async () => {

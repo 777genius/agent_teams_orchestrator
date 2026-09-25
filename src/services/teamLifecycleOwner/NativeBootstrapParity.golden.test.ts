@@ -33,12 +33,14 @@ afterEach(async () => Promise.all(roots.splice(0).map(root => rm(root, { recursi
 /** The hosted lane for the same roster: the desktop member workflow is the hosted member prompt. */
 function hostedSpec(workspaceRoot: string): Json {
   const shape = {
-    lane: { laneId: 'native-lane', kind: 'native', provider: 'anthropic', members: [] },
-    provider: 'anthropic',
+    leadLane: { laneId: 'native-lane', kind: 'native', provider: 'anthropic', members: [] },
+    leadProvider: 'anthropic',
+    providers: new Set(['anthropic']),
     lead: { name: 'team-lead', prompt: 'Lead the team.' },
     teammates: desktop.members.map(member => ({
       name: String(member.name),
       prompt: String(member.workflow),
+      provider: String(member.provider),
       ...(member.model ? { model: String(member.model) } : {}),
       ...(member.effort ? { effort: String(member.effort) } : {}),
     })),

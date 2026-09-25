@@ -28,6 +28,8 @@ export type TeamLifecycleLaneInput = {
   workspaceRoot: string
   toolApprovalMode: 'manual' | 'auto'
   lane: TeamLifecycleLaunchLane
+  /** Every lane of the admitted plan, for adapters that launch several lanes as one team. */
+  planLanes?: readonly TeamLifecycleLaunchLane[]
 }
 
 type ExecuteBridge = ReturnType<typeof createOwnedOpenCodeLifecycleCommandExecutor>
