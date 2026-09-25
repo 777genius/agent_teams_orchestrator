@@ -31,7 +31,7 @@ const capabilitySnapshotId = `opencode:${'e'.repeat(32)}`
 const verifiedObservation = {
   state: 'responded_plain_text', deliveredUserMessageId: 'prompt-1', assistantMessageId: 'assistant-1',
 }
-type TestBridge = (input: { command: string; memberName?: string; text?: string }, guard: () => Promise<boolean>, signal: AbortSignal) =>
+type TestBridge = (input: { command: string; memberName?: string; text?: string; requestId?: string }, guard: () => Promise<boolean>, signal: AbortSignal) =>
   Promise<{ ok: boolean; data?: Record<string, unknown> }>
 
 async function fixture() {
@@ -418,4 +418,42 @@ describe('HostedTeamLeadInboxPump', () => {
     // The native process marks its own rows read.
     expect(lead).toEqual([expect.objectContaining({ messageId: message.messageId, read: false })])
   })
+
+  test('resends an intent whose fence failed before the bridge call and reports the reason once', async () => {
+    const f = await fixture()
+    const reports: unknown[] = []
+    const fenced = f.build({
+      readActiveRun: async () => ({ phase: 'stopping', runId }),
+      reportDecision: report => { reports.push(report) },
+    })
+    expect(await fenced.wake(message, authority)).toEqual({ kind: 'unavailable' })
+    expect(await fenced.wake(message, authority)).toEqual({ kind: 'unavailable' })
+    expect(reports).toEqual([{ messageId: message.messageId, recipient: 'team-lead',
+      decision: 'unavailable', reason: 'fence:run_not_running:stopping' }])
+    expect(f.calls).toEqual([])
+    // The durable intent was never sent, so it is sent now instead of being
+    // reconciled into an acceptance the runtime never saw.
+    expect(await f.build().wake(message, authority)).toEqual({ kind: 'accepted' })
+    expect(f.calls).toEqual(['send'])
+  })
+
+  test('retries a proven failed_before_accept with a fresh request a bounded number of times', async () => {
+    const f = await fixture()
+    const requestIds: string[] = []
+    f.setBridge(async input => {
+      f.calls.push(input.command)
+      if (input.command === 'send') {
+        requestIds.push((input as { requestId?: string }).requestId ?? '')
+        return { ok: false }
+      }
+      return { ok: true, data: { status: 'failed_before_accept', accepted: false, safeToRetry: true } }
+    })
+    expect(await f.build().wake(message, authority)).toEqual({ kind: 'pending' })
+    expect(await f.build().recover()).toEqual([{ kind: 'pending' }])
+    expect(await f.build().recover()).toEqual([{ kind: 'operator_required' }])
+    expect(await f.build().recover()).toEqual([{ kind: 'operator_required' }])
+    expect(f.calls.filter(command => command === 'send')).toHaveLength(3)
+    expect(new Set(requestIds).size).toBe(3)
+  })
 })
+

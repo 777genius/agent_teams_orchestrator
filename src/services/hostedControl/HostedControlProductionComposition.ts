@@ -2,7 +2,6 @@ import { join } from 'node:path'
 
 import { DurableTeamLifecycleExecution } from '../teamLifecycleOwner/DurableTeamLifecycleExecution.js'
 import type { TeamLifecycleLaneEffectPort } from '../teamLifecycleOwner/OpenCodeTeamLifecycleLane.js'
-import { TEAM_LEAD_NAME } from '../../utils/swarm/constants.js'
 import { createTeamLifecycleAuthorityComposition } from '../teamLifecycleOwner/TeamLifecycleAuthorityComposition.js'
 import { PrivateFileTeamLifecycleLaunchPlanStore } from '../teamLifecycleOwner/TeamLifecycleLaunchPlan.js'
 import { createHostedControlEffectServices } from './HostedControlEffectServices.js'
@@ -11,6 +10,7 @@ import type {
   HostedControlRuntimePortFactoryContext,
 } from './HostedControlRuntime.js'
 import { HostedLifecycleAuthorityWal } from './HostedLifecycleAuthorityWal.js'
+import { confirmDeliveryThroughInboxPump } from './HostedInboxPumpDelivery.js'
 import { HostedTeamLeadMessageDelivery } from './HostedTeamLeadMessageDelivery.js'
 import type {
   HostedTeamLeadInboxPumpOptions,
@@ -153,6 +153,12 @@ export function createHostedControlPortFactory(
         guard: authorityGuard,
         planStore,
         execution,
+        // One redacted JSON line per change of a message's pump decision.
+        reportDecision: report => {
+          process.stderr.write(`${JSON.stringify({
+            kind: 'hosted-inbox-pump-decision', teamId: context.authority.teamId, ...report,
+          })}\n`)
+        },
       })
       : undefined
     const services = createHostedControlEffectServices({
@@ -160,19 +166,8 @@ export function createHostedControlPortFactory(
       teamId: context.authority.teamId,
       lifecycleGuard: authorityGuard,
       messageGuard: authorityGuard,
-      messageDelivery: inboxPump
-        ? {
-          deliver: async (message, authority) => {
-            const decision = await messageDelivery.deliver(message, authority)
-            if (decision.kind === 'delivered') {
-              // Wake the inbox the message was appended to: team-lead unless it names a teammate.
-              void inboxPump.wake({ recipient: message.recipient ?? TEAM_LEAD_NAME, message, authority })
-                .catch(() => undefined)
-            }
-            return decision
-          },
-        }
-        : messageDelivery,
+      // With a pump, `delivered` means the recipient's session accepted the prompt.
+      messageDelivery: inboxPump ? confirmDeliveryThroughInboxPump(messageDelivery, inboxPump) : messageDelivery,
       messageRecipients,
       lifecycleEffects: lifecycle.authority,
       planAdmission: {
