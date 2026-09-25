@@ -257,8 +257,8 @@ describe('createHostedControlProductionPorts', () => {
     const runId = `run_${'c'.repeat(32)}`
     const planSha256 = createHash('sha256').update(await readFile(join(teamRoot, HOSTED_LIFECYCLE_PLAN_FILE))).digest('hex')
     const runReservation = {
-      schemaVersion: 1 as const, workspaceId: stableAuthority.workspaceId,
-      runtimeWorkspaceId: `workspace_${'3'.repeat(32)}`, teamId,
+      schemaVersion: 1 as const, workspaceId: `workspace_${'3'.repeat(32)}`,
+      runtimeWorkspaceId: stableAuthority.workspaceId, teamId,
       actorId: currentAuthority.actorId, deploymentId: stableAuthority.deploymentId,
       bootId: stableAuthority.bootId, commandId: command.commandId,
       idempotencyKey: command.idempotencyKey, expectedRevision: command.expectedRevision,

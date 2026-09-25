@@ -47,7 +47,8 @@ export function decodeHostedLifecycleRunReservation(
   const evidence = exactObject(raw.authorityEvidence, ['userId', 'sessionId', 'grantGeneration'])
   const sha = /^[0-9a-f]{64}$/
   if (raw.schemaVersion !== 1 ||
-    raw.workspaceId !== authority.workspaceId || raw.teamId !== authority.teamId ||
+    typeof raw.workspaceId !== 'string' || !/^workspace_[0-9a-f]{32}$/.test(raw.workspaceId) ||
+    raw.runtimeWorkspaceId !== authority.workspaceId || raw.teamId !== authority.teamId ||
     raw.actorId !== authority.actorId || raw.deploymentId !== authority.deploymentId ||
     raw.bootId !== authority.bootId || raw.commandId !== command.commandId ||
     raw.idempotencyKey !== command.idempotencyKey || raw.expectedRevision !== command.expectedRevision ||

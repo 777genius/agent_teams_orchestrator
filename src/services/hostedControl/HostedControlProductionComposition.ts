@@ -69,7 +69,7 @@ export function createHostedControlProductionPortFactory(
           if (signal.aborted || !receipt || !input.reservationPlanGeneration ||
             receipt.expectedPlanGeneration !== input.reservationPlanGeneration ||
             receipt.planSha256 !== input.reservationPlanGeneration.slice('plan-generation_'.length) ||
-            receipt.workspaceId !== context.authority.workspaceId ||
+            receipt.runtimeWorkspaceId !== context.authority.workspaceId ||
             receipt.teamId !== context.authority.teamId ||
             receipt.deploymentId !== context.authority.deploymentId ||
             receipt.bootId !== context.authority.bootId ||

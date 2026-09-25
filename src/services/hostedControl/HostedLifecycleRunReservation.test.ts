@@ -21,8 +21,8 @@ const command = {
   expectedRevision: `revision_${'c'.repeat(64)}`,
 }
 const receipt = {
-  schemaVersion: 1, workspaceId: authority.workspaceId,
-  runtimeWorkspaceId: `workspace_${'3'.repeat(32)}`, teamId: authority.teamId,
+  schemaVersion: 1, workspaceId: `workspace_${'3'.repeat(32)}`,
+  runtimeWorkspaceId: authority.workspaceId, teamId: authority.teamId,
   actorId: authority.actorId, deploymentId: authority.deploymentId, bootId: authority.bootId,
   ...command, expectedPlanGeneration: `plan-generation_${'d'.repeat(64)}`,
   ownerAuthority: owner.ownerAuthority, ownerGeneration: owner.ownerGeneration,
@@ -39,6 +39,7 @@ describe('hosted lifecycle Product run reservation', () => {
     expect(decodeHostedLifecycleRunReservation(receipt, command, authority, owner).runId).toBe(receipt.runId)
     for (const changed of [
       { ...receipt, actorId: 'actor_other-actor' },
+      { ...receipt, runtimeWorkspaceId: `workspace_${'4'.repeat(32)}` },
       { ...receipt, ownerSessionId: 'owner-session_other-session' },
       { ...receipt, expectedRevision: `revision_${'0'.repeat(64)}` },
       { ...receipt, planSha256: '0'.repeat(64) },
