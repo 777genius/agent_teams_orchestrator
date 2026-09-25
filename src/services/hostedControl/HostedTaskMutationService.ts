@@ -4,6 +4,7 @@ import { basename, dirname, join } from 'node:path'
 import { TaskMutationLockUnavailableError, withTaskMutationCoordination } from '../../utils/taskMutationCoordinator.js'
 import { fingerprintHostedTaskCommand } from './protocol.js'
 import { hostedTaskBoardRevision, hostedTaskBoardSourceGeneration, hostedTaskBoardTaskId } from './HostedTaskBoardIdentity.js'
+import { ControllerFileLockTimeoutError, withControllerFileLock } from './HostedControllerFileLock.js'
 import type { HostedControlAuthority, HostedControlStableAuthority, HostedTaskMutationCommand, HostedTaskMutationCommittedResult, HostedTaskMutationReceipt, HostedTaskMutationRequest, HostedTaskMutationTerminalResult } from './protocol.js'
 import { fsyncDirectoryPath, fsyncFileAndParent, HOSTED_MUTATION_RETRY_AFTER_MS, HostedTaskMutationWal, type HostedMutationFileImage, type HostedMutationIntent, type HostedMutationWrite } from './HostedTaskMutationWal.js'
 
@@ -79,7 +80,7 @@ export class HostedTaskMutationService {
     }
     try { return await withTaskMutationCoordination(this.options.legacyKey, async () => {
       if (!(await this.#validateOwner())) return false
-      try { const recovered = await this.options.wal.withFence(() => this.#recoverPrepared()); return recovered ?? false } catch { return false }
+      try { const recovered = await this.options.wal.withFence(() => this.#withBoardLock(() => this.#recoverPrepared())); return recovered ?? false } catch { return false }
     }, { claudeRoot: this.options.claudeRoot }) } catch { return false }
   }
 
@@ -108,8 +109,25 @@ export class HostedTaskMutationService {
 
   async #mutateFenced(request: HostedTaskMutationRequest): Promise<HostedTaskMutationOutcome> {
     const published: HostedMutationWrite[] = []
-    const result = await this.#mutateFencedResult(request, published)
+    let result: HostedTaskMutationTerminalResult
+    try {
+      result = await this.#withBoardLock(() => this.#mutateFencedResult(request, published))
+    } catch (error) {
+      if (!(error instanceof ControllerFileLockTimeoutError)) throw error
+      return { result: { kind: 'unavailable', retryAfterMs: HOSTED_MUTATION_RETRY_AFTER_MS }, selfWriteEffects: [] }
+    }
     return { result, selfWriteEffects: result.kind === 'committed' ? taskSelfWriteEffects(published) : [] }
+  }
+
+  /**
+   * Agents change the same task and kanban files through the MCP controller under
+   * `<team>/board-state`. Hold that lock from the board read and recovery through publication and
+   * the terminal WAL: a preimage an agent changed after the read would leave a prepared intent that
+   * recovery refuses. Order: task coordination, then the WAL fence, then this lock; the controller
+   * takes none of the Owner's locks while it holds the board lock.
+   */
+  #withBoardLock<T>(run: () => Promise<T>): Promise<T> {
+    return withControllerFileLock(join(this.options.claudeRoot, 'teams', this.options.legacyKey, 'board-state'), run)
   }
 
   async #mutateFencedResult(request: HostedTaskMutationRequest, published: HostedMutationWrite[]): Promise<HostedTaskMutationTerminalResult> {

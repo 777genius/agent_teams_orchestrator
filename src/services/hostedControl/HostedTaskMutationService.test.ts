@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test'
+import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { lstat, mkdir, mkdtemp, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -120,6 +121,50 @@ describe('HostedTaskMutationService', () => {
     await writeFile(join(teamRoot, 'hosted-task-board-mutation.wal.v1.json'), productWal, { mode: 0o600 })
     expect(await service().recover()).toBe(true)
     expect(await readFile(join(teamRoot, 'hosted-task-board-mutation.wal.v1.json'), 'utf8')).toBe(productWal)
+  })
+
+  test('never loses an MCP controller task write made under the board-state lock', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'hosted-service-board-lock-')); roots.push(root)
+    const teamRoot = join(root, 'teams', 'legacy'); const taskRoot = join(root, 'tasks', 'legacy')
+    await mkdir(teamRoot, { recursive: true, mode: 0o700 }); await mkdir(taskRoot, { recursive: true, mode: 0o700 })
+    const teamId = `team_${'c'.repeat(32)}`; const authority = authorityFor(teamId)
+    let onTaskWritten: (() => Promise<void>) | null = null
+    const service = () => new HostedTaskMutationService({ claudeRoot: root, legacyKey: 'legacy', authority, wal: new HostedTaskMutationWal(teamRoot, teamId),
+      crashHook: async stage => { if (stage === 'after_task_write' && onTaskWritten) { const pause = onTaskWritten; onTaskWritten = null; await pause() } } })
+    const created = await runCommand(service(), authority, { schemaVersion: 1, kind: 'create_task', commandId: 'command_board_lock', idempotencyKey: 'idem:board-lock', teamId, expectedSourceGeneration: 'generation_stale', expectedRevision: 'revision_stale', subject: 'Original', description: null, status: 'pending', ownerId: null, column: 'todo', order: 0 })
+    if (created.result.kind !== 'committed') throw new Error('expected committed create')
+    const taskFile = join(taskRoot, (await readdir(taskRoot)).find(name => name.endsWith('.json'))!)
+    const writer = new URL('./fixtures/agentTeamsController/controllerBoardWriter.cjs', import.meta.url).pathname
+    const agent = (pauseMs: number) => {
+      const child = spawn(process.execPath, [writer, teamRoot, taskFile, String(pauseMs)], { stdio: ['ignore', 'pipe', 'inherit'] })
+      const locked = new Promise<number>(resolve => child.stdout.on('data', chunk => resolve(Number(/locked (\d+)/.exec(String(chunk))?.[1]))))
+      const exited = new Promise<number | null>(resolve => child.once('exit', resolve))
+      return { locked, exited }
+    }
+
+    // The agent read the task under board-state and writes it after a pause. The Owner edit waits
+    // for that lock and then sees the agent's write instead of publishing over it.
+    const holding = agent(400); await holding.locked
+    const edit: HostedTaskMutationCommand = { schemaVersion: 1, kind: 'update_details', commandId: 'command_board_lock_edit', idempotencyKey: 'idem:board-lock-edit', teamId, expectedSourceGeneration: created.command.expectedSourceGeneration, expectedRevision: created.result.receipt.revision, taskId: created.result.receipt.affectedTaskIds[0]!, subject: 'Owner edit' }
+    const first = await service().mutate(requestFor(authority, edit))
+    expect(await holding.exited).toBe(0)
+    expect(first.kind).toBe('stale_revision')
+    if (first.kind !== 'stale_revision') return
+    expect((await service().mutate(requestFor(authority, { ...edit, expectedRevision: first.currentRevision }))).kind).toBe('committed')
+    expect(JSON.parse(await readFile(taskFile, 'utf8'))).toMatchObject({ subject: 'Owner edit', status: 'in_progress' })
+
+    // The controller honours the Owner's lock record the same way: an agent that starts while the
+    // Owner is publishing gets the lock only after the Owner has finished.
+    const second = { ...edit, commandId: 'command_board_lock_edit_2', idempotencyKey: 'idem:board-lock-edit-2', subject: 'Owner edit 2', expectedRevision: 'revision_stale' }
+    const current = await service().mutate(requestFor(authority, second))
+    if (current.kind !== 'stale_revision') throw new Error('expected stale revision')
+    let waiting: ReturnType<typeof agent> | null = null; let pauseEndedAt = 0
+    onTaskWritten = async () => { waiting = agent(0); await new Promise(resolve => setTimeout(resolve, 300)); pauseEndedAt = Date.now() }
+    expect((await service().mutate(requestFor(authority, { ...second, expectedRevision: current.currentRevision }))).kind).toBe('committed')
+    const lockedAt = await waiting!.locked
+    expect(await waiting!.exited).toBe(0)
+    expect(lockedAt).toBeGreaterThanOrEqual(pauseEndedAt)
+    expect(JSON.parse(await readFile(taskFile, 'utf8'))).toMatchObject({ subject: 'Owner edit 2', status: 'in_progress' })
   })
 
   test('derives source generation from the board directory authority before revision admission', async () => {
