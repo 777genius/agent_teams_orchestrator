@@ -1976,33 +1976,21 @@ const OPEN_CODE_STRICT_AUTHLESS_PROVIDER_IDS = new Set([
   'vllm',
 ])
 
-// OpenCode Zen's own catalog is the authority on price (OpenCodeModelAccessPolicy
-// reads it live); this list only grants authless *strict-profile* authority and
-// must stay manually synced with Zen's stealth/free model ids until that catalog
-// classification is threaded into this resolver.
-const OPEN_CODE_BUILTIN_FREE_MODEL_IDS = new Set([
-  'big-pickle',
-  'ling-3.0-flash-fin-free',
-  'mimo-v2.5-free',
-  'muse-spark-1.2-contributor-free',
-  'muse-spark-1.3-contributor-free',
-  'nemotron-3-ultra-free',
-  'nemotron-3.5-lightning-free',
-  'space-bunny-free',
-])
-
 function resolveOpenCodeAuthlessAuthorityMode(input: {
   providerId: string
   selectedModel: string
   providerConfig: unknown
 }): OpenCodeAuthlessAuthorityMode | null {
   const selectedModel = input.selectedModel.trim()
-  const modelId = selectedModel.slice(selectedModel.indexOf('/') + 1)
-  if (
-    input.providerId === 'opencode'
-    && modelId.length > 0
-    && OPEN_CODE_BUILTIN_FREE_MODEL_IDS.has(modelId)
-  ) {
+  const separatorIndex = selectedModel.indexOf('/')
+  const modelId = separatorIndex > 0 ? selectedModel.slice(separatorIndex + 1) : ''
+  if (input.providerId === 'opencode' && modelId.length > 0) {
+    // Only binds "no credential" to this exact model; it does not authorize the
+    // model. OpenCodeModelAccessPolicy decides access from the live Zen catalog
+    // (assertOpenCodeSelectedModelLaunchAccess runs before any session exists),
+    // so a paid or unknown Zen model without a key is still refused there. A
+    // static list here went stale every time Zen added a free model. The mode
+    // string stays 'builtin_free' so existing scope fingerprints do not rotate.
     return 'builtin_free'
   }
 
