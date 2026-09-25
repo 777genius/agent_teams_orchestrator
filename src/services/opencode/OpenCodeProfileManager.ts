@@ -859,11 +859,74 @@ const OPEN_CODE_SCOPE_PLACEHOLDER_MODEL_IDS = new Set([
   'oauth-authority',
 ])
 
+const LOCAL_OPENCODE_SELECTED_MODEL_CONTEXT_LIMIT = 32_768
+const LOCAL_OPENCODE_SELECTED_MODEL_OUTPUT_LIMIT = 4_096
+
+function readPositiveOpenCodeModelLimit(value: unknown): {
+  context: number
+  output: number
+} | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const record = value as Record<string, unknown>
+  const context = typeof record.context === 'number' && Number.isFinite(record.context) && record.context > 0
+    ? Math.floor(record.context)
+    : null
+  const output = typeof record.output === 'number' && Number.isFinite(record.output) && record.output > 0
+    ? Math.floor(record.output)
+    : null
+  if (context == null && output == null) return null
+  return {
+    context: context ?? LOCAL_OPENCODE_SELECTED_MODEL_CONTEXT_LIMIT,
+    output: output ?? LOCAL_OPENCODE_SELECTED_MODEL_OUTPUT_LIMIT,
+  }
+}
+
+function buildSelectedLocalOpenCodeModelSeed(
+  existingModels: Record<string, unknown>,
+): Record<string, unknown> {
+  for (const value of Object.values(existingModels)) {
+    const limit = readPositiveOpenCodeModelLimit(
+      value && typeof value === 'object' && !Array.isArray(value)
+        ? (value as Record<string, unknown>).limit
+        : null,
+    )
+    if (limit) {
+      return { tool_call: true, limit }
+    }
+  }
+  return {
+    tool_call: true,
+    limit: {
+      context: LOCAL_OPENCODE_SELECTED_MODEL_CONTEXT_LIMIT,
+      output: LOCAL_OPENCODE_SELECTED_MODEL_OUTPUT_LIMIT,
+    },
+  }
+}
+
+function selectedLocalOpenCodeModelNeedsSeed(value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return true
+  const record = value as Record<string, unknown>
+  return record.tool_call !== true || readPositiveOpenCodeModelLimit(record.limit) == null
+}
+
+function enrichSelectedLocalOpenCodeModel(
+  value: unknown,
+  seed: Record<string, unknown>,
+): Record<string, unknown> {
+  const current = value && typeof value === 'object' && !Array.isArray(value)
+    ? { ...(value as Record<string, unknown>) }
+    : {}
+  if (current.tool_call !== true) current.tool_call = true
+  if (!readPositiveOpenCodeModelLimit(current.limit)) current.limit = seed.limit
+  return current
+}
+
 /**
  * User OpenCode config can pin an Ollama/LM Studio models allowlist. Imported
  * as-is, that list hides later local models and launch probes hang after
  * `ProviderModelNotFoundError`. Add the selected model without shrinking a
- * live-discovery provider (empty models map).
+ * live-discovery provider (empty models map), and keep tool-calling plus a
+ * usable context window so local teammates can actually invoke write/bash.
  */
 export function ensureSelectedOpenCodeModelInImportedConfig(
   config: Record<string, unknown>,
@@ -881,17 +944,22 @@ export function ensureSelectedOpenCodeModelInImportedConfig(
     ?? findCanonicalProviderConfig(providers, parsed.providerId)
   if (!found) return
   const models = asRecord(found.config.models)
-  if (!hasOwnRecordKeys(models) || Object.prototype.hasOwnProperty.call(models, parsed.modelId)) {
+  if (!hasOwnRecordKeys(models)) return
+  const current = Object.prototype.hasOwnProperty.call(models, parsed.modelId)
+    ? models[parsed.modelId]
+    : undefined
+  if (current !== undefined && !selectedLocalOpenCodeModelNeedsSeed(current)) {
     return
   }
 
+  const seed = buildSelectedLocalOpenCodeModelSeed(models)
   const nextProviders = { ...providers }
   if (found.key !== providerId) delete nextProviders[found.key]
   nextProviders[providerId] = {
     ...found.config,
     models: {
       ...models,
-      [parsed.modelId]: {},
+      [parsed.modelId]: enrichSelectedLocalOpenCodeModel(current, seed),
     },
   }
   config.provider = nextProviders
