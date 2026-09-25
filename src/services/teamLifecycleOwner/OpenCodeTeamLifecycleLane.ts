@@ -29,9 +29,11 @@ export type TeamLifecycleLaneInput = {
 
 type ExecuteBridge = ReturnType<typeof createOwnedOpenCodeLifecycleCommandExecutor>
 
-export function createProductionOpenCodeTeamLifecycleLane(): OpenCodeTeamLifecycleLane {
+export function createProductionOpenCodeTeamLifecycleLane(
+  hasLiveCapability: () => boolean = () => true,
+): OpenCodeTeamLifecycleLane {
   const executeBridge = createOwnedOpenCodeLifecycleCommandExecutor()
-  return new OpenCodeTeamLifecycleLane(executeBridge, 300_000, () => true)
+  return new OpenCodeTeamLifecycleLane(executeBridge, 300_000, hasLiveCapability)
 }
 
 /** Existing OpenCode bridge is the sole production effect owner for OpenCode sessions. */

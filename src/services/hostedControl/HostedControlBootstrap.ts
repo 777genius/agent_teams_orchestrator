@@ -4,6 +4,7 @@ import { close, fstat, read } from 'node:fs'
 import { createReadStream } from 'node:fs'
 import type { BigIntStats } from 'node:fs'
 import { promisify } from 'node:util'
+import type { HostedAppMcpDescriptor } from '../opencode/OpenCodeMcpManager.js'
 import type { HostedControlRuntimeConfig } from './HostedControlRuntimeConfig.js'
 
 export const HOSTED_CONTROL_BOOTSTRAP_FORMAT = 'agent-teams.hosted-control.bootstrap/v1'
@@ -92,9 +93,19 @@ type HostedControlBootstrapHeaderBase = {
   leaseEvidence: HostedControlLeaseEvidence
 }
 
+/**
+ * `core-lifecycle-personal-host-v1` is the ADR-30 `trusted_process` profile:
+ * agents run as operator-trusted processes of the owner's OS user. Older
+ * owners reject it as an unknown kind instead of silently dropping lanes.
+ */
+export type HostedControlAdmissionKind = 'core-lifecycle-v1' | 'core-lifecycle-personal-host-v1'
+export const HOSTED_CONTROL_PERSONAL_HOST_ADMISSION_KIND = 'core-lifecycle-personal-host-v1'
+
 export type HostedControlBootstrapHeader = HostedControlBootstrapHeaderBase & {
-  admissionKind?: 'core-lifecycle-v1'
+  admissionKind?: HostedControlAdmissionKind
   approvalActivationV2?: HostedApprovalActivationV2BootstrapExpectation
+  /** Personal-host only; absent when the issuer did not prepare the MCP artifact. */
+  appMcp?: HostedAppMcpDescriptor
 }
 
 export type HostedControlDescriptorGuard = {
@@ -107,6 +118,9 @@ export type HostedControlBootstrapAdmission = {
   config: Omit<HostedControlRuntimeConfig, 'secretFile'>
   bootstrapBinding: HostedControlBootstrapBinding
   approvalActivationV2?: HostedApprovalActivationV2BootstrapExpectation
+  /** Present only for authenticated Core headers; selects the lifecycle composition. */
+  admissionKind?: HostedControlAdmissionKind
+  appMcp?: HostedAppMcpDescriptor
   expectedOwnerArtifactDigest: `sha256:${string}`
   secret: Buffer
   guard: HostedControlDescriptorGuard
@@ -122,6 +136,11 @@ const CORE_HEADER_KEYS = [
   'ownerAuthority', 'ownerGeneration', 'ownerSessionId', 'claudeRoot', 'socketPath',
   'legacyKey', 'bootstrapBinding', 'leaseEvidence',
 ] as const
+const PERSONAL_HOST_APP_MCP_HEADER_KEYS = [...CORE_HEADER_KEYS, 'appMcp'] as const
+const APP_MCP_KEYS = ['command', 'commandSha256', 'entry', 'entrySha256'] as const
+const CORE_ADMISSION_KINDS: readonly string[] = [
+  'core-lifecycle-v1', HOSTED_CONTROL_PERSONAL_HOST_ADMISSION_KIND,
+]
 const BINDING_KEYS = [
   'deploymentId', 'bootId', 'workspaceId', 'mountGeneration', 'bootstrapDigest',
   'ownerArtifactDigest', 'proofKeyId',
@@ -226,6 +245,8 @@ export async function readHostedControlBootstrap(options: {
       config,
       bootstrapBinding: header.bootstrapBinding,
       ...(header.approvalActivationV2 ? { approvalActivationV2: header.approvalActivationV2 } : {}),
+      ...(header.admissionKind ? { admissionKind: header.admissionKind } : {}),
+      ...(header.appMcp ? { appMcp: header.appMcp } : {}),
       expectedOwnerArtifactDigest: lease.ownerArtifactDigest,
       secret,
       guard,
@@ -256,9 +277,15 @@ function decodeCanonicalHeader(bytes: Buffer): HostedControlBootstrapHeader {
   try { text = new TextDecoder('utf-8', { fatal: true }).decode(bytes) } catch { fail() }
   let unknown: unknown
   try { unknown = JSON.parse(text) } catch { fail() }
-  const isCore = !!unknown && typeof unknown === 'object' && !Array.isArray(unknown) &&
-    (unknown as Record<string, unknown>).admissionKind === 'core-lifecycle-v1'
-  const raw = exactRecord(unknown, isCore ? CORE_HEADER_KEYS : HEADER_KEYS)
+  const kind = !!unknown && typeof unknown === 'object' && !Array.isArray(unknown)
+    ? (unknown as Record<string, unknown>).admissionKind
+    : undefined
+  // An unknown kind falls through to the approval key set and is rejected there.
+  const isCore = typeof kind === 'string' && CORE_ADMISSION_KINDS.includes(kind)
+  const hasAppMcp = kind === HOSTED_CONTROL_PERSONAL_HOST_ADMISSION_KIND &&
+    Object.hasOwn(unknown as object, 'appMcp')
+  const raw = exactRecord(unknown, !isCore ? HEADER_KEYS
+    : hasAppMcp ? PERSONAL_HOST_APP_MCP_HEADER_KEYS : CORE_HEADER_KEYS)
   if (JSON.stringify(raw) !== text) fail()
   const binding = exactRecord(raw.bootstrapBinding, BINDING_KEYS)
   const activation = isCore ? null : exactRecord(raw.approvalActivationV2, ACTIVATION_KEYS)
@@ -275,7 +302,8 @@ function decodeCanonicalHeader(bytes: Buffer): HostedControlBootstrapHeader {
     claudeRoot: absoluteCanonicalPath(raw.claudeRoot),
     socketPath: absoluteCanonicalPath(raw.socketPath, 103),
     legacyKey: exactString(raw.legacyKey, /^[A-Za-z0-9_-]{1,128}$/),
-    ...(isCore ? { admissionKind: exactString(raw.admissionKind, /^core-lifecycle-v1$/) as 'core-lifecycle-v1' } : { approvalActivationV2: {
+    ...(hasAppMcp ? { appMcp: decodeAppMcp(raw.appMcp) } : {}),
+    ...(isCore ? { admissionKind: exactString(raw.admissionKind, /^core-lifecycle(?:-personal-host)?-v1$/) as HostedControlAdmissionKind } : { approvalActivationV2: {
       approvalGeneration: integer(activation.approvalGeneration, 1),
       admissionOwnerGeneration: integer(activation.admissionOwnerGeneration, 1),
       approvalDigest: exactString(activation.approvalDigest, /^sha256:[0-9a-f]{64}$/) as `sha256:${string}`,
@@ -318,9 +346,9 @@ function validateBootstrapBinding(
   expectedOwnerExecutableDigest: unknown,
 ): void {
   const { bootstrapBinding: binding, approvalActivationV2: activation } = header
-  if ((header.admissionKind === 'core-lifecycle-v1') !==
-    (lease.ownerExecutableDigest !== undefined)) fail()
-  if (header.admissionKind === 'core-lifecycle-v1') {
+  const isCore = header.admissionKind !== undefined
+  if (isCore !== (lease.ownerExecutableDigest !== undefined)) fail()
+  if (isCore) {
     if (exactString(expectedOwnerExecutableDigest, /^sha256:[0-9a-f]{64}$/) !== lease.ownerExecutableDigest ||
       lease.ownerExecutableDigest === lease.ownerArtifactDigest) fail()
   } else if (exactString(expectedOwnerExecutableDigest, /^sha256:[0-9a-f]{64}$/) !== lease.ownerArtifactDigest) fail()
@@ -336,6 +364,18 @@ function validateBootstrapBinding(
 }
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/
+
+function decodeAppMcp(value: unknown): HostedAppMcpDescriptor {
+  const raw = exactRecord(value, APP_MCP_KEYS)
+  const descriptor = {
+    command: absoluteCanonicalPath(raw.command),
+    commandSha256: exactString(raw.commandSha256, /^[0-9a-f]{64}$/),
+    entry: absoluteCanonicalPath(raw.entry),
+    entrySha256: exactString(raw.entrySha256, /^[0-9a-f]{64}$/),
+  }
+  if (descriptor.command === descriptor.entry) fail()
+  return descriptor
+}
 
 function exactRecord(value: unknown, keys: readonly string[]): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) fail()

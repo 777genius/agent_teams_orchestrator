@@ -60,6 +60,8 @@ export type HostedControlApprovalActivationV2Context = Readonly<{
 export type HostedControlRuntimePortFactoryContext = {
   authority: Readonly<HostedControlStableAuthority>
   readonly legacyKey: string
+  /** Canonical owner-validated Claude root; hosted replacement for `~/.claude`. */
+  readonly claudeRoot: string
   /** Canonical owner-validated root for all private hosted durable state. */
   teamRoot: string
   /** Present only for the authenticated inherited-descriptor activation-v2 bootstrap. */
@@ -199,6 +201,7 @@ export class HostedControlRuntime {
       ports = await this.createPorts(Object.freeze({
         authority,
         legacyKey: config.legacyKey,
+        claudeRoot: ownerScope.canonicalClaudeRoot,
         teamRoot: ownerScope.canonicalTeamRoot,
         ...(descriptorAdmission?.approvalActivationV2 ? {
           activationV2: Object.freeze({

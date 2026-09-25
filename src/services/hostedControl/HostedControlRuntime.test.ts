@@ -225,6 +225,7 @@ describe('HostedControlRuntime', () => {
     let guardCloses = 0
     let portCloses = 0
     let activationPresent = true
+    let portClaudeRoot: string | undefined
     const admission: HostedControlBootstrapAdmission = {
       config: {
         socketPath: join(runtimeRoot, 'control.sock'), claudeRoot,
@@ -250,6 +251,7 @@ describe('HostedControlRuntime', () => {
     }
     const runtime = new HostedControlRuntime(admission, context => {
       activationPresent = context.activationV2 !== undefined
+      portClaudeRoot = context.claudeRoot
       return {
         lifecycle: { dispatch: async () => ({ payload: {}, resourceRevision: null }) },
         messages: { dispatch: async () => ({}) },
@@ -259,6 +261,8 @@ describe('HostedControlRuntime', () => {
     runtimes.push(runtime)
     await runtime.start()
     expect(activationPresent).toBe(false)
+    // Host-local lanes and the MCP claude dir use the owner-validated canonical root.
+    expect(portClaudeRoot).toBe(claudeRoot)
     expect(currentChecks).toBeGreaterThanOrEqual(4)
     expect(secret.every(byte => byte === 0xa5)).toBe(true)
     await runtime.stop()

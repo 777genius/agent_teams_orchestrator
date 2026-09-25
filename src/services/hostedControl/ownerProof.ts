@@ -17,6 +17,7 @@ export async function resolveHostedControlOwnerBinding(input: {
   claudeRoot: string
   legacyKey: string
 }): Promise<{
+  canonicalClaudeRoot: string
   canonicalTeamRoot: string
   rootIdentity: { claudeRoot: [number, number]; teamRoot: [number, number] }
 }> {
@@ -55,6 +56,7 @@ export async function resolveHostedControlOwnerBinding(input: {
       throw new Error('Hosted control owner paths are not owned by this process user')
     }
     return {
+      canonicalClaudeRoot: claudeRoot,
       canonicalTeamRoot: teamRoot,
       rootIdentity: { claudeRoot: [rootStat.dev, rootStat.ino], teamRoot: [teamStat.dev, teamStat.ino] },
     }

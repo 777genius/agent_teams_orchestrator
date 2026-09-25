@@ -22,7 +22,11 @@ try {
     declaredRootHash: admission.config.declaredRootHash,
     bootstrapBinding: admission.bootstrapBinding,
     expectedOwnerArtifactDigest: admission.expectedOwnerArtifactDigest,
-    ...(process.argv[5] ? { approvalActivationV2Present: !!admission.approvalActivationV2 } : {}),
+    ...(process.argv[5] ? {
+      approvalActivationV2Present: !!admission.approvalActivationV2,
+      admissionKind: admission.admissionKind ?? null,
+      appMcp: admission.appMcp ?? null,
+    } : {}),
   })}\n`)
   await admission.guard.lost
   admission.secret.fill(0)

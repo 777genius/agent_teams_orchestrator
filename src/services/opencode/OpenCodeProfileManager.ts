@@ -31,6 +31,7 @@ import {
   isOpenCodeAutoUpdateAllowed,
 } from './OpenCodeAutoUpdatePolicy.js'
 import {
+  isHostedAppMcpAuthorityInstalled,
   OPEN_CODE_APP_MCP_SERVER_NAME,
   resolveOpenCodeAppMcpLaunchConfig,
   type ResolvedAppMcpLaunchConfig,
@@ -2552,9 +2553,10 @@ async function resolveOpenCodeProfileScopeInternal(
     authlessAuthorityFingerprint,
     ...(cursorAssetsIdentity ? { cursorAssetsIdentity } : {}),
   })
-  const retainedAppMcpLaunchConfig = safeParseJSONC(
-    env[OPEN_CODE_SCOPE_APP_MCP_LAUNCH_CONFIG_ENV],
-  ) as ResolvedAppMcpLaunchConfig | null
+  // Hosted launches always re-derive the config from the signed descriptor.
+  const retainedAppMcpLaunchConfig = isHostedAppMcpAuthorityInstalled()
+    ? null
+    : safeParseJSONC(env[OPEN_CODE_SCOPE_APP_MCP_LAUNCH_CONFIG_ENV]) as ResolvedAppMcpLaunchConfig | null
   const appMcpLaunchConfig = input.purpose === 'launch_runtime'
     ? retainedAppMcpLaunchConfig ?? await resolveOpenCodeAppMcpLaunchConfig({ env }).then(resolved => {
         const managedConfig = buildManagedConfig(resolved.config)

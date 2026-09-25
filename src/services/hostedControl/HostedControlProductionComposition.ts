@@ -2,6 +2,7 @@ import { join } from 'node:path'
 
 import { DurableTeamLifecycleExecution } from '../teamLifecycleOwner/DurableTeamLifecycleExecution.js'
 import type { TeamLifecycleLaneEffectPort } from '../teamLifecycleOwner/OpenCodeTeamLifecycleLane.js'
+import { TEAM_LEAD_NAME } from '../../utils/swarm/constants.js'
 import { createTeamLifecycleAuthorityComposition } from '../teamLifecycleOwner/TeamLifecycleAuthorityComposition.js'
 import { PrivateFileTeamLifecycleLaunchPlanStore } from '../teamLifecycleOwner/TeamLifecycleLaunchPlan.js'
 import { createHostedControlEffectServices } from './HostedControlEffectServices.js'
@@ -11,6 +12,12 @@ import type {
 } from './HostedControlRuntime.js'
 import { HostedLifecycleAuthorityWal } from './HostedLifecycleAuthorityWal.js'
 import { HostedTeamLeadMessageDelivery } from './HostedTeamLeadMessageDelivery.js'
+import type {
+  HostedTeamLeadInboxPumpOptions,
+  InboxPumpDecision,
+} from './HostedTeamLeadInboxPump.js'
+import type { HostedPersistedMessage } from './HostedTeamMessageService.js'
+import type { HostedControlAuthority } from './protocol.js'
 import { HostedApprovalOwnerWal } from './HostedApprovalOwnerWal.js'
 import { HostedApprovalOwnerStore } from './HostedApprovalOwnerStore.js'
 import { HostedApprovalOwnerService } from './HostedApprovalOwnerService.js'
@@ -37,32 +44,49 @@ export const OPEN_CODE_HOSTED_APPROVAL_ATOMIC_REPLY_SUPPORTED: boolean = false
  * Its port must own the live supervisor, FD3, session, gateway and effect fences;
  * supports() remains false until those dependencies are actually ready.
  */
-export type HostedIsolatedOpenCodeLaneFactory = (
+export type HostedOpenCodeLaneFactory = (
   context: Readonly<HostedControlRuntimePortFactoryContext>,
 ) => TeamLifecycleLaneEffectPort | Promise<TeamLifecycleLaneEffectPort>
+
+/** Recipient-addressed so delivery can grow beyond the team lead without a contract change. */
+export type HostedTeamInboxPumpPort = Readonly<{
+  wake(input: Readonly<{
+    recipient: string
+    message: HostedPersistedMessage
+    authority: HostedControlAuthority
+  }>): Promise<InboxPumpDecision>
+  recover(): Promise<unknown>
+  start(): void
+  close(): Promise<void>
+}>
+
+/** Lifecycle effect owners of one hosted runtime. The default production composition has none. */
+export type HostedLifecycleEffects = Readonly<{
+  lanes: readonly TeamLifecycleLaneEffectPort[]
+  /** Installed only next to a host-local OpenCode lane, whose sessions it prompts. */
+  createInboxPump?(options: HostedTeamLeadInboxPumpOptions): HostedTeamInboxPumpPort
+}>
+
+export type HostedLifecycleEffectsFactory = (
+  context: Readonly<HostedControlRuntimePortFactoryContext>,
+) => HostedLifecycleEffects | Promise<HostedLifecycleEffects>
 
 /**
  * Final local composition for the single hosted-control runtime. All state is
  * rooted below the canonical team directory admitted by HostedControlRuntime.
- * No lifecycle effect is installed until a trusted isolated runtime supplies
- * its own capability-fenced OpenCode lane. Native lanes remain unavailable.
+ * Without an effects factory no lane is installed and launch stays unavailable.
  */
-export function createHostedControlProductionPortFactory(
-  createIsolatedOpenCodeLane?: HostedIsolatedOpenCodeLaneFactory,
+export function createHostedControlPortFactory(
+  createEffects?: HostedLifecycleEffectsFactory,
 ): HostedControlRuntimePortFactory {
   return async (context: HostedControlRuntimePortFactoryContext) => {
     const planStore = new PrivateFileTeamLifecycleLaunchPlanStore(
       join(context.teamRoot, HOSTED_LIFECYCLE_PLAN_FILE),
     )
-    const isolatedLane = createIsolatedOpenCodeLane
-      ? await createIsolatedOpenCodeLane(context)
-      : undefined
-    if (isolatedLane && isolatedLane.kind !== 'opencode') {
-      throw new TypeError('Hosted isolated lifecycle factory must provide an OpenCode lane')
-    }
+    const effects: HostedLifecycleEffects = createEffects ? await createEffects(context) : { lanes: [] }
     const execution = new DurableTeamLifecycleExecution(
       join(context.teamRoot, HOSTED_LIFECYCLE_EXECUTION_STATE_FILE),
-      isolatedLane ? [isolatedLane] : [],
+      [...effects.lanes],
       'team-lifecycle-owner',
       {
         requireRunReservation: true,
@@ -108,12 +132,34 @@ export function createHostedControlProductionPortFactory(
       authority: context.authority,
       guard: authorityGuard,
     })
+    const inboxPump = effects.createInboxPump
+      ? effects.createInboxPump({
+        canonicalTeamRoot: context.teamRoot,
+        legacyKey: context.legacyKey,
+        authority: context.authority,
+        guard: authorityGuard,
+        planStore,
+        execution,
+      })
+      : undefined
     const services = createHostedControlEffectServices({
       messageDirectory: join(context.teamRoot, HOSTED_MESSAGE_DIRECTORY),
       teamId: context.authority.teamId,
       lifecycleGuard: authorityGuard,
       messageGuard: authorityGuard,
-      messageDelivery,
+      messageDelivery: inboxPump
+        ? {
+          deliver: async (message, authority) => {
+            const decision = await messageDelivery.deliver(message, authority)
+            if (decision.kind === 'delivered') {
+              // HostedTeamLeadMessageDelivery only ever delivers to the lead.
+              void inboxPump.wake({ recipient: TEAM_LEAD_NAME, message, authority })
+                .catch(() => undefined)
+            }
+            return decision
+          },
+        }
+        : messageDelivery,
       lifecycleEffects: lifecycle.authority,
       planAdmission: {
         admitLaunchPlan: async input => {
@@ -171,20 +217,42 @@ export function createHostedControlProductionPortFactory(
       ...(approvals ? { approvals } : {}),
       ...(activationSessionFactory ? { activationSessionFactory } : {}),
       revoke,
+      ...(inboxPump
+        ? {
+          onReadinessLease: () => {
+            void inboxPump.recover().catch(() => undefined)
+            inboxPump.start()
+          },
+        }
+        : {}),
       close: async () => {
         // Calling revoke fences the delegate synchronously; all awaited work is
         // cleanup and therefore precedes lifecycle/authority resource release.
         await revoke().catch(() => undefined)
-        await messageDelivery.close()
+        await Promise.all([messageDelivery.close(), inboxPump?.close()])
         await execution.shutdown()
       },
     }
   }
 }
 
+/** Explicit single OpenCode lane composition; without one no lifecycle effect exists. */
+export function createHostedControlProductionPortFactory(
+  createOpenCodeLane?: HostedOpenCodeLaneFactory,
+): HostedControlRuntimePortFactory {
+  return createHostedControlPortFactory(createOpenCodeLane ? async context => {
+    const lane = await createOpenCodeLane(context)
+    if (lane.kind !== 'opencode') {
+      throw new TypeError('Hosted OpenCode lane factory must provide an OpenCode lane')
+    }
+    return { lanes: [lane] }
+  } : undefined)
+}
+
+/** Default for every admission kind except personal-host: no lane, launch unavailable. */
 export const createHostedControlProductionPorts = createHostedControlProductionPortFactory()
 
-/** Explicit root/Product composition. The default production factory above remains inactive. */
+/** Explicit root/Product composition for the post-v1 isolated profile. */
 export function createHostedManagedOpenCodeProductionPortFactory(
   dependencies: HostedManagedOpenCodeLaneDependencies,
 ): HostedControlRuntimePortFactory {

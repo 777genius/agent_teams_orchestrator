@@ -1,11 +1,14 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 
 import type { HostedLifecycleAuthority } from './HostedControlDispatcher.js'
 import type { TeamLifecycleLaneEffectPort } from '../teamLifecycleOwner/OpenCodeTeamLifecycleLane.js'
+import { TEAM_LEAD_NAME } from '../../utils/swarm/constants.js'
+import type { HostedControlRuntimePorts } from './HostedControlRuntime.js'
+import { createHostedPersonalHostLocalPortFactory } from './HostedPersonalHostLocalComposition.js'
 import {
   createHostedControlProductionPortFactory,
   createHostedControlProductionPorts,
@@ -398,6 +401,192 @@ describe('createHostedControlProductionPorts', () => {
   })
 })
 
+describe('createHostedPersonalHostLocalPortFactory', () => {
+  test('launches a reserved run on the host-local lane, wakes the lead, and closes the pump before teardown', async () => {
+    const teamRoot = await makeTeamRoot('hosted-personal-launch-')
+    const workspace = await writeAdmittedPlan(teamRoot)
+    const events: string[] = []
+    const launches: string[] = []
+    const lane = fakeLane({
+      launch: async input => { launches.push(input.runId); return { phase: 'running', recoverable: false } },
+      stop: async () => { events.push('lane-stop'); return { phase: 'idle', recoverable: false } },
+    })
+    const woken: Array<{ recipient: string; messageId: string }> = []
+    const ports = await createHostedPersonalHostLocalPortFactory({
+      appMcp: null,
+      lanes: [() => lane],
+      createInboxPump: options => {
+        expect(options.canonicalTeamRoot).toBe(teamRoot)
+        return {
+          wake: async ({ recipient, message }) => {
+            woken.push({ recipient, messageId: message.messageId })
+            return { kind: 'observed' }
+          },
+          recover: async () => { events.push('recover'); return [] },
+          start: () => { events.push('start') },
+          close: async () => { events.push('pump-close') },
+        }
+      },
+    })(personalContext(teamRoot, workspace))
+
+    const { request, runId } = await reservedLaunchRequest(ports, teamRoot)
+    expect((await ports.lifecycle.dispatch(request)).payload.kind).toBe('settled')
+    expect(launches).toEqual([runId])
+
+    ports.onReadinessLease!()
+    const messageId = await deliverLeadMessage(ports, workspace)
+    expect(woken).toEqual([{ recipient: TEAM_LEAD_NAME, messageId }])
+    await ports.close()
+    expect(events).toEqual(['recover', 'start', 'pump-close', 'lane-stop'])
+  })
+
+  test('never reaches the lane for a workspace that is not the exact declared mount root', async () => {
+    for (const variant of ['hash', 'symlink'] as const) {
+      const teamRoot = await makeTeamRoot(`hosted-personal-${variant}-`)
+      const workspace = await writeAdmittedPlan(teamRoot)
+      let declared = workspace
+      if (variant === 'symlink') {
+        // The hash matches the plan path, but that path is not canonical.
+        declared = join(teamRoot, 'workspace-link')
+        await symlink(workspace, declared)
+        await writePlan(teamRoot, 'opencode', declared)
+      }
+      const launches: string[] = []
+      const ports = await createHostedPersonalHostLocalPortFactory({
+        appMcp: null,
+        lanes: [() => fakeLane({ launch: async input => {
+          launches.push(input.runId)
+          return { phase: 'running', recoverable: false }
+        } })],
+        createInboxPump: () => ({ wake: async () => ({ kind: 'observed' }), recover: async () => [],
+          start: () => undefined, close: async () => undefined }),
+      })(personalContext(teamRoot, variant === 'hash' ? join(teamRoot, 'other') : declared))
+      const { request } = await reservedLaunchRequest(ports, teamRoot)
+      await ports.lifecycle.dispatch(request)
+      await ports.close()
+      expect(launches).toEqual([])
+    }
+  })
+
+  test('the production OpenCode lane is launchable only with a verified pinned MCP artifact', async () => {
+    const teamRoot = await makeTeamRoot('hosted-personal-app-mcp-')
+    const workspace = await writeAdmittedPlan(teamRoot)
+    const command = join(teamRoot, 'node')
+    const entry = join(teamRoot, 'index.js')
+    await writeFile(command, 'node binary\n')
+    await writeFile(entry, 'mcp entry\n')
+    const digest = (text: string) => createHash('sha256').update(text).digest('hex')
+    const appMcp = { command, commandSha256: digest('node binary\n'), entry, entrySha256: digest('mcp entry\n') }
+    const actions = async (descriptor: typeof appMcp | null) => {
+      const ports = await createHostedPersonalHostLocalPortFactory({ appMcp: descriptor })(
+        personalContext(teamRoot, workspace))
+      try {
+        return (await ports.lifecycle.dispatch(controlStateInput())).payload
+      } finally { await ports.close() }
+    }
+    expect(await actions(appMcp)).toMatchObject({ kind: 'control_state', availableActions: ['launch'] })
+    expect((await actions(null)).kind).toBe('unavailable')
+    expect((await actions({ ...appMcp, entrySha256: digest('other entry\n') })).kind).toBe('unavailable')
+  })
+})
+
+function fakeLane(overrides: Partial<TeamLifecycleLaneEffectPort>): TeamLifecycleLaneEffectPort {
+  return {
+    kind: 'opencode', supports: () => true,
+    inspect: async input => ({ phase: input.runId ? 'running' : 'idle', recoverable: false }),
+    launch: async () => ({ phase: 'running', recoverable: false }),
+    cancel: async () => ({ phase: 'idle', recoverable: false }),
+    stop: async () => ({ phase: 'idle', recoverable: false }),
+    recover: async () => ({ phase: 'idle', recoverable: false }),
+    ...overrides,
+  }
+}
+
+/** Personal-host plans must name the canonical mount whose hash the launcher declared. */
+async function writeAdmittedPlan(teamRoot: string): Promise<string> {
+  const workspace = join(teamRoot, 'sandbox-workspace')
+  await mkdir(workspace, { mode: 0o700 })
+  await writePlan(teamRoot, 'opencode', workspace)
+  return workspace
+}
+
+function personalContext(teamRoot: string, declaredRoot: string): HostedControlRuntimePortFactoryContext {
+  const base = context(teamRoot)
+  return { ...base, authority: { ...base.authority, mountBinding: {
+    ...base.authority.mountBinding,
+    declaredRootHash: createHash('sha256').update(declaredRoot).digest('hex'),
+  } } }
+}
+
+async function deliverLeadMessage(ports: HostedControlRuntimePorts, workspace: string): Promise<string> {
+  const authority = { actorId: 'actor-a', ...stableAuthority, mountBinding: {
+    ...stableAuthority.mountBinding,
+    declaredRootHash: createHash('sha256').update(workspace).digest('hex'),
+  } }
+  const text = 'Wake the lead.'
+  const persisted = await ports.messages.dispatch({
+    operation: 'message_persist', authority,
+    payload: { schemaVersion: 1, teamId, clientMessageId: 'client_message_personal-wake', text },
+  })
+  const { messageId } = persisted.receipt as { messageId: string }
+  const delivered = await ports.messages.dispatch({
+    operation: 'message_deliver', authority,
+    payload: { teamId, messageId, clientMessageId: 'client_message_personal-wake', text },
+  })
+  expect(delivered.kind).toBe('delivered')
+  return messageId
+}
+
+async function reservedLaunchRequest(ports: HostedControlRuntimePorts, teamRoot: string) {
+  const state = (await ports.lifecycle.dispatch(controlStateInput())).payload
+  expect(state.kind).toBe('control_state')
+  const command = { ...launchAuthorizeInput().payload.command,
+    expectedRevision: state.resourceRevision as string }
+  const currentAuthority = { ...lifecycleAuthority, resourceRevision: command.expectedRevision }
+  const commandContext = { ...controlStateInput().payload.context,
+    authorizedScope: 'scope_hosted-lifecycle-command' }
+  const authorized = (await ports.lifecycle.dispatch({ operation: 'authorize', authority: currentAuthority,
+    payload: { command, context: commandContext, authority: currentAuthority } })).payload
+  expect(authorized.kind).toBe('authorized')
+  const runId = `run_${'c'.repeat(32)}`
+  const planSha256 = createHash('sha256').update(await readFile(join(teamRoot, HOSTED_LIFECYCLE_PLAN_FILE))).digest('hex')
+  const runReservation = {
+    schemaVersion: 1 as const, workspaceId: `workspace_${'3'.repeat(32)}`,
+    runtimeWorkspaceId: stableAuthority.workspaceId, teamId,
+    actorId: currentAuthority.actorId, deploymentId: stableAuthority.deploymentId,
+    bootId: stableAuthority.bootId, commandId: command.commandId,
+    idempotencyKey: command.idempotencyKey, expectedRevision: command.expectedRevision,
+    expectedPlanGeneration: `plan-generation_${planSha256}`,
+    ownerAuthority: 'owner-authority_test-owner', ownerGeneration: 1,
+    ownerSessionId: 'owner-session_test-owner',
+    restoreGeneration: stableAuthority.restoreGeneration,
+    mountGeneration: stableAuthority.mountBinding.mountGeneration,
+    ownerEffectFence: currentAuthority.ownerEffectFence,
+    authorityEvidence: { userId: 'user_test-user', sessionId: 'session_test-user', grantGeneration: 1 },
+    runId, promotionOperationId: `promotion_${'1'.repeat(32)}`,
+    planSha256, rosterBindingSha256: '2'.repeat(64), createdAtMs: Date.now(),
+  }
+  const digest = createHash('sha256').update(JSON.stringify([
+    'agent-teams.hosted-lifecycle-command/v1', 1, 'launch', command.commandId,
+    command.idempotencyKey, command.workspaceId, command.teamId, command.expectedRevision,
+    runId, currentAuthority.ownerEffectFence.grantRevision,
+    currentAuthority.ownerEffectFence.identityChecksum,
+  ])).digest('hex')
+  const durableCommand = {
+    schemaVersion: 1,
+    commandFingerprint: { algorithm: 'sha256', version: 1, digest },
+    idempotency: { deploymentId: stableAuthority.deploymentId, actorId: currentAuthority.actorId,
+      action: 'launch', idempotencyKey: command.idempotencyKey },
+    resource: { bootId: stableAuthority.bootId, workspaceId: command.workspaceId, teamId,
+      runId, expectedRevision: command.expectedRevision, restoreGeneration: stableAuthority.restoreGeneration,
+      mountGeneration: stableAuthority.mountBinding.mountGeneration,
+      ownerEffectFence: currentAuthority.ownerEffectFence },
+  }
+  return { runId, request: { operation: 'execute' as const, authority: currentAuthority,
+    payload: { command, authorization: authorized.authorization as Record<string, unknown>,
+      durableCommand, runReservation, context: commandContext, authority: currentAuthority } } }
+}
+
 async function makeTeamRoot(prefix: string): Promise<string> {
   const parent = await mkdtemp(join(tmpdir(), prefix))
   roots.push(parent)
@@ -455,6 +644,7 @@ function context(
   return {
     authority: stableAuthority,
     legacyKey: 'legacy',
+    claudeRoot: dirname(teamRoot),
     teamRoot,
     isCurrentAuthority: async () => true,
     ...(withActivation ? { activationV2 } : {}),
@@ -506,7 +696,11 @@ function launchAuthorizeInput() {
   }
 }
 
-async function writePlan(teamRoot: string, kind: 'opencode' | 'native'): Promise<void> {
+async function writePlan(
+  teamRoot: string,
+  kind: 'opencode' | 'native',
+  workspaceRoot = join(teamRoot, 'sandbox-workspace'),
+): Promise<void> {
   await mkdir(teamRoot, { recursive: true, mode: 0o700 })
   const lane =
     kind === 'opencode'
@@ -530,7 +724,7 @@ async function writePlan(teamRoot: string, kind: 'opencode' | 'native'): Promise
       schemaVersion: 2,
       workspaceId: stableAuthority.workspaceId,
       teamId,
-      workspaceRoot: join(teamRoot, 'sandbox-workspace'),
+      workspaceRoot,
       toolApprovalMode: 'manual',
       lanes: [lane],
     }),

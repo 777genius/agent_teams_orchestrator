@@ -45,12 +45,43 @@ describe('hosted control inherited-descriptor bootstrap', () => {
       bootstrapBinding: fixture.header.bootstrapBinding,
       expectedOwnerArtifactDigest: fixture.header.bootstrapBinding.ownerArtifactDigest,
       approvalActivationV2Present: false,
+      admissionKind: 'core-lifecycle-v1',
+      appMcp: null,
     })
     fixture.liveness.end()
     expect(await fixture.lines.next()).toEqual({
       kind: 'lost', secretZeroed: true, fd3Closed: true, fd4Closed: true,
     })
     expect(await exitCode(fixture.child)).toBe(0)
+  }, 30_000)
+
+  test('admits the personal-host kind with an optional trailing app MCP pin and rejects unknown kinds', async () => {
+    const appMcp = {
+      command: '/opt/issuer/agent-teams-mcp/node', commandSha256: '1'.repeat(64),
+      entry: '/opt/issuer/agent-teams-mcp/index.js', entrySha256: '2'.repeat(64),
+    }
+    const personal = (header: HostedControlBootstrapHeader): HostedControlBootstrapHeader =>
+      ({ ...header, admissionKind: 'core-lifecycle-personal-host-v1' })
+    for (const [transform, expectedAppMcp] of [
+      [personal, null],
+      [(header: HostedControlBootstrapHeader) => ({ ...personal(header), appMcp }), appMcp],
+    ] as const) {
+      const fixture = await launchFixture(10_000, { core: true, header: transform })
+      fixture.bootstrap.end(frame(fixture.header, fixture.secret))
+      expect(await fixture.lines.next()).toMatchObject({
+        kind: 'admitted', admissionKind: 'core-lifecycle-personal-host-v1', appMcp: expectedAppMcp,
+      })
+      fixture.liveness.end()
+      expect(await fixture.lines.next()).toMatchObject({ kind: 'lost' })
+      expect(await exitCode(fixture.child)).toBe(0)
+    }
+    await Promise.all([
+      expectRejected(await launchFixture(10_000, { core: true, header: header =>
+        ({ ...header, admissionKind: 'core-lifecycle-personal-host-v2' as 'core-lifecycle-v1' }) })),
+      expectRejected(await launchFixture(10_000, { core: true, header: header => ({ ...header, appMcp }) })),
+      expectRejected(await launchFixture(10_000, { core: true, header: header =>
+        ({ ...personal(header), appMcp: { ...appMcp, entry: 'relative/index.js' } }) })),
+    ])
   }, 30_000)
 
   test('Core rejects executable pin and OCI binding cross-splices', async () => {

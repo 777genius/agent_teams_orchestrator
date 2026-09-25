@@ -289,7 +289,11 @@ export type OpenCodeMcpResponse = Record<string, OpenCodeMcpStatusEntry>
 
 export type OpenCodeAppMcpStatus = 'present' | 'attached' | 'missing' | 'attach_failed'
 
-export type OpenCodeAppMcpLaunchSource = 'env-override' | 'workspace-dist' | 'workspace-src'
+export type OpenCodeAppMcpLaunchSource =
+  | 'env-override'
+  | 'workspace-dist'
+  | 'workspace-src'
+  | 'hosted-descriptor'
 
 export type OpenCodeAppMcpSummary = {
   serverName: string
