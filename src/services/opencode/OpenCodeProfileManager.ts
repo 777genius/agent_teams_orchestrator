@@ -1976,6 +1976,10 @@ const OPEN_CODE_STRICT_AUTHLESS_PROVIDER_IDS = new Set([
   'vllm',
 ])
 
+// OpenCode Zen's own catalog is the authority on price (OpenCodeModelAccessPolicy
+// reads it live); this list only grants authless *strict-profile* authority and
+// must stay manually synced with Zen's stealth/free model ids until that catalog
+// classification is threaded into this resolver.
 const OPEN_CODE_BUILTIN_FREE_MODEL_IDS = new Set([
   'big-pickle',
   'ling-3.0-flash-fin-free',
@@ -1984,6 +1988,7 @@ const OPEN_CODE_BUILTIN_FREE_MODEL_IDS = new Set([
   'muse-spark-1.3-contributor-free',
   'nemotron-3-ultra-free',
   'nemotron-3.5-lightning-free',
+  'space-bunny-free',
 ])
 
 function resolveOpenCodeAuthlessAuthorityMode(input: {

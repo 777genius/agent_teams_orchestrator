@@ -629,9 +629,15 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       'opencode/nemotron-3.5-lightning-free',
       'launch_runtime',
     )
+    const spaceBunnyProbe = await resolve('opencode/space-bunny-free', 'execution_probe')
+    const spaceBunnyLaunch = await resolve('opencode/space-bunny-free', 'launch_runtime')
     await expect(resolve('opencode/BIG-PICKLE', 'execution_probe'))
       .rejects.toThrow('requires explicit selected authentication')
     await expect(resolve('opencode/BIG-PICKLE', 'launch_runtime'))
+      .rejects.toThrow('requires explicit selected authentication')
+    // Zen and Go share model ids across catalogs (Space Bunny Free exists in
+    // both); the Go route must never inherit Zen's authless allowlist entry.
+    await expect(resolve('opencode-go/space-bunny-free', 'execution_probe'))
       .rejects.toThrow('requires explicit selected authentication')
     const ollama = await resolve('ollama/qwen3:8b', 'execution_probe')
     const ollamaOtherModel = await resolve('ollama/llama3.2:3b', 'execution_probe')
@@ -653,6 +659,10 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     expect(builtinSame).toEqual(builtin)
     expect(builtin.selectedAuthIdentity).toBe('absent')
     expect(currentBuiltinLaunch.selectedAuthIdentity).toBe('absent')
+    expect(spaceBunnyProbe.selectedAuthIdentity).toBe('absent')
+    expect(spaceBunnyLaunch.selectedAuthIdentity).toBe('absent')
+    expect(spaceBunnyProbe.scopeToken).not.toBe(builtin.scopeToken)
+    expect(spaceBunnyProbe.configFingerprint).not.toBe(builtin.configFingerprint)
     expect(ollama.selectedAuthIdentity).toBe('absent')
     expect(loopback.selectedAuthIdentity).toBe('absent')
     expect(ollamaOtherModel.configFingerprint).not.toBe(ollama.configFingerprint)
