@@ -47,6 +47,7 @@ function fixture(snapshot: HostedAgentTaskSnapshot | null = taskSnapshot) {
   const messages: Array<{ memberId: string; to: string; text: string; callID: string }> = []
   const executors = createHostedAgentToolExecutors({
     binding, authority, ownerBinding,
+    testOnlyAllowOwnerLocalEffects: true,
     taskService: { mutate: async request => {
       mutations.push(request)
       return { kind: 'committed', currentSourceGeneration: 'generation_test',
@@ -177,6 +178,7 @@ describe('HostedAgentToolExecutors', () => {
       const currentBinding = { ...binding, workspaceRoot: root }
       const executors = createHostedAgentToolExecutors({
         binding: currentBinding, authority, ownerBinding, taskService: crashing,
+        testOnlyAllowOwnerLocalEffects: true,
         taskReader: { getTask: async () => ({ ...taskSnapshot, taskId: publicId,
           sourceGeneration: generation.currentSourceGeneration, revision: revision.currentRevision }) },
         comments: { addComment: async () => { throw new Error('Unexpected comment') } },

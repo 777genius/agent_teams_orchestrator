@@ -10,6 +10,8 @@ import { HostedAgentToolEffectGate } from '../agentTools/HostedAgentToolEffectGa
 import { HostedAgentToolReceiver } from '../agentTools/HostedAgentToolReceiver.js'
 import type { HostedAgentToolRequest } from '../agentTools/HostedAgentToolContract.js'
 import { HostedAgentToolWal, type HostedAgentToolBinding } from '../agentTools/HostedAgentToolWal.js'
+import { INACTIVE_HOSTED_AGENT_PRODUCT_EFFECT_WRITER,
+  type HostedAgentProductEffectWriter } from './HostedAgentProductEffectWriter.js'
 import { matchesHostedAgentRootConnector, readLinuxHostedAgentPeerCredentials,
   type HostedAgentExpectedRootConnector, type HostedAgentPeerCredentials } from './HostedAgentPeerCredentials.js'
 
@@ -49,6 +51,8 @@ export type HostedAgentToolBrokerOptions = Readonly<{
   taskReader: HostedAgentTaskReader
   comments: HostedAgentTaskCommentWriter
   messages: HostedAgentTeamMessageSender
+  /** Trusted Root/Product composition only. Omission closes every hosted write. */
+  productWriter?: HostedAgentProductEffectWriter
   isCurrent: (binding: Readonly<HostedAgentToolBinding>, context: Context) => boolean | Promise<boolean>
   /** Must read the current exact recipient incarnation, not resolve by name alone. */
   currentRecipient: (to: string, binding: Readonly<HostedAgentToolBinding>) =>
@@ -151,6 +155,8 @@ export class HostedAgentToolBroker {
       binding, authority: this.options.authority, ownerBinding: this.options.ownerBinding,
       taskService: this.options.taskService, taskReader: this.options.taskReader,
       comments: this.options.comments, messages: this.options.messages,
+      productWriter: this.options.productWriter ?? INACTIVE_HOSTED_AGENT_PRODUCT_EFFECT_WRITER,
+      recipientForMessage: (to, caller) => this.options.currentRecipient(to, caller),
     })
     this.#receiver = new HostedAgentToolReceiver({ socket, binding,
       teamName: this.options.teamName, gate: this.options.gate, wal: this.options.wal,

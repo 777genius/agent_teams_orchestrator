@@ -11,7 +11,8 @@ import { HostedAgentToolEffectGate } from './HostedAgentToolEffectGate.js'
 import { HostedAgentToolWal, type HostedAgentToolBinding } from './HostedAgentToolWal.js'
 
 type Context = HostedAgentToolRequest['context']
-export type HostedAgentTaskCall = Readonly<{ binding: Readonly<HostedAgentToolBinding>; taskId: string; callID: string; signal: AbortSignal }>
+export type HostedAgentTaskCall = Readonly<{ binding: Readonly<HostedAgentToolBinding>; taskId: string;
+  messageID?: string; callID: string; signal: AbortSignal }>
 type TaskCall = HostedAgentTaskCall
 type TextTaskCall = TaskCall & Readonly<{ text: string }>
 type MessageCall = Readonly<{
@@ -19,6 +20,7 @@ type MessageCall = Readonly<{
   to: string
   text: string
   taskRefs: readonly { teamName: string; taskId: string }[]
+  messageID?: string
   callID: string
   signal: AbortSignal
 }>
@@ -171,16 +173,19 @@ export class HostedAgentToolReceiver {
       case 'hosted_task_start':
       case 'hosted_task_complete': {
         const args = request.args as { taskId: string }
-        return this.options.executors[request.tool]({ binding, taskId: args.taskId, callID: request.context.callID, signal })
+        return this.options.executors[request.tool]({ binding, taskId: args.taskId,
+          messageID: request.context.messageID, callID: request.context.callID, signal })
       }
       case 'hosted_task_add_comment': {
         const args = request.args as { taskId: string; text: string }
-        return this.options.executors.hosted_task_add_comment({ binding, ...args, callID: request.context.callID, signal })
+        return this.options.executors.hosted_task_add_comment({ binding, ...args,
+          messageID: request.context.messageID, callID: request.context.callID, signal })
       }
       case 'hosted_message_send': {
         const args = request.args as { to: string; text: string; taskRefs?: readonly { teamName: string; taskId: string }[] }
         return this.options.executors.hosted_message_send({ binding, to: args.to, text: args.text,
-          taskRefs: args.taskRefs ?? [], callID: request.context.callID, signal })
+          taskRefs: args.taskRefs ?? [], messageID: request.context.messageID,
+          callID: request.context.callID, signal })
       }
     }
   }

@@ -93,6 +93,17 @@ describe('HostedAgentToolBroker', () => {
     expect(result).toMatchObject({ ok: true })
     expect(JSON.parse(result.result)).toMatchObject({ taskId, ownerId: binding.memberId })
     expect(effects()).toBe(0)
+    const write = Buffer.from(JSON.stringify({ version: 1, type: 'request', requestId: randomUUID(),
+      tool: 'hosted_task_start', context: { sessionID: binding.sessionID,
+        messageID: 'message_2', callID: 'call_write_without_product' }, args: { taskId } }))
+    const writeFrame = Buffer.alloc(4 + write.length)
+    writeFrame.writeUInt32BE(write.length, 0)
+    write.copy(writeFrame, 4)
+    const denied = new Promise<{ ok: boolean; error: string }>(resolve => socket.once('data', bytes =>
+      resolve(JSON.parse(bytes.subarray(4).toString('utf8')) as { ok: boolean; error: string })))
+    socket.write(writeFrame)
+    expect(await denied).toMatchObject({ ok: false, error: 'operator_required' })
+    expect(effects()).toBe(0)
     await broker.revoke()
     socket.destroy()
   })

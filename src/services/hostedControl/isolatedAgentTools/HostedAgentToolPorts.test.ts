@@ -51,6 +51,7 @@ describe('concrete Owner agent tool ports', () => {
     const f = await fixture()
     const reader = new HostedAgentTaskReaderPort(f.service)
     const executors = createHostedAgentToolExecutors({ binding, authority: f.authority,
+      testOnlyAllowOwnerLocalEffects: true,
       ownerBinding: { ownerAuthority: 'owner_authority1', ownerGeneration: 1,
         ownerSessionId: `owner_session_${'d'.repeat(32)}`,
         socketIdentity: { device: '1', inode: '2', uid: 501, gid: 20, mode: 0o600 } },

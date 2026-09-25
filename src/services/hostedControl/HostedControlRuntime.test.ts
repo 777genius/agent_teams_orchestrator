@@ -521,7 +521,7 @@ describe('HostedControlRuntime', () => {
       ...taskUnsigned,
       ownerProof: createHostedControlProof(secret, 'request', taskUnsigned),
     })}\n`)
-    expect(JSON.parse(taskLine).payload.kind).toBe('stale_generation')
+    expect(JSON.parse(taskLine).payload.kind).toBe('unavailable')
     expect(lifecycleCalls).toBe(1)
     expect(messageCalls).toBe(1)
 

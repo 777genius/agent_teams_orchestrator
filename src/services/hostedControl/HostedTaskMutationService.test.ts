@@ -32,6 +32,29 @@ function authorityFor(teamId: string, patch: Partial<Authority> = {}): Authority
 function publicId(teamId: string, rawId: string): string { return `task_${createHash('sha256').update(JSON.stringify({ domain: 'hosted-task-board-task/v1', teamId, rawTaskId: rawId })).digest('hex').slice(0, 32)}` }
 
 describe('HostedTaskMutationService', () => {
+  test('production task writer denies assignment before any Owner-local durable write', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'hosted-service-product-deny-')); roots.push(root)
+    const teamRoot = join(root, 'teams', 'legacy')
+    const taskRoot = join(root, 'tasks', 'legacy')
+    await mkdir(teamRoot, { recursive: true }); await mkdir(taskRoot, { recursive: true })
+    const teamId = `team_${'9'.repeat(32)}`
+    const authority = authorityFor(teamId)
+    const rawId = 'sandbox-task'
+    const taskPath = join(taskRoot, `${rawId}.json`)
+    const original = JSON.stringify({ id: rawId, subject: 'Sandbox task', status: 'pending',
+      owner: `member_${'a'.repeat(32)}`, blocks: [], blockedBy: [] })
+    await writeFile(taskPath, original)
+    const command: HostedTaskMutationCommand = { schemaVersion: 1, kind: 'update_owner',
+      commandId: 'command_assignment_denied', idempotencyKey: 'assignment-denied', teamId,
+      expectedSourceGeneration: 'generation_stale', expectedRevision: 'revision_stale',
+      taskId: publicId(teamId, rawId), ownerId: `member_${'b'.repeat(32)}` }
+    const service = new HostedTaskMutationService({ claudeRoot: root, legacyKey: 'legacy', authority,
+      wal: new HostedTaskMutationWal(teamRoot, teamId), denyOwnerLocalWrites: true })
+    expect(await service.recover()).toBe(true)
+    expect(await service.mutate(requestFor(authority, command))).toEqual({ kind: 'unavailable' })
+    expect(await readFile(taskPath, 'utf8')).toBe(original)
+  })
+
   test('derives source generation from the board directory authority before revision admission', async () => {
     const root = await mkdtemp(join(tmpdir(), 'hosted-service-test-')); roots.push(root)
     await mkdir(join(root, 'teams', 'legacy'), { recursive: true }); await mkdir(join(root, 'tasks', 'legacy'), { recursive: true })
@@ -67,6 +90,10 @@ describe('HostedTaskMutationService', () => {
     if (revisionResult.kind !== 'stale_revision') return
     command = { ...command, expectedRevision: revisionResult.currentRevision }
     expect((await makeService('after_task_write').mutate(request())).kind).toBe('unavailable')
+    const deniedRecovery = new HostedTaskMutationService({ claudeRoot: root, legacyKey: 'legacy',
+      authority, wal, denyOwnerLocalWrites: true })
+    expect(await deniedRecovery.recover()).toBe(false)
+    expect((await deniedRecovery.mutate(request())).kind).toBe('unavailable')
     expect(await makeService().recover()).toBe(true)
     const firstReplay = await makeService().mutate(request()); expect(firstReplay.kind).toBe('idempotent_replay')
     const durableKey = createHash('sha256').update(JSON.stringify({ domain: 'hosted-task-board-idempotency-ledger/v3', teamId, sourceGeneration: command.expectedSourceGeneration, idempotencyKey: command.idempotencyKey })).digest('hex')

@@ -24,6 +24,8 @@ export type HostedTaskMutationServiceOptions = {
   legacyKey: string
   authority: HostedControlStableAuthority
   wal: HostedTaskMutationWal
+  /** Production fence until Product provides an atomic final-write task port. */
+  denyOwnerLocalWrites?: boolean
   validateOwner?: () => boolean | Promise<boolean>
   now?: () => number
   crashHook?: (stage: CrashStage) => void | Promise<void>
@@ -68,6 +70,9 @@ export class HostedTaskMutationService {
   }
 
   async recover(): Promise<boolean> {
+    if (this.options.denyOwnerLocalWrites) {
+      try { return (await this.options.wal.listAmbiguous()).length === 0 } catch { return false }
+    }
     try { return await withTaskMutationCoordination(this.options.legacyKey, async () => {
       if (!(await this.#validateOwner())) return false
       try { const recovered = await this.options.wal.withFence(() => this.#recoverPrepared()); return recovered ?? false } catch { return false }
@@ -75,6 +80,7 @@ export class HostedTaskMutationService {
   }
 
   async mutate(request: HostedTaskMutationRequest): Promise<HostedTaskMutationTerminalResult> {
+    if (this.options.denyOwnerLocalWrites) return { kind: 'unavailable' }
     if (!sameAuthority(request.authority, this.options.authority)) return { kind: 'unavailable' }
     try { return await withTaskMutationCoordination(this.options.legacyKey, async () => {
       if (!(await this.#validateOwner())) return { kind: 'unsafe_active' }

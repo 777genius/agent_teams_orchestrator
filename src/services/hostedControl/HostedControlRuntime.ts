@@ -175,6 +175,8 @@ export class HostedControlRuntime {
         authority,
         wal,
         validateOwner,
+        // Product has no atomic task writer yet; hosted Owner may only read the board.
+        denyOwnerLocalWrites: true,
       })
       if (startup.cancelled || this.#descriptorAuthorityLost) {
         throw new Error('Hosted control launcher authority is no longer current')
