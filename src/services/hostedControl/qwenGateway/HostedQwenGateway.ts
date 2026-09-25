@@ -358,14 +358,21 @@ export class HostedQwenGateway {
             if (!result.allowed || finished || cancelled) { fail(); return }
           }
           for (const piece of pieces) {
-            const result = await this.responseEffect(admission, epoch, remote, () =>
-              !finished && !cancelled && !res.destroyed ? res.write(piece) : false)
-            if (!result.allowed || finished || cancelled) { fail(); return }
-            if (!result.value) await new Promise<void>(resolve => {
-              const done = () => { res.off('drain', done); res.off('close', done); resolve() }
-              res.once('drain', done)
-              res.once('close', done)
+            const result = await this.responseEffect(admission, epoch, remote, () => {
+              if (finished || cancelled || res.destroyed) return null
+              let done = () => undefined
+              const drained = new Promise<void>(resolve => {
+                done = () => { res.off('drain', done); res.off('close', done); resolve() }
+                res.once('drain', done)
+                res.once('close', done)
+              })
+              try {
+                if (res.write(piece)) { done(); return null }
+                return { drained }
+              } catch (error) { done(); throw error }
             })
+            if (!result.allowed || finished || cancelled) { fail(); return }
+            if (result.value) await result.value.drained
             if (finished || cancelled) return
           }
           if (parser.done) {

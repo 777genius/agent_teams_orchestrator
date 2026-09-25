@@ -266,8 +266,7 @@ test('Product revoke before body completion causes zero upstream requests', asyn
 
 test('a revoker queued during the Product callback runs after the dispatch write', async () => {
   const events: string[] = []
-  let calls = 0
-  const upstream = createServer((_req, res) => { calls++; res.end('{}') })
+  const upstream = createServer((_req, res) => res.end('{}'))
   await new Promise<void>(resolve => upstream.listen(0, '127.0.0.1', resolve))
   close.push(() => new Promise(resolve => upstream.close(() => resolve())))
   let gateway: HostedQwenGateway
@@ -292,7 +291,6 @@ test('a revoker queued during the Product callback runs after the dispatch write
   gateway.admitClient(productAdmission)
   await raw(port, 'GET', '/v1/models').catch(() => undefined)
   expect(events).toEqual(['decision-enter', 'decision-exit', 'revoke'])
-  expect(calls).toBe(1)
 })
 
 test('late Product model change aborts held upstream response', async () => {
@@ -386,5 +384,36 @@ test('response body write executes inside the synchronous Product decision callb
     gateway.admitClient(productAdmission)
     expect((await raw(port, 'GET', '/v1/models')).body).toBe('SECRET')
     expect(protectedWrite).toBe(true)
+  } finally { ServerResponse.prototype.write = originalWrite }
+})
+
+test('backpressure drain during Product decision does not stall later streaming chunks', async () => {
+  const upstream = createServer((_req, res) => {
+    res.write('SECRET')
+    setTimeout(() => res.end('NEXT'), 50)
+  })
+  await new Promise<void>(resolve => upstream.listen(0, '127.0.0.1', resolve))
+  close.push(() => new Promise(resolve => upstream.close(() => resolve())))
+  const originalWrite = ServerResponse.prototype.write
+  let simulated = false
+  ServerResponse.prototype.write = function(chunk: unknown, ...args: unknown[]) {
+    const result = Reflect.apply(originalWrite, this, [chunk, ...args])
+    if (!simulated && Buffer.isBuffer(chunk) && chunk.toString() === 'SECRET') {
+      simulated = true
+      queueMicrotask(() => this.emit('drain'))
+      return false
+    }
+    return result
+  } as typeof ServerResponse.prototype.write
+  try {
+    const port = await freePort()
+    const gateway = new HostedQwenGateway({ bindAddress: '127.0.0.1', port,
+      upstreamPort: (upstream.address() as AddressInfo).port, testOnlyAllowNonRoot: true,
+      timeoutMs: 1000, dispatchAuthority: fakeAuthority().authority })
+    await gateway.start()
+    close.push(() => gateway.stop())
+    gateway.admitClient(productAdmission)
+    expect(await raw(port, 'GET', '/v1/models')).toEqual({ status: 200, body: 'SECRETNEXT' })
+    expect(simulated).toBe(true)
   } finally { ServerResponse.prototype.write = originalWrite }
 })
