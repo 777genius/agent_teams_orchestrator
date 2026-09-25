@@ -239,13 +239,14 @@ describe('createHostedControlProductionPorts', () => {
       const teamRoot = await makeTeamRoot(`hosted-production-long-launch-${ownerLost}-`)
       await writePlan(teamRoot, 'opencode')
       let ownerCurrent = true
+      let deadlineAtMs = 0
       const actions: string[] = []
       const lane = fakeLane({
         launch: async () => {
           actions.push('launch')
-          // Readiness plus launch take longer than the command's deadline;
+          // Readiness plus launch outlive the command's deadline;
           // the owner may also lose its epoch meanwhile.
-          await Bun.sleep(300)
+          await Bun.sleep(Math.max(0, deadlineAtMs - Date.now()) + 50)
           if (ownerLost) ownerCurrent = false
           return { phase: 'running', recoverable: false }
         },
@@ -256,11 +257,19 @@ describe('createHostedControlProductionPorts', () => {
         isCurrentAuthority: async () => ownerCurrent,
       })
       const { request } = await reservedLaunchRequest(ports, teamRoot)
+      // Generous enough that a loaded runner still starts the effect before it expires.
+      deadlineAtMs = Date.now() + 1_000
       const expiring = { ...request, payload: { ...request.payload,
-        context: { ...request.payload.context, deadlineAtMs: Date.now() + 150 } } }
+        context: { ...request.payload.context, deadlineAtMs } } }
       expect((await ports.lifecycle.dispatch(expiring)).payload.kind).toBe('settled')
-      await Bun.sleep(600)
-      const state = JSON.parse(await readFile(join(teamRoot, HOSTED_LIFECYCLE_EXECUTION_STATE_FILE), 'utf8'))
+      const settledAt = Date.now()
+      let state: Record<string, unknown> = {}
+      while (Date.now() - settledAt < 3_000) {
+        state = JSON.parse(await readFile(join(teamRoot, HOSTED_LIFECYCLE_EXECUTION_STATE_FILE), 'utf8')
+          .catch(() => '{}'))
+        if (ownerLost ? state.phase === 'failed' && actions.includes('stop') : Date.now() > deadlineAtMs + 300) break
+        await Bun.sleep(25)
+      }
       if (ownerLost) {
         expect(state).toMatchObject({ phase: 'failed',
           failure: { action: 'launch', message: 'Team lifecycle effect authority changed' } })
