@@ -4,10 +4,19 @@ import { lstat, open, realpath } from 'node:fs/promises'
 import path from 'node:path'
 import { Database } from 'bun:sqlite'
 
+import { PRODUCT_V30_V33_SCHEMA } from './ProductV30V33Schema.js'
+
 const SHA = /^[a-f0-9]{64}$/
 const RUN = /^run_[a-f0-9]{32}$/
 const MEMBER = /^member_[a-f0-9]{32}$/
 const ID = /^[a-z][a-z0-9-]*_[A-Za-z0-9][A-Za-z0-9._-]{7,127}$/
+const DEPLOYMENT = /^deployment_[A-Za-z0-9][A-Za-z0-9._-]*$/
+const PHASE_ONE = (prefix: string, value: unknown): boolean => typeof value === 'string' &&
+  value.length <= 128 && new RegExp(`^${prefix}_[A-Za-z0-9][A-Za-z0-9._-]*$`).test(value)
+const REVISION = /^revision_[A-Za-z0-9][A-Za-z0-9._-]*$/
+const IDEMPOTENCY = /^idempotency_[A-Za-z0-9][A-Za-z0-9._-]{7,127}$/
+const PROMOTION = /^promotion_[a-f0-9]{32}$/
+const ADOPTION = /^adoption_[a-f0-9]{32}$/
 const MAX_CALLBACK_MS = 1000
 
 export type HostedProductMemberBinding = Readonly<{
@@ -70,8 +79,10 @@ function bindingValid(value: HostedProductMemberBinding): boolean {
     'runId', 'memberId', 'teamId', 'laneId', 'deploymentId', 'runtimeWorkspaceId',
     'planSha256', 'rosterBindingSha256', 'restoreGeneration', 'mountGeneration',
   ].sort().join(',') && RUN.test(value.runId) && MEMBER.test(value.memberId) &&
-    [value.teamId, value.laneId, value.deploymentId, value.runtimeWorkspaceId]
+    [value.teamId, value.laneId, value.runtimeWorkspaceId]
       .every(id => typeof id === 'string' && ID.test(id)) &&
+    typeof value.deploymentId === 'string' && value.deploymentId.length <= 128 &&
+    DEPLOYMENT.test(value.deploymentId) &&
     SHA.test(value.planSha256) && SHA.test(value.rosterBindingSha256) &&
     Number.isSafeInteger(value.restoreGeneration) && value.restoreGeneration >= 0 &&
     Number.isSafeInteger(value.mountGeneration) && value.mountGeneration >= 1
@@ -86,6 +97,122 @@ function actorId(userId: string): string {
   frame.writeUInt32BE(user.length, 4 + domain.length)
   user.copy(frame, 8 + domain.length)
   return `actor_${createHash('sha256').update(frame).digest('hex')}`
+}
+
+function initialMemberName(value: unknown): value is string {
+  if (typeof value !== 'string' || value.length > 64 || value.trim() !== value ||
+    !/^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,62}[A-Za-z0-9])?$/.test(value)) return false
+  const lower = value.toLowerCase()
+  const stem = lower.split('.')[0]
+  const suffix = /^(.+)-(\d+)$/.exec(value)
+  return lower !== 'user' && lower !== 'team-lead' && !lower.endsWith('-provisioner') &&
+    !new Set(['con', 'prn', 'aux', 'nul', ...Array.from({ length: 9 }, (_, i) => `com${i + 1}`),
+      ...Array.from({ length: 9 }, (_, i) => `lpt${i + 1}`)]).has(stem) &&
+    !(suffix && Number(suffix[2]) >= 2)
+}
+
+function qualifiedModel(value: unknown): value is string {
+  if (typeof value !== 'string' || !value || value.length > 256 || value.trim() !== value ||
+    !/^[A-Za-z0-9][A-Za-z0-9._:/[\]-]*$/.test(value) || /^[A-Za-z]:/.test(value) ||
+    value.split('/').some(part => part === '.' || part === '..')) return false
+  const slash = value.indexOf('/')
+  return slash > 0 && slash < value.length - 1 && /^[a-z0-9._-]+$/i.test(value.slice(0, slash))
+}
+
+function validEffort(value: unknown): boolean {
+  return value === undefined || value === 'low' || value === 'medium' || value === 'high'
+}
+
+function frozenSnapshot(promotion: Row): { lanes: Row[] } {
+  if (typeof promotion.frozenDraftJson !== 'string' || typeof promotion.frozenRosterJson !== 'string' ||
+    typeof promotion.planJson !== 'string' || typeof promotion.planSha256 !== 'string' ||
+    typeof promotion.admittedWorkspaceRoot !== 'string' ||
+    !promotion.admittedWorkspaceRoot.startsWith('/') ||
+    promotion.admittedWorkspaceRoot.includes('\0') || promotion.admittedWorkspaceRoot.length > 4096) {
+    throw new Error('hosted-product-promotion-snapshot-corrupt')
+  }
+  const draft = exact(parsed(promotion.frozenDraftJson, 256 * 1024),
+    ['workspaceId', 'teamId', 'revision', 'metadata', 'members', 'configuration'])
+  const envelope = exact(parsed(promotion.frozenRosterJson, 256 * 1024),
+    ['schemaVersion', 'members', 'configuration'])
+  if (draft.workspaceId !== promotion.workspaceId || draft.teamId !== promotion.teamId ||
+    draft.revision !== promotion.expectedRevision || envelope.schemaVersion !== 1 ||
+    JSON.stringify(draft.members) !== JSON.stringify(envelope.members) ||
+    JSON.stringify(draft.configuration) !== JSON.stringify(envelope.configuration) ||
+    !Array.isArray(promotion.laneIds) || !Array.isArray(draft.members)) {
+    throw new Error('hosted-product-promotion-snapshot-corrupt')
+  }
+  const metadata = object(draft.metadata)
+  const metadataLimits: Readonly<Record<string, number>> = {
+    name: 128, description: 4000, color: 64, language: 64,
+  }
+  if (Object.keys(metadata).length < 1 || Object.entries(metadata).some(([key, value]) =>
+    !Object.hasOwn(metadataLimits, key) || typeof value !== 'string' || !value ||
+    value.length > metadataLimits[key] || value.trim() !== value) ||
+    !Object.hasOwn(metadata, 'name') ||
+    draft.members.some(value => !initialMemberName(exact(value, ['name']).name))) {
+    throw new Error('hosted-product-promotion-snapshot-corrupt')
+  }
+  const configuration = exact(draft.configuration, ['schemaVersion', 'toolApprovalMode', 'lanes'])
+  if (configuration.schemaVersion !== 1 || configuration.toolApprovalMode !== 'auto' ||
+    !Array.isArray(configuration.lanes) || configuration.lanes.length < 1 ||
+    configuration.lanes.length > 32 || configuration.lanes.length !== promotion.laneIds.length ||
+    draft.members.length < 1 || draft.members.length > 32 ||
+    Buffer.byteLength(JSON.stringify(configuration)) > 192 * 1024 ||
+    new Set(promotion.laneIds).size !== promotion.laneIds.length) {
+    throw new Error('hosted-product-promotion-snapshot-corrupt')
+  }
+  const seenNames = new Set<string>()
+  const orderedNames: string[] = []
+  const lanes = configuration.lanes.map((value: unknown, index: number) => {
+    const lane = object(value)
+    const optionalEffort = Object.hasOwn(lane, 'effort') ? ['effort'] : []
+    exact(lane, ['kind', 'provider', 'selectedModel', 'members', ...optionalEffort])
+    if (lane.kind !== 'opencode' || lane.provider !== 'opencode' ||
+      !qualifiedModel(lane.selectedModel) || !validEffort(lane.effort) || !Array.isArray(lane.members) ||
+      lane.members.length < 1 || lane.members.length > 32 ||
+      typeof promotion.laneIds[index] !== 'string' ||
+      !/^lane_[a-f0-9]{32}$/.test(promotion.laneIds[index] as string)) {
+      throw new Error('hosted-product-promotion-snapshot-corrupt')
+    }
+    return lane
+  })
+  const planLanes = lanes.map((lane, index) => ({
+    laneId: promotion.laneIds[index], kind: lane.kind, provider: lane.provider,
+    selectedModel: lane.selectedModel,
+    ...(lane.effort === undefined ? {} : { effort: lane.effort }),
+    members: (lane.members as unknown[]).map(value => {
+      const member = object(value)
+      exact(member, ['name', 'prompt', ...(Object.hasOwn(member, 'model') ? ['model'] : []),
+        ...(Object.hasOwn(member, 'effort') ? ['effort'] : [])])
+      if (typeof member.name !== 'string' || !member.name ||
+        !initialMemberName(member.name) || seenNames.has(member.name.toLowerCase()) ||
+        typeof member.prompt !== 'string' || !member.prompt ||
+        member.prompt.trim() !== member.prompt || member.prompt.includes('\0') ||
+        Buffer.byteLength(member.prompt) > 64 * 1024 ||
+        !validEffort(member.effort) ||
+        member.model !== undefined && !qualifiedModel(member.model)) {
+        throw new Error('hosted-product-promotion-snapshot-corrupt')
+      }
+      seenNames.add(member.name.toLowerCase())
+      orderedNames.push(member.name)
+      if (seenNames.size > 32) throw new Error('hosted-product-promotion-snapshot-corrupt')
+      return { name: member.name, prompt: member.prompt,
+        ...(member.model === undefined ? {} : { model: member.model }),
+        ...(member.effort === undefined ? {} : { effort: member.effort }) }
+    }),
+  }))
+  const expectedPlanJson = JSON.stringify({ schemaVersion: 2,
+    workspaceId: promotion.runtimeWorkspaceId, teamId: promotion.teamId,
+    workspaceRoot: promotion.admittedWorkspaceRoot,
+    toolApprovalMode: configuration.toolApprovalMode, lanes: planLanes })
+  if (orderedNames.length !== draft.members.length || orderedNames.some((name, index) =>
+    name !== object(draft.members[index]).name)) throw new Error('hosted-product-promotion-snapshot-corrupt')
+  if (expectedPlanJson !== promotion.planJson || sha(expectedPlanJson) !== promotion.planSha256 ||
+    promotion.planGeneration !== `plan-generation_${promotion.planSha256}`) {
+    throw new Error('hosted-product-promotion-snapshot-corrupt')
+  }
+  return { lanes }
 }
 
 /** Root process reads the Product v33 writer DB. This is a current decision, never a launch permit. */
@@ -201,19 +328,83 @@ export class HostedProductCurrentMemberDecision {
         throw new Error('hosted-product-schema-incompatible')
       }
     }
+    for (const [version, table, triggerPrefix, autoindexes] of [
+      ['v30', 'hosted_team_configuration_promotions', 'hosted_promotions_', 3],
+      ['v32', 'hosted_promotion_roster_bindings', 'hosted_roster_bindings_', 1],
+      ['v33', 'hosted_lifecycle_run_reservations', 'hosted_run_reservations_', 4],
+    ] as const) {
+      const statements = PRODUCT_V30_V33_SCHEMA[version]
+      const expected: Array<{ type: string; name: string; tableName: string; sql: string | null }> =
+        statements.map(sql => {
+          const match = /^CREATE (TABLE|TRIGGER) ([a-z_]+)/u.exec(sql)
+          if (!match) throw new Error('hosted-product-schema-contract-invalid')
+          const tableName = match[1] === 'TABLE' ? match[2] : / ON ([a-z_]+)\n/u.exec(sql)?.[1]
+          if (!tableName) throw new Error('hosted-product-schema-contract-invalid')
+          return { type: match[1].toLowerCase(), name: match[2],
+            tableName, sql }
+        })
+      for (let index = 1; index <= autoindexes; index++) {
+        expected.push({ type: 'index', name: `sqlite_autoindex_${table}_${index}`, tableName: table,
+          sql: null })
+      }
+      const records = (schema: 'main' | 'temp') => (db.query(
+        `SELECT type, name, tbl_name AS tableName, sql FROM ${schema}.sqlite_schema`).all() as Row[])
+        .filter(row => row.tableName === table ||
+          typeof row.name === 'string' && (row.name.startsWith(triggerPrefix) ||
+            version === 'v30' && row.name.startsWith(table) ||
+            row.name.startsWith(`sqlite_autoindex_${table}`)))
+      const actual = records('main')
+      if (records('temp').length || actual.length !== expected.length ||
+        expected.some(wanted => !actual.some(row => row.type === wanted.type &&
+          row.name === wanted.name && row.tableName === wanted.tableName && row.sql === wanted.sql))) {
+        throw new Error('hosted-product-schema-incompatible')
+      }
+    }
+    if ((db.query('PRAGMA ignore_check_constraints').get() as Row | null)?.ignore_check_constraints !== 0 ||
+      (db.query('PRAGMA main.foreign_key_check').all() as Row[]).length !== 0 ||
+      (db.query('PRAGMA main.integrity_check').get() as Row | null)?.integrity_check !== 'ok') {
+      throw new Error('hosted-product-schema-incompatible')
+    }
   }
 
   private current(binding: HostedProductMemberBinding): HostedProductCurrentMember | null {
     const db = this.database
     const reservationRow = db.query(`SELECT run_id, promotion_operation_id, deployment_id, actor_id,
-      boot_id, team_id, record_json FROM main.hosted_lifecycle_run_reservations WHERE run_id = ?`)
+      boot_id, team_id, expected_revision, command_id, idempotency_key, record_json
+      FROM main.hosted_lifecycle_run_reservations WHERE run_id = ?`)
       .get(binding.runId) as Row | null
     if (!reservationRow) return null
-    const reservation = parsed(reservationRow.record_json, 16 * 1024)
+    const reservation = exact(parsed(reservationRow.record_json, 16 * 1024), [
+      'schemaVersion', 'workspaceId', 'runtimeWorkspaceId', 'teamId', 'actorId',
+      'deploymentId', 'bootId', 'commandId', 'idempotencyKey', 'expectedRevision',
+      'expectedPlanGeneration', 'ownerAuthority', 'ownerGeneration', 'ownerSessionId',
+      'restoreGeneration', 'mountGeneration', 'ownerEffectFence', 'authorityEvidence',
+      'runId', 'promotionOperationId', 'planSha256', 'rosterBindingSha256', 'createdAtMs',
+    ])
     for (const [column, field] of [['run_id', 'runId'], ['promotion_operation_id', 'promotionOperationId'],
       ['deployment_id', 'deploymentId'], ['actor_id', 'actorId'], ['boot_id', 'bootId'],
-      ['team_id', 'teamId']] as const) {
+      ['team_id', 'teamId'], ['expected_revision', 'expectedRevision'],
+      ['command_id', 'commandId'], ['idempotency_key', 'idempotencyKey']] as const) {
       if (!same(reservationRow[column], reservation[field])) throw new Error('hosted-product-reservation-corrupt')
+    }
+    if (reservation.schemaVersion !== 1 || !Number.isSafeInteger(reservation.createdAtMs) ||
+      (reservation.createdAtMs as number) < 0 ||
+      !/^workspace_[a-f0-9]{32}$/.test(reservation.workspaceId as string) ||
+      !/^workspace_[a-f0-9]{32}$/.test(reservation.runtimeWorkspaceId as string) ||
+      !/^team_[a-f0-9]{32}$/.test(reservation.teamId as string) ||
+      !PHASE_ONE('actor', reservation.actorId) || !PHASE_ONE('boot', reservation.bootId) ||
+      !PHASE_ONE('deployment', reservation.deploymentId) ||
+      !PROMOTION.test(reservation.promotionOperationId as string) ||
+      !/^lifecycle-command_[A-Za-z0-9][A-Za-z0-9._-]{7,127}$/.test(reservation.commandId as string) ||
+      !IDEMPOTENCY.test(reservation.idempotencyKey as string) ||
+      typeof reservation.expectedRevision !== 'string' ||
+      reservation.expectedRevision.length > 256 || !REVISION.test(reservation.expectedRevision) ||
+      typeof reservation.ownerAuthority !== 'string' ||
+      !/^owner-authority_[A-Za-z0-9][A-Za-z0-9._-]{7,127}$/.test(reservation.ownerAuthority) ||
+      typeof reservation.ownerSessionId !== 'string' ||
+      !/^owner-session_[A-Za-z0-9][A-Za-z0-9._-]{7,127}$/.test(reservation.ownerSessionId) ||
+      !Number.isSafeInteger(reservation.ownerGeneration) || (reservation.ownerGeneration as number) < 1) {
+      throw new Error('hosted-product-reservation-corrupt')
     }
     if (reservation.runId !== binding.runId || reservation.teamId !== binding.teamId ||
       reservation.deploymentId !== binding.deploymentId ||
@@ -225,14 +416,42 @@ export class HostedProductCurrentMemberDecision {
       reservation.expectedPlanGeneration !== `plan-generation_${binding.planSha256}`) return null
     const evidence = exact(reservation.authorityEvidence, ['userId', 'sessionId', 'grantGeneration'])
     const fence = exact(reservation.ownerEffectFence, ['grantRevision', 'identityChecksum'])
+    if (typeof evidence.userId !== 'string' || !ID.test(evidence.userId) ||
+      !ID.test(evidence.sessionId as string) || !SHA.test(fence.grantRevision as string) ||
+      !SHA.test(fence.identityChecksum as string) ||
+      !Number.isSafeInteger(evidence.grantGeneration) || (evidence.grantGeneration as number) < 0 ||
+      evidence.grantGeneration !== reservation.restoreGeneration) {
+      throw new Error('hosted-product-reservation-corrupt')
+    }
     const promotionRow = db.query(`SELECT operation_id, workspace_id, team_id, actor_id, deployment_id,
+      idempotency_key,
       record_json FROM main.hosted_team_configuration_promotions WHERE operation_id = ?`)
       .get(reservation.promotionOperationId as string) as Row | null
     if (!promotionRow) return null
-    const promotion = parsed(promotionRow.record_json, 2 * 1024 * 1024)
+    const promotion = exact(parsed(promotionRow.record_json, 2 * 1024 * 1024), [
+      'workspaceId', 'teamId', 'actorId', 'deploymentId', 'createOperationId',
+      'runtimeWorkspaceId', 'bindingGeneration', 'expectedRevision', 'idempotencyKey',
+      'admittedWorkspaceRoot', 'operationId', 'frozenRosterJson', 'frozenDraftJson',
+      'laneIds', 'planJson', 'planSha256', 'planGeneration', 'createdAtMs', 'state',
+    ])
     for (const [column, field] of [['operation_id', 'operationId'], ['workspace_id', 'workspaceId'],
-      ['team_id', 'teamId'], ['actor_id', 'actorId'], ['deployment_id', 'deploymentId']] as const) {
+      ['team_id', 'teamId'], ['actor_id', 'actorId'], ['deployment_id', 'deploymentId'],
+      ['idempotency_key', 'idempotencyKey']] as const) {
       if (!same(promotionRow[column], promotion[field])) throw new Error('hosted-product-promotion-corrupt')
+    }
+    if (!PROMOTION.test(promotion.operationId as string) ||
+      !ADOPTION.test(promotion.createOperationId as string) ||
+      !IDEMPOTENCY.test(promotion.idempotencyKey as string) ||
+      !Number.isSafeInteger(promotion.bindingGeneration) || (promotion.bindingGeneration as number) < 1 ||
+      !Number.isSafeInteger(promotion.createdAtMs) || (promotion.createdAtMs as number) < 0 ||
+      typeof promotion.expectedRevision !== 'string' ||
+      promotion.expectedRevision.length > 256 || !REVISION.test(promotion.expectedRevision) ||
+      !/^workspace_[a-f0-9]{32}$/.test(promotion.workspaceId as string) ||
+      !/^workspace_[a-f0-9]{32}$/.test(promotion.runtimeWorkspaceId as string) ||
+      !/^team_[a-f0-9]{32}$/.test(promotion.teamId as string) ||
+      !PHASE_ONE('actor', promotion.actorId) ||
+      !PHASE_ONE('deployment', promotion.deploymentId)) {
+      throw new Error('hosted-product-promotion-corrupt')
     }
     if (promotion.state !== 'frozen' || promotion.operationId !== reservation.promotionOperationId ||
       promotion.workspaceId !== reservation.workspaceId || promotion.teamId !== binding.teamId ||
@@ -240,26 +459,33 @@ export class HostedProductCurrentMemberDecision {
       promotion.runtimeWorkspaceId !== binding.runtimeWorkspaceId ||
       promotion.planSha256 !== binding.planSha256 ||
       promotion.planGeneration !== reservation.expectedPlanGeneration) return null
+    const snapshot = frozenSnapshot(promotion)
     const rosterRow = db.query(`SELECT plan_sha256, binding_json FROM main.hosted_promotion_roster_bindings
       WHERE operation_id = ?`).get(promotion.operationId as string) as Row | null
     if (!rosterRow || rosterRow.plan_sha256 !== binding.planSha256) return null
-    const roster = parsed(rosterRow.binding_json, 256 * 1024)
+    const roster = exact(parsed(rosterRow.binding_json, 256 * 1024),
+      ['schemaVersion', 'operationId', 'planSha256', 'lanes'])
     if (roster.schemaVersion !== 1 || roster.operationId !== promotion.operationId ||
       roster.planSha256 !== binding.planSha256 ||
       sha(JSON.stringify(roster)) !== binding.rosterBindingSha256 ||
       !Array.isArray(roster.lanes) || roster.lanes.length < 1 || roster.lanes.length > 32) return null
+    if (roster.lanes.length !== snapshot.lanes.length) return null
     const memberIds = new Set<string>()
     const found = roster.lanes.flatMap((lane: unknown, laneOrdinal: number) => {
       const row = exact(lane, ['laneOrdinal', 'laneId', 'members'])
+      const source = snapshot.lanes[laneOrdinal]
       if (row.laneOrdinal !== laneOrdinal || typeof row.laneId !== 'string' ||
-        !/^lane_[a-f0-9]{32}$/.test(row.laneId) || !Array.isArray(row.members) ||
-        row.members.length < 1 || row.members.length > 32) throw new Error('hosted-product-roster-corrupt')
+        row.laneId !== promotion.laneIds?.[laneOrdinal] || !Array.isArray(row.members) ||
+        row.members.length !== (source.members as unknown[]).length) {
+        throw new Error('hosted-product-roster-corrupt')
+      }
       return row.members.map((value: unknown, memberOrdinal: number) => {
         const member = exact(value, ['memberOrdinal', 'memberId', 'name', 'model', 'promptSha256'])
+        const original = object((source.members as unknown[])[memberOrdinal])
         if (member.memberOrdinal !== memberOrdinal || typeof member.memberId !== 'string' ||
           !MEMBER.test(member.memberId) || memberIds.has(member.memberId) ||
-          typeof member.name !== 'string' || !member.name || typeof member.model !== 'string' ||
-          !member.model || typeof member.promptSha256 !== 'string' || !SHA.test(member.promptSha256)) {
+          member.name !== original.name || member.model !== (original.model ?? source.selectedModel) ||
+          typeof original.prompt !== 'string' || member.promptSha256 !== sha(original.prompt)) {
           throw new Error('hosted-product-roster-corrupt')
         }
         memberIds.add(member.memberId)
@@ -268,7 +494,7 @@ export class HostedProductCurrentMemberDecision {
     })
     if (found.length !== 1 || found[0].lane.laneId !== binding.laneId) return null
     const publication = db.query(`SELECT operation_id, runtime_workspace_id, binding_generation,
-      legacy_key, directory_fingerprint FROM main.hosted_team_configuration_publications
+      legacy_key, directory_fingerprint, initial_revision FROM main.hosted_team_configuration_publications
       WHERE workspace_id = ? AND team_id = ? AND actor_id = ? AND deployment_id = ? AND state = 'published'`)
       .get(reservation.workspaceId as string, binding.teamId, reservation.actorId as string,
         binding.deploymentId) as Row | null
@@ -284,6 +510,10 @@ export class HostedProductCurrentMemberDecision {
       identity.workspace_binding_generation !== publication.binding_generation ||
       identity.adoption_intent_id !== publication.operation_id ||
       identity.identity_checksum !== fence.identityChecksum) return null
+    const createKeys = db.query(`SELECT initial_revision FROM main.hosted_team_configuration_create_keys
+      WHERE workspace_id = ? AND team_id = ?`).all(reservation.workspaceId as string,
+      binding.teamId) as Row[]
+    if (createKeys.length !== 1 || createKeys[0].initial_revision !== publication.initial_revision) return null
     if (!this.currentGrantAndSession(reservation, evidence, fence)) return null
     const { lane, member } = found[0]
     return Object.freeze({ ...binding, workspaceId: reservation.workspaceId as string,
