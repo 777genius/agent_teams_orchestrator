@@ -94,6 +94,51 @@ describe('model list handler', () => {
     expect(details.models.map(model => model.id)).toEqual(['xai/grok-code-fast-1'])
   })
 
+  describe('OpenCode Default matches runtime status', () => {
+    const snapshotWith = (models: string[]) => async () => ({
+      detected: true,
+      binaryPath: '/tmp/opencode',
+      version: '1.18.4',
+      projectPath: '/tmp/project',
+      profile: null,
+      connectedProviders: [],
+      availableProviders: ['openai', 'opencode', 'xai'],
+      models,
+      modelMetadata: [],
+      agents: [],
+      authStorePath: null,
+      probeError: null,
+      diagnostics: [],
+    })
+
+    const runtimeStatusDefault = async (models: string[]) => {
+      const registryModulePath = new URL(
+        '../../services/runtimeBackends/registry.js',
+        import.meta.url,
+      ).href
+      const { getUnifiedRuntimeStatusPayload } = await import(
+        `${registryModulePath}?test=${Math.random().toString(36).slice(2)}`
+      )
+      const payload = await getUnifiedRuntimeStatusPayload('opencode', {
+        getOpenCodeInventorySnapshot: snapshotWith(models),
+      })
+      return payload.providers.opencode?.modelCatalog?.defaultLaunchModel ?? null
+    }
+
+    test.each([
+      [['openai/gpt-5.4', 'opencode/big-pickle'], 'opencode/big-pickle'],
+      [['opencode/big-pickle', 'openai/gpt-5.4'], 'opencode/big-pickle'],
+      [['openai/gpt-5.4', 'xai/grok-code-fast-1'], 'openai/gpt-5.4'],
+    ])('picks the same Default for %j', async (models, expected) => {
+      const details = await getProviderModels('opencode', {
+        getOpenCodeInventorySnapshot: snapshotWith(models),
+      })
+
+      expect(details.defaultModel).toBe(expected)
+      expect(await runtimeStatusDefault(models)).toBe(expected)
+    })
+  })
+
   test('waits for JSON stdout to flush before exiting', async () => {
     const originalWrite = process.stdout.write
     const originalExit = process.exit
