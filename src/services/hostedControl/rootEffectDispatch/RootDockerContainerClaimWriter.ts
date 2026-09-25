@@ -36,6 +36,23 @@ type Options = Readonly<{
   testOnlyAllowNonRoot?: boolean
 }>
 
+type DirectoryIdentity = Readonly<{ name: string; dev: number; ino: number }>
+
+function trustedAncestors(directory: string, uid: number, test: boolean): readonly DirectoryIdentity[] {
+  const ancestors: DirectoryIdentity[] = []
+  for (let name = path.dirname(directory); ; name = path.dirname(name)) {
+    const stat = lstatSync(name)
+    const immediate = name === path.dirname(directory)
+    if (!stat.isDirectory() || stat.isSymbolicLink() || realpathSync(name) !== name ||
+      (test ? immediate && (stat.uid !== uid || (stat.mode & 0o777) !== 0o700) :
+        stat.uid !== 0 || (stat.mode & 0o022) !== 0)) {
+      throw new Error('root-container-writer-ancestor-untrusted')
+    }
+    ancestors.push({ name, dev: stat.dev, ino: stat.ino })
+    if (name === path.dirname(name)) return ancestors
+  }
+}
+
 function exact(value: unknown, keys: readonly string[]): boolean {
   return !!value && typeof value === 'object' && !Array.isArray(value) &&
     Object.keys(value).sort().join(',') === [...keys].sort().join(',')
@@ -45,12 +62,47 @@ function pathUnder(value: string, parent: string): boolean {
   return typeof value === 'string' && path.dirname(value) === parent && PROFILE.test(path.basename(value))
 }
 
+function snapshotTarget(value: RootContainerTarget, withId: boolean): RootContainerTarget {
+  const fields = ['memberOperationId', 'handle', 'generation', 'networkId',
+    ...(withId ? ['containerId'] : [])]
+  if (!value || Object.getPrototypeOf(value) !== Object.prototype || !exact(value, fields)) {
+    throw new Error('root-container-writer-target-invalid')
+  }
+  const copy: Record<string, unknown> = {}
+  for (const key of fields) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key)
+    if (!descriptor || !descriptor.enumerable || !('value' in descriptor)) {
+      throw new Error('root-container-writer-target-invalid')
+    }
+    copy[key] = descriptor.value
+  }
+  return Object.freeze(copy) as RootContainerTarget
+}
+
+function snapshotInput(value: CreateInput): CreateInput {
+  const fields = ['target', 'workspace', 'profile', 'config', 'seccomp', 'apparmorProfile']
+  if (!value || Object.getPrototypeOf(value) !== Object.prototype || !exact(value, fields)) {
+    throw new Error('root-container-writer-create-invalid')
+  }
+  const copy: Record<string, unknown> = {}
+  for (const key of fields) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key)
+    if (!descriptor || !descriptor.enumerable || !('value' in descriptor)) {
+      throw new Error('root-container-writer-create-invalid')
+    }
+    copy[key] = descriptor.value
+  }
+  return Object.freeze(copy) as CreateInput
+}
+
 /** Publishes only root-owned, secret-free launch claims. An existing claim is never overwritten. */
 export class RootDockerContainerClaimWriter {
   private readonly identity: Readonly<{ dev: number; ino: number }>
   private readonly uid: number
+  private readonly options: Options
+  private readonly ancestors: readonly DirectoryIdentity[]
 
-  private constructor(private readonly options: Options) {
+  private constructor(options: Options) {
     if (options.testOnlyAllowNonRoot && process.env.NODE_ENV !== 'test' ||
       !options.testOnlyAllowNonRoot && (process.platform !== 'linux' || process.getuid?.() !== 0) ||
       !IMAGE.test(options.image) || !SHA.test(options.networkId) ||
@@ -65,6 +117,8 @@ export class RootDockerContainerClaimWriter {
       throw new Error('root-container-writer-state-invalid')
     }
     this.identity = { dev: stat.dev, ino: stat.ino }
+    this.ancestors = trustedAncestors(options.stateDirectory, this.uid, !!options.testOnlyAllowNonRoot)
+    this.options = Object.freeze({ ...options, binding: Object.freeze({ ...options.binding }) })
   }
 
   static create(options: Options): RootDockerContainerClaimWriter {
@@ -72,6 +126,13 @@ export class RootDockerContainerClaimWriter {
   }
 
   private assertDirectory(): void {
+    const currentAncestors = trustedAncestors(this.options.stateDirectory, this.uid,
+      !!this.options.testOnlyAllowNonRoot)
+    if (currentAncestors.length !== this.ancestors.length || currentAncestors.some((entry, index) =>
+      entry.name !== this.ancestors[index].name || entry.dev !== this.ancestors[index].dev ||
+      entry.ino !== this.ancestors[index].ino)) {
+      throw new Error('root-container-writer-ancestor-substituted')
+    }
     const stat = lstatSync(this.options.stateDirectory)
     if (!stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== this.uid ||
       (stat.mode & 0o777) !== 0o700 || stat.dev !== this.identity.dev ||
@@ -86,6 +147,21 @@ export class RootDockerContainerClaimWriter {
     if (bytes.length < 1 || bytes.length > 256 * 1024 + 512) {
       throw new Error('root-container-writer-claim-too-large')
     }
+    const directory = openSync(this.options.stateDirectory, constants.O_RDONLY | constants.O_DIRECTORY |
+      constants.O_NOFOLLOW)
+    try {
+      const opened = fstatSync(directory)
+      if (opened.dev !== this.identity.dev || opened.ino !== this.identity.ino) {
+        throw new Error('root-container-writer-state-substituted')
+      }
+      this.assertDirectory()
+      this.writeClaim(name, bytes)
+      this.assertDirectory()
+      fsyncSync(directory)
+    } finally { closeSync(directory) }
+  }
+
+  private writeClaim(name: string, bytes: Buffer): void {
     const fd = openSync(path.join(this.options.stateDirectory, name),
       constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600)
     try {
@@ -102,9 +178,6 @@ export class RootDockerContainerClaimWriter {
         throw new Error('root-container-writer-claim-invalid')
       }
     } finally { closeSync(fd) }
-    const directory = openSync(this.options.stateDirectory, constants.O_RDONLY | constants.O_DIRECTORY |
-      constants.O_NOFOLLOW)
-    try { fsyncSync(directory) } finally { closeSync(directory) }
   }
 
   private manifest(memberOperationId: string): Record<string, unknown> {
@@ -125,13 +198,13 @@ export class RootDockerContainerClaimWriter {
     } finally { closeSync(fd) }
   }
 
-  async writeCreate(input: CreateInput): Promise<void> {
-    if (!exact(input, ['target', 'workspace', 'profile', 'config', 'seccomp', 'apparmorProfile']) ||
-      !exact(input.target, ['memberOperationId', 'handle', 'generation', 'networkId']) ||
-      input.target.memberOperationId !== hostedMemberStartOperationId(this.options.binding.runId,
+  async writeCreate(source: CreateInput): Promise<void> {
+    const input = snapshotInput(source)
+    const target = snapshotTarget(input.target, false)
+    if (target.memberOperationId !== hostedMemberStartOperationId(this.options.binding.runId,
         this.options.binding.memberId, this.options.binding.planSha256) ||
-      !HANDLE.test(input.target.handle) || !GENERATION.test(input.target.generation) ||
-      input.target.networkId !== this.options.networkId ||
+      !HANDLE.test(target.handle) || !GENERATION.test(target.generation) ||
+      target.networkId !== this.options.networkId ||
       !pathUnder(input.workspace, this.options.workspaceParent) ||
       !pathUnder(input.profile, this.options.profileParent) ||
       !pathUnder(input.config, this.options.configParent) ||
@@ -144,13 +217,13 @@ export class RootDockerContainerClaimWriter {
     const body = JSON.stringify({ Image: this.options.image, User: '1000:1000',
       WorkingDir: '/sandbox/workspace',
       Entrypoint: [BOOTSTRAP],
-      Cmd: ['--socket-name', `fd3-${input.target.generation}`, '--sender-uid', '0'],
+      Cmd: ['--socket-name', `fd3-${target.generation}`, '--sender-uid', '0'],
       Env: ['HOME=/sandbox/profile/home', 'XDG_CONFIG_HOME=/sandbox/profile/config',
         'XDG_DATA_HOME=/sandbox/profile/data', 'XDG_CACHE_HOME=/sandbox/profile/cache',
         'XDG_STATE_HOME=/sandbox/profile/state', 'TMPDIR=/sandbox/profile/tmp',
         'OPENCODE_CONFIG_DIR=/sandbox/config', 'OPENCODE_DISABLE_PROJECT_CONFIG=1',
         'OPENCODE_DISABLE_CLAUDE_CODE=1', 'OPENCODE_SERVER_PASSWORD'],
-      Labels: { [GENERATION_LABEL]: input.target.generation },
+      Labels: { [GENERATION_LABEL]: target.generation },
       ExposedPorts: { '4096/tcp': {} },
       HostConfig: { ReadonlyRootfs: true, Privileged: false, NetworkMode: this.options.networkId,
         IpcMode: 'private', CapDrop: ['ALL'], SecurityOpt: ['no-new-privileges:true',
@@ -169,21 +242,21 @@ export class RootDockerContainerClaimWriter {
       throw new Error('root-container-writer-create-invalid')
     }
     await this.options.authority.withCurrentMemberDecision(this.options.binding, 'prepare', () => {
-      this.claim(`container-create-${input.target.memberOperationId}.json`, { ...input.target, body })
+      this.claim(`container-create-${target.memberOperationId}.json`, { ...target, body })
     })
   }
 
   /** Post-create evidence is recorded even after revocation so exact cleanup can locate the resource. */
   writeTarget(target: RootContainerTarget): void {
-    if (!exact(target, ['memberOperationId', 'handle', 'generation', 'networkId', 'containerId']) ||
-      typeof target.containerId !== 'string' || !SHA.test(target.containerId) ||
-      target.memberOperationId !== hostedMemberStartOperationId(this.options.binding.runId,
+    const stable = snapshotTarget(target, true)
+    if (typeof stable.containerId !== 'string' || !SHA.test(stable.containerId) ||
+      stable.memberOperationId !== hostedMemberStartOperationId(this.options.binding.runId,
         this.options.binding.memberId, this.options.binding.planSha256)) {
       throw new Error('root-container-writer-target-invalid')
     }
-    const manifest = this.manifest(target.memberOperationId)
-    if (target.handle !== manifest.handle || target.generation !== manifest.generation ||
-      target.networkId !== manifest.networkId) throw new Error('root-container-writer-target-unbound')
-    this.claim(`container-target-${target.memberOperationId}.json`, target)
+    const manifest = this.manifest(stable.memberOperationId)
+    if (stable.handle !== manifest.handle || stable.generation !== manifest.generation ||
+      stable.networkId !== manifest.networkId) throw new Error('root-container-writer-target-unbound')
+    this.claim(`container-target-${stable.memberOperationId}.json`, stable)
   }
 }
