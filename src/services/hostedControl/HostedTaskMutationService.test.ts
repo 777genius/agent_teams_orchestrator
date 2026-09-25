@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { lstat, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, mkdtemp, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { getAgentStatuses, getTask, listTasks } from '../../utils/tasks.js'
@@ -89,6 +89,37 @@ describe('HostedTaskMutationService', () => {
 
     const denied = new HostedTaskMutationService({ claudeRoot: root, legacyKey: 'legacy', authority, wal: new HostedTaskMutationWal(join(root, 'teams', 'legacy'), teamId), denyOwnerLocalWrites: true })
     expect(await denied.mutateWithSelfWriteEffects(requestFor(authority, { ...updated.command, commandId: 'command_denied', idempotencyKey: 'idem:denied' }))).toEqual({ result: { kind: 'unavailable' }, selfWriteEffects: [] })
+  })
+
+  test('keeps its WAL and fence off the Product task-board transaction files and adopts a legacy Owner WAL', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'hosted-service-owner-wal-')); roots.push(root)
+    const teamRoot = join(root, 'teams', 'legacy')
+    await mkdir(teamRoot, { recursive: true, mode: 0o700 }); await mkdir(join(root, 'tasks', 'legacy'), { recursive: true, mode: 0o700 })
+    const teamId = `team_${'b'.repeat(32)}`; const authority = authorityFor(teamId)
+    let crash = false
+    const service = () => new HostedTaskMutationService({ claudeRoot: root, legacyKey: 'legacy', authority, wal: new HostedTaskMutationWal(teamRoot, teamId),
+      crashHook: stage => { if (crash && stage === 'after_task_write') { crash = false; throw new Error('cut') } } })
+    const created = await runCommand(service(), authority, { schemaVersion: 1, kind: 'create_task', commandId: 'command_owner_wal', idempotencyKey: 'idem:owner-wal', teamId, expectedSourceGeneration: 'generation_stale', expectedRevision: 'revision_stale', subject: 'Owner WAL', description: null, status: 'pending', ownerId: null, column: 'todo', order: 0 })
+    expect(created.result.kind).toBe('committed')
+    // Product reads hosted-task-board-mutation.wal.v1.json as its own transaction; it must stay Product's.
+    expect((await readdir(teamRoot)).sort()).toEqual(['hosted-task-board-mutation-ledger.v2.json', 'hosted-task-board-owner-mutation.wal.v1.json', 'kanban-state.json'])
+
+    // An earlier Owner left a crashed WAL under Product's name: recovery adopts and completes it.
+    crash = true
+    const next = { ...created.command, commandId: 'command_owner_wal_2', idempotencyKey: 'idem:owner-wal-2', subject: 'Owner WAL recovered', expectedRevision: 'revision_stale' }
+    const stale = await service().mutate(requestFor(authority, next)); if (stale.kind !== 'stale_revision') throw new Error('expected stale revision')
+    const second = { ...next, expectedRevision: stale.currentRevision }
+    expect((await service().mutate(requestFor(authority, second))).kind).toBe('unavailable')
+    await rename(join(teamRoot, 'hosted-task-board-owner-mutation.wal.v1.json'), join(teamRoot, 'hosted-task-board-mutation.wal.v1.json'))
+    expect(await service().recover()).toBe(true)
+    expect((await readdir(teamRoot)).sort()).toEqual(['hosted-task-board-mutation-ledger.v2.json', 'hosted-task-board-owner-mutation.wal.v1.json', 'kanban-state.json'])
+    expect((await service().mutate(requestFor(authority, second))).kind).toBe('idempotent_replay')
+
+    // A Product WAL under that name is not the Owner's and is left exactly as it is.
+    const productWal = JSON.stringify({ schemaVersion: 3, phase: 'terminal', transactionId: 'transaction_product' })
+    await writeFile(join(teamRoot, 'hosted-task-board-mutation.wal.v1.json'), productWal, { mode: 0o600 })
+    expect(await service().recover()).toBe(true)
+    expect(await readFile(join(teamRoot, 'hosted-task-board-mutation.wal.v1.json'), 'utf8')).toBe(productWal)
   })
 
   test('derives source generation from the board directory authority before revision admission', async () => {

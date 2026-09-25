@@ -73,6 +73,7 @@ export class HostedTaskMutationService {
   }
 
   async recover(): Promise<boolean> {
+    try { await this.options.wal.adoptLegacyWal() } catch { return false }
     if (this.options.denyOwnerLocalWrites) {
       try { return (await this.options.wal.listAmbiguous()).length === 0 } catch { return false }
     }

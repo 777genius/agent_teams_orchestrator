@@ -9,6 +9,14 @@ import { decodeHostedControlAuthority, decodeHostedTaskMutationCommand, fingerpr
 import type { HostedControlAuthority, HostedTaskMutationCommand, HostedTaskMutationCommittedResult, HostedTaskMutationReceipt } from './protocol.js'
 
 const MAX_WAL_BYTES = 8 * 1024 * 1024
+/**
+ * Product's own task-board writer and read source own `hosted-task-board-mutation.{wal,fence}.v1.json`
+ * in the same team directory, with a different transaction format. The Owner writer keeps its
+ * files under Owner names; the idempotency ledger is the one format both writers share.
+ */
+export const HOSTED_OWNER_TASK_MUTATION_WAL_FILE = 'hosted-task-board-owner-mutation.wal.v1.json'
+export const HOSTED_OWNER_TASK_MUTATION_FENCE_FILE = 'hosted-task-board-owner-mutation.fence.v1.json'
+const LEGACY_OWNER_TASK_MUTATION_WAL_FILE = 'hosted-task-board-mutation.wal.v1.json'
 const PROCESS_START_IDENTITY = readProcessStartIdentity(process.pid) ??
   `start_${createHash('sha256').update(`${process.pid}\0${Math.floor(Date.now() - process.uptime() * 1000)}`).digest('hex')}`
 export const HOSTED_MUTATION_RETRY_AFTER_MS = 5_000
@@ -84,8 +92,29 @@ export class HostedTaskMutationWal {
         const current = (options.getProcessStartIdentity ?? readProcessStartIdentity)(pid)
         return current !== null && current === recorded
       })
-    this.#path = join(directory, 'hosted-task-board-mutation.wal.v1.json')
-    this.#fencePath = join(directory, 'hosted-task-board-mutation.fence.v1.json')
+    this.#path = join(directory, HOSTED_OWNER_TASK_MUTATION_WAL_FILE)
+    this.#fencePath = join(directory, HOSTED_OWNER_TASK_MUTATION_FENCE_FILE)
+  }
+  /**
+   * Earlier Owners wrote their WAL under Product's name, which Product then failed to read. Move
+   * a WAL that decodes as this Owner's format to the Owner name; a Product WAL is never touched.
+   */
+  async adoptLegacyWal(): Promise<void> {
+    const legacyPath = join(this.directory, LEGACY_OWNER_TASK_MUTATION_WAL_FILE)
+    const legacy = await readNoFollowFile(legacyPath).catch(error => {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+      throw error
+    })
+    if (!legacy) return
+    try { decodeWalState(JSON.parse(legacy.text), this.teamId) } catch { return }
+    if (await lstat(this.#path).then(() => true, error => {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+      throw error
+    })) throw new Error('Hosted WAL exists under both the legacy and the Owner name')
+    await rename(legacyPath, this.#path)
+    const moved = await lstat(this.#path)
+    if (moved.dev !== legacy.device || moved.ino !== legacy.inode) throw new Error('Hosted legacy WAL changed while it was adopted')
+    await fsyncDirectoryPath(this.directory)
   }
   get path(): string { return this.#path }
   get fencePath(): string { return this.#fencePath }
