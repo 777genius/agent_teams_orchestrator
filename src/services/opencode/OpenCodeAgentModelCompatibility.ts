@@ -88,3 +88,17 @@ export function filterOpenCodeAgentModels(
     evaluateOpenCodeAgentModelCompatibility(model, metadataById.get(model)).compatible,
   )
 }
+
+const OPEN_CODE_PREFERRED_DEFAULT_AGENT_MODEL = 'opencode/big-pickle'
+
+// Both `runtime status` (the catalog the app shows) and `model list` (what a
+// launch resolves when no model was chosen) must pick the same Default.
+export function selectOpenCodeDefaultAgentModel(
+  agentModels: readonly string[],
+): string | null {
+  return (
+    agentModels.find(model => model === OPEN_CODE_PREFERRED_DEFAULT_AGENT_MODEL) ??
+    agentModels[0] ??
+    null
+  )
+}

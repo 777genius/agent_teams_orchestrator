@@ -4,6 +4,7 @@ import {
   evaluateOpenCodeAgentModelCompatibility,
   filterOpenCodeAgentModels,
   getOpenCodeModelInputModalities,
+  selectOpenCodeDefaultAgentModel,
 } from './OpenCodeAgentModelCompatibility.js'
 
 import type { OpenCodeModelMetadata } from './types.js'
@@ -73,5 +74,13 @@ describe('OpenCode agent model compatibility', () => {
         [image],
       ),
     ).toEqual(['xai/grok-4.3', 'custom/unknown'])
+  })
+
+  test('selects the preferred Default wherever it sits, else the first agent model', () => {
+    expect(selectOpenCodeDefaultAgentModel(['openai/gpt-5.4', 'opencode/big-pickle']))
+      .toBe('opencode/big-pickle')
+    expect(selectOpenCodeDefaultAgentModel(['openai/gpt-5.4', 'xai/grok-4.3']))
+      .toBe('openai/gpt-5.4')
+    expect(selectOpenCodeDefaultAgentModel([])).toBeNull()
   })
 })
