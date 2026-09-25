@@ -3,6 +3,7 @@
 
 import importlib.util
 import array
+import copy
 import hashlib
 import io
 import json
@@ -82,6 +83,85 @@ def synthetic_authority_directory():
     return temp, directory
 
 
+def current_member(config):
+    """Canonical decision shape only; this fixture is not a Product validator."""
+    member = {key: value for key, value in config["binding"].items() if key != "operationId"}
+    member.update({
+        "workspaceId": "workspace_" + "6" * 32, "actorId": "actor_fixture1234",
+        "bootId": "boot_fixture1234", "promotionOperationId": "promotion_" + "7" * 32,
+        "memberName": "builder", "model": "qwen/model", "promptSha256": "c" * 64,
+        "admittedWorkspaceRoot": "/sandbox/workspace", "grantRevision": "d" * 64,
+        "grantGeneration": config["binding"]["restoreGeneration"], "laneOrdinal": 0,
+        "memberOrdinal": 0,
+    })
+    return member
+
+
+class ExactClaimContractTest(unittest.TestCase):
+    def setUp(self):
+        self.config = authority_config(arguments(), "/unused/product.sqlite")
+        self.current = current_member(self.config)
+
+    def check(self, current=None, owner_binding=None, owner_container=None):
+        handoff.assert_exact_handoff_claim(
+            self.current if current is None else current, self.config["binding"],
+            self.config["container"], self.config["binding"] if owner_binding is None else owner_binding,
+            self.config["container"] if owner_container is None else owner_container)
+
+    def test_exact_decision_and_owner_claim_projections_match(self):
+        self.check()
+        # Mapping insertion order is not authority.
+        self.check(owner_binding=dict(reversed(list(self.config["binding"].items()))))
+
+    def test_stale_product_member_plan_and_epoch_are_rejected(self):
+        replacements = {
+            "runId": "run_" + "f" * 32, "memberId": "member_" + "f" * 32,
+            "teamId": "team_" + "f" * 32, "laneId": "lane_" + "f" * 32,
+            "deploymentId": "deployment_stale1234", "runtimeWorkspaceId": "workspace_" + "f" * 32,
+            "planSha256": "f" * 64, "rosterBindingSha256": "f" * 64,
+            "restoreGeneration": 1, "mountGeneration": 2,
+        }
+        for field, value in replacements.items():
+            for source in ("current", "owner_binding"):
+                changed = copy.deepcopy(self.current if source == "current" else self.config["binding"])
+                changed[field] = value
+                with self.subTest(field=field, source=source), self.assertRaises(handoff.HandoffError):
+                    self.check(**{source: changed})
+        changed = dict(self.config["binding"], operationId="start_" + "f" * 64)
+        with self.assertRaises(handoff.HandoffError):
+            self.check(owner_binding=changed)
+
+    def test_owner_claim_cannot_change_any_dispatch_target_field(self):
+        replacements = {
+            "containerId": "f" * 64, "handle": "opencode_" + "f" * 32,
+            "generation": "f" * 32, "networkId": "f" * 64, "pid": 12346,
+            "startTicks": "987654322", "netns": "net:[4026533000]", "binarySha256": "f" * 64,
+        }
+        for field, value in replacements.items():
+            changed = dict(self.config["container"], **{field: value})
+            with self.subTest(field=field), self.assertRaises(handoff.HandoffError):
+                self.check(owner_container=changed)
+
+    def test_ambiguous_types_missing_fields_and_unknown_fields_are_rejected(self):
+        for source, original in (("current", self.current), ("owner_binding", self.config["binding"]),
+                                 ("owner_container", self.config["container"])):
+            invalid = [None, [], dict(original, unexpected=True)]
+            missing = dict(original)
+            missing.pop(next(iter(missing)))
+            invalid.append(missing)
+            field = "pid" if source == "owner_container" else "mountGeneration"
+            for value in (True, float(original[field]), str(original[field])):
+                invalid.append(dict(original, **{field: value}))
+            for value in invalid:
+                with self.subTest(source=source, value=value), self.assertRaises(handoff.HandoffError):
+                    # Call directly so None cannot select the fixture default.
+                    inputs = {"current_member": self.current, "owner_binding": self.config["binding"],
+                              "owner_container": self.config["container"]}
+                    inputs["current_member" if source == "current" else source] = value
+                    handoff.assert_exact_handoff_claim(binding=self.config["binding"],
+                                                      container=self.config["container"], **inputs)
+
+
 class HandoffContractTest(unittest.TestCase):
     def test_private_generation_config_binds_exact_container_member_and_db(self):
         args = arguments()
@@ -143,16 +223,24 @@ class HandoffContractTest(unittest.TestCase):
             db.commit()
             db.close()
             db_path.chmod(0o600)
-            fence = handoff.ProductMemberFence(authority_config(args, db_path), test_only=True)
+            config = authority_config(args, db_path)
+            fence = handoff.ProductMemberFence(config, test_only=True)
             revoker = sqlite3.connect(db_path, timeout=0)
             sender, recipient = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
             owner, carried = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
-            # Only this inert test patches the intentionally unavailable Product validator.
-            with patch.object(handoff.ProductMemberFence, "assert_current", return_value=None):
+            # The real validator is intentionally unavailable. Exercise only the
+            # exact comparison and transaction/send boundary with inert fixtures.
+            def fixture_check():
+                self.assertTrue(fence.connection.in_transaction)
+                handoff.assert_exact_handoff_claim(current_member(config), config["binding"],
+                    config["container"], dict(config["binding"]), dict(config["container"]))
+
+            with patch.object(handoff.ProductMemberFence, "assert_current", side_effect=fixture_check):
                 fence.begin()
                 with self.assertRaises(sqlite3.OperationalError):
                     revoker.execute("UPDATE synthetic_revocation SET value=1")
                 attempt = handoff.HandoffAttempt()
+                fence.assert_current()
                 attempt.send(sender, carried)
                 marker, ancillary, _flags, _address = recipient.recvmsg(1, socket.CMSG_SPACE(4))
                 self.assertEqual(marker, b"F")

@@ -50,6 +50,10 @@ PRODUCT_BINDING_KEYS = frozenset((*CANONICAL_IDS, "planSha256", "rosterBindingSh
                                   "restoreGeneration", "mountGeneration", "operationId"))
 CONTAINER_BINDING_KEYS = frozenset(("containerId", "handle", "generation", "networkId",
                                     "pid", "startTicks", "netns", "binarySha256"))
+CURRENT_MEMBER_KEYS = (PRODUCT_BINDING_KEYS - {"operationId"}) | frozenset((
+    "workspaceId", "actorId", "bootId", "promotionOperationId", "memberName", "model",
+    "promptSha256", "admittedWorkspaceRoot", "grantRevision", "grantGeneration",
+    "laneOrdinal", "memberOrdinal"))
 
 
 class HandoffError(Exception):
@@ -90,6 +94,63 @@ def exact_object(value, keys, reason):
 
 def canonical_json(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def validate_product_binding(binding):
+    exact_object(binding, PRODUCT_BINDING_KEYS, "authority-binding")
+    for key, pattern in CANONICAL_IDS.items():
+        require(type(binding[key]) is str and len(binding[key]) <= 128 and
+                pattern.fullmatch(binding[key]), "authority-binding")
+    require(all(type(binding[key]) is str and SHA256.fullmatch(binding[key]) for key in
+                ("planSha256", "rosterBindingSha256")) and
+            type(binding["restoreGeneration"]) is int and
+            0 <= binding["restoreGeneration"] <= 2**53 - 1 and
+            type(binding["mountGeneration"]) is int and
+            1 <= binding["mountGeneration"] <= 2**53 - 1,
+            "authority-binding")
+    operation = "start_" + hashlib.sha256(
+        b"agent-teams.hosted-opencode-member-start/v1\0" +
+        json.dumps([binding["runId"], binding["memberId"], binding["planSha256"]],
+                   separators=(",", ":")).encode("utf-8")).hexdigest()
+    require(type(binding["operationId"]) is str and binding["operationId"] == operation,
+            "authority-binding")
+
+
+def validate_container_binding(container):
+    exact_object(container, CONTAINER_BINDING_KEYS, "authority-container")
+    patterns = {
+        "containerId": r"[0-9a-f]{64}", "handle": r"opencode_[0-9a-f]{32}",
+        "generation": r"[0-9a-f]{32}", "networkId": r"[0-9a-f]{64}",
+        "startTicks": r"[1-9][0-9]*", "netns": r"net:\[[1-9][0-9]*\]",
+    }
+    require(all(type(container[key]) is str and len(container[key]) <= 128 and
+                re.fullmatch(pattern, container[key]) for key, pattern in patterns.items()) and
+            type(container["pid"]) is int and 1 < container["pid"] <= 2**31 - 1 and
+            container["binarySha256"] == OFFICIAL_BINARY_SHA, "authority-container")
+
+
+def assert_exact_handoff_claim(current_member, binding, container, owner_binding, owner_container):
+    """Compare decoded claim projections; this function grants no dispatch authority.
+
+    The current_member input must come from the canonical Product v33 validator
+    while holding its writer lock, and Owner projections from independently
+    verified durable root state. Neither source is wired here yet. In particular,
+    caller-provided JSON or a previously successful comparison is not authority.
+    Production ProductMemberFence.assert_current continues to deny all sends.
+    """
+    validate_product_binding(binding)
+    validate_product_binding(owner_binding)
+    validate_container_binding(container)
+    validate_container_binding(owner_container)
+    current = exact_object(current_member, CURRENT_MEMBER_KEYS, "claim-current-member")
+    current_binding = {key: current[key] for key in PRODUCT_BINDING_KEYS - {"operationId"}}
+    current_binding["operationId"] = binding["operationId"]
+    validate_product_binding(current_binding)
+    # Compare serialized values as well as exact schemas: Python considers True
+    # equal to 1, and 1.0 equal to 1. Those are different authority generations.
+    require(canonical_json(current_binding) == canonical_json(binding) and
+            canonical_json(owner_binding) == canonical_json(binding), "claim-member-mismatch")
+    require(canonical_json(owner_container) == canonical_json(container), "claim-target-mismatch")
 
 
 def trusted_ancestor(path, uid, test_only=False):
@@ -141,22 +202,9 @@ def load_authority_config(args, test_only=False):
             type(config["expectedProductUid"]) is int and
             0 <= config["expectedProductUid"] <= 2**31 - 1 and
             data == canonical_json(config), "authority-config-canonical")
-    binding = exact_object(config["binding"], PRODUCT_BINDING_KEYS, "authority-binding")
-    container = exact_object(config["container"], CONTAINER_BINDING_KEYS, "authority-container")
-    for key, pattern in CANONICAL_IDS.items():
-        require(type(binding[key]) is str and pattern.fullmatch(binding[key]), "authority-binding")
-    require(all(type(binding[key]) is str and SHA256.fullmatch(binding[key]) for key in
-                ("planSha256", "rosterBindingSha256")) and
-            type(binding["restoreGeneration"]) is int and
-            0 <= binding["restoreGeneration"] <= 2**53 - 1 and
-            type(binding["mountGeneration"]) is int and
-            1 <= binding["mountGeneration"] <= 2**53 - 1,
-            "authority-binding")
-    operation = "start_" + hashlib.sha256(
-        b"agent-teams.hosted-opencode-member-start/v1\0" +
-        json.dumps([binding["runId"], binding["memberId"], binding["planSha256"]],
-                   separators=(",", ":")).encode("utf-8")).hexdigest()
-    require(binding["operationId"] == operation, "authority-binding")
+    validate_product_binding(config["binding"])
+    container = config["container"]
+    validate_container_binding(container)
     expected = {"containerId": args.container_id, "handle": args.handle,
                 "generation": args.generation, "networkId": args.network_id,
                 "pid": args.pid, "startTicks": args.start_ticks, "netns": args.netns,
