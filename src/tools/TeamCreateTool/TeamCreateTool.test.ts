@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdtempSync, rmSync } from 'fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 
@@ -135,6 +135,33 @@ describe('TeamCreateTool', () => {
 
     const teamFile = await readTeamFileAsync('codex-safe-fallback')
     expect(teamFile?.members[0]?.model).toBe('gpt-5.4')
+  })
+
+  test('replaces the hosted draft placeholder in place instead of renaming the team', async () => {
+    const teamDir = join(tempConfigDir, 'teams', 'hosted-draft')
+    mkdirSync(teamDir, { recursive: true })
+    writeFileSync(join(teamDir, 'config.json'),
+      `${JSON.stringify({ name: 'hosted-draft', pendingCreate: true }, null, 2)}\n`)
+    // A pinned model keeps lead model resolution away from ambient provider auth.
+    setMainLoopModelOverride('claude-opus-4-6')
+    setInitialMainLoopModel('claude-opus-4-6')
+    let appState: AppState = { teamContext: undefined } as AppState
+
+    const call = TeamCreateTool.call as (input: unknown, context: unknown) => Promise<unknown>
+    const result = await call(
+      { team_name: 'hosted-draft', description: 'Hosted native launch' },
+      {
+        getAppState: () => appState,
+        setAppState: updater => {
+          appState = updater(appState)
+        },
+      } as never
+    )
+
+    expect((result as { data: { team_name: string } }).data.team_name).toBe('hosted-draft')
+    const teamFile = await readTeamFileAsync('hosted-draft')
+    expect(teamFile?.leadAgentId).toBe('team-lead@hosted-draft')
+    expect(teamFile?.members.map(member => member.name)).toEqual(['team-lead'])
   })
 
   test('rejects Windows reserved team names before creating team files', async () => {

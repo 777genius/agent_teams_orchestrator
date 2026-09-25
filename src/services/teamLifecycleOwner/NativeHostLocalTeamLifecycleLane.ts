@@ -1,11 +1,12 @@
 import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
 import { closeSync, openSync } from 'node:fs'
-import { access, mkdir, rm } from 'node:fs/promises'
+import { mkdir, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { isAbsolute, join, sep } from 'node:path'
 
 import { isInBundledMode } from '../../utils/bundledMode.js'
+import { isHostedTeamDraftPlaceholder } from '../../utils/swarm/hostedTeamDraftPlaceholder.js'
 import {
   enforceNativeLaneLogLimit,
   ensureClaudeWorkspaceTrust,
@@ -267,7 +268,7 @@ export class NativeHostLocalTeamLifecycleLane implements TeamLifecycleLaneEffect
       claudeRoot: this.#claudeRoot,
       workspaceRoot: input.workspaceRoot,
     })
-    const teamExists = await access(join(this.#teamRoot, 'config.json')).then(() => true, () => false)
+    const teamExists = await hasMaterializedTeam(this.#teamRoot, this.#teamName)
     const files = {
       specPath: join(runtimeDir, 'bootstrap-spec.json'),
       userPromptPath: join(runtimeDir, 'lead-prompt.txt'),
@@ -426,6 +427,23 @@ export function createNativeHostLocalTeamLifecycleLane(
   dependencies?: NativeHostLocalLaneDependencies,
 ): NativeHostLocalTeamLifecycleLane {
   return new NativeHostLocalTeamLifecycleLane(context, config, dependencies)
+}
+
+/**
+ * A bootstrap `launch` needs a real team file. The hosted draft placeholder is
+ * not one, so it takes the `create` path, which replaces it in place.
+ */
+async function hasMaterializedTeam(teamRoot: string, teamName: string): Promise<boolean> {
+  let raw: string
+  try {
+    raw = await readFile(join(teamRoot, 'config.json'), 'utf8')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+    throw error
+  }
+  let parsed: unknown
+  try { parsed = JSON.parse(raw) } catch { return true }
+  return !isHostedTeamDraftPlaceholder(parsed, teamName)
 }
 
 /** Stable per-team directory name below the host-private root. */

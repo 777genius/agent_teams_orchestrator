@@ -21,6 +21,7 @@ import {
   unregisterTeamForSessionCleanup,
   updateTeamFileAsync,
 } from 'src/utils/swarm/teamHelpers.js'
+import { isHostedTeamDraftPlaceholder } from 'src/utils/swarm/hostedTeamDraftPlaceholder.js'
 import {
   getTeammateRuntimePaths,
   readRecentTeammateRuntimeEvents,
@@ -312,7 +313,7 @@ async function ensureLeaderAttachedToTeam(
   }
 
   const existingTeam = await deps.readTeamFileAsync(request.teamName)
-  if (!existingTeam) {
+  if (!existingTeam || isHostedTeamDraftPlaceholder(existingTeam, request.teamName)) {
     return 'missing'
   }
 

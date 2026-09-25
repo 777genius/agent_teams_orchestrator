@@ -20,6 +20,7 @@ import { jsonStringify } from '../../utils/slowOperations.js'
 import { getResolvedTeammateMode } from '../../utils/swarm/backends/registry.js'
 import { TEAM_LEAD_NAME } from '../../utils/swarm/constants.js'
 import type { TeamFile } from '../../utils/swarm/teamHelpers.js'
+import { isHostedTeamDraftPlaceholder } from '../../utils/swarm/hostedTeamDraftPlaceholder.js'
 import {
   getTeamFilePath,
   readTeamFile,
@@ -70,7 +71,8 @@ export type Input = z.infer<InputSchema>
  */
 function generateUniqueTeamName(providedName: string): string {
   // If the team doesn't exist, use the provided name
-  if (!readTeamFile(providedName)) {
+  const existing = readTeamFile(providedName)
+  if (!existing || isHostedTeamDraftPlaceholder(existing, providedName)) {
     return providedName
   }
 
@@ -196,7 +198,7 @@ export const TeamCreateTool: Tool<InputSchema, Output> = buildTool({
 
       const created = await withTeamFileLock(candidateTeamName, async () => {
         const existingTeam = await readTeamFileAsync(candidateTeamName)
-        if (existingTeam) {
+        if (existingTeam && !isHostedTeamDraftPlaceholder(existingTeam, candidateTeamName)) {
           return false
         }
         await writeTeamFileAsync(candidateTeamName, candidateTeamFile)

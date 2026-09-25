@@ -174,6 +174,19 @@ describe.skipIf(!supportedOnHost)('NativeHostLocalTeamLifecycleLane process life
     expect(await lane.inspect(run)).toEqual({ phase: 'idle', recoverable: false })
   }, 30_000)
 
+  test('a hosted draft placeholder makes the bootstrap create the team in place', async () => {
+    const harness = await createHarness()
+    await writeFile(join(harness.teamRoot, 'config.json'),
+      `${JSON.stringify({ name: harness.team, pendingCreate: true }, null, 2)}\n`)
+    const lane = harness.createLane()
+    await lane.launch(laneInput(harness, 'run_draft'))
+    const record = JSON.parse(await readFile(join(harness.teamRoot, NATIVE_LANE_RUNTIME_RECORD_FILE), 'utf8'))
+    const spec = JSON.parse(await readFile(join(record.runtimeDir, 'bootstrap-spec.json'), 'utf8'))
+    expect(spec.mode).toBe('create')
+    expect(spec.team.name).toBe(harness.team)
+    await lane.stop(laneInput(harness, 'run_draft'))
+  }, 30_000)
+
   test('builds the lead env from an allowlist and only the configured credential', async () => {
     const harness = await createHarness()
     const lane = harness.createLane()
