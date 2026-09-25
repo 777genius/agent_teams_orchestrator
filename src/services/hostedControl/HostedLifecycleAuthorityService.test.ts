@@ -40,6 +40,7 @@ class MutableProvider implements HostedLifecycleProviderAdapter {
   commandBindings: Array<{ commandId: string; idempotencyKey?: string }> = []
   failAfterEffect = false
   effectSnapshot: HostedLifecycleProviderSnapshot | null = null
+  observationAfterEffect: HostedLifecycleProviderSnapshot | null = null
   snapshot: HostedLifecycleProviderSnapshot = {
     providerId: this.providerId, providerGeneration: 'generation-1', phase: 'idle', runId: null, recoverable: false,
   }
@@ -53,11 +54,12 @@ class MutableProvider implements HostedLifecycleProviderAdapter {
     this.executions += 1
     this.expectedProviderGenerations.push(input.expectedProviderGeneration)
     this.commandBindings.push({ commandId: input.commandId, idempotencyKey: input.idempotencyKey })
-    this.snapshot = this.effectSnapshot ?? (input.action === 'launch'
+    const applied = this.effectSnapshot ?? (input.action === 'launch'
       ? { ...this.snapshot, providerGeneration: `generation-${this.executions + 1}`, phase: 'running', runId: 'run_test01' }
       : { ...this.snapshot, providerGeneration: `generation-${this.executions + 1}`, phase: 'idle', runId: null })
+    this.snapshot = this.observationAfterEffect ?? applied
     if (this.failAfterEffect) throw new Error('ambiguous provider completion')
-    return { kind: 'applied', snapshot: this.snapshot }
+    return { kind: 'applied', snapshot: applied }
   }
 }
 
@@ -297,6 +299,45 @@ describe('HostedLifecycleAuthorityService', () => {
       result: { ...executed.result, kind: 'idempotent_replay' },
     })
     expect(provider.executions).toBe(1)
+  })
+
+  test('settles an exact run when launch advances from launching to running before authority re-inspection', async () => {
+    const provider = new MutableProvider()
+    provider.effectSnapshot = { ...provider.snapshot, providerGeneration: 'generation-2',
+      phase: 'launching', runId: 'run_test01' }
+    provider.observationAfterEffect = { ...provider.effectSnapshot,
+      providerGeneration: 'generation-3', phase: 'running' }
+    const { service } = await fixture(provider)
+    const originalAuthority = authority(provider)
+    const command = launchCommand(provider)
+    const admitted = await service.authorize({ command, context, authority: originalAuthority })
+    if (admitted.kind !== 'authorized') throw new Error('expected authorization')
+    const durable = durableCommand(command, admitted.authorization)
+    const first = await service.execute({ command, authorization: admitted.authorization,
+      durableCommand: durable, context, authority: originalAuthority })
+    expect(first.kind).toBe('settled')
+    if (first.kind !== 'settled') throw new Error('expected settled result')
+    expect(first.result.runId).toBe('run_test01')
+    const replay = await service.replayLookup({ command, authorization: admitted.authorization,
+      durableCommand: durable, context, authority: originalAuthority })
+    expect(replay.kind).toBe('settled')
+    expect(provider.executions).toBe(1)
+  })
+
+  test('does not settle a launch whose re-inspected run was substituted', async () => {
+    const provider = new MutableProvider()
+    provider.effectSnapshot = { ...provider.snapshot, providerGeneration: 'generation-2',
+      phase: 'launching', runId: 'run_test01' }
+    provider.observationAfterEffect = { ...provider.effectSnapshot,
+      providerGeneration: 'generation-3', phase: 'running', runId: 'run_other01' }
+    const { service } = await fixture(provider)
+    const originalAuthority = authority(provider)
+    const command = launchCommand(provider)
+    const admitted = await service.authorize({ command, context, authority: originalAuthority })
+    if (admitted.kind !== 'authorized') throw new Error('expected authorization')
+    const first = await service.execute({ command, authorization: admitted.authorization,
+      durableCommand: durableCommand(command, admitted.authorization), context, authority: originalAuthority })
+    expect(first.kind).toBe('unavailable')
   })
 
   test('exposes exact completed results and synthesizes correlated operator-required results', async () => {

@@ -5,6 +5,7 @@ import type {
   HostedLifecycleOwnerEffectFence,
   HostedLifecycleOperation,
 } from './HostedControlDispatcher.js'
+import type { HostedLifecycleRunReservation } from './HostedLifecycleRunReservation.js'
 
 const ACTIONS = ['launch', 'cancel', 'stop', 'recover'] as const
 const CONFLICT_REASONS = [
@@ -112,6 +113,7 @@ export interface HostedLifecycleAuthorityEffectPort {
     command: LifecycleCommand
     authorization: LifecycleAuthorization
     durableCommand: Record<string, unknown>
+    runReservation?: HostedLifecycleRunReservation
     context: LifecycleContext
     authority: HostedLifecycleAuthority
   }): Promise<HostedLifecycleExecutionDecision>
@@ -239,7 +241,9 @@ export class HostedLifecycleCommandService implements HostedLifecycleCommandPort
       !(await this.#requestCurrent(context, input.authority))) {
       return unavailable(input.operation)
     }
-    const decision = await this.effects.execute({ command, authorization, durableCommand, context, authority: input.authority })
+    const decision = await this.effects.execute({ command, authorization, durableCommand,
+      runReservation: input.payload.runReservation as HostedLifecycleRunReservation | undefined,
+      context, authority: input.authority })
     if (!(await this.#requestCurrent(context, input.authority))) return unavailable(input.operation)
     // Older owner adapters returned `result`; preserve that in-process port while
     // emitting only the canonical durable `settled` wire shape.

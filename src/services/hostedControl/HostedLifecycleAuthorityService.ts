@@ -22,6 +22,7 @@ import {
   type HostedLifecycleOwnerResolution,
 } from './HostedLifecycleProviderRegistry.js'
 import { createHostedLifecycleSnapshot } from './HostedLifecycleSnapshot.js'
+import type { HostedLifecycleRunReservation } from './HostedLifecycleRunReservation.js'
 
 type LifecycleContext = {
   actorId: string
@@ -47,6 +48,8 @@ export type HostedLifecycleAuthorityServiceOptions = {
   wal: HostedLifecycleAuthorityWal
   providers: HostedLifecycleProviderRegistry
   createId?: () => string
+  /** Production composition rejects missing Product pre-reservation before WAL starts an effect. */
+  requireRunReservation?: boolean
 }
 
 /**
@@ -243,6 +246,7 @@ export class HostedLifecycleAuthorityService implements HostedLifecycleAuthority
     command: LifecycleCommand
     authorization: LifecycleAuthorization
     durableCommand: HostedLifecycleWireDurableCommand
+    runReservation?: HostedLifecycleRunReservation
     context: LifecycleContext
     authority: HostedLifecycleAuthority
   }): Promise<HostedLifecycleExecutionDecision> {
@@ -273,6 +277,14 @@ export class HostedLifecycleAuthorityService implements HostedLifecycleAuthority
       if (before.resourceRevision !== input.command.expectedRevision ||
         (input.command.action !== 'launch' && before.runId !== input.command.runId) ||
         !before.availableActions.includes(input.command.action)) return unavailableDecision()
+      if (input.command.action === 'launch' && this.options.requireRunReservation && !input.runReservation) {
+        return unavailableDecision()
+      }
+      if (input.runReservation &&
+        (input.command.action !== 'launch' ||
+          (input.durableCommand.resource as { runId?: unknown })?.runId !== input.runReservation.runId)) {
+        return unavailableDecision()
+      }
       await this.options.wal.append({
         schemaVersion: 1, kind: 'started', fingerprint, command: input.command,
         durableCommand: input.durableCommand,
@@ -287,6 +299,8 @@ export class HostedLifecycleAuthorityService implements HostedLifecycleAuthority
           idempotencyKey: input.command.idempotencyKey,
           runId: input.command.runId ?? null,
           expectedProviderGeneration: before.providerGeneration,
+          runReservation: input.runReservation,
+          deadlineAtMs: input.context.deadlineAtMs,
         })
       } catch { return unavailableDecision() }
       if (effect.kind !== 'applied' || effect.snapshot.providerId !== owner.adapter.providerId) {
@@ -295,7 +309,12 @@ export class HostedLifecycleAuthorityService implements HostedLifecycleAuthority
       }
       const observedOwner = await this.options.providers.resolve(this.#scope())
       if (observedOwner.kind !== 'owned' || observedOwner.adapter.providerId !== owner.adapter.providerId ||
-        !isDeepStrictEqual(observedOwner.snapshot, effect.snapshot)) return unavailableDecision()
+        state.grants.get(input.authorization.grantId) !== grant ||
+        !this.#bindingCurrent(input.context, input.authority, COMMAND_SCOPE) ||
+        input.runReservation && (effect.snapshot.runId !== input.runReservation.runId ||
+          observedOwner.snapshot.runId !== input.runReservation.runId) ||
+        !effectConfirmedByObservation(input.command.action, before.providerGeneration,
+          effect.snapshot, observedOwner.snapshot)) return unavailableDecision()
       let after
       try { after = createHostedLifecycleSnapshot({ ...this.#incarnation(), provider: observedOwner.snapshot }) } catch {
         return unavailableDecision()
@@ -447,6 +466,24 @@ export class HostedLifecycleAuthorityService implements HostedLifecycleAuthority
   }
 }
 
+function effectConfirmedByObservation(
+  action: LifecycleCommand['action'],
+  beforeGeneration: string,
+  applied: HostedLifecycleProviderSnapshot,
+  observed: HostedLifecycleProviderSnapshot,
+): boolean {
+  if (observed.providerId !== applied.providerId ||
+    applied.providerGeneration === beforeGeneration || observed.providerGeneration === beforeGeneration) return false
+  if (isDeepStrictEqual(observed, applied)) return true
+  // A launch may complete between the adapter receipt and authority re-inspection.
+  // Only the same canonical run advancing from launching to a confirmed successor is safe.
+  return action === 'launch' && applied.phase === 'launching' && !applied.recoverable &&
+    applied.runId !== null && observed.runId === applied.runId &&
+    observed.providerGeneration !== applied.providerGeneration &&
+    (observed.phase === 'running' && !observed.recoverable ||
+      observed.phase === 'failed' && observed.recoverable)
+}
+
 function fingerprintCommand(command: LifecycleCommand, binding: HostedLifecycleDurableBinding): string {
   return createHostedLifecycleGrantFingerprint(command, binding)
 }
@@ -473,7 +510,9 @@ function durableFingerprint(
     idempotency.actorId !== authorization.actorId || idempotency.action !== command.action ||
     idempotency.idempotencyKey !== command.idempotencyKey || resource.bootId !== authorization.bootId ||
     resource.workspaceId !== command.workspaceId || resource.teamId !== command.teamId ||
-    resource.runId !== (command.action === 'launch' ? null : command.runId) ||
+    (command.action === 'launch'
+      ? !(resource.runId === null || typeof resource.runId === 'string' && /^run_[0-9a-f]{32}$/.test(resource.runId))
+      : resource.runId !== command.runId) ||
     resource.expectedRevision !== command.expectedRevision ||
     resource.restoreGeneration !== authorization.restoreGeneration ||
     resource.mountGeneration !== authorization.mountGeneration ||
@@ -483,7 +522,7 @@ function durableFingerprint(
   const expected = createHash('sha256').update(JSON.stringify([
     'agent-teams.hosted-lifecycle-command/v1', command.schemaVersion, command.action,
     command.commandId, command.idempotencyKey, command.workspaceId, command.teamId,
-    command.expectedRevision, command.action === 'launch' ? null : command.runId,
+    command.expectedRevision, resource.runId,
     authorization.ownerEffectFence.grantRevision, authorization.ownerEffectFence.identityChecksum,
   ])).digest('hex')
   if (digest !== expected) throw new TypeError('Invalid lifecycle durable command fingerprint')

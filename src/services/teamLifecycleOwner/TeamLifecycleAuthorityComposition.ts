@@ -47,6 +47,7 @@ export function createTeamLifecycleAuthorityComposition(
     requiredScope: options.requiredScope,
     wal: options.wal,
     createId: options.createId,
+    requireRunReservation: options.requireRunReservation,
     providers,
   })
   return { authority, owner, providers }

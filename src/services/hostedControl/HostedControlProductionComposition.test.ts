@@ -167,6 +167,140 @@ describe('createHostedControlProductionPorts', () => {
     await ports.close()
   })
 
+  test('requires Product reservation before a capable production lane can launch', async () => {
+    const teamRoot = await makeTeamRoot('hosted-production-run-reservation-')
+    await writePlan(teamRoot, 'opencode')
+    const launches: string[] = []
+    const lane: TeamLifecycleLaneEffectPort = {
+      kind: 'opencode', supports: () => true,
+      inspect: async input => ({ phase: input.runId ? 'running' : 'idle', recoverable: false }),
+      launch: async input => { launches.push(input.runId); return { phase: 'running', recoverable: false } },
+      cancel: async () => ({ phase: 'idle', recoverable: false }),
+      stop: async () => ({ phase: 'idle', recoverable: false }),
+      recover: async () => ({ phase: 'idle', recoverable: false }),
+    }
+    const ports = await createHostedControlProductionPortFactory(async () => lane)(context(teamRoot))
+    const state = (await ports.lifecycle.dispatch(controlStateInput())).payload
+    expect(state.kind).toBe('control_state')
+    const command = {
+      ...launchAuthorizeInput().payload.command,
+      expectedRevision: state.resourceRevision as string,
+    }
+    const currentAuthority = { ...lifecycleAuthority, resourceRevision: command.expectedRevision }
+    const commandContext = {
+      ...controlStateInput().payload.context,
+      authorizedScope: 'scope_hosted-lifecycle-command',
+    }
+    const authorized = (await ports.lifecycle.dispatch({
+      operation: 'authorize', authority: currentAuthority,
+      payload: { command, context: commandContext, authority: currentAuthority },
+    })).payload
+    expect(authorized.kind).toBe('authorized')
+    const authorization = authorized.authorization as Record<string, unknown>
+    const runId = `run_${'c'.repeat(32)}`
+    const fingerprint = createHash('sha256').update(JSON.stringify([
+      'agent-teams.hosted-lifecycle-command/v1', 1, 'launch', command.commandId,
+      command.idempotencyKey, command.workspaceId, command.teamId, command.expectedRevision,
+      runId, lifecycleAuthority.ownerEffectFence.grantRevision,
+      lifecycleAuthority.ownerEffectFence.identityChecksum,
+    ])).digest('hex')
+    const durableCommand = {
+      schemaVersion: 1,
+      commandFingerprint: { algorithm: 'sha256', version: 1, digest: fingerprint },
+      idempotency: { deploymentId: stableAuthority.deploymentId, actorId: lifecycleAuthority.actorId,
+        action: 'launch', idempotencyKey: command.idempotencyKey },
+      resource: { bootId: stableAuthority.bootId, workspaceId: command.workspaceId, teamId,
+        runId, expectedRevision: command.expectedRevision, restoreGeneration: stableAuthority.restoreGeneration,
+        mountGeneration: stableAuthority.mountBinding.mountGeneration,
+        ownerEffectFence: lifecycleAuthority.ownerEffectFence },
+    }
+    const rejected = (await ports.lifecycle.dispatch({
+      operation: 'execute', authority: currentAuthority,
+      payload: { command, authorization, durableCommand, context: commandContext,
+        authority: currentAuthority },
+    })).payload
+    expect(rejected.kind).toBe('unavailable')
+    expect(launches).toEqual([])
+    expect(await readdir(teamRoot)).not.toContain(HOSTED_LIFECYCLE_EXECUTION_STATE_FILE)
+    expect(await readFile(join(teamRoot, 'hosted-lifecycle-authority.wal.v1.jsonl'), 'utf8'))
+      .not.toContain('"kind":"started"')
+    await ports.close()
+  })
+
+  test('starts and replays only the exact Product reserved run in production', async () => {
+    const teamRoot = await makeTeamRoot('hosted-production-reserved-run-')
+    await writePlan(teamRoot, 'opencode')
+    const launches: string[] = []
+    let releaseLaunch!: () => void
+    const launchCompletion = new Promise<void>(resolve => { releaseLaunch = resolve })
+    const lane: TeamLifecycleLaneEffectPort = {
+      kind: 'opencode', supports: () => true,
+      inspect: async input => ({ phase: input.runId ? 'running' : 'idle', recoverable: false }),
+      launch: async input => { launches.push(input.runId); await launchCompletion;
+        return { phase: 'running', recoverable: false } },
+      cancel: async () => ({ phase: 'idle', recoverable: false }),
+      stop: async () => ({ phase: 'idle', recoverable: false }),
+      recover: async () => ({ phase: 'idle', recoverable: false }),
+    }
+    const ports = await createHostedControlProductionPortFactory(async () => lane)(context(teamRoot))
+    const state = (await ports.lifecycle.dispatch(controlStateInput())).payload
+    expect(state.kind).toBe('control_state')
+    const command = { ...launchAuthorizeInput().payload.command,
+      expectedRevision: state.resourceRevision as string }
+    const currentAuthority = { ...lifecycleAuthority, resourceRevision: command.expectedRevision }
+    const commandContext = { ...controlStateInput().payload.context,
+      authorizedScope: 'scope_hosted-lifecycle-command' }
+    const authorized = (await ports.lifecycle.dispatch({ operation: 'authorize', authority: currentAuthority,
+      payload: { command, context: commandContext, authority: currentAuthority } })).payload
+    expect(authorized.kind).toBe('authorized')
+    const authorization = authorized.authorization as Record<string, unknown>
+    const runId = `run_${'c'.repeat(32)}`
+    const planSha256 = createHash('sha256').update(await readFile(join(teamRoot, HOSTED_LIFECYCLE_PLAN_FILE))).digest('hex')
+    const runReservation = {
+      schemaVersion: 1 as const, workspaceId: stableAuthority.workspaceId,
+      runtimeWorkspaceId: `workspace_${'3'.repeat(32)}`, teamId,
+      actorId: currentAuthority.actorId, deploymentId: stableAuthority.deploymentId,
+      bootId: stableAuthority.bootId, commandId: command.commandId,
+      idempotencyKey: command.idempotencyKey, expectedRevision: command.expectedRevision,
+      expectedPlanGeneration: `plan-generation_${planSha256}`,
+      ownerAuthority: 'owner-authority_test-owner', ownerGeneration: 1,
+      ownerSessionId: 'owner-session_test-owner',
+      restoreGeneration: stableAuthority.restoreGeneration,
+      mountGeneration: stableAuthority.mountBinding.mountGeneration,
+      ownerEffectFence: currentAuthority.ownerEffectFence,
+      authorityEvidence: { userId: 'user_test-user', sessionId: 'session_test-user', grantGeneration: 1 },
+      runId, promotionOperationId: `promotion_${'1'.repeat(32)}`,
+      planSha256, rosterBindingSha256: '2'.repeat(64), createdAtMs: Date.now(),
+    }
+    const digest = createHash('sha256').update(JSON.stringify([
+      'agent-teams.hosted-lifecycle-command/v1', 1, 'launch', command.commandId,
+      command.idempotencyKey, command.workspaceId, command.teamId, command.expectedRevision,
+      runId, currentAuthority.ownerEffectFence.grantRevision,
+      currentAuthority.ownerEffectFence.identityChecksum,
+    ])).digest('hex')
+    const durableCommand = {
+      schemaVersion: 1,
+      commandFingerprint: { algorithm: 'sha256', version: 1, digest },
+      idempotency: { deploymentId: stableAuthority.deploymentId, actorId: currentAuthority.actorId,
+        action: 'launch', idempotencyKey: command.idempotencyKey },
+      resource: { bootId: stableAuthority.bootId, workspaceId: command.workspaceId, teamId,
+        runId, expectedRevision: command.expectedRevision, restoreGeneration: stableAuthority.restoreGeneration,
+        mountGeneration: stableAuthority.mountBinding.mountGeneration,
+        ownerEffectFence: currentAuthority.ownerEffectFence },
+    }
+    const request = { operation: 'execute' as const, authority: currentAuthority,
+      payload: { command, authorization, durableCommand, runReservation,
+        context: commandContext, authority: currentAuthority } }
+    const first = (await ports.lifecycle.dispatch(request)).payload
+    expect(first.kind).toBe('settled')
+    expect((first.result as { runId: string }).runId).toBe(runId)
+    const replay = (await ports.lifecycle.dispatch(request)).payload
+    expect((replay.result as { runId: string }).runId).toBe(runId)
+    expect(launches).toEqual([runId])
+    releaseLaunch()
+    await ports.close()
+  })
+
   test('does not recover or wake the host-local inbox executor for a persisted hosted message', async () => {
     const teamRoot = await makeTeamRoot('hosted-production-inbox-disabled-')
     await writePlan(teamRoot, 'opencode')

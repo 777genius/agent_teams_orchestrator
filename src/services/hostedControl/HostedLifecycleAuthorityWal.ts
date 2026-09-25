@@ -422,7 +422,9 @@ function decodeWireDurableCommand(
   if (idempotency.deploymentId !== authorization.deploymentId || idempotency.actorId !== authorization.actorId ||
     idempotency.action !== command.action || idempotency.idempotencyKey !== command.idempotencyKey ||
     resource.bootId !== authorization.bootId || resource.workspaceId !== command.workspaceId ||
-    resource.teamId !== command.teamId || resource.runId !== (command.action === 'launch' ? null : command.runId) ||
+    resource.teamId !== command.teamId || (command.action === 'launch'
+      ? !(resource.runId === null || typeof resource.runId === 'string' && /^run_[0-9a-f]{32}$/.test(resource.runId))
+      : resource.runId !== command.runId) ||
     resource.expectedRevision !== command.expectedRevision || resource.restoreGeneration !== authorization.restoreGeneration ||
     resource.mountGeneration !== authorization.mountGeneration ||
     !isDeepStrictEqual(resource.ownerEffectFence, authorization.ownerEffectFence)) {
@@ -431,7 +433,7 @@ function decodeWireDurableCommand(
   const expectedFingerprint = createHash('sha256').update(JSON.stringify([
     'agent-teams.hosted-lifecycle-command/v1', command.schemaVersion, command.action,
     command.commandId, command.idempotencyKey, command.workspaceId, command.teamId,
-    command.expectedRevision, command.action === 'launch' ? null : command.runId,
+    command.expectedRevision, resource.runId,
     authorization.ownerEffectFence.grantRevision, authorization.ownerEffectFence.identityChecksum,
   ])).digest('hex')
   if (fingerprint.digest !== expectedFingerprint) {

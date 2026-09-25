@@ -49,6 +49,7 @@ export type TeamLifecycleRunReservation = {
 export type TeamLifecycleRunReservationPort = (
   binding: Omit<TeamLifecycleRunReservation, 'runId'>,
   signal: AbortSignal,
+  input: TeamLifecycleOwnerEffectInput,
 ) => Promise<TeamLifecycleRunReservation | null>
 
 export type DurableTeamLifecycleExecutionOptions = {
@@ -158,7 +159,7 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
           commandId: input.commandId,
           idempotencyKey: input.idempotencyKey!,
         }
-        const reservation = await this.#resolveReservation(binding)
+        const reservation = await this.#resolveReservation(binding, input)
         if (!reservation || reservation.planFingerprint !== binding.planFingerprint ||
           reservation.expectedProviderGeneration !== binding.expectedProviderGeneration ||
           reservation.commandId !== binding.commandId ||
@@ -445,6 +446,7 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
 
   async #resolveReservation(
     binding: Omit<TeamLifecycleRunReservation, 'runId'>,
+    input: TeamLifecycleOwnerEffectInput,
   ): Promise<TeamLifecycleRunReservation | null> {
     const reserve = this.options.runReservation!
     const controller = new AbortController()
@@ -460,7 +462,7 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
         onAbort = () => reject(controller.signal.reason)
         controller.signal.addEventListener('abort', onAbort, { once: true })
       })
-      return await Promise.race([reserve(binding, controller.signal), aborted])
+      return await Promise.race([reserve(binding, controller.signal, input), aborted])
     } finally {
       clearTimeout(timeout)
       if (onAbort) controller.signal.removeEventListener('abort', onAbort)

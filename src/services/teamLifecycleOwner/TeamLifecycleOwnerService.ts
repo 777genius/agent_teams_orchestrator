@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import type { HostedLifecycleRunReservation } from '../hostedControl/HostedLifecycleRunReservation.js'
 
 import type {
   HostedLifecycleProviderAdapter,
@@ -22,6 +23,10 @@ export type TeamLifecycleOwnerEffectInput = {
   idempotencyKey?: string
   /** Stable bound generation supplied by the hosted command for reservation replay. */
   reservationExpectedProviderGeneration?: string
+  /** Product's pre-reserved canonical run, authenticated by the hosted lifecycle socket. */
+  runReservation?: HostedLifecycleRunReservation
+  reservationPlanGeneration?: string
+  reservationDeadlineAtMs?: number
   runId: string | null
   expectedProviderGeneration: string
   /** Revalidated immediately before each lane adapter performs an effect. */
@@ -118,6 +123,8 @@ export class TeamLifecycleOwnerService implements HostedLifecycleProviderAdapter
     idempotencyKey?: string
     runId: string | null
     expectedProviderGeneration: string
+    runReservation?: HostedLifecycleRunReservation
+    deadlineAtMs?: number
   }): Promise<HostedLifecycleProviderEffectResult> {
     return this.#serialized(input.scope, async () => {
       const admission = await this.options.planStore.load(input.scope)
@@ -137,7 +144,8 @@ export class TeamLifecycleOwnerService implements HostedLifecycleProviderAdapter
         !(await this.#admissionCurrent(admission))) {
         return { kind: 'unavailable' }
       }
-      const effectGuard = () => this.#admissionCurrent(admission)
+      const effectGuard = () =>
+        (input.deadlineAtMs === undefined || Date.now() < input.deadlineAtMs) && this.#admissionCurrent(admission)
       if (!(await effectGuard())) return { kind: 'unavailable' }
       let rawAfter: TeamLifecycleOwnerState
       const effectInput: TeamLifecycleOwnerEffectInput = {
@@ -147,6 +155,9 @@ export class TeamLifecycleOwnerService implements HostedLifecycleProviderAdapter
         reservationExpectedProviderGeneration: input.expectedProviderGeneration,
         runId: input.runId,
         expectedProviderGeneration: rawBefore.providerGeneration,
+        runReservation: input.runReservation,
+        reservationPlanGeneration: admission.planGeneration,
+        reservationDeadlineAtMs: input.deadlineAtMs,
         effectGuard,
       }
       try {

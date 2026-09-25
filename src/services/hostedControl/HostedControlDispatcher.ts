@@ -10,6 +10,7 @@ import type {
   HostedControlOwnerBinding,
   HostedControlStableAuthority,
 } from './protocol.js'
+import { decodeHostedLifecycleRunReservation } from './HostedLifecycleRunReservation.js'
 import {
   HOSTED_LIFECYCLE_PROOF_DOMAIN,
   HOSTED_TEAM_MESSAGE_PROOF_DOMAIN,
@@ -131,7 +132,7 @@ export class HostedControlDispatcher {
       throw new Error('Invalid hosted lifecycle owner binding')
     }
     const ownerEffectFence = decodeOwnerEffectFence(message.ownerEffectFence)
-    const payload = decodeLifecyclePayload(operation, message.payload, this.options.authority, ownerEffectFence)
+    const payload = decodeLifecyclePayload(operation, message.payload, this.options.authority, ownerEffectFence, activeOwner)
     const provenance = decodeLifecycleRequestProvenance(
       message.provenance,
       payload,
@@ -266,6 +267,7 @@ function decodeLifecyclePayload(
   value: unknown,
   expected: HostedControlStableAuthority,
   expectedOwnerEffectFence: HostedLifecycleOwnerEffectFence,
+  owner: HostedControlOwnerBinding,
 ): Record<string, unknown> & { authority: HostedLifecycleAuthority } {
   const payload = record(value, 'lifecycle payload')
   const queryOperation = isLifecycleQueryOperation(operation)
@@ -276,7 +278,8 @@ function decodeLifecyclePayload(
       : operation === 'revalidate' || operation === 'release'
         ? ['command', 'authorization', 'context', 'authority']
         : ['command', 'authorization', 'durableCommand', 'context', 'authority']
-  exactKeys(payload, expectedKeys, 'lifecycle payload')
+  const hasReservation = operation === 'execute' && Object.hasOwn(payload, 'runReservation')
+  exactKeys(payload, hasReservation ? [...expectedKeys, 'runReservation'] : expectedKeys, 'lifecycle payload')
   record(payload[queryOperation ? 'request' : 'command'], 'lifecycle command')
   if (operation === 'admit_launch_plan') {
     const request = record(payload.request, 'lifecycle plan admission request')
@@ -323,10 +326,17 @@ function decodeLifecyclePayload(
     authority.bootId !== expected.bootId) {
     throw new Error('Invalid hosted lifecycle authority')
   }
-  if (operation === 'replay_lookup' || operation === 'execute') {
-    decodeDurableCommand(payload.durableCommand, payload.command, expectedOwnerEffectFence, expected, authority.actorId)
+  const reservation = hasReservation
+    ? decodeHostedLifecycleRunReservation(payload.runReservation,
+      record(payload.command, 'lifecycle command'), authority, owner)
+    : undefined
+  if (reservation && record(payload.command, 'lifecycle command').action !== 'launch') {
+    throw new Error('Run reservation is only valid for launch execution')
   }
-  return { ...payload, authority }
+  if (operation === 'replay_lookup' || operation === 'execute') {
+    decodeDurableCommand(payload.durableCommand, payload.command, expectedOwnerEffectFence, expected, authority.actorId, reservation?.runId)
+  }
+  return { ...payload, ...(reservation ? { runReservation: reservation } : {}), authority }
 }
 
 function sameStableAuthority(
@@ -379,6 +389,7 @@ function decodeDurableCommand(
   ownerEffectFence: HostedLifecycleOwnerEffectFence,
   expected: HostedControlStableAuthority,
   actorId: string,
+  reservedRunId?: string,
 ): void {
   const durable = record(value, 'lifecycle durable command')
   exactKeys(durable, ['schemaVersion', 'commandFingerprint', 'idempotency', 'resource'], 'lifecycle durable command')
@@ -401,14 +412,17 @@ function decodeDurableCommand(
     resource.mountGeneration !== expected.mountBinding.mountGeneration ||
     resource.workspaceId !== command.workspaceId || resource.teamId !== command.teamId ||
     resource.expectedRevision !== command.expectedRevision ||
-    resource.runId !== (command.action === 'launch' ? null : command.runId) ||
+    (command.action === 'launch'
+      ? !(resource.runId === null || typeof resource.runId === 'string' && /^run_[0-9a-f]{32}$/.test(resource.runId)) ||
+        reservedRunId !== undefined && resource.runId !== reservedRunId
+      : resource.runId !== command.runId) ||
     !isDeepStrictEqual(decodeOwnerEffectFence(resource.ownerEffectFence), ownerEffectFence)) {
     throw new Error('Invalid durable command correlation')
   }
   const preimage = [
     'agent-teams.hosted-lifecycle-command/v1', command.schemaVersion, command.action,
     command.commandId, command.idempotencyKey, command.workspaceId, command.teamId,
-    command.expectedRevision, command.action === 'launch' ? null : command.runId,
+    command.expectedRevision, resource.runId,
     ownerEffectFence.grantRevision, ownerEffectFence.identityChecksum,
   ]
   const expectedDigest = createHash('sha256').update(JSON.stringify(preimage)).digest('hex')

@@ -61,6 +61,27 @@ export function createHostedControlProductionPortFactory(
     const execution = new DurableTeamLifecycleExecution(
       join(context.teamRoot, HOSTED_LIFECYCLE_EXECUTION_STATE_FILE),
       isolatedLane ? [isolatedLane] : [],
+      'team-lifecycle-owner',
+      {
+        requireRunReservation: true,
+        runReservation: async (binding, signal, input) => {
+          const receipt = input.runReservation
+          if (signal.aborted || !receipt || !input.reservationPlanGeneration ||
+            receipt.expectedPlanGeneration !== input.reservationPlanGeneration ||
+            receipt.planSha256 !== input.reservationPlanGeneration.slice('plan-generation_'.length) ||
+            receipt.workspaceId !== context.authority.workspaceId ||
+            receipt.teamId !== context.authority.teamId ||
+            receipt.deploymentId !== context.authority.deploymentId ||
+            receipt.bootId !== context.authority.bootId ||
+            receipt.restoreGeneration !== context.authority.restoreGeneration ||
+            receipt.mountGeneration !== context.authority.mountBinding.mountGeneration ||
+            receipt.commandId !== binding.commandId || receipt.idempotencyKey !== binding.idempotencyKey ||
+            input.reservationDeadlineAtMs === undefined || Date.now() >= input.reservationDeadlineAtMs) {
+            return null
+          }
+          return { ...binding, runId: receipt.runId }
+        },
+      },
     )
     const lifecycle = createTeamLifecycleAuthorityComposition({
       workspaceId: context.authority.workspaceId,
@@ -74,6 +95,7 @@ export function createHostedControlProductionPortFactory(
       ),
       planStore,
       execution,
+      requireRunReservation: true,
       effectGuard: () => context.isCurrentAuthority({ actorId: 'hosted-lifecycle-owner', ...context.authority }),
     })
 

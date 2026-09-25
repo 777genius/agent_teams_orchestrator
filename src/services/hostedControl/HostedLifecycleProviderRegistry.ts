@@ -1,4 +1,5 @@
 import type { HostedLifecycleAction, HostedLifecycleProviderSnapshot } from './HostedLifecycleSnapshot.js'
+import type { HostedLifecycleRunReservation } from './HostedLifecycleRunReservation.js'
 
 export type HostedLifecycleScope = { workspaceId: string; teamId: string }
 export type HostedLifecycleProviderInspection =
@@ -22,6 +23,8 @@ export interface HostedLifecycleProviderAdapter {
     idempotencyKey?: string
     runId: string | null
     expectedProviderGeneration: string
+    runReservation?: HostedLifecycleRunReservation
+    deadlineAtMs?: number
   }): Promise<HostedLifecycleProviderEffectResult>
 }
 
