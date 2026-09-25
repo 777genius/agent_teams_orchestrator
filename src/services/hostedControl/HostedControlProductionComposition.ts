@@ -20,6 +20,8 @@ import {
   HostedApprovalActivationSession,
   type HostedApprovalActivationConnection,
 } from './HostedApprovalActivationSession.js'
+import { createHostedManagedOpenCodeLane,
+  type HostedManagedOpenCodeLaneDependencies } from './isolatedLane/HostedManagedOpenCodeLane.js'
 
 export const HOSTED_LIFECYCLE_PLAN_FILE = 'hosted-lifecycle-plan.v1.json'
 export const HOSTED_LIFECYCLE_EXECUTION_STATE_FILE =
@@ -181,3 +183,11 @@ export function createHostedControlProductionPortFactory(
 }
 
 export const createHostedControlProductionPorts = createHostedControlProductionPortFactory()
+
+/** Explicit root/Product composition. The default production factory above remains inactive. */
+export function createHostedManagedOpenCodeProductionPortFactory(
+  dependencies: HostedManagedOpenCodeLaneDependencies,
+): HostedControlRuntimePortFactory {
+  return createHostedControlProductionPortFactory(context =>
+    createHostedManagedOpenCodeLane(context, dependencies))
+}
