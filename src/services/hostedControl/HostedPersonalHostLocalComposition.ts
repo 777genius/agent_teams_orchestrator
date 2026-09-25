@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import { realpathSync } from 'node:fs'
-import { isAbsolute } from 'node:path'
+import { isAbsolute, join } from 'node:path'
 
 import {
   buildHostedAppMcpLaunchConfig,
@@ -14,6 +14,7 @@ import {
   type TeamLifecycleLaneInput,
 } from '../teamLifecycleOwner/OpenCodeTeamLifecycleLane.js'
 import type { TeamLifecycleLaunchPlan } from '../teamLifecycleOwner/TeamLifecycleLaunchPlan.js'
+import { getTeamsDir } from '../../utils/envUtils.js'
 import { TEAM_LEAD_NAME } from '../../utils/swarm/constants.js'
 import {
   createHostedControlPortFactory,
@@ -67,6 +68,12 @@ export function createHostedPersonalHostLocalPortFactory(
   const laneFactories = config.lanes ?? [createHostLocalOpenCodeLane]
   const createInboxPump = config.createInboxPump ?? createHostedTeamLeadInboxPumpPort
   return createHostedControlPortFactory(async context => {
+    // Host-local runtimes resolve team state through the process config root;
+    // Main pins it to the signed Claude root. Anything else would write to the
+    // operator's desktop `~/.claude` instead of this admission's team root.
+    if (join(getTeamsDir(), context.legacyKey) !== context.teamRoot) {
+      throw new TypeError('Hosted host-local lanes require the admitted Claude root as config root')
+    }
     const appMcp = config.appMcp && await verifyHostedAppMcpDescriptor(config.appMcp)
       ? buildHostedAppMcpLaunchConfig(config.appMcp, context.claudeRoot)
       : null
@@ -79,7 +86,7 @@ export function createHostedPersonalHostLocalPortFactory(
         lanes.some(existing => existing.kind === lane.kind)) {
         throw new TypeError('Hosted host-local lanes must have distinct supported kinds')
       }
-      lanes.push(withAdmittedWorkspaceRoot(lane, context.authority.mountBinding.declaredRootHash))
+      lanes.push(bindHostLocalLane(lane, context))
     }
     return {
       lanes,
@@ -104,16 +111,23 @@ function createHostedTeamLeadInboxPumpPort(
 }
 
 /**
- * Host-local agents act directly on the host filesystem, so the plan's
- * workspace must be the exact canonical mount the launcher declared. The check
- * is synchronous: DurableTeamLifecycleExecution forbids any asynchronous
- * boundary between its authority guard and the adapter call.
+ * Binds a host-local lane to this admission. The plan's team id must be the
+ * signed one, and the runtime addresses the team by the signed legacy key, the
+ * name of the canonical team directory. Launch and inspect additionally require
+ * the plan workspace to be the exact canonical mount the launcher declared.
+ * Checks are synchronous: DurableTeamLifecycleExecution forbids any
+ * asynchronous boundary between its authority guard and the adapter call.
  */
-function withAdmittedWorkspaceRoot(
+function bindHostLocalLane(
   lane: TeamLifecycleLaneEffectPort,
-  declaredRootHash: string,
+  context: Readonly<HostedControlRuntimePortFactoryContext>,
 ): TeamLifecycleLaneEffectPort {
-  const admit = (workspaceRoot: string): void => {
+  const { teamId, mountBinding: { declaredRootHash } } = context.authority
+  const runtimeTeam = <T extends TeamLifecycleLaneInput>(input: T): T => {
+    if (input.planTeamId !== teamId) throw new Error('Hosted lifecycle plan belongs to another team')
+    return { ...input, planTeamId: context.legacyKey }
+  }
+  const admitWorkspace = (workspaceRoot: string): void => {
     let canonical: string | null = null
     try { canonical = realpathSync(workspaceRoot) } catch { /* rejected below */ }
     if (!isAbsolute(workspaceRoot) || canonical !== workspaceRoot ||
@@ -128,15 +142,15 @@ function withAdmittedWorkspaceRoot(
     // Plan admission (for example native topology limits) must survive the wrapper.
     ...(lane.supportsPlan ? { supportsPlan: (plan: TeamLifecycleLaunchPlan) => lane.supportsPlan!(plan) } : {}),
     inspect: async (input: TeamLifecycleLaneInput & { runId: string | null }) => {
-      admit(input.workspaceRoot)
-      return lane.inspect(input)
+      admitWorkspace(input.workspaceRoot)
+      return lane.inspect(runtimeTeam(input))
     },
     launch: async (input: Running) => {
-      admit(input.workspaceRoot)
-      return lane.launch(input)
+      admitWorkspace(input.workspaceRoot)
+      return lane.launch(runtimeTeam(input))
     },
-    cancel: (input: Running) => lane.cancel(input),
-    stop: (input: Running) => lane.stop(input),
-    recover: (input: Running) => lane.recover(input),
+    cancel: async (input: Running) => lane.cancel(runtimeTeam(input)),
+    stop: async (input: Running) => lane.stop(runtimeTeam(input)),
+    recover: async (input: Running) => lane.recover(runtimeTeam(input)),
   })
 }

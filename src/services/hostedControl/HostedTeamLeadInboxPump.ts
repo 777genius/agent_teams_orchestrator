@@ -4,7 +4,6 @@ import { dirname, isAbsolute, join } from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
 
 import { writeFileAtomic } from '../../utils/atomicWrite.js'
-import { getTeamsDir } from '../../utils/envUtils.js'
 import * as lockfile from '../../utils/lockfile.js'
 import { TEAM_LEAD_NAME } from '../../utils/swarm/constants.js'
 import { createOwnedOpenCodeHostedInboxExecutor } from '../opencode/OpenCodeBridgeCommandHandler.js'
@@ -107,8 +106,9 @@ export class HostedTeamLeadInboxPump {
     this.#execution = options.execution
     this.#readActiveRun = options.readActiveRun ?? (plan => this.#readPersistedActiveRun(plan))
     this.#getSession = options.getSession ?? ((teamId, laneId, memberName) => openCodeSessionStore.get(teamId, laneId, memberName))
+    // The canonical teams directory of this admission, never the ambient config root.
     this.#getCapability = options.getCapability ?? (input => readOpenCodeLegacyStopCapability({
-      teamsPath: getTeamsDir(), ...input,
+      teamsPath: dirname(this.#root), ...input,
     }))
     this.#executeBridge = options.executeBridge ?? createOwnedOpenCodeHostedInboxExecutor()
   }
@@ -292,7 +292,7 @@ export class HostedTeamLeadInboxPump {
   }
 
   #bridgeInput(intent: Intent, command: BridgeInput['command']): BridgeInput {
-    return { command, requestId: intent.requestId, teamId: intent.message.teamId,
+    return { command, requestId: intent.requestId, teamId: this.#legacyKey,
       laneId: intent.selected.laneId, memberName: TEAM_LEAD_NAME,
       runId: intent.selected.runId, projectPath: intent.selected.projectPath,
       sessionId: intent.selected.sessionId, capabilitySnapshotId: intent.selected.capabilitySnapshotId,
@@ -313,15 +313,17 @@ export class HostedTeamLeadInboxPump {
     if (!state || state.phase !== 'running' || !state.runId || !(await admission.isCurrent())) return null
     const lane = lanes[0]!
     if (lane.kind !== 'opencode') return null
-    const session = await this.#getSession(authority.teamId, lane.laneId, TEAM_LEAD_NAME)
+    // Host-local lanes register the runtime team under the admitted legacy key,
+    // which is also the canonical team directory name.
+    const session = await this.#getSession(this.#legacyKey, lane.laneId, TEAM_LEAD_NAME)
     if (!session || isOpenCodeSessionStopped(session) || session.staleReason ||
-      session.teamId !== authority.teamId || session.runId !== state.runId || session.laneId !== lane.laneId ||
+      session.teamId !== this.#legacyKey || session.runId !== state.runId || session.laneId !== lane.laneId ||
       session.memberName !== TEAM_LEAD_NAME || session.projectPath !== admission.plan.workspaceRoot ||
       session.profileScope?.purpose !== 'launch_runtime' ||
       session.selectedModel !== lane.selectedModel ||
       !session.opencodeSessionId) return null
     const capabilitySnapshotId = session.stopAuthority?.runtime.capabilitySnapshotId ??
-      await this.#getCapability({ teamId: authority.teamId, laneId: lane.laneId, runId: state.runId }).catch(() => null)
+      await this.#getCapability({ teamId: this.#legacyKey, laneId: lane.laneId, runId: state.runId }).catch(() => null)
     if (!capabilitySnapshotId || !/^opencode:[a-f0-9]{32}$/.test(capabilitySnapshotId)) return null
     if (readOnly) {
       const latest = await this.#readActiveRun(admission.plan)

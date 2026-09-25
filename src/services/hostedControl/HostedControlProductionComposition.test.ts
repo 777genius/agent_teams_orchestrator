@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
 import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -402,14 +402,30 @@ describe('createHostedControlProductionPorts', () => {
 })
 
 describe('createHostedPersonalHostLocalPortFactory', () => {
+  const previousConfigDir = process.env.CLAUDE_CONFIG_DIR
+  beforeEach(() => { delete process.env.CLAUDE_CONFIG_DIR })
+  afterEach(() => {
+    if (previousConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = previousConfigDir
+  })
+
   test('launches a reserved run on the host-local lane, wakes the lead, and closes the pump before teardown', async () => {
-    const teamRoot = await makeTeamRoot('hosted-personal-launch-')
+    const teamRoot = await makePersonalTeamRoot('hosted-personal-launch-')
     const workspace = await writeAdmittedPlan(teamRoot)
     const events: string[] = []
     const launches: string[] = []
+    const runtimeTeams: string[] = []
     const lane = fakeLane({
-      launch: async input => { launches.push(input.runId); return { phase: 'running', recoverable: false } },
-      stop: async () => { events.push('lane-stop'); return { phase: 'idle', recoverable: false } },
+      launch: async input => {
+        launches.push(input.runId)
+        runtimeTeams.push(input.planTeamId)
+        return { phase: 'running', recoverable: false }
+      },
+      stop: async input => {
+        events.push('lane-stop')
+        runtimeTeams.push(input.planTeamId)
+        return { phase: 'idle', recoverable: false }
+      },
     })
     const woken: Array<{ recipient: string; messageId: string }> = []
     const ports = await createHostedPersonalHostLocalPortFactory({
@@ -438,11 +454,24 @@ describe('createHostedPersonalHostLocalPortFactory', () => {
     expect(woken).toEqual([{ recipient: TEAM_LEAD_NAME, messageId }])
     await ports.close()
     expect(events).toEqual(['recover', 'start', 'pump-close', 'lane-stop'])
+    // The runtime team is the signed legacy key: the canonical team directory name.
+    expect(runtimeTeams).toEqual(['legacy', 'legacy'])
+  })
+
+  test('refuses host-local lanes when the process config root is not the admitted Claude root', async () => {
+    const teamRoot = await makePersonalTeamRoot('hosted-personal-config-root-')
+    const workspace = await writeAdmittedPlan(teamRoot)
+    process.env.CLAUDE_CONFIG_DIR = join(dirname(dirname(dirname(teamRoot))), 'operator-desktop-claude')
+    let created = false
+    await expect(createHostedPersonalHostLocalPortFactory({
+      appMcp: null, lanes: [() => { created = true; return fakeLane({}) }],
+    })(personalContext(teamRoot, workspace))).rejects.toThrow(TypeError)
+    expect(created).toBe(false)
   })
 
   test('never reaches the lane for a workspace that is not the exact declared mount root', async () => {
     for (const variant of ['hash', 'symlink'] as const) {
-      const teamRoot = await makeTeamRoot(`hosted-personal-${variant}-`)
+      const teamRoot = await makePersonalTeamRoot(`hosted-personal-${variant}-`)
       const workspace = await writeAdmittedPlan(teamRoot)
       let declared = workspace
       if (variant === 'symlink') {
@@ -488,7 +517,7 @@ describe('createHostedPersonalHostLocalPortFactory', () => {
   })
 
   test('the production OpenCode lane is launchable only with a verified pinned MCP artifact', async () => {
-    const teamRoot = await makeTeamRoot('hosted-personal-app-mcp-')
+    const teamRoot = await makePersonalTeamRoot('hosted-personal-app-mcp-')
     const workspace = await writeAdmittedPlan(teamRoot)
     const command = join(teamRoot, 'node')
     const entry = join(teamRoot, 'index.js')
@@ -529,8 +558,18 @@ async function writeAdmittedPlan(teamRoot: string): Promise<string> {
   return workspace
 }
 
+/** `<claudeRoot>/teams/legacy`, with the process config root pinned like Main does. */
+async function makePersonalTeamRoot(prefix: string): Promise<string> {
+  const claudeRoot = await realpath(await mkdtemp(join(tmpdir(), prefix)))
+  roots.push(claudeRoot)
+  const teamRoot = join(claudeRoot, 'teams', 'legacy')
+  await mkdir(teamRoot, { recursive: true, mode: 0o700 })
+  process.env.CLAUDE_CONFIG_DIR = claudeRoot
+  return teamRoot
+}
+
 function personalContext(teamRoot: string, declaredRoot: string): HostedControlRuntimePortFactoryContext {
-  const base = context(teamRoot)
+  const base = { ...context(teamRoot), claudeRoot: dirname(dirname(teamRoot)) }
   return { ...base, authority: { ...base.authority, mountBinding: {
     ...base.authority.mountBinding,
     declaredRootHash: createHash('sha256').update(declaredRoot).digest('hex'),

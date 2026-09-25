@@ -6,7 +6,10 @@ import { join } from 'node:path'
 import type { OpenCodeSessionRecord } from '../opencode/types.js'
 import type { TeamLifecycleLaunchPlan } from '../teamLifecycleOwner/TeamLifecycleLaunchPlan.js'
 import { HostedTeamLeadMessageDelivery } from './HostedTeamLeadMessageDelivery.js'
-import { HostedTeamLeadInboxPump } from './HostedTeamLeadInboxPump.js'
+import {
+  HostedTeamLeadInboxPump,
+  type HostedTeamLeadInboxPumpOptions,
+} from './HostedTeamLeadInboxPump.js'
 import type { HostedControlAuthority } from './protocol.js'
 
 const roots: string[] = []
@@ -63,7 +66,7 @@ async function fixture() {
       sessionId, runtimePromptMessageId: 'prompt-1' } }
     return { ok: true, data: { observed: true, sessionId, responseObservation: verifiedObservation } }
   }
-  const build = () => new HostedTeamLeadInboxPump({
+  const build = (overrides: Partial<HostedTeamLeadInboxPumpOptions> = {}) => new HostedTeamLeadInboxPump({
     canonicalTeamRoot: root, legacyKey: 'legacy', authority,
     guard: { isCurrent: async () => current },
     planStore: { load: async () => {
@@ -75,13 +78,14 @@ async function fixture() {
       phase: active ? 'running' : 'stopping', runId, recoverable: false }) },
     readActiveRun: async () => ({ phase: active ? 'running' : 'stopping', runId }),
     getSession: async () => { await sessionReadHook(); return ({
-      teamId, laneId: 'lead-lane', memberName: 'team-lead', runId,
+      teamId: 'legacy', laneId: 'lead-lane', memberName: 'team-lead', runId,
       opencodeSessionId: selectedSession, projectPath: workspace,
       selectedModel: 'openai/gpt-6-sol', staleReason: null,
       profileScope: { purpose: 'launch_runtime' },
     }) as OpenCodeSessionRecord },
     getCapability: async () => { await capabilityReadHook(); return capabilitySnapshotId },
     executeBridge: (input, guard, signal) => bridge(input, guard, signal),
+    ...overrides,
   })
   return { root, build, calls, setBridge: (next: typeof bridge) => { bridge = next },
     stop: () => { active = false }, resume: () => { active = true },
@@ -100,6 +104,47 @@ afterEach(async () => {
 })
 
 describe('HostedTeamLeadInboxPump', () => {
+  test('addresses the host-local runtime by the legacy key under the canonical teams directory only', async () => {
+    const f = await fixture()
+    const parent = join(f.root, '..')
+    const manifest = (teamName: string) => JSON.stringify({ schemaVersion: 1, teamName,
+      activeRunId: runId, activeCapabilitySnapshotId: capabilitySnapshotId })
+    await mkdir(join(f.root, '.opencode-runtime', 'lanes', 'lead-lane'), { recursive: true })
+    await writeFile(join(f.root, '.opencode-runtime', 'lanes', 'lead-lane', 'manifest.json'), manifest('legacy'))
+    // An ambient config root with a matching-looking manifest must be ignored.
+    const ambient = join(parent, 'ambient-claude')
+    await mkdir(join(ambient, 'teams', 'legacy', '.opencode-runtime', 'lanes', 'lead-lane'), { recursive: true })
+    await writeFile(join(ambient, 'teams', 'legacy', '.opencode-runtime', 'lanes', 'lead-lane', 'manifest.json'),
+      JSON.stringify({ schemaVersion: 1, teamName: 'legacy', activeRunId: runId,
+        activeCapabilitySnapshotId: `opencode:${'9'.repeat(32)}` }))
+    const previous = process.env.CLAUDE_CONFIG_DIR
+    process.env.CLAUDE_CONFIG_DIR = ambient
+    try {
+      const sessionTeams: string[] = []
+      const bridged: Array<{ teamId: string; capabilitySnapshotId: string }> = []
+      const pump = f.build({
+        getCapability: undefined,
+        getSession: async (team, laneId, memberName) => {
+          sessionTeams.push(team)
+          return { teamId: team, laneId, memberName, runId, opencodeSessionId: sessionId,
+            projectPath: join(parent, 'workspace'), selectedModel: 'openai/gpt-6-sol', staleReason: null,
+            profileScope: { purpose: 'launch_runtime' } } as OpenCodeSessionRecord
+        },
+        executeBridge: async input => {
+          bridged.push({ teamId: input.teamId, capabilitySnapshotId: input.capabilitySnapshotId })
+          return { ok: true, data: { accepted: true, sessionId, runtimePromptMessageId: 'prompt-1' } }
+        },
+      })
+      expect(await pump.recover()).toEqual([{ kind: 'accepted' }])
+      expect(sessionTeams.length).toBeGreaterThan(0)
+      expect(new Set(sessionTeams)).toEqual(new Set(['legacy']))
+      expect(bridged).toEqual([{ teamId: 'legacy', capabilitySnapshotId }])
+    } finally {
+      if (previous === undefined) delete process.env.CLAUDE_CONFIG_DIR
+      else process.env.CLAUDE_CONFIG_DIR = previous
+    }
+  })
+
   test('recovers a missed wake from durable inbox and sends once across restart', async () => {
     const f = await fixture()
     const first = f.build()
