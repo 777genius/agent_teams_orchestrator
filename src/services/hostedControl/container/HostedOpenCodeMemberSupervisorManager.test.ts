@@ -118,6 +118,42 @@ describe('HostedOpenCodeMemberSupervisorManager', () => {
     expect(calls).toEqual([A.operationId])
   })
 
+  test('concurrent Start cannot borrow another receipt or mutate its queued request', async () => {
+    const f = await fixture()
+    const factory = f.options.testOnlySupervisorFactory!
+    let entered!: () => void
+    let release!: () => void
+    const startEntered = new Promise<void>(resolve => { entered = resolve })
+    const holdStart = new Promise<void>(resolve => { release = resolve })
+    const manager = await HostedOpenCodeMemberSupervisorManager.create({ ...f.options,
+      testOnlySupervisorFactory: async options => {
+        const supervisor = await factory(options)
+        return { ...supervisor, startPrepared: async input => {
+          entered()
+          await holdStart
+          return supervisor.startPrepared(input)
+        } }
+      },
+    })
+    const receipt = await manager.prepareMember(A)
+    const first = manager.startPrepared({ operationId: A.operationId, receiptId: receipt.receiptId })
+    await startEntered
+    const foreign = manager.startPrepared({ operationId: A.operationId, receiptId: 'f'.repeat(32) })
+    release()
+    await expect(foreign).rejects.toThrow('hosted-member-receipt-unbound')
+    await expect(first).resolves.toMatchObject({ handle: receipt.handle })
+    expect(f.started).toEqual([A.operationId])
+
+    const other = await fixture()
+    const queued = await HostedOpenCodeMemberSupervisorManager.create(other.options)
+    const next = await queued.prepareMember(A)
+    const input = { operationId: A.operationId, receiptId: next.receiptId }
+    const starting = queued.startPrepared(input)
+    input.receiptId = 'f'.repeat(32)
+    await expect(starting).resolves.toMatchObject({ handle: next.handle })
+    expect(other.started).toEqual([A.operationId])
+  })
+
   test('a terminal stop before Start cannot later activate the prepared member', async () => {
     const f = await fixture()
     const manager = await HostedOpenCodeMemberSupervisorManager.create(f.options)

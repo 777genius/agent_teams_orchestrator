@@ -97,7 +97,7 @@ function exact(value: unknown, keys: readonly string[]): value is Record<string,
 export class HostedOpenCodeMemberSupervisorManager {
   private readonly supervisors = new Map<string, Promise<Supervisor>>()
   private readonly preparations = new Map<string, Promise<Receipt>>()
-  private readonly starts = new Map<string, Promise<StartResult>>()
+  private readonly starts = new Map<string, Readonly<{ receiptId: string; promise: Promise<StartResult> }>>()
   private readonly memberMutations = new Map<string, Promise<unknown>>()
   private readonly uid: number
   private readonly identity: Readonly<{ dev: number; ino: number }>
@@ -439,11 +439,15 @@ export class HostedOpenCodeMemberSupervisorManager {
   async startPrepared(input: { operationId: string; receiptId: string }): ReturnType<Supervisor['startPrepared']> {
     if (!exact(input, ['operationId', 'receiptId']) || !ID.test(input.operationId) ||
       !RECEIPT_ID.test(input.receiptId)) throw new Error('hosted-member-prepared-start-invalid')
-    const pending = this.starts.get(input.operationId)
-    if (pending) return pending
-    const starting = this.mutateMember(input.operationId, () => this.startPreparedOnce(input))
-    this.starts.set(input.operationId, starting)
-    try { return await starting } finally { this.starts.delete(input.operationId) }
+    const request = { operationId: input.operationId, receiptId: input.receiptId }
+    const pending = this.starts.get(request.operationId)
+    if (pending) {
+      if (pending.receiptId !== request.receiptId) throw new Error('hosted-member-receipt-unbound')
+      return pending.promise
+    }
+    const starting = this.mutateMember(request.operationId, () => this.startPreparedOnce(request))
+    this.starts.set(request.operationId, { receiptId: request.receiptId, promise: starting })
+    try { return await starting } finally { this.starts.delete(request.operationId) }
   }
 
   private async startPreparedOnce(input: { operationId: string; receiptId: string }): Promise<StartResult> {
