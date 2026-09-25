@@ -30,6 +30,7 @@ import {
   createHostLocalNativeLaneFactory,
   type HostedNativeHostLocalConfig,
 } from './HostedNativeHostLocalLane.js'
+import { HostedOpenCodeLaunchCapabilityStore } from './HostedOpenCodeLaunchCapabilityStore.js'
 import {
   HostedTeamLeadInboxPump,
   type HostedTeamLeadInboxPumpOptions,
@@ -51,9 +52,10 @@ export type HostedHostLocalLaneFactory = (
 ) => TeamLifecycleLaneEffectPort | undefined | Promise<TeamLifecycleLaneEffectPort | undefined>
 
 /** OpenCode stays capability-false until the pinned MCP artifact is verified. */
-export const createHostLocalOpenCodeLane: HostedHostLocalLaneFactory = (_context, host) => {
+export const createHostLocalOpenCodeLane: HostedHostLocalLaneFactory = (context, host) => {
   const ready = host.appMcp !== null
-  return createProductionOpenCodeTeamLifecycleLane(() => ready)
+  return createProductionOpenCodeTeamLifecycleLane(() => ready,
+    new HostedOpenCodeLaunchCapabilityStore(context.teamRoot))
 }
 
 export type HostedPersonalHostLocalConfig = Readonly<{
@@ -114,14 +116,14 @@ export function createHostedPersonalHostLocalPortFactory(
 
 /**
  * Hosted runs have no Product-written legacy manifest, so the pump takes the
- * capability this lane committed at launch; the legacy manifest stays the
- * fallback. The lane is keyed by the legacy key, as is the pump.
+ * capability this lane or its predecessor committed at launch; the legacy
+ * manifest stays the fallback. The lane is keyed by the legacy key, as is the pump.
  */
 function withLaunchedCapability(
   lane: OpenCodeTeamLifecycleLane,
   options: HostedTeamLeadInboxPumpOptions,
 ): NonNullable<HostedTeamLeadInboxPumpOptions['getCapability']> {
-  return async input => lane.launchedCapability(input) ??
+  return async input => await lane.launchedCapability(input) ??
     readOpenCodeLegacyStopCapability({ teamsPath: dirname(options.canonicalTeamRoot), ...input })
 }
 

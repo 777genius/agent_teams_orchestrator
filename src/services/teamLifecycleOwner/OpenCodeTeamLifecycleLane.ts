@@ -38,8 +38,17 @@ type ExecuteBridge = ReturnType<typeof createOwnedOpenCodeLifecycleCommandExecut
  */
 const LIFECYCLE_OWNER_HANDSHAKE_IDENTITY = 'hosted-lifecycle-owner/v1'
 
+export type LaunchedCapabilityRun = { teamId: string; laneId: string; runId: string }
+
 /** Capability the bridge committed for this exact run, or null before any session record exists. */
-export type ReadLaunchedCapability = (input: { teamId: string; laneId: string; runId: string }) => Promise<string | null>
+export type ReadLaunchedCapability = (input: LaunchedCapabilityRun) => Promise<string | null>
+
+/** Durable copy of the capability a run launched with, for an owner that adopts the run after a restart. */
+export interface LaunchedCapabilityStore {
+  read(run: LaunchedCapabilityRun): Promise<string | null>
+  write(run: LaunchedCapabilityRun & { capabilitySnapshotId: string }): Promise<void>
+  remove(run: LaunchedCapabilityRun): Promise<void>
+}
 
 const readLaunchedCapability: ReadLaunchedCapability = async ({ teamId, laneId, runId }) => {
   const ids = new Set((await openCodeSessionStore.list())
@@ -51,9 +60,11 @@ const readLaunchedCapability: ReadLaunchedCapability = async ({ teamId, laneId, 
 
 export function createProductionOpenCodeTeamLifecycleLane(
   hasLiveCapability: () => boolean = () => true,
+  launchedCapabilityStore?: LaunchedCapabilityStore,
 ): OpenCodeTeamLifecycleLane {
   const executeBridge = createOwnedOpenCodeLifecycleCommandExecutor()
-  return new OpenCodeTeamLifecycleLane(executeBridge, 300_000, hasLiveCapability)
+  return new OpenCodeTeamLifecycleLane(executeBridge, 300_000, hasLiveCapability, readLaunchedCapability,
+    launchedCapabilityStore)
 }
 
 /** Existing OpenCode bridge is the sole production effect owner for OpenCode sessions. */
@@ -68,17 +79,19 @@ export class OpenCodeTeamLifecycleLane implements TeamLifecycleLaneEffectPort {
     private readonly timeoutMs = 300_000,
     private readonly hasLiveCapability: () => boolean = () => false,
     private readonly readCapability: ReadLaunchedCapability = readLaunchedCapability,
+    private readonly launchedCapabilityStore?: LaunchedCapabilityStore,
   ) {}
 
   supports(): boolean { return this.hasLiveCapability() }
 
   /**
-   * Capability the bridge reported when this process launched the run.
-   * Non-Cursor session records carry no stop authority, so delivery to the
-   * run's retained host has no other source for it.
+   * Capability the bridge reported when the run was launched, by this process
+   * or by the owner it took over from. Non-Cursor session records carry no stop
+   * authority, so delivery to the run's retained host has no other source for it.
    */
-  launchedCapability(input: { teamId: string; laneId: string; runId: string }): string | null {
-    return this.#launchedCapabilities.get(runKey(input.teamId, input.laneId, input.runId)) ?? null
+  async launchedCapability(run: LaunchedCapabilityRun): Promise<string | null> {
+    return this.#launchedCapabilities.get(runKey(run.teamId, run.laneId, run.runId)) ??
+      await this.launchedCapabilityStore?.read(run) ?? null
   }
 
   async inspect(input: {
@@ -94,8 +107,8 @@ export class OpenCodeTeamLifecycleLane implements TeamLifecycleLaneEffectPort {
       // With a committed capability the bridge reconciles on the run's own
       // retained host; without it only a generic probe is possible, which may
       // evict that host.
-      const capabilitySnapshotId = this.#launchedCapabilities.get(runKey(input.planTeamId, input.lane.laneId, runId))
-        ?? await this.readCapability({ teamId: input.planTeamId, laneId: input.lane.laneId, runId })
+      const run = { teamId: input.planTeamId, laneId: input.lane.laneId, runId }
+      const capabilitySnapshotId = await this.launchedCapability(run) ?? await this.readCapability(run)
       const data = await this.#execute('opencode.reconcileTeam', input.workspaceRoot, {
         runId,
         laneId: input.lane.laneId,
@@ -167,6 +180,9 @@ export class OpenCodeTeamLifecycleLane implements TeamLifecycleLaneEffectPort {
         ? (runtime as Record<string, unknown>).capabilitySnapshotId
         : undefined
       if (typeof capability === 'string' && /^opencode:[a-f0-9]{32}$/.test(capability)) {
+        // Durable first: a launch whose capability could not be kept fails and is compensated.
+        await this.launchedCapabilityStore?.write({ teamId: input.planTeamId, laneId: lane.laneId,
+          runId: input.runId, capabilitySnapshotId: capability })
         this.#launchedCapabilities.set(runKey(input.planTeamId, lane.laneId, input.runId), capability)
       }
       return launchObservation(asRecord(response.data))
@@ -239,6 +255,9 @@ export class OpenCodeTeamLifecycleLane implements TeamLifecycleLaneEffectPort {
     })
     if (data.stopped !== true) throw new Error('OpenCode bridge did not confirm lane stop')
     this.#launchedCapabilities.delete(runKey(input.planTeamId, input.lane.laneId, input.runId))
+    // The lane is stopped; a leftover record binds only this finished run.
+    await this.launchedCapabilityStore?.remove({ teamId: input.planTeamId, laneId: input.lane.laneId,
+      runId: input.runId }).catch(() => undefined)
     return idle()
   }
 

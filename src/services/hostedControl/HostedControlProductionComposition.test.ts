@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 
@@ -11,6 +11,10 @@ import {
 } from '../teamLifecycleOwner/OpenCodeTeamLifecycleLane.js'
 import { TEAM_LEAD_NAME } from '../../utils/swarm/constants.js'
 import type { HostedControlRuntimePortFactory, HostedControlRuntimePorts } from './HostedControlRuntime.js'
+import {
+  HOSTED_OPENCODE_LAUNCH_CAPABILITY_DIRECTORY,
+  HostedOpenCodeLaunchCapabilityStore,
+} from './HostedOpenCodeLaunchCapabilityStore.js'
 import { createHostedPersonalHostLocalPortFactory } from './HostedPersonalHostLocalComposition.js'
 import type { HostedTeamLeadInboxPumpOptions } from './HostedTeamLeadInboxPump.js'
 import {
@@ -511,41 +515,60 @@ describe('createHostedPersonalHostLocalPortFactory', () => {
     expect(runtimeTeams).toEqual(['legacy', 'legacy'])
   })
 
-  test('the inbox pump selects the capability the host-local OpenCode lane launched with', async () => {
+  test('an owner that adopts a crashed owner\'s run delivers and reconciles with its launch capability', async () => {
     const teamRoot = await makePersonalTeamRoot('hosted-personal-capability-')
     const workspace = await writeAdmittedPlan(teamRoot)
     const launchedCapability = `opencode:${'e'.repeat(32)}`
+    const calls: Array<{ command: string; body: Record<string, unknown> }> = []
     const execute = (async (input: unknown) => {
-      const { command } = input as { command: string }
+      const request = input as { command: string; body: Record<string, unknown> }
+      calls.push(request)
       return {
         ok: true,
         runtime: { capabilitySnapshotId: launchedCapability },
-        data: command === 'opencode.readiness'
+        data: request.command === 'opencode.readiness'
           ? { state: 'ready', launchAllowed: true, missing: [],
               expectedBehaviorEvidence: { expectedBehaviorFingerprint: 'f'.repeat(64) } }
-          : command === 'opencode.stopTeam' ? { stopped: true } : { teamLaunchState: 'ready' },
+          : request.command === 'opencode.stopTeam' ? { stopped: true } : { teamLaunchState: 'ready' },
       }
     }) as never
     const pumpOptions: HostedTeamLeadInboxPumpOptions[] = []
-    const ports = await createHostedPersonalHostLocalPortFactory({
+    // Each owner process builds its own lane; non-Cursor session records carry
+    // no stop authority and hosted runs have no legacy manifest.
+    const createOwner = () => createHostedPersonalHostLocalPortFactory({
       appMcp: null,
-      // Non-Cursor session records carry no stop authority and hosted runs have no legacy manifest.
-      lanes: [() => new OpenCodeTeamLifecycleLane(execute, 10_000, () => true, async () => null)],
+      lanes: [context => new OpenCodeTeamLifecycleLane(execute, 10_000, () => true, async () => null,
+        new HostedOpenCodeLaunchCapabilityStore(context.teamRoot))],
       createInboxPump: options => {
         pumpOptions.push(options)
         return { wake: async () => ({ kind: 'observed' }), recover: async () => [],
           start: () => undefined, close: async () => undefined }
       },
     })(personalContext(teamRoot, workspace))
-    const { request, runId } = await reservedLaunchRequest(ports, teamRoot)
-    expect((await ports.lifecycle.dispatch(request)).payload.kind).toBe('settled')
+    const crashed = await createOwner()
+    const { request, runId } = await reservedLaunchRequest(crashed, teamRoot)
+    expect((await crashed.lifecycle.dispatch(request)).payload.kind).toBe('settled')
+    const records = join(teamRoot, HOSTED_OPENCODE_LAUNCH_CAPABILITY_DIRECTORY)
+    const [record] = await readdir(records)
+    expect((await stat(join(records, record!))).mode & 0o777).toBe(0o600)
 
-    expect(pumpOptions).toHaveLength(1)
-    const getCapability = pumpOptions[0]!.getCapability!
+    // The crashed owner never shuts down; the next one knows the run only from disk.
+    const adopting = await createOwner()
+    const getCapability = pumpOptions[1]!.getCapability!
     const run = { teamId: 'legacy', laneId: 'opencode-primary', runId }
     expect(await getCapability(run)).toBe(launchedCapability)
     await expect(getCapability({ ...run, runId: `run_${'d'.repeat(32)}` })).rejects.toThrow()
-    await ports.close()
+    calls.length = 0
+    expect((await adopting.lifecycle.dispatch(controlStateInput())).payload.kind).toBe('control_state')
+    expect(calls.find(call => call.command === 'opencode.reconcileTeam')).toMatchObject({
+      body: { expectedCapabilitySnapshotId: launchedCapability,
+        preconditions: { expectedRunId: runId, expectedCapabilitySnapshotId: launchedCapability } } })
+
+    // Graceful shutdown stops the adopted run and retires its record.
+    await adopting.close()
+    expect(calls.some(call => call.command === 'opencode.stopTeam')).toBe(true)
+    expect(await readdir(records)).toEqual([])
+    await crashed.close()
   })
 
   test('refuses host-local lanes when the process config root is not the admitted Claude root', async () => {
