@@ -207,4 +207,41 @@ describe('HostedAgentToolBroker', () => {
     await broker.revoke()
     socket.destroy()
   })
+
+  test('rejects recipient replacement between admission and Product proposal', async () => {
+    let reads = 0
+    let productCalls = 0
+    const admitted = { teamId: binding.teamId, runId: binding.runId,
+      laneId: 'lane_peer', memberId: `member_${'6'.repeat(32)}`, memberName: 'peer' }
+    const replacement = { ...admitted, laneId: 'lane_replacement',
+      memberId: `member_${'7'.repeat(32)}` }
+    const forbidden = async () => { productCalls++; return 'unexpected Product write' }
+    const { broker, options, effects } = await setup({
+      currentRecipient: async () => ++reads === 1 ? admitted : replacement,
+      productWriter: { commitTaskStatus: forbidden, appendTaskComment: forbidden,
+        appendPeerMessage: forbidden },
+    })
+    const socket = await connectPeer(options)
+    await ack(socket)
+    await broker.waitForPeer()
+    broker.bindSession(binding.sessionID)
+    await broker.activate({ operationId: options.operationId, containerGeneration: options.containerGeneration,
+      runId: binding.runId, laneId: binding.laneId, memberId: binding.memberId,
+      sessionID: binding.sessionID })
+    const request = Buffer.from(JSON.stringify({ version: 1, type: 'request', requestId: randomUUID(),
+      tool: 'hosted_message_send', context: { sessionID: binding.sessionID,
+        messageID: 'message_replacement', callID: 'call_replacement' },
+      args: { to: 'peer', text: 'sandbox message' } }))
+    const frame = Buffer.alloc(4 + request.length)
+    frame.writeUInt32BE(request.length, 0); request.copy(frame, 4)
+    const response = new Promise<{ ok: boolean; error: string }>(resolve => socket.once('data', bytes =>
+      resolve(JSON.parse(bytes.subarray(4).toString('utf8')) as { ok: boolean; error: string })))
+    socket.write(frame)
+    expect(await response).toMatchObject({ ok: false, error: 'operator_required' })
+    expect(reads).toBe(2)
+    expect(productCalls).toBe(0)
+    expect(effects()).toBe(0)
+    await broker.revoke()
+    socket.destroy()
+  })
 })

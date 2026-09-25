@@ -156,20 +156,27 @@ export class HostedAgentToolBroker {
       taskService: this.options.taskService, taskReader: this.options.taskReader,
       comments: this.options.comments, messages: this.options.messages,
       productWriter: this.options.productWriter ?? INACTIVE_HOSTED_AGENT_PRODUCT_EFFECT_WRITER,
-      recipientForMessage: (to, caller) => this.options.currentRecipient(to, caller),
+      recipientForMessage: (to, caller) => this.#currentAdmittedRecipient(to, caller),
     })
     this.#receiver = new HostedAgentToolReceiver({ socket, binding,
       teamName: this.options.teamName, gate: this.options.gate, wal: this.options.wal,
       isCurrent: (binding, context) => this.#state === 'active' && this.options.isCurrent(binding, context),
       canSendTo: async (to, caller) => {
-        const admitted = this.#roster.find(member => member.teamId === caller.teamId &&
-          member.runId === caller.runId && member.memberName === to && member.memberId !== caller.memberId)
-        if (!admitted) return false
-        const current = await this.options.currentRecipient(to, caller)
-        return !!current && current.teamId === admitted.teamId && current.runId === admitted.runId &&
-          current.laneId === admitted.laneId && current.memberId === admitted.memberId &&
-          current.memberName === admitted.memberName && await this.options.canSendTo(to, caller)
+        return !!await this.#currentAdmittedRecipient(to, caller) &&
+          await this.options.canSendTo(to, caller)
       }, executors })
+  }
+
+  async #currentAdmittedRecipient(to: string, caller: Readonly<HostedAgentToolBinding>):
+    Promise<HostedAgentToolRosterMember | null> {
+    const admitted = this.#roster.filter(member => member.teamId === caller.teamId &&
+      member.runId === caller.runId && member.memberName === to && member.memberId !== caller.memberId)
+    if (admitted.length !== 1) return null
+    const current = await this.options.currentRecipient(to, caller)
+    const pin = admitted[0]!
+    return current && current.teamId === pin.teamId && current.runId === pin.runId &&
+      current.laneId === pin.laneId && current.memberId === pin.memberId &&
+      current.memberName === pin.memberName ? pin : null
   }
 
   async revoke(): Promise<void> {
