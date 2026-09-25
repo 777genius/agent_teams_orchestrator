@@ -12,35 +12,52 @@ import { HostedRootSingleMemberAuthority, type HostedRootSingleMemberPins } from
   './HostedRootSingleMemberAuthority.js'
 
 const FIXTURES = path.join(import.meta.dir, '../productAuthority/fixtures')
-const SANDBOX_ROOT = '/sandbox/member-fixture'
 const START_DOMAIN = 'agent-teams.hosted-opencode-member-start/v1\0'
 
 type Fixture = { directory: string; db: Database; decision: HostedProductCurrentMemberDecision;
   authority: HostedRootSingleMemberAuthority; binding: HostedProductMemberBinding;
   pins: HostedRootSingleMemberPins; request: HostedMemberNetworkRequest }
 
-async function fixture(sandboxWorkspaceRoot = SANDBOX_ROOT): Promise<Fixture> {
+async function fixture(sandboxWorkspaceRoot?: string): Promise<Fixture> {
   const directory = await realpath(await mkdtemp('/tmp/hosted-root-single-member-'))
   await chmod(directory, 0o700)
   const databasePath = path.join(directory, 'product.sqlite')
-  const bytes = await readFile(path.join(FIXTURES, 'product-v33-current-member.sqlite.gz'))
+  const bytes = await readFile(path.join(FIXTURES, 'product-v35-current-member.sqlite.gz'))
   await writeFile(databasePath, gunzipSync(bytes), { mode: 0o600 })
   const metadata = JSON.parse(await readFile(path.join(FIXTURES,
-    'product-v33-current-member.binding.json'), 'utf8')) as
-    HostedProductMemberBinding & { expectedName: string; now: number }
-  const { expectedName: _expectedName, now, ...binding } = metadata
+    'product-v35-current-member.metadata.json'), 'utf8')) as {
+      now: number; expectedName: string; runId: string; memberId: string; runtimeWorkspaceId: string;
+      binding: { deploymentId: string; bootId: string; ownerGeneration: number;
+        ownerSessionId: string; restoreGeneration: number; mountGeneration: number }
+    }
   const db = new Database(databasePath, { create: false, readwrite: true })
-  const reservation = JSON.parse((db.query('SELECT record_json FROM hosted_lifecycle_run_reservations')
-    .get() as { record_json: string }).record_json) as { bootId: string; ownerGeneration: number;
-      ownerSessionId: string }
-  const pins = { binding, workspaceParent: '/sandbox', sandboxWorkspaceRoot,
-    bootId: reservation.bootId, ownerGeneration: reservation.ownerGeneration,
-    ownerSessionId: reservation.ownerSessionId }
+  const reservation = JSON.parse((db.query('SELECT record_json FROM hosted_lifecycle_run_reservations WHERE run_id = ?')
+    .get(metadata.runId) as { record_json: string }).record_json) as {
+      teamId: string; promotionOperationId: string; planSha256: string; rosterBindingSha256: string }
+  const roster = JSON.parse((db.query('SELECT binding_json FROM hosted_promotion_roster_bindings WHERE operation_id = ?')
+    .get(reservation.promotionOperationId) as { binding_json: string }).binding_json) as {
+      lanes: Array<{ laneId: string; members: Array<{ memberId: string }> }> }
+  const lane = roster.lanes.find(entry => entry.members.some(member => member.memberId === metadata.memberId))
+  if (!lane) throw new Error('fixture-member-missing')
+  const binding: HostedProductMemberBinding = { runId: metadata.runId, memberId: metadata.memberId,
+    teamId: reservation.teamId, laneId: lane.laneId, deploymentId: metadata.binding.deploymentId,
+    runtimeWorkspaceId: metadata.runtimeWorkspaceId, planSha256: reservation.planSha256,
+    rosterBindingSha256: reservation.rosterBindingSha256,
+    restoreGeneration: metadata.binding.restoreGeneration,
+    mountGeneration: metadata.binding.mountGeneration }
   const decision = await HostedProductCurrentMemberDecision.create({ databasePath,
-    expectedUid: process.getuid!(), now: () => now, testOnlyAllowNonRoot: true })
+    expectedUid: process.getuid!(), now: () => metadata.now, testOnlyAllowNonRoot: true })
+  const admittedWorkspaceRoot = await decision.withCurrentMemberDecision(binding, 'observe',
+    current => current.admittedWorkspaceRoot)
+  const pinnedWorkspaceRoot = sandboxWorkspaceRoot ?? admittedWorkspaceRoot
+  const pins = { binding, workspaceParent: path.dirname(pinnedWorkspaceRoot),
+    sandboxWorkspaceRoot: pinnedWorkspaceRoot, bootId: metadata.binding.bootId,
+    ownerGeneration: metadata.binding.ownerGeneration,
+    ownerSessionId: metadata.binding.ownerSessionId }
   const authority = new HostedRootSingleMemberAuthority(decision, pins, current => ({
-    runId: current.runId, bootId: reservation.bootId, ownerGeneration: reservation.ownerGeneration,
-    ownerSessionId: reservation.ownerSessionId, state: 'active',
+    runId: current.runId, bootId: metadata.binding.bootId,
+    ownerGeneration: metadata.binding.ownerGeneration,
+    ownerSessionId: metadata.binding.ownerSessionId, state: 'active',
   }))
   const operationId = `start_${createHash('sha256').update(START_DOMAIN +
     JSON.stringify([binding.runId, binding.memberId, binding.planSha256])).digest('hex')}`
@@ -62,7 +79,7 @@ test('one root-owned sandbox member binds the canonical Product plan and one man
     expect(f.authority.matchesManagedRequest(f.request)).toBe(true)
     expect(await f.authority.assertCurrent()).toBe(true)
     expect(await f.authority.withCurrentMemberDecision(f.binding, 'start', current =>
-      [current.memberName, current.admittedWorkspaceRoot])).toEqual(['builder', SANDBOX_ROOT])
+      [current.memberName, current.admittedWorkspaceRoot])).toEqual(['builder', f.pins.sandboxWorkspaceRoot])
     for (const request of [
       { ...f.request, operationId: `start_${'a'.repeat(64)}` },
       { ...f.request, planFingerprint: 'a'.repeat(64) },
