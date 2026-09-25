@@ -188,6 +188,11 @@ test('root manager RPC dispatches bound member operations and leaves legacy supe
       calls.push(`start:${request.receiptId}`)
       return { ...HANDLE, status: 'unresolved' as const, effectEnabled: false }
     },
+    lookupManagedMember: async (request: { memberOperationId: string; memberId: string }) => {
+      calls.push(`lookup:${request.memberId}`)
+      return { memberOperationId: request.memberOperationId, receiptId: 'c'.repeat(32),
+        ...HANDLE, state: 'unresolved' as const }
+    },
     observe: async (request: typeof managedHandle) => {
       calls.push(`observe:${request.memberOperationId}`)
       return { ...HANDLE, status: 'stopped' as const, effectEnabled: false }
@@ -197,7 +202,7 @@ test('root manager RPC dispatches bound member operations and leaves legacy supe
       return { ...HANDLE, stopped: true as const, unresolved: false as const }
     },
   } as unknown as Pick<HostedOpenCodeMemberSupervisorManager,
-    'prepareMember' | 'startPrepared' | 'observe' | 'stop'>
+    'prepareMember' | 'startPrepared' | 'lookupManagedMember' | 'observe' | 'stop'>
   const server = new HostedOpenCodeSupervisorRpcServer({ socketPath, secret, ownerGid: process.getgid!(),
     manager, testOnlyAllowNonRoot: true })
   try {
@@ -211,9 +216,15 @@ test('root manager RPC dispatches bound member operations and leaves legacy supe
     expect(await client.prepareManagedMember(MEMBER)).toMatchObject({ operationId: MEMBER.operationId })
     expect(await client.startManagedMember({ operationId: MEMBER.operationId, receiptId: 'c'.repeat(32) }))
       .toMatchObject({ effectEnabled: false })
+    const lookup = { ...MEMBER, memberOperationId: MEMBER.operationId, operationId: 'lookup_member123' }
+    await expect(client.lookupManagedMember({ ...lookup, memberId: 'bad' }))
+      .rejects.toThrow('command-invalid')
+    expect(await client.lookupManagedMember(lookup)).toEqual({ memberOperationId: MEMBER.operationId,
+      receiptId: 'c'.repeat(32), ...HANDLE, state: 'unresolved' })
     expect(await client.observeManagedMember(managedHandle)).toMatchObject({ status: 'stopped' })
     expect(await client.stopManagedMember(managedHandle)).toMatchObject({ stopped: true, unresolved: false })
     expect(calls).toEqual([`prepare:${MEMBER.memberId}`, `start:${'c'.repeat(32)}`,
+      `lookup:${MEMBER.memberId}`,
       `observe:${MEMBER.operationId}`, `stop:${MEMBER.operationId}`])
   } finally { await server.close().catch(() => undefined); await rm(root, { recursive: true, force: true }) }
 })

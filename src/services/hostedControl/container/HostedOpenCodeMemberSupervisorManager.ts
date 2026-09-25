@@ -13,7 +13,28 @@ const HANDLE = /^opencode_[0-9a-f]{32}$/
 
 type Supervisor = Pick<HostedOpenCodeContainerSupervisor, 'prepareMember' | 'startPrepared' | 'observe' | 'stop'>
 type Receipt = Awaited<ReturnType<Supervisor['prepareMember']>>
+type StartResult = Awaited<ReturnType<Supervisor['startPrepared']>>
 type Action = 'prepare' | 'start' | 'observe'
+
+export type ManagedMemberLookup = Readonly<{
+  /** A fresh read operation, separate from the durable member Start operation. */
+  operationId: string
+  memberOperationId: string
+  planTeamId: string
+  planFingerprint: string
+  runId: string
+  teamId: string
+  laneId: string
+  memberId: string
+}>
+
+export type ManagedMemberBinding = Readonly<{
+  memberOperationId: string
+  receiptId: string
+  handle: string
+  generation: string
+  state: 'prepared' | 'started' | 'stopped' | 'unresolved'
+}>
 
 export type HostedMemberSupervisorManagerOptions = Readonly<{
   stateDirectory: string
@@ -37,6 +58,8 @@ export type HostedMemberSupervisorManagerOptions = Readonly<{
 type Operation = Readonly<{ request: HostedMemberNetworkRequest; directoryName: string }>
 type NetworkClaim = Readonly<{ operationId: string; networkId: string }>
 type StopTerminal = Readonly<{ handle: string; generation: string; stopped: true; unresolved: false }>
+type StartIntent = Readonly<{ receiptId: string; handle: string; generation: string }>
+type StartTerminal = StartIntent & Readonly<{ status: 'started' | 'unresolved'; effectEnabled: false }>
 
 function validRequest(request: HostedMemberNetworkRequest): boolean {
   return !!request && Object.keys(request).sort().join(',') ===
@@ -44,6 +67,16 @@ function validRequest(request: HostedMemberNetworkRequest): boolean {
     [request.operationId, request.planTeamId, request.runId, request.teamId, request.laneId,
       request.memberId].every(value => typeof value === 'string' && ID.test(value)) &&
     typeof request.planFingerprint === 'string' && NETWORK_ID.test(request.planFingerprint)
+}
+
+function validReceipt(row: unknown, operationId: string): row is Receipt {
+  if (!exact(row, ['operationId', 'receiptId', 'handle', 'generation', 'connector']) ||
+    row.operationId !== operationId || typeof row.receiptId !== 'string' || !RECEIPT_ID.test(row.receiptId) ||
+    typeof row.handle !== 'string' || !HANDLE.test(row.handle) ||
+    typeof row.generation !== 'string' || !RECEIPT_ID.test(row.generation) ||
+    !exact(row.connector, ['pid', 'startTicks'])) return false
+  return Number.isSafeInteger(row.connector.pid) && Number(row.connector.pid) > 0 &&
+    typeof row.connector.startTicks === 'string' && /^\d+$/.test(row.connector.startTicks)
 }
 
 function sameRequest(left: HostedMemberNetworkRequest, right: HostedMemberNetworkRequest): boolean {
@@ -64,6 +97,8 @@ function exact(value: unknown, keys: readonly string[]): value is Record<string,
 export class HostedOpenCodeMemberSupervisorManager {
   private readonly supervisors = new Map<string, Promise<Supervisor>>()
   private readonly preparations = new Map<string, Promise<Receipt>>()
+  private readonly starts = new Map<string, Promise<StartResult>>()
+  private readonly memberMutations = new Map<string, Promise<unknown>>()
   private readonly uid: number
   private readonly identity: Readonly<{ dev: number; ino: number }>
 
@@ -157,7 +192,7 @@ export class HostedOpenCodeMemberSupervisorManager {
   }
 
   private async publishImmutable(name: string, value: unknown, beforePublish?: () => Promise<void>,
-    afterLink?: () => Promise<void>): Promise<void> {
+    afterLink?: () => Promise<void>): Promise<boolean> {
     const destination = this.file(name)
     const staging = `${destination}.stage-${randomBytes(16).toString('hex')}`
     await this.assertDirectory()
@@ -174,12 +209,25 @@ export class HostedOpenCodeMemberSupervisorManager {
     await this.syncDirectory()
     await unlink(staging)
     await this.syncDirectory()
+    return linked
   }
 
   private async authorized(request: HostedMemberNetworkRequest, action: Action): Promise<void> {
     if (!validRequest(request) || !await this.options.admitMember(request) ||
       !await this.options.assertEffectFence(request, action)) {
       throw new Error('hosted-member-product-authority-denied')
+    }
+  }
+
+  private async mutateMember<T>(operationId: string, work: () => Promise<T>): Promise<T> {
+    const previous = this.memberMutations.get(operationId)
+    const current = (async () => {
+      await previous?.catch(() => undefined)
+      return work()
+    })()
+    this.memberMutations.set(operationId, current)
+    try { return await current } finally {
+      if (this.memberMutations.get(operationId) === current) this.memberMutations.delete(operationId)
     }
   }
 
@@ -284,13 +332,70 @@ export class HostedOpenCodeMemberSupervisorManager {
   private async receipt(operationId: string): Promise<Receipt | null> {
     const row = await this.read<Receipt>(`receipt-${operationId}.json`)
     if (!row) return null
-    if (!exact(row, ['operationId', 'receiptId', 'handle', 'generation', 'connector']) ||
-      row.operationId !== operationId || typeof row.receiptId !== 'string' || !RECEIPT_ID.test(row.receiptId) ||
-      typeof row.handle !== 'string' || !HANDLE.test(row.handle) ||
-      typeof row.generation !== 'string' || !RECEIPT_ID.test(row.generation)) {
+    if (!validReceipt(row, operationId)) {
       throw new Error('hosted-member-receipt-invalid')
     }
+    const index = await this.read<Receipt>(`receipt-handle-${row.handle}.json`)
+    if (!index || JSON.stringify(index) !== JSON.stringify(row)) {
+      throw new Error('hosted-member-receipt-index-invalid')
+    }
     return row
+  }
+
+  private async startIntent(operationId: string, receipt: Receipt): Promise<StartIntent | null> {
+    const row = await this.read<StartIntent>(`start-intent-${operationId}.json`)
+    if (!row) return null
+    if (!exact(row, ['receiptId', 'handle', 'generation']) || row.receiptId !== receipt.receiptId ||
+      row.handle !== receipt.handle || row.generation !== receipt.generation) {
+      throw new Error('hosted-member-start-intent-invalid')
+    }
+    return row
+  }
+
+  private async startTerminal(operationId: string, receipt: Receipt): Promise<StartTerminal | null> {
+    const row = await this.read<StartTerminal>(`start-terminal-${operationId}.json`)
+    if (!row) return null
+    if (!exact(row, ['receiptId', 'handle', 'generation', 'status', 'effectEnabled']) ||
+      row.receiptId !== receipt.receiptId || row.handle !== receipt.handle ||
+      row.generation !== receipt.generation || !['started', 'unresolved'].includes(row.status) ||
+      row.effectEnabled !== false) throw new Error('hosted-member-start-terminal-invalid')
+    return row
+  }
+
+  /** Exact, read-only root recovery. No supervisor or network provisioner is opened. */
+  async lookupManagedMember(input: ManagedMemberLookup): Promise<ManagedMemberBinding | null> {
+    if (!exact(input, ['operationId', 'memberOperationId', 'planTeamId', 'planFingerprint',
+      'runId', 'teamId', 'laneId', 'memberId']) || !ID.test(input.operationId) ||
+      !validRequest({ operationId: input.memberOperationId, planTeamId: input.planTeamId,
+        planFingerprint: input.planFingerprint, runId: input.runId, teamId: input.teamId,
+        laneId: input.laneId, memberId: input.memberId })) {
+      throw new Error('hosted-member-lookup-invalid')
+    }
+    if (!await this.read<Operation>(`operation-${input.memberOperationId}.json`)) return null
+    const operation = await this.operation(input.memberOperationId)
+    const expected = { operationId: input.memberOperationId, planTeamId: input.planTeamId,
+      planFingerprint: input.planFingerprint, runId: input.runId, teamId: input.teamId,
+      laneId: input.laneId, memberId: input.memberId }
+    if (!sameRequest(operation.request, expected)) throw new Error('hosted-member-lookup-binding-conflict')
+    await this.assertMemberBinding(operation)
+    if (!await this.networkId(input.memberOperationId)) throw new Error('hosted-member-network-unresolved')
+    const positive = await this.options.admitMember(operation.request) &&
+      await this.options.assertEffectFence(operation.request, 'observe')
+    if (!positive && !await this.options.assertCleanupAuthority(operation.request, input.operationId)) {
+      throw new Error('hosted-member-lookup-authority-denied')
+    }
+    const receipt = await this.receipt(input.memberOperationId)
+    if (!receipt) throw new Error('hosted-member-receipt-unbound')
+    const intent = await this.startIntent(input.memberOperationId, receipt)
+    const terminal = await this.startTerminal(input.memberOperationId, receipt)
+    if (terminal && !intent) throw new Error('hosted-member-start-terminal-unbound')
+    const stop = await this.stopTerminal(input.memberOperationId)
+    if (stop && (stop.handle !== receipt.handle || stop.generation !== receipt.generation)) {
+      throw new Error('hosted-member-stop-terminal-conflict')
+    }
+    return { memberOperationId: input.memberOperationId, receiptId: receipt.receiptId,
+      handle: receipt.handle, generation: receipt.generation,
+      state: stop ? 'stopped' : terminal?.status ?? (intent ? 'unresolved' : 'prepared') }
   }
 
   private async stopTerminal(operationId: string): Promise<StopTerminal | null> {
@@ -314,6 +419,12 @@ export class HostedOpenCodeMemberSupervisorManager {
       const supervisor = await this.supervisor(operation, true)
       await this.authorized(request, 'prepare')
       const receipt = await supervisor.prepareMember({ operationId: request.operationId })
+      if (!validReceipt(receipt, request.operationId)) throw new Error('hosted-member-receipt-invalid')
+      await this.publishImmutable(`receipt-handle-${receipt.handle}.json`, receipt)
+      const indexed = await this.read<Receipt>(`receipt-handle-${receipt.handle}.json`)
+      if (!indexed || JSON.stringify(indexed) !== JSON.stringify(receipt)) {
+        throw new Error('hosted-member-receipt-index-conflict')
+      }
       const prior = await this.receipt(request.operationId)
       if (!prior) await this.publishImmutable(`receipt-${request.operationId}.json`, receipt,
         this.options.testOnlyBeforeReceiptPublish)
@@ -326,18 +437,62 @@ export class HostedOpenCodeMemberSupervisorManager {
   }
 
   async startPrepared(input: { operationId: string; receiptId: string }): ReturnType<Supervisor['startPrepared']> {
+    if (!exact(input, ['operationId', 'receiptId']) || !ID.test(input.operationId) ||
+      !RECEIPT_ID.test(input.receiptId)) throw new Error('hosted-member-prepared-start-invalid')
+    const pending = this.starts.get(input.operationId)
+    if (pending) return pending
+    const starting = this.mutateMember(input.operationId, () => this.startPreparedOnce(input))
+    this.starts.set(input.operationId, starting)
+    try { return await starting } finally { this.starts.delete(input.operationId) }
+  }
+
+  private async startPreparedOnce(input: { operationId: string; receiptId: string }): Promise<StartResult> {
     const operation = await this.operation(input.operationId)
     await this.authorized(operation.request, 'start')
     const receipt = await this.receipt(input.operationId)
     if (!receipt || receipt.receiptId !== input.receiptId) throw new Error('hosted-member-receipt-unbound')
     await this.assertMemberBinding(operation)
+    const stop = await this.stopTerminal(input.operationId)
+    if (stop) {
+      if (stop.handle !== receipt.handle || stop.generation !== receipt.generation) {
+        throw new Error('hosted-member-stop-terminal-conflict')
+      }
+      throw new Error('hosted-member-already-stopped')
+    }
+    const priorIntent = await this.startIntent(input.operationId, receipt)
+    const priorTerminal = await this.startTerminal(input.operationId, receipt)
+    if (priorTerminal && !priorIntent) throw new Error('hosted-member-start-terminal-unbound')
+    if (priorIntent) return priorTerminal
+      ? { handle: priorTerminal.handle, generation: priorTerminal.generation,
+        status: priorTerminal.status, effectEnabled: false }
+      : { handle: receipt.handle, generation: receipt.generation, status: 'unresolved', effectEnabled: false }
     const supervisor = await this.supervisor(operation, false)
     await this.authorized(operation.request, 'start')
+    const created = await this.publishImmutable(`start-intent-${input.operationId}.json`, {
+      receiptId: receipt.receiptId, handle: receipt.handle, generation: receipt.generation,
+    } satisfies StartIntent)
+    if (!await this.startIntent(input.operationId, receipt)) throw new Error('hosted-member-start-intent-unbound')
+    if (!created) {
+      const terminal = await this.startTerminal(input.operationId, receipt)
+      return terminal
+        ? { handle: terminal.handle, generation: terminal.generation,
+          status: terminal.status, effectEnabled: false }
+        : { handle: receipt.handle, generation: receipt.generation,
+          status: 'unresolved', effectEnabled: false }
+    }
     const result = await supervisor.startPrepared(input)
-    if (result.handle !== receipt.handle || result.generation !== receipt.generation) {
+    if (result.handle !== receipt.handle || result.generation !== receipt.generation ||
+      !['started', 'unresolved'].includes(result.status) || result.effectEnabled !== false) {
       throw new Error('hosted-member-start-result-conflict')
     }
-    return result
+    await this.publishImmutable(`start-terminal-${input.operationId}.json`, {
+      receiptId: receipt.receiptId, handle: result.handle, generation: result.generation,
+      status: result.status, effectEnabled: false,
+    } satisfies StartTerminal)
+    const stored = await this.startTerminal(input.operationId, receipt)
+    if (!stored || stored.status !== result.status) throw new Error('hosted-member-start-result-conflict')
+    return { handle: stored.handle, generation: stored.generation,
+      status: stored.status, effectEnabled: false }
   }
 
   async observe(input: { memberOperationId: string; operationId: string; handle: string; generation: string }):
@@ -351,6 +506,11 @@ export class HostedOpenCodeMemberSupervisorManager {
 
   async stop(input: { memberOperationId: string; operationId: string; handle: string; generation: string }):
     ReturnType<Supervisor['stop']> {
+    return this.mutateMember(input.memberOperationId, () => this.stopOnce(input))
+  }
+
+  private async stopOnce(input: { memberOperationId: string; operationId: string; handle: string;
+    generation: string }): ReturnType<Supervisor['stop']> {
     const { operation, request } = await this.boundHandle(input)
     await this.cleanupAuthorized(operation.request, input.operationId)
     const prior = await this.stopTerminal(input.memberOperationId)

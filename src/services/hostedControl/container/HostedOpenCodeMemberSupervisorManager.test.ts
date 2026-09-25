@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { mkdtemp, readdir, realpath, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -12,6 +12,9 @@ const A: HostedMemberNetworkRequest = {
   runId: 'run_test123', teamId: 'team_test123', laneId: 'lane_test123', memberId: 'member_a123',
 }
 const B: HostedMemberNetworkRequest = { ...A, operationId: 'operation_b123', memberId: 'member_b123' }
+const lookup = (request: HostedMemberNetworkRequest) => ({
+  ...request, memberOperationId: request.operationId, operationId: 'lookup_member123',
+})
 const NETWORK_A = '1'.repeat(64)
 const NETWORK_B = '2'.repeat(64)
 const directories: string[] = []
@@ -64,6 +67,118 @@ async function fixture() {
 }
 
 describe('HostedOpenCodeMemberSupervisorManager', () => {
+  test('exact root lookup survives restart and returns only pinned member state', async () => {
+    const f = await fixture()
+    const manager = await HostedOpenCodeMemberSupervisorManager.create(f.options)
+    expect(await manager.lookupManagedMember(lookup(A))).toBeNull()
+    const receipt = await manager.prepareMember(A)
+    const restarted = await HostedOpenCodeMemberSupervisorManager.create(f.options)
+    const identity = { memberOperationId: A.operationId, receiptId: receipt.receiptId,
+      handle: receipt.handle, generation: receipt.generation }
+    expect(await restarted.lookupManagedMember(lookup(A))).toEqual({ ...identity, state: 'prepared' })
+    expect(f.created).toEqual([A.operationId])
+    expect(f.supervisors).toHaveLength(1)
+    expect(f.started).toEqual([])
+    await restarted.startPrepared({ operationId: A.operationId, receiptId: receipt.receiptId })
+    const afterStart = await HostedOpenCodeMemberSupervisorManager.create(f.options)
+    expect(await afterStart.lookupManagedMember(lookup(A))).toEqual({ ...identity, state: 'started' })
+    expect(f.started).toEqual([A.operationId])
+    await afterStart.stop({ memberOperationId: A.operationId, operationId: 'stop_lookup123',
+      handle: receipt.handle, generation: receipt.generation })
+    const afterStop = await HostedOpenCodeMemberSupervisorManager.create(f.options)
+    expect(await afterStop.lookupManagedMember(lookup(A))).toEqual({ ...identity, state: 'stopped' })
+    await expect(afterStop.startPrepared({ operationId: A.operationId, receiptId: receipt.receiptId }))
+      .rejects.toThrow('hosted-member-already-stopped')
+    expect(f.started).toEqual([A.operationId])
+  })
+
+  test('ambiguous Start is durably unresolved and lookup never reissues it', async () => {
+    const f = await fixture()
+    const factory = f.options.testOnlySupervisorFactory!
+    const calls: string[] = []
+    const options = { ...f.options, testOnlySupervisorFactory: async (
+      settings: Parameters<typeof factory>[0]) => {
+      const supervisor = await factory(settings)
+      return { ...supervisor, startPrepared: async (input: { operationId: string; receiptId: string }) => {
+        calls.push(input.operationId)
+        throw new Error('simulated-uncertain-reply')
+      } }
+    } } satisfies HostedMemberSupervisorManagerOptions
+    const manager = await HostedOpenCodeMemberSupervisorManager.create(options)
+    const receipt = await manager.prepareMember(A)
+    await expect(manager.startPrepared({ operationId: A.operationId, receiptId: receipt.receiptId }))
+      .rejects.toThrow('simulated-uncertain-reply')
+    const restarted = await HostedOpenCodeMemberSupervisorManager.create(options)
+    expect(await restarted.lookupManagedMember(lookup(A))).toEqual({
+      memberOperationId: A.operationId, receiptId: receipt.receiptId,
+      handle: receipt.handle, generation: receipt.generation, state: 'unresolved',
+    })
+    expect(await restarted.startPrepared({ operationId: A.operationId, receiptId: receipt.receiptId }))
+      .toMatchObject({ status: 'unresolved', effectEnabled: false })
+    expect(calls).toEqual([A.operationId])
+  })
+
+  test('a terminal stop before Start cannot later activate the prepared member', async () => {
+    const f = await fixture()
+    const manager = await HostedOpenCodeMemberSupervisorManager.create(f.options)
+    const receipt = await manager.prepareMember(A)
+    await manager.stop({ memberOperationId: A.operationId, operationId: 'stop_prepared123',
+      handle: receipt.handle, generation: receipt.generation })
+    const restarted = await HostedOpenCodeMemberSupervisorManager.create(f.options)
+    await expect(restarted.startPrepared({ operationId: A.operationId, receiptId: receipt.receiptId }))
+      .rejects.toThrow('hosted-member-already-stopped')
+    expect(await restarted.lookupManagedMember(lookup(A))).toMatchObject({ state: 'stopped' })
+    expect(f.started).toEqual([])
+  })
+
+  test('concurrent Stop wins over a later Start in the same root manager', async () => {
+    const f = await fixture()
+    const factory = f.options.testOnlySupervisorFactory!
+    let entered!: () => void
+    let release!: () => void
+    const stopEntered = new Promise<void>(resolve => { entered = resolve })
+    const holdStop = new Promise<void>(resolve => { release = resolve })
+    const manager = await HostedOpenCodeMemberSupervisorManager.create({ ...f.options,
+      testOnlySupervisorFactory: async options => {
+        const supervisor = await factory(options)
+        return { ...supervisor, stop: async request => {
+          entered()
+          await holdStop
+          return supervisor.stop(request)
+        } }
+      },
+    })
+    const receipt = await manager.prepareMember(A)
+    const stopping = manager.stop({ memberOperationId: A.operationId, operationId: 'stop_race123',
+      handle: receipt.handle, generation: receipt.generation })
+    await stopEntered
+    const starting = manager.startPrepared({ operationId: A.operationId, receiptId: receipt.receiptId })
+    release()
+    await stopping
+    await expect(starting).rejects.toThrow('hosted-member-already-stopped')
+    expect(f.started).toEqual([])
+  })
+
+  test('lookup rejects a foreign tuple, substituted receipt, and revoked authority', async () => {
+    const f = await fixture()
+    const manager = await HostedOpenCodeMemberSupervisorManager.create(f.options)
+    const receipt = await manager.prepareMember(A)
+    await expect(manager.lookupManagedMember({ ...lookup(A), memberId: B.memberId }))
+      .rejects.toThrow('hosted-member-lookup-binding-conflict')
+    await expect(manager.lookupManagedMember({ ...lookup(A), planFingerprint: 'b'.repeat(64) }))
+      .rejects.toThrow('hosted-member-lookup-binding-conflict')
+    f.denyAdmission()
+    f.denyCleanup()
+    await expect(manager.lookupManagedMember(lookup(A))).rejects.toThrow('hosted-member-lookup-authority-denied')
+    const file = path.join(f.stateDirectory, `receipt-${A.operationId}.json`)
+    const stored = JSON.parse(await readFile(file, 'utf8')) as Record<string, unknown>
+    await writeFile(file, JSON.stringify({ ...stored, handle: `opencode_${'e'.repeat(32)}` }))
+    const restarted = await HostedOpenCodeMemberSupervisorManager.create({ ...f.options,
+      admitMember: async () => true })
+    await expect(restarted.lookupManagedMember(lookup(A))).rejects.toThrow('hosted-member-receipt-index-invalid')
+    expect(receipt.handle).not.toBe(`opencode_${'e'.repeat(32)}`)
+    expect(f.started).toEqual([])
+  })
   test('two concurrent members keep distinct internal network IDs, supervisor directories and exact handle routes', async () => {
     const f = await fixture()
     const manager = await HostedOpenCodeMemberSupervisorManager.create(f.options)

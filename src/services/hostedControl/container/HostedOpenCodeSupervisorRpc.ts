@@ -5,6 +5,7 @@ import path from 'node:path'
 
 import type { HostedOpenCodeContainerSupervisor } from './HostedOpenCodeContainerSupervisor.js'
 import type { HostedOpenCodeMemberSupervisorManager } from './HostedOpenCodeMemberSupervisorManager.js'
+import type { ManagedMemberLookup } from './HostedOpenCodeMemberSupervisorManager.js'
 import type { HostedMemberNetworkRequest } from '../containerNetworkProvisioning/HostedMemberNetworkProvisioner.js'
 
 const VERSION = 1
@@ -18,13 +19,13 @@ const DOMAIN = 'agent-teams.hosted-opencode-supervisor/v1'
 
 type Operation = 'prepareMember' | 'startPrepared' | 'start' | 'lookupStart' | 'observe' | 'stop' |
   'reconcile' | 'beginEndpointUse' | 'endEndpointUse' | 'prepareManagedMember' |
-  'startManagedMember' | 'observeManagedMember' | 'stopManagedMember'
+  'startManagedMember' | 'lookupManagedMember' | 'observeManagedMember' | 'stopManagedMember'
 const COMMAND_DEADLINE_MS: Readonly<Record<Operation, number>> = {
   prepareMember: 30_000, startPrepared: 120_000,
   start: 120_000, lookupStart: 15_000, observe: 30_000, stop: 60_000,
   reconcile: 60_000, beginEndpointUse: 30_000, endEndpointUse: 15_000,
   prepareManagedMember: 30_000, startManagedMember: 120_000,
-  observeManagedMember: 30_000, stopManagedMember: 60_000,
+  lookupManagedMember: 15_000, observeManagedMember: 30_000, stopManagedMember: 60_000,
 }
 type Start = Parameters<HostedOpenCodeContainerSupervisor['start']>[0]
 type Handle = Parameters<HostedOpenCodeContainerSupervisor['stop']>[0]
@@ -33,12 +34,12 @@ type Prepare = Parameters<HostedOpenCodeContainerSupervisor['prepareMember']>[0]
 type PreparedStart = Parameters<HostedOpenCodeContainerSupervisor['startPrepared']>[0]
 type ManagedHandle = Parameters<HostedOpenCodeMemberSupervisorManager['stop']>[0]
 type Command = Readonly<{ operation: Operation; payload: Start | Handle | EndpointEnd | Prepare |
-  PreparedStart | HostedMemberNetworkRequest | ManagedHandle }>
+  PreparedStart | HostedMemberNetworkRequest | ManagedMemberLookup | ManagedHandle }>
 type SupervisorPort = Pick<HostedOpenCodeContainerSupervisor,
   'prepareMember' | 'startPrepared' | 'start' | 'lookupStart' | 'observe' | 'stop' | 'reconcile' |
   'beginEndpointUse' | 'endEndpointUse'>
 type ManagerPort = Pick<HostedOpenCodeMemberSupervisorManager,
-  'prepareMember' | 'startPrepared' | 'observe' | 'stop'>
+  'prepareMember' | 'startPrepared' | 'lookupManagedMember' | 'observe' | 'stop'>
 
 function exactKeys(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value) &&
@@ -59,6 +60,13 @@ function validCommand(operation: unknown, payload: unknown): operation is Operat
     return exactKeys(payload, ['operationId', 'planTeamId', 'planFingerprint', 'runId', 'teamId',
       'laneId', 'memberId']) &&
       ['operationId', 'planTeamId', 'runId', 'teamId', 'laneId', 'memberId']
+        .every(key => typeof payload[key] === 'string' && ID.test(payload[key])) &&
+      typeof payload.planFingerprint === 'string' && PROOF.test(payload.planFingerprint)
+  }
+  if (operation === 'lookupManagedMember') {
+    return exactKeys(payload, ['operationId', 'memberOperationId', 'planTeamId', 'planFingerprint',
+      'runId', 'teamId', 'laneId', 'memberId']) &&
+      ['operationId', 'memberOperationId', 'planTeamId', 'runId', 'teamId', 'laneId', 'memberId']
         .every(key => typeof payload[key] === 'string' && ID.test(payload[key])) &&
       typeof payload.planFingerprint === 'string' && PROOF.test(payload.planFingerprint)
   }
@@ -285,6 +293,8 @@ export class HostedOpenCodeSupervisorRpcServer {
           command.payload as HostedMemberNetworkRequest); break
         case 'startManagedMember': result = await this.options.manager?.startPrepared(
           command.payload as PreparedStart); break
+        case 'lookupManagedMember': result = await this.options.manager?.lookupManagedMember(
+          command.payload as ManagedMemberLookup); break
         case 'observeManagedMember': result = await this.options.manager?.observe(
           command.payload as ManagedHandle); break
         case 'stopManagedMember': result = await this.options.manager?.stop(
@@ -335,6 +345,10 @@ export class HostedOpenCodeSupervisorRpcClient {
 
   startManagedMember(request: PreparedStart): ReturnType<ManagerPort['startPrepared']> {
     return this.command({ operation: 'startManagedMember', payload: request })
+  }
+
+  lookupManagedMember(request: ManagedMemberLookup): ReturnType<ManagerPort['lookupManagedMember']> {
+    return this.command({ operation: 'lookupManagedMember', payload: request })
   }
 
   observeManagedMember(request: ManagedHandle): ReturnType<ManagerPort['observe']> {
