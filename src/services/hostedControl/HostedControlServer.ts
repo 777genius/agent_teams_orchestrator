@@ -18,8 +18,10 @@ import { HOSTED_CONTROL_SOCKET_BROKER_FLAG } from './HostedControlSocketBroker.j
 import {
   HOSTED_APPROVAL_ACTIVATION_PREPARE_MAX_BYTES,
   HOSTED_APPROVAL_ACTIVATION_PUBLICATION_MAX_BYTES,
-  type HostedApprovalActivationConnection,
-  type HostedApprovalActivationTransportSession,
+} from './HostedApprovalActivationLimits.js'
+import type {
+  HostedApprovalActivationConnection,
+  HostedApprovalActivationTransportSession,
 } from './HostedApprovalActivationSession.js'
 import {
   HOSTED_CONTROL_OPERATION,
