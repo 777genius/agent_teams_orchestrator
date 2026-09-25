@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { getAgentStatuses, getTask, listTasks } from '../../utils/tasks.js'
@@ -55,6 +55,42 @@ describe('HostedTaskMutationService', () => {
     expect(await readFile(taskPath, 'utf8')).toBe(original)
   })
 
+  test('reports exactly the task files published by a fresh commit as self-write effects', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'hosted-service-effects-')); roots.push(root)
+    const taskRoot = join(root, 'tasks', 'legacy')
+    await mkdir(join(root, 'teams', 'legacy'), { recursive: true }); await mkdir(taskRoot, { recursive: true })
+    const teamId = `team_${'a'.repeat(32)}`; const authority = authorityFor(teamId)
+    const service = new HostedTaskMutationService({ claudeRoot: root, legacyKey: 'legacy', authority, wal: new HostedTaskMutationWal(join(root, 'teams', 'legacy'), teamId) })
+    const converge = async (initial: HostedTaskMutationCommand) => {
+      let command = initial
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const outcome = await service.mutateWithSelfWriteEffects(requestFor(authority, command))
+        if (outcome.result.kind === 'stale_generation') { command = { ...command, expectedSourceGeneration: outcome.result.currentSourceGeneration }; continue }
+        if (outcome.result.kind === 'stale_revision') { command = { ...command, expectedRevision: outcome.result.currentRevision }; continue }
+        return { command, outcome }
+      }
+      throw new Error('command admission did not converge')
+    }
+    const effectsOnDisk = async (fileKeys: string[]) => Promise.all(fileKeys.map(async fileKey => ({ fileKey,
+      expectedChecksum: createHash('sha256').update(await readFile(join(taskRoot, `${fileKey}.json`))).digest('hex') })))
+
+    const created = await converge({ schemaVersion: 1, kind: 'create_task', commandId: 'command_effects', idempotencyKey: 'idem:effects', teamId, expectedSourceGeneration: 'generation_stale', expectedRevision: 'revision_stale', subject: 'Effects', description: null, status: 'pending', ownerId: null, column: 'todo', order: 0 })
+    expect(created.outcome.result.kind).toBe('committed')
+    const fileKeys = (await readdir(taskRoot)).filter(name => name.endsWith('.json')).map(name => name.slice(0, -'.json'.length))
+    expect(fileKeys).toHaveLength(1)
+    expect(created.outcome.selfWriteEffects).toEqual(await effectsOnDisk(fileKeys))
+
+    const replay = await service.mutateWithSelfWriteEffects(requestFor(authority, created.command))
+    expect(replay).toEqual({ result: expect.objectContaining({ kind: 'idempotent_replay' }), selfWriteEffects: [] })
+    if (created.outcome.result.kind !== 'committed') return
+    const updated = await converge({ schemaVersion: 1, kind: 'update_details', commandId: 'command_effects_update', idempotencyKey: 'idem:effects-update', teamId, expectedSourceGeneration: created.command.expectedSourceGeneration, expectedRevision: 'revision_stale', taskId: created.outcome.result.receipt.affectedTaskIds[0]!, subject: 'Effects updated' })
+    expect(updated.outcome.result.kind).toBe('committed')
+    expect(updated.outcome.selfWriteEffects).toEqual(await effectsOnDisk(fileKeys))
+
+    const denied = new HostedTaskMutationService({ claudeRoot: root, legacyKey: 'legacy', authority, wal: new HostedTaskMutationWal(join(root, 'teams', 'legacy'), teamId), denyOwnerLocalWrites: true })
+    expect(await denied.mutateWithSelfWriteEffects(requestFor(authority, { ...updated.command, commandId: 'command_denied', idempotencyKey: 'idem:denied' }))).toEqual({ result: { kind: 'unavailable' }, selfWriteEffects: [] })
+  })
+
   test('derives source generation from the board directory authority before revision admission', async () => {
     const root = await mkdtemp(join(tmpdir(), 'hosted-service-test-')); roots.push(root)
     await mkdir(join(root, 'teams', 'legacy'), { recursive: true }); await mkdir(join(root, 'tasks', 'legacy'), { recursive: true })
@@ -67,8 +103,9 @@ describe('HostedTaskMutationService', () => {
     const result = await service.mutate(request)
     expect(result.kind).toBe('stale_generation')
     if (result.kind === 'stale_generation') {
-      const [teamStat, tasksStat] = await Promise.all([lstat(join(root, 'teams', 'legacy')), lstat(join(root, 'tasks', 'legacy'))])
-      const expected = `generation_${createHash('sha256').update(JSON.stringify({ domain: 'hosted-task-board-source/v3', deploymentId: authority.deploymentId, bootId: authority.bootId, restoreGeneration: authority.restoreGeneration, workspaceId: authority.workspaceId, mountGeneration: authority.mountBinding.mountGeneration, declaredRootHash: authority.mountBinding.declaredRootHash, teamId, teamDirectory: [String(teamStat.dev), String(teamStat.ino)], tasksDirectory: [String(tasksStat.dev), String(tasksStat.ino)] })).digest('hex')}`
+      const [teamStat, tasksStat] = await Promise.all([lstat(join(root, 'teams', 'legacy'), { bigint: true }), lstat(join(root, 'tasks', 'legacy'), { bigint: true })])
+      // Byte-identical to Product hostedTaskBoardSourceGeneration, which issues expectedSourceGeneration.
+      const expected = `generation_${createHash('sha256').update(JSON.stringify({ domain: 'hosted-task-board-source/v2', deploymentId: authority.deploymentId, bootId: authority.bootId, workspaceId: authority.workspaceId, mountGeneration: authority.mountBinding.mountGeneration, teamId, teamDirectory: [teamStat.dev.toString(), teamStat.ino.toString()], tasksDirectory: [tasksStat.dev.toString(), tasksStat.ino.toString()] })).digest('hex')}`
       expect(result.currentSourceGeneration).toBe(expected)
     }
   })

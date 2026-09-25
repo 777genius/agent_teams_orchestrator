@@ -16,6 +16,11 @@ import {
   HOSTED_TEAM_MESSAGE_PROOF_DOMAIN,
 } from './HostedControlServer.js'
 import {
+  dispatchProductTaskMutation,
+  isProductTaskMutationEnvelope,
+  type HostedProductTaskMutationPort,
+} from './HostedProductTaskMutationWire.js'
+import {
   HostedApprovalWireDispatcher,
   isHostedApprovalOperation,
   type HostedApprovalWirePort,
@@ -79,6 +84,8 @@ export type HostedControlDispatcherOptions = {
   getOwnerBinding: () => HostedControlOwnerBinding | null
   lifecycle: HostedLifecycleCommandPort
   messages: HostedTeamMessagePort
+  /** Product-envelope task_mutate; the Owner writer itself decides whether local writes are admitted. */
+  tasks?: HostedProductTaskMutationPort
   /** Absent until a single durable approval runtime owner is composed. */
   approvals?: HostedApprovalWirePort
 }
@@ -102,6 +109,17 @@ export class HostedControlDispatcher {
     }
     if (isMessageOperation(message.operation)) {
       return this.#dispatchMessage(message)
+    }
+    if (isProductTaskMutationEnvelope(message)) {
+      if (!this.options.tasks) throw new Error('Hosted Product task writer is unavailable')
+      return dispatchProductTaskMutation({
+        message,
+        secret: this.options.secret,
+        proofDomain: HOSTED_TEAM_MESSAGE_PROOF_DOMAIN,
+        authority: this.options.authority,
+        activeOwner: this.options.getOwnerBinding(),
+        tasks: this.options.tasks,
+      })
     }
     return null
   }

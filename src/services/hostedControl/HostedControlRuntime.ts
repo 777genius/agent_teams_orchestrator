@@ -20,9 +20,10 @@ import {
 import { HostedTaskMutationService } from './HostedTaskMutationService.js'
 import { HostedTaskMutationWal } from './HostedTaskMutationWal.js'
 import { HostedRootOwnerLease } from './HostedRootOwnerLease.js'
-import type {
-  HostedControlBootstrapAdmission,
-  HostedControlDescriptorGuard,
+import {
+  HOSTED_CONTROL_PERSONAL_HOST_ADMISSION_KIND,
+  type HostedControlBootstrapAdmission,
+  type HostedControlDescriptorGuard,
 } from './HostedControlBootstrap.js'
 import {
   hostedControlAuthorityFromConfig,
@@ -177,8 +178,9 @@ export class HostedControlRuntime {
         authority,
         wal,
         validateOwner,
-        // Product has no atomic task writer yet; hosted Owner may only read the board.
-        denyOwnerLocalWrites: true,
+        // Temporary personal-host writer: its agents are already trusted host processes. Every
+        // other profile stays read-only until Product owns the single atomic task writer.
+        denyOwnerLocalWrites: descriptorAdmission?.admissionKind !== HOSTED_CONTROL_PERSONAL_HOST_ADMISSION_KIND,
       })
       if (startup.cancelled || this.#descriptorAuthorityLost) {
         throw new Error('Hosted control launcher authority is no longer current')
@@ -240,6 +242,7 @@ export class HostedControlRuntime {
         getOwnerBinding: () => server?.ownerBinding ?? null,
         lifecycle: ports.lifecycle,
         messages: ports.messages,
+        tasks: taskService,
         approvals: ports.approvals,
       })
       if (this.#descriptorGuard && !(await this.#descriptorGuard.assertCurrent())) {

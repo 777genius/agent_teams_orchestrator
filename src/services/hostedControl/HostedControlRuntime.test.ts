@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { createHash } from 'node:crypto'
+import { createHash, createHmac } from 'node:crypto'
 import { chmod, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
 import { connect, type Socket } from 'node:net'
 import { join } from 'node:path'
@@ -526,6 +526,18 @@ describe('HostedControlRuntime', () => {
       ownerProof: createHostedControlProof(secret, 'request', taskUnsigned),
     })}\n`)
     expect(JSON.parse(taskLine).payload.kind).toBe('unavailable')
+    // Product's envelope (fenced authority, operation-bound proof) reaches the task writer through
+    // the coexisting dispatcher; a config-file owner is not personal-host, so it stays read-only.
+    const productTaskUnsigned = {
+      ...taskUnsigned,
+      exchangeId: `task-request_${'a'.repeat(32)}`,
+      authority: { ...taskUnsigned.authority, ownerEffectFence: { grantRevision: '2'.repeat(64), identityChecksum: '3'.repeat(64) } },
+    }
+    const productTaskLine = await exchange(socketPath, `${JSON.stringify({
+      ...productTaskUnsigned,
+      ownerProof: createHmac('sha256', secret).update(`${HOSTED_TEAM_MESSAGE_PROOF_DOMAIN}\u0000task_mutate\u0000request\u0000${JSON.stringify(productTaskUnsigned)}`).digest('hex'),
+    })}\n`)
+    expect(JSON.parse(productTaskLine).payload).toEqual({ schemaVersion: 1, kind: 'unavailable', retryAfterMs: null })
     expect(lifecycleCalls).toBe(1)
     expect(messageCalls).toBe(1)
 

@@ -10,6 +10,8 @@ type BoardState = { sourceGeneration: string; revision: string; directories: { t
 type SourceState = Pick<BoardState, 'sourceGeneration' | 'directories'>
 type MutationLedger = { schemaVersion: 2; entries: Record<string, LedgerEntry> }
 type LedgerEntry = { fingerprint: string; commandId: string; sourceGeneration: string; expectedRevision: string; receipt: HostedTaskMutationReceipt; committedAtMs: number }
+export type HostedTaskSelfWriteEffect = { fileKey: string; expectedChecksum: string }
+export type HostedTaskMutationOutcome = { result: HostedTaskMutationTerminalResult; selfWriteEffects: HostedTaskSelfWriteEffect[] }
 type PlanResult = { writes: HostedMutationWrite[]; result: HostedTaskMutationCommittedResult } | { terminal: HostedTaskMutationTerminalResult }
 type CrashStage = 'after_task_detach' | 'after_task_write' | 'before_kanban_write' | 'before_terminal'
 class ControlledHostedMutationCrash extends Error {}
@@ -80,15 +82,21 @@ export class HostedTaskMutationService {
   }
 
   async mutate(request: HostedTaskMutationRequest): Promise<HostedTaskMutationTerminalResult> {
-    if (this.options.denyOwnerLocalWrites) return { kind: 'unavailable' }
-    if (!sameAuthority(request.authority, this.options.authority)) return { kind: 'unavailable' }
+    return (await this.mutateWithSelfWriteEffects(request)).result
+  }
+
+  /** Effects are the task files this exact call published; replays and recovered intents report none. */
+  async mutateWithSelfWriteEffects(request: HostedTaskMutationRequest): Promise<HostedTaskMutationOutcome> {
+    const outcome = (result: HostedTaskMutationTerminalResult): HostedTaskMutationOutcome => ({ result, selfWriteEffects: [] })
+    if (this.options.denyOwnerLocalWrites) return outcome({ kind: 'unavailable' })
+    if (!sameAuthority(request.authority, this.options.authority)) return outcome({ kind: 'unavailable' })
     try { return await withTaskMutationCoordination(this.options.legacyKey, async () => {
-      if (!(await this.#validateOwner())) return { kind: 'unsafe_active' }
-      let fenced: HostedTaskMutationTerminalResult | undefined
-      try { fenced = await this.options.wal.withFence(() => this.#mutateFenced(request)) } catch { return { kind: 'unsafe_active' }
+      if (!(await this.#validateOwner())) return outcome({ kind: 'unsafe_active' })
+      let fenced: HostedTaskMutationOutcome | undefined
+      try { fenced = await this.options.wal.withFence(() => this.#mutateFenced(request)) } catch { return outcome({ kind: 'unsafe_active' })
       }
-      return fenced ?? { kind: 'unavailable', retryAfterMs: HOSTED_MUTATION_RETRY_AFTER_MS }
-    }, { claudeRoot: this.options.claudeRoot }) } catch (error) { return error instanceof TaskMutationLockUnavailableError ? { kind: 'unavailable', retryAfterMs: HOSTED_MUTATION_RETRY_AFTER_MS } : { kind: 'unsafe_active' } }
+      return fenced ?? outcome({ kind: 'unavailable', retryAfterMs: HOSTED_MUTATION_RETRY_AFTER_MS })
+    }, { claudeRoot: this.options.claudeRoot }) } catch (error) { return outcome(error instanceof TaskMutationLockUnavailableError ? { kind: 'unavailable', retryAfterMs: HOSTED_MUTATION_RETRY_AFTER_MS } : { kind: 'unsafe_active' }) }
   }
 
   async #recoverPrepared(): Promise<boolean> {
@@ -96,7 +104,13 @@ export class HostedTaskMutationService {
     return true
   }
 
-  async #mutateFenced(request: HostedTaskMutationRequest): Promise<HostedTaskMutationTerminalResult> {
+  async #mutateFenced(request: HostedTaskMutationRequest): Promise<HostedTaskMutationOutcome> {
+    const published: HostedMutationWrite[] = []
+    const result = await this.#mutateFencedResult(request, published)
+    return { result, selfWriteEffects: result.kind === 'committed' ? taskSelfWriteEffects(published) : [] }
+  }
+
+  async #mutateFencedResult(request: HostedTaskMutationRequest, published: HostedMutationWrite[]): Promise<HostedTaskMutationTerminalResult> {
       if (!(await this.#recoverPrepared())) return { kind: 'unsafe_active' }
       const command = request.payload.command
       let source: SourceState
@@ -123,6 +137,7 @@ export class HostedTaskMutationService {
         await this.#runCrashHook('before_terminal')
         if (!(await this.#validateIntentGuards(intent))) throw new Error('Hosted board guard changed before terminal receipt')
         await this.options.wal.appendTerminal(intent.walId, planned.result)
+        published.push(...intent.writes)
         return planned.result
       } catch (error) {
         return error instanceof ControlledHostedMutationCrash ? { kind: 'unavailable', retryAfterMs: HOSTED_MUTATION_RETRY_AFTER_MS } : { kind: 'unsafe_active' }
@@ -231,7 +246,9 @@ export class HostedTaskMutationService {
     const teamDir = join(this.options.claudeRoot, 'teams', this.options.legacyKey); const tasksDir = join(this.options.claudeRoot, 'tasks', this.options.legacyKey)
     const [teamStat, tasksStat] = await Promise.all([safeDirectoryStat(teamDir), safeDirectoryStat(tasksDir)])
     const a = this.options.authority
-    const sourceGeneration = `generation_${sha(JSON.stringify({ domain: 'hosted-task-board-source/v3', deploymentId: a.deploymentId, bootId: a.bootId, restoreGeneration: a.restoreGeneration, workspaceId: a.workspaceId, mountGeneration: a.mountBinding.mountGeneration, declaredRootHash: a.mountBinding.declaredRootHash, teamId: a.teamId, teamDirectory: [String(teamStat.dev), String(teamStat.ino)], tasksDirectory: [String(tasksStat.dev), String(tasksStat.ino)] }))}`
+    // Product reads the board and issues expectedSourceGeneration with this exact formula
+    // (hostedTaskBoardSourceGeneration). Restore generation and root hash stay fenced by sameAuthority.
+    const sourceGeneration = `generation_${sha(JSON.stringify({ domain: 'hosted-task-board-source/v2', deploymentId: a.deploymentId, bootId: a.bootId, workspaceId: a.workspaceId, mountGeneration: a.mountBinding.mountGeneration, teamId: a.teamId, teamDirectory: teamStat.identity, tasksDirectory: tasksStat.identity }))}`
     return { sourceGeneration, directories: { team: [teamStat.dev, teamStat.ino], tasks: [tasksStat.dev, tasksStat.ino] } }
   }
 
@@ -428,7 +445,11 @@ function sameImage(a: HostedMutationFileImage, b: HostedMutationFileImage): bool
 function matchesPreimage(current: HostedMutationFileImage, before: HostedMutationFileImage): boolean { return sameImage(current, before) && (!before.stat || JSON.stringify(current.stat) === JSON.stringify(before.stat)) }
 async function optionalText(path: string, maximumBytes?: number): Promise<string | null> { const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0)).catch(error => { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error }); if (!handle) return null; try { const stat = await handle.stat(); if (!stat.isFile() || (maximumBytes !== undefined && stat.size > maximumBytes)) throw new Error('Unsafe hosted file'); const text = await handle.readFile('utf8'); if (maximumBytes !== undefined && Buffer.byteLength(text) > maximumBytes) throw new Error('Hosted file exceeds size limit'); return text } finally { await handle.close() } }
 async function readPathImage(path: string): Promise<HostedMutationFileImage> { const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0)).catch(error => { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error }); if (!handle) return missingImage(); try { const stat = await handle.stat(); if (!stat.isFile()) throw new Error('Unsafe hosted staged target'); const text = await handle.readFile('utf8'); return image(text, { device: stat.dev, inode: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs }) } finally { await handle.close() } }
-async function safeDirectoryStat(path: string): Promise<{ dev: number; ino: number }> { const stat = await lstat(path); if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('Unsafe hosted board directory'); return { dev: stat.dev, ino: stat.ino } }
+async function safeDirectoryStat(path: string): Promise<{ dev: number; ino: number; identity: [string, string] }> { const stat = await lstat(path, { bigint: true }); if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('Unsafe hosted board directory'); return { dev: Number(stat.dev), ino: Number(stat.ino), identity: [stat.dev.toString(), stat.ino.toString()] } }
+function taskSelfWriteEffects(writes: HostedMutationWrite[]): HostedTaskSelfWriteEffect[] {
+  return writes.flatMap(write => write.target.startsWith('task:') && write.after.existed && write.after.sha256
+    ? [{ fileKey: write.target.slice('task:'.length, -'.json'.length), expectedChecksum: write.after.sha256 }] : [])
+}
 function publicTaskId(teamId: string, rawTaskId: string): string { return `task_${sha(JSON.stringify({ domain: 'hosted-task-board-task/v1', teamId, rawTaskId })).slice(0, 32)}` }
 function sameAuthority(a: HostedControlAuthority, b: HostedControlStableAuthority): boolean {
   const { actorId: _, ...stable } = a
