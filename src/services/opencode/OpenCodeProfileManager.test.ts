@@ -626,7 +626,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     const builtinSame = await resolve('opencode/big-pickle', 'execution_probe')
     const builtinLaunch = await resolve('opencode/big-pickle', 'launch_runtime')
     const currentBuiltinLaunch = await resolve(
-      'opencode/nemotron-3.5-lightning-free',
+      'opencode/mimo-v2.6-flash-free',
       'launch_runtime',
     )
     await expect(resolve('opencode/BIG-PICKLE', 'execution_probe'))
