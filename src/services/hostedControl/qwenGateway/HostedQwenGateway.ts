@@ -311,6 +311,7 @@ export class HostedQwenGateway {
           writePinnedQwen(upstream!, frame)
         })
       }
+      if (upstream.destroyed) throw new Error('hosted-qwen-upstream-closed-before-response')
       if (!this.sameAdmission(admission, epoch, remote) || cancelled) { exchange.cancel(); return }
     } catch {
       upstream?.destroy()
