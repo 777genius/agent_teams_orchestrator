@@ -14,11 +14,13 @@ import json
 import os
 import re
 import select
+import sqlite3
 import socket
 import struct
 import subprocess
 import sys
 import time
+from urllib.parse import quote
 
 
 DOCKER = "/usr/bin/docker"
@@ -32,6 +34,22 @@ LINUX_CAPABILITY_VERSION_3 = 0x20080522
 HANDOFF_SECONDS = 8.0
 OFFICIAL_BINARY_SHA = "513f500a1a5ea1dc7d865547ac87b32a8936334e8d5abd5b3ff585c45a170080"
 BOOTSTRAP_SHA = "af0644070946ef34bef205c1940b02bd76a09ffcef4b5cffb8b072ae04ca32e6"
+AUTHORITY_CONFIG_DIRECTORY = "/run/agent-teams/fd3"
+AUTHORITY_CONFIG_MAX_BYTES = 4096
+PRODUCT_DB_BUSY_SECONDS = 0.25
+SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+CANONICAL_IDS = {
+    "runId": re.compile(r"run_[0-9a-f]{32}\Z"),
+    "memberId": re.compile(r"member_[0-9a-f]{32}\Z"),
+    "teamId": re.compile(r"team_[0-9a-f]{32}\Z"),
+    "laneId": re.compile(r"lane_[0-9a-f]{32}\Z"),
+    "runtimeWorkspaceId": re.compile(r"workspace_[0-9a-f]{32}\Z"),
+    "deploymentId": re.compile(r"deployment_[A-Za-z0-9][A-Za-z0-9._-]*\Z"),
+}
+PRODUCT_BINDING_KEYS = frozenset((*CANONICAL_IDS, "planSha256", "rosterBindingSha256",
+                                  "restoreGeneration", "mountGeneration", "operationId"))
+CONTAINER_BINDING_KEYS = frozenset(("containerId", "handle", "generation", "networkId",
+                                    "pid", "startTicks", "netns", "binarySha256"))
 
 
 class HandoffError(Exception):
@@ -63,6 +81,164 @@ class HandoffAttempt:
 def require(condition, reason):
     if not condition:
         raise HandoffError(reason)
+
+
+def exact_object(value, keys, reason):
+    require(type(value) is dict and value.keys() == keys, reason)
+    return value
+
+
+def canonical_json(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def trusted_ancestor(path, uid, test_only=False):
+    """Production accepts only root-owned non-writable ancestors, then one private Product leaf."""
+    require(os.path.isabs(path) and os.path.normpath(path) == path, "authority-path")
+    parts = path.split(os.sep)
+    current = os.sep
+    for index, part in enumerate(parts[1:]):
+        if not part:
+            continue
+        current = os.path.join(current, part)
+        st = os.lstat(current)
+        require(not os.path.islink(current) and os.path.isdir(current), "authority-ancestor")
+        final = index == len(parts[1:]) - 1
+        if final:
+            require(st.st_uid == uid and (st.st_mode & 0o077) == 0, "authority-ancestor")
+        elif not test_only:
+            require(st.st_uid == 0 and (st.st_mode & 0o022) == 0, "authority-ancestor")
+        else:
+            require(st.st_uid in (0, os.getuid()) and
+                    ((st.st_mode & 0o022) == 0 or st.st_uid == 0 and
+                     (st.st_mode & 0o1000) != 0), "authority-ancestor")
+
+
+def load_authority_config(args, test_only=False):
+    """The root daemon must create one immutable private config for this generation."""
+    directory = AUTHORITY_CONFIG_DIRECTORY
+    require(os.path.isabs(directory) and os.path.normpath(directory) == directory,
+            "authority-config-path")
+    trusted_ancestor(directory, os.getuid() if test_only else 0, test_only)
+    path = os.path.join(directory, f"member-{args.generation}.json")
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        st = os.fstat(fd)
+        current = os.lstat(path)
+        require(st.st_dev == current.st_dev and st.st_ino == current.st_ino and
+                st.st_nlink == 1 and current.st_nlink == 1 and
+                st.st_uid == (os.getuid() if test_only else 0) and
+                (st.st_mode & 0o077) == 0 and 1 <= st.st_size <= AUTHORITY_CONFIG_MAX_BYTES and
+                (st.st_mode & 0o170000) == 0o100000, "authority-config-identity")
+        data = os.read(fd, AUTHORITY_CONFIG_MAX_BYTES + 1)
+        require(len(data) == st.st_size, "authority-config-size")
+    finally:
+        os.close(fd)
+    config = exact_object(json.loads(data.decode("utf-8")),
+                          {"version", "databasePath", "expectedProductUid", "binding", "container"},
+                          "authority-config-schema")
+    require(type(config["version"]) is int and config["version"] == 1 and
+            type(config["expectedProductUid"]) is int and
+            0 <= config["expectedProductUid"] <= 2**31 - 1 and
+            data == canonical_json(config), "authority-config-canonical")
+    binding = exact_object(config["binding"], PRODUCT_BINDING_KEYS, "authority-binding")
+    container = exact_object(config["container"], CONTAINER_BINDING_KEYS, "authority-container")
+    for key, pattern in CANONICAL_IDS.items():
+        require(type(binding[key]) is str and pattern.fullmatch(binding[key]), "authority-binding")
+    require(all(type(binding[key]) is str and SHA256.fullmatch(binding[key]) for key in
+                ("planSha256", "rosterBindingSha256")) and
+            type(binding["restoreGeneration"]) is int and
+            0 <= binding["restoreGeneration"] <= 2**53 - 1 and
+            type(binding["mountGeneration"]) is int and
+            1 <= binding["mountGeneration"] <= 2**53 - 1,
+            "authority-binding")
+    operation = "start_" + hashlib.sha256(
+        b"agent-teams.hosted-opencode-member-start/v1\0" +
+        json.dumps([binding["runId"], binding["memberId"], binding["planSha256"]],
+                   separators=(",", ":")).encode("utf-8")).hexdigest()
+    require(binding["operationId"] == operation, "authority-binding")
+    expected = {"containerId": args.container_id, "handle": args.handle,
+                "generation": args.generation, "networkId": args.network_id,
+                "pid": args.pid, "startTicks": args.start_ticks, "netns": args.netns,
+                "binarySha256": args.binary_sha256}
+    require(container == expected, "authority-container")
+    db_path = config["databasePath"]
+    require(type(db_path) is str and os.path.isabs(db_path) and
+            os.path.normpath(db_path) == db_path and len(db_path) <= 4096 and
+            not any(value in db_path for value in ("\0", "?", "#")), "authority-database-path")
+    return config
+
+
+class ProductMemberFence:
+    """Owns a Product writer lock across the exact FD send; currentness stays denied for now."""
+
+    def __init__(self, config, test_only=False):
+        self.config = config
+        self.test_only = test_only
+        self.connection = None
+        self.identity = None
+
+    def begin(self):
+        path = self.config["databasePath"]
+        parent = os.path.dirname(path)
+        trusted_ancestor(parent, self.config["expectedProductUid"], self.test_only)
+        before = os.lstat(path)
+        require((before.st_mode & 0o170000) == 0o100000 and before.st_nlink == 1 and
+                before.st_uid == self.config["expectedProductUid"] and
+                (before.st_mode & 0o022) == 0, "product-database-identity")
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            opened = os.fstat(fd)
+            require((opened.st_dev, opened.st_ino) == (before.st_dev, before.st_ino),
+                    "product-database-substituted")
+        finally:
+            os.close(fd)
+        self.identity = (before.st_dev, before.st_ino)
+        uri = "file:" + quote(path, safe="/") + "?mode=rw"
+        connection = sqlite3.connect(uri, uri=True, isolation_level=None,
+                                     timeout=PRODUCT_DB_BUSY_SECONDS)
+        self.connection = connection
+        try:
+            connection.execute("PRAGMA busy_timeout=250")
+            require(connection.execute("PRAGMA user_version").fetchone() == (33,) and
+                    connection.execute("PRAGMA journal_mode").fetchone() == ("wal",),
+                    "product-schema-unavailable")
+            self.assert_file_identity()
+            connection.execute("BEGIN IMMEDIATE")
+            self.assert_current()
+        except Exception:
+            self.abort()
+            raise
+
+    def assert_file_identity(self):
+        st = os.lstat(self.config["databasePath"])
+        require((st.st_dev, st.st_ino) == self.identity and st.st_nlink == 1 and
+                st.st_uid == self.config["expectedProductUid"] and
+                (st.st_mode & 0o022) == 0, "product-database-substituted")
+
+    def assert_current(self):
+        # No Python parity proof yet for Product v33 reservation, roster,
+        # publication, grant, OIDC/personal session, and launcher epochs.
+        # A lock alone is never authorization. Keep FD3 denied.
+        raise HandoffError("product-authority-unavailable")
+
+    def finish(self):
+        require(self.connection is not None, "product-fence-state")
+        try:
+            self.assert_file_identity()
+            self.connection.execute("COMMIT")
+        finally:
+            self.connection.close()
+            self.connection = None
+
+    def abort(self):
+        if self.connection is not None:
+            try:
+                if self.connection.in_transaction:
+                    self.connection.execute("ROLLBACK")
+            finally:
+                self.connection.close()
+                self.connection = None
 
 
 def parse_args(argv):
@@ -258,6 +434,7 @@ def handoff(args):
     require(os.getppid() > 1, "root-parent")
     os.environ.clear()
     os.umask(0o077)
+    config = load_authority_config(args)
     for name in os.listdir("/proc/self/fd"):
         fd = int(name)
         if fd > 3:
@@ -269,6 +446,7 @@ def handoff(args):
     pidfd = os.pidfd_open(args.pid, 0)
     netfd = os.open(f"/proc/{args.pid}/ns/net", os.O_RDONLY | os.O_CLOEXEC)
     attempt = HandoffAttempt()
+    fence = ProductMemberFence(config)
     try:
         inspect_exact(args)
         check_process(args, pidfd, netfd)
@@ -280,6 +458,9 @@ def handoff(args):
             os.close(executable)
         inspect_exact(args)
         check_process(args, pidfd, netfd)
+        # The helper itself acquires the Product writer before entering the
+        # namespace. No parent-held lock is inherited or trusted here.
+        fence.begin()
         enter_netns(netfd)
         check_process(args, pidfd, netfd)
 
@@ -292,7 +473,10 @@ def handoff(args):
             try:
                 check_process(args, pidfd, netfd)
                 require(pidfd_live(peerfd), "bootstrap-peer")
+                fence.assert_file_identity()
+                fence.assert_current()
                 attempt.send(control, owner)
+                fence.finish()
                 control.shutdown(socket.SHUT_WR)
                 control.settimeout(max(0.01, deadline - time.monotonic()))
                 require(control.recv(1) == b"", "handoff-eof")
@@ -303,6 +487,8 @@ def handoff(args):
     except Exception as error:
         attempt.fail(error)
     finally:
+        with suppress(Exception):
+            fence.abort()
         with suppress(OSError):
             os.close(netfd)
         with suppress(OSError):

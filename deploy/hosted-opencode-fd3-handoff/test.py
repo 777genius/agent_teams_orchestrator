@@ -10,8 +10,10 @@ import os
 from pathlib import Path
 from contextlib import redirect_stderr
 import socket
+import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from types import SimpleNamespace
 import unittest
@@ -46,7 +48,131 @@ def inspection(args):
     }
 
 
+def authority_config(args, db_path):
+    run_id = "run_" + "1" * 32
+    member_id = "member_" + "2" * 32
+    plan_sha = "a" * 64
+    operation_id = "start_" + hashlib.sha256(
+        b"agent-teams.hosted-opencode-member-start/v1\0" +
+        json.dumps([run_id, member_id, plan_sha], separators=(",", ":")).encode()).hexdigest()
+    return {
+        "version": 1,
+        "databasePath": str(db_path),
+        "expectedProductUid": os.getuid(),
+        "binding": {
+            "runId": run_id, "memberId": member_id, "teamId": "team_" + "3" * 32,
+            "laneId": "lane_" + "4" * 32, "deploymentId": "deployment_fixture1234",
+            "runtimeWorkspaceId": "workspace_" + "5" * 32,
+            "planSha256": plan_sha, "rosterBindingSha256": "b" * 64,
+            "restoreGeneration": 0, "mountGeneration": 1, "operationId": operation_id,
+        },
+        "container": {
+            "containerId": args.container_id, "handle": args.handle,
+            "generation": args.generation, "networkId": args.network_id,
+            "pid": args.pid, "startTicks": args.start_ticks, "netns": args.netns,
+            "binarySha256": args.binary_sha256,
+        },
+    }
+
+
+def synthetic_authority_directory():
+    temp = tempfile.TemporaryDirectory(prefix="fd3-product-fence-")
+    directory = Path(temp.name).resolve()
+    directory.chmod(0o700)
+    return temp, directory
+
+
 class HandoffContractTest(unittest.TestCase):
+    def test_private_generation_config_binds_exact_container_member_and_db(self):
+        args = arguments()
+        temp, directory = synthetic_authority_directory()
+        try:
+            db_path = directory / "product.sqlite"
+            config = authority_config(args, db_path)
+            path = directory / f"member-{args.generation}.json"
+            path.write_bytes(handoff.canonical_json(config))
+            path.chmod(0o600)
+            with patch.object(handoff, "AUTHORITY_CONFIG_DIRECTORY", str(directory)):
+                self.assertEqual(handoff.load_authority_config(args, test_only=True), config)
+                forged = arguments()
+                forged.container_id = "f" * 64
+                with self.assertRaisesRegex(handoff.HandoffError, "authority-container"):
+                    handoff.load_authority_config(forged, test_only=True)
+                config["binding"]["memberId"] = "member_" + "f" * 32
+                path.write_bytes(handoff.canonical_json(config))
+                with self.assertRaisesRegex(handoff.HandoffError, "authority-binding"):
+                    handoff.load_authority_config(args, test_only=True)
+                config["binding"]["memberId"] = "member_" + "2" * 32
+                path.write_bytes(b" " + handoff.canonical_json(config))
+                with self.assertRaisesRegex(handoff.HandoffError, "authority-config-canonical"):
+                    handoff.load_authority_config(args, test_only=True)
+        finally:
+            temp.cleanup()
+
+    def test_missing_config_and_default_product_policy_refuse_transfer(self):
+        args = arguments()
+        temp, directory = synthetic_authority_directory()
+        try:
+            with patch.object(handoff, "AUTHORITY_CONFIG_DIRECTORY", str(directory)):
+                with self.assertRaises(FileNotFoundError):
+                    handoff.load_authority_config(args, test_only=True)
+            db_path = directory / "product.sqlite"
+            db = sqlite3.connect(db_path)
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("PRAGMA user_version=33")
+            db.close()
+            db_path.chmod(0o600)
+            fence = handoff.ProductMemberFence(authority_config(args, db_path), test_only=True)
+            with self.assertRaisesRegex(handoff.HandoffError, "product-authority-unavailable"):
+                fence.begin()
+            self.assertIsNone(fence.connection)
+        finally:
+            temp.cleanup()
+
+    def test_synthetic_writer_lock_is_retained_through_exact_fd_send(self):
+        args = arguments()
+        temp, directory = synthetic_authority_directory()
+        sender = recipient = owner = carried = None
+        try:
+            db_path = directory / "product.sqlite"
+            db = sqlite3.connect(db_path)
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("PRAGMA user_version=33")
+            db.execute("CREATE TABLE synthetic_revocation(value INTEGER)")
+            db.execute("INSERT INTO synthetic_revocation VALUES (0)")
+            db.commit()
+            db.close()
+            db_path.chmod(0o600)
+            fence = handoff.ProductMemberFence(authority_config(args, db_path), test_only=True)
+            revoker = sqlite3.connect(db_path, timeout=0)
+            sender, recipient = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+            owner, carried = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+            # Only this inert test patches the intentionally unavailable Product validator.
+            with patch.object(handoff.ProductMemberFence, "assert_current", return_value=None):
+                fence.begin()
+                with self.assertRaises(sqlite3.OperationalError):
+                    revoker.execute("UPDATE synthetic_revocation SET value=1")
+                attempt = handoff.HandoffAttempt()
+                attempt.send(sender, carried)
+                marker, ancillary, _flags, _address = recipient.recvmsg(1, socket.CMSG_SPACE(4))
+                self.assertEqual(marker, b"F")
+                received = array.array("i")
+                received.frombytes(ancillary[0][2][:received.itemsize])
+                os.close(received[0])
+                with self.assertRaises(sqlite3.OperationalError):
+                    revoker.execute("UPDATE synthetic_revocation SET value=1")
+                fence.finish()
+            revoker.execute("UPDATE synthetic_revocation SET value=1")
+            revoker.commit()
+            self.assertEqual(revoker.execute("SELECT value FROM synthetic_revocation").fetchone(), (1,))
+            revoker.close()
+        finally:
+            if sender: sender.close()
+            if recipient: recipient.close()
+            if owner: owner.close()
+            if carried: carried.close()
+            temp.cleanup()
+
     def test_only_pinned_official_binary_is_accepted(self):
         args = arguments()
         self.assertEqual(args.binary_sha256, handoff.OFFICIAL_BINARY_SHA)
