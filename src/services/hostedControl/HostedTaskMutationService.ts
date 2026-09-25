@@ -3,6 +3,7 @@ import { constants, link, lstat, mkdir, open, readdir, realpath, unlink } from '
 import { basename, dirname, join } from 'node:path'
 import { TaskMutationLockUnavailableError, withTaskMutationCoordination } from '../../utils/taskMutationCoordinator.js'
 import { fingerprintHostedTaskCommand } from './protocol.js'
+import { hostedTaskBoardRevision, hostedTaskBoardSourceGeneration, hostedTaskBoardTaskId } from './HostedTaskBoardIdentity.js'
 import type { HostedControlAuthority, HostedControlStableAuthority, HostedTaskMutationCommand, HostedTaskMutationCommittedResult, HostedTaskMutationReceipt, HostedTaskMutationRequest, HostedTaskMutationTerminalResult } from './protocol.js'
 import { fsyncDirectoryPath, fsyncFileAndParent, HOSTED_MUTATION_RETRY_AFTER_MS, HostedTaskMutationWal, type HostedMutationFileImage, type HostedMutationIntent, type HostedMutationWrite } from './HostedTaskMutationWal.js'
 
@@ -179,7 +180,7 @@ export class HostedTaskMutationService {
     switch (command.kind) {
       case 'create_task': {
         const rawId = `hosted-${sha(JSON.stringify({ commandId: command.commandId })).slice(0, 40)}`
-        const publicId = publicTaskId(command.teamId, rawId)
+        const publicId = hostedTaskBoardTaskId(command.teamId, rawId)
         const name = `${rawId}.json`
         if (taskTexts.has(name)) return { terminal: stateConflict(state) }
         const owner = command.ownerId === null ? null : (await this.#activeMembers()).get(command.ownerId)
@@ -246,9 +247,8 @@ export class HostedTaskMutationService {
     const teamDir = join(this.options.claudeRoot, 'teams', this.options.legacyKey); const tasksDir = join(this.options.claudeRoot, 'tasks', this.options.legacyKey)
     const [teamStat, tasksStat] = await Promise.all([safeDirectoryStat(teamDir), safeDirectoryStat(tasksDir)])
     const a = this.options.authority
-    // Product reads the board and issues expectedSourceGeneration with this exact formula
-    // (hostedTaskBoardSourceGeneration). Restore generation and root hash stay fenced by sameAuthority.
-    const sourceGeneration = `generation_${sha(JSON.stringify({ domain: 'hosted-task-board-source/v2', deploymentId: a.deploymentId, bootId: a.bootId, workspaceId: a.workspaceId, mountGeneration: a.mountBinding.mountGeneration, teamId: a.teamId, teamDirectory: teamStat.identity, tasksDirectory: tasksStat.identity }))}`
+    // Product issues expectedSourceGeneration; restore generation and root hash stay fenced by sameAuthority.
+    const sourceGeneration = hostedTaskBoardSourceGeneration({ deploymentId: a.deploymentId, bootId: a.bootId, workspaceId: a.workspaceId, mountGeneration: a.mountBinding.mountGeneration, teamId: a.teamId, teamDirectory: teamStat.identity, tasksDirectory: tasksStat.identity })
     return { sourceGeneration, directories: { team: [teamStat.dev, teamStat.ino], tasks: [tasksStat.dev, tasksStat.ino] } }
   }
 
@@ -277,7 +277,7 @@ export class HostedTaskMutationService {
       validCandidates = next
     }
     for (const task of validCandidates) {
-      const { rawId } = task; const publicId = publicTaskId(a.teamId, rawId)
+      const { rawId } = task; const publicId = hostedTaskBoardTaskId(a.teamId, rawId)
       if (tasks.has(publicId)) throw new Error('Duplicate hosted task identity')
       tasks.set(publicId, { rawId, publicId, path: task.path, text: task.text, value: task.value })
     }
@@ -292,8 +292,7 @@ export class HostedTaskMutationService {
   }
 
   async #revision(sourceGeneration: string, tasks: Map<string, string>, kanbanText: string | null, roster: Array<[string, string | null]>): Promise<string> {
-    const taskFiles = [...tasks.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([name, text]) => [name, sha(text)])
-    return `revision_${sha(JSON.stringify({ domain: 'hosted-task-board-revision/v3', sourceGeneration, taskFiles, kanban: kanbanText === null ? null : sha(kanbanText), roster }))}`
+    return hostedTaskBoardRevision({ sourceGeneration, taskTexts: tasks, kanbanText, rosterHashes: roster })
   }
 
   async #activeMembers(): Promise<Map<string, string>> {
@@ -450,7 +449,6 @@ function taskSelfWriteEffects(writes: HostedMutationWrite[]): HostedTaskSelfWrit
   return writes.flatMap(write => write.target.startsWith('task:') && write.after.existed && write.after.sha256
     ? [{ fileKey: write.target.slice('task:'.length, -'.json'.length), expectedChecksum: write.after.sha256 }] : [])
 }
-function publicTaskId(teamId: string, rawTaskId: string): string { return `task_${sha(JSON.stringify({ domain: 'hosted-task-board-task/v1', teamId, rawTaskId })).slice(0, 32)}` }
 function sameAuthority(a: HostedControlAuthority, b: HostedControlStableAuthority): boolean {
   const { actorId: _, ...stable } = a
   const { actorId: _ignored, ...stableExpected } = b as HostedControlAuthority
