@@ -6,12 +6,16 @@ import path from 'node:path'
 import { expect, test } from 'bun:test'
 
 import type { HostedOpenCodeContainerSupervisor } from './HostedOpenCodeContainerSupervisor.js'
+import type { HostedOpenCodeMemberSupervisorManager } from './HostedOpenCodeMemberSupervisorManager.js'
 import { HostedOpenCodeSupervisorRpcClient, HostedOpenCodeSupervisorRpcServer } from './HostedOpenCodeSupervisorRpc.js'
 
 const START = { operationId: 'start_12345678', leaseId: 'lease_12345678', runId: 'run_12345678',
   teamId: 'team_12345678', laneId: 'lane_12345678', memberId: 'member_12345678' }
 const HANDLE = { operationId: 'stop_12345678', handle: `opencode_${'a'.repeat(32)}`,
   generation: 'b'.repeat(32) }
+const MEMBER = { operationId: 'member_12345678', planTeamId: 'plan_12345678',
+  planFingerprint: 'd'.repeat(64), runId: START.runId, teamId: START.teamId,
+  laneId: START.laneId, memberId: START.memberId }
 
 function packet(value: object): Buffer {
   const bytes = Buffer.from(JSON.stringify(value))
@@ -163,6 +167,54 @@ test('Linux slow Start times out as uncertain and is recovered by lookup without
       ownerGid: process.getgid!(), testOnlyAllowNonRoot: true, testOnlyCommandDeadlineMs: 1000 })
     expect(await recovery.lookupStart(START)).toEqual(claimed)
     expect(starts).toBe(1)
+  } finally { await server.close().catch(() => undefined); await rm(root, { recursive: true, force: true }) }
+})
+
+test('root manager RPC dispatches bound member operations and leaves legacy supervisor unavailable', async () => {
+  if (process.platform !== 'linux') return
+  const root = await realpath(await mkdtemp('/tmp/hosted-member-manager-rpc-'))
+  await chmod(root, 0o700)
+  const socketPath = path.join(root, 's.sock')
+  const secret = Buffer.alloc(32, 11)
+  const calls: string[] = []
+  const managedHandle = { memberOperationId: MEMBER.operationId, ...HANDLE }
+  const manager = {
+    prepareMember: async (request: typeof MEMBER) => {
+      calls.push(`prepare:${request.memberId}`)
+      return { operationId: request.operationId, receiptId: 'c'.repeat(32),
+        handle: HANDLE.handle, generation: HANDLE.generation, connector: { pid: 123, startTicks: '456' } }
+    },
+    startPrepared: async (request: { operationId: string; receiptId: string }) => {
+      calls.push(`start:${request.receiptId}`)
+      return { ...HANDLE, status: 'unresolved' as const, effectEnabled: false }
+    },
+    observe: async (request: typeof managedHandle) => {
+      calls.push(`observe:${request.memberOperationId}`)
+      return { ...HANDLE, status: 'stopped' as const, effectEnabled: false }
+    },
+    stop: async (request: typeof managedHandle) => {
+      calls.push(`stop:${request.memberOperationId}`)
+      return { ...HANDLE, stopped: true as const, unresolved: false as const }
+    },
+  } as unknown as Pick<HostedOpenCodeMemberSupervisorManager,
+    'prepareMember' | 'startPrepared' | 'observe' | 'stop'>
+  const server = new HostedOpenCodeSupervisorRpcServer({ socketPath, secret, ownerGid: process.getgid!(),
+    manager, testOnlyAllowNonRoot: true })
+  try {
+    await server.start()
+    const client = new HostedOpenCodeSupervisorRpcClient({ socketPath, secret,
+      ownerGid: process.getgid!(), testOnlyAllowNonRoot: true })
+    await expect(client.start(START)).rejects.toThrow()
+    await expect(client.prepareManagedMember({ ...MEMBER, planFingerprint: 'invalid' }))
+      .rejects.toThrow('command-invalid')
+    expect(calls).toEqual([])
+    expect(await client.prepareManagedMember(MEMBER)).toMatchObject({ operationId: MEMBER.operationId })
+    expect(await client.startManagedMember({ operationId: MEMBER.operationId, receiptId: 'c'.repeat(32) }))
+      .toMatchObject({ effectEnabled: false })
+    expect(await client.observeManagedMember(managedHandle)).toMatchObject({ status: 'stopped' })
+    expect(await client.stopManagedMember(managedHandle)).toMatchObject({ stopped: true, unresolved: false })
+    expect(calls).toEqual([`prepare:${MEMBER.memberId}`, `start:${'c'.repeat(32)}`,
+      `observe:${MEMBER.operationId}`, `stop:${MEMBER.operationId}`])
   } finally { await server.close().catch(() => undefined); await rm(root, { recursive: true, force: true }) }
 })
 

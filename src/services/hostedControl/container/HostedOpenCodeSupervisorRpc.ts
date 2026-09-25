@@ -4,6 +4,8 @@ import { connect, createServer, type Server, type Socket } from 'node:net'
 import path from 'node:path'
 
 import type { HostedOpenCodeContainerSupervisor } from './HostedOpenCodeContainerSupervisor.js'
+import type { HostedOpenCodeMemberSupervisorManager } from './HostedOpenCodeMemberSupervisorManager.js'
+import type { HostedMemberNetworkRequest } from '../containerNetworkProvisioning/HostedMemberNetworkProvisioner.js'
 
 const VERSION = 1
 const MAX_FRAME = 4096
@@ -15,21 +17,28 @@ const GENERATION = /^[0-9a-f]{32}$/
 const DOMAIN = 'agent-teams.hosted-opencode-supervisor/v1'
 
 type Operation = 'prepareMember' | 'startPrepared' | 'start' | 'lookupStart' | 'observe' | 'stop' |
-  'reconcile' | 'beginEndpointUse' | 'endEndpointUse'
+  'reconcile' | 'beginEndpointUse' | 'endEndpointUse' | 'prepareManagedMember' |
+  'startManagedMember' | 'observeManagedMember' | 'stopManagedMember'
 const COMMAND_DEADLINE_MS: Readonly<Record<Operation, number>> = {
   prepareMember: 30_000, startPrepared: 120_000,
   start: 120_000, lookupStart: 15_000, observe: 30_000, stop: 60_000,
   reconcile: 60_000, beginEndpointUse: 30_000, endEndpointUse: 15_000,
+  prepareManagedMember: 30_000, startManagedMember: 120_000,
+  observeManagedMember: 30_000, stopManagedMember: 60_000,
 }
 type Start = Parameters<HostedOpenCodeContainerSupervisor['start']>[0]
 type Handle = Parameters<HostedOpenCodeContainerSupervisor['stop']>[0]
 type EndpointEnd = Parameters<HostedOpenCodeContainerSupervisor['endEndpointUse']>[0]
 type Prepare = Parameters<HostedOpenCodeContainerSupervisor['prepareMember']>[0]
 type PreparedStart = Parameters<HostedOpenCodeContainerSupervisor['startPrepared']>[0]
-type Command = Readonly<{ operation: Operation; payload: Start | Handle | EndpointEnd | Prepare | PreparedStart }>
+type ManagedHandle = Parameters<HostedOpenCodeMemberSupervisorManager['stop']>[0]
+type Command = Readonly<{ operation: Operation; payload: Start | Handle | EndpointEnd | Prepare |
+  PreparedStart | HostedMemberNetworkRequest | ManagedHandle }>
 type SupervisorPort = Pick<HostedOpenCodeContainerSupervisor,
   'prepareMember' | 'startPrepared' | 'start' | 'lookupStart' | 'observe' | 'stop' | 'reconcile' |
   'beginEndpointUse' | 'endEndpointUse'>
+type ManagerPort = Pick<HostedOpenCodeMemberSupervisorManager,
+  'prepareMember' | 'startPrepared' | 'observe' | 'stop'>
 
 function exactKeys(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value) &&
@@ -46,6 +55,25 @@ function verify(secret: Uint8Array, direction: 'request' | 'response', unsigned:
 }
 
 function validCommand(operation: unknown, payload: unknown): operation is Operation {
+  if (operation === 'prepareManagedMember') {
+    return exactKeys(payload, ['operationId', 'planTeamId', 'planFingerprint', 'runId', 'teamId',
+      'laneId', 'memberId']) &&
+      ['operationId', 'planTeamId', 'runId', 'teamId', 'laneId', 'memberId']
+        .every(key => typeof payload[key] === 'string' && ID.test(payload[key])) &&
+      typeof payload.planFingerprint === 'string' && PROOF.test(payload.planFingerprint)
+  }
+  if (operation === 'startManagedMember') {
+    return exactKeys(payload, ['operationId', 'receiptId']) &&
+      typeof payload.operationId === 'string' && ID.test(payload.operationId) &&
+      typeof payload.receiptId === 'string' && GENERATION.test(payload.receiptId)
+  }
+  if (operation === 'observeManagedMember' || operation === 'stopManagedMember') {
+    return exactKeys(payload, ['memberOperationId', 'operationId', 'handle', 'generation']) &&
+      typeof payload.memberOperationId === 'string' && ID.test(payload.memberOperationId) &&
+      typeof payload.operationId === 'string' && ID.test(payload.operationId) &&
+      typeof payload.handle === 'string' && /^opencode_[0-9a-f]{32}$/.test(payload.handle) &&
+      typeof payload.generation === 'string' && GENERATION.test(payload.generation)
+  }
   if (operation === 'prepareMember') {
     return exactKeys(payload, ['operationId']) && typeof payload.operationId === 'string' &&
       ID.test(payload.operationId)
@@ -164,12 +192,14 @@ export class HostedOpenCodeSupervisorRpcServer {
     socketPath: string
     secret: Uint8Array
     ownerGid: number
-    supervisor: SupervisorPort
+    supervisor?: SupervisorPort
+    manager?: ManagerPort
     /** Inert fixture only. Production is root-owned. */
     testOnlyAllowNonRoot?: boolean
     testOnlyCommandDeadlineMs?: number
   }) {
     if (options.secret.length !== 32 || !Number.isSafeInteger(options.ownerGid) || options.ownerGid < 0 ||
+      (!options.supervisor && !options.manager) ||
       options.testOnlyAllowNonRoot && process.env.NODE_ENV !== 'test' ||
       !options.testOnlyAllowNonRoot && (process.platform !== 'linux' || process.getuid?.() !== 0) ||
       options.testOnlyCommandDeadlineMs !== undefined &&
@@ -251,16 +281,25 @@ export class HostedOpenCodeSupervisorRpcServer {
         () => socket.destroy())
       let result: unknown
       switch (command.operation) {
-        case 'prepareMember': result = await this.options.supervisor.prepareMember(command.payload as Prepare); break
-        case 'startPrepared': result = await this.options.supervisor.startPrepared(command.payload as PreparedStart); break
-        case 'start': result = await this.options.supervisor.start(command.payload as Start); break
-        case 'lookupStart': result = await this.options.supervisor.lookupStart(command.payload as Start); break
-        case 'observe': result = await this.options.supervisor.observe(command.payload as Handle); break
-        case 'stop': result = await this.options.supervisor.stop(command.payload as Handle); break
-        case 'reconcile': result = await this.options.supervisor.reconcile(command.payload as Handle); break
-        case 'beginEndpointUse': result = await this.options.supervisor.beginEndpointUse(command.payload as Handle); break
-        case 'endEndpointUse': result = await this.options.supervisor.endEndpointUse(command.payload as EndpointEnd); break
+        case 'prepareManagedMember': result = await this.options.manager?.prepareMember(
+          command.payload as HostedMemberNetworkRequest); break
+        case 'startManagedMember': result = await this.options.manager?.startPrepared(
+          command.payload as PreparedStart); break
+        case 'observeManagedMember': result = await this.options.manager?.observe(
+          command.payload as ManagedHandle); break
+        case 'stopManagedMember': result = await this.options.manager?.stop(
+          command.payload as ManagedHandle); break
+        case 'prepareMember': result = await this.options.supervisor?.prepareMember(command.payload as Prepare); break
+        case 'startPrepared': result = await this.options.supervisor?.startPrepared(command.payload as PreparedStart); break
+        case 'start': result = await this.options.supervisor?.start(command.payload as Start); break
+        case 'lookupStart': result = await this.options.supervisor?.lookupStart(command.payload as Start); break
+        case 'observe': result = await this.options.supervisor?.observe(command.payload as Handle); break
+        case 'stop': result = await this.options.supervisor?.stop(command.payload as Handle); break
+        case 'reconcile': result = await this.options.supervisor?.reconcile(command.payload as Handle); break
+        case 'beginEndpointUse': result = await this.options.supervisor?.beginEndpointUse(command.payload as Handle); break
+        case 'endEndpointUse': result = await this.options.supervisor?.endEndpointUse(command.payload as EndpointEnd); break
       }
+      if (result === undefined) throw new Error('hosted-supervisor-operation-unavailable')
       const response = { schemaVersion: VERSION, challenge, nonce: command.nonce, operation: command.operation,
         ok: true, result }
       socket.end(frame({ ...response, proof: proof(this.options.secret, 'response', response) }))
@@ -288,6 +327,22 @@ export class HostedOpenCodeSupervisorRpcClient {
 
   prepareMember(request: Prepare): ReturnType<HostedOpenCodeContainerSupervisor['prepareMember']> {
     return this.command({ operation: 'prepareMember', payload: request })
+  }
+
+  prepareManagedMember(request: HostedMemberNetworkRequest): ReturnType<ManagerPort['prepareMember']> {
+    return this.command({ operation: 'prepareManagedMember', payload: request })
+  }
+
+  startManagedMember(request: PreparedStart): ReturnType<ManagerPort['startPrepared']> {
+    return this.command({ operation: 'startManagedMember', payload: request })
+  }
+
+  observeManagedMember(request: ManagedHandle): ReturnType<ManagerPort['observe']> {
+    return this.command({ operation: 'observeManagedMember', payload: request })
+  }
+
+  stopManagedMember(request: ManagedHandle): ReturnType<ManagerPort['stop']> {
+    return this.command({ operation: 'stopManagedMember', payload: request })
   }
 
   startPrepared(request: PreparedStart): ReturnType<HostedOpenCodeContainerSupervisor['startPrepared']> {

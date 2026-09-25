@@ -2,8 +2,9 @@ import { constants } from 'node:fs'
 import { lstat, open, realpath } from 'node:fs/promises'
 import path from 'node:path'
 
-import { HostedOpenCodeContainerSupervisor } from '../services/hostedControl/container/HostedOpenCodeContainerSupervisor.js'
+import { HostedOpenCodeMemberSupervisorManager } from '../services/hostedControl/container/HostedOpenCodeMemberSupervisorManager.js'
 import { HostedOpenCodeSupervisorRpcServer } from '../services/hostedControl/container/HostedOpenCodeSupervisorRpc.js'
+import { HostedMemberNetworkProvisioner } from '../services/hostedControl/containerNetworkProvisioning/HostedMemberNetworkProvisioner.js'
 
 const SHA = /^[0-9a-f]{64}$/
 
@@ -47,11 +48,12 @@ async function main(): Promise<void> {
   }
   process.umask(0o077)
   const config = row(JSON.parse((await readRootFile(process.argv[3], 0o400, 8192)).toString('utf8')))
-  const fields = ['schemaVersion', 'image', 'bootstrapSha256', 'networkId', 'workspaceParent', 'profileParent',
-    'configParent', 'stateDirectory', 'seccompPath', 'seccompSha256', 'apparmorProfile',
+  const fields = ['schemaVersion', 'image', 'bootstrapSha256', 'workspaceParent', 'profileParent',
+    'configParent', 'memberManagerStateDirectory', 'memberNetworkStateDirectory',
+    'seccompPath', 'seccompSha256', 'apparmorProfile',
     'handoffHelperPath', 'handoffHelperSha256', 'handoffPythonSha256', 'ownerSocketDirectory', 'ownerUid',
     'rpcSocketPath', 'rpcSecretPath', 'serverPasswordKeyPath', 'ownerGid']
-  if (Object.keys(config).sort().join(',') !== fields.sort().join(',') || config.schemaVersion !== 1 ||
+  if (Object.keys(config).sort().join(',') !== fields.sort().join(',') || config.schemaVersion !== 2 ||
     !Number.isSafeInteger(config.ownerUid) || !Number.isSafeInteger(config.ownerGid)) {
     throw new Error('hosted-root-config-invalid')
   }
@@ -61,19 +63,30 @@ async function main(): Promise<void> {
   if (!SHA.test(secretHex) || !SHA.test(passwordKeyHex) || secretHex === passwordKeyHex) {
     throw new Error('hosted-root-secret-invalid')
   }
-  const supervisor = await HostedOpenCodeContainerSupervisor.create({
-    image: string(config.image), bootstrapSha256: string(config.bootstrapSha256),
-    networkId: string(config.networkId), workspaceParent: string(config.workspaceParent),
-    profileParent: string(config.profileParent), configParent: string(config.configParent),
-    stateDirectory: string(config.stateDirectory), seccompPath: string(config.seccompPath),
-    seccompSha256: string(config.seccompSha256), apparmorProfile: string(config.apparmorProfile),
-    handoffHelperPath: string(config.handoffHelperPath), handoffHelperSha256: string(config.handoffHelperSha256),
-    handoffPythonSha256: string(config.handoffPythonSha256),
-    ownerSocketDirectory: string(config.ownerSocketDirectory), ownerUid: Number(config.ownerUid),
-    serverPasswordKey: Buffer.from(passwordKeyHex, 'hex'),
+  // The independent Product roster and effect fence have no production adapter yet.
+  // Do not treat a signed Owner RPC or root-owned config as admission evidence.
+  const denyProductAuthority = async () => false
+  const network = await HostedMemberNetworkProvisioner.create({
+    stateDirectory: string(config.memberNetworkStateDirectory), admitMember: denyProductAuthority,
+  })
+  const manager = await HostedOpenCodeMemberSupervisorManager.create({
+    stateDirectory: string(config.memberManagerStateDirectory), network,
+    admitMember: denyProductAuthority,
+    assertEffectFence: denyProductAuthority,
+    assertCleanupAuthority: denyProductAuthority,
+    supervisorOptions: {
+      image: string(config.image), bootstrapSha256: string(config.bootstrapSha256),
+      workspaceParent: string(config.workspaceParent), profileParent: string(config.profileParent),
+      configParent: string(config.configParent), seccompPath: string(config.seccompPath),
+      seccompSha256: string(config.seccompSha256), apparmorProfile: string(config.apparmorProfile),
+      handoffHelperPath: string(config.handoffHelperPath), handoffHelperSha256: string(config.handoffHelperSha256),
+      handoffPythonSha256: string(config.handoffPythonSha256),
+      ownerSocketDirectory: string(config.ownerSocketDirectory), ownerUid: Number(config.ownerUid),
+      serverPasswordKey: Buffer.from(passwordKeyHex, 'hex'),
+    },
   })
   const server = new HostedOpenCodeSupervisorRpcServer({ socketPath: string(config.rpcSocketPath),
-    secret: Buffer.from(secretHex, 'hex'), ownerGid: Number(config.ownerGid), supervisor })
+    secret: Buffer.from(secretHex, 'hex'), ownerGid: Number(config.ownerGid), manager })
   await server.start()
   const shutdown = () => { void server.close().finally(() => process.exit(0)) }
   process.once('SIGTERM', shutdown)
