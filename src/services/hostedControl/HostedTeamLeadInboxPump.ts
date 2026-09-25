@@ -18,10 +18,21 @@ import type { HostedControlAuthority, HostedControlStableAuthority } from './pro
 import type { HostedMessageAuthorityGuard, HostedPersistedMessage } from './HostedTeamMessageService.js'
 import { fsyncFileAndParent } from './HostedTaskMutationWal.js'
 import { isHostedMessageRecipientName } from './HostedTeamRecipientRoster.js'
+import {
+  hostedInboxRelayMessageId,
+  relayPromptFields,
+  selectDeliverableInboxRows,
+  type DeliverableInboxRow,
+} from './HostedInboxRelayRows.js'
 
 const DIRECTORY = 'hosted-team-lead-inbox-pump'
 const DELIVERY_DIRECTORY = 'hosted-message-delivery-operations'
-const MAX_FILE_BYTES = 32 * 1024
+/** Intents carry the prompt text; relayed teammate rows may be up to MAX_RELAY_TEXT_BYTES. */
+const MAX_FILE_BYTES = 256 * 1024
+/** Larger teammate rows stay in the inbox for the recipient's own reads. */
+const MAX_RELAY_TEXT_BYTES = 64 * 1024
+/** Actor recorded on intents for teammate rows, which no browser request authorized. */
+const RELAY_ACTOR_ID = 'hosted-inbox-relay'
 const MAX_INBOX_BYTES = 8 * 1024 * 1024
 const MAX_AMBIGUOUS_RECONCILIATIONS = 12
 /** A prompt the runtime provably never accepted may be sent this many times in total. */
@@ -36,10 +47,21 @@ type Selected = {
   capabilitySnapshotId: string
   projectPath: string
 }
+/**
+ * A teammate- or app-written inbox row carries `relay`: the row itself is the
+ * durable source (no Product delivery marker), `messageId` is the bridge id
+ * derived from it, and replies go to its sender, as in desktop's inbox relay.
+ */
+type RelayOrigin = {
+  sourceMessageId: string
+  from: string
+  replyRecipient: string
+} & ReturnType<typeof relayPromptFields>
+type PumpMessage = HostedPersistedMessage & { relay?: RelayOrigin }
 type Intent = {
   schemaVersion: 1
   authority: HostedControlAuthority
-  message: HostedPersistedMessage
+  message: PumpMessage
   textSha256: string
   selected: Selected
   requestId: string
@@ -60,7 +82,7 @@ type Intent = {
 type NativeInboxRecord = {
   schemaVersion: 1
   authority: HostedControlAuthority
-  message: HostedPersistedMessage
+  message: PumpMessage
   textSha256: string
   status: 'native_inbox'
 }
@@ -154,7 +176,7 @@ export class HostedTeamLeadInboxPump {
     this.#reportDecision = options.reportDecision
   }
 
-  async wake(message: HostedPersistedMessage, authority: HostedControlAuthority): Promise<InboxPumpDecision> {
+  async wake(message: PumpMessage, authority: HostedControlAuthority): Promise<InboxPumpDecision> {
     if (!this.#accepting) return { kind: 'unavailable' }
     const work = this.#wake(message, authority).then(({ decision, reason }) => {
       this.#report(message, decision, reason)
@@ -189,6 +211,11 @@ export class HostedTeamLeadInboxPump {
   async #recover(): Promise<InboxPumpDecision[]> {
     if (!this.#accepting) return [{ kind: 'unavailable' }]
     await this.#assertPrivateRoot()
+    return [...await this.#recoverOperatorMessages(), ...await this.#recoverRelayRows()]
+  }
+
+  /** Operator messages: Product's delivery markers name each appended `from: user` row. */
+  async #recoverOperatorMessages(): Promise<InboxPumpDecision[]> {
     let names: string[]
     try { names = await readdir(join(this.#root, DELIVERY_DIRECTORY)) }
     catch (error) {
@@ -234,6 +261,56 @@ export class HostedTeamLeadInboxPump {
   }
 
   /**
+   * Teammate and app rows: every row desktop's OpenCode member inbox relay prompts,
+   * read from the inbox of every OpenCode lane member of the current plan. Native
+   * members read their own inbox and are not touched. The queue is FIFO per
+   * recipient in desktop order: a row that cannot be prompted yet holds the rows
+   * behind it, and so does an operator row still in flight on its own path.
+   */
+  async #recoverRelayRows(): Promise<InboxPumpDecision[]> {
+    const admission = await this.#planStore.load({
+      workspaceId: this.#authority.workspaceId, teamId: this.#authority.teamId,
+    })
+    if (!admission || !(await admission.isCurrent())) return []
+    const members = [...new Set(admission.plan.lanes
+      .filter(lane => lane.kind === 'opencode')
+      .flatMap(lane => lane.members.map(member => member.name))
+      .filter(isInboxRecipient))]
+    const authority: HostedControlAuthority = { actorId: RELAY_ACTOR_ID, ...this.#authority }
+    const results: InboxPumpDecision[] = []
+    for (const recipient of members) {
+      let rows: Array<Record<string, unknown>>
+      try { rows = await this.#readInbox(recipient) } catch { continue }
+      for (const deliverable of selectDeliverableInboxRows(rows, recipient)) {
+        if (!this.#accepting) return results
+        // TODO(hosted-dedupe-plan M1): operator rows still arrive through Product's
+        // message_deliver markers. Once message_send replaces persist+deliver, this
+        // branch, the markers and #hasDurableDeliveryReceipt go away.
+        if (deliverable.from.toLowerCase() === 'user') {
+          if (await this.#operatorRowInFlight(recipient, deliverable.sourceMessageId)) break
+          continue
+        }
+        const message = relayMessage(authority.teamId, recipient, deliverable)
+        if (!message) continue
+        const decision = await this.wake(message, authority)
+        results.push(decision)
+        if (decision.kind === 'pending' || decision.kind === 'unavailable') break
+      }
+    }
+    return results
+  }
+
+  /** An operator row the pump claimed but has not settled yet keeps the recipient's order. */
+  async #operatorRowInFlight(recipient: string, messageId: string): Promise<boolean> {
+    try {
+      const stored = await readPrivateJson(join(this.#root, DIRECTORY,
+        `${intentDigest(this.#authority.teamId, recipient, messageId)}.json`)) as Intent | NativeInboxRecord | null
+      if (!stored || stored.status === 'native_inbox' || stored.status === 'operator_required') return false
+      return !(stored.status === 'observed' && stored.inboxReadCommitted === true)
+    } catch { return false }
+  }
+
+  /**
    * A native append, an operator_required intent and an observed prompt whose inbox row is marked
    * read never change again, so recovery answers them without rereading the inbox or waking the
    * message. Anything else, or any doubt about the stored record, takes the full wake path.
@@ -266,7 +343,7 @@ export class HostedTeamLeadInboxPump {
     await Promise.all([...this.#pending])
   }
 
-  #report(message: HostedPersistedMessage, decision: InboxPumpDecision, reason: string | null): void {
+  #report(message: PumpMessage, decision: InboxPumpDecision, reason: string | null): void {
     if (!this.#reportDecision) return
     const key = `${decision.kind}\0${reason ?? ''}`
     if (this.#lastReports.get(message.messageId) === key) return
@@ -277,7 +354,7 @@ export class HostedTeamLeadInboxPump {
     } catch { /* Diagnostics never change delivery. */ }
   }
 
-  async #wake(message: HostedPersistedMessage, authority: HostedControlAuthority): Promise<WakeOutcome> {
+  async #wake(message: PumpMessage, authority: HostedControlAuthority): Promise<WakeOutcome> {
     if (!sameAuthority(authority, this.#authority) || message.teamId !== authority.teamId ||
       !/^message_[0-9a-f]{32}$/.test(message.messageId) ||
       !/^client_message_[A-Za-z0-9][A-Za-z0-9._-]{7,127}$/.test(message.clientMessageId)) {
@@ -291,11 +368,12 @@ export class HostedTeamLeadInboxPump {
     try {
       await this.#assertPrivateRoot()
       if (!(await this.#hasDurableInboxRow(message, recipient))) return outcome('operator_required', 'inbox_row_mismatch')
-      if (!(await this.#hasDurableDeliveryReceipt(message, recipient, authority))) {
+      if (!message.relay && !(await this.#hasDurableDeliveryReceipt(message, recipient, authority))) {
         return outcome('operator_required', 'delivery_marker_mismatch')
       }
       await this.#prepareDirectory()
-      const path = join(this.#root, DIRECTORY, `${intentDigest(authority.teamId, recipient, message.messageId)}.json`)
+      const path = join(this.#root, DIRECTORY,
+        `${intentDigest(authority.teamId, recipient, inboxRowOf(message).messageId)}.json`)
       const release = await lockfile.lock(path, LOCK_OPTIONS)
       try {
         const stored = await readPrivateJson(path) as Intent | NativeInboxRecord | null
@@ -451,8 +529,8 @@ export class HostedTeamLeadInboxPump {
       messageId: intent.message.messageId, payloadHash: intent.textSha256,
       ...(command === 'send'
         ? {
-          // Same delivery contract as desktop: the recipient learns it was the
-          // user and answers through message_send with relayOfMessageId.
+          // Same delivery contract as desktop: the recipient learns who wrote it
+          // and answers through message_send with relayOfMessageId.
           text: buildOpenCodeRuntimeMessageText({
             runId: intent.selected.runId,
             // Agents address their team by the admitted directory name, as the bridge does.
@@ -460,8 +538,11 @@ export class HostedTeamLeadInboxPump {
             laneId: intent.selected.laneId,
             memberName,
             text: intent.message.text,
-            messageId: intent.message.messageId,
-            replyRecipient: 'user',
+            messageId: inboxRowOf(intent.message).messageId,
+            replyRecipient: intent.message.relay?.replyRecipient ?? 'user',
+            ...(intent.message.relay?.taskRefs ? { taskRefs: intent.message.relay.taskRefs } : {}),
+            ...(intent.message.relay?.messageKind ? { messageKind: intent.message.relay.messageKind } : {}),
+            ...(intent.message.relay?.actionMode ? { actionMode: intent.message.relay.actionMode } : {}),
           }),
         }
         : {}),
@@ -571,7 +652,7 @@ export class HostedTeamLeadInboxPump {
       const marked = await markMailboxMessageReadAtCanonicalTeamRoot({
         canonicalTeamRoot: this.#root,
         recipientName: intent.message.recipient ?? TEAM_LEAD_NAME,
-        message: { messageId: intent.message.messageId, from: 'user',
+        message: { ...inboxRowOf(intent.message),
           text: intent.message.text, timestamp: intent.message.createdAt },
       })
       if (marked === 'marked' || marked === 'already_read') {
@@ -581,10 +662,11 @@ export class HostedTeamLeadInboxPump {
     return decision
   }
 
-  async #hasDurableInboxRow(message: HostedPersistedMessage, recipient: string): Promise<boolean> {
+  async #hasDurableInboxRow(message: PumpMessage, recipient: string): Promise<boolean> {
     const rows = await this.#readInbox(recipient)
-    const matches = rows.filter(row => row.messageId === message.messageId)
-    return matches.length === 1 && matches[0]?.from === 'user' &&
+    const row = inboxRowOf(message)
+    const matches = rows.filter(candidate => candidate.messageId === row.messageId)
+    return matches.length === 1 && matches[0]?.from === row.from &&
       matches[0].text === message.text && matches[0].timestamp === message.createdAt
   }
 
@@ -611,7 +693,7 @@ export class HostedTeamLeadInboxPump {
 
   async #readInbox(recipient: string): Promise<Array<Record<string, unknown>>> {
     if (!isInboxRecipient(recipient)) throw new Error('Invalid hosted inbox recipient')
-    const value = await readPrivateJson(join(this.#root, 'inboxes', `${recipient}.json`), MAX_INBOX_BYTES)
+    const value = await readPrivateJson(join(this.#root, 'inboxes', `${recipient}.json`), MAX_INBOX_BYTES, 0o022)
     if (!Array.isArray(value) || value.length > 10_000 || value.some(row => !asRecord(row))) {
       throw new Error('Invalid hosted inbox')
     }
@@ -654,6 +736,35 @@ function requestIdFor(teamId: string, messageId: string, selected: Selected, att
 function bridgeFailure(result: BridgeResponse): string {
   if (result.ok) return typeof result.data?.status === 'string' ? result.data.status.slice(0, 48) : 'not_accepted'
   return 'bridge_error'
+}
+/** The inbox row a pump message stands for: its own id for operator rows, the source row otherwise. */
+function inboxRowOf(message: PumpMessage): { messageId: string; from: string } {
+  return message.relay
+    ? { messageId: message.relay.sourceMessageId, from: message.relay.from }
+    : { messageId: message.messageId, from: 'user' }
+}
+/** Hosted-only exclusions on top of the desktop selection; null leaves the row in the inbox. */
+function relayMessage(teamId: string, recipient: string, deliverable: DeliverableInboxRow): PumpMessage | null {
+  const { row } = deliverable
+  // A member never gets its own rows; the read commit needs the raw sender and timestamp.
+  if (deliverable.from.toLowerCase() === recipient.toLowerCase() || typeof row.from !== 'string' ||
+    typeof row.timestamp !== 'string' || Buffer.byteLength(String(row.text)) > MAX_RELAY_TEXT_BYTES) {
+    return null
+  }
+  const messageId = hostedInboxRelayMessageId(teamId, recipient, deliverable.sourceMessageId)
+  return {
+    teamId, messageId,
+    // Unused by relay rows; the pattern only keeps one message shape across both paths.
+    clientMessageId: `client_message_relay-${messageId.slice('message_'.length)}`,
+    text: String(row.text), createdAt: row.timestamp,
+    ...(recipient === TEAM_LEAD_NAME ? {} : { recipient }),
+    relay: {
+      sourceMessageId: deliverable.sourceMessageId,
+      from: row.from,
+      replyRecipient: deliverable.replyRecipient,
+      ...relayPromptFields(row),
+    },
+  }
 }
 function isInboxRecipient(value: unknown): value is string {
   return value === TEAM_LEAD_NAME || isHostedMessageRecipientName(value)
@@ -703,7 +814,15 @@ async function writeIntent(path: string, intent: Intent | NativeInboxRecord): Pr
   await writeFileAtomic(path, `${JSON.stringify(intent)}\n`, { mode: 0o600 })
   await fsyncFileAndParent(path)
 }
-async function readPrivateJson(path: string, maxBytes = MAX_FILE_BYTES): Promise<unknown | null> {
+/**
+ * Pump state is 0600. Inboxes are shared with the agent-teams MCP writer, which
+ * creates them under its umask, so for them only foreign write bits are refused.
+ */
+async function readPrivateJson(
+  path: string,
+  maxBytes = MAX_FILE_BYTES,
+  forbiddenModeBits = 0o077,
+): Promise<unknown | null> {
   const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0)).catch(error => {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
     throw error
@@ -713,7 +832,7 @@ async function readPrivateJson(path: string, maxBytes = MAX_FILE_BYTES): Promise
     const [stat, linked] = await Promise.all([handle.stat(), lstat(path)])
     if (!stat.isFile() || !linked.isFile() || linked.isSymbolicLink() ||
       stat.dev !== linked.dev || stat.ino !== linked.ino || stat.size > maxBytes ||
-      (stat.mode & 0o077) !== 0 ||
+      (stat.mode & forbiddenModeBits) !== 0 ||
       (process.getuid?.() !== undefined && stat.uid !== process.getuid()) ||
       await realpath(path) !== path) throw new Error('Unsafe hosted inbox pump file')
     return JSON.parse(await handle.readFile('utf8')) as unknown

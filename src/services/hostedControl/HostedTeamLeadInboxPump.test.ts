@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -246,7 +246,7 @@ describe('HostedTeamLeadInboxPump', () => {
     expect(observed).toMatchObject({ status: 'observed', inboxReadCommitted: true })
     // An unsafe inbox fails every path that reads it, so a skipped read is observable.
     const inbox = join(f.root, 'inboxes', 'team-lead.json')
-    await chmod(inbox, 0o644)
+    await chmod(inbox, 0o664)
     f.calls.length = 0
     expect(await f.build().recover()).toEqual([{ kind: 'observed' }])
     expect(await f.build().wake(message, authority)).toEqual({ kind: 'operator_required' })
@@ -493,6 +493,102 @@ describe('HostedTeamLeadInboxPump', () => {
     expect(await f.build().recover()).toEqual([{ kind: 'operator_required' }])
     expect(f.calls.filter(command => command === 'send')).toHaveLength(3)
     expect(new Set(requestIds).size).toBe(3)
+  })
+
+  test('relays a teammate row to the recipient session once, like desktop, and never back to its sender', async () => {
+    const f = await fixture()
+    // The agent-teams MCP writer creates inboxes under its umask: 0644 on a live host.
+    const inbox = async (member: string, rows: Array<Record<string, unknown>>) => {
+      const path = join(f.root, 'inboxes', `${member}.json`)
+      await writeFile(path, JSON.stringify(rows))
+      await chmod(path, 0o644)
+    }
+    const leadToAlice = { messageId: 'relay-source-1', from: 'team-lead', text: 'Alice, take task #t1.',
+      timestamp: '2026-09-24T10:01:00.000Z', read: false }
+    await inbox('alice', [
+      leadToAlice,
+      // Its own row and an operator row without a Product marker are never relayed.
+      { messageId: 'relay-self', from: 'alice', text: 'note to self', timestamp: '2026-09-24T10:02:00.000Z', read: false },
+      { messageId: 'relay-user', from: 'user', text: 'unmarked', timestamp: '2026-09-24T10:03:00.000Z', read: false },
+    ])
+    const sent: Array<{ memberName?: string; text?: string }> = []
+    f.setBridge(async input => {
+      f.calls.push(input.command)
+      if (input.command === 'send') sent.push({ memberName: input.memberName, text: input.text })
+      return { ok: true, data: { accepted: true, sessionId, runtimePromptMessageId: 'prompt-1' } }
+    })
+
+    const pump = f.build()
+    await pump.recover()
+    expect(sent.filter(prompt => prompt.memberName === 'alice')).toHaveLength(1)
+    const prompt = sent.find(candidate => candidate.memberName === 'alice')!.text!
+    // The recipient answers its sender through message_send, linked to the source row.
+    expect(prompt).toContain(`{"teamName":"legacy","to":"team-lead","from":"alice","source":"runtime_delivery","relayOfMessageId":"relay-source-1"}`)
+    expect(prompt).toEndWith(`<opencode_inbound_app_message>\n${leadToAlice.text}\n</opencode_inbound_app_message>`)
+    const rows = JSON.parse(await readFile(join(f.root, 'inboxes', 'alice.json'), 'utf8'))
+    expect(rows.map((row: { messageId: string; read: boolean }) => [row.messageId, row.read])).toEqual([
+      ['relay-source-1', true], ['relay-self', false], ['relay-user', false],
+    ])
+    // The owner's read commit leaves the inbox owner-private again.
+    expect((await lstat(join(f.root, 'inboxes', 'alice.json'))).mode & 0o777).toBe(0o600)
+    const sends = sent.length
+    await pump.recover()
+    await f.build().recover()
+    expect(sent).toHaveLength(sends)
+  })
+
+  test('a restart between the issued send and its acceptance never relays the row twice', async () => {
+    const f = await fixture()
+    await writeFile(join(f.root, 'inboxes', 'alice.json'), JSON.stringify([
+      { messageId: 'relay-lost', from: 'team-lead', text: 'Ship it.', timestamp: '2026-09-24T10:01:00.000Z', read: false },
+    ]), { mode: 0o600 })
+    let sends = 0
+    let runtimeReachable = false
+    f.setBridge(async input => {
+      f.calls.push(input.command)
+      if (input.memberName !== 'alice') {
+        return { ok: true, data: { accepted: true, sessionId, runtimePromptMessageId: 'prompt-1' } }
+      }
+      if (input.command === 'send') {
+        sends++
+        // The prompt reached the runtime, then the owner died before the answer.
+        throw new Error('owner stopped after the POST')
+      }
+      if (!runtimeReachable) throw new Error('runtime unreachable while the owner restarts')
+      return { ok: true, data: { status: 'prompt_accepted', accepted: true, sessionId, runtimePromptMessageId: 'prompt-1' } }
+    })
+    await f.build().recover()
+    expect(sends).toBe(1)
+    runtimeReachable = true
+    const restarted = f.build()
+    await restarted.recover()
+    await restarted.recover()
+    expect(sends).toBe(1)
+    const [row] = JSON.parse(await readFile(join(f.root, 'inboxes', 'alice.json'), 'utf8'))
+    expect(row.read).toBe(true)
+  })
+
+  test('holds later rows of a recipient behind one that cannot be prompted yet', async () => {
+    const f = await fixture()
+    await writeFile(join(f.root, 'inboxes', 'alice.json'), JSON.stringify([
+      { messageId: 'relay-second', from: 'team-lead', text: 'Second.', timestamp: '2026-09-24T10:02:00.000Z', read: false },
+      { messageId: 'relay-first', from: 'team-lead', text: 'First.', timestamp: '2026-09-24T10:01:00.000Z', read: false },
+    ]), { mode: 0o600 })
+    const texts: string[] = []
+    f.setBridge(async input => {
+      f.calls.push(input.command)
+      if (input.memberName !== 'alice') {
+        return { ok: true, data: { accepted: true, sessionId, runtimePromptMessageId: 'prompt-1' } }
+      }
+      if (input.command === 'send') {
+        texts.push(input.text!)
+        return { ok: false }
+      }
+      return { ok: true, data: { status: 'failed_before_accept', accepted: false, safeToRetry: true } }
+    })
+    await f.build().recover()
+    expect(texts).toHaveLength(1)
+    expect(texts[0]).toContain('First.')
   })
 })
 

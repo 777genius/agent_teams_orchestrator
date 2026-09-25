@@ -237,13 +237,13 @@ describe('HostedTeamLeadMessageDelivery', () => {
     const inboxDir = join(teamRoot, 'inboxes')
     await mkdir(inboxDir, { mode: 0o700 })
     const inboxPath = join(inboxDir, 'team-lead.json')
-    await writeFile(inboxPath, '[]', { mode: 0o640 })
-    await chmod(inboxPath, 0o640)
+    await writeFile(inboxPath, '[]', { mode: 0o660 })
+    await chmod(inboxPath, 0o660)
 
     expect(await makeDelivery(teamRoot).deliver(message, authority)).toEqual({
       kind: 'operator_required',
     })
-    expect((await lstat(inboxPath)).mode & 0o077).toBe(0o040)
+    expect((await lstat(inboxPath)).mode & 0o077).toBe(0o060)
   })
 
   test('revalidates after the effect and leaves a delivered replay marker', async () => {

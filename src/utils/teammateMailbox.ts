@@ -565,6 +565,13 @@ export async function markMailboxMessageReadAtCanonicalTeamRoot(input: {
   }
 }
 
+/**
+ * Hosted inbox files are shared with the agent-teams MCP writer, which creates
+ * them under the process umask (0644 at 0022). Integrity needs only that no other
+ * user can write them; this owner's writes always leave them 0600.
+ */
+const EXPLICIT_ROOT_INBOX_FOREIGN_WRITE_BITS = 0o022
+
 async function readMailboxPathStrict(
   inboxPath: string,
 ): Promise<TeammateMessage[]> {
@@ -580,7 +587,7 @@ async function readMailboxPathStrict(
       current.isSymbolicLink() ||
       stat.dev !== current.dev ||
       stat.ino !== current.ino ||
-      (stat.mode & 0o077) !== 0 ||
+      (stat.mode & EXPLICIT_ROOT_INBOX_FOREIGN_WRITE_BITS) !== 0 ||
       (process.getuid?.() !== undefined && stat.uid !== process.getuid())
     ) {
       throw new Error(`mailbox path was substituted: ${inboxPath}`)
@@ -656,7 +663,7 @@ async function assertPrivateRegularFile(
       current.isSymbolicLink() ||
       stat.dev !== current.dev ||
       stat.ino !== current.ino ||
-      (stat.mode & 0o077) !== 0 ||
+      (stat.mode & EXPLICIT_ROOT_INBOX_FOREIGN_WRITE_BITS) !== 0 ||
       (process.getuid?.() !== undefined && stat.uid !== process.getuid())
     ) {
       throw new Error(`Unsafe explicit-root mailbox file: ${path}`)
@@ -692,7 +699,7 @@ async function fsyncFileAndParentDirectory(path: string): Promise<void> {
         currentFile.isSymbolicLink() ||
         fileStat.dev !== currentFile.dev ||
         fileStat.ino !== currentFile.ino ||
-        (fileStat.mode & 0o077) !== 0 ||
+        (fileStat.mode & EXPLICIT_ROOT_INBOX_FOREIGN_WRITE_BITS) !== 0 ||
         (process.getuid?.() !== undefined &&
           fileStat.uid !== process.getuid()) ||
         !parentStat.isDirectory() ||

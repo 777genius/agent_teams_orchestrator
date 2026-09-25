@@ -321,8 +321,9 @@ describe('teammateMailbox', () => {
     const inboxDir = join(teamRoot, 'inboxes')
     await mkdir(inboxDir, { mode: 0o700 })
     const inboxPath = join(inboxDir, 'team-lead.json')
-    await writeFile(inboxPath, '[]', { mode: 0o640 })
-    await chmod(inboxPath, 0o640)
+    // Readable by others is the MCP writer's umask; writable by others is unsafe.
+    await writeFile(inboxPath, '[]', { mode: 0o660 })
+    await chmod(inboxPath, 0o660)
 
     await expect(
       writeToMailboxAtCanonicalTeamRootVerified({
@@ -336,7 +337,7 @@ describe('teammateMailbox', () => {
         },
       }),
     ).rejects.toThrow('Unsafe explicit-root mailbox file')
-    expect((await lstat(inboxPath)).mode & 0o077).toBe(0o040)
+    expect((await lstat(inboxPath)).mode & 0o077).toBe(0o060)
   })
 
   it('rejects a group-writable explicit-root inbox directory without repairing it', async () => {
