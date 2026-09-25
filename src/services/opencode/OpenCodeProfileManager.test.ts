@@ -3566,7 +3566,62 @@ describe('ensureSelectedOpenCodeModelInImportedConfig', () => {
     )
     expect(config.provider.ollama.models).toEqual({
       'qwen2.5-coder:0.5b': {},
-      'qwen2.5-coder:7b-32k': {},
+      'qwen2.5-coder:7b-32k': {
+        tool_call: true,
+        limit: {
+          context: 32_768,
+          output: 4096,
+        },
+      },
+    })
+  })
+
+  test('copies a sibling local allowlist context window onto the selected model', () => {
+    const config = {
+      provider: {
+        ollama: {
+          models: {
+            'qwen2.5-coder:0.5b': {
+              tool_call: true,
+              limit: { context: 32_768, output: 4096 },
+            },
+          },
+        },
+      },
+    }
+    ensureSelectedOpenCodeModelInImportedConfig(
+      config,
+      'ollama/qwen2.5-coder:7b-32k',
+      'launch_runtime',
+    )
+    expect(config.provider.ollama.models['qwen2.5-coder:7b-32k']).toEqual({
+      tool_call: true,
+      limit: { context: 32_768, output: 4096 },
+    })
+  })
+
+  test('upgrades an empty selected local allowlist entry so tools keep a real context window', () => {
+    const config = {
+      provider: {
+        ollama: {
+          models: {
+            'qwen2.5-coder:0.5b': {
+              tool_call: true,
+              limit: { context: 32_768, output: 4096 },
+            },
+            'qwen2.5-coder:7b-32k': {},
+          },
+        },
+      },
+    }
+    ensureSelectedOpenCodeModelInImportedConfig(
+      config,
+      'ollama/qwen2.5-coder:7b-32k',
+      'launch_runtime',
+    )
+    expect(config.provider.ollama.models['qwen2.5-coder:7b-32k']).toEqual({
+      tool_call: true,
+      limit: { context: 32_768, output: 4096 },
     })
   })
 
@@ -3608,7 +3663,13 @@ describe('ensureSelectedOpenCodeModelInImportedConfig', () => {
     )
     expect(config.provider.ollama.models).toEqual({
       'qwen2.5-coder:0.5b': {},
-      'qwen2.5-coder:7b-32k': {},
+      'qwen2.5-coder:7b-32k': {
+        tool_call: true,
+        limit: {
+          context: 32_768,
+          output: 4096,
+        },
+      },
     })
   })
 
@@ -3627,7 +3688,13 @@ describe('ensureSelectedOpenCodeModelInImportedConfig', () => {
       ollama: {
         models: {
           'qwen2.5-coder:0.5b': {},
-          'qwen2.5-coder:7b-32k': {},
+          'qwen2.5-coder:7b-32k': {
+            tool_call: true,
+            limit: {
+              context: 32_768,
+              output: 4096,
+            },
+          },
         },
       },
     })
@@ -3648,7 +3715,13 @@ describe('ensureSelectedOpenCodeModelInImportedConfig', () => {
       lmstudio: {
         models: {
           'local-model': {},
-          'qwen2.5-coder:7b-32k': {},
+          'qwen2.5-coder:7b-32k': {
+            tool_call: true,
+            limit: {
+              context: 32_768,
+              output: 4096,
+            },
+          },
         },
       },
     })
@@ -3671,7 +3744,13 @@ describe('ensureSelectedOpenCodeModelInImportedConfig', () => {
       lmstudio: {
         models: {
           'local-model': {},
-          'qwen2.5-coder:7b-32k': {},
+          'qwen2.5-coder:7b-32k': {
+            tool_call: true,
+            limit: {
+              context: 32_768,
+              output: 4096,
+            },
+          },
         },
       },
     })
