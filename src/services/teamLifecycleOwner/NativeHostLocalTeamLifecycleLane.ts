@@ -385,7 +385,7 @@ export class NativeHostLocalTeamLifecycleLane implements TeamLifecycleLaneEffect
     }
     const codex = this.config.codex
     if (!codex) throw new NativeHostLocalLaneError('native_lane_provider_not_configured')
-    await verifyCodexConfiguration(codex)
+    await verifyCodexConfiguration(codex, this.#claudeRoot)
     return { provider, codexHome: codex.codexHome, codexCliPath: codex.codexCliPath }
   }
 

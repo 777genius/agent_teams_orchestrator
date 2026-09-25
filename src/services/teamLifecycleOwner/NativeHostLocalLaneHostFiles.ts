@@ -130,17 +130,21 @@ export async function readClaudeOAuthToken(tokenFile: string, claudeRoot: string
     realpath(tokenFile).catch(fail),
     realpath(claudeRoot).catch(fail),
   ])
-  const fromRoot = relative(canonicalRoot, canonicalToken)
-  const outsideRoot = fromRoot === '..' || fromRoot.startsWith(`..${sep}`) || isAbsolute(fromRoot)
-  if (!outsideRoot) fail()
+  if (!isOutside(canonicalRoot, canonicalToken)) fail()
   const bytes = await readOwnerPrivateFile(tokenFile, TOKEN_MAX_BYTES).catch(fail)
   const token = bytes?.toString('utf8').trim() ?? ''
   if (!/^[\x21-\x7e]{16,8192}$/.test(token)) fail()
   return token
 }
 
-/** The Codex binary and home are pinned by trusted configuration, never looked up in PATH. */
-export async function verifyCodexConfiguration(input: { codexHome: string; codexCliPath: string }): Promise<void> {
+/**
+ * The Codex binary and home are pinned by trusted configuration, never looked
+ * up in PATH, and neither may resolve into the Product-writable Claude root.
+ */
+export async function verifyCodexConfiguration(
+  input: { codexHome: string; codexCliPath: string },
+  claudeRoot: string,
+): Promise<void> {
   const fail = (): never => {
     throw new NativeHostLocalLaneError('native_lane_credentials_unavailable', 'Codex home or binary is unavailable')
   }
@@ -148,6 +152,15 @@ export async function verifyCodexConfiguration(input: { codexHome: string; codex
   const [home, binary] = await Promise.all([stat(input.codexHome).catch(fail), stat(input.codexCliPath).catch(fail)])
   if (!home.isDirectory() || !binary.isFile()) fail()
   await access(input.codexCliPath, constants.X_OK).catch(fail)
+  const canonicalRoot = await realpath(claudeRoot).catch(fail)
+  for (const path of [input.codexHome, input.codexCliPath]) {
+    if (!isOutside(canonicalRoot, await realpath(path).catch(fail))) fail()
+  }
+}
+
+function isOutside(root: string, path: string): boolean {
+  const fromRoot = relative(root, path)
+  return fromRoot === '..' || fromRoot.startsWith(`..${sep}`) || isAbsolute(fromRoot)
 }
 
 /**

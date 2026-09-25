@@ -536,6 +536,40 @@ describe('createHostedPersonalHostLocalPortFactory', () => {
     expect((await actions(null)).kind).toBe('unavailable')
     expect((await actions({ ...appMcp, entrySha256: digest('other entry\n') })).kind).toBe('unavailable')
   })
+
+  test('the native lane exists only with signed provider paths and the verified MCP artifact', async () => {
+    const teamRoot = await makePersonalTeamRoot('hosted-personal-native-')
+    const workspace = join(teamRoot, 'sandbox-workspace')
+    await mkdir(workspace, { mode: 0o700 })
+    const planPath = join(teamRoot, HOSTED_LIFECYCLE_PLAN_FILE)
+    await writeFile(planPath, JSON.stringify({
+      schemaVersion: 2, workspaceId: stableAuthority.workspaceId, teamId, workspaceRoot: workspace,
+      toolApprovalMode: 'auto',
+      lanes: [{ laneId: 'lane_native', kind: 'native', provider: 'codex', members: [
+        { name: TEAM_LEAD_NAME, prompt: 'Lead the team.', model: 'gpt-5.6-sol' },
+        { name: 'worker', prompt: 'Work only in the admitted sandbox.', model: 'gpt-5.6-sol' },
+      ] }],
+    }), { mode: 0o600 })
+    await chmod(planPath, 0o600)
+    const command = join(teamRoot, 'node')
+    const entry = join(teamRoot, 'index.js')
+    await writeFile(command, 'node binary\n')
+    await writeFile(entry, 'mcp entry\n')
+    const digest = (text: string) => createHash('sha256').update(text).digest('hex')
+    const appMcp = { command, commandSha256: digest('node binary\n'), entry, entrySha256: digest('mcp entry\n') }
+    const native = { codex: { codexHome: '/home/operator/.codex', codexCliPath: '/opt/codex/bin/codex' } }
+    const actions = async (config: Parameters<typeof createHostedPersonalHostLocalPortFactory>[0]) => {
+      const ports = await createHostedPersonalHostLocalPortFactory(config)(personalContext(teamRoot, workspace))
+      try {
+        return (await ports.lifecycle.dispatch(controlStateInput())).payload
+      } finally { await ports.close() }
+    }
+    expect(await actions({ appMcp, native })).toMatchObject({ kind: 'control_state', availableActions: ['launch'] })
+    expect((await actions({ appMcp, native: null })).kind).toBe('unavailable')
+    expect((await actions({ appMcp: null, native })).kind).toBe('unavailable')
+    expect((await actions({ appMcp, native: { anthropic: { oauthTokenFile: '/home/operator/token' } } })).kind)
+      .toBe('unavailable')
+  })
 })
 
 function fakeLane(overrides: Partial<TeamLifecycleLaneEffectPort>): TeamLifecycleLaneEffectPort {

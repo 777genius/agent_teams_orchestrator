@@ -274,6 +274,28 @@ describe('NativeHostLocalTeamLifecycleLane admission and typed failures', () => 
     })
   })
 
+  test('refuses a Codex home or binary that resolves into the shared Claude root', async () => {
+    const harness = await createHarness()
+    const outside = join(harness.base, 'operator', 'codex')
+    await writeFile(outside, '#!/bin/sh\n', { mode: 0o700 })
+    const insideHome = join(harness.claudeRoot, 'codex-home')
+    await mkdir(insideHome)
+    const codexLane = { ...nativeLane, provider: 'codex' as const }
+    const lane = new NativeHostLocalTeamLifecycleLane(
+      { claudeRoot: harness.claudeRoot, teamRoot: harness.teamRoot, legacyKey: harness.team },
+      {
+        ownerCommand: { command: process.execPath, args: [FIXTURE] },
+        codex: { codexHome: insideHome, codexCliPath: outside },
+        resolveMcpServer: async () => ({ command: '/usr/bin/env', args: [] }),
+        privateRuntimeParent: join(harness.base, 'host-private'),
+      },
+      { preflight: async () => undefined, platform: 'linux', processes: emptyProcessPort() },
+    )
+    await expect(lane.launch(laneInput(harness, 'run_codex', codexLane))).rejects.toMatchObject({
+      code: 'native_lane_credentials_unavailable',
+    })
+  })
+
   test('refuses a token file readable by group or others', async () => {
     const harness = await createHarness()
     await chmod(harness.tokenFile, 0o640)

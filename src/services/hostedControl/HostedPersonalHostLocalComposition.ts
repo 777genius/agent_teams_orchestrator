@@ -24,7 +24,10 @@ import type {
   HostedControlRuntimePortFactory,
   HostedControlRuntimePortFactoryContext,
 } from './HostedControlRuntime.js'
-import type { HostedNativeHostLocalConfig } from './HostedNativeHostLocalLane.js'
+import {
+  createHostLocalNativeLaneFactory,
+  type HostedNativeHostLocalConfig,
+} from './HostedNativeHostLocalLane.js'
 import {
   HostedTeamLeadInboxPump,
   type HostedTeamLeadInboxPumpOptions,
@@ -68,7 +71,10 @@ export type HostedPersonalHostLocalConfig = Readonly<{
 export function createHostedPersonalHostLocalPortFactory(
   config: HostedPersonalHostLocalConfig,
 ): HostedControlRuntimePortFactory {
-  const laneFactories = config.lanes ?? [createHostLocalOpenCodeLane]
+  const laneFactories = config.lanes ?? [
+    createHostLocalOpenCodeLane,
+    ...(config.native ? [createHostLocalNativeLaneFactory(config.native)] : []),
+  ]
   const createInboxPump = config.createInboxPump ?? createHostedTeamLeadInboxPumpPort
   return createHostedControlPortFactory(async context => {
     // Host-local runtimes resolve team state through the process config root;
