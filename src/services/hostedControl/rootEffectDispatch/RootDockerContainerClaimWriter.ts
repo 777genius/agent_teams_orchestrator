@@ -13,6 +13,10 @@ const HANDLE = /^opencode_[a-f0-9]{32}$/
 const IMAGE = /^[a-z0-9][a-z0-9._:/-]*@sha256:[a-f0-9]{64}$/
 const PROFILE = /^[a-f0-9]{32}$/
 const GENERATION_LABEL = 'org.agentteams.hosted-opencode.generation'
+const OPERATION_LABEL = 'org.agentteams.hosted-opencode.member-operation-id'
+const RUN_LABEL = 'org.agentteams.hosted-opencode.run-id'
+const MEMBER_LABEL = 'org.agentteams.hosted-opencode.member-id'
+const WORKSPACE_LABEL = 'org.agentteams.hosted-opencode.runtime-workspace-id'
 const BOOTSTRAP = '/usr/local/bin/hosted-opencode-fd3-bootstrap'
 
 type CreateInput = Readonly<{
@@ -223,7 +227,11 @@ export class RootDockerContainerClaimWriter {
         'XDG_STATE_HOME=/sandbox/profile/state', 'TMPDIR=/sandbox/profile/tmp',
         'OPENCODE_CONFIG_DIR=/sandbox/config', 'OPENCODE_DISABLE_PROJECT_CONFIG=1',
         'OPENCODE_DISABLE_CLAUDE_CODE=1', 'OPENCODE_SERVER_PASSWORD'],
-      Labels: { [GENERATION_LABEL]: target.generation },
+      Labels: { [GENERATION_LABEL]: target.generation,
+        [OPERATION_LABEL]: target.memberOperationId,
+        [RUN_LABEL]: this.options.binding.runId,
+        [MEMBER_LABEL]: this.options.binding.memberId,
+        [WORKSPACE_LABEL]: this.options.binding.runtimeWorkspaceId },
       ExposedPorts: { '4096/tcp': {} },
       HostConfig: { ReadonlyRootfs: true, Privileged: false, NetworkMode: this.options.networkId,
         IpcMode: 'private', CapDrop: ['ALL'], SecurityOpt: ['no-new-privileges:true',

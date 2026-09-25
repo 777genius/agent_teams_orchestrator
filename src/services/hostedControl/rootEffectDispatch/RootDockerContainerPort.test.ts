@@ -40,7 +40,11 @@ async function fixture() {
   await chmod(stateDirectory, 0o700)
   await chmod(effectClaimDirectory, 0o700)
   const body = JSON.stringify({ Image: image, Env: ['OPENCODE_SERVER_PASSWORD'], Labels: {
-    'org.agentteams.hosted-opencode.generation': target.generation },
+    'org.agentteams.hosted-opencode.generation': target.generation,
+    'org.agentteams.hosted-opencode.member-operation-id': target.memberOperationId,
+    'org.agentteams.hosted-opencode.run-id': binding.runId,
+    'org.agentteams.hosted-opencode.member-id': binding.memberId,
+    'org.agentteams.hosted-opencode.runtime-workspace-id': binding.runtimeWorkspaceId },
   HostConfig: { NetworkMode: target.networkId, ReadonlyRootfs: true,
     Privileged: false, CapDrop: ['ALL'] } })
   await writeFile(path.join(stateDirectory, `container-create-${target.memberOperationId}.json`),

@@ -182,6 +182,10 @@ test('each Docker effect has a fixed method and path with no generic proxy route
       bodySha256: emptyHash }, 'GET /v1.47/containers/abc/json HTTP/1.1'],
     [{ kind: 'stop_container', operationId: 'operation_stop_container', containerId: 'abc',
       bodySha256: emptyHash }, 'POST /v1.47/containers/abc/stop HTTP/1.1'],
+    [{ kind: 'remove_container', operationId: 'operation_remove_container', containerId: 'abc',
+      bodySha256: emptyHash }, 'DELETE /v1.47/containers/abc HTTP/1.1'],
+    [{ kind: 'inspect_container_absence', operationId: 'operation_inspect_absence', containerId: 'abc',
+      bodySha256: emptyHash }, 'GET /v1.47/containers/abc/json HTTP/1.1'],
     [{ kind: 'inspect_network', operationId: 'operation_inspect_network', networkId: 'net1',
       bodySha256: emptyHash }, 'GET /v1.47/networks/net1 HTTP/1.1'],
   ]

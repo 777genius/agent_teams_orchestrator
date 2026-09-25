@@ -19,7 +19,8 @@ export type RootDockerOperation = Readonly<{
 } & (
   | { kind: 'create_network'; body: string }
   | { kind: 'create_container'; containerName: string; body: string }
-  | { kind: 'start_container' | 'inspect_container' | 'stop_container'; containerId: string }
+  | { kind: 'start_container' | 'inspect_container' | 'stop_container' |
+      'remove_container' | 'inspect_container_absence'; containerId: string }
   | { kind: 'inspect_network'; networkId: string }
   | { kind: 'inspect_image'; imageRef: string }
 )>
@@ -29,7 +30,7 @@ export type RootDockerDispatchResult =
   | Readonly<{ outcome: 'uncertain'; reason: string }>
   | Readonly<{ outcome: 'already_claimed' | 'claim_conflict' }>
 
-/** The implementation must hold its current Product transaction through the entire callback. */
+/** The implementation must hold its authoritative decision through the entire synchronous callback. */
 export interface RootCurrentMemberDecision<Binding> {
   withCurrentMemberDecision<T>(binding: Binding, kind: 'prepare' | 'start' | 'observe' | 'stop',
     callback: (current: unknown) => T): Promise<T>
@@ -96,7 +97,8 @@ function sameOperation(left: RootDockerOperation, right: RootDockerOperation): b
   return serialize(left) === serialize(right)
 }
 
-type Route = Readonly<{ method: 'GET' | 'POST'; uri: string; decision: 'prepare' | 'start' | 'observe' | 'stop';
+type Route = Readonly<{ method: 'GET' | 'POST' | 'DELETE'; uri: string;
+  decision: 'prepare' | 'start' | 'observe' | 'stop';
   body: Buffer; successStatus: readonly number[] }>
 
 function route(operation: RootDockerOperation): Route {
@@ -111,6 +113,8 @@ function route(operation: RootDockerOperation): Route {
     start_container: ['operationId', 'bodySha256', 'kind', 'containerId'],
     inspect_container: ['operationId', 'bodySha256', 'kind', 'containerId'],
     stop_container: ['operationId', 'bodySha256', 'kind', 'containerId'],
+    remove_container: ['operationId', 'bodySha256', 'kind', 'containerId'],
+    inspect_container_absence: ['operationId', 'bodySha256', 'kind', 'containerId'],
     inspect_network: ['operationId', 'bodySha256', 'kind', 'networkId'],
     inspect_image: ['operationId', 'bodySha256', 'kind', 'imageRef'],
   }
@@ -119,7 +123,7 @@ function route(operation: RootDockerOperation): Route {
     throw new Error('root-docker-operation-invalid')
   }
   let uri: string
-  let method: 'GET' | 'POST'
+  let method: 'GET' | 'POST' | 'DELETE'
   let decision: Route['decision']
   let body: Buffer = Buffer.alloc(0)
   let successStatus: readonly number[]
@@ -139,15 +143,20 @@ function route(operation: RootDockerOperation): Route {
     case 'start_container':
     case 'inspect_container':
     case 'stop_container':
+    case 'remove_container':
+    case 'inspect_container_absence':
       if (typeof operation.containerId !== 'string' || !DOCKER_ID.test(operation.containerId)) {
         throw new Error('root-docker-target-invalid')
       }
-      uri = `${API}/containers/${operation.containerId}/${operation.kind === 'inspect_container' ? 'json' :
-        operation.kind === 'start_container' ? 'start' : 'stop'}`
-      method = operation.kind === 'inspect_container' ? 'GET' : 'POST'
-      decision = operation.kind === 'inspect_container' ? 'observe' :
+      uri = `${API}/containers/${operation.containerId}${operation.kind === 'remove_container' ? '' :
+        `/${operation.kind === 'inspect_container' || operation.kind === 'inspect_container_absence' ? 'json' :
+          operation.kind === 'start_container' ? 'start' : 'stop'}`}`
+      method = operation.kind === 'remove_container' ? 'DELETE' :
+        operation.kind === 'inspect_container' || operation.kind === 'inspect_container_absence' ? 'GET' : 'POST'
+      decision = operation.kind === 'inspect_container' || operation.kind === 'inspect_container_absence' ? 'observe' :
         operation.kind === 'start_container' ? 'start' : 'stop'
-      successStatus = operation.kind === 'inspect_container' ? [200] : [204]
+      successStatus = operation.kind === 'inspect_container_absence' ? [404] :
+        operation.kind === 'inspect_container' ? [200] : [204]
       break
     case 'inspect_network':
       if (typeof operation.networkId !== 'string' || !DOCKER_ID.test(operation.networkId)) {
@@ -364,8 +373,8 @@ export class RootDockerEngineDispatcher<Binding extends object> {
       const fd = pinnedFd(socket)
       const response = responseFrom(socket, this.timeoutMs)
       void response.catch(() => {}) // A rejected guard still closes the socket without awaiting its response.
-      // The Product callback is synchronous. Claim publication and the only kernel
-      // socket write both occur while its BEGIN IMMEDIATE still fences revokers.
+      // The authority callback is synchronous. Claim publication and the only kernel
+      // socket write occur while its Product transaction or historical root decision is held.
       const claim = await this.decision.withCurrentMemberDecision(stableBinding, target.decision, current => {
         const resolved: unknown = this.resolveAuthorizedOperation(stableBinding, current,
           stableOperation.operationId)

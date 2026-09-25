@@ -71,6 +71,11 @@ test('root writer publishes immutable secret-free create and exact target claims
   expect(manifest).toMatchObject(target)
   expect(manifest.body).toContain('OPENCODE_SERVER_PASSWORD')
   expect(manifest.body).not.toContain('OPENCODE_SERVER_PASSWORD=')
+  const labels = JSON.parse(manifest.body as string).Labels as Record<string, string>
+  expect(labels['org.agentteams.hosted-opencode.member-operation-id']).toBe(target.memberOperationId)
+  expect(labels['org.agentteams.hosted-opencode.run-id']).toBe(binding.runId)
+  expect(labels['org.agentteams.hosted-opencode.member-id']).toBe(binding.memberId)
+  expect(labels['org.agentteams.hosted-opencode.runtime-workspace-id']).toBe(binding.runtimeWorkspaceId)
   await expect(f.writer.writeCreate(f.input)).rejects.toThrow('EEXIST')
   f.revoke()
   f.writer.writeTarget({ ...target, containerId: 'e'.repeat(64) })

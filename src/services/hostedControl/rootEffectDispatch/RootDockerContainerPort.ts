@@ -7,6 +7,7 @@ import type { HostedProductMemberBinding } from '../productAuthority/HostedProdu
 import { HostedRootSingleMemberAuthority } from './HostedRootSingleMemberAuthority.js'
 import { RootDockerEngineDispatcher, type RootDockerOperation } from './RootDockerEngineDispatcher.js'
 import type { RootDockerReadOnlyProofPort } from './RootDockerReadOnlyProofPort.js'
+import { withRootDockerContainerOperationLock } from './RootDockerContainerOperationLock.js'
 
 const SHA = /^[a-f0-9]{64}$/
 const GENERATION = /^[a-f0-9]{32}$/
@@ -14,6 +15,10 @@ const HANDLE = /^opencode_[a-f0-9]{32}$/
 const OPERATION = /^[a-z][a-z0-9_-]{7,95}$/
 const IMAGE = /^[a-z0-9][a-z0-9._:/-]*@sha256:[a-f0-9]{64}$/
 const GENERATION_LABEL = 'org.agentteams.hosted-opencode.generation'
+const OPERATION_LABEL = 'org.agentteams.hosted-opencode.member-operation-id'
+const RUN_LABEL = 'org.agentteams.hosted-opencode.run-id'
+const MEMBER_LABEL = 'org.agentteams.hosted-opencode.member-id'
+const WORKSPACE_LABEL = 'org.agentteams.hosted-opencode.runtime-workspace-id'
 const sha = (value: string | Buffer): string => createHash('sha256').update(value).digest('hex')
 
 export type RootContainerTarget = Readonly<{
@@ -159,7 +164,11 @@ export class RootDockerContainerPort {
     const env = row?.Env
     if (!row || typeof row !== 'object' || Array.isArray(row) ||
       row.Image !== this.options.image || !labels || typeof labels !== 'object' ||
-      labels[GENERATION_LABEL] !== target.generation || !host || typeof host !== 'object' ||
+      labels[GENERATION_LABEL] !== target.generation ||
+      labels[OPERATION_LABEL] !== target.memberOperationId ||
+      labels[RUN_LABEL] !== this.binding.runId || labels[MEMBER_LABEL] !== this.binding.memberId ||
+      labels[WORKSPACE_LABEL] !== this.binding.runtimeWorkspaceId ||
+      !host || typeof host !== 'object' ||
       host.NetworkMode !== this.options.networkId || host.ReadonlyRootfs !== true ||
       host.Privileged !== false || !Array.isArray(host.CapDrop) ||
       host.CapDrop.length !== 1 || host.CapDrop[0] !== 'ALL' || !Array.isArray(env) ||
@@ -235,7 +244,8 @@ export class RootDockerContainerPort {
     this.operationTargets.set(op.operationId, stableTarget)
     if (effect === 'inspect') this.inspectProbes.set(op.operationId, probe)
     try {
-      const result = await this.dispatcher.dispatch(op, this.binding)
+      const result = await withRootDockerContainerOperationLock(stableTarget.memberOperationId,
+        () => this.dispatcher.dispatch(op, this.binding))
       if (result.outcome !== 'responded') throw new Error(`root-container-port-${effect}-unresolved`)
       return result.body
     } finally {
