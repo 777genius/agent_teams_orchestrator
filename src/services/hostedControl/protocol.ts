@@ -1,9 +1,6 @@
 import { createHash } from 'node:crypto'
 
-export const HOSTED_CONTROL_SCHEMA_VERSION = 2 as const
 export const HOSTED_CONTROL_OPERATION = 'task_mutate' as const
-export const OWNER_PROOF_ALGORITHM = 'hmac-sha256' as const
-export const OWNER_PROOF_DOMAIN = 'agent-teams.hosted-task-board.owner-proof/v1' as const
 
 export type HostedControlOwnerBinding = {
   ownerAuthority: string
@@ -79,18 +76,7 @@ export type HostedTaskMutationTerminalResult =
   | { kind: 'unsafe_active' }
   | { kind: 'unavailable'; retryAfterMs?: number }
 
-export type HostedTaskMutationResponse = {
-  schemaVersion: 2
-  exchangeId: string
-  operation: 'task_mutate'
-  ownerBinding: HostedControlOwnerBinding
-  authority: HostedControlAuthority
-  payload: HostedTaskMutationTerminalResult
-  ownerProof: HostedControlProof
-}
-
 const ID = {
-  exchange: /^task-request_[0-9a-f]{32}$/,
   team: /^team_[0-9a-f]{32}$/,
   member: /^member_[0-9a-f]{32}$/,
   task: /^task_[0-9a-f]{32}$/,
@@ -98,8 +84,6 @@ const ID = {
   idempotency: /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/,
   generation: /^generation_[A-Za-z0-9][A-Za-z0-9._-]{0,245}$/,
   revision: /^revision_[A-Za-z0-9][A-Za-z0-9._-]{0,246}$/,
-  ownerAuthority: /^owner-authority_[A-Za-z0-9][A-Za-z0-9._-]{7,127}$/,
-  ownerSession: /^owner-session_[A-Za-z0-9][A-Za-z0-9._-]{7,127}$/,
   hash: /^[0-9a-f]{64}$/,
   fingerprint: /^[A-Za-z0-9_-]{43}$/,
 }
@@ -144,11 +128,6 @@ function column(value: unknown): Column {
   return value as Column
 }
 
-function decodeOwnerBinding(value: unknown): HostedControlOwnerBinding {
-  const v = record(value, 'ownerBinding'); exact(v, ['ownerAuthority', 'ownerGeneration', 'ownerSessionId', 'socketIdentity'], 'ownerBinding')
-  const socket = record(v.socketIdentity, 'socketIdentity'); exact(socket, ['device', 'inode', 'uid', 'gid', 'mode'], 'socketIdentity')
-  return { ownerAuthority: string(v.ownerAuthority, 'ownerAuthority', ID.ownerAuthority), ownerGeneration: integer(v.ownerGeneration, 'ownerGeneration', 1), ownerSessionId: string(v.ownerSessionId, 'ownerSessionId', ID.ownerSession), socketIdentity: { device: string(socket.device, 'device', /^\d{1,32}$/), inode: string(socket.inode, 'inode', /^\d{1,32}$/), uid: integer(socket.uid, 'uid'), gid: integer(socket.gid, 'gid'), mode: integer(socket.mode, 'mode', 0, 0o777) } }
-}
 export function decodeHostedControlAuthority(value: unknown): HostedControlAuthority {
   const v = record(value, 'authority'); exact(v, ['actorId', 'deploymentId', 'bootId', 'restoreGeneration', 'workspaceId', 'mountBinding', 'teamId'], 'authority')
   const mount = record(v.mountBinding, 'mountBinding'); exact(mount, ['mountGeneration', 'declaredRootHash'], 'mountBinding')
@@ -179,24 +158,6 @@ export function decodeHostedTaskMutationCommand(value: unknown): HostedTaskMutat
     }
     default: throw new Error('Invalid command.kind')
   }
-}
-
-function decodeProof(value: unknown): HostedControlProof {
-  return string(value, 'ownerProof', ID.hash)
-}
-
-export function decodeHostedTaskMutationRequest(value: unknown): HostedTaskMutationRequest {
-  const v = record(value, 'request'); exact(v, ['schemaVersion', 'exchangeId', 'operation', 'ownerBinding', 'authority', 'payload', 'ownerProof'], 'request')
-  if (v.schemaVersion !== 2 || v.operation !== 'task_mutate') throw new Error('Invalid request header')
-  const payload = record(v.payload, 'payload'); exact(payload, ['command', 'payloadFingerprint'], 'payload')
-  const command = decodeHostedTaskMutationCommand(payload.command); const payloadFingerprint = string(payload.payloadFingerprint, 'payloadFingerprint', ID.fingerprint)
-  if (fingerprintHostedTaskCommand(command) !== payloadFingerprint) throw new Error('Payload fingerprint mismatch')
-  const authority = decodeHostedControlAuthority(v.authority)
-  if (command.teamId !== authority.teamId) throw new Error('Command authority mismatch')
-  string(v.exchangeId, 'exchangeId', ID.exchange); decodeOwnerBinding(v.ownerBinding); decodeProof(v.ownerProof)
-  // Proofs cover JSON.stringify byte ordering, so validation must not rebuild or
-  // reorder the parsed envelope before proof verification.
-  return value as HostedTaskMutationRequest
 }
 
 function decodeReceipt(value: unknown, outcome: HostedTaskMutationReceipt['outcome']): HostedTaskMutationReceipt {
@@ -257,21 +218,6 @@ export function decodeHostedTaskMutationTerminalResult(value: unknown): HostedTa
       return { kind: 'unavailable', ...(hasRetry ? { retryAfterMs: integer(v.retryAfterMs, 'retryAfterMs', 1, 3_600_000) } : {}) }
     }
     default: throw new Error('Invalid mutation result kind')
-  }
-}
-
-export function decodeHostedTaskMutationResponse(value: unknown): HostedTaskMutationResponse {
-  const v = record(value, 'response')
-  exact(v, ['schemaVersion', 'exchangeId', 'operation', 'ownerBinding', 'authority', 'payload', 'ownerProof'], 'response')
-  if (v.schemaVersion !== HOSTED_CONTROL_SCHEMA_VERSION || v.operation !== HOSTED_CONTROL_OPERATION) throw new Error('Invalid response header')
-  return {
-    schemaVersion: HOSTED_CONTROL_SCHEMA_VERSION,
-    exchangeId: string(v.exchangeId, 'exchangeId', ID.exchange),
-    operation: HOSTED_CONTROL_OPERATION,
-    ownerBinding: decodeOwnerBinding(v.ownerBinding),
-    authority: decodeHostedControlAuthority(v.authority),
-    payload: decodeHostedTaskMutationTerminalResult(v.payload),
-    ownerProof: decodeProof(v.ownerProof),
   }
 }
 

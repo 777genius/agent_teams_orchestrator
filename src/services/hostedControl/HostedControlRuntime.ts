@@ -231,7 +231,6 @@ export class HostedControlRuntime {
         secret,
         ownerIdentity: hostedControlOwnerIdentityFromConfig(config),
         authority,
-        service: taskService,
         bootstrapBinding: descriptorAdmission?.bootstrapBinding,
         dispatchCoexistingOperation: (message, rawLine) => dispatcher.dispatch(message, rawLine),
         activationSessionFactory: ports.activationSessionFactory,

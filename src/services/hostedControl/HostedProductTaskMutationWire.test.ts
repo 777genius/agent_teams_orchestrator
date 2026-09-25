@@ -183,10 +183,51 @@ describe('Product task_mutate envelope', () => {
     expect(lines.join('')).not.toContain('99')
   })
 
-  test('leaves the legacy control envelope on its own route', () => {
-    const legacy = taskRequest(createCommand())
-    const { ownerEffectFence: _, ...authority } = legacy.authority
-    expect(isProductOwnerBoundEnvelope({ ...legacy, authority })).toBe(false)
+  test('routes no task or message frame that lacks the Product fence', async () => {
+    const { root, dispatcher } = await fixture({ denyOwnerLocalWrites: false })
+    for (const request of [taskRequest(createCommand()), productRequest('message_persist', { schemaVersion: 1 })]) {
+      const { ownerEffectFence: _, ...authority } = request.authority
+      expect(isProductOwnerBoundEnvelope({ ...request, authority })).toBe(false)
+      expect(await dispatcher.dispatch({ ...request, authority })).toBeNull()
+    }
+    expect(await readdir(join(root, 'tasks', 'legacy'))).toEqual([])
+  })
+
+  test('does not sign a committed task result substituted by the injected writer', async () => {
+    const command = createCommand()
+    const receipt = {
+      schemaVersion: 1 as const, outcome: 'committed' as const, commandId: command.commandId, teamId: command.teamId,
+      sourceGeneration: command.expectedSourceGeneration, revision: command.expectedRevision, affectedTaskIds: [],
+    }
+    const valid = {
+      kind: 'committed' as const, currentSourceGeneration: command.expectedSourceGeneration,
+      payloadFingerprint: fingerprintHostedTaskCommand(command), receipt,
+    }
+    const root = await mkdtemp(join(tmpdir(), 'hosted-product-task-substituted-')); roots.push(root)
+    await mkdir(join(root, 'teams', 'legacy'), { recursive: true })
+    await writeFile(join(root, 'teams', 'legacy', 'team.identity.json'), teamIdentityBytes)
+    let result: Record<string, unknown> = valid
+    const dispatcher = new HostedControlDispatcher({
+      secret,
+      authority: stableAuthority,
+      getOwnerBinding: () => ownerBinding,
+      lifecycle: { dispatch: async () => { throw new Error('unexpected lifecycle dispatch') } },
+      messages: { dispatch: async () => { throw new Error('unexpected message dispatch') } },
+      tasks: { mutateWithSelfWriteEffects: async () => ({ result: result as never, selfWriteEffects: [] }) },
+      verifyOwnerEffectFence: createHostedTeamIdentityFenceVerifier({ claudeRoot: root, legacyKey: 'legacy', teamId: stableAuthority.teamId }),
+    })
+    for (const substituted of [
+      { ...valid, payloadFingerprint: 'A'.repeat(43) },
+      { ...valid, receipt: { ...receipt, commandId: 'command_substituted' } },
+      { ...valid, receipt: { ...receipt, teamId: `team_${'f'.repeat(32)}` } },
+      { ...valid, currentSourceGeneration: 'generation_substituted', receipt: { ...receipt, sourceGeneration: 'generation_substituted' } },
+    ]) {
+      result = substituted
+      await expect(dispatcher.dispatch(taskRequest(command))).rejects.toThrow('does not match its request')
+    }
+    result = valid
+    const request = taskRequest(command)
+    expect(productVerifiedPayload(request, (await dispatcher.dispatch(request))!)).toMatchObject({ kind: 'committed', receipt })
   })
 })
 

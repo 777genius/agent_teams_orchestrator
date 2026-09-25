@@ -1,10 +1,11 @@
 import { describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
-import { createHostedLifecycleOwnerIdentityChecksum, HostedControlDispatcher } from './HostedControlDispatcher.js'
+import { HostedControlDispatcher } from './HostedControlDispatcher.js'
 import { HostedLifecycleCommandService } from './HostedLifecycleCommandService.js'
 import { HOSTED_LIFECYCLE_PROOF_DOMAIN, HOSTED_TEAM_MESSAGE_PROOF_DOMAIN } from './HostedControlServer.js'
-import { createHostedDomainProof, createHostedRawDomainProof } from './ownerProof.js'
+import { productOwnerBoundProof } from './HostedProductOwnerBoundEnvelope.js'
+import { createHostedRawDomainProof } from './ownerProof.js'
 import type { HostedControlOwnerBinding, HostedControlStableAuthority } from './protocol.js'
 
 const secret = Buffer.alloc(32, 3)
@@ -70,7 +71,6 @@ const lifecycleAuthorization = {
 
 describe('HostedControlDispatcher response decoding', () => {
   test('accepts the Product published canonical TeamIdentity checksum as the signed lifecycle fence', async () => {
-    expect(publishedIdentityChecksum).not.toBe(createHostedLifecycleOwnerIdentityChecksum(ownerBinding, authority))
     await expect(lifecycleDispatcher({
       payload: { schemaVersion: 1, kind: 'not_found' }, resourceRevision: null,
     }).dispatch(signedLifecycleRequest())).resolves.toMatchObject({
@@ -116,6 +116,7 @@ describe('HostedControlDispatcher response decoding', () => {
       authority,
       getOwnerBinding: () => ownerBinding,
       lifecycle: { dispatch: async () => ({ payload: { schemaVersion: 1, kind: 'not_found' }, resourceRevision: null }) },
+      verifyOwnerEffectFence: async () => 'current',
       messages: { dispatch: async () => ({
         schemaVersion: 2,
         kind: 'persisted',
@@ -136,6 +137,7 @@ describe('HostedControlDispatcher response decoding', () => {
       getOwnerBinding: () => ownerBinding,
       lifecycle: { dispatch: async () => ({ payload: { schemaVersion: 1, kind: 'not_found' }, resourceRevision: null }) },
       messages: { dispatch: async () => payload },
+      verifyOwnerEffectFence: async () => 'current',
     })
     const persisted = (extra: Record<string, unknown>) =>
       ({ schemaVersion: 2, kind: 'persisted', receipt: { ...receipt, ...extra } })
@@ -200,6 +202,7 @@ describe('HostedControlDispatcher response decoding', () => {
       getOwnerBinding: () => ownerBinding,
       lifecycle: { dispatch: async () => ({ payload: { schemaVersion: 1, kind: 'not_found' }, resourceRevision: null }) },
       messages: { dispatch: async () => ({ schemaVersion: 2, kind: 'unavailable', retryAfterMs: 60_001 }) },
+      verifyOwnerEffectFence: async () => 'current',
     })
     await expect(dispatcher.dispatch(signedMessageRequest())).resolves.toMatchObject({
       payload: { kind: 'unavailable', retryAfterMs: 60_001 },
@@ -563,14 +566,14 @@ function rawSigned(unsigned: Record<string, unknown>): Record<string, unknown> {
   return { ...unsigned, ownerProof: createHostedRawDomainProof(secret, HOSTED_LIFECYCLE_PROOF_DOMAIN, 'request', serialized) }
 }
 
+/** Product's fenced message envelope; the operation is part of the signed input. */
 function signedMessageRequest(recipient?: string): Record<string, unknown> {
-  const messageAuthority = { actorId: 'actor-a', ...authority }
   const unsigned = {
     schemaVersion: 2,
     exchangeId: `message-request_${'d'.repeat(32)}`,
     operation: 'message_persist',
     ownerBinding,
-    authority: messageAuthority,
+    authority: { actorId: 'actor-a', ...authority, ownerEffectFence: lifecycleAuthority.ownerEffectFence },
     payload: {
       schemaVersion: 1,
       teamId: authority.teamId,
@@ -579,5 +582,8 @@ function signedMessageRequest(recipient?: string): Record<string, unknown> {
       ...(recipient === undefined ? {} : { recipient }),
     },
   }
-  return { ...unsigned, ownerProof: createHostedDomainProof(secret, HOSTED_TEAM_MESSAGE_PROOF_DOMAIN, 'request', unsigned) }
+  return {
+    ...unsigned,
+    ownerProof: productOwnerBoundProof(secret, HOSTED_TEAM_MESSAGE_PROOF_DOMAIN, 'message_persist', 'request', unsigned),
+  }
 }

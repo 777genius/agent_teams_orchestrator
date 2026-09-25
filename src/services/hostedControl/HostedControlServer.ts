@@ -7,11 +7,9 @@ import { connect, createServer, type Server, type Socket } from 'node:net'
 import { basename, dirname, join } from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
 import {
-  createHostedControlProof,
   createHostedDomainProof,
   createHostedRawDomainProof,
   parseStrictHostedProofLastJsonFrame,
-  verifyHostedControlProof,
 } from './ownerProof.js'
 import type { HostedControlBootstrapBinding } from './HostedControlBootstrap.js'
 import { isProductOwnerBoundEnvelope } from './HostedProductOwnerBoundEnvelope.js'
@@ -24,16 +22,9 @@ import {
   type HostedApprovalActivationTransportSession,
 } from './HostedApprovalActivationSession.js'
 import {
-  decodeHostedTaskMutationRequest,
-  decodeHostedTaskMutationTerminalResult,
   HOSTED_CONTROL_OPERATION,
-  HOSTED_CONTROL_SCHEMA_VERSION,
-  type HostedControlAuthority,
   type HostedControlOwnerBinding,
   type HostedControlStableAuthority,
-  type HostedTaskMutationRequest,
-  type HostedTaskMutationResponse,
-  type HostedTaskMutationTerminalResult,
 } from './protocol.js'
 
 export const HOSTED_CONTROL_STANDARD_MAX_LINE_BYTES = 64 * 1024
@@ -44,10 +35,6 @@ export const HOSTED_LIFECYCLE_PROOF_DOMAIN = 'agent-teams.hosted-lifecycle.owner
 export const HOSTED_TEAM_MESSAGE_PROOF_DOMAIN = 'agent-teams.hosted-team-message.owner-proof/v1'
 export const HOSTED_READINESS_MAX_LINE_BYTES = 4 * 1024
 
-export type HostedTaskMutationPort = {
-  mutate(request: HostedTaskMutationRequest): Promise<HostedTaskMutationTerminalResult>
-}
-
 export type HostedApprovalActivationSessionFactory = (
   connection: HostedApprovalActivationConnection,
 ) => HostedApprovalActivationTransportSession
@@ -57,7 +44,6 @@ export type HostedControlServerOptions = {
   secret: Uint8Array
   ownerIdentity: Omit<HostedControlOwnerBinding, 'socketIdentity'>
   authority: HostedControlStableAuthority
-  service: HostedTaskMutationPort
   readDeadlineMs?: number
   /** Recovery has a separate absolute bound after the publication read completes. */
   activationRecoveryDeadlineMs?: number
@@ -590,78 +576,44 @@ export class HostedControlServer {
       return
     }
     if (message.operation === 'readiness') { await this.#handleReadiness(socket, line, message); return }
-    if (message.operation !== HOSTED_CONTROL_OPERATION || isProductOwnerBoundEnvelope(message)) {
-      const leaseSocket = this.#leaseSocket
-      const ownerBinding = this.#ownerBinding
-      const productEnvelope = isProductOwnerBoundEnvelope(message)
-      if (productEnvelope) {
-        reportHostedOwnerBoundStage(message.operation, 'received', { writable: socket.writable, peerEnded: socket.readableEnded })
-      }
-      if (!leaseSocket || leaseSocket.destroyed || !(await this.#hasCurrentSocketIdentity()) ||
-        !ownerBinding || !this.#options.dispatchCoexistingOperation) {
-        if (productEnvelope) reportHostedOwnerBoundStage(message.operation, 'rejected', { reason: 'owner-lease-unavailable' })
-        socket.destroy()
-        return
-      }
-      const response = await this.#mutationLease.run(
-        leaseSocket,
-        () => this.#options.dispatchCoexistingOperation!(message, line),
-      )
-      if (!response || this.#leaseSocket !== leaseSocket || leaseSocket.destroyed ||
-        !(await this.#hasCurrentSocketIdentity()) || !isDeepStrictEqual(ownerBinding, this.#ownerBinding)) {
-        if (productEnvelope) {
-          reportHostedOwnerBoundStage(message.operation, 'rejected', { reason: response ? 'owner-lease-lost' : 'no-response' })
-        }
-        socket.destroy()
-        return
-      }
-      if (productEnvelope) {
-        const writable = socket.writable; const peerEnded = socket.readableEnded
-        const bytes = writeBoundedResponse(socket, response)
-        reportHostedOwnerBoundStage(message.operation, 'replied', { bytes, writable, peerEnded })
-      } else {
-        writeBoundedResponse(socket, response)
-      }
+    // Tasks are admitted only in Product's fenced envelope; the older task frame closes unread.
+    if (message.operation === HOSTED_CONTROL_OPERATION && !isProductOwnerBoundEnvelope(message)) {
+      socket.destroy()
       return
     }
     const leaseSocket = this.#leaseSocket
-    if (!leaseSocket || leaseSocket.destroyed || !(await this.#hasCurrentSocketIdentity())) { socket.destroy(); return }
-    const request = decodeHostedTaskMutationRequest(message)
     const ownerBinding = this.#ownerBinding
-    const [socketStat, parentStat] = await Promise.all([lstat(this.#options.socketPath).catch(() => null), lstat(dirname(this.#options.socketPath)).catch(() => null)])
-    const parentIdentity = this.#socketParentIdentity
-    if (!ownerBinding || !socketStat?.isSocket() ||
-      (socketStat.mode & 0o077) !== 0 || (process.getuid?.() !== undefined && socketStat.uid !== process.getuid?.()) ||
-      !parentIdentity || !parentStat?.isDirectory() || parentStat.isSymbolicLink() || parentIdentity.device !== parentStat.dev || parentIdentity.inode !== parentStat.ino ||
-      ownerBinding.socketIdentity.device !== String(socketStat.dev) || ownerBinding.socketIdentity.inode !== String(socketStat.ino) ||
-      JSON.stringify(request.ownerBinding) !== JSON.stringify(ownerBinding) ||
-      !sameStableAuthority(request.authority, this.#options.authority)) {
+    const productEnvelope = isProductOwnerBoundEnvelope(message)
+    if (productEnvelope) {
+      reportHostedOwnerBoundStage(message.operation, 'received', { writable: socket.writable, peerEnded: socket.readableEnded })
+    }
+    if (!leaseSocket || leaseSocket.destroyed || !(await this.#hasCurrentSocketIdentity()) ||
+      !ownerBinding || !this.#options.dispatchCoexistingOperation) {
+      if (productEnvelope) reportHostedOwnerBoundStage(message.operation, 'rejected', { reason: 'owner-lease-unavailable' })
       socket.destroy()
       return
     }
-    if (!verifyHostedControlProof(this.#options.secret, 'request', request)) {
+    // Owner writes that call hasActiveLease inherit this exact lease through async WAL
+    // publication guards, so a replacement readiness lease never validates this request.
+    const response = await this.#mutationLease.run(
+      leaseSocket,
+      () => this.#options.dispatchCoexistingOperation!(message, line),
+    )
+    if (!response || this.#leaseSocket !== leaseSocket || leaseSocket.destroyed ||
+      !(await this.#hasCurrentSocketIdentity()) || !isDeepStrictEqual(ownerBinding, this.#ownerBinding)) {
+      if (productEnvelope) {
+        reportHostedOwnerBoundStage(message.operation, 'rejected', { reason: response ? 'owner-lease-lost' : 'no-response' })
+      }
       socket.destroy()
       return
     }
-    // validateOwner callbacks that call hasActiveLease inherit this exact lease
-    // through async WAL publication guards. A replacement readiness lease can
-    // never validate an in-flight mutation from the connection it replaced.
-    const result = decodeHostedTaskMutationTerminalResult(await this.#mutationLease.run(leaseSocket, () => this.#options.service.mutate(request)))
-    if (!taskResultMatchesRequest(request, result)) { socket.destroy(); return }
-    if (this.#leaseSocket !== leaseSocket || leaseSocket.destroyed || !(await this.#hasCurrentSocketIdentity()) || JSON.stringify(request.ownerBinding) !== JSON.stringify(this.#ownerBinding)) { socket.destroy(); return }
-    const unsigned = {
-      schemaVersion: HOSTED_CONTROL_SCHEMA_VERSION,
-      exchangeId: request.exchangeId,
-      operation: HOSTED_CONTROL_OPERATION,
-      ownerBinding,
-      authority: request.authority,
-      payload: result,
+    if (productEnvelope) {
+      const writable = socket.writable; const peerEnded = socket.readableEnded
+      const bytes = writeBoundedResponse(socket, response)
+      reportHostedOwnerBoundStage(message.operation, 'replied', { bytes, writable, peerEnded })
+    } else {
+      writeBoundedResponse(socket, response)
     }
-    const response: HostedTaskMutationResponse = {
-      ...unsigned,
-      ownerProof: createHostedControlProof(this.#options.secret, 'response', unsigned),
-    }
-    socket.end(`${JSON.stringify(response)}\n`)
   }
 
   async #handleReadiness(socket: Socket, line: string, message: Record<string, unknown>): Promise<void> {
@@ -895,19 +847,6 @@ function validBootstrapBinding(
     value.proofKeyId === proofKeyId
 }
 
-function taskResultMatchesRequest(
-  request: HostedTaskMutationRequest,
-  result: HostedTaskMutationTerminalResult,
-): boolean {
-  if (result.kind !== 'committed' && result.kind !== 'idempotent_replay') return true
-  const command = request.payload.command
-  return result.payloadFingerprint === request.payload.payloadFingerprint &&
-    result.currentSourceGeneration === command.expectedSourceGeneration &&
-    result.receipt.commandId === command.commandId &&
-    result.receipt.teamId === command.teamId &&
-    result.receipt.sourceGeneration === command.expectedSourceGeneration
-}
-
 function writeBoundedResponse(socket: Socket, value: Record<string, unknown>): number {
   const line = `${JSON.stringify(value)}\n`
   const maximum = isApprovalOperation(value.operation)
@@ -918,15 +857,6 @@ function writeBoundedResponse(socket: Socket, value: Record<string, unknown>): n
   }
   socket.end(line)
   return Buffer.byteLength(line)
-}
-
-function sameStableAuthority(
-  actual: HostedControlAuthority,
-  expected: HostedControlStableAuthority,
-): boolean {
-  const { actorId: _, ...stable } = actual
-  const { actorId: _ignored, ...stableExpected } = expected as HostedControlAuthority
-  return isDeepStrictEqual(stable, stableExpected)
 }
 
 type PublicationProbe = {

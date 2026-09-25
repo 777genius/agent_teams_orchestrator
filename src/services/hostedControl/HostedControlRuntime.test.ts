@@ -3,14 +3,13 @@ import { createHash, createHmac } from 'node:crypto'
 import { chmod, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
 import { connect, type Socket } from 'node:net'
 import { join } from 'node:path'
-import { createHostedControlProof, createHostedDomainProof, createHostedRawDomainProof } from './ownerProof.js'
+import { createHostedDomainProof, createHostedRawDomainProof } from './ownerProof.js'
 import {
   fingerprintHostedTaskCommand,
   type HostedControlOwnerBinding,
   type HostedTaskMutationCommand,
 } from './protocol.js'
 import { HostedControlRuntime, type HostedControlRuntimePortFactoryContext } from './HostedControlRuntime.js'
-import { createHostedLifecycleOwnerIdentityChecksum } from './HostedControlDispatcher.js'
 import type { HostedControlBootstrapAdmission } from './HostedControlBootstrap.js'
 import type { HostedApprovalActivationConnection } from './HostedApprovalActivationSession.js'
 import { HostedApprovalActivatablePort } from './HostedApprovalActivatablePort.js'
@@ -414,10 +413,7 @@ describe('HostedControlRuntime', () => {
       bootId: 'wrong-boot',
     })).toBe(false)
 
-    const ownerEffectFence = {
-      grantRevision: '1'.repeat(64),
-      identityChecksum: createHostedLifecycleOwnerIdentityChecksum(ownerBinding, portContext.authority),
-    }
+    const ownerEffectFence = { grantRevision: '1'.repeat(64), identityChecksum }
     const lifecyclePayload = {
       request: { schemaVersion: 1, workspaceId: 'workspace_test', teamId },
       context: {
@@ -483,21 +479,26 @@ describe('HostedControlRuntime', () => {
         text: 'hello',
       },
     }
-    const messageLine = await exchange(socketPath, signedDomainLine(
+    // Product's envelope (fenced authority, operation-bound proof) is the only task and message wire.
+    const productLine = (unsigned: Record<string, unknown>) => `${JSON.stringify({
+      ...unsigned,
+      ownerProof: createHmac('sha256', secret).update(`${HOSTED_TEAM_MESSAGE_PROOF_DOMAIN}\u0000${String(unsigned.operation)}\u0000request\u0000${JSON.stringify(unsigned)}`).digest('hex'),
+    })}\n`
+    const productFence = { grantRevision: '2'.repeat(64), identityChecksum }
+    // A validly signed message without the Product fence closes without reaching the port.
+    expect(await exchange(socketPath, signedDomainLine(
       secret,
       HOSTED_TEAM_MESSAGE_PROOF_DOMAIN,
       messageUnsigned,
-    ))
+    ))).toBe('')
+    expect(messageCalls).toBe(0)
+    const productMessageUnsigned = { ...messageUnsigned, authority: { ...messageAuthority, ownerEffectFence: productFence } }
+    const messageLine = await exchangeProductFrame(socketPath, productLine(productMessageUnsigned))
     expect(JSON.parse(messageLine).payload.kind).toBe('persisted')
+    const signedMessage = JSON.parse(productLine(productMessageUnsigned)) as Record<string, unknown>
     expect(await exchange(socketPath, `${JSON.stringify({
-      ...messageUnsigned,
-      payload: { ...messageUnsigned.payload, text: 'tampered' },
-      ownerProof: createHostedDomainProof(
-        secret,
-        HOSTED_TEAM_MESSAGE_PROOF_DOMAIN,
-        'request',
-        messageUnsigned,
-      ),
+      ...signedMessage,
+      payload: { ...productMessageUnsigned.payload, text: 'tampered' },
     })}\n`)).toBe('')
     expect(messageCalls).toBe(1)
 
@@ -524,18 +525,10 @@ describe('HostedControlRuntime', () => {
       authority: { ...messageAuthority, actorId: 'actor_task' },
       payload: { command, payloadFingerprint: fingerprintHostedTaskCommand(command) },
     }
-    const taskLine = await exchange(socketPath, `${JSON.stringify({
-      ...taskUnsigned,
-      ownerProof: createHostedControlProof(secret, 'request', taskUnsigned),
-    })}\n`)
-    expect(JSON.parse(taskLine).payload.kind).toBe('unavailable')
-    // Product's envelope (fenced authority, operation-bound proof) reaches the task writer through
-    // the coexisting dispatcher; a config-file owner is not personal-host, so it stays read-only.
-    const productLine = (unsigned: Record<string, unknown>) => `${JSON.stringify({
-      ...unsigned,
-      ownerProof: createHmac('sha256', secret).update(`${HOSTED_TEAM_MESSAGE_PROOF_DOMAIN}\u0000${String(unsigned.operation)}\u0000request\u0000${JSON.stringify(unsigned)}`).digest('hex'),
-    })}\n`
-    const fencedAuthority = { ...taskUnsigned.authority, ownerEffectFence: { grantRevision: '2'.repeat(64), identityChecksum } }
+    // The retired task frame closes unread even when its old proof is valid.
+    expect(await exchange(socketPath, legacyTaskLine(secret, taskUnsigned))).toBe('')
+    // A config-file owner is not personal-host, so the Owner writer stays read-only.
+    const fencedAuthority = { ...taskUnsigned.authority, ownerEffectFence: productFence }
     const productTaskUnsigned = { ...taskUnsigned, exchangeId: `task-request_${'a'.repeat(32)}`, authority: fencedAuthority }
     const productTaskLine = await exchangeProductFrame(socketPath, productLine(productTaskUnsigned))
     expect(productTaskLine.endsWith('\n')).toBe(true)
@@ -546,9 +539,8 @@ describe('HostedControlRuntime', () => {
       authority: { ...fencedAuthority, ownerEffectFence: { grantRevision: '2'.repeat(64), identityChecksum: '3'.repeat(64) } },
     }))).toBe('')
     const productMessageLine = await exchangeProductFrame(socketPath, productLine({
-      ...messageUnsigned,
+      ...productMessageUnsigned,
       exchangeId: `message-request_${'a'.repeat(32)}`,
-      authority: { ...messageAuthority, ownerEffectFence: fencedAuthority.ownerEffectFence },
     }))
     expect(JSON.parse(productMessageLine).payload.kind).toBe('persisted')
     expect(lifecycleCalls).toBe(1)
@@ -565,15 +557,14 @@ describe('HostedControlRuntime', () => {
       HOSTED_LIFECYCLE_PROOF_DOMAIN,
       lifecycleUnsigned,
     ))).toBe('')
-    expect(await exchange(socketPath, signedDomainLine(
-      secret,
-      HOSTED_TEAM_MESSAGE_PROOF_DOMAIN,
-      messageUnsigned,
-    ))).toBe('')
-    expect(await exchange(socketPath, `${JSON.stringify({
-      ...taskUnsigned,
-      ownerProof: createHostedControlProof(secret, 'request', taskUnsigned),
-    })}\n`)).toBe('')
+    expect(await exchange(socketPath, productLine({
+      ...productMessageUnsigned,
+      exchangeId: `message-request_${'b'.repeat(32)}`,
+    }))).toBe('')
+    expect(await exchange(socketPath, productLine({
+      ...productTaskUnsigned,
+      exchangeId: `task-request_${'b'.repeat(32)}`,
+    }))).toBe('')
     expect(lifecycleCalls).toBe(1)
     expect(messageCalls).toBe(2)
 
@@ -630,6 +621,14 @@ function runtimeApprovalDelegate(): HostedApprovalWirePort {
     deliverDecision: async () => ({ status: 'unavailable' }),
     reconcileDecision: async () => ({ status: 'unavailable' }),
   }
+}
+
+/** The retired task-board frame, signed as its last client did. */
+function legacyTaskLine(secret: Uint8Array, unsigned: Record<string, unknown>): string {
+  const proof = createHmac('sha256', secret)
+    .update(`agent-teams.hosted-task-board.owner-proof/v1\0request\0${JSON.stringify(unsigned)}`)
+    .digest('hex')
+  return `${JSON.stringify({ ...unsigned, ownerProof: proof })}\n`
 }
 
 function signedRawDomainLine(

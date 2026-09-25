@@ -1,11 +1,7 @@
-import { createHmac, timingSafeEqual } from 'node:crypto'
+import { createHmac } from 'node:crypto'
 import { constants, type FileHandle, lstat, open, realpath } from 'node:fs/promises'
 import { join, relative } from 'node:path'
-import {
-  OWNER_PROOF_DOMAIN,
-  type HostedControlOwnerBinding,
-  type HostedControlProof,
-} from './protocol.js'
+import type { HostedControlOwnerBinding } from './protocol.js'
 
 const O_NOFOLLOW = constants.O_NOFOLLOW ?? 0
 
@@ -102,9 +98,6 @@ export async function readHostedControlSecret(path: string): Promise<Buffer> {
   }
 }
 
-function proofInput(direction: 'request' | 'response', envelope: object): string {
-  return domainProofInput(OWNER_PROOF_DOMAIN, direction, envelope)
-}
 function domainProofInput(domain: string, direction: string, envelope: object): string {
   const unsigned = { ...(envelope as Record<string, unknown>) }
   delete unsigned.ownerProof
@@ -235,23 +228,4 @@ export function assertNoDuplicateJsonObjectKeys(source: string): void {
   }
   value(); whitespace()
   if (cursor !== source.length) fail()
-}
-
-export function createHostedControlProof(
-  secret: Uint8Array,
-  direction: 'request' | 'response',
-  envelope: object,
-): HostedControlProof {
-  return createHmac('sha256', secret).update(proofInput(direction, envelope)).digest('hex')
-}
-
-export function verifyHostedControlProof(
-  secret: Uint8Array,
-  direction: 'request' | 'response',
-  envelope: { ownerProof: HostedControlProof },
-): boolean {
-  const expected = createHostedControlProof(secret, direction, envelope)
-  const actual = envelope.ownerProof
-  if (actual.length !== expected.length) return false
-  return timingSafeEqual(Buffer.from(actual, 'hex'), Buffer.from(expected, 'hex'))
 }

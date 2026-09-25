@@ -1,7 +1,6 @@
 import { createHash, timingSafeEqual } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
 import {
-  createHostedDomainProof,
   createHostedRawDomainProof,
   parseStrictHostedSignedJsonFrame,
 } from './ownerProof.js'
@@ -117,11 +116,9 @@ export class HostedControlDispatcher {
     if (isLifecycleOperation(message.operation)) {
       return this.#dispatchLifecycle(message, rawLine ?? JSON.stringify(message))
     }
+    // Task and message frames exist only in Product's fenced envelope; anything else closes.
     if (isProductOwnerBoundEnvelope(message)) {
       return this.#dispatchProductOwnerBound(message)
-    }
-    if (isMessageOperation(message.operation)) {
-      return this.#dispatchMessage(message)
     }
     return null
   }
@@ -255,82 +252,6 @@ export class HostedControlDispatcher {
         'response', JSON.stringify(envelope)),
     }
   }
-
-  async #dispatchMessage(message: Record<string, unknown>): Promise<Record<string, unknown>> {
-    exactKeys(message, [
-      'schemaVersion',
-      'exchangeId',
-      'operation',
-      'ownerBinding',
-      'authority',
-      'payload',
-      'ownerProof',
-    ], 'message request')
-    if (message.schemaVersion !== 2 ||
-      typeof message.exchangeId !== 'string' ||
-      !/^message-request_[0-9a-f]{32}$/.test(message.exchangeId)) {
-      throw new Error('Invalid hosted message request')
-    }
-    const operation = message.operation
-    if (!isMessageOperation(operation)) throw new Error('Invalid hosted message operation')
-    const ownerBinding = record(message.ownerBinding, 'message owner binding')
-    const activeOwner = this.options.getOwnerBinding()
-    if (!activeOwner || !isDeepStrictEqual(ownerBinding, activeOwner)) {
-      throw new Error('Invalid hosted message owner binding')
-    }
-    const authority = decodeMessageAuthority(message.authority)
-    if (!sameStableAuthority(authority, this.options.authority)) {
-      throw new Error('Invalid hosted message authority')
-    }
-    const payload = record(message.payload, 'message payload')
-    const unsigned = {
-      schemaVersion: 2,
-      exchangeId: message.exchangeId,
-      operation,
-      ownerBinding: activeOwner,
-      authority,
-      payload,
-    }
-    verifyDomainProof(this.options.secret, HOSTED_TEAM_MESSAGE_PROOF_DOMAIN, 'request', message.ownerProof, unsigned)
-    const responsePayload = decodeMessageResponsePayload(operation, record(
-      await this.options.messages.dispatch({ operation, payload, authority }),
-      'message response payload',
-    ), payload, authority)
-    const envelope = { ...unsigned, payload: responsePayload }
-    return {
-      ...envelope,
-      ownerProof: createHostedDomainProof(
-        this.options.secret,
-        HOSTED_TEAM_MESSAGE_PROOF_DOMAIN,
-        'response',
-        envelope,
-      ),
-    }
-  }
-}
-
-export function createHostedLifecycleOwnerIdentityChecksum(
-  ownerBinding: HostedControlOwnerBinding,
-  authority: HostedControlStableAuthority,
-): string {
-  return createHash('sha256').update(JSON.stringify([
-    'agent-teams.hosted-lifecycle-owner-effect-identity/v1',
-    ownerBinding.ownerAuthority,
-    ownerBinding.ownerGeneration,
-    ownerBinding.ownerSessionId,
-    ownerBinding.socketIdentity.device,
-    ownerBinding.socketIdentity.inode,
-    ownerBinding.socketIdentity.uid,
-    ownerBinding.socketIdentity.gid,
-    ownerBinding.socketIdentity.mode,
-    authority.deploymentId,
-    authority.bootId,
-    authority.restoreGeneration,
-    authority.workspaceId,
-    authority.mountBinding.mountGeneration,
-    authority.mountBinding.declaredRootHash,
-    authority.teamId,
-  ])).digest('hex')
 }
 
 function decodeLifecyclePayload(
@@ -408,15 +329,6 @@ function decodeLifecyclePayload(
     decodeDurableCommand(payload.durableCommand, payload.command, expectedOwnerEffectFence, expected, authority.actorId, reservation?.runId)
   }
   return { ...payload, ...(reservation ? { runReservation: reservation } : {}), authority }
-}
-
-function sameStableAuthority(
-  actual: HostedControlAuthority,
-  expected: HostedControlStableAuthority,
-): boolean {
-  const { actorId: _, ...stable } = actual
-  const { actorId: _ignored, ...stableExpected } = expected as HostedControlAuthority
-  return isDeepStrictEqual(stable, stableExpected)
 }
 
 function decodeLifecycleAuthority(value: unknown): HostedLifecycleAuthority {
@@ -536,33 +448,6 @@ function decodeLifecycleRequestProvenance(
 
 function reverseLifecycleProvenance(value: LifecycleWireProvenance): LifecycleWireProvenance {
   return { from: value.to, to: value.from, target: value.target }
-}
-
-function decodeMessageAuthority(value: unknown): HostedControlAuthority {
-  const authority = record(value, 'message authority')
-  exactKeys(authority, [
-    'actorId',
-    'deploymentId',
-    'bootId',
-    'restoreGeneration',
-    'workspaceId',
-    'mountBinding',
-    'teamId',
-  ], 'message authority')
-  const mountBinding = record(authority.mountBinding, 'message mount binding')
-  exactKeys(mountBinding, ['mountGeneration', 'declaredRootHash'], 'message mount binding')
-  return {
-    actorId: nonEmptyString(authority.actorId, 'message authority.actorId'),
-    deploymentId: nonEmptyString(authority.deploymentId, 'message authority.deploymentId'),
-    bootId: nonEmptyString(authority.bootId, 'message authority.bootId'),
-    restoreGeneration: nonNegativeInteger(authority.restoreGeneration, 'message authority.restoreGeneration'),
-    workspaceId: nonEmptyString(authority.workspaceId, 'message authority.workspaceId'),
-    mountBinding: {
-      mountGeneration: nonNegativeInteger(mountBinding.mountGeneration, 'message mount generation'),
-      declaredRootHash: patternString(mountBinding.declaredRootHash, /^[0-9a-f]{64}$/, 'message declared root hash'),
-    },
-    teamId: patternString(authority.teamId, /^team_[0-9a-f]{32}$/, 'message team id'),
-  }
 }
 
 function decodeLifecycleResponsePayload(
@@ -899,20 +784,6 @@ function messageRetryAfter(value: unknown): void {
   }
 }
 
-function verifyDomainProof(
-  secret: Uint8Array,
-  domain: string,
-  direction: string,
-  proof: unknown,
-  envelope: object,
-): void {
-  const expected = createHostedDomainProof(secret, domain, direction, envelope)
-  if (typeof proof !== 'string' || !/^[0-9a-f]{64}$/.test(proof) ||
-    !timingSafeEqual(Buffer.from(expected, 'hex'), Buffer.from(proof, 'hex'))) {
-    throw new Error('Invalid hosted control proof')
-  }
-}
-
 function verifyRawDomainProof(
   secret: Uint8Array,
   domain: string,
@@ -933,9 +804,6 @@ function isLifecycleOperation(value: unknown): value is HostedLifecycleOperation
 function isLifecycleQueryOperation(operation: HostedLifecycleOperation): boolean {
   return operation === 'control_state' || operation === 'admit_launch_plan' || operation === 'prepare' || operation === 'get_status' ||
     operation === 'prepare_provisioning' || operation === 'get_provisioning_status'
-}
-function isMessageOperation(value: unknown): value is HostedTeamMessageOperation {
-  return MESSAGE_OPERATIONS.includes(value as HostedTeamMessageOperation)
 }
 function record(value: unknown, field: string): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`Invalid ${field}`)
