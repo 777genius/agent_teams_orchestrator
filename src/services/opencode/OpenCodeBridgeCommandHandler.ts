@@ -2827,6 +2827,10 @@ async function runReadiness(
   }
   if (qualifiedSelectedModel) {
     let retained: Awaited<ReturnType<typeof openCodeProvisioningProbe.probeRetainingHost>> | null = null
+    // Only the final success return below can set launchAllowed true; every
+    // earlier return in this try forces it false, so this is the sole path
+    // that keeps the verified persistent host alive for the next launch.
+    let keepVerifiedHost = false
     try {
       retained = await runtimeDeadline.runPhase('host_start', context =>
         openCodeProvisioningProbe.probeRetainingHost(projectPath, {
@@ -2967,20 +2971,24 @@ async function runReadiness(
             return undefined
           })
         : undefined
-      return {
+      const data = readinessData(
         snapshot,
-        data: readinessData(
-          snapshot,
-          qualifiedSelectedModel.raw,
-          executionOutcome,
-          toolProof,
-          true,
-          executionProof,
-          executionProof?.expectedBehaviorEvidence ?? initialEvidence,
-        ),
-      }
+        qualifiedSelectedModel.raw,
+        executionOutcome,
+        toolProof,
+        true,
+        executionProof,
+        executionProof?.expectedBehaviorEvidence ?? initialEvidence,
+      )
+      keepVerifiedHost = data.launchAllowed === true
+      return { snapshot, data }
     } finally {
-      await retained?.release().catch(() => undefined)
+      await retained?.release(keepVerifiedHost).catch(error => {
+        console.warn(
+          '[opencode-readiness] retained host release failed',
+          error instanceof Error ? error.message : String(error),
+        )
+      })
     }
   }
   let earlyCursorExecutionOutcome: Awaited<ReturnType<
