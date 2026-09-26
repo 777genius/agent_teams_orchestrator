@@ -149,7 +149,7 @@ export class OpenCodeTeamLifecycleLane implements TeamLifecycleLaneEffectPort {
     return this.#serialized(input, async () => {
       // Strict launch only accepts the behavior fingerprint that a selected
       // execution-proof readiness attested for this project, model and host.
-      const expectedBehaviorFingerprint = await this.#attestLaunchBehavior(input.workspaceRoot, lane.selectedModel)
+      const attested = await this.#attestLaunchBehavior(input.workspaceRoot, lane.selectedModel)
       const response = await this.#executeCommand('opencode.launchTeam', input.workspaceRoot, {
         runId: input.runId,
         laneId: lane.laneId,
@@ -165,12 +165,15 @@ export class OpenCodeTeamLifecycleLane implements TeamLifecycleLaneEffectPort {
           ...(member.model ? { model: member.model } : {}),
           ...(member.effort ? { effort: member.effort } : {}),
         })),
+        // Like desktop, the readiness execution proof lets the bridge validate
+        // the same host and model instead of running a second live model probe.
+        ...(attested.executionProof ? { executionProof: attested.executionProof } : {}),
         preconditions: {
           handshakeIdentityHash: LIFECYCLE_OWNER_HANDSHAKE_IDENTITY,
           laneId: lane.laneId,
           expectedRunId: input.runId,
           expectedCapabilitySnapshotId: null,
-          expectedBehaviorFingerprint,
+          expectedBehaviorFingerprint: attested.fingerprint,
           expectedManifestHighWatermark: null,
           // Caller-owned host lease for this single launch attempt.
           commandLeaseId: `hosted-launch-lease_${randomUUID()}`,
@@ -191,7 +194,10 @@ export class OpenCodeTeamLifecycleLane implements TeamLifecycleLaneEffectPort {
     })
   }
 
-  async #attestLaunchBehavior(workspaceRoot: string, selectedModel: string): Promise<string> {
+  async #attestLaunchBehavior(
+    workspaceRoot: string,
+    selectedModel: string,
+  ): Promise<{ fingerprint: string; executionProof: Record<string, unknown> | null }> {
     const readiness = await this.#execute('opencode.readiness', workspaceRoot, {
       projectPath: workspaceRoot,
       selectedModel,
@@ -208,7 +214,12 @@ export class OpenCodeTeamLifecycleLane implements TeamLifecycleLaneEffectPort {
     if (typeof fingerprint !== 'string' || !/^[a-f0-9]{64}$/.test(fingerprint)) {
       throw new Error('OpenCode readiness did not attest an expected behavior fingerprint')
     }
-    return fingerprint
+    const proof = readiness.executionProof
+    // The bridge validates the proof itself; a missing or foreign one only costs a fresh probe.
+    const executionProof = proof && typeof proof === 'object' && !Array.isArray(proof)
+      ? proof as Record<string, unknown>
+      : null
+    return { fingerprint, executionProof }
   }
 
   cancel(input: {

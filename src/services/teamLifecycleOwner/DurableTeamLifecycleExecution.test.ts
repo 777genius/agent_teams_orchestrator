@@ -878,6 +878,8 @@ describe('OpenCodeTeamLifecycleLane', () => {
       idempotencyKey: 'hosted-launch:draft-team:opencode-lane:run_strict',
     })
     expect(typeof first!.handshakeIdentityHash).toBe('string')
+    // Without an execution proof from readiness the bridge probes the model again itself.
+    expect(calls[1]!.body).not.toHaveProperty('executionProof')
     // The idempotency key is stable per run; each attempt owns a fresh host lease.
     expect(second!.idempotencyKey).toBe(first!.idempotencyKey)
     expect(second!.commandLeaseId).not.toBe(first!.commandLeaseId)
@@ -894,6 +896,29 @@ describe('OpenCodeTeamLifecycleLane', () => {
     readiness = { ...readyReadiness, expectedBehaviorEvidence: {} }
     await expect(lane.launch(input)).rejects.toThrow('did not attest an expected behavior fingerprint')
     expect(calls.map(call => call.command)).toEqual(['opencode.readiness', 'opencode.readiness'])
+  })
+
+  test('hands the readiness execution proof to launch so the model is probed once, like desktop', async () => {
+    const calls: Array<{ command: string; body: Record<string, unknown> }> = []
+    const executionProof = { schemaVersion: 1, selectedModel: 'provider/model', verifiedAt: '2026-09-26T08:00:00.000Z' }
+    const execute = (async (input: unknown) => {
+      const request = input as { command: string; body: Record<string, unknown> }
+      calls.push(request)
+      return {
+        ok: true,
+        runtime: { capabilitySnapshotId: `opencode:${'e'.repeat(32)}` },
+        data: request.command === 'opencode.readiness'
+          ? { ...readyReadiness, executionProof }
+          : { teamLaunchState: 'ready' },
+      }
+    }) as never
+    const lane = new OpenCodeTeamLifecycleLane(execute, 10_000, () => true, async () => null)
+    await lane.launch({
+      planTeamId: 'draft-team', workspaceRoot: plan.workspaceRoot, toolApprovalMode: plan.toolApprovalMode,
+      lane: plan.lanes[0]!, runId: 'run_proof',
+    })
+    expect(calls.map(call => call.command)).toEqual(['opencode.readiness', 'opencode.launchTeam'])
+    expect(calls[1]!.body.executionProof).toEqual(executionProof)
   })
 
   test('maps admitted launch data and requires positive bridge confirmations', async () => {
