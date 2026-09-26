@@ -47,7 +47,9 @@ type LaneInput = {
 type EffectGuard = NonNullable<TeamLifecycleOwnerEffectInput['effectGuard']>
 /** `start` gates beginning a lane effect; `authority` must still hold when it returns. */
 type EffectGuards = Readonly<{ start: EffectGuard; authority: EffectGuard }>
+/** First lead-lane poll delay; it doubles up to the cap so a slow bootstrap costs few inspections. */
 const LEAD_LANE_READY_POLL_MS = 500
+const LEAD_LANE_READY_MAX_POLL_MS = 5_000
 /** Above the longest native bootstrap budget (900 s) plus its lane deadline grace. */
 const LEAD_LANE_READY_TIMEOUT_MS = 20 * 60_000
 const EFFECT_ALLOWED: EffectGuard = () => true
@@ -427,9 +429,11 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
   ): Promise<TeamLifecycleLaneObservation> {
     let observation = launched
     const deadline = Date.now() + LEAD_LANE_READY_TIMEOUT_MS
+    let pollMs = LEAD_LANE_READY_POLL_MS
     while (observation.phase === 'launching') {
       if (Date.now() >= deadline) return { phase: 'failed', recoverable: true }
-      await new Promise(resolve => setTimeout(resolve, LEAD_LANE_READY_POLL_MS))
+      await new Promise(resolve => setTimeout(resolve, pollMs))
+      pollMs = Math.min(pollMs * 2, LEAD_LANE_READY_MAX_POLL_MS)
       if (!(await this.#launchStillOwned(plan, runId))) return observation
       observation = await this.#adapter(lane.kind).inspect({
         planTeamId: plan.teamId,

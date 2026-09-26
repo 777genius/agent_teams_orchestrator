@@ -795,7 +795,7 @@ describe('DurableTeamLifecycleExecution lead-first launch', () => {
     const log: string[] = []
     const { execution, launching } = await launched(log)
     expect(launching.phase).toBe('launching')
-    for (let attempt = 0; attempt < 100 && (await execution.inspect(mixedPlan)).phase !== 'running'; attempt += 1) {
+    for (let attempt = 0; attempt < 200 && (await execution.inspect(mixedPlan)).phase !== 'running'; attempt += 1) {
       await Bun.sleep(50)
     }
     await execution.close()
@@ -805,7 +805,30 @@ describe('DurableTeamLifecycleExecution lead-first launch', () => {
       'opencode.launch',
     ])
     await expect(execution.inspect(mixedPlan)).resolves.toMatchObject({ phase: 'running', runId: launching.runId })
-  }, 10_000)
+  }, 20_000)
+
+  test('a single-lane plan launches at once and never polls its lane from the launch job', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'team-owner-single-lane-'))
+    roots.push(root)
+    const lane = new FakeLane()
+    lane.launchResult = { phase: 'launching', recoverable: false }
+    let inspections = 0
+    const inspect = lane.inspect.bind(lane)
+    lane.inspect = async input => { inspections += 1; return inspect(input) }
+    const singleLead: TeamLifecycleLaunchPlan = { ...plan, lanes: [{ ...plan.lanes[0]!,
+      members: [{ name: 'team-lead', prompt: 'Lead.' }, { name: 'worker', prompt: 'Work.' }] }] }
+    const execution = new DurableTeamLifecycleExecution(join(root, 'state.json'), [lane])
+    const idle = await execution.inspect(singleLead)
+    inspections = 0
+    const startedAt = Date.now()
+    await execution.launch({ plan: singleLead, commandId: 'command-launch', runId: null,
+      expectedProviderGeneration: idle.providerGeneration })
+    // close() drains the launch job: it must settle without waiting on or inspecting the lane.
+    await execution.close()
+    expect(lane.launched).toHaveLength(1)
+    expect(inspections).toBe(0)
+    expect(Date.now() - startedAt).toBeLessThan(400)
+  })
 
   test('a cancel while the lead bootstraps never starts the side lanes', async () => {
     const log: string[] = []
