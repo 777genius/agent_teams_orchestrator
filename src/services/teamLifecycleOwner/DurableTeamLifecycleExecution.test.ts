@@ -741,6 +741,85 @@ const readyReadiness = {
   expectedBehaviorEvidence: { expectedBehaviorFingerprint: attestedFingerprint },
 }
 
+describe('DurableTeamLifecycleExecution lead-first launch', () => {
+  const mixedPlan: TeamLifecycleLaunchPlan = {
+    ...plan,
+    toolApprovalMode: 'auto',
+    lanes: [
+      { laneId: 'opencode-lane', kind: 'opencode', provider: 'opencode', selectedModel: 'provider/model',
+        members: [{ name: 'worker', prompt: 'Build it.' }] },
+      { laneId: 'native-lane', kind: 'native', provider: 'anthropic',
+        members: [{ name: 'team-lead', prompt: 'Lead.' }] },
+    ],
+  }
+
+  class OrderedLane implements TeamLifecycleLaneEffectPort {
+    inspectsUntilRunning = 2
+    constructor(readonly kind: 'native' | 'opencode', private readonly log: string[]) {}
+    supports(): boolean { return true }
+    async inspect(input: { runId: string | null }): Promise<TeamLifecycleLaneObservation> {
+      if (!input.runId || !this.log.includes(`${this.kind}.launch`)) return { phase: 'idle', recoverable: false }
+      const phase = this.kind === 'native' && this.inspectsUntilRunning-- > 0 ? 'launching' : 'running'
+      this.log.push(`${this.kind}.inspect:${phase}`)
+      return { phase, recoverable: false }
+    }
+    async launch(): Promise<TeamLifecycleLaneObservation> {
+      this.log.push(`${this.kind}.launch`)
+      return { phase: this.kind === 'native' ? 'launching' : 'running', recoverable: false }
+    }
+    async cancel(): Promise<TeamLifecycleLaneObservation> {
+      this.log.push(`${this.kind}.cancel`)
+      return { phase: 'idle', recoverable: false }
+    }
+    async stop(): Promise<TeamLifecycleLaneObservation> {
+      this.log.push(`${this.kind}.stop`)
+      return { phase: 'idle', recoverable: false }
+    }
+    async recover(): Promise<TeamLifecycleLaneObservation> { return { phase: 'idle', recoverable: false } }
+  }
+
+  async function launched(log: string[]) {
+    const root = await mkdtemp(join(tmpdir(), 'team-owner-lead-first-'))
+    roots.push(root)
+    const execution = new DurableTeamLifecycleExecution(join(root, 'state.json'),
+      [new OrderedLane('native', log), new OrderedLane('opencode', log)])
+    const idle = await execution.inspect(mixedPlan)
+    const launching = await execution.launch({
+      plan: mixedPlan, commandId: 'command-launch', runId: null,
+      expectedProviderGeneration: idle.providerGeneration,
+    })
+    return { execution, launching }
+  }
+
+  test('starts side lanes only after the lead lane reports running, like desktop', async () => {
+    const log: string[] = []
+    const { execution, launching } = await launched(log)
+    expect(launching.phase).toBe('launching')
+    for (let attempt = 0; attempt < 100 && (await execution.inspect(mixedPlan)).phase !== 'running'; attempt += 1) {
+      await Bun.sleep(50)
+    }
+    await execution.close()
+    // Later entries are the inspections of the running team.
+    expect(log.slice(0, 5)).toEqual([
+      'native.launch', 'native.inspect:launching', 'native.inspect:launching', 'native.inspect:running',
+      'opencode.launch',
+    ])
+    await expect(execution.inspect(mixedPlan)).resolves.toMatchObject({ phase: 'running', runId: launching.runId })
+  }, 10_000)
+
+  test('a cancel while the lead bootstraps never starts the side lanes', async () => {
+    const log: string[] = []
+    const { execution, launching } = await launched(log)
+    const current = await execution.inspect(mixedPlan)
+    await expect(execution.cancel({
+      plan: mixedPlan, commandId: 'command-cancel', runId: launching.runId,
+      expectedProviderGeneration: current.providerGeneration,
+    })).resolves.toMatchObject({ phase: 'idle', runId: null })
+    await execution.close()
+    expect(log).not.toContain('opencode.launch')
+  }, 10_000)
+})
+
 describe('OpenCodeTeamLifecycleLane', () => {
   test('attests readiness, then launches with strict preconditions bound to that fingerprint', async () => {
     const calls: Array<{ command: string; body: Record<string, unknown> }> = []

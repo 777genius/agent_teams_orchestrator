@@ -4,6 +4,7 @@ import { lstat, open } from 'node:fs/promises'
 import { isAbsolute } from 'node:path'
 
 import { writeFileAtomic } from '../../utils/atomicWrite.js'
+import { TEAM_LEAD_NAME } from '../../utils/swarm/constants.js'
 import { fsyncFileAndParent } from '../hostedControl/HostedTaskMutationWal.js'
 import type { HostedLifecycleAction, HostedLifecycleProviderSnapshot } from '../hostedControl/HostedLifecycleSnapshot.js'
 import type { TeamLifecycleLaunchPlan } from './TeamLifecycleLaunchPlan.js'
@@ -46,6 +47,9 @@ type LaneInput = {
 type EffectGuard = NonNullable<TeamLifecycleOwnerEffectInput['effectGuard']>
 /** `start` gates beginning a lane effect; `authority` must still hold when it returns. */
 type EffectGuards = Readonly<{ start: EffectGuard; authority: EffectGuard }>
+const LEAD_LANE_READY_POLL_MS = 500
+/** Above the longest native bootstrap budget (900 s) plus its lane deadline grace. */
+const LEAD_LANE_READY_TIMEOUT_MS = 20 * 60_000
 const EFFECT_ALLOWED: EffectGuard = () => true
 
 export type TeamLifecycleRunReservation = {
@@ -361,7 +365,7 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
     let observations: TeamLifecycleLaneObservation[]
     let failure: TeamLifecycleLaneFailure | undefined
     try {
-      observations = await this.#applyLanes(plan, runId, 'launch', guards)
+      observations = await this.#launchLanes(plan, runId, guards)
     } catch (error) {
       observations = [{ phase: 'failed', recoverable: true }]
       failure = laneFailureFromError('launch', error)
@@ -386,6 +390,63 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
       }, plan)
       if (reason) this.#reportLaneFailure(reason, runId, plan)
     })
+  }
+
+  /**
+   * Desktop launch order: the lane holding team-lead starts first, and every
+   * other lane starts one at a time only after it reports running, so side
+   * lanes join a team the lead has already created. A plan without exactly
+   * one lead lane keeps a single concurrent pass.
+   */
+  async #launchLanes(
+    plan: TeamLifecycleLaunchPlan,
+    runId: string,
+    guards: EffectGuards,
+  ): Promise<TeamLifecycleLaneObservation[]> {
+    const leadLanes = plan.lanes.filter(lane => lane.members.some(member => member.name === TEAM_LEAD_NAME))
+    if (plan.lanes.length === 1 || leadLanes.length !== 1) return this.#applyLanes(plan, runId, 'launch', guards)
+    const leadLane = leadLanes[0]!
+    const [launched] = await this.#applyLanes(plan, runId, 'launch', guards, [leadLane])
+    const lead = await this.#awaitLaneReady(plan, runId, leadLane, launched!)
+    if (lead.phase !== 'running') return [lead]
+    const observations = [lead]
+    for (const lane of plan.lanes) {
+      if (lane === leadLane) continue
+      if (!(await this.#launchStillOwned(plan, runId))) return [...observations, { phase: 'launching', recoverable: false }]
+      observations.push(...await this.#applyLanes(plan, runId, 'launch', guards, [lane]))
+    }
+    return observations
+  }
+
+  /** Polls the lead lane while it bootstraps; a cancel, stop or close ends the wait. */
+  async #awaitLaneReady(
+    plan: TeamLifecycleLaunchPlan,
+    runId: string,
+    lane: TeamLifecycleLaunchPlan['lanes'][number],
+    launched: TeamLifecycleLaneObservation,
+  ): Promise<TeamLifecycleLaneObservation> {
+    let observation = launched
+    const deadline = Date.now() + LEAD_LANE_READY_TIMEOUT_MS
+    while (observation.phase === 'launching') {
+      if (Date.now() >= deadline) return { phase: 'failed', recoverable: true }
+      await new Promise(resolve => setTimeout(resolve, LEAD_LANE_READY_POLL_MS))
+      if (!(await this.#launchStillOwned(plan, runId))) return observation
+      observation = await this.#adapter(lane.kind).inspect({
+        planTeamId: plan.teamId,
+        workspaceRoot: plan.workspaceRoot,
+        toolApprovalMode: plan.toolApprovalMode,
+        lane,
+        planLanes: plan.lanes,
+        runId,
+      })
+    }
+    return observation
+  }
+
+  async #launchStillOwned(plan: TeamLifecycleLaunchPlan, runId: string): Promise<boolean> {
+    if (!this.#acceptingEffects) return false
+    const current = await this.#read(plan).catch(() => null)
+    return current?.runId === runId && current.phase === 'launching'
   }
 
   async #completeStop(plan: TeamLifecycleLaunchPlan, runId: string, guards: EffectGuards): Promise<void> {
@@ -464,8 +525,9 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
     runId: string,
     action: 'launch' | 'cancel' | 'stop' | 'recover',
     guards: EffectGuards,
+    lanes: TeamLifecycleLaunchPlan['lanes'] = plan.lanes,
   ): Promise<TeamLifecycleLaneObservation[]> {
-    return Promise.all(plan.lanes.map(async lane => {
+    return Promise.all(lanes.map(async lane => {
       const adapter = this.#adapter(lane.kind)
       const laneInput: LaneInput = {
         planTeamId: plan.teamId,

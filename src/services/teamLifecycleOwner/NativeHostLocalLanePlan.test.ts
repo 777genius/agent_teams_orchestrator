@@ -36,7 +36,11 @@ describe('classifyNativeHostLocalPlan', () => {
     const claudeWorker: TeamLifecycleLaunchLane = {
       laneId: 'lane_claude', kind: 'native', provider: 'anthropic', members: [{ name: 'worker', prompt: 'Work.' }],
     }
-    expect(classifyNativeHostLocalPlan(plan([codexLane, openCode]), options)).toBe('native_lane_mixed_with_opencode')
+    expect(classifyNativeHostLocalPlan(plan([{ ...openCode, members: [{ name: 'team-lead', prompt: 'Lead.' }] },
+      { ...codexLane, members: codexLane.members.filter(member => member.name !== 'team-lead') }]), options))
+      .toBe('native_lane_opencode_lead_unsupported')
+    expect(classifyNativeHostLocalPlan(plan([codexLane, { ...openCode, members: [{ name: 'REVIEWER', prompt: 'x' }] }]),
+      options)).toBe('native_lane_member_name_invalid')
     expect(classifyNativeHostLocalPlan(plan([codexLane, { ...claudeWorker, members: [
       { name: 'team-lead', prompt: 'Second lead.' }] }]), options)).toBe('native_lane_member_name_invalid')
     expect(classifyNativeHostLocalPlan(plan([codexLane, { ...claudeWorker, members: [
@@ -117,6 +121,20 @@ describe('mixed native providers (desktop primary_only)', () => {
     expect(env.CODEX_HOME).toBe('/home/op/.codex')
     expect(env.CLAUDE_CODE_CODEX_FORCED_LOGIN_METHOD).toBe('chatgpt')
     expect(Object.values(env)).not.toContain('leak')
+  })
+})
+
+describe('native lead with OpenCode side lanes (desktop mixed_opencode_side_lanes)', () => {
+  test('the lead bootstrap carries only native members; OpenCode members run in their own lanes', () => {
+    const options = { teamName: 'hosted-team', configuredProviders: both, platform: 'linux' as const }
+    const openCode: TeamLifecycleLaunchLane = {
+      laneId: 'lane_oc', kind: 'opencode', provider: 'opencode', selectedModel: 'opencode/x',
+      members: [{ name: 'helper', prompt: 'Help.' }],
+    }
+    const shape = classifyNativeHostLocalPlan(plan([openCode, codexLane]), options)
+    if (typeof shape === 'string') throw new Error(shape)
+    expect(shape.leadLane.laneId).toBe('lane_codex')
+    expect(shape.teammates.map(member => member.name)).toEqual(['reviewer'])
   })
 })
 

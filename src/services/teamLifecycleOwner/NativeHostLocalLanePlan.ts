@@ -13,7 +13,7 @@ export type NativeHostLocalProvider = Extract<NativeTeamLifecycleProvider, 'anth
 type NativeLane = Extract<TeamLifecycleLaunchLane, { kind: 'native' }>
 
 export type NativeHostLocalLaneErrorCode =
-  | 'native_lane_mixed_with_opencode'
+  | 'native_lane_opencode_lead_unsupported'
   | 'native_lane_lead_missing'
   | 'native_lane_member_name_invalid'
   | 'native_lane_too_many_members'
@@ -89,7 +89,9 @@ export function classifyNativeHostLocalPlan(
 /**
  * Desktop parity for native teams: a Claude or Codex lead with members of
  * either provider, spawned by the lead from one bootstrap (desktop
- * `primary_only`). Mixed native+OpenCode teams are still a typed rejection.
+ * `primary_only`). OpenCode lanes may join a native-led team as side lanes
+ * (desktop `mixed_opencode_side_lanes`); their members are not in the lead's
+ * bootstrap. Like desktop, an OpenCode lead with native members is rejected.
  */
 export function classifyNativeHostLocalLanes(
   lanes: readonly TeamLifecycleLaunchLane[],
@@ -99,7 +101,10 @@ export function classifyNativeHostLocalLanes(
   if (!isNativeHostLocalPlatform(options.platform)) return 'native_lane_platform_unsupported'
   const native = lanes.filter((lane): lane is NativeLane => lane.kind === 'native')
   if (native.length === 0) return 'native_lane_lead_missing'
-  if (native.length !== lanes.length) return 'native_lane_mixed_with_opencode'
+  const sideLanes = lanes.filter(lane => lane.kind !== 'native')
+  if (sideLanes.some(lane => lane.members.some(member => member.name === TEAM_LEAD_NAME))) {
+    return 'native_lane_opencode_lead_unsupported'
+  }
   const providers = new Set<NativeHostLocalProvider>()
   for (const lane of native) {
     if (lane.provider !== 'anthropic' && lane.provider !== 'codex') return 'native_lane_provider_unsupported'
@@ -118,7 +123,9 @@ export function classifyNativeHostLocalLanes(
     .map(member => ({ ...member, provider: lane.provider as NativeHostLocalProvider })))
   if (teammates.length > MAX_BOOTSTRAP_TEAMMATES) return 'native_lane_too_many_members'
   const normalized = new Set<string>()
-  for (const member of teammates) {
+  // Names are one namespace across every lane: inboxes and the roster key by name.
+  const everyTeammate = [...teammates, ...sideLanes.flatMap(lane => lane.members)]
+  for (const member of everyTeammate) {
     const lowered = member.name.toLowerCase()
     const key = sanitizeName(member.name)
     if (lowered === TEAM_LEAD_NAME || lowered === 'user' || !key || normalized.has(key)) {

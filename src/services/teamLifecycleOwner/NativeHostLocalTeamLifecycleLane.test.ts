@@ -230,6 +230,23 @@ describe.skipIf(!supportedOnHost)('NativeHostLocalTeamLifecycleLane process life
     expect(await livePidsForTeam(harness.team)).toEqual([])
   }, 30_000)
 
+  test('a native lead with an OpenCode side lane bootstraps only its native members', async () => {
+    const harness = await createHarness()
+    const lane = harness.createLane()
+    const sideLane: TeamLifecycleLaunchLane = {
+      laneId: 'lane_opencode', kind: 'opencode', provider: 'opencode', selectedModel: 'opencode/test',
+      members: [{ name: 'helper', prompt: 'Help.' }],
+    }
+    const run = { ...laneInput(harness, 'run_side'), planLanes: [sideLane, nativeLane] }
+    await lane.launch(run)
+    const record = JSON.parse(await readFile(join(harness.teamRoot, NATIVE_LANE_RUNTIME_RECORD_FILE), 'utf8'))
+    const spec = JSON.parse(await readFile(join(record.runtimeDir, 'bootstrap-spec.json'), 'utf8'))
+    expect(spec.members.map((member: { name: string }) => member.name)).toEqual(['worker'])
+    expect(await eventually(() => lane.inspect(run), observed => observed.phase === 'running'))
+      .toEqual({ phase: 'running', recoverable: false })
+    expect(await lane.stop(run)).toEqual({ phase: 'idle', recoverable: false })
+  }, 30_000)
+
   test('builds the lead env from an allowlist and only the configured credential', async () => {
     const harness = await createHarness()
     const lane = harness.createLane()
@@ -401,14 +418,19 @@ describe('NativeHostLocalTeamLifecycleLane admission and typed failures', () => 
     }
     expect(lane.supports()).toBe(true)
     expect(lane.supportsPlan(plan([nativeLane]))).toBe(true)
-    expect(lane.supportsPlan(plan([nativeLane, openCodeLane]))).toBe(false)
+    // Desktop mixed_opencode_side_lanes: a native lead with OpenCode members, but never an OpenCode lead.
+    expect(lane.supportsPlan(plan([nativeLane, openCodeLane]))).toBe(true)
+    expect(lane.supportsPlan(plan([
+      { ...nativeLane, members: [{ name: 'worker', prompt: 'Work.' }] },
+      { ...openCodeLane, members: [{ name: 'team-lead', prompt: 'Lead.' }] },
+    ]))).toBe(false)
     expect(lane.supportsPlan(plan([nativeLane], 'manual'))).toBe(false)
     expect(lane.supportsPlan(plan([{ ...nativeLane, provider: 'codex' }]))).toBe(false)
     expect(lane.supportsPlan(plan([{ ...nativeLane, provider: 'gemini' }]))).toBe(false)
     expect(lane.supportsPlan(plan([{ ...nativeLane, members: [{ name: 'worker', prompt: 'Work.' }] }]))).toBe(false)
     expect(harness.createLane({ platform: 'win32' }).supports()).toBe(false)
 
-    // The durable owner consults plan admission, so a mixed plan is never launched.
+    // The durable owner consults plan admission, so an OpenCode-led mixed plan is never launched.
     const openCodeAdapter: TeamLifecycleLaneEffectPort = {
       kind: 'opencode',
       supports: () => true,
@@ -420,7 +442,11 @@ describe('NativeHostLocalTeamLifecycleLane admission and typed failures', () => 
     }
     const execution = new DurableTeamLifecycleExecution(join(harness.teamRoot, 'execution.json'), [lane, openCodeAdapter])
     expect(execution.supports(plan([nativeLane]), 'launch')).toBe(true)
-    expect(execution.supports(plan([nativeLane, openCodeLane]), 'launch')).toBe(false)
+    expect(execution.supports(plan([nativeLane, openCodeLane]), 'launch')).toBe(true)
+    expect(execution.supports(plan([
+      { ...nativeLane, members: [{ name: 'worker', prompt: 'Work.' }] },
+      { ...openCodeLane, members: [{ name: 'team-lead', prompt: 'Lead.' }] },
+    ]), 'launch')).toBe(false)
     expect(execution.supports(plan([openCodeLane]), 'launch')).toBe(true)
   })
 })
