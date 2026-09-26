@@ -2536,6 +2536,8 @@ async function assertOpenCodeSelectedModelLaunchAccess(
     if (proofValidation.valid) {
       return
     }
+    // A fixed reason string, never credential data: says why launch probes the model again.
+    console.warn(`[opencode-bridge] launch execution proof rejected (${proofValidation.reason}); probing ${selectedModel} again`)
   }
 
   const executionOutcome = await openCodeExecutionProbe.probeModel({
