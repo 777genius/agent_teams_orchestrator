@@ -135,11 +135,16 @@ export function createHostedControlPortFactory(
         authority: context.authority,
         guard: authorityGuard,
         planStore,
-        execution,
         // One redacted JSON line per change of a message's pump decision.
         reportDecision: report => {
           process.stderr.write(`${JSON.stringify({
             kind: 'hosted-inbox-pump-decision', teamId: context.authority.teamId, ...report,
+          })}\n`)
+        },
+        // One line per prompt with its stage offsets in ms, to see where delivery latency goes.
+        reportTiming: timing => {
+          process.stderr.write(`${JSON.stringify({
+            kind: 'hosted-inbox-relay-timing', teamId: context.authority.teamId, ...timing,
           })}\n`)
         },
       })

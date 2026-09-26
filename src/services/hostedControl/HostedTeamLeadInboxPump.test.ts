@@ -9,6 +9,7 @@ import { writeToMailboxAtCanonicalTeamRootVerified } from '../../utils/teammateM
 import {
   HostedTeamLeadInboxPump,
   type HostedTeamLeadInboxPumpOptions,
+  type InboxPumpTiming,
 } from './HostedTeamLeadInboxPump.js'
 import type { HostedControlAuthority } from './protocol.js'
 
@@ -39,8 +40,12 @@ const capabilitySnapshotId = `opencode:${'e'.repeat(32)}`
 const verifiedObservation = {
   state: 'responded_plain_text', deliveredUserMessageId: 'prompt-1', assistantMessageId: 'assistant-1',
 }
-type TestBridge = (input: { command: string; memberName?: string; text?: string; requestId?: string }, guard: () => Promise<boolean>, signal: AbortSignal) =>
-  Promise<{ ok: boolean; data?: Record<string, unknown> }>
+type TestBridge = (
+  input: { command: string; memberName?: string; text?: string; requestId?: string },
+  guard: () => Promise<boolean>,
+  signal: AbortSignal,
+  onStage?: (stage: string) => void,
+) => Promise<{ ok: boolean; data?: Record<string, unknown>; notReceived?: true }>
 
 async function fixture() {
   const parent = await realpath(await mkdtemp(join(tmpdir(), 'hosted-inbox-pump-')))
@@ -81,8 +86,6 @@ async function fixture() {
       return { plan, planGeneration: admittedGeneration,
         isCurrent: async () => planGeneration === admittedGeneration }
     } },
-    execution: { inspect: async () => ({ providerId: 'team-lifecycle-owner', providerGeneration: 'generation-a',
-      phase: active ? 'running' : 'stopping', runId, recoverable: false }) },
     readActiveRun: async () => ({ phase: active ? 'running' : 'stopping', runId }),
     getSession: async (_teamId, _laneId, memberName) => { await sessionReadHook(); return ({
       teamId: 'legacy', laneId: 'lead-lane', memberName, runId,
@@ -91,7 +94,7 @@ async function fixture() {
       profileScope: { purpose: 'launch_runtime' },
     }) as OpenCodeSessionRecord },
     getCapability: async () => { await capabilityReadHook(); return capabilitySnapshotId },
-    executeBridge: (input, guard, signal) => bridge(input, guard, signal),
+    executeBridge: (input, guard, signal, onStage) => bridge(input, guard, signal, onStage),
     ...overrides,
   })
   return { root, build, calls, setBridge: (next: typeof bridge) => { bridge = next },
@@ -468,14 +471,17 @@ describe('HostedTeamLeadInboxPump', () => {
   test('resends an intent whose fence failed before the bridge call and reports the reason once', async () => {
     const f = await fixture()
     const reports: unknown[] = []
+    let runReads = 0
     const fenced = f.build({
-      readActiveRun: async () => ({ phase: 'stopping', runId }),
+      // Running when the intent is selected (two reads), stopping by its fence.
+      readActiveRun: async () => ({ phase: runReads++ < 2 ? 'running' : 'stopping', runId }),
       reportDecision: report => { reports.push(report) },
     })
     expect(await wakeLead(fenced)).toEqual({ kind: 'unavailable' })
     expect(await wakeLead(fenced)).toEqual({ kind: 'unavailable' })
-    expect(reports).toEqual([{ messageId: message.messageId, recipient: 'team-lead',
-      decision: 'unavailable', reason: 'fence:run_not_running:stopping' }])
+    // The resend reselects before its fence, so the second miss names the selection.
+    expect(reports).toEqual(['fence:run_not_running:stopping', 'run_not_running:stopping'].map(reason => ({
+      messageId: message.messageId, recipient: 'team-lead', decision: 'unavailable', reason })))
     expect(f.calls).toEqual([])
     // The durable intent was never sent, so it is sent now instead of being
     // reconciled into an acceptance the runtime never saw.
@@ -666,6 +672,56 @@ describe('HostedTeamLeadInboxPump', () => {
     ]), { mode: 0o600 })
     await new Promise(resolve => setTimeout(resolve, 400))
     expect(sent).toEqual(['team-lead', 'alice'])
+  })
+
+  test('reports where a prompt spent its time, as stage codes without text', async () => {
+    const f = await fixture()
+    f.setBridge(async (input, _guard, _signal, onStage) => {
+      f.calls.push(input.command)
+      onStage?.('received')
+      await new Promise(resolve => setTimeout(resolve, 300))
+      onStage?.('prompt_accepted')
+      return { ok: true, data: { accepted: true, sessionId, runtimePromptMessageId: 'prompt-1' } }
+    })
+    const timings: InboxPumpTiming[] = []
+    expect((await wakeLead(f.build({ reportTiming: timing => { timings.push(timing) } }))).kind).toBe('accepted')
+    expect(timings).toHaveLength(1)
+    const [timing] = timings
+    expect(timing).toMatchObject({ messageId: message.messageId, recipient: 'team-lead', decision: 'accepted' })
+    expect(timing!.rowAgeMs).toBeGreaterThan(0)
+    const order = ['checked', 'locked', 'selected', 'intent', 'fenced', 'issued',
+      'bridge.received', 'bridge.prompt_accepted', 'bridged', 'read']
+    expect(Object.keys(timing!.stages)).toEqual(order)
+    const at = timing!.stages
+    for (let i = 1; i < order.length; i += 1) expect(at[order[i]!]!).toBeGreaterThanOrEqual(at[order[i - 1]!]!)
+    // The bridge's 300 ms lands in its own segment, not in the pump's.
+    expect(at['bridge.prompt_accepted']! - at['bridge.received']!).toBeGreaterThanOrEqual(290)
+    expect(JSON.stringify(timing)).not.toContain(message.text)
+    // A wake that finds the row already delivered does not report a prompt.
+    await markLeadRowUnread(f.root)
+    await wakeLead(f.build({ reportTiming: timing => { timings.push(timing) } }))
+    expect(timings).toHaveLength(1)
+  })
+
+  test('a send the bridge never recorded stays unsent and is retried under the same request id', async () => {
+    const f = await fixture()
+    const requests: string[] = []
+    let reachable = false
+    f.setBridge(async input => {
+      f.calls.push(input.command)
+      if (input.command !== 'send') throw new Error('a never-recorded send needs no status reconcile')
+      requests.push(input.requestId!)
+      return reachable
+        ? { ok: true, data: { accepted: true, sessionId, runtimePromptMessageId: 'prompt-1' } }
+        : { ok: false, notReceived: true }
+    })
+    expect((await wakeLead(f.build())).kind).toBe('unavailable')
+    expect(JSON.parse(await readFile(join(f.root, 'inboxes', 'team-lead.json'), 'utf8'))[0].read).toBe(false)
+    reachable = true
+    expect((await wakeLead(f.build())).kind).toBe('accepted')
+    expect(f.calls).toEqual(['send', 'send'])
+    expect(new Set(requests).size).toBe(1)
+    expect(JSON.parse(await readFile(join(f.root, 'inboxes', 'team-lead.json'), 'utf8'))[0].read).toBe(true)
   })
 })
 

@@ -13,7 +13,6 @@ import { readOpenCodeLegacyStopCapability } from '../opencode/OpenCodeLegacyStop
 import { buildOpenCodeRuntimeMessageText } from '../opencode/OpenCodeRuntimeMessageText.js'
 import { isOpenCodeSessionStopped, openCodeSessionStore } from '../opencode/OpenCodeSessionStore.js'
 import type { OpenCodeSessionRecord } from '../opencode/types.js'
-import type { TeamLifecycleExecutionPort } from '../teamLifecycleOwner/TeamLifecycleOwnerService.js'
 import type { TeamLifecycleLaunchPlan, TeamLifecycleLaunchPlanStore } from '../teamLifecycleOwner/TeamLifecycleLaunchPlan.js'
 import type { HostedControlAuthority, HostedControlStableAuthority } from './protocol.js'
 import type { HostedMessageAuthorityGuard } from './HostedTeamMessageService.js'
@@ -103,7 +102,13 @@ type BridgeInput = {
   text?: string
   runtimePromptMessageId?: string
 }
-type BridgeResponse = { ok: boolean; data?: Record<string, unknown>; error?: { message?: string } }
+type BridgeResponse = {
+  ok: boolean
+  data?: Record<string, unknown>
+  error?: { message?: string }
+  /** A failed send the bridge never recorded: nothing was prompted. */
+  notReceived?: true
+}
 export type InboxPumpDecision = {
   kind: 'observed' | 'accepted' | 'pending' | 'operator_required' | 'unavailable' | 'native_inbox'
 }
@@ -114,6 +119,18 @@ export type InboxPumpReport = Readonly<{
   decision: InboxPumpDecision['kind']
   reason: string | null
 }>
+/**
+ * Where one prompt spent its time: ms offsets from its wake, named by stage code.
+ * `bridge.*` stages are the bridge's durable send statuses. Codes and ids only.
+ */
+export type InboxPumpTiming = Readonly<{
+  messageId: string
+  recipient: string
+  decision: InboxPumpDecision['kind']
+  /** From the row's own timestamp to the wake: file watch, debounce and queue wait. */
+  rowAgeMs: number
+  stages: Readonly<Record<string, number>>
+}>
 type SelectMiss = { miss: string }
 
 export type HostedTeamLeadInboxPumpOptions = {
@@ -122,14 +139,20 @@ export type HostedTeamLeadInboxPumpOptions = {
   authority: Readonly<HostedControlStableAuthority>
   guard: HostedMessageAuthorityGuard
   planStore: TeamLifecycleLaunchPlanStore
-  execution: Pick<TeamLifecycleExecutionPort, 'inspect'>
-  /** Read only view used inside the OpenCode prompt host operation. */
+  /** The persisted run a prompt is fenced to; the bridge itself checks the session is live. */
   readActiveRun?: (plan: TeamLifecycleLaunchPlan) => Promise<{ phase: string; runId: string | null } | null>
   getSession?: (teamId: string, laneId: string, memberName: string) => Promise<OpenCodeSessionRecord | null>
   getCapability?: (input: { teamId: string; laneId: string; runId: string }) => Promise<string>
-  executeBridge?: (input: BridgeInput, effectGuard: () => Promise<boolean>, signal: AbortSignal) => Promise<BridgeResponse>
+  executeBridge?: (
+    input: BridgeInput,
+    effectGuard: () => Promise<boolean>,
+    signal: AbortSignal,
+    onStage?: (stage: string) => void,
+  ) => Promise<BridgeResponse>
   /** Called when a message's decision or reason changes, so a stuck delivery is visible once. */
   reportDecision?: (report: InboxPumpReport) => void
+  /** Called once per prompt the pump handed to the bridge. */
+  reportTiming?: (timing: InboxPumpTiming) => void
 }
 
 /**
@@ -143,12 +166,12 @@ export class HostedTeamLeadInboxPump {
   readonly #authority: Readonly<HostedControlStableAuthority>
   readonly #guard: HostedMessageAuthorityGuard
   readonly #planStore: TeamLifecycleLaunchPlanStore
-  readonly #execution: Pick<TeamLifecycleExecutionPort, 'inspect'>
   readonly #readActiveRun: NonNullable<HostedTeamLeadInboxPumpOptions['readActiveRun']>
   readonly #getSession: NonNullable<HostedTeamLeadInboxPumpOptions['getSession']>
   readonly #getCapability: NonNullable<HostedTeamLeadInboxPumpOptions['getCapability']>
   readonly #executeBridge: NonNullable<HostedTeamLeadInboxPumpOptions['executeBridge']>
   readonly #reportDecision: HostedTeamLeadInboxPumpOptions['reportDecision']
+  readonly #reportTiming: HostedTeamLeadInboxPumpOptions['reportTiming']
   readonly #lastReports = new Map<string, string>()
   readonly #abort = new AbortController()
   readonly #pending = new Set<Promise<void>>()
@@ -175,7 +198,6 @@ export class HostedTeamLeadInboxPump {
     this.#authority = Object.freeze({ ...options.authority, mountBinding: Object.freeze({ ...options.authority.mountBinding }) })
     this.#guard = options.guard
     this.#planStore = options.planStore
-    this.#execution = options.execution
     this.#readActiveRun = options.readActiveRun ?? (plan => this.#readPersistedActiveRun(plan))
     this.#getSession = options.getSession ?? ((teamId, laneId, memberName) => openCodeSessionStore.get(teamId, laneId, memberName))
     // The canonical teams directory of this admission, never the ambient config root.
@@ -184,6 +206,7 @@ export class HostedTeamLeadInboxPump {
     }))
     this.#executeBridge = options.executeBridge ?? createOwnedOpenCodeHostedInboxExecutor()
     this.#reportDecision = options.reportDecision
+    this.#reportTiming = options.reportTiming
   }
 
   /**
@@ -386,6 +409,20 @@ export class HostedTeamLeadInboxPump {
   }
 
   async #wake(message: PumpMessage, authority: HostedControlAuthority): Promise<WakeOutcome> {
+    const clock = new StageClock()
+    const rowAgeMs = Date.now() - Date.parse(message.createdAt)
+    const result = await this.#prompt(message, authority, clock)
+    if (this.#reportTiming && clock.has('issued')) {
+      try {
+        this.#reportTiming(Object.freeze({ messageId: message.relay.sourceMessageId,
+          recipient: message.recipient ?? TEAM_LEAD_NAME, decision: result.decision.kind,
+          rowAgeMs: Number.isFinite(rowAgeMs) ? rowAgeMs : -1, stages: clock.stages }))
+      } catch { /* Diagnostics never change delivery. */ }
+    }
+    return result
+  }
+
+  async #prompt(message: PumpMessage, authority: HostedControlAuthority, clock: StageClock): Promise<WakeOutcome> {
     if (!sameAuthority(authority, this.#authority) || message.teamId !== authority.teamId ||
       !/^message_[0-9a-f]{32}$/.test(message.messageId)) {
       return outcome('operator_required', 'message_binding_invalid')
@@ -399,9 +436,11 @@ export class HostedTeamLeadInboxPump {
       await this.#assertPrivateRoot()
       if (!(await this.#hasDurableInboxRow(message, recipient))) return outcome('operator_required', 'inbox_row_mismatch')
       await this.#prepareDirectory()
+      clock.mark('checked')
       const path = join(this.#root, DIRECTORY,
         `${intentDigest(authority.teamId, recipient, inboxRowOf(message).messageId)}.json`)
       const release = await lockfile.lock(path, LOCK_OPTIONS)
+      clock.mark('locked')
       try {
         const intent = await readPrivateJson(path) as Intent | null
         if (intent) {
@@ -415,25 +454,27 @@ export class HostedTeamLeadInboxPump {
           // failed_before_accept was reset for retry): sending is safe. Intents
           // written before attempts were tracked have no attempt and stay ambiguous.
           if (intent.status === 'intent' && intent.attempt !== undefined && !intent.sendIssued) {
-            return await this.#send(path, intent)
+            return await this.#send(path, intent, clock)
           }
           const decision = intent.status === 'observed' ? { kind: 'observed' as const } : await this.#reconcile(path, intent)
           return outcome((await this.#commitInboxRead(path, decision)).kind)
         }
         const selected = await this.#select(authority, recipient)
         if ('miss' in selected) return outcome('unavailable', selected.miss)
+        clock.mark('selected')
         const created: Intent = { schemaVersion: 1, authority, message, textSha256: sha256(message.text),
           selected, requestId: requestIdFor(authority.teamId, message.messageId, selected, 0),
           status: 'intent', attempt: 0 }
         await writeIntent(path, created)
+        clock.mark('intent')
         // Awaited so the send, reconcile and read commit finish while this intent lock is held.
-        return await this.#send(path, created, selected)
+        return await this.#send(path, created, clock, selected)
       } finally { await release() }
     } catch { return outcome('operator_required', 'pump_error') }
   }
 
   /** Sends one not-yet-issued intent; the intent must be durable and its lock held. */
-  async #send(path: string, pending: Intent, preselected?: Selected): Promise<WakeOutcome> {
+  async #send(path: string, pending: Intent, clock: StageClock, preselected?: Selected): Promise<WakeOutcome> {
     const recipient = pending.message.recipient ?? TEAM_LEAD_NAME
     const selected = preselected ?? await this.#select(pending.authority, recipient)
     if ('miss' in selected) return outcome('unavailable', selected.miss)
@@ -447,22 +488,34 @@ export class HostedTeamLeadInboxPump {
       if (intent !== pending) await writeIntent(path, intent)
       return outcome('unavailable', miss)
     }
+    clock.mark('fenced')
     intent = { ...intent, sendIssued: true }
     await writeIntent(path, intent)
+    clock.mark('issued')
     let result: BridgeResponse
     try {
       result = await this.#executeBridge(this.#bridgeInput(intent, 'send'),
-        () => this.#stillSelected(intent), this.#abort.signal)
+        () => this.#stillSelected(intent), this.#abort.signal, stage => clock.mark(`bridge.${stage}`))
     } catch {
       return outcome((await this.#commitInboxRead(path, await this.#reconcile(path, intent))).kind,
         'send_response_lost')
     }
+    clock.mark('bridged')
     if (result.ok && result.data?.accepted === true && result.data.sessionId === selected.sessionId) {
       const promptId = result.data.runtimePromptMessageId
       intent = { ...intent, status: 'accepted', reconcileChecks: 0,
         ...(typeof promptId === 'string' ? { runtimePromptMessageId: promptId } : {}) }
       await writeIntent(path, intent)
-      return outcome((await this.#commitInboxRead(path, { kind: 'accepted' })).kind)
+      const decision = await this.#commitInboxRead(path, { kind: 'accepted' })
+      clock.mark('read')
+      return outcome(decision.kind)
+    }
+    if (!result.ok && result.notReceived === true && !this.#abort.signal.aborted) {
+      // Nothing was prompted (a lane that died since its last inspection fails here):
+      // the intent stays unsent under the same request id and the next wake retries it.
+      const { sendIssued: _issued, ...unsent } = intent
+      await writeIntent(path, unsent)
+      return outcome('unavailable', `send_not_received:${bridgeFailure(result)}`)
     }
     const decision = await this.#commitInboxRead(path, await this.#reconcile(path, intent))
     return outcome(decision.kind, decision.kind === 'accepted' || decision.kind === 'observed'
@@ -562,11 +615,12 @@ export class HostedTeamLeadInboxPump {
       ...(intent.runtimePromptMessageId ? { runtimePromptMessageId: intent.runtimePromptMessageId } : {}) }
   }
 
-  async #select(
-    authority: HostedControlAuthority,
-    recipient: string,
-    readOnly = false,
-  ): Promise<Selected | SelectMiss> {
+  /**
+   * The recipient's session under the persisted running run. Like desktop's relay,
+   * a prompt does not first reconcile the whole team: that costs a bridge round trip
+   * per lane, and the bridge itself refuses a session that is gone.
+   */
+  async #select(authority: HostedControlAuthority, recipient: string): Promise<Selected | SelectMiss> {
     const admission = await this.#planStore.load({ workspaceId: authority.workspaceId, teamId: authority.teamId })
     if (!admission) return { miss: 'plan_missing' }
     if (!(await admission.isCurrent())) return { miss: 'plan_not_current' }
@@ -576,9 +630,7 @@ export class HostedTeamLeadInboxPump {
     if (admission.plan.workspaceRoot !== await realpath(admission.plan.workspaceRoot)) {
       return { miss: 'workspace_not_canonical' }
     }
-    const state = readOnly
-      ? await this.#readActiveRun(admission.plan)
-      : await this.#execution.inspect(admission.plan)
+    const state = await this.#readActiveRun(admission.plan)
     if (!state || state.phase !== 'running' || !state.runId) return { miss: `run_not_running:${state?.phase ?? 'none'}` }
     if (!(await admission.isCurrent())) return { miss: 'plan_not_current' }
     const lane = lanes[0]!
@@ -604,10 +656,8 @@ export class HostedTeamLeadInboxPump {
     if (!capabilitySnapshotId || !/^opencode:[a-f0-9]{32}$/.test(capabilitySnapshotId)) {
       return { miss: 'capability_missing' }
     }
-    if (readOnly) {
-      const latest = await this.#readActiveRun(admission.plan)
-      if (!latest || latest.phase !== 'running' || latest.runId !== state.runId) return { miss: 'run_changed' }
-    }
+    const latest = await this.#readActiveRun(admission.plan)
+    if (!latest || latest.phase !== 'running' || latest.runId !== state.runId) return { miss: 'run_changed' }
     if (!(await admission.isCurrent())) return { miss: 'plan_not_current' }
     return { planGeneration: admission.planGeneration, runId: state.runId,
       laneId: lane.laneId, sessionId: session.opencodeSessionId,
@@ -623,7 +673,7 @@ export class HostedTeamLeadInboxPump {
   async #selectionMiss(intent: Intent): Promise<string | null> {
     if (!this.#accepting) return 'pump_closing'
     if (!(await this.#guard.isCurrent(intent.authority))) return 'authority_not_current'
-    const selected = await this.#select(intent.authority, intent.message.recipient ?? TEAM_LEAD_NAME, true)
+    const selected = await this.#select(intent.authority, intent.message.recipient ?? TEAM_LEAD_NAME)
     if (!this.#accepting || this.#abort.signal.aborted) return 'pump_closing'
     if ('miss' in selected) return `fence:${selected.miss}`
     if (!isDeepStrictEqual(selected, intent.selected)) return 'fence:selection_changed'
@@ -703,6 +753,17 @@ export class HostedTeamLeadInboxPump {
 }
 
 function sha256(text: string): string { return createHash('sha256').update(text).digest('hex') }
+/** Ms offsets of named stages; a repeated stage gets a numbered suffix. */
+class StageClock {
+  readonly #start = performance.now()
+  readonly stages: Record<string, number> = {}
+  mark(stage: string): void {
+    let key = stage
+    for (let n = 2; key in this.stages; n += 1) key = `${stage}.${n}`
+    this.stages[key] = Math.round(performance.now() - this.#start)
+  }
+  has(stage: string): boolean { return stage in this.stages }
+}
 type WakeOutcome = { decision: InboxPumpDecision; reason: string | null }
 function outcome(kind: InboxPumpDecision['kind'], reason: string | null = null): WakeOutcome {
   return { decision: { kind }, reason }

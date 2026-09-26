@@ -1325,6 +1325,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
       return { runtimePromptMessageId: 'msg-hosted-test', hookDiagnostics: [] }
     }
     let current = true
+    const stages: string[] = []
     const execute = createOwnedOpenCodeHostedInboxExecutor()
     const pending = execute({
       command: 'send', requestId: 'hosted-inbox-guard-test', teamId: record.teamId,
@@ -1332,12 +1333,32 @@ describe('OpenCodeBridgeCommandHandler', () => {
       projectPath: record.projectPath, sessionId: record.opencodeSessionId,
       capabilitySnapshotId: String(envelope.body.expectedCapabilitySnapshotId),
       messageId: `message_${'a'.repeat(32)}`, payloadHash: 'b'.repeat(64), text: 'hello',
-    }, async () => current)
+    }, async () => current, undefined, stage => stages.push(stage))
     await waitForCommandStage(entered.promise, pending, 'hosted send preflight')
     current = false
     resume.resolve()
     const result = await pending
     expect(result.ok).toBe(false)
+    expect(state.prompts).toBe(0)
+    // Recorded before it failed: only a status reconcile may settle it.
+    expect(stages[0]).toBe('received')
+    expect('notReceived' in result).toBe(false)
+  })
+
+  test('hosted inbox executor marks a send refused before the bridge recorded it as not received', async () => {
+    const { record, state, envelope } = await setupSelectedDeliveryRegression('opencode.sendMessage')
+    state.records = []
+    const stages: string[] = []
+    const result = await createOwnedOpenCodeHostedInboxExecutor()({
+      command: 'send', requestId: 'hosted-inbox-not-received-test', teamId: record.teamId,
+      laneId: record.laneId!, memberName: record.memberName, runId: 'run_1',
+      projectPath: record.projectPath, sessionId: record.opencodeSessionId,
+      capabilitySnapshotId: String(envelope.body.expectedCapabilitySnapshotId),
+      messageId: `message_${'a'.repeat(32)}`, payloadHash: 'b'.repeat(64), text: 'hello',
+    }, async () => true, undefined, stage => stages.push(stage))
+    expect(result.ok).toBe(false)
+    expect(result).toMatchObject({ notReceived: true })
+    expect(stages).toEqual([])
     expect(state.prompts).toBe(0)
   })
 

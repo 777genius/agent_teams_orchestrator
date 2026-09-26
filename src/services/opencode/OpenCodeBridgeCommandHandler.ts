@@ -325,6 +325,8 @@ type SendMessageOutcomeBase = {
   memberName: string
   projectPath: string
   runId: string | null
+  /** Hosted inbox delivery timing: named once each status is durable. */
+  stage?: (stage: string) => void
 }
 
 function teamDiagnosticToOutcomeString(diagnostic: TeamDiagnostic): string {
@@ -396,6 +398,7 @@ async function markSendMessageOutcome(
     ...(input.definitelyUnsubmitted ? { definitelyUnsubmitted: input.definitelyUnsubmitted } : {}),
   }
   await openCodeCommandOutcomeStore.upsert(patch, options)
+  base.stage?.(input.status)
 }
 
 function commandStatusFromOutcomeStatus(
@@ -5028,6 +5031,7 @@ async function runSendMessage(
   envelope: BridgeEnvelope,
   authority?: Awaited<ReturnType<typeof probeStoredLaneAuthority>>,
   hostedInboxEffectGuard?: () => Promise<boolean>,
+  hostedInboxStage?: (stage: string) => void,
 ): Promise<{
   snapshot: OpenCodeProvisioningSnapshot
   deliveryRuntime?: ReturnType<typeof createRuntimeSnapshot>
@@ -5055,6 +5059,7 @@ async function runSendMessage(
     memberName,
     projectPath,
     runId,
+    ...(hostedInboxStage ? { stage: hostedInboxStage } : {}),
   }
   await markSendMessageOutcome(outcomeBase, {
     status: 'received',
@@ -6186,6 +6191,7 @@ async function handleEnvelope(
   externalSignal?: AbortSignal,
   lifecycleOwner = false,
   hostedInboxEffectGuard?: () => Promise<boolean>,
+  hostedInboxStage?: (stage: string) => void,
 ) {
   switch (envelope.command) {
     case 'opencode.handshake': {
@@ -6318,7 +6324,7 @@ async function handleEnvelope(
       if (expectedCapabilitySnapshotId(envelope.body)) {
         if (!runtimeDeadline) throw new Error('OpenCode delivery authority deadline was not initialized')
         return withStoredLaneAuthority(envelope, envelope.command, runtimeDeadline, externalSignal,
-          retained => runSendMessage(envelope, retained, hostedInboxEffectGuard))
+          retained => runSendMessage(envelope, retained, hostedInboxEffectGuard, hostedInboxStage))
       }
       return runSendMessage(envelope)
     case 'opencode.observeMessageDelivery': {
@@ -6412,7 +6418,7 @@ export function createOwnedOpenCodeHostedInboxExecutor() {
     payloadHash: string
     text?: string
     runtimePromptMessageId?: string
-  }, effectGuard: () => Promise<boolean>, signal?: AbortSignal) => {
+  }, effectGuard: () => Promise<boolean>, signal?: AbortSignal, onStage?: (stage: string) => void) => {
     if (!/^run_[A-Za-z0-9][A-Za-z0-9._-]{0,250}$/.test(input.runId)
       || !/^opencode:[a-f0-9]{32}$/.test(input.capabilitySnapshotId)
       || !/^message_[0-9a-f]{32}$/.test(input.messageId)
@@ -6443,7 +6449,8 @@ export function createOwnedOpenCodeHostedInboxExecutor() {
         ? { runtimePromptMessageId: input.runtimePromptMessageId } : {}),
       ...(input.command === 'status' ? { originalRequestId: input.requestId } : {}),
     }
-    return executeOpenCodeBridgeCommandEnvelopeInternal({
+    let received = false
+    const result = await executeOpenCodeBridgeCommandEnvelopeInternal({
       schemaVersion: 1,
       requestId: input.command === 'send' ? input.requestId : `${input.requestId}-${input.command}`,
       command,
@@ -6451,20 +6458,33 @@ export function createOwnedOpenCodeHostedInboxExecutor() {
       startedAt: nowIso(),
       timeoutMs: input.command === 'send' ? 120_000 : 30_000,
       body,
-    }, { signal, hostedInboxEffectGuard: input.command === 'send'
-      ? async () => {
+    }, input.command === 'send' ? {
+      signal,
+      hostedInboxEffectGuard: async () => {
         signal?.throwIfAborted()
         const current = await effectGuard()
         signal?.throwIfAborted()
+        onStage?.('guard')
         return current
-      }
-      : undefined })
+      },
+      hostedInboxStage: stage => {
+        if (stage === 'received') received = true
+        onStage?.(stage)
+      },
+    } : { signal })
+    // The send records `received` before anything else and prompts only after it,
+    // so a failed send that never recorded it provably prompted nothing.
+    return input.command === 'send' && !result.ok && !received ? { ...result, notReceived: true as const } : result
   }
 }
 
 async function executeOpenCodeBridgeCommandEnvelopeInternal(
   input: unknown,
-  options: { signal?: AbortSignal; hostedInboxEffectGuard?: () => Promise<boolean> } = {},
+  options: {
+    signal?: AbortSignal
+    hostedInboxEffectGuard?: () => Promise<boolean>
+    hostedInboxStage?: (stage: string) => void
+  } = {},
   ownerCapability?: typeof HOSTED_LIFECYCLE_OWNER_CAPABILITY,
 ) {
   const startedAtMs = Date.now()
@@ -6512,6 +6532,7 @@ async function executeOpenCodeBridgeCommandEnvelopeInternal(
       options.signal,
       ownerCapability === HOSTED_LIFECYCLE_OWNER_CAPABILITY,
       options.hostedInboxEffectGuard,
+      options.hostedInboxStage,
     )
     if (envelope.command === 'opencode.readiness') {
       runtimeDeadline?.throwIfExpired()
