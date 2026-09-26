@@ -23,6 +23,8 @@ const COLUMNS = ['todo', 'in_progress', 'review', 'approved', 'done'] as const
 const MAX_ROSTER_FILE_BYTES = 256 * 1024
 const MAX_ROSTER_MEMBERS = 512
 type Column = typeof COLUMNS[number]
+/** Like desktop, these columns are the task status; only review and approved live in kanban tasks. */
+const STATUS_COLUMNS: Partial<Record<Column, string>> = { todo: 'pending', in_progress: 'in_progress', done: 'completed' }
 
 export type HostedTaskMutationServiceOptions = {
   claudeRoot: string
@@ -206,7 +208,7 @@ export class HostedTaskMutationService {
         if (taskTexts.has(name)) return { terminal: stateConflict(state) }
         const owner = command.ownerId === null ? null : (await this.#activeMembers()).get(command.ownerId)
         if (command.ownerId && owner === undefined) return { terminal: stateConflict(state) }
-        const task: Record<string, unknown> = { id: rawId, subject: command.subject, ...(command.description === null ? {} : { description: command.description }), status: command.status, blocks: [], blockedBy: [], ...(owner ? { owner } : {}) }
+        const task: Record<string, unknown> = { id: rawId, subject: command.subject, ...(command.description === null ? {} : { description: command.description }), status: STATUS_COLUMNS[command.column] ?? command.status, blocks: [], blockedBy: [], ...(owner ? { owner } : {}) }
         taskAfter = taskText(task); taskTarget = `task:${name}`; taskTexts.set(name, taskAfter); affected.push(publicId)
         placeTask(kanban, rawId, command.column, command.order, new Date(this.#now()).toISOString(), state.tasks)
         kanbanChanged = true
@@ -239,7 +241,12 @@ export class HostedTaskMutationService {
         const targetWithoutTask = actualColumnOrder(kanban, command.column, state.tasks).filter(id => id !== existing!.rawId)
         const clampedOrder = Math.min(command.order, targetWithoutTask.length)
         if (current === command.column && currentOrder === clampedOrder) return { terminal: stateConflict(state) }
-        placeTask(kanban, existing!.rawId, command.column, command.order, new Date(this.#now()).toISOString(), state.tasks); affected.push(command.taskId); kanbanChanged = true; break
+        placeTask(kanban, existing!.rawId, command.column, command.order, new Date(this.#now()).toISOString(), state.tasks); affected.push(command.taskId); kanbanChanged = true
+        const status = STATUS_COLUMNS[command.column]
+        if (status && existing!.value.status !== status) {
+          taskAfter = taskText({ ...existing!.value, status }); taskTarget = `task:${basename(existing!.path)}`; taskTexts.set(basename(existing!.path), taskAfter)
+        }
+        break
       }
       case 'reorder_column': {
         const rawIds = command.orderedTaskIds.map(id => state.tasks.get(id)?.rawId)
@@ -544,11 +551,11 @@ function parseKanban(text: string | null, teamName: string): Record<string, unkn
   if (value.tasks !== undefined && !isRecord(value.tasks)) throw new Error('Invalid hosted kanban tasks')
   if (value.reviewers !== undefined && (!Array.isArray(value.reviewers) || !value.reviewers.every(item => typeof item === 'string'))) throw new Error('Invalid hosted kanban reviewers')
   if (value.columnOrder !== undefined && !isRecord(value.columnOrder)) throw new Error('Invalid hosted kanban column order')
-  const seen = new Set<string>()
+  // An id may sit in two columns: the controller's column reorder does not remove it from the
+  // other one. Placement follows the task, so such an order is stale, not unsafe.
   for (const column of COLUMNS) {
     const ids = (value.columnOrder as Record<string, unknown> | undefined)?.[column]
-    if (ids !== undefined && (!Array.isArray(ids) || !ids.every(id => typeof id === 'string') || ids.some(id => seen.has(id)))) throw new Error('Invalid hosted kanban column order')
-    for (const id of (ids as string[] | undefined) ?? []) seen.add(id)
+    if (ids !== undefined && (!Array.isArray(ids) || !ids.every(id => typeof id === 'string'))) throw new Error('Invalid hosted kanban column order')
   }
   for (const entry of Object.values((value.tasks as Record<string, unknown> | undefined) ?? {})) {
     if (!isRecord(entry) || !COLUMNS.includes(entry.column as Column)) throw new Error('Invalid hosted kanban task placement')
@@ -567,14 +574,18 @@ function actualColumnOrder(kanban: Record<string, unknown>, column: Column, task
   return explicit
 }
 function setColumnOrder(kanban: Record<string, unknown>, column: string, ids: string[]): void { (kanban.columnOrder as Record<string, unknown>)[column] = ids }
+/** The caller sets the task status for a status column; only the target column order is written. */
 function placeTask(kanban: Record<string, unknown>, rawId: string, column: Column, order: number, now: string, taskSnapshot: BoardState['tasks']): void {
-  const materialized = Object.fromEntries(COLUMNS.map(col => [col, actualColumnOrder(kanban, col, taskSnapshot).filter(id => id !== rawId)])) as Record<Column, string[]>
-  const target = materialized[column]
+  const target = actualColumnOrder(kanban, column, taskSnapshot).filter(id => id !== rawId)
   target.splice(Math.min(order, target.length), 0, rawId)
-  for (const col of COLUMNS) setColumnOrder(kanban, col, materialized[col])
+  for (const col of COLUMNS) {
+    const ids = columnOrder(kanban, col)
+    if (col !== column && ids.includes(rawId)) setColumnOrder(kanban, col, ids.filter(id => id !== rawId))
+  }
+  setColumnOrder(kanban, column, target)
   const tasks = kanban.tasks as Record<string, unknown>; const previous = tasks[rawId] && typeof tasks[rawId] === 'object' ? tasks[rawId] as Record<string, unknown> : {}
   if (column === 'review' || column === 'approved') tasks[rawId] = { ...previous, column, movedAt: now }
-  else { const next: Record<string, unknown> = { ...previous, column }; delete next.movedAt; tasks[rawId] = next }
+  else delete tasks[rawId]
 }
 function parseRoster(metaText: string | null, configText: string | null): Record<string, unknown>[] {
   const meta = metaText === null ? null : parseRecord(metaText, 'members metadata')

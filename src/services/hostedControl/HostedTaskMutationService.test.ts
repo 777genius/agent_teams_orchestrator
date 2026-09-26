@@ -278,9 +278,43 @@ describe('HostedTaskMutationService', () => {
     const moved = await runCommand(service, authority, { schemaVersion: 1, kind: 'move_task', commandId: 'command_preserve_placement', idempotencyKey: 'preserve-placement', teamId, expectedSourceGeneration: details.command.expectedSourceGeneration, expectedRevision: 'revision_stale', taskId, column: 'todo', order: 0 })
     expect(moved.result.kind).toBe('committed')
     const movedKanban = JSON.parse(await readFile(join(root, 'teams', 'legacy', 'kanban-state.json'), 'utf8'))
-    expect(movedKanban.tasks[rawId]).toEqual({ column: 'todo', futureEntry: 1 })
-    expect(Object.keys(movedKanban.columnOrder).sort()).toEqual(['approved', 'done', 'futureColumn', 'in_progress', 'review', 'todo'])
+    // Like desktop, todo is the pending status, not a kanban entry; only the target order is written.
+    expect(Object.hasOwn(movedKanban.tasks, rawId)).toBe(false)
+    expect(JSON.parse(await readFile(join(root, 'tasks', 'legacy', `${rawId}.json`), 'utf8')).status).toBe('pending')
+    expect(Object.keys(movedKanban.columnOrder).sort()).toEqual(['futureColumn', 'review', 'todo'])
     expect(movedKanban.columnOrder.todo).toEqual([rawId]); expect(movedKanban.columnOrder.review).toEqual([])
+  })
+
+  test('a hosted move survives the controller rewriting kanban for an agent task_start', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'hosted-service-kanban-controller-')); roots.push(root)
+    const teamRoot = join(root, 'teams', 'legacy'); const kanbanPath = join(teamRoot, 'kanban-state.json')
+    await mkdir(teamRoot, { recursive: true }); await mkdir(join(root, 'tasks', 'legacy'), { recursive: true })
+    const teamId = `team_${'d'.repeat(32)}`; const authority = authorityFor(teamId)
+    const service = new HostedTaskMutationService({ claudeRoot: root, legacyKey: 'legacy', authority, wal: new HostedTaskMutationWal(teamRoot, teamId) })
+    const task = (id: string) => JSON.stringify({ id, subject: id, status: 'pending', blocks: [], blockedBy: [] }, null, 2)
+    await writeFile(join(root, 'tasks', 'legacy', 'a.json'), task('a')); await writeFile(join(root, 'tasks', 'legacy', 'b.json'), task('b'))
+    const moved = await runCommand(service, authority, { schemaVersion: 1, kind: 'move_task', commandId: 'command_move_done', idempotencyKey: 'move-done', teamId, expectedSourceGeneration: 'generation_stale', expectedRevision: 'revision_stale', taskId: publicId(teamId, 'a'), column: 'done', order: 0 })
+    expect(moved.result.kind).toBe('committed')
+    expect(JSON.parse(await readFile(join(root, 'tasks', 'legacy', 'a.json'), 'utf8')).status).toBe('completed')
+
+    // An agent task_start on b: the controller sets its status and rewrites kanban through its
+    // sanitizeState (agent-teams-controller/src/internal/kanbanStore.js), which keeps only
+    // review/approved entries with movedAt and the column order as is.
+    await writeFile(join(root, 'tasks', 'legacy', 'b.json'), JSON.stringify({ ...JSON.parse(task('b')), status: 'in_progress' }, null, 2))
+    const kanban = JSON.parse(await readFile(kanbanPath, 'utf8'))
+    const kept = Object.fromEntries(Object.entries(kanban.tasks as Record<string, { column: string; movedAt?: unknown }>)
+      .filter(([, entry]) => (entry.column === 'review' || entry.column === 'approved') && typeof entry.movedAt === 'string'))
+    // The controller's column reorder can also leave an id in two columns.
+    await writeFile(kanbanPath, JSON.stringify({ teamName: 'legacy', reviewers: [], tasks: kept, columnOrder: { ...kanban.columnOrder, todo: ['a', 'b'] } }))
+
+    // a is still done by its status, and the Owner keeps accepting board writes.
+    expect(JSON.parse(await readFile(join(root, 'tasks', 'legacy', 'a.json'), 'utf8')).status).toBe('completed')
+    const back = await runCommand(service, authority, { schemaVersion: 1, kind: 'move_task', commandId: 'command_move_back', idempotencyKey: 'move-back', teamId, expectedSourceGeneration: moved.command.expectedSourceGeneration, expectedRevision: 'revision_stale', taskId: publicId(teamId, 'a'), column: 'in_progress', order: 0 })
+    expect(back.result.kind).toBe('committed')
+    expect(JSON.parse(await readFile(join(root, 'tasks', 'legacy', 'a.json'), 'utf8')).status).toBe('in_progress')
+    const after = JSON.parse(await readFile(kanbanPath, 'utf8'))
+    expect(after.tasks).toEqual({}); expect(after.columnOrder.todo).toEqual(['b']); expect(after.columnOrder.done).toEqual([])
+    expect(after.columnOrder.in_progress).toEqual(['a', 'b'])
   })
 
   test('omits null create descriptions, rejects clamped move no-ops, and reorders against actual placement', async () => {
