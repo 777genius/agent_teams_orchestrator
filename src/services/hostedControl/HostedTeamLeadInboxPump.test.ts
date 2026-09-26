@@ -97,6 +97,13 @@ async function fixture() {
     replacePlan: () => { planGeneration = 'plan-generation_second' },
     onSessionRead: (hook: typeof sessionReadHook) => { sessionReadHook = hook },
     onCapabilityRead: (hook: typeof capabilityReadHook) => { capabilityReadHook = hook },
+    // A native lead team (planLanes) with one OpenCode member lane, like desktop mixed_opencode_side_lanes.
+    useMixedLanes: () => { plan = { ...plan, toolApprovalMode: 'auto', lanes: [
+      { laneId: 'native-lane', kind: 'native', provider: 'anthropic',
+        members: [{ name: 'team-lead', prompt: 'Lead.' }, { name: 'bob', prompt: 'Review.' }] },
+      { laneId: 'lead-lane', kind: 'opencode', provider: 'opencode', selectedModel: 'openai/gpt-6-sol',
+        members: [{ name: 'alice', prompt: 'Build.' }] },
+    ] } },
     useNativeLane: () => { plan = { ...plan, lanes: [{ laneId: 'native-lane', kind: 'native',
       provider: 'anthropic', members: [{ name: 'team-lead', prompt: 'Lead.' }, { name: 'alice', prompt: 'Build.' }] }] } },
     removeLead: () => { plan = { ...plan, lanes: [{ ...plan.lanes[0]!,
@@ -535,6 +542,41 @@ describe('HostedTeamLeadInboxPump', () => {
     await pump.recover()
     await f.build().recover()
     expect(sent).toHaveLength(sends)
+  })
+
+  test('in a native-led team relays only to OpenCode members and never touches native inboxes', async () => {
+    const f = await fixture()
+    f.useMixedLanes()
+    const inbox = async (member: string, rows: Array<Record<string, unknown>>) => {
+      const path = join(f.root, 'inboxes', `${member}.json`)
+      await writeFile(path, JSON.stringify(rows))
+      await chmod(path, 0o644)
+      return path
+    }
+    await inbox('alice', [{ messageId: 'lead-to-alice', from: 'team-lead', text: 'Alice, build #t1.',
+      timestamp: '2026-09-24T10:01:00.000Z', read: false }])
+    const nativeInboxes = [
+      await inbox('bob', [{ messageId: 'alice-to-bob', from: 'alice', text: 'Please review.',
+        timestamp: '2026-09-24T10:02:00.000Z', read: false }]),
+      await inbox('team-lead', [{ messageId: 'alice-to-lead', from: 'alice', text: 'Done with #t1.',
+        timestamp: '2026-09-24T10:03:00.000Z', read: false }]),
+    ]
+    const before = await Promise.all(nativeInboxes.map(async path => [await readFile(path, 'utf8'),
+      (await lstat(path)).mode & 0o777] as const))
+    const sent: string[] = []
+    f.setBridge(async input => {
+      f.calls.push(input.command)
+      if (input.command === 'send') sent.push(String(input.memberName))
+      return { ok: true, data: { accepted: true, sessionId, runtimePromptMessageId: 'prompt-1' } }
+    })
+
+    await f.build().recover()
+    expect(sent).toEqual(['alice'])
+    const aliceRows = JSON.parse(await readFile(join(f.root, 'inboxes', 'alice.json'), 'utf8'))
+    expect(aliceRows.map((row: { read: boolean }) => row.read)).toEqual([true])
+    // The native lead and native teammates poll their own inboxes: bytes and mode stay as written.
+    expect(await Promise.all(nativeInboxes.map(async path => [await readFile(path, 'utf8'),
+      (await lstat(path)).mode & 0o777] as const))).toEqual(before)
   })
 
   test('a restart between the issued send and its acceptance never relays the row twice', async () => {
