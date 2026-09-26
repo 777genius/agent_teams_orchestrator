@@ -71,33 +71,12 @@ const committed = {
   },
 }
 
-/**
- * Stands in for the MCP bundle's hosted task command. It records what the Owner passed and then
- * behaves as `mode.json` in the Claude root says, since the Owner hands it no other environment.
- */
-const STUB = `
-const fs = require('fs')
-const path = require('path')
-const root = process.env.AGENT_TEAMS_MCP_CLAUDE_DIR
-const mode = JSON.parse(fs.readFileSync(path.join(root, 'mode.json'), 'utf8'))
-let input = ''
-process.stdin.on('data', chunk => { input += chunk })
-process.stdin.on('end', () => {
-  fs.writeFileSync(path.join(root, 'seen.json'), JSON.stringify({ argv: process.argv.slice(2), env: Object.keys(process.env).sort(), cwd: process.cwd(), input: JSON.parse(input) }))
-  const finish = () => {
-    if (mode.exit) process.exit(mode.exit)
-    process.stdout.write(mode.stdout)
-  }
-  if (mode.delayMs) setTimeout(finish, mode.delayMs)
-  else finish()
-})
-`
+const STUB = join(import.meta.dir, 'fixtures', 'hostedTaskCommandStub.cjs')
 
 async function fixture(mode: Record<string, unknown>) {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'hosted-task-writer-')))
   roots.push(root)
-  const entry = join(root, 'stub.cjs')
-  await writeFile(entry, STUB)
+  const entry = STUB
   await writeFile(join(root, 'mode.json'), JSON.stringify(mode))
   const diagnostics: HostedTaskCommandDiagnostic[] = []
   const writer = new HostedControllerTaskWriter({
@@ -177,7 +156,7 @@ describe('HostedControllerTaskWriter', () => {
     const foreign = { ...request, authority: { ...request.authority, restoreGeneration: 3 } }
     expect(await writer.mutateWithSelfWriteEffects(foreign)).toEqual({ result: { kind: 'unavailable' }, selfWriteEffects: [] })
 
-    const lost = new HostedControllerTaskWriter({ command: process.execPath, entry: join(root, 'stub.cjs'), claudeRoot: root, legacyKey: 'writer-team', authority, isCurrent: () => false })
+    const lost = new HostedControllerTaskWriter({ command: process.execPath, entry: STUB, claudeRoot: root, legacyKey: 'writer-team', authority, isCurrent: () => false })
     expect(await lost.mutateWithSelfWriteEffects(request)).toEqual({ result: { kind: 'unsafe_active' }, selfWriteEffects: [] })
     expect(await readFile(join(root, 'seen.json'), 'utf8').catch(() => null)).toBeNull()
   })
