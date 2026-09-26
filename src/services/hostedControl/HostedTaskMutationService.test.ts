@@ -280,7 +280,7 @@ describe('HostedTaskMutationService', () => {
     const movedKanban = JSON.parse(await readFile(join(root, 'teams', 'legacy', 'kanban-state.json'), 'utf8'))
     // Like desktop, todo is the pending status, not a kanban entry; only the target order is written.
     expect(Object.hasOwn(movedKanban.tasks, rawId)).toBe(false)
-    expect(JSON.parse(await readFile(join(root, 'tasks', 'legacy', `${rawId}.json`), 'utf8')).status).toBe('pending')
+    expect(JSON.parse(await readFile(join(root, 'tasks', 'legacy', `${rawId}.json`), 'utf8'))).toMatchObject({ status: 'pending', reviewState: 'none' })
     expect(Object.keys(movedKanban.columnOrder).sort()).toEqual(['futureColumn', 'review', 'todo'])
     expect(movedKanban.columnOrder.todo).toEqual([rawId]); expect(movedKanban.columnOrder.review).toEqual([])
   })

@@ -243,8 +243,10 @@ export class HostedTaskMutationService {
         if (current === command.column && currentOrder === clampedOrder) return { terminal: stateConflict(state) }
         placeTask(kanban, existing!.rawId, command.column, command.order, new Date(this.#now()).toISOString(), state.tasks); affected.push(command.taskId); kanbanChanged = true
         const status = STATUS_COLUMNS[command.column]
-        if (status && existing!.value.status !== status) {
-          taskAfter = taskText({ ...existing!.value, status }); taskTarget = `task:${basename(existing!.path)}`; taskTexts.set(basename(existing!.path), taskAfter)
+        // Leaving review or approved clears the review state, like desktop clearKanban.
+        const leavesReview = current === 'review' || current === 'approved'
+        if (status && (existing!.value.status !== status || leavesReview)) {
+          taskAfter = taskText({ ...existing!.value, status, ...(leavesReview ? { reviewState: 'none' } : {}) }); taskTarget = `task:${basename(existing!.path)}`; taskTexts.set(basename(existing!.path), taskAfter)
         }
         break
       }
