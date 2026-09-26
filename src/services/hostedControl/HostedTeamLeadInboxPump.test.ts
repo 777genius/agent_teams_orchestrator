@@ -163,7 +163,9 @@ describe('HostedTeamLeadInboxPump', () => {
     expect(await first.recover()).toEqual([{ kind: 'accepted' }])
     expect(f.calls).toEqual(['send'])
     const restarted = f.build()
-    expect(await restarted.recover()).toEqual([{ kind: 'observed' }])
+    // Recovery treats an accepted prompt whose row is read as delivered: no bridge call.
+    expect(await restarted.recover()).toEqual([{ kind: 'accepted' }])
+    expect(f.calls).toEqual(['send'])
     expect(await restarted.wake(message, authority)).toEqual({ kind: 'observed' })
     expect(f.calls).toEqual(['send', 'status', 'observe'])
     const [marker] = await readdir(join(f.root, 'hosted-team-lead-inbox-pump'))
@@ -221,7 +223,7 @@ describe('HostedTeamLeadInboxPump', () => {
     expect(JSON.parse(await readFile(join(f.root, 'hosted-team-lead-inbox-pump', marker!), 'utf8')).status)
       .toBe('accepted')
     expect(await f.build().recover()).toEqual([{ kind: 'accepted' }])
-    expect(f.calls).toEqual(['send', 'status', 'observe', 'status', 'observe'])
+    expect(f.calls).toEqual(['send', 'status', 'observe'])
   })
 
   test('crash at durable intent with unknown bridge outcome requires an operator', async () => {
@@ -380,7 +382,9 @@ describe('HostedTeamLeadInboxPump', () => {
       const f = await fixture()
       expect(await f.build().wake(message, authority)).toEqual({ kind: 'accepted' })
       f[mutate]()
-      expect(await f.build().recover()).toEqual([{ kind: 'unavailable' }])
+      // Delivered is final for recovery; only an explicit wake would reconcile it, under current fences.
+      expect(await f.build().recover()).toEqual([{ kind: 'accepted' }])
+      expect(await f.build().wake(message, authority)).toEqual({ kind: 'unavailable' })
       expect(f.calls).toEqual(['send'])
     }
   })
@@ -631,6 +635,40 @@ describe('HostedTeamLeadInboxPump', () => {
     await f.build().recover()
     expect(texts).toHaveLength(1)
     expect(texts[0]).toContain('First.')
+  })
+
+  test('a new inbox row is prompted on its file change, well before the next poll', async () => {
+    const f = await fixture()
+    const sent: string[] = []
+    f.setBridge(async input => {
+      f.calls.push(input.command)
+      if (input.command === 'send') sent.push(input.memberName ?? '')
+      return { ok: true, data: { accepted: true, sessionId, runtimePromptMessageId: 'prompt-1' } }
+    })
+    const pump = f.build()
+    pump.start(60_000)
+    const deadline = (ms: number) => Date.now() + ms
+    const until = async (condition: () => boolean, ms: number) => {
+      const end = deadline(ms)
+      while (!condition() && Date.now() < end) await new Promise(resolve => setTimeout(resolve, 20))
+    }
+    await until(() => sent.includes('team-lead'), 2_000)
+    expect(sent).toEqual(['team-lead'])
+    const startedAt = Date.now()
+    await writeFile(join(f.root, 'inboxes', 'alice.json'), JSON.stringify([
+      { messageId: 'relay-watch', from: 'team-lead', text: 'Now.', timestamp: '2026-09-24T10:05:00.000Z', read: false },
+    ]), { mode: 0o600 })
+    await until(() => sent.includes('alice'), 2_000)
+    expect(sent).toEqual(['team-lead', 'alice'])
+    expect(Date.now() - startedAt).toBeLessThan(2_000)
+
+    await pump.close()
+    await writeFile(join(f.root, 'inboxes', 'alice.json'), JSON.stringify([
+      { messageId: 'relay-watch', from: 'team-lead', text: 'Now.', timestamp: '2026-09-24T10:05:00.000Z', read: true },
+      { messageId: 'relay-after-close', from: 'team-lead', text: 'Late.', timestamp: '2026-09-24T10:06:00.000Z', read: false },
+    ]), { mode: 0o600 })
+    await new Promise(resolve => setTimeout(resolve, 400))
+    expect(sent).toEqual(['team-lead', 'alice'])
   })
 })
 

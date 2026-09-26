@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { statSync, watch, type FSWatcher } from 'node:fs'
 import { constants, lstat, mkdir, open, readdir, realpath } from 'node:fs/promises'
 import { dirname, isAbsolute, join } from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
@@ -38,6 +39,8 @@ const MAX_AMBIGUOUS_RECONCILIATIONS = 12
 /** A prompt the runtime provably never accepted may be sent this many times in total. */
 const MAX_SEND_ATTEMPTS = 3
 const LOCK_OPTIONS = { realpath: false, retries: { retries: 50, minTimeout: 5, maxTimeout: 100 } } as const
+/** Coalesces the burst of events one atomic inbox write produces (temp file, rename). */
+const INBOX_WATCH_DEBOUNCE_MS = 150
 
 type Selected = {
   planGeneration: string
@@ -152,6 +155,12 @@ export class HostedTeamLeadInboxPump {
   readonly #pending = new Set<Promise<void>>()
   #poller: ReturnType<typeof setInterval> | null = null
   #recovery: Promise<InboxPumpDecision[]> | null = null
+  /** Set when a change arrives during a pass; that pass is followed by exactly one more. */
+  #recoverAgain = false
+  #watcher: FSWatcher | null = null
+  /** Identity of the watched inboxes/ directory; a recreated directory is watched anew. */
+  #watchedInbox: string | null = null
+  #watchDebounce: ReturnType<typeof setTimeout> | null = null
   #accepting = true
 
   constructor(options: HostedTeamLeadInboxPumpOptions) {
@@ -188,14 +197,22 @@ export class HostedTeamLeadInboxPump {
     return work
   }
 
-  /** Install once during composition; the first active owner lease admits recovery. */
+  /**
+   * Install once during composition; the first active owner lease admits recovery.
+   * A watch on inboxes/ prompts a new row within the debounce, like desktop's file
+   * watcher; the poll stays the fallback for missed events and re-arms the watch.
+   */
   start(pollIntervalMs = 5_000): void {
     if (!this.#accepting || this.#poller) return
     if (!Number.isSafeInteger(pollIntervalMs) || pollIntervalMs < 100) {
       throw new TypeError('Invalid hosted inbox pump polling interval')
     }
-    this.#poller = setInterval(() => { void this.recover().catch(() => undefined) }, pollIntervalMs)
+    this.#poller = setInterval(() => {
+      this.#armInboxWatch()
+      void this.recover().catch(() => undefined)
+    }, pollIntervalMs)
     this.#poller.unref?.()
+    this.#armInboxWatch()
     setTimeout(() => { void this.recover().catch(() => undefined) }, 0).unref?.()
   }
 
@@ -206,6 +223,58 @@ export class HostedTeamLeadInboxPump {
     this.#recovery = recovery
     void recovery.finally(() => { if (this.#recovery === recovery) this.#recovery = null }).catch(() => undefined)
     return recovery
+  }
+
+  /** A change seen during a pass must not be lost to the pass already reading the old inbox. */
+  #requestRecovery(): void {
+    if (!this.#accepting) return
+    if (this.#recovery) {
+      if (this.#recoverAgain) return
+      this.#recoverAgain = true
+      void this.#recovery.catch(() => undefined).finally(() => {
+        this.#recoverAgain = false
+        void this.recover().catch(() => undefined)
+      })
+      return
+    }
+    void this.recover().catch(() => undefined)
+  }
+
+  /** Watches inboxes/; a missing or recreated directory is re-armed by the next poll. */
+  #armInboxWatch(): void {
+    if (!this.#accepting) return
+    const directory = join(this.#root, 'inboxes')
+    let identity: string
+    try {
+      const stat = statSync(directory)
+      if (!stat.isDirectory()) return
+      identity = `${stat.dev}:${stat.ino}`
+    } catch { return }
+    if (this.#watcher && this.#watchedInbox === identity) return
+    this.#watcher?.close()
+    this.#watcher = null
+    let watcher: FSWatcher
+    try {
+      watcher = watch(directory, { persistent: false }, (_event, name) => {
+        if (name !== null && !String(name).endsWith('.json')) return
+        if (this.#watchDebounce) clearTimeout(this.#watchDebounce)
+        this.#watchDebounce = setTimeout(() => {
+          this.#watchDebounce = null
+          this.#requestRecovery()
+        }, INBOX_WATCH_DEBOUNCE_MS)
+        this.#watchDebounce.unref?.()
+      })
+    } catch { return }
+    const drop = (): void => {
+      if (this.#watcher === watcher) this.#watcher = null
+      watcher.close()
+    }
+    watcher.on('error', drop)
+    watcher.on('close', () => { if (this.#watcher === watcher) this.#watcher = null })
+    this.#watcher = watcher
+    this.#watchedInbox = identity
+    // Rows written before the watch existed are picked up by this pass.
+    this.#requestRecovery()
   }
 
   async #recover(): Promise<InboxPumpDecision[]> {
@@ -330,7 +399,10 @@ export class HostedTeamLeadInboxPump {
       if (stored.status === 'native_inbox') return validNativeInboxRecord(stored) ? { kind: 'native_inbox' } : null
       if (!validIntent(stored)) return null
       if (stored.status === 'operator_required') return { kind: 'operator_required' }
-      return stored.status === 'observed' && stored.inboxReadCommitted === true ? { kind: 'observed' } : null
+      // An accepted prompt whose row is read is delivered; re-reconciling it every pass
+      // spent bridge calls and stretched the poll well past its interval.
+      if (stored.inboxReadCommitted !== true) return null
+      return stored.status === 'observed' || stored.status === 'accepted' ? { kind: stored.status } : null
     } catch { return null }
   }
 
@@ -339,6 +411,10 @@ export class HostedTeamLeadInboxPump {
     this.#abort.abort(new Error('Hosted inbox pump is closing'))
     if (this.#poller) clearInterval(this.#poller)
     this.#poller = null
+    if (this.#watchDebounce) clearTimeout(this.#watchDebounce)
+    this.#watchDebounce = null
+    this.#watcher?.close()
+    this.#watcher = null
     await this.#recovery?.catch(() => undefined)
     await Promise.all([...this.#pending])
   }
