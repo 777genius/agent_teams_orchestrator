@@ -8,7 +8,7 @@ import type { HostedTaskMutationRequest } from './protocol.js'
 
 // The same bytes live in agent-teams-ai docs/; both repositories pin this digest. Product
 // generates the cases by running the real `--hosted-task-command` of its MCP bundle.
-const GOLDEN_SHA256 = '1bc4ccaa4ce2cca7c8f80bc92aeafb1173d890a28d27a9b34f2a963feeb861f5'
+const GOLDEN_SHA256 = '68ce5ed8b0ae3bba7c2d8dbe365941d1e137111c3e800513b3b1153ac141ce74'
 const GOLDEN_PATH = resolve(import.meta.dir, '../../../docs/hosted-task-command-golden.json')
 const STUB = join(import.meta.dir, 'fixtures', 'hostedTaskCommandStub.cjs')
 
