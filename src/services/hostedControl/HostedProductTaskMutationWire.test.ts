@@ -37,7 +37,7 @@ const stableAuthority: HostedControlStableAuthority = {
 const teamIdentityBytes = `${JSON.stringify({ schemaVersion: 1, teamId: stableAuthority.teamId, createdAt: '2026-09-25T00:00:00.000Z' }, null, 2)}\n`
 const identityChecksum = createHash('sha256').update(teamIdentityBytes).digest('hex')
 
-type Operation = 'task_mutate' | 'message_persist' | 'message_deliver'
+type Operation = 'task_mutate' | 'message_send'
 
 /** Mirrors Product hostedTeamMessageOrchestratorAuthority.proof: the operation is signed. */
 function productProof(operation: Operation, direction: 'request' | 'response', envelope: Record<string, unknown>): string {
@@ -172,20 +172,20 @@ describe('Product task_mutate envelope', () => {
       const { ownerProof: _, ...unsigned } = taskRequest(createCommand())
       const foreign = { ...unsigned, authority: { ...unsigned.authority, restoreGeneration: 99, mountBinding: { ...unsigned.authority.mountBinding, declaredRootHash: 'b'.repeat(64) } } }
       await expect(dispatcher.dispatch({ ...foreign, ownerProof: productProof('task_mutate', 'request', foreign) })).rejects.toThrow('authority')
-      await expect(dispatcher.dispatch(productRequest('message_persist', { schemaVersion: 1 }, { grantRevision: 'd'.repeat(64), identityChecksum: 'e'.repeat(64) }))).rejects.toThrow('team identity')
+      await expect(dispatcher.dispatch(productRequest('message_send', { schemaVersion: 1 }, { grantRevision: 'd'.repeat(64), identityChecksum: 'e'.repeat(64) }))).rejects.toThrow('team identity')
     } finally {
       process.stderr.write = write
     }
     expect(lines.map(line => JSON.parse(line))).toEqual([
       { event: 'hosted_owner_bound', operation: 'task_mutate', stage: 'rejected', reason: 'authority:mountBinding.declaredRootHash,restoreGeneration' },
-      { event: 'hosted_owner_bound', operation: 'message_persist', stage: 'rejected', reason: 'team identity fence:identity-checksum-mismatch' },
+      { event: 'hosted_owner_bound', operation: 'message_send', stage: 'rejected', reason: 'team identity fence:identity-checksum-mismatch' },
     ])
     expect(lines.join('')).not.toContain('99')
   })
 
   test('routes no task or message frame that lacks the Product fence', async () => {
     const { root, dispatcher } = await fixture({ denyOwnerLocalWrites: false })
-    for (const request of [taskRequest(createCommand()), productRequest('message_persist', { schemaVersion: 1 })]) {
+    for (const request of [taskRequest(createCommand()), productRequest('message_send', { schemaVersion: 1 })]) {
       const { ownerEffectFence: _, ...authority } = request.authority
       expect(isProductOwnerBoundEnvelope({ ...request, authority })).toBe(false)
       expect(await dispatcher.dispatch({ ...request, authority })).toBeNull()
@@ -232,35 +232,33 @@ describe('Product task_mutate envelope', () => {
 })
 
 describe('Product message envelopes', () => {
-  const persistPayload = { schemaVersion: 1, teamId: stableAuthority.teamId, clientMessageId: 'client_message_product-wire', text: 'hello from the browser' }
-  const deliverPayload = { teamId: stableAuthority.teamId, messageId: `message_${'5'.repeat(32)}`, clientMessageId: 'client_message_product-wire', text: 'hello from the browser' }
+  const sendPayload = { schemaVersion: 1, teamId: stableAuthority.teamId, clientMessageId: 'client_message_product-wire', text: 'hello from the browser' }
 
-  test('persists and delivers through the message port and signs Product responses', async () => {
+  test('sends through the message port in one exchange and signs the Product response', async () => {
     const calls: Parameters<HostedTeamMessagePort['dispatch']>[0][] = []
     const { dispatcher } = await fixture({
       denyOwnerLocalWrites: true,
       messages: { dispatch: async input => {
         calls.push(input)
-        return input.operation === 'message_persist'
-          ? { schemaVersion: 2, kind: 'persisted', receipt: { schemaVersion: 1, teamId: stableAuthority.teamId, messageId: deliverPayload.messageId, clientMessageId: persistPayload.clientMessageId, persistence: 'durable' } }
-          : { schemaVersion: 2, kind: 'delivered' }
+        return { schemaVersion: 2, kind: 'persisted', runtimeDelivery: 'delivered', receipt: { schemaVersion: 1,
+          teamId: stableAuthority.teamId, messageId: `message_${'5'.repeat(32)}`,
+          clientMessageId: sendPayload.clientMessageId, persistence: 'durable' } }
       } },
     })
-    const persist = productRequest('message_persist', persistPayload)
-    expect(productVerifiedPayload(persist, (await dispatcher.dispatch(persist))!)).toMatchObject({ schemaVersion: 2, kind: 'persisted' })
-    const deliver = productRequest('message_deliver', deliverPayload)
-    expect(productVerifiedPayload(deliver, (await dispatcher.dispatch(deliver))!)).toEqual({ schemaVersion: 2, kind: 'delivered' })
-    expect(calls.map(call => call.operation)).toEqual(['message_persist', 'message_deliver'])
+    const send = productRequest('message_send', sendPayload)
+    expect(productVerifiedPayload(send, (await dispatcher.dispatch(send))!))
+      .toMatchObject({ schemaVersion: 2, kind: 'persisted', runtimeDelivery: 'delivered' })
+    expect(calls.map(call => call.operation)).toEqual(['message_send'])
     expect(calls[0]!.authority).toEqual({ actorId: 'actor_product', ...stableAuthority })
-    expect(calls[0]!.payload).toEqual(persistPayload)
+    expect(calls[0]!.payload).toEqual(sendPayload)
   })
 
   test('never reaches the message port with a stale identity fence or a wrong exchange id', async () => {
     const { dispatcher, messageCalls } = await fixture({ denyOwnerLocalWrites: true })
-    await expect(dispatcher.dispatch(productRequest('message_persist', persistPayload, { grantRevision: 'd'.repeat(64), identityChecksum: 'e'.repeat(64) }))).rejects.toThrow('team identity')
-    const { ownerProof: _, ...unsigned } = productRequest('message_deliver', deliverPayload)
+    await expect(dispatcher.dispatch(productRequest('message_send', sendPayload, { grantRevision: 'd'.repeat(64), identityChecksum: 'e'.repeat(64) }))).rejects.toThrow('team identity')
+    const { ownerProof: _, ...unsigned } = productRequest('message_send', sendPayload)
     const taskIdForMessage = { ...unsigned, exchangeId: `task-request_${'9'.repeat(32)}` }
-    await expect(dispatcher.dispatch({ ...taskIdForMessage, ownerProof: productProof('message_deliver', 'request', taskIdForMessage) })).rejects.toThrow('owner-bound request')
+    await expect(dispatcher.dispatch({ ...taskIdForMessage, ownerProof: productProof('message_send', 'request', taskIdForMessage) })).rejects.toThrow('owner-bound request')
     expect(messageCalls).toEqual([])
   })
 })

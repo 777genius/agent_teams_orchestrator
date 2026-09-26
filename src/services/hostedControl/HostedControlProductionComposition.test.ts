@@ -22,7 +22,6 @@ import {
   createHostedControlProductionPorts,
   HOSTED_LIFECYCLE_EXECUTION_STATE_FILE,
   HOSTED_LIFECYCLE_PLAN_FILE,
-  HOSTED_MESSAGE_DIRECTORY,
   HOSTED_APPROVAL_RUNTIME_ADMISSION_FILE,
   OPEN_CODE_HOSTED_APPROVAL_ATOMIC_REPLY_SUPPORTED,
 } from './HostedControlProductionComposition.js'
@@ -122,7 +121,7 @@ describe('createHostedControlProductionPorts', () => {
     })
 
     const persisted = await ports.messages.dispatch({
-      operation: 'message_persist',
+      operation: 'message_send',
       authority: { actorId: 'actor-a', ...stableAuthority },
       payload: {
         schemaVersion: 1,
@@ -131,8 +130,8 @@ describe('createHostedControlProductionPorts', () => {
         text: 'persist me',
       },
     })
-    expect(persisted.kind).toBe('persisted')
-    expect(await readdir(join(teamRoot, HOSTED_MESSAGE_DIRECTORY))).toHaveLength(1)
+    expect(persisted).toMatchObject({ kind: 'persisted', runtimeDelivery: 'delivered' })
+    expect(await readdir(join(teamRoot, 'inboxes'))).toEqual(['team-lead.json'])
     expect(await readdir(teamRoot)).not.toContain(HOSTED_LIFECYCLE_EXECUTION_STATE_FILE)
   })
 
@@ -403,18 +402,12 @@ describe('createHostedControlProductionPorts', () => {
     ports.onReadinessLease?.()
     const authority = { actorId: 'actor-a', ...stableAuthority }
     const text = 'A durable hosted message.'
-    const persisted = await ports.messages.dispatch({
-      operation: 'message_persist', authority,
+    const sent = await ports.messages.dispatch({
+      operation: 'message_send', authority,
       payload: { schemaVersion: 1, teamId, clientMessageId: 'client_message_inbox-disabled', text },
     })
-    expect(persisted.kind).toBe('persisted')
-    const receipt = persisted.receipt as { messageId: string }
-    const delivered = await ports.messages.dispatch({
-      operation: 'message_deliver', authority,
-      payload: { teamId, messageId: receipt.messageId,
-        clientMessageId: 'client_message_inbox-disabled', text },
-    })
-    expect(delivered.kind).toBe('delivered')
+    // Without an OpenCode pump the appended row is the delivery.
+    expect(sent).toMatchObject({ kind: 'persisted', runtimeDelivery: 'delivered' })
     expect(await readdir(oldPumpRoot)).toEqual(['persisted-intent.json'])
     expect(await readFile(oldIntent, 'utf8')).toBe('previous runtime intent\n')
     await ports.close()
@@ -530,8 +523,8 @@ describe('createHostedPersonalHostLocalPortFactory', () => {
       createInboxPump: options => {
         expect(options.canonicalTeamRoot).toBe(teamRoot)
         return {
-          wake: async ({ recipient, message }) => {
-            woken.push({ recipient, messageId: message.messageId })
+          wakeRecipient: async (recipient, messageId) => {
+            woken.push({ recipient, messageId })
             return { kind: 'observed' }
           },
           recover: async () => { events.push('recover'); return [] },
@@ -580,7 +573,7 @@ describe('createHostedPersonalHostLocalPortFactory', () => {
         new HostedOpenCodeLaunchCapabilityStore(context.teamRoot))],
       createInboxPump: options => {
         pumpOptions.push(options)
-        return { wake: async () => ({ kind: 'observed' }), recover: async () => [],
+        return { wakeRecipient: async () => ({ kind: 'observed' }), recover: async () => [],
           start: () => undefined, close: async () => undefined }
       },
     })(personalContext(teamRoot, workspace))
@@ -639,7 +632,7 @@ describe('createHostedPersonalHostLocalPortFactory', () => {
           launches.push(input.runId)
           return { phase: 'running', recoverable: false }
         } })],
-        createInboxPump: () => ({ wake: async () => ({ kind: 'observed' }), recover: async () => [],
+        createInboxPump: () => ({ wakeRecipient: async () => ({ kind: 'observed' }), recover: async () => [],
           start: () => undefined, close: async () => undefined }),
       })(personalContext(teamRoot, variant === 'hash' ? join(teamRoot, 'other') : declared))
       const { request } = await reservedLaunchRequest(ports, teamRoot)
@@ -768,17 +761,12 @@ async function deliverLeadMessage(ports: HostedControlRuntimePorts, workspace: s
     declaredRootHash: createHash('sha256').update(workspace).digest('hex'),
   } }
   const text = 'Wake the lead.'
-  const persisted = await ports.messages.dispatch({
-    operation: 'message_persist', authority,
+  const sent = await ports.messages.dispatch({
+    operation: 'message_send', authority,
     payload: { schemaVersion: 1, teamId, clientMessageId: 'client_message_personal-wake', text },
   })
-  const { messageId } = persisted.receipt as { messageId: string }
-  const delivered = await ports.messages.dispatch({
-    operation: 'message_deliver', authority,
-    payload: { teamId, messageId, clientMessageId: 'client_message_personal-wake', text },
-  })
-  expect(delivered.kind).toBe('delivered')
-  return messageId
+  expect(sent).toMatchObject({ kind: 'persisted', runtimeDelivery: 'delivered' })
+  return (sent.receipt as { messageId: string }).messageId
 }
 
 async function reservedLaunchRequest(ports: HostedControlRuntimePorts, teamRoot: string) {

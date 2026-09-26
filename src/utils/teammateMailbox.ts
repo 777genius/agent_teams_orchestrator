@@ -117,7 +117,11 @@ export type VerifiedMailboxWriteReceipt = {
 }
 
 export type ExplicitRootVerifiedMailboxWriteResult =
-  | ({ kind: 'written' | 'idempotent_replay' } & VerifiedMailboxWriteReceipt)
+  | ({
+      kind: 'written' | 'idempotent_replay'
+      /** Timestamp of the stored row, which a replay keeps. */
+      timestamp: string
+    } & VerifiedMailboxWriteReceipt)
   | { kind: 'conflict' }
 
 export const MAILBOX_STALE_CLAIM_TIMEOUT_MS = 5 * 60 * 1000
@@ -419,6 +423,12 @@ export async function writeToMailboxAtCanonicalTeamRootVerified(input: {
   canonicalTeamRoot: string
   recipientName: string
   message: Omit<RawTeammateMessage, 'read'>
+  /**
+   * `exact` (default) replays only an identical row. `same_content` replays a row
+   * with the same id, sender and text whatever its timestamp: a retried send of a
+   * deterministic message id is the same message written earlier.
+   */
+  replay?: 'exact' | 'same_content'
 }): Promise<ExplicitRootVerifiedMailboxWriteResult> {
   if (
     !isAbsolute(input.canonicalTeamRoot) ||
@@ -466,14 +476,20 @@ export async function writeToMailboxAtCanonicalTeamRootVerified(input: {
     const messages = await readMailboxPathStrict(inboxPath)
     const existing = messages.filter(row => row.messageId === messageId)
     if (existing.length > 0) {
-      return existing.length === 1 &&
-        hasVerifiedMailboxMessage(existing, canonicalMessage)
+      const replayed =
+        existing.length === 1 &&
+        (input.replay === 'same_content'
+          ? existing[0]!.from === canonicalMessage.from &&
+            existing[0]!.text === canonicalMessage.text
+          : hasVerifiedMailboxMessage(existing, canonicalMessage))
+      return replayed
         ? {
             kind: 'idempotent_replay',
             messageId,
             inboxPath,
             attempts: 0,
             totalMessages: messages.length,
+            timestamp: existing[0]!.timestamp,
           }
         : { kind: 'conflict' }
     }
@@ -501,6 +517,7 @@ export async function writeToMailboxAtCanonicalTeamRootVerified(input: {
       kind: 'written',
       messageId,
       inboxPath,
+      timestamp: canonicalMessage.timestamp,
       attempts: 1,
       totalMessages: readback.length,
     }

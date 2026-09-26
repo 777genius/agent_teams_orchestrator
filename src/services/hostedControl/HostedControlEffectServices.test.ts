@@ -28,11 +28,9 @@ describe('createHostedControlEffectServices', () => {
     const root = await mkdtemp(join(tmpdir(), 'hosted-effect-services-'))
     roots.push(root)
     const services = createHostedControlEffectServices({
-      messageDirectory: join(root, 'messages'),
-      teamId,
+      canonicalTeamRoot: root,
       lifecycleGuard: { isCurrent: () => true },
       messageGuard: { isCurrent: () => true },
-      messageDelivery: { deliver: async () => ({ kind: 'delivered' }) },
     })
     await expect(services.lifecycle.dispatch({
       operation: 'control_state',

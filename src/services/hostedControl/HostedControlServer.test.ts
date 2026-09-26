@@ -337,7 +337,7 @@ describe('HostedControlServer', () => {
       dispatchCoexistingOperation: async message => { dispatched += 1; markStarted(); await gate; return { schemaVersion: 2, operation: message.operation, payload: { schemaVersion: 2, kind: 'delivered' } } } })
     servers.push(server); await server.start()
     await openReadiness(socketPath, server.ownerBinding!)
-    const frame = `${JSON.stringify({ schemaVersion: 2, exchangeId: `message-request_${'9'.repeat(32)}`, operation: 'message_deliver', ownerBinding: server.ownerBinding, authority: { ...unsigned.authority, actorId: 'actor', ownerEffectFence: { grantRevision: 'd'.repeat(64), identityChecksum: 'e'.repeat(64) } }, payload: {}, ownerProof: '0'.repeat(64) })}\n`
+    const frame = `${JSON.stringify({ schemaVersion: 2, exchangeId: `message-request_${'9'.repeat(32)}`, operation: 'message_send', ownerBinding: server.ownerBinding, authority: { ...unsigned.authority, actorId: 'actor', ownerEffectFence: { grantRevision: 'd'.repeat(64), identityChecksum: 'e'.repeat(64) } }, payload: {}, ownerProof: '0'.repeat(64) })}\n`
 
     expect(await exchange(socketPath, `${frame}x`)).toBe('')
     expect(dispatched).toBe(0)

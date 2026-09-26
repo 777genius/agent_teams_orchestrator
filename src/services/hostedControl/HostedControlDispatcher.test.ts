@@ -121,6 +121,7 @@ describe('HostedControlDispatcher response decoding', () => {
         schemaVersion: 2,
         kind: 'persisted',
         receipt: { schemaVersion: 1, teamId: authority.teamId, extension: true },
+        runtimeDelivery: 'delivered',
       }) },
     })
     await expect(dispatcher.dispatch(signedMessageRequest())).rejects.toThrow('keys')
@@ -140,7 +141,7 @@ describe('HostedControlDispatcher response decoding', () => {
       verifyOwnerEffectFence: async () => 'current',
     })
     const persisted = (extra: Record<string, unknown>) =>
-      ({ schemaVersion: 2, kind: 'persisted', receipt: { ...receipt, ...extra } })
+      ({ schemaVersion: 2, kind: 'persisted', receipt: { ...receipt, ...extra }, runtimeDelivery: 'delivered' })
 
     await expect(respond(persisted({ recipient: 'alice' })).dispatch(signedMessageRequest('alice')))
       .resolves.toMatchObject({ payload: { receipt: { recipient: 'alice' } } })
@@ -571,7 +572,7 @@ function signedMessageRequest(recipient?: string): Record<string, unknown> {
   const unsigned = {
     schemaVersion: 2,
     exchangeId: `message-request_${'d'.repeat(32)}`,
-    operation: 'message_persist',
+    operation: 'message_send',
     ownerBinding,
     authority: { actorId: 'actor-a', ...authority, ownerEffectFence: lifecycleAuthority.ownerEffectFence },
     payload: {
@@ -584,6 +585,6 @@ function signedMessageRequest(recipient?: string): Record<string, unknown> {
   }
   return {
     ...unsigned,
-    ownerProof: productOwnerBoundProof(secret, HOSTED_TEAM_MESSAGE_PROOF_DOMAIN, 'message_persist', 'request', unsigned),
+    ownerProof: productOwnerBoundProof(secret, HOSTED_TEAM_MESSAGE_PROOF_DOMAIN, 'message_send', 'request', unsigned),
   }
 }

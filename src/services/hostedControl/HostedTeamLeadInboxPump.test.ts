@@ -5,12 +5,11 @@ import { join } from 'node:path'
 
 import type { OpenCodeSessionRecord } from '../opencode/types.js'
 import type { TeamLifecycleLaunchPlan } from '../teamLifecycleOwner/TeamLifecycleLaunchPlan.js'
-import { HostedTeamLeadMessageDelivery } from './HostedTeamLeadMessageDelivery.js'
+import { writeToMailboxAtCanonicalTeamRootVerified } from '../../utils/teammateMailbox.js'
 import {
   HostedTeamLeadInboxPump,
   type HostedTeamLeadInboxPumpOptions,
 } from './HostedTeamLeadInboxPump.js'
-import { HostedTeamRecipientRoster } from './HostedTeamRecipientRoster.js'
 import type { HostedControlAuthority } from './protocol.js'
 
 const roots: string[] = []
@@ -20,10 +19,19 @@ const authority: HostedControlAuthority = {
   restoreGeneration: 1, workspaceId: 'workspace-a',
   mountBinding: { mountGeneration: 1, declaredRootHash: 'b'.repeat(64) }, teamId,
 }
+/** An operator row as message_send appends it to team-lead's inbox. */
 const message = {
-  teamId, messageId: `message_${'c'.repeat(32)}`,
-  clientMessageId: 'client_message_inbox-pump', text: 'Message the lead.',
-  createdAt: '2026-09-24T10:00:00.000Z',
+  messageId: `message_${'c'.repeat(32)}`, text: 'Message the lead.', createdAt: '2026-09-24T10:00:00.000Z',
+}
+const appendOperatorRow = (root: string, recipientName: string, row: typeof message) =>
+  writeToMailboxAtCanonicalTeamRootVerified({ canonicalTeamRoot: root, recipientName,
+    message: { messageId: row.messageId, from: 'user', text: row.text, timestamp: row.createdAt } })
+const wakeLead = (pump: HostedTeamLeadInboxPump) => pump.wakeRecipient('team-lead', message.messageId)
+/** Simulates a crash before the read commit reached the inbox. */
+async function markLeadRowUnread(root: string): Promise<void> {
+  const path = join(root, 'inboxes', 'team-lead.json')
+  const rows = JSON.parse(await readFile(path, 'utf8')) as Array<Record<string, unknown>>
+  await writeFile(path, JSON.stringify(rows.map(row => ({ ...row, read: false }))), { mode: 0o600 })
 }
 const sessionId = 'session-lead'
 const runId = `run_${'d'.repeat(32)}`
@@ -41,11 +49,7 @@ async function fixture() {
   const workspace = join(parent, 'workspace')
   await mkdir(root, { mode: 0o700 })
   await mkdir(workspace, { mode: 0o700 })
-  const delivery = new HostedTeamLeadMessageDelivery({
-    canonicalTeamRoot: root, legacyKey: 'legacy', authority,
-    guard: { isCurrent: async () => true },
-  })
-  expect(await delivery.deliver(message, authority)).toEqual({ kind: 'delivered' })
+  expect((await appendOperatorRow(root, 'team-lead', message)).kind).toBe('written')
   let plan: TeamLifecycleLaunchPlan = {
     schemaVersion: 2, workspaceId: authority.workspaceId, teamId,
     workspaceRoot: workspace, toolApprovalMode: 'manual', lanes: [{
@@ -162,15 +166,17 @@ describe('HostedTeamLeadInboxPump', () => {
     const first = f.build()
     expect(await first.recover()).toEqual([{ kind: 'accepted' }])
     expect(f.calls).toEqual(['send'])
+    // The accepted row is read now: a restarted pump neither prompts nor reconciles it.
     const restarted = f.build()
-    // Recovery treats an accepted prompt whose row is read as delivered: no bridge call.
-    expect(await restarted.recover()).toEqual([{ kind: 'accepted' }])
+    expect(await restarted.recover()).toEqual([])
+    expect(await wakeLead(restarted)).toEqual({ kind: 'accepted' })
     expect(f.calls).toEqual(['send'])
-    expect(await restarted.wake(message, authority)).toEqual({ kind: 'observed' })
-    expect(f.calls).toEqual(['send', 'status', 'observe'])
     const [marker] = await readdir(join(f.root, 'hosted-team-lead-inbox-pump'))
     expect(JSON.parse(await readFile(join(f.root, 'hosted-team-lead-inbox-pump', marker!), 'utf8')))
-      .toMatchObject({ status: 'observed', message, selected: { sessionId, runId, laneId: 'lead-lane' } })
+      .toMatchObject({ status: 'accepted', inboxReadCommitted: true,
+        message: { text: message.text, createdAt: message.createdAt,
+          relay: { sourceMessageId: message.messageId, from: 'user', replyRecipient: 'user' } },
+        selected: { sessionId, runId, laneId: 'lead-lane' } })
   })
 
   test('ambiguous prompt outcome is reconciled and never blindly sent again', async () => {
@@ -181,7 +187,7 @@ describe('HostedTeamLeadInboxPump', () => {
       if (input.command === 'status') return { ok: true, data: { status: 'prompt_submitting', accepted: false, safeToRetry: false } }
       return { ok: false }
     })
-    expect(await f.build().wake(message, authority)).toEqual({ kind: 'pending' })
+    expect(await wakeLead(f.build())).toEqual({ kind: 'pending' })
     expect(await f.build().recover()).toEqual([{ kind: 'pending' }])
     expect(f.calls).toEqual(['send', 'status', 'status'])
     for (let check = 0; check < 9; check++) {
@@ -201,8 +207,8 @@ describe('HostedTeamLeadInboxPump', () => {
       } }
       return { ok: true, data: { observed: true, sessionId, responseObservation: verifiedObservation } }
     })
-    expect(await f.build().wake(message, authority)).toEqual({ kind: 'observed' })
-    expect(await f.build().recover()).toEqual([{ kind: 'observed' }])
+    expect(await wakeLead(f.build())).toEqual({ kind: 'observed' })
+    expect(await f.build().recover()).toEqual([])
     expect(f.calls).toEqual(['send', 'status', 'observe'])
   })
 
@@ -218,22 +224,23 @@ describe('HostedTeamLeadInboxPump', () => {
         state: 'reconcile_failed', deliveredUserMessageId: null, assistantMessageId: null,
       } } }
     })
-    expect(await f.build().wake(message, authority)).toEqual({ kind: 'accepted' })
+    expect(await wakeLead(f.build())).toEqual({ kind: 'accepted' })
     const [marker] = await readdir(join(f.root, 'hosted-team-lead-inbox-pump'))
     expect(JSON.parse(await readFile(join(f.root, 'hosted-team-lead-inbox-pump', marker!), 'utf8')).status)
       .toBe('accepted')
-    expect(await f.build().recover()).toEqual([{ kind: 'accepted' }])
+    expect(await f.build().recover()).toEqual([])
     expect(f.calls).toEqual(['send', 'status', 'observe'])
   })
 
   test('crash at durable intent with unknown bridge outcome requires an operator', async () => {
     const f = await fixture()
-    expect(await f.build().wake(message, authority)).toEqual({ kind: 'accepted' })
+    expect(await wakeLead(f.build())).toEqual({ kind: 'accepted' })
     const [name] = await readdir(join(f.root, 'hosted-team-lead-inbox-pump'))
     const path = join(f.root, 'hosted-team-lead-inbox-pump', name!)
-    const persisted = JSON.parse(await readFile(path, 'utf8'))
+    const { inboxReadCommitted: _read, ...persisted } = JSON.parse(await readFile(path, 'utf8'))
     await writeFile(path, `${JSON.stringify({ ...persisted, status: 'intent',
       runtimePromptMessageId: undefined })}\n`, { mode: 0o600 })
+    await markLeadRowUnread(f.root)
     f.calls.length = 0
     f.setBridge(async input => {
       f.calls.push(input.command)
@@ -245,43 +252,36 @@ describe('HostedTeamLeadInboxPump', () => {
     expect(JSON.parse(await readFile(path, 'utf8')).status).toBe('operator_required')
   })
 
-  test('recovery answers a terminal intent without rereading the inbox or the bridge', async () => {
+  test('an operator_required or foreign intent is never prompted again while its row stays unread', async () => {
     const f = await fixture()
-    expect(await f.build().wake(message, authority)).toEqual({ kind: 'accepted' })
-    expect(await f.build().wake(message, authority)).toEqual({ kind: 'observed' })
+    expect(await wakeLead(f.build())).toEqual({ kind: 'accepted' })
     const [name] = await readdir(join(f.root, 'hosted-team-lead-inbox-pump'))
     const path = join(f.root, 'hosted-team-lead-inbox-pump', name!)
-    const observed = JSON.parse(await readFile(path, 'utf8'))
-    expect(observed).toMatchObject({ status: 'observed', inboxReadCommitted: true })
-    // An unsafe inbox fails every path that reads it, so a skipped read is observable.
-    const inbox = join(f.root, 'inboxes', 'team-lead.json')
-    await chmod(inbox, 0o664)
+    const accepted = JSON.parse(await readFile(path, 'utf8'))
+    await markLeadRowUnread(f.root)
     f.calls.length = 0
-    expect(await f.build().recover()).toEqual([{ kind: 'observed' }])
-    expect(await f.build().wake(message, authority)).toEqual({ kind: 'operator_required' })
-    await writeFile(path, `${JSON.stringify({ ...observed, status: 'operator_required' })}\n`, { mode: 0o600 })
+    await writeFile(path, `${JSON.stringify({ ...accepted, status: 'operator_required' })}\n`, { mode: 0o600 })
+    expect(await f.build().recover()).toEqual([{ kind: 'operator_required' }])
+    // A record for another actor is not trusted and is left for an operator.
+    await writeFile(path, `${JSON.stringify({ ...accepted,
+      authority: { ...accepted.authority, actorId: 'actor-b' } })}\n`, { mode: 0o600 })
     expect(await f.build().recover()).toEqual([{ kind: 'operator_required' }])
     expect(f.calls).toEqual([])
-
-    // A record for another actor is not trusted as terminal and takes the full wake path.
-    await writeFile(path, `${JSON.stringify({ ...observed,
-      authority: { ...observed.authority, actorId: 'actor-b' } })}\n`, { mode: 0o600 })
-    expect(await f.build().recover()).toEqual([{ kind: 'operator_required' }])
-    await chmod(inbox, 0o600)
-    expect(await f.build().recover()).toEqual([{ kind: 'operator_required' }])
     expect(JSON.parse(await readFile(path, 'utf8')).authority.actorId).toBe('actor-b')
   })
 
   test('recovery still commits the inbox read of an observed prompt', async () => {
     const f = await fixture()
-    expect(await f.build().wake(message, authority)).toEqual({ kind: 'accepted' })
-    expect(await f.build().wake(message, authority)).toEqual({ kind: 'observed' })
+    expect(await wakeLead(f.build())).toEqual({ kind: 'accepted' })
     const [name] = await readdir(join(f.root, 'hosted-team-lead-inbox-pump'))
     const path = join(f.root, 'hosted-team-lead-inbox-pump', name!)
     const { inboxReadCommitted: _, ...uncommitted } = JSON.parse(await readFile(path, 'utf8'))
-    await writeFile(path, `${JSON.stringify(uncommitted)}\n`, { mode: 0o600 })
+    await writeFile(path, `${JSON.stringify({ ...uncommitted, status: 'observed' })}\n`, { mode: 0o600 })
+    await markLeadRowUnread(f.root)
     expect(await f.build().recover()).toEqual([{ kind: 'observed' }])
     expect(JSON.parse(await readFile(path, 'utf8'))).toMatchObject({ status: 'observed', inboxReadCommitted: true })
+    const [row] = JSON.parse(await readFile(join(f.root, 'inboxes', 'team-lead.json'), 'utf8'))
+    expect(row.read).toBe(true)
   })
 
   test('periodic recovery submits a queued row when the selected run becomes active', async () => {
@@ -302,7 +302,7 @@ describe('HostedTeamLeadInboxPump', () => {
   test('does not reroute a missing lead message to a worker session', async () => {
     const f = await fixture()
     f.removeLead()
-    expect(await f.build().wake(message, authority)).toEqual({ kind: 'unavailable' })
+    expect(await wakeLead(f.build())).toEqual({ kind: 'unavailable' })
     expect(f.calls).toEqual([])
   })
 
@@ -325,7 +325,7 @@ describe('HostedTeamLeadInboxPump', () => {
         return { ok: true, data: { status: 'unknown', accepted: false } }
       })
       const pump = f.build()
-      const pending = pump.wake(message, authority)
+      const pending = wakeLead(pump)
       await started
       const closing = change === 'close' ? pump.close() : null
       if (change !== 'close') f[change]()
@@ -361,7 +361,7 @@ describe('HostedTeamLeadInboxPump', () => {
         }
         return { ok: true, data: { status: 'unknown', accepted: false } }
       })
-      const pending = f.build().wake(message, authority)
+      const pending = wakeLead(f.build())
       await started
       f[change]()
       resume()
@@ -375,16 +375,16 @@ describe('HostedTeamLeadInboxPump', () => {
     for (const mutate of ['stop', 'revoke'] as const) {
       const f = await fixture()
       f[mutate]()
-      expect(await f.build().wake(message, authority)).toEqual({ kind: 'unavailable' })
+      expect(await wakeLead(f.build())).toEqual({ kind: 'unavailable' })
       expect(f.calls).toEqual([])
     }
     for (const mutate of ['stop', 'replaceSession', 'replacePlan', 'revoke'] as const) {
       const f = await fixture()
-      expect(await f.build().wake(message, authority)).toEqual({ kind: 'accepted' })
+      expect(await wakeLead(f.build())).toEqual({ kind: 'accepted' })
+      await markLeadRowUnread(f.root)
       f[mutate]()
-      // Delivered is final for recovery; only an explicit wake would reconcile it, under current fences.
-      expect(await f.build().recover()).toEqual([{ kind: 'accepted' }])
-      expect(await f.build().wake(message, authority)).toEqual({ kind: 'unavailable' })
+      // An accepted prompt is only reconciled under the fences it was sent with.
+      expect(await f.build().recover()).toEqual([{ kind: 'unavailable' }])
       expect(f.calls).toEqual(['send'])
     }
   })
@@ -402,11 +402,11 @@ describe('HostedTeamLeadInboxPump', () => {
       return { ok: true, data: { accepted: true, sessionId, runtimePromptMessageId: 'prompt-1' } }
     })
     const pump = f.build()
-    const pending = pump.wake(message, authority)
+    const pending = wakeLead(pump)
     await entered
     let closed = false
     const closing = pump.close().then(() => { closed = true })
-    expect(await pump.wake(message, authority)).toEqual({ kind: 'unavailable' })
+    expect(await wakeLead(pump)).toEqual({ kind: 'unavailable' })
     expect(closed).toBe(false)
     release()
     expect(await pending).toEqual({ kind: 'accepted' })
@@ -417,15 +417,9 @@ describe('HostedTeamLeadInboxPump', () => {
 
   test('prompts the addressed teammate with the delivery contract and marks its inbox row read', async () => {
     const f = await fixture()
-    await writeFile(join(f.root, 'config.json'), JSON.stringify({
-      members: [{ name: 'team-lead', agentType: 'team-lead' }, { name: 'alice' }],
-    }), { mode: 0o600 })
-    const dm = { ...message, messageId: `message_${'f'.repeat(32)}`,
-      clientMessageId: 'client_message_inbox-pump-dm', text: 'Alice, check the build.', recipient: 'alice' }
-    expect(await new HostedTeamLeadMessageDelivery({
-      canonicalTeamRoot: f.root, legacyKey: 'legacy', authority, guard: { isCurrent: async () => true },
-      recipients: new HostedTeamRecipientRoster(f.root),
-    }).deliver(dm, authority)).toEqual({ kind: 'delivered' })
+    const dm = { messageId: `message_${'f'.repeat(32)}`, text: 'Alice, check the build.',
+      createdAt: '2026-09-24T10:00:30.000Z' }
+    expect((await appendOperatorRow(f.root, 'alice', dm)).kind).toBe('written')
     const sent: Array<{ memberName?: string; text?: string }> = []
     f.setBridge(async input => {
       f.calls.push(input.command)
@@ -433,7 +427,7 @@ describe('HostedTeamLeadInboxPump', () => {
       return { ok: true, data: { accepted: true, sessionId, runtimePromptMessageId: 'prompt-1' } }
     })
 
-    expect(await f.build().wake(dm, authority)).toEqual({ kind: 'accepted' })
+    expect(await f.build().wakeRecipient('alice', dm.messageId)).toEqual({ kind: 'accepted' })
     expect(sent).toHaveLength(1)
     expect(sent[0]!.memberName).toBe('alice')
     expect(sent[0]!.text).toStartWith('<opencode_app_message_delivery>')
@@ -447,12 +441,13 @@ describe('HostedTeamLeadInboxPump', () => {
     expect(lead).toEqual([expect.objectContaining({ messageId: message.messageId, read: false })])
 
     // A replayed wake is idempotent: no second prompt, the read commit is durable.
-    expect(await f.build().wake(dm, authority)).toEqual({ kind: 'accepted' })
+    expect(await f.build().wakeRecipient('alice', dm.messageId)).toEqual({ kind: 'accepted' })
     expect(sent).toHaveLength(1)
     const intents = await Promise.all((await readdir(join(f.root, 'hosted-team-lead-inbox-pump')))
       .map(async name => JSON.parse(await readFile(join(f.root, 'hosted-team-lead-inbox-pump', name), 'utf8'))))
     expect(intents).toEqual([expect.objectContaining({
-      message: dm, status: 'accepted', inboxReadCommitted: true,
+      message: expect.objectContaining({ recipient: 'alice', relay: expect.objectContaining({ sourceMessageId: dm.messageId }) }),
+      status: 'accepted', inboxReadCommitted: true,
     })])
   })
 
@@ -460,9 +455,10 @@ describe('HostedTeamLeadInboxPump', () => {
     const f = await fixture()
     f.useNativeLane()
     const pump = f.build()
-    expect(await pump.wake(message, authority)).toEqual({ kind: 'native_inbox' })
-    expect(await pump.recover()).toEqual([{ kind: 'native_inbox' }])
-    expect(await f.build().wake(message, authority)).toEqual({ kind: 'native_inbox' })
+    expect(await wakeLead(pump)).toEqual({ kind: 'native_inbox' })
+    // Recovery drains only OpenCode members; a native member reads its own inbox.
+    expect(await pump.recover()).toEqual([])
+    expect(await wakeLead(f.build())).toEqual({ kind: 'native_inbox' })
     expect(f.calls).toEqual([])
     const lead = JSON.parse(await readFile(join(f.root, 'inboxes', 'team-lead.json'), 'utf8'))
     // The native process marks its own rows read.
@@ -476,14 +472,14 @@ describe('HostedTeamLeadInboxPump', () => {
       readActiveRun: async () => ({ phase: 'stopping', runId }),
       reportDecision: report => { reports.push(report) },
     })
-    expect(await fenced.wake(message, authority)).toEqual({ kind: 'unavailable' })
-    expect(await fenced.wake(message, authority)).toEqual({ kind: 'unavailable' })
+    expect(await wakeLead(fenced)).toEqual({ kind: 'unavailable' })
+    expect(await wakeLead(fenced)).toEqual({ kind: 'unavailable' })
     expect(reports).toEqual([{ messageId: message.messageId, recipient: 'team-lead',
       decision: 'unavailable', reason: 'fence:run_not_running:stopping' }])
     expect(f.calls).toEqual([])
     // The durable intent was never sent, so it is sent now instead of being
     // reconciled into an acceptance the runtime never saw.
-    expect(await f.build().wake(message, authority)).toEqual({ kind: 'accepted' })
+    expect(await wakeLead(f.build())).toEqual({ kind: 'accepted' })
     expect(f.calls).toEqual(['send'])
   })
 
@@ -498,7 +494,7 @@ describe('HostedTeamLeadInboxPump', () => {
       }
       return { ok: true, data: { status: 'failed_before_accept', accepted: false, safeToRetry: true } }
     })
-    expect(await f.build().wake(message, authority)).toEqual({ kind: 'pending' })
+    expect(await wakeLead(f.build())).toEqual({ kind: 'pending' })
     expect(await f.build().recover()).toEqual([{ kind: 'pending' }])
     expect(await f.build().recover()).toEqual([{ kind: 'operator_required' }])
     expect(await f.build().recover()).toEqual([{ kind: 'operator_required' }])
@@ -518,9 +514,9 @@ describe('HostedTeamLeadInboxPump', () => {
       timestamp: '2026-09-24T10:01:00.000Z', read: false }
     await inbox('alice', [
       leadToAlice,
-      // Its own row and an operator row without a Product marker are never relayed.
+      // Its own row is never relayed; an operator row takes the same path, after the teammate row.
       { messageId: 'relay-self', from: 'alice', text: 'note to self', timestamp: '2026-09-24T10:02:00.000Z', read: false },
-      { messageId: 'relay-user', from: 'user', text: 'unmarked', timestamp: '2026-09-24T10:03:00.000Z', read: false },
+      { messageId: 'relay-user', from: 'user', text: 'Operator note.', timestamp: '2026-09-24T10:03:00.000Z', read: false },
     ])
     const sent: Array<{ memberName?: string; text?: string }> = []
     f.setBridge(async input => {
@@ -531,14 +527,16 @@ describe('HostedTeamLeadInboxPump', () => {
 
     const pump = f.build()
     await pump.recover()
-    expect(sent.filter(prompt => prompt.memberName === 'alice')).toHaveLength(1)
-    const prompt = sent.find(candidate => candidate.memberName === 'alice')!.text!
+    const alicePrompts = sent.filter(prompt => prompt.memberName === 'alice').map(prompt => prompt.text!)
+    expect(alicePrompts).toHaveLength(2)
+    const prompt = alicePrompts[0]!
+    expect(alicePrompts[1]).toContain('"to":"user","from":"alice","source":"runtime_delivery","relayOfMessageId":"relay-user"')
     // The recipient answers its sender through message_send, linked to the source row.
     expect(prompt).toContain(`{"teamName":"legacy","to":"team-lead","from":"alice","source":"runtime_delivery","relayOfMessageId":"relay-source-1"}`)
     expect(prompt).toEndWith(`<opencode_inbound_app_message>\n${leadToAlice.text}\n</opencode_inbound_app_message>`)
     const rows = JSON.parse(await readFile(join(f.root, 'inboxes', 'alice.json'), 'utf8'))
     expect(rows.map((row: { messageId: string; read: boolean }) => [row.messageId, row.read])).toEqual([
-      ['relay-source-1', true], ['relay-self', false], ['relay-user', false],
+      ['relay-source-1', true], ['relay-self', false], ['relay-user', true],
     ])
     // The owner's read commit leaves the inbox owner-private again.
     expect((await lstat(join(f.root, 'inboxes', 'alice.json'))).mode & 0o777).toBe(0o600)
@@ -645,13 +643,12 @@ describe('HostedTeamLeadInboxPump', () => {
       if (input.command === 'send') sent.push(input.memberName ?? '')
       return { ok: true, data: { accepted: true, sessionId, runtimePromptMessageId: 'prompt-1' } }
     })
-    const pump = f.build()
-    pump.start(60_000)
-    const deadline = (ms: number) => Date.now() + ms
     const until = async (condition: () => boolean, ms: number) => {
-      const end = deadline(ms)
+      const end = Date.now() + ms
       while (!condition() && Date.now() < end) await new Promise(resolve => setTimeout(resolve, 20))
     }
+    const pump = f.build()
+    pump.start(60_000)
     await until(() => sent.includes('team-lead'), 2_000)
     expect(sent).toEqual(['team-lead'])
     const startedAt = Date.now()

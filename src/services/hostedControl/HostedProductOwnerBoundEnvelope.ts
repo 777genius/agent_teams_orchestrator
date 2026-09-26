@@ -7,7 +7,7 @@ import {
   type HostedControlStableAuthority,
 } from './protocol.js'
 
-export const PRODUCT_OWNER_BOUND_OPERATIONS = ['task_mutate', 'message_persist', 'message_deliver'] as const
+export const PRODUCT_OWNER_BOUND_OPERATIONS = ['task_mutate', 'message_send'] as const
 export type ProductOwnerBoundOperation = (typeof PRODUCT_OWNER_BOUND_OPERATIONS)[number]
 
 /**
@@ -28,8 +28,7 @@ export type ProductOwnerBoundRequest = {
 
 const EXCHANGE_ID: Record<ProductOwnerBoundOperation, RegExp> = {
   task_mutate: /^task-request_[0-9a-f]{32}$/,
-  message_persist: /^message-request_[0-9a-f]{32}$/,
-  message_deliver: /^message-request_[0-9a-f]{32}$/,
+  message_send: /^message-request_[0-9a-f]{32}$/,
 }
 const SHA256_HEX = /^[0-9a-f]{64}$/
 

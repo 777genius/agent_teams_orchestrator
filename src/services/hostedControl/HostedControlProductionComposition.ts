@@ -1,3 +1,4 @@
+import { readdir } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import { DurableTeamLifecycleExecution } from '../teamLifecycleOwner/DurableTeamLifecycleExecution.js'
@@ -10,22 +11,17 @@ import type {
   HostedControlRuntimePortFactoryContext,
 } from './HostedControlRuntime.js'
 import { HostedLifecycleAuthorityWal } from './HostedLifecycleAuthorityWal.js'
-import { confirmDeliveryThroughInboxPump } from './HostedInboxPumpDelivery.js'
-import { HostedTeamLeadMessageDelivery } from './HostedTeamLeadMessageDelivery.js'
 import type {
   HostedTeamLeadInboxPumpOptions,
   InboxPumpDecision,
 } from './HostedTeamLeadInboxPump.js'
-import type { HostedPersistedMessage } from './HostedTeamMessageService.js'
 import { HostedTeamRecipientRoster } from './HostedTeamRecipientRoster.js'
-import type { HostedControlAuthority } from './protocol.js'
 import type { HostedApprovalActivationConnection } from './HostedApprovalActivationSession.js'
 import type { HostedManagedOpenCodeLaneDependencies } from './isolatedLane/HostedManagedOpenCodeLane.js'
 
 export const HOSTED_LIFECYCLE_PLAN_FILE = 'hosted-lifecycle-plan.v1.json'
 export const HOSTED_LIFECYCLE_EXECUTION_STATE_FILE =
   'hosted-lifecycle-execution-state.v1.json'
-export const HOSTED_MESSAGE_DIRECTORY = 'hosted-messages'
 export const HOSTED_APPROVAL_RUNTIME_ADMISSION_FILE = 'hosted-approval-runtime-admission.v1.json'
 export const HOSTED_APPROVAL_OWNER_WAL_FILE = 'hosted-approval-owner.v1.json'
 /** Remains false until the pinned hosted-approval v2 artifact passes the no-fake sandbox E2E. */
@@ -40,13 +36,9 @@ export type HostedOpenCodeLaneFactory = (
   context: Readonly<HostedControlRuntimePortFactoryContext>,
 ) => TeamLifecycleLaneEffectPort | Promise<TeamLifecycleLaneEffectPort>
 
-/** Recipient-addressed so delivery can grow beyond the team lead without a contract change. */
+/** Prompts OpenCode recipients' inbox rows; a wake drains one recipient's queue now. */
 export type HostedTeamInboxPumpPort = Readonly<{
-  wake(input: Readonly<{
-    recipient: string
-    message: HostedPersistedMessage
-    authority: HostedControlAuthority
-  }>): Promise<InboxPumpDecision>
+  wakeRecipient(recipient: string, messageId: string): Promise<InboxPumpDecision>
   recover(): Promise<unknown>
   start(): void
   close(): Promise<void>
@@ -135,13 +127,7 @@ export function createHostedControlPortFactory(
 
     const authorityGuard = { isCurrent: context.isCurrentAuthority }
     const messageRecipients = new HostedTeamRecipientRoster(context.teamRoot)
-    const messageDelivery = new HostedTeamLeadMessageDelivery({
-      canonicalTeamRoot: context.teamRoot,
-      legacyKey: context.legacyKey,
-      authority: context.authority,
-      guard: authorityGuard,
-      recipients: messageRecipients,
-    })
+    void reportLegacyMessageState(context.teamRoot, context.authority.teamId)
     const inboxPump = effects.createInboxPump
       ? effects.createInboxPump({
         canonicalTeamRoot: context.teamRoot,
@@ -159,13 +145,12 @@ export function createHostedControlPortFactory(
       })
       : undefined
     const services = createHostedControlEffectServices({
-      messageDirectory: join(context.teamRoot, HOSTED_MESSAGE_DIRECTORY),
-      teamId: context.authority.teamId,
+      canonicalTeamRoot: context.teamRoot,
       lifecycleGuard: authorityGuard,
       messageGuard: authorityGuard,
-      // With a pump, `delivered` means the recipient's session accepted the prompt.
-      messageDelivery: inboxPump ? confirmDeliveryThroughInboxPump(messageDelivery, inboxPump) : messageDelivery,
       messageRecipients,
+      // With a pump, `delivered` means the recipient's session accepted the prompt.
+      ...(inboxPump ? { messagePump: inboxPump } : {}),
       lifecycleEffects: lifecycle.authority,
       planAdmission: {
         admitLaunchPlan: async input => {
@@ -237,7 +222,7 @@ export function createHostedControlPortFactory(
         // Calling revoke fences the delegate synchronously; all awaited work is
         // cleanup and therefore precedes lifecycle/authority resource release.
         await revoke().catch(() => undefined)
-        await Promise.all([messageDelivery.close(), inboxPump?.close()])
+        await inboxPump?.close()
         await execution.shutdown()
       },
     }
@@ -287,4 +272,24 @@ async function loadHostedApprovalModules() {
     HostedApprovalActivatablePort: port.HostedApprovalActivatablePort,
     HostedApprovalActivationSession: session.HostedApprovalActivationSession,
   }
+}
+
+/**
+ * State the single message_send no longer reads: the two-phase message records and their
+ * delivery markers. It is left in place; one redacted line with the file counts makes it
+ * visible on a host that ran the older owner. Counts only, never paths or contents.
+ */
+async function reportLegacyMessageState(teamRoot: string, teamId: string): Promise<void> {
+  const count = async (name: string): Promise<number> =>
+    readdir(join(teamRoot, name)).then(entries => entries.length, () => 0)
+  try {
+    const [hostedMessages, deliveryOperations] = await Promise.all([
+      count('hosted-messages'),
+      count('hosted-message-delivery-operations'),
+    ])
+    if (hostedMessages === 0 && deliveryOperations === 0) return
+    process.stderr.write(`${JSON.stringify({
+      kind: 'hosted-message-legacy-state', teamId, hostedMessages, deliveryOperations,
+    })}\n`)
+  } catch { /* Diagnostics never affect startup. */ }
 }

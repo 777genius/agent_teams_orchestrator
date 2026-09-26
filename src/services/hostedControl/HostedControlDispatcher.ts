@@ -47,7 +47,7 @@ const LIFECYCLE_OPERATIONS = [
   'execute',
   'release',
 ] as const
-const MESSAGE_OPERATIONS = ['message_persist', 'message_deliver'] as const
+const MESSAGE_OPERATIONS = ['message_send'] as const
 
 export type HostedLifecycleOperation = (typeof LIFECYCLE_OPERATIONS)[number]
 export type HostedTeamMessageOperation = (typeof MESSAGE_OPERATIONS)[number]
@@ -733,15 +733,11 @@ function decodeMessageResponsePayload(
     messageRetryAfter(payload.retryAfterMs)
     return payload
   }
-  if (operation === 'message_deliver') {
-    exactKeys(payload, ['schemaVersion', 'kind'], 'message delivery response')
-    if (!['delivered', 'pending', 'operator_required'].includes(payload.kind)) {
-      throw new Error('Invalid message delivery response')
-    }
-    return payload
-  }
   if (payload.kind === 'persisted' || payload.kind === 'idempotent_replay') {
-    exactKeys(payload, ['schemaVersion', 'kind', 'receipt'], 'message persistence response')
+    exactKeys(payload, ['schemaVersion', 'kind', 'receipt', 'runtimeDelivery'], 'message send response')
+    if (!['delivered', 'pending', 'operator_required'].includes(String(payload.runtimeDelivery))) {
+      throw new Error('Invalid message runtime delivery')
+    }
     const receipt = record(payload.receipt, 'message persistence receipt')
     const receiptKeys = ['schemaVersion', 'teamId', 'messageId', 'clientMessageId', 'persistence']
     exactKeys(receipt, Object.hasOwn(request, 'recipient') ? [...receiptKeys, 'recipient'] : receiptKeys,

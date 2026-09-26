@@ -1,12 +1,17 @@
-import { describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, test } from 'bun:test'
+import { mkdir, mkdtemp, readFile, realpath, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+
+import type { InboxPumpDecision } from './HostedTeamLeadInboxPump.js'
 import {
-  FailClosedHostedMessageDelivery,
+  hostedMessageIdFor,
   HostedTeamMessageService,
-  type HostedMessageDeliveryEffectPort,
-  type HostedMessageDurablePersistencePort,
+  type HostedTeamMessageServiceOptions,
 } from './HostedTeamMessageService.js'
 import type { HostedControlAuthority } from './protocol.js'
 
+const roots: string[] = []
 const authority: HostedControlAuthority = {
   actorId: 'actor-a',
   deploymentId: 'deployment-a',
@@ -22,193 +27,106 @@ const command = {
   clientMessageId: 'client_message_command01',
   text: 'hello team',
 }
-const message = {
-  teamId: authority.teamId,
-  messageId: `message_${'c'.repeat(32)}`,
-  clientMessageId: command.clientMessageId,
-  text: command.text,
-  createdAt: '2026-08-09T12:00:00.000Z',
-}
-const receipt = {
-  schemaVersion: 1 as const,
-  teamId: authority.teamId,
-  messageId: message.messageId,
-  clientMessageId: command.clientMessageId,
-  persistence: 'durable' as const,
+const messageId = hostedMessageIdFor(authority.teamId, command.clientMessageId)
+
+afterEach(async () => {
+  await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true })))
+})
+
+async function teamRoot(): Promise<string> {
+  const parent = await realpath(await mkdtemp(join(tmpdir(), 'hosted-message-send-')))
+  roots.push(parent)
+  const root = join(parent, 'legacy')
+  await mkdir(root, { mode: 0o700 })
+  return root
 }
 
-function fixture(
-  persistenceOverrides: Partial<HostedMessageDurablePersistencePort> = {},
-  deliveryOverrides: Partial<HostedMessageDeliveryEffectPort> = {},
-) {
-  let persists = 0
-  let deliveries = 0
-  const persistence: HostedMessageDurablePersistencePort = {
-    persist: async () => { persists += 1; return { kind: 'persisted', receipt } },
-    find: async () => ({ kind: 'found', message }),
-    ...persistenceOverrides,
-  }
-  const delivery: HostedMessageDeliveryEffectPort = {
-    deliver: async () => { deliveries += 1; return { kind: 'delivered' } },
-    ...deliveryOverrides,
-  }
-  return { persistence, delivery, persists: () => persists, deliveries: () => deliveries }
+function service(root: string, options: Partial<HostedTeamMessageServiceOptions> = {}) {
+  return new HostedTeamMessageService({ canonicalTeamRoot: root, guard: { isCurrent: () => true }, ...options })
+}
+
+function send(target: HostedTeamMessageService, payload: Record<string, unknown> = command) {
+  return target.dispatch({ operation: 'message_send', payload, authority })
+}
+
+async function inbox(root: string, member: string): Promise<Array<Record<string, unknown>>> {
+  return JSON.parse(await readFile(join(root, 'inboxes', `${member}.json`), 'utf8'))
 }
 
 describe('HostedTeamMessageService', () => {
-  test('has no global mailbox side effect without an incarnation-bound adapter', async () => {
-    await expect(new FailClosedHostedMessageDelivery().deliver())
-      .resolves.toEqual({ kind: 'unavailable' })
-  })
-
-  test('returns exact durable persistence and replay receipts', async () => {
-    for (const kind of ['persisted', 'idempotent_replay'] as const) {
-      const f = fixture({ persist: async () => ({ kind, receipt }) })
-      const service = new HostedTeamMessageService(f.persistence, f.delivery, { isCurrent: () => true })
-      await expect(service.dispatch({ operation: 'message_persist', payload: command, authority })).resolves.toEqual({
-        schemaVersion: 2,
-        kind,
-        receipt,
-      })
+  test('appends one row with an id derived from the client id and replays it after a restart', async () => {
+    const root = await teamRoot()
+    const receipt = {
+      schemaVersion: 1, teamId: authority.teamId, messageId,
+      clientMessageId: command.clientMessageId, persistence: 'durable',
     }
+    await expect(send(service(root, { now: () => new Date('2026-09-26T10:00:00.000Z') })))
+      .resolves.toEqual({ schemaVersion: 2, kind: 'persisted', receipt, runtimeDelivery: 'delivered' })
+    // A new instance has no memory: the inbox row is the idempotency record.
+    await expect(send(service(root, { now: () => new Date('2026-09-26T10:05:00.000Z') })))
+      .resolves.toEqual({ schemaVersion: 2, kind: 'idempotent_replay', receipt, runtimeDelivery: 'delivered' })
+    expect(await inbox(root, 'team-lead')).toEqual([{
+      messageId, from: 'user', text: command.text, timestamp: '2026-09-26T10:00:00.000Z', read: false,
+    }])
+    await expect(send(service(root), { ...command, text: 'changed' }))
+      .resolves.toEqual({ schemaVersion: 2, kind: 'conflict', reason: 'idempotency_mismatch' })
+    expect(await inbox(root, 'team-lead')).toHaveLength(1)
   })
 
-  test('preserves an idempotency conflict without attempting delivery', async () => {
-    const f = fixture({
-      persist: async () => ({ kind: 'conflict', reason: 'idempotency_mismatch' }),
-    })
-    const service = new HostedTeamMessageService(f.persistence, f.delivery, { isCurrent: () => true })
-    const result = await service.dispatch({ operation: 'message_persist', payload: command, authority })
-    expect(result).toEqual({ schemaVersion: 2, kind: 'conflict', reason: 'idempotency_mismatch' })
-    expect(f.deliveries()).toBe(0)
+  test('two concurrent sends of one client id write one row and the other replays it', async () => {
+    const root = await teamRoot()
+    const results = await Promise.all([send(service(root)), send(service(root))])
+    expect(results.map(result => result.kind).sort()).toEqual(['idempotent_replay', 'persisted'])
+    expect(new Set(results.map(result => JSON.stringify(result.receipt))).size).toBe(1)
+    expect(await inbox(root, 'team-lead')).toHaveLength(1)
   })
 
-  test('delivers only the exact durable record and returns its acknowledgement', async () => {
-    const f = fixture()
-    const service = new HostedTeamMessageService(f.persistence, f.delivery, { isCurrent: () => true })
-    await expect(service.dispatch({
-      operation: 'message_deliver',
-      payload: { teamId: message.teamId, messageId: message.messageId, clientMessageId: message.clientMessageId, text: message.text },
-      authority,
-    })).resolves.toEqual({ schemaVersion: 2, kind: 'delivered' })
-    expect(f.deliveries()).toBe(1)
-  })
-
-  test('requires an operator for missing or mismatched persistence proof', async () => {
-    for (const find of [
-      async () => ({ kind: 'not_found' as const }),
-      async () => ({ kind: 'found' as const, message: { ...message, text: 'different' } }),
-    ]) {
-      const f = fixture({ find })
-      const service = new HostedTeamMessageService(f.persistence, f.delivery, { isCurrent: () => true })
-      const result = await service.dispatch({
-        operation: 'message_deliver',
-        payload: { teamId: message.teamId, messageId: message.messageId, clientMessageId: message.clientMessageId, text: message.text },
-        authority,
+  test('reports delivered only when the pump confirmed the row, pending otherwise', async () => {
+    const cases: Array<[InboxPumpDecision['kind'] | 'hang' | 'throw', string]> = [
+      ['accepted', 'delivered'], ['observed', 'delivered'], ['native_inbox', 'delivered'],
+      ['pending', 'pending'], ['unavailable', 'pending'], ['operator_required', 'operator_required'],
+      ['hang', 'pending'], ['throw', 'pending'],
+    ]
+    for (const [decision, expected] of cases) {
+      const root = await teamRoot()
+      const woken: string[] = []
+      const target = service(root, {
+        confirmationMs: 20,
+        pump: {
+          wakeRecipient: async (recipient, id) => {
+            woken.push(`${recipient}:${id}`)
+            if (decision === 'hang') return new Promise(() => {})
+            if (decision === 'throw') throw new Error('bridge down')
+            return { kind: decision }
+          },
+        },
       })
-      expect(result).toEqual({ schemaVersion: 2, kind: 'operator_required' })
-      expect(f.deliveries()).toBe(0)
+      const result = await send(target)
+      expect({ decision, runtimeDelivery: result.runtimeDelivery }).toEqual({ decision, runtimeDelivery: expected })
+      expect(woken).toEqual([`team-lead:${messageId}`])
     }
-  })
-
-  test('does not persist or deliver after denied or stale authority', async () => {
-    const f = fixture()
-    const denied = new HostedTeamMessageService(f.persistence, f.delivery, { isCurrent: () => false })
-    expect((await denied.dispatch({ operation: 'message_persist', payload: command, authority })).kind).toBe('unavailable')
-    expect(f.persists()).toBe(0)
-
-    let checks = 0
-    const stale = new HostedTeamMessageService(f.persistence, f.delivery, {
-      isCurrent: () => ++checks === 1,
-    })
-    const result = await stale.dispatch({
-      operation: 'message_deliver',
-      payload: { teamId: message.teamId, messageId: message.messageId, clientMessageId: message.clientMessageId, text: message.text },
-      authority,
-    })
-    expect(result).toEqual({ schemaVersion: 2, kind: 'operator_required' })
-    expect(f.deliveries()).toBe(0)
-  })
-
-  test('maps an ambiguous delivery to operator_required without retrying', async () => {
-    let attempts = 0
-    const f = fixture({}, {
-      deliver: async () => { attempts += 1; return { kind: 'operator_required' } },
-    })
-    const service = new HostedTeamMessageService(f.persistence, f.delivery, { isCurrent: () => true })
-    const result = await service.dispatch({
-      operation: 'message_deliver',
-      payload: { teamId: message.teamId, messageId: message.messageId, clientMessageId: message.clientMessageId, text: message.text },
-      authority,
-    })
-    expect(result).toEqual({ schemaVersion: 2, kind: 'operator_required' })
-    expect(attempts).toBe(1)
-  })
-
-  test('suppresses the acknowledgement when authority changes during delivery', async () => {
-    let checks = 0
-    const f = fixture()
-    const service = new HostedTeamMessageService(f.persistence, f.delivery, {
-      isCurrent: () => ++checks <= 3,
-    })
-    const result = await service.dispatch({
-      operation: 'message_deliver',
-      payload: { teamId: message.teamId, messageId: message.messageId, clientMessageId: message.clientMessageId, text: message.text },
-      authority,
-    })
-    expect(f.deliveries()).toBe(1)
-    expect(result).toEqual({ schemaVersion: 2, kind: 'unavailable', retryAfterMs: null })
-  })
-
-  test('normalizes unavailable results to the exact retry envelope', async () => {
-    const persistenceFixture = fixture({ persist: async () => ({ kind: 'unavailable' }) })
-    const persistenceService = new HostedTeamMessageService(
-      persistenceFixture.persistence,
-      persistenceFixture.delivery,
-      { isCurrent: () => true },
-    )
-    await expect(persistenceService.dispatch({
-      operation: 'message_persist', payload: command, authority,
-    })).resolves.toEqual({ schemaVersion: 2, kind: 'unavailable', retryAfterMs: null })
-
-    const deliveryFixture = fixture({}, {
-      deliver: async () => ({ kind: 'unavailable', retryAfterMs: 250 }),
-    })
-    const deliveryService = new HostedTeamMessageService(
-      deliveryFixture.persistence,
-      deliveryFixture.delivery,
-      { isCurrent: () => true },
-    )
-    await expect(deliveryService.dispatch({
-      operation: 'message_deliver',
-      payload: { teamId: message.teamId, messageId: message.messageId, clientMessageId: message.clientMessageId, text: message.text },
-      authority,
-    })).resolves.toEqual({ schemaVersion: 2, kind: 'unavailable', retryAfterMs: 250 })
   })
 
   test('admits a teammate recipient only from the current roster and fails closed without one', async () => {
-    const payload = { ...command, recipient: 'alice' }
-    const persisted: unknown[] = []
-    const f = fixture({ persist: async input => { persisted.push(input); return { kind: 'persisted', receipt } } })
+    const root = await teamRoot()
     const roster = { isActiveRecipient: async (name: string) => name === 'alice' }
-    const service = new HostedTeamMessageService(f.persistence, f.delivery, { isCurrent: () => true }, roster)
-
-    await expect(service.dispatch({
-      operation: 'message_persist', payload: { ...command, recipient: 'mallory' }, authority,
-    })).resolves.toEqual({ schemaVersion: 2, kind: 'invalid_recipient' })
-    expect(persisted).toEqual([])
-    await expect(service.dispatch({ operation: 'message_persist', payload, authority }))
-      .resolves.toMatchObject({ schemaVersion: 2, kind: 'persisted' })
-    expect(persisted).toEqual([payload])
-
+    await expect(send(service(root, { recipients: roster }), { ...command, recipient: 'mallory' }))
+      .resolves.toEqual({ schemaVersion: 2, kind: 'invalid_recipient' })
+    await expect(send(service(root, { recipients: roster }), { ...command, recipient: 'alice' }))
+      .resolves.toMatchObject({ kind: 'persisted', receipt: { recipient: 'alice' } })
+    expect(await inbox(root, 'alice')).toEqual([expect.objectContaining({ messageId, from: 'user' })])
     for (const recipient of ['team-lead', 'user', '../alice', '']) {
-      await expect(service.dispatch({
-        operation: 'message_persist', payload: { ...command, recipient }, authority,
-      })).rejects.toThrow('Invalid hosted message recipient')
+      await expect(send(service(root, { recipients: roster }), { ...command, recipient }))
+        .rejects.toThrow('Invalid hosted message recipient')
     }
-    const withoutRoster = new HostedTeamMessageService(f.persistence, f.delivery, { isCurrent: () => true })
-    await expect(withoutRoster.dispatch({ operation: 'message_persist', payload, authority }))
+    await expect(send(service(root), { ...command, clientMessageId: 'client_message_command02', recipient: 'alice' }))
       .resolves.toEqual({ schemaVersion: 2, kind: 'unavailable', retryAfterMs: null })
-    expect(persisted).toEqual([payload])
+  })
+
+  test('writes nothing under a stale authority', async () => {
+    const root = await teamRoot()
+    await expect(send(service(root, { guard: { isCurrent: () => false } })))
+      .resolves.toEqual({ schemaVersion: 2, kind: 'unavailable', retryAfterMs: null })
+    await expect(readFile(join(root, 'inboxes', 'team-lead.json'))).rejects.toThrow()
   })
 })

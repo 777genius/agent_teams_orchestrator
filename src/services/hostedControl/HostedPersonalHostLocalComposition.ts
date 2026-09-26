@@ -17,7 +17,6 @@ import {
 } from '../teamLifecycleOwner/OpenCodeTeamLifecycleLane.js'
 import type { TeamLifecycleLaunchPlan } from '../teamLifecycleOwner/TeamLifecycleLaunchPlan.js'
 import { getTeamsDir } from '../../utils/envUtils.js'
-import { TEAM_LEAD_NAME } from '../../utils/swarm/constants.js'
 import {
   createHostedControlPortFactory,
   type HostedTeamInboxPumpPort,
@@ -132,10 +131,7 @@ function createHostedTeamLeadInboxPumpPort(
 ): HostedTeamInboxPumpPort {
   const pump = new HostedTeamLeadInboxPump(options)
   return Object.freeze({
-    // The pump derives the member from the persisted message; a mismatched port call is a bug.
-    wake: async ({ recipient, message, authority }) => recipient === (message.recipient ?? TEAM_LEAD_NAME)
-      ? pump.wake(message, authority)
-      : { kind: 'operator_required' as const },
+    wakeRecipient: (recipient, messageId) => pump.wakeRecipient(recipient, messageId),
     recover: () => pump.recover(),
     start: () => pump.start(),
     close: () => pump.close(),

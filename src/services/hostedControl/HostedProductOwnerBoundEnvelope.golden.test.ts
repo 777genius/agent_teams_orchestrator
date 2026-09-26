@@ -19,7 +19,7 @@ import {
 } from './protocol.js'
 
 // The same bytes live in agent-teams-ai docs/; both repositories pin this digest.
-const GOLDEN_SHA256 = '50bfcece70d6856df88df39eadc58b31944d251898651c820ab56a85a889ea1a'
+const GOLDEN_SHA256 = '3a318fc170b8d993cc9a3373e16a7c48ba8aa219e14c02cfaa9988bd59f50e36'
 
 type Json = Record<string, unknown>
 type GoldenSide = { unsigned: Json; proofInput: string; ownerProof: string }
@@ -80,7 +80,7 @@ describe('hosted owner-bound envelope cross-repository golden', () => {
     expect(createHash('sha256').update(raw).digest('hex')).toBe(GOLDEN_SHA256)
     expect(golden.format).toBe('agent-teams.hosted-owner-bound-envelope-golden/v1')
     expect(golden.proofDomain).toBe(HOSTED_TEAM_MESSAGE_PROOF_DOMAIN)
-    expect(golden.cases.map(entry => entry.operation).sort()).toEqual(['message_deliver', 'message_persist', 'task_mutate', 'task_mutate'])
+    expect(golden.cases.map(entry => entry.operation).sort()).toEqual(['message_send', 'message_send', 'task_mutate', 'task_mutate'])
   })
 
   test('verifies every Product request and signs the byte-identical Product response', async () => {

@@ -1,70 +1,79 @@
+import { createHash } from 'node:crypto'
+import { isAbsolute } from 'node:path'
+
+import { TEAM_LEAD_NAME } from '../../utils/swarm/constants.js'
+import { writeToMailboxAtCanonicalTeamRootVerified } from '../../utils/teammateMailbox.js'
 import type { HostedControlAuthority } from './protocol.js'
 import type { HostedTeamMessageOperation, HostedTeamMessagePort } from './HostedControlDispatcher.js'
+import type { InboxPumpDecision } from './HostedTeamLeadInboxPump.js'
 import {
   isHostedMessageRecipientName,
   type HostedMessageRecipientRoster,
 } from './HostedTeamRecipientRoster.js'
 
-/** An absent recipient addresses the team lead, exactly as before recipients existed. */
-type PersistCommand = {
-  schemaVersion: 1
+/**
+ * How long message_send waits for the pump before answering `pending`. It must
+ * stay well inside Product's 5s owner-exchange deadline.
+ */
+export const HOSTED_INBOX_PUMP_CONFIRMATION_MS = 2_000
+const MESSAGE_ID_DOMAIN = 'agent-teams.hosted-message.id/v1'
+
+/** An absent recipient addresses the team lead. */
+type SendCommand = {
   teamId: string
   clientMessageId: string
   text: string
   recipient?: string
 }
-type DeliveryRequest = { teamId: string; messageId: string; clientMessageId: string; text: string }
-export type HostedPersistedMessage = DeliveryRequest & { createdAt: string; recipient?: string }
-type PersistenceReceipt = {
-  schemaVersion: 1
-  teamId: string
-  messageId: string
-  clientMessageId: string
-  persistence: 'durable'
-  recipient?: string
-}
-
-export type HostedMessagePersistenceDecision =
-  | { kind: 'persisted' | 'idempotent_replay'; receipt: PersistenceReceipt }
-  | { kind: 'conflict'; reason: 'idempotency_mismatch' }
-  | { kind: 'not_found' }
-  | { kind: 'unavailable'; retryAfterMs?: number }
-
-/** Durable store owns atomic idempotency across process restarts. */
-export interface HostedMessageDurablePersistencePort {
-  persist(command: PersistCommand, authority: HostedControlAuthority): Promise<HostedMessagePersistenceDecision>
-  find(request: DeliveryRequest, authority: HostedControlAuthority): Promise<
-    | { kind: 'found'; message: HostedPersistedMessage }
-    | { kind: 'not_found' | 'conflict' | 'unavailable' }
-  >
-}
-
-/** Delivery must be idempotent and return operator_required after an ambiguous write. */
-export interface HostedMessageDeliveryEffectPort {
-  deliver(message: HostedPersistedMessage, authority: HostedControlAuthority): Promise<
-    | { kind: 'delivered' | 'pending' | 'operator_required' }
-    | { kind: 'unavailable'; retryAfterMs?: number }
-  >
-}
+type RuntimeDelivery = 'delivered' | 'pending' | 'operator_required'
 
 export interface HostedMessageAuthorityGuard {
   isCurrent(authority: HostedControlAuthority): boolean | Promise<boolean>
 }
 
+/** The pump that prompts a recipient's OpenCode session; absent when no OpenCode lane exists. */
+export interface HostedMessageDeliveryWaker {
+  wakeRecipient(recipient: string, messageId: string): Promise<InboxPumpDecision>
+}
+
+export type HostedTeamMessageServiceOptions = {
+  canonicalTeamRoot: string
+  guard: HostedMessageAuthorityGuard
+  /** Without a roster only lead messages are admitted. */
+  recipients?: HostedMessageRecipientRoster | null
+  pump?: HostedMessageDeliveryWaker
+  writeMailbox?: typeof writeToMailboxAtCanonicalTeamRootVerified
+  now?: () => Date
+  confirmationMs?: number
+}
+
+/**
+ * The one hosted user-message operation. The inbox row is the durable record:
+ * its id derives from the browser's client message id, so a retry after any
+ * restart finds the row and replays it. The pump then prompts the recipient,
+ * and `delivered` means its session accepted the row, or a native recipient,
+ * which reads its own inbox, has it.
+ */
 export class HostedTeamMessageService implements HostedTeamMessagePort {
-  constructor(
-    private readonly persistence: HostedMessageDurablePersistencePort,
-    private readonly delivery: HostedMessageDeliveryEffectPort,
-    private readonly guard: HostedMessageAuthorityGuard,
-    /** Without a roster only lead messages are admitted. */
-    private readonly recipients: HostedMessageRecipientRoster | null = null,
-  ) {
-    if (typeof persistence.persist !== 'function' || typeof persistence.find !== 'function') {
-      throw new TypeError('Hosted durable message persistence is not installed')
+  readonly #root: string
+  readonly #guard: HostedMessageAuthorityGuard
+  readonly #recipients: HostedMessageRecipientRoster | null
+  readonly #pump: HostedMessageDeliveryWaker | undefined
+  readonly #writeMailbox: typeof writeToMailboxAtCanonicalTeamRootVerified
+  readonly #now: () => Date
+  readonly #confirmationMs: number
+
+  constructor(options: HostedTeamMessageServiceOptions) {
+    if (!isAbsolute(options.canonicalTeamRoot)) {
+      throw new TypeError('Hosted message service requires the canonical team root')
     }
-    if (typeof delivery.deliver !== 'function') {
-      throw new TypeError('Hosted message delivery effect is not installed')
-    }
+    this.#root = options.canonicalTeamRoot
+    this.#guard = options.guard
+    this.#recipients = options.recipients ?? null
+    this.#pump = options.pump
+    this.#writeMailbox = options.writeMailbox ?? writeToMailboxAtCanonicalTeamRootVerified
+    this.#now = options.now ?? (() => new Date())
+    this.#confirmationMs = options.confirmationMs ?? HOSTED_INBOX_PUMP_CONFIRMATION_MS
   }
 
   async dispatch(input: {
@@ -72,57 +81,99 @@ export class HostedTeamMessageService implements HostedTeamMessagePort {
     payload: Record<string, unknown>
     authority: HostedControlAuthority
   }): Promise<Record<string, unknown>> {
-    if (!(await this.guard.isCurrent(input.authority))) return unavailable()
-    if (input.operation === 'message_persist') {
-      const command = persistCommand(input.payload, input.authority)
-      if (command.recipient !== undefined) {
-        if (!this.recipients) return unavailable()
-        let admitted: boolean
-        try {
-          admitted = await this.recipients.isActiveRecipient(command.recipient)
-        } catch {
-          return unavailable()
-        }
-        if (!(await this.guard.isCurrent(input.authority))) return unavailable()
-        if (!admitted) return { schemaVersion: 2, kind: 'invalid_recipient' }
+    if (input.operation !== 'message_send') throw new TypeError('Invalid hosted message operation')
+    if (!(await this.#guard.isCurrent(input.authority))) return unavailable()
+    const command = sendCommand(input.payload, input.authority)
+    if (command.recipient !== undefined) {
+      if (!this.#recipients) return unavailable()
+      let admitted: boolean
+      try {
+        admitted = await this.#recipients.isActiveRecipient(command.recipient)
+      } catch {
+        return unavailable()
       }
-      const decision = await this.persistence.persist(command, input.authority)
-      if (!(await this.guard.isCurrent(input.authority))) return unavailable()
-      return persistencePayload(decision)
+      if (!(await this.#guard.isCurrent(input.authority))) return unavailable()
+      if (!admitted) return { schemaVersion: 2, kind: 'invalid_recipient' }
     }
+    const recipient = command.recipient ?? TEAM_LEAD_NAME
+    const messageId = hostedMessageIdFor(command.teamId, command.clientMessageId)
+    let written: Awaited<ReturnType<typeof writeToMailboxAtCanonicalTeamRootVerified>>
+    try {
+      written = await this.#writeMailbox({
+        canonicalTeamRoot: this.#root,
+        recipientName: recipient,
+        message: { messageId, from: 'user', text: command.text, timestamp: this.#now().toISOString() },
+        replay: 'same_content',
+      })
+    } catch {
+      // Whatever reached the inbox carries the deterministic id: the retry replays it.
+      return unavailable()
+    }
+    if (written.kind === 'conflict') return { schemaVersion: 2, kind: 'conflict', reason: 'idempotency_mismatch' }
+    if (!(await this.#guard.isCurrent(input.authority))) return unavailable()
+    return {
+      schemaVersion: 2,
+      kind: written.kind === 'written' ? 'persisted' : 'idempotent_replay',
+      receipt: {
+        schemaVersion: 1,
+        teamId: command.teamId,
+        messageId,
+        clientMessageId: command.clientMessageId,
+        persistence: 'durable',
+        ...(command.recipient === undefined ? {} : { recipient: command.recipient }),
+      },
+      runtimeDelivery: await this.#runtimeDelivery(recipient, messageId),
+    }
+  }
 
-    const request = deliveryRequest(input.payload, input.authority)
-    const persisted = await this.persistence.find(request, input.authority)
-    if (persisted.kind !== 'found' || !(await this.guard.isCurrent(input.authority))) {
-      return persisted.kind === 'unavailable' ? unavailable() : { schemaVersion: 2, kind: 'operator_required' }
+  /** Without a pump the appended row is the delivery, as it is for native readers. */
+  async #runtimeDelivery(recipient: string, messageId: string): Promise<RuntimeDelivery> {
+    if (!this.#pump) return 'delivered'
+    const wake = this.#pump.wakeRecipient(recipient, messageId)
+      .catch((): InboxPumpDecision => ({ kind: 'unavailable' }))
+    const decision = await settleWithin(wake, this.#confirmationMs)
+    switch (decision?.kind) {
+      case 'accepted':
+      case 'observed':
+      case 'native_inbox':
+        return 'delivered'
+      case 'operator_required':
+        return 'operator_required'
+      default:
+        return 'pending'
     }
-    if (!sameDelivery(request, persisted.message)) {
-      return { schemaVersion: 2, kind: 'operator_required' }
-    }
-    if (!(await this.guard.isCurrent(input.authority))) return unavailable()
-    const decision = await this.delivery.deliver(persisted.message, input.authority)
-    if (!(await this.guard.isCurrent(input.authority))) return unavailable()
-    return deliveryPayload(decision)
   }
 }
 
-/** Safe default until an incarnation-bound mailbox authority is explicitly composed. */
-export class FailClosedHostedMessageDelivery implements HostedMessageDeliveryEffectPort {
-  async deliver(): Promise<{ kind: 'unavailable' }> {
-    return { kind: 'unavailable' }
+/** The id a browser send gets in every inbox and receipt; stable across restarts. */
+export function hostedMessageIdFor(teamId: string, clientMessageId: string): string {
+  return `message_${createHash('sha256')
+    .update(`${MESSAGE_ID_DOMAIN}\0${teamId}\0${clientMessageId}`)
+    .digest('hex').slice(0, 32)}`
+}
+
+async function settleWithin<T>(work: Promise<T>, ms: number): Promise<T | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<null>(resolve => {
+    timer = setTimeout(() => resolve(null), ms)
+    timer.unref?.()
+  })
+  try {
+    return await Promise.race([work, timeout])
+  } finally {
+    clearTimeout(timer)
   }
 }
 
-function persistCommand(value: unknown, authority: HostedControlAuthority): PersistCommand {
+function sendCommand(value: unknown, authority: HostedControlAuthority): SendCommand {
   const keys = ['schemaVersion', 'teamId', 'clientMessageId', 'text']
   const hasRecipient = !!value && typeof value === 'object' && Object.hasOwn(value, 'recipient')
-  const record = exactRecord(value, hasRecipient ? [...keys, 'recipient'] : keys, 'persist payload')
+  const record = exactRecord(value, hasRecipient ? [...keys, 'recipient'] : keys, 'send payload')
   if (record.schemaVersion !== 1 || record.teamId !== authority.teamId) throw new TypeError('Invalid hosted message team')
   if (hasRecipient && !isHostedMessageRecipientName(record.recipient)) {
     throw new TypeError('Invalid hosted message recipient')
   }
   return {
-    schemaVersion: 1,
     teamId: authority.teamId,
     clientMessageId: pattern(record.clientMessageId, /^client_message_[A-Za-z0-9][A-Za-z0-9._-]{7,127}$/, 'clientMessageId'),
     text: messageText(record.text),
@@ -130,44 +181,8 @@ function persistCommand(value: unknown, authority: HostedControlAuthority): Pers
   }
 }
 
-function deliveryRequest(value: unknown, authority: HostedControlAuthority): DeliveryRequest {
-  const record = exactRecord(value, ['teamId', 'messageId', 'clientMessageId', 'text'], 'delivery payload')
-  if (record.teamId !== authority.teamId) throw new TypeError('Invalid hosted message team')
-  return {
-    teamId: authority.teamId,
-    messageId: pattern(record.messageId, /^message_[0-9a-f]{32}$/, 'messageId'),
-    clientMessageId: pattern(record.clientMessageId, /^client_message_[A-Za-z0-9][A-Za-z0-9._-]{7,127}$/, 'clientMessageId'),
-    text: messageText(record.text),
-  }
-}
-
-function sameDelivery(request: DeliveryRequest, message: HostedPersistedMessage): boolean {
-  return request.teamId === message.teamId && request.messageId === message.messageId &&
-    request.clientMessageId === message.clientMessageId && request.text === message.text &&
-    Number.isFinite(Date.parse(message.createdAt))
-}
-
 function unavailable(): Record<string, unknown> {
   return { schemaVersion: 2, kind: 'unavailable', retryAfterMs: null }
-}
-function persistencePayload(decision: HostedMessagePersistenceDecision): Record<string, unknown> {
-  if (decision.kind === 'unavailable') return unavailableWithRetry(decision.retryAfterMs)
-  return { schemaVersion: 2, ...decision }
-}
-function deliveryPayload(
-  decision: Awaited<ReturnType<HostedMessageDeliveryEffectPort['deliver']>>,
-): Record<string, unknown> {
-  if (decision.kind === 'unavailable') return unavailableWithRetry(decision.retryAfterMs)
-  return { schemaVersion: 2, ...decision }
-}
-function unavailableWithRetry(retryAfterMs: number | undefined): Record<string, unknown> {
-  return {
-    schemaVersion: 2,
-    kind: 'unavailable',
-    retryAfterMs: Number.isSafeInteger(retryAfterMs) && (retryAfterMs as number) > 0
-      ? retryAfterMs
-      : null,
-  }
 }
 function exactRecord(value: unknown, keys: string[], field: string): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new TypeError(`Invalid ${field}`)

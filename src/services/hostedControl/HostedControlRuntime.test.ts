@@ -379,6 +379,7 @@ describe('HostedControlRuntime', () => {
               clientMessageId: 'client_message_runtime-test',
               persistence: 'durable',
             },
+            runtimeDelivery: 'delivered',
           }
         },
       },
@@ -469,7 +470,7 @@ describe('HostedControlRuntime', () => {
     const messageUnsigned = {
       schemaVersion: 2,
       exchangeId: `message-request_${'e'.repeat(32)}`,
-      operation: 'message_persist',
+      operation: 'message_send',
       ownerBinding,
       authority: messageAuthority,
       payload: {
