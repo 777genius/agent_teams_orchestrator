@@ -75,6 +75,11 @@ describe('classifyNativeHostLocalPlan', () => {
       name: 'reviewer', workflow: 'Review changes.', cwd: '/work', provider: 'codex', effort: 'medium',
     }])
     expect(spec.launch).toEqual({ bootstrapTimeoutMs: 120_000, continueOnPartialFailure: true })
+    expect(spec.lead).toEqual({})
+    expect(buildNativeBootstrapSpec({
+      runId: 'run_1', teamName: 'hosted-team', workspaceRoot: '/work', mode: 'create', shape,
+      agentLanguage: 'Russian',
+    }).lead).toEqual({ agentLanguage: 'Russian' })
   })
 })
 

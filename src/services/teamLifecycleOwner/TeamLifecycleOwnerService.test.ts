@@ -512,6 +512,11 @@ describe('TeamLifecycleOwnerService', () => {
 describe('TeamLifecycleLaunchPlan', () => {
   test('rejects unknown fields, provider/kind mismatches and duplicate lanes', () => {
     expect(() => parseTeamLifecycleLaunchPlan({ ...plan, browserSelectedProvider: 'anthropic' })).toThrow('Unexpected')
+    expect(parseTeamLifecycleLaunchPlan({ ...plan, agentLanguage: 'Russian' }).agentLanguage).toBe('Russian')
+    expect('agentLanguage' in parseTeamLifecycleLaunchPlan(plan)).toBe(false)
+    for (const agentLanguage of ['', ' Russian', 'x'.repeat(65), 'Rus\nsian', 7]) {
+      expect(() => parseTeamLifecycleLaunchPlan({ ...plan, agentLanguage })).toThrow('agentLanguage')
+    }
     expect(() => parseTeamLifecycleLaunchPlan({ ...plan, lanes: [{ laneId: 'lane_a', kind: 'native', provider: 'opencode' }] }))
       .toThrow('Unsupported provider')
     expect(() => parseTeamLifecycleLaunchPlan({ ...plan, lanes: [plan.lanes[0], plan.lanes[0]] })).toThrow('Duplicate')

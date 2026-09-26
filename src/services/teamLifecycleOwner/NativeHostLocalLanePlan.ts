@@ -160,6 +160,7 @@ export function buildNativeBootstrapSpec(input: {
   workspaceRoot: string
   mode: 'create' | 'launch'
   shape: NativeHostLocalLaunchShape
+  agentLanguage?: string
 }): Record<string, unknown> {
   return {
     version: 1,
@@ -167,7 +168,8 @@ export function buildNativeBootstrapSpec(input: {
     mode: input.mode,
     initiator: { kind: 'app', source: 'claude_team_agent_teams_orchestrator' },
     team: { name: input.teamName, cwd: input.workspaceRoot },
-    lead: {},
+    // The runtime adds the language line to every teammate prompt, as for the desktop launch.
+    lead: input.agentLanguage ? { agentLanguage: input.agentLanguage } : {},
     members: input.shape.teammates.map(member => ({
       name: member.name,
       workflow: member.prompt,

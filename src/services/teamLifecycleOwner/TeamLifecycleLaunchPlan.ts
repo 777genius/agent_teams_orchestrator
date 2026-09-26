@@ -38,6 +38,8 @@ export type TeamLifecycleLaunchPlan = {
   teamId: string
   workspaceRoot: string
   toolApprovalMode: 'manual' | 'auto'
+  /** Language name agents communicate in (desktop `lead.agentLanguage`); absent means none. */
+  agentLanguage?: string
   lanes: readonly TeamLifecycleLaunchLane[]
 }
 
@@ -136,9 +138,11 @@ function decodePlan(raw: Uint8Array): string {
 
 export function parseTeamLifecycleLaunchPlan(value: unknown): TeamLifecycleLaunchPlan {
   const record = asRecord(value, 'launch plan')
+  const hasAgentLanguage = Object.prototype.hasOwnProperty.call(record, 'agentLanguage')
   assertExactKeys(
     record,
-    ['schemaVersion', 'workspaceId', 'teamId', 'workspaceRoot', 'toolApprovalMode', 'lanes'],
+    ['schemaVersion', 'workspaceId', 'teamId', 'workspaceRoot', 'toolApprovalMode',
+      ...(hasAgentLanguage ? ['agentLanguage'] : []), 'lanes'],
     'launch plan',
   )
   if (record.schemaVersion !== 2) throw new TypeError('Unsupported team lifecycle launch-plan schema')
@@ -149,6 +153,13 @@ export function parseTeamLifecycleLaunchPlan(value: unknown): TeamLifecycleLaunc
   }
   if (record.toolApprovalMode !== 'manual' && record.toolApprovalMode !== 'auto') {
     throw new TypeError('Invalid launch-plan toolApprovalMode')
+  }
+  const agentLanguage = hasAgentLanguage
+    ? boundedString(record.agentLanguage, 'launch-plan agentLanguage', 64)
+    : undefined
+  // eslint-disable-next-line no-control-regex
+  if (agentLanguage !== undefined && /[\u0000-\u001f\u007f]/.test(agentLanguage)) {
+    throw new TypeError('Invalid launch-plan agentLanguage')
   }
   if (!Array.isArray(record.lanes) || record.lanes.length === 0 || record.lanes.length > 64) {
     throw new TypeError('Launch plan requires 1-64 lanes')
@@ -194,6 +205,7 @@ export function parseTeamLifecycleLaunchPlan(value: unknown): TeamLifecycleLaunc
     teamId,
     workspaceRoot: record.workspaceRoot,
     toolApprovalMode: record.toolApprovalMode,
+    ...(agentLanguage === undefined ? {} : { agentLanguage }),
     lanes,
   }
 }

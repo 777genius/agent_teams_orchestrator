@@ -40,6 +40,7 @@ import {
   type NativeHostLocalProcessPort,
 } from './NativeHostLocalLaneProcesses.js'
 import { runNativeProviderPreflight, type NativeProviderPreflight } from './NativeHostLocalLanePreflight.js'
+import { withAgentLanguageInstruction } from '../teamBootstrap/agentLanguageInstruction.js'
 import type {
   TeamLifecycleLaneEffectPort,
   TeamLifecycleLaneInput,
@@ -292,8 +293,10 @@ export class NativeHostLocalTeamLifecycleLane implements TeamLifecycleLaneEffect
       workspaceRoot: input.workspaceRoot,
       mode: teamExists ? 'launch' : 'create',
       shape,
+      ...(input.agentLanguage === undefined ? {} : { agentLanguage: input.agentLanguage }),
     })))
-    await writeNativeLanePrivateFile(files.userPromptPath, shape.lead.prompt)
+    await writeNativeLanePrivateFile(files.userPromptPath,
+      withAgentLanguageInstruction(input.agentLanguage, shape.lead.prompt))
     await writeNativeLanePrivateFile(files.mcpConfigPath, JSON.stringify(buildNativeMcpConfig(mcpServer, this.#claudeRoot)))
     return files
   }

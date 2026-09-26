@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 
 import { createOwnedOpenCodeLifecycleCommandExecutor } from '../opencode/OpenCodeBridgeCommandHandler.js'
 import { openCodeSessionStore } from '../opencode/OpenCodeSessionStore.js'
+import { withAgentLanguageInstruction } from '../teamBootstrap/agentLanguageInstruction.js'
 import type { TeamLifecycleLaunchLane, TeamLifecycleLaunchPlan } from './TeamLifecycleLaunchPlan.js'
 
 export type TeamLifecycleLanePhase = 'idle' | 'launching' | 'running' | 'failed'
@@ -30,6 +31,8 @@ export type TeamLifecycleLaneInput = {
   lane: TeamLifecycleLaunchLane
   /** Every lane of the admitted plan, for adapters that launch several lanes as one team. */
   planLanes?: readonly TeamLifecycleLaunchLane[]
+  /** The plan's agent language; launch prefixes it to the prompts it writes. */
+  agentLanguage?: string
 }
 
 type ExecuteBridge = ReturnType<typeof createOwnedOpenCodeLifecycleCommandExecutor>
@@ -143,6 +146,7 @@ export class OpenCodeTeamLifecycleLane implements TeamLifecycleLaneEffectPort {
     toolApprovalMode: 'manual' | 'auto'
     lane: TeamLifecycleLaunchLane
     runId: string
+    agentLanguage?: string
   }): Promise<TeamLifecycleLaneObservation> {
     if (input.lane.kind !== 'opencode') throw new Error('OpenCode lane received a native plan')
     const lane = input.lane
@@ -161,7 +165,7 @@ export class OpenCodeTeamLifecycleLane implements TeamLifecycleLaneEffectPort {
         ...(lane.effort ? { effort: lane.effort } : {}),
         members: lane.members.map(member => ({
           name: member.name,
-          prompt: member.prompt,
+          prompt: withAgentLanguageInstruction(input.agentLanguage, member.prompt),
           ...(member.model ? { model: member.model } : {}),
           ...(member.effort ? { effort: member.effort } : {}),
         })),

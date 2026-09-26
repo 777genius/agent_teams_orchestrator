@@ -955,6 +955,11 @@ describe('OpenCodeTeamLifecycleLane', () => {
       { name: 'worker', prompt: 'Implement the fixture.', effort: 'high' },
     ])
     expect(calls[0]!.body).toMatchObject({ toolApprovalMode: 'manual', skipPermissions: false })
+    await lane.launch({ ...input, runId: 'run_language', agentLanguage: 'Russian' })
+    expect((calls.at(-1)!.body as Record<string, unknown>).members).toEqual([
+      { name: 'worker', prompt: 'IMPORTANT: Communicate in Russian. All messages, summaries, and task descriptions MUST be in Russian.\n\nImplement the fixture.', effort: 'high' },
+    ])
+    calls.pop()
     // Reconcile binds to the run's committed capability so the bridge reuses its host.
     expect(calls[1]!.body).toMatchObject({
       expectedCapabilitySnapshotId: capability,

@@ -148,7 +148,7 @@ describe.skipIf(!supportedOnHost)('NativeHostLocalTeamLifecycleLane process life
   test('launches the lead, reports bootstrap completion, and stops the whole team', async () => {
     const harness = await createHarness()
     const lane = harness.createLane()
-    const run = laneInput(harness, 'run_first')
+    const run = { ...laneInput(harness, 'run_first'), agentLanguage: 'Russian' }
 
     expect(await lane.launch(run)).toEqual({ phase: 'launching', recoverable: false })
     const record = JSON.parse(await readFile(join(harness.teamRoot, NATIVE_LANE_RUNTIME_RECORD_FILE), 'utf8'))
@@ -171,7 +171,10 @@ describe.skipIf(!supportedOnHost)('NativeHostLocalTeamLifecycleLane process life
     expect(spec.members).toEqual([{
       name: 'worker', workflow: 'Implement the assigned tasks.', cwd: harness.workspaceRoot, provider: 'anthropic',
     }])
-    expect(await readFile(join(record.runtimeDir, 'lead-prompt.txt'), 'utf8')).toBe('Lead the hosted team.')
+    // The runtime adds the language line to teammate prompts from lead.agentLanguage.
+    expect(spec.lead).toEqual({ agentLanguage: 'Russian' })
+    expect(await readFile(join(record.runtimeDir, 'lead-prompt.txt'), 'utf8'))
+      .toBe('IMPORTANT: Communicate in Russian. All messages, summaries, and task descriptions MUST be in Russian.\n\nLead the hosted team.')
 
     expect(await lane.stop(run)).toEqual({ phase: 'idle', recoverable: false })
     expect(isProcessAlive(record.pid)).toBe(false)

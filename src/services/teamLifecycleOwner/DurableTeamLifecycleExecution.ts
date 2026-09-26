@@ -41,6 +41,7 @@ type LaneInput = {
   toolApprovalMode: TeamLifecycleLaunchPlan['toolApprovalMode']
   lane: TeamLifecycleLaunchPlan['lanes'][number]
   planLanes: TeamLifecycleLaunchPlan['lanes']
+  agentLanguage?: string
   runId: string
 }
 
@@ -539,6 +540,7 @@ export class DurableTeamLifecycleExecution implements TeamLifecycleExecutionPort
         toolApprovalMode: plan.toolApprovalMode,
         lane,
         planLanes: plan.lanes,
+        ...(plan.agentLanguage === undefined ? {} : { agentLanguage: plan.agentLanguage }),
         runId,
       }
       // No asynchronous boundary may exist between the authority comparison and

@@ -4,14 +4,9 @@ import { listTasks } from 'src/utils/tasks.js'
 import { normalizeBootstrapModelSelection } from './teamBootstrapModelSelection.js'
 import type { TeamBootstrapSpec } from './teamBootstrapTypes.js'
 import { buildNativeAppManagedBootstrapPrivatePrompt } from './nativeAppManagedBootstrapContext.js'
+import { buildAgentLanguageInstruction } from './agentLanguageInstruction.js'
 
-export function buildAgentLanguageInstruction(agentLanguage?: string): string {
-  const trimmed = agentLanguage?.trim()
-  if (!trimmed || trimmed.toLowerCase() === 'system') {
-    return ''
-  }
-  return `IMPORTANT: Communicate in ${trimmed}. All messages, summaries, and task descriptions MUST be in ${trimmed}.`
-}
+export { buildAgentLanguageInstruction }
 
 export async function resolveBootstrapLeadName(
   spec: TeamBootstrapSpec,

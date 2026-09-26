@@ -20,7 +20,11 @@ type Golden = {
   format: string
   disallowedTools: string
   bootstrapTimeoutMs: Array<{ teammates: number; timeoutMs: number }>
-  desktopCreateSpec: Json & { team: { name: string; cwd: string }; members: Json[] }
+  desktopCreateSpec: Json & {
+    team: { name: string; cwd: string }
+    lead: { agentLanguage: string }
+    members: Json[]
+  }
 }
 
 const raw = readFileSync(new URL('../../../docs/hosted-native-bootstrap-parity-golden.json', import.meta.url))
@@ -30,7 +34,10 @@ const desktop = golden.desktopCreateSpec
 const roots: string[] = []
 afterEach(async () => Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true }))))
 
-/** The hosted lane for the same roster: the desktop member workflow is the hosted member prompt. */
+/**
+ * The hosted lane for the same roster and plan language: the desktop member
+ * workflow is the hosted member prompt.
+ */
 function hostedSpec(workspaceRoot: string): Json {
   const shape = {
     leadLane: { laneId: 'native-lane', kind: 'native', provider: 'anthropic', members: [] },
@@ -47,6 +54,7 @@ function hostedSpec(workspaceRoot: string): Json {
   } as unknown as NativeHostLocalLaunchShape
   return buildNativeBootstrapSpec({
     runId: String(desktop.runId), teamName: desktop.team.name, workspaceRoot, mode: 'create', shape,
+    agentLanguage: desktop.lead.agentLanguage,
   })
 }
 
@@ -63,12 +71,8 @@ describe('hosted native bootstrap parity cross-repository golden', () => {
     }
   })
 
-  test('builds the desktop spec for the same roster, less the desktop-only lead language', () => {
-    const hosted = hostedSpec(desktop.team.cwd)
-    const { lead: _desktopLead, ...desktopShared } = desktop
-    const { lead: hostedLead, ...hostedShared } = hosted
-    expect(hostedLead).toEqual({})
-    expect(hostedShared).toEqual(desktopShared)
+  test('builds the desktop spec for the same roster and language', () => {
+    expect(hostedSpec(desktop.team.cwd)).toEqual(desktop)
   })
 
   test('both specs pass the runtime bootstrap spec reader', async () => {
@@ -91,9 +95,8 @@ describe('hosted native bootstrap parity cross-repository golden', () => {
     const fromDesktop = await read('desktop', relocate(desktop))
     expect(fromDesktop.members.map(member => member.originalName))
       .toEqual(desktop.members.map(member => String(member.name)))
-    // Hosted drafts carry no agent language yet, so teammates miss the desktop language line.
-    const withoutLanguage = await read('desktop-without-language', relocate({ ...desktop, lead: {} }))
-    expect(withoutLanguage).not.toEqual(fromDesktop)
-    expect(await read('hosted', hostedSpec(root))).toEqual(withoutLanguage)
+    expect(fromDesktop.members.every(member => member.prompt.includes(
+      `Communicate in ${desktop.lead.agentLanguage}.`))).toBe(true)
+    expect(await read('hosted', hostedSpec(root))).toEqual(fromDesktop)
   })
 })
