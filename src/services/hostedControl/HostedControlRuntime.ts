@@ -1,4 +1,3 @@
-import { join } from 'node:path'
 import {
   readHostedControlSecret,
   resolveHostedControlOwnerBinding,
@@ -17,14 +16,13 @@ import {
   HostedControlServer,
   type HostedApprovalActivationSessionFactory,
 } from './HostedControlServer.js'
-import { HostedTaskMutationService } from './HostedTaskMutationService.js'
+import { createHostedTaskWriter } from './HostedControllerTaskWriter.js'
+import { assertNoPreparedRetiredOwnerTaskMutation } from './HostedOwnerTaskWalRetirement.js'
 import { createHostedTeamIdentityFenceVerifier } from './HostedTeamIdentityFence.js'
-import { HostedTaskMutationWal } from './HostedTaskMutationWal.js'
 import { HostedRootOwnerLease } from './HostedRootOwnerLease.js'
-import {
-  HOSTED_CONTROL_PERSONAL_HOST_ADMISSION_KIND,
-  type HostedControlBootstrapAdmission,
-  type HostedControlDescriptorGuard,
+import type {
+  HostedControlBootstrapAdmission,
+  HostedControlDescriptorGuard,
 } from './HostedControlBootstrap.js'
 import {
   hostedControlAuthorityFromConfig,
@@ -143,14 +141,9 @@ export class HostedControlRuntime {
         ...configuredAuthority,
         mountBinding: Object.freeze({ ...configuredAuthority.mountBinding }),
       })
-      const wal = new HostedTaskMutationWal(
-        join(config.claudeRoot, 'teams', config.legacyKey),
-        config.teamId,
-      )
       rootLease = descriptorAdmission ? null : new HostedRootOwnerLease(ownerScope.canonicalTeamRoot)
       await rootLease?.acquire()
       this.#rootLease = rootLease
-      let startupRecovery = true
       const validateOwner = async (): Promise<boolean> => {
         if (!this.#acceptingEffects) return false
         const validRoot = await validateHostedControlOwnerBinding({
@@ -160,7 +153,7 @@ export class HostedControlRuntime {
         })
         if (!validRoot) return false
         if (this.#descriptorGuard && !(await this.#descriptorGuard.assertCurrent())) return false
-        return startupRecovery || !!server && await server.hasActiveLease()
+        return !!server && await server.hasActiveLease()
       }
       const isCurrentAuthority = async (
         candidate: HostedControlAuthority | HostedLifecycleAuthority,
@@ -173,24 +166,19 @@ export class HostedControlRuntime {
           expectedRootIdentity: ownerScope.rootIdentity,
         })
       }
-      const taskService = new HostedTaskMutationService({
-        claudeRoot: config.claudeRoot,
+      await assertNoPreparedRetiredOwnerTaskMutation(ownerScope.canonicalTeamRoot)
+      const tasks = await createHostedTaskWriter({
+        admissionKind: descriptorAdmission?.admissionKind,
+        appMcp: descriptorAdmission?.appMcp,
+        claudeRoot: ownerScope.canonicalClaudeRoot,
         legacyKey: config.legacyKey,
         authority,
-        wal,
-        validateOwner,
-        // Temporary personal-host writer: its agents are already trusted host processes. Every
-        // other profile stays read-only until Product owns the single atomic task writer.
-        denyOwnerLocalWrites: descriptorAdmission?.admissionKind !== HOSTED_CONTROL_PERSONAL_HOST_ADMISSION_KIND,
+        isCurrent: validateOwner,
       })
       if (startup.cancelled || this.#descriptorAuthorityLost) {
         throw new Error('Hosted control launcher authority is no longer current')
       }
       this.#acceptingEffects = true
-      if (!(await taskService.recover())) {
-        throw new Error('Hosted control WAL recovery did not establish a safe state')
-      }
-      startupRecovery = false
       let dispatcher: HostedControlDispatcher
       if (!(await validateHostedControlOwnerBinding({
         claudeRoot: config.claudeRoot,
@@ -243,7 +231,7 @@ export class HostedControlRuntime {
         getOwnerBinding: () => server?.ownerBinding ?? null,
         lifecycle: ports.lifecycle,
         messages: ports.messages,
-        tasks: taskService,
+        tasks,
         verifyOwnerEffectFence: createHostedTeamIdentityFenceVerifier({
           claudeRoot: ownerScope.canonicalClaudeRoot,
           legacyKey: config.legacyKey,

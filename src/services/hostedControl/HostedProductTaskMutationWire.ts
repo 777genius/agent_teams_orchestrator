@@ -10,9 +10,12 @@ import {
   sealProductOwnerBoundResponse,
   type ProductOwnerBoundRequest,
 } from './HostedProductOwnerBoundEnvelope.js'
-import type { HostedTaskMutationOutcome } from './HostedTaskMutationService.js'
 
 const MAX_SELF_WRITE_EFFECTS = 512
+
+/** A task file the committed mutation published, so Product counts it as its own write. */
+export type HostedTaskSelfWriteEffect = { fileKey: string; expectedChecksum: string }
+export type HostedTaskMutationOutcome = { result: HostedTaskMutationTerminalResult; selfWriteEffects: HostedTaskSelfWriteEffect[] }
 
 export type HostedProductTaskMutationPort = {
   mutateWithSelfWriteEffects(request: HostedTaskMutationRequest): Promise<HostedTaskMutationOutcome>

@@ -8,7 +8,7 @@ import { HostedControlDispatcher } from './HostedControlDispatcher.js'
 import { HOSTED_TEAM_MESSAGE_PROOF_DOMAIN } from './HostedControlServer.js'
 import { productOwnerBoundProofInput, type ProductOwnerBoundOperation } from './HostedProductOwnerBoundEnvelope.js'
 import { hostedTaskBoardRevision, hostedTaskBoardSourceGeneration, hostedTaskBoardTaskId, sha256 } from './HostedTaskBoardIdentity.js'
-import type { HostedTaskMutationOutcome } from './HostedTaskMutationService.js'
+import type { HostedTaskMutationOutcome } from './HostedProductTaskMutationWire.js'
 import { createHostedTeamIdentityFenceVerifier } from './HostedTeamIdentityFence.js'
 import {
   fingerprintHostedTaskCommand,

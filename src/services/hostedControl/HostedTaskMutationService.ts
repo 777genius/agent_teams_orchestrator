@@ -13,8 +13,7 @@ type BoardState = { sourceGeneration: string; revision: string; directories: { t
 type SourceState = Pick<BoardState, 'sourceGeneration' | 'directories'>
 type MutationLedger = { schemaVersion: 2; entries: Record<string, LedgerEntry> }
 type LedgerEntry = { fingerprint: string; commandId: string; sourceGeneration: string; expectedRevision: string; receipt: HostedTaskMutationReceipt; committedAtMs: number }
-export type HostedTaskSelfWriteEffect = { fileKey: string; expectedChecksum: string }
-export type HostedTaskMutationOutcome = { result: HostedTaskMutationTerminalResult; selfWriteEffects: HostedTaskSelfWriteEffect[] }
+import type { HostedTaskMutationOutcome, HostedTaskSelfWriteEffect } from './HostedProductTaskMutationWire.js'
 type PlanResult = { writes: HostedMutationWrite[]; result: HostedTaskMutationCommittedResult } | { terminal: HostedTaskMutationTerminalResult }
 type CrashStage = 'after_task_detach' | 'after_task_write' | 'before_kanban_write' | 'before_terminal'
 class ControlledHostedMutationCrash extends Error {}
