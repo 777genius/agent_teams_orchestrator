@@ -25,6 +25,12 @@ import {
 } from './OpenCodeHostManager.js'
 import { readOpenCodeAuthCredential, withOpenCodeOAuthRefreshLock, type OpenCodeOAuthNativeProbeOwner } from './OpenCodeAuthStore.js'
 import { buildOpenCodeRuntimePromptMessageId } from './OpenCodeMessageIds.js'
+import { normalizeOpenCodePermissions } from './OpenCodePermissionNormalizer.js'
+import {
+  OPEN_CODE_FREE_TIER_RESTRICTED_FAILURE_CODE,
+  OPEN_CODE_FREE_TIER_RESTRICTED_REASON,
+  isOpenCodeFreeTierRestrictedError,
+} from './OpenCodeFreeTierFailure.js'
 import {
   ensureOpenCodeNativeCliCredentialBridge,
   OPEN_CODE_MODEL_PROBE_AGENT_NAME,
@@ -519,6 +525,53 @@ function getLatestAssistantMessageError(messages: OpenCodeExecutionProbeResult['
     }
   }
 
+  return null
+}
+
+export const OPEN_CODE_PROBE_PERMISSION_REJECT_MESSAGE =
+  'Tools are disabled in this check. Reply with text only.'
+
+// The Zen probe agent keeps the teammate tool set behind "ask", so any tool call surfaces as a
+// permission request. Rejecting it with a message keeps the probe from running anything, and
+// the message makes OpenCode hand the refusal back to the model as feedback instead of
+// blocking the turn, so the model can still answer in text. Returns how many were rejected.
+export async function rejectProbeSessionPermissions(
+  client: Pick<OpenCodeClient, 'getPermissions' | 'answerPermission'>,
+  sessionId: string,
+  diagnostics: Set<string>,
+): Promise<number> {
+  let rejected = 0
+  for (const permission of normalizeOpenCodePermissions(await client.getPermissions())) {
+    if (permission.sessionId !== sessionId) continue
+    await client.answerPermission({
+      requestId: permission.requestId,
+      sessionId,
+      decision: 'reject',
+      message: OPEN_CODE_PROBE_PERMISSION_REJECT_MESSAGE,
+    })
+    rejected += 1
+    diagnostics.add(`OpenCode probe rejected a ${permission.tool ?? 'tool'} permission request`)
+  }
+  return rejected
+}
+
+type ProbeFailureClassification = Pick<OpenCodeExecutionProbeResult, 'outcome' | 'reason' | 'failureCode'>
+
+// Checked before the message classifier, which would read the 403 as not_authenticated.
+function classifyFreeTierRestrictedAssistantError(
+  rawMessages: OpenCodeMessage[],
+): ProbeFailureClassification | null {
+  for (let index = rawMessages.length - 1; index >= 0; index -= 1) {
+    const info = rawMessages[index]?.info
+    if (!info || typeof info !== 'object' || info.role !== 'assistant' || !info.error) continue
+    return isOpenCodeFreeTierRestrictedError(info.error)
+      ? {
+          outcome: 'unavailable',
+          reason: OPEN_CODE_FREE_TIER_RESTRICTED_REASON,
+          failureCode: OPEN_CODE_FREE_TIER_RESTRICTED_FAILURE_CODE,
+        }
+      : null
+  }
   return null
 }
 
@@ -1409,6 +1462,16 @@ export class OpenCodeExecutionProbe {
         let latestErrorCount = 0
         let idleMissingAssistantMessageId: string | null = null
         let idleMissingAssistantConfirmations = 0
+        let permissionSweep: Promise<void> | null = null
+        let rejectedProbePermissions = 0
+        let idleAfterRejectedPermissionConfirmations = 0
+        const sweepProbePermissions = (client: OpenCodeClient) => {
+          if (permissionSweep || !sessionId) return
+          permissionSweep = rejectProbeSessionPermissions(client, sessionId, diagnostics)
+            .then(count => { rejectedProbePermissions += count })
+            .catch(() => undefined)
+            .finally(() => { permissionSweep = null })
+        }
         const finishPollRequestFailure = (
           error: unknown,
           source: 'status' | 'messages',
@@ -1577,6 +1640,7 @@ export class OpenCodeExecutionProbe {
                 continue pollLoop
               }
               context?.throwIfExpired()
+              sweepProbePermissions(pollClient)
               const statusRequest = pollClient.getSessionStatus().then(
                 statusMap => ({ kind: 'status' as const, statusMap }),
                 error => ({ kind: 'error' as const, error }),
@@ -1763,10 +1827,12 @@ export class OpenCodeExecutionProbe {
             ?? summary.latestAssistantPreview
             ?? summary.latestAssistantText
             ?? null
-          const eagerFailure = failureMessage
-            && (latestAssistantError || summary.durableState === 'retrying')
-            ? classifyProbeFailure({ message: failureMessage })
-            : null
+          const freeTierFailure = classifyFreeTierRestrictedAssistantError(messages)
+          const eagerFailure: ProbeFailureClassification | null = freeTierFailure
+            ?? (failureMessage
+              && (latestAssistantError || summary.durableState === 'retrying')
+              ? classifyProbeFailure({ message: failureMessage })
+              : null)
           if (eagerFailure && eagerFailure.outcome !== 'unknown') {
             if (summary.durableState === 'idle') sessionRequiresCleanup = false
             diagnostics.add(
@@ -1779,6 +1845,7 @@ export class OpenCodeExecutionProbe {
               expectedOutput,
               outcome: eagerFailure.outcome,
               reason: eagerFailure.reason,
+              ...(eagerFailure.failureCode ? { failureCode: eagerFailure.failureCode } : {}),
               durationMs: buildDurationMs(startedAtMs),
               rawStatus: summary.rawStatus,
               durableState: summary.durableState,
@@ -1786,6 +1853,42 @@ export class OpenCodeExecutionProbe {
               latestAssistantPreview: summary.latestAssistantPreview,
               toolCallCount: summary.toolCallCount,
               errorCount: Math.max(1, summary.errorCount),
+              diagnostics: Array.from(diagnostics),
+            })
+          }
+          // A rejected tool call can still end the turn without text when OpenCode blocks
+          // parallel pending calls; then nothing more will arrive, so do not wait for the deadline.
+          idleAfterRejectedPermissionConfirmations =
+            rejectedProbePermissions > 0 && summary.durableState === 'idle' && !failureMessage
+              ? idleAfterRejectedPermissionConfirmations + 1
+              : 0
+          if (
+            rejectedProbePermissions > 0
+            && !failureMessage
+            && (hasCompletedAssistantResponseWithoutText(summary)
+              || idleAfterRejectedPermissionConfirmations
+                >= OPEN_CODE_EXECUTION_PROBE_IDLE_MISSING_ASSISTANT_CONFIRMATIONS)
+          ) {
+            sessionRequiresCleanup = false
+            const reason =
+              'OpenCode model verification ended after the model tried to use a tool instead of answering'
+            diagnostics.add(
+              `${reason}; ${rejectedProbePermissions} tool permission request(s) were rejected`,
+            )
+            return finish({
+              providerId: 'opencode',
+              modelId: params.selectedModel,
+              probePrompt: prompt,
+              expectedOutput,
+              outcome: 'unknown',
+              reason,
+              durationMs: buildDurationMs(startedAtMs),
+              rawStatus: summary.rawStatus,
+              durableState: summary.durableState,
+              latestAssistantText: summary.latestAssistantText,
+              latestAssistantPreview: summary.latestAssistantPreview,
+              toolCallCount: summary.toolCallCount,
+              errorCount: summary.errorCount,
               diagnostics: Array.from(diagnostics),
             })
           }
@@ -1858,7 +1961,8 @@ export class OpenCodeExecutionProbe {
           }
 
           if (failureMessage && isSettledProbeAssistantTurn(summary)) {
-            const classified = classifyProbeFailure({ message: failureMessage })
+            const classified: ProbeFailureClassification = freeTierFailure
+              ?? classifyProbeFailure({ message: failureMessage })
             if (classified.outcome !== 'unknown') {
               diagnostics.add(
                 `OpenCode assistant payload exposed a terminal provider failure after polling completed in ${Math.max(0, nowMs() - executionPollStartedAtMs)}ms`,
@@ -1878,6 +1982,7 @@ export class OpenCodeExecutionProbe {
                     ? 'OpenCode exact-model execution proof was mismatched'
                     : 'OpenCode local-model execution proof was mismatched'
                   : classified.reason,
+              ...(classified.failureCode ? { failureCode: classified.failureCode } : {}),
               durationMs: buildDurationMs(startedAtMs),
               rawStatus: summary.rawStatus,
               durableState: summary.durableState,

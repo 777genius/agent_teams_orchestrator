@@ -71,6 +71,7 @@ export type OpenCodeClient = {
       requestIncarnation: string
       permissionDigest: string
     }
+    message?: string
   }): Promise<unknown>
   sendSessionMessage(
     id: string,
@@ -717,6 +718,9 @@ export class OpenCodeClientFactory {
           decision: body.decision,
           allow: body.decision === 'allow' || body.decision === 'always',
           always: body.decision === 'always',
+          // With a message, OpenCode turns a reject into feedback for the model instead of
+          // blocking the session, so the turn continues and can still answer in text.
+          ...(body.message?.trim() ? { message: body.message.trim() } : {}),
         }
         const encodedRequestId = encodeURIComponent(body.requestId)
         if (!body.condition) {

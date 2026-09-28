@@ -629,9 +629,21 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       'opencode/mimo-v2.6-flash-free',
       'launch_runtime',
     )
-    await expect(resolve('opencode/BIG-PICKLE', 'execution_probe'))
+    const spaceBunnyProbe = await resolve('opencode/space-bunny-free', 'execution_probe')
+    const spaceBunnyLaunch = await resolve('opencode/space-bunny-free', 'launch_runtime')
+    // A Zen free model released after this build must not need a runtime
+    // release to launch; the live catalog in the access policy decides it.
+    const futureFreeLaunch = await resolve('opencode/some-future-free-model', 'launch_runtime')
+    // Exact-model binding: a case variant gets its own scope and can never reuse
+    // big-pickle's. The access policy rejects it as absent from the catalog.
+    const caseVariant = await resolve('opencode/BIG-PICKLE', 'execution_probe')
+    await expect(resolve('opencode/', 'execution_probe'))
       .rejects.toThrow('requires explicit selected authentication')
-    await expect(resolve('opencode/BIG-PICKLE', 'launch_runtime'))
+    // Zen and Go share model ids across catalogs (Space Bunny Free exists in
+    // both); a Go route always needs its subscription key.
+    await expect(resolve('opencode-go/space-bunny-free', 'execution_probe'))
+      .rejects.toThrow('requires explicit selected authentication')
+    await expect(resolve('opencode-go/space-bunny-free', 'launch_runtime'))
       .rejects.toThrow('requires explicit selected authentication')
     const ollama = await resolve('ollama/qwen3:8b', 'execution_probe')
     const ollamaOtherModel = await resolve('ollama/llama3.2:3b', 'execution_probe')
@@ -653,6 +665,14 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     expect(builtinSame).toEqual(builtin)
     expect(builtin.selectedAuthIdentity).toBe('absent')
     expect(currentBuiltinLaunch.selectedAuthIdentity).toBe('absent')
+    expect(spaceBunnyProbe.selectedAuthIdentity).toBe('absent')
+    expect(spaceBunnyLaunch.selectedAuthIdentity).toBe('absent')
+    expect(spaceBunnyProbe.scopeToken).not.toBe(builtin.scopeToken)
+    expect(spaceBunnyProbe.configFingerprint).not.toBe(builtin.configFingerprint)
+    expect(futureFreeLaunch.selectedAuthIdentity).toBe('absent')
+    expect(caseVariant.selectedAuthIdentity).toBe('absent')
+    expect(caseVariant.scopeToken).not.toBe(builtin.scopeToken)
+    expect(caseVariant.configFingerprint).not.toBe(builtin.configFingerprint)
     expect(ollama.selectedAuthIdentity).toBe('absent')
     expect(loopback.selectedAuthIdentity).toBe('absent')
     expect(ollamaOtherModel.configFingerprint).not.toBe(ollama.configFingerprint)
@@ -678,8 +698,6 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     })
 
     await expect(resolve('deepinfra/model'))
-      .rejects.toThrow('requires explicit selected authentication')
-    await expect(resolve('opencode/not-a-catalog-model-free'))
       .rejects.toThrow('requires explicit selected authentication')
     await writeFile(authPath, JSON.stringify({
       opencode: { type: 'api', key: '' },
@@ -1316,6 +1334,52 @@ describe('OpenCodeProfileManager project behavior contract', () => {
         },
       },
     })
+  })
+
+  test('gives only the auto-mode OpenCode Zen probe the teammate tool set, behind ask', () => {
+    const probeOf = (options: Parameters<typeof buildManagedConfig>[1]) =>
+      (buildManagedConfig(null, options).agent as Record<string, Record<string, unknown>>)['teammate-model-probe']
+    const toolLess = {
+      mode: 'primary',
+      description: 'Minimal model execution probe agent with tools disabled.',
+      tools: { '*': false },
+      permission: { '*': 'deny' },
+    }
+
+    // Zen gates free-tier requests on the standard tool set, so its probe carries it.
+    const zen = probeOf({ managedProviderId: 'opencode' })
+    expect(zen).not.toHaveProperty('tools')
+    expect(zen.permission).toEqual({
+      '*': 'deny',
+      read: 'ask',
+      glob: 'ask',
+      grep: 'ask',
+      list: 'ask',
+      lsp: 'ask',
+      todoread: 'ask',
+      todowrite: 'ask',
+      edit: 'ask',
+      write: 'ask',
+      bash: 'ask',
+      task: { '*': 'deny' },
+      external_directory: 'deny',
+      doom_loop: 'deny',
+      'agent-teams_*': 'ask',
+      'agent_teams_*': 'ask',
+      'mcp__agent-teams__*': 'ask',
+      'mcp__agent_teams__*': 'ask',
+    })
+    // Nothing in the probe may be "allow"; "question" and every unlisted tool stay denied.
+    expect(JSON.stringify(zen.permission)).not.toContain('"allow"')
+    expect((zen.permission as Record<string, unknown>).question).toBeUndefined()
+    expect((zen.permission as Record<string, unknown>)['*']).toBe('deny')
+
+    // Manual-mode hosts can hold per-instance "always" approvals, so they keep the tool-less probe.
+    expect(probeOf({ managedProviderId: 'opencode', toolApprovalMode: 'manual' })).toEqual(toolLess)
+    // Other providers and unscoped profiles keep the small tool-less probe.
+    expect(probeOf({ managedProviderId: 'deepinfra' })).toEqual(toolLess)
+    expect(probeOf({ managedProviderId: 'opencode-go' })).toEqual(toolLess)
+    expect(probeOf({})).toEqual(toolLess)
   })
 
   test('can build a manual approval teammate profile while keeping app MCP allowed', () => {
@@ -3548,7 +3612,62 @@ describe('ensureSelectedOpenCodeModelInImportedConfig', () => {
     )
     expect(config.provider.ollama.models).toEqual({
       'qwen2.5-coder:0.5b': {},
-      'qwen2.5-coder:7b-32k': {},
+      'qwen2.5-coder:7b-32k': {
+        tool_call: true,
+        limit: {
+          context: 32_768,
+          output: 4096,
+        },
+      },
+    })
+  })
+
+  test('copies a sibling local allowlist context window onto the selected model', () => {
+    const config = {
+      provider: {
+        ollama: {
+          models: {
+            'qwen2.5-coder:0.5b': {
+              tool_call: true,
+              limit: { context: 32_768, output: 4096 },
+            },
+          },
+        },
+      },
+    }
+    ensureSelectedOpenCodeModelInImportedConfig(
+      config,
+      'ollama/qwen2.5-coder:7b-32k',
+      'launch_runtime',
+    )
+    expect(config.provider.ollama.models['qwen2.5-coder:7b-32k']).toEqual({
+      tool_call: true,
+      limit: { context: 32_768, output: 4096 },
+    })
+  })
+
+  test('upgrades an empty selected local allowlist entry so tools keep a real context window', () => {
+    const config = {
+      provider: {
+        ollama: {
+          models: {
+            'qwen2.5-coder:0.5b': {
+              tool_call: true,
+              limit: { context: 32_768, output: 4096 },
+            },
+            'qwen2.5-coder:7b-32k': {},
+          },
+        },
+      },
+    }
+    ensureSelectedOpenCodeModelInImportedConfig(
+      config,
+      'ollama/qwen2.5-coder:7b-32k',
+      'launch_runtime',
+    )
+    expect(config.provider.ollama.models['qwen2.5-coder:7b-32k']).toEqual({
+      tool_call: true,
+      limit: { context: 32_768, output: 4096 },
     })
   })
 
@@ -3590,7 +3709,13 @@ describe('ensureSelectedOpenCodeModelInImportedConfig', () => {
     )
     expect(config.provider.ollama.models).toEqual({
       'qwen2.5-coder:0.5b': {},
-      'qwen2.5-coder:7b-32k': {},
+      'qwen2.5-coder:7b-32k': {
+        tool_call: true,
+        limit: {
+          context: 32_768,
+          output: 4096,
+        },
+      },
     })
   })
 
@@ -3609,7 +3734,13 @@ describe('ensureSelectedOpenCodeModelInImportedConfig', () => {
       ollama: {
         models: {
           'qwen2.5-coder:0.5b': {},
-          'qwen2.5-coder:7b-32k': {},
+          'qwen2.5-coder:7b-32k': {
+            tool_call: true,
+            limit: {
+              context: 32_768,
+              output: 4096,
+            },
+          },
         },
       },
     })
@@ -3630,7 +3761,13 @@ describe('ensureSelectedOpenCodeModelInImportedConfig', () => {
       lmstudio: {
         models: {
           'local-model': {},
-          'qwen2.5-coder:7b-32k': {},
+          'qwen2.5-coder:7b-32k': {
+            tool_call: true,
+            limit: {
+              context: 32_768,
+              output: 4096,
+            },
+          },
         },
       },
     })
@@ -3653,7 +3790,13 @@ describe('ensureSelectedOpenCodeModelInImportedConfig', () => {
       lmstudio: {
         models: {
           'local-model': {},
-          'qwen2.5-coder:7b-32k': {},
+          'qwen2.5-coder:7b-32k': {
+            tool_call: true,
+            limit: {
+              context: 32_768,
+              output: 4096,
+            },
+          },
         },
       },
     })

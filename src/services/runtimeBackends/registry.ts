@@ -39,6 +39,7 @@ import {
   evaluateOpenCodeAgentModelCompatibility,
   filterOpenCodeAgentModels,
   getOpenCodeModelInputModalities,
+  selectOpenCodeDefaultAgentModel,
 } from '../opencode/OpenCodeAgentModelCompatibility.js'
 import type { OpenCodeInventorySnapshot } from '../opencode/types.js'
 import type { GeminiBackendStatus } from '../gemini/types.js'
@@ -645,10 +646,7 @@ async function buildOpenCodeStatus(
   const authoritative = statusCheck.statusCheckOutcome === 'authoritative'
   const effectiveAuthenticated = authoritative && authenticated
   const fetchedAt = new Date()
-  const defaultModel =
-    agentModels.find((model) => model === 'opencode/big-pickle') ??
-    agentModels[0] ??
-    null
+  const defaultModel = selectOpenCodeDefaultAgentModel(agentModels)
   const metadataByModelId = new Map(
     snapshot.modelMetadata?.map((metadata) => [metadata.id, metadata]) ?? [],
   )

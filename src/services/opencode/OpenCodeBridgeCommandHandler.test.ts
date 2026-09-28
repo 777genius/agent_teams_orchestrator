@@ -12,6 +12,7 @@ import {
   createOwnedOpenCodeHostedInboxExecutor,
   createOwnedOpenCodeLifecycleCommandExecutor,
   executeOpenCodeBridgeCommandEnvelope,
+  __readinessDataForTests,
 } from './OpenCodeBridgeCommandHandler.js'
 import { OpenCodeTeamLifecycleLane } from '../teamLifecycleOwner/OpenCodeTeamLifecycleLane.js'
 import { openCodeCommandOutcomeStore } from './OpenCodeCommandOutcomeStore.js'
@@ -11531,5 +11532,41 @@ describe('OpenCodeBridgeCommandHandler', () => {
       return
     }
     expect(result.error.message).toContain('does not match sessionId session-old')
+  })
+})
+
+describe('free-tier readiness', () => {
+  const failedProbe = (failureCode?: 'free_tier_restricted') => ({
+    providerId: 'opencode' as const,
+    modelId: 'opencode/big-pickle',
+    probePrompt: 'p',
+    expectedOutput: 'e',
+    outcome: 'unavailable' as const,
+    reason: failureCode ? 'OpenCode rejected this free-tier request (HTTP 403).' : 'model failed',
+    durationMs: 1,
+    rawStatus: null,
+    durableState: 'idle' as const,
+    latestAssistantText: null,
+    latestAssistantPreview: null,
+    toolCallCount: 0,
+    errorCount: 1,
+    diagnostics: [],
+    ...(failureCode ? { failureCode } : {}),
+  })
+  const noMcpProof = { ok: false, observedTools: [], missingTools: ['x'], diagnostics: [], route: null, contractConfigIdentity: null }
+  const disconnected = { ...snapshot, appMcp: { ...snapshot.appMcp!, status: 'missing' as const, connected: false } }
+
+  test('reports the free-tier refusal even when the MCP contract is also unavailable', () => {
+    const data = __readinessDataForTests(disconnected, 'opencode/big-pickle', failedProbe('free_tier_restricted'), noMcpProof, true)
+    expect(data.state).toBe('model_unavailable')
+    expect(data.launchAllowed).toBe(false)
+    expect((data as { failureCode?: string }).failureCode).toBe('free_tier_restricted')
+    expect(data.missing[0]).toContain('free-tier')
+  })
+
+  test('keeps the existing MCP state and adds no code for other probe failures', () => {
+    const data = __readinessDataForTests(disconnected, 'opencode/big-pickle', failedProbe(), noMcpProof, true)
+    expect(data.state).toBe('mcp_unavailable')
+    expect((data as { failureCode?: string }).failureCode).toBeUndefined()
   })
 })

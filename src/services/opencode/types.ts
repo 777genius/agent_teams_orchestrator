@@ -371,7 +371,9 @@ export type OpenCodePendingPermission = {
   sessionID?: string
   sessionId?: string
   session?: string
-  tool?: string | { messageID?: string; callID?: string }
+  // OpenCode 1.18 sends `tool` as the {messageID, callID} reference and the tool
+  // name in the string `permission` field; older builds used a string `tool`.
+  tool?: string | Record<string, unknown>
   toolName?: string
   name?: string
   title?: string
@@ -379,7 +381,7 @@ export type OpenCodePendingPermission = {
   kind?: string
   type?: string
   metadata?: Record<string, unknown>
-  permission?: Record<string, unknown> | string
+  permission?: string | Record<string, unknown>
   [key: string]: unknown
 }
 
@@ -617,7 +619,7 @@ export type OpenCodeExecutionProbeResult = {
   toolCallCount: number
   errorCount: number
   diagnostics: string[]
-  failureCode?: 'prompt_start_failed' | 'execution_timeout'
+  failureCode?: 'prompt_start_failed' | 'execution_timeout' | 'free_tier_restricted'
   verifiedAt?: string
 }
 

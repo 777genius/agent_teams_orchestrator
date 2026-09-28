@@ -341,6 +341,49 @@ function buildOpenCodeTeammatePermission(
   }
 }
 
+function downgradeAllowToAsk(value: unknown): unknown {
+  if (value === 'allow') return 'ask'
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>).map(([key, entry]) => [key, downgradeAllowToAsk(entry)]),
+  )
+}
+
+const OPEN_CODE_TOOL_LESS_MODEL_PROBE_AGENT = {
+  mode: 'primary',
+  description: 'Minimal model execution probe agent with tools disabled.',
+  tools: {
+    '*': false,
+  },
+  permission: {
+    '*': 'deny',
+  },
+} as const
+
+// OpenCode Zen answers free-tier requests that carry no standard tool set with a 403
+// FreeTierError (anomalyco/opencode#49580), while the real teammate passes. Only for Zen does
+// the probe send the auto-mode teammate tool set, every "allow" downgraded to "ask" so any
+// call surfaces as a permission request the probe rejects. Manual-mode hosts keep the
+// tool-less probe: OpenCode stores "always" approvals per instance and they override "ask",
+// so a tool the user approved for a teammate there could otherwise run during a probe.
+// Every other provider keeps the tool-less probe as well, so its prompt stays small.
+function buildOpenCodeModelProbeAgent(input: {
+  managedProviderId: string | null | undefined
+  toolApprovalMode: OpenCodeToolApprovalMode | undefined
+}): Record<string, unknown> {
+  const providerId = input.managedProviderId
+    ? canonicalizeOpenCodeProviderId(input.managedProviderId)
+    : null
+  if (providerId !== 'opencode' || (input.toolApprovalMode ?? 'auto') !== 'auto') {
+    return structuredClone(OPEN_CODE_TOOL_LESS_MODEL_PROBE_AGENT) as Record<string, unknown>
+  }
+  return {
+    mode: 'primary',
+    description: 'Model execution probe agent that carries the teammate tool set but cannot run any of it.',
+    permission: downgradeAllowToAsk(buildOpenCodeTeammatePermission('auto')),
+  }
+}
+
 function parseProviderScopedModelId(value: string): {
   providerId: string
   modelId: string
@@ -791,16 +834,10 @@ export function buildManagedConfig(
           'mcp__agent_teams__*': 'allow',
         },
       },
-      [OPEN_CODE_MODEL_PROBE_AGENT_NAME]: {
-        mode: 'primary',
-        description: 'Minimal model execution probe agent with tools disabled.',
-        tools: {
-          '*': false,
-        },
-        permission: {
-          '*': 'deny',
-        },
-      },
+      [OPEN_CODE_MODEL_PROBE_AGENT_NAME]: buildOpenCodeModelProbeAgent({
+        managedProviderId: selectedManagedProviderId,
+        toolApprovalMode: options.toolApprovalMode,
+      }),
     },
     // Keep project/global plugin config untouched. OpenCode merges inline config as overrides,
     // so setting plugin here would shadow user and project extension points.
@@ -860,11 +897,74 @@ const OPEN_CODE_SCOPE_PLACEHOLDER_MODEL_IDS = new Set([
   'oauth-authority',
 ])
 
+const LOCAL_OPENCODE_SELECTED_MODEL_CONTEXT_LIMIT = 32_768
+const LOCAL_OPENCODE_SELECTED_MODEL_OUTPUT_LIMIT = 4_096
+
+function readPositiveOpenCodeModelLimit(value: unknown): {
+  context: number
+  output: number
+} | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const record = value as Record<string, unknown>
+  const context = typeof record.context === 'number' && Number.isFinite(record.context) && record.context > 0
+    ? Math.floor(record.context)
+    : null
+  const output = typeof record.output === 'number' && Number.isFinite(record.output) && record.output > 0
+    ? Math.floor(record.output)
+    : null
+  if (context == null && output == null) return null
+  return {
+    context: context ?? LOCAL_OPENCODE_SELECTED_MODEL_CONTEXT_LIMIT,
+    output: output ?? LOCAL_OPENCODE_SELECTED_MODEL_OUTPUT_LIMIT,
+  }
+}
+
+function buildSelectedLocalOpenCodeModelSeed(
+  existingModels: Record<string, unknown>,
+): Record<string, unknown> {
+  for (const value of Object.values(existingModels)) {
+    const limit = readPositiveOpenCodeModelLimit(
+      value && typeof value === 'object' && !Array.isArray(value)
+        ? (value as Record<string, unknown>).limit
+        : null,
+    )
+    if (limit) {
+      return { tool_call: true, limit }
+    }
+  }
+  return {
+    tool_call: true,
+    limit: {
+      context: LOCAL_OPENCODE_SELECTED_MODEL_CONTEXT_LIMIT,
+      output: LOCAL_OPENCODE_SELECTED_MODEL_OUTPUT_LIMIT,
+    },
+  }
+}
+
+function selectedLocalOpenCodeModelNeedsSeed(value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return true
+  const record = value as Record<string, unknown>
+  return record.tool_call !== true || readPositiveOpenCodeModelLimit(record.limit) == null
+}
+
+function enrichSelectedLocalOpenCodeModel(
+  value: unknown,
+  seed: Record<string, unknown>,
+): Record<string, unknown> {
+  const current = value && typeof value === 'object' && !Array.isArray(value)
+    ? { ...(value as Record<string, unknown>) }
+    : {}
+  if (current.tool_call !== true) current.tool_call = true
+  if (!readPositiveOpenCodeModelLimit(current.limit)) current.limit = seed.limit
+  return current
+}
+
 /**
  * User OpenCode config can pin an Ollama/LM Studio models allowlist. Imported
  * as-is, that list hides later local models and launch probes hang after
  * `ProviderModelNotFoundError`. Add the selected model without shrinking a
- * live-discovery provider (empty models map).
+ * live-discovery provider (empty models map), and keep tool-calling plus a
+ * usable context window so local teammates can actually invoke write/bash.
  */
 export function ensureSelectedOpenCodeModelInImportedConfig(
   config: Record<string, unknown>,
@@ -882,17 +982,22 @@ export function ensureSelectedOpenCodeModelInImportedConfig(
     ?? findCanonicalProviderConfig(providers, parsed.providerId)
   if (!found) return
   const models = asRecord(found.config.models)
-  if (!hasOwnRecordKeys(models) || Object.prototype.hasOwnProperty.call(models, parsed.modelId)) {
+  if (!hasOwnRecordKeys(models)) return
+  const current = Object.prototype.hasOwnProperty.call(models, parsed.modelId)
+    ? models[parsed.modelId]
+    : undefined
+  if (current !== undefined && !selectedLocalOpenCodeModelNeedsSeed(current)) {
     return
   }
 
+  const seed = buildSelectedLocalOpenCodeModelSeed(models)
   const nextProviders = { ...providers }
   if (found.key !== providerId) delete nextProviders[found.key]
   nextProviders[providerId] = {
     ...found.config,
     models: {
       ...models,
-      [parsed.modelId]: {},
+      [parsed.modelId]: enrichSelectedLocalOpenCodeModel(current, seed),
     },
   }
   config.provider = nextProviders
@@ -1977,29 +2082,24 @@ const OPEN_CODE_STRICT_AUTHLESS_PROVIDER_IDS = new Set([
   'vllm',
 ])
 
-const OPEN_CODE_BUILTIN_FREE_MODEL_IDS = new Set([
-  'big-pickle',
-  'ling-3.0-flash-fin-free',
-  'mimo-v2.5-free',
-  'mimo-v2.6-flash-free',
-  'muse-spark-1.2-contributor-free',
-  'muse-spark-1.3-contributor-free',
-  'nemotron-3-ultra-free',
-  'nemotron-3.5-lightning-free',
-])
-
 function resolveOpenCodeAuthlessAuthorityMode(input: {
   providerId: string
   selectedModel: string
   providerConfig: unknown
 }): OpenCodeAuthlessAuthorityMode | null {
   const selectedModel = input.selectedModel.trim()
-  const modelId = selectedModel.slice(selectedModel.indexOf('/') + 1)
-  if (
-    input.providerId === 'opencode'
-    && modelId.length > 0
-    && OPEN_CODE_BUILTIN_FREE_MODEL_IDS.has(modelId)
-  ) {
+  const separatorIndex = selectedModel.indexOf('/')
+  const modelId = separatorIndex > 0 ? selectedModel.slice(separatorIndex + 1) : ''
+  if (input.providerId === 'opencode' && modelId.length > 0) {
+    // Only binds "no credential" to this exact model; it does not authorize the
+    // model. OpenCodeModelAccessPolicy decides access from the live Zen catalog:
+    // launchTeam runs assertOpenCodeSelectedModelLaunchAccess before creating any
+    // session, so a paid or unknown Zen model without a key is refused there.
+    // Later session recreation (e.g. stale records in sendMessage) only reuses a
+    // model that already passed that gate, and an authless scope holds no
+    // credential to leak. A static list here went stale every time Zen added a
+    // free model. The mode string stays 'builtin_free' so existing scope
+    // fingerprints do not rotate.
     return 'builtin_free'
   }
 
@@ -3325,7 +3425,10 @@ export class OpenCodeProfileManager {
     const wantsCursorManagedAssets = options.profileScope
       ? canonicalizeOpenCodeProviderId(options.profileScope.providerId) === 'cursor-acp'
       : options.includeManagedSubscriptionPlugins !== false
+    // Generic inventory may run without Cursor installed. Only an explicitly
+    // selected Cursor scope may enter the strict managed path without its CLI.
     const cursorManagedAssets = wantsCursorManagedAssets
+      && (options.profileScope || await resolveCursorAgentExecutable(runtimeEnv))
       ? await resolveManagedCursorAssets(runtimeEnv)
       : null
     if (cursorManagedAssets) {
