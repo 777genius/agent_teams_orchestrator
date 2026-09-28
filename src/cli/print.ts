@@ -349,7 +349,13 @@ import {
   markMessagesAsRead,
   isShutdownApproved,
 } from '../utils/teammateMailbox.js'
-import { removeTeammateFromTeamFile } from '../utils/swarm/teamHelpers.js'
+import { readTeamFileAsync, removeTeammateFromTeamFileIfIdentityMatches } from '../utils/swarm/teamHelpers.js'
+import { killProcessBackendRuntime } from '../utils/swarm/processBackend.js'
+import { shouldTeamLeadPollInbox } from '../utils/swarm/hostedLeadInboxPoll.js'
+import { ensureBackendsRegistered, getBackendByType } from '../utils/swarm/backends/registry.js'
+import { isInsideTmux } from '../utils/swarm/backends/detection.js'
+import { isPaneBackend } from '../utils/swarm/backends/types.js'
+import { persistTeammateTerminationRecovery, preserveTeammateAfterTerminationFailure } from '../utils/teammateTermination.js'
 import { unassignTeammateTasks } from '../utils/tasks.js'
 import { getRunningTasks } from '../utils/task/framework.js'
 import { isBackgroundTask } from '../tasks/types.js'
@@ -2644,7 +2650,13 @@ function runHeadlessStreaming(
             (refreshedState.teamContext &&
               Object.keys(refreshedState.teamContext.teammates).length > 0)
 
-          if (!hasActiveTeammates) {
+          if (
+            !shouldTeamLeadPollInbox({
+              hasActiveTeammates: Boolean(hasActiveTeammates),
+              hasTeamContext: Boolean(refreshedState.teamContext),
+              inputClosed,
+            })
+          ) {
             logForDebugging(
               '[print.ts] No more active teammates, stopping poll',
             )
@@ -2670,9 +2682,16 @@ function runHeadlessStreaming(
             // Process shutdown_approved messages - remove teammates from team file
             // This mirrors what useInboxPoller does in interactive mode (lines 546-606)
             const teamName = refreshedState.teamContext?.teamName
+            const handledShutdownApprovals = new Set<(typeof unread)[number]>()
             for (const m of unread) {
               const shutdownApproval = isShutdownApproved(m.text)
               if (shutdownApproval && teamName) {
+                if (shutdownApproval.from !== m.from) {
+                  logForDebugging(
+                    `[print.ts] Ignoring shutdown approval whose claimed sender ${shutdownApproval.from} does not match mailbox sender ${m.from}`,
+                  )
+                  continue
+                }
                 const teammateToRemove = shutdownApproval.from
                 logForDebugging(
                   `[print.ts] Processing shutdown_approved from ${teammateToRemove}`,
@@ -2680,17 +2699,123 @@ function runHeadlessStreaming(
 
                 // Find the teammate ID by name
                 const teammateId = refreshedState.teamContext?.teammates
-                  ? Object.entries(refreshedState.teamContext.teammates).find(
+                  ? (Object.entries(refreshedState.teamContext.teammates) as Array<[string, { name?: string }]>).find(
                       ([, t]) => t.name === teammateToRemove,
                     )?.[0]
                   : undefined
 
                 if (teammateId) {
+                  const teammate = (await readTeamFileAsync(teamName))?.members.find(
+                    member => member.agentId === teammateId,
+                  )
+                  if (!teammate || teammate.name !== m.from) continue
+                  if (teammate?.outstandingShutdownRequestId !== shutdownApproval.requestId) {
+                    continue
+                  }
+                  const persistedPaneId = teammate?.tmuxPaneId?.trim()
+                  const messagePaneId = shutdownApproval.paneId?.trim()
+                  if (
+                    messagePaneId !== persistedPaneId ||
+                    shutdownApproval.backendType !== teammate.backendType
+                  ) {
+                    logForDebugging(
+                      `[print.ts] Ignoring shutdown approval with substituted runtime binding for ${teammateToRemove}`,
+                    )
+                    continue
+                  }
+                  const processRuntime =
+                    shutdownApproval.backendType === 'process' ||
+                    Boolean(persistedPaneId?.startsWith('process:')) ||
+                    Boolean(messagePaneId?.startsWith('process:'))
+                  if (processRuntime) {
+                    const identityMatches =
+                      Boolean(persistedPaneId) &&
+                      (!messagePaneId || messagePaneId === persistedPaneId) &&
+                      shutdownApproval.processStartedAtMs === teammate?.processStartedAtMs &&
+                      shutdownApproval.processOsIdentity === teammate?.processOsIdentity &&
+                      shutdownApproval.processOwnerToken === teammate?.processOwnerToken &&
+                      shutdownApproval.processRunId === teammate?.processRunId
+                    const terminated = identityMatches
+                      ? await killProcessBackendRuntime(persistedPaneId, {
+                          expectedAgentId: teammateId,
+                          teamName,
+                          expectedStartedAtMs: shutdownApproval.processStartedAtMs,
+                          expectedOsIdentity: shutdownApproval.processOsIdentity,
+                          expectedOwnerToken: shutdownApproval.processOwnerToken,
+                          expectedRunId: shutdownApproval.processRunId,
+                        }).catch(() => false)
+                      : false
+                    if (!terminated) {
+                      await persistTeammateTerminationRecovery(teamName, teammateId, {
+                        teammateName: teammateToRemove,
+                        requestId: shutdownApproval.requestId,
+                        paneId: persistedPaneId,
+                        processStartedAtMs: teammate?.processStartedAtMs,
+                        processOsIdentity: teammate?.processOsIdentity,
+                        processOwnerToken: teammate?.processOwnerToken,
+                        processRunId: teammate?.processRunId,
+                        detail: 'Noninteractive shutdown could not prove exact runtime termination.',
+                      })
+                      setAppState(prev => preserveTeammateAfterTerminationFailure(prev, {
+                        teammateName: teammateToRemove,
+                        requestId: shutdownApproval.requestId,
+                        paneId: persistedPaneId,
+                        processStartedAtMs: teammate?.processStartedAtMs,
+                        processOsIdentity: teammate?.processOsIdentity,
+                        processOwnerToken: teammate?.processOwnerToken,
+                        processRunId: teammate?.processRunId,
+                        detail: 'Noninteractive shutdown could not prove exact runtime termination.',
+                      }))
+                      continue
+                    }
+                  } else if (persistedPaneId && teammate?.backendType && isPaneBackend(teammate.backendType)) {
+                    await ensureBackendsRegistered()
+                    const terminated = Boolean(await getBackendByType(teammate.backendType).killPane(
+                      persistedPaneId,
+                      !(await isInsideTmux()),
+                    ).catch(() => false))
+                    if (!terminated) {
+                      await persistTeammateTerminationRecovery(teamName, teammateId, {
+                        teammateName: teammateToRemove,
+                        requestId: shutdownApproval.requestId,
+                        paneId: persistedPaneId,
+                        detail: 'Noninteractive pane termination was not confirmed.',
+                      })
+                      setAppState(prev => preserveTeammateAfterTerminationFailure(prev, {
+                        teammateName: teammateToRemove,
+                        requestId: shutdownApproval.requestId,
+                        paneId: persistedPaneId,
+                        detail: 'Noninteractive pane termination was not confirmed.',
+                      }))
+                      continue
+                    }
+                  } else {
+                    await persistTeammateTerminationRecovery(teamName, teammateId, {
+                      teammateName: teammateToRemove,
+                      requestId: shutdownApproval.requestId,
+                      paneId: persistedPaneId,
+                      detail: 'Noninteractive runtime type is unavailable; termination cannot be confirmed.',
+                    })
+                    setAppState(prev => preserveTeammateAfterTerminationFailure(prev, {
+                      teammateName: teammateToRemove,
+                      requestId: shutdownApproval.requestId,
+                      paneId: persistedPaneId,
+                      detail: 'Noninteractive runtime type is unavailable; termination cannot be confirmed.',
+                    }))
+                    continue
+                  }
                   // Remove from team file
-                  removeTeammateFromTeamFile(teamName, {
+                  const removed = await removeTeammateFromTeamFileIfIdentityMatches(teamName, {
                     agentId: teammateId,
-                    name: teammateToRemove,
+                    paneId: teammate.tmuxPaneId,
+                    processStartedAtMs: teammate.processStartedAtMs,
+                    processOsIdentity: teammate.processOsIdentity,
+                    processOwnerToken: teammate.processOwnerToken,
+                    processRunId: teammate.processRunId,
+                    spawnClaimToken: teammate.spawnClaimToken,
+                    spawnClaimRunId: teammate.spawnClaimRunId,
                   })
+                  if (!removed) continue
                   logForDebugging(
                     `[print.ts] Removed ${teammateToRemove} from team file`,
                   )
@@ -2717,17 +2842,21 @@ function runHeadlessStreaming(
                       },
                     }
                   })
+                  handledShutdownApprovals.add(m)
                 }
               }
             }
 
             // Format messages same as useInboxPoller
             const formatted = unread
+              .filter(m => !handledShutdownApprovals.has(m))
               .map(
                 (m: { from: string; text: string; color?: string }) =>
                   `<${TEAMMATE_MESSAGE_TAG} teammate_id="${m.from}"${m.color ? ` color="${m.color}"` : ''}>\n${m.text}\n</${TEAMMATE_MESSAGE_TAG}>`,
               )
               .join('\n\n')
+
+            if (!formatted) continue
 
             // Enqueue and process
             enqueue({

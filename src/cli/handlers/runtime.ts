@@ -529,33 +529,55 @@ export async function runtimeVerifyModel(opts: {
     )
   }
 
-  if (opts.text) {
-    const result = await openCodeExecutionProbe.probeModel({
-      selectedModel: opts.model,
-    })
-    printOpenCodeModelProbe(result)
-  } else {
-    await withRuntimeJsonStdoutGuardedResponse(
-      () =>
-        openCodeExecutionProbe.probeModel({
-          selectedModel: opts.model,
+  try {
+    if (opts.text) {
+      const result = await openCodeExecutionProbe.probeModel({
+        selectedModel: opts.model,
+      })
+      printOpenCodeModelProbe(result)
+    } else {
+      type Response =
+        | { result: Awaited<ReturnType<typeof openCodeExecutionProbe.probeModel>>; error?: never }
+        | { result?: never; error: { code: 'runtime-unhealthy'; message: string; recoverable: true } }
+      await withRuntimeJsonStdoutGuardedResponse<Response>(
+        async () => ({
+          result: await openCodeExecutionProbe.probeModel({ selectedModel: opts.model }),
         }),
-      async (result, stdoutWrite) => {
-        await writeStdoutAndDrain(
-          jsonStringify(
-            {
-              schemaVersion: 1,
-              providerId: 'opencode',
-              result,
-            },
-            null,
-            2,
-          ) + '\n',
-          stdoutWrite,
-        )
-        return 0
-      },
+        async (response, stdoutWrite) => {
+          // A stalled writer may let the process exit before the drain promise
+          // settles, so establish failure before attempting the error response.
+          if (response.error) process.exitCode = 1
+          await writeStdoutAndDrain(
+            jsonStringify({ schemaVersion: 1, providerId: 'opencode', ...response }, null, 2) + '\n',
+            stdoutWrite,
+          )
+          return response.error ? 1 : 0
+        },
+        error => ({
+          error: {
+            code: 'runtime-unhealthy',
+            message: `Runtime model verification failed: ${redactRuntimeProviderSecretPatterns(error instanceof Error ? error.message : String(error))}`,
+            recoverable: true,
+          },
+        }),
+      )
+      return
+    }
+  } catch (error) {
+    process.exitCode = 1
+    const message = redactRuntimeProviderSecretPatterns(
+      error instanceof Error ? error.message : String(error),
     )
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      await new Promise<void>(resolve => {
+        timer = setTimeout(resolve, STDOUT_DRAIN_FALLBACK_TIMEOUT_MS)
+        process.stderr.write(`Runtime model verification failed: ${message}\n`, () => resolve())
+      })
+    } finally {
+      clearTimeout(timer)
+      exitRuntimeCommand(1)
+    }
     return
   }
 

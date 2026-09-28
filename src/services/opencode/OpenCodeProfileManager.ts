@@ -31,6 +31,7 @@ import {
   isOpenCodeAutoUpdateAllowed,
 } from './OpenCodeAutoUpdatePolicy.js'
 import {
+  isHostedAppMcpAuthorityInstalled,
   OPEN_CODE_APP_MCP_SERVER_NAME,
   resolveOpenCodeAppMcpLaunchConfig,
   type ResolvedAppMcpLaunchConfig,
@@ -2652,9 +2653,10 @@ async function resolveOpenCodeProfileScopeInternal(
     authlessAuthorityFingerprint,
     ...(cursorAssetsIdentity ? { cursorAssetsIdentity } : {}),
   })
-  const retainedAppMcpLaunchConfig = safeParseJSONC(
-    env[OPEN_CODE_SCOPE_APP_MCP_LAUNCH_CONFIG_ENV],
-  ) as ResolvedAppMcpLaunchConfig | null
+  // Hosted launches always re-derive the config from the signed descriptor.
+  const retainedAppMcpLaunchConfig = isHostedAppMcpAuthorityInstalled()
+    ? null
+    : safeParseJSONC(env[OPEN_CODE_SCOPE_APP_MCP_LAUNCH_CONFIG_ENV]) as ResolvedAppMcpLaunchConfig | null
   const appMcpLaunchConfig = input.purpose === 'launch_runtime'
     ? retainedAppMcpLaunchConfig ?? await resolveOpenCodeAppMcpLaunchConfig({ env }).then(resolved => {
         const managedConfig = buildManagedConfig(resolved.config)
@@ -3157,6 +3159,7 @@ export class OpenCodeProfileManager {
     operation: (armNativeSession: (owner: OpenCodeOAuthNativeSessionOwner) => Promise<void>,
       armNativeProbe: (owner: OpenCodeOAuthNativeProbeOwner) => Promise<void>) => Promise<T>
     isNativeSettled?: (value: T) => boolean
+    isNativeDefinitelyUnsubmitted?: (value: T) => boolean
     allowNativeContinuation?: boolean
     abortSignal?: AbortSignal
   }): Promise<T> {
@@ -3260,6 +3263,7 @@ export class OpenCodeProfileManager {
         await armSession({ ...native, sessionAuthorities })
       }, armProbe),
       isNativeSettled: input.isNativeSettled,
+      isNativeDefinitelyUnsubmitted: input.isNativeDefinitelyUnsubmitted,
       allowNativeContinuation: input.allowNativeContinuation,
       recoveryOwner: authority.scope.purpose === 'catalog' ? undefined : {
         projectPath: authority.snapshot.projectPath, purpose: authority.scope.purpose,
@@ -3854,6 +3858,7 @@ export class OpenCodeProfileManager {
       globalAuthPath,
       managedAuthPath,
       sourceAuthPath: sourceAuthSources.findLast(source => source.fingerprint)?.path ?? null,
+      sourceAuthSources: sourceAuthSources.map(source => ({ ...source })),
       sourceAuthFingerprint,
       managedAuthFingerprint,
       selectedSourceAuthIdentity,

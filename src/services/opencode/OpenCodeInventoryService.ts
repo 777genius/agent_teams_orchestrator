@@ -1,10 +1,10 @@
 import { mkdir, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import stripAnsi from 'strip-ansi'
+import type { ChildProcess } from 'node:child_process'
 
 import { getCwd } from '../../utils/cwd.js'
 import * as lockfile from '../../utils/lockfile.js'
-import { killProcessTreeAndWait } from '../../utils/processKill.js'
 import { spawnPortableCli } from '../../utils/portableCli.js'
 import { gte } from '../../utils/semver.js'
 import {
@@ -14,6 +14,7 @@ import {
 import { canonicalizeOpenCodeProviderId } from './OpenCodeProviderIdentity.js'
 import { readOpenCodeAuthProviderSummaries } from './OpenCodeAuthStore.js'
 import { resolveOpenCodeBinaryPath } from './OpenCodeBinaryResolver.js'
+import { assertHostedOfficialOpenCodeArtifact } from './OpenCodeHostedOfficialArtifact.js'
 import {
   getOpenCodeManagedSubscriptionPluginPackages,
   isOpenCodeCuratedSubscriptionProviderId,
@@ -315,6 +316,13 @@ function stripOneFinalNewline(value: string): string {
   return value.replace(/\r?\n$/, '')
 }
 
+export function signalSpawnedOpenCodeChildBestEffort(
+  child: Pick<ChildProcess, 'pid' | 'kill'>,
+  signal: NodeJS.Signals,
+): boolean {
+  return Boolean(child.pid) && child.kill(signal)
+}
+
 export function execOpenCodePortableCommand(input: {
   binaryPath: string
   args: string[]
@@ -352,8 +360,8 @@ export function execOpenCodePortableCommand(input: {
       clearTimeout(timeout)
       input.abortSignal?.removeEventListener('abort', abort)
 
-      const pid = child?.pid
-      if (!pid) {
+      const ownedChild = child
+      if (!ownedChild?.pid) {
         finish({
           ...snapshotOutput(),
           code: 1,
@@ -362,7 +370,11 @@ export function execOpenCodePortableCommand(input: {
         return
       }
 
-      void killProcessTreeAndWait(pid, 'SIGKILL').finally(() => {
+      // ChildProcess.kill() is ordinary PID signaling in Node/Bun. This
+      // non-persistent probe cleanup is deliberately best-effort and must not
+      // be reused as an exact-incarnation termination primitive.
+      signalSpawnedOpenCodeChildBestEffort(ownedChild, 'SIGKILL')
+      void Promise.resolve().finally(() => {
         finish({
           ...snapshotOutput(),
           code: 1,
@@ -391,6 +403,7 @@ export function execOpenCodePortableCommand(input: {
     input.abortSignal?.addEventListener('abort', abort, { once: true })
 
     try {
+      assertHostedOfficialOpenCodeArtifact(input.binaryPath)
       child = spawnPortableCli(input.binaryPath, input.args, {
         cwd: input.profile.projectPath,
         env: input.profile.env,

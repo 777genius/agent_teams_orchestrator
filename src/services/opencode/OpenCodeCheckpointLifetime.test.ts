@@ -3,7 +3,7 @@ import { Database } from 'bun:sqlite'
 import { mkdtemp, realpath, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { isProcessAlive, readProcessStartTimeMs } from '../../utils/processKill.js'
+import { buildExactProcessTreeSpawn, captureProcessTreeIdentity, isProcessAlive, readProcessStartTimeMs } from '../../utils/processKill.js'
 import { OpenCodeProfileManager, resolveOpenCodeProfileScope } from './OpenCodeProfileManager.js'
 import { OpenCodeSessionBridge } from './OpenCodeSessionBridge.js'
 import { OpenCodeExecutionProbe } from './OpenCodeExecutionProbe.js'
@@ -70,7 +70,7 @@ describe('pending native OAuth session authority', () => {
     expect(birth).toBeGreaterThan(0)
     owner = { record, baseUrl: 'http://127.0.0.1:43210', pid: process.pid, processStartedAtMs: birth!,
       messageId: 'msg-TEST', noReply: false }
-    const leaseKey = 'TEST::primary::owner'
+    const leaseKey = `${record.teamId}::${record.laneId}::${record.memberName}::session:${record.opencodeSessionId}`
     registry = { schemaVersion: 1, processIdentityFormat: 'platform-native-v2', hosts: { [record.hostKey]: {
       ...record, baseUrl: owner.baseUrl, port: 43210, pid: owner.pid, processStartedAtMs: birth,
       version: 'TEST', resolvedConfigFingerprint: profile.managedConfigFingerprint,
@@ -93,17 +93,25 @@ describe('pending native OAuth session authority', () => {
   test.each(['retained-control', 'exit-listener', 'force-stop', 'force-stop-exit-after-reconcile'])('owned child exit preserves recovery lease evidence: %s', async mode => {
     const cleanup = mode !== 'retained-control'
     const { spawn } = await import('node:child_process')
-    const child = spawn(process.execPath, ['-e', 'await Bun.stdin.text()'], { stdio: ['pipe', 'ignore', 'ignore'] })
+    const releasePath = path.join(root, 'release-child')
+    const command = buildExactProcessTreeSpawn(process.execPath,
+      ['-e', 'while (!(await Bun.file(process.argv[1]).exists())) await Bun.sleep(20)', releasePath],
+      { stdio: ['ignore', 'ignore', 'ignore'] })
+    const child = spawn(command.command, command.args, command.options)
     const exited = new Promise<number | null>(resolve => child.once('exit', resolve))
     let removed: Promise<void> | undefined
+    let treeConfirmedOnForceStop = false
     let releaseRemoval!: () => void
     const removalGate = new Promise<void>(resolve => { releaseRemoval = resolve })
     try {
       const birth = await readProcessStartTimeMs(child.pid!)
       expect(birth).toBeGreaterThan(0)
+      const processTreeIdentity = command.osIdentity === 'unix-pgid:pending'
+        ? await captureProcessTreeIdentity(child.pid!) : command.osIdentity
+      expect(processTreeIdentity).toBeTruthy()
       owner = { ...owner, pid: child.pid!, processStartedAtMs: birth!, record: { ...owner.record, runtimePid: child.pid! } }
       await sessionStore.upsert(owner.record)
-      Object.assign(registry.hosts[owner.record.hostKey], { pid: child.pid, processStartedAtMs: birth })
+      Object.assign(registry.hosts[owner.record.hostKey], { pid: child.pid, processStartedAtMs: birth, processTreeIdentity })
       await saveRegistry()
       await arm() // Successfully returns a pending admitted operation; no throw or crash before submission.
       await writeFile(profile.managedAuthPath, JSON.stringify({ xai: c1 }))
@@ -139,7 +147,8 @@ describe('pending native OAuth session authority', () => {
         }
         hostManager.cleanupOpenTuiTempArtifactsIfUnused = async () => {}
         const entry = { child, handle: { hostKey: owner.record.hostKey, state: 'healthy', diagnostics: [],
-          pid: child.pid, processStartedAtMs: birth, profile, baseUrl: owner.baseUrl }, lifetime: 'persistent', ownedByProcess: true, refCount: 1 }
+          pid: child.pid, processStartedAtMs: birth, processTreeIdentity, profile, baseUrl: owner.baseUrl },
+          lifetime: 'persistent', ownedByProcess: true, refCount: 1 }
         hostManager.hosts.set(owner.record.hostKey, entry)
         hostManager.bindHostLifecycle(owner.record.hostKey, entry)
         if (mode === 'force-stop-exit-after-reconcile') {
@@ -159,12 +168,15 @@ describe('pending native OAuth session authority', () => {
       if (mode.startsWith('force-stop')) {
         const stopped = await lifecycleManager.reconcilePersistentHosts({ mode: 'force', reason: 'shutdown' })
         expect(stopped.hosts[0].action).toBe('kept_pending_oauth')
-        expect(stopped.hosts[0].reason).toContain('owned process stopped')
+        treeConfirmedOnForceStop = stopped.hosts[0].reason.includes('owned process tree stopped')
+        if (process.platform !== 'win32') expect(treeConfirmedOnForceStop).toBe(false)
+        expect(stopped.hosts[0].reason).toContain(treeConfirmedOnForceStop
+          ? 'owned process tree stopped; pending OAuth publication retains exact owner evidence'
+          : 'host root stopped; unconfirmed tree and pending OAuth owner evidence retained')
         const exitCode = await exited
-        // Windows kills the tree with taskkill /T /F, which reports an exit
-        // code rather than a POSIX signal. Stdin is still open here: only the
-        // owned force-stop may end this child, and its death must be observed.
-        expect(child.stdin.writableEnded).toBe(false)
+        // The sentinel is absent: only the owned force-stop may end this
+        // child, and its death must be observed.
+        expect(await Bun.file(releasePath).exists()).toBe(false)
         expect(isProcessAlive(child.pid!)).toBe(false)
         if (process.platform === 'win32') {
           expect(child.signalCode).toBeNull()
@@ -174,32 +186,36 @@ describe('pending native OAuth session authority', () => {
           expect(child.signalCode).toBe('SIGTERM')
           expect(exitCode).toBeNull()
         }
-        expect(lifecycleManager.getHost(owner.record.hostKey)).toBeNull()
+        expect(lifecycleManager.getHost(owner.record.hostKey)?.state ?? null).toBe(
+          treeConfirmedOnForceStop ? null : 'degraded')
         if (mode === 'force-stop-exit-after-reconcile') {
           expect(deliverExit).toBeDefined()
           expect(removed).toBeUndefined()
           deliverExit!()
-          // The real listener must return early for an entry already reconciled.
+          // The delayed listener cannot retire persistent owner evidence.
           expect(removed).toBeUndefined()
           expect(removalCalls).toEqual([])
         }
       } else {
-        child.stdin.end()
+        await writeFile(releasePath, '')
         expect(await exited).toBe(0)
       }
       if (mode === 'exit-listener') {
-        expect(removed).toBeDefined()
+        expect(removed).toBeUndefined()
         expect(removalFinished).toBe(false)
+        expect(removalCalls).toEqual([])
+        expect(lifecycleManager.getHost(owner.record.hostKey)?.state).toBe('degraded')
         releaseRemoval()
       }
-      // Force reconciliation owns cleanup and can remove the in-memory entry
-      // before the exit listener runs. Drain registry work only if it was begun.
+      // Only confirmed tree cleanup removes an in-memory entry. Root exit keeps
+      // the degraded entry and registry; no exit callback may delete evidence.
       if (removed) {
         expect(removalCalls).toEqual([[owner.record.hostKey, { pid: child.pid, startedAtMs: birth }]])
         await removed
         expect(removalFinished).toBe(true)
       }
-      if (cleanup) expect(lifecycleManager.getHost(owner.record.hostKey)).toBeNull()
+      if (cleanup) expect(lifecycleManager.getHost(owner.record.hostKey)?.state ?? null).toBe(
+        treeConfirmedOnForceStop ? null : 'degraded')
       const fresh = () => resolveOpenCodeProfileScope({ projectPath: project, selectedModel: 'xai/grok-4.3', purpose: 'launch_runtime', env })
       expect(JSON.parse(await readFile(registryPath, 'utf8')).hosts[owner.record.hostKey].leases).toEqual(
         registry.hosts[owner.record.hostKey].leases)
@@ -218,9 +234,21 @@ describe('pending native OAuth session authority', () => {
       expect(await readSaved()).toEqual(c1)
       expect(await Bun.file(`${global}.agent-teams-xai-oauth-save.json`).exists()).toBe(false)
       if (cleanup) {
-        await lifecycleManager.reconcilePersistentHosts({ mode: 'stale' })
-        expect(await Bun.file(registryPath).exists()).toBe(false)
+        const result = await lifecycleManager.reconcilePersistentHosts({ mode: 'stale' })
+        if (process.platform !== 'win32') {
+          expect(result.hosts[0].action).toBe('failed')
+          expect(result.hosts[0].reason).toContain('terminal owner authority is required')
+          expect(JSON.parse(await readFile(registryPath, 'utf8')).hosts[owner.record.hostKey].leases).toEqual(
+            registry.hosts[owner.record.hostKey].leases)
+        } else if (result.hosts[0].action === 'removed_dead') {
+          expect(await Bun.file(registryPath).exists()).toBe(false)
+        } else {
+          expect(result.hosts[0].action).toBe('failed')
+          expect(result.hosts[0].reason).toContain('terminal owner authority is required')
+          expect(JSON.parse(await readFile(registryPath, 'utf8')).hosts[owner.record.hostKey].leases).toEqual(
+            registry.hosts[owner.record.hostKey].leases)
+        }
       }
-    } finally { releaseRemoval(); child.stdin.end(); await exited; await removed }
+    } finally { releaseRemoval(); await writeFile(releasePath, ''); await exited; await removed }
   })
 })

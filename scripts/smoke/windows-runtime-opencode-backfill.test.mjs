@@ -269,9 +269,18 @@ test('provider fixture supplies an isolated MCP entry to the production resolver
           assert.equal(env[key], undefined, 'Fixture must not use an inherited MCP override');
         }
         const resolver = fileURLToPath(new URL('../../src/services/opencode/OpenCodeMcpManager.ts', import.meta.url));
+        const portableResolver = fileURLToPath(new URL('../../src/utils/portableCli.ts', import.meta.url));
         const program = `
           import assert from 'node:assert/strict';
           const { resolveOpenCodeAppMcpLaunchConfig } = await import(${JSON.stringify(resolver)});
+          const { resolveDirectWindowsLauncher } = await import(${JSON.stringify(portableResolver)});
+          const originalPlatform = process.platform;
+          Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+          try {
+            assert.deepEqual(resolveDirectWindowsLauncher(process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH), {
+              command: 'node', argsPrefix: [${JSON.stringify(path.join(root, 'fake-opencode.cjs'))}],
+            });
+          } finally { Object.defineProperty(process, 'platform', { value: originalPlatform, configurable: true }); }
           const resolved = await resolveOpenCodeAppMcpLaunchConfig({
             pathExists: async () => { throw new Error('Fixture must not discover a sibling app'); },
           });
@@ -307,6 +316,25 @@ test('readiness rejects a degraded host even with a successful envelope', () => 
   assert.throws(() => assertReadinessHost({ ...payload, data: {} }));
 });
 
+test('fake provider records a timestamp for each isolated probe', () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'provider-probe-timestamp-'));
+  try {
+    const script = path.join(root, 'fake-opencode.cjs');
+    writeFileSync(script, readFileSync(new URL('./windows-runtime-opencode-fixture.cjs', import.meta.url)));
+    const env = sandboxEnvironment(root, path.join(root, 'opencode.cmd'));
+    const before = Date.now();
+    const result = spawnSync(process.execPath, [script, '--version'],
+      { cwd: root, env, encoding: 'utf8', timeout: 3000 });
+    const after = Date.now();
+    assert.ifError(result.error);
+    assert.equal(result.status, 0, result.stderr);
+    const [probe] = readFileSync(path.join(root, 'fake-opencode-invocations.jsonl'), 'utf8')
+      .trim().split('\n').map(line => JSON.parse(line));
+    assert.ok(Date.parse(probe.startedAt) >= before && Date.parse(probe.startedAt) <= after);
+    assert.equal('env' in probe, false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test('combined evidence runs all provider checks after backfill or provider failure', () => {
   // Exercise the real provider harness with injected process results, including
   // file output. No packaged binary, provider process or Windows simulation claim.
@@ -315,14 +343,20 @@ test('combined evidence runs all provider checks after backfill or provider fail
     const report = {};
     const labels = ['providers-view', 'handshake-file', 'handshake-stdout', 'readiness-stdout'];
     let calls = 0;
+    const timeouts = [];
     runSmokeGroups(report, {
       backfill: group => {
         if (failedGroup === 'backfill') throw new Error('forced backfill failure');
         group.passed = true;
       },
       provider: (group, flush) => runProviderSmoke('/fixture/runtime.exe', group, flush, {
-        spawn: (executable, argv) => {
+        spawn: (executable, argv, options) => {
+          timeouts.push(options.timeout);
           const label = labels[calls++];
+          if (label === 'readiness-stdout') {
+            const inputPath = argv[argv.indexOf('--input') + 1];
+            assert.equal(JSON.parse(readFileSync(inputPath, 'utf8')).timeoutMs, 90_000);
+          }
           const payload = label === 'providers-view'
             ? { runtimeId: 'opencode', view: { providers: [{ providerId: 'opencode' }] } }
             : label === 'readiness-stdout'
@@ -348,6 +382,7 @@ test('combined evidence runs all provider checks after backfill or provider fail
       }),
     }, () => snapshots.push(structuredClone(report)));
     assert.equal(calls, 4);
+    assert.deepEqual(timeouts, [90_000, 45_000, 45_000, 120_000]);
     assert.equal(report.passed, failedGroup === 'none');
     assert.equal(snapshots.at(-1).passed, report.passed);
     assert.equal(report.groups.provider.cases.length, 4);
@@ -361,6 +396,10 @@ test('combined evidence runs all provider checks after backfill or provider fail
       assert.equal(item.executable, '/fixture/runtime.exe');
       assert.equal(item.argv[0], 'runtime');
       assert.equal(typeof item.stdout, 'string');
+      assert.equal(item.state, 'finished');
+      assert.equal(item.timeoutMs, item.label === 'readiness-stdout' ? 120_000 : item.label === 'providers-view' ? 90_000 : 45_000);
+      assert.ok(Date.parse(item.finishedAt) >= Date.parse(item.startedAt));
+      assert.ok(Number.isFinite(item.elapsedMs) && item.elapsedMs >= 0);
       assert.equal('env' in item, false);
       assert.equal(item.passed, item.label !== failedGroup);
       if (item.label === failedGroup) {
@@ -382,6 +421,9 @@ test('spawn timeout records argv and stderr and fails the provider check', () =>
   assert.equal(validated, false);
   assert.equal(item.passed, false);
   assert.equal(item.stderr, 'before timeout');
+  assert.equal(item.timeoutMs, 45_000);
+  assert.equal(item.state, 'finished');
+  assert.ok(Number.isFinite(item.elapsedMs) && item.elapsedMs >= 0);
   assert.deepEqual(item.argv, ['runtime']);
   assert.match(item.error, /ETIMEDOUT/);
 });

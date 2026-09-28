@@ -10,7 +10,7 @@ function deferred() {
 function fixture(marked = true) {
   const host = { hostKey: 'host', pid: 100, processStartedAtMs: 10, baseUrl: 'http://127.0.0.1:1234' }
   const owner = { teamId: 'team', memberName: 'lead', runId: 'run', sessionId: 'session' }
-  const key = 'team::primary::lead'
+  const key = `team::primary::lead::session:${owner.sessionId}`
   let registry: any = { schemaVersion: 1, hosts: { host: {
     ...host, ...(marked ? { cursorAgentReapContractVersion: 1 } : {}), leases: {
       [key]: { ...owner, leaseKey: key, laneId: 'primary', createdAt: 'birth', updatedAt: 'birth' },

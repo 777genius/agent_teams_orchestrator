@@ -1,4 +1,7 @@
 import { describe, expect, test } from 'bun:test'
+import { createHash } from 'node:crypto'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import path from 'node:path'
 
 import {
@@ -924,5 +927,64 @@ describe('OpenCodeMcpManager', () => {
     )
 
     expect(normalizePath(root ?? '')).toBe(normalizePath(repoRoot))
+  })
+})
+
+describe('hosted app MCP authority', () => {
+  test('uses only the pinned descriptor, fails closed without it or on digest drift, and ignores env', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'hosted-app-mcp-'))
+    try {
+      const command = path.join(root, 'node')
+      const entry = path.join(root, 'index.js')
+      await writeFile(command, 'node binary\n')
+      await writeFile(entry, 'mcp entry\n')
+      const digest = (text: string) => createHash('sha256').update(text).digest('hex')
+      const descriptor = {
+        command, commandSha256: digest('node binary\n'), entry, entrySha256: digest('mcp entry\n'),
+      }
+      const claudeRoot = path.join(root, 'claude')
+      // Would win on the desktop path; a hosted owner must not even read them.
+      const env = {
+        CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL: 'http://127.0.0.1:1/mcp',
+        CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY: '/tmp/attacker.js',
+        CLAUDE_TEAM_CONTROL_URL: 'http://127.0.0.1:2',
+        AGENT_TEAMS_MCP_CLAUDE_DIR: '/home/user/.claude',
+      }
+
+      const resolved = await resolveOpenCodeAppMcpLaunchConfig({
+        env, hostedAuthority: { descriptor, claudeRoot },
+      })
+      expect(resolved).toEqual({
+        source: 'hosted-descriptor',
+        config: {
+          type: 'local', command: [command, entry],
+          environment: {
+            AGENT_TEAMS_MCP_CLAUDE_DIR: claudeRoot,
+            AGENT_TEAMS_MCP_TRUST_MODE: 'personal-host-trusted-process',
+            HOSTED_OPENCODE_RUNTIME_MODE: '',
+            AUTH_MODE: '',
+          },
+          enabled: true, timeout: 30_000,
+        },
+      })
+      // OpenCode spawns a local MCP with `{...process.env, ...environment}`, and
+      // `opencode serve` inherits the Owner's own Hosted markers. The MCP child
+      // must see the personal-host trust mode, not container Hosted mode.
+      const childEnv: Record<string, string | undefined> = {
+        HOSTED_OPENCODE_RUNTIME_MODE: 'official-v1.18.32', AUTH_MODE: 'hosted',
+        ...resolved.config.environment,
+      }
+      expect(Boolean(childEnv.HOSTED_OPENCODE_RUNTIME_MODE || childEnv.AUTH_MODE)).toBe(false)
+      expect(childEnv.AGENT_TEAMS_MCP_TRUST_MODE).toBe('personal-host-trusted-process')
+      await expect(resolveOpenCodeAppMcpLaunchConfig({
+        env, hostedAuthority: { descriptor: null, claudeRoot },
+      })).rejects.toThrow('not admitted')
+      await writeFile(entry, 'replaced entry\n')
+      await expect(resolveOpenCodeAppMcpLaunchConfig({
+        env, hostedAuthority: { descriptor, claudeRoot },
+      })).rejects.toThrow('does not match')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
   })
 })

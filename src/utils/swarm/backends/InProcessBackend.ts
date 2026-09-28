@@ -15,6 +15,7 @@ import {
   killInProcessTeammate,
   spawnInProcessTeammate,
 } from '../spawnInProcess.js'
+import { recordOutstandingShutdownRequest } from '../teamHelpers.js'
 import type {
   TeammateExecutor,
   TeammateMessage,
@@ -238,6 +239,9 @@ export class InProcessBackend implements TeammateExecutor {
       from: 'team-lead', // Terminate is always called by the leader
       reason,
     })
+    if (!(await recordOutstandingShutdownRequest(task.identity.teamName, task.identity.agentName, requestId))) {
+      return false
+    }
 
     // Send to teammate's mailbox
     const teammateAgentName = task.identity.agentName

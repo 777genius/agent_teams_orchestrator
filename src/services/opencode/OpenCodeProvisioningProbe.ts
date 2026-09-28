@@ -31,9 +31,9 @@ type OpenCodeProvisioningProbeDeps = {
   inventoryService?: Pick<typeof openCodeInventoryService, 'probe'>
   hostManager?: Pick<
     typeof openCodeHostManager,
-    'ensureHost' | 'releaseHost' | 'refreshResolvedConfigFingerprint'
+    'ensureHost' | 'releaseHost' | 'refreshResolvedConfigFingerprint' | 'releaseHostLease'
   >
-    & Partial<Pick<typeof openCodeHostManager, 'withHostOperation' | 'retainHostLease' | 'releaseHostLease'>>
+    & Partial<Pick<typeof openCodeHostManager, 'withHostOperation' | 'retainHostLease'>>
   clientFactory?: Pick<typeof openCodeClientFactory, 'create'>
   mcpManager?: Pick<typeof openCodeMcpManager, 'ensureAppMcp'>
 }
@@ -286,6 +286,7 @@ export class OpenCodeProvisioningProbe {
         hostLifetime: options.retainHost || options.disposeHostOnRelease === false
           ? 'persistent'
           : 'process',
+        lease: preflightLease,
         ...(profileScope ? {
           prewarmManagedSubscriptionPlugins: false,
           resolveConfigFingerprint: false,

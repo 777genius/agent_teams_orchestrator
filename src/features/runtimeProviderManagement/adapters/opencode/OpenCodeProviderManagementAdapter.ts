@@ -22,7 +22,7 @@ import {
 } from '../../../../services/opencode/OpenCodeAuthStore.js'
 import type { OpenCodeAuthCredential } from '../../../../services/opencode/OpenCodeAuthStore.js'
 import {
-  OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID,
+  createOpenCodePreflightHostLeaseInput,
   openCodeHostManager,
   resolveOpenCodeBinaryHostIdentity,
 } from '../../../../services/opencode/OpenCodeHostManager.js'
@@ -3153,7 +3153,6 @@ export class OpenCodeProviderManagementAdapter
   private readonly directoryCache = new Map<string, ProviderDirectoryCacheEntry>()
   private readonly catalogCache = new Map<string, ProviderCatalogCacheEntry>()
   private readonly catalogGenerationByScope = new Map<string, number>()
-  private hostLeaseSequence = 0
 
   constructor(private readonly deps: OpenCodeProviderManagementAdapterDeps = {}) {}
 
@@ -3243,23 +3242,21 @@ export class OpenCodeProviderManagementAdapter
     }
   }
 
-  private async retainProviderManagementHost(
+  private createProviderManagementHostLease(): OpenCodeHostLeaseInput {
+    return {
+      ...createOpenCodePreflightHostLeaseInput('provider-management'),
+      laneId: 'provider-management',
+    }
+  }
+
+  private async reconcileProviderManagementHostLease(
     hostManager: OpenCodeHostManagerLike,
     host: OpenCodeHostHandle,
+    lease: OpenCodeHostLeaseInput,
     evictIdleHosts = true,
   ): Promise<OpenCodeHostLeaseInput | null> {
-    if (!hostManager.retainHostLease) {
-      return null
-    }
-    const lease: OpenCodeHostLeaseInput = {
-      teamId: OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID,
-      laneId: 'provider-management',
-      memberName: `provider-management-${process.pid}-${++this.hostLeaseSequence}`,
-      runId: null,
-      sessionId: null,
-    }
     try {
-      await hostManager.retainHostLease(host.hostKey, lease)
+      await hostManager.retainHostLease?.(host.hostKey, lease)
       if (evictIdleHosts) await hostManager.reconcilePersistentHosts?.({
         mode: 'stale',
         reason: 'provider-management-idle-eviction',
@@ -3785,7 +3782,9 @@ export class OpenCodeProviderManagementAdapter
     const clientFactory = this.deps.clientFactory ?? openCodeClientFactory
     const hostLifetime = options.hostLifetime ?? 'persistent'
     let host: OpenCodeHostHandle | null = null
-    let hostLease: OpenCodeHostLeaseInput | null = null
+    let hostLease: OpenCodeHostLeaseInput | null = hostLifetime === 'persistent'
+      ? this.createProviderManagementHostLease()
+      : null
 
     try {
       const inventory = await this.probeInventory(inventoryService, projectPath, {
@@ -3815,11 +3814,12 @@ export class OpenCodeProviderManagementAdapter
         resolveConfigFingerprint: false,
         prewarmManagedSubscriptionPlugins: options.prewarmManagedSubscriptionPlugins,
         abortSignal: options.abortSignal,
+        ...(hostLease ? { lease: hostLease } : {}),
       })
       leaveHostStep?.()
       const leaveLeaseStep = options.progress?.enterStep('retain catalog host lease')
-      if (hostLifetime === 'persistent') {
-        hostLease = await this.retainProviderManagementHost(hostManager, host)
+      if (hostLease) {
+        hostLease = await this.reconcileProviderManagementHostLease(hostManager, host, hostLease)
       }
       leaveLeaseStep?.()
       const client = clientFactory.create(host.baseUrl, { signal: options.abortSignal })
@@ -3941,7 +3941,7 @@ export class OpenCodeProviderManagementAdapter
     const hostManager = this.deps.hostManager ?? openCodeHostManager
     const clientFactory = this.deps.clientFactory ?? openCodeClientFactory
     let host: OpenCodeHostHandle | null = null
-    let hostLease: OpenCodeHostLeaseInput | null = null
+    let hostLease: OpenCodeHostLeaseInput | null = this.createProviderManagementHostLease()
     let liveView: ProviderManagementView | null = null
 
     try {
@@ -3957,12 +3957,12 @@ export class OpenCodeProviderManagementAdapter
         resolveConfigFingerprint: false,
         healthTimeoutMs: OPEN_CODE_PROVIDER_MANAGEMENT_HOST_HEALTH_TIMEOUT_MS,
         abortSignal: deadline.signal,
+        lease: hostLease!,
       })
       leaveHost()
       deadline.throwIfExpired()
       const leaveLease = progress.enterStep('retain settings host lease')
-      // Reading settings must not synchronously evict unrelated persistent hosts.
-      hostLease = await this.retainProviderManagementHost(hostManager, host, false)
+      hostLease = await this.reconcileProviderManagementHostLease(hostManager, host, hostLease!, false)
       leaveLease()
       deadline.throwIfExpired()
       const client = clientFactory.create(host.baseUrl, {
@@ -4074,7 +4074,9 @@ export class OpenCodeProviderManagementAdapter
     const clientFactory = this.deps.clientFactory ?? openCodeClientFactory
     const hostLifetime = input.refresh ? 'process' : 'persistent'
     let host: OpenCodeHostHandle | null = null
-    let hostLease: OpenCodeHostLeaseInput | null = null
+    let hostLease: OpenCodeHostLeaseInput | null = hostLifetime === 'persistent'
+      ? this.createProviderManagementHostLease()
+      : null
 
     try {
       host = await hostManager.ensureHost({
@@ -4086,8 +4088,11 @@ export class OpenCodeProviderManagementAdapter
         hostLifetime,
         resolveConfigFingerprint: false,
         healthTimeoutMs: OPEN_CODE_PROVIDER_MANAGEMENT_HOST_HEALTH_TIMEOUT_MS,
+        ...(hostLease ? { lease: hostLease } : {}),
       })
-      hostLease = await this.retainProviderManagementHost(hostManager, host)
+      if (hostLease) {
+        hostLease = await this.reconcileProviderManagementHostLease(hostManager, host, hostLease)
+      }
       const cacheKey = this.getDirectoryCacheKey({
         runtimeId: input.runtimeId,
         inventory,

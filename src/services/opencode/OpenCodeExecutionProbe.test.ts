@@ -204,10 +204,8 @@ describe('OpenCodeExecutionProbe', () => {
       hostManager: {
         ensureHost: async input => {
           ensureHostInput = input
+          if (input?.lease) retainedLeaseTeamIds.push(input.lease.teamId)
           return host
-        },
-        retainHostLease: async (_hostKey, input) => {
-          retainedLeaseTeamIds.push(input.teamId)
         },
         releaseHostLease: async (_hostKey, input) => {
           releasedLeaseTeamIds.push(input.teamId)
@@ -308,6 +306,7 @@ describe('OpenCodeExecutionProbe', () => {
         ],
       },
       hostLifetime: 'process',
+      lease: { teamId: OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID },
     })
 
     observedProviderId = 'other'
@@ -2440,9 +2439,9 @@ describe('OpenCodeExecutionProbe', () => {
     let releaseHostCount = 0
     const probe = new OpenCodeExecutionProbe({
       hostManager: {
-        ensureHost: async () => host,
-        retainHostLease: async (_hostKey, input) => {
-          retainedLeaseTeamIds.push(input.teamId)
+        ensureHost: async input => {
+          if (input?.lease) retainedLeaseTeamIds.push(input.lease.teamId)
+          return host
         },
         releaseHostLease: async (_hostKey, input) => {
           releasedLeaseTeamIds.push(input.teamId)
@@ -2528,7 +2527,6 @@ describe('OpenCodeExecutionProbe', () => {
           await new Promise(resolve => setTimeout(resolve, 20))
           return host
         },
-        retainHostLease: async () => {},
         releaseHostLease: async () => {},
         releaseHost: async () => {},
       },
@@ -2609,9 +2607,9 @@ describe('OpenCodeExecutionProbe', () => {
     let releaseHostCount = 0
     const probe = new OpenCodeExecutionProbe({
       hostManager: {
-        ensureHost: async () => host,
-        retainHostLease: async (_hostKey, input) => {
-          retainedLeaseTeamIds.push(input.teamId)
+        ensureHost: async input => {
+          if (input?.lease) retainedLeaseTeamIds.push(input.lease.teamId)
+          return host
         },
         releaseHostLease: async (_hostKey, input) => {
           releasedLeaseTeamIds.push(input.teamId)

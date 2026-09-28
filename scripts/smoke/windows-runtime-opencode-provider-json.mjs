@@ -10,14 +10,15 @@ import { pathToFileURL } from 'node:url';
 import { finishSmokeCleanup, runBackfillSmoke, runSmokeGroups, sandboxEnvironment } from './windows-runtime-opencode-backfill.mjs';
 
 // Record before launch and before assertions: failures retain exact transport evidence.
-export function runRecordedCheck(group, label, invocation, validate, { spawn = spawnSync, flush = () => {} } = {}) {
+export function runRecordedCheck(group, label, invocation, validate, { spawn = spawnSync, flush = () => {}, timeoutMs = 45_000 } = {}) {
   const { env, ...transport } = invocation;
-  const item = { label, ...transport, passed: false };
+  const item = { label, ...transport, timeoutMs, startedAt: new Date().toISOString(), state: 'running', passed: false };
   group.cases.push(item);
   flush();
+  const started = performance.now();
   try {
     const result = spawn(item.executable, item.argv, { cwd: item.cwd, env,
-      encoding: 'utf8', maxBuffer: 10 * 1024 * 1024, timeout: 45000, windowsHide: true, shell: false });
+      encoding: 'utf8', maxBuffer: 10 * 1024 * 1024, timeout: timeoutMs, windowsHide: true, shell: false });
     Object.assign(item, { pid: result.pid, status: result.status, signal: result.signal,
       stdout: result.stdout, stderr: result.stderr, error: result.error?.message });
     if (item.outputPath && existsSync(item.outputPath)) item.output = readFileSync(item.outputPath, 'utf8');
@@ -27,7 +28,11 @@ export function runRecordedCheck(group, label, invocation, validate, { spawn = s
     validate(item.outputPath ? item.output : item.stdout, result);
     item.passed = true;
   } catch (error) { item.error = error.stack || String(error); }
-  finally { flush(); }
+  finally {
+    Object.assign(item, { state: 'finished', finishedAt: new Date().toISOString(),
+      elapsedMs: Math.round(performance.now() - started) });
+    flush();
+  }
   return item;
 }
 
@@ -85,7 +90,7 @@ export function runProviderSmoke(runtimeBinary, report, flush, { spawn = spawnSy
 
     writeFileSync(
       fakeOpenCodeCmd,
-      '@echo off\r\nnode "%~dp0fake-opencode.cjs" %*\r\n',
+      '@echo off\r\nSET "_prog=node"\r\n"%_prog%" "%~dp0fake-opencode.cjs" %*\r\n',
       'utf8',
     );
 
@@ -100,17 +105,18 @@ export function runProviderSmoke(runtimeBinary, report, flush, { spawn = spawnSy
       'throw new Error("Windows provider smoke fixture only: not an MCP server");\n', 'utf8');
     smokeEnv.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY = fixtureMcpEntry;
 
-    const check = (label, argv, validate, outputPath) => runRecordedCheck(report, label,
+    const check = (label, argv, validate, outputPath, timeoutMs) => runRecordedCheck(report, label,
       { executable: runtimeBinary, argv, cwd: projectPath, env: smokeEnv, outputPath },
-      (raw, result) => validate(assertJsonObject(raw || '', label, result)), { spawn, flush });
+      (raw, result) => validate(assertJsonObject(raw || '', label, result)), { spawn, flush, timeoutMs });
 
+    // Cold Windows Job startup plus provider CLI probes can outlast the default check budget.
     check('providers-view', [
       'runtime', 'providers', 'view', '--runtime', 'opencode', '--json', '--compact', '--project-path', projectPath,
     ], payload => {
       assert.equal(payload.runtimeId, 'opencode');
       assert.ok(payload.view?.providers?.some(provider => provider?.providerId === 'opencode'),
         'runtime providers view did not include the fake OpenCode provider');
-    });
+    }, undefined, 90_000);
 
     const bridgeInputPath = path.join(tempRoot, 'opencode-handshake.json');
     const bridgeOutputPath = path.join(tempRoot, 'opencode-handshake.output.json');
@@ -183,7 +189,7 @@ export function runProviderSmoke(runtimeBinary, report, flush, { spawn = spawnSy
         command: 'opencode.readiness',
         cwd: projectPath,
         startedAt: new Date().toISOString(),
-        timeoutMs: 45_000,
+        timeoutMs: 90_000,
         body: {
           projectPath,
           selectedModel: 'opencode/big-pickle',
@@ -193,7 +199,9 @@ export function runProviderSmoke(runtimeBinary, report, flush, { spawn = spawnSy
       'utf8',
     );
 
-    check('readiness-stdout', ['runtime', 'opencode-command', '--json', '--input', readinessInputPath], assertReadinessHost);
+    // Host startup and MCP attach on a cold Windows runner can exceed 45 seconds.
+    check('readiness-stdout', ['runtime', 'opencode-command', '--json', '--input', readinessInputPath],
+      assertReadinessHost, undefined, 120_000);
   } catch (error) { report.error = error.stack || String(error); }
   finally {
     try {

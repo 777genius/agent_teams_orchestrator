@@ -946,6 +946,9 @@ export class OpenCodeExecutionProbe {
     const hostStartupState: { promise: Promise<OpenCodeHostHandle> | null } = {
       promise: null,
     }
+    const preflightLease = createOpenCodePreflightHostLeaseInput(
+      `model-probe-${params.selectedModel}`,
+    )
     let host: OpenCodeHostHandle
     try {
       host = await this.runPhase(params.runtimeDeadline, 'host_start', async context => {
@@ -973,6 +976,7 @@ export class OpenCodeExecutionProbe {
             ...(context ? { healthTimeoutMs: context.remainingMs() } : {}),
             ...(context ? { abortSignal: context.signal } : {}),
             hostLifetime: params.disposeHostOnRelease === false ? 'persistent' : 'process',
+            lease: preflightLease,
           })
           if (context?.signal.aborted) {
             await this.hostManager.releaseHost(ensuredHost.hostKey).catch(() => undefined)
@@ -1001,9 +1005,6 @@ export class OpenCodeExecutionProbe {
       }
       throw error
     }
-    const preflightLease = createOpenCodePreflightHostLeaseInput(
-      `model-probe-${params.selectedModel}`,
-    )
     try {
       await this.hostManager.retainHostLease?.(host.hostKey, preflightLease)
       return await this.runProbeModelWithHost({

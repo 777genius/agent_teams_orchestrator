@@ -1,0 +1,14 @@
+{
+  "runId": "run_4172ea8fc5374325785bfbc407f223b9",
+  "memberId": "member_55f53d105051ff38bfff50014b567f3a",
+  "teamId": "team_99a6458740b5aab68e618c024c059b62",
+  "laneId": "lane_4983cc3c2a250b7627157a329b84c1b2",
+  "deploymentId": "deployment_fixture.1234",
+  "runtimeWorkspaceId": "workspace_22222222222222222222222222222222",
+  "planSha256": "e54a54813105bec494e36242cc4534460c8cdf8cee8fd7c6925a3ff68ec62a0c",
+  "rosterBindingSha256": "a17b4a9e3c638874c6d49b5c9b792f99545fafda13e30c5d4098626910c50a15",
+  "restoreGeneration": 2,
+  "mountGeneration": 3,
+  "expectedName": "builder",
+  "now": 1000000
+}

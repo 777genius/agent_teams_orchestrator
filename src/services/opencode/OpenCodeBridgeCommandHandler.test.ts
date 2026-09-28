@@ -9,9 +9,12 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import {
   __getAppMcpPreflightTimeoutMsForTests,
   __resetAppMcpToolProofCacheForTests,
+  createOwnedOpenCodeHostedInboxExecutor,
+  createOwnedOpenCodeLifecycleCommandExecutor,
   executeOpenCodeBridgeCommandEnvelope,
   __readinessDataForTests,
 } from './OpenCodeBridgeCommandHandler.js'
+import { OpenCodeTeamLifecycleLane } from '../teamLifecycleOwner/OpenCodeTeamLifecycleLane.js'
 import { openCodeCommandOutcomeStore } from './OpenCodeCommandOutcomeStore.js'
 import { openCodeExecutionProbe } from './OpenCodeExecutionProbe.js'
 import { openCodeHostManager } from './OpenCodeHostManager.js'
@@ -177,6 +180,7 @@ function buildRecord(overrides: Partial<OpenCodeSessionRecord> = {}): OpenCodeSe
   return {
     teamId: 'team-a',
     laneId: 'primary',
+    runId: null,
     memberName: 'alice',
     providerId: 'opencode',
     selectedModel: 'openrouter/minimax-m2.5-free',
@@ -970,6 +974,20 @@ describe('OpenCodeBridgeCommandHandler', () => {
     })
   })
 
+  test('keeps legacy public lifecycle commands on the public bridge path', async () => {
+    openCodeProvisioningProbe.probe = async () => snapshot
+    const result = await executeOpenCodeBridgeCommandEnvelope(
+      buildEnvelope('opencode.reconcileTeam', {
+        runId: 'run-legacy-public',
+        laneId: 'legacy-public-lane',
+        teamId: 'legacy-public-team',
+        expectedMembers: [],
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+  })
+
   test('uses lightweight handshake for launch commands without a required capability snapshot', async () => {
     let probeCalled = false
     openCodeProvisioningProbe.probe = (async () => {
@@ -1287,6 +1305,63 @@ describe('OpenCodeBridgeCommandHandler', () => {
       ...body, expectedCapabilitySnapshotId: handshake.runtime.capabilitySnapshotId,
     }) }
   }
+
+  test('hosted inbox executor rechecks owner after selected send preflight', async () => {
+    const { record, state, envelope } = await setupSelectedDeliveryRegression('opencode.sendMessage')
+    const selectedRunId = 'run_1'
+    state.records = [{ ...record, runId: selectedRunId }]
+    const entered = createDeferred<void>()
+    const resume = createDeferred<void>()
+    const ensureMcp = openCodeSessionBridge.ensureSessionAppMcpReady
+    openCodeSessionBridge.ensureSessionAppMcpReady = async (...args) => {
+      entered.resolve()
+      await resume.promise
+      return ensureMcp(...args)
+    }
+    openCodeSessionBridge.promptAsyncUntilAccepted = async (_record, params) => {
+      await params.onPromptSubmitting?.({ sessionId: record.opencodeSessionId,
+        runtimePromptMessageId: 'msg-hosted-test', baseUrl: 'http://127.0.0.1:4096' })
+      await params.beforePromptTransport?.()
+      state.prompts++
+      return { runtimePromptMessageId: 'msg-hosted-test', hookDiagnostics: [] }
+    }
+    let current = true
+    const stages: string[] = []
+    const execute = createOwnedOpenCodeHostedInboxExecutor()
+    const pending = execute({
+      command: 'send', requestId: 'hosted-inbox-guard-test', teamId: record.teamId,
+      laneId: record.laneId!, memberName: record.memberName, runId: selectedRunId,
+      projectPath: record.projectPath, sessionId: record.opencodeSessionId,
+      capabilitySnapshotId: String(envelope.body.expectedCapabilitySnapshotId),
+      messageId: `message_${'a'.repeat(32)}`, payloadHash: 'b'.repeat(64), text: 'hello',
+    }, async () => current, undefined, stage => stages.push(stage))
+    await waitForCommandStage(entered.promise, pending, 'hosted send preflight')
+    current = false
+    resume.resolve()
+    const result = await pending
+    expect(result.ok).toBe(false)
+    expect(state.prompts).toBe(0)
+    // Recorded before it failed: only a status reconcile may settle it.
+    expect(stages[0]).toBe('received')
+    expect('notReceived' in result).toBe(false)
+  })
+
+  test('hosted inbox executor marks a send refused before the bridge recorded it as not received', async () => {
+    const { record, state, envelope } = await setupSelectedDeliveryRegression('opencode.sendMessage')
+    state.records = []
+    const stages: string[] = []
+    const result = await createOwnedOpenCodeHostedInboxExecutor()({
+      command: 'send', requestId: 'hosted-inbox-not-received-test', teamId: record.teamId,
+      laneId: record.laneId!, memberName: record.memberName, runId: 'run_1',
+      projectPath: record.projectPath, sessionId: record.opencodeSessionId,
+      capabilitySnapshotId: String(envelope.body.expectedCapabilitySnapshotId),
+      messageId: `message_${'a'.repeat(32)}`, payloadHash: 'b'.repeat(64), text: 'hello',
+    }, async () => true, undefined, stage => stages.push(stage))
+    expect(result.ok).toBe(false)
+    expect(result).toMatchObject({ notReceived: true })
+    expect(stages).toEqual([])
+    expect(state.prompts).toBe(0)
+  })
 
   for (const command of ['opencode.sendMessage', 'opencode.observeMessageDelivery']) {
     for (const change of ['replacement run', 'session', 'host', 'PID', 'scope', 'stopped', 'missing member']) {
@@ -2624,7 +2699,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
   })
 
   test('selected readiness uses one retained launch host and releases it without broad fallback', async () => {
-    let released = 0
+    const releases: Array<boolean | undefined> = []
     let provenHost: string | null = null
     let observedProviderId = 'deepinfra'
     const selected = parseOpenCodeProviderScopedModelRef('deepinfra/chosen')!
@@ -2649,7 +2724,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
       snapshot: { ...snapshot, models: [selected.raw], host: retainedHost,
         profile: retainedHost.profile },
       host: retainedHost,
-      release: async () => { released += 1 },
+      release: async keepAlive => { releases.push(keepAlive) },
     })) as typeof openCodeProvisioningProbe.probeRetainingHost
     openCodeExecutionProbe.probeModel = (async () => {
       throw new Error('separate execution host poison path must not run')
@@ -2672,7 +2747,8 @@ describe('OpenCodeBridgeCommandHandler', () => {
 
     expect(result.ok).toBe(true)
     expect(provenHost).toBe('host-key')
-    expect(released).toBe(1)
+    // Only a launch-allowed result may keep the verified host for adoption.
+    expect(releases).toEqual([true])
     if (result.ok) expect(result.data.expectedBehaviorEvidence.fullModelId).toBe(selected.raw)
 
     observedProviderId = 'other'
@@ -2684,6 +2760,20 @@ describe('OpenCodeBridgeCommandHandler', () => {
       expect(mismatch.data.launchAllowed).toBe(false)
       expect(mismatch.data.executionProof).toBeUndefined()
     }
+    expect(releases).toEqual([true, false])
+
+    const unprobed = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.readiness', {
+      projectPath: '/tmp/project', selectedModel: selected.raw,
+    }))
+    expect(unprobed).toMatchObject({ ok: true, data: { launchAllowed: false } })
+    expect(releases).toEqual([true, false, false])
+
+    openCodeProvisioningProbe.refreshSelectedProfileAuthority = async () => null
+    const rejected = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.readiness', {
+      projectPath: '/tmp/project', selectedModel: selected.raw, requireExecutionProbe: true,
+    }))
+    expect(rejected.ok).toBe(false)
+    expect(releases).toEqual([true, false, false, false])
   })
 
   test('selected readiness reports bounded authority diagnostics before and after execution', async () => {
@@ -3995,6 +4085,59 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(secondResult.ok).toBe(true)
     expect(connectCalls).toBe(1)
     expect(listToolsCalls).toBe(1)
+  })
+
+  test('hosted lifecycle lane passes readiness and strict launch through the real bridge', async () => {
+    openCodeProvisioningProbe.probe = async () => snapshot
+    // Only the sessions this launch commits; never the developer's real store.
+    const stored = new Map<string, OpenCodeSessionRecord>()
+    openCodeSessionStore.upsert = (async (record: OpenCodeSessionRecord) => {
+      stored.set(`${record.teamId}\0${record.laneId}\0${record.memberName}`, structuredClone(record))
+      return 'updated'
+    }) as typeof openCodeSessionStore.upsert
+    openCodeSessionStore.list = async () => [...stored.values()].map(record => structuredClone(record))
+    const ensured: string[] = []
+    openCodeSessionBridge.ensureSession = (async input => {
+      ensured.push(input.memberName)
+      return {
+        ...buildRecord({
+          laneId: input.laneId, memberName: input.memberName,
+          selectedModel: input.selectedModel, opencodeSessionId: `session-${input.memberName}`,
+        }),
+        // Like the real bridge, a launched session keeps its launch-runtime scope.
+        profileScope: input.preparedProfile?.profileScope,
+        toolApprovalMode: input.toolApprovalMode,
+      }
+    }) as typeof openCodeSessionBridge.ensureSession
+    openCodeSessionBridge.promptAsync = (async () => {}) as typeof openCodeSessionBridge.promptAsync
+    openCodeSessionBridge.reconcileSession = (async record => ({
+      summary: buildReconcileSummary({ sessionId: record.opencodeSessionId }),
+    })) as typeof openCodeSessionBridge.reconcileSession
+    // The production owner executor, not a fake: the bridge enforces every
+    // strict launch precondition the lane must provide.
+    const lane = new OpenCodeTeamLifecycleLane(
+      createOwnedOpenCodeLifecycleCommandExecutor(), 30_000, () => true, async () => null)
+    const input = {
+      planTeamId: 'team-a', workspaceRoot: '/tmp/project', toolApprovalMode: 'auto' as const, runId: 'run-1',
+      lane: {
+        laneId: 'secondary:opencode:alice', kind: 'opencode' as const, provider: 'opencode' as const,
+        selectedModel: 'openrouter/minimax-m2.5-free',
+        members: [{ name: 'alice', prompt: 'Join the team' }],
+      },
+    }
+    const observation = await lane.launch(input)
+    expect(['launching', 'running']).toContain(observation.phase)
+    expect(ensured).toEqual(['alice'])
+    // Reconcile must reuse the run's own host by its committed capability; a
+    // broad probe would start another host and try to evict it on every inspect.
+    const retainedHosts: Array<string | undefined> = []
+    const retaining = openCodeProvisioningProbe.probeRetainingHost
+    openCodeProvisioningProbe.probeRetainingHost = (async (projectPath, options) => {
+      retainedHosts.push(options.existingHostKey)
+      return retaining(projectPath, options)
+    }) as typeof openCodeProvisioningProbe.probeRetainingHost
+    await expect(lane.inspect(input)).resolves.toMatchObject({ recoverable: false })
+    expect(retainedHosts).toEqual(['host-key'])
   })
 
   test('launches only the addressed lane and forwards laneId into ensureSession', async () => {

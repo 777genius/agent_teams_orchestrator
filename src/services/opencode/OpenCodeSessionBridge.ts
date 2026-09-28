@@ -1,11 +1,15 @@
 import { createHash } from 'node:crypto'
+import { closeSync, constants, fstatSync, lstatSync, openSync, readSync, realpathSync } from 'node:fs'
+import path from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
 
 import { readProcessStartTimeMs } from '../../utils/processKill.js'
-
 import { jsonStringify } from '../../utils/slowOperations.js'
-
-import { openCodeClientFactory } from './OpenCodeClientFactory.js'
+import {
+  canonicalHostedApprovalDigest,
+  OpenCodePermissionConditionRejectedError,
+  openCodeClientFactory,
+} from './OpenCodeClientFactory.js'
 import { readOpenCodeAuthCredential, type OpenCodeOAuthNativeSessionOwner } from './OpenCodeAuthStore.js'
 import { openCodeEventTranslator } from './OpenCodeEventTranslator.js'
 import { openCodeHostManager } from './OpenCodeHostManager.js'
@@ -36,6 +40,9 @@ import type {
   OpenCodeHostHandle,
   OpenCodeLogProjection,
   OpenCodeMessage,
+  OpenCodeNormalizedPermission,
+  OpenCodeHostedApprovalCapability,
+  OpenCodeHostedApprovalPermission,
   OpenCodePrepareProfileOptions,
   OpenCodePreparedProfile,
   OpenCodeProfileScope,
@@ -54,7 +61,7 @@ type OpenCodeSessionBridgeDeps = {
   hostManager?: Pick<typeof openCodeHostManager, 'ensureHost' | 'releaseHost'>
     & Partial<Pick<
       typeof openCodeHostManager,
-      'withHostOperation' | 'withConfirmedAbsentHostAuthority' | 'resolveOwnedSessionEndpoint' | 'refreshResolvedConfigFingerprint' | 'releaseHostLease' | 'releaseHostLeaseStrict' | 'retainHostLease'
+      'withHostOperation' | 'withConfirmedAbsentHostAuthority' | 'resolveOwnedSessionEndpoint' | 'refreshResolvedConfigFingerprint' | 'releaseHostLease' | 'releaseHostLeaseStrict' | 'retainHostLease' | 'prepareEffectHostToken'
     >>
   sessionStore?: Pick<typeof openCodeSessionStore, 'get' | 'upsert' | 'markStale'>
     & Partial<Pick<typeof openCodeSessionStore,
@@ -80,6 +87,9 @@ type OpenCodeSessionBridgeDeps = {
     providerId: string
     sourceAuthPath: string
   }) => Promise<void>
+  preparePermissionProfileToken?: (
+    profile: OpenCodePreparedProfile,
+  ) => Promise<OpenCodePermissionEffectToken | null>
 }
 
 type OpenCodeClient = ReturnType<typeof openCodeClientFactory.create>
@@ -133,6 +143,168 @@ export type OpenCodeSessionAppMcpReadyResult = {
   status: OpenCodeAppMcpStatus
   connected: boolean | null
   diagnostics: string[]
+}
+
+export type OpenCodePermissionEffectContext = {
+  record: OpenCodeSessionRecord
+  profile: OpenCodePreparedProfile
+  host: {
+    hostKey: string
+    profileRootKey: string
+    projectPath: string
+    projectBehaviorFingerprint: string
+    openCodeArtifactDigest?: `sha256:${string}` | null
+    pid: number
+    processStartedAtMs: number | null
+    resolvedConfigFingerprint: string | null
+  }
+}
+
+export type OpenCodePermissionEffectToken = { consume(): boolean }
+
+export class OpenCodePermissionEffectNotAuthorizedError extends Error {
+  constructor() { super('OpenCode permission effect not authorized at provider edge') }
+}
+
+export class OpenCodePermissionPostInvocationError extends Error {
+  constructor(readonly cause: unknown) {
+    super('OpenCode permission POST outcome is uncertain')
+  }
+}
+
+export class OpenCodePermissionEffectUnavailableError extends Error {
+  constructor(readonly cause: unknown) {
+    super('OpenCode permission effect pre-POST verification unavailable')
+  }
+}
+
+const MAX_PERMISSION_PROFILE_FILE_BYTES = 16 * 1024 * 1024
+
+type PinnedProfileFile = {
+  consume(): boolean
+}
+
+function readPinnedFile(fd: number, size: number): Buffer | null {
+  if (!Number.isSafeInteger(size) || size < 0 || size > MAX_PERMISSION_PROFILE_FILE_BYTES) {
+    return null
+  }
+  const bytes = Buffer.alloc(size)
+  return readSync(fd, bytes, 0, size, 0) === size ? bytes : null
+}
+
+function hashProfileFile(bytes: Buffer): string {
+  return createHash('sha256').update(bytes).digest('hex')
+}
+
+function missingCanonicalFile(filePath: string): boolean {
+  try {
+    lstatSync(filePath)
+    return false
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ENOENT'
+  }
+}
+
+function pinCanonicalProfileFile(
+  filePath: string,
+  expectedFingerprint: string | null,
+): PinnedProfileFile | null {
+  if (expectedFingerprint === null) {
+    if (!missingCanonicalFile(filePath)) return null
+    let consumed = false
+    return {
+      consume: () => {
+        if (consumed) return false
+        consumed = true
+        return missingCanonicalFile(filePath)
+      },
+    }
+  }
+
+  let fd = -1
+  try {
+    fd = openSync(filePath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
+    const opened = fstatSync(fd)
+    const linked = lstatSync(filePath)
+    const bytes = opened.isFile() ? readPinnedFile(fd, opened.size) : null
+    if (!bytes || !linked.isFile() || linked.isSymbolicLink() ||
+      opened.dev !== linked.dev || opened.ino !== linked.ino ||
+      realpathSync(filePath) !== path.resolve(filePath) ||
+      hashProfileFile(bytes) !== expectedFingerprint) {
+      closeSync(fd)
+      return null
+    }
+    const identity = { dev: opened.dev, ino: opened.ino, size: opened.size }
+    const ownedFd = fd
+    fd = -1
+    let consumed = false
+    return {
+      consume: () => {
+        if (consumed) return false
+        consumed = true
+        try {
+          const current = fstatSync(ownedFd)
+          const linkedBefore = lstatSync(filePath)
+          const currentBytes = current.isFile() ? readPinnedFile(ownedFd, current.size) : null
+          const linkedAfter = lstatSync(filePath)
+          return !!currentBytes && current.dev === identity.dev && current.ino === identity.ino &&
+            current.size === identity.size && linkedBefore.isFile() && linkedAfter.isFile() &&
+            !linkedBefore.isSymbolicLink() && !linkedAfter.isSymbolicLink() &&
+            linkedBefore.dev === identity.dev && linkedBefore.ino === identity.ino &&
+            linkedAfter.dev === identity.dev && linkedAfter.ino === identity.ino &&
+            realpathSync(filePath) === path.resolve(filePath) &&
+            hashProfileFile(currentBytes) === expectedFingerprint
+        } catch {
+          return false
+        } finally {
+          closeSync(ownedFd)
+        }
+      },
+    }
+  } catch {
+    if (fd >= 0) closeSync(fd)
+    return null
+  }
+}
+
+/** Pins every auth file whose bytes form the prepared profile projection. */
+export async function prepareOpenCodePermissionProfileToken(
+  profile: OpenCodePreparedProfile,
+): Promise<OpenCodePermissionEffectToken | null> {
+  const sources = profile.sourceAuthSources
+  if (!sources) return null
+  const sourceFingerprint = sources.some(source => source.fingerprint)
+    ? createHash('sha256').update(sources
+      .filter(source => source.fingerprint)
+      .map(source => `${source.path}:${source.fingerprint}`)
+      .join('\n')).digest('hex')
+    : null
+  const selectedSourcePath = sources.findLast(source => source.fingerprint)?.path ?? null
+  if (sourceFingerprint !== profile.sourceAuthFingerprint ||
+    selectedSourcePath !== profile.sourceAuthPath) return null
+
+  const pinned: PinnedProfileFile[] = []
+  for (const source of [
+    ...sources,
+    { path: profile.managedAuthPath, fingerprint: profile.managedAuthFingerprint },
+  ]) {
+    const token = pinCanonicalProfileFile(source.path, source.fingerprint)
+    if (!token) {
+      for (const prepared of pinned) prepared.consume()
+      return null
+    }
+    pinned.push(token)
+  }
+  let consumed = false
+  return {
+    consume: () => {
+      if (consumed) return false
+      consumed = true
+      let valid = true
+      for (const token of pinned) valid = token.consume() && valid
+      return valid
+    },
+  }
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -203,6 +375,67 @@ function messageHasNoReplySideEffectParts(message: OpenCodeMessage): boolean {
 
 function hashText(value: string): string {
   return createHash('sha256').update(value).digest('hex')
+}
+
+function canonicalEffectValue(value: unknown): string {
+  if (value === null || typeof value !== 'object') {
+    const encoded = JSON.stringify(value)
+    if (encoded === undefined) throw new Error('Unsupported OpenCode permission canonical value')
+    return encoded
+  }
+  if (Array.isArray(value)) return `[${value.map(canonicalEffectValue).join(',')}]`
+  const record = value as Record<string, unknown>
+  return `{${Object.keys(record).sort().map(key =>
+    `${JSON.stringify(key)}:${canonicalEffectValue(record[key])}`,
+  ).join(',')}}`
+}
+
+const HOSTED_APPROVAL_PROTOCOL = 'agent-teams-hosted-approval-v2' as const
+
+function decodeHostedApprovalCapability(value: unknown): {
+  schemaVersion: 2
+  protocol: typeof HOSTED_APPROVAL_PROTOCOL
+  authentication: 'opencode-basic'
+  runtimeInstanceId: string
+  configGeneration: string
+} | null {
+  const record = asRecord(value)
+  if (!record || Object.keys(record).sort().join(',') !==
+    'authentication,configGeneration,protocol,runtimeInstanceId,schemaVersion' ||
+    record.schemaVersion !== 2 ||
+    record.protocol !== HOSTED_APPROVAL_PROTOCOL ||
+    record.authentication !== 'opencode-basic' ||
+    typeof record.runtimeInstanceId !== 'string' ||
+    !/^runtime_instance_[0-9a-f]{32}$/.test(record.runtimeInstanceId) ||
+    typeof record.configGeneration !== 'string' ||
+    !/^config_generation_[0-9a-f]{32}$/.test(record.configGeneration)) {
+    return null
+  }
+  return record as {
+    schemaVersion: 2
+    protocol: typeof HOSTED_APPROVAL_PROTOCOL
+    authentication: 'opencode-basic'
+    runtimeInstanceId: string
+    configGeneration: string
+  }
+}
+
+export type OpenCodeHostedApprovalObservedPermission = {
+  capability: OpenCodeHostedApprovalCapability
+  permission: OpenCodeHostedApprovalPermission
+  normalized: OpenCodeNormalizedPermission
+}
+
+function hostedApprovalAuth(profile: OpenCodePreparedProfile) {
+  const password = profile.env.OPENCODE_SERVER_PASSWORD
+  if (password === undefined || password === '') {
+    throw new Error('OpenCode hosted approval Basic Auth unavailable')
+  }
+  return {
+    username: profile.env.OPENCODE_SERVER_USERNAME ?? 'opencode',
+    password,
+    directory: profile.projectPath,
+  }
 }
 
 function extractManagedConfigFingerprintFromHostKey(hostKey: string | null | undefined): string | null {
@@ -347,6 +580,7 @@ function isOpenCodeStrictMaterializedSessionCompatible(
     && record.laneId === expected.laneId
     && record.memberName === expected.memberName
     && record.hostKey === expected.host.hostKey
+    && (record.openCodeArtifactDigest ?? null) === (expected.host.openCodeArtifactDigest ?? null)
     && record.projectPath === expected.host.projectPath
     && record.profileRootKey === expected.host.profileRootKey
     && ((!record.profileScope && !expected.host.profile.profileScope)
@@ -608,11 +842,18 @@ export class OpenCodeSessionBridge {
     const host = await this.hostManager.ensureHost({
       projectPath: params.profile.projectPath,
       preparedProfile: params.profile,
+      lease: {
+        teamId: params.identity.teamId,
+        laneId: params.identity.laneId,
+        memberName: params.identity.memberName,
+        runId: params.runId ?? null,
+      },
       // Selected launches seal the managed-config domain used by strict host reuse.
       ...(params.profile.profileScope?.purpose === 'launch_runtime'
         ? { resolveConfigFingerprint: false, prewarmManagedSubscriptionPlugins: false }
         : {}),
     })
+    let promotedSessionId: string | null = null
 
     try {
       const client = this.clientFactory.create(host.baseUrl)
@@ -644,8 +885,8 @@ export class OpenCodeSessionBridge {
       const now = buildNowIso()
       const record: OpenCodeSessionRecord = {
         teamId: params.identity.teamId,
-        ...(params.runId ? { runId: params.runId } : {}),
         laneId: params.identity.laneId,
+        runId: params.runId ?? null,
         memberName: params.identity.memberName,
         providerId: 'opencode',
         selectedModel: params.selectedModel,
@@ -653,6 +894,7 @@ export class OpenCodeSessionBridge {
         projectPath: host.projectPath,
         profileRootKey: host.profileRootKey,
         hostKey: host.hostKey,
+        openCodeArtifactDigest: host.openCodeArtifactDigest ?? null,
         profileScope: host.profile.profileScope ?? null,
         toolApprovalMode: params.toolApprovalMode ?? 'auto',
         runtimePid: host.pid > 0 ? host.pid : undefined,
@@ -680,12 +922,34 @@ export class OpenCodeSessionBridge {
         runId: params.runId ?? null,
         sessionId: session.id,
       })
+      promotedSessionId = session.id
+      await this.hostManager.releaseHostLease?.(host.hostKey, {
+        teamId: params.identity.teamId,
+        laneId: params.identity.laneId,
+        memberName: params.identity.memberName,
+        runId: params.runId ?? null,
+      })
 
       return {
         retainedHostKey: host.hostKey,
         record,
       }
     } catch (error) {
+      if (promotedSessionId) {
+        await this.hostManager.releaseHostLease?.(host.hostKey, {
+          teamId: params.identity.teamId,
+          laneId: params.identity.laneId,
+          memberName: params.identity.memberName,
+          runId: params.runId ?? null,
+          sessionId: promotedSessionId,
+        }).catch(() => undefined)
+      }
+      await this.hostManager.releaseHostLease?.(host.hostKey, {
+        teamId: params.identity.teamId,
+        laneId: params.identity.laneId,
+        memberName: params.identity.memberName,
+        runId: params.runId ?? null,
+      }).catch(() => undefined)
       await this.hostManager.releaseHost(host.hostKey)
       throw error
     }
@@ -990,6 +1254,7 @@ export class OpenCodeSessionBridge {
       profile: OpenCodePreparedProfile
       resolvedConfigFingerprint: string | null
       runtimePid: number | null
+      host: OpenCodePermissionEffectContext['host']
       processStartedAtMs: number | null
     }) => Promise<T>,
     profile?: OpenCodePreparedProfile,
@@ -1011,6 +1276,16 @@ export class OpenCodeSessionBridge {
         resolvedConfigFingerprint: host.resolvedConfigFingerprint,
         runtimePid: host.pid > 0 ? host.pid : null,
         processStartedAtMs: host.processStartedAtMs ?? null,
+        host: {
+          hostKey: host.hostKey,
+          profileRootKey: host.profileRootKey,
+          projectPath: host.projectPath,
+          projectBehaviorFingerprint: host.projectBehaviorFingerprint,
+          openCodeArtifactDigest: host.openCodeArtifactDigest ?? null,
+          pid: host.pid,
+          processStartedAtMs: host.processStartedAtMs ?? null,
+          resolvedConfigFingerprint: host.resolvedConfigFingerprint,
+        },
       }))
     } finally {
       await this.hostManager.releaseHost(host.hostKey, { keepPersistentAlive: record.profileScope?.purpose === 'launch_runtime' })
@@ -1026,6 +1301,7 @@ export class OpenCodeSessionBridge {
       runtimePid: number | null
       processStartedAtMs: number | null
       armOAuthNativeSession?: (messageId: string, noReply?: boolean) => Promise<void>
+      markPromptDefinitelyUnsubmitted?: (messageId: string) => void
     }) => Promise<T>,
     isNativeSettled?: (value: T) => boolean,
   ): Promise<T> {
@@ -1045,6 +1321,7 @@ export class OpenCodeSessionBridge {
     }
     const capturedRecord = structuredClone(record)
     let settled = false
+    let definitelyUnsubmitted = false
     return this.withSessionHost(record, async context => {
       const completion = await openCodeProfileManager.withOwnedOAuthRefresh({
         profile: context.profile,
@@ -1076,7 +1353,12 @@ export class OpenCodeSessionBridge {
           let failed = false
           let error: unknown
           try {
-            value = await callback({ ...context, armOAuthNativeSession: async (messageId, noReply = false) => {
+            value = await callback({ ...context, markPromptDefinitelyUnsubmitted: messageId => {
+              if (nativeOwner?.messageId !== messageId) {
+                throw new Error('OpenCode definitely unsubmitted prompt owner changed')
+              }
+              definitelyUnsubmitted = true
+            }, armOAuthNativeSession: async (messageId, noReply = false) => {
               if (!context.runtimePid) throw new Error('OpenCode OAuth session has no owned process')
               const candidate = { record: capturedRecord, baseUrl: context.baseUrl,
                 pid: context.runtimePid, processStartedAtMs: context.processStartedAtMs!, messageId, noReply }
@@ -1089,11 +1371,13 @@ export class OpenCodeSessionBridge {
           if (!nativeOwner && failed) throw error
           // A lost HTTP response does not undo native token consumption. Only the
           // exact armed prompt's terminal history authorizes saving on failure.
-          settled = !!nativeOwner && (failed || isNativeSettled?.(value as T) === true)
+          settled = !definitelyUnsubmitted && !!nativeOwner
+            && (failed || isNativeSettled?.(value as T) === true)
             && await this.isOwnedOAuthNativeSessionSettled(nativeOwner)
           return { value, failed, error }
         },
         isNativeSettled: () => settled,
+        isNativeDefinitelyUnsubmitted: () => definitelyUnsubmitted,
         allowNativeContinuation: !isNativeSettled,
       })
       if (completion.failed) throw completion.error
@@ -1606,6 +1890,7 @@ export class OpenCodeSessionBridge {
       ...(selectedVariant ? { selectedVariant } : {}),
       projectPath: params.host.projectPath,
       profileRootKey: params.host.profileRootKey,
+      openCodeArtifactDigest: params.host.openCodeArtifactDigest ?? null,
       profileScope: params.host.profile.profileScope ?? null,
       toolApprovalMode: params.toolApprovalMode ?? 'auto',
       runtimePid: params.host.pid > 0 ? params.host.pid : undefined,
@@ -2163,17 +2448,265 @@ export class OpenCodeSessionBridge {
     params: {
       requestId: string
       decision: 'allow' | 'always' | 'reject'
+      /** Exact raw permission incarnation admitted by the hosted owner. */
+      expectedPermissionRaw?: OpenCodeNormalizedPermission['raw']
+      /** Exact v2 provider observation admitted by the hosted owner. */
+      expectedHostedPermission?: OpenCodeHostedApprovalObservedPermission
+      /** Requires the upstream atomic config-CAS permission-reply contract. */
+      requireAtomicConfigReply?: boolean
+      /** Fences the executable before any hosted provider observation. */
+      authorizeObservation?: (
+        context: OpenCodePermissionEffectContext,
+      ) => Promise<boolean>
+      /** Revalidates the persisted session/effect binding after fresh host proof. */
+      validatePreparedEffect?: (
+        context: OpenCodePermissionEffectContext,
+      ) => Promise<boolean | OpenCodePermissionEffectToken>
+      /** Last asynchronous admission fence, immediately pre-POST. */
+      authorizeEffect?: (
+        context: OpenCodePermissionEffectContext,
+      ) => Promise<boolean | OpenCodePermissionEffectToken>
     },
   ): Promise<unknown> {
-    return this.withSessionHost(record, async ({ baseUrl }) => {
-      // Recheck the selected record after host/lease acquisition and inside the
-      // session operation guard, immediately before dispatch.
-      await this.assertExactSessionAuthority(record)
-      const client = this.clientFactory.create(baseUrl)
-      return client.answerPermission({
-        requestId: params.requestId,
-        sessionId: record.opencodeSessionId,
-        decision: params.decision,
+    const invocation: {
+      phase: 'not_started' | 'invoked' | 'completed'
+      completedResult?: unknown
+    } = { phase: 'not_started' }
+    try {
+      return await this.withSessionHost(record, async ({ baseUrl, profile, host }) => {
+      // A run-bound legacy session still has durable ownership even without a
+      // sealed launch scope. Recheck it after host acquisition, before POST.
+      if (record.runId || record.profileScope?.purpose === 'launch_runtime') {
+        await this.assertExactSessionAuthority(record)
+      }
+      if (params.authorizeObservation &&
+        !(await params.authorizeObservation({ record, profile, host }))) {
+        throw new OpenCodePermissionEffectNotAuthorizedError()
+      }
+      const client = this.clientFactory.create(
+        baseUrl,
+        {},
+        params.requireAtomicConfigReply ? hostedApprovalAuth(profile) : undefined,
+      )
+      let preparedToken: OpenCodePermissionEffectToken | null = null
+      let authorityToken: OpenCodePermissionEffectToken | null = null
+      let profileToken: OpenCodePermissionEffectToken | null = null
+      let hostToken: OpenCodePermissionEffectToken | null = null
+      let preparedConsumed = false
+      let authorityConsumed = false
+      let profileConsumed = false
+      let hostConsumed = false
+      let configGeneration: string | null = null
+      let runtimeInstanceId: string | null = null
+      let requestIncarnation: string | null = null
+      let permissionDigest: string | null = null
+      try {
+      // Capability probe is deliberately before the raw permission GET. A
+      // current upstream host (which lacks atomic config-CAS reply) therefore
+      // performs neither the raw read nor the provider decision effect.
+      if (params.requireAtomicConfigReply) {
+        if (!client.getHostedApprovalCapability) {
+          throw new Error('OpenCode atomic hosted approval capability unavailable')
+        }
+        const capability = decodeHostedApprovalCapability(
+          await client.getHostedApprovalCapability(),
+        )
+        if (!capability) throw new Error('OpenCode atomic hosted approval capability unavailable')
+        configGeneration = capability.configGeneration
+        runtimeInstanceId = capability.runtimeInstanceId
+        if (!client.observeHostedApprovalPermissions || !params.expectedHostedPermission) {
+          throw new Error('OpenCode atomic hosted approval observation unavailable')
+        }
+        const observation = await client.observeHostedApprovalPermissions(record.opencodeSessionId)
+        if (observation.runtimeInstanceId !== capability.runtimeInstanceId ||
+          observation.configGeneration !== capability.configGeneration) {
+          throw new OpenCodePermissionEffectNotAuthorizedError()
+        }
+        const expected = params.expectedHostedPermission
+        const permission = observation.permissions.find(candidate =>
+          candidate.requestId === params.requestId &&
+          candidate.sessionId === record.opencodeSessionId &&
+          candidate.requestIncarnation === expected.permission.requestIncarnation &&
+          candidate.permissionDigest === expected.permission.permissionDigest &&
+          canonicalEffectValue(candidate.rawPermission) ===
+            canonicalEffectValue(expected.permission.rawPermission),
+        )
+        if (!permission || expected.capability.runtimeInstanceId !== capability.runtimeInstanceId ||
+          expected.capability.configGeneration !== capability.configGeneration) {
+          throw new OpenCodePermissionEffectNotAuthorizedError()
+        }
+        requestIncarnation = permission.requestIncarnation
+        permissionDigest = permission.permissionDigest
+      }
+      // Observe the exact provider-side incarnation before preparing any final
+      // effect tokens. The final host proof below must therefore cover this GET.
+      if (params.expectedPermissionRaw && !params.requireAtomicConfigReply) {
+        const exactPermission = normalizeOpenCodePermissions(await client.getPermissions()).find(permission =>
+          permission.requestId === params.requestId &&
+          permission.sessionId === record.opencodeSessionId &&
+          canonicalEffectValue(permission.raw) === canonicalEffectValue(params.expectedPermissionRaw),
+        )
+        if (!exactPermission) throw new OpenCodePermissionEffectNotAuthorizedError()
+      }
+      if (params.expectedPermissionRaw) {
+        if (params.validatePreparedEffect) {
+          const prepared = await params.validatePreparedEffect({ record, profile, host })
+          if (!prepared) throw new OpenCodePermissionEffectNotAuthorizedError()
+          preparedToken = typeof prepared === 'boolean' ? null : prepared
+        }
+      }
+      if (params.authorizeEffect) {
+        const authorized = await params.authorizeEffect({ record, profile, host })
+        if (!authorized) throw new OpenCodePermissionEffectNotAuthorizedError()
+        authorityToken = typeof authorized === 'boolean' ? null : authorized
+      }
+      if (params.expectedPermissionRaw) {
+        const prepareProfileToken = this.deps.preparePermissionProfileToken
+          ?? prepareOpenCodePermissionProfileToken
+        profileToken = await prepareProfileToken(profile)
+        if (!profileToken) throw new OpenCodePermissionEffectNotAuthorizedError()
+      }
+      // Host proof is deliberately the last asynchronous operation. Everything
+      // after it is a synchronous one-use token consumption followed by POST.
+      const hostInput = {
+        hostKey: host.hostKey,
+        pid: host.pid,
+        processStartedAtMs: host.processStartedAtMs,
+        resolvedConfigFingerprint: host.resolvedConfigFingerprint,
+        openCodeArtifactDigest: host.openCodeArtifactDigest ?? null,
+      }
+      const prepareHost = this.hostManager.prepareEffectHostToken?.bind(this.hostManager)
+      hostToken = prepareHost
+        ? await prepareHost(hostInput)
+        : null
+      if (params.expectedPermissionRaw && !hostToken) throw new OpenCodePermissionEffectNotAuthorizedError()
+      if (preparedToken) {
+        preparedConsumed = true
+        if (!preparedToken.consume()) throw new OpenCodePermissionEffectNotAuthorizedError()
+      }
+      if (profileToken) {
+        profileConsumed = true
+        if (!profileToken.consume()) throw new OpenCodePermissionEffectNotAuthorizedError()
+      }
+      if (authorityToken) {
+        authorityConsumed = true
+        if (!authorityToken.consume()) throw new OpenCodePermissionEffectNotAuthorizedError()
+      }
+      // The fresh process/executed-artifact proof is consumed last, with no
+      // asynchronous boundary before the provider POST.
+      if (hostToken) {
+        hostConsumed = true
+        if (!hostToken.consume()) throw new OpenCodePermissionEffectNotAuthorizedError()
+      }
+      try {
+        invocation.phase = 'invoked'
+        invocation.completedResult = await client.answerPermission({
+          requestId: params.requestId,
+          sessionId: record.opencodeSessionId,
+          decision: params.decision,
+          ...(configGeneration && runtimeInstanceId && requestIncarnation && permissionDigest
+            ? {
+                condition: {
+                  runtimeInstanceId,
+                  configGeneration,
+                  requestIncarnation,
+                  permissionDigest,
+                },
+              }
+            : {}),
+        })
+        invocation.phase = 'completed'
+        return invocation.completedResult
+      } catch (error) {
+        if (error instanceof OpenCodePermissionConditionRejectedError) {
+          invocation.phase = 'not_started'
+          throw new OpenCodePermissionEffectNotAuthorizedError()
+        }
+        throw new OpenCodePermissionPostInvocationError(error)
+      }
+      } finally {
+        if (preparedToken && !preparedConsumed) preparedToken.consume()
+        if (profileToken && !profileConsumed) profileToken.consume()
+        if (hostToken && !hostConsumed) hostToken.consume()
+        if (authorityToken && !authorityConsumed) authorityToken.consume()
+      }
+      })
+    } catch (error) {
+      // A successful provider response remains success even if releaseHost or
+      // another post-response cleanup step fails.
+      if (invocation.phase === 'completed') return invocation.completedResult
+      if (invocation.phase === 'invoked' && !(error instanceof OpenCodePermissionPostInvocationError)) {
+        throw new OpenCodePermissionPostInvocationError(error)
+      }
+      if (error instanceof OpenCodePermissionEffectNotAuthorizedError ||
+        error instanceof OpenCodePermissionPostInvocationError) throw error
+      throw new OpenCodePermissionEffectUnavailableError(error)
+    }
+  }
+
+  /** Returns the upstream config generation only for the exact atomic contract. */
+  async probeHostedApprovalCapability(record: OpenCodeSessionRecord): Promise<string | null> {
+    try {
+      return await this.withSessionHost(record, async ({ baseUrl, profile }) => {
+        const client = this.clientFactory.create(baseUrl, {}, hostedApprovalAuth(profile))
+        if (!client.getHostedApprovalCapability) return null
+        const capability = decodeHostedApprovalCapability(
+          await client.getHostedApprovalCapability(),
+        )
+        return capability?.configGeneration ?? null
+      })
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * Proves the hosted capability and reads raw permissions from the same
+   * retained host and client acquisition. No raw permission read occurs unless
+   * the exact capability response has already been validated.
+   */
+  async observeHostedApprovalPermissions(
+    record: OpenCodeSessionRecord,
+    authorizeObservation?: (context: OpenCodePermissionEffectContext) => Promise<boolean>,
+  ): Promise<OpenCodeHostedApprovalObservedPermission[]> {
+    return this.withSessionHost(record, async ({ baseUrl, profile, host }) => {
+      if (authorizeObservation && !(await authorizeObservation({ record, profile, host }))) {
+        throw new OpenCodePermissionEffectNotAuthorizedError()
+      }
+      const client = this.clientFactory.create(baseUrl, {}, hostedApprovalAuth(profile))
+      if (!client.getHostedApprovalCapability) {
+        throw new Error('OpenCode atomic hosted approval capability unavailable')
+      }
+      const capability = decodeHostedApprovalCapability(
+        await client.getHostedApprovalCapability(),
+      )
+      if (!capability) {
+        throw new Error('OpenCode atomic hosted approval capability unavailable')
+      }
+      if (!client.observeHostedApprovalPermissions) {
+        throw new Error('OpenCode atomic hosted approval observation unavailable')
+      }
+      const observation = await client.observeHostedApprovalPermissions(record.opencodeSessionId)
+      if (observation.runtimeInstanceId !== capability.runtimeInstanceId ||
+        observation.configGeneration !== capability.configGeneration) {
+        throw new Error('OpenCode hosted approval observation generation changed')
+      }
+      return observation.permissions.map(permission => {
+        const raw = permission.rawPermission
+        const normalized: OpenCodeNormalizedPermission = {
+          requestId: raw.id,
+          sessionId: raw.sessionID,
+          tool: raw.permission,
+          title: null,
+          kind: null,
+          raw,
+        }
+        if (normalized.requestId !== permission.requestId ||
+          normalized.sessionId !== permission.sessionId ||
+          canonicalHostedApprovalDigest(permission.rawPermission) !== permission.permissionDigest) {
+          throw new Error('OpenCode hosted approval permission projection mismatch')
+        }
+        return { capability, permission, normalized }
       })
     })
   }
@@ -2203,6 +2736,7 @@ export class OpenCodeSessionBridge {
       agent?: string
       noReply?: boolean
       system?: string
+      beforePromptTransport?: () => Promise<void>
     } & Pick<OpenCodePromptAsyncWithTurnSettledHooks, 'onPromptSubmitting' | 'onPromptAccepted' | 'onPromptDefinitelyUnsubmitted'>,
   ): Promise<{
     runtimePromptMessageId: string
@@ -2211,7 +2745,8 @@ export class OpenCodeSessionBridge {
     if (params.noReply) {
       throw new Error('OpenCode prompt acceptance observation does not support noReply prompts')
     }
-    return this.withSessionPromptHost(record, async ({ baseUrl, profile, armOAuthNativeSession }) => {
+    return this.withSessionPromptHost(record, async ({ baseUrl, profile, armOAuthNativeSession,
+      markPromptDefinitelyUnsubmitted }) => {
       const client = this.clientFactory.create(baseUrl)
       try {
         const allocation = await this.allocateRuntimePromptMessageId(client, record.opencodeSessionId)
@@ -2222,7 +2757,17 @@ export class OpenCodeSessionBridge {
           runtimePromptMessageId,
           baseUrl,
         })
+        await params.beforePromptTransport?.()
         await this.armPromptBeforeTransport(record, runtimePromptMessageId, false, armOAuthNativeSession, params)
+        try {
+          await params.beforePromptTransport?.()
+        } catch (error) {
+          markPromptDefinitelyUnsubmitted?.(runtimePromptMessageId)
+          await params.onPromptDefinitelyUnsubmitted?.({
+            sessionId: record.opencodeSessionId, runtimePromptMessageId, error,
+          })
+          throw error
+        }
         await client.promptSessionAsync(record.opencodeSessionId, {
           messageID: runtimePromptMessageId,
           agent: params.agent,

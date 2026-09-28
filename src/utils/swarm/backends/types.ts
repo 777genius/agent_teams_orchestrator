@@ -77,6 +77,7 @@ export type PaneBackend = {
   createTeammatePaneInSwarmView(
     name: string,
     color: AgentColorName,
+    onCreated?: (paneId: PaneId) => Promise<void>,
   ): Promise<CreatePaneResult>
 
   /**

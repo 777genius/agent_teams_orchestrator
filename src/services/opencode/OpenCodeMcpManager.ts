@@ -1,6 +1,9 @@
 import path from 'node:path'
-import { existsSync, readFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { createReadStream, existsSync, readFileSync } from 'node:fs'
+import { lstat } from 'node:fs/promises'
 import os from 'node:os'
+import { pipeline } from 'node:stream/promises'
 
 import { openCodeClientFactory } from './OpenCodeClientFactory.js'
 import {
@@ -34,6 +37,15 @@ const OPEN_CODE_MCP_ENV_JSON_ENV = 'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENV_JSON'
 const OPEN_CODE_MCP_URL_ENV = 'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL'
 const AGENT_TEAMS_MCP_CLAUDE_DIR_ENV = 'AGENT_TEAMS_MCP_CLAUDE_DIR'
 const CLAUDE_TEAM_CONTROL_URL_ENV = 'CLAUDE_TEAM_CONTROL_URL'
+/** Explicit selection the Product MCP honours only together with its Claude root. */
+const AGENT_TEAMS_MCP_TRUST_MODE_ENV = 'AGENT_TEAMS_MCP_TRUST_MODE'
+const AGENT_TEAMS_MCP_PERSONAL_HOST_TRUST_MODE = 'personal-host-trusted-process'
+/**
+ * Owner-process markers the MCP child would inherit through `opencode serve`
+ * (OpenCode spawns it with `{...process.env, ...environment}`) and read as
+ * container Hosted mode. Blank values override them.
+ */
+const HOSTED_AGENT_TOOL_MODE_ENV_KEYS = ['HOSTED_OPENCODE_RUNTIME_MODE', 'AUTH_MODE'] as const
 const OPEN_CODE_MCP_ENVIRONMENT_ALLOWLIST = [
   'PATH',
   'HOME',
@@ -369,10 +381,115 @@ function buildLocalMcpEnvironment(env: NodeJS.ProcessEnv): Record<string, string
   }
 }
 
+/** Launcher-pinned agent-teams MCP artifact; digests are bare lowercase SHA-256 hex. */
+export type HostedAppMcpDescriptor = Readonly<{
+  command: string
+  commandSha256: string
+  entry: string
+  entrySha256: string
+}>
+
+/**
+ * Hosted replacement for the env/workspace discovery below. `descriptor` is
+ * null when the signed bootstrap carried no MCP artifact.
+ */
+export type HostedAppMcpAuthority = Readonly<{
+  descriptor: HostedAppMcpDescriptor | null
+  claudeRoot: string
+}>
+
+let hostedAppMcpAuthority: HostedAppMcpAuthority | undefined
+
+/** Ambient MCP wiring that a hosted-control process must never inherit or forward. */
+export const HOSTED_IGNORED_APP_MCP_ENV_KEYS: readonly string[] = Object.freeze([
+  OPEN_CODE_MCP_URL_ENV,
+  OPEN_CODE_MCP_COMMAND_ENV,
+  OPEN_CODE_MCP_ENTRY_ENV,
+  OPEN_CODE_MCP_ARGS_JSON_ENV,
+  OPEN_CODE_MCP_ENV_JSON_ENV,
+  AGENT_TEAMS_MCP_CLAUDE_DIR_ENV,
+  CLAUDE_TEAM_CONTROL_URL_ENV,
+])
+
+/**
+ * Installed once by hosted-control from its authenticated bootstrap. From then
+ * on this process never reads MCP overrides from env (bun auto-loads `.env`
+ * from an agent-writable cwd) and never falls back to workspace builds.
+ */
+export function installHostedAppMcpAuthority(authority: HostedAppMcpAuthority): void {
+  if (hostedAppMcpAuthority) throw new Error('Hosted app MCP authority is already installed')
+  hostedAppMcpAuthority = Object.freeze({
+    descriptor: authority.descriptor ? Object.freeze({ ...authority.descriptor }) : null,
+    claudeRoot: authority.claudeRoot,
+  })
+}
+
+export function isHostedAppMcpAuthorityInstalled(): boolean {
+  return hostedAppMcpAuthority !== undefined
+}
+
+/** Both artifacts must be regular files whose exact bytes match the pinned digests. */
+export async function verifyHostedAppMcpDescriptor(
+  descriptor: HostedAppMcpDescriptor,
+): Promise<boolean> {
+  try {
+    for (const [file, expected] of [
+      [descriptor.command, descriptor.commandSha256],
+      [descriptor.entry, descriptor.entrySha256],
+    ] as const) {
+      if (!path.isAbsolute(file) || !(await lstat(file)).isFile()) return false
+      const hash = createHash('sha256')
+      await pipeline(createReadStream(file), hash)
+      if (hash.digest('hex') !== expected) return false
+    }
+    return true
+  } catch {
+    return false
+  }
+}
+
+export function buildHostedAppMcpLaunchConfig(
+  descriptor: HostedAppMcpDescriptor,
+  claudeRoot: string,
+): ResolvedAppMcpLaunchConfig {
+  return {
+    source: 'hosted-descriptor',
+    config: {
+      type: 'local',
+      command: [descriptor.command, descriptor.entry],
+      // Only the hosted Claude root and the personal-host trust mode; no control
+      // URL and nothing forwarded from env.
+      environment: {
+        [AGENT_TEAMS_MCP_CLAUDE_DIR_ENV]: claudeRoot,
+        [AGENT_TEAMS_MCP_TRUST_MODE_ENV]: AGENT_TEAMS_MCP_PERSONAL_HOST_TRUST_MODE,
+        ...Object.fromEntries(HOSTED_AGENT_TOOL_MODE_ENV_KEYS.map(key => [key, ''])),
+      },
+      enabled: true,
+      timeout: OPEN_CODE_APP_MCP_TIMEOUT_MS,
+    },
+  }
+}
+
+async function resolveHostedAppMcpLaunchConfig(
+  authority: HostedAppMcpAuthority,
+): Promise<ResolvedAppMcpLaunchConfig> {
+  if (!authority.descriptor) {
+    throw new Error('Hosted agent-teams MCP artifact was not admitted by the bootstrap')
+  }
+  if (!(await verifyHostedAppMcpDescriptor(authority.descriptor))) {
+    throw new Error('Hosted agent-teams MCP artifact does not match its pinned digests')
+  }
+  return buildHostedAppMcpLaunchConfig(authority.descriptor, authority.claudeRoot)
+}
+
 export async function resolveOpenCodeAppMcpLaunchConfig(deps: {
   env?: NodeJS.ProcessEnv
   pathExists?: (targetPath: string) => Promise<boolean>
+  /** Test seam; production reads the process-wide hosted authority. */
+  hostedAuthority?: HostedAppMcpAuthority
 } = {}): Promise<ResolvedAppMcpLaunchConfig> {
+  const hostedAuthority = deps.hostedAuthority ?? hostedAppMcpAuthority
+  if (hostedAuthority) return resolveHostedAppMcpLaunchConfig(hostedAuthority)
   const env = deps.env ?? process.env
   const pathExists = deps.pathExists ?? defaultPathExists
   const remoteUrlOverrideRaw = asString(env[OPEN_CODE_MCP_URL_ENV])

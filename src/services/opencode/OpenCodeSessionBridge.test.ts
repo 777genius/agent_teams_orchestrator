@@ -1,4 +1,5 @@
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -9,8 +10,17 @@ import {
   buildOpenCodeRuntimePromptMessageId,
   resetOpenCodeRuntimePromptMessageIdAllocatorForTest,
 } from './OpenCodeMessageIds.js'
+import {
+  OpenCodePermissionEffectNotAuthorizedError,
+  OpenCodePermissionEffectUnavailableError,
+  OpenCodePermissionPostInvocationError,
+  prepareOpenCodePermissionProfileToken,
+  sessionManagedAuthMatches,
+  isOpenCodeStrictSessionCompatible,
+  OpenCodeSessionBridge,
+} from './OpenCodeSessionBridge.js'
+import { canonicalHostedApprovalDigest } from './OpenCodeClientFactory.js'
 import { canonicalizeOpenCodeProjectPath, resolveOpenCodeProfileScope } from './OpenCodeProfileManager.js'
-import { sessionManagedAuthMatches, isOpenCodeStrictSessionCompatible, OpenCodeSessionBridge } from './OpenCodeSessionBridge.js'
 import { OpenCodeSessionStore } from './OpenCodeSessionStore.js'
 import { OpenCodeHostManager } from './OpenCodeHostManager.js'
 import {
@@ -52,7 +62,7 @@ const profile: OpenCodePreparedProfile = {
   sourceAuthFingerprint: 'source-auth',
   managedAuthFingerprint: 'managed-auth',
   authState: 'ok',
-  env: {},
+  env: { OPENCODE_SERVER_PASSWORD: 'test-password' },
 }
 
 const host: OpenCodeHostHandle = {
@@ -268,6 +278,7 @@ describe('OpenCodeSessionBridge', () => {
       hostManager: {
         ensureHost: async input => {
           expect(input?.preparedProfile).toBe(profile)
+          if (input?.lease) retainedLeases.push(input.lease)
           return host
         },
         releaseHost: async () => {},
@@ -330,6 +341,466 @@ describe('OpenCodeSessionBridge', () => {
         sessionId: 'session-1',
       },
     ])
+  })
+
+  test('authorizes permission only after prepareProfile and ensureHost, immediately before provider POST', async () => {
+    const order: string[] = []
+    let releaseHost!: () => void
+    let signalHostStarted!: () => void
+    const hostStarted = new Promise<void>(resolve => { signalHostStarted = resolve })
+    const delayedHost = new Promise<void>(resolve => { releaseHost = resolve })
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => { order.push('profile'); return profile },
+      hostManager: {
+        ensureHost: async () => { order.push('host-start'); signalHostStarted(); await delayedHost; order.push('host-ready'); return { ...host, processStartedAtMs: 1000 } },
+        releaseHost: async () => {},
+        retainHostLease: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          answerPermission: async () => { order.push('post') },
+        } as never),
+      },
+    })
+    const pending = bridge.answerPermission(buildRecord({ runtimePid: host.pid }), {
+      requestId: 'permission_1', decision: 'allow',
+      authorizeEffect: async context => {
+        order.push(`authorize:${context.host.pid}:${context.host.processStartedAtMs}`)
+        return false
+      },
+    })
+    await hostStarted
+    expect(order).toEqual(['profile', 'host-start'])
+    releaseHost()
+    await expect(pending).rejects.toBeInstanceOf(OpenCodePermissionEffectNotAuthorizedError)
+    expect(order).toEqual(['profile', 'host-start', 'host-ready', 'authorize:123:1000'])
+  })
+
+  test('freshly proves host, persisted effect, exact raw permission, and admission in POST-edge order', async () => {
+    const order: string[] = []
+    const raw = { requestID: 'permission_1', sessionID: 'session-1', title: 'Run test' }
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => { order.push('profile'); return profile },
+      hostManager: {
+        ensureHost: async () => { order.push('host'); return { ...host, processStartedAtMs: 1000 } },
+        prepareEffectHostToken: async input => {
+          order.push(`host-proof:${input.pid}:${input.processStartedAtMs}:${input.resolvedConfigFingerprint}`)
+          return { consume: () => { order.push('host-token'); return true } }
+        },
+        releaseHost: async () => {}, retainHostLease: async () => {},
+      },
+      preparePermissionProfileToken: async () => ({
+        consume: () => { order.push('auth-token'); return true },
+      }),
+      clientFactory: { create: () => ({
+        getPermissions: async () => { order.push('permissions'); return [{ title: 'Run test', sessionID: 'session-1', requestID: 'permission_1' }] },
+        answerPermission: async () => { order.push('post') },
+      } as never) },
+    })
+    await bridge.answerPermission(buildRecord(), {
+      requestId: 'permission_1', decision: 'allow', expectedPermissionRaw: raw,
+      validatePreparedEffect: async () => {
+        order.push('session-effect')
+        return { consume: () => { order.push('session-token'); return true } }
+      },
+      authorizeEffect: async () => {
+        order.push('admission')
+        return { consume: () => { order.push('owner-token'); return true } }
+      },
+    })
+    expect(order).toEqual([
+      'profile', 'host', 'permissions', 'session-effect', 'admission',
+      'host-proof:123:1000:resolved-fingerprint', 'session-token',
+      'auth-token', 'owner-token', 'host-token', 'post',
+    ])
+  })
+
+  test('fails closed before raw permission GET when atomic config reply is unsupported', async () => {
+    let rawGets = 0
+    let replies = 0
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
+      hostManager: {
+        ensureHost: async () => ({ ...host, processStartedAtMs: 1000 }),
+        releaseHost: async () => {},
+      },
+      clientFactory: { create: () => ({
+        getHostedApprovalCapability: async () => {
+          throw new Error('OpenCode request failed (404 Not Found)')
+        },
+        getPermissions: async () => { rawGets += 1; return [] },
+        answerPermission: async () => { replies += 1 },
+      } as never) },
+    })
+
+    await expect(bridge.answerPermission(buildRecord({ toolApprovalMode: 'manual' }), {
+      requestId: 'permission_1',
+      decision: 'allow',
+      expectedPermissionRaw: { requestID: 'permission_1', sessionID: 'session-1' },
+      requireAtomicConfigReply: true,
+    })).rejects.toBeInstanceOf(OpenCodePermissionEffectUnavailableError)
+    expect({ rawGets, replies }).toEqual({ rawGets: 0, replies: 0 })
+  })
+
+  test('proves capability before raw permissions on one pinned host and client acquisition', async () => {
+    const order: string[] = []
+    let acquisitions = 0
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
+      hostManager: {
+        ensureHost: async () => ({ ...host, processStartedAtMs: 1000 }),
+        releaseHost: async () => {},
+      },
+      clientFactory: { create: () => {
+        acquisitions += 1
+        return {
+          getHostedApprovalCapability: async () => {
+            order.push('capability')
+            return {
+              schemaVersion: 2,
+              protocol: 'agent-teams-hosted-approval-v2',
+              authentication: 'opencode-basic',
+              runtimeInstanceId: `runtime_instance_${'1'.repeat(32)}`,
+              configGeneration: `config_generation_${'2'.repeat(32)}`,
+            }
+          },
+          observeHostedApprovalPermissions: async () => {
+            order.push('permissions')
+            const rawPermission = {
+              id: 'per_1', sessionID: 'ses_1', permission: 'bash',
+              patterns: ['ls'], metadata: { cwd: '/tmp' }, always: [],
+            }
+            return {
+              schemaVersion: 2,
+              protocol: 'agent-teams-hosted-approval-v2',
+              runtimeInstanceId: `runtime_instance_${'1'.repeat(32)}`,
+              configGeneration: `config_generation_${'2'.repeat(32)}`,
+              sessionId: 'ses_1',
+              permissions: [{
+                requestId: 'per_1', sessionId: 'ses_1',
+                requestIncarnation: `request_incarnation_${'3'.repeat(32)}`,
+                permissionDigest: createHash('sha256')
+                  .update('{"always":[],"id":"per_1","metadata":{"cwd":"/tmp"},"patterns":["ls"],"permission":"bash","sessionID":"ses_1"}')
+                  .digest('hex'),
+                rawPermission,
+              }],
+            }
+          },
+        } as never
+      } },
+    })
+
+    await expect(bridge.observeHostedApprovalPermissions(buildRecord({
+      toolApprovalMode: 'manual', opencodeSessionId: 'ses_1',
+    })))
+      .resolves.toMatchObject([{
+        normalized: { requestId: 'per_1', sessionId: 'ses_1', tool: 'bash' },
+        permission: { requestIncarnation: `request_incarnation_${'3'.repeat(32)}` },
+      }])
+    expect({ acquisitions, order }).toEqual({
+      acquisitions: 1,
+      order: ['capability', 'permissions'],
+    })
+  })
+
+  test('preserves configured hosted Basic credentials without trimming', async () => {
+    const auth: unknown[] = []
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => ({
+        ...profile,
+        env: {
+          ...profile.env,
+          OPENCODE_SERVER_USERNAME: ' user ',
+          OPENCODE_SERVER_PASSWORD: ' pass ',
+        },
+      }),
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: (_baseUrl, _context, hostedApprovalAuth) => {
+          auth.push(hostedApprovalAuth)
+          return {
+            getHostedApprovalCapability: async () => ({
+              schemaVersion: 2,
+              protocol: 'agent-teams-hosted-approval-v2',
+              authentication: 'opencode-basic',
+              runtimeInstanceId: `runtime_instance_${'1'.repeat(32)}`,
+              configGeneration: `config_generation_${'2'.repeat(32)}`,
+            }),
+          } as never
+        },
+      },
+    })
+    await expect(bridge.probeHostedApprovalCapability(buildRecord({ toolApprovalMode: 'manual' })))
+      .resolves.toBe(`config_generation_${'2'.repeat(32)}`)
+    expect(auth).toEqual([{
+      username: ' user ', password: ' pass ', directory: profile.projectPath,
+    }])
+  })
+
+  test('projects valid hosted identifiers byte-for-byte without legacy trimming', async () => {
+    const rawPermission = {
+      id: 'per_1 ', sessionID: 'ses_1 ', permission: 'bash ',
+      patterns: ['ls'], metadata: {}, always: [],
+    }
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => ({
+          getHostedApprovalCapability: async () => ({
+            schemaVersion: 2,
+            protocol: 'agent-teams-hosted-approval-v2',
+            authentication: 'opencode-basic',
+            runtimeInstanceId: `runtime_instance_${'1'.repeat(32)}`,
+            configGeneration: `config_generation_${'2'.repeat(32)}`,
+          }),
+          observeHostedApprovalPermissions: async () => ({
+            schemaVersion: 2,
+            protocol: 'agent-teams-hosted-approval-v2',
+            runtimeInstanceId: `runtime_instance_${'1'.repeat(32)}`,
+            configGeneration: `config_generation_${'2'.repeat(32)}`,
+            sessionId: rawPermission.sessionID,
+            permissions: [{
+              requestId: rawPermission.id,
+              sessionId: rawPermission.sessionID,
+              requestIncarnation: `request_incarnation_${'3'.repeat(32)}`,
+              permissionDigest: canonicalHostedApprovalDigest(rawPermission),
+              rawPermission,
+            }],
+          }),
+        } as never),
+      },
+    })
+    const observed = await bridge.observeHostedApprovalPermissions(buildRecord({
+      toolApprovalMode: 'manual', opencodeSessionId: rawPermission.sessionID,
+    }))
+    expect(observed).toMatchObject([{
+      normalized: {
+        requestId: rawPermission.id,
+        sessionId: rawPermission.sessionID,
+        tool: rawPermission.permission,
+      },
+    }])
+  })
+
+  test('performs zero raw permission reads for a missing or malformed capability', async () => {
+    for (const capability of [undefined, async () => ({ schemaVersion: 2, protocol: 'wrong', configGeneration: `config_generation_${'2'.repeat(32)}` })]) {
+      let rawReads = 0
+      const bridge = new OpenCodeSessionBridge({
+        prepareProfile: async () => profile,
+        hostManager: {
+          ensureHost: async () => ({ ...host, processStartedAtMs: 1000 }),
+          releaseHost: async () => {},
+        },
+        clientFactory: { create: () => ({
+          ...(capability ? { getHostedApprovalCapability: capability } : {}),
+          observeHostedApprovalPermissions: async () => { rawReads += 1; return [] },
+        } as never) },
+      })
+      await expect(bridge.observeHostedApprovalPermissions(buildRecord({ toolApprovalMode: 'manual' })))
+        .rejects.toThrow('capability unavailable')
+      expect(rawReads).toBe(0)
+    }
+  })
+
+  test('authorizes the OpenCode artifact before creating an observation or reply client', async () => {
+    let clients = 0
+    const artifactDigest = `sha256:${'d'.repeat(64)}` as const
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
+      hostManager: {
+        ensureHost: async () => ({ ...host, openCodeArtifactDigest: artifactDigest }),
+        releaseHost: async () => {},
+      },
+      clientFactory: {
+        create: () => {
+          clients += 1
+          return {} as never
+        },
+      },
+    })
+    const record = buildRecord({ openCodeArtifactDigest: artifactDigest })
+    const rejectArtifact = async () => false
+
+    await expect(bridge.observeHostedApprovalPermissions(record, rejectArtifact))
+      .rejects.toBeInstanceOf(OpenCodePermissionEffectNotAuthorizedError)
+    await expect(bridge.answerPermission(record, {
+      requestId: 'permission_1',
+      decision: 'allow',
+      authorizeObservation: rejectArtifact,
+    })).rejects.toBeInstanceOf(OpenCodePermissionEffectNotAuthorizedError)
+    expect(clients).toBe(0)
+  })
+
+  test('preserves provider success when host cleanup fails after POST', async () => {
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => { throw new Error('cleanup failed') },
+      },
+      clientFactory: {
+        create: () => ({
+          answerPermission: async () => ({ ok: true }),
+        } as never),
+      },
+    })
+    await expect(bridge.answerPermission(buildRecord(), {
+      requestId: 'permission_1', decision: 'allow',
+    })).resolves.toEqual({ ok: true })
+  })
+
+  test('consumes exact session host and authority tokens synchronously before POST', async () => {
+    const order: string[] = []
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => {},
+        prepareEffectHostToken: async () => ({ consume: () => { order.push('host-token'); return true } }),
+      },
+      preparePermissionProfileToken: async () => ({
+        consume: () => { order.push('auth-token'); return true },
+      }),
+      clientFactory: {
+        create: () => ({
+          getPermissions: async () => [{ requestID: 'permission_1', sessionID: 'session-1' }],
+          answerPermission: async () => { order.push('post') },
+        } as never),
+      },
+    })
+    await bridge.answerPermission(buildRecord({ toolApprovalMode: 'manual' }), {
+      requestId: 'permission_1', decision: 'allow',
+      expectedPermissionRaw: { requestID: 'permission_1', sessionID: 'session-1' },
+      validatePreparedEffect: async () => ({ consume: () => { order.push('session-token'); return true } }),
+      authorizeEffect: async () => ({ consume: () => { order.push('owner-token'); return false } }),
+    }).catch(error => expect(error).toBeInstanceOf(OpenCodePermissionEffectNotAuthorizedError))
+    expect(order).toEqual(['session-token', 'auth-token', 'owner-token', 'host-token'])
+  })
+
+  test('performs zero POSTs when live auth bytes rotate during final host proof', async () => {
+    const tempDir = await realpath(await mkdtemp(path.join(os.tmpdir(), 'opencode-approval-auth-')))
+    try {
+      const sourcePath = path.join(tempDir, 'source-auth.json')
+      const managedPath = path.join(tempDir, 'managed-auth.json')
+      const sourceBytes = '{"openai":{"type":"api","key":"source-v1"}}'
+      const managedBytes = '{"openai":{"type":"api","key":"managed-v1"}}'
+      await writeFile(sourcePath, sourceBytes, { mode: 0o600 })
+      await writeFile(managedPath, managedBytes, { mode: 0o600 })
+      const sourceHash = createHash('sha256').update(sourceBytes).digest('hex')
+      const managedHash = createHash('sha256').update(managedBytes).digest('hex')
+      const liveProfile: OpenCodePreparedProfile = {
+        ...profile,
+        sourceAuthPath: sourcePath,
+        sourceAuthSources: [{ path: sourcePath, fingerprint: sourceHash }],
+        sourceAuthFingerprint: createHash('sha256')
+          .update(`${sourcePath}:${sourceHash}`)
+          .digest('hex'),
+        managedAuthPath: managedPath,
+        managedAuthFingerprint: managedHash,
+      }
+      let posts = 0
+      let hostProofs = 0
+      const bridge = new OpenCodeSessionBridge({
+        prepareProfile: async () => liveProfile,
+        hostManager: {
+          ensureHost: async () => ({ ...host, profile: liveProfile, processStartedAtMs: 1000 }),
+          releaseHost: async () => {},
+          prepareEffectHostToken: async () => {
+            hostProofs += 1
+            await writeFile(managedPath, '{"openai":{"type":"api","key":"managed-v2"}}')
+            return { consume: () => true }
+          },
+        },
+        clientFactory: { create: () => ({
+          getPermissions: async () => [{ requestID: 'permission_1', sessionID: 'session-1' }],
+          answerPermission: async () => { posts += 1 },
+        } as never) },
+      })
+      await expect(bridge.answerPermission(buildRecord({ toolApprovalMode: 'manual' }), {
+        requestId: 'permission_1', decision: 'allow',
+        expectedPermissionRaw: { requestID: 'permission_1', sessionID: 'session-1' },
+      })).rejects.toBeInstanceOf(OpenCodePermissionEffectNotAuthorizedError)
+      expect(hostProofs).toBe(1)
+      expect(posts).toBe(0)
+    } finally {
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('pins absent auth sources and rejects their creation before consumption', async () => {
+    const tempDir = await realpath(await mkdtemp(path.join(os.tmpdir(), 'opencode-approval-auth-missing-')))
+    try {
+      const sourcePath = path.join(tempDir, 'missing-source.json')
+      const managedPath = path.join(tempDir, 'missing-managed.json')
+      const token = await prepareOpenCodePermissionProfileToken({
+        ...profile,
+        sourceAuthPath: null,
+        sourceAuthSources: [{ path: sourcePath, fingerprint: null }],
+        sourceAuthFingerprint: null,
+        managedAuthPath: managedPath,
+        managedAuthFingerprint: null,
+      })
+      expect(token).not.toBeNull()
+      await writeFile(sourcePath, '{}', { mode: 0o600 })
+      expect(token!.consume()).toBe(false)
+    } finally {
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('rejects raw request-id reuse and classifies failures by POST invocation phase', async () => {
+    const raw = { requestID: 'permission_1', sessionID: 'session-1', metadata: { scope: 'old' } }
+    const make = (phase: 'host' | 'permission' | 'admission' | 'post') => {
+      let posts = 0
+      const bridge = new OpenCodeSessionBridge({
+        prepareProfile: async () => profile,
+        hostManager: {
+          ensureHost: async () => ({ ...host, processStartedAtMs: 1000 }),
+          prepareEffectHostToken: async () => phase === 'host' ? null : { consume: () => true },
+          releaseHost: async () => {}, retainHostLease: async () => {},
+        },
+        preparePermissionProfileToken: async () => ({ consume: () => true }),
+        clientFactory: { create: () => ({
+          getPermissions: async () => {
+            if (phase === 'permission') throw new Error('permission unavailable')
+            return [{ requestID: 'permission_1', sessionID: 'session-1', metadata: { scope: 'replacement' } }]
+          },
+          answerPermission: async () => { posts += 1; throw new Error('socket closed') },
+        } as never) },
+      })
+      return { bridge, posts: () => posts }
+    }
+    const hostFailure = make('host')
+    await expect(hostFailure.bridge.answerPermission(buildRecord(), {
+      requestId: 'permission_1', decision: 'allow', expectedPermissionRaw: raw,
+    })).rejects.toBeInstanceOf(OpenCodePermissionEffectNotAuthorizedError)
+    expect(hostFailure.posts()).toBe(0)
+
+    const probeFailure = make('permission')
+    await expect(probeFailure.bridge.answerPermission(buildRecord(), {
+      requestId: 'permission_1', decision: 'allow', expectedPermissionRaw: raw,
+    })).rejects.toBeInstanceOf(OpenCodePermissionEffectUnavailableError)
+    expect(probeFailure.posts()).toBe(0)
+
+    const rawReuse = make('admission')
+    await expect(rawReuse.bridge.answerPermission(buildRecord(), {
+      requestId: 'permission_1', decision: 'allow', expectedPermissionRaw: raw,
+      authorizeEffect: async () => false,
+    })).rejects.toBeInstanceOf(OpenCodePermissionEffectNotAuthorizedError)
+    expect(rawReuse.posts()).toBe(0)
+
+    const post = make('post')
+    await expect(post.bridge.answerPermission(buildRecord(), {
+      requestId: 'permission_1', decision: 'allow',
+    })).rejects.toBeInstanceOf(OpenCodePermissionPostInvocationError)
+    expect(post.posts()).toBe(1)
   })
 
   test('rejects scoped prepared-profile reuse without sealed session authority', async () => {
@@ -450,6 +921,7 @@ describe('OpenCodeSessionBridge', () => {
 
   test('persists manual tool approval mode in fresh session records', async () => {
     const upserts: OpenCodeSessionRecord[] = []
+    const admittedArtifactDigest = `sha256:${'d'.repeat(64)}` as const
     const bridge = new OpenCodeSessionBridge({
       prepareProfile: async () => profile,
       sessionStore: {
@@ -463,7 +935,7 @@ describe('OpenCodeSessionBridge', () => {
       hostManager: {
         ensureHost: async input => {
           expect(input?.preparedProfile).toBe(profile)
-          return host
+          return { ...host, openCodeArtifactDigest: admittedArtifactDigest }
         },
         releaseHost: async () => {},
         retainHostLease: async () => {},
@@ -511,8 +983,10 @@ describe('OpenCodeSessionBridge', () => {
     })
 
     expect(record.toolApprovalMode).toBe('manual')
+    expect(record.openCodeArtifactDigest).toBe(admittedArtifactDigest)
     expect(record.managedConfigFingerprint).toBe('managed-config-v1')
     expect(upserts[0]?.toolApprovalMode).toBe('manual')
+    expect(upserts[0]?.openCodeArtifactDigest).toBe(admittedArtifactDigest)
     expect(upserts[0]?.managedConfigFingerprint).toBe('managed-config-v1')
   })
 
@@ -793,6 +1267,7 @@ describe('OpenCodeSessionBridge', () => {
 
     expect(createSessionCalls).toBe(2)
     expect(record.opencodeSessionId).toBe('session-new')
+    expect(record.runId).toBe('run-1')
     expect(record.selectedVariant).toBe('max')
     expect(upserts).toHaveLength(1)
     expect(upserts[0]?.selectedVariant).toBe('max')
@@ -924,6 +1399,7 @@ describe('OpenCodeSessionBridge', () => {
       },
     })
     const digest = 'a'.repeat(64)
+    const artifactDigest = `sha256:${'b'.repeat(64)}` as const
 
     const materialized = await bridge.materializeSessionOnHost({
       teamId: 'team-a',
@@ -933,13 +1409,15 @@ describe('OpenCodeSessionBridge', () => {
       runId: 'run-1',
       expectedBehaviorFingerprint: digest,
       expectedBootstrapForSession: () => ({ messageID: 'msg_expected', contextHash: 'context', briefingHash: 'briefing', agent: 'teammate' }),
-      host,
+      host: { ...host, openCodeArtifactDigest: artifactDigest },
       signal: controller.signal,
       remainingMs: () => 1_000,
     })
 
     expect(materialized.record.expectedBehaviorFingerprint).toBe(digest)
     expect(persisted?.expectedBehaviorFingerprint).toBe(digest)
+    expect(materialized.record.openCodeArtifactDigest).toBe(artifactDigest)
+    expect(persisted?.openCodeArtifactDigest).toBe(artifactDigest)
     expect(materialized.record.runId).toBe('run-1')
     expect(persisted?.runId).toBe('run-1')
   })
@@ -1923,7 +2401,11 @@ describe('OpenCodeSessionBridge', () => {
       prepareProfile: async () => profile,
       hostManager: {
         ensureHost: async input => {
-          expect(input).toEqual({ projectPath: profile.projectPath, hostKey: 'host-key', preparedProfile: profile })
+          expect(input).toMatchObject({
+            projectPath: profile.projectPath,
+            hostKey: 'host-key',
+            preparedProfile: profile,
+          })
           return host
         },
         releaseHost: async () => {
@@ -2119,7 +2601,7 @@ describe('OpenCodeSessionBridge', () => {
   })
 
   test('rejects permission dispatch when the session is replaced during host acquisition', async () => {
-    const record = buildRecord()
+    const record = buildRecord({ runId: 'original-run' })
     let current = record
     let answers = 0
     const bridge = new OpenCodeSessionBridge({
@@ -2139,7 +2621,9 @@ describe('OpenCodeSessionBridge', () => {
     })
     await expect(bridge.answerPermission(record, {
       requestId: 'perm-1', decision: 'allow',
-    })).rejects.toThrow('no longer active')
+    })).rejects.toMatchObject({
+      cause: expect.objectContaining({ message: expect.stringContaining('no longer active') }),
+    })
     expect(answers).toBe(0)
   })
 
@@ -2266,7 +2750,10 @@ describe('OpenCodeSessionBridge', () => {
         markStale: async () => null,
       },
       hostManager: {
-        ensureHost: async () => host,
+        ensureHost: async input => {
+          if (input?.lease) retainedLeases.push(input.lease)
+          return host
+        },
         releaseHost: async () => {
           releaseHostCalls += 1
         },
@@ -2325,6 +2812,12 @@ describe('OpenCodeSessionBridge', () => {
         laneId: 'primary',
         memberName: 'alice',
         runId: 'run-1',
+      },
+      {
+        teamId: 'team-a',
+        laneId: 'primary',
+        memberName: 'alice',
+        runId: 'run-1',
         sessionId: 'session-new',
       },
     ])
@@ -2334,9 +2827,66 @@ describe('OpenCodeSessionBridge', () => {
         laneId: 'primary',
         memberName: 'alice',
         runId: 'run-1',
+      },
+      {
+        teamId: 'team-a',
+        laneId: 'primary',
+        memberName: 'alice',
+        runId: 'run-1',
         sessionId: 'session-new',
       },
     ])
+    expect(releaseHostCalls).toBe(1)
+  })
+
+  test('rolls back the promoted session lease when provisional lease release fails', async () => {
+    const releasedLeases: Array<{ sessionId?: string }> = []
+    let releaseHostCalls = 0
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
+      sessionStore: {
+        get: async () => null,
+        upsert: async () => 'updated',
+        markStale: async () => null,
+      },
+      hostManager: {
+        ensureHost: async () => host,
+        releaseHost: async () => { releaseHostCalls += 1 },
+        retainHostLease: async () => {},
+        releaseHostLease: async (_hostKey, input) => {
+          releasedLeases.push(input)
+          if (!input.sessionId) throw new Error('provisional lease release failed')
+        },
+      },
+      clientFactory: {
+        create: () => ({
+          getConfig: async () => { throw new Error('not used') },
+          getConfigProviders: async () => { throw new Error('not used') },
+          getProviders: async () => { throw new Error('not used') },
+          getProviderAuth: async () => { throw new Error('not used') },
+          listAgents: async () => { throw new Error('not used') },
+          getMcp: async () => { throw new Error('not used') },
+          createSession: async () => ({ id: 'session-promoted' }),
+          getSession: async () => ({ id: 'session-promoted' }),
+          getSessionStatus: async () => ({}),
+          getSessionMessages: async () => [],
+          getPermissions: async () => [],
+          sendSessionMessage: async () => ({ info: {}, parts: [] }),
+          promptSessionAsync: async () => {},
+          abortSession: async () => true,
+        }),
+      },
+    })
+
+    await expect(bridge.ensureSession({
+      teamId: 'team-a',
+      memberName: 'alice',
+      selectedModel: 'openai/gpt-5.4-mini',
+      projectPath: '/tmp/project',
+      runId: 'run-1',
+    })).rejects.toThrow('provisional lease release failed')
+
+    expect(releasedLeases.some(lease => lease.sessionId === 'session-promoted')).toBe(true)
     expect(releaseHostCalls).toBe(1)
   })
 
@@ -2849,12 +3399,43 @@ describe('OpenCodeSessionBridge', () => {
     ])
   })
 
+  test('checks hosted authority after prompt arming and before prompt transport', async () => {
+    let promptCalls = 0
+    const bridge = new OpenCodeSessionBridge({
+      prepareProfile: async () => profile,
+      hostManager: { ensureHost: async () => host, releaseHost: async () => {} },
+      clientFactory: { create: () => ({
+        getConfig: async () => { throw new Error('not used') },
+        getConfigProviders: async () => { throw new Error('not used') },
+        getProviders: async () => { throw new Error('not used') },
+        getProviderAuth: async () => { throw new Error('not used') },
+        listAgents: async () => { throw new Error('not used') },
+        getMcp: async () => { throw new Error('not used') },
+        createSession: async () => ({ id: 'session-new' }),
+        getSession: async () => ({ id: 'session-1' }),
+        getSessionStatus: async () => ({}),
+        getSessionMessages: async () => [],
+        getPermissions: async () => [],
+        sendSessionMessage: async () => ({ info: {}, parts: [] }),
+        promptSessionAsync: async () => { promptCalls++ },
+        abortSession: async () => true,
+      }) },
+    })
+    await expect(bridge.promptAsyncUntilAccepted(buildRecord(), {
+      text: 'Must remain unsubmitted',
+      onPromptSubmitting: async () => {},
+      beforePromptTransport: async () => { throw new Error('hosted owner revoked') },
+    })).rejects.toThrow('hosted owner revoked')
+    expect(promptCalls).toBe(0)
+  })
+
   test('allocates prompt_async message ids after latest canonical OpenCode message id', async () => {
     const latestAssistantMessageId = buildOpenCodeRuntimePromptMessageId({
       timestampMs: Date.now(),
       counter: 1,
       randomSuffix: 'AAAAAAAAAAAAAA',
     })
+    const lowerLegacyMessageId = `msg_${latestAssistantMessageId.slice(4, 16)}${'0'.repeat(20)}`
     const promptBodies: Array<Record<string, unknown>> = []
     const bridge = new OpenCodeSessionBridge({
       prepareProfile: async () => profile,
@@ -2891,7 +3472,7 @@ describe('OpenCodeSessionBridge', () => {
               parts: [],
             },
             {
-              info: { id: 'msg_0d008f4f44e4481a8e3b0bbe848d519c', role: 'user' },
+              info: { id: lowerLegacyMessageId, role: 'user' },
               parts: [],
             },
           ],

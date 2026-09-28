@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
-import { access, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
+import type { ChildProcess } from 'node:child_process'
+import { access, chmod, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
@@ -24,6 +25,7 @@ import {
   parseOpenCodeModelsVerboseOutput,
   parseOpenCodeProvidersOutput,
   supportsOpenCodeSuperGrokOAuth,
+  signalSpawnedOpenCodeChildBestEffort,
   withOpenCodeInventoryProbeTimeout,
 } from './OpenCodeInventoryService.js'
 
@@ -86,6 +88,16 @@ function inventorySnapshot(
 }
 
 describe('OpenCodeInventoryService parsers', () => {
+  test('labels spawned-child timeout signaling as best effort', () => {
+    let ownedSignals = 0
+    const owned = {
+      pid: 42,
+      kill: () => (++ownedSignals, true),
+    } as unknown as ChildProcess
+
+    expect(signalSpawnedOpenCodeChildBestEffort(owned, 'SIGKILL')).toBe(true)
+    expect(ownedSignals).toBe(1)
+  })
   test('requires an OpenCode version with native SuperGrok OAuth support', () => {
     expect(supportsOpenCodeSuperGrokOAuth('1.15.6')).toBe(false)
     expect(supportsOpenCodeSuperGrokOAuth('v1.15.7')).toBe(true)
@@ -402,6 +414,30 @@ describe('OpenCodeInventoryService parsers', () => {
       })
       expect(result.stderr).toBe('inventory warning')
     } finally {
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('hosted mode rejects an unpinned inventory binary before execution', async () => {
+    const tempDir = await mkdtemp(path.join(tmpdir(), 'opencode-hosted-inventory-'))
+    const binaryPath = path.join(tempDir, 'opencode')
+    const markerPath = path.join(tempDir, 'executed')
+    const previousMode = process.env.HOSTED_OPENCODE_RUNTIME_MODE
+    try {
+      await writeFile(binaryPath, `#!/bin/sh\ntouch '${markerPath}'\n`)
+      await chmod(binaryPath, 0o755)
+      process.env.HOSTED_OPENCODE_RUNTIME_MODE = 'official-v1.18.32'
+      const result = await execOpenCodePortableCommand({
+        binaryPath,
+        args: ['--version'],
+        profile: { projectPath: tempDir, env: process.env } as OpenCodePreparedProfile,
+      })
+      expect(result.code).toBe(1)
+      expect(result.error).toContain('Hosted official OpenCode')
+      await expect(access(markerPath)).rejects.toThrow()
+    } finally {
+      if (previousMode === undefined) delete process.env.HOSTED_OPENCODE_RUNTIME_MODE
+      else process.env.HOSTED_OPENCODE_RUNTIME_MODE = previousMode
       await rm(tempDir, { recursive: true, force: true })
     }
   })

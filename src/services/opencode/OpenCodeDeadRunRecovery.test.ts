@@ -65,11 +65,12 @@ async function seedRegisteredDeadHost(overrides: Record<string, unknown> = {}) {
   const before = JSON.stringify({ schemaVersion: 1, processIdentityFormat: 'platform-native-v2',
     hosts: { [lead.hostKey]: oldHost, 'foreign-host': foreignHost } })
   await writeFile(registryPath, before)
-  return { before, foreignHost }
+  return { before, foreignHost, oldHost }
 }
 
 describe('dead previous-run recovery', () => {
   test('recovers the stranded lead of a partially stopped three-member run and admits the new run', async () => {
+    lead = { ...lead, staleReason: null }
     await store.upsert(lead)
     const siblings = ['alice', 'bob'].map(memberName => ({
       ...lead, memberName, opencodeSessionId: `old-${memberName}-session`,
@@ -120,14 +121,51 @@ describe('dead previous-run recovery', () => {
 
   test('retires a registered dead host with three leases while preserving a foreign host', async () => {
     await store.upsert(lead)
-    const { foreignHost } = await seedRegisteredDeadHost()
+    const { foreignHost, oldHost } = await seedRegisteredDeadHost()
     const retired = await recover()
     expect(retired?.staleReason).toBe('runtime_process_gone')
     expect(retired?.stoppedAt).toEqual(expect.any(String))
     expect(retired?.stopAuthority).toBeUndefined()
     const registry = JSON.parse(await readFile(registryPath, 'utf8'))
     expect(registry.hosts).toEqual({ 'foreign-host': foreignHost })
+    expect(Object.values(registry.recoveryTrees)).toEqual([oldHost])
     expect((await store.claimMaterialization(lead, 'next-lead', 'new-run')).kind).toBe('claimed')
+  })
+
+  test('retires an exact degraded in-memory host only after its tombstone is durable', async () => {
+    await store.upsert(lead)
+    const { oldHost } = await seedRegisteredDeadHost()
+    const hosts = manager()
+    const internals = hosts as unknown as { hosts: Map<string, unknown> }
+    const entry = { handle: {
+      hostKey: lead.hostKey, pid: lead.runtimePid,
+      processStartedAtMs: oldHost.processStartedAtMs,
+      processTreeIdentity: null, attributionId: null,
+      state: 'degraded',
+    }, child: null, refCount: 0, ownedByProcess: true, lifetime: 'persistent' }
+    internals.hosts.set(lead.hostKey, entry)
+    expect(await recover(hosts)).not.toBeNull()
+    expect(internals.hosts.has(lead.hostKey)).toBe(false)
+    const registry = JSON.parse(await readFile(registryPath, 'utf8'))
+    expect(registry.hosts[lead.hostKey]).toBeUndefined()
+    expect(Object.values(registry.recoveryTrees)).toEqual([oldHost])
+  })
+
+  test('keeps an exact degraded in-memory host when OS absence is not proved', async () => {
+    await store.upsert(lead)
+    const { before, oldHost } = await seedRegisteredDeadHost()
+    const hosts = manager('alive')
+    const internals = hosts as unknown as { hosts: Map<string, unknown> }
+    const entry = { handle: {
+      hostKey: lead.hostKey, pid: lead.runtimePid,
+      processStartedAtMs: oldHost.processStartedAtMs,
+      processTreeIdentity: null, attributionId: null,
+      state: 'degraded',
+    }, child: null, refCount: 0, ownedByProcess: true, lifetime: 'persistent' }
+    internals.hosts.set(lead.hostKey, entry)
+    await expect(recover(hosts)).rejects.toThrow('old runtime process is alive or unverified')
+    expect(internals.hosts.get(lead.hostKey)).toBe(entry)
+    expect(await readFile(registryPath, 'utf8')).toBe(before)
   })
 
   test('rejects a registered host with a different PID despite gone evidence', async () => {
@@ -179,6 +217,7 @@ describe('dead previous-run recovery', () => {
     const after = JSON.parse(await readFile(registryPath, 'utf8'))
     expect(Object.hasOwn(after, 'processIdentityFormat')).toBe(false)
     expect(after.hosts).toEqual({ 'foreign-host': before.hosts['foreign-host'] })
+    expect(Object.values(after.recoveryTrees)).toEqual([before.hosts[lead.hostKey]])
   })
 
   test('preserves registered dead authority when the terminal operation throws', async () => {

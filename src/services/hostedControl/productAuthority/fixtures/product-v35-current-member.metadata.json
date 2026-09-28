@@ -1,0 +1,18 @@
+{
+  "now": 100,
+  "binding": {
+    "deploymentId": "deployment_44444444444444444444444444444444",
+    "bootId": "boot_55555555555555555555555555555555",
+    "ownerAuthority": "owner-authority_member-admission",
+    "ownerGeneration": 1,
+    "ownerSessionId": "owner-session_member-admission",
+    "restoreGeneration": 1,
+    "mountGeneration": 1
+  },
+  "runId": "run_81724117b5fe8cf8504818960723df70",
+  "memberId": "member_e2c34e24763c321934cc006c17775c2f",
+  "userId": "usr_88888888888888888888888888888888",
+  "sessionId": "session_99999999999999999999999999999999",
+  "runtimeWorkspaceId": "workspace_22222222222222222222222222222222",
+  "expectedName": "builder"
+}

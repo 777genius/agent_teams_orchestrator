@@ -649,7 +649,7 @@ function parseProcStartToken(token: string | null): number | null {
  */
 export async function pruneStaleAttributionRecords(
   directory: string,
-  options: AgentJudgementOptions = {},
+  options: AgentJudgementOptions & { retainHostAttributionIds?: ReadonlySet<string> } = {},
 ): Promise<PruneAttributionRecordsResult> {
   const judge = buildAgentJudge(options)
   const records = await readAttributionRecords(directory)
@@ -666,6 +666,7 @@ export async function pruneStaleAttributionRecords(
 
   const hostsWithLiveAgents = new Set<string>()
   for (const agent of records.agents) {
+    if (options.retainHostAttributionIds?.has(agent.record.attributionId)) continue
     if (await judgeAgentRecord(agent.record, judge) === 'live') {
       hostsWithLiveAgents.add(agent.record.attributionId)
       continue
@@ -675,6 +676,7 @@ export async function pruneStaleAttributionRecords(
   }
 
   for (const host of records.hosts) {
+    if (options.retainHostAttributionIds?.has(host.record.attributionId)) continue
     const liveness = judge.liveness(host.record.hostPid)
     let stale = liveness === 'dead'
       || (liveness === 'unknown' && judge.expired(Date.parse(host.record.updatedAt)))
