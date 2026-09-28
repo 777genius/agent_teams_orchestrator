@@ -3421,7 +3421,10 @@ export class OpenCodeProfileManager {
     const wantsCursorManagedAssets = options.profileScope
       ? canonicalizeOpenCodeProviderId(options.profileScope.providerId) === 'cursor-acp'
       : options.includeManagedSubscriptionPlugins !== false
+    // Generic inventory may run without Cursor installed. Only an explicitly
+    // selected Cursor scope may enter the strict managed path without its CLI.
     const cursorManagedAssets = wantsCursorManagedAssets
+      && (options.profileScope || await resolveCursorAgentExecutable(runtimeEnv))
       ? await resolveManagedCursorAssets(runtimeEnv)
       : null
     if (cursorManagedAssets) {
