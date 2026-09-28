@@ -1,6 +1,6 @@
 /** Full selected-authority conformance, no inference. Run ONLY in a clean network-none
  * Linux Docker container with this bundled script, Bun and the pinned binary mounted.
- * bun selected-authority.js /absolute/opencode 1.18.29 SHA256
+ * bun selected-authority.js /absolute/opencode 1.18.32 SHA256
  */
 import { spawn, type ChildProcess } from 'node:child_process'
 import { createHash } from 'node:crypto'
@@ -16,7 +16,7 @@ async function main() {
   await access('/.dockerenv')
   const [binaryArg, version, digest] = process.argv.slice(2)
   assert(binaryArg && path.isAbsolute(binaryArg), 'Absolute binary required')
-  assert(['1.18.4', '1.18.29'].includes(version ?? ''), 'Pinned supported version required')
+  assert(['1.18.4', '1.18.29', '1.18.32'].includes(version ?? ''), 'Pinned supported version required')
   assert(/^[a-f0-9]{64}$/i.test(digest ?? ''), 'Binary SHA256 required')
   const binary = await realpath(binaryArg)
   assert(createHash('sha256').update(await readFile(binary)).digest('hex') === digest!.toLowerCase(), 'Binary digest mismatch')

@@ -70,6 +70,25 @@ describe('selected launch authority contract', () => {
     expect(f.diagnostics).toEqual([])
   })
 
+  test('accepts only the observed OpenCode root permission and still enforces agent policy', async () => {
+    const f = fixture()
+    f.live.permission = { bash: 'ask' }
+    expect(await f.refresh()).not.toBeNull()
+    expect(f.diagnostics).toEqual([])
+    for (const permission of [
+      { bash: 'allow' }, { bash: 'deny' }, { bash: 'ask', read: 'allow' },
+      { '*': 'ask' }, { bash: { '*': 'ask' } }, [],
+    ]) {
+      const changed = fixture()
+      changed.live.permission = permission
+      expect(await changed.refresh()).toBeNull()
+      expect(changed.diagnostics).toContainEqual({ check: 'selected_config_match', fields: ['permission'] })
+    }
+    f.agents[0].permission.at(-1).action = 'deny'
+    expect(await f.refresh()).toBeNull()
+    expect(f.diagnostics).toContainEqual({ check: 'selected_config_match', fields: ['agent'] })
+  })
+
   test('rejects provider routes, opaque environment, configured model set and retained live env literals', async () => {
     for (const mutate of [
       (live: any) => { live.provider.custom.options.route = 'changed' },

@@ -175,6 +175,12 @@ export async function refreshSelectedProfileAuthority(input: {
       if (identity(liveMcp) !== identity(preparedMcp)) return reject({ check: 'mcp_config_match' })
       if (contractIdentity && identity(liveMcp) !== contractIdentity) return reject({ check: 'contract_config_match' })
       const liveSelected = selectedConfig(live)
+      // OpenCode 1.18.32 can expose this exact root permission on GET /config even
+      // when the prepared profile has no root policy. Agent policies are checked
+      // independently against the exact ordered effective rules below.
+      if (expectedSelected.permission === null && isDeepStrictEqual(liveSelected.permission, { bash: 'ask' })) {
+        liveSelected.permission = null
+      }
       const changed: OpenCodeSelectedConfigField[] = []
       try {
         if (!isDeepStrictEqual(expectedProvider, buildOpenCodeLaunchProviderContract(live, selected.providerId))) changed.push('provider')
