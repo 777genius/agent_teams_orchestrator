@@ -3,8 +3,9 @@ import { feature } from 'bun:bundle'
 // Define MACRO global for development (normally injected by bun build --define)
 if (typeof MACRO === 'undefined') {
   ;(globalThis as any).MACRO = {
-    // Match the build-time Fable 5.1 workaround: https://github.com/777genius/agent-teams-ai/issues/569
-    VERSION: '2.1.251-dev',
+    // Match the build's synthetic compatibility identity, not an upstream upgrade.
+    // https://github.com/777genius/agent-teams-ai/issues/569
+    VERSION: '2.777.777-dev',
     BUILD_TIME: new Date().toISOString(),
     PACKAGE_URL: 'claude-code-source-snapshot',
     FEEDBACK_CHANNEL: 'github',

@@ -41,7 +41,7 @@ env:
   DEFAULT_TARGET_RELEASE_REPO: 777genius/agent_teams_orchestrator_binaries
   # --version reports the Fable 5.1 compatibility workaround, not the 0.0.x release label.
   # Keep this aligned with scripts/build.ts: https://github.com/777genius/agent-teams-ai/issues/569
-  EXPECTED_CLAUDE_CODE_VERSION: '2.1.251'
+  EXPECTED_CLAUDE_CODE_VERSION: '2.777.777'
 
 jobs:
   prepare-release:
