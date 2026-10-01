@@ -2,6 +2,7 @@
 // No provider process, credential discovery, or network transport.
 import { afterEach, expect, test } from 'bun:test'
 import { Database } from 'bun:sqlite'
+import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
@@ -21,7 +22,70 @@ const c0 = { type: 'oauth', access: 'AUDIT-C0', refresh: 'AUDIT-single-use-C0', 
 const c1 = { ...c0, access: 'AUDIT-C1', refresh: 'AUDIT-single-use-C1', expires: 500 }
 const roots: string[] = []
 const manager = new OpenCodeProfileManager()
-afterEach(async () => { for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }) })
+
+// Keep OS-owned handles until close, including when Bun cancels a timed-out test.
+// Draining pipes through Node streams avoids awaiting Bun's Windows pipe readers.
+function startOwnedChild(script: string, args: string[], env: NodeJS.ProcessEnv, phase: string) {
+  const child = spawn(process.execPath, ['-e', script, ...args], {
+    env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true,
+  })
+  const state = { phase, stdout: '', stderr: '', stdoutEnded: false,
+    exited: false, code: null as number | null, signal: null as NodeJS.Signals | null,
+    error: null as Error | null, cleaning: false }
+  child.stdout.on('data', chunk => { state.stdout += chunk.toString() })
+  child.stdout.once('end', () => { state.stdoutEnded = true })
+  child.stderr.on('data', chunk => { state.stderr += chunk.toString() })
+  child.stdin.on('error', error => { if (!state.cleaning) state.error = error })
+  child.once('error', error => { state.error = error })
+  child.once('exit', (code, signal) => {
+    state.exited = true; state.code = code; state.signal = signal
+  })
+  const closed = new Promise<void>(resolve => {
+    child.once('close', () => { ownedChildren.delete(entry); resolve() })
+  })
+  const entry = { child, state, closed }
+  ownedChildren.add(entry)
+  return entry
+}
+const ownedChildren = new Set<ReturnType<typeof startOwnedChild>>()
+
+// Bun records timeout failure without cancelling the async test body. Once
+// afterEach has reaped its resources, park that interrupted continuation on an
+// inert promise so it cannot resume assertions or touch deleted sandbox roots.
+function stopInterruptedContinuation(): Promise<never> {
+  return new Promise(() => {})
+}
+
+async function reapOwnedChild(entry: ReturnType<typeof startOwnedChild>): Promise<void> {
+  entry.state.cleaning = true
+  const diagnostic = { phase: entry.state.phase, stdoutEnded: entry.state.stdoutEnded,
+    exited: entry.state.exited, code: entry.state.code, signal: entry.state.signal,
+    stdoutBytes: Buffer.byteLength(entry.state.stdout), stderrBytes: Buffer.byteLength(entry.state.stderr) }
+  // Only the tracked child handle is signalled, never a persisted registry PID.
+  if (!entry.state.exited) entry.child.kill('SIGKILL')
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    await Promise.race([entry.closed, new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`Owned fixture cleanup did not close: ${JSON.stringify(diagnostic)}`)), 2_500)
+    })])
+  } finally { clearTimeout(timer) }
+  console.error(`Owned recovery fixture reaped after test interruption: ${JSON.stringify({ ...diagnostic,
+    closeCode: entry.state.code, closeSignal: entry.state.signal })}`)
+}
+
+afterEach(async () => {
+  // A timeout must remain a failure; reaping only prevents cascading EBUSY and
+  // dangling-child failures in subsequent tests. Preserve roots if reaping fails.
+  const interrupted = [...ownedChildren]
+  await Promise.all(interrupted.map(reapOwnedChild))
+  if (interrupted.length) {
+    // Earlier setup IO may still settle after interruption. Keep its isolated
+    // roots, rather than race removal against an async body Bun did not cancel.
+    console.error(`Interrupted recovery fixture roots retained: ${JSON.stringify(roots.splice(0))}`)
+    return
+  }
+  for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true })
+})
 const read = (authPath: string) => readOpenCodeAuthCredential({ authPath, providerId: 'xai' })
 const exists = (file: string) => Bun.file(file).exists()
 
@@ -60,32 +124,37 @@ async function fixture(options: { session?: boolean, purpose?: 'launch_runtime' 
     projectPath: project, selectedModel: 'xai/grok-4.3', purpose, env,
   }) })
   // Real OS birth and ESRCH; this child is only a synthetic writer lifetime.
-  const child = Bun.spawn([process.execPath, '-e', 'await Bun.stdin.text()'], { env, stdin: 'pipe', stdout: 'ignore', stderr: 'pipe' })
+  const writer = startOwnedChild(`process.stdin.resume();
+    process.stdin.on('end', () => process.exit(0));
+    process.stdin.on('error', () => process.exit(1));`, [], env, 'synthetic writer EOF')
+  const { child } = writer
   let native: any
   try {
-    const birth = await readProcessStartTimeMs(child.pid)
+    const pid = child.pid
+    if (pid === undefined) throw new Error('Synthetic writer failed to spawn')
+    const birth = await readProcessStartTimeMs(pid)
     expect(birth).toBeGreaterThan(0)
     native = { projectPath: project, scopeToken: profile.scopeToken!, profileRootKey: profile.profileRootKey,
       hostKey: `audit-host::${profile.scopeToken}`, baseUrl: 'http://127.0.0.1:43210',
-      pid: child.pid, processStartedAtMs: birth!, sessionId: 'audit-session', messageId: 'audit-message', selectedModel: 'xai/grok-4.3' }
+      pid, processStartedAtMs: birth!, sessionId: 'audit-session', messageId: 'audit-message', selectedModel: 'xai/grok-4.3' }
     let sessionOwner: any
     if (options.session) {
       const now = new Date().toISOString()
       const record = { teamId: 'AUDIT', laneId: 'primary', memberName: 'owner', runId: 'audit-run',
         providerId: 'opencode' as const, selectedModel: native.selectedModel, projectPath: project,
         profileRootKey: profile.profileRootKey, hostKey: native.hostKey, profileScope: profile.profileScope,
-        runtimePid: child.pid, resolvedBehaviorFingerprint: 'audit-behavior', opencodeSessionId: native.sessionId,
+        runtimePid: pid, resolvedBehaviorFingerprint: 'audit-behavior', opencodeSessionId: native.sessionId,
         lastCanonicalCursor: null, lastKnownRawStatus: null, lastKnownDurableState: null,
         sourceAuthFingerprint: profile.sourceAuthFingerprint, managedAuthFingerprint: profile.managedAuthFingerprint,
         projectBehaviorFingerprint: profile.projectBehaviorFingerprint, managedConfigFingerprint: profile.managedConfigFingerprint,
         expectedBehaviorFingerprint: 'audit-proof', staleReason: null, createdAt: now, updatedAt: now }
-      sessionOwner = { record, baseUrl: native.baseUrl, pid: child.pid, processStartedAtMs: birth!,
+      sessionOwner = { record, baseUrl: native.baseUrl, pid, processStartedAtMs: birth!,
         messageId: native.messageId, noReply: false }
       await new OpenCodeSessionStore(path.join(path.dirname(global), 'session-store.json')).upsert(record)
       const leaseKey = 'AUDIT::primary::owner'
       await writeFile(path.join(path.dirname(global), 'host-registry.json'), JSON.stringify({
         schemaVersion: 1, processIdentityFormat: 'platform-native-v2', hosts: { [record.hostKey]: {
-          ...record, baseUrl: native.baseUrl, port: 43210, pid: child.pid, processStartedAtMs: birth,
+          ...record, baseUrl: native.baseUrl, port: 43210, pid, processStartedAtMs: birth,
           version: 'AUDIT', resolvedConfigFingerprint: profile.managedConfigFingerprint,
           leases: { [leaseKey]: { leaseKey, teamId: record.teamId, laneId: record.laneId,
             memberName: record.memberName, runId: record.runId, sessionId: native.sessionId,
@@ -118,7 +187,13 @@ async function fixture(options: { session?: boolean, purpose?: 'launch_runtime' 
         db.query('insert into message values (?, ?, ?, ?, ?)').run(info.id, native.sessionId, 1, null, JSON.stringify(info))
       }
     } finally { db.close() }
-  } finally { child.stdin.end(); expect(await child.exited).toBe(0) }
+  } finally {
+    child.stdin.end()
+    await writer.closed
+    if (writer.state.cleaning) await stopInterruptedContinuation()
+    expect(writer.state.error).toBeNull()
+    expect(writer.state.code).toBe(0)
+  }
   const receiptText = await readFile(receiptPath, 'utf8')
   const receipt = JSON.parse(receiptText)
   expect(receipt.successor).toBeNull()
@@ -147,10 +222,14 @@ async function fresh(f: Fixture, env = f.env, purpose = f.purpose, project = f.p
     try { const scope = await resolveOpenCodeProfileScope({ projectPath: process.argv[1], selectedModel: 'xai/grok-4.3', purpose: process.argv[2] });
       process.stdout.write(JSON.stringify({ ok: true, scope }));
     } catch (e) { process.stdout.write(JSON.stringify({ ok: false, error: e.message })); }`
-  const child = Bun.spawn([process.execPath, '-e', script, project, purpose], { env, stdout: 'pipe', stderr: 'pipe' })
-  const [out, err, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited])
-  expect(err).toBe(''); expect(code).toBe(0)
-  return JSON.parse(out)
+  const entry = startOwnedChild(script, [project, purpose], env, 'fresh recovery natural exit')
+  entry.child.stdin.end()
+  await entry.closed
+  if (entry.state.cleaning) await stopInterruptedContinuation()
+  // Fresh recovery must exit naturally, including closing its imported handles.
+  expect(entry.state.error).toBeNull()
+  expect(entry.state.stderr).toBe(''); expect(entry.state.code).toBe(0)
+  return JSON.parse(entry.state.stdout)
 }
 const current = (f: Fixture, env = f.env) => isOpenCodeOAuthPublicationScopeCurrent(f.receipt.owner, c0, env)
 const saved = (f: Fixture, env = f.env) => readOpenCodeSavedAuthStore({ globalAuthPath: f.global, sourceAuthPaths: f.receipt.sourceAuthPaths, env })
