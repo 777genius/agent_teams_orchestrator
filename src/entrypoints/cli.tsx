@@ -1,10 +1,13 @@
 import { feature } from 'bun:bundle'
+import { getClientVersion } from '../utils/clientVersion.js'
 
 // Define MACRO global for development (normally injected by bun build --define)
 if (typeof MACRO === 'undefined') {
   ;(globalThis as any).MACRO = {
-    // Match the build-time Fable 5.1 workaround: https://github.com/777genius/agent-teams-ai/issues/569
     VERSION: '2.1.251-dev',
+    // Match the build's synthetic client identity, independent of the snapshot.
+    // https://github.com/777genius/agent-teams-ai/issues/569
+    CLIENT_VERSION: '2.777.777-dev',
     BUILD_TIME: new Date().toISOString(),
     PACKAGE_URL: 'claude-code-source-snapshot',
     FEEDBACK_CHANNEL: 'github',
@@ -214,11 +217,11 @@ async function runRuntimeProvidersFastPath(args: string[]): Promise<boolean> {
 async function main(): Promise<void> {
   const args = process.argv.slice(2)
 
-  // Fast-path for --version/-v: zero module loading needed
+  // Fast-path for --version/-v: no startup modules needed
   if (args.length === 1 && (args[0] === '--version' || args[0] === '-v' || args[0] === '-V')) {
-    // MACRO.VERSION is inlined at build time
+    // Client identity is inlined at build time; avoid the full startup path.
     // biome-ignore lint/suspicious/noConsole:: intentional console output
-    console.log(`${MACRO.VERSION} (Claude Code)`)
+    console.log(`${getClientVersion()} (Claude Code)`)
     return
   }
 

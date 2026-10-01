@@ -145,10 +145,15 @@ const outfile = compile
 const bundleOutdir = dev ? './dist/local-cli-dev' : './dist/local-cli'
 const bundleEntrypoint = `${bundleOutdir}/cli.js`
 const buildTime = new Date().toISOString()
-// Compatibility workaround: Anthropic rejects Fable 5.1 when MACRO.VERSION is
-// our 0.0.x package version. Report 2.1.251 globally; this is not an upstream upgrade.
-// https://github.com/777genius/agent-teams-ai/issues/569
+// Internal snapshot version controls updater ordering and upstream feature gates.
 const version = dev ? getDevVersion('2.1.251') : '2.1.251'
+
+// Anthropic gates model access on the reported Claude Code client version.
+// This synthetic identity gives minimum-version checks headroom; it does not
+// upgrade the upstream snapshot or guarantee support for future model features.
+// The actual runtime package version remains separate in MACRO.RUNTIME_VERSION.
+// https://github.com/777genius/agent-teams-ai/issues/569
+const clientVersion = dev ? getDevVersion('2.777.777') : '2.777.777'
 
 const outfileDir = dirname(outfile)
 if (outfileDir !== '.') {
@@ -206,8 +211,8 @@ const defines = {
   'process.env.CLAUDE_CODE_VERIFY_PLAN': JSON.stringify('false'),
   'process.env.CCR_FORCE_BUNDLE': JSON.stringify('true'),
   'MACRO.VERSION': JSON.stringify(version),
-  // The runtime's own package version. MACRO.VERSION above is the Claude Code
-  // compatibility version and says nothing about which runtime build is running.
+  'MACRO.CLIENT_VERSION': JSON.stringify(clientVersion),
+  // The runtime's own package version is independent of both upstream versions.
   'MACRO.RUNTIME_VERSION': JSON.stringify(pkg.version),
   'MACRO.BUILD_TIME': JSON.stringify(buildTime),
   'MACRO.PACKAGE_URL': JSON.stringify(pkg.name),

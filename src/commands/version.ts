@@ -1,11 +1,12 @@
 import type { Command, LocalCommandCall } from '../types/command.js'
+import { getClientVersion } from '../utils/clientVersion.js'
 
 const call: LocalCommandCall = async () => {
   return {
     type: 'text',
     value: MACRO.BUILD_TIME
-      ? `${MACRO.VERSION} (built ${MACRO.BUILD_TIME})`
-      : MACRO.VERSION,
+      ? `${getClientVersion()} (built ${MACRO.BUILD_TIME})`
+      : getClientVersion(),
   }
 }
 

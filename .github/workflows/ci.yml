@@ -130,6 +130,9 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      - name: Test client identity and headless runtime
+        run: bun test src/utils/clientVersion.test.ts src/utils/renderOptions.test.ts src/utils/headlessInputPrompt.test.ts
+
       - name: Test task change ledger
         run: bun run test:task-change-ledger
 

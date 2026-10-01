@@ -1,5 +1,6 @@
 declare const MACRO: {
   VERSION: string
+  CLIENT_VERSION?: string
   RUNTIME_VERSION?: string
   BUILD_TIME: string
   PACKAGE_URL?: string
