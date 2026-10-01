@@ -8,6 +8,7 @@ import {
   type AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
   logEvent,
 } from 'src/services/analytics/index.js'
+import { getClientVersion } from './clientVersion.js'
 import { type ReleaseChannel, saveGlobalConfig } from './config.js'
 import { logForDebugging } from './debug.js'
 import { env } from './env.js'
@@ -77,13 +78,14 @@ export async function assertMinVersion(): Promise<void> {
       minVersion: string
     }>('tengu_version_config', { minVersion: '0.0.0' })
 
+    const clientVersion = getClientVersion()
     if (
       versionConfig.minVersion &&
-      lt(MACRO.VERSION, versionConfig.minVersion)
+      lt(clientVersion, versionConfig.minVersion)
     ) {
       // biome-ignore lint/suspicious/noConsole:: intentional console output
       console.error(`
-It looks like your version of Claude Code (${MACRO.VERSION}) needs an update.
+It looks like your version of Claude Code (${clientVersion}) needs an update.
 A newer version (${versionConfig.minVersion} or higher) is required to continue.
 
 To update, please run:

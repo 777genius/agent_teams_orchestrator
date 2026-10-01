@@ -1,4 +1,5 @@
 import { createHash } from 'crypto'
+import { getClientVersion } from './clientVersion.js'
 import type { AssistantMessage, UserMessage } from '../types/message.js'
 
 /**
@@ -44,7 +45,7 @@ export function extractFirstMessageText(
  * 1P and 3P (Bedrock, Vertex, Azure) APIs.
  *
  * @param messageText - First user message text content
- * @param version - Version string (from MACRO.VERSION)
+ * @param version - Anthropic client identity version
  * @returns 3-character hex fingerprint
  */
 export function computeFingerprint(
@@ -72,5 +73,5 @@ export function computeFingerprintFromMessages(
   messages: (UserMessage | AssistantMessage)[],
 ): string {
   const firstMessageText = extractFirstMessageText(messages)
-  return computeFingerprint(firstMessageText, MACRO.VERSION)
+  return computeFingerprint(firstMessageText, getClientVersion())
 }
