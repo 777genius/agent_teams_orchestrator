@@ -1912,7 +1912,6 @@ describe('OpenCodeHostManager', () => {
   test('force-kills a healthy spawned host when persistent registry write fails', async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-host-registry-'))
     const registryPath = path.join(tempDir, 'host-registry.json')
-    await mkdir(registryPath)
     const spawned = createMockChildProcess(43135)
     const killedSignals: Array<{ pid: number; signal: NodeJS.Signals }> = []
 
@@ -1928,6 +1927,8 @@ describe('OpenCodeHostManager', () => {
           }
         }
         if (url.endsWith('/config')) {
+          // The failure occurs after spawn, so owned cleanup remains exercised.
+          await mkdir(registryPath)
           return {
             status: 200,
             data: { server: { port: 43135 }, default_agent: 'teammate' },

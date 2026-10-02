@@ -10,7 +10,9 @@ function fixture() {
   const workspace = path.resolve(os.tmpdir(), 'cursor-reap-fake-workspace')
   const id = 'a'.repeat(32)
   const host = { hostKey: 'host', attributionId: id, pid: 100, processStartedAtMs: 10,
-    projectPath: workspace, leases: {}, cursorAgentReapContractVersion: 1 }
+    projectPath: workspace, profileRootKey: 'profile', projectBehaviorFingerprint: 'TEST-behavior',
+    baseUrl: 'http://127.0.0.1:9911', port: 9911, version: null, resolvedConfigFingerprint: null,
+    updatedAt: '2026-10-01T00:00:00.000Z', leases: {}, cursorAgentReapContractVersion: 1 }
   const registry = { schemaVersion: 1, processIdentityFormat: 'platform-native-v2', hosts: { host } }
   const records: AttributionRecords = { corruptPaths: [], hosts: [{ filePath: 'fake-host', record: {
     schemaVersion: 1, attributionId: id, hostPid: 100, hostStartedAtNative: 10,
@@ -82,7 +84,8 @@ test('same-generation upsert preserves only previously supported markers', async
     // Exercise the same internal writer used by create and adoption without spawning.
     const writer = manager as unknown as { upsertPersistentHost: (handle: unknown, fresh?: boolean) => Promise<void> }
     const handle = { hostKey: 'host', pid: 100, processStartedAtMs: 10, attributionId: 'a'.repeat(32),
-      profile: {}, projectPath: directory }
+      profile: {}, projectPath: directory, profileRootKey: 'profile', projectBehaviorFingerprint: 'TEST-behavior',
+      baseUrl: 'http://127.0.0.1:9911', port: 9911, version: null, resolvedConfigFingerprint: null }
     await writer.upsertPersistentHost(handle, true)
     await writer.upsertPersistentHost(handle)
     let raw = JSON.parse(await readFile(registryPath, 'utf8'))
