@@ -1,0 +1,51 @@
+name: OpenCode generation spike contracts
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/opencode-generation-contract-spike.ts'
+      - 'scripts/opencode-generation-spikes/**'
+      - 'test/fixtures/opencode-generation-native/**'
+      - '.github/workflows/opencode-generation-spike-contracts.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/opencode-generation-contract-spike.ts'
+      - 'scripts/opencode-generation-spikes/**'
+      - 'test/fixtures/opencode-generation-native/**'
+      - '.github/workflows/opencode-generation-spike-contracts.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  contracts:
+    name: OpenCode generation spike contracts (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+      - name: Prepare isolated test roots
+        shell: bash
+        run: |
+          test_root="$RUNNER_TEMP/TEST-opencode-generation-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -p "$test_root"/{home,config,state,cache,data,tmp,appdata,localappdata} .task-output/unit-roots
+          printf 'TEST_ROOT=%s\n' "$test_root" >> "$GITHUB_ENV"
+      - name: Verify decoder and cleanup contracts without native or model services
+        run: bun test scripts/opencode-generation-spikes/contracts.test.ts scripts/opencode-generation-spikes/recipe.test.ts
+        env:
+          HOME: ${{ env.TEST_ROOT }}/home
+          USERPROFILE: ${{ env.TEST_ROOT }}/home
+          XDG_CONFIG_HOME: ${{ env.TEST_ROOT }}/config
+          XDG_STATE_HOME: ${{ env.TEST_ROOT }}/state
+          XDG_CACHE_HOME: ${{ env.TEST_ROOT }}/cache
+          XDG_DATA_HOME: ${{ env.TEST_ROOT }}/data
+          TMPDIR: ${{ env.TEST_ROOT }}/tmp
+          APPDATA: ${{ env.TEST_ROOT }}/appdata
+          LOCALAPPDATA: ${{ env.TEST_ROOT }}/localappdata
+          Q0_TEST_TMP: ${{ github.workspace }}/.task-output/unit-roots

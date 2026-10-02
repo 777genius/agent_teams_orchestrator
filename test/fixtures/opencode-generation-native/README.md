@@ -1,0 +1,1 @@
+These dummy-only localhost/sandbox responses are immutable decoder regression fixtures copied byte-for-byte from measured Linux native runs. They are test inputs, not qualification evidence. Historical protocol status remains MISSING. Tests author fresh sandbox joins and mutations; no model service or OpenCode process is started by this fixture suite.

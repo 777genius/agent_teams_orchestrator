@@ -1,0 +1,17 @@
+{
+  "args": [
+    "/srv/workers/evidence/agent-teams-ai/opencode-dual-20261001/TEST-root-native-qualification-1790929300494998579/TEST-v2-2.0.21/artifacts/native-opencode",
+    "serve",
+    "--help"
+  ],
+  "pid": 484684,
+  "birth": {
+    "format": "linux-start-ticks",
+    "value": "101630313",
+    "bootId": "f12bc43a-9252-42d4-919d-85b846a176a8"
+  },
+  "stdout": "DESCRIPTION\n  Start the v2 API and web server\n\nUSAGE\n  opencode serve [flags]\n\nFLAGS\n  --hostname string    \n  --port integer       \n  --cors string        Additional allowed CORS origin (repeat for multiple origins)\n  --service            \n  --stdio              \n\nGLOBAL FLAGS\n  --help, -h                                                          Show help information\n  --version, -v                                                       Show version information\n  --wizard                                                            Start wizard mode for a command\n  --completions <bash|zsh|fish|sh>                                    Print shell completion script (choices: bash, zsh, fish, sh)\n  --log-level <all|trace|debug|info|warn|warning|error|fatal|none>    Sets the minimum log level (choices: all, trace, debug, info, warn, warning, error, fatal, none)\n  --print-logs                                                        Print logs to stderr (server logs require --standalone)\n",
+  "stderr": "",
+  "code": 0,
+  "expired": false
+}

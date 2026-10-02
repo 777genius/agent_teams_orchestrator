@@ -1,0 +1,16 @@
+{
+  "args": [
+    "/srv/workers/evidence/agent-teams-ai/opencode-dual-20261001/TEST-root-native-qualification-1790928391277242590/TEST-v1-1.18.34/artifacts/native-opencode",
+    "--version"
+  ],
+  "pid": 3773166,
+  "birth": {
+    "format": "linux-start-ticks",
+    "value": "101539117",
+    "bootId": "f12bc43a-9252-42d4-919d-85b846a176a8"
+  },
+  "stdout": "1.18.34\n",
+  "stderr": "",
+  "code": 0,
+  "expired": false
+}

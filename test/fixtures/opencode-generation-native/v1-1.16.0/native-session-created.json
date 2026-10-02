@@ -1,0 +1,23 @@
+{
+  "id": "ses_f04592209ffejRETVRWEyzXwl0",
+  "slug": "cosmic-island",
+  "projectID": "global",
+  "directory": "/srv/workers/evidence/agent-teams-ai/opencode-dual-20261001/TEST-root-native-qualification-1790928391277242590/TEST-v1-1.16.0",
+  "path": "",
+  "cost": 0,
+  "tokens": {
+    "input": 0,
+    "output": 0,
+    "reasoning": 0,
+    "cache": {
+      "read": 0,
+      "write": 0
+    }
+  },
+  "title": "TEST q0 protocol",
+  "version": "1.16.0",
+  "time": {
+    "created": 1790928412150,
+    "updated": 1790928412150
+  }
+}

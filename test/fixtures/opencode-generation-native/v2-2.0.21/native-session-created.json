@@ -1,0 +1,30 @@
+{
+  "data": {
+    "id": "ses_f044b5be7ffe1WHm9YhCS7bQdX",
+    "projectID": "global",
+    "agent": "build",
+    "model": {
+      "id": "q0-catalog",
+      "providerID": "test-model",
+      "variant": "default"
+    },
+    "cost": 0,
+    "tokens": {
+      "input": 0,
+      "output": 0,
+      "reasoning": 0,
+      "cache": {
+        "read": 0,
+        "write": 0
+      }
+    },
+    "time": {
+      "created": 1790929314860,
+      "updated": 1790929314860
+    },
+    "title": "TEST q0 protocol",
+    "location": {
+      "directory": "/srv/workers/evidence/agent-teams-ai/opencode-dual-20261001/TEST-root-native-qualification-1790929300494998579/TEST-v2-2.0.21"
+    }
+  }
+}
