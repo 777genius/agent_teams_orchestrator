@@ -42,7 +42,9 @@ test('fixture is readable and reconstructs one strictly attributed write through
       const { OpenCodeOfflineSessionReader } = await import(${JSON.stringify(reader)});
       const { OpenCodeToolpartChangeReconstructor } = await import(${JSON.stringify(reconstructor)});
       const fixture = JSON.parse(readFileSync(${JSON.stringify(path.join(root, 'fixture.json'))}, 'utf8'));
-      const record = JSON.parse(readFileSync(${JSON.stringify(path.join(env.CLAUDE_MULTIMODEL_DATA_HOME, 'opencode/session-store.json'))}, 'utf8')).records.fixture;
+      const { OpenCodeSessionStore } = await import(${JSON.stringify(path.join(repository, 'src/services/opencode/OpenCodeSessionStore.ts'))});
+      const record = await new OpenCodeSessionStore(${JSON.stringify(path.join(env.CLAUDE_MULTIMODEL_DATA_HOME, 'opencode/session-store.json'))}).get(fixture.body.teamName, 'secondary:opencode:bob', 'bob');
+      assert.ok(record, 'Fixture must resolve through the production session store');
       const offline = await new OpenCodeOfflineSessionReader().readSession(record);
       assert.equal(offline.historyShape, 'supported');
       assert.equal(offline.rawMessages.length, 2);
