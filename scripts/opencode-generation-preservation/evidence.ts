@@ -9,6 +9,7 @@ export function assess(reader: Reader, variant: Variant, operation: string, obse
   if (changed) return { status: 'FAIL', reason: 'Unknown original bytes overwritten or removed on TEST copy' }
   if (added.some(file => file.endsWith('.quarantine'))) return { status: 'FAIL', reason: 'Preserve-only forbids quarantine of unknown authority' }
   const value = observed.result
+  if (observed.returned && operation === 'resolveOwnedSessionEndpoint' && value?.baseUrl) return { status: 'FAIL', reason: 'Unknown/partial containing host authority accepted endpoint without uncertainty veto; original bytes retained' }
   if (observed.returned && operation === 'query' && value?.record === null) return { status: 'FAIL', reason: 'Unknown authority returned null outcome (empty fallback)' }
   if (observed.returned && operation === 'query' && variant === 'partial') return { status: 'FAIL', reason: 'Partial containing authority filtered without uncertainty veto' }
   if (observed.returned && operation === 'list-get') return { status: 'FAIL', reason: value?.list?.length === 0 ? 'Unknown authority returned empty session list' : 'Partial ownership rows exposed without uncertainty veto' }
@@ -28,3 +29,11 @@ export const boundaryGaps = [
     reason: 'Reader-only API probe cannot qualify production lane reset or S5b native disk downgrade.',
     extraction: 'A2a: explicit future/read-error veto at evidence and VersionedJsonStore boundaries before launch/reset; S5b replays old readers against final namespaced stores.' },
 ]
+
+export function decodeObservation(receipt: { stdout: string; stderr: string; code: number | null }) {
+  let observation: any
+  try { observation = JSON.parse(receipt.stdout.trim().split('\n').at(-1)!) }
+  catch { observation = { qualification: 'MISSING', reason: 'Reader child did not emit valid observation', code: receipt.code, stderr: receipt.stderr } }
+  if (receipt.code !== 0) observation = { qualification: 'MISSING', reason: 'Reader process failed', processResult: receipt, priorObservation: observation }
+  return observation
+}

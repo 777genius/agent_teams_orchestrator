@@ -42,6 +42,7 @@ export async function command(executable: string, args: string[], cwd: string, e
   })
 }
 export async function testProject(parent: string, caseId: string, bun: string, forbidden: string[]) {
+  parent = path.resolve(parent)
   // Reject source parents before creating any TEST content, including symlink parents.
   let nearest = path.resolve(parent)
   while (true) {
@@ -79,4 +80,53 @@ export async function testProject(parent: string, caseId: string, bun: string, f
   }
   if (!(await lstat(path.join(project, '.git'))).isDirectory()) throw new Error('TEST Git root missing')
   return { project: canonical, nonce, marker, env }
+}
+
+const contains = (root: string, candidate: string) => {
+  const relative = path.relative(root, candidate)
+  return relative === '' || (relative !== '..' && !relative.startsWith('..' + path.sep) && !path.isAbsolute(relative))
+}
+export async function canonicalDestination(destination: string): Promise<string> {
+  const absolute = path.resolve(destination)
+  const suffix: string[] = []
+  let ancestor = absolute
+  while (true) {
+    try { return path.join(await realpath(ancestor), ...suffix) }
+    catch (error: any) {
+      if (error.code !== 'ENOENT' || path.dirname(ancestor) === ancestor) throw error
+      // A dangling symlink is a destination too, never a missing ancestor.
+      if (await lstat(ancestor).then(() => true, () => false)) throw new Error('Symlink destination')
+      suffix.unshift(path.basename(ancestor)); ancestor = path.dirname(ancestor)
+    }
+  }
+}
+export async function validateOutputRoots(evidence: string, projects: string, forbidden: string[]) {
+  const roots = await Promise.all([evidence, projects].map(canonicalDestination))
+  for (const source of forbidden) {
+    const canonical = await realpath(source)
+    for (const root of roots) if (contains(canonical, root) || contains(root, canonical)) throw new Error('Output overlaps source INPUT')
+  }
+  if (contains(roots[0]!, roots[1]!) || contains(roots[1]!, roots[0]!)) throw new Error('Evidence INPUT and TEST projects must be distinct')
+  // Evidence must be fresh and empty, not an unrelated directory or alias.
+  await assertNoSymlinks(evidence)
+  const existing = await lstat(evidence).catch((error: any) => { if (error.code !== 'ENOENT') throw error; return null })
+  if (existing && (!existing.isDirectory() || (await readdir(evidence)).length)) throw new Error('Evidence destination must be fresh and empty')
+}
+export async function assertNoSymlinks(destination: string) {
+  let current = path.resolve(destination)
+  while (true) {
+    const info = await lstat(current).catch((error: any) => { if (error.code !== 'ENOENT') throw error; return null })
+    if (info?.isSymbolicLink()) throw new Error('Symlink destination')
+    if (path.dirname(current) === current) return
+    current = path.dirname(current)
+  }
+}
+// All evidence writes reject link components and open the final file NOFOLLOW.
+export async function safeWrite(destination: string, data: string | Uint8Array) {
+  destination = path.resolve(destination)
+  await assertNoSymlinks(destination)
+  const { open } = await import('node:fs/promises')
+  const { constants } = await import('node:fs')
+  const handle = await open(destination, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW, 0o600)
+  try { await handle.writeFile(data) } finally { await handle.close() }
 }
