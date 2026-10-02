@@ -53,7 +53,7 @@ export async function testProject(parent: string, caseId: string, bun: string, f
   }
   for (const source of forbidden) {
     for (const candidate of [path.resolve(parent), nearest]) {
-      const relative = path.relative(await realpath(source), candidate)
+      const relative = path.relative(await canonicalDestination(source), candidate)
       if (relative === '' || (!relative.startsWith('..' + path.sep) && relative !== '..' && !path.isAbsolute(relative))) throw new Error('TEST parent inside source INPUT')
     }
   }
@@ -61,7 +61,7 @@ export async function testProject(parent: string, caseId: string, bun: string, f
   const project = await mkdtemp(path.join(parent, `TEST-S5a-${caseId}-`))
   const canonical = await realpath(project)
   for (const source of forbidden) {
-    const relative = path.relative(await realpath(source), canonical)
+    const relative = path.relative(await canonicalDestination(source), canonical)
     if (relative === '' || (!relative.startsWith('..' + path.sep) && relative !== '..' && !path.isAbsolute(relative))) throw new Error('TEST project inside source INPUT')
   }
   const nonce = randomUUID()
@@ -100,10 +100,35 @@ export async function canonicalDestination(destination: string): Promise<string>
     }
   }
 }
+export async function protectedSourceRoots(source: string): Promise<string[]> {
+  const roots = [source, ...['product', 'reference', 'owner'].map(name => path.join(source, '.task-inputs', name))]
+  const gitfile = path.join(source, '.git')
+  await assertNoSymlinks(gitfile)
+  const entry = await lstat(gitfile)
+  if (entry.isDirectory()) return [...new Set(await Promise.all(roots.map(canonicalDestination)))]
+  if (!entry.isFile()) throw new Error('Invalid linked Git metadata')
+  const metadata = await readFile(gitfile, 'utf8')
+  const match = /^gitdir: ([^\r\n\0]+)\r?\n?$/.exec(metadata)
+  if (!match) throw new Error('Invalid linked Git metadata')
+  const admin = path.resolve(source, match[1]!.trim())
+  await assertNoSymlinks(admin)
+  if (!(await lstat(admin)).isDirectory()) throw new Error('Invalid linked Git admin directory')
+  const commonfile = path.join(admin, 'commondir')
+  await assertNoSymlinks(commonfile)
+  if (!(await lstat(commonfile)).isFile()) throw new Error('Invalid linked Git commondir')
+  const commonText = await readFile(commonfile, 'utf8')
+  if (!/^[^\r\n\0]+(?:\r?\n)?$/.test(commonText) || !commonText.trim()) throw new Error('Invalid linked Git commondir')
+  const common = path.resolve(admin, commonText.trim())
+  await assertNoSymlinks(common)
+  if (!(await lstat(common)).isDirectory() || path.basename(common) !== '.git') throw new Error('Linked owner checkout cannot be resolved')
+  if (path.dirname(admin) !== path.join(common, 'worktrees')) throw new Error('Linked Git admin/common authority mismatch')
+  roots.push(path.dirname(common))
+  return [...new Set(await Promise.all(roots.map(canonicalDestination)))]
+}
 export async function validateOutputRoots(evidence: string, projects: string, forbidden: string[]) {
   const roots = await Promise.all([evidence, projects].map(canonicalDestination))
   for (const source of forbidden) {
-    const canonical = await realpath(source)
+    const canonical = await canonicalDestination(source)
     for (const root of roots) if (contains(canonical, root) || contains(root, canonical)) throw new Error('Output overlaps source INPUT')
   }
   if (contains(roots[0]!, roots[1]!) || contains(roots[1]!, roots[0]!)) throw new Error('Evidence INPUT and TEST projects must be distinct')

@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { fixture, operations, readers, variants, type Reader, type Variant } from './fixtures'
 import { assess, boundaryGaps, decodeObservation } from './evidence'
-import { command, sha256, snapshot, testProject, validateOutputRoots, safeWrite } from './isolation'
+import { command, sha256, snapshot, testProject, validateOutputRoots, safeWrite, protectedSourceRoots } from './isolation'
 
 export const ownerSource = path.resolve(fileURLToPath(new URL('../..', import.meta.url)))
 export const taskId = 'hosted-v1-opencode-dual-q0-preservation-20261001'
@@ -35,7 +35,8 @@ export async function runBaseline(options: Options) {
   options = { ...options, evidenceDir: path.resolve(options.evidenceDir), testParent: path.resolve(options.testParent) }
   const bun = path.join(ownerSource, '.task-inputs/toolchain/bun')
   if (Bun.version !== '1.3.11') throw new Error(`Pinned Bun 1.3.11 required, got ${Bun.version}`)
-  await validateOutputRoots(options.evidenceDir, options.testParent, [ownerSource, path.join(ownerSource, '.task-inputs/product'), path.join(ownerSource, '.task-inputs/reference')])
+  const protectedRoots = await protectedSourceRoots(ownerSource)
+  await validateOutputRoots(options.evidenceDir, options.testParent, protectedRoots)
   await mkdir(options.evidenceDir, { recursive: true })
   await safeWrite(path.join(options.evidenceDir, '.evidence-owner.json'), JSON.stringify({ taskId, root: await realpath(options.evidenceDir), purpose: 'fresh TEST public-reader evidence' }))
   const build = await buildWorker(path.join(options.evidenceDir, 'INPUT'))
@@ -48,7 +49,7 @@ export async function runBaseline(options: Options) {
         const id = `${reader}-${variant}-${operation}`
         const recordDir = path.join(options.evidenceDir, 'cases', id)
         await mkdir(recordDir, { recursive: true })
-        const test = await testProject(options.testParent, id, bun, [ownerSource, path.join(ownerSource, '.task-inputs/product')])
+        const test = await testProject(options.testParent, id, bun, protectedRoots)
         const original = fixture(reader, variant, test.project)
         await safeWrite(path.join(recordDir, 'test-marker.json'), JSON.stringify(test.marker, null, 2))
         await cp(build.executable, path.join(test.project, 'reader-worker.js'))
