@@ -1,3 +1,8 @@
+import {
+  readOpenCodeAuthority, requireOpenCodeAuthority, isKnownHostRegistry,
+  normalizeKnownHostRegistry, normalizePersistentHostLeases, type PersistentHostRegistryShape,
+  type PersistentHostRegistryRecord, type PersistentHostLeaseRecord,
+} from './OpenCodeAuthorityStoreRead.js'
 import { createHash, randomUUID } from 'node:crypto'
 import { type ChildProcess, type SpawnOptions } from 'node:child_process'
 import type { Dirent } from 'node:fs'
@@ -142,41 +147,6 @@ export type OpenCodeHostLeaseInput = {
   memberName: string
   runId?: string | null
   sessionId?: string | null
-}
-
-type PersistentHostLeaseRecord = {
-  leaseKey: string
-  teamId: string
-  laneId: string
-  memberName: string
-  runId: string | null
-  sessionId: string | null
-  createdAt: string
-  updatedAt: string
-}
-
-type PersistentHostRegistryRecord = {
-  cursorAgentReapContractVersion?: 1
-  hostKey: string
-  profileRootKey: string
-  projectPath: string
-  projectBehaviorFingerprint: string
-  managedConfigFingerprint?: string | null
-  baseUrl: string
-  port: number
-  pid: number
-  processStartedAtMs?: number | null
-  attributionId?: string | null
-  version: string | null
-  resolvedConfigFingerprint: string | null
-  updatedAt: string
-  leases?: Record<string, PersistentHostLeaseRecord>
-}
-
-type PersistentHostRegistryShape = {
-  schemaVersion: 1
-  processIdentityFormat?: 'platform-native-v2'
-  hosts: Record<string, PersistentHostRegistryRecord>
 }
 
 type PersistentHostProcessIdentity = {
@@ -500,43 +470,6 @@ export function buildOpenCodeHostProfileIdentity(
   // them, so it has to be part of reuse or a signed-out account keeps serving.
   const readiness = profile.env.AGENT_TEAMS_CURSOR_READINESS ?? 'absent'
   return `${profile.projectPath}::${profile.profileRootKey}::${profile.projectBehaviorFingerprint}::${profile.managedConfigFingerprint}::auth:${authIdentity}::scope:${profile.scopeToken ?? 'unscoped'}::${OPEN_CODE_MANAGED_HOST_CONFIG_GENERATION}::binary:${binaryHostIdentity}::mcp:${transportIdentity}::readiness:${readiness}`
-}
-
-function normalizePersistentHostLeases(value: unknown): Record<string, PersistentHostLeaseRecord> {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    return {}
-  }
-
-  const leases: Record<string, PersistentHostLeaseRecord> = {}
-  for (const [key, rawLease] of Object.entries(value as Record<string, unknown>)) {
-    if (!rawLease || typeof rawLease !== 'object' || Array.isArray(rawLease)) {
-      continue
-    }
-    const lease = rawLease as Partial<PersistentHostLeaseRecord>
-    if (
-      typeof lease.teamId !== 'string' ||
-      typeof lease.laneId !== 'string' ||
-      typeof lease.memberName !== 'string' ||
-      typeof lease.createdAt !== 'string' ||
-      typeof lease.updatedAt !== 'string'
-    ) {
-      continue
-    }
-    const leaseKey =
-      typeof lease.leaseKey === 'string' && lease.leaseKey.trim() ? lease.leaseKey : key
-    leases[leaseKey] = {
-      leaseKey,
-      teamId: lease.teamId,
-      laneId: lease.laneId,
-      memberName: lease.memberName,
-      runId: typeof lease.runId === 'string' && lease.runId.trim() ? lease.runId : null,
-      sessionId:
-        typeof lease.sessionId === 'string' && lease.sessionId.trim() ? lease.sessionId : null,
-      createdAt: lease.createdAt,
-      updatedAt: lease.updatedAt,
-    }
-  }
-  return leases
 }
 
 export class OpenCodeHostManager {
@@ -941,50 +874,9 @@ export class OpenCodeHostManager {
   }
 
   private async readPersistentRegistryUnlocked(): Promise<PersistentHostRegistryShape> {
-    const registryPath = this.persistentRegistryPath
-    if (!registryPath) {
-      return { schemaVersion: 1, hosts: {} }
-    }
-
-    try {
-      const parsed = JSON.parse(
-        await readFile(registryPath, 'utf8'),
-      ) as Partial<PersistentHostRegistryShape>
-      if (parsed.schemaVersion !== 1 || !parsed.hosts || typeof parsed.hosts !== 'object') {
-        return { schemaVersion: 1, hosts: {} }
-      }
-      const hosts = Object.fromEntries(
-        Object.entries(parsed.hosts as Record<string, PersistentHostRegistryRecord>).map(
-          ([hostKey, record]) => [
-            hostKey,
-            {
-              ...record,
-              // Before Linux switched to /proc start ticks, this field held
-              // ps lstart epoch milliseconds. Treat that old value as a
-              // legacy PID-only identity so command, health, fingerprint and
-              // stable tick checks can migrate it without orphaning the host.
-              ...(process.platform === 'linux'
-                && parsed.processIdentityFormat !== 'platform-native-v2'
-                && Number(record.processStartedAtMs) > 1_000_000_000_000
-                ? { processStartedAtMs: undefined } : {}),
-              // Normalization must never manufacture destructive cleanup authority.
-              cursorAgentReapContractVersion:
-                parsed.processIdentityFormat === 'platform-native-v2'
-                && record.cursorAgentReapContractVersion === 1
-                && record.leases !== null && typeof record.leases === 'object'
-                && !Array.isArray(record.leases)
-                && Object.keys(record.leases).every(key =>
-                  Object.prototype.hasOwnProperty.call(normalizePersistentHostLeases(record.leases), key))
-                  ? 1 : undefined,
-              leases: normalizePersistentHostLeases(record.leases),
-            },
-          ],
-        ),
-      )
-      return { schemaVersion: 1, processIdentityFormat: parsed.processIdentityFormat, hosts }
-    } catch {
-      return { schemaVersion: 1, hosts: {} }
-    }
+    if (!this.persistentRegistryPath) return { schemaVersion: 1, hosts: {} }
+    const result = await readOpenCodeAuthority(this.persistentRegistryPath, isKnownHostRegistry)
+    return normalizeKnownHostRegistry(requireOpenCodeAuthority(result, 'host', () => ({ schemaVersion: 1, hosts: {} })))
   }
 
   private async writePersistentRegistryUnlocked(
@@ -1009,6 +901,7 @@ export class OpenCodeHostManager {
       && previous?.processStartedAtMs === handle.processStartedAtMs
       && previous?.attributionId === handle.attributionId
     return {
+      ...previous,
       ...(newGeneration || (sameGeneration && previous?.cursorAgentReapContractVersion === 1)
         ? { cursorAgentReapContractVersion: 1 as const } : {}),
       hostKey: handle.hostKey,
@@ -1195,7 +1088,7 @@ export class OpenCodeHostManager {
       if (await this.hasPendingOAuthHost(hostKey)) return
       delete registry.hosts[hostKey]
       await this.retireHostAttributionRecords(record.attributionId)
-      if (Object.keys(registry.hosts).length === 0) {
+      if (Object.keys(registry.hosts).length === 0 && Object.keys(registry).every(key => ['schemaVersion', 'processIdentityFormat', 'hosts'].includes(key))) {
         await unlink(registryPath).catch(() => undefined)
         return
       }
@@ -1256,9 +1149,9 @@ export class OpenCodeHostManager {
     try {
       await this.withPersistentRegistryLock(async () => {
         guard()
-        let raw: unknown
-        try { raw = JSON.parse(await readFile(registryPath, 'utf8')) }
-        catch { result.diagnostics.push('Registry missing, unreadable or corrupt'); return }
+        const read = await readOpenCodeAuthority(registryPath, isKnownHostRegistry)
+        if (read.kind === 'missing') { result.diagnostics.push('Registry missing'); return }
+        const raw = requireOpenCodeAuthority(read, 'host', () => ({ schemaVersion: 1, hosts: {} }))
         guard()
         const records = await readAttributionRecords(directory)
         guard()
@@ -1386,6 +1279,7 @@ export class OpenCodeHostManager {
         return
       }
       leases[leaseKey] = {
+        ...previous,
         leaseKey,
         teamId: input.teamId.trim(),
         laneId: input.laneId?.trim() || 'primary',
@@ -1846,19 +1740,9 @@ export class OpenCodeHostManager {
     }
     return this.withPersistentHostStartupLock(record.hostKey, async () => {
       return this.withPersistentRegistryLock(async () => {
-        let registry: PersistentHostRegistryShape = { schemaVersion: 1, hosts: {} }
-        let hosts: Record<string, unknown> = registry.hosts
-        try {
-          const parsed = JSON.parse(await readFile(registryPath, 'utf8'))
-          if (parsed?.schemaVersion !== 1 || !parsed.hosts
-            || typeof parsed.hosts !== 'object' || Array.isArray(parsed.hosts)) {
-            throw new Error('OpenCode dead runtime recovery registry is invalid')
-          }
-          registry = parsed
-          hosts = parsed.hosts
-        } catch (error) {
-          if (!error || typeof error !== 'object' || !('code' in error) || error.code !== 'ENOENT') throw error
-        }
+        const registry = requireOpenCodeAuthority(await readOpenCodeAuthority(registryPath, isKnownHostRegistry),
+          'host', () => ({ schemaVersion: 1, hosts: {} }))
+        const hosts = registry.hosts
         const registered = hosts[record.hostKey]
         if (record.expectedProcessStartedAtMs !== undefined && (!registered || typeof registered !== 'object'
           || !('processStartedAtMs' in registered) || registered.processStartedAtMs !== record.expectedProcessStartedAtMs)) {
@@ -1994,6 +1878,7 @@ export class OpenCodeHostManager {
     if (params.abortSignal?.aborted) {
       throwOpenCodeAbortReason(params.abortSignal)
     }
+    await this.withPersistentRegistryLock(async () => { await this.readPersistentRegistryUnlocked() })
     const profile = params.preparedProfile ?? await raceOpenCodeAbortSignal(
       this.prepareProfile(params.projectPath, {
         ...params.profileOptions,
@@ -2111,6 +1996,7 @@ export class OpenCodeHostManager {
   }
 
   async refreshResolvedConfigFingerprint(hostKey: string): Promise<string | null> {
+    await this.withPersistentRegistryLock(async () => { await this.readPersistentRegistryUnlocked() })
     const entry = this.hosts.get(hostKey)
     if (!entry) {
       return null
@@ -2234,6 +2120,7 @@ export class OpenCodeHostManager {
   }
 
   async disposeHost(hostKey: string): Promise<boolean> {
+    await this.withPersistentRegistryLock(async () => { await this.readPersistentRegistryUnlocked() })
     const entry = this.hosts.get(hostKey)
     if (!entry) {
       return false
@@ -2268,7 +2155,7 @@ export class OpenCodeHostManager {
           && current.processStartedAtMs === record.processStartedAtMs) {
           const latest = await this.readPersistentRegistryUnlocked()
           delete latest.hosts[hostKey]
-          if (Object.keys(latest.hosts).length === 0) {
+          if (Object.keys(latest.hosts).length === 0 && Object.keys(latest).every(key => ['schemaVersion', 'processIdentityFormat', 'hosts'].includes(key))) {
             await unlink(this.persistentRegistryPath!).catch(() => undefined)
           } else {
             await this.writePersistentRegistryUnlocked(latest)
@@ -2650,7 +2537,7 @@ export class OpenCodeHostManager {
       }
 
       if (changed) {
-        if (Object.keys(registry.hosts).length === 0) {
+        if (Object.keys(registry.hosts).length === 0 && Object.keys(registry).every(key => ['schemaVersion', 'processIdentityFormat', 'hosts'].includes(key))) {
           await unlink(registryPath).catch(() => undefined)
         } else {
           await this.writePersistentRegistryUnlocked(registry)
@@ -2724,6 +2611,7 @@ export class OpenCodeHostManager {
     hostKey: string,
     options: { keepPersistentAlive?: boolean } = {},
   ): Promise<void> {
+    await this.withPersistentRegistryLock(async () => { await this.readPersistentRegistryUnlocked() })
     const entry = this.hosts.get(hostKey)
     if (!entry) {
       return

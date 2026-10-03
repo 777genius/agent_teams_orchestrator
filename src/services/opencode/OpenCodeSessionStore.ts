@@ -1,4 +1,8 @@
-import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
+import {
+  readOpenCodeAuthority, requireOpenCodeAuthority, isKnownSessionStore,
+  type SessionStoreShape,
+} from './OpenCodeAuthorityStoreRead.js'
+import { mkdir, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
 
@@ -18,15 +22,50 @@ import {
 
 import type { OpenCodeSessionRecord, OpenCodeSessionStopAuthority } from './types.js'
 
-type SessionStoreShape = {
-  schemaVersion: 1
-  records: Record<string, OpenCodeSessionRecord>
-  stopReceipts?: Record<string, OpenCodeStopReceipt>
-  materializationClaims?: Record<string, string>
-  materializationClaimRuns?: Record<string, string>
-  materializationOwners?: Record<string, MaterializationOwnerToken>
-  materializationOwnerVersions?: Record<string, number>
-  materializationOwnerProcesses?: Record<string, MaterializationOwnerProcessIdentity>
+// Upsert is a full V1 record replacement. Only opaque extension fields inherit.
+// Exhaustiveness makes a newly recognized field require an explicit boundary update.
+const SESSION_RECORD_FIELDS = {
+  teamId: true,
+  runId: true,
+  stoppedAt: true,
+  stopAuthority: true,
+  laneId: true,
+  memberName: true,
+  providerId: true,
+  selectedModel: true,
+  selectedVariant: true,
+  projectPath: true,
+  profileRootKey: true,
+  hostKey: true,
+  profileScope: true,
+  toolApprovalMode: true,
+  runtimePid: true,
+  resolvedBehaviorFingerprint: true,
+  opencodeSessionId: true,
+  lastCanonicalCursor: true,
+  lastKnownRawStatus: true,
+  lastKnownDurableState: true,
+  sourceAuthFingerprint: true,
+  managedAuthFingerprint: true,
+  projectBehaviorFingerprint: true,
+  managedConfigFingerprint: true,
+  managedConfigSectionFingerprints: true,
+  expectedBehaviorFingerprint: true,
+  opencodeVersion: true,
+  bootstrapMode: true,
+  bootstrapEvidenceSource: true,
+  appManagedBootstrap: true,
+  staleReason: true,
+  createdAt: true,
+  updatedAt: true,
+} satisfies Record<keyof OpenCodeSessionRecord, true>
+
+function replaceSessionRecord(previous: OpenCodeSessionRecord | undefined, record: OpenCodeSessionRecord): OpenCodeSessionRecord {
+  const next = { ...previous, ...record }
+  for (const field of Object.keys(SESSION_RECORD_FIELDS) as (keyof OpenCodeSessionRecord)[]) {
+    if (!Object.prototype.hasOwnProperty.call(record, field)) delete next[field]
+  }
+  return next
 }
 
 type LegacyMaterializationOwnerToken = Omit<MaterializationOwnerToken, 'version'>
@@ -131,15 +170,6 @@ function isMaterializationOwnerProcessIdentity(
 
 function buildRecordKey(record: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' | 'memberName'>): string {
   return `${record.teamId}::${record.laneId ?? 'primary'}::${record.memberName}`
-}
-
-async function fileExists(filePath: string): Promise<boolean> {
-  try {
-    await stat(filePath)
-    return true
-  } catch {
-    return false
-  }
 }
 
 export function isOpenCodeSessionStopped(record: Pick<OpenCodeSessionRecord, 'stoppedAt'>): boolean {
@@ -410,30 +440,9 @@ export class OpenCodeSessionStore {
   }
 
   private async readStore(preserveMaterializationFences = false): Promise<SessionStoreShape> {
-    const exists = preserveMaterializationFences
-      ? await stat(this.filePath).then(() => true, error => {
-        if (error.code === 'ENOENT') return false
-        throw error
-      })
-      : await fileExists(this.filePath)
-    if (!exists) {
-      return {
-        schemaVersion: 1,
-        records: {},
-      }
-    }
-
-    const content = await readFile(this.filePath, 'utf8')
-    const parsed = JSON.parse(content) as SessionStoreShape
-    if (!parsed || parsed.schemaVersion !== 1 || typeof parsed.records !== 'object' || parsed.records === null || Array.isArray(parsed.records)) {
-      if (preserveMaterializationFences) throw new Error('Invalid OpenCode session store authority')
-      return {
-        schemaVersion: 1,
-        records: {},
-      }
-    }
-
-    return preserveMaterializationFences ? parsed : normalizeMaterializationOwners(parsed)
+    const result = await readOpenCodeAuthority(this.filePath, isKnownSessionStore)
+    const store = requireOpenCodeAuthority<SessionStoreShape>(result, 'session', () => ({ schemaVersion: 1, records: {} }))
+    return preserveMaterializationFences ? store : normalizeMaterializationOwners(store)
   }
 
   private async writeStore(store: SessionStoreShape): Promise<void> {
@@ -619,7 +628,8 @@ export class OpenCodeSessionStore {
       if (!ownerTokenAuthorizes(owner, ownerToken)) {
         throw new Error('OpenCode session write is fenced by a materialization owner')
       }
-      if (previous && jsonStringify(previous) === jsonStringify(record)) return 'unchanged'
+      const next = replaceSessionRecord(previous, record)
+      if (previous && jsonStringify(previous) === jsonStringify(next)) return 'unchanged'
       if (previous && isOpenCodeSessionStopped(previous)) {
         throw new Error('OpenCode stopped session can only be replaced by a new launch claim')
       }
@@ -628,7 +638,7 @@ export class OpenCodeSessionStore {
         throw new Error('OpenCode session write does not match the committed run and session')
       }
 
-      store.records[key] = record
+      store.records[key] = next
       await this.writeStore(store)
       return previous ? 'updated' : 'created'
     })
@@ -695,7 +705,6 @@ export class OpenCodeSessionStore {
     ownerToken: MaterializationOwnerToken,
     signal?: AbortSignal,
   ): Promise<MaterializationOwnerToken | null> {
-    const ownerProcessIdentity = await this.currentOwnerProcessIdentity()
     return this.withStoreLock(async () => {
       const store = await this.readStore()
       const key = buildRecordKey(record)
@@ -723,6 +732,7 @@ export class OpenCodeSessionStore {
         )
       ))
       if (previous && !replacingExisting) return null
+      const ownerProcessIdentity = await this.currentOwnerProcessIdentity()
       const committedOwner = { ...ownerToken, sessionId: record.opencodeSessionId }
       store.records[key] = record
       delete store.materializationClaims[key]
@@ -746,7 +756,6 @@ export class OpenCodeSessionStore {
     signal?: AbortSignal,
     expectedOwnerToken?: MaterializationOwnerToken | null,
   ): Promise<MaterializationOwnerToken | null> {
-    const nextOwnerProcessIdentity = await this.currentOwnerProcessIdentity()
     return this.withStoreLock(async () => {
       const store = await this.readStore()
       const key = buildRecordKey(record)
@@ -771,6 +780,7 @@ export class OpenCodeSessionStore {
         typeof currentVersion === 'number' && Number.isSafeInteger(currentVersion) ? currentVersion : 0,
         0,
       ) + 1
+      const nextOwnerProcessIdentity = await this.currentOwnerProcessIdentity()
       const nextOwner = { attemptId, sessionId: record.opencodeSessionId, version: nextVersion }
       store.materializationOwners ??= {}
       store.materializationOwners[key] = nextOwner

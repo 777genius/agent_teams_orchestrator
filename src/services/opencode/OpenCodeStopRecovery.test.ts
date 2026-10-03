@@ -110,8 +110,12 @@ describe('owned durable Stop outcomes', () => {
     const disk = JSON.parse(await readFile(file, 'utf8'))
     const receipt = Object.values(disk.stopReceipts)[0] as { data: unknown }
     receipt.data = data
-    await writeFile(file, JSON.stringify(disk))
-    await expect(new OpenCodeSessionStore(file).lookupStop(request)).rejects.toThrow('Invalid durable Stop result')
+    const corruptBytes = JSON.stringify(disk)
+    await writeFile(file, corruptBytes)
+    await expect(new OpenCodeSessionStore(file).lookupStop(request)).rejects.toMatchObject({
+      name: 'OpenCodeAuthorityVetoError', kind: 'preserved_unknown', store: 'session', reason: 'invalid',
+    })
+    expect(await readFile(file, 'utf8')).toBe(corruptBytes)
   })
 
   test('crash after effect remains inflight, but exact terminal state reconciles separately', async () => {

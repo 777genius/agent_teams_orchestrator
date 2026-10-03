@@ -97,7 +97,7 @@ export function createBackfillFixture(env, workspaceRoot, projectDir) {
     staleReason: null, createdAt: '2026-04-26T10:00:00.000Z', updatedAt: '2026-04-26T10:00:00.000Z',
   };
   writeFileSync(path.join(env.CLAUDE_MULTIMODEL_DATA_HOME, 'opencode/session-store.json'),
-    JSON.stringify({ schemaVersion: 1, records: { fixture: record } }));
+    JSON.stringify({ schemaVersion: 1, records: { [`${teamName}::${laneId}::${memberName}`]: record } }));
   const contextDir = mkdtempSync(path.join(env.TEMP, 'claude-team-opencode-ledger-context-'));
   const deliveryContextPath = path.join(contextDir, 'delivery-context.json');
   const context = JSON.stringify({ schemaVersion: 1, teamName, taskId, records: [{
