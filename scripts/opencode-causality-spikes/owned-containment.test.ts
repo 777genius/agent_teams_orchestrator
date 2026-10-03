@@ -107,6 +107,18 @@ test('owned TEST access preserves binary/config bytes and Root-private evidence'
     await writeFile(binary, Buffer.from([0, 1, 2, 255]), { mode: 0o700 });
     await writeFile(config, '{"TEST":true}\n', { mode: 0o600 });
     const before = await Promise.all([binary, config].map(async path => digest(await readFile(path))));
+    if (process.platform !== 'linux' || process.geteuid?.() !== 0) {
+      const paths = [scope.root, scope.evidence, binary, config];
+      const access = async () => Promise.all(paths.map(async path => {
+        const stat = await lstat(path);
+        return { uid: stat.uid, gid: stat.gid, mode: stat.mode };
+      }));
+      const originalAccess = await access();
+      await expect(prepareTestFilesystemAccess(scope, 65534, 65534)).rejects.toThrow('Root and explicit unprivileged TEST identity required');
+      expect(await access()).toEqual(originalAccess);
+      expect(await Promise.all([binary, config].map(async path => digest(await readFile(path))))).toEqual(before);
+      return;
+    }
     const env = await prepareTestFilesystemAccess(scope, 65534, 65534);
     expect(env).toEqual({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'safe.directory', GIT_CONFIG_VALUE_0: scope.root });
     const after = await Promise.all([binary, config].map(async path => digest(await readFile(path))));
@@ -125,13 +137,14 @@ test('symlink, hardlink and changed marker fail before any access grant', async 
   for (const kind of ['symlink', 'hardlink', 'marker']) await filesystemCase(async scope => {
     const config = join(scope.root, 'config');
     await writeFile(config, 'TEST bytes', { mode: 0o600 });
+    const originalConfig = await lstat(config);
     if (kind === 'symlink') await symlink(scope.evidence, join(scope.root, 'escape'));
     if (kind === 'hardlink') await link(config, join(scope.root, 'alias'));
     if (kind === 'marker') await writeFile(join(scope.root, '.test-project-owner.json'), '{}');
     await expect(prepareTestFilesystemAccess(scope, 65534, 65534)).rejects.toThrow();
     expect((await lstat(scope.root)).mode & 0o777).toBe(0o700);
     expect((await lstat(config)).mode & 0o777).toBe(0o600);
-    expect((await lstat(config)).gid).toBe(0);
+    expect((await lstat(config)).gid).toBe(originalConfig.gid);
     expect(await readFile(config, 'utf8')).toBe('TEST bytes');
   });
 });

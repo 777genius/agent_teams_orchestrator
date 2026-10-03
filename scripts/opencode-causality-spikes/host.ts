@@ -16,23 +16,22 @@ export async function host(sandbox: Sandbox, artifact: NativeArtifact, selected:
   if (sha(await readFile(artifact.binary)) !== artifact.sha256) throw new Error('binary changed before spawn');
   // Validate explicit TEST opt-in before any spawn. No worker provisioning.
   const containment = await LinuxTestContainment.prepare();
-  const launchReceipt = join(sandbox.evidence, 'TEST-containment-' + randomUUID() + '.json');
-  let base: string, proc: Bun.Subprocess<'pipe', 'pipe', 'pipe'>;
+  const launchReceipt = containment ? join(sandbox.evidence, 'TEST-containment-' + randomUUID() + '.json') : undefined;
+  let base: string, proc: Bun.Subprocess<'pipe' | 'ignore', 'pipe', 'pipe'>;
   try {
     const childAccess = containment ? await prepareTestFilesystemAccess(sandbox, containment.options.uid, containment.options.gid) : {};
     if (sha(await readFile(artifact.binary)) !== artifact.sha256) throw new Error('binary changed during TEST access preparation');
     const port = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response('TEST reserved') });
     base = `http://127.0.0.1:${port.port}`; const selectedPort = port.port; port.stop(true);
     const argv = [artifact.binary, 'serve', '--hostname', '127.0.0.1', '--port', String(selectedPort)];
-    proc = Bun.spawn(containment ? containment.command(argv[0]!, argv.slice(1), launchReceipt) : argv, {
-      cwd: sandbox.root, env: { ...sandbox.env(), ...childAccess, TEST_Q0_MODEL_API_KEY: 'TEST-DUMMY-KEY' }, stdin: 'pipe', stdout: 'pipe', stderr: 'pipe',
+    proc = Bun.spawn(containment ? containment.command(argv[0]!, argv.slice(1), launchReceipt!) : argv, {
+      cwd: sandbox.root, env: { ...sandbox.env(), ...childAccess, TEST_Q0_MODEL_API_KEY: 'TEST-DUMMY-KEY' }, stdin: containment ? 'pipe' : 'ignore', stdout: 'pipe', stderr: 'pipe',
     });
   } catch (e) { await containment?.close(); throw e; }
   let launchPipeClosed = false;
   const closeLaunchPipe = async () => {
-    if (!launchPipeClosed) { await proc.stdin.end(); launchPipeClosed = true; }
+    if (containment && !launchPipeClosed) { await proc.stdin!.end(); launchPipeClosed = true; }
   };
-  if (!containment) await closeLaunchPipe();
   let birth: Awaited<ReturnType<typeof processBirth>> | undefined;
   let tree: OwnedProcessTree | undefined, owner: OwnedEndpoint | undefined;
   let owned: OwnedCleanup | undefined;
@@ -91,7 +90,7 @@ export async function host(sandbox: Sandbox, artifact: NativeArtifact, selected:
       if (errors.length) throw new Error('host cleanup incomplete: ' + errors.join('; '));
     } finally {
       pipeAbort.abort(); owner?.revoke(); await containment?.close();
-      if (containment) await unlink(launchReceipt).catch((e: any) => { if (e.code !== 'ENOENT') throw e; });
+      if (containment) await unlink(launchReceipt!).catch((e: any) => { if (e.code !== 'ENOENT') throw e; });
     }
   })();
   try {
@@ -100,9 +99,9 @@ export async function host(sandbox: Sandbox, artifact: NativeArtifact, selected:
     birth = await processBirth(proc.pid);
     tree = new OwnedProcessTree(proc.pid, birth);
     owned = new OwnedCleanup(proc, birth, tree);
-    if (containment) await containment.admit(proc.pid, birth, launchReceipt);
+    if (containment) await containment.admit(proc.pid, birth, launchReceipt!);
     owned.start();
-    if (containment) await cleanupBound(containment.release({ write: data => proc.stdin.write(data), end: closeLaunchPipe }), 'parent admission ACK');
+    if (containment) await cleanupBound(containment.release({ write: data => proc.stdin!.write(data), end: closeLaunchPipe }), 'parent admission ACK');
     owner = new OwnedEndpoint(sandbox, base, proc.pid, birth);
     stdout = owner.stdout(out); stdout.catch(e => { captureError = e; });
     stderr = boundedText(err); stderr.catch(e => { captureError = e; });
