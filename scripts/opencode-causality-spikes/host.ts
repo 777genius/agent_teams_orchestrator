@@ -1,21 +1,38 @@
-import { readFile, readlink } from 'node:fs/promises';
+import { readFile, readlink, unlink } from 'node:fs/promises';
 import { Sandbox, processBirth, OwnedProcessTree, sha, boundedText } from '../opencode-generation-spikes/sandbox';
 import { OwnedEndpoint } from '../opencode-generation-spikes/auth';
 import { NativeArtifact } from '../opencode-generation-spikes/artifacts';
 import { Evidence, Wire, Missing, RequestFailure, RecordingFailure } from './wire';
 import { Selection } from './contracts';
 import { OwnedCleanup, cleanupBound } from './owned-cleanup';
+import { LinuxTestContainment, prepareTestFilesystemAccess } from './owned-containment';
+import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 
 // S0/start/stop's existing authentication and process ownership are reused read-only.
 // A small separate launcher exposes raw HTTP/SSE; the S0 requester drops raw 4xx.
 export async function host(sandbox: Sandbox, artifact: NativeArtifact, selected: Selection, evidence: Evidence, signal: AbortSignal, observeWire?: (wire: Wire) => void) {
   await sandbox.validate(); await sandbox.path(artifact.binary);
   if (sha(await readFile(artifact.binary)) !== artifact.sha256) throw new Error('binary changed before spawn');
-  const port = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response('TEST reserved') });
-  const base = `http://127.0.0.1:${port.port}`; const selectedPort = port.port; port.stop(true);
-  const proc = Bun.spawn([artifact.binary, 'serve', '--hostname', '127.0.0.1', '--port', String(selectedPort)], {
-    cwd: sandbox.root, env: { ...sandbox.env(), TEST_Q0_MODEL_API_KEY: 'TEST-DUMMY-KEY' }, stdout: 'pipe', stderr: 'pipe',
-  });
+  // Validate explicit TEST opt-in before any spawn. No worker provisioning.
+  const containment = await LinuxTestContainment.prepare();
+  const launchReceipt = join(sandbox.evidence, 'TEST-containment-' + randomUUID() + '.json');
+  let base: string, proc: Bun.Subprocess<'pipe', 'pipe', 'pipe'>;
+  try {
+    const childAccess = containment ? await prepareTestFilesystemAccess(sandbox, containment.options.uid, containment.options.gid) : {};
+    if (sha(await readFile(artifact.binary)) !== artifact.sha256) throw new Error('binary changed during TEST access preparation');
+    const port = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response('TEST reserved') });
+    base = `http://127.0.0.1:${port.port}`; const selectedPort = port.port; port.stop(true);
+    const argv = [artifact.binary, 'serve', '--hostname', '127.0.0.1', '--port', String(selectedPort)];
+    proc = Bun.spawn(containment ? containment.command(argv[0]!, argv.slice(1), launchReceipt) : argv, {
+      cwd: sandbox.root, env: { ...sandbox.env(), ...childAccess, TEST_Q0_MODEL_API_KEY: 'TEST-DUMMY-KEY' }, stdin: 'pipe', stdout: 'pipe', stderr: 'pipe',
+    });
+  } catch (e) { await containment?.close(); throw e; }
+  let launchPipeClosed = false;
+  const closeLaunchPipe = async () => {
+    if (!launchPipeClosed) { await proc.stdin.end(); launchPipeClosed = true; }
+  };
+  if (!containment) await closeLaunchPipe();
   let birth: Awaited<ReturnType<typeof processBirth>> | undefined;
   let tree: OwnedProcessTree | undefined, owner: OwnedEndpoint | undefined;
   let owned: OwnedCleanup | undefined;
@@ -25,6 +42,8 @@ export async function host(sandbox: Sandbox, artifact: NativeArtifact, selected:
   let captureError: unknown, stopping: Promise<void> | undefined;
   const stop = () => stopping ??= (async () => {
     const errors: string[] = [];
+    // EOF without ACK cancels an unadmitted launcher without a signal.
+    try { await closeLaunchPipe(); } catch (e) { errors.push('stdin close: ' + String(e)); }
     let cleanup: unknown, drained = false;
     try {
       try {
@@ -32,17 +51,19 @@ export async function host(sandbox: Sandbox, artifact: NativeArtifact, selected:
       } catch (e) { errors.push('retire: ' + String(e)); }
       try {
         if (owned) {
-          cleanup = await owned.stop();
+          cleanup = await owned.stop(containment);
           errors.push(...(cleanup as any).errors);
         } else {
-          // The intrinsic handle also covers failed ownership construction.
-          proc.kill('SIGKILL');
-          cleanup = { authority: 'fresh-subprocess-handle', signal: 'SIGKILL' };
+          const maySignal = !containment || containment.hasAdmission;
+          if (maySignal) proc.kill('SIGKILL');
+          cleanup = { authority: maySignal ? 'fresh-subprocess-handle' : 'withheld-admission-pipe',
+            signal: maySignal ? 'SIGKILL' : null, containedTreeDrained: false };
+          errors.push('creation after failed ownership setup unproven');
         }
       } catch (e) {
         errors.push('termination: ' + String(e));
-        // Observation/setup errors must never skip the intrinsic leader handle.
-        try { proc.kill('SIGKILL'); } catch (fallback: any) {
+        // Intrinsic fallback also requires trusted containment admission.
+        try { if (!containment || containment.hasAdmission) proc.kill('SIGKILL'); } catch (fallback: any) {
           if (fallback.code !== 'ENOENT' && fallback.code !== 'ESRCH') errors.push('leader fallback: ' + String(fallback));
         }
       }
@@ -66,20 +87,29 @@ export async function host(sandbox: Sandbox, artifact: NativeArtifact, selected:
         } catch (e) { errors.push(name + ': ' + String(e)); }
       }
       await evidence.json('host-cleanup.json', { pid: proc.pid, birth: birth ?? null,
-        cleanup, drained, exitCode: proc.exitCode, errors });
+        cleanup, drained, knownLeaderExited: drained, containedTreeDrained: (cleanup as any)?.containedTreeDrained === true, exitCode: proc.exitCode, errors });
       if (errors.length) throw new Error('host cleanup incomplete: ' + errors.join('; '));
-    } finally { pipeAbort.abort(); owner?.revoke(); }
+    } finally {
+      pipeAbort.abort(); owner?.revoke(); await containment?.close();
+      if (containment) await unlink(launchReceipt).catch((e: any) => { if (e.code !== 'ENOENT') throw e; });
+    }
   })();
   try {
     out = proc.stdout.pipeThrough(new TransformStream(), { signal: pipeAbort.signal });
     err = proc.stderr.pipeThrough(new TransformStream(), { signal: pipeAbort.signal });
     birth = await processBirth(proc.pid);
     tree = new OwnedProcessTree(proc.pid, birth);
-    owned = new OwnedCleanup(proc, birth, tree); owned.start();
+    owned = new OwnedCleanup(proc, birth, tree);
+    if (containment) await containment.admit(proc.pid, birth, launchReceipt);
+    owned.start();
+    if (containment) await cleanupBound(containment.release({ write: data => proc.stdin.write(data), end: closeLaunchPipe }), 'parent admission ACK');
     owner = new OwnedEndpoint(sandbox, base, proc.pid, birth);
     stdout = owner.stdout(out); stdout.catch(e => { captureError = e; });
     stderr = boundedText(err); stderr.catch(e => { captureError = e; });
-    const wire = new Wire(base, u => owner!.headers(u), evidence.raw, signal);
+    const wire = new Wire(base, async (u): Promise<Record<string, string>> => {
+      const { Authorization } = await owner!.headers(u);
+      return Authorization === undefined ? {} : { Authorization };
+    }, evidence.raw, signal);
     observeWire?.(wire);
     let identity: any;
     const path = selected.generation === 'v1' ? '/global/health' : selected.version === '2.0.0' ? '/api/health' : '/api/info';

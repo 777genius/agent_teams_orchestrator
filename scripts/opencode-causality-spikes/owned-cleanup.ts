@@ -1,4 +1,5 @@
 import { readFile } from 'node:fs/promises';
+import type { LinuxTestContainment, ContainmentReceipt } from './owned-containment';
 import { processBirth, OwnedProcessTree } from '../opencode-generation-spikes/sandbox';
 
 type Birth = Awaited<ReturnType<typeof processBirth>>;
@@ -83,8 +84,14 @@ export class OwnedCleanup {
       this.scan = this.scan.then(() => this.capture()).catch(e => { this.errors.push('scan: ' + String(e)); });
     }, 100);
   }
-  async stop() {
+  async stop(containment?: LinuxTestContainment) {
     clearInterval(this.timer);
+    if (containment && !containment.hasAdmission) {
+      this.captureOpen = false;
+      // The caller closes the launch pipe; never signal an unadmitted boundary.
+      await cleanupBound(this.proc.exited, 'unadmitted launcher exit', 11000);
+      return { containedTreeDrained: false, containment: null, errors: ['no trusted containment admission; execution withheld'] };
+    }
     try {
       await cleanupBound(this.scan, 'owned scan');
       await cleanupBound(this.capture(), 'owned final capture');
@@ -98,9 +105,9 @@ export class OwnedCleanup {
     // The leader itself may create its first child during TERM, even when
     // no descendant has previously entered the ledger. Its intrinsic exit
     // proves only leader termination, never closure of that creation window.
-    this.errors.push('leader creation after capture closure unproven: ' + this.proc.pid);
+    const obligations = ['leader creation after capture closure unproven: ' + this.proc.pid];
     const descendants = [...this.processes.keys()].filter(pid => pid !== this.proc.pid);
-    if (descendants.length) this.errors.push(
+    if (descendants.length) obligations.push(
       'descendant creation after capture closure unproven: ' + descendants.join(','));
     const results: any[] = [];
     // The intrinsic spawn handle remains authority if kernel observation fails.
@@ -108,6 +115,18 @@ export class OwnedCleanup {
     catch (e) { if (!absent(e)) this.errors.push('leader signal: ' + String(e)); }
     const started = performance.now(), deadline = started + 3000;
     let escalated = false;
+    // Under containment, give captured descendants the same bounded TERM grace.
+    // Exact births remain mandatory; unknown observation never grants a signal.
+    if (containment) {
+      for (const pid of descendants) {
+        if (performance.now() - started >= 250) break;
+        try {
+          const state = await cleanupBound(this.identity(pid, this.processes.get(pid)!), `grace identity ${pid}`,
+            Math.max(1, 250 - (performance.now() - started)));
+          if (state === 'live') process.kill(pid, 'SIGTERM');
+        } catch (e) { if (!absent(e)) this.errors.push(`descendant grace ${pid}: ${String(e)}`); }
+      }
+    }
     // Escalation remains bounded even when every kernel observation is unknown.
     try {
       const exited = await Promise.race([this.proc.exited.then(() => true), Bun.sleep(250).then(() => false)]);
@@ -118,6 +137,15 @@ export class OwnedCleanup {
       try { this.proc.kill('SIGKILL'); }
       catch (signal) { if (!absent(signal)) this.errors.push('leader escalation: ' + String(signal)); }
     }
+    // Only the admitted kernel boundary can discharge creation obligations.
+    // Kernel/scan errors still remain errors, even with a positive tree proof.
+    let boundary: ContainmentReceipt | undefined;
+    if (containment) {
+      await Bun.sleep(Math.max(0, 250 - (performance.now() - started)));
+      try { boundary = await containment.drain(); this.errors.push(...boundary.errors); }
+      catch (e) { this.errors.push('containment drain: ' + String(e)); }
+    }
+    if (!boundary?.containedTreeDrained) this.errors.push(...obligations);
     const pending = new Map(this.processes);
     do {
       if (!escalated && performance.now() - started >= 250) {
@@ -146,7 +174,7 @@ export class OwnedCleanup {
       this.errors.push(`owned process drain unproven at deadline: ${pid}`);
       results.push({ pid, birth, result: 'unknown' });
     }
-    return { authority: 'intrinsic-spawn-handle-and-exact-descendant-births', signal: 'SIGTERM', escalation: escalated ? 'SIGKILL' : null, graceMs: 250, results, errors: [...this.errors] };
+    return { containedTreeDrained: boundary?.containedTreeDrained === true, containment: boundary ?? null, authority: 'intrinsic-spawn-handle-and-exact-descendant-births', signal: 'SIGTERM', escalation: escalated ? 'SIGKILL' : null, graceMs: 250, results, errors: [...this.errors] };
   }
 }
 
