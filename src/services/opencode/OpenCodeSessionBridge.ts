@@ -1,3 +1,4 @@
+import { OpenCodeAuthorityVetoError } from './OpenCodeAuthorityStoreRead.js'
 import { createHash } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
 
@@ -686,6 +687,7 @@ export class OpenCodeSessionBridge {
         record,
       }
     } catch (error) {
+      if (error instanceof OpenCodeAuthorityVetoError) throw error
       await this.hostManager.releaseHost(host.hostKey)
       throw error
     }
@@ -726,6 +728,7 @@ export class OpenCodeSessionBridge {
       await this.hostManager.retainHostLease?.(record.hostKey, lease)
       if (scoped) await this.assertExactSessionAuthority(record)
     } catch (error) {
+      if (error instanceof OpenCodeAuthorityVetoError) throw error
       if (scoped) {
         await this.hostManager.releaseHostLease?.(record.hostKey, lease).catch(() => undefined)
       }
@@ -792,6 +795,7 @@ export class OpenCodeSessionBridge {
       await this.assertExactSessionAuthority(record)
       return host
     } catch (error) {
+      if (error instanceof OpenCodeAuthorityVetoError) throw error
       await this.hostManager.releaseHost(host.hostKey, { keepPersistentAlive: scoped })
       throw error
     }
@@ -812,6 +816,7 @@ export class OpenCodeSessionBridge {
       try {
         await this.retainSessionHostLease(record, runId)
       } catch (error) {
+        if (error instanceof OpenCodeAuthorityVetoError) throw error
         this.retainedSessionHosts.delete(sessionKey)
         await this.hostManager.releaseHost(record.hostKey).catch(() => undefined)
         throw error
@@ -829,6 +834,7 @@ export class OpenCodeSessionBridge {
     try {
       await this.retainSessionHostLease(record, runId)
     } catch (error) {
+      if (error instanceof OpenCodeAuthorityVetoError) throw error
       await this.hostManager.releaseHost(host.hostKey).catch(() => undefined)
       throw error
     }
@@ -1003,6 +1009,7 @@ export class OpenCodeSessionBridge {
       : await this.prepareProfileForSessionRecord(record, record.projectPath, options)
     const host = await this.ensureSessionAuthorityHost(record, sessionProfile.profile, options)
 
+    let authorityUnknown = false
     try {
       await this.retainSessionHostLease(record, record.runId)
       return await this.withSessionOperation(host, record, () => callback({
@@ -1012,8 +1019,13 @@ export class OpenCodeSessionBridge {
         runtimePid: host.pid > 0 ? host.pid : null,
         processStartedAtMs: host.processStartedAtMs ?? null,
       }))
+    } catch (error) {
+      authorityUnknown = error instanceof OpenCodeAuthorityVetoError
+      throw error
     } finally {
-      await this.hostManager.releaseHost(host.hostKey, { keepPersistentAlive: record.profileScope?.purpose === 'launch_runtime' })
+      if (!authorityUnknown) {
+        await this.hostManager.releaseHost(host.hostKey, { keepPersistentAlive: record.profileScope?.purpose === 'launch_runtime' })
+      }
     }
   }
 
@@ -1482,6 +1494,7 @@ export class OpenCodeSessionBridge {
         created.retainedHostKey,
       )
     } catch (error) {
+      if (error instanceof OpenCodeAuthorityVetoError) throw error
       await this.hostManager.releaseHostLease?.(created.retainedHostKey, {
         teamId: created.record.teamId,
         laneId: created.record.laneId,
@@ -1574,6 +1587,7 @@ export class OpenCodeSessionBridge {
           runId: existing.runId, sessionId: existing.opencodeSessionId,
         })
       } catch (error) {
+        if (error instanceof OpenCodeAuthorityVetoError) throw error
         await this.sessionStore.releaseMaterializationOwner?.(existing, ownerToken)
         throw error
       }
@@ -1644,6 +1658,7 @@ export class OpenCodeSessionBridge {
         runId: params.runId, sessionId: session.id,
       })
     } catch (error) {
+      if (error instanceof OpenCodeAuthorityVetoError) throw error
       // Persist a known remote identity even when lease persistence is ambiguous.
       // A retry will restore the exact lease before resuming bootstrap.
       let reconciledOwner: MaterializationOwnerToken | undefined
@@ -1658,8 +1673,8 @@ export class OpenCodeSessionBridge {
       throw error
     }
     const releaseLeaseUnlessSameSessionWon = async (): Promise<void> => {
+      // Only a successful authority read supplies winner/absence evidence.
       const winner = await this.sessionStore.get(record.teamId, record.laneId, record.memberName)
-        .catch(() => null)
       if (winner && jsonStringify(winner) === jsonStringify(record)) return
       await this.hostManager.releaseHostLease?.(params.host.hostKey, {
         teamId: record.teamId, laneId: record.laneId, memberName: record.memberName,
@@ -1670,9 +1685,12 @@ export class OpenCodeSessionBridge {
     try {
       ownerToken = await commitKnownRecord(params.signal)
     } catch (error) {
+      // Unknown authority cannot be reconciled into permission to drop this lease.
+      if (error instanceof OpenCodeAuthorityVetoError) throw error
       try {
         ownerToken = await commitKnownRecord()
-      } catch {
+      } catch (reconciliationError) {
+        if (reconciliationError instanceof OpenCodeAuthorityVetoError) throw reconciliationError
         ownerToken = undefined
       }
       if (!ownerToken) {
