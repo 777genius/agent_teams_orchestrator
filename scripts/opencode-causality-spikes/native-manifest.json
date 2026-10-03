@@ -1,0 +1,65 @@
+{
+  "ownerBase": "6132299836a89e58d633a0557e504243035e806b",
+  "files": [
+    {
+      "path": "scripts/opencode-generation-contract-spike.ts",
+      "sha256": "95a78f595366b75dd71e5242df51a7a04ffc7724d651357f496be3638a73f744"
+    },
+    {
+      "path": "scripts/opencode-generation-spikes/README.md",
+      "sha256": "4c9e1be4adea2cf1c0174757b4433ec8f770cb820d38e6dd59a85457463cbe13"
+    },
+    {
+      "path": "scripts/opencode-generation-spikes/acceptance.ts",
+      "sha256": "8b2aa816d0c15e463c3caa4084bf8dde51fc7d1d4ce47b9ff03e0e447ecf7f04"
+    },
+    {
+      "path": "scripts/opencode-generation-spikes/artifacts.ts",
+      "sha256": "7f1ea6831f06f45964ff9159d769e5e15502a4ce5341c8b9a8675c3845107b70"
+    },
+    {
+      "path": "scripts/opencode-generation-spikes/auth.ts",
+      "sha256": "b291711cc69885bbc7729c4a39037b43aff8632bf1c1764f0ca1ecbb65bc95b9"
+    },
+    {
+      "path": "scripts/opencode-generation-spikes/collections.ts",
+      "sha256": "49dc21103422126feef9d4d3483b23655ccdc6699605e4e0fe994f5e9ef74010"
+    },
+    {
+      "path": "scripts/opencode-generation-spikes/contracts.test.ts",
+      "sha256": "b188f4ebf7b12407a976a345a730db85a70256da1960ac725ef9f37815b6dd23"
+    },
+    {
+      "path": "scripts/opencode-generation-spikes/evidence.ts",
+      "sha256": "0fb64b5400ddf1df2190f3bcf6627951d872974cfdbe212ab7447617f56f0d34"
+    },
+    {
+      "path": "scripts/opencode-generation-spikes/model.ts",
+      "sha256": "67b7359d9f72fc4b193b2ff656469e6ad27f6e4836a03ed233500531628b3b92"
+    },
+    {
+      "path": "scripts/opencode-generation-spikes/native.ts",
+      "sha256": "3da92032d4f705e2f916edeab9429d39ce4f7450df0cf5eb2d7da953384c956d"
+    },
+    {
+      "path": "scripts/opencode-generation-spikes/producer.ts",
+      "sha256": "c8fc0ef4e3afc0a041c8d8742562f08ba7537d216debc8e5ac0cbaaab8e548c2"
+    },
+    {
+      "path": "scripts/opencode-generation-spikes/protocol.ts",
+      "sha256": "322272977af008444e4ae563b8cfdd59d59f438f376eef2dd9a032c0f16a9e82"
+    },
+    {
+      "path": "scripts/opencode-generation-spikes/recipe.test.ts",
+      "sha256": "8aec6e1365a8a33842a4d362ae51f195f8da70440795e851067eedc8e8ba1bd8"
+    },
+    {
+      "path": "scripts/opencode-generation-spikes/sandbox.ts",
+      "sha256": "b4c2cf2e7031f34745988feb4cb1d196ccda456ac921a507704324208aab2ff5"
+    },
+    {
+      "path": "scripts/opencode-generation-spikes/version.ts",
+      "sha256": "668b8a4e089b1eb70eab7596ffb2755d2ff9c9777383a81bf24bf26b4c062689"
+    }
+  ]
+}

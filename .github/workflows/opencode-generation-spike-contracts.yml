@@ -4,6 +4,8 @@ on:
   pull_request:
     paths:
       - 'scripts/opencode-generation-contract-spike.ts'
+      - 'scripts/opencode-causality-spike.ts'
+      - 'scripts/opencode-causality-spikes/**'
       - 'scripts/opencode-generation-spikes/**'
       - 'test/fixtures/opencode-generation-native/**'
       - '.github/workflows/opencode-generation-spike-contracts.yml'
@@ -11,6 +13,8 @@ on:
     branches: [main]
     paths:
       - 'scripts/opencode-generation-contract-spike.ts'
+      - 'scripts/opencode-causality-spike.ts'
+      - 'scripts/opencode-causality-spikes/**'
       - 'scripts/opencode-generation-spikes/**'
       - 'test/fixtures/opencode-generation-native/**'
       - '.github/workflows/opencode-generation-spike-contracts.yml'
@@ -37,7 +41,7 @@ jobs:
           mkdir -p "$test_root"/{home,config,state,cache,data,tmp,appdata,localappdata} .task-output/unit-roots
           printf 'TEST_ROOT=%s\n' "$test_root" >> "$GITHUB_ENV"
       - name: Verify decoder and cleanup contracts without native or model services
-        run: bun test scripts/opencode-generation-spikes/contracts.test.ts scripts/opencode-generation-spikes/recipe.test.ts
+        run: bun test scripts/opencode-generation-spikes/contracts.test.ts scripts/opencode-generation-spikes/recipe.test.ts scripts/opencode-causality-spikes
         env:
           HOME: ${{ env.TEST_ROOT }}/home
           USERPROFILE: ${{ env.TEST_ROOT }}/home
