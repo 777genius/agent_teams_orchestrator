@@ -1,0 +1,17 @@
+{
+  "args": [
+    "/srv/workers/evidence/agent-teams-ai/opencode-dual-20261001/TEST-root-native-qualification-1790928391277242590/TEST-v1-1.16.0/artifacts/native-opencode",
+    "serve",
+    "--help"
+  ],
+  "pid": 3774059,
+  "birth": {
+    "format": "linux-start-ticks",
+    "value": "101539168",
+    "bootId": "f12bc43a-9252-42d4-919d-85b846a176a8"
+  },
+  "stdout": "",
+  "stderr": "opencode serve\n\nstarts a headless opencode server\n\nOptions:\n  -h, --help         show help                                                             [boolean]\n  -v, --version      show version number                                                   [boolean]\n      --print-logs   print logs to stderr                                                  [boolean]\n      --log-level    log level                  [string] [choices: \"DEBUG\", \"INFO\", \"WARN\", \"ERROR\"]\n      --pure         run without external plugins                                          [boolean]\n      --port         port to listen on                                         [number] [default: 0]\n      --hostname     hostname to listen on                           [string] [default: \"127.0.0.1\"]\n      --mdns         enable mDNS service discovery (defaults hostname to 0.0.0.0)\n                                                                          [boolean] [default: false]\n      --mdns-domain  custom domain name for mDNS service (default: opencode.local)\n                                                                [string] [default: \"opencode.local\"]\n      --cors         additional domains to allow for CORS                      [array] [default: []]",
+  "code": 0,
+  "expired": false
+}
