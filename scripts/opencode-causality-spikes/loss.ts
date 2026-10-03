@@ -1,4 +1,4 @@
-import { Wire, Evidence, Missing, readBounded } from './wire';
+import { Wire, Evidence, Missing, RequestFailure, readBounded } from './wire';
 
 // Transparent, one-mutation-only response-loss boundary. This is not a native
 // emulator: the saved path/body is forwarded to the owned native Wire unchanged.
@@ -11,9 +11,9 @@ export class LossBoundary {
   constructor(readonly native: Wire, readonly path: string, readonly body: unknown,
     readonly phase: 'before-forward' | 'after-response', readonly evidence: Evidence) {}
   private failedResponse() {
-    return new Response(new ReadableStream({ start(controller) {
-      controller.error(new Missing('selected native response channel dropped'));
-    } }), { headers: { 'content-type': 'application/json' } });
+    return Response.json({ observation: 'deliberately-suppressed', automaticMutationReplay: false }, {
+      status: 503, headers: { 'x-test-observation': 'deliberately-suppressed' },
+    });
   }
   handle = async (request: Request) => {
     if (new URL(request.url).pathname !== '/loss/' + this.nonce || request.method !== 'POST') return new Response('unselected request', { status: 404 });
@@ -21,14 +21,15 @@ export class LossBoundary {
     this.accepted = true;
     const raw = await readBounded(request.body, 4 * 1024 * 1024, this.native.signal, this.evidence.raw, 'loss-caller-request.raw');
     if (raw.toString() !== JSON.stringify(this.body)) throw new Error('loss boundary body differs from saved native mutation');
-    await this.evidence.json('loss-channel.json', { phase: this.phase, nativePath: this.path, mutationCount: 1 });
+    await this.evidence.json('loss-channel.json', { phase: this.phase, nativePath: this.path, mutationCount: 1,
+      mechanism: 'deliberate-observer-loss-owned-503', trueTCPLossQualified: false, beforeEffectQualified: false });
     const forward = async () => {
       const reply = await this.native.call(this.path, 'POST', this.body);
       this.witness = { status: reply.status, value: reply.value };
       await this.evidence.json('loss-native-witness.json', { ...this.witness, nativePath: this.path, forwardedExactlyOnce: true });
     };
     if (this.phase === 'before-forward') {
-      // The downstream body is permanently errored before any upstream fetch.
+      // Select suppression before forwarding; this does not qualify before-effect loss.
       const failed = this.failedResponse();
       this.forwarded = forward(); this.forwarded.catch(() => {});
       return failed;
@@ -42,25 +43,48 @@ export class LossBoundary {
   }
   async observe() {
     if (!this.server) throw new Error('loss boundary not listening');
-    let lost = false;
+    let lost = false, response: Response | undefined;
     try {
-      const response = await fetch(`http://127.0.0.1:${this.server.port}/loss/${this.nonce}`, {
-        method: 'POST', body: JSON.stringify(this.body), signal: this.native.signal, redirect: 'error',
+      response = await fetch(`http://127.0.0.1:${this.server.port}/loss/${this.nonce}`, {
+        method: 'POST', body: JSON.stringify(this.body), signal: this.native.signal, redirect: 'error', keepalive: false,
       });
-      // Bun may represent an errored response stream as a proxy 500 or connection
-      // loss. Neither delivers the original native reply; record the actual form.
-      lost = response.status >= 500;
-      await this.evidence.json('loss-downstream-status.json', { status: response.status });
-      await readBounded(response.body, 8 * 1024 * 1024, this.native.signal, this.evidence.raw, 'loss-downstream-response.raw');
     } catch (error) {
+      this.native.signal.throwIfAborted();
       lost = true;
       await this.evidence.json('loss-observer.json', { error: String(error), automaticMutationReplay: false });
     }
+    if (response) {
+      // The owned 503 is deliberate suppression; native admission remains unknown
+      // until its independent witness and readback, even for native 204/null.
+      lost = response.status >= 500;
+      try {
+        await this.evidence.json('loss-downstream-status.json', { status: response.status });
+        await readBounded(response.body, 8 * 1024 * 1024, this.native.signal, this.evidence.raw, 'loss-downstream-response.raw');
+      } catch (error) {
+        this.native.signal.throwIfAborted();
+        if (!(error instanceof RequestFailure)) throw error;
+        lost = true;
+        await this.evidence.json('loss-observer.json', { error: String(error), automaticMutationReplay: false });
+      } finally { await response.body?.cancel().catch(() => {}); }
+    }
     if (!lost) throw new Error('response loss not observed');
-    await this.forwarded; // readback follows the native exactly-once forwarding witness
+    await this.drain(); // readback follows the native exactly-once forwarding witness
     if (!this.witness) throw new Missing('native forwarding witness missing');
   }
   async stop() {
-    try { await this.forwarded; } finally { this.server?.stop(true); this.server = undefined; }
+    try {
+      if (this.forwarded) await this.drain();
+    } finally { this.server?.stop(true); this.server = undefined; }
+  }
+  private async drain() {
+    this.native.signal.throwIfAborted();
+    let abort!: () => void;
+    try {
+      await Promise.race([this.forwarded, new Promise<never>((_, reject) => {
+        abort = () => reject(this.native.signal.reason);
+        this.native.signal.addEventListener('abort', abort, { once: true });
+        if (this.native.signal.aborted) abort();
+      })]);
+    } finally { this.native.signal.removeEventListener('abort', abort); }
   }
 }

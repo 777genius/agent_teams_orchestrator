@@ -236,7 +236,8 @@ for (const phase of ['before-forward', 'after-response'] as const) {
     const boundary = new LossBoundary(wireFor(native), '/api/session', { id: 'ses_reserved' }, phase, evidence);
     const request = () => new Request('http://127.0.0.1:1234/loss/' + boundary.nonce, { method: 'POST', body: '{"id":"ses_reserved"}' });
     const response = await boundary.handle(request());
-    await expect(response.text()).rejects.toThrow('channel dropped');
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({ observation: 'deliberately-suppressed', automaticMutationReplay: false });
     await boundary.stop();
     expect(boundary.witness).toEqual({ status: 200, value: { data: { id: 'ses_reserved' } } });
     expect(incoming).toEqual([{ method: 'POST', path: '/api/session', body: { id: 'ses_reserved' } }]);

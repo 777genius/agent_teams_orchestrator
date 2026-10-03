@@ -3,6 +3,7 @@ import { expect, mock } from 'bun:test';
 import { createServer } from 'node:http';
 import { readlink, readFile, rm } from 'node:fs/promises';
 import { testSpace } from './test-space';
+import { cleanupBound } from './owned-cleanup';
 import * as sandbox from '../opencode-generation-spikes/sandbox';
 import { Missing } from './wire';
 const original = { ...sandbox }, mode = process.argv[2];
@@ -10,7 +11,21 @@ const birth = await original.processBirth(process.pid);
 let finish!: (code: number) => void, stops = 0;
 const exited = new Promise<number>(resolve => { finish = resolve; });
 mock.module('../opencode-generation-spikes/sandbox', () => ({ ...original,
-  OwnedProcessTree: class { start() {} async stop() { stops++; finish(0); return 'TEST-drained'; } },
+  OwnedProcessTree: class {
+    readonly processes;
+    constructor(pid: number, token: typeof birth) { this.processes = new Map([[pid, token]]); }
+  },
+}));
+mock.module('./owned-cleanup', () => ({
+  OwnedCleanup: class {
+    readonly processes;
+    constructor(readonly proc: any, token: typeof birth, tree: any) {
+      this.processes = tree.processes; expect(this.processes.get(proc.pid)).toEqual(token);
+    }
+    start() {}
+    async stop() { stops++; this.proc.kill('SIGTERM'); await this.proc.exited; return { errors: [], results: ['TEST-drained'] }; }
+  },
+  cleanupBound,
 }));
 mock.module('../opencode-generation-spikes/auth', () => ({ OwnedEndpoint: class {
   async headers() { return { Authorization: 'Basic TEST-SECRET' }; }
@@ -47,7 +62,8 @@ const server = createServer((req, res) => {
 });
 server.on('connection', socket => { sockets.add(socket); socket.on('close', () => sockets.delete(socket)); });
 const spawn = Bun.spawn;
-const proc: any = { pid: process.pid, exitCode: null, exited, stdout: new Response('').body, stderr: new Response('').body };
+const proc: any = { pid: process.pid, exitCode: null, exited,
+  kill(signal: string) { expect(['SIGTERM', 'SIGKILL']).toContain(signal); finish(0); }, stdout: new Response('').body, stderr: new Response('').body };
 exited.then(code => { proc.exitCode = code; });
 (Bun as any).spawn = (argv: string[]) => { server.listen(Number(argv.at(-1)), '127.0.0.1'); return proc; };
 let result: Awaited<ReturnType<typeof host>> | undefined, error: any;

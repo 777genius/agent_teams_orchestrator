@@ -4,6 +4,7 @@ import { OwnedEndpoint } from '../opencode-generation-spikes/auth';
 import { NativeArtifact } from '../opencode-generation-spikes/artifacts';
 import { Evidence, Wire, Missing, RequestFailure, RecordingFailure } from './wire';
 import { Selection } from './contracts';
+import { OwnedCleanup, cleanupBound } from './owned-cleanup';
 
 // S0/start/stop's existing authentication and process ownership are reused read-only.
 // A small separate launcher exposes raw HTTP/SSE; the S0 requester drops raw 4xx.
@@ -17,25 +18,34 @@ export async function host(sandbox: Sandbox, artifact: NativeArtifact, selected:
   });
   let birth: Awaited<ReturnType<typeof processBirth>> | undefined;
   let tree: OwnedProcessTree | undefined, owner: OwnedEndpoint | undefined;
+  let owned: OwnedCleanup | undefined;
+  const pipeAbort = new AbortController();
+  let out = proc.stdout, err = proc.stderr;
   let stdout: Promise<string> | undefined, stderr: Promise<string> | undefined;
-  let captureError: unknown, stopped = false;
-  const stop = async () => {
-    if (stopped) return;
-    stopped = true;
+  let captureError: unknown, stopping: Promise<void> | undefined;
+  const stop = () => stopping ??= (async () => {
     const errors: string[] = [];
     let cleanup: unknown, drained = false;
     try {
-      owner?.retire();
       try {
-        if (birth) {
-          // Even ownership construction/start failure retains the exact birth token.
-          cleanup = await (tree ?? new OwnedProcessTree(proc.pid, birth)).stop();
+        owner?.retire();
+      } catch (e) { errors.push('retire: ' + String(e)); }
+      try {
+        if (owned) {
+          cleanup = await owned.stop();
+          errors.push(...(cleanup as any).errors);
         } else {
-          // Only the intrinsic handle returned by this spawn is authority pre-birth.
+          // The intrinsic handle also covers failed ownership construction.
           proc.kill('SIGKILL');
           cleanup = { authority: 'fresh-subprocess-handle', signal: 'SIGKILL' };
         }
-      } catch (e) { errors.push('termination: ' + String(e)); }
+      } catch (e) {
+        errors.push('termination: ' + String(e));
+        // Observation/setup errors must never skip the intrinsic leader handle.
+        try { proc.kill('SIGKILL'); } catch (fallback: any) {
+          if (fallback.code !== 'ENOENT' && fallback.code !== 'ESRCH') errors.push('leader fallback: ' + String(fallback));
+        }
+      }
       let timer: ReturnType<typeof setTimeout> | undefined;
       try {
         await Promise.race([proc.exited, new Promise<never>((_, reject) => {
@@ -46,26 +56,29 @@ export async function host(sandbox: Sandbox, artifact: NativeArtifact, selected:
       finally { clearTimeout(timer); }
       // Failed setup may never have attached either capture; close those pipes too.
       for (const [name, stream, capture] of [
-        ['stdout', proc.stdout, stdout], ['stderr', proc.stderr, stderr],
+        ['stdout', out, stdout], ['stderr', err, stderr],
       ] as const) {
         try {
           if (capture && drained) {
-            const text = await capture;
-            await evidence.raw('host-' + name + '.raw', Buffer.from(owner!.scrub(text)));
-          } else if (!stream.locked) await stream.cancel();
+            const text = await cleanupBound(capture, name + ' capture');
+            await evidence.raw('host-' + name + '.raw', Buffer.from(owner?.scrub(text) ?? text));
+          } else if (!stream.locked) await cleanupBound(stream.cancel(), name + ' cancel');
         } catch (e) { errors.push(name + ': ' + String(e)); }
       }
       await evidence.json('host-cleanup.json', { pid: proc.pid, birth: birth ?? null,
         cleanup, drained, exitCode: proc.exitCode, errors });
       if (errors.length) throw new Error('host cleanup incomplete: ' + errors.join('; '));
-    } finally { owner?.revoke(); }
-  };
+    } finally { pipeAbort.abort(); owner?.revoke(); }
+  })();
   try {
+    out = proc.stdout.pipeThrough(new TransformStream(), { signal: pipeAbort.signal });
+    err = proc.stderr.pipeThrough(new TransformStream(), { signal: pipeAbort.signal });
     birth = await processBirth(proc.pid);
-    tree = new OwnedProcessTree(proc.pid, birth); tree.start();
+    tree = new OwnedProcessTree(proc.pid, birth);
+    owned = new OwnedCleanup(proc, birth, tree); owned.start();
     owner = new OwnedEndpoint(sandbox, base, proc.pid, birth);
-    stdout = owner.stdout(proc.stdout); stdout.catch(e => { captureError = e; });
-    stderr = boundedText(proc.stderr); stderr.catch(e => { captureError = e; });
+    stdout = owner.stdout(out); stdout.catch(e => { captureError = e; });
+    stderr = boundedText(err); stderr.catch(e => { captureError = e; });
     const wire = new Wire(base, u => owner!.headers(u), evidence.raw, signal);
     observeWire?.(wire);
     let identity: any;
