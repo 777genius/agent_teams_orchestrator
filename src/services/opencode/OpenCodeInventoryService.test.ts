@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { access, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
+import { access, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
@@ -368,6 +368,7 @@ describe('OpenCodeInventoryService parsers', () => {
   test('portable inventory command runner captures stdout and stderr', async () => {
     const tempDir = await mkdtemp(path.join(tmpdir(), 'opencode-inventory-runner-'))
     try {
+      await writeFile(path.join(tempDir, 'cwd-marker'), tempDir, 'utf8')
       const scriptPath = path.join(tempDir, 'echo-env.js')
       await writeFile(
         scriptPath,
@@ -395,11 +396,15 @@ describe('OpenCodeInventoryService parsers', () => {
       })
 
       expect(result.code).toBe(0)
-      expect(JSON.parse(result.stdout)).toEqual({
-        cwd: await realpath(tempDir),
+      const output = JSON.parse(result.stdout) as { cwd: string; arg: string; env: string }
+      expect(output).toEqual({
+        cwd: expect.any(String),
         arg: 'hello',
         env: 'present',
       })
+      // Windows may report an 8.3 alias for the same directory (RUNNER~1).
+      // Verify the effective cwd through a fixture unique to this directory.
+      expect(await readFile(path.join(output.cwd, 'cwd-marker'), 'utf8')).toBe(tempDir)
       expect(result.stderr).toBe('inventory warning')
     } finally {
       await rm(tempDir, { recursive: true, force: true })
