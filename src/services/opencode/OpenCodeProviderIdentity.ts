@@ -19,7 +19,11 @@ const OPEN_CODE_PROVIDER_ALIASES = new Map<string, string>([
 ])
 
 export function canonicalizeOpenCodeProviderId(value: string): string {
-  const label = value.trim().toLowerCase().replace(/\s+/g, '-')
+  const displayLabel = value.trim().toLowerCase().replace(/\s+/g, ' ')
+  // The auth CLI prints the built-in provider's display name, not its ID.
+  // Match the spaced label so a custom raw ID "opencode-zen" stays distinct.
+  if (displayLabel === 'opencode zen') return 'opencode'
+  const label = displayLabel.replace(/ /g, '-')
   return (
     OPEN_CODE_PROVIDER_ALIASES.get(label)
     ?? normalizeOpenCodeProviderId(label)
