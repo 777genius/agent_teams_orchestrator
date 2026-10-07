@@ -2444,20 +2444,25 @@ export class OpenCodeSessionBridge {
       assertCallerActive()
       const rawStatus = statusMap[targetSessionId] ?? null
       // Keep canonical native terminal authority separate from reply/activity projection.
-      const terminalController = new AbortController()
-      const abortTerminal = () => terminalController.abort(options.signal?.reason)
-      options.signal?.addEventListener('abort', abortTerminal, { once: true })
-      if (options.signal?.aborted) abortTerminal()
-      const terminalDeadline = setTimeout(() => terminalController.abort(), 2_000)
-      let terminalEvidence: Awaited<ReturnType<typeof readOpenCodeV1TerminalTranscript>>
-      try {
-        terminalEvidence = await readOpenCodeV1TerminalTranscript({
-          authority: activeRecord, baseUrl, sessionId: targetSessionId, signal: terminalController.signal,
-          runtimePromptMessageId: options.runtimePromptMessageId, remainingMs: options.remainingMs,
-        })
-      } finally {
-        clearTimeout(terminalDeadline)
-        options.signal?.removeEventListener('abort', abortTerminal)
+      // Unscoped inventory/history reconciliation has no exact user anchor and
+      // cannot qualify a turn. Preserve its existing read path; only an explicit
+      // prompt observation acquires the additional native terminal evidence.
+      let terminalEvidence: Awaited<ReturnType<typeof readOpenCodeV1TerminalTranscript>> | undefined
+      if (options.runtimePromptMessageId) {
+        const terminalController = new AbortController()
+        const abortTerminal = () => terminalController.abort(options.signal?.reason)
+        options.signal?.addEventListener('abort', abortTerminal, { once: true })
+        if (options.signal?.aborted) abortTerminal()
+        const terminalDeadline = setTimeout(() => terminalController.abort(), 2_000)
+        try {
+          terminalEvidence = await readOpenCodeV1TerminalTranscript({
+            authority: activeRecord, baseUrl, sessionId: targetSessionId, signal: terminalController.signal,
+            runtimePromptMessageId: options.runtimePromptMessageId, remainingMs: options.remainingMs,
+          })
+        } finally {
+          clearTimeout(terminalDeadline)
+          options.signal?.removeEventListener('abort', abortTerminal)
+        }
       }
       // Terminal reads report incomplete evidence on cancellation/deadline. The
       // caller's original budget still fences projection, persistence and return.
