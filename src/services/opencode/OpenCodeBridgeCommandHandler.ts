@@ -70,6 +70,7 @@ import {
   isOpenCodeRuntimeDeadlineError,
   OpenCodeRuntimeDeadline,
   raceOpenCodeAbortSignal,
+  waitForOpenCodeAbortableDelay,
   type OpenCodePhaseContext,
   throwOpenCodeAbortReason,
 } from './OpenCodeRuntimeDeadline.js'
@@ -1402,6 +1403,7 @@ async function reobserveAfterMessageSendToolErrorFallbackGrace(input: {
   limit?: number
   diagnosticCode: string
   signal?: AbortSignal
+  deadline?: OpenCodeRuntimeDeadline
 }): Promise<{
   record: OpenCodeSessionRecord
   summary: OpenCodeSessionReconcileSummary
@@ -1417,21 +1419,26 @@ async function reobserveAfterMessageSendToolErrorFallbackGrace(input: {
 
   do {
     input.signal?.throwIfAborted()
+    input.deadline?.throwIfExpired()
     const elapsedMs = Math.max(0, Date.now() - startedAt)
     const waitMs = Math.min(pollIntervalMs, Math.max(0, fallbackGraceMs - elapsedMs))
     if (waitMs > 0) {
-      await delayMs(waitMs)
+      await waitForOpenCodeAbortableDelay(waitMs, input.signal)
     }
+    input.signal?.throwIfAborted()
+    input.deadline?.throwIfExpired()
     attemptCount += 1
-    reconciled = await withTimeout(
+    reconciled = await raceOpenCodeAbortSignal(withTimeout(
       openCodeSessionBridge.reconcileSession(
         input.record,
         typeof input.limit === 'number' || input.sessionId || input.signal
-          ? { limit: input.limit, sessionId: input.sessionId, ...(input.signal ? { signal: input.signal } : {}) }
+          ? { limit: input.limit, sessionId: input.sessionId, runtimePromptMessageId: input.runtimePromptMessageId, remainingMs: input.deadline ? () => input.deadline!.remainingMs() : undefined, ...(input.signal ? { signal: input.signal } : {}) }
           : undefined,
       ),
       input.timeoutMs,
-    )
+    ), input.signal)
+    input.signal?.throwIfAborted()
+    input.deadline?.throwIfExpired()
     responseObservation = observeOpenCodeDeliveryResponse({
       inboundMessageId: input.inboundMessageId,
       prePromptCursor: input.prePromptCursor,
@@ -5008,11 +5015,15 @@ async function runStop(
 async function runSendMessage(
   envelope: BridgeEnvelope,
   authority?: Awaited<ReturnType<typeof probeStoredLaneAuthority>>,
+  signal?: AbortSignal,
+  deadline?: OpenCodeRuntimeDeadline,
 ): Promise<{
   snapshot: OpenCodeProvisioningSnapshot
   deliveryRuntime?: ReturnType<typeof createRuntimeSnapshot>
   data: SendMessageCommandData
 }> {
+  const checkOperation = () => { signal?.throwIfAborted(); deadline?.throwIfExpired() }
+  checkOperation()
   const authoritySnapshot = authority?.snapshot
   const body = envelope.body
   const teamId = asString(body.teamId) ?? asString(body.teamName)
@@ -5306,7 +5317,9 @@ async function runSendMessage(
     })
   }
   try {
+    checkOperation()
     await assertStoredDeliveryAuthority(deliveryRecord, authority)
+    checkOperation()
     if (noReply) {
       await openCodeSessionBridge.promptAsync(deliveryRecord, {
         text: deliveryText,
@@ -5403,6 +5416,7 @@ async function runSendMessage(
       }
     } else {
       const prompted = await openCodeSessionBridge.promptAsyncWithTurnSettled(deliveryRecord, {
+        signal,
         text: deliveryText,
         parts: fileParts,
         agent: deliveryAgent,
@@ -5467,6 +5481,7 @@ async function runSendMessage(
     throw error
   }
 
+  checkOperation()
   if (!noReply && settlementMode === 'acceptance') {
     const acceptedRuntimePid = mcpRuntimePid ?? deliveryRecord.runtimePid ?? undefined
     const finalData: SendMessageCommandData = {
@@ -5499,6 +5514,7 @@ async function runSendMessage(
       sendMessageData: finalData,
       diagnostics: finalData.diagnostics.map(teamDiagnosticToOutcomeString),
     }).catch(() => undefined)
+    checkOperation()
     await openCodeTurnSettledEmissionCoordinator.emitDelivery({
       record: deliveryRecord,
       runtimePromptMessageId,
@@ -5520,10 +5536,12 @@ async function runSendMessage(
   let reconcileSummary: OpenCodeSessionReconcileSummary | null = null
   let emitRecord = deliveryRecord
   try {
-    const reconciled = await withTimeout(
-      openCodeSessionBridge.reconcileSession(deliveryRecord, { limit: 50 }),
+    checkOperation()
+    const reconciled = await raceOpenCodeAbortSignal(withTimeout(
+      openCodeSessionBridge.reconcileSession(deliveryRecord, { limit: 50, signal, runtimePromptMessageId, remainingMs: deadline ? () => deadline.remainingMs() : undefined }),
       OPENCODE_SEND_RECONCILE_TIMEOUT_MS,
-    )
+    ), signal)
+    checkOperation()
     emitRecord = reconciled.record
     reconcileSummary = reconciled.summary
     runtimePid =
@@ -5546,6 +5564,7 @@ async function runSendMessage(
       try {
         const reobserved = await reobserveAfterMessageSendToolErrorFallbackGrace({
           record: reconciled.record,
+          signal, deadline,
           inboundMessageId: asString(body.messageId),
           prePromptCursor,
           runtimePromptMessageId,
@@ -5553,6 +5572,7 @@ async function runSendMessage(
           limit: 50,
           diagnosticCode: 'opencode_send_reconcile',
         })
+        checkOperation()
         emitRecord = reobserved.record
         reconcileSummary = reobserved.summary
         responseObservation = reobserved.responseObservation
@@ -5590,7 +5610,9 @@ async function runSendMessage(
     ]
     responseObservation = reconcileFailedObservation(message)
   }
+  checkOperation()
   if (!noReply) {
+    checkOperation()
     await openCodeTurnSettledEmissionCoordinator.emitDelivery({
       record: emitRecord,
       runtimePromptMessageId,
@@ -5649,6 +5671,8 @@ async function runSendMessage(
 async function runObserveMessageDelivery(
   envelope: BridgeEnvelope,
   authority?: Awaited<ReturnType<typeof probeStoredLaneAuthority>>,
+  signal?: AbortSignal,
+  deadline?: OpenCodeRuntimeDeadline,
 ): Promise<{
   snapshot: OpenCodeProvisioningSnapshot
   deliveryRuntime?: ReturnType<typeof createRuntimeSnapshot>
@@ -5695,13 +5719,18 @@ async function runObserveMessageDelivery(
   const diagnostics: TeamDiagnostic[] = []
   let responseObservation: OpenCodeDeliveryResponseObservation
   try {
-    const limited = await withTimeout(
+    signal?.throwIfAborted()
+    deadline?.throwIfExpired()
+    const limited = await raceOpenCodeAbortSignal(withTimeout(
       openCodeSessionBridge.reconcileSession(record, {
         limit: 80,
-        sessionId: requestedSessionId, signal: authority?.signal,
+        sessionId: requestedSessionId, signal: signal ?? authority?.signal, runtimePromptMessageId,
+        remainingMs: deadline ? () => deadline.remainingMs() : undefined,
       }),
       OPENCODE_OBSERVE_MESSAGE_TIMEOUT_MS,
-    )
+    ), signal)
+    signal?.throwIfAborted()
+    deadline?.throwIfExpired()
     let observeRecord = limited.record
     runtimePid =
       typeof limited.record.runtimePid === 'number' && limited.record.runtimePid > 0
@@ -5721,12 +5750,17 @@ async function runObserveMessageDelivery(
 
     if (responseObservation.needsFullHistory === true) {
       await assertStoredDeliveryAuthority(limited.record, authority)
-      const full = await withTimeout(
+      signal?.throwIfAborted()
+      deadline?.throwIfExpired()
+      const full = await raceOpenCodeAbortSignal(withTimeout(
         openCodeSessionBridge.reconcileSession(limited.record, {
-          sessionId: requestedSessionId, signal: authority?.signal,
+          sessionId: requestedSessionId, signal: signal ?? authority?.signal, runtimePromptMessageId,
+          remainingMs: deadline ? () => deadline.remainingMs() : undefined,
         }),
         OPENCODE_OBSERVE_MESSAGE_TIMEOUT_MS,
-      )
+      ), signal)
+      signal?.throwIfAborted()
+      deadline?.throwIfExpired()
       observeRecord = full.record
       runtimePid =
         typeof full.record.runtimePid === 'number' && full.record.runtimePid > 0
@@ -5751,7 +5785,7 @@ async function runObserveMessageDelivery(
           inboundMessageId: messageId,
           prePromptCursor: asString(body.prePromptCursor),
           runtimePromptMessageId,
-          sessionId: requestedSessionId, signal: authority?.signal,
+          sessionId: requestedSessionId, signal: signal ?? authority?.signal, deadline,
           timeoutMs: OPENCODE_OBSERVE_MESSAGE_TIMEOUT_MS,
           limit: 80,
           diagnosticCode: 'opencode_observe_reconcile',
@@ -5763,6 +5797,8 @@ async function runObserveMessageDelivery(
         responseObservation = reobserved.responseObservation
         diagnostics.push(...reobserved.diagnostics)
       } catch (fallbackError) {
+        signal?.throwIfAborted()
+        deadline?.throwIfExpired()
         const fallbackMessage = fallbackError instanceof Error
           ? fallbackError.message
           : String(fallbackError)
@@ -5776,12 +5812,16 @@ async function runObserveMessageDelivery(
       }
     }
   } catch (error) {
+    signal?.throwIfAborted()
+    deadline?.throwIfExpired()
     const message = error instanceof Error ? error.message : String(error)
     diagnostics.push(teamDiagnostic('opencode_observe_reconcile_failed', message, 'warning'))
     responseObservation = reconcileFailedObservation(message)
   }
 
   await assertStoredDeliveryAuthority(record, authority)
+  signal?.throwIfAborted()
+  deadline?.throwIfExpired()
   return {
     snapshot, deliveryRuntime: authority?.deliveryRuntime,
     data: {
@@ -6284,16 +6324,19 @@ async function handleEnvelope(
       if (expectedCapabilitySnapshotId(envelope.body)) {
         if (!runtimeDeadline) throw new Error('OpenCode delivery authority deadline was not initialized')
         return withStoredLaneAuthority(envelope, envelope.command, runtimeDeadline, externalSignal,
-          retained => runSendMessage(envelope, retained))
+          retained => runSendMessage(envelope, retained, externalSignal ? AbortSignal.any([externalSignal, runtimeDeadline.signal]) : runtimeDeadline.signal, runtimeDeadline))
       }
-      return runSendMessage(envelope)
+      return runSendMessage(envelope, undefined, runtimeDeadline
+        ? (externalSignal ? AbortSignal.any([externalSignal, runtimeDeadline.signal]) : runtimeDeadline.signal) : externalSignal, runtimeDeadline)
     case 'opencode.observeMessageDelivery': {
       const record = await openCodeSessionStore.get(asString(envelope.body.teamId) ?? asString(envelope.body.teamName) ?? '',
         asString(envelope.body.laneId) ?? '', asString(envelope.body.memberName) ?? '')
       if (record?.profileScope?.purpose === 'launch_runtime') {
         if (!runtimeDeadline) throw new Error('OpenCode observation authority deadline was not initialized')
         return withStoredLaneAuthority(envelope, envelope.command, runtimeDeadline, externalSignal,
-          retained => runObserveMessageDelivery(envelope, retained))
+          retained => runObserveMessageDelivery(envelope, retained,
+            externalSignal ? AbortSignal.any([externalSignal, runtimeDeadline.signal]) : runtimeDeadline.signal,
+            runtimeDeadline))
       }
       return runObserveMessageDelivery(envelope)
     }
@@ -6370,7 +6413,7 @@ export async function executeOpenCodeBridgeCommandEnvelope(
     || envelope.command === 'opencode.stopOutcome'
     || envelope.command === 'opencode.reconcileStop'
     || envelope.command === 'opencode.observeMessageDelivery'
-    || (envelope.command === 'opencode.sendMessage' && !!expectedCapabilitySnapshotId(envelope.body))
+    || envelope.command === 'opencode.sendMessage'
     || (envelope.command === 'opencode.handshake'
       && ['opencode.launchTeam', 'opencode.reconcileTeam', 'opencode.stopTeam', 'opencode.sendMessage', 'opencode.observeMessageDelivery']
         .includes(envelope.body.requiredCommand as string)

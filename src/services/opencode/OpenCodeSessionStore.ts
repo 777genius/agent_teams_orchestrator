@@ -381,13 +381,15 @@ export class OpenCodeSessionStore {
     return operation
   }
 
-  private async acquireStoreLock(signal?: AbortSignal): Promise<() => Promise<void>> {
+  private async acquireStoreLock(signal?: AbortSignal, assertActive?: () => void): Promise<() => Promise<void>> {
+    assertActive?.()
     if (!signal) {
       return this.lock(this.lockPath, LOCK_OPTIONS)
     }
 
     let retryDelayMs = LOCK_RETRY_OPTIONS.minTimeout
     for (let attempt = 0; ; attempt += 1) {
+      assertActive?.()
       if (signal.aborted) throwOpenCodeAbortReason(signal)
       let release: (() => Promise<void>) | undefined
       try {
@@ -397,6 +399,7 @@ export class OpenCodeSessionStore {
           attempt => this.trackLateLockRelease(attempt),
         )
       } catch (error) {
+        assertActive?.()
         if (isLockContention(error) && signal.aborted) {
           throwOpenCodeAbortReason(signal)
         }
@@ -423,13 +426,17 @@ export class OpenCodeSessionStore {
   private async withStoreLock<T>(
     callback: () => Promise<T>,
     signal?: AbortSignal,
+    assertActive?: () => void,
   ): Promise<T> {
+    assertActive?.()
     if (signal?.aborted) throwOpenCodeAbortReason(signal)
     await this.ensureLockFile()
+    assertActive?.()
 
     let release: (() => Promise<void>) | undefined
     try {
-      release = await this.acquireStoreLock(signal)
+      release = await this.acquireStoreLock(signal, assertActive)
+      assertActive?.()
       if (signal?.aborted) throwOpenCodeAbortReason(signal)
       return await callback()
     } finally {
@@ -445,8 +452,8 @@ export class OpenCodeSessionStore {
     return preserveMaterializationFences ? store : normalizeMaterializationOwners(store)
   }
 
-  private async writeStore(store: SessionStoreShape): Promise<void> {
-    await writeJsonFileAtomic(this.filePath, store, { indent: 2 })
+  private async writeStore(store: SessionStoreShape, assertCommitEligible?: () => void): Promise<void> {
+    await writeJsonFileAtomic(this.filePath, store, { indent: 2, assertCommitEligible })
   }
 
   private stopLane(store: SessionStoreShape, request: OpenCodeStopRequest): OpenCodeSessionRecord[] {
@@ -599,13 +606,21 @@ export class OpenCodeSessionStore {
     }, signal)
   }
 
-  async upsert(record: OpenCodeSessionRecord, ownerToken?: MaterializationOwnerToken, expectedRecord?: OpenCodeSessionRecord): Promise<UpsertResult> {
+  async upsert(record: OpenCodeSessionRecord, ownerToken?: MaterializationOwnerToken, expectedRecord?: OpenCodeSessionRecord,
+    operation?: { signal?: AbortSignal; remainingMs?: () => number }): Promise<UpsertResult> {
+    const assertActive = () => {
+      if (operation?.signal?.aborted) throwOpenCodeAbortReason(operation.signal)
+      if (operation?.remainingMs && operation.remainingMs() <= 0) {
+        throw new Error('OpenCode reconciliation operation deadline expired')
+      }
+    }
     if (expectedRecord) {
       expectedRecord = structuredClone(expectedRecord)
       record = structuredClone(record)
     }
     return this.withStoreLock(async () => {
       const store = await this.readStore()
+      assertActive()
       const key = buildRecordKey(record)
       const previous = store.records[key]
       if (expectedRecord) {
@@ -639,9 +654,9 @@ export class OpenCodeSessionStore {
       }
 
       store.records[key] = next
-      await this.writeStore(store)
+      await this.writeStore(store, operation ? assertActive : undefined)
       return previous ? 'updated' : 'created'
-    })
+    }, operation?.signal, operation ? assertActive : undefined)
   }
 
   async claimMaterialization(

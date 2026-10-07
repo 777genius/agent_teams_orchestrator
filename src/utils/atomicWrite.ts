@@ -32,6 +32,9 @@ type AtomicWriteOptions = {
   encoding?: BufferEncoding
   mode?: number
   deps?: Partial<AtomicWriteDeps>
+  // Synchronous admission fence. A filesystem commit already admitted here
+  // cannot be cancelled or undone by a later rejection.
+  assertCommitEligible?: () => void
 }
 
 type AtomicJsonWriteOptions = AtomicWriteOptions & {
@@ -91,8 +94,10 @@ async function renameWithRetry(
   tempPath: string,
   finalPath: string,
   deps: AtomicWriteDeps,
+  assertCommitEligible?: () => void,
 ): Promise<void> {
   for (let attemptIndex = 0; attemptIndex < ATOMIC_RENAME_MAX_ATTEMPTS; attemptIndex += 1) {
+    assertCommitEligible?.()
     try {
       await deps.rename(tempPath, finalPath)
       return
@@ -110,9 +115,10 @@ async function moveFileIntoPlace(
   tempPath: string,
   finalPath: string,
   deps: AtomicWriteDeps,
+  assertCommitEligible?: () => void,
 ): Promise<void> {
   try {
-    await renameWithRetry(tempPath, finalPath, deps)
+    await renameWithRetry(tempPath, finalPath, deps, assertCommitEligible)
     return
   } catch (error) {
     if (!isCrossDeviceRenameError(error)) {
@@ -120,6 +126,7 @@ async function moveFileIntoPlace(
     }
   }
 
+  assertCommitEligible?.()
   await deps.copyFile(tempPath, finalPath)
   await deps.unlink(tempPath).catch(() => undefined)
 }
@@ -212,12 +219,15 @@ export async function writeFileAtomic(
   )
 
   try {
+    options.assertCommitEligible?.()
     await deps.mkdir(dirname(filePath), { recursive: true })
+    options.assertCommitEligible?.()
     await deps.writeFile(tempPath, content, {
       encoding: options.encoding ?? 'utf8',
       ...(options.mode === undefined ? {} : { mode: options.mode }),
     })
-    await moveFileIntoPlace(tempPath, filePath, deps)
+    options.assertCommitEligible?.()
+    await moveFileIntoPlace(tempPath, filePath, deps, options.assertCommitEligible)
   } catch (error) {
     await deps.rm(tempPath, { force: true }).catch(() => undefined)
     throw error

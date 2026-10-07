@@ -1,12 +1,8 @@
 import {
   emitOpenCodeRuntimeTurnSettledBestEffort,
   type OpenCodeRuntimeTurnSettledEmitterPort,
-  type OpenCodeRuntimeTurnSettledOutcome,
-} from './OpenCodeRuntimeTurnSettledEmitter.js'
-import {
-  summarizeOpenCodeBootstrapMcpFailure,
-  summarizeOpenCodeBootstrapMcpReadiness,
-} from './OpenCodeBootstrapMcpFailure.js'
+  } from './OpenCodeRuntimeTurnSettledEmitter.js'
+import { qualifyOpenCodeV1TerminalProof } from './OpenCodeV1TerminalProof.js'
 import type { OpenCodeDeliveryResponseObservation } from './OpenCodeDeliveryResponseObserver.js'
 import type { OpenCodeTurnSettledSummary } from './OpenCodeTurnSettledObserver.js'
 import type {
@@ -29,151 +25,6 @@ function deriveOpenCodeCompletedGeneration(identity: string): number {
   return hash >>> 0
 }
 
-function isTerminalDeliveryProof(observation: OpenCodeDeliveryResponseObservation | undefined): boolean {
-  return observation?.state === 'responded_visible_message' ||
-    observation?.state === 'responded_plain_text' ||
-    observation?.state === 'responded_tool_call' ||
-    observation?.state === 'responded_non_visible_tool' ||
-    observation?.state === 'tool_error'
-}
-
-function hasAssistantResponseForPrompt(
-  summary: OpenCodeSessionReconcileSummary | null | undefined,
-  runtimePromptMessageId: string | null | undefined,
-): boolean {
-  const promptId = runtimePromptMessageId?.trim()
-  if (!summary || !promptId) {
-    return false
-  }
-
-  if (summary.replyPendingSinceMessageId === promptId) {
-    return false
-  }
-
-  if (summary.messages.some(message => message.role === 'assistant' && message.parentId === promptId)) {
-    return true
-  }
-
-  const promptIndex = summary.messages.findIndex(
-    message => message.role === 'user' && message.id === promptId,
-  )
-  if (promptIndex < 0) {
-    return false
-  }
-
-  return summary.messages.slice(promptIndex + 1).some(message => message.role === 'assistant')
-}
-
-function hasErrorForPrompt(
-  summary: OpenCodeSessionReconcileSummary | null | undefined,
-  runtimePromptMessageId: string | null | undefined,
-): boolean {
-  const promptId = runtimePromptMessageId?.trim()
-  if (!summary || !promptId) {
-    return false
-  }
-
-  if (
-    summary.messages.some(
-      message => message.role === 'assistant' && message.parentId === promptId && message.hasError,
-    )
-  ) {
-    return true
-  }
-
-  const promptIndex = summary.messages.findIndex(
-    message => message.role === 'user' && message.id === promptId,
-  )
-  if (promptIndex < 0) {
-    return false
-  }
-
-  return summary.messages
-    .slice(promptIndex + 1)
-    .some(message => message.role === 'assistant' && message.hasError)
-}
-
-function isAppManagedOpenCodeBootstrap(
-  record: Pick<OpenCodeSessionRecord, 'bootstrapMode'>,
-): boolean {
-  return record.bootstrapMode !== 'model_tool_checkin'
-}
-
-function bootstrapMcpFailureDetail(
-  record: OpenCodeSessionRecord,
-  summary: OpenCodeSessionReconcileSummary | null | undefined,
-): string | null {
-  if (!summary || isAppManagedOpenCodeBootstrap(record)) {
-    return null
-  }
-  return summarizeOpenCodeBootstrapMcpFailure(summary)?.message ?? null
-}
-
-function outcomeFromDelivery(input: {
-  turnSettled?: OpenCodeTurnSettledSummary | null
-  reconcileSummary?: OpenCodeSessionReconcileSummary | null
-  responseObservation?: OpenCodeDeliveryResponseObservation
-  runtimePromptMessageId?: string | null
-}): OpenCodeRuntimeTurnSettledOutcome {
-  if (isTerminalDeliveryProof(input.responseObservation)) {
-    return input.responseObservation?.state === 'tool_error' ? 'error' : 'success'
-  }
-  const runtimePromptMessageId =
-    input.runtimePromptMessageId?.trim() ||
-    input.turnSettled?.runtimePromptMessageId?.trim()
-  if (hasErrorForPrompt(input.reconcileSummary, runtimePromptMessageId)) {
-    return 'error'
-  }
-  if (hasAssistantResponseForPrompt(input.reconcileSummary, runtimePromptMessageId)) {
-    return 'success'
-  }
-  return input.turnSettled?.outcome ?? 'unknown'
-}
-
-function outcomeFromLaunch(input: {
-  record: OpenCodeSessionRecord
-  previewSummary?: OpenCodeSessionPreviewSummary | null
-  reconcileSummary?: OpenCodeSessionReconcileSummary | null
-}): OpenCodeRuntimeTurnSettledOutcome {
-  if (input.reconcileSummary?.staleReason) {
-    return 'error'
-  }
-  if (input.reconcileSummary?.errorCount && input.reconcileSummary.errorCount > 0) {
-    return 'error'
-  }
-  if (bootstrapMcpFailureDetail(input.record, input.reconcileSummary)) {
-    return 'error'
-  }
-  if (isAppManagedOpenCodeBootstrap(input.record)) {
-    if (
-      input.reconcileSummary?.pendingPermissionRequestIds.length ||
-      input.reconcileSummary?.durableState === 'blocked'
-    ) {
-      return 'idle_without_assistant_activity'
-    }
-    if (input.previewSummary?.runtimeState === 'error') {
-      return 'error'
-    }
-    if (input.previewSummary?.streamConnected === false && !input.reconcileSummary) {
-      return 'stream_unavailable'
-    }
-    return 'success'
-  }
-  if (input.reconcileSummary && summarizeOpenCodeBootstrapMcpReadiness(input.reconcileSummary).ready) {
-    return 'success'
-  }
-  if (input.previewSummary?.runtimeState === 'error') {
-    return 'error'
-  }
-  if (input.previewSummary?.latestAssistantMessageId) {
-    return 'success'
-  }
-  if (input.previewSummary?.streamConnected === false) {
-    return 'stream_unavailable'
-  }
-  return 'idle_without_assistant_activity'
-}
-
 function compactDiagnostics(values: Array<string | null | undefined>): string | undefined {
   const value = values
     .filter((item): item is string => Boolean(item?.trim()))
@@ -184,6 +35,8 @@ function compactDiagnostics(values: Array<string | null | undefined>): string | 
 }
 
 export class OpenCodeTurnSettledEmissionCoordinator {
+  private readonly emittedObservations = new WeakSet<object>()
+
   constructor(private readonly deps: CoordinatorDeps = {}) {}
 
   async emitDelivery(input: {
@@ -193,9 +46,19 @@ export class OpenCodeTurnSettledEmissionCoordinator {
     reconcileSummary?: OpenCodeSessionReconcileSummary | null
     responseObservation?: OpenCodeDeliveryResponseObservation
   }): Promise<void> {
-    const runtimePromptMessageId =
-      input.runtimePromptMessageId?.trim() ||
-      input.turnSettled?.runtimePromptMessageId?.trim()
+    const runtimePromptMessageId = input.runtimePromptMessageId
+    if (!input.record.laneId || !input.record.teamId || !input.record.memberName || input.record.staleReason) return
+    const observation = input.turnSettled
+    if (observation && (observation.sessionId !== input.record.opencodeSessionId || observation.runtimePromptMessageId !== runtimePromptMessageId)) return
+    const evidence = input.reconcileSummary ? input.reconcileSummary.terminalEvidence : observation?.terminalProof?.evidence
+    if (input.reconcileSummary && (input.reconcileSummary.sessionId !== input.record.opencodeSessionId || input.reconcileSummary.staleReason || input.reconcileSummary.durableState === 'blocked' || input.reconcileSummary.pendingPermissionRequestIds.length)) return
+    const { proof } = qualifyOpenCodeV1TerminalProof(evidence, input.record.opencodeSessionId, runtimePromptMessageId)
+    if (!proof) return
+    const authority = proof.evidence.authority
+    if (!authority || authority.hostKey !== input.record.hostKey || authority.runId !== input.record.runId || authority.profileRootKey !== input.record.profileRootKey || authority.projectPath !== input.record.projectPath) return
+    if (observation?.terminalProof && (observation.terminalProof.sessionId !== input.record.opencodeSessionId || observation.terminalProof.runtimePromptMessageId !== runtimePromptMessageId)) return
+    if (observation && this.emittedObservations.has(observation)) return
+    if (observation) this.emittedObservations.add(observation)
     const detail = compactDiagnostics([
       input.responseObservation?.state,
       input.responseObservation?.reason,
@@ -212,13 +75,10 @@ export class OpenCodeTurnSettledEmissionCoordinator {
         recordedAt: (this.deps.now ?? (() => new Date()))().toISOString(),
         sessionId: input.record.opencodeSessionId,
         teamName: input.record.teamId,
-        memberName: input.record.memberName,
+        memberName: input.record.memberName ?? '',
         laneId: input.record.laneId,
         cwd: input.record.projectPath,
-        outcome: outcomeFromDelivery({
-          ...input,
-          runtimePromptMessageId,
-        }),
+        outcome: proof.outcome,
         ...(runtimePromptMessageId ? { runtimePromptMessageId, turnId: runtimePromptMessageId } : {}),
         runtimeInstanceId: `opencode:${input.record.laneId}`,
         completedGeneration: deriveOpenCodeCompletedGeneration(
@@ -236,42 +96,16 @@ export class OpenCodeTurnSettledEmissionCoordinator {
 
   async emitLaunch(input: {
     record: OpenCodeSessionRecord
+    runtimePromptMessageId?: string | null
     previewSummary?: OpenCodeSessionPreviewSummary | null
     reconcileSummary?: OpenCodeSessionReconcileSummary | null
   }): Promise<void> {
-    const turnId = input.reconcileSummary?.latestUserMessageId
-    const detail = compactDiagnostics([
-      bootstrapMcpFailureDetail(input.record, input.reconcileSummary),
-      ...(input.previewSummary?.diagnostics ?? []),
-      ...(input.reconcileSummary?.diagnostics ?? []),
-    ])
-    await emitOpenCodeRuntimeTurnSettledBestEffort(
-      {
-        schemaVersion: 1,
-        provider: 'opencode',
-        eventName: 'runtime_turn_settled',
-        hookEventName: 'Stop',
-        source: 'agent-teams-orchestrator-opencode',
-        recordedAt: (this.deps.now ?? (() => new Date()))().toISOString(),
-        sessionId: input.record.opencodeSessionId,
-        teamName: input.record.teamId,
-        memberName: input.record.memberName,
-        laneId: input.record.laneId,
-        cwd: input.record.projectPath,
-        outcome: outcomeFromLaunch(input),
-        ...(turnId ? { turnId } : {}),
-        runtimeInstanceId: `opencode:${input.record.laneId}`,
-        completedGeneration: deriveOpenCodeCompletedGeneration(
-          turnId || input.record.opencodeSessionId,
-        ),
-        ...(input.record.selectedModel ? { selectedModel: input.record.selectedModel } : {}),
-        ...(typeof input.record.runtimePid === 'number' && input.record.runtimePid > 0
-          ? { runtimePid: input.record.runtimePid }
-          : {}),
-        ...(detail ? { detail } : {}),
-      },
-      this.deps.emitter,
-    )
+    // Silent bootstrap is lifecycle readiness, never native execution.
+    if (input.record.bootstrapMode !== 'model_tool_checkin' || !input.runtimePromptMessageId || input.record.bootstrapRuntimePromptMessageId !== input.runtimePromptMessageId) return
+    await this.emitDelivery({
+      record: input.record, runtimePromptMessageId: input.runtimePromptMessageId,
+      reconcileSummary: input.reconcileSummary,
+    })
   }
 }
 

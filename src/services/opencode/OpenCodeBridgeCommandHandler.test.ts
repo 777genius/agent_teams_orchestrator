@@ -9398,7 +9398,86 @@ describe('OpenCodeBridgeCommandHandler', () => {
     }
   }, 15_000)
 
-  test('emits runtime turn-settled spool from the production send-message command path', async () => {
+  // R6: original send starts fresh reconciliation after observer cancellation and spools Stop.
+  test.each(['observation', 'final', 'fallback', 'deadline'] as const)('public send cancellation during %s fences reads and Stop; recovery retains prompt without replay', async phase => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'TEST-opencode-cancel-'))
+    process.env[RUNTIME_TURN_SETTLED_SPOOL_ROOT_ENV] = path.join(tempDir, 'spool')
+    const record = buildRecord({ laneId: 'secondary:opencode:bob', memberName: 'bob', opencodeSessionId: 'session-bob' })
+    const operation = new AbortController()
+    let readsAfterCancel = 0, submissions = 0, savedId: string | null = null
+    let observedSignal: AbortSignal | undefined, finalSignal: AbortSignal | undefined, finalReads = 0
+    const upsert = openCodeCommandOutcomeStore.upsert
+    openCodeCommandOutcomeStore.upsert = async patch => {
+      if (patch.runtimePromptMessageId) savedId = patch.runtimePromptMessageId
+      return upsert(patch)
+    }
+    const prompt = openCodeSessionBridge.promptAsyncWithTurnSettled
+    openCodeSessionBridge.promptAsyncWithTurnSettled = async (sessionRecord, input) => prompt(sessionRecord, {
+      ...input, onPromptAccepted: async event => {
+        await input.onPromptAccepted?.(event)
+        expect(input.signal?.aborted).toBe(false)
+        observedSignal = input.signal
+        if (phase === 'observation') operation.abort(new Error('TEST cancel accepted turn'))
+        if (phase === 'deadline') { const until = performance.now() + 10; while (performance.now() < until) { /* Hold the timer queue past the deadline. */ } }
+      },
+    })
+    openCodeProvisioningProbe.probe = async () => snapshot
+    openCodeSessionStore.get = async () => record
+    openCodeSessionBridge.promptAsync = async () => { submissions++ }
+    openCodeSessionBridge.reconcileSession = async (sessionRecord, options) => {
+      if (operation.signal.aborted && options?.signal?.aborted !== false) readsAfterCancel++
+      const user = buildCanonicalMessage({ id: 'msg_test_turn_settled', role: 'user', createdAt: 100 })
+      if (options?.limit === 50) {
+        finalSignal = options.signal
+        finalReads++
+        if (phase === 'final') operation.abort(new Error('TEST cancel final confirmation'))
+      }
+      const assistant = buildCanonicalMessage({ id: 'msg_TEST_terminal', parentId: user.id, role: 'assistant',
+        createdAt: 101, completedAt: 102, finishReason: 'stop', text: finalReads > 1 ? 'TEST recovered reply' : '' })
+      if (phase === 'fallback' && finalReads === 1 && !operation.signal.aborted) {
+        assistant.toolCalls = [buildToolCall({ callId: 'TEST-call', toolName: 'agent-teams_message_send', status: 'errored',
+          isError: true, input: { relayOfMessageId: 'TEST-inbound-cancel', text: 'TEST reply' }, outputText: 'Not connected' })]
+        setTimeout(() => operation.abort(new Error('TEST cancel fallback grace')), 1)
+      }
+      return { record: sessionRecord, summary: buildReconcileSummary({ sessionId: record.opencodeSessionId,
+        latestUserMessageId: user.id, latestAssistantMessageId: assistant.id, messages: [user, assistant],
+        terminalEvidence: { authority: record, sessionId: record.opencodeSessionId, messages: [user, assistant],
+          messageSessionIds: [record.opencodeSessionId, record.opencodeSessionId], complete: true, interactionsSettled: true, diagnostics: [] },
+      }) }
+    }
+    try {
+      const body = { teamId: 'team-a', teamName: 'team-a', laneId: record.laneId, memberName: 'bob',
+        projectPath: '/tmp/project', text: 'TEST retained input', messageId: 'TEST-inbound-cancel' }
+      const envelope = buildEnvelope('opencode.sendMessage', body)
+      if (phase === 'deadline') envelope.timeoutMs = 5
+      const result = await executeOpenCodeBridgeCommandEnvelope(envelope, { signal: operation.signal })
+      const stopped = await readdir(path.join(tempDir, 'spool', 'incoming')).catch((error: NodeJS.ErrnoException) => {
+        if (error.code === 'ENOENT') return []
+        throw error
+      })
+      console.log('R6 public cancellation', JSON.stringify({ phase, ok: result.ok, readsAfterCancel, finalReads, submissions, savedId, Stop: stopped.length }))
+      expect(result.ok).toBe(false)
+      expect(readsAfterCancel).toBe(0)
+      if (phase === 'final' || phase === 'fallback') expect(finalSignal).toBe(observedSignal)
+      if (phase === 'deadline') { expect(finalReads).toBe(0); if ('error' in result) expect(result.error.kind).toBe('timeout') }
+      expect(String(savedId)).toBe('msg_test_turn_settled')
+      expect(submissions).toBe(1)
+      const recovery = new AbortController()
+      const recovered = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.observeMessageDelivery', {
+        ...body, sessionId: record.opencodeSessionId, runtimePromptMessageId: savedId,
+      }), { signal: recovery.signal })
+      expect(recovered.ok).toBe(true)
+      expect(submissions).toBe(1)
+      expect(String(savedId)).toBe('msg_test_turn_settled')
+      const files = await readdir(path.join(tempDir, 'spool', 'incoming')).catch((error: NodeJS.ErrnoException) => {
+        if (error.code === 'ENOENT') return []
+        throw error
+      })
+      expect(files).toHaveLength(0)
+    } finally { await rm(tempDir, { recursive: true, force: true }) }
+  })
+
+  test('suppresses execution spool when the production send-message path has only reply progress', async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-send-spool-test-'))
     process.env[RUNTIME_TURN_SETTLED_SPOOL_ROOT_ENV] = path.join(tempDir, 'runtime-turn-settled')
     const record = buildRecord({
@@ -9477,20 +9556,12 @@ describe('OpenCodeBridgeCommandHandler', () => {
 
       expect(result.ok).toBe(true)
       const incomingDir = path.join(tempDir, 'runtime-turn-settled', 'incoming')
-      const files = await readdir(incomingDir)
-      expect(files).toHaveLength(1)
-      const event = JSON.parse(await readFile(path.join(incomingDir, files[0] ?? ''), 'utf8'))
-      expect(event).toMatchObject({
-        provider: 'opencode',
-        source: 'agent-teams-orchestrator-opencode',
-        eventName: 'runtime_turn_settled',
-        hookEventName: 'Stop',
-        teamName: 'team-a',
-        memberName: 'bob',
-        sessionId: 'session-bob',
-        runtimePromptMessageId: 'msg_test_turn_settled',
-        outcome: 'success',
+      // Regression: assistant allocation/text plus an outcome summary used to spool Stop.
+      const files = await readdir(incomingDir).catch((error: NodeJS.ErrnoException) => {
+        if (error.code === 'ENOENT') return []
+        throw error
       })
+      expect(files).toHaveLength(0)
     } finally {
       await rm(tempDir, { recursive: true, force: true })
     }

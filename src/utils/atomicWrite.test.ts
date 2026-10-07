@@ -15,7 +15,7 @@ afterEach(async () => {
 })
 
 async function createTempDir(): Promise<string> {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'atomic-write-'))
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'TEST-atomic-write-'))
   tempDirs.push(dir)
   return dir
 }
@@ -31,6 +31,44 @@ async function listTempFiles(dir: string, finalName: string): Promise<string[]> 
 }
 
 describe('writeJsonFileAtomic', () => {
+  for (const boundary of ['mkdir', 'temp-write', 'retry', 'fallback'] as const) {
+    test(`expired commit eligibility at ${boundary} preserves destination bytes and removes temp`, async () => {
+      const dir = await createTempDir(), file = path.join(dir, 'TEST-state.json')
+      await fs.writeFile(file, '{"saved":"TEST-original"}')
+      const before = await fs.readFile(file, 'utf8')
+      const deadline = performance.now() + 20
+      const expire = () => { while (performance.now() < deadline) {} }
+      let attempts = 0, copies = 0
+      await expect(writeJsonFileAtomic(file, { saved: 'TEST-replacement' }, {
+        assertCommitEligible: () => { if (performance.now() >= deadline) throw new Error('TEST expired') },
+        deps: {
+          mkdir: async (...args) => { await fs.mkdir(...args); if (boundary === 'mkdir') expire(); return undefined },
+          writeFile: async (...args) => { await fs.writeFile(...args); if (boundary === 'temp-write') expire() },
+          rename: async (from, to) => {
+            attempts++
+            if (boundary === 'retry' && attempts === 1) throw errno('EBUSY')
+            if (boundary === 'fallback') { expire(); throw errno('EXDEV') }
+            await fs.rename(from, to)
+          },
+          sleep: async () => { expire() },
+          copyFile: async (...args) => { copies++; await fs.copyFile(...args) },
+        },
+      })).rejects.toThrow('TEST expired')
+      expect(await fs.readFile(file, 'utf8')).toBe(before)
+      expect(attempts).toBe(boundary === 'retry' || boundary === 'fallback' ? 1 : 0)
+      expect(copies).toBe(0); expect(await listTempFiles(dir, 'TEST-state.json')).toHaveLength(0)
+    })
+  }
+  test('an already admitted commit completes without rollback after eligibility expires', async () => {
+    const dir = await createTempDir(), file = path.join(dir, 'TEST-admitted.json')
+    let active = true
+    await writeJsonFileAtomic(file, { committed: true }, {
+      assertCommitEligible: () => { if (!active) throw new Error('TEST expired') },
+      deps: { rename: async (from, to) => { active = false; await fs.rename(from, to) } },
+    })
+    expect(JSON.parse(await fs.readFile(file, 'utf8'))).toEqual({ committed: true })
+    expect(await listTempFiles(dir, 'TEST-admitted.json')).toHaveLength(0)
+  })
   for (const code of ['EPERM', 'EACCES', 'EBUSY']) {
     test(`retries transient ${code} rename failures`, async () => {
       const dir = await createTempDir()

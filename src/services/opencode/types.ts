@@ -603,6 +603,7 @@ export type OpenCodeExecutionProof = {
 }
 
 export type OpenCodeSessionReconcileSummary = {
+  terminalEvidence?: import('./OpenCodeV1TerminalProof.js').OpenCodeV1TerminalEvidence
   sessionId: string
   reconcileOutcome: 'reconciled' | 'stale'
   rawStatus: OpenCodeSessionStatus | null
@@ -681,6 +682,7 @@ export type OpenCodeSessionRecord = {
   managedConfigSectionFingerprints?: Record<string, string>
   expectedBehaviorFingerprint?: string
   opencodeVersion?: string
+  bootstrapRuntimePromptMessageId?: string
   bootstrapMode?: OpenCodeBootstrapMode
   bootstrapEvidenceSource?: OpenCodeBootstrapEvidenceSource
   appManagedBootstrap?: OpenCodeAppManagedBootstrapRecord
