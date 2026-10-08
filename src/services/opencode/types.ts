@@ -653,6 +653,14 @@ export type OpenCodeSessionStopAuthority = {
   expectedBehaviorFingerprint: string
 }
 
+// Schema1 writers before scalar normalization retained this API payload.
+export type OpenCodeLegacySessionStatus = {
+  type: OpenCodeSessionStatus
+  attempt?: number
+  message?: string
+  next?: number
+}
+
 export type OpenCodeSessionRecord = {
   teamId: string
   runId?: string
@@ -672,7 +680,7 @@ export type OpenCodeSessionRecord = {
   resolvedBehaviorFingerprint: string | null
   opencodeSessionId: string
   lastCanonicalCursor: string | null
-  lastKnownRawStatus: string | null
+  lastKnownRawStatus: string | OpenCodeLegacySessionStatus | null
   lastKnownDurableState: OpenCodeDurableSessionState | null
   sourceAuthFingerprint: string | null
   managedAuthFingerprint: string | null
