@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url'
 const policyPath = /^(?:\.github\/workflows\/|scripts\/ci\/)/
 const platformPath = /^(?:package\.json$|bun\.lock$|tsconfig[^/]*\.json$|cli(?:-source)?$|install\.sh$|scripts\/(?:build|compile)[^/]*|features\/|src\/(?:native-ts\/|entrypoints\/)|src\/utils\/(?:platform|nativeInstaller|subprocessEnv))/
 const lifecyclePath = /^(?:src\/services\/(?:runtimeBackends|teamBootstrap)\/|src\/features\/runtimeProviderManagement\/(?:application|adapters|domain|ports)\/|src\/utils\/(?:process(?:\.ts$|Kill\.)|genericProcessUtils|swarm\/)|src\/tools\/shared\/spawnMultiAgent|src\/cli\/handlers\/runtime|scripts\/(?:opencode-.*conformance|smoke\/windows-runtime-opencode)|test\/fixtures\/opencode-generation-native\/)/
-const authorityPath = /^src\/services\/opencode\/(?:types\.ts$|recovery-contract\/|OpenCode[^/]*(?:Authority|Recovery|Identity|Attribution|Host|Launch|Startup|Stop|Cursor|Profile|Session|Native|OAuth|ExecutionProbe|ManagedPaths|AuthCoordination|AuthStore|RuntimeDeadline|EffectiveAgentPolicyContract|BridgePreconditions|BridgeCommandHandler|McpManager))/
+const authorityPath = /^src\/services\/opencode\/(?:types\.ts$|recovery-contract\/|OpenCode[^/]*(?:Authority|Recovery|Identity|Attribution|Host|BinaryResolver|ProvisioningProbe|ExecutionProof|Launch|Startup|Stop|Cursor|Profile|Session|Native|OAuth|ExecutionProbe|ManagedPaths|AuthCoordination|AuthStore|RuntimeDeadline|EffectiveAgentPolicyContract|BridgePreconditions|BridgeCommandHandler|McpManager))/
 
 export function classify(paths: string[], full = false) {
   const native = full || paths.some(path => policyPath.test(path) || platformPath.test(path) || lifecyclePath.test(path) || authorityPath.test(path))
