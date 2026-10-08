@@ -1,3 +1,4 @@
+import { createRuntimeStatusCommand } from './cli/runtimeStatusCommand.js';
 // These side-effects must run before all other imports:
 // 1. profileCheckpoint marks entry before heavy module evaluation begins
 // 2. startMdmRawRead fires MDM subprocesses (plutil/reg query) so they run in
@@ -4298,17 +4299,10 @@ async function run(): Promise<CommanderCommand> {
   });
 
   const runtime = program.command('runtime').description('Inspect runtime backend availability').configureHelp(createSortedHelpConfig());
-  runtime.command('status').description('Show runtime backend status by provider').addOption(new Option('--provider <provider>', 'Provider to inspect').choices(['anthropic', 'codex', 'gemini', 'opencode', 'all'])).option('--json', 'Output as JSON (default)').option('--text', 'Output as human-readable text').option('--summary', 'Output fast live status without full model catalog metadata').action(async (opts: {
-    json?: boolean;
-    text?: boolean;
-    summary?: boolean;
-    provider?: 'anthropic' | 'codex' | 'gemini' | 'opencode' | 'all';
-  }) => {
-    const {
-      runtimeStatus
-    } = await import('./cli/handlers/runtime.js');
+  runtime.addCommand(createRuntimeStatusCommand(async opts => {
+    const { runtimeStatus } = await import('./cli/handlers/runtime.js');
     await runtimeStatus(opts);
-  });
+  }));
   const runtimeProviders = runtime.command('providers').description('Manage nested runtime providers').configureHelp(createSortedHelpConfig());
   runtimeProviders.command('view').description('Return nested runtime provider management state').addOption(new Option('--runtime <runtime>', 'Runtime to inspect').choices(['opencode'])).option('--project-path <path>', 'Project path whose OpenCode profile should be managed').option('--json', 'Output as JSON (default)').option('--compact', 'Omit unavailable manual-only providers').action(async (opts: {
     runtime?: 'opencode';

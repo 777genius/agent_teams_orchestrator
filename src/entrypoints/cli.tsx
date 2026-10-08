@@ -105,6 +105,31 @@ function parseOpenCodeCommandOptions(args: string[]): {
   }
 }
 
+async function runRuntimeStatusFastPath(args: string[]): Promise<boolean> {
+  if (args[0] !== 'runtime' || args[1] !== 'status') return false
+  // Status is a provider inventory command, including when Anthropic is not
+  // configured. Do not load interactive startup, OAuth or account migrations.
+  const { createRuntimeStatusCommand } = await import('../cli/runtimeStatusCommand.js')
+  const command = createRuntimeStatusCommand(async opts => {
+    const { runtimeStatus } = await import('../cli/handlers/runtime.js')
+    await runtimeStatus(opts)
+  })
+  command.hook('preAction', async () => {
+    const { ensureMdmSettingsLoaded } = await import('../utils/settings/mdm/settings.js')
+    await ensureMdmSettingsLoaded()
+    const { enableConfigs } = await import('../utils/config.js')
+    enableConfigs()
+    const { applySafeConfigEnvironmentVariables } = await import('../utils/managedEnv.js')
+    applySafeConfigEnvironmentVariables()
+    const { applyExtraCACertsFromConfig } = await import('../utils/caCertsConfig.js')
+    applyExtraCACertsFromConfig()
+    const { configureGlobalAgents } = await import('../utils/proxy.js')
+    configureGlobalAgents()
+  })
+  await command.parseAsync(args.slice(2), { from: 'user' })
+  return true
+}
+
 async function runRuntimeProvidersFastPath(args: string[]): Promise<boolean> {
   if (args[0] !== 'runtime' || args[1] !== 'providers' || hasHelpOption(args)) {
     return false
@@ -240,6 +265,8 @@ async function main(): Promise<void> {
     await runtimeOpenCodeCommand(parseOpenCodeCommandOptions(args.slice(2)))
     return
   }
+
+  if (await runRuntimeStatusFastPath(args)) return
 
   if (await runRuntimeProvidersFastPath(args)) {
     profileCheckpoint('cli_runtime_providers_fast_path')

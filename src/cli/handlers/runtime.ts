@@ -1,3 +1,4 @@
+import type { RuntimeStatusOptions } from '../runtimeStatusCommand.js'
 /* eslint-disable custom-rules/no-process-exit -- CLI subcommand handler intentionally exits */
 
 import { getUnifiedRuntimeStatusPayload } from '../../services/runtimeBackends/registry.js'
@@ -62,16 +63,24 @@ async function withRuntimeJsonStdoutGuardedResponse<T>(
   recoverOperationError?: (error: unknown) => T,
 ): Promise<void> {
   const originalWrite = process.stdout.write
+  const originalConsole = { log: console.log, info: console.info, debug: console.debug }
+  const writeDiagnostic = console.error.bind(console)
   let stdoutRestored = false
   const restoreStdout = () => {
     if (stdoutRestored) {
       return
     }
     process.stdout.write = originalWrite
+    Object.assign(console, originalConsole)
     stdoutRestored = true
   }
   process.stdout.write = ((...args: Parameters<typeof process.stdout.write>) =>
     process.stderr.write(...args)) as typeof process.stdout.write
+  // Bun console methods can bypass process.stdout.write. Keep vendor diagnostics
+  // on stderr while the command owns the JSON stdout response.
+  console.log = writeDiagnostic
+  console.info = writeDiagnostic
+  console.debug = writeDiagnostic
   try {
     let result: T
     try {
@@ -324,12 +333,7 @@ function printProviderStatus(provider: RuntimeProviderStatus): void {
   }
 }
 
-export async function runtimeStatus(opts: {
-  json?: boolean
-  text?: boolean
-  provider?: RuntimeProviderTarget
-  summary?: boolean
-}): Promise<void> {
+export async function runtimeStatus(opts: RuntimeStatusOptions): Promise<void> {
   const providerFilter = opts.provider && opts.provider !== 'all' ? opts.provider : undefined
   const loadPayload = () =>
     getUnifiedRuntimeStatusPayload(
