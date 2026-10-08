@@ -323,31 +323,6 @@ augment_launcher_path
 wait_for_target
 BUN_BIN="$(resolve_bun)" || exit $?
 
-if [[ "\${1-}" == "runtime" && "\${2-}" == "status" ]]; then
-  for arg in "$@"; do
-    if [[ "$arg" == "--json" ]]; then
-      RAW_OUTPUT="$(
-        "$BUN_BIN" "$TARGET" "$@" 2> >(cat >&2)
-      )"
-      RAW_OUTPUT="$RAW_OUTPUT" node <<'EOF'
-const raw = process.env.RAW_OUTPUT ?? ''
-const start = raw.indexOf('{')
-const end = raw.lastIndexOf('}')
-if (start < 0 || end <= start) {
-  process.stderr.write(raw)
-  process.exit(1)
-}
-const prefix = raw.slice(0, start).trim()
-if (prefix.length > 0) {
-  process.stderr.write(prefix + '\\n')
-}
-process.stdout.write(raw.slice(start, end + 1) + '\\n')
-EOF
-      exit $?
-    fi
-  done
-fi
-
 exec "$BUN_BIN" "$TARGET" "$@"
 `
 
