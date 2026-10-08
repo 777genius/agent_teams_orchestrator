@@ -8,6 +8,7 @@ import type { Message, StreamEvent } from '../../types/message.js'
 import type { EffortValue } from '../../utils/effort.js'
 import type { PermissionMode } from '../../utils/permissions/PermissionMode.js'
 import { EMPTY_USAGE } from '../api/emptyUsage.js'
+import type { CodexAppServerApprovalRequestHandler } from './appServerApproval.js'
 import { executeCodexNativeTurn } from './turnExecutor.js'
 
 type RunCodexNativeTurnInReplParams = {
@@ -20,6 +21,7 @@ type RunCodexNativeTurnInReplParams = {
   initialAppState: AppState
   transcriptMessages: Message[]
   abortSignal?: AbortSignal
+  requestApproval: CodexAppServerApprovalRequestHandler
   onReplEvent: (event: Message | StreamEvent) => void
 }
 
@@ -67,6 +69,7 @@ export async function runCodexNativeTurnInRepl(
     initialAppState: params.initialAppState,
     startTime: Date.now(),
     abortSignal: params.abortSignal,
+    requestApproval: params.requestApproval,
   })) {
     if (sdkMessage.type === 'assistant' && sdkMessage.error) {
       emittedAssistantError = true

@@ -11,7 +11,10 @@ import {
   isSwarmWorker,
   sendPermissionRequestViaMailbox,
 } from '../../../utils/swarm/permissionSync.js'
-import { registerPermissionCallback } from '../../useSwarmPermissionPoller.js'
+import {
+  registerPermissionCallback,
+  unregisterPermissionCallback,
+} from '../../useSwarmPermissionPoller.js'
 import type { PermissionContext } from '../PermissionContext.js'
 import { createResolveOnce } from '../PermissionContext.js'
 
@@ -76,6 +79,23 @@ async function handleSwarmWorkerPermission(
         permissionSuggestions: suggestions,
       })
 
+      const signal = ctx.toolUseContext.abortController.signal
+      const cleanup = (): void => {
+        signal.removeEventListener('abort', onAbort)
+        unregisterPermissionCallback(request.id)
+        clearPendingRequest()
+      }
+      const onAbort = (): void => {
+        if (!claim()) return
+        cleanup()
+        ctx.logCancelled()
+        resolveOnce(ctx.cancelAndAbort(undefined, true))
+      }
+      if (signal.aborted) {
+        onAbort()
+        return
+      }
+
       // Register callback BEFORE sending the request to avoid race condition
       // where leader responds before callback is registered
       registerPermissionCallback({
@@ -88,7 +108,7 @@ async function handleSwarmWorkerPermission(
           contentBlocks?: ContentBlockParam[],
         ) {
           if (!claim()) return // atomic check-and-mark before await
-          clearPendingRequest()
+          cleanup()
 
           // Merge the updated input with the original input
           const finalInput =
@@ -108,7 +128,7 @@ async function handleSwarmWorkerPermission(
         },
         onReject(feedback?: string, contentBlocks?: ContentBlockParam[]) {
           if (!claim()) return
-          clearPendingRequest()
+          cleanup()
 
           ctx.logDecision({
             decision: 'reject',
@@ -118,9 +138,6 @@ async function handleSwarmWorkerPermission(
           resolveOnce(ctx.cancelAndAbort(feedback, undefined, contentBlocks))
         },
       })
-
-      // Now that callback is registered, send the request to the leader
-      void sendPermissionRequestViaMailbox(request)
 
       // Show visual indicator that we're waiting for leader approval
       ctx.toolUseContext.setAppState(prev => ({
@@ -132,18 +149,9 @@ async function handleSwarmWorkerPermission(
         },
       }))
 
-      // If the abort signal fires while waiting for the leader response,
-      // resolve the promise with a cancel decision so it does not hang.
-      ctx.toolUseContext.abortController.signal.addEventListener(
-        'abort',
-        () => {
-          if (!claim()) return
-          clearPendingRequest()
-          ctx.logCancelled()
-          resolveOnce(ctx.cancelAndAbort(undefined, true))
-        },
-        { once: true },
-      )
+      signal.addEventListener('abort', onAbort, { once: true })
+      // Now that callback and cancellation are registered, send to the leader.
+      void sendPermissionRequestViaMailbox(request)
     })
 
     return decision

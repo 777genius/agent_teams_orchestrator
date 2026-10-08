@@ -44,6 +44,7 @@ export type CodexAppServerEffort =
 
 export type CodexAppServerApprovalRequestHandler = (
   approval: CodexAppServerToolApprovalRequest,
+  abortSignal?: AbortSignal,
 ) => Promise<CodexAppServerApprovalDecision>
 
 export interface CodexAppServerThreadManualPolicy {
