@@ -6,6 +6,8 @@ import path from 'node:path'
 import { describe, expect, test } from 'bun:test'
 import { readOpenCodeAuthority, isKnownHostRegistry, isKnownSessionStore } from './OpenCodeAuthorityStoreRead.js'
 import { OpenCodeHostManager } from './OpenCodeHostManager.js'
+import { OpenCodeSessionStore } from './OpenCodeSessionStore.js'
+import { normalizeOpenCodeSessionStatus } from './OpenCodeEventTranslator.js'
 
 // Previously only parse errors survived session reads; typed missing/unknown
 // classification and host read failures did not distinguish absence from veto.
@@ -108,6 +110,92 @@ describe('O1a typed authority read', () => {
       await chmod(file, 0o600)
       expect(await readFile(file, 'utf8')).toBe(bytes)
       expect(await readFile(sentinel, 'utf8')).toBe('shared-peer-authority')
+    } finally { await rm(root, { recursive: true, force: true }) }
+  })
+})
+
+
+// Historical writers persisted API status objects and pre-lane two-part indexes.
+const legacyRecord = {
+  teamId: 'TEST-legacy-team', memberName: 'TEST-member', providerId: 'opencode',
+  selectedModel: 'TEST/model', projectPath: '/tmp/TEST-legacy-project', profileRootKey: 'TEST-profile',
+  hostKey: 'TEST-host', opencodeSessionId: 'TEST-old-session', projectBehaviorFingerprint: 'TEST-behavior',
+  createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z',
+  lastKnownRawStatus: { type: 'idle' },
+}
+const legacyKey = 'TEST-legacy-team::TEST-member'
+const currentKey = 'TEST-legacy-team::primary::TEST-member'
+
+describe('schema1 historical session compatibility', () => {
+  test('known API status objects are retained and projected to scalar status', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'TEST-legacy-status-'))
+    try {
+      const file = path.join(root, 'sessions.json')
+      for (const status of [{ type: 'idle' }, { type: 'busy' },
+        { type: 'retry', attempt: 2, message: 'TEST retry', next: 123 }] as const) {
+        const bytes = JSON.stringify({ schemaVersion: 1, records: {
+          [currentKey]: { ...legacyRecord, lastKnownRawStatus: status },
+        } })
+        await writeFile(file, bytes)
+        const read = await readOpenCodeAuthority(file, isKnownSessionStore)
+        expect(read.kind).toBe('known')
+        if (read.kind !== 'known') throw new Error('historical record rejected')
+        expect(read.value.records[currentKey].lastKnownRawStatus).toEqual(status)
+        expect(normalizeOpenCodeSessionStatus(read.value.records[currentKey].lastKnownRawStatus).status).toBe(status.type)
+        expect(await readFile(file, 'utf8')).toBe(bytes)
+      }
+    } finally { await rm(root, { recursive: true, force: true }) }
+  })
+
+  test('two-part records remain archival across a new claim and cannot authorize Stop', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'TEST-legacy-archive-'))
+    try {
+      const file = path.join(root, 'sessions.json')
+      const retained = { ...legacyRecord, runId: 'TEST-run' }
+      const bytes = JSON.stringify({ schemaVersion: 1, records: { [legacyKey]: retained } })
+      await writeFile(file, bytes)
+      const store = new OpenCodeSessionStore(file)
+      expect(await store.list()).toEqual([])
+      expect(await store.get(retained.teamId, retained.memberName)).toBeNull()
+      let capabilityReads = 0
+      const request = { contractVersion: 1 as const, originalRequestId: 'TEST-stop', idempotencyKey: 'TEST-stop-key',
+        target: { teamId: retained.teamId, laneId: 'primary', runId: 'TEST-run', projectPath: retained.projectPath,
+          capabilitySnapshotId: `opencode:${'a'.repeat(32)}`, expectedBehaviorFingerprint: 'b'.repeat(64),
+          members: [{ memberName: retained.memberName, sessionId: retained.opencodeSessionId }] } }
+      expect((await store.reconcileStop(request, async () => { capabilityReads++; return request.target.capabilitySnapshotId })).status).toBe('unknown')
+      expect(capabilityReads).toBe(0)
+      expect(await readFile(file, 'utf8')).toBe(bytes)
+      const claim = await store.claimMaterialization(retained, 'TEST-new-attempt', 'TEST-new-run')
+      expect(claim.kind).toBe('claimed')
+      const disk = JSON.parse(await readFile(file, 'utf8'))
+      expect(disk.records).toEqual({ [legacyKey]: retained })
+      expect(disk.materializationClaimRuns[currentKey]).toBe('TEST-new-run')
+      expect(await store.list()).toEqual([])
+    } finally { await rm(root, { recursive: true, force: true }) }
+  })
+
+  test('unknown status or ambiguous legacy identity still vetoes without changing bytes', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'TEST-legacy-veto-'))
+    try {
+      const file = path.join(root, 'sessions.json')
+      const invalid = [
+        { key: legacyKey, record: { ...legacyRecord, laneId: 'primary' } },
+        { key: 'TEST-other::TEST-member', record: legacyRecord },
+        ...[{ type: 'unknown' }, { status: 'idle' }, { type: 'idle', authority: true }, [],
+          { type: 'retry', attempt: -1 }, { type: 'retry', attempt: '2' },
+          { type: 'retry', next: -1 }, { type: 'retry', next: 8_640_000_000_000_001 }, { type: 'retry', message: 7 }].map(status => ({
+            key: currentKey, record: { ...legacyRecord, lastKnownRawStatus: status },
+          })),
+        { key: currentKey, record: { ...legacyRecord, runtimePid: 0 } },
+        { key: currentKey, record: { ...legacyRecord, runId: 42 } },
+      ]
+      for (const item of invalid) {
+        const bytes = JSON.stringify({ schemaVersion: 1, records: { [item.key]: item.record } })
+        await writeFile(file, bytes)
+        expect(await readOpenCodeAuthority(file, isKnownSessionStore)).toEqual({ kind: 'preserved_unknown', reason: 'invalid' })
+        await expect(new OpenCodeSessionStore(file).list()).rejects.toMatchObject({ name: 'OpenCodeAuthorityVetoError' })
+        expect(await readFile(file, 'utf8')).toBe(bytes)
+      }
     } finally { await rm(root, { recursive: true, force: true }) }
   })
 })
