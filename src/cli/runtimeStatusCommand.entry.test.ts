@@ -13,7 +13,7 @@ async function runStatus(flags: readonly string[]) {
   const home = await mkdtemp(join(tmpdir(), 'TEST-runtime-status-entry-'))
   const child = spawn(bun, ['--no-install', '--no-env-file', entry, 'runtime', 'status', ...flags], {
     cwd: home,
-    env: { PATH: '', HOME: home, XDG_CONFIG_HOME: join(home, '.config'), XDG_CACHE_HOME: join(home, '.cache'), NODE_ENV: 'development', CI: '1' },
+    env: { PATH: '', HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: join(home, '.claude'), APPDATA: join(home, 'appdata'), LOCALAPPDATA: join(home, 'local-appdata'), XDG_CONFIG_HOME: join(home, '.config'), XDG_CACHE_HOME: join(home, '.cache'), NODE_ENV: 'development', CI: '1' },
     stdio: ['ignore', 'pipe', 'pipe'],
   })
   let stdout = '', stderr = ''

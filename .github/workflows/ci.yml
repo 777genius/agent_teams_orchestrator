@@ -185,7 +185,7 @@ jobs:
         if: runner.os == 'Linux'
         run: python3 --version
       - name: Test runtime status and adjacent output boundaries
-        run: bun test src/cli/handlers/runtime.status-stdout.test.ts src/cli/handlers/runtime.providers-stdout.test.ts src/cli/handlers/runtime.verify-stdout.test.ts
+        run: bun test src/cli/handlers/runtime.status-stdout.test.ts src/cli/handlers/runtime.providers-stdout.test.ts src/cli/handlers/runtime.verify-stdout.test.ts src/cli/runtimeStatusCommand.entry.test.ts
 
   opencode-conformance:
     name: OpenCode ${{ matrix.version }} conformance (${{ matrix.os }})
