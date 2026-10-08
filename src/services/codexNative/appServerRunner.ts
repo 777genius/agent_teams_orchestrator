@@ -656,6 +656,9 @@ export async function* runCodexNativeAppServer(
   let completed = false
   let cleanupStarted = false
   let transportEnded = false
+  const approvalAbortController = new AbortController()
+  const cancelApprovals = (): void => approvalAbortController.abort()
+  options.abortSignal?.addEventListener('abort', cancelApprovals, { once: true })
   const mapNotification = createCodexAppServerNotificationMapper()
   let refreshIdleDeadline = (): void => {}
 
@@ -665,6 +668,7 @@ export async function* runCodexNativeAppServer(
     }
     if (event.type === 'turn_completed') {
       completed = true
+      cancelApprovals()
     }
     observations.push({ type: 'normalized_event', event })
   }
@@ -684,6 +688,8 @@ export async function* runCodexNativeAppServer(
   const cleanup = (): void => {
     if (cleanupStarted) return
     cleanupStarted = true
+    cancelApprovals()
+    options.abortSignal?.removeEventListener('abort', cancelApprovals)
     lineReader.close()
     stderrReader?.close()
     if (child.stdin && !child.stdin.destroyed) {
@@ -752,7 +758,10 @@ export async function* runCodexNativeAppServer(
     if (!canRespondToApproval()) return
 
     try {
-      const decision = await options.requestApproval(approval)
+      const decision = await options.requestApproval(
+        approval,
+        approvalAbortController.signal,
+      )
       if (!canRespondToApproval()) return
       writeJson(
         buildCodexAppServerApprovalResponse(requestMessage, decision.allow),
@@ -820,12 +829,14 @@ export async function* runCodexNativeAppServer(
 
   child.once('error', error => {
     transportEnded = true
+    cancelApprovals()
     const normalized = error instanceof Error ? error : new Error(String(error))
     rejectAll(normalized)
     observations.push({ type: 'runner_error', error: normalized })
   })
   child.once('exit', (code, signal) => {
     transportEnded = true
+    cancelApprovals()
     const error =
       pending.size > 0 || !completed
         ? new Error(

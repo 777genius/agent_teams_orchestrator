@@ -1,11 +1,23 @@
 import { EventEmitter } from 'node:events'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { PassThrough } from 'node:stream'
 import { describe, expect, test } from 'bun:test'
 
 import type { ToolUseContext } from '../../Tool.js'
+import type { ToolUseConfirm } from '../../components/permissions/PermissionRequest.js'
+import { createPermissionContext } from '../../hooks/toolPermission/PermissionContext.js'
+import { handleInteractivePermission } from '../../hooks/toolPermission/handlers/interactiveHandler.js'
+import { handleSwarmWorkerPermission } from '../../hooks/toolPermission/handlers/swarmWorkerHandler.js'
+import {
+  hasPermissionCallback,
+  processMailboxPermissionResponse,
+  unregisterPermissionCallback,
+} from '../../hooks/useSwarmPermissionPoller.js'
+import type { AppState } from '../../state/AppState.js'
+import { getDynamicTeamContext, setDynamicTeamContext } from '../../utils/teammate.js'
+import { readMailbox } from '../../utils/teammateMailbox.js'
 import type { Message, StreamEvent } from '../../types/message.js'
 import type { PermissionDecision } from '../../utils/permissions/PermissionResult.js'
 import type { CodexAppServerApprovalDecision } from './appServerApproval.js'
@@ -124,7 +136,9 @@ function createApprovalServer(cwd: string, completeOnDecision = true) {
       options: { signal?: AbortSignal },
     ) => {
       options.signal?.addEventListener('abort', () => {
-        child.emit('error', options.signal?.reason ?? new Error('Cancelled'))
+        if (child.listenerCount('error') > 0) {
+          child.emit('error', options.signal?.reason ?? new Error('Cancelled'))
+        }
       }, { once: true })
       return child as never
     },
@@ -150,7 +164,10 @@ describe('native REPL approval transport', () => {
         context: ToolUseContext
         force: string | undefined
       }> = []
-      const context = {} as ToolUseContext
+      const context = {
+        abortController: new AbortController(),
+        getAppState: () => ({ fastMode: false }) as never,
+      } as ToolUseContext
       const events: (Message | StreamEvent)[] = []
       const requestApproval = createCodexAppServerApprovalPromptHandler({
         toolUseContext: context,
@@ -201,7 +218,11 @@ describe('native REPL approval transport', () => {
         expect(
           fake.sent.find(message => message.id === 'approval-test')?.error?.message,
         ).toBeUndefined()
-        expect(observed).toEqual([{ name: 'Bash', context, force: 'ask' }])
+        expect(observed).toMatchObject([{ name: 'Bash', force: 'ask' }])
+        expect(observed[0]?.context.abortController).not.toBe(context.abortController)
+        expect(observed[0]?.context.getAppState).toBe(context.getAppState)
+        observed[0]?.context.abortController.abort()
+        expect(context.abortController.signal.aborted).toBe(false)
         expect(fake.sent.find(message => message.id === 'approval-test')).toMatchObject({
           result: { decision: allow ? 'accept' : 'decline' },
         })
@@ -226,6 +247,180 @@ describe('native REPL approval transport', () => {
       }
     })
   }
+
+  for (const stop of ['cancel', 'user cancel', 'completed turn', 'shutdown', 'process error', 'idle timeout'] as const) {
+    test(`settles the real permission prompt and removes its queue entry after ${stop}`, async () => {
+      const cwd = await mkdtemp(path.join(tmpdir(), 'repl-prompt-cancellation-test-'))
+      const fake = createApprovalServer(cwd, false)
+      const parentController = new AbortController()
+      const queue: ToolUseConfirm[] = []
+      const opened = deferred<void>()
+      let promptSettled = false
+      const context = { abortController: parentController } as ToolUseContext
+      const promptHandler = createCodexAppServerApprovalPromptHandler({
+        toolUseContext: context,
+        canUseTool: (tool, input, toolContext, message, toolUseId) =>
+          new Promise<PermissionDecision>(resolve => {
+            const permissionContext = createPermissionContext(
+              tool,
+              input,
+              toolContext,
+              message,
+              toolUseId,
+              () => {},
+              {
+                push: item => queue.push(item),
+                remove: id => {
+                  const index = queue.findIndex(item => item.toolUseID === id)
+                  if (index !== -1) queue.splice(index, 1)
+                },
+                update: () => {},
+              },
+            )
+            handleInteractivePermission({
+              ctx: permissionContext,
+              description: 'Synthetic permission prompt',
+              result: { behavior: 'ask', message: 'Synthetic approval' },
+              awaitAutomatedChecksBeforeDialog: true,
+            }, resolve)
+            opened.resolve()
+          }).finally(() => { promptSettled = true }),
+      })
+      try {
+        const running = drain(runCodexNativeAppServer({
+          prompt: 'Synthetic prompt cancellation test',
+          cwd,
+          extraEnv: { CODEX_HOME: cwd },
+          abortSignal: parentController.signal,
+          idleTimeoutMs: stop === 'idle timeout' ? 10 : null,
+          requestApproval: promptHandler,
+        }, fake.deps)).then(() => null, error => error as Error)
+        await opened.promise
+        expect(queue).toHaveLength(1)
+        if (stop === 'cancel') parentController.abort(new Error('Synthetic cancellation'))
+        if (stop === 'user cancel') {
+          // The UI owns removal when the user dismisses the visible dialog.
+          const visiblePrompt = queue.shift()
+          visiblePrompt?.onAbort()
+        }
+        if (stop === 'completed turn') fake.complete()
+        if (stop === 'process error') fake.child.emit('error', new Error('Synthetic pipe failure'))
+        if (stop === 'shutdown') {
+          fake.child.exitCode = 1
+          fake.child.emit('exit', 1, null)
+        }
+        const failure = await running
+        await flushCallbacks()
+        if (stop === 'completed turn') expect(failure).toBeNull()
+        else expect(failure).toBeInstanceOf(Error)
+        expect(queue).toHaveLength(0)
+        expect(promptSettled).toBe(true)
+        expect(parentController.signal.aborted).toBe(
+          stop === 'cancel' || stop === 'user cancel',
+        )
+        expect(fake.sent.filter(message => message.id === 'approval-test')).toEqual([])
+        expect(fake.writeErrors).toEqual([])
+      } finally {
+        // Tear down the intentionally pending old-code prompt after red assertions.
+        for (const item of queue) item.onAbort()
+        await rm(cwd, { recursive: true, force: true })
+      }
+    })
+  }
+
+  test('unregisters a real swarm permission callback after app-server shutdown', async () => {
+    const fixture = await mkdtemp(path.join(tmpdir(), 'repl-swarm-cancellation-test-'))
+    const previousConfigDir = process.env.CLAUDE_CONFIG_DIR
+    const previousUserType = process.env.USER_TYPE
+    const previousTeamContext = getDynamicTeamContext()
+    const teamName = 'synthetic-approval-test'
+    const fake = createApprovalServer(fixture, false)
+    const parentController = new AbortController()
+    const opened = deferred<void>()
+    let appState = { pendingWorkerRequest: null } as AppState
+    let requestId: string | undefined
+    let promptSettled = false
+    try {
+      process.env.CLAUDE_CONFIG_DIR = fixture
+      process.env.USER_TYPE = 'ant'
+      setDynamicTeamContext({
+        agentId: 'synthetic-worker-id',
+        agentName: 'synthetic-worker',
+        teamName,
+        planModeRequired: false,
+      })
+      const teamDir = path.join(fixture, 'teams', teamName)
+      await mkdir(teamDir, { recursive: true })
+      await writeFile(path.join(teamDir, 'config.json'), JSON.stringify({
+        leadAgentId: 'synthetic-leader-id',
+        members: [{ agentId: 'synthetic-leader-id', name: 'team-lead' }],
+      }))
+      const context = {
+        abortController: parentController,
+        getAppState: () => appState,
+        setAppState: (update: (state: AppState) => AppState) => {
+          appState = update(appState)
+          if (appState.pendingWorkerRequest) opened.resolve()
+        },
+      } as ToolUseContext
+      const handler = createCodexAppServerApprovalPromptHandler({
+        toolUseContext: context,
+        canUseTool: async (tool, input, toolContext, message, toolUseId) => {
+          const ctx = createPermissionContext(
+            tool, input, toolContext, message, toolUseId, () => {},
+          )
+          const result = await handleSwarmWorkerPermission({
+            ctx,
+            description: 'Synthetic swarm approval',
+            updatedInput: undefined,
+            suggestions: undefined,
+          })
+          if (!result) throw new Error('Synthetic swarm permission handler did not engage')
+          return result
+        },
+      })
+      const running = drain(runCodexNativeAppServer({
+        prompt: 'Synthetic swarm cancellation test',
+        cwd: fixture,
+        extraEnv: { CODEX_HOME: fixture },
+        abortSignal: parentController.signal,
+        requestApproval: (approval, signal) => handler(approval, signal)
+          .finally(() => { promptSettled = true }),
+      }, fake.deps)).then(() => null, error => error as Error)
+      await opened.promise
+      for (let attempt = 0; attempt < 100 && !requestId; attempt++) {
+        const messages = await readMailbox('team-lead', teamName)
+        const request = messages.map(message => JSON.parse(message.text) as {
+          type?: string
+          request_id?: string
+        }).find(message => message.type === 'permission_request')
+        requestId = request?.request_id
+        if (!requestId) await flushCallbacks()
+      }
+      expect(requestId).toBeDefined()
+      if (!requestId) throw new Error('Synthetic permission request missing from mailbox')
+      expect(hasPermissionCallback(requestId)).toBe(true)
+      fake.child.exitCode = 1
+      fake.child.emit('exit', 1, null)
+      expect(await running).toBeInstanceOf(Error)
+      await flushCallbacks()
+      expect(promptSettled).toBe(true)
+      expect(appState.pendingWorkerRequest).toBeNull()
+      expect(hasPermissionCallback(requestId)).toBe(false)
+      expect(processMailboxPermissionResponse({ requestId, decision: 'approved' })).toBe(false)
+      expect(parentController.signal.aborted).toBe(false)
+      expect(fake.sent.filter(message => message.id === 'approval-test')).toEqual([])
+    } finally {
+      parentController.abort()
+      if (requestId) unregisterPermissionCallback(requestId)
+      setDynamicTeamContext(previousTeamContext)
+      if (previousConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR
+      else process.env.CLAUDE_CONFIG_DIR = previousConfigDir
+      if (previousUserType === undefined) delete process.env.USER_TYPE
+      else process.env.USER_TYPE = previousUserType
+      await rm(fixture, { recursive: true, force: true })
+    }
+  })
 
   for (const stop of ['cancel', 'completed turn', 'shutdown'] as const) {
     for (const outcome of ['allow', 'reject'] as const) {

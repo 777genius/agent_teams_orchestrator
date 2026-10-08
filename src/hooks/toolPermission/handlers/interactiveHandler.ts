@@ -67,7 +67,13 @@ function handleInteractivePermission(
     channelCallbacks,
   } = params
 
-  const { resolve: resolveOnce, isResolved, claim } = createResolveOnce(resolve)
+  const signal = ctx.toolUseContext.abortController.signal
+  const { resolve: resolveOnce, isResolved, claim } = createResolveOnce(
+    decision => {
+      signal.removeEventListener('abort', onContextAbort)
+      resolve(decision)
+    },
+  )
   let userInteracted = false
   let checkmarkTransitionTimer: ReturnType<typeof setTimeout> | undefined
   // Hoisted so onDismissCheckmark (Esc during checkmark window) can also
@@ -88,6 +94,24 @@ function handleInteractivePermission(
       ctx.updateQueueItem({ classifierCheckInProgress: false })
     }
   }
+
+  function onContextAbort(): void {
+    if (!claim()) return
+    if (bridgeCallbacks && bridgeRequestId) {
+      bridgeCallbacks.cancelRequest(bridgeRequestId)
+    }
+    channelUnsubscribe?.()
+    clearClassifierChecking(ctx.toolUseID)
+    ctx.removeFromQueue()
+    ctx.logCancelled()
+    resolveOnce(ctx.cancelAndAbort(undefined, true))
+  }
+
+  if (signal.aborted) {
+    onContextAbort()
+    return
+  }
+  signal.addEventListener('abort', onContextAbort, { once: true })
 
   ctx.pushToQueue({
     assistantMessage: ctx.assistantMessage,

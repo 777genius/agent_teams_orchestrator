@@ -60,21 +60,49 @@ export function createCodexAppServerApprovalPromptHandler(params: {
   canUseTool: CanUseToolFn
   toolUseContext: ToolUseContext
 }): CodexAppServerApprovalRequestHandler {
-  return async approval => {
+  return async (approval, abortSignal) => {
     const request = buildCodexPermissionRequest(approval)
     const tool = createToolStub(approval.toolName)
     const assistantMessage = createSyntheticAssistantMessage(
       request,
       approval.providerRequestId,
     )
-    const decision = await params.canUseTool(
-      tool,
-      approval.toolInput,
-      params.toolUseContext,
-      assistantMessage,
-      approval.providerRequestId,
-      buildForcedAskDecision(approval),
-    )
-    return mapPermissionDecision(decision)
+    const parentController = params.toolUseContext.abortController
+    const promptController = abortSignal ? new AbortController() : parentController
+    const onParentAbort = (): void => promptController.abort(parentController.signal.reason)
+    const onTransportAbort = (): void => promptController.abort(abortSignal?.reason)
+    const onPromptAbort = (): void => {
+      // A local user cancellation still cancels the turn. Transport termination
+      // only retires this approval and must not abort the reusable parent context.
+      if (!parentController.signal.aborted && !abortSignal?.aborted) {
+        parentController.abort(promptController.signal.reason)
+      }
+    }
+    if (abortSignal) {
+      parentController.signal.addEventListener('abort', onParentAbort, { once: true })
+      abortSignal.addEventListener('abort', onTransportAbort, { once: true })
+      promptController.signal.addEventListener('abort', onPromptAbort, { once: true })
+      if (parentController.signal.aborted) onParentAbort()
+      if (abortSignal.aborted) onTransportAbort()
+    }
+    try {
+      const decision = await params.canUseTool(
+        tool,
+        approval.toolInput,
+        abortSignal
+          ? { ...params.toolUseContext, abortController: promptController }
+          : params.toolUseContext,
+        assistantMessage,
+        approval.providerRequestId,
+        buildForcedAskDecision(approval),
+      )
+      return mapPermissionDecision(decision)
+    } finally {
+      if (abortSignal) {
+        parentController.signal.removeEventListener('abort', onParentAbort)
+        abortSignal.removeEventListener('abort', onTransportAbort)
+        promptController.signal.removeEventListener('abort', onPromptAbort)
+      }
+    }
   }
 }
