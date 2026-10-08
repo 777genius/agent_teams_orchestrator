@@ -999,6 +999,8 @@ export class OpenCodeExecutionProbe {
             this.deps.hostStartupCleanupTimeoutMs ?? OPEN_CODE_EXECUTION_CLEANUP_TIMEOUT_MS,
           ),
           'OpenCode execution probe host startup cleanup timed out',
+          // The runtime deadline has fired; awaited cleanup owns its settlement timer.
+          { keepAlive: true },
         ).catch(() => undefined)
       }
       throw error
