@@ -823,6 +823,8 @@ export class OpenCodeExecutionProbe {
         })(),
         cleanupTimeoutMs,
         'OpenCode execution probe session cleanup timed out',
+        // An abort request may never settle or leave any active I/O behind.
+        { keepAlive: true },
       )
     } finally {
       clearTimeout(timer)
