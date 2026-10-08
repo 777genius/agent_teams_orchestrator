@@ -18,6 +18,7 @@ function baseParams(
       fastMode: false,
     } as never,
     transcriptMessages: [],
+    requestApproval: async () => ({ allow: false }),
     onReplEvent: (_event: Message | StreamEvent) => {},
     ...overrides,
   }

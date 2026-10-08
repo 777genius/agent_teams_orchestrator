@@ -160,6 +160,7 @@ import { queryCheckpoint, logQueryProfileReport } from '../utils/queryProfiler.j
 import type { Message as MessageType, UserMessage, ProgressMessage, HookResultMessage, PartialCompactDirection } from '../types/message.js';
 import { query } from '../query.js';
 import { runCodexNativeTurnInRepl } from '../services/codexNative/replTurnBridge.js';
+import { createCodexAppServerApprovalPromptHandler } from '../services/codexNative/approvalPromptBridge.js';
 import { resolveCodexRuntimeSelection } from '../services/runtimeBackends/codexBackendResolver.js';
 import { mergeClients, useMergedClients } from '../hooks/useMergedClients.js';
 import { getQuerySourceForREPL } from '../utils/promptCategory.js';
@@ -2889,6 +2890,10 @@ export function REPL({
         initialAppState: store.getState(),
         transcriptMessages: messagesIncludingNewMessages,
         abortSignal: abortController.signal,
+        requestApproval: createCodexAppServerApprovalPromptHandler({
+          canUseTool,
+          toolUseContext
+        }),
         onReplEvent: onQueryEvent
       });
     } else {

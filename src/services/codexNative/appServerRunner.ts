@@ -655,6 +655,7 @@ export async function* runCodexNativeAppServer(
   let threadId: string | null = null
   let completed = false
   let cleanupStarted = false
+  let transportEnded = false
   const mapNotification = createCodexAppServerNotificationMapper()
   let refreshIdleDeadline = (): void => {}
 
@@ -724,6 +725,14 @@ export async function* runCodexNativeAppServer(
     })
   }
 
+  const canRespondToApproval = (): boolean =>
+    !cleanupStarted &&
+    !completed &&
+    !transportEnded &&
+    !options.abortSignal?.aborted &&
+    !child.stdin!.destroyed &&
+    !child.stdin!.writableEnded
+
   const handleServerRequest = async (
     requestMessage: CodexAppServerRequest,
   ): Promise<void> => {
@@ -740,12 +749,16 @@ export async function* runCodexNativeAppServer(
       return
     }
 
+    if (!canRespondToApproval()) return
+
     try {
       const decision = await options.requestApproval(approval)
+      if (!canRespondToApproval()) return
       writeJson(
         buildCodexAppServerApprovalResponse(requestMessage, decision.allow),
       )
     } catch (error) {
+      if (!canRespondToApproval()) return
       const message = error instanceof Error ? error.message : String(error)
       writeJson({
         jsonrpc: '2.0',
@@ -806,11 +819,13 @@ export async function* runCodexNativeAppServer(
   })
 
   child.once('error', error => {
+    transportEnded = true
     const normalized = error instanceof Error ? error : new Error(String(error))
     rejectAll(normalized)
     observations.push({ type: 'runner_error', error: normalized })
   })
   child.once('exit', (code, signal) => {
+    transportEnded = true
     const error =
       pending.size > 0 || !completed
         ? new Error(
