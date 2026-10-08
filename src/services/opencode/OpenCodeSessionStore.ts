@@ -172,6 +172,12 @@ function buildRecordKey(record: Pick<OpenCodeSessionRecord, 'teamId' | 'laneId' 
   return `${record.teamId}::${record.laneId ?? 'primary'}::${record.memberName}`
 }
 
+function currentSessionRecords(store: SessionStoreShape): OpenCodeSessionRecord[] {
+  // Two-part historical indexes remain intact but confer no current authority.
+  return Object.entries(store.records).filter(([key, record]) => key === buildRecordKey(record))
+    .map(([, record]) => record)
+}
+
 export function isOpenCodeSessionStopped(record: Pick<OpenCodeSessionRecord, 'stoppedAt'>): boolean {
   const value = record.stoppedAt
   return typeof value === 'string' && Number.isFinite(Date.parse(value))
@@ -450,7 +456,7 @@ export class OpenCodeSessionStore {
   }
 
   private stopLane(store: SessionStoreShape, request: OpenCodeStopRequest): OpenCodeSessionRecord[] {
-    return Object.values(store.records).filter(record => record.teamId === request.target.teamId
+    return currentSessionRecords(store).filter(record => record.teamId === request.target.teamId
       && (record.laneId ?? 'primary') === request.target.laneId
       && (record.runId === request.target.runId || !isOpenCodeSessionStopped(record)
         || request.target.members.some(member => member.memberName === record.memberName)))
@@ -575,7 +581,7 @@ export class OpenCodeSessionStore {
 
   async list(): Promise<OpenCodeSessionRecord[]> {
     const store = await this.readStore()
-    return Object.values(store.records)
+    return currentSessionRecords(store)
   }
 
   async get(teamId: string, laneIdOrMemberName: string, memberName?: string): Promise<OpenCodeSessionRecord | null> {

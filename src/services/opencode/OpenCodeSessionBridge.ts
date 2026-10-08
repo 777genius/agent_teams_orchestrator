@@ -8,7 +8,7 @@ import { jsonStringify } from '../../utils/slowOperations.js'
 
 import { openCodeClientFactory } from './OpenCodeClientFactory.js'
 import { readOpenCodeAuthCredential, type OpenCodeOAuthNativeSessionOwner } from './OpenCodeAuthStore.js'
-import { openCodeEventTranslator } from './OpenCodeEventTranslator.js'
+import { normalizeOpenCodeSessionStatus, openCodeEventTranslator } from './OpenCodeEventTranslator.js'
 import { openCodeHostManager } from './OpenCodeHostManager.js'
 import { openCodeLogProjector } from './OpenCodeLogProjector.js'
 import { openCodeMcpManager } from './OpenCodeMcpManager.js'
@@ -43,7 +43,6 @@ import type {
   OpenCodeSessionRecord,
   OpenCodeSessionPreviewSummary,
   OpenCodeSessionReconcileSummary,
-  OpenCodeSessionStatus,
   OpenCodeSessionStatusInput,
   OpenCodeSessionSummary,
   OpenCodeToolApprovalMode,
@@ -1255,7 +1254,7 @@ export class OpenCodeSessionBridge {
       summary: {
         sessionId: nextRecord.opencodeSessionId,
         reconcileOutcome: 'stale',
-        rawStatus: nextRecord.lastKnownRawStatus as OpenCodeSessionStatus | null,
+        rawStatus: normalizeOpenCodeSessionStatus(nextRecord.lastKnownRawStatus).status,
         durableState: nextRecord.lastKnownDurableState ?? 'unknown',
         staleReason: params.staleReason,
         profileAuthState: params.profileAuthState,
@@ -2629,7 +2628,7 @@ export class OpenCodeSessionBridge {
     }
     const summary = this.eventTranslator.reconcileSessionMessages({
       sessionId: record.opencodeSessionId,
-      rawStatus: record.lastKnownRawStatus as OpenCodeSessionStatus | null,
+      rawStatus: normalizeOpenCodeSessionStatus(record.lastKnownRawStatus).status,
       messages: offline.messages,
     })
     summary.reconcileOutcome = 'stale'

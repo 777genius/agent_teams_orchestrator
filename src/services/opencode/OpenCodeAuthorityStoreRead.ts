@@ -148,15 +148,31 @@ function claim(v: unknown): boolean {
   if (!(v as string).trimStart().startsWith('{')) return true
   try { const parsed = JSON.parse(v as string); return owner(parsed) && positive(parsed.version) } catch { return false }
 }
+function storedStatus(v: unknown): boolean {
+  if (nullableText(v)) return true
+  // Older schema1 writers retained API payloads, not a scalar status.
+  return object(v) && ['idle', 'busy', 'retry'].includes(v.type as string)
+    && Object.keys(v).every(name => ['type', 'attempt', 'message', 'next'].includes(name))
+    && optional(v, 'message', text)
+    && optional(v, 'attempt', value => Number.isSafeInteger(value) && Number(value) >= 0)
+    && optional(v, 'next', value => finite(value) && value >= 0 && Number.isFinite(new Date(value).getTime()))
+}
+function sessionIndex(v: Record<string, unknown>, key: string): boolean {
+  if (key === `${v.teamId}::${v.laneId ?? 'primary'}::${v.memberName}`) return true
+  // Pre-lane indexes are retained as archives; never assign them a lane.
+  return !Object.hasOwn(v, 'laneId') && key.split('::').length === 2
+    && key === `${v.teamId}::${v.memberName}`
+}
 function sessionRecord(v: unknown, key: string): boolean {
   if (!object(v) || v.providerId !== 'opencode'
     || !fields(v, ['teamId', 'memberName', 'selectedModel', 'projectPath', 'profileRootKey', 'hostKey',
       'opencodeSessionId', 'projectBehaviorFingerprint', 'createdAt', 'updatedAt'], text)
-    || key !== `${v.teamId}::${v.laneId ?? 'primary'}::${v.memberName}`) return false
+    || !sessionIndex(v, key)) return false
   if (!['runId', 'laneId', 'selectedVariant', 'expectedBehaviorFingerprint', 'managedConfigFingerprint', 'opencodeVersion']
     .every(name => optional(v, name, text))) return false
-  if (!['resolvedBehaviorFingerprint', 'lastCanonicalCursor', 'lastKnownRawStatus', 'lastKnownDurableState',
+  if (!['resolvedBehaviorFingerprint', 'lastCanonicalCursor', 'lastKnownDurableState',
     'sourceAuthFingerprint', 'managedAuthFingerprint', 'staleReason'].every(name => optional(v, name, nullableText))) return false
+  if (!optional(v, 'lastKnownRawStatus', storedStatus)) return false
   if (!optional(v, 'toolApprovalMode', value => value === 'auto' || value === 'manual')) return false
   if (!optional(v, 'runtimePid', positive) || !optional(v, 'stoppedAt', text)) return false
   if (!optional(v, 'profileScope', value => value === null || (object(value)
