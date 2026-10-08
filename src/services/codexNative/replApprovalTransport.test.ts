@@ -167,7 +167,7 @@ describe('native REPL approval transport', () => {
       const context = {
         abortController: new AbortController(),
         getAppState: () => ({ fastMode: false }) as never,
-      } as ToolUseContext
+      } as unknown as ToolUseContext
       const events: (Message | StreamEvent)[] = []
       const requestApproval = createCodexAppServerApprovalPromptHandler({
         toolUseContext: context,

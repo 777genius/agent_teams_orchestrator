@@ -68,7 +68,7 @@ function handleInteractivePermission(
   } = params
 
   const signal = ctx.toolUseContext.abortController.signal
-  const { resolve: resolveOnce, isResolved, claim } = createResolveOnce(
+  const { resolve: resolveOnce, isResolved, claim } = createResolveOnce<PermissionDecision>(
     decision => {
       signal.removeEventListener('abort', onContextAbort)
       resolve(decision)
