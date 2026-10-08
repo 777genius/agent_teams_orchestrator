@@ -3,27 +3,56 @@ name: CI
 on:
   push:
     branches: [main, dev]
-    paths:
-      - 'src/**'
-      - 'scripts/**'
-      - '.github/workflows/**'
-      - 'package.json'
-      - 'bun.lock'
-      - 'tsconfig*.json'
   pull_request:
-    paths:
-      - 'src/**'
-      - 'scripts/**'
-      - '.github/workflows/**'
-      - 'package.json'
-      - 'bun.lock'
-      - 'tsconfig*.json'
+  workflow_dispatch:
+    inputs:
+      full:
+        description: Run Windows authority, packaged candidate and native conformance
+        type: boolean
+        default: true
+        required: true
 
 permissions:
   contents: read
 
 jobs:
+  scope:
+    name: CI scope
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      native: ${{ steps.scope.outputs.native }}
+      authority_os: ${{ steps.scope.outputs.authority_os }}
+      reason: ${{ steps.scope.outputs.reason }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - name: Test gating contracts in isolated TEST scratch
+        run: |
+          mkdir -p "$RUNNER_TEMP/TEST-ci-policy"
+          TMPDIR="$RUNNER_TEMP/TEST-ci-policy" node --test scripts/ci/policy.test.ts
+      - name: Classify event changes
+        id: scope
+        env:
+          CI_EVENT: ${{ github.event_name }}
+          CI_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          CI_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+          CI_FULL: ${{ inputs.full }}
+        run: node scripts/ci/policy.ts classify
+      - name: Explain selected checks
+        env:
+          REASON: ${{ steps.scope.outputs.reason }}
+        run: printf '%s\n' "$REASON" >> "$GITHUB_STEP_SUMMARY"
+
   windows-packaged-backfill:
+    needs: scope
+    if: needs.scope.outputs.native == 'true'
     name: Windows packaged backfill (candidate)
     runs-on: windows-latest
     timeout-minutes: 25
@@ -146,6 +175,7 @@ jobs:
         run: bun run build:dev
 
   opencode-authority:
+    needs: scope
     name: OpenCode selected authority (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     # Windows recovery fixtures spend ~20 minutes in real process-identity
@@ -155,7 +185,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: ${{ fromJSON(needs.scope.outputs.authority_os) }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -194,6 +224,8 @@ jobs:
         run: bun test src/cli/handlers/runtime.status-stdout.test.ts src/cli/handlers/runtime.providers-stdout.test.ts src/cli/handlers/runtime.verify-stdout.test.ts
 
   opencode-conformance:
+    needs: scope
+    if: needs.scope.outputs.native == 'true'
     name: OpenCode ${{ matrix.version }} conformance (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
@@ -276,3 +308,22 @@ jobs:
           name: opencode-conformance-${{ matrix.os }}-${{ matrix.version }}
           path: conformance-*.json
           if-no-files-found: ignore
+
+  required:
+    name: CI required
+    if: always()
+    needs: [scope, cursor-managed-plugin, task-change-ledger, opencode-authority, windows-packaged-backfill, opencode-conformance]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - name: Require every selected check and explain optional skips
+        env:
+          CI_NEEDS: ${{ toJSON(needs) }}
+        run: node scripts/ci/policy.ts aggregate >> "$GITHUB_STEP_SUMMARY"
