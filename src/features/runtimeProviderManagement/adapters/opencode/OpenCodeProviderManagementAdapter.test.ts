@@ -8836,3 +8836,64 @@ for (const readGeneration of ['v1', undefined] as const) {
     expect(result.ok).toBe(true); expect(hosts).toBe(1); expect(cleared).toBe(1)
   })
 }
+
+for (const readGeneration of ['v2', 'unsupported'] as const) {
+  for (const read of ['settings', 'directory'] as const) {
+    test(`provider reads stay hostless for ${readGeneration} ${read}`, async () => {
+      let hosts = 0
+      let clients = 0
+      const diagnostic = 'TEST selected generation has no V1 profile'
+      const adapter = new OpenCodeProviderManagementAdapter({
+        inventoryService: {
+          probe: async () => inventory({ readGeneration, profile: null, diagnostics: [diagnostic] }),
+        },
+        hostManager: {
+          ensureHost: async () => { hosts++; throw new Error('TEST cross-generation host forbidden') },
+          releaseHost: async () => {},
+        },
+        clientFactory: { create: () => { clients++; throw new Error('TEST native client forbidden') } },
+      })
+      const input = { runtimeId: 'opencode' as const, projectPath: '/TEST/project' }
+      const result = read === 'settings'
+        ? await adapter.loadView(input)
+        : await adapter.loadDirectory({ ...input, query: null, filter: 'all', limit: 50, cursor: null })
+
+      expect(hosts).toBe(0)
+      expect(clients).toBe(0)
+      expect(result.ok).toBe(true)
+      if (result.ok) expect(result.value.diagnostics).toContain(diagnostic)
+    })
+  }
+}
+
+for (const readGeneration of ['v1', undefined] as const) {
+  for (const read of ['settings', 'directory'] as const) {
+    test(`provider reads preserve ${readGeneration ?? 'legacy untagged'} ${read} host acquisition`, async () => {
+      let hosts = 0
+      let clients = 0
+      const adapter = new OpenCodeProviderManagementAdapter({
+        inventoryService: { probe: async () => inventory({ readGeneration }) },
+        hostManager: {
+          ensureHost: async () => { hosts++; return host() },
+          releaseHost: async () => {},
+        },
+        clientFactory: { create: () => {
+          clients++
+          return {
+            getConfigProviders: async () => ({ providers: [], default: {} }),
+            getProviders: async () => ({ all: [], connected: [], default: {} }),
+            getProviderAuth: async () => ({}),
+          }
+        } },
+      })
+      const input = { runtimeId: 'opencode' as const, projectPath: '/TEST/project' }
+      const result = read === 'settings'
+        ? await adapter.loadView(input)
+        : await adapter.loadDirectory({ ...input, query: null, filter: 'all', limit: 50, cursor: null })
+
+      expect(result.ok).toBe(true)
+      expect(hosts).toBe(1)
+      expect(clients).toBe(1)
+    })
+  }
+}

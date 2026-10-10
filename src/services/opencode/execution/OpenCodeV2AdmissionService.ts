@@ -65,6 +65,8 @@ export class OpenCodeV2AdmissionService {
     catch (failure) {
       // This callback precedes the durable submitting marker and native call.
       // CAS only our still-prepared reservation; write/race failure stays unknown.
+      // Stop owns its prepared-row fence; competing cleanup could block it.
+      if (failure instanceof Error && failure.message === 'run_stopped') throw failure
       if (reserved.state !== 'prepared') throw failure
       return this.store.update(intent.identity.requestId, reserved.revision, {
         state: 'not_submitted', disposition: 'rejected', complete: false,

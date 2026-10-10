@@ -334,7 +334,8 @@ export class OpenCodeV2RunOwner {
         const admission = await admissions.admitQueue(intent, true, async () => {
           member.intents.set(intent.identity.nativeInputID, intent)
           await this.persistIntents()
-          executionAssert(this.state === 'active' && !signal.aborted && deadline > Date.now(), 'run_stopped')
+          executionAssert(this.state === 'active', 'run_stopped')
+          executionAssert(!signal.aborted && deadline > Date.now(), 'run_operation_timeout')
         })
         return { kind: 'send', admission, turn: null }
       }

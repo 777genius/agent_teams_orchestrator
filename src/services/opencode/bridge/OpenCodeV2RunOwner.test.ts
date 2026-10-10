@@ -14,6 +14,8 @@ import { OpenCodeV2AdmissionStore } from '../execution/OpenCodeV2AdmissionStore.
 import type { ExecutionBridgeClient, ExecutionInbox, ExecutionLog, ExecutionMessage } from '../transport/OpenCodeV2ExecutionClientFactory.js'
 import { ExecutionTransportFailure, OpenCodeV2ExecutionFetch } from '../transport/OpenCodeV2ExecutionFetch.js'
 import type { QueueIntent } from '../execution/OpenCodeV2AdmissionService.js'
+import * as runControl from './OpenCodeV2RunControl.js'
+import * as atomicWrite from '../../../utils/atomicWrite.js'
 
 // These tests cross the real durable session/admission boundary with fake
 // native/lease ports. They neither import an official server nor mint a native
@@ -567,6 +569,74 @@ test('lost send response after native invocation stays fenced and a fresh bridge
 
 
 describe('owner submission generation and prepared callback failures', () => {
+  test('stop owns the prepared fence when it interrupts intent persistence', async () => {
+    const f = await fixture()
+    const gate = () => { let release!: () => void; const promise = new Promise<void>(resolve => { release = resolve }); return { promise, release } }
+    const callbackEntered = gate(), releaseCallback = gate(), stopEntered = gate(), releaseStop = gate()
+    const cleanupEntered = gate(), releaseCleanup = gate()
+    const originalControlWrite = runControl.writeRunControlFile, originalAtomicWrite = atomicWrite.writeJsonFileAtomic
+    let controlWrite: ReturnType<typeof spyOn> | undefined, atomic: ReturnType<typeof spyOn> | undefined
+    let sent: Promise<unknown> | undefined, stopped: ReturnType<typeof f.owner.stop> | undefined
+    try {
+      await f.owner.ready()
+      const store = await f.store()
+      controlWrite = spyOn(runControl, 'writeRunControlFile').mockImplementation(async (directory, name, value) => {
+        if (directory === f.directory && name === 'intents.json') { callbackEntered.release(); await releaseCallback.promise }
+        if (directory === f.directory && name === 'tombstone.json') { stopEntered.release(); await releaseStop.promise }
+        return originalControlWrite(directory, name, value)
+      })
+      atomic = spyOn(atomicWrite, 'writeJsonFileAtomic').mockImplementation(async (file, value, options) => {
+        const state = value as { tombstone?: boolean; admissions?: { state: string }[] }
+        if (file === store.filePath && state.tombstone === false && state.admissions?.[0]?.state === 'not_submitted') {
+          cleanupEntered.release(); await releaseCleanup.promise
+        }
+        return originalAtomicWrite(file, value, options)
+      })
+      sent = f.owner.execute({ operation: 'send', ...f.selected, intent }, Date.now() + 5000)
+        .then(value => ({ value }), error => ({ error }))
+      await callbackEntered.promise
+      stopped = f.owner.stop()
+      await stopEntered.promise
+      releaseCallback.release()
+      // Old cleanup holds the real store lock; corrected code lets send fail
+      // and leaves the prepared row exclusively to the stop fence.
+      await Promise.race([cleanupEntered.promise, sent])
+      releaseStop.release()
+      const receipt = await stopped
+      expect(receipt.members[0]?.errors).not.toContain('tombstone_unknown')
+      expect(await store.snapshot()).toMatchObject({ tombstone: true, slot: null,
+        admissions: [{ state: 'not_submitted' }] })
+      expect(f.counters.prompted).toBe(0)
+    } finally {
+      releaseCallback.release(); releaseStop.release(); releaseCleanup.release()
+      await sent; await stopped
+      controlWrite?.mockRestore(); atomic?.mockRestore()
+      await f.close()
+    }
+  }, 15000)
+
+  test('active-owner callback deadline still releases the never-invoked prepared slot', async () => {
+    const f = await fixture()
+    let clock: ReturnType<typeof spyOn> | undefined, controlWrite: ReturnType<typeof spyOn> | undefined
+    const originalControlWrite = runControl.writeRunControlFile
+    try {
+      await f.owner.ready()
+      const deadline = Date.now() + 5000
+      controlWrite = spyOn(runControl, 'writeRunControlFile').mockImplementation(async (directory, name, value) => {
+        await originalControlWrite(directory, name, value)
+        if (directory === f.directory && name === 'intents.json') clock = spyOn(Date, 'now').mockReturnValue(deadline + 1)
+      })
+      expect(await f.owner.execute({ operation: 'send', ...f.selected, intent }, deadline))
+        .toMatchObject({ kind: 'send', admission: { state: 'not_submitted', disposition: 'rejected' } })
+      clock?.mockRestore(); controlWrite.mockRestore()
+      expect((await (await f.store()).snapshot()).slot).toBeNull()
+      expect(f.counters.prompted).toBe(0)
+      expect(await f.owner.execute({ operation: 'send', ...f.selected, intent: successor(2) }, Date.now() + 5000))
+        .toMatchObject({ kind: 'send', admission: { state: 'accepted' } })
+      expect(f.counters.prompted).toBe(1)
+    } finally { clock?.mockRestore(); controlWrite?.mockRestore(); await f.close() }
+  })
+
   test('failed intent persistence releases only the never-invoked prepared slot for the next input', async () => {
     const f = await fixture()
     try {

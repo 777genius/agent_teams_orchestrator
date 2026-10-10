@@ -3916,7 +3916,8 @@ export class OpenCodeProviderManagementAdapter
       progress,
     })
 
-    if (!inventory.detected) {
+    if (!inventory.detected
+      || (inventory.readGeneration !== undefined && inventory.readGeneration !== 'v1')) {
       return {
         ok: true,
         value: buildView({
@@ -4029,7 +4030,8 @@ export class OpenCodeProviderManagementAdapter
       refreshModels: input.refresh === true && input.summary !== true,
     })
 
-    if (!inventory.detected) {
+    if (!inventory.detected
+      || (!input.summary && inventory.readGeneration !== undefined && inventory.readGeneration !== 'v1')) {
       return {
         ok: true,
         value: buildProviderDirectory({
