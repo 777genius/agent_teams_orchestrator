@@ -475,6 +475,12 @@ export async function executeSelectedOpenCodeBridgeCommandEnvelope(input: unknow
   let binding: ReturnType<typeof resolveOpenCodeV2RunBinding>
   try { binding = resolveOpenCodeV2RunBinding(envelope.body) }
   catch (error) { return refusal(envelope, Date.now(), error instanceof Error ? error.message : 'run_identity_conflict') }
+  // Startup maintenance owns only the persisted legacy host registry, not a selected native runtime.
+  if (envelope.command === 'opencode.cleanupStartupHosts') {
+    if (envelope.body.runId !== undefined || envelope.body.expectedRunId !== undefined)
+      return refusal(envelope, Date.now(), 'Startup host registry cleanup cannot target a V2 run owner.')
+    return executeV1(input)
+  }
   const bridge = binding ? new OpenCodeV2TeamBridge(resolveClaudeMultimodelPaths().data, binding) : null
   if (bridge) {
     try { if (await bridge.discover()) return executeV2(envelope, null, bridge) }
