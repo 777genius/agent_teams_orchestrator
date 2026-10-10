@@ -1,5 +1,9 @@
 import { feature } from 'bun:bundle'
 import { getClientVersion } from '../utils/clientVersion.js'
+import type { PackagedOpenCodeDeliveryIdentity } from '../cli/packagedOpenCodeDelivery.js'
+
+// Inlined only by the reviewed release build; absent in source and plain builds.
+declare const PACKAGED_OPENCODE_DELIVERY: PackagedOpenCodeDeliveryIdentity | undefined
 
 // Define MACRO global for development (normally injected by bun build --define)
 if (typeof MACRO === 'undefined') {
@@ -241,6 +245,13 @@ async function runRuntimeProvidersFastPath(args: string[]): Promise<boolean> {
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2)
+
+  if (typeof PACKAGED_OPENCODE_DELIVERY !== 'undefined' &&
+    (args[0] === 'runtime' || (args[0] === 'model' && args[1] === 'list'))) {
+    const { runPackagedOpenCodeDelivery } = await import('../cli/packagedOpenCodeDelivery.js')
+    // Propagate the delegated command status explicitly at the compiled boundary.
+    process.exit(await runPackagedOpenCodeDelivery(args, PACKAGED_OPENCODE_DELIVERY))
+  }
 
   // Fast-path for --version/-v: no startup modules needed
   if (args.length === 1 && (args[0] === '--version' || args[0] === '-v' || args[0] === '-V')) {

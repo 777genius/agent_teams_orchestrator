@@ -388,14 +388,20 @@ describe('native REPL approval transport', () => {
           .finally(() => { promptSettled = true }),
       }, fake.deps)).then(() => null, error => error as Error)
       await opened.promise
-      for (let attempt = 0; attempt < 100 && !requestId; attempt++) {
+      // The pending indicator precedes the asynchronous mailbox write. Wait for
+      // publication, yielding real timer turns, with budget left for shutdown.
+      const mailboxDeadline = performance.now() + 2_000
+      while (!requestId && !promptSettled && performance.now() < mailboxDeadline) {
         const messages = await readMailbox('team-lead', teamName)
         const request = messages.map(message => JSON.parse(message.text) as {
           type?: string
           request_id?: string
         }).find(message => message.type === 'permission_request')
         requestId = request?.request_id
-        if (!requestId) await flushCallbacks()
+        if (!requestId) {
+          const remainingMs = mailboxDeadline - performance.now()
+          if (remainingMs > 0) await new Promise<void>(resolve => setTimeout(resolve, Math.min(20, remainingMs)))
+        }
       }
       expect(requestId).toBeDefined()
       if (!requestId) throw new Error('Synthetic permission request missing from mailbox')

@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { constants, fstatSync } from 'node:fs'
+import { constants, fstatSync, readlinkSync } from 'node:fs'
 import { lstat, open, readFile, readlink, readdir, realpath, type FileHandle } from 'node:fs/promises'
 import path from 'node:path'
 import type { ExecutionBirth } from './OpenCodeV2ExecutionBinding.js'
@@ -13,20 +13,38 @@ function assert(value: unknown, code = 'execution_containment_unavailable'): ass
 // CLOEXEC and held solely by the controller; none enter the executable stdio.
 async function loadLinuxPidfds() {
   assert(process.platform === 'linux' && process.versions.bun === '1.3.11', 'execution_containment_pidfd_runtime_pending')
-  const { dlopen, FFIType } = await import('bun:ffi')
+  const { dlopen, FFIType, ptr } = await import('bun:ffi')
   const library = dlopen('libc.so.6', {
     pidfd_open: { args: [FFIType.i32, FFIType.u32], returns: FFIType.i32 },
     pidfd_send_signal: { args: [FFIType.i32, FFIType.i32, FFIType.ptr, FFIType.u32], returns: FFIType.i32 },
+    poll: { args: [FFIType.ptr, FFIType.u64, FFIType.i32], returns: FFIType.i32 },
     close: { args: [FFIType.i32], returns: FFIType.i32 },
   })
   return Object.freeze({
     open(pid: number): number { const fd = library.symbols.pidfd_open(pid, 0); assert(fd >= 0, 'execution_containment_pidfd_unavailable'); return fd },
     kill(fd: number): boolean { return library.symbols.pidfd_send_signal(fd, 9, null, 0) === 0 },
+    exited(fd: number): boolean {
+      assert(Number.isSafeInteger(fd) && fd >= 0, 'cleanup_unknown')
+      let target: string | undefined
+      try { target = readlinkSync(`/proc/self/fd/${fd}`) } catch { /* Closed descriptors are UNKNOWN. */ }
+      assert(target === 'anon_inode:[pidfd]', 'cleanup_unknown')
+      const pollfd = Buffer.alloc(8)
+      pollfd.writeInt32LE(fd, 0); pollfd.writeInt16LE(1, 4) // POLLIN, timeout zero.
+      const ready = library.symbols.poll(ptr(pollfd), 1, 0)
+      const events = pollfd.readInt16LE(6)
+      assert(ready >= 0 && !(events & (8 | 32)), 'cleanup_unknown') // POLLERR/POLLNVAL.
+      return ready === 1 && (events & 1) !== 0
+    },
     close(fd: number): void { assert(library.symbols.close(fd) === 0, 'cleanup_unknown') },
   })
 }
 let pidfdSupport: ReturnType<typeof loadLinuxPidfds> | undefined
-const linuxPidfds = () => pidfdSupport ??= loadLinuxPidfds()
+let loadedPidfds: Awaited<ReturnType<typeof loadLinuxPidfds>> | undefined
+const linuxPidfds = () => pidfdSupport ??= loadLinuxPidfds().then(api => { loadedPidfds = api; return api })
+/** Read-only kernel observation; this cannot mint a mapping or retirement receipt. */
+export async function linuxPidfdHasExited(fd: number): Promise<boolean> {
+  return (loadedPidfds ?? await linuxPidfds()).exited(fd)
+}
 const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b)
 export async function linuxFileHash(file: string): Promise<string> {
   return createHash('sha256').update(await readFile(file)).digest('hex')
@@ -316,18 +334,12 @@ export function launchLinuxExecution(plan: LinuxLaunchPlan, nonce: string, lease
     const current = await linuxBirth(pid)
     if (current && same(current, birth)) {
       // The signal goes to the pinned task even if pid is reused after this check.
-      const signalled = (await linuxPidfds()).kill(fd)
+      const api = await linuxPidfds()
+      // Retirement can release a captured descriptor while the birth read awaits.
+      assert(fd === initFD || fd === supervisorFD, 'cleanup_unknown')
+      const signalled = api.kill(fd)
       assert(signalled || await linuxBirth(pid) === null, 'cleanup_unknown')
     } else assert(current === null, 'cleanup_unknown')
-  }
-  async function census(namespace: string): Promise<void> {
-    for (const name of await readdir('/proc')) {
-      if (!/^\d+$/.test(name)) continue
-      try { assert(await readlink(`/proc/${name}/ns/pid`) !== namespace, 'cleanup_unknown') } catch (error) {
-        const code = (error as NodeJS.ErrnoException).code
-        if (code !== 'ENOENT' && code !== 'ESRCH') throw error
-      }
-    }
   }
   async function retire(): Promise<KernelRetirement> {
     return retireWork ??= (async () => {
@@ -351,16 +363,22 @@ export function launchLinuxExecution(plan: LinuxLaunchPlan, nonce: string, lease
         assert(await linuxBirth(mapping.init.hostPID) === null && await linuxBirth(mapping.supervisor.hostPID) === null, 'cleanup_unknown')
         const ns = await namespaceFD.stat({ bigint: true })
         assert(String(ns.ino) === mapping.namespace.inode && String(ns.dev) === mapping.namespace.device, 'cleanup_unknown')
-        await census(mapping.namespace.name)
-        // PID1 death is the kernel proof for all descendants, including nested
-        // PID namespaces. The outer census corroborates it while the FD is pinned.
+        assert(initFD !== undefined && await linuxPidfdHasExited(initFD), 'cleanup_unknown')
+        // The held pidfd identifies the verified namespace PID1, not a reused PID.
+        // Linux completes zap_pid_ns_processes before PID1 exit notification;
+        // its reaping implies all namespace tasks are gone, including nested ones.
+        // A host-wide /proc census instead requires access to unrelated users' tasks.
+        // https://github.com/torvalds/linux/blob/v6.8/kernel/pid_namespace.c (zap_pid_ns_processes)
+        // https://github.com/torvalds/linux/blob/v6.8/kernel/fork.c (pidfd_poll)
         const result = Object.freeze({ pid: mapping.bun.hostPID, birth: mapping.bun.birth, scopeClosed: closed, mapping })
         retirements.add(result); return result
       } finally {
         const failures: unknown[] = []
-        try { await namespaceFD?.close() } catch (error) { failures.push(error) }
+        const namespace = namespaceFD, descriptors = [initFD, supervisorFD]
+        namespaceFD = undefined; initFD = undefined; supervisorFD = undefined
+        try { await namespace?.close() } catch (error) { failures.push(error) }
         const api = await linuxPidfds()
-        for (const fd of [initFD, supervisorFD]) {
+        for (const fd of descriptors) {
           try { if (fd !== undefined) api.close(fd) } catch (error) { failures.push(error) }
         }
         assert(failures.length === 0, 'cleanup_unknown')

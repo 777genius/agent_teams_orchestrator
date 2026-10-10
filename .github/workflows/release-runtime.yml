@@ -20,6 +20,11 @@ on:
         required: false
         default: false
         type: boolean
+      publish_prerelease:
+        description: Publish as a public qualification prerelease without promoting latest
+        required: false
+        default: false
+        type: boolean
       target_release_repo:
         description: Public repository that should receive the runtime assets
         required: false
@@ -193,16 +198,16 @@ jobs:
 
       - name: Install dependencies
         if: matrix.platform != 'win32-arm64'
-        run: bun install --frozen-lockfile
+        run: bun install --frozen-lockfile --linker hoisted
 
       - name: Install Windows ARM64 dependencies
         if: matrix.platform == 'win32-arm64'
-        run: bun install --frozen-lockfile --os=win32 --cpu=arm64
+        run: bun install --frozen-lockfile --linker hoisted --os=win32 --cpu=arm64
 
-      - name: Compile runtime
+      - name: Build packaged runtime deliveries
         env:
           BUN_COMPILE_TARGET: ${{ matrix.compile_target }}
-        run: bun run compile
+        run: bun run ./scripts/package-runtime.ts --platform ${{ matrix.platform }}
 
       - name: Verify compiled runtime
         if: runner.os != 'Windows' && matrix.platform != 'win32-arm64'
@@ -308,6 +313,8 @@ jobs:
           # manual staging step nobody performs on a real install.
           [[ -d dist/cursor-managed ]] || { echo "Managed Cursor assets missing"; exit 1; }
           cp -R dist/cursor-managed release/runtime/cursor-managed
+          cp -R dist/local-cli release/runtime/local-cli
+          cp -R dist/bun release/runtime/bun
           tar -czf "release/${{ matrix.archive_name }}" -C release runtime
 
       - name: Package cross-compiled Windows ARM64 runtime archive
@@ -330,6 +337,8 @@ jobs:
           # manual staging step nobody performs on a real install.
           [[ -d dist/cursor-managed ]] || { echo "Managed Cursor assets missing"; exit 1; }
           cp -R dist/cursor-managed release/runtime/cursor-managed
+          cp -R dist/local-cli release/runtime/local-cli
+          cp -R dist/bun release/runtime/bun
           (cd release && zip -qr "${{ matrix.archive_name }}" runtime)
 
       - name: Package runtime archive (Windows)
@@ -357,6 +366,8 @@ jobs:
           # Resolved beside the installed binary; see the bash packaging step.
           if (-not (Test-Path dist/cursor-managed)) { throw "Managed Cursor assets missing" }
           Copy-Item dist/cursor-managed release/runtime/cursor-managed -Recurse
+          Copy-Item dist/local-cli release/runtime/local-cli -Recurse
+          Copy-Item dist/bun release/runtime/bun -Recurse
           Compress-Archive -Path release/runtime -DestinationPath "release/${{ matrix.archive_name }}" -Force
 
       - name: Rename archive to versioned asset name
@@ -435,6 +446,7 @@ jobs:
           TARGET_RELEASE_TAG: ${{ needs.prepare-release.outputs.target_tag }}
           EXISTING_DRAFT_RELEASE_ID: ${{ needs.prepare-release.outputs.draft_release_id }}
           PUBLISH_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release || false }}
+          PUBLISH_PRERELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_prerelease || false }}
         shell: bash
         run: |
           set -euo pipefail
@@ -474,7 +486,7 @@ jobs:
             -f name="$TARGET_RELEASE_TAG" \
             -f body="Runtime assets for $TARGET_RELEASE_TAG" \
             -F draft=true \
-            -F prerelease=false \
+            -F prerelease="$PUBLISH_PRERELEASE" \
             -f make_latest=false)"
           release_id="$(jq -r '.id' <<<"$release_json")"
 
@@ -531,7 +543,7 @@ jobs:
             --method PATCH \
             "repos/${TARGET_RELEASE_REPO}/releases/${release_id}" \
             -F draft=false \
-            -F prerelease=false \
+            -F prerelease="$PUBLISH_PRERELEASE" \
             -f make_latest=false \
             >/dev/null
 

@@ -180,7 +180,7 @@ async function ensureInboxDir(teamName?: string): Promise<void> {
   const team = teamName || getTeamName() || 'default'
   const safeTeam = sanitizePathComponent(team)
   const inboxDir = join(getTeamsDir(), safeTeam, 'inboxes')
-  await mkdir(inboxDir, { recursive: true })
+  await mkdir(inboxDir, { recursive: true, mode: 0o700 })
   logForDebugging(`[TeammateMailbox] Ensured inbox directory: ${inboxDir}`)
 }
 
@@ -322,7 +322,7 @@ export async function writeToMailbox(
 
   // Ensure the inbox file exists before locking (proper-lockfile requires the file to exist)
   try {
-    await writeFile(inboxPath, '[]', { encoding: 'utf-8', flag: 'wx' })
+    await writeFile(inboxPath, '[]', { encoding: 'utf-8', flag: 'wx', mode: 0o600 })
     logForDebugging(`[TeammateMailbox] writeToMailbox: created new inbox file`)
   } catch (error) {
     const code = getErrnoCode(error)
@@ -358,7 +358,7 @@ export async function writeToMailbox(
 
     messages.push(newMessage)
 
-    await writeFileAtomic(inboxPath, serializeMailboxMutation(source))
+    await writeFileAtomic(inboxPath, serializeMailboxMutation(source), { mode: 0o600 })
     logForDebugging(
       `[TeammateMailbox] Wrote message to ${recipientName}'s inbox from ${message.from}`,
     )
@@ -512,7 +512,7 @@ export async function markMessageAsReadByIndex(
 
     messages[messageIndex] = { ...message, read: true }
 
-    await writeFileAtomic(inboxPath, serializeMailboxMutation(source))
+    await writeFileAtomic(inboxPath, serializeMailboxMutation(source), { mode: 0o600 })
     logForDebugging(
       `[TeammateMailbox] markMessageAsReadByIndex: marked message at index ${messageIndex} as read`,
     )
@@ -586,7 +586,7 @@ export async function markMessagesAsRead(
     // messages comes from jsonParse - fresh, unshared objects safe to mutate
     for (const m of messages) m.read = true
 
-    await writeFileAtomic(inboxPath, serializeMailboxMutation(source))
+    await writeFileAtomic(inboxPath, serializeMailboxMutation(source), { mode: 0o600 })
     logForDebugging(
       `[TeammateMailbox] markMessagesAsRead: WROTE ${unreadCount} message(s) as read to ${inboxPath}`,
     )
@@ -673,7 +673,7 @@ export async function supersedeStaleLeadBootstrapMessages(
       return []
     }
 
-    await writeFileAtomic(inboxPath, serializeMailboxMutation(source))
+    await writeFileAtomic(inboxPath, serializeMailboxMutation(source), { mode: 0o600 })
     logForDebugging(
       `[TeammateMailbox] superseded ${supersededIds.length} stale bootstrap row(s) for ${agentName}: ${supersededIds.join(', ')}`,
     )
@@ -717,7 +717,7 @@ export async function clearMailbox(
     release = await lockfile.lock(inboxPath, { lockfilePath: `${inboxPath}.lock`, ...LOCK_OPTIONS })
     const source = await readMailboxMutationSource(agentName, teamName)
     if (source.hasGroups) throw new Error('GROUP_STORAGE_UNAVAILABLE: group history cannot be cleared by legacy mailbox cleanup')
-    await writeFileAtomic(inboxPath, '[]')
+    await writeFileAtomic(inboxPath, '[]', { mode: 0o600 })
   } catch (error) {
     if (getErrnoCode(error) !== 'ENOENT') logError(error)
   } finally {
@@ -1698,7 +1698,7 @@ async function readAndClaimInteractiveMailboxSnapshotUnderLock(
     }
 
     if (didMutateClaims) {
-      await writeFileAtomic(inboxPath, serializeMailboxMutation(source))
+      await writeFileAtomic(inboxPath, serializeMailboxMutation(source), { mode: 0o600 })
     }
 
     return {
@@ -1791,7 +1791,7 @@ export async function markMessagesAsReadByIds(
     })
 
     if (didMutate) {
-      await writeFileAtomic(inboxPath, serializeMailboxMutation(source, updatedMessages))
+      await writeFileAtomic(inboxPath, serializeMailboxMutation(source, updatedMessages), { mode: 0o600 })
     }
   } catch (error) {
     const code = getErrnoCode(error)
@@ -1857,7 +1857,7 @@ export async function finalizeClaimedMessagesAsRead(
     })
 
     if (didMutate) {
-      await writeFileAtomic(inboxPath, serializeMailboxMutation(source, updatedMessages))
+      await writeFileAtomic(inboxPath, serializeMailboxMutation(source, updatedMessages), { mode: 0o600 })
     }
   } catch (error) {
     const code = getErrnoCode(error)
@@ -1906,7 +1906,7 @@ export async function markMessagesAsReadByPredicate(
       !m.read && predicate(m) ? { ...m, read: true } : m,
     )
 
-    await writeFileAtomic(inboxPath, serializeMailboxMutation(source, updatedMessages))
+    await writeFileAtomic(inboxPath, serializeMailboxMutation(source, updatedMessages), { mode: 0o600 })
   } catch (error) {
     const code = getErrnoCode(error)
     if (code === 'ENOENT') {

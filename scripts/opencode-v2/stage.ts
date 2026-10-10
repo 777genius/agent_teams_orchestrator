@@ -29,12 +29,15 @@ async function metadata(root: string): Promise<PackageMetadata> {
 
 // Match Node/Bun's package lookup before reading exports. Package roots are not
 // necessarily exported, and the floor alias's manifest has its official name.
-async function packageRoot(name: string, from: string): Promise<string | null> {
+async function packageRoot(name: string, from: string, physical = false): Promise<string | null> {
   if (!/^(?:@[a-z0-9._-]+\/)?[a-z0-9._-]+$/i.test(name)) throw new Error('Invalid dependency name')
   let directory = from
   for (;;) {
     const candidate = path.join(directory, 'node_modules', name)
-    try { return await realpath(candidate) }
+    try {
+      if (physical && !(await lstat(candidate)).isDirectory()) throw new Error('Portable graph requires a physical hoisted install')
+      return await realpath(candidate)
+    }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
     const parent = path.dirname(directory)
     if (parent === directory) return null
@@ -96,13 +99,17 @@ async function verifyGraphs(from: string, ownedRoot?: string): Promise<void> {
 
 /** Build-time staging only. No installs or runtime fallbacks. All package bytes
  * and installed native assets are copied, preserving separate physical graphs. */
-export async function stageOpenCodeV2Graphs(sourceRoot: string, bundleDirectory: string): Promise<void> {
+export async function stageOpenCodeV2Graphs(sourceRoot: string, bundleDirectory: string,
+  options: { portable?: boolean; platform?: string; arch?: string } = {}): Promise<void> {
   sourceRoot = await realpath(sourceRoot)
   const destination = path.resolve(bundleDirectory, 'node_modules')
   await verifyGraphs(sourceRoot)
   await mkdir(destination, { recursive: true })
   const packages = new Map<string, PackageNode>()
   const link = async (directory: string, name: string, target: string) => {
+    // Portable packages retain the source hoisted/nested positions. The normal
+    // ancestor lookup already reaches their copied dependencies; no links needed.
+    if (options.portable) return
     const location = path.join(directory, name)
     await mkdir(path.dirname(location), { recursive: true })
     // Relative directory links make the complete bundle relocatable.
@@ -113,7 +120,11 @@ export async function stageOpenCodeV2Graphs(sourceRoot: string, bundleDirectory:
     if (existing) return existing
     const info = await metadata(source)
     const id = createHash('sha256').update(path.relative(sourceRoot, source)).digest('hex').slice(0, 24)
-    const target = path.join(destination, '.opencode-v2', id)
+    const physicalRelative = path.relative(path.join(sourceRoot, 'node_modules'), source)
+    if (options.portable && (physicalRelative.startsWith('..') || path.isAbsolute(physicalRelative))) {
+      throw new Error('Portable graph escaped the hoisted install')
+    }
+    const target = options.portable ? path.join(destination, physicalRelative) : path.join(destination, '.opencode-v2', id)
     const node = { source, target, metadata: info }
     packages.set(source, node)
     await cp(source, target, { recursive: true, dereference: true, filter: async file => {
@@ -131,7 +142,7 @@ export async function stageOpenCodeV2Graphs(sourceRoot: string, bundleDirectory:
     const required = info.dependencies ?? {}
     const peers = info.peerDependencies ?? {}
     for (const dependency of [...new Set([...Object.keys(required), ...Object.keys(optional), ...Object.keys(peers)])].sort()) {
-      const resolved = await packageRoot(dependency, source)
+      const resolved = await packageRoot(dependency, source, options.portable)
       if (!resolved) {
         if ((dependency in required && !(dependency in optional)) ||
           (dependency in peers && !info.peerDependenciesMeta?.[dependency]?.optional)) {
@@ -145,7 +156,7 @@ export async function stageOpenCodeV2Graphs(sourceRoot: string, bundleDirectory:
     return node
   }
   for (const [alias, name, version] of selections) {
-    const source = await packageRoot(alias, sourceRoot)
+    const source = await packageRoot(alias, sourceRoot, options.portable)
     if (!source) throw new Error(`Missing selected package ${alias}`)
     const node = await copy(source)
     if (node.metadata.name !== name || node.metadata.version !== version) throw new Error(`Wrong selected package ${alias}`)
@@ -153,7 +164,7 @@ export async function stageOpenCodeV2Graphs(sourceRoot: string, bundleDirectory:
   }
   await verifyGraphs(path.resolve(bundleDirectory), destination)
   await writeFile(path.join(bundleDirectory, 'opencode-v2-graphs.json'), JSON.stringify({
-    schema: 1, pins: ['2.0.0', '2.0.21'], effect: '4.0.0-rc.112', platform: process.platform, arch: process.arch,
+    schema: 1, pins: ['2.0.0', '2.0.21'], effect: '4.0.0-rc.112', platform: options.platform ?? process.platform, arch: options.arch ?? process.arch,
     packages: [...packages.values()].map(node => ({ name: node.metadata.name, version: node.metadata.version,
       path: path.relative(bundleDirectory, node.target),
     })),
