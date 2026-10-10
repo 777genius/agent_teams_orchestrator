@@ -16,7 +16,7 @@ export type OpenCodeAuthorityRead<T> =
 export class OpenCodeAuthorityVetoError extends Error {
   readonly kind = 'preserved_unknown' as const
   constructor(readonly store: 'host' | 'session', readonly reason: 'unreadable' | 'nonregular' | 'invalid') {
-    super('OpenCode authority is unknown; operation vetoed and store preserved')
+    super('OpenCode authority is unknown; operation vetoed and store preserved (' + store + '/' + reason + ')')
     this.name = 'OpenCodeAuthorityVetoError'
   }
 }
