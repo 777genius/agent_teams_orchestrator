@@ -10,21 +10,21 @@ import {
   type OpenCodeSseFetch,
 } from './OpenCodeSseEventStream.js'
 import { buildOpenCodeRuntimePromptMessageId } from './OpenCodeMessageIds.js'
-import { hasTerminalOpenCodeAssistantResponse } from './OpenCodeEventTranslator.js'
-import { openCodeTranscriptProjector } from './OpenCodeTranscriptProjector.js'
+import { qualifyOpenCodeV1TerminalProof, type OpenCodeV1TerminalProof, type OpenCodeV1TerminalAuthority } from './OpenCodeV1TerminalProof.js'
+import { readOpenCodeV1TerminalTranscript } from './OpenCodeV1TerminalTranscriptReader.js'
 import type { OpenCodeRuntimeTurnSettledOutcome } from './OpenCodeRuntimeTurnSettledEmitter.js'
-import type { OpenCodeMessage, OpenCodeSseEvent } from './types.js'
+import type { OpenCodeSseEvent } from './types.js'
 
 export { buildOpenCodeRuntimePromptMessageId } from './OpenCodeMessageIds.js'
 
 const DEFAULT_TURN_SETTLED_TIMEOUT_MS = 15_000
 const DEFAULT_TURN_SETTLED_IDLE_TIMEOUT_MS = 2_500
-const DEFAULT_TURN_SETTLED_TRANSCRIPT_LIMIT = 50
 const ENDPOINTS: OpenCodeSseEndpoint[] = ['/event', '/global/event']
 
 type PromptState = 'created' | 'submitting' | 'accepted' | 'rejected'
 
 export type OpenCodeTurnSettledSummary = {
+  terminalProof?: OpenCodeV1TerminalProof
   outcome: OpenCodeRuntimeTurnSettledOutcome
   sessionId: string
   runtimePromptMessageId: string
@@ -74,23 +74,6 @@ type ObservationState = {
   terminal: OpenCodeTurnSettledSummary | null
 }
 
-type TranscriptResponseProof = {
-  promptPersisted: boolean
-  assistantMessageId: string | null
-  assistantHasError?: boolean
-}
-
-function asRecord(value: unknown): Record<string, unknown> | null {
-  if (value && typeof value === 'object' && !Array.isArray(value)) {
-    return value as Record<string, unknown>
-  }
-  return null
-}
-
-function asString(value: unknown): string | null {
-  return typeof value === 'string' && value.length > 0 ? value : null
-}
-
 function isAssistantActivityPartType(partType: string | null): boolean {
   return partType === 'text' ||
     partType === 'tool' ||
@@ -103,122 +86,12 @@ function isAssistantActivityPartType(partType: string | null): boolean {
     partType === 'step_finish'
 }
 
-function isTranscriptAssistantResponsePartType(partType: string | null): boolean {
-  return partType === 'text' ||
-    partType === 'tool' ||
-    partType === 'tool_use' ||
-    partType === 'tool_result' ||
-    partType === 'reasoning' ||
-    partType === 'step-finish' ||
-    partType === 'step_finish'
-}
-
-function getTranscriptMessageInfo(message: OpenCodeMessage): Record<string, unknown> | null {
-  return asRecord(message.info)
-}
-
-function getTranscriptMessageId(message: OpenCodeMessage): string | null {
-  return asString(getTranscriptMessageInfo(message)?.id)
-}
-
-function getTranscriptMessageParentId(message: OpenCodeMessage): string | null {
-  const info = getTranscriptMessageInfo(message)
-  return (
-    asString(info?.parentID) ??
-    asString(info?.parentId) ??
-    asString(info?.parent)
-  )
-}
-
-function getTranscriptMessageRole(message: OpenCodeMessage): string | null {
-  return asString(getTranscriptMessageInfo(message)?.role)
-}
-
-function hasTranscriptAssistantActivity(message: OpenCodeMessage): boolean {
-  if (!Array.isArray(message.parts)) {
-    return false
-  }
-
-  return message.parts.some((part) => {
-    const record = asRecord(part)
-    const type = asString(record?.type)
-    if (isTranscriptAssistantResponsePartType(type)) {
-      return true
-    }
-    return asString(record?.text) !== null
-  })
-}
-
-function findTranscriptResponseForPrompt(
-  messages: OpenCodeMessage[],
-  runtimePromptMessageId: string,
-  requireTerminal = false,
-): TranscriptResponseProof {
-  const promptIndex = messages.findIndex(message =>
-    getTranscriptMessageRole(message) === 'user' &&
-    getTranscriptMessageId(message) === runtimePromptMessageId
-  )
-  if (requireTerminal) {
-    const following = promptIndex >= 0 ? messages.slice(promptIndex + 1) : messages
-    const nextUserIndex = following.findIndex(message => getTranscriptMessageRole(message) === 'user')
-    const candidates = promptIndex >= 0
-      ? following.slice(0, nextUserIndex >= 0 ? nextUserIndex : undefined)
-      : following.filter(message => getTranscriptMessageParentId(message) === runtimePromptMessageId)
-    const latestAssistant = candidates.findLast(message => getTranscriptMessageRole(message) === 'assistant')
-    const canonical = latestAssistant && Array.isArray(latestAssistant.parts)
-      ? openCodeTranscriptProjector.projectSessionMessages({
-        sessionId: '', messages: [latestAssistant],
-      }).messages[0]
-      : null
-    return {
-      promptPersisted: promptIndex >= 0 || Boolean(latestAssistant),
-      assistantMessageId: canonical && hasTerminalOpenCodeAssistantResponse(canonical) ? canonical.id : null,
-      assistantHasError: canonical?.hasError,
-    }
-  }
-  const parentMatchedAssistant = messages.find(message =>
-    getTranscriptMessageRole(message) === 'assistant' &&
-    getTranscriptMessageParentId(message) === runtimePromptMessageId &&
-    hasTranscriptAssistantActivity(message)
-  )
-
-  if (parentMatchedAssistant) {
-    return {
-      promptPersisted: true,
-      assistantMessageId: getTranscriptMessageId(parentMatchedAssistant),
-    }
-  }
-
-  if (promptIndex < 0) {
-    return {
-      promptPersisted: false,
-      assistantMessageId: null,
-    }
-  }
-
-  for (const message of messages.slice(promptIndex + 1)) {
-    const role = getTranscriptMessageRole(message)
-    if (role === 'user') {
-      break
-    }
-    if (role === 'assistant' && hasTranscriptAssistantActivity(message)) {
-      return {
-        promptPersisted: true,
-        assistantMessageId: getTranscriptMessageId(message),
-      }
-    }
-  }
-
-  return {
-    promptPersisted: true,
-    assistantMessageId: null,
-  }
-}
-
 export class OpenCodeTurnSettledObserver {
   constructor(private readonly deps: OpenCodeTurnSettledObserverDeps = {}) {}
 
   observe(params: {
+    authority?: OpenCodeV1TerminalAuthority
+    signal?: AbortSignal
     baseUrl: string
     sessionId: string
     projectPath?: string | null
@@ -230,6 +103,10 @@ export class OpenCodeTurnSettledObserver {
       params.runtimePromptMessageId?.trim() ||
       (this.deps.promptMessageIdFactory ?? buildOpenCodeRuntimePromptMessageId)()
     const turnId = runtimePromptMessageId
+    const authority = params.authority ? {
+      hostKey: params.authority.hostKey, runId: params.authority.runId,
+      profileRootKey: params.authority.profileRootKey, projectPath: params.authority.projectPath,
+    } : undefined
     const state: ObservationState = {
       promptState: 'created',
       disposed: false,
@@ -249,10 +126,19 @@ export class OpenCodeTurnSettledObserver {
     }
 
     const timeoutMs = params.timeoutMs ?? DEFAULT_TURN_SETTLED_TIMEOUT_MS
+    const deadlineAt = performance.now() + timeoutMs
     const idleTimeoutMs = params.idleTimeoutMs ?? DEFAULT_TURN_SETTLED_IDLE_TIMEOUT_MS
     const controller = new AbortController()
     let idleTimer: ReturnType<typeof setTimeout> | null = null
     let idleTranscriptProbeInFlight = false
+    let reconciliationRequested = false
+    let transcriptReadCount = 0
+    let finalReadCount = 0
+    let finalRequested = false
+    let reconciliationTimer: ReturnType<typeof setTimeout> | null = null
+    let lastReadAt = -Infinity
+    const progressIntervalMs = Math.max(10, Math.min(250, timeoutMs / 48))
+    let terminalProof: OpenCodeV1TerminalProof | undefined
     let resolveWait: ((summary: OpenCodeTurnSettledSummary) => void) | null = null
     const waitPromise = new Promise<OpenCodeTurnSettledSummary>(resolve => {
       resolveWait = resolve
@@ -270,6 +156,7 @@ export class OpenCodeTurnSettledObserver {
       diagnostic?: string,
     ): OpenCodeTurnSettledSummary => ({
       outcome,
+      ...(terminalProof ? { terminalProof } : {}),
       sessionId: params.sessionId,
       runtimePromptMessageId,
       turnId,
@@ -290,9 +177,16 @@ export class OpenCodeTurnSettledObserver {
       }
       state.terminal = buildSummary(outcome, diagnostic)
       clearIdleTimer()
+      if (reconciliationTimer) clearTimeout(reconciliationTimer)
+      reconciliationTimer = null
       controller.abort()
+      params.signal?.removeEventListener('abort', abortObservation)
       resolveWait?.(state.terminal)
     }
+
+    const abortObservation = () => settle('unknown', 'OpenCode turn observation operation aborted')
+    params.signal?.addEventListener('abort', abortObservation, { once: true })
+    if (params.signal?.aborted) abortObservation()
 
     const resetIdleTimer = () => {
       if (idleTimeoutMs <= 0 || state.terminal) {
@@ -300,7 +194,7 @@ export class OpenCodeTurnSettledObserver {
       }
       clearIdleTimer()
       idleTimer = setTimeout(() => {
-        if (state.promptState === 'accepted' && state.assistantActivityCount > 0) {
+        if (state.promptState === 'accepted') {
           reconcileTranscriptAfterIdle('event silence')
         }
       }, idleTimeoutMs)
@@ -336,90 +230,56 @@ export class OpenCodeTurnSettledObserver {
       )
     }
 
-    const fetchTranscriptResponseProof = async (requireTerminal: boolean): Promise<TranscriptResponseProof | null> => {
-      const fetchImpl = this.deps.fetchImpl ?? fetch
-      const path =
-        `/session/${encodeURIComponent(params.sessionId)}/message?limit=${DEFAULT_TURN_SETTLED_TRANSCRIPT_LIMIT}`
-      let response: Response
-      try {
-        response = await fetchImpl(params.baseUrl + path, {
-          method: 'GET',
-          signal: controller.signal,
-          headers: {
-            Accept: 'application/json',
-          },
-        })
-      } catch (error) {
-        if (controller.signal.aborted || state.terminal || state.disposed) {
-          return null
-        }
-        state.diagnostics.push(
-          `OpenCode transcript reconcile failed after idle - ${error instanceof Error ? error.message : String(error)}`,
-        )
-        return null
-      }
-
-      if (!response.ok) {
-        state.diagnostics.push(
-          `OpenCode transcript reconcile returned ${response.status} ${response.statusText}`,
-        )
-        return null
-      }
-
-      let raw: unknown
-      try {
-        raw = await response.json()
-      } catch (error) {
-        state.diagnostics.push(
-          `OpenCode transcript reconcile returned invalid JSON - ${error instanceof Error ? error.message : String(error)}`,
-        )
-        return null
-      }
-
-      if (!Array.isArray(raw)) {
-        state.diagnostics.push('OpenCode transcript reconcile returned a non-array message list')
-        return null
-      }
-
-      return findTranscriptResponseForPrompt(raw as OpenCodeMessage[], runtimePromptMessageId, requireTerminal)
-    }
-
-    const reconcileTranscriptAfterIdle = (source: 'session.idle' | 'session.status idle' | 'event silence') => {
-      if (state.terminal || state.disposed || idleTranscriptProbeInFlight) {
+    const reconcileTranscriptAfterIdle = (source: string, final = false) => {
+      if (state.terminal || state.disposed || state.promptState !== 'accepted') return
+      finalRequested ||= final
+      if (idleTranscriptProbeInFlight) { reconciliationRequested = true; return }
+      const reserved = finalRequested
+      if ((reserved && finalReadCount >= 8) || (!reserved && transcriptReadCount >= 24)) {
+        const diagnostic = `OpenCode ${reserved ? 'final' : 'progress'} reconciliation budget exhausted`
+        if (!state.diagnostics.includes(diagnostic)) state.diagnostics.push(diagnostic)
         return
       }
-
+      const delay = reserved ? 0 : Math.max(0, lastReadAt + progressIntervalMs - performance.now())
+      if (delay > 0) {
+        if (!reconciliationTimer) reconciliationTimer = setTimeout(() => {
+          reconciliationTimer = null
+          reconcileTranscriptAfterIdle(source)
+        }, delay)
+        return
+      }
+      if (reconciliationTimer) clearTimeout(reconciliationTimer)
+      reconciliationTimer = null
+      finalRequested = false
+      reconciliationRequested = false
+      if (reserved) finalReadCount++; else transcriptReadCount++
+      lastReadAt = performance.now()
       idleTranscriptProbeInFlight = true
       const matchedEventCount = state.matchedEventCount
       void (async () => {
         try {
-          const proof = await fetchTranscriptResponseProof(source === 'event silence')
-          if (!proof || state.terminal || state.disposed) {
-            return
-          }
-          if (source === 'event silence' && state.matchedEventCount !== matchedEventCount) {
-            resetIdleTimer()
-            return
-          }
-          if (proof.promptPersisted) {
-            state.promptPersisted = true
-          }
-          if (!proof.assistantMessageId) {
-            state.diagnostics.push(
-              `OpenCode transcript reconcile after ${source} found no assistant response for the current prompt`,
-            )
-            return
-          }
-
-          state.assistantMessageObserved = true
-          state.assistantActivityCount = Math.max(state.assistantActivityCount, 1)
-          state.latestAssistantMessageId = proof.assistantMessageId
-          settle(
-            proof.assistantHasError ? 'error' : 'success',
-            `OpenCode transcript reconcile after ${source} observed ${source === 'event silence' ? 'a terminal assistant response' : 'assistant activity'}`,
-          )
+          const evidence = await readOpenCodeV1TerminalTranscript({
+            authority, baseUrl: params.baseUrl, sessionId: params.sessionId, runtimePromptMessageId,
+            remainingMs: () => Math.max(0, deadlineAt - performance.now()),
+            signal: controller.signal, fetchImpl: this.deps.fetchImpl,
+          })
+          if (state.terminal || state.disposed) return
+          if (performance.now() >= deadlineAt) { settle('timeout', 'OpenCode absolute observation deadline expired'); return }
+          if (state.matchedEventCount !== matchedEventCount) { reconciliationRequested = true; return }
+          const result = qualifyOpenCodeV1TerminalProof(evidence, params.sessionId, runtimePromptMessageId)
+          // Diagnostics are bounded by the finite reconciliation allowance.
+          state.diagnostics.push(...evidence.diagnostics, ...result.diagnostics)
+          if (!result.proof) return
+          terminalProof = result.proof
+          state.promptPersisted = true
+          state.latestAssistantMessageId = result.proof.assistantMessageId
+          settle(result.proof.outcome, `OpenCode qualified terminal assistant response after ${source}`)
         } finally {
           idleTranscriptProbeInFlight = false
+          if (!state.terminal && !state.disposed) {
+            if (reconciliationRequested || finalRequested) reconcileTranscriptAfterIdle('coalesced event')
+            resetIdleTimer()
+          }
         }
       })()
     }
@@ -449,69 +309,28 @@ export class OpenCodeTurnSettledObserver {
       resetIdleTimer()
 
       if (event.type === 'session.error') {
-        const diagnostic = `OpenCode observed session.error for ${params.sessionId}`
-        if (state.promptState === 'accepted') {
-          if (hasCurrentPromptEvidence()) {
-            settle('error', diagnostic)
-            return
-          }
-          recordUnattributedSessionError(
-            diagnostic,
-            'OpenCode ignored session.error without current prompt evidence',
-          )
-          return
-        }
-        if (state.promptState === 'submitting') {
-          recordUnattributedSessionError(
-            diagnostic,
-            'OpenCode buffered session.error before prompt_async endpoint acceptance',
-          )
-        }
-        return
-      }
-
-      if (event.type === 'session.idle') {
-        if (state.promptState !== 'accepted') {
-          return
-        }
-        if (!hasCurrentPromptEvidence()) {
-          state.diagnostics.push(
-            'OpenCode ignored session.idle without current prompt evidence',
-          )
-          reconcileTranscriptAfterIdle('session.idle')
-          return
-        }
-        if (state.assistantActivityCount > 0) {
-          settle('success', 'OpenCode observed deprecated session.idle after assistant activity')
-          return
-        }
-        state.diagnostics.push(
-          'OpenCode observed deprecated session.idle without assistant activity; waiting for full turn timeout',
+        recordUnattributedSessionError(
+          `OpenCode observed session.error for ${params.sessionId}`,
+          'Session-only error requires persisted per-prompt terminal attribution',
         )
-        reconcileTranscriptAfterIdle('session.idle')
+        reconcileTranscriptAfterIdle('session.error', true)
         return
       }
-
-      if (event.type === 'session.status') {
-        const status = getOpenCodeSseSessionStatusType(event.properties.status, params.sessionId)
-        if (status === 'idle' && state.promptState === 'accepted') {
-          if (!hasCurrentPromptEvidence()) {
-            state.diagnostics.push(
-              'OpenCode ignored session.status idle without current prompt evidence',
-            )
-            reconcileTranscriptAfterIdle('session.status idle')
-            return
-          }
-          if (state.assistantActivityCount > 0) {
-            settle('success', 'OpenCode observed session.status idle after assistant activity')
-            return
-          }
-          state.diagnostics.push(
-            'OpenCode observed session.status idle without assistant activity; waiting for full turn timeout',
-          )
-          reconcileTranscriptAfterIdle('session.status idle')
-        }
+      if (event.type === 'session.idle' ||
+        (event.type === 'session.status' && getOpenCodeSseSessionStatusType(event.properties.status, params.sessionId) === 'idle')) {
+        reconcileTranscriptAfterIdle(event.type, true)
         return
+      }
+      if (event.type === 'message.updated' || event.type === 'message.part.updated' || event.type === 'message.part.delta') {
+        const info = event.properties.info
+        // A completed tool-calls assistant is step progress, even with time.completed.
+        // SSE only schedules persisted proof; measured stop/native-abort candidates use reserve.
+        const final = event.type === 'message.updated' && info !== null && typeof info === 'object'
+          && 'role' in info && info.role === 'assistant'
+          && ('finish' in info && info.finish === 'stop'
+            || 'error' in info && info.error !== null && typeof info.error === 'object'
+              && 'name' in info.error && info.error.name === 'MessageAbortedError')
+        reconcileTranscriptAfterIdle(event.type, final)
       }
 
       if (state.promptState !== 'submitting' && state.promptState !== 'accepted') {
@@ -642,6 +461,7 @@ export class OpenCodeTurnSettledObserver {
         if (state.promptState === 'submitting') {
           state.promptState = 'accepted'
           resetIdleTimer()
+          reconcileTranscriptAfterIdle('endpoint acceptance')
         }
       },
       markPromptRejectedByEndpoint: error => {

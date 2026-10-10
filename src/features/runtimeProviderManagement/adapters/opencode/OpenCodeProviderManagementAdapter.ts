@@ -1,3 +1,4 @@
+import { selectedProviderUsesOpenCodeV2, connectOpenCodeV2Provider, loadOpenCodeV2ProviderModels, testOpenCodeV2ProviderModel } from './OpenCodeV2ProviderManagement.js'
 import path from 'node:path'
 
 import {
@@ -3806,6 +3807,9 @@ export class OpenCodeProviderManagementAdapter
       if (!inventory.detected) {
         return providerManagementError('runtime-missing', 'OpenCode CLI not detected on PATH')
       }
+      if (inventory.readGeneration !== undefined && inventory.readGeneration !== 'v1') {
+        return providerManagementError('runtime-unhealthy', 'Selected OpenCode generation is not supported for this action')
+      }
       const leaveHostStep = options.progress?.enterStep('ensure managed catalog host')
       host = await hostManager.ensureHost({
         projectPath: projectPath ?? inventory.projectPath,
@@ -3912,7 +3916,8 @@ export class OpenCodeProviderManagementAdapter
       progress,
     })
 
-    if (!inventory.detected) {
+    if (!inventory.detected
+      || (inventory.readGeneration !== undefined && inventory.readGeneration !== 'v1')) {
       return {
         ok: true,
         value: buildView({
@@ -4025,7 +4030,8 @@ export class OpenCodeProviderManagementAdapter
       refreshModels: input.refresh === true && input.summary !== true,
     })
 
-    if (!inventory.detected) {
+    if (!inventory.detected
+      || (!input.summary && inventory.readGeneration !== undefined && inventory.readGeneration !== 'v1')) {
       return {
         ok: true,
         value: buildProviderDirectory({
@@ -4305,6 +4311,14 @@ export class OpenCodeProviderManagementAdapter
   async loadModels(
     input: LoadProviderModelsInput,
   ): Promise<ProviderManagementResult<RuntimeProviderModelsView>> {
+    let selectedV2 = false
+    try { selectedV2 = input.runtimeId === 'opencode' && await selectedProviderUsesOpenCodeV2() }
+    catch { return providerManagementError('runtime-unhealthy', 'Selected OpenCode identity is unavailable') }
+    if (selectedV2) {
+      const providerId = normalizeProviderId(canonicalizeOpenCodeProviderId(input.providerId))
+      if (!providerId) return providerManagementError('provider-missing', 'Provider id is invalid')
+      return loadOpenCodeV2ProviderModels({ ...input, providerId })
+    }
     const deadline = new OpenCodeRuntimeDeadline(
       this.deps.catalogOverallTimeoutMs ?? OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS,
     )
@@ -5093,7 +5107,11 @@ export class OpenCodeProviderManagementAdapter
       return providerManagementError('provider-missing', 'Provider id is invalid')
     }
 
+    let selectedV2 = false
+    try { selectedV2 = input.runtimeId === 'opencode' && await selectedProviderUsesOpenCodeV2() }
+    catch { return providerManagementError('runtime-unhealthy', 'Selected OpenCode identity is unavailable') }
     if (input.method === 'oauth') {
+      if (selectedV2) return connectOpenCodeV2Provider({ ...input, providerId })
       return this.connectProviderWithOAuth(input, observer)
     }
 
@@ -5115,6 +5133,8 @@ export class OpenCodeProviderManagementAdapter
     if (curatedSubscriptionKeyError) {
       return providerManagementError('auth-required', curatedSubscriptionKeyError)
     }
+
+    if (selectedV2) return connectOpenCodeV2Provider({ ...input, providerId, apiKey })
 
     return this.withManagedOpenCodeClient(
       input.runtimeId,
@@ -5669,6 +5689,11 @@ export class OpenCodeProviderManagementAdapter
         `Model id must be scoped to provider ${providerId}`,
       )
     }
+
+    let selectedV2 = false
+    try { selectedV2 = input.runtimeId === 'opencode' && await selectedProviderUsesOpenCodeV2() }
+    catch { return providerManagementError('runtime-unhealthy', 'Selected OpenCode identity is unavailable') }
+    if (selectedV2) return testOpenCodeV2ProviderModel({ ...input, providerId, modelId })
 
     return this.withManagedOpenCodeClient(
       input.runtimeId,

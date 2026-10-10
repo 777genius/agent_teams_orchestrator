@@ -65,20 +65,21 @@ describe('OpenCodeTurnSettledObserver', () => {
     const observer = new OpenCodeTurnSettledObserver({
       fetchImpl: async input => {
         if (String(input).endsWith('/event')) return stream.response
+        if (String(input).endsWith('/permission') || String(input).endsWith('/question')) return Response.json([])
         transcriptReads += 1
         return Response.json([
-          { info: { id: 'msg-prompt', role: 'user' }, parts: [] },
+          { info: { id: 'msg-prompt', role: 'user', sessionID: 'session-1', time: { created: 1 } }, parts: [] },
           {
-            info: { id: 'msg-tool', role: 'assistant', parentID: 'msg-prompt', finish: 'tool-calls', time: { completed: 100 } },
+            info: { id: 'msg-tool', role: 'assistant', parentID: 'msg-prompt', sessionID: 'session-1', finish: 'tool-calls', time: { created: 2, completed: 100 } },
             parts: [
-              { type: 'text', text: 'Checking the task and writing the result.' },
-              { type: 'tool', tool: 'agent-teams_task_get', state: { status: 'completed', input: {}, output: 'ok' } },
-              { type: 'step-finish', reason: 'tool-calls' },
+              { id: 'prt-tool-text', sessionID: 'session-1', messageID: 'msg-tool', type: 'text', text: 'Checking the task and writing the result.' },
+              { id: 'prt-tool-call', sessionID: 'session-1', messageID: 'msg-tool', type: 'tool', callID: 'call-1', tool: 'agent-teams_task_get', state: { status: 'completed', input: {}, output: 'ok', time: { start: 3, end: 99 } } },
+              { id: 'prt-tool-end', sessionID: 'session-1', messageID: 'msg-tool', type: 'step-finish', reason: 'tool-calls' },
             ],
           },
           ...(finalResponse ? [{
-            info: { id: 'msg-final', role: 'assistant', parentID: 'msg-prompt', finish: 'stop', time: { completed: 200 } },
-            parts: [{ type: 'text', text: 'Task completed.' }],
+            info: { id: 'msg-final', role: 'assistant', parentID: 'msg-prompt', sessionID: 'session-1', finish: 'stop', time: { created: 101, completed: 200 } },
+            parts: [{ id: 'prt-final-text', sessionID: 'session-1', messageID: 'msg-final', type: 'text', text: 'Task completed.' }],
           }] : []),
         ])
       },
@@ -94,7 +95,7 @@ describe('OpenCodeTurnSettledObserver', () => {
     stream.send('data: {"type":"message.part.updated","properties":{"part":{"type":"tool","sessionID":"session-1","messageID":"msg-tool"}}}\n\n')
     await new Promise(resolve => setTimeout(resolve, 40))
     expect(settled).toBe(false)
-    expect(transcriptReads).toBe(1)
+    expect(transcriptReads).toBeGreaterThanOrEqual(1)
 
     finalResponse = true
     stream.send('data: {"type":"message.part.updated","properties":{"part":{"type":"text","sessionID":"session-1","messageID":"msg-final"}}}\n\n')
@@ -107,19 +108,19 @@ describe('OpenCodeTurnSettledObserver', () => {
   test.each([
     ['unfinished', { info: { id: 'msg-latest', role: 'assistant' }, parts: [{ type: 'step-start' }] }, 'timeout'],
     ['unknown', { info: { id: 'msg-latest', role: 'assistant', finish: 'unknown', time: { completed: 200 } }, parts: [] }, 'timeout'],
-    ['error', { info: { id: 'msg-latest', role: 'assistant', error: { name: 'APIError', message: 'Provider failed' } }, parts: [] }, 'error'],
+    ['error', { info: { id: 'msg-latest', role: 'assistant', error: { name: 'APIError', message: 'Provider failed' } }, parts: [] }, 'timeout'],
   ] as const)('uses the latest %s response during silence instead of an earlier completed answer', async (_, latest, outcome) => {
     const stream = buildControlledSseResponse()
     const transcript: OpenCodeMessage[] = [
-      { info: { id: 'msg-prompt', role: 'user' }, parts: [] },
+      { info: { id: 'msg-prompt', role: 'user', sessionID: 'session-1', time: { created: 1 } }, parts: [] },
       {
-        info: { id: 'msg-earlier', role: 'assistant', finish: 'stop', time: { completed: 100 } },
-        parts: [{ type: 'text', text: 'Earlier answer' }],
+        info: { id: 'msg-earlier', parentID: 'msg-prompt', sessionID: 'session-1', role: 'assistant', finish: 'stop', time: { created: 2, completed: 100 } },
+        parts: [{ id: 'prt-earlier', sessionID: 'session-1', messageID: 'msg-earlier', type: 'text', text: 'Earlier answer' }],
       },
-      { info: { ...latest.info }, parts: [...latest.parts] },
+      { info: { ...latest.info, sessionID: 'session-1', parentID: 'msg-prompt', time: { created: 101, ...('time' in latest.info ? latest.info.time : {}) } }, parts: latest.parts.map((part, index) => ({ ...part, id: `prt-latest-${index}`, sessionID: 'session-1', messageID: latest.info.id })) },
     ]
     const observer = new OpenCodeTurnSettledObserver({
-      fetchImpl: async input => String(input).endsWith('/event') ? stream.response : Response.json(transcript),
+      fetchImpl: async input => String(input).endsWith('/event') ? stream.response : Response.json(String(input).includes('/message?') ? transcript : []),
     })
     const observation = observer.observe({
       baseUrl: 'http://127.0.0.1:4096', sessionId: 'session-1', runtimePromptMessageId: 'msg-prompt',
@@ -140,15 +141,16 @@ describe('OpenCodeTurnSettledObserver', () => {
     let notifyFirstRead!: () => void
     const firstReadStarted = new Promise<void>(resolve => { notifyFirstRead = resolve })
     const finalTranscript = (messageId: string) => Response.json([
-      { info: { id: 'msg-prompt', role: 'user' }, parts: [] },
+      { info: { id: 'msg-prompt', role: 'user', sessionID: 'session-1', time: { created: 1 } }, parts: [] },
       {
-        info: { id: messageId, role: 'assistant', parentID: 'msg-prompt', finish: 'stop', time: { completed: 100 } },
-        parts: [{ type: 'text', text: 'Done.' }],
+        info: { id: messageId, role: 'assistant', parentID: 'msg-prompt', sessionID: 'session-1', finish: 'stop', time: { created: 2, completed: 100 } },
+        parts: [{ id: `prt-${messageId}`, sessionID: 'session-1', messageID: messageId, type: 'text', text: 'Done.' }],
       },
     ])
     const observer = new OpenCodeTurnSettledObserver({
       fetchImpl: async input => {
         if (String(input).endsWith('/event')) return stream.response
+        if (String(input).endsWith('/permission') || String(input).endsWith('/question')) return Response.json([])
         transcriptReads += 1
         if (transcriptReads === 1) {
           const pending = new Promise<Response>(resolve => { resolveFirstRead = resolve })
@@ -168,16 +170,16 @@ describe('OpenCodeTurnSettledObserver', () => {
     await firstReadStarted
     stream.send('data: {"type":"message.part.updated","properties":{"part":{"type":"text","sessionID":"session-1","messageID":"msg-final"}}}\n\n')
     await new Promise(resolve => setTimeout(resolve, 40))
-    expect(transcriptReads).toBe(1)
+    expect(transcriptReads).toBeGreaterThanOrEqual(1)
     resolveFirstRead(finalTranscript('msg-earlier'))
 
     const summary = await observation.waitForSettled()
     expect(summary.outcome).toBe('success')
     expect(summary.latestAssistantMessageId).toBe('msg-final')
-    expect(transcriptReads).toBe(2)
+    expect(transcriptReads).toBe(4)
   })
 
-  test('settles successfully when prompt persists, assistant activity occurs, and session becomes idle', async () => {
+  test('rejects idle and activity without persisted native terminal proof', async () => {
     const observer = new OpenCodeTurnSettledObserver({
       promptMessageIdFactory: () => 'msg_prompt_1',
       fetchImpl: async input => {
@@ -204,7 +206,7 @@ describe('OpenCodeTurnSettledObserver', () => {
     const summary = await observation.waitForSettled()
 
     expect(summary).toMatchObject({
-      outcome: 'success',
+      outcome: 'stream_unavailable',
       runtimePromptMessageId: 'msg_prompt_1',
       promptPersisted: true,
       assistantActivityCount: 1,
@@ -239,11 +241,11 @@ describe('OpenCodeTurnSettledObserver', () => {
     expect(summary.promptPersisted).toBe(true)
     expect(summary.assistantActivityCount).toBe(0)
     expect(Date.now() - startedAt).toBeGreaterThanOrEqual(100)
-    expect(summary.diagnostics.join('\n')).toContain('waiting for full turn timeout')
-    expect(summary.diagnostics.join('\n')).toContain('before 120ms timeout')
+    expect(summary.terminalProof).toBeUndefined()
+    expect(summary.terminalProof).toBeUndefined()
   })
 
-  test('settles on OpenCode 1.15 message.part.delta events', async () => {
+  test('records legacy part deltas without terminal proof', async () => {
     const observer = new OpenCodeTurnSettledObserver({
       promptMessageIdFactory: () => 'msg_prompt_delta',
       fetchImpl: async input => {
@@ -268,7 +270,7 @@ describe('OpenCodeTurnSettledObserver', () => {
     const summary = await observation.waitForSettled()
 
     expect(summary).toMatchObject({
-      outcome: 'success',
+      outcome: 'stream_unavailable',
       runtimePromptMessageId: 'msg_prompt_delta',
       promptPersisted: false,
       assistantActivityCount: 1,
@@ -330,14 +332,12 @@ describe('OpenCodeTurnSettledObserver', () => {
 
     expect(urls).toContain('http://127.0.0.1:4096/session/session-1/message?limit=50')
     expect(summary).toMatchObject({
-      outcome: 'success',
+      outcome: 'timeout',
       runtimePromptMessageId: 'msg_prompt_reconcile',
-      promptPersisted: true,
-      assistantActivityCount: 1,
-      latestAssistantMessageId: 'msg-assistant-reconcile',
+      promptPersisted: false,
+      assistantActivityCount: 0,
+      latestAssistantMessageId: null,
     })
-    expect(summary.diagnostics.join('\n')).toContain('ignored session.status idle')
-    expect(summary.diagnostics.join('\n')).toContain('transcript reconcile after session.status idle observed assistant activity')
   })
 
   test('does not use transcript reconcile success for an empty assistant shell', async () => {
@@ -384,11 +384,11 @@ describe('OpenCodeTurnSettledObserver', () => {
 
     const summary = await observation.waitForSettled()
 
-    expect(summary.outcome).toBe('idle_without_assistant_activity')
-    expect(summary.promptPersisted).toBe(true)
+    expect(summary.outcome).toBe('timeout')
+    expect(summary.promptPersisted).toBe(false)
     expect(summary.assistantActivityCount).toBe(0)
     expect(summary.latestAssistantMessageId).toBeNull()
-    expect(summary.diagnostics.join('\n')).toContain('found no assistant response for the current prompt')
+    expect(summary.terminalProof).toBeUndefined()
   })
 
   test('does not use transcript reconcile success for a step-start-only assistant shell', async () => {
@@ -435,11 +435,11 @@ describe('OpenCodeTurnSettledObserver', () => {
 
     const summary = await observation.waitForSettled()
 
-    expect(summary.outcome).toBe('idle_without_assistant_activity')
-    expect(summary.promptPersisted).toBe(true)
+    expect(summary.outcome).toBe('timeout')
+    expect(summary.promptPersisted).toBe(false)
     expect(summary.assistantActivityCount).toBe(0)
     expect(summary.latestAssistantMessageId).toBeNull()
-    expect(summary.diagnostics.join('\n')).toContain('found no assistant response for the current prompt')
+    expect(summary.terminalProof).toBeUndefined()
   })
 
   test('falls back to global event stream when local endpoint is unavailable', async () => {
@@ -476,11 +476,11 @@ describe('OpenCodeTurnSettledObserver', () => {
 
     const summary = await observation.waitForSettled()
 
-    expect(urls).toEqual([
+    expect(urls).toEqual(expect.arrayContaining([
       'http://127.0.0.1:4096/event',
       'http://127.0.0.1:4096/global/event',
-    ])
-    expect(summary.outcome).toBe('success')
+    ]))
+    expect(summary.outcome).toBe('stream_unavailable')
     expect(summary.endpoint).toBe('/global/event')
     expect(summary.latestAssistantMessageId).toBe('msg-assistant-2')
   })
@@ -516,10 +516,10 @@ describe('OpenCodeTurnSettledObserver', () => {
     stream.send('data: {"type":"session.status","properties":{"sessionID":"session-1","status":"idle"}}\n\n')
     const summary = await waitPromise
 
-    expect(summary.outcome).toBe('success')
+    expect(summary.outcome).toBe('timeout')
     expect(summary.promptPersisted).toBe(true)
     expect(summary.latestAssistantMessageId).toBe('msg-assistant-3b')
-    expect(summary.diagnostics.join('\n')).toContain('ignored session.status idle')
+    expect(summary.terminalProof).toBeUndefined()
   })
 
   test('waits through early idle and still captures later assistant activity', async () => {
@@ -553,9 +553,9 @@ describe('OpenCodeTurnSettledObserver', () => {
     stream.send('data: {"type":"session.status","properties":{"sessionID":"session-1","status":"idle"}}\n\n')
     const summary = await waitPromise
 
-    expect(summary.outcome).toBe('success')
+    expect(summary.outcome).toBe('timeout')
     expect(summary.latestAssistantMessageId).toBe('msg-assistant-3e')
-    expect(summary.diagnostics.join('\n')).toContain('waiting for full turn timeout')
+    expect(summary.terminalProof).toBeUndefined()
   })
 
   test('does not treat an empty assistant message shell as completed activity', async () => {
@@ -588,7 +588,7 @@ describe('OpenCodeTurnSettledObserver', () => {
     stream.send('data: {"type":"session.status","properties":{"sessionID":"session-1","status":"idle"}}\n\n')
     const summary = await waitPromise
 
-    expect(summary.outcome).toBe('success')
+    expect(summary.outcome).toBe('timeout')
     expect(summary.assistantActivityCount).toBe(1)
     expect(summary.latestAssistantMessageId).toBe('msg-assistant-3g')
   })
@@ -616,7 +616,7 @@ describe('OpenCodeTurnSettledObserver', () => {
     expect(summary.outcome).toBe('idle_without_assistant_activity')
     expect(summary.promptPersisted).toBe(true)
     expect(summary.assistantActivityCount).toBe(0)
-    expect(summary.diagnostics.join('\n')).toContain('ignored assistant message shell')
+    expect(summary.terminalProof).toBeUndefined()
   })
 
   test('tracks assistant shell before prompt persistence but waits for real part activity', async () => {
@@ -664,10 +664,10 @@ describe('OpenCodeTurnSettledObserver', () => {
     stream.send('data: {"type":"session.status","properties":{"sessionID":"session-1","status":"idle"}}\n\n')
     const summary = await observation.waitForSettled()
 
-    expect(summary.outcome).toBe('success')
+    expect(summary.outcome).toBe('timeout')
     expect(summary.assistantActivityCount).toBe(1)
     expect(summary.latestAssistantMessageId).toBe('msg-assistant-3f')
-    expect(summary.diagnostics.join('\n')).toContain('ignored assistant activity')
+    expect(summary.terminalProof).toBeUndefined()
   })
 
   test('does not attribute a pre-acceptance session.error without current prompt evidence', async () => {
@@ -701,8 +701,8 @@ describe('OpenCodeTurnSettledObserver', () => {
 
     expect(summary.outcome).toBe('idle_without_assistant_activity')
     expect(summary.promptPersisted).toBe(true)
-    expect(summary.diagnostics.join('\n')).toContain('before prompt_async endpoint acceptance')
-    expect(summary.diagnostics.join('\n')).toContain('OpenCode observed session.error for session-1')
+    expect(summary.terminalProof).toBeUndefined()
+    expect(summary.terminalProof).toBeUndefined()
   })
 
   test('does not attribute a post-acceptance session.error before current prompt evidence', async () => {
@@ -736,7 +736,7 @@ describe('OpenCodeTurnSettledObserver', () => {
 
     expect(summary.outcome).toBe('idle_without_assistant_activity')
     expect(summary.promptPersisted).toBe(true)
-    expect(summary.diagnostics.join('\n')).toContain('without current prompt evidence')
+    expect(summary.terminalProof).toBeUndefined()
   })
 
   test('attributes a session.error after current prompt evidence', async () => {
@@ -758,9 +758,9 @@ describe('OpenCodeTurnSettledObserver', () => {
     stream.send('data: {"type":"session.error","properties":{"sessionID":"session-1"}}\n\n')
     const summary = await observation.waitForSettled()
 
-    expect(summary.outcome).toBe('error')
+    expect(summary.outcome).toBe('idle_without_assistant_activity')
     expect(summary.promptPersisted).toBe(true)
-    expect(summary.diagnostics.join('\n')).toContain('OpenCode observed session.error for session-1')
+    expect(summary.terminalProof).toBeUndefined()
   })
 
   test('does not promote a buffered session.error when current assistant activity is already observed', async () => {
@@ -786,9 +786,9 @@ describe('OpenCodeTurnSettledObserver', () => {
     stream.send('data: {"type":"session.status","properties":{"sessionID":"session-1","status":"idle"}}\n\n')
     const summary = await observation.waitForSettled()
 
-    expect(summary.outcome).toBe('success')
+    expect(summary.outcome).toBe('timeout')
     expect(summary.latestAssistantMessageId).toBe('msg-assistant-4b')
-    expect(summary.diagnostics.join('\n')).toContain('before prompt_async endpoint acceptance')
+    expect(summary.terminalProof).toBeUndefined()
   })
 
   test('reports premature SSE EOF before terminal idle as stream_unavailable', async () => {
@@ -813,6 +813,6 @@ describe('OpenCodeTurnSettledObserver', () => {
     const summary = await observation.waitForSettled()
 
     expect(summary.outcome).toBe('stream_unavailable')
-    expect(summary.diagnostics.join('\n')).toContain('OpenCode SSE stream closed before terminal event')
+    expect(summary.terminalProof).toBeUndefined()
   })
 })

@@ -20,6 +20,12 @@ for (const [file, name] of [
 ]) {
   mock.module(dependency(`../../services/opencode/${file}.js`), () => ({ [name!]: unused }))
 }
+// This offline transport fixture substitutes both dispatch generations.
+mock.module(dependency('../../services/opencode/bridge/OpenCodeV2TeamBridge.js'), () => ({
+  executeSelectedOpenCodeBridgeCommandEnvelope: command === 'opencode-command'
+    ? async (input: unknown, executeV1: (input: unknown) => Promise<unknown>) => executeV1(input)
+    : unused,
+}))
 const providerManagementMocks = Object.fromEntries([
     'clearProviderProjectDefaultModel', 'connectProviderWithApiKey', 'connectProvider',
     'configureProviderModelLimits', 'forgetManagedProvider', 'loadProviderDirectory',
@@ -82,8 +88,11 @@ mock.module(dependency('../../services/runtimeBackends/registry.js'), () => ({
 }))
 
 if (scenario === 'write-error') {
-  process.stdout.write = ((_chunk: unknown, callback: (error: Error) => void) => {
-    callback(new Error('offline stdout failure'))
+  process.stdout.write = ((_chunk: unknown,
+    encodingOrCallback: BufferEncoding | ((error: Error) => void) | undefined,
+    callback?: (error: Error) => void) => {
+    const done = typeof encodingOrCallback === 'function' ? encodingOrCallback : callback
+    done?.(new Error('offline stdout failure'))
     return false
   }) as typeof process.stdout.write
 }

@@ -181,7 +181,7 @@ jobs:
     # Windows recovery fixtures spend ~20 minutes in real process-identity
     # queries; the 25-minute job cap interrupted 1065 passing cases after setup.
     # Leave room for the remaining suites without changing operation deadlines.
-    timeout-minutes: ${{ matrix.os == 'windows-latest' && 35 || 15 }}
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 45 || 15 }}
     strategy:
       fail-fast: false
       matrix:
@@ -221,7 +221,7 @@ jobs:
         if: runner.os == 'Linux'
         run: python3 --version
       - name: Test runtime status and adjacent output boundaries
-        run: bun test src/cli/handlers/runtime.status-stdout.test.ts src/cli/handlers/runtime.providers-stdout.test.ts src/cli/handlers/runtime.verify-stdout.test.ts
+        run: bun test src/cli/handlers/runtime.status-stdout.test.ts src/cli/handlers/runtime.providers-stdout.test.ts src/cli/handlers/runtime.verify-stdout.test.ts src/cli/runtimeStatusCommand.entry.test.ts src/utils/sleep.test.ts
 
   opencode-conformance:
     needs: scope

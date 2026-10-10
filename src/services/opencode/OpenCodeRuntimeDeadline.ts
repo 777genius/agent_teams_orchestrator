@@ -69,7 +69,12 @@ export async function raceOpenCodeAbortSignal<T>(
   signal?: AbortSignal,
 ): Promise<T> {
   if (!signal) return operation
-  if (signal.aborted) throwOpenCodeAbortReason(signal)
+  if (signal.aborted) {
+    // Work may abort the signal before returning its promise. Keep observing
+    // its eventual rejection while returning the original abort immediately.
+    void operation.catch(() => undefined)
+    throwOpenCodeAbortReason(signal)
+  }
 
   let removeAbortListener = () => {}
   const aborted = new Promise<never>((_, reject) => {

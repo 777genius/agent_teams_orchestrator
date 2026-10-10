@@ -60,8 +60,9 @@ function rejectWithTimeout(reject: (e: Error) => void, message: string): void {
 /**
  * Race a promise against a timeout. Rejects with `Error(message)` if the
  * promise doesn't settle within `ms`. The timeout timer is cleared when
- * the promise settles (no dangling timer) and unref'd so it doesn't
- * block process exit.
+ * the promise settles (no dangling timer) and unref'd by default so it
+ * doesn't block process exit. Pass `keepAlive: true` when a pending
+ * operation must settle even without active I/O.
  *
  * Note: this doesn't cancel the underlying work — if the promise is
  * backed by a runaway async operation, that keeps running. This just
@@ -71,12 +72,13 @@ export function withTimeout<T>(
   promise: Promise<T>,
   ms: number,
   message: string,
+  options?: { keepAlive?: boolean },
 ): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined
   const timeoutPromise = new Promise<never>((_, reject) => {
     // eslint-disable-next-line no-restricted-syntax -- not a sleep: REJECTS after ms (timeout guard)
     timer = setTimeout(rejectWithTimeout, ms, reject, message)
-    if (typeof timer === 'object') timer.unref?.()
+    if (!options?.keepAlive && typeof timer === 'object') timer.unref?.()
   })
   return Promise.race([promise, timeoutPromise]).finally(() => {
     if (timer !== undefined) clearTimeout(timer)

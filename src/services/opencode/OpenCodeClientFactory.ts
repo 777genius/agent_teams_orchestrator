@@ -1,3 +1,6 @@
+import { readOpenCodeBoundedHttpResponse } from './OpenCodeBoundedHttpResponse.js'
+import type { OpenCodeClientRequestContext } from './OpenCodeClientRequestContext.js'
+export type { OpenCodeClientRequestContext } from './OpenCodeClientRequestContext.js'
 import type {
   OpenCodeAgentResponse,
   OpenCodeApiAuthInput,
@@ -40,7 +43,7 @@ export type OpenCodeClient = {
   createSession(body?: { parentID?: string; title?: string }): Promise<OpenCodeSessionSummary>
   getSession(id: string): Promise<OpenCodeSessionSummary>
   getSessionStatus(): Promise<Record<string, OpenCodeSessionStatusInput>>
-  getSessionMessages(id: string, limit?: number): Promise<OpenCodeMessage[]>
+  getSessionMessages(id: string, limit?: number, before?: string): Promise<OpenCodeMessage[]>
   getSessionMessage?(id: string, messageID: string): Promise<OpenCodeMessage | null>
   getPermissions(): Promise<OpenCodePendingPermission[]>
   listExperimentalToolIds(input?: {
@@ -94,13 +97,8 @@ export type OpenCodeClient = {
   abortSession(id: string): Promise<boolean>
 }
 
-export type OpenCodeClientRequestContext = {
-  signal?: AbortSignal
-  remainingMs?: () => number
-}
-
 type OpenCodeClientFactoryDeps = {
-  fetchImpl?: typeof fetch
+  fetchImpl?: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
 }
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000
@@ -170,11 +168,14 @@ export class OpenCodeClientFactory {
       path: string,
       init?: RequestInit,
       endpointTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
+      maxItems?: number,
+      responseKind: 'metadata' | 'transcript' = 'metadata',
     ): Promise<T> => {
       const timeoutMs = resolveRequestTimeoutMs(endpointTimeoutMs, context)
       const timeoutError = new Error(
         `OpenCode request timed out after ${timeoutMs}ms for ${path}`,
       )
+      if (timeoutMs <= 0) throw timeoutError
       if (context.signal?.aborted) {
         throw resolveAbortReason(context.signal, timeoutError)
       }
@@ -200,7 +201,13 @@ export class OpenCodeClientFactory {
           },
         })
         // Keep the timer and caller abort listener until the body is consumed.
-        const result = await parseResponse<T>(response)
+        try {
+          controller.signal.throwIfAborted()
+          if (context.remainingMs && context.remainingMs() <= 0) throw timeoutError
+        } catch (error) { void response.body?.cancel().catch(() => undefined); throw error }
+        const result = context.boundedReconciliation || maxItems !== undefined
+          ? await readOpenCodeBoundedHttpResponse(response, controller.signal, maxItems ?? 256, context.remainingMs, responseKind) as T
+          : await parseResponse<T>(response)
         controller.signal.throwIfAborted()
         return result
       } catch (error) {
@@ -287,26 +294,39 @@ export class OpenCodeClientFactory {
       getSession: id => request<OpenCodeSessionSummary>(`/session/${id}`),
       getSessionStatus: () =>
         request<Record<string, OpenCodeSessionStatusInput>>('/session/status'),
-      getSessionMessages: (id, limit) =>
+      getSessionMessages: (id, limit, before) =>
         request<OpenCodeMessage[]>(
-          `/session/${id}/message${typeof limit === 'number' ? `?limit=${limit}` : ''}`,
+          buildQueryPath(`/session/${id}/message`, {
+            limit: typeof limit === 'number' ? String(limit) : context.boundedReconciliation ? '50' : null,
+            before,
+          }), undefined, DEFAULT_REQUEST_TIMEOUT_MS,
+          typeof limit === 'number' ? limit : context.boundedReconciliation ? 50 : undefined,
+          'transcript',
         ),
       getSessionMessage: async (id, messageID) => {
         try {
           return await request<OpenCodeMessage>(
             `/session/${encodeURIComponent(id)}/message/${encodeURIComponent(messageID)}`,
+            undefined, DEFAULT_REQUEST_TIMEOUT_MS, undefined, 'transcript',
           )
         } catch (error) {
           if (error instanceof Error && error.message.includes('(404 ')) {
-            const messages = await request<OpenCodeMessage[]>(
-              `/session/${encodeURIComponent(id)}/message`,
-            ).catch(() => [])
-            return (
-              messages.find(message => {
-                const info = message.info && typeof message.info === 'object' ? message.info : null
-                return info?.id === messageID
-              }) ?? null
-            )
+            if (context.boundedReconciliation) {
+              let before: string | undefined
+              for (let page = 0; page < 4; page++) {
+                const messages = await request<OpenCodeMessage[]>(buildQueryPath(`/session/${encodeURIComponent(id)}/message`,
+                  { limit: '50', before }), undefined, DEFAULT_REQUEST_TIMEOUT_MS, 50, 'transcript')
+                const found = messages.find(message => message.info.id === messageID)
+                if (found) return found
+                if (messages.length < 50) return null
+                const oldest = messages[0]?.info.id
+                if (typeof oldest !== 'string' || oldest === before) throw new Error('Invalid native pagination boundary')
+                before = oldest
+              }
+              throw new Error('Native message lookup pagination budget exhausted; completeness unknown')
+            }
+            const messages = await request<OpenCodeMessage[]>(`/session/${encodeURIComponent(id)}/message`).catch(() => [])
+            return messages.find(message => message.info?.id === messageID) ?? null
           }
           throw error
         }

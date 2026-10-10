@@ -1,3 +1,5 @@
+import type { OpenCodeV2ReadStatus } from './catalog/OpenCodeV2ReadStatus.js'
+
 export type OpenCodeAuthSource = 'credentials' | 'environment'
 
 export type OpenCodeAgentMode = 'primary' | 'subagent' | 'unknown'
@@ -113,6 +115,8 @@ export type OpenCodeModelMetadata = {
 }
 
 export type OpenCodeInventorySnapshot = {
+  readGeneration?: 'v1' | 'v2' | 'unsupported'
+  readStatus?: OpenCodeV2ReadStatus
   detected: boolean
   binaryPath: string | null
   version: string | null
@@ -603,6 +607,7 @@ export type OpenCodeExecutionProof = {
 }
 
 export type OpenCodeSessionReconcileSummary = {
+  terminalEvidence?: import('./OpenCodeV1TerminalProof.js').OpenCodeV1TerminalEvidence
   sessionId: string
   reconcileOutcome: 'reconciled' | 'stale'
   rawStatus: OpenCodeSessionStatus | null
@@ -689,6 +694,7 @@ export type OpenCodeSessionRecord = {
   managedConfigSectionFingerprints?: Record<string, string>
   expectedBehaviorFingerprint?: string
   opencodeVersion?: string
+  bootstrapRuntimePromptMessageId?: string
   bootstrapMode?: OpenCodeBootstrapMode
   bootstrapEvidenceSource?: OpenCodeBootstrapEvidenceSource
   appManagedBootstrap?: OpenCodeAppManagedBootstrapRecord

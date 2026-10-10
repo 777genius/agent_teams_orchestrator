@@ -1,3 +1,4 @@
+import { mapLegacyOpenCodeV2Package, mapSelectedOpenCodeV2Model, type ExecutionProviderModels } from './profile/OpenCodeV2ExecutionConfig.js'
 import { readProcessStartTimeMs } from '../../utils/processKill.js'
 import { publishNativeCliFile } from './OpenCodeNativeCliPublication.js'
 import { resolveOpenCodeBinaryPath } from './OpenCodeBinaryResolver.js'
@@ -2514,6 +2515,7 @@ async function resolveOpenCodeProfileScopeInternal(
   recoveryPredecessor?: OpenCodeAuthCredential,
   captureCredentialBinding?: (binding: NonNullable<OpenCodeOAuthSaveOwner['credentialBinding']>) => void,
   captureSnapshot?: (snapshot: OpenCodeEffectiveConfigSnapshot) => void,
+  catalogProviderId?: string,
 ): Promise<OpenCodeProfileScope> {
   const envSnapshot = scopeSourceEnvironment(input.env ?? process.env)
   const projectPath = await canonicalizeOpenCodeProjectPath(input.projectPath)
@@ -2527,7 +2529,8 @@ async function resolveOpenCodeProfileScopeInternal(
   const env = Object.freeze(envSnapshot)
   const snapshotHomePath = env.HOME?.trim() || env.USERPROFILE?.trim() || os.homedir()
   const snapshotManagedPaths = resolveClaudeMultimodelPaths(env)
-  const providerId = canonicalizeOpenCodeProviderId(input.selectedModel.split('/')[0] ?? '')
+  if (catalogProviderId !== undefined && input.purpose !== 'catalog') throw new Error('OpenCode explicit provider requires catalog scope')
+  const providerId = canonicalizeOpenCodeProviderId(catalogProviderId ?? input.selectedModel.split('/')[0] ?? '')
   if (!providerId) {
     throw new Error(`OpenCode model must be provider-scoped, received "${input.selectedModel}"`)
   }
@@ -2752,6 +2755,41 @@ async function resolveOpenCodeProfileScopeInternal(
     else openCodeEffectiveConfigSnapshots.set(scopeToken, snapshot)
   }
   return scope
+}
+
+/** V2 imports only the selected provider from a process-owned resolution snapshot.
+ * The target is a fresh private V2 profile; native legacy migration owns the DB import. */
+export async function materializeOpenCodeSelectedScopeAuth(scope: OpenCodeProfileScope,
+  projectPath: string, targetAuthPath: string, selectedModelID: string | undefined, signal?: AbortSignal): Promise<Readonly<{ package?: string; baseURL?: string; models?: ExecutionProviderModels }>> {
+  signal?.throwIfAborted()
+  const snapshot = openCodeEffectiveConfigSnapshots.get(scope.scopeToken)
+  if (!snapshot || !['launch_runtime', 'catalog'].includes(scope.purpose) ||
+    !isDeepStrictEqual(snapshot.scopeIdentity, buildScopeIdentity(planOpenCodeProfilePolicy(scope).scope)) ||
+    await canonicalizeOpenCodeProjectPath(projectPath) !== snapshot.projectPath) {
+    throw new Error('OpenCode selected V2 scope is unavailable')
+  }
+  const credential = snapshot.selectedAuthCredential
+  if (credential) {
+    const c = credential
+    const api = c.type === 'api' && typeof c.key === 'string' && c.key.length > 0 &&
+      (c.metadata === undefined || (asRecord(c.metadata) !== null && Object.values(asRecord(c.metadata)!).every(value => typeof value === 'string')))
+    const oauth = c.type === 'oauth' && typeof c.access === 'string' && typeof c.refresh === 'string' &&
+      Number.isSafeInteger(c.expires) && Number(c.expires) >= 0
+    const wellknown = c.type === 'wellknown' && typeof c.key === 'string' && typeof c.token === 'string'
+    if (!api && !oauth && !wellknown) throw new Error('OpenCode selected V2 credential shape is unsupported')
+  }
+  const provider = asRecord(asRecord(snapshot.importedRuntimeConfig.provider)?.[scope.providerId]) ?? {}
+  const options = asRecord(provider.options) ?? {}
+  const selectedModel = selectedModelID === undefined ? undefined : asRecord(provider.models)?.[selectedModelID]
+  const models = selectedModelID === undefined || selectedModel === undefined ? undefined : mapSelectedOpenCodeV2Model(selectedModelID, selectedModel)
+  // V1-only plugin/provider options cannot silently alter the selected V2 request.
+  if (Object.keys(options).some(key => !['baseURL', 'apiKey'].includes(key))) throw new Error('OpenCode selected provider V2 options are unsupported')
+  if (options.apiKey !== undefined && !credential) throw new Error('OpenCode selected provider key is not resolved')
+  signal?.throwIfAborted()
+  await materializeOpenCodeSelectedAuthCredential({ authPath: targetAuthPath, providerId: scope.providerId, credential, abortSignal: signal })
+  signal?.throwIfAborted()
+  return { ...(typeof provider.npm === 'string' ? { package: mapLegacyOpenCodeV2Package(provider.npm) } : {}),
+    ...(typeof options.baseURL === 'string' ? { baseURL: options.baseURL } : {}), ...(models ? { models } : {}) }
 }
 
 export async function assertOpenCodePreparedProfileScope(
@@ -3870,3 +3908,34 @@ export class OpenCodeProfileManager {
 }
 
 export const openCodeProfileManager = new OpenCodeProfileManager()
+
+export async function readOpenCodeSelectedScopeMetadata(scope: OpenCodeProfileScope, projectPath: string) {
+  const snapshot = openCodeEffectiveConfigSnapshots.get(scope.scopeToken)
+  if (!snapshot || scope.purpose !== 'launch_runtime' ||
+    !isDeepStrictEqual(snapshot.scopeIdentity, buildScopeIdentity(planOpenCodeProfilePolicy(scope).scope)) ||
+    await canonicalizeOpenCodeProjectPath(projectPath) !== snapshot.projectPath)
+    throw new Error('OpenCode selected scope metadata is unavailable')
+  return { ...await collectProjectBehaviorMetadata(snapshot.projectPath, snapshot.runtimeEnv),
+    authoritySourceFingerprint: snapshot.authoritySourceFingerprint, selectedAuthIdentity: snapshot.scopeIdentity.selectedAuthIdentity }
+}
+
+/** Exact catalog snapshot only; no execution model, MCP transport or ambient credential selection. */
+export async function materializeOpenCodeV2CatalogScope(scope: OpenCodeProfileScope, projectPath: string, targetAuthPath: string) {
+  const snapshot = openCodeEffectiveConfigSnapshots.get(scope.scopeToken)
+  if (!snapshot || scope.purpose !== 'catalog' || await canonicalizeOpenCodeProjectPath(projectPath) !== snapshot.projectPath ||
+    !isDeepStrictEqual(snapshot.scopeIdentity, buildScopeIdentity(planOpenCodeProfilePolicy(scope).scope))) throw new Error('OpenCode catalog scope changed')
+  const provider = asRecord(asRecord(snapshot.importedRuntimeConfig.provider)?.[scope.providerId]) ?? {}
+  const declared = asRecord(provider.models) ?? {}, models: ExecutionProviderModels = {}
+  if (Object.keys(declared).length > 2048) throw new Error('OpenCode selected catalog model budget exceeded')
+  for (const [id, definition] of Object.entries(declared)) Object.assign(models, mapSelectedOpenCodeV2Model(id, definition))
+  const imported = await materializeOpenCodeSelectedScopeAuth(scope, projectPath, targetAuthPath, undefined)
+  const selected = snapshot.importedRuntimeConfig.model
+  return { provider: { ...imported, ...(Object.keys(models).length ? { models } : {}) },
+    preferredModel: typeof selected === 'string' && selected.startsWith(scope.providerId + '/') ? selected : null,
+    authPath: path.join(snapshot.managedPaths.data, 'opencode', 'auth.json') }
+}
+
+export async function resolveOpenCodeV2CatalogProfileScope(input: { projectPath?: string | null; providerId: string }) {
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,255}$/.test(input.providerId)) throw new Error('OpenCode catalog provider is invalid')
+  return resolveOpenCodeProfileScopeInternal({ projectPath: input.projectPath, purpose: 'catalog', selectedModel: '' }, undefined, undefined, undefined, input.providerId)
+}

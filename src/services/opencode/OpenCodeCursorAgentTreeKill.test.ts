@@ -82,3 +82,76 @@ test('failed helper timeout kill retains the operation until helper close', asyn
   await work
   expect(settled).toBe(true)
 })
+
+
+test('native birth failures retain finite helper evidence before returning null', async () => {
+  const module = import.meta.resolve('./OpenCodeCursorAgentTreeKill.ts')
+  const script = `
+    import {mock} from 'bun:test'
+    import assert from 'node:assert/strict'
+    import {EventEmitter} from 'node:events'
+    const original=await import('node:child_process')
+    let mode='exit'
+    mock.module('node:child_process',()=>({...original,spawn:()=>{
+      const child=Object.assign(new EventEmitter(),{pid:123,stdout:new EventEmitter(),
+        kill:()=>{queueMicrotask(()=>child.emit('close',null));return true}})
+      if(mode==='exit')queueMicrotask(()=>child.emit('close',7))
+      return child
+    }}))
+    Object.defineProperty(process,'platform',{value:'win32'})
+    const {nativePorts}=await import(${JSON.stringify(module)})
+    for(mode of ['exit','timeout']) {
+      const failures=[]
+      const ports=nativePorts({},failure=>failures.push(failure))
+      assert.equal(await ports.birth(123,10),null)
+      assert.equal(failures.length,1)
+      assert.equal(failures[0].operation,'birth')
+      assert.equal(failures[0].reason,mode==='exit'?'helper_nonzero':'helper_timeout')
+      assert.equal(failures[0].exitCode,mode==='exit'?7:null)
+      assert(Number.isFinite(failures[0].elapsedMs)&&failures[0].elapsedMs>=0)
+    }
+    console.log('TEST actual helper failure retained')
+  `
+  const child=Bun.spawn([process.execPath,'-e',script],{cwd:import.meta.dir,stdout:'pipe',stderr:'pipe'})
+  const [exit,stdout,stderr]=await Promise.all([child.exited,new Response(child.stdout).text(),new Response(child.stderr).text()])
+  expect({exit,stderr}).toEqual({exit:0,stderr:''})
+  expect(stdout.trim()).toBe('TEST actual helper failure retained')
+},15000)
+
+
+test('Windows census uses direct WMI rows and retains strict process table parsing', async () => {
+  const module=import.meta.resolve('./OpenCodeCursorAgentTreeKill.ts')
+  const script=`
+    import {mock} from 'bun:test'
+    import assert from 'node:assert/strict'
+    import {EventEmitter} from 'node:events'
+    const original=await import('node:child_process')
+    let malformed=false,calls=0
+    mock.module('node:child_process',()=>({...original,spawn:(command,args,options)=>{
+      calls++
+      assert(command.split(String.fromCharCode(92)).join('/').endsWith('System32/WindowsPowerShell/v1.0/powershell.exe'))
+      assert.deepEqual(args.slice(0,3),['-NoProfile','-NonInteractive','-Command'])
+      const census=args[3]
+      assert(census.includes('System.Management.ManagementObjectSearcher'))
+      assert(census.includes('SELECT ProcessId, ParentProcessId FROM Win32_Process'))
+      assert(census.includes("GetPropertyValue('ProcessId')")&&census.includes("GetPropertyValue('ParentProcessId')"))
+      assert(census.includes('$row.Dispose()')&&census.includes('$results.Dispose()')&&census.includes('$searcher.Dispose()'))
+      assert(!/Get-CimInstance|Get-WmiObject|Import-Module|ForEach-Object/.test(census))
+      assert.deepEqual(options,{windowsHide:true,stdio:['ignore','pipe','ignore']})
+      const child=Object.assign(new EventEmitter(),{pid:123,stdout:new EventEmitter(),kill:()=>true})
+      queueMicrotask(()=>{child.stdout.emit('data',malformed?'12 invalid\\r\\n':'0 0\\r\\n12 0\\r\\n34 12\\r\\n');child.emit('close',0)})
+      return child
+    }}))
+    Object.defineProperty(process,'platform',{value:'win32'})
+    const {nativePorts}=await import(${JSON.stringify(module)})
+    assert.deepEqual(await nativePorts().tree(2000),[{pid:12,ppid:0},{pid:34,ppid:12}])
+    malformed=true
+    await assert.rejects(nativePorts().tree(2000),/Unreadable process tree/)
+    assert.equal(calls,2)
+    console.log('TEST Windows census contract qualified; native execution unclaimed')
+  `
+  const child=Bun.spawn([process.execPath,'-e',script],{cwd:import.meta.dir,stdout:'pipe',stderr:'pipe'})
+  const [exit,stdout,stderr]=await Promise.all([child.exited,new Response(child.stdout).text(),new Response(child.stderr).text()])
+  expect({exit,stderr}).toEqual({exit:0,stderr:''})
+  expect(stdout.trim()).toBe('TEST Windows census contract qualified; native execution unclaimed')
+},15000)

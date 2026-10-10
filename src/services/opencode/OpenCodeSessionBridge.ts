@@ -1,3 +1,4 @@
+import { readOpenCodeV1TerminalTranscript } from './OpenCodeV1TerminalTranscriptReader.js'
 import { OpenCodeAuthorityVetoError } from './OpenCodeAuthorityStoreRead.js'
 import { createHash } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
@@ -105,6 +106,7 @@ export type OpenCodePromptPart =
   | { type: 'file'; mime: string; url: string; filename: string }
 
 export type OpenCodePromptAsyncWithTurnSettledHooks = {
+  signal?: AbortSignal
   onPromptSubmitting?: (event: {
     sessionId: string
     runtimePromptMessageId: string
@@ -2057,9 +2059,11 @@ export class OpenCodeSessionBridge {
       throw new Error('OpenCode turn-settled observation does not support noReply prompts')
     }
     return this.withSessionPromptHost(record, async ({ baseUrl, profile, armOAuthNativeSession }) => {
-      const client = this.clientFactory.create(baseUrl)
+      const client = this.clientFactory.create(baseUrl, params.signal ? { signal: params.signal } : undefined)
       const allocation = await this.allocateRuntimePromptMessageId(client, record.opencodeSessionId)
       const observation = this.turnSettledObserver.observe({
+        authority: record,
+        signal: params.signal,
         baseUrl,
         sessionId: record.opencodeSessionId,
         projectPath: record.projectPath,
@@ -2278,11 +2282,14 @@ export class OpenCodeSessionBridge {
       limit?: number
       sessionId?: string | null
       signal?: AbortSignal
+      runtimePromptMessageId?: string | null
+      remainingMs?: () => number
     } = {},
   ): Promise<{
     record: OpenCodeSessionRecord
     summary: OpenCodeSessionReconcileSummary
   }> {
+    options.signal?.throwIfAborted()
     if (record.profileScope?.purpose === 'launch_runtime' && record.profileScope.providerId === 'xai') {
       // Observation must remain available while an admitted native turn owns
       // the publication fence. Preparing a profile here both gates the read on
@@ -2368,7 +2375,7 @@ export class OpenCodeSessionBridge {
   private async reconcileSessionAtEndpoint(
     record: OpenCodeSessionRecord,
     activeRecord: OpenCodeSessionRecord,
-    options: { limit?: number; sessionId?: string | null; signal?: AbortSignal },
+    options: { limit?: number; sessionId?: string | null; signal?: AbortSignal; runtimePromptMessageId?: string | null; remainingMs?: () => number },
     context: {
       baseUrl: string
       resolvedConfigFingerprint: string | null
@@ -2378,38 +2385,94 @@ export class OpenCodeSessionBridge {
       assertOwner?: () => Promise<void>
     },
   ): Promise<{ record: OpenCodeSessionRecord; summary: OpenCodeSessionReconcileSummary }> {
+    const assertCallerActive = () => {
+      options.signal?.throwIfAborted()
+      if (options.remainingMs && options.remainingMs() <= 0) {
+        throw new Error('OpenCode reconciliation operation deadline expired')
+      }
+    }
+    assertCallerActive()
     const { baseUrl, resolvedConfigFingerprint, runtimePid, profileAuthState, preflightDiagnostics, assertOwner } = context
     if (assertOwner && options.sessionId?.trim() && options.sessionId.trim() !== record.opencodeSessionId) {
       throw new Error('OpenCode observation requires the exact owned session')
     }
-      const client = this.clientFactory.create(baseUrl, options.signal ? { signal: options.signal } : undefined)
+      const boundedReconciliation = Boolean(options.runtimePromptMessageId || options.remainingMs)
+      const client = this.clientFactory.create(baseUrl, {
+        signal: options.signal, remainingMs: options.remainingMs, boundedReconciliation,
+      })
       let permissionDiagnostic: string | null = null
       const [statusMap, pendingPermissions] = await Promise.all([
         client.getSessionStatus(),
         client.getPermissions().catch(error => {
+          if (boundedReconciliation) throw error
           permissionDiagnostic = error instanceof Error ? error.message : String(error)
           return []
         }),
       ])
       const messageDiagnostics: string[] = []
       const targetSessionId = options.sessionId?.trim() || activeRecord.opencodeSessionId
-      let messages = await client.getSessionMessages(targetSessionId, options.limit)
+      options.signal?.throwIfAborted()
+      const limit = boundedReconciliation ? Math.min(50, Math.max(1, options.limit ?? 50)) : options.limit
+      let messages = await client.getSessionMessages(targetSessionId, limit)
+      assertCallerActive()
       if (
-        typeof options.limit === 'number'
+        typeof limit === 'number'
         && activeRecord.lastCanonicalCursor
         && !messages.some(message => getMessageId(message) === activeRecord.lastCanonicalCursor)
       ) {
         messageDiagnostics.push(
-          `Stored cursor ${activeRecord.lastCanonicalCursor} was missing from the latest ${options.limit} messages, rebuilding full OpenCode session history`,
+          `Stored cursor ${activeRecord.lastCanonicalCursor} was missing from the latest ${limit} messages, ${boundedReconciliation ? 'acquiring bounded OpenCode cursor pages' : 'rebuilding full OpenCode session history'}`,
         )
-        messages = await client.getSessionMessages(targetSessionId)
+        options.signal?.throwIfAborted()
+        if (boundedReconciliation) {
+          const seen = new Set(messages.map(getMessageId))
+          for (let page = 1; !seen.has(activeRecord.lastCanonicalCursor); page++) {
+            if (messages.length < limit || page >= 4) throw new Error('Native cursor/window pagination budget exhausted; completeness unknown')
+            const oldest = messages[0]
+            const before = oldest ? getMessageId(oldest) : null
+            if (!before) throw new Error('Missing native cursor pagination boundary')
+            const older = await client.getSessionMessages(targetSessionId, limit, before)
+            assertCallerActive()
+            if (older.some(message => !getMessageId(message) || seen.has(getMessageId(message)))) throw new Error('Conflicting native cursor pagination boundary')
+            for (const message of older) seen.add(getMessageId(message))
+            messages = [...older, ...messages]
+            if (older.length < limit && !seen.has(activeRecord.lastCanonicalCursor)) throw new Error('Native cursor missing from bounded history; completeness unknown')
+          }
+        } else messages = await client.getSessionMessages(targetSessionId)
       }
+      assertCallerActive()
       const rawStatus = statusMap[targetSessionId] ?? null
+      // Keep canonical native terminal authority separate from reply/activity projection.
+      // Unscoped inventory/history reconciliation has no exact user anchor and
+      // cannot qualify a turn. Preserve its existing read path; only an explicit
+      // prompt observation acquires the additional native terminal evidence.
+      let terminalEvidence: Awaited<ReturnType<typeof readOpenCodeV1TerminalTranscript>> | undefined
+      if (options.runtimePromptMessageId) {
+        const terminalController = new AbortController()
+        const abortTerminal = () => terminalController.abort(options.signal?.reason)
+        options.signal?.addEventListener('abort', abortTerminal, { once: true })
+        if (options.signal?.aborted) abortTerminal()
+        const terminalDeadline = setTimeout(() => terminalController.abort(), 2_000)
+        try {
+          terminalEvidence = await readOpenCodeV1TerminalTranscript({
+            authority: activeRecord, baseUrl, sessionId: targetSessionId, signal: terminalController.signal,
+            runtimePromptMessageId: options.runtimePromptMessageId, remainingMs: options.remainingMs,
+          })
+        } finally {
+          clearTimeout(terminalDeadline)
+          options.signal?.removeEventListener('abort', abortTerminal)
+        }
+      }
+      // Terminal reads report incomplete evidence on cancellation/deadline. The
+      // caller's original budget still fences projection, persistence and return.
+      assertCallerActive()
       const summary = this.eventTranslator.reconcileSessionMessages({
         sessionId: targetSessionId,
         rawStatus,
         messages,
       })
+      summary.terminalEvidence = terminalEvidence
+      summary.diagnostics.push(...(summary.terminalEvidence?.diagnostics ?? []))
       summary.profileAuthState = profileAuthState
       const normalizedPendingPermissions = normalizeOpenCodePermissions(pendingPermissions)
         .filter(permission => permission.sessionId === targetSessionId)
@@ -2434,6 +2497,7 @@ export class OpenCodeSessionBridge {
       }
 
       await assertOwner?.()
+      assertCallerActive()
       const nextRecord = this.buildUpdatedRecord(activeRecord, {
         lastCanonicalCursor: summary.lastCanonicalCursor,
         lastKnownRawStatus: summary.rawStatus,
@@ -2453,9 +2517,12 @@ export class OpenCodeSessionBridge {
           || nextRecord.toolApprovalMode !== record.toolApprovalMode
         )
       ) {
-        await this.sessionStore.upsert(nextRecord, undefined, assertOwner ? record : undefined)
+        await this.sessionStore.upsert(nextRecord, undefined, assertOwner ? record : undefined, options.signal || options.remainingMs ? {
+          signal: options.signal, remainingMs: options.remainingMs,
+        } : undefined)
       }
 
+      assertCallerActive()
       const reconciledRecord = isCurrentSession ? nextRecord : activeRecord
       return {
         record: runtimePid ? { ...reconciledRecord, runtimePid } : reconciledRecord,

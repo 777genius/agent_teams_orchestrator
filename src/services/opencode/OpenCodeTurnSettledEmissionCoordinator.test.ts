@@ -134,7 +134,7 @@ function buildBootstrapReadyMessages(): OpenCodeCanonicalMessage[] {
 }
 
 describe('OpenCodeTurnSettledEmissionCoordinator', () => {
-  test('emits successful delivery event from visible response proof', async () => {
+  test('suppresses delivery Stop from visible response progress', async () => {
     const events: OpenCodeRuntimeTurnSettledEvent[] = []
     const coordinator = new OpenCodeTurnSettledEmissionCoordinator({
       now: () => new Date('2026-04-29T12:00:00.000Z'),
@@ -163,25 +163,11 @@ describe('OpenCodeTurnSettledEmissionCoordinator', () => {
       responseObservation,
     })
 
-    expect(events).toEqual([
-      expect.objectContaining({
-        provider: 'opencode',
-        source: 'agent-teams-orchestrator-opencode',
-        eventName: 'runtime_turn_settled',
-        hookEventName: 'Stop',
-        recordedAt: '2026-04-29T12:00:00.000Z',
-        teamName: 'team-a',
-        memberName: 'alice',
-        sessionId: 'session-1',
-        runtimePromptMessageId: 'msg_prompt_1',
-        turnId: 'msg_prompt_1',
-        outcome: 'success',
-        runtimePid: 123,
-      }),
-    ])
+    // Regression: progress/readiness used to emit an execution Stop.
+    expect(events).toEqual([])
   })
 
-  test('emits error outcome for tool error delivery proof', async () => {
+  test('suppresses delivery Stop from tool error progress', async () => {
     const events: OpenCodeRuntimeTurnSettledEvent[] = []
     const coordinator = new OpenCodeTurnSettledEmissionCoordinator({
       emitter: {
@@ -206,10 +192,8 @@ describe('OpenCodeTurnSettledEmissionCoordinator', () => {
       },
     })
 
-    expect(events[0]).toMatchObject({
-      outcome: 'error',
-      detail: expect.stringContaining('MCP Not connected'),
-    })
+    // Regression: progress/readiness used to emit an execution Stop.
+    expect(events).toEqual([])
   })
 
   test('does not upgrade a stale previous assistant message to success for the current prompt', async () => {
@@ -257,11 +241,8 @@ describe('OpenCodeTurnSettledEmissionCoordinator', () => {
       }),
     })
 
-    expect(events[0]).toMatchObject({
-      outcome: 'idle_without_assistant_activity',
-      runtimePromptMessageId: 'msg-current-user',
-      detail: expect.stringContaining('without assistant activity'),
-    })
+    // Regression: progress/readiness used to emit an execution Stop.
+    expect(events).toEqual([])
   })
 
   test('does not downgrade the current prompt because of a stale previous assistant error', async () => {
@@ -312,13 +293,11 @@ describe('OpenCodeTurnSettledEmissionCoordinator', () => {
       }),
     })
 
-    expect(events[0]).toMatchObject({
-      outcome: 'idle_without_assistant_activity',
-      runtimePromptMessageId: 'msg-current-user',
-    })
+    // Regression: progress/readiness used to emit an execution Stop.
+    expect(events).toEqual([])
   })
 
-  test('uses reconcile proof only when an assistant response belongs to the current prompt', async () => {
+  test('requires completion beyond assistant attribution', async () => {
     const events: OpenCodeRuntimeTurnSettledEvent[] = []
     const coordinator = new OpenCodeTurnSettledEmissionCoordinator({
       emitter: {
@@ -362,13 +341,11 @@ describe('OpenCodeTurnSettledEmissionCoordinator', () => {
       }),
     })
 
-    expect(events[0]).toMatchObject({
-      outcome: 'success',
-      runtimePromptMessageId: 'msg-current-user',
-    })
+    // Regression: progress/readiness used to emit an execution Stop.
+    expect(events).toEqual([])
   })
 
-  test('uses reconcile error only when it belongs to the current prompt', async () => {
+  test('rejects unmeasured and incomplete reconcile errors', async () => {
     const events: OpenCodeRuntimeTurnSettledEvent[] = []
     const coordinator = new OpenCodeTurnSettledEmissionCoordinator({
       emitter: {
@@ -415,13 +392,11 @@ describe('OpenCodeTurnSettledEmissionCoordinator', () => {
       }),
     })
 
-    expect(events[0]).toMatchObject({
-      outcome: 'error',
-      runtimePromptMessageId: 'msg-current-user',
-    })
+    // Regression: progress/readiness used to emit an execution Stop.
+    expect(events).toEqual([])
   })
 
-  test('emits legacy launch error when bootstrap MCP tools are not connected', async () => {
+  test('suppresses unqualified legacy launch error when bootstrap MCP tools are not connected', async () => {
     const events: OpenCodeRuntimeTurnSettledEvent[] = []
     const coordinator = new OpenCodeTurnSettledEmissionCoordinator({
       emitter: {
@@ -463,13 +438,11 @@ describe('OpenCodeTurnSettledEmissionCoordinator', () => {
       }),
     })
 
-    expect(events[0]).toMatchObject({
-      outcome: 'error',
-      detail: expect.stringContaining('runtime_bootstrap_checkin, member_briefing'),
-    })
+    // Regression: progress/readiness used to emit an execution Stop.
+    expect(events).toEqual([])
   })
 
-  test('emits app-managed launch success when assistant response omits legacy bootstrap tools', async () => {
+  test('suppresses app-managed launch execution when assistant response omits legacy bootstrap tools', async () => {
     const events: OpenCodeRuntimeTurnSettledEvent[] = []
     const coordinator = new OpenCodeTurnSettledEmissionCoordinator({
       emitter: {
@@ -497,15 +470,11 @@ describe('OpenCodeTurnSettledEmissionCoordinator', () => {
       }),
     })
 
-    expect(events[0]).toMatchObject({
-      outcome: 'success',
-    })
-    expect(events[0]?.detail ?? '').not.toContain(
-      'OpenCode bootstrap MCP did not complete required tools before assistant response',
-    )
+    // Regression: progress/readiness used to emit an execution Stop.
+    expect(events).toEqual([])
   })
 
-  test('emits legacy launch error when bootstrap assistant response omits required MCP tools', async () => {
+  test('suppresses unqualified legacy launch error when bootstrap assistant response omits required MCP tools', async () => {
     const events: OpenCodeRuntimeTurnSettledEvent[] = []
     const coordinator = new OpenCodeTurnSettledEmissionCoordinator({
       emitter: {
@@ -536,11 +505,7 @@ describe('OpenCodeTurnSettledEmissionCoordinator', () => {
       }),
     })
 
-    expect(events[0]).toMatchObject({
-      outcome: 'error',
-      detail: expect.stringContaining(
-        'OpenCode bootstrap MCP did not complete required tools before assistant response',
-      ),
-    })
+    // Regression: progress/readiness used to emit an execution Stop.
+    expect(events).toEqual([])
   })
 })

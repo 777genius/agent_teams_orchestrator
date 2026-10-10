@@ -16,7 +16,7 @@ import type {
   OpenCodeProvisioningSnapshot,
 } from './types.js'
 
-export const OPEN_CODE_EXECUTION_PROOF_TTL_MS = 45_000
+export const OPEN_CODE_EXECUTION_PROOF_TTL_MS = 120_000
 
 type OpenCodeExecutionProofDeps = {
   nowMs?: () => number

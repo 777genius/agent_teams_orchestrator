@@ -358,13 +358,14 @@ export class OpenCodeCommandOutcomeStore {
 
   async upsert(patch: OpenCodeCommandOutcomePatch, options: {
     requireRetryable?: boolean
-    definitelyUnsubmitted?: { runtimePromptMessageId: string }
+    definitelyUnsubmitted?: { runtimePromptMessageId: string; submissionOwner?: string }
+    retryUnreservedOwner?: { runtimePromptMessageId: string; intentHash: string }
   } = {}): Promise<OpenCodeCommandOutcomeRecord> {
     patch = structuredClone(patch)
     options = structuredClone(options)
     return this.withStoreLock(async () => {
       const { store, diagnostics } = await this.readStore()
-      if ((options.requireRetryable || options.definitelyUnsubmitted !== undefined) && diagnostics.length) {
+      if ((options.requireRetryable || options.definitelyUnsubmitted !== undefined || options.retryUnreservedOwner !== undefined) && diagnostics.length) {
         throw new Error('OpenCode delivery admission requires readable outcome history')
       }
       const previous = store.records[patch.requestId] ?? null
@@ -385,9 +386,11 @@ export class OpenCodeCommandOutcomeStore {
       }
       if (options.definitelyUnsubmitted !== undefined) {
         const messageId = options.definitelyUnsubmitted?.runtimePromptMessageId
+        const submissionOwner = options.definitelyUnsubmitted.submissionOwner
         // This evidence is captured before native transport. Compare the complete
         // captured owner under the admission lock; omitted fields are not wildcards.
-        if (patch.status !== 'failed_before_accept' || previous?.status !== 'prompt_submitting'
+        if ((submissionOwner !== undefined && previous?.diagnostics.filter(value => value.startsWith('v2_submission_owner:')).at(-1) !== `v2_submission_owner:${submissionOwner}`)
+          || patch.status !== 'failed_before_accept' || previous?.status !== 'prompt_submitting'
           || typeof messageId !== 'string' || !messageId.trim()
           || messageId !== previous.runtimePromptMessageId
           || messageId !== patch.runtimePromptMessageId
@@ -438,8 +441,26 @@ export class OpenCodeCommandOutcomeStore {
       }
       const retryAdmission = previous?.status === 'failed_before_accept'
         && patch.status === 'prompt_submitting'
+      if (options.retryUnreservedOwner !== undefined) {
+        const proof = options.retryUnreservedOwner
+        // V2 retains its immutable native ID only after its owner proved that
+        // this exact intent never acquired an admission. Generic pre-fetch
+        // failures and UNKNOWN submissions cannot use this exception.
+        if (!retryAdmission || !options.requireRetryable || !previous.safeToRetry ||
+          previous.error !== 'native_input_not_reserved' || previous.acceptedAt !== null ||
+          previous.turnObservedAt !== null || previous.sendMessageData ||
+          !/^[a-f0-9]{64}$/.test(proof.intentHash) ||
+          !previous.diagnostics.includes(`v2_intent_sha256:${proof.intentHash}`) ||
+          !previous.diagnostics.includes(`v2_unreserved_sha256:${proof.intentHash}`) ||
+          proof.runtimePromptMessageId !== previous.runtimePromptMessageId ||
+          patch.runtimePromptMessageId !== previous.runtimePromptMessageId ||
+          (['requestId', 'teamId', 'teamName', 'laneId', 'memberName', 'projectPath',
+            'runId', 'deliveryAttemptId', 'messageId', 'payloadHash', 'sessionId', 'runtimePid'] as const)
+            .some(field => !Object.prototype.hasOwnProperty.call(patch, field) || patch[field] !== previous[field]))
+          throw new Error('OpenCode unreserved retry requires the exact proved owner')
+      }
       if (retryAdmission && (!options.requireRetryable || !patch.runtimePromptMessageId
-        || patch.runtimePromptMessageId === previous.runtimePromptMessageId)) {
+        || patch.runtimePromptMessageId === previous.runtimePromptMessageId && !options.retryUnreservedOwner)) {
         throw new Error('OpenCode delivery retry requires atomic admission with a new prompt owner')
       }
       const updatedAt = nowIso()

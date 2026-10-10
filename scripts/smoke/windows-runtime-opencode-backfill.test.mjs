@@ -1,3 +1,4 @@
+import './windows-runtime-opencode-launcher.test.mts';
 import assert from 'node:assert/strict';
 import childProcess, { spawn, spawnSync } from 'node:child_process';
 import { syncBuiltinESMExports } from 'node:module';

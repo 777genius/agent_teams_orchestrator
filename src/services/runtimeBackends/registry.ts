@@ -42,6 +42,8 @@ import {
   selectOpenCodeDefaultAgentModel,
 } from '../opencode/OpenCodeAgentModelCompatibility.js'
 import type { OpenCodeInventorySnapshot } from '../opencode/types.js'
+import { buildOpenCodeV2RuntimeStatus } from '../opencode/catalog/OpenCodeV2RuntimeStatus.js'
+import { boundOpenCodeRead } from '../opencode/transport/OpenCodeBoundedFetch.js'
 import type { GeminiBackendStatus } from '../gemini/types.js'
 import {
   getAnthropicCompatibleRuntimeBackendLabel,
@@ -610,8 +612,10 @@ async function buildOpenCodeStatus(
     OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS
   const abortController = new AbortController()
   const progress = createOpenCodeInventoryProbeProgressTracker()
-  const snapshot = await withOpenCodeInventoryProbeTimeout(
-    deps.getOpenCodeInventorySnapshot
+  let v2ReadStarted = false
+  let readAcquisitionPending = false
+  const deadline = Date.now() + timeoutMs
+  const probe = deps.getOpenCodeInventorySnapshot
       ? deps.getOpenCodeInventorySnapshot()
       : openCodeInventoryService.probe(
           null,
@@ -620,14 +624,30 @@ async function buildOpenCodeStatus(
             includeAppMcp: false,
             abortSignal: abortController.signal,
             progress,
+            remainingMs: () => deadline - Date.now(),
+            onV2ReadStarted: () => { v2ReadStarted = true },
+            onReadAcquisitionStarted: () => { readAcquisitionPending = true },
+            onReadAcquisitionSettled: () => { readAcquisitionPending = false },
           },
-        ),
+        )
+  let snapshot = await withOpenCodeInventoryProbeTimeout(
+    probe,
     {
       timeoutMs,
       progress,
       onTimeout: () => abortController.abort(),
     },
   )
+  // Admission owns a version-probe tree before the V2 route is known. Join it
+  // as well as the ephemeral HTTP/server lease before returning status.
+  if ((readAcquisitionPending || v2ReadStarted) && abortController.signal.aborted) {
+    try { snapshot = await boundOpenCodeRead(probe, 15_000) }
+    catch { snapshot = { ...snapshot, readGeneration: v2ReadStarted ? 'v2' : 'unsupported',
+      probeError: 'OpenCode owned read cleanup unknown.' } }
+  }
+  if (snapshot.readStatus || snapshot.readGeneration === 'v2' || snapshot.readGeneration === 'unsupported') {
+    return buildOpenCodeV2RuntimeStatus(snapshot)
+  }
   const runtimeModels = snapshot.models
   const agentModels = filterOpenCodeAgentModels(runtimeModels, snapshot.modelMetadata)
   const hasConnectedProvider = snapshot.connectedProviders.length > 0
@@ -927,7 +947,7 @@ async function buildGeminiStatuses(): Promise<{
       ? [apiStatus, cliStatus].some(status =>
           status.authMethod !== 'none' &&
           status.validationError !== 'invalid_credentials')
-      : preferredStatus?.authMethod !== 'none' &&
+      : preferredStatus !== null && preferredStatus.authMethod !== 'none' &&
         preferredStatus.validationError !== 'invalid_credentials')
   const validationUnavailable =
     apiStatus.validationError === 'operational' ||

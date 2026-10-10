@@ -823,6 +823,8 @@ export class OpenCodeExecutionProbe {
         })(),
         cleanupTimeoutMs,
         'OpenCode execution probe session cleanup timed out',
+        // An abort request may never settle or leave any active I/O behind.
+        { keepAlive: true },
       )
     } finally {
       clearTimeout(timer)
@@ -997,6 +999,8 @@ export class OpenCodeExecutionProbe {
             this.deps.hostStartupCleanupTimeoutMs ?? OPEN_CODE_EXECUTION_CLEANUP_TIMEOUT_MS,
           ),
           'OpenCode execution probe host startup cleanup timed out',
+          // The runtime deadline has fired; awaited cleanup owns its settlement timer.
+          { keepAlive: true },
         ).catch(() => undefined)
       }
       throw error

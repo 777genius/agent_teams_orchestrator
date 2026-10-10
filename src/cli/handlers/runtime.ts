@@ -1,3 +1,4 @@
+import type { RuntimeStatusOptions } from '../runtimeStatusCommand.js'
 /* eslint-disable custom-rules/no-process-exit -- CLI subcommand handler intentionally exits */
 
 import { getUnifiedRuntimeStatusPayload } from '../../services/runtimeBackends/registry.js'
@@ -7,6 +8,7 @@ import { openCodeProvisioningProbe } from '../../services/opencode/OpenCodeProvi
 import { openCodeSessionBridge } from '../../services/opencode/OpenCodeSessionBridge.js'
 import { openCodeSessionStore } from '../../services/opencode/OpenCodeSessionStore.js'
 import { executeOpenCodeBridgeCommandEnvelope } from '../../services/opencode/OpenCodeBridgeCommandHandler.js'
+import { executeSelectedOpenCodeBridgeCommandEnvelope } from '../../services/opencode/bridge/OpenCodeV2TeamBridge.js'
 import { openCodeLedgerBridgeService } from '../../services/opencode/OpenCodeLedgerBridgeService.js'
 import {
   clearProviderProjectDefaultModel,
@@ -62,16 +64,24 @@ async function withRuntimeJsonStdoutGuardedResponse<T>(
   recoverOperationError?: (error: unknown) => T,
 ): Promise<void> {
   const originalWrite = process.stdout.write
+  const originalConsole = { log: console.log, info: console.info, debug: console.debug }
+  const writeDiagnostic = console.error.bind(console)
   let stdoutRestored = false
   const restoreStdout = () => {
     if (stdoutRestored) {
       return
     }
     process.stdout.write = originalWrite
+    Object.assign(console, originalConsole)
     stdoutRestored = true
   }
   process.stdout.write = ((...args: Parameters<typeof process.stdout.write>) =>
     process.stderr.write(...args)) as typeof process.stdout.write
+  // Bun console methods can bypass process.stdout.write. Keep vendor diagnostics
+  // on stderr while the command owns the JSON stdout response.
+  console.log = writeDiagnostic
+  console.info = writeDiagnostic
+  console.debug = writeDiagnostic
   try {
     let result: T
     try {
@@ -324,12 +334,7 @@ function printProviderStatus(provider: RuntimeProviderStatus): void {
   }
 }
 
-export async function runtimeStatus(opts: {
-  json?: boolean
-  text?: boolean
-  provider?: RuntimeProviderTarget
-  summary?: boolean
-}): Promise<void> {
+export async function runtimeStatus(opts: RuntimeStatusOptions): Promise<void> {
   const providerFilter = opts.provider && opts.provider !== 'all' ? opts.provider : undefined
   const loadPayload = () =>
     getUnifiedRuntimeStatusPayload(
@@ -882,6 +887,7 @@ export async function runtimeOpenCodeCommand(opts: {
     watchdog.unref?.()
     signalCleanupPromise = openCodeHostManager
       .disposeUnregisteredOwnedHosts()
+      .then(() => undefined)
       .catch(() => undefined)
       .finally(() => {
         clearTimeout(watchdog)
@@ -898,7 +904,7 @@ export async function runtimeOpenCodeCommand(opts: {
     const raw = await readFile(opts.input, 'utf8')
     logOpenCodeCommandDebug('execute:start')
     const envelope = JSON.parse(raw) as unknown
-    const result = await executeOpenCodeBridgeCommandEnvelope(envelope)
+    const result = await executeSelectedOpenCodeBridgeCommandEnvelope(envelope, executeOpenCodeBridgeCommandEnvelope)
     logOpenCodeCommandDebug('execute:done')
     if (signalCleanupPromise) {
       await signalCleanupPromise
@@ -1011,7 +1017,7 @@ function writeStdoutAndDrain(
       STDOUT_DRAIN_FALLBACK_TIMEOUT_MS,
     )
     if (timeoutPolicy === 'best-effort') timer.unref?.()
-    const shouldWaitForDrain = !stdoutWrite.call(process.stdout, payload, error => {
+    const shouldWaitForDrain = !stdoutWrite.call(process.stdout, payload, undefined, (error?: Error | null) => {
       finish(error)
     })
     if (shouldWaitForDrain && !settled) {
@@ -1527,6 +1533,7 @@ export async function runtimeProvidersConnect(opts: {
     watchdog.unref?.()
     signalCleanupPromise = openCodeHostManager
       .disposeUnregisteredOwnedHosts()
+      .then(() => undefined)
       .catch(() => undefined)
       .finally(() => {
         clearTimeout(watchdog)

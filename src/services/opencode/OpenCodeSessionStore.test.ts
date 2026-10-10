@@ -1,8 +1,9 @@
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
+import * as fs from 'node:fs/promises'
 import path from 'node:path'
 
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 
 import * as lockfile from '../../utils/lockfile.js'
 import { OpenCodeSessionStore } from './OpenCodeSessionStore.js'
@@ -36,7 +37,7 @@ const baseRecord = {
 let tempDir = ''
 
 beforeEach(async () => {
-  tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-session-store-test-'))
+  tempDir = await mkdtemp(path.join(os.tmpdir(), 'TEST-opencode-session-store-'))
 })
 
 afterEach(async () => {
@@ -46,6 +47,46 @@ afterEach(async () => {
 })
 
 describe('OpenCodeSessionStore', () => {
+  for (const boundary of ['lock', 'read', 'temp-write', 'abort-temp-write'] as const) {
+    test(`reconciliation persistence rejects after genuine ${boundary} scheduling`, async () => {
+      const file = path.join(tempDir, 'TEST-deadline.json'), initial = new OpenCodeSessionStore(file)
+      await initial.upsert(baseRecord)
+      const before = await readFile(file, 'utf8'), operation = new AbortController()
+      const reason = new Error('TEST cancelled before commit')
+      let deadline = performance.now() + 30, armed = true
+      const expire = () => { while (performance.now() < deadline) {} }
+      const open = fs.open, write = fs.writeFile
+      const openSpy = spyOn(fs, 'open').mockImplementation(async (...args) => {
+        const handle = await open(...args)
+        if (armed && boundary === 'read' && args[0] === file) expire()
+        return handle
+      })
+      const writeSpy = spyOn(fs, 'writeFile').mockImplementation(async (...args) => {
+        await write(...args)
+        if (armed && String(args[0]).startsWith(file + '.tmp.')) {
+          if (boundary === 'temp-write') expire()
+          if (boundary === 'abort-temp-write') operation.abort(reason)
+        }
+      })
+      const store = new OpenCodeSessionStore(file, { lock: async (...args) => {
+        const release = await lockfile.lock(...args)
+        if (armed && boundary === 'lock') expire()
+        return release
+      } })
+      try {
+        const next = { ...baseRecord, lastCanonicalCursor: 'msg_TEST_deadline' }
+        const pending = store.upsert(next, undefined, baseRecord, { signal: operation.signal, remainingMs: () => deadline - performance.now() })
+        if (boundary === 'abort-temp-write') await expect(pending).rejects.toBe(reason)
+        else await expect(pending).rejects.toThrow('deadline expired')
+        await store.drainPendingLateLockReleases()
+        expect(await readFile(file, 'utf8')).toBe(before)
+        expect((await fs.readdir(tempDir)).filter(name => name.includes('.tmp.'))).toHaveLength(0)
+        armed = false; deadline = performance.now() + 1000
+        expect(await store.upsert(next, undefined, baseRecord, { remainingMs: () => deadline - performance.now() })).toBe('updated')
+        expect((await store.get(baseRecord.teamId, baseRecord.memberName))?.lastCanonicalCursor).toBe(next.lastCanonicalCursor)
+      } finally { openSpy.mockRestore(); writeSpy.mockRestore() }
+    })
+  }
   test('upserts and reads records', async () => {
     const store = new OpenCodeSessionStore(path.join(tempDir, 'session-store.json'))
 

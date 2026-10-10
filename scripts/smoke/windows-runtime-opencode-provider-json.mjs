@@ -85,7 +85,7 @@ export function runProviderSmoke(runtimeBinary, report, flush, { spawn = spawnSy
 
     writeFileSync(
       fakeOpenCodeCmd,
-      '@echo off\r\nnode "%~dp0fake-opencode.cjs" %*\r\n',
+      `@echo off\r\n"${process.execPath}" "%~dp0fake-opencode.cjs" %*\r\n`,
       'utf8',
     );
 
