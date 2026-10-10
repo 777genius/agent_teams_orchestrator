@@ -81,8 +81,9 @@ export class OpenCodeV2TeamBridge {
     }
     // A stale observation or stop never enters launchExplicit or acquires a host.
     const controlOnly = request.operation === 'stop'
-    return this.ports.request(record, request, controlOnly ? timeoutMs
-      : Math.min(timeoutMs, Math.max(1, record.deadline - Date.now())))
+    const remaining = deadline - Date.now(); executionAssert(remaining > 0, 'operation_timeout')
+    return this.ports.request(record, request, controlOnly ? remaining
+      : Math.min(remaining, Math.max(1, record.deadline - Date.now())))
   }
   async resolveMember(memberId: string, laneId: string | null, expectedSessionId: string | null, timeoutMs: number) {
     const status = await this.call({ operation: 'status' }, timeoutMs)

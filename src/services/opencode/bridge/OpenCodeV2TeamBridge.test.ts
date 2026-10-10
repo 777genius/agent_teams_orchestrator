@@ -58,6 +58,30 @@ describe('V2 semantic control adapter', () => {
     await bridge.call({ operation: 'stop' }, 5000)
     expect(budgets).toEqual([5000])
   })
+  for (const operation of ['send', 'stop'] as const) for (const timeoutMs of [1000, 500]) test(`${operation} preserves the caller ${timeoutMs}ms deadline across owner discovery`, async () => {
+    let clock = 1000, requests = 0
+    const budgets: number[] = []
+    const now = spyOn(Date, 'now').mockImplementation(() => clock)
+    const bridge = new OpenCodeV2TeamBridge('/TEST', record.binding, {
+      discover: async () => { clock += 600; return record },
+      launch: async () => { throw new Error('replacement forbidden') },
+      request: async (_record, _request, budget) => {
+        requests++; budgets.push(budget!)
+        return { kind: 'status', state: 'active', members: [], deadline: record.deadline }
+      },
+    })
+    const request = operation === 'stop' ? { operation } : { operation, memberId: 'worker', originalSessionId: 'ses_original',
+      intent: createV2ProtocolQueueIntent(envelope) }
+    try {
+      if (timeoutMs > 600) {
+        await bridge.call(request, timeoutMs)
+        expect(budgets).toEqual([400])
+      } else {
+        await expect(bridge.call(request, timeoutMs)).rejects.toThrow('operation_timeout')
+        expect(requests).toBe(0)
+      }
+    } finally { now.mockRestore() }
+  })
   test('changed original session and stopped run cannot obtain send target', async () => {
     const counts = { launched: 0, requested: 0 }
     const active: RunControlResult = { kind: 'status', state: 'active', qualification: { capabilitySnapshotId: 'TEST-original', expectedBehaviorFingerprint: 'a'.repeat(64), binaryPath: '/TEST/native', binaryFingerprint: 'b'.repeat(64), version: '2.0.21' }, deadline: record.deadline,
