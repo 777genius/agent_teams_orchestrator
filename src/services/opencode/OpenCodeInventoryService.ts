@@ -14,6 +14,8 @@ import {
 import { canonicalizeOpenCodeProviderId } from './OpenCodeProviderIdentity.js'
 import { readOpenCodeAuthProviderSummaries } from './OpenCodeAuthStore.js'
 import { resolveOpenCodeBinaryPath } from './OpenCodeBinaryResolver.js'
+import { inspectOpenCodeReadSelection } from './compatibility/OpenCodeNativeIdentity.js'
+import { probeOpenCodeV2Inventory } from './catalog/OpenCodeV2InventoryService.js'
 import {
   getOpenCodeManagedSubscriptionPluginPackages,
   isOpenCodeCuratedSubscriptionProviderId,
@@ -139,6 +141,10 @@ async function acquireOpenCodeLock(
 type OpenCodeInventoryProbeMode = 'full' | 'summary' | 'profile'
 
 type OpenCodeInventoryProbeOptions = {
+  onV2ReadStarted?: () => void
+  onReadAcquisitionStarted?: () => void
+  onReadAcquisitionSettled?: () => void
+  remainingMs?: () => number
   bypassCache?: boolean
   mode?: OpenCodeInventoryProbeMode
   refreshModels?: boolean
@@ -976,17 +982,49 @@ export class OpenCodeInventoryService {
     options: OpenCodeInventoryProbeOptions = {},
   ): Promise<OpenCodeInventorySnapshot> {
     const mode = options.mode ?? 'full'
+    if (mode === 'summary') {
+      const binaryPath = process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH?.trim() || process.env.OPENCODE_BIN_PATH?.trim() || null
+      return { detected: Boolean(binaryPath), binaryPath, version: null, projectPath: path.resolve(projectPath?.trim() || getCwd()),
+        profile: null, connectedProviders: [], availableProviders: [], models: [], agents: [], authStorePath: null,
+        probeError: null, diagnostics: ['Passive metadata only; no authentication or launch proof.'] }
+    }
     const resolvedProjectPath = await canonicalizeOpenCodeProjectPath(projectPath)
+    // Select generation before V1 profile preparation, plugin prewarming, locks or cache lookup.
+    let selection: Awaited<ReturnType<typeof inspectOpenCodeReadSelection>>
+    try { selection = await inspectOpenCodeReadSelection(options.abortSignal, options.onReadAcquisitionStarted) }
+    catch (failure) {
+      return {
+        detected: false, binaryPath: null, version: null, projectPath: resolvedProjectPath,
+        profile: null, connectedProviders: [], availableProviders: [], models: [], agents: [], authStorePath: null,
+        probeError: failure instanceof Error && failure.message === 'cleanup_unknown'
+          ? 'Selected OpenCode owned acquisition cleanup unknown.'
+          : 'Selected OpenCode identity unavailable; choose a verified native binary.',
+        diagnostics: ['capabilities_pending'], readGeneration: 'unsupported',
+      }
+    }
+    finally { options.onReadAcquisitionSettled?.() }
+    if (selection.native && mode === 'full') {
+      options.onV2ReadStarted?.()
+      return probeOpenCodeV2Inventory(selection.native, resolvedProjectPath, { signal: options.abortSignal, remainingMs: options.remainingMs })
+    }
+    if (selection.path && selection.policy.generation !== 'v1') {
+      return {
+        detected: true, binaryPath: selection.path, version: selection.policy.version, projectPath: resolvedProjectPath,
+        profile: null, connectedProviders: [], availableProviders: [], models: [], agents: [], authStorePath: null,
+        probeError: 'This selected generation requires an explicit qualified V2 full catalog read.',
+        diagnostics: ['capabilities_pending'], readGeneration: selection.policy.generation,
+      }
+    }
     const toolApprovalMode = options.toolApprovalMode ?? 'auto'
     const scopeKey = options.profileScope ? JSON.stringify(options.profileScope) : 'legacy'
-    const cacheKey = `${resolvedProjectPath}\0${mode}\0${options.includeAppMcp === false ? 'without-app-mcp' : 'with-app-mcp'}\0${toolApprovalMode}\0${scopeKey}`
+    const cacheKey = `${selection.path}\0${selection.fingerprint}\0${selection.policy.version}\0${resolvedProjectPath}\0${mode}\0${options.includeAppMcp === false ? 'without-app-mcp' : 'with-app-mcp'}\0${toolApprovalMode}\0${scopeKey}`
     const cached = this.cache.get(cacheKey)
     const cacheEnabled = mode === 'full' && !options.bypassCache
     if (cacheEnabled && cached && cached.expiresAt > Date.now()) {
       return cached.snapshot
     }
 
-    const binaryPath = resolveOpenCodeBinaryPath()
+    const binaryPath = selection.path
     if (!binaryPath) {
       const missingSnapshot: OpenCodeInventorySnapshot = {
         detected: false,
@@ -1017,7 +1055,7 @@ export class OpenCodeInventoryService {
         abortSignal: options.abortSignal,
         progress: options.progress,
         includeAppMcp: options.includeAppMcp !== false,
-        includeManagedSubscriptionPlugins: mode !== 'summary',
+        includeManagedSubscriptionPlugins: true,
         toolApprovalMode,
         profileScope: options.profileScope,
       }),
@@ -1170,7 +1208,7 @@ export class OpenCodeInventoryService {
         ...connectedProviders.map(provider => provider.id),
         ...models
           .map(model => parseOpenCodeProviderScopedModelRef(model)?.providerId)
-          .filter(Boolean),
+          .filter((provider): provider is string => typeof provider === 'string' && provider.length > 0),
       ]),
     ).sort()
 

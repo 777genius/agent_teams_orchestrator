@@ -18,6 +18,19 @@ import type {
   OpenCodeProvisioningSnapshot,
 } from './types.js'
 
+import type {
+  OpenCodeModelAccessKind,
+  OpenCodeModelProofState,
+  OpenCodeModelRouteKind,
+  OpenCodeModelRouteMetadata,
+} from './OpenCodeModelRouteTypes.js'
+export type {
+  OpenCodeModelAccessKind,
+  OpenCodeModelProofState,
+  OpenCodeModelRouteKind,
+  OpenCodeModelRouteMetadata,
+} from './OpenCodeModelRouteTypes.js'
+
 export type OpenCodeModelAccessCatalog = {
   connectedProviders: readonly string[]
   models: readonly string[]
@@ -26,16 +39,6 @@ export type OpenCodeModelAccessCatalog = {
   providers?: OpenCodeProviderResponse | null
 }
 
-export type OpenCodeModelAccessKind =
-  | 'no_model'
-  | 'unknown_model'
-  | 'credentialed'
-  | 'builtin_free'
-  | 'configured_authless'
-  | 'verified'
-  | 'not_authenticated'
-  | 'execution_failed'
-
 export type OpenCodeModelAccessEvaluation = {
   kind: OpenCodeModelAccessKind
   providerId: string | null
@@ -43,30 +46,6 @@ export type OpenCodeModelAccessEvaluation = {
   launchAllowed: boolean
   requiresExecutionProof: boolean
   reason: string | null
-}
-
-export type OpenCodeModelRouteKind =
-  | 'connected_provider'
-  | 'builtin_free'
-  | 'configured_local'
-  | 'catalog_provider'
-
-export type OpenCodeModelProofState =
-  | 'not_required'
-  | 'needs_probe'
-  | 'verified'
-  | 'failed'
-
-export type OpenCodeModelRouteMetadata = {
-  providerId: string | null
-  modelId: string | null
-  sourceLabel: string | null
-  accessKind: OpenCodeModelAccessKind
-  routeKind: OpenCodeModelRouteKind
-  proofState: OpenCodeModelProofState
-  requiresExecutionProof: boolean
-  reason: string | null
-  failureCode?: 'free_tier_restricted'
 }
 
 const KNOWN_AUTHLESS_OPEN_CODE_PROVIDER_IDS = new Set([

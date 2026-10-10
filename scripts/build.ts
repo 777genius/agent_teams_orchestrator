@@ -11,6 +11,7 @@ import {
 } from 'fs'
 import { dirname, join, relative, resolve } from 'path'
 import { stageCursorManagedAssets } from './cursor-plugin/stage.js'
+import { OPENCODE_V2_EXTERNALS, stageOpenCodeV2Graphs } from './opencode-v2/stage.js'
 
 const pkg = await Bun.file(new URL('../package.json', import.meta.url)).json() as {
   name: string
@@ -109,6 +110,7 @@ const defaultFeatures = ['VOICE_MODE']
 const featureSet = new Set(defaultFeatures)
 for (let i = 0; i < args.length; i += 1) {
   const arg = args[i]
+  if (arg === undefined) continue
   if (arg === '--feature-set' && args[i + 1]) {
     if (args[i + 1] === 'dev-full') {
       for (const feature of fullExperimentalFeatures) {
@@ -195,6 +197,10 @@ const externals = [
   'keytar',
   'modifiers-napi',
   'url-handler-napi',
+  // JS delivery keeps each selected official graph physically distinct. The
+  // compiled delivery is fenced before V2 acquisition and retains its existing
+  // bundled dependencies for the rest of the CLI.
+  ...(!compile ? OPENCODE_V2_EXTERNALS : []),
 ]
 
 const defines = {
@@ -405,6 +411,7 @@ if (compile) {
   }
 
   console.log(`Built ${outfile}`)
+  console.log('OpenCode V2 catalog acquisition is unsupported in compiled binaries; use the JS ./cli wrapper.')
 } else {
   const stagingOutdir = `${bundleOutdir}.staging-${process.pid}-${Date.now()}`
   rmSync(stagingOutdir, { recursive: true, force: true })
@@ -414,6 +421,9 @@ if (compile) {
     'bun',
     'build',
     './src/entrypoints/cli.tsx',
+    './src/entrypoints/opencodeV2Server.ts',
+    './src/entrypoints/opencodeV2ExecutionServer.ts',
+    './src/entrypoints/opencodeV2RunOwner.ts',
     '--target',
     'bun',
     '--format',
@@ -428,6 +438,7 @@ if (compile) {
   ])
 
   runBuild(cmd)
+  await stageOpenCodeV2Graphs(process.cwd(), stagingOutdir)
   publishBundleOutdir(stagingOutdir, bundleOutdir)
   writeLauncher(outfile, bundleEntrypoint)
 

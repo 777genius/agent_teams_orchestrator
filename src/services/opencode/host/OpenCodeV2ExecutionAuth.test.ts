@@ -1,0 +1,83 @@
+import { expect, test } from 'bun:test'
+import { createHash } from 'node:crypto'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import path from 'node:path'
+import { tmpdir } from 'node:os'
+import { pathToFileURL } from 'node:url'
+import { Database as SQLite } from 'bun:sqlite'
+import { attachOpenCodeV2SelectedKey, initializeOpenCodeV2ExecutionAuth } from './OpenCodeV2ExecutionAuth.js'
+import type { ExecutionAuthority, ExecutionContext } from '../execution/OpenCodeV2ExecutionContracts.js'
+import type { SelectedExecutionProfile } from './OpenCodeV2ExecutionBinding.js'
+const digest = (value: string) => createHash('sha256').update(value).digest('hex')
+async function fixture(credential: unknown = { type: 'api', key: 'TEST-DUMMY-KEY' }) {
+  const root = await mkdtemp(path.join(tmpdir(), 'TEST-v2-auth-'))
+  const data = path.join(root, 'data/opencode'); await mkdir(data, { recursive: true, mode: 0o700 })
+  const content = JSON.stringify(credential === null ? {} : { groq: credential })
+  const auth = path.join(data, 'auth.json'); await writeFile(auth, content, { mode: 0o600 })
+  const profile: SelectedExecutionProfile = { root, epoch: 'TEST', directory: root, databasePath: path.join(data, 'opencode.db'),
+    authSha256: digest(content), env: {}, envSha256: digest('{}'), config: { directory: root, content: '{}', sha256: digest('{}') },
+    selection: { agent: 'build', model: { providerID: 'groq', id: 'TEST-model' }, permissions: [] } }
+  return { profile, auth, content, remove: () => rm(root, { recursive: true, force: true }) }
+}
+
+test('fresh official database skips legacy key import; native key attachment makes the selected credential available', async () => {
+  const f = await fixture()
+  let db: SQLite | undefined
+  try {
+    const server = Bun.resolveSync('@opencode/server-v2-floor/process', import.meta.dir)
+    const core = Bun.resolveSync('@opencode/core/database/database', server)
+    const { Database }: typeof import('@opencode/core/database/database') = await import(pathToFileURL(core).href)
+    const { Global }: typeof import('@opencode/util/global') = await import(pathToFileURL(Bun.resolveSync('@opencode/util/global', core)).href)
+    const { Effect }: typeof import('effect') = await import(pathToFileURL(Bun.resolveSync('effect', core)).href)
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () { yield* Database.Service }).pipe(
+      Effect.provide(Database.layer({ path: f.profile.databasePath })),
+      Effect.provide(Global.layerWith({ data: path.dirname(f.auth), cache: f.profile.root, config: f.profile.root,
+        state: f.profile.root, tmp: f.profile.root, bin: f.profile.root, log: f.profile.root, repos: f.profile.root })),
+    )))
+    db = new SQLite(f.profile.databasePath)
+    const connections = () => (db!.query('select id from credential').all() as { id: string }[]).map(row => ({ type: 'credential', id: row.id }))
+    expect(connections()).toEqual([])
+    expect(db.query("select id from migration where id='20260805200742_import_legacy_credentials'").get()).not.toBeNull()
+    let posts = 0
+    await attachOpenCodeV2SelectedKey(f.profile, {
+      providers: async () => ({ location: { directory: f.profile.directory }, data: [{ id: 'groq', integrationID: 'groq' }] }),
+      integration: async id => ({ location: { directory: f.profile.directory }, data: { id, methods: [{ type: 'key' }], connections: connections() } }),
+      connect: async (id, key) => {
+        expect(id).toBe('groq'); expect(key).toBe('TEST-DUMMY-KEY'); posts++
+        db!.query('insert into credential(id,integration_id,label,value,time_created,time_updated) values(?,?,?,?,?,?)')
+          .run('cred_TESToriginal', id, 'API key', JSON.stringify({ type: 'key', key }), 1, 1)
+      },
+    })
+    expect(posts).toBe(1); expect(connections()).toEqual([{ type: 'credential', id: 'cred_TESToriginal' }])
+    expect(await readFile(f.auth, 'utf8')).toBe(f.content)
+    // Existing native connection never permits another POST or replacement.
+    await expect(attachOpenCodeV2SelectedKey(f.profile, {
+      providers: async () => ({ location: { directory: f.profile.directory }, data: [{ id: 'groq', integrationID: 'groq' }] }),
+      integration: async id => ({ location: { directory: f.profile.directory }, data: { id, methods: [{ type: 'key' }], connections: connections() } }),
+      connect: async () => { posts++; },
+    })).rejects.toThrow('execution_selected_auth_existing_or_unsupported')
+    expect(posts).toBe(1)
+  } finally { db?.close(); await f.remove() }
+}, 20_000)
+
+test('changed, absent and unsupported selected auth never reach native mutation', async () => {
+  for (const mode of ['changed', 'absent', 'oauth'] as const) {
+    const f = await fixture(mode === 'absent' ? null : mode === 'oauth' ? { type: 'oauth', access: 'TEST-only' } : undefined)
+    let calls = 0
+    try {
+      if (mode === 'changed') await writeFile(f.auth, '{}')
+      const port = { providers: async () => { calls++; return {} }, integration: async () => { calls++; return {} }, connect: async () => { calls++; } }
+      await expect(attachOpenCodeV2SelectedKey(f.profile, port)).rejects.toThrow('execution_selected_auth_' +
+        (mode === 'changed' ? 'changed' : mode === 'absent' ? 'missing' : 'unsupported'))
+      expect(calls).toBe(0)
+    } finally { await f.remove() }
+  }
+})
+
+test('execution auth rejects a different profile before endpoint or native API access', async () => {
+  const f = await fixture()
+  try {
+    const authority = { profileRoot: f.profile.root + '-other', profileEpoch: f.profile.epoch, directory: f.profile.directory } as ExecutionAuthority
+    await expect(initializeOpenCodeV2ExecutionAuth(authority, f.profile, {} as ExecutionContext)).rejects.toThrow('execution_selected_auth_profile_changed')
+  } finally { await f.remove() }
+})

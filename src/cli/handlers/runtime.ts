@@ -8,6 +8,7 @@ import { openCodeProvisioningProbe } from '../../services/opencode/OpenCodeProvi
 import { openCodeSessionBridge } from '../../services/opencode/OpenCodeSessionBridge.js'
 import { openCodeSessionStore } from '../../services/opencode/OpenCodeSessionStore.js'
 import { executeOpenCodeBridgeCommandEnvelope } from '../../services/opencode/OpenCodeBridgeCommandHandler.js'
+import { executeSelectedOpenCodeBridgeCommandEnvelope } from '../../services/opencode/bridge/OpenCodeV2TeamBridge.js'
 import { openCodeLedgerBridgeService } from '../../services/opencode/OpenCodeLedgerBridgeService.js'
 import {
   clearProviderProjectDefaultModel,
@@ -886,6 +887,7 @@ export async function runtimeOpenCodeCommand(opts: {
     watchdog.unref?.()
     signalCleanupPromise = openCodeHostManager
       .disposeUnregisteredOwnedHosts()
+      .then(() => undefined)
       .catch(() => undefined)
       .finally(() => {
         clearTimeout(watchdog)
@@ -902,7 +904,7 @@ export async function runtimeOpenCodeCommand(opts: {
     const raw = await readFile(opts.input, 'utf8')
     logOpenCodeCommandDebug('execute:start')
     const envelope = JSON.parse(raw) as unknown
-    const result = await executeOpenCodeBridgeCommandEnvelope(envelope)
+    const result = await executeSelectedOpenCodeBridgeCommandEnvelope(envelope, executeOpenCodeBridgeCommandEnvelope)
     logOpenCodeCommandDebug('execute:done')
     if (signalCleanupPromise) {
       await signalCleanupPromise
@@ -1015,7 +1017,7 @@ function writeStdoutAndDrain(
       STDOUT_DRAIN_FALLBACK_TIMEOUT_MS,
     )
     if (timeoutPolicy === 'best-effort') timer.unref?.()
-    const shouldWaitForDrain = !stdoutWrite.call(process.stdout, payload, error => {
+    const shouldWaitForDrain = !stdoutWrite.call(process.stdout, payload, undefined, (error?: Error | null) => {
       finish(error)
     })
     if (shouldWaitForDrain && !settled) {
@@ -1531,6 +1533,7 @@ export async function runtimeProvidersConnect(opts: {
     watchdog.unref?.()
     signalCleanupPromise = openCodeHostManager
       .disposeUnregisteredOwnedHosts()
+      .then(() => undefined)
       .catch(() => undefined)
       .finally(() => {
         clearTimeout(watchdog)

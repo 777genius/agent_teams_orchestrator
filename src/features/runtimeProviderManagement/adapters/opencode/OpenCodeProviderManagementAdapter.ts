@@ -1,3 +1,4 @@
+import { selectedProviderUsesOpenCodeV2, connectOpenCodeV2Provider, loadOpenCodeV2ProviderModels, testOpenCodeV2ProviderModel } from './OpenCodeV2ProviderManagement.js'
 import path from 'node:path'
 
 import {
@@ -4305,6 +4306,11 @@ export class OpenCodeProviderManagementAdapter
   async loadModels(
     input: LoadProviderModelsInput,
   ): Promise<ProviderManagementResult<RuntimeProviderModelsView>> {
+    if (input.runtimeId === 'opencode' && await selectedProviderUsesOpenCodeV2()) {
+      const providerId = normalizeProviderId(canonicalizeOpenCodeProviderId(input.providerId))
+      if (!providerId) return providerManagementError('provider-missing', 'Provider id is invalid')
+      return loadOpenCodeV2ProviderModels({ ...input, providerId })
+    }
     const deadline = new OpenCodeRuntimeDeadline(
       this.deps.catalogOverallTimeoutMs ?? OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS,
     )
@@ -5093,7 +5099,9 @@ export class OpenCodeProviderManagementAdapter
       return providerManagementError('provider-missing', 'Provider id is invalid')
     }
 
+    const selectedV2 = input.runtimeId === 'opencode' && await selectedProviderUsesOpenCodeV2()
     if (input.method === 'oauth') {
+      if (selectedV2) return connectOpenCodeV2Provider({ ...input, providerId })
       return this.connectProviderWithOAuth(input, observer)
     }
 
@@ -5115,6 +5123,8 @@ export class OpenCodeProviderManagementAdapter
     if (curatedSubscriptionKeyError) {
       return providerManagementError('auth-required', curatedSubscriptionKeyError)
     }
+
+    if (selectedV2) return connectOpenCodeV2Provider({ ...input, providerId, apiKey })
 
     return this.withManagedOpenCodeClient(
       input.runtimeId,
@@ -5669,6 +5679,8 @@ export class OpenCodeProviderManagementAdapter
         `Model id must be scoped to provider ${providerId}`,
       )
     }
+
+    if (input.runtimeId === 'opencode' && await selectedProviderUsesOpenCodeV2()) return testOpenCodeV2ProviderModel({ ...input, providerId, modelId })
 
     return this.withManagedOpenCodeClient(
       input.runtimeId,

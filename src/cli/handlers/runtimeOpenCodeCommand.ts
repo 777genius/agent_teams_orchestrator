@@ -4,6 +4,7 @@ import { readFile } from 'node:fs/promises'
 import { drainStartupTaskkills } from '../../utils/processKill.js'
 
 import { executeOpenCodeBridgeCommandEnvelope } from '../../services/opencode/OpenCodeBridgeCommandHandler.js'
+import { executeSelectedOpenCodeBridgeCommandEnvelope } from '../../services/opencode/bridge/OpenCodeV2TeamBridge.js'
 import { openCodeHostManager } from '../../services/opencode/OpenCodeHostManager.js'
 import { openCodeSessionStore } from '../../services/opencode/OpenCodeSessionStore.js'
 import { writeFileAtomic } from '../../utils/atomicWrite.js'
@@ -105,7 +106,8 @@ export async function runtimeOpenCodeCommand(opts: {
   output?: string
 }, deps: RuntimeOpenCodeCommandDeps = {}): Promise<void> {
   const readInput = deps.readInput ?? (path => readFile(path, 'utf8'))
-  const executeEnvelope = deps.executeEnvelope ?? executeOpenCodeBridgeCommandEnvelope
+  const executeEnvelope = deps.executeEnvelope ?? ((input: unknown, options: { signal?: AbortSignal }) =>
+    executeSelectedOpenCodeBridgeCommandEnvelope(input, value => executeOpenCodeBridgeCommandEnvelope(value, options)))
   const writePayload = deps.writePayload ?? (async (commandOpts, payload) => {
     if (commandOpts.output?.trim()) {
       await writeOutputFileAtomically(commandOpts.output.trim(), payload)

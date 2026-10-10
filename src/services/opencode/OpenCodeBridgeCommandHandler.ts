@@ -1,3 +1,5 @@
+import { parseOpenCodePromptFileParts, SUPPORTED_COMMANDS, validateEnvelope, type BridgeEnvelope } from './bridge/OpenCodeBridgeProtocol.js'
+import { openCodeDeliveryJournalRecoveryData, teamDiagnosticToOutcomeString, commandStatusFromOutcomeStatus, isAcceptedOutcomeStatus, outcomeSendMessageDataToCommandData, commandStatusMismatchReason, type CommandStatusCommandData, markSendMessageOutcome, type SendMessageCommandData, type SendMessageOutcomeBase, type TeamDiagnostic } from './bridge/OpenCodeBridgeDeliveryJournal.js'
 import { drainStartupTaskkills, pendingStartupTaskkillPids } from '../../utils/processKill.js'
 import { OpenCodeStartupCleanupBudget } from './OpenCodeStartupCleanupBudget.js'
 import type { OpenCodeOAuthNativeProbeOwner } from './OpenCodeAuthStore.js'
@@ -78,9 +80,10 @@ import { normalizeOpenCodeSessionStatus } from './OpenCodeEventTranslator.js'
 import { openCodeOfflineSessionReader } from './OpenCodeOfflineSessionReader.js'
 import {
   isOpenCodeStrictSessionCompatible,
-  openCodeSessionBridge,
+  openCodeSessionBridge as v1OpenCodeSessionBridge,
 } from './OpenCodeSessionBridge.js'
-import type { OpenCodePromptPart } from './OpenCodeSessionBridge.js'
+import type { OpenCodeSessionSemanticPorts } from './bridge/OpenCodeRuntimeAdapterFactory.js'
+
 import { isOpenCodeSessionStopped, openCodeSessionStore, type MaterializationOwnerToken } from './OpenCodeSessionStore.js'
 import {
   coordinateStrictLaunch,
@@ -106,10 +109,7 @@ import {
 } from './OpenCodeLedgerBridgeService.js'
 import {
   openCodeCommandOutcomeStore,
-  type OpenCodeCommandOutcomePatch,
   type OpenCodeCommandOutcomeRecord,
-  type OpenCodeCommandOutcomeSendMessageData,
-  type OpenCodeCommandOutcomeStatus,
 } from './OpenCodeCommandOutcomeStore.js'
 import {
   getClaudeConfigHomeDir,
@@ -131,6 +131,8 @@ import type {
   OpenCodeSessionReconcileSummary,
   OpenCodeToolApprovalMode,
 } from './types.js'
+
+const openCodeSessionBridge: OpenCodeSessionSemanticPorts = v1OpenCodeSessionBridge
 
 const BRIDGE_SCHEMA_VERSION = 1
 // Manifest high watermarks are owned by the desktop app's runtime store. The
@@ -158,51 +160,9 @@ const OPENCODE_MESSAGE_SEND_TOOL_ERROR_FALLBACK_GRACE_ENV =
 const OPEN_CODE_TEAMMATE_AGENT = 'teammate'
 const OPEN_CODE_TEAMMATE_BOOTSTRAP_AGENT = 'teammate-bootstrap'
 const ELECTRON_RUN_AS_NODE_ENV = 'ELECTRON_RUN_AS_NODE'
-const SUPPORTED_OPENCODE_PROMPT_FILE_MIME_TYPES = new Set([
-  'image/png',
-  'image/jpeg',
-  'image/webp',
-  'video/mp4',
-  'video/webm',
-  'video/quicktime',
-])
-
 function resolveLaunchToolApprovalMode(body: Record<string, unknown>): OpenCodeToolApprovalMode {
   return body.skipPermissions === false ? 'manual' : 'auto'
 }
-const SUPPORTED_COMMANDS = [
-  'opencode.handshake',
-  'opencode.commandStatus',
-  'opencode.stopOutcome',
-  'opencode.reconcileStop',
-  'opencode.readiness',
-  'opencode.cleanupHosts',
-  'opencode.cleanupStartupHosts',
-  'opencode.reapUnleasedCursorAgentTrees',
-  'opencode.launchTeam',
-  'opencode.reconcileTeam',
-  'opencode.stopTeam',
-  'opencode.sendMessage',
-  'opencode.observeMessageDelivery',
-  'opencode.answerPermission',
-  'opencode.listRuntimePermissions',
-  'opencode.getRuntimeTranscript',
-  'opencode.backfillTaskLedger',
-  'opencode.recoverDeliveryJournal',
-] as const
-
-type BridgeCommandName = typeof SUPPORTED_COMMANDS[number]
-
-type BridgeEnvelope = {
-  schemaVersion: 1
-  requestId: string
-  command: BridgeCommandName
-  cwd: string
-  startedAt: string
-  timeoutMs: number
-  body: Record<string, unknown>
-}
-
 type BridgeDiagnosticEvent = {
   type: string
   providerId: 'opencode'
@@ -210,12 +170,6 @@ type BridgeDiagnosticEvent = {
   message: string
   data?: Record<string, unknown>
   createdAt: string
-}
-
-type TeamDiagnostic = {
-  code: string
-  severity: 'info' | 'warning' | 'error'
-  message: string
 }
 
 type TeamWarning = {
@@ -253,45 +207,6 @@ type OpenCodeAppManagedBootstrapCandidate = {
   agent?: string
 }
 
-type SendMessageCommandData = {
-  accepted: boolean
-  runId?: string
-  sessionId?: string
-  memberName: string
-  runtimePid?: number
-  prePromptCursor?: string | null
-  runtimePromptMessageId?: string
-  snapshotBoundary?: OpenCodeSnapshotBoundary
-  responseObservation?: OpenCodeDeliveryResponseObservation
-  diagnostics: TeamDiagnostic[]
-  idempotencyKey?: string
-  manifestHighWatermark?: number | null
-  runtimeStoreManifestHighWatermark?: number | null
-}
-
-type CommandStatusCommandData = {
-  status:
-    | 'unknown'
-    | 'received'
-    | 'prompt_submitting'
-    | 'prompt_accepted'
-    | 'turn_observed'
-    | 'reconciled'
-    | 'failed_before_accept'
-    | 'failed_after_accept'
-    | 'precondition_mismatch'
-  safeToRetry: boolean
-  accepted: boolean
-  originalRequestId?: string
-  deliveryAttemptId?: string
-  sessionId?: string
-  runtimePid?: number
-  runtimePromptMessageId?: string
-  prePromptCursor?: string | null
-  sendMessageData?: SendMessageCommandData
-  diagnostics: string[]
-}
-
 type ObserveMessageDeliveryCommandData = {
   observed: boolean
   sessionId?: string
@@ -303,177 +218,9 @@ type ObserveMessageDeliveryCommandData = {
   diagnostics: TeamDiagnostic[]
 }
 
-type SendMessageOutcomeBase = {
-  requestId: string
-  body: Record<string, unknown>
-  teamId: string
-  teamName: string
-  laneId: string
-  memberName: string
-  projectPath: string
-  runId: string | null
-}
-
-function teamDiagnosticToOutcomeString(diagnostic: TeamDiagnostic): string {
-  return `${diagnostic.code}: ${diagnostic.message}`
-}
-
-function toOutcomeSendMessageData(data: SendMessageCommandData): OpenCodeCommandOutcomeSendMessageData | undefined {
-  if (data.accepted !== true) {
-    return undefined
-  }
-  return {
-    accepted: true,
-    ...(data.sessionId ? { sessionId: data.sessionId } : {}),
-    memberName: data.memberName,
-    ...(typeof data.runtimePid === 'number' && data.runtimePid > 0
-      ? { runtimePid: data.runtimePid }
-      : {}),
-    ...(data.prePromptCursor !== undefined ? { prePromptCursor: data.prePromptCursor } : {}),
-    ...(data.runtimePromptMessageId ? { runtimePromptMessageId: data.runtimePromptMessageId } : {}),
-    ...(data.responseObservation ? { responseObservation: data.responseObservation } : {}),
-    diagnostics: data.diagnostics,
-  }
-}
-
-async function markSendMessageOutcome(
-  base: SendMessageOutcomeBase,
-  input: {
-    status: OpenCodeCommandOutcomeStatus
-    definitelyUnsubmitted?: { runtimePromptMessageId: string }
-    sessionId?: string | null
-    runtimePid?: number | null
-    prePromptCursor?: string | null
-    runtimePromptMessageId?: string | null
-    acceptedAt?: string | null
-    turnObservedAt?: string | null
-    completedAt?: string | null
-    error?: string | null
-    diagnostics?: string[]
-    sendMessageData?: SendMessageCommandData
-  },
-): Promise<void> {
-  const patch: OpenCodeCommandOutcomePatch = {
-    requestId: base.requestId,
-    status: input.status,
-    teamId: base.teamId,
-    teamName: base.teamName,
-    laneId: base.laneId,
-    memberName: base.memberName,
-    projectPath: base.projectPath,
-    runId: base.runId,
-    deliveryAttemptId: asString(base.body.deliveryAttemptId) ?? undefined,
-    messageId: asString(base.body.messageId),
-    payloadHash: asString(base.body.payloadHash),
-    sessionId: input.sessionId ?? undefined,
-    runtimePid: input.runtimePid ?? undefined,
-    prePromptCursor: input.prePromptCursor ?? undefined,
-    runtimePromptMessageId: input.runtimePromptMessageId ?? undefined,
-    acceptedAt: input.acceptedAt ?? undefined,
-    turnObservedAt: input.turnObservedAt ?? undefined,
-    completedAt: input.completedAt ?? undefined,
-    error: input.error ?? undefined,
-    diagnostics: input.diagnostics,
-    sendMessageData: input.sendMessageData ? toOutcomeSendMessageData(input.sendMessageData) : undefined,
-  }
-  // OutcomeStore owns the locked identity check and durable transition. Older
-  // stores ignore this option and conservatively retain prompt_submitting.
-  const options = {
-    requireRetryable: input.status === 'received' || input.status === 'prompt_submitting',
-    ...(input.definitelyUnsubmitted ? { definitelyUnsubmitted: input.definitelyUnsubmitted } : {}),
-  }
-  await openCodeCommandOutcomeStore.upsert(patch, options)
-}
-
-function commandStatusFromOutcomeStatus(
-  status: OpenCodeCommandOutcomeStatus,
-): CommandStatusCommandData['status'] {
-  if (
-    status === 'received' ||
-    status === 'preconditions_checked' ||
-    status === 'session_resolved' ||
-    status === 'mcp_ready'
-  ) {
-    return 'received'
-  }
-  return status
-}
-
-function isAcceptedOutcomeStatus(status: CommandStatusCommandData['status']): boolean {
-  return (
-    status === 'prompt_accepted' ||
-    status === 'turn_observed' ||
-    status === 'reconciled' ||
-    status === 'failed_after_accept'
-  )
-}
-
-function outcomeSendMessageDataToCommandData(
-  data: OpenCodeCommandOutcomeSendMessageData | undefined,
-): SendMessageCommandData | undefined {
-  if (!data) {
-    return undefined
-  }
-  return {
-    accepted: true,
-    ...(data.sessionId ? { sessionId: data.sessionId } : {}),
-    memberName: data.memberName,
-    ...(typeof data.runtimePid === 'number' && data.runtimePid > 0
-      ? { runtimePid: data.runtimePid }
-      : {}),
-    ...(data.prePromptCursor !== undefined ? { prePromptCursor: data.prePromptCursor } : {}),
-    ...(data.runtimePromptMessageId ? { runtimePromptMessageId: data.runtimePromptMessageId } : {}),
-    ...(data.responseObservation ? { responseObservation: data.responseObservation } : {}),
-    diagnostics: data.diagnostics,
-  }
-}
-
 function messageMatchesRuntimePromptId(message: OpenCodeMessage, runtimePromptMessageId: string): boolean {
   const info = asRecord(message.info)
   return asString(info?.id) === runtimePromptMessageId && asString(info?.role) === 'user'
-}
-
-function commandStatusMismatchReason(
-  record: OpenCodeCommandOutcomeRecord,
-  body: Record<string, unknown>,
-): string | null {
-  const expectedCommand = asString(body.originalCommand)
-  if (expectedCommand && expectedCommand !== 'opencode.sendMessage') {
-    return 'originalCommand mismatch'
-  }
-  const teamId = asString(body.teamId)
-  if (teamId && teamId !== record.teamId) {
-    return 'teamId mismatch'
-  }
-  const teamName = asString(body.teamName)
-  if (teamName && teamName !== record.teamName) {
-    return 'teamName mismatch'
-  }
-  const laneId = asString(body.laneId)
-  if (laneId && laneId !== record.laneId) {
-    return 'laneId mismatch'
-  }
-  const memberName = asString(body.memberName)
-  if (memberName && memberName !== record.memberName) {
-    return 'memberName mismatch'
-  }
-  const messageId = asString(body.messageId)
-  if (messageId && messageId !== record.messageId) {
-    return 'messageId mismatch'
-  }
-  const payloadHash = asString(body.payloadHash)
-  if (payloadHash && payloadHash !== record.payloadHash) {
-    return 'payloadHash mismatch'
-  }
-  const projectPath = asString(body.projectPath)
-  if (projectPath && projectPath !== record.projectPath) {
-    return 'projectPath mismatch'
-  }
-  const runId = asString(body.runId)
-  if (runId && runId !== record.runId) {
-    return 'runId mismatch'
-  }
-  return null
 }
 
 async function findPromptAcceptedEvidenceReadOnly(input: {
@@ -683,40 +430,6 @@ function asStringArray(value: unknown): string[] {
     : []
 }
 
-function parseOpenCodePromptFileParts(value: unknown): OpenCodePromptPart[] {
-  if (value === undefined || value === null) {
-    return []
-  }
-  if (!Array.isArray(value)) {
-    throw new Error('OpenCode attachment parts must be an array.')
-  }
-
-  return value.map((item, index): OpenCodePromptPart => {
-    const record = asRecord(item)
-    if (!record || record.type !== 'file') {
-      throw new Error(`OpenCode attachment part at index ${index} must be a file part.`)
-    }
-    const mime = asString(record.mime)
-    const url = asString(record.url)
-    const filename = asString(record.filename)
-    if (!mime || !url || !filename) {
-      throw new Error(`OpenCode file part at index ${index} is missing mime, url, or filename.`)
-    }
-    if (!SUPPORTED_OPENCODE_PROMPT_FILE_MIME_TYPES.has(mime)) {
-      throw new Error(`OpenCode file part at index ${index} has unsupported MIME: ${mime}`)
-    }
-    if (!url.startsWith(`data:${mime};base64,`)) {
-      throw new Error(`OpenCode file part at index ${index} must use a matching data URL.`)
-    }
-    return {
-      type: 'file',
-      mime,
-      url,
-      filename,
-    }
-  })
-}
-
 function assertUniqueOpenCodeMemberNames(items: unknown[], context: string): void {
   const seen = new Set<string>()
   for (const [index, item] of items.entries()) {
@@ -779,7 +492,7 @@ function getOpenCodeSessionCompatibilityStaleReason(record: OpenCodeSessionRecor
     : 'app_managed_bootstrap_message_id_not_opencode_sortable'
 }
 
-function buildOpenCodeAppManagedBootstrapContextText(input: {
+export function buildOpenCodeAppManagedBootstrapContextText(input: {
   teamName: string
   memberName: string
   runId: string
@@ -1065,10 +778,12 @@ async function probeStoredLaneAuthority(
     && authorityRecords.some(isOpenCodeSessionStopped)) {
     throw new Error('OpenCode delivery lane is stopped; launch a new run')
   }
+  const firstAuthority = authorityRecords[0]
+  if (!firstAuthority) throw new Error('OpenCode lifecycle selected run authority is unavailable')
   const projectPath = await canonicalizeOpenCodeProjectPath(asString(body.projectPath) ?? envelope.cwd)
-  const selectedModel = parseOpenCodeProviderScopedModelRef(authorityRecords[0].selectedModel)
-  const mode = authorityRecords[0].toolApprovalMode
-  const scope = authorityRecords[0].profileScope
+  const selectedModel = parseOpenCodeProviderScopedModelRef(firstAuthority.selectedModel)
+  const mode = firstAuthority.toolApprovalMode
+  const scope = firstAuthority.profileScope
   if (!selectedModel || scope?.purpose !== 'launch_runtime'
     || (mode !== 'auto' && mode !== 'manual')) {
     throw new Error('OpenCode lifecycle selected lane scope is unavailable')
@@ -1096,14 +811,14 @@ async function probeStoredLaneAuthority(
     // Pre-fix Cursor records lack the receipt, but the desktop persists the
     // original launch capability. Preserve that exact capability for cleanup.
     const legacyCursor = selectedModel.providerId === 'cursor-acp' && !allHaveReceipt
-    const legacyVersion = authorityRecords[0].opencodeVersion ?? null
+    const legacyVersion = firstAuthority.opencodeVersion ?? null
     const runtime: ConfirmedStopRuntime = legacyCursor ? {
       providerId: 'opencode', binaryPath: 'opencode', version: legacyVersion,
       binaryFingerprint: legacyVersion ? `version:${legacyVersion}` : null,
       capabilitySnapshotId: await readOpenCodeLegacyStopCapability({
         teamsPath: getTeamsDir(), teamId, laneId, runId,
       }),
-    } : authorityRecords[0].stopAuthority!.runtime
+    } : firstAuthority.stopAuthority!.runtime
     if (runtime.providerId !== 'opencode'
       || !/^opencode:[a-f0-9]{32}$/.test(runtime.capabilitySnapshotId)
       || authorityRecords.some(record => !/^[a-f0-9]{64}$/.test(record.expectedBehaviorFingerprint ?? '')
@@ -1129,7 +844,7 @@ async function probeStoredLaneAuthority(
       release: async () => {},
     }
   }
-  const existingHostKey = authorityRecords[0].hostKey
+  const existingHostKey = firstAuthority.hostKey
   if (!existingHostKey || authorityRecords.some(record => record.hostKey !== existingHostKey)) {
     throw new Error('OpenCode lifecycle lane host authority is ambiguous')
   }
@@ -1144,14 +859,14 @@ async function probeStoredLaneAuthority(
     // recover that receipt and verify live selected authority in SessionBridge
     // before arming the next prompt under the OAuth publication lock.
     const ownerChecks: Array<() => Promise<void>> = []
-    let snapshot = buildSendMessageStoredSessionSnapshot(projectPath, authorityRecords[0])
+    let snapshot = buildSendMessageStoredSessionSnapshot(projectPath, firstAuthority)
     for (const record of authorityRecords) {
       if (!record.opencodeVersion || !record.managedConfigFingerprint
         || record.resolvedBehaviorFingerprint !== record.managedConfigFingerprint
         || !/^[a-f0-9]{64}$/.test(record.expectedBehaviorFingerprint ?? '')
-        || record.opencodeVersion !== authorityRecords[0].opencodeVersion
-        || record.managedConfigFingerprint !== authorityRecords[0].managedConfigFingerprint
-        || record.projectBehaviorFingerprint !== authorityRecords[0].projectBehaviorFingerprint) {
+        || record.opencodeVersion !== firstAuthority.opencodeVersion
+        || record.managedConfigFingerprint !== firstAuthority.managedConfigFingerprint
+        || record.projectBehaviorFingerprint !== firstAuthority.projectBehaviorFingerprint) {
         throw new Error('OpenCode observation launch authority is unavailable')
       }
       await openCodeSessionBridge.withOwnedOAuthSessionObservation(record, async ({ baseUrl }, assertOwner) => {
@@ -1256,7 +971,7 @@ async function withStoredLaneAuthority<T>(
   }
 }
 
-function createBridgeServerIdentity(
+export function createBridgeServerIdentity(
   snapshot?: OpenCodeProvisioningSnapshot | null,
   overrides: { runtimeStoreManifestHighWatermark?: number | null; confirmedStopRuntime?: ConfirmedStopRuntime; deliveryRuntime?: ReturnType<typeof createRuntimeSnapshot> } = {},
 ) {
@@ -1515,41 +1230,6 @@ function failure(
       ...(details ? { details } : {}),
     },
     diagnostics,
-  }
-}
-
-function validateEnvelope(input: unknown): BridgeEnvelope {
-  const envelope = asRecord(input)
-  if (!envelope) {
-    throw new Error('Bridge envelope must be an object')
-  }
-  if (envelope.schemaVersion !== BRIDGE_SCHEMA_VERSION) {
-    throw new Error('Unsupported bridge schemaVersion')
-  }
-  const command = asString(envelope.command)
-  if (!command || !SUPPORTED_COMMANDS.includes(command as BridgeCommandName)) {
-    throw new Error(`Unsupported bridge command: ${String(envelope.command)}`)
-  }
-  const requestId = asString(envelope.requestId)
-  const cwd = asString(envelope.cwd)
-  const startedAt = asString(envelope.startedAt)
-  const body = asRecord(envelope.body)
-  if (!requestId || !cwd || !startedAt || !body) {
-    throw new Error('Bridge envelope missing requestId, cwd, startedAt or body')
-  }
-  if (typeof envelope.timeoutMs === 'number' && !Number.isFinite(envelope.timeoutMs)) {
-    throw new Error('Bridge envelope timeoutMs must be finite')
-  }
-  return {
-    schemaVersion: BRIDGE_SCHEMA_VERSION,
-    requestId,
-    command: command as BridgeCommandName,
-    cwd,
-    startedAt,
-    timeoutMs: typeof envelope.timeoutMs === 'number' && envelope.timeoutMs > 0
-      ? envelope.timeoutMs
-      : 0,
-    body,
   }
 }
 
@@ -1844,7 +1524,7 @@ async function proveAppMcpToolsFromLaunchConfig(
     return raceOpenCodeAbortSignal(inFlight, phaseContext?.signal)
   }
 
-  let proofPromise: Promise<AppMcpToolProof>
+  let proofPromise: Promise<AppMcpToolProof> | undefined
   proofPromise = (async () => {
     try {
       const observedTools = await listAppMcpToolsFromResolvedLaunchConfig(
@@ -2795,36 +2475,36 @@ async function runReadiness(
     phase: 'host_start' | 'post_probe_refresh',
     options: Parameters<typeof openCodeProvisioningProbe.probe>[1],
   ): Promise<OpenCodeProvisioningSnapshot> => {
-    let pending: Promise<OpenCodeProvisioningSnapshot> | null = null
+    const pending: { value: Promise<OpenCodeProvisioningSnapshot> | null } = { value: null }
     try {
       return await runtimeDeadline.runPhase(phase, context => {
-        pending = openCodeProvisioningProbe.probe(projectPath, {
+        pending.value = openCodeProvisioningProbe.probe(projectPath, {
           ...options,
           phaseContext: context,
         })
-        return pending
+        return pending.value
       })
     } catch (error) {
-      if (isOpenCodeRuntimeDeadlineError(error) && pending) {
-        await withTimeout(pending.catch(() => undefined), 5_000).catch(() => undefined)
+      if (isOpenCodeRuntimeDeadlineError(error) && pending.value) {
+        await withTimeout(pending.value.catch(() => undefined), 5_000).catch(() => undefined)
       }
       throw error
     }
   }
   const runDirectToolProof = async (preparedHost?: OpenCodeHostHandle): Promise<AppMcpToolProof> => {
-    let pending: Promise<AppMcpToolProof> | null = null
+    const pending: { value: Promise<AppMcpToolProof> | null } = { value: null }
     try {
       return await runtimeDeadline.runPhase('mcp_preflight', context => {
         context.throwIfExpired()
-        pending = proveAppMcpToolsFromLaunchConfig(context, preparedHost)
-        return pending.then(proof => {
+        pending.value = proveAppMcpToolsFromLaunchConfig(context, preparedHost)
+        return pending.value.then(proof => {
           context.throwIfExpired()
           return proof
         })
       })
     } catch (error) {
-      if (isOpenCodeRuntimeDeadlineError(error) && pending) {
-        await withTimeout(pending.catch(() => undefined), 5_000).catch(() => undefined)
+      if (isOpenCodeRuntimeDeadlineError(error) && pending.value) {
+        await withTimeout(pending.value.catch(() => undefined), 5_000).catch(() => undefined)
       }
       throw error
     }
@@ -2849,6 +2529,7 @@ async function runReadiness(
       }
       assertOpenCodeLaunchRuntimeAvailable(retained.snapshot)
       if (!retained.host) throw new Error('OpenCode readiness retained host is unavailable')
+      const retainedHost = retained.host
       const selectedAccess = evaluateOpenCodeModelAccess({
         selectedModel: qualifiedSelectedModel.raw,
         catalog: getOpenCodeAccessPolicyCatalog(retained.snapshot),
@@ -2909,7 +2590,7 @@ async function runReadiness(
         authorityDiagnostic = describeAuthorityRejection(diagnostic)
       }
       const refreshedBefore = await runtimeDeadline.runPhase('post_probe_refresh', phaseContext => openCodeProvisioningProbe.refreshSelectedProfileAuthority({
-        host: retained.host,
+        host: retainedHost,
         selectedModel: qualifiedSelectedModel.raw,
         expectedBehaviorFingerprint: initialEvidence.expectedBehaviorFingerprint,
         contractConfigIdentity: toolProof.contractConfigIdentity,
@@ -2924,13 +2605,13 @@ async function runReadiness(
       // races Ollama/llama.cpp locks the same way launch used to.
       const executionOutcome = await openCodeExecutionProbe.probeModelOnHost({
         onOwnedOAuthProbeSuccess: owner => { completedOAuthProbe = owner },
-        host: retained.host,
+        host: retainedHost,
         selectedModel: qualifiedSelectedModel.raw,
         runtimeDeadline,
         cleanupSuccessfulSession: true,
       })
       const refreshedAfter = await runtimeDeadline.runPhase('post_probe_refresh', phaseContext => openCodeProvisioningProbe.refreshSelectedProfileAuthority({
-        host: retained.host,
+        host: retainedHost,
         selectedModel: qualifiedSelectedModel.raw,
         completedOAuthProbe: executionOutcome.outcome === 'available'
           && executionOutcome.observedProviderId === qualifiedSelectedModel.providerId
@@ -2990,7 +2671,7 @@ async function runReadiness(
   let earlyCursorExecutionOutcome: Awaited<ReturnType<
     typeof openCodeExecutionProbe.probeModel
   >> | undefined
-  const parsedSelectedModel = qualifiedSelectedModel
+  const parsedSelectedModel = parseOpenCodeProviderScopedModelRef(selectedModel)
   const openCodeBinaryPath = shouldProbeSelectedModel
     && parsedSelectedModel?.providerId === 'cursor-acp'
     ? resolveOpenCodeBinaryPath()
@@ -3367,6 +3048,7 @@ async function markStaleAndReleaseSession(
   diagnosticPrefix: string,
 ): Promise<TeamDiagnostic[]> {
   const diagnostics: TeamDiagnostic[] = []
+  if (!record.laneId) throw new Error('OpenCode stale session lane authority is unavailable')
   try {
     const updated = await openCodeSessionStore.markStale(
       record.teamId,
@@ -3768,10 +3450,10 @@ async function runLaunch(
         apiSelectedModel,
         getOpenCodeAccessPolicyCatalog(snapshot),
       )
-      const runtimeDeadline = {
+      const runtimeDeadline: Pick<OpenCodeRuntimeDeadline, 'signal' | 'remainingMs' | 'throwIfExpired' | 'runPhase'> = {
         signal,
         remainingMs,
-        throwIfExpired: phase => phaseContext(phase).throwIfExpired(),
+        throwIfExpired: (phase = 'host_start') => phaseContext(phase).throwIfExpired(),
         runPhase: (phase, operation) => operation(phaseContext(phase)),
       }
       // Local models still accept inexact output, but proof stays on this
@@ -5240,7 +4922,7 @@ async function runSendMessage(
         diagnostics: diagnostics.map(teamDiagnosticToOutcomeString),
       })
       return {
-        snapshot, deliveryRuntime: authority?.deliveryRuntime,
+        snapshot,
         data: {
           accepted: false,
           sessionId: deliveryRecord.opencodeSessionId,
@@ -6370,10 +6052,7 @@ async function handleEnvelope(
       const snapshot = await openCodeProvisioningProbe.probe(envelope.cwd)
       return {
         snapshot,
-        data: {
-          recovered: false,
-          diagnostics: ['Delivery journal recovery is currently app-owned; no orchestrator repair was required.'],
-        },
+        data: openCodeDeliveryJournalRecoveryData(),
       }
     }
   }

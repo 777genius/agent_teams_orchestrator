@@ -1,4 +1,5 @@
-import type { OpenCodeModelRouteMetadata } from '../opencode/OpenCodeModelAccessPolicy.js'
+import type { OpenCodeModelRouteMetadata } from '../opencode/OpenCodeModelRouteTypes.js'
+import type { OpenCodeV2ReadStatus } from '../opencode/catalog/OpenCodeV2ReadStatus.js'
 
 export type RuntimeProviderId = 'anthropic' | 'codex' | 'gemini' | 'opencode'
 
@@ -182,6 +183,7 @@ export type RuntimeStatusCheckErrorCode =
   | 'partial_response'
 
 export type RuntimeProviderStatus = {
+  openCodeReadStatus?: OpenCodeV2ReadStatus
   providerId: RuntimeProviderId
   displayName: string
   supported: boolean

@@ -1,4 +1,6 @@
 import { readOpenCodeBoundedHttpResponse } from './OpenCodeBoundedHttpResponse.js'
+import type { OpenCodeClientRequestContext } from './OpenCodeClientRequestContext.js'
+export type { OpenCodeClientRequestContext } from './OpenCodeClientRequestContext.js'
 import type {
   OpenCodeAgentResponse,
   OpenCodeApiAuthInput,
@@ -93,13 +95,6 @@ export type OpenCodeClient = {
     },
   ): Promise<void>
   abortSession(id: string): Promise<boolean>
-}
-
-export type OpenCodeClientRequestContext = {
-  signal?: AbortSignal
-  remainingMs?: () => number
-  /** O0 final/fallback reads: bounded pages, status and interactions before parsing. */
-  boundedReconciliation?: boolean
 }
 
 type OpenCodeClientFactoryDeps = {
