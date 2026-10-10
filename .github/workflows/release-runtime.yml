@@ -229,7 +229,10 @@ jobs:
           node-version: '24'
 
       - name: Verify compiled runtime (Windows)
-        timeout-minutes: 12
+        # Staging four portable deliveries consumes most of the Windows step;
+        # retain room for strict teardown and provider checks. Native deadlines
+        # remain enforced by the smoke harness.
+        timeout-minutes: 20
         if: runner.os == 'Windows' && matrix.platform == 'win32-x64'
         shell: pwsh
         run: |
