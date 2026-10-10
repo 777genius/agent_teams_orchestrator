@@ -55,8 +55,11 @@ describe('V2 semantic control adapter', () => {
         return { kind: 'stop', state: 'cleanup_unknown', members: [] }
       },
     })
-    await bridge.call({ operation: 'stop' }, 5000)
-    expect(budgets).toEqual([5000])
+    const now = spyOn(Date, 'now').mockReturnValue(Date.now())
+    try {
+      await bridge.call({ operation: 'stop' }, 5000)
+      expect(budgets).toEqual([5000])
+    } finally { now.mockRestore() }
   })
   for (const operation of ['send', 'stop'] as const) for (const timeoutMs of [1000, 500]) test(`${operation} preserves the caller ${timeoutMs}ms deadline across owner discovery`, async () => {
     let clock = 1000, requests = 0

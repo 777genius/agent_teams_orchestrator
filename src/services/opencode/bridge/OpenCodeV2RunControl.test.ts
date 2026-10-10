@@ -1,11 +1,11 @@
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, test, spyOn } from 'bun:test'
 import { spawn, execFile, type ChildProcess } from 'node:child_process'
 import { promisify } from 'node:util'
 import { mkdtemp, rm, readFile, rename, chmod, writeFile, mkdir, symlink, lstat } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { discoverOpenCodeV2Run, awaitOpenCodeV2RunMemberReadiness, parseRunControlRequest, requestOpenCodeV2Run, reserveRunControlDirectory, serveOpenCodeV2RunControl } from './OpenCodeV2RunControl.js'
+import { discoverOpenCodeV2Run, awaitOpenCodeV2RunMemberReadiness, parseRunControlRequest, requestOpenCodeV2Run, reserveRunControlDirectory, serveOpenCodeV2RunControl, writeRunControlFile } from './OpenCodeV2RunControl.js'
 import { boundOpenCodeRead } from '../transport/OpenCodeBoundedFetch.js'
 
 const peer = fileURLToPath(new URL('./fixtures/OpenCodeV2RunControlPeer.ts', import.meta.url))
@@ -85,6 +85,36 @@ describe('private run control with separate synthetic CLI processes', () => {
       if (record) await expect(requestOpenCodeV2Run(record, { operation: 'status' }, 1000)).rejects.toThrow()
     } finally { await Promise.all([stopTestChild(owner), stopTestChild(foreign)]); await rm(parent, { recursive: true, force: true }) }
   }, 120_000)
+  for (const archiveDelayMs of [250, 10_001]) test(`stop archive reads retain the caller deadline after ${archiveDelayMs}ms`, async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'TEST-stop-archive-deadline-'))
+    const directory = await reserveRunControlDirectory(root, binding, 'a'.repeat(64))
+    const origin = Date.now()
+    let clock = origin, calls = 0, signedDeadline: number | undefined
+    const control = await serveOpenCodeV2RunControl(directory, binding, origin + 5000, 'a'.repeat(64),
+      async (_request, deadline) => { calls++; signedDeadline = deadline; throw new Error('TEST_stop_observed') })
+    await writeRunControlFile(directory, 'tombstone.json', { binding })
+    await writeRunControlFile(directory, 'stop.json', { binding, receipt: { kind: 'stop', state: 'cleanup_unknown', members: [] } })
+    const now = spyOn(Date, 'now').mockImplementation(() => clock)
+    try {
+      const pending = requestOpenCodeV2Run(control.record, { operation: 'stop' }, 10_000)
+      // The public request is now awaiting real archive filesystem reads.
+      clock += archiveDelayMs
+      let failure: unknown
+      try { await pending } catch (error) { failure = error }
+      if (archiveDelayMs < 10_000) {
+        expect(calls).toBe(1)
+        expect(signedDeadline).toBe(origin + 10_000)
+        expect(failure).toMatchObject({ message: 'run_operation_unknown' })
+      } else {
+        expect(calls).toBe(0)
+        expect(failure).toMatchObject({ message: 'run_deadline_expired' })
+      }
+    } finally {
+      now.mockRestore()
+      await control.close()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
   test('published control waits for the same delayed native member before its sole original admission', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'TEST-r261-ready-'))
     const directory = await reserveRunControlDirectory(root, binding, 'a'.repeat(64))

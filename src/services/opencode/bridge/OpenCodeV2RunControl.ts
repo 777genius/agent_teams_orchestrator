@@ -311,12 +311,12 @@ export async function awaitOpenCodeV2RunMemberReadiness(record: RunControlRecord
 export async function requestOpenCodeV2Run(record: RunControlRecord, request: RunControlRequest, timeoutMs = MAX_OPERATION_MS): Promise<RunControlResult> {
   request = parseRunControlRequest(request)
   executionAssert(Number.isSafeInteger(timeoutMs) && timeoutMs > 0 && timeoutMs <= MAX_OPERATION_MS, 'run_control_invalid')
+  const cleanup = request.operation === 'stop' || request.operation === 'status'
+  const deadline = Math.min(Date.now() + timeoutMs, record.deadline + (cleanup ? MAX_OPERATION_MS : 0))
   if (request.operation === 'stop') {
     const archived = await readOpenCodeV2RunStop(record)
     if (archived?.ownerRetired) return archived
   }
-  const cleanup = request.operation === 'stop' || request.operation === 'status'
-  const deadline = Math.min(Date.now() + timeoutMs, record.deadline + (cleanup ? MAX_OPERATION_MS : 0))
   executionAssert(deadline > Date.now(), 'run_deadline_expired')
   await validateEndpoint(record)
   const secret = await readPrivate(path.join(record.directory, 'challenge'), record.uid)
