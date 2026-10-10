@@ -329,6 +329,7 @@ describe('native REPL approval transport', () => {
   }
 
   test('unregisters a real swarm permission callback after app-server shutdown', async () => {
+    const testDeadline = performance.now() + 5_000 // Bun's unchanged default test deadline.
     const fixture = await mkdtemp(path.join(tmpdir(), 'repl-swarm-cancellation-test-'))
     const previousConfigDir = process.env.CLAUDE_CONFIG_DIR
     const previousUserType = process.env.USER_TYPE
@@ -388,14 +389,19 @@ describe('native REPL approval transport', () => {
           .finally(() => { promptSettled = true }),
       }, fake.deps)).then(() => null, error => error as Error)
       await opened.promise
-      for (let attempt = 0; attempt < 100 && !requestId; attempt++) {
+      // The pending indicator precedes the asynchronous mailbox write. Wait for
+      // publication, yielding real timer turns, within the original test deadline.
+      while (!requestId && performance.now() < testDeadline) {
         const messages = await readMailbox('team-lead', teamName)
         const request = messages.map(message => JSON.parse(message.text) as {
           type?: string
           request_id?: string
         }).find(message => message.type === 'permission_request')
         requestId = request?.request_id
-        if (!requestId) await flushCallbacks()
+        if (!requestId) {
+          const remainingMs = testDeadline - performance.now()
+          if (remainingMs > 0) await new Promise<void>(resolve => setTimeout(resolve, Math.min(20, remainingMs)))
+        }
       }
       expect(requestId).toBeDefined()
       if (!requestId) throw new Error('Synthetic permission request missing from mailbox')

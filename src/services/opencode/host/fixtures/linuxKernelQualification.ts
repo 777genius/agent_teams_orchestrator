@@ -1,12 +1,12 @@
 // Sole producer execution exception: fresh owned synthetic Bun IPC/PID fixture.
-// Root must run with the pinned Bun. No official server/provider/build imports.
+// Run with the pinned Bun, including ordinary-user controllers. No official server/provider/build imports.
 import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { mkdir, mkdtemp, readFile, readdir, realpath, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { linuxBirth, linuxFileHash, linuxLauncherVersion, planLinuxExecution, launchLinuxExecution,
-  readLinuxProcessIdentity, isKernelRetirement, type LinuxExecutionLaunch } from '../OpenCodeV2ExecutionLauncher.js'
+  readLinuxProcessIdentity, isKernelRetirement, linuxPidfdHasExited, type LinuxExecutionLaunch } from '../OpenCodeV2ExecutionLauncher.js'
 
 const PINNED_BUN_SHA256 = '6d5bb405b1d037a2a466b92757de7e47e4369930fa94bd42f8ff44ba49de6c57'
 function assert(value: unknown, message: string): asserts value { if (!value) throw new Error(message) }
@@ -20,9 +20,11 @@ let launch: LinuxExecutionLaunch | undefined
 let sentinel: ReturnType<typeof spawn> | undefined, sentinelExit: Promise<void> | undefined
 const sentinelStderr: Buffer[] = []
 let sentinelPID: number | undefined, sentinelBirth: Awaited<ReturnType<typeof linuxBirth>> = null
+let observedInitFD: number | undefined
+let closeObservedInitFD: ((fd: number) => void) | undefined
 const receipt = () => ({ schema: 1, status, qualification: status === 'PASS' ? 'SYNTHETIC ONLY' : 'NOT RUN/BLOCKED',
   startedAt, elapsedMs: Date.now() - startedAt, maxDurationMs: 30_000,
-  controller: { executable: process.execPath, bunVersion: process.versions.bun }, failure, cleanupUnknown,
+  controller: { executable: process.execPath, bunVersion: process.versions.bun, uid: process.getuid?.() }, failure, cleanupUnknown,
   observations, nativeTests: 'NOT RUN', broadTests: 'NOT RUN', typechecks: 'NOT RUN', buildInstall: 'NOT RUN' })
 const watchdog = setTimeout(() => {
   cleanupUnknown = true; failure = 'fixture_global_deadline_cleanup_unknown'
@@ -51,6 +53,12 @@ try {
   assert(process.versions.bun === '1.3.11', 'fixture_controller_requires_pinned_Bun_1.3.11')
   const bun = { path: await realpath(process.execPath), sha256: await linuxFileHash(process.execPath) }
   assert(bun.sha256 === PINNED_BUN_SHA256, 'fixture_Bun_digest_mismatch')
+  const { dlopen, FFIType } = await import('bun:ffi')
+  const pidfds = dlopen('libc.so.6', {
+    pidfd_open: { args: [FFIType.i32, FFIType.u32], returns: FFIType.i32 },
+    close: { args: [FFIType.i32], returns: FFIType.i32 },
+  })
+  closeObservedInitFD = fd => assert(pidfds.symbols.close(fd) === 0, 'fixture_pidfd_close_failed')
   const launcherVersion = await bound(linuxLauncherVersion('/usr/bin/bwrap'), 1500)
   observations.push({ launcherVersion, launcherSha256: await linuxFileHash('/usr/bin/bwrap'), bun })
   assert(launcherVersion === 'bubblewrap 0.13.0', 'fixture_requires_pinned_bwrap_0.13.0')
@@ -97,6 +105,8 @@ try {
       'fixture_PID_namespace_mapping')
     let offspring: Awaited<ReturnType<typeof readLinuxProcessIdentity>> | undefined
     if (mode === 'normal') {
+      observedInitFD = pidfds.symbols.pidfd_open(mapping.init.hostPID, 0)
+      assert(observedInitFD >= 0 && !await linuxPidfdHasExited(observedInitFD), 'fixture_live_init_reported_retired')
       const local = JSON.parse(await readFile(path.join(directory, 'orphan.json'), 'utf8')) as Record<string, unknown>
       const taskDirs = await readdir(`/proc/${mapping.init.hostPID}/task`)
       for (const task of taskDirs) {
@@ -108,7 +118,7 @@ try {
         }
       }
       assert(offspring, 'fixture_early_doublefork_host_mapping_missing')
-      observations.push({ mode, mapping, preStartStatus: await readFile(`/proc/${mapping.bun.hostPID}/status`, 'utf8'), earlyDoublefork: offspring, survivedWorkloadProcessGroupCleanup: true })
+      observations.push({ mode, mapping, preStartStatus: await readFile(`/proc/${mapping.bun.hostPID}/status`, 'utf8'), earlyDoublefork: offspring, survivedWorkloadProcessGroupCleanup: true, liveInitPidfdNotReady: true })
     }
     if (mode === 'stop-before-start' || mode === 'deadline-before-start') {
       if (mode === 'stop-before-start') active.sendClose()
@@ -130,6 +140,11 @@ try {
     assert(isKernelRetirement(retirement) && retirement.scopeClosed === (mode !== 'wrong-closed'), 'fixture_closed_ack_qualification')
     assert(await linuxBirth(mapping.bun.hostPID) === null && await linuxBirth(supervisorPID) === null, 'fixture_Bun_supervisor_survived')
     if (offspring) assert(await linuxBirth(offspring.hostPID) === null, 'fixture_escaped_offspring_survived_kernel_retirement')
+    if (observedInitFD !== undefined) {
+      assert(await linuxPidfdHasExited(observedInitFD), 'fixture_retired_init_pidfd_not_ready')
+      closeObservedInitFD(observedInitFD); observedInitFD = undefined
+      observations.push({ mode, retiredInitPidfdReady: true })
+    }
     assert(JSON.stringify(await linuxBirth(sentinelPID)) === JSON.stringify(sentinelBirth) && sentinel.exitCode === null, 'fixture_sentinel_touched')
     await writeFile(path.join(directory, 'stdout'), active.output().stdout)
     await writeFile(path.join(directory, 'stderr'), active.output().stderr)
@@ -157,6 +172,10 @@ try {
     try { await bound(sentinelExit) } catch { cleanupUnknown = true }
   }
   if (sentinelStderr.length) await writeFile(path.join(root, 'sentinel.stderr'), Buffer.concat(sentinelStderr))
+  if (observedInitFD !== undefined) {
+    try { assert(closeObservedInitFD, 'fixture_pidfd_close_unavailable'); closeObservedInitFD(observedInitFD) }
+    catch { cleanupUnknown = true }
+  }
   clearTimeout(watchdog)
   await writeFile(path.join(root, 'receipt.json'), JSON.stringify(receipt(), null, 2) + '\n')
   console.log(JSON.stringify(receipt()))
