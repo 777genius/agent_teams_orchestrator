@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
-import { mkdtemp, readFile, rm, writeFile, mkdir } from 'fs/promises'
+import { mkdtemp, readFile, rm, writeFile, mkdir, stat } from 'fs/promises'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { GROUP_MAILBOX_SOURCE_MAX_BYTES } from './groupMailbox.js'
@@ -19,6 +19,9 @@ import {
   finalizeClaimedMessagesAsRead,
   getInboxPath,
   markMessagesAsReadByIds,
+  markMessageAsReadByIndex,
+  markMessagesAsRead,
+  markMessagesAsReadByPredicate,
   isAgentErrorNotificationMessage,
   isLegacyPlanApprovalResponseMessage,
   isPlanApprovalResponse,
@@ -121,6 +124,84 @@ describe('teammateMailbox', () => {
       process.env.CLAUDE_CONFIG_DIR = originalConfigDir
     }
     await rm(tempConfigDir, { recursive: true, force: true })
+  })
+
+  it.skipIf(process.platform === 'win32')('keeps fresh mailbox publications private under a shared umask', async () => {
+    const previousUmask = process.umask(0o002)
+    const team = 'private-publications'
+    const inboxPath = getInboxPath('alice', team)
+    const assertPrivate = async () => {
+      expect({
+        directory: (await stat(join(inboxPath, '..'))).mode & 0o777,
+        file: (await stat(inboxPath)).mode & 0o777,
+      }).toEqual({ directory: 0o700, file: 0o600 })
+    }
+    const message = {
+      messageId: 'initial',
+      from: 'team-lead',
+      text: 'bootstrap',
+      timestamp: '2026-01-01T00:00:00.000Z',
+    }
+    const append = async (messageId: string) => {
+      await writeToMailbox('alice', { ...message, messageId }, team)
+      await assertPrivate()
+    }
+    try {
+      await writeToMailboxVerified('alice', message, team)
+      await writeToMailboxVerified('alice', message, team)
+      expect(await readMailbox('alice', team)).toHaveLength(1)
+      await assertPrivate()
+
+      expect(await claimUnreadRegularMessages('alice', 'owner', team)).toHaveLength(1)
+      await assertPrivate()
+      await finalizeClaimedMessagesAsRead('alice', ['initial'], 'owner', team)
+      expect((await readMailbox('alice', team))[0]?.read).toBe(true)
+      expect((await readMailbox('alice', team))[0]?.claimedBySessionId).toBeUndefined()
+      await assertPrivate()
+
+      await append('by-id')
+      await markMessagesAsReadByIds('alice', ['by-id'], team)
+      await assertPrivate()
+      await append('predicate')
+      await markMessagesAsReadByPredicate('alice', row => row.messageId === 'predicate', team)
+      await assertPrivate()
+      await append('by-index')
+      await markMessageAsReadByIndex('alice', team, 3)
+      await assertPrivate()
+      await append('all')
+      await markMessagesAsRead('alice', team)
+      expect(await readUnreadMessages('alice', team)).toEqual([])
+      await assertPrivate()
+
+      await append('stale-bootstrap')
+      expect(await supersedeStaleLeadBootstrapMessages('alice', {
+        teamName: team,
+        beforeIso: '2026-01-02T00:00:00.000Z',
+        isBootstrapInstructionText: text => text === 'bootstrap',
+      })).toEqual(['stale-bootstrap'])
+      await assertPrivate()
+      await clearMailbox('alice', team)
+      expect(await readMailbox('alice', team)).toEqual([])
+      await assertPrivate()
+    } finally {
+      process.umask(previousUmask)
+    }
+  })
+
+  it.skipIf(process.platform === 'win32')('does not change preexisting inbox directory permissions', async () => {
+    const previousUmask = process.umask(0o002)
+    const team = 'preexisting-shared-directory'
+    const inboxPath = getInboxPath('alice', team)
+    try {
+      await mkdir(join(inboxPath, '..'), { recursive: true, mode: 0o775 })
+      await writeToMailbox('alice', {
+        messageId: 'new-message', from: 'user', text: 'preserved', timestamp: '2026-01-01T00:00:00.000Z',
+      }, team)
+      expect((await stat(join(inboxPath, '..'))).mode & 0o777).toBe(0o775)
+      expect(await readMailbox('alice', team)).toMatchObject([{ messageId: 'new-message', text: 'preserved', read: false }])
+    } finally {
+      process.umask(previousUmask)
+    }
   })
 
   it('preserves damaged group bytes through ordinary append, claim and read writers', async () => {

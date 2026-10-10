@@ -15,7 +15,7 @@ test('routine source and documentation keep Linux coverage without native jobs',
 })
 
 test('custody, process identity, startup cleanup, lifecycle, ABI and policy retain native gates', () => {
-  for (const path of ['src/services/opencode/OpenCodeBinaryResolver.ts', 'src/services/opencode/OpenCodeProvisioningProbe.ts', 'src/services/opencode/OpenCodeExecutionProof.ts', 'src/services/opencode/OpenCodeSelectedSessionAuthority.ts', 'src/services/opencode/OpenCodeCursorAgentAtomicReap.test.ts', 'src/services/opencode/OpenCodeStartupCleanup.ts', 'src/services/opencode/OpenCodeProcessAttributionStore.ts', 'src/services/opencode/recovery-contract/independent-boundaries.test.ts', 'src/utils/processKill.ts', 'src/utils/swarm/processBackend.ts', 'src/services/runtimeBackends/registry.ts', 'src/services/teamBootstrap/teamBootstrapRunner.ts', 'src/features/runtimeProviderManagement/application/connectProvider.ts', 'src/native-ts/yoga-layout/index.ts', 'src/entrypoints/cli.tsx', 'scripts/build.ts', 'package.json', 'bun.lock', 'tsconfig.json', '.github/workflows/ci.yml', 'scripts/ci/policy.test.ts', 'scripts/smoke/windows-runtime-opencode-provider-json.mjs']) {
+  for (const path of ['src/services/opencode/OpenCodeBinaryResolver.ts', 'src/services/opencode/OpenCodeProvisioningProbe.ts', 'src/services/opencode/OpenCodeExecutionProof.ts', 'src/services/opencode/OpenCodeSelectedSessionAuthority.ts', 'src/services/opencode/OpenCodeCursorAgentAtomicReap.test.ts', 'src/services/opencode/OpenCodeStartupCleanup.ts', 'src/services/opencode/OpenCodeProcessAttributionStore.ts', 'src/services/opencode/recovery-contract/independent-boundaries.test.ts', 'src/utils/processKill.ts', 'src/utils/swarm/processBackend.ts', 'src/services/runtimeBackends/registry.ts', 'src/services/teamBootstrap/teamBootstrapRunner.ts', 'src/features/runtimeProviderManagement/application/connectProvider.ts', 'src/native-ts/yoga-layout/index.ts', 'src/entrypoints/cli.tsx', 'scripts/build.ts', 'scripts/package-runtime.ts', 'scripts/runtime-bun-pins.json', 'scripts/opencode-v2/stage.ts', 'src/cli/packagedOpenCodeDelivery.ts', 'src/cli/packagedOpenCodeDelivery.test.ts', 'package.json', 'bun.lock', 'tsconfig.json', '.github/workflows/ci.yml', 'scripts/ci/policy.test.ts', 'scripts/smoke/windows-runtime-opencode-provider-json.mjs']) {
     assert.equal(classify([path]).native, 'true', path)
     assert.deepEqual(JSON.parse(classify([path]).authority_os), ['ubuntu-latest', 'windows-latest'])
   }
@@ -69,6 +69,7 @@ function needs(native = 'false') {
     'cursor-managed-plugin': { result: 'success' },
     'task-change-ledger': { result: 'success' },
     'opencode-authority': { result: 'success' },
+    'packaged-delivery': { result: native === 'true' ? 'success' : 'skipped' },
     'windows-packaged-backfill': { result: native === 'true' ? 'success' : 'skipped' },
     'opencode-conformance': { result: native === 'true' ? 'success' : 'skipped' },
   }
@@ -81,7 +82,7 @@ test('aggregate independently rejects required failures/cancellation/skips and c
       for (const result of ['failure', 'cancelled', 'skipped', 'unknown']) {
         const sample = needs(native)
         sample[job as keyof typeof sample].result = result
-        if (native === 'false' && result === 'skipped' && ['windows-packaged-backfill', 'opencode-conformance'].includes(job)) {
+        if (native === 'false' && result === 'skipped' && ['windows-packaged-backfill', 'opencode-conformance', 'packaged-delivery'].includes(job)) {
           assert.equal(aggregate(sample), 'TEST decision')
         } else assert.throws(() => aggregate(sample), `${job}/${native}/${result}`)
       }

@@ -12,6 +12,7 @@ import {
 import { dirname, join, relative, resolve } from 'path'
 import { stageCursorManagedAssets } from './cursor-plugin/stage.js'
 import { OPENCODE_V2_EXTERNALS, stageOpenCodeV2Graphs } from './opencode-v2/stage.js'
+import { validatePackagedOpenCodeIdentity } from '../src/cli/packagedOpenCodeDelivery.js'
 
 const pkg = await Bun.file(new URL('../package.json', import.meta.url)).json() as {
   name: string
@@ -22,6 +23,10 @@ const args = process.argv.slice(2)
 const compile = args.includes('--compile')
 const dev = args.includes('--dev')
 const compileTarget = process.env.BUN_COMPILE_TARGET?.trim() || 'bun'
+const portablePlatform = args.find(arg => arg.startsWith('--release-platform='))?.slice('--release-platform='.length)
+const packagedDelivery = compile && args.includes('--packaged-delivery')
+  ? validatePackagedOpenCodeIdentity(JSON.parse(readFileSync('./dist/opencode-delivery.json', 'utf8')))
+  : undefined
 
 const supportedCompileTargets = new Set([
   'bun',
@@ -204,6 +209,7 @@ const externals = [
 ]
 
 const defines = {
+  PACKAGED_OPENCODE_DELIVERY: packagedDelivery ? JSON.stringify(packagedDelivery) : 'undefined',
   'process.env.USER_TYPE': JSON.stringify('external'),
   'process.env.CLAUDE_CODE_FORCE_FULL_LOGO': JSON.stringify('true'),
   ...(dev
@@ -387,7 +393,7 @@ function publishBundleOutdir(stagingOutdir: string, finalOutdir: string): void {
 
 if (compile) {
   const cmd = extendBuildArgs([
-    'bun',
+    process.execPath,
     'build',
     './src/entrypoints/cli.tsx',
     '--compile',
@@ -411,14 +417,15 @@ if (compile) {
   }
 
   console.log(`Built ${outfile}`)
-  console.log('OpenCode V2 catalog acquisition is unsupported in compiled binaries; use the JS ./cli wrapper.')
+  console.log(packagedDelivery ? 'Packaged OpenCode commands delegate to the verified physical JS delivery.' :
+    'OpenCode V2 catalog acquisition is unsupported in compiled binaries; use the JS ./cli wrapper.')
 } else {
   const stagingOutdir = `${bundleOutdir}.staging-${process.pid}-${Date.now()}`
   rmSync(stagingOutdir, { recursive: true, force: true })
   mkdirSync(stagingOutdir, { recursive: true })
 
   const cmd = extendBuildArgs([
-    'bun',
+    process.execPath,
     'build',
     './src/entrypoints/cli.tsx',
     './src/entrypoints/opencodeV2Server.ts',
@@ -438,7 +445,8 @@ if (compile) {
   ])
 
   runBuild(cmd)
-  await stageOpenCodeV2Graphs(process.cwd(), stagingOutdir)
+  await stageOpenCodeV2Graphs(process.cwd(), stagingOutdir, { portable: args.includes('--portable-graph'),
+    platform: portablePlatform?.split('-')[0], arch: portablePlatform?.split('-')[1] })
   publishBundleOutdir(stagingOutdir, bundleOutdir)
   writeLauncher(outfile, bundleEntrypoint)
 

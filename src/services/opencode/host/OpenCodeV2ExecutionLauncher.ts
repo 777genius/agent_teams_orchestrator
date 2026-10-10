@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { constants, fstatSync } from 'node:fs'
+import { constants, fstatSync, readlinkSync } from 'node:fs'
 import { lstat, open, readFile, readlink, readdir, realpath, type FileHandle } from 'node:fs/promises'
 import path from 'node:path'
 import type { ExecutionBirth } from './OpenCodeV2ExecutionBinding.js'
@@ -25,6 +25,9 @@ async function loadLinuxPidfds() {
     kill(fd: number): boolean { return library.symbols.pidfd_send_signal(fd, 9, null, 0) === 0 },
     exited(fd: number): boolean {
       assert(Number.isSafeInteger(fd) && fd >= 0, 'cleanup_unknown')
+      let target: string | undefined
+      try { target = readlinkSync(`/proc/self/fd/${fd}`) } catch { /* Closed descriptors are UNKNOWN. */ }
+      assert(target === 'anon_inode:[pidfd]', 'cleanup_unknown')
       const pollfd = Buffer.alloc(8)
       pollfd.writeInt32LE(fd, 0); pollfd.writeInt16LE(1, 4) // POLLIN, timeout zero.
       const ready = library.symbols.poll(ptr(pollfd), 1, 0)
@@ -36,10 +39,11 @@ async function loadLinuxPidfds() {
   })
 }
 let pidfdSupport: ReturnType<typeof loadLinuxPidfds> | undefined
-const linuxPidfds = () => pidfdSupport ??= loadLinuxPidfds()
+let loadedPidfds: Awaited<ReturnType<typeof loadLinuxPidfds>> | undefined
+const linuxPidfds = () => pidfdSupport ??= loadLinuxPidfds().then(api => { loadedPidfds = api; return api })
 /** Read-only kernel observation; this cannot mint a mapping or retirement receipt. */
 export async function linuxPidfdHasExited(fd: number): Promise<boolean> {
-  return (await linuxPidfds()).exited(fd)
+  return (loadedPidfds ?? await linuxPidfds()).exited(fd)
 }
 const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b)
 export async function linuxFileHash(file: string): Promise<string> {
@@ -330,7 +334,10 @@ export function launchLinuxExecution(plan: LinuxLaunchPlan, nonce: string, lease
     const current = await linuxBirth(pid)
     if (current && same(current, birth)) {
       // The signal goes to the pinned task even if pid is reused after this check.
-      const signalled = (await linuxPidfds()).kill(fd)
+      const api = await linuxPidfds()
+      // Retirement can release a captured descriptor while the birth read awaits.
+      assert(fd === initFD || fd === supervisorFD, 'cleanup_unknown')
+      const signalled = api.kill(fd)
       assert(signalled || await linuxBirth(pid) === null, 'cleanup_unknown')
     } else assert(current === null, 'cleanup_unknown')
   }
@@ -367,9 +374,11 @@ export function launchLinuxExecution(plan: LinuxLaunchPlan, nonce: string, lease
         retirements.add(result); return result
       } finally {
         const failures: unknown[] = []
-        try { await namespaceFD?.close() } catch (error) { failures.push(error) }
+        const namespace = namespaceFD, descriptors = [initFD, supervisorFD]
+        namespaceFD = undefined; initFD = undefined; supervisorFD = undefined
+        try { await namespace?.close() } catch (error) { failures.push(error) }
         const api = await linuxPidfds()
-        for (const fd of [initFD, supervisorFD]) {
+        for (const fd of descriptors) {
           try { if (fd !== undefined) api.close(fd) } catch (error) { failures.push(error) }
         }
         assert(failures.length === 0, 'cleanup_unknown')

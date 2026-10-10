@@ -105,8 +105,11 @@ try {
       'fixture_PID_namespace_mapping')
     let offspring: Awaited<ReturnType<typeof readLinuxProcessIdentity>> | undefined
     if (mode === 'normal') {
-      observedInitFD = pidfds.symbols.pidfd_open(mapping.init.hostPID, 0)
-      assert(observedInitFD >= 0 && !await linuxPidfdHasExited(observedInitFD), 'fixture_live_init_reported_retired')
+      const opened = pidfds.symbols.pidfd_open(mapping.init.hostPID, 0)
+      assert(opened >= 0, 'fixture_init_pidfd_open_failed')
+      observedInitFD = opened
+      assert(JSON.stringify(await linuxBirth(mapping.init.hostPID)) === JSON.stringify(mapping.init.birth), 'fixture_init_pidfd_birth_mismatch')
+      assert(!await linuxPidfdHasExited(observedInitFD), 'fixture_live_init_reported_retired')
       const local = JSON.parse(await readFile(path.join(directory, 'orphan.json'), 'utf8')) as Record<string, unknown>
       const taskDirs = await readdir(`/proc/${mapping.init.hostPID}/task`)
       for (const task of taskDirs) {
@@ -137,12 +140,16 @@ try {
     }
     await bound(active.exit)
     const retirement = await bound(active.retire())
+    let retiredKillRefused = false
+    try { await active.kill() } catch { retiredKillRefused = true }
+    assert(retiredKillRefused, 'fixture_retired_launch_retained_signal_authority')
     assert(isKernelRetirement(retirement) && retirement.scopeClosed === (mode !== 'wrong-closed'), 'fixture_closed_ack_qualification')
     assert(await linuxBirth(mapping.bun.hostPID) === null && await linuxBirth(supervisorPID) === null, 'fixture_Bun_supervisor_survived')
     if (offspring) assert(await linuxBirth(offspring.hostPID) === null, 'fixture_escaped_offspring_survived_kernel_retirement')
     if (observedInitFD !== undefined) {
       assert(await linuxPidfdHasExited(observedInitFD), 'fixture_retired_init_pidfd_not_ready')
-      closeObservedInitFD(observedInitFD); observedInitFD = undefined
+      const closing = observedInitFD; observedInitFD = undefined
+      closeObservedInitFD(closing)
       observations.push({ mode, retiredInitPidfdReady: true })
     }
     assert(JSON.stringify(await linuxBirth(sentinelPID)) === JSON.stringify(sentinelBirth) && sentinel.exitCode === null, 'fixture_sentinel_touched')
@@ -173,7 +180,8 @@ try {
   }
   if (sentinelStderr.length) await writeFile(path.join(root, 'sentinel.stderr'), Buffer.concat(sentinelStderr))
   if (observedInitFD !== undefined) {
-    try { assert(closeObservedInitFD, 'fixture_pidfd_close_unavailable'); closeObservedInitFD(observedInitFD) }
+    const closing = observedInitFD; observedInitFD = undefined
+    try { assert(closeObservedInitFD, 'fixture_pidfd_close_unavailable'); closeObservedInitFD(closing) }
     catch { cleanupUnknown = true }
   }
   clearTimeout(watchdog)

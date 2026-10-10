@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url'
 
 // Keep routine source work on Linux. Native boundaries need Windows as well.
 const policyPath = /^(?:\.github\/workflows\/|scripts\/ci\/)/
-const platformPath = /^(?:package\.json$|bun\.lock$|tsconfig[^/]*\.json$|cli(?:-source)?$|install\.sh$|scripts\/(?:build|compile)[^/]*|features\/|src\/(?:native-ts\/|entrypoints\/)|src\/utils\/(?:platform|nativeInstaller|subprocessEnv))/
+const platformPath = /^(?:package\.json$|bun\.lock$|tsconfig[^/]*\.json$|cli(?:-source)?$|install\.sh$|scripts\/(?:package-runtime\.ts$|runtime-bun-pins\.json$|opencode-v2\/|(?:build|compile)[^/]*)|features\/|src\/(?:native-ts\/|entrypoints\/|cli\/packagedOpenCodeDelivery[^/]*)|src\/utils\/(?:platform|nativeInstaller|subprocessEnv))/
 const lifecyclePath = /^(?:src\/services\/(?:runtimeBackends|teamBootstrap)\/|src\/features\/runtimeProviderManagement\/(?:application|adapters|domain|ports)\/|src\/utils\/(?:process(?:\.ts$|Kill\.)|genericProcessUtils|swarm\/)|src\/tools\/shared\/spawnMultiAgent|src\/cli\/handlers\/runtime|scripts\/(?:opencode-.*conformance|smoke\/windows-runtime-opencode)|test\/fixtures\/opencode-generation-native\/)/
 const authorityPath = /^src\/services\/opencode\/(?:types\.ts$|recovery-contract\/|OpenCode[^/]*(?:Authority|Recovery|Identity|Attribution|Host|BinaryResolver|ProvisioningProbe|ExecutionProof|Launch|Startup|Stop|Cursor|Profile|Session|Native|OAuth|ExecutionProbe|ManagedPaths|AuthCoordination|AuthStore|RuntimeDeadline|EffectiveAgentPolicyContract|BridgePreconditions|BridgeCommandHandler|McpManager))/
 
@@ -39,7 +39,7 @@ export function aggregate(needs: Record<string, Need>): string {
   const reason = scope.outputs?.reason
   if (!['true', 'false'].includes(native ?? '') || !reason?.trim()) throw new Error('Missing classifier decision/reason')
   const required = ['cursor-managed-plugin', 'task-change-ledger', 'opencode-authority']
-  const optional = ['windows-packaged-backfill', 'opencode-conformance']
+  const optional = ['windows-packaged-backfill', 'opencode-conformance', 'packaged-delivery']
   for (const job of [...required, ...optional]) {
     const result = needs[job]?.result
     const allowedSkip = native === 'false' && optional.includes(job)
