@@ -1,13 +1,15 @@
 import { fileURLToPath } from 'node:url'
 import { describe, expect, test, spyOn } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { OpenCodeV2RunOwner } from './OpenCodeV2RunOwner.js'
-import { reserveRunControlDirectory } from './OpenCodeV2RunControl.js'
-import type { RunExecutionPorts, RunLaunchPlan } from './OpenCodeV2RunTypes.js'
+import { reserveRunControlDirectory, serveOpenCodeV2RunControl, requestOpenCodeV2Run } from './OpenCodeV2RunControl.js'
+import type { RunControlRequest, RunExecutionPorts, RunLaunchPlan } from './OpenCodeV2RunTypes.js'
 import type { ExecutionAuthority, SessionAuthority } from '../execution/OpenCodeV2ExecutionContracts.js'
+import { OpenCodeV2TeamBridge } from './OpenCodeV2TeamBridge.js'
+import type { SendMessageOutcomeBase } from './OpenCodeBridgeDeliveryJournal.js'
 import { OpenCodeV2AdmissionStore } from '../execution/OpenCodeV2AdmissionStore.js'
 import type { ExecutionBridgeClient, ExecutionInbox, ExecutionLog, ExecutionMessage } from '../transport/OpenCodeV2ExecutionClientFactory.js'
 import { ExecutionTransportFailure, OpenCodeV2ExecutionFetch } from '../transport/OpenCodeV2ExecutionFetch.js'
@@ -181,7 +183,8 @@ describe('run-owned V2 lease/session/admission composition', () => {
       await f.owner.ready()
       await f.owner.execute({ operation: 'send', ...f.selected, intent }, Date.now() + 5000)
       if (!unknown) publishTerminal(f, false)
-      await expect(f.owner.execute({ operation: 'send', ...f.selected, intent: successor(2) }, Date.now() + 5000)).rejects.toThrow('session_fenced')
+      expect(await f.owner.execute({ operation: 'send', ...f.selected, intent: successor(2) }, Date.now() + 5000))
+        .toMatchObject({ kind: 'send_refused', disposition: 'not_reserved', intent: successor(2) })
       expect((await (await f.store()).snapshot()).slot).toBe(intent.identity.requestId)
       expect(f.counters.prompted).toBe(1)
     } finally { await f.close() }
@@ -195,7 +198,7 @@ describe('run-owned V2 lease/session/admission composition', () => {
       const results = await Promise.allSettled([2, 3].map(n => f.owner.execute({ operation: 'send', ...f.selected, intent: successor(n) }, Date.now() + 5000)))
       // Competing strict readbacks may both lose a revision race. They may
       // refuse conservatively, but cannot reserve/enqueue two successors.
-      const admitted = results.filter(result => result.status === 'fulfilled')
+      const admitted = results.filter(result => result.status === 'fulfilled' && result.value.kind === 'send')
       expect(admitted.length).toBeLessThanOrEqual(1)
       expect(f.counters.prompted).toBe(1 + admitted.length)
       const stored = await (await f.store()).snapshot()
@@ -277,7 +280,8 @@ describe('run-owned V2 lease/session/admission composition', () => {
     const f = await fixture()
     try {
       await f.owner.ready(); f.drift()
-      await expect(f.owner.execute({ operation: 'send', ...f.selected, intent }, Date.now() + 5000)).rejects.toThrow('session_selection_changed')
+      expect(await f.owner.execute({ operation: 'send', ...f.selected, intent }, Date.now() + 5000))
+        .toMatchObject({ kind: 'send_refused', disposition: 'not_reserved' })
       expect(f.counters.prompted).toBe(0)
     } finally { await f.close() }
   })
@@ -446,4 +450,179 @@ describe('run-owned V2 lease/session/admission composition', () => {
       expect(f.counters.closed).toBe(1)
     } finally { release(); await f.close() }
   })
+})
+
+
+describe('durable owner refusal crosses authenticated control and app journal', () => {
+  // These regressions go red if pre-reservation refusal becomes UNKNOWN, if a
+  // retry resends an uncertain native mutation, or if payload identity changes.
+  for (const loseRefusal of [false, true]) test(`unreserved successor remains retryable across fresh bridges (lost response: ${loseRefusal})`, async () => {
+    const f = await fixture()
+    let control: Awaited<ReturnType<typeof serveOpenCodeV2RunControl>> | undefined
+    try {
+      await f.owner.ready()
+      control = await serveOpenCodeV2RunControl(f.directory,
+        { teamId: 'TEST-team', runId: 'TEST-run', ownerId: 'TEST-owner', controllerInstanceId: 'TEST-controller' },
+        Date.now() + 10_000, 'f'.repeat(64), (request, deadline) => f.owner.execute(request, deadline))
+      const record = control.record
+      const base = (value: QueueIntent): SendMessageOutcomeBase => ({ requestId: value.identity.requestId,
+        body: { deliveryAttemptId: value.identity.deliveryAttemptId, messageId: value.identity.localMessageId, payloadHash: 'a'.repeat(64) },
+        teamId: record.binding.teamId, teamName: record.binding.teamId, runId: record.binding.runId,
+        laneId: 'primary', memberName: 'worker', projectPath: '/TEST-project' })
+      let lost = false
+      let refusedSend: Extract<RunControlRequest, { operation: 'send' }> | undefined
+      const bridge = () => new OpenCodeV2TeamBridge(f.root, record.binding, { discover: async () => record,
+        launch: async () => { throw Error('TEST forbidden') }, request: async (owner, request, budget) => {
+          const result = await requestOpenCodeV2Run(owner, request, budget)
+          if (result.kind === 'send_refused' && request.operation === 'send' && !refusedSend) refusedSend = request
+          if (loseRefusal && result.kind === 'send_refused' && !lost) { lost = true; throw Error('run_control_disconnected') }
+          return result
+        } })
+      const send = (value: QueueIntent) => bridge().send({ operation: 'send', ...f.selected, intent: value }, base(value), 5000)
+      expect((await send(intent)).accepted).toBe(true)
+      publishTerminal(f, false)
+      const next = successor(2)
+      if (loseRefusal) {
+        await expect(send(next)).rejects.toThrow('run_control_disconnected')
+        expect((await bridge().queryOutcome({ requestId: next.identity.requestId })).record?.safeToRetry).toBe(false)
+      }
+      expect((await send(next)).accepted).toBe(false)
+      expect((await bridge().queryOutcome({ requestId: next.identity.requestId })).record).toMatchObject({
+        status: 'failed_before_accept', safeToRetry: true, runtimePromptMessageId: next.identity.nativeInputID })
+      expect((await (await f.store()).snapshot()).admissions).toHaveLength(1)
+      expect(f.counters.prompted).toBe(1)
+      await expect(send({ ...next, input: { ...next.input, text: 'changed payload' } })).rejects.toThrow('delivery_identity_conflict')
+      publishTerminal(f)
+      expect((await send(next)).accepted).toBe(true)
+      expect(f.counters.prompted).toBe(2)
+      expect((await (await f.store()).snapshot()).admissions).toHaveLength(2)
+      if (!refusedSend) throw Error('TEST original refused generation missing')
+      // Even after a new generation was accepted, a delayed old send token is
+      // still refused by the owner and cannot reach native transport.
+      expect(await requestOpenCodeV2Run(record, refusedSend, 5000)).toMatchObject({ kind: 'send_refused',
+        submissionOwner: refusedSend.submissionOwner, intent: next })
+      expect(f.counters.prompted).toBe(2)
+    } finally { await control?.close(); await f.close() }
+  }, 15000)
+
+  for (const capped of [false, true]) test(`failed complete-cut read proves no reservation; invoked transport failure stays UNKNOWN (event cap: ${capped})`, async () => {
+    const f = await fixture({ unknown: true })
+    try {
+      await f.owner.ready()
+      const log = f.native.log
+      f.native.log = async () => {
+        if (!capped) throw Error('TEST cut unavailable')
+        return { synced: true, watermark: 2049, events: Array.from({ length: 2049 }, (_, index) => ({
+          id: `TEST-${index}`, type: 'session.execution.started', seq: index + 1,
+          aggregateID: f.selected.originalSessionId, data: { sessionID: f.selected.originalSessionId },
+        })) }
+      }
+      expect(await f.owner.execute({ operation: 'send', ...f.selected, intent }, Date.now() + 5000))
+        .toMatchObject({ kind: 'send_refused', disposition: 'not_reserved' })
+      expect((await (await f.store()).snapshot()).admissions).toHaveLength(0)
+      expect(f.counters.prompted).toBe(0)
+      f.native.log = log
+      expect(await f.owner.execute({ operation: 'send', ...f.selected, intent }, Date.now() + 5000))
+        .toMatchObject({ kind: 'send', admission: { state: 'unknown' } })
+      expect(await f.owner.execute({ operation: 'observe', ...f.selected,
+        nativeInputID: intent.identity.nativeInputID, intent }, Date.now() + 5000))
+        .toMatchObject({ kind: 'observe', admission: { state: 'unknown' } })
+      expect(f.counters.prompted).toBe(1)
+    } finally { await f.close() }
+  })
+})
+
+
+test('lost send response after native invocation stays fenced and a fresh bridge only observes', async () => {
+  const f = await fixture({ unknown: true })
+  let control: Awaited<ReturnType<typeof serveOpenCodeV2RunControl>> | undefined
+  try {
+    await f.owner.ready()
+    control = await serveOpenCodeV2RunControl(f.directory,
+      { teamId: 'TEST-team', runId: 'TEST-run', ownerId: 'TEST-owner', controllerInstanceId: 'TEST-controller' },
+      Date.now() + 10_000, 'f'.repeat(64), (request, deadline) => f.owner.execute(request, deadline))
+    const record = control.record, operations: string[] = []
+    const base: SendMessageOutcomeBase = { requestId: intent.identity.requestId,
+      body: { deliveryAttemptId: intent.identity.deliveryAttemptId, messageId: intent.identity.localMessageId, payloadHash: 'a'.repeat(64) },
+      teamId: record.binding.teamId, teamName: record.binding.teamId, runId: record.binding.runId,
+      laneId: 'primary', memberName: 'worker', projectPath: '/TEST-project' }
+    const bridge = () => new OpenCodeV2TeamBridge(f.root, record.binding, { discover: async () => record,
+      launch: async () => { throw Error('TEST forbidden') }, request: async (owner, request, budget) => {
+        operations.push(request.operation)
+        const result = await requestOpenCodeV2Run(owner, request, budget)
+        if (request.operation === 'send') throw Error('run_control_disconnected')
+        return result
+      } })
+    const send = () => bridge().send({ operation: 'send', ...f.selected, intent }, base, 5000)
+    await expect(send()).rejects.toThrow('run_control_disconnected')
+    expect((await bridge().queryOutcome({ requestId: intent.identity.requestId })).record).toMatchObject({
+      status: 'prompt_submitting', safeToRetry: false })
+    expect((await send()).accepted).toBe(false)
+    expect(operations).toEqual(['send', 'observe'])
+    expect(f.counters.prompted).toBe(1)
+    expect((await (await f.store()).snapshot()).admissions[0]?.state).toBe('unknown')
+    expect((await bridge().queryOutcome({ requestId: intent.identity.requestId })).record?.safeToRetry).toBe(false)
+  } finally { await control?.close(); await f.close() }
+}, 15000)
+
+
+describe('owner submission generation and prepared callback failures', () => {
+  test('failed intent persistence releases only the never-invoked prepared slot for the next input', async () => {
+    const f = await fixture()
+    try {
+      await f.owner.ready()
+      const blocked = path.join(f.directory, 'intents.json')
+      await mkdir(blocked)
+      const result = await f.owner.execute({ operation: 'send', ...f.selected, intent }, Date.now() + 5000)
+      expect(result).toMatchObject({ kind: 'send', admission: { state: 'not_submitted', disposition: 'rejected' } })
+      const after = await (await f.store()).snapshot()
+      expect(after.slot).toBeNull()
+      expect(after.admissions[0]?.state).toBe('not_submitted')
+      expect(f.counters.prompted).toBe(0)
+      await rm(blocked, { recursive: true })
+      expect(await f.owner.execute({ operation: 'send', ...f.selected, intent: successor(2) }, Date.now() + 5000))
+        .toMatchObject({ kind: 'send', admission: { state: 'accepted' } })
+      expect(f.counters.prompted).toBe(1)
+    } finally { await f.close() }
+  })
+
+  test('observe reaching the owner before the original send cannot invent a retryable refusal', async () => {
+    const f = await fixture()
+    let control: Awaited<ReturnType<typeof serveOpenCodeV2RunControl>> | undefined
+    let release: () => void = () => undefined
+    const barrier = new Promise<void>(resolve => { release = resolve })
+    let reached: () => void = () => undefined
+    const firstSendReached = new Promise<void>(resolve => { reached = resolve })
+    let pending: Promise<unknown> | undefined
+    try {
+      await f.owner.ready()
+      control = await serveOpenCodeV2RunControl(f.directory,
+        { teamId: 'TEST-team', runId: 'TEST-run', ownerId: 'TEST-owner', controllerInstanceId: 'TEST-controller' },
+        Date.now() + 10_000, 'f'.repeat(64), (request, deadline) => f.owner.execute(request, deadline))
+      const record = control.record, operations: string[] = []
+      const base: SendMessageOutcomeBase = { requestId: intent.identity.requestId,
+        body: { deliveryAttemptId: intent.identity.deliveryAttemptId, messageId: intent.identity.localMessageId, payloadHash: 'a'.repeat(64) },
+        teamId: record.binding.teamId, teamName: record.binding.teamId, runId: record.binding.runId,
+        laneId: 'primary', memberName: 'worker', projectPath: '/TEST-project' }
+      const bridge = () => new OpenCodeV2TeamBridge(f.root, record.binding, { discover: async () => record,
+        launch: async () => { throw Error('TEST forbidden') }, request: async (owner, request, budget) => {
+          operations.push(request.operation)
+          if (request.operation === 'send') { reached(); await barrier }
+          return requestOpenCodeV2Run(owner, request, budget)
+        } })
+      const send = () => bridge().send({ operation: 'send', ...f.selected, intent }, base, 5000)
+      pending = send().then(value => ({ value }), error => ({ error }))
+      await firstSendReached
+      await expect(send()).rejects.toThrow('run_operation_unknown')
+      expect((await bridge().queryOutcome({ requestId: intent.identity.requestId })).record).toMatchObject({
+        status: 'prompt_submitting', safeToRetry: false })
+      expect(f.counters.prompted).toBe(0)
+      release()
+      expect(await pending).toMatchObject({ value: { accepted: true } })
+      expect(operations).toEqual(['send', 'observe'])
+      expect(f.counters.prompted).toBe(1)
+      expect((await bridge().queryOutcome({ requestId: intent.identity.requestId })).record).toMatchObject({
+        status: 'prompt_accepted', safeToRetry: false })
+    } finally { release(); await pending; await control?.close(); await f.close() }
+  }, 15000)
 })

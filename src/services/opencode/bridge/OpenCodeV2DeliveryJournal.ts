@@ -1,4 +1,5 @@
 import path from 'node:path'
+import { randomUUID } from 'node:crypto'
 import { lstat, mkdir, realpath, writeFile } from 'node:fs/promises'
 import * as lockfile from '../../../utils/lockfile.js'
 import { OpenCodeCommandOutcomeStore, type OpenCodeCommandOutcomeRecord } from '../OpenCodeCommandOutcomeStore.js'
@@ -41,35 +42,77 @@ export class OpenCodeV2DeliveryJournal {
     try { return await operation() } finally { await release() }
   }
 
-  async reserve(base: SendMessageOutcomeBase, sessionId: string, identity: IntentIdentity): Promise<'submit' | 'observe'> {
+  reserve(base: SendMessageOutcomeBase, sessionId: string, identity: IntentIdentity): Promise<'submit' | 'observe'>
+  reserve(base: SendMessageOutcomeBase, sessionId: string, identity: IntentIdentity, intentHash: string): Promise<{ action: 'submit' | 'observe'; submissionOwner: string }>
+  async reserve(base: SendMessageOutcomeBase, sessionId: string, identity: IntentIdentity, intentHash?: string): Promise<'submit' | 'observe' | { action: 'submit' | 'observe'; submissionOwner: string }> {
     assertIntentIdentity(identity)
     executionAssert(base.requestId === identity.requestId && base.body.deliveryAttemptId === identity.deliveryAttemptId &&
       base.body.messageId === identity.localMessageId && /^ses_[a-zA-Z0-9]+$/.test(sessionId), 'delivery_identity_conflict')
-    return this.withLock<'submit' | 'observe'>(async () => {
+    return this.withLock(async () => {
+      const decision = (action: 'submit' | 'observe', submissionOwner = '') => intentHash ? { action, submissionOwner } : action
       // A combined lookup deliberately treats a missing request as a conflict.
       // Fresh delivery has neither owner: inspect each index independently, then
       // require every retained owner to join the original immutable identity.
       const byRequest = await this.query({ requestId: base.requestId })
       const byAttempt = await this.query({ deliveryAttemptId: identity.deliveryAttemptId })
       executionAssert(byRequest.diagnostics.length === 0 && byAttempt.diagnostics.length === 0, 'delivery_journal_unknown')
-      if (byRequest.record) this.assertOriginal(byRequest.record, base, sessionId, identity)
-      if (byAttempt.record) this.assertOriginal(byAttempt.record, base, sessionId, identity)
+      if (byRequest.record) this.assertOriginal(byRequest.record, base, sessionId, identity, intentHash)
+      if (byAttempt.record) this.assertOriginal(byAttempt.record, base, sessionId, identity, intentHash)
       const found = { record: byRequest.record ?? byAttempt.record }
       if (found.record && !found.record.safeToRetry) {
-        this.assertOriginal(found.record, base, sessionId, identity)
-        return 'observe'
+        this.assertOriginal(found.record, base, sessionId, identity, intentHash)
+        const submissionOwner = found.record.diagnostics.filter(value => value.startsWith('v2_submission_owner:')).at(-1)?.slice('v2_submission_owner:'.length) ?? ''
+        // Older fenced journals have no retry metadata. Keep them read-only;
+        // an empty token can never authorize a refusal transition.
+        return decision('observe', submissionOwner)
+      }
+      const submissionOwner = randomUUID()
+      if (found.record?.status === 'failed_before_accept' && intentHash) {
+        await this.store.upsert({ ...found.record, status: 'prompt_submitting',
+          diagnostics: [`v2_intent_sha256:${intentHash}`, `v2_unreserved_sha256:${intentHash}`, `v2_submission_owner:${submissionOwner}`] }, { requireRetryable: true,
+          retryUnreservedOwner: { runtimePromptMessageId: identity.nativeInputID, intentHash } })
+        return decision('submit', submissionOwner)
       }
       // The shared locked store arbitrates a simultaneous fresh CLI admission.
       // UNKNOWN/submitting retries never pass this fence or allocate a new ID.
-      await markSendMessageOutcome(base, { status: 'received' }, this.store)
+      await markSendMessageOutcome(base, { status: 'received',
+        ...(intentHash ? { diagnostics: [`v2_intent_sha256:${intentHash}`, `v2_submission_owner:${submissionOwner}`] } : {}) }, this.store)
       await markSendMessageOutcome(base, { status: 'prompt_submitting', sessionId,
         runtimePromptMessageId: identity.nativeInputID }, this.store)
-      return 'submit'
+      return decision('submit', submissionOwner)
+    })
+  }
+
+
+  async refuse(base: SendMessageOutcomeBase, sessionId: string, intent: import('../execution/OpenCodeV2AdmissionService.js').QueueIntent,
+    result: Extract<RunControlResult, { kind: 'send_refused' }>, submissionOwner: string): Promise<SendMessageCommandData> {
+    return this.withLock(async () => {
+      executionAssert(result.disposition === 'not_reserved' && result.submissionOwner === submissionOwner && executionHash(result.intent) === executionHash(intent) &&
+        result.authority.sessionID === sessionId && result.authority.teamId === base.teamId &&
+        result.authority.runId === base.runId && result.authority.laneId === base.laneId &&
+        result.authority.memberId === base.memberName, 'original_input_conflict')
+      const found = await this.query({ requestId: intent.identity.requestId, deliveryAttemptId: intent.identity.deliveryAttemptId })
+      executionAssert(found.record && found.diagnostics.length === 0, 'delivery_journal_unknown')
+      this.assertOriginal(found.record, base, sessionId, intent.identity, executionHash(intent))
+      executionAssert(found.record.diagnostics.filter(value => value.startsWith('v2_submission_owner:')).at(-1) ===
+        `v2_submission_owner:${submissionOwner}`, 'delivery_submission_changed')
+      // Supply every captured owner field, including nullable process identity;
+      // the shared store compares this exact owner under its own write lock.
+      await this.store.upsert({ ...found.record, status: 'failed_before_accept', error: 'native_input_not_reserved',
+        diagnostics: [`v2_intent_sha256:${executionHash(intent)}`, `v2_unreserved_sha256:${executionHash(intent)}`] },
+        { definitelyUnsubmitted: { runtimePromptMessageId: intent.identity.nativeInputID, submissionOwner } })
+      return { accepted: false, runId: base.runId ?? undefined, sessionId, memberName: base.memberName,
+        runtimePromptMessageId: intent.identity.nativeInputID,
+        diagnostics: [{ code: 'native_input_not_reserved', severity: 'warning', message: 'The original input was not reserved or submitted.' }] }
     })
   }
 
   private assertOriginal(record: OpenCodeCommandOutcomeRecord, base: SendMessageOutcomeBase,
-    sessionId: string, identity: IntentIdentity): void {
+    sessionId: string, identity: IntentIdentity, intentHash?: string): void {
+    if (intentHash) {
+      const tagged = record.diagnostics.some(value => value.startsWith('v2_intent_sha256:'))
+      executionAssert(tagged ? record.diagnostics.includes(`v2_intent_sha256:${intentHash}`) : !record.safeToRetry, 'delivery_identity_conflict')
+    }
     executionAssert(record.requestId === base.requestId && record.requestId === identity.requestId &&
       record.deliveryAttemptId === identity.deliveryAttemptId && record.messageId === identity.localMessageId &&
       record.runtimePromptMessageId === identity.nativeInputID && record.sessionId === sessionId &&

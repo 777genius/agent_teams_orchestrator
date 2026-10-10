@@ -138,7 +138,7 @@ async function acquireOpenCodeLock(
   }
 }
 
-type OpenCodeInventoryProbeMode = 'full' | 'summary' | 'profile'
+type OpenCodeInventoryProbeMode = 'full' | 'summary' | 'profile' | 'passive'
 
 type OpenCodeInventoryProbeOptions = {
   onV2ReadStarted?: () => void
@@ -982,7 +982,7 @@ export class OpenCodeInventoryService {
     options: OpenCodeInventoryProbeOptions = {},
   ): Promise<OpenCodeInventorySnapshot> {
     const mode = options.mode ?? 'full'
-    if (mode === 'summary') {
+    if (mode === 'passive') {
       const binaryPath = process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH?.trim() || process.env.OPENCODE_BIN_PATH?.trim() || null
       return { detected: Boolean(binaryPath), binaryPath, version: null, projectPath: path.resolve(projectPath?.trim() || getCwd()),
         profile: null, connectedProviders: [], availableProviders: [], models: [], agents: [], authStorePath: null,

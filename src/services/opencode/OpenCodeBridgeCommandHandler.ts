@@ -312,7 +312,7 @@ async function findPromptAcceptedEvidenceReadOnly(input: {
 
 async function buildCommandStatusReadOnlySnapshot(projectPath: string): Promise<OpenCodeProvisioningSnapshot> {
   const inventory = await openCodeInventoryService.probe(projectPath, {
-    mode: 'summary',
+    mode: 'passive',
     includeAppMcp: false,
   })
   return {

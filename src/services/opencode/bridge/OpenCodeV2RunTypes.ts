@@ -1,7 +1,7 @@
 import type { OpenCodePreparedProfile, OpenCodeExecutionProof } from '../types.js'
 import type { ControllerToolProof } from './OpenCodeV2ControllerTools.js'
 import type { QueueIntent } from '../execution/OpenCodeV2AdmissionService.js'
-import type { AdmissionRecord } from '../execution/OpenCodeV2ExecutionContracts.js'
+import type { AdmissionRecord, SessionAuthority } from '../execution/OpenCodeV2ExecutionContracts.js'
 import type { ExecutionLease, SelectedExecutionProfile, ValidatedExecutionNative } from '../host/OpenCodeV2ExecutionHost.js'
 import type { ExecutionCleanupReceipt } from '../host/OpenCodeV2ExecutionLifecycle.js'
 import type { ExecutionBridgeClient, ExecutionLog, ExecutionMessagePage, ExecutionPermission, ExecutionMcpServer } from '../transport/OpenCodeV2ExecutionClientFactory.js'
@@ -34,8 +34,8 @@ export type RunLaunchPlan = Readonly<{
 }>
 type MemberRequest = Readonly<{ memberId: string; originalSessionId: string }>
 export type RunControlRequest =
-  | (MemberRequest & Readonly<{ operation: 'send'; intent: QueueIntent }>)
-  | (MemberRequest & Readonly<{ operation: 'observe'; nativeInputID: string; intent?: QueueIntent }>)
+  | (MemberRequest & Readonly<{ operation: 'send'; intent: QueueIntent; submissionOwner?: string }>)
+  | (MemberRequest & Readonly<{ operation: 'observe'; nativeInputID: string; intent?: QueueIntent; submissionOwner?: string }>)
   | (MemberRequest & Readonly<{ operation: 'transcript' }>)
   | (MemberRequest & Readonly<{ operation: 'permissions' }>)
   | (MemberRequest & Readonly<{ operation: 'mcp' }>)
@@ -54,6 +54,7 @@ export type RunMemberStatus = Readonly<{
 }>
 export type RunStopMember = Readonly<{ memberId: string; cleanup: ExecutionCleanupReceipt | null; errors: readonly string[] }>
 export type RunControlResult =
+  | Readonly<{ kind: 'send_refused'; disposition: 'not_reserved'; authority: SessionAuthority; intent: QueueIntent; submissionOwner?: string }>
   | Readonly<{ kind: 'send' | 'observe'; admission: AdmissionRecord; turn: OpenCodeV2TurnProjection | null }>
   | Readonly<{ kind: 'transcript'; messages: ExecutionMessagePage; log: ExecutionLog }>
   | Readonly<{ kind: 'permissions'; requests: ExecutionPermission[] }>

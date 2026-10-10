@@ -47,7 +47,7 @@ export class OpenCodeV2AdmissionService {
     this.authority = structuredClone(authority)
     executionAssert(executionHash(client.authority) === executionHash(authority.host), 'authority_conflict')
   }
-  async admitQueue(intent: QueueIntent, resumePolicy: boolean): Promise<AdmissionRecord> {
+  async admitQueue(intent: QueueIntent, resumePolicy: boolean, onReserved?: (record: AdmissionRecord) => Promise<void>): Promise<AdmissionRecord> {
     intent = JSON.parse(canonicalExecutionJSON(intent)) as QueueIntent
     const hash = validateIntent(intent, resumePolicy)
     // A fresh read verifies session selection; neither aliases nor recovery can
@@ -60,6 +60,16 @@ export class OpenCodeV2AdmissionService {
       boundary = { beforeCursor: cut.log.watermark, beforeUserIDs: cut.messages.filter(m => m.type === 'user').map(m => m.id) }
     }
     const reserved = await this.store.reserve(intent.identity, hash, boundary)
+    // Persist owner intent only after durable reservation and before invocation.
+    try { await onReserved?.(reserved) }
+    catch (failure) {
+      // This callback precedes the durable submitting marker and native call.
+      // CAS only our still-prepared reservation; write/race failure stays unknown.
+      if (reserved.state !== 'prepared') throw failure
+      return this.store.update(intent.identity.requestId, reserved.revision, {
+        state: 'not_submitted', disposition: 'rejected', complete: false,
+      })
+    }
     if (reserved.state !== 'prepared') return reserved
     const sent = await this.store.submitting(intent.identity.requestId, reserved.revision)
     try {

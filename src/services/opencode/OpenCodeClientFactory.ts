@@ -169,6 +169,7 @@ export class OpenCodeClientFactory {
       init?: RequestInit,
       endpointTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
       maxItems?: number,
+      responseKind: 'metadata' | 'transcript' = 'metadata',
     ): Promise<T> => {
       const timeoutMs = resolveRequestTimeoutMs(endpointTimeoutMs, context)
       const timeoutError = new Error(
@@ -205,7 +206,7 @@ export class OpenCodeClientFactory {
           if (context.remainingMs && context.remainingMs() <= 0) throw timeoutError
         } catch (error) { void response.body?.cancel().catch(() => undefined); throw error }
         const result = context.boundedReconciliation || maxItems !== undefined
-          ? await readOpenCodeBoundedHttpResponse(response, controller.signal, maxItems ?? 256, context.remainingMs) as T
+          ? await readOpenCodeBoundedHttpResponse(response, controller.signal, maxItems ?? 256, context.remainingMs, responseKind) as T
           : await parseResponse<T>(response)
         controller.signal.throwIfAborted()
         return result
@@ -300,11 +301,13 @@ export class OpenCodeClientFactory {
             before,
           }), undefined, DEFAULT_REQUEST_TIMEOUT_MS,
           typeof limit === 'number' ? limit : context.boundedReconciliation ? 50 : undefined,
+          'transcript',
         ),
       getSessionMessage: async (id, messageID) => {
         try {
           return await request<OpenCodeMessage>(
             `/session/${encodeURIComponent(id)}/message/${encodeURIComponent(messageID)}`,
+            undefined, DEFAULT_REQUEST_TIMEOUT_MS, undefined, 'transcript',
           )
         } catch (error) {
           if (error instanceof Error && error.message.includes('(404 ')) {
@@ -312,7 +315,7 @@ export class OpenCodeClientFactory {
               let before: string | undefined
               for (let page = 0; page < 4; page++) {
                 const messages = await request<OpenCodeMessage[]>(buildQueryPath(`/session/${encodeURIComponent(id)}/message`,
-                  { limit: '50', before }), undefined, DEFAULT_REQUEST_TIMEOUT_MS, 50)
+                  { limit: '50', before }), undefined, DEFAULT_REQUEST_TIMEOUT_MS, 50, 'transcript')
                 const found = messages.find(message => message.info.id === messageID)
                 if (found) return found
                 if (messages.length < 50) return null

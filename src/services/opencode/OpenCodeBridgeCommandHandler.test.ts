@@ -2551,7 +2551,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(probeCalls).toEqual([
       {
         projectPath: '/tmp/project',
-        options: { mode: 'summary', includeAppMcp: false },
+        options: { mode: 'passive', includeAppMcp: false },
       },
     ])
   })

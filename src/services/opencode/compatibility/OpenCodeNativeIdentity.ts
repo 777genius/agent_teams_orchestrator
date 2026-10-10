@@ -43,12 +43,14 @@ export async function hashOpenCodeFile(file: string): Promise<string> {
 }
 
 export function selectedOpenCodeReadPath(): string | null {
-  const explicit = process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH ?? process.env.OPENCODE_BIN_PATH
-  if (explicit !== undefined) {
-    if (!explicit.trim() || !path.isAbsolute(explicit.trim())) throw new Error('identity_mismatch')
-    return explicit.trim()
+  // Keep the legacy resolver's blank/stale override fallback, then bind the
+  // one resolved executable to the same strict generation and native checks.
+  const selected = resolveOpenCodeBinaryPath()
+  for (const explicit of [process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH, process.env.OPENCODE_BIN_PATH]) {
+    if (explicit?.trim() && !path.isAbsolute(explicit.trim())) throw new Error('identity_mismatch')
+    if (explicit?.trim() && path.resolve(explicit.trim()) === selected) break
   }
-  return resolveOpenCodeBinaryPath()
+  return selected
 }
 
 /** Execute only --version, in private roots, before any V1 profile/registry is opened. */

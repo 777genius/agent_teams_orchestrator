@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from 'node:util'
 import {
   emitOpenCodeRuntimeTurnSettledBestEffort,
   type OpenCodeRuntimeTurnSettledEmitterPort,
@@ -50,8 +51,25 @@ export class OpenCodeTurnSettledEmissionCoordinator {
     if (!input.record.laneId || !input.record.teamId || !input.record.memberName || input.record.staleReason) return
     const observation = input.turnSettled
     if (observation && (observation.sessionId !== input.record.opencodeSessionId || observation.runtimePromptMessageId !== runtimePromptMessageId)) return
-    const evidence = input.reconcileSummary ? input.reconcileSummary.terminalEvidence : observation?.terminalProof?.evidence
+    let evidence = input.reconcileSummary ? input.reconcileSummary.terminalEvidence : observation?.terminalProof?.evidence
     if (input.reconcileSummary && (input.reconcileSummary.sessionId !== input.record.opencodeSessionId || input.reconcileSummary.staleReason || input.reconcileSummary.durableState === 'blocked' || input.reconcileSummary.pendingPermissionRequestIds.length)) return
+    // A second bounded read cannot erase independent qualified native proof. Only
+    // unavailable reads may fall back, and their current projected user window
+    // must agree exactly; malformed, changed or pending native facts veto it.
+    if (input.reconcileSummary && evidence?.readUnavailable && !evidence.complete
+      && evidence.sessionId === input.record.opencodeSessionId
+      && evidence.messages.length === 0 && evidence.messageSessionIds.length === 0
+      && observation?.terminalProof) {
+      const prior = observation.terminalProof.evidence
+      const window = (messages: typeof prior.messages) => {
+        const start = messages.findIndex(message => message.id === runtimePromptMessageId && message.role === 'user')
+        if (start < 0) return null
+        const next = messages.findIndex((message, index) => index > start && message.role === 'user')
+        return messages.slice(start, next < 0 ? undefined : next)
+      }
+      const currentWindow = window(input.reconcileSummary.messages)
+      if (currentWindow && isDeepStrictEqual(currentWindow, window(prior.messages))) evidence = prior
+    }
     const { proof } = qualifyOpenCodeV1TerminalProof(evidence, input.record.opencodeSessionId, runtimePromptMessageId)
     if (!proof) return
     const authority = proof.evidence.authority

@@ -108,16 +108,20 @@ export function parseRunControlRequest(value: unknown): RunControlRequest {
   const memberId = string(row.memberId), originalSessionId = string(row.originalSessionId)
   executionAssert(/^ses_[a-zA-Z0-9]+$/.test(originalSessionId), 'run_control_invalid')
   if (operation === 'send') {
-    keys(row, ['operation', 'memberId', 'originalSessionId', 'intent'])
-    return { operation, memberId, originalSessionId, intent: parseIntent(row.intent) }
+    optionalKeys(row, ['operation', 'memberId', 'originalSessionId', 'intent'], ['submissionOwner'])
+    const submissionOwner = row.submissionOwner === undefined ? undefined : string(row.submissionOwner)
+    executionAssert(submissionOwner === undefined || /^[a-zA-Z0-9._-]{1,200}$/.test(submissionOwner), 'run_control_invalid')
+    return { operation, memberId, originalSessionId, intent: parseIntent(row.intent), ...(submissionOwner ? { submissionOwner } : {}) }
   }
   if (operation === 'observe') {
-    optionalKeys(row, ['operation', 'memberId', 'originalSessionId', 'nativeInputID'], ['intent'])
+    optionalKeys(row, ['operation', 'memberId', 'originalSessionId', 'nativeInputID'], ['intent', 'submissionOwner'])
     const nativeInputID = string(row.nativeInputID)
     executionAssert(/^msg_[a-zA-Z0-9]+$/.test(nativeInputID), 'run_control_invalid')
     const intent = row.intent === undefined ? undefined : parseIntent(row.intent)
     executionAssert(!intent || intent.identity.nativeInputID === nativeInputID, 'run_control_invalid')
-    return { operation, memberId, originalSessionId, nativeInputID, ...(intent ? { intent } : {}) }
+    const submissionOwner = row.submissionOwner === undefined ? undefined : string(row.submissionOwner)
+    executionAssert(submissionOwner === undefined || intent && /^[a-zA-Z0-9._-]{1,200}$/.test(submissionOwner), 'run_control_invalid')
+    return { operation, memberId, originalSessionId, nativeInputID, ...(intent ? { intent } : {}), ...(submissionOwner ? { submissionOwner } : {}) }
   }
   if (operation === 'transcript' || operation === 'permissions' || operation === 'mcp' || operation === 'probeEvidence') {
     keys(row, ['operation', 'memberId', 'originalSessionId']); return { operation, memberId, originalSessionId }
@@ -338,7 +342,8 @@ export async function requestOpenCodeV2Run(record: RunControlRecord, request: Ru
     const value = executionRecord(result.result)
     // The result comes only from the authenticated typed owner; it carries
     // public receipts, never reconstructible ExecutionLease authority.
-    executionAssert(value.kind === request.operation, 'run_control_invalid')
+    executionAssert(value.kind === request.operation || (value.kind === 'send_refused' &&
+      (request.operation === 'send' || request.operation === 'observe' && request.intent !== undefined)), 'run_control_invalid')
     if (value.kind === 'stop') {
       const stop = value as Extract<RunControlResult, { kind: 'stop' }>
       // Native cleanup receipts and source supervisor retirement are distinct.

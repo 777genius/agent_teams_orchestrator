@@ -1,4 +1,4 @@
-import { readOpenCodeBoundedHttpResponse } from './OpenCodeBoundedHttpResponse.js'
+import { OpenCodeV1ReadUnavailableError, readOpenCodeBoundedHttpResponse } from './OpenCodeBoundedHttpResponse.js'
 import { openCodeTranscriptProjector } from './OpenCodeTranscriptProjector.js'
 import type { OpenCodeSseFetch } from './OpenCodeSseEventStream.js'
 import type { OpenCodeMessage } from './types.js'
@@ -19,12 +19,15 @@ export async function readOpenCodeV1TerminalTranscript(params: {
   baseUrl: string; sessionId: string; signal: AbortSignal; fetchImpl?: OpenCodeSseFetch
 }): Promise<OpenCodeV1TerminalEvidence> {
   const diagnostics: string[] = []
+  let successfulReads = 0
   const empty: OpenCodeV1TerminalEvidence = { sessionId: params.sessionId, messages: [], messageSessionIds: [], complete: false, interactionsSettled: false, diagnostics }
   const read = async (path: string, maxItems: number, remainingMs?: () => number): Promise<unknown> => {
     params.signal.throwIfAborted()
-    if (params.remainingMs && params.remainingMs() <= 0) throw new Error('V1 terminal operation deadline expired')
+    if (params.remainingMs && params.remainingMs() <= 0) throw new OpenCodeV1ReadUnavailableError('V1 terminal operation deadline expired')
     const response = await (params.fetchImpl ?? fetch)(params.baseUrl + path, { method: 'GET', signal: params.signal, headers: { Accept: 'application/json' } })
-    return readOpenCodeBoundedHttpResponse(response, params.signal, maxItems, params.remainingMs)
+    const value = await readOpenCodeBoundedHttpResponse(response, params.signal, maxItems, params.remainingMs, path.includes('/message?') ? 'transcript' : 'metadata')
+    successfulReads++
+    return value
   }
   try {
     // Native floor/current /doc: limit + before, latest page in chronological order.
@@ -68,7 +71,7 @@ export async function readOpenCodeV1TerminalTranscript(params: {
     const confirmed = await capture()
     if (JSON.stringify(confirmed) !== JSON.stringify(raw)) throw new Error('Native user window changed during reconciliation')
     params.signal.throwIfAborted()
-    if (params.remainingMs && params.remainingMs() <= 0) throw new Error('V1 terminal operation deadline expired')
+    if (params.remainingMs && params.remainingMs() <= 0) throw new OpenCodeV1ReadUnavailableError('V1 terminal operation deadline expired')
     const rawById = new Map(raw.map(message => [String(message.info.id), message]))
     const messages = openCodeTranscriptProjector.projectSessionMessages({ sessionId: params.sessionId, messages: raw }).messages.map(message => {
       const info = rawById.get(message.id ?? '')?.info
@@ -95,6 +98,9 @@ export async function readOpenCodeV1TerminalTranscript(params: {
       complete: true, interactionsSettled: !pending && diagnostics.length === 0, diagnostics,
     }
   } catch (error) {
+    // Once any native response was observed, a later transport failure must not
+    // erase pending interactions or changed windows from this attempted read.
+    empty.readUnavailable = successfulReads === 0 && (params.signal.aborted || error instanceof OpenCodeV1ReadUnavailableError)
     diagnostics.push(error instanceof Error ? error.message : String(error))
     return empty
   }

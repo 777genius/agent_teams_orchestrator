@@ -1,16 +1,22 @@
 const MAX_BYTES = 1024 * 1024
-const MAX_TOKENS = 16_384
+const MAX_TRANSCRIPT_BYTES = 32 * 1024 * 1024
+export class OpenCodeV1ReadUnavailableError extends Error {}
 const MAX_DEPTH = 32
 /** Bound consumed bytes and JSON complexity BEFORE parsing, including chunked lists. */
-export async function readOpenCodeBoundedHttpResponse(response: Response, signal: AbortSignal, maxItems: number, remainingMs?: () => number): Promise<unknown> {
+export async function readOpenCodeBoundedHttpResponse(response: Response, signal: AbortSignal, maxItems: number, remainingMs?: () => number, kind: 'metadata' | 'transcript' = 'metadata'): Promise<unknown> {
+  const maxBytes = kind === 'transcript' && response.ok ? MAX_TRANSCRIPT_BYTES : MAX_BYTES
+  // JSON tokens each consume at least one byte; avoid a smaller arbitrary limit
+  // rejecting tool metadata within the accepted transcript byte budget.
+  const maxTokens = kind === 'transcript' ? maxBytes : 16_384
   const cancelBody = () => { void response.body?.cancel().catch(() => undefined) }
   let deadlineExpired = false
-  const check = () => { signal.throwIfAborted(); if (deadlineExpired || remainingMs && remainingMs() <= 0) throw new Error('V1 terminal operation deadline expired') }
+  const check = () => { signal.throwIfAborted(); if (deadlineExpired || remainingMs && remainingMs() <= 0) throw new OpenCodeV1ReadUnavailableError('V1 terminal operation deadline expired') }
   try { check() } catch (error) { cancelBody(); throw error }
   const declared = Number(response.headers.get('content-length'))
-  if (!response.ok || declared > MAX_BYTES) {
+  if (!response.ok || declared > maxBytes) {
     cancelBody()
-    throw new Error(!response.ok ? `OpenCode request failed (${response.status} ${response.statusText})` : 'V1 terminal body byte budget exceeded')
+    if (!response.ok) throw new Error(`OpenCode request failed (${response.status} ${response.statusText})`)
+    throw new OpenCodeV1ReadUnavailableError('V1 terminal body byte budget exceeded')
   }
   const reader = response.body?.getReader()
   if (!reader) return undefined
@@ -40,7 +46,7 @@ export async function readOpenCodeBoundedHttpResponse(response: Response, signal
       else if (char === '}' || char === ']') { depth--; primitive = false }
       else if (char === ',' || char === ':') { primitive = false; if (depth === 1 && char === ',') topValue = true }
       else if (!primitive) { primitive = true; tokens++ }
-      if (depth > MAX_DEPTH || tokens > MAX_TOKENS) throw new Error('V1 terminal JSON depth/token budget exceeded')
+      if (depth > MAX_DEPTH || tokens > maxTokens) throw new Error('V1 terminal JSON depth/token budget exceeded')
     }
   }
   try {
@@ -50,7 +56,7 @@ export async function readOpenCodeBoundedHttpResponse(response: Response, signal
       check()
       if (chunk.done) break
       bytes += chunk.value.byteLength
-      if (bytes > MAX_BYTES) throw new Error('V1 terminal body byte budget exceeded')
+      if (bytes > maxBytes) throw new OpenCodeV1ReadUnavailableError('V1 terminal body byte budget exceeded')
       const decoded = decoder.decode(chunk.value, { stream: true })
       scan(decoded)
       text += decoded

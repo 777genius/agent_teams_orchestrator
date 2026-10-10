@@ -1,5 +1,7 @@
 import type { ChildProcess } from 'node:child_process'
-import { spawnPortableCli } from '../../../utils/portableCli.js'
+import { open } from 'node:fs/promises'
+import path from 'node:path'
+import { resolveDirectWindowsLauncher, spawnPortableCli } from '../../../utils/portableCli.js'
 import { nativePorts, query, type NativeHelperFailure, type NativeRow } from '../OpenCodeCursorAgentTreeKill.js'
 import type { OpenCodeV2ReadRoots } from '../profile/OpenCodeV2ManagedConfig.js'
 import { boundOpenCodeRead } from '../transport/OpenCodeBoundedFetch.js'
@@ -17,6 +19,29 @@ type Member = NativeRow & { group: number | null; retired: boolean }
 type ProbeOwner = { child?: ChildProcess; roots: OpenCodeV2ReadRoots; pending: Set<Promise<unknown>> }
 const retained = new Set<ProbeOwner>()
 
+/** Resolve a legacy script loader before entering private roots; do not inherit PATH. */
+async function versionLauncher(executable: string): Promise<{ command: string; args: string[] }> {
+  const windows = resolveDirectWindowsLauncher(executable)
+  if (windows) {
+    const command = path.isAbsolute(windows.command) ? windows.command : Bun.which(windows.command)
+    if (!command) throw new Error('selection_unavailable')
+    return { command, args: [...windows.argsPrefix, '--version'] }
+  }
+  const handle = await open(executable, 'r')
+  let shebang: string
+  try {
+    const bytes = Buffer.alloc(256), result = await handle.read(bytes, 0, bytes.length, 0)
+    shebang = bytes.subarray(0, result.bytesRead).toString('utf8').split('\n')[0]!
+  } finally { await handle.close() }
+  const loader = /^#!\s*\/usr\/bin\/env\s+(node|bun)\s*$/.exec(shebang)?.[1]
+  if (loader) {
+    const command = Bun.which(loader)
+    if (!command) throw new Error('selection_unavailable')
+    return { command, args: [executable, '--version'] }
+  }
+  return { command: executable, args: ['--version'] }
+}
+
 /** Private --version admission, including children which inherit its stdout. */
 export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCodeV2ReadRoots,
   signal?: AbortSignal): Promise<string> {
@@ -32,7 +57,9 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
   }
   try {
     signal?.throwIfAborted()
-    child = spawnPortableCli(executable, ['--version'], { cwd: roots.root, env: roots.env,
+    const launcher = await versionLauncher(executable)
+    signal?.throwIfAborted()
+    child = spawnPortableCli(launcher.command, launcher.args, { cwd: roots.root, env: roots.env,
       stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true, detached: process.platform !== 'win32' })
     owner.child = child
     let helperFailure: NativeHelperFailure | null = null

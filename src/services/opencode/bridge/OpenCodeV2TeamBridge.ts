@@ -1,3 +1,6 @@
+import path from 'node:path'
+import { canonicalizeOpenCodeProjectPath } from '../OpenCodeProfileManager.js'
+import { readOpenCodeAuthority, isKnownSessionStore, requireOpenCodeAuthority, type SessionStoreShape } from '../OpenCodeAuthorityStoreRead.js'
 import { OpenCodeVersionProbeCleanupError } from '../compatibility/OpenCodeVersionProbe.js'
 import { classifyOpenCodeV2ExecutionDelivery } from '../host/OpenCodeV2ExecutionDelivery.js'
 import { resolveOpenCodeBinaryHostIdentity } from '../OpenCodeHostIdentity.js'
@@ -110,11 +113,14 @@ export class OpenCodeV2TeamBridge {
       base.memberName === request.memberId && base.requestId === identity.requestId &&
       base.body.deliveryAttemptId === identity.deliveryAttemptId && base.body.messageId === identity.localMessageId,
     'delivery_identity_conflict')
-    const action = await boundOpenCodeRead(this.journal.reserve(base, request.originalSessionId, identity), remaining())
+    const claim = await boundOpenCodeRead(this.journal.reserve(base, request.originalSessionId, identity, executionHash(request.intent)), remaining())
     // A retained submitting/UNKNOWN owner is read-only. Carry the immutable
     // intent for conflict checking, never invoke another admission/send.
-    const result = await this.call(action === 'submit' ? request : { operation: 'observe', memberId: request.memberId,
-      originalSessionId: request.originalSessionId, nativeInputID: identity.nativeInputID, intent: request.intent }, remaining())
+    const generation = claim.submissionOwner ? { submissionOwner: claim.submissionOwner } : {}
+    const result = await this.call(claim.action === 'submit' ? { ...request, ...generation } : { operation: 'observe', memberId: request.memberId,
+      originalSessionId: request.originalSessionId, nativeInputID: identity.nativeInputID, intent: request.intent, ...generation }, remaining())
+    if (result.kind === 'send_refused') return boundOpenCodeRead(
+      this.journal.refuse(base, request.originalSessionId, request.intent, result, claim.submissionOwner), remaining())
     executionAssert((result.kind === 'send' || result.kind === 'observe') && result.admission.authority.sessionID === request.originalSessionId &&
       result.admission.authority.teamId === base.teamId && result.admission.authority.runId === base.runId &&
       result.admission.authority.memberId === base.memberName && result.admission.authority.laneId === base.laneId &&
@@ -469,13 +475,43 @@ async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: O
   } catch (error) { return refusal(envelope, started, error instanceof Error ? error.message : 'V2 bridge operation unknown') }
 }
 
+// Recovery follows persisted original ownership even if the installed CLI changes.
+// A missing or unreadable V2 launch fence is never converted into legacy authority.
+async function ownsLegacyRecovery(envelope: BridgeEnvelope, binding: { teamId: string; runId?: string }): Promise<boolean> {
+  const read = await readOpenCodeAuthority<SessionStoreShape>(path.join(resolveClaudeMultimodelPaths().data, 'opencode/session-store.json'), isKnownSessionStore)
+  const store = requireOpenCodeAuthority<SessionStoreShape>(read, 'session', () => ({ schemaVersion: 1 as const, records: {} }))
+  const recovery = envelope.body.stopRecovery === undefined ? null : parseOpenCodeStopRequest(envelope.body.stopRecovery).target
+  const laneId = text(envelope.body.laneId) ?? recovery?.laneId ?? 'primary'
+  const projectPath = await canonicalizeOpenCodeProjectPath(envelope.cwd)
+  const matches = async (target: { teamId: string; runId?: string; projectPath: string; laneId?: string }) =>
+    target.teamId === binding.teamId && Boolean(text(target.runId)) &&
+    (binding.runId === undefined || target.runId === binding.runId) && (target.laneId ?? 'primary') === laneId &&
+    await canonicalizeOpenCodeProjectPath(target.projectPath) === projectPath
+  for (const [key, record] of Object.entries(store.records)) {
+    if (key === `${record.teamId}::${record.laneId ?? 'primary'}::${record.memberName}` && await matches(record)) return true
+  }
+  for (const receipt of Object.values(store.stopReceipts ?? {})) if (await matches(receipt.request.target)) return true
+  return false
+}
+const legacyRecoveryCommands = new Set([
+  'opencode.stopTeam', 'opencode.stopOutcome', 'opencode.reconcileStop',
+  'opencode.commandStatus',
+])
+
 /** Public protocol1 routing. The existing V1 executor is passed unchanged. */
 export async function executeSelectedOpenCodeBridgeCommandEnvelope(input: unknown,
   executeV1: (input: unknown) => Promise<unknown>): Promise<unknown> {
   let envelope: BridgeEnvelope
   try { envelope = validateEnvelope(input) } catch { return executeV1(input) }
   let binding: ReturnType<typeof resolveOpenCodeV2RunBinding>
-  try { binding = resolveOpenCodeV2RunBinding(envelope.body) }
+  try {
+    const recovery = envelope.body.stopRecovery === undefined ? null : parseOpenCodeStopRequest(envelope.body.stopRecovery).target
+    binding = resolveOpenCodeV2RunBinding(envelope.body)
+    if (recovery) {
+      executionAssert(!binding || (binding.teamId === recovery.teamId && binding.runId === recovery.runId), 'run_identity_conflict')
+      binding ??= { teamId: recovery.teamId, runId: recovery.runId }
+    }
+  }
   catch (error) { return refusal(envelope, Date.now(), error instanceof Error ? error.message : 'run_identity_conflict') }
   // Startup maintenance owns only the persisted legacy host registry, not a selected native runtime.
   if (envelope.command === 'opencode.cleanupStartupHosts') {
@@ -484,13 +520,24 @@ export async function executeSelectedOpenCodeBridgeCommandEnvelope(input: unknow
     return executeV1(input)
   }
   const bridge = binding ? new OpenCodeV2TeamBridge(resolveClaudeMultimodelPaths().data, binding) : null
-  if (bridge) {
+  if (bridge && process.platform === 'linux' && process.getuid) {
     try { if (await bridge.discover()) return executeV2(envelope, null, bridge) }
     catch (error) {
       if (envelope.command === 'opencode.commandStatus' || envelope.command === 'opencode.recoverDeliveryJournal')
         return executeV2(envelope, null, bridge)
       return refusal(envelope, Date.now(), error instanceof Error ? error.message : 'run_owner_unknown')
     }
+  }
+  // This command touches only the legacy registry and never creates a host.
+  if (envelope.command === 'opencode.cleanupHosts') return executeV1(input)
+  const recoveryHandshake = envelope.command === 'opencode.handshake' &&
+    ['opencode.stopOutcome', 'opencode.reconcileStop'].includes(text(envelope.body.requiredCommand) ?? '')
+  // Recovery negotiation identifies a legacy lane, but grants no run or launch authority.
+  const legacyBinding = binding ?? (recoveryHandshake && text(envelope.body.teamId ?? envelope.body.teamName) && text(envelope.body.laneId)
+    ? { teamId: required(envelope.body.teamId ?? envelope.body.teamName, 'teamId') } : null)
+  if (legacyBinding && (legacyRecoveryCommands.has(envelope.command) || recoveryHandshake)) {
+    try { if (await ownsLegacyRecovery(envelope, legacyBinding)) return executeV1(input) }
+    catch (error) { return refusal(envelope, Date.now(), error instanceof Error ? error.message : 'legacy_owner_unknown') }
   }
   let selection: Awaited<ReturnType<typeof inspectOpenCodeRuntimeAdapterSelection>>
   try { selection = await inspectOpenCodeRuntimeAdapterSelection() }

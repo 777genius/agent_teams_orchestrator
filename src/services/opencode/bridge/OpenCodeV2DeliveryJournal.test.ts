@@ -6,6 +6,7 @@ import { OpenCodeV2DeliveryJournal } from './OpenCodeV2DeliveryJournal.js'
 import { OpenCodeV2TeamBridge, projectV2DeliveryObservation } from './OpenCodeV2TeamBridge.js'
 import { markSendMessageOutcome, type SendMessageOutcomeBase } from './OpenCodeBridgeDeliveryJournal.js'
 import { OpenCodeCommandOutcomeStore, openCodeCommandOutcomeStore } from '../OpenCodeCommandOutcomeStore.js'
+import { executionHash } from '../execution/OpenCodeV2ExecutionContracts.js'
 import type { AdmissionRecord } from '../execution/OpenCodeV2ExecutionContracts.js'
 import type { RunControlRecord, RunControlResult } from './OpenCodeV2RunTypes.js'
 import type { QueueIntent } from '../execution/OpenCodeV2AdmissionService.js'
@@ -166,4 +167,62 @@ describe('V2 composition with the existing durable app outcome authority', () =>
       expect(operations).toEqual(['send', 'observe'])
     } finally { await f.close() }
   })
+})
+
+
+test('stale unreserved refusal cannot release a newer immutable-input submission owner', async () => {
+  const f = await fixture()
+  try {
+    const refused = { kind: 'send_refused' as const, disposition: 'not_reserved' as const,
+      authority: admission('prepared').authority, intent }
+    const first = await f.journal.reserve(base, sessionId, identity, executionHash(intent))
+    expect(first.action).toBe('submit')
+    await f.journal.refuse(base, sessionId, intent, { ...refused, submissionOwner: first.submissionOwner }, first.submissionOwner)
+    let current = first
+    // Retry metadata remains usable past the shared diagnostics retention cap.
+    for (let i = 0; i < 45; i++) {
+      current = await f.journal.reserve(base, sessionId, identity, executionHash(intent))
+      expect(current.action).toBe('submit')
+      if (i < 44) await f.journal.refuse(base, sessionId, intent, { ...refused, submissionOwner: current.submissionOwner }, current.submissionOwner)
+    }
+    expect(current.submissionOwner).not.toBe(first.submissionOwner)
+    await expect(f.journal.refuse(base, sessionId, intent, { ...refused, submissionOwner: first.submissionOwner }, first.submissionOwner))
+      .rejects.toThrow('delivery_submission_changed')
+    expect((await f.journal.query({ requestId: identity.requestId })).record).toMatchObject({
+      status: 'prompt_submitting', safeToRetry: false, runtimePromptMessageId: identity.nativeInputID })
+    await f.journal.commit(base, sessionId, identity, result('unknown'), observe(null))
+    const after = await f.journal.reserve(base, sessionId, identity, executionHash(intent))
+    expect(after).toEqual({ action: 'observe', submissionOwner: current.submissionOwner })
+    await expect(f.journal.refuse(base, 'ses_foreign', intent, { ...refused, submissionOwner: current.submissionOwner }, current.submissionOwner)).rejects.toThrow('original_input_conflict')
+  } finally { await f.close() }
+})
+
+
+test('persisted untagged V2 UNKNOWN journal remains read-only across an upgrade', async () => {
+  const f = await fixture()
+  const operations: string[] = []
+  try {
+    // The previous release persisted only the original outcome identity; it
+    // cannot supply the new intent-hash or private submission-generation tag.
+    await f.journal.reserve(base, sessionId, identity)
+    const record: RunControlRecord = { schema: 1, protocol: 1,
+      binding: { teamId: 'TEST', runId: 'run', ownerId: 'owner', controllerInstanceId: 'controller' },
+      process: { pid: 123, startTicks: '123', bootId: 'TEST', executablePath: '/TEST-bun', executableSha256: 'a'.repeat(64) },
+      directory: '/TEST', socketPath: '/TEST/control.sock', socketDevice: 1, socketInode: 2,
+      deadline: Date.now() + 10000, uid: 1000, sourceSha256: 'b'.repeat(64) }
+    const bridge = new OpenCodeV2TeamBridge(f.root, record.binding, { discover: async () => record,
+      launch: async () => { throw Error('TEST forbidden') }, request: async (_record, request) => {
+        operations.push(request.operation)
+        expect(request).toMatchObject({ operation: 'observe', nativeInputID: identity.nativeInputID, intent })
+        return result('unknown')
+      } })
+    expect((await bridge.send({ operation: 'send', memberId: 'worker', originalSessionId: sessionId, intent }, base, 5000)).accepted).toBe(false)
+    expect(operations).toEqual(['observe'])
+    const retained = (await f.journal.query({ requestId: identity.requestId })).record
+    expect(retained).toMatchObject({ status: 'prompt_submitting', safeToRetry: false, runtimePromptMessageId: identity.nativeInputID })
+    expect(retained?.diagnostics).toEqual([])
+    await expect(f.journal.refuse(base, sessionId, intent, { kind: 'send_refused', disposition: 'not_reserved', submissionOwner: '',
+      authority: admission('prepared').authority, intent }, '')).rejects.toThrow('delivery_submission_changed')
+    expect((await f.journal.query({ requestId: identity.requestId })).record?.safeToRetry).toBe(false)
+  } finally { await f.close() }
 })

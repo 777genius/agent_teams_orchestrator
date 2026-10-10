@@ -8,6 +8,8 @@ export type OpenCodeV1TerminalEvidence = {
   sessionId: string
   messages: OpenCodeCanonicalMessage[]
   messageSessionIds: Array<string | null>
+  /** Transport budget/deadline prevented the first read; no native response was observed. */
+  readUnavailable?: boolean
   complete: boolean
   interactionsSettled: boolean
   diagnostics: string[]

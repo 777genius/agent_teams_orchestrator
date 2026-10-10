@@ -23,7 +23,7 @@ const sha = (value: string | Buffer) => createHash('sha256').update(value).diges
 type Member = {
   plan: RunMemberPlan; lease: ExecutionLease; client: ExecutionBridgeClient; authority: SessionAuthority
   store: OpenCodeV2AdmissionStore; session: OpenCodeV2SessionService; state: RunMemberStatus['state']
-  probeAuthority?: ProbeAuthority; bootstrap: InstructionReceipt | null; mcpConnected: boolean; controllerTools?: ControllerToolProof; intents: Map<string, QueueIntent>
+  probeAuthority?: ProbeAuthority; bootstrap: InstructionReceipt | null; mcpConnected: boolean; controllerTools?: ControllerToolProof; intents: Map<string, QueueIntent>; deliveryTail: Promise<void>; refusals: Map<string, QueueIntent>
 }
 
 export function validateRunLaunchPlan(plan: RunLaunchPlan): void {
@@ -98,6 +98,15 @@ export class OpenCodeV2RunOwner {
   private async persistState(): Promise<void> {
     await writeRunControlFile(this.directory, 'state.json', { binding: this.plan.binding, state: this.state, deadline: this.plan.deadline, members: this.statuses() })
   }
+  private async persistIntents(refusal?: { member: Member; submissionOwner: string; intent: QueueIntent }): Promise<void> {
+    await writeRunControlFile(this.directory, 'intents.json', {
+      binding: this.plan.binding, members: [...this.members.values()].map(value => ({ memberId: value.plan.memberId,
+        originalSessionId: value.authority.sessionID, intents: [...value.intents.values()],
+        refusals: [...value.refusals, ...(refusal?.member === value ? [[refusal.submissionOwner, refusal.intent] as const] : [])]
+          .map(([submissionOwner, intent]) => ({ submissionOwner, intent })),
+      })),
+    })
+  }
   private async initialize(): Promise<void> {
     const initializationDeadline = Math.min(this.plan.deadline, Date.now() + OPEN_CODE_V2_RUN_INITIALIZATION_MS)
     for (const memberPlan of this.plan.members) {
@@ -120,7 +129,7 @@ export class OpenCodeV2RunOwner {
           agent: memberPlan.profile.selection.agent, model: memberPlan.profile.selection.model }
         const store = await OpenCodeV2AdmissionStore.open(this.plan.dataRoot, authority)
         const session = new OpenCodeV2SessionService(client, store, authority)
-        member = { plan: memberPlan, lease, client, authority, store, session, state: 'unknown', bootstrap: null, mcpConnected: false, intents: new Map() }
+        member = { plan: memberPlan, lease, client, authority, store, session, state: 'unknown', bootstrap: null, mcpConnected: false, intents: new Map(), deliveryTail: Promise.resolve(), refusals: new Map() }
         this.members.set(memberPlan.memberId, member)
         this.pendingLeases.delete(memberPlan.memberId)
         executionAssert(this.state === 'starting', 'run_stopped')
@@ -227,7 +236,43 @@ export class OpenCodeV2RunOwner {
     const member = this.member(request), abort = new AbortController()
     const timeout = setTimeout(() => abort.abort(new Error('run_operation_timeout')), deadline - Date.now())
     this.operations.add(abort)
-    const work = this.perform(member, request, deadline, abort.signal)
+    // Serialize delivery ownership and absence proofs for this session. Keep
+    // the tail until lower work ends, even if the caller's response times out.
+    const delivery = request.operation === 'send' || request.operation === 'observe'
+    const work = (delivery ? member.deliveryTail : Promise.resolve()).then(() => {
+      executionAssert(!abort.signal.aborted && this.state === 'active' && deadline > Date.now(), 'run_not_active')
+      if ((request.operation === 'send' || request.operation === 'observe') && request.submissionOwner) {
+        const refused = member.refusals.get(request.submissionOwner)
+        if (refused) {
+          executionAssert(request.intent && executionHash(request.intent) === executionHash(refused), 'run_intent_conflict')
+          return { kind: 'send_refused', disposition: 'not_reserved', authority: member.authority,
+            intent: refused, submissionOwner: request.submissionOwner } as const
+        }
+      }
+      return this.perform(member, request, deadline, abort.signal)
+    }).catch(async failure => {
+      const intent = request.operation === 'send' ? request.intent : request.operation === 'observe' ? request.intent : undefined
+      if (request.operation === 'send' && intent && !member.intents.has(intent.identity.nativeInputID) &&
+          (!request.submissionOwner || !member.refusals.has(request.submissionOwner))) {
+        // Positive durable absence is the only pre-admission retry proof. A
+        // reserved/submitting/UNKNOWN input or unreadable store stays unknown.
+        const snapshot = await member.store.snapshot()
+        if (!snapshot.admissions.some(row => row.identity.requestId === intent.identity.requestId ||
+            row.identity.nativeInputID === intent.identity.nativeInputID)) {
+          if (request.submissionOwner) {
+            // Only the original send can mint this generation's refusal. An
+            // observe that overtakes an unseen send must stay UNKNOWN.
+            executionAssert(member.refusals.size < 128, 'run_refusal_limit')
+            await this.persistIntents({ member, submissionOwner: request.submissionOwner, intent })
+            member.refusals.set(request.submissionOwner, intent)
+          }
+          return { kind: 'send_refused', disposition: 'not_reserved', authority: member.authority, intent,
+            ...(request.submissionOwner ? { submissionOwner: request.submissionOwner } : {}) } as const
+        }
+      }
+      throw failure
+    })
+    if (delivery) member.deliveryTail = work.then(() => undefined, () => undefined)
     this.active.add(work)
     void work.finally(() => {
       clearTimeout(timeout); this.operations.delete(abort); this.active.delete(work)
@@ -278,11 +323,6 @@ export class OpenCodeV2RunOwner {
         executionAssert(!old || executionHash(old) === executionHash(request.intent), 'run_intent_conflict')
         executionAssert(old || member.intents.size < 128, 'run_intent_limit')
         intent = old ?? JSON.parse(canonicalExecutionJSON(request.intent)) as QueueIntent
-        member.intents.set(intent.identity.nativeInputID, intent)
-        await writeRunControlFile(this.directory, 'intents.json', {
-          binding: this.plan.binding, members: [...this.members.values()].map(value => ({ memberId: value.plan.memberId,
-            originalSessionId: value.authority.sessionID, intents: [...value.intents.values()] })),
-        })
         const snapshot = await member.store.snapshot()
         if (snapshot.slot && snapshot.slot !== intent.identity.requestId &&
             !snapshot.admissions.some(record => record.identity.requestId === intent.identity.requestId)) {
@@ -291,7 +331,11 @@ export class OpenCodeV2RunOwner {
           await admissions.settleOriginalInput(previous)
         }
         executionAssert(this.state === 'active' && !signal.aborted, 'run_stopped')
-        const admission = await admissions.admitQueue(intent, true)
+        const admission = await admissions.admitQueue(intent, true, async () => {
+          member.intents.set(intent.identity.nativeInputID, intent)
+          await this.persistIntents()
+          executionAssert(this.state === 'active' && !signal.aborted && deadline > Date.now(), 'run_stopped')
+        })
         return { kind: 'send', admission, turn: null }
       }
       executionAssert(request.operation === 'observe', 'run_operation_invalid')
