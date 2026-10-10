@@ -283,6 +283,13 @@ export class OpenCodeV2RunOwner {
           binding: this.plan.binding, members: [...this.members.values()].map(value => ({ memberId: value.plan.memberId,
             originalSessionId: value.authority.sessionID, intents: [...value.intents.values()] })),
         })
+        const snapshot = await member.store.snapshot()
+        if (snapshot.slot && snapshot.slot !== intent.identity.requestId &&
+            !snapshot.admissions.some(record => record.identity.requestId === intent.identity.requestId)) {
+          const previous = [...member.intents.values()].find(value => value.identity.requestId === snapshot.slot)
+          executionAssert(previous, 'run_original_input_unknown')
+          await admissions.settleOriginalInput(previous)
+        }
         executionAssert(this.state === 'active' && !signal.aborted, 'run_stopped')
         const admission = await admissions.admitQueue(intent, true)
         return { kind: 'send', admission, turn: null }

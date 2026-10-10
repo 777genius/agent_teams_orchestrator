@@ -9,7 +9,7 @@ import { reserveRunControlDirectory } from './OpenCodeV2RunControl.js'
 import type { RunExecutionPorts, RunLaunchPlan } from './OpenCodeV2RunTypes.js'
 import type { ExecutionAuthority, SessionAuthority } from '../execution/OpenCodeV2ExecutionContracts.js'
 import { OpenCodeV2AdmissionStore } from '../execution/OpenCodeV2AdmissionStore.js'
-import type { ExecutionBridgeClient, ExecutionInbox } from '../transport/OpenCodeV2ExecutionClientFactory.js'
+import type { ExecutionBridgeClient, ExecutionInbox, ExecutionLog, ExecutionMessage } from '../transport/OpenCodeV2ExecutionClientFactory.js'
 import { ExecutionTransportFailure, OpenCodeV2ExecutionFetch } from '../transport/OpenCodeV2ExecutionFetch.js'
 import type { QueueIntent } from '../execution/OpenCodeV2AdmissionService.js'
 
@@ -99,12 +99,92 @@ async function fixture(options: { unknown?: boolean; foreignClient?: boolean;
   const selected = { memberId: 'worker', originalSessionId: 'ses_TESToriginal' }
   const sessionAuthority: SessionAuthority = { host: authority, teamId: binding.teamId, runId: binding.runId, laneId: 'primary', memberId: 'worker',
     sessionID: 'ses_TESToriginal', agent: 'worker', model: { providerID: 'TEST-provider', id: 'TEST-model' } }
-  return { owner, counters, prompted, closingStarted, selected, directory, root,
+  return { owner, counters, prompted, closingStarted, selected, directory, root, native, sessionAuthority,
     drift: () => { drift = true }, store: () => OpenCodeV2AdmissionStore.open(root, sessionAuthority),
     close: async () => { await owner.stop(); await owner.awaitCleanupTerminal(); await rm(root, { recursive: true, force: true }) } }
 }
 
+// Native terminal evidence can exist without a delivery-observe RPC. The owner
+// must reconcile that exact original before reserving a subsequent queue input.
+function publishTerminal(f: Awaited<ReturnType<typeof fixture>>, terminal = true) {
+  const a = f.sessionAuthority, sessionID = a.sessionID, nativeInputID = intent.identity.nativeInputID
+  const events: ExecutionLog['events'] = [
+    { id: 'enqueued', type: 'session.inbox.enqueued', seq: 1, aggregateID: sessionID,
+      data: { sessionID, inboxID: nativeInputID, item: { type: 'user', delivery: 'queue', payload: { text: intent.input.text } } } },
+    { id: 'started', type: 'session.execution.started', seq: 2, aggregateID: sessionID, data: { sessionID } },
+    { id: 'delivered', type: 'session.inbox.delivered', seq: 3, aggregateID: sessionID, data: { sessionID, inboxID: nativeInputID } },
+    { id: 'step', type: 'session.step.started', seq: 4, aggregateID: sessionID,
+      data: { sessionID, assistantMessageID: 'msg_assistant', agent: a.agent, model: a.model } },
+    { id: 'text', type: 'session.text.ended', seq: 5, aggregateID: sessionID,
+      data: { sessionID, assistantMessageID: 'msg_assistant', text: 'done' } },
+    { id: 'stepend', type: 'session.step.ended', seq: 6, aggregateID: sessionID,
+      data: { sessionID, assistantMessageID: 'msg_assistant', finish: 'stop' } },
+  ]
+  if (terminal) events.push({ id: 'evt_terminal', type: 'session.execution.succeeded', seq: 7, aggregateID: sessionID, data: { sessionID } })
+  const messages: ExecutionMessage[] = [
+    { id: nativeInputID, timeCreated: 1, type: 'user', data: { id: nativeInputID, type: 'user', text: intent.input.text } },
+    { id: 'msg_assistant', timeCreated: 1, type: 'assistant', data: { id: 'msg_assistant', type: 'assistant',
+      agent: a.agent, model: a.model, time: { created: 1, completed: 2 }, finish: 'stop', content: [{ type: 'text', text: 'done' }] } },
+    ...(terminal ? [{ id: 'msg_terminal', timeCreated: 1, type: 'idle', data: { outcome: 'succeeded' } }] : []),
+  ]
+  f.native.log = async () => ({ events, synced: true, watermark: events.at(-1)!.seq })
+  f.native.messages = async (_id, cursor) => cursor === undefined
+    ? { data: messages, previous: 'TEST-newest', next: 'TEST-oldest' } : { data: [], previous: null, next: null }
+}
+function successor(n: number): QueueIntent {
+  return { delivery: 'queue', identity: { requestId: `request-${n}`, deliveryAttemptId: `attempt-${n}`,
+    localMessageId: `local-${n}`, nativeInputID: `msg_TEST${n}` }, input: { nativeInputID: `msg_TEST${n}`, text: `next ${n}`, resume: true } }
+}
+
 describe('run-owned V2 lease/session/admission composition', () => {
+  test('next send settles the exact native-completed original without an observe RPC or replay', async () => {
+    const f = await fixture()
+    try {
+      await f.owner.ready()
+      await f.owner.execute({ operation: 'send', ...f.selected, intent }, Date.now() + 5000)
+      publishTerminal(f)
+      const before = await (await f.store()).snapshot()
+      expect(before.slot).toBe(intent.identity.requestId)
+      expect(before.admissions[0]).toMatchObject({ complete: false, cursor: null })
+      const next = successor(2)
+      const result = await f.owner.execute({ operation: 'send', ...f.selected, intent: next }, Date.now() + 5000)
+      expect(result).toMatchObject({ kind: 'send', admission: { identity: next.identity, state: 'accepted' } })
+      const after = await (await f.store()).snapshot()
+      expect(after.slot).toBe(next.identity.requestId)
+      expect(after.terminalSettlements).toHaveLength(1)
+      expect(f.counters.prompted).toBe(2)
+      await f.owner.execute({ operation: 'send', ...f.selected, intent }, Date.now() + 5000)
+      expect((await (await f.store()).snapshot()).slot).toBe(next.identity.requestId)
+      expect(f.counters.prompted).toBe(2)
+    } finally { await f.close() }
+  })
+  for (const unknown of [false, true]) test(`${unknown ? 'unknown' : 'nonterminal'} original still fences successors without replay`, async () => {
+    const f = await fixture({ unknown })
+    try {
+      await f.owner.ready()
+      await f.owner.execute({ operation: 'send', ...f.selected, intent }, Date.now() + 5000)
+      if (!unknown) publishTerminal(f, false)
+      await expect(f.owner.execute({ operation: 'send', ...f.selected, intent: successor(2) }, Date.now() + 5000)).rejects.toThrow('session_fenced')
+      expect((await (await f.store()).snapshot()).slot).toBe(intent.identity.requestId)
+      expect(f.counters.prompted).toBe(1)
+    } finally { await f.close() }
+  })
+  test('concurrent successors cannot both reserve the completed original slot', async () => {
+    const f = await fixture()
+    try {
+      await f.owner.ready()
+      await f.owner.execute({ operation: 'send', ...f.selected, intent }, Date.now() + 5000)
+      publishTerminal(f)
+      const results = await Promise.allSettled([2, 3].map(n => f.owner.execute({ operation: 'send', ...f.selected, intent: successor(n) }, Date.now() + 5000)))
+      expect(results.filter(result => result.status === 'fulfilled')).toHaveLength(1)
+      expect(results.filter(result => result.status === 'rejected')).toHaveLength(1)
+      expect(f.counters.prompted).toBe(2)
+      const stored = await (await f.store()).snapshot()
+      expect(['request-2', 'request-3']).toContain(stored.slot)
+      expect(stored.terminalSettlements).toHaveLength(1)
+    } finally { await f.close() }
+  })
+
   test('graph preparation and native startup share a bounded initialization budget', async () => {
     const origin = Date.now()
     let elapsed = 0
