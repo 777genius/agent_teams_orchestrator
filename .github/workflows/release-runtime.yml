@@ -228,6 +228,15 @@ jobs:
         with:
           node-version: '24'
 
+      - name: Checkout reviewed Windows qualification harness
+        if: runner.os == 'Windows' && matrix.platform == 'win32-x64'
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          path: .release-smoke-harness
+          sparse-checkout: scripts/smoke
+          persist-credentials: false
+
       - name: Verify compiled runtime (Windows)
         # Staging four portable deliveries consumes most of the Windows step;
         # retain room for strict teardown and provider checks. Native deadlines
@@ -235,6 +244,8 @@ jobs:
         timeout-minutes: 20
         if: runner.os == 'Windows' && matrix.platform == 'win32-x64'
         shell: pwsh
+        env:
+          EXPECTED_RUNTIME_SOURCE_COMMIT: ${{ needs.prepare-release.outputs.source_commit }}
         run: |
           $actualVersion = (& .\dist\cli.exe --version).Split(" ")[0]
           if ($LASTEXITCODE -ne 0) {
@@ -245,9 +256,15 @@ jobs:
           }
           .\dist\cli.exe --version
           $env:BACKFILL_RUNTIME_SOURCE_COMMIT = git rev-parse HEAD
-          $env:BACKFILL_RUNTIME_HARNESS_COMMIT = $env:BACKFILL_RUNTIME_SOURCE_COMMIT
+          if ($LASTEXITCODE -ne 0 -or $env:BACKFILL_RUNTIME_SOURCE_COMMIT -ne $env:EXPECTED_RUNTIME_SOURCE_COMMIT) {
+            throw 'Compiled runtime source must match the resolved immutable release source'
+          }
+          $env:BACKFILL_RUNTIME_HARNESS_COMMIT = git -C .release-smoke-harness rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or $env:BACKFILL_RUNTIME_HARNESS_COMMIT -ne $env:GITHUB_SHA) {
+            throw 'Windows qualification harness must match the workflow commit'
+          }
           $env:BACKFILL_RUNTIME_BUN_VERSION = bun --version
-          node .\scripts\smoke\windows-runtime-opencode-provider-json.mjs .\dist\cli.exe .\backfill-runtime-evidence.json
+          node .\.release-smoke-harness\scripts\smoke\windows-runtime-opencode-provider-json.mjs .\dist\cli.exe .\backfill-runtime-evidence.json
           if ($LASTEXITCODE -ne 0) { throw 'Packaged Windows smoke failed; see captured evidence' }
 
       - name: Upload Windows executable regression evidence
