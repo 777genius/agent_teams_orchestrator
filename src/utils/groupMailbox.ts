@@ -1,3 +1,4 @@
+import type { QueuedCommand } from '../types/textInputTypes.js'
 import type { AppState } from '../state/AppStateStore.js'
 import { getSessionId } from '../bootstrap/state.js'
 import { TEAMMATE_BOOTSTRAP_RUN_ID_ENV } from './swarm/teammateRuntimeEvents.js'
@@ -74,6 +75,57 @@ export function assertValidGroupMailboxRows(rows: unknown[]): void {
 export function getCurrentGroupRunIdentity(): { bootstrapRunId: string; runtimeRunId: string; pid: number; groupRunKey: string; runKey: string } {
   const bootstrapRunId = process.env[TEAMMATE_BOOTSTRAP_RUN_ID_ENV]?.trim() || getSessionId()
   return { bootstrapRunId, runtimeRunId: bootstrapRunId, pid: process.pid, groupRunKey: `${bootstrapRunId}:${process.pid}`, runKey: `${bootstrapRunId}:${process.pid}` }
+}
+
+export const GROUP_MAILBOX_PROTOCOL_KIND = 'group_chat_message'
+
+// The headless lead has a dedicated single-envelope consumer. Suppress its
+// group rows from the generic mid-turn attachment reader in this exact run.
+type HeadlessGroupMailboxOwner = { teamName: string; memberName: string; runKey: string }
+let headlessGroupMailboxProcessor: HeadlessGroupMailboxOwner | undefined
+let activeHeadlessGroupMailboxTurn: HeadlessGroupMailboxOwner | undefined
+
+export function setHeadlessGroupMailboxProcessor(
+  owner: HeadlessGroupMailboxOwner | undefined,
+): void {
+  headlessGroupMailboxProcessor = owner
+}
+
+export function hasHeadlessGroupMailboxProcessor(teamName?: string, memberName?: string): boolean {
+  return !!headlessGroupMailboxProcessor &&
+    headlessGroupMailboxProcessor.teamName === teamName &&
+    headlessGroupMailboxProcessor.memberName === memberName &&
+    headlessGroupMailboxProcessor.runKey === getCurrentGroupRunIdentity().groupRunKey
+}
+
+export function setActiveHeadlessGroupMailboxTurn(owner: HeadlessGroupMailboxOwner | undefined): void {
+  activeHeadlessGroupMailboxTurn = owner
+}
+
+export function hasActiveHeadlessGroupMailboxTurn(teamName?: string, memberName?: string): boolean {
+  const owner = activeHeadlessGroupMailboxTurn
+  return !!owner && hasHeadlessGroupMailboxProcessor(owner.teamName, owner.memberName) &&
+    owner.runKey === getCurrentGroupRunIdentity().groupRunKey &&
+    (teamName === undefined || owner.teamName === teamName) &&
+    (memberName === undefined || owner.memberName === memberName)
+}
+
+/** Exclude before query snapshots are consumed, so deferred commands remain queued. */
+export function hasProcessingGroupMailboxTurn(
+  messages: readonly (GroupMailboxEnvelope & { status?: string; messageId?: string })[],
+): boolean {
+  return messages.some(message => message.status === 'processing' &&
+    hasGroupMailboxMarker(message) && isCurrentGroupMailboxMessage(message))
+}
+
+export function shouldDeferGroupMailboxCommand(
+  command: Pick<QueuedCommand, 'agentId' | 'mode' | 'protocolKind'>,
+  processingGroupTurn = false,
+): boolean {
+  if (command.agentId !== undefined) return false
+  return command.protocolKind === GROUP_MAILBOX_PROTOCOL_KIND ||
+    ((processingGroupTurn || hasActiveHeadlessGroupMailboxTurn()) &&
+      command.mode === 'prompt')
 }
 
 export function isCurrentGroupMailboxMessage(message: GroupMailboxEnvelope & { messageId?: string }, runKey = getCurrentGroupRunIdentity().groupRunKey): boolean {

@@ -340,15 +340,37 @@ import { refreshActivePlugins } from '../utils/plugins/refresh.js'
 import { loadAllPluginsCacheOnly } from '../utils/plugins/pluginLoader.js'
 import {
   isTeamLead,
+  getAgentName,
   hasActiveInProcessTeammates,
   hasWorkingInProcessTeammates,
   waitForTeammatesToBecomeIdle,
 } from '../utils/teammate.js'
 import {
   readUnreadMessages,
-  markMessagesAsRead,
+  markMessagesAsReadByIds,
   isShutdownApproved,
+  type TeammateMessage,
 } from '../utils/teammateMailbox.js'
+import {
+  GROUP_MAILBOX_PROTOCOL_KIND,
+  buildGroupMailboxPrompt,
+  findGroupMailboxReplyOutcome,
+  getCurrentGroupRunIdentity,
+  hasConflictingGroupReplyScope,
+  hasGroupChatTools,
+  hasGroupMailboxMarker,
+  isCurrentGroupMailboxMessage,
+  setHeadlessGroupMailboxProcessor,
+  setActiveHeadlessGroupMailboxTurn,
+} from '../utils/groupMailbox.js'
+import {
+  hasBoundGroupChatControl,
+  readFreshGroupChatCatalog,
+  relayGroupAssistantText,
+} from '../utils/groupChatControlClient.js'
+import { buildWorkSyncAdmissionCapabilityPath } from '../utils/workSyncAdmissionCapability.js'
+import { writeFileAtomic } from '../utils/atomicWrite.js'
+import { findOrdinaryDirectReplyFallback } from '../hooks/useInboxPoller.js'
 import { removeTeammateFromTeamFile } from '../utils/swarm/teamHelpers.js'
 import { unassignTeammateTasks } from '../utils/tasks.js'
 import { getRunningTasks } from '../utils/task/framework.js'
@@ -453,6 +475,8 @@ export function canBatchWith(
 ): boolean {
   return (
     next !== undefined &&
+    head.protocolKind !== GROUP_MAILBOX_PROTOCOL_KIND &&
+    next.protocolKind !== GROUP_MAILBOX_PROTOCOL_KIND &&
     next.mode === 'prompt' &&
     next.workload === head.workload &&
     next.isMeta === head.isMeta
@@ -1115,6 +1139,7 @@ function runHeadlessStreaming(
   turnInterruptionState?: TurnInterruptionState,
 ): AsyncIterable<StdoutMessage> {
   let running = false
+  let leadMailboxPollGeneration = 0
   let runPhase:
     | 'draining_commands'
     | 'waiting_for_agents'
@@ -1607,6 +1632,23 @@ function runHeadlessStreaming(
     return allTools
   }
 
+  // One physical group envelope owns one prompt UUID and one reply scope.
+  // Keep metadata outside the generic text queue so it survives prompt dispatch.
+  const groupMailboxTurns = new Map<string, {
+    message: TeammateMessage
+    teamName: string
+    memberName: string
+  }>()
+  const getHeadlessGroupContext = () => {
+    const state = getAppState()
+    if (!state.teamContext || !isTeamLead(state.teamContext)) return undefined
+    const teamName = state.teamContext.teamName
+    const memberName = getAgentName() ??
+      state.teamContext.teammates[state.teamContext.leadAgentId]?.name ?? 'team-lead'
+    if (!teamName || !memberName) return undefined
+    return { teamName, memberName, ready: hasGroupChatTools(buildAllTools(state)) && hasBoundGroupChatControl() }
+  }
+
   // Bridge handle for remote-control (SDK control message).
   // Mirrors the REPL's useReplBridge hook: the handle is created when
   // `remote_control` is enabled and torn down when disabled.
@@ -1976,6 +2018,7 @@ function runHeadlessStreaming(
     }
 
     running = true
+    const runGeneration = ++leadMailboxPollGeneration
     runPhase = undefined
     notifySessionStateChanged('running')
     idleTimeout.stop()
@@ -2129,6 +2172,16 @@ function runHeadlessStreaming(
           }
 
           const allTools = buildAllTools(appState)
+          const queuedGroupTurn = command.uuid ? groupMailboxTurns.get(command.uuid) : undefined
+          if (queuedGroupTurn) {
+            const current = getHeadlessGroupContext()
+            if (!current?.ready || current.teamName !== queuedGroupTurn.teamName ||
+                current.memberName !== queuedGroupTurn.memberName ||
+                !isCurrentGroupMailboxMessage(queuedGroupTurn.message)) {
+              groupMailboxTurns.delete(command.uuid!)
+              continue
+            }
+          }
 
           for (const uuid of batchUuids) {
             notifyCommandLifecycle(uuid, 'started')
@@ -2270,115 +2323,175 @@ function runHeadlessStreaming(
           // const-capture: TS loses `while ((command = dequeue()))` narrowing
           // inside the closure.
           const cmd = command
-          await runWithWorkload(cmd.workload ?? options.workload, async () => {
-            for await (const message of ask({
-              commands: uniqBy(
-                [...currentCommands, ...appState.mcp.commands],
-                'name',
-              ),
-              prompt: input,
-              promptUuid: cmd.uuid,
-              isMeta: cmd.isMeta,
-              cwd: cwd(),
-              tools: allTools,
-              verbose: options.verbose,
-              mcpClients: allMcpClients,
-              thinkingConfig: options.thinkingConfig,
-              maxTurns: options.maxTurns,
-              maxBudgetUsd: options.maxBudgetUsd,
-              taskBudget: options.taskBudget,
-              canUseTool,
-              userSpecifiedModel: activeUserSpecifiedModel,
-              fallbackModel: options.fallbackModel,
-              jsonSchema: getInitJsonSchema() ?? options.jsonSchema,
-              mutableMessages,
-              getReadFileCache: () =>
-                pendingSeeds.size === 0
-                  ? readFileState
-                  : mergeFileStateCaches(readFileState, pendingSeeds),
-              setReadFileCache: cache => {
-                readFileState = cache
-                for (const [path, seed] of pendingSeeds.entries()) {
-                  const existing = readFileState.get(path)
-                  if (!existing || seed.timestamp > existing.timestamp) {
-                    readFileState.set(path, seed)
-                  }
-                }
-                pendingSeeds.clear()
-              },
-              customSystemPrompt: options.systemPrompt,
-              appendSystemPrompt: options.appendSystemPrompt,
-              getAppState,
-              setAppState,
-              abortController,
-              replayUserMessages: options.replayUserMessages,
-              includePartialMessages: options.includePartialMessages,
-              handleElicitation: (serverName, params, elicitSignal) =>
-                structuredIO.handleElicitation(
-                  serverName,
-                  params.message,
-                  undefined,
-                  elicitSignal,
-                  params.mode,
-                  params.url,
-                  'elicitationId' in params ? params.elicitationId : undefined,
+          if (queuedGroupTurn) {
+            setActiveHeadlessGroupMailboxTurn({
+              teamName: queuedGroupTurn.teamName,
+              memberName: queuedGroupTurn.memberName,
+              runKey: queuedGroupTurn.message.groupRunKey!,
+            })
+          }
+          try {
+            await runWithWorkload(cmd.workload ?? options.workload, async () => {
+              for await (const message of ask({
+                commands: uniqBy(
+                  [...currentCommands, ...appState.mcp.commands],
+                  'name',
                 ),
-              agents: currentAgents,
-              orphanedPermission: cmd.orphanedPermission,
-              setSDKStatus: status => {
-                output.enqueue({
-                  type: 'system',
-                  subtype: 'status',
-                  status,
-                  session_id: getSessionId(),
-                  uuid: randomUUID(),
-                })
-              },
-            })) {
-              // Forward messages to bridge incrementally (mid-turn) so
-              // claude.ai sees progress and the connection stays alive
-              // while blocked on permission requests.
-              forwardMessagesToBridge()
-
-              if (message.type === 'result') {
-                // Flush pending SDK events so they appear before result on the stream.
-                for (const event of drainSdkEvents()) {
-                  output.enqueue(event)
+                prompt: input,
+                promptUuid: cmd.uuid,
+                isMeta: cmd.isMeta,
+                cwd: cwd(),
+                tools: allTools,
+                verbose: options.verbose,
+                mcpClients: allMcpClients,
+                thinkingConfig: options.thinkingConfig,
+                maxTurns: options.maxTurns,
+                maxBudgetUsd: options.maxBudgetUsd,
+                taskBudget: options.taskBudget,
+                canUseTool,
+                userSpecifiedModel: activeUserSpecifiedModel,
+                fallbackModel: options.fallbackModel,
+                jsonSchema: getInitJsonSchema() ?? options.jsonSchema,
+                mutableMessages,
+                getReadFileCache: () =>
+                  pendingSeeds.size === 0
+                    ? readFileState
+                    : mergeFileStateCaches(readFileState, pendingSeeds),
+                setReadFileCache: cache => {
+                  readFileState = cache
+                  for (const [path, seed] of pendingSeeds.entries()) {
+                    const existing = readFileState.get(path)
+                    if (!existing || seed.timestamp > existing.timestamp) {
+                      readFileState.set(path, seed)
+                    }
+                  }
+                  pendingSeeds.clear()
+                },
+                customSystemPrompt: options.systemPrompt,
+                appendSystemPrompt: options.appendSystemPrompt,
+                getAppState,
+                setAppState,
+                abortController,
+                replayUserMessages: options.replayUserMessages,
+                includePartialMessages: options.includePartialMessages,
+                handleElicitation: (serverName, params, elicitSignal) =>
+                  structuredIO.handleElicitation(
+                    serverName,
+                    params.message,
+                    undefined,
+                    elicitSignal,
+                    params.mode,
+                    params.url,
+                    'elicitationId' in params ? params.elicitationId : undefined,
+                  ),
+                agents: currentAgents,
+                orphanedPermission: cmd.orphanedPermission,
+                setSDKStatus: status => {
+                  output.enqueue({
+                    type: 'system',
+                    subtype: 'status',
+                    status,
+                    session_id: getSessionId(),
+                    uuid: randomUUID(),
+                  })
+                },
+              })) {
+                if (queuedGroupTurn) {
+                  // Group prompts are internal mailbox turns, not app stdio user
+                  // commands. Retain ask's mutable transcript and tool execution,
+                  // but only canonical group tools/the bound relay may publish.
+                  // No assistant/commentary/partial/result/replay can enter an
+                  // unrelated lead DM capture or the unscoped live projection.
+                  drainSdkEvents()
+                  bridgeLastForwardedIndex = mutableMessages.length
+                  continue
                 }
+                // Forward messages to bridge incrementally (mid-turn) so
+                // claude.ai sees progress and the connection stays alive
+                // while blocked on permission requests.
+                forwardMessagesToBridge()
 
-                // Hold-back: don't emit result while background agents are running
-                const currentState = getAppState()
-                if (
-                  getRunningTasks(currentState).some(
-                    t =>
-                      (t.type === 'local_agent' ||
-                        t.type === 'local_workflow') &&
-                      isBackgroundTask(t),
-                  )
-                ) {
-                  heldBackResult = message
+                if (message.type === 'result') {
+                  // Flush pending SDK events so they appear before result on the stream.
+                  for (const event of drainSdkEvents()) {
+                    output.enqueue(event)
+                  }
+
+                  // Hold-back: don't emit result while background agents are running
+                  const currentState = getAppState()
+                  if (
+                    getRunningTasks(currentState).some(
+                      t =>
+                        (t.type === 'local_agent' ||
+                          t.type === 'local_workflow') &&
+                        isBackgroundTask(t),
+                    )
+                  ) {
+                    heldBackResult = message
+                  } else {
+                    heldBackResult = null
+                    output.enqueue(message)
+                  }
                 } else {
-                  heldBackResult = null
+                  // Flush SDK events (task_started, task_progress) so background
+                  // agent progress is streamed in real-time, not batched until result.
+                  for (const event of drainSdkEvents()) {
+                    output.enqueue(event)
+                  }
                   output.enqueue(message)
                 }
-              } else {
-                // Flush SDK events (task_started, task_progress) so background
-                // agent progress is streamed in real-time, not batched until result.
-                for (const event of drainSdkEvents()) {
-                  output.enqueue(event)
+              }
+            }) // end runWithWorkload
+          } finally {
+            if (queuedGroupTurn) {
+              setActiveHeadlessGroupMailboxTurn(undefined)
+              bridgeLastForwardedIndex = mutableMessages.length
+            }
+          }
+
+          const groupTurn = cmd.uuid ? groupMailboxTurns.get(cmd.uuid) : undefined
+          if (groupTurn && cmd.uuid) {
+            groupMailboxTurns.delete(cmd.uuid)
+            const scope = {
+              messages: mutableMessages,
+              submitUserMessageUuid: cmd.uuid,
+              teamName: groupTurn.teamName,
+              memberName: groupTurn.memberName,
+              groupChatId: groupTurn.message.groupChatId!,
+              physicalMessageId: groupTurn.message.messageId,
+            }
+            const outcome = findGroupMailboxReplyOutcome(scope)
+            const current = getHeadlessGroupContext()
+            if (outcome === 'none' && !hasConflictingGroupReplyScope(scope) &&
+                current?.ready && current.teamName === groupTurn.teamName &&
+                current.memberName === groupTurn.memberName &&
+                isCurrentGroupMailboxMessage(groupTurn.message)) {
+              const fallback = findOrdinaryDirectReplyFallback(scope)
+              if (fallback) {
+                try {
+                  await relayGroupAssistantText({
+                    teamName: groupTurn.teamName,
+                    from: groupTurn.memberName,
+                    message: groupTurn.message,
+                    text: fallback.text,
+                  })
+                } catch (error) {
+                  logForDebugging('[print.ts] Group reply blocked or unknown: ' + String(error))
                 }
-                output.enqueue(message)
               }
             }
-          }) // end runWithWorkload
+          }
 
           for (const uuid of batchUuids) {
             notifyCommandLifecycle(uuid, 'completed')
           }
 
-          // Forward messages to bridge after each turn
-          forwardMessagesToBridge()
-          bridgeHandle?.sendResult()
+          // Group transcript is retained locally, never replayed into a later
+          // ordinary bridge turn through its cursor.
+          if (!queuedGroupTurn) {
+            forwardMessagesToBridge()
+            bridgeHandle?.sendResult()
+          }
 
           if (feature('FILE_PERSISTENCE') && turnStartTime !== undefined) {
             void executeFilePersistence(
@@ -2400,7 +2513,7 @@ function runHeadlessStreaming(
 
           // Generate and emit prompt suggestion for SDK consumers
           if (
-            options.promptSuggestions &&
+            !queuedGroupTurn && options.promptSuggestions &&
             !isEnvDefinedFalsy(process.env.CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION)
           ) {
             // TS narrows suggestionState to never in the while loop body;
@@ -2629,7 +2742,8 @@ function runHeadlessStreaming(
       const teamContext = currentAppState.teamContext
 
       if (teamContext && isTeamLead(teamContext)) {
-        const agentName = 'team-lead'
+        const agentName = getAgentName() ??
+          teamContext.teammates[teamContext.leadAgentId]?.name ?? 'team-lead'
 
         // Poll for messages while teammates are active
         // This is needed because teammates may send messages while we're waiting
@@ -2637,6 +2751,7 @@ function runHeadlessStreaming(
         const POLL_INTERVAL_MS = 500
 
         while (true) {
+          if (runGeneration !== leadMailboxPollGeneration) return
           // Check if teammates are still active
           const refreshedState = getAppState()
           const hasActiveTeammates =
@@ -2651,20 +2766,17 @@ function runHeadlessStreaming(
             break
           }
 
-          const unread = await readUnreadMessages(
+          // Group rows belong to the separate envelope-aware processor below,
+          // including JSON-looking text that must never enter shutdown parsing.
+          const unread = (await readUnreadMessages(
             agentName,
             refreshedState.teamContext?.teamName,
-          )
+          )).filter(message => !hasGroupMailboxMarker(message))
+          if (runGeneration !== leadMailboxPollGeneration) return
 
           if (unread.length > 0) {
             logForDebugging(
               `[print.ts] Team-lead found ${unread.length} unread messages`,
-            )
-
-            // Mark as read immediately to avoid duplicate processing
-            await markMessagesAsRead(
-              agentName,
-              refreshedState.teamContext?.teamName,
             )
 
             // Process shutdown_approved messages - remove teammates from team file
@@ -2737,6 +2849,9 @@ function runHeadlessStreaming(
               isMeta: true,
               protocolKind: TEAMMATE_MESSAGE_TAG,
             })
+            // Acknowledge only rows admitted to this prompt, preserving any
+            // concurrent arrival and all group envelopes.
+            await markMessagesAsReadByIds(agentName, unread.map(message => message.messageId), teamName)
             void run()
             return // run() will come back here after processing
           }
@@ -2808,6 +2923,92 @@ function runHeadlessStreaming(
       }
     }
   }
+
+  // Install the actual group consumer before publishing readiness or reading
+  // stdin. Unlike the legacy lead DM loop it also works while input is idle.
+  let groupPollInFlight = false
+  let groupProcessorStopped = false
+  let groupPollTask: Promise<void> | undefined
+  const admittedGroupMessageIds = new Set<string>()
+  let publishedGroupCapability: { path: string; signature: string } | undefined
+  const refreshHeadlessGroupMailbox = async () => {
+    if (groupPollInFlight || groupProcessorStopped || isShuttingDown()) return
+    groupPollInFlight = true
+    try {
+      const context = getHeadlessGroupContext()
+      const identity = getCurrentGroupRunIdentity()
+      setHeadlessGroupMailboxProcessor(context ? { ...context, runKey: identity.groupRunKey } : undefined)
+      const currentCapabilityPath = context ? buildWorkSyncAdmissionCapabilityPath(context) : undefined
+      if (publishedGroupCapability && publishedGroupCapability.path !== currentCapabilityPath) {
+        publishedGroupCapability = undefined
+      }
+      if (context) {
+        const path = buildWorkSyncAdmissionCapabilityPath(context)
+        const capability = {
+          schemaVersion: 1,
+          teamName: context.teamName,
+          memberName: context.memberName,
+          processorReady: context.ready,
+          ...(context.ready ? { groupChatProtocolVersion: 1, ...identity } : {}),
+        }
+        const signature = JSON.stringify(capability)
+        if (publishedGroupCapability?.path !== path || publishedGroupCapability.signature !== signature) {
+          // This consumer owns GROUP only. In particular it has no WorkSync
+          // continuation owner and must never advertise recoveryProtocolVersion 2.
+          await writeFileAtomic(path, JSON.stringify({ ...capability, publishedAt: new Date().toISOString() }))
+          publishedGroupCapability = { path, signature }
+        }
+      }
+      if (!context?.ready || groupProcessorStopped) return
+      const unread = (await readUnreadMessages(context.memberName, context.teamName))
+        .filter(hasGroupMailboxMarker)
+      for (const message of unread) {
+        if (admittedGroupMessageIds.has(message.messageId)) continue
+        // Stale deliveries cannot become a new run's input. Leave them and
+        // malformed/unknown rows untouched for their storage owner.
+        if (!isCurrentGroupMailboxMessage(message, identity.groupRunKey)) continue
+        let catalog: unknown
+        try { catalog = await readFreshGroupChatCatalog(context.teamName, context.memberName) }
+        catch (error) { logForDebugging('[print.ts] Fresh group catalog unavailable: ' + String(error)) }
+        const current = getHeadlessGroupContext()
+        if (groupProcessorStopped || !current?.ready || current.teamName !== context.teamName ||
+            current.memberName !== context.memberName || !isCurrentGroupMailboxMessage(message)) break
+        const uuid = randomUUID()
+        admittedGroupMessageIds.add(message.messageId)
+        groupMailboxTurns.set(uuid, { message, teamName: context.teamName, memberName: context.memberName })
+        enqueue({
+          mode: 'prompt',
+          value: buildGroupMailboxPrompt(message, context.teamName, context.memberName, catalog),
+          uuid,
+          isMeta: true,
+          protocolKind: GROUP_MAILBOX_PROTOCOL_KIND,
+        })
+        await markMessagesAsReadByIds(context.memberName, [message.messageId], context.teamName)
+        void run()
+      }
+    } catch (error) {
+      logForDebugging('[print.ts] Headless group inbox unavailable: ' + String(error))
+    } finally {
+      groupPollInFlight = false
+    }
+  }
+  const scheduleGroupMailboxPoll = () => {
+    if (!groupPollInFlight && !groupProcessorStopped) {
+      groupPollTask = refreshHeadlessGroupMailbox()
+    }
+  }
+  const groupMailboxTimer = setInterval(scheduleGroupMailboxPoll, 500)
+  groupMailboxTimer.unref()
+  registerCleanup(async () => {
+    groupProcessorStopped = true
+    clearInterval(groupMailboxTimer)
+    await groupPollTask
+    setHeadlessGroupMailboxProcessor(undefined)
+    setActiveHeadlessGroupMailboxTurn(undefined)
+    // Do not demote this shared path: a replacement run may already own it.
+    // The app fences the saved proof by its actual current run and live PID.
+  })
+  scheduleGroupMailboxPoll()
 
   // Set up UDS inbox callback so the query loop is kicked off
   // when a message arrives via the UDS socket in headless mode.

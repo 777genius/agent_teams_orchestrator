@@ -1,4 +1,4 @@
-import { hasGroupMailboxMarker, isCurrentGroupMailboxMessage, type GroupMailboxEnvelope } from './groupMailbox.js'
+import { hasActiveHeadlessGroupMailboxTurn, hasProcessingGroupMailboxTurn, hasGroupMailboxMarker, isCurrentGroupMailboxMessage, type GroupMailboxEnvelope } from './groupMailbox.js'
 // biome-ignore-all assist/source/organizeImports: ANT-ONLY import markers must not be reordered
 import {
   logEvent,
@@ -3636,7 +3636,16 @@ export async function getTeammateMailboxAttachments(
     shouldUseLiveInboxOwnerPathForScope(mailboxDeliveryScope)
   const currentSessionId = getSessionId()
 
-  const allUnreadMessages = (await readUnreadMessages(agentName, teamName)).filter(message => isCurrentGroupMailboxMessage(message))
+  // Group envelopes have an explicit single-message dispatch owner (native
+  // inbox poller or headless processor). Generic attachments must never steal
+  // their pending rows or mix private inputs into an active group turn.
+  const processingGroupMailboxTurn =
+    (shouldUseLiveInboxOwnerPath && hasProcessingGroupMailboxTurn(appState.inbox.messages)) ||
+    hasActiveHeadlessGroupMailboxTurn(teamName, agentName)
+  const allUnreadMessages = (await readUnreadMessages(agentName, teamName)).filter(message =>
+    !processingGroupMailboxTurn && !hasGroupMailboxMarker(message) &&
+    isCurrentGroupMailboxMessage(message),
+  )
   const shouldReadFileBackedWorkSyncNudges =
     !mailboxDeliveryScope.inProcessTeammate &&
     (shouldReadRegularMailboxMessagesFromFile ||
@@ -3680,7 +3689,9 @@ export async function getTeammateMailboxAttachments(
     shouldUseLiveInboxOwnerPath
       ? appState.inbox.messages.filter(
           m =>
+            !processingGroupMailboxTurn &&
             (m.status === 'pending' || m.status === 'processing') &&
+            !hasGroupMailboxMarker(m) &&
             isCurrentGroupMailboxMessage(m) &&
             isLiveInboxMirrorMessageOwnedBySession(m, currentSessionId),
         )
