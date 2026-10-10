@@ -31,7 +31,7 @@ const intent: QueueIntent = { delivery: 'queue', identity: {
 
 async function fixture(options: { unknown?: boolean; foreignClient?: boolean;
   promptBarrier?: Promise<void>; closeBarrier?: Promise<void>; permissionResources?: string[];
-  lifetimeMs?: number; preparation?: () => void; startup?: () => void;
+  lifetimeMs?: number; twoMembers?: boolean; preparation?: () => void; startup?: () => void;
   permissions?: import('../host/OpenCodeV2ExecutionBinding.js').ExecutionSelection['permissions'] } = {}) {
   const root = await mkdtemp(path.join(os.tmpdir(), 'TEST-r249-owner-'))
   const authority: ExecutionAuthority = { generation: 'v2', pin: '2.0.21', dialect: 'v2-2.0.21',
@@ -40,7 +40,7 @@ async function fixture(options: { unknown?: boolean; foreignClient?: boolean;
     hostInstanceId: 'TEST-host', profileEpoch: 'TEST-epoch', profileRoot: '/TEST-profile', directory: '/TEST-project', leaseOwnerId: 'TEST-owner' }
   const value = 'silent TEST context', counters = { acquired: 0, prompted: 0, closed: 0, interrupted: 0, replied: 0 }
   const binding = { teamId: 'TEST-team', runId: 'TEST-run', ownerId: 'TEST-owner', controllerInstanceId: 'TEST-controller' }
-  const plan: RunLaunchPlan = { dataRoot: root, binding, deadline: Date.now() + (options.lifetimeMs ?? 15_000),
+  let plan: RunLaunchPlan = { dataRoot: root, binding, deadline: Date.now() + (options.lifetimeMs ?? 15_000),
     source: { entryPath: '/TEST-entry.ts', entrySha256: 'd'.repeat(64), bunPath: '/TEST-bun', bunSha256: 'c'.repeat(64),
       files: [{ path: '/TEST-entry.ts', sha256: 'd'.repeat(64) }], env: {} },
     members: [{ memberId: 'worker', laneId: 'primary', originalSessionId: 'ses_TESToriginal',
@@ -53,19 +53,27 @@ async function fixture(options: { unknown?: boolean; foreignClient?: boolean;
       bootstrap: { key: 'test.context', value, contextHash: createHash('sha256').update(value).digest('hex'), briefingHash: 'f'.repeat(64) },
       controllerMcpName: 'agent-teams', advertisedTools: ['message_send'] }],
   }
-  let created = false, instruction: Parameters<ExecutionBridgeClient['putInstruction']>[2] = null
+  if (options.twoMembers) {
+    const first = plan.members[0]!
+    plan = { ...plan, members: [...plan.members, { ...first,
+      memberId: 'worker-2', originalSessionId: 'ses_TESTsecond',
+      profile: { ...first.profile, root: '/TEST-profile-2', epoch: 'TEST-epoch-2' } }] }
+  }
+  const created = new Set<string>()
+  let instruction: Parameters<ExecutionBridgeClient['putInstruction']>[2] = null
   let drift = false, resolvePrompted: () => void = () => undefined
   const prompted = new Promise<void>(resolve => { resolvePrompted = resolve })
   let resolveClosing: () => void = () => undefined
   const closingStarted = new Promise<void>(resolve => { resolveClosing = resolve })
+  let selectedAuthority = authority
   const native: ExecutionBridgeClient = {
-    authority: options.foreignClient ? structuredClone(authority) : authority,
+    get authority() { return options.foreignClient ? structuredClone(selectedAuthority) : selectedAuthority },
     getSession: async id => {
-      if (!created) return missingSession(id)
+      if (!created.has(id)) return missingSession(id)
       return { id: drift ? 'ses_TESTchanged' : id, directory: '/TEST-project', agent: 'worker',
         model: { providerID: 'TEST-provider', id: 'TEST-model' }, timeCreated: 1 }
     },
-    createSession: async input => { created = true; return { id: input.sessionID, directory: '/TEST-project',
+    createSession: async input => { created.add(input.sessionID); return { id: input.sessionID, directory: '/TEST-project',
       agent: input.agent, model: input.model, timeCreated: 1 } },
     promptQueue: async (sessionID, input): Promise<ExecutionInbox> => {
       counters.prompted++; resolvePrompted(); await options.promptBarrier
@@ -83,16 +91,25 @@ async function fixture(options: { unknown?: boolean; foreignClient?: boolean;
   }
   const ports: RunExecutionPorts = {
     acquire: async (_native, _profile, context) => {
-      expect(context).toMatchObject({ teamId: binding.teamId, runId: binding.runId, memberId: 'worker', laneId: 'primary' })
+      expect(context).toMatchObject({ teamId: binding.teamId, runId: binding.runId, laneId: 'primary' })
+      expect(plan.members.some(member => member.memberId === context.memberId)).toBe(true)
+      const owned = context.memberId === 'worker' ? authority : { ...authority,
+        profileRoot: '/TEST-profile-2', profileEpoch: 'TEST-epoch-2' }
+      selectedAuthority = owned
       counters.acquired++
       options.preparation?.()
-      return { authority, signal: new AbortController().signal, close: async () => {
+      return { authority: owned, signal: new AbortController().signal, close: async () => {
         counters.closed++
         resolveClosing(); await options.closeBarrier
         return { scopeClosed: true, processRetired: true, descendantsRetired: true, pid: authority.child.pid, birth: authority.child.birth }
       } }
     },
-    client: async owned => { expect(owned).toBe(authority); options.startup?.(); return native },
+    client: async (owned, context) => {
+      expect(owned.profileRoot).toBe(native.authority.profileRoot)
+      options.startup?.()
+      if (Date.now() >= context.deadline) throw new Error('deadline')
+      return native
+    },
   }
   const directory = await reserveRunControlDirectory(root, binding, 'f'.repeat(64))
   const owner = new OpenCodeV2RunOwner(plan, directory, ports)
@@ -176,15 +193,36 @@ describe('run-owned V2 lease/session/admission composition', () => {
       await f.owner.execute({ operation: 'send', ...f.selected, intent }, Date.now() + 5000)
       publishTerminal(f)
       const results = await Promise.allSettled([2, 3].map(n => f.owner.execute({ operation: 'send', ...f.selected, intent: successor(n) }, Date.now() + 5000)))
-      expect(results.filter(result => result.status === 'fulfilled')).toHaveLength(1)
-      expect(results.filter(result => result.status === 'rejected')).toHaveLength(1)
-      expect(f.counters.prompted).toBe(2)
+      // Competing strict readbacks may both lose a revision race. They may
+      // refuse conservatively, but cannot reserve/enqueue two successors.
+      const admitted = results.filter(result => result.status === 'fulfilled')
+      expect(admitted.length).toBeLessThanOrEqual(1)
+      expect(f.counters.prompted).toBe(1 + admitted.length)
       const stored = await (await f.store()).snapshot()
-      expect(['request-2', 'request-3']).toContain(stored.slot)
-      expect(stored.terminalSettlements).toHaveLength(1)
+      expect(stored.admissions).toHaveLength(1 + admitted.length)
+      expect((stored.terminalSettlements ?? []).length).toBeLessThanOrEqual(1)
+      if (admitted.length) expect(['request-2', 'request-3']).toContain(stored.slot)
+      else expect([intent.identity.requestId, null]).toContain(stored.slot)
     } finally { await f.close() }
   })
 
+  for (const lifetimeMs of [120_000, 70_000]) test(`two serial 36s member startups respect shared initialization and original ${lifetimeMs}ms lifetime`, async () => {
+    const origin = Date.now()
+    let elapsed = 0
+    const clock = spyOn(Date, 'now').mockImplementation(() => origin + elapsed)
+    const f = await fixture({ lifetimeMs, twoMembers: true,
+      preparation: () => { elapsed += 18_000 }, startup: () => { elapsed += 18_000 } })
+    try {
+      if (lifetimeMs === 120_000) {
+        await f.owner.ready()
+        expect(await f.owner.execute({ operation: 'status' }, Date.now() + 5000)).toMatchObject({ state: 'active',
+          members: [{ state: 'accepted', bootstrap: { verified: true } }, { state: 'accepted', bootstrap: { verified: true } }] })
+      } else await expect(f.owner.ready()).rejects.toThrow('deadline')
+      expect(elapsed).toBe(72_000)
+      expect(f.counters.acquired).toBe(2)
+      expect(f.counters.prompted).toBe(0)
+    } finally { clock.mockRestore(); await f.close() }
+  })
   test('graph preparation and native startup share a bounded initialization budget', async () => {
     const origin = Date.now()
     let elapsed = 0

@@ -12,7 +12,7 @@ export type { RunBinding, RunControlRecord, RunControlRequest, RunControlResult,
 
 const MAX_FRAME = 512 * 1024
 // Graph preparation and native startup share one absolute budget. Individual control operations remain capped at 30s.
-export const OPEN_CODE_V2_RUN_INITIALIZATION_MS = 60_000
+export const OPEN_CODE_V2_RUN_INITIALIZATION_MS = 90_000
 const MAX_OPERATION_MS = 30_000
 const digest = (bytes: string | Buffer) => createHash('sha256').update(bytes).digest('hex')
 const keys = (row: Record<string, unknown>, names: readonly string[]) => executionAssert(
