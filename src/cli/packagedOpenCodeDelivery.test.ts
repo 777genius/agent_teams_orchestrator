@@ -44,12 +44,25 @@ async function run(args: string[], input = '', extra: Record<string,string> = {}
   expect(exit).toBe(0);expect(error).toBe('')
   return JSON.parse(output) as {stdout:string;stderr:string;exit:number}
 }
+async function nativeExecutableIdentity(file: string) {
+  // Resolve DOS 8.3 aliases with the independent Node caller, then check the
+  // actual file ID and bytes rather than accepting path spelling differences.
+  const program = `const fs=require('node:fs'),crypto=require('node:crypto');const file=fs.realpathSync.native(process.argv[1]),s=fs.statSync(file,{bigint:true});console.log(JSON.stringify({file,device:String(s.dev),inode:String(s.ino),size:String(s.size),sha256:crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex')}))`
+  const oracle=Bun.spawn([Bun.which('node')!,'-e',program,file],{stdout:'pipe',stderr:'pipe'})
+  const [output,error,exit]=await Promise.all([new Response(oracle.stdout).text(),new Response(oracle.stderr).text(),oracle.exited])
+  expect(error).toBe('');expect(exit).toBe(0)
+  return JSON.parse(output) as {file:string;device:string;inode:string;size:string;sha256:string}
+}
 test('compiled delegation preserves argv stdin cwd env and nonzero exit without PATH', async () => {
   const args = ['runtime','providers','connect','--provider','literal $() " value']
   const result = await run(args,'line one\nline two\n',{TEST_DELIVERY_EXIT:'7'})
   expect(result.exit).toBe(7); expect(result.stderr).toBe('')
   const output = JSON.parse(result.stdout)
-  expect(output).toEqual({args,input:'line one\nline two\n',cwd:root,marker:'literal $() " marker',bun})
+  const {bun:actualBun,...transport}=output
+  expect(transport).toEqual({args,input:'line one\nline two\n',cwd:root,marker:'literal $() " marker'})
+  const [actual,expected]=await Promise.all([nativeExecutableIdentity(actualBun),nativeExecutableIdentity(bun)])
+  expect(actual).toEqual(expected)
+  expect(actual.sha256).toBe(sha(await readFile(bun)))
 })
 test('changed JS refuses before executing the sidecar', async () => {
   const marker=path.join(root,'unexpected-effect')
@@ -96,7 +109,8 @@ try {
   $handle=$p.Handle
   $birth=$p.StartTime.ToUniversalTime().Ticks.ToString()
   $row=Get-CimInstance Win32_Process -Filter ('ProcessId='+$args[0])
-  if ($null -eq $row -or $row.ParentProcessId -ne [int]$args[1] -or $p.MainModule.FileName -ne $args[2]) { throw 'owned_sidecar_identity_mismatch' }
+  $observedPath=$p.MainModule.FileName
+  if ($null -eq $row -or $row.ParentProcessId -ne [int]$args[1] -or $observedPath -ne $args[2]) { throw ('owned_sidecar_identity_mismatch '+(@{pid=$p.Id;parentPid=$row.ParentProcessId;expectedParentPid=$args[1];path=$observedPath;expectedPath=$args[2]}|ConvertTo-Json -Compress)) }
   $owned=$true
   [Console]::WriteLine(('READY '+(@{pid=$p.Id;birth=$birth;parentPid=$row.ParentProcessId}|ConvertTo-Json -Compress)))
   [Console]::Out.Flush()
@@ -110,7 +124,7 @@ try {
   const watcher = path.join(root,'owned-sidecar-watch.ps1')
   await writeFile(watcher,script)
   const program = `
-const{spawn}=require('node:child_process');const{once}=require('node:events');
+const{spawn}=require('node:child_process');const{once}=require('node:events');const{realpathSync}=require('node:fs');
 let data='';process.stdin.on('data',x=>data+=x);process.stdin.on('end',async()=>{
  const r=JSON.parse(data);let c,w,stdout='',stderr='',watchout='',watcherr='',timer;
  try {
@@ -118,7 +132,7 @@ let data='';process.stdin.on('data',x=>data+=x);process.stdin.on('end',async()=>
   c.stdin.end();c.stdout.on('data',x=>stdout+=x);c.stderr.on('data',x=>stderr+=x);
   const line=await Promise.race([new Promise((resolve,reject)=>{const read=()=>{if(stdout.includes('\\n')){c.stdout.off('data',read);resolve(stdout.split('\\n')[0])}};c.stdout.on('data',read);c.once('error',reject);c.once('exit',()=>reject(Error('sidecar_startup_missing')))}),new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('sidecar_startup_timeout')),5000)})]);clearTimeout(timer);
   const pid=JSON.parse(line).pid;if(!Number.isSafeInteger(pid)||pid<=0)throw Error('sidecar_pid_invalid');
-  w=spawn(r.powershell,['-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',r.watcher,String(pid),String(c.pid),r.bun],{stdio:'pipe'});
+  w=spawn(r.powershell,['-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',r.watcher,String(pid),String(c.pid),realpathSync.native(r.bun)],{stdio:'pipe'});
   w.stdout.on('data',x=>watchout+=x);w.stderr.on('data',x=>watcherr+=x);
   const ready=await Promise.race([new Promise((resolve,reject)=>{const read=()=>{if(watchout.includes('\\n')){w.stdout.off('data',read);resolve(watchout.split('\\n')[0])}};w.stdout.on('data',read);w.once('error',reject);w.once('exit',()=>reject(Error('identity_observer_failed')))}),new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('identity_observer_timeout')),8000)})]);clearTimeout(timer);
   const identity=JSON.parse(ready.slice(6));if(!ready.startsWith('READY ')||identity.pid!==pid||identity.parentPid!==c.pid||!/^\\d+$/.test(identity.birth))throw Error('sidecar_identity_invalid');
@@ -126,13 +140,13 @@ let data='';process.stdin.on('data',x=>data+=x);process.stdin.on('end',async()=>
   const [[exit],[watchExit]]=await Promise.race([Promise.all([closed,observed]),new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('termination_observation_timeout')),8000)})]);clearTimeout(timer);
   const result=JSON.parse(watchout.split('\\n').find(x=>x.startsWith('RESULT ')).slice(7));
   console.log(JSON.stringify({exit,watchExit,identity,result,stdout,stderr,watcherr}));
- } catch(e){console.error(e.message);process.exitCode=1}
+ } catch(e){console.error(JSON.stringify({phase:e.message,watchout,watcherr,frontendStderr:stderr}));process.exitCode=1}
  finally {clearTimeout(timer);if(c&&c.exitCode===null&&c.signalCode===null)c.kill('SIGKILL');if(w&&w.exitCode===null&&w.signalCode===null){if(!w.stdin.writableEnded)w.stdin.end('WAIT\\n');const cleanup=setTimeout(()=>w.kill('SIGKILL'),3000);await once(w,'close').catch(()=>{});clearTimeout(cleanup)}if(c){c.stdout.destroy();c.stderr.destroy()}}
 })`
   const oracle=Bun.spawn([Bun.which('node')!,'-e',program],{stdin:'pipe',stdout:'pipe',stderr:'pipe'})
   oracle.stdin.write(JSON.stringify({binary,root,bun,watcher,powershell:path.join(process.env.SystemRoot!,'System32/WindowsPowerShell/v1.0/powershell.exe'),env:{HOME:root,PATH:path.join(root,'missing')}}));oracle.stdin.end()
   const [output,error,exit]=await Promise.all([new Response(oracle.stdout).text(),new Response(oracle.stderr).text(),oracle.exited])
-  expect(exit).toBe(0);expect(error).toBe('')
+  expect(error).toBe('');expect(exit).toBe(0)
   const result=JSON.parse(output)
   expect(Number.isInteger(result.exit)).toBe(true);expect(result.exit).not.toBe(0);expect(result.watchExit).toBe(0)
   expect(result.result).toEqual({gone:true,cleanupRequired:false})
