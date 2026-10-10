@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto'
 import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 
@@ -994,7 +995,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
       openCodeProvisioningProbe.probe = async () => live
       openCodeProvisioningProbe.probeRetainingHost = async () => ({ snapshot: live, host: live.host!, release: async () => {} })
       const mcpConfig = live.host!.profile.managedConfig.mcp!['agent-teams']!
-      mcpConfig.command = [process.execPath, new URL('./fixtures/group-chat-mcp.ts', import.meta.url).pathname]
+      mcpConfig.command = [process.execPath, fileURLToPath(new URL('./fixtures/group-chat-mcp.ts', import.meta.url))]
       mcpConfig.environment!.SYNTHETIC_MCP_TOOL_NAMES = JSON.stringify(REQUIRED_MOCK_MCP_TOOL_NAMES)
       mcpConfig.environment!.SYNTHETIC_GROUP_TOOLS = '1'
       Client.prototype.connect = originalClientConnect
