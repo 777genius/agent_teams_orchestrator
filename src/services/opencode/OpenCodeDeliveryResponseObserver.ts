@@ -661,10 +661,10 @@ function classifyChildren(input: {
   }
 
   const lastChild = input.children[input.children.length - 1]
-  // A silent group peer may complete without sending a reply. Keep unknown or
-  // unfinished empty children distinct so the app cannot acknowledge them.
+  // A silent group peer may complete without sending a reply. A missing status
+  // is not completion proof: the exact child must positively finish on its own.
   const completedSilentGroupTurn = Boolean(
-    input.groupChatId && input.rawStatus === 'idle' && lastChild?.id
+    input.groupChatId && (input.rawStatus === 'idle' || input.rawStatus === null) && lastChild?.id
     && Number.isFinite(lastChild.completedAt) && (lastChild.completedAt ?? 0) > 0
     && lastChild.finishReason === 'stop' && observedToolNames.size === 0,
   )

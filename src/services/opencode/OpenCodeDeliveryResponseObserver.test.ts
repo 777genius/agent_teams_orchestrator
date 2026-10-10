@@ -146,7 +146,7 @@ describe('OpenCodeDeliveryResponseObserver', () => {
     expect(observed.deliveredUserMessageId).toBe('user-1')
   })
 
-  test('distinguishes an explicitly completed idle silent group child from unanswered work', () => {
+  test('distinguishes an explicitly completed silent group child from unanswered work', () => {
     const user = message({ id: 'accepted-peer-prompt', role: 'user', text: 'Peer FYI' })
     const child = message({
       id: 'silent-peer-child', parentId: user.id, role: 'assistant',
@@ -163,7 +163,10 @@ describe('OpenCodeDeliveryResponseObserver', () => {
     expect(proof.reason).toBe('assistant_child_completed_without_visible_or_meaningful_response')
     expect(proof.deliveredUserMessageId).toBe(user.id)
     expect(proof.assistantMessageId).toBe(child.id)
-    for (const rawStatus of ['busy', 'retry', null] as const) {
+    // Successful provider status maps may omit this completed session.
+    // Completion comes from the exact child, never from the missing entry.
+    expect(observe([child], null).reason).toBe(proof.reason)
+    for (const rawStatus of ['busy', 'retry'] as const) {
       expect(observe([child], rawStatus).reason).not.toBe(proof.reason)
     }
     for (const incomplete of [
@@ -172,6 +175,7 @@ describe('OpenCodeDeliveryResponseObserver', () => {
       { hasError: true, errorMessage: 'provider failed' },
     ]) {
       expect(observe([{ ...child, ...incomplete }]).reason).not.toBe(proof.reason)
+      expect(observe([{ ...child, ...incomplete }], null).reason).not.toBe(proof.reason)
     }
     expect(observe([]).reason).toBe('no_assistant_child_for_delivered_prompt')
     expect(observeOpenCodeDeliveryResponse({
