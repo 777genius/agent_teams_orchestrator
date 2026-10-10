@@ -4,6 +4,7 @@ import {
   OPEN_CODE_READINESS_PHASES,
   OpenCodeRuntimeDeadline,
   OpenCodeRuntimeDeadlineError,
+  raceOpenCodeAbortSignal,
   waitForOpenCodeAbortableDelay,
 } from './OpenCodeRuntimeDeadline.js'
 
@@ -136,5 +137,41 @@ describe('OpenCodeRuntimeDeadline', () => {
     expect(() => new OpenCodeRuntimeDeadline(Number.NaN)).toThrow(
       'OpenCode runtime deadline requires a positive finite command budget',
     )
+  })
+})
+
+describe('raceOpenCodeAbortSignal', () => {
+  test('observes rejection when starting work synchronously aborts its signal', async () => {
+    const controller = new AbortController()
+    const reason = new Error('deadline expired while starting work')
+    const operation = (async () => {
+      controller.abort(reason)
+      throw reason
+    })()
+
+    await expect(raceOpenCodeAbortSignal(operation, controller.signal)).rejects.toBe(reason)
+    // Bun reports an orphan operation rejection here even though the returned
+    // abort promise has been handled. Exercise the real rejection lifecycle.
+    await new Promise<void>(resolve => setImmediate(resolve))
+  })
+
+  test('observes a later work rejection without delaying an already-aborted result', async () => {
+    const controller = new AbortController()
+    const reason = new Error('already cancelled')
+    controller.abort(reason)
+    let rejectWork!: (reason: Error) => void
+    const operation = new Promise<never>((_resolve, reject) => { rejectWork = reject })
+
+    await expect(raceOpenCodeAbortSignal(operation, controller.signal)).rejects.toBe(reason)
+    rejectWork(new Error('work rejected during eventual cleanup'))
+    await new Promise<void>(resolve => setImmediate(resolve))
+  })
+
+  test('preserves abort precedence over an already-completed operation', async () => {
+    const controller = new AbortController()
+    const reason = new Error('already cancelled')
+    controller.abort(reason)
+
+    await expect(raceOpenCodeAbortSignal(Promise.resolve('late success'), controller.signal)).rejects.toBe(reason)
   })
 })
