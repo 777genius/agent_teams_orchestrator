@@ -91,7 +91,19 @@ export function nativePorts(overrides: Partial<CursorAgentNativePorts> = {},
         ? await observedQuery('tree', path.win32.join(process.env.SystemRoot || 'C:\\Windows',
           'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
           ['-NoProfile', '-NonInteractive', '-Command',
-            'Get-CimInstance Win32_Process -ErrorAction Stop | ForEach-Object { "{0} {1}" -f $_.ProcessId, $_.ParentProcessId }'], timeout)
+            // Avoid loading CimCmdlets in the private Windows environment.
+            // Keep the same PID/parent projection and dispose every WMI resource.
+            `$ErrorActionPreference = 'Stop';
+[void][System.Reflection.Assembly]::Load('System.Management, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a');
+$searcher = [System.Management.ManagementObjectSearcher]::new('SELECT ProcessId, ParentProcessId FROM Win32_Process');
+$results = $null;
+try {
+  $results = $searcher.Get();
+  foreach ($row in $results) {
+    try { [Console]::Out.WriteLine('{0} {1}', $row.GetPropertyValue('ProcessId'), $row.GetPropertyValue('ParentProcessId')) }
+    finally { $row.Dispose() }
+  }
+} finally { if ($null -ne $results) { $results.Dispose() }; $searcher.Dispose() }`], timeout)
         : await observedQuery('tree', 'ps', ['-e', '-o', 'pid=', '-o', 'ppid='], timeout)
       const rows = output.trim().split('\n').filter(Boolean).map(line => {
         const match = /^\s*(\d+)\s+(\d+)\s*$/.exec(line)
