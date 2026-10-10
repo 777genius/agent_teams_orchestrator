@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
-import { mkdtemp, rm } from 'fs/promises'
+import { mkdtemp, readFile, rm, writeFile, mkdir } from 'fs/promises'
 import { tmpdir } from 'os'
 import { join } from 'path'
+import { GROUP_MAILBOX_SOURCE_MAX_BYTES } from './groupMailbox.js'
 
 import {
   getSessionId,
@@ -12,9 +13,12 @@ import {
 import { asSessionId } from '../types/ids.js'
 import {
   claimUnreadRegularMessages,
+  clearMailbox,
   classifyIdleNotification,
   createCompatibilityInboxMessageId,
   finalizeClaimedMessagesAsRead,
+  getInboxPath,
+  markMessagesAsReadByIds,
   isAgentErrorNotificationMessage,
   isLegacyPlanApprovalResponseMessage,
   isPlanApprovalResponse,
@@ -117,6 +121,43 @@ describe('teammateMailbox', () => {
       process.env.CLAUDE_CONFIG_DIR = originalConfigDir
     }
     await rm(tempConfigDir, { recursive: true, force: true })
+  })
+
+  it('preserves damaged group bytes through ordinary append, claim and read writers', async () => {
+    const inboxPath = getInboxPath('alice', 'synthetic-groups')
+    await mkdir(join(inboxPath, '..'), { recursive: true })
+    const dm = { messageId: 'dm', from: 'user', text: 'DM', timestamp: '2026-10-10T00:00:00Z', read: false }
+    const group = { ...dm, messageId: '0bdf10f0-3fd3-4494-a974-b394de06c181', groupChatId: '3695a573-5ad2-469a-91f2-427f90792e11',
+      groupMessageId: 'b8192a4c-97c8-4f67-bccd-7b29d8131286', groupChatProtocolVersion: 1 as const, groupRunKey: 'synthetic-run:123' }
+    for (const bytes of ['{ broken groupChatId', '{"rows":[]}', JSON.stringify([dm, { ...group, groupChatId: null }]), JSON.stringify([group, group])]) {
+      await writeFile(inboxPath, bytes)
+      await writeToMailbox('alice', dm, 'synthetic-groups')
+      await claimUnreadRegularMessages('alice', 'claim', 'synthetic-groups')
+      await markMessagesAsReadByIds('alice', ['dm'], 'synthetic-groups')
+      await clearMailbox('alice', 'synthetic-groups')
+      expect(await readFile(inboxPath, 'utf8')).toBe(bytes)
+    }
+    const unrelated = { unrecognized: true, keep: ['raw', null, 12] }
+    await writeFile(inboxPath, JSON.stringify([unrelated, group, dm]))
+    await claimUnreadRegularMessages('alice', 'claim', 'synthetic-groups')
+    await finalizeClaimedMessagesAsRead('alice', [group.messageId], 'claim', 'synthetic-groups')
+    await writeToMailbox('alice', { ...dm, messageId: 'dm-2' }, 'synthetic-groups')
+    const saved = JSON.parse(await readFile(inboxPath, 'utf8'))
+    expect(saved[0]).toEqual(unrelated)
+    expect(saved[1]).toMatchObject({ ...group, read: true })
+    expect(saved[2]).toMatchObject({ ...dm, claimedBySessionId: 'claim' })
+    expect(saved[3].messageId).toBe('dm-2')
+    const beforeClear = await readFile(inboxPath, 'utf8')
+    await clearMailbox('alice', 'synthetic-groups')
+    expect(await readFile(inboxPath, 'utf8')).toBe(beforeClear)
+    await writeToMailbox('alice', group, 'synthetic-groups')
+    expect(await readFile(inboxPath, 'utf8')).toBe(beforeClear)
+    const overhead = Buffer.byteLength(JSON.stringify([group, '']))
+    const atCapacity = JSON.stringify([group, 'x'.repeat(GROUP_MAILBOX_SOURCE_MAX_BYTES - overhead - 1)])
+    await writeFile(inboxPath, atCapacity)
+    expect(await claimUnreadRegularMessages('alice', 'new-claim', 'synthetic-groups')).toEqual([])
+    await writeToMailbox('alice', { ...dm, messageId: 'capacity-dm' }, 'synthetic-groups')
+    expect(await readFile(inboxPath, 'utf8')).toBe(atCapacity)
   })
 
   it('uses the documented compatibility vector for legacy rows', () => {

@@ -40,6 +40,9 @@ export type OpenCodeDeliveryResponseObservation = {
 
 export type ObserveOpenCodeDeliveryResponseInput = {
   inboundMessageId?: string | null
+  groupChatId?: string | null
+  memberName?: string | null
+  teamName?: string | null
   prePromptCursor?: string | null
   runtimePromptMessageId?: string | null
   summary: OpenCodeSessionReconcileSummary
@@ -83,6 +86,7 @@ const RESPONSE_STATE_PRIORITY: Record<OpenCodeDeliveryResponseState, number> = {
 function normalizeToolName(name: string | null): string {
   return String(name || '')
     .trim()
+    .replace(/^proxy_(?=(?:mcp__agent[-_]teams__|agent[-_]teams_))/, '')
     .replace(/^mcp__agent-teams__/, '')
     .replace(/^mcp__agent_teams__/, '')
     .replace(/^agent-teams_/, '')
@@ -343,6 +347,25 @@ function getVisibleReplyMessageId(tool: OpenCodeCanonicalToolCall): string | nul
   )
 }
 
+function findGroupSendReceipt(value: unknown): Record<string, unknown> | null {
+  if (typeof value === 'string') return findGroupSendReceipt(parseJsonRecord(value))
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const receipt = findGroupSendReceipt(item)
+      if (receipt) return receipt
+    }
+    return null
+  }
+  const record = asRecord(value)
+  if (!record) return null
+  if ('saved' in record || 'error' in record) return record
+  for (const key of ['content', 'text', 'result', 'output', 'data']) {
+    const receipt = findGroupSendReceipt(record[key])
+    if (receipt) return receipt
+  }
+  return null
+}
+
 function findDeliveredUserMessages(input: ObserveOpenCodeDeliveryResponseInput): {
   messages: OpenCodeCanonicalMessage[]
   usedCursorFallback: boolean
@@ -428,6 +451,9 @@ function buildObservation(input: Partial<OpenCodeDeliveryResponseObservation> & 
 
 function classifyChildren(input: {
   inboundMessageId: string | null
+  groupChatId?: string | null
+  memberName?: string | null
+  teamName?: string | null
   userMessage: OpenCodeCanonicalMessage
   children: OpenCodeCanonicalMessage[]
   rawStatus: OpenCodeSessionReconcileSummary['rawStatus']
@@ -448,6 +474,7 @@ function classifyChildren(input: {
     })
   }
 
+  let groupReplyBlocked = false
   let hasRunningTool = false
   let hasErroredMeaningfulTool = false
   let hasRejectedMemberWorkSyncReport = false
@@ -484,6 +511,30 @@ function classifyChildren(input: {
       }
       if (isRunningTool(tool)) {
         hasRunningTool = true
+        continue
+      }
+      if (input.groupChatId && (normalizedName === 'group_chat_send' || normalizedName === 'message_send' || normalizedName === 'sendmessage')) {
+        const receipt = findGroupSendReceipt(tool.output) ?? findGroupSendReceipt(tool.outputText)
+        const matched = normalizedName === 'group_chat_send' && !isErroredTool(tool) &&
+          tool.input?.groupChatId === input.groupChatId &&
+          tool.input?.from === input.memberName &&
+          (!input.teamName || tool.input?.teamName === input.teamName) &&
+          tool.input?.relayOfMessageId === input.inboundMessageId &&
+          receipt?.saved === true && receipt.groupChatId === input.groupChatId &&
+          receipt.relayOfMessageId === input.inboundMessageId &&
+          typeof tool.input?.messageId === 'string' &&
+          (receipt.groupMessageId ?? receipt.messageId) === tool.input.messageId
+        if (matched) {
+          best = buildObservation({
+            state: 'responded_visible_message', deliveredUserMessageId,
+            assistantMessageId: child.id, toolCallNames: [...observedToolNames],
+            visibleMessageToolCallId: tool.callId,
+            visibleReplyMessageId: tool.input!.messageId as string,
+            visibleReplyCorrelation: 'relayOfMessageId', latestAssistantPreview: messagePreview(child),
+          })
+        } else {
+          groupReplyBlocked = true
+        }
         continue
       }
       if (isErroredTool(tool)) {
@@ -572,6 +623,14 @@ function classifyChildren(input: {
     })
   }
 
+  if (groupReplyBlocked && best?.state !== 'responded_visible_message') {
+    return buildObservation({
+      state: 'tool_error', deliveredUserMessageId,
+      assistantMessageId: input.children[input.children.length - 1]?.id ?? null,
+      toolCallNames: [...observedToolNames], reason: 'group_reply_blocked',
+    })
+  }
+
   if (hasRejectedMemberWorkSyncReport && !hasAcceptedMemberWorkSyncReport) {
     return buildObservation({
       state: 'tool_error',
@@ -601,13 +660,23 @@ function classifyChildren(input: {
     })
   }
 
+  const lastChild = input.children[input.children.length - 1]
+  // A silent group peer may complete without sending a reply. A missing status
+  // is not completion proof: the exact child must positively finish on its own.
+  const completedSilentGroupTurn = Boolean(
+    input.groupChatId && (input.rawStatus === 'idle' || input.rawStatus === null) && lastChild?.id
+    && Number.isFinite(lastChild.completedAt) && (lastChild.completedAt ?? 0) > 0
+    && lastChild.finishReason === 'stop' && observedToolNames.size === 0,
+  )
   return buildObservation({
     state: 'empty_assistant_turn',
     deliveredUserMessageId,
-    assistantMessageId: input.children[input.children.length - 1]?.id ?? null,
+    assistantMessageId: lastChild?.id ?? null,
     toolCallNames: [...observedToolNames],
-    latestAssistantPreview: messagePreview(input.children[input.children.length - 1] ?? null),
-    reason: 'assistant_child_has_no_visible_or_meaningful_response',
+    latestAssistantPreview: messagePreview(lastChild ?? null),
+    reason: completedSilentGroupTurn
+      ? 'assistant_child_completed_without_visible_or_meaningful_response'
+      : 'assistant_child_has_no_visible_or_meaningful_response',
   })
 }
 
@@ -647,6 +716,9 @@ export function observeOpenCodeDeliveryResponse(
   for (const userMessage of delivered.messages) {
     const observation = classifyChildren({
       inboundMessageId,
+      groupChatId: input.groupChatId,
+      memberName: input.memberName,
+      teamName: input.teamName,
       userMessage,
       children: assistantResponseChain(input.summary, userMessage),
       rawStatus: input.summary.rawStatus,

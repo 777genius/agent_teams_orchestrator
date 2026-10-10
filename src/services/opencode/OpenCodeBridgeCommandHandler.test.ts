@@ -4,7 +4,9 @@ import { createHash } from 'node:crypto'
 import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 
 import {
   __getAppMcpPreflightTimeoutMsForTests,
@@ -950,6 +952,157 @@ async function withManualTimers<T>(run: (timers: ManualTimer[]) => Promise<T>): 
 }
 
 describe('OpenCodeBridgeCommandHandler', () => {
+  test('publishes group protocol only for a live bootstrapped lane with fresh group tools and the retained binding', async () => {
+    const live = structuredClone(snapshot)
+    let sessionAvailable = true
+    let mcpConnected = true
+    let archived = false
+    const groupContext = JSON.stringify({ appInstanceId: 'synthetic-app', dataRootFingerprint: 'synthetic-root', connectionGeneration: 1 })
+    const hostRequests: string[] = []
+    const host = Bun.serve({
+      hostname: '127.0.0.1', port: 0,
+      async fetch(request) {
+        const pathname = new URL(request.url).pathname
+        hostRequests.push(pathname)
+        if (pathname === '/mcp') return Response.json({ 'agent-teams': { status: mcpConnected ? 'connected' : 'disconnected' } })
+        if (pathname === '/session/session-1') return sessionAvailable ? Response.json({ id: 'session-1' }) : new Response('Missing session', { status: 404 })
+        if (pathname.startsWith('/api/teams/team-a/group-chats/')) {
+          if (request.headers.get('x-agent-teams-app-context') !== groupContext) return new Response('Wrong binding', { status: 409 })
+          const body = await request.json() as Record<string, unknown>
+          if (pathname.endsWith('/list')) return Response.json([{ id: '3695a573-5ad2-469a-91f2-427f90792e11', name: 'Design', archivedAt: archived ? '2026-10-10T00:00:01Z' : null }])
+          if (archived) return Response.json({ code: 'GROUP_ARCHIVED' }, { status: 409 })
+          return Response.json({ saved: true, groupChatId: body.groupChatId, groupMessageId: body.messageId, relayOfMessageId: body.relayOfMessageId })
+        }
+        return new Response('Unknown synthetic endpoint', { status: 404 })
+      },
+    })
+    try {
+      live.host!.baseUrl = host.url.origin
+      live.host!.port = host.port!
+      live.host!.pid = process.pid
+      live.mcp = { 'agent-teams': { status: 'connected' } }
+      live.host!.profile.managedConfig.mcp!['agent-teams']!.environment = {
+        AGENT_TEAMS_BOUND_CONTROL_URL: host.url.origin,
+        AGENT_TEAMS_BOUND_CONTEXT_JSON: groupContext,
+      }
+      let record = buildRecord({
+        runtimePid: process.pid, selectedModel: 'openai/gpt-5.6-sol', toolApprovalMode: 'auto',
+        profileScope: { purpose: 'launch_runtime', providerId: 'openai', scopeToken: 'group-lane', configFingerprint: 'config', selectedAuthIdentity: 'absent' },
+        appManagedBootstrap: { schemaVersion: 1, messageID: 'msg_bootstrap_group', contextHash: 'a'.repeat(64), briefingHash: 'b'.repeat(64), injectionVerifiedAt: '2026-10-10T00:00:00Z' },
+      })
+      openCodeSessionStore.list = async () => [record]
+      openCodeSessionStore.get = async () => record
+      openCodeProvisioningProbe.probe = async () => live
+      openCodeProvisioningProbe.probeRetainingHost = async () => ({ snapshot: live, host: live.host!, release: async () => {} })
+      const mcpConfig = live.host!.profile.managedConfig.mcp!['agent-teams']!
+      mcpConfig.command = [process.execPath, fileURLToPath(new URL('./fixtures/group-chat-mcp.ts', import.meta.url))]
+      mcpConfig.environment!.SYNTHETIC_MCP_TOOL_NAMES = JSON.stringify(REQUIRED_MOCK_MCP_TOOL_NAMES)
+      mcpConfig.environment!.SYNTHETIC_GROUP_TOOLS = '1'
+      Client.prototype.connect = originalClientConnect
+      Client.prototype.listTools = originalClientListTools
+      Client.prototype.close = originalClientClose
+      const negotiation = { requiredCommand: 'opencode.sendMessage', teamName: 'team-a', memberName: 'alice', teamId: 'team-a', laneId: 'primary', runId: record.runId, expectedCapabilitySnapshotId: 'opencode:' + 'a'.repeat(32) }
+      const handshake = async () => {
+        const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.handshake', negotiation))
+        if ('error' in result) throw new Error(result.error.message)
+        if (!('server' in result.data)) throw new Error('Expected handshake server identity')
+        return result.data.server
+      }
+      const ready = await handshake()
+      expect(ready.bridgeProtocol.groupChatProtocolVersion).toBe(1)
+      expect(ready.runtime.groupChatRunProof).toEqual({
+        teamName: 'team-a', memberName: 'alice', runId: 'run-1', runKey: 'run-1', laneId: 'primary',
+        runtimePid: process.pid, runtimeSessionId: record.opencodeSessionId, processorReady: true,
+      })
+      expect(Object.hasOwn(ready.runtime, 'groupChatCapabilities')).toBe(false)
+      expect(Object.hasOwn(ready.runtime, 'groupRunKey')).toBe(false)
+      expect(Object.hasOwn(ready.runtime, 'groupChatProtocolVersion')).toBe(false)
+      expect(hostRequests).toContain('/session/session-1')
+      expect(hostRequests).toContain('/mcp')
+      process.kill(ready.runtime.groupChatRunProof.runtimePid, 0)
+      openCodeSessionBridge.reconcileSession = (async target => ({ record: target, summary: buildReconcileSummary() })) as typeof openCodeSessionBridge.reconcileSession
+      const reconciled = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.reconcileTeam', {
+        ...negotiation, expectedCapabilitySnapshotId: ready.runtime.capabilitySnapshotId,
+        expectedMembers: [{ name: 'alice', model: record.selectedModel }],
+      }))
+      if ('error' in reconciled) throw new Error(reconciled.error.message)
+      if (!('members' in reconciled.data)) throw new Error('Expected reconciled member projection')
+      const reconciledMember = reconciled.data.members.alice
+      if (!('groupChatRunProof' in reconciledMember)) throw new Error('Expected current member group proof')
+      expect(reconciledMember.groupChatRunProof).toEqual(ready.runtime.groupChatRunProof)
+      expect(Object.hasOwn(reconciledMember, 'groupRunKey')).toBe(false)
+      const prompts: string[] = []
+      openCodeSessionBridge.promptAsync = (async (_record, input) => { prompts.push(input.text) }) as typeof openCodeSessionBridge.promptAsync
+      const groupBody = {
+        teamId: 'team-a', teamName: 'team-a', laneId: 'primary', runId: 'run-1', memberName: 'alice', text: 'Review this',
+        expectedCapabilitySnapshotId: ready.runtime.capabilitySnapshotId, expectedBehaviorFingerprint: record.expectedBehaviorFingerprint,
+        groupChatProtocolVersion: 1, groupRunKey: ready.runtime.groupChatRunProof.runKey,
+        groupChatId: '3695a573-5ad2-469a-91f2-427f90792e11', groupChatName: 'Design',
+        groupMessageId: 'b8192a4c-97c8-4f67-bccd-7b29d8131286', messageId: '0bdf10f0-3fd3-4494-a974-b394de06c181',
+        from: 'user', timestamp: '2026-10-10T00:00:00Z', settlementMode: 'acceptance',
+      }
+      const delivered = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.sendMessage', groupBody))
+      expect(delivered.ok).toBe(true)
+      if ('error' in delivered) throw new Error(delivered.error.message)
+      if (!('accepted' in delivered.data)) throw new Error('Expected send acceptance')
+      expect(delivered.data.accepted).toBe(true)
+      expect(prompts).toHaveLength(1)
+      expect(prompts[0]).toContain('Group name: "Design"')
+      expect(prompts[0]).toContain('"relayOfMessageId":"0bdf10f0-3fd3-4494-a974-b394de06c181"')
+      expect(prompts[0]).toContain('Fresh group catalog:')
+      expect(prompts[0]).toContain('Sender: "user". Timestamp: "2026-10-10T00:00:00Z".')
+      let observedMcpToolNames: string[] = []
+      let groupToolResults: unknown[] = []
+      const mcp = new Client({ name: 'synthetic-group-reply-proof', version: '1' })
+      try {
+        await mcp.connect(new StdioClientTransport({ command: mcpConfig.command![0]!, args: mcpConfig.command!.slice(1), env: mcpConfig.environment }))
+        observedMcpToolNames = (await mcp.listTools()).tools.map(tool => tool.name)
+        const catalog = await mcp.callTool({ name: 'group_chat_list', arguments: { teamName: 'team-a', from: 'alice' } })
+        expect(catalog.isError).toBe(false)
+        const reply = { teamName: 'team-a', from: 'alice', groupChatId: groupBody.groupChatId,
+          messageId: 'fae7d421-dfd0-4bd3-bc0b-2693fd24b344', relayOfMessageId: groupBody.messageId, text: 'Group reply' }
+        const saved = await mcp.callTool({ name: 'mcp__agent-teams__group_chat_send', arguments: reply })
+        expect(saved.isError).toBe(false)
+        expect(saved.content).toEqual([{ type: 'text', text: JSON.stringify({ saved: true, groupChatId: reply.groupChatId, groupMessageId: reply.messageId, relayOfMessageId: reply.relayOfMessageId }) }])
+        archived = true
+        const blocked = await mcp.callTool({ name: 'mcp__agent-teams__group_chat_send', arguments: reply })
+        expect(blocked.isError).toBe(true)
+        groupToolResults = [catalog, saved, blocked]
+      } finally { await mcp.close() }
+      archived = false
+      const missingRunKey = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.sendMessage', { ...groupBody, groupRunKey: undefined }))
+      expect(missingRunKey.ok).toBe(false)
+      const stale = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.sendMessage', { ...groupBody, groupRunKey: 'old-run:123' }))
+      expect(stale.ok).toBe(false)
+      expect(prompts).toHaveLength(1)
+      if (process.env.GROUP_CHAT_RUNTIME_EVIDENCE_PATH) {
+        await writeFile(process.env.GROUP_CHAT_RUNTIME_EVIDENCE_PATH, JSON.stringify({
+          observedAt: new Date().toISOString(), synthetic: true,
+          source: 'synthetic live HTTP host/session + real stdio MCP tools/list; retained lane store/provisioning mocked, no model',
+          server: ready, hostRequests, pidLiveAtObservation: true,
+          observedMcpToolNames, groupToolResults, reconciledMember,
+        }, null, 2))
+      }
+      const lightweight = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.handshake', { requiredCommand: 'opencode.launchTeam' }))
+      if ('error' in lightweight) throw new Error(lightweight.error.message)
+      if (!('server' in lightweight.data)) throw new Error('Expected lightweight handshake identity')
+      expect(lightweight.data.server.bridgeProtocol.groupChatProtocolVersion).toBeUndefined()
+      expect(lightweight.data.server.runtime.groupChatRunProof).toBeUndefined()
+      sessionAvailable = false
+      expect((await handshake()).runtime.groupChatRunProof).toBeUndefined()
+      sessionAvailable = true
+      mcpConnected = false
+      expect((await handshake()).runtime.groupChatRunProof).toBeUndefined()
+      mcpConnected = true
+      mcpConfig.environment!.SYNTHETIC_GROUP_TOOLS = '0'
+      expect((await handshake()).runtime.groupChatRunProof).toBeUndefined()
+      mcpConfig.environment!.SYNTHETIC_GROUP_TOOLS = '1'
+      record = { ...record, runtimePid: 2147483647 }
+      expect((await handshake()).runtime.groupChatRunProof).toBeUndefined()
+      record = { ...record, runtimePid: process.pid, appManagedBootstrap: undefined }
+      expect((await handshake()).runtime.groupChatRunProof).toBeUndefined()
+    } finally { host.stop(true) }
+  })
   test('exposes the OpenCode task ledger evidence contract version in handshake', async () => {
     openCodeProvisioningProbe.probe = async () => snapshot
 

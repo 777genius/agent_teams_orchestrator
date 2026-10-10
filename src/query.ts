@@ -3,6 +3,7 @@ import type {
   ToolResultBlockParam,
   ToolUseBlock,
 } from '@anthropic-ai/sdk/resources/index.mjs'
+import { hasProcessingGroupMailboxTurn, shouldDeferGroupMailboxCommand } from './utils/groupMailbox.js'
 import type { CanUseToolFn } from './hooks/useCanUseTool.js'
 import { FallbackTriggeredError } from './services/api/withRetry.js'
 import {
@@ -1599,9 +1600,13 @@ async function* queryLoop(
     const isMainThread =
       querySource.startsWith('repl_main_thread') || querySource === 'sdk'
     const currentAgentId = toolUseContext.agentId
+    const processingGroupMailboxTurn = hasProcessingGroupMailboxTurn(
+      toolUseContext.getAppState().inbox.messages,
+    )
     const queuedCommandsSnapshot = getCommandsByMaxPriority(
       sleepRan ? 'later' : 'next',
     ).filter(cmd => {
+      if (shouldDeferGroupMailboxCommand(cmd, processingGroupMailboxTurn)) return false
       if (isSlashCommand(cmd)) return false
       if (isMainThread) return cmd.agentId === undefined
       // Subagents only drain task-notifications addressed to them — never

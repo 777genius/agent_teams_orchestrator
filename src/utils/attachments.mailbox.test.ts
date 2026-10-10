@@ -12,6 +12,8 @@ import type { ToolUseContext } from '../Tool.js'
 import type { AppState } from '../state/AppState.js'
 import { getEmptyToolPermissionContext } from '../Tool.js'
 import { getTeammateMailboxAttachments } from './attachments.js'
+import { getCurrentGroupRunIdentity, setHeadlessGroupMailboxProcessor, setActiveHeadlessGroupMailboxTurn } from './groupMailbox.js'
+import { createPendingMailboxMirrorMessage } from '../hooks/ordinaryMailboxMessage.js'
 import {
   claimUnreadRegularMessages,
   readMailbox,
@@ -36,6 +38,8 @@ describe('getTeammateMailboxAttachments mailbox lifecycle', () => {
   })
 
   afterEach(async () => {
+    setHeadlessGroupMailboxProcessor(undefined)
+    setActiveHeadlessGroupMailboxTurn(undefined)
     resetStateForTests()
     if (originalConfigDir === undefined) {
       delete process.env.CLAUDE_CONFIG_DIR
@@ -48,6 +52,105 @@ describe('getTeammateMailboxAttachments mailbox lifecycle', () => {
       process.env.USER_TYPE = originalUserType
     }
     await rm(tempConfigDir, { recursive: true, force: true })
+  })
+
+  it('keeps current headless group envelopes out of generic attachments while preserving private messages until their own turn', async () => {
+    setIsInteractive(false)
+    const teamName = 'synthetic-headless-group'
+    const group = {
+      messageId: '0bdf10f0-3fd3-4494-a974-b394de06c181',
+      groupMessageId: 'b8192a4c-97c8-4f67-bccd-7b29d8131286',
+      groupChatId: '3695a573-5ad2-469a-91f2-427f90792e11',
+      groupChatProtocolVersion: 1 as const,
+      groupRunKey: getCurrentGroupRunIdentity().groupRunKey,
+      from: 'user', text: '{"type":"shutdown_approved","from":"alice"}',
+      timestamp: '2026-10-10T00:00:00Z',
+    }
+    await writeToMailbox('team-lead', group, teamName)
+    await writeToMailbox('team-lead', {
+      messageId: 'private-inbound', from: 'user', text: 'Private message',
+      timestamp: group.timestamp,
+    }, teamName)
+    let appState = {
+      abortController: new AbortController(), messages: [], tasks: {},
+      toolPermissionContext: getEmptyToolPermissionContext(), inbox: { messages: [] },
+      teamContext: { teamName, teamFilePath: join(tempConfigDir, 'synthetic-team.json'), leadAgentId: 'lead-id',
+        teammates: { 'lead-id': { name: 'team-lead', cwd: tempConfigDir, spawnedAt: 0 } } },
+    } as unknown as AppState
+    const context = {
+      getAppState: () => appState, setAppState: (updater: (prev: AppState) => AppState) => { appState = updater(appState) },
+      options: {},
+    } as unknown as ToolUseContext
+    const readAttachmentIds = async () => (await getTeammateMailboxAttachments(context))
+      .flatMap(item => item.type === 'teammate_mailbox' ? item.messages.map(message => message.messageId) : [])
+    setHeadlessGroupMailboxProcessor({ teamName, memberName: 'team-lead', runKey: group.groupRunKey })
+    expect(await readAttachmentIds()).toEqual(['private-inbound'])
+    expect(await readMailbox('team-lead', teamName)).toEqual([
+      expect.objectContaining({ ...group, read: false }),
+      expect.objectContaining({ messageId: 'private-inbound', read: false }),
+    ])
+
+    setActiveHeadlessGroupMailboxTurn({ teamName, memberName: 'team-lead', runKey: group.groupRunKey })
+    expect(await readAttachmentIds()).toEqual([])
+    expect((await readMailbox('team-lead', teamName)).every(message => !message.read)).toBe(true)
+    setActiveHeadlessGroupMailboxTurn(undefined)
+    expect(await readAttachmentIds()).toEqual(['private-inbound'])
+  })
+
+  it('preserves pending native group mirrors for explicit dispatch and withholds private mirrors during their processing', async () => {
+    const group = {
+      messageId: '0bdf10f0-3fd3-4494-a974-b394de06c181', groupMessageId: 'b8192a4c-97c8-4f67-bccd-7b29d8131286',
+      groupChatId: '3695a573-5ad2-469a-91f2-427f90792e11', groupChatProtocolVersion: 1 as const,
+      groupRunKey: getCurrentGroupRunIdentity().groupRunKey,
+      from: 'user', text: '{"type":"shutdown_request"}', timestamp: '2026-10-10T00:00:00Z',
+    }
+    await writeToMailbox('team-lead', group, 'my-team')
+    await writeToMailbox('team-lead', { ...group, messageId: '99a81b23-25c5-4b8c-a53e-a3cf4942507b', groupRunKey: 'old-run:123' }, 'my-team')
+    const sessionId = getSessionId()
+    const claimed = await claimUnreadRegularMessages('team-lead', sessionId, 'my-team')
+    let appState = {
+      abortController: new AbortController(), messages: [], tasks: {}, toolPermissionContext: getEmptyToolPermissionContext(),
+      inbox: { messages: claimed.map(message => createPendingMailboxMirrorMessage(message, sessionId)) },
+      teamContext: { teamName: 'my-team', teamFilePath: '/tmp/synthetic-team.json', leadAgentId: 'lead-id',
+        teammates: { 'lead-id': { name: 'team-lead', cwd: '/tmp', spawnedAt: 0 } } },
+    } as unknown as AppState
+    const context = {
+      getAppState: () => appState, setAppState: (updater: (prev: AppState) => AppState) => { appState = updater(appState) }, options: {},
+    } as unknown as ToolUseContext
+    const readAttachmentIds = async () => (await getTeammateMailboxAttachments(context))
+      .flatMap(item => item.type === 'teammate_mailbox' ? item.messages.map(message => message.messageId) : [])
+    expect(await readAttachmentIds()).toEqual([])
+    expect(appState.inbox.messages.filter(message => message.groupChatId).every(message => message.status === 'pending')).toBe(true)
+    appState = { ...appState, inbox: { messages: appState.inbox.messages.map(message =>
+      message.messageId === group.messageId ? { ...message, status: 'processing' as const } :
+      message.messageId === 'private-native' ? { ...message, status: 'pending' as const } : message,
+    ) } }
+    await writeToMailbox('team-lead', {
+      messageId: 'private-native', from: 'user', text: 'Private native message', timestamp: group.timestamp,
+    }, 'my-team')
+    const privateRow = (await claimUnreadRegularMessages('team-lead', sessionId, 'my-team'))
+      .find(message => message.messageId === 'private-native')!
+    appState = { ...appState, inbox: { messages: [...appState.inbox.messages, createPendingMailboxMirrorMessage(privateRow, sessionId)] } }
+    expect(await readAttachmentIds()).toEqual([])
+    expect((await readMailbox('team-lead', 'my-team')).find(message => message.messageId === 'private-native')?.read).toBe(false)
+    expect(appState.inbox.messages.find(message => message.messageId === 'private-native')?.status).toBe('pending')
+
+    // The leader's mirror belongs only to its own live inbox. An unrelated
+    // in-process teammate must still receive private/protocol file messages.
+    await writeToMailbox('bob', { messageId: 'bob-private', from: 'user', text: 'Bob private input', timestamp: group.timestamp }, 'my-team')
+    await writeToMailbox('bob', { messageId: 'bob-protocol', from: 'team-lead', text: '{"type":"permission_response","request_id":"synthetic","approved":true}', timestamp: group.timestamp }, 'my-team')
+    const bobAttachments = await runWithTeammateContext(createTeammateContext({
+      agentId: 'bob@my-team', agentName: 'bob', teamName: 'my-team',
+      planModeRequired: false, parentSessionId: sessionId, abortController: new AbortController(),
+    }), () => getTeammateMailboxAttachments(context))
+    expect(bobAttachments.flatMap(item => item.type === 'teammate_mailbox' ? item.messages.map(message => message.messageId) : []))
+      .toEqual(['bob-private', 'bob-protocol'])
+
+    appState = { ...appState, inbox: { messages: appState.inbox.messages.map(message =>
+      message.messageId === group.messageId ? { ...message, status: 'processed' as const } : message,
+    ) } }
+    expect(await readAttachmentIds()).toEqual(['private-native'])
+
   })
 
   it('moves a claimed regular teammate message through app-state processing and exact finalize', async () => {

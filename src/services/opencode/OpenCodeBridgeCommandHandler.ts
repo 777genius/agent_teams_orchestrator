@@ -1,4 +1,7 @@
 import { drainStartupTaskkills, pendingStartupTaskkillPids } from '../../utils/processKill.js'
+import { buildOpenCodeGroupChatRunProof, type OpenCodeGroupChatRunProof } from './OpenCodeGroupChatCapability.js'
+import { isBoundGroupChatControl, readFreshGroupChatCatalog } from '../../utils/groupChatControlClient.js'
+import { assertValidGroupMailboxRows, buildGroupMailboxPrompt, hasGroupMailboxMarker } from '../../utils/groupMailbox.js'
 import { OpenCodeStartupCleanupBudget } from './OpenCodeStartupCleanupBudget.js'
 import type { OpenCodeOAuthNativeProbeOwner } from './OpenCodeAuthStore.js'
 import { createHash, randomUUID } from 'node:crypto'
@@ -223,6 +226,7 @@ type TeamWarning = {
 }
 
 type LaunchMemberDraft = {
+  groupChatRunProof?: OpenCodeGroupChatRunProof
   sessionId: string
   launchState: 'created' | 'confirmed_alive' | 'permission_blocked' | 'failed'
   pendingPermissionRequestIds?: string[]
@@ -236,6 +240,7 @@ type LaunchMemberDraft = {
 }
 
 type OpenCodeAppManagedBootstrapCandidate = {
+  groupChatRunProof?: OpenCodeGroupChatRunProof
   schemaVersion: 1
   source: 'app_managed_bootstrap'
   teamName: string
@@ -906,6 +911,7 @@ function buildOpenCodeRuntimeIdentityBlock(input: {
   runId: string
   runtimeSessionId: string
   purpose?: 'launch' | 'reminder'
+  groupChatId?: string | null
 }): string {
   const purpose = input.purpose ?? 'reminder'
   const checkinPayload = {
@@ -938,11 +944,11 @@ function buildOpenCodeRuntimeIdentityBlock(input: {
           'If the briefing says there are no actionable tasks, stay idle silently.',
         ]
       : [
-          'For this delivered app message, prioritize the requested visible reply through message_send.',
+          input.groupChatId ? 'For this group delivery, reply only through group_chat_send in the explicit group with the physical inbound relayOfMessageId.' : 'For this delivered app message, prioritize the requested visible reply through message_send.',
           'Only send a visible message when you are replying to this delivered app message or reporting real task/blocker/result context.',
           'Do not send unrelated readiness, understood, idle, or no-task acknowledgements.',
         ]),
-    'For visible team/app messages, use the exposed Agent Teams message_send tool, usually agent-teams_message_send or mcp__agent-teams__message_send. Do not use SendMessage.',
+    input.groupChatId ? 'This is a group message. Never redirect it to message_send or SendMessage. A blocked group send is terminal; do not repair or fall back to a private message.' : 'For visible team/app messages, use the exposed Agent Teams message_send tool, usually agent-teams_message_send or mcp__agent-teams__message_send. Do not use SendMessage.',
     'Do not use runtime_deliver_message for ordinary visible replies unless a runtime-delivery prompt explicitly provides runId/runtimeSessionId/idempotencyKey.',
     '</opencode_runtime_identity>',
   ].join('\n')
@@ -1257,7 +1263,7 @@ async function withStoredLaneAuthority<T>(
 
 function createBridgeServerIdentity(
   snapshot?: OpenCodeProvisioningSnapshot | null,
-  overrides: { runtimeStoreManifestHighWatermark?: number | null; confirmedStopRuntime?: ConfirmedStopRuntime; deliveryRuntime?: ReturnType<typeof createRuntimeSnapshot> } = {},
+  overrides: { runtimeStoreManifestHighWatermark?: number | null; confirmedStopRuntime?: ConfirmedStopRuntime; deliveryRuntime?: ReturnType<typeof createRuntimeSnapshot>; groupChatRunProof?: OpenCodeGroupChatRunProof } = {},
 ) {
   return {
     schemaVersion: BRIDGE_SCHEMA_VERSION,
@@ -1273,11 +1279,13 @@ function createBridgeServerIdentity(
       opencodeAppManagedBootstrapContractVersion: OPENCODE_APP_MANAGED_BOOTSTRAP_CONTRACT_VERSION,
       opencodeDeliveryAcceptanceContractVersion: OPENCODE_DELIVERY_ACCEPTANCE_CONTRACT_VERSION,
       opencodeFilePartsContractVersion: OPENCODE_FILE_PARTS_CONTRACT_VERSION,
+      ...(overrides.groupChatRunProof ? { groupChatProtocolVersion: 1 as const } : {}),
       expectedBehaviorFingerprintSchemaVersion:
         OPEN_CODE_EXPECTED_BEHAVIOR_FINGERPRINT_SCHEMA_VERSION,
     },
     runtime: {
       ...createRuntimePreconditionSnapshot(snapshot, overrides),
+      ...(overrides.groupChatRunProof ? { groupChatRunProof: overrides.groupChatRunProof } : {}),
     },
     featureFlags: {
       opencodeTeamLaunch: true,
@@ -1395,6 +1403,9 @@ function messageSendToolErrorFallbackGraceMs(): number {
 async function reobserveAfterMessageSendToolErrorFallbackGrace(input: {
   record: OpenCodeSessionRecord
   inboundMessageId: string | null
+  groupChatId?: string | null
+  memberName?: string | null
+  teamName?: string | null
   prePromptCursor: string | null
   runtimePromptMessageId?: string | null
   sessionId?: string | null
@@ -1434,6 +1445,7 @@ async function reobserveAfterMessageSendToolErrorFallbackGrace(input: {
     )
     responseObservation = observeOpenCodeDeliveryResponse({
       inboundMessageId: input.inboundMessageId,
+      groupChatId: input.groupChatId, memberName: input.memberName, teamName: input.teamName,
       prePromptCursor: input.prePromptCursor,
       runtimePromptMessageId: input.runtimePromptMessageId,
       summary: reconciled.summary,
@@ -1981,6 +1993,64 @@ async function listAppMcpToolsFromResolvedLaunchConfig(
   }
 }
 
+async function readLiveGroupChatRunProofs(
+  snapshot: OpenCodeProvisioningSnapshot | null,
+  records: OpenCodeSessionRecord[],
+  phaseContext?: OpenCodePhaseContext,
+): Promise<OpenCodeGroupChatRunProof[]> {
+  if (!snapshot?.host || !isAppMcpConnected(snapshot)) return []
+  try {
+    const launchConfig = getRetainedAppMcpLaunchConfig(snapshot.host)
+    const binding = { ...snapshot.host.profile.env, ...launchConfig.config.environment }
+    if (!isBoundGroupChatControl(binding.AGENT_TEAMS_BOUND_CONTROL_URL, binding.AGENT_TEAMS_BOUND_CONTEXT_JSON)) return []
+    // Deliberately bypass the persisted/version-scoped tools cache for this run.
+    const observed = await listAppMcpToolsFromResolvedLaunchConfig(launchConfig, phaseContext, snapshot.host.profile.env)
+    const client = openCodeClientFactory.create(snapshot.host.baseUrl, phaseContext ? {
+      signal: phaseContext.signal, remainingMs: phaseContext.remainingMs,
+    } : {})
+    const mcp = await client.getMcp()
+    if (mcp['agent-teams']?.status !== 'connected') return []
+    const proofs: OpenCodeGroupChatRunProof[] = []
+    for (const record of records) {
+      const session = await client.getSession(record.opencodeSessionId)
+      if (session.id !== record.opencodeSessionId) continue
+      const current = await openCodeSessionStore.get(record.teamId, record.laneId ?? 'primary', record.memberName)
+      if (!current || current.runId !== record.runId || current.hostKey !== record.hostKey ||
+          current.runtimePid !== record.runtimePid || current.opencodeSessionId !== record.opencodeSessionId) continue
+      const proof = buildOpenCodeGroupChatRunProof(
+        { ...snapshot, mcp }, current, observed.map(canonicalizeAppMcpToolId),
+      )
+      if (proof) proofs.push(proof)
+    }
+    return proofs
+  } catch {
+    if (phaseContext?.signal.aborted) throwOpenCodeAbortReason(phaseContext.signal)
+    return []
+  }
+}
+
+async function attachGroupChatLaunchProofs(
+  snapshot: OpenCodeProvisioningSnapshot,
+  members: Record<string, LaunchMemberDraft>,
+  teamId: string, laneId: string, runId: string,
+): Promise<void> {
+  const host = snapshot.host
+  if (!host) return
+  const binding = { ...host.profile.env, ...host.profile.managedConfig.mcp?.[OPEN_CODE_APP_MCP_SERVER_NAME]?.environment }
+  if (!isBoundGroupChatControl(binding.AGENT_TEAMS_BOUND_CONTROL_URL, binding.AGENT_TEAMS_BOUND_CONTEXT_JSON)) return
+  const records: OpenCodeSessionRecord[] = []
+  for (const [name, member] of Object.entries(members)) {
+    if (member.launchState !== 'created' && member.launchState !== 'confirmed_alive') continue
+    const record = await openCodeSessionStore.get(teamId, laneId, name)
+    if (record?.runId === runId && record.opencodeSessionId === member.sessionId) records.push(record)
+  }
+  for (const capability of await readLiveGroupChatRunProofs(snapshot, records)) {
+    const member = members[capability.memberName]!
+    member.groupChatRunProof = capability
+    if (member.appManagedBootstrapCandidate) member.appManagedBootstrapCandidate.groupChatRunProof = capability
+  }
+}
+
 function buildMcpPreflightEnv(
   base: NodeJS.ProcessEnv,
   extra?: Record<string, string>,
@@ -2420,6 +2490,7 @@ function buildTeamLaunchData(params: {
         memberName,
         {
           sessionId: member.sessionId,
+          ...(member.groupChatRunProof ? { groupChatRunProof: member.groupChatRunProof } : {}),
           launchState: member.launchState,
           ...(member.bootstrapEvidenceSource
             ? { bootstrapEvidenceSource: member.bootstrapEvidenceSource }
@@ -4126,6 +4197,7 @@ async function runLaunch(
     projection.appManagedBootstrapCandidate?.memberName ?? projection.sessionId,
     projection,
   ]))
+  await attachGroupChatLaunchProofs(snapshot, members, teamId, laneId, runId)
   return {
     snapshot,
     data: buildTeamLaunchData({
@@ -4417,6 +4489,7 @@ async function runLaunchWithProvisioningSnapshot(
     'info',
   ))
 
+  await attachGroupChatLaunchProofs(snapshot, members, teamId, laneId, runId)
   return {
     snapshot,
     data: buildTeamLaunchData({
@@ -4553,6 +4626,7 @@ async function runReconcile(envelope: BridgeEnvelope) {
     }
   }
 
+  await attachGroupChatLaunchProofs(snapshot, members, teamId, laneId, runId)
   return {
     snapshot,
     data: buildTeamLaunchData({
@@ -5015,6 +5089,14 @@ async function runSendMessage(
 }> {
   const authoritySnapshot = authority?.snapshot
   const body = envelope.body
+  if (hasGroupMailboxMarker(body) && !asString(body.groupChatId)) throw new Error('GROUP_INVALID_ENVELOPE: explicit group destination required')
+  if (hasGroupMailboxMarker(body) && (!authority || body.groupChatProtocolVersion !== 1 || !asString(body.groupRunKey))) {
+    throw new Error('GROUP_RECIPIENT_INCOMPATIBLE: group delivery requires an existing bound run')
+  }
+  if (hasGroupMailboxMarker(body)) {
+    try { assertValidGroupMailboxRows([{ ...body, read: false }]) }
+    catch { throw new Error('GROUP_INVALID_ENVELOPE: valid group, canonical and physical origin fields required') }
+  }
   const teamId = asString(body.teamId) ?? asString(body.teamName)
   const laneId = asString(body.laneId)
   const memberName = asString(body.memberName)
@@ -5271,6 +5353,17 @@ async function runSendMessage(
   }
   const prePromptCursor = deliveryRecord.lastCanonicalCursor ?? null
 
+  const groupChatId = asString(body.groupChatId)
+  if (groupChatId) {
+    const [capability] = await readLiveGroupChatRunProofs(snapshot, [deliveryRecord])
+    if (!authority || !capability || capability.runId !== runId ||
+        capability.runKey !== asString(body.groupRunKey) ||
+        body.groupChatProtocolVersion !== 1 || !asString(body.groupMessageId) ||
+        !asString(body.messageId) || body.messageId === body.groupMessageId) {
+      throw new Error('GROUP_RECIPIENT_INCOMPATIBLE: current group bridge/run proof unavailable')
+    }
+    await assertStoredDeliveryAuthority(deliveryRecord, authority)
+  }
   const identityReminder = runId
     ? buildOpenCodeRuntimeIdentityBlock({
       teamName: teamId,
@@ -5278,10 +5371,25 @@ async function runSendMessage(
       runId,
       runtimeSessionId: deliveryRecord.opencodeSessionId,
       purpose: 'reminder',
+      groupChatId: asString(body.groupChatId),
     })
     : null
 
-  const deliveryText = identityReminder ? `${identityReminder}\n\n${text}` : text
+  let groupCatalog: unknown
+  if (groupChatId && snapshot.host) {
+    const launchConfig = getRetainedAppMcpLaunchConfig(snapshot.host)
+    const env = { ...snapshot.host.profile.env, ...launchConfig.config.environment }
+    try { groupCatalog = await readFreshGroupChatCatalog(teamId, memberName, {
+      controlUrl: env.AGENT_TEAMS_BOUND_CONTROL_URL, context: env.AGENT_TEAMS_BOUND_CONTEXT_JSON,
+    }) } catch { /* Unavailable is explicit in the handoff prompt. */ }
+    await assertStoredDeliveryAuthority(deliveryRecord, authority)
+  }
+  const groupPrompt = groupChatId ? buildGroupMailboxPrompt({
+    groupChatId, groupChatName: asString(body.groupChatName) ?? undefined,
+    groupMessageId: asString(body.groupMessageId)!, messageId: asString(body.messageId)!,
+    from: asString(body.from)!, text, timestamp: asString(body.timestamp)!,
+  }, teamId, memberName, groupCatalog) : text
+  const deliveryText = identityReminder ? `${identityReminder}\n\n${groupPrompt}` : groupPrompt
   const deliveryAgent = asString(body.agent) ?? OPEN_CODE_TEAMMATE_AGENT
   const noReply = body.noReply === true
   const settlementMode = body.settlementMode === 'acceptance' ? 'acceptance' : 'observed'
@@ -5538,6 +5646,7 @@ async function runSendMessage(
     ]
     responseObservation = observeOpenCodeDeliveryResponse({
       inboundMessageId: asString(body.messageId),
+      groupChatId: asString(body.groupChatId), memberName, teamName: teamId,
       prePromptCursor,
       runtimePromptMessageId,
       summary: reconciled.summary,
@@ -5547,6 +5656,7 @@ async function runSendMessage(
         const reobserved = await reobserveAfterMessageSendToolErrorFallbackGrace({
           record: reconciled.record,
           inboundMessageId: asString(body.messageId),
+      groupChatId: asString(body.groupChatId), memberName, teamName: teamId,
           prePromptCursor,
           runtimePromptMessageId,
           timeoutMs: OPENCODE_SEND_RECONCILE_TIMEOUT_MS,
@@ -5714,6 +5824,7 @@ async function runObserveMessageDelivery(
     )
     responseObservation = observeOpenCodeDeliveryResponse({
       inboundMessageId: messageId,
+      groupChatId: asString(body.groupChatId), memberName, teamName: teamId,
       prePromptCursor: asString(body.prePromptCursor),
       runtimePromptMessageId,
       summary: limited.summary,
@@ -5739,6 +5850,7 @@ async function runObserveMessageDelivery(
       )
       responseObservation = observeOpenCodeDeliveryResponse({
         inboundMessageId: messageId,
+      groupChatId: asString(body.groupChatId), memberName, teamName: teamId,
         prePromptCursor: asString(body.prePromptCursor),
         runtimePromptMessageId,
         summary: full.summary,
@@ -5749,6 +5861,7 @@ async function runObserveMessageDelivery(
         const reobserved = await reobserveAfterMessageSendToolErrorFallbackGrace({
           record: observeRecord,
           inboundMessageId: messageId,
+      groupChatId: asString(body.groupChatId), memberName, teamName: teamId,
           prePromptCursor: asString(body.prePromptCursor),
           runtimePromptMessageId,
           sessionId: requestedSessionId, signal: authority?.signal,
@@ -6162,6 +6275,7 @@ async function handleEnvelope(
       let snapshot: OpenCodeProvisioningSnapshot | null = null
       let confirmedStopRuntime: ConfirmedStopRuntime | undefined
       let deliveryRuntime: ReturnType<typeof createRuntimeSnapshot> | undefined
+      let groupChatRunProofs: OpenCodeGroupChatRunProof[] = []
       if (envelope.body.requiredCommand === 'opencode.stopOutcome'
         || envelope.body.requiredCommand === 'opencode.reconcileStop') {
         // Recovery negotiation must remain available after the original host exits.
@@ -6208,6 +6322,18 @@ async function handleEnvelope(
             snapshot = retained.snapshot
             confirmedStopRuntime = retained.confirmedStopRuntime
             deliveryRuntime = retained.deliveryRuntime
+            if (envelope.body.requiredCommand !== 'opencode.stopTeam') {
+              groupChatRunProofs = await readLiveGroupChatRunProofs(retained.snapshot, retained.records, {
+                signal: retained.signal ?? runtimeDeadline.signal,
+                remainingMs: () => runtimeDeadline.remainingMs(),
+                throwIfExpired: () => runtimeDeadline.throwIfExpired('mcp_preflight'),
+                phase: 'mcp_preflight',
+              })
+              for (const capability of groupChatRunProofs) {
+                const record = retained.records.find(row => row.memberName === capability.memberName)!
+                await assertStoredDeliveryAuthority(record, retained)
+              }
+            }
           })
       } else if (!lightweightLaunchHandshake) {
         snapshot = await openCodeProvisioningProbe.probe(envelope.cwd, {
@@ -6216,6 +6342,9 @@ async function handleEnvelope(
       }
       const identity = createBridgeServerIdentity(snapshot, {
         confirmedStopRuntime, deliveryRuntime,
+        groupChatRunProof: asString(envelope.body.memberName)
+          ? groupChatRunProofs.find(proof => proof.memberName === asString(envelope.body.memberName))
+          : groupChatRunProofs.length === 1 ? groupChatRunProofs[0] : undefined,
         // Every handshake that carries the app's manifest high watermark gets it
         // back unchanged, whatever command it negotiates.
         runtimeStoreManifestHighWatermark: expectedManifestHighWatermark,

@@ -1,3 +1,4 @@
+import { hasGroupMailboxMarker, type GroupMailboxEnvelope } from './groupMailbox.js'
 import { TEAM_LEAD_NAME } from './swarm/constants.js'
 import {
   getBoundWorkSyncContinuationTicket,
@@ -14,7 +15,7 @@ const BOOTSTRAP_MEMBER_BRIEFING_MARKER =
 const BOOTSTRAP_PERSISTENT_TEAMMATE_MARKER =
   'The team has already been created and you are being attached as a persistent teammate.'
 
-export type OrdinaryPendingMailboxMessage = {
+export type OrdinaryPendingMailboxMessage = GroupMailboxEnvelope & {
   messageId?: string
   messageKind?: string
   from?: string
@@ -34,7 +35,8 @@ function isBootstrapMailboxInstructionText(text: string): boolean {
   )
 }
 
-function isRegularInteractiveMailboxMessage(message: { text: string }): boolean {
+function isRegularInteractiveMailboxMessage(message: GroupMailboxEnvelope & { text: string }): boolean {
+  if (hasGroupMailboxMarker(message)) return true
   try {
     const parsed: unknown = JSON.parse(message.text)
     if (!parsed || typeof parsed !== 'object' || !('type' in parsed)) {
@@ -59,7 +61,7 @@ function isRegularInteractiveMailboxMessage(message: { text: string }): boolean 
 }
 
 export function classifyTicketedWorkSyncEnvelope(
-  message: OrdinaryPendingMailboxMessage,
+  message: Parameters<typeof readWorkSyncInboxContinuationTicket>[0],
 ): 'match' | 'wait' | 'stale' | 'none' {
   const ticket = readWorkSyncInboxContinuationTicket(message)
   if (!ticket) {
@@ -109,7 +111,7 @@ export function getOrdinaryPendingMessage<T extends OrdinaryPendingMailboxMessag
     message =>
       !!message.messageId &&
       message.messageKind !== 'agent_error' &&
-      isRegularInteractiveMailboxMessage({ text: message.text }) &&
+      isRegularInteractiveMailboxMessage(message) &&
       !(
         message.from === TEAM_LEAD_NAME &&
         isBootstrapMailboxInstructionText(message.text)
