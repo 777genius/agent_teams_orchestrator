@@ -7,6 +7,8 @@ import { isPackagedOpenCodeCommand, validatePackagedOpenCodeIdentity } from './p
 
 let root: string, binary: string, bun: string, entry: string, content: string
 const sha = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex')
+const abruptCallerTermination = (code: number | null, signal: string | null) =>
+  (Number.isInteger(code) && code !== 0 && signal === null) || (code === null && signal === 'SIGTERM')
 beforeAll(async () => {
   root = await mkdtemp(path.join(tmpdir(), 'TEST-packaged-opencode-'))
   binary = path.join(root, process.platform === 'win32' ? 'frontdoor.exe' : 'frontdoor')
@@ -14,7 +16,16 @@ beforeAll(async () => {
   entry = path.join(root, 'local-cli/cli.js')
   await mkdir(path.dirname(bun), { recursive: true }); await mkdir(path.dirname(entry), { recursive: true })
   await copyFile(process.execPath, bun)
-  content = `const input=await Bun.stdin.text(); console.log(JSON.stringify({args:process.argv.slice(2),input,cwd:process.cwd(),marker:process.env.TEST_DELIVERY_MARKER,bun:process.execPath,...(process.argv.includes('--wait')?{pid:process.pid}:{})})); if(process.argv.includes('--wait')){if(process.argv.includes('--ignore-term'))process.on('SIGTERM',()=>{});else process.once('SIGTERM',()=>{console.log('CANCELLED');process.exit(143)});setInterval(()=>{},1000)}else process.exit(Number(process.env.TEST_DELIVERY_EXIT??0));`
+  content = `
+const input=await Bun.stdin.text(), waiting=process.argv.includes('--wait');
+if(waiting){
+  if(process.argv.includes('--ignore-term'))process.on('SIGTERM',()=>{});
+  else process.once('SIGTERM',()=>{console.log('CANCELLED');process.exit(143)});
+  setInterval(()=>{},1000);
+  await new Promise(resolve=>setImmediate(resolve));
+}
+console.log(JSON.stringify({args:process.argv.slice(2),input,cwd:process.cwd(),marker:process.env.TEST_DELIVERY_MARKER,bun:process.execPath,...(waiting?{pid:process.pid,ready:true}:{})}));
+if(!waiting)process.exit(Number(process.env.TEST_DELIVERY_EXIT??0));`
   await writeFile(entry, content)
   const identity = { schema: 1, platform: process.platform, arch: process.arch, bunVersion: '1.3.11',
     bunSha256: sha(await readFile(bun)), entrySha256: sha(await readFile(entry)) }
@@ -31,6 +42,11 @@ test('routes the complete runtime and model list prefixes', () => {
   expect(isPackagedOpenCodeCommand(['model','list','--provider=all'])).toBe(true)
   for (const args of [['--version'],['model'],['auth','login'],['--print','runtime']]) expect(isPackagedOpenCodeCommand(args)).toBe(false)
   expect(() => validatePackagedOpenCodeIdentity({schema:1,bunVersion:'1.4.2'})).toThrow()
+})
+test('abrupt caller evidence rejects successful, unknown and unrelated termination', () => {
+  expect(abruptCallerTermination(1,null)).toBe(true)
+  expect(abruptCallerTermination(null,'SIGTERM')).toBe(true)
+  for (const [code,signal] of [[0,null],[null,null],[null,'SIGKILL'],[1,'SIGTERM']] as const) expect(abruptCallerTermination(code,signal)).toBe(false)
 })
 
 async function run(args: string[], input = '', extra: Record<string,string> = {}) {
@@ -82,16 +98,24 @@ test('changed Bun refuses before executing the sidecar', async () => {
   finally {await writeFile(bun,original)}
 })
 if (process.platform !== 'win32') {
+async function readDeliveryReady(reader: ReadableStreamDefaultReader<Uint8Array>): Promise<string> {
+  let output=''
+  while(!output.includes('\n')) {const next=await reader.read();expect(next.done).toBe(false);output+=new TextDecoder().decode(next.value)}
+  const acknowledgement=JSON.parse(output.split('\n')[0])
+  expect(acknowledgement.ready).toBe(true)
+  expect(Number.isSafeInteger(acknowledgement.pid)&&acknowledgement.pid>0).toBe(true)
+  return output
+}
 test('POSIX caller cancellation reaches exact live child and propagates exit', async () => {
   const child=Bun.spawn([binary,'runtime','status','--wait'],{cwd:root,env:{HOME:root,PATH:path.join(root,'missing')},stdin:'pipe',stdout:'pipe',stderr:'pipe'})
   child.stdin.end();const reader=child.stdout.getReader();let output=''
-  try {const first=await reader.read();expect(first.done).toBe(false);output+=new TextDecoder().decode(first.value);child.kill('SIGTERM');for(;;){const next=await reader.read();if(next.done)break;output+=new TextDecoder().decode(next.value)}expect(await child.exited).toBe(143);expect(output).toContain('CANCELLED')}
+  try {output=await readDeliveryReady(reader);child.kill('SIGTERM');for(;;){const next=await reader.read();if(next.done)break;output+=new TextDecoder().decode(next.value)}expect(await child.exited).toBe(143);expect(output).toContain('CANCELLED')}
   finally {if(child.exitCode===null)child.kill('SIGKILL');reader.releaseLock()}
 },10_000)
 test('POSIX stalled cancellation kills only the child without manufacturing cleanup evidence', async () => {
   const child=Bun.spawn([binary,'runtime','status','--wait','--ignore-term'],{cwd:root,env:{HOME:root,PATH:path.join(root,'missing')},stdin:'pipe',stdout:'pipe',stderr:'pipe'})
   child.stdin.end();const reader=child.stdout.getReader();let output=''
-  try {const first=await reader.read();expect(first.done).toBe(false);output+=new TextDecoder().decode(first.value);child.kill('SIGTERM');for(;;){const next=await reader.read();if(next.done)break;output+=new TextDecoder().decode(next.value)}expect(await child.exited).toBe(143);expect(output).not.toContain('CANCELLED');expect(output).not.toContain('cleanup')}
+  try {output=await readDeliveryReady(reader);child.kill('SIGTERM');for(;;){const next=await reader.read();if(next.done)break;output+=new TextDecoder().decode(next.value)}expect(await child.exited).toBe(143);expect(output).not.toContain('CANCELLED');expect(output).not.toContain('cleanup')}
   finally {if(child.exitCode===null)child.kill('SIGKILL');reader.releaseLock()}
 },10_000)
 } else {
@@ -134,13 +158,13 @@ let data='';process.stdin.on('data',x=>data+=x);process.stdin.on('end',async()=>
   const pid=JSON.parse(line).pid;if(!Number.isSafeInteger(pid)||pid<=0)throw Error('sidecar_pid_invalid');
   w=spawn(r.powershell,['-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',r.watcher,String(pid),String(c.pid),realpathSync.native(r.bun)],{stdio:'pipe'});
   w.stdout.on('data',x=>watchout+=x);w.stderr.on('data',x=>watcherr+=x);
-  const ready=await Promise.race([new Promise((resolve,reject)=>{const read=()=>{if(watchout.includes('\\n')){w.stdout.off('data',read);resolve(watchout.split('\\n')[0])}};w.stdout.on('data',read);w.once('error',reject);w.once('exit',()=>reject(Error('identity_observer_failed')))}),new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('identity_observer_timeout')),8000)})]);clearTimeout(timer);
+  const ready=await Promise.race([new Promise((resolve,reject)=>{const read=()=>{if(watchout.includes('\\n')){w.stdout.off('data',read);resolve(watchout.split('\\n')[0])}};w.stdout.on('data',read);w.once('error',reject);w.once('close',()=>reject(Error('identity_observer_failed')))}),new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('identity_observer_timeout')),8000)})]);clearTimeout(timer);
   const identity=JSON.parse(ready.slice(6));if(!ready.startsWith('READY ')||identity.pid!==pid||identity.parentPid!==c.pid||!/^\\d+$/.test(identity.birth))throw Error('sidecar_identity_invalid');
   const closed=once(c,'close'),observed=once(w,'close');if(!c.kill('SIGTERM'))throw Error('caller_termination_failed');w.stdin.end('WAIT\\n');
-  const [[exit],[watchExit]]=await Promise.race([Promise.all([closed,observed]),new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('termination_observation_timeout')),8000)})]);clearTimeout(timer);
+  const [[exit,signal],[watchExit]]=await Promise.race([Promise.all([closed,observed]),new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('termination_observation_timeout')),8000)})]);clearTimeout(timer);
   const result=JSON.parse(watchout.split('\\n').find(x=>x.startsWith('RESULT ')).slice(7));
-  console.log(JSON.stringify({exit,watchExit,identity,result,stdout,stderr,watcherr}));
- } catch(e){console.error(JSON.stringify({phase:e.message,watchout,watcherr,frontendStderr:stderr}));process.exitCode=1}
+  console.log(JSON.stringify({exit,signal,watchExit,identity,result,stdout,stderr,watcherr}));
+ } catch(e){console.error(JSON.stringify({phase:e.message,watchout:watchout.slice(0,8192),watcherr:watcherr.slice(0,8192),frontendStderr:stderr.slice(0,8192)}));process.exitCode=1}
  finally {clearTimeout(timer);if(c&&c.exitCode===null&&c.signalCode===null)c.kill('SIGKILL');if(w&&w.exitCode===null&&w.signalCode===null){if(!w.stdin.writableEnded)w.stdin.end('WAIT\\n');const cleanup=setTimeout(()=>w.kill('SIGKILL'),3000);await once(w,'close').catch(()=>{});clearTimeout(cleanup)}if(c){c.stdout.destroy();c.stderr.destroy()}}
 })`
   const oracle=Bun.spawn([Bun.which('node')!,'-e',program],{stdin:'pipe',stdout:'pipe',stderr:'pipe'})
@@ -148,8 +172,13 @@ let data='';process.stdin.on('data',x=>data+=x);process.stdin.on('end',async()=>
   const [output,error,exit]=await Promise.all([new Response(oracle.stdout).text(),new Response(oracle.stderr).text(),oracle.exited])
   expect(error).toBe('');expect(exit).toBe(0)
   const result=JSON.parse(output)
-  expect(Number.isInteger(result.exit)).toBe(true);expect(result.exit).not.toBe(0);expect(result.watchExit).toBe(0)
-  expect(result.result).toEqual({gone:true,cleanupRequired:false})
-  expect(result.stderr).toBe('');expect(result.watcherr).toBe('')
+  // Node's close event reports either an exit code or a terminating signal.
+  // Windows SIGTERM still terminates abruptly; null without that exact signal
+  // remains unknown, and the independent retained-child proof is required.
+  const diagnostic=output.slice(0,8192)
+  expect(abruptCallerTermination(result.exit,result.signal),diagnostic).toBe(true)
+  expect(result.watchExit,diagnostic).toBe(0)
+  expect(result.result,diagnostic).toEqual({gone:true,cleanupRequired:false})
+  expect(result.stderr,diagnostic).toBe('');expect(result.watcherr,diagnostic).toBe('')
 },30_000)
 }
