@@ -43,7 +43,7 @@ function message(input: Partial<OpenCodeCanonicalMessage> & { id: string; role: 
     providerId: null,
     modelId: null,
     createdAt: null,
-    completedAt: null,
+    completedAt: input.completedAt ?? null,
     text: input.text ?? '',
     reasoningText: input.reasoningText ?? '',
     previewText: input.previewText ?? null,
@@ -144,6 +144,40 @@ describe('OpenCodeDeliveryResponseObserver', () => {
 
     expect(observed.state).toBe('empty_assistant_turn')
     expect(observed.deliveredUserMessageId).toBe('user-1')
+  })
+
+  test('distinguishes an explicitly completed idle silent group child from unanswered work', () => {
+    const user = message({ id: 'accepted-peer-prompt', role: 'user', text: 'Peer FYI' })
+    const child = message({
+      id: 'silent-peer-child', parentId: user.id, role: 'assistant',
+      completedAt: 1791609686528, finishReason: 'stop',
+    })
+    const observe = (children = [child], rawStatus: OpenCodeSessionReconcileSummary['rawStatus'] = 'idle') =>
+      observeOpenCodeDeliveryResponse({
+        inboundMessageId: 'physical-peer', runtimePromptMessageId: user.id,
+        groupChatId: 'group-1', memberName: 'alice', teamName: 'team',
+        summary: summary([user, ...children], rawStatus),
+      })
+    const proof = observe()
+    expect(proof.state).toBe('empty_assistant_turn')
+    expect(proof.reason).toBe('assistant_child_completed_without_visible_or_meaningful_response')
+    expect(proof.deliveredUserMessageId).toBe(user.id)
+    expect(proof.assistantMessageId).toBe(child.id)
+    for (const rawStatus of ['busy', 'retry', null] as const) {
+      expect(observe([child], rawStatus).reason).not.toBe(proof.reason)
+    }
+    for (const incomplete of [
+      { completedAt: null }, { completedAt: 0 }, { completedAt: NaN },
+      { finishReason: null }, { finishReason: 'length' },
+      { hasError: true, errorMessage: 'provider failed' },
+    ]) {
+      expect(observe([{ ...child, ...incomplete }]).reason).not.toBe(proof.reason)
+    }
+    expect(observe([]).reason).toBe('no_assistant_child_for_delivered_prompt')
+    expect(observeOpenCodeDeliveryResponse({
+      runtimePromptMessageId: 'different-prompt', groupChatId: 'group-1',
+      summary: summary([user, child]),
+    }).reason).not.toBe(proof.reason)
   })
 
   test('classifies message_send with relayOfMessageId as correlated visible reply', () => {

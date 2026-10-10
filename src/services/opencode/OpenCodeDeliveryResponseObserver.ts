@@ -660,13 +660,23 @@ function classifyChildren(input: {
     })
   }
 
+  const lastChild = input.children[input.children.length - 1]
+  // A silent group peer may complete without sending a reply. Keep unknown or
+  // unfinished empty children distinct so the app cannot acknowledge them.
+  const completedSilentGroupTurn = Boolean(
+    input.groupChatId && input.rawStatus === 'idle' && lastChild?.id
+    && Number.isFinite(lastChild.completedAt) && (lastChild.completedAt ?? 0) > 0
+    && lastChild.finishReason === 'stop' && observedToolNames.size === 0,
+  )
   return buildObservation({
     state: 'empty_assistant_turn',
     deliveredUserMessageId,
-    assistantMessageId: input.children[input.children.length - 1]?.id ?? null,
+    assistantMessageId: lastChild?.id ?? null,
     toolCallNames: [...observedToolNames],
-    latestAssistantPreview: messagePreview(input.children[input.children.length - 1] ?? null),
-    reason: 'assistant_child_has_no_visible_or_meaningful_response',
+    latestAssistantPreview: messagePreview(lastChild ?? null),
+    reason: completedSilentGroupTurn
+      ? 'assistant_child_completed_without_visible_or_meaningful_response'
+      : 'assistant_child_has_no_visible_or_meaningful_response',
   })
 }
 
