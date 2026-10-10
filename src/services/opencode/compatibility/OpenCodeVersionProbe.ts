@@ -66,6 +66,10 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
     const ports = nativePorts({}, failure => { helperFailure = failure })
     const pid = child.pid
     const started = Date.now(), deadline = started + 8000
+    // Match processKill.ts's 5s Windows process-birth query budget: cold
+    // PowerShell/WMI startup can exceed 2s. Every helper still uses the
+    // original 8s probe remainder; POSIX queries keep their 2s cap.
+    const helperTimeout = process.platform === 'win32' ? 5000 : 2000
     let ended = false, closed = false, code: number | null = null
     let output = '', bytes = 0, failure: Error | undefined
     let stopping = false
@@ -91,7 +95,7 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
     const observe = <T>(work: Promise<T>) => boundOpenCodeRead(track(work), cap())
     const births = new Map<number, number>()
     const signalled = new Set<number>()
-    const birth = (target: number) => observe(ports.birth(target, Math.min(2000, cap())))
+    const birth = (target: number) => observe(ports.birth(target, Math.min(helperTimeout, cap())))
     const sameBirth = async (target: number, expected: number): Promise<boolean> => {
       if (await birth(target) === expected) return true
       // Exiting between a table snapshot and the birth read is retirement,
@@ -100,7 +104,7 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
       throw new Error('cleanup_unknown')
     }
     const table = async (): Promise<Member[]> => {
-      if (process.platform === 'win32') return (await observe(ports.tree(Math.min(2000, cap()))))
+      if (process.platform === 'win32') return (await observe(ports.tree(Math.min(helperTimeout, cap()))))
         .map(row => ({ ...row, group: null, retired: false }))
       // The detached POSIX spawn creates an isolated group. Unlike a PPID walk,
       // PGID membership still includes orphans after the leader has exited.
