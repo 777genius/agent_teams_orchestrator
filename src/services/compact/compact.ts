@@ -1,4 +1,7 @@
 import { feature } from 'bun:bundle'
+import { getFreshGroupChatDiscoveryPrompt, hasBoundGroupChatControl } from '../../utils/groupChatControlClient.js'
+import { hasGroupChatTools } from '../../utils/groupMailbox.js'
+import { getAgentName, getTeamName } from '../../utils/teammate.js'
 import type { UUID } from 'crypto'
 import uniqBy from 'lodash-es/uniqBy.js'
 
@@ -622,6 +625,18 @@ export async function compactConversation(
         isVisibleInTranscriptOnly: true,
       }),
     ]
+
+    const teamContext = context.getAppState().teamContext
+    const groupTeamName = getTeamName(teamContext)
+    const groupMemberName = getAgentName() ?? (teamContext
+      ? teamContext.teammates[teamContext.leadAgentId]?.name ?? 'team-lead'
+      : undefined)
+    if (groupTeamName && groupMemberName && hasBoundGroupChatControl() && hasGroupChatTools(context.options.tools)) {
+      summaryMessages.push(createUserMessage({
+        content: await getFreshGroupChatDiscoveryPrompt(groupTeamName, groupMemberName),
+        isMeta: true,
+      }))
+    }
 
     // Previously "postCompactTokenCount" — renamed because this is the
     // compact API call's total usage (input_tokens ≈ preCompactTokenCount),

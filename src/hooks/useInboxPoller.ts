@@ -1,3 +1,5 @@
+import { buildGroupMailboxPrompt, findGroupMailboxReplyOutcome, hasConflictingGroupReplyScope, hasGroupMailboxMarker, isCurrentGroupMailboxMessage, type GroupMailboxEnvelope } from '../utils/groupMailbox.js'
+import { readFreshGroupChatCatalog, relayGroupAssistantText } from '../utils/groupChatControlClient.js'
 import { randomUUID } from 'crypto'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useInterval } from 'usehooks-ts'
@@ -251,7 +253,9 @@ type PendingInboxMirrorMessage = Pick<
   | 'timestamp'
   | 'status'
 > &
-  Partial<Pick<AppState['inbox']['messages'][number], 'messageKind' | 'source'>>
+  GroupMailboxEnvelope & Partial<Pick<AppState['inbox']['messages'][number],
+    'messageKind' | 'source' | 'workSyncRuntimeTicketId' | 'workSyncRuntimeGeneration' |
+    'workSyncRuntimeInstanceId' | 'workSyncIntentId' | 'workSyncAdmissionPayloadHash' | 'workSyncControlRevision'>>
 
 type QueuedMailboxPromptMessage = Pick<PendingInboxMirrorMessage, 'from' | 'text'>
 
@@ -536,16 +540,22 @@ export function getOrdinaryInlineHandoffPrompt({
   text,
   teamName,
   timestamp,
-}: {
+  groupCatalog,
+  ...groupEnvelope
+}: GroupMailboxEnvelope & {
   from: string
   source?: string
   memberName?: string
   messageId?: string
   replyProtocol?: OrdinaryUserDirectReplyProtocol
+  groupCatalog?: unknown
   text: string
   teamName?: string
   timestamp: string
 }): string {
+  if (hasGroupMailboxMarker(groupEnvelope)) {
+    return buildGroupMailboxPrompt({ ...groupEnvelope, from, messageId, text, timestamp }, teamName, memberName, groupCatalog)
+  }
   const isUserMessage = isHumanDirectMailboxMessage({ from, source })
   const normalizedTeamName = teamName?.trim()
   const normalizedMemberName = memberName?.trim()
@@ -1936,6 +1946,7 @@ export function getOrdinaryProcessingAction({
   processingOrdinaryMessage,
   recoveryAttemptCount = 0,
   teamName,
+  memberName = getAgentName(),
 }: {
   attempt?: OrdinaryAttemptState
   messages: AppState['messages']
@@ -1943,6 +1954,7 @@ export function getOrdinaryProcessingAction({
   processingOrdinaryMessage?: PendingInboxMirrorMessage
   recoveryAttemptCount?: number
   teamName?: string
+  memberName?: string
 }): OrdinaryProcessingAction {
   if (!processingOrdinaryMessage?.messageId) {
     return { type: 'noop' }
@@ -1950,6 +1962,25 @@ export function getOrdinaryProcessingAction({
 
   if (!attempt) {
     return { type: 'reset_to_pending' }
+  }
+
+  if (hasGroupMailboxMarker(processingOrdinaryMessage)) {
+    const groupOutcome = findGroupMailboxReplyOutcome({
+      messages, submitUserMessageUuid: attempt.submitUserMessageUuid, teamName,
+      groupChatId: processingOrdinaryMessage.groupChatId!,
+      physicalMessageId: processingOrdinaryMessage.messageId,
+      memberName,
+    })
+    if (groupOutcome === 'sent' || groupOutcome === 'blocked') return { type: 'finalize' }
+    if (groupOutcome === 'pending') return { type: 'noop' }
+    if (hasConflictingGroupReplyScope({ messages, submitUserMessageUuid: attempt.submitUserMessageUuid, groupChatId: processingOrdinaryMessage.groupChatId!, physicalMessageId: processingOrdinaryMessage.messageId, teamName, memberName })) {
+      logForDebugging('[InboxPoller] Ambiguous group turn: no inferred reply destination or private fallback')
+      return { type: 'finalize' }
+    }
+    const fallback = findOrdinaryDirectReplyFallback({ messages, submitUserMessageUuid: attempt.submitUserMessageUuid, teamName })
+    if (fallback) return { type: 'deliver_assistant_text', text: fallback.text }
+    if (hasAttemptObservedPostSubmitActivity({ messages, submitUserMessageUuid: attempt.submitUserMessageUuid })) return { type: 'finalize' }
+    return { type: 'noop' }
   }
 
   const outcome = findOrdinaryDirectReplyOutcome({
@@ -2258,10 +2289,16 @@ export function useInboxPoller({
           teamName,
           { excludeMessageIds: [...mirroredMessageIds] },
         )
-      const agentErrorNotificationMessages = claimedRegularMessages.filter(
+      const staleGroupMessages = claimedRegularMessages.filter(message => !isCurrentGroupMailboxMessage(message))
+      if (staleGroupMessages.length > 0) {
+        await finalizeClaimedMessagesAsRead(agentName, staleGroupMessages.map(message => message.messageId), sessionId, teamName)
+        logForDebugging(`[InboxPoller] Suppressed ${staleGroupMessages.length} stale or invalid group deliveries for this run`)
+      }
+      const currentRunClaimedRegularMessages = claimedRegularMessages.filter(message => isCurrentGroupMailboxMessage(message))
+      const agentErrorNotificationMessages = currentRunClaimedRegularMessages.filter(
         isAgentErrorNotificationMessage,
       )
-      const nonAgentErrorClaimedRegularMessages = claimedRegularMessages.filter(
+      const nonAgentErrorClaimedRegularMessages = currentRunClaimedRegularMessages.filter(
         message => !isAgentErrorNotificationMessage(message),
       )
       const silentlyFinalizedRegularMessages =
@@ -3144,6 +3181,7 @@ export function useInboxPoller({
           attempt: coolingAttempt,
           messages: transcriptMessages,
           processingOrdinaryMessage: message,
+          memberName: agentName,
           recoveryAttemptCount:
             ordinaryRecoveryRef.current.get(message.messageId)?.attemptCount ?? 0,
           ...(teamName ? { teamName } : {}),
@@ -3203,6 +3241,7 @@ export function useInboxPoller({
         attempt,
         messages: transcriptMessages,
         processingOrdinaryMessage,
+        memberName: agentName,
         recoveryAttemptCount:
           ordinaryRecoveryRef.current.get(processingOrdinaryMessage.messageId)
             ?.attemptCount ?? 0,
@@ -3439,6 +3478,14 @@ export function useInboxPoller({
 
         void (async () => {
           try {
+            if (hasGroupMailboxMarker(processingOrdinaryMessage)) {
+              try {
+                await relayGroupAssistantText({ teamName: teamName!, from: agentName, message: processingOrdinaryMessage, text: processingAction.text })
+              } catch (error) {
+                // Archived/invalid/unknown group outcome stays in its group. Never guess a private destination or replay.
+                logForDebugging(`[InboxPoller] Group reply blocked or unknown: ${String(error)}`)
+              }
+            } else {
             await writeToMailbox(
               'user',
               {
@@ -3450,6 +3497,7 @@ export function useInboxPoller({
               },
               teamName,
             )
+            }
             await finalizeClaimedMessagesAsRead(
               agentName,
               [processingOrdinaryMessage.messageId!],
@@ -3838,7 +3886,7 @@ export function useInboxPoller({
 
     const ordinaryPendingMessage =
       bootstrapPendingMessage == null
-        ? getOrdinaryPendingMessage({
+        ? getOrdinaryPendingMessage<PendingInboxMirrorMessage>({
             pendingMessages,
             deferUnticketedWorkSyncNudges: shouldDeferUnticketedWorkSyncNudges(),
           })
@@ -3942,6 +3990,11 @@ export function useInboxPoller({
         ordinaryPendingMessage?.messageId != null
           ? ordinaryRecoveryRef.current.get(ordinaryPendingMessage.messageId)
           : undefined
+      let groupCatalog: unknown
+      if (ordinaryPendingMessage && hasGroupMailboxMarker(ordinaryPendingMessage) && teamName && agentName) {
+        try { groupCatalog = await readFreshGroupChatCatalog(teamName, agentName) }
+        catch (error) { logForDebugging(`[InboxPoller] Fresh group catalog unavailable: ${String(error)}`) }
+      }
       const ordinaryPrompt =
         ordinaryPendingMessage != null
           ? ordinaryRecovery != null
@@ -3953,6 +4006,8 @@ export function useInboxPoller({
                 taskRef: ordinaryRecovery.taskRef,
               })
             : getOrdinaryInlineHandoffPrompt({
+                ...ordinaryPendingMessage,
+                groupCatalog,
                 from: ordinaryPendingMessage.from,
                 source: ordinaryPendingMessage.source,
                 memberName: agentName,

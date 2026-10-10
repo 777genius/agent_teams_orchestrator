@@ -1,3 +1,4 @@
+import { hasGroupMailboxMarker, isCurrentGroupMailboxMessage, type GroupMailboxEnvelope } from './groupMailbox.js'
 // biome-ignore-all assist/source/organizeImports: ANT-ONLY import markers must not be reordered
 import {
   logEvent,
@@ -732,7 +733,10 @@ export type Attachment =
 
 export type TeammateMailboxAttachment = {
   type: 'teammate_mailbox'
-  messages: Array<{
+  teamName?: string
+  memberName?: string
+  messages: Array<GroupMailboxEnvelope & {
+    messageId?: string
     messageKind?:
       | 'agent_error'
       | 'member_work_sync_nudge'
@@ -3632,7 +3636,7 @@ export async function getTeammateMailboxAttachments(
     shouldUseLiveInboxOwnerPathForScope(mailboxDeliveryScope)
   const currentSessionId = getSessionId()
 
-  const allUnreadMessages = await readUnreadMessages(agentName, teamName)
+  const allUnreadMessages = (await readUnreadMessages(agentName, teamName)).filter(message => isCurrentGroupMailboxMessage(message))
   const shouldReadFileBackedWorkSyncNudges =
     !mailboxDeliveryScope.inProcessTeammate &&
     (shouldReadRegularMailboxMessagesFromFile ||
@@ -3655,6 +3659,7 @@ export async function getTeammateMailboxAttachments(
     ? allUnreadMessages.filter(
         m =>
           m.messageKind !== 'member_work_sync_nudge' &&
+          !hasGroupMailboxMarker(m) &&
           isStructuredProtocolMessage(m.text),
       )
     : []
@@ -3676,6 +3681,7 @@ export async function getTeammateMailboxAttachments(
       ? appState.inbox.messages.filter(
           m =>
             (m.status === 'pending' || m.status === 'processing') &&
+            isCurrentGroupMailboxMessage(m) &&
             isLiveInboxMirrorMessageOwnedBySession(m, currentSessionId),
         )
       : [] // Viewer, in-process, and non-interactive paths are read-only w.r.t. live ownership
@@ -3704,7 +3710,7 @@ export async function getTeammateMailboxAttachments(
   // prefers the live AppState owner path; file-backed regular reads remain only
   // for viewer, in-process, and non-interactive scenarios.
   const seen = new Set<string>()
-  let allMessages: Array<{
+  let allMessages: Array<GroupMailboxEnvelope & {
     messageId?: string
     messageKind?:
       | 'agent_error'
@@ -3730,6 +3736,11 @@ export async function getTeammateMailboxAttachments(
     if (!seen.has(key)) {
       seen.add(key)
       allMessages.push({
+        ...(hasGroupMailboxMarker(m) ? {
+          groupChatId: m.groupChatId, groupChatName: m.groupChatName,
+          groupMessageId: m.groupMessageId, groupChatProtocolVersion: m.groupChatProtocolVersion,
+          groupRunKey: m.groupRunKey, relayOfMessageId: m.relayOfMessageId,
+        } : {}),
         messageId: m.messageId,
         messageKind: m.messageKind,
         from: m.from,
@@ -3746,7 +3757,7 @@ export async function getTeammateMailboxAttachments(
   const idleAgentByIndex = new Map<number, string>()
   const latestIdleByAgent = new Map<string, number>()
   for (let i = 0; i < allMessages.length; i++) {
-    const idle = isIdleNotification(allMessages[i]!.text)
+    const idle = hasGroupMailboxMarker(allMessages[i]) ? null : isIdleNotification(allMessages[i]!.text)
     if (idle) {
       idleAgentByIndex.set(i, idle.from)
       latestIdleByAgent.set(idle.from, i)
@@ -3824,6 +3835,7 @@ export async function getTeammateMailboxAttachments(
   const attachment: Attachment[] = [
     {
       type: 'teammate_mailbox',
+      ...(allMessages.some(hasGroupMailboxMarker) ? { teamName, memberName: agentName } : {}),
       messages: allMessages,
     },
   ]

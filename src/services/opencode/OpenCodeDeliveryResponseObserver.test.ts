@@ -5,8 +5,34 @@ import { observeOpenCodeDeliveryResponse } from './OpenCodeDeliveryResponseObser
 
 import type {
   OpenCodeCanonicalMessage,
+  OpenCodeCanonicalToolStatus,
   OpenCodeSessionReconcileSummary,
 } from './types.js'
+
+test('named group reply proof requires exact group, sender, team and physical relay; blocked and proactive never become a private reply', () => {
+  const groupChatId = '3695a573-5ad2-469a-91f2-427f90792e11'
+  const physical = '0bdf10f0-3fd3-4494-a974-b394de06c181'
+  const replyId = 'fae7d421-dfd0-4bd3-bc0b-2693fd24b344'
+  const input = { groupChatId, from: 'alice', teamName: 'synthetic-groups', relayOfMessageId: physical, messageId: replyId }
+  const receipt = { saved: true, groupChatId, groupMessageId: replyId, relayOfMessageId: physical }
+  const user = message({ id: 'delivered-group', role: 'user', text: physical })
+  const observe = (toolName: string, args = input, output: unknown = receipt, status: OpenCodeCanonicalToolStatus = 'completed') => observeOpenCodeDeliveryResponse({
+    inboundMessageId: physical, runtimePromptMessageId: user.id, groupChatId, memberName: 'alice', teamName: 'synthetic-groups',
+    summary: summary([user, message({ id: 'group-answer', parentId: user.id, role: 'assistant', text: 'No private echo', toolCalls: [{
+      callId: 'group-send', toolName, input: args, output, outputText: null, status, title: null, isError: status === 'errored', outputPreview: null, startedAt: null, completedAt: null,
+    }] })]),
+  })
+  for (const prefix of ['', 'agent-teams_', 'agent_teams_', 'mcp__agent-teams__', 'mcp__agent_teams__', 'proxy_agent-teams_', 'proxy_agent_teams_', 'proxy_mcp__agent-teams__', 'proxy_mcp__agent_teams__']) {
+    const proof = observe(`${prefix}group_chat_send`)
+    expect(proof.state).toBe('responded_visible_message')
+    expect(proof.visibleReplyMessageId).toBe(replyId)
+  }
+  for (const args of [{ ...input, groupChatId: 'ef4a2e64-ce6a-419f-9614-0f5a808762c3' }, { ...input, from: 'bob' }, { ...input, teamName: 'other-team' }, { ...input, relayOfMessageId: 'other-physical' }]) {
+    expect(observe('agent-teams_group_chat_send', args).reason).toBe('group_reply_blocked')
+  }
+  expect(observe('agent-teams_group_chat_send', input, { code: 'GROUP_ARCHIVED' }, 'errored').state).toBe('tool_error')
+  expect(observe('agent-teams_message_send', input).reason).toBe('group_reply_blocked')
+})
 
 function message(input: Partial<OpenCodeCanonicalMessage> & { id: string; role: OpenCodeCanonicalMessage['role'] }): OpenCodeCanonicalMessage {
   return {

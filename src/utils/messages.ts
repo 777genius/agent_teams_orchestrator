@@ -3621,6 +3621,7 @@ export function normalizeAttachmentForAPI(
         createUserMessage({
           content: getTeammateMailbox().formatTeammateMessages(
             attachment.messages,
+            { teamName: attachment.teamName, memberName: attachment.memberName },
           ),
           isMeta: true,
         }),

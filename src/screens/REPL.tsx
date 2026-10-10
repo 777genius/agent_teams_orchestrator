@@ -1,3 +1,5 @@
+import { getCurrentGroupRunIdentity, hasGroupChatTools } from '../utils/groupMailbox.js'
+import { hasBoundGroupChatControl } from '../utils/groupChatControlClient.js'
 import { c as _c } from "react/compiler-runtime";
 // biome-ignore-all assist/source/organizeImports: ANT-ONLY import markers must not be reordered
 import { feature } from 'bun:bundle';
@@ -929,9 +931,14 @@ export function REPL({
   const queryGuard = React.useRef(new QueryGuard()).current;
   const incomingPromptKindRef = React.useRef<InboxPromptSubmitOptions['submissionKind']>(undefined);
 
+  const groupChatToolsReady = hasGroupChatTools(tools) && hasBoundGroupChatControl();
+  const groupCapabilityTeamName = getTeamName(teamContext);
+  const groupCapabilityMemberName = getAgentName() ?? (teamContext
+    ? teamContext.teammates[teamContext.leadAgentId]?.name ?? 'team-lead'
+    : undefined);
   React.useEffect(() => {
-    const teamName = getTeamName();
-    const memberName = getAgentName();
+    const teamName = groupCapabilityTeamName;
+    const memberName = groupCapabilityMemberName;
     if (!teamName || !memberName) {
       return;
     }
@@ -941,6 +948,16 @@ export function REPL({
       memberName,
     });
     bindWorkSyncTurnSettledOwnerGate();
+    return () => {
+      unbindWorkSyncContinuationAdmission();
+      unbindWorkSyncTurnSettledOwnerGate();
+    };
+  }, [queryGuard, groupCapabilityTeamName, groupCapabilityMemberName]);
+
+  React.useEffect(() => {
+    const teamName = groupCapabilityTeamName;
+    const memberName = groupCapabilityMemberName;
+    if (!teamName || !memberName) return;
     const providerId = shouldUseCodexProviderRoutingForCurrentProcess()
       ? 'codex'
       : 'anthropic';
@@ -948,22 +965,19 @@ export function REPL({
       schemaVersion: 1,
       recoveryProtocolVersion: 2,
       teamName,
-    teamIncarnation: process.env.CLAUDE_TEAM_INCARNATION?.trim() || 'unspecified',
+      teamIncarnation: process.env.CLAUDE_TEAM_INCARNATION?.trim() || 'unspecified',
       memberName,
       providerId,
       runtimeMode: providerId === 'codex' ? 'app-server' : 'repl',
       runtimeInstanceId: queryGuard.runtimeInstanceId,
       generation: queryGuard.generation,
       processorReady: true,
+      ...(groupChatToolsReady ? { groupChatProtocolVersion: 1 as const, ...getCurrentGroupRunIdentity() } : {}),
       publishedAt: new Date().toISOString(),
     }).catch(error => {
       logForDebugging(`[WorkSyncAdmission] capability write failed: ${String(error)}`);
     });
-    return () => {
-      unbindWorkSyncContinuationAdmission();
-      unbindWorkSyncTurnSettledOwnerGate();
-    };
-  }, [queryGuard]);
+  }, [queryGuard, groupChatToolsReady, groupCapabilityTeamName, groupCapabilityMemberName]);
 
   // Subscribe to the guard — true during dispatching or running.
   // This is the single source of truth for "is a local query in flight".

@@ -898,12 +898,12 @@ describe('useInboxPoller queued mailbox meta prompt', () => {
     const previous = process.env.CLAUDE_WORK_SYNC_TEST_HOLD_CONSUME_PATH
     process.env.CLAUDE_WORK_SYNC_TEST_HOLD_CONSUME_PATH = holdPath
     const guard = new QueryGuard('runtime-1')
-    guard.reserveContinuation({
+    expect(guard.reserveContinuation({
       runtimeInstanceId: 'runtime-1',
-      expectedGeneration: 1,
+      expectedGeneration: guard.generation,
       intentId: 'work-sync-nudge',
       reservationNonce: 'ticket-1',
-    })
+    }).ok).toBe(true)
     bindWorkSyncContinuationAdmission({
       guard,
       teamName: 'team-a',
@@ -927,7 +927,7 @@ describe('useInboxPoller queued mailbox meta prompt', () => {
               messageKind: 'member_work_sync_nudge',
               workSyncRuntimeTicketId: 'ticket-1',
               workSyncRuntimeInstanceId: 'runtime-1',
-              workSyncRuntimeGeneration: 1,
+              workSyncRuntimeGeneration: guard.generation,
             },
           ],
         }),

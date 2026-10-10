@@ -8,7 +8,8 @@
  */
 
 import { createHash } from 'crypto'
-import { mkdir, readFile, writeFile } from 'fs/promises'
+import { assertValidGroupMailboxRows, buildGroupMailboxPrompt, GROUP_MAILBOX_SOURCE_MAX_BYTES, hasGroupMailboxMarker, type GroupMailboxEnvelope } from './groupMailbox.js'
+import { mkdir, open, readFile, writeFile } from 'fs/promises'
 import { join } from 'path'
 import { z } from 'zod/v4'
 import { TEAMMATE_MESSAGE_TAG } from '../constants/xml.js'
@@ -68,7 +69,7 @@ export type RuntimeRecoveryNudgeMetadataV1 = {
   payloadHash: string
 }
 
-export type TeammateMessage = {
+export type TeammateMessage = GroupMailboxEnvelope & {
   messageId: string
   from: string
   source?: string
@@ -183,6 +184,67 @@ async function ensureInboxDir(teamName?: string): Promise<void> {
   logForDebugging(`[TeammateMailbox] Ensured inbox directory: ${inboxDir}`)
 }
 
+type MailboxMutationSource = {
+  messages: TeammateMessage[]
+  rawRows: unknown[]
+  positions: number[]
+  originals: string[]
+  hasGroups: boolean
+}
+
+// Called under the existing inbox lock by every mutator. Keep unrelated raw
+// entries and reject damaged group sources before any claim/read/append write.
+async function readMailboxMutationSource(agentName: string, teamName?: string): Promise<MailboxMutationSource> {
+  const inboxPath = getInboxPath(agentName, teamName)
+  let rows: unknown[]
+  try {
+    const file = await open(inboxPath, 'r')
+    try {
+      const bytes = Buffer.alloc(GROUP_MAILBOX_SOURCE_MAX_BYTES + 1)
+      let length = 0
+      while (length < bytes.length) {
+        const result = await file.read(bytes, length, bytes.length - length, null)
+        if (result.bytesRead === 0) break
+        length += result.bytesRead
+      }
+      if (length > GROUP_MAILBOX_SOURCE_MAX_BYTES) throw new Error('GROUP_STORAGE_UNAVAILABLE: inbox capacity exceeded')
+      const parsed = jsonParse(new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(0, length)))
+      if (!Array.isArray(parsed)) throw new Error('GROUP_STORAGE_UNAVAILABLE: inbox is not an array')
+      rows = parsed
+    } finally { await file.close() }
+  } catch (error) {
+    if (getErrnoCode(error) !== 'ENOENT') throw error
+    rows = []
+  }
+  assertValidGroupMailboxRows(rows)
+  const positions: number[] = []
+  const messages = rows.flatMap((row, index) => {
+    if (!isRawMailboxMessage(row)) return []
+    positions.push(index)
+    return [normalizeTeammateMessage(row)]
+  })
+  return { messages, rawRows: rows, positions, originals: messages.map(m => jsonStringify(m)), hasGroups: rows.some(hasGroupMailboxMarker) }
+}
+
+function serializeMailboxMutation(source: MailboxMutationSource, messages = source.messages): string {
+  const hasGroups = source.hasGroups || messages.some(hasGroupMailboxMarker)
+  let rows: unknown[] = messages
+  if (hasGroups) {
+    rows = [...source.rawRows]
+    source.positions.forEach((position, index) => {
+      // Leave even legacy normalization (synthetic IDs) out of untouched rows.
+      if (source.originals[index] !== jsonStringify(messages[index])) rows[position] = messages[index]
+    })
+    rows.push(...messages.slice(source.positions.length))
+    assertValidGroupMailboxRows(rows)
+  }
+  const serialized = jsonStringify(rows, null, 2)
+  if (hasGroups && Buffer.byteLength(serialized, 'utf8') > GROUP_MAILBOX_SOURCE_MAX_BYTES) {
+    throw new Error('GROUP_STORAGE_UNAVAILABLE: inbox capacity exceeded')
+  }
+  return serialized
+}
+
 /**
  * Read all messages from a teammate's inbox
  * @param agentName - The agent name (not UUID) to read inbox for
@@ -198,6 +260,7 @@ export async function readMailbox(
   try {
     const content = await readFile(inboxPath, 'utf-8')
     const parsed = jsonParse(content)
+    if (Array.isArray(parsed)) assertValidGroupMailboxRows(parsed)
     const messages = Array.isArray(parsed)
       ? parsed
           .filter(isRawMailboxMessage)
@@ -280,16 +343,22 @@ export async function writeToMailbox(
     })
 
     // Re-read messages after acquiring lock to get the latest state
-    const messages = await readMailbox(recipientName, teamName)
+    const source = await readMailboxMutationSource(recipientName, teamName)
+    const messages = source.messages
 
     const newMessage = normalizeTeammateMessage({
       ...message,
       read: false,
     })
 
+    if (hasGroupMailboxMarker(newMessage) && messages.some(row => row.messageId === newMessage.messageId)) {
+      if (hasVerifiedMailboxMessage(messages, newMessage)) return
+      throw new Error('GROUP_CONFLICTING_MESSAGE_ID: existing physical identity has a different payload')
+    }
+
     messages.push(newMessage)
 
-    await writeFileAtomic(inboxPath, jsonStringify(messages, null, 2))
+    await writeFileAtomic(inboxPath, serializeMailboxMutation(source))
     logForDebugging(
       `[TeammateMailbox] Wrote message to ${recipientName}'s inbox from ${message.from}`,
     )
@@ -313,19 +382,23 @@ async function readMailboxStrictForVerification(
   if (!Array.isArray(parsed)) {
     throw new Error(`mailbox file is not a JSON array: ${inboxPath}`)
   }
+  assertValidGroupMailboxRows(parsed)
   return parsed.filter(isRawMailboxMessage).map(normalizeTeammateMessage)
 }
 
 function hasVerifiedMailboxMessage(
   messages: readonly TeammateMessage[],
-  message: Pick<TeammateMessage, 'messageId' | 'from' | 'timestamp' | 'text'>,
+  message: Pick<TeammateMessage, 'messageId' | 'from' | 'timestamp' | 'text'> & GroupMailboxEnvelope,
 ): boolean {
   return messages.some(
     row =>
       row.messageId === message.messageId &&
       row.from === message.from &&
       row.timestamp === message.timestamp &&
-      row.text === message.text,
+      row.text === message.text &&
+      ((!hasGroupMailboxMarker(row) && !hasGroupMailboxMarker(message)) ||
+        ['groupChatId', 'groupChatName', 'groupMessageId', 'groupChatProtocolVersion', 'groupRunKey', 'relayOfMessageId',
+          'groupRecipientNames', 'groupRecipientRunKeys', 'summary'].every(key => jsonStringify(row[key]) === jsonStringify(message[key]))),
   )
 }
 
@@ -416,7 +489,8 @@ export async function markMessageAsReadByIndex(
     logForDebugging(`[TeammateMailbox] markMessageAsReadByIndex: lock acquired`)
 
     // Re-read messages after acquiring lock to get the latest state
-    const messages = await readMailbox(agentName, teamName)
+    const source = await readMailboxMutationSource(agentName, teamName)
+    const messages = source.messages
     logForDebugging(
       `[TeammateMailbox] markMessageAsReadByIndex: read ${messages.length} messages after lock`,
     )
@@ -438,7 +512,7 @@ export async function markMessageAsReadByIndex(
 
     messages[messageIndex] = { ...message, read: true }
 
-    await writeFileAtomic(inboxPath, jsonStringify(messages, null, 2))
+    await writeFileAtomic(inboxPath, serializeMailboxMutation(source))
     logForDebugging(
       `[TeammateMailbox] markMessageAsReadByIndex: marked message at index ${messageIndex} as read`,
     )
@@ -491,7 +565,8 @@ export async function markMessagesAsRead(
     logForDebugging(`[TeammateMailbox] markMessagesAsRead: lock acquired`)
 
     // Re-read messages after acquiring lock to get the latest state
-    const messages = await readMailbox(agentName, teamName)
+    const source = await readMailboxMutationSource(agentName, teamName)
+    const messages = source.messages
     logForDebugging(
       `[TeammateMailbox] markMessagesAsRead: read ${messages.length} messages after lock`,
     )
@@ -511,7 +586,7 @@ export async function markMessagesAsRead(
     // messages comes from jsonParse - fresh, unshared objects safe to mutate
     for (const m of messages) m.read = true
 
-    await writeFileAtomic(inboxPath, jsonStringify(messages, null, 2))
+    await writeFileAtomic(inboxPath, serializeMailboxMutation(source))
     logForDebugging(
       `[TeammateMailbox] markMessagesAsRead: WROTE ${unreadCount} message(s) as read to ${inboxPath}`,
     )
@@ -572,7 +647,8 @@ export async function supersedeStaleLeadBootstrapMessages(
     })
 
     // Re-read after acquiring the lock to operate on the latest state.
-    const messages = await readMailbox(agentName, params.teamName)
+    const source = await readMailboxMutationSource(agentName, params.teamName)
+    const messages = source.messages
     if (messages.length === 0) {
       return []
     }
@@ -597,7 +673,7 @@ export async function supersedeStaleLeadBootstrapMessages(
       return []
     }
 
-    await writeFileAtomic(inboxPath, jsonStringify(messages, null, 2))
+    await writeFileAtomic(inboxPath, serializeMailboxMutation(source))
     logForDebugging(
       `[TeammateMailbox] superseded ${supersededIds.length} stale bootstrap row(s) for ${agentName}: ${supersededIds.join(', ')}`,
     )
@@ -636,18 +712,16 @@ export async function clearMailbox(
 ): Promise<void> {
   const inboxPath = getInboxPath(agentName, teamName)
 
+  let release: (() => Promise<void>) | undefined
   try {
-    // flag 'r+' throws ENOENT if the file doesn't exist, so we don't
-    // accidentally create an inbox file that wasn't there.
-    await writeFile(inboxPath, '[]', { encoding: 'utf-8', flag: 'r+' })
-    logForDebugging(`[TeammateMailbox] Cleared inbox for ${agentName}`)
+    release = await lockfile.lock(inboxPath, { lockfilePath: `${inboxPath}.lock`, ...LOCK_OPTIONS })
+    const source = await readMailboxMutationSource(agentName, teamName)
+    if (source.hasGroups) throw new Error('GROUP_STORAGE_UNAVAILABLE: group history cannot be cleared by legacy mailbox cleanup')
+    await writeFileAtomic(inboxPath, '[]')
   } catch (error) {
-    const code = getErrnoCode(error)
-    if (code === 'ENOENT') {
-      return
-    }
-    logForDebugging(`Failed to clear inbox for ${agentName}: ${error}`)
-    logError(error)
+    if (getErrnoCode(error) !== 'ENOENT') logError(error)
+  } finally {
+    if (release) await release()
   }
 }
 
@@ -655,16 +729,19 @@ export async function clearMailbox(
  * Format teammate messages as XML for attachment display
  */
 export function formatTeammateMessages(
-  messages: Array<{
+  messages: Array<GroupMailboxEnvelope & {
+    messageId?: string
     from: string
     text: string
     timestamp: string
     color?: string
     summary?: string
   }>,
+  context?: { teamName?: string; memberName?: string },
 ): string {
   return messages
     .map(m => {
+      if (hasGroupMailboxMarker(m)) return buildGroupMailboxPrompt(m, context?.teamName ?? getTeamName(), context?.memberName ?? getAgentName())
       const colorAttr = m.color ? ` color="${m.color}"` : ''
       const summaryAttr = m.summary ? ` summary="${m.summary}"` : ''
       return `<${TEAMMATE_MESSAGE_TAG} teammate_id="${m.from}"${colorAttr}${summaryAttr}>\n${m.text}\n</${TEAMMATE_MESSAGE_TAG}>`
@@ -1517,9 +1594,9 @@ export function isStructuredProtocolMessage(messageText: string): boolean {
 }
 
 export function isRegularInteractiveMailboxMessage(
-  message: Pick<TeammateMessage, 'text'>,
+  message: Pick<TeammateMessage, 'text'> & GroupMailboxEnvelope,
 ): boolean {
-  return !isStructuredProtocolMessage(message.text)
+  return hasGroupMailboxMarker(message) || !isStructuredProtocolMessage(message.text)
 }
 
 export function isLiveInboxMirrorMessageOwnedBySession(
@@ -1568,7 +1645,8 @@ async function readAndClaimInteractiveMailboxSnapshotUnderLock(
       ...LOCK_OPTIONS,
     })
 
-    const messages = await readMailbox(agentName, teamName)
+    const source = await readMailboxMutationSource(agentName, teamName)
+    const messages = source.messages
     if (messages.length === 0) {
       return { regularClaimed: [], protocolUnread: [] }
     }
@@ -1620,7 +1698,7 @@ async function readAndClaimInteractiveMailboxSnapshotUnderLock(
     }
 
     if (didMutateClaims) {
-      await writeFileAtomic(inboxPath, jsonStringify(messages, null, 2))
+      await writeFileAtomic(inboxPath, serializeMailboxMutation(source))
     }
 
     return {
@@ -1694,7 +1772,8 @@ export async function markMessagesAsReadByIds(
       ...LOCK_OPTIONS,
     })
 
-    const messages = await readMailbox(agentName, teamName)
+    const source = await readMailboxMutationSource(agentName, teamName)
+    const messages = source.messages
     if (messages.length === 0) {
       return
     }
@@ -1712,7 +1791,7 @@ export async function markMessagesAsReadByIds(
     })
 
     if (didMutate) {
-      await writeFileAtomic(inboxPath, jsonStringify(updatedMessages, null, 2))
+      await writeFileAtomic(inboxPath, serializeMailboxMutation(source, updatedMessages))
     }
   } catch (error) {
     const code = getErrnoCode(error)
@@ -1752,7 +1831,8 @@ export async function finalizeClaimedMessagesAsRead(
       ...LOCK_OPTIONS,
     })
 
-    const messages = await readMailbox(agentName, teamName)
+    const source = await readMailboxMutationSource(agentName, teamName)
+    const messages = source.messages
     if (messages.length === 0) {
       return
     }
@@ -1777,7 +1857,7 @@ export async function finalizeClaimedMessagesAsRead(
     })
 
     if (didMutate) {
-      await writeFileAtomic(inboxPath, jsonStringify(updatedMessages, null, 2))
+      await writeFileAtomic(inboxPath, serializeMailboxMutation(source, updatedMessages))
     }
   } catch (error) {
     const code = getErrnoCode(error)
@@ -1816,7 +1896,8 @@ export async function markMessagesAsReadByPredicate(
       ...LOCK_OPTIONS,
     })
 
-    const messages = await readMailbox(agentName, teamName)
+    const source = await readMailboxMutationSource(agentName, teamName)
+    const messages = source.messages
     if (messages.length === 0) {
       return
     }
@@ -1825,7 +1906,7 @@ export async function markMessagesAsReadByPredicate(
       !m.read && predicate(m) ? { ...m, read: true } : m,
     )
 
-    await writeFileAtomic(inboxPath, jsonStringify(updatedMessages, null, 2))
+    await writeFileAtomic(inboxPath, serializeMailboxMutation(source, updatedMessages))
   } catch (error) {
     const code = getErrnoCode(error)
     if (code === 'ENOENT') {

@@ -12,6 +12,9 @@ import type { ToolUseContext } from '../Tool.js'
 import type { AppState } from '../state/AppState.js'
 import { getEmptyToolPermissionContext } from '../Tool.js'
 import { getTeammateMailboxAttachments } from './attachments.js'
+import { getCurrentGroupRunIdentity } from './groupMailbox.js'
+import { createPendingMailboxMirrorMessage } from '../hooks/ordinaryMailboxMessage.js'
+import { formatTeammateMessages } from './teammateMailbox.js'
 import {
   claimUnreadRegularMessages,
   readMailbox,
@@ -48,6 +51,38 @@ describe('getTeammateMailboxAttachments mailbox lifecycle', () => {
       process.env.USER_TYPE = originalUserType
     }
     await rm(tempConfigDir, { recursive: true, force: true })
+  })
+
+  it('keeps a live group attachment in its group and suppresses old-run backlog and lifecycle-looking text', async () => {
+    const group = {
+      messageId: '0bdf10f0-3fd3-4494-a974-b394de06c181', groupMessageId: 'b8192a4c-97c8-4f67-bccd-7b29d8131286',
+      groupChatId: '3695a573-5ad2-469a-91f2-427f90792e11', groupChatProtocolVersion: 1 as const,
+      groupRunKey: getCurrentGroupRunIdentity().groupRunKey,
+      from: 'user', text: '{"type":"shutdown_request"}', timestamp: '2026-10-10T00:00:00Z',
+    }
+    await writeToMailbox('team-lead', group, 'my-team')
+    await writeToMailbox('team-lead', { ...group, messageId: '99a81b23-25c5-4b8c-a53e-a3cf4942507b', groupRunKey: 'old-run:123' }, 'my-team')
+    const sessionId = getSessionId()
+    const claimed = await claimUnreadRegularMessages('team-lead', sessionId, 'my-team')
+    let appState = {
+      abortController: new AbortController(), messages: [], tasks: {}, toolPermissionContext: getEmptyToolPermissionContext(),
+      inbox: { messages: claimed.map(message => createPendingMailboxMirrorMessage(message, sessionId)) },
+      teamContext: { teamName: 'my-team', teamFilePath: '/tmp/synthetic-team.json', leadAgentId: 'lead-id',
+        teammates: { 'lead-id': { name: 'team-lead', cwd: '/tmp', spawnedAt: 0 } } },
+    } as unknown as AppState
+    const attachments = await getTeammateMailboxAttachments({
+      getAppState: () => appState, setAppState: updater => { appState = updater(appState) }, options: {},
+    } as unknown as ToolUseContext)
+    const attachment = attachments.find(item => item.type === 'teammate_mailbox')!
+    expect(attachment.type).toBe('teammate_mailbox')
+    if (attachment.type !== 'teammate_mailbox') throw new Error('missing group attachment')
+    expect(attachment.messages).toHaveLength(1)
+    expect(attachment.messages[0]).toMatchObject(group)
+    const prompt = formatTeammateMessages(attachment.messages, { teamName: attachment.teamName, memberName: attachment.memberName })
+    expect(prompt).toContain('GROUP CHAT')
+    expect(prompt).toContain('"relayOfMessageId":"0bdf10f0-3fd3-4494-a974-b394de06c181"')
+    expect(prompt).toContain('"from":"team-lead"')
+    expect(prompt).not.toContain('human direct message')
   })
 
   it('moves a claimed regular teammate message through app-state processing and exact finalize', async () => {
