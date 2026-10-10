@@ -1,9 +1,10 @@
-import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { afterAll, expect, mock, test } from 'bun:test'
 
 import * as managedAssets from './OpenCodeCursorManagedAssets.js'
+import { resolveCursorAgentExecutable } from './OpenCodeCursorNativeAuthority.js'
 
 const originalManagedAssetResolver = managedAssets.resolveOpenCodeCursorManagedAssets
 
@@ -69,7 +70,11 @@ test.skipIf(process.platform === 'win32')(
     await mkdir(project)
     process.env.HOME = home
     process.env.USERPROFILE = home
-    process.env.PATH = path.join(root, 'empty-bin')
+    const isolatedBin = path.join(root, 'isolated-bin')
+    await mkdir(isolatedBin)
+    // Version admission needs native process retirement while Cursor stays absent.
+    await symlink(process.platform === 'darwin' ? '/bin/ps' : '/usr/bin/ps', path.join(isolatedBin, 'ps'))
+    process.env.PATH = isolatedBin
     process.env.CURSOR_AGENT_EXECUTABLE = path.join(root, 'absent-cursor-agent')
     process.env.XDG_CONFIG_HOME = path.join(home, 'config')
     process.env.XDG_DATA_HOME = path.join(home, 'data')
@@ -77,10 +82,11 @@ test.skipIf(process.platform === 'win32')(
     process.env[CLAUDE_MULTIMODEL_DATA_HOME_ENV] = path.join(root, 'app-data')
     process.env[CLAUDE_MULTIMODEL_CACHE_HOME_ENV] = path.join(root, 'app-cache')
     const fakeOpenCode = path.join(root, 'fake-opencode')
-    await writeFile(fakeOpenCode, '#!/bin/sh\nexit 0\n', { mode: 0o700 })
+    await writeFile(fakeOpenCode, '#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf \"1.18.34\\n\"; fi\nexit 0\n', { mode: 0o700 })
     process.env.OPENCODE_BIN_PATH = fakeOpenCode
     process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH = fakeOpenCode
 
+    expect(await resolveCursorAgentExecutable(process.env)).toBeNull()
     const inventory = await new OpenCodeInventoryService().probe(project, {
       mode: 'profile',
       includeAppMcp: false,

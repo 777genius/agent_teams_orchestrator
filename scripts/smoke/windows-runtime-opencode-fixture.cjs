@@ -95,7 +95,7 @@ if (require.main === module) {
   const write = value => process.stdout.write(value + '\n');
 
   if (args[0] === '--version') {
-    write('1.15.10');
+    write('1.18.34');
     process.exit(0);
   }
 

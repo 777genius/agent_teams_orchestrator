@@ -386,7 +386,7 @@ export function runBackfillSmoke(binaryInput, evidenceInput, { report: suppliedR
         assert.equal(item.executableSha256, report.executableSha256);
         copyFileSync(fixtureSource, path.join(caseRoot, 'fake-opencode.cjs'));
         const fakeBinary = path.join(caseRoot, 'opencode.cmd');
-        writeFileSync(fakeBinary, '@echo off\r\nnode "%~dp0fake-opencode.cjs" %*\r\n');
+        writeFileSync(fakeBinary, `@echo off\r\n"${process.execPath}" "%~dp0fake-opencode.cjs" %*\r\n`);
         const env = sandboxEnvironment(caseRoot, fakeBinary);
         const invoke = (label, body, outcome, count) => {
           const input = path.join(env.TEMP, `${label}.input.json`);
