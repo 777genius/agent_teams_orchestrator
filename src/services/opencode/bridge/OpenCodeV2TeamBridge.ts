@@ -1,3 +1,4 @@
+import { OpenCodeVersionProbeCleanupError } from '../compatibility/OpenCodeVersionProbe.js'
 import { classifyOpenCodeV2ExecutionDelivery } from '../host/OpenCodeV2ExecutionDelivery.js'
 import { resolveOpenCodeBinaryHostIdentity } from '../OpenCodeHostIdentity.js'
 import { resolveOpenCodeV2ExecutionProbe } from './OpenCodeV2ExecutionProbe.js'
@@ -492,7 +493,11 @@ export async function executeSelectedOpenCodeBridgeCommandEnvelope(input: unknow
   }
   let selection: Awaited<ReturnType<typeof inspectOpenCodeRuntimeAdapterSelection>>
   try { selection = await inspectOpenCodeRuntimeAdapterSelection() }
-  catch (error) { return refusal(envelope, Date.now(), error instanceof Error ? error.message : 'selection_unavailable') }
+  catch (error) {
+    const result = refusal(envelope, Date.now(), error instanceof Error ? error.message : 'selection_unavailable')
+    return error instanceof OpenCodeVersionProbeCleanupError && error.helperFailure
+      ? { ...result, diagnostics: [{ code: 'opencode_version_probe_helper_failed', ...error.helperFailure }] } : result
+  }
   const selected = selectOpenCodeRuntimeAdapter(selection.policy, {
     v1: () => () => executeV1(input),
     v2: pin => () => executeV2(envelope, pin, bridge),

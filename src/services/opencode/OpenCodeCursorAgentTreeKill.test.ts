@@ -82,3 +82,38 @@ test('failed helper timeout kill retains the operation until helper close', asyn
   await work
   expect(settled).toBe(true)
 })
+
+
+test('native birth failures retain finite helper evidence before returning null', async () => {
+  const module = import.meta.resolve('./OpenCodeCursorAgentTreeKill.ts')
+  const script = `
+    import {mock} from 'bun:test'
+    import assert from 'node:assert/strict'
+    import {EventEmitter} from 'node:events'
+    const original=await import('node:child_process')
+    let mode='exit'
+    mock.module('node:child_process',()=>({...original,spawn:()=>{
+      const child=Object.assign(new EventEmitter(),{pid:123,stdout:new EventEmitter(),
+        kill:()=>{queueMicrotask(()=>child.emit('close',null));return true}})
+      if(mode==='exit')queueMicrotask(()=>child.emit('close',7))
+      return child
+    }}))
+    Object.defineProperty(process,'platform',{value:'win32'})
+    const {nativePorts}=await import(${JSON.stringify(module)})
+    for(mode of ['exit','timeout']) {
+      const failures=[]
+      const ports=nativePorts({},failure=>failures.push(failure))
+      assert.equal(await ports.birth(123,10),null)
+      assert.equal(failures.length,1)
+      assert.equal(failures[0].operation,'birth')
+      assert.equal(failures[0].reason,mode==='exit'?'helper_nonzero':'helper_timeout')
+      assert.equal(failures[0].exitCode,mode==='exit'?7:null)
+      assert(Number.isFinite(failures[0].elapsedMs)&&failures[0].elapsedMs>=0)
+    }
+    console.log('TEST actual helper failure retained')
+  `
+  const child=Bun.spawn([process.execPath,'-e',script],{cwd:import.meta.dir,stdout:'pipe',stderr:'pipe'})
+  const [exit,stdout,stderr]=await Promise.all([child.exited,new Response(child.stdout).text(),new Response(child.stderr).text()])
+  expect({exit,stderr}).toEqual({exit:0,stderr:''})
+  expect(stdout.trim()).toBe('TEST actual helper failure retained')
+},15000)

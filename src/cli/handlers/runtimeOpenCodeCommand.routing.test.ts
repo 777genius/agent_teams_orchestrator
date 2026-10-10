@@ -80,3 +80,35 @@ test('startup registry cleanup is binary-independent and cannot accept V2 run ta
   expect({ exit, stderr }).toEqual({ exit: 0, stderr: '' })
   expect(stdout.trim()).toBe('TEST startup registry boundary qualified')
 }, 15_000)
+
+
+test('selection cleanup refusal projects finite helper evidence without raw causes', async () => {
+  const selected=import.meta.resolve('../../services/opencode/bridge/OpenCodeV2TeamBridge.ts')
+  const factory=import.meta.resolve('../../services/opencode/bridge/OpenCodeRuntimeAdapterFactory.ts')
+  const probe=import.meta.resolve('../../services/opencode/compatibility/OpenCodeVersionProbe.ts')
+  const script=`
+    import {mock} from 'bun:test'
+    import assert from 'node:assert/strict'
+    const {OpenCodeVersionProbeCleanupError}=await import(${JSON.stringify(probe)})
+    const factory=await import(${JSON.stringify(factory)})
+    const helperFailure={operation:'tree',reason:'helper_nonzero',exitCode:7,elapsedMs:35}
+    mock.module(${JSON.stringify(factory)},()=>({...factory,inspectOpenCodeRuntimeAdapterSelection:async()=>{
+      throw new OpenCodeVersionProbeCleanupError(new Error('TEST-PRIVATE-PATH-AND-STDERR'),helperFailure)
+    }}))
+    const {executeSelectedOpenCodeBridgeCommandEnvelope:execute}=await import(${JSON.stringify(selected)})
+    let legacyCalls=0
+    const result=await execute({schemaVersion:1,requestId:'TEST-diagnostic',command:'opencode.commandStatus',
+      cwd:'/TEST',startedAt:new Date().toISOString(),timeoutMs:30000,body:{originalRequestId:'absent'}},
+      async()=>{legacyCalls++;throw Error('TEST legacy forbidden')})
+    assert.equal(result.ok,false)
+    assert.deepEqual(result.error,{kind:'runtime_not_ready',message:'cleanup_unknown',retryable:false})
+    assert.deepEqual(result.diagnostics,[{code:'opencode_version_probe_helper_failed',...helperFailure}])
+    assert.equal(legacyCalls,0)
+    assert(!JSON.stringify(result).includes('TEST-PRIVATE'))
+    console.log('TEST finite cleanup refusal diagnostic qualified')
+  `
+  const child=Bun.spawn([process.execPath,'-e',script],{cwd:import.meta.dir,stdout:'pipe',stderr:'pipe'})
+  const [exit,stdout,stderr]=await Promise.all([child.exited,new Response(child.stdout).text(),new Response(child.stderr).text()])
+  expect({exit,stderr}).toEqual({exit:0,stderr:''})
+  expect(stdout.trim()).toBe('TEST finite cleanup refusal diagnostic qualified')
+},15000)

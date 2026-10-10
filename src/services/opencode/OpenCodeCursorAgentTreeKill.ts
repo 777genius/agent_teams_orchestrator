@@ -47,7 +47,28 @@ export function query(command: string, args: string[], timeout: number,
   })
 }
 
-export function nativePorts(overrides: Partial<CursorAgentNativePorts> = {}): CursorAgentNativePorts {
+export type NativeHelperFailure = Readonly<{
+  operation: 'birth' | 'tree'
+  reason: 'helper_timeout' | 'helper_nonzero' | 'helper_spawn_error' | 'helper_output_limit' | 'helper_error'
+  exitCode: number | null
+  elapsedMs: number
+}>
+
+export function nativePorts(overrides: Partial<CursorAgentNativePorts> = {},
+  onHelperFailure?: (failure: NativeHelperFailure) => void): CursorAgentNativePorts {
+  const observedQuery = async (operation: NativeHelperFailure['operation'], command: string, args: string[], timeout: number) => {
+    const started = Date.now()
+    try { return await query(command, args, timeout) }
+    catch (error) {
+      const message = error instanceof Error ? error.message : ''
+      const exit = /^Native helper exited (-?\d+)$/.exec(message)
+      const reason: NativeHelperFailure['reason'] = message === 'Native helper timed out' ? 'helper_timeout'
+        : exit ? 'helper_nonzero' : message === 'Native helper output exceeded limit' ? 'helper_output_limit'
+          : error instanceof Error && 'code' in error ? 'helper_spawn_error' : 'helper_error'
+      onHelperFailure?.({ operation, reason, exitCode: exit ? Number(exit[1]) : null, elapsedMs: Math.max(0, Date.now() - started) })
+      throw error
+    }
+  }
   return {
     platform: process.platform, selfPid: process.pid, now: Date.now,
     birth: async (pid, timeout) => {
@@ -56,8 +77,8 @@ export function nativePorts(overrides: Partial<CursorAgentNativePorts> = {}): Cu
       if (process.platform !== 'darwin' && process.platform !== 'win32') return null
       try {
         const output = process.platform === 'darwin'
-          ? await query('ps', ['-p', String(pid), '-o', 'lstart='], timeout)
-          : await query(path.win32.join(process.env.SystemRoot || 'C:\\Windows',
+          ? await observedQuery('birth', 'ps', ['-p', String(pid), '-o', 'lstart='], timeout)
+          : await observedQuery('birth', path.win32.join(process.env.SystemRoot || 'C:\\Windows',
             'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
             ['-NoProfile', '-NonInteractive', '-Command',
               `$ErrorActionPreference = "Stop"; $p = [System.Diagnostics.Process]::GetProcessById(${pid}); try { $p.StartTime.ToUniversalTime().ToString("o") } finally { $p.Dispose() }`], timeout)
@@ -67,11 +88,11 @@ export function nativePorts(overrides: Partial<CursorAgentNativePorts> = {}): Cu
     },
     tree: async timeout => {
       const output = process.platform === 'win32'
-        ? await query(path.win32.join(process.env.SystemRoot || 'C:\\Windows',
+        ? await observedQuery('tree', path.win32.join(process.env.SystemRoot || 'C:\\Windows',
           'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
           ['-NoProfile', '-NonInteractive', '-Command',
             'Get-CimInstance Win32_Process -ErrorAction Stop | ForEach-Object { "{0} {1}" -f $_.ProcessId, $_.ParentProcessId }'], timeout)
-        : await query('ps', ['-e', '-o', 'pid=', '-o', 'ppid='], timeout)
+        : await observedQuery('tree', 'ps', ['-e', '-o', 'pid=', '-o', 'ppid='], timeout)
       const rows = output.trim().split('\n').filter(Boolean).map(line => {
         const match = /^\s*(\d+)\s+(\d+)\s*$/.exec(line)
         if (!match) throw new Error('Unreadable process tree')

@@ -1,8 +1,15 @@
 import type { ChildProcess } from 'node:child_process'
 import { spawnPortableCli } from '../../../utils/portableCli.js'
-import { nativePorts, query, type NativeRow } from '../OpenCodeCursorAgentTreeKill.js'
+import { nativePorts, query, type NativeHelperFailure, type NativeRow } from '../OpenCodeCursorAgentTreeKill.js'
 import type { OpenCodeV2ReadRoots } from '../profile/OpenCodeV2ManagedConfig.js'
 import { boundOpenCodeRead } from '../transport/OpenCodeBoundedFetch.js'
+
+/** Finite helper evidence only; raw query causes remain private to this process. */
+export class OpenCodeVersionProbeCleanupError extends Error {
+  constructor(cause: unknown, readonly helperFailure: NativeHelperFailure | null) {
+    super('cleanup_unknown', { cause })
+  }
+}
 
 type Member = NativeRow & { group: number | null; retired: boolean }
 // An observation deadline is not a retirement receipt. Keep unresolved owners
@@ -28,7 +35,8 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
     child = spawnPortableCli(executable, ['--version'], { cwd: roots.root, env: roots.env,
       stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true, detached: process.platform !== 'win32' })
     owner.child = child
-    const ports = nativePorts()
+    let helperFailure: NativeHelperFailure | null = null
+    const ports = nativePorts({}, failure => { helperFailure = failure })
     const pid = child.pid
     const started = Date.now(), deadline = started + 8000
     let ended = false, closed = false, code: number | null = null
@@ -146,7 +154,7 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
         await ports.sleep(Math.min(25, cap()))
       }
     } catch (error) {
-      if (!retired) throw new Error('cleanup_unknown', { cause: error })
+      if (!retired) throw new OpenCodeVersionProbeCleanupError(error, helperFailure)
       throw error
     } finally {
       clearTimeout(timer); signal?.removeEventListener('abort', abort)
