@@ -11,7 +11,7 @@ import { once } from 'node:events';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { assertBackfillEnvelope, assertImportedLedger, buildWindowsTeardownCommand, createBackfillFixture, finishSmokeCleanup, runSmokeGroups, sandboxEnvironment, teardownOwnedProcesses, trustedSearchPath, windowsNodeScriptPattern } from './windows-runtime-opencode-backfill.mjs';
+import { assertBackfillEnvelope, assertImportedLedger, buildWindowsTeardownCommand, createBackfillFixture, finishSmokeCleanup, runSmokeGroups, sandboxEnvironment, stageRuntimeDelivery, teardownOwnedProcesses, trustedSearchPath, windowsNodeScriptPattern } from './windows-runtime-opencode-backfill.mjs';
 
 import { assertReadinessHost, runProviderSmoke, runRecordedCheck } from './windows-runtime-opencode-provider-json.mjs';
 import { environmentSummary, traceSpawn } from './windows-process-identity-probe.mjs';
@@ -22,6 +22,71 @@ const hash = value => createHash('sha256').update(value).digest('hex');
 const existingBun = () => (process.env.PATH || '').split(path.delimiter)
   .map(dir => path.join(dir, process.platform === 'win32' ? 'bun.exe' : 'bun'))
   .find(candidate => existsSync(candidate));
+
+test('runtime relocation preserves packaged Bun and executable physical graph across every path shape', () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'runtime-relocation-'));
+  try {
+    const source = path.join(root, 'source');
+    const modules = path.join(source, 'local-cli/node_modules/fixture-package');
+    mkdirSync(modules, { recursive: true });
+    mkdirSync(path.join(source, 'bun'));
+    mkdirSync(path.join(source, 'cursor-managed'));
+    const executable = Buffer.from('compiled-frontdoor-fixture');
+    const bundledBun = Buffer.from('pinned-bun-fixture');
+    writeFileSync(path.join(source, 'cli.exe'), executable);
+    writeFileSync(path.join(source, 'bun/bun.exe'), bundledBun);
+    writeFileSync(path.join(source, 'cursor-managed/asset.txt'), 'managed-asset');
+    writeFileSync(path.join(modules, 'index.cjs'), 'module.exports = "physical-dependency";');
+    writeFileSync(path.join(source, 'local-cli/cli.js'), `
+      const assert = require('node:assert/strict');
+      const fs = require('node:fs');
+      const path = require('node:path');
+      assert.equal(fs.readFileSync(path.join(__dirname, '../bun/bun.exe'), 'utf8'), 'pinned-bun-fixture');
+      console.log(require('./node_modules/fixture-package/index.cjs'));
+    `);
+    for (const shape of ['ascii', 'with spaces', 'Юникод 世界', 'Юникод 世界 cmd']) {
+      const target = path.join(root, shape, 'bin');
+      mkdirSync(target, { recursive: true });
+      const binary = stageRuntimeDelivery(path.join(source, 'cli.exe'), target);
+      assert.deepEqual(readFileSync(binary), executable);
+      assert.deepEqual(readFileSync(path.join(target, 'bun/bun.exe')), bundledBun);
+      assert.equal(readFileSync(path.join(target, 'cursor-managed/asset.txt'), 'utf8'), 'managed-asset');
+      // Execute the relocated physical graph with Node; actual Windows front-door
+      // and hash verification remain covered by the existing executable smoke.
+      const result = spawnSync(process.execPath, [path.join(target, 'local-cli/cli.js')], {
+        cwd: target, encoding: 'utf8', timeout: 5000,
+      });
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(result.stdout.trim(), 'physical-dependency');
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('runtime relocation preserves legacy standalone compiled delivery', () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'runtime-relocation-legacy-'));
+  try {
+    const source = path.join(root, 'source'), target = path.join(root, 'target');
+    mkdirSync(source); mkdirSync(target);
+    writeFileSync(path.join(source, 'cli.exe'), 'standalone-frontdoor');
+    const binary = stageRuntimeDelivery(path.join(source, 'cli.exe'), target);
+    assert.equal(readFileSync(binary, 'utf8'), 'standalone-frontdoor');
+    assert.equal(existsSync(path.join(target, 'bun')), false);
+    assert.equal(existsSync(path.join(target, 'local-cli')), false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('runtime relocation refuses a partial packaged delivery before copying an executable', () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'runtime-relocation-partial-'));
+  try {
+    for (const present of ['bun', 'local-cli']) {
+      const source = path.join(root, present, 'source'), target = path.join(root, present, 'target');
+      mkdirSync(path.join(source, present), { recursive: true }); mkdirSync(target);
+      writeFileSync(path.join(source, 'cli.exe'), 'compiled-frontdoor');
+      assert.throws(() => stageRuntimeDelivery(path.join(source, 'cli.exe'), target), /requires both bun and local-cli/);
+      assert.equal(existsSync(path.join(target, 'runtime.exe')), false);
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
 
 
 // Real SQLite reader + attribution/reconstruction, without loading the full CLI,

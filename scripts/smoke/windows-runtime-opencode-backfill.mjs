@@ -25,6 +25,22 @@ export function trustedSearchPath(platform = process.platform, nodePath = proces
     : ['/usr/bin', '/bin'])].join(platform === 'win32' ? ';' : ':');
 }
 
+export function stageRuntimeDelivery(runtimeBinary, binaryDir) {
+  const sourceDir = path.dirname(runtimeBinary);
+  const hasBun = existsSync(path.join(sourceDir, 'bun'));
+  const hasGraph = existsSync(path.join(sourceDir, 'local-cli'));
+  assert.equal(hasBun, hasGraph, 'Packaged runtime relocation requires both bun and local-cli');
+  const binary = path.join(binaryDir, 'runtime.exe');
+  copyFileSync(runtimeBinary, binary);
+  // Release front doors verify and execute these physical siblings after relocation.
+  // Standalone compile fixtures have neither and retain their original coverage.
+  for (const directory of ['bun', 'local-cli', 'cursor-managed']) {
+    const source = path.join(sourceDir, directory);
+    if (existsSync(source)) cpSync(source, path.join(binaryDir, directory), { recursive: true });
+  }
+  return binary;
+}
+
 export function sandboxEnvironment(root, fakeBinary) {
   // Allowlist platform plumbing. Do not inherit credentials, runtime selection,
   // shell startup hooks, provider config paths, or actual project/home pointers.
@@ -379,9 +395,7 @@ export function runBackfillSmoke(binaryInput, evidenceInput, { report: suppliedR
         for (const dir of [binaryDir, projectPath, projectDir]) mkdirSync(dir, { recursive: true });
         const binary = path.join(binaryDir, 'runtime.exe');
         if (shape === 'ascii') assert.match(binary, /^[\x21-\x7e]+$/, 'ASCII case needs an ASCII temp root without spaces');
-        copyFileSync(runtimeBinary, binary);
-        const managedAssets = path.join(path.dirname(runtimeBinary), 'cursor-managed');
-        if (existsSync(managedAssets)) cpSync(managedAssets, path.join(binaryDir, 'cursor-managed'), { recursive: true });
+        stageRuntimeDelivery(runtimeBinary, binaryDir);
         item.executableSha256 = sha256(readFileSync(binary));
         assert.equal(item.executableSha256, report.executableSha256);
         copyFileSync(fixtureSource, path.join(caseRoot, 'fake-opencode.cjs'));
