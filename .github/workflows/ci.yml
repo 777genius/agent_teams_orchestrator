@@ -145,7 +145,7 @@ jobs:
     # Windows recovery fixtures spend ~20 minutes in real process-identity
     # queries; the 25-minute job cap interrupted 1065 passing cases after setup.
     # Leave room for the remaining suites without changing operation deadlines.
-    timeout-minutes: ${{ matrix.os == 'windows-latest' && 35 || 15 }}
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 45 || 15 }}
     strategy:
       fail-fast: false
       matrix:
