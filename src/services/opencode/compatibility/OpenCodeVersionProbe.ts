@@ -75,6 +75,7 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
     let stopping = false
     const fail = () => { failure ??= new Error('selection_unavailable'); stopping = true }
     const abort = () => fail()
+    const acquisitionDeadline = started + 5000
     const timer = setTimeout(fail, 5000)
     signal?.addEventListener('abort', abort, { once: true })
     child.stdout?.on('data', (chunk: Buffer) => {
@@ -85,7 +86,14 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
     child.once('error', () => { fail(); if (!child?.pid) ended = true })
     child.once('exit', value => { ended = true; code = value; stopping = true })
     const close = track(new Promise<void>(resolve => {
-      child!.once('close', () => { closed = true; resolve() })
+      child!.once('close', () => {
+        // Close ends version acquisition, not the bounded ownership cleanup.
+        // Preserve the deadline if event-loop delay delivered close too late.
+        if (Date.now() >= acquisitionDeadline) fail()
+        clearTimeout(timer)
+        closed = true
+        resolve()
+      })
     }))
     const cap = () => {
       const remaining = deadline - Date.now()
