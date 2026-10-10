@@ -281,6 +281,111 @@ describe('run-owned V2 lease/session/admission composition', () => {
       expect(f.counters.prompted).toBe(0)
     } finally { await f.close() }
   })
+  test('stop proves the exact terminal original without observe, cancellation or post-fence writes', async () => {
+    const f = await fixture()
+    let cancelled = 0
+    try {
+      await f.owner.ready()
+      await f.owner.execute({ operation: 'send', ...f.selected, intent }, Date.now() + 5000)
+      publishTerminal(f)
+      const before = await (await f.store()).snapshot()
+      let resolveFirstCut: () => void = () => undefined, interrupted = false
+      const firstCut = new Promise<void>(resolve => { resolveFirstCut = resolve }), readLog = f.native.log
+      f.native.log = async (...args) => {
+        const cut = structuredClone(await readLog(...args))
+        if (interrupted) {
+          cut.events.push({ id: 'stop-interrupt', type: 'session.execution.interrupted', seq: 8,
+            aggregateID: f.sessionAuthority.sessionID, data: { sessionID: f.sessionAuthority.sessionID } })
+          cut.watermark = 8
+        }
+        resolveFirstCut(); await Promise.resolve()
+        return cut
+      }
+      f.native.interrupt = async () => { await firstCut; interrupted = true; f.counters.interrupted++; return { interrupted: true } }
+      f.native.cancelInbox = async () => { cancelled++; throw new ExecutionTransportFailure('invalid_response', 'unknown') }
+      const update = spyOn(OpenCodeV2AdmissionStore.prototype, 'update')
+      const settle = spyOn(OpenCodeV2AdmissionStore.prototype, 'settleOriginalTerminal')
+      try {
+        const stopped = await f.owner.stop()
+        expect(stopped.members[0]!.errors).toEqual(['physical_cleanup_unknown'])
+        const after = await (await f.store()).snapshot()
+        expect(after.tombstone).toBe(true)
+        expect(after.admissions).toEqual(before.admissions)
+        expect(after.terminalSettlements).toEqual(before.terminalSettlements)
+        expect(update).not.toHaveBeenCalled()
+        expect(settle).not.toHaveBeenCalled()
+      } finally { update.mockRestore(); settle.mockRestore() }
+      expect(cancelled).toBe(0)
+      expect(f.counters.interrupted).toBe(1)
+      expect(f.counters.closed).toBe(1)
+      expect(f.counters.prompted).toBe(1)
+    } finally { await f.close() }
+  })
+  for (const reason of ['nonterminal', 'unknown', 'payload', 'session', 'revision'] as const) {
+    test(`stop preserves strict cancellation for ${reason} original evidence`, async () => {
+      const f = await fixture({ unknown: reason === 'unknown' })
+      let cancelled = 0
+      let snapshotSpy: ReturnType<typeof spyOn<OpenCodeV2AdmissionStore, 'snapshot'>> | undefined
+      try {
+        await f.owner.ready()
+        await f.owner.execute({ operation: 'send', ...f.selected, intent }, Date.now() + 5000)
+        publishTerminal(f, reason !== 'nonterminal')
+        if (reason === 'payload') {
+          const read = f.native.log
+          f.native.log = async (...args) => {
+            const cut = structuredClone(await read(...args))
+            cut.events = cut.events.map(event => event.type === 'session.inbox.enqueued' ? { ...event,
+              data: { ...event.data, item: { type: 'user', delivery: 'queue', payload: { text: 'foreign payload' } } } } : event)
+            return cut
+          }
+        }
+        if (reason === 'session') f.drift()
+        if (reason === 'revision') {
+          let sessionReads = 0
+          const readSession = f.native.getSession, snapshot = OpenCodeV2AdmissionStore.prototype.snapshot
+          f.native.getSession = async id => { sessionReads++; return readSession(id) }
+          snapshotSpy = spyOn(OpenCodeV2AdmissionStore.prototype, 'snapshot').mockImplementation(async function () {
+            const current = await snapshot.call(this)
+            // A competing commit becomes visible after the proof's independent session read.
+            return current.tombstone && sessionReads >= 2 ? { ...current,
+              admissions: current.admissions.map(row => ({ ...row, revision: row.revision + 1 })) } : current
+          })
+        }
+        f.native.cancelInbox = async (_session, nativeInputID) => {
+          expect(nativeInputID).toBe(intent.identity.nativeInputID)
+          expect((await (await f.store()).snapshot()).tombstone).toBe(true)
+          cancelled++; throw new ExecutionTransportFailure('invalid_response', 'unknown')
+        }
+        const stopped = await f.owner.stop()
+        expect(cancelled).toBe(1)
+        expect(stopped.members[0]!.errors).toEqual(['cancel_or_interrupt_unknown', 'physical_cleanup_unknown'])
+        expect(f.counters.interrupted).toBe(1)
+        expect(f.counters.closed).toBe(1)
+        expect(f.counters.prompted).toBe(1)
+      } finally { snapshotSpy?.mockRestore(); await f.close() }
+    })
+  }
+  test('stop never starts cancellation after terminal classification exhausts its original input budget', async () => {
+    const f = await fixture()
+    let cancelled = 0, clock: ReturnType<typeof spyOn<DateConstructor, 'now'>> | undefined
+    try {
+      await f.owner.ready()
+      await f.owner.execute({ operation: 'send', ...f.selected, intent }, Date.now() + 5000)
+      publishTerminal(f)
+      let now = Date.now()
+      clock = spyOn(Date, 'now').mockImplementation(() => now)
+      const readSession = f.native.getSession
+      f.native.getSession = async id => { now += 2001; return readSession(id) }
+      f.native.cancelInbox = async () => { cancelled++ }
+      const stopped = await f.owner.stop()
+      expect(cancelled).toBe(0)
+      expect(stopped.members[0]!.errors).toEqual(['cancel_or_interrupt_unknown', 'physical_cleanup_unknown'])
+      expect((await (await f.store()).snapshot()).tombstone).toBe(true)
+      expect(f.counters.interrupted).toBe(1)
+      expect(f.counters.closed).toBe(1)
+      expect(f.counters.prompted).toBe(1)
+    } finally { clock?.mockRestore(); await f.close() }
+  })
   test('stop tombstones concurrent admission, refuses later sends, and closes owned lease once', async () => {
     let release: () => void = () => undefined
     const barrier = new Promise<void>(resolve => { release = resolve })

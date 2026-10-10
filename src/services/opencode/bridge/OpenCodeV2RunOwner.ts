@@ -343,9 +343,22 @@ export class OpenCodeV2RunOwner {
         // deadline or reopens lease/session authority after the run tombstone.
         cleanupClient = await boundOpenCodeRead(this.ports.client(member.lease.authority,
           this.context(member.plan, Math.min(cleanupDeadline, Date.now() + 5000))), remaining(2000))
-        const native = cleanupClient
+        const native = cleanupClient, admissions = new OpenCodeV2AdmissionService(native, member.store, member.authority)
+        const candidates = ids.map(nativeInputID => ({ nativeInputID, deadline: Date.now() + remaining(2000) }))
+        // Read terminal cuts before interrupt can change their native log. Classification
+        // and any remaining cancellation share the original per-input deadline.
+        const terminal = await Promise.all(candidates.map(async ({ nativeInputID, deadline }) => {
+          const original = member.intents.get(nativeInputID)
+          const proved = original ? await boundOpenCodeRead(admissions.terminalAfterStop(original), Math.max(1, deadline - Date.now()))
+            .catch(() => false) : false
+          return proved && Date.now() < deadline
+        }))
         const cancellation = await Promise.allSettled([
-          ...ids.map(nativeInputID => boundOpenCodeRead(native.cancelInbox(member.authority.sessionID, nativeInputID), remaining(2000))),
+          ...candidates.filter((_candidate, index) => !terminal[index]).map(async ({ nativeInputID, deadline }) => {
+            const budget = deadline - Date.now()
+            executionAssert(budget > 0, 'authority_or_deadline')
+            await boundOpenCodeRead(native.cancelInbox(member.authority.sessionID, nativeInputID), budget)
+          }),
           boundOpenCodeRead(native.interrupt(member.authority.sessionID), remaining(2000)),
         ])
         if (cancellation.some(result => result.status === 'rejected')) errors.push('cancel_or_interrupt_unknown')

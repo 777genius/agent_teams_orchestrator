@@ -85,7 +85,8 @@ export class OpenCodeV2AdmissionService {
     executionAssert(new Set(snapshots.map(i => i.identity.nativeInputID)).size === 3)
     await this.store.reserveParkedSeries(snapshots.map(i => ({ identity: i.identity, payloadHash: validateIntent(i, i.input.resume) })))
   }
-  async readOriginalInput(intent: QueueIntent): Promise<AdmissionRecord> {
+  readOriginalInput(intent: QueueIntent): Promise<AdmissionRecord> { return this.readOriginalEvidence(intent, true) }
+  private async readOriginalEvidence(intent: QueueIntent, commit: boolean): Promise<AdmissionRecord> {
     intent = JSON.parse(canonicalExecutionJSON(intent)) as QueueIntent
     const hash = validateIntent(intent, intent.input.resume), snapshot = await this.store.snapshot()
     const original = snapshot.admissions.find(r => r.identity.requestId === intent.identity.requestId)
@@ -121,16 +122,32 @@ export class OpenCodeV2AdmissionService {
       const candidate = delivered ? messages.find(m => m.id === nativeID && m.type === 'user' && !original.beforeUserIDs.includes(m.id)) : undefined
       executionAssert(!delivered || candidate, 'projection_incomplete')
       if (candidate) verifyNativePayload(candidate.data, intent.input)
-      return await this.store.update(intent.identity.requestId, original.revision, {
+      const patch: Parameters<OpenCodeV2AdmissionStore['update']>[2] = {
         state: 'accepted', disposition: cancelled ? 'cancelled' : receipt ? 'pending' : delivered ? 'accepted' : 'unknown',
         returnedInboxID: nativeID, nativePayloadHash, ...(candidate ? { projectedUserID: candidate.id } : {}),
         complete: true, cursor: after.watermark,
-      })
+      }
+      return commit ? await this.store.update(intent.identity.requestId, original.revision, patch) : { ...original, ...patch }
     } catch {
       // Keep the last committed cursor/evidence and all original IDs; an empty
       // inbox, idle or partial page cannot remove the admission fence.
       return original
     }
+  }
+  /** Stop may classify a consumed original, but never settle or update after its fence. */
+  async terminalAfterStop(intent: QueueIntent): Promise<boolean> {
+    try {
+      const fenced = await this.store.snapshot()
+      if (!fenced.tombstone || fenced.admissions.find(row => row.identity.requestId === intent.identity.requestId)?.state !== 'accepted') return false
+      const observed = await this.readOriginalEvidence(intent, false)
+      const proof = await readOriginalTerminal(this.client, this.authority, intent, observed)
+      if (!proof) return false
+      const current = await this.store.snapshot()
+      const original = current.admissions.find(row => row.identity.requestId === proof.requestId)
+      return current.tombstone && !!original && original.state === 'accepted' && original.revision === proof.expectedRevision &&
+        executionHash(original.identity) === proof.identityHash && original.payloadHash === proof.payloadHash &&
+        original.nativePayloadHash === proof.nativePayloadHash
+    } catch { return false }
   }
   async settleOriginalInput(intent: QueueIntent): Promise<AdmissionRecord> {
     const snapshot = await this.store.snapshot()
