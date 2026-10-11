@@ -67,7 +67,12 @@ async function probeOfficialGraphNativeAccess(targets: ReadonlyMap<string, boole
             if (!library.symbols.CloseHandle(handle)) throw new Error('TEST native NT resolver handle close failed')
           }
         }
-        try { result.bunDirectoryEntries = { readable: true, count: (await readdir(target)).length } }
+        try {
+          const entries = await readdir(target, { withFileTypes: true })
+          const expectedNames = [...targets.keys()].filter(candidate => path.dirname(candidate) === target).map(candidate => path.basename(candidate))
+          result.bunDirectoryEntries = { readable: true, count: entries.length,
+            expectedKinds: expectedNames.map(name => { const entry = entries.find(candidate => candidate.name === name); return { name, present: !!entry, directory: entry?.isDirectory() ?? false, file: entry?.isFile() ?? false, symbolicLink: entry?.isSymbolicLink() ?? false } }) }
+        }
         catch (error) { result.bunDirectoryEntries = { readable: false, code: (error as NodeJS.ErrnoException).code ?? 'UNKNOWN' } }
       }
       // Observe exact requested rights; never set ACLs or write any file data.
@@ -191,6 +196,15 @@ if (child) {
       catch (error) { diagnostic.physicalEntryError = String(error).slice(0, 1024) }
       try { diagnostic.absoluteResolvedEntry = Bun.resolveSync(entry, directory); diagnostic.absoluteMatchesStagedEntry = diagnostic.absoluteResolvedEntry === entry }
       catch (error) { diagnostic.absoluteResolverError = String(error).slice(0, 1024) }
+      // Explicit package-relative input bypasses package exports without loading code.
+      const packageRoot = path.resolve(import.meta.dir, row.packageRoot)
+      const packageRelativeEntry = `.${path.sep}${path.relative(packageRoot, entry)}`
+      try { const resolved = Bun.resolveSync(packageRelativeEntry, packageRoot); diagnostic.packageRelativeResolution = { specifier: packageRelativeEntry, matched: resolved === entry, resolvedEntry: path.relative(import.meta.dir, resolved) } }
+      catch (error) { diagnostic.packageRelativeResolution = { specifier: packageRelativeEntry, error: String(error).slice(0, 1024) } }
+      if (row.specifier === 'effect') {
+        try { const resolved = Bun.resolveSync('effect/package.json', directory); diagnostic.packageJsonExportResolution = { matched: resolved === path.resolve(import.meta.dir, row.manifest), resolvedEntry: path.relative(import.meta.dir, resolved) } }
+        catch (error) { diagnostic.packageJsonExportResolution = { error: String(error).slice(0, 1024) } }
+      }
       const contexts: Record<string, unknown>[] = []
       diagnostic.resolverContexts = contexts
       for (const [name, from] of [['exactImporter', path.join(directory, 'checkpoint.ts')], ['trailingDirectory', directory + path.sep], ['graphRoot', import.meta.dir]] as const) {
@@ -352,6 +366,23 @@ foreach ($entry in $workPackageAllows) { if (([int]$entry.FileSystemRights -band
     evidence.ancestorDirectoryAccessMask = '0x1200a9'
     evidence.runtimeInputMetadataGrant = { files: 3 + (officialShellMode ? officialArtifacts.filter(artifact => artifact.metadataReadInput).length + 1 : 0), readAndExecute: true, writeAttributes: true, writeData: false, delete: false, changePermissions: false }
     evidence.ancestorGrantCount = (JSON.parse(await readFile(ancestorJournal, 'utf8')) as unknown[]).length
+    if (officialShellMode) {
+      // Parent normal Bun control uses the SAME fresh staged graph, never repository dependencies.
+      const graphRoot = path.join(root, 'readonly'), from = path.join(graphRoot, 'windows-official-shell')
+      const resolution: unknown = JSON.parse(await readFile(path.join(from, 'resolution.json'), 'utf8'))
+      if (!Array.isArray(resolution) || resolution.length !== 4) throw new Error('TEST parent resolution manifest invalid')
+      const diagnostics: Record<string, unknown>[] = []
+      evidence.officialShellParentResolution = { phase: 'staged-before-container-launch', bunVersion: Bun.version, diagnostics }
+      for (const row of resolution) {
+        if (!row || typeof row !== 'object' || typeof row.specifier !== 'string' || typeof row.entry !== 'string') throw new Error('TEST parent resolution entry invalid')
+        const entry = path.resolve(graphRoot, row.entry), relative = path.relative(graphRoot, entry)
+        if (relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw new Error('TEST parent resolution entry escaped staged graph')
+        const diagnostic: Record<string, unknown> = { specifier: row.specifier, expectedEntry: row.entry }
+        diagnostics.push(diagnostic)
+        try { const resolved = Bun.resolveSync(row.specifier, from); diagnostic.matched = resolved === entry; diagnostic.resolvedEntry = path.relative(graphRoot, resolved) }
+        catch (error) { diagnostic.error = String(error).slice(0, 1024) }
+      }
+    }
     const executable = path.join(root, 'readonly', 'bun.exe'), childOutput = path.join(root, 'child-output.txt')
     const launchEnv = { SystemRoot: process.env.SystemRoot!, WINDIR: process.env.WINDIR!, PATH: `${path.dirname(executable)};${process.env.SystemRoot}\\System32`,
       // CreateProcess constructs the profile namespace from this system path.
