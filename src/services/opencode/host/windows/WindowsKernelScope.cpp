@@ -440,13 +440,14 @@ struct OwnerStore {
               "execution_owner_path_invalid");
       // The exact DELETE-capable original handle denies external rename/deletion.
       // Its native FILE_WRITE_THROUGH mode is queried above, never assumed.
-      size_t size = FIELD_OFFSET(FILE_RENAME_INFO, FileName) + basename.size() * sizeof(wchar_t);
+      size_t size = sizeof(FILE_RENAME_INFO) + basename.size() * sizeof(wchar_t);
       std::vector<BYTE> bytes(size);
       auto rename = reinterpret_cast<FILE_RENAME_INFO *>(bytes.data());
       rename->ReplaceIfExists = FALSE;
       rename->RootDirectory = directory.parents.back().value;
       rename->FileNameLength = static_cast<DWORD>(basename.size() * sizeof(wchar_t));
       memcpy(rename->FileName, basename.data(), rename->FileNameLength);
+      rename->FileName[basename.size()] = L'\0';
       if (!SetFileInformationByHandle(directory.file.value, FileRenameInfo, rename,
                                       static_cast<DWORD>(size)))
         throw NativeError{"execution_owner_archive_unknown", GetLastError(),

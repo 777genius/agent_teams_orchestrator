@@ -1,20 +1,17 @@
 name: OpenCode V2 Windows boundary TEST
 on:
   workflow_dispatch:
-  push:
-    branches: [feat/opencode-v2-windows-boundary]
-    paths:
-      - 'scripts/spikes/opencode-v2-windows-boundary.ts'
-      - 'scripts/spikes/opencode-v2-windows-native.ts'
-      - 'scripts/spikes/windows-http-bridge/**'
-      - 'scripts/spikes/windows-official-shell/**'
-      - 'src/services/opencode/host/windows/**'
-      - 'scripts/opencode-v2/windows-owner-probe.ts'
-      - '.github/workflows/opencode-v2-windows-boundary-spike.yml'
+    inputs:
+      lane:
+        description: 'Select the mechanism under investigation; all for final qualification'
+        type: choice
+        options: [all, native-owner, native-boundary, official-shell]
+        default: all
 permissions:
   contents: read
 jobs:
   native-owner:
+    if: inputs.lane == 'all' || inputs.lane == 'native-owner'
     runs-on: windows-2022
     timeout-minutes: 10
     steps:
@@ -56,6 +53,7 @@ jobs:
             ${{ runner.temp }}/TEST-windows-owner-*/
           if-no-files-found: error
   native-boundary:
+    if: inputs.lane == 'all' || inputs.lane == 'native-boundary'
     runs-on: windows-2022
     timeout-minutes: 10
     steps:
@@ -73,6 +71,7 @@ jobs:
           path: ${{ runner.temp }}/windows-boundary-evidence.json
           if-no-files-found: error
   official-shell:
+    if: inputs.lane == 'all' || inputs.lane == 'official-shell'
     runs-on: windows-2022
     timeout-minutes: 20
     steps:
