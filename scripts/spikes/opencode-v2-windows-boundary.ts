@@ -44,6 +44,21 @@ async function probeOfficialGraphNativeAccess(targets: ReadonlyMap<string, boole
         if (status >= 0) {
           const handle = handleOut.readBigUInt64LE()
           try {
+            if (targets.has(path.join(target, 'package.json'))) {
+              // PackageJSON.parse -> FSCache.readFileWithAllocator uses openatA
+              // relative to the cached directory handle, not absolute CreateFileW.
+              const leaf = Buffer.from('package.json\0', 'utf16le')
+              const leafName = Buffer.alloc(16), leafObject = Buffer.alloc(48), leafIo = Buffer.alloc(16), leafHandle = Buffer.alloc(8)
+              leafName.writeUInt16LE(leaf.length - 2, 0); leafName.writeUInt16LE(leaf.length, 2)
+              leafName.writeBigUInt64LE(BigInt(ptr(leaf)), 8)
+              leafObject.writeUInt32LE(48, 0); leafObject.writeBigUInt64LE(handle, 8)
+              leafObject.writeBigUInt64LE(BigInt(ptr(leafName)), 16)
+              // GENERIC_READ|READ_CONTROL|FILE_WRITE_ATTRIBUTES|SYNCHRONIZE;
+              // FILE_OPEN, FILE_SYNCHRONOUS_IO_NONALERT, no case-insensitive flag.
+              const relative = nt.symbols.NtCreateFile(ptr(leafHandle), 0x80120100, ptr(leafObject), ptr(leafIo), null, 0x80, 7, 1, 0x20, null, 0)
+              result.bunNtRelativePackageOpen = { status: statusHex(relative), opened: relative >= 0 }
+              if (relative >= 0 && !library.symbols.CloseHandle(leafHandle.readBigUInt64LE())) throw new Error('TEST native relative package handle close failed')
+            }
             const buffer = Buffer.alloc(64 * 1024)
             const query = nt.symbols.NtQueryDirectoryFile(handle, null, null, null, ptr(io), ptr(buffer), buffer.length, 1, 0, null, 1)
             result.bunNtDirectoryQuery = { status: statusHex(query), succeeded: query >= 0,
@@ -176,6 +191,12 @@ if (child) {
       catch (error) { diagnostic.physicalEntryError = String(error).slice(0, 1024) }
       try { diagnostic.absoluteResolvedEntry = Bun.resolveSync(entry, directory); diagnostic.absoluteMatchesStagedEntry = diagnostic.absoluteResolvedEntry === entry }
       catch (error) { diagnostic.absoluteResolverError = String(error).slice(0, 1024) }
+      const contexts: Record<string, unknown>[] = []
+      diagnostic.resolverContexts = contexts
+      for (const [name, from] of [['exactImporter', path.join(directory, 'checkpoint.ts')], ['trailingDirectory', directory + path.sep], ['graphRoot', import.meta.dir]] as const) {
+        try { const resolved = Bun.resolveSync(row.specifier, from); contexts.push({ name, matched: resolved === entry, resolvedEntry: path.relative(import.meta.dir, resolved) }) }
+        catch (error) { contexts.push({ name, error: String(error).slice(0, 1024) }) }
+      }
       try { diagnostic.resolvedEntry = path.relative(import.meta.dir, Bun.resolveSync(row.specifier, directory)); diagnostic.matchesStagedEntry = diagnostic.resolvedEntry === row.entry }
       catch (error) { diagnostic.resolverError = String(error).slice(0, 1024) }
     }
