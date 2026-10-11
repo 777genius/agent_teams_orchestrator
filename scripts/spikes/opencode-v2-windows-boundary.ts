@@ -7,10 +7,11 @@ if (process.platform !== 'win32' || process.arch !== 'x64' || process.versions.b
 const native = await import('./opencode-v2-windows-native.ts')
 const httpCheckpoint = await import('./windows-http-bridge/checkpoint.ts')
 const pause = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms))
+const officialShellMode = process.env.TEST_WINDOWS_OFFICIAL_SHELL === '1'
 const child = process.argv[2] === 'child'
 if (child) {
   const base = process.argv[3]!, pipeName = process.argv[4]!
-  const attempts: Record<string, boolean | number | string> = {}
+  const attempts: Record<string, unknown> = {}
   let baseUrl = ''
   const deny = async (name: string, action: () => Promise<unknown>) => {
     try { await action(); attempts[name] = false } catch (error) { attempts[name] = (error as NodeJS.ErrnoException).code === 'EACCES' || (error as NodeJS.ErrnoException).code === 'EPERM' }
@@ -92,6 +93,10 @@ if (child) {
       attempts[`spawnProbe_${mode}`] = JSON.stringify({ ...probe, markerMatchesHeldPID: receipt?.probePID === probe.pid, receipt })
     } catch (error) { attempts[`spawnProbe_${mode}`] = String(error) }
   }
+  if (officialShellMode) {
+    const checkpoint = await import('./windows-official-shell/checkpoint.ts')
+    attempts.officialShellCheckpoint = await checkpoint.runOfficialShellCheckpoint(base)
+  }
   const breakaway = native.attemptWindowsJobBreakaway(process.execPath)
   attempts.jobBreakawayError = breakaway.error
   attempts.jobBreakawayReceipt = JSON.stringify(breakaway)
@@ -112,6 +117,7 @@ if (child) {
   let pipe: ReturnType<typeof native.createWindowsPipe> | undefined
   let launch: ReturnType<typeof native.launchWindowsContainer> | undefined
   const ancestorJournal = path.join(root, 'ancestor-ace-journal.json')
+  let officialArtifacts: import('./windows-official-shell/fixture.ts').Artifact[] = []
   const runPowerShell = async (script: string) => {
     const command = Bun.spawn([path.join(process.env.ProgramFiles!, 'PowerShell', '7', 'pwsh.exe'), '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
       { env: { ...process.env, PSModulePath: path.join(process.env.ProgramFiles!, 'PowerShell', '7', 'Modules'), TEST_CONTAINER_SID: container!.sid, TEST_ROOT: root, TEST_ANCESTOR_JOURNAL: ancestorJournal }, stdout: 'pipe', stderr: 'pipe' })
@@ -134,6 +140,7 @@ if (child) {
     await cp(import.meta.filename, path.join(root, 'readonly', 'opencode-v2-windows-boundary.ts'))
     await cp(path.join(import.meta.dir, 'opencode-v2-windows-native.ts'), path.join(root, 'readonly', 'opencode-v2-windows-native.ts'))
     await cp(path.join(import.meta.dir, 'windows-http-bridge'), path.join(root, 'readonly', 'windows-http-bridge'), { recursive: true })
+    if (officialShellMode) officialArtifacts = await (await import('./windows-official-shell/fixture.ts')).stageFixture(path.join(root, 'readonly'))
     container = native.createWindowsContainer(profileName)
     evidence.containerSid = container.sid
     // The server is an unsandboxed broker. LOCAL would redirect the AC client
@@ -155,9 +162,16 @@ function Rule($target, $rights, $effect) {
 Rule (Join-Path $env:TEST_ROOT 'work') ([System.Security.AccessControl.FileSystemRights]::Modify) ([System.Security.AccessControl.AccessControlType]::Allow)
 Rule (Join-Path $env:TEST_ROOT 'readonly') ([System.Security.AccessControl.FileSystemRights]::ReadAndExecute) ([System.Security.AccessControl.AccessControlType]::Allow)
 # Bun1.3.11 sys.zig openatWindowsTMaybeNormalize requests FILE_WRITE_ATTRIBUTES
-# even for O_RDONLY. Qualify that request on these two TEST runtime inputs only.
+# even for O_RDONLY. Qualify only the finite copied TEST runtime read inputs.
 $runtimeInputRights = [System.Security.AccessControl.FileSystemRights]'ReadAndExecute,WriteAttributes'
-foreach ($name in @('opencode-v2-windows-boundary.ts', 'opencode-v2-windows-native.ts', 'windows-http-bridge/checkpoint.ts')) {
+# Exact finite copied graph artifact list, hashed before and after the child.
+$runtimeInputs = @('opencode-v2-windows-boundary.ts', 'opencode-v2-windows-native.ts', 'windows-http-bridge/checkpoint.ts')
+$manifest = Join-Path (Join-Path $env:TEST_ROOT 'readonly') 'official-artifacts.json'
+if (Test-Path -LiteralPath $manifest) {
+  $runtimeInputs += 'official-artifacts.json'
+  $runtimeInputs += @(Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json | Where-Object { $_.metadataReadInput -eq $true } | ForEach-Object { $_.path })
+}
+foreach ($name in $runtimeInputs) {
   $target = Join-Path (Join-Path $env:TEST_ROOT 'readonly') $name
   $acl = Get-Acl -LiteralPath $target
   $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($sid, $runtimeInputRights, [System.Security.AccessControl.AccessControlType]::Allow))
@@ -218,7 +232,7 @@ foreach ($entry in $workPackageAllows) { if (([int]$entry.FileSystemRights -band
     await writeFile(path.join(root, 'work', 'protected', 'owner.json'), 'host-owned')
     evidence.trustedOwnerWrite = true
     evidence.ancestorDirectoryAccessMask = '0x1200a9'
-    evidence.runtimeInputMetadataGrant = { files: 3, readAndExecute: true, writeAttributes: true, writeData: false, delete: false, changePermissions: false }
+    evidence.runtimeInputMetadataGrant = { files: 3 + (officialShellMode ? officialArtifacts.filter(artifact => artifact.metadataReadInput).length + 1 : 0), readAndExecute: true, writeAttributes: true, writeData: false, delete: false, changePermissions: false }
     evidence.ancestorGrantCount = (JSON.parse(await readFile(ancestorJournal, 'utf8')) as unknown[]).length
     const executable = path.join(root, 'readonly', 'bun.exe'), childOutput = path.join(root, 'child-output.txt')
     const launchEnv = { SystemRoot: process.env.SystemRoot!, WINDIR: process.env.WINDIR!, PATH: `${path.dirname(executable)};${process.env.SystemRoot}\\System32`,
@@ -226,6 +240,7 @@ foreach ($entry in $workPackageAllows) { if (([int]$entry.FileSystemRights -band
       // Chromium's AppContainer launcher also retains LOCALAPPDATA explicitly.
       LOCALAPPDATA: process.env.LOCALAPPDATA!, USERPROFILE: path.join(root, 'work'), HOME: path.join(root, 'work'),
       TEMP: path.join(root, 'work'), TMP: path.join(root, 'work') }
+    if (officialShellMode) Object.assign(launchEnv, { TEST_WINDOWS_OFFICIAL_SHELL: '1', XDG_DATA_HOME: path.join(root, 'work', 'data'), XDG_CACHE_HOME: path.join(root, 'work', 'cache'), XDG_CONFIG_HOME: path.join(root, 'work', 'config'), XDG_STATE_HOME: path.join(root, 'work', 'state') })
     evidence.environmentPresence = Object.fromEntries(Object.entries(launchEnv).map(([key, value]) => [key, typeof value === 'string' && value.length > 0]))
     if (Object.values(launchEnv).some(value => typeof value !== 'string' || value.length === 0)) throw new Error('required native environment path missing')
     launch = native.launchWindowsContainer({ containerSid: container.address, executable,
@@ -233,7 +248,7 @@ foreach ($entry in $workPackageAllows) { if (([int]$entry.FileSystemRights -band
       env: launchEnv, onEnvironmentShape: shape => { evidence.environmentShape = shape } })
     evidence.pid = launch.pid; evidence.birthFiletime = launch.birthFiletime; evidence.assignedBeforeResume = true
     let bytes = ''
-    const deadline = Date.now() + 45000
+    const deadline = Date.now() + (officialShellMode ? 180000 : 45000)
     while (!bytes.includes('\n') && !launch.exited() && Date.now() < deadline) { bytes += pipe.read(); await pause(20) }
     if (!bytes.includes('\n')) {
       evidence.childExitCode = launch.exitCode()
@@ -256,6 +271,7 @@ foreach ($entry in $workPackageAllows) { if (([int]$entry.FileSystemRights -band
     const retiredDeadline = Date.now() + 5000
     while ((launch.active() !== 0 || !launch.exited()) && Date.now() < retiredDeadline) await pause(20)
     evidence.activeAfterTerminate = launch.active(); evidence.processExited = launch.exited()
+    if (officialShellMode) { await (await import('./windows-official-shell/fixture.ts')).verifyArtifacts(path.join(root, 'readonly'), officialArtifacts); evidence.officialArtifactsRetained = true }
     evidence.hostStateRetained = await readFile(path.join(root, 'host-state', 'secret.txt'), 'utf8') === 'host-owned'
     evidence.protectedRetained = await readFile(path.join(root, 'work', 'protected', 'owner.json'), 'utf8') === 'host-owned'
     evidence.readOnlyRetained = await readFile(path.join(root, 'readonly', 'immutable.txt'), 'utf8') === 'host-owned'

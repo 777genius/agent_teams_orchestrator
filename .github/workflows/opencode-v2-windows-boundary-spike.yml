@@ -6,6 +6,8 @@ on:
     paths:
       - 'scripts/spikes/opencode-v2-windows-boundary.ts'
       - 'scripts/spikes/opencode-v2-windows-native.ts'
+      - 'scripts/spikes/windows-http-bridge/**'
+      - 'scripts/spikes/windows-official-shell/**'
       - '.github/workflows/opencode-v2-windows-boundary-spike.yml'
 permissions:
   contents: read
@@ -26,4 +28,27 @@ jobs:
         with:
           name: opencode-v2-windows-boundary-${{ github.sha }}
           path: ${{ runner.temp }}/windows-boundary-evidence.json
+          if-no-files-found: error
+  official-shell:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - name: Install the existing pinned official graphs
+        shell: pwsh
+        run: bun install --frozen-lockfile
+      - name: Prove official Shell execution and cancellation in TEST containment
+        shell: pwsh
+        run: bun run scripts/spikes/windows-official-shell/prove.ts "$env:RUNNER_TEMP\windows-official-shell-evidence.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: opencode-v2-windows-official-shell-${{ github.sha }}
+          path: ${{ runner.temp }}/windows-official-shell-evidence.json
           if-no-files-found: error
