@@ -1,6 +1,6 @@
 import path from 'node:path'
 import { createHash } from 'node:crypto'
-import { builtinModules } from 'node:module'
+import { builtinModules, isBuiltin } from 'node:module'
 import { readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { mkdir, readFile, realpath, writeFile, readdir } from 'node:fs/promises'
 import type { Artifact } from './fixture.ts'
@@ -174,10 +174,11 @@ async function buildOnly(generatedEntry: string, sourceRoot: string, output: str
     logs: result.logs.map(log => ({ name: log.name, message: log.message, level: log.level, position: log.position })),
     fullTaskQualified: false,
   }), { flag: 'wx' })
+  await writeFile(path.join(path.dirname(stagePath), 'build-metafile.json'), JSON.stringify(result.metafile ?? null), { flag: 'wx' })
   if (!result.success || !result.metafile) throw new Error('TEST bundled checkpoint build refused')
-  for (const input of Object.values(result.metafile.inputs)) for (const imported of input.imports) {
-    if (imported.external && !imported.path.startsWith('node:') && !imported.path.startsWith('bun:')) throw new Error('TEST bundle retained an external non-builtin import')
-  }
+  const externalImports = Object.entries(result.metafile.inputs).flatMap(([source, input]) => input.imports.filter(imported => imported.external).map(imported => ({ source, ...imported, allowed: isBuiltin(imported.path) || imported.path.startsWith('bun:') })))
+  await writeFile(path.join(path.dirname(stagePath), 'build-externals.json'), JSON.stringify({ imports: externalImports, offenders: externalImports.filter(imported => !imported.allowed), fullTaskQualified: false }), { flag: 'wx' })
+  if (externalImports.some(imported => !imported.allowed)) throw new Error('TEST bundle retained an external non-builtin import')
   const emitted = await collectBundledOutputs(result.outputs, path.dirname(output), [...inputs.values()])
   const assets: { path: string; sha256: string }[] = []
   for (const [relative, asset] of emitted.assets) {
