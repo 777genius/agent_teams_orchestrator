@@ -25,7 +25,11 @@ const server = createServer(async (request, response) => {
       response.end(Buffer.alloc(100000, 0xa7))
     } else if (request.url === '/early') {
       response.statusCode = 413; response.end('early-response')
-    } else if (request.url === '/sse' || request.url === '/disconnect') {
+    } else if (request.url === '/disconnect') {
+      // Headers establish a real HTTP transaction; no response bytes can
+      // satisfy the pending read before the deliberate native disconnection.
+      response.setHeader('content-type', 'text/event-stream'); response.flushHeaders()
+    } else if (request.url === '/sse') {
       response.setHeader('content-type', 'text/event-stream'); response.flushHeaders()
       let blocked = false
       const timer = setInterval(() => {
@@ -89,6 +93,22 @@ control.events.on('message', (value: Record<string, unknown>) => {
         }
       }
       await control.send({ type: 'testFilesystemResult', nonce: value.nonce, leaseOwnerId: value.leaseOwnerId, operations })
+    } else if (value.type === 'testReopenCwd') {
+      const before = process.cwd(), bytes = Buffer.from('native-fs-bytes-é\0\x01\xff', 'utf8')
+      const observed: Record<string, unknown> = { testOnly: true, reopened: false, written: false }
+      let stage = 'reopen-cwd'
+      try {
+        // Bun 1.3.11 resolves dotted relative node-fs paths by querying its cwd
+        // HANDLE. Reopen this same selected directory; change no ACL or path.
+        process.chdir(before); observed.reopened = true; observed.cwdUnchanged = process.cwd() === before
+        stage = 'relative-node-write'; await writeFile('node-reopened.txt', bytes); observed.written = true
+        stage = 'absolute-node-read'; const read = await readFile(path.join(before, 'node-reopened.txt'))
+        observed.absoluteNodeReadMatches = read.equals(bytes); observed.bytes = read.length
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code
+        observed.failedStage = stage; observed.code = typeof code === 'string' && /^[A-Z_]{1,64}$/.test(code) ? code : 'UNKNOWN'
+      }
+      await control.send({ type: 'testReopenCwdResult', nonce: value.nonce, leaseOwnerId: value.leaseOwnerId, ...observed })
     } else if (value.type === 'close') {
       await bridge?.close()
       for (const socket of sockets) socket.destroy()

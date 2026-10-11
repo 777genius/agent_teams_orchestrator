@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url'
 import { createWindowsNativeBroker, resolveWindowsNativeArtifact } from '../../src/services/opencode/host/windows/OpenCodeV2WindowsNativeBroker.js'
 import { createWindowsOwnerFilesystem, type WindowsOwnerDirectory } from '../../src/services/opencode/host/windows/OpenCodeV2WindowsOwnerFilesystem.js'
 import { createWindowsExecutionHttpClient } from '../../src/services/opencode/host/windows/OpenCodeV2WindowsHTTP.js'
+import { verifyWindowsHttpDisconnectContract } from './windows-http-disconnect-contract.js'
 
 assert.equal(process.platform, 'win32'); assert.equal(process.versions.bun, '1.3.11')
 const requestedRoot = process.argv[2], receiptPath = process.argv[3]
@@ -37,15 +38,16 @@ async function run(disconnect: 'child-pipe' | 'broker') {
   const handles: WindowsOwnerDirectory[] = [], messages: Record<string, unknown>[] = []
   let sid: string | undefined, mapping: Record<string, unknown> | undefined, peer: Record<string, unknown> | undefined
   let failed: Record<string, unknown> | undefined, helperCloseCode: number | null | undefined, launched = false, retired = false
+  let transportFailure: Error | undefined
   const frameCounts: Record<string, number> = {}; let receivedBytes = 0
   const http = createWindowsExecutionHttpClient(
     frame => broker.request('send', { value: { ...frame, nonce, leaseOwnerId } }).then(() => undefined),
     () => { if (!broker.ended()) void broker.request('retire').catch(() => undefined) },
   )
-  broker.events.on('error', error => http.fail(error))
-  broker.events.on('close', code => { helperCloseCode = code; http.fail(new Error('execution_containment_helper_closed')) })
+  broker.events.on('error', error => { transportFailure ??= error; http.fail(transportFailure) })
+  broker.events.on('close', code => { helperCloseCode = code; transportFailure ??= new Error('execution_containment_helper_closed'); http.fail(transportFailure) })
   broker.events.on('connected', value => { peer = record(value) })
-  broker.events.on('failed', value => { failed = record(value); http.fail(new Error('execution_containment_launcher_denied')) })
+  broker.events.on('failed', value => { failed = record(value); transportFailure ??= new Error('execution_containment_launcher_denied'); http.fail(transportFailure) })
   broker.events.on('message', value => {
     const frame = record(value); assert.equal(frame.nonce, nonce); assert.equal(frame.leaseOwnerId, leaseOwnerId)
     if (frame.type === 'windowsHTTP') {
@@ -140,6 +142,17 @@ if($LASTEXITCODE-ne 0){throw 'TEST low label failed'}
       }
       assert.equal(names.size, 0)
       result.filesystemDiagnostic = { qualified: verified.every(item => item.hostReadMatches === true), operations: verified }
+      phase = 'native-cwd-reopen-diagnostic'
+      await broker.request('send', { value: { type: 'testReopenCwd', nonce, leaseOwnerId } })
+      const reopened = await until(() => messages.find(value => value.type === 'testReopenCwdResult'), 'windows_http_cwd_diagnostic_missing')
+      result.cwdReopenDiagnostic = reopened
+      if (reopened.reopened === true) assert.equal(reopened.cwdUnchanged, true)
+      if (reopened.written === true) {
+        assert.equal(reopened.absoluteNodeReadMatches, true)
+        const target = path.join(root, 'node-reopened.txt'), info = await stat(target)
+        assert.ok(info.isFile()); assert.equal(info.size, expectedBytes.length); assert.deepEqual(await readFile(target), expectedBytes)
+        result.cwdReopenDiagnostic = { ...reopened, hostReadMatches: true }
+      }
       phase = 'get-post'
       const get = await bounded(http.fetch(baseUrl + '/get'), 'windows_http_get_timeout')
       assert.equal(get.headers.get('x-native-http'), 'production-transport'); assert.equal(await bounded(get.text(), 'windows_http_get_body_timeout'), 'native-http-get-é')
@@ -191,10 +204,14 @@ if($LASTEXITCODE-ne 0){throw 'TEST low label failed'}
     // Both modes disconnect while a real response consumer is waiting for bytes.
     const response = await bounded(http.fetch(baseUrl + '/disconnect'), 'windows_http_disconnect_setup_timeout')
     const reader = response.body!.getReader()
-    await bounded(reader.read(), 'windows_http_disconnect_initial_read_timeout')
+    const pendingRead = reader.read(); let readSettled = false
+    void pendingRead.then(() => { readSettled = true }, () => { readSettled = true })
+    await Bun.sleep(0); assert.equal(readSettled, false, 'windows_http_disconnect_read_not_pending')
+    result.pendingReadBeforeDisconnect = true
     if (disconnect === 'child-pipe') {
       await broker.request('send', { value: { type: 'testDisconnect', nonce, leaseOwnerId } })
       await until(() => failed)
+      assert.equal(failed!.code, 'execution_containment_pipe_denied')
       assert.equal(failed!.clientPID, main.nativePID); assert.deepEqual(failed!.bun, main)
       result.authenticatedFailure = failed
     } else {
@@ -202,11 +219,14 @@ if($LASTEXITCODE-ne 0){throw 'TEST low label failed'}
       brokerDisconnected = true; assert.equal(helperCloseCode, 0)
       result.nativeWatchdogExitCode = helperCloseCode
     }
-    // Previously queued data must be discarded by the terminal transport failure.
+    // The actual pending read must receive the original terminal failure;
+    // a diagnostic deadline or a later cleanup error cannot establish proof.
     const expectedFailure = disconnect === 'child-pipe' ? 'execution_containment_launcher_denied' : 'execution_containment_helper_closed'
-    await assert.rejects(bounded(reader.read(), 'windows_http_disconnect_unsettled'), error => error instanceof Error && error.message === expectedFailure)
+    assert.equal(transportFailure?.message, expectedFailure)
+    await assert.rejects(bounded(pendingRead, 'windows_http_disconnect_unsettled'), error => error === transportFailure)
+    await assert.rejects(bounded(reader.read(), 'windows_http_disconnect_next_read_unsettled'), error => error === transportFailure)
     await assert.rejects(bounded(http.fetch(baseUrl + '/get'), 'windows_http_new_request_unsettled'), error => error instanceof Error && error.message === 'execution_http_transport_unknown')
-    result.pendingResponseRejected = true; result.newRequestRejected = true
+    result.pendingResponseRejected = true; result.terminalErrorIdentityPreserved = true; result.newRequestRejected = true
     if (!brokerDisconnected) {
       const retirement = record(await broker.request('retire'))
       assert.equal(retirement.activeProcesses, 0); assert.equal(retirement.heldProcessExited, true); assert.equal(retirement.ownAcesRemoved, true)
@@ -262,6 +282,7 @@ if($LASTEXITCODE-ne 0){throw 'TEST low label failed'}
   if (localFailure) throw localFailure
 }
 try {
+  facts.protocolDisconnectContract = await verifyWindowsHttpDisconnectContract()
   artifact = await resolveWindowsNativeArtifact(); facts.helper = artifact
   const modules = ['OpenCodeV2WindowsHTTP.ts', 'OpenCodeV2WindowsChildControl.ts', 'OpenCodeV2WindowsNativeBroker.ts']
   facts.productionSourceHashes = Object.fromEntries(await Promise.all(modules.map(async name => [name, await digest(path.join(moduleDirectory, name))])))
