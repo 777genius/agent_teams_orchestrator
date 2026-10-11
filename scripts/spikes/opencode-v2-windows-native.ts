@@ -83,9 +83,21 @@ export function attemptWindowsJobBreakaway(executable: string): number {
   finally { kernel.symbols.CloseHandle(thread); kernel.symbols.CloseHandle(processHandle) }
   return 0
 }
-export function launchWindowsNativeDescendant(executable: string, markerPath: string) {
+export function probeWindowsNulAccess() {
+  const name = utf16('NUL'), attributes = Buffer.alloc(24)
+  attributes.writeUInt32LE(24); attributes.writeUInt32LE(1, 16)
+  return [{ name: 'stdin', mask: 0x120089 }, { name: 'stdout', mask: 0x120196 }].map(input => {
+    // Exact uv__create_nul_handle masks and inheritance; no ACL modifications.
+    const handle = handleValue(kernel.symbols.CreateFileW(ptr(name), input.mask, 3, ptr(attributes), 3, 0, 0n))
+    if (handle === 0xffffffffffffffffn) return { ...input, error: kernel.symbols.GetLastError() }
+    check(kernel.symbols.CloseHandle(handle), 'CloseHandle:TEST NUL probe')
+    return { ...input, error: 0 }
+  })
+}
+export function launchWindowsNativeDescendant(executable: string, markerPath: string, probe?: { script: string; waitMs: number }) {
+  if (probe && (!Number.isInteger(probe.waitMs) || probe.waitMs < 1 || probe.waitMs > 5000)) throw new Error('TEST native probe timeout out of bounds')
   const quote = (argument: string) => '"' + argument.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\+)$/g, '$1$1') + '"'
-  const script = `require('node:fs').writeFileSync(${JSON.stringify(markerPath)},JSON.stringify({pid:process.pid,nativeDescendant:true}));setInterval(()=>{},1000)`
+  const script = probe?.script ?? `require('node:fs').writeFileSync(${JSON.stringify(markerPath)},JSON.stringify({pid:process.pid,nativeDescendant:true}));setInterval(()=>{},1000)`
   const executableBytes = utf16(executable), command = utf16([executable, '-e', script].map(quote).join(' '))
   const startup = Buffer.alloc(104); startup.writeUInt32LE(104)
   const info = Buffer.alloc(24)
@@ -94,7 +106,7 @@ export function launchWindowsNativeDescendant(executable: string, markerPath: st
   check(kernel.symbols.CreateProcessW(ptr(executableBytes), ptr(command), null, null, false, 4 | 0x08000000, null, null, ptr(startup), ptr(info)), 'CreateProcessW:TEST native descendant')
   const processHandle = info.readBigUInt64LE(), thread = info.readBigUInt64LE(8)
   const errors: unknown[] = []
-  let result: { pid: number; birthFiletime: string; inheritedJob: true } | undefined
+  let result: { pid: number; birthFiletime: string; inheritedJob: true; timedOut?: boolean; exitCode?: number } | undefined
   try {
     const inJob = Buffer.alloc(4)
     check(kernel.symbols.IsProcessInJob(processHandle, 0n, ptr(inJob)) && inJob.readUInt32LE() === 1, 'TEST descendant inherited Job')
@@ -102,6 +114,18 @@ export function launchWindowsNativeDescendant(executable: string, markerPath: st
     check(kernel.symbols.GetProcessTimes(processHandle, ptr(creation), ptr(exit), ptr(kernelTime), ptr(userTime)), 'TEST descendant birth')
     check(kernel.symbols.ResumeThread(thread) === 1, 'TEST descendant resume')
     result = { pid: info.readUInt32LE(16), birthFiletime: creation.readBigUInt64LE().toString(), inheritedJob: true }
+    if (probe) {
+      const wait = kernel.symbols.WaitForSingleObject(processHandle, probe.waitMs)
+      check(wait === 0 || wait === 258, 'wait TEST native spawn probe')
+      result.timedOut = wait === 258
+      if (result.timedOut) {
+        check(kernel.symbols.TerminateProcess(processHandle, 99), 'terminate timed-out TEST spawn probe')
+        check(kernel.symbols.WaitForSingleObject(processHandle, 5000) === 0, 'wait timed-out TEST spawn probe')
+      }
+      const exitCode = Buffer.alloc(4)
+      check(kernel.symbols.GetExitCodeProcess(processHandle, ptr(exitCode)), 'TEST spawn probe exit code')
+      result.exitCode = exitCode.readUInt32LE()
+    }
   } catch (error) {
     errors.push(error)
     try {

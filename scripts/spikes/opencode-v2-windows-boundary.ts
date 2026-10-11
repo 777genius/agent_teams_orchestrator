@@ -54,6 +54,30 @@ if (child) {
     }
     attempts.nativeDescendantBunStarted = marker?.pid === descendant.pid && marker.nativeDescendant === true
   } catch (error) { attempts.nativeDescendantStartupError = String(error) }
+  attempts.nulAccess = JSON.stringify(native.probeWindowsNulAccess())
+  try {
+    const markerPath = path.join(base, 'work', 'bun-spawn-inherit.json')
+    const script = `require('node:fs').writeFileSync(${JSON.stringify(markerPath)},JSON.stringify({pid:process.pid}));process.exit(0)`
+    const spawned = Bun.spawn([process.execPath, '-e', script], { stdio: ['inherit', 'inherit', 'inherit'], env: { ...process.env } })
+    const exitCode = await Promise.race([spawned.exited, pause(3000).then(() => 'timeout')])
+    if (exitCode === 'timeout') spawned.kill()
+    const marker = await readFile(markerPath, 'utf8').then(text => JSON.parse(text) as { pid?: number }).catch(() => undefined)
+    attempts.spawnProbe_inherit = JSON.stringify({ pid: spawned.pid, exitCode, markerMatchesSpawnPID: marker?.pid === spawned.pid })
+  } catch (error) { attempts.spawnProbe_inherit = String(error) }
+  // Isolate synchronous libuv pipe creation: its ACCESS_DENIED retry loop can
+  // block the event loop, so each variant runs in a held, bounded native child.
+  for (const mode of ['ignore', 'files', 'pipe'] as const) {
+    const markerPath = path.join(base, 'work', `bun-spawn-${mode}.json`)
+    const stdio = mode === 'files'
+      ? `[Bun.file(${JSON.stringify(path.join(base, 'work', 'allowed.txt'))}),Bun.file(${JSON.stringify(path.join(base, 'work', 'spawn-stdout.txt'))}),Bun.file(${JSON.stringify(path.join(base, 'work', 'spawn-stderr.txt'))})]`
+      : JSON.stringify([mode, mode, mode])
+    const script = `const fs=require('node:fs'),marker=${JSON.stringify(markerPath)};fs.writeFileSync(marker,JSON.stringify({probePID:process.pid,phase:'before-spawn'}));try{const child=Bun.spawn([process.execPath,'-e','process.exit(0)'],{stdio:${stdio},env:{...process.env}});const drains=${mode === 'pipe' ? '[new Response(child.stdout).text(),new Response(child.stderr).text()]' : '[]'};const [exitCode]=await Promise.all([child.exited,...drains]);fs.writeFileSync(marker,JSON.stringify({probePID:process.pid,phase:'completed',childPID:child.pid,exitCode}));}catch(error){fs.writeFileSync(marker,JSON.stringify({probePID:process.pid,phase:'failed',error:String(error)}));}`
+    try {
+      const probe = native.launchWindowsNativeDescendant(process.execPath, markerPath, { script, waitMs: 3000 })
+      const receipt = await readFile(markerPath, 'utf8').then(text => JSON.parse(text) as { probePID?: number }).catch(() => undefined)
+      attempts[`spawnProbe_${mode}`] = JSON.stringify({ ...probe, markerMatchesHeldPID: receipt?.probePID === probe.pid, receipt })
+    } catch (error) { attempts[`spawnProbe_${mode}`] = String(error) }
+  }
   attempts.jobBreakawayError = native.attemptWindowsJobBreakaway(process.execPath)
   } catch (error) { attempts.childStartupError = String(error); console.error(JSON.stringify({ childStartupError: String(error) })) }
   // Named pipe carries the probe response without admin loopback exemptions.
@@ -190,7 +214,7 @@ foreach ($entry in $workPackageAllows) { if (([int]$entry.FileSystemRights -band
       env: launchEnv, onEnvironmentShape: shape => { evidence.environmentShape = shape } })
     evidence.pid = launch.pid; evidence.birthFiletime = launch.birthFiletime; evidence.assignedBeforeResume = true
     let bytes = ''
-    const deadline = Date.now() + 25000
+    const deadline = Date.now() + 45000
     while (!bytes.includes('\n') && !launch.exited() && Date.now() < deadline) { bytes += pipe.read(); await pause(20) }
     if (!bytes.includes('\n')) {
       evidence.childExitCode = launch.exitCode()
