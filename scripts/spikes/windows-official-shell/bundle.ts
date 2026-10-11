@@ -143,6 +143,14 @@ async function buildOnly(generatedEntry: string, sourceRoot: string, output: str
       })
     } }] })
   stage('build-returned')
+  await writeFile(path.join(path.dirname(stagePath), 'build-diagnostics.json'), JSON.stringify({
+    success: result.success,
+    outputCount: result.outputs.length,
+    outputs: result.outputs.map(artifact => ({ path: artifact.path, kind: artifact.kind, loader: artifact.loader, bytes: artifact.size, hash: artifact.hash })),
+    metafilePresent: result.metafile !== undefined && result.metafile !== null,
+    logs: result.logs.map(log => ({ name: log.name, message: log.message, level: log.level, position: log.position })),
+    fullTaskQualified: false,
+  }), { flag: 'wx' })
   if (!result.success || result.outputs.length !== 1 || result.outputs[0]?.kind !== 'entry-point' || !result.metafile) throw new Error('TEST bundled checkpoint build refused')
   for (const input of Object.values(result.metafile.inputs)) for (const imported of input.imports) {
     if (imported.external && !imported.path.startsWith('node:') && !imported.path.startsWith('bun:')) throw new Error('TEST bundle retained an external non-builtin import')
