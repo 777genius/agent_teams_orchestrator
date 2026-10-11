@@ -9567,40 +9567,66 @@ describe('OpenCodeBridgeCommandHandler', () => {
       }
     }) as typeof openCodeSessionBridge.reconcileSession
 
+    const realNow = Date.now
+    let now = 1_000
+    Date.now = () => now
     try {
-      const result = await executeOpenCodeBridgeCommandEnvelope(
-        buildEnvelope('opencode.sendMessage', {
-          teamId: 'team-a',
-          teamName: 'team-a',
-          laneId: 'secondary:opencode:tom',
-          memberName: 'tom',
-          projectPath: '/tmp/project',
-          text: 'hello tom',
-          messageId: 'message-fallback',
-        }),
-      )
+      await withManualTimers(async timers => {
+        const pollStages = [createDeferred<void>(), createDeferred<void>()]
+        const setManualTimer = globalThis.setTimeout
+        let pollWaitCount = 0
+        globalThis.setTimeout = ((callback: () => void, timeoutMs = 0) => {
+          const timer = setManualTimer(callback, timeoutMs)
+          if (timeoutMs === 20) pollStages[pollWaitCount++]?.resolve()
+          return timer
+        }) as typeof setTimeout
+        const resultPromise = executeOpenCodeBridgeCommandEnvelope(
+          buildEnvelope('opencode.sendMessage', {
+            teamId: 'team-a',
+            teamName: 'team-a',
+            laneId: 'secondary:opencode:tom',
+            memberName: 'tom',
+            projectPath: '/tmp/project',
+            text: 'hello tom',
+            messageId: 'message-fallback',
+          }),
+        )
 
-      expect(result.ok).toBe(true)
-      if (!result.ok) {
-        return
-      }
-      expect(reconcileCalls).toBe(3)
-      expect(result.data.responseObservation).toMatchObject({
-        state: 'responded_plain_text',
-        assistantMessageId: 'assistant-plain-fallback',
-        latestAssistantPreview: 'GAUNTLET_CONCURRENT_TOM_OK_1',
-        visibleReplyCorrelation: 'plain_assistant_text',
+        // Drive both real grace-loop waits after their preceding reconciliation.
+        for (const [index, stage] of pollStages.entries()) {
+          await waitForCommandStage(stage.promise, resultPromise, `fallback poll ${index + 1}`)
+          const timer = timers.find(timer => timer.timeoutMs === 20 && !timer.cancelled)
+          expect(timer).toBeDefined()
+          expect(reconcileCalls).toBe(index + 1)
+          now += 20
+          timer!.callback()
+        }
+        const result = await resultPromise
+        expect(pollWaitCount).toBe(2)
+
+        expect(result.ok).toBe(true)
+        if (!result.ok) {
+          return
+        }
+        expect(reconcileCalls).toBe(3)
+        expect(result.data.responseObservation).toMatchObject({
+          state: 'responded_plain_text',
+          assistantMessageId: 'assistant-plain-fallback',
+          latestAssistantPreview: 'GAUNTLET_CONCURRENT_TOM_OK_1',
+          visibleReplyCorrelation: 'plain_assistant_text',
+        })
+        const fallbackDiagnostic = result.data.diagnostics.find(
+          diagnostic =>
+            diagnostic.code ===
+            'opencode_send_reconcile_message_send_tool_error_fallback_grace',
+        )
+        expect(fallbackDiagnostic?.severity).toBe('info')
+        expect(fallbackDiagnostic?.message).toContain(
+          'Reconciled OpenCode session during 80ms message_send tool_error fallback grace',
+        )
       })
-      const fallbackDiagnostic = result.data.diagnostics.find(
-        diagnostic =>
-          diagnostic.code ===
-          'opencode_send_reconcile_message_send_tool_error_fallback_grace',
-      )
-      expect(fallbackDiagnostic?.severity).toBe('info')
-      expect(fallbackDiagnostic?.message).toContain(
-        'Reconciled OpenCode session during 80ms message_send tool_error fallback grace',
-      )
     } finally {
+      Date.now = realNow
       if (previousFallbackGrace === undefined) {
         delete process.env.AGENT_TEAMS_OPENCODE_MESSAGE_SEND_TOOL_ERROR_FALLBACK_GRACE_MS
       } else {
