@@ -9,6 +9,34 @@ const httpCheckpoint = await import('./windows-http-bridge/checkpoint.ts')
 const pause = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms))
 const officialShellMode = process.env.TEST_WINDOWS_OFFICIAL_SHELL === '1'
 const child = process.argv[2] === 'child'
+async function probeOfficialGraphNativeAccess(targets: ReadonlyMap<string, boolean>) {
+  const { dlopen, FFIType, ptr } = await import('bun:ffi')
+  const library = dlopen('kernel32.dll', {
+    GetFileAttributesW: { args: [FFIType.ptr], returns: FFIType.u32 },
+    CreateFileW: { args: [FFIType.ptr, FFIType.u32, FFIType.u32, FFIType.ptr, FFIType.u32, FFIType.u32, FFIType.u64], returns: FFIType.u64 },
+    CloseHandle: { args: [FFIType.u64], returns: FFIType.bool },
+    GetLastError: { args: [], returns: FFIType.u32 },
+  })
+  const results: Record<string, unknown>[] = []
+  try {
+    for (const [target, directory] of targets) {
+      const bytes = Buffer.from(target + '\0', 'utf16le')
+      const attributes = library.symbols.GetFileAttributesW(ptr(bytes))
+      const result: Record<string, unknown> = { path: target, directory, attributes,
+        attributeError: attributes === 0xffffffff ? library.symbols.GetLastError() : 0, opens: [] }
+      const opens: Record<string, unknown>[] = []
+      result.opens = opens; results.push(result)
+      // Observe exact requested rights; never set ACLs or write any file data.
+      for (const [name, mask] of [['attributesOnly', 0x80], ['bunDirectoryRead', 0x1200a9], ['bunFileRead', 0x120089], ['readWithWriteAttributes', directory ? 0x1201a9 : 0x120189]] as const) {
+        const handle = BigInt(library.symbols.CreateFileW(ptr(bytes), mask, 7, null, 3, directory ? 0x02200000 : 0x00200000, 0n))
+        const error = handle === 0xffffffffffffffffn ? library.symbols.GetLastError() : 0
+        opens.push({ name, mask, opened: error === 0, error })
+        if (error === 0 && !library.symbols.CloseHandle(handle)) throw new Error('TEST native resolver diagnostic handle close failed')
+      }
+    }
+  } finally { library.close() }
+  return results
+}
 if (child) {
   const base = process.argv[3]!, pipeName = process.argv[4]!
   const attempts: Record<string, unknown> = {}
@@ -98,19 +126,29 @@ if (child) {
     const resolution: unknown = JSON.parse(await readFile(path.join(directory, 'resolution.json'), 'utf8'))
     if (!Array.isArray(resolution) || resolution.length !== 4) throw new Error('TEST official resolution manifest invalid')
     const diagnostics: Record<string, unknown>[] = []
+    const nativeTargets = new Map<string, boolean>([[import.meta.dir, true], [path.join(import.meta.dir, 'node_modules'), true], [directory, true]])
     attempts.officialShellResolution = diagnostics
     for (const row of resolution) {
-      if (!row || typeof row !== 'object' || typeof row.specifier !== 'string' || typeof row.entry !== 'string') throw new Error('TEST official resolution entry invalid')
+      if (!row || typeof row !== 'object' || typeof row.specifier !== 'string' || typeof row.entry !== 'string' || typeof row.packageRoot !== 'string' || typeof row.manifest !== 'string') throw new Error('TEST official resolution entry invalid')
       const entry = path.resolve(import.meta.dir, row.entry)
       const relative = path.relative(import.meta.dir, entry)
       if (relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw new Error('TEST official resolution entry escaped its staged graph')
       const diagnostic: Record<string, unknown> = { specifier: row.specifier, expectedEntry: row.entry }
       diagnostics.push(diagnostic)
+      for (const [relativePath, isDirectory] of [[row.packageRoot, true], [row.manifest, false], [row.entry, false]] as const) {
+        const target = path.resolve(import.meta.dir, relativePath), relativeTarget = path.relative(import.meta.dir, target)
+        if (relativeTarget.startsWith(`..${path.sep}`) || path.isAbsolute(relativeTarget)) throw new Error('TEST native graph access target escaped')
+        nativeTargets.set(target, isDirectory)
+        if (isDirectory && path.basename(path.dirname(target)) === '@opencode') nativeTargets.set(path.dirname(target), true)
+      }
+      try { const metadata: unknown = JSON.parse(await readFile(path.resolve(import.meta.dir, row.manifest), 'utf8')); diagnostic.packageManifestReadable = true; diagnostic.packageIdentityMatches = !!metadata && typeof metadata === 'object' && 'name' in metadata && metadata.name === row.packageName && 'version' in metadata && metadata.version === row.packageVersion }
+      catch (error) { diagnostic.packageManifestError = String(error).slice(0, 1024) }
       try { await readFile(entry); diagnostic.physicalEntryReadable = true }
       catch (error) { diagnostic.physicalEntryError = String(error).slice(0, 1024) }
       try { diagnostic.resolvedEntry = path.relative(import.meta.dir, Bun.resolveSync(row.specifier, directory)); diagnostic.matchesStagedEntry = diagnostic.resolvedEntry === row.entry }
       catch (error) { diagnostic.resolverError = String(error).slice(0, 1024) }
     }
+    attempts.officialShellNativeAccess = await probeOfficialGraphNativeAccess(nativeTargets)
     if (diagnostics.some(row => row.physicalEntryReadable !== true || row.matchesStagedEntry !== true)) throw new Error('TEST official child graph resolution refused; see officialShellResolution')
     const checkpoint = await import('./windows-official-shell/checkpoint.ts')
     attempts.officialShellCheckpoint = await checkpoint.runOfficialShellCheckpoint(base)

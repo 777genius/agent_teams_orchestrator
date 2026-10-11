@@ -14,7 +14,21 @@ export async function stageFixture(readonly: string): Promise<Artifact[]> {
     const entry = await realpath(Bun.resolveSync(specifier, path.join(readonly, 'windows-official-shell')))
     const relative = path.relative(readonly, entry)
     if (relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw new Error('TEST official child import escaped its staged graph')
-    resolution.push({ specifier, entry: relative })
+    let packageRoot = path.dirname(entry)
+    for (;;) {
+      const manifest = path.join(packageRoot, 'package.json')
+      const metadata: unknown = await readFile(manifest, 'utf8').then(JSON.parse).catch(error => {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+        return null
+      })
+      if (metadata && typeof metadata === 'object' && 'name' in metadata && typeof metadata.name === 'string' && 'version' in metadata && typeof metadata.version === 'string') {
+        resolution.push({ specifier, entry: relative, packageRoot: path.relative(readonly, packageRoot), manifest: path.relative(readonly, manifest), packageName: metadata.name, packageVersion: metadata.version })
+        break
+      }
+      const parent = path.dirname(packageRoot)
+      if (parent === packageRoot || parent === readonly) throw new Error('TEST official child package identity missing')
+      packageRoot = parent
+    }
   }
   await writeFile(path.join(readonly, 'windows-official-shell', 'resolution.json'), JSON.stringify(resolution))
   const artifacts: Artifact[] = []
