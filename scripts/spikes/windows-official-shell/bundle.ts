@@ -36,6 +36,28 @@ export function transformBundledNodeFetch(file: string, bytes: Buffer, sourceRoo
   const contents = Buffer.from(source.replace(literal, replacement))
   return { contents, transformation: { file, literal, replacement, entry, originalSha256: hash(bytes), transformedSha256: hash(contents) } }
 }
+export function transformBundledDriverLogger(file: string, bytes: Buffer, sourceRoot: string) {
+  const drivers = [
+    { suffix: path.join('node_modules', '@opencode', 'server-v2-floor', 'node_modules', '@opencode', 'core', 'dist', 'chunks', 'aisdk-native-361ty1x8.js'), sha256: '08644d86bc78e833a284618cd09b0d12e26cd207698d0cf3711ba319a2a56c20' },
+    { suffix: path.join('node_modules', '@opencode', 'core', 'dist', 'chunks', 'job-my8d63dw.js'), sha256: '7d76c8b2be8cffe47c0fbebaa0aa752a67d15081d1db407da611a6739e2dc095' },
+  ]
+  const selected = drivers.find(driver => file.endsWith(driver.suffix))
+  if (!selected) return { contents: bytes, transformation: undefined }
+  within(sourceRoot, file)
+  const literal = 'import { EffectLogger } from "drizzle-orm/effect-core";'
+  const source = bytes.toString('utf8')
+  if (hash(bytes) !== selected.sha256 || source.split(literal).length !== 2) throw new Error('TEST bundle SQLite driver logger source mismatch')
+  const barrel = realpathSync(Bun.resolveSync('drizzle-orm/effect-core', path.dirname(file)))
+  const root = path.dirname(barrel), manifest = path.join(root, 'package.json')
+  within(sourceRoot, manifest)
+  const metadata: unknown = JSON.parse(readFileSync(manifest, 'utf8'))
+  if (!metadata || typeof metadata !== 'object' || !('name' in metadata) || metadata.name !== 'drizzle-orm' || !('version' in metadata) || metadata.version !== '1.0.0-rc.5-169397b') throw new Error('TEST bundle SQLite driver logger package mismatch')
+  const entry = realpathSync(path.join(root, 'effect-core', 'logger.js'))
+  within(root, entry)
+  const replacement = `import { EffectLogger } from ${JSON.stringify(bundledImportPath(entry))};`
+  const contents = Buffer.from(source.replace(literal, replacement))
+  return { contents, transformation: { file, literal, replacement, entry, originalSha256: hash(bytes), transformedSha256: hash(contents) } }
+}
 export async function collectBundledOutputs(outputs: readonly Bun.BuildArtifact[], directory: string, rawInputs: readonly Uint8Array[]) {
   const entries = outputs.filter(artifact => artifact.kind === 'entry-point')
   if (entries.length !== 1 || !entries[0]) throw new Error('TEST bundle requires exactly one entry point')
@@ -106,8 +128,7 @@ export async function stageBundledFixture(readonly: string): Promise<Artifact[]>
   }
   if (!loggerSelection) throw new Error('TEST bundle logger selection absent')
   imports.push(`import { EffectLogger as diagnosticDirectLogger } from ${JSON.stringify(bundledImportPath(loggerSelection.path))};`)
-  imports.push(`import { EffectLogger as diagnosticBarrelLogger } from ${JSON.stringify(bundledImportPath(loggerSelection.barrelPath))};`)
-  imports.push('export const bundledLoggerBinding = { direct: diagnosticDirectLogger, barrel: diagnosticBarrelLogger };')
+  imports.push('export const bundledLoggerBinding = { direct: diagnosticDirectLogger };')
   // Generated TS has static, exact per-pin imports; no runtime package resolver.
   const generatedEntry = path.join(buildDirectory, 'checkpoint-entry.ts')
   await writeFile(generatedEntry, renderBundledCheckpointEntry(imports, tables))
@@ -126,7 +147,7 @@ export async function stageBundledFixture(readonly: string): Promise<Artifact[]>
     await writeFile(path.join(buildDirectory, 'parent-result.json'), JSON.stringify({ phase: 'build-child-failed', code, signal: child.signalCode, fullTaskQualified: false }))
     throw new Error('TEST bundle child failed; retained build phase evidence')
   }
-  const result: { inputs: { file: string; sha256: string }[]; transformations: { file: string; literal: string; replacement: string; entry: string; originalSha256: string; transformedSha256: string }[]; assets: { path: string; sha256: string }[]; loggerBinding: { directExportJoined: boolean }, metafile: Bun.BuildMetafile } = JSON.parse(await readFile(resultPath, 'utf8'))
+  const result: { inputs: { file: string; sha256: string }[]; transformations: { file: string; literal: string; replacement: string; entry: string; originalSha256: string; transformedSha256: string }[]; assets: { path: string; sha256: string }[]; loggerBinding: { directExportRetained: boolean }, metafile: Bun.BuildMetafile } = JSON.parse(await readFile(resultPath, 'utf8'))
   const inputs = new Map<string, Buffer>()
   for (const input of result.inputs) {
     if (input.file !== generatedEntry) within(sourceRoot, input.file)
@@ -134,13 +155,14 @@ export async function stageBundledFixture(readonly: string): Promise<Artifact[]>
     if (hash(bytes) !== input.sha256) throw new Error('TEST bundle consumed source changed')
     inputs.set(input.file, bytes)
   }
-  if (hash(inputs.get(loggerSelection.path) ?? Buffer.alloc(0)) !== loggerSelection.sha256 || result.loggerBinding.directExportJoined !== true || hash(await readFile(loggerSelection.manifestPath)) !== loggerSelection.manifestSha256) throw new Error('TEST bundle logger retained source binding absent')
+  if (hash(inputs.get(loggerSelection.path) ?? Buffer.alloc(0)) !== loggerSelection.sha256 || result.loggerBinding.directExportRetained !== true || hash(await readFile(loggerSelection.manifestPath)) !== loggerSelection.manifestSha256) throw new Error('TEST bundle logger retained source binding absent')
   for (const transformation of result.transformations) {
     const original = inputs.get(transformation.file)
     if (!original || hash(original) !== transformation.originalSha256) throw new Error('TEST bundle transformed source custody changed')
-    const expected = transformBundledNodeFetch(transformation.file, original, sourceRoot).transformation
+    const expected = (transformation.literal === 'import { EffectLogger } from "drizzle-orm/effect-core";' ? transformBundledDriverLogger(transformation.file, original, sourceRoot) : transformBundledNodeFetch(transformation.file, original, sourceRoot)).transformation
     if (!expected || JSON.stringify(expected) !== JSON.stringify(transformation)) throw new Error('TEST bundle resolution transformation changed')
   }
+  if (result.transformations.filter(item => item.literal === 'import { EffectLogger } from "drizzle-orm/effect-core";').length !== 2 || result.transformations.some(item => item.literal === 'import { EffectLogger } from "drizzle-orm/effect-core";' && item.entry !== loggerSelection.path)) throw new Error('TEST bundle selected driver logger bindings incomplete')
   const artifacts: Artifact[] = [], provenance: { path: string; sha256: string; bytes: number; lf: number; crlf: number; dynamicReferences: string[] }[] = []
   const add = async (destination: string, bytes: Uint8Array, metadataReadInput: boolean) => {
     await mkdir(path.dirname(destination), { recursive: true }); await writeFile(destination, bytes, { flag: 'wx' })
@@ -209,7 +231,8 @@ async function buildOnly(generatedEntry: string, sourceRoot: string, output: str
         if (file !== generatedEntry) within(sourceRoot, file)
         const bytes = readFileSync(file)
         inputs.set(file, bytes)
-        const transformed = transformBundledNodeFetch(file, bytes, sourceRoot)
+        const driver = transformBundledDriverLogger(file, bytes, sourceRoot)
+        const transformed = driver.transformation ? driver : transformBundledNodeFetch(file, bytes, sourceRoot)
         if (transformed.transformation) transformations.push(transformed.transformation)
         if (inputs.size === 1) stage('build-first-source-loaded')
         return { contents: transformed.contents, loader: args.loader }
@@ -252,13 +275,13 @@ async function buildOnly(generatedEntry: string, sourceRoot: string, output: str
   try {
     const loaded = await import(pathToFileURL(output).href)
     if (typeof loaded.runOfficialShellCheckpointBundled !== 'function') throw new Error('TEST bundled checkpoint export absent')
-    if (typeof loaded.bundledLoggerBinding?.direct !== 'function' || loaded.bundledLoggerBinding.direct !== loaded.bundledLoggerBinding.barrel) throw new Error('TEST bundled direct logger/barrel identity mismatch')
-    await writeFile(validationPath, JSON.stringify({ ...validation, phase: 'import-passed', passed: true, loggerBinding: { directExportJoined: true } }))
+    if (typeof loaded.bundledLoggerBinding?.direct !== 'function' || loaded.bundledLoggerBinding.direct.Default === undefined) throw new Error('TEST bundled direct logger export absent')
+    await writeFile(validationPath, JSON.stringify({ ...validation, phase: 'import-passed', passed: true, loggerBinding: { directExportRetained: true } }))
   } catch (error) {
     await writeFile(validationPath, JSON.stringify({ ...validation, phase: 'import-failed', passed: false, error: error instanceof Error ? { name: error.name, message: error.message.slice(0, 2048), stack: error.stack?.slice(0, 8192) } : { name: 'NonError' } }))
     throw new Error('TEST bundled checkpoint import refused; retained import evidence')
   }
-  await writeFile(resultPath, JSON.stringify({ inputs: [...inputs].map(([file, bytes]) => ({ file, sha256: hash(bytes) })), transformations, assets, loggerBinding: { directExportJoined: true }, metafile: result.metafile }), { flag: 'wx' })
+  await writeFile(resultPath, JSON.stringify({ inputs: [...inputs].map(([file, bytes]) => ({ file, sha256: hash(bytes) })), transformations, assets, loggerBinding: { directExportRetained: true }, metafile: result.metafile }), { flag: 'wx' })
   stage('build-result-published')
 }
 if (process.argv[2] === '--build-only') {
