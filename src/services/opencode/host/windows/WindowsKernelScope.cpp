@@ -915,14 +915,16 @@ struct Scope {
         }
       }
     } catch (...) {
-      if (!stopping) {
-        JsonObject value;
-        str(value, L"code", L"execution_containment_pipe_denied");
-        event(L"failed", value);
-      }
+      // The same terminal event covers rejected frames and unexpected EOF.
     }
-    if (!stopping && job)
-      TerminateJobObject(job.value, 99);
+    if (!stopping) {
+      JsonObject value = JsonObject::Parse(mapping.Stringify());
+      str(value, L"code", L"execution_containment_pipe_denied");
+      num(value, L"clientPID", pid);
+      event(L"failed", value);
+      if (job)
+        TerminateJobObject(job.value, 99);
+    }
   }
   JsonObject retire() {
     stopping = true;

@@ -5,13 +5,13 @@ on:
       lane:
         description: 'Select the mechanism under investigation; all for final qualification'
         type: choice
-        options: [all, native-owner, native-command, native-boundary, official-shell, resolver-primitive]
+        options: [all, native-owner, native-command, native-http, native-boundary, official-shell, resolver-primitive]
         default: all
 permissions:
   contents: read
 jobs:
   native-owner:
-    if: inputs.lane == 'all' || inputs.lane == 'native-owner' || inputs.lane == 'native-command'
+    if: inputs.lane == 'all' || inputs.lane == 'native-owner' || inputs.lane == 'native-command' || inputs.lane == 'native-http'
     runs-on: windows-2022
     timeout-minutes: 10
     steps:
@@ -50,6 +50,13 @@ jobs:
           $root = Join-Path $env:RUNNER_TEMP ('TEST-windows-command-' + [guid]::NewGuid().ToString())
           & bun scripts/opencode-v2/windows-command-probe.ts $root "$env:RUNNER_TEMP\windows-command-evidence.json" 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP\windows-command-output.txt"
           exit $LASTEXITCODE
+      - name: Prove production HTTP transport with authenticated native pipe bytes and disconnects
+        if: inputs.lane == 'all' || inputs.lane == 'native-http'
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP ('TEST-windows-http-' + [guid]::NewGuid().ToString())
+          & bun scripts/opencode-v2/windows-http-probe.ts $root "$env:RUNNER_TEMP\windows-http-evidence.json" 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP\windows-http-output.txt"
+          exit $LASTEXITCODE
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -60,6 +67,8 @@ jobs:
             ${{ runner.temp }}/TEST-windows-owner-*/
             ${{ runner.temp }}/windows-command-evidence.json
             ${{ runner.temp }}/windows-command-output.txt
+            ${{ runner.temp }}/windows-http-evidence.json
+            ${{ runner.temp }}/windows-http-output.txt
           if-no-files-found: error
   native-boundary:
     if: inputs.lane == 'all' || inputs.lane == 'native-boundary'
