@@ -20,7 +20,10 @@ const lease = 'b04ca87c-d84d-4b55-a89a-9c8fa7bd1f16'
 const facts: Record<string, unknown> = { schema: 1, qualified: false, primitive: 'held-directory-rename', runRoot: requestedRoot }
 let failure: unknown
 try {
-  retain(await filesystem.createDirectory(requestedRoot))
+  const setupRoot = await filesystem.createDirectory(requestedRoot)
+  // The scratch parent is setup only. Actual source fences below retain their
+  // original DELETE-capable handles; the existing parent needs traversal only.
+  await setupRoot.close()
   const originalPath = path.win32.join(requestedRoot, '.opencode-v2-execution-owner')
   const original = retain(await filesystem.createDirectory(originalPath))
   const record = { schema: 1, synthetic: true, leaseOwnerId: lease, marker: 'retained-original-é' }
