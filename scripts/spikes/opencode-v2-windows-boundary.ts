@@ -10,9 +10,11 @@ const child = process.argv[2] === 'child'
 if (child) {
   const base = process.argv[3]!, pipeName = process.argv[4]!
   const attempts: Record<string, boolean | number | string> = {}
+  let baseUrl = ''
   const deny = async (name: string, action: () => Promise<unknown>) => {
     try { await action(); attempts[name] = false } catch (error) { attempts[name] = (error as NodeJS.ErrnoException).code === 'EACCES' || (error as NodeJS.ErrnoException).code === 'EPERM' }
   }
+  try {
   await writeFile(path.join(base, 'work', 'allowed.txt'), 'owned write')
   attempts.ownedWrite = true
   await deny('hostStateWriteDenied', () => writeFile(path.join(base, 'host-state', 'secret.txt'), 'escape'))
@@ -22,7 +24,6 @@ if (child) {
   attempts.protectedAclEscapeError = native.attemptWindowsAclEscape(path.join(base, 'work', 'protected'))
   attempts.readOnlyAclEscapeError = native.attemptWindowsAclEscape(path.join(base, 'readonly'))
   await deny('readOnlyWriteDenied', () => writeFile(path.join(base, 'readonly', 'immutable.txt'), 'escape'))
-  let baseUrl = ''
   try {
     const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response('native-http-ok') })
     baseUrl = `http://127.0.0.1:${server.port}`
@@ -34,7 +35,9 @@ if (child) {
     attempts.descendantPID = descendant.pid
   } catch (error) { attempts.descendantStartupError = String(error) }
   attempts.jobBreakawayError = native.attemptWindowsJobBreakaway(process.execPath)
+  } catch (error) { attempts.childStartupError = String(error); console.error(JSON.stringify({ childStartupError: String(error) })) }
   // Named pipe carries the probe response without admin loopback exemptions.
+  console.log(JSON.stringify({ pid: process.pid, baseUrl, attempts }))
   const pipe = createConnection(pipeName)
   pipe.once('connect', () => { pipe.write(JSON.stringify({ pid: process.pid, baseUrl, attempts }) + '\n') })
   pipe.once('error', error => { void writeFile(path.join(base, 'work', 'pipe-error.txt'), String(error)) })
@@ -84,7 +87,7 @@ if ($LASTEXITCODE -ne 0) { throw 'TEST low integrity setup failed' }
       { env: { ...process.env, PSModulePath: path.join(process.env.ProgramFiles!, 'PowerShell', '7', 'Modules'), TEST_CONTAINER_SID: container.sid, TEST_ROOT: root }, stdout: 'pipe', stderr: 'pipe' })
     const aclError = await new Response(acl.stderr).text()
     if (await acl.exited !== 0) throw new Error(`TEST ACL setup:${aclError}`)
-    const executable = path.join(root, 'readonly', 'bun.exe')
+    const executable = path.join(root, 'readonly', 'bun.exe'), childOutput = path.join(root, 'child-output.txt')
     const launchEnv = { SystemRoot: process.env.SystemRoot!, WINDIR: process.env.WINDIR!, PATH: `${path.dirname(executable)};${process.env.SystemRoot}\\System32`,
       // CreateProcess constructs the profile namespace from this system path.
       // Chromium's AppContainer launcher also retains LOCALAPPDATA explicitly.
@@ -93,13 +96,15 @@ if ($LASTEXITCODE -ne 0) { throw 'TEST low integrity setup failed' }
     evidence.environmentPresence = Object.fromEntries(Object.entries(launchEnv).map(([key, value]) => [key, typeof value === 'string' && value.length > 0]))
     if (Object.values(launchEnv).some(value => typeof value !== 'string' || value.length === 0)) throw new Error('required native environment path missing')
     launch = native.launchWindowsContainer({ containerSid: container.address, executable,
-      arguments: [path.join(root, 'readonly', 'opencode-v2-windows-boundary.ts'), 'child', root, pipeName], cwd: path.join(root, 'work'),
+      arguments: [path.join(root, 'readonly', 'opencode-v2-windows-boundary.ts'), 'child', root, pipeName], cwd: path.join(root, 'work'), outputPath: childOutput,
       env: launchEnv, onEnvironmentShape: shape => { evidence.environmentShape = shape } })
     evidence.pid = launch.pid; evidence.birthFiletime = launch.birthFiletime; evidence.assignedBeforeResume = true
     let bytes = ''
     const deadline = Date.now() + 25000
     while (!bytes.includes('\n') && !launch.exited() && Date.now() < deadline) { bytes += pipe.read(); await pause(20) }
     if (!bytes.includes('\n')) {
+      evidence.childExitCode = launch.exitCode()
+      evidence.childOutput = await readFile(childOutput, 'utf8').catch(() => null)
       evidence.pipeError = await readFile(path.join(root, 'work', 'pipe-error.txt'), 'utf8').catch(() => null)
       throw new Error('native Bun/IPC probe did not report')
     }
@@ -123,7 +128,16 @@ if ($LASTEXITCODE -ne 0) { throw 'TEST low integrity setup failed' }
   } catch (error) { evidence.error = String(error); evidence.qualified = false }
   finally {
     const cleanupErrors: string[] = []
-    for (const dispose of [() => launch?.terminate(), () => launch?.close(), () => pipe?.close(), () => container?.close()]) {
+    if (launch) {
+      try {
+        launch.terminate()
+        const deadline = Date.now() + 5000
+        while (launch.active() !== 0 && Date.now() < deadline) await pause(20)
+        evidence.cleanupActiveProcesses = launch.active(); evidence.cleanupProcessExited = launch.exited()
+        if (evidence.cleanupActiveProcesses !== 0 || !evidence.cleanupProcessExited) throw new Error('TEST native retirement uncertain')
+      } catch (error) { cleanupErrors.push(String(error)) }
+    }
+    for (const dispose of [() => launch?.close(), () => pipe?.close(), () => container?.close()]) {
       try { dispose() } catch (error) { cleanupErrors.push(String(error)) }
     }
     if (cleanupErrors.length) { evidence.cleanupErrors = cleanupErrors; evidence.qualified = false }

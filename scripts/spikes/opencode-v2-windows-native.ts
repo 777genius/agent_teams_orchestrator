@@ -16,6 +16,8 @@ const kernel = dlopen('kernel32.dll', {
   TerminateJobObject: { args: [h, d], returns: b },
   WaitForSingleObject: { args: [h, d], returns: d },
   GetProcessTimes: { args: [h, p, p, p, p], returns: b },
+  GetExitCodeProcess: { args: [h, p], returns: b },
+  CreateFileW: { args: [p, d, d, p, d, d, h], returns: h },
   CloseHandle: { args: [h], returns: b },
   GetLastError: { args: [], returns: d },
   lstrlenW: { args: [p], returns: FFIType.i32 },
@@ -112,21 +114,22 @@ export function createWindowsPipe(name: string, sid: string) {
   }
 }
 const launchBufferPins = new Set<Buffer[]>()
-export function launchWindowsContainer(input: { containerSid: number; executable: string; arguments: readonly string[]; cwd: string; env: Record<string, string>; onEnvironmentShape?: (shape: { unicode: true; doubleNull: boolean; bytes: number }) => void }) {
+export function launchWindowsContainer(input: { containerSid: number; executable: string; arguments: readonly string[]; cwd: string; outputPath: string; env: Record<string, string>; onEnvironmentShape?: (shape: { unicode: true; doubleNull: boolean; bytes: number }) => void }) {
   const job = handleValue(kernel.symbols.CreateJobObjectW(null, null)); check(job !== 0n, 'CreateJobObjectW')
   let processHandle = 0n, thread = 0n
   let attributeAddress: Pointer | undefined, initialized = false, capabilityAddress: Pointer | undefined
   const backing: Buffer[] = []; launchBufferPins.add(backing)
+  const stdioHandles: bigint[] = []
   try {
   const limits = Buffer.alloc(144); limits.writeUInt32LE(0x2000, 16) // KILL_ON_JOB_CLOSE; no breakaway flags.
   check(kernel.symbols.SetInformationJobObject(job, 9, ptr(limits), limits.length), 'SetInformationJobObject')
   const size = Buffer.alloc(8)
-  kernel.symbols.InitializeProcThreadAttributeList(null, 2, 0, ptr(size))
+  kernel.symbols.InitializeProcThreadAttributeList(null, 3, 0, ptr(size))
   check(kernel.symbols.GetLastError() === 122, 'attribute sizing')
   const attributes = Buffer.alloc(Number(size.readBigUInt64LE()))
   backing.push(attributes)
   attributeAddress = ptr(attributes)
-  check(kernel.symbols.InitializeProcThreadAttributeList(attributeAddress, 2, 0, ptr(size)), 'attributes')
+  check(kernel.symbols.InitializeProcThreadAttributeList(attributeAddress, 3, 0, ptr(size)), 'attributes')
   initialized = true
   const internet = Buffer.alloc(8), internetText = utf16('S-1-15-3-1')
   check(security.symbols.ConvertStringSidToSidW(ptr(internetText), ptr(internet)), 'internet SID')
@@ -138,6 +141,19 @@ export function launchWindowsContainer(input: { containerSid: number; executable
   check(kernel.symbols.UpdateProcThreadAttribute(ptr(attributes), 0, 0x20009n, ptr(caps), caps.length, null, null), 'security capabilities')
   check(kernel.symbols.UpdateProcThreadAttribute(ptr(attributes), 0, 0x2000dn, ptr(jobs), jobs.length, null, null), 'job list')
   const startup = Buffer.alloc(112); startup.writeUInt32LE(112); pointer(startup, 104, ptr(attributes))
+  // Only these two TEST-owned handles can cross the process boundary.
+  const inheritable = Buffer.alloc(24); inheritable.writeUInt32LE(24); inheritable.writeUInt32LE(1, 16)
+  const outputPath = utf16(input.outputPath), nullPath = utf16('NUL')
+  const openStdio = (file: Buffer, access: number, disposition: number) => {
+    const handle = handleValue(kernel.symbols.CreateFileW(ptr(file), access, 3, ptr(inheritable), disposition, 0x80, 0n))
+    check(handle !== 0xffffffffffffffffn, 'CreateFileW:TEST stdio')
+    stdioHandles.push(handle); return handle
+  }
+  const stdout = openStdio(outputPath, 0x40000000, 2), stdin = openStdio(nullPath, 0x80000000, 3)
+  const handles = Buffer.alloc(16); pointer(handles, 0, stdout); pointer(handles, 8, stdin)
+  backing.push(inheritable, outputPath, nullPath, handles)
+  check(kernel.symbols.UpdateProcThreadAttribute(ptr(attributes), 0, 0x20002n, ptr(handles), handles.length, null, null), 'TEST stdio handle list')
+  startup.writeUInt32LE(0x100, 60); pointer(startup, 80, stdin); pointer(startup, 88, stdout); pointer(startup, 96, stdout)
   const processInfo = Buffer.alloc(24), executable = utf16(input.executable), cwd = utf16(input.cwd)
   // Windows CommandLineToArgvW-compatible quoting, including terminal backslashes.
   const quote = (argument: string) => '"' + argument.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\+)$/g, '$1$1') + '"'
@@ -147,9 +163,14 @@ export function launchWindowsContainer(input: { containerSid: number; executable
   input.onEnvironmentShape?.({ unicode: true, doubleNull, bytes: environment.length })
   check(doubleNull, 'Unicode environment termination')
   backing.push(startup, processInfo, executable, cwd, command, environment)
-    check(kernel.symbols.CreateProcessW(ptr(executable), ptr(command), null, null, false, 0x80000 | 4 | 0x400 | 0x08000000,
+    check(kernel.symbols.CreateProcessW(ptr(executable), ptr(command), null, null, true, 0x80000 | 4 | 0x400 | 0x08000000,
       ptr(environment), ptr(cwd), ptr(startup), ptr(processInfo)), 'CreateProcessW')
   processHandle = processInfo.readBigUInt64LE(); thread = processInfo.readBigUInt64LE(8)
+  while (stdioHandles.length) {
+    const handle = stdioHandles[stdioHandles.length - 1]!
+    check(kernel.symbols.CloseHandle(handle), 'CloseHandle:TEST stdio')
+    stdioHandles.pop()
+  }
   const pid = processInfo.readUInt32LE(16)
   const active = () => {
     const accounting = Buffer.alloc(48)
@@ -164,6 +185,7 @@ export function launchWindowsContainer(input: { containerSid: number; executable
   let closed = false
   return { pid, birthFiletime: creation.readBigUInt64LE().toString(), active,
     exited: () => kernel.symbols.WaitForSingleObject(processHandle, 0) === 0,
+    exitCode() { const code = Buffer.alloc(4); check(kernel.symbols.GetExitCodeProcess(processHandle, ptr(code)), 'GetExitCodeProcess'); return code.readUInt32LE() },
     terminate() { check(kernel.symbols.TerminateJobObject(job, 99), 'TerminateJobObject') },
     close() { if (closed) return; closed = true; check(kernel.symbols.CloseHandle(job), 'CloseHandle:job'); check(kernel.symbols.CloseHandle(processHandle), 'CloseHandle:process') },
   }
@@ -177,8 +199,12 @@ export function launchWindowsContainer(input: { containerSid: number; executable
     if (cleanup.length) throw new Error(`native acquisition cleanup uncertain:${cleanup.join(',')}`, { cause: error })
     throw error
   } finally {
+    // These remain only when acquisition failed; its catch already retired the job.
+    const stdioCleanupErrors: string[] = []
+    for (const handle of stdioHandles) if (!kernel.symbols.CloseHandle(handle)) stdioCleanupErrors.push('TEST stdio')
     if (initialized && attributeAddress) kernel.symbols.DeleteProcThreadAttributeList(attributeAddress)
     if (capabilityAddress) kernel.symbols.LocalFree(capabilityAddress)
     launchBufferPins.delete(backing)
+    if (stdioCleanupErrors.length) throw new Error('native stdio acquisition cleanup uncertain')
   }
 }
