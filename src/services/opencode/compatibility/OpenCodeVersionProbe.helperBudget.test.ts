@@ -275,3 +275,98 @@ test('darwin gone group member with reparented PPID requires absence and final c
   expect(f.budgets.every(budget => budget > 0 && budget <= 2000)).toBe(true)
   expect(f.events.slice(-2)).toEqual(['census:empty', 'remove'])
 })
+
+// The wrapper can close before the first birth helper completes while WMI still
+// returns its old tree. These rows must never confer birth or signal authority.
+function unanchoredFixture(mode: 'gone' | 'alive' | 'unknown' | 'orphan' | 'reused' | 'persistent' | 'final-reappeared' | 'absence-before-close') {
+  Object.defineProperty(process, 'platform', { value: 'win32' })
+  const root = 900_020, relay = 900_021, leaf = 900_022, orphan = 900_023, grandchild = 900_024
+  let clock = 1_000_000, removed = 0, trees = 0, births = 0
+  const budgets: number[] = [], signals: number[] = [], taskkills: number[] = [], aliveReads: number[] = []
+  const events: string[] = []
+  const child = new EventEmitter() as ChildProcess
+  Object.assign(child, { pid: root, stdout: new PassThrough() })
+  const initialRows = [{ pid: root, ppid: process.pid }, { pid: relay, ppid: root }, { pid: leaf, ppid: relay }]
+  const date = spyOn(Date, 'now').mockImplementation(() => clock)
+  const launcher = spyOn(portable, 'resolveDirectWindowsLauncher').mockReturnValue({ command: '/TEST/native', argsPrefix: [] })
+  const spawn = spyOn(portable, 'spawnPortableCli').mockImplementation(() => {
+    queueMicrotask(() => {
+      child.stdout!.emit('data', Buffer.from('1.19.0\n'))
+      child.emit('exit', 0)
+      if (mode !== 'absence-before-close') child.emit('close', 0)
+    })
+    return child
+  })
+  const ports = spyOn(native, 'nativePorts').mockImplementation(() => ({
+    platform: 'win32', selfPid: process.pid, now: () => clock,
+    birth: async (_target, budget) => { births++; budgets.push(budget); clock += 350; return null },
+    tree: async budget => {
+      budgets.push(budget); trees++
+      let rows = trees === 1 || mode === 'persistent' ? initialRows : []
+      if (trees === 2 && mode === 'orphan') rows = [{ pid: grandchild, ppid: orphan }, { pid: orphan, ppid: leaf }]
+      if (trees === 2 && mode === 'reused') rows = [{ pid: leaf, ppid: 900_099 }]
+      if (trees === 3 && mode === 'final-reappeared') rows = [{ pid: orphan, ppid: leaf }]
+      events.push(rows.length ? 'census:rows' : 'census:empty')
+      return rows
+    },
+    alive: target => {
+      aliveReads.push(target)
+      if ((mode === 'alive' && target === leaf) || (mode === 'orphan' && target === grandchild) ||
+        (mode === 'reused' && trees === 2 && target === leaf)) return 'alive'
+      return mode === 'unknown' && target === leaf ? 'unknown' : 'gone'
+    },
+    signal: target => { signals.push(target) },
+    taskkill: async target => { taskkills.push(target); throw new Error('TEST unowned process kill') },
+    sleep: async ms => {
+      clock += ms
+      if (mode === 'absence-before-close' && trees === 2) {
+        expect(removed).toBe(0)
+        events.push('close'); child.emit('close', 0)
+      }
+    },
+  }))
+  restore.push(() => date.mockRestore(), () => launcher.mockRestore(), () => spawn.mockRestore(), () => ports.mockRestore())
+  const roots = { root: '/TEST/private', env: {}, remove: async () => { events.push('remove'); removed++ } } as OpenCodeV2ReadRoots
+  return { run: () => readOpenCodeOwnedVersion('/TEST/native', roots), removed: () => removed,
+    trees: () => trees, births: () => births, elapsed: () => clock - 1_000_000,
+    budgets, signals, taskkills, aliveReads, events, root, relay, leaf, orphan, grandchild }
+}
+
+test('Windows unanchored gone rows require independent gone checks, raw absence and strict final census', async () => {
+  const f = unanchoredFixture('gone')
+  expect(await f.run()).toBe('1.19.0\n')
+  expect(f.aliveReads).toEqual([f.root, f.relay, f.leaf])
+  expect(f.events).toEqual(['census:rows', 'census:empty', 'census:empty', 'remove'])
+  expect(f.births()).toBe(1)
+  expect(f.signals).toEqual([])
+  expect(f.taskkills).toEqual([])
+  expect(f.budgets).toEqual([5000, 5000, 5000, 5000])
+  expect(f.removed()).toBe(1)
+})
+
+test('Windows unanchored census absence waits for child close before strict final census and removal', async () => {
+  const f = unanchoredFixture('absence-before-close')
+  expect(await f.run()).toBe('1.19.0\n')
+  expect(f.events).toEqual(['census:rows', 'census:empty', 'close', 'census:empty', 'census:empty', 'remove'])
+  expect(f.births()).toBe(1)
+  expect(f.signals).toEqual([])
+  expect(f.taskkills).toEqual([])
+  expect(f.removed()).toBe(1)
+})
+
+for (const mode of ['alive', 'unknown', 'orphan', 'reused', 'persistent', 'final-reappeared'] as const) {
+  test(`Windows unanchored ${mode} census cannot retire or signal numeric candidates`, async () => {
+    const f = unanchoredFixture(mode)
+    await expect(f.run()).rejects.toThrow('cleanup_unknown')
+    expect(f.removed()).toBe(0)
+    expect(f.signals).toEqual([])
+    expect(f.taskkills).toEqual([])
+    expect(f.births()).toBe(1)
+    expect(f.aliveReads).toContain(f.leaf)
+    expect(f.budgets.every(budget => budget > 0 && budget <= 5000)).toBe(true)
+    if (mode === 'orphan') { expect(f.trees()).toBe(2); expect(f.aliveReads).toContain(f.grandchild) }
+    if (mode === 'reused') expect(f.trees()).toBe(2)
+    if (mode === 'final-reappeared') expect(f.trees()).toBe(3)
+    if (mode === 'persistent') expect(f.elapsed()).toBe(8000)
+  })
+}

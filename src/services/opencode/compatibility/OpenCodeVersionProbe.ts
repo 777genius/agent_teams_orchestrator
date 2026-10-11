@@ -107,9 +107,28 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
     // snapshot members visible to later full tables, including surviving orphans
     // and numeric PID reuse after their original ancestry has disappeared.
     const unownedCandidates = new Set<number>()
-    const assertCandidatesAbsent = (rows: Member[]) => {
+    let unanchoredRetirement = false
+    const assertCandidatesAbsent = (rows: Member[], strict = !unanchoredRetirement): boolean => {
+      if (!strict) {
+        // Keep ancestry across stale tables and reparenting, without acquiring
+        // birth or signal authority from any numeric census candidate.
+        for (let changed = true; changed;) {
+          changed = false
+          for (const row of rows) if (unownedCandidates.has(row.ppid) && !unownedCandidates.has(row.pid)) {
+            unownedCandidates.add(row.pid); changed = true
+          }
+        }
+        const candidates = rows.filter(row => unownedCandidates.has(row.pid))
+        for (const row of candidates) {
+          if (row.pid === process.pid || row.pid === process.ppid || ports.alive(row.pid) !== 'gone') {
+            throw new Error('cleanup_unknown')
+          }
+        }
+        return candidates.length > 0
+      }
       if (rows.some(row => !row.retired &&
         (unownedCandidates.has(row.pid) || unownedCandidates.has(row.ppid)))) throw new Error('cleanup_unknown')
+      return false
     }
     const birth = (target: number) => observe(ports.birth(target, Math.min(helperTimeout, cap())))
     const sameBirth = async (target: number, expected: number): Promise<boolean> => {
@@ -153,7 +172,11 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
       for (;;) {
         cap()
         const rows = await table(), group = members(rows)
-        assertCandidatesAbsent(rows)
+        const candidatesPresent = assertCandidatesAbsent(rows)
+        if (unanchoredRetirement && candidatesPresent) {
+          await ports.sleep(Math.min(25, cap()))
+          continue
+        }
         const live = rows.filter(row => !row.retired)
         // A live birth-checked member anchors group continuity. If the initial
         // leader vanished before identity capture, do not infer orphan ownership.
@@ -163,7 +186,18 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
           if (expected !== undefined && await sameBirth(row.pid, expected)) { anchor = row; break }
         }
         const additions = group.filter(row => !births.has(row.pid))
-        if (additions.length && !anchor) throw new Error('cleanup_unknown')
+        if (additions.length && !anchor) {
+          if (process.platform !== 'win32' || births.size) throw new Error('cleanup_unknown')
+          // A fast wrapper may close before its initial birth can be read.
+          // Gone observations permit waiting only: raw census absence, child
+          // close and a strict final full table still gate physical retirement.
+          unanchoredRetirement = true
+          if (pid) unownedCandidates.add(pid)
+          for (const row of group) unownedCandidates.add(row.pid)
+          assertCandidatesAbsent(rows)
+          await ports.sleep(Math.min(25, cap()))
+          continue
+        }
         const capturedAdditions: Member[] = []
         for (const row of additions) {
           if (row.pid === process.pid || row.pid === process.ppid) throw new Error('cleanup_unknown')
@@ -212,7 +246,7 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
           if (pending.size) throw new Error('cleanup_unknown')
           if (unownedCandidates.size) {
             const finalRows = await table()
-            assertCandidatesAbsent(finalRows)
+            assertCandidatesAbsent(finalRows, true)
             if (members(finalRows).length || finalRows.some(row => !row.retired && births.has(row.pid))) {
               throw new Error('cleanup_unknown')
             }
