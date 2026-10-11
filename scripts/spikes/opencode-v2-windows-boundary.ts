@@ -17,6 +17,11 @@ async function probeOfficialGraphNativeAccess(targets: ReadonlyMap<string, boole
     CloseHandle: { args: [FFIType.u64], returns: FFIType.bool },
     GetLastError: { args: [], returns: FFIType.u32 },
   })
+  const nt = dlopen('ntdll.dll', {
+    NtCreateFile: { args: [FFIType.ptr, FFIType.u32, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.u32, FFIType.u32, FFIType.u32, FFIType.u32, FFIType.ptr, FFIType.u32], returns: FFIType.i32 },
+    NtQueryDirectoryFile: { args: [FFIType.u64, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.u32, FFIType.u32, FFIType.u8, FFIType.ptr, FFIType.u8], returns: FFIType.i32 },
+  })
+  const statusHex = (status: number) => '0x' + (status >>> 0).toString(16).padStart(8, '0')
   const results: Record<string, unknown>[] = []
   try {
     for (const [target, directory] of targets) {
@@ -26,6 +31,30 @@ async function probeOfficialGraphNativeAccess(targets: ReadonlyMap<string, boole
         attributeError: attributes === 0xffffffff ? library.symbols.GetLastError() : 0, opens: [] }
       const opens: Record<string, unknown>[] = []
       result.opens = opens; results.push(result)
+      if (directory) {
+        // Match pinned Bun1.3.11 sys.openDirAtWindowsNtPath and DirIterator,
+        // including OBJECT_ATTRIBUTES.Attributes=0 and backup-intent option.
+        const name = Buffer.from('\\??\\' + target + '\0', 'utf16le')
+        const unicode = Buffer.alloc(16), object = Buffer.alloc(48), io = Buffer.alloc(16), handleOut = Buffer.alloc(8)
+        unicode.writeUInt16LE(name.length - 2, 0); unicode.writeUInt16LE(name.length, 2)
+        unicode.writeBigUInt64LE(BigInt(ptr(name)), 8)
+        object.writeUInt32LE(48, 0); object.writeBigUInt64LE(BigInt(ptr(unicode)), 16)
+        const status = nt.symbols.NtCreateFile(ptr(handleOut), 0x1200a9, ptr(object), ptr(io), null, 0, 7, 1, 0x4021, null, 0)
+        result.bunNtDirectoryOpen = { status: statusHex(status), opened: status >= 0 }
+        if (status >= 0) {
+          const handle = handleOut.readBigUInt64LE()
+          try {
+            const buffer = Buffer.alloc(64 * 1024)
+            const query = nt.symbols.NtQueryDirectoryFile(handle, null, null, null, ptr(io), ptr(buffer), buffer.length, 1, 0, null, 1)
+            result.bunNtDirectoryQuery = { status: statusHex(query), succeeded: query >= 0,
+              bytes: Number(io.readBigUInt64LE(8)), endOfDirectory: (query >>> 0) === 0x80000006 }
+          } finally {
+            if (!library.symbols.CloseHandle(handle)) throw new Error('TEST native NT resolver handle close failed')
+          }
+        }
+        try { result.bunDirectoryEntries = { readable: true, count: (await readdir(target)).length } }
+        catch (error) { result.bunDirectoryEntries = { readable: false, code: (error as NodeJS.ErrnoException).code ?? 'UNKNOWN' } }
+      }
       // Observe exact requested rights; never set ACLs or write any file data.
       for (const [name, mask] of [['attributesOnly', 0x80], ['bunDirectoryRead', 0x1200a9], ['bunFileRead', 0x120089], ['readWithWriteAttributes', directory ? 0x1201a9 : 0x120189]] as const) {
         const handle = BigInt(library.symbols.CreateFileW(ptr(bytes), mask, 7, null, 3, directory ? 0x02200000 : 0x00200000, 0n))
@@ -34,7 +63,7 @@ async function probeOfficialGraphNativeAccess(targets: ReadonlyMap<string, boole
         if (error === 0 && !library.symbols.CloseHandle(handle)) throw new Error('TEST native resolver diagnostic handle close failed')
       }
     }
-  } finally { library.close() }
+  } finally { nt.close(); library.close() }
   return results
 }
 if (child) {
@@ -145,8 +174,16 @@ if (child) {
       catch (error) { diagnostic.packageManifestError = String(error).slice(0, 1024) }
       try { await readFile(entry); diagnostic.physicalEntryReadable = true }
       catch (error) { diagnostic.physicalEntryError = String(error).slice(0, 1024) }
+      try { diagnostic.absoluteResolvedEntry = Bun.resolveSync(entry, directory); diagnostic.absoluteMatchesStagedEntry = diagnostic.absoluteResolvedEntry === entry }
+      catch (error) { diagnostic.absoluteResolverError = String(error).slice(0, 1024) }
       try { diagnostic.resolvedEntry = path.relative(import.meta.dir, Bun.resolveSync(row.specifier, directory)); diagnostic.matchesStagedEntry = diagnostic.resolvedEntry === row.entry }
       catch (error) { diagnostic.resolverError = String(error).slice(0, 1024) }
+    }
+    // Resolver builds its directory cache top-down from the drive root.
+    // Record counts/status only; do not export sibling filenames.
+    for (let ancestor = path.dirname(import.meta.dir);; ancestor = path.dirname(ancestor)) {
+      nativeTargets.set(ancestor, true)
+      if (ancestor === path.dirname(ancestor)) break
     }
     attempts.officialShellNativeAccess = await probeOfficialGraphNativeAccess(nativeTargets)
     if (diagnostics.some(row => row.physicalEntryReadable !== true || row.matchesStagedEntry !== true)) throw new Error('TEST official child graph resolution refused; see officialShellResolution')
