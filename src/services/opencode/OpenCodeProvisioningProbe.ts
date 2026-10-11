@@ -156,6 +156,7 @@ export class OpenCodeProvisioningProbe {
     if (options.selectedModel && !selectedModel) {
       throw new Error('OpenCode strict launch requires a provider-qualified selected model')
     }
+    options.phaseContext?.reportProvisioningStage?.('profile_scope')
     const profileScope = selectedModel
       ? await resolveOpenCodeProfileScope({
           projectPath,
@@ -163,6 +164,7 @@ export class OpenCodeProvisioningProbe {
           selectedModel: selectedModel.raw,
         })
       : undefined
+    options.phaseContext?.reportProvisioningStage?.('inventory')
     const inventory = await inventoryService.probe(projectPath, {
       bypassCache: !options.useCache,
       ...(profileScope ? { mode: 'profile' as const } : {}),
@@ -277,6 +279,7 @@ export class OpenCodeProvisioningProbe {
       }
     }
     try {
+      options.phaseContext?.reportProvisioningStage?.('ensure_host')
       const ensurePromise = hostManager.ensureHost({
         projectPath: inventory.projectPath,
         ...(options.existingHostKey ? { hostKey: options.existingHostKey, existingOnly: true } : {}),
@@ -305,6 +308,7 @@ export class OpenCodeProvisioningProbe {
         host = undefined
         throwOpenCodeAbortReason(options.phaseContext.signal)
       }
+      options.phaseContext?.reportProvisioningStage?.('retain_lease')
       await hostManager.retainHostLease?.(host.hostKey, preflightLease)
     } catch (error) {
       // A failed durable admission must not leak the reference ensureHost acquired.
@@ -358,6 +362,7 @@ export class OpenCodeProvisioningProbe {
 
     const acquiredHost = host
     const inspect = async (): Promise<RetainedOpenCodeProvisioningProbe> => {
+      options.phaseContext?.reportProvisioningStage?.('host_inspect')
       const host = acquiredHost
       const requestContext = options.phaseContext
         ? {
@@ -386,11 +391,13 @@ export class OpenCodeProvisioningProbe {
           ) {
             throw new Error('OpenCode strict launch retained host/profile fingerprint mismatch')
           }
+          options.phaseContext?.reportProvisioningStage?.('app_mcp')
           const appMcp = await mcpManager.ensureAppMcp({
             baseUrl: host.baseUrl,
             attachIfMissing: options.attachAppMcp !== false,
             requestContext,
           })
+          options.phaseContext?.reportProvisioningStage?.('host_finalize')
           const appMcpReady = appMcp.summary.status === 'attached'
             || appMcp.summary.status === 'present'
           return {
@@ -572,6 +579,7 @@ export class OpenCodeProvisioningProbe {
       }
     }
     try {
+      options.phaseContext?.reportProvisioningStage?.('host_operation_wait')
       return await (hostManager.withHostOperation
         ? hostManager.withHostOperation(acquiredHost, preflightLease, inspect)
         : inspect())

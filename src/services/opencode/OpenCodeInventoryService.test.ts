@@ -522,7 +522,18 @@ describe('OpenCodeInventoryService parsers', () => {
       expect(result.stdout).toBe('started')
       expect(result.stderr).toBe('waiting')
     } finally {
-      await rm(tempDir, { recursive: true, force: true })
+      // Bun 1.3.11 ignores fs.rm retry options; Windows may still hold the cwd.
+      for (let attempt = 0; attempt < 6; attempt++) {
+        try {
+          await rm(tempDir, { recursive: true, force: true })
+          break
+        } catch (error) {
+          const busy = error !== null && typeof error === 'object'
+            && 'code' in error && error.code === 'EBUSY'
+          if (process.platform !== 'win32' || !busy || attempt === 5) throw error
+          await new Promise(resolve => setTimeout(resolve, 100 * (attempt + 1)))
+        }
+      }
     }
   })
 

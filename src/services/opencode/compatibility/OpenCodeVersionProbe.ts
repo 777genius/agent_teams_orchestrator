@@ -103,6 +103,14 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
     const observe = <T>(work: Promise<T>) => boundOpenCodeRead(track(work), cap())
     const births = new Map<number, number>()
     const signalled = new Set<number>()
+    // Census-only candidates confer no birth or signal authority. Keep vanished
+    // snapshot members visible to later full tables, including surviving orphans
+    // and numeric PID reuse after their original ancestry has disappeared.
+    const unownedCandidates = new Set<number>()
+    const assertCandidatesAbsent = (rows: Member[]) => {
+      if (rows.some(row => !row.retired &&
+        (unownedCandidates.has(row.pid) || unownedCandidates.has(row.ppid)))) throw new Error('cleanup_unknown')
+    }
     const birth = (target: number) => observe(ports.birth(target, Math.min(helperTimeout, cap())))
     const sameBirth = async (target: number, expected: number): Promise<boolean> => {
       if (await birth(target) === expected) return true
@@ -145,6 +153,7 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
       for (;;) {
         cap()
         const rows = await table(), group = members(rows)
+        assertCandidatesAbsent(rows)
         const live = rows.filter(row => !row.retired)
         // A live birth-checked member anchors group continuity. If the initial
         // leader vanished before identity capture, do not infer orphan ownership.
@@ -155,23 +164,38 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
         }
         const additions = group.filter(row => !births.has(row.pid))
         if (additions.length && !anchor) throw new Error('cleanup_unknown')
+        const capturedAdditions: Member[] = []
         for (const row of additions) {
           if (row.pid === process.pid || row.pid === process.ppid) throw new Error('cleanup_unknown')
           const identity = await birth(row.pid)
+          if (identity === null) {
+            if (ports.alive(row.pid) !== 'gone') throw new Error('cleanup_unknown')
+            cap()
+            unownedCandidates.add(row.pid)
+            continue
+          }
           const parentBirth = process.platform === 'win32' ? births.get(row.ppid) : births.get(anchor!.pid)
-          if (identity === null || parentBirth === undefined || identity < parentBirth) throw new Error('cleanup_unknown')
+          if (parentBirth === undefined || identity < parentBirth) throw new Error('cleanup_unknown')
           births.set(row.pid, identity)
+          capturedAdditions.push(row)
         }
         if (additions.length) {
-          const confirmation = members(await table())
-          for (const row of additions) {
-            if (!confirmation.some(current => current.pid === row.pid && current.ppid === row.ppid) ||
-              await birth(row.pid) !== births.get(row.pid)) throw new Error('cleanup_unknown')
+          const confirmationRows = await table()
+          assertCandidatesAbsent(confirmationRows)
+          const confirmation = members(confirmationRows)
+          for (const row of capturedAdditions) {
+            if (!confirmation.some(current => current.pid === row.pid && current.ppid === row.ppid)) {
+              if (ports.alive(row.pid) !== 'gone') throw new Error('cleanup_unknown')
+              unownedCandidates.add(row.pid)
+            } else if (!await sameBirth(row.pid, births.get(row.pid)!)) {
+              unownedCandidates.add(row.pid)
+            }
+            cap()
           }
         }
         if (stopping) {
           for (const [target, identity] of births) {
-            if (!live.some(row => row.pid === target) || signalled.has(target)) continue
+            if (unownedCandidates.has(target) || !live.some(row => row.pid === target) || signalled.has(target)) continue
             if (!await sameBirth(target, identity)) continue
             cap()
             // Signals target captured births only, never a numeric group alone.
@@ -186,6 +210,16 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
           await boundOpenCodeRead(close, cap())
           await boundOpenCodeRead(Promise.allSettled([...pending]), cap())
           if (pending.size) throw new Error('cleanup_unknown')
+          if (unownedCandidates.size) {
+            const finalRows = await table()
+            assertCandidatesAbsent(finalRows)
+            if (members(finalRows).length || finalRows.some(row => !row.retired && births.has(row.pid))) {
+              throw new Error('cleanup_unknown')
+            }
+            await boundOpenCodeRead(Promise.allSettled([...pending]), cap())
+            if (pending.size) throw new Error('cleanup_unknown')
+            cap()
+          }
           retired = true
           if (failure || !ended || code !== 0 || signal?.aborted) throw failure ?? new Error('selection_unavailable')
           return output
