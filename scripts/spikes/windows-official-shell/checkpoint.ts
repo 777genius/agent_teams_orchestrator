@@ -20,13 +20,13 @@ async function graph(alias: string) {
     entry,
   }
 }
-export async function runOfficialShellCheckpoint(base: string) {
+export async function runOfficialShellCheckpoint(base: string, resolveGraph: typeof graph = graph) {
   const pins: Record<string, unknown>[] = []
   for (const [pin, alias] of [['2.0.0', '@opencode/server-v2-floor'], ['2.0.21', '@opencode/server']] as const) {
     const receipts: CommandReceipt[] = [], record: Record<string, unknown> = { pin, receipts }
     pins.push(record)
     try {
-      const official = await graph(alias)
+      const official = await resolveGraph(alias)
       const work = path.join(base, 'work'), shell = path.join(process.env.SystemRoot!, 'System32', 'cmd.exe')
       const edited = path.join(work, `official-${pin}-edited.txt`), marker = path.join(work, `official-${pin}-descendant.json`)
       const commandFile = path.join(work, `official-${pin}-command.js`), cancelFile = path.join(work, `official-${pin}-cancel.js`)

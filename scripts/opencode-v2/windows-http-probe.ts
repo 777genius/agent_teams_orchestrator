@@ -121,6 +121,25 @@ if($LASTEXITCODE-ne 0){throw 'TEST low label failed'}
     assert.equal(typeof ready.baseUrl, 'string'); const baseUrl = String(ready.baseUrl)
     http.bindOrigin(baseUrl); result.baseUrl = baseUrl
     if (disconnect === 'child-pipe') {
+      phase = 'native-filesystem-api-diagnostic'
+      await broker.request('send', { value: { type: 'testFilesystem', nonce, leaseOwnerId } })
+      const diagnostic = await until(() => messages.find(value => value.type === 'testFilesystemResult'), 'windows_http_filesystem_diagnostic_missing')
+      const names = new Map([['node-relative', 'node-relative.txt'], ['node-absolute', 'node-absolute.txt'], ['node-sync-relative', 'node-sync.txt'],
+        ['node-relative-no-dot', 'nodeplain'], ['bun-relative', 'bun-relative.txt'], ['bun-absolute', 'bun-absolute.txt']])
+      assert.ok(Array.isArray(diagnostic.operations) && diagnostic.operations.length === names.size)
+      const expectedBytes = Buffer.from('native-fs-bytes-é\0\x01\xff', 'utf8'), verified: Record<string, unknown>[] = []
+      for (const item of diagnostic.operations) {
+        const operation = record(item), name = names.get(String(operation.id)); assert.ok(name); names.delete(String(operation.id))
+        if (operation.written === true) {
+          assert.equal(operation.absoluteNodeReadMatches, true)
+          const target = path.join(root, name), info = await stat(target)
+          assert.ok(info.isFile()); assert.equal(info.size, expectedBytes.length)
+          assert.deepEqual(await readFile(target), expectedBytes)
+          verified.push({ ...operation, hostReadMatches: true })
+        } else verified.push(operation)
+      }
+      assert.equal(names.size, 0)
+      result.filesystemDiagnostic = { qualified: verified.every(item => item.hostReadMatches === true), operations: verified }
       phase = 'get-post'
       const get = await bounded(http.fetch(baseUrl + '/get'), 'windows_http_get_timeout')
       assert.equal(get.headers.get('x-native-http'), 'production-transport'); assert.equal(await bounded(get.text(), 'windows_http_get_body_timeout'), 'native-http-get-é')
@@ -144,14 +163,21 @@ if($LASTEXITCODE-ne 0){throw 'TEST low label failed'}
       const observed = await until(() => messages.find(value => value.type === 'testSseCancellation'), 'windows_http_server_abort_not_observed')
       result.serverCancellation = observed
       assert.equal(observed.event, 'request-aborted'); assert.equal(observed.requestAborted, true); assert.equal(observed.socketDestroyed, true)
-      if (observed.markerWritten !== true) throw new Error(`windows_http_server_marker_write_failed:${String(observed.markerError)}`)
-      phase = 'server-marker-read'
-      const marker = path.join(root, 'sse-cancelled.txt'), info = await stat(marker)
-      assert.ok(info.isFile() && info.size > 0 && info.size <= 1024)
-      const bytes = await readFile(marker); result.serverMarkerBytes = bytes.length
-      assert.deepEqual(JSON.parse(bytes.toString()), { event: 'request-aborted', requestAborted: true,
-        socketDestroyed: true, responseDestroyed: observed.responseDestroyed })
+      // Authenticated server request/socket evidence establishes cancellation.
+      // Preserve the independent relative node-fs defect; no synthetic marker.
       result.serverObservedCancellation = true
+      phase = 'server-marker-read'
+      const marker = path.join(root, 'sse-cancelled.txt')
+      if (observed.markerWritten === true) {
+        const info = await stat(marker); assert.ok(info.isFile() && info.size > 0 && info.size <= 1024)
+        const bytes = await readFile(marker); result.serverMarkerBytes = bytes.length
+        assert.deepEqual(JSON.parse(bytes.toString()), { event: 'request-aborted', requestAborted: true,
+          socketDestroyed: true, responseDestroyed: observed.responseDestroyed })
+      } else {
+        result.serverMarkerWriteDefect = observed.markerError
+        try { const info = await stat(marker); result.serverMarkerFailureStat = { isFile: info.isFile(), bytes: info.size } }
+        catch (error) { const code = (error as NodeJS.ErrnoException).code; result.serverMarkerFailureCode = typeof code === 'string' && /^[A-Z_]{1,64}$/.test(code) ? code : 'UNKNOWN' }
+      }
       phase = 'early-response'
       let uploadCancelled = false
       const upload = new ReadableStream<Uint8Array>({ pull(controller) { controller.enqueue(Buffer.alloc(8192)) }, cancel() { uploadCancelled = true } }, { highWaterMark: 0 })

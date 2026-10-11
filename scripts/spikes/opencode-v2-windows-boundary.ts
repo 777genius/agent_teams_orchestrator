@@ -8,9 +8,11 @@ const native = await import('./opencode-v2-windows-native.ts')
 const httpCheckpoint = await import('./windows-http-bridge/checkpoint.ts')
 const pause = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms))
 const officialShellMode = process.env.TEST_WINDOWS_OFFICIAL_SHELL === '1'
+const bundledOfficialShellMode = process.env.TEST_WINDOWS_OFFICIAL_SHELL_BUNDLED === '1'
 const resolverPrimitiveMode = process.env.TEST_WINDOWS_RESOLVER_PRIMITIVE === '1'
 const resolverDiagnosticsMode = officialShellMode || resolverPrimitiveMode
 if (officialShellMode && resolverPrimitiveMode) throw new Error('TEST resolver primitive cannot qualify official Shell')
+if (bundledOfficialShellMode && !officialShellMode) throw new Error('TEST bundled checkpoint requires official Shell mode')
 const child = process.argv[2] === 'child'
 async function probeOfficialGraphNativeAccess(targets: ReadonlyMap<string, boolean>) {
   const { dlopen, FFIType, ptr } = await import('bun:ffi')
@@ -213,7 +215,7 @@ if (child) {
     } catch (error) { attempts[`spawnProbe_${mode}`] = String(error) }
   }
   }
-  if (resolverDiagnosticsMode) {
+  if (resolverDiagnosticsMode && !bundledOfficialShellMode) {
     const directory = path.join(import.meta.dir, 'windows-official-shell')
     const resolution: unknown = JSON.parse(await readFile(path.join(directory, 'resolution.json'), 'utf8'))
     if (!Array.isArray(resolution) || resolution.length !== (resolverPrimitiveMode ? 1 : 4)) throw new Error('TEST official resolution manifest invalid')
@@ -270,6 +272,12 @@ if (child) {
       attempts.officialShellCheckpoint = await checkpoint.runOfficialShellCheckpoint(base)
     } else { attempts.resolverPrimitiveCompleted = true; attempts.fullTaskQualified = false }
   }
+  if (bundledOfficialShellMode) {
+    const bundledPath = path.join(import.meta.dir, 'windows-official-shell', 'checkpoint-bundled.js')
+    const checkpoint: { runOfficialShellCheckpointBundled(base: string): ReturnType<typeof import('./windows-official-shell/checkpoint.ts').runOfficialShellCheckpoint> } = await import(bundledPath)
+    attempts.officialShellCheckpoint = await checkpoint.runOfficialShellCheckpointBundled(base)
+    attempts.fullTaskQualified = false
+  }
   if (!resolverPrimitiveMode) {
   const breakaway = native.attemptWindowsJobBreakaway(process.execPath)
   attempts.jobBreakawayError = breakaway.error
@@ -316,7 +324,9 @@ if (child) {
     await cp(import.meta.filename, path.join(root, 'readonly', 'opencode-v2-windows-boundary.ts'))
     await cp(path.join(import.meta.dir, 'opencode-v2-windows-native.ts'), path.join(root, 'readonly', 'opencode-v2-windows-native.ts'))
     await cp(path.join(import.meta.dir, 'windows-http-bridge'), path.join(root, 'readonly', 'windows-http-bridge'), { recursive: true })
-    if (officialShellMode) officialArtifacts = await (await import('./windows-official-shell/fixture.ts')).stageFixture(path.join(root, 'readonly'))
+    if (officialShellMode) officialArtifacts = bundledOfficialShellMode
+      ? await (await import('./windows-official-shell/bundle.ts')).stageBundledFixture(path.join(root, 'readonly'))
+      : await (await import('./windows-official-shell/fixture.ts')).stageFixture(path.join(root, 'readonly'))
     if (resolverPrimitiveMode) officialArtifacts = await (await import('./windows-resolver-primitive/fixture.ts')).stagePrimitiveFixture(path.join(root, 'readonly'))
     container = native.createWindowsContainer(profileName)
     evidence.containerSid = container.sid
@@ -415,7 +425,7 @@ foreach ($entry in $workPackageAllows) { if (([int]$entry.FileSystemRights -band
     evidence.ancestorDirectoryAccessMask = '0x1200a9'
     evidence.runtimeInputMetadataGrant = { files: 3 + (resolverDiagnosticsMode ? officialArtifacts.filter(artifact => artifact.metadataReadInput).length + 1 : 0), readAndExecute: true, writeAttributes: true, writeData: false, delete: false, changePermissions: false }
     evidence.ancestorGrantCount = (JSON.parse(await readFile(ancestorJournal, 'utf8')) as unknown[]).length
-    if (resolverDiagnosticsMode) {
+    if (resolverDiagnosticsMode && !bundledOfficialShellMode) {
       // Parent normal Bun control uses the SAME fresh staged graph, never repository dependencies.
       const graphRoot = path.join(root, 'readonly'), from = path.join(graphRoot, 'windows-official-shell')
       const resolution: unknown = JSON.parse(await readFile(path.join(from, 'resolution.json'), 'utf8'))
@@ -439,6 +449,7 @@ foreach ($entry in $workPackageAllows) { if (([int]$entry.FileSystemRights -band
       LOCALAPPDATA: process.env.LOCALAPPDATA!, USERPROFILE: path.join(root, 'work'), HOME: path.join(root, 'work'),
       TEMP: path.join(root, 'work'), TMP: path.join(root, 'work') }
     if (officialShellMode) Object.assign(launchEnv, { TEST_WINDOWS_OFFICIAL_SHELL: '1', XDG_DATA_HOME: path.join(root, 'work', 'data'), XDG_CACHE_HOME: path.join(root, 'work', 'cache'), XDG_CONFIG_HOME: path.join(root, 'work', 'config'), XDG_STATE_HOME: path.join(root, 'work', 'state') })
+    if (bundledOfficialShellMode) Object.assign(launchEnv, { TEST_WINDOWS_OFFICIAL_SHELL_BUNDLED: '1' })
     if (resolverPrimitiveMode) Object.assign(launchEnv, { TEST_WINDOWS_RESOLVER_PRIMITIVE: '1' })
     evidence.environmentPresence = Object.fromEntries(Object.entries(launchEnv).map(([key, value]) => [key, typeof value === 'string' && value.length > 0]))
     if (Object.values(launchEnv).some(value => typeof value !== 'string' || value.length === 0)) throw new Error('required native environment path missing')

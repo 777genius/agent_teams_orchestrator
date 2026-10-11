@@ -1,5 +1,7 @@
 import { createServer } from 'node:http'
-import { writeFile } from 'node:fs/promises'
+import { writeFile, readFile } from 'node:fs/promises'
+import { writeFileSync } from 'node:fs'
+import path from 'node:path'
 import { bindWindowsExecutionHttp } from '../../src/services/opencode/host/windows/OpenCodeV2WindowsHTTP.js'
 import { prepareWindowsExecutionChild, windowsExecutionChildControl } from '../../src/services/opencode/host/windows/OpenCodeV2WindowsChildControl.js'
 
@@ -61,6 +63,32 @@ control.events.on('message', (value: Record<string, unknown>) => {
       const baseUrl = `http://127.0.0.1:${address.port}`
       bridge = bindWindowsExecutionHttp(baseUrl)
       await control.send({ ...prepared, type: 'ready', baseUrl })
+    } else if (value.type === 'testFilesystem') {
+      // Same bytes and same private root. These are actual API operations,
+      // retained independently from HTTP cancellation qualification.
+      const bytes = Buffer.from('native-fs-bytes-é\0\x01\xff', 'utf8')
+      const absolute = (name: string) => path.join(process.cwd(), name)
+      const cases: [string, string, () => void | Promise<unknown>][] = [
+        ['node-relative', 'node-relative.txt', () => writeFile('node-relative.txt', bytes)],
+        ['node-absolute', 'node-absolute.txt', () => writeFile(absolute('node-absolute.txt'), bytes)],
+        ['node-sync-relative', 'node-sync.txt', () => writeFileSync('node-sync.txt', bytes)],
+        ['node-relative-no-dot', 'nodeplain', () => writeFile('nodeplain', bytes)],
+        ['bun-relative', 'bun-relative.txt', () => Bun.write('bun-relative.txt', bytes)],
+        ['bun-absolute', 'bun-absolute.txt', () => Bun.write(absolute('bun-absolute.txt'), bytes)],
+      ]
+      const operations: Record<string, unknown>[] = []
+      for (const [id, name, write] of cases) {
+        let stage = 'write'
+        try {
+          await write(); stage = 'absolute-node-read'
+          const read = await readFile(absolute(name))
+          operations.push({ id, written: true, absoluteNodeReadMatches: read.equals(bytes), bytes: read.length })
+        } catch (error) {
+          const code = (error as NodeJS.ErrnoException).code
+          operations.push({ id, failedStage: stage, code: typeof code === 'string' && /^[A-Z_]{1,64}$/.test(code) ? code : 'UNKNOWN' })
+        }
+      }
+      await control.send({ type: 'testFilesystemResult', nonce: value.nonce, leaseOwnerId: value.leaseOwnerId, operations })
     } else if (value.type === 'close') {
       await bridge?.close()
       for (const socket of sockets) socket.destroy()

@@ -9,6 +9,7 @@ const passed = evidence.filesystemPassed === true && evidence.jobPassed === true
 // A Shell seam checkpoint is narrower than packaged V2 task qualification.
 evidence.officialShellSeamPassed = passed
 evidence.qualified = false
+evidence.fullTaskQualified = false
 await writeFile(output, JSON.stringify(evidence, null, 2) + '\n')
 console.log(JSON.stringify({ officialShellSeamPassed: passed, qualified: false }))
 process.exitCode = passed ? 0 : 2
