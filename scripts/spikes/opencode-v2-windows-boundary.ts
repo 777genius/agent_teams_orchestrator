@@ -5,6 +5,7 @@ import { createConnection } from 'node:net'
 
 if (process.platform !== 'win32' || process.arch !== 'x64' || process.versions.bun !== '1.3.11') throw new Error('native Windows x64 Bun 1.3.11 required')
 const native = await import('./opencode-v2-windows-native.ts')
+const httpCheckpoint = await import('./windows-http-bridge/checkpoint.ts')
 const pause = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms))
 const child = process.argv[2] === 'child'
 if (child) {
@@ -30,9 +31,22 @@ if (child) {
   await deny('readOnlyWriteDenied', () => writeFile(path.join(base, 'readonly', 'immutable.txt'), 'escape'))
   await deny('runtimeInputWriteDenied', () => writeFile(path.join(base, 'readonly', 'opencode-v2-windows-boundary.ts'), 'escape'))
   await deny('runtimeHelperWriteDenied', () => writeFile(path.join(base, 'readonly', 'opencode-v2-windows-native.ts'), 'escape'))
+  await deny('runtimeHttpModuleWriteDenied', () => writeFile(path.join(base, 'readonly', 'windows-http-bridge', 'checkpoint.ts'), 'escape'))
   attempts.runtimeInputAclEscapeError = native.attemptWindowsAclEscape(path.join(base, 'readonly', 'opencode-v2-windows-boundary.ts'))
+  attempts.runtimeHttpModuleAclEscapeError = native.attemptWindowsAclEscape(path.join(base, 'readonly', 'windows-http-bridge', 'checkpoint.ts'))
   try {
-    const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response('native-http-ok') })
+    const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
+      const route = new URL(request.url).pathname
+      if (route === '/echo') return new Response(await request.text())
+      if (route === '/sse') {
+        let cancelled = false
+        return new Response(new ReadableStream({
+          async pull(controller) { await pause(20); if (!cancelled) controller.enqueue(new TextEncoder().encode('data: native-sse\n\n')) },
+          cancel() { cancelled = true; void writeFile(path.join(base, 'work', 'http-sse-cancelled.txt'), 'cancelled') },
+        }, { highWaterMark: 0 }), { headers: { 'Content-Type': 'text/event-stream' } })
+      }
+      return new Response('native-http-ok')
+    } })
     baseUrl = `http://127.0.0.1:${server.port}`
   } catch (error) { attempts.serverStartupError = String(error) }
   try { attempts.selfHttp = await (await fetch(baseUrl, { signal: AbortSignal.timeout(3000) })).text() } catch (error) { attempts.selfHttp = String(error) }
@@ -86,6 +100,7 @@ if (child) {
   // Named pipe carries the probe response without admin loopback exemptions.
   console.log(JSON.stringify({ pid: process.pid, baseUrl, attempts }))
   const pipe = createConnection(pipeName)
+  httpCheckpoint.attachCheckpointChild(pipe, baseUrl)
   pipe.once('connect', () => { pipe.write(JSON.stringify({ pid: process.pid, baseUrl, attempts }) + '\n') })
   pipe.once('error', error => { void writeFile(path.join(base, 'work', 'pipe-error.txt'), String(error)) })
   setInterval(() => {}, 1000)
@@ -118,6 +133,7 @@ if (child) {
     await cp(process.execPath, path.join(root, 'readonly', 'bun.exe'))
     await cp(import.meta.filename, path.join(root, 'readonly', 'opencode-v2-windows-boundary.ts'))
     await cp(path.join(import.meta.dir, 'opencode-v2-windows-native.ts'), path.join(root, 'readonly', 'opencode-v2-windows-native.ts'))
+    await cp(path.join(import.meta.dir, 'windows-http-bridge'), path.join(root, 'readonly', 'windows-http-bridge'), { recursive: true })
     container = native.createWindowsContainer(profileName)
     evidence.containerSid = container.sid
     // The server is an unsandboxed broker. LOCAL would redirect the AC client
@@ -141,7 +157,7 @@ Rule (Join-Path $env:TEST_ROOT 'readonly') ([System.Security.AccessControl.FileS
 # Bun1.3.11 sys.zig openatWindowsTMaybeNormalize requests FILE_WRITE_ATTRIBUTES
 # even for O_RDONLY. Qualify that request on these two TEST runtime inputs only.
 $runtimeInputRights = [System.Security.AccessControl.FileSystemRights]'ReadAndExecute,WriteAttributes'
-foreach ($name in @('opencode-v2-windows-boundary.ts', 'opencode-v2-windows-native.ts')) {
+foreach ($name in @('opencode-v2-windows-boundary.ts', 'opencode-v2-windows-native.ts', 'windows-http-bridge/checkpoint.ts')) {
   $target = Join-Path (Join-Path $env:TEST_ROOT 'readonly') $name
   $acl = Get-Acl -LiteralPath $target
   $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($sid, $runtimeInputRights, [System.Security.AccessControl.AccessControlType]::Allow))
@@ -202,7 +218,7 @@ foreach ($entry in $workPackageAllows) { if (([int]$entry.FileSystemRights -band
     await writeFile(path.join(root, 'work', 'protected', 'owner.json'), 'host-owned')
     evidence.trustedOwnerWrite = true
     evidence.ancestorDirectoryAccessMask = '0x1200a9'
-    evidence.runtimeInputMetadataGrant = { files: 2, readAndExecute: true, writeAttributes: true, writeData: false, delete: false, changePermissions: false }
+    evidence.runtimeInputMetadataGrant = { files: 3, readAndExecute: true, writeAttributes: true, writeData: false, delete: false, changePermissions: false }
     evidence.ancestorGrantCount = (JSON.parse(await readFile(ancestorJournal, 'utf8')) as unknown[]).length
     const executable = path.join(root, 'readonly', 'bun.exe'), childOutput = path.join(root, 'child-output.txt')
     const launchEnv = { SystemRoot: process.env.SystemRoot!, WINDIR: process.env.WINDIR!, PATH: `${path.dirname(executable)};${process.env.SystemRoot}\\System32`,
@@ -229,6 +245,12 @@ foreach ($entry in $workPackageAllows) { if (([int]$entry.FileSystemRights -band
     evidence.report = report
     if (report.pid !== launch.pid) throw new Error('native PID mismatch')
     try { evidence.parentHttp = await (await fetch(report.baseUrl, { signal: AbortSignal.timeout(3000) })).text() } catch (error) { evidence.parentHttp = String(error) }
+    try {
+      evidence.httpBridgeCheckpoint = await httpCheckpoint.runCheckpointHost(pipe, pid => launch!.validatePeer(pid))
+      const deadline = Date.now() + 3000
+      while (Date.now() < deadline && await readFile(path.join(root, 'work', 'http-sse-cancelled.txt'), 'utf8').catch(() => '') !== 'cancelled') await pause(20)
+      evidence.httpBridgeServerCancellation = await readFile(path.join(root, 'work', 'http-sse-cancelled.txt'), 'utf8').catch(() => '') === 'cancelled'
+    } catch (error) { evidence.httpBridgeCheckpointError = String(error) }
     evidence.activeWithDescendant = launch.active()
     launch.terminate()
     const retiredDeadline = Date.now() + 5000
@@ -237,8 +259,8 @@ foreach ($entry in $workPackageAllows) { if (([int]$entry.FileSystemRights -band
     evidence.hostStateRetained = await readFile(path.join(root, 'host-state', 'secret.txt'), 'utf8') === 'host-owned'
     evidence.protectedRetained = await readFile(path.join(root, 'work', 'protected', 'owner.json'), 'utf8') === 'host-owned'
     evidence.readOnlyRetained = await readFile(path.join(root, 'readonly', 'immutable.txt'), 'utf8') === 'host-owned'
-    const critical = ['ownedWrite', 'outsideApprovedReadDenied', 'outsideApprovedWriteDenied', 'siblingListingDenied', 'hostStateWriteDenied', 'protectedWriteDenied', 'protectedRenameDenied', 'protectedDeleteDenied', 'readOnlyWriteDenied', 'runtimeInputWriteDenied', 'runtimeHelperWriteDenied']
-    evidence.filesystemPassed = critical.every(key => report.attempts[key] === true) && report.attempts.protectedAclEscapeError === 5 && report.attempts.protectedFileAclEscapeError === 5 && report.attempts.readOnlyAclEscapeError === 5 && report.attempts.runtimeInputAclEscapeError === 5 && evidence.hostStateRetained && evidence.protectedRetained && evidence.readOnlyRetained && evidence.trustedOwnerWrite
+    const critical = ['ownedWrite', 'outsideApprovedReadDenied', 'outsideApprovedWriteDenied', 'siblingListingDenied', 'hostStateWriteDenied', 'protectedWriteDenied', 'protectedRenameDenied', 'protectedDeleteDenied', 'readOnlyWriteDenied', 'runtimeInputWriteDenied', 'runtimeHelperWriteDenied', 'runtimeHttpModuleWriteDenied']
+    evidence.filesystemPassed = critical.every(key => report.attempts[key] === true) && report.attempts.protectedAclEscapeError === 5 && report.attempts.protectedFileAclEscapeError === 5 && report.attempts.readOnlyAclEscapeError === 5 && report.attempts.runtimeInputAclEscapeError === 5 && report.attempts.runtimeHttpModuleAclEscapeError === 5 && evidence.hostStateRetained && evidence.protectedRetained && evidence.readOnlyRetained && evidence.trustedOwnerWrite
     evidence.jobPassed = Number(evidence.activeWithDescendant) >= 2 && report.attempts.nativeDescendantInheritedJob === true && report.attempts.nativeDescendantBunStarted === true && evidence.activeAfterTerminate === 0 && evidence.processExited && report.attempts.jobBreakawayContained === true
     evidence.dropInLoopbackPassed = evidence.parentHttp === 'native-http-ok'
     evidence.qualified = evidence.filesystemPassed && evidence.jobPassed && evidence.dropInLoopbackPassed

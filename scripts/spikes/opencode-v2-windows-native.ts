@@ -27,6 +27,7 @@ const kernel = dlopen('kernel32.dll', {
   LocalFree: { args: [p], returns: p },
   CreateNamedPipeW: { args: [p, d, d, d, d, d, d, p], returns: h },
   ConnectNamedPipe: { args: [h, p], returns: b },
+  GetNamedPipeClientProcessId: { args: [h, p], returns: b },
   PeekNamedPipe: { args: [h, p, d, p, p, p], returns: b },
   ReadFile: { args: [h, p, d, p, p], returns: b },
   WriteFile: { args: [h, p, d, p, p], returns: b },
@@ -193,6 +194,19 @@ export function createWindowsPipe(name: string, sid: string) {
       const data = Buffer.from(text), written = Buffer.alloc(4)
       check(kernel.symbols.WriteFile(handle, ptr(data), data.length, ptr(written), null) && written.readUInt32LE() === data.length, 'WriteFile')
     },
+    writeSome(text: string) {
+      const data = Buffer.from(text), written = Buffer.alloc(4)
+      const ok = kernel.symbols.WriteFile(handle, ptr(data), data.length, ptr(written), null)
+      if (!ok) { const error = kernel.symbols.GetLastError(); if (error === 232) return 0; throw new Error(`TEST pipe partial write:${error}`) }
+      check(written.readUInt32LE() <= data.length, 'TEST pipe partial write count')
+      return written.readUInt32LE()
+    },
+    clientPID() {
+      check(connected, 'TEST pipe peer not connected')
+      const pid = Buffer.alloc(4)
+      check(kernel.symbols.GetNamedPipeClientProcessId(handle, ptr(pid)), 'GetNamedPipeClientProcessId')
+      return pid.readUInt32LE()
+    },
     close() { check(kernel.symbols.CloseHandle(handle), 'CloseHandle:pipe') },
   }
 }
@@ -271,6 +285,13 @@ export function launchWindowsContainer(input: { containerSid: number; executable
   check(kernel.symbols.CloseHandle(thread), 'CloseHandle:thread'); thread = 0n
   let closed = false
   return { pid, birthFiletime: creation.readBigUInt64LE().toString(), active,
+    validatePeer(peerPID: number) {
+      check(!closed && peerPID === pid && kernel.symbols.WaitForSingleObject(processHandle, 0) === 258, 'TEST pipe held peer identity')
+      const observed = Buffer.alloc(8)
+      check(kernel.symbols.GetProcessTimes(processHandle, ptr(observed), ptr(exit), ptr(kernelTime), ptr(userTime)), 'TEST pipe held peer birth')
+      check(observed.readBigUInt64LE() === creation.readBigUInt64LE(), 'TEST pipe held peer birth changed')
+      return { pid, birthFiletime: observed.readBigUInt64LE().toString() }
+    },
     exited: () => kernel.symbols.WaitForSingleObject(processHandle, 0) === 0,
     exitCode() { const code = Buffer.alloc(4); check(kernel.symbols.GetExitCodeProcess(processHandle, ptr(code)), 'GetExitCodeProcess'); return code.readUInt32LE() },
     terminate() { check(kernel.symbols.TerminateJobObject(job, 99), 'TerminateJobObject') },
