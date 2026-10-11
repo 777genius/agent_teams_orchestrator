@@ -177,9 +177,14 @@ async function main(): Promise<void> {
     let config: Config | undefined
     const deadline = Date.now() + 25000
     while (Date.now() < deadline && child.exitCode === null && child.signalCode === null) {
-      try { config = await readProbeEndpoint(port, '/config') as Config; break } catch { await Bun.sleep(100) }
+      try {
+        const candidate = await readProbeEndpoint(port, '/config') as Config
+        await readProbeEndpoint(port, '/config/providers')
+        config = candidate
+        break
+      } catch { await Bun.sleep(100) }
     }
-    assert(config, 'OpenCode startup/config probe failed within deadline')
+    assert(config, 'OpenCode startup/config/provider readiness failed within deadline')
     phase = 'config_contamination'
     // /config encoder reorders permission object keys; effective order is checked from /agent.
     assertNoContamination(expected, config)
