@@ -4,6 +4,10 @@ import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
+import { openCodeClientFactory } from './OpenCodeClientFactory.js'
+import { resolveClaudeMultimodelPaths } from './OpenCodeManagedPaths.js'
+import { OpenCodeRuntimeDeadlineError } from './OpenCodeRuntimeDeadline.js'
+
 import { OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID } from './OpenCodeHostManager.js'
 import {
   buildManagedConfigFingerprint,
@@ -427,6 +431,71 @@ describe('OpenCodeProvisioningProbe', () => {
       await rm(tempDir, { recursive: true, force: true })
     }
   }, 20_000)
+
+  for (const stage of ['startup', 'verification'] as const) {
+    for (const code of ['ELOCKED', 'ECOMPROMISED'] as const) {
+      test(`sanitizes ${code} provisioning ${stage} failure before snapshot strings`, async () => {
+        const temp = await mkdtemp(path.join(os.tmpdir(), 'TEST-probe-lock-'))
+        const savedDataHome = process.env.CLAUDE_MULTIMODEL_DATA_HOME
+        process.env.CLAUDE_MULTIMODEL_DATA_HOME = temp
+        try {
+          const root = path.join(resolveClaudeMultimodelPaths().data, 'opencode')
+          const file = path.join(root, 'profiles', 'SECRET-PROFILE', 'node_modules.prepare-lock')
+          const failure = Object.assign(new Error(`SECRET-MESSAGE ${file} /private/auth.json`), {
+            code, file, stack: 'SECRET-STACK', env: { TOKEN: 'SECRET-ENV' },
+          })
+          const fail = async () => { throw failure }
+          let acquired = 0, released = 0, clients = 0
+          const probe = new OpenCodeProvisioningProbe({
+            inventoryService: { probe: async () => ({ ...inventory, diagnostics: ['Inventory warning'] }) },
+            hostManager: {
+              ensureHost: async () => { acquired++; if (stage === 'startup') throw failure; return host },
+              releaseHost: async () => { released++ },
+              refreshResolvedConfigFingerprint: async () => null,
+            },
+            clientFactory: { create: () => {
+              clients++
+              return { ...openCodeClientFactory.create(host.baseUrl), getConfig: fail,
+                getConfigProviders: fail, getProviders: fail, getProviderAuth: fail, listAgents: fail }
+            } },
+          })
+          const snapshot = await probe.probe('/tmp/project', { bypassCache: true })
+          const message = `OpenCode lock operation failed [code=${code}, lock=profile]`
+          expect(snapshot.hostHealthy).toBe(false)
+          expect(snapshot.probeError).toBe(message)
+          expect(snapshot.diagnostics).toEqual(['Inventory warning', message])
+          expect(snapshot.host === null).toBe(stage === 'startup')
+          expect(acquired).toBe(1)
+          expect(released).toBe(stage === 'startup' ? 0 : 1)
+          expect(clients).toBe(stage === 'startup' ? 0 : 1)
+          for (const secret of ['SECRET-', root, file, '/private/auth.json', 'TOKEN']) {
+            expect(JSON.stringify(snapshot)).not.toContain(secret)
+          }
+        } finally {
+          if (savedDataHome === undefined) delete process.env.CLAUDE_MULTIMODEL_DATA_HOME
+          else process.env.CLAUDE_MULTIMODEL_DATA_HOME = savedDataHome
+          await rm(temp, { recursive: true, force: true })
+        }
+      })
+    }
+  }
+
+  test('preserves provisioning deadline text ahead of lock metadata', async () => {
+    const failure = Object.assign(new OpenCodeRuntimeDeadlineError('host_start', 50, 60), {
+      code: 'ELOCKED', file: '/TEST/private/host-registry.json.lock',
+    })
+    const probe = new OpenCodeProvisioningProbe({
+      inventoryService: { probe: async () => inventory },
+      hostManager: {
+        ensureHost: async () => { throw failure }, releaseHost: async () => {},
+        refreshResolvedConfigFingerprint: async () => null,
+      },
+    })
+    const snapshot = await probe.probe('/tmp/project', { bypassCache: true })
+    expect(snapshot.probeError).toBe(failure.message)
+    expect(snapshot.diagnostics).toEqual([failure.message])
+    expect(JSON.stringify(snapshot)).not.toContain('lock=')
+  })
 
   test('keeps inventory warnings diagnostic-only when host startup fails', async () => {
     const probe = new OpenCodeProvisioningProbe({

@@ -1,5 +1,6 @@
 import { refreshSelectedProfileAuthority } from './OpenCodeSelectedProfileAuthority.js'
 export type { OpenCodeAuthorityRejection } from './OpenCodeSelectedProfileAuthority.js'
+import { formatOpenCodeLockFailure, safeOpenCodeLockFailure } from './OpenCodeLockFailure.js'
 import { openCodeClientFactory } from './OpenCodeClientFactory.js'
 import {
   createOpenCodePreflightHostLeaseInput,
@@ -18,6 +19,7 @@ import {
 import {
   type OpenCodePhaseContext,
   throwOpenCodeAbortReason,
+  isOpenCodeRuntimeDeadlineError,
 } from './OpenCodeRuntimeDeadline.js'
 
 import type {
@@ -318,7 +320,9 @@ export class OpenCodeProvisioningProbe {
         throwOpenCodeAbortReason(options.phaseContext.signal)
       }
       if (options.existingHostKey) throw error
-      const probeFailure = error instanceof Error ? error.message : String(error)
+      const lockFailure = isOpenCodeRuntimeDeadlineError(error) ? null : safeOpenCodeLockFailure(error)
+      const probeFailure = lockFailure ? formatOpenCodeLockFailure(lockFailure)
+        : error instanceof Error ? error.message : String(error)
       const diagnostics = [
         ...inventory.diagnostics,
         probeFailure,
@@ -529,7 +533,9 @@ export class OpenCodeProvisioningProbe {
         if (options.phaseContext?.signal.aborted) {
           throwOpenCodeAbortReason(options.phaseContext.signal)
         }
-        const probeFailure = error instanceof Error ? error.message : String(error)
+        const lockFailure = isOpenCodeRuntimeDeadlineError(error) ? null : safeOpenCodeLockFailure(error)
+        const probeFailure = lockFailure ? formatOpenCodeLockFailure(lockFailure)
+          : error instanceof Error ? error.message : String(error)
         const diagnostics = [
           ...inventory.diagnostics,
           probeFailure,
