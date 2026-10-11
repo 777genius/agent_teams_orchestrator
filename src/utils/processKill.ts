@@ -83,9 +83,10 @@ function readProcessQueryOutput(
 
     try {
       child = spawn(command, args, {
-        stdio: ['ignore', 'pipe', 'ignore'],
+        stdio: ['ignore', 'pipe', command === 'powershell.exe' ? 'pipe' : 'ignore'],
         windowsHide: true,
       })
+      child.stderr?.resume()
       child.stdout?.on('data', (chunk: Buffer | string) => {
         if (settled || output.length >= outputLimitBytes) {
           return
