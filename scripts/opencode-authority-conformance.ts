@@ -87,6 +87,20 @@ export function checkProviders(expected: Config, actual: Config): void {
   }
 }
 
+export async function readProbeEndpoint(port: number, route: '/config' | '/config/providers' | '/agent' | '/mcp'): Promise<unknown> {
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}${route}`, { signal: AbortSignal.timeout(2000) })
+    assert(response.ok, `Probe failed: ${route} HTTP ${response.status}`)
+    return await response.json()
+  } catch (error) {
+    if (error instanceof ProbeError) throw error
+    const failure = error instanceof Error && error.name === 'TimeoutError' ? 'timeout'
+      : error instanceof Error && error.name === 'AbortError' ? 'aborted'
+      : error instanceof SyntaxError ? 'invalid_json' : 'transport'
+    throw new ProbeError(`Endpoint probe failed: ${route} (${failure})`)
+  }
+}
+
 async function unusedPort(): Promise<number> {
   const server = createServer()
   await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve) })
@@ -160,17 +174,17 @@ async function main(): Promise<void> {
     const port = await unusedPort()
     child = Bun.spawn([binary, 'serve', '--hostname', '127.0.0.1', '--port', String(port)],
       { cwd: roots.project, env, stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' })
-    const read = async (route: string) => {
-      const response = await fetch(`http://127.0.0.1:${port}${route}`, { signal: AbortSignal.timeout(2000) })
-      assert(response.ok, `Probe failed: ${route} HTTP ${response.status}`)
-      return response.json()
-    }
     let config: Config | undefined
     const deadline = Date.now() + 25000
     while (Date.now() < deadline && child.exitCode === null && child.signalCode === null) {
-      try { config = await read('/config') as Config; break } catch { await Bun.sleep(100) }
+      try {
+        const candidate = await readProbeEndpoint(port, '/config') as Config
+        await readProbeEndpoint(port, '/config/providers')
+        config = candidate
+        break
+      } catch { await Bun.sleep(100) }
     }
-    assert(config, 'OpenCode startup/config probe failed within deadline')
+    assert(config, 'OpenCode startup/config/provider readiness failed within deadline')
     phase = 'config_contamination'
     // /config encoder reorders permission object keys; effective order is checked from /agent.
     assertNoContamination(expected, config)
@@ -182,9 +196,9 @@ async function main(): Promise<void> {
     try { checkProviders(expected, negative) } catch { rejected = true }
     assert(rejected, 'Provider checker accepted a mutated live endpoint')
     phase = 'read_endpoints'
-    const providers = await read('/config/providers')
-    const agents = await read('/agent')
-    const mcp = await read('/mcp')
+    const providers = await readProbeEndpoint(port, '/config/providers')
+    const agents = await readProbeEndpoint(port, '/agent')
+    const mcp = await readProbeEndpoint(port, '/mcp')
     assert(providers && typeof providers === 'object', 'Invalid provider response')
     assert(Array.isArray(agents), 'Invalid agent response')
     phase = 'effective_agent_policy'

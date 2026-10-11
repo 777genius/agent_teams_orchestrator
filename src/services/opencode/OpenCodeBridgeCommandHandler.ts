@@ -660,7 +660,7 @@ function buildOpenCodeRuntimeIdentityBlock(input: {
           'If the briefing says there are no actionable tasks, stay idle silently.',
         ]
       : [
-          input.groupChatId ? 'For this group delivery, reply only through group_chat_send in the explicit group with the physical inbound relayOfMessageId.' : 'For this delivered app message, prioritize the requested visible reply through message_send.',
+          input.groupChatId ? 'For this group delivery, use group_chat_send in the explicit group with the physical inbound relayOfMessageId for requested or substantive replies. For an optional informational acknowledgement, use group_chat_react with the same group and physical inbound relayOfMessageId. After success stop; never send an extra OK or answer a reaction.' : 'For this delivered app message, prioritize the requested visible reply through message_send.',
           'Only send a visible message when you are replying to this delivered app message or reporting real task/blocker/result context.',
           'Do not send unrelated readiness, understood, idle, or no-task acknowledgements.',
         ]),

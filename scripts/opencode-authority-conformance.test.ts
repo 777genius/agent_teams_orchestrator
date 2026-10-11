@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { assertNoContamination, checkProviders, fixtureConfig, managedAgentFixtures } from './opencode-authority-conformance.js'
+import { assertNoContamination, checkProviders, fixtureConfig, managedAgentFixtures, readProbeEndpoint } from './opencode-authority-conformance.js'
 
 describe('isolated conformance comparison', () => {
   const expected = fixtureConfig('http://127.0.0.1:12345')
@@ -9,7 +9,7 @@ describe('isolated conformance comparison', () => {
     expect(() => assertNoContamination(expected, live)).not.toThrow()
     expect(() => checkProviders(expected, live)).not.toThrow()
   })
-  test('rejects unknown effective configuration and modified auth/endpoint', () => {
+  test('rejects unknown effective configuration and modified auth/endpoint', async () => {
     expect(() => assertNoContamination(expected, { ...expected, instructions: ['foreign.md'] })).toThrow()
     expect(() => assertNoContamination(expected, { ...expected, agent: { foreign: {} } })).toThrow()
     for (const provider of ['openrouter', 'authority-fixture']) {
@@ -19,6 +19,23 @@ describe('isolated conformance comparison', () => {
         expect(() => checkProviders(expected, live)).toThrow()
       }
     }
+    const originalFetch = globalThis.fetch
+    try {
+      for (const [error, failure] of [
+        [new DOMException('SECRET-provider-config', 'TimeoutError'), 'timeout'],
+        [new DOMException('SECRET-provider-config', 'AbortError'), 'aborted'],
+        [new SyntaxError('SECRET-provider-config'), 'invalid_json'],
+        [new TypeError('SECRET-provider-config'), 'transport'],
+      ] as const) {
+        globalThis.fetch = Object.assign(async () => {
+          if (error instanceof SyntaxError) return new Response('SECRET-provider-config')
+          throw error
+        }, { preconnect: originalFetch.preconnect })
+        await expect(readProbeEndpoint(12345, '/config/providers')).rejects.toMatchObject({
+          message: `Endpoint probe failed: /config/providers (${failure})`,
+        })
+      }
+    } finally { globalThis.fetch = originalFetch }
   })
 })
 

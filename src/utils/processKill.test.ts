@@ -81,6 +81,7 @@ describe('processKill', () => {
   function mockWindowsQuery() {
     const child = Object.assign(new EventEmitter(), {
       stdout: new PassThrough(),
+      stderr: new PassThrough(),
       kill: mock(() => true),
     })
     const spawn = spyOn(childProcess, 'spawn').mockReturnValue(child as unknown as childProcess.ChildProcess)
@@ -128,7 +129,8 @@ describe('processKill', () => {
     expect(query).toContain('catch { exit 1 } finally { if ($null -ne $process) { $process.Dispose() } }')
     expect(query).toEndWith('[Console]::Out.WriteLine($startedAt)')
     expect(query).not.toMatch(/Get-Process|Get-CimInstance|Import-Module|Write-Output/)
-    expect(options).toEqual({ stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true })
+    expect(options).toEqual({ stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
+    child.stderr.end('ignored diagnostic\n2020-01-01T00:00:00.000Z\n')
     child.stdout.write('2026-09-09T03:26:43.')
     child.stdout.write('6163024Z\r\n')
     child.emit('close', 0)

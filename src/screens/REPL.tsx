@@ -972,7 +972,7 @@ export function REPL({
       runtimeInstanceId: queryGuard.runtimeInstanceId,
       generation: queryGuard.generation,
       processorReady: true,
-      ...(groupChatToolsReady ? { groupChatProtocolVersion: 1 as const, ...getCurrentGroupRunIdentity() } : {}),
+      ...(groupChatToolsReady ? { groupChatProtocolVersion: 1 as const, groupReactionProtocolVersion: 1 as const, ...getCurrentGroupRunIdentity() } : {}),
       publishedAt: new Date().toISOString(),
     }).catch(error => {
       logForDebugging(`[WorkSyncAdmission] capability write failed: ${String(error)}`);

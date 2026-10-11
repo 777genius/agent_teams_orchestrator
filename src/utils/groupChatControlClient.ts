@@ -66,6 +66,7 @@ export async function getFreshGroupChatDiscoveryPrompt(teamName: string, from: s
   return [
     catalog === undefined ? 'Fresh group catalog unavailable.' : `Fresh group catalog: ${JSON.stringify(catalog)}`,
     `After compaction, call group_chat_list with ${JSON.stringify({ teamName, from })} before a proactive group post.`,
+    'group_chat_react optionally acknowledges one informational inbound using its explicit groupChatId and physical relayOfMessageId. After success stop without an extra OK. Never answer a reaction; still send requested or substantive replies with group_chat_send.',
     'Use group_chat_send with an explicit groupChatId. For a reply preserve its physical inbound relayOfMessageId. Archived or blocked groups never fall back to a private message.',
   ].join('\n')
 }
