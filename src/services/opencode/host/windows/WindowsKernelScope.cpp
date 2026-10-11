@@ -19,8 +19,11 @@
 #include <winrt/base.h>
 #include <winternl.h>
 using namespace winrt::Windows::Data::Json;
+static constexpr size_t CONTROL_PACKET_LIMIT = 16 * 1024 * 1024;
 struct NativeError {
   std::string code;
+  DWORD win32 = 0;
+  const char *stage = nullptr;
 };
 static void require(bool value, const char *code) {
   if (!value)
@@ -29,13 +32,10 @@ static void require(bool value, const char *code) {
 struct Handle {
   HANDLE value = nullptr;
   Handle() = default;
-  explicit Handle(HANDLE v) : value(v) {
-  }
+  explicit Handle(HANDLE v) : value(v) {}
   Handle(const Handle &) = delete;
   Handle &operator=(const Handle &) = delete;
-  Handle(Handle &&other) noexcept : value(other.value) {
-    other.value = nullptr;
-  }
+  Handle(Handle &&other) noexcept : value(other.value) { other.value = nullptr; }
   Handle &operator=(Handle &&other) noexcept {
     if (this != &other) {
       reset();
@@ -44,17 +44,13 @@ struct Handle {
     }
     return *this;
   }
-  ~Handle() {
-    reset();
-  }
+  ~Handle() { reset(); }
   void reset() {
     if (value && value != INVALID_HANDLE_VALUE)
       CloseHandle(value);
     value = nullptr;
   }
-  explicit operator bool() const {
-    return value && value != INVALID_HANDLE_VALUE;
-  }
+  explicit operator bool() const { return value && value != INVALID_HANDLE_VALUE; }
 };
 struct LocalMemory {
   void *value = nullptr;
@@ -114,9 +110,7 @@ static void num(JsonObject &object, const wchar_t *key, std::uint64_t value) {
 static void flag(JsonObject &object, const wchar_t *key, bool value) {
   object.SetNamedValue(key, JsonValue::CreateBooleanValue(value));
 }
-static std::wstring decimal(std::uint64_t value) {
-  return std::to_wstring(value);
-}
+static std::wstring decimal(std::uint64_t value) { return std::to_wstring(value); }
 static std::uint64_t filetime(FILETIME value) {
   return (static_cast<std::uint64_t>(value.dwHighDateTime) << 32) | value.dwLowDateTime;
 }
@@ -453,9 +447,10 @@ struct OwnerStore {
       rename->RootDirectory = directory.parents.back().value;
       rename->FileNameLength = static_cast<DWORD>(basename.size() * sizeof(wchar_t));
       memcpy(rename->FileName, basename.data(), rename->FileNameLength);
-      require(SetFileInformationByHandle(directory.file.value, FileRenameInfo, rename,
-                                         static_cast<DWORD>(size)) != 0,
-              "execution_owner_archive_unknown");
+      if (!SetFileInformationByHandle(directory.file.value, FileRenameInfo, rename,
+                                      static_cast<DWORD>(size)))
+        throw NativeError{"execution_owner_archive_unknown", GetLastError(),
+                          "owner_archive_rename"};
       directory.path = destination;
       require(equalPath(finalPath(directory.file.value), extended(destination)) &&
                   fileIdentity(directory.file.value, directory.owner, true).Stringify() ==
@@ -626,8 +621,20 @@ struct Scope {
             "cleanup_unknown");
     return info.ActiveProcesses;
   }
-  bool exited() {
-    return WaitForSingleObject(process.value, 0) == WAIT_OBJECT_0;
+  bool exited() { return WaitForSingleObject(process.value, 0) == WAIT_OBJECT_0; }
+  bool completeIo(OVERLAPPED &overlap, DWORD &transferred, DWORD timeout) {
+    HANDLE events[] = {overlap.hEvent, cancel.value, process.value};
+    DWORD waited = WaitForMultipleObjects(3, events, FALSE, timeout);
+    if (waited == WAIT_OBJECT_0)
+      return GetOverlappedResult(pipe.value, &overlap, &transferred, FALSE) != 0;
+
+    // CancelIoEx requests cancellation; it does not establish completion. Keep
+    // the OVERLAPPED, event and caller buffer alive until the kernel completes
+    // this exact operation, including the already-completed race.
+    CancelIoEx(pipe.value, &overlap);
+    DWORD ignored = 0;
+    GetOverlappedResult(pipe.value, &overlap, &ignored, TRUE);
+    return false;
   }
   bool io(bool write, void *bytes, DWORD count, DWORD &transferred) {
     Handle ready(CreateEventW(nullptr, TRUE, FALSE, nullptr));
@@ -640,18 +647,13 @@ struct Scope {
       return true;
     if (GetLastError() != ERROR_IO_PENDING)
       return false;
-    HANDLE events[] = {ready.value, cancel.value, process.value};
-    DWORD waited = WaitForMultipleObjects(3, events, FALSE, 15000);
-    if (waited != WAIT_OBJECT_0) {
-      CancelIoEx(pipe.value, &overlap);
-      WaitForSingleObject(ready.value, 5000);
-      return false;
-    }
-    return GetOverlappedResult(pipe.value, &overlap, &transferred, FALSE) != 0;
+    // Quiet sessions remain live. Writes are bounded; reads end on peer data,
+    // explicit cancellation or the privately held main-process signal.
+    return completeIo(overlap, transferred, write ? 15000 : INFINITE);
   }
   void send(JsonObject value) {
     std::string bytes = narrow(std::wstring(value.Stringify())) + '\n';
-    require(bytes.size() <= 512 * 1024, "execution_invalid_response");
+    require(bytes.size() <= CONTROL_PACKET_LIMIT, "execution_invalid_response");
     std::lock_guard<std::mutex> lock(pipeMutex);
     DWORD offset = 0;
     while (offset < bytes.size()) {
@@ -665,6 +667,7 @@ struct Scope {
   void read() {
     try {
       Handle ready(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+      require(static_cast<bool>(ready), "execution_native_unknown");
       OVERLAPPED overlap{};
       overlap.hEvent = ready.value;
       BOOL connected = ConnectNamedPipe(pipe.value, &overlap);
@@ -672,17 +675,13 @@ struct Scope {
       require(connected || error == ERROR_PIPE_CONNECTED || error == ERROR_IO_PENDING,
               "execution_containment_pipe_denied");
       if (error == ERROR_IO_PENDING) {
-        HANDLE events[] = {ready.value, cancel.value, process.value};
-        require(WaitForMultipleObjects(3, events, FALSE, 15000) == WAIT_OBJECT_0,
-                "execution_containment_pipe_denied");
         DWORD count = 0;
-        require(GetOverlappedResult(pipe.value, &overlap, &count, FALSE) != 0,
-                "execution_containment_pipe_denied");
+        require(completeIo(overlap, count, 15000), "execution_containment_pipe_denied");
       }
       ULONG client = 0;
       require(GetNamedPipeClientProcessId(pipe.value, &client) && client == pid && !exited(),
               "execution_identity_mismatch");
-      JsonObject peer = mapping;
+      JsonObject peer = JsonObject::Parse(mapping.Stringify());
       num(peer, L"clientPID", client);
       event(L"connected", peer);
       std::string buffer;
@@ -692,7 +691,7 @@ struct Scope {
         if (!io(false, bytes, sizeof(bytes), count) || count == 0)
           break;
         buffer.append(bytes, count);
-        require(buffer.size() <= 512 * 1024, "execution_invalid_response");
+        require(buffer.size() <= CONTROL_PACKET_LIMIT, "execution_invalid_response");
         for (size_t newline; (newline = buffer.find('\n')) != std::string::npos;) {
           auto packet = JsonObject::Parse(wide(buffer.substr(0, newline)));
           buffer.erase(0, newline + 1);
@@ -881,6 +880,17 @@ static std::unique_ptr<Scope> launch(const JsonObject &input) {
   scope->thread.reset();
   return scope;
 }
+static bool readControlLine(std::string &line) {
+  line.clear();
+  for (char next; std::cin.get(next);) {
+    if (next == '\n')
+      return true;
+    require(line.size() < CONTROL_PACKET_LIMIT, "execution_invalid_response");
+    line.push_back(next);
+  }
+  require(line.empty(), "execution_invalid_response");
+  return false;
+}
 int wmain(int argc, wchar_t **argv) {
   if (argc != 2 || std::wstring(argv[1]) != L"--broker")
     return 64;
@@ -889,8 +899,8 @@ int wmain(int argc, wchar_t **argv) {
     OwnerStore owners;
     std::unique_ptr<Scope> scope;
     std::string line;
-    while (std::getline(std::cin, line)) {
-      require(line.size() <= 512 * 1024, "execution_invalid_response");
+    while (readControlLine(line)) {
+      require(line.size() <= CONTROL_PACKET_LIMIT, "execution_invalid_response");
       double id = 0;
       JsonObject reply;
       num(reply, L"schema", 1);
@@ -940,6 +950,10 @@ int wmain(int argc, wchar_t **argv) {
       } catch (const NativeError &error) {
         flag(reply, L"ok", false);
         str(reply, L"error", wide(error.code));
+        if (error.stage) {
+          str(reply, L"stage", wide(error.stage));
+          num(reply, L"nativeCode", error.win32);
+        }
       } catch (...) {
         flag(reply, L"ok", false);
         str(reply, L"error", L"execution_native_unknown");
