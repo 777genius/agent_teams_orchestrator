@@ -176,7 +176,9 @@ foreach ($name in $runtimeInputs) {
   $acl = Get-Acl -LiteralPath $target
   $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($sid, $runtimeInputRights, [System.Security.AccessControl.AccessControlType]::Allow))
   Set-Acl -LiteralPath $target -AclObject $acl
-  & icacls.exe $target /setintegritylevel 'L' /Q
+  # icacls needs the extended path spelling for nested dependency graphs.
+  $nativeTarget = if ($target.StartsWith('\\?\')) { $target } else { '\\?\' + $target }
+  & icacls.exe $nativeTarget /setintegritylevel 'L' /Q
   if ($LASTEXITCODE -ne 0) { throw 'TEST runtime input low integrity setup failed' }
 }
 Rule (Join-Path $env:TEST_ROOT 'work/protected') ([System.Security.AccessControl.FileSystemRights]'Write,Delete,DeleteSubdirectoriesAndFiles,ChangePermissions,TakeOwnership') ([System.Security.AccessControl.AccessControlType]::Deny)
