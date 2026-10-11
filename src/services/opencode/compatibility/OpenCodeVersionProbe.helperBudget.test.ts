@@ -175,6 +175,7 @@ function additionFixture(mode: 'gone' | 'alive' | 'unknown' | 'orphan' | 'reused
   const root = 900_010, relay = 900_011, leaf = 900_012
   let clock = 1_000_000, removed = 0, trees = 0, closed = false, leafReads = 0
   const signalled: number[] = [], budgets: number[] = [], aliveReads: number[] = []
+  const events: Array<'census:rows' | 'census:empty' | 'remove'> = []
   const child = new EventEmitter() as ChildProcess
   Object.assign(child, { pid: root, stdout: new PassThrough() })
   const rows = [{ pid: root, ppid: process.pid }, { pid: relay, ppid: root },
@@ -225,13 +226,18 @@ function additionFixture(mode: 'gone' | 'alive' | 'unknown' | 'orphan' | 'reused
   }))
   restore.push(() => date.mockRestore(), () => launcher.mockRestore(), () => spawn.mockRestore(), () => ports.mockRestore())
   if (platform === 'darwin') {
-    const posix = spyOn(native, 'query').mockImplementation(async (_command, _args, budget) =>
-      readRows(budget).map(row => `${row.pid} ${row.ppid} ${root} S`).join('\n'))
+    const posix = spyOn(native, 'query').mockImplementation(async (command, args, budget) => {
+      expect(command).toBe('ps')
+      expect(args).toEqual(['-e', '-o', 'pid=', '-o', 'ppid=', '-o', 'pgid=', '-o', 'stat='])
+      const census = readRows(budget)
+      events.push(census.length ? 'census:rows' : 'census:empty')
+      return census.map(row => `${row.pid} ${row.ppid} ${root} S`).join('\n')
+    })
     restore.push(() => posix.mockRestore())
   }
-  const roots = { root: '/TEST/private', env: {}, remove: async () => { removed++ } } as OpenCodeV2ReadRoots
+  const roots = { root: '/TEST/private', env: {}, remove: async () => { events.push('remove'); removed++ } } as OpenCodeV2ReadRoots
   return { run: () => readOpenCodeOwnedVersion('/TEST/native', roots), removed: () => removed,
-    trees: () => trees, leafReads: () => leafReads, signalled, budgets, aliveReads, leaf }
+    trees: () => trees, leafReads: () => leafReads, signalled, budgets, aliveReads, events, leaf }
 }
 
 for (const mode of ['gone', 'confirmation-gone', 'stale-gone'] as const) {
@@ -267,4 +273,5 @@ test('darwin gone group member with reparented PPID requires absence and final c
   expect(f.removed()).toBe(1)
   expect(f.signalled).toEqual([])
   expect(f.budgets.every(budget => budget > 0 && budget <= 2000)).toBe(true)
+  expect(f.events.slice(-2)).toEqual(['census:empty', 'remove'])
 })
