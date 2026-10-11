@@ -171,16 +171,17 @@ if (Test-Path -LiteralPath $manifest) {
   $runtimeInputs += 'official-artifacts.json'
   $runtimeInputs += @(Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json | Where-Object { $_.metadataReadInput -eq $true } | ForEach-Object { $_.path })
 }
+# Apply the low integrity label in one traversal. File data and ACL write
+# permissions remain denied; only the finite metadata inputs below gain rights.
+$extendedPrefix = [string][char]92 + [char]92 + '?' + [char]92
+$readonlyRoot = Join-Path $env:TEST_ROOT 'readonly'
+& icacls.exe ($extendedPrefix + $readonlyRoot) /setintegritylevel '(OI)(CI)L' /T /Q
+if ($LASTEXITCODE -ne 0) { throw 'TEST runtime graph low integrity setup failed' }
 foreach ($name in $runtimeInputs) {
   $target = Join-Path (Join-Path $env:TEST_ROOT 'readonly') $name
   $acl = Get-Acl -LiteralPath $target
   $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($sid, $runtimeInputRights, [System.Security.AccessControl.AccessControlType]::Allow))
   Set-Acl -LiteralPath $target -AclObject $acl
-  # icacls needs the extended path spelling for nested dependency graphs.
-  $extendedPrefix = [string][char]92 + [char]92 + '?' + [char]92
-  $nativeTarget = if ($target.StartsWith($extendedPrefix)) { $target } else { $extendedPrefix + $target }
-  & icacls.exe $nativeTarget /setintegritylevel 'L' /Q
-  if ($LASTEXITCODE -ne 0) { throw 'TEST runtime input low integrity setup failed' }
 }
 Rule (Join-Path $env:TEST_ROOT 'work/protected') ([System.Security.AccessControl.FileSystemRights]'Write,Delete,DeleteSubdirectoriesAndFiles,ChangePermissions,TakeOwnership') ([System.Security.AccessControl.AccessControlType]::Deny)
 Rule (Join-Path $env:TEST_ROOT 'host-state') ([System.Security.AccessControl.FileSystemRights]::FullControl) ([System.Security.AccessControl.AccessControlType]::Deny)

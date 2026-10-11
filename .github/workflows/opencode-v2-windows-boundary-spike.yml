@@ -8,10 +8,51 @@ on:
       - 'scripts/spikes/opencode-v2-windows-native.ts'
       - 'scripts/spikes/windows-http-bridge/**'
       - 'scripts/spikes/windows-official-shell/**'
+      - 'src/services/opencode/host/windows/**'
+      - 'scripts/opencode-v2/windows-owner-probe.ts'
       - '.github/workflows/opencode-v2-windows-boundary-spike.yml'
 permissions:
   contents: read
 jobs:
+  native-owner:
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+      - name: Compile the static native helper and pin its artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (!$vs) { throw 'MSVC installation missing' }
+          $directory = Join-Path $env:GITHUB_WORKSPACE 'native\win32-x64'
+          New-Item -ItemType Directory -Path $directory -Force | Out-Null
+          $helper = Join-Path $directory 'opencode-v2-windows-helper.exe'
+          $source = Join-Path $env:GITHUB_WORKSPACE 'src\services\opencode\host\windows\WindowsKernelScope.cpp'
+          $vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
+          & cmd.exe /d /s /c "`"`"$vcvars`" && cl.exe /nologo /std:c++20 /EHsc /MT /W4 /O2 /DUNICODE /D_UNICODE `"$source`" /Fe:`"$helper`" /link windowsapp.lib userenv.lib advapi32.lib`""
+          if ($LASTEXITCODE -ne 0) { throw 'native helper compile failed' }
+          $manifest = @{format=1;platform='win32';arch='x64';name='opencode-v2-windows-helper.exe';sha256=(Get-FileHash $helper -Algorithm SHA256).Hash.ToLowerInvariant()}
+          $manifest | ConvertTo-Json -Compress | Set-Content (Join-Path $directory 'windows-helper.json') -Encoding utf8NoBOM
+      - name: Prove durable owner fencing with actual held native handles
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP ('TEST-windows-owner-' + [guid]::NewGuid().ToString())
+          & bun scripts/opencode-v2/windows-owner-probe.ts $root 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP\windows-owner-evidence.txt"
+          exit $LASTEXITCODE
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: opencode-v2-windows-native-owner-${{ github.sha }}
+          path: |
+            native/win32-x64/
+            ${{ runner.temp }}/windows-owner-evidence.txt
+            ${{ runner.temp }}/TEST-windows-owner-*/
+          if-no-files-found: error
   native-boundary:
     runs-on: windows-2022
     timeout-minutes: 10
