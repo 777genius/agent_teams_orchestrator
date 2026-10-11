@@ -77,8 +77,16 @@ function assertPrivateAces(snapshot: unknown, packageSid: string, afterRetiremen
     assert.ok(Array.isArray(entry.aces) && entry.aces.length > 0)
     const aces = entry.aces.map(record)
     for (const ace of aces) {
-      assert.ok(ace.sid === owner || ace.sid === 'S-1-5-18' || (!afterRetirement && ace.sid === packageSid))
-      if (afterRetirement) assert.notEqual(ace.sid, packageSid)
+      if (afterRetirement && ace.sid === packageSid) {
+        // The protected fence retains its exact deny; package allows must be gone.
+        assert.equal(name, '.native-owner'); assert.equal(ace.type, 'Deny')
+        assert.equal(ace.rights, 0x1f01ff); assert.equal(ace.inherited, false)
+        assert.equal(ace.inheritance, 'ContainerInherit, ObjectInherit')
+        assert.equal(ace.propagation, 'None')
+      } else assert.ok(ace.sid === owner || ace.sid === 'S-1-5-18' || (!afterRetirement && ace.sid === packageSid))
+    }
+    if (afterRetirement && name === '.native-owner') {
+      assert.equal(aces.filter(ace => ace.sid === packageSid && ace.type === 'Deny').length, 1)
     }
     for (const principal of [owner, 'S-1-5-18']) {
       const trusted = aces.find(ace => ace.sid === principal && ace.type === 'Allow')
@@ -277,7 +285,7 @@ finally {
       facts.aclPrincipalsAfterRetirement = assertPrivateAces(facts.fileAclAfterRetirement, sid!, true)
       assert.equal(await readFile(path.join(root, 'actual-command.txt'), 'utf8'), 'native-command-written')
       assert.deepEqual(await handles[0]!.readRecord('owner.json'), { schema: 1, testOnly: true, nonce, leaseOwnerId })
-      facts.postRetireHostReadPassed = true; facts.nativeOwnerRecordPreserved = true
+      facts.postRetireHostReadPassed = true; facts.nativeOwnerRecordPreserved = true; facts.protectedFenceDenyRetained = true
     } catch { cleanupErrors.push('native_post_retire_acl_or_read_failed') }
   }
   for (const handle of handles.reverse()) try { await handle.close() } catch { cleanupErrors.push('native_owner_handle_close_unknown') }
