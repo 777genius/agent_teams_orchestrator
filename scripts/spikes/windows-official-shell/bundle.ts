@@ -11,6 +11,23 @@ export const bundledImportPath = (file: string): string => file.replaceAll('\\',
 export function renderBundledCheckpointEntry(imports: readonly string[], tables: readonly string[]): string {
   return `${imports.join('\n')}\nconst graphs = { ${tables.join(',\n')} };\nexport const runOfficialShellCheckpointBundled = (base: string) => runOfficialShellCheckpoint(base, async alias => { if (alias !== '@opencode/server-v2-floor' && alias !== '@opencode/server') throw new Error('TEST bundle pin not selected'); return graphs[alias]; });\n`
 }
+export async function collectBundledOutputs(outputs: readonly Bun.BuildArtifact[], directory: string, rawInputs: readonly Uint8Array[]) {
+  const entries = outputs.filter(artifact => artifact.kind === 'entry-point')
+  if (entries.length !== 1 || !entries[0]) throw new Error('TEST bundle requires exactly one entry point')
+  const assets = new Map<string, { bytes: Buffer; sha256: string }>()
+  for (const artifact of outputs) {
+    if (artifact.kind === 'entry-point') continue
+    if (artifact.kind !== 'asset' || artifact.loader !== 'file') throw new Error('TEST bundle unexpected non-asset output')
+    const relative = within(directory, path.resolve(directory, artifact.path))
+    if (!relative || relative === 'checkpoint-bundled.js') throw new Error('TEST bundle asset output collision')
+    const bytes = Buffer.from(await artifact.arrayBuffer())
+    if (!rawInputs.some(input => input.byteLength === bytes.byteLength && bytes.equals(input))) throw new Error('TEST bundle asset lacks exact raw input custody')
+    const previous = assets.get(relative)
+    if (previous && !previous.bytes.equals(bytes)) throw new Error('TEST bundle asset path has different bytes')
+    if (!previous) assets.set(relative, { bytes, sha256: hash(bytes) })
+  }
+  return { entry: entries[0], assets }
+}
 async function packageIdentity(file: string): Promise<{ root: string; name: string; version: string }> {
   let root = path.dirname(file)
   for (;;) {
@@ -69,7 +86,7 @@ export async function stageBundledFixture(readonly: string): Promise<Artifact[]>
     await writeFile(path.join(buildDirectory, 'parent-result.json'), JSON.stringify({ phase: 'build-child-failed', code, signal: child.signalCode, fullTaskQualified: false }))
     throw new Error('TEST bundle child failed; retained build phase evidence')
   }
-  const result: { inputs: { file: string; sha256: string }[]; metafile: Bun.BuildMetafile } = JSON.parse(await readFile(resultPath, 'utf8'))
+  const result: { inputs: { file: string; sha256: string }[]; assets: { path: string; sha256: string }[]; metafile: Bun.BuildMetafile } = JSON.parse(await readFile(resultPath, 'utf8'))
   const inputs = new Map<string, Buffer>()
   for (const input of result.inputs) {
     if (input.file !== generatedEntry) within(sourceRoot, input.file)
@@ -116,7 +133,13 @@ export async function stageBundledFixture(readonly: string): Promise<Artifact[]>
     await walk(root)
   }
   await add(path.join(readonly, 'windows-official-shell', 'checkpoint-bundled.js'), await readFile(buildOutput), true)
-  await add(path.join(readonly, 'windows-official-shell', 'bundle-provenance.json'), Buffer.from(JSON.stringify({ purpose: 'TEST-bundled-Shell-only', fullTaskQualified: false, bun: Bun.version, target: 'bun', format: 'esm', splitting: false, effectEntry: within(sourceRoot, effectEntry), selections, inputs: provenance, watcherDisabled: true, fffDisabled: true })), false)
+  for (const asset of result.assets) {
+    within(buildDirectory, path.resolve(buildDirectory, asset.path))
+    const bytes = await readFile(path.join(buildDirectory, asset.path))
+    if (hash(bytes) !== asset.sha256) throw new Error('TEST bundle emitted asset changed')
+    await add(path.join(readonly, 'windows-official-shell', asset.path), bytes, true)
+  }
+  await add(path.join(readonly, 'windows-official-shell', 'bundle-provenance.json'), Buffer.from(JSON.stringify({ purpose: 'TEST-bundled-Shell-only', fullTaskQualified: false, bun: Bun.version, target: 'bun', format: 'esm', splitting: false, effectEntry: within(sourceRoot, effectEntry), selections, inputs: provenance, emittedAssets: result.assets, watcherDisabled: true, fffDisabled: true })), false)
   await add(path.join(readonly, 'windows-official-shell', 'bundle-metafile.json'), Buffer.from(JSON.stringify(result.metafile)), false)
   await writeFile(path.join(readonly, 'official-artifacts.json'), JSON.stringify(artifacts), { flag: 'wx' })
   return artifacts
@@ -151,12 +174,19 @@ async function buildOnly(generatedEntry: string, sourceRoot: string, output: str
     logs: result.logs.map(log => ({ name: log.name, message: log.message, level: log.level, position: log.position })),
     fullTaskQualified: false,
   }), { flag: 'wx' })
-  if (!result.success || result.outputs.length !== 1 || result.outputs[0]?.kind !== 'entry-point' || !result.metafile) throw new Error('TEST bundled checkpoint build refused')
+  if (!result.success || !result.metafile) throw new Error('TEST bundled checkpoint build refused')
   for (const input of Object.values(result.metafile.inputs)) for (const imported of input.imports) {
     if (imported.external && !imported.path.startsWith('node:') && !imported.path.startsWith('bun:')) throw new Error('TEST bundle retained an external non-builtin import')
   }
-  await writeFile(output, new Uint8Array(await result.outputs[0].arrayBuffer()), { flag: 'wx' })
-  await writeFile(resultPath, JSON.stringify({ inputs: [...inputs].map(([file, bytes]) => ({ file, sha256: hash(bytes) })), metafile: result.metafile }), { flag: 'wx' })
+  const emitted = await collectBundledOutputs(result.outputs, path.dirname(output), [...inputs.values()])
+  const assets: { path: string; sha256: string }[] = []
+  for (const [relative, asset] of emitted.assets) {
+    await mkdir(path.dirname(path.join(path.dirname(output), relative)), { recursive: true })
+    await writeFile(path.join(path.dirname(output), relative), asset.bytes, { flag: 'wx' })
+    assets.push({ path: relative, sha256: asset.sha256 })
+  }
+  await writeFile(output, new Uint8Array(await emitted.entry.arrayBuffer()), { flag: 'wx' })
+  await writeFile(resultPath, JSON.stringify({ inputs: [...inputs].map(([file, bytes]) => ({ file, sha256: hash(bytes) })), assets, metafile: result.metafile }), { flag: 'wx' })
   stage('build-result-published')
 }
 if (process.argv[2] === '--build-only') {
