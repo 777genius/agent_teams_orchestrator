@@ -27,6 +27,9 @@ if (child) {
   attempts.protectedAclEscapeError = native.attemptWindowsAclEscape(path.join(base, 'work', 'protected'))
   attempts.readOnlyAclEscapeError = native.attemptWindowsAclEscape(path.join(base, 'readonly'))
   await deny('readOnlyWriteDenied', () => writeFile(path.join(base, 'readonly', 'immutable.txt'), 'escape'))
+  await deny('runtimeInputWriteDenied', () => writeFile(path.join(base, 'readonly', 'opencode-v2-windows-boundary.ts'), 'escape'))
+  await deny('runtimeHelperWriteDenied', () => writeFile(path.join(base, 'readonly', 'opencode-v2-windows-native.ts'), 'escape'))
+  attempts.runtimeInputAclEscapeError = native.attemptWindowsAclEscape(path.join(base, 'readonly', 'opencode-v2-windows-boundary.ts'))
   try {
     const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response('native-http-ok') })
     baseUrl = `http://127.0.0.1:${server.port}`
@@ -92,6 +95,17 @@ function Rule($target, $rights, $effect) {
 }
 Rule (Join-Path $env:TEST_ROOT 'work') ([System.Security.AccessControl.FileSystemRights]::Modify) ([System.Security.AccessControl.AccessControlType]::Allow)
 Rule (Join-Path $env:TEST_ROOT 'readonly') ([System.Security.AccessControl.FileSystemRights]::ReadAndExecute) ([System.Security.AccessControl.AccessControlType]::Allow)
+# Bun1.3.11 sys.zig openatWindowsTMaybeNormalize requests FILE_WRITE_ATTRIBUTES
+# even for O_RDONLY. Qualify that request on these two TEST runtime inputs only.
+$runtimeInputRights = [System.Security.AccessControl.FileSystemRights]'ReadAndExecute,WriteAttributes'
+foreach ($name in @('opencode-v2-windows-boundary.ts', 'opencode-v2-windows-native.ts')) {
+  $target = Join-Path (Join-Path $env:TEST_ROOT 'readonly') $name
+  $acl = Get-Acl -LiteralPath $target
+  $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($sid, $runtimeInputRights, [System.Security.AccessControl.AccessControlType]::Allow))
+  Set-Acl -LiteralPath $target -AclObject $acl
+  & icacls.exe $target /setintegritylevel 'L' /Q
+  if ($LASTEXITCODE -ne 0) { throw 'TEST runtime input low integrity setup failed' }
+}
 Rule (Join-Path $env:TEST_ROOT 'work/protected') ([System.Security.AccessControl.FileSystemRights]'Write,Delete,DeleteSubdirectoriesAndFiles,ChangePermissions,TakeOwnership') ([System.Security.AccessControl.AccessControlType]::Deny)
 Rule (Join-Path $env:TEST_ROOT 'host-state') ([System.Security.AccessControl.FileSystemRights]::FullControl) ([System.Security.AccessControl.AccessControlType]::Deny)
 & icacls.exe (Join-Path $env:TEST_ROOT 'work') /setintegritylevel '(OI)(CI)L' /T /Q
@@ -115,6 +129,7 @@ while ($ancestor) {
 `;
     await runPowerShell(aclScript)
     evidence.ancestorDirectoryAccessMask = '0x1200a9'
+    evidence.runtimeInputMetadataGrant = { files: 2, readAndExecute: true, writeAttributes: true, writeData: false, delete: false, changePermissions: false }
     evidence.ancestorGrantCount = (JSON.parse(await readFile(ancestorJournal, 'utf8')) as unknown[]).length
     const executable = path.join(root, 'readonly', 'bun.exe'), childOutput = path.join(root, 'child-output.txt')
     const launchEnv = { SystemRoot: process.env.SystemRoot!, WINDIR: process.env.WINDIR!, PATH: `${path.dirname(executable)};${process.env.SystemRoot}\\System32`,
@@ -149,8 +164,8 @@ while ($ancestor) {
     evidence.hostStateRetained = await readFile(path.join(root, 'host-state', 'secret.txt'), 'utf8') === 'host-owned'
     evidence.protectedRetained = await readFile(path.join(root, 'work', 'protected', 'owner.json'), 'utf8') === 'host-owned'
     evidence.readOnlyRetained = await readFile(path.join(root, 'readonly', 'immutable.txt'), 'utf8') === 'host-owned'
-    const critical = ['ownedWrite', 'outsideApprovedReadDenied', 'outsideApprovedWriteDenied', 'siblingListingDenied', 'hostStateWriteDenied', 'protectedWriteDenied', 'protectedRenameDenied', 'protectedDeleteDenied', 'readOnlyWriteDenied']
-    evidence.filesystemPassed = critical.every(key => report.attempts[key] === true) && report.attempts.protectedAclEscapeError === 5 && report.attempts.readOnlyAclEscapeError === 5 && evidence.hostStateRetained && evidence.protectedRetained && evidence.readOnlyRetained
+    const critical = ['ownedWrite', 'outsideApprovedReadDenied', 'outsideApprovedWriteDenied', 'siblingListingDenied', 'hostStateWriteDenied', 'protectedWriteDenied', 'protectedRenameDenied', 'protectedDeleteDenied', 'readOnlyWriteDenied', 'runtimeInputWriteDenied', 'runtimeHelperWriteDenied']
+    evidence.filesystemPassed = critical.every(key => report.attempts[key] === true) && report.attempts.protectedAclEscapeError === 5 && report.attempts.readOnlyAclEscapeError === 5 && report.attempts.runtimeInputAclEscapeError === 5 && evidence.hostStateRetained && evidence.protectedRetained && evidence.readOnlyRetained
     evidence.jobPassed = Number(evidence.activeWithDescendant) >= 2 && evidence.activeAfterTerminate === 0 && evidence.processExited && report.attempts.jobBreakawayError === 5
     evidence.dropInLoopbackPassed = evidence.parentHttp === 'native-http-ok'
     evidence.qualified = evidence.filesystemPassed && evidence.jobPassed && evidence.dropInLoopbackPassed
