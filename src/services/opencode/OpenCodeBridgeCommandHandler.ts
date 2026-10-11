@@ -78,6 +78,7 @@ import {
   raceOpenCodeAbortSignal,
   waitForOpenCodeAbortableDelay,
   type OpenCodePhaseContext,
+  type OpenCodeProvisioningStage,
   throwOpenCodeAbortReason,
 } from './OpenCodeRuntimeDeadline.js'
 import { normalizeOpenCodeSessionStatus } from './OpenCodeEventTranslator.js'
@@ -3264,29 +3265,40 @@ async function runLaunch(
     : runtimeDeadline.signal
   const provisioningController = new AbortController()
   const provisioningSignal = AbortSignal.any([launchSignal, provisioningController.signal])
+  let provisioningStage: OpenCodeProvisioningStage = 'project_path'
+  let provisioningStageEnteredAt = performance.now()
+  const reportProvisioningStage = (stage: OpenCodeProvisioningStage): void => {
+    if (provisioningSignal.aborted || Date.now() >= workDeadlineAt) return
+    provisioningStage = stage
+    provisioningStageEnteredAt = performance.now()
+  }
+  const provisioningDeadlineError = () => new Error(
+    `OpenCode strict launch provisioning deadline expired (stage=${provisioningStage}, stageElapsedMs=${Math.max(0, Math.round(performance.now() - provisioningStageEnteredAt))})`,
+  )
   const provisioningTimer = setTimeout(() => provisioningController.abort(
-    new Error('OpenCode strict launch provisioning deadline expired'),
+    provisioningDeadlineError(),
   ), Math.max(0, workDeadlineAt - Date.now()))
   provisioningTimer.unref?.()
   try {
     const phaseContext: OpenCodePhaseContext = {
       phase: 'host_start',
       signal: provisioningSignal,
+      reportProvisioningStage,
       remainingMs: () => Math.max(0, workDeadlineAt - Date.now()),
       throwIfExpired: () => {
         if (provisioningSignal.aborted) throwOpenCodeAbortReason(provisioningSignal)
-        if (Date.now() >= workDeadlineAt) throw new Error(
-          'OpenCode strict launch provisioning deadline expired',
-        )
+        if (Date.now() >= workDeadlineAt) throw provisioningDeadlineError()
       },
     }
     phaseContext.throwIfExpired()
     const launchProjectPath = await canonicalizeOpenCodeProjectPath(asString(body.projectPath) ?? envelope.cwd)
+    reportProvisioningStage('session_store')
     const oldRecords = (await openCodeSessionStore.list()).filter(record =>
       record.teamId === teamId && (record.laneId ?? 'primary') === laneId
       && record.profileScope?.purpose === 'launch_runtime'
       && record.runId && record.runId !== runId && !isOpenCodeSessionStopped(record))
     for (const record of oldRecords) {
+      reportProvisioningStage('session_recovery')
       if (await canonicalizeOpenCodeProjectPath(record.projectPath) !== launchProjectPath) {
         throw new Error('OpenCode dead runtime recovery project authority mismatch')
       }
@@ -3303,6 +3315,7 @@ async function runLaunch(
       }, provisioningSignal)
     }
     phaseContext.throwIfExpired()
+    reportProvisioningStage('probe')
     pendingProbe = openCodeProvisioningProbe.probeRetainingHost(
       asString(body.projectPath) ?? envelope.cwd,
       { toolApprovalMode, phaseContext, selectedModel: apiSelectedModel,
