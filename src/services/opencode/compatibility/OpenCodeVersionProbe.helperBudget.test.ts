@@ -164,3 +164,85 @@ for (const mode of ['open', 'exit-only', 'late-close', 'abort'] as const) {
     expect(f.removed()).toBe(1)
   })
 }
+
+// A real catalog trace captured root -> relay -> leaf, then the leaf vanished
+// during its first birth read after the wrapper closed. A tree row alone must
+// never become signal authority, nor hide an orphan in the next full census.
+function additionFixture(mode: 'gone' | 'alive' | 'unknown' | 'orphan' | 'reused' | 'older' | 'expired' |
+  'confirmation-gone' | 'confirmation-live' | 'confirmation-reused' | 'late-orphan' | 'open') {
+  Object.defineProperty(process, 'platform', { value: 'win32' })
+  const root = 900_010, relay = 900_011, leaf = 900_012
+  let clock = 1_000_000, removed = 0, trees = 0, closed = false, leafReads = 0
+  const signalled: number[] = [], budgets: number[] = [], aliveReads: number[] = []
+  const child = new EventEmitter() as ChildProcess
+  Object.assign(child, { pid: root, stdout: new PassThrough() })
+  const rows = [{ pid: root, ppid: process.pid }, { pid: relay, ppid: root }, { pid: leaf, ppid: relay }]
+  const date = spyOn(Date, 'now').mockImplementation(() => clock)
+  const launcher = spyOn(portable, 'resolveDirectWindowsLauncher').mockReturnValue({ command: '/TEST/native', argsPrefix: [] })
+  const spawn = spyOn(portable, 'spawnPortableCli').mockImplementation(() => {
+    queueMicrotask(() => child.stdout!.emit('data', Buffer.from('1.19.0\n')))
+    return child
+  })
+  const ports = spyOn(native, 'nativePorts').mockImplementation(() => ({
+    platform: 'win32', selfPid: process.pid, now: () => clock,
+    birth: async (target, budget) => {
+      budgets.push(budget)
+      clock += 10
+      if (target === leaf) {
+        leafReads++
+        if (leafReads === 1 && mode !== 'open') {
+          child.emit('exit', 0); child.emit('close', 0); closed = true
+        }
+        if (mode === 'expired') clock += 8000
+        if (mode === 'older') return 5
+        if (mode.startsWith('confirmation-')) return leafReads === 1 ? 30 : mode === 'confirmation-reused' ? 31 : null
+        return null
+      }
+      return closed ? null : target === root ? 10 : 20
+    },
+    tree: async budget => {
+      budgets.push(budget)
+      trees++
+      if (trees === 1) return rows
+      if (trees === 2 && (mode === 'orphan' || mode === 'late-orphan')) return mode === 'orphan' ? [{ pid: 900_013, ppid: leaf }] : []
+      if (trees === 2 && mode === 'reused') return [{ pid: leaf, ppid: 900_099 }]
+      if (trees === 2 && mode === 'confirmation-reused') return rows
+      if (trees === 4 && mode === 'late-orphan') return [{ pid: 900_013, ppid: leaf }]
+      return []
+    },
+    alive: target => {
+      aliveReads.push(target)
+      return target === leaf && (mode === 'alive' || mode === 'confirmation-live' || mode === 'confirmation-reused') ? 'alive'
+        : target === leaf && mode === 'unknown' ? 'unknown' : 'gone'
+    },
+    signal: target => { signalled.push(target); throw new Error('TEST must not signal uncaptured candidate') },
+    taskkill: async () => { throw new Error('TEST must not kill uncaptured candidate') },
+    sleep: async ms => { clock += ms },
+  }))
+  restore.push(() => date.mockRestore(), () => launcher.mockRestore(), () => spawn.mockRestore(), () => ports.mockRestore())
+  const roots = { root: '/TEST/private', env: {}, remove: async () => { removed++ } } as OpenCodeV2ReadRoots
+  return { run: () => readOpenCodeOwnedVersion('/TEST/native', roots), removed: () => removed,
+    trees: () => trees, signalled, budgets, aliveReads, leaf }
+}
+
+for (const mode of ['gone', 'confirmation-gone'] as const) {
+  test(`Windows ${mode} snapshot addition retires only after independent absence and fresh full tables`, async () => {
+    const f = additionFixture(mode)
+    expect(await f.run()).toBe('1.19.0\n')
+    expect(f.aliveReads).toContain(f.leaf)
+    expect(f.trees()).toBeGreaterThanOrEqual(4)
+    expect(f.removed()).toBe(1)
+    expect(f.signalled).toEqual([])
+    expect(f.budgets.every(budget => budget > 0 && budget <= 5000)).toBe(true)
+  })
+}
+
+for (const mode of ['alive', 'unknown', 'orphan', 'reused', 'older', 'expired',
+  'confirmation-live', 'confirmation-reused', 'late-orphan', 'open'] as const) {
+  test(`Windows ${mode} snapshot addition remains unknown without deleting private roots or signalling candidates`, async () => {
+    const f = additionFixture(mode)
+    await expect(f.run()).rejects.toThrow('cleanup_unknown')
+    expect(f.removed()).toBe(0)
+    expect(f.signalled).toEqual([])
+  })
+}
