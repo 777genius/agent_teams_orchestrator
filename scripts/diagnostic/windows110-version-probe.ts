@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { gunzipSync } from 'node:zlib'
-import { mkdtemp, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, mkdtemp, readFile, realpath, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { tmpdir } from 'node:os'
 import { createOpenCodeV2ReadRoots } from '../../src/services/opencode/profile/OpenCodeV2ManagedConfig.js'
-import { readOpenCodeOwnedVersion } from '../../src/services/opencode/compatibility/OpenCodeVersionProbe.js'
+import { hashOpenCodeFile, selectedOpenCodeReadPath } from '../../src/services/opencode/compatibility/OpenCodeNativeIdentity.js'
+import { OpenCodeVersionProbeCleanupError, readOpenCodeOwnedVersion } from '../../src/services/opencode/compatibility/OpenCodeVersionProbe.js'
 
 const packageName = 'opencode-windows-x64'
 const version = '1.19.0'
@@ -103,14 +104,55 @@ assert.equal(sha256(nativeBytes), executableSha256, 'Product native byte binding
 const executable = path.join(fixtureRoot, 'opencode.exe')
 await writeFile(executable, nativeBytes, { flag: 'wx' })
 const acquisition = { packageName, version, metadataUrl, metadataSha256: sha256(metadataBytes), tarballUrl, archiveSri, archiveSha256: sha256(archive), archiveBytes: archive.length, executable, executableSha256, executableBytes: nativeBytes.length, anonymous: true }
-const roots = await createOpenCodeV2ReadRoots()
+assert.equal(process.env.TEST_PRODUCT_SOURCE_COMMIT, '209bdab0c2d09c0b14dd186d55a70701fc470712')
+const wrapperInput = process.env.TEST_WRAPPER_EXECUTABLE
+const sourceInput = process.env.TEST_WRAPPER_SOURCE_FILE
+const producerInput = process.env.TEST_WRAPPER_PRODUCER_FILE
+assert(wrapperInput && path.isAbsolute(wrapperInput))
+assert(sourceInput && path.isAbsolute(sourceInput))
+assert(producerInput && path.isAbsolute(producerInput))
+const sourceBytes = await readFile(sourceInput)
+const producerBytes = await readFile(producerInput)
+const sourceSha256 = sha256(Buffer.from(sourceBytes.toString('utf8').replace(/\r\n/g, '\n')))
+const producerSha256 = sha256(Buffer.from(producerBytes.toString('utf8').replace(/\r\n/g, '\n')))
+assert.equal(sourceSha256, 'd8c6cc55da5f26b5255fc1686d513d26a21bcdd41fce4c4b1932f7c9e871eead')
+assert.equal(producerSha256, '9b1edfd453aaa76e3aa34db6e3eaabc34200cafdcc3d0cc621c8e2cb9c5cf4f1')
+assert((await lstat(wrapperInput)).isFile(), 'Compiled wrapper must be a regular file')
+const wrapperBytes = await readFile(wrapperInput)
+const wrapperDirectory = path.join(fixtureRoot, 'resources', 'runtime', 'opencode-console')
+await mkdir(wrapperDirectory, { recursive: true })
+const wrapper = path.join(wrapperDirectory, 'opencode.exe')
+await writeFile(wrapper, wrapperBytes, { flag: 'wx' })
+const sidecar = path.join(wrapperDirectory, 'opencode.real.path')
+await writeFile(sidecar, executable, { flag: 'wx' })
+// Match Product209's normal selected-wrapper projection, including its sidecar.
+process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH = wrapper
+process.env.OPENCODE_BIN_PATH = wrapper
+process.env.OPENCODE_CONSOLE_WRAPPER_TARGET = executable
+process.env.PATH = [path.dirname(executable), ...(process.env.PATH ?? '').split(path.delimiter)].join(path.delimiter)
+const wrapperAcquisition = { productCommit: process.env.TEST_PRODUCT_SOURCE_COMMIT, sourceSha256, producerSha256, wrapper, wrapperSha256: sha256(wrapperBytes), sidecar, sidecarSha256: sha256(await readFile(sidecar)), sidecarTarget: 'matching-pinned-native', parentTarget: 'matching-pinned-native' }
+let roots: Awaited<ReturnType<typeof createOpenCodeV2ReadRoots>> | undefined
+let stage = 'selected-path'
+let selectedPath: string | null = null
+let selectedSha256: string | null = null
 const started = Date.now()
 let result: unknown
 try {
-  // Its first native invocation: no separate warm-up, retries or holds.
-  result = { status: 'RETURNED', version: await readOpenCodeOwnedVersion(executable, roots), elapsedMs: Date.now() - started }
+  selectedPath = selectedOpenCodeReadPath()
+  assert.equal(selectedPath, wrapper)
+  stage = 'realpath'
+  selectedPath = await realpath(selectedPath)
+  stage = 'fingerprint'
+  selectedSha256 = await hashOpenCodeFile(selectedPath)
+  assert.equal(selectedSha256, wrapperAcquisition.wrapperSha256)
+  stage = 'private-roots'
+  roots = await createOpenCodeV2ReadRoots()
+  assert.equal(roots.env.OPENCODE_CONSOLE_WRAPPER_TARGET, undefined)
+  stage = 'owned-version'
+  // Sole executable invocation; unchanged d64 ownership admission and budgets.
+  result = { status: 'RETURNED', stage, version: await readOpenCodeOwnedVersion(selectedPath, roots), elapsedMs: Date.now() - started }
 } catch (error) {
-  result = { status: 'THREW', name: error instanceof Error ? error.name : 'unknown', message: error instanceof Error ? error.message : 'unknown', elapsedMs: Date.now() - started }
+  result = { status: 'THREW', stage, helperFailure: error instanceof OpenCodeVersionProbeCleanupError ? error.helperFailure : null, cause: error instanceof Error && error.cause instanceof Error ? { name: error.cause.name, message: error.cause.message } : null, name: error instanceof Error ? error.name : 'unknown', message: error instanceof Error ? error.message : 'unknown', elapsedMs: Date.now() - started }
 }
-await writeFile(process.env.TEST_VERSION_DIAGNOSTIC_RESULT ?? path.join(fixtureRoot, 'result.json'), JSON.stringify({ schema: 2, diagnosticOnly: true, sourceCommit: process.env.TEST_SOURCE_COMMIT, harnessCommit: process.env.GITHUB_SHA, bunVersion: process.versions.bun, acquisition, fixtureRoot, privateRoot: roots.root, result, noModel: true, cleanup: 'Retained; no extra kill authority or acceptance change' }, null, 2))
+await writeFile(process.env.TEST_VERSION_DIAGNOSTIC_RESULT ?? path.join(fixtureRoot, 'result.json'), JSON.stringify({ schema: 3, diagnosticOnly: true, sourceCommit: process.env.TEST_SOURCE_COMMIT, harnessCommit: process.env.GITHUB_SHA, bunVersion: process.versions.bun, acquisition, wrapperAcquisition, selectedPath, selectedSha256, privateTarget: !roots ? 'not-created' : roots.env.OPENCODE_CONSOLE_WRAPPER_TARGET === undefined ? 'absent' : 'present', fixtureRoot, privateRoot: roots?.root ?? null, result, noModel: true, cleanup: 'Retained; no extra kill authority or acceptance change' }, null, 2))
 console.log(JSON.stringify({ fixtureRoot, result }))

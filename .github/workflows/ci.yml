@@ -17,6 +17,16 @@ jobs:
           ref: d64fda3f249153e1d6a828817343a508053099b9
           path: runtime
           persist-credentials: false
+      - uses: actions/checkout@v6
+        with:
+          repository: 777genius/agent-teams-ai
+          ref: 209bdab0c2d09c0b14dd186d55a70701fc470712
+          path: product
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /scripts/stage-opencode-console-wrapper.mjs
+            /tools/opencode-console-wrapper/OpenCodeConsoleWrapper.cs
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.3.11
@@ -41,7 +51,14 @@ jobs:
           New-Item -ItemType Directory runtime/scripts/diagnostic -Force | Out-Null
           Copy-Item harness/scripts/diagnostic/windows110-version-probe.ts runtime/scripts/diagnostic/
           $env:TEST_SOURCE_COMMIT = $source
-          $env:TEST_NODE_EXECUTABLE = node -p process.execPath
+          $product = git -C product rev-parse HEAD
+          if ($product -ne '209bdab0c2d09c0b14dd186d55a70701fc470712') { throw 'Product source mismatch' }
+          node product/scripts/stage-opencode-console-wrapper.mjs --platform win32-x64 --require
+          if ($LASTEXITCODE -ne 0) { throw 'Product wrapper build failed' }
+          $env:TEST_PRODUCT_SOURCE_COMMIT = $product
+          $env:TEST_WRAPPER_EXECUTABLE = "$env:GITHUB_WORKSPACE/product/resources/runtime/opencode-console/opencode.exe"
+          $env:TEST_WRAPPER_SOURCE_FILE = "$env:GITHUB_WORKSPACE/product/tools/opencode-console-wrapper/OpenCodeConsoleWrapper.cs"
+          $env:TEST_WRAPPER_PRODUCER_FILE = "$env:GITHUB_WORKSPACE/product/scripts/stage-opencode-console-wrapper.mjs"
           $env:TEST_VERSION_DIAGNOSTIC_TRACE = "$env:GITHUB_WORKSPACE/version-ownership-trace.jsonl"
           $env:TEST_VERSION_DIAGNOSTIC_RESULT = "$env:GITHUB_WORKSPACE/version-ownership-result.json"
           bun runtime/scripts/diagnostic/windows110-version-probe.ts
