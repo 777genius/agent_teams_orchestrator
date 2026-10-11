@@ -460,6 +460,80 @@ describe('qualified original terminal slot settlement', () => {
         ? { data: messages, previous: 'TEST-newest', next: 'TEST-oldest' } : { data: [], previous: null, next: null } }, selectedAuthority)
     return { original, owned, log, messages }
   }
+  function withCleanRetries(native: ReturnType<typeof terminalFixture>) {
+    const first = native.log.events[4]!, text = native.log.events[5]!
+    const retry = (seq: number, attempt: number): typeof first => ({ ...first, id: `evt_retry${seq}`,
+      type: 'session.retry.scheduled', seq, data: { sessionID: first.data.sessionID,
+        assistantMessageID: first.data.assistantMessageID, attempt, at: seq * 100,
+        error: { type: 'TEST-retry', message: 'TEST retry' } } })
+    native.log.events = [...native.log.events.slice(0, 5), retry(6, 2),
+      { ...first, id: 'evt_retry_start7', seq: 7 }, retry(8, 3),
+      { ...first, id: 'evt_retry_start9', seq: 9 },
+      { ...text, id: 'evt_text_start', type: 'session.text.started', seq: 10 },
+      { ...text, id: 'evt_text_delta', type: 'session.text.delta', seq: 11 },
+      ...native.log.events.slice(5).map(row => ({ ...row, seq: row.seq + 6 })) ]
+    native.log.watermark = 14
+    return native
+  }
+  for (const pin of ['2.0.0', '2.0.21'] as const) {
+    const selectedAuthority: SessionAuthority = { ...authority, host: { ...authority.host, pin,
+      dialect: pin === '2.0.0' ? 'v2-2.0.0' : 'v2-2.0.21', selectedCli: { ...authority.host.selectedCli, version: pin } } }
+    test(`${pin} clean native retry lineage releases only the original accepted slot`, async () => {
+      const f = await setup(selectedAuthority), native = withCleanRetries(terminalFixture(selectedAuthority))
+      try {
+        const service = new OpenCodeV2AdmissionService(native.owned, f.store, selectedAuthority)
+        await service.admitQueue(native.original, true)
+        await service.settleOriginalInput(native.original)
+        expect((await f.store.snapshot()).slot).toBeNull()
+        expect((await f.store.snapshot()).terminalSettlements).toHaveLength(1)
+      } finally { await f.close() }
+    })
+    for (const mode of ['mixed-agent', 'mixed-model', 'all-foreign-agent', 'all-foreign-model', 'foreign-input'] as const) {
+      test(`${pin} retry ${mode} retains original admission fence`, async () => {
+        const f = await setup(selectedAuthority), native = withCleanRetries(terminalFixture(selectedAuthority))
+        try {
+          const service = new OpenCodeV2AdmissionService(native.owned, f.store, selectedAuthority)
+          await service.admitQueue(native.original, true)
+          const observed = await service.readOriginalInput(native.original)
+          native.log.events = native.log.events.map(row => {
+            if (row.type === 'session.inbox.delivered' && mode === 'foreign-input')
+              return { ...row, data: { ...row.data, inboxID: 'msg_TESTforeign' } }
+            if (mode === 'foreign-input' || row.type !== 'session.step.started' || !mode.startsWith('all-') && row.seq !== 7) return row
+            return { ...row, data: { ...row.data, ...(mode.endsWith('agent')
+              ? { agent: 'TEST-foreign' } : { model: { ...selectedAuthority.model, variant: 'foreign' } }) } }
+          })
+          if (mode.startsWith('all-')) await expect(readOriginalTerminal(native.owned, selectedAuthority,
+            native.original, observed)).rejects.toThrow('terminal_assistant_selection_changed')
+          else expect(await readOriginalTerminal(native.owned, selectedAuthority, native.original, observed)).toBeNull()
+          expect((await f.store.snapshot()).slot).toBe(native.original.identity.requestId)
+          expect((await f.store.snapshot()).terminalSettlements ?? []).toHaveLength(0)
+        } finally { await f.close() }
+      })
+    }
+    for (const side of ['prior', 'later'] as const) {
+      test(`${pin} retry ${side} assistant reuse cannot mint an original terminal proof`, async () => {
+        const f = await setup(selectedAuthority), native = withCleanRetries(terminalFixture(selectedAuthority))
+        try {
+          const service = new OpenCodeV2AdmissionService(native.owned, f.store, selectedAuthority)
+          await service.admitQueue(native.original, true)
+          const observed = await service.readOriginalInput(native.original)
+          const original = native.log.events, start = original[4]!, ended = original[12]!
+          const seq = side === 'prior' ? 1 : 15
+          const adjacent = [
+            { ...original[2]!, id: 'evt_adjacent_start', seq },
+            { ...start, id: 'evt_adjacent_step', seq: seq + 1 },
+            { ...ended, id: 'evt_adjacent_stepend', seq: seq + 2 },
+            { ...original[13]!, id: 'evt_adjacent_terminal', seq: seq + 3 },
+          ]
+          native.log.events = side === 'prior'
+            ? [...adjacent, ...original.map(row => ({ ...row, seq: row.seq + 4 }))] : [...original, ...adjacent]
+          native.log.watermark = 18
+          expect(await readOriginalTerminal(native.owned, selectedAuthority, native.original, observed)).toBeNull()
+          expect((await f.store.snapshot()).slot).toBe(native.original.identity.requestId)
+        } finally { await f.close() }
+      })
+    }
+  }
   test('queue acceptance remains held until native terminal, then replay cannot release successor', async () => {
     const f = await setup(), native = terminalFixture()
     try {

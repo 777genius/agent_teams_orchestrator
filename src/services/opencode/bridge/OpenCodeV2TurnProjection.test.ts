@@ -1,8 +1,8 @@
 import { describe, expect, test } from 'bun:test'
 import { projectOpenCodeV2Turn, type OpenCodeV2TurnCut } from './OpenCodeV2TurnProjection.js'
 import type { ExecutionLogEvent, ExecutionMessage } from '../transport/OpenCodeV2ExecutionClientFactory.js'
-import type { SessionStepStarted as CurrentStepStarted, SessionStepEnded as CurrentStepEnded } from '@opencode/client'
-import type { SessionStepStarted as FloorStepStarted } from '@opencode/client-v2-floor'
+import type { SessionStepStarted as CurrentStepStarted, SessionStepEnded as CurrentStepEnded, SessionRetryScheduled as CurrentRetryScheduled } from '@opencode/client'
+import type { SessionStepStarted as FloorStepStarted, SessionRetryScheduled as FloorRetryScheduled } from '@opencode/client-v2-floor'
 
 const sessionID = 'ses_TESToriginal', nativeInputID = 'msg_TESTinput', assistantID = 'msg_TESTassistant'
 const text = 'TEST inbound app relay'
@@ -47,6 +47,62 @@ function assistant(value: OpenCodeV2TurnCut): ExecutionMessage {
   const item = value.messages.data.find(message => message.id === assistantID)
   if (!item) throw new Error('TEST-assistant-missing')
   return item
+}
+
+const retryData = { sessionID, assistantMessageID: assistantID, attempt: 2, at: 100,
+  error: { type: 'TEST-retry', message: 'TEST retry' } } satisfies CurrentRetryScheduled['data'] & FloorRetryScheduled['data']
+function retryCut(pin: OpenCodeV2TurnCut['pin']): OpenCodeV2TurnCut {
+  const value = cut(), started = pin === '2.0.0' ? floorStarted : currentStarted
+  const events = [
+    event('session.created', 1), event('session.inbox.enqueued', 2, { inboxID: nativeInputID }),
+    event('session.execution.started', 3), event('session.inbox.delivered', 4, { inboxID: nativeInputID }),
+    event('session.step.started', 5, started), event('session.retry.scheduled', 6, retryData),
+    event('session.step.started', 7, started), event('session.retry.scheduled', 8, { ...retryData, attempt: 3, at: 200 }),
+    event('session.step.started', 9, started),
+    ...value.log.events.slice(3).map(row => ({ ...row, id: `evt_TEST${row.seq + 6}`, seq: row.seq + 6 })),
+  ]
+  value.messages.data[value.messages.data.length - 1] = message('msg_TEST14', 'idle', { outcome: 'succeeded' })
+  return { ...value, pin, log: { synced: true, watermark: 14, events } }
+}
+for (const pin of ['2.0.0', '2.0.21'] as const) {
+  test(`${pin} native clean retries 5/6/7/8/9 produce one assistant and one original visible receipt`, () => {
+    const projected = projectOpenCodeV2Turn(retryCut(pin))
+    expect(projected.state).toBe('succeeded')
+    expect(projected.assistantMessageIds).toEqual([assistantID])
+    expect(projected.toolEffects).toHaveLength(1)
+    expect(projected.visibleReplies).toHaveLength(1)
+  })
+  for (const mode of ['unbacked', 'foreign-retry', 'first-attempt', 'attempt-gap', 'invalid-at',
+    'invalid-error', 'foreign-agent', 'foreign-model', 'interleaved-assistant', 'text-effect',
+    'tool-effect', 'step-terminal', 'foreign-delivery', 'foreign-session', 'original-payload', 'unfinished-retry'] as const) {
+    test(`${pin} ambiguous native retry ${mode} cannot publish`, () => {
+      const value = retryCut(pin)
+      const events = value.log.events.map(row => ({ ...row, data: { ...row.data } }))
+      const retry = events[5]!, start = events[6]!
+      if (mode === 'unbacked') retry.type = 'session.updated'
+      if (mode === 'foreign-retry') retry.data.assistantMessageID = 'msg_TESTforeign'
+      if (mode === 'first-attempt') retry.data.attempt = 1
+      if (mode === 'attempt-gap') events[7]!.data.attempt = 4
+      if (mode === 'invalid-at') retry.data.at = -1
+      if (mode === 'invalid-error') retry.data.error = null
+      if (mode === 'foreign-agent') start.data.agent = 'TEST-foreign'
+      if (mode === 'foreign-model') start.data.model = { ...floorStarted.model, variant: 'foreign' }
+      if (mode === 'interleaved-assistant') start.data.assistantMessageID = 'msg_TESTforeign'
+      if (mode === 'text-effect') retry.type = 'session.text.delta'
+      if (mode === 'tool-effect') retry.type = 'session.tool.input.started'
+      if (mode === 'step-terminal') retry.type = 'session.step.ended'
+      if (mode === 'foreign-delivery') retry.type = 'session.inbox.delivered'
+      if (mode === 'foreign-session') retry.data.sessionID = 'ses_TESTforeign'
+      if (mode === 'original-payload') {
+        const user = value.messages.data[0]!
+        user.data = { ...user.data, text: 'TEST foreign payload' }
+      }
+      if (mode === 'unfinished-retry') events[8]!.type = 'session.updated'
+      const projected = projectOpenCodeV2Turn({ ...value, log: { ...value.log, events } })
+      expect(projected.state).toBe('unknown')
+      expect(projected.visibleReplies).toHaveLength(0)
+    })
+  }
 }
 
 describe('V2 actual durable terminal projection', () => {
