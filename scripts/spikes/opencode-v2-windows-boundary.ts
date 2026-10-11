@@ -41,6 +41,19 @@ if (child) {
     const descendant = Bun.spawn([process.execPath, '-e', 'setInterval(()=>{},1000)'], { stdio: ['ignore', 'ignore', 'ignore'], env: { ...process.env } })
     attempts.descendantPID = descendant.pid
   } catch (error) { attempts.descendantStartupError = String(error) }
+  try {
+    const markerPath = path.join(base, 'work', 'native-descendant-marker.json')
+    const descendant = native.launchWindowsNativeDescendant(process.execPath, markerPath)
+    attempts.nativeDescendantPID = descendant.pid; attempts.nativeDescendantBirth = descendant.birthFiletime
+    attempts.nativeDescendantInheritedJob = descendant.inheritedJob
+    const deadline = Date.now() + 5000
+    let marker: { pid?: number; nativeDescendant?: boolean } | undefined
+    while (!marker && Date.now() < deadline) {
+      marker = await readFile(markerPath, 'utf8').then(text => JSON.parse(text) as typeof marker).catch(() => undefined)
+      if (!marker) await pause(20)
+    }
+    attempts.nativeDescendantBunStarted = marker?.pid === descendant.pid && marker.nativeDescendant === true
+  } catch (error) { attempts.nativeDescendantStartupError = String(error) }
   attempts.jobBreakawayError = native.attemptWindowsJobBreakaway(process.execPath)
   } catch (error) { attempts.childStartupError = String(error); console.error(JSON.stringify({ childStartupError: String(error) })) }
   // Named pipe carries the probe response without admin loopback exemptions.
@@ -199,7 +212,7 @@ foreach ($entry in $workPackageAllows) { if (([int]$entry.FileSystemRights -band
     evidence.readOnlyRetained = await readFile(path.join(root, 'readonly', 'immutable.txt'), 'utf8') === 'host-owned'
     const critical = ['ownedWrite', 'outsideApprovedReadDenied', 'outsideApprovedWriteDenied', 'siblingListingDenied', 'hostStateWriteDenied', 'protectedWriteDenied', 'protectedRenameDenied', 'protectedDeleteDenied', 'readOnlyWriteDenied', 'runtimeInputWriteDenied', 'runtimeHelperWriteDenied']
     evidence.filesystemPassed = critical.every(key => report.attempts[key] === true) && report.attempts.protectedAclEscapeError === 5 && report.attempts.protectedFileAclEscapeError === 5 && report.attempts.readOnlyAclEscapeError === 5 && report.attempts.runtimeInputAclEscapeError === 5 && evidence.hostStateRetained && evidence.protectedRetained && evidence.readOnlyRetained && evidence.trustedOwnerWrite
-    evidence.jobPassed = Number(evidence.activeWithDescendant) >= 2 && evidence.activeAfterTerminate === 0 && evidence.processExited && report.attempts.jobBreakawayError === 5
+    evidence.jobPassed = Number(evidence.activeWithDescendant) >= 2 && report.attempts.nativeDescendantInheritedJob === true && report.attempts.nativeDescendantBunStarted === true && evidence.activeAfterTerminate === 0 && evidence.processExited && report.attempts.jobBreakawayError === 5
     evidence.dropInLoopbackPassed = evidence.parentHttp === 'native-http-ok'
     evidence.qualified = evidence.filesystemPassed && evidence.jobPassed && evidence.dropInLoopbackPassed
   } catch (error) { evidence.error = String(error); evidence.qualified = false }

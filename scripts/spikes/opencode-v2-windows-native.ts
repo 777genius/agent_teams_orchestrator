@@ -17,6 +17,7 @@ const kernel = dlopen('kernel32.dll', {
   WaitForSingleObject: { args: [h, d], returns: d },
   GetProcessTimes: { args: [h, p, p, p, p], returns: b },
   GetExitCodeProcess: { args: [h, p], returns: b },
+  IsProcessInJob: { args: [h, h, p], returns: b },
   CreateFileW: { args: [p, d, d, p, d, d, h], returns: h },
   CloseHandle: { args: [h], returns: b },
   GetLastError: { args: [], returns: d },
@@ -81,6 +82,39 @@ export function attemptWindowsJobBreakaway(executable: string): number {
   try { check(kernel.symbols.TerminateProcess(processHandle, 99), 'cleanup escaped TEST process') }
   finally { kernel.symbols.CloseHandle(thread); kernel.symbols.CloseHandle(processHandle) }
   return 0
+}
+export function launchWindowsNativeDescendant(executable: string, markerPath: string) {
+  const quote = (argument: string) => '"' + argument.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\+)$/g, '$1$1') + '"'
+  const script = `require('node:fs').writeFileSync(${JSON.stringify(markerPath)},JSON.stringify({pid:process.pid,nativeDescendant:true}));setInterval(()=>{},1000)`
+  const executableBytes = utf16(executable), command = utf16([executable, '-e', script].map(quote).join(' '))
+  const startup = Buffer.alloc(104); startup.writeUInt32LE(104)
+  const info = Buffer.alloc(24)
+  // Inherit the already curated native child environment and its current Job;
+  // no breakaway flags and no inherited handles. Start suspended for validation.
+  check(kernel.symbols.CreateProcessW(ptr(executableBytes), ptr(command), null, null, false, 4 | 0x08000000, null, null, ptr(startup), ptr(info)), 'CreateProcessW:TEST native descendant')
+  const processHandle = info.readBigUInt64LE(), thread = info.readBigUInt64LE(8)
+  const errors: unknown[] = []
+  let result: { pid: number; birthFiletime: string; inheritedJob: true } | undefined
+  try {
+    const inJob = Buffer.alloc(4)
+    check(kernel.symbols.IsProcessInJob(processHandle, 0n, ptr(inJob)) && inJob.readUInt32LE() === 1, 'TEST descendant inherited Job')
+    const creation = Buffer.alloc(8), exit = Buffer.alloc(8), kernelTime = Buffer.alloc(8), userTime = Buffer.alloc(8)
+    check(kernel.symbols.GetProcessTimes(processHandle, ptr(creation), ptr(exit), ptr(kernelTime), ptr(userTime)), 'TEST descendant birth')
+    check(kernel.symbols.ResumeThread(thread) === 1, 'TEST descendant resume')
+    result = { pid: info.readUInt32LE(16), birthFiletime: creation.readBigUInt64LE().toString(), inheritedJob: true }
+  } catch (error) {
+    errors.push(error)
+    try {
+      check(kernel.symbols.TerminateProcess(processHandle, 99), 'cleanup TEST descendant acquisition')
+      check(kernel.symbols.WaitForSingleObject(processHandle, 5000) === 0, 'wait TEST descendant acquisition cleanup')
+    } catch (cleanupError) { errors.push(cleanupError) }
+  } finally {
+    try { check(kernel.symbols.CloseHandle(thread), 'CloseHandle:TEST descendant thread') } catch (error) { errors.push(error) }
+    try { check(kernel.symbols.CloseHandle(processHandle), 'CloseHandle:TEST descendant process') } catch (error) { errors.push(error) }
+  }
+  if (errors.length) throw new AggregateError(errors, 'TEST native descendant acquisition or handle cleanup failed')
+  if (!result) throw new Error('TEST native descendant result missing')
+  return result
 }
 export function createWindowsPipe(name: string, sid: string) {
   const descriptor = Buffer.alloc(8), text = utf16(`D:P(A;;GA;;;SY)(A;;GA;;;OW)(A;;GRGW;;;${sid})S:(ML;;NW;;;LW)`)
