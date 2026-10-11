@@ -213,13 +213,20 @@ if($LASTEXITCODE-ne 0){throw 'TEST low label failed'}
       const upload = new ReadableStream<Uint8Array>({ pull(controller) { controller.enqueue(Buffer.alloc(8192)) }, cancel() { uploadCancelled = true } }, { highWaterMark: 0 })
       const request = new Request(baseUrl + '/early', { method: 'POST', body: upload, duplex: 'half' } as RequestInit)
       const early = await bounded(http.fetch(request), 'windows_http_early_timeout')
-      assert.equal(early.status, 413); assert.equal(await bounded(early.text(), 'windows_http_early_body_timeout'), 'early-response')
+      assert.equal(early.status, 413); assert.equal(early.headers.get('connection'), 'close')
+      assert.equal(await bounded(early.text(), 'windows_http_early_body_timeout'), 'early-response')
       assert.equal(uploadCancelled, true); result.earlyResponseUploadSettled = true
+      phase = 'get-after-early-response'
+      const after = await bounded(http.fetch(baseUrl + '/get'), 'windows_http_get_after_early_timeout')
+      result.getAfterEarlyStatus = after.status; assert.equal(after.status, 200)
+      assert.equal(await bounded(after.text(), 'windows_http_get_after_early_body_timeout'), 'native-http-get-é')
+      result.getAfterEarlyPassed = true
       await assert.rejects(bounded(http.fetch('http://127.0.0.1:1/outside-selected-origin'), 'windows_http_outside_origin_unsettled'), error => error instanceof Error && error.message === 'execution_http_transport_unknown')
     }
     phase = 'native-disconnect'
     // Both modes disconnect while a real response consumer is waiting for bytes.
     const response = await bounded(http.fetch(baseUrl + '/disconnect'), 'windows_http_disconnect_setup_timeout')
+    assert.equal(response.status, 200, 'windows_http_disconnect_status_not_200')
     const reader = response.body!.getReader()
     const warmup = await bounded(reader.read(), 'windows_http_disconnect_warmup_timeout')
     assert.equal(warmup.done, false, 'windows_http_disconnect_warmup_ended')
@@ -303,6 +310,8 @@ if($LASTEXITCODE-ne 0){throw 'TEST low label failed'}
     result.helperExitCode = helperCloseCode; result.brokerEnded = broker.ended(); result.cleanupErrors = errors
     result.frameCounts = frameCounts; result.disconnectFrames = disconnectFrames
     result.disconnectFixtureEvents = messages.filter(value => value.type === 'testDisconnectFixtureWrite' || value.type === 'testDisconnectFixtureFailure')
+    result.httpHandlerHits = messages.filter(value => value.type === 'testHttpHandlerHit')
+    result.httpSocketCloses = messages.filter(value => value.type === 'testHttpSocketClosed')
     result.qualified = localFailure === undefined && errors.length === 0 && retired && broker.ended()
     if (localFailure) {
       result.failedPhase = phase

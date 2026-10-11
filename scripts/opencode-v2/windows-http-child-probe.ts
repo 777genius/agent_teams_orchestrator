@@ -12,8 +12,13 @@ control.events.on('error', () => {})
 let bridge: ReturnType<typeof bindWindowsExecutionHttp> | undefined
 let selectedBirth: unknown, selectedNamespace: unknown
 const sockets = new Set<import('node:net').Socket>()
+const socketIds = new WeakMap<import('node:net').Socket, number>(); let nextSocketId = 0
 const server = createServer(async (request, response) => {
   try {
+    const route = ['/get', '/post', '/early', '/sse', '/disconnect'].includes(request.url ?? '') ? request.url : 'other'
+    void control.send({ type: 'testHttpHandlerHit', nonce: process.env.OPENCODE_V2_WINDOWS_NONCE,
+      leaseOwnerId: process.env.OPENCODE_V2_WINDOWS_LEASE, route, socketId: socketIds.get(request.socket),
+      method: ['GET', 'POST'].includes(request.method ?? '') ? request.method : 'OTHER' }).catch(() => control.disconnect())
     if (request.url === '/get') {
       response.setHeader('x-native-http', 'production-transport'); response.end('native-http-get-é')
     } else if (request.url === '/post') {
@@ -24,6 +29,9 @@ const server = createServer(async (request, response) => {
       response.statusCode = 201; response.setHeader('x-upload-bytes', String(body.length))
       response.end(Buffer.alloc(100000, 0xa7))
     } else if (request.url === '/early') {
+      // This fixture rejects an infinite request without reading its body.
+      // RFC 9112 section 9.3 requires closing this connection after response.
+      response.setHeader('connection', 'close')
       response.statusCode = 413; response.end('early-response')
     } else if (request.url === '/sse' || request.url === '/disconnect') {
       // Exact native-qualified SSE ordering: flush default-framed headers,
@@ -73,7 +81,14 @@ const server = createServer(async (request, response) => {
     } else { response.statusCode = 404; response.end() }
   } catch { response.destroy() }
 })
-server.on('connection', socket => { sockets.add(socket); socket.once('close', () => sockets.delete(socket)) })
+server.on('connection', socket => {
+  const socketId = ++nextSocketId; socketIds.set(socket, socketId); sockets.add(socket)
+  socket.once('close', () => {
+    sockets.delete(socket)
+    void control.send({ type: 'testHttpSocketClosed', nonce: process.env.OPENCODE_V2_WINDOWS_NONCE,
+      leaseOwnerId: process.env.OPENCODE_V2_WINDOWS_LEASE, socketId }).catch(() => {})
+  })
+})
 control.events.on('message', (value: Record<string, unknown>) => {
   void (async () => {
     if (value.type === 'prepare') {
