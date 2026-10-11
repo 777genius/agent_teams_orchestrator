@@ -163,6 +163,28 @@ export function buildGroupMailboxPrompt(message: GroupMailboxEnvelope & {
   ].join('\n')
 }
 
+/** Read one official MCP envelope; structured data never falls back to text. */
+function parseGroupReactionResult(text: string): Record<string, unknown> | undefined {
+  const isRecord = (value: unknown): value is Record<string, unknown> =>
+    !!value && typeof value === 'object' && !Array.isArray(value)
+  try {
+    let result: unknown = JSON.parse(text)
+    if (!isRecord(result) || result.isError === true) return undefined
+    if ('content' in result || 'structuredContent' in result) {
+      if (result.structuredContent !== null && result.structuredContent !== undefined) {
+        result = result.structuredContent
+      } else {
+        const content = result.content
+        if (!Array.isArray(content) || content.length !== 1) return undefined
+        const block: unknown = content[0]
+        if (!isRecord(block) || block.type !== 'text' || typeof block.text !== 'string') return undefined
+        result = JSON.parse(block.text)
+      }
+    }
+    return isRecord(result) && result.isError !== true ? result : undefined
+  } catch { return undefined }
+}
+
 /** Completed sends and acknowledgements consume only their exact group inbound. */
 export function findGroupMailboxReplyOutcome(input: {
   messages: AppState['messages']; submitUserMessageUuid: string; teamName?: string;
@@ -203,15 +225,11 @@ export function findGroupMailboxReplyOutcome(input: {
         if (reactions.has(block.tool_use_id)) {
           // Failed, pending or unverifiable reactions leave the prior fallback intact.
           if (block.is_error === true) continue
-          for (const text of texts) {
-            try {
-              const result = JSON.parse(text)
-              if (result.saved === true && result.acknowledged === true &&
-                  result.teamName === input.teamName && result.from === input.memberName &&
-                  result.groupChatId === input.groupChatId && result.messageId === input.canonicalMessageId &&
-                  result.relayOfMessageId === input.physicalMessageId && result.groupRunKey === input.groupRunKey) acknowledged = true
-            } catch { /* No exact committed consumption proof. */ }
-          }
+          const result = texts.length === 1 ? parseGroupReactionResult(texts[0]!) : undefined
+          if (result?.saved === true && result.acknowledged === true &&
+              result.teamName === input.teamName && result.from === input.memberName &&
+              result.groupChatId === input.groupChatId && result.messageId === input.canonicalMessageId &&
+              result.relayOfMessageId === input.physicalMessageId && result.groupRunKey === input.groupRunKey) acknowledged = true
           // Keep scanning: explicit substantive sends remain authoritative.
           continue
         }

@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { getOrdinaryInlineHandoffPrompt, getOrdinaryProcessingAction } from './useInboxPoller.js'
+import { getOrdinaryInlineHandoffPrompt, getOrdinaryProcessingAction, findOrdinaryDirectReplyFallback } from './useInboxPoller.js'
 import { createAssistantMessage, createUserMessage } from '../utils/messages.js'
 import { createPendingMailboxMirrorMessage } from './ordinaryMailboxMessage.js'
 import { getFreshGroupChatDiscoveryPrompt, relayGroupAssistantText } from '../utils/groupChatControlClient.js'
@@ -137,6 +137,14 @@ describe('named group mailbox routing', () => {
     ] as never })
     expect(getOrdinaryProcessingAction({ attempt, messages: [submitted, wrongActor, plain], processingOrdinaryMessage: row, teamName: 'sandbox', memberName: 'alice', now: 1000 }).type).toBe('finalize')
     expect(getOrdinaryProcessingAction({ attempt, messages: [submitted, plain], processingOrdinaryMessage: row, teamName: 'sandbox', now: 1000 }).type).toBe('deliver_assistant_text')
+    const empty = createAssistantMessage({ content: '' })
+    expect(getOrdinaryProcessingAction({ attempt, messages: [submitted, empty], processingOrdinaryMessage: row, teamName: 'sandbox', now: 1000 })).toEqual({ type: 'finalize' })
+    const mixed = createAssistantMessage({ content: [
+      { type: 'text', text: '(no content)' }, { type: 'text', text: 'Substantive group reply' },
+    ] as never })
+    expect(getOrdinaryProcessingAction({ attempt, messages: [submitted, empty, mixed], processingOrdinaryMessage: row, teamName: 'sandbox', now: 1000 })).toEqual({ type: 'deliver_assistant_text', text: 'Substantive group reply' })
+    // Private fallback retains its existing behavior; only group callers opt in.
+    expect(findOrdinaryDirectReplyFallback({ messages: [submitted, empty], submitUserMessageUuid: 'group-submit', teamName: 'sandbox' })).toEqual({ text: '(no content)' })
   })
 })
 
@@ -165,6 +173,7 @@ describe('group reaction consumption at the mailbox completion boundary', () => 
   const args = { teamName: 'sandbox', from: 'alice', groupChatId: inbound.groupChatId, relayOfMessageId: inbound.messageId }
   const saved = { ...args, saved: true, acknowledged: true, messageId: inbound.groupMessageId, groupRunKey: inbound.groupRunKey }
   const plain = createAssistantMessage({ content: 'OK' })
+  const nativeResult = (result: unknown) => ({ content: [{ type: 'text', text: JSON.stringify(result) }], structuredContent: null, _meta: null })
   const useReaction = (input = args) => createAssistantMessage({ content: [
     { type: 'tool_use', id: 'react', name: 'mcp__agent-teams__group_chat_react', input },
   ] as never })
@@ -181,6 +190,13 @@ describe('group reaction consumption at the mailbox completion boundary', () => 
     const messages = [submitted, useReaction(), reactionResult(saved), plain]
     expect(complete(messages)).toEqual({ type: 'finalize' })
     expect(findGroupMailboxReplyOutcome({ ...scope, messages })).toBe('acknowledged')
+    // Actual native MCP projection serializes the official envelope, with commentary before the tool and an empty final response.
+    const commentary = createAssistantMessage({ content: 'I’ll check the group catalog, then add the requested reaction.' })
+    for (const result of [nativeResult(saved), { ...nativeResult({ ...saved, from: 'bob' }), structuredContent: saved }]) {
+      const nativeMessages = [submitted, commentary, useReaction(), reactionResult(result), createAssistantMessage({ content: '' })]
+      expect(complete(nativeMessages)).toEqual({ type: 'finalize' })
+      expect(findGroupMailboxReplyOutcome({ ...scope, messages: nativeMessages })).toBe('acknowledged')
+    }
     // Neither another canonical message nor a fresh physical delivery can reuse this proof.
     expect(findGroupMailboxReplyOutcome({ ...scope, messages, canonicalMessageId: 'fae7d421-dfd0-4bd3-bc0b-2693fd24b344' })).toBe('none')
     expect(findGroupMailboxReplyOutcome({ ...scope, messages, physicalMessageId: 'fresh-physical' })).toBe('none')
@@ -203,6 +219,16 @@ describe('group reaction consumption at the mailbox completion boundary', () => 
       [useReaction(), reactionResult({ ...saved, groupRunKey: 'old-run:123' })],
       [useReaction({ ...args, from: 'bob' }), reactionResult(saved)],
       [useReaction(), reactionResult('unverifiable')],
+      [useReaction(), reactionResult(nativeResult(saved), true)],
+      [useReaction(), reactionResult({ ...nativeResult(saved), isError: true })],
+      [useReaction(), reactionResult({ ...saved, isError: true })],
+      [useReaction(), reactionResult(nativeResult({ ...saved, from: 'bob' }))],
+      [useReaction(), reactionResult({ ...nativeResult(saved), structuredContent: { ...saved, acknowledged: false } })],
+      [useReaction(), reactionResult({ ...nativeResult(saved), structuredContent: [] })],
+      [useReaction(), reactionResult({ ...nativeResult(saved), structuredContent: 'malformed' })],
+      [useReaction(), reactionResult({ content: [...nativeResult(saved).content, ...nativeResult(saved).content] })],
+      [useReaction(), reactionResult({ content: [{ type: 'text', text: 'malformed' }] })],
+      [useReaction(), reactionResult(nativeResult(nativeResult(saved)))],
     ]
     for (const toolMessages of cases) {
       const messages = [submitted, ...toolMessages, plain]

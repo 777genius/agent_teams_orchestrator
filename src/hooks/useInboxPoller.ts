@@ -43,7 +43,7 @@ import {
 import {
   readWorkSyncInboxContinuationTicket,
 } from '../utils/workSyncInboxTicket.js'
-import { createAssistantMessage } from '../utils/messages.js'
+import { createAssistantMessage, isEmptyMessageText } from '../utils/messages.js'
 import {
   permissionModeFromString,
   toExternalPermissionMode,
@@ -1212,7 +1212,7 @@ export function findOrdinaryDirectReplyOutcome({
   return 'none'
 }
 
-function extractAssistantText(message: AppState['messages'][number]): string {
+function extractAssistantText(message: AppState['messages'][number], excludeEmptyMessages = false): string {
   if (message.type !== 'assistant') {
     return ''
   }
@@ -1222,7 +1222,7 @@ function extractAssistantText(message: AppState['messages'][number]): string {
       if (block.type !== 'text') {
         return []
       }
-      return typeof block.text === 'string' ? [block.text.trim()] : []
+      return typeof block.text === 'string' && (!excludeEmptyMessages || !isEmptyMessageText(block.text)) ? [block.text.trim()] : []
     })
     .filter(Boolean)
     .join('\n\n')
@@ -1732,10 +1732,12 @@ export function findOrdinaryDirectReplyFallback({
   messages,
   submitUserMessageUuid,
   teamName,
+  excludeEmptyMessages = false,
 }: {
   messages: AppState['messages']
   submitUserMessageUuid: string
   teamName?: string
+  excludeEmptyMessages?: boolean
 }): OrdinaryDirectReplyFallback | null {
   const startIndex = messages.findIndex(
     message => message.type === 'user' && message.uuid === submitUserMessageUuid,
@@ -1764,7 +1766,7 @@ export function findOrdinaryDirectReplyFallback({
       continue
     }
 
-    const text = extractAssistantText(message)
+    const text = extractAssistantText(message, excludeEmptyMessages)
     if (text) {
       assistantTextParts.push(text)
     }
@@ -1979,7 +1981,7 @@ export function getOrdinaryProcessingAction({
       logForDebugging('[InboxPoller] Ambiguous group turn: no inferred reply destination or private fallback')
       return { type: 'finalize' }
     }
-    const fallback = findOrdinaryDirectReplyFallback({ messages, submitUserMessageUuid: attempt.submitUserMessageUuid, teamName })
+    const fallback = findOrdinaryDirectReplyFallback({ messages, submitUserMessageUuid: attempt.submitUserMessageUuid, teamName, excludeEmptyMessages: true })
     if (fallback) return { type: 'deliver_assistant_text', text: fallback.text }
     if (hasAttemptObservedPostSubmitActivity({ messages, submitUserMessageUuid: attempt.submitUserMessageUuid })) return { type: 'finalize' }
     return { type: 'noop' }
