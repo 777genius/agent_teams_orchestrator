@@ -1,0 +1,112 @@
+diff --git a/src/services/opencode/OpenCodeCursorAgentTreeKill.ts b/src/services/opencode/OpenCodeCursorAgentTreeKill.ts
+index 620199f0..5a17da50 100644
+--- a/src/services/opencode/OpenCodeCursorAgentTreeKill.ts
++++ b/src/services/opencode/OpenCodeCursorAgentTreeKill.ts
+@@ -1,5 +1,11 @@
+ import { spawn } from 'node:child_process'
+ import path from 'node:path'
++import { appendFileSync } from 'node:fs'
++let diagnosticCount = 0
++export function diagnostic(stage: string, details: Record<string, unknown> = {}): void {
++  const file = process.env.TEST_VERSION_DIAGNOSTIC_TRACE
++  if (file && diagnosticCount++ < 500) appendFileSync(file, JSON.stringify({ stage, now: Date.now(), observerPid: process.pid, ...details }) + '\n')
++}
+ import { readProcessStartTimeMs } from '../../utils/processKill.js'
+
+ export type NativeRow = { pid: number; ppid: number }
+@@ -19,7 +25,10 @@ export type CursorAgentNativePorts = {
+ export function query(command: string, args: string[], timeout: number,
+   launch: typeof spawn = spawn): Promise<string> {
+   return new Promise((resolve, reject) => {
+-    const child = launch(command, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] })
++    const child = launch(command, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
++    diagnostic('helper-spawn', { helperPid: child.pid, timeout })
++    let helperStderr = ''
++    child.stderr?.on('data', (chunk: Buffer | string) => { if (helperStderr.length < 4096) helperStderr += String(chunk).slice(0, 4096 - helperStderr.length) })
+     let output = ''
+     let failure: Error | undefined
+     const stop = (error: Error) => {
+@@ -41,6 +50,7 @@ export function query(command: string, args: string[], timeout: number,
+     })
+     child.once('close', code => {
+       clearTimeout(timer)
++      diagnostic('helper-close', { helperPid: child.pid, code, stderrCategory: /no process|cannot find a process|not running|has exited/i.test(helperStderr) ? 'process-not-found' : /access.*denied|unauthorized/i.test(helperStderr) ? 'access-denied' : helperStderr ? 'other-stderr' : 'empty' })
+       if (failure || code !== 0) reject(failure ?? new Error(`Native helper exited ${code}`))
+       else resolve(output)
+     })
+@@ -75,6 +85,7 @@ export function nativePorts(overrides: Partial<CursorAgentNativePorts> = {},
+       if (!Number.isSafeInteger(pid) || pid <= 0) return null
+       if (process.platform === 'linux') return readProcessStartTimeMs(pid, 'linux', timeout)
+       if (process.platform !== 'darwin' && process.platform !== 'win32') return null
++      diagnostic('birth-start', { targetPid: pid, timeout })
+       try {
+         const output = process.platform === 'darwin'
+           ? await observedQuery('birth', 'ps', ['-p', String(pid), '-o', 'lstart='], timeout)
+@@ -83,8 +94,13 @@ export function nativePorts(overrides: Partial<CursorAgentNativePorts> = {},
+             ['-NoProfile', '-NonInteractive', '-Command',
+               `$ErrorActionPreference = "Stop"; $p = [System.Diagnostics.Process]::GetProcessById(${pid}); try { $p.StartTime.ToUniversalTime().ToString("o") } finally { $p.Dispose() }`], timeout)
+         const value = Date.parse(output.trim())
++        diagnostic('birth-result', { targetPid: pid, birth: Number.isFinite(value) ? value : null })
+         return Number.isFinite(value) ? value : null
+-      } catch { return null }
++      } catch {
++        let observedState: 'alive' | 'gone' | 'unknown' = 'alive'
++        try { process.kill(pid, 0) } catch (error) { observedState = (error as NodeJS.ErrnoException).code === 'ESRCH' ? 'gone' : 'unknown' }
++        diagnostic('birth-result', { targetPid: pid, birth: null, queryFailed: true, observedState }); return null
++      }
+     },
+     tree: async timeout => {
+       const output = process.platform === 'win32'
+diff --git a/src/services/opencode/compatibility/OpenCodeVersionProbe.ts b/src/services/opencode/compatibility/OpenCodeVersionProbe.ts
+index 2509505a..79a96625 100644
+--- a/src/services/opencode/compatibility/OpenCodeVersionProbe.ts
++++ b/src/services/opencode/compatibility/OpenCodeVersionProbe.ts
+@@ -2,7 +2,7 @@ import type { ChildProcess } from 'node:child_process'
+ import { open } from 'node:fs/promises'
+ import path from 'node:path'
+ import { resolveDirectWindowsLauncher, spawnPortableCli } from '../../../utils/portableCli.js'
+-import { nativePorts, query, type NativeHelperFailure, type NativeRow } from '../OpenCodeCursorAgentTreeKill.js'
++import { diagnostic, nativePorts, query, type NativeHelperFailure, type NativeRow } from '../OpenCodeCursorAgentTreeKill.js'
+ import type { OpenCodeV2ReadRoots } from '../profile/OpenCodeV2ManagedConfig.js'
+ import { boundOpenCodeRead } from '../transport/OpenCodeBoundedFetch.js'
+
+@@ -62,6 +62,7 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
+     child = spawnPortableCli(launcher.command, launcher.args, { cwd: roots.root, env: roots.env,
+       stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true, detached: process.platform !== 'win32' })
+     owner.child = child
++    diagnostic('version-spawn', { targetPid: child.pid })
+     let helperFailure: NativeHelperFailure | null = null
+     const ports = nativePorts({}, failure => { helperFailure = failure })
+     const pid = child.pid
+@@ -84,13 +85,14 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
+       else output += chunk.toString('utf8')
+     })
+     child.once('error', () => { fail(); if (!child?.pid) ended = true })
+-    child.once('exit', value => { ended = true; code = value; stopping = true })
++    child.once('exit', value => { diagnostic('version-exit', { targetPid: child?.pid, code: value }); ended = true; code = value; stopping = true })
+     const close = track(new Promise<void>(resolve => {
+       child!.once('close', () => {
+         // Close ends version acquisition, not the bounded ownership cleanup.
+         // Preserve the deadline if event-loop delay delivered close too late.
+         if (Date.now() >= acquisitionDeadline) fail()
+         clearTimeout(timer)
++        diagnostic('version-close', { targetPid: child?.pid, code })
+         closed = true
+         resolve()
+       })
+@@ -145,6 +147,7 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
+       for (;;) {
+         cap()
+         const rows = await table(), group = members(rows)
++        diagnostic('version-table', { targetPid: pid, group: group.map(row => ({ pid: row.pid, ppid: row.ppid })), closed, births: [...births.keys()] })
+         const live = rows.filter(row => !row.retired)
+         // A live birth-checked member anchors group continuity. If the initial
+         // leader vanished before identity capture, do not infer orphan ownership.
+@@ -193,6 +196,7 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
+         await ports.sleep(Math.min(25, cap()))
+       }
+     } catch (error) {
++      diagnostic('version-failure', { targetPid: pid, retired, helperFailure })
+       if (!retired) throw new OpenCodeVersionProbeCleanupError(error, helperFailure)
+       throw error
+     } finally {
