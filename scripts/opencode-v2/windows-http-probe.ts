@@ -214,6 +214,9 @@ if($LASTEXITCODE-ne 0){throw 'TEST low label failed'}
     // Both modes disconnect while a real response consumer is waiting for bytes.
     const response = await bounded(http.fetch(baseUrl + '/disconnect'), 'windows_http_disconnect_setup_timeout')
     const reader = response.body!.getReader()
+    const warmup = await bounded(reader.read(), 'windows_http_disconnect_warmup_timeout')
+    assert.equal(warmup.done, false, 'windows_http_disconnect_warmup_ended')
+    assert.deepEqual(Buffer.from(warmup.value!), Buffer.of(0x71)); result.disconnectWarmupBytes = 1
     const pendingRead = reader.read(); let readSettled = false
     void pendingRead.then(() => { readSettled = true }, () => { readSettled = true })
     await Bun.sleep(0); assert.equal(readSettled, false, 'windows_http_disconnect_read_not_pending')

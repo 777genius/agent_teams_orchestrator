@@ -26,10 +26,11 @@ const server = createServer(async (request, response) => {
     } else if (request.url === '/early') {
       response.statusCode = 413; response.end('early-response')
     } else if (request.url === '/disconnect') {
-      // Keep a real chunked response outstanding, with no bytes that could
-      // satisfy the pending read before deliberate native disconnection.
+      // A single known byte enters Bun's real response streaming path. The
+      // parent consumes it fully before establishing the pending next read.
       response.setHeader('content-type', 'text/event-stream')
-      response.setHeader('transfer-encoding', 'chunked'); response.flushHeaders()
+      response.setHeader('transfer-encoding', 'chunked')
+      response.write(Buffer.of(0x71)); response.flushHeaders()
       await new Promise<void>((resolve, reject) => {
         const socket = request.socket
         const cleanup = () => {
