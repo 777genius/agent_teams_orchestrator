@@ -247,7 +247,9 @@ export function bindWindowsExecutionHttp(baseUrl: string, signal?: AbortSignal):
         const task = Promise.resolve().then(async () => {
           let result: Response | undefined
           try {
-            result = await fetch(target, { method: String(frame.method), headers: requestHeaders, body, signal: controller.signal, redirect: 'manual', ...(body ? { duplex: 'half' as const } : {}) })
+            // Bun 1.3.11 can reuse an unfinished streamed upload after an
+            // early response. Keep these requests out of its shared pool.
+            result = await fetch(target, { method: String(frame.method), headers: requestHeaders, body, signal: controller.signal, redirect: 'manual', ...(body ? { duplex: 'half' as const, keepalive: false } : {}) })
             await send({ action: 'head', status: result.status, statusText: result.statusText, headers: headers([...result.headers]), body: result.body !== null })
             await response.pump(result.body)
             await send({ action: 'done' })
