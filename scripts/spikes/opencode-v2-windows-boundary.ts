@@ -138,12 +138,18 @@ foreach ($relative in @('work/protected', 'work/protected/owner.json')) {
   $acl = Get-Acl -LiteralPath $target
   $before = @($acl.Access | Where-Object { $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -eq $sid.Value } | ForEach-Object { @{ rights = [int]$_.FileSystemRights; effect = [string]$_.AccessControlType; inherited = $_.IsInherited } })
   $acl.SetAccessRuleProtection($true, $true)
+  # Persist conversion before removing inherited grants: the Win32 write turns
+  # those grants into explicit ACEs. RemoveAccessRuleSpecific skipped them before.
+  Set-Acl -LiteralPath $target -AclObject $acl
+  $acl = Get-Acl -LiteralPath $target
   foreach ($existing in @($acl.Access)) {
-    if ($existing.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -eq $sid.Value -and $existing.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow) { $acl.RemoveAccessRuleSpecific($existing) }
+    if ($existing.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -eq $sid.Value -and $existing.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow) { $acl.RemoveAccessRuleAll($existing) }
   }
   $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($sid, $protectedRights, [System.Security.AccessControl.InheritanceFlags]::None, $none, [System.Security.AccessControl.AccessControlType]::Deny))
   Set-Acl -LiteralPath $target -AclObject $acl
   $actual = Get-Acl -LiteralPath $target
+  $unexpectedAllow = $actual.Access | Where-Object { $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -eq $sid.Value -and $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow }
+  if ($unexpectedAllow) { throw 'TEST protected package allow remained after removal' }
   $after = @($actual.Access | Where-Object { $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -eq $sid.Value } | ForEach-Object { @{ rights = [int]$_.FileSystemRights; effect = [string]$_.AccessControlType; inherited = $_.IsInherited } })
   $protectedAcls += @{ relative = $relative; before = $before; after = $after; inheritanceProtected = $actual.AreAccessRulesProtected }
 }
