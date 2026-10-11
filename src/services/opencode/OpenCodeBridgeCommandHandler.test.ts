@@ -5379,8 +5379,11 @@ describe('OpenCodeBridgeCommandHandler', () => {
       const acquired = createDeferred<RetainedProbe>()
       const provisioningStarted = createDeferred<void>()
       let workCalls = 0; let releaseCalls = 0
-      openCodeProvisioningProbe.probeRetainingHost = (async () => { provisioningStarted.resolve(); return acquired.promise }) as
-        typeof openCodeProvisioningProbe.probeRetainingHost
+      openCodeProvisioningProbe.probeRetainingHost = (async (_projectPath, options) => {
+        options?.phaseContext?.reportProvisioningStage?.('inventory')
+        provisioningStarted.resolve()
+        return acquired.promise
+      }) as typeof openCodeProvisioningProbe.probeRetainingHost
       const noWork = async () => { workCalls += 1; throw new Error('work must not run') }
       openCodeExecutionProbe.probeModelOnHost = noWork as typeof openCodeExecutionProbe.probeModelOnHost
       openCodeSessionBridge.materializeSessionOnHost = noWork as typeof openCodeSessionBridge.materializeSessionOnHost
@@ -5395,6 +5398,11 @@ describe('OpenCodeBridgeCommandHandler', () => {
       expect(workTimer).toBeDefined(); workTimer!.callback()
       const result = await resultPromise
       expect(result.ok).toBe(false)
+      if (!('error' in result)) throw new Error('Expected provisioning failure error')
+      expect(result.error.kind).toBe('provider_error')
+      expect(result.error.message).toMatch(
+        /OpenCode strict launch provisioning deadline expired \(stage=inventory, stageElapsedMs=\d+\)/,
+      )
       expect(workCalls).toBe(0)
       acquired.resolve({ snapshot, host: snapshot.host, release: async () => { releaseCalls += 1 } })
       await Promise.resolve(); await Promise.resolve()

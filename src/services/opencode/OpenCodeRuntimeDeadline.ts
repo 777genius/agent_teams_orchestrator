@@ -11,11 +11,17 @@ export const OPEN_CODE_READINESS_PHASES = [
 
 export type OpenCodeReadinessPhase = typeof OPEN_CODE_READINESS_PHASES[number]
 
+export type OpenCodeProvisioningStage =
+  | 'project_path' | 'session_store' | 'session_recovery' | 'probe'
+  | 'profile_scope' | 'inventory' | 'ensure_host' | 'retain_lease'
+  | 'host_operation' | 'app_mcp'
+
 export type OpenCodePhaseContext = {
   phase: OpenCodeReadinessPhase
   signal: AbortSignal
   remainingMs(): number
   throwIfExpired(): void
+  reportProvisioningStage?(stage: OpenCodeProvisioningStage): void
 }
 
 type OpenCodeRuntimeDeadlineDeps = {
