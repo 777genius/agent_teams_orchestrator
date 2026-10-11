@@ -39,9 +39,14 @@ async function run(disconnect: 'child-pipe' | 'broker') {
   let sid: string | undefined, mapping: Record<string, unknown> | undefined, peer: Record<string, unknown> | undefined
   let failed: Record<string, unknown> | undefined, helperCloseCode: number | null | undefined, launched = false, retired = false
   let transportFailure: Error | undefined
+  let disconnectTransactionId: string | undefined
+  const disconnectFrames: Record<string, unknown>[] = []
   const frameCounts: Record<string, number> = {}; let receivedBytes = 0
   const http = createWindowsExecutionHttpClient(
-    frame => broker.request('send', { value: { ...frame, nonce, leaseOwnerId } }).then(() => undefined),
+    frame => {
+      if (frame.action === 'request' && frame.path === '/disconnect') disconnectTransactionId = String(frame.id)
+      return broker.request('send', { value: { ...frame, nonce, leaseOwnerId } }).then(() => undefined)
+    },
     () => { if (!broker.ended()) void broker.request('retire').catch(() => undefined) },
   )
   broker.events.on('error', error => { transportFailure ??= error; http.fail(transportFailure) })
@@ -53,6 +58,11 @@ async function run(disconnect: 'child-pipe' | 'broker') {
     if (frame.type === 'windowsHTTP') {
       frameCounts[String(frame.action)] = (frameCounts[String(frame.action)] ?? 0) + 1
       if (frame.action === 'data' && frame.direction === 'response') receivedBytes += Buffer.from(String(frame.bytes), 'base64').length
+      if (frame.id === disconnectTransactionId) {
+        assert.ok(disconnectFrames.length < 128, 'windows_http_disconnect_frame_limit')
+        disconnectFrames.push({ action: frame.action, direction: frame.direction,
+          ...(frame.action === 'data' ? { bytes: Buffer.from(String(frame.bytes), 'base64').length } : {}) })
+      }
       http.accept(frame)
     } else messages.push(frame)
   })
@@ -223,8 +233,22 @@ if($LASTEXITCODE-ne 0){throw 'TEST low label failed'}
     // a diagnostic deadline or a later cleanup error cannot establish proof.
     const expectedFailure = disconnect === 'child-pipe' ? 'execution_containment_launcher_denied' : 'execution_containment_helper_closed'
     assert.equal(transportFailure?.message, expectedFailure)
-    await assert.rejects(bounded(pendingRead, 'windows_http_disconnect_unsettled'), error => error === transportFailure)
-    await assert.rejects(bounded(reader.read(), 'windows_http_disconnect_next_read_unsettled'), error => error === transportFailure)
+    async function expectRejectedRead(read: ReturnType<typeof reader.read>, name: 'pending' | 'next') {
+      let rejected = false, observedError: unknown
+      try {
+        const observed = await bounded(read, `windows_http_disconnect_${name}_unsettled`)
+        result[`${name}ReadOutcome`] = { rejected: false, done: observed.done, bytes: observed.value?.byteLength ?? 0 }
+      } catch (error) {
+        rejected = true; observedError = error
+        const message = error instanceof Error ? error.message : ''
+        result[`${name}ReadOutcome`] = { rejected: true, terminalErrorIdentity: error === transportFailure,
+          code: /^[a-zA-Z0-9_:.-]{1,160}$/.test(message) ? message : 'windows_http_unknown_error' }
+      }
+      assert.equal(rejected, true, `windows_http_disconnect_${name}_resolved`)
+      assert.equal(observedError, transportFailure, `windows_http_disconnect_${name}_error_mismatch`)
+    }
+    phase = 'native-disconnect-pending-read'; await expectRejectedRead(pendingRead, 'pending')
+    phase = 'native-disconnect-next-read'; await expectRejectedRead(reader.read(), 'next')
     await assert.rejects(bounded(http.fetch(baseUrl + '/get'), 'windows_http_new_request_unsettled'), error => error instanceof Error && error.message === 'execution_http_transport_unknown')
     result.pendingResponseRejected = true; result.terminalErrorIdentityPreserved = true; result.newRequestRejected = true
     if (!brokerDisconnected) {
@@ -267,6 +291,7 @@ if($LASTEXITCODE-ne 0){throw 'TEST low label failed'}
     } else for (const handle of handles.reverse()) try { await handle.close() } catch { errors.push('native_owner_close_unknown') }
     if (!broker.ended()) try { await broker.close() } catch { errors.push('native_broker_close_unknown') }
     result.helperExitCode = helperCloseCode; result.brokerEnded = broker.ended(); result.cleanupErrors = errors
+    result.frameCounts = frameCounts; result.disconnectFrames = disconnectFrames
     result.qualified = localFailure === undefined && errors.length === 0 && retired && broker.ended()
     if (localFailure) {
       result.failedPhase = phase
