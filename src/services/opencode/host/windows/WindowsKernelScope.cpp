@@ -3,8 +3,8 @@
 #include <aclapi.h>
 #include <algorithm>
 #include <atomic>
-#include <cstdint>
 #include <cstddef>
+#include <cstdint>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -176,7 +176,7 @@ static std::wstring currentSid() {
   LocalMemory memory{value};
   return value;
 }
-static bool privateAcl(HANDLE file, const std::wstring &owner) {
+static bool privateAcl(HANDLE file, const std::wstring &owner, PSID selectedPackage = nullptr) {
   PACL acl = nullptr;
   PSID ownerSid = nullptr;
   PSECURITY_DESCRIPTOR descriptor = nullptr;
@@ -201,12 +201,14 @@ static bool privateAcl(HANDLE file, const std::wstring &owner) {
     LPWSTR trustee = nullptr;
     require(ConvertSidToStringSidW(&ace->SidStart, &trustee) != 0, "execution_owner_unknown");
     LocalMemory trusteeMemory{trustee};
-    require(owner == trustee || std::wstring(trustee) == L"S-1-5-18",
+    require(owner == trustee || std::wstring(trustee) == L"S-1-5-18" ||
+                (selectedPackage && EqualSid(&ace->SidStart, selectedPackage)),
             "execution_owner_not_private");
   }
   return true;
 }
-static JsonObject fileIdentity(HANDLE file, const std::wstring &owner, bool directory) {
+static JsonObject fileIdentity(HANDLE file, const std::wstring &owner, bool directory,
+                               PSID selectedPackage = nullptr) {
   FILE_ID_INFO id{};
   FILE_ATTRIBUTE_TAG_INFO tag{};
   FILE_STANDARD_INFO standard{};
@@ -217,7 +219,7 @@ static JsonObject fileIdentity(HANDLE file, const std::wstring &owner, bool dire
   require(!(tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
               !!standard.Directory == directory && standard.NumberOfLinks == 1,
           "execution_owner_alias");
-  privateAcl(file, owner);
+  privateAcl(file, owner, selectedPackage);
   static const wchar_t hex[] = L"0123456789abcdef";
   std::wstring fileId;
   for (BYTE byte : id.FileId.Identifier) {
@@ -318,8 +320,8 @@ using NtSetFileFunction = NTSTATUS(NTAPI *)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULO
                                             FILE_INFORMATION_CLASS);
 using NtStatusErrorFunction = ULONG(NTAPI *)(NTSTATUS);
 static_assert(sizeof(void *) == 8 && offsetof(FILE_RENAME_INFO, RootDirectory) == 8 &&
-              offsetof(FILE_RENAME_INFO, FileNameLength) == 16 &&
-              offsetof(FILE_RENAME_INFO, FileName) == 20,
+                  offsetof(FILE_RENAME_INFO, FileNameLength) == 16 &&
+                  offsetof(FILE_RENAME_INFO, FileName) == 20,
               "x64/arm64 native FILE_RENAME_INFORMATION ABI");
 static DWORD directoryMode(HANDLE file) {
   auto query = reinterpret_cast<NtQueryFileFunction>(
@@ -362,11 +364,12 @@ static Handle ownerDirectory(const std::wstring &path, bool create, const std::w
   attributes.SecurityDescriptor = descriptor.value;
   IO_STATUS_BLOCK status{};
   HANDLE raw = nullptr;
-  NTSTATUS result =
-      createFile(&raw, FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE | (create ? DELETE : 0),
-                 &attributes, &status, nullptr, FILE_ATTRIBUTE_DIRECTORY,
-                 FILE_SHARE_READ | FILE_SHARE_WRITE | (create ? 0 : FILE_SHARE_DELETE),
-                 create ? 2 : 1, 0x1 | 0x2 | 0x20 | 0x200000, nullptr, 0);
+  NTSTATUS result = createFile(
+      &raw,
+      FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE | (create ? DELETE : 0),
+      &attributes, &status, nullptr, FILE_ATTRIBUTE_DIRECTORY,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | (create ? 0 : FILE_SHARE_DELETE), create ? 2 : 1,
+      0x1 | 0x2 | 0x20 | 0x200000, nullptr, 0);
   if (result != 0 || status.Status != 0) {
     auto statusError = reinterpret_cast<NtStatusErrorFunction>(
         GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlNtStatusToDosError"));
@@ -388,9 +391,155 @@ struct OwnerDirectory {
   JsonObject identity;
   bool writable = false;
 };
+struct SelectedProfileDirectory {
+  Handle file;
+  std::vector<Handle> ancestors;
+  std::wstring path;
+  JsonObject identity;
+};
+struct SelectedProfile {
+  Handle root, parent, database;
+  std::vector<Handle> ancestors;
+  std::wstring rootPath, parentPath, databasePath, owner;
+  JsonObject rootIdentity, parentIdentity, databaseIdentity;
+  std::vector<SelectedProfileDirectory> directories;
+  std::vector<std::wstring> admittedDirectories;
+};
 struct OwnerStore {
   std::map<std::wstring, OwnerDirectory> directories;
+  std::map<std::wstring, SelectedProfile> selectedProfiles;
+  // This SID is assigned only from the helper's own private kernel Scope,
+  // never from a request. Temporary grants to that contained package preserve
+  // the selected profile identity; no other package principal is admitted.
+  PSID selectedPackage = nullptr;
   std::uint64_t next = 0;
+  Handle holdSelectedDirectory(const std::wstring &path) {
+    for (auto &entry : directories) {
+      if (!equalPath(entry.second.path, path))
+        continue;
+      require(equalPath(finalPath(entry.second.file.value), extended(path)) &&
+                  fileIdentity(entry.second.file.value, entry.second.owner, true).Stringify() ==
+                      entry.second.identity.Stringify(),
+              "execution_owner_unknown");
+      HANDLE duplicate = nullptr;
+      require(DuplicateHandle(GetCurrentProcess(), entry.second.file.value, GetCurrentProcess(),
+                              &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS) != 0,
+              "execution_owner_unknown");
+      return Handle(duplicate);
+    }
+    return canonicalDirectory(path, FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL);
+  }
+  std::pair<Handle, std::wstring> createSpool(const JsonObject &input, const std::wstring &nonce) {
+    for (auto root : input.GetNamedArray(L"protectedRoots")) {
+      require(root.ValueType() == JsonValueType::String, "execution_owner_unknown");
+      std::wstring selected(root.GetString());
+      for (auto &entry : directories) {
+        auto &directory = entry.second;
+        if (!directory.writable || !equalPath(directory.path, selected))
+          continue;
+        require(equalPath(finalPath(directory.file.value), extended(directory.path)) &&
+                    fileIdentity(directory.file.value, directory.owner, true).Stringify() ==
+                        directory.identity.Stringify(),
+                "execution_owner_unknown");
+        auto path = directory.path + L"\\native-stdio-" + nonce;
+        return {ownerDirectory(path, true, directory.owner), path};
+      }
+    }
+    throw NativeError{"execution_native_stdio_owner_unknown"};
+  }
+  JsonObject validateSelectedProfile(const JsonObject &input) {
+    auto root = text(input, L"root"), database = text(input, L"databasePath");
+    require(database.size() > root.size() + 1 && equalPath(database.substr(0, root.size()), root) &&
+                database[root.size()] == L'\\',
+            "execution_database_alias");
+    auto parent = database.substr(0, database.find_last_of(L'\\'));
+    std::vector<std::wstring> admitted;
+    for (auto name :
+         {L"home", L"config", L"data", L"cache", L"state", L"tmp", L"appdata", L"localappdata"})
+      admitted.push_back(root + L"\\" + name);
+    require(input.HasKey(L"directories") && input.GetNamedArray(L"directories").Size() <= 64,
+            "execution_profile_changed");
+    for (auto item : input.GetNamedArray(L"directories")) {
+      require(item.ValueType() == JsonValueType::String, "execution_profile_changed");
+      std::wstring path(item.GetString());
+      require(path == root ||
+                  (path.size() > root.size() + 1 && equalPath(path.substr(0, root.size()), root) &&
+                   path[root.size()] == L'\\'),
+              "execution_profile_changed");
+      if (std::find(admitted.begin(), admitted.end(), path) == admitted.end())
+        admitted.push_back(path);
+    }
+    auto key = root + L"|" + database;
+    auto found = selectedProfiles.find(key);
+    if (found == selectedProfiles.end()) {
+      SelectedProfile value;
+      value.owner = currentSid();
+      value.rootPath = root;
+      value.parentPath = parent;
+      value.databasePath = database;
+      value.ancestors = ancestors(database);
+      value.root = holdSelectedDirectory(root);
+      value.parent = holdSelectedDirectory(parent);
+      value.rootIdentity = fileIdentity(value.root.value, value.owner, true, selectedPackage);
+      value.parentIdentity = fileIdentity(value.parent.value, value.owner, true, selectedPackage);
+      value.admittedDirectories = admitted;
+      for (const auto &path : admitted) {
+        SelectedProfileDirectory directory;
+        directory.path = path;
+        directory.ancestors = ancestors(path);
+        directory.file = holdSelectedDirectory(path);
+        directory.identity = fileIdentity(directory.file.value, value.owner, true, selectedPackage);
+        value.directories.push_back(std::move(directory));
+      }
+      wchar_t filesystem[64]{};
+      require(GetVolumeInformationByHandleW(value.root.value, nullptr, 0, nullptr, nullptr, nullptr,
+                                            filesystem, 64) &&
+                  std::wstring(filesystem) == L"NTFS",
+              "execution_owner_ntfs_required");
+      found = selectedProfiles.emplace(key, std::move(value)).first;
+    }
+    auto &selected = found->second;
+    require(
+        equalPath(finalPath(selected.root.value), extended(root)) &&
+            equalPath(finalPath(selected.parent.value), extended(parent)) &&
+            fileIdentity(selected.root.value, selected.owner, true, selectedPackage).Stringify() ==
+                selected.rootIdentity.Stringify() &&
+            fileIdentity(selected.parent.value, selected.owner, true, selectedPackage)
+                    .Stringify() == selected.parentIdentity.Stringify(),
+        "execution_owner_unknown");
+    if (!selected.database) {
+      Handle file(CreateFileW(extended(database).c_str(), FILE_READ_ATTRIBUTES | READ_CONTROL,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                              FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+      if (!file)
+        require(GetLastError() == ERROR_FILE_NOT_FOUND, "execution_database_alias");
+      else {
+        require(equalPath(finalPath(file.value), extended(database)), "execution_database_alias");
+        selected.databaseIdentity =
+            fileIdentity(file.value, selected.owner, false, selectedPackage);
+        selected.database = std::move(file);
+      }
+    } else
+      require(equalPath(finalPath(selected.database.value), extended(database)) &&
+                  fileIdentity(selected.database.value, selected.owner, false, selectedPackage)
+                          .Stringify() == selected.databaseIdentity.Stringify(),
+              "execution_database_alias");
+    JsonObject result;
+    num(result, L"schema", 1);
+    flag(result, L"ok", true);
+    str(result, L"root", root);
+    str(result, L"databasePath", database);
+    result.SetNamedValue(L"rootIdentity", selected.rootIdentity);
+    result.SetNamedValue(L"parentIdentity", selected.parentIdentity);
+    if (selected.database)
+      result.SetNamedValue(L"databaseIdentity", selected.databaseIdentity);
+    else
+      result.SetNamedValue(L"databaseIdentity", JsonValue::CreateNullValue());
+    flag(result, L"privateAcl", true);
+    flag(result, L"reparse", false);
+    str(result, L"filesystem", L"NTFS");
+    return result;
+  }
   JsonObject describe(OwnerDirectory &directory) {
     JsonObject result;
     num(result, L"schema", 1);
@@ -415,10 +564,12 @@ struct OwnerStore {
     // A duplicate references that same kernel file object without another open
     // or a share-mode relaxation; its original traversal right is preserved.
     for (auto &entry : directories) {
-      if (!equalPath(entry.second.path, parentPath)) continue;
+      if (!equalPath(entry.second.path, parentPath))
+        continue;
       require(equalPath(finalPath(entry.second.file.value), extended(parentPath)) &&
                   fileIdentity(entry.second.file.value, owner, true).Stringify() ==
-                      entry.second.identity.Stringify(), "execution_owner_unknown");
+                      entry.second.identity.Stringify(),
+              "execution_owner_unknown");
       HANDLE duplicate = nullptr;
       if (!DuplicateHandle(GetCurrentProcess(), entry.second.file.value, GetCurrentProcess(),
                            &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS))
@@ -427,7 +578,8 @@ struct OwnerStore {
       break;
     }
     if (!targetParent)
-      targetParent = canonicalDirectory(parentPath, FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL);
+      targetParent =
+          canonicalDirectory(parentPath, FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL);
     parents.back() = std::move(targetParent);
     auto file = ownerDirectory(path, create, owner);
     auto id = fileIdentity(file.value, owner, true);
@@ -450,6 +602,8 @@ struct OwnerStore {
     return directory;
   }
   JsonObject request(const std::wstring &operation, const JsonObject &input) {
+    if (operation == L"ownerValidateSelectedProfile")
+      return validateSelectedProfile(input);
     if (operation == L"ownerOpenDirectory")
       return open(input);
     // Close remains possible after identity/mutation uncertainty. It only drops
@@ -628,10 +782,12 @@ struct AttributeList {
             "execution_containment_unavailable");
   }
 };
+#include "WindowsNativeCommand.hpp"
 struct Scope;
 static void removeGrants(Scope &scope);
 struct Scope {
-  Handle job, process, thread, pipe, cancel;
+  Handle job, process, thread, pipe, cancel, spool, inputFile, outputFile, errorFile;
+  std::unique_ptr<NativeCommandStore> commands;
   LocalMemory sid, network, pipeDescriptor;
   std::wstring profile, pipeName, cwd;
   DWORD pid = 0;
@@ -652,6 +808,11 @@ struct Scope {
       WaitForSingleObject(process.value, 5000);
     if (reader.joinable())
       reader.join();
+    commands.reset();
+    inputFile.reset();
+    outputFile.reset();
+    errorFile.reset();
+    spool.reset();
     process.reset();
     pipe.reset();
     bool empty = false;
@@ -772,6 +933,12 @@ struct Scope {
     require(exited() && active() == 0, "cleanup_unknown");
     if (reader.joinable())
       reader.join();
+    if (commands)
+      commands->retireAll();
+    inputFile.reset();
+    outputFile.reset();
+    errorFile.reset();
+    spool.reset();
     JsonObject value;
     flag(value, L"empty", true);
     flag(value, L"heldProcessExited", true);
@@ -823,7 +990,7 @@ static void removeGrants(Scope &scope) {
   }
   scope.aclRoots.clear();
 }
-static std::unique_ptr<Scope> launch(const JsonObject &input) {
+static std::unique_ptr<Scope> launch(const JsonObject &input, OwnerStore &owners) {
   auto scope = std::make_unique<Scope>();
   auto nonce = text(input, L"nonce"), lease = text(input, L"leaseOwnerId"),
        executable = text(input, L"executable"), entry = text(input, L"entry");
@@ -881,13 +1048,27 @@ static std::unique_ptr<Scope> launch(const JsonObject &input) {
   require(SetInformationJobObject(scope->job.value, JobObjectExtendedLimitInformation, &limits,
                                   sizeof(limits)) != 0,
           "execution_containment_unavailable");
-  AttributeList attributes(2);
+  auto ownedSpool = owners.createSpool(input, nonce);
+  scope->spool = std::move(ownedSpool.first);
+  scope->commands =
+      std::make_unique<NativeCommandStore>(scope->job.value, scope->sid.value, scope->network.value,
+                                           ownedSpool.second, currentSid(), object(input, L"env"));
+  scope->inputFile = scope->commands->createFile(L"main.stdin", GENERIC_READ);
+  scope->outputFile = scope->commands->createFile(L"main.stdout", GENERIC_WRITE);
+  scope->errorFile = scope->commands->createFile(L"main.stderr", GENERIC_WRITE);
+  HANDLE stdio[] = {scope->inputFile.value, scope->outputFile.value, scope->errorFile.value};
+  AttributeList attributes(3);
   HANDLE job = scope->job.value;
   attributes.set(PROC_THREAD_ATTRIBUTE_JOB_LIST, &job, sizeof(job));
   attributes.set(PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, &capabilities, sizeof(capabilities));
+  attributes.set(PROC_THREAD_ATTRIBUTE_HANDLE_LIST, stdio, sizeof(stdio));
   STARTUPINFOEXW startup{};
   startup.StartupInfo.cb = sizeof(startup);
   startup.lpAttributeList = attributes.get();
+  startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+  startup.StartupInfo.hStdInput = stdio[0];
+  startup.StartupInfo.hStdOutput = stdio[1];
+  startup.StartupInfo.hStdError = stdio[2];
   auto environment = object(input, L"env");
   str(environment, L"OPENCODE_V2_WINDOWS_PIPE", scope->pipeName);
   str(environment, L"OPENCODE_V2_WINDOWS_NONCE", nonce);
@@ -905,7 +1086,7 @@ static std::unique_ptr<Scope> launch(const JsonObject &input) {
   require(block.size() <= 32767, "execution_invalid_response");
   std::wstring command = quote(executable) + L" " + quote(entry);
   PROCESS_INFORMATION process{};
-  require(CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, FALSE,
+  require(CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, TRUE,
                          EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED |
                              CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
                          block.data(), scope->cwd.c_str(), &startup.StartupInfo, &process) != 0,
@@ -980,8 +1161,13 @@ int wmain(int argc, wchar_t **argv) {
             value = identity(process.value, static_cast<DWORD>(raw));
         } else if (operation == L"launch") {
           require(!scope, "execution_containment_unavailable");
-          scope = launch(input);
+          scope = launch(input, owners);
+          owners.selectedPackage = scope->sid.value;
           value = scope->mapping;
+        } else if (operation.rfind(L"command", 0) == 0) {
+          require(scope && scope->commands && !scope->stopping && !scope->exited(),
+                  "execution_native_command_unknown");
+          value = scope->commands->request(operation, input);
         } else if (operation == L"send") {
           require(scope && !scope->stopping && !scope->exited(), "execution_native_unknown");
           scope->send(object(input, L"value"));
