@@ -1,4 +1,4 @@
-name: TEST Windows 110 version ownership diagnostic
+name: TEST Windows 110 compiled catalog admission diagnostic
 on:
   workflow_dispatch:
 permissions:
@@ -25,6 +25,21 @@ jobs:
           persist-credentials: false
           sparse-checkout-cone-mode: false
           sparse-checkout: |
+            /scripts/e2e/opencode-diagnostics/packaged.mjs
+            /scripts/e2e/opencode-diagnostics/platform.mjs
+            /src/main/utils/cliPathMerge.ts
+            /src/main/utils/cliProcessDefaults.ts
+            /src/main/services/runtime/openCodeRuntimeBinaryEnv.ts
+            /src/main/services/runtime/openCodeAutoUpdatePolicy.ts
+            /src/main/services/runtime/providerAwareCliEnv.ts
+            /src/main/services/runtime/buildRuntimeBaseEnv.ts
+            /src/main/services/runtime/providerRuntimeEnv.ts
+            /src/main/services/runtime/agentTeamsMcpLaunchEnv.ts
+            /src/main/services/runtime/ProviderConnectionService.ts
+            /src/main/services/identity/AgentTeamsIdentityStore.ts
+            /src/main/services/infrastructure/ConfigManager.ts
+            /src/main/utils/pathDecoder.ts
+            /src/main/utils/cliEnv.ts
             /scripts/stage-opencode-console-wrapper.mjs
             /tools/opencode-console-wrapper/OpenCodeConsoleWrapper.cs
       - uses: oven-sh/setup-bun@v2
@@ -33,36 +48,48 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: '24'
-      - name: Install immutable frozen dependencies
-        working-directory: runtime
-        run: bun install --frozen-lockfile
-      - name: Apply TEST observation patch and run once
+      - name: Stage immutable published Windows runtime
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:GITHUB_WORKSPACE 'runtime110.zip'
+          Invoke-WebRequest -Uri 'https://github.com/777genius/agent_teams_orchestrator_binaries/releases/download/runtime-v0.0.110/agent-teams-runtime-win32-x64-v0.0.110.zip' -OutFile $zip
+          if ((Get-Item $zip).Length -ne 265993905 -or (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant() -ne '9dd23b817928413b869fd283bc9bd64652ea74c51dbb9e3d31e88c2ede25d462') { throw 'Release archive mismatch' }
+          $resources = Join-Path $env:GITHUB_WORKSPACE 'packaged-root/resources'
+          New-Item -ItemType Directory $resources | Out-Null
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $archive = [IO.Compression.ZipFile]::OpenRead($zip)
+          try {
+            $prefix = [IO.Path]::GetFullPath($resources) + [IO.Path]::DirectorySeparatorChar
+            $names = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+            foreach ($entry in $archive.Entries) {
+              $name = $entry.FullName
+              if (-not $name.StartsWith('runtime/') -or $name.Contains('\') -or $name.Contains(':') -or ($name.Split('/') | Where-Object { $_ -eq '.' -or $_ -eq '..' }).Count) { throw 'Release entry path refused' }
+              $full = [IO.Path]::GetFullPath([IO.Path]::Combine($resources, $name))
+              if (-not $full.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) -or -not $names.Add($name.TrimEnd('/'))) { throw 'Release entry containment/alias refused' }
+              $kind = ($entry.ExternalAttributes -shr 16) -band 0xf000
+              if ($kind -notin @(0, 0x4000, 0x8000)) { throw 'Release link/special entry refused' }
+            }
+          } finally { $archive.Dispose() }
+          [IO.Compression.ZipFile]::ExtractToDirectory($zip, $resources)
+      - name: Prepare exact Product wrapper and observe compiled catalog once
         shell: pwsh
         run: |
           $source = git -C runtime rev-parse HEAD
           if ($source -ne 'd64fda3f249153e1d6a828817343a508053099b9') { throw 'Source mismatch' }
-          # Checkout may convert patch context lines to CRLF; git requires LF patch syntax.
-          $patchPath = Join-Path $env:GITHUB_WORKSPACE 'harness/scripts/diagnostic/windows110-observation.patch'
-          $patchText = [IO.File]::ReadAllText($patchPath).Replace("`r`n", "`n")
-          if ($patchText.Contains("`r")) { throw 'Unexpected patch carriage return' }
-          [IO.File]::WriteAllText($patchPath, $patchText, [Text.UTF8Encoding]::new($false))
-          git -C runtime apply ../harness/scripts/diagnostic/windows110-observation.patch
-          if ($LASTEXITCODE -ne 0) { throw 'Observation patch mismatch' }
-          New-Item -ItemType Directory runtime/scripts/diagnostic -Force | Out-Null
-          Copy-Item harness/scripts/diagnostic/windows110-version-probe.ts runtime/scripts/diagnostic/
-          $env:TEST_SOURCE_COMMIT = $source
           $product = git -C product rev-parse HEAD
           if ($product -ne '209bdab0c2d09c0b14dd186d55a70701fc470712') { throw 'Product source mismatch' }
           node product/scripts/stage-opencode-console-wrapper.mjs --platform win32-x64 --require
           if ($LASTEXITCODE -ne 0) { throw 'Product wrapper build failed' }
+          $env:TEST_SOURCE_COMMIT = $source
           $env:TEST_PRODUCT_SOURCE_COMMIT = $product
+          $env:TEST_PRODUCT_ROOT = "$env:GITHUB_WORKSPACE/product"
+          $env:TEST_RUNTIME_RESOURCES = "$env:GITHUB_WORKSPACE/packaged-root/resources"
+          $env:TEST_RUNTIME_ARCHIVE = "$env:GITHUB_WORKSPACE/runtime110.zip"
           $env:TEST_WRAPPER_EXECUTABLE = "$env:GITHUB_WORKSPACE/product/resources/runtime/opencode-console/opencode.exe"
-          $env:TEST_WRAPPER_SOURCE_FILE = "$env:GITHUB_WORKSPACE/product/tools/opencode-console-wrapper/OpenCodeConsoleWrapper.cs"
-          $env:TEST_WRAPPER_PRODUCER_FILE = "$env:GITHUB_WORKSPACE/product/scripts/stage-opencode-console-wrapper.mjs"
           $env:TEST_VERSION_DIAGNOSTIC_TRACE = "$env:GITHUB_WORKSPACE/version-ownership-trace.jsonl"
           $env:TEST_VERSION_DIAGNOSTIC_RESULT = "$env:GITHUB_WORKSPACE/version-ownership-result.json"
-          bun runtime/scripts/diagnostic/windows110-version-probe.ts
-          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic execution failed' }
+          bun harness/scripts/diagnostic/windows110-version-probe.ts
+          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic contract failed' }
       - name: Preserve finite chronology
         if: always()
         uses: actions/upload-artifact@v4
