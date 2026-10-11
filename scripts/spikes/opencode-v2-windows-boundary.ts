@@ -177,7 +177,8 @@ foreach ($name in $runtimeInputs) {
   $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($sid, $runtimeInputRights, [System.Security.AccessControl.AccessControlType]::Allow))
   Set-Acl -LiteralPath $target -AclObject $acl
   # icacls needs the extended path spelling for nested dependency graphs.
-  $nativeTarget = if ($target.StartsWith('\\?\')) { $target } else { '\\?\' + $target }
+  $extendedPrefix = [string][char]92 + [char]92 + '?' + [char]92
+  $nativeTarget = if ($target.StartsWith($extendedPrefix)) { $target } else { $extendedPrefix + $target }
   & icacls.exe $nativeTarget /setintegritylevel 'L' /Q
   if ($LASTEXITCODE -ne 0) { throw 'TEST runtime input low integrity setup failed' }
 }
