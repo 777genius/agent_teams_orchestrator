@@ -87,7 +87,7 @@ export function createWindowsPipe(name: string, sid: string) {
   check(security.symbols.ConvertStringSecurityDescriptorToSecurityDescriptorW(ptr(text), 1, ptr(descriptor), null), 'pipe security')
   const attributes = Buffer.alloc(24); attributes.writeUInt32LE(24); pointer(attributes, 8, descriptor.readBigUInt64LE())
   const pipeName = utf16(name)
-  const handle = handleValue(kernel.symbols.CreateNamedPipeW(ptr(pipeName), 3 | 0x80000, 1, 1, 65536, 65536, 0, ptr(attributes)))
+  const handle = handleValue(kernel.symbols.CreateNamedPipeW(ptr(pipeName), 3 | 0x80000, 1 | 8, 1, 65536, 65536, 0, ptr(attributes)))
   kernel.symbols.LocalFree(addressOf(descriptor.readBigUInt64LE()))
   check(handle !== 0xffffffffffffffffn, 'CreateNamedPipeW')
   let connected = false

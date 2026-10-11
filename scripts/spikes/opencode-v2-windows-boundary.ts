@@ -21,10 +21,11 @@ if (child) {
   await deny('outsideApprovedWriteDenied', () => writeFile(path.join(base, 'private-canary.txt'), 'escape'))
   await deny('siblingListingDenied', () => readdir(path.join(base, 'private-sibling')))
   await deny('hostStateWriteDenied', () => writeFile(path.join(base, 'host-state', 'secret.txt'), 'escape'))
+  attempts.protectedAclEscapeError = native.attemptWindowsAclEscape(path.join(base, 'work', 'protected'))
+  attempts.protectedFileAclEscapeError = native.attemptWindowsAclEscape(path.join(base, 'work', 'protected', 'owner.json'))
   await deny('protectedWriteDenied', () => writeFile(path.join(base, 'work', 'protected', 'owner.json'), 'escape'))
   await deny('protectedRenameDenied', () => rename(path.join(base, 'work', 'protected'), path.join(base, 'work', 'stolen')))
   await deny('protectedDeleteDenied', () => rm(path.join(base, 'work', 'protected'), { recursive: true }))
-  attempts.protectedAclEscapeError = native.attemptWindowsAclEscape(path.join(base, 'work', 'protected'))
   attempts.readOnlyAclEscapeError = native.attemptWindowsAclEscape(path.join(base, 'readonly'))
   await deny('readOnlyWriteDenied', () => writeFile(path.join(base, 'readonly', 'immutable.txt'), 'escape'))
   await deny('runtimeInputWriteDenied', () => writeFile(path.join(base, 'readonly', 'opencode-v2-windows-boundary.ts'), 'escape'))
@@ -79,7 +80,9 @@ if (child) {
     await cp(path.join(import.meta.dir, 'opencode-v2-windows-native.ts'), path.join(root, 'readonly', 'opencode-v2-windows-native.ts'))
     container = native.createWindowsContainer(profileName)
     evidence.containerSid = container.sid
-    const pipeName = `\\\\.\\pipe\\LOCAL\\agt-${randomUUID()}`
+    // The server is an unsandboxed broker. LOCAL would redirect the AC client
+    // into a different NPFS package namespace, as Chromium's Mojo source notes.
+    const pipeName = `\\\\.\\pipe\\agt-${randomUUID()}`
     pipe = native.createWindowsPipe(pipeName, container.sid)
     // Only TEST-owned paths are ACL modified. Modify omits FILE_DELETE_CHILD;
     // explicit protected denies prohibit its deletion through the writable parent.
@@ -126,8 +129,32 @@ while ($ancestor) {
   if ($parent -eq $ancestor) { break }
   $ancestor = $parent
 }
+# Apply explicit protection after all ancestor inheritance updates. Preserve
+# other trustees, remove only this unique package's writable inherited grants.
+$protectedRights = [System.Security.AccessControl.FileSystemRights]'Write,Delete,DeleteSubdirectoriesAndFiles,ChangePermissions,TakeOwnership'
+$protectedAcls = @()
+foreach ($relative in @('work/protected', 'work/protected/owner.json')) {
+  $target = Join-Path $env:TEST_ROOT $relative
+  $acl = Get-Acl -LiteralPath $target
+  $before = @($acl.Access | Where-Object { $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -eq $sid.Value } | ForEach-Object { @{ rights = [int]$_.FileSystemRights; effect = [string]$_.AccessControlType; inherited = $_.IsInherited } })
+  $acl.SetAccessRuleProtection($true, $true)
+  foreach ($existing in @($acl.Access)) {
+    if ($existing.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -eq $sid.Value -and $existing.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow) { $acl.RemoveAccessRuleSpecific($existing) }
+  }
+  $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($sid, $protectedRights, [System.Security.AccessControl.InheritanceFlags]::None, $none, [System.Security.AccessControl.AccessControlType]::Deny))
+  Set-Acl -LiteralPath $target -AclObject $acl
+  $actual = Get-Acl -LiteralPath $target
+  $after = @($actual.Access | Where-Object { $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -eq $sid.Value } | ForEach-Object { @{ rights = [int]$_.FileSystemRights; effect = [string]$_.AccessControlType; inherited = $_.IsInherited } })
+  $protectedAcls += @{ relative = $relative; before = $before; after = $after; inheritanceProtected = $actual.AreAccessRulesProtected }
+}
+ConvertTo-Json -InputObject $protectedAcls -Depth 5 -Compress | Set-Content -LiteralPath (Join-Path $env:TEST_ROOT 'protected-acl-evidence.json') -Encoding utf8NoBOM
+$workPackageAllows = (Get-Acl -LiteralPath (Join-Path $env:TEST_ROOT 'work')).Access | Where-Object { $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -eq $sid.Value -and $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow }
+foreach ($entry in $workPackageAllows) { if (([int]$entry.FileSystemRights -band 0x40) -ne 0) { throw 'TEST writable parent grants package DELETE_CHILD' } }
 `;
     await runPowerShell(aclScript)
+    evidence.protectedAcls = JSON.parse(await readFile(path.join(root, 'protected-acl-evidence.json'), 'utf8'))
+    await writeFile(path.join(root, 'work', 'protected', 'owner.json'), 'host-owned')
+    evidence.trustedOwnerWrite = true
     evidence.ancestorDirectoryAccessMask = '0x1200a9'
     evidence.runtimeInputMetadataGrant = { files: 2, readAndExecute: true, writeAttributes: true, writeData: false, delete: false, changePermissions: false }
     evidence.ancestorGrantCount = (JSON.parse(await readFile(ancestorJournal, 'utf8')) as unknown[]).length
@@ -159,13 +186,13 @@ while ($ancestor) {
     evidence.activeWithDescendant = launch.active()
     launch.terminate()
     const retiredDeadline = Date.now() + 5000
-    while (launch.active() !== 0 && Date.now() < retiredDeadline) await pause(20)
+    while ((launch.active() !== 0 || !launch.exited()) && Date.now() < retiredDeadline) await pause(20)
     evidence.activeAfterTerminate = launch.active(); evidence.processExited = launch.exited()
     evidence.hostStateRetained = await readFile(path.join(root, 'host-state', 'secret.txt'), 'utf8') === 'host-owned'
     evidence.protectedRetained = await readFile(path.join(root, 'work', 'protected', 'owner.json'), 'utf8') === 'host-owned'
     evidence.readOnlyRetained = await readFile(path.join(root, 'readonly', 'immutable.txt'), 'utf8') === 'host-owned'
     const critical = ['ownedWrite', 'outsideApprovedReadDenied', 'outsideApprovedWriteDenied', 'siblingListingDenied', 'hostStateWriteDenied', 'protectedWriteDenied', 'protectedRenameDenied', 'protectedDeleteDenied', 'readOnlyWriteDenied', 'runtimeInputWriteDenied', 'runtimeHelperWriteDenied']
-    evidence.filesystemPassed = critical.every(key => report.attempts[key] === true) && report.attempts.protectedAclEscapeError === 5 && report.attempts.readOnlyAclEscapeError === 5 && report.attempts.runtimeInputAclEscapeError === 5 && evidence.hostStateRetained && evidence.protectedRetained && evidence.readOnlyRetained
+    evidence.filesystemPassed = critical.every(key => report.attempts[key] === true) && report.attempts.protectedAclEscapeError === 5 && report.attempts.protectedFileAclEscapeError === 5 && report.attempts.readOnlyAclEscapeError === 5 && report.attempts.runtimeInputAclEscapeError === 5 && evidence.hostStateRetained && evidence.protectedRetained && evidence.readOnlyRetained && evidence.trustedOwnerWrite
     evidence.jobPassed = Number(evidence.activeWithDescendant) >= 2 && evidence.activeAfterTerminate === 0 && evidence.processExited && report.attempts.jobBreakawayError === 5
     evidence.dropInLoopbackPassed = evidence.parentHttp === 'native-http-ok'
     evidence.qualified = evidence.filesystemPassed && evidence.jobPassed && evidence.dropInLoopbackPassed
@@ -176,7 +203,7 @@ while ($ancestor) {
       try {
         launch.terminate()
         const deadline = Date.now() + 5000
-        while (launch.active() !== 0 && Date.now() < deadline) await pause(20)
+        while ((launch.active() !== 0 || !launch.exited()) && Date.now() < deadline) await pause(20)
         evidence.cleanupActiveProcesses = launch.active(); evidence.cleanupProcessExited = launch.exited()
         if (evidence.cleanupActiveProcesses !== 0 || !evidence.cleanupProcessExited) throw new Error('TEST native retirement uncertain')
       } catch (error) { cleanupErrors.push(String(error)) }
