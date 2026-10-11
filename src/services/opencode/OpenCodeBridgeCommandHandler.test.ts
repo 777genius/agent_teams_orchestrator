@@ -1066,7 +1066,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
       expect(ready.bridgeProtocol.groupChatProtocolVersion).toBe(1)
       expect(ready.runtime.groupChatRunProof).toEqual({
         teamName: 'team-a', memberName: 'alice', runId: 'run-1', runKey: 'run-1', laneId: 'primary',
-        runtimePid: process.pid, runtimeSessionId: record.opencodeSessionId, processorReady: true,
+        runtimePid: process.pid, runtimeSessionId: record.opencodeSessionId, processorReady: true, groupReactionProtocolVersion: 1,
       })
       expect(Object.hasOwn(ready.runtime, 'groupChatCapabilities')).toBe(false)
       expect(Object.hasOwn(ready.runtime, 'groupRunKey')).toBe(false)

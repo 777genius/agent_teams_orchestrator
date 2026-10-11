@@ -11,6 +11,7 @@ export type OpenCodeGroupChatRunProof = {
   runtimePid: number
   runtimeSessionId: string
   processorReady: true
+  groupReactionProtocolVersion?: 1
 }
 
 // A retained host/session and a fresh tools/list are required. Version labels,
@@ -34,6 +35,6 @@ export function buildOpenCodeGroupChatRunProof(
   return {
     teamName: record.teamId, memberName: record.memberName,
     runId: record.runId, runKey: record.runId, laneId: record.laneId ?? null,
-    runtimePid: pid, runtimeSessionId: record.opencodeSessionId, processorReady: true,
+    runtimePid: pid, runtimeSessionId: record.opencodeSessionId, processorReady: true, groupReactionProtocolVersion: 1,
   }
 }

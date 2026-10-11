@@ -2459,6 +2459,8 @@ function runHeadlessStreaming(
               memberName: groupTurn.memberName,
               groupChatId: groupTurn.message.groupChatId!,
               physicalMessageId: groupTurn.message.messageId,
+              canonicalMessageId: groupTurn.message.groupMessageId,
+              groupRunKey: groupTurn.message.groupRunKey,
             }
             const outcome = findGroupMailboxReplyOutcome(scope)
             const current = getHeadlessGroupContext()
@@ -2949,7 +2951,7 @@ function runHeadlessStreaming(
           teamName: context.teamName,
           memberName: context.memberName,
           processorReady: context.ready,
-          ...(context.ready ? { groupChatProtocolVersion: 1, ...identity } : {}),
+          ...(context.ready ? { groupChatProtocolVersion: 1, groupReactionProtocolVersion: 1, ...identity } : {}),
         }
         const signature = JSON.stringify(capability)
         if (publishedGroupCapability?.path !== path || publishedGroupCapability.signature !== signature) {

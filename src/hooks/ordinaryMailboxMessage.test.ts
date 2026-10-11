@@ -140,7 +140,7 @@ describe('named group mailbox routing', () => {
   })
 })
 
-import { findGroupMailboxReplyOutcome, isCurrentGroupMailboxMessage } from '../utils/groupMailbox.js'
+import { findGroupMailboxReplyOutcome, getCurrentGroupRunIdentity, isCurrentGroupMailboxMessage } from '../utils/groupMailbox.js'
 test('stale run cannot consume group backlog; proactive or private post is not exact reply proof', () => {
   const group = { messageId: 'physical', groupMessageId: 'canonical', groupChatId: '3695a573-5ad2-469a-91f2-427f90792e11', groupChatProtocolVersion: 1 as const, groupRunKey: 'old:10' }
   expect(isCurrentGroupMailboxMessage(group, 'new:20')).toBe(false)
@@ -150,4 +150,78 @@ test('stale run cannot consume group backlog; proactive or private post is not e
   const use = createAssistantMessage({ content: [{ type: 'tool_use', id: 'proactive', name: 'group_chat_send', input: { teamName: 'sandbox', groupChatId: 'ef4a2e64-ce6a-419f-9614-0f5a808762c3', relayOfMessageId: 'physical' } }] as never })
   const result = createUserMessage({ content: [{ type: 'tool_result', tool_use_id: 'proactive', content: 'saved' }] as never })
   expect(findGroupMailboxReplyOutcome({ messages: [submitted, use, result], submitUserMessageUuid: 'submitted', teamName: 'sandbox', groupChatId: '3695a573-5ad2-469a-91f2-427f90792e11', physicalMessageId: 'physical' })).toBe('none')
+})
+
+
+describe('group reaction consumption at the mailbox completion boundary', () => {
+  const inbound = {
+    messageId: '0bdf10f0-3fd3-4494-a974-b394de06c181', groupMessageId: 'b8192a4c-97c8-4f67-bccd-7b29d8131286',
+    groupChatId: '3695a573-5ad2-469a-91f2-427f90792e11', groupChatProtocolVersion: 1 as const,
+    groupRunKey: getCurrentGroupRunIdentity().groupRunKey, from: 'user', text: 'FYI', read: false,
+    timestamp: '2026-10-11T00:00:00Z',
+  }
+  const submitted = createUserMessage({ content: 'group handoff', isMeta: true, uuid: 'reaction-submit' })
+  const attempt = { status: 'in_flight' as const, submittedAt: 1, submitUserMessageUuid: 'reaction-submit', cooldownUntil: 0, timer: null }
+  const args = { teamName: 'sandbox', from: 'alice', groupChatId: inbound.groupChatId, relayOfMessageId: inbound.messageId }
+  const saved = { ...args, saved: true, acknowledged: true, messageId: inbound.groupMessageId, groupRunKey: inbound.groupRunKey }
+  const plain = createAssistantMessage({ content: 'OK' })
+  const useReaction = (input = args) => createAssistantMessage({ content: [
+    { type: 'tool_use', id: 'react', name: 'mcp__agent-teams__group_chat_react', input },
+  ] as never })
+  const reactionResult = (result: unknown, is_error = false) => createUserMessage({ content: [
+    { type: 'tool_result', tool_use_id: 'react', content: JSON.stringify(result), is_error },
+  ] as never })
+  const scope = { submitUserMessageUuid: 'reaction-submit', teamName: 'sandbox', memberName: 'alice',
+    groupChatId: inbound.groupChatId, physicalMessageId: inbound.messageId, canonicalMessageId: inbound.groupMessageId, groupRunKey: inbound.groupRunKey }
+  const complete = (messages: Parameters<typeof getOrdinaryProcessingAction>[0]['messages']) => getOrdinaryProcessingAction({
+    attempt, messages, processingOrdinaryMessage: createPendingMailboxMirrorMessage(inbound, 'session'), teamName: 'sandbox', memberName: 'alice', now: 1000,
+  })
+
+  test('a saved exact current-run acknowledgement consumes the inbound and prevents a plain OK echo', () => {
+    const messages = [submitted, useReaction(), reactionResult(saved), plain]
+    expect(complete(messages)).toEqual({ type: 'finalize' })
+    expect(findGroupMailboxReplyOutcome({ ...scope, messages })).toBe('acknowledged')
+    // Neither another canonical message nor a fresh physical delivery can reuse this proof.
+    expect(findGroupMailboxReplyOutcome({ ...scope, messages, canonicalMessageId: 'fae7d421-dfd0-4bd3-bc0b-2693fd24b344' })).toBe('none')
+    expect(findGroupMailboxReplyOutcome({ ...scope, messages, physicalMessageId: 'fresh-physical' })).toBe('none')
+    expect(findGroupMailboxReplyOutcome({ ...scope, messages, groupRunKey: 'other-run:123' })).toBe('none')
+    const staleMessages = [submitted, useReaction(), reactionResult({ ...saved, groupRunKey: 'old-run:123' }), plain]
+    expect(findGroupMailboxReplyOutcome({ ...scope, messages: staleMessages, groupRunKey: 'old-run:123' })).toBe('none')
+  })
+
+  test('failed, pending, malformed and unrelated reactions retain ordinary group text fallback', () => {
+    const cases = [
+      [useReaction(), reactionResult(saved, true)],
+      [useReaction()],
+      [useReaction(), reactionResult({ ...saved, saved: false })],
+      [useReaction(), reactionResult({ ...saved, acknowledged: false })],
+      [useReaction(), reactionResult({ ...saved, from: 'bob' })],
+      [useReaction(), reactionResult({ ...saved, teamName: 'another-team' })],
+      [useReaction(), reactionResult({ ...saved, groupChatId: 'ef4a2e64-ce6a-419f-9614-0f5a808762c3' })],
+      [useReaction(), reactionResult({ ...saved, relayOfMessageId: 'another-physical' })],
+      [useReaction(), reactionResult({ ...saved, messageId: 'not-a-UUID' })],
+      [useReaction(), reactionResult({ ...saved, groupRunKey: 'old-run:123' })],
+      [useReaction({ ...args, from: 'bob' }), reactionResult(saved)],
+      [useReaction(), reactionResult('unverifiable')],
+    ]
+    for (const toolMessages of cases) {
+      const messages = [submitted, ...toolMessages, plain]
+      expect(findGroupMailboxReplyOutcome({ ...scope, messages })).toBe('none')
+      expect(complete(messages)).toEqual({ type: 'deliver_assistant_text', text: 'OK' })
+    }
+  })
+
+  test('an explicit substantive group send remains authoritative after a successful reaction', () => {
+    const messageId = 'fae7d421-dfd0-4bd3-bc0b-2693fd24b344'
+    const send = createAssistantMessage({ content: [
+      { type: 'tool_use', id: 'send', name: 'group_chat_send', input: { ...args, messageId, text: 'I found a blocking issue' } },
+    ] as never })
+    const sent = createUserMessage({ content: [
+      { type: 'tool_result', tool_use_id: 'send', content: JSON.stringify({ saved: true, groupChatId: inbound.groupChatId, relayOfMessageId: inbound.messageId, groupMessageId: messageId }) },
+    ] as never })
+    const messages = [submitted, useReaction(), reactionResult(saved), send, sent, plain]
+    expect(findGroupMailboxReplyOutcome({ ...scope, messages })).toBe('sent')
+    expect(findGroupMailboxReplyOutcome({ ...scope, messages: [submitted, useReaction(), reactionResult(saved), send] })).toBe('pending')
+    expect(complete(messages).type).toBe('finalize')
+  })
 })

@@ -17,6 +17,7 @@ export type WorkSyncAdmissionCapability = {
   generation: number
   processorReady: true
   groupChatProtocolVersion?: 1
+  groupReactionProtocolVersion?: 1
   groupRunKey?: string
   runKey?: string
   bootstrapRunId?: string

@@ -169,7 +169,7 @@ jobs:
         run: bun test src/services/codexNative/replApprovalTransport.test.ts src/services/codexNative/replTurnBridge.test.ts src/services/codexNative/appServerRunner.test.ts
 
       - name: Test mailbox publications and lifecycle
-        run: bun test src/utils/teammateMailbox.test.ts
+        run: bun test src/utils/teammateMailbox.test.ts src/hooks/ordinaryMailboxMessage.test.ts src/cli/print.groupMailbox.test.ts
 
       - name: Test task change ledger
         run: bun run test:task-change-ledger

@@ -23,6 +23,8 @@ export function hasGroupMailboxMarker(message: unknown): boolean {
   ].some(key => Object.prototype.hasOwnProperty.call(message, key))
 }
 
+const isGroupMailboxUuid = (value: unknown): value is string => typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)
+
 // Same 10 MiB source budget as the app inbox/history owner. No repair or truncation.
 export const GROUP_MAILBOX_SOURCE_MAX_BYTES = 10 * 1024 * 1024
 
@@ -35,11 +37,10 @@ export function assertValidGroupMailboxRows(rows: unknown[]): void {
     counts.set(id, (counts.get(id) ?? 0) + 1)
   }
   const nonempty = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0
-  const uuid = (value: unknown): boolean => typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)
   for (const value of rows) {
     if (!hasGroupMailboxMarker(value)) continue
     const row = value as Record<string, unknown>
-    if (!uuid(row.groupChatId) || !uuid(row.groupMessageId) || !nonempty(row.messageId) ||
+    if (!isGroupMailboxUuid(row.groupChatId) || !isGroupMailboxUuid(row.groupMessageId) || !nonempty(row.messageId) ||
         row.groupChatProtocolVersion !== 1 || !nonempty(row.from) || typeof row.text !== 'string' ||
         !nonempty(row.timestamp) || !Number.isFinite(Date.parse(row.timestamp)) || typeof row.read !== 'boolean' ||
         (row.groupChatName !== undefined && !nonempty(row.groupChatName)) ||
@@ -135,7 +136,7 @@ export function isCurrentGroupMailboxMessage(message: GroupMailboxEnvelope & { m
     message.groupRunKey === runKey
 }
 
-export function isGroupToolName(name: string, tool: 'group_chat_list' | 'group_chat_send'): boolean {
+export function isGroupToolName(name: string, tool: 'group_chat_list' | 'group_chat_send' | 'group_chat_react'): boolean {
   return name === tool || ['agent-teams_', 'agent_teams_', 'mcp__agent-teams__', 'mcp__agent_teams__'].some(prefix => name === `${prefix}${tool}`)
 }
 
@@ -154,27 +155,41 @@ export function buildGroupMailboxPrompt(message: GroupMailboxEnvelope & {
     `Canonical message ID: ${JSON.stringify(message.groupMessageId)}. Physical inbound ID: ${JSON.stringify(message.messageId)}.`,
     `First call group_chat_list (or mcp__agent-teams__group_chat_list) with teamName=${JSON.stringify(teamName)}, from=${JSON.stringify(memberName)} for the fresh group catalog. An unavailable catalog does not mean no groups exist.`,
     `If a reply is needed, call group_chat_send (or mcp__agent-teams__group_chat_send) with ${JSON.stringify({ teamName, from: memberName, groupChatId: message.groupChatId, messageId: '<new UUID, reused only for retry of this exact post>', relayOfMessageId: message.messageId, text: '<reply>' })}.`,
+    `For an optional informational acknowledgement, call group_chat_react (or mcp__agent-teams__group_chat_react) with ${JSON.stringify({ teamName, from: memberName, groupChatId: message.groupChatId, relayOfMessageId: message.messageId })}. After success stop; never send an extra OK or answer a reaction. Still use group_chat_send for requested or substantive replies.`,
     'Do not reply with SendMessage or message_send to user. They are private-message tools. Do not guess a last group or redirect a blocked group reply to a private chat.',
-    'An archived, not-member, invalid-relay, or unavailable result is blocked: stop this reply attempt. Do not retry with another destination. A peer FYI needs no acknowledgement.',
+    'An archived, not-member, invalid-relay, or unavailable result is blocked: stop this reply attempt. Do not retry with another destination. A peer FYI needs no text acknowledgement.',
     'You may proactively post in any active group you belong to after a fresh group_chat_list. A proactive post in another group does not reply to this inbound.',
     '<queued_mailbox_message>', message.text, '</queued_mailbox_message>',
   ].join('\n')
 }
 
-/** Only a completed tool for this exact group + physical inbound proves a reply. */
+/** Completed sends and acknowledgements consume only their exact group inbound. */
 export function findGroupMailboxReplyOutcome(input: {
   messages: AppState['messages']; submitUserMessageUuid: string; teamName?: string;
-  groupChatId: string; physicalMessageId: string; memberName?: string
-}): 'sent' | 'blocked' | 'pending' | 'none' {
+  groupChatId: string; physicalMessageId: string; memberName?: string;
+  canonicalMessageId?: string; groupRunKey?: string
+}): 'sent' | 'acknowledged' | 'blocked' | 'pending' | 'none' {
   const start = input.messages.findIndex(message => message.type === 'user' && message.uuid === input.submitUserMessageUuid)
   if (start < 0) return 'none'
   const matching = new Map<string, string>()
+  const reactions = new Set<string>()
+  let acknowledged = false
+  const canAcknowledge = !!input.teamName?.trim() && !!input.memberName?.trim() &&
+    isGroupMailboxUuid(input.groupChatId) && isGroupMailboxUuid(input.canonicalMessageId) &&
+    !!input.physicalMessageId.trim() && input.physicalMessageId !== input.canonicalMessageId &&
+    input.groupRunKey === getCurrentGroupRunIdentity().groupRunKey
   for (const message of input.messages.slice(start + 1)) {
     if (message.type === 'assistant') {
       for (const block of message.message.content) {
-        if (block.type !== 'tool_use' || !isGroupToolName(block.name, 'group_chat_send')) continue
+        if (block.type !== 'tool_use') continue
+        const send = isGroupToolName(block.name, 'group_chat_send')
+        const react = isGroupToolName(block.name, 'group_chat_react')
+        if (!send && !react) continue
         const args = block.input as Record<string, unknown> | null
-        if (args && typeof args.messageId === 'string' && args.groupChatId === input.groupChatId && args.relayOfMessageId === input.physicalMessageId && args.teamName === input.teamName && (!input.memberName || args.from === input.memberName)) matching.set(block.id, args.messageId)
+        if (!args || args.groupChatId !== input.groupChatId || args.relayOfMessageId !== input.physicalMessageId ||
+            args.teamName !== input.teamName || (input.memberName && args.from !== input.memberName)) continue
+        if (send && typeof args.messageId === 'string') matching.set(block.id, args.messageId)
+        if (react && canAcknowledge && args.from === input.memberName) reactions.add(block.id)
       }
     } else if (message.type === 'user') {
       if (!Array.isArray(message.message.content)) break
@@ -182,11 +197,26 @@ export function findGroupMailboxReplyOutcome(input: {
       for (const block of message.message.content) {
         if (block.type !== 'tool_result') continue
         sawToolResult = true
-        if (!matching.has(block.tool_use_id)) continue
-        // Structured errors are terminal; no private fallback or speculative repair.
-        if (block.is_error === true) return 'blocked'
+        if (!matching.has(block.tool_use_id) && !reactions.has(block.tool_use_id)) continue
         const texts = typeof block.content === 'string' ? [block.content] :
           Array.isArray(block.content) ? block.content.flatMap(part => part.type === 'text' ? [part.text] : []) : []
+        if (reactions.has(block.tool_use_id)) {
+          // Failed, pending or unverifiable reactions leave the prior fallback intact.
+          if (block.is_error === true) continue
+          for (const text of texts) {
+            try {
+              const result = JSON.parse(text)
+              if (result.saved === true && result.acknowledged === true &&
+                  result.teamName === input.teamName && result.from === input.memberName &&
+                  result.groupChatId === input.groupChatId && result.messageId === input.canonicalMessageId &&
+                  result.relayOfMessageId === input.physicalMessageId && result.groupRunKey === input.groupRunKey) acknowledged = true
+            } catch { /* No exact committed consumption proof. */ }
+          }
+          // Keep scanning: explicit substantive sends remain authoritative.
+          continue
+        }
+        // Structured errors are terminal; no private fallback or speculative repair.
+        if (block.is_error === true) return 'blocked'
         for (const text of texts) {
           try {
             const result = JSON.parse(text)
@@ -200,7 +230,7 @@ export function findGroupMailboxReplyOutcome(input: {
       if (!sawToolResult) break
     }
   }
-  return matching.size > 0 ? 'pending' : 'none'
+  return matching.size > 0 ? 'pending' : acknowledged ? 'acknowledged' : 'none'
 }
 
 export function hasConflictingGroupReplyScope(input: {

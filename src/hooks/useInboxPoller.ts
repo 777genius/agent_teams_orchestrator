@@ -1969,9 +1969,11 @@ export function getOrdinaryProcessingAction({
       messages, submitUserMessageUuid: attempt.submitUserMessageUuid, teamName,
       groupChatId: processingOrdinaryMessage.groupChatId!,
       physicalMessageId: processingOrdinaryMessage.messageId,
+      canonicalMessageId: processingOrdinaryMessage.groupMessageId,
+      groupRunKey: processingOrdinaryMessage.groupRunKey,
       memberName,
     })
-    if (groupOutcome === 'sent' || groupOutcome === 'blocked') return { type: 'finalize' }
+    if (groupOutcome === 'sent' || groupOutcome === 'acknowledged' || groupOutcome === 'blocked') return { type: 'finalize' }
     if (groupOutcome === 'pending') return { type: 'noop' }
     if (hasConflictingGroupReplyScope({ messages, submitUserMessageUuid: attempt.submitUserMessageUuid, groupChatId: processingOrdinaryMessage.groupChatId!, physicalMessageId: processingOrdinaryMessage.messageId, teamName, memberName })) {
       logForDebugging('[InboxPoller] Ambiguous group turn: no inferred reply destination or private fallback')
