@@ -236,7 +236,8 @@ static Handle canonicalDirectory(const std::wstring &value,
   Handle handle(CreateFileW(full.c_str(), access, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                             OPEN_EXISTING,
                             FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
-  require(static_cast<bool>(handle), "execution_owner_unknown");
+  if (!handle)
+    throw NativeError{"execution_owner_unknown", GetLastError(), "owner_canonical_open"};
   FILE_ATTRIBUTE_TAG_INFO tag{};
   require(GetFileInformationByHandleEx(handle.value, FileAttributeTagInfo, &tag, sizeof(tag)) &&
               (tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
@@ -366,7 +367,14 @@ static Handle ownerDirectory(const std::wstring &path, bool create, const std::w
                  &attributes, &status, nullptr, FILE_ATTRIBUTE_DIRECTORY,
                  FILE_SHARE_READ | FILE_SHARE_WRITE | (create ? 0 : FILE_SHARE_DELETE),
                  create ? 2 : 1, 0x1 | 0x2 | 0x20 | 0x200000, nullptr, 0);
-  require(result >= 0, "execution_owner_unknown");
+  if (result != 0 || status.Status != 0) {
+    auto statusError = reinterpret_cast<NtStatusErrorFunction>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlNtStatusToDosError"));
+    auto native = result != 0 ? result : status.Status;
+    throw NativeError{"execution_owner_unknown", statusError ? statusError(native) : 0,
+                      create ? "owner_directory_create" : "owner_directory_open",
+                      static_cast<DWORD>(native)};
+  }
   Handle handle(raw);
   require(equalPath(finalPath(handle.value), checked), "execution_path_alias");
   directoryMode(handle.value);
@@ -474,14 +482,15 @@ struct OwnerStore {
                           "owner_archive_nt_rename",
                           static_cast<DWORD>(status != 0 ? status : completion.Status)};
       directory.path = destination;
-      require(equalPath(finalPath(directory.file.value), extended(destination)) &&
-                  fileIdentity(directory.file.value, directory.owner, true).Stringify() ==
-                      directory.identity.Stringify(),
-              "execution_owner_unknown");
+      require(equalPath(finalPath(directory.file.value), extended(destination)),
+              "execution_owner_archive_path_mismatch");
+      require(fileIdentity(directory.file.value, directory.owner, true).Stringify() ==
+                  directory.identity.Stringify(),
+              "execution_owner_archive_identity_mismatch");
       auto reopened = ownerDirectory(destination, false, directory.owner);
       require(fileIdentity(reopened.value, directory.owner, true).Stringify() ==
                   directory.identity.Stringify(),
-              "execution_owner_unknown");
+              "execution_owner_archive_reopen_identity_mismatch");
       result = describe(directory);
       flag(result, L"writeThrough", true);
       flag(result, L"noReplace", true);

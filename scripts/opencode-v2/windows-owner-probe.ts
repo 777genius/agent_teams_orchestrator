@@ -12,7 +12,8 @@ assert.ok(requestedRoot && path.win32.isAbsolute(requestedRoot))
 assert.match(path.win32.basename(requestedRoot), /^TEST-windows-owner-[a-zA-Z0-9-]+$/)
 const broker = createWindowsNativeBroker(await resolveWindowsNativeArtifact())
 broker.events.on('error', () => {})
-const filesystem = createWindowsOwnerFilesystem(request => broker.request(request.op, request))
+let lastOperation = 'none'
+const filesystem = createWindowsOwnerFilesystem(request => { lastOperation = request.op; return broker.request(request.op, request) })
 const handles: WindowsOwnerDirectory[] = []
 const retain = (handle: WindowsOwnerDirectory): WindowsOwnerDirectory => { handles.push(handle); return handle }
 const lease = 'b04ca87c-d84d-4b55-a89a-9c8fa7bd1f16'
@@ -63,7 +64,7 @@ try {
     originalPathFreeForNewFence: true, nextIdentity: next.identity,
     noReplaceCollisionPreserved: true, partialFenceBlocksAcquisition: true,
     existingRecordNotOverwritten: true, readOnlyReopenCannotMutate: true })
-} catch (error) { failure = error }
+} catch (error) { failure = error; facts.failedOperation = lastOperation }
 finally {
   const closeFailures: string[] = []
   for (const handle of handles.reverse()) {
