@@ -9,6 +9,7 @@ import type { OpenCodeOAuthNativeProbeOwner } from './OpenCodeAuthStore.js'
 import { createHash, randomUUID } from 'node:crypto'
 import { readFile, stat } from 'node:fs/promises'
 import nodePath from 'node:path'
+import { formatOpenCodeLockFailure, safeOpenCodeLockFailure } from './OpenCodeLockFailure.js'
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
@@ -6187,6 +6188,7 @@ async function handleEnvelope(
   }
 }
 
+
 export async function executeOpenCodeBridgeCommandEnvelope(
   input: unknown,
   options: { signal?: AbortSignal } = {},
@@ -6239,14 +6241,18 @@ export async function executeOpenCodeBridgeCommandEnvelope(
         : 'confirmedStopRuntime' in result ? result.confirmedStopRuntime : undefined)
   } catch (error) {
     const deadlineError = isOpenCodeRuntimeDeadlineError(error) ? error : null
+    const lockFailure = deadlineError ? null : safeOpenCodeLockFailure(error)
+    const message = lockFailure
+      ? formatOpenCodeLockFailure(lockFailure)
+      : error instanceof Error ? error.message : String(error)
     return failure(
       envelope,
       deadlineError ? 'timeout' : 'provider_error',
-      error instanceof Error ? error.message : String(error),
+      message,
       startedAtMs,
       true,
-      [diagnostic(error instanceof Error ? error.message : String(error), 'error')],
-      deadlineError?.toDetails(),
+      [diagnostic(message, 'error')],
+      deadlineError?.toDetails() ?? lockFailure ?? undefined,
     )
   } finally {
     runtimeDeadline?.dispose()

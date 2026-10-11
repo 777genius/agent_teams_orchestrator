@@ -285,7 +285,7 @@ async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: O
       if (owner) executionAssert(owner.members.every(member => member.selectedModel === `${selection.model.providerID}/${selection.model.id}`), 'run_selected_model_changed')
       const qualified = owner !== null && openCodeV2SupportedSourcePredicate(owner)
       const sourceCapabilities = { teamLaunch: true, memberSession: qualified, permission: false }
-      const probe = await resolveOpenCodeV2ExecutionProbe(envelope, selection, envelope.command === 'opencode.readiness' && body.requireExecutionProbe === true)
+      const probe = await resolveOpenCodeV2ExecutionProbe(envelope, selection, envelope.command === 'opencode.readiness' && body.requireExecutionProbe === true, { unattendedTeam: true })
       measured = owner?.qualification ?? { capabilitySnapshotId: selection.capabilitySnapshotId,
         expectedBehaviorFingerprint: probe.proof?.expectedBehaviorEvidence.expectedBehaviorFingerprint ?? '',
         binaryPath: probe.proof?.binaryPath ?? selection.native.executablePath,
