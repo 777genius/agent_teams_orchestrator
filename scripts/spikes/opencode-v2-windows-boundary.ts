@@ -78,7 +78,10 @@ if (child) {
       attempts[`spawnProbe_${mode}`] = JSON.stringify({ ...probe, markerMatchesHeldPID: receipt?.probePID === probe.pid, receipt })
     } catch (error) { attempts[`spawnProbe_${mode}`] = String(error) }
   }
-  attempts.jobBreakawayError = native.attemptWindowsJobBreakaway(process.execPath)
+  const breakaway = native.attemptWindowsJobBreakaway(process.execPath)
+  attempts.jobBreakawayError = breakaway.error
+  attempts.jobBreakawayReceipt = JSON.stringify(breakaway)
+  attempts.jobBreakawayContained = breakaway.error === 5 || ('outerJobContained' in breakaway && breakaway.outerJobContained && breakaway.candidateRetired && breakaway.neverResumed)
   } catch (error) { attempts.childStartupError = String(error); console.error(JSON.stringify({ childStartupError: String(error) })) }
   // Named pipe carries the probe response without admin loopback exemptions.
   console.log(JSON.stringify({ pid: process.pid, baseUrl, attempts }))
@@ -236,7 +239,7 @@ foreach ($entry in $workPackageAllows) { if (([int]$entry.FileSystemRights -band
     evidence.readOnlyRetained = await readFile(path.join(root, 'readonly', 'immutable.txt'), 'utf8') === 'host-owned'
     const critical = ['ownedWrite', 'outsideApprovedReadDenied', 'outsideApprovedWriteDenied', 'siblingListingDenied', 'hostStateWriteDenied', 'protectedWriteDenied', 'protectedRenameDenied', 'protectedDeleteDenied', 'readOnlyWriteDenied', 'runtimeInputWriteDenied', 'runtimeHelperWriteDenied']
     evidence.filesystemPassed = critical.every(key => report.attempts[key] === true) && report.attempts.protectedAclEscapeError === 5 && report.attempts.protectedFileAclEscapeError === 5 && report.attempts.readOnlyAclEscapeError === 5 && report.attempts.runtimeInputAclEscapeError === 5 && evidence.hostStateRetained && evidence.protectedRetained && evidence.readOnlyRetained && evidence.trustedOwnerWrite
-    evidence.jobPassed = Number(evidence.activeWithDescendant) >= 2 && report.attempts.nativeDescendantInheritedJob === true && report.attempts.nativeDescendantBunStarted === true && evidence.activeAfterTerminate === 0 && evidence.processExited && report.attempts.jobBreakawayError === 5
+    evidence.jobPassed = Number(evidence.activeWithDescendant) >= 2 && report.attempts.nativeDescendantInheritedJob === true && report.attempts.nativeDescendantBunStarted === true && evidence.activeAfterTerminate === 0 && evidence.processExited && report.attempts.jobBreakawayContained === true
     evidence.dropInLoopbackPassed = evidence.parentHttp === 'native-http-ok'
     evidence.qualified = evidence.filesystemPassed && evidence.jobPassed && evidence.dropInLoopbackPassed
   } catch (error) { evidence.error = String(error); evidence.qualified = false }

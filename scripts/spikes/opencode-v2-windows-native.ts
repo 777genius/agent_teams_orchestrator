@@ -18,6 +18,8 @@ const kernel = dlopen('kernel32.dll', {
   GetProcessTimes: { args: [h, p, p, p, p], returns: b },
   GetExitCodeProcess: { args: [h, p], returns: b },
   IsProcessInJob: { args: [h, h, p], returns: b },
+  GetCurrentProcess: { args: [], returns: h },
+  DuplicateHandle: { args: [h, h, h, p, d, b, d], returns: b },
   CreateFileW: { args: [p, d, d, p, d, d, h], returns: h },
   CloseHandle: { args: [h], returns: b },
   GetLastError: { args: [], returns: d },
@@ -72,16 +74,39 @@ export function attemptWindowsAclEscape(target: string): number {
   const bytes = utf16(target)
   return security.symbols.SetNamedSecurityInfoW(ptr(bytes), 1, 4, null, null, null, null)
 }
-export function attemptWindowsJobBreakaway(executable: string): number {
+function testOuterJob() {
+  const text = process.env.TEST_OUTER_JOB_QUERY_HANDLE
+  if (!text || !/^\d+$/.test(text) || BigInt(text) === 0n) throw new Error('TEST exact outer Job query handle missing')
+  return BigInt(text)
+}
+export function attemptWindowsJobBreakaway(executable: string) {
   const executableBytes = utf16(executable), command = utf16(`"${executable}" -e "setInterval(()=>{},1000)"`)
   const startup = Buffer.alloc(104); startup.writeUInt32LE(104)
   const info = Buffer.alloc(24)
-  if (!kernel.symbols.CreateProcessW(ptr(executableBytes), ptr(command), null, null, false, 0x01000000 | 0x08000000, null, null, ptr(startup), ptr(info))) return kernel.symbols.GetLastError()
-  // A successful bypass is a failed test; cleanup uses only the acquired handles.
+  if (!kernel.symbols.CreateProcessW(ptr(executableBytes), ptr(command), null, null, false, 4 | 0x01000000 | 0x08000000, null, null, ptr(startup), ptr(info))) return { error: kernel.symbols.GetLastError(), neverResumed: true }
+  // Nested libuv Jobs permit inner breakaway. Check the exact outer Job while
+  // suspended, never execute candidate code, and retire through acquired handles.
   const processHandle = info.readBigUInt64LE(), thread = info.readBigUInt64LE(8)
-  try { check(kernel.symbols.TerminateProcess(processHandle, 99), 'cleanup escaped TEST process') }
-  finally { kernel.symbols.CloseHandle(thread); kernel.symbols.CloseHandle(processHandle) }
-  return 0
+  const errors: unknown[] = []
+  let result: { error: number; pid: number; birthFiletime: string; outerJobContained: boolean; neverResumed: true; candidateRetired: boolean } | undefined
+  try {
+    const membership = Buffer.alloc(4), creation = Buffer.alloc(8), exit = Buffer.alloc(8), kernelTime = Buffer.alloc(8), userTime = Buffer.alloc(8)
+    check(kernel.symbols.GetProcessTimes(processHandle, ptr(creation), ptr(exit), ptr(kernelTime), ptr(userTime)), 'TEST breakaway held birth')
+    check(kernel.symbols.IsProcessInJob(processHandle, testOuterJob(), ptr(membership)), 'TEST breakaway exact outer Job')
+    result = { error: 0, pid: info.readUInt32LE(16), birthFiletime: creation.readBigUInt64LE().toString(), outerJobContained: membership.readUInt32LE() === 1, neverResumed: true, candidateRetired: false }
+  } catch (error) { errors.push(error) }
+  finally {
+    try {
+      check(kernel.symbols.TerminateProcess(processHandle, 99), 'terminate suspended TEST breakaway candidate')
+      check(kernel.symbols.WaitForSingleObject(processHandle, 5000) === 0, 'wait TEST breakaway candidate retirement')
+      if (result) result.candidateRetired = true
+    } catch (error) { errors.push(error) }
+    try { check(kernel.symbols.CloseHandle(thread), 'CloseHandle:TEST breakaway thread') } catch (error) { errors.push(error) }
+    try { check(kernel.symbols.CloseHandle(processHandle), 'CloseHandle:TEST breakaway process') } catch (error) { errors.push(error) }
+  }
+  if (errors.length) throw new AggregateError(errors, 'TEST breakaway validation or retirement failed')
+  if (!result) throw new Error('TEST breakaway result missing')
+  return result
 }
 export function probeWindowsNulAccess() {
   const name = utf16('NUL'), attributes = Buffer.alloc(24)
@@ -109,7 +134,7 @@ export function launchWindowsNativeDescendant(executable: string, markerPath: st
   let result: { pid: number; birthFiletime: string; inheritedJob: true; timedOut?: boolean; exitCode?: number } | undefined
   try {
     const inJob = Buffer.alloc(4)
-    check(kernel.symbols.IsProcessInJob(processHandle, 0n, ptr(inJob)) && inJob.readUInt32LE() === 1, 'TEST descendant inherited Job')
+    check(kernel.symbols.IsProcessInJob(processHandle, testOuterJob(), ptr(inJob)) && inJob.readUInt32LE() === 1, 'TEST descendant inherited exact outer Job')
     const creation = Buffer.alloc(8), exit = Buffer.alloc(8), kernelTime = Buffer.alloc(8), userTime = Buffer.alloc(8)
     check(kernel.symbols.GetProcessTimes(processHandle, ptr(creation), ptr(exit), ptr(kernelTime), ptr(userTime)), 'TEST descendant birth')
     check(kernel.symbols.ResumeThread(thread) === 1, 'TEST descendant resume')
@@ -199,7 +224,8 @@ export function launchWindowsContainer(input: { containerSid: number; executable
   check(kernel.symbols.UpdateProcThreadAttribute(ptr(attributes), 0, 0x20009n, ptr(caps), caps.length, null, null), 'security capabilities')
   check(kernel.symbols.UpdateProcThreadAttribute(ptr(attributes), 0, 0x2000dn, ptr(jobs), jobs.length, null, null), 'job list')
   const startup = Buffer.alloc(112); startup.writeUInt32LE(112); pointer(startup, 104, ptr(attributes))
-  // Only these two TEST-owned handles can cross the process boundary.
+  // Only TEST stdio and an exact JOB_OBJECT_QUERY(4) duplicate cross this
+  // checkpoint boundary. The query duplicate is TEST-only, never production.
   const inheritable = Buffer.alloc(24); inheritable.writeUInt32LE(24); inheritable.writeUInt32LE(1, 16)
   const outputPath = utf16(input.outputPath), nullPath = utf16('NUL')
   const openStdio = (file: Buffer, access: number, disposition: number) => {
@@ -208,7 +234,10 @@ export function launchWindowsContainer(input: { containerSid: number; executable
     stdioHandles.push(handle); return handle
   }
   const stdout = openStdio(outputPath, 0x40000000, 2), stdin = openStdio(nullPath, 0x80000000, 3)
-  const handles = Buffer.alloc(16); pointer(handles, 0, stdout); pointer(handles, 8, stdin)
+  const queryOutput = Buffer.alloc(8), current = handleValue(kernel.symbols.GetCurrentProcess())
+  check(kernel.symbols.DuplicateHandle(current, job, current, ptr(queryOutput), 4, true, 0), 'DuplicateHandle:TEST outer Job query-only')
+  const queryJob = queryOutput.readBigUInt64LE(); stdioHandles.push(queryJob)
+  const handles = Buffer.alloc(24); pointer(handles, 0, stdout); pointer(handles, 8, stdin); pointer(handles, 16, queryJob)
   backing.push(inheritable, outputPath, nullPath, handles)
   check(kernel.symbols.UpdateProcThreadAttribute(ptr(attributes), 0, 0x20002n, ptr(handles), handles.length, null, null), 'TEST stdio handle list')
   startup.writeUInt32LE(0x100, 60); pointer(startup, 80, stdin); pointer(startup, 88, stdout); pointer(startup, 96, stdout)
@@ -216,7 +245,7 @@ export function launchWindowsContainer(input: { containerSid: number; executable
   // Windows CommandLineToArgvW-compatible quoting, including terminal backslashes.
   const quote = (argument: string) => '"' + argument.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\+)$/g, '$1$1') + '"'
   const command = utf16([input.executable, ...input.arguments].map(quote).join(' '))
-  const environment = Buffer.from(Object.entries(input.env).sort(([a], [b]) => a.localeCompare(b)).map(([key, value]) => `${key}=${value}\0`).join('') + '\0', 'utf16le')
+  const environment = Buffer.from(Object.entries({ ...input.env, TEST_OUTER_JOB_QUERY_HANDLE: queryJob.toString() }).sort(([a], [b]) => a.localeCompare(b)).map(([key, value]) => `${key}=${value}\0`).join('') + '\0', 'utf16le')
   const doubleNull = environment.length >= 4 && environment.readUInt32LE(environment.length - 4) === 0
   input.onEnvironmentShape?.({ unicode: true, doubleNull, bytes: environment.length })
   check(doubleNull, 'Unicode environment termination')
