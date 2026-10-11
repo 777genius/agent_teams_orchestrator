@@ -1,5 +1,5 @@
 import path from 'node:path'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { cp, mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
 import { createConnection } from 'node:net'
 
@@ -8,6 +8,9 @@ const native = await import('./opencode-v2-windows-native.ts')
 const httpCheckpoint = await import('./windows-http-bridge/checkpoint.ts')
 const pause = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms))
 const officialShellMode = process.env.TEST_WINDOWS_OFFICIAL_SHELL === '1'
+const resolverPrimitiveMode = process.env.TEST_WINDOWS_RESOLVER_PRIMITIVE === '1'
+const resolverDiagnosticsMode = officialShellMode || resolverPrimitiveMode
+if (officialShellMode && resolverPrimitiveMode) throw new Error('TEST resolver primitive cannot qualify official Shell')
 const child = process.argv[2] === 'child'
 async function probeOfficialGraphNativeAccess(targets: ReadonlyMap<string, boolean>) {
   const { dlopen, FFIType, ptr } = await import('bun:ffi')
@@ -15,6 +18,7 @@ async function probeOfficialGraphNativeAccess(targets: ReadonlyMap<string, boole
     GetFileAttributesW: { args: [FFIType.ptr], returns: FFIType.u32 },
     CreateFileW: { args: [FFIType.ptr, FFIType.u32, FFIType.u32, FFIType.ptr, FFIType.u32, FFIType.u32, FFIType.u64], returns: FFIType.u64 },
     CloseHandle: { args: [FFIType.u64], returns: FFIType.bool },
+    ReadFile: { args: [FFIType.u64, FFIType.ptr, FFIType.u32, FFIType.ptr, FFIType.ptr], returns: FFIType.bool },
     GetLastError: { args: [], returns: FFIType.u32 },
   })
   const nt = dlopen('ntdll.dll', {
@@ -57,7 +61,44 @@ async function probeOfficialGraphNativeAccess(targets: ReadonlyMap<string, boole
               // FILE_OPEN, FILE_SYNCHRONOUS_IO_NONALERT, no case-insensitive flag.
               const relative = nt.symbols.NtCreateFile(ptr(leafHandle), 0x80120100, ptr(leafObject), ptr(leafIo), null, 0x80, 7, 1, 0x20, null, 0)
               result.bunNtRelativePackageOpen = { status: statusHex(relative), opened: relative >= 0 }
-              if (relative >= 0 && !library.symbols.CloseHandle(leafHandle.readBigUInt64LE())) throw new Error('TEST native relative package handle close failed')
+              if (relative >= 0) {
+                const fileHandle = leafHandle.readBigUInt64LE()
+                try {
+                  // Pinned Bun FSCache uses synchronous kernel32.ReadFile on
+                  // this exact native handle after its relative NtCreateFile.
+                  const buffer = Buffer.alloc(64 * 1024), amount = Buffer.alloc(4)
+                  let total = 0, eof = false, error = 0
+                  while (total < buffer.length) {
+                    amount.writeUInt32LE(0)
+                    const ok = library.symbols.ReadFile(fileHandle, ptr(buffer.subarray(total)), buffer.length - total, ptr(amount), null)
+                    if (!ok) { error = library.symbols.GetLastError(); break }
+                    const count = amount.readUInt32LE()
+                    if (count > buffer.length - total) throw new Error('TEST native package read exceeded buffer')
+                    total += count
+                    if (count === 0) { eof = true; break }
+                  }
+                  const contents = buffer.subarray(0, total)
+                  const read: Record<string, unknown> = { succeeded: error === 0 && eof, error, bytes: total, eof,
+                    limitBytes: buffer.length, sha256: createHash('sha256').update(contents).digest('hex') }
+                  result.bunNtRelativePackageRead = read
+                  if (error === 0 && eof) {
+                    const expected = await readFile(path.join(target, 'package.json'))
+                    read.matchesReadableManifest = createHash('sha256').update(expected).digest('hex') === read.sha256
+                    try {
+                      const actual: unknown = JSON.parse(contents.toString('utf8')), original: unknown = JSON.parse(expected.toString('utf8'))
+                      const object = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value)
+                      read.validJson = object(actual)
+                      if (object(actual) && object(original)) {
+                        read.expectedNameMatches = actual.name === original.name
+                        read.expectedVersionMatches = actual.version === original.version
+                        read.expectedExportsTargetsMatch = JSON.stringify(actual.exports) === JSON.stringify(original.exports)
+                      }
+                    } catch { read.validJson = false }
+                  }
+                } finally {
+                  if (!library.symbols.CloseHandle(fileHandle)) throw new Error('TEST native relative package handle close failed')
+                }
+              }
             }
             const buffer = Buffer.alloc(64 * 1024)
             const query = nt.symbols.NtQueryDirectoryFile(handle, null, null, null, ptr(io), ptr(buffer), buffer.length, 1, 0, null, 1)
@@ -94,6 +135,7 @@ if (child) {
     try { await action(); attempts[name] = false } catch (error) { attempts[name] = (error as NodeJS.ErrnoException).code === 'EACCES' || (error as NodeJS.ErrnoException).code === 'EPERM' }
   }
   try {
+  if (!resolverPrimitiveMode) {
   await writeFile(path.join(base, 'work', 'allowed.txt'), 'owned write')
   attempts.ownedWrite = true
   await deny('outsideApprovedReadDenied', () => readFile(path.join(base, 'private-canary.txt')))
@@ -170,10 +212,11 @@ if (child) {
       attempts[`spawnProbe_${mode}`] = JSON.stringify({ ...probe, markerMatchesHeldPID: receipt?.probePID === probe.pid, receipt })
     } catch (error) { attempts[`spawnProbe_${mode}`] = String(error) }
   }
-  if (officialShellMode) {
+  }
+  if (resolverDiagnosticsMode) {
     const directory = path.join(import.meta.dir, 'windows-official-shell')
     const resolution: unknown = JSON.parse(await readFile(path.join(directory, 'resolution.json'), 'utf8'))
-    if (!Array.isArray(resolution) || resolution.length !== 4) throw new Error('TEST official resolution manifest invalid')
+    if (!Array.isArray(resolution) || resolution.length !== (resolverPrimitiveMode ? 1 : 4)) throw new Error('TEST official resolution manifest invalid')
     const diagnostics: Record<string, unknown>[] = []
     const nativeTargets = new Map<string, boolean>([[import.meta.dir, true], [path.join(import.meta.dir, 'node_modules'), true], [directory, true]])
     attempts.officialShellResolution = diagnostics
@@ -221,19 +264,23 @@ if (child) {
       if (ancestor === path.dirname(ancestor)) break
     }
     attempts.officialShellNativeAccess = await probeOfficialGraphNativeAccess(nativeTargets)
-    if (diagnostics.some(row => row.physicalEntryReadable !== true || row.matchesStagedEntry !== true)) throw new Error('TEST official child graph resolution refused; see officialShellResolution')
-    const checkpoint = await import('./windows-official-shell/checkpoint.ts')
-    attempts.officialShellCheckpoint = await checkpoint.runOfficialShellCheckpoint(base)
+    if (!resolverPrimitiveMode) {
+      if (diagnostics.some(row => row.physicalEntryReadable !== true || row.matchesStagedEntry !== true)) throw new Error('TEST official child graph resolution refused; see officialShellResolution')
+      const checkpoint = await import('./windows-official-shell/checkpoint.ts')
+      attempts.officialShellCheckpoint = await checkpoint.runOfficialShellCheckpoint(base)
+    } else { attempts.resolverPrimitiveCompleted = true; attempts.fullTaskQualified = false }
   }
+  if (!resolverPrimitiveMode) {
   const breakaway = native.attemptWindowsJobBreakaway(process.execPath)
   attempts.jobBreakawayError = breakaway.error
   attempts.jobBreakawayReceipt = JSON.stringify(breakaway)
   attempts.jobBreakawayContained = breakaway.error === 5 || ('outerJobContained' in breakaway && breakaway.outerJobContained && breakaway.candidateRetired && breakaway.neverResumed)
+  }
   } catch (error) { attempts.childStartupError = String(error); console.error(JSON.stringify({ childStartupError: String(error) })) }
   // Named pipe carries the probe response without admin loopback exemptions.
   console.log(JSON.stringify({ pid: process.pid, baseUrl, attempts }))
   const pipe = createConnection(pipeName)
-  httpCheckpoint.attachCheckpointChild(pipe, baseUrl)
+  if (!resolverPrimitiveMode) httpCheckpoint.attachCheckpointChild(pipe, baseUrl)
   pipe.once('connect', () => { pipe.write(JSON.stringify({ pid: process.pid, baseUrl, attempts }) + '\n') })
   pipe.once('error', error => { void writeFile(path.join(base, 'work', 'pipe-error.txt'), String(error)) })
   setInterval(() => {}, 1000)
@@ -255,6 +302,7 @@ if (child) {
   }
   const evidence: Record<string, unknown> = { schema: 1, purpose: 'TEST-native-feasibility', repositorySHA: process.env.GITHUB_SHA ?? null,
     os: process.platform, arch: process.arch, bun: process.versions.bun, profileName, root }
+  if (resolverPrimitiveMode) Object.assign(evidence, { purpose: 'TEST-resolver-primitive', fullTaskQualified: false, qualified: false })
   try {
     await mkdir(root, { recursive: true })
     for (const directory of ['work', 'work/protected', 'host-state', 'readonly', 'private-sibling']) await mkdir(path.join(root, directory), { recursive: true })
@@ -269,6 +317,7 @@ if (child) {
     await cp(path.join(import.meta.dir, 'opencode-v2-windows-native.ts'), path.join(root, 'readonly', 'opencode-v2-windows-native.ts'))
     await cp(path.join(import.meta.dir, 'windows-http-bridge'), path.join(root, 'readonly', 'windows-http-bridge'), { recursive: true })
     if (officialShellMode) officialArtifacts = await (await import('./windows-official-shell/fixture.ts')).stageFixture(path.join(root, 'readonly'))
+    if (resolverPrimitiveMode) officialArtifacts = await (await import('./windows-resolver-primitive/fixture.ts')).stagePrimitiveFixture(path.join(root, 'readonly'))
     container = native.createWindowsContainer(profileName)
     evidence.containerSid = container.sid
     // The server is an unsandboxed broker. LOCAL would redirect the AC client
@@ -364,13 +413,13 @@ foreach ($entry in $workPackageAllows) { if (([int]$entry.FileSystemRights -band
     await writeFile(path.join(root, 'work', 'protected', 'owner.json'), 'host-owned')
     evidence.trustedOwnerWrite = true
     evidence.ancestorDirectoryAccessMask = '0x1200a9'
-    evidence.runtimeInputMetadataGrant = { files: 3 + (officialShellMode ? officialArtifacts.filter(artifact => artifact.metadataReadInput).length + 1 : 0), readAndExecute: true, writeAttributes: true, writeData: false, delete: false, changePermissions: false }
+    evidence.runtimeInputMetadataGrant = { files: 3 + (resolverDiagnosticsMode ? officialArtifacts.filter(artifact => artifact.metadataReadInput).length + 1 : 0), readAndExecute: true, writeAttributes: true, writeData: false, delete: false, changePermissions: false }
     evidence.ancestorGrantCount = (JSON.parse(await readFile(ancestorJournal, 'utf8')) as unknown[]).length
-    if (officialShellMode) {
+    if (resolverDiagnosticsMode) {
       // Parent normal Bun control uses the SAME fresh staged graph, never repository dependencies.
       const graphRoot = path.join(root, 'readonly'), from = path.join(graphRoot, 'windows-official-shell')
       const resolution: unknown = JSON.parse(await readFile(path.join(from, 'resolution.json'), 'utf8'))
-      if (!Array.isArray(resolution) || resolution.length !== 4) throw new Error('TEST parent resolution manifest invalid')
+      if (!Array.isArray(resolution) || resolution.length !== (resolverPrimitiveMode ? 1 : 4)) throw new Error('TEST parent resolution manifest invalid')
       const diagnostics: Record<string, unknown>[] = []
       evidence.officialShellParentResolution = { phase: 'staged-before-container-launch', bunVersion: Bun.version, diagnostics }
       for (const row of resolution) {
@@ -390,6 +439,7 @@ foreach ($entry in $workPackageAllows) { if (([int]$entry.FileSystemRights -band
       LOCALAPPDATA: process.env.LOCALAPPDATA!, USERPROFILE: path.join(root, 'work'), HOME: path.join(root, 'work'),
       TEMP: path.join(root, 'work'), TMP: path.join(root, 'work') }
     if (officialShellMode) Object.assign(launchEnv, { TEST_WINDOWS_OFFICIAL_SHELL: '1', XDG_DATA_HOME: path.join(root, 'work', 'data'), XDG_CACHE_HOME: path.join(root, 'work', 'cache'), XDG_CONFIG_HOME: path.join(root, 'work', 'config'), XDG_STATE_HOME: path.join(root, 'work', 'state') })
+    if (resolverPrimitiveMode) Object.assign(launchEnv, { TEST_WINDOWS_RESOLVER_PRIMITIVE: '1' })
     evidence.environmentPresence = Object.fromEntries(Object.entries(launchEnv).map(([key, value]) => [key, typeof value === 'string' && value.length > 0]))
     if (Object.values(launchEnv).some(value => typeof value !== 'string' || value.length === 0)) throw new Error('required native environment path missing')
     launch = native.launchWindowsContainer({ containerSid: container.address, executable,
@@ -408,6 +458,7 @@ foreach ($entry in $workPackageAllows) { if (([int]$entry.FileSystemRights -band
     const report = JSON.parse(bytes.split('\n')[0]!) as { pid: number; baseUrl: string; attempts: Record<string, unknown> }
     evidence.report = report
     if (report.pid !== launch.pid) throw new Error('native PID mismatch')
+    if (!resolverPrimitiveMode) {
     try { evidence.parentHttp = await (await fetch(report.baseUrl, { signal: AbortSignal.timeout(3000) })).text() } catch (error) { evidence.parentHttp = String(error) }
     try {
       evidence.httpBridgeCheckpoint = await httpCheckpoint.runCheckpointHost(pipe, pid => launch!.validatePeer(pid))
@@ -415,12 +466,19 @@ foreach ($entry in $workPackageAllows) { if (([int]$entry.FileSystemRights -band
       while (Date.now() < deadline && await readFile(path.join(root, 'work', 'http-sse-cancelled.txt'), 'utf8').catch(() => '') !== 'cancelled') await pause(20)
       evidence.httpBridgeServerCancellation = await readFile(path.join(root, 'work', 'http-sse-cancelled.txt'), 'utf8').catch(() => '') === 'cancelled'
     } catch (error) { evidence.httpBridgeCheckpointError = String(error) }
+    }
     evidence.activeWithDescendant = launch.active()
     launch.terminate()
     const retiredDeadline = Date.now() + 5000
     while ((launch.active() !== 0 || !launch.exited()) && Date.now() < retiredDeadline) await pause(20)
     evidence.activeAfterTerminate = launch.active(); evidence.processExited = launch.exited()
     if (officialShellMode) { await (await import('./windows-official-shell/fixture.ts')).verifyArtifacts(path.join(root, 'readonly'), officialArtifacts); evidence.officialArtifactsRetained = true }
+    if (resolverPrimitiveMode) {
+      await (await import('./windows-resolver-primitive/fixture.ts')).verifyPrimitiveArtifacts(path.join(root, 'readonly'), officialArtifacts)
+      evidence.purpose = 'TEST-resolver-primitive'; evidence.fullTaskQualified = false
+      evidence.resolverPrimitiveCompleted = report.attempts.resolverPrimitiveCompleted === true && evidence.activeAfterTerminate === 0 && evidence.processExited === true
+      evidence.primitiveArtifactsRetained = true
+    }
     evidence.hostStateRetained = await readFile(path.join(root, 'host-state', 'secret.txt'), 'utf8') === 'host-owned'
     evidence.protectedRetained = await readFile(path.join(root, 'work', 'protected', 'owner.json'), 'utf8') === 'host-owned'
     evidence.readOnlyRetained = await readFile(path.join(root, 'readonly', 'immutable.txt'), 'utf8') === 'host-owned'
@@ -428,7 +486,7 @@ foreach ($entry in $workPackageAllows) { if (([int]$entry.FileSystemRights -band
     evidence.filesystemPassed = critical.every(key => report.attempts[key] === true) && report.attempts.protectedAclEscapeError === 5 && report.attempts.protectedFileAclEscapeError === 5 && report.attempts.readOnlyAclEscapeError === 5 && report.attempts.runtimeInputAclEscapeError === 5 && report.attempts.runtimeHttpModuleAclEscapeError === 5 && evidence.hostStateRetained && evidence.protectedRetained && evidence.readOnlyRetained && evidence.trustedOwnerWrite
     evidence.jobPassed = Number(evidence.activeWithDescendant) >= 2 && report.attempts.nativeDescendantInheritedJob === true && report.attempts.nativeDescendantBunStarted === true && evidence.activeAfterTerminate === 0 && evidence.processExited && report.attempts.jobBreakawayContained === true
     evidence.dropInLoopbackPassed = evidence.parentHttp === 'native-http-ok'
-    evidence.qualified = evidence.filesystemPassed && evidence.jobPassed && evidence.dropInLoopbackPassed
+    evidence.qualified = !resolverPrimitiveMode && evidence.filesystemPassed && evidence.jobPassed && evidence.dropInLoopbackPassed
   } catch (error) { evidence.error = String(error); evidence.qualified = false }
   finally {
     const cleanupErrors: string[] = []
@@ -471,5 +529,5 @@ if (Test-Path -LiteralPath $env:TEST_ANCESTOR_JOURNAL) {
     await writeFile(output, JSON.stringify(evidence, null, 2) + '\n')
     console.log(JSON.stringify(evidence, null, 2))
   }
-  if (!evidence.qualified) process.exitCode = 2
+  if (resolverPrimitiveMode ? evidence.resolverPrimitiveCompleted !== true || evidence.cleanupErrors !== undefined || evidence.primitiveArtifactsRetained !== true : !evidence.qualified) process.exitCode = 2
 }

@@ -5,7 +5,7 @@ on:
       lane:
         description: 'Select the mechanism under investigation; all for final qualification'
         type: choice
-        options: [all, native-owner, native-command, native-boundary, official-shell]
+        options: [all, native-owner, native-command, native-boundary, official-shell, resolver-primitive]
         default: all
 permissions:
   contents: read
@@ -102,4 +102,30 @@ jobs:
         with:
           name: opencode-v2-windows-official-shell-${{ github.sha }}
           path: ${{ runner.temp }}/windows-official-shell-evidence.json
+          if-no-files-found: error
+  resolver-primitive:
+    if: inputs.lane == 'resolver-primitive'
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - name: Install pinned published package inputs
+        shell: pwsh
+        run: bun install --frozen-lockfile
+      - name: Diagnose synchronous package-cache read in TEST containment
+        shell: pwsh
+        env:
+          TEST_WINDOWS_RESOLVER_PRIMITIVE: '1'
+        run: bun run scripts/spikes/opencode-v2-windows-boundary.ts "$env:RUNNER_TEMP\windows-resolver-primitive-evidence.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: opencode-v2-windows-resolver-primitive-${{ github.sha }}
+          path: ${{ runner.temp }}/windows-resolver-primitive-evidence.json
           if-no-files-found: error
