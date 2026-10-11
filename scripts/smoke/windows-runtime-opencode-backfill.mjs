@@ -17,6 +17,15 @@ const memberName = 'bob';
 const laneId = 'secondary:opencode:bob';
 const sessionId = 'session-bob';
 const content = 'Fixture only: spaces, "quotes", C:\\fake\\path, Привет 世界\n';
+const backfillCases = [
+  ['ascii', 'direct'], ['with spaces', 'direct'], ['Юникод 世界', 'direct'],
+  ['Юникод 世界 cmd', 'app-exe-fallback'],
+];
+
+export function fixtureScriptPaths(root) {
+  return ['', ...backfillCases.map(([shape]) => shape)]
+    .map(directory => path.resolve(root, directory, 'fake-opencode.cjs'));
+}
 
 export function trustedSearchPath(platform = process.platform, nodePath = process.execPath, systemRoot = process.env.SystemRoot || process.env.SYSTEMROOT || 'C:\\Windows') {
   const paths = platform === 'win32' ? path.win32 : path;
@@ -209,6 +218,7 @@ $rootPath = ${literal(path.resolve(root) + path.sep)}
 $nodePath = ${literal(process.execPath)}
 $nodeScriptPattern = ${literal(windowsNodeScriptPattern)}
 $diagnosticPids = @(${candidates.join(', ')})
+$fixtureScriptCandidates = @(${fixtureScriptPaths(root).map(literal).join(', ')})
 function Get-OwnershipPath([string]$value) {
   # Windows PowerShell/.NET Framework GetFullPath expands existing 8.3 names.
   # Reject relative paths: the inspecting shell is not the target process cwd.
@@ -219,7 +229,13 @@ $rootPath = Get-OwnershipPath $rootPath
 $nodePath = Get-OwnershipPath $nodePath
 if (-not $rootPath -or -not $nodePath) { throw 'Fixture ownership paths must be absolute' }
 [Console]::Error.WriteLine('teardown: before script enumeration')
-$scripts = @(Get-ChildItem -LiteralPath $rootPath -Filter fake-opencode.cjs -Recurse -File | ForEach-Object { Get-OwnershipPath $_.FullName })
+# The fixture creates only these exact script locations. Never walk the copied
+# portable dependency graphs; they cannot introduce cleanup ownership.
+$scripts = @(foreach ($candidate in $fixtureScriptCandidates) {
+  $script = Get-OwnershipPath $candidate
+  if (-not $script -or -not $script.StartsWith($rootPath, [StringComparison]::OrdinalIgnoreCase)) { throw 'Fixture script path escaped root' }
+  if (Test-Path -LiteralPath $script -PathType Leaf) { $script }
+})
 [Console]::Error.WriteLine('teardown: after script enumeration count=' + $scripts.Count)
 function Is-Owned($entry) {
   $executablePath = Get-OwnershipPath $entry.ExecutablePath
@@ -381,10 +397,7 @@ export function runBackfillSmoke(binaryInput, evidenceInput, { report: suppliedR
   flush();
   const root = mkdtempSync(path.join(os.tmpdir(), 'backfill-exe-'));
   try {
-    for (const [shape, transport] of [
-      ['ascii', 'direct'], ['with spaces', 'direct'], ['Юникод 世界', 'direct'],
-      ['Юникод 世界 cmd', 'app-exe-fallback'],
-    ]) {
+    for (const [shape, transport] of backfillCases) {
       const item = { shape, transport, invocations: [], passed: false };
       report.cases.push(item);
       const caseRoot = path.join(root, shape);

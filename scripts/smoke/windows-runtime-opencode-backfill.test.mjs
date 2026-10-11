@@ -11,7 +11,7 @@ import { once } from 'node:events';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { assertBackfillEnvelope, assertImportedLedger, buildWindowsTeardownCommand, createBackfillFixture, finishSmokeCleanup, runSmokeGroups, sandboxEnvironment, stageRuntimeDelivery, teardownOwnedProcesses, trustedSearchPath, windowsNodeScriptPattern } from './windows-runtime-opencode-backfill.mjs';
+import { assertBackfillEnvelope, assertImportedLedger, buildWindowsTeardownCommand, createBackfillFixture, finishSmokeCleanup, fixtureScriptPaths, runSmokeGroups, sandboxEnvironment, stageRuntimeDelivery, teardownOwnedProcesses, trustedSearchPath, windowsNodeScriptPattern } from './windows-runtime-opencode-backfill.mjs';
 
 import { assertReadinessHost, runProviderSmoke, runRecordedCheck } from './windows-runtime-opencode-provider-json.mjs';
 import { environmentSummary, traceSpawn } from './windows-process-identity-probe.mjs';
@@ -85,6 +85,22 @@ test('runtime relocation refuses a partial packaged delivery before copying an e
       assert.throws(() => stageRuntimeDelivery(path.join(source, 'cli.exe'), target), /requires both bun and local-cli/);
       assert.equal(existsSync(path.join(target, 'runtime.exe')), false);
     }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('cleanup script inventory covers known fixtures without admitting dependency graph scripts', () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'cleanup-inventory-'));
+  try {
+    const expected = ['', 'ascii', 'with spaces', 'Юникод 世界', 'Юникод 世界 cmd']
+      .map(directory => path.join(root, directory, 'fake-opencode.cjs'));
+    for (const script of expected) {
+      mkdirSync(path.dirname(script), { recursive: true }); writeFileSync(script, '// owned fixture');
+    }
+    const foreign = path.join(root, 'ascii/bin/local-cli/node_modules/foreign/fake-opencode.cjs');
+    mkdirSync(path.dirname(foreign), { recursive: true }); writeFileSync(foreign, '// dependency script');
+    assert.deepEqual(fixtureScriptPaths(root), expected);
+    assert.equal(fixtureScriptPaths(root).includes(foreign), false);
+    assert.ok(fixtureScriptPaths(root).every(script => existsSync(script)));
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -226,7 +242,7 @@ test('teardown retains the last phase on timeout or failure and keeps stdout sep
       ...['Microsoft.PowerShell.Management', 'Microsoft.PowerShell.Utility']
         .map(name => [`import ${name}`, `Import-Module ${name} -ErrorAction Stop`]),
       ['load System.Management', "[void][System.Reflection.Assembly]::Load('System.Management, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a')"],
-      ['script enumeration', '$scripts = @(Get-ChildItem -LiteralPath'],
+      ['script enumeration', '$scripts = @(foreach ($candidate in $fixtureScriptCandidates)'],
       ['process enumeration', '$entries = @(Read-ProcessEntries)'],
       ['Get-Process', '$target = Get-Process -Id'],
       ['hold handle', '$heldHandle = $target.Handle'],
@@ -1046,4 +1062,54 @@ test('Windows isolated PATH captures identity and teardown stops only the owned 
   }
   if (originalError) throw originalError;
   assert.deepEqual(evidence.cleanupErrors, [], 'Direct test-child cleanup must succeed');
+});
+
+// Keep this PowerShell contract after the first native production identity test;
+// it must not warm that test's cold helper query.
+test('Windows cleanup admits exact fixtures without recursively inspecting portable graphs', {
+  skip: process.platform !== 'win32', timeout: 25000,
+}, () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'cleanup inventory 世界-'));
+  try {
+    const scripts = fixtureScriptPaths(root);
+    for (const script of scripts) {
+      mkdirSync(path.dirname(script), { recursive: true }); writeFileSync(script, '// owned fixture');
+    }
+    const foreign = path.join(root, 'ascii/bin/local-cli/node_modules/foreign/fake-opencode.cjs');
+    mkdirSync(path.dirname(foreign), { recursive: true }); writeFileSync(foreign, '// dependency script');
+    const literal = value => "'" + value.replaceAll("'", "''") + "'";
+    const cases = [...scripts.map(script => [true, script]),
+      [false, foreign], [false, path.join(root + '-sibling', 'fake-opencode.cjs')]];
+    const marker = "[Console]::Error.WriteLine('teardown: before script enumeration')";
+    const prefix = buildWindowsTeardownCommand(root).split('$stopped = @()')[0];
+    // A copied dependency graph may be arbitrarily large or unreadable. Force
+    // any directory walk to fail, while actual direct file checks remain live.
+    const guarded = prefix.replace(marker,
+      "function Get-ChildItem { throw 'Unexpected fixture directory traversal' }\n" + marker);
+    const command = guarded + `
+      $cases = ConvertFrom-Json ${literal(JSON.stringify(cases))}
+      foreach ($case in $cases) {
+        $entry = [pscustomobject]@{ ExecutablePath = $nodePath; CommandLine = ('"' + $nodePath + '" "' + $case[1] + '"') }
+        if ([bool](Is-Owned $entry) -ne $case[0]) { throw 'Fixed fixture inventory ownership mismatch' }
+      }
+      if ($scripts.Count -ne 5) { throw 'Known fixture inventory is incomplete' }
+      ConvertTo-Json -InputObject @{ cases = $cases.Count; scripts = $scripts.Count } -Compress
+    `;
+    const invoke = body => spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', body], {
+      cwd: root, env: sandboxEnvironment(root, path.join(root, 'opencode.cmd')),
+      encoding: 'utf8', timeout: 10000, windowsHide: true, maxBuffer: 64 * 1024,
+    });
+    // Execute the original selector under the same traversal guard: it must
+    // fail, rather than silently widening or skipping script ownership.
+    const start = guarded.indexOf('$scripts = @(');
+    const end = guarded.indexOf("[Console]::Error.WriteLine('teardown: after script enumeration");
+    assert.ok(start >= 0 && end > start);
+    const oldSelector = '$scripts = @(Get-ChildItem -LiteralPath $rootPath -Filter fake-opencode.cjs -Recurse -File | ForEach-Object { Get-OwnershipPath $_.FullName })\n';
+    const old = invoke(guarded.slice(0, start) + oldSelector + guarded.slice(end));
+    assert.notEqual(old.status, 0);
+    assert.match(old.stderr, /Unexpected fixture directory traversal/);
+    const result = invoke(command);
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), { cases: 7, scripts: 5 });
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
