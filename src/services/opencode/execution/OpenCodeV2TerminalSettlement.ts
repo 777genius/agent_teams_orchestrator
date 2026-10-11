@@ -98,7 +98,8 @@ export async function readOriginalTerminal(client: ExecutionClient, authority: S
     const assistant = messages.find(row => row.id === id && row.type === 'assistant')
     const starts = log.events.filter(event => event.type === 'session.step.started' && event.data.assistantMessageID === id)
     executionAssert(assistant && assistant.data.agent === authority.agent && executionHash(assistant.data.model) === executionHash(authority.model) &&
-      starts.length === 1 && starts[0]!.data.agent === authority.agent && executionHash(starts[0]!.data.model) === executionHash(authority.model), 'terminal_assistant_selection_changed')
+      starts.length > 0 && starts.every(start => start.data.agent === authority.agent &&
+        executionHash(start.data.model) === executionHash(authority.model)), 'terminal_assistant_selection_changed')
   }
   const proof = Object.freeze({ authorityHash: executionHash(authority), identityHash: executionHash(admission.identity),
     requestId: intent.identity.requestId, nativeInputID: intent.identity.nativeInputID,

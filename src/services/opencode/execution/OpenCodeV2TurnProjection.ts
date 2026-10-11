@@ -33,6 +33,31 @@ const messageIDFromEvent = (id: string): string => id.replace(/^evt_/, 'msg_')
 const same = (left: unknown, right: unknown): boolean => {
   try { return canonicalExecutionJSON(left) === canonicalExecutionJSON(right) } catch { return false }
 }
+function assistantLineage(interval: readonly ExecutionLogEvent[]): string[] | null {
+  const starts = new Map<string, { event: ExecutionLogEvent; index: number; count: number }>()
+  const retries = new Set<number>()
+  for (const [index, event] of interval.entries()) {
+    if (event.type !== 'session.step.started') continue
+    const id = string(event.data.assistantMessageID)
+    if (!id) return null
+    const previous = starts.get(id)
+    if (previous) {
+      const retry = interval[index - 1], error = record(retry?.data.error)
+      // Both pins retain the assistant ID across native provider retries. Only
+      // an adjacent start/retry/start chain without output or effects is proven.
+      // Native retry counters start at 1 and increment before scheduling.
+      if (previous.index !== index - 2 || retry?.type !== 'session.retry.scheduled' ||
+          retry.data.assistantMessageID !== id || retry.data.attempt !== previous.count + 1 ||
+          !Number.isSafeInteger(retry.data.at) || (retry.data.at as number) < 0 ||
+          !error || typeof error.type !== 'string' || typeof error.message !== 'string' ||
+          !same(event.data.agent, previous.event.data.agent) || !same(event.data.model, previous.event.data.model)) return null
+      retries.add(index - 1)
+    }
+    starts.set(id, { event, index, count: (previous?.count ?? 0) + 1 })
+  }
+  if (interval.some((event, index) => event.type === 'session.retry.scheduled' && !retries.has(index))) return null
+  return [...starts.keys()]
+}
 function toolResult(content: readonly unknown[]): Record<string, unknown> | null {
   // The controller's existing message/task tools return their result as one
   // JSON text item. Multiple JSON results are ambiguous and cannot publish.
@@ -97,11 +122,11 @@ export function projectOpenCodeV2Turn(input: OpenCodeV2TurnCut): OpenCodeV2TurnP
   const starts = interval.filter(event => event.type === 'session.execution.started')
   if (starts.length !== 1 || interval.some(event => event.type === 'session.step.started' && event.seq < delivered.seq))
     return unknown('execution_interval_lineage_missing')
-  const stepStarts = interval.filter(event => event.type === 'session.step.started')
-  const assistantMessageIds = stepStarts.map(event => string(event.data.assistantMessageID))
-  if (assistantMessageIds.some(id => id === null) || new Set(assistantMessageIds).size !== assistantMessageIds.length)
+  const assistants = assistantLineage(interval)
+  if (!assistants) return unknown('ambiguous_assistant_lineage')
+  if (events.some(event => event.type === 'session.step.started' &&
+      assistants.includes(event.data.assistantMessageID as string) && !interval.includes(event)))
     return unknown('ambiguous_assistant_lineage')
-  const assistants = assistantMessageIds.filter((id): id is string => id !== null)
   const text: string[] = [], toolEffects: OpenCodeV2ToolEffect[] = [], visibleReplies: OpenCodeV2VisibleReply[] = []
   for (const assistantId of assistants) {
     const message = input.messages.data.find(item => item.id === assistantId)
