@@ -25,7 +25,10 @@ async function ps(script: string, extra: Record<string, string> = {}) {
     env: { ...process.env, PSModulePath: path.join(process.env.ProgramFiles!, 'PowerShell', '7', 'Modules'), TEST_ROOT: root, TEST_NONCE: nonce, TEST_JOURNAL: journal, ...extra }, stdout: 'pipe', stderr: 'pipe',
   })
   const [out, err, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited])
-  if (code !== 0) throw new Error(`windows_command_setup_failed:${code}:${err.slice(-2048)}`)
+  if (code !== 0) {
+    const category = /identity references could not be translated/i.test(err) ? 'sid_translation' : 'powershell'
+    throw new Error(`windows_command_setup_failed:${category}:${code}`)
+  }
   return out.trim()
 }
 function record(value: unknown): Record<string, unknown> { assert.ok(value && typeof value === 'object' && !Array.isArray(value)); return value as Record<string, unknown> }
@@ -111,7 +114,8 @@ $sid
   assert.match(sid, /^S-1-15-2-/)
   await ps(`
 $ErrorActionPreference='Stop';$sid=$env:TEST_SID
-$rule=[System.Security.AccessControl.FileSystemAccessRule]::new($sid,'ReadAndExecute','None','None','Allow')
+$identity=[System.Security.Principal.SecurityIdentifier]::new($sid)
+$rule=[System.Security.AccessControl.FileSystemAccessRule]::new($identity,'ReadAndExecute','None','None','Allow')
 $planned=[System.Collections.Generic.List[string]]::new();$ancestor=$env:TEST_ROOT
 while($ancestor){$planned.Add($ancestor);$info=[System.IO.DirectoryInfo]::new($ancestor).Parent;if(!$info){break};$ancestor=$info.FullName}
 [IO.File]::WriteAllText($env:TEST_JOURNAL,(ConvertTo-Json -InputObject @($planned)),[Text.UTF8Encoding]::new($false))
