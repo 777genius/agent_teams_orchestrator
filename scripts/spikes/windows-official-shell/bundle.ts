@@ -77,6 +77,7 @@ export async function stageBundledFixture(readonly: string): Promise<Artifact[]>
   const selections: { pin: string; alias: string; entries: Record<string, string> }[] = []
   const imports: string[] = [`import { runOfficialShellCheckpoint } from ${JSON.stringify(bundledImportPath(path.join(import.meta.dir, 'checkpoint.ts')))};`]
   const tables: string[] = []
+  let loggerSelection: { path: string; sha256: string; barrelPath: string; manifestPath: string; manifestSha256: string; name: string; version: string } | undefined
   for (const [index, [pin, alias]] of [['2.0.0', '@opencode/server-v2-floor'], ['2.0.21', '@opencode/server']].entries()) {
     await writeFile(path.join(buildDirectory, 'stage.json'), JSON.stringify({ phase: 'select-before-pin-resolution', pin, alias, fullTaskQualified: false }))
     const entry = await realpath(Bun.resolveSync(`${alias}/routes`, import.meta.dir))
@@ -90,14 +91,28 @@ export async function stageBundledFixture(readonly: string): Promise<Artifact[]>
       if (await realpath(Bun.resolveSync('effect', path.dirname(file))) !== effectEntry) throw new Error('TEST bundle selected graph has a different Effect instance')
       imports.push(`import * as graph${index}_${key} from ${JSON.stringify(bundledImportPath(file))};`)
     }
+    const loggerBarrel = await realpath(Bun.resolveSync('drizzle-orm/effect-core', path.dirname(entry)))
+    const loggerIdentity = await packageIdentity(loggerBarrel)
+    if (loggerIdentity.name !== 'drizzle-orm' || loggerIdentity.version !== '1.0.0-rc.5-169397b') throw new Error('TEST bundle Drizzle pin mismatch')
+    const loggerPath = await realpath(path.join(loggerIdentity.root, 'effect-core', 'logger.js'))
+    const loggerManifest = path.join(loggerIdentity.root, 'package.json')
+    within(sourceRoot, loggerBarrel); within(loggerIdentity.root, loggerPath); within(sourceRoot, loggerManifest)
+    if (await realpath(Bun.resolveSync('effect', path.dirname(loggerPath))) !== effectEntry) throw new Error('TEST bundle logger has a different Effect instance')
+    const selectedLogger = { path: loggerPath, sha256: hash(await readFile(loggerPath)), barrelPath: loggerBarrel, manifestPath: loggerManifest, manifestSha256: hash(await readFile(loggerManifest)), name: loggerIdentity.name, version: loggerIdentity.version }
+    if (loggerSelection && JSON.stringify(loggerSelection) !== JSON.stringify(selectedLogger)) throw new Error('TEST bundle pins have different logger sources')
+    loggerSelection = selectedLogger
     selections.push({ pin: pin!, alias: alias!, entries })
     tables.push(`${JSON.stringify(alias)}: { ${Object.keys(entries).map(key => `${key}: graph${index}_${key}`).join(', ')}, entry: ${JSON.stringify(path.join(readonly, within(sourceRoot, entry)))} }`)
   }
+  if (!loggerSelection) throw new Error('TEST bundle logger selection absent')
+  imports.push(`import { EffectLogger as diagnosticDirectLogger } from ${JSON.stringify(bundledImportPath(loggerSelection.path))};`)
+  imports.push(`import { EffectLogger as diagnosticBarrelLogger } from ${JSON.stringify(bundledImportPath(loggerSelection.barrelPath))};`)
+  imports.push('export const bundledLoggerBinding = { direct: diagnosticDirectLogger, barrel: diagnosticBarrelLogger };')
   // Generated TS has static, exact per-pin imports; no runtime package resolver.
   const generatedEntry = path.join(buildDirectory, 'checkpoint-entry.ts')
   await writeFile(generatedEntry, renderBundledCheckpointEntry(imports, tables))
   const stagePath = path.join(buildDirectory, 'stage.json')
-  await writeFile(path.join(buildDirectory, 'selection.json'), JSON.stringify({ generatedEntry, generatedSha256: hash(await readFile(generatedEntry)), selections, effectEntry, fullTaskQualified: false }))
+  await writeFile(path.join(buildDirectory, 'selection.json'), JSON.stringify({ generatedEntry, generatedSha256: hash(await readFile(generatedEntry)), selections, effectEntry, loggerSelection, fullTaskQualified: false }))
   await writeFile(stagePath, JSON.stringify({ phase: 'generated-entry-ready', fullTaskQualified: false }))
   const buildOutput = path.join(buildDirectory, 'checkpoint-bundled.js')
   const resultPath = path.join(buildDirectory, 'build-result.json')
@@ -111,7 +126,7 @@ export async function stageBundledFixture(readonly: string): Promise<Artifact[]>
     await writeFile(path.join(buildDirectory, 'parent-result.json'), JSON.stringify({ phase: 'build-child-failed', code, signal: child.signalCode, fullTaskQualified: false }))
     throw new Error('TEST bundle child failed; retained build phase evidence')
   }
-  const result: { inputs: { file: string; sha256: string }[]; transformations: { file: string; literal: string; replacement: string; entry: string; originalSha256: string; transformedSha256: string }[]; assets: { path: string; sha256: string }[]; metafile: Bun.BuildMetafile } = JSON.parse(await readFile(resultPath, 'utf8'))
+  const result: { inputs: { file: string; sha256: string }[]; transformations: { file: string; literal: string; replacement: string; entry: string; originalSha256: string; transformedSha256: string }[]; assets: { path: string; sha256: string }[]; loggerBinding: { directExportJoined: boolean }, metafile: Bun.BuildMetafile } = JSON.parse(await readFile(resultPath, 'utf8'))
   const inputs = new Map<string, Buffer>()
   for (const input of result.inputs) {
     if (input.file !== generatedEntry) within(sourceRoot, input.file)
@@ -119,6 +134,7 @@ export async function stageBundledFixture(readonly: string): Promise<Artifact[]>
     if (hash(bytes) !== input.sha256) throw new Error('TEST bundle consumed source changed')
     inputs.set(input.file, bytes)
   }
+  if (hash(inputs.get(loggerSelection.path) ?? Buffer.alloc(0)) !== loggerSelection.sha256 || result.loggerBinding.directExportJoined !== true || hash(await readFile(loggerSelection.manifestPath)) !== loggerSelection.manifestSha256) throw new Error('TEST bundle logger retained source binding absent')
   for (const transformation of result.transformations) {
     const original = inputs.get(transformation.file)
     if (!original || hash(original) !== transformation.originalSha256) throw new Error('TEST bundle transformed source custody changed')
@@ -170,7 +186,7 @@ export async function stageBundledFixture(readonly: string): Promise<Artifact[]>
     if (hash(bytes) !== asset.sha256) throw new Error('TEST bundle emitted asset changed')
     await add(path.join(readonly, 'windows-official-shell', asset.path), bytes, true)
   }
-  await add(path.join(readonly, 'windows-official-shell', 'bundle-provenance.json'), Buffer.from(JSON.stringify({ purpose: 'TEST-bundled-Shell-only', fullTaskQualified: false, bun: Bun.version, target: 'bun', format: 'esm', splitting: false, ignoreDCEAnnotations: true, effectEntry: within(sourceRoot, effectEntry), selections, inputs: provenance, transformations: result.transformations, emittedAssets: result.assets, watcherDisabled: true, fffDisabled: true })), false)
+  await add(path.join(readonly, 'windows-official-shell', 'bundle-provenance.json'), Buffer.from(JSON.stringify({ purpose: 'TEST-bundled-Shell-only', fullTaskQualified: false, bun: Bun.version, target: 'bun', format: 'esm', splitting: false, ignoreDCEAnnotations: true, effectEntry: within(sourceRoot, effectEntry), loggerSelection, loggerBinding: result.loggerBinding, selections, inputs: provenance, transformations: result.transformations, emittedAssets: result.assets, watcherDisabled: true, fffDisabled: true })), false)
   await add(path.join(readonly, 'windows-official-shell', 'bundle-metafile.json'), Buffer.from(JSON.stringify(result.metafile)), false)
   await writeFile(path.join(readonly, 'official-artifacts.json'), JSON.stringify(artifacts), { flag: 'wx' })
   return artifacts
@@ -236,12 +252,13 @@ async function buildOnly(generatedEntry: string, sourceRoot: string, output: str
   try {
     const loaded = await import(pathToFileURL(output).href)
     if (typeof loaded.runOfficialShellCheckpointBundled !== 'function') throw new Error('TEST bundled checkpoint export absent')
-    await writeFile(validationPath, JSON.stringify({ ...validation, phase: 'import-passed', passed: true }))
+    if (typeof loaded.bundledLoggerBinding?.direct !== 'function' || loaded.bundledLoggerBinding.direct !== loaded.bundledLoggerBinding.barrel) throw new Error('TEST bundled direct logger/barrel identity mismatch')
+    await writeFile(validationPath, JSON.stringify({ ...validation, phase: 'import-passed', passed: true, loggerBinding: { directExportJoined: true } }))
   } catch (error) {
     await writeFile(validationPath, JSON.stringify({ ...validation, phase: 'import-failed', passed: false, error: error instanceof Error ? { name: error.name, message: error.message.slice(0, 2048), stack: error.stack?.slice(0, 8192) } : { name: 'NonError' } }))
     throw new Error('TEST bundled checkpoint import refused; retained import evidence')
   }
-  await writeFile(resultPath, JSON.stringify({ inputs: [...inputs].map(([file, bytes]) => ({ file, sha256: hash(bytes) })), transformations, assets, metafile: result.metafile }), { flag: 'wx' })
+  await writeFile(resultPath, JSON.stringify({ inputs: [...inputs].map(([file, bytes]) => ({ file, sha256: hash(bytes) })), transformations, assets, loggerBinding: { directExportJoined: true }, metafile: result.metafile }), { flag: 'wx' })
   stage('build-result-published')
 }
 if (process.argv[2] === '--build-only') {
