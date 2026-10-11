@@ -22,12 +22,17 @@ if (child) {
   attempts.protectedAclEscapeError = native.attemptWindowsAclEscape(path.join(base, 'work', 'protected'))
   attempts.readOnlyAclEscapeError = native.attemptWindowsAclEscape(path.join(base, 'readonly'))
   await deny('readOnlyWriteDenied', () => writeFile(path.join(base, 'readonly', 'immutable.txt'), 'escape'))
-  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response('native-http-ok') })
-  const baseUrl = `http://127.0.0.1:${server.port}`
+  let baseUrl = ''
+  try {
+    const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response('native-http-ok') })
+    baseUrl = `http://127.0.0.1:${server.port}`
+  } catch (error) { attempts.serverStartupError = String(error) }
   try { attempts.selfHttp = await (await fetch(baseUrl, { signal: AbortSignal.timeout(3000) })).text() } catch (error) { attempts.selfHttp = String(error) }
   try { attempts.internet = (await fetch('https://example.com', { signal: AbortSignal.timeout(10000) })).status } catch (error) { attempts.internet = String(error) }
-  const descendant = Bun.spawn([process.execPath, '-e', 'setInterval(()=>{},1000)'], { stdio: ['ignore', 'ignore', 'ignore'], env: { ...process.env } })
-  attempts.descendantPID = descendant.pid
+  try {
+    const descendant = Bun.spawn([process.execPath, '-e', 'setInterval(()=>{},1000)'], { stdio: ['ignore', 'ignore', 'ignore'], env: { ...process.env } })
+    attempts.descendantPID = descendant.pid
+  } catch (error) { attempts.descendantStartupError = String(error) }
   attempts.jobBreakawayError = native.attemptWindowsJobBreakaway(process.execPath)
   // Named pipe carries the probe response without admin loopback exemptions.
   const pipe = createConnection(pipeName)

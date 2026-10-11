@@ -1,6 +1,12 @@
 name: OpenCode V2 Windows boundary TEST
 on:
   workflow_dispatch:
+  push:
+    branches: [feat/opencode-v2-windows-boundary]
+    paths:
+      - 'scripts/spikes/opencode-v2-windows-boundary.ts'
+      - 'scripts/spikes/opencode-v2-windows-native.ts'
+      - '.github/workflows/opencode-v2-windows-boundary-spike.yml'
 permissions:
   contents: read
 jobs:
