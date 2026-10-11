@@ -86,6 +86,9 @@ test('a hung Windows helper exhausts the original remainder without a retirement
   expect(failure).toBeInstanceOf(OpenCodeVersionProbeCleanupError)
   expect((failure as OpenCodeVersionProbeCleanupError).message).toBe('cleanup_unknown')
   expect((failure as OpenCodeVersionProbeCleanupError).helperFailure).toMatchObject({ operation: 'tree', reason: 'helper_timeout' })
+  expect((failure as OpenCodeVersionProbeCleanupError).probeFailure).toEqual({
+    phase: 'deadline', targetPid: null, targetRole: null, birthAvailable: null, alive: null,
+    censusMemberCount: null, censusMemberPids: [] })
   expect(f.budgets).toEqual([5000, 2975])
   expect(f.elapsed()).toBe(8000)
   expect(f.removed()).toBe(0)
@@ -176,12 +179,14 @@ function additionFixture(mode: 'gone' | 'alive' | 'unknown' | 'orphan' | 'reused
   let clock = 1_000_000, removed = 0, trees = 0, closed = false, leafReads = 0
   const signalled: number[] = [], budgets: number[] = [], aliveReads: number[] = []
   const events: Array<'census:rows' | 'census:empty' | 'remove'> = []
+  const operations: string[] = []
   const child = new EventEmitter() as ChildProcess
   Object.assign(child, { pid: root, stdout: new PassThrough() })
   const rows = [{ pid: root, ppid: process.pid }, { pid: relay, ppid: root },
     { pid: leaf, ppid: platform === 'darwin' ? 1 : relay }]
   const readRows = (budget: number) => {
     budgets.push(budget)
+    operations.push('tree')
     trees++
     if (trees === 1) return rows
     if (trees === 2 && (mode === 'orphan' || mode === 'late-orphan')) return mode === 'orphan' ? [{ pid: 900_013, ppid: leaf }] : []
@@ -199,6 +204,7 @@ function additionFixture(mode: 'gone' | 'alive' | 'unknown' | 'orphan' | 'reused
   const ports = spyOn(native, 'nativePorts').mockImplementation(() => ({
     platform, selfPid: process.pid, now: () => clock,
     birth: async (target, budget) => {
+      operations.push(`birth:${target}`)
       budgets.push(budget)
       clock += 10
       if (target === leaf) {
@@ -216,6 +222,7 @@ function additionFixture(mode: 'gone' | 'alive' | 'unknown' | 'orphan' | 'reused
     },
     tree: async budget => readRows(budget),
     alive: target => {
+      operations.push(`alive:${target}`)
       aliveReads.push(target)
       return target === leaf && (mode === 'alive' || mode === 'confirmation-live' || mode === 'confirmation-reused' || mode === 'stale-live') ? 'alive'
         : target === leaf && mode === 'unknown' ? 'unknown' : 'gone'
@@ -237,7 +244,7 @@ function additionFixture(mode: 'gone' | 'alive' | 'unknown' | 'orphan' | 'reused
   }
   const roots = { root: '/TEST/private', env: {}, remove: async () => { events.push('remove'); removed++ } } as OpenCodeV2ReadRoots
   return { run: () => readOpenCodeOwnedVersion('/TEST/native', roots), removed: () => removed,
-    trees: () => trees, leafReads: () => leafReads, signalled, budgets, aliveReads, events, leaf }
+    trees: () => trees, leafReads: () => leafReads, signalled, budgets, aliveReads, events, leaf, operations }
 }
 
 for (const mode of ['gone', 'confirmation-gone', 'stale-gone'] as const) {
@@ -257,7 +264,16 @@ for (const mode of ['alive', 'unknown', 'orphan', 'reused', 'older', 'expired',
   'confirmation-live', 'confirmation-reused', 'stale-live', 'late-orphan', 'open'] as const) {
   test(`Windows ${mode} snapshot addition remains unknown without deleting private roots or signalling candidates`, async () => {
     const f = additionFixture(mode)
-    await expect(f.run()).rejects.toThrow('cleanup_unknown')
+    let failure: unknown
+    try { await f.run() } catch (error) { failure = error }
+    expect(failure).toBeInstanceOf(OpenCodeVersionProbeCleanupError)
+    expect((failure as Error).message).toBe('cleanup_unknown')
+    if (mode === 'confirmation-live') expect((failure as OpenCodeVersionProbeCleanupError).probeFailure).toEqual({
+      phase: 'confirmation_member_absent', targetPid: f.leaf, targetRole: 'member',
+      birthAvailable: null, alive: 'alive', censusMemberCount: 0, censusMemberPids: [] })
+    if (mode === 'late-orphan') expect((failure as OpenCodeVersionProbeCleanupError).probeFailure).toEqual({
+      phase: 'candidate_reappeared', targetPid: null, targetRole: null,
+      birthAvailable: null, alive: null, censusMemberCount: 0, censusMemberPids: [] })
     expect(f.removed()).toBe(0)
     expect(f.signalled).toEqual([])
     if (mode === 'stale-live') expect(f.leafReads()).toBe(2)
@@ -275,3 +291,26 @@ test('darwin gone group member with reparented PPID requires absence and final c
   expect(f.budgets.every(budget => budget > 0 && budget <= 2000)).toBe(true)
   expect(f.events.slice(-2)).toEqual(['census:empty', 'remove'])
 })
+
+// Diagnostic metadata is a snapshot of existing reads, not a second census.
+for (const [mode, phase, operations] of [
+  ['alive', 'candidate_birth', ['birth:900010', 'tree', 'birth:900010', 'birth:900011', 'birth:900012', 'alive:900012']],
+  ['stale-live', 'confirmation_birth', ['birth:900010', 'tree', 'birth:900010', 'birth:900011', 'birth:900012', 'tree', 'birth:900011', 'alive:900011', 'birth:900012', 'alive:900012']],
+] as const) {
+  test(`TEST trace records ${mode} identity refusal without extra queries or signals`, async () => {
+    const f = additionFixture(mode)
+    let rejected: unknown
+    try { await f.run() } catch (error) { rejected = error }
+    expect(rejected).toBeInstanceOf(OpenCodeVersionProbeCleanupError)
+    const error = rejected as OpenCodeVersionProbeCleanupError
+    expect(error.message).toBe('cleanup_unknown')
+    expect(f.operations).toEqual([...operations])
+    expect(f.budgets).toEqual(Array(mode === 'alive' ? 5 : 8).fill(5000))
+    expect(f.removed()).toBe(0)
+    expect(f.signalled).toEqual([])
+    expect(Object.isFrozen(error.probeFailure?.censusMemberPids)).toBe(true)
+    expect(error.probeFailure).toEqual({ phase, targetPid: f.leaf, targetRole: 'member',
+      birthAvailable: false, alive: 'alive', censusMemberCount: 3,
+      censusMemberPids: [900010, 900011, 900012] })
+  })
+}

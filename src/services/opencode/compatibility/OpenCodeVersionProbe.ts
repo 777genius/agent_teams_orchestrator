@@ -6,9 +6,21 @@ import { nativePorts, query, type NativeHelperFailure, type NativeRow } from '..
 import type { OpenCodeV2ReadRoots } from '../profile/OpenCodeV2ManagedConfig.js'
 import { boundOpenCodeRead } from '../transport/OpenCodeBoundedFetch.js'
 
+// TEST diagnostic instrumentation only; not the immutable d636 production closure.
+type VersionProbePhase = 'started' | 'deadline' | 'candidate_reappeared' | 'initial_birth' |
+  'anchor_birth' | 'candidate_birth' | 'confirmation_birth' | 'signal_birth' | 'census' |
+  'unanchored_members' | 'candidate_identity_order' | 'confirmation_census' |
+  'confirmation_member_absent' | 'signal' | 'pending_retirement' | 'final_census' | 'self_in_group' | 'sleep'
+type VersionProbeTrace = {
+  phase: VersionProbePhase; targetPid: number | null; targetRole: 'leader' | 'member' | null
+  birthAvailable: boolean | null; alive: 'alive' | 'gone' | 'unknown' | null
+  censusMemberCount: number | null; censusMemberPids: readonly number[]
+}
+
 /** Finite helper evidence only; raw query causes remain private to this process. */
 export class OpenCodeVersionProbeCleanupError extends Error {
-  constructor(cause: unknown, readonly helperFailure: NativeHelperFailure | null) {
+  constructor(cause: unknown, readonly helperFailure: NativeHelperFailure | null,
+    readonly probeFailure: Readonly<VersionProbeTrace> | null = null) {
     super('cleanup_unknown', { cause })
   }
 }
@@ -65,6 +77,13 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
     let helperFailure: NativeHelperFailure | null = null
     const ports = nativePorts({}, failure => { helperFailure = failure })
     const pid = child.pid
+    const trace: VersionProbeTrace = { phase: 'started', targetPid: null, targetRole: null,
+      birthAvailable: null, alive: null, censusMemberCount: null, censusMemberPids: [] }
+    const setPhase = (phase: VersionProbePhase, target: number | null = null) => {
+      trace.phase = phase; trace.targetPid = target
+      trace.targetRole = target === null ? null : target === pid ? 'leader' : 'member'
+      trace.birthAvailable = null; trace.alive = null
+    }
     const started = Date.now(), deadline = started + 8000
     // Match processKill.ts's 5s Windows process-birth query budget: cold
     // PowerShell/WMI startup can exceed 2s. Every helper still uses the
@@ -97,7 +116,7 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
     }))
     const cap = () => {
       const remaining = deadline - Date.now()
-      if (remaining <= 0) throw new Error('cleanup_unknown')
+      if (remaining <= 0) { setPhase('deadline'); throw new Error('cleanup_unknown') }
       return remaining
     }
     const observe = <T>(work: Promise<T>) => boundOpenCodeRead(track(work), cap())
@@ -109,17 +128,34 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
     const unownedCandidates = new Set<number>()
     const assertCandidatesAbsent = (rows: Member[]) => {
       if (rows.some(row => !row.retired &&
-        (unownedCandidates.has(row.pid) || unownedCandidates.has(row.ppid)))) throw new Error('cleanup_unknown')
+        (unownedCandidates.has(row.pid) || unownedCandidates.has(row.ppid)))) {
+        setPhase('candidate_reappeared'); throw new Error('cleanup_unknown')
+      }
     }
-    const birth = (target: number) => observe(ports.birth(target, Math.min(helperTimeout, cap())))
-    const sameBirth = async (target: number, expected: number): Promise<boolean> => {
-      if (await birth(target) === expected) return true
+    const birth = (target: number, phase: VersionProbePhase) => {
+      setPhase(phase, target)
+      const work = observe(ports.birth(target, Math.min(helperTimeout, cap())))
+      // Observe the original promise; do not insert another awaited boundary.
+      void work.then(value => { trace.birthAvailable = value !== null }, () => { trace.birthAvailable = null })
+      return work
+    }
+    const alive = (target: number) => {
+      const value = ports.alive(target)
+      if (trace.targetPid !== target) trace.birthAvailable = null
+      trace.targetPid = target; trace.targetRole = target === pid ? 'leader' : 'member'
+      trace.alive = value
+      return value
+    }
+    const sameBirth = async (target: number, expected: number, phase: VersionProbePhase): Promise<boolean> => {
+      if (await birth(target, phase) === expected) return true
       // Exiting between a table snapshot and the birth read is retirement,
       // whereas a live replacement or unreadable live identity is unknown.
-      if (ports.alive(target) === 'gone') return false
+      if (alive(target) === 'gone') return false
       throw new Error('cleanup_unknown')
     }
-    const table = async (): Promise<Member[]> => {
+    const table = async (phase: VersionProbePhase = 'census'): Promise<Member[]> => {
+      setPhase(phase)
+      trace.censusMemberCount = null; trace.censusMemberPids = []
       if (process.platform === 'win32') return (await observe(ports.tree(Math.min(helperTimeout, cap()))))
         .map(row => ({ ...row, group: null, retired: false }))
       // The detached POSIX spawn creates an isolated group. Unlike a PPID walk,
@@ -147,12 +183,13 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
     try {
       if (signal?.aborted) fail()
       if (pid) {
-        const initial = await birth(pid)
+        const initial = await birth(pid, 'initial_birth')
         if (initial !== null) births.set(pid, initial)
       }
       for (;;) {
         cap()
         const rows = await table(), group = members(rows)
+        trace.censusMemberCount = group.length; trace.censusMemberPids = group.slice(0, 64).map(row => row.pid)
         assertCandidatesAbsent(rows)
         const live = rows.filter(row => !row.retired)
         // A live birth-checked member anchors group continuity. If the initial
@@ -160,34 +197,36 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
         let anchor: Member | undefined
         for (const row of group) {
           const expected = births.get(row.pid)
-          if (expected !== undefined && await sameBirth(row.pid, expected)) { anchor = row; break }
+          if (expected !== undefined && await sameBirth(row.pid, expected, 'anchor_birth')) { anchor = row; break }
         }
         const additions = group.filter(row => !births.has(row.pid))
-        if (additions.length && !anchor) throw new Error('cleanup_unknown')
+        if (additions.length && !anchor) { setPhase('unanchored_members'); throw new Error('cleanup_unknown') }
         const capturedAdditions: Member[] = []
         for (const row of additions) {
-          if (row.pid === process.pid || row.pid === process.ppid) throw new Error('cleanup_unknown')
-          const identity = await birth(row.pid)
+          if (row.pid === process.pid || row.pid === process.ppid) { setPhase('self_in_group', row.pid); throw new Error('cleanup_unknown') }
+          const identity = await birth(row.pid, 'candidate_birth')
           if (identity === null) {
-            if (ports.alive(row.pid) !== 'gone') throw new Error('cleanup_unknown')
+            if (alive(row.pid) !== 'gone') throw new Error('cleanup_unknown')
             cap()
             unownedCandidates.add(row.pid)
             continue
           }
           const parentBirth = process.platform === 'win32' ? births.get(row.ppid) : births.get(anchor!.pid)
-          if (parentBirth === undefined || identity < parentBirth) throw new Error('cleanup_unknown')
+          if (parentBirth === undefined || identity < parentBirth) { trace.phase = 'candidate_identity_order'; throw new Error('cleanup_unknown') }
           births.set(row.pid, identity)
           capturedAdditions.push(row)
         }
         if (additions.length) {
-          const confirmationRows = await table()
-          assertCandidatesAbsent(confirmationRows)
+          const confirmationRows = await table('confirmation_census')
           const confirmation = members(confirmationRows)
+          trace.censusMemberCount = confirmation.length; trace.censusMemberPids = confirmation.slice(0, 64).map(row => row.pid)
+          assertCandidatesAbsent(confirmationRows)
           for (const row of capturedAdditions) {
             if (!confirmation.some(current => current.pid === row.pid && current.ppid === row.ppid)) {
-              if (ports.alive(row.pid) !== 'gone') throw new Error('cleanup_unknown')
+              setPhase('confirmation_member_absent', row.pid)
+              if (alive(row.pid) !== 'gone') throw new Error('cleanup_unknown')
               unownedCandidates.add(row.pid)
-            } else if (!await sameBirth(row.pid, births.get(row.pid)!)) {
+            } else if (!await sameBirth(row.pid, births.get(row.pid)!, 'confirmation_birth')) {
               unownedCandidates.add(row.pid)
             }
             cap()
@@ -196,24 +235,27 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
         if (stopping) {
           for (const [target, identity] of births) {
             if (unownedCandidates.has(target) || !live.some(row => row.pid === target) || signalled.has(target)) continue
-            if (!await sameBirth(target, identity)) continue
+            if (!await sameBirth(target, identity, 'signal_birth')) continue
             cap()
             // Signals target captured births only, never a numeric group alone.
-            try { ports.signal(target) } catch {
-              if (ports.alive(target) !== 'gone') throw new Error('cleanup_unknown')
+            try { trace.phase = 'signal'; ports.signal(target) } catch {
+              if (alive(target) !== 'gone') throw new Error('cleanup_unknown')
             }
             signalled.add(target)
           }
         }
         const survivors = [...births.keys()].filter(target => live.some(row => row.pid === target))
         if (closed && group.length === 0 && survivors.length === 0) {
+          setPhase('pending_retirement')
           await boundOpenCodeRead(close, cap())
           await boundOpenCodeRead(Promise.allSettled([...pending]), cap())
           if (pending.size) throw new Error('cleanup_unknown')
           if (unownedCandidates.size) {
-            const finalRows = await table()
+            const finalRows = await table('final_census')
+            const finalMembers = members(finalRows)
+            trace.censusMemberCount = finalMembers.length; trace.censusMemberPids = finalMembers.slice(0, 64).map(row => row.pid)
             assertCandidatesAbsent(finalRows)
-            if (members(finalRows).length || finalRows.some(row => !row.retired && births.has(row.pid))) {
+            if (finalMembers.length || finalRows.some(row => !row.retired && births.has(row.pid))) {
               throw new Error('cleanup_unknown')
             }
             await boundOpenCodeRead(Promise.allSettled([...pending]), cap())
@@ -224,10 +266,12 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
           if (failure || !ended || code !== 0 || signal?.aborted) throw failure ?? new Error('selection_unavailable')
           return output
         }
+        setPhase('sleep')
         await ports.sleep(Math.min(25, cap()))
       }
     } catch (error) {
-      if (!retired) throw new OpenCodeVersionProbeCleanupError(error, helperFailure)
+      if (!retired) throw new OpenCodeVersionProbeCleanupError(error, helperFailure,
+        Object.freeze({ ...trace, censusMemberPids: Object.freeze([...trace.censusMemberPids]) }))
       throw error
     } finally {
       clearTimeout(timer); signal?.removeEventListener('abort', abort)
