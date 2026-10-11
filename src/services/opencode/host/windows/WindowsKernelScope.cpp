@@ -1157,8 +1157,10 @@ int wmain(int argc, wchar_t **argv) {
           if (!process) {
             require(GetLastError() == ERROR_INVALID_PARAMETER, "execution_identity_unknown");
             flag(value, L"absent", true);
-          } else
+          } else {
             value = identity(process.value, static_cast<DWORD>(raw));
+            flag(value, L"exited", WaitForSingleObject(process.value, 0) == WAIT_OBJECT_0);
+          }
         } else if (operation == L"launch") {
           require(!scope, "execution_containment_unavailable");
           scope = launch(input, owners);

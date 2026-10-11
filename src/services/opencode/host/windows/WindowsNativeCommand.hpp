@@ -14,8 +14,14 @@ struct NativeCommand {
     finished = true;
     if (job)
       TerminateJobObject(job.value, 99);
-    if (process)
+    if (process) {
+      // Even pre-resume validation failure retains the exact created HANDLE.
+      // Retire that process directly if Job queries/assignment are uncertain;
+      // never leave a suspended acquisition waiting for an unverifiable Job.
+      if (WaitForSingleObject(process.value, 0) != WAIT_OBJECT_0)
+        TerminateProcess(process.value, 99);
       WaitForSingleObject(process.value, INFINITE);
+    }
     if (monitor.joinable())
       monitor.join();
   }
@@ -63,6 +69,7 @@ struct NativeCommand {
       num(result, L"exitCode", code);
     }
     flag(result, L"outputLimitExceeded", oversized);
+    num(result, L"activeProcesses", active());
     return result;
   }
   JsonObject retire() {

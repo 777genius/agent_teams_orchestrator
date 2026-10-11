@@ -5,13 +5,13 @@ on:
       lane:
         description: 'Select the mechanism under investigation; all for final qualification'
         type: choice
-        options: [all, native-owner, native-boundary, official-shell]
+        options: [all, native-owner, native-command, native-boundary, official-shell]
         default: all
 permissions:
   contents: read
 jobs:
   native-owner:
-    if: inputs.lane == 'all' || inputs.lane == 'native-owner'
+    if: inputs.lane == 'all' || inputs.lane == 'native-owner' || inputs.lane == 'native-command'
     runs-on: windows-2022
     timeout-minutes: 10
     steps:
@@ -43,6 +43,13 @@ jobs:
           $root = Join-Path $env:RUNNER_TEMP ('TEST-windows-owner-' + [guid]::NewGuid().ToString())
           & bun scripts/opencode-v2/windows-owner-probe.ts $root 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP\windows-owner-evidence.txt"
           exit $LASTEXITCODE
+      - name: Prove native command output, stdin EOF and descendant cancellation
+        if: inputs.lane == 'all' || inputs.lane == 'native-command'
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP ('TEST-windows-command-' + [guid]::NewGuid().ToString())
+          & bun scripts/opencode-v2/windows-command-probe.ts $root "$env:RUNNER_TEMP\windows-command-evidence.json" 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP\windows-command-output.txt"
+          exit $LASTEXITCODE
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -51,6 +58,9 @@ jobs:
             native/win32-x64/
             ${{ runner.temp }}/windows-owner-evidence.txt
             ${{ runner.temp }}/TEST-windows-owner-*/
+            ${{ runner.temp }}/windows-command-evidence.json
+            ${{ runner.temp }}/windows-command-output.txt
+            ${{ runner.temp }}/TEST-windows-command-*/
           if-no-files-found: error
   native-boundary:
     if: inputs.lane == 'all' || inputs.lane == 'native-boundary'

@@ -37,8 +37,9 @@ export type WindowsNativeBroker = Readonly<{
  * reference; no HANDLE values are serialized or inherited by user commands. */
 export function createWindowsNativeBroker(artifact: WindowsNativeArtifact): WindowsNativeBroker {
   assert(artifacts.has(artifact), 'execution_containment_helper_identity')
+  assert(typeof process.env.LOCALAPPDATA === 'string' && path.win32.isAbsolute(process.env.LOCALAPPDATA), 'execution_containment_profile_denied')
   const events = new EventEmitter(), pending = new Map<number, { resolve(value: unknown): void; reject(error: Error): void; dispose(): void }>()
-  const child = spawn(artifact.path, ['--broker'], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], env: { SystemRoot: process.env.SystemRoot, WINDIR: process.env.WINDIR } })
+  const child = spawn(artifact.path, ['--broker'], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], env: { SystemRoot: process.env.SystemRoot, WINDIR: process.env.WINDIR, LOCALAPPDATA: process.env.LOCALAPPDATA } })
   let ended = false, sequence = 0, buffer = '', stderr = ''
   const decoder = new StringDecoder('utf8')
   let resolveExit!: () => void
