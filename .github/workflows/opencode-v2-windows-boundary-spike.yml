@@ -34,7 +34,9 @@ jobs:
           $helper = Join-Path $directory 'opencode-v2-windows-helper.exe'
           $source = Join-Path $env:GITHUB_WORKSPACE 'src\services\opencode\host\windows\WindowsKernelScope.cpp'
           $vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
-          & cmd.exe /d /s /c "`"`"$vcvars`" && cl.exe /nologo /std:c++20 /EHsc /MT /W4 /O2 /DUNICODE /D_UNICODE `"$source`" /Fe:`"$helper`" /link windowsapp.lib userenv.lib advapi32.lib`""
+          $compileScript = Join-Path $env:RUNNER_TEMP 'compile-opencode-native.cmd'
+          @("@echo off", "call `"$vcvars`"", "if errorlevel 1 exit /b 1", "cl.exe /nologo /std:c++20 /EHsc /MT /W4 /O2 /DUNICODE /D_UNICODE `"$source`" /Fe:`"$helper`" /link windowsapp.lib userenv.lib advapi32.lib", "exit /b %errorlevel%") | Set-Content $compileScript -Encoding ascii
+          & cmd.exe /d /c $compileScript
           if ($LASTEXITCODE -ne 0) { throw 'native helper compile failed' }
           $manifest = @{format=1;platform='win32';arch='x64';name='opencode-v2-windows-helper.exe';sha256=(Get-FileHash $helper -Algorithm SHA256).Hash.ToLowerInvariant()}
           $manifest | ConvertTo-Json -Compress | Set-Content (Join-Path $directory 'windows-helper.json') -Encoding utf8NoBOM
