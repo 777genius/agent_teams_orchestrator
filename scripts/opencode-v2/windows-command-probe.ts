@@ -31,6 +31,43 @@ async function ps(script: string, extra: Record<string, string> = {}) {
   }
   return out.trim()
 }
+async function aclSnapshot() {
+  return JSON.parse(await ps(`
+$ErrorActionPreference='Stop'
+Add-Type -TypeDefinition @'
+using System;using System.Runtime.InteropServices;
+public static class TestFileMask {
+[DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)]public static extern IntPtr CreateFileW(string name,uint access,uint share,IntPtr security,uint creation,uint flags,IntPtr template);
+[DllImport("kernel32.dll")]public static extern bool CloseHandle(IntPtr handle);
+}
+'@
+$result=[ordered]@{}
+foreach($name in @('.','actual-command.txt')){
+$p=if($name-eq '.'){ $env:TEST_ROOT }else{Join-Path $env:TEST_ROOT $name}
+$entry=[ordered]@{}
+try{
+$acl=Get-Acl -LiteralPath $p
+$entry.owner=$acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+$entry.sddl=$acl.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]'Owner,Group,Access')
+$entry.protected=$acl.AreAccessRulesProtected
+$entry.aces=@($acl.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier])|ForEach-Object{
+[ordered]@{sid=$_.IdentityReference.Value;rights=[uint32]$_.FileSystemRights;type=[string]$_.AccessControlType;inherited=$_.IsInherited;inheritance=[string]$_.InheritanceFlags;propagation=[string]$_.PropagationFlags}
+})
+}catch{$entry.aclError=[int]$_.Exception.HResult}
+if($name-ne '.'){
+$entry.masks=[ordered]@{}
+foreach($mask in @(0x80,0x1,0x120189)){
+$handle=[TestFileMask]::CreateFileW($p,[uint32]$mask,7,[IntPtr]::Zero,3,0x200000,[IntPtr]::Zero)
+$errorCode=[Runtime.InteropServices.Marshal]::GetLastWin32Error()
+if($handle-ne [IntPtr]::new(-1)){[TestFileMask]::CloseHandle($handle)|Out-Null;$errorCode=0}
+$entry.masks[[string]$mask]=$errorCode
+}
+}
+$result[$name]=$entry
+}
+ConvertTo-Json -InputObject $result -Depth 8 -Compress
+`)) as unknown
+}
 function record(value: unknown): Record<string, unknown> { assert.ok(value && typeof value === 'object' && !Array.isArray(value)); return value as Record<string, unknown> }
 const messages: Record<string, unknown>[] = []
 broker.events.on('message', value => messages.push(record(value)))
@@ -139,8 +176,10 @@ if($LASTEXITCODE-ne 0){throw 'TEST low label failed'}
   const command = await start(path.join(root, 'output.ts'), 'ignore')
   const [stdout, stderr] = await Promise.all([output(command.commandId, 'stdout'), output(command.commandId, 'stderr')])
   assert.equal(stdout.toString(), 'native-output-é'); assert.equal(stderr.toString(), 'native-error-marker')
+  facts.outputCommand = command; facts.nativeStdoutPassed = true; facts.nativeStderrPassed = true
+  facts.fileAclBeforeRetirement = await aclSnapshot()
   assert.equal(await readFile(path.join(root, 'actual-command.txt'), 'utf8'), 'native-command-written')
-  facts.outputCommand = command; await closeCommand(command.commandId)
+  await closeCommand(command.commandId)
   stage = 'native-stdin-echo'
   const echo = await start(path.join(root, 'echo.ts'), 'pipe'), expected = Buffer.alloc(23000)
   for (let i = 0; i < expected.length; i++) expected[i] = i % 251
@@ -176,7 +215,8 @@ finally {
   facts.failedStage = failure ? stage : undefined
   if (failure) {
     const value = failure instanceof Error ? failure.message : ''
-    facts.failureCode = /^[a-zA-Z0-9_:.-]{1,160}$/.test(value) ? value : 'windows_command_assertion_failed'
+    const code = (failure as { code?: unknown }).code
+    facts.failureCode = /^[a-zA-Z0-9_:.-]{1,160}$/.test(value) ? value : typeof code === 'string' && /^[A-Z_]{1,64}$/.test(code) ? `windows_command_host_io:${code}` : 'windows_command_assertion_failed'
   }
   const cleanupErrors: string[] = []
   if (launched) {
@@ -190,6 +230,10 @@ finally {
       await ps(`$ErrorActionPreference='Stop';$paths=@(Get-Content -LiteralPath $env:TEST_JOURNAL -Raw|ConvertFrom-Json);foreach($p in $paths){$acl=Get-Acl -LiteralPath $p;foreach($rule in @($acl.Access)){if($rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value-eq $env:TEST_SID){$acl.RemoveAccessRuleAll($rule)}};Set-Acl -LiteralPath $p -AclObject $acl;$check=Get-Acl -LiteralPath $p;foreach($rule in @($check.Access)){if($rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value-eq $env:TEST_SID){throw 'TEST own ACE remains'}}}`, { TEST_SID: sid })
       facts.ancestorOwnAcesRemoved = true
     } catch { cleanupErrors.push('test_ancestor_cleanup_unknown') }
+  }
+  if (retired && facts.fileAclBeforeRetirement) {
+    try { facts.fileAclAfterRetirement = await aclSnapshot() }
+    catch { facts.fileAclAfterRetirement = { snapshotFailed: true } }
   }
   for (const handle of handles.reverse()) try { await handle.close() } catch { cleanupErrors.push('native_owner_handle_close_unknown') }
   try { await broker.close() } catch { cleanupErrors.push('native_broker_close_unknown') }

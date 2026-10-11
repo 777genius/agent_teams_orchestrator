@@ -60,7 +60,6 @@ jobs:
             ${{ runner.temp }}/TEST-windows-owner-*/
             ${{ runner.temp }}/windows-command-evidence.json
             ${{ runner.temp }}/windows-command-output.txt
-            ${{ runner.temp }}/TEST-windows-command-*/
           if-no-files-found: error
   native-boundary:
     if: inputs.lane == 'all' || inputs.lane == 'native-boundary'
