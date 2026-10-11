@@ -1,6 +1,6 @@
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { cp, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { cp, mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
 import { createConnection } from 'node:net'
 
 if (process.platform !== 'win32' || process.arch !== 'x64' || process.versions.bun !== '1.3.11') throw new Error('native Windows x64 Bun 1.3.11 required')
@@ -17,6 +17,9 @@ if (child) {
   try {
   await writeFile(path.join(base, 'work', 'allowed.txt'), 'owned write')
   attempts.ownedWrite = true
+  await deny('outsideApprovedReadDenied', () => readFile(path.join(base, 'private-canary.txt')))
+  await deny('outsideApprovedWriteDenied', () => writeFile(path.join(base, 'private-canary.txt'), 'escape'))
+  await deny('siblingListingDenied', () => readdir(path.join(base, 'private-sibling')))
   await deny('hostStateWriteDenied', () => writeFile(path.join(base, 'host-state', 'secret.txt'), 'escape'))
   await deny('protectedWriteDenied', () => writeFile(path.join(base, 'work', 'protected', 'owner.json'), 'escape'))
   await deny('protectedRenameDenied', () => rename(path.join(base, 'work', 'protected'), path.join(base, 'work', 'stolen')))
@@ -49,11 +52,22 @@ if (child) {
   let container: ReturnType<typeof native.createWindowsContainer> | undefined
   let pipe: ReturnType<typeof native.createWindowsPipe> | undefined
   let launch: ReturnType<typeof native.launchWindowsContainer> | undefined
+  const ancestorJournal = path.join(root, 'ancestor-ace-journal.json')
+  const runPowerShell = async (script: string) => {
+    const command = Bun.spawn([path.join(process.env.ProgramFiles!, 'PowerShell', '7', 'pwsh.exe'), '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
+      { env: { ...process.env, PSModulePath: path.join(process.env.ProgramFiles!, 'PowerShell', '7', 'Modules'), TEST_CONTAINER_SID: container!.sid, TEST_ROOT: root, TEST_ANCESTOR_JOURNAL: ancestorJournal }, stdout: 'pipe', stderr: 'pipe' })
+    // Drain both streams; neither can block a setup or cleanup operation.
+    const [stderr, stdout, code] = await Promise.all([new Response(command.stderr).text(), new Response(command.stdout).text(), command.exited])
+    if (code !== 0) throw new Error(`TEST ACL operation:${stderr}${stdout}`)
+  }
   const evidence: Record<string, unknown> = { schema: 1, purpose: 'TEST-native-feasibility', repositorySHA: process.env.GITHUB_SHA ?? null,
     os: process.platform, arch: process.arch, bun: process.versions.bun, profileName, root }
   try {
     await mkdir(root, { recursive: true })
-    for (const directory of ['work', 'work/protected', 'host-state', 'readonly']) await mkdir(path.join(root, directory), { recursive: true })
+    for (const directory of ['work', 'work/protected', 'host-state', 'readonly', 'private-sibling']) await mkdir(path.join(root, directory), { recursive: true })
+    await writeFile(path.join(root, 'private-canary.txt'), 'host-owned')
+    await writeFile(path.join(root, 'private-sibling', 'secret.txt'), 'host-owned')
+    await writeFile(ancestorJournal, '[]')
     await writeFile(path.join(root, 'host-state', 'secret.txt'), 'host-owned')
     await writeFile(path.join(root, 'work', 'protected', 'owner.json'), 'host-owned')
     await writeFile(path.join(root, 'readonly', 'immutable.txt'), 'host-owned')
@@ -82,11 +96,26 @@ Rule (Join-Path $env:TEST_ROOT 'work/protected') ([System.Security.AccessControl
 Rule (Join-Path $env:TEST_ROOT 'host-state') ([System.Security.AccessControl.FileSystemRights]::FullControl) ([System.Security.AccessControl.AccessControlType]::Deny)
 & icacls.exe (Join-Path $env:TEST_ROOT 'work') /setintegritylevel '(OI)(CI)L' /T /Q
 if ($LASTEXITCODE -ne 0) { throw 'TEST low integrity setup failed' }
+# Bun1.3.11 resolver opens every ancestor directory with mask0x1200a9.
+# Each ACE applies to this directory only, never files or subdirectories.
+$added = [System.Collections.Generic.List[string]]::new()
+$ancestor = $env:TEST_ROOT
+while ($ancestor) {
+  $acl = Get-Acl -LiteralPath $ancestor
+  $rule = [System.Security.AccessControl.FileSystemAccessRule]::new($sid, [System.Security.AccessControl.FileSystemRights]::ReadAndExecute, [System.Security.AccessControl.InheritanceFlags]::None, $none, [System.Security.AccessControl.AccessControlType]::Allow)
+  $acl.AddAccessRule($rule)
+  $added.Add($ancestor)
+  ConvertTo-Json -InputObject $added.ToArray() -Compress | Set-Content -LiteralPath $env:TEST_ANCESTOR_JOURNAL -Encoding utf8NoBOM
+  Set-Acl -LiteralPath $ancestor -AclObject $acl
+  $parentInfo = [System.IO.DirectoryInfo]::new($ancestor).Parent
+  $parent = if ($parentInfo) { $parentInfo.FullName } else { $null }
+  if ($parent -eq $ancestor) { break }
+  $ancestor = $parent
+}
 `;
-    const acl = Bun.spawn([path.join(process.env.ProgramFiles!, 'PowerShell', '7', 'pwsh.exe'), '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(aclScript, 'utf16le').toString('base64')],
-      { env: { ...process.env, PSModulePath: path.join(process.env.ProgramFiles!, 'PowerShell', '7', 'Modules'), TEST_CONTAINER_SID: container.sid, TEST_ROOT: root }, stdout: 'pipe', stderr: 'pipe' })
-    const aclError = await new Response(acl.stderr).text()
-    if (await acl.exited !== 0) throw new Error(`TEST ACL setup:${aclError}`)
+    await runPowerShell(aclScript)
+    evidence.ancestorDirectoryAccessMask = '0x1200a9'
+    evidence.ancestorGrantCount = (JSON.parse(await readFile(ancestorJournal, 'utf8')) as unknown[]).length
     const executable = path.join(root, 'readonly', 'bun.exe'), childOutput = path.join(root, 'child-output.txt')
     const launchEnv = { SystemRoot: process.env.SystemRoot!, WINDIR: process.env.WINDIR!, PATH: `${path.dirname(executable)};${process.env.SystemRoot}\\System32`,
       // CreateProcess constructs the profile namespace from this system path.
@@ -120,7 +149,7 @@ if ($LASTEXITCODE -ne 0) { throw 'TEST low integrity setup failed' }
     evidence.hostStateRetained = await readFile(path.join(root, 'host-state', 'secret.txt'), 'utf8') === 'host-owned'
     evidence.protectedRetained = await readFile(path.join(root, 'work', 'protected', 'owner.json'), 'utf8') === 'host-owned'
     evidence.readOnlyRetained = await readFile(path.join(root, 'readonly', 'immutable.txt'), 'utf8') === 'host-owned'
-    const critical = ['ownedWrite', 'hostStateWriteDenied', 'protectedWriteDenied', 'protectedRenameDenied', 'protectedDeleteDenied', 'readOnlyWriteDenied']
+    const critical = ['ownedWrite', 'outsideApprovedReadDenied', 'outsideApprovedWriteDenied', 'siblingListingDenied', 'hostStateWriteDenied', 'protectedWriteDenied', 'protectedRenameDenied', 'protectedDeleteDenied', 'readOnlyWriteDenied']
     evidence.filesystemPassed = critical.every(key => report.attempts[key] === true) && report.attempts.protectedAclEscapeError === 5 && report.attempts.readOnlyAclEscapeError === 5 && evidence.hostStateRetained && evidence.protectedRetained && evidence.readOnlyRetained
     evidence.jobPassed = Number(evidence.activeWithDescendant) >= 2 && evidence.activeAfterTerminate === 0 && evidence.processExited && report.attempts.jobBreakawayError === 5
     evidence.dropInLoopbackPassed = evidence.parentHttp === 'native-http-ok'
@@ -137,9 +166,32 @@ if ($LASTEXITCODE -ne 0) { throw 'TEST low integrity setup failed' }
         if (evidence.cleanupActiveProcesses !== 0 || !evidence.cleanupProcessExited) throw new Error('TEST native retirement uncertain')
       } catch (error) { cleanupErrors.push(String(error)) }
     }
-    for (const dispose of [() => launch?.close(), () => pipe?.close(), () => container?.close()]) {
+    let heldHandlesClosed = !launch
+    try { launch?.close(); heldHandlesClosed = true; evidence.cleanupHeldHandlesClosed = true } catch (error) { cleanupErrors.push(String(error)) }
+    for (const dispose of [() => pipe?.close()]) {
       try { dispose() } catch (error) { cleanupErrors.push(String(error)) }
     }
+    if (container && heldHandlesClosed && (!launch || (evidence.cleanupActiveProcesses === 0 && evidence.cleanupProcessExited === true))) {
+      try {
+        await runPowerShell(`
+$ErrorActionPreference = 'Stop'
+$sid = [System.Security.Principal.SecurityIdentifier]::new($env:TEST_CONTAINER_SID)
+$rule = [System.Security.AccessControl.FileSystemAccessRule]::new($sid, [System.Security.AccessControl.FileSystemRights]::ReadAndExecute, [System.Security.AccessControl.InheritanceFlags]::None, [System.Security.AccessControl.PropagationFlags]::None, [System.Security.AccessControl.AccessControlType]::Allow)
+if (Test-Path -LiteralPath $env:TEST_ANCESTOR_JOURNAL) {
+  $paths = @(Get-Content -LiteralPath $env:TEST_ANCESTOR_JOURNAL -Raw | ConvertFrom-Json)
+  foreach ($target in $paths) {
+    $acl = Get-Acl -LiteralPath $target
+    $acl.RemoveAccessRuleSpecific($rule)
+    Set-Acl -LiteralPath $target -AclObject $acl
+    $remaining = (Get-Acl -LiteralPath $target).Access | Where-Object { !$_.IsInherited -and $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -eq $sid.Value -and $_.InheritanceFlags -eq [System.Security.AccessControl.InheritanceFlags]::None -and $_.PropagationFlags -eq [System.Security.AccessControl.PropagationFlags]::None -and $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and [int]$_.FileSystemRights -eq 0x1200a9 }
+    if ($remaining) { throw 'TEST ancestor ACE remained after removal' }
+  }
+}
+`)
+        evidence.ancestorOwnAcesRemoved = true
+      } catch (error) { cleanupErrors.push(String(error)) }
+    } else if (container) cleanupErrors.push('TEST ancestor grants retained: native retirement uncertain')
+    try { container?.close() } catch (error) { cleanupErrors.push(String(error)) }
     if (cleanupErrors.length) { evidence.cleanupErrors = cleanupErrors; evidence.qualified = false }
     await writeFile(output, JSON.stringify(evidence, null, 2) + '\n')
     console.log(JSON.stringify(evidence, null, 2))
