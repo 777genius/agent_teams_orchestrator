@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstddef>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -24,6 +25,7 @@ struct NativeError {
   std::string code;
   DWORD win32 = 0;
   const char *stage = nullptr;
+  DWORD nativeStatus = 0;
 };
 static void require(bool value, const char *code) {
   if (!value)
@@ -229,7 +231,7 @@ static JsonObject fileIdentity(HANDLE file, const std::wstring &owner, bool dire
   return value;
 }
 static Handle canonicalDirectory(const std::wstring &value,
-                                 DWORD access = FILE_READ_ATTRIBUTES | READ_CONTROL) {
+                                 DWORD access = FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL) {
   auto full = extended(value);
   Handle handle(CreateFileW(full.c_str(), access, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                             OPEN_EXISTING,
@@ -308,6 +310,16 @@ using NtCreateFileFunction = NTSTATUS(NTAPI *)(PHANDLE, ACCESS_MASK, POBJECT_ATT
                                                ULONG, ULONG, PVOID, ULONG);
 using NtQueryFileFunction = NTSTATUS(NTAPI *)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG,
                                               FILE_INFORMATION_CLASS);
+// Native FileRenameInformation(10) accepts the already-held source HANDLE
+// and a basename relative to the already-held parent HANDLE. No path reopen,
+// no replace flag, no post-failure alternate rename are involved.
+using NtSetFileFunction = NTSTATUS(NTAPI *)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG,
+                                            FILE_INFORMATION_CLASS);
+using NtStatusErrorFunction = ULONG(NTAPI *)(NTSTATUS);
+static_assert(sizeof(void *) == 8 && offsetof(FILE_RENAME_INFO, RootDirectory) == 8 &&
+              offsetof(FILE_RENAME_INFO, FileNameLength) == 16 &&
+              offsetof(FILE_RENAME_INFO, FileName) == 20,
+              "x64/arm64 native FILE_RENAME_INFORMATION ABI");
 static DWORD directoryMode(HANDLE file) {
   auto query = reinterpret_cast<NtQueryFileFunction>(
       GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationFile"));
@@ -448,10 +460,19 @@ struct OwnerStore {
       rename->FileNameLength = static_cast<DWORD>(basename.size() * sizeof(wchar_t));
       memcpy(rename->FileName, basename.data(), rename->FileNameLength);
       rename->FileName[basename.size()] = L'\0';
-      if (!SetFileInformationByHandle(directory.file.value, FileRenameInfo, rename,
-                                      static_cast<DWORD>(size)))
-        throw NativeError{"execution_owner_archive_unknown", GetLastError(),
-                          "owner_archive_rename"};
+      auto set = reinterpret_cast<NtSetFileFunction>(
+          GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtSetInformationFile"));
+      auto statusError = reinterpret_cast<NtStatusErrorFunction>(
+          GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlNtStatusToDosError"));
+      require(set && statusError, "execution_owner_archive_unknown");
+      IO_STATUS_BLOCK completion{};
+      NTSTATUS status = set(directory.file.value, &completion, rename, static_cast<ULONG>(size),
+                            static_cast<FILE_INFORMATION_CLASS>(10));
+      if (status != 0 || completion.Status != 0)
+        throw NativeError{"execution_owner_archive_unknown",
+                          statusError(status != 0 ? status : completion.Status),
+                          "owner_archive_nt_rename",
+                          static_cast<DWORD>(status != 0 ? status : completion.Status)};
       directory.path = destination;
       require(equalPath(finalPath(directory.file.value), extended(destination)) &&
                   fileIdentity(directory.file.value, directory.owner, true).Stringify() ==
@@ -464,7 +485,7 @@ struct OwnerStore {
       result = describe(directory);
       flag(result, L"writeThrough", true);
       flag(result, L"noReplace", true);
-      str(result, L"primitive", L"SetFileInformationByHandle/FileRenameInfo");
+      str(result, L"primitive", L"NtSetInformationFile/FileRenameInformation");
       return result;
     }
     auto name = text(input, L"name");
@@ -954,6 +975,8 @@ int wmain(int argc, wchar_t **argv) {
         if (error.stage) {
           str(reply, L"stage", wide(error.stage));
           num(reply, L"nativeCode", error.win32);
+          if (error.nativeStatus)
+            num(reply, L"nativeStatus", error.nativeStatus);
         }
       } catch (...) {
         flag(reply, L"ok", false);
