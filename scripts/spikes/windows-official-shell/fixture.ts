@@ -1,5 +1,5 @@
 import path from 'node:path'
-import { cp, readFile, readdir, writeFile } from 'node:fs/promises'
+import { cp, readFile, readdir, realpath, writeFile } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
 import { stageOpenCodeV2Graphs } from '../../opencode-v2/stage.ts'
 
@@ -7,6 +7,16 @@ export type Artifact = { path: string; sha256: string; metadataReadInput: boolea
 export async function stageFixture(readonly: string): Promise<Artifact[]> {
   await stageOpenCodeV2Graphs(path.resolve(import.meta.dir, '../../..'), readonly, { portable: true, platform: 'win32', arch: 'x64' })
   await cp(import.meta.dir, path.join(readonly, 'windows-official-shell'), { recursive: true })
+  // Verify the actual child import location, not merely the graph root. Keep
+  // the finite expected physical entries for ACL/resolver failure diagnostics.
+  const resolution = []
+  for (const specifier of ['effect', 'effect/unstable/process/ChildProcessSpawner', '@opencode/server-v2-floor/routes', '@opencode/server/routes']) {
+    const entry = await realpath(Bun.resolveSync(specifier, path.join(readonly, 'windows-official-shell')))
+    const relative = path.relative(readonly, entry)
+    if (relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw new Error('TEST official child import escaped its staged graph')
+    resolution.push({ specifier, entry: relative })
+  }
+  await writeFile(path.join(readonly, 'windows-official-shell', 'resolution.json'), JSON.stringify(resolution))
   const artifacts: Artifact[] = []
   async function walk(directory: string) {
     for (const entry of await readdir(directory, { withFileTypes: true })) {

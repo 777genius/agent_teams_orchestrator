@@ -94,6 +94,24 @@ if (child) {
     } catch (error) { attempts[`spawnProbe_${mode}`] = String(error) }
   }
   if (officialShellMode) {
+    const directory = path.join(import.meta.dir, 'windows-official-shell')
+    const resolution: unknown = JSON.parse(await readFile(path.join(directory, 'resolution.json'), 'utf8'))
+    if (!Array.isArray(resolution) || resolution.length !== 4) throw new Error('TEST official resolution manifest invalid')
+    const diagnostics: Record<string, unknown>[] = []
+    attempts.officialShellResolution = diagnostics
+    for (const row of resolution) {
+      if (!row || typeof row !== 'object' || typeof row.specifier !== 'string' || typeof row.entry !== 'string') throw new Error('TEST official resolution entry invalid')
+      const entry = path.resolve(import.meta.dir, row.entry)
+      const relative = path.relative(import.meta.dir, entry)
+      if (relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw new Error('TEST official resolution entry escaped its staged graph')
+      const diagnostic: Record<string, unknown> = { specifier: row.specifier, expectedEntry: row.entry }
+      diagnostics.push(diagnostic)
+      try { await readFile(entry); diagnostic.physicalEntryReadable = true }
+      catch (error) { diagnostic.physicalEntryError = String(error).slice(0, 1024) }
+      try { diagnostic.resolvedEntry = path.relative(import.meta.dir, Bun.resolveSync(row.specifier, directory)); diagnostic.matchesStagedEntry = diagnostic.resolvedEntry === row.entry }
+      catch (error) { diagnostic.resolverError = String(error).slice(0, 1024) }
+    }
+    if (diagnostics.some(row => row.physicalEntryReadable !== true || row.matchesStagedEntry !== true)) throw new Error('TEST official child graph resolution refused; see officialShellResolution')
     const checkpoint = await import('./windows-official-shell/checkpoint.ts')
     attempts.officialShellCheckpoint = await checkpoint.runOfficialShellCheckpoint(base)
   }
