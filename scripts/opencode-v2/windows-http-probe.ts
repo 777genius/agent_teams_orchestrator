@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { createHash, randomUUID } from 'node:crypto'
-import { copyFile, readFile, writeFile } from 'node:fs/promises'
+import { copyFile, readFile, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createWindowsNativeBroker, resolveWindowsNativeArtifact } from '../../src/services/opencode/host/windows/OpenCodeV2WindowsNativeBroker.js'
@@ -20,9 +20,9 @@ async function bounded<T>(promise: Promise<T>, code: string, milliseconds = 1000
   try { return await Promise.race([promise, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(code)), milliseconds) })]) }
   finally { clearTimeout(timer) }
 }
-async function until<T>(read: () => T | undefined): Promise<T> {
+async function until<T>(read: () => T | undefined, code = 'windows_http_wait_timeout'): Promise<T> {
   const deadline = Date.now() + 10000
-  for (;;) { const value = read(); if (value !== undefined) return value; assert.ok(Date.now() < deadline, 'windows_http_wait_timeout'); await Bun.sleep(10) }
+  for (;;) { const value = read(); if (value !== undefined) return value; assert.ok(Date.now() < deadline, code); await Bun.sleep(10) }
 }
 const digest = async (file: string) => createHash('sha256').update(await readFile(file)).digest('hex')
 let artifact: Awaited<ReturnType<typeof resolveWindowsNativeArtifact>>
@@ -67,7 +67,7 @@ async function ps(script: string, extra: Record<string, string> = {}) {
   }
   return out.trim()
 }
-  let localFailure: unknown, brokerDisconnected = false
+  let localFailure: unknown, brokerDisconnected = false, phase = 'setup'
   try {
     const parent = await filesystem.createDirectory(root); await parent.close()
     const fence = await filesystem.createDirectory(fencePath); handles.push(fence)
@@ -79,6 +79,7 @@ async function ps(script: string, extra: Record<string, string> = {}) {
     assert.equal(build.success, true); assert.equal(build.outputs.length, 1)
     const childEntry = path.join(root, 'http-child.js'); await writeFile(childEntry, Buffer.from(await build.outputs[0]!.arrayBuffer()))
     result.bundleSha256 = await digest(childEntry); result.childFixtureSha256 = await digest(entry)
+    result.childFixtureLfSha256 = createHash('sha256').update((await readFile(entry, 'utf8')).replace(/\r\n/g, '\n')).digest('hex')
     await writeFile(journal, '[]')
   sid = await ps(`
 $ErrorActionPreference='Stop'
@@ -106,7 +107,7 @@ foreach($ancestor in $planned){$acl=Get-Acl -LiteralPath $ancestor;$acl.AddAcces
 & icacls.exe $env:TEST_ROOT /setintegritylevel '(OI)(CI)L' /T /Q | Out-Null
 if($LASTEXITCODE-ne 0){throw 'TEST low label failed'}
 `, { TEST_SID: sid })
-    launched = true
+    phase = 'native-launch'; launched = true
     mapping = record(await broker.request('launch', { executable: path.join(root, 'bun.exe'), entry: childEntry, cwd: root, env: environment,
       writableRoots: [root], readOnlyRoots: [], protectedRoots: [fencePath], nonce, leaseOwnerId }))
     assert.equal(mapping.containerSid, sid)
@@ -120,6 +121,7 @@ if($LASTEXITCODE-ne 0){throw 'TEST low label failed'}
     assert.equal(typeof ready.baseUrl, 'string'); const baseUrl = String(ready.baseUrl)
     http.bindOrigin(baseUrl); result.baseUrl = baseUrl
     if (disconnect === 'child-pipe') {
+      phase = 'get-post'
       const get = await bounded(http.fetch(baseUrl + '/get'), 'windows_http_get_timeout')
       assert.equal(get.headers.get('x-native-http'), 'production-transport'); assert.equal(await bounded(get.text(), 'windows_http_get_body_timeout'), 'native-http-get-é')
       const expected = Buffer.alloc(23000); for (let i = 0; i < expected.length; i++) expected[i] = i % 251
@@ -127,18 +129,30 @@ if($LASTEXITCODE-ne 0){throw 'TEST low label failed'}
       assert.equal(post.status, 201); assert.equal(post.headers.get('x-upload-bytes'), '23000')
       assert.deepEqual(Buffer.from(await bounded(post.arrayBuffer(), 'windows_http_post_body_timeout')), Buffer.alloc(100000, 0xa7))
       result.getPassed = true; result.binaryPostBytes = expected.length; result.binaryResponseBytes = 100000
+      phase = 'sse-window'
       const beforeSse = receivedBytes, sse = await bounded(http.fetch(baseUrl + '/sse'), 'windows_http_sse_timeout')
       assert.equal(sse.headers.get('content-type'), 'text/event-stream')
       await Bun.sleep(150); assert.ok(receivedBytes - beforeSse > 0 && receivedBytes - beforeSse <= 32768)
       result.sseUnreadWindowBytes = receivedBytes - beforeSse
       const reader = sse.body!.getReader(); const event = await bounded(reader.read(), 'windows_http_sse_read_timeout')
       assert.equal(event.done, false); assert.ok(new TextDecoder().decode(event.value).startsWith('data: '))
+      phase = 'sse-cancel-ack'
       const cancelledBefore = frameCounts.cancelled ?? 0
       await bounded(reader.cancel(), 'windows_http_cancel_ack_timeout')
-      assert.equal(frameCounts.cancelled, cancelledBefore + 1)
-      await until(() => { try { return Bun.file(path.join(root, 'sse-cancelled.txt')).size > 0 ? true : undefined } catch { return undefined } })
-      assert.equal(await readFile(path.join(root, 'sse-cancelled.txt'), 'utf8'), 'server-observed-cancel')
-      result.sseCancelAck = true; result.serverObservedCancellation = true
+      assert.equal(frameCounts.cancelled, cancelledBefore + 1); result.sseCancelAck = true
+      phase = 'server-aborted-evidence'
+      const observed = await until(() => messages.find(value => value.type === 'testSseCancellation'), 'windows_http_server_abort_not_observed')
+      result.serverCancellation = observed
+      assert.equal(observed.event, 'request-aborted'); assert.equal(observed.requestAborted, true); assert.equal(observed.socketDestroyed, true)
+      if (observed.markerWritten !== true) throw new Error(`windows_http_server_marker_write_failed:${String(observed.markerError)}`)
+      phase = 'server-marker-read'
+      const marker = path.join(root, 'sse-cancelled.txt'), info = await stat(marker)
+      assert.ok(info.isFile() && info.size > 0 && info.size <= 1024)
+      const bytes = await readFile(marker); result.serverMarkerBytes = bytes.length
+      assert.deepEqual(JSON.parse(bytes.toString()), { event: 'request-aborted', requestAborted: true,
+        socketDestroyed: true, responseDestroyed: observed.responseDestroyed })
+      result.serverObservedCancellation = true
+      phase = 'early-response'
       let uploadCancelled = false
       const upload = new ReadableStream<Uint8Array>({ pull(controller) { controller.enqueue(Buffer.alloc(8192)) }, cancel() { uploadCancelled = true } }, { highWaterMark: 0 })
       const request = new Request(baseUrl + '/early', { method: 'POST', body: upload, duplex: 'half' } as RequestInit)
@@ -147,6 +161,7 @@ if($LASTEXITCODE-ne 0){throw 'TEST low label failed'}
       assert.equal(uploadCancelled, true); result.earlyResponseUploadSettled = true
       await assert.rejects(bounded(http.fetch('http://127.0.0.1:1/outside-selected-origin'), 'windows_http_outside_origin_unsettled'), error => error instanceof Error && error.message === 'execution_http_transport_unknown')
     }
+    phase = 'native-disconnect'
     // Both modes disconnect while a real response consumer is waiting for bytes.
     const response = await bounded(http.fetch(baseUrl + '/disconnect'), 'windows_http_disconnect_setup_timeout')
     const reader = response.body!.getReader()
@@ -208,6 +223,11 @@ if($LASTEXITCODE-ne 0){throw 'TEST low label failed'}
     result.helperExitCode = helperCloseCode; result.brokerEnded = broker.ended(); result.cleanupErrors = errors
     result.qualified = localFailure === undefined && errors.length === 0 && retired && broker.ended()
     if (localFailure) {
+      result.failedPhase = phase
+      const observed = messages.find(value => value.type === 'testSseCancellation'); if (observed) result.serverCancellation = observed
+      const marker = path.join(root, 'sse-cancelled.txt')
+      try { const info = await stat(marker); result.markerFailureStat = { isFile: info.isFile(), bytes: info.size }; if (info.isFile() && info.size <= 1024) result.markerFailureBytes = await readFile(marker, 'utf8') }
+      catch (error) { const code = (error as NodeJS.ErrnoException).code; result.markerFailureCode = typeof code === 'string' && /^[A-Z_]{1,64}$/.test(code) ? code : 'UNKNOWN' }
       const message = localFailure instanceof Error ? localFailure.message : ''
       result.failureCode = /^[a-zA-Z0-9_:.-]{1,160}$/.test(message) ? message : 'windows_http_assertion_failed'
     }
@@ -217,7 +237,9 @@ if($LASTEXITCODE-ne 0){throw 'TEST low label failed'}
 }
 try {
   artifact = await resolveWindowsNativeArtifact(); facts.helper = artifact
-  facts.productionSourceHashes = Object.fromEntries(await Promise.all(['OpenCodeV2WindowsHTTP.ts', 'OpenCodeV2WindowsChildControl.ts', 'OpenCodeV2WindowsNativeBroker.ts'].map(async name => [name, await digest(path.join(moduleDirectory, name))])))
+  const modules = ['OpenCodeV2WindowsHTTP.ts', 'OpenCodeV2WindowsChildControl.ts', 'OpenCodeV2WindowsNativeBroker.ts']
+  facts.productionSourceHashes = Object.fromEntries(await Promise.all(modules.map(async name => [name, await digest(path.join(moduleDirectory, name))])))
+  facts.productionSourceLfHashes = Object.fromEntries(await Promise.all(modules.map(async name => [name, createHash('sha256').update((await readFile(path.join(moduleDirectory, name), 'utf8')).replace(/\r\n/g, '\n')).digest('hex')])))
   await run('child-pipe'); await run('broker'); facts.qualified = true
 }
 catch (error) { failure = error }

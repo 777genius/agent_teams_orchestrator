@@ -30,9 +30,21 @@ const server = createServer(async (request, response) => {
         if (!blocked) blocked = !response.write('data: ' + 's'.repeat(3064) + '\n\n')
       }, 1)
       response.on('drain', () => { blocked = false })
-      response.once('close', () => {
+      response.once('close', () => clearInterval(timer))
+      // Bun 1.3.11 reports real peer cancellation on IncomingMessage; its
+      // ServerResponse close event is not emitted in this path.
+      request.once('aborted', () => {
         clearInterval(timer)
-        if (request.url === '/sse') void writeFile('sse-cancelled.txt', 'server-observed-cancel')
+        if (request.url !== '/sse') return
+        const observed = { event: 'request-aborted', requestAborted: request.aborted,
+          socketDestroyed: request.socket.destroyed, responseDestroyed: response.destroyed ?? null }
+        void (async () => {
+          let markerWritten = false, markerError: string | undefined
+          try { await writeFile('sse-cancelled.txt', JSON.stringify(observed)); markerWritten = true }
+          catch (error) { const code = (error as NodeJS.ErrnoException).code; markerError = typeof code === 'string' && /^[A-Z_]{1,64}$/.test(code) ? code : 'UNKNOWN' }
+          await control.send({ type: 'testSseCancellation', nonce: process.env.OPENCODE_V2_WINDOWS_NONCE,
+            leaseOwnerId: process.env.OPENCODE_V2_WINDOWS_LEASE, ...observed, markerWritten, markerError })
+        })().catch(() => control.disconnect())
       })
     } else { response.statusCode = 404; response.end() }
   } catch { response.destroy() }
