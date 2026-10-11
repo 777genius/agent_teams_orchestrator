@@ -11,6 +11,30 @@ export const bundledImportPath = (file: string): string => file.replaceAll('\\',
 export function renderBundledCheckpointEntry(imports: readonly string[], tables: readonly string[]): string {
   return `${imports.join('\n')}\nconst graphs = { ${tables.join(',\n')} };\nexport const runOfficialShellCheckpointBundled = (base: string) => runOfficialShellCheckpoint(base, async alias => { if (alias !== '@opencode/server-v2-floor' && alias !== '@opencode/server') throw new Error('TEST bundle pin not selected'); return graphs[alias]; });\n`
 }
+export function resolveBundledNodeFetch(specifier: string, importer: string, sourceRoot: string): string | undefined {
+  if (specifier !== 'node-fetch') return undefined
+  // Bun 1.3.11 treats this npm name as an internal compatibility module, but
+  // it is not a node:module builtin. Select its installed published bytes.
+  const manifest = realpathSync(Bun.resolveSync('node-fetch/package.json', path.dirname(importer)))
+  within(sourceRoot, manifest)
+  const metadata: unknown = JSON.parse(readFileSync(manifest, 'utf8'))
+  if (!metadata || typeof metadata !== 'object' || !('name' in metadata) || metadata.name !== 'node-fetch' || !('version' in metadata) || metadata.version !== '3.3.2' || !('main' in metadata) || typeof metadata.main !== 'string') throw new Error('TEST bundle node-fetch published identity mismatch')
+  const root = path.dirname(manifest), entry = realpathSync(path.resolve(root, metadata.main))
+  within(root, entry)
+  return entry
+}
+export function transformBundledNodeFetch(file: string, bytes: Buffer, sourceRoot: string) {
+  const literal = "import('node-fetch')"
+  const source = bytes.toString('utf8')
+  if (!source.includes(literal)) return { contents: bytes, transformation: undefined }
+  within(sourceRoot, file)
+  if (!file.endsWith(path.join('gaxios', 'build', 'cjs', 'src', 'gaxios.js')) || source.split(literal).length !== 2) throw new Error('TEST bundle unexpected node-fetch literal source')
+  const entry = resolveBundledNodeFetch('node-fetch', file, sourceRoot)
+  if (!entry) throw new Error('TEST bundle node-fetch published entry absent')
+  const replacement = `import(${JSON.stringify(bundledImportPath(entry))})`
+  const contents = Buffer.from(source.replace(literal, replacement))
+  return { contents, transformation: { file, literal, replacement, entry, originalSha256: hash(bytes), transformedSha256: hash(contents) } }
+}
 export async function collectBundledOutputs(outputs: readonly Bun.BuildArtifact[], directory: string, rawInputs: readonly Uint8Array[]) {
   const entries = outputs.filter(artifact => artifact.kind === 'entry-point')
   if (entries.length !== 1 || !entries[0]) throw new Error('TEST bundle requires exactly one entry point')
@@ -86,13 +110,19 @@ export async function stageBundledFixture(readonly: string): Promise<Artifact[]>
     await writeFile(path.join(buildDirectory, 'parent-result.json'), JSON.stringify({ phase: 'build-child-failed', code, signal: child.signalCode, fullTaskQualified: false }))
     throw new Error('TEST bundle child failed; retained build phase evidence')
   }
-  const result: { inputs: { file: string; sha256: string }[]; assets: { path: string; sha256: string }[]; metafile: Bun.BuildMetafile } = JSON.parse(await readFile(resultPath, 'utf8'))
+  const result: { inputs: { file: string; sha256: string }[]; transformations: { file: string; literal: string; replacement: string; entry: string; originalSha256: string; transformedSha256: string }[]; assets: { path: string; sha256: string }[]; metafile: Bun.BuildMetafile } = JSON.parse(await readFile(resultPath, 'utf8'))
   const inputs = new Map<string, Buffer>()
   for (const input of result.inputs) {
     if (input.file !== generatedEntry) within(sourceRoot, input.file)
     const bytes = await readFile(input.file)
     if (hash(bytes) !== input.sha256) throw new Error('TEST bundle consumed source changed')
     inputs.set(input.file, bytes)
+  }
+  for (const transformation of result.transformations) {
+    const original = inputs.get(transformation.file)
+    if (!original || hash(original) !== transformation.originalSha256) throw new Error('TEST bundle transformed source custody changed')
+    const expected = transformBundledNodeFetch(transformation.file, original, sourceRoot).transformation
+    if (!expected || JSON.stringify(expected) !== JSON.stringify(transformation)) throw new Error('TEST bundle resolution transformation changed')
   }
   const artifacts: Artifact[] = [], provenance: { path: string; sha256: string; bytes: number; lf: number; crlf: number; dynamicReferences: string[] }[] = []
   const add = async (destination: string, bytes: Uint8Array, metadataReadInput: boolean) => {
@@ -139,7 +169,7 @@ export async function stageBundledFixture(readonly: string): Promise<Artifact[]>
     if (hash(bytes) !== asset.sha256) throw new Error('TEST bundle emitted asset changed')
     await add(path.join(readonly, 'windows-official-shell', asset.path), bytes, true)
   }
-  await add(path.join(readonly, 'windows-official-shell', 'bundle-provenance.json'), Buffer.from(JSON.stringify({ purpose: 'TEST-bundled-Shell-only', fullTaskQualified: false, bun: Bun.version, target: 'bun', format: 'esm', splitting: false, effectEntry: within(sourceRoot, effectEntry), selections, inputs: provenance, emittedAssets: result.assets, watcherDisabled: true, fffDisabled: true })), false)
+  await add(path.join(readonly, 'windows-official-shell', 'bundle-provenance.json'), Buffer.from(JSON.stringify({ purpose: 'TEST-bundled-Shell-only', fullTaskQualified: false, bun: Bun.version, target: 'bun', format: 'esm', splitting: false, effectEntry: within(sourceRoot, effectEntry), selections, inputs: provenance, transformations: result.transformations, emittedAssets: result.assets, watcherDisabled: true, fffDisabled: true })), false)
   await add(path.join(readonly, 'windows-official-shell', 'bundle-metafile.json'), Buffer.from(JSON.stringify(result.metafile)), false)
   await writeFile(path.join(readonly, 'official-artifacts.json'), JSON.stringify(artifacts), { flag: 'wx' })
   return artifacts
@@ -147,6 +177,7 @@ export async function stageBundledFixture(readonly: string): Promise<Artifact[]>
 
 async function buildOnly(generatedEntry: string, sourceRoot: string, output: string, resultPath: string, stagePath: string): Promise<void> {
   const inputs = new Map<string, Buffer>()
+  const transformations: NonNullable<ReturnType<typeof transformBundledNodeFetch>['transformation']>[] = []
   const stage = (phase: string) => writeFileSync(stagePath, JSON.stringify({ phase, inputCount: inputs.size, fullTaskQualified: false }))
   stage('build-before-call')
   const result = await Bun.build({ entrypoints: [generatedEntry], target: 'bun', format: 'esm', splitting: false, minify: false, metafile: true,
@@ -161,11 +192,14 @@ async function buildOnly(generatedEntry: string, sourceRoot: string, output: str
         if (file !== generatedEntry) within(sourceRoot, file)
         const bytes = readFileSync(file)
         inputs.set(file, bytes)
+        const transformed = transformBundledNodeFetch(file, bytes, sourceRoot)
+        if (transformed.transformation) transformations.push(transformed.transformation)
         if (inputs.size === 1) stage('build-first-source-loaded')
-        return { contents: bytes, loader: args.loader }
+        return { contents: transformed.contents, loader: args.loader }
       })
     } }] })
   stage('build-returned')
+  await writeFile(path.join(path.dirname(stagePath), 'build-transformations.json'), JSON.stringify(transformations), { flag: 'wx' })
   await writeFile(path.join(path.dirname(stagePath), 'build-diagnostics.json'), JSON.stringify({
     success: result.success,
     outputCount: result.outputs.length,
@@ -194,7 +228,7 @@ async function buildOnly(generatedEntry: string, sourceRoot: string, output: str
     assets.push({ path: relative, sha256: asset.sha256 })
   }
   await writeFile(output, new Uint8Array(await emitted.entry.arrayBuffer()), { flag: 'wx' })
-  await writeFile(resultPath, JSON.stringify({ inputs: [...inputs].map(([file, bytes]) => ({ file, sha256: hash(bytes) })), assets, metafile: result.metafile }), { flag: 'wx' })
+  await writeFile(resultPath, JSON.stringify({ inputs: [...inputs].map(([file, bytes]) => ({ file, sha256: hash(bytes) })), transformations, assets, metafile: result.metafile }), { flag: 'wx' })
   stage('build-result-published')
 }
 if (process.argv[2] === '--build-only') {
