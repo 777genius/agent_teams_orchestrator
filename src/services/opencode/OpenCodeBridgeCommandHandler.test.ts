@@ -14,6 +14,8 @@ import {
   executeOpenCodeBridgeCommandEnvelope,
   __readinessDataForTests,
 } from './OpenCodeBridgeCommandHandler.js'
+import { OpenCodeRuntimeDeadlineError } from './OpenCodeRuntimeDeadline.js'
+import { resolveClaudeMultimodelPaths } from './OpenCodeManagedPaths.js'
 import { openCodeCommandOutcomeStore } from './OpenCodeCommandOutcomeStore.js'
 import { openCodeExecutionProbe } from './OpenCodeExecutionProbe.js'
 import { openCodeHostManager } from './OpenCodeHostManager.js'
@@ -952,6 +954,58 @@ async function withManualTimers<T>(run: (timers: ManualTimer[]) => Promise<T>): 
 }
 
 describe('OpenCodeBridgeCommandHandler', () => {
+  for (const code of ['ELOCKED', 'ECOMPROMISED']) {
+    test(`redacts lock failure ${code} while preserving finite classification`, async () => {
+      const root = path.join(resolveClaudeMultimodelPaths().data, 'opencode')
+      const cases: { file: unknown; category: string }[] = [
+        { file: path.join(root, 'host-registry.json.lock'), category: 'registry' },
+        { file: path.join(root, 'profiles', 'SECRET-PROFILE', 'node_modules.prepare-lock'), category: 'profile' },
+        { file: path.join(root, 'host-startup-locks', `${'a'.repeat(64)}.lock`), category: 'startup' },
+        { file: path.join(`${root}-outside`, 'host-registry.json.lock'), category: 'unknown' },
+        { file: path.join(root, '..', 'profiles', 'node_modules.prepare-lock'), category: 'unknown' },
+        { file: path.join(root, 'host-startup-locks', 'SECRET-PROFILE.lock'), category: 'unknown' },
+        { file: path.join(root, 'host-registry.json.lock') + '\0SECRET-PROFILE', category: 'unknown' },
+        { file: 'host-registry.json.lock', category: 'unknown' },
+        { file: 123, category: 'unknown' },
+      ]
+      for (const { file, category } of cases) {
+        const failure = Object.assign(new Error('SECRET-MESSAGE /private/auth.json'), {
+          code, file, stack: 'SECRET-STACK', env: { TOKEN: 'SECRET-ENV' },
+        })
+        openCodeProvisioningProbe.probe = async () => { throw failure }
+        const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.handshake', {}))
+        if (!('error' in result)) throw new Error('Expected lock failure')
+        expect(result.error.kind).toBe('provider_error')
+        expect(result.error.details).toEqual({ lockCode: code, lockCategory: category })
+        expect(result.error.message).toBe(`OpenCode lock operation failed [code=${code}, lock=${category}]`)
+        const serialized = JSON.stringify(result)
+        for (const secret of ['SECRET-', root, '/private/auth.json', 'TOKEN']) expect(serialized).not.toContain(secret)
+        if (typeof file === 'string') expect(serialized).not.toContain(file)
+      }
+    })
+  }
+
+  test('keeps deadline classification and details ahead of lock metadata', async () => {
+    const timeout = Object.assign(new OpenCodeRuntimeDeadlineError('host_start', 50, 60), { code: 'ELOCKED' })
+    openCodeProvisioningProbe.probe = async () => { throw timeout }
+    const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.handshake', {}))
+    if (!('error' in result)) throw new Error('Expected deadline failure')
+    expect(result.error.kind).toBe('timeout')
+    expect(result.error.message).toBe(timeout.message)
+    expect(result.error.details).toEqual(timeout.toDetails())
+    expect(JSON.stringify(result)).not.toContain('lockCode')
+  })
+
+  test('keeps non-lock provider failure message and diagnostic unchanged', async () => {
+    const message = 'Known provider failure'
+    openCodeProvisioningProbe.probe = async () => { throw Object.assign(new Error(message), { code: 'OTHER' }) }
+    const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.handshake', {}))
+    if (!('error' in result)) throw new Error('Expected provider failure')
+    expect(result.error.message).toBe(message)
+    expect(result.error.details).toBeUndefined()
+    expect(result.diagnostics).toEqual([expect.objectContaining({ message })])
+  })
+
   test('publishes group protocol only for a live bootstrapped lane with fresh group tools and the retained binding', async () => {
     const live = structuredClone(snapshot)
     let sessionAvailable = true

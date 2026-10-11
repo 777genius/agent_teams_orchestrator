@@ -9,6 +9,7 @@ import type { OpenCodeOAuthNativeProbeOwner } from './OpenCodeAuthStore.js'
 import { createHash, randomUUID } from 'node:crypto'
 import { readFile, stat } from 'node:fs/promises'
 import nodePath from 'node:path'
+import { resolveClaudeMultimodelPaths } from './OpenCodeManagedPaths.js'
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
@@ -6187,6 +6188,23 @@ async function handleEnvelope(
   }
 }
 
+function safeOpenCodeLockFailure(error: unknown) {
+  const row = asRecord(error)
+  const code = row?.code
+  if (code !== 'ELOCKED' && code !== 'ECOMPROMISED') return null
+  const root = nodePath.join(resolveClaudeMultimodelPaths().data, 'opencode')
+  const file = typeof row?.file === 'string' && nodePath.isAbsolute(row.file)
+    && !row.file.includes('\0') ? nodePath.relative(root, nodePath.normalize(row.file)) : null
+  const category = file === 'host-registry.json.lock' ? 'registry'
+    : file && !file.startsWith(`..${nodePath.sep}`) && !nodePath.isAbsolute(file)
+      && file !== '..' && file.split(nodePath.sep)[0] === 'profiles'
+      && nodePath.basename(file) === 'node_modules.prepare-lock' ? 'profile'
+    : file && file.split(nodePath.sep).length === 2
+      && file.split(nodePath.sep)[0] === 'host-startup-locks'
+      && /^[a-f0-9]{64}\.lock$/.test(nodePath.basename(file)) ? 'startup' : 'unknown'
+  return { lockCode: code, lockCategory: category }
+}
+
 export async function executeOpenCodeBridgeCommandEnvelope(
   input: unknown,
   options: { signal?: AbortSignal } = {},
@@ -6239,14 +6257,18 @@ export async function executeOpenCodeBridgeCommandEnvelope(
         : 'confirmedStopRuntime' in result ? result.confirmedStopRuntime : undefined)
   } catch (error) {
     const deadlineError = isOpenCodeRuntimeDeadlineError(error) ? error : null
+    const lockFailure = deadlineError ? null : safeOpenCodeLockFailure(error)
+    const message = lockFailure
+      ? `OpenCode lock operation failed [code=${lockFailure.lockCode}, lock=${lockFailure.lockCategory}]`
+      : error instanceof Error ? error.message : String(error)
     return failure(
       envelope,
       deadlineError ? 'timeout' : 'provider_error',
-      error instanceof Error ? error.message : String(error),
+      message,
       startedAtMs,
       true,
-      [diagnostic(error instanceof Error ? error.message : String(error), 'error')],
-      deadlineError?.toDetails(),
+      [diagnostic(message, 'error')],
+      deadlineError?.toDetails() ?? lockFailure ?? undefined,
     )
   } finally {
     runtimeDeadline?.dispose()
