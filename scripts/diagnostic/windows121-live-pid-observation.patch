@@ -1,0 +1,114 @@
+diff --git a/src/services/opencode/OpenCodeHostManager.ts b/src/services/opencode/OpenCodeHostManager.ts
+index 2c23b57..552c386 100644
+--- a/src/services/opencode/OpenCodeHostManager.ts
++++ b/src/services/opencode/OpenCodeHostManager.ts
+@@ -4,6 +4,7 @@ import {
+   type PersistentHostRegistryRecord, type PersistentHostLeaseRecord,
+ } from './OpenCodeAuthorityStoreRead.js'
+ import { createHash, randomUUID } from 'node:crypto'
++import { traceOwnPid } from '../../../scripts/diagnostic/windows121-live-pid-trace.js'
+ import { type ChildProcess, type SpawnOptions } from 'node:child_process'
+ import type { Dirent } from 'node:fs'
+ import net from 'node:net'
+@@ -719,13 +720,18 @@ export class OpenCodeHostManager {
+     record: PersistentHostRegistryRecord,
+     budget?: OpenCodeStartupCleanupBudget,
+   ): Promise<PersistentHostProcessIdentity> {
+-    if (!this.isProcessAlive(record.pid)) {
++    const aliveBefore = this.isProcessAlive(record.pid)
++    traceOwnPid('identity-entry', record.pid, { aliveBefore, expectedBirth: record.processStartedAtMs })
++    if (!aliveBefore) {
+       return { state: 'gone', startedAtMs: null }
+     }
+ 
+     const startedAtMs = await this.readProcessStartTimeMs(record.pid, budget).catch(() => null)
++    traceOwnPid('identity-read', record.pid, { observedBirth: startedAtMs, expectedBirth: record.processStartedAtMs })
+     if (!Number.isFinite(startedAtMs) || startedAtMs === null) {
+-      if (!this.isProcessAlive(record.pid)) {
++      const aliveAfter = this.isProcessAlive(record.pid)
++      traceOwnPid('identity-unreadable', record.pid, { aliveAfter })
++      if (!aliveAfter) {
+         return { state: 'gone', startedAtMs: null }
+       }
+       // Unit tests commonly inject synthetic process control without creating a
+@@ -1123,7 +1129,9 @@ export class OpenCodeHostManager {
+         || record.baseUrl !== `http://127.0.0.1:${record.port}`) {
+         throw new Error('OpenCode cleanup endpoint is invalid')
+       }
+-      if ((await this.inspectPersistentHostProcessIdentity(record)).state !== 'confirmed') {
++      const cleanupIdentity = await this.inspectPersistentHostProcessIdentity(record)
++      traceOwnPid('cleanup-admission', record.pid, { state: cleanupIdentity.state, observedBirth: cleanupIdentity.startedAtMs, expectedBirth: record.processStartedAtMs })
++      if (cleanupIdentity.state !== 'confirmed') {
+         throw new Error('OpenCode cleanup host process ownership is unavailable')
+       }
+       if (abortSignal?.aborted) throwOpenCodeAbortReason(abortSignal)
+diff --git a/src/utils/processKill.ts b/src/utils/processKill.ts
+index d54c352..2ae2b6c 100644
+--- a/src/utils/processKill.ts
++++ b/src/utils/processKill.ts
+@@ -1,6 +1,8 @@
+ import { spawn } from 'node:child_process'
+ import { readFile } from 'node:fs/promises'
+ import { join } from 'node:path'
++import { performance } from 'node:perf_hooks'
++import { traceOwnPid } from '../../scripts/diagnostic/windows121-live-pid-trace.js'
+ 
+ const PROCESS_START_TIME_QUERY_TIMEOUT_MS = 2_500
+ // Cold PowerShell identity queries have reached the 2.5s cutoff while a repeat
+@@ -58,6 +60,7 @@ function readProcessQueryOutput(
+   args: string[],
+   outputLimitBytes: number,
+   timeoutMs = PROCESS_START_TIME_QUERY_TIMEOUT_MS,
++  diagnosticPid?: number,
+ ): Promise<string | null> {
+   return new Promise(resolve => {
+     let settled = false
+@@ -71,7 +74,9 @@ function readProcessQueryOutput(
+       clearTimeout(timeout)
+       resolve(value)
+     }
++    const queryStarted = performance.now()
+     const timeout = setTimeout(() => {
++      traceOwnPid('birth-helper-timeout', diagnosticPid, { helperPid: child?.pid, timeoutMs, elapsedMs: performance.now() - queryStarted })
+       try {
+         child?.kill('SIGKILL')
+       } catch {
+@@ -86,15 +91,23 @@ function readProcessQueryOutput(
+         stdio: ['ignore', 'pipe', 'ignore'],
+         windowsHide: true,
+       })
++      traceOwnPid('birth-helper-spawn', diagnosticPid, { helperPid: child.pid, timeoutMs })
+       child.stdout?.on('data', (chunk: Buffer | string) => {
+         if (settled || output.length >= outputLimitBytes) {
+           return
+         }
+         output = `${output}${chunk.toString()}`.slice(0, outputLimitBytes)
+       })
+-      child.once('error', () => finish(null))
+-      child.once('close', code => finish(code === 0 ? output : null))
++      child.once('error', () => {
++        traceOwnPid('birth-helper-error', diagnosticPid, { elapsedMs: performance.now() - queryStarted })
++        finish(null)
++      })
++      child.once('close', (code, signal) => {
++        traceOwnPid('birth-helper-close', diagnosticPid, { helperPid: child?.pid, code, signal, elapsedMs: performance.now() - queryStarted, outputPresent: output.trim().length > 0 })
++        finish(code === 0 ? output : null)
++      })
+     } catch {
++      traceOwnPid('birth-helper-spawn-throw', diagnosticPid, {})
+       finish(null)
+     }
+   })
+@@ -156,8 +169,11 @@ export async function readProcessStartTimeMs(
+     args,
+     PROCESS_START_TIME_OUTPUT_LIMIT_BYTES,
+     timeoutMs ?? WINDOWS_PROCESS_START_TIME_QUERY_TIMEOUT_MS,
++    normalizedPid,
+   )
+-  return output === null ? null : parseProcessStartTime(output)
++  const birth = output === null ? null : parseProcessStartTime(output)
++  traceOwnPid('birth-query-result', normalizedPid, { outputAvailable: output !== null, parseSucceeded: birth !== null, observedBirth: birth })
++  return birth
+ }
+ 
+ export async function readProcessCommandLine(
