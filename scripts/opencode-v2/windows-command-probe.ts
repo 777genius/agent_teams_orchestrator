@@ -42,7 +42,7 @@ public static class TestFileMask {
 }
 '@
 $result=[ordered]@{}
-foreach($name in @('.','actual-command.txt')){
+foreach($name in @('.','actual-command.txt','.native-owner','.native-owner/owner.json')){
 $p=if($name-eq '.'){ $env:TEST_ROOT }else{Join-Path $env:TEST_ROOT $name}
 $entry=[ordered]@{}
 try{
@@ -69,6 +69,35 @@ ConvertTo-Json -InputObject $result -Depth 8 -Compress
 `)) as unknown
 }
 function record(value: unknown): Record<string, unknown> { assert.ok(value && typeof value === 'object' && !Array.isArray(value)); return value as Record<string, unknown> }
+function assertPrivateAces(snapshot: unknown, packageSid: string, afterRetirement: boolean) {
+  const entries = record(snapshot), owner = String(record(entries['.']).owner)
+  assert.match(owner, /^S-1-5-21-/)
+  for (const name of ['.', 'actual-command.txt', '.native-owner', '.native-owner/owner.json']) {
+    const entry = record(entries[name]); assert.equal(entry.aclError, undefined)
+    assert.ok(Array.isArray(entry.aces) && entry.aces.length > 0)
+    const aces = entry.aces.map(record)
+    for (const ace of aces) {
+      assert.ok(ace.sid === owner || ace.sid === 'S-1-5-18' || (!afterRetirement && ace.sid === packageSid))
+      if (afterRetirement) assert.notEqual(ace.sid, packageSid)
+    }
+    for (const principal of [owner, 'S-1-5-18']) {
+      const trusted = aces.find(ace => ace.sid === principal && ace.type === 'Allow')
+      assert.ok(trusted); assert.equal(trusted.rights, 0x1f01ff)
+      if (name === '.' || name === '.native-owner') {
+        assert.equal(entry.owner, owner); assert.equal(entry.protected, true)
+        assert.ok(String(trusted.inheritance).includes('ContainerInherit'))
+        assert.ok(String(trusted.inheritance).includes('ObjectInherit'))
+      }
+      if (name === 'actual-command.txt') assert.equal(trusted.inherited, true)
+      if (name === '.native-owner/owner.json') {
+        assert.equal(entry.owner, owner); assert.equal(trusted.inherited, false)
+      }
+    }
+  }
+  // Workspace output ownership is observed separately; it never grants owner-record authority.
+  return { privateOwner: owner, outputOwner: record(entries['actual-command.txt']).owner }
+}
+
 const messages: Record<string, unknown>[] = []
 broker.events.on('message', value => messages.push(record(value)))
 let connectedPeer: Record<string, unknown> | undefined
@@ -128,7 +157,15 @@ if(message.type==='prepare'){prepared=message;send({...message,type:'prepared',p
 if(message.type==='close'){send({type:'closed',pid:process.pid,birth:prepared.birth,namespace:prepared.namespace,scopeClosed:true});socket.end()}
 }})
 `)
-  await writeFile(path.join(root, 'output.ts'), `await Bun.write('actual-command.txt','native-command-written');await Bun.stdout.write(new TextEncoder().encode('native-output-é'));await Bun.stderr.write('native-error-marker')`)
+  await writeFile(path.join(root, 'output.ts'), `
+import {readFile,appendFile,rename,unlink} from 'node:fs/promises'
+const protectedFile='.native-owner/owner.json'
+for(const attempt of [()=>readFile(protectedFile),()=>appendFile(protectedFile,'forbidden'),()=>rename(protectedFile,'forbidden-owner.json'),()=>unlink(protectedFile)]){
+let denied=false;try{await attempt()}catch(error){denied=['EACCES','EPERM'].includes(error.code)}
+if(!denied)throw new Error('protected-fence-access-not-denied')
+}
+await Bun.write('actual-command.txt','native-command-written');await Bun.stdout.write(new TextEncoder().encode('native-output-é'));await Bun.stderr.write('native-error-marker')
+`)
   await writeFile(path.join(root, 'echo.ts'), `for await(const bytes of Bun.stdin.stream())await Bun.stdout.write(bytes);await Bun.stderr.write('stdin-eof-observed')`)
   await writeFile(path.join(root, 'grandchild.ts'), `await Bun.write('grandchild-live.txt',String(process.pid));setInterval(()=>{},1000)`)
   await writeFile(path.join(root, 'cancel.ts'), `const child=Bun.spawn([process.execPath,'grandchild.ts'],{stdin:'inherit',stdout:'inherit',stderr:'inherit'});await Bun.write('cancel-child.txt',String(child.pid));setInterval(()=>{},1000)`)
@@ -178,6 +215,9 @@ if($LASTEXITCODE-ne 0){throw 'TEST low label failed'}
   assert.equal(stdout.toString(), 'native-output-é'); assert.equal(stderr.toString(), 'native-error-marker')
   facts.outputCommand = command; facts.nativeStdoutPassed = true; facts.nativeStderrPassed = true
   facts.fileAclBeforeRetirement = await aclSnapshot()
+  facts.aclPrincipalsBeforeRetirement = assertPrivateAces(facts.fileAclBeforeRetirement, sid, false)
+  assert.deepEqual(await fence.readRecord('owner.json'), { schema: 1, testOnly: true, nonce, leaseOwnerId })
+  facts.protectedFenceDenied = true
   assert.equal(await readFile(path.join(root, 'actual-command.txt'), 'utf8'), 'native-command-written')
   await closeCommand(command.commandId)
   stage = 'native-stdin-echo'
@@ -232,8 +272,13 @@ finally {
     } catch { cleanupErrors.push('test_ancestor_cleanup_unknown') }
   }
   if (retired && facts.fileAclBeforeRetirement) {
-    try { facts.fileAclAfterRetirement = await aclSnapshot() }
-    catch { facts.fileAclAfterRetirement = { snapshotFailed: true } }
+    try {
+      facts.fileAclAfterRetirement = await aclSnapshot()
+      facts.aclPrincipalsAfterRetirement = assertPrivateAces(facts.fileAclAfterRetirement, sid!, true)
+      assert.equal(await readFile(path.join(root, 'actual-command.txt'), 'utf8'), 'native-command-written')
+      assert.deepEqual(await handles[0]!.readRecord('owner.json'), { schema: 1, testOnly: true, nonce, leaseOwnerId })
+      facts.postRetireHostReadPassed = true; facts.nativeOwnerRecordPreserved = true
+    } catch { cleanupErrors.push('native_post_retire_acl_or_read_failed') }
   }
   for (const handle of handles.reverse()) try { await handle.close() } catch { cleanupErrors.push('native_owner_handle_close_unknown') }
   try { await broker.close() } catch { cleanupErrors.push('native_broker_close_unknown') }

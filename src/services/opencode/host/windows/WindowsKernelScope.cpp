@@ -345,7 +345,9 @@ static Handle ownerDirectory(const std::wstring &path, bool create, const std::w
   require(createFile != nullptr, "execution_owner_unknown");
   LocalMemory descriptor;
   if (create) {
-    std::wstring sddl = L"O:" + owner + L"D:P(A;;FA;;;SY)(A;;FA;;;" + owner + L")";
+    // Newly created private directories preserve trusted owner access in child files.
+    // Existing project ACLs and explicit private record descriptors are unchanged.
+    std::wstring sddl = L"O:" + owner + L"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;" + owner + L")";
     require(ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1,
                                                                  &descriptor.value, nullptr) != 0,
             "execution_owner_unknown");
