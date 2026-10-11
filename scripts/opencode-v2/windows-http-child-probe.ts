@@ -25,38 +25,40 @@ const server = createServer(async (request, response) => {
       response.end(Buffer.alloc(100000, 0xa7))
     } else if (request.url === '/early') {
       response.statusCode = 413; response.end('early-response')
-    } else if (request.url === '/disconnect') {
-      // A single known byte enters Bun's real response streaming path. The
-      // parent consumes it fully before establishing the pending next read.
-      response.setHeader('content-type', 'text/event-stream')
-      response.setHeader('transfer-encoding', 'chunked')
-      response.write(Buffer.of(0x71)); response.flushHeaders()
-      await new Promise<void>((resolve, reject) => {
-        const socket = request.socket
-        const cleanup = () => {
-          clearTimeout(timer); request.removeListener('aborted', closed)
-          socket.removeListener('close', closed); response.removeListener('close', closed)
-        }
-        const closed = () => { cleanup(); resolve() }
-        const timer = setTimeout(() => {
-          cleanup(); reject(new Error('test-disconnect-fixture-timeout'))
-          response.destroy()
-        }, 15000)
-        request.once('aborted', closed); socket.once('close', closed); response.once('close', closed)
-        if (request.aborted || socket.destroyed) closed()
-      })
-    } else if (request.url === '/sse') {
+    } else if (request.url === '/sse' || request.url === '/disconnect') {
+      // Exact native-qualified SSE ordering: flush default-framed headers,
+      // then write on the deferred timer. Disconnect sends only one byte.
       response.setHeader('content-type', 'text/event-stream'); response.flushHeaders()
       let blocked = false
+      const report = (value: Record<string, unknown>) => control.send({ ...value,
+        nonce: process.env.OPENCODE_V2_WINDOWS_NONCE, leaseOwnerId: process.env.OPENCODE_V2_WINDOWS_LEASE })
+      const deadline = request.url === '/disconnect' ? setTimeout(() => {
+        clearInterval(timer)
+        void report({ type: 'testDisconnectFixtureFailure', stage: 'fixture-deadline', code: 'TIMEOUT' }).finally(() => response.destroy()).catch(() => control.disconnect())
+      }, 15000) : undefined
       const timer = setInterval(() => {
-        if (!blocked) blocked = !response.write('data: ' + 's'.repeat(3064) + '\n\n')
+        if (blocked) return
+        try {
+          if (request.url === '/disconnect') {
+            clearInterval(timer)
+            const accepted = response.write('q')
+            void report({ type: 'testDisconnectFixtureWrite', stage: 'deferred-write', bytes: 1,
+              accepted, headersSent: response.headersSent, writableEnded: response.writableEnded,
+              responseDestroyed: response.destroyed ?? null }).catch(() => control.disconnect())
+          } else blocked = !response.write('data: ' + 's'.repeat(3064) + '\n\n')
+        } catch (error) {
+          clearInterval(timer); clearTimeout(deadline)
+          const code = (error as NodeJS.ErrnoException).code, name = error instanceof Error ? error.name : ''
+          void report({ type: 'testDisconnectFixtureFailure', stage: 'deferred-write',
+            code: typeof code === 'string' && /^[A-Z_]{1,64}$/.test(code) ? code : /^[a-zA-Z]{1,64}$/.test(name) ? name : 'UNKNOWN' }).finally(() => response.destroy()).catch(() => control.disconnect())
+        }
       }, 1)
       response.on('drain', () => { blocked = false })
-      response.once('close', () => clearInterval(timer))
+      response.once('close', () => { clearInterval(timer); clearTimeout(deadline) })
       // Bun 1.3.11 reports real peer cancellation on IncomingMessage; its
       // ServerResponse close event is not emitted in this path.
       request.once('aborted', () => {
-        clearInterval(timer)
+        clearInterval(timer); clearTimeout(deadline)
         if (request.url !== '/sse') return
         const observed = { event: 'request-aborted', requestAborted: request.aborted,
           socketDestroyed: request.socket.destroyed, responseDestroyed: response.destroyed ?? null }

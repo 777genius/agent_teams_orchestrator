@@ -60,7 +60,14 @@ async function run(disconnect: 'child-pipe' | 'broker') {
       if (frame.action === 'data' && frame.direction === 'response') receivedBytes += Buffer.from(String(frame.bytes), 'base64').length
       if (frame.id === disconnectTransactionId) {
         assert.ok(disconnectFrames.length < 128, 'windows_http_disconnect_frame_limit')
+        const framing = (name: string) => {
+          const fields = Array.isArray(frame.headers) ? frame.headers : []
+          const field = fields.find(value => Array.isArray(value) && typeof value[0] === 'string' && value[0].toLowerCase() === name)
+          return Array.isArray(field) && typeof field[1] === 'string' && field[1].length <= 128 ? field[1] : null
+        }
         disconnectFrames.push({ action: frame.action, direction: frame.direction,
+          ...(frame.action === 'head' ? { status: frame.status, body: frame.body,
+            contentLength: framing('content-length'), transferEncoding: framing('transfer-encoding') } : {}),
           ...(frame.action === 'data' ? { bytes: Buffer.from(String(frame.bytes), 'base64').length } : {}) })
       }
       http.accept(frame)
@@ -295,6 +302,7 @@ if($LASTEXITCODE-ne 0){throw 'TEST low label failed'}
     if (!broker.ended()) try { await broker.close() } catch { errors.push('native_broker_close_unknown') }
     result.helperExitCode = helperCloseCode; result.brokerEnded = broker.ended(); result.cleanupErrors = errors
     result.frameCounts = frameCounts; result.disconnectFrames = disconnectFrames
+    result.disconnectFixtureEvents = messages.filter(value => value.type === 'testDisconnectFixtureWrite' || value.type === 'testDisconnectFixtureFailure')
     result.qualified = localFailure === undefined && errors.length === 0 && retired && broker.ended()
     if (localFailure) {
       result.failedPhase = phase
