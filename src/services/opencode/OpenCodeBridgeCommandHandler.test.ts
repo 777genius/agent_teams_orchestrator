@@ -1104,6 +1104,11 @@ describe('OpenCodeBridgeCommandHandler', () => {
       expect(prompts[0]).toContain('Group name: "Design"')
       expect(prompts[0]).toContain('"relayOfMessageId":"0bdf10f0-3fd3-4494-a974-b394de06c181"')
       expect(prompts[0]).toContain('Fresh group catalog:')
+      expect(prompts[0]).toContain('For an optional informational acknowledgement, use group_chat_react')
+      expect(prompts[0]).toContain('for requested or substantive replies')
+      expect(prompts[0]).toContain('After success stop; never send an extra OK or answer a reaction.')
+      expect(prompts[0]).not.toContain('reply only through group_chat_send')
+      expect(prompts[0]).toContain('Never redirect it to message_send or SendMessage.')
       expect(prompts[0]).toContain('Sender: "user". Timestamp: "2026-10-10T00:00:00Z".')
       let observedMcpToolNames: string[] = []
       let groupToolResults: unknown[] = []
