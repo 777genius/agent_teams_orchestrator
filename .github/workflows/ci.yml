@@ -31,6 +31,11 @@ jobs:
         run: |
           $source = git -C runtime rev-parse HEAD
           if ($source -ne 'd64fda3f249153e1d6a828817343a508053099b9') { throw 'Source mismatch' }
+          # Checkout may convert patch context lines to CRLF; git requires LF patch syntax.
+          $patchPath = Join-Path $env:GITHUB_WORKSPACE 'harness/scripts/diagnostic/windows110-observation.patch'
+          $patchText = [IO.File]::ReadAllText($patchPath).Replace("`r`n", "`n")
+          if ($patchText.Contains("`r")) { throw 'Unexpected patch carriage return' }
+          [IO.File]::WriteAllText($patchPath, $patchText, [Text.UTF8Encoding]::new($false))
           git -C runtime apply ../harness/scripts/diagnostic/windows110-observation.patch
           if ($LASTEXITCODE -ne 0) { throw 'Observation patch mismatch' }
           New-Item -ItemType Directory runtime/scripts/diagnostic -Force | Out-Null
