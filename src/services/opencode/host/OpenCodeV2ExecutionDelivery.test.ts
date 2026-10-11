@@ -39,12 +39,14 @@ test('actual Bun JS bundle resolves and hashes both adjacent children without a 
 })
 
 test('source delivery keeps genuine TypeScript child paths and byte identities', async () => {
+  for (const location of [import.meta.url, new URL('./darwin/OpenCodeV2DarwinExecution.ts', import.meta.url).href]) {
   for (const [child, name] of [['execution', 'opencodeV2ExecutionServer'], ['run-owner', 'opencodeV2RunOwner']] as const) {
-    const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, child)
+    const delivery = await resolveOpenCodeV2ExecutionDelivery(location, child)
     expect(delivery.runtimeMode).toBe('source')
     expect(delivery.root).toBe(workspace)
     expect(delivery.entryPath).toBe(path.join(workspace, `src/entrypoints/${name}.ts`))
     expect(delivery.entrySha256).toBe(sha(await readFile(delivery.entryPath)))
+  }
   }
 })
 

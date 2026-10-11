@@ -8,6 +8,7 @@ import type { QueueIntent } from '../execution/OpenCodeV2AdmissionService.js'
 import type { ExecutionMention } from '../transport/OpenCodeV2ExecutionClientFactory.js'
 import type { RunBinding, RunControlRecord, RunControlRequest, RunControlResult, RunMemberStatus, RunProcessIdentity } from './OpenCodeV2RunTypes.js'
 import { OpenCodeV2RunNonces } from './OpenCodeV2RunNonces.js'
+import { retainedControllerPath } from './OpenCodeV2ControllerTools.js'
 export type { RunBinding, RunControlRecord, RunControlRequest, RunControlResult, RunLaunchPlan } from './OpenCodeV2RunTypes.js'
 
 const MAX_FRAME = 512 * 1024
@@ -44,10 +45,41 @@ export function parseRunBinding(value: unknown): RunBinding {
 function parseIdentity(value: unknown): RunProcessIdentity {
   const row = executionRecord(value); keys(row, ['pid', 'startTicks', 'bootId', 'executablePath', 'executableSha256'])
   const result = { pid: integer(row.pid), startTicks: string(row.startTicks), bootId: string(row.bootId), executablePath: string(row.executablePath), executableSha256: string(row.executableSha256) }
-  executionAssert(result.pid > 0 && /^[0-9]+$/.test(result.startTicks) && /^[a-f0-9]{64}$/.test(result.executableSha256), 'run_control_invalid')
+  executionAssert(result.pid > 0 && (process.platform === 'darwin' ? /^\d+:[1-9]\d*$/.test(result.startTicks) : /^[0-9]+$/.test(result.startTicks)) && /^[a-f0-9]{64}$/.test(result.executableSha256), 'run_control_invalid')
   return result
 }
 export async function readRunProcessIdentity(pid = process.pid): Promise<RunProcessIdentity> {
+  if (process.platform === 'darwin') {
+    executionAssert(Number.isSafeInteger(pid) && pid > 0, 'run_process_unknown')
+    const { dlopen, FFIType, ptr, toArrayBuffer } = await import('bun:ffi')
+    const native = dlopen('/usr/lib/libSystem.B.dylib', {
+      proc_pidinfo: { args: [FFIType.i32, FFIType.i32, FFIType.u64, FFIType.ptr, FFIType.i32], returns: FFIType.i32 },
+      proc_pidpath: { args: [FFIType.i32, FFIType.ptr, FFIType.u32], returns: FFIType.i32 },
+      sysctlbyname: { args: [FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.u64], returns: FFIType.i32 },
+      __error: { args: [], returns: FFIType.ptr },
+    })
+    try {
+      const before = Buffer.alloc(56), after = Buffer.alloc(56), executable = Buffer.alloc(4096), boot = Buffer.alloc(128), length = Buffer.alloc(8)
+      length.writeBigUInt64LE(128n)
+      if (native.symbols.proc_pidinfo(pid, 17, 0, ptr(before), before.length) !== before.length) {
+        const pointer = native.symbols.__error()
+        executionAssert(pointer !== null, 'run_process_unknown')
+        const errno = new DataView(toArrayBuffer(pointer, 0, 4)).getInt32(0, true)
+        // Only the kernel's ESRCH establishes absence; access/query failures
+        // remain UNKNOWN and cannot qualify retirement or authorize takeover.
+        throw Object.assign(new Error('run_process_unknown'), { code: errno === 3 ? 'ESRCH' : 'EACCES' })
+      }
+      executionAssert(native.symbols.proc_pidpath(pid, ptr(executable), executable.length) > 0 &&
+        native.symbols.sysctlbyname(ptr(Buffer.from('kern.bootsessionuuid\0')), ptr(boot), ptr(length), null, 0) === 0, 'run_process_unknown')
+      const executablePath = executable.toString('utf8').split('\0')[0]!, bootId = boot.toString('utf8').split('\0')[0]!.toLowerCase()
+      executionAssert(await realpath(executablePath) === executablePath && /^[a-f0-9-]{36}$/.test(bootId), 'run_process_unknown')
+      const executableSha256 = digest(await readFile(executablePath))
+      executionAssert(native.symbols.proc_pidinfo(pid, 17, 0, ptr(after), after.length) === after.length && before.equals(after), 'run_process_changed')
+      // Stable record field; on Darwin this is unique process ID:PID version,
+      // not a fabricated Linux clock tick. Every reader uses the same parser.
+      return { pid, startTicks: `${before.readBigUInt64LE(16)}:${before.readInt32LE(32)}`, bootId, executablePath, executableSha256 }
+    } finally { native.close() }
+  }
   executionAssert(process.platform === 'linux' && Number.isSafeInteger(pid) && pid > 0, 'run_source_linux_required')
   const proc = `/proc/${pid}`
   const [stat, bootId, executablePath] = await Promise.all([
@@ -140,9 +172,9 @@ async function privatePath(file: string, kind: 'directory' | 'file' | 'socket', 
     (kind === 'directory' ? stat.isDirectory() : kind === 'socket' ? stat.isSocket() : stat.isFile() && stat.nlink === 1), 'run_control_foreign')
   return stat
 }
-/** Linux directory-FD alias reaches the same private inode without a long sockaddr. */
+/** Both transports address the held directory vnode, even for long durable paths. */
 async function openSocketDirectory(directory: string, uid: number) {
-  executionAssert(process.platform === 'linux' && process.versions.bun === '1.3.11', 'run_source_linux_bun_required')
+  executionAssert((process.platform === 'linux' || process.platform === 'darwin') && process.versions.bun === '1.3.11', 'run_source_unix_bun_required')
   const before = await privatePath(directory, 'directory', uid)
   executionAssert(await realpath(directory) === directory, 'run_control_foreign')
   const fd = await open(directory, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW)
@@ -151,12 +183,29 @@ async function openSocketDirectory(directory: string, uid: number) {
       const [opened, current] = await Promise.all([fd.stat(), privatePath(directory, 'directory', uid)])
       executionAssert(opened.dev === before.dev && opened.ino === before.ino &&
         current.dev === before.dev && current.ino === before.ino &&
-        await realpath(`/proc/self/fd/${fd.fd}`) === directory, 'run_control_changed')
+        await retainedControllerPath(fd) === directory, 'run_control_changed')
     }
     await assertCurrent()
+    if (process.platform === 'darwin') {
+      const { dlopen, FFIType } = await import('bun:ffi')
+      const native = dlopen('/usr/lib/libSystem.B.dylib', {
+        pthread_fchdir_np: { args: [FFIType.i32], returns: FFIType.i32 },
+      })
+      // XNU gives this thread a retained vnode cwd. Bun bind/connect are
+      // synchronous here; no await or caller code runs before clearing it.
+      const within = <T>(operation: () => T): T => {
+        executionAssert(native.symbols.pthread_fchdir_np(fd.fd) === 0, 'run_control_changed')
+        try { return operation() }
+        finally { executionAssert(native.symbols.pthread_fchdir_np(-1) === 0, 'run_control_changed') }
+      }
+      return { fd: { close: async () => { try { await fd.close() } finally { native.close() } } }, assertCurrent,
+        connect: () => within(() => createConnection('control.sock')),
+        listen: (server: ReturnType<typeof createServer>, ready: () => void) => within(() => server.listen('control.sock', ready)) }
+    }
     const socketPath = `/proc/self/fd/${fd.fd}/control.sock`
     executionAssert(Buffer.byteLength(socketPath) <= 103, 'run_socket_path_too_long')
-    return { fd, socketPath, assertCurrent }
+    return { fd, assertCurrent, connect: () => createConnection(socketPath),
+      listen: (server: ReturnType<typeof createServer>, ready: () => void) => server.listen(socketPath, ready) }
   } catch (error) { await fd.close(); throw error }
 }
 async function readPrivate(file: string, uid: number): Promise<Buffer> {
@@ -330,7 +379,7 @@ export async function requestOpenCodeV2Run(record: RunControlRecord, request: Ru
   let socket: Socket | undefined
   try {
     await validateEndpoint(record)
-    const connected = createConnection(socketDirectory.socketPath)
+    const connected = socketDirectory.connect()
     socket = connected
     const response = readFrame(connected, Math.max(1, deadline - Date.now()))
     connected.once('connect', () => { try { writeFrame(connected, { payload, mac: signature(secret, payload) }) } catch { connected.destroy() } })
@@ -445,7 +494,7 @@ export async function serveOpenCodeV2RunControl(directory: string, binding: RunB
   }
   const close = () => closing ??= closeOnce()
   try {
-    await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(socketDirectory.socketPath, () => { server.off('error', reject); resolve() }) })
+    await new Promise<void>((resolve, reject) => { server.once('error', reject); socketDirectory.listen(server, () => { server.off('error', reject); resolve() }) })
     // Capture ownership immediately after bind, before publication or slow birth hashing.
     const bound = await lstat(socketPath)
     executionAssert(bound.isSocket() && bound.uid === uid, 'run_control_foreign')

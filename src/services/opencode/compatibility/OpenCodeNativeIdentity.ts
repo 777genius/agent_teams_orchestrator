@@ -31,7 +31,16 @@ export async function hashOpenCodeFile(file: string): Promise<string> {
     const before = await handle.stat()
     if (!before.isFile() || before.size > 256 * 1024 * 1024) throw new Error('identity_mismatch')
     const hash = createHash('sha256')
-    for await (const chunk of handle.createReadStream({ autoClose: false })) hash.update(chunk)
+    // Keep one explicit handle owner. Bun 1.3.11's streamed FileHandle reads
+    // can invalidate later child stdio after hashing a large package graph.
+    const bytes = Buffer.alloc(64 * 1024)
+    for (let offset = 0;;) {
+      const { bytesRead } = await handle.read(bytes, 0, bytes.length, offset)
+      if (bytesRead === 0) break
+      offset += bytesRead
+      if (offset > 256 * 1024 * 1024) throw new Error('identity_mismatch')
+      hash.update(bytes.subarray(0, bytesRead))
+    }
     const after = await handle.stat()
     const current = await stat(file)
     if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size ||

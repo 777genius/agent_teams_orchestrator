@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import * as profiles from '../OpenCodeProfileManager.js'
@@ -11,12 +11,14 @@ import * as probes from './OpenCodeV2ExecutionProbe.js'
 import { buildOpenCodeExecutionProof } from '../OpenCodeExecutionProof.js'
 import { executionHash } from '../execution/OpenCodeV2ExecutionContracts.js'
 import { createOpenCodeV2PreparedMember, createOpenCodeV2LaunchPlan, inspectOpenCodeV2SourceAvailability } from './OpenCodeV2LaunchPlan.js'
+import { launchExplicitOpenCodeV2Run, startOpenCodeV2RunSupervisor } from './OpenCodeV2RunOwner.js'
 import type { BridgeEnvelope } from './OpenCodeBridgeProtocol.js'
 import type { OpenCodePreparedProfile, OpenCodeProfileScope, OpenCodeProvisioningSnapshot } from '../types.js'
 import type { ValidatedExecutionNative } from '../host/OpenCodeV2ExecutionHost.js'
 
 let root: string, project: string, pin: '2.0.0' | '2.0.21' = '2.0.21'
 let saved: NodeJS.ProcessEnv
+let nativeSelectionCalls = 0
 const restores: { mockRestore(): void }[] = []
 const behavior = 'b'.repeat(64)
 const digest = (value: string) => createHash('sha256').update(value).digest('hex')
@@ -33,6 +35,7 @@ function envelope(): BridgeEnvelope {
       selectedModel: 'provider/model', skipPermissions: true, members: [{ name: 'worker' }] } }
 }
 beforeEach(async () => {
+  nativeSelectionCalls = 0
   root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'TEST-v2-unattended-')))
   project = path.join(root, 'project'); await mkdir(project)
   const env = { CLAUDE_MULTIMODEL_DATA_HOME: path.join(root, 'app-data'), CLAUDE_MULTIMODEL_CACHE_HOME: path.join(root, 'app-cache') }
@@ -49,8 +52,11 @@ beforeEach(async () => {
     spyOn(profiles, 'readOpenCodeSelectedScopeMetadata').mockImplementation(async () => ({ projectBehaviorFingerprint: behavior,
       behaviorSources: [], selectedAuthIdentity: 'absent', authoritySourceFingerprint: 'd'.repeat(64) })),
     spyOn(profiles, 'collectProjectBehaviorMetadata').mockImplementation(async () => ({ projectBehaviorFingerprint: behavior, behaviorSources: [] })),
-    spyOn(nativeIdentity, 'inspectOpenCodeReadSelection').mockImplementation(async () => ({ path: native().executablePath,
-      policy: { generation: 'v2', version: pin, dialect: native().dialect }, native: native(), fingerprint: native().executableSha256 })),
+    spyOn(nativeIdentity, 'inspectOpenCodeReadSelection').mockImplementation(async () => {
+      nativeSelectionCalls += 1
+      return { path: native().executablePath,
+        policy: { generation: 'v2', version: pin, dialect: native().dialect }, native: native(), fingerprint: native().executableSha256 }
+    }),
     spyOn(receipts, 'createOpenCodeV2ExecutionReceipt').mockImplementation(async () => native()),
     spyOn(mcp, 'resolveOpenCodeAppMcpLaunchConfig').mockImplementation(async () => ({ config: {
       type: 'remote', enabled: true, url: 'http://127.0.0.1:1/mcp' }, source: 'env-override' })))
@@ -66,6 +72,30 @@ async function proof(prepared: OpenCodePreparedProfile, capabilitySnapshotId: st
   return buildOpenCodeExecutionProof({ selectedModel: 'provider/model', snapshot, capabilitySnapshotId }, {
     resolveBinaryPath: () => native().executablePath, resolveBinaryIdentity: async () => 'TEST-native-identity', readCredential: async () => null })
 }
+for (const version of ['2.0.0', '2.0.21'] as const) test(`${version} admits Linux and Darwin selection but fences unsupported hosts before identity reads`, async () => {
+  pin = version
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform')!
+  const bun = Object.getOwnPropertyDescriptor(process.versions, 'bun')!
+  try {
+    for (const host of ['linux', 'darwin'] as const) {
+      Object.defineProperty(process, 'platform', { ...platform, value: host })
+      const selection = await inspectOpenCodeV2SourceAvailability(envelope())
+      expect(selection.native.version).toBe(version)
+      expect(selection.installedGraphFiles).toBeGreaterThan(0)
+      expect(selection.model).toEqual({ providerID: 'provider', id: 'model' })
+    }
+    expect(nativeSelectionCalls).toBe(2)
+    Object.defineProperty(process, 'platform', { ...platform, value: 'win32' })
+    await expect(inspectOpenCodeV2SourceAvailability(envelope())).rejects.toThrow('execution_containment_platform_pending')
+    Object.defineProperty(process, 'platform', { ...platform, value: 'darwin' })
+    Object.defineProperty(process.versions, 'bun', { ...bun, value: '1.3.10' })
+    await expect(inspectOpenCodeV2SourceAvailability(envelope())).rejects.toThrow('run_source_bun_required')
+    expect(nativeSelectionCalls).toBe(2)
+  } finally {
+    Object.defineProperty(process, 'platform', platform)
+    Object.defineProperty(process.versions, 'bun', bun)
+  }
+})
 for (const version of ['2.0.0', '2.0.21'] as const) test(`${version} team launch requires the same unattended profile as its strict proof`, async () => {
   pin = version
   const request = envelope(), selection = await inspectOpenCodeV2SourceAvailability(request)
@@ -86,6 +116,15 @@ for (const version of ['2.0.0', '2.0.21'] as const) test(`${version} team launch
   const launch = { ...request, body: { ...request.body, executionProof: samePolicyProof, preconditions } }
   const plan = await createOpenCodeV2LaunchPlan(launch)
   expect(plan.members[0]?.profile.config.sha256).toBe(samePolicyProof.managedConfigFingerprint)
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform')!
+  try {
+    Object.defineProperty(process, 'platform', { ...platform, value: 'win32' })
+    await expect(launchExplicitOpenCodeV2Run(plan)).rejects.toThrow('execution_containment_platform_pending')
+    await expect(startOpenCodeV2RunSupervisor(plan, '/TEST-unqualified', 'TEST')).rejects.toThrow('execution_containment_platform_pending')
+  } finally { Object.defineProperty(process, 'platform', platform) }
+  // A permitted host still cannot launch the fixture's unqualified Bun bytes.
+  await expect(launchExplicitOpenCodeV2Run(plan)).rejects.toThrow('run_source_changed')
+  expect(await readdir(path.join(root, 'app-data/opencode/v2'))).not.toContain('runs')
   const changedPolicyProof = await proof(generic.prepared, selection.capabilitySnapshotId)
   probe.mockImplementation(async () => ({ state: 'available', proof: changedPolicyProof, reason: null }))
   await expect(createOpenCodeV2LaunchPlan({ ...launch, body: { ...launch.body, executionProof: changedPolicyProof,

@@ -1,4 +1,5 @@
-import { prepareLinuxExecutionChild, linuxBirth } from '../services/opencode/host/OpenCodeV2ExecutionLauncher.js'
+import { windowsExecutionChildControl } from '../services/opencode/host/windows/OpenCodeV2WindowsChildControl.js'
+import { prepareExecutionPlatformChild, readExecutionPlatformBirth } from '../services/opencode/host/OpenCodeV2ExecutionPlatform.js'
 import { pathToFileURL } from 'node:url'
 import { resolveOpenCodeV2ExecutionDelivery } from '../services/opencode/host/OpenCodeV2ExecutionDelivery.js'
 import { hashOpenCodeFile } from '../services/opencode/compatibility/OpenCodeNativeIdentity.js'
@@ -10,14 +11,32 @@ import type { ServerOptions as FloorOptions } from '@opencode/server-v2-floor/op
 import type { ServerOptions as CurrentOptions } from '@opencode/server/options'
 
 // Dedicated IPC child. The execution DB/profile are retained, including failed acquisition.
+// Native Windows uses an authenticated named pipe; POSIX keeps its inherited
+// process IPC. The official runtime sees no process-global transport overrides.
+const childControl = process.platform === 'win32' ? windowsExecutionChildControl() : {
+  events: process,
+  connected: () => !!process.send && process.connected === true,
+  send: (value: Readonly<Record<string, unknown>>) => new Promise<void>((resolve, reject) => {
+    executionAssert(process.send && process.connected, 'execution_containment_identity_mismatch')
+    process.send!(value, error => error ? reject(error) : resolve())
+  }),
+  disconnect: () => process.disconnect?.(),
+}
 const controller = new AbortController()
-let prepared: Awaited<ReturnType<typeof prepareLinuxExecutionChild>> | undefined
-let preparation: ReturnType<typeof prepareLinuxExecutionChild> | undefined
+let prepared: Awaited<ReturnType<typeof prepareExecutionPlatformChild>> | undefined
+let preparation: ReturnType<typeof prepareExecutionPlatformChild> | undefined
 let leaseOwnerId: string | undefined
 let nonce: string | undefined, started = false, closing = false
 let startup: Promise<void> | undefined, finalize: (() => Promise<void>) | undefined
 let closeWork: Promise<void> | undefined
-const startupTimer = setTimeout(() => { void close() }, 30_000)
+const startupStartedAt = Date.now()
+let startupStage = 'waiting-for-prepare'
+function reportStartupFailure(reason: 'timeout' | 'failed'): void {
+  // Fixed stage names and elapsed time only; never include credentials or payloads.
+  process.stderr.write(JSON.stringify({ event: 'opencode-v2-startup', reason, stage: startupStage,
+    elapsedMs: Date.now() - startupStartedAt }) + '\n')
+}
+const startupTimer = setTimeout(() => { reportStartupFailure('timeout'); void close() }, 30_000)
 function close(): Promise<void> {
   return closeWork ??= (async () => {
     closing = true; controller.abort(); clearTimeout(startupTimer)
@@ -26,16 +45,16 @@ function close(): Promise<void> {
     try { if (startup) await boundOpenCodeRead(startup.catch(() => undefined), 6000) } catch { complete = false }
     try { if (finalize) await boundOpenCodeRead(finalize(), 3000) } catch { complete = false }
     try {
-      const birth = await linuxBirth(process.pid)
-      executionAssert(complete && birth && nonce && process.send && process.connected, 'cleanup_unknown')
-      await boundOpenCodeRead(new Promise<void>((resolve, reject) => {
-        process.send!({ type: 'closed', nonce, leaseOwnerId: prepared?.leaseOwnerId, namespace: prepared?.namespace, executableSha256: prepared?.executableSha256, pid: process.pid, birth, scopeClosed: true }, error => error ? reject(error) : resolve())
-      }), 500)
-      process.disconnect?.(); process.exit(0)
+      const birth = await readExecutionPlatformBirth(process.pid)
+      executionAssert(complete && birth && nonce && childControl.connected(), 'cleanup_unknown')
+      await boundOpenCodeRead(childControl.send({ type: 'closed', nonce, leaseOwnerId: prepared?.leaseOwnerId,
+        namespace: prepared?.namespace, executableSha256: prepared?.executableSha256, pid: process.pid,
+        birth, scopeClosed: true }), 500)
+      childControl.disconnect(); process.exit(0)
     } catch { process.exit(1) }
   })()
 }
-process.once('disconnect', () => { void close() })
+childControl.events.once('disconnect', () => { void close() })
 process.once('SIGTERM', () => { void close() })
 
 async function start(input: Record<string, unknown>): Promise<void> {
@@ -52,23 +71,17 @@ async function start(input: Record<string, unknown>): Promise<void> {
     native.generation === 'v2' &&
     (native.version === '2.0.0' || native.version === '2.0.21') && native.dialect === `v2-${native.version}` &&
     process.versions.bun === '1.3.11', 'execution_identity_mismatch')
+  startupStage = 'profile-validation'
   await validateExecutionProfile(profile); controller.signal.throwIfAborted()
   executionAssert(profile.directory === process.cwd() && process.env.PWD === profile.directory &&
     Object.entries(profile.env).every(([key, value]) => process.env[key] === value), 'execution_profile_changed')
   executionAssert(process.execPath === native.bun.path && await hashOpenCodeFile(process.execPath) === native.bun.sha256 &&
     await hashOpenCodeFile(process.argv[1]!) === native.entrySha256, 'execution_identity_mismatch')
+  startupStage = 'native-validation'
   await validateExecutionNative(native)
   controller.signal.throwIfAborted()
+  startupStage = 'graph-validation'
   const graph = await validateExecutionGraph(native.version, native.graph)
-  controller.signal.throwIfAborted()
-  // Effect and runtime resolve from the same verified official package graph.
-  const effect: typeof import('effect') = await import(pathToFileURL(graph.effectPath).href)
-  controller.signal.throwIfAborted()
-  const runtime: typeof import('@opencode/server/process') = await import(pathToFileURL(graph.modulePath).href)
-  controller.signal.throwIfAborted()
-  const { Effect, Scope, Exit } = effect
-  const scope = await Effect.runPromise(Scope.make())
-  finalize = () => Effect.runPromise(Scope.close(scope, Exit.void))
   controller.signal.throwIfAborted()
   const options = {
     hostname: '127.0.0.1', port: 0, password: input.password,
@@ -78,30 +91,64 @@ async function start(input: Record<string, unknown>): Promise<void> {
     models: { fetch: false, snapshot: !profile.models, ...(profile.models ? { file: profile.models.path } : {}) },
     fs: { filewatcher: false, fff: false },
   } satisfies FloorOptions & CurrentOptions
-  const server = await Effect.runPromise(runtime.start<never, never>(options).pipe(Effect.provideService(Scope.Scope, scope)), { signal: controller.signal })
+  let baseUrl: string
+  if (process.platform === 'win32') {
+    startupStage = 'runtime-import'
+    const { loadOpenCodeV2WindowsRuntime } = await import('../services/opencode/host/windows/OpenCodeV2WindowsRuntime.js')
+    const { windowsExecutionCommandPort } = await import('../services/opencode/host/windows/OpenCodeV2WindowsCommand.js')
+    const { bindWindowsExecutionHttp } = await import('../services/opencode/host/windows/OpenCodeV2WindowsHTTP.js')
+    const runtime = await loadOpenCodeV2WindowsRuntime(native.version, graph.moduleSha256,
+      windowsExecutionCommandPort(), profile.env)
+    controller.signal.throwIfAborted()
+    startupStage = 'server-start'
+    const server = await runtime.start(options, controller.signal)
+    // Register ownership before binding so a failed bridge bind still closes
+    // the acquired official server, without acknowledging partial cleanup.
+    finalize = server.close
+    const bridge = bindWindowsExecutionHttp(server.baseUrl, controller.signal)
+    finalize = async () => { try { await bridge.close() } finally { await server.close() } }
+    baseUrl = server.baseUrl
+  } else {
+    // Effect and runtime resolve from the same verified official package graph.
+    startupStage = 'effect-import'
+    const effect: typeof import('effect') = await import(pathToFileURL(graph.effectPath).href)
+    controller.signal.throwIfAborted()
+    startupStage = 'runtime-import'
+    const runtime: typeof import('@opencode/server/process') = await import(pathToFileURL(graph.modulePath).href)
+    controller.signal.throwIfAborted()
+    const { Effect, Scope, Exit } = effect
+    startupStage = 'scope-acquisition'
+    const scope = await Effect.runPromise(Scope.make())
+    finalize = () => Effect.runPromise(Scope.close(scope, Exit.void))
+    controller.signal.throwIfAborted()
+    startupStage = 'server-start'
+    const server = await Effect.runPromise(runtime.start<never, never>(options).pipe(Effect.provideService(Scope.Scope, scope)), { signal: controller.signal })
+    executionAssert(server.address._tag === 'TcpAddress' && server.address.hostname === '127.0.0.1')
+    baseUrl = `http://127.0.0.1:${server.address.port}`
+  }
   controller.signal.throwIfAborted()
-  const birth = await linuxBirth(process.pid)
+  startupStage = 'ready-identity'
+  const birth = await readExecutionPlatformBirth(process.pid)
   controller.signal.throwIfAborted()
-  executionAssert(!closing && birth && server.address._tag === 'TcpAddress' && server.address.hostname === '127.0.0.1')
+  executionAssert(!closing && birth && /^http:\/\/127\.0\.0\.1:[1-9]\d*$/.test(baseUrl))
   clearTimeout(startupTimer)
-  executionAssert(process.send && process.connected)
-  const port = server.address.port
-  await boundOpenCodeRead(new Promise<void>((resolve, reject) => {
-    process.send!({ type: 'ready', nonce, leaseOwnerId: prepared?.leaseOwnerId, namespace: prepared?.namespace, pid: process.pid, birth, pin: native.version,
-      baseUrl: `http://127.0.0.1:${port}`, graphSha256: native.graph.sha256,
-      executableSha256: native.bun.sha256, profileEpoch: profile.epoch,
-      selectionSha256: executionHash(profile.selection) }, error => error ? reject(error) : resolve())
-  }), 1000, controller.signal)
+  executionAssert(childControl.connected())
+  await boundOpenCodeRead(childControl.send({ type: 'ready', nonce, leaseOwnerId: prepared?.leaseOwnerId,
+    namespace: prepared?.namespace, pid: process.pid, birth, pin: native.version,
+    baseUrl, graphSha256: native.graph.sha256,
+    executableSha256: native.bun.sha256, profileEpoch: profile.epoch,
+    selectionSha256: executionHash(profile.selection) }), 1000, controller.signal)
 }
-process.on('message', message => {
+childControl.events.on('message', (message: unknown) => {
   try {
     const input = executionRecord(message)
     executionAssert(typeof input.nonce === 'string' && /^[a-f0-9-]{36}$/.test(input.nonce))
+    if (process.platform === 'win32' && (input.type === 'windowsHTTP' || input.type === 'commandResult')) return
     if (input.type === 'prepare') {
       executionAssert(!preparation && !started && !closing)
       executionAssert(typeof input.leaseOwnerId === 'string')
       nonce = input.nonce; leaseOwnerId = input.leaseOwnerId
-      preparation = prepareLinuxExecutionChild(input)
+      preparation = prepareExecutionPlatformChild(input)
       void preparation.then(value => { prepared = value }, () => { void close() })
       return
     }
@@ -109,9 +156,9 @@ process.on('message', message => {
       if (!started && !closing && nonce === undefined) nonce = input.nonce
       executionAssert(input.nonce === nonce && (leaseOwnerId === undefined || input.leaseOwnerId === leaseOwnerId), 'execution_identity_mismatch'); void close(); return
     }
-    executionAssert(preparation && !started && !closing && input.type === 'start' && process.send)
+    executionAssert(preparation && !started && !closing && input.type === 'start' && childControl.connected())
     started = true; nonce = input.nonce
     startup = start(input)
-    void startup.catch(() => { if (!closing) process.send?.({ type: 'failed', nonce }); void close() })
+    void startup.catch(() => { if (!closing) reportStartupFailure('failed'); if (!closing) void childControl.send({ type: 'failed', nonce, leaseOwnerId }).catch(() => undefined); void close() })
   } catch { void close() }
 })

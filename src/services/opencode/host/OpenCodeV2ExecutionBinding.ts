@@ -1,11 +1,11 @@
 import path from 'node:path'
-import { linuxBirth } from './OpenCodeV2ExecutionLauncher.js'
+import { readExecutionPlatformBirth } from './OpenCodeV2ExecutionPlatform.js'
 import { lstat, open, readFile, readdir, realpath } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
 import { readProcessStartTimeMs } from '../../../utils/processKill.js'
 import { hashOpenCodeFile, readOpenCodePackageManifest, type OpenCodeV2NativeIdentity } from '../compatibility/OpenCodeNativeIdentity.js'
 import { assertExecutionSelectedModel, executionAssert, executionHash, executionRecord,
-  type ExecutionSelectedModel } from '../execution/OpenCodeV2ExecutionContracts.js'
+  type ExecutionSelectedModel, type ExecutionBirth } from '../execution/OpenCodeV2ExecutionContracts.js'
 import { verifyOpenCodeV2ServerGraph } from './OpenCodeV2ServerGraph.js'
 
 export type ExecutionGraph = Readonly<{ sha256: string; files: readonly Readonly<{ path: string; sha256: string }>[] }>
@@ -76,9 +76,13 @@ export async function validateExecutionGraph(pin: '2.0.0' | '2.0.21', receipt: E
   executionAssert(receipt.files.length > 0 && receipt.files.length <= 65_536)
   const rows = [...receipt.files].sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0)
   executionAssert(new Set(rows.map(row => row.path)).size === rows.length && executionHash(rows) === receipt.sha256, 'execution_graph_changed')
-  for (const row of rows) {
-    executionAssert(/^[a-f0-9]{64}$/.test(row.sha256) && path.isAbsolute(row.path) && await realpath(row.path) === row.path)
-    executionAssert(await hashOpenCodeFile(row.path) === row.sha256, 'execution_graph_changed')
+  // Official graphs contain tens of thousands of independent files. Bound
+  // concurrent reads instead of serializing each filesystem round trip.
+  for (let offset = 0; offset < rows.length; offset += 16) {
+    await Promise.all(rows.slice(offset, offset + 16).map(async row => {
+      executionAssert(/^[a-f0-9]{64}$/.test(row.sha256) && path.isAbsolute(row.path) && await realpath(row.path) === row.path)
+      executionAssert(await hashOpenCodeFile(row.path) === row.sha256, 'execution_graph_changed')
+    }))
   }
   const graph = await verifyOpenCodeV2ServerGraph(pin)
   executionAssert(rows.some(row => row.path === graph.modulePath && row.sha256 === graph.moduleSha256) &&
@@ -121,7 +125,7 @@ export async function validateExecutionGraph(pin: '2.0.0' | '2.0.21', receipt: E
     await walk(root)
     const dependencies = metadata.dependencies === undefined ? {} : metadata.dependencies as Record<string, unknown>
     executionAssert(dependencies !== null && typeof dependencies === 'object' && !Array.isArray(dependencies))
-    for (const name of Object.keys(dependencies)) await visit(await locate(name, root), name)
+    for (const name of Object.keys(dependencies)) await visit(await locate(name, root), dependencyPackageName(name, dependencies[name]))
     const optional = metadata.optionalDependencies === undefined ? {} : metadata.optionalDependencies as Record<string, unknown>
     executionAssert(optional !== null && typeof optional === 'object' && !Array.isArray(optional))
     for (const name of Object.keys(optional)) {
@@ -130,7 +134,7 @@ export async function validateExecutionGraph(pin: '2.0.0' | '2.0.21', receipt: E
         if (!(error instanceof Error) || error.message !== 'execution_graph_dependency_missing') throw error
         continue
       }
-      await visit(resolved, name)
+      await visit(resolved, dependencyPackageName(name, optional[name]))
     }
   }
   const client = await realpath(Bun.resolveSync(pin === '2.0.0' ? '@opencode/client-v2-floor' : '@opencode/client', import.meta.dir))
@@ -138,6 +142,16 @@ export async function validateExecutionGraph(pin: '2.0.0' | '2.0.21', receipt: E
   await visit(await packageRoot(graph.effectPath), 'effect')
   await visit(await packageRoot(client), '@opencode/client')
   return graph
+}
+
+/** npm aliases keep the dependency lookup key but declare another package name.
+ * The installed target still passes the same pin and complete byte checks. */
+function dependencyPackageName(name: string, specification: unknown): string {
+  executionAssert(typeof specification === 'string', 'execution_graph_changed')
+  if (!specification.startsWith('npm:')) return name
+  const alias = /^npm:((?:@[a-z0-9._-]+\/)?[a-z0-9._-]+)(?:@[^\s]+)?$/.exec(specification)
+  executionAssert(alias, 'execution_graph_changed')
+  return alias[1]!
 }
 
 export async function validateExecutionNative(native: ValidatedExecutionNative): Promise<void> {
@@ -156,10 +170,10 @@ export async function validateExecutionNative(native: ValidatedExecutionNative):
   } finally { await handle.close() }
 }
 
-export type ExecutionBirth = Readonly<{ format: 'linux-start-ticks' | 'utc-ms'; value: string; bootId: string | null }>
-/** Linux ticks are never compared with a wall clock. */
+export type { ExecutionBirth } from '../execution/OpenCodeV2ExecutionContracts.js'
+/** Native Linux ticks and Darwin process versions are never compared with a wall clock. */
 export async function readExecutionBirth(pid: number): Promise<ExecutionBirth | null> {
-  if (process.platform === 'linux') return linuxBirth(pid)
+  if (process.platform === 'linux' || process.platform === 'darwin') return readExecutionPlatformBirth(pid)
   const value = await readProcessStartTimeMs(pid)
   if (value === null) return null
   return Object.freeze({ format: 'utc-ms', value: String(value), bootId: null })

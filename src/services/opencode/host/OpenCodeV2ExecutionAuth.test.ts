@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { tmpdir } from 'node:os'
 import { pathToFileURL } from 'node:url'
@@ -10,7 +10,7 @@ import type { ExecutionAuthority, ExecutionContext } from '../execution/OpenCode
 import type { SelectedExecutionProfile } from './OpenCodeV2ExecutionBinding.js'
 const digest = (value: string) => createHash('sha256').update(value).digest('hex')
 async function fixture(credential: unknown = { type: 'api', key: 'TEST-DUMMY-KEY' }) {
-  const root = await mkdtemp(path.join(tmpdir(), 'TEST-v2-auth-'))
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), 'TEST-v2-auth-')))
   const data = path.join(root, 'data/opencode'); await mkdir(data, { recursive: true, mode: 0o700 })
   const content = JSON.stringify(credential === null ? {} : { groq: credential })
   const auth = path.join(data, 'auth.json'); await writeFile(auth, content, { mode: 0o600 })
@@ -79,5 +79,37 @@ test('execution auth rejects a different profile before endpoint or native API a
   try {
     const authority = { profileRoot: f.profile.root + '-other', profileEpoch: f.profile.epoch, directory: f.profile.directory } as ExecutionAuthority
     await expect(initializeOpenCodeV2ExecutionAuth(authority, f.profile, {} as ExecutionContext)).rejects.toThrow('execution_selected_auth_profile_changed')
+  } finally { await f.remove() }
+})
+
+
+test('anonymous native readback admits only the exact enabled free selected model without credential mutation', async () => {
+  const f = await fixture()
+  const profile: SelectedExecutionProfile = { ...f.profile, authSha256: undefined }
+  let posts = 0
+  const location = { directory: profile.directory }
+  const provider = { id: 'groq', integrationID: 'TEST-integration', activation: 'enabled', settings: { apiKey: 'public' } }
+  const model = { id: 'TEST-model', providerID: 'groq', enabled: true, status: 'active', cost: [{ input: 0, output: 0, cache: { read: 0, write: 0 } }] }
+  const port = {
+    providers: async () => ({ location, data: [provider] }),
+    integration: async () => ({ location, data: { id: 'TEST-integration', connections: [] } }),
+    models: async () => ({ location, data: [model] }),
+    connect: async () => { posts++ },
+  }
+  try {
+    // The anonymous branch must not depend on an auth file or a provider-name allowlist.
+    await rm(f.auth)
+    await attachOpenCodeV2SelectedKey(profile, port)
+    for (const changed of [
+      { ...port, providers: async () => ({ location, data: [{ ...provider, activation: 'auto' }] }) },
+      { ...port, providers: async () => ({ location, data: [{ ...provider, settings: {} }] }) },
+      { ...port, integration: async () => ({ location, data: { id: 'TEST-integration', connections: [{ type: 'credential', id: 'cred_TEST' }] } }) },
+      { ...port, models: async () => ({ location, data: [{ ...model, enabled: false }] }) },
+      { ...port, models: async () => ({ location, data: [{ ...model, id: 'other' }] }) },
+      { ...port, models: async () => ({ location, data: [{ ...model, cost: [{ input: 1, output: 0, cache: { read: 0, write: 0 } }] }] }) },
+      { ...port, models: async () => ({ location, data: [model, model] }) },
+      { ...port, models: async () => ({ location: { directory: profile.directory + '-other' }, data: [model] }) },
+    ]) await expect(attachOpenCodeV2SelectedKey(profile, changed)).rejects.toThrow('execution_selected_auth_')
+    expect(posts).toBe(0)
   } finally { await f.remove() }
 })

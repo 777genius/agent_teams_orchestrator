@@ -5,6 +5,7 @@ import type { ValidatedExecutionNative } from '../host/OpenCodeV2ExecutionHost.j
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { resolveOpenCodeV2ExecutionDelivery } from '../host/OpenCodeV2ExecutionDelivery.js'
+import { assertExecutionPlatformAvailable } from '../host/OpenCodeV2ExecutionPlatform.js'
 import { mkdir, mkdtemp, readdir, realpath, writeFile, access } from 'node:fs/promises'
 import { constants } from 'node:fs'
 
@@ -26,7 +27,8 @@ import type { RunLaunchPlan, RunMemberPlan } from './OpenCodeV2RunTypes.js'
 const text = (value: unknown): string => { executionAssert(typeof value === 'string' && value.trim().length > 0, 'run_launch_input_invalid'); return value }
 
 export async function inspectOpenCodeV2LaunchSelection(envelope: BridgeEnvelope) {
-  executionAssert(process.platform === 'linux' && process.versions.bun === '1.3.11', 'run_source_linux_bun_required')
+  assertExecutionPlatformAvailable()
+  executionAssert(process.versions.bun === '1.3.11', 'run_source_bun_required')
   const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'run-owner')
   const selected = await inspectOpenCodeReadSelection()
   executionAssert(selected.native && selected.policy.generation === 'v2', 'run_selected_native_unknown')

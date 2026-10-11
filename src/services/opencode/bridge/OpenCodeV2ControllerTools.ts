@@ -9,6 +9,48 @@ import type { ExecutionBridgeClient, ExecutionMcpConfig } from '../transport/Ope
 import type { SelectedExecutionProfile } from '../host/OpenCodeV2ExecutionHost.js'
 import { boundOpenCodeRead } from '../transport/OpenCodeBoundedFetch.js'
 
+/** Darwin fd paths cannot traverse children. Open relative to the retained
+ * vnode, then duplicate the descriptor into a FileHandle, never its pathname. */
+async function openControllerPath(parent: FileHandle | undefined, name: string, flags: number): Promise<FileHandle> {
+  if (process.platform !== 'darwin' || !parent) return open(name, flags)
+  const { dlopen, FFIType, ptr, toArrayBuffer } = await import('bun:ffi')
+  const native = dlopen('/usr/lib/libSystem.B.dylib', {
+    openat: { args: [FFIType.i32, FFIType.ptr, FFIType.i32], returns: FFIType.i32 },
+    close: { args: [FFIType.i32], returns: FFIType.i32 },
+    __error: { args: [], returns: FFIType.ptr },
+  })
+  let descriptor = -1
+  try {
+    executionAssert(!name.includes('/') && name !== '.' && name !== '..', 'run_controller_inbox_unknown')
+    descriptor = native.symbols.openat(parent.fd, ptr(Buffer.from(name + '\0')), flags | 0x01000000 /* Darwin O_CLOEXEC */)
+    if (descriptor < 0) {
+      const pointer = native.symbols.__error()
+      executionAssert(pointer !== null, 'run_controller_inbox_unknown')
+      const errno = new DataView(toArrayBuffer(pointer, 0, 4)).getInt32(0, true)
+      throw Object.assign(new Error('run_controller_inbox_unknown'), { code: errno === 2 ? 'ENOENT' : 'EACCES' })
+    }
+    // fdescfs duplicates the retained descriptor but is not itself a directory.
+    // The caller checks the duplicate's actual inode/type before reading it.
+    return await open(`/dev/fd/${descriptor}`, flags & ~constants.O_DIRECTORY)
+  } finally { if (descriptor >= 0) native.symbols.close(descriptor); native.close() }
+}
+
+export async function retainedControllerPath(handle: FileHandle): Promise<string> {
+  if (process.platform !== 'darwin') return realpath(`/proc/self/fd/${handle.fd}`)
+  const { dlopen, FFIType, ptr } = await import('bun:ffi')
+  const native = dlopen('/usr/lib/libSystem.B.dylib', {
+    // Fixed-ABI syscall stub: the public variadic fcntl ABI differs on ARM64.
+    __fcntl: { args: [FFIType.i32, FFIType.i32, FFIType.ptr], returns: FFIType.i32 },
+  })
+  try {
+    const bytes = Buffer.alloc(1024)
+    executionAssert(native.symbols.__fcntl(handle.fd, 50 /* F_GETPATH */, ptr(bytes)) === 0, 'run_controller_inbox_unknown')
+    const end = bytes.indexOf(0)
+    executionAssert(end > 0, 'run_controller_inbox_unknown')
+    return new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(0, end))
+  } finally { native.close() }
+}
+
 export type ControllerToolProof = Readonly<{
   server: string; configHash: string; schemasHash: string
   tools: readonly Readonly<{ name: string; inputSchema: Readonly<Record<string, unknown>> }>[]
@@ -85,20 +127,20 @@ export async function readOwnedControllerInbox(profile: SelectedExecutionProfile
     let address = root
     for (const segment of ['', 'teams', binding.teamId, 'inboxes']) {
       check()
-      if (segment) { expected = path.join(expected, segment); address = `/proc/self/fd/${handles.at(-1)!.fd}/${segment}` }
-      const handle = await open(address, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW)
+      if (segment) { expected = path.join(expected, segment); address = process.platform === 'darwin' ? segment : `/proc/self/fd/${handles.at(-1)!.fd}/${segment}` }
+      const handle = await openControllerPath(handles.at(-1), address, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW)
       handles.push(handle)
       const stat = await handle.stat()
       executionAssert(stat.isDirectory() && stat.uid === process.getuid?.() && (stat.mode & 0o022) === 0 &&
-        await realpath(`/proc/self/fd/${handle.fd}`) === expected, 'run_controller_inbox_unknown')
+        await retainedControllerPath(handle) === expected, 'run_controller_inbox_unknown')
     }
     check()
     expected = path.join(expected, 'user.json')
-    const file = await open(`/proc/self/fd/${handles.at(-1)!.fd}/user.json`, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+    const file = await openControllerPath(handles.at(-1), process.platform === 'darwin' ? 'user.json' : `/proc/self/fd/${handles.at(-1)!.fd}/user.json`, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
     handles.push(file)
     const before = await file.stat()
     executionAssert(before.isFile() && before.uid === process.getuid?.() && (before.mode & 0o022) === 0 &&
-      before.size <= limit && await realpath(`/proc/self/fd/${file.fd}`) === expected, 'run_controller_inbox_unknown')
+      before.size <= limit && await retainedControllerPath(file) === expected, 'run_controller_inbox_unknown')
     const bytes = Buffer.alloc(limit + 1)
     let length = 0
     while (length < bytes.length) {
@@ -109,7 +151,7 @@ export async function readOwnedControllerInbox(profile: SelectedExecutionProfile
     }
     const after = await file.stat()
     executionAssert(length <= limit && before.size === length && after.size === before.size &&
-      after.mtimeMs === before.mtimeMs && await realpath(`/proc/self/fd/${file.fd}`) === expected,
+      after.mtimeMs === before.mtimeMs && await retainedControllerPath(file) === expected,
       'run_controller_inbox_unknown')
     const rows: unknown = JSON.parse(bytes.subarray(0, length).toString('utf8'))
     executionAssert(Array.isArray(rows) && rows.length <= 4096, 'run_controller_inbox_unknown')

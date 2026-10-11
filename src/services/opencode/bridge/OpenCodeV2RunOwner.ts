@@ -5,6 +5,7 @@ import { createHash } from 'node:crypto'
 import { readFile, realpath } from 'node:fs/promises'
 import path from 'node:path'
 import { resolveOpenCodeV2ExecutionDelivery } from '../host/OpenCodeV2ExecutionDelivery.js'
+import { assertExecutionPlatformAvailable } from '../host/OpenCodeV2ExecutionPlatform.js'
 import { OpenCodeV2AdmissionService, type QueueIntent } from '../execution/OpenCodeV2AdmissionService.js'
 import { OpenCodeV2AdmissionStore } from '../execution/OpenCodeV2AdmissionStore.js'
 import { OpenCodeV2SessionService, verifyExecutionSession } from '../execution/OpenCodeV2SessionService.js'
@@ -441,7 +442,8 @@ export class OpenCodeV2RunOwner {
 export async function launchExplicitOpenCodeV2Run(plan: RunLaunchPlan): Promise<RunControlRecord> {
   plan = structuredClone(plan)
   validateRunLaunchPlan(plan)
-  executionAssert(process.platform === 'linux' && process.versions.bun === '1.3.11', 'run_source_linux_bun_required')
+  assertExecutionPlatformAvailable()
+  executionAssert(process.versions.bun === '1.3.11', 'run_source_bun_required')
   executionAssert(await realpath(plan.source.bunPath) === plan.source.bunPath && sha(await readFile(plan.source.bunPath)) === plan.source.bunSha256, 'run_source_changed')
   const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'run-owner')
   const entry = delivery.entryPath
@@ -475,6 +477,7 @@ export async function launchExplicitOpenCodeV2Run(plan: RunLaunchPlan): Promise<
 }
 
 export async function startOpenCodeV2RunSupervisor(plan: RunLaunchPlan, directory: string, sourceSha256: string): Promise<{ record: RunControlRecord; owner: OpenCodeV2RunOwner; retire(): Promise<void> }> {
+  assertExecutionPlatformAvailable()
   plan = structuredClone(plan)
   validateRunLaunchPlan(plan)
   executionAssert(directory === runControlDirectory(plan.dataRoot, plan.binding.teamId, plan.binding.runId) &&

@@ -1,13 +1,13 @@
 import { execFileSync } from 'node:child_process'
 import { expect, test } from 'bun:test'
-import { mkdtemp, mkdir, writeFile, symlink, rm, chmod } from 'node:fs/promises'
+import { mkdtemp, mkdir, writeFile, symlink, rm, chmod, realpath } from 'node:fs/promises'
 import path from 'node:path'
 import { executionHash } from '../execution/OpenCodeV2ExecutionContracts.js'
 import type { SelectedExecutionProfile } from '../host/OpenCodeV2ExecutionHost.js'
 import { readOwnedControllerInbox, type ControllerToolProof } from './OpenCodeV2ControllerTools.js'
 
 test('selected local canonical inbox reader binds exact config, schema and bounded owned regular bytes', async () => {
-  const root = await mkdtemp(path.join(process.env.TMPDIR!, 'TEST-controller-inbox-'))
+  const root = await realpath(await mkdtemp(path.join(process.env.TMPDIR!, 'TEST-controller-inbox-')))
   const directory = path.join(root, 'teams/TEST-team/inboxes')
   const binding = { teamId: 'TEST-team', runId: 'TEST-run', memberId: 'worker', sessionID: 'ses_TESToriginal' }
   const config = { type: 'local', command: ['TEST-unused'], environment: { AGENT_TEAMS_MCP_CLAUDE_DIR: root } }

@@ -1,5 +1,7 @@
 import path from 'node:path'
 import { resolveOpenCodeV2ExecutionDelivery } from '../host/OpenCodeV2ExecutionDelivery.js'
+import { assertExecutionPlatformAvailable } from '../host/OpenCodeV2ExecutionPlatform.js'
+import { validateExecutionNative } from '../host/OpenCodeV2ExecutionBinding.js'
 import { createHash } from 'node:crypto'
 import { readFile, realpath, readdir, lstat } from 'node:fs/promises'
 import { executionHash, executionAssert, executionRecord } from '../execution/OpenCodeV2ExecutionContracts.js'
@@ -8,9 +10,12 @@ import type { ValidatedExecutionNative } from '../host/OpenCodeV2ExecutionBindin
 
 /** Read-only installed graph receipt; no server import, CLI execution, or output file. */
 export async function createOpenCodeV2ExecutionReceipt(_sourceRoot: string, identity: import('../compatibility/OpenCodeNativeIdentity.js').OpenCodeV2NativeIdentity, controller?: ExecutionMcpConfig): Promise<ValidatedExecutionNative> {
+assertExecutionPlatformAvailable()
+executionAssert(process.versions.bun === '1.3.11' && identity.generation === 'v2', 'source_bun_required')
 const cli = await realpath(identity.executablePath), bun = await realpath(process.execPath), pin = identity.version
-executionAssert(process.platform === 'linux' && process.versions.bun === '1.3.11' && identity.generation === 'v2', 'source_linux_required')
 const sha = async (file: string) => createHash('sha256').update(await readFile(file)).digest('hex')
+const cliSha256 = await sha(cli)
+executionAssert(cliSha256 === identity.executableSha256, 'native_selection_changed')
 const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'execution')
 // Legacy callers supply a source root; delivery is derived from this module, never that hint.
 const resolutionRoot = delivery.runtimeMode === 'source' ? path.join(delivery.root, 'src/services/opencode/host') : delivery.root
@@ -46,10 +51,17 @@ async function visit(root: string, expectedName?: string): Promise<void> {
   for (const optional of [false, true]) {
     const deps = metadata[optional ? 'optionalDependencies' : 'dependencies']
     if (deps === undefined) continue
-    for (const name of Object.keys(executionRecord(deps))) {
+    const dependencies = executionRecord(deps)
+    for (const name of Object.keys(dependencies)) {
       const dependency = await locate(name, root)
       if (!dependency && optional) continue
-      executionAssert(dependency, 'graph_dependency_missing:' + name); await visit(dependency, name)
+      executionAssert(dependency, 'graph_dependency_missing:' + name)
+      const specification = dependencies[name]
+      executionAssert(typeof specification === 'string', 'graph_dependency_invalid')
+      const alias = specification.startsWith('npm:')
+        ? /^npm:((?:@[a-z0-9._-]+\/)?[a-z0-9._-]+)(?:@[^\s]+)?$/.exec(specification) : null
+      executionAssert(!specification.startsWith('npm:') || alias, 'graph_dependency_invalid')
+      await visit(dependency, alias ? alias[1]! : name)
     }
   }
 }
@@ -63,8 +75,10 @@ await visit(await resolveOpenCodeV2ReceiptPackageRoot(mcpSdk), '@modelcontextpro
 if (controller?.type === 'local') {
   executionAssert(controller.command.length >= 2 && path.isAbsolute(controller.command[0]!), 'controller_runtime_missing')
   const runtime = await realpath(controller.command[0]!)
+  const magic = (await readFile(runtime)).subarray(0, 4).toString('hex')
   executionAssert(runtime === controller.command[0] && (await lstat(runtime)).isFile() &&
-    (await readFile(runtime)).subarray(0, 4).toString('hex') === '7f454c46', 'controller_runtime_invalid')
+    (process.platform === 'linux' ? magic === '7f454c46' :
+      ['cffaedfe', 'cefaedfe', 'feedfacf', 'feedface', 'cafebabe', 'bebafeca'].includes(magic)), 'controller_runtime_invalid')
   files.push({ path: runtime, sha256: await sha(runtime) })
   let entries = 0
   for (const argument of controller.command.slice(1)) {
@@ -79,12 +93,12 @@ if (controller?.type === 'local') {
 files.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0)
 executionAssert(new Set(files.map(row => row.path)).size === files.length)
 const cliMetadata = executionRecord(JSON.parse(await readFile(path.join(path.dirname(path.dirname(cli)), 'package.json'), 'utf8')))
-executionAssert(typeof cliMetadata.name === 'string' && cliMetadata.name.startsWith('@opencode/cli-linux-') && cliMetadata.version === pin)
-executionAssert((await readFile(cli)).subarray(0, 4).toString('hex') === '7f454c46')
+executionAssert(typeof cliMetadata.name === 'string' && cliMetadata.version === pin)
 const native = { generation: 'v2', version: pin, dialect: `v2-${pin}`, runtimeMode: delivery.runtimeMode, executablePath: cli,
-  executableSha256: await sha(cli), packageName: cliMetadata.name, entrySha256: delivery.entrySha256,
+  executableSha256: cliSha256, packageName: cliMetadata.name, entrySha256: delivery.entrySha256,
   bun: { path: bun, sha256: await sha(bun) }, graph: { sha256: executionHash(files), files } } satisfies ValidatedExecutionNative
 executionAssert(native.executableSha256 === identity.executableSha256 && native.packageName === identity.packageName, 'native_selection_changed')
+await validateExecutionNative(native)
 return native
 }
 

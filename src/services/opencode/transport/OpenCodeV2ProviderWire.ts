@@ -28,7 +28,7 @@ export class OpenCodeV2ProviderWire {
       (location ? url.searchParams.get('location[directory]') === this.authority.directory : url.search === ''), 'provider_directory_changed')
     const signal = AbortSignal.any([this.abort.signal, this.endpoint.signal, AbortSignal.timeout(Math.max(1, this.deadline - Date.now()))])
     const headers = new Headers(request.headers); headers.set('authorization', 'Basic ' + Buffer.from('opencode:' + this.endpoint.password).toString('base64'))
-    const response = await boundOpenCodeRead(globalThis.fetch(request, { headers, signal, redirect: 'error' }), this.deadline - Date.now(), signal)
+    const response = await boundOpenCodeRead((this.endpoint.fetch ?? globalThis.fetch)(request, { headers, signal, redirect: 'error' }), this.deadline - Date.now(), signal)
     executionAssert(!response.redirected && (!response.url || new URL(response.url).origin === url.origin), 'provider_authority_changed')
     const reader = response.body?.getReader(); let bytes = 0; const pieces: Uint8Array[] = []
     try {

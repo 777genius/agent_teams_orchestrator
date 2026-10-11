@@ -12,13 +12,45 @@ import type { OwnedNativeProfile } from './OpenCodeV2ExecutionBinding.js'
 type SelectedKeyPort = {
   providers(): Promise<unknown>; integration(id: string): Promise<unknown>
   connect(id: string, key: string): Promise<void>
+  models?(): Promise<unknown>
 }
 
 /** Fresh native databases bootstrap their schema without running the legacy auth migration.
  * Attach only the sealed selected key through the native API before any session admission. */
 export async function attachOpenCodeV2SelectedKey(profile: OwnedNativeProfile, port: SelectedKeyPort): Promise<void> {
   executionAssert(!('purpose' in profile.selection), 'execution_selected_auth_required')
-  const providerId = profile.selection.model.providerID
+  const selectedModel = profile.selection.model
+  const providerId = selectedModel.providerID
+  // Both pinned native plugins publish this sentinel only for their anonymous lane.
+  // No caller provider name or absent auth file alone grants anonymous admission.
+  if (profile.authSha256 === undefined) {
+    executionAssert(typeof port.models === 'function', 'execution_selected_auth_anonymous_unproven')
+    const scoped = (value: unknown) => {
+      const row = executionRecord(value)
+      executionAssert(executionRecord(row.location).directory === profile.directory, 'execution_selected_auth_location_changed')
+      return row.data
+    }
+    const providers = scoped(await port.providers())
+    executionAssert(Array.isArray(providers), 'execution_selected_auth_provider_unknown')
+    const matches = providers.map(executionRecord).filter(row => row.id === providerId)
+    const provider = matches[0]
+    executionAssert(matches.length === 1 && provider?.activation === 'enabled' &&
+      executionRecord(provider.settings).apiKey === 'public' && typeof provider.integrationID === 'string' &&
+      provider.integrationID.length > 0, 'execution_selected_auth_anonymous_unproven')
+    const integration = executionRecord(scoped(await port.integration(provider.integrationID)))
+    executionAssert(integration.id === provider.integrationID && Array.isArray(integration.connections) &&
+      integration.connections.length === 0, 'execution_selected_auth_anonymous_unproven')
+    const models = scoped(await port.models())
+    executionAssert(Array.isArray(models), 'execution_selected_auth_anonymous_unproven')
+    const selected = models.map(executionRecord).filter(row => row.providerID === providerId && row.id === selectedModel.id)
+    const model = selected[0]
+    executionAssert(selected.length === 1 && model?.enabled === true && model.status === 'active' &&
+      Array.isArray(model.cost) && model.cost.length > 0 && model.cost.every(value => {
+        const cost = executionRecord(value), cache = executionRecord(cost.cache)
+        return cost.input === 0 && cost.output === 0 && cache.read === 0 && cache.write === 0
+      }), 'execution_selected_auth_anonymous_unproven')
+    return
+  }
   const file = path.join(profile.root, 'data/opencode/auth.json')
   const fingerprint = profile.authSha256
   executionAssert(typeof fingerprint === 'string' && /^[a-f0-9]{64}$/.test(fingerprint), 'execution_selected_auth_unbound')
@@ -75,6 +107,7 @@ export async function initializeOpenCodeV2ExecutionAuth(authority: ExecutionAuth
     const location = { directory: profile.directory }
     await attachOpenCodeV2SelectedKey(profile, {
       providers: () => sdk.provider.list({ location }),
+      models: () => sdk.model.list({ location }),
       integration: integrationID => sdk.integration.get({ location, integrationID }),
       connect: (integrationID, key) => sdk.integration.connect.key({ location, integrationID, key }),
     })
