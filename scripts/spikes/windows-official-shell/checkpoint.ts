@@ -39,10 +39,10 @@ export async function runOfficialShellCheckpoint(base: string, resolveGraph: typ
         const context = yield* locations.contextEffect(official.location.Ref.make({ directory: official.schema.AbsolutePath.make(work) }))
         const service = Context.get(context, official.shell.Service)
         let beforeCalled = false
-        const first = yield* service.create({ command: `"${process.execPath}" "${commandFile}"`, cwd: work, shell }, () => Effect.sync(() => { beforeCalled = true }))
+        const first = yield* service.create({ command: `"${process.execPath}" "${commandFile}"`, cwd: work, shell, timeout: 30000 }, () => Effect.sync(() => { beforeCalled = true }))
         const result = yield* service.result(first)
         record.command = { status: result.info.status, exit: result.info.exit, output: result.capture?.output, beforeCalled, pid: result.info.pid }
-        const cancelled = yield* service.create({ command: `"${process.execPath}" "${cancelFile}"`, cwd: work, shell })
+        const cancelled = yield* service.create({ command: `"${process.execPath}" "${cancelFile}"`, cwd: work, shell, timeout: 30000 })
         let descendant: { parentPID: number; descendantPID: number } | undefined
         const deadline = Date.now() + 10000
         while (!descendant && Date.now() < deadline) {

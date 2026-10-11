@@ -2,6 +2,7 @@ import { readFile, writeFile } from 'node:fs/promises'
 if (process.platform !== 'win32' || process.arch !== 'x64' || process.versions.bun !== '1.3.11') throw new Error('native Windows x64 Bun 1.3.11 required')
 const output = process.argv[2]
 if (!output) throw new Error('TEST evidence output path required')
+if (process.env.TEST_WINDOWS_OFFICIAL_SHELL_BUNDLED === '1') await writeFile(output, JSON.stringify({ phase: 'before-boundary-import', qualified: false, fullTaskQualified: false }) + '\n')
 process.env.TEST_WINDOWS_OFFICIAL_SHELL = '1'
 await import('../opencode-v2-windows-boundary.ts')
 const evidence = JSON.parse(await readFile(output, 'utf8'))

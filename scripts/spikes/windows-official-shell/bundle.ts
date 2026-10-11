@@ -1,11 +1,16 @@
 import path from 'node:path'
 import { createHash } from 'node:crypto'
 import { builtinModules } from 'node:module'
+import { readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { mkdir, readFile, realpath, writeFile, readdir } from 'node:fs/promises'
 import type { Artifact } from './fixture.ts'
 
 const hash = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex')
 const within = (root: string, file: string) => { const relative = path.relative(root, file); if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw new Error('TEST bundle input escaped qualified install'); return relative }
+export const bundledImportPath = (file: string): string => file.replaceAll('\\', '/')
+export function renderBundledCheckpointEntry(imports: readonly string[], tables: readonly string[]): string {
+  return `${imports.join('\n')}\nconst graphs = { ${tables.join(',\n')} };\nexport const runOfficialShellCheckpointBundled = (base: string) => runOfficialShellCheckpoint(base, async alias => { if (alias !== '@opencode/server-v2-floor' && alias !== '@opencode/server') throw new Error('TEST bundle pin not selected'); return graphs[alias]; });\n`
+}
 async function packageIdentity(file: string): Promise<{ root: string; name: string; version: string }> {
   let root = path.dirname(file)
   for (;;) {
@@ -20,14 +25,18 @@ async function packageIdentity(file: string): Promise<{ root: string; name: stri
 
 export async function stageBundledFixture(readonly: string): Promise<Artifact[]> {
   if (Bun.version !== '1.3.11' || process.platform !== 'win32') throw new Error('TEST bundle requires pinned Windows Bun')
+  const buildDirectory = path.join(path.dirname(readonly), 'bundle-build')
+  await mkdir(buildDirectory, { recursive: true })
+  await writeFile(path.join(buildDirectory, 'stage.json'), JSON.stringify({ phase: 'select-before-effect-resolution', fullTaskQualified: false }))
   const sourceRoot = await realpath(path.resolve(import.meta.dir, '../../..'))
   const effectEntry = await realpath(Bun.resolveSync('effect', import.meta.dir))
   const effectIdentity = await packageIdentity(effectEntry)
   if (effectIdentity.name !== 'effect' || effectIdentity.version !== '4.0.0-rc.112') throw new Error('TEST bundle Effect pin mismatch')
   const selections: { pin: string; alias: string; entries: Record<string, string> }[] = []
-  const imports: string[] = [`import { runOfficialShellCheckpoint } from ${JSON.stringify(path.join(import.meta.dir, 'checkpoint.ts').replaceAll('\\', '/'))};`]
+  const imports: string[] = [`import { runOfficialShellCheckpoint } from ${JSON.stringify(bundledImportPath(path.join(import.meta.dir, 'checkpoint.ts')))};`]
   const tables: string[] = []
   for (const [index, [pin, alias]] of [['2.0.0', '@opencode/server-v2-floor'], ['2.0.21', '@opencode/server']].entries()) {
+    await writeFile(path.join(buildDirectory, 'stage.json'), JSON.stringify({ phase: 'select-before-pin-resolution', pin, alias, fullTaskQualified: false }))
     const entry = await realpath(Bun.resolveSync(`${alias}/routes`, import.meta.dir))
     const entries: Record<string, string> = { routes: entry }
     for (const [key, specifier] of [['cross', '@opencode/util/cross-spawn-spawner'], ['locations', '@opencode/core/location-service-map'], ['location', '@opencode/core/location'], ['shell', '@opencode/core/shell'], ['schema', '@opencode/schema/schema'], ['http', '@effect/platform-node/NodeHttpServer']] as const) entries[key] = await realpath(Bun.resolveSync(specifier, path.dirname(entry)))
@@ -37,35 +46,36 @@ export async function stageBundledFixture(readonly: string): Promise<Artifact[]>
       const expectedName = key === 'routes' ? '@opencode/server' : key === 'cross' ? '@opencode/util' : key === 'schema' ? '@opencode/schema' : key === 'http' ? '@effect/platform-node' : '@opencode/core'
       if (identity.name !== expectedName || (key !== 'http' && identity.version !== pin)) throw new Error('TEST bundle selected official package pin mismatch')
       if (await realpath(Bun.resolveSync('effect', path.dirname(file))) !== effectEntry) throw new Error('TEST bundle selected graph has a different Effect instance')
-      imports.push(`import * as graph${index}_${key} from ${JSON.stringify(file.replaceAll('\\', '/'))};`)
+      imports.push(`import * as graph${index}_${key} from ${JSON.stringify(bundledImportPath(file))};`)
     }
     selections.push({ pin: pin!, alias: alias!, entries })
     tables.push(`${JSON.stringify(alias)}: { ${Object.keys(entries).map(key => `${key}: graph${index}_${key}`).join(', ')}, entry: ${JSON.stringify(path.join(readonly, within(sourceRoot, entry)))} }`)
   }
   // Generated TS has static, exact per-pin imports; no runtime package resolver.
-  const buildDirectory = path.join(path.dirname(readonly), 'bundle-build')
-  await mkdir(buildDirectory, { recursive: true })
   const generatedEntry = path.join(buildDirectory, 'checkpoint-entry.ts')
-  await writeFile(generatedEntry, `${imports.join('\n')}\nconst graphs = { ${tables.join(',\n')} };\nexport const runOfficialShellCheckpointBundled = (base: string) => runOfficialShellCheckpoint(base, async alias => { if (alias !== '@opencode/server-v2-floor' && alias !== '@opencode/server') throw new Error('TEST bundle pin not selected'); return graphs[alias]; });\n`)
+  await writeFile(generatedEntry, renderBundledCheckpointEntry(imports, tables))
+  const stagePath = path.join(buildDirectory, 'stage.json')
+  await writeFile(path.join(buildDirectory, 'selection.json'), JSON.stringify({ generatedEntry, generatedSha256: hash(await readFile(generatedEntry)), selections, effectEntry, fullTaskQualified: false }))
+  await writeFile(stagePath, JSON.stringify({ phase: 'generated-entry-ready', fullTaskQualified: false }))
+  const buildOutput = path.join(buildDirectory, 'checkpoint-bundled.js')
+  const resultPath = path.join(buildDirectory, 'build-result.json')
+  const child = Bun.spawn([process.execPath, import.meta.filename, '--build-only', generatedEntry, sourceRoot, buildOutput, resultPath, stagePath], {
+    cwd: sourceRoot, env: { ...process.env }, stdout: Bun.file(path.join(buildDirectory, 'build.stdout')), stderr: Bun.file(path.join(buildDirectory, 'build.stderr')),
+  })
+  const timeout = setTimeout(() => child.kill('SIGKILL'), 120000)
+  let code: number
+  try { code = await child.exited } finally { clearTimeout(timeout) }
+  if (code !== 0) {
+    await writeFile(path.join(buildDirectory, 'parent-result.json'), JSON.stringify({ phase: 'build-child-failed', code, signal: child.signalCode, fullTaskQualified: false }))
+    throw new Error('TEST bundle child failed; retained build phase evidence')
+  }
+  const result: { inputs: { file: string; sha256: string }[]; metafile: Bun.BuildMetafile } = JSON.parse(await readFile(resultPath, 'utf8'))
   const inputs = new Map<string, Buffer>()
-  const result = await Bun.build({ entrypoints: [generatedEntry], target: 'bun', format: 'esm', splitting: false, minify: false, metafile: true,
-    plugins: [{ name: 'TEST-pinned-source-provenance', setup(builder) {
-      builder.onResolve({ filter: /.*/ }, args => {
-        if (args.path.startsWith('node:') || args.path.startsWith('bun:')) return { path: args.path, external: true }
-        if (builtinModules.includes(args.path)) return { path: `node:${args.path}`, external: true }
-        return undefined
-      })
-      builder.onLoad({ filter: /.*/, namespace: 'file' }, async args => {
-        const file = await realpath(args.path)
-        if (file !== generatedEntry) within(sourceRoot, file)
-        inputs.set(file, await readFile(file))
-        return undefined
-      })
-    } }] })
-  if (!result.success || result.outputs.filter(output => output.kind === 'entry-point').length !== 1) throw new Error('TEST bundled checkpoint build refused')
-  if (!result.metafile) throw new Error('TEST bundle import metadata absent')
-  for (const input of Object.values(result.metafile.inputs)) for (const imported of input.imports) {
-    if (imported.external && !imported.path.startsWith('node:') && !imported.path.startsWith('bun:')) throw new Error('TEST bundle retained an external non-builtin import')
+  for (const input of result.inputs) {
+    if (input.file !== generatedEntry) within(sourceRoot, input.file)
+    const bytes = await readFile(input.file)
+    if (hash(bytes) !== input.sha256) throw new Error('TEST bundle consumed source changed')
+    inputs.set(input.file, bytes)
   }
   const artifacts: Artifact[] = [], provenance: { path: string; sha256: string; bytes: number; lf: number; crlf: number; dynamicReferences: string[] }[] = []
   const add = async (destination: string, bytes: Uint8Array, metadataReadInput: boolean) => {
@@ -105,13 +115,44 @@ export async function stageBundledFixture(readonly: string): Promise<Artifact[]>
     }
     await walk(root)
   }
-  for (const output of result.outputs) {
-    if (output.kind !== 'entry-point') throw new Error('TEST bundle emitted an unreviewed asset/chunk')
-    const bytes = new Uint8Array(await output.arrayBuffer())
-    await add(path.join(readonly, 'windows-official-shell', 'checkpoint-bundled.js'), bytes, true)
-  }
+  await add(path.join(readonly, 'windows-official-shell', 'checkpoint-bundled.js'), await readFile(buildOutput), true)
   await add(path.join(readonly, 'windows-official-shell', 'bundle-provenance.json'), Buffer.from(JSON.stringify({ purpose: 'TEST-bundled-Shell-only', fullTaskQualified: false, bun: Bun.version, target: 'bun', format: 'esm', splitting: false, effectEntry: within(sourceRoot, effectEntry), selections, inputs: provenance, watcherDisabled: true, fffDisabled: true })), false)
   await add(path.join(readonly, 'windows-official-shell', 'bundle-metafile.json'), Buffer.from(JSON.stringify(result.metafile)), false)
   await writeFile(path.join(readonly, 'official-artifacts.json'), JSON.stringify(artifacts), { flag: 'wx' })
   return artifacts
+}
+
+async function buildOnly(generatedEntry: string, sourceRoot: string, output: string, resultPath: string, stagePath: string): Promise<void> {
+  const inputs = new Map<string, Buffer>()
+  const stage = (phase: string) => writeFileSync(stagePath, JSON.stringify({ phase, inputCount: inputs.size, fullTaskQualified: false }))
+  stage('build-before-call')
+  const result = await Bun.build({ entrypoints: [generatedEntry], target: 'bun', format: 'esm', splitting: false, minify: false, metafile: true,
+    plugins: [{ name: 'TEST-pinned-source-provenance', setup(builder) {
+      builder.onResolve({ filter: /.*/ }, args => {
+        if (args.path.startsWith('node:') || args.path.startsWith('bun:')) return { path: args.path, external: true }
+        if (builtinModules.includes(args.path)) return { path: `node:${args.path}`, external: true }
+        return undefined
+      })
+      builder.onLoad({ filter: /.*/, namespace: 'file' }, args => {
+        const file = realpathSync(args.path)
+        if (file !== generatedEntry) within(sourceRoot, file)
+        const bytes = readFileSync(file)
+        inputs.set(file, bytes)
+        if (inputs.size === 1) stage('build-first-source-loaded')
+        return { contents: bytes, loader: args.loader }
+      })
+    } }] })
+  stage('build-returned')
+  if (!result.success || result.outputs.length !== 1 || result.outputs[0]?.kind !== 'entry-point' || !result.metafile) throw new Error('TEST bundled checkpoint build refused')
+  for (const input of Object.values(result.metafile.inputs)) for (const imported of input.imports) {
+    if (imported.external && !imported.path.startsWith('node:') && !imported.path.startsWith('bun:')) throw new Error('TEST bundle retained an external non-builtin import')
+  }
+  await writeFile(output, new Uint8Array(await result.outputs[0].arrayBuffer()), { flag: 'wx' })
+  await writeFile(resultPath, JSON.stringify({ inputs: [...inputs].map(([file, bytes]) => ({ file, sha256: hash(bytes) })), metafile: result.metafile }), { flag: 'wx' })
+  stage('build-result-published')
+}
+if (process.argv[2] === '--build-only') {
+  const [entry, root, output, result, stage] = process.argv.slice(3)
+  if (!entry || !root || !output || !result || !stage || process.versions.bun !== '1.3.11') throw new Error('TEST bundle child inputs invalid')
+  await buildOnly(entry, root, output, result, stage)
 }

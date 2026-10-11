@@ -164,6 +164,7 @@ jobs:
           name: opencode-v2-windows-bundled-shell-${{ github.sha }}
           path: |
             ${{ runner.temp }}/windows-bundled-shell-evidence.json
+            ${{ runner.temp }}/TEST-opencode-v2-windows-*/bundle-build/
             ${{ runner.temp }}/TEST-opencode-v2-windows-*/readonly/windows-official-shell/bundle-provenance.json
             ${{ runner.temp }}/TEST-opencode-v2-windows-*/readonly/windows-official-shell/bundle-metafile.json
             ${{ runner.temp }}/TEST-opencode-v2-windows-*/readonly/official-artifacts.json
