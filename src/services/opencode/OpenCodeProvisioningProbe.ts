@@ -362,6 +362,7 @@ export class OpenCodeProvisioningProbe {
 
     const acquiredHost = host
     const inspect = async (): Promise<RetainedOpenCodeProvisioningProbe> => {
+      options.phaseContext?.reportProvisioningStage?.('host_inspect')
       const host = acquiredHost
       const requestContext = options.phaseContext
         ? {
@@ -396,7 +397,7 @@ export class OpenCodeProvisioningProbe {
             attachIfMissing: options.attachAppMcp !== false,
             requestContext,
           })
-          options.phaseContext?.reportProvisioningStage?.('host_operation')
+          options.phaseContext?.reportProvisioningStage?.('host_finalize')
           const appMcpReady = appMcp.summary.status === 'attached'
             || appMcp.summary.status === 'present'
           return {
@@ -578,7 +579,7 @@ export class OpenCodeProvisioningProbe {
       }
     }
     try {
-      options.phaseContext?.reportProvisioningStage?.('host_operation')
+      options.phaseContext?.reportProvisioningStage?.('host_operation_wait')
       return await (hostManager.withHostOperation
         ? hostManager.withHostOperation(acquiredHost, preflightLease, inspect)
         : inspect())

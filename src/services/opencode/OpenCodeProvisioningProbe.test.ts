@@ -6,7 +6,7 @@ import path from 'node:path'
 
 import { openCodeClientFactory } from './OpenCodeClientFactory.js'
 import { resolveClaudeMultimodelPaths } from './OpenCodeManagedPaths.js'
-import { OpenCodeRuntimeDeadlineError } from './OpenCodeRuntimeDeadline.js'
+import { OpenCodeRuntimeDeadlineError, type OpenCodeProvisioningStage } from './OpenCodeRuntimeDeadline.js'
 
 import { OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID } from './OpenCodeHostManager.js'
 import {
@@ -125,6 +125,7 @@ describe('OpenCodeProvisioningProbe', () => {
       ])
       try {
       const commandLog: string[] = []
+      const stages: OpenCodeProvisioningStage[] = []
       let inventoryInput: Record<string, unknown> | null = null
       let ensureInput: Record<string, unknown> | null = null
       const mcpUrls: string[] = []
@@ -184,7 +185,16 @@ describe('OpenCodeProvisioningProbe', () => {
 
       const retained = await probe.probeRetainingHost('/tmp/project', {
         selectedModel, leaseId: 'lease-scoped',
+        phaseContext: {
+          phase: 'host_start', signal: new AbortController().signal,
+          remainingMs: () => 10_000, throwIfExpired: () => {},
+          reportProvisioningStage: stage => { stages.push(stage) },
+        },
       })
+      expect(stages).toEqual([
+        'profile_scope', 'inventory', 'ensure_host', 'retain_lease',
+        'host_operation_wait', 'host_inspect', 'app_mcp', 'host_finalize',
+      ])
       expect(inventoryInput).toEqual(expect.objectContaining({
         mode: 'profile',
         profileScope: expect.objectContaining({

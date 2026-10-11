@@ -14,7 +14,7 @@ export type OpenCodeReadinessPhase = typeof OPEN_CODE_READINESS_PHASES[number]
 export type OpenCodeProvisioningStage =
   | 'project_path' | 'session_store' | 'session_recovery' | 'probe'
   | 'profile_scope' | 'inventory' | 'ensure_host' | 'retain_lease'
-  | 'host_operation' | 'app_mcp'
+  | 'host_operation_wait' | 'host_inspect' | 'host_finalize' | 'app_mcp'
 
 export type OpenCodePhaseContext = {
   phase: OpenCodeReadinessPhase

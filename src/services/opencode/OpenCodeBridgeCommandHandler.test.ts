@@ -14,7 +14,7 @@ import {
   executeOpenCodeBridgeCommandEnvelope,
   __readinessDataForTests,
 } from './OpenCodeBridgeCommandHandler.js'
-import { OpenCodeRuntimeDeadlineError } from './OpenCodeRuntimeDeadline.js'
+import { OpenCodeRuntimeDeadlineError, type OpenCodeProvisioningStage } from './OpenCodeRuntimeDeadline.js'
 import { resolveClaudeMultimodelPaths } from './OpenCodeManagedPaths.js'
 import { openCodeCommandOutcomeStore } from './OpenCodeCommandOutcomeStore.js'
 import { openCodeExecutionProbe } from './OpenCodeExecutionProbe.js'
@@ -5375,39 +5375,51 @@ describe('OpenCodeBridgeCommandHandler', () => {
   })
 
   test('fences abort-ignoring provisioning and releases only a late owned host in time', async () => {
-    await withManualTimers(async timers => {
-      const acquired = createDeferred<RetainedProbe>()
-      const provisioningStarted = createDeferred<void>()
-      let workCalls = 0; let releaseCalls = 0
-      openCodeProvisioningProbe.probeRetainingHost = (async (_projectPath, options) => {
-        options?.phaseContext?.reportProvisioningStage?.('inventory')
-        provisioningStarted.resolve()
-        return acquired.promise
-      }) as typeof openCodeProvisioningProbe.probeRetainingHost
-      const noWork = async () => { workCalls += 1; throw new Error('work must not run') }
-      openCodeExecutionProbe.probeModelOnHost = noWork as typeof openCodeExecutionProbe.probeModelOnHost
-      openCodeSessionBridge.materializeSessionOnHost = noWork as typeof openCodeSessionBridge.materializeSessionOnHost
-      const envelope = buildEnvelope('opencode.launchTeam', {
-        runId: 'run-provisioning-work-timeout', laneId: 'primary',
-        teamId: 'team-a', selectedModel: 'deepinfra/chosen', members: [{ name: 'alice' }],
+    const realNow = Date.now
+    let now = 1_000
+    Date.now = () => now
+    try {
+      await withManualTimers(async timers => {
+        const acquired = createDeferred<RetainedProbe>()
+        const provisioningStarted = createDeferred<void>()
+        let workCalls = 0; let releaseCalls = 0
+        let reportStage: ((stage: OpenCodeProvisioningStage) => void) | undefined
+        openCodeProvisioningProbe.probeRetainingHost = (async (_projectPath, options) => {
+          reportStage = options?.phaseContext?.reportProvisioningStage
+          options?.phaseContext?.reportProvisioningStage?.('inventory')
+          provisioningStarted.resolve()
+          return acquired.promise
+        }) as typeof openCodeProvisioningProbe.probeRetainingHost
+        const noWork = async () => { workCalls += 1; throw new Error('work must not run') }
+        openCodeExecutionProbe.probeModelOnHost = noWork as typeof openCodeExecutionProbe.probeModelOnHost
+        openCodeSessionBridge.materializeSessionOnHost = noWork as typeof openCodeSessionBridge.materializeSessionOnHost
+        const envelope = buildEnvelope('opencode.launchTeam', {
+          runId: 'run-provisioning-work-timeout', laneId: 'primary',
+          teamId: 'team-a', selectedModel: 'deepinfra/chosen', members: [{ name: 'alice' }],
+        })
+        envelope.timeoutMs = 1_000
+        const resultPromise = executeOpenCodeBridgeCommandEnvelope(envelope)
+        await waitForCommandStage(provisioningStarted.promise, resultPromise, 'provisioning')
+        // Microtasks may resume after the deadline before the timer can abort.
+        now += 1_000
+        reportStage?.('ensure_host')
+        const workTimer = timers.find(timer => timer.timeoutMs < 1_000 && !timer.cancelled)
+        expect(workTimer).toBeDefined(); workTimer!.callback()
+        const result = await resultPromise
+        expect(result.ok).toBe(false)
+        if (!('error' in result)) throw new Error('Expected provisioning failure error')
+        expect(result.error.kind).toBe('provider_error')
+        expect(result.error.message).toMatch(
+          /OpenCode strict launch provisioning deadline expired \(stage=inventory, stageElapsedMs=\d+\)/,
+        )
+        expect(workCalls).toBe(0)
+        acquired.resolve({ snapshot, host: snapshot.host, release: async () => { releaseCalls += 1 } })
+        await Promise.resolve(); await Promise.resolve()
+        expect(releaseCalls).toBe(1)
       })
-      envelope.timeoutMs = 1_000
-      const resultPromise = executeOpenCodeBridgeCommandEnvelope(envelope)
-      await waitForCommandStage(provisioningStarted.promise, resultPromise, 'provisioning')
-      const workTimer = timers.find(timer => timer.timeoutMs < 1_000 && !timer.cancelled)
-      expect(workTimer).toBeDefined(); workTimer!.callback()
-      const result = await resultPromise
-      expect(result.ok).toBe(false)
-      if (!('error' in result)) throw new Error('Expected provisioning failure error')
-      expect(result.error.kind).toBe('provider_error')
-      expect(result.error.message).toMatch(
-        /OpenCode strict launch provisioning deadline expired \(stage=inventory, stageElapsedMs=\d+\)/,
-      )
-      expect(workCalls).toBe(0)
-      acquired.resolve({ snapshot, host: snapshot.host, release: async () => { releaseCalls += 1 } })
-      await Promise.resolve(); await Promise.resolve()
-      expect(releaseCalls).toBe(1)
-    })
+    } finally {
+      Date.now = realNow
+    }
   })
 
   test('external cancellation cleans an exact late lease after deadline and contains late rejection', async () => {

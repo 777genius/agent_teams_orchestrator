@@ -3268,7 +3268,7 @@ async function runLaunch(
   let provisioningStage: OpenCodeProvisioningStage = 'project_path'
   let provisioningStageEnteredAt = performance.now()
   const reportProvisioningStage = (stage: OpenCodeProvisioningStage): void => {
-    if (provisioningSignal.aborted) return
+    if (provisioningSignal.aborted || Date.now() >= workDeadlineAt) return
     provisioningStage = stage
     provisioningStageEnteredAt = performance.now()
   }
