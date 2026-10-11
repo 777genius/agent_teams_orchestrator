@@ -85,10 +85,16 @@ if ($LASTEXITCODE -ne 0) { throw 'TEST low integrity setup failed' }
     const aclError = await new Response(acl.stderr).text()
     if (await acl.exited !== 0) throw new Error(`TEST ACL setup:${aclError}`)
     const executable = path.join(root, 'readonly', 'bun.exe')
+    const launchEnv = { SystemRoot: process.env.SystemRoot!, WINDIR: process.env.WINDIR!, PATH: `${path.dirname(executable)};${process.env.SystemRoot}\\System32`,
+      // CreateProcess constructs the profile namespace from this system path.
+      // Chromium's AppContainer launcher also retains LOCALAPPDATA explicitly.
+      LOCALAPPDATA: process.env.LOCALAPPDATA!, USERPROFILE: path.join(root, 'work'), HOME: path.join(root, 'work'),
+      TEMP: path.join(root, 'work'), TMP: path.join(root, 'work') }
+    evidence.environmentPresence = Object.fromEntries(Object.entries(launchEnv).map(([key, value]) => [key, typeof value === 'string' && value.length > 0]))
+    if (Object.values(launchEnv).some(value => typeof value !== 'string' || value.length === 0)) throw new Error('required native environment path missing')
     launch = native.launchWindowsContainer({ containerSid: container.address, executable,
       arguments: [path.join(root, 'readonly', 'opencode-v2-windows-boundary.ts'), 'child', root, pipeName], cwd: path.join(root, 'work'),
-      env: { SystemRoot: process.env.SystemRoot!, WINDIR: process.env.WINDIR!, PATH: `${path.dirname(executable)};${process.env.SystemRoot}\\System32`,
-        USERPROFILE: path.join(root, 'work'), HOME: path.join(root, 'work'), TEMP: path.join(root, 'work'), TMP: path.join(root, 'work') } })
+      env: launchEnv, onEnvironmentShape: shape => { evidence.environmentShape = shape } })
     evidence.pid = launch.pid; evidence.birthFiletime = launch.birthFiletime; evidence.assignedBeforeResume = true
     let bytes = ''
     const deadline = Date.now() + 25000

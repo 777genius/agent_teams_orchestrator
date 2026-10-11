@@ -112,7 +112,7 @@ export function createWindowsPipe(name: string, sid: string) {
   }
 }
 const launchBufferPins = new Set<Buffer[]>()
-export function launchWindowsContainer(input: { containerSid: number; executable: string; arguments: readonly string[]; cwd: string; env: Record<string, string> }) {
+export function launchWindowsContainer(input: { containerSid: number; executable: string; arguments: readonly string[]; cwd: string; env: Record<string, string>; onEnvironmentShape?: (shape: { unicode: true; doubleNull: boolean; bytes: number }) => void }) {
   const job = handleValue(kernel.symbols.CreateJobObjectW(null, null)); check(job !== 0n, 'CreateJobObjectW')
   let processHandle = 0n, thread = 0n
   let attributeAddress: Pointer | undefined, initialized = false, capabilityAddress: Pointer | undefined
@@ -143,6 +143,9 @@ export function launchWindowsContainer(input: { containerSid: number; executable
   const quote = (argument: string) => '"' + argument.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\+)$/g, '$1$1') + '"'
   const command = utf16([input.executable, ...input.arguments].map(quote).join(' '))
   const environment = Buffer.from(Object.entries(input.env).sort(([a], [b]) => a.localeCompare(b)).map(([key, value]) => `${key}=${value}\0`).join('') + '\0', 'utf16le')
+  const doubleNull = environment.length >= 4 && environment.readUInt32LE(environment.length - 4) === 0
+  input.onEnvironmentShape?.({ unicode: true, doubleNull, bytes: environment.length })
+  check(doubleNull, 'Unicode environment termination')
   backing.push(startup, processInfo, executable, cwd, command, environment)
     check(kernel.symbols.CreateProcessW(ptr(executable), ptr(command), null, null, false, 0x80000 | 4 | 0x400 | 0x08000000,
       ptr(environment), ptr(cwd), ptr(startup), ptr(processInfo)), 'CreateProcessW')
