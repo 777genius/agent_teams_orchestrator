@@ -231,7 +231,7 @@ static JsonObject fileIdentity(HANDLE file, const std::wstring &owner, bool dire
   return value;
 }
 static Handle canonicalDirectory(const std::wstring &value,
-                                 DWORD access = FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL) {
+                                 DWORD access = FILE_READ_ATTRIBUTES | READ_CONTROL) {
   auto full = extended(value);
   Handle handle(CreateFileW(full.c_str(), access, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                             OPEN_EXISTING,
@@ -363,7 +363,7 @@ static Handle ownerDirectory(const std::wstring &path, bool create, const std::w
   IO_STATUS_BLOCK status{};
   HANDLE raw = nullptr;
   NTSTATUS result =
-      createFile(&raw, FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE | (create ? DELETE : 0),
+      createFile(&raw, FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE | (create ? DELETE : 0),
                  &attributes, &status, nullptr, FILE_ATTRIBUTE_DIRECTORY,
                  FILE_SHARE_READ | FILE_SHARE_WRITE | (create ? 0 : FILE_SHARE_DELETE),
                  create ? 2 : 1, 0x1 | 0x2 | 0x20 | 0x200000, nullptr, 0);
@@ -408,6 +408,27 @@ struct OwnerStore {
     auto path = text(input, L"path"), owner = currentSid();
     bool create = input.GetNamedBoolean(L"createExclusive", false);
     auto parents = ancestors(path);
+    require(!parents.empty(), "execution_owner_path_invalid");
+    auto parentPath = path.substr(0, path.find_last_of(L'\\'));
+    Handle targetParent;
+    // Existing creator capabilities already hold DELETE and deny sharing it.
+    // A duplicate references that same kernel file object without another open
+    // or a share-mode relaxation; its original traversal right is preserved.
+    for (auto &entry : directories) {
+      if (!equalPath(entry.second.path, parentPath)) continue;
+      require(equalPath(finalPath(entry.second.file.value), extended(parentPath)) &&
+                  fileIdentity(entry.second.file.value, owner, true).Stringify() ==
+                      entry.second.identity.Stringify(), "execution_owner_unknown");
+      HANDLE duplicate = nullptr;
+      if (!DuplicateHandle(GetCurrentProcess(), entry.second.file.value, GetCurrentProcess(),
+                           &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS))
+        throw NativeError{"execution_owner_unknown", GetLastError(), "owner_parent_duplicate"};
+      targetParent = Handle(duplicate);
+      break;
+    }
+    if (!targetParent)
+      targetParent = canonicalDirectory(parentPath, FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL);
+    parents.back() = std::move(targetParent);
     auto file = ownerDirectory(path, create, owner);
     auto id = fileIdentity(file.value, owner, true);
     auto key = decimal(++next);
