@@ -26,9 +26,24 @@ const server = createServer(async (request, response) => {
     } else if (request.url === '/early') {
       response.statusCode = 413; response.end('early-response')
     } else if (request.url === '/disconnect') {
-      // Headers establish a real HTTP transaction; no response bytes can
-      // satisfy the pending read before the deliberate native disconnection.
-      response.setHeader('content-type', 'text/event-stream'); response.flushHeaders()
+      // Keep a real chunked response outstanding, with no bytes that could
+      // satisfy the pending read before deliberate native disconnection.
+      response.setHeader('content-type', 'text/event-stream')
+      response.setHeader('transfer-encoding', 'chunked'); response.flushHeaders()
+      await new Promise<void>((resolve, reject) => {
+        const socket = request.socket
+        const cleanup = () => {
+          clearTimeout(timer); request.removeListener('aborted', closed)
+          socket.removeListener('close', closed); response.removeListener('close', closed)
+        }
+        const closed = () => { cleanup(); resolve() }
+        const timer = setTimeout(() => {
+          cleanup(); reject(new Error('test-disconnect-fixture-timeout'))
+          response.destroy()
+        }, 15000)
+        request.once('aborted', closed); socket.once('close', closed); response.once('close', closed)
+        if (request.aborted || socket.destroyed) closed()
+      })
     } else if (request.url === '/sse') {
       response.setHeader('content-type', 'text/event-stream'); response.flushHeaders()
       let blocked = false
