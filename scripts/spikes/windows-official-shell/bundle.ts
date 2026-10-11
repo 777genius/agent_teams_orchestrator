@@ -1,6 +1,7 @@
 import path from 'node:path'
 import { createHash } from 'node:crypto'
 import { builtinModules, isBuiltin } from 'node:module'
+import { pathToFileURL } from 'node:url'
 import { readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { mkdir, readFile, realpath, writeFile, readdir } from 'node:fs/promises'
 import type { Artifact } from './fixture.ts'
@@ -169,7 +170,7 @@ export async function stageBundledFixture(readonly: string): Promise<Artifact[]>
     if (hash(bytes) !== asset.sha256) throw new Error('TEST bundle emitted asset changed')
     await add(path.join(readonly, 'windows-official-shell', asset.path), bytes, true)
   }
-  await add(path.join(readonly, 'windows-official-shell', 'bundle-provenance.json'), Buffer.from(JSON.stringify({ purpose: 'TEST-bundled-Shell-only', fullTaskQualified: false, bun: Bun.version, target: 'bun', format: 'esm', splitting: false, effectEntry: within(sourceRoot, effectEntry), selections, inputs: provenance, transformations: result.transformations, emittedAssets: result.assets, watcherDisabled: true, fffDisabled: true })), false)
+  await add(path.join(readonly, 'windows-official-shell', 'bundle-provenance.json'), Buffer.from(JSON.stringify({ purpose: 'TEST-bundled-Shell-only', fullTaskQualified: false, bun: Bun.version, target: 'bun', format: 'esm', splitting: false, ignoreDCEAnnotations: true, effectEntry: within(sourceRoot, effectEntry), selections, inputs: provenance, transformations: result.transformations, emittedAssets: result.assets, watcherDisabled: true, fffDisabled: true })), false)
   await add(path.join(readonly, 'windows-official-shell', 'bundle-metafile.json'), Buffer.from(JSON.stringify(result.metafile)), false)
   await writeFile(path.join(readonly, 'official-artifacts.json'), JSON.stringify(artifacts), { flag: 'wx' })
   return artifacts
@@ -180,7 +181,7 @@ async function buildOnly(generatedEntry: string, sourceRoot: string, output: str
   const transformations: NonNullable<ReturnType<typeof transformBundledNodeFetch>['transformation']>[] = []
   const stage = (phase: string) => writeFileSync(stagePath, JSON.stringify({ phase, inputCount: inputs.size, fullTaskQualified: false }))
   stage('build-before-call')
-  const result = await Bun.build({ entrypoints: [generatedEntry], target: 'bun', format: 'esm', splitting: false, minify: false, metafile: true,
+  const result = await Bun.build({ entrypoints: [generatedEntry], target: 'bun', format: 'esm', splitting: false, minify: false, ignoreDCEAnnotations: true, metafile: true,
     plugins: [{ name: 'TEST-pinned-source-provenance', setup(builder) {
       builder.onResolve({ filter: /.*/ }, args => {
         if (args.path.startsWith('node:') || args.path.startsWith('bun:')) return { path: args.path, external: true }
@@ -228,6 +229,18 @@ async function buildOnly(generatedEntry: string, sourceRoot: string, output: str
     assets.push({ path: relative, sha256: asset.sha256 })
   }
   await writeFile(output, new Uint8Array(await emitted.entry.arrayBuffer()), { flag: 'wx' })
+  const validationPath = path.join(path.dirname(stagePath), 'build-import-validation.json')
+  const validation = { purpose: 'TEST-precontainment-import-only', bun: Bun.version, emittedSha256: hash(await readFile(output)), ignoreDCEAnnotations: true, checkpointInvoked: false, fullTaskQualified: false }
+  await writeFile(validationPath, JSON.stringify({ ...validation, phase: 'before-import' }))
+  stage('build-before-import-validation')
+  try {
+    const loaded = await import(pathToFileURL(output).href)
+    if (typeof loaded.runOfficialShellCheckpointBundled !== 'function') throw new Error('TEST bundled checkpoint export absent')
+    await writeFile(validationPath, JSON.stringify({ ...validation, phase: 'import-passed', passed: true }))
+  } catch (error) {
+    await writeFile(validationPath, JSON.stringify({ ...validation, phase: 'import-failed', passed: false, error: error instanceof Error ? { name: error.name, message: error.message.slice(0, 2048), stack: error.stack?.slice(0, 8192) } : { name: 'NonError' } }))
+    throw new Error('TEST bundled checkpoint import refused; retained import evidence')
+  }
   await writeFile(resultPath, JSON.stringify({ inputs: [...inputs].map(([file, bytes]) => ({ file, sha256: hash(bytes) })), transformations, assets, metafile: result.metafile }), { flag: 'wx' })
   stage('build-result-published')
 }
