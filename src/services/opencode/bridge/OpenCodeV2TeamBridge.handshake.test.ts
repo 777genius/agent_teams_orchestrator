@@ -19,7 +19,7 @@ test('fresh and original-owner handshakes bind all returned fields in the identi
   const proof={capabilitySnapshotId:'TEST-capability',binaryPath:'/TEST/native',binaryFingerprint:'TEST-binary',
    opencodeVersion:'2.0.0',expectedBehaviorEvidence:{expectedBehaviorFingerprint:'b'.repeat(64)}}
   const probe=await import(${JSON.stringify(probe)})
-  mock.module(${JSON.stringify(probe)},()=>({...probe,resolveOpenCodeV2ExecutionProbe:async()=>({proof,reason:null})}))
+  mock.module(${JSON.stringify(probe)},()=>({...probe,resolveOpenCodeV2ExecutionProbe:async(_envelope,_selection,_run,options)=>{assert.equal(options?.unattendedTeam,true);return{proof,reason:null}}}))
   const {createBridgeServerIdentity}=await import(${JSON.stringify(legacy)})
   const {executionHash}=await import(${JSON.stringify(contracts)})
   const {OpenCodeV2TeamBridge,executeSelectedOpenCodeBridgeCommandEnvelope:execute}=await import(${JSON.stringify(target)})

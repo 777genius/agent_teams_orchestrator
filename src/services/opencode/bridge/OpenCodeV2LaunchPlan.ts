@@ -96,7 +96,7 @@ export async function createOpenCodeV2LaunchPlan(envelope: BridgeEnvelope): Prom
   executionAssert(body.teamName === undefined || body.teamName === teamId, 'run_controller_team_changed')
   const preconditions = parseOpenCodeBridgePreconditions(body.preconditions)
   const availability = await inspectOpenCodeV2SourceAvailability(envelope)
-  const verified = await resolveOpenCodeV2ExecutionProbe(envelope, availability, false)
+  const verified = await resolveOpenCodeV2ExecutionProbe(envelope, availability, false, { unattendedTeam: true })
   const supplied = parseOpenCodeExecutionProof(body.executionProof)
   executionAssert(verified.proof && verified.proof.projectPath === selection.project &&
     verified.proof.modelId === `${selection.model.providerID}/${selection.model.id}` &&
@@ -117,7 +117,7 @@ export async function createOpenCodeV2LaunchPlan(envelope: BridgeEnvelope): Prom
 
 /** Production constructor only: no caller body receipt, endpoint or mount hook. */
 export async function buildOpenCodeV2InternalRunPlan(selection: Awaited<ReturnType<typeof inspectOpenCodeV2LaunchSelection>>,
-  body: Record<string, unknown>, controllerInstanceId: string, probe?: { intent: import('../execution/OpenCodeV2AdmissionService.js').QueueIntent; expectedText: string }): Promise<RunLaunchPlan> {
+  body: Record<string, unknown>, controllerInstanceId: string, probe?: { intent: import('../execution/OpenCodeV2AdmissionService.js').QueueIntent; expectedText: string; unattendedTeam?: boolean }): Promise<RunLaunchPlan> {
   const teamId = text(body.teamId ?? body.teamName), runId = text(body.runId), laneId = text(body.laneId)
   executionAssert(Array.isArray(body.members) && body.members.length > 0 && body.members.length <= 32, 'run_members_invalid')
   const rawMembers = body.members.map(executionRecord)
@@ -134,7 +134,7 @@ export async function buildOpenCodeV2InternalRunPlan(selection: Awaited<ReturnTy
   for (const member of rawMembers) {
     const memberId = text(member.name), sessionID = `ses_${randomUUID().replaceAll('-', '')}`
     const variant = typeof member.effort === 'string' ? member.effort : typeof body.effort === 'string' ? body.effort : undefined
-    const { profile, prepared } = await createOpenCodeV2PreparedMember(selection, native, profileParent, { teamId, runId, memberId, variant })
+    const { profile, prepared } = await createOpenCodeV2PreparedMember(selection, native, profileParent, { teamId, runId, memberId, variant, unattendedTeam: probe ? probe.unattendedTeam === true : true })
     if (probe) probePrepared = prepared
     const prompt = typeof member.prompt === 'string' ? member.prompt : `Join OpenCode team ${teamId} as ${memberId}. Wait for app MCP task delivery.`
     const value = buildOpenCodeAppManagedBootstrapContextText({ teamName: typeof body.teamName === 'string' ? body.teamName : teamId,
@@ -179,7 +179,7 @@ export async function buildOpenCodeV2InternalRunPlan(selection: Awaited<ReturnTy
 async function hashText(value: string): Promise<string> { const { createHash } = await import('node:crypto'); return createHash('sha256').update(value).digest('hex') }
 
 export async function createOpenCodeV2PreparedMember(selection: Awaited<ReturnType<typeof inspectOpenCodeV2LaunchSelection>>,
-  native: ValidatedExecutionNative, profileParent: string, input: { teamId: string; runId: string; memberId: string; variant?: string }) {
+  native: ValidatedExecutionNative, profileParent: string, input: { teamId: string; runId: string; memberId: string; variant?: string; unattendedTeam?: boolean }) {
   const { teamId, runId, memberId, variant } = input
     const root = await realpath(await mkdtemp(path.join(profileParent, `${executionHash({ teamId, runId, memberId }).slice(0, 16)}-`)))
     for (const name of ['home', 'config', 'data', 'cache', 'state', 'tmp', 'appdata', 'localappdata']) await mkdir(path.join(root, name), { mode: 0o700 })
@@ -189,7 +189,7 @@ export async function createOpenCodeV2PreparedMember(selection: Awaited<ReturnTy
     const model = { ...selection.model, variant: variant ?? 'default' }
     const selected = { agent: 'build', model, permissions: [{ action: '*', resource: '*', effect: 'allow' as const }] }
     const config = createOpenCodeV2ExecutionConfig({ pin: native.version, selection: selected,
-      controller: { server: 'agent-teams', config: selection.controller }, provider })
+      controller: { server: 'agent-teams', config: selection.controller }, provider, unattendedTeam: input.unattendedTeam })
     await writeFile(path.join(configDirectory, 'opencode.json'), config.content, { flag: 'wx', mode: 0o600 })
     const env = createOpenCodeV2OwnedProfileEnvironment(root)
     env.OPENCODE_CONFIG_DIR = configDirectory

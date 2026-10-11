@@ -14,6 +14,8 @@ export type ExecutionProviderModels = NonNullable<NonNullable<ExecutionConfigInf
 export type ExecutionConfigInput = {
   pin: '2.0.0' | '2.0.21'
   selection: ExecutionSelection
+  /** Autonomous team profiles cannot wait for an interactive form response. */
+  unattendedTeam?: boolean
   controller: { server: string; config: ExecutionMcpConfig }
   provider?: Readonly<{ package?: string; baseURL?: string; models?: ExecutionProviderModels }>
 }
@@ -50,7 +52,8 @@ export function createOpenCodeV2ExecutionConfig(input: ExecutionConfigInput): {
     ? { ...mcp, command: [...mcp.command] }
     : { ...mcp }
   const info = {
-    update: 'disable', share: 'disabled', snapshots: false, warming: false, plugins: [],
+    update: 'disable', share: 'disabled', snapshots: false, warming: false,
+    plugins: input.unattendedTeam === true ? ['-opencode.tool.question'] : [],
     model: selectedModel, default_agent: selection.agent, permissions,
     agents: { [selection.agent]: { model: selectedModel, permissions, mode: 'primary' } },
     mcp: { servers: { [controller.server]: nativeMcp } },

@@ -40,11 +40,13 @@ function parseRecord(value: unknown): ProbeRecord {
 
 /** Normal readiness protocol. The cached proof is a result of this owned producer,
  * never a public caller proof DTO. UNKNOWN retains the original IDs and only observes. */
-export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, selection: Selection, run: boolean) {
+export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, selection: Selection, run: boolean,
+  options: { unattendedTeam?: boolean } = {}) {
+  const unattendedTeam = options.unattendedTeam === true
   const behavior = await collectProjectBehaviorMetadata(selection.project)
   const variant = typeof envelope.body.effort === 'string' ? envelope.body.effort : 'default'
   const sourceKey = executionHash({ project: selection.project, scopeToken: selection.scope.scopeToken, selectedAuthIdentity: selection.scope.selectedAuthIdentity, source: selection.behaviorFingerprint, graph: selection.installedGraphSHA256,
-    projectBehavior: behavior.projectBehaviorFingerprint, variant })
+    projectBehavior: behavior.projectBehaviorFingerprint, variant, ...(unattendedTeam ? { unattendedTeam: true } : {}) })
   const requestedDataRoot = path.resolve(resolveClaudeMultimodelPaths().data)
   await privateDirectory(requestedDataRoot)
   const dataRoot = await realpath(requestedDataRoot)
@@ -100,7 +102,7 @@ export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, 
       const plan = await buildOpenCodeV2InternalRunPlan(selection, { teamId, teamName: teamId, runId: nonce, laneId: 'execution-probe',
         selectedModel: `${selection.model.providerID}/${selection.model.id}`, effort: variant,
         members: [{ name: 'probe', prompt: 'Execute the single selected-model readiness prompt. Do not call controller tools.' }] },
-        randomUUID(), { intent, expectedText })
+        randomUUID(), { intent, expectedText, unattendedTeam })
       const member = plan.members[0]; executionAssert(member, 'probe_plan_invalid')
       record = { sourceKey, binding: plan.binding, sessionID: member.originalSessionId, intent, submitted: false, proof: null, retired: false }
       await save(record) // Original identities precede launch and every prompt effect.
