@@ -80,8 +80,8 @@ Rule (Join-Path $env:TEST_ROOT 'host-state') ([System.Security.AccessControl.Fil
 & icacls.exe (Join-Path $env:TEST_ROOT 'work') /setintegritylevel '(OI)(CI)L' /T /Q
 if ($LASTEXITCODE -ne 0) { throw 'TEST low integrity setup failed' }
 `;
-    const acl = Bun.spawn(['powershell.exe', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(aclScript, 'utf16le').toString('base64')],
-      { env: { ...process.env, TEST_CONTAINER_SID: container.sid, TEST_ROOT: root }, stdout: 'pipe', stderr: 'pipe' })
+    const acl = Bun.spawn([path.join(process.env.ProgramFiles!, 'PowerShell', '7', 'pwsh.exe'), '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(aclScript, 'utf16le').toString('base64')],
+      { env: { ...process.env, PSModulePath: path.join(process.env.ProgramFiles!, 'PowerShell', '7', 'Modules'), TEST_CONTAINER_SID: container.sid, TEST_ROOT: root }, stdout: 'pipe', stderr: 'pipe' })
     const aclError = await new Response(acl.stderr).text()
     if (await acl.exited !== 0) throw new Error(`TEST ACL setup:${aclError}`)
     const executable = path.join(root, 'readonly', 'bun.exe')
