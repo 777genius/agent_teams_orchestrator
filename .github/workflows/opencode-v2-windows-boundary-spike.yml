@@ -1,0 +1,236 @@
+name: OpenCode V2 Windows boundary TEST
+on:
+  workflow_dispatch:
+    inputs:
+      lane:
+        description: 'Select the mechanism under investigation; all for final qualification'
+        type: choice
+        options: [all, native-delivery, native-owner, native-command, native-http, native-realpath, native-boundary, official-shell, resolver-primitive, official-shell-bundled]
+        default: all
+permissions:
+  contents: read
+jobs:
+  native-delivery:
+    if: inputs.lane == 'all' || inputs.lane == 'native-delivery'
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+      - name: Compile and stage production native assets
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (!$vs) { throw 'MSVC installation missing' }
+          $vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
+          $directory = Join-Path $env:GITHUB_WORKSPACE 'native\win32-x64'
+          New-Item -ItemType Directory -Path $directory -Force | Out-Null
+          $helper = Join-Path $directory 'opencode-v2-windows-helper.exe'
+          $dll = Join-Path $directory 'opencode-v2-windows-realpath.dll'
+          $helperSource = Join-Path $env:GITHUB_WORKSPACE 'src\services\opencode\host\windows\WindowsKernelScope.cpp'
+          $dllSource = Join-Path $env:GITHUB_WORKSPACE 'src\services\opencode\host\windows\WindowsNativeRealpath.cpp'
+          $script = Join-Path $env:RUNNER_TEMP 'compile-native-delivery.cmd'
+          @("@echo off", "call `"$vcvars`"", "if errorlevel 1 exit /b 1", "cl.exe /nologo /std:c++20 /EHsc /MT /W4 /O2 /DUNICODE /D_UNICODE `"$helperSource`" /Fe:`"$helper`" /link windowsapp.lib userenv.lib advapi32.lib", "if errorlevel 1 exit /b 1", "cl.exe /nologo /std:c++20 /EHsc /MT /LD /W4 /O2 /DUNICODE /D_UNICODE `"$dllSource`" /Fe:`"$dll`"", "exit /b %errorlevel%") | Set-Content $script -Encoding ascii
+          & cmd.exe /d /c $script
+          if ($LASTEXITCODE -ne 0) { throw 'Production native compilation failed' }
+          foreach ($asset in @(@{path=$helper;manifest='windows-helper.json'},@{path=$dll;manifest='windows-realpath.json'})) {
+            @{format=1;platform='win32';arch='x64';name=[IO.Path]::GetFileName($asset.path);sha256=(Get-FileHash $asset.path -Algorithm SHA256).Hash.ToLowerInvariant()} | ConvertTo-Json -Compress | Set-Content (Join-Path $directory $asset.manifest) -Encoding utf8NoBOM
+          }
+          & bun -e "import { stageWindowsHelper } from './scripts/opencode-v2/stage-windows.ts'; await stageWindowsHelper('./native', './TEST-native-delivery', 'x64');"
+          if ($LASTEXITCODE -ne 0) { throw 'Production native staging failed' }
+      - name: Check packaging refusals
+        shell: pwsh
+        run: bun test scripts/opencode-v2/stage-windows.test.ts
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: opencode-v2-windows-production-native-${{ github.sha }}
+          path: TEST-native-delivery/native/win32-x64/
+          if-no-files-found: error
+  native-owner:
+    if: inputs.lane == 'all' || inputs.lane == 'native-owner' || inputs.lane == 'native-command' || inputs.lane == 'native-http' || inputs.lane == 'native-realpath'
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+      - name: Compile the static native helper and pin its artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (!$vs) { throw 'MSVC installation missing' }
+          $directory = Join-Path $env:GITHUB_WORKSPACE 'native\win32-x64'
+          New-Item -ItemType Directory -Path $directory -Force | Out-Null
+          $helper = Join-Path $directory 'opencode-v2-windows-helper.exe'
+          $source = Join-Path $env:GITHUB_WORKSPACE 'src\services\opencode\host\windows\WindowsKernelScope.cpp'
+          $vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
+          $compileScript = Join-Path $env:RUNNER_TEMP 'compile-opencode-native.cmd'
+          @("@echo off", "call `"$vcvars`"", "if errorlevel 1 exit /b 1", "cl.exe /nologo /std:c++20 /EHsc /MT /W4 /O2 /DUNICODE /D_UNICODE `"$source`" /Fe:`"$helper`" /link windowsapp.lib userenv.lib advapi32.lib", "exit /b %errorlevel%") | Set-Content $compileScript -Encoding ascii
+          & cmd.exe /d /c $compileScript
+          if ($LASTEXITCODE -ne 0) { throw 'native helper compile failed' }
+          $manifest = @{format=1;platform='win32';arch='x64';name='opencode-v2-windows-helper.exe';sha256=(Get-FileHash $helper -Algorithm SHA256).Hash.ToLowerInvariant()}
+          $manifest | ConvertTo-Json -Compress | Set-Content (Join-Path $directory 'windows-helper.json') -Encoding utf8NoBOM
+      - name: Compile the TEST-only realpath DLL ABI
+        if: inputs.lane == 'all' || inputs.lane == 'native-realpath'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (!$vs) { throw 'MSVC installation missing' }
+          $vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
+          $source = Join-Path $env:GITHUB_WORKSPACE 'scripts\spikes\windows-realpath-native\WindowsRealpathTestDll.cpp'
+          $dll = Join-Path $env:GITHUB_WORKSPACE 'native\win32-x64\realpath-test.dll'
+          $script = Join-Path $env:RUNNER_TEMP 'compile-realpath-test.cmd'
+          @("@echo off", "call `"$vcvars`"", "if errorlevel 1 exit /b 1", "cl.exe /nologo /std:c++20 /EHsc /MT /LD /W4 /O2 /DUNICODE /D_UNICODE `"$source`" /Fe:`"$dll`"", "exit /b %errorlevel%") | Set-Content $script -Encoding ascii
+          & cmd.exe /d /c $script
+          if ($LASTEXITCODE -ne 0) { throw 'TEST realpath DLL compile failed' }
+      - name: Prove durable owner fencing with actual held native handles
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP ('TEST-windows-owner-' + [guid]::NewGuid().ToString())
+          & bun scripts/opencode-v2/windows-owner-probe.ts $root 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP\windows-owner-evidence.txt"
+          exit $LASTEXITCODE
+      - name: Prove native command output, stdin EOF and descendant cancellation
+        if: inputs.lane == 'all' || inputs.lane == 'native-command'
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP ('TEST-windows-command-' + [guid]::NewGuid().ToString())
+          & bun scripts/opencode-v2/windows-command-probe.ts $root "$env:RUNNER_TEMP\windows-command-evidence.json" 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP\windows-command-output.txt"
+          exit $LASTEXITCODE
+      - name: Prove production HTTP transport with authenticated native pipe bytes and disconnects
+        if: inputs.lane == 'all' || inputs.lane == 'native-http'
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP ('TEST-windows-http-' + [guid]::NewGuid().ToString())
+          & bun scripts/opencode-v2/windows-http-probe.ts $root "$env:RUNNER_TEMP\windows-http-evidence.json" 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP\windows-http-output.txt"
+          exit $LASTEXITCODE
+      - name: Prove realpath ABI with genuine AppContainer DOS access denial
+        if: inputs.lane == 'all' || inputs.lane == 'native-realpath'
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP ('TEST-windows-realpath-' + [guid]::NewGuid().ToString())
+          & bun scripts/opencode-v2/windows-realpath-probe.ts $root "$env:RUNNER_TEMP\windows-realpath-evidence.json" 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP\windows-realpath-output.txt"
+          exit $LASTEXITCODE
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: opencode-v2-windows-native-owner-${{ github.sha }}
+          path: |
+            native/win32-x64/
+            ${{ runner.temp }}/windows-owner-evidence.txt
+            ${{ runner.temp }}/TEST-windows-owner-*/
+            ${{ runner.temp }}/windows-command-evidence.json
+            ${{ runner.temp }}/windows-command-output.txt
+            ${{ runner.temp }}/windows-http-evidence.json
+            ${{ runner.temp }}/windows-http-output.txt
+            ${{ runner.temp }}/windows-realpath-evidence.json
+            ${{ runner.temp }}/windows-realpath-output.txt
+          if-no-files-found: error
+  native-boundary:
+    if: inputs.lane == 'all' || inputs.lane == 'native-boundary'
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+      - name: Prove native filesystem, Job, IPC and HTTP boundaries
+        shell: pwsh
+        run: bun run scripts/spikes/opencode-v2-windows-boundary.ts "$env:RUNNER_TEMP\windows-boundary-evidence.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: opencode-v2-windows-boundary-${{ github.sha }}
+          path: ${{ runner.temp }}/windows-boundary-evidence.json
+          if-no-files-found: error
+  official-shell:
+    if: inputs.lane == 'all' || inputs.lane == 'official-shell'
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - name: Install the existing pinned official graphs
+        shell: pwsh
+        run: bun install --frozen-lockfile
+      - name: Prove official Shell execution and cancellation in TEST containment
+        shell: pwsh
+        run: bun run scripts/spikes/windows-official-shell/prove.ts "$env:RUNNER_TEMP\windows-official-shell-evidence.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: opencode-v2-windows-official-shell-${{ github.sha }}
+          path: ${{ runner.temp }}/windows-official-shell-evidence.json
+          if-no-files-found: error
+  resolver-primitive:
+    if: inputs.lane == 'resolver-primitive'
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - name: Install pinned published package inputs
+        shell: pwsh
+        run: bun install --frozen-lockfile
+      - name: Diagnose synchronous package-cache read in TEST containment
+        shell: pwsh
+        env:
+          TEST_WINDOWS_RESOLVER_PRIMITIVE: '1'
+        run: bun run scripts/spikes/opencode-v2-windows-boundary.ts "$env:RUNNER_TEMP\windows-resolver-primitive-evidence.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: opencode-v2-windows-resolver-primitive-${{ github.sha }}
+          path: ${{ runner.temp }}/windows-resolver-primitive-evidence.json
+          if-no-files-found: error
+  official-shell-bundled:
+    if: inputs.lane == 'official-shell-bundled'
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - name: Install the existing pinned official graphs
+        shell: pwsh
+        run: bun install --frozen-lockfile
+      - name: Build and prove the bounded bundled official Shell checkpoint
+        shell: pwsh
+        env:
+          TEST_WINDOWS_OFFICIAL_SHELL_BUNDLED: '1'
+        run: bun run scripts/spikes/windows-official-shell/prove.ts "$env:RUNNER_TEMP\windows-bundled-shell-evidence.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: opencode-v2-windows-bundled-shell-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/windows-bundled-shell-evidence.json
+            ${{ runner.temp }}/TEST-opencode-v2-windows-*/bundle-build/
+            ${{ runner.temp }}/TEST-opencode-v2-windows-*/readonly/windows-official-shell/bundle-provenance.json
+            ${{ runner.temp }}/TEST-opencode-v2-windows-*/readonly/windows-official-shell/bundle-metafile.json
+            ${{ runner.temp }}/TEST-opencode-v2-windows-*/readonly/official-artifacts.json
+          if-no-files-found: error

@@ -15,6 +15,7 @@
 #include <userenv.h>
 #include <vector>
 #include <windows.h>
+#include <wincrypt.h>
 #include <winrt/Windows.Data.Json.h>
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/base.h>
@@ -324,6 +325,121 @@ struct RetainedRealpathAnchor {
     str(value, L"admittedPath", path);
     str(value, L"kind", kind);
     return value;
+  }
+};
+// Producer-selected DLL is held separately from writable/readonly root grants.
+// A retained non-sharing handle blocks replacement and content writes until the
+// native scope retires; only its exact file receives the package execute ACE.
+static std::wstring heldFileSha256(HANDLE file) {
+  HCRYPTPROV provider = 0;
+  HCRYPTHASH digest = 0;
+  struct Cleanup {
+    HCRYPTPROV &provider;
+    HCRYPTHASH &digest;
+    ~Cleanup() {
+      if (digest) CryptDestroyHash(digest);
+      if (provider) CryptReleaseContext(provider, 0);
+    }
+  } cleanup{provider, digest};
+  require(CryptAcquireContextW(&provider, nullptr, nullptr, PROV_RSA_AES,
+                              CRYPT_VERIFYCONTEXT) &&
+              CryptCreateHash(provider, CALG_SHA_256, 0, 0, &digest),
+          "execution_containment_dll_identity");
+  LARGE_INTEGER zero{};
+  require(SetFilePointerEx(file, zero, nullptr, FILE_BEGIN),
+          "execution_containment_dll_identity");
+  BYTE buffer[65536];
+  DWORD count = 0;
+  for (;;) {
+    require(ReadFile(file, buffer, sizeof(buffer), &count, nullptr),
+            "execution_containment_dll_identity");
+    if (!count) break;
+    require(CryptHashData(digest, buffer, count, 0),
+            "execution_containment_dll_identity");
+  }
+  BYTE bytes[32];
+  DWORD size = sizeof(bytes);
+  require(CryptGetHashParam(digest, HP_HASHVAL, bytes, &size, 0) && size == sizeof(bytes),
+          "execution_containment_dll_identity");
+  static const wchar_t hex[] = L"0123456789abcdef";
+  std::wstring value;
+  for (BYTE byte : bytes) {
+    value += hex[byte >> 4];
+    value += hex[byte & 15];
+  }
+  return value;
+}
+struct RetainedRealpathDll {
+  Handle file;
+  std::vector<RetainedAnchorComponent> parents;
+  std::wstring path, owner, sha256;
+  JsonObject identity;
+  PSID package = nullptr; // Scope's SID outlives this capability.
+  bool granted = false;
+  RetainedRealpathDll(const JsonObject &selection, PSID selectedPackage)
+      : path(text(selection, L"path")), owner(currentSid()),
+        sha256(text(selection, L"sha256")), package(selectedPackage) {
+    require(sha256.size() == 64 &&
+                sha256.find_first_not_of(L"0123456789abcdef") == std::wstring::npos,
+            "execution_containment_dll_identity");
+    for (auto &parent : ancestors(path))
+      parents.emplace_back(std::move(parent));
+    file = Handle(CreateFileW(extended(path).c_str(), GENERIC_READ | READ_CONTROL | WRITE_DAC,
+                              FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                              FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+    require(static_cast<bool>(file), "execution_containment_dll_identity");
+    identity = fileIdentity(file.value, owner, false, package);
+    auto canonical = finalPath(file.value);
+    require(equalPath(canonical, extended(path)), "execution_containment_dll_identity");
+    path = canonical.substr(4);
+    require(heldFileSha256(file.value) == sha256, "execution_containment_dll_identity");
+  }
+  void changeAce(ACCESS_MODE mode) {
+    PACL previous = nullptr;
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    require(GetSecurityInfo(file.value, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                            nullptr, nullptr, &previous, nullptr, &descriptor) == ERROR_SUCCESS,
+            "execution_containment_dll_identity");
+    LocalMemory original{descriptor};
+    EXPLICIT_ACCESSW entry{};
+    entry.grfAccessMode = mode;
+    entry.grfAccessPermissions = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
+    entry.grfInheritance = NO_INHERITANCE;
+    BuildTrusteeWithSidW(&entry.Trustee, package);
+    PACL next = nullptr;
+    require(SetEntriesInAclW(1, &entry, previous, &next) == ERROR_SUCCESS,
+            "execution_containment_dll_identity");
+    LocalMemory nextMemory{next};
+    // Mark acquisition before publication, so later setup failure still revokes
+    // exactly this unique package SID through the retained file HANDLE.
+    if (mode == GRANT_ACCESS) granted = true;
+    require(SetSecurityInfo(file.value, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                            nullptr, nullptr, next, nullptr) == ERROR_SUCCESS,
+            "execution_containment_dll_identity");
+    if (mode == REVOKE_ACCESS) granted = false;
+  }
+  void assertLive() const {
+    for (const auto &parent : parents) parent.assertLive();
+    require(equalPath(finalPath(file.value), extended(path)) &&
+                fileIdentity(file.value, owner, false, package).Stringify() == identity.Stringify() &&
+                heldFileSha256(file.value) == sha256,
+            "execution_containment_dll_identity");
+    Handle reopened(CreateFileW(extended(path).c_str(), GENERIC_READ | READ_CONTROL,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                                FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+    require(static_cast<bool>(reopened) &&
+                fileIdentity(reopened.value, owner, false, package).Stringify() == identity.Stringify(),
+            "execution_containment_dll_identity");
+  }
+  JsonObject receipt(const std::wstring &nonce, DWORD pid, const std::wstring &creation) const {
+    auto result = JsonObject::Parse(identity.Stringify());
+    str(result, L"path", path);
+    str(result, L"sha256", sha256);
+    str(result, L"nonce", nonce);
+    str(result, L"receiptId", L"windows-dll:" + decimal(GetCurrentProcessId()) + L":" +
+                                     decimal(pid) + L":" + creation);
+    flag(result, L"held", true);
+    return result;
   }
 };
 static std::string base64(const std::vector<BYTE> &bytes) {
@@ -867,10 +983,12 @@ struct Scope {
   std::mutex pipeMutex;
   std::vector<std::wstring> aclRoots;
   std::vector<RetainedRealpathAnchor> realpathAnchors;
+  std::unique_ptr<RetainedRealpathDll> realpathDll;
   void assertRealpathAnchorsLive() const {
     require(!stopping, "execution_identity_mismatch");
     for (const auto &anchor : realpathAnchors)
       anchor.assertLive();
+    if (realpathDll) realpathDll->assertLive();
   }
   ~Scope() {
     stopping = true;
@@ -1048,6 +1166,8 @@ static void grantRoot(Scope &scope, const std::wstring &path, DWORD mask, ACCESS
           "execution_containment_filesystem_denied");
 }
 static void removeGrants(Scope &scope) {
+  if (scope.realpathDll && scope.realpathDll->granted)
+    scope.realpathDll->changeAce(REVOKE_ACCESS);
   for (auto it = scope.aclRoots.rbegin(); it != scope.aclRoots.rend(); ++it) {
     auto handle = canonicalDirectory(*it, READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES);
     PACL previous = nullptr;
@@ -1103,6 +1223,13 @@ static std::unique_ptr<Scope> launch(const JsonObject &input, OwnerStore &owners
                     : (FILE_GENERIC_READ | FILE_GENERIC_EXECUTE),
                 kind == std::wstring(L"protectedRoots") ? DENY_ACCESS : GRANT_ACCESS);
     }
+  }
+  // Helper-only native owner/command probes do not select a DLL. Production
+  // composition requires this selection and its authenticated prepare receipt.
+  if (input.HasKey(L"realpathDll")) {
+    scope->realpathDll = std::make_unique<RetainedRealpathDll>(
+        object(input, L"realpathDll"), scope->sid.value);
+    scope->realpathDll->changeAce(GRANT_ACCESS);
   }
   LPWSTR sidString = nullptr;
   require(ConvertSidToStringSidW(scope->sid.value, &sidString) != 0,
@@ -1197,6 +1324,9 @@ static std::unique_ptr<Scope> launch(const JsonObject &input, OwnerStore &owners
     entries.Append(anchor.receipt());
   anchors.SetNamedValue(L"anchors", entries);
   mapping.SetNamedValue(L"realpathAnchors", anchors);
+  if (scope->realpathDll)
+    mapping.SetNamedValue(L"realpathDll", scope->realpathDll->receipt(
+        nonce, scope->pid, text(birth(scope->process.value), L"value")));
   str(mapping, L"nonce", nonce);
   // Bound the expanded launch/connected receipt before the child can run.
   // Remaining response envelope is small and fixed; reserve a full KiB.
