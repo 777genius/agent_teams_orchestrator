@@ -212,6 +212,23 @@ if($LASTEXITCODE-ne 0){throw 'TEST low label failed'}
   const peer = await until(() => connectedPeer)
   assert.equal(peer.clientPID, main.nativePID); assert.deepEqual(peer.bun, main)
   facts.nativeMain = main; facts.nativeConnectedPeer = peer
+  const { clientPID: _clientPID, ...peerMapping } = peer
+  assert.deepEqual(peerMapping, mapping)
+  assert.equal(mapping.nonce, nonce)
+  const anchors = record(mapping.realpathAnchors)
+  assert.equal(anchors.nonce, nonce)
+  const supervisor = record(mapping.supervisor), mainBirth = record(main.birth)
+  assert.equal(anchors.receiptId, `windows-anchors:${supervisor.nativePID}:${main.nativePID}:${mainBirth.value}`)
+  assert.ok(Array.isArray(anchors.anchors)); assert.equal(anchors.anchors.length, 1)
+  const anchor = record(anchors.anchors[0])
+  assert.equal(anchor.kind, 'writable'); assert.equal(anchor.admittedPath, root)
+  assert.equal(typeof anchor.dosPath, 'string'); assert.equal(path.win32.relative(root, String(anchor.dosPath)), '')
+  assert.equal(typeof anchor.ntPath, 'string'); assert.ok(String(anchor.ntPath).startsWith('\\Device\\'))
+  assert.match(String(anchor.volumeSerial), /^(?:0|[1-9]\d{0,19})$/); assert.ok(BigInt(String(anchor.volumeSerial)) <= 0xffffffffffffffffn)
+  assert.match(String(anchor.fileId), /^[a-f0-9]{32}$/)
+  assert.deepEqual(await broker.request('assertLive'), mapping)
+  facts.heldAnchorReceipt = anchors; facts.heldAnchorLiveRecheckPassed = true
+  facts.protectedRootExcludedFromPositiveAnchors = true
   await broker.request('send', { value: { type: 'prepare', nonce, leaseOwnerId, namespace: mapping.namespace, birth: main.birth } })
   const connected = await until(() => messages.find(value => value.type === 'prepared'))
   // Preparation is sent only once the native pipe reports its held main PID.
