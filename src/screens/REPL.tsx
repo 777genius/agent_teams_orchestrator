@@ -1090,7 +1090,12 @@ export function REPL({
   const PROMPT_SUPPRESSION_MS = 1500;
   // True when user is actively typing — defers interrupt dialogs so keystrokes
   // don't accidentally dismiss or answer a permission prompt the user hasn't read yet.
-  const [isPromptInputActive, setIsPromptInputActive] = React.useState(false);
+  const [isPromptInputActive, setIsPromptInputActiveRaw] = React.useState(false);
+  const isPromptInputActiveRef = React.useRef(false);
+  const setIsPromptInputActive = useCallback((active: boolean) => {
+    isPromptInputActiveRef.current = active;
+    setIsPromptInputActiveRaw(active);
+  }, []);
   const [autoUpdaterResult, setAutoUpdaterResult] = useState<AutoUpdaterResult | null>(null);
   useEffect(() => {
     if (autoUpdaterResult?.notifications) {
@@ -4220,11 +4225,12 @@ export function REPL({
     ))
     return (
       queryGuard.status === 'idle' &&
+      !isPromptInputActiveRef.current &&
       !focusedInputDialogRef.current &&
       !bootstrapAdmissionPendingRef.current &&
       getBlockingIncomingPromptQueueModes(commandQueueModes).length === 0
     )
-  }, [queryGuard]);
+  }, [queryGuard, isPromptInputActive]);
 
   const { getNativeAppManagedBootstrapContextInjection } =
     useNativeAppManagedBootstrapContextInjection();
