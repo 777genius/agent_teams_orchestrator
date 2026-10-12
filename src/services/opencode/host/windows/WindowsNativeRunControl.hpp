@@ -51,6 +51,10 @@ struct WindowsNativeRunControl {
     HANDLE intendedBun = nullptr;
     HANDLE processImage = nullptr;
     PSID selectedPackage = nullptr;
+    // Optional AppContainer peer access is derived only from this retained
+    // PROCESS and matched against the native Scope's own generated package SID.
+    HANDLE packagePeerProcess = nullptr;
+    PSID packagePeerSid = nullptr;
     Role localRole = Role::server;
     std::wstring sealedPath;
     std::wstring sealedBinding;
@@ -325,6 +329,18 @@ private:
     expected_ = held_.expected;
     sealedBinding_ = held_.expected.bytes;
     runControlValidateHeldInputs();
+    require((held_.packagePeerProcess == nullptr) == (held_.packagePeerSid == nullptr),
+            "run_control_package_peer_identity");
+    if (held_.packagePeerProcess) {
+      packagePeerProcess_ = runControlDuplicateHandle(held_.packagePeerProcess);
+      require(IsValidSid(held_.packagePeerSid), "run_control_package_peer_identity");
+      const DWORD length = GetLengthSid(held_.packagePeerSid);
+      require(length > 0 && length <= SECURITY_MAX_SID_SIZE, "run_control_package_peer_identity");
+      expectedPackageSid_.resize(length);
+      require(CopySid(length, expectedPackageSid_.data(), held_.packagePeerSid),
+              "run_control_package_peer_identity");
+      runControlValidatePackagePeer();
+    }
   }
 
   static std::uint64_t runControlNewId() {
@@ -348,7 +364,7 @@ private:
   static std::wstring runControlUnpredictablePipeName() {
     BYTE random[16]{};
     require(BCryptGenRandom(nullptr, random, sizeof(random),
-                            BCRYPT_USE_SYSTEM_PREFERRED_RNG) == STATUS_SUCCESS,
+                            BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0,
             "run_control_pipe_name");
     static const wchar_t hex[] = L"0123456789abcdef";
     std::wstring name = L"\\\\.\\pipe\\agt-v2-run-control-";
@@ -358,9 +374,11 @@ private:
     }
     return name;
   }
-  static PSECURITY_DESCRIPTOR runControlProtectedPipeDescriptor(const std::wstring &owner) {
-    const std::wstring sddl =
-        L"O:" + owner + L"D:P(A;;GRGW;;;SY)(A;;GRGW;;;" + owner + L")S:(ML;;NW;;;LW)";
+  static PSECURITY_DESCRIPTOR runControlProtectedPipeDescriptor(
+      const std::wstring &owner, const std::wstring &packageSid) {
+    std::wstring sddl = L"O:" + owner + L"D:P(A;;GRGW;;;SY)(A;;GRGW;;;" + owner + L")";
+    if (!packageSid.empty()) sddl += L"(A;;GRGW;;;" + packageSid + L")";
+    sddl += L"S:(ML;;NW;;;LW)";
     PSECURITY_DESCRIPTOR descriptor = nullptr;
     require(ConvertStringSecurityDescriptorToSecurityDescriptorW(
                 sddl.c_str(), SDDL_REVISION_1, &descriptor, nullptr) != 0,
@@ -368,7 +386,8 @@ private:
     return descriptor;
   }
   Handle runControlCreateServer(const std::wstring &name, bool first) {
-    LocalMemory descriptor{runControlProtectedPipeDescriptor(ownerSid_)};
+    if (packagePeerProcess_) runControlValidatePackagePeer();
+    LocalMemory descriptor{runControlProtectedPipeDescriptor(ownerSid_, packageSid_)};
     SECURITY_ATTRIBUTES attributes{sizeof(attributes), descriptor.value, FALSE};
     DWORD mode = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED;
     if (first)
@@ -526,7 +545,7 @@ private:
         if (value)
           BCryptDestroyHash(value);
       }
-    } hash;
+    };
     LARGE_INTEGER original{};
     require(SetFilePointerEx(file, LARGE_INTEGER{}, &original, FILE_CURRENT) != 0,
             "run_control_image_hash");
@@ -540,18 +559,21 @@ private:
     require(SetFilePointerEx(file, LARGE_INTEGER{}, nullptr, FILE_BEGIN) != 0,
             "run_control_image_hash");
     require(BCryptOpenAlgorithmProvider(&algorithm.value, BCRYPT_SHA256_ALGORITHM, nullptr, 0) ==
-                STATUS_SUCCESS,
+                0,
             "run_control_image_hash");
     ULONG objectLength = 0, ignored = 0;
     require(BCryptGetProperty(algorithm.value, BCRYPT_OBJECT_LENGTH,
                               reinterpret_cast<PUCHAR>(&objectLength), sizeof(objectLength),
-                              &ignored, 0) == STATUS_SUCCESS &&
+                              &ignored, 0) == 0 &&
                 objectLength > 0 && objectLength <= 1024 * 1024,
             "run_control_image_hash");
     std::vector<BYTE> state(objectLength), buffer(64 * 1024);
+    // BCrypt retains pbHashObject until DestroyHash; hash must be destroyed
+    // before its backing vector, while the algorithm provider remains alive.
+    Hash hash;
     std::array<BYTE, 32> digest{};
     require(BCryptCreateHash(algorithm.value, &hash.value, state.data(), objectLength, nullptr, 0,
-                             0) == STATUS_SUCCESS,
+                             0) == 0,
             "run_control_image_hash");
     for (;;) {
       DWORD read = 0;
@@ -561,11 +583,11 @@ private:
       }
       if (read == 0)
         break;
-      require(BCryptHashData(hash.value, buffer.data(), read, 0) == STATUS_SUCCESS,
+      require(BCryptHashData(hash.value, buffer.data(), read, 0) == 0,
               "run_control_image_hash");
     }
     require(BCryptFinishHash(hash.value, digest.data(), static_cast<ULONG>(digest.size()), 0) ==
-                STATUS_SUCCESS,
+                0,
             "run_control_image_hash");
     return digest;
   }
@@ -749,6 +771,48 @@ private:
                 !runControlSameProcess(expectedLocal, expectedPeer),
             "run_control_held_identity");
   }
+  void runControlValidatePackagePeer() {
+    const ProcessPin expectedPeer = held_.localRole == Role::server ? expected_.client : expected_.server;
+    const ProcessPin before = runControlObserveProcess(packagePeerProcess_.value);
+    require(runControlAlive(packagePeerProcess_.value) && runControlSameProcess(before, expectedPeer),
+            "run_control_package_peer_identity");
+    HANDLE raw = nullptr;
+    require(OpenProcessToken(packagePeerProcess_.value, TOKEN_QUERY, &raw),
+            "run_control_package_peer_identity");
+    Handle token(raw);
+    DWORD isContainer = 0, returned = 0;
+    require(GetTokenInformation(token.value, TokenIsAppContainer, &isContainer,
+                                 sizeof(isContainer), &returned) &&
+                returned == sizeof(isContainer) && isContainer == 1,
+            "run_control_package_peer_identity");
+    DWORD size = 0;
+    GetTokenInformation(token.value, TokenAppContainerSid, nullptr, 0, &size);
+    require(size >= sizeof(TOKEN_APPCONTAINER_INFORMATION) && size <= 65536,
+            "run_control_package_peer_identity");
+    std::vector<BYTE> information(size);
+    require(GetTokenInformation(token.value, TokenAppContainerSid, information.data(),
+                                 size, &returned) && returned >= sizeof(TOKEN_APPCONTAINER_INFORMATION) && returned <= size,
+            "run_control_package_peer_identity");
+    PSID actual = reinterpret_cast<TOKEN_APPCONTAINER_INFORMATION *>(information.data())->TokenAppContainer;
+    const auto first = reinterpret_cast<std::uintptr_t>(information.data());
+    const auto last = first + returned;
+    const auto address = reinterpret_cast<std::uintptr_t>(actual);
+    require(actual && address >= first && address <= last && last - address >= 8,
+            "run_control_package_peer_identity");
+    const DWORD actualLength = GetLengthSid(actual);
+    require(actualLength >= 8 && actualLength <= SECURITY_MAX_SID_SIZE &&
+                actualLength <= last - address && IsValidSid(actual) &&
+                EqualSid(actual, expectedPackageSid_.data()),
+            "run_control_package_peer_identity");
+    const auto actualString = runControlSidString(actual);
+    require(actualString.rfind(L"S-1-15-2-", 0) == 0 && actualString != L"S-1-15-2-1",
+            "run_control_package_peer_identity");
+    const ProcessPin after = runControlObserveProcess(packagePeerProcess_.value);
+    require(runControlSameProcess(before, after) && runControlSameProcess(after, expectedPeer),
+            "run_control_package_peer_identity");
+    if (!packageSid_.empty()) require(packageSid_ == actualString, "run_control_package_peer_identity");
+    packageSid_ = actualString;
+  }
   void runControlRevalidateHeld() {
     require(runControlAlive(intendedBun_.value), "run_control_parent_join");
     const ProcessPin parentBefore = runControlObserveProcess(intendedBun_.value);
@@ -767,6 +831,7 @@ private:
   }
   void runControlAuthenticate(Connection &connection) {
     runControlRevalidateHeld();
+    if (packagePeerProcess_) runControlValidatePackagePeer();
     const DWORD peerPid =
         connection.side == Role::server
             ? runControlPipePeerPid(connection.pipe.value, true)
@@ -1056,7 +1121,9 @@ private:
   std::array<BYTE, 32> heldImageHash_{};
   std::wstring ownerSid_;
   std::vector<BYTE> ownerSidBytes_;
-  Handle selectedDirectory_, config_, intendedBun_, processImage_;
+  Handle selectedDirectory_, config_, intendedBun_, processImage_, packagePeerProcess_;
+  std::vector<BYTE> expectedPackageSid_;
+  std::wstring packageSid_;
   std::unique_ptr<Listener> listener_;
   std::map<std::uint64_t, std::unique_ptr<Connection>> registry_;
   std::array<std::unique_ptr<IoOperation>, MAX_RETAINED_OPERATIONS> retainedIo_;

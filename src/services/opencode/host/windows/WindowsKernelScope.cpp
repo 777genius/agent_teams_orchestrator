@@ -1308,6 +1308,8 @@ struct WindowsNativeRunControlIssuer {
     held.intendedBun = parent.value;
     held.processImage = executable.value;
     held.selectedPackage = scope.sid.value;
+    held.packagePeerProcess = scope.process.value;
+    held.packagePeerSid = scope.sid.value;
     held.localRole = Control::Role::server;
     held.expected.root = Control::runControlObserveFile(selected.root.value, true);
     held.expected.config = Control::runControlObserveFile(selected.config.value, false);
