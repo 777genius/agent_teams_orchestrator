@@ -540,7 +540,7 @@ export async function launchExplicitOpenCodeV2Run(plan: RunLaunchPlan): Promise<
   })
   try {
     child.send({ type: 'start', plan, directory, sourceSha256 })
-    await boundOpenCodeRead(ready, Math.min(30_000, plan.deadline - Date.now()))
+    await boundOpenCodeRead(ready, Math.min(process.platform === 'darwin' ? OPEN_CODE_V2_RUN_INITIALIZATION_MS : 30_000, plan.deadline - Date.now()))
     const record = await discoverOpenCodeV2Run(plan.dataRoot, plan.binding.teamId, plan.binding.runId)
     executionAssert(record && child.pid === record.process.pid && executionHash(record.binding) === executionHash(plan.binding) && record.sourceSha256 === sourceSha256, 'run_owner_unknown')
     child.disconnect(); child.unref(); return record

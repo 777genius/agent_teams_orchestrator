@@ -255,7 +255,7 @@ describe('private run control with separate synthetic CLI processes', () => {
       expect(durable.binding.ownerId).toBe('owner'); expect(owner.exitCode).toBeNull()
     } finally { await stopTestChild(owner); await rm(root, { recursive: true, force: true }) }
   }, 15_000)
-  test('replaced pathname refuses cleanup but still retires the owned listener without unlinking the replacement', async () => {
+  test.skipIf(process.platform !== 'linux')('replaced pathname refuses cleanup but still retires the owned listener without unlinking the replacement', async () => {
     const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'TEST-r249-ctl-')))
     const directory = await reserveRunControlDirectory(root, binding, 'a'.repeat(64))
     const control = await serveOpenCodeV2RunControl(directory, binding, Date.now() + 5000, 'a'.repeat(64),
