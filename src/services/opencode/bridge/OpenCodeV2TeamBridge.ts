@@ -3,6 +3,7 @@ import { canonicalizeOpenCodeProjectPath } from '../OpenCodeProfileManager.js'
 import { readOpenCodeAuthority, isKnownSessionStore, requireOpenCodeAuthority, type SessionStoreShape } from '../OpenCodeAuthorityStoreRead.js'
 import { OpenCodeVersionProbeCleanupError } from '../compatibility/OpenCodeVersionProbe.js'
 import { classifyOpenCodeV2ExecutionDelivery } from '../host/OpenCodeV2ExecutionDelivery.js'
+import { isExecutionPlatformAvailable } from '../host/OpenCodeV2ExecutionPlatform.js'
 import { resolveOpenCodeBinaryHostIdentity } from '../OpenCodeHostIdentity.js'
 import { resolveOpenCodeV2ExecutionProbe } from './OpenCodeV2ExecutionProbe.js'
 import { parseOpenCodeBridgePreconditions, validateOpenCodeBridgeStateChangingPreconditions } from '../OpenCodeBridgePreconditions.js'
@@ -206,7 +207,7 @@ function refusal(envelope: BridgeEnvelope, started: number, message: string) {
  * Exported product defaults remain false; caller booleans cannot activate these capabilities. */
 export function openCodeV2SupportedSourcePredicate(status: Extract<RunControlResult, { kind: 'status' }>): boolean {
   try { classifyOpenCodeV2ExecutionDelivery(import.meta.url) } catch { return false }
-  return process.platform === 'linux' && process.versions.bun === '1.3.11' &&
+  return isExecutionPlatformAvailable() && process.versions.bun === '1.3.11' &&
     status.qualification !== undefined && status.state === 'active' && status.deadline > Date.now() && status.members.length > 0 &&
     status.members.every(member => ['2.0.0', '2.0.21'].includes(member.pin) && member.state === 'accepted' &&
       member.originalSessionId === member.opencodeSessionId && member.originalSessionId === member.runtimeSessionId &&
@@ -520,7 +521,7 @@ export async function executeSelectedOpenCodeBridgeCommandEnvelope(input: unknow
     return executeV1(input)
   }
   const bridge = binding ? new OpenCodeV2TeamBridge(resolveClaudeMultimodelPaths().data, binding) : null
-  if (bridge && process.platform === 'linux' && process.getuid) {
+  if (bridge && isExecutionPlatformAvailable() && process.getuid) {
     try { if (await bridge.discover()) return executeV2(envelope, null, bridge) }
     catch (error) {
       if (envelope.command === 'opencode.commandStatus' || envelope.command === 'opencode.recoverDeliveryJournal')

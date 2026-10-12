@@ -9,6 +9,7 @@ import { executionAssert, ExecutionTransportFailure, executionSessionIsMissing, 
   rejectExecutionBeforeInvocation, OpenCodeV2ExecutionFetch } from './OpenCodeV2ExecutionFetch.js'
 
 export type ExecutionModel = { providerID: string; id: string; variant?: string }
+type ExecutionEndpoint = Pick<ReturnType<typeof requireExecutionEndpoint>, 'baseUrl' | 'password' | 'signal' | 'fetch'>
 export type ExecutionMention = { start: number; end: number; text: string }
 export type ExecutionQueueInput = {
   nativeInputID: string; text: string; resume: boolean
@@ -169,7 +170,7 @@ class OpenCodeV2BridgeFetch {
   private readonly pending = new Set<Promise<unknown>>()
   private readonly controllers = new Set<AbortController>()
   constructor(private readonly authority: ExecutionAuthority, private readonly context: ExecutionContext,
-    private readonly endpoint: { baseUrl: string; password: string; signal: AbortSignal }) {}
+    private readonly endpoint: ExecutionEndpoint) {}
   private check(): void {
     executionAssert(!this.closed && Date.now() < this.context.deadline && !this.endpoint.signal.aborted &&
       !this.context.signal?.aborted, 'authority_or_deadline')
@@ -242,7 +243,7 @@ class OpenCodeV2BridgeFetch {
       const headers = new Headers(request.headers)
       headers.set('authorization', 'Basic ' + Buffer.from('opencode:' + this.endpoint.password).toString('base64'))
       invoked = true
-      const response = await boundOpenCodeRead(this.track(globalThis.fetch(request, { headers, signal, redirect: 'error' })
+      const response = await boundOpenCodeRead(this.track((this.endpoint.fetch ?? globalThis.fetch)(request, { headers, signal, redirect: 'error' })
         .then(async response => { if (signal.aborted) { await response.body?.cancel(); throw new Error('deadline') }; return response })), remaining(), signal)
       executionAssert(!response.redirected && (!response.url || new URL(response.url).origin === this.endpoint.baseUrl), 'authority_mismatch')
       const body = await consume(response.body, 8 * 1024 * 1024)
@@ -272,7 +273,7 @@ class OpenCodeV2BridgeFetch {
 }
 
 async function operations(authority: ExecutionAuthority, context: ExecutionContext,
-  endpoint: { baseUrl: string; password: string; signal: AbortSignal }) {
+  endpoint: ExecutionEndpoint) {
   executionAssert(authority.generation === 'v2' && (authority.pin === '2.0.0' || authority.pin === '2.0.21') &&
     authority.dialect === `v2-${authority.pin}`, 'unqualified_version')
   const graph = requireExecutionGraph(authority)
@@ -289,7 +290,7 @@ async function operations(authority: ExecutionAuthority, context: ExecutionConte
     executionAssert(dependencyProof && await hashOpenCodeFile(resolved) === dependencyProof.sha256, 'graph_mismatch')
   }
   const wire = new OpenCodeV2ExecutionFetch(endpoint.baseUrl, authority.pin, authority.directory, endpoint.password,
-    { deadline: context.deadline, signal: AbortSignal.any([endpoint.signal, ...(context.signal ? [context.signal] : [])]) })
+    { deadline: context.deadline, signal: AbortSignal.any([endpoint.signal, ...(context.signal ? [context.signal] : [])]) }, endpoint.fetch)
   const bridgeWire = new OpenCodeV2BridgeFetch(authority, context, endpoint)
   try {
     wire.check()
@@ -300,7 +301,7 @@ async function operations(authority: ExecutionAuthority, context: ExecutionConte
   } catch (failure) { await Promise.allSettled([wire.dispose(), bridgeWire.dispose()]); throw failure }
 }
 
-export async function awaitOpenCodeV2CatalogReadiness(endpoint: { baseUrl: string; password: string; signal: AbortSignal },
+export async function awaitOpenCodeV2CatalogReadiness(endpoint: ExecutionEndpoint,
   authority: ExecutionAuthority, context: ExecutionContext): Promise<void> {
   const { ops, wire, bridgeWire } = await operations(authority, context, endpoint)
   try {
@@ -314,7 +315,7 @@ export async function awaitOpenCodeV2CatalogReadiness(endpoint: { baseUrl: strin
   } finally { await Promise.all([wire.dispose(), bridgeWire.dispose()]) }
 }
 
-export async function awaitOpenCodeV2ExecutionReadiness(endpoint: { baseUrl: string; password: string; signal: AbortSignal },
+export async function awaitOpenCodeV2ExecutionReadiness(endpoint: ExecutionEndpoint,
   authority: ExecutionAuthority, context: ExecutionContext,
   selection: { agent: string; model: ExecutionModel; permissions: readonly { action: string; resource: string; effect: 'allow' | 'deny' | 'ask' }[] }): Promise<void> {
   const { ops, wire, bridgeWire } = await operations(authority, context, endpoint)

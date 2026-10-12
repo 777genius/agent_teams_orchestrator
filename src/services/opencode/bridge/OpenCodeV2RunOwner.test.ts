@@ -1,7 +1,7 @@
 import { fileURLToPath } from 'node:url'
 import { describe, expect, test, spyOn } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, realpath, rm } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { OpenCodeV2RunOwner } from './OpenCodeV2RunOwner.js'
@@ -37,7 +37,7 @@ async function fixture(options: { unknown?: boolean; foreignClient?: boolean;
   promptBarrier?: Promise<void>; closeBarrier?: Promise<void>; permissionResources?: string[];
   lifetimeMs?: number; twoMembers?: boolean; preparation?: () => void; startup?: () => void;
   permissions?: import('../host/OpenCodeV2ExecutionBinding.js').ExecutionSelection['permissions'] } = {}) {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'TEST-r249-owner-'))
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'TEST-r249-owner-')))
   const authority: ExecutionAuthority = { generation: 'v2', pin: '2.0.21', dialect: 'v2-2.0.21',
     graphSha256: 'a'.repeat(64), selectedCli: { path: '/TEST-opencode', sha256: 'b'.repeat(64), version: '2.0.21' },
     child: { pid: 42, birth: { format: 'linux-start-ticks', value: '42', bootId: 'TEST' }, executablePath: '/TEST-bun', sha256: 'c'.repeat(64) },

@@ -5,6 +5,7 @@ import { createHash } from 'node:crypto'
 import { readFile, realpath } from 'node:fs/promises'
 import path from 'node:path'
 import { resolveOpenCodeV2ExecutionDelivery } from '../host/OpenCodeV2ExecutionDelivery.js'
+import { assertExecutionPlatformAvailable } from '../host/OpenCodeV2ExecutionPlatform.js'
 import { OpenCodeV2AdmissionService, type QueueIntent } from '../execution/OpenCodeV2AdmissionService.js'
 import { OpenCodeV2AdmissionStore } from '../execution/OpenCodeV2AdmissionStore.js'
 import { OpenCodeV2SessionService, verifyExecutionSession } from '../execution/OpenCodeV2SessionService.js'
@@ -291,9 +292,9 @@ export class OpenCodeV2RunOwner {
         executionAssert(probe && probe.memberId === member.plan.memberId && member.probeAuthority, 'probe_not_owned')
         const service = new OpenCodeV2AdmissionService(client, member.store, member.authority)
         const admission = await service.settleOriginalInput(probe.intent)
-        const proof = await buildOwnedV2ProbeProof({ client, authority: member.authority, captured: member.probeAuthority,
+        const evidence = await buildOwnedV2ProbeProof({ client, authority: member.authority, captured: member.probeAuthority,
           intent: probe.intent, admission, expectedText: probe.expectedText, capabilitySnapshotId: probe.capabilitySnapshotId })
-        return { kind: 'probeEvidence', proof }
+        return { kind: 'probeEvidence', ...evidence }
       }
       if (request.operation === 'transcript') return { kind: 'transcript', ...await this.cut(client, id) }
       if (request.operation === 'mcp') return { kind: 'mcp', servers: await client.mcp() }
@@ -380,7 +381,21 @@ export class OpenCodeV2RunOwner {
     // it before initialization settles. Do not launch a replacement owner.
     await boundOpenCodeRead(this.initialization.catch(() => undefined), remaining(2000)).catch(() => { durable = false })
     const results = await Promise.all([...this.members.values()].map(async (member): Promise<RunStopMember> => {
-      const errors: string[] = [], ids: readonly string[] = await boundOpenCodeRead(member.store.fenceStop(), remaining(2000))
+      const fenceDeadline = Date.now() + remaining(2000)
+      const fence = async (): Promise<readonly string[]> => {
+        for (;;) {
+          executionAssert(Date.now() < fenceDeadline, 'run_stop_fence_timeout')
+          try { return await member.store.fenceStop() }
+          catch (error) {
+            // An already admitted update can briefly hold the same lock. Only
+            // lock contention may retry this monotonic fence; no native input
+            // is repeated and the original stop budget never moves.
+            if (!error || typeof error !== 'object' || !('code' in error) || error.code !== 'ELOCKED' || Date.now() >= fenceDeadline) throw error
+            await new Promise(resolve => setTimeout(resolve, Math.min(10, fenceDeadline - Date.now())))
+          }
+        }
+      }
+      const errors: string[] = [], ids: readonly string[] = await boundOpenCodeRead(fence(), Math.max(1, fenceDeadline - Date.now()))
         .catch(() => { errors.push('tombstone_unknown'); return [] })
       let cleanupClient: ExecutionBridgeClient | undefined
       try {
@@ -441,7 +456,8 @@ export class OpenCodeV2RunOwner {
 export async function launchExplicitOpenCodeV2Run(plan: RunLaunchPlan): Promise<RunControlRecord> {
   plan = structuredClone(plan)
   validateRunLaunchPlan(plan)
-  executionAssert(process.platform === 'linux' && process.versions.bun === '1.3.11', 'run_source_linux_bun_required')
+  assertExecutionPlatformAvailable()
+  executionAssert(process.versions.bun === '1.3.11', 'run_source_bun_required')
   executionAssert(await realpath(plan.source.bunPath) === plan.source.bunPath && sha(await readFile(plan.source.bunPath)) === plan.source.bunSha256, 'run_source_changed')
   const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'run-owner')
   const entry = delivery.entryPath
@@ -475,6 +491,7 @@ export async function launchExplicitOpenCodeV2Run(plan: RunLaunchPlan): Promise<
 }
 
 export async function startOpenCodeV2RunSupervisor(plan: RunLaunchPlan, directory: string, sourceSha256: string): Promise<{ record: RunControlRecord; owner: OpenCodeV2RunOwner; retire(): Promise<void> }> {
+  assertExecutionPlatformAvailable()
   plan = structuredClone(plan)
   validateRunLaunchPlan(plan)
   executionAssert(directory === runControlDirectory(plan.dataRoot, plan.binding.teamId, plan.binding.runId) &&

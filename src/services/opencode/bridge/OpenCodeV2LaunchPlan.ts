@@ -5,7 +5,8 @@ import type { ValidatedExecutionNative } from '../host/OpenCodeV2ExecutionHost.j
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { resolveOpenCodeV2ExecutionDelivery } from '../host/OpenCodeV2ExecutionDelivery.js'
-import { mkdir, mkdtemp, readdir, realpath, writeFile, access } from 'node:fs/promises'
+import { assertExecutionPlatformAvailable } from '../host/OpenCodeV2ExecutionPlatform.js'
+import { mkdir, mkdtemp, readFile, readdir, realpath, writeFile, access } from 'node:fs/promises'
 import { constants } from 'node:fs'
 
 import { executionAssert, executionHash, executionRecord } from '../execution/OpenCodeV2ExecutionContracts.js'
@@ -26,7 +27,8 @@ import type { RunLaunchPlan, RunMemberPlan } from './OpenCodeV2RunTypes.js'
 const text = (value: unknown): string => { executionAssert(typeof value === 'string' && value.trim().length > 0, 'run_launch_input_invalid'); return value }
 
 export async function inspectOpenCodeV2LaunchSelection(envelope: BridgeEnvelope) {
-  executionAssert(process.platform === 'linux' && process.versions.bun === '1.3.11', 'run_source_linux_bun_required')
+  assertExecutionPlatformAvailable()
+  executionAssert(process.versions.bun === '1.3.11', 'run_source_bun_required')
   const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'run-owner')
   const selected = await inspectOpenCodeReadSelection()
   executionAssert(selected.native && selected.policy.generation === 'v2', 'run_selected_native_unknown')
@@ -186,6 +188,14 @@ export async function createOpenCodeV2PreparedMember(selection: Awaited<ReturnTy
     const configDirectory = path.join(root, 'config', 'opencode'), nativeData = path.join(root, 'data', 'opencode')
     await mkdir(configDirectory, { mode: 0o700 }); await mkdir(nativeData, { mode: 0o700 })
     const provider = await materializeOpenCodeSelectedScopeAuth(selection.scope, selection.project, path.join(nativeData, 'auth.json'), selection.model.id)
+    const managedAuthPath = path.join(nativeData, 'auth.json')
+    const managedAuthFingerprint = await hashOpenCodeFile(managedAuthPath)
+    const anonymous = selection.scope.selectedAuthIdentity === 'absent'
+    // An empty sealed store binds the normal proof without pretending the native
+    // public marker is a credential. The host's read-only catalog guard must still
+    // qualify this exact free model before admitting any native session.
+    if (anonymous) executionAssert(Object.keys(executionRecord(JSON.parse(await readFile(managedAuthPath, 'utf8')))).length === 0,
+      'run_selected_auth_changed')
     const model = { ...selection.model, variant: variant ?? 'default' }
     const selected = { agent: 'build', model, permissions: [{ action: '*', resource: '*', effect: 'allow' as const }] }
     const config = createOpenCodeV2ExecutionConfig({ pin: native.version, selection: selected,
@@ -196,12 +206,11 @@ export async function createOpenCodeV2PreparedMember(selection: Awaited<ReturnTy
     if (selection.controller.type === 'local' && selection.controller.environment?.AGENT_TEAMS_MCP_CLAUDE_DIR)
       env.AGENT_TEAMS_MCP_CLAUDE_DIR = selection.controller.environment.AGENT_TEAMS_MCP_CLAUDE_DIR
     const profile: SelectedExecutionProfile = { epoch: randomUUID(), root, directory: selection.project,
-      databasePath: path.join(nativeData, 'opencode.db'), authSha256: await hashOpenCodeFile(path.join(nativeData, 'auth.json')), env, envSha256: executionHash(env),
+      databasePath: path.join(nativeData, 'opencode.db'), ...(anonymous ? {} : { authSha256: managedAuthFingerprint }), env, envSha256: executionHash(env),
       config: { directory: configDirectory, content: config.content, sha256: config.sha256 }, selection: selected }
   const metadata = await readOpenCodeSelectedScopeMetadata(selection.scope, selection.project)
-  const managedAuthPath = path.join(nativeData, 'auth.json')
-  const managedAuthFingerprint = await hashOpenCodeFile(managedAuthPath)
-  executionAssert(profile.authSha256 === managedAuthFingerprint, 'run_selected_auth_changed')
+  executionAssert(metadata.selectedAuthIdentity === selection.scope.selectedAuthIdentity &&
+    await hashOpenCodeFile(managedAuthPath) === managedAuthFingerprint, 'run_selected_auth_changed')
   const prepared: OpenCodePreparedProfile = {
     projectPath: selection.project, canonicalProjectPath: selection.project, workingDirectoryPath: selection.project,
     scopeToken: selection.scope.scopeToken, profileRootKey: executionHash({ project: selection.project,
@@ -222,6 +231,9 @@ export async function createOpenCodeV2PreparedMember(selection: Awaited<ReturnTy
 
 /** Native-owned profiles follow the planner's fixed loader environment fence. */
 export function createOpenCodeV2OwnedProfileEnvironment(root: string): Record<string, string> {
-  return Object.fromEntries(Object.entries(privateOpenCodeReadEnvironment(root))
+  const env = Object.fromEntries(Object.entries(privateOpenCodeReadEnvironment(root))
     .filter((pair): pair is [string, string] => pair[0] !== 'NODE_ENV' && typeof pair[1] === 'string'))
+  // Selected Homebrew Node must not load ambient OpenSSL configuration outside the owned profile.
+  if (process.platform === 'darwin') env.OPENSSL_CONF = '/dev/null'
+  return env
 }

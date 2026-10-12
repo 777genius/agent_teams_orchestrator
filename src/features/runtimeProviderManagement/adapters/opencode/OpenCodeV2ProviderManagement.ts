@@ -12,7 +12,7 @@ import { createOpenCodeV2ExecutionReceipt } from '../../../../services/opencode/
 import { acquireOpenCodeV2CatalogLease, requireExecutionEndpoint, registerExecutionDisposer } from '../../../../services/opencode/host/OpenCodeV2ExecutionHost.js'
 import type { CatalogExecutionProfile } from '../../../../services/opencode/host/OpenCodeV2ExecutionBinding.js'
 import { executionAssert, executionHash, executionRecord, type ExecutionAuthority } from '../../../../services/opencode/execution/OpenCodeV2ExecutionContracts.js'
-import { OpenCodeV2ProviderWire as ProviderWire } from '../../../../services/opencode/transport/OpenCodeV2ProviderWire.js'
+import { OpenCodeV2ProviderWire as ProviderWire, readOpenCodeV2ProviderWireFailure } from '../../../../services/opencode/transport/OpenCodeV2ProviderWire.js'
 import { type OpenCodeAuthCredential, readOpenCodeAuthCredential, upsertOpenCodeApiAuthCredential, upsertOpenCodeAuthCredential, removeOpenCodeAuthCredential } from '../../../../services/opencode/OpenCodeAuthStore.js'
 import { withOpenCodeAuthCoordinationLock } from '../../../../services/opencode/OpenCodeAuthCoordinationLock.js'
 import { inspectOpenCodeV2SourceAvailability, createOpenCodeV2OwnedProfileEnvironment } from '../../../../services/opencode/bridge/OpenCodeV2LaunchPlan.js'
@@ -276,6 +276,9 @@ const privateProviderFailureCodes = new Set(['provider_missing', 'provider_key_m
   'execution_selected_auth_missing', 'execution_selected_auth_unsupported', 'execution_selected_auth_location_changed',
   'execution_selected_auth_provider_unknown', 'execution_selected_auth_existing_or_unsupported',
   'execution_selected_auth_readback_unknown', 'execution_selected_auth_profile_changed',
+  'execution_selected_oauth_readback_unknown', 'execution_selected_oauth_recovery_required', 'execution_selected_oauth_windows_unqualified',
+  'execution_selected_oauth_provider_unknown', 'execution_selected_oauth_integration_unknown',
+  'execution_selected_oauth_connection_unknown', 'execution_selected_oauth_model_unknown',
   'execution_lease_not_owned', 'execution_host_unavailable', 'execution_invalid_response', 'execution_identity_mismatch',
   'execution_profile_changed', 'execution_graph_changed', 'execution_graph_incomplete', 'execution_graph_dependency_missing',
   'execution_timeout', 'execution_owner_unknown', 'cleanup_unknown', 'selection_mismatch', 'authority_mismatch',
@@ -288,11 +291,13 @@ export async function recordOpenCodeV2ProviderFailure(phase: string, error: unkn
     ? error.cause : undefined
   const category = cause instanceof Error && privateProviderFailureCodes.has(cause.message) ? cause.message
     : error instanceof Error && privateProviderFailureCodes.has(error.message) ? error.message : 'provider_operation_unknown'
+  const operation = readOpenCodeV2ProviderWireFailure(error)
   try {
     const directory = path.join(resolveClaudeMultimodelPaths().data, 'opencode/v2/provider-diagnostics')
     await mkdir(directory, { recursive: true, mode: 0o700 })
     const info = await lstat(directory)
     executionAssert(info.isDirectory() && !info.isSymbolicLink() && info.uid === process.getuid?.() && (info.mode & 0o077) === 0, 'provider_diagnostics_foreign')
-    await writeFile(path.join(directory, randomUUID() + '.json'), JSON.stringify({ schemaVersion: 1, phase, category, retainedOriginal, recordedAt: new Date().toISOString() }), { flag: 'wx', mode: 0o600 })
+    await writeFile(path.join(directory, randomUUID() + '.json'), JSON.stringify({ schemaVersion: 1, phase, category, retainedOriginal,
+      ...(operation ? { operation } : {}), recordedAt: new Date().toISOString() }), { flag: 'wx', mode: 0o600 })
   } catch { /* Diagnostics cannot replace or retry the unresolved original operation. */ }
 }

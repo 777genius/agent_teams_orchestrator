@@ -13,5 +13,6 @@ test('native-owned catalog and execution profiles meet planner loader fence whil
   expect(env.XDG_CACHE_HOME).toBe(root + '/cache'); expect(env.XDG_STATE_HOME).toBe(root + '/state')
   expect(env.TMPDIR).toBe(root + '/tmp'); expect(env.APPDATA).toBe(root + '/appdata')
   expect(env.LOCALAPPDATA).toBe(root + '/localappdata'); expect(env.NO_COLOR).toBe('1')
+  expect(env.OPENSSL_CONF).toBe(process.platform === 'darwin' ? '/dev/null' : undefined)
   expect(env.PATH).toBe([path.dirname(process.execPath), '/usr/bin', '/bin'].join(path.delimiter))
 })

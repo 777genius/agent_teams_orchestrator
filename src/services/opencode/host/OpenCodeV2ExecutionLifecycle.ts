@@ -1,7 +1,7 @@
 import { boundOpenCodeRead } from '../transport/OpenCodeBoundedFetch.js'
 import { executionAssert, executionHash, executionRecord } from '../execution/OpenCodeV2ExecutionContracts.js'
 import type { ExecutionBirth } from './OpenCodeV2ExecutionBinding.js'
-import { requireExecutionContainmentRetirement } from './OpenCodeV2ExecutionContainment.js'
+import { executionPlatformRetirementBudgetMs, requireExecutionPlatformRetirement } from './OpenCodeV2ExecutionPlatform.js'
 
 export type ExecutionCleanupReceipt = Readonly<{ scopeClosed: true; processRetired: true; descendantsRetired: true; pid: number; birth: ExecutionBirth }>
 // Receipt identity, rather than caller-controlled fields, gates durable owner
@@ -44,9 +44,9 @@ export async function retireExecutionChild(port: ExecutionRetirementPort): Promi
     retired = port.exited() && (birth === null || executionHash(birth) !== executionHash(port.birth))
   } catch (error) { failures.push(error) }
   let kernel: unknown
-  try { kernel = await boundOpenCodeRead(port.retireOwnedDescendants(), 4000) } catch (error) { failures.push(error) }
+  try { kernel = await boundOpenCodeRead(port.retireOwnedDescendants(), executionPlatformRetirementBudgetMs()) } catch (error) { failures.push(error) }
   executionAssert(failures.length === 0 && retired && port.acknowledged(), 'cleanup_unknown')
-  const evidence = requireExecutionContainmentRetirement(kernel)
+  const evidence = requireExecutionPlatformRetirement(kernel)
   executionAssert(evidence.pid === port.pid && executionHash(evidence.birth) === executionHash(port.birth), 'cleanup_unknown')
   const receipt: ExecutionCleanupReceipt = Object.freeze({ scopeClosed: true, processRetired: true,
     descendantsRetired: true, pid: evidence.pid, birth: evidence.birth })

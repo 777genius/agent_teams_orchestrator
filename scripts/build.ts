@@ -12,6 +12,7 @@ import {
 import { dirname, join, relative, resolve } from 'path'
 import { stageCursorManagedAssets } from './cursor-plugin/stage.js'
 import { OPENCODE_V2_EXTERNALS, stageOpenCodeV2Graphs } from './opencode-v2/stage.js'
+import { stageOpenCodeV2DarwinHelper } from './opencode-v2/stage-darwin.js'
 import { validatePackagedOpenCodeIdentity } from '../src/cli/packagedOpenCodeDelivery.js'
 
 const pkg = await Bun.file(new URL('../package.json', import.meta.url)).json() as {
@@ -446,6 +447,8 @@ if (compile) {
 
   runBuild(cmd)
   await stageOpenCodeV2Graphs(process.cwd(), stagingOutdir, { portable: args.includes('--portable-graph'),
+    platform: portablePlatform?.split('-')[0], arch: portablePlatform?.split('-')[1] })
+  await stageOpenCodeV2DarwinHelper(process.cwd(), stagingOutdir, {
     platform: portablePlatform?.split('-')[0], arch: portablePlatform?.split('-')[1] })
   publishBundleOutdir(stagingOutdir, bundleOutdir)
   writeLauncher(outfile, bundleEntrypoint)

@@ -72,6 +72,15 @@ describe('execution host ownership and cleanup', () => {
   test('descendant retirement failure cannot become a successful lease close', async () => {
     await expect(retireExecutionChild(retirement({ retireOwnedDescendants: async () => { throw new Error('escaped') } }))).rejects.toThrow('cleanup_unknown')
   })
+  // A caller can report every successful close field, but only a concrete
+  // launch-owned kernel receipt may authorize freeing the durable profile/DB.
+  test('caller supplied native retirement fields cannot mint a cleanup receipt', async () => {
+    const bun = { hostPID: 73, nativePID: 1, birth, executablePath: '/TEST-bun', executableSha256: 'a'.repeat(64) }
+    const mapping = { bun, init: bun, supervisor: bun, leaseOwnerId: 'TEST-lease',
+      namespace: { name: 'pid:[73]', inode: '73', device: '1' } }
+    const forged = { pid: 73, birth, scopeClosed: true, processRetired: true, descendantsRetired: true, mapping }
+    await expect(retireExecutionChild(retirement({ retireOwnedDescendants: async () => forged }))).rejects.toThrow('cleanup_unknown')
+  })
   // Even late Scope ACK + leader disappearance cannot certify unqualified descendants.
   test('late close acquisition is joined while unqualified cleanup remains unknown', async () => {
     let exited = false, ack = false, resolveExit: () => void = () => undefined

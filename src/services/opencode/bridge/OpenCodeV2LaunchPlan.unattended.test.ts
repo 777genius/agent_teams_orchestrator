@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import * as profiles from '../OpenCodeProfileManager.js'
@@ -10,13 +10,18 @@ import * as mcp from '../OpenCodeMcpManager.js'
 import * as probes from './OpenCodeV2ExecutionProbe.js'
 import { buildOpenCodeExecutionProof } from '../OpenCodeExecutionProof.js'
 import { executionHash } from '../execution/OpenCodeV2ExecutionContracts.js'
+import { attachOpenCodeV2SelectedKey } from '../host/OpenCodeV2ExecutionAuth.js'
 import { createOpenCodeV2PreparedMember, createOpenCodeV2LaunchPlan, inspectOpenCodeV2SourceAvailability } from './OpenCodeV2LaunchPlan.js'
+import { launchExplicitOpenCodeV2Run, startOpenCodeV2RunSupervisor } from './OpenCodeV2RunOwner.js'
 import type { BridgeEnvelope } from './OpenCodeBridgeProtocol.js'
 import type { OpenCodePreparedProfile, OpenCodeProfileScope, OpenCodeProvisioningSnapshot } from '../types.js'
 import type { ValidatedExecutionNative } from '../host/OpenCodeV2ExecutionHost.js'
 
 let root: string, project: string, pin: '2.0.0' | '2.0.21' = '2.0.21'
 let saved: NodeJS.ProcessEnv
+let nativeSelectionCalls = 0
+let authContent = '{}\n'
+let metadataAuthIdentity: OpenCodeProfileScope['selectedAuthIdentity'] = 'absent'
 const restores: { mockRestore(): void }[] = []
 const behavior = 'b'.repeat(64)
 const digest = (value: string) => createHash('sha256').update(value).digest('hex')
@@ -33,6 +38,8 @@ function envelope(): BridgeEnvelope {
       selectedModel: 'provider/model', skipPermissions: true, members: [{ name: 'worker' }] } }
 }
 beforeEach(async () => {
+  nativeSelectionCalls = 0
+  authContent = '{}\n'; metadataAuthIdentity = 'absent'
   root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'TEST-v2-unattended-')))
   project = path.join(root, 'project'); await mkdir(project)
   const env = { CLAUDE_MULTIMODEL_DATA_HOME: path.join(root, 'app-data'), CLAUDE_MULTIMODEL_CACHE_HOME: path.join(root, 'app-cache') }
@@ -44,13 +51,16 @@ beforeEach(async () => {
   restores.push(spyOn(profiles, 'canonicalizeOpenCodeProjectPath').mockImplementation(async () => project),
     spyOn(profiles, 'resolveOpenCodeProfileScope').mockImplementation(async () => scope),
     spyOn(profiles, 'materializeOpenCodeSelectedScopeAuth').mockImplementation(async (_scope, _project, authPath) => {
-      await writeFile(authPath, '{}\n', { mode: 0o600 }); return {}
+      await writeFile(authPath, authContent, { mode: 0o600 }); return {}
     }),
     spyOn(profiles, 'readOpenCodeSelectedScopeMetadata').mockImplementation(async () => ({ projectBehaviorFingerprint: behavior,
-      behaviorSources: [], selectedAuthIdentity: 'absent', authoritySourceFingerprint: 'd'.repeat(64) })),
+      behaviorSources: [], selectedAuthIdentity: metadataAuthIdentity, authoritySourceFingerprint: 'd'.repeat(64) })),
     spyOn(profiles, 'collectProjectBehaviorMetadata').mockImplementation(async () => ({ projectBehaviorFingerprint: behavior, behaviorSources: [] })),
-    spyOn(nativeIdentity, 'inspectOpenCodeReadSelection').mockImplementation(async () => ({ path: native().executablePath,
-      policy: { generation: 'v2', version: pin, dialect: native().dialect }, native: native(), fingerprint: native().executableSha256 })),
+    spyOn(nativeIdentity, 'inspectOpenCodeReadSelection').mockImplementation(async () => {
+      nativeSelectionCalls += 1
+      return { path: native().executablePath,
+        policy: { generation: 'v2', version: pin, dialect: native().dialect }, native: native(), fingerprint: native().executableSha256 }
+    }),
     spyOn(receipts, 'createOpenCodeV2ExecutionReceipt').mockImplementation(async () => native()),
     spyOn(mcp, 'resolveOpenCodeAppMcpLaunchConfig').mockImplementation(async () => ({ config: {
       type: 'remote', enabled: true, url: 'http://127.0.0.1:1/mcp' }, source: 'env-override' })))
@@ -66,6 +76,77 @@ async function proof(prepared: OpenCodePreparedProfile, capabilitySnapshotId: st
   return buildOpenCodeExecutionProof({ selectedModel: 'provider/model', snapshot, capabilitySnapshotId }, {
     resolveBinaryPath: () => native().executablePath, resolveBinaryIdentity: async () => 'TEST-native-identity', readCredential: async () => null })
 }
+for (const version of ['2.0.0', '2.0.21'] as const) test(`${version} absent selected auth routes prepared profiles through native free-model readback while sealing paid keys`, async () => {
+  pin = version
+  const selection = await inspectOpenCodeV2SourceAvailability(envelope())
+  const parent = path.join(root, 'profiles'); await mkdir(parent)
+  const member = { teamId: 'TEST-team', runId: 'TEST-run', memberId: 'worker', unattendedTeam: true }
+  const anonymous = await createOpenCodeV2PreparedMember(selection, native(), parent, member)
+  expect(anonymous.profile.authSha256).toBeUndefined()
+  expect(anonymous.prepared.managedAuthFingerprint).toBe(digest(authContent))
+  expect(anonymous.prepared.selectedSourceAuthIdentity).toBe('absent')
+  expect(anonymous.prepared.authState).toBe('missing')
+  expect(await readFile(anonymous.prepared.managedAuthPath, 'utf8')).toBe('{}\n')
+  const location = { directory: project }
+  const provider = { id: 'provider', integrationID: 'TEST-integration', activation: 'enabled', settings: { apiKey: 'public' } }
+  const model = { id: 'model', providerID: 'provider', enabled: true, status: 'active',
+    cost: [{ input: 0, output: 0, cache: { read: 0, write: 0 } }] }
+  let posts = 0
+  const port = {
+    providers: async () => ({ location, data: [provider] }),
+    integration: async () => ({ location, data: { id: 'TEST-integration', connections: [] } }),
+    models: async () => ({ location, data: [model] }),
+    connect: async () => { posts++ },
+  }
+  await attachOpenCodeV2SelectedKey(anonymous.profile, port)
+  for (const changed of [
+    { ...port, providers: async () => ({ location, data: [{ ...provider, settings: {} }] }) },
+    { ...port, integration: async () => ({ location, data: { id: 'TEST-integration', connections: [{ type: 'credential', id: 'cred_TEST' }] } }) },
+    { ...port, models: async () => ({ location, data: [{ ...model, cost: [{ input: 1, output: 0, cache: { read: 0, write: 0 } }] }] }) },
+  ]) await expect(attachOpenCodeV2SelectedKey(anonymous.profile, changed)).rejects.toThrow('execution_selected_auth_anonymous_unproven')
+  expect(posts).toBe(0)
+  const selectedKey = 'TEST-only-key'
+  authContent = JSON.stringify({ provider: { type: 'api', key: selectedKey } })
+  await expect(createOpenCodeV2PreparedMember(selection, native(), parent, member)).rejects.toThrow('run_selected_auth_changed')
+  metadataAuthIdentity = `known:${digest(authContent)}`
+  const paid = await createOpenCodeV2PreparedMember({ ...selection,
+    scope: { ...selection.scope, selectedAuthIdentity: metadataAuthIdentity } }, native(), parent, member)
+  expect(paid.profile.authSha256).toBe(digest(authContent))
+  expect(paid.prepared.managedAuthFingerprint).toBe(digest(authContent))
+  expect(paid.prepared.authState).toBe('ok')
+  await attachOpenCodeV2SelectedKey(paid.profile, { ...port,
+    integration: async () => ({ location, data: { id: 'TEST-integration', methods: [{ type: 'key' }],
+      connections: posts === 0 ? [] : [{ type: 'credential', id: 'cred_TESTselected' }] } }),
+    connect: async (_id, key) => { expect(key).toBe(selectedKey); posts++ },
+  })
+  expect(posts).toBe(1)
+  authContent = '{}\n'
+  await expect(createOpenCodeV2PreparedMember(selection, native(), parent, member)).rejects.toThrow('run_selected_auth_changed')
+})
+for (const version of ['2.0.0', '2.0.21'] as const) test(`${version} admits Linux and Darwin selection but fences unsupported hosts before identity reads`, async () => {
+  pin = version
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform')!
+  const bun = Object.getOwnPropertyDescriptor(process.versions, 'bun')!
+  try {
+    for (const host of ['linux', 'darwin'] as const) {
+      Object.defineProperty(process, 'platform', { ...platform, value: host })
+      const selection = await inspectOpenCodeV2SourceAvailability(envelope())
+      expect(selection.native.version).toBe(version)
+      expect(selection.installedGraphFiles).toBeGreaterThan(0)
+      expect(selection.model).toEqual({ providerID: 'provider', id: 'model' })
+    }
+    expect(nativeSelectionCalls).toBe(2)
+    Object.defineProperty(process, 'platform', { ...platform, value: 'win32' })
+    await expect(inspectOpenCodeV2SourceAvailability(envelope())).rejects.toThrow('execution_containment_platform_pending')
+    Object.defineProperty(process, 'platform', { ...platform, value: 'darwin' })
+    Object.defineProperty(process.versions, 'bun', { ...bun, value: '1.3.10' })
+    await expect(inspectOpenCodeV2SourceAvailability(envelope())).rejects.toThrow('run_source_bun_required')
+    expect(nativeSelectionCalls).toBe(2)
+  } finally {
+    Object.defineProperty(process, 'platform', platform)
+    Object.defineProperty(process.versions, 'bun', bun)
+  }
+})
 for (const version of ['2.0.0', '2.0.21'] as const) test(`${version} team launch requires the same unattended profile as its strict proof`, async () => {
   pin = version
   const request = envelope(), selection = await inspectOpenCodeV2SourceAvailability(request)
@@ -86,6 +167,15 @@ for (const version of ['2.0.0', '2.0.21'] as const) test(`${version} team launch
   const launch = { ...request, body: { ...request.body, executionProof: samePolicyProof, preconditions } }
   const plan = await createOpenCodeV2LaunchPlan(launch)
   expect(plan.members[0]?.profile.config.sha256).toBe(samePolicyProof.managedConfigFingerprint)
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform')!
+  try {
+    Object.defineProperty(process, 'platform', { ...platform, value: 'win32' })
+    await expect(launchExplicitOpenCodeV2Run(plan)).rejects.toThrow('execution_containment_platform_pending')
+    await expect(startOpenCodeV2RunSupervisor(plan, '/TEST-unqualified', 'TEST')).rejects.toThrow('execution_containment_platform_pending')
+  } finally { Object.defineProperty(process, 'platform', platform) }
+  // A permitted host still cannot launch the fixture's unqualified Bun bytes.
+  await expect(launchExplicitOpenCodeV2Run(plan)).rejects.toThrow('run_source_changed')
+  expect(await readdir(path.join(root, 'app-data/opencode/v2'))).not.toContain('runs')
   const changedPolicyProof = await proof(generic.prepared, selection.capabilitySnapshotId)
   probe.mockImplementation(async () => ({ state: 'available', proof: changedPolicyProof, reason: null }))
   await expect(createOpenCodeV2LaunchPlan({ ...launch, body: { ...launch.body, executionProof: changedPolicyProof,
@@ -109,4 +199,29 @@ test('generic unresolved probes retain their original cache key while team polic
   expect(team.reason).toBe('Selected-model execution proof was not requested.')
   expect(digest(await readFile(path.join(directory, 'probe.json'), 'utf8'))).toBe(digest(JSON.stringify({ sourceKey, binding: { teamId: 'TEST-original', runId: nonce,
     controllerInstanceId: nonce, ownerId: nonce }, sessionID: 'ses_TEST', intent, submitted: true, proof: null, retired: false })))
+})
+
+// Append in the existing OpenCodeV2LaunchPlan.unattended.test.ts fixture.
+// No new mocks, model effects or synthetic cleanup qualification.
+test('retired original terminal failure is retained across read and run requests without replay', async () => {
+  const request = envelope(), selection = await inspectOpenCodeV2SourceAvailability(request)
+  const sourceKey = executionHash({ project, scopeToken: selection.scope.scopeToken,
+    selectedAuthIdentity: selection.scope.selectedAuthIdentity, source: selection.behaviorFingerprint,
+    graph: selection.installedGraphSHA256, projectBehavior: behavior, variant: 'default' })
+  const directory = path.join(root, 'app-data/opencode/v2/execution-probes', sourceKey)
+  await mkdir(directory, { recursive: true, mode: 0o700 })
+  const nonce = 'TEST-retired-provider-failure'
+  const intent = { identity: { requestId: nonce, deliveryAttemptId: nonce, localMessageId: nonce,
+    nativeInputID: 'msg_TESTfailed' }, delivery: 'queue',
+    input: { nativeInputID: 'msg_TESTfailed', resume: true, text: 'Original failed TEST input' } }
+  const saved = JSON.stringify({ sourceKey, binding: { teamId: 'TEST-original', runId: nonce,
+    controllerInstanceId: nonce, ownerId: nonce }, sessionID: 'ses_TESTfailed', intent,
+    submitted: true, proof: null, retired: true, failure: 'native_execution_failed' })
+  const file = path.join(directory, 'probe.json')
+  await writeFile(file, saved, { mode: 0o600 })
+  for (const run of [false, true]) {
+    expect(await probes.resolveOpenCodeV2ExecutionProbe(request, selection, run))
+      .toEqual({ state: 'failed', proof: null, reason: 'native_execution_failed' })
+    expect(await readFile(file, 'utf8')).toBe(saved)
+  }
 })
