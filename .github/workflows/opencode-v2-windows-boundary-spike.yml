@@ -34,7 +34,7 @@ jobs:
           $helperSource = Join-Path $env:GITHUB_WORKSPACE 'src\services\opencode\host\windows\WindowsKernelScope.cpp'
           $dllSource = Join-Path $env:GITHUB_WORKSPACE 'src\services\opencode\host\windows\WindowsNativeRealpath.cpp'
           $script = Join-Path $env:RUNNER_TEMP 'compile-native-delivery.cmd'
-          @("@echo off", "call `"$vcvars`"", "if errorlevel 1 exit /b 1", "cl.exe /nologo /std:c++20 /EHsc /MT /W4 /O2 /DUNICODE /D_UNICODE `"$helperSource`" /Fe:`"$helper`" /link windowsapp.lib userenv.lib advapi32.lib", "if errorlevel 1 exit /b 1", "cl.exe /nologo /std:c++20 /EHsc /MT /LD /W4 /O2 /DUNICODE /D_UNICODE `"$dllSource`" /Fe:`"$dll`"", "exit /b %errorlevel%") | Set-Content $script -Encoding ascii
+          @("@echo off", "call `"$vcvars`"", "if errorlevel 1 exit /b 1", "cl.exe /nologo /std:c++20 /EHsc /MT /W4 /O2 /DUNICODE /D_UNICODE `"$helperSource`" /Fe:`"$helper`" /link windowsapp.lib userenv.lib advapi32.lib bcrypt.lib", "if errorlevel 1 exit /b 1", "cl.exe /nologo /std:c++20 /EHsc /MT /LD /W4 /O2 /DUNICODE /D_UNICODE `"$dllSource`" /Fe:`"$dll`"", "exit /b %errorlevel%") | Set-Content $script -Encoding ascii
           & cmd.exe /d /c $script
           if ($LASTEXITCODE -ne 0) { throw 'Production native compilation failed' }
           foreach ($asset in @(@{path=$helper;manifest='windows-helper.json'},@{path=$dll;manifest='windows-realpath.json'})) {
@@ -73,7 +73,7 @@ jobs:
           $source = Join-Path $env:GITHUB_WORKSPACE 'src\services\opencode\host\windows\WindowsKernelScope.cpp'
           $vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
           $compileScript = Join-Path $env:RUNNER_TEMP 'compile-opencode-native.cmd'
-          @("@echo off", "call `"$vcvars`"", "if errorlevel 1 exit /b 1", "cl.exe /nologo /std:c++20 /EHsc /MT /W4 /O2 /DUNICODE /D_UNICODE `"$source`" /Fe:`"$helper`" /link windowsapp.lib userenv.lib advapi32.lib", "exit /b %errorlevel%") | Set-Content $compileScript -Encoding ascii
+          @("@echo off", "call `"$vcvars`"", "if errorlevel 1 exit /b 1", "cl.exe /nologo /std:c++20 /EHsc /MT /W4 /O2 /DUNICODE /D_UNICODE `"$source`" /Fe:`"$helper`" /link windowsapp.lib userenv.lib advapi32.lib bcrypt.lib", "exit /b %errorlevel%") | Set-Content $compileScript -Encoding ascii
           & cmd.exe /d /c $compileScript
           if ($LASTEXITCODE -ne 0) { throw 'native helper compile failed' }
           $manifest = @{format=1;platform='win32';arch='x64';name='opencode-v2-windows-helper.exe';sha256=(Get-FileHash $helper -Algorithm SHA256).Hash.ToLowerInvariant()}

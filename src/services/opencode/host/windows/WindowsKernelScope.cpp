@@ -591,7 +591,31 @@ struct SelectedProfile {
   std::vector<SelectedProfileDirectory> directories;
   std::vector<std::wstring> admittedDirectories;
 };
+struct WindowsNativeRunControlIssuer;
+class SelectedControllerConfig {
+  friend struct OwnerStore;
+  friend struct WindowsNativeRunControlIssuer;
+  Handle root, config;
+  std::wstring path, owner, sha256;
+  JsonObject identity;
+  SelectedControllerConfig(Handle heldRoot, Handle heldConfig, std::wstring selectedPath,
+                           std::wstring selectedOwner, std::wstring selectedHash)
+      : root(std::move(heldRoot)), config(std::move(heldConfig)), path(std::move(selectedPath)),
+        owner(std::move(selectedOwner)), sha256(std::move(selectedHash)),
+        identity(fileIdentity(config.value, owner, false)) {}
+public:
+  void assertLive(PSID package) const {
+    require(equalPath(finalPath(config.value), extended(path)) &&
+                fileIdentity(config.value, owner, false, package).Stringify() == identity.Stringify() &&
+                heldFileSha256(config.value) == sha256,
+            "run_control_config_identity");
+  }
+};
 struct OwnerStore {
+private:
+  friend struct WindowsNativeRunControlIssuer;
+  std::map<std::wstring, std::unique_ptr<SelectedControllerConfig>> selectedConfigs;
+public:
   std::map<std::wstring, OwnerDirectory> directories;
   std::map<std::wstring, SelectedProfile> selectedProfiles;
   // This SID is assigned only from the helper's own private kernel Scope,
@@ -726,6 +750,55 @@ struct OwnerStore {
     str(result, L"filesystem", L"NTFS");
     return result;
   }
+  JsonObject selectConfig(const JsonObject &input) {
+    require(selectedConfigs.size() < 64, "run_control_selection_budget");
+    auto root = text(input, L"root"), database = text(input, L"databasePath");
+    auto found = selectedProfiles.find(root + L"|" + database);
+    require(found != selectedProfiles.end(), "run_control_selection_missing");
+    auto &selected = found->second;
+    auto directory = root + L"\\config\\opencode";
+    auto configPath = directory + L"\\opencode.json";
+    auto expectedHash = text(input, L"sha256");
+    require(expectedHash.size() == 64 &&
+                expectedHash.find_first_not_of(L"0123456789abcdef") == std::wstring::npos,
+            "run_control_config_identity");
+    require(std::find(selected.admittedDirectories.begin(), selected.admittedDirectories.end(),
+                      directory) != selected.admittedDirectories.end(),
+            "run_control_selection_missing");
+    require(fileIdentity(selected.root.value, selected.owner, true, selectedPackage).Stringify() ==
+                selected.rootIdentity.Stringify(), "run_control_selection_changed");
+    // The config pathname is fixed by the existing private selected profile,
+    // never an arbitrary basename, serialized HANDLE or ExpectedBinding DTO.
+    auto checkedParents = ancestors(configPath);
+    Handle config(CreateFileW(extended(configPath).c_str(), GENERIC_READ | READ_CONTROL,
+                               FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                               FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+    require(static_cast<bool>(config) && equalPath(finalPath(config.value), extended(configPath)),
+            "run_control_config_identity");
+    fileIdentity(config.value, selected.owner, false, selectedPackage);
+    FILE_STANDARD_INFO configSize{};
+    require(GetFileInformationByHandleEx(config.value, FileStandardInfo, &configSize,
+                                         sizeof(configSize)) &&
+                configSize.EndOfFile.QuadPart >= 0 && configSize.EndOfFile.QuadPart <= 4 * 1024 * 1024,
+            "run_control_config_budget");
+    require(heldFileSha256(config.value) == expectedHash, "run_control_config_identity");
+    HANDLE rootDuplicate = nullptr;
+    require(DuplicateHandle(GetCurrentProcess(), selected.root.value, GetCurrentProcess(),
+                             &rootDuplicate, 0, FALSE, DUPLICATE_SAME_ACCESS),
+            "run_control_selection_changed");
+    const auto id = decimal(++next);
+    selectedConfigs.emplace(id, std::unique_ptr<SelectedControllerConfig>(
+        new SelectedControllerConfig(Handle(rootDuplicate), std::move(config), configPath,
+                                     selected.owner, expectedHash)));
+    JsonObject result;
+    num(result, L"schema", 1);
+    flag(result, L"ok", true);
+    str(result, L"selectionId", id);
+    str(result, L"root", root);
+    str(result, L"path", configPath);
+    str(result, L"sha256", expectedHash);
+    return result;
+  }
   JsonObject describe(OwnerDirectory &directory) {
     JsonObject result;
     num(result, L"schema", 1);
@@ -788,6 +861,8 @@ struct OwnerStore {
     return directory;
   }
   JsonObject request(const std::wstring &operation, const JsonObject &input) {
+    if (operation == L"ownerSelectConfig")
+      return selectConfig(input);
     if (operation == L"ownerValidateSelectedProfile")
       return validateSelectedProfile(input);
     if (operation == L"ownerOpenDirectory")
@@ -969,11 +1044,14 @@ struct AttributeList {
   }
 };
 #include "WindowsNativeCommand.hpp"
+#include "WindowsNativeRunControl.hpp"
 struct Scope;
 static void removeGrants(Scope &scope);
 struct Scope {
   Handle job, process, thread, pipe, cancel, spool, inputFile, outputFile, errorFile;
   std::unique_ptr<NativeCommandStore> commands;
+  std::unique_ptr<WindowsNativeRunControl> ownedPairControl;
+  bool ownedPairClosed = false;
   LocalMemory sid, network, pipeDescriptor;
   std::wstring profile, pipeName, cwd;
   DWORD pid = 0;
@@ -1002,6 +1080,13 @@ struct Scope {
       WaitForSingleObject(process.value, 5000);
     if (reader.joinable())
       reader.join();
+    if (ownedPairControl) {
+      try {
+        auto closed = ownedPairControl->shutdown();
+        if (closed.GetNamedBoolean(L"complete", false)) ownedPairControl.reset();
+        else (void)ownedPairControl.release();
+      } catch (...) { (void)ownedPairControl.release(); } // UNKNOWN keeps its held I/O custody.
+    }
     commands.reset();
     inputFile.reset();
     outputFile.reset();
@@ -1129,6 +1214,13 @@ struct Scope {
     require(exited() && active() == 0, "cleanup_unknown");
     if (reader.joinable())
       reader.join();
+    if (ownedPairControl) {
+      auto closed = ownedPairControl->shutdown();
+      require(closed.GetNamedBoolean(L"complete", false) &&
+                  !closed.GetNamedBoolean(L"cleanupUnknown", true), "cleanup_unknown");
+      ownedPairControl.reset();
+      ownedPairClosed = true;
+    }
     if (commands)
       commands->retireAll();
     inputFile.reset();
@@ -1138,6 +1230,7 @@ struct Scope {
     JsonObject value;
     flag(value, L"empty", true);
     flag(value, L"heldProcessExited", true);
+    if (ownedPairClosed) flag(value, L"ownedPairClosed", true);
     num(value, L"activeProcesses", 0);
     value.SetNamedValue(L"mapping", mapping);
     return value;
@@ -1188,6 +1281,50 @@ static void removeGrants(Scope &scope) {
   }
   scope.aclRoots.clear();
 }
+// Only this native friend may construct the header capability. All pins are
+// measured from an existing selected-profile cache and the actual CreateProcess
+// acquisition; no request can supply PIDs, birth values, FilePins or peer DTOs.
+struct WindowsNativeRunControlIssuer {
+  static std::unique_ptr<WindowsNativeRunControl> issueOwnedPair(
+      OwnerStore &owners, Scope &scope, const std::wstring &selectionId,
+      const std::wstring &nonce, const std::wstring &lease) {
+    auto found = owners.selectedConfigs.find(selectionId);
+    require(found != owners.selectedConfigs.end(), "run_control_selection_missing");
+    auto &selected = *found->second;
+    selected.assertLive(scope.sid.value);
+    using Control = WindowsNativeRunControl;
+    const auto parentPid = Control::runControlParentPid(GetCurrentProcess());
+    require(parentPid > 0 && parentPid <= MAXDWORD, "run_control_parent_join");
+    Handle parent(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE,
+                               static_cast<DWORD>(parentPid)));
+    require(static_cast<bool>(parent), "run_control_parent_join");
+    Handle executable(CreateFileW(extended(image(GetCurrentProcess())).c_str(),
+                                   GENERIC_READ | READ_CONTROL, FILE_SHARE_READ, nullptr,
+                                   OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+    require(static_cast<bool>(executable), "run_control_process_identity");
+    Control::HeldInputs held;
+    held.selectedDirectory = selected.root.value;
+    held.config = selected.config.value;
+    held.intendedBun = parent.value;
+    held.processImage = executable.value;
+    held.selectedPackage = scope.sid.value;
+    held.localRole = Control::Role::server;
+    held.expected.root = Control::runControlObserveFile(selected.root.value, true);
+    held.expected.config = Control::runControlObserveFile(selected.config.value, false);
+    held.expected.image = Control::runControlObserveFile(executable.value, false);
+    held.expected.image.sha256 = Control::runControlSha256(executable.value);
+    held.expected.parent = Control::runControlObserveProcess(parent.value);
+    held.expected.server = Control::runControlObserveProcess(GetCurrentProcess());
+    held.expected.client = Control::runControlObserveProcess(scope.process.value);
+    // This is an owned main-Bun peer checkpoint. It must not be reported as a
+    // fresh CLI client capability: the latter needs its own held acquisition.
+    held.sealedPath = selected.path;
+    held.sealedBinding = nonce + L":" + lease + L":" + selectionId;
+    auto binding = narrow(held.sealedBinding);
+    held.expected.bytes.assign(binding.begin(), binding.end());
+    return std::unique_ptr<Control>(new Control(held));
+  }
+};
 static std::unique_ptr<Scope> launch(const JsonObject &input, OwnerStore &owners) {
   auto scope = std::make_unique<Scope>();
   auto nonce = text(input, L"nonce"), lease = text(input, L"leaseOwnerId"),
@@ -1307,6 +1444,9 @@ static std::unique_ptr<Scope> launch(const JsonObject &input, OwnerStore &owners
   require(IsProcessInJob(scope->process.value, scope->job.value, &member) && member &&
               scope->active() == 1,
           "execution_identity_mismatch");
+  if (input.HasKey(L"selectedConfigId"))
+    scope->ownedPairControl = WindowsNativeRunControlIssuer::issueOwnedPair(
+        owners, *scope, text(input, L"selectedConfigId"), nonce, lease);
   JsonObject mapping;
   mapping.SetNamedValue(L"bun", identity(scope->process.value, scope->pid));
   mapping.SetNamedValue(L"supervisor", identity(GetCurrentProcess(), GetCurrentProcessId()));

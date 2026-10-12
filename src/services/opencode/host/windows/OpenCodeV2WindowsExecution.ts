@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { readFile, realpath } from 'node:fs/promises'
 import path from 'node:path'
-import type { ExecutionBirth } from '../OpenCodeV2ExecutionBinding.js'
+import { validateExecutionProfile, type OwnedNativeProfile, type ExecutionBirth } from '../OpenCodeV2ExecutionBinding.js'
 import { createWindowsNativeBroker, resolveWindowsNativeArtifact, resolveWindowsRealpathArtifact, requireWindowsRealpathArtifact, type WindowsRealpathArtifact, type WindowsNativeArtifact, type WindowsNativeBroker } from './OpenCodeV2WindowsNativeBroker.js'
 import { createWindowsOwnerFilesystem } from './OpenCodeV2WindowsOwnerFilesystem.js'
 import { createWindowsExecutionHttpClient } from './OpenCodeV2WindowsHTTP.js'
@@ -23,6 +23,7 @@ export type WindowsExecutionMapping = Readonly<{ bun: WindowsExecutionIdentity; 
 export type WindowsKernelRetirement = Readonly<{ pid: number; birth: ExecutionBirth; scopeClosed: boolean; mapping: WindowsExecutionMapping; activeProcesses: 0; heldProcessExited: true; ownAcesRemoved: true }>
 export type WindowsLaunchPlan = Readonly<{ helper: WindowsNativeArtifact; realpathDll: WindowsRealpathArtifact; executable: string; entry: string; cwd: string; writableRoots: readonly string[]; readOnlyRoots: readonly string[]; protectedRoots: readonly string[]; profileDirectories: readonly string[]; env: Readonly<Record<string, string>> }>
 const plans = new WeakSet<WindowsLaunchPlan>(), mappings = new WeakSet<WindowsExecutionMapping>(), retirements = new WeakSet<WindowsKernelRetirement>()
+const selectedConfigs = new WeakMap<WindowsLaunchPlan, string>(), selectingConfigs = new WeakSet<WindowsLaunchPlan>()
 const brokers = new WeakMap<WindowsLaunchPlan, WindowsNativeBroker>(), binaries = new WeakMap<WindowsLaunchPlan, Readonly<{ path: string; sha256: string }>>()
 export function isWindowsExecutionMapping(value: unknown): value is WindowsExecutionMapping { return !!value && typeof value === 'object' && mappings.has(value as WindowsExecutionMapping) }
 export function isWindowsKernelRetirement(value: unknown): value is WindowsKernelRetirement { return !!value && typeof value === 'object' && retirements.has(value as WindowsKernelRetirement) }
@@ -68,6 +69,22 @@ export async function windowsBirth(pid: number): Promise<ExecutionBirth | null> 
   try { const value = row(await broker.request('identity', { pid }, Date.now() + 3000)); return value.absent === true ? null : birth(value.birth) }
   finally { await broker.close() }
 }
+// Every raw root is canonicalized before this step. Select only already
+// admitted ancestors: descendant grants add no access to the existing union.
+// win32.relative handles case/separators; drive/UNC ambiguity is rejected above.
+function compactReadOnlyGrantUnion(roots: readonly string[]): readonly string[] {
+  const selected: string[] = []
+  const inside = (parent: string, child: string) => {
+    const relative = path.win32.relative(parent, child)
+    return relative === '' || (relative !== '..' && !relative.startsWith('..\\') && !path.win32.isAbsolute(relative))
+  }
+  for (const root of roots) {
+    if (selected.some(parent => inside(parent, root))) continue
+    for (let index = selected.length - 1; index >= 0; index--) if (inside(root, selected[index]!)) selected.splice(index, 1)
+    selected.push(root)
+  }
+  return Object.freeze(selected)
+}
 export async function planWindowsExecution(requested: Readonly<{
   bun: Readonly<{ path: string; sha256: string }>; entry: string; cwd: string; writableRoots: readonly string[]; readOnlyRoots: readonly string[]; protectedRoots?: readonly string[]; profileDirectories?: readonly string[]; readOnlyMounts?: readonly Readonly<{ source: string; target: string }>[]; env: Readonly<Record<string, string>>
 }>): Promise<WindowsLaunchPlan> {
@@ -76,7 +93,7 @@ export async function planWindowsExecution(requested: Readonly<{
   assert(await realpath(input.bun.path) === input.bun.path && await hash(input.bun.path) === input.bun.sha256, 'execution_identity_mismatch')
   assert(input.profileDirectories && input.profileDirectories.length > 0, 'execution_profile_changed')
   assert(!input.readOnlyMounts?.length, 'execution_containment_path_alias_pending')
-  for (const root of [...input.writableRoots, ...input.readOnlyRoots, ...input.profileDirectories, input.cwd]) assert(path.isAbsolute(root) && path.parse(root).root !== root && await realpath(root) === root, 'execution_path_alias')
+  for (const root of [...input.writableRoots, ...input.readOnlyRoots, ...input.profileDirectories, input.cwd]) assert(path.isAbsolute(root) && /^[A-Za-z]:\\/.test(root) && !root.includes('/') && path.parse(root).root !== root && await realpath(root) === root, 'execution_path_alias')
   for (const key of Object.keys(input.env)) assert(!/^(?:NODE_CHANNEL_|OPENCODE_V2_WINDOWS_|DYLD_|LD_)/.test(key), 'execution_profile_changed')
   const helper = await resolveWindowsNativeArtifact(), realpathDll = await resolveWindowsRealpathArtifact()
   for (const root of [...input.writableRoots, ...(input.protectedRoots ?? [])]) {
@@ -84,7 +101,8 @@ export async function planWindowsExecution(requested: Readonly<{
     assert(relative !== '' && (relative === '..' || relative.startsWith('..\\') || path.win32.isAbsolute(relative)), 'execution_containment_dll_identity')
   }
   const plan: WindowsLaunchPlan = Object.freeze({ helper, realpathDll, executable: input.bun.path, entry: input.entry, cwd: input.cwd,
-    writableRoots: Object.freeze([...new Set(input.writableRoots)]), readOnlyRoots: Object.freeze([...new Set(input.readOnlyRoots)]), protectedRoots: Object.freeze([...new Set(input.protectedRoots ?? [])]), profileDirectories: Object.freeze([...new Set(input.profileDirectories)]), env: Object.freeze(input.env) })
+    writableRoots: Object.freeze([...new Set(input.writableRoots)]), readOnlyRoots: compactReadOnlyGrantUnion(input.readOnlyRoots), protectedRoots: Object.freeze([...new Set(input.protectedRoots ?? [])]), profileDirectories: Object.freeze([...new Set(input.profileDirectories)]), env: Object.freeze(input.env) })
+  assert(plan.readOnlyRoots.length + plan.writableRoots.length <= 4096, 'execution_containment_anchor_budget')
   const broker = createWindowsNativeBroker(helper); broker.events.on('error', () => {})
   plans.add(plan); brokers.set(plan, broker); binaries.set(plan, Object.freeze(input.bun)); return plan
 }
@@ -97,8 +115,23 @@ export function ownerFilesystemForWindowsPlan(plan: WindowsLaunchPlan) {
   assert(plans.has(plan)); const broker = brokers.get(plan); assert(broker && !broker.ended(), 'execution_owner_unknown')
   return createWindowsOwnerFilesystem(request => broker.request(request.op, request), plan.profileDirectories)
 }
+/** Root composition calls this after native selected-profile validation and
+ * fence acquisition, before launch. The private plan/cache admits the exact
+ * managed config; scalar caller process/FileID/binding DTOs are never accepted. */
+export async function bindWindowsExecutionSelectedConfig(plan: WindowsLaunchPlan, profile: OwnedNativeProfile): Promise<void> {
+  assert(plans.has(plan) && !selectingConfigs.has(plan), 'execution_owner_unknown')
+  selectingConfigs.add(plan) // A mutation with unknown completion cannot replay.
+  const broker = brokers.get(plan); assert(broker && !broker.ended(), 'execution_owner_unknown')
+  await validateExecutionProfile(profile)
+  assert(plan.writableRoots.includes(profile.root) && plan.profileDirectories.includes(profile.root) &&
+    plan.profileDirectories.includes(profile.config.directory) && profile.config.directory === path.win32.join(profile.root, 'config', 'opencode'), 'execution_profile_changed')
+  const selected = row(await broker.request('ownerSelectConfig', { root: profile.root, databasePath: profile.databasePath, sha256: profile.config.sha256 }))
+  assert(selected.schema === 1 && selected.ok === true && typeof selected.selectionId === 'string' && /^[1-9]\d{0,19}$/.test(selected.selectionId) && selected.root === profile.root &&
+    selected.path === path.win32.join(profile.config.directory, 'opencode.json') && selected.sha256 === profile.config.sha256, 'execution_profile_changed')
+  selectedConfigs.set(plan, selected.selectionId)
+}
 export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, leaseOwnerId: string, bun: Readonly<{ path: string; sha256: string }>) {
-  assert(plans.has(plan) && equal(binaries.get(plan), bun) && /^[a-f0-9-]{36}$/.test(nonce) && /^[a-f0-9-]{36}$/.test(leaseOwnerId))
+  assert(plans.has(plan) && selectedConfigs.has(plan) && equal(binaries.get(plan), bun) && /^[a-f0-9-]{36}$/.test(nonce) && /^[a-f0-9-]{36}$/.test(leaseOwnerId))
   const broker = brokers.get(plan); assert(broker && !broker.ended())
   const child = new EventEmitter() as EventEmitter & { pid?: number }
   const http = createWindowsExecutionHttpClient(
@@ -145,7 +178,7 @@ export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, l
     } catch { child.emit('error', new Error('execution_invalid_response')) }
   })
   const launch = broker.request('launch', { executable: plan.executable, entry: plan.entry, cwd: plan.cwd, env: plan.env,
-    writableRoots: plan.writableRoots, readOnlyRoots: plan.readOnlyRoots, protectedRoots: plan.protectedRoots, realpathDll: plan.realpathDll, nonce, leaseOwnerId })
+    writableRoots: plan.writableRoots, readOnlyRoots: plan.readOnlyRoots, protectedRoots: plan.protectedRoots, realpathDll: plan.realpathDll, selectedConfigId: selectedConfigs.get(plan), nonce, leaseOwnerId })
   void launch.catch(connectedReject)
   async function bounded<T>(work: Promise<T>, deadline: number, signal?: AbortSignal): Promise<T> {
     signal?.throwIfAborted(); assert(deadline > Date.now(), 'execution_timeout')
@@ -186,7 +219,7 @@ export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, l
     retire(): Promise<WindowsKernelRetirement> {
       return retirement ??= (async () => {
         stopped = true; const observed = row(await launch), receipt = row(await broker!.request('retire'))
-        assert(mapping && equal(receipt.mapping, observed) && receipt.empty === true && receipt.activeProcesses === 0 && receipt.heldProcessExited === true && receipt.ownAcesRemoved === true, 'cleanup_unknown')
+        assert(mapping && equal(receipt.mapping, observed) && receipt.empty === true && receipt.activeProcesses === 0 && receipt.heldProcessExited === true && receipt.ownedPairClosed === true && receipt.ownAcesRemoved === true, 'cleanup_unknown')
         const value = Object.freeze({ pid: mapping.bun.hostPID, birth: mapping.bun.birth, mapping, scopeClosed: closed, activeProcesses: 0 as const, heldProcessExited: true as const, ownAcesRemoved: true as const })
         retirements.add(value); return value
       })()
