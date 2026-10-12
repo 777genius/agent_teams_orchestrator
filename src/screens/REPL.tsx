@@ -4220,6 +4220,7 @@ export function REPL({
     ))
     return (
       queryGuard.status === 'idle' &&
+      !focusedInputDialogRef.current &&
       !bootstrapAdmissionPendingRef.current &&
       getBlockingIncomingPromptQueueModes(commandQueueModes).length === 0
     )

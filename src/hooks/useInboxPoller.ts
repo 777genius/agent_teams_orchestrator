@@ -25,6 +25,7 @@ import { SEND_MESSAGE_TOOL_NAME } from '../tools/SendMessageTool/constants.js'
 import type { PermissionUpdate } from '../types/permissions.js'
 import { logForDebugging } from '../utils/debug.js'
 import { logError } from '../utils/log.js'
+import { shouldUseCodexProviderRoutingForCurrentProcess } from '../utils/auth.js'
 import {
   findInProcessTeammateTaskId,
   handlePlanApprovalResponse,
@@ -4249,8 +4250,7 @@ export function useInboxPoller({
             return
           }
           const provider: NativeAttachmentProvider =
-            process.env.CLAUDE_CODE_ENTRY_PROVIDER?.trim().toLowerCase() ===
-            'codex'
+            shouldUseCodexProviderRoutingForCurrentProcess()
               ? 'codex'
               : 'anthropic'
           promptContent = await prepareNativeAttachmentPromptContent({
