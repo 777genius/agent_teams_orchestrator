@@ -42,6 +42,53 @@ export function verifyBundledCompilerIdentity(sourceRoot: string, expected: Retu
   if (JSON.stringify(readBundledCompilerIdentity(sourceRoot)) !== JSON.stringify(expected) || JSON.stringify(reported) !== JSON.stringify(expected)) throw new Error('TEST compiler changed or child identity disagrees')
 }
 
+type BundleImportFailure = {
+  kind: string; name?: string; _tag?: string; message?: string; stack?: string;
+  value?: string | number | boolean | null; cause?: BundleImportFailure; error?: BundleImportFailure;
+  defect?: BundleImportFailure; reasons?: BundleImportFailure[]; truncated?: boolean; unavailableFields?: string[];
+}
+// Only TEST compile/import failures, never native/model/provider response data.
+export function describeBundleImportFailure(value: unknown): BundleImportFailure {
+  const seen = new WeakSet<object>()
+  let nodes = 0, fields = 0
+  const visit = (value: unknown, depth: number): BundleImportFailure => {
+    const kind = value === null ? 'null' : typeof value
+    if (++nodes > 16 || depth > 2) return { kind, truncated: true }
+    if (value === null) return { kind, value: null }
+    if (typeof value === 'string') return { kind, value: value.slice(0, 2048) }
+    if (typeof value === 'boolean') return { kind, value }
+    if (typeof value === 'number') return { kind, value: Number.isFinite(value) ? value : String(value) }
+    if (typeof value === 'bigint' || typeof value === 'symbol') return { kind, value: String(value).slice(0, 2048) }
+    if (typeof value !== 'object' && typeof value !== 'function') return { kind }
+    if (seen.has(value)) return { kind: 'circular' }
+    seen.add(value)
+    const result: BundleImportFailure = { kind }
+    const field = (key: string): unknown => {
+      if (++fields > 64) { result.truncated = true; return undefined }
+      try { return Reflect.get(value, key) }
+      catch { (result.unavailableFields ??= []).push(key); return undefined }
+    }
+    for (const [key, limit] of [['name', 128], ['_tag', 128], ['message', 2048], ['stack', 8192]] as const) {
+      const found = field(key)
+      if (typeof found === 'string') result[key] = found.slice(0, limit)
+    }
+    // Fixed fields preserve Error causes and Effect Fail(error)/Die(defect).
+    for (const key of ['cause', 'error', 'defect'] as const) {
+      const found = field(key)
+      if (found !== undefined) result[key] = visit(found, depth + 1)
+    }
+    const reasons = field('reasons')
+    try {
+      if (Array.isArray(reasons)) {
+        result.reasons = Array.prototype.slice.call(reasons, 0, 4).map(reason => visit(reason, depth + 1))
+        if (reasons.length > 4) result.truncated = true
+      }
+    } catch { (result.unavailableFields ??= []).push('reasons') }
+    return result
+  }
+  return visit(value, 0)
+}
+
 export async function stageBundledFixture(readonly: string): Promise<Artifact[]> {
   if (Bun.version !== '1.3.11' || process.platform !== 'win32') throw new Error('TEST bundle requires pinned Windows Bun')
   const buildDirectory = path.join(path.dirname(readonly), 'bundle-build')
@@ -357,7 +404,7 @@ async function buildOnly(generatedEntry: string, sourceRoot: string, output: str
       if (typeof loaded.runOfficialShellCheckpointBundled !== 'function' || typeof loaded.bundledLoggerBinding?.direct !== 'function' || loaded.bundledLoggerBinding.direct.Default === undefined) throw new Error('TEST full checkpoint/logger export absent')
       await writeFile(validationPath, JSON.stringify({ ...validation, phase: 'import-passed', passed: true, loggerBinding: { directExportRetained: true } }))
     } catch (error) {
-      await writeFile(validationPath, JSON.stringify({ ...validation, phase: 'import-failed', passed: false, error: error instanceof Error ? { name: error.name, message: error.message.slice(0, 2048), stack: error.stack?.slice(0, 8192) } : { name: 'NonError' } }))
+      await writeFile(validationPath, JSON.stringify({ ...validation, phase: 'import-failed', passed: false, error: describeBundleImportFailure(error) }))
       throw new Error('TEST full checkpoint import refused; retained evidence')
     }
     await writeFile(resultPath, JSON.stringify({ inputs: [...inputs].map(([file, bytes]) => ({ file, sha256: hash(bytes) })), transformations: [], nativeAssets, ptyAssets, assets, compiler, loggerBinding: { directExportRetained: true }, metafile: result.metafile }), { flag: 'wx' })
