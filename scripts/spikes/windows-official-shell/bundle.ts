@@ -42,6 +42,26 @@ export function verifyBundledCompilerIdentity(sourceRoot: string, expected: Retu
   if (JSON.stringify(readBundledCompilerIdentity(sourceRoot)) !== JSON.stringify(expected) || JSON.stringify(reported) !== JSON.stringify(expected)) throw new Error('TEST compiler changed or child identity disagrees')
 }
 
+export function resolveBundledJsoncEntry(importer: string, sourceRoot: string) {
+  const file = realpathSync(importer)
+  within(sourceRoot, file)
+  const importers = [
+    { file: path.join(sourceRoot, 'node_modules/@opencode/server-v2-floor/node_modules/@opencode/core/dist/chunks/aisdk-native-y9tfvs3x.js'), sha256: '589433c1718d8d2504d8bcbd2a0980b78b4ccf2a59f5590713ee62763f44c87d' },
+    { file: path.join(sourceRoot, 'node_modules/@opencode/core/dist/chunks/job-f09mb087.js'), sha256: '4e3afaa397c91d4a7792214df5b9851e94a335d0bcac9d867ec8ccc6e7ddcd1e' },
+  ]
+  const selected = importers.find(item => realpathSync(item.file) === file)
+  if (!selected || hash(readFileSync(file)) !== selected.sha256) throw new Error('TEST jsonc-parser importer differs from selected official config')
+  const manifest = realpathSync(Bun.resolveSync('jsonc-parser/package.json', path.dirname(file)))
+  within(sourceRoot, manifest)
+  const manifestBytes = readFileSync(manifest), metadata: unknown = JSON.parse(manifestBytes.toString('utf8'))
+  if (hash(manifestBytes) !== 'a7a9192caaac00d9330592f4fd572908bee037518128a0fc3db96d2cd652e2b5' || !metadata || typeof metadata !== 'object' || !('name' in metadata) || metadata.name !== 'jsonc-parser' || !('version' in metadata) || metadata.version !== '3.3.1' || !('main' in metadata) || metadata.main !== './lib/umd/main.js' || !('module' in metadata) || metadata.module !== './lib/esm/main.js') throw new Error('TEST jsonc-parser published module identity mismatch')
+  const root = path.dirname(manifest), entry = realpathSync(path.join(root, metadata.module)), original = realpathSync(path.join(root, metadata.main))
+  within(root, entry); within(root, original)
+  const entrySha256 = hash(readFileSync(entry)), originalSha256 = hash(readFileSync(original))
+  if (entrySha256 !== '72ff182105e158a1505ca3ecbf3f30359abb138a3980edaef1db7f4010ffb7dc' || originalSha256 !== '6dc132e2e792a9616688ff93d10dd671c1fbcfa3301d76bff3e81193d049337d') throw new Error('TEST jsonc-parser published entry bytes mismatch')
+  return { specifier: 'jsonc-parser', importer: file, importerSha256: selected.sha256, manifest, manifestSha256: hash(manifestBytes), original, originalSha256, entry, entrySha256 }
+}
+
 type BundleImportFailure = {
   kind: string; name?: string; _tag?: string; message?: string; stack?: string;
   value?: string | number | boolean | null; cause?: BundleImportFailure; error?: BundleImportFailure;
@@ -152,7 +172,7 @@ export async function stageBundledFixture(readonly: string): Promise<Artifact[]>
     await writeFile(path.join(buildDirectory, 'parent-result.json'), JSON.stringify({ phase: 'build-child-failed', code, signal: child.signalCode, fullTaskQualified: false }))
     throw new Error('TEST bundle child failed; retained build phase evidence')
   }
-  const result: { inputs: { file: string; sha256: string }[]; transformations: never[]; nativeAssets: { file: string; relative: string; sha256: string; manifest: string; manifestSha256: string; wrapper: string; wrapperSha256: string }[]; ptyAssets: { manifest: string; manifestSha256: string; terminal: string; terminalSha256: string; assets: { file: string; relative: string; sha256: string; wrapper: string; wrapperSha256: string }[] }; compiler: ReturnType<typeof readBundledCompilerIdentity>; assets: { path: string; sha256: string }[]; loggerBinding: { directExportRetained: boolean }, metafile: Metafile } = JSON.parse(await readFile(resultPath, 'utf8'))
+  const result: { inputs: { file: string; sha256: string }[]; transformations: never[]; resolutions: ReturnType<typeof resolveBundledJsoncEntry>[]; nativeAssets: { file: string; relative: string; sha256: string; manifest: string; manifestSha256: string; wrapper: string; wrapperSha256: string }[]; ptyAssets: { manifest: string; manifestSha256: string; terminal: string; terminalSha256: string; assets: { file: string; relative: string; sha256: string; wrapper: string; wrapperSha256: string }[] }; compiler: ReturnType<typeof readBundledCompilerIdentity>; assets: { path: string; sha256: string }[]; loggerBinding: { directExportRetained: boolean }, metafile: Metafile } = JSON.parse(await readFile(resultPath, 'utf8'))
   verifyBundledCompilerIdentity(sourceRoot, compilerBefore, result.compiler)
   for (const original of selectedSourcesBefore) if (hash(readFileSync(original.file)) !== original.sha256) throw new Error('TEST selected source changed during child build')
   const inputs = new Map<string, Buffer>()
@@ -164,6 +184,8 @@ export async function stageBundledFixture(readonly: string): Promise<Artifact[]>
   }
   if (hash(inputs.get(loggerSelection.path) ?? Buffer.alloc(0)) !== loggerSelection.sha256 || result.loggerBinding.directExportRetained !== true || hash(await readFile(loggerSelection.manifestPath)) !== loggerSelection.manifestSha256) throw new Error('TEST bundle logger retained source binding absent')
   if (result.transformations.length !== 0 || result.compiler.name !== 'esbuild' || result.compiler.version !== '0.28.2' || result.compiler.lockSha256 !== hash(await readFile(path.join(sourceRoot, 'bun.lock')))) throw new Error('TEST clean compiler custody mismatch')
+  if (result.resolutions.length !== 2 || new Set(result.resolutions.map(item => item.importer)).size !== 2) throw new Error('TEST jsonc-parser selected config resolutions incomplete')
+  for (const resolution of result.resolutions) if (JSON.stringify(resolveBundledJsoncEntry(resolution.importer, sourceRoot)) !== JSON.stringify(resolution) || hash(inputs.get(resolution.entry) ?? Buffer.alloc(0)) !== resolution.entrySha256) throw new Error('TEST jsonc-parser published selection custody changed')
   for (const asset of [...result.nativeAssets, ...result.ptyAssets.assets]) {
     if (hash(inputs.get(asset.file) ?? Buffer.alloc(0)) !== asset.sha256 || hash(Buffer.from(asset.wrapper)) !== asset.wrapperSha256 || !result.assets.some(output => output.path === asset.relative && output.sha256 === asset.sha256)) throw new Error('TEST relocated asset source/output custody mismatch')
   }
@@ -214,7 +236,7 @@ export async function stageBundledFixture(readonly: string): Promise<Artifact[]>
     if (hash(bytes) !== asset.sha256) throw new Error('TEST bundle emitted asset changed')
     await add(path.join(readonly, 'windows-official-shell', asset.path), bytes, true)
   }
-  await add(path.join(readonly, 'windows-official-shell', 'bundle-provenance.json'), Buffer.from(JSON.stringify({ purpose: 'TEST-bundled-Shell-only', fullTaskQualified: false, bun: Bun.version, compiler: result.compiler, platform: 'node', conditions: ['bun'], target: 'esnext', format: 'esm', splitting: false, effectEntry: within(sourceRoot, effectEntry), loggerSelection, loggerBinding: result.loggerBinding, selections, inputs: provenance, transformations: result.transformations, nativeAssets: result.nativeAssets, ptyAssets: result.ptyAssets, emittedAssets: result.assets, watcherDisabled: true, fffDisabled: true })), false)
+  await add(path.join(readonly, 'windows-official-shell', 'bundle-provenance.json'), Buffer.from(JSON.stringify({ purpose: 'TEST-bundled-Shell-only', fullTaskQualified: false, bun: Bun.version, compiler: result.compiler, platform: 'node', conditions: ['bun'], target: 'esnext', format: 'esm', splitting: false, effectEntry: within(sourceRoot, effectEntry), loggerSelection, loggerBinding: result.loggerBinding, selections, inputs: provenance, transformations: result.transformations, resolutions: result.resolutions, nativeAssets: result.nativeAssets, ptyAssets: result.ptyAssets, emittedAssets: result.assets, watcherDisabled: true, fffDisabled: true })), false)
   await add(path.join(readonly, 'windows-official-shell', 'bundle-metafile.json'), Buffer.from(JSON.stringify(result.metafile)), false)
   await writeFile(path.join(readonly, 'official-artifacts.json'), JSON.stringify(artifacts), { flag: 'wx' })
   return artifacts
@@ -351,10 +373,20 @@ async function buildOnly(generatedEntry: string, sourceRoot: string, output: str
       return undefined
     })
   } }
+  const resolutions: ReturnType<typeof resolveBundledJsoncEntry>[] = []
+  const jsonc: Plugin = { name: 'TEST-published-jsonc-parser-ESM-entry', setup(builder) {
+    builder.onResolve({ filter: /^jsonc-parser$/ }, args => {
+      if (args.kind !== 'import-statement') throw new Error('TEST jsonc-parser config import kind changed')
+      const selection = resolveBundledJsoncEntry(args.importer, sourceRoot)
+      resolutions.push(selection)
+      return { path: selection.entry }
+    })
+  } }
   stage('build-before-call')
   try {
-    const result = await build({ absWorkingDir: sourceRoot, entryPoints: [generatedEntry], outdir: directory, entryNames: 'checkpoint-bundled', assetNames: 'assets/[name]-[hash]', bundle: true, platform: 'node', conditions: ['bun'], target: 'esnext', format: 'esm', splitting: false, minify: false, write: false, metafile: true, logLevel: 'silent', loader: { '.wasm': 'file' }, plugins: [custody, native.plugin, pty.plugin], banner: { js: `${native.banner}\n${pty.banner}` } })
+    const result = await build({ absWorkingDir: sourceRoot, entryPoints: [generatedEntry], outdir: directory, entryNames: 'checkpoint-bundled', assetNames: 'assets/[name]-[hash]', bundle: true, platform: 'node', conditions: ['bun'], target: 'esnext', format: 'esm', splitting: false, minify: false, write: false, metafile: true, logLevel: 'silent', loader: { '.wasm': 'file' }, plugins: [custody, jsonc, native.plugin, pty.plugin], banner: { js: `${native.banner}\n${pty.banner}` } })
     stage('build-returned')
+    await save('build-package-resolutions.json', resolutions)
     await save('build-diagnostics.json', { warnings: result.warnings, errors: result.errors, outputs: result.outputFiles?.map(item => ({ path: item.path, bytes: item.contents.byteLength, sha256: hash(item.contents) })), fullTaskQualified: false })
     await save('build-metafile.json', result.metafile)
     if (!result.metafile || !result.outputFiles) throw new Error('TEST successful compiler result lacks outputs')
@@ -407,13 +439,14 @@ async function buildOnly(generatedEntry: string, sourceRoot: string, output: str
       await writeFile(validationPath, JSON.stringify({ ...validation, phase: 'import-failed', passed: false, error: describeBundleImportFailure(error) }))
       throw new Error('TEST full checkpoint import refused; retained evidence')
     }
-    await writeFile(resultPath, JSON.stringify({ inputs: [...inputs].map(([file, bytes]) => ({ file, sha256: hash(bytes) })), transformations: [], nativeAssets, ptyAssets, assets, compiler, loggerBinding: { directExportRetained: true }, metafile: result.metafile }), { flag: 'wx' })
+    await writeFile(resultPath, JSON.stringify({ inputs: [...inputs].map(([file, bytes]) => ({ file, sha256: hash(bytes) })), transformations: [], resolutions, nativeAssets, ptyAssets, assets, compiler, loggerBinding: { directExportRetained: true }, metafile: result.metafile }), { flag: 'wx' })
     stage('build-result-published')
   } catch (error) {
     if (error && typeof error === 'object' && 'errors' in error && 'warnings' in error) await save('build-failure-diagnostics.json', { errors: error.errors, warnings: error.warnings, fullTaskQualified: false })
     throw error
   } finally {
     native.verifyUnchanged(); pty.verifyUnchanged()
+    for (const resolution of resolutions) if (JSON.stringify(resolveBundledJsoncEntry(resolution.importer, sourceRoot)) !== JSON.stringify(resolution)) throw new Error('TEST published jsonc-parser resolution changed')
     const unchanged = [...inputs].every(([file, bytes]) => hash(readFileSync(file)) === hash(bytes)) && JSON.stringify(readBundledCompilerIdentity(sourceRoot)) === JSON.stringify(compiler)
     await save('build-unchanged.json', { unchanged, inputCount: inputs.size, fullTaskQualified: false })
     if (!unchanged) throw new Error('TEST final source/compiler custody changed')
