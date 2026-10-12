@@ -38,12 +38,14 @@ export function diagnoseWindowsRealpath(target: string) {
   const name = utf16(target)
   const handle = BigInt(kernel.symbols.CreateFileW(ptr(name), 0, 0, null, 3, 0x02000080, 0n))
   const opened = handle !== 0xffffffffffffffffn
-  const result: { opened: boolean; openError: number; closeError: number; names: { flags: number; error: number; characters: number; bounded: boolean; matchesTarget: boolean }[] } = {
+  const result: { opened: boolean; openError: number; closeError: number; names: { flags: number; error: number; characters: number; bounded: boolean; matchesTarget: boolean; normalizedNtName: boolean }[] } = {
     opened, openError: opened ? 0 : kernel.symbols.GetLastError(), closeError: 0, names: [],
   }
   if (!opened) return result
   try {
-    for (const flags of [0, 8]) {
+    // VOLUME_NAME_NT bypasses DOS volume lookup. This only diagnoses the
+    // primitive; it does not establish a trusted NT-to-DOS anchor mapping.
+    for (const flags of [0, 8, 2]) {
       const buffer = Buffer.alloc(32768 * 2)
       const characters = kernel.symbols.GetFinalPathNameByHandleW(handle, ptr(buffer), 32768, flags)
       const error = characters === 0 ? kernel.symbols.GetLastError() : 0
@@ -51,7 +53,8 @@ export function diagnoseWindowsRealpath(target: string) {
       const value = bounded ? buffer.subarray(0, characters * 2).toString('utf16le') : ''
       const withoutPrefix = value.startsWith('\\\\?\\') ? value.slice(4) : value
       result.names.push({ flags, error,
-        characters, bounded, matchesTarget: bounded && withoutPrefix.toLowerCase() === target.toLowerCase() })
+        characters, bounded, matchesTarget: bounded && withoutPrefix.toLowerCase() === target.toLowerCase(),
+        normalizedNtName: flags === 2 && bounded && value.startsWith('\\Device\\') })
     }
     return result
   } finally {
