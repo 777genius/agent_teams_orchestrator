@@ -21,6 +21,7 @@ const kernel = dlopen('kernel32.dll', {
   GetCurrentProcess: { args: [], returns: h },
   DuplicateHandle: { args: [h, h, h, p, d, b, d], returns: b },
   CreateFileW: { args: [p, d, d, p, d, d, h], returns: h },
+  GetFinalPathNameByHandleW: { args: [h, p, d, d], returns: d },
   CloseHandle: { args: [h], returns: b },
   GetLastError: { args: [], returns: d },
   lstrlenW: { args: [p], returns: FFIType.i32 },
@@ -32,6 +33,31 @@ const kernel = dlopen('kernel32.dll', {
   ReadFile: { args: [h, p, d, p, p], returns: b },
   WriteFile: { args: [h, p, d, p, p], returns: b },
 })
+/** TEST-only exact Windows libuv realpath primitive; never grants access. */
+export function diagnoseWindowsRealpath(target: string) {
+  const name = utf16(target)
+  const handle = BigInt(kernel.symbols.CreateFileW(ptr(name), 0, 0, null, 3, 0x02000080, 0n))
+  const opened = handle !== 0xffffffffffffffffn
+  const result: { opened: boolean; openError: number; closeError: number; names: { flags: number; error: number; characters: number; bounded: boolean; matchesTarget: boolean }[] } = {
+    opened, openError: opened ? 0 : kernel.symbols.GetLastError(), closeError: 0, names: [],
+  }
+  if (!opened) return result
+  try {
+    for (const flags of [0, 8]) {
+      const buffer = Buffer.alloc(32768 * 2)
+      const characters = kernel.symbols.GetFinalPathNameByHandleW(handle, ptr(buffer), 32768, flags)
+      const error = characters === 0 ? kernel.symbols.GetLastError() : 0
+      const bounded = characters > 0 && characters < 32768
+      const value = bounded ? buffer.subarray(0, characters * 2).toString('utf16le') : ''
+      const withoutPrefix = value.startsWith('\\\\?\\') ? value.slice(4) : value
+      result.names.push({ flags, error,
+        characters, bounded, matchesTarget: bounded && withoutPrefix.toLowerCase() === target.toLowerCase() })
+    }
+    return result
+  } finally {
+    if (!kernel.symbols.CloseHandle(handle)) result.closeError = kernel.symbols.GetLastError()
+  }
+}
 const security = dlopen('advapi32.dll', {
   ConvertStringSecurityDescriptorToSecurityDescriptorW: { args: [p, d, p, p], returns: b },
   ConvertStringSidToSidW: { args: [p, p], returns: b },

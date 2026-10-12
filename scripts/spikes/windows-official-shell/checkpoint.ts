@@ -1,8 +1,8 @@
 import path from 'node:path'
-import { readFile, realpath, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, realpath, stat, writeFile } from 'node:fs/promises'
 import { Context, Effect, Layer } from 'effect'
 import { commandLayer, type CommandReceipt } from './spawner.ts'
-import { attemptWindowsAclEscape } from '../opencode-v2-windows-native.ts'
+import { attemptWindowsAclEscape, diagnoseWindowsRealpath } from '../opencode-v2-windows-native.ts'
 
 // Resolve every internal module from its selected server, preserving floor's
 // physical dependency graph and the single pinned Effect identity.
@@ -36,6 +36,17 @@ export async function runOfficialShellCheckpoint(base: string, resolveGraph: typ
       const data = path.join(work, `data-${pin}`), cache = path.join(work, `cache-${pin}`)
       const globalPaths = { home: work, data, cache, config: path.join(work, `config-${pin}`), state: path.join(work, `state-${pin}`),
         tmp: path.join(work, `tmp-${pin}`), bin: path.join(cache, 'bin'), log: path.join(data, 'log'), repos: path.join(data, 'repos') }
+      const tempDiagnostic: Record<string, unknown> = {}
+      record.tempDiagnostic = tempDiagnostic
+      const fsCode = (error: unknown) => {
+        const code = (error as NodeJS.ErrnoException)?.code
+        return typeof code === 'string' && /^[A-Z][A-Z0-9_]{0,31}$/.test(code) ? code : 'unknown'
+      }
+      try { await mkdir(globalPaths.tmp, { recursive: true }); tempDiagnostic.mkdir = true }
+      catch (error) { tempDiagnostic.mkdirError = fsCode(error) }
+      try { const metadata = await stat(globalPaths.tmp); tempDiagnostic.stat = { directory: metadata.isDirectory(), dev: metadata.dev, ino: metadata.ino } }
+      catch (error) { tempDiagnostic.statError = fsCode(error) }
+      tempDiagnostic.nativeRealpath = diagnoseWindowsRealpath(globalPaths.tmp)
       const routes = official.routes.createRoutes({ database: { path: path.join(work, `official-${pin}.db`) }, config: { directory: globalPaths.config, project: false }, models: { fetch: false, snapshot: false }, fs: { filewatcher: false, fff: false }, events: { persist: false } }, () => [], [
         official.cross.node.replace(commandLayer(path.join(work, `stdio-${pin}`), receipts)),
         official.global.node.replace(official.global.layerWith(globalPaths)),
