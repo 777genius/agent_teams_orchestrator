@@ -236,7 +236,13 @@ export async function reserveRunControlDirectory(dataRoot: string, binding: RunB
   for (const part of ['opencode', 'v2', 'runs']) {
     parent = path.join(parent, part)
     await mkdir(parent, { mode: 0o700 }).catch((error: unknown) => { if (executionRecord(error).code !== 'EEXIST') throw error })
-    await privatePath(parent, 'directory', uid)
+    if (part === 'opencode') {
+      // V1's registry shares this ancestor and may create it as 0755. It holds
+      // no V2 secrets; its namespace must remain owned and non-writable to others.
+      const shared = await lstat(parent)
+      executionAssert(shared.isDirectory() && !shared.isSymbolicLink() && shared.uid === uid &&
+        (shared.mode & 0o022) === 0 && await realpath(parent) === parent, 'run_control_foreign')
+    } else await privatePath(parent, 'directory', uid)
   }
   await mkdir(directory, { mode: 0o700 })
   await writeRunControlFile(directory, 'start.json', { binding, sourceSha256 })

@@ -11,6 +11,27 @@ import { boundOpenCodeRead } from '../transport/OpenCodeBoundedFetch.js'
 const peer = fileURLToPath(new URL('./fixtures/OpenCodeV2RunControlPeer.ts', import.meta.url))
 const binding = { teamId: 'TEST-team', runId: 'TEST-run', controllerInstanceId: 'controller', ownerId: 'owner' }
 const execute = promisify(execFile)
+test.skipIf(process.platform === 'win32')('shared owned V1 ancestor permits private V2 runs but writable or symlink ancestors fail', async () => {
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'TEST-shared-opencode-')))
+  const ancestor = path.join(root, 'opencode')
+  try {
+    await mkdir(ancestor, { mode: 0o755 }); await chmod(ancestor, 0o755)
+    const directory = await reserveRunControlDirectory(root, binding, 'a'.repeat(64))
+    expect((await lstat(ancestor)).mode & 0o777).toBe(0o755)
+    for (const file of [path.join(ancestor, 'v2'), path.dirname(directory), directory]) {
+      expect((await lstat(file)).mode & 0o777).toBe(0o700)
+    }
+    expect((await lstat(path.join(directory, 'challenge'))).mode & 0o777).toBe(0o600)
+    await chmod(path.join(ancestor, 'v2'), 0o755)
+    await expect(reserveRunControlDirectory(root, { ...binding, runId: 'TEST-exposed-v2' }, 'a'.repeat(64))).rejects.toThrow('run_control_foreign')
+    await chmod(path.join(ancestor, 'v2'), 0o700)
+    await chmod(ancestor, 0o777)
+    await expect(reserveRunControlDirectory(root, { ...binding, runId: 'TEST-writable' }, 'a'.repeat(64))).rejects.toThrow('run_control_foreign')
+    await chmod(ancestor, 0o755); await rename(ancestor, path.join(root, 'original'))
+    await symlink(path.join(root, 'original'), ancestor)
+    await expect(reserveRunControlDirectory(root, { ...binding, runId: 'TEST-symlink' }, 'a'.repeat(64))).rejects.toThrow('run_control_foreign')
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
 function ready(child: ChildProcess): Promise<void> {
   return boundOpenCodeRead(new Promise<void>((resolve, reject) => {
     let output = '', stderr = ''
