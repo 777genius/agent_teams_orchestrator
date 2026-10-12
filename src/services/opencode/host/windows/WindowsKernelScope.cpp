@@ -148,10 +148,10 @@ static std::wstring extended(const std::wstring &value) {
           "execution_path_alias");
   return L"\\\\?\\" + value;
 }
-static std::wstring finalPath(HANDLE file) {
+static std::wstring finalPath(HANDLE file, DWORD volume = VOLUME_NAME_DOS) {
   std::vector<wchar_t> bytes(32768);
   DWORD count = GetFinalPathNameByHandleW(file, bytes.data(), static_cast<DWORD>(bytes.size()),
-                                          FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+                                          FILE_NAME_NORMALIZED | volume);
   require(count > 0 && count < bytes.size(), "execution_path_alias");
   return std::wstring(bytes.data(), count);
 }
@@ -258,6 +258,74 @@ static std::vector<Handle> ancestors(const std::wstring &path) {
       values.push_back(canonicalDirectory(path.substr(0, i)));
   return values;
 }
+// Physical admission is independent of owner-private ACL qualification: vendor
+// roots may be shared, but every retained component must remain the same object.
+static JsonObject anchorIdentity(HANDLE file) {
+  FILE_ID_INFO id{};
+  FILE_ATTRIBUTE_TAG_INFO tag{};
+  FILE_STANDARD_INFO standard{};
+  require(GetFileInformationByHandleEx(file, FileIdInfo, &id, sizeof(id)) &&
+              GetFileInformationByHandleEx(file, FileAttributeTagInfo, &tag, sizeof(tag)) &&
+              GetFileInformationByHandleEx(file, FileStandardInfo, &standard, sizeof(standard)) &&
+              standard.Directory && !(tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT),
+          "execution_path_alias");
+  static const wchar_t hex[] = L"0123456789abcdef";
+  std::wstring fileId;
+  for (BYTE byte : id.FileId.Identifier) {
+    fileId += hex[byte >> 4];
+    fileId += hex[byte & 15];
+  }
+  JsonObject value;
+  str(value, L"volumeSerial", decimal(id.VolumeSerialNumber));
+  str(value, L"fileId", fileId);
+  str(value, L"dosPath", finalPath(file));
+  auto nt = finalPath(file, VOLUME_NAME_NT);
+  require(nt.rfind(L"\\Device\\", 0) == 0, "execution_path_alias");
+  str(value, L"ntPath", nt);
+  return value;
+}
+struct RetainedAnchorComponent {
+  Handle handle;
+  std::wstring path;
+  JsonObject identity;
+  explicit RetainedAnchorComponent(Handle owned)
+      : handle(std::move(owned)), identity(anchorIdentity(handle.value)) {
+    auto dos = text(identity, L"dosPath");
+    require(dos.rfind(L"\\\\?\\", 0) == 0, "execution_path_alias");
+    path = dos.substr(4);
+  }
+  void assertLive() const {
+    require(anchorIdentity(handle.value).Stringify() == identity.Stringify(),
+            "execution_path_alias");
+    auto reopened = canonicalDirectory(path);
+    require(anchorIdentity(reopened.value).Stringify() == identity.Stringify(),
+            "execution_path_alias");
+  }
+};
+struct RetainedRealpathAnchor {
+  std::wstring kind, path;
+  std::vector<RetainedAnchorComponent> components;
+  RetainedRealpathAnchor(const std::wstring &root, const std::wstring &accessKind,
+                         std::vector<Handle> parents)
+      : kind(accessKind), path(root) {
+    for (auto &parent : parents)
+      components.emplace_back(std::move(parent));
+    components.emplace_back(canonicalDirectory(root));
+  }
+  void assertLive() const {
+    for (const auto &component : components)
+      component.assertLive();
+  }
+  JsonObject receipt() const {
+    require(!components.empty(), "execution_path_alias");
+    auto value = JsonObject::Parse(components.back().identity.Stringify());
+    // Child path mapping uses ordinary DOS syntax; its NT suffix retains case.
+    str(value, L"dosPath", components.back().path);
+    str(value, L"admittedPath", path);
+    str(value, L"kind", kind);
+    return value;
+  }
+};
 static std::string base64(const std::vector<BYTE> &bytes) {
   static const char *alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
   std::string out;
@@ -345,7 +413,9 @@ static Handle ownerDirectory(const std::wstring &path, bool create, const std::w
   require(createFile != nullptr, "execution_owner_unknown");
   LocalMemory descriptor;
   if (create) {
-    std::wstring sddl = L"O:" + owner + L"D:P(A;;FA;;;SY)(A;;FA;;;" + owner + L")";
+    // Newly created private directories preserve trusted owner access in child files.
+    // Existing project ACLs and explicit private record descriptors are unchanged.
+    std::wstring sddl = L"O:" + owner + L"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;" + owner + L")";
     require(ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1,
                                                                  &descriptor.value, nullptr) != 0,
             "execution_owner_unknown");
@@ -796,6 +866,12 @@ struct Scope {
   std::thread reader;
   std::mutex pipeMutex;
   std::vector<std::wstring> aclRoots;
+  std::vector<RetainedRealpathAnchor> realpathAnchors;
+  void assertRealpathAnchorsLive() const {
+    require(!stopping, "execution_identity_mismatch");
+    for (const auto &anchor : realpathAnchors)
+      anchor.assertLive();
+  }
   ~Scope() {
     stopping = true;
     if (cancel)
@@ -913,14 +989,16 @@ struct Scope {
         }
       }
     } catch (...) {
-      if (!stopping) {
-        JsonObject value;
-        str(value, L"code", L"execution_containment_pipe_denied");
-        event(L"failed", value);
-      }
+      // The same terminal event covers rejected frames and unexpected EOF.
     }
-    if (!stopping && job)
-      TerminateJobObject(job.value, 99);
+    if (!stopping) {
+      JsonObject value = JsonObject::Parse(mapping.Stringify());
+      str(value, L"code", L"execution_containment_pipe_denied");
+      num(value, L"clientPID", pid);
+      event(L"failed", value);
+      if (job)
+        TerminateJobObject(job.value, 99);
+    }
   }
   JsonObject retire() {
     stopping = true;
@@ -1014,6 +1092,10 @@ static std::unique_ptr<Scope> launch(const JsonObject &input, OwnerStore &owners
       require(value.ValueType() == JsonValueType::String, "execution_invalid_response");
       std::wstring root(value.GetString());
       auto checked = ancestors(root);
+      if (kind != std::wstring(L"protectedRoots"))
+        scope->realpathAnchors.emplace_back(
+            root, kind == std::wstring(L"writableRoots") ? L"writable" : L"readOnly",
+            std::move(checked));
       grantRoot(*scope, root,
                 kind == std::wstring(L"protectedRoots") ? FILE_ALL_ACCESS
                 : kind == std::wstring(L"writableRoots")
@@ -1104,6 +1186,22 @@ static std::unique_ptr<Scope> launch(const JsonObject &input, OwnerStore &owners
   str(mapping, L"leaseOwnerId", lease);
   str(mapping, L"namespace", L"windows-job:" + nonce);
   str(mapping, L"containerSid", sidString);
+  JsonObject anchors;
+  str(anchors, L"nonce", nonce);
+  str(anchors, L"receiptId", L"windows-anchors:" + decimal(GetCurrentProcessId()) + L":" +
+                                     decimal(scope->pid) + L":" +
+                                     text(birth(scope->process.value), L"value"));
+  JsonArray entries;
+  scope->assertRealpathAnchorsLive();
+  for (const auto &anchor : scope->realpathAnchors)
+    entries.Append(anchor.receipt());
+  anchors.SetNamedValue(L"anchors", entries);
+  mapping.SetNamedValue(L"realpathAnchors", anchors);
+  str(mapping, L"nonce", nonce);
+  // Bound the expanded launch/connected receipt before the child can run.
+  // Remaining response envelope is small and fixed; reserve a full KiB.
+  require(winrt::to_string(mapping.Stringify()).size() <= CONTROL_PACKET_LIMIT - 1024,
+          "execution_invalid_response");
   scope->mapping = mapping;
   scope->reader = std::thread([value = scope.get()] {
     winrt::init_apartment(winrt::apartment_type::multi_threaded);
@@ -1157,8 +1255,10 @@ int wmain(int argc, wchar_t **argv) {
           if (!process) {
             require(GetLastError() == ERROR_INVALID_PARAMETER, "execution_identity_unknown");
             flag(value, L"absent", true);
-          } else
+          } else {
             value = identity(process.value, static_cast<DWORD>(raw));
+            flag(value, L"exited", WaitForSingleObject(process.value, 0) == WAIT_OBJECT_0);
+          }
         } else if (operation == L"launch") {
           require(!scope, "execution_containment_unavailable");
           scope = launch(input, owners);
@@ -1175,6 +1275,7 @@ int wmain(int argc, wchar_t **argv) {
         } else if (operation == L"assertLive") {
           require(scope && !scope->stopping && !scope->exited() && scope->active() > 0,
                   "execution_identity_mismatch");
+          scope->assertRealpathAnchorsLive();
           value = scope->mapping;
         } else if (operation == L"retire") {
           require(static_cast<bool>(scope), "cleanup_unknown");
