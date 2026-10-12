@@ -132,9 +132,24 @@ try {
   $p=[System.Diagnostics.Process]::GetProcessById([int]$args[0])
   $handle=$p.Handle
   $birth=$p.StartTime.ToUniversalTime().Ticks.ToString()
-  $row=Get-CimInstance Win32_Process -Filter ('ProcessId='+$args[0])
+  # Query WMI directly without CimCmdlets autoimport, retaining the held handle.
+  [void][System.Reflection.Assembly]::Load('System.Management, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a')
+  $searcher=[System.Management.ManagementObjectSearcher]::new('SELECT ProcessId, ParentProcessId FROM Win32_Process WHERE ProcessId='+[int]$args[0])
+  $results=$null
+  $row=$null
+  try {
+    $results=$searcher.Get()
+    foreach ($entry in $results) {
+      try {
+        $row=@{ProcessId=$entry.GetPropertyValue('ProcessId');ParentProcessId=$entry.GetPropertyValue('ParentProcessId')}
+      } finally { $entry.Dispose() }
+    }
+  } finally {
+    if ($null -ne $results) { $results.Dispose() }
+    $searcher.Dispose()
+  }
   $observedPath=$p.MainModule.FileName
-  if ($null -eq $row -or $row.ParentProcessId -ne [int]$args[1] -or $observedPath -ne $args[2]) { throw ('owned_sidecar_identity_mismatch '+(@{pid=$p.Id;parentPid=$row.ParentProcessId;expectedParentPid=$args[1];path=$observedPath;expectedPath=$args[2]}|ConvertTo-Json -Compress)) }
+  if ($null -eq $row -or $row.ProcessId -ne $p.Id -or $row.ParentProcessId -ne [int]$args[1] -or $observedPath -ne $args[2]) { throw ('owned_sidecar_identity_mismatch '+(@{pid=$p.Id;parentPid=$row.ParentProcessId;expectedParentPid=$args[1];path=$observedPath;expectedPath=$args[2]}|ConvertTo-Json -Compress)) }
   $owned=$true
   [Console]::WriteLine(('READY '+(@{pid=$p.Id;birth=$birth;parentPid=$row.ParentProcessId}|ConvertTo-Json -Compress)))
   [Console]::Out.Flush()

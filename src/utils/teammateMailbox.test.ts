@@ -712,6 +712,31 @@ describe('teammateMailbox', () => {
     expect(protocolRow?.claimedBySessionId).toBeUndefined()
   })
 
+  it('claims native user JSON as ordinary content and retains session ownership until normal completion', async () => {
+    const nativeAttachmentDelivery = { version: 1 as const, recipientRuntimeInstanceId: 'runtime-1' }
+    for (const [index, text] of [idleNotification, structuredModeSetRequest].entries()) {
+      await writeToMailbox('team-lead', {
+        messageId: `native-json-${index}`, from: 'user', text,
+        timestamp: '2026-10-12T00:00:00Z', nativeAttachmentDelivery,
+      }, 'my-team')
+    }
+    const snapshot = await readAndClaimInteractiveMailboxSnapshot('team-lead', 'session-a', 'my-team')
+    expect(snapshot.protocolUnread).toEqual([])
+    expect(snapshot.regularClaimed).toHaveLength(2)
+    for (const row of snapshot.regularClaimed) {
+      expect(row.nativeAttachmentDelivery).toEqual(nativeAttachmentDelivery)
+      expect(isSilentRegularMailboxMessageForLiveContext(row)).toBe(false)
+      const mirror = { ...row, mailboxClaimedBySessionId: row.claimedBySessionId }
+      expect(isLiveInboxMirrorMessageOwnedBySession(mirror, 'session-a')).toBe(true)
+      expect(isLiveInboxMirrorMessageOwnedBySession(mirror, 'session-b')).toBe(false)
+    }
+    expect(await readUnreadMessages('team-lead', 'my-team')).toHaveLength(2)
+    await finalizeClaimedMessagesAsRead('team-lead', snapshot.regularClaimed.map(row => row.messageId), 'session-b', 'my-team')
+    expect(await readUnreadMessages('team-lead', 'my-team')).toHaveLength(2)
+    await finalizeClaimedMessagesAsRead('team-lead', snapshot.regularClaimed.map(row => row.messageId), 'session-a', 'my-team')
+    expect(await readUnreadMessages('team-lead', 'my-team')).toHaveLength(0)
+  })
+
   it('allows stale-claim takeover only after the configured timeout', async () => {
     await writeToMailbox(
       'team-lead',
@@ -1019,5 +1044,53 @@ describe('teammateMailbox', () => {
 
     const unread = await readUnreadMessages('team-lead', 'my-team')
     expect(unread.map(message => message.text)).toEqual(['second-message'])
+  })
+
+  it('deduplicates immutable attachment failures and rejects conflicting reuse', async () => {
+    const failure = {
+      messageId: 'native-attachment-failure-original-1',
+      from: 'native-member',
+      text: 'Native teammate attachment failure',
+      timestamp: '2026-01-08T00:00:00.000Z',
+      messageKind: 'agent_error' as const,
+      nativeAttachmentFailure: {
+        reasonCode: 'attachment_missing',
+        originalMessageId: 'original-1',
+      },
+    }
+    await Promise.all([
+      writeToMailboxVerified('user', failure, 'my-team', {
+        immutableAttachmentFailure: true,
+      }),
+      writeToMailboxVerified('user', failure, 'my-team', {
+        immutableAttachmentFailure: true,
+      }),
+    ])
+    expect(
+      (await readMailbox('user', 'my-team')).filter(
+        message => message.messageId === failure.messageId,
+      ),
+    ).toHaveLength(1)
+
+    await expect(
+      writeToMailboxVerified(
+        'user',
+        {
+          ...failure,
+          text: 'conflicting failure text',
+        },
+        'my-team',
+        { immutableAttachmentFailure: true },
+      ),
+    ).rejects.toThrow('ATTACHMENT_FAILURE_CONFLICTING_MESSAGE_ID: native-attachment-failure-original-1')
+    await expect(writeToMailboxVerified('user', {
+      ...failure,
+      nativeAttachmentFailure: { ...failure.nativeAttachmentFailure, originalMessageId: 'other-original' },
+    }, 'my-team', { immutableAttachmentFailure: true })).rejects.toThrow('ATTACHMENT_FAILURE_CONFLICTING_MESSAGE_ID')
+    expect(
+      (await readMailbox('user', 'my-team')).filter(
+        message => message.messageId === failure.messageId,
+      ),
+    ).toHaveLength(1)
   })
 })

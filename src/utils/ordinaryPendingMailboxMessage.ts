@@ -9,6 +9,12 @@ import {
   isMatchingWorkSyncContinuationTicket,
   readWorkSyncInboxContinuationTicket,
 } from './workSyncInboxTicket.js'
+import {
+  isNativeAttachmentMailboxMessage,
+  type NativeAttachmentMessageMetadata,
+  type NativeAttachmentDeliveryV1,
+  type NativeAttachmentMetaV1,
+} from './nativeTeammateAttachments.js'
 
 const BOOTSTRAP_MEMBER_BRIEFING_MARKER =
   'Your FIRST action: call MCP tool member_briefing'
@@ -26,6 +32,8 @@ export type OrdinaryPendingMailboxMessage = GroupMailboxEnvelope & {
   workSyncIntentId?: string
   workSyncAdmissionPayloadHash?: string
   workSyncControlRevision?: number
+  attachments?: readonly NativeAttachmentMetaV1[]
+  nativeAttachmentDelivery?: NativeAttachmentDeliveryV1
 }
 
 function isBootstrapMailboxInstructionText(text: string): boolean {
@@ -35,8 +43,8 @@ function isBootstrapMailboxInstructionText(text: string): boolean {
   )
 }
 
-function isRegularInteractiveMailboxMessage(message: GroupMailboxEnvelope & { text: string }): boolean {
-  if (hasGroupMailboxMarker(message)) return true
+function isRegularInteractiveMailboxMessage(message: GroupMailboxEnvelope & NativeAttachmentMessageMetadata & { text: string }): boolean {
+  if (isNativeAttachmentMailboxMessage(message) || hasGroupMailboxMarker(message)) return true
   try {
     const parsed: unknown = JSON.parse(message.text)
     if (!parsed || typeof parsed !== 'object' || !('type' in parsed)) {
