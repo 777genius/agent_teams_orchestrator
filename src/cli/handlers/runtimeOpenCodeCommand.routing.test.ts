@@ -91,20 +91,30 @@ test('selection cleanup refusal projects finite helper evidence without raw caus
     import assert from 'node:assert/strict'
     const {OpenCodeVersionProbeCleanupError}=await import(${JSON.stringify(probe)})
     const factory=await import(${JSON.stringify(factory)})
-    const helperFailure={operation:'tree',reason:'helper_nonzero',exitCode:7,elapsedMs:35}
+    const helperCause={stage:'process_lookup',category:'ArgumentException',hresult:-2147024809,nativeErrorCode:null}
+    const helperFailure={operation:'birth',reason:'helper_nonzero',exitCode:1,elapsedMs:35,
+      helperCause:{...helperCause,privatePath:'TEST-PRIVATE-HELPER'},privateStderr:'TEST-PRIVATE-STDERR'}
+    const terminalDiagnostic={phase:'candidate_validation',guard:'candidate_unknown',closed:true,ended:true,exitCode:0,
+      birthsCount:0,candidatesCount:1,pendingCount:0,lastGroupCount:1,lastSurvivorCount:null,remainingMs:7200}
+    let includeHelper=true
     mock.module(${JSON.stringify(factory)},()=>({...factory,inspectOpenCodeRuntimeAdapterSelection:async()=>{
-      throw new OpenCodeVersionProbeCleanupError(new Error('TEST-PRIVATE-PATH-AND-STDERR'),helperFailure)
+      throw new OpenCodeVersionProbeCleanupError(new Error('TEST-PRIVATE-PATH-AND-STDERR'),
+        includeHelper?helperFailure:null,{...terminalDiagnostic,privatePath:'TEST-PRIVATE-TERMINAL'})
     }}))
     const {executeSelectedOpenCodeBridgeCommandEnvelope:execute}=await import(${JSON.stringify(selected)})
     let legacyCalls=0
-    const result=await execute({schemaVersion:1,requestId:'TEST-diagnostic',command:'opencode.commandStatus',
-      cwd:'/TEST',startedAt:new Date().toISOString(),timeoutMs:30000,body:{originalRequestId:'absent'}},
-      async()=>{legacyCalls++;throw Error('TEST legacy forbidden')})
-    assert.equal(result.ok,false)
-    assert.deepEqual(result.error,{kind:'runtime_not_ready',message:'cleanup_unknown',retryable:false})
-    assert.deepEqual(result.diagnostics,[{code:'opencode_version_probe_helper_failed',...helperFailure}])
+    for(includeHelper of [true,false]) {
+      const result=await execute({schemaVersion:1,requestId:'TEST-diagnostic',command:'opencode.commandStatus',
+        cwd:'/TEST',startedAt:new Date().toISOString(),timeoutMs:30000,body:{originalRequestId:'absent'}},
+        async()=>{legacyCalls++;throw Error('TEST legacy forbidden')})
+      assert.equal(result.ok,false)
+      assert.deepEqual(result.error,{kind:'runtime_not_ready',message:'cleanup_unknown',retryable:false})
+      assert.deepEqual(result.diagnostics,[...(includeHelper?[{code:'opencode_version_probe_helper_failed',evidence:'last_observed',
+        operation:'birth',reason:'helper_nonzero',exitCode:1,elapsedMs:35,helperCause}]:[]),
+        {code:'opencode_version_probe_cleanup_unknown',...terminalDiagnostic}])
+      assert(!JSON.stringify(result).includes('TEST-PRIVATE'))
+    }
     assert.equal(legacyCalls,0)
-    assert(!JSON.stringify(result).includes('TEST-PRIVATE'))
     console.log('TEST finite cleanup refusal diagnostic qualified')
   `
   const child=Bun.spawn([process.execPath,'-e',script],{cwd:import.meta.dir,stdout:'pipe',stderr:'pipe'})

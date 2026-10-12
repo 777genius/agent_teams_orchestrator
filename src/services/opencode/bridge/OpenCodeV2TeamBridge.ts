@@ -543,8 +543,24 @@ export async function executeSelectedOpenCodeBridgeCommandEnvelope(input: unknow
   try { selection = await inspectOpenCodeRuntimeAdapterSelection() }
   catch (error) {
     const result = refusal(envelope, Date.now(), error instanceof Error ? error.message : 'selection_unavailable')
-    return error instanceof OpenCodeVersionProbeCleanupError && error.helperFailure
-      ? { ...result, diagnostics: [{ code: 'opencode_version_probe_helper_failed', ...error.helperFailure }] } : result
+    if (!(error instanceof OpenCodeVersionProbeCleanupError)) return result
+    const helper = error.helperFailure, terminal = error.terminalDiagnostic
+    const diagnostics = []
+    if (helper) diagnostics.push({
+      code: 'opencode_version_probe_helper_failed', evidence: 'last_observed',
+      operation: helper.operation, reason: helper.reason, exitCode: helper.exitCode, elapsedMs: helper.elapsedMs,
+      ...(helper.helperCause ? { helperCause: {
+        stage: helper.helperCause.stage, category: helper.helperCause.category,
+        hresult: helper.helperCause.hresult, nativeErrorCode: helper.helperCause.nativeErrorCode,
+      } } : {}),
+    })
+    if (terminal) diagnostics.push({
+      code: 'opencode_version_probe_cleanup_unknown', phase: terminal.phase, guard: terminal.guard,
+      closed: terminal.closed, ended: terminal.ended, exitCode: terminal.exitCode,
+      birthsCount: terminal.birthsCount, candidatesCount: terminal.candidatesCount, pendingCount: terminal.pendingCount,
+      lastGroupCount: terminal.lastGroupCount, lastSurvivorCount: terminal.lastSurvivorCount, remainingMs: terminal.remainingMs,
+    })
+    return diagnostics.length ? { ...result, diagnostics } : result
   }
   const selected = selectOpenCodeRuntimeAdapter(selection.policy, {
     v1: () => () => executeV1(input),
