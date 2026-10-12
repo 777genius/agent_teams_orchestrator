@@ -10,24 +10,44 @@ function assert(value: unknown, code: string): asserts value { if (!value) throw
 export type WindowsNativeArtifact = Readonly<{ path: string; sha256: string; arch: 'x64' | 'arm64' }>
 const artifacts = new WeakSet<WindowsNativeArtifact>()
 const CONTROL_PACKET_LIMIT = 16 * 1024 * 1024
-const hash = async (file: string) => createHash('sha256').update(await readFile(file)).digest('hex')
-/** One sealed native producer artifact. End users never compile or download it. */
-export async function resolveWindowsNativeArtifact(): Promise<WindowsNativeArtifact> {
+/** Resolve only producer-selected assets from the installed architecture directory. */
+async function resolveWindowsProducerAsset(name: string, manifestName: string, dll: boolean): Promise<WindowsNativeArtifact> {
   assert(process.platform === 'win32' && ['x64', 'arm64'].includes(process.arch), 'execution_containment_platform_pending')
   const location = fileURLToPath(import.meta.url)
   assert(!location.includes('$bunfs') && !location.includes('~BUN'), 'v2_compiled_runtime_unsupported')
   const marker = `${path.sep}src${path.sep}`
   const root = location.includes(marker) ? location.slice(0, location.lastIndexOf(marker)) : path.dirname(location)
   const directory = path.join(await realpath(root), 'native', `win32-${process.arch}`)
-  const executable = path.join(directory, 'opencode-v2-windows-helper.exe')
-  const manifest: unknown = JSON.parse(await readFile(path.join(directory, 'windows-helper.json'), 'utf8'))
+  assert(await realpath(directory) === directory, 'execution_containment_helper_identity')
+  const executable = path.join(directory, name)
+  const manifest: unknown = JSON.parse(await readFile(path.join(directory, manifestName), 'utf8'))
   assert(manifest && typeof manifest === 'object' && !Array.isArray(manifest), 'execution_containment_helper_identity')
   const value = manifest as Record<string, unknown>
-  assert(value.format === 1 && value.platform === 'win32' && value.arch === process.arch && value.name === 'opencode-v2-windows-helper.exe' && typeof value.sha256 === 'string' && /^[a-f0-9]{64}$/.test(value.sha256), 'execution_containment_helper_identity')
+  assert(value.format === 1 && value.platform === 'win32' && value.arch === process.arch && value.name === name && typeof value.sha256 === 'string' && /^[a-f0-9]{64}$/.test(value.sha256), 'execution_containment_helper_identity')
   const info = await lstat(executable)
-  assert(info.isFile() && !info.isSymbolicLink() && info.nlink === 1 && await realpath(executable) === executable && await hash(executable) === value.sha256, 'execution_containment_helper_identity')
-  const artifact = Object.freeze({ path: executable, sha256: value.sha256, arch: process.arch as 'x64' | 'arm64' })
+  assert(info.isFile() && !info.isSymbolicLink() && info.nlink === 1 && await realpath(executable) === executable, 'execution_containment_helper_identity')
+  const bytes = await readFile(executable)
+  assert(createHash('sha256').update(bytes).digest('hex') === value.sha256 && bytes.length >= 64 && bytes.readUInt16LE(0) === 0x5a4d, 'execution_containment_helper_identity')
+  const pe = bytes.readUInt32LE(0x3c)
+  assert(pe >= 64 && pe <= bytes.length - 24 && bytes.readUInt32LE(pe) === 0x00004550 &&
+    bytes.readUInt16LE(pe + 4) === (process.arch === 'x64' ? 0x8664 : 0xaa64) &&
+    ((bytes.readUInt16LE(pe + 22) & 0x2000) !== 0) === dll, 'execution_containment_helper_identity')
+  return Object.freeze({ path: executable, sha256: value.sha256, arch: process.arch as 'x64' | 'arm64' })
+}
+/** Helper-only owner and spike paths never require the realpath DLL. */
+export async function resolveWindowsNativeArtifact(): Promise<WindowsNativeArtifact> {
+  const artifact = await resolveWindowsProducerAsset('opencode-v2-windows-helper.exe', 'windows-helper.json', false)
   artifacts.add(artifact); return artifact
+}
+export type WindowsRealpathArtifact = WindowsNativeArtifact
+const realpathArtifacts = new WeakSet<WindowsRealpathArtifact>()
+/** Production composition must additionally bind this selection to its native held DLL identity. */
+export async function resolveWindowsRealpathArtifact(): Promise<WindowsRealpathArtifact> {
+  const artifact = await resolveWindowsProducerAsset('opencode-v2-windows-realpath.dll', 'windows-realpath.json', true)
+  realpathArtifacts.add(artifact); return artifact
+}
+export function requireWindowsRealpathArtifact(artifact: WindowsRealpathArtifact): void {
+  assert(realpathArtifacts.has(artifact), 'execution_containment_helper_identity')
 }
 export type WindowsNativeBroker = Readonly<{
   events: EventEmitter; request(operation: string, input?: Readonly<Record<string, unknown>>, deadline?: number, signal?: AbortSignal): Promise<unknown>

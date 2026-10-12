@@ -7,6 +7,7 @@ import { verifyOpenCodePackage, verifyOpenCodeV2ServerGraph } from '../OpenCodeV
 import type { ServerOptions as FloorOptions } from '@opencode/server-v2-floor/options'
 import type { ServerOptions as CurrentOptions } from '@opencode/server/options'
 import { isWindowsCommandPort, type WindowsCommandPort } from './OpenCodeV2WindowsCommand.js'
+import type { OwnedNativeProfile } from '../OpenCodeV2ExecutionBinding.js'
 
 function requireValue(value: unknown): asserts value {
   if (!value) throw new Error('execution_windows_runtime_invalid')
@@ -18,11 +19,21 @@ const CONTROL_ENV = /^OPENCODE_V2_/i
  * Does not open Windows admission or imply parent loopback reachability.
  * Environment comes from the private child composition, not an ambient merge. */
 export async function loadOpenCodeV2WindowsRuntime(pin: OpenCodeV2Pin, expectedModuleSha256: string,
-  commands: WindowsCommandPort, environment: Readonly<Record<string, string>>) {
+  commands: WindowsCommandPort, profile: OwnedNativeProfile) {
   requireValue(process.platform === 'win32' && process.versions.bun === '1.3.11')
   requireValue(pin === '2.0.0' || pin === '2.0.21')
   requireValue(isWindowsCommandPort(commands))
-  const trustedEnvironment = Object.freeze({ ...environment })
+  const trustedEnvironment = Object.freeze({ ...profile.env })
+  const databasePath = profile.databasePath, configDirectory = profile.config.directory
+  const data = path.dirname(databasePath), cache = path.join(trustedEnvironment.XDG_CACHE_HOME!, 'opencode')
+  const globalPaths = Object.freeze({ home: trustedEnvironment.HOME!, data, cache, config: configDirectory,
+    state: path.join(trustedEnvironment.XDG_STATE_HOME!, 'opencode'), tmp: trustedEnvironment.TMPDIR!,
+    bin: path.join(cache, 'bin'), log: path.join(data, 'log'), repos: path.join(data, 'repos') })
+  requireValue(path.isAbsolute(profile.root) && Object.values(globalPaths).every(value => {
+    if (typeof value !== 'string' || !path.isAbsolute(value)) return false
+    const relative = path.relative(profile.root, value)
+    return relative !== '' && relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)
+  }) && trustedEnvironment.TEMP === globalPaths.tmp && trustedEnvironment.TMP === globalPaths.tmp)
   const graph = await verifyOpenCodeV2ServerGraph(pin)
   requireValue(graph.moduleSha256 === expectedModuleSha256)
   const directory = path.dirname(graph.modulePath)
@@ -39,6 +50,7 @@ export async function loadOpenCodeV2WindowsRuntime(pin: OpenCodeV2Pin, expectedM
   const routes = await load<typeof import('@opencode/server/routes')>('@opencode/server/routes', '@opencode/server', pin)
   const cross = await load<typeof import('@opencode/util/cross-spawn-spawner')>(
     '@opencode/util/cross-spawn-spawner', '@opencode/util', pin)
+  const global = await load<typeof import('@opencode/util/global')>('@opencode/util/global', '@opencode/util', pin)
   const http = await load<typeof import('@effect/platform-node/NodeHttpServer')>(
     '@effect/platform-node/NodeHttpServer', '@effect/platform-node', '4.0.0-rc.112')
   const { Effect, Layer, PlatformError, Stream, Sink, Scope, Exit, Context } = effect
@@ -182,8 +194,10 @@ export async function loadOpenCodeV2WindowsRuntime(pin: OpenCodeV2Pin, expectedM
     })
   }))
   function createRoutes(options: FloorOptions & CurrentOptions, urls: () => readonly string[]) {
-    requireValue(typeof options.password === 'string' && options.password.length === 43 && !options.simulation)
-    return routes.createRoutes(options, urls, [cross.node.replace(Layer.succeed(spawn.ChildProcessSpawner, spawner))])
+    requireValue(typeof options.password === 'string' && options.password.length === 43 && !options.simulation &&
+      options.database?.path === databasePath && options.config?.directory === configDirectory)
+    return routes.createRoutes(options, urls, [cross.node.replace(Layer.succeed(spawn.ChildProcessSpawner, spawner)),
+      global.node.replace(global.layerWith(globalPaths))])
   }
   async function start(options: FloorOptions & CurrentOptions, signal?: AbortSignal) {
     requireValue(typeof options.password === 'string' && options.password.length === 43 && !options.simulation)

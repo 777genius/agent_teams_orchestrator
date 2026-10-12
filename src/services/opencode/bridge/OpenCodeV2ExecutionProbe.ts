@@ -8,15 +8,20 @@ import { collectProjectBehaviorMetadata } from '../OpenCodeProfileManager.js'
 import { executionAssert, executionHash, executionRecord } from '../execution/OpenCodeV2ExecutionContracts.js'
 import { buildOpenCodeV2InternalRunPlan, type inspectOpenCodeV2SourceAvailability } from './OpenCodeV2LaunchPlan.js'
 import { launchExplicitOpenCodeV2Run } from './OpenCodeV2RunOwner.js'
-import { OPEN_CODE_V2_RUN_INITIALIZATION_MS, discoverOpenCodeV2Run, awaitOpenCodeV2RunMemberReadiness, requestOpenCodeV2Run, parseRunControlRequest } from './OpenCodeV2RunControl.js'
+import { OPEN_CODE_V2_RUN_INITIALIZATION_MS, discoverOpenCodeV2Run, awaitOpenCodeV2RunMemberReadiness, requestOpenCodeV2Run, parseRunControlRequest, isTransientOpenCodeV2ControlRead } from './OpenCodeV2RunControl.js'
 import type { OpenCodeExecutionProof } from '../types.js'
 import type { BridgeEnvelope } from './OpenCodeBridgeProtocol.js'
-import type { RunBinding } from './OpenCodeV2RunTypes.js'
+import type { RunBinding, RunProbeFailure } from './OpenCodeV2RunTypes.js'
 import type { QueueIntent } from '../execution/OpenCodeV2AdmissionService.js'
 
 type Selection = Awaited<ReturnType<typeof inspectOpenCodeV2SourceAvailability>>
 type ProbeRecord = { sourceKey: string; binding: RunBinding; sessionID: string; intent: QueueIntent;
-  submitted: boolean; proof: OpenCodeExecutionProof | null; retired: boolean }
+  submitted: boolean; proof: OpenCodeExecutionProof | null; retired: boolean; failure: RunProbeFailure | null }
+function parseProbeFailure(value: unknown): RunProbeFailure | null {
+  if (value === null || value === undefined) return null // Existing records predate this field.
+  executionAssert(value === 'native_execution_failed' || value === 'native_execution_cancelled', 'probe_failure_invalid')
+  return value
+}
 async function privateDirectory(root: string) {
   await mkdir(root, { recursive: true, mode: 0o700 })
   const stat = await lstat(root)
@@ -34,8 +39,10 @@ function parseRecord(value: unknown): ProbeRecord {
   executionAssert(request.operation === 'send', 'probe_store_invalid')
   const proof = row.proof === null ? null : parseOpenCodeExecutionProof(row.proof)
   executionAssert(row.proof === null || proof, 'probe_store_invalid')
+  const failure = parseProbeFailure(row.failure)
+  executionAssert(!failure || row.submitted === true && !proof, 'probe_store_invalid')
   return { sourceKey: row.sourceKey, binding: typedBinding, sessionID: row.sessionID,
-    submitted: row.submitted, retired: row.retired, intent: request.intent, proof }
+    submitted: row.submitted, retired: row.retired, intent: request.intent, proof, failure }
 }
 
 /** Normal readiness protocol. The cached proof is a result of this owned producer,
@@ -78,6 +85,8 @@ export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, 
       record.proof.binaryPath === selection.native.executablePath && record.proof.projectBehaviorFingerprint === behavior.projectBehaviorFingerprint, 'probe_cached_target_changed')
     if (record?.proof && record.retired && Date.parse(record.proof.expiresAt) > Date.now())
       return { state: 'available' as const, proof: record.proof, reason: null }
+    if (record?.failure && (record.retired || !run)) return { state: 'failed' as const, proof: null,
+      reason: record.retired ? record.failure : `${record.failure}; probe_physical_cleanup_unknown` }
     // A retained unresolved attempt never allocates another session or input.
     if (!run) return { state: 'pending' as const, proof: null, reason: record ? 'Original native execution proof is pending or expired.' : 'Selected-model execution proof was not requested.' }
     if (record?.retired && !record.proof) return { state: 'pending' as const, proof: null, reason: 'Original native probe was retired without qualifying terminal evidence.' }
@@ -104,13 +113,35 @@ export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, 
         members: [{ name: 'probe', prompt: 'Execute the single selected-model readiness prompt. Do not call controller tools.' }] },
         randomUUID(), { intent, expectedText, unattendedTeam })
       const member = plan.members[0]; executionAssert(member, 'probe_plan_invalid')
-      record = { sourceKey, binding: plan.binding, sessionID: member.originalSessionId, intent, submitted: false, proof: null, retired: false }
+      record = { sourceKey, binding: plan.binding, sessionID: member.originalSessionId, intent, submitted: false, proof: null, retired: false, failure: null }
       await save(record) // Original identities precede launch and every prompt effect.
       await launchExplicitOpenCodeV2Run(plan)
     }
     const owner = await discoverOpenCodeV2Run(dataRoot, record.binding.teamId, record.binding.runId)
-    if (!owner) return { state: 'pending' as const, proof: null, reason: 'Original native owner is unavailable; no replay is authorized.' }
+    if (!owner) return { state: record.failure ? 'failed' as const : 'pending' as const, proof: null,
+      reason: record.failure ? `${record.failure}; probe_physical_cleanup_unknown` : 'Original native owner is unavailable; no replay is authorized.' }
     executionAssert(executionHash(owner.binding) === executionHash(record.binding), 'probe_original_owner_changed')
+    const retire = async () => {
+      const stopped = await requestOpenCodeV2Run(owner, { operation: 'stop' }, 30_000)
+      executionAssert(stopped.kind === 'stop' && stopped.state === 'stopped' && stopped.ownerRetired === true &&
+        stopped.members.length === 1 && stopped.members[0]?.memberId === 'probe' &&
+        stopped.members[0].cleanup !== null && stopped.members[0].errors.length === 0, 'probe_physical_cleanup_unknown')
+    }
+    const finishFailure = async (original: ProbeRecord) => {
+      executionAssert(original.failure && original.submitted && !original.proof, 'probe_store_invalid')
+      try { await retire() }
+      catch (error) {
+        // Only known bounded stop uncertainty is reported as cleanup unknown.
+        // Foreign/framing/identity faults and unexpected errors still propagate.
+        if (!isTransientOpenCodeV2ControlRead(error) && !(error instanceof Error &&
+          ['probe_physical_cleanup_unknown', 'run_deadline_expired', 'run_operation_unknown'].includes(error.message))) throw error
+        return { state: 'failed' as const, proof: null, reason: `${original.failure}; probe_physical_cleanup_unknown` }
+      }
+      original.retired = true; await save(original)
+      return { state: 'failed' as const, proof: null, reason: original.failure }
+    }
+    // Retry only the original stop/readback after a persisted failure, never send.
+    if (record.failure) return await finishFailure(record)
     const deadline = Date.now() + Math.max(1, Math.min(envelope.timeoutMs || 120_000, 300_000) - 25_000)
     if (!record.submitted) {
       const ready = await awaitOpenCodeV2RunMemberReadiness(owner, { memberId: 'probe', originalSessionId: record.sessionID,
@@ -123,11 +154,15 @@ export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, 
     while (Date.now() < deadline) {
       const observed = await requestOpenCodeV2Run(owner, { operation: 'probeEvidence', memberId: 'probe', originalSessionId: record.sessionID }, Math.min(10_000, deadline - Date.now()))
       executionAssert(observed.kind === 'probeEvidence', 'probe_observation_unknown')
+      const failure = parseProbeFailure(observed.failure)
+      executionAssert(!failure || !observed.proof, 'probe_observation_unknown')
+      if (failure) {
+        executionAssert(record.proof === null, 'probe_observation_unknown')
+        record.failure = failure; await save(record) // Failure precedes every stop effect.
+        return await finishFailure(record)
+      }
       if (observed.proof) {
-        const stopped = await requestOpenCodeV2Run(owner, { operation: 'stop' }, 30_000)
-        executionAssert(stopped.kind === 'stop' && stopped.state === 'stopped' && stopped.ownerRetired === true &&
-          stopped.members.length === 1 && stopped.members[0]?.memberId === 'probe' &&
-          stopped.members[0].cleanup !== null && stopped.members[0].errors.length === 0, 'probe_physical_cleanup_unknown')
+        await retire()
         record.proof = observed.proof; record.retired = true; await save(record)
         return { state: 'available' as const, proof: record.proof, reason: null }
       }

@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises'
+import { realpathSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -18,10 +19,12 @@ import type {
 } from '../../../../services/opencode/OpenCodeHostManager.js'
 import type { ProviderManagementError, ProviderManagementResult } from '../../domain/types.js'
 
+const testBinaryPath = realpathSync(process.execPath)
+
 function inventory(overrides: Partial<OpenCodeInventorySnapshot> = {}): OpenCodeInventorySnapshot {
   return {
     detected: true,
-    binaryPath: '/opt/homebrew/bin/opencode',
+    binaryPath: testBinaryPath,
     version: '1.14.19',
     projectPath: '/tmp/project',
     profile: {
@@ -98,7 +101,7 @@ function authStore() {
 
 function catalogIdentityDependencies() {
   return {
-    resolveBinaryPath: () => '/opt/homebrew/bin/opencode',
+    resolveBinaryPath: () => testBinaryPath,
     resolveBinaryIdentity: async () => 'test-binary-identity',
     profileManager: {
       listManagedAuthPaths: async () => [],
@@ -7893,7 +7896,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
     })
     const adapter = new OpenCodeProviderManagementAdapter({
       catalogTimeoutMs: 500,
-      resolveBinaryPath: () => '/opt/homebrew/bin/opencode',
+      resolveBinaryPath: () => testBinaryPath,
       resolveBinaryIdentity: async () => 'binary-a',
       profileManager: {
         listManagedAuthPaths: async () => [],
@@ -7974,7 +7977,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
       catalogTimeoutMs: 500,
       catalogOverallTimeoutMs: 500,
       inventoryTimeoutMs: 5_000,
-      resolveBinaryPath: () => '/opt/homebrew/bin/opencode',
+      resolveBinaryPath: () => testBinaryPath,
       resolveBinaryIdentity: async () => 'binary-a',
       profileManager: {
         listManagedAuthPaths: async () => [],
@@ -8034,7 +8037,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
         catalogTimeoutMs: phaseCase === 'overall rejects late publication' ? 500 : 20,
         catalogInstanceTimeoutMs: phaseCase === 'instance is bounded' ? 20 : 500,
         catalogOverallTimeoutMs: phaseCase === 'host is bounded' || phaseCase === 'overall rejects late publication' ? 50 : 500,
-        resolveBinaryPath: () => '/opt/homebrew/bin/opencode',
+        resolveBinaryPath: () => testBinaryPath,
         resolveBinaryIdentity: async () => 'test-binary',
         profileManager: {
           listManagedAuthPaths: async () => [],
@@ -8134,7 +8137,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
     }>(resolve => { resolveSlow = resolve })
     const adapter = new OpenCodeProviderManagementAdapter({
       catalogTimeoutMs: 500,
-      resolveBinaryPath: () => '/opt/homebrew/bin/opencode',
+      resolveBinaryPath: () => testBinaryPath,
       resolveBinaryIdentity: async () => 'binary-a',
       profileManager: {
         listManagedAuthPaths: async () => [],
@@ -8203,7 +8206,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
     })
     const adapter = new OpenCodeProviderManagementAdapter({
       catalogTimeoutMs: 200,
-      resolveBinaryPath: () => '/opt/homebrew/bin/opencode',
+      resolveBinaryPath: () => testBinaryPath,
       resolveBinaryIdentity: async () => binaryFingerprint,
       profileManager: {
         listManagedAuthPaths: async () => [],
@@ -8317,13 +8320,60 @@ describe('OpenCodeProviderManagementAdapter', () => {
     }
   })
 
+  test('accepts the canonical inventory binary for a real selected symlink and rejects retargeting', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'TEST-opencode-catalog-symlink-'))
+    const target = path.join(root, 'opencode-v1')
+    const other = path.join(root, 'other-binary')
+    const selected = path.join(root, 'opencode')
+    await writeFile(target, 'TEST V1 binary identity')
+    await writeFile(other, 'TEST replacement binary identity')
+    await symlink(target, selected)
+    const canonical = await realpath(selected)
+    let providerCalls = 0
+    const adapter = new OpenCodeProviderManagementAdapter({
+      profileManager: {
+        listManagedAuthPaths: async () => [],
+        readCatalogSelectedAuthIdentity: async () => ({
+          source: 'absent', managed: 'absent', preferences: 'known:test-preferences',
+        }),
+      },
+      resolveBinaryPath: () => selected,
+      resolveBinaryIdentity: undefined,
+      inventoryService: { probe: async () => inventory({ binaryPath: canonical, models: [], availableProviders: [] }) },
+      hostManager: { ensureHost: async () => host(), releaseHost: async () => {} },
+      clientFactory: { create: () => ({
+        getConfigProviders: async () => ({ providers: [], default: {} }),
+        getProviders: async () => {
+          providerCalls += 1
+          return { all: [{ id: 'local', name: 'Local', models: { model: {} } }], connected: [], default: {} }
+        },
+        getProviderAuth: async () => ({}),
+      }) },
+    })
+    const input = { runtimeId: 'opencode' as const, providerId: 'local', projectPath: root }
+    try {
+      const first = await adapter.loadModels(input)
+      expect(first.ok).toBe(true)
+      expect(providerCalls).toBe(1)
+      await rm(selected)
+      await symlink(other, selected)
+      expect((await adapter.loadModels(input)).ok).toBe(false)
+      expect(providerCalls).toBe(1)
+      await rm(other)
+      expect((await adapter.loadModels(input)).ok).toBe(false)
+      expect(providerCalls).toBe(1)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 15_000)
+
   test('rejects before preparation when current catalog identity cannot be proven', async () => {
     let identityReadError = false
     let probeCalls = 0
     const adapter = new OpenCodeProviderManagementAdapter({
       catalogTimeoutMs: 200,
       inventoryTimeoutMs: 5_000,
-      resolveBinaryPath: () => '/opt/homebrew/bin/opencode',
+      resolveBinaryPath: () => testBinaryPath,
       resolveBinaryIdentity: async () => 'binary-a',
       profileManager: {
         listManagedAuthPaths: async () => [],
@@ -8376,7 +8426,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
         catalogTimeoutMs: 500,
         inventoryTimeoutMs: evidence === 'overall expired' ? 5_000 : 100,
         catalogOverallTimeoutMs: evidence === 'overall expired' ? 500 : 5_000,
-        resolveBinaryPath: () => '/opt/homebrew/bin/opencode',
+        resolveBinaryPath: () => testBinaryPath,
         resolveBinaryIdentity: async () => 'binary-a',
         profileManager: {
           listManagedAuthPaths: async () => [],
@@ -8449,7 +8499,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
     const providersStarted = new Promise<void>(resolve => { markProvidersStarted = resolve })
     const adapter = new OpenCodeProviderManagementAdapter({
       catalogTimeoutMs: 1_000,
-      resolveBinaryPath: () => '/opt/homebrew/bin/opencode',
+      resolveBinaryPath: () => testBinaryPath,
       resolveBinaryIdentity: async () => 'binary-a',
       profileManager: {
         listManagedAuthPaths: async () => [],
@@ -8496,7 +8546,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
     const endpoint = 'https://private.example.invalid/v1/models?tenant=classified'
     const secret = 'violet-elephant-uncatalogued-7391'
     const adapter = new OpenCodeProviderManagementAdapter({
-      resolveBinaryPath: () => '/opt/homebrew/bin/opencode',
+      resolveBinaryPath: () => testBinaryPath,
       resolveBinaryIdentity: async () => 'binary-a',
       profileManager: {
         listManagedAuthPaths: async () => [],
@@ -8666,7 +8716,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
     await writeFile(authPath, JSON.stringify({ openrouter: { type: 'api', key: 'selected-key' } }))
     let identityReads = 0
     const adapter = new OpenCodeProviderManagementAdapter({
-      resolveBinaryPath: () => '/opt/homebrew/bin/opencode',
+      resolveBinaryPath: () => testBinaryPath,
       resolveBinaryIdentity: async () => 'binary-a',
       profileManager: {
         listManagedAuthPaths: async () => [],
@@ -8714,7 +8764,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
     let slow = false
     const adapter = new OpenCodeProviderManagementAdapter({
       catalogTimeoutMs: 100,
-      resolveBinaryPath: () => '/opt/homebrew/bin/opencode',
+      resolveBinaryPath: () => testBinaryPath,
       resolveBinaryIdentity: async () => 'binary-a',
       profileManager: {
         listManagedAuthPaths: async () => [],
@@ -8753,7 +8803,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
     async finalState => {
       let identityReads = 0
       const adapter = new OpenCodeProviderManagementAdapter({
-        resolveBinaryPath: () => '/opt/homebrew/bin/opencode',
+        resolveBinaryPath: () => testBinaryPath,
         resolveBinaryIdentity: async () => 'binary-a',
         profileManager: {
           listManagedAuthPaths: async () => [],

@@ -72,18 +72,36 @@ export async function validateExecutionProfile(profile: OwnedNativeProfile): Pro
 }
 
 /** Receipt covers the owner's reviewed graph, including generated client and server dependencies. */
-export async function validateExecutionGraph(pin: '2.0.0' | '2.0.21', receipt: ExecutionGraph) {
+export type ExecutionGraphProgress = Readonly<{ phase: 'hash' | 'closure'; completed: number; total: number }>
+export async function validateExecutionGraph(pin: '2.0.0' | '2.0.21', receipt: ExecutionGraph,
+  progress?: (value: ExecutionGraphProgress) => void) {
   executionAssert(receipt.files.length > 0 && receipt.files.length <= 65_536)
   const rows = [...receipt.files].sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0)
   executionAssert(new Set(rows.map(row => row.path)).size === rows.length && executionHash(rows) === receipt.sha256, 'execution_graph_changed')
+  progress?.({ phase: 'hash', completed: 0, total: rows.length })
   // Official graphs contain tens of thousands of independent files. Bound
   // concurrent reads instead of serializing each filesystem round trip.
-  for (let offset = 0; offset < rows.length; offset += 16) {
-    await Promise.all(rows.slice(offset, offset + 16).map(async row => {
-      executionAssert(/^[a-f0-9]{64}$/.test(row.sha256) && path.isAbsolute(row.path) && await realpath(row.path) === row.path)
-      executionAssert(await hashOpenCodeFile(row.path) === row.sha256, 'execution_graph_changed')
-    }))
+  let next = 0, completed = 0, failed = false
+  let failure: unknown
+  const worker = async () => {
+    try {
+      while (!failed) {
+        const row = rows[next++]
+        if (!row) return
+        executionAssert(/^[a-f0-9]{64}$/.test(row.sha256) && path.isAbsolute(row.path) && await realpath(row.path) === row.path)
+        executionAssert(await hashOpenCodeFile(row.path) === row.sha256, 'execution_graph_changed')
+        completed++
+        if (completed % 16 === 0 || completed === rows.length) progress?.({ phase: 'hash', completed, total: rows.length })
+      }
+    } catch (error) {
+      if (!failed) { failed = true; failure = error }
+      throw error
+    }
   }
+  // A failed row stops new claims; join every already claimed read before reject.
+  await Promise.allSettled(Array.from({ length: Math.min(16, rows.length) }, worker))
+  if (failed) throw failure
+  progress?.({ phase: 'closure', completed: rows.length, total: rows.length })
   const graph = await verifyOpenCodeV2ServerGraph(pin)
   executionAssert(rows.some(row => row.path === graph.modulePath && row.sha256 === graph.moduleSha256) &&
     rows.some(row => row.path === graph.effectPath), 'execution_graph_incomplete')

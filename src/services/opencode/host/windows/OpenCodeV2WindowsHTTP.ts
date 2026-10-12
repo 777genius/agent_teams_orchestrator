@@ -42,6 +42,7 @@ class Direction {
   private credit = WINDOW
   private available = deferred<void>()
   private reader?: ReadableStreamDefaultReader<Uint8Array>
+  private streamController?: ReadableStreamDefaultController<Uint8Array>
   private cancellation: Promise<void> = Promise.resolve()
   private senderStopped = false
   private consumed = false
@@ -51,7 +52,11 @@ class Direction {
   }
   private wake() { this.changed.resolve(); this.changed = deferred<void>() }
   fail(error: unknown) {
+    if (this.failure) return
     this.failure = error ?? new Error('execution_http_cancelled'); this.queue = []; this.queued = 0
+    // Error the Web stream itself, including bytes already queued by a native
+    // Response reader. Normal consumed EOF is settled by onFinish instead.
+    if (!this.consumed) this.streamController?.error(this.failure)
     this.wake(); this.available.resolve()
     this.cancellation = this.reader?.cancel(this.failure).then(() => undefined, () => undefined) ?? Promise.resolve()
   }
@@ -80,6 +85,7 @@ class Direction {
   }
   stream(cancel: (reason: unknown) => void | Promise<void>): ReadableStream<Uint8Array> {
     return new ReadableStream<Uint8Array>({
+      start: controller => { this.streamController = controller; if (this.failure) controller.error(this.failure) },
       pull: async controller => {
         try {
           while (!this.queue.length && !this.ended && !this.failure) await this.changed.promise
@@ -88,6 +94,9 @@ class Direction {
           if (bytes) {
             this.queued -= bytes.length
             await this.send({ action: 'credit', direction: this.name, bytes: bytes.length })
+            // A peer failure can occur while the credit acknowledgement waits.
+            if (this.failure) throw this.failure
+            this.abort.throwIfAborted()
             controller.enqueue(bytes)
           } else { await this.finish(); controller.close() }
         } catch (error) { controller.error(error); await cancel(error) }
@@ -238,7 +247,9 @@ export function bindWindowsExecutionHttp(baseUrl: string, signal?: AbortSignal):
         const task = Promise.resolve().then(async () => {
           let result: Response | undefined
           try {
-            result = await fetch(target, { method: String(frame.method), headers: requestHeaders, body, signal: controller.signal, redirect: 'manual', ...(body ? { duplex: 'half' as const } : {}) })
+            // Bun 1.3.11 can reuse an unfinished streamed upload after an
+            // early response. Keep these requests out of its shared pool.
+            result = await fetch(target, { method: String(frame.method), headers: requestHeaders, body, signal: controller.signal, redirect: 'manual', ...(body ? { duplex: 'half' as const, keepalive: false } : {}) })
             await send({ action: 'head', status: result.status, statusText: result.statusText, headers: headers([...result.headers]), body: result.body !== null })
             await response.pump(result.body)
             await send({ action: 'done' })

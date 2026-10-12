@@ -6,7 +6,7 @@ import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { resolveOpenCodeV2ExecutionDelivery } from '../host/OpenCodeV2ExecutionDelivery.js'
 import { assertExecutionPlatformAvailable } from '../host/OpenCodeV2ExecutionPlatform.js'
-import { mkdir, mkdtemp, readdir, realpath, writeFile, access } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, realpath, writeFile, access } from 'node:fs/promises'
 import { constants } from 'node:fs'
 
 import { executionAssert, executionHash, executionRecord } from '../execution/OpenCodeV2ExecutionContracts.js'
@@ -77,6 +77,11 @@ export async function inspectOpenCodeV2LaunchSelection(envelope: BridgeEnvelope)
  * graph only; it never acquires a host or runs a model preflight. */
 export async function inspectOpenCodeV2SourceAvailability(envelope: BridgeEnvelope) {
   const selection = await inspectOpenCodeV2LaunchSelection(envelope)
+  return (await prepareSelectedOpenCodeV2SourceAvailability(selection)).availability
+}
+
+/** Reuse only this command's selection; installed bytes are still verified afresh. */
+async function prepareSelectedOpenCodeV2SourceAvailability(selection: Awaited<ReturnType<typeof inspectOpenCodeV2LaunchSelection>>) {
   const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'execution')
   const receipt = await createOpenCodeV2ExecutionReceipt(delivery.root, selection.native, selection.controller)
   const config = selection.controller
@@ -88,7 +93,7 @@ export async function inspectOpenCodeV2SourceAvailability(envelope: BridgeEnvelo
   }
   executionAssert(receipt.graph.files.length > 0 && receipt.graph.sha256.length === 64 &&
     receipt.executableSha256 === selection.native.executableSha256, 'run_source_graph_unknown')
-  return { ...selection, installedGraphSHA256: receipt.graph.sha256, installedGraphFiles: receipt.graph.files.length }
+  return { native: receipt, availability: { ...selection, installedGraphSHA256: receipt.graph.sha256, installedGraphFiles: receipt.graph.files.length } }
 }
 
 /** Stable protocol1 fields feed an SDK-owned production provisioner. No caller receipt or endpoint authority. */
@@ -97,7 +102,7 @@ export async function createOpenCodeV2LaunchPlan(envelope: BridgeEnvelope): Prom
   const teamId = text(body.teamId ?? body.teamName), runId = text(body.runId), laneId = text(body.laneId)
   executionAssert(body.teamName === undefined || body.teamName === teamId, 'run_controller_team_changed')
   const preconditions = parseOpenCodeBridgePreconditions(body.preconditions)
-  const availability = await inspectOpenCodeV2SourceAvailability(envelope)
+  const { native, availability } = await prepareSelectedOpenCodeV2SourceAvailability(selection)
   const verified = await resolveOpenCodeV2ExecutionProbe(envelope, availability, false, { unattendedTeam: true })
   const supplied = parseOpenCodeExecutionProof(body.executionProof)
   executionAssert(verified.proof && verified.proof.projectPath === selection.project &&
@@ -108,7 +113,7 @@ export async function createOpenCodeV2LaunchPlan(envelope: BridgeEnvelope): Prom
     'run_launch_native_execution_proof_required')
   validateOpenCodeBridgeStateChangingPreconditions({ body, runtime: { capabilitySnapshotId: selection.capabilitySnapshotId,
     runtimeStoreManifestHighWatermark: null } })
-  const plan = await buildOpenCodeV2InternalRunPlan(selection, body, preconditions.commandLeaseId)
+  const plan = await buildOpenCodeV2InternalRunPlanWithNative(selection, body, preconditions.commandLeaseId, native)
   executionAssert(plan.members.every(member => member.profile.config.sha256 === verified.proof!.managedConfigFingerprint), 'run_launch_config_variant_changed')
   for (const member of plan.members) executionAssert(await hashOpenCodeFile(path.join(member.profile.root, 'data/opencode/auth.json')) === verified.proof.managedAuthFingerprint, 'run_launch_selected_auth_changed')
   executionAssert((await collectProjectBehaviorMetadata(selection.project)).projectBehaviorFingerprint === verified.proof.projectBehaviorFingerprint && Date.parse(verified.proof.expiresAt) > Date.now(), 'run_launch_project_behavior_or_proof_changed')
@@ -120,6 +125,16 @@ export async function createOpenCodeV2LaunchPlan(envelope: BridgeEnvelope): Prom
 /** Production constructor only: no caller body receipt, endpoint or mount hook. */
 export async function buildOpenCodeV2InternalRunPlan(selection: Awaited<ReturnType<typeof inspectOpenCodeV2LaunchSelection>>,
   body: Record<string, unknown>, controllerInstanceId: string, probe?: { intent: import('../execution/OpenCodeV2AdmissionService.js').QueueIntent; expectedText: string; unattendedTeam?: boolean }): Promise<RunLaunchPlan> {
+  const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'run-owner')
+  const native = await createOpenCodeV2ExecutionReceipt(delivery.root, selection.native, selection.controller)
+  return buildOpenCodeV2InternalRunPlanWithNative(selection, body, controllerInstanceId, native, probe)
+}
+
+/** Reuse only the receipt constructed in this command's private preparation.
+ * Caller DTOs and subsequent commands cannot supply or retain this receipt. */
+async function buildOpenCodeV2InternalRunPlanWithNative(selection: Awaited<ReturnType<typeof inspectOpenCodeV2LaunchSelection>>,
+  body: Record<string, unknown>, controllerInstanceId: string, native: ValidatedExecutionNative,
+  probe?: { intent: import('../execution/OpenCodeV2AdmissionService.js').QueueIntent; expectedText: string; unattendedTeam?: boolean }): Promise<RunLaunchPlan> {
   const teamId = text(body.teamId ?? body.teamName), runId = text(body.runId), laneId = text(body.laneId)
   executionAssert(Array.isArray(body.members) && body.members.length > 0 && body.members.length <= 32, 'run_members_invalid')
   const rawMembers = body.members.map(executionRecord)
@@ -130,7 +145,6 @@ export async function buildOpenCodeV2InternalRunPlan(selection: Awaited<ReturnTy
   const profileParent = path.join(dataRoot, 'opencode', 'v2', 'profiles')
   await mkdir(profileParent, { recursive: true, mode: 0o700 })
   const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'run-owner')
-  const native = await createOpenCodeV2ExecutionReceipt(delivery.root, selection.native, selection.controller)
   const members: RunMemberPlan[] = []
   let probePrepared: OpenCodePreparedProfile | undefined
   for (const member of rawMembers) {
@@ -188,6 +202,14 @@ export async function createOpenCodeV2PreparedMember(selection: Awaited<ReturnTy
     const configDirectory = path.join(root, 'config', 'opencode'), nativeData = path.join(root, 'data', 'opencode')
     await mkdir(configDirectory, { mode: 0o700 }); await mkdir(nativeData, { mode: 0o700 })
     const provider = await materializeOpenCodeSelectedScopeAuth(selection.scope, selection.project, path.join(nativeData, 'auth.json'), selection.model.id)
+    const managedAuthPath = path.join(nativeData, 'auth.json')
+    const managedAuthFingerprint = await hashOpenCodeFile(managedAuthPath)
+    const anonymous = selection.scope.selectedAuthIdentity === 'absent'
+    // An empty sealed store binds the normal proof without pretending the native
+    // public marker is a credential. The host's read-only catalog guard must still
+    // qualify this exact free model before admitting any native session.
+    if (anonymous) executionAssert(Object.keys(executionRecord(JSON.parse(await readFile(managedAuthPath, 'utf8')))).length === 0,
+      'run_selected_auth_changed')
     const model = { ...selection.model, variant: variant ?? 'default' }
     const selected = { agent: 'build', model, permissions: [{ action: '*', resource: '*', effect: 'allow' as const }] }
     const config = createOpenCodeV2ExecutionConfig({ pin: native.version, selection: selected,
@@ -198,12 +220,11 @@ export async function createOpenCodeV2PreparedMember(selection: Awaited<ReturnTy
     if (selection.controller.type === 'local' && selection.controller.environment?.AGENT_TEAMS_MCP_CLAUDE_DIR)
       env.AGENT_TEAMS_MCP_CLAUDE_DIR = selection.controller.environment.AGENT_TEAMS_MCP_CLAUDE_DIR
     const profile: SelectedExecutionProfile = { epoch: randomUUID(), root, directory: selection.project,
-      databasePath: path.join(nativeData, 'opencode.db'), authSha256: await hashOpenCodeFile(path.join(nativeData, 'auth.json')), env, envSha256: executionHash(env),
+      databasePath: path.join(nativeData, 'opencode.db'), ...(anonymous ? {} : { authSha256: managedAuthFingerprint }), env, envSha256: executionHash(env),
       config: { directory: configDirectory, content: config.content, sha256: config.sha256 }, selection: selected }
   const metadata = await readOpenCodeSelectedScopeMetadata(selection.scope, selection.project)
-  const managedAuthPath = path.join(nativeData, 'auth.json')
-  const managedAuthFingerprint = await hashOpenCodeFile(managedAuthPath)
-  executionAssert(profile.authSha256 === managedAuthFingerprint, 'run_selected_auth_changed')
+  executionAssert(metadata.selectedAuthIdentity === selection.scope.selectedAuthIdentity &&
+    await hashOpenCodeFile(managedAuthPath) === managedAuthFingerprint, 'run_selected_auth_changed')
   const prepared: OpenCodePreparedProfile = {
     projectPath: selection.project, canonicalProjectPath: selection.project, workingDirectoryPath: selection.project,
     scopeToken: selection.scope.scopeToken, profileRootKey: executionHash({ project: selection.project,
@@ -224,6 +245,9 @@ export async function createOpenCodeV2PreparedMember(selection: Awaited<ReturnTy
 
 /** Native-owned profiles follow the planner's fixed loader environment fence. */
 export function createOpenCodeV2OwnedProfileEnvironment(root: string): Record<string, string> {
-  return Object.fromEntries(Object.entries(privateOpenCodeReadEnvironment(root))
+  const env = Object.fromEntries(Object.entries(privateOpenCodeReadEnvironment(root))
     .filter((pair): pair is [string, string] => pair[0] !== 'NODE_ENV' && typeof pair[1] === 'string'))
+  // Selected Homebrew Node must not load ambient OpenSSL configuration outside the owned profile.
+  if (process.platform === 'darwin') env.OPENSSL_CONF = '/dev/null'
+  return env
 }

@@ -33,7 +33,7 @@ export async function hashOpenCodeFile(file: string): Promise<string> {
     const hash = createHash('sha256')
     // Keep one explicit handle owner. Bun 1.3.11's streamed FileHandle reads
     // can invalidate later child stdio after hashing a large package graph.
-    const bytes = Buffer.alloc(64 * 1024)
+    const bytes = Buffer.alloc(Math.max(1, Math.min(64 * 1024, before.size)))
     for (let offset = 0;;) {
       const { bytesRead } = await handle.read(bytes, 0, bytes.length, offset)
       if (bytesRead === 0) break

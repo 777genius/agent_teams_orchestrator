@@ -14,7 +14,9 @@ import { assertExecutionPlatformAvailable, launchExecutionPlatform, planExecutio
   type ExecutionPlatformLaunch, type ExecutionPlatformMapping } from './OpenCodeV2ExecutionPlatform.js'
 import { acquireExecutionProfileOwner } from './OpenCodeV2ExecutionOwner.js'
 import { initializeOpenCodeV2ExecutionAuth } from './OpenCodeV2ExecutionAuth.js'
-import { closeWindowsExecutionPlan } from './windows/OpenCodeV2WindowsExecution.js'
+import { bindWindowsExecutionSelectedConfig, closeWindowsExecutionPlan } from './windows/OpenCodeV2WindowsExecution.js'
+import { resolveOpenCodeV2DarwinControllerRuntimeClosure } from '../profile/OpenCodeV2ExecutionReceipt.js'
+import { recordOpenCodeV2ProviderFailure, type ExecutionAcquisitionPhase } from '../execution/OpenCodeV2Diagnostics.js'
 
 export type { SelectedExecutionProfile, ValidatedExecutionNative } from './OpenCodeV2ExecutionBinding.js'
 type PrivateEndpoint = Readonly<{ baseUrl: string; password: string; signal: AbortSignal; nativePID: number; fetch?: ExecutionPlatformLaunch['fetch'] }>
@@ -83,11 +85,12 @@ export async function acquireOpenCodeV2CatalogLease(native: ValidatedExecutionNa
 
 /** Internal preparation performs the real guards/plan without acquiring an owner or starting a server. */
 export async function prepareOwnedNativeExecutionPlan(validatedNative: ValidatedExecutionNative,
-  selectedProfile: OwnedNativeProfile, context: ExecutionContext, lifetimeSignal?: AbortSignal) {
+  selectedProfile: OwnedNativeProfile, context: ExecutionContext, lifetimeSignal?: AbortSignal, progress?: (phase: ExecutionAcquisitionPhase) => void) {
   // Delivery mode is explicit. No packaged/source fallback and no acquisition effect before this fence.
   const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'execution')
   executionAssert(validatedNative.runtimeMode === delivery.runtimeMode, 'v2_execution_delivery_mismatch')
   const native = structuredClone(validatedNative), profile = structuredClone(selectedProfile)
+  progress?.('delivery-resolved')
   const check = () => {
     context.signal?.throwIfAborted(); lifetimeSignal?.throwIfAborted()
     executionAssert(Number.isFinite(context.deadline) && Date.now() < context.deadline, 'execution_timeout')
@@ -98,25 +101,45 @@ export async function prepareOwnedNativeExecutionPlan(validatedNative: Validated
     native.dialect === `v2-${native.version}` && process.versions.bun === '1.3.11', 'execution_identity_mismatch')
   executionAssert([context.teamId, context.runId, context.laneId, context.memberId].every(value => value.length > 0))
   await validateExecutionProfile(profile); check()
-  await canonicalExecutionDirectory(profile.directory); check()
+  await canonicalExecutionDirectory(profile.directory); check(); progress?.('profile-validated')
   await validateExecutionNative(native); check()
   executionAssert(await realpath(process.execPath) === native.bun.path &&
-    await hashOpenCodeFile(native.bun.path) === native.bun.sha256, 'execution_identity_mismatch'); check()
-  await validateExecutionGraph(native.version, native.graph); check()
+    await hashOpenCodeFile(native.bun.path) === native.bun.sha256, 'execution_identity_mismatch'); check(); progress?.('native-validated')
+  await validateExecutionGraph(native.version, native.graph); check(); progress?.('graph-validated')
   const entry = delivery.entryPath; check()
   executionAssert(delivery.entrySha256 === native.entrySha256, 'execution_entry_changed'); check()
   const sourceRoot = delivery.root
-  const resolutionMounts = await executionResolutionMounts(sourceRoot, native.graph); check()
+  const resolutionMounts = await executionResolutionMounts(sourceRoot, native.graph); check(); progress?.('resolution-prepared')
+  const controllerLoaderFiles = new Set<string>()
+  const controllerLoaderAliases: { source: string; target: string }[] = []
+  if (process.platform === 'darwin') {
+    const document = executionRecord(JSON.parse(profile.config.content))
+    const graphFiles = new Map(native.graph.files.map(file => [file.path, file.sha256]))
+    if (document.mcp !== undefined) {
+      const servers = executionRecord(executionRecord(document.mcp).servers)
+      for (const value of Object.values(servers)) {
+        const server = executionRecord(value)
+        if (server.type !== 'local' || server.disabled === true) continue
+        executionAssert(Array.isArray(server.command) && typeof server.command[0] === 'string', 'controller_runtime_missing')
+        const closure = await resolveOpenCodeV2DarwinControllerRuntimeClosure(server.command[0]); check()
+        for (const file of closure.files) {
+          executionAssert(graphFiles.get(file.path) === file.sha256, 'controller_runtime_changed')
+          controllerLoaderFiles.add(file.path)
+        }
+        controllerLoaderAliases.push(...closure.aliases)
+      }
+    }
+  }
   const selectedCliRoot = await realpath(path.dirname(path.dirname(native.executablePath))); check()
-  const controllerStateRoots = await readSelectedOpenCodeV2ControllerState(profile, context); check()
+  const controllerStateRoots = await readSelectedOpenCodeV2ControllerState(profile, context); check(); progress?.('controller-prepared')
   const profileDirectories = [...new Set([profile.root, profile.config.directory, path.dirname(profile.databasePath),
     ...['HOME', 'USERPROFILE', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME',
       'TMPDIR', 'TMP', 'TEMP', 'APPDATA', 'LOCALAPPDATA'].map(key => profile.env[key]!)])]
   const plan = await planExecutionPlatform({ bun: native.bun, entry, cwd: profile.directory, profileDirectories,
     writableRoots: [profile.root, profile.directory, ...controllerStateRoots],
     readOnlyRoots: [sourceRoot, path.dirname(native.bun.path), selectedCliRoot,
-      ...native.graph.files.map(file => path.dirname(file.path))],
-    readOnlyMounts: resolutionMounts,
+      ...native.graph.files.map(file => controllerLoaderFiles.has(file.path) ? file.path : path.dirname(file.path))],
+    readOnlyMounts: [...resolutionMounts, ...controllerLoaderAliases],
     protectedRoots: [path.join(profile.root, '.opencode-v2-execution-owner'),
       path.join(path.dirname(profile.databasePath), `.${path.basename(profile.databasePath)}.opencode-v2-execution-owner`)],
     env: { ...profile.env, PWD: profile.directory } })
@@ -134,7 +157,16 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
     context.signal?.throwIfAborted(); lifetime.signal.throwIfAborted()
     executionAssert(Number.isFinite(context.deadline) && Date.now() < context.deadline, 'execution_timeout')
   }
-  const { native, profile, entry, plan } = await prepareOwnedNativeExecutionPlan(validatedNative, selectedProfile, context, lifetime.signal)
+  const acquisitionStartedAt = Date.now()
+  const history: { phase: ExecutionAcquisitionPhase; elapsedMs: number }[] = [{ phase: 'preparing', elapsedMs: 0 }]
+  const mark = (phase: ExecutionAcquisitionPhase) => history.push({ phase,
+    elapsedMs: Math.max(history.at(-1)!.elapsedMs, Date.now() - acquisitionStartedAt) })
+  const timing = () => ({ elapsedMs: Math.max(history.at(-1)!.elapsedMs, Date.now() - acquisitionStartedAt), history })
+  let prepared: Awaited<ReturnType<typeof prepareOwnedNativeExecutionPlan>>
+  try { prepared = await prepareOwnedNativeExecutionPlan(validatedNative, selectedProfile, context, lifetime.signal, mark) }
+  catch (failure) { await recordOpenCodeV2ProviderFailure('execution-host-startup', failure, true, undefined, timing()); throw failure }
+  mark('prepared')
+  const { native, profile, entry, plan } = prepared
   const nonce = randomUUID(), leaseOwnerId = randomUUID(), password = randomBytes(32).toString('base64url')
   const ownerIdentity = { hostInstanceId: nonce, leaseOwnerId, graphSha256: native.graph.sha256 }
   let owner: Awaited<ReturnType<typeof acquireExecutionProfileOwner>>
@@ -143,6 +175,7 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
     owner = await acquireExecutionProfileOwner(profile, ownerIdentity,
       plan.platform === 'win32' ? { windowsPlan: plan.concrete } : undefined)
   } catch (failure) {
+    await recordOpenCodeV2ProviderFailure('execution-host-startup', failure, true, undefined, timing())
     if (plan.platform === 'win32') await closeWindowsExecutionPlan(plan.concrete).catch(() => undefined)
     throw failure
   }
@@ -185,6 +218,13 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
   const abort = () => { lifetime.abort(); void close().catch(() => undefined) }
   try {
     check()
+    // Native owner acquisition has already retained the selected profile and
+    // both physical fences. Bind the fixed managed config before marking a
+    // launch attempt, so known pre-launch failures still use normal abandonment.
+    if (plan.platform === 'win32') {
+      await bindWindowsExecutionSelectedConfig(plan.concrete, profile, context.deadline, context.signal)
+      check()
+    }
     await owner.beforeSpawn(); check()
     launch = launchExecutionPlatform(plan, nonce, leaseOwnerId, native.bun)
     child = launch.child
@@ -202,13 +242,14 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
     })
     void ready.catch(() => undefined)
     context.signal?.addEventListener('abort', abort, { once: true }); check()
+    mark('mapping')
     mappingWork = launch.prepare(context.deadline, lifetime.signal)
     mapping = await boundOpenCodeRead(mappingWork, context.deadline - Date.now(), context.signal); check()
     birth = mapping.bun.birth
     executionAssert(!closeWork && !exited, 'execution_identity_mismatch')
-    await owner.bindChild(mapping.bun.hostPID, birth, mapping); check()
+    await owner.bindChild(mapping.bun.hostPID, birth, mapping); check(); mark('child-bound')
     await launch.assertLive(); check()
-    await launch.start({ password, native, profile }, context.deadline, lifetime.signal); check()
+    await launch.start({ password, native, profile }, context.deadline, lifetime.signal); check(); mark('start-sent')
     const row = await boundOpenCodeRead(ready, context.deadline - Date.now(), context.signal); check()
     executionAssert(row.pid === mapping.bun.nativePID && row.leaseOwnerId === leaseOwnerId && row.namespace === mapping.namespace.name && row.pin === native.version && row.graphSha256 === native.graph.sha256 &&
       row.executableSha256 === native.bun.sha256 && row.profileEpoch === profile.epoch &&
@@ -227,17 +268,19 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
     endpoints.set(authority, endpoint)
     disposers.set(authority, new Set())
     graphs.set(authority, Object.freeze({ sha256: native.graph.sha256, files: Object.freeze(native.graph.files.map(row => Object.freeze(row))) }))
-    if ('purpose' in profile.selection) await awaitOpenCodeV2CatalogReadiness(endpoint, authority, context)
-    else {
-      await awaitOpenCodeV2CatalogReadiness(endpoint, authority, context)
-      await initializeOpenCodeV2ExecutionAuth(authority, profile, context)
-      await awaitOpenCodeV2ExecutionReadiness(endpoint, authority, context, profile.selection)
+    mark('ready')
+    await awaitOpenCodeV2CatalogReadiness(endpoint, authority, context); mark('catalog-ready')
+    if (!('purpose' in profile.selection)) {
+      await initializeOpenCodeV2ExecutionAuth(authority, profile, context); mark('auth-ready')
+      await awaitOpenCodeV2ExecutionReadiness(endpoint, authority, context, profile.selection); mark('selection-ready')
     }
     check()
     executionAssert(!closeWork && !exited, 'execution_host_unavailable')
     return Object.freeze({ authority, signal: lifetime.signal, close })
   } catch (failure) {
+    const acquisitionTiming = timing()
     if (!child) {
+      await recordOpenCodeV2ProviderFailure('execution-host-startup', failure, true, launch?.output?.().stderr, acquisitionTiming)
       // Once spawn is attempted even a synchronous error has no retirement
       // proof. Preserve ownership; only pre-launch cancellation may release.
       try { await owner.abandonBeforeSpawn() } catch { throw new Error('execution_owner_unknown', { cause: failure }) }
@@ -245,6 +288,11 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
       throw failure
     }
     try { await close() } catch { throw new Error('cleanup_unknown', { cause: failure }) }
+    finally {
+      // Closing an unfinished child publishes its finite stage. Capture after
+      // joining that attempt without changing original failure or cleanup proof.
+      await recordOpenCodeV2ProviderFailure('execution-host-startup', failure, true, launch?.output?.().stderr, acquisitionTiming)
+    }
     throw failure
   }
 }

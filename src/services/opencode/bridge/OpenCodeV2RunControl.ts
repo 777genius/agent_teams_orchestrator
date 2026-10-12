@@ -450,7 +450,23 @@ export async function serveOpenCodeV2RunControl(directory: string, binding: RunB
       usedNonces.claim(nonce, requestDeadline, request.operation, Date.now())
       let result: RunControlResult | undefined, error: string | undefined
       try { result = await execute(request, requestDeadline) }
-      catch { error = 'run_operation_unknown' }
+      catch (failure) {
+        error = 'run_operation_unknown'
+        // This original-run diagnostic is private; the signed public error stays unknown.
+        try {
+          const codes = ['mutable_readback', 'run_mutable_cut', 'run_operation_timeout', 'run_not_active', 'session_selection_changed', 'terminal_cut_not_owned',
+            'terminal_cut_unknown', 'terminal_assistant_selection_changed', 'terminal_authority_conflict',
+            'terminal_payload_conflict', 'payload_conflict', 'probe_terminal_cut_changed',
+            'probe_observed_model_variant_changed', 'probe_expected_output_not_observed',
+            'probe_selected_auth_changed', 'probe_selected_authority_changed', 'probe_profile_authority_changed',
+            'probe_config_readback_unavailable', 'execution_selected_auth_changed', 'execution_profile_changed'] as const
+          const category = failure instanceof Error ? codes.find(code => code === failure.message) ?? 'unclassified' : 'unclassified'
+          await writeRunControlFile(directory, 'operation-failure.json', {
+            schemaVersion: 1, event: 'opencode_v2_run_operation_failure', binding,
+            operation: request.operation, category, timestamp: new Date().toISOString(),
+          })
+        } catch { /* Diagnostic failure cannot change the existing operation result. */ }
+      }
       const response = { nonce, endpoint: payload.endpoint, ...(error ? { error } : { result }) }
       writeFrame(socket, { payload: response, mac: signature(secret, response) }); socket.end()
     })().catch(() => socket.destroy())

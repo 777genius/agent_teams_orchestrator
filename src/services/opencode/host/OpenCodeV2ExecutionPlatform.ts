@@ -17,6 +17,7 @@ export type ExecutionPlatformMapping = Readonly<{
   namespace: Readonly<{ name: string }>; leaseOwnerId: string
 }>
 export type ExecutionPlatformLaunch = Readonly<{
+  output?(): Readonly<{ stdout: string; stderr: string }>
   fetch?: (input: Parameters<typeof globalThis.fetch>[0], init?: Parameters<typeof globalThis.fetch>[1]) => Promise<Response>
   child: Pick<EventEmitter, 'on' | 'once'> & Readonly<{ pid?: number }>
   prepare(deadline: number, signal?: AbortSignal): Promise<ExecutionPlatformMapping>
@@ -31,8 +32,11 @@ type ExecutionPlatformPlan =
 
 // Closed composition, not a caller-registerable adapter registry. Unsupported
 // systems cannot cross admission before native containment and delivery exist.
+export function isExecutionPlatformAvailable(): boolean {
+  return process.platform === 'linux' || process.platform === 'darwin'
+}
 export function assertExecutionPlatformAvailable(): void {
-  executionAssert(process.platform === 'linux' || process.platform === 'darwin', 'execution_containment_platform_pending')
+  executionAssert(isExecutionPlatformAvailable(), 'execution_containment_platform_pending')
 }
 export async function planExecutionPlatform(input: Parameters<typeof planLinuxExecution>[0] & Readonly<{ profileDirectories?: readonly string[] }>): Promise<ExecutionPlatformPlan> {
   assertExecutionPlatformAvailable()

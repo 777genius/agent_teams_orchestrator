@@ -1,7 +1,7 @@
 import { fileURLToPath } from 'node:url'
 import { describe, expect, test, spyOn } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { mkdir, mkdtemp, readFile, realpath, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { OpenCodeV2RunOwner } from './OpenCodeV2RunOwner.js'
@@ -34,15 +34,20 @@ const intent: QueueIntent = { delivery: 'queue', identity: {
 }, input: { nativeInputID: 'msg_TESTinput', text: 'hello worker', resume: true } }
 
 async function fixture(options: { unknown?: boolean; foreignClient?: boolean;
-  promptBarrier?: Promise<void>; closeBarrier?: Promise<void>; permissionResources?: string[];
-  lifetimeMs?: number; twoMembers?: boolean; preparation?: () => void; startup?: () => void;
+  probe?: boolean; promptBarrier?: Promise<void>; closeBarrier?: Promise<void>; permissionResources?: string[];
+  lifetimeMs?: number; twoMembers?: boolean; memberCount?: number; preparation?: () => void; startup?: () => void;
+  acquisition?: (memberId: string, signal: AbortSignal | undefined) => Promise<void>;
   permissions?: import('../host/OpenCodeV2ExecutionBinding.js').ExecutionSelection['permissions'] } = {}) {
   const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'TEST-r249-owner-')))
   const authority: ExecutionAuthority = { generation: 'v2', pin: '2.0.21', dialect: 'v2-2.0.21',
     graphSha256: 'a'.repeat(64), selectedCli: { path: '/TEST-opencode', sha256: 'b'.repeat(64), version: '2.0.21' },
     child: { pid: 42, birth: { format: 'linux-start-ticks', value: '42', bootId: 'TEST' }, executablePath: '/TEST-bun', sha256: 'c'.repeat(64) },
-    hostInstanceId: 'TEST-host', profileEpoch: 'TEST-epoch', profileRoot: '/TEST-profile', directory: '/TEST-project', leaseOwnerId: 'TEST-owner' }
-  const value = 'silent TEST context', counters = { acquired: 0, prompted: 0, closed: 0, interrupted: 0, replied: 0 }
+    hostInstanceId: 'TEST-host', profileEpoch: 'TEST-epoch', profileRoot: options.probe ? root : '/TEST-profile', directory: options.probe ? path.join(root, 'project') : '/TEST-project', leaseOwnerId: 'TEST-owner' }
+  if (options.probe) {
+    await mkdir(authority.directory); await mkdir(path.join(root, 'data/opencode'), { recursive: true })
+    await writeFile(path.join(root, 'data/opencode/auth.json'), '{}', { mode: 0o600 })
+  }
+  const value = 'silent TEST context', counters = { acquired: 0, prompted: 0, closed: 0, interrupted: 0, replied: 0, clients: 0, sessions: 0 }
   const binding = { teamId: 'TEST-team', runId: 'TEST-run', ownerId: 'TEST-owner', controllerInstanceId: 'TEST-controller' }
   let plan: RunLaunchPlan = { dataRoot: root, binding, deadline: Date.now() + (options.lifetimeMs ?? 15_000),
     source: { entryPath: '/TEST-entry.ts', entrySha256: 'd'.repeat(64), bunPath: '/TEST-bun', bunSha256: 'c'.repeat(64),
@@ -57,36 +62,47 @@ async function fixture(options: { unknown?: boolean; foreignClient?: boolean;
       bootstrap: { key: 'test.context', value, contextHash: createHash('sha256').update(value).digest('hex'), briefingHash: 'f'.repeat(64) },
       controllerMcpName: 'agent-teams', advertisedTools: ['message_send'] }],
   }
-  if (options.twoMembers) {
+  if (options.probe) {
+    const member = plan.members[0]!, config = JSON.parse(member.profile.config.content)
+    plan = { ...plan, members: [{ ...member, profile: { ...member.profile, root, directory: authority.directory } }], executionProbe: { memberId: member.memberId, intent, expectedText: 'done', capabilitySnapshotId: 'TEST-capability',
+      prepared: { projectPath: authority.directory, canonicalProjectPath: authority.directory, workingDirectoryPath: authority.directory,
+        scopeToken: null, profileRootKey: 'TEST-profile', profileRootPath: root, projectBehaviorFingerprint: 'b'.repeat(64), behaviorSources: [],
+        managedConfig: config, managedConfigFingerprint: createHash('sha256').update(JSON.stringify(config)).digest('hex'),
+        homePath: root, tmpPath: root, xdgConfigHome: root, xdgDataHome: root, xdgCacheHome: root,
+        managedAuthPath: path.join(root, 'data/opencode/auth.json'), sourceAuthPath: null, sourceAuthFingerprint: null,
+        managedAuthFingerprint: createHash('sha256').update('{}').digest('hex'), authState: 'missing', env: {} } } }
+  }
+  if (options.twoMembers || options.memberCount) {
     const first = plan.members[0]!
-    plan = { ...plan, members: [...plan.members, { ...first,
-      memberId: 'worker-2', originalSessionId: 'ses_TESTsecond',
-      profile: { ...first.profile, root: '/TEST-profile-2', epoch: 'TEST-epoch-2' } }] }
+    plan = { ...plan, members: [first, ...Array.from({ length: (options.memberCount ?? 2) - 1 }, (_, index) => ({ ...first,
+      memberId: `worker-${index + 2}`, originalSessionId: index === 0 ? 'ses_TESTsecond' : `ses_TEST${index + 2}`,
+      profile: { ...first.profile, root: `/TEST-profile-${index + 2}`, epoch: `TEST-epoch-${index + 2}` } }))] }
   }
   const created = new Set<string>()
-  let instruction: Parameters<ExecutionBridgeClient['putInstruction']>[2] = null
+  const instructions = new Map<string, Parameters<ExecutionBridgeClient['putInstruction']>[2]>()
   let drift = false, resolvePrompted: () => void = () => undefined
   const prompted = new Promise<void>(resolve => { resolvePrompted = resolve })
   let resolveClosing: () => void = () => undefined
   const closingStarted = new Promise<void>(resolve => { resolveClosing = resolve })
-  let selectedAuthority = authority
   const native: ExecutionBridgeClient = {
-    get authority() { return options.foreignClient ? structuredClone(selectedAuthority) : selectedAuthority },
+    get authority() { return options.foreignClient ? structuredClone(authority) : authority },
     getSession: async id => {
       if (!created.has(id)) return missingSession(id)
-      return { id: drift ? 'ses_TESTchanged' : id, directory: '/TEST-project', agent: 'worker',
+      return { id: drift ? 'ses_TESTchanged' : id, directory: authority.directory, agent: 'worker',
         model: { providerID: 'TEST-provider', id: 'TEST-model' }, timeCreated: 1 }
     },
-    createSession: async input => { created.add(input.sessionID); return { id: input.sessionID, directory: '/TEST-project',
+    createSession: async input => { counters.sessions++; created.add(input.sessionID); return { id: input.sessionID, directory: authority.directory,
       agent: input.agent, model: input.model, timeCreated: 1 } },
     promptQueue: async (sessionID, input): Promise<ExecutionInbox> => {
       counters.prompted++; resolvePrompted(); await options.promptBarrier
       if (options.unknown) throw new ExecutionTransportFailure('synthetic_timeout', 'unknown')
       return { id: input.nativeInputID, sessionID, type: 'user', timeCreated: 1, delivery: 'queue', payload: { text: input.text } }
     },
+    config: async () => [{ type: 'document', info: JSON.parse(plan.members[0]!.profile.config.content) }],
     log: async () => ({ events: [], synced: true, watermark: null }),
     messages: async () => ({ data: [], next: null, previous: null }), inbox: async () => [], dispose: async () => {},
-    putInstruction: async (_id, _key, input) => { instruction = input }, instructions: async () => [{ key: 'test.context', value: instruction }],
+    putInstruction: async (id, _key, input) => { instructions.set(id, input) },
+    instructions: async id => [{ key: 'test.context', value: instructions.get(id)! }],
     connectMcp: async () => {}, disconnectMcp: async () => {}, addMcp: async () => {},
     mcp: async () => [{ name: 'agent-teams', status: 'connected' }],
     interrupt: async () => { counters.interrupted++; return { interrupted: true } }, cancelInbox: async () => {},
@@ -97,11 +113,12 @@ async function fixture(options: { unknown?: boolean; foreignClient?: boolean;
     acquire: async (_native, _profile, context) => {
       expect(context).toMatchObject({ teamId: binding.teamId, runId: binding.runId, laneId: 'primary' })
       expect(plan.members.some(member => member.memberId === context.memberId)).toBe(true)
+      const profile = plan.members.find(member => member.memberId === context.memberId)!.profile
       const owned = context.memberId === 'worker' ? authority : { ...authority,
-        profileRoot: '/TEST-profile-2', profileEpoch: 'TEST-epoch-2' }
-      selectedAuthority = owned
+        profileRoot: profile.root, profileEpoch: profile.epoch }
       counters.acquired++
       options.preparation?.()
+      await options.acquisition?.(context.memberId!, context.signal)
       return { authority: owned, signal: new AbortController().signal, close: async () => {
         counters.closed++
         resolveClosing(); await options.closeBarrier
@@ -109,10 +126,11 @@ async function fixture(options: { unknown?: boolean; foreignClient?: boolean;
       } }
     },
     client: async (owned, context) => {
-      expect(owned.profileRoot).toBe(native.authority.profileRoot)
+      counters.clients++
       options.startup?.()
       if (Date.now() >= context.deadline) throw new Error('deadline')
-      return native
+      if (owned === authority) return native
+      return { ...native, authority: options.foreignClient ? structuredClone(owned) : owned }
     },
   }
   const directory = await reserveRunControlDirectory(root, binding, 'f'.repeat(64))
@@ -156,6 +174,97 @@ function successor(n: number): QueueIntent {
   return { delivery: 'queue', identity: { requestId: `request-${n}`, deliveryAttemptId: `attempt-${n}`,
     localMessageId: `local-${n}`, nativeInputID: `msg_TEST${n}` }, input: { nativeInputID: `msg_TEST${n}`, text: `next ${n}`, resume: true } }
 }
+function publishPending(f: Awaited<ReturnType<typeof fixture>>) {
+  const sessionID = f.sessionAuthority.sessionID, inboxID = intent.identity.nativeInputID
+  f.native.log = async () => ({ synced: true, watermark: 1, events: [{ id: 'enqueued',
+    type: 'session.inbox.enqueued', seq: 1, aggregateID: sessionID,
+    data: { sessionID, inboxID, item: { type: 'user', delivery: 'queue', payload: { text: intent.input.text } } } }] })
+  f.native.messages = async () => ({ data: [], previous: null, next: null })
+  f.native.inbox = async () => [{ id: inboxID, sessionID, type: 'user', delivery: 'queue',
+    timeCreated: 1, payload: { text: intent.input.text } }]
+}
+
+function acquisitionGate() {
+  let release: () => void = () => undefined
+  let reject: (reason: Error) => void = () => undefined
+  const promise = new Promise<void>((resolve, fail) => { release = resolve; reject = fail })
+  return { promise, release, reject }
+}
+async function waitForTestAcquisitions(observe: () => boolean) {
+  const deadline = Date.now() + 1000
+  while (!observe() && Date.now() < deadline) await Bun.sleep(5)
+  expect(observe()).toBe(true)
+}
+
+test('three original acquisitions overlap, the fourth stays queued, and all six become ready without model input', async () => {
+  const gate = acquisitionGate(), started: string[] = []
+  let active = 0, maximum = 0
+  const f = await fixture({ memberCount: 6, acquisition: async memberId => {
+    started.push(memberId); active++; maximum = Math.max(maximum, active)
+    try { if (started.length <= 3) await gate.promise } finally { active-- }
+  } })
+  try {
+    await waitForTestAcquisitions(() => started.length === 3)
+    expect(started).toEqual(['worker', 'worker-2', 'worker-3'])
+    expect(active).toBe(3)
+    expect(f.counters.clients).toBe(0)
+    expect(await f.owner.execute({ operation: 'status' }, Date.now() + 1000)).toMatchObject({ state: 'starting' })
+    gate.release()
+    await f.owner.ready()
+    const status = await f.owner.execute({ operation: 'status' }, Date.now() + 1000)
+    expect(status).toMatchObject({ state: 'active' })
+    if (status.kind !== 'status') throw Error('TEST status missing')
+    expect(status.members).toHaveLength(6)
+    expect(status.members.every(member => member.state === 'accepted' && member.bootstrap?.verified)).toBe(true)
+    expect(maximum).toBe(3)
+    expect(f.counters).toMatchObject({ acquired: 6, clients: 6, sessions: 6, prompted: 0 })
+  } finally { gate.release(); await f.close() }
+}, 15_000)
+
+test('first acquisition failure aborts peers, closes late original leases and never starts queued members or clients', async () => {
+  const gates = Array.from({ length: 3 }, acquisitionGate), started: string[] = [], signals: AbortSignal[] = []
+  let settled = 0
+  const f = await fixture({ memberCount: 5, acquisition: async (memberId, signal) => {
+    const index = started.length; started.push(memberId)
+    if (!signal) throw Error('TEST acquisition signal absent')
+    signals.push(signal)
+    try { await gates[index]!.promise } finally { settled++ }
+  } })
+  try {
+    await waitForTestAcquisitions(() => started.length === 3)
+    gates[0]!.reject(new Error('TEST original acquisition failure'))
+    await waitForTestAcquisitions(() => signals.slice(1).every(signal => signal.aborted))
+    gates[1]!.release(); gates[2]!.release() // Deliberately late success must be closed before any client/session.
+    await expect(f.owner.ready()).rejects.toThrow('TEST original acquisition failure')
+    await f.owner.stop()
+    expect(started).toEqual(['worker', 'worker-2', 'worker-3'])
+    expect(settled).toBe(3)
+    expect(f.counters).toMatchObject({ acquired: 3, closed: 2, clients: 0, sessions: 0, prompted: 0 })
+    expect(await f.owner.execute({ operation: 'status' }, Date.now() + 1000)).toMatchObject({ state: 'cleanup_unknown' })
+  } finally { for (const gate of gates) gate.release(); await f.close() }
+}, 15_000)
+
+test('stop during three held acquisitions joins late original leases and refuses both queued starts and model input', async () => {
+  const gate = acquisitionGate(), started: string[] = [], signals: AbortSignal[] = []
+  let settled = 0
+  const f = await fixture({ memberCount: 5, acquisition: async (memberId, signal) => {
+    started.push(memberId)
+    if (!signal) throw Error('TEST acquisition signal absent')
+    signals.push(signal)
+    try { await gate.promise } finally { settled++ }
+  } })
+  try {
+    await waitForTestAcquisitions(() => started.length === 3)
+    const stopping = f.owner.stop()
+    await waitForTestAcquisitions(() => signals.every(signal => signal.aborted))
+    gate.release()
+    await expect(f.owner.ready()).rejects.toThrow('run_stopped')
+    expect(await stopping).toMatchObject({ state: 'cleanup_unknown' }) // Fake close never proves native retirement.
+    expect(started).toEqual(['worker', 'worker-2', 'worker-3'])
+    expect(settled).toBe(3)
+    expect(f.counters).toMatchObject({ acquired: 3, closed: 3, clients: 0, sessions: 0, prompted: 0 })
+  } finally { gate.release(); await f.close() }
+}, 15_000)
 
 describe('run-owned V2 lease/session/admission composition', () => {
   test('next send settles the exact native-completed original without an observe RPC or replay', async () => {
@@ -206,12 +315,12 @@ describe('run-owned V2 lease/session/admission composition', () => {
       const stored = await (await f.store()).snapshot()
       expect(stored.admissions).toHaveLength(1 + admitted.length)
       expect((stored.terminalSettlements ?? []).length).toBeLessThanOrEqual(1)
-      if (admitted.length) expect(['request-2', 'request-3']).toContain(stored.slot)
+      if (admitted.length) expect(stored.slot === 'request-2' || stored.slot === 'request-3').toBe(true)
       else expect([intent.identity.requestId, null]).toContain(stored.slot)
     } finally { await f.close() }
   })
 
-  for (const lifetimeMs of [120_000, 70_000]) test(`two serial 36s member startups respect shared initialization and original ${lifetimeMs}ms lifetime`, async () => {
+  for (const lifetimeMs of [120_000, 70_000]) test(`two member startup work retains shared initialization and original ${lifetimeMs}ms lifetime`, async () => {
     const origin = Date.now()
     let elapsed = 0
     const clock = spyOn(Date, 'now').mockImplementation(() => origin + elapsed)
@@ -222,7 +331,7 @@ describe('run-owned V2 lease/session/admission composition', () => {
         await f.owner.ready()
         expect(await f.owner.execute({ operation: 'status' }, Date.now() + 5000)).toMatchObject({ state: 'active',
           members: [{ state: 'accepted', bootstrap: { verified: true } }, { state: 'accepted', bootstrap: { verified: true } }] })
-      } else await expect(f.owner.ready()).rejects.toThrow('deadline')
+      } else await expect(f.owner.ready()).rejects.toThrow(/deadline|run_stopped/)
       expect(elapsed).toBe(72_000)
       expect(f.counters.acquired).toBe(2)
       expect(f.counters.prompted).toBe(0)
@@ -287,6 +396,40 @@ describe('run-owned V2 lease/session/admission composition', () => {
       expect(f.counters.prompted).toBe(0)
     } finally { await f.close() }
   })
+  for (const mode of ['pending', 'projected', 'promotion-race', 'unknown-after-race', 'projected-interrupt-false'] as const) {
+    test(`stop routes ${mode} original without replay or post-fence admission writes`, async () => {
+      const f = await fixture()
+      let cancelled = 0
+      try {
+        await f.owner.ready()
+        await f.owner.execute({ operation: 'send', ...f.selected, intent }, Date.now() + 5000)
+        if (mode === 'projected' || mode === 'projected-interrupt-false') publishTerminal(f, false); else publishPending(f)
+        if (mode === 'projected-interrupt-false') f.native.interrupt = async () => {
+          f.counters.interrupted++; return { interrupted: false }
+        }
+        f.native.cancelInbox = async (sessionID, inboxID) => {
+          expect(sessionID).toBe(f.sessionAuthority.sessionID)
+          expect(inboxID).toBe(intent.identity.nativeInputID)
+          expect((await (await f.store()).snapshot()).tombstone).toBe(true)
+          cancelled++
+          if (mode === 'promotion-race') { publishTerminal(f, false); f.native.inbox = async () => [] }
+          if (mode === 'unknown-after-race') f.native.log = async () => { throw new Error('TEST-unavailable') }
+          if (mode !== 'pending') throw new ExecutionTransportFailure('invalid_response', 'unknown')
+        }
+        const before = await (await f.store()).snapshot()
+        const stopped = await f.owner.stop(), after = await (await f.store()).snapshot()
+        expect(cancelled).toBe(mode === 'projected' || mode === 'projected-interrupt-false' ? 0 : 1)
+        expect(stopped.members[0]!.errors).toEqual(mode === 'unknown-after-race' || mode === 'projected-interrupt-false'
+          ? ['cancel_or_interrupt_unknown', 'physical_cleanup_unknown'] : ['physical_cleanup_unknown'])
+        expect(after.tombstone).toBe(true)
+        expect(after.admissions).toEqual(before.admissions)
+        expect(after.terminalSettlements).toEqual(before.terminalSettlements)
+        expect(f.counters.interrupted).toBe(1)
+        expect(f.counters.closed).toBe(1)
+        expect(f.counters.prompted).toBe(1)
+      } finally { await f.close() }
+    })
+  }
   test('stop proves the exact terminal original without observe, cancellation or post-fence writes', async () => {
     const f = await fixture()
     let cancelled = 0
@@ -327,15 +470,15 @@ describe('run-owned V2 lease/session/admission composition', () => {
       expect(f.counters.prompted).toBe(1)
     } finally { await f.close() }
   })
-  for (const reason of ['nonterminal', 'unknown', 'payload', 'session', 'revision'] as const) {
-    test(`stop preserves strict cancellation for ${reason} original evidence`, async () => {
+  for (const reason of ['unknown', 'payload', 'session', 'revision'] as const) {
+    test(`stop refuses cancellation for unproved ${reason} original evidence`, async () => {
       const f = await fixture({ unknown: reason === 'unknown' })
       let cancelled = 0
       let snapshotSpy: ReturnType<typeof spyOn<OpenCodeV2AdmissionStore, 'snapshot'>> | undefined
       try {
         await f.owner.ready()
         await f.owner.execute({ operation: 'send', ...f.selected, intent }, Date.now() + 5000)
-        publishTerminal(f, reason !== 'nonterminal')
+        publishTerminal(f)
         if (reason === 'payload') {
           const read = f.native.log
           f.native.log = async (...args) => {
@@ -350,7 +493,7 @@ describe('run-owned V2 lease/session/admission composition', () => {
           let sessionReads = 0
           const readSession = f.native.getSession, snapshot = OpenCodeV2AdmissionStore.prototype.snapshot
           f.native.getSession = async id => { sessionReads++; return readSession(id) }
-          snapshotSpy = spyOn(OpenCodeV2AdmissionStore.prototype, 'snapshot').mockImplementation(async function () {
+          snapshotSpy = spyOn(OpenCodeV2AdmissionStore.prototype, 'snapshot').mockImplementation(async function (this: OpenCodeV2AdmissionStore) {
             const current = await snapshot.call(this)
             // A competing commit becomes visible after the proof's independent session read.
             return current.tombstone && sessionReads >= 2 ? { ...current,
@@ -363,7 +506,7 @@ describe('run-owned V2 lease/session/admission composition', () => {
           cancelled++; throw new ExecutionTransportFailure('invalid_response', 'unknown')
         }
         const stopped = await f.owner.stop()
-        expect(cancelled).toBe(1)
+        expect(cancelled).toBe(0)
         expect(stopped.members[0]!.errors).toEqual(['cancel_or_interrupt_unknown', 'physical_cleanup_unknown'])
         expect(f.counters.interrupted).toBe(1)
         expect(f.counters.closed).toBe(1)
@@ -696,3 +839,69 @@ describe('owner submission generation and prepared callback failures', () => {
     } finally { release(); await pending; await control?.close(); await f.close() }
   }, 15000)
 })
+
+
+test('probe readiness retains one original across a mutable cut and rejects unbranded faults', async () => {
+  if (process.env.TEST_MUTABLE_READBACK_CHILD !== '1') {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'TEST-probe-cut-preload-'))
+    try {
+      const preload = path.join(root, 'endpoint.ts')
+      const endpoint = await realpath(fileURLToPath(import.meta.resolve('../host/OpenCodeV2ExecutionHost.ts')))
+      await writeFile(preload, `import { mock } from 'bun:test'
+import * as endpoints from ${JSON.stringify(endpoint)}
+mock.module(${JSON.stringify(endpoint)}, () => ({ ...endpoints,
+requireExecutionEndpoint: authority => {
+ if (authority.hostInstanceId !== 'TEST-host' || !authority.profileRoot.includes('/TEST-r249-owner-')) throw Error('TEST foreign endpoint')
+ return { baseUrl: 'http://127.0.0.1:1', nativePID: 42 }
+} }))`)
+      const child = Bun.spawn([process.execPath, 'test', '--preload', preload, import.meta.path, '-t', 'probe readiness retains one original'], {
+        cwd: import.meta.dir, stdout: 'pipe', stderr: 'pipe', env: { PATH: process.env.PATH ?? '', NODE_ENV: 'test', TEST_MUTABLE_READBACK_CHILD: '1' } })
+      const [exit, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()])
+      expect({ exit, stderr: exit === 0 ? '' : stderr }).toEqual({ exit: 0, stderr: '' })
+      expect(stdout).not.toContain('TEST_RAW_')
+    } finally { await rm(root, { recursive: true, force: true }) }
+    return
+  }
+  const f = await fixture({ probe: true })
+  try {
+    await f.owner.ready()
+    await f.owner.execute({ operation: 'send', ...f.selected, intent }, Date.now() + 2000)
+    publishTerminal(f)
+    const stable = f.native.log
+    let reads = 0
+    f.native.log = async id => {
+      const cut = structuredClone(await stable(id))
+      // First reconciliation is stable and may update the same original record.
+      // The next terminal read advances while its transcript is being collected.
+      if (++reads === 4) cut.events = cut.events.map((event, index) => index === cut.events.length - 1
+        ? { ...event, data: { ...event.data, TEST_streaming: true } } : event)
+      return cut
+    }
+    const before = await (await f.store()).snapshot()
+    const pending = await f.owner.execute({ operation: 'probeEvidence', ...f.selected }, Date.now() + 2000)
+    expect(pending).toEqual({ kind: 'probeEvidence', proof: null, failure: null })
+    const retained = await (await f.store()).snapshot()
+    expect(retained.slot).toBe(intent.identity.requestId)
+    expect(retained.admissions).toHaveLength(1)
+    expect(retained.admissions[0]!.identity).toEqual(before.admissions[0]!.identity)
+    expect(retained.admissions[0]!.authority).toEqual(before.admissions[0]!.authority)
+    expect(f.counters).toMatchObject({ prompted: 1, acquired: 1, sessions: 1 })
+    f.native.log = stable
+    const settled = await f.owner.execute({ operation: 'probeEvidence', ...f.selected }, Date.now() + 2000)
+    expect(settled.kind).toBe('probeEvidence')
+    if (settled.kind !== 'probeEvidence') throw Error('TEST probe missing')
+    expect(settled.failure).toBeNull()
+    expect(settled.proof).toMatchObject({ modelId: 'TEST-provider/TEST-model', opencodeVersion: '2.0.21', capabilitySnapshotId: 'TEST-capability' })
+    expect((await (await f.store()).snapshot()).slot).toBeNull()
+    expect(f.counters).toMatchObject({ prompted: 1, acquired: 1, sessions: 1 })
+    for (const fault of [new Error('mutable_readback'), new ExecutionTransportFailure('invalid_response', 'not_submitted')]) {
+      f.native.log = async () => { throw fault }
+      await expect(f.owner.execute({ operation: 'probeEvidence', ...f.selected }, Date.now() + 2000)).rejects.toBe(fault)
+    }
+    f.native.log = async id => {
+      const cut = structuredClone(await stable(id)); cut.events.at(-1)!.aggregateID = 'ses_TESTforeign'; return cut
+    }
+    await expect(f.owner.execute({ operation: 'probeEvidence', ...f.selected }, Date.now() + 2000)).rejects.toThrow('incomplete_log')
+    expect(f.counters.prompted).toBe(1)
+  } finally { f.native.log = async () => ({ events: [], synced: true, watermark: null }); await f.close() }
+}, 15_000)

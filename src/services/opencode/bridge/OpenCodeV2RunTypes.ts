@@ -53,6 +53,7 @@ export type RunMemberStatus = Readonly<{
   controllerTools?: ControllerToolProof
 }>
 export type RunStopMember = Readonly<{ memberId: string; cleanup: ExecutionCleanupReceipt | null; errors: readonly string[] }>
+export type RunProbeFailure = 'native_execution_failed' | 'native_execution_cancelled'
 export type RunControlResult =
   | Readonly<{ kind: 'send_refused'; disposition: 'not_reserved'; authority: SessionAuthority; intent: QueueIntent; submissionOwner?: string }>
   | Readonly<{ kind: 'send' | 'observe'; admission: AdmissionRecord; turn: OpenCodeV2TurnProjection | null }>
@@ -60,7 +61,7 @@ export type RunControlResult =
   | Readonly<{ kind: 'permissions'; requests: ExecutionPermission[] }>
   | Readonly<{ kind: 'permissionReply'; status: 'applied' | 'unknown' }>
   | Readonly<{ kind: 'mcp'; servers: ExecutionMcpServer[] }>
-  | Readonly<{ kind: 'probeEvidence'; proof: OpenCodeExecutionProof | null }>
+  | Readonly<{ kind: 'probeEvidence'; proof: OpenCodeExecutionProof | null; failure: RunProbeFailure | null }>
   | Readonly<{ kind: 'status'; qualification?: RunQualification; state: RunOwnerState; members: readonly RunMemberStatus[]; deadline: number }>
   | Readonly<{ kind: 'stop'; state: 'stopped' | 'cleanup_unknown'; members: readonly RunStopMember[]; ownerRetired?: boolean }>
 

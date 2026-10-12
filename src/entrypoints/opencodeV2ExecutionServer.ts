@@ -5,8 +5,9 @@ import { resolveOpenCodeV2ExecutionDelivery } from '../services/opencode/host/Op
 import { hashOpenCodeFile } from '../services/opencode/compatibility/OpenCodeNativeIdentity.js'
 import { executionAssert, executionHash, executionRecord } from '../services/opencode/execution/OpenCodeV2ExecutionContracts.js'
 import { validateExecutionGraph, validateExecutionNative, validateExecutionProfile,
-  type OwnedNativeProfile, type ValidatedExecutionNative } from '../services/opencode/host/OpenCodeV2ExecutionBinding.js'
+  type ExecutionGraphProgress, type OwnedNativeProfile, type ValidatedExecutionNative } from '../services/opencode/host/OpenCodeV2ExecutionBinding.js'
 import { boundOpenCodeRead } from '../services/opencode/transport/OpenCodeBoundedFetch.js'
+import { importOpenCodeV2SelectedOAuth } from '../services/opencode/host/OpenCodeV2ExecutionOAuth.js'
 import type { ServerOptions as FloorOptions } from '@opencode/server-v2-floor/options'
 import type { ServerOptions as CurrentOptions } from '@opencode/server/options'
 
@@ -31,14 +32,26 @@ let startup: Promise<void> | undefined, finalize: (() => Promise<void>) | undefi
 let closeWork: Promise<void> | undefined
 const startupStartedAt = Date.now()
 let startupStage = 'waiting-for-prepare'
+const startupHistory = [{ stage: startupStage, elapsedMs: 0 }]
+let graphProgress: ExecutionGraphProgress | undefined
+let runtimeReady = false, startupFailureReported = false
+function enterStartupStage(stage: string): void {
+  startupStage = stage
+  startupHistory.push({ stage, elapsedMs: Math.max(startupHistory.at(-1)!.elapsedMs, Date.now() - startupStartedAt) })
+}
 function reportStartupFailure(reason: 'timeout' | 'failed'): void {
+  if (runtimeReady || startupFailureReported) return
+  startupFailureReported = true
   // Fixed stage names and elapsed time only; never include credentials or payloads.
   process.stderr.write(JSON.stringify({ event: 'opencode-v2-startup', reason, stage: startupStage,
-    elapsedMs: Date.now() - startupStartedAt }) + '\n')
+    elapsedMs: Math.max(startupHistory.at(-1)!.elapsedMs, Date.now() - startupStartedAt), history: startupHistory, ...(graphProgress ? { graph: graphProgress } : {}) }) + '\n')
 }
-const startupTimer = setTimeout(() => { reportStartupFailure('timeout'); void close() }, 30_000)
+// A source graph can legitimately take more than 30 seconds under concurrent
+// startup. The owner still enforces its original shared initialization deadline.
+const startupTimer = setTimeout(() => { reportStartupFailure('timeout'); void close() }, 60_000)
 function close(): Promise<void> {
   return closeWork ??= (async () => {
+    if (!runtimeReady) reportStartupFailure('failed')
     closing = true; controller.abort(); clearTimeout(startupTimer)
     let complete = true
     // Acquisition may register a Scope after a suspended import. A timeout cannot earn ACK.
@@ -71,17 +84,17 @@ async function start(input: Record<string, unknown>): Promise<void> {
     native.generation === 'v2' &&
     (native.version === '2.0.0' || native.version === '2.0.21') && native.dialect === `v2-${native.version}` &&
     process.versions.bun === '1.3.11', 'execution_identity_mismatch')
-  startupStage = 'profile-validation'
+  enterStartupStage('profile-validation')
   await validateExecutionProfile(profile); controller.signal.throwIfAborted()
   executionAssert(profile.directory === process.cwd() && process.env.PWD === profile.directory &&
     Object.entries(profile.env).every(([key, value]) => process.env[key] === value), 'execution_profile_changed')
   executionAssert(process.execPath === native.bun.path && await hashOpenCodeFile(process.execPath) === native.bun.sha256 &&
     await hashOpenCodeFile(process.argv[1]!) === native.entrySha256, 'execution_identity_mismatch')
-  startupStage = 'native-validation'
+  enterStartupStage('native-validation')
   await validateExecutionNative(native)
   controller.signal.throwIfAborted()
-  startupStage = 'graph-validation'
-  const graph = await validateExecutionGraph(native.version, native.graph)
+  enterStartupStage('graph-validation')
+  const graph = await validateExecutionGraph(native.version, native.graph, value => { graphProgress = value })
   controller.signal.throwIfAborted()
   const options = {
     hostname: '127.0.0.1', port: 0, password: input.password,
@@ -93,14 +106,14 @@ async function start(input: Record<string, unknown>): Promise<void> {
   } satisfies FloorOptions & CurrentOptions
   let baseUrl: string
   if (process.platform === 'win32') {
-    startupStage = 'runtime-import'
+    enterStartupStage('runtime-import')
     const { loadOpenCodeV2WindowsRuntime } = await import('../services/opencode/host/windows/OpenCodeV2WindowsRuntime.js')
     const { windowsExecutionCommandPort } = await import('../services/opencode/host/windows/OpenCodeV2WindowsCommand.js')
     const { bindWindowsExecutionHttp } = await import('../services/opencode/host/windows/OpenCodeV2WindowsHTTP.js')
     const runtime = await loadOpenCodeV2WindowsRuntime(native.version, graph.moduleSha256,
-      windowsExecutionCommandPort(), profile.env)
+      windowsExecutionCommandPort(), profile)
     controller.signal.throwIfAborted()
-    startupStage = 'server-start'
+    enterStartupStage('server-start')
     const server = await runtime.start(options, controller.signal)
     // Register ownership before binding so a failed bridge bind still closes
     // the acquired official server, without acknowledging partial cleanup.
@@ -110,24 +123,27 @@ async function start(input: Record<string, unknown>): Promise<void> {
     baseUrl = server.baseUrl
   } else {
     // Effect and runtime resolve from the same verified official package graph.
-    startupStage = 'effect-import'
+    enterStartupStage('effect-import')
     const effect: typeof import('effect') = await import(pathToFileURL(graph.effectPath).href)
     controller.signal.throwIfAborted()
-    startupStage = 'runtime-import'
+    enterStartupStage('selected-oauth-import')
+    await importOpenCodeV2SelectedOAuth(profile, native.graph, graph.modulePath, effect, controller.signal)
+    controller.signal.throwIfAborted()
+    enterStartupStage('runtime-import')
     const runtime: typeof import('@opencode/server/process') = await import(pathToFileURL(graph.modulePath).href)
     controller.signal.throwIfAborted()
     const { Effect, Scope, Exit } = effect
-    startupStage = 'scope-acquisition'
+    enterStartupStage('scope-acquisition')
     const scope = await Effect.runPromise(Scope.make())
     finalize = () => Effect.runPromise(Scope.close(scope, Exit.void))
     controller.signal.throwIfAborted()
-    startupStage = 'server-start'
+    enterStartupStage('server-start')
     const server = await Effect.runPromise(runtime.start<never, never>(options).pipe(Effect.provideService(Scope.Scope, scope)), { signal: controller.signal })
     executionAssert(server.address._tag === 'TcpAddress' && server.address.hostname === '127.0.0.1')
     baseUrl = `http://127.0.0.1:${server.address.port}`
   }
   controller.signal.throwIfAborted()
-  startupStage = 'ready-identity'
+  enterStartupStage('ready-identity')
   const birth = await readExecutionPlatformBirth(process.pid)
   controller.signal.throwIfAborted()
   executionAssert(!closing && birth && /^http:\/\/127\.0\.0\.1:[1-9]\d*$/.test(baseUrl))
@@ -138,6 +154,7 @@ async function start(input: Record<string, unknown>): Promise<void> {
     baseUrl, graphSha256: native.graph.sha256,
     executableSha256: native.bun.sha256, profileEpoch: profile.epoch,
     selectionSha256: executionHash(profile.selection) }), 1000, controller.signal)
+  runtimeReady = true
 }
 childControl.events.on('message', (message: unknown) => {
   try {

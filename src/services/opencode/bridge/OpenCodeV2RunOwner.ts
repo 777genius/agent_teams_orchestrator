@@ -1,3 +1,4 @@
+import { retainOpenCodeV2InitializationPhase, type RunInitializationPhase } from '../execution/OpenCodeV2Diagnostics.js'
 import { captureOwnedV2ProbeAuthority, buildOwnedV2ProbeProof, type ProbeAuthority } from './OpenCodeV2ProbeProof.js'
 import { readOwnedControllerInbox, readOwnedControllerTools, type ControllerToolProof } from './OpenCodeV2ControllerTools.js'
 import { spawn } from 'node:child_process'
@@ -7,6 +8,7 @@ import path from 'node:path'
 import { resolveOpenCodeV2ExecutionDelivery } from '../host/OpenCodeV2ExecutionDelivery.js'
 import { assertExecutionPlatformAvailable } from '../host/OpenCodeV2ExecutionPlatform.js'
 import { OpenCodeV2AdmissionService, type QueueIntent } from '../execution/OpenCodeV2AdmissionService.js'
+import { isMutableExecutionReadback } from '../execution/OpenCodeV2TerminalSettlement.js'
 import { OpenCodeV2AdmissionStore } from '../execution/OpenCodeV2AdmissionStore.js'
 import { OpenCodeV2SessionService, verifyExecutionSession } from '../execution/OpenCodeV2SessionService.js'
 import { canonicalExecutionJSON, executionAssert, executionHash, executionRecord, type ExecutionContext, type SessionAuthority } from '../execution/OpenCodeV2ExecutionContracts.js'
@@ -110,68 +112,98 @@ export class OpenCodeV2RunOwner {
   }
   private async initialize(): Promise<void> {
     const initializationDeadline = Math.min(this.plan.deadline, Date.now() + OPEN_CODE_V2_RUN_INITIALIZATION_MS)
-    for (const memberPlan of this.plan.members) {
-      executionAssert(this.state === 'starting' && Date.now() < initializationDeadline, 'run_stopped')
-      const acquiring = new AbortController()
-      this.acquisitions.add(acquiring)
-      const acquisitionTimer = setTimeout(() => acquiring.abort(new Error('run_acquisition_timeout')), initializationDeadline - Date.now())
-      let lease: ExecutionLease
-      try { lease = await this.ports.acquire(memberPlan.native, memberPlan.profile, this.context(memberPlan, this.plan.deadline, acquiring.signal)) }
-      finally { clearTimeout(acquisitionTimer); this.acquisitions.delete(acquiring) }
-      this.pendingLeases.set(memberPlan.memberId, lease)
-      let member: Member | undefined
-      const initializationTimer = setTimeout(() => this.initializationAbort.abort(new Error('run_initialization_timeout')), initializationDeadline - Date.now())
-      try {
-        executionAssert(this.state === 'starting', 'run_stopped')
-        const client = await this.ports.client(lease.authority, this.context(memberPlan, initializationDeadline, this.initializationAbort.signal))
-        executionAssert(client.authority === lease.authority, 'run_lease_not_owned')
-        const authority: SessionAuthority = { host: lease.authority, teamId: this.plan.binding.teamId, runId: this.plan.binding.runId,
-          laneId: memberPlan.laneId, memberId: memberPlan.memberId, sessionID: memberPlan.originalSessionId,
-          agent: memberPlan.profile.selection.agent, model: memberPlan.profile.selection.model }
-        const store = await OpenCodeV2AdmissionStore.open(this.plan.dataRoot, authority)
-        const session = new OpenCodeV2SessionService(client, store, authority)
-        member = { plan: memberPlan, lease, client, authority, store, session, state: 'unknown', bootstrap: null, mcpConnected: false, intents: new Map(), deliveryTail: Promise.resolve(), refusals: new Map() }
-        this.members.set(memberPlan.memberId, member)
-        this.pendingLeases.delete(memberPlan.memberId)
-        executionAssert(this.state === 'starting', 'run_stopped')
-        await session.reserveSession()
-        const created = await session.createSession(memberPlan.title)
-        member.state = created.disposition
-        await this.persistState()
-        executionAssert(created.disposition === 'accepted' && created.session, 'run_original_session_unknown')
-        // Actual native persistent context, never a queue/resume:false model
-        // turn. There is no published messageID for an instruction entry.
-        const value = { context: memberPlan.bootstrap.value, contextHash: memberPlan.bootstrap.contextHash,
-          briefingHash: memberPlan.bootstrap.briefingHash, teamId: authority.teamId, runId: authority.runId,
-          laneId: authority.laneId, memberId: authority.memberId, originalSessionId: authority.sessionID }
-        const before = await this.cut(client, authority.sessionID)
-        await client.putInstruction(authority.sessionID, memberPlan.bootstrap.key, value)
-        const entries = await client.instructions(authority.sessionID)
-        const after = await this.cut(client, authority.sessionID)
-        verifyOpenCodeV2SilentBootstrap({ before, after, entries, key: memberPlan.bootstrap.key, value })
-        member.bootstrap = { strategy: 'instruction-entry', key: memberPlan.bootstrap.key,
-          contextHash: memberPlan.bootstrap.contextHash, briefingHash: memberPlan.bootstrap.briefingHash,
-          verified: true, missingNativeMessageID: true }
-        await client.connectMcp(memberPlan.controllerMcpName)
-        const servers = await client.mcp()
-        member.mcpConnected = servers.filter(server => server.name === memberPlan.controllerMcpName && server.status === 'connected').length === 1
-        executionAssert(member.mcpConnected, 'run_controller_mcp_unknown')
-        member.controllerTools = await readOwnedControllerTools(client, memberPlan.profile, memberPlan.controllerMcpName, initializationDeadline, this.initializationAbort.signal)
-        if (this.plan.executionProbe?.memberId === memberPlan.memberId)
-          member.probeAuthority = await captureOwnedV2ProbeAuthority(client, this.plan.executionProbe.prepared)
-        await this.persistState()
-      } catch (failure) {
-        // If an object was not yet registered, no lease may escape cleanup.
-        if (!member || this.state !== 'starting') {
-          const closing = this.closeLease(lease)
-          if (member) await boundOpenCodeRead(member.client.dispose(), 2000).catch(() => undefined)
-          await closing.then(() => this.pendingLeases.delete(memberPlan.memberId)).catch(() => undefined)
+    let nextMember = 0
+    const initializeWorker = async () => {
+      while (nextMember < this.plan.members.length && !this.initializationAbort.signal.aborted) {
+        const memberPlan = this.plan.members[nextMember++]!
+        try { await this.initializeMember(memberPlan, initializationDeadline) }
+        catch (error) {
+          this.initializationAbort.abort(error)
+          for (const acquisition of this.acquisitions) acquisition.abort(error)
+          throw error
         }
-        throw failure
-      } finally { clearTimeout(initializationTimer) }
+      }
     }
-    executionAssert(this.state === 'starting', 'run_stopped')
+    // Profiles and session identities are disjoint. Bound startup concurrency
+    // while retaining one run deadline and joining every original acquisition.
+    const results = await Promise.allSettled(Array.from({ length: Math.min(3, this.plan.members.length) }, initializeWorker))
+    const rejected = results.find(result => result.status === 'rejected')
+    if (rejected?.status === 'rejected') throw rejected.reason
+    executionAssert(this.state === 'starting' && !this.initializationAbort.signal.aborted &&
+      Date.now() < initializationDeadline, 'run_stopped')
     this.state = 'active'; await this.persistState()
+  }
+  private async initializeMember(memberPlan: RunMemberPlan, initializationDeadline: number): Promise<void> {
+    const initializationStartedAt = Date.now()
+    let initializationPhase: RunInitializationPhase | undefined
+    executionAssert(this.state === 'starting' && !this.initializationAbort.signal.aborted &&
+      Date.now() < initializationDeadline, 'run_stopped')
+    const acquiring = new AbortController()
+    this.acquisitions.add(acquiring)
+    const acquisitionTimer = setTimeout(() => acquiring.abort(new Error('run_acquisition_timeout')), initializationDeadline - Date.now())
+    let lease: ExecutionLease
+    try { lease = await this.ports.acquire(memberPlan.native, memberPlan.profile, this.context(memberPlan, this.plan.deadline, acquiring.signal)) }
+    finally { clearTimeout(acquisitionTimer); this.acquisitions.delete(acquiring) }
+    this.pendingLeases.set(memberPlan.memberId, lease)
+    let member: Member | undefined
+    const initializationTimer = setTimeout(() => this.initializationAbort.abort(new Error('run_initialization_timeout')), initializationDeadline - Date.now())
+    try {
+      executionAssert(this.state === 'starting' && !this.initializationAbort.signal.aborted &&
+        Date.now() < initializationDeadline, 'run_stopped')
+      const client = await this.ports.client(lease.authority, this.context(memberPlan, initializationDeadline, this.initializationAbort.signal))
+      executionAssert(client.authority === lease.authority, 'run_lease_not_owned')
+      const authority: SessionAuthority = { host: lease.authority, teamId: this.plan.binding.teamId, runId: this.plan.binding.runId,
+        laneId: memberPlan.laneId, memberId: memberPlan.memberId, sessionID: memberPlan.originalSessionId,
+        agent: memberPlan.profile.selection.agent, model: memberPlan.profile.selection.model }
+      const store = await OpenCodeV2AdmissionStore.open(this.plan.dataRoot, authority)
+      const session = new OpenCodeV2SessionService(client, store, authority)
+      member = { plan: memberPlan, lease, client, authority, store, session, state: 'unknown', bootstrap: null, mcpConnected: false, intents: new Map(), deliveryTail: Promise.resolve(), refusals: new Map() }
+      this.members.set(memberPlan.memberId, member)
+      this.pendingLeases.delete(memberPlan.memberId)
+      executionAssert(this.state === 'starting' && !this.initializationAbort.signal.aborted &&
+        Date.now() < initializationDeadline, 'run_stopped')
+      await session.reserveSession()
+      const created = await session.createSession(memberPlan.title)
+      member.state = created.disposition
+      await this.persistState()
+      executionAssert(created.disposition === 'accepted' && created.session, 'run_original_session_unknown')
+      // Actual native persistent context, never a queue/resume:false model
+      // turn. There is no published messageID for an instruction entry.
+      const value = { context: memberPlan.bootstrap.value, contextHash: memberPlan.bootstrap.contextHash,
+        briefingHash: memberPlan.bootstrap.briefingHash, teamId: authority.teamId, runId: authority.runId,
+        laneId: authority.laneId, memberId: authority.memberId, originalSessionId: authority.sessionID }
+      const before = await this.cut(client, authority.sessionID)
+      await client.putInstruction(authority.sessionID, memberPlan.bootstrap.key, value)
+      const entries = await client.instructions(authority.sessionID)
+      const after = await this.cut(client, authority.sessionID)
+      verifyOpenCodeV2SilentBootstrap({ before, after, entries, key: memberPlan.bootstrap.key, value })
+      member.bootstrap = { strategy: 'instruction-entry', key: memberPlan.bootstrap.key,
+        contextHash: memberPlan.bootstrap.contextHash, briefingHash: memberPlan.bootstrap.briefingHash,
+        verified: true, missingNativeMessageID: true }
+      initializationPhase = 'MCP-connect'
+      await client.connectMcp(memberPlan.controllerMcpName)
+      initializationPhase = 'MCP-readback'
+      const servers = await client.mcp()
+      member.mcpConnected = servers.filter(server => server.name === memberPlan.controllerMcpName && server.status === 'connected').length === 1
+      executionAssert(member.mcpConnected, 'run_controller_mcp_unknown')
+      initializationPhase = 'controller-tools'
+      member.controllerTools = await readOwnedControllerTools(client, memberPlan.profile, memberPlan.controllerMcpName, initializationDeadline, this.initializationAbort.signal)
+      if (this.plan.executionProbe?.memberId === memberPlan.memberId) {
+        initializationPhase = 'probe-authority'
+        member.probeAuthority = await captureOwnedV2ProbeAuthority(client, this.plan.executionProbe.prepared)
+      }
+      initializationPhase = undefined
+      await this.persistState()
+    } catch (failure) {
+      if (initializationPhase) retainOpenCodeV2InitializationPhase(failure, initializationPhase, Date.now() - initializationStartedAt)
+      // If an object was not yet registered, no lease may escape cleanup.
+      if (!member || this.state !== 'starting') {
+        const closing = this.closeLease(lease)
+        if (member) await boundOpenCodeRead(member.client.dispose(), 2000).catch(() => undefined)
+        await closing.then(() => this.pendingLeases.delete(memberPlan.memberId)).catch(() => undefined)
+      }
+      throw failure
+    } finally { clearTimeout(initializationTimer) }
   }
   async ready(): Promise<void> { await this.initialization }
   private closeLease(lease: ExecutionLease): Promise<ExecutionCleanupReceipt> {
@@ -291,10 +323,17 @@ export class OpenCodeV2RunOwner {
         const probe = this.plan.executionProbe
         executionAssert(probe && probe.memberId === member.plan.memberId && member.probeAuthority, 'probe_not_owned')
         const service = new OpenCodeV2AdmissionService(client, member.store, member.authority)
-        const admission = await service.settleOriginalInput(probe.intent)
-        const proof = await buildOwnedV2ProbeProof({ client, authority: member.authority, captured: member.probeAuthority,
-          intent: probe.intent, admission, expectedText: probe.expectedText, capabilitySnapshotId: probe.capabilitySnapshotId })
-        return { kind: 'probeEvidence', proof }
+        try {
+          const admission = await service.settleOriginalInput(probe.intent)
+          const evidence = await buildOwnedV2ProbeProof({ client, authority: member.authority, captured: member.probeAuthority,
+            intent: probe.intent, admission, expectedText: probe.expectedText, capabilitySnapshotId: probe.capabilitySnapshotId })
+          return { kind: 'probeEvidence', ...evidence }
+        } catch (failure) {
+          // The same original may still be streaming. No resubmission, release
+          // or catch-side journal write; the next bounded read retains its IDs.
+          if (isMutableExecutionReadback(failure)) return { kind: 'probeEvidence', proof: null, failure: null }
+          throw failure
+        }
       }
       if (request.operation === 'transcript') return { kind: 'transcript', ...await this.cut(client, id) }
       if (request.operation === 'mcp') return { kind: 'mcp', servers: await client.mcp() }
@@ -381,7 +420,21 @@ export class OpenCodeV2RunOwner {
     // it before initialization settles. Do not launch a replacement owner.
     await boundOpenCodeRead(this.initialization.catch(() => undefined), remaining(2000)).catch(() => { durable = false })
     const results = await Promise.all([...this.members.values()].map(async (member): Promise<RunStopMember> => {
-      const errors: string[] = [], ids: readonly string[] = await boundOpenCodeRead(member.store.fenceStop(), remaining(2000))
+      const fenceDeadline = Date.now() + remaining(2000)
+      const fence = async (): Promise<readonly string[]> => {
+        for (;;) {
+          executionAssert(Date.now() < fenceDeadline, 'run_stop_fence_timeout')
+          try { return await member.store.fenceStop() }
+          catch (error) {
+            // An already admitted update can briefly hold the same lock. Only
+            // lock contention may retry this monotonic fence; no native input
+            // is repeated and the original stop budget never moves.
+            if (!error || typeof error !== 'object' || !('code' in error) || error.code !== 'ELOCKED' || Date.now() >= fenceDeadline) throw error
+            await new Promise(resolve => setTimeout(resolve, Math.min(10, fenceDeadline - Date.now())))
+          }
+        }
+      }
+      const errors: string[] = [], ids: readonly string[] = await boundOpenCodeRead(fence(), Math.max(1, fenceDeadline - Date.now()))
         .catch(() => { errors.push('tombstone_unknown'); return [] })
       let cleanupClient: ExecutionBridgeClient | undefined
       try {
@@ -393,21 +446,43 @@ export class OpenCodeV2RunOwner {
         const candidates = ids.map(nativeInputID => ({ nativeInputID, deadline: Date.now() + remaining(2000) }))
         // Read terminal cuts before interrupt can change their native log. Classification
         // and any remaining cancellation share the original per-input deadline.
-        const terminal = await Promise.all(candidates.map(async ({ nativeInputID, deadline }) => {
+        const dispositions = await Promise.all(candidates.map(async ({ nativeInputID, deadline }) => {
           const original = member.intents.get(nativeInputID)
-          const proved = original ? await boundOpenCodeRead(admissions.terminalAfterStop(original), Math.max(1, deadline - Date.now()))
-            .catch(() => false) : false
-          return proved && Date.now() < deadline
+          const disposition = original ? await boundOpenCodeRead(admissions.dispositionAfterStop(original), Math.max(1, deadline - Date.now()))
+            .catch(() => 'unknown' as const) : 'unknown'
+          return Date.now() < deadline ? disposition : 'unknown'
         }))
-        const cancellation = await Promise.allSettled([
-          ...candidates.filter((_candidate, index) => !terminal[index]).map(async ({ nativeInputID, deadline }) => {
+        const routing = await Promise.allSettled(candidates.map(async ({ nativeInputID, deadline }, index) => {
+          const disposition = dispositions[index]
+          executionAssert(disposition !== 'unknown', 'stop_original_unknown')
+          if (disposition !== 'pending') return disposition
+          try {
             const budget = deadline - Date.now()
             executionAssert(budget > 0, 'authority_or_deadline')
             await boundOpenCodeRead(native.cancelInbox(member.authority.sessionID, nativeInputID), budget)
-          }),
-          boundOpenCodeRead(native.interrupt(member.authority.sessionID), remaining(2000)),
-        ])
-        if (cancellation.some(result => result.status === 'rejected')) errors.push('cancel_or_interrupt_unknown')
+            return 'cancelled' as const
+          } catch {
+            // A pending input can promote between the read and cancellation.
+            // No HTTP error itself proves delivery; independently bind the
+            // original projected USER/terminal cut before routing to interrupt.
+            const original = member.intents.get(nativeInputID), budget = deadline - Date.now()
+            executionAssert(original && budget > 0, 'stop_original_unknown')
+            const raced = await boundOpenCodeRead(admissions.dispositionAfterStop(original), budget)
+            executionAssert(raced === 'projected' || raced === 'terminal', 'stop_original_unknown')
+            return raced
+          }
+        }))
+        const interruption = await boundOpenCodeRead(native.interrupt(member.authority.sessionID), remaining(2000))
+        executionAssert(routing.every(result => result.status === 'fulfilled'), 'stop_original_unknown')
+        if (!interruption.interrupted) {
+          for (let index = 0; index < routing.length; index++) {
+            const result = routing[index], candidate = candidates[index]!
+            if (result?.status !== 'fulfilled' || result.value !== 'projected') continue
+            const original = member.intents.get(candidate.nativeInputID), budget = candidate.deadline - Date.now()
+            executionAssert(original && budget > 0 &&
+              await boundOpenCodeRead(admissions.terminalAfterStop(original), budget), 'stop_interrupt_unknown')
+          }
+        }
       } catch { errors.push('cancel_or_interrupt_unknown') }
       try { await boundOpenCodeRead(Promise.all([member.client.dispose(), ...(cleanupClient ? [cleanupClient.dispose()] : [])]), remaining(2000)) }
       catch { errors.push('readers_unknown') }

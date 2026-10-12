@@ -99,9 +99,13 @@ export class OpenCodeV2ExecutionFetch {
       executionAssert(request.method === 'GET' && (session || list || log || scoped || identity) ||
         request.method === 'POST' && (create || prompt || activation), 'capabilities_pending')
       const allowed = scoped || activation ? ['location[directory]'] : log ? ['after', 'follow'] :
-        url.pathname.endsWith('/message') ? ['cursor', 'limit'] : []
+        url.pathname.endsWith('/message') ? ['cursor', 'limit', 'order'] : []
       for (const key of url.searchParams.keys()) {
         executionAssert(allowed.includes(key) && url.searchParams.getAll(key).length === 1, 'authority_mismatch')
+      }
+      if (url.pathname.endsWith('/message')) {
+        const order = url.searchParams.get('order')
+        executionAssert(order === null || order === 'asc' && !url.searchParams.has('cursor'), 'authority_mismatch')
       }
       if (scoped || activation) executionAssert(url.searchParams.get('location[directory]') === this.directory, 'authority_mismatch')
       if (log) executionAssert(url.searchParams.get('follow') === 'false', 'capabilities_pending')

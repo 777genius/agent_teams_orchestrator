@@ -128,6 +128,29 @@ describe('private run control with separate synthetic CLI processes', () => {
       if (record) await expect(requestOpenCodeV2Run(record, { operation: 'status' }, 1000)).rejects.toThrow()
     } finally { await Promise.all([stopTestChild(owner), stopTestChild(foreign)]); await rm(parent, { recursive: true, force: true }) }
   }, 120_000)
+  test('operation failures retain only exact private codes while the public result remains unknown', async () => {
+    const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'TEST-run-private-failure-')))
+    const directory = await reserveRunControlDirectory(root, binding, 'a'.repeat(64))
+    let failure = 'mutable_readback'
+    const control = await serveOpenCodeV2RunControl(directory, binding, Date.now() + 30_000, 'a'.repeat(64),
+      async () => { throw new Error(failure) })
+    try {
+      await expect(requestOpenCodeV2Run(control.record, { operation: 'status' }, 5000)).rejects.toThrow('run_operation_unknown')
+      const first = JSON.parse(await readFile(path.join(directory, 'operation-failure.json'), 'utf8'))
+      expect(first).toEqual({ schemaVersion: 1, event: 'opencode_v2_run_operation_failure', binding,
+        operation: 'status', category: 'mutable_readback', timestamp: expect.any(String) })
+      failure = 'mutable_readback SECRET provider body /private/auth'
+      await expect(requestOpenCodeV2Run(control.record, { operation: 'status' }, 5000)).rejects.toThrow('run_operation_unknown')
+      const text = await readFile(path.join(directory, 'operation-failure.json'), 'utf8')
+      expect(JSON.parse(text).category).toBe('unclassified')
+      expect(text).not.toContain('SECRET')
+      expect(text).not.toContain('/private/auth')
+      expect((await lstat(path.join(directory, 'operation-failure.json'))).mode & 0o777).toBe(0o600)
+    } finally {
+      await control.close()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 30_000)
   for (const archiveDelayMs of [250, 10_001]) test(`stop archive reads retain the caller deadline after ${archiveDelayMs}ms`, async () => {
     const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'TEST-stop-archive-deadline-')))
     const directory = await reserveRunControlDirectory(root, binding, 'a'.repeat(64))

@@ -98,6 +98,24 @@ async function identity(value: unknown): Promise<DarwinProcessIdentity> {
     coalition: Object.freeze({ resource: scope.resource, jetsam: scope.jetsam }) })
 }
 const quote = (text: string) => JSON.stringify(text)
+/** Remove only descendants already covered by an existing read grant.
+ * Canonical validation still checks every requested root before policy emission. */
+export function minimalReadOnlyRoots(roots: readonly string[]): readonly string[] {
+  const retained: string[] = []
+  for (const root of [...new Set(roots)].sort((a, b) => a.length - b.length || (a < b ? -1 : a > b ? 1 : 0))) {
+    if (!retained.some(parent => root.startsWith(`${parent}${path.sep}`))) retained.push(root)
+  }
+  return retained
+}
+const systemReadOnlyRoots = ['/System', '/usr', '/bin', '/sbin', '/Library/Apple'] as const
+/** Keep directory-only ancestor grants unless an existing read subpath covers them. */
+export function uncoveredReadAncestorDirectories(
+  ancestors: readonly string[], readSubpaths: readonly string[],
+): readonly string[] {
+  const readUnion = minimalReadOnlyRoots(readSubpaths)
+  return ancestors.filter(directory => !readUnion.some(root =>
+    directory === root || directory.startsWith(`${root}${path.sep}`)))
+}
 export async function planDarwinExecution(requested: Readonly<{
   bun: Readonly<{ path: string; sha256: string }>; entry: string; cwd: string
   writableRoots: readonly string[]; readOnlyRoots: readonly string[]; protectedRoots?: readonly string[]
@@ -112,7 +130,12 @@ export async function planDarwinExecution(requested: Readonly<{
       'execution_containment_path_alias_pending')
   }
   const roots = [...new Set([...input.writableRoots, ...input.readOnlyRoots])]
-  for (const root of roots) assert(path.isAbsolute(root) && root !== '/' && await realpath(root) === root)
+  // Validate every current root without serializing independent filesystem reads.
+  for (let offset = 0; offset < roots.length; offset += 16) {
+    await Promise.all(roots.slice(offset, offset + 16).map(async root => {
+      assert(path.isAbsolute(root) && root !== '/' && await realpath(root) === root)
+    }))
+  }
   // Owner fences are acquired after planning. Validate absent protected paths
   // against their existing canonical ancestor without creating ownership state.
   for (const root of input.protectedRoots ?? []) {
@@ -137,16 +160,21 @@ export async function planDarwinExecution(requested: Readonly<{
       if (parent === path.dirname(parent)) break
     }
   }
+  const uncoveredAncestorDirectories = uncoveredReadAncestorDirectories([...ancestorDirectories], [
+    ...input.readOnlyRoots, ...input.writableRoots,
+    ...(input.readOnlyMounts ?? []).flatMap(mount => [mount.source, mount.target]),
+    ...systemReadOnlyRoots,
+  ])
   // Keep process creation available. External delegation and cross-sandbox
   // signals cannot confer authority outside the immutable kernel scope.
   const profile = ['(version 1)', '(deny default)', '(import "system.sb")', '(allow file-read-metadata)',
-    ...[...ancestorDirectories].map(root => `(allow file-read-data (require-all (literal ${quote(root)}) (vnode-type DIRECTORY)))`),
+    ...uncoveredAncestorDirectories.map(root => `(allow file-read-data (require-all (literal ${quote(root)}) (vnode-type DIRECTORY)))`),
     '(allow sysctl-read)', DARWIN_SCOPE_POLICY,
     '(allow process-exec)', '(allow signal (target same-sandbox))',
     '(allow network-outbound)', '(allow network-inbound)', '(allow network-bind)',
-    '(allow file-read* (subpath "/System") (subpath "/usr") (subpath "/bin") (subpath "/sbin") (subpath "/Library/Apple"))',
+    `(allow file-read* ${systemReadOnlyRoots.map(root => `(subpath ${quote(root)})`).join(' ')})`,
     '(allow file-read* file-write* (literal "/dev/null") (literal "/dev/urandom"))',
-    ...[...new Set(input.readOnlyRoots)].map(root => `(allow file-read* (subpath ${quote(root)}))`),
+    ...minimalReadOnlyRoots(input.readOnlyRoots).map(root => `(allow file-read* (subpath ${quote(root)}))`),
     ...(input.readOnlyMounts ?? []).flatMap(mount => [`(allow file-read* (subpath ${quote(mount.source)}))`, `(allow file-read* (subpath ${quote(mount.target)}))`]),
     ...input.writableRoots.map(root => `(allow file-read* file-write* (subpath ${quote(root)}))`),
     ...(input.protectedRoots ?? []).map(root => `(deny file-read* file-write* (subpath ${quote(root)}))`),

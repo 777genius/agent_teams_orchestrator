@@ -1,4 +1,5 @@
 import { expect, test } from 'bun:test'
+import { createHash } from 'node:crypto'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -52,5 +53,17 @@ test('same-path executable replacement changes authority digest', async () => {
     const old = await hashOpenCodeFile(executable)
     await writeFile(executable, 'new executable bytes')
     expect(await hashOpenCodeFile(executable)).not.toBe(old)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('file hashing matches independent SHA for empty, tiny and multiple read chunks', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'TEST-opencode-hash-buffer-'))
+  try {
+    for (const size of [0, 1, 37, 64 * 1024, 64 * 1024 + 1, 3 * 64 * 1024 + 17]) {
+      const content = Buffer.from(Uint8Array.from({ length: size }, (_, index) => index % 251))
+      const file = path.join(root, `bytes-${size}`)
+      await writeFile(file, content)
+      expect(await hashOpenCodeFile(file)).toBe(createHash('sha256').update(content).digest('hex'))
+    }
   } finally { await rm(root, { recursive: true, force: true }) }
 })

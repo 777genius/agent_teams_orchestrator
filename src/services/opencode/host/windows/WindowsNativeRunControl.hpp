@@ -5,6 +5,7 @@
 #include <sddl.h>
 #include <winternl.h>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
@@ -23,13 +24,13 @@
 // generations; HANDLE and PID values never cross the JSON boundary.
 struct WindowsNativeRunControlIssuer;
 struct WindowsNativeRunControl {
+  enum class Role { client, server };
   struct FilePin {
     std::array<BYTE, 16> fileId{};
     ULONGLONG volumeSerial = 0;
     std::uint64_t size = 0;
     std::array<BYTE, 32> sha256{};
     bool directory = false;
-    bool hasSha256 = false;
   };
   struct ProcessPin {
     DWORD pid = 0;
@@ -40,14 +41,21 @@ struct WindowsNativeRunControl {
   struct ExpectedBinding {
     std::vector<BYTE> bytes;
     FilePin root, config, image;
-    ProcessPin client, server;
+    ProcessPin parent, client, server;
     std::wstring endpoint;
   };
   struct HeldInputs {
     HANDLE selectedDirectory = nullptr;
     HANDLE config = nullptr;
+    // This is the retained parent Bun PROCESS, never the local helper role.
     HANDLE intendedBun = nullptr;
     HANDLE processImage = nullptr;
+    PSID selectedPackage = nullptr;
+    // Optional AppContainer peer access is derived only from this retained
+    // PROCESS and matched against the native Scope's own generated package SID.
+    HANDLE packagePeerProcess = nullptr;
+    PSID packagePeerSid = nullptr;
+    Role localRole = Role::server;
     std::wstring sealedPath;
     std::wstring sealedBinding;
     ExpectedBinding expected;
@@ -63,11 +71,13 @@ struct WindowsNativeRunControl {
       shutdown();
     } catch (...) {
     }
+    runControlAbandonPending();
   }
 
   static constexpr DWORD MAX_FRAME_BYTES = 512 * 1024;
   static constexpr size_t MAX_CONNECTIONS = 8;
   static constexpr size_t MAX_CAPABILITIES = 64;
+  static constexpr size_t MAX_RETAINED_OPERATIONS = MAX_CONNECTIONS + 1;
   static constexpr DWORD CANCEL_DRAIN_MS = 5000;
 
   JsonObject listen(const JsonObject &input) {
@@ -98,7 +108,7 @@ struct WindowsNativeRunControl {
     Handle pipe(CreateFileW(endpoint.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
                             OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr));
     require(static_cast<bool>(pipe), "run_control_connect_unknown");
-    auto connection = runControlMakeConnection(std::move(pipe), Side::client, timeout);
+    auto connection = runControlMakeConnection(std::move(pipe), Role::client, timeout);
     connection->endpoint = endpoint;
     runControlAuthenticate(*connection);
     const auto id = connection->id;
@@ -110,33 +120,50 @@ struct WindowsNativeRunControl {
 
   JsonObject accept(const JsonObject &input) {
     require(listener_ && !shutdown_, "run_control_foreign");
+    require(!listener_->poisoned && !listener_->acceptOperation, "run_control_foreign");
     require(runControlActiveCount() < MAX_CONNECTIONS &&
                 registry_.size() < MAX_CAPABILITIES,
             "run_control_connection_limit");
     const DWORD timeout = runControlTimeoutMs(input, L"timeoutMs");
-    require(listener_->pending, "run_control_accept_unknown");
-    OVERLAPPED overlap{};
-    Handle ready(CreateEventW(nullptr, TRUE, FALSE, nullptr));
-    require(static_cast<bool>(ready), "run_control_accept_unknown");
-    overlap.hEvent = ready.value;
-    BOOL connected = ConnectNamedPipe(listener_->pending->value, &overlap);
+    require(static_cast<bool>(listener_->pending), "run_control_accept_unknown");
+    auto owned = std::unique_ptr<IoOperation>(new IoOperation);
+    owned->kind = IoKind::accept;
+    owned->issuingHandle = runControlDuplicateHandle(listener_->pending.value);
+    owned->event = Handle(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    require(static_cast<bool>(owned->event), "run_control_accept_unknown");
+    owned->overlap.hEvent = owned->event.value;
+    IoOperation *operation = runControlRetain(std::move(owned));
+    listener_->acceptOperation = operation;
+
+    BOOL connected = ConnectNamedPipe(operation->issuingHandle.value, &operation->overlap);
     DWORD error = connected ? ERROR_SUCCESS : GetLastError();
+    operation->issued = true;
+    if (!connected && error != ERROR_IO_PENDING && error != ERROR_PIPE_CONNECTED) {
+      operation->complete = true;
+      operation->error = error;
+      runControlForget(operation);
+      throw NativeError{"run_control_accept_unknown", error, "accept"};
+    }
     if (!connected && error == ERROR_IO_PENDING) {
-      DWORD acceptedBytes = 0;
-      if (!runControlWaitOperation(listener_->pending->value, overlap, acceptedBytes, timeout,
-                                   ready.value)) {
-        runControlCancelOperation(listener_->pending->value, overlap, ready.value);
+      const auto wait = runControlWaitOperation(*operation, timeout);
+      if (!wait.completed) {
+        const auto cancelled = runControlCancelAndDrain(*operation);
+        if (!cancelled.completed) {
+          operation->unresolved = operation->poisoned = listener_->poisoned = true;
+          throw NativeError{"cleanup_unknown", ERROR_OPERATION_ABORTED, "accept"};
+        }
+        runControlForget(operation);
         throw NativeError{"run_control_accept_timeout", ERROR_OPERATION_ABORTED, "accept"};
       }
-    } else
-      require(error == ERROR_PIPE_CONNECTED, "run_control_accept_unknown");
+      operation->transferred = wait.transferred;
+      operation->error = wait.error;
+    }
+    require(operation->error == ERROR_SUCCESS, "run_control_accept_unknown");
+    operation->complete = true;
+    Handle accepted = std::move(operation->issuingHandle);
+    runControlForget(operation);
 
-    HANDLE raw = nullptr;
-    require(DuplicateHandle(GetCurrentProcess(), listener_->pending->value, GetCurrentProcess(),
-                            &raw, 0, FALSE, DUPLICATE_SAME_ACCESS),
-            "run_control_accept_unknown");
-    Handle duplicated(raw);
-    auto connection = runControlMakeConnection(std::move(duplicated), Side::server, timeout);
+    auto connection = runControlMakeConnection(std::move(accepted), Role::server, timeout);
     connection->endpoint = listener_->name;
     runControlAuthenticate(*connection);
     const auto id = connection->id;
@@ -145,7 +172,6 @@ struct WindowsNativeRunControl {
     // The accepted instance remains connected and owned by the registry. The
     // listener is independently retained and immediately offers a fresh server
     // instance; no DisconnectNamedPipe call destroys the accepted endpoint.
-    listener_->pending.reset();
     listener_->pending = runControlCreateServer(listener_->name, false);
     JsonObject result;
     num(result, L"id", id);
@@ -189,8 +215,9 @@ struct WindowsNativeRunControl {
     auto found = registry_.find(id);
     const bool foreign = found == registry_.end();
     if (!foreign && !found->second->retired) {
-      runControlRetire(*found->second, false);
-      found->second->retired = true;
+      const bool complete = runControlRetire(*found->second);
+      if (!complete)
+        throw NativeError{"cleanup_unknown", ERROR_OPERATION_ABORTED, "close"};
     }
     JsonObject result;
     flag(result, L"closed", true);
@@ -200,16 +227,28 @@ struct WindowsNativeRunControl {
 
   JsonObject shutdown() {
     if (shutdown_)
-      return runControlShutdownReceipt();
+      return runControlShutdownReceipt(shutdownComplete_);
     shutdown_ = true;
+    bool complete = true;
     if (listener_) {
-      listener_->pending.reset();
+      if (listener_->acceptOperation) {
+        const auto cancelled = runControlCancelAndDrain(*listener_->acceptOperation);
+        if (cancelled.completed)
+          runControlForget(listener_->acceptOperation);
+        else {
+          listener_->acceptOperation->unresolved = listener_->acceptOperation->poisoned = true;
+          listener_->poisoned = true;
+          complete = false;
+        }
+      }
       listener_.reset();
     }
-    for (auto &entry : registry_)
+    for (auto &entry : registry_) {
       if (!entry.second->retired)
-        runControlRetire(*entry.second, true);
-    return runControlShutdownReceipt();
+        complete = runControlRetire(*entry.second) && complete;
+    }
+    shutdownComplete_ = complete;
+    return runControlShutdownReceipt(complete);
   }
 
   JsonObject request(const std::wstring &operation, const JsonObject &input) {
@@ -231,26 +270,37 @@ struct WindowsNativeRunControl {
   }
 
 private:
-  enum class Side { client, server };
+  enum class IoKind { accept, read, write };
+  struct IoResult {
+    bool completed = false;
+    DWORD transferred = 0;
+    DWORD error = ERROR_IO_INCOMPLETE;
+  };
   struct IoOperation {
     OVERLAPPED overlap{};
     Handle event;
+    Handle issuingHandle;
     std::vector<BYTE> bytes;
     DWORD transferred = 0;
+    DWORD error = ERROR_SUCCESS;
+    IoKind kind = IoKind::read;
+    bool issued = false;
+    bool complete = false;
     bool poisoned = false;
     bool unresolved = false;
   };
   struct Connection {
     std::uint64_t id = 0;
-    Side side = Side::client;
+    Role side = Role::client;
     Handle pipe;
     DWORD timeout = 0;
     std::wstring endpoint;
     bool authenticated = false;
     bool poisoned = false;
     bool retired = false;
-    std::vector<std::unique_ptr<IoOperation>> pending;
+    std::vector<IoOperation *> pending;
     std::string readAccum;
+    Handle peerProcess;
     ProcessPin peer;
     ProcessPin local;
   };
@@ -260,6 +310,8 @@ private:
     std::wstring endpoint;
     std::wstring owner;
     Handle pending;
+    IoOperation *acceptOperation = nullptr;
+    bool poisoned = false;
   };
 
   explicit WindowsNativeRunControl(HeldInputs held) : held_(std::move(held)) {
@@ -277,6 +329,18 @@ private:
     expected_ = held_.expected;
     sealedBinding_ = held_.expected.bytes;
     runControlValidateHeldInputs();
+    require((held_.packagePeerProcess == nullptr) == (held_.packagePeerSid == nullptr),
+            "run_control_package_peer_identity");
+    if (held_.packagePeerProcess) {
+      packagePeerProcess_ = runControlDuplicateHandle(held_.packagePeerProcess);
+      require(IsValidSid(held_.packagePeerSid), "run_control_package_peer_identity");
+      const DWORD length = GetLengthSid(held_.packagePeerSid);
+      require(length > 0 && length <= SECURITY_MAX_SID_SIZE, "run_control_package_peer_identity");
+      expectedPackageSid_.resize(length);
+      require(CopySid(length, expectedPackageSid_.data(), held_.packagePeerSid),
+              "run_control_package_peer_identity");
+      runControlValidatePackagePeer();
+    }
   }
 
   static std::uint64_t runControlNewId() {
@@ -300,7 +364,7 @@ private:
   static std::wstring runControlUnpredictablePipeName() {
     BYTE random[16]{};
     require(BCryptGenRandom(nullptr, random, sizeof(random),
-                            BCRYPT_USE_SYSTEM_PREFERRED_RNG) == STATUS_SUCCESS,
+                            BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0,
             "run_control_pipe_name");
     static const wchar_t hex[] = L"0123456789abcdef";
     std::wstring name = L"\\\\.\\pipe\\agt-v2-run-control-";
@@ -310,9 +374,11 @@ private:
     }
     return name;
   }
-  static PSECURITY_DESCRIPTOR runControlProtectedPipeDescriptor(const std::wstring &owner) {
-    const std::wstring sddl =
-        L"O:" + owner + L"D:P(A;;GRGW;;;SY)(A;;GRGW;;;" + owner + L")S:(ML;;NW;;;LW)";
+  static PSECURITY_DESCRIPTOR runControlProtectedPipeDescriptor(
+      const std::wstring &owner, const std::wstring &packageSid) {
+    std::wstring sddl = L"O:" + owner + L"D:P(A;;GRGW;;;SY)(A;;GRGW;;;" + owner + L")";
+    if (!packageSid.empty()) sddl += L"(A;;GRGW;;;" + packageSid + L")";
+    sddl += L"S:(ML;;NW;;;LW)";
     PSECURITY_DESCRIPTOR descriptor = nullptr;
     require(ConvertStringSecurityDescriptorToSecurityDescriptorW(
                 sddl.c_str(), SDDL_REVISION_1, &descriptor, nullptr) != 0,
@@ -320,7 +386,8 @@ private:
     return descriptor;
   }
   Handle runControlCreateServer(const std::wstring &name, bool first) {
-    LocalMemory descriptor{runControlProtectedPipeDescriptor(ownerSid_)};
+    if (packagePeerProcess_) runControlValidatePackagePeer();
+    LocalMemory descriptor{runControlProtectedPipeDescriptor(ownerSid_, packageSid_)};
     SECURITY_ATTRIBUTES attributes{sizeof(attributes), descriptor.value, FALSE};
     DWORD mode = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED;
     if (first)
@@ -333,7 +400,18 @@ private:
     require(raw != INVALID_HANDLE_VALUE, "run_control_listen_unknown");
     return Handle(raw);
   }
-  std::unique_ptr<Connection> runControlMakeConnection(Handle pipe, Side side, DWORD timeout) {
+  static Handle runControlDuplicateHandle(HANDLE source,
+                                          const char *code = "run_control_held_inputs") {
+    require(source != nullptr && source != INVALID_HANDLE_VALUE, "run_control_held_inputs");
+    HANDLE raw = nullptr;
+    require(DuplicateHandle(GetCurrentProcess(), source, GetCurrentProcess(), &raw, 0, FALSE,
+                            DUPLICATE_SAME_ACCESS),
+            code);
+    Handle acquired(raw);
+    require(static_cast<bool>(acquired), code);
+    return acquired;
+  }
+  std::unique_ptr<Connection> runControlMakeConnection(Handle pipe, Role side, DWORD timeout) {
     require(static_cast<bool>(pipe), "run_control_foreign");
     std::unique_ptr<Connection> connection(new Connection);
     connection->id = runControlNewId();
@@ -427,8 +505,7 @@ private:
   }
   static bool runControlSameFile(const FilePin &a, const FilePin &b) {
     return a.volumeSerial == b.volumeSerial && a.fileId == b.fileId && a.size == b.size &&
-           a.directory == b.directory && a.hasSha256 == b.hasSha256 &&
-           (!a.hasSha256 || a.sha256 == b.sha256);
+           a.directory == b.directory;
   }
   static bool runControlSameSid(const std::vector<BYTE> &a, const std::vector<BYTE> &b) {
     return a.size() == b.size() && !a.empty() && std::memcmp(a.data(), b.data(), a.size()) == 0;
@@ -454,24 +531,49 @@ private:
     pin.directory = directory;
     return pin;
   }
-  static std::array<BYTE, 32> runControlHash(HANDLE file) {
-    LARGE_INTEGER origin{};
-    require(SetFilePointerEx(file, origin, nullptr, FILE_BEGIN) != 0,
+  static std::array<BYTE, 32> runControlSha256(HANDLE file) {
+    struct Algorithm {
+      BCRYPT_ALG_HANDLE value = nullptr;
+      ~Algorithm() {
+        if (value)
+          BCryptCloseAlgorithmProvider(value, 0);
+      }
+    } algorithm;
+    struct Hash {
+      BCRYPT_HASH_HANDLE value = nullptr;
+      ~Hash() {
+        if (value)
+          BCryptDestroyHash(value);
+      }
+    };
+    LARGE_INTEGER original{};
+    require(SetFilePointerEx(file, LARGE_INTEGER{}, &original, FILE_CURRENT) != 0,
             "run_control_image_hash");
-    BCRYPT_ALG_HANDLE algorithm = nullptr;
-    BCRYPT_HASH_HANDLE hash = nullptr;
-    require(BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) ==
-                STATUS_SUCCESS,
+    struct Position {
+      HANDLE file;
+      LARGE_INTEGER position;
+      ~Position() {
+        SetFilePointerEx(file, position, nullptr, FILE_BEGIN);
+      }
+    } restore{file, original};
+    require(SetFilePointerEx(file, LARGE_INTEGER{}, nullptr, FILE_BEGIN) != 0,
+            "run_control_image_hash");
+    require(BCryptOpenAlgorithmProvider(&algorithm.value, BCRYPT_SHA256_ALGORITHM, nullptr, 0) ==
+                0,
             "run_control_image_hash");
     ULONG objectLength = 0, ignored = 0;
-    require(BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH,
+    require(BCryptGetProperty(algorithm.value, BCRYPT_OBJECT_LENGTH,
                               reinterpret_cast<PUCHAR>(&objectLength), sizeof(objectLength),
-                              &ignored, 0) == STATUS_SUCCESS,
+                              &ignored, 0) == 0 &&
+                objectLength > 0 && objectLength <= 1024 * 1024,
             "run_control_image_hash");
     std::vector<BYTE> state(objectLength), buffer(64 * 1024);
+    // BCrypt retains pbHashObject until DestroyHash; hash must be destroyed
+    // before its backing vector, while the algorithm provider remains alive.
+    Hash hash;
     std::array<BYTE, 32> digest{};
-    require(BCryptCreateHash(algorithm, &hash, state.data(), objectLength, nullptr, 0, 0) ==
-                STATUS_SUCCESS,
+    require(BCryptCreateHash(algorithm.value, &hash.value, state.data(), objectLength, nullptr, 0,
+                             0) == 0,
             "run_control_image_hash");
     for (;;) {
       DWORD read = 0;
@@ -481,17 +583,22 @@ private:
       }
       if (read == 0)
         break;
-      require(BCryptHashData(hash, buffer.data(), read, 0) == STATUS_SUCCESS,
+      require(BCryptHashData(hash.value, buffer.data(), read, 0) == 0,
               "run_control_image_hash");
     }
-    require(BCryptFinishHash(hash, digest.data(), static_cast<ULONG>(digest.size()), 0) ==
-                STATUS_SUCCESS,
+    require(BCryptFinishHash(hash.value, digest.data(), static_cast<ULONG>(digest.size()), 0) ==
+                0,
             "run_control_image_hash");
-    BCryptDestroyHash(hash);
-    BCryptCloseAlgorithmProvider(algorithm, 0);
-    LARGE_INTEGER reset{};
-    require(SetFilePointerEx(file, reset, nullptr, FILE_BEGIN) != 0,
-            "run_control_image_hash");
+    return digest;
+  }
+  static std::array<BYTE, 32> runControlVerifyImage(HANDLE file, const FilePin &sealed) {
+    const FilePin before = runControlObserveFile(file, false);
+    require(runControlSameFile(before, sealed), "run_control_image_changed");
+    const auto digest = runControlSha256(file);
+    const FilePin after = runControlObserveFile(file, false);
+    require(runControlSameFile(before, after) && runControlSameFile(after, sealed) &&
+                before.size > 0 && digest == sealed.sha256,
+            "run_control_image_changed");
     return digest;
   }
   static std::wstring runControlCurrentSid() {
@@ -604,85 +711,151 @@ private:
     return a.pid == b.pid && runControlSameBirth(a.birth, b.birth) &&
            runControlSameSid(a.sid, b.sid) && runControlSameFile(a.image, b.image);
   }
-  static bool runControlPrivateFile(HANDLE file, const std::wstring &owner) {
-    return privateAcl(file, owner, nullptr);
-  }
   void runControlDuplicateHeld() {
-    HANDLE root = nullptr, config = nullptr, bun = nullptr, image = nullptr;
-    require(DuplicateHandle(GetCurrentProcess(), held_.selectedDirectory, GetCurrentProcess(),
-                            &root, 0, FALSE, DUPLICATE_SAME_ACCESS) &&
-                DuplicateHandle(GetCurrentProcess(), held_.config, GetCurrentProcess(), &config,
-                                0, FALSE, DUPLICATE_SAME_ACCESS) &&
-                DuplicateHandle(GetCurrentProcess(), held_.intendedBun, GetCurrentProcess(), &bun,
-                                0, FALSE, DUPLICATE_SAME_ACCESS) &&
-                DuplicateHandle(GetCurrentProcess(), held_.processImage, GetCurrentProcess(),
-                                &image, 0, FALSE, DUPLICATE_SAME_ACCESS),
-            "run_control_held_inputs");
-    selectedDirectory_.reset(root);
-    config_.reset(config);
-    intendedBun_.reset(bun);
-    processImage_.reset(image);
+    Handle root = runControlDuplicateHandle(held_.selectedDirectory);
+    Handle config = runControlDuplicateHandle(held_.config);
+    Handle parent = runControlDuplicateHandle(held_.intendedBun);
+    Handle image = runControlDuplicateHandle(held_.processImage);
+    selectedDirectory_ = std::move(root);
+    config_ = std::move(config);
+    intendedBun_ = std::move(parent);
+    processImage_ = std::move(image);
   }
   void runControlValidateHeldInputs() {
     const FilePin root = runControlObserveFile(selectedDirectory_.value, true);
     const FilePin config = runControlObserveFile(config_.value, false);
-    const FilePin imageBefore = runControlObserveFile(processImage_.value, false);
+    const FilePin image = runControlObserveFile(processImage_.value, false);
     require(runControlSameFile(root, expected_.root) &&
                 runControlSameFile(config, expected_.config) &&
-                runControlSameFile(imageBefore, expected_.image) &&
-                root.fileId != config.fileId && root.fileId != imageBefore.fileId &&
-                config.fileId != imageBefore.fileId &&
-                runControlPrivateFile(selectedDirectory_.value, ownerSid_) &&
-                runControlPrivateFile(config_.value, ownerSid_) &&
-                runControlPrivateFile(processImage_.value, ownerSid_),
+                runControlSameFile(image, expected_.image) && root.fileId != config.fileId &&
+                root.fileId != image.fileId && config.fileId != image.fileId,
             "run_control_held_identity");
-    const auto imageHash = runControlHash(processImage_.value);
-    const FilePin imageAfter = runControlObserveFile(processImage_.value, false);
-    require(imageBefore.fileId == imageAfter.fileId &&
-                imageBefore.volumeSerial == imageAfter.volumeSerial &&
-                imageBefore.size == imageAfter.size && imageBefore.size > 0 &&
-                imageAfter.size == expected_.image.size && imageHash == expected_.image.sha256 &&
-                expected_.image.hasSha256,
-            "run_control_image_changed");
+    const JsonObject rootIdentity =
+        fileIdentity(selectedDirectory_.value, ownerSid_, true, held_.selectedPackage);
+    const JsonObject configIdentity =
+        fileIdentity(config_.value, ownerSid_, false, held_.selectedPackage);
+    const JsonObject imageIdentity =
+        fileIdentity(processImage_.value, ownerSid_, false, held_.selectedPackage);
+    require(rootIdentity.HasKey(L"fileId") && configIdentity.HasKey(L"fileId") &&
+                imageIdentity.HasKey(L"fileId"),
+            "run_control_held_identity");
+    const auto imageHash = runControlVerifyImage(processImage_.value, expected_.image);
     heldImageHash_ = imageHash;
-    const ProcessPin child = runControlObserveProcess(intendedBun_.value);
-    require(runControlSameProcess(child, expected_.client) &&
-                runControlSameFile(child.image, expected_.image) &&
-                runControlParentPid(intendedBun_.value) == GetCurrentProcessId(),
+
+    const FILETIME parentBirthBefore = runControlBirth(intendedBun_.value);
+    require(runControlAlive(intendedBun_.value), "run_control_parent_join");
+    const ProcessPin parentBefore = runControlObserveProcess(intendedBun_.value);
+    const ProcessPin helper = runControlObserveProcess(GetCurrentProcess());
+    const ProcessPin parentAfter = runControlObserveProcess(intendedBun_.value);
+    require(runControlParentPid(GetCurrentProcess()) == parentBefore.pid &&
+                runControlSameProcess(parentBefore, parentAfter) &&
+                runControlSameBirth(parentBirthBefore, parentAfter.birth),
             "run_control_parent_join");
     const FILETIME parentBirth = runControlBirth(GetCurrentProcess());
-    require(filetime(parentBirth) <= filetime(child.birth), "run_control_parent_birth");
+    require(filetime(parentBefore.birth) <= filetime(helper.birth) &&
+                filetime(parentBirth) <= filetime(helper.birth),
+            "run_control_parent_birth");
     require(runControlSameBirth(parentBirth, runControlBirth(GetCurrentProcess())),
             "run_control_parent_birth");
-    require(runControlSameSid(child.sid, expected_.client.sid), "run_control_held_identity");
+    const ProcessPin expectedLocal =
+        held_.localRole == Role::server ? expected_.server : expected_.client;
+    const ProcessPin expectedPeer =
+        held_.localRole == Role::server ? expected_.client : expected_.server;
+    require(runControlSameProcess(parentBefore, expected_.parent) &&
+                runControlSameProcess(helper, expectedLocal) &&
+                runControlSameFile(helper.image, expectedLocal.image) &&
+                runControlSameFile(image, expectedLocal.image) &&
+                !runControlSameProcess(expected_.client, expected_.server) &&
+                !runControlSameProcess(expected_.parent, expected_.client) &&
+                !runControlSameProcess(expected_.parent, expected_.server) &&
+                !runControlSameProcess(expectedLocal, expectedPeer),
+            "run_control_held_identity");
+  }
+  void runControlValidatePackagePeer() {
+    const ProcessPin expectedPeer = held_.localRole == Role::server ? expected_.client : expected_.server;
+    const ProcessPin before = runControlObserveProcess(packagePeerProcess_.value);
+    require(runControlAlive(packagePeerProcess_.value) && runControlSameProcess(before, expectedPeer),
+            "run_control_package_peer_identity");
+    HANDLE raw = nullptr;
+    require(OpenProcessToken(packagePeerProcess_.value, TOKEN_QUERY, &raw),
+            "run_control_package_peer_identity");
+    Handle token(raw);
+    DWORD isContainer = 0, returned = 0;
+    require(GetTokenInformation(token.value, TokenIsAppContainer, &isContainer,
+                                 sizeof(isContainer), &returned) &&
+                returned == sizeof(isContainer) && isContainer == 1,
+            "run_control_package_peer_identity");
+    DWORD size = 0;
+    GetTokenInformation(token.value, TokenAppContainerSid, nullptr, 0, &size);
+    require(size >= sizeof(TOKEN_APPCONTAINER_INFORMATION) && size <= 65536,
+            "run_control_package_peer_identity");
+    std::vector<BYTE> information(size);
+    require(GetTokenInformation(token.value, TokenAppContainerSid, information.data(),
+                                 size, &returned) && returned >= sizeof(TOKEN_APPCONTAINER_INFORMATION) && returned <= size,
+            "run_control_package_peer_identity");
+    PSID actual = reinterpret_cast<TOKEN_APPCONTAINER_INFORMATION *>(information.data())->TokenAppContainer;
+    const auto first = reinterpret_cast<std::uintptr_t>(information.data());
+    const auto last = first + returned;
+    const auto address = reinterpret_cast<std::uintptr_t>(actual);
+    require(actual && address >= first && address <= last && last - address >= 8,
+            "run_control_package_peer_identity");
+    const DWORD actualLength = GetLengthSid(actual);
+    require(actualLength >= 8 && actualLength <= SECURITY_MAX_SID_SIZE &&
+                actualLength <= last - address && IsValidSid(actual) &&
+                EqualSid(actual, expectedPackageSid_.data()),
+            "run_control_package_peer_identity");
+    const auto actualString = runControlSidString(actual);
+    require(actualString.rfind(L"S-1-15-2-", 0) == 0 && actualString != L"S-1-15-2-1",
+            "run_control_package_peer_identity");
+    const ProcessPin after = runControlObserveProcess(packagePeerProcess_.value);
+    require(runControlSameProcess(before, after) && runControlSameProcess(after, expectedPeer),
+            "run_control_package_peer_identity");
+    if (!packageSid_.empty()) require(packageSid_ == actualString, "run_control_package_peer_identity");
+    packageSid_ = actualString;
   }
   void runControlRevalidateHeld() {
-    require(runControlAlive(intendedBun_.value), "run_process_changed");
-    const FilePin before = runControlObserveFile(processImage_.value, false);
-    const auto hash = runControlHash(processImage_.value);
-    const FilePin after = runControlObserveFile(processImage_.value, false);
-    require(runControlSameFile(before, expected_.image) &&
-                runControlSameFile(after, expected_.image) && before.size == after.size &&
-                hash == heldImageHash_, "run_control_image_changed");
-    const ProcessPin child = runControlObserveProcess(intendedBun_.value);
-    require(runControlSameProcess(child, expected_.client), "run_process_changed");
+    require(runControlAlive(intendedBun_.value), "run_control_parent_join");
+    const ProcessPin parentBefore = runControlObserveProcess(intendedBun_.value);
+    const ProcessPin helper = runControlObserveProcess(GetCurrentProcess());
+    const ProcessPin parentAfter = runControlObserveProcess(intendedBun_.value);
+    const ProcessPin expectedLocal =
+        held_.localRole == Role::server ? expected_.server : expected_.client;
+    require(runControlParentPid(GetCurrentProcess()) == parentBefore.pid &&
+                runControlSameProcess(parentBefore, expected_.parent) &&
+                runControlSameProcess(parentBefore, parentAfter) &&
+                runControlSameProcess(helper, expectedLocal) &&
+                runControlSameFile(helper.image, expectedLocal.image),
+            "run_process_changed");
+    const auto hash = runControlVerifyImage(processImage_.value, expected_.image);
+    require(hash == heldImageHash_, "run_control_image_changed");
   }
   void runControlAuthenticate(Connection &connection) {
     runControlRevalidateHeld();
-    const DWORD peerPid = connection.side == Side::server
-                              ? runControlPipePeerPid(connection.pipe.value, true)
-                              : runControlPipePeerPid(connection.pipe.value, false);
+    if (packagePeerProcess_) runControlValidatePackagePeer();
+    const DWORD peerPid =
+        connection.side == Role::server
+            ? runControlPipePeerPid(connection.pipe.value, true)
+            : runControlPipePeerPid(connection.pipe.value, false);
     require(peerPid != 0, "run_control_peer_identity");
-    Handle peer(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, peerPid));
-    require(static_cast<bool>(peer), "run_control_peer_identity");
-    const ProcessPin peerPin = runControlObserveProcess(peer.value);
+    if (!connection.peerProcess) {
+      Handle peer(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, peerPid));
+      require(static_cast<bool>(peer), "run_control_peer_identity");
+      connection.peerProcess = std::move(peer);
+    }
+    const ProcessPin peerPin = runControlObserveProcess(connection.peerProcess.value);
     const ProcessPin localPin = runControlObserveProcess(GetCurrentProcess());
-    const ProcessPin expectedPeer = connection.side == Side::server ? expected_.client : expected_.server;
-    const ProcessPin expectedLocal = connection.side == Side::server ? expected_.server : expected_.client;
+    const ProcessPin expectedPeer =
+        connection.side == Role::server ? expected_.client : expected_.server;
+    const ProcessPin expectedLocal =
+        connection.side == Role::server ? expected_.server : expected_.client;
     require(runControlSameProcess(peerPin, expectedPeer) &&
                 runControlSameProcess(localPin, expectedLocal) &&
                 runControlSameFile(peerPin.image, expectedPeer.image) &&
-                runControlSameFile(localPin.image, expectedLocal.image),
+                runControlSameFile(localPin.image, expectedLocal.image) &&
+                !runControlSameProcess(peerPin, localPin) &&
+                (!connection.authenticated ||
+                 (runControlSameProcess(peerPin, connection.peer) &&
+                  runControlSameProcess(localPin, connection.local))),
             "run_control_peer_identity");
     connection.peer = peerPin;
     connection.local = localPin;
@@ -702,66 +875,157 @@ private:
     const ULONGLONG left = deadline - now;
     return left > MAXDWORD ? MAXDWORD : static_cast<DWORD>(left);
   }
-  static bool runControlWaitOperation(HANDLE pipe, OVERLAPPED &overlap, DWORD &transferred,
-                                      DWORD timeout, HANDLE event) {
-    if (WaitForSingleObject(event, timeout) != WAIT_OBJECT_0)
-      return false;
-    return GetOverlappedResult(pipe, &overlap, &transferred, FALSE) != 0;
-  }
-  static void runControlCancelOperation(HANDLE pipe, OVERLAPPED &overlap, HANDLE event) {
-    CancelIoEx(pipe, &overlap);
+  static IoResult runControlPollOperation(IoOperation &operation) {
+    IoResult result;
     DWORD transferred = 0;
-    // Cancellation is not completion. Drain with a finite bound; callers retain
-    // the operation when this returns and poison the capability.
-    for (DWORD elapsed = 0; elapsed < CANCEL_DRAIN_MS; elapsed += 50) {
-      if (GetOverlappedResult(pipe, &overlap, &transferred, FALSE) != 0 ||
-          GetLastError() != ERROR_IO_INCOMPLETE)
-        return;
-      WaitForSingleObject(event, 50);
+    if (GetOverlappedResult(operation.issuingHandle.value, &operation.overlap, &transferred,
+                            FALSE) != 0) {
+      result.completed = true;
+      result.transferred = transferred;
+      result.error = ERROR_SUCCESS;
+    } else {
+      const DWORD error = GetLastError();
+      if (error != ERROR_IO_INCOMPLETE) {
+        result.completed = true;
+        result.transferred = transferred;
+        result.error = error;
+      }
     }
+    return result;
+  }
+  static IoResult runControlWaitOperation(IoOperation &operation, DWORD timeout) {
+    const DWORD waited = WaitForSingleObject(operation.event.value, timeout);
+    if (waited == WAIT_TIMEOUT)
+      return {};
+    // A wait failure is not completion proof. GetOverlappedResult remains the
+    // sole authority for both success and terminal failure of the kernel I/O.
+    return runControlPollOperation(operation);
+  }
+  static IoResult runControlCancelAndDrain(IoOperation &operation) {
+    if (operation.complete)
+      return {true, operation.transferred, operation.error};
+    CancelIoEx(operation.issuingHandle.value, &operation.overlap);
+    const std::uint64_t deadline = GetTickCount64() + CANCEL_DRAIN_MS;
+    for (;;) {
+      const auto result = runControlPollOperation(operation);
+      if (result.completed)
+        return result;
+      const DWORD remaining = runControlRemaining(deadline);
+      if (remaining == 0)
+        break;
+      WaitForSingleObject(operation.event.value, remaining < 50 ? remaining : 50);
+    }
+    return runControlPollOperation(operation);
+  }
+  IoOperation *runControlRetain(std::unique_ptr<IoOperation> operation) {
+    for (auto &slot : retainedIo_) {
+      if (!slot) {
+        IoOperation *raw = operation.get();
+        slot = std::move(operation);
+        return raw;
+      }
+    }
+    require(false, "cleanup_unknown");
+    return nullptr;
+  }
+  void runControlForget(IoOperation *operation) {
+    if (listener_ && listener_->acceptOperation == operation)
+      listener_->acceptOperation = nullptr;
+    for (auto &entry : registry_) {
+      auto &pending = entry.second->pending;
+      pending.erase(std::remove(pending.begin(), pending.end(), operation), pending.end());
+    }
+    for (auto &slot : retainedIo_)
+      if (slot.get() == operation)
+        slot.reset();
+  }
+  void runControlAbandonPending() {
+    // OVERLAPPED, event and issuing HANDLE storage must outlive this object if
+    // the kernel has not reported completion. The fixed owner is bounded by one
+    // operation per capability plus one accept operation.
+    for (auto &slot : retainedIo_)
+      if (slot)
+        (void)slot.release();
+  }
+  static bool runControlExtractFrame(std::string &accum, std::string &frame) {
+    if (accum.empty())
+      return false;
+    const size_t newline = accum.find('\n');
+    if (newline == std::string::npos) {
+      require(accum.size() <= MAX_FRAME_BYTES, "run_control_frame_oversize");
+      return false;
+    }
+    require(newline + 1 <= MAX_FRAME_BYTES && accum.find('\r') == std::string::npos,
+            "run_control_frame_invalid");
+    frame.assign(accum.data(), newline);
+    require(frame.size() < MAX_FRAME_BYTES && runControlStrictUtf8(frame),
+            "run_control_frame_invalid");
+    const size_t tail = accum.size() - newline - 1;
+    require(tail <= MAX_FRAME_BYTES, "run_control_frame_oversize");
+    accum.erase(0, newline + 1);
+    return true;
   }
   std::string runControlReadFrame(Connection &connection, DWORD timeout) {
     require(connection.readAccum.size() <= MAX_FRAME_BYTES, "run_control_frame_oversize");
     const std::uint64_t deadline = GetTickCount64() + timeout;
     for (;;) {
-      if (!connection.readAccum.empty() && connection.readAccum.back() == '\n') {
-        const size_t newline = connection.readAccum.find('\n');
-        require(newline == connection.readAccum.size() - 1 &&
-                    connection.readAccum.find('\r') == std::string::npos,
-                "run_control_frame_invalid");
-        std::string frame = connection.readAccum.substr(0, newline);
-        connection.readAccum.clear();
-        require(frame.size() < MAX_FRAME_BYTES && runControlStrictUtf8(frame),
-                "run_control_frame_invalid");
+      std::string frame;
+      if (runControlExtractFrame(connection.readAccum, frame))
         return frame;
-      }
-      require(connection.readAccum.size() < MAX_FRAME_BYTES + 1, "run_control_frame_oversize");
       auto operation = std::unique_ptr<IoOperation>(new IoOperation);
+      operation->kind = IoKind::read;
+      operation->issuingHandle =
+          runControlDuplicateHandle(connection.pipe.value, "run_control_read_unknown");
       operation->bytes.resize(64 * 1024);
       operation->event = Handle(CreateEventW(nullptr, TRUE, FALSE, nullptr));
       require(static_cast<bool>(operation->event), "run_control_read_unknown");
       operation->overlap.hEvent = operation->event.value;
-      connection.pending.push_back(std::move(operation));
-      IoOperation &io = *connection.pending.back();
-      BOOL issued = ReadFile(connection.pipe.value, io.bytes.data(),
+      IoOperation *raw = runControlRetain(std::move(operation));
+      connection.pending.push_back(raw);
+      IoOperation &io = *raw;
+      BOOL issued = ReadFile(io.issuingHandle.value, io.bytes.data(),
                              static_cast<DWORD>(io.bytes.size()), nullptr, &io.overlap);
-      if (!issued && GetLastError() != ERROR_IO_PENDING) {
+      io.issued = true;
+      const DWORD issueError = issued ? ERROR_SUCCESS : GetLastError();
+      if (!issued && issueError != ERROR_IO_PENDING) {
+        io.complete = true;
+        io.error = issueError;
         io.poisoned = connection.poisoned = true;
-        throw NativeError{"run_control_read_unknown", GetLastError(), "read"};
+        runControlForget(&io);
+        throw NativeError{issueError == ERROR_BROKEN_PIPE ? "run_control_disconnected"
+                                                         : "run_control_read_unknown",
+                          issueError, "read"};
       }
-      const DWORD remaining = runControlRemaining(deadline);
-      if (!runControlWaitOperation(connection.pipe.value, io.overlap, io.transferred, remaining,
-                                   io.event.value)) {
-        runControlCancelOperation(connection.pipe.value, io.overlap, io.event.value);
-        io.poisoned = connection.poisoned = true;
+      const auto waited = runControlWaitOperation(io, runControlRemaining(deadline));
+      if (!waited.completed) {
+        const auto cancelled = runControlCancelAndDrain(io);
+        if (!cancelled.completed) {
+          io.unresolved = io.poisoned = connection.poisoned = true;
+          throw NativeError{"cleanup_unknown", ERROR_OPERATION_ABORTED, "read"};
+        }
+        io.complete = true;
+        io.transferred = cancelled.transferred;
+        io.error = cancelled.error;
+        connection.readAccum.clear();
+        connection.poisoned = true;
+        const bool retired = runControlRetire(connection);
+        if (!retired)
+          throw NativeError{"cleanup_unknown", ERROR_OPERATION_ABORTED, "read"};
         throw NativeError{"run_control_timeout", ERROR_OPERATION_ABORTED, "read"};
       }
+      io.complete = true;
+      io.transferred = waited.transferred;
+      io.error = waited.error;
+      require(waited.error == ERROR_SUCCESS, waited.error == ERROR_BROKEN_PIPE
+                                                  ? "run_control_disconnected"
+                                                  : "run_control_read_unknown");
+      require(waited.transferred <= io.bytes.size(), "run_control_read_unknown");
       const std::string part(reinterpret_cast<const char *>(io.bytes.data()), io.transferred);
       connection.readAccum += part;
-      connection.pending.pop_back();
+      runControlForget(&io);
       if (part.empty())
         throw NativeError{"run_control_disconnected", ERROR_BROKEN_PIPE, "read"};
-      if (connection.readAccum.size() > MAX_FRAME_BYTES + 1)
+      if (connection.readAccum.size() > 2 * MAX_FRAME_BYTES)
         throw NativeError{"run_control_frame_oversize"};
     }
   }
@@ -770,50 +1034,84 @@ private:
     size_t offset = 0;
     while (offset < bytes.size()) {
       auto operation = std::unique_ptr<IoOperation>(new IoOperation);
+      operation->kind = IoKind::write;
+      operation->issuingHandle =
+          runControlDuplicateHandle(connection.pipe.value, "run_control_write_unknown");
       operation->bytes.assign(bytes.begin() + static_cast<std::ptrdiff_t>(offset), bytes.end());
       operation->event = Handle(CreateEventW(nullptr, TRUE, FALSE, nullptr));
       require(static_cast<bool>(operation->event), "run_control_write_unknown");
       operation->overlap.hEvent = operation->event.value;
-      connection.pending.push_back(std::move(operation));
-      IoOperation &io = *connection.pending.back();
-      BOOL issued = WriteFile(connection.pipe.value, io.bytes.data(),
+      IoOperation *raw = runControlRetain(std::move(operation));
+      connection.pending.push_back(raw);
+      IoOperation &io = *raw;
+      BOOL issued = WriteFile(io.issuingHandle.value, io.bytes.data(),
                               static_cast<DWORD>(io.bytes.size()), nullptr, &io.overlap);
-      if (!issued && GetLastError() != ERROR_IO_PENDING) {
+      io.issued = true;
+      const DWORD issueError = issued ? ERROR_SUCCESS : GetLastError();
+      if (!issued && issueError != ERROR_IO_PENDING) {
+        io.complete = true;
+        io.error = issueError;
         io.poisoned = connection.poisoned = true;
-        throw NativeError{"run_control_write_unknown", GetLastError(), "write"};
+        runControlForget(&io);
+        throw NativeError{issueError == ERROR_BROKEN_PIPE ? "run_control_disconnected"
+                                                         : "run_control_write_unknown",
+                          issueError, "write"};
       }
-      const DWORD remaining = runControlRemaining(deadline);
-      if (!runControlWaitOperation(connection.pipe.value, io.overlap, io.transferred, remaining,
-                                   io.event.value)) {
-        runControlCancelOperation(connection.pipe.value, io.overlap, io.event.value);
-        io.poisoned = connection.poisoned = true;
+      const auto waited = runControlWaitOperation(io, runControlRemaining(deadline));
+      if (!waited.completed) {
+        const auto cancelled = runControlCancelAndDrain(io);
+        if (!cancelled.completed) {
+          io.unresolved = io.poisoned = connection.poisoned = true;
+          throw NativeError{"cleanup_unknown", ERROR_OPERATION_ABORTED, "write"};
+        }
+        io.complete = true;
+        io.transferred = cancelled.transferred;
+        io.error = cancelled.error;
+        connection.poisoned = true;
+        const bool retired = runControlRetire(connection);
+        if (!retired)
+          throw NativeError{"cleanup_unknown", ERROR_OPERATION_ABORTED, "write"};
         throw NativeError{"run_control_timeout", ERROR_OPERATION_ABORTED, "write"};
       }
-      require(io.transferred > 0 && io.transferred <= io.bytes.size(),
+      io.complete = true;
+      io.transferred = waited.transferred;
+      io.error = waited.error;
+      require(waited.error == ERROR_SUCCESS, waited.error == ERROR_BROKEN_PIPE
+                                                  ? "run_control_disconnected"
+                                                  : "run_control_write_unknown");
+      require(waited.transferred > 0 && waited.transferred <= io.bytes.size(),
               "run_control_write_partial");
-      offset += io.transferred;
-      connection.pending.pop_back();
+      offset += waited.transferred;
+      runControlForget(&io);
     }
   }
-  void runControlRetire(Connection &connection, bool shutdown) {
-    for (auto &operation : connection.pending) {
-      CancelIoEx(connection.pipe.value, &operation->overlap);
-      runControlCancelOperation(connection.pipe.value, operation->overlap, operation->event.value);
-      DWORD transferred = 0;
-      if (GetOverlappedResult(connection.pipe.value, &operation->overlap, &transferred, FALSE) == 0 &&
-          GetLastError() == ERROR_IO_INCOMPLETE) {
-        operation->unresolved = operation->poisoned = true;
-        connection.poisoned = true;
-        if (!shutdown)
-          throw NativeError{"cleanup_unknown"};
+  bool runControlRetire(Connection &connection) {
+    bool complete = true;
+    const auto pending = connection.pending;
+    for (IoOperation *operation : pending) {
+      const auto cancelled = runControlCancelAndDrain(*operation);
+      if (cancelled.completed) {
+        operation->complete = true;
+        operation->transferred = cancelled.transferred;
+        operation->error = cancelled.error;
+        runControlForget(operation);
+      } else {
+        operation->unresolved = operation->poisoned = connection.poisoned = true;
+        complete = false;
       }
     }
+    if (!complete)
+      return false;
     connection.pipe.reset();
     connection.retired = true;
+    return complete;
   }
-  JsonObject runControlShutdownReceipt() const {
+  JsonObject runControlShutdownReceipt(bool complete) const {
     JsonObject result;
     flag(result, L"shutdown", true);
+    flag(result, L"complete", complete);
+    flag(result, L"cleanupUnknown", !complete);
+    flag(result, L"success", complete);
     return result;
   }
 
@@ -823,8 +1121,12 @@ private:
   std::array<BYTE, 32> heldImageHash_{};
   std::wstring ownerSid_;
   std::vector<BYTE> ownerSidBytes_;
-  Handle selectedDirectory_, config_, intendedBun_, processImage_;
+  Handle selectedDirectory_, config_, intendedBun_, processImage_, packagePeerProcess_;
+  std::vector<BYTE> expectedPackageSid_;
+  std::wstring packageSid_;
   std::unique_ptr<Listener> listener_;
   std::map<std::uint64_t, std::unique_ptr<Connection>> registry_;
+  std::array<std::unique_ptr<IoOperation>, MAX_RETAINED_OPERATIONS> retainedIo_;
   bool shutdown_ = false;
+  bool shutdownComplete_ = true;
 };

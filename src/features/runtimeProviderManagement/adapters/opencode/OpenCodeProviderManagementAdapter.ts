@@ -1,5 +1,6 @@
 import { selectedProviderUsesOpenCodeV2, connectOpenCodeV2Provider, loadOpenCodeV2ProviderModels, testOpenCodeV2ProviderModel } from './OpenCodeV2ProviderManagement.js'
 import path from 'node:path'
+import { realpath } from 'node:fs/promises'
 
 import {
   openCodeClientFactory,
@@ -3194,7 +3195,8 @@ export class OpenCodeProviderManagementAdapter
 
     let binary: CatalogIdentityComponent
     try {
-      const binaryPath = (this.deps.resolveBinaryPath ?? resolveOpenCodeBinaryPath)()
+      const selectedBinaryPath = (this.deps.resolveBinaryPath ?? resolveOpenCodeBinaryPath)()
+      const binaryPath = selectedBinaryPath ? await realpath(selectedBinaryPath) : null
       if (input.expectedBinaryPath !== undefined && binaryPath !== input.expectedBinaryPath) {
         binary = { state: 'error' }
       } else if (!binaryPath) {
@@ -4347,6 +4349,13 @@ export class OpenCodeProviderManagementAdapter
       return providerManagementError('provider-missing', 'Provider id is invalid')
     }
 
+    type FailureStage = 'scope' | 'preidentity' | 'preidentity-validation' | 'managed-profile-host' | 'prepared-identity' | 'prepared-identity-reuse' | 'prepared-identity-change' | 'instance-config' | 'catalog-http' | 'publish-identity' | 'catalog-generation'
+    let failureStage: FailureStage = 'scope', failureReported = false
+    const reportFailure = (stage: FailureStage = failureStage): void => {
+      if (failureReported) return
+      failureReported = true
+      try { process.stderr.write(JSON.stringify({ event: 'opencode_v1_catalog_failure', stage }) + '\n') } catch {}
+    }
     let profileScope: NonNullable<OpenCodePrepareProfileOptions['profileScope']>
     let canonicalProjectPath: string
     try {
@@ -4359,6 +4368,7 @@ export class OpenCodeProviderManagementAdapter
         selectedModel: `${providerId}/catalog`,
       }), deadline.signal)
     } catch (error) {
+      reportFailure('scope')
       return providerManagementError(
         'runtime-unhealthy',
         catalogSanitizedUnknownMessage(providerId),
@@ -4372,6 +4382,7 @@ export class OpenCodeProviderManagementAdapter
     ].join('|')
     const generation = (this.catalogGenerationByScope.get(scopeKey) ?? 0) + 1
     this.catalogGenerationByScope.set(scopeKey, generation)
+    failureStage = 'preidentity'
     let prePreparationIdentity: CatalogIdentity
     try {
       prePreparationIdentity = await raceOpenCodeAbortSignal(this.readCatalogIdentity({
@@ -4380,6 +4391,7 @@ export class OpenCodeProviderManagementAdapter
         expectedScope: profileScope,
       }), deadline.signal)
     } catch {
+      reportFailure('preidentity')
       return providerManagementError('runtime-unhealthy', catalogSanitizedUnknownMessage(providerId))
     }
     if (
@@ -4387,6 +4399,7 @@ export class OpenCodeProviderManagementAdapter
       || (!prePreparationIdentity.managedAuthConsistent
         && !prePreparationIdentity.managedAuthAbsent)
     ) {
+      reportFailure('preidentity-validation')
       return providerManagementError('runtime-unhealthy', catalogSanitizedUnknownMessage(providerId))
     }
     const abortController = new AbortController()
@@ -4437,10 +4450,12 @@ export class OpenCodeProviderManagementAdapter
     }
     let catalogInstanceStarted = false
     let startPhaseTimeout = (_phase: 'instance' | 'query'): void => {}
+    failureStage = 'managed-profile-host'
     const operation = this.withManagedOpenCodeClient(
       input.runtimeId,
       input.projectPath,
       async ({ inventory, client }) => {
+        failureStage = 'prepared-identity'
         catalogInstanceStarted = true
         // Native cold startup owns the existing host budget, not the query budget.
         deadline.throwIfExpired()
@@ -4454,17 +4469,20 @@ export class OpenCodeProviderManagementAdapter
         })
         leaveIdentityStep()
         if (!identity.reusable) {
+          reportFailure('prepared-identity-reuse')
           return providerManagementError('runtime-unhealthy', catalogSanitizedUnknownMessage(providerId))
         }
         if (
           identity.key !== prePreparationIdentity.key
           || !identity.managedAuthConsistent
         ) {
+          reportFailure('prepared-identity-change')
           return providerManagementError('runtime-unhealthy', catalogSanitizedUnknownMessage(providerId))
         }
         // Health only proves the server is listening. Its first directory-scoped
         // request also initializes plugins/config, so do that once under the
         // startup phase, without consuming the subsequent query's budget.
+        failureStage = 'instance-config'
         const leaveInstanceStep = progress.enterStep('initialize catalog instance and read config providers')
         const configProvidersResult = await safeRead(() => client.getConfigProviders({ initializeInstance: true }))
         leaveInstanceStep()
@@ -4474,6 +4492,7 @@ export class OpenCodeProviderManagementAdapter
         const managedPreferencesResult = inventory.profile
           ? safeRead(() => this.getManagedPreferences().read(inventory.profile!.profileRootPath))
           : Promise.resolve({ ok: true, value: null } as SafeValue<OpenCodeManagedRuntimePreferences | null>)
+        failureStage = 'catalog-http'
         const leaveHttpStep = progress.enterStep('read catalog HTTP endpoints and preferences')
         const [providersResult, preferencesResult] = await Promise.all([
           safeRead(() => client.getProviders()),
@@ -4516,6 +4535,7 @@ export class OpenCodeProviderManagementAdapter
           }
         }
 
+        failureStage = 'publish-identity'
         const leavePublishStep = progress.enterStep('verify catalog publish identity')
         const publishIdentity = await this.readCatalogIdentity({
           projectPath: canonicalProjectPath,
@@ -4529,6 +4549,7 @@ export class OpenCodeProviderManagementAdapter
           || !publishIdentity.managedAuthConsistent
           || publishIdentity.key !== prePreparationIdentity.key
         ) {
+          reportFailure('publish-identity')
           return providerManagementError(
             'runtime-unhealthy',
             catalogSanitizedUnknownMessage(providerId),
@@ -4536,6 +4557,7 @@ export class OpenCodeProviderManagementAdapter
         }
 
         if (this.catalogGenerationByScope.get(scopeKey) !== generation) {
+          reportFailure('catalog-generation')
           return providerManagementError(
             'runtime-unhealthy',
             'OpenCode catalog response was superseded by a newer provider request',
@@ -4560,7 +4582,7 @@ export class OpenCodeProviderManagementAdapter
     )
     let timeout: ReturnType<typeof setTimeout> | undefined
     try {
-    return await raceOpenCodeAbortSignal(Promise.race([
+    const result = await raceOpenCodeAbortSignal(Promise.race([
       operation.then(async value => {
         if (abortController.signal.aborted) {
           return new Promise<ProviderManagementResult<RuntimeProviderModelsView>>(() => {})
@@ -4616,6 +4638,11 @@ export class OpenCodeProviderManagementAdapter
         }
       }),
     ]), deadline.signal)
+    if (!result.ok) reportFailure()
+    return result
+    } catch (error) {
+      reportFailure()
+      throw error
     } finally {
       if (timeout) clearTimeout(timeout)
       deadline.signal.removeEventListener('abort', abortFromDeadline)

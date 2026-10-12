@@ -3,6 +3,7 @@ import { canonicalizeOpenCodeProjectPath } from '../OpenCodeProfileManager.js'
 import { readOpenCodeAuthority, isKnownSessionStore, requireOpenCodeAuthority, type SessionStoreShape } from '../OpenCodeAuthorityStoreRead.js'
 import { OpenCodeVersionProbeCleanupError } from '../compatibility/OpenCodeVersionProbe.js'
 import { classifyOpenCodeV2ExecutionDelivery } from '../host/OpenCodeV2ExecutionDelivery.js'
+import { isExecutionPlatformAvailable } from '../host/OpenCodeV2ExecutionPlatform.js'
 import { resolveOpenCodeBinaryHostIdentity } from '../OpenCodeHostIdentity.js'
 import { resolveOpenCodeV2ExecutionProbe } from './OpenCodeV2ExecutionProbe.js'
 import { parseOpenCodeBridgePreconditions, validateOpenCodeBridgeStateChangingPreconditions } from '../OpenCodeBridgePreconditions.js'
@@ -19,7 +20,7 @@ import type { OpenCodeNormalizedPermission } from '../types.js'
 import { parseOpenCodeStopRequest, type OpenCodeStopData } from '../OpenCodeStopRecovery.js'
 import { openCodeDeliveryJournalRecoveryData, commandStatusFromOutcomeStatus, isAcceptedOutcomeStatus, commandStatusMismatchReason, outcomeSendMessageDataToCommandData, type SendMessageOutcomeBase, type SendMessageCommandData } from './OpenCodeBridgeDeliveryJournal.js'
 import { OpenCodeV2DeliveryJournal } from './OpenCodeV2DeliveryJournal.js'
-import { discoverOpenCodeV2Run, requestOpenCodeV2Run, isTransientOpenCodeV2ControlRead } from './OpenCodeV2RunControl.js'
+import { discoverOpenCodeV2Run, requestOpenCodeV2Run, isTransientOpenCodeV2ControlRead, OPEN_CODE_V2_RUN_INITIALIZATION_MS } from './OpenCodeV2RunControl.js'
 import { launchExplicitOpenCodeV2Run } from './OpenCodeV2RunOwner.js'
 import type { RunBinding, RunControlRecord, RunControlRequest, RunControlResult, RunLaunchPlan } from './OpenCodeV2RunTypes.js'
 import type { OpenCodeV2TurnProjection } from './OpenCodeV2TurnProjection.js'
@@ -62,6 +63,44 @@ export class OpenCodeV2TeamBridge {
       plan.binding.runId === this.binding.runId, 'run_binding_conflict')
     executionAssert(await this.discover() === null, 'run_already_owned')
     return this.ports.launch(plan)
+  }
+  /** Endpoint publication enables cancellation; a launch response waits for the
+   * same original members without another acquisition or model input. */
+  async awaitLaunchReady(record: RunControlRecord, plan: RunLaunchPlan, deadline: number) {
+    executionAssert(executionHash(record.binding) === executionHash(plan.binding) &&
+      record.binding.teamId === this.binding.teamId && record.binding.runId === this.binding.runId &&
+      record.deadline === plan.deadline && Number.isFinite(deadline) && deadline <= record.deadline &&
+      deadline <= Date.now() + OPEN_CODE_V2_RUN_INITIALIZATION_MS, 'run_readiness_changed')
+    while (Date.now() < deadline) {
+      const remaining = deadline - Date.now()
+      let status: RunControlResult
+      try { status = await this.ports.request(record, { operation: 'status' }, Math.min(5000, remaining)) }
+      catch (error) {
+        if (!isTransientOpenCodeV2ControlRead(error)) throw error
+        await new Promise(resolve => setTimeout(resolve, Math.min(100, Math.max(1, deadline - Date.now()))))
+        continue
+      }
+      executionAssert(status.kind === 'status' && status.deadline === record.deadline &&
+        executionHash(status.qualification ?? null) === executionHash(plan.qualification ?? null) &&
+        status.members.length === plan.members.length, 'run_readiness_changed')
+      for (const expected of plan.members) {
+        const matches = status.members.filter(member => member.memberId === expected.memberId)
+        const member = matches[0], model = expected.profile.selection.model
+        executionAssert(matches.length === 1 && member && member.laneId === expected.laneId &&
+          member.originalSessionId === expected.originalSessionId &&
+          member.opencodeSessionId === expected.originalSessionId && member.runtimeSessionId === expected.originalSessionId &&
+          member.selectedModel === `${model.providerID}/${model.id}` && member.selectedVariant === model.variant &&
+          member.pin === expected.native.version, 'run_readiness_changed')
+      }
+      if (status.state === 'active') {
+        executionAssert(Date.now() < deadline && openCodeV2SupportedSourcePredicate(status) &&
+          status.members.every(member => Number.isSafeInteger(member.runtimePid) && member.runtimePid! > 0), 'run_readiness_unknown')
+        return status
+      }
+      executionAssert(status.state === 'starting', 'run_readiness_unknown')
+      await new Promise(resolve => setTimeout(resolve, Math.min(100, Math.max(1, deadline - Date.now()))))
+    }
+    throw new Error('run_readiness_unknown')
   }
   async call(request: RunControlRequest, timeoutMs: number): Promise<RunControlResult> {
     executionAssert(Number.isFinite(timeoutMs) && timeoutMs > 0 && timeoutMs <= 30_000, 'invalid_operation_deadline')
@@ -206,7 +245,7 @@ function refusal(envelope: BridgeEnvelope, started: number, message: string) {
  * Exported product defaults remain false; caller booleans cannot activate these capabilities. */
 export function openCodeV2SupportedSourcePredicate(status: Extract<RunControlResult, { kind: 'status' }>): boolean {
   try { classifyOpenCodeV2ExecutionDelivery(import.meta.url) } catch { return false }
-  return process.platform === 'linux' && process.versions.bun === '1.3.11' &&
+  return isExecutionPlatformAvailable() && process.versions.bun === '1.3.11' &&
     status.qualification !== undefined && status.state === 'active' && status.deadline > Date.now() && status.members.length > 0 &&
     status.members.every(member => ['2.0.0', '2.0.21'].includes(member.pin) && member.state === 'accepted' &&
       member.originalSessionId === member.opencodeSessionId && member.originalSessionId === member.runtimeSessionId &&
@@ -248,9 +287,9 @@ async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: O
       const plan = await createOpenCodeV2LaunchPlan(envelope)
       measured = plan.qualification
       acceptedIdempotencyKey = parseOpenCodeBridgePreconditions(body.preconditions)?.idempotencyKey
-      await bridge.launchExplicit(plan)
-      const status = await bridge.call({ operation: 'status' }, 30_000)
-      executionAssert(status.kind === 'status', 'run_status_unknown')
+      const record = await bridge.launchExplicit(plan)
+      const status = await bridge.awaitLaunchReady(record, plan, Math.min(record.deadline,
+        started + (envelope.timeoutMs || OPEN_CODE_V2_RUN_INITIALIZATION_MS), Date.now() + OPEN_CODE_V2_RUN_INITIALIZATION_MS))
       return respond(envelope, started, { ...projectV2TeamStatus(status, plan.binding.runId), expectedBehaviorFingerprint: measured?.expectedBehaviorFingerprint }, pin)
     }
     if (envelope.command === 'opencode.readiness' || envelope.command === 'opencode.handshake') {
@@ -292,17 +331,6 @@ async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: O
         binaryFingerprint: probe.proof?.binaryFingerprint ?? await resolveOpenCodeBinaryHostIdentity(selection.native.executablePath),
         version: probe.proof?.opencodeVersion ?? selection.native.version }
 
-      if (envelope.command === 'opencode.readiness') return respond(envelope, started, {
-        state: probe.proof ? 'ready' : 'model_unavailable', launchAllowed: probe.proof !== null, modelId: `${selection.model.providerID}/${selection.model.id}`,
-        availableModels: [], opencodeVersion: selection.native.version, binaryPath: selection.native.executablePath,
-        hostHealthy: qualified, appMcpConnected: qualified, requiredToolsPresent: qualified, permissionBridgeReady: false,
-        runtimeStoresReady: owner !== null, supportLevel: qualified ? 'source_linux' : null,
-        missing: probe.proof ? [] : [probe.reason ?? 'Selected-model native execution proof is required.'],
-        diagnostics: ['Source availability is verified. No execution proof is claimed until the normal owned native probe observes the original terminal and physical cleanup.'],
-        executionProof: probe.proof, expectedBehaviorEvidence: probe.proof?.expectedBehaviorEvidence ?? null,
-        expectedBehaviorFingerprint: probe.proof?.expectedBehaviorEvidence.expectedBehaviorFingerprint ?? null, capabilitySnapshotId: selection.capabilitySnapshotId,
-        sourceAvailability: { installedGraphSHA256: selection.installedGraphSHA256, installedGraphFiles: selection.installedGraphFiles, sourceOnly: true },
-        sourceCapabilities, ...(owner ? { team: projectV2TeamStatus(owner, required(body.runId, 'runId')) } : {}) }, selection.native.version)
       const identity = createBridgeServerIdentity(null, { runtimeStoreManifestHighWatermark: typeof body.expectedManifestHighWatermark === 'number' ? body.expectedManifestHighWatermark : null })
       identity.runtime.capabilitySnapshotId = measured.capabilitySnapshotId
       identity.runtime.binaryPath = measured.binaryPath
@@ -316,6 +344,18 @@ async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: O
       const { identityHash: omittedIdentityHash, ...unsignedHandshake } = handshake
       void omittedIdentityHash
       handshake.identityHash = executionHash(unsignedHandshake)
+      if (envelope.command === 'opencode.readiness') return respond(envelope, started, {
+        state: probe.proof ? 'ready' : 'model_unavailable', launchAllowed: probe.proof !== null, modelId: `${selection.model.providerID}/${selection.model.id}`,
+        availableModels: [], opencodeVersion: selection.native.version, binaryPath: selection.native.executablePath,
+        hostHealthy: qualified, appMcpConnected: qualified, requiredToolsPresent: qualified, permissionBridgeReady: false,
+        runtimeStoresReady: owner !== null, supportLevel: qualified ? 'source_linux' : null,
+        missing: probe.proof ? [] : [probe.reason ?? 'Selected-model native execution proof is required.'],
+        diagnostics: ['Source availability is verified. No execution proof is claimed until the normal owned native probe observes the original terminal and physical cleanup.'],
+        executionProof: probe.proof, expectedBehaviorEvidence: probe.proof?.expectedBehaviorEvidence ?? null,
+        expectedBehaviorFingerprint: probe.proof?.expectedBehaviorEvidence.expectedBehaviorFingerprint ?? null, capabilitySnapshotId: selection.capabilitySnapshotId,
+        sourceAvailability: { installedGraphSHA256: selection.installedGraphSHA256, installedGraphFiles: selection.installedGraphFiles, sourceOnly: true },
+        ...(probe.proof && body.client ? { launchHandshake: handshake } : {}),
+        sourceCapabilities, ...(owner ? { team: projectV2TeamStatus(owner, required(body.runId, 'runId')) } : {}) }, selection.native.version)
       return respond(envelope, started, handshake, selection.native.version)
     }
     const timeout = Math.min(envelope.timeoutMs || 8000, 30_000)
@@ -520,7 +560,7 @@ export async function executeSelectedOpenCodeBridgeCommandEnvelope(input: unknow
     return executeV1(input)
   }
   const bridge = binding ? new OpenCodeV2TeamBridge(resolveClaudeMultimodelPaths().data, binding) : null
-  if (bridge && process.platform === 'linux' && process.getuid) {
+  if (bridge && isExecutionPlatformAvailable() && process.getuid) {
     try { if (await bridge.discover()) return executeV2(envelope, null, bridge) }
     catch (error) {
       if (envelope.command === 'opencode.commandStatus' || envelope.command === 'opencode.recoverDeliveryJournal')
