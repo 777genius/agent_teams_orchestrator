@@ -14,6 +14,7 @@ import {
   getBootstrapReadinessDecision,
   getBootstrapProcessingAction,
   getOrdinaryProcessingAction,
+  getOrdinaryInboxDeliveryState,
   getBootstrapInlineHandoffPrompt,
   getOrdinaryInlineHandoffPrompt,
   getOrdinaryRecoveryInlineHandoffPrompt,
@@ -26,6 +27,7 @@ import {
   resolveOrdinaryUserDirectReplyProtocol,
   buildAgentErrorNotificationText,
   buildOrdinaryAgentErrorMetadata,
+  buildNativeAttachmentFailureMessage,
   buildMailboxExecutionFailureLeadNotificationText,
   isBootstrapMemberBriefingCallableNow,
   isBootstrapMailboxInstructionText,
@@ -3649,5 +3651,124 @@ describe('useInboxPoller queued mailbox meta prompt', () => {
       reason: 'timeout_recovery_failed',
       taskRef: '545b704e',
     })
+  })
+
+  test('native attachment execution errors recover once and then terminate', () => {
+    const submitted = createUserMessage({
+      content: 'native attachment handoff',
+      isMeta: true,
+      uuid: 'native-attachment-uuid',
+    })
+    const apiError = createAssistantAPIErrorMessage({
+      content: 'provider rejected request',
+      errorDetails: 'provider rejected request',
+    })
+    const input = {
+      attempt: {
+        cooldownUntil: 0,
+        status: 'in_flight' as const,
+        submitUserMessageUuid: 'native-attachment-uuid',
+        submittedAt: 1,
+        timer: null,
+      },
+      messages: [submitted, apiError],
+      processingOrdinaryMessage: {
+        id: 'native-row',
+        messageId: 'native-message',
+        mailboxClaimedBySessionId: 'session-1',
+        from: 'user',
+        status: 'processing' as const,
+        timestamp: '2026-04-09T13:00:00.000Z',
+        text: 'Inspect attachment',
+        attachments: [],
+        nativeAttachmentDelivery: {
+          version: 1 as const,
+          recipientRuntimeInstanceId: 'runtime-1',
+        },
+      },
+    }
+    expect(getOrdinaryProcessingAction(input)).toEqual({
+      type: 'schedule_recovery',
+      detail: 'provider rejected request',
+      taskRef: undefined,
+    })
+    expect(getOrdinaryProcessingAction({ ...input, recoveryAttemptCount: 1 })).toEqual({
+      type: 'notify_failure',
+      detail: 'provider rejected request',
+      reason: 'timeout_recovery_failed',
+      taskRef: undefined,
+    })
+  })
+
+  test('final ordinary selector preserves native reserved JSON while leaving text-only control on the protocol path', () => {
+    for (const type of ['idle_notification', 'permission_request']) {
+      const row = {
+        id: 'native-row', messageId: 'native-message', from: 'user',
+        status: 'pending' as const, timestamp: '2026-10-12T00:00:00Z',
+        text: JSON.stringify({ type, idleReason: 'available' }),
+        mailboxClaimedBySessionId: 'session-1',
+        nativeAttachmentDelivery: { version: 1 as const, recipientRuntimeInstanceId: 'runtime-1' },
+      }
+      const state = getOrdinaryInboxDeliveryState([row], new Set())
+      expect(getOrdinaryPendingMessage({ pendingMessages: state.actionableMessages })).toEqual(row)
+    }
+    expect(getOrdinaryPendingMessage({ pendingMessages: [{
+      messageId: 'text-control', from: 'user', text: '{"type":"permission_request"}',
+    }] })).toBeUndefined()
+  })
+
+  test('pending native failure proof retains attempt ownership and prevents provider selection across polls', () => {
+    const row = {
+      id: 'native-row', messageId: 'native-message', from: 'user',
+      status: 'processing' as const, timestamp: '2026-10-12T00:00:00Z',
+      text: 'Inspect attachment', mailboxClaimedBySessionId: 'session-1',
+      nativeAttachmentDelivery: { version: 1 as const, recipientRuntimeInstanceId: 'runtime-1' },
+    }
+    // A failed USER write leaves this ID pending; repeated polls may not lose
+    // the original attempt/recovery or make the row actionable again.
+    const pendingFailureIds = new Set(['native-message'])
+    for (const messages of [[row], [row], []]) {
+      const state = getOrdinaryInboxDeliveryState(messages, pendingFailureIds)
+      expect(state.actionableMessages).toEqual([])
+      expect([...state.ownedMessageIds]).toEqual(['native-message'])
+    }
+    const regularState = getOrdinaryInboxDeliveryState([row], new Set())
+    expect(regularState.actionableMessages).toEqual([row])
+  })
+
+  test('native attachment USER failures are deterministic and avoid recovery trigger phrases', () => {
+    const payload = {
+      message: {
+        id: 'native-row',
+        messageId: 'native-message',
+        mailboxClaimedBySessionId: 'session-1',
+        from: 'user',
+        status: 'pending' as const,
+        timestamp: '2026-04-09T13:00:00.000Z',
+        text: 'Inspect attachment',
+      },
+      agentName: 'native-member',
+      teamName: 'team-a',
+      sessionId: 'session-1',
+      reasonCode: 'attachment_missing' as const,
+      detail: 'attachment_missing',
+    }
+    const first = buildNativeAttachmentFailureMessage(payload)
+    const second = buildNativeAttachmentFailureMessage(payload)
+    expect(first.messageId).toBe(second.messageId)
+    expect(first.text).not.toMatch(
+      /mailbox turn execution error|could not recover|API Error:/,
+    )
+    expect(first.agentError).toBeUndefined()
+    expect(first.nativeAttachmentFailure).toEqual({
+      originalMessageId: 'native-message',
+      reasonCode: 'attachment_missing',
+    })
+    expect(buildNativeAttachmentFailureMessage({
+      ...payload,
+      reasonCode: 'attachment_digest_mismatch',
+      agentName: 'replacement-member',
+      message: { ...payload.message, timestamp: '2026-10-12T00:00:00Z' },
+    }).messageId).toBe(first.messageId)
   })
 })

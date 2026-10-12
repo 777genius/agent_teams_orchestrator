@@ -243,6 +243,8 @@ const TEAMMATE_ENV_VARS = [
   'GCLOUD_PROJECT',
   // Config directory override
   'CLAUDE_CONFIG_DIR',
+  // App-owned immutable teammate attachment root contract.
+  'CLAUDE_AGENT_TEAMS_ATTACHMENT_ROOT',
   // Desktop-managed teammate backend preference. Forward this so process-backed
   // teammates keep spawning their own teammates without requiring tmux.
   'CLAUDE_TEAM_FORCE_PROCESS_TEAMMATES',

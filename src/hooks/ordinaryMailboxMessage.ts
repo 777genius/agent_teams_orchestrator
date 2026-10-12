@@ -35,6 +35,10 @@ export function createPendingMailboxMirrorMessage(
     status: 'pending',
     color: message.color,
     summary: message.summary,
+    ...(message.attachments ? { attachments: message.attachments } : {}),
+    ...(message.nativeAttachmentDelivery
+      ? { nativeAttachmentDelivery: message.nativeAttachmentDelivery }
+      : {}),
     ...(message.workSyncRuntimeTicketId
       ? { workSyncRuntimeTicketId: message.workSyncRuntimeTicketId }
       : {}),

@@ -1,4 +1,5 @@
 import { hasActiveHeadlessGroupMailboxTurn, hasProcessingGroupMailboxTurn, hasGroupMailboxMarker, isCurrentGroupMailboxMessage, type GroupMailboxEnvelope } from './groupMailbox.js'
+import { isNativeAttachmentMailboxMessage } from './nativeTeammateAttachments.js'
 // biome-ignore-all assist/source/organizeImports: ANT-ONLY import markers must not be reordered
 import {
   logEvent,
@@ -3643,7 +3644,8 @@ export async function getTeammateMailboxAttachments(
     (shouldUseLiveInboxOwnerPath && hasProcessingGroupMailboxTurn(appState.inbox.messages)) ||
     hasActiveHeadlessGroupMailboxTurn(teamName, agentName)
   const allUnreadMessages = (await readUnreadMessages(agentName, teamName)).filter(message =>
-    !processingGroupMailboxTurn && !hasGroupMailboxMarker(message) &&
+    !processingGroupMailboxTurn && !isNativeAttachmentMailboxMessage(message) &&
+    !hasGroupMailboxMarker(message) &&
     isCurrentGroupMailboxMessage(message),
   )
   const shouldReadFileBackedWorkSyncNudges =
@@ -3690,6 +3692,7 @@ export async function getTeammateMailboxAttachments(
       ? appState.inbox.messages.filter(
           m =>
             !processingGroupMailboxTurn &&
+            !isNativeAttachmentMailboxMessage(m) &&
             (m.status === 'pending' || m.status === 'processing') &&
             !hasGroupMailboxMarker(m) &&
             isCurrentGroupMailboxMessage(m) &&

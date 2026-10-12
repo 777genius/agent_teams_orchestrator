@@ -25,6 +25,11 @@ import {
   type WorkSyncAdmissionCommand,
 } from './workSyncContinuationAdmission.js'
 
+import {
+  writeWorkSyncAdmissionCapability,
+  type WorkSyncAdmissionCapability,
+} from './workSyncAdmissionCapability.js'
+
 const NOW = '2026-09-14T18:00:00.000Z'
 const NOW_MS = Date.parse(NOW)
 
@@ -58,6 +63,34 @@ function reserveCommand(
 }
 
 describe('work-sync continuation admission', () => {
+  test('attachment readiness is monotonic only within the current runtime instance', async () => {
+    const teamsDir = await mkdtemp(join(tmpdir(), 'native-capability-instance-'))
+    try {
+      const capability: WorkSyncAdmissionCapability = {
+        schemaVersion: 1, recoveryProtocolVersion: 2, teamName: 'sandbox-team',
+        teamIncarnation: 'unspecified', memberName: 'native-member', providerId: 'codex',
+        runtimeMode: 'app-server', runtimeInstanceId: 'runtime-a', generation: 0,
+        processorReady: true, nativeInboxAttachmentsVersion: 1,
+        publishedAt: '2026-10-12T00:00:00Z', pid: 101, bootstrapRunId: 'run-a',
+      }
+      const path = await writeWorkSyncAdmissionCapability(capability, teamsDir)
+      const { nativeInboxAttachmentsVersion: _ready, ...notReady } = capability
+      await writeWorkSyncAdmissionCapability(notReady, teamsDir)
+      expect(JSON.parse(await readFile(path, 'utf8')).nativeInboxAttachmentsVersion).toBe(1)
+      await writeWorkSyncAdmissionCapability({ ...notReady, runtimeInstanceId: 'runtime-b', pid: 202, bootstrapRunId: 'run-b' }, teamsDir)
+      const updated = { ...notReady, runtimeInstanceId: 'runtime-b', pid: 202, bootstrapRunId: 'run-b', generation: 1 }
+      await writeWorkSyncAdmissionCapability(updated, teamsDir)
+      expect(JSON.parse(await readFile(path, 'utf8'))).toEqual(updated)
+      await Promise.all([
+        writeWorkSyncAdmissionCapability({ ...updated, nativeInboxAttachmentsVersion: 1 }, teamsDir),
+        writeWorkSyncAdmissionCapability({ ...updated, generation: 2 }, teamsDir),
+      ])
+      expect(JSON.parse(await readFile(path, 'utf8')).nativeInboxAttachmentsVersion).toBe(1)
+    } finally {
+      await rm(teamsDir, { recursive: true, force: true })
+    }
+  })
+
   afterEach(() => {
     resetWorkSyncAdmissionProcessorForTests()
     unbindWorkSyncContinuationAdmission()
