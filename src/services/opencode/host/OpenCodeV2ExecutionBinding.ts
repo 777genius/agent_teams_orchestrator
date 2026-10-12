@@ -16,6 +16,7 @@ export type ExecutionSelection = Readonly<{
 export type ValidatedExecutionNative = OpenCodeV2NativeIdentity & Readonly<{
   runtimeMode: 'source' | 'packaged'; entrySha256: string
   bun: Readonly<{ path: string; sha256: string }>; graph: ExecutionGraph
+  taskNode?: Readonly<{ path: string; sha256: string }>
 }>
 /** The profile owner supplies this immutable epoch; acquisition never discovers HOME or copies auth. */
 export type SelectedExecutionProfile = Readonly<{

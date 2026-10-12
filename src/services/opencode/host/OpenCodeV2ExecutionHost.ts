@@ -115,6 +115,15 @@ export async function prepareOwnedNativeExecutionPlan(validatedNative: Validated
   if (process.platform === 'darwin') {
     const document = executionRecord(JSON.parse(profile.config.content))
     const graphFiles = new Map(native.graph.files.map(file => [file.path, file.sha256]))
+    if (native.taskNode) {
+      const closure = await resolveOpenCodeV2DarwinControllerRuntimeClosure(native.taskNode.path); check()
+      executionAssert(graphFiles.get(native.taskNode.path) === native.taskNode.sha256, 'controller_runtime_changed')
+      for (const file of closure.files) {
+        executionAssert(graphFiles.get(file.path) === file.sha256, 'controller_runtime_changed')
+        controllerLoaderFiles.add(file.path)
+      }
+      controllerLoaderAliases.push(...closure.aliases)
+    }
     if (document.mcp !== undefined) {
       const servers = executionRecord(executionRecord(document.mcp).servers)
       for (const value of Object.values(servers)) {

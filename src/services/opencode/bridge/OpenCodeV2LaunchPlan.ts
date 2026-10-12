@@ -216,6 +216,8 @@ export async function createOpenCodeV2PreparedMember(selection: Awaited<ReturnTy
       controller: { server: 'agent-teams', config: selection.controller }, provider, unattendedTeam: input.unattendedTeam })
     await writeFile(path.join(configDirectory, 'opencode.json'), config.content, { flag: 'wx', mode: 0o600 })
     const env = createOpenCodeV2OwnedProfileEnvironment(root)
+    if (process.platform === 'darwin' && native.taskNode)
+      env.PATH = [path.dirname(native.taskNode.path), env.PATH].join(path.delimiter)
     env.OPENCODE_CONFIG_DIR = configDirectory
     if (selection.controller.type === 'local' && selection.controller.environment?.AGENT_TEAMS_MCP_CLAUDE_DIR)
       env.AGENT_TEAMS_MCP_CLAUDE_DIR = selection.controller.environment.AGENT_TEAMS_MCP_CLAUDE_DIR

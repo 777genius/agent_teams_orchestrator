@@ -102,13 +102,28 @@ if (controller?.type === 'local') {
   }
   executionAssert(entries > 0, 'controller_entry_missing')
 }
+let taskNode: Readonly<{ path: string; sha256: string }> | undefined
+if (process.platform === 'darwin') {
+  const selected = Bun.which('node')
+  if (selected) {
+    const runtime = await realpath(selected)
+    const closure = await resolveOpenCodeV2DarwinControllerRuntimeClosure(runtime)
+    for (const row of closure.files) {
+      const previous = files.find(file => file.path === row.path)
+      executionAssert(!previous || previous.sha256 === row.sha256, 'controller_runtime_changed')
+      if (!previous) files.push(row)
+    }
+    taskNode = { path: runtime, sha256: await sha(runtime) }
+  }
+}
 files.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0)
 executionAssert(new Set(files.map(row => row.path)).size === files.length)
 const cliMetadata = executionRecord(JSON.parse(await readFile(path.join(path.dirname(path.dirname(cli)), 'package.json'), 'utf8')))
 executionAssert(typeof cliMetadata.name === 'string' && cliMetadata.version === pin)
 const native = { generation: 'v2', version: pin, dialect: `v2-${pin}`, runtimeMode: delivery.runtimeMode, executablePath: cli,
   executableSha256: cliSha256, packageName: cliMetadata.name, entrySha256: delivery.entrySha256,
-  bun: { path: bun, sha256: await sha(bun) }, graph: { sha256: executionHash(files), files } } satisfies ValidatedExecutionNative
+  bun: { path: bun, sha256: await sha(bun) }, graph: { sha256: executionHash(files), files },
+  ...(taskNode ? { taskNode } : {}) } satisfies ValidatedExecutionNative
 executionAssert(native.executableSha256 === identity.executableSha256 && native.packageName === identity.packageName, 'native_selection_changed')
 await validateExecutionNative(native)
 return native
