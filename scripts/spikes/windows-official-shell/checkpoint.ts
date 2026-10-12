@@ -1,5 +1,5 @@
 import path from 'node:path'
-import { readFile, writeFile } from 'node:fs/promises'
+import { readFile, realpath, writeFile } from 'node:fs/promises'
 import { Context, Effect, Layer } from 'effect'
 import { commandLayer, type CommandReceipt } from './spawner.ts'
 import { attemptWindowsAclEscape } from '../opencode-v2-windows-native.ts'
@@ -12,6 +12,7 @@ async function graph(alias: string) {
   return {
     routes: await import(entry) as typeof import('@opencode/server/routes'),
     cross: await load('@opencode/util/cross-spawn-spawner') as typeof import('@opencode/util/cross-spawn-spawner'),
+    global: await load('@opencode/util/global') as typeof import('@opencode/util/global'),
     locations: await load('@opencode/core/location-service-map') as typeof import('@opencode/core/location-service-map'),
     location: await load('@opencode/core/location') as typeof import('@opencode/core/location'),
     shell: await load('@opencode/core/shell') as typeof import('@opencode/core/shell'),
@@ -32,9 +33,25 @@ export async function runOfficialShellCheckpoint(base: string, resolveGraph: typ
       const commandFile = path.join(work, `official-${pin}-command.js`), cancelFile = path.join(work, `official-${pin}-cancel.js`)
       await writeFile(commandFile, `const fs=require('node:fs');fs.writeFileSync(${JSON.stringify(edited)},'official-edited');if(fs.readFileSync(${JSON.stringify(edited)},'utf8')!=='official-edited')process.exit(3);console.log('OFFICIAL_TEST_PASS');console.error('OFFICIAL_STDERR_PASS')`)
       await writeFile(cancelFile, `const fs=require('node:fs');const child=Bun.spawn([process.execPath,'-e','setInterval(()=>{},1000)'],{stdio:['inherit','inherit','inherit'],env:{...process.env}});fs.writeFileSync(${JSON.stringify(marker)},JSON.stringify({parentPID:process.pid,descendantPID:child.pid}));setInterval(()=>{},1000)`)
-      const routes = official.routes.createRoutes({ database: { path: path.join(work, `official-${pin}.db`) }, config: { directory: path.join(work, `config-${pin}`), project: false }, models: { fetch: false, snapshot: false }, fs: { filewatcher: false, fff: false }, events: { persist: false } }, () => [], [official.cross.node.replace(commandLayer(path.join(work, `stdio-${pin}`), receipts))])
+      const data = path.join(work, `data-${pin}`), cache = path.join(work, `cache-${pin}`)
+      const globalPaths = { home: work, data, cache, config: path.join(work, `config-${pin}`), state: path.join(work, `state-${pin}`),
+        tmp: path.join(work, `tmp-${pin}`), bin: path.join(cache, 'bin'), log: path.join(data, 'log'), repos: path.join(data, 'repos') }
+      const routes = official.routes.createRoutes({ database: { path: path.join(work, `official-${pin}.db`) }, config: { directory: globalPaths.config, project: false }, models: { fetch: false, snapshot: false }, fs: { filewatcher: false, fff: false }, events: { persist: false } }, () => [], [
+        official.cross.node.replace(commandLayer(path.join(work, `stdio-${pin}`), receipts)),
+        official.global.node.replace(official.global.layerWith(globalPaths)),
+      ])
       await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
         const services = yield* Layer.build(routes.pipe(Layer.provideMerge(official.http.layerHttpServices)))
+        const resolvedGlobal = Context.get(services, official.global.Service)
+        const canonicalWork = yield* Effect.promise(() => realpath(work))
+        for (const [key, expected] of Object.entries(globalPaths)) {
+          const actual = resolvedGlobal[key as keyof typeof globalPaths]
+          if (actual !== expected) return yield* Effect.die(new Error('TEST official Global path escaped selected work'))
+          const canonical = yield* Effect.promise(() => realpath(actual))
+          const relative = path.relative(canonicalWork, canonical)
+          if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return yield* Effect.die(new Error('TEST official Global path escaped selected work'))
+        }
+        record.globalPathsScoped = true
         const locations = Context.get(services, official.locations.Service)
         const context = yield* locations.contextEffect(official.location.Ref.make({ directory: official.schema.AbsolutePath.make(work) }))
         const service = Context.get(context, official.shell.Service)
@@ -61,7 +78,7 @@ export async function runOfficialShellCheckpoint(base: string, resolveGraph: typ
       record.officialInputAclDenied = attemptWindowsAclEscape(official.entry) === 5
       try { await writeFile(official.entry, 'escape'); record.officialInputWriteDenied = false } catch (error) { record.officialInputWriteDenied = ['EACCES', 'EPERM'].includes((error as NodeJS.ErrnoException).code ?? '') }
       const command = record.command as { status: string; exit: number; output: string; beforeCalled: boolean }, cancel = record.cancel as { status: string }
-      record.passed = command.status === 'exited' && command.exit === 0 && command.output.includes('OFFICIAL_TEST_PASS') && command.output.includes('OFFICIAL_STDERR_PASS') && command.beforeCalled && record.editedFile && cancel.status === 'timeout' && receipts.length === 2 && receipts.every(receipt => receipt.assignedBeforeResume && receipt.exactOuterJob && receipt.closed && receipt.activeAfterClose === 0 && receipt.heldExited) && Number(receipts[1]?.activeBeforeCancel) >= 3 && record.officialInputAclDenied && record.officialInputWriteDenied
+      record.passed = record.globalPathsScoped === true && command.status === 'exited' && command.exit === 0 && command.output.includes('OFFICIAL_TEST_PASS') && command.output.includes('OFFICIAL_STDERR_PASS') && command.beforeCalled && record.editedFile && cancel.status === 'timeout' && receipts.length === 2 && receipts.every(receipt => receipt.assignedBeforeResume && receipt.exactOuterJob && receipt.closed && receipt.activeAfterClose === 0 && receipt.heldExited) && Number(receipts[1]?.activeBeforeCancel) >= 3 && record.officialInputAclDenied && record.officialInputWriteDenied
     } catch (error) { record.error = String(error); record.passed = false }
   }
   return { purpose: 'TEST-official-Shell-spawner-seam', permissionToolQualified: false, passed: pins.every(pin => pin.passed === true), pins }

@@ -126,11 +126,11 @@ export async function stageBundledFixture(readonly: string): Promise<Artifact[]>
     await writeFile(path.join(buildDirectory, 'stage.json'), JSON.stringify({ phase: 'select-before-pin-resolution', pin, alias, fullTaskQualified: false }))
     const entry = await realpath(Bun.resolveSync(`${alias}/routes`, import.meta.dir))
     const entries: Record<string, string> = { routes: entry }
-    for (const [key, specifier] of [['cross', '@opencode/util/cross-spawn-spawner'], ['locations', '@opencode/core/location-service-map'], ['location', '@opencode/core/location'], ['shell', '@opencode/core/shell'], ['schema', '@opencode/schema/schema'], ['http', '@effect/platform-node/NodeHttpServer']] as const) entries[key] = await realpath(Bun.resolveSync(specifier, path.dirname(entry)))
+    for (const [key, specifier] of [['cross', '@opencode/util/cross-spawn-spawner'], ['global', '@opencode/util/global'], ['locations', '@opencode/core/location-service-map'], ['location', '@opencode/core/location'], ['shell', '@opencode/core/shell'], ['schema', '@opencode/schema/schema'], ['http', '@effect/platform-node/NodeHttpServer']] as const) entries[key] = await realpath(Bun.resolveSync(specifier, path.dirname(entry)))
     for (const [key, file] of Object.entries(entries)) {
       within(sourceRoot, file)
       const identity = await packageIdentity(file)
-      const expectedName = key === 'routes' ? '@opencode/server' : key === 'cross' ? '@opencode/util' : key === 'schema' ? '@opencode/schema' : key === 'http' ? '@effect/platform-node' : '@opencode/core'
+      const expectedName = key === 'routes' ? '@opencode/server' : key === 'cross' || key === 'global' ? '@opencode/util' : key === 'schema' ? '@opencode/schema' : key === 'http' ? '@effect/platform-node' : '@opencode/core'
       if (identity.name !== expectedName || (key !== 'http' && identity.version !== pin)) throw new Error('TEST bundle selected official package pin mismatch')
       if (await realpath(Bun.resolveSync('effect', path.dirname(file))) !== effectEntry) throw new Error('TEST bundle selected graph has a different Effect instance')
       imports.push(`import * as graph${index}_${key} from ${JSON.stringify(bundledImportPath(file))};`)
