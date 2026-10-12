@@ -69,7 +69,8 @@ const environment: Record<string, string> = {
 }
 try {
   const parent = await filesystem.createDirectory(root); await parent.close()
-  const fence = await filesystem.createDirectory(path.join(root, '.native-owner')); handles.push(fence)
+  const fencePath = path.join(root, '.native-owner')
+  const fence = await filesystem.createDirectory(fencePath); handles.push(fence)
   await fence.writeExclusive('owner.json', { schema: 1, testOnly: true, nonce, leaseOwnerId })
   await copyFile(process.execPath, path.join(root, 'bun.exe'))
   await writeFile(path.join(root, 'main.ts'), `
@@ -114,7 +115,8 @@ $sid
 `)
   assert.match(sid, /^S-1-15-2-/)
   stage = 'native-main-launch'; launched = true
-  const mapping = record(await broker.request('launch', { executable: path.join(root, 'bun.exe'), entry: path.join(root, 'main.ts'), cwd: root, env: environment, writableRoots: [root], readOnlyRoots: [], protectedRoots: [fence.path], nonce, leaseOwnerId }))
+  await fence.assertOwned()
+  const mapping = record(await broker.request('launch', { executable: path.join(root, 'bun.exe'), entry: path.join(root, 'main.ts'), cwd: root, env: environment, writableRoots: [root], readOnlyRoots: [], protectedRoots: [fencePath], nonce, leaseOwnerId }))
   assert.equal(mapping.containerSid, sid)
   const main = record(mapping.bun)
   const connected = await until(() => messages.find(value => value.type === 'prepared'))
