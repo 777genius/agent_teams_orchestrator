@@ -101,6 +101,11 @@ if($LASTEXITCODE-ne 0){throw 'TEST low label failed'}
   stage = 'native-realpath-facade'
   await broker.request('send', { value: { type: 'prepare', nonce, leaseOwnerId, namespace: mapping.namespace, birth: main.birth, realpathAnchors: anchors } })
   const result = await until(() => messages.find(value => value.type === 'realpathResult' || value.type === 'realpathFailed'))
+  facts.childDiagnostics = messages.filter(value => value.type === 'realpathDiagnostic').map(value => {
+    assert.equal(value.nonce, nonce); assert.equal(value.leaseOwnerId, leaseOwnerId)
+    return record(value.facts)
+  })
+  assert.ok((facts.childDiagnostics as unknown[]).length <= 1)
   facts.childResult = result
   assert.equal(result.type, 'realpathResult'); assert.equal(result.nonce, nonce); assert.equal(result.leaseOwnerId, leaseOwnerId)
   assert.equal(record(result.result).pid, main.nativePID); assert.equal(record(result.result).creation, record(main.birth).value)

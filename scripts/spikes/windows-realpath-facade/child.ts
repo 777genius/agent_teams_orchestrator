@@ -52,7 +52,7 @@ function currentBirth() {
   // Pseudo-handle is borrowed, never published or closed.
   return creation.readBigUInt64LE(0)
 }
-async function run(prepare?: Record<string, unknown>) {
+async function run(prepare?: Record<string, unknown>, diagnostic?: (value: Record<string, unknown>) => void) {
   const creation = currentBirth()
   const controls: Record<string, unknown>[] = []
   const targets = [root, path.join(root, 'ordinary.txt'), process.env.TEST_REALPATH_LONG!]
@@ -89,6 +89,34 @@ async function run(prepare?: Record<string, unknown>) {
   const require = createRequire(import.meta.url)
   const fs = require('node:fs') as typeof import('node:fs')
   const original = fs.realpathSync, denied = targets[1]!, fileURL = pathToFileURL(denied)
+  // Record actual Bun surfaces separately from the Win32 same-HANDLE denial.
+  // Do not import ESM fs/promises before the production installation.
+  const cjsBefore = require('node:fs/promises') as typeof import('node:fs/promises')
+  const probe = async (target: string, operation: () => unknown) => {
+    try {
+      const value: unknown = await operation()
+      return { succeeded: true, canonicalMatch: typeof value === 'string' && path.win32.relative(target, value) === '' }
+    } catch (error) {
+      const code = error && typeof error === 'object' && 'code' in error ? error.code : undefined
+      return { succeeded: false, code: typeof code === 'string' && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(code) ? code : 'non_errno_error' }
+    }
+  }
+  const surfaceControls: Record<string, unknown>[] = []
+  for (let index = 0; index < targets.length; index++) {
+    const target = targets[index]!
+    const callback = (native: boolean) => new Promise<string>((resolve, reject) => {
+      ;(native ? fs.realpath.native : fs.realpath)(target, (error, value) => error ? reject(error) : resolve(value))
+    })
+    surfaceControls.push({ index, chars: target.length,
+      sync: await probe(target, () => fs.realpathSync(target)),
+      syncNative: await probe(target, () => fs.realpathSync.native(target)),
+      callback: await probe(target, () => callback(false)),
+      callbackNative: await probe(target, () => callback(true)),
+      cjsPromises: await probe(target, () => cjsBefore.realpath(target)),
+    })
+  }
+  diagnostic?.({ phase: 'before-facade', controls, surfaceControls })
+
   const errorOf = (operation: () => unknown): NodeJS.ErrnoException => {
     try { operation() } catch (error) {
       assert.ok(error instanceof Error && 'code' in error)
@@ -157,8 +185,8 @@ async function run(prepare?: Record<string, unknown>) {
     sixSurfacesPassed: true, encodingAndFileURLPassed: true, relativePathPassed: true,
     pendingRetiredPassed: true, detachedRetiredPassed: true, longPathPassed: targets[2]!.length > 260 }
 }
-async function guardedRun(prepare?: Record<string, unknown>) {
-  try { return await run(prepare) }
+async function guardedRun(prepare?: Record<string, unknown>, diagnostic?: (value: Record<string, unknown>) => void) {
+  try { return await run(prepare, diagnostic) }
   finally { for (const handle of held) closeFile(handle); kernel.close() }
 }
 if (process.argv[2] === 'ordinary') console.log(JSON.stringify(await guardedRun()))
@@ -175,7 +203,7 @@ else {
       assert.equal(message.nonce, nonce); assert.equal(message.leaseOwnerId, leaseOwnerId)
       if (message.type === 'prepare') {
         assert.equal(prepared, false); prepared = true
-        void guardedRun(message).then(result => send({ type: 'realpathResult', result }),
+        void guardedRun(message, facts => send({ type: 'realpathDiagnostic', facts })).then(result => send({ type: 'realpathResult', result }),
           error => send({ type: 'realpathFailed', error: error instanceof Error ? error.message.slice(0, 240) : 'realpath_test_unknown' }))
       }
     }
