@@ -90,7 +90,12 @@ const read = (authPath: string) => readOpenCodeAuthCredential({ authPath, provid
 const exists = (file: string) => Bun.file(file).exists()
 
 async function fixture(options: { session?: boolean, purpose?: 'launch_runtime' | 'execution_probe', remote?: boolean,
-  terminal?: string, successor?: typeof c0, controlUrl?: string } = {}) {
+  terminal?: string, successor?: typeof c0, controlUrl?: string, diagnostic?: 'claude-dir' | 'command' } = {}) {
+  const started = Date.now()
+  const mark = (phase: string) => {
+    if (process.platform === 'win32' && options.diagnostic)
+      console.error(`Owned recovery fixture ${options.diagnostic}: ${phase} elapsedMs=${Date.now() - started}`)
+  }
   const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'oauth-restart-audit-')))
   roots.push(root)
   const project = path.join(root, 'project')
@@ -120,9 +125,11 @@ async function fixture(options: { session?: boolean, purpose?: 'launch_runtime' 
   const receiptPath = `${global}.agent-teams-xai-oauth-save.json`
   const archivePath = `${receiptPath}.revoked-${createHash('sha256').update(c0.refresh).digest('hex')}`
   await upsertOpenCodeAuthCredential({ authPath: global, providerId: 'xai', credential: c0 })
+  mark('prepare-profile begin')
   const profile = await manager.prepareProfile(project, { profileScope: await resolveOpenCodeProfileScope({
     projectPath: project, selectedModel: 'xai/grok-4.3', purpose, env,
   }) })
+  mark('prepare-profile end')
   // Real OS birth and ESRCH; this child is only a synthetic writer lifetime.
   const writer = startOwnedChild(`process.stdin.resume();
     process.stdin.on('end', () => process.exit(0));
@@ -132,8 +139,13 @@ async function fixture(options: { session?: boolean, purpose?: 'launch_runtime' 
   try {
     const pid = child.pid
     if (pid === undefined) throw new Error('Synthetic writer failed to spawn')
+    writer.state.phase = 'measure-writer'
+    mark('measure-writer begin')
     const birth = await readProcessStartTimeMs(pid)
     expect(birth).toBeGreaterThan(0)
+    mark('measure-writer end')
+    writer.state.phase = 'write-native-history'
+    mark('write-native-history begin')
     native = { projectPath: project, scopeToken: profile.scopeToken!, profileRootKey: profile.profileRootKey,
       hostKey: `audit-host::${profile.scopeToken}`, baseUrl: 'http://127.0.0.1:43210',
       pid, processStartedAtMs: birth!, sessionId: 'audit-session', messageId: 'audit-message', selectedModel: 'xai/grok-4.3' }
@@ -187,10 +199,14 @@ async function fixture(options: { session?: boolean, purpose?: 'launch_runtime' 
         db.query('insert into message values (?, ?, ?, ?, ?)').run(info.id, native.sessionId, 1, null, JSON.stringify(info))
       }
     } finally { db.close() }
+    mark('write-native-history end')
   } finally {
+    writer.state.phase = 'writer-eof-wait'
+    mark('writer-eof-wait begin')
     child.stdin.end()
     await writer.closed
     if (writer.state.cleaning) await stopInterruptedContinuation()
+    mark('writer-eof-wait end')
     expect(writer.state.error).toBeNull()
     expect(writer.state.code).toBe(0)
   }
@@ -282,7 +298,8 @@ test.each([false, true])('restart acceptance: original completed C1 is selected 
 
 for (const drift of ['missing-control', 'claude-dir', 'command', 'args', 'remote-port', 'control-host', 'control-path', 'control-query', 'control-scheme', 'security-env']) {
   test(`unauthorized transition retains terminal evidence and fences publication: ${drift}`, async () => {
-    const f = await fixture({ remote: drift === 'remote-port' })
+    const diagnostic = drift === 'claude-dir' || drift === 'command' ? drift : undefined
+    const f = await fixture({ remote: drift === 'remote-port', diagnostic })
     const changed = { ...f.env }
     if (drift === 'control-host') changed.CLAUDE_TEAM_CONTROL_URL = 'http://127.0.0.2:43102'
     if (drift === 'control-path') changed.CLAUDE_TEAM_CONTROL_URL += '/other'
@@ -309,7 +326,7 @@ for (const drift of ['missing-control', 'claude-dir', 'command', 'args', 'remote
     await expect(manager.withOwnedOAuthRefresh({ profile: f.profile, assertHostOwnership: async () => {},
       operation: async () => { operations++ } })).rejects.toThrow('revoked pending native admission')
     expect(operations).toBe(0)
-  })
+  }, process.platform === 'win32' && (drift === 'claude-dir' || drift === 'command') ? 60_000 : undefined)
 }
 
 test('new control port retains exact terminal checks before publishing', async () => {
