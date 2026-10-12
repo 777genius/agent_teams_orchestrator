@@ -30,6 +30,12 @@ import type { BackendType } from './swarm/backends/types.js'
 import { TEAM_LEAD_NAME } from './swarm/constants.js'
 import { sanitizePathComponent } from './tasks.js'
 import { getAgentName, getTeammateColor, getTeamName } from './teammate.js'
+import {
+  isNativeAttachmentMailboxMessage,
+  type NativeAttachmentMessageMetadata,
+  type NativeAttachmentDeliveryV1,
+  type NativeAttachmentMetaV1,
+} from './nativeTeammateAttachments.js'
 
 // Lock options: retry with backoff so concurrent callers (multiple Claudes
 // in a swarm) wait for the lock instead of failing immediately. The sync
@@ -89,7 +95,10 @@ export type TeammateMessage = GroupMailboxEnvelope & {
   workSyncAdmissionPayloadHash?: string
   messageKind?: TeammateMessageKind
   agentError?: AgentErrorMetadataV1
+  nativeAttachmentFailure?: { originalMessageId: string; reasonCode: string }
   runtimeRecovery?: RuntimeRecoveryNudgeMetadataV1
+  attachments?: readonly NativeAttachmentMetaV1[]
+  nativeAttachmentDelivery?: NativeAttachmentDeliveryV1
 }
 
 export function isAgentErrorNotificationMessage(
@@ -108,6 +117,12 @@ export type VerifiedMailboxWriteReceipt = {
   attempts: number
   totalMessages: number
 }
+
+type MailboxWriteOptions = {
+  immutableAttachmentFailure?: boolean
+}
+
+class ImmutableMailboxMessageConflictError extends Error {}
 
 export const MAILBOX_STALE_CLAIM_TIMEOUT_MS = 5 * 60 * 1000
 const VERIFIED_MAILBOX_WRITE_MAX_ATTEMPTS = 3
@@ -310,6 +325,7 @@ export async function writeToMailbox(
   recipientName: string,
   message: Omit<RawTeammateMessage, 'read'>,
   teamName?: string,
+  options?: MailboxWriteOptions,
 ): Promise<void> {
   await ensureInboxDir(teamName)
 
@@ -351,6 +367,18 @@ export async function writeToMailbox(
       read: false,
     })
 
+    if (options?.immutableAttachmentFailure) {
+      const existing = messages.find(row => row.messageId === newMessage.messageId)
+      if (existing) {
+        if (hasVerifiedAttachmentFailureMessage(existing, newMessage)) {
+          return
+        }
+        throw new ImmutableMailboxMessageConflictError(
+          `ATTACHMENT_FAILURE_CONFLICTING_MESSAGE_ID: ${newMessage.messageId}`,
+        )
+      }
+    }
+
     if (hasGroupMailboxMarker(newMessage) && messages.some(row => row.messageId === newMessage.messageId)) {
       if (hasVerifiedMailboxMessage(messages, newMessage)) return
       throw new Error('GROUP_CONFLICTING_MESSAGE_ID: existing physical identity has a different payload')
@@ -363,6 +391,9 @@ export async function writeToMailbox(
       `[TeammateMailbox] Wrote message to ${recipientName}'s inbox from ${message.from}`,
     )
   } catch (error) {
+    if (error instanceof ImmutableMailboxMessageConflictError) {
+      throw error
+    }
     logForDebugging(`Failed to write to inbox for ${recipientName}: ${error}`)
     logError(error)
   } finally {
@@ -402,10 +433,32 @@ function hasVerifiedMailboxMessage(
   )
 }
 
+function hasVerifiedAttachmentFailureMessage(
+  row: TeammateMessage,
+  message: TeammateMessage,
+): boolean {
+  return (
+    row.messageId === message.messageId &&
+    row.from === message.from &&
+    row.timestamp === message.timestamp &&
+    row.text === message.text &&
+    row.messageKind === message.messageKind &&
+    row.source === message.source &&
+    row.summary === message.summary &&
+    row.color === message.color &&
+    jsonStringify(row.nativeAttachmentFailure) === jsonStringify(message.nativeAttachmentFailure) &&
+    jsonStringify(row.agentError) === jsonStringify(message.agentError) &&
+    jsonStringify(row.nativeAttachmentDelivery) ===
+      jsonStringify(message.nativeAttachmentDelivery) &&
+    jsonStringify(row.attachments) === jsonStringify(message.attachments)
+  )
+}
+
 export async function writeToMailboxVerified(
   recipientName: string,
   message: Omit<RawTeammateMessage, 'read'>,
   teamName?: string,
+  options?: MailboxWriteOptions,
 ): Promise<VerifiedMailboxWriteReceipt> {
   const inboxPath = getInboxPath(recipientName, teamName)
   const messageId = resolveTeammateMessageId(message)
@@ -418,7 +471,16 @@ export async function writeToMailboxVerified(
   for (let attempt = 0; attempt < VERIFIED_MAILBOX_WRITE_MAX_ATTEMPTS; attempt++) {
     try {
       const messages = await readMailboxStrictForVerification(recipientName, teamName)
-      if (hasVerifiedMailboxMessage(messages, canonicalMessage)) {
+      if (
+        options?.immutableAttachmentFailure
+          ? messages.some(row =>
+              hasVerifiedAttachmentFailureMessage(row, {
+                ...canonicalMessage,
+                read: false,
+              }),
+            )
+          : hasVerifiedMailboxMessage(messages, canonicalMessage)
+      ) {
         return {
           messageId,
           inboxPath,
@@ -431,10 +493,19 @@ export async function writeToMailboxVerified(
       lastError = error
     }
 
-    await writeToMailbox(recipientName, canonicalMessage, teamName)
+    await writeToMailbox(recipientName, canonicalMessage, teamName, options)
     try {
       const messages = await readMailboxStrictForVerification(recipientName, teamName)
-      if (hasVerifiedMailboxMessage(messages, canonicalMessage)) {
+      if (
+        options?.immutableAttachmentFailure
+          ? messages.some(row =>
+              hasVerifiedAttachmentFailureMessage(row, {
+                ...canonicalMessage,
+                read: false,
+              }),
+            )
+          : hasVerifiedMailboxMessage(messages, canonicalMessage)
+      ) {
         return {
           messageId,
           inboxPath,
@@ -918,8 +989,9 @@ export function classifyIdleNotification(
  * visible so the leader can react.
  */
 export function isSilentRegularMailboxMessageForLiveContext(
-  message: Pick<TeammateMessage, 'text'>,
+  message: Pick<TeammateMessage, 'text'> & NativeAttachmentMessageMetadata,
 ): boolean {
+  if (isNativeAttachmentMailboxMessage(message)) return false
   const classified = classifyIdleNotification(message)
   return (
     classified !== null && classified.liveDelivery !== 'visible_actionable'
@@ -1594,19 +1666,20 @@ export function isStructuredProtocolMessage(messageText: string): boolean {
 }
 
 export function isRegularInteractiveMailboxMessage(
-  message: Pick<TeammateMessage, 'text'> & GroupMailboxEnvelope,
+  message: Pick<TeammateMessage, 'text'> & GroupMailboxEnvelope & NativeAttachmentMessageMetadata,
 ): boolean {
-  return hasGroupMailboxMarker(message) || !isStructuredProtocolMessage(message.text)
+  return isNativeAttachmentMailboxMessage(message) ||
+    hasGroupMailboxMarker(message) || !isStructuredProtocolMessage(message.text)
 }
 
 export function isLiveInboxMirrorMessageOwnedBySession(
   message: {
     text: string
     mailboxClaimedBySessionId?: string
-  },
+  } & GroupMailboxEnvelope & NativeAttachmentMessageMetadata,
   sessionId: string,
 ): boolean {
-  if (!isRegularInteractiveMailboxMessage({ text: message.text })) {
+  if (!isRegularInteractiveMailboxMessage(message)) {
     return true
   }
 

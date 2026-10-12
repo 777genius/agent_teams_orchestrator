@@ -831,4 +831,70 @@ describe('getTeammateMailboxAttachments mailbox lifecycle', () => {
     expect(mailboxRow).not.toHaveProperty('claimedBySessionId')
     expect(mailboxRow).not.toHaveProperty('claimedAt')
   })
+
+  it('excludes native attachment rows from raw and live text drains without consuming them', async () => {
+    const nativeRow = {
+      messageId: 'native-attachment-row-1',
+      from: 'user',
+      text: 'Structured native attachment',
+      timestamp: '2026-10-11T00:00:00Z',
+      attachments: [{
+        id: 'attachment-1',
+        filename: 'image.png',
+        mimeType: 'image/png',
+        size: 3,
+        filePath: '/app/attachments/team-a/native-attachment-row-1/attachment-1--image.png',
+        sha256: 'a'.repeat(64),
+      }],
+      nativeAttachmentDelivery: {
+        version: 1 as const,
+        recipientRuntimeInstanceId: 'runtime-1',
+      },
+    }
+    setIsInteractive(false)
+    await writeToMailbox('team-lead', nativeRow, 'my-team')
+    await writeToMailbox('team-lead', {
+      messageId: 'plain-row-1',
+      from: 'user',
+      text: 'Plain remains drainable',
+      timestamp: '2026-10-11T00:00:01Z',
+    }, 'my-team')
+
+    let appState = {
+      abortController: new AbortController(),
+      messages: [],
+      tasks: {},
+      toolPermissionContext: getEmptyToolPermissionContext(),
+      inbox: { messages: [] },
+      teamContext: {
+        teamName: 'my-team',
+        teamFilePath: join(tempConfigDir, 'my-team.json'),
+        leadAgentId: 'lead-id',
+        teammates: { 'lead-id': { name: 'team-lead', cwd: tempConfigDir, spawnedAt: 0 } },
+      },
+    } as unknown as AppState
+    const context = {
+      getAppState: () => appState,
+      setAppState: (updater: (prev: AppState) => AppState) => {
+        appState = updater(appState)
+      },
+      options: {},
+    } as unknown as ToolUseContext
+    const rawAttachments = await getTeammateMailboxAttachments(context)
+    expect(rawAttachments.flatMap(item =>
+      item.type === 'teammate_mailbox' ? item.messages.map(message => message.messageId) : [],
+    )).toEqual(['plain-row-1'])
+    expect((await readMailbox('team-lead', 'my-team')).find(
+      message => message.messageId === nativeRow.messageId,
+    )).toMatchObject({ read: false })
+
+    setIsInteractive(true)
+    const liveRow = createPendingMailboxMirrorMessage(
+      { ...nativeRow, messageId: nativeRow.messageId, read: false },
+      getSessionId(),
+    )
+    appState.inbox.messages = [liveRow]
+    expect(await getTeammateMailboxAttachments(context)).toEqual([])
+    expect(appState.inbox.messages[0]).toMatchObject({ status: 'pending' })
+  })
 })

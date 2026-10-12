@@ -212,7 +212,7 @@ import {
   getBootstrapTranscriptActivitySignature,
   useInboxPoller,
 } from '../hooks/useInboxPoller.js';
-import type { AgentErrorUserNotification, InboxPromptSubmitOptions, InboxPromptSubmitResult } from '../hooks/useInboxPoller.js';
+import type { AgentErrorUserNotification, InboxPromptSubmitOptions, InboxPromptSubmitResult, NativeInboxAttachmentsReadiness } from '../hooks/useInboxPoller.js';
 import { decideIncomingPromptAdmission, getBlockingIncomingPromptQueueModes, startQueryForIncomingKind } from '../utils/incomingPromptAdmission.js';
 import { useNativeAppManagedBootstrapContextInjection } from '../hooks/useNativeAppManagedBootstrapContextInjection.js';
 // Dead code elimination: conditional import for loop mode
@@ -930,6 +930,8 @@ export function REPL({
   // batched) and isQueryRunning (ref, sync) could desync. See QueryGuard.ts.
   const queryGuard = React.useRef(new QueryGuard()).current;
   const incomingPromptKindRef = React.useRef<InboxPromptSubmitOptions['submissionKind']>(undefined);
+  const [nativeInboxAttachmentsReady, setNativeInboxAttachmentsReady] =
+    useState<NativeInboxAttachmentsReadiness | null>(null);
 
   const groupChatToolsReady = hasGroupChatTools(tools) && hasBoundGroupChatControl();
   const groupCapabilityTeamName = getTeamName(teamContext);
@@ -961,6 +963,7 @@ export function REPL({
     const providerId = shouldUseCodexProviderRoutingForCurrentProcess()
       ? 'codex'
       : 'anthropic';
+    const runIdentity = getCurrentGroupRunIdentity();
     void writeWorkSyncAdmissionCapability({
       schemaVersion: 1,
       recoveryProtocolVersion: 2,
@@ -972,12 +975,23 @@ export function REPL({
       runtimeInstanceId: queryGuard.runtimeInstanceId,
       generation: queryGuard.generation,
       processorReady: true,
-      ...(groupChatToolsReady ? { groupChatProtocolVersion: 1 as const, groupReactionProtocolVersion: 1 as const, ...getCurrentGroupRunIdentity() } : {}),
+      pid: runIdentity.pid,
+      bootstrapRunId: runIdentity.bootstrapRunId,
+      runtimeRunId: runIdentity.runtimeRunId,
+      ...(nativeInboxAttachmentsReady
+        ? { nativeInboxAttachmentsVersion: 1 as const }
+        : {}),
+      ...(groupChatToolsReady ? {
+        groupChatProtocolVersion: 1 as const,
+        groupReactionProtocolVersion: 1 as const,
+        groupRunKey: runIdentity.groupRunKey,
+        runKey: runIdentity.runKey,
+      } : {}),
       publishedAt: new Date().toISOString(),
     }).catch(error => {
       logForDebugging(`[WorkSyncAdmission] capability write failed: ${String(error)}`);
     });
-  }, [queryGuard, groupChatToolsReady, groupCapabilityTeamName, groupCapabilityMemberName]);
+  }, [queryGuard, groupChatToolsReady, groupCapabilityTeamName, groupCapabilityMemberName, nativeInboxAttachmentsReady]);
 
   // Subscribe to the guard — true during dispatching or running.
   // This is the single source of truth for "is a local query in flight".
@@ -4157,7 +4171,7 @@ export function REPL({
   // Submits incoming prompts from teammate messages or tasks mode as new turns.
   // Returns acceptance plus the created user-message UUID so bootstrap delivery
   // can correlate the submitted meta turn with the later transcript outcome.
-  const handleIncomingPrompt = useCallback((content: string, options?: InboxPromptSubmitOptions): InboxPromptSubmitResult => {
+  const handleIncomingPrompt = useCallback((content: string | ContentBlockParam[], options?: InboxPromptSubmitOptions): InboxPromptSubmitResult => {
     // Read from the module-level store at call time (not the render-time
     // snapshot) to avoid a stale closure — this callback's deps don't
     // include the queue.
@@ -4200,6 +4214,17 @@ export function REPL({
     };
   }, [onQuery, mainLoopModel, store]);
 
+  const isIncomingPromptIdle = useCallback(() => {
+    const commandQueueModes = Array.from(new Set(
+      getCommandQueue().map(command => String(command.mode ?? 'unknown')),
+    ))
+    return (
+      queryGuard.status === 'idle' &&
+      !bootstrapAdmissionPendingRef.current &&
+      getBlockingIncomingPromptQueueModes(commandQueueModes).length === 0
+    )
+  }, [queryGuard]);
+
   const { getNativeAppManagedBootstrapContextInjection } =
     useNativeAppManagedBootstrapContextInjection();
 
@@ -4235,10 +4260,13 @@ export function REPL({
     isLoading,
     focusedInputDialog,
     getMessages: () => messagesRef.current,
+    runtimeInstanceId: queryGuard.runtimeInstanceId,
     onSubmitMessage: handleIncomingPrompt,
     getNativeAppManagedBootstrapContextInjection,
     onAgentErrorNotification: handleAgentErrorNotification,
     onBootstrapConfirmed: confirmBootstrapAdmission,
+    onNativeInboxAttachmentsReady: setNativeInboxAttachmentsReady,
+    isIncomingPromptIdle,
     transcriptActivitySignature: getBootstrapTranscriptActivitySignature(messages),
   });
   useTeammateStartupReadySentinel({

@@ -21,6 +21,10 @@ import type { AgentDefinitionsResult } from '../tools/AgentTool/loadAgentsDir.js
 import type { AllowedPrompt } from '../tools/ExitPlanModeTool/ExitPlanModeV2Tool.js'
 import type { AgentId } from '../types/ids.js'
 import type { Message, UserMessage } from '../types/message.js'
+import type {
+  NativeAttachmentDeliveryV1,
+  NativeAttachmentMetaV1,
+} from '../utils/nativeTeammateAttachments.js'
 import type { LoadedPlugin, PluginError } from '../types/plugin.js'
 import type { DeepImmutable } from '../types/utils.js'
 import {
@@ -369,6 +373,8 @@ export type AppState = DeepImmutable<{
       workSyncIntentId?: string
       workSyncPayloadHash?: string
       workSyncAdmissionPayloadHash?: string
+      attachments?: readonly NativeAttachmentMetaV1[]
+      nativeAttachmentDelivery?: NativeAttachmentDeliveryV1
     }>
   }
   // Worker sandbox permission requests (leader side) - for network access approval

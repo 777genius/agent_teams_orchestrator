@@ -1,6 +1,7 @@
 import { buildGroupMailboxPrompt, findGroupMailboxReplyOutcome, hasConflictingGroupReplyScope, hasGroupMailboxMarker, isCurrentGroupMailboxMessage, type GroupMailboxEnvelope } from '../utils/groupMailbox.js'
+import type { ContentBlockParam } from '@anthropic-ai/sdk/resources/messages.mjs'
 import { readFreshGroupChatCatalog, relayGroupAssistantText } from '../utils/groupChatControlClient.js'
-import { randomUUID } from 'crypto'
+import { createHash, randomUUID } from 'crypto'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useInterval } from 'usehooks-ts'
 import { createPendingMailboxMirrorMessage, isHumanDirectMailboxMessage } from './ordinaryMailboxMessage.js'
@@ -23,6 +24,7 @@ import { assembleToolPool, getAllBaseTools } from '../tools.js'
 import { SEND_MESSAGE_TOOL_NAME } from '../tools/SendMessageTool/constants.js'
 import type { PermissionUpdate } from '../types/permissions.js'
 import { logForDebugging } from '../utils/debug.js'
+import { logError } from '../utils/log.js'
 import {
   findInProcessTeammateTaskId,
   handlePlanApprovalResponse,
@@ -106,6 +108,7 @@ import {
   readAndClaimInteractiveMailboxSnapshot,
   type TeammateMessage,
   writeToMailbox,
+  writeToMailboxVerified,
 } from '../utils/teammateMailbox.js'
 import {
   hasPermissionCallback,
@@ -119,6 +122,14 @@ import {
   isNativeAppManagedBootstrapInstructionText,
   NATIVE_APP_MANAGED_BOOTSTRAP_PROOF_SOURCE,
 } from '../services/teamBootstrap/nativeAppManagedBootstrapContext.js'
+import {
+  isNativeAttachmentMailboxMessage,
+  isNativeAttachmentRootReady,
+  NativeAttachmentPreparationError,
+  prepareNativeAttachmentPromptContent,
+  type NativeAttachmentFailureReason,
+  type NativeAttachmentProvider,
+} from '../utils/nativeTeammateAttachments.js'
 
 /**
  * Get the agent name to poll for messages.
@@ -190,6 +201,24 @@ export type InboxPromptSubmitOptions = {
   submissionKind?: IncomingPromptSubmissionKind
 }
 
+export type NativeInboxAttachmentsReadiness = {
+  pid: number
+  bootstrapRunId: string
+  runtimeRunId: string
+}
+
+export type NativeAttachmentFailurePayload = {
+  message: PendingInboxMirrorMessage
+  agentName: string
+  teamName?: string
+  sessionId: string
+  reasonCode:
+    | NativeAttachmentFailureReason
+    | 'attachment_submission_uncorrelated'
+    | 'attachment_execution_failed'
+  detail: string
+}
+
 export type AgentErrorUserNotification = Pick<
   TeammateMessage,
   'messageId' | 'from' | 'text' | 'timestamp' | 'color' | 'summary' | 'messageKind'
@@ -201,15 +230,20 @@ type Props = {
   focusedInputDialog: string | undefined
   getMessages: () => AppState['messages']
   transcriptActivitySignature: string
+  runtimeInstanceId: string
   // Returns true if submission succeeded, false if rejected (e.g., query already running)
   // Dead code elimination: parameter named onSubmitMessage to avoid "teammate" string in external builds
   onSubmitMessage: (
-    formatted: string,
+    formatted: string | ContentBlockParam[],
     options?: InboxPromptSubmitOptions,
   ) => InboxPromptSubmitResult
   getNativeAppManagedBootstrapContextInjection?: GetNativeAppManagedBootstrapContextInjection
   onAgentErrorNotification: (message: AgentErrorUserNotification) => void
   onBootstrapConfirmed: () => void
+  onNativeInboxAttachmentsReady?: (
+    readiness: NativeInboxAttachmentsReadiness,
+  ) => void
+  isIncomingPromptIdle?: () => boolean
 }
 
 function formatPromptSubmitRejectionDetail(submitted: InboxPromptSubmitResult): string {
@@ -243,7 +277,7 @@ function formatBootstrapMessageAgeMs(timestamp: string | undefined, now: number)
   return String(Math.max(0, now - parsed))
 }
 
-type PendingInboxMirrorMessage = Pick<
+export type PendingInboxMirrorMessage = Pick<
   AppState['inbox']['messages'][number],
   | 'id'
   | 'messageId'
@@ -256,6 +290,8 @@ type PendingInboxMirrorMessage = Pick<
   GroupMailboxEnvelope & Partial<Pick<AppState['inbox']['messages'][number],
     'messageKind' | 'source' | 'workSyncRuntimeTicketId' | 'workSyncRuntimeGeneration' |
     'workSyncRuntimeInstanceId' | 'workSyncIntentId' | 'workSyncAdmissionPayloadHash' | 'workSyncControlRevision'>>
+  & Partial<Pick<AppState['inbox']['messages'][number],
+    'attachments' | 'nativeAttachmentDelivery'>>
 
 type QueuedMailboxPromptMessage = Pick<PendingInboxMirrorMessage, 'from' | 'text'>
 
@@ -431,6 +467,27 @@ export function getProcessingOrdinaryMessage({
       shouldProcessCoolingDown?.(message) === true
     )
   })
+}
+
+export function getOrdinaryInboxDeliveryState(
+  messages: readonly PendingInboxMirrorMessage[],
+  pendingNativeFailureIds: ReadonlySet<string>,
+): { actionableMessages: PendingInboxMirrorMessage[]; ownedMessageIds: Set<string> } {
+  const actionableMessages = messages.filter(message =>
+    !pendingNativeFailureIds.has(message.messageId ?? '') &&
+    message.messageKind !== 'agent_error' &&
+    isRegularInteractiveMailboxMessage(message) &&
+    !(message.from === TEAM_LEAD_NAME && isBootstrapMailboxInstructionText(message.text)),
+  )
+  return {
+    actionableMessages,
+    // A pending durable failure retains ownership without becoming actionable.
+    ownedMessageIds: new Set([
+      ...pendingNativeFailureIds,
+      ...actionableMessages.map(message => message.messageId)
+        .filter((messageId): messageId is string => !!messageId),
+    ]),
+  }
 }
 
 export function shouldDeferPendingInboxDelivery(params: {
@@ -1848,6 +1905,30 @@ type OrdinaryProcessingAction =
     }
   | { type: 'deliver_assistant_text'; text: string }
 
+export function buildNativeAttachmentFailureMessage(
+  payload: NativeAttachmentFailurePayload,
+): Omit<TeammateMessage, 'read'> {
+  const originalMessageId = payload.message.messageId!
+  const failureId = `native-attachment-failure-${createHash('sha256')
+    .update(originalMessageId)
+    .digest('hex')
+    .slice(0, 24)}`
+  const detail = payload.reasonCode
+  return {
+    messageId: failureId,
+    from: payload.agentName,
+    text: `Native teammate attachment delivery failed for message ${originalMessageId}: ${detail}.`,
+    timestamp: payload.message.timestamp,
+    summary: 'Native teammate attachment failure',
+    color: getTeammateColor(),
+    messageKind: 'agent_error',
+    nativeAttachmentFailure: {
+      originalMessageId,
+      reasonCode: payload.reasonCode,
+    },
+  }
+}
+
 export function getBootstrapProcessingAction({
   attempt,
   messages,
@@ -2060,7 +2141,8 @@ export function getOrdinaryProcessingAction({
 
   if (
     attempt.status === 'in_flight' &&
-    executionError?.type === 'codex_native_timeout'
+    (executionError?.type === 'codex_native_timeout' ||
+      (executionError && isNativeAttachmentMailboxMessage(processingOrdinaryMessage)))
   ) {
     const taskRef = extractTaskRefFromMailboxText(processingOrdinaryMessage.text)
     if (
@@ -2170,10 +2252,13 @@ export function useInboxPoller({
   focusedInputDialog,
   getMessages,
   transcriptActivitySignature,
+  runtimeInstanceId,
   onSubmitMessage,
   getNativeAppManagedBootstrapContextInjection,
   onAgentErrorNotification,
   onBootstrapConfirmed,
+  onNativeInboxAttachmentsReady,
+  isIncomingPromptIdle,
 }: Props): void {
   // Assign to original name for clarity within the function
   const onSubmitTeammateMessage = onSubmitMessage
@@ -2203,6 +2288,11 @@ export function useInboxPoller({
   )
   const ordinaryTerminalFailureRef = useRef<Set<string>>(new Set())
   const ordinaryFinalizationInFlightRef = useRef<Set<string>>(new Set())
+  const nativeAttachmentPreparationInFlightRef = useRef<Set<string>>(new Set())
+  const nativeAttachmentFailureWritesRef = useRef<
+    Map<string, NativeAttachmentFailurePayload & { failureMessage: Omit<TeammateMessage, 'read'> }>
+  >(new Map())
+  const nativeAttachmentFailureWriteInFlightRef = useRef<Set<string>>(new Set())
   const bootstrapReadinessWaitsRef = useRef<
     Map<string, BootstrapReadinessWaitState>
   >(new Map())
@@ -2211,6 +2301,72 @@ export function useInboxPoller({
   const idleDeliveryRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
     null,
   )
+
+  const persistNativeAttachmentFailure = useCallback(async (
+    payload: NativeAttachmentFailurePayload & { failureMessage: Omit<TeammateMessage, 'read'> },
+  ): Promise<void> => {
+    const originalMessageId = payload.message.messageId
+    if (!originalMessageId) return
+    if (nativeAttachmentFailureWriteInFlightRef.current.has(originalMessageId)) {
+      return
+    }
+    nativeAttachmentFailureWriteInFlightRef.current.add(originalMessageId)
+    try {
+      await writeToMailboxVerified(
+        'user',
+        payload.failureMessage,
+        payload.teamName,
+        { immutableAttachmentFailure: true },
+      )
+
+      // Durable USER proof is the terminal boundary. Nothing below may run
+      // before the stable failure row is written and verified.
+      ordinaryTerminalFailureRef.current.add(originalMessageId)
+      const attempt = ordinaryAttemptsRef.current.get(originalMessageId)
+      if (attempt?.timer) clearTimeout(attempt.timer)
+      ordinaryAttemptsRef.current.delete(originalMessageId)
+      ordinaryRecoveryRef.current.delete(originalMessageId)
+      await finalizeClaimedMessagesAsRead(
+        payload.agentName,
+        [originalMessageId],
+        payload.sessionId,
+        payload.teamName,
+      )
+      const rowId = payload.message.id
+      setAppState(prev => ({
+        ...prev,
+        inbox: {
+          messages: prev.inbox.messages.map(message =>
+            message.id === rowId
+              ? { ...message, status: 'processed' as const }
+              : message,
+          ),
+        },
+      }))
+      nativeAttachmentFailureWritesRef.current.delete(originalMessageId)
+    } catch (error) {
+      logForDebugging(
+        `[InboxPoller] Native attachment USER failure write remains pending for ${originalMessageId}: ${String(error)}`,
+      )
+      logError(error)
+      nativeAttachmentFailureWritesRef.current.set(originalMessageId, payload)
+    } finally {
+      nativeAttachmentFailureWriteInFlightRef.current.delete(originalMessageId)
+    }
+  }, [setAppState])
+
+  const queueNativeAttachmentFailure = useCallback((
+    payload: NativeAttachmentFailurePayload,
+  ): void => {
+    if (!payload.message.messageId) return
+    const originalMessageId = payload.message.messageId
+    const frozenPayload = nativeAttachmentFailureWritesRef.current.get(originalMessageId) ?? {
+      ...payload,
+      failureMessage: Object.freeze(buildNativeAttachmentFailureMessage(payload)),
+    }
+    nativeAttachmentFailureWritesRef.current.set(originalMessageId, frozenPayload)
+    void persistNativeAttachmentFailure(frozenPayload)
+  }, [persistNativeAttachmentFailure])
 
   useEffect(() => {
     return () => {
@@ -2233,6 +2389,9 @@ export function useInboxPoller({
       ordinaryAttemptsRef.current.clear()
       ordinaryRecoveryRef.current.clear()
       ordinaryTerminalFailureRef.current.clear()
+      nativeAttachmentPreparationInFlightRef.current.clear()
+      nativeAttachmentFailureWritesRef.current.clear()
+      nativeAttachmentFailureWriteInFlightRef.current.clear()
       for (const waitState of bootstrapReadinessWaitsRef.current.values()) {
         if (waitState.timer) {
           clearTimeout(waitState.timer)
@@ -2253,6 +2412,16 @@ export function useInboxPoller({
       const agentName = getAgentNameToPoll(currentAppState)
       if (!agentName) return
       const teamName = currentAppState.teamContext?.teamName
+      for (const payload of nativeAttachmentFailureWritesRef.current.values()) {
+        if (
+          payload.agentName === agentName &&
+          !nativeAttachmentFailureWriteInFlightRef.current.has(
+            payload.message.messageId!,
+          )
+        ) {
+          void persistNativeAttachmentFailure(payload)
+        }
+      }
       if (teamName) {
         await processBoundWorkSyncContinuationAdmission()
       }
@@ -3081,6 +3250,7 @@ export function useInboxPoller({
     focusedInputDialog,
     isLoading,
     onAgentErrorNotification,
+    persistNativeAttachmentFailure,
     setAppState,
     terminal,
     store,
@@ -3098,8 +3268,22 @@ export function useInboxPoller({
     const teamName = currentAppState.teamContext?.teamName
     const now = Date.now()
 
+    const pendingNativeFailureIds = new Set<string>(
+      nativeAttachmentFailureWritesRef.current.keys(),
+    )
+    for (const payload of nativeAttachmentFailureWritesRef.current.values()) {
+      if (
+        payload.agentName === agentName &&
+        !nativeAttachmentFailureWriteInFlightRef.current.has(
+          payload.message.messageId!,
+        )
+      ) {
+        void persistNativeAttachmentFailure(payload)
+      }
+    }
     const liveOwnedMessagesForGate = currentAppState.inbox.messages.filter(message =>
-      isLiveInboxMirrorMessageOwnedBySession(message, sessionId),
+      isLiveInboxMirrorMessageOwnedBySession(message, sessionId) &&
+      !pendingNativeFailureIds.has(message.messageId ?? ''),
     )
 
     if (
@@ -3154,20 +3338,10 @@ export function useInboxPoller({
         .map(message => message.messageId)
         .filter((messageId): messageId is string => !!messageId),
     )
-    const activeOrdinaryMessages = liveOwnedMessages.filter(
-      message =>
-        message.messageKind !== 'agent_error' &&
-        isRegularInteractiveMailboxMessage({ text: message.text }) &&
-        !(
-          message.from === TEAM_LEAD_NAME &&
-          isBootstrapMailboxInstructionText(message.text)
-        ),
-    )
-    const activeOrdinaryMessageIds = new Set(
-      activeOrdinaryMessages
-        .map(message => message.messageId)
-        .filter((messageId): messageId is string => !!messageId),
-    )
+    const {
+      actionableMessages: activeOrdinaryMessages,
+      ownedMessageIds: activeOrdinaryMessageIds,
+    } = getOrdinaryInboxDeliveryState(liveOwnedMessages, pendingNativeFailureIds)
     const transcriptMessages = getMessages()
     const processingOrdinaryMessage = getProcessingOrdinaryMessage({
       messages: activeOrdinaryMessages,
@@ -3272,6 +3446,7 @@ export function useInboxPoller({
         )
 
         const timer = setTimeout(() => {
+          if (nativeAttachmentFailureWritesRef.current.has(processingOrdinaryMessage.messageId!)) return
           ordinaryAttemptsRef.current.delete(processingOrdinaryMessage.messageId!)
           setAppState(prev => ({
             ...prev,
@@ -3301,19 +3476,39 @@ export function useInboxPoller({
           void writeAgentErrorLeadNotification({
             agentName,
             teamName,
-            text: buildCodexNativeMailboxTimeoutLeadNotificationText({
-              memberName: agentName,
-              taskRef: recoveryState.taskRef,
-              detail: recoveryState.failureDetail,
-              final: false,
-            }),
-            summary: 'Codex native mailbox timeout',
+            text: isNativeAttachmentMailboxMessage(processingOrdinaryMessage)
+              ? `Native teammate attachment turn retry scheduled for message ${processingOrdinaryMessage.messageId}.`
+              : buildCodexNativeMailboxTimeoutLeadNotificationText({
+                  memberName: agentName,
+                  taskRef: recoveryState.taskRef,
+                  detail: recoveryState.failureDetail,
+                  final: false,
+                }),
+            summary: isNativeAttachmentMailboxMessage(processingOrdinaryMessage)
+              ? 'Native attachment turn retry'
+              : 'Codex native mailbox timeout',
           }).catch(error => {
             logForDebugging(
-              `[InboxPoller] Failed to notify about Codex native timeout for ordinary mailbox row ${processingOrdinaryMessage.messageId}: ${String(error)}`,
+              `[InboxPoller] Failed to notify about recovery for ordinary mailbox row ${processingOrdinaryMessage.messageId}: ${String(error)}`,
             )
           })
         }
+        return
+      }
+
+      if (
+        processingAction.type === 'notify_failure' &&
+        attempt &&
+        isNativeAttachmentMailboxMessage(processingOrdinaryMessage)
+      ) {
+        queueNativeAttachmentFailure({
+          message: processingOrdinaryMessage,
+          agentName,
+          ...(teamName ? { teamName } : {}),
+          sessionId,
+          reasonCode: 'attachment_execution_failed',
+          detail: processingAction.detail,
+        })
         return
       }
 
@@ -3548,6 +3743,7 @@ export function useInboxPoller({
         const cooldownMs =
           processingAction.cooldownMs ?? ORDINARY_DIRECT_MESSAGE_RETRY_COOLDOWN_MS
         const timer = setTimeout(() => {
+          if (nativeAttachmentFailureWritesRef.current.has(processingOrdinaryMessage.messageId!)) return
           ordinaryAttemptsRef.current.delete(processingOrdinaryMessage.messageId!)
           setAppState(prev => ({
             ...prev,
@@ -3593,6 +3789,7 @@ export function useInboxPoller({
     const pendingMessages = currentAppState.inbox.messages.filter(
       m =>
         m.status === 'pending' &&
+        !pendingNativeFailureIds.has(m.messageId ?? '') &&
         m.messageKind !== 'agent_error' &&
         isLiveInboxMirrorMessageOwnedBySession(m, sessionId),
     )
@@ -4034,6 +4231,75 @@ export function useInboxPoller({
             : pendingMessages,
           isTeammateSession: isTeammate(),
         })
+      let promptContent: string | ContentBlockParam[] = prompt
+
+      if (
+        ordinaryPendingMessage &&
+        isNativeAttachmentMailboxMessage(ordinaryPendingMessage)
+      ) {
+        const preparationId = ordinaryPendingMessage.messageId!
+        if (nativeAttachmentPreparationInFlightRef.current.has(preparationId)) {
+          return
+        }
+        nativeAttachmentPreparationInFlightRef.current.add(preparationId)
+        try {
+          const stillIdle = isIncomingPromptIdle?.() ??
+            (!isLoading && !focusedInputDialog)
+          if (!stillIdle) {
+            return
+          }
+          const provider: NativeAttachmentProvider =
+            process.env.CLAUDE_CODE_ENTRY_PROVIDER?.trim().toLowerCase() ===
+            'codex'
+              ? 'codex'
+              : 'anthropic'
+          promptContent = await prepareNativeAttachmentPromptContent({
+            message: {
+              ...ordinaryPendingMessage,
+              ...(teamName ? { teamName } : {}),
+            },
+            provider,
+            replyProtocolText: prompt,
+            runtimeInstanceId,
+          })
+
+          const latestState = store.getState()
+          const latestMessage = latestState.inbox.messages.find(
+            message => message.id === ordinaryPendingMessage.id,
+          )
+          const currentAgentName = getAgentNameToPoll(latestState)
+          if (
+            !latestMessage ||
+            latestMessage.status !== 'pending' ||
+            currentAgentName !== agentName ||
+            !isLiveInboxMirrorMessageOwnedBySession(latestMessage, sessionId) ||
+            latestMessage.nativeAttachmentDelivery
+              ?.recipientRuntimeInstanceId !== runtimeInstanceId ||
+            !(isIncomingPromptIdle?.() ?? (!isLoading && !focusedInputDialog))
+          ) {
+            return
+          }
+        } catch (error) {
+          const reasonCode =
+            error instanceof NativeAttachmentPreparationError
+              ? error.reasonCode
+              : 'attachment_path_invalid'
+          logForDebugging(
+            `[InboxPoller] Native attachment preparation failed for ${ordinaryPendingMessage.messageId}: ${String(error)}`,
+          )
+          queueNativeAttachmentFailure({
+            message: ordinaryPendingMessage,
+            agentName,
+            ...(teamName ? { teamName } : {}),
+            sessionId,
+            reasonCode,
+            detail: reasonCode,
+          })
+          return
+        } finally {
+          nativeAttachmentPreparationInFlightRef.current.delete(preparationId)
+        }
+      }
 
       const nativeBootstrapInjection =
         bootstrapPendingMessage != null &&
@@ -4106,7 +4372,7 @@ export function useInboxPoller({
         })
       }
 
-      const submitted = onSubmitTeammateMessage(prompt, {
+      const submitted = onSubmitTeammateMessage(promptContent, {
         isMeta: true,
         submissionKind: resolveIncomingMailboxSubmissionKind({
           bootstrapPendingMessage,
@@ -4257,6 +4523,17 @@ export function useInboxPoller({
         }))
       } else if (ordinaryPendingMessage?.messageId) {
         if (!submitted.userMessageUuid) {
+          if (isNativeAttachmentMailboxMessage(ordinaryPendingMessage)) {
+            queueNativeAttachmentFailure({
+              message: ordinaryPendingMessage,
+              agentName,
+              ...(teamName ? { teamName } : {}),
+              sessionId,
+              reasonCode: 'attachment_submission_uncorrelated',
+              detail: 'attachment_submission_uncorrelated',
+            })
+            return
+          }
           logForDebugging(
             `[InboxPoller] Ordinary mailbox submission for ${ordinaryPendingMessage.messageId} was accepted without a transcript user message UUID; keeping row pending`,
           )
@@ -4292,9 +4569,13 @@ export function useInboxPoller({
     isLoading,
     focusedInputDialog,
     getMessages,
+    runtimeInstanceId,
     onSubmitTeammateMessage,
+    isIncomingPromptIdle,
     getNativeAppManagedBootstrapContextInjection,
     onBootstrapConfirmed,
+    persistNativeAttachmentFailure,
+    queueNativeAttachmentFailure,
     setAppState,
     inboxStateSignature,
     idleDeliveryRetryTick,
@@ -4343,11 +4624,26 @@ export function useInboxPoller({
             bootstrapRunId,
             source: 'useInboxPoller',
           })
+          const providerId =
+            process.env.CLAUDE_CODE_ENTRY_PROVIDER?.trim().toLowerCase()
+          if (
+            await isNativeAttachmentRootReady() &&
+            (providerId === undefined ||
+              providerId === '' ||
+              providerId === 'codex' ||
+              providerId === 'anthropic')
+          ) {
+            onNativeInboxAttachmentsReady?.({
+              pid: process.pid,
+              bootstrapRunId: bootstrapRunId || runId,
+              runtimeRunId: runId,
+            })
+          }
         })()
       }
       void poll()
     }
     // Note: poll uses store.getState() (not appState) so it won't re-run on appState changes
     // The ref guard is a safety measure to ensure initial poll only happens once
-  }, [enabled, poll, store])
+  }, [enabled, onNativeInboxAttachmentsReady, poll, store])
 }
