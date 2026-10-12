@@ -5,11 +5,52 @@ on:
       lane:
         description: 'Select the mechanism under investigation; all for final qualification'
         type: choice
-        options: [all, native-owner, native-command, native-http, native-realpath, native-boundary, official-shell, resolver-primitive, official-shell-bundled]
+        options: [all, native-delivery, native-owner, native-command, native-http, native-realpath, native-boundary, official-shell, resolver-primitive, official-shell-bundled]
         default: all
 permissions:
   contents: read
 jobs:
+  native-delivery:
+    if: inputs.lane == 'all' || inputs.lane == 'native-delivery'
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+      - name: Compile and stage production native assets
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (!$vs) { throw 'MSVC installation missing' }
+          $vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
+          $directory = Join-Path $env:GITHUB_WORKSPACE 'native\win32-x64'
+          New-Item -ItemType Directory -Path $directory -Force | Out-Null
+          $helper = Join-Path $directory 'opencode-v2-windows-helper.exe'
+          $dll = Join-Path $directory 'opencode-v2-windows-realpath.dll'
+          $helperSource = Join-Path $env:GITHUB_WORKSPACE 'src\services\opencode\host\windows\WindowsKernelScope.cpp'
+          $dllSource = Join-Path $env:GITHUB_WORKSPACE 'src\services\opencode\host\windows\WindowsNativeRealpath.cpp'
+          $script = Join-Path $env:RUNNER_TEMP 'compile-native-delivery.cmd'
+          @("@echo off", "call `"$vcvars`"", "if errorlevel 1 exit /b 1", "cl.exe /nologo /std:c++20 /EHsc /MT /W4 /O2 /DUNICODE /D_UNICODE `"$helperSource`" /Fe:`"$helper`" /link windowsapp.lib userenv.lib advapi32.lib", "if errorlevel 1 exit /b 1", "cl.exe /nologo /std:c++20 /EHsc /MT /LD /W4 /O2 /DUNICODE /D_UNICODE `"$dllSource`" /Fe:`"$dll`"", "exit /b %errorlevel%") | Set-Content $script -Encoding ascii
+          & cmd.exe /d /c $script
+          if ($LASTEXITCODE -ne 0) { throw 'Production native compilation failed' }
+          foreach ($asset in @(@{path=$helper;manifest='windows-helper.json'},@{path=$dll;manifest='windows-realpath.json'})) {
+            @{format=1;platform='win32';arch='x64';name=[IO.Path]::GetFileName($asset.path);sha256=(Get-FileHash $asset.path -Algorithm SHA256).Hash.ToLowerInvariant()} | ConvertTo-Json -Compress | Set-Content (Join-Path $directory $asset.manifest) -Encoding utf8NoBOM
+          }
+          & bun -e "import { stageWindowsHelper } from './scripts/opencode-v2/stage-windows.ts'; await stageWindowsHelper('./native', './TEST-native-delivery', 'x64');"
+          if ($LASTEXITCODE -ne 0) { throw 'Production native staging failed' }
+      - name: Check packaging refusals
+        shell: pwsh
+        run: bun test scripts/opencode-v2/stage-windows.test.ts
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: opencode-v2-windows-production-native-${{ github.sha }}
+          path: TEST-native-delivery/native/win32-x64/
+          if-no-files-found: error
   native-owner:
     if: inputs.lane == 'all' || inputs.lane == 'native-owner' || inputs.lane == 'native-command' || inputs.lane == 'native-http' || inputs.lane == 'native-realpath'
     runs-on: windows-2022
