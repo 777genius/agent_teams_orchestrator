@@ -126,16 +126,23 @@ async function run(prepare?: Record<string, unknown>, diagnostic?: (value: Recor
     }
     throw new Error('realpath_fixture_not_denied')
   }
-  const originalError = errorOf(() => original(denied))
+  for (const control of surfaceControls) {
+    assert.deepEqual(control.sync, { succeeded: true, canonicalMatch: true })
+    assert.deepEqual(control.callback, { succeeded: true, canonicalMatch: true })
+    for (const field of ['syncNative', 'callbackNative', 'cjsPromises']) {
+      assert.deepEqual(control[field], { succeeded: false, code: 'EPERM' })
+    }
+  }
+  const originalError = errorOf(() => original.native(denied))
   const originalCallbackError = await new Promise<NodeJS.ErrnoException>((resolve, reject) => {
-    fs.realpath(denied, error => error ? resolve(error) : reject(new Error('realpath_fixture_not_denied')))
+    fs.realpath.native(denied, error => error ? resolve(error) : reject(new Error('realpath_fixture_not_denied')))
   })
   assert.ok(originalCallbackError.code === 'EPERM' || originalCallbackError.code === 'EACCES')
   // Import the exact production facade before the first ESM node:fs/promises import.
   const facade: typeof import('../../../src/services/opencode/host/windows/OpenCodeV2WindowsRealpath.js') =
     await import(pathToFileURL(path.join(root, 'facade.ts')).href)
   const installation = facade.installWindowsRealpathFallback(selection)
-  const detachedSync = fs.realpathSync, detachedCallback = fs.realpath
+  const detachedSync = fs.realpathSync.native, detachedCallback = fs.realpath.native
   let pending: Promise<NodeJS.ErrnoException> | undefined, callbackCalls = 0, uninstalled = false
   try {
     for (const target of targets) {
@@ -169,7 +176,7 @@ async function run(prepare?: Record<string, unknown>, diagnostic?: (value: Recor
     })
     assert.equal(callbackCalls, 0)
   } finally { installation.uninstall(); uninstalled = true }
-  assert.notEqual(detachedSync, fs.realpathSync); assert.notEqual(detachedCallback, fs.realpath)
+  assert.notEqual(detachedSync, fs.realpathSync.native); assert.notEqual(detachedCallback, fs.realpath.native)
   const detachedError = errorOf(() => detachedSync(denied))
   assert.equal(detachedError.code, originalError.code); assert.equal(detachedError.message, originalError.message)
   assert.ok(pending)
@@ -180,6 +187,11 @@ async function run(prepare?: Record<string, unknown>, diagnostic?: (value: Recor
     detachedCallback(denied, error => error ? resolve(error) : reject(new Error('realpath_detached_callback_succeeded')))
   })
   assert.equal(laterError.code, originalCallbackError.code); assert.equal(laterError.message, originalCallbackError.message)
+  assert.equal(path.win32.relative(denied, fs.realpathSync(denied)), '')
+  const ordinaryAfter = await new Promise<string>((resolve, reject) => {
+    fs.realpath(denied, (error, value) => error ? reject(error) : resolve(value))
+  })
+  assert.equal(path.win32.relative(denied, ordinaryAfter), '')
   installation.uninstall()
   return { pid: process.pid, creation: creation.toString(), controls, kind: 'production-facade-genuine-appcontainer-dos5',
     sixSurfacesPassed: true, encodingAndFileURLPassed: true, relativePathPassed: true,
