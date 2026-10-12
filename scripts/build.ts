@@ -454,7 +454,8 @@ if (compile) {
   if ((portablePlatform?.split('-')[0] ?? process.platform) === 'win32') {
     const arch = portablePlatform?.split('-')[1] ?? process.arch
     if (arch !== 'x64' && arch !== 'arm64') throw new Error('execution_containment_native_build_required')
-    await stageWindowsHelper(resolve('native'), stagingOutdir, arch)
+    // Native V2 is qualified for x64 only; ARM64 retains the existing V1 delivery.
+    if (arch === 'x64') await stageWindowsHelper(resolve('native'), stagingOutdir, arch)
   }
   publishBundleOutdir(stagingOutdir, bundleOutdir)
   writeLauncher(outfile, bundleEntrypoint)
