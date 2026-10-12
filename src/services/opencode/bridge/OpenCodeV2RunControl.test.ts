@@ -17,7 +17,9 @@ function ready(child: ChildProcess): Promise<void> {
     child.stderr?.on('data', chunk => { stderr = (stderr + String(chunk)).slice(-4096) })
     child.stdout?.on('data', chunk => { output += String(chunk); if (output.includes('ready\n')) resolve() })
     child.once('error', reject); child.once('exit', () => reject(new Error('TEST_peer_exited_before_ready: ' + stderr)))
-  }), 5000)
+  // The source peer imports the runtime graph before its bounded 20s initialization.
+  // Match that fixture budget; a 5s import-plus-ready race can reject healthy peers.
+  }), 20_000)
 }
 async function stopTestChild(child: ChildProcess): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) return
