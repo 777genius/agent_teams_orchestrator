@@ -13,6 +13,7 @@ import { dirname, join, relative, resolve } from 'path'
 import { stageCursorManagedAssets } from './cursor-plugin/stage.js'
 import { OPENCODE_V2_EXTERNALS, stageOpenCodeV2Graphs } from './opencode-v2/stage.js'
 import { stageOpenCodeV2DarwinHelper } from './opencode-v2/stage-darwin.js'
+import { stageWindowsHelper } from './opencode-v2/stage-windows.js'
 import { validatePackagedOpenCodeIdentity } from '../src/cli/packagedOpenCodeDelivery.js'
 
 const pkg = await Bun.file(new URL('../package.json', import.meta.url)).json() as {
@@ -450,6 +451,11 @@ if (compile) {
     platform: portablePlatform?.split('-')[0], arch: portablePlatform?.split('-')[1] })
   await stageOpenCodeV2DarwinHelper(process.cwd(), stagingOutdir, {
     platform: portablePlatform?.split('-')[0], arch: portablePlatform?.split('-')[1] })
+  if ((portablePlatform?.split('-')[0] ?? process.platform) === 'win32') {
+    const arch = portablePlatform?.split('-')[1] ?? process.arch
+    if (arch !== 'x64' && arch !== 'arm64') throw new Error('execution_containment_native_build_required')
+    await stageWindowsHelper(resolve('native'), stagingOutdir, arch)
+  }
   publishBundleOutdir(stagingOutdir, bundleOutdir)
   writeLauncher(outfile, bundleEntrypoint)
 
