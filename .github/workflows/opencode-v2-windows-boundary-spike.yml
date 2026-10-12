@@ -5,13 +5,13 @@ on:
       lane:
         description: 'Select the mechanism under investigation; all for final qualification'
         type: choice
-        options: [all, native-owner, native-command, native-http, native-boundary, official-shell, resolver-primitive, official-shell-bundled]
+        options: [all, native-owner, native-command, native-http, native-realpath, native-boundary, official-shell, resolver-primitive, official-shell-bundled]
         default: all
 permissions:
   contents: read
 jobs:
   native-owner:
-    if: inputs.lane == 'all' || inputs.lane == 'native-owner' || inputs.lane == 'native-command' || inputs.lane == 'native-http'
+    if: inputs.lane == 'all' || inputs.lane == 'native-owner' || inputs.lane == 'native-command' || inputs.lane == 'native-http' || inputs.lane == 'native-realpath'
     runs-on: windows-2022
     timeout-minutes: 10
     steps:
@@ -37,6 +37,21 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'native helper compile failed' }
           $manifest = @{format=1;platform='win32';arch='x64';name='opencode-v2-windows-helper.exe';sha256=(Get-FileHash $helper -Algorithm SHA256).Hash.ToLowerInvariant()}
           $manifest | ConvertTo-Json -Compress | Set-Content (Join-Path $directory 'windows-helper.json') -Encoding utf8NoBOM
+      - name: Compile the TEST-only realpath DLL ABI
+        if: inputs.lane == 'all' || inputs.lane == 'native-realpath'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (!$vs) { throw 'MSVC installation missing' }
+          $vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
+          $source = Join-Path $env:GITHUB_WORKSPACE 'scripts\spikes\windows-realpath-native\WindowsRealpathTestDll.cpp'
+          $dll = Join-Path $env:GITHUB_WORKSPACE 'native\win32-x64\realpath-test.dll'
+          $script = Join-Path $env:RUNNER_TEMP 'compile-realpath-test.cmd'
+          @("@echo off", "call `"$vcvars`"", "if errorlevel 1 exit /b 1", "cl.exe /nologo /std:c++20 /EHsc /MT /LD /W4 /O2 /DUNICODE /D_UNICODE `"$source`" /Fe:`"$dll`"", "exit /b %errorlevel%") | Set-Content $script -Encoding ascii
+          & cmd.exe /d /c $script
+          if ($LASTEXITCODE -ne 0) { throw 'TEST realpath DLL compile failed' }
       - name: Prove durable owner fencing with actual held native handles
         shell: pwsh
         run: |
@@ -57,6 +72,13 @@ jobs:
           $root = Join-Path $env:RUNNER_TEMP ('TEST-windows-http-' + [guid]::NewGuid().ToString())
           & bun scripts/opencode-v2/windows-http-probe.ts $root "$env:RUNNER_TEMP\windows-http-evidence.json" 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP\windows-http-output.txt"
           exit $LASTEXITCODE
+      - name: Prove realpath ABI with genuine AppContainer DOS access denial
+        if: inputs.lane == 'all' || inputs.lane == 'native-realpath'
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP ('TEST-windows-realpath-' + [guid]::NewGuid().ToString())
+          & bun scripts/opencode-v2/windows-realpath-probe.ts $root "$env:RUNNER_TEMP\windows-realpath-evidence.json" 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP\windows-realpath-output.txt"
+          exit $LASTEXITCODE
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -69,6 +91,8 @@ jobs:
             ${{ runner.temp }}/windows-command-output.txt
             ${{ runner.temp }}/windows-http-evidence.json
             ${{ runner.temp }}/windows-http-output.txt
+            ${{ runner.temp }}/windows-realpath-evidence.json
+            ${{ runner.temp }}/windows-realpath-output.txt
           if-no-files-found: error
   native-boundary:
     if: inputs.lane == 'all' || inputs.lane == 'native-boundary'
