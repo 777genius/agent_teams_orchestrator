@@ -3052,7 +3052,7 @@ test('cleanup resolves exact persistent ownership across restart without profile
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 
-test('isolated umask0002 missing host directory is created private without relaxing unsafe existing directories', async () => {
+test.skipIf(process.platform === 'win32')('isolated umask0002 missing host directory is created private without relaxing unsafe existing directories', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-host-directory-mode-'))
   const lease = { teamId: 'team', laneId: 'primary', memberName: 'alice', runId: 'run', sessionId: 'session' }
   const resolveInSubprocess = async (registryPath: string, projectPath: string) => {
