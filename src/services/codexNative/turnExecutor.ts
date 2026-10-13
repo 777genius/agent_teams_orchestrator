@@ -34,12 +34,14 @@ import {
 import { runCodexNativeExec } from './execRunner.js'
 import {
   type CodexAppServerApprovalRequestHandler,
+  type CodexManualTurnStartParams,
   buildCodexAutoExecPolicy,
   buildCodexManualAppServerThreadPolicy,
 } from './appServerApproval.js'
 import { runCodexNativeAppServer } from './appServerRunner.js'
 import { buildCodexNativeCustomProviderConfigOverrides } from './customProviderConfigOverrides.js'
 import { buildCodexNativeLaunchConfigOverrides } from './launchConfigOverrides.js'
+import { buildCodexNativeStartupContextPrompt } from './nativeStartupContextPrompt.js'
 import {
   buildCodexNativeUserLoopbackProviderConfigOverrides,
   resolveCodexNativeUserLoopbackLaunchConfig,
@@ -259,7 +261,12 @@ function extractCodexNativePreparedImagePath(
 
 function toCodexNativePromptText(
   prompt: string | ContentBlockParam[],
-): { ok: true; text: string; imagePaths: string[] } | { ok: false; error: string } {
+): {
+  ok: true
+  text: string
+  imagePaths: string[]
+  input?: CodexManualTurnStartParams['input']
+} | { ok: false; error: string } {
   if (typeof prompt === 'string') {
     return {
       ok: true,
@@ -270,9 +277,11 @@ function toCodexNativePromptText(
 
   const textBlocks: ContentBlockParam[] = []
   const imagePaths: string[] = []
+  const input: CodexManualTurnStartParams['input'] = []
   for (const block of prompt) {
     if (block.type === 'text') {
       textBlocks.push(block)
+      input.push({ type: 'text', text: block.text, text_elements: [] })
       continue
     }
 
@@ -286,6 +295,7 @@ function toCodexNativePromptText(
         }
       }
       imagePaths.push(imagePath)
+      input.push({ type: 'localImage', path: imagePath })
       continue
     }
 
@@ -307,6 +317,7 @@ function toCodexNativePromptText(
     ok: true,
     text,
     imagePaths,
+    input,
   }
 }
 
@@ -582,10 +593,10 @@ export async function* executeCodexNativeTurn(
   const unsupportedReason =
     params.jsonSchema !== undefined
       ? 'Codex native phase 0 does not support structured-output enforcement yet.'
-      : !resolvedPrompt.ok
+      : resolvedPrompt.ok === false
         ? resolvedPrompt.error
         : null
-  if (unsupportedReason) {
+  if (resolvedPrompt.ok === false || unsupportedReason) {
     const assistantMessage = createAssistantAPIErrorMessage({
       content: unsupportedReason,
     })
@@ -634,6 +645,10 @@ export async function* executeCodexNativeTurn(
     null
 
   try {
+    const contextualPrompt = await buildCodexNativeStartupContextPrompt(
+      resolvedPrompt.text,
+      resolvedPrompt.input,
+    )
     const timeoutPolicy = resolveCodexNativeExecTimeoutPolicy(
       resolvedPrompt.text,
     )
@@ -649,7 +664,7 @@ export async function* executeCodexNativeTurn(
         ? resolveLoopbackLaunchConfig(deps)
         : EMPTY_LOOPBACK_LAUNCH_CONFIG
     const commonOptions = {
-      prompt: resolvedPrompt.text,
+      prompt: contextualPrompt.prompt,
       imagePaths: resolvedPrompt.imagePaths,
       cwd: params.cwd,
       model: params.model,
@@ -682,6 +697,7 @@ export async function* executeCodexNativeTurn(
       launchPolicy.transport === 'app-server'
         ? runAppServer({
             ...commonOptions,
+            input: contextualPrompt.input,
             loopbackOverlayToml: loopbackLaunch.overlayToml,
             requestApproval:
               params.requestApproval ??

@@ -20,7 +20,8 @@ import { getDynamicTeamContext, setDynamicTeamContext } from '../../utils/teamma
 import { readMailbox } from '../../utils/teammateMailbox.js'
 import type { Message, StreamEvent } from '../../types/message.js'
 import type { PermissionDecision } from '../../utils/permissions/PermissionResult.js'
-import type { CodexAppServerApprovalDecision } from './appServerApproval.js'
+import { EMPTY_USAGE } from '../api/emptyUsage.js'
+import type { CodexAppServerApprovalDecision, CodexManualTurnStartParams } from './appServerApproval.js'
 import { runCodexNativeAppServer } from './appServerRunner.js'
 import { createCodexAppServerApprovalPromptHandler } from './approvalPromptBridge.js'
 import { runCodexNativeTurnInRepl } from './replTurnBridge.js'
@@ -155,6 +156,55 @@ async function drain(iterator: AsyncGenerator<unknown, unknown, unknown>) {
 const flushCallbacks = () => new Promise<void>(resolve => setImmediate(resolve))
 
 describe('native REPL approval transport', () => {
+  test('preserves structured attachment order through the executor and actual turn/start request', async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), 'repl-ordered-input-test-'))
+    const fake = createApprovalServer(cwd)
+    let observedOptions: Parameters<typeof runCodexNativeAppServer>[0] | undefined
+    const prompt = [
+      { type: 'text', text: 'protocol\n' },
+      { type: 'image', source: { type: 'file', path: path.join(cwd, 'first.png') } },
+      { type: 'text', text: 'Attached file: note.txt\n\nПривіт 世界\n' },
+      { type: 'image', source: { type: 'file', path: path.join(cwd, 'last.png') } },
+    ]
+    try {
+      await drain(executeCodexNativeTurn({
+        prompt: prompt as unknown as Parameters<typeof executeCodexNativeTurn>[0]['prompt'],
+        cwd,
+        model: 'gpt-5.4',
+        effortValue: undefined,
+        permissionMode: 'default',
+        additionalWritableDirectories: [],
+        initialAppState: { fastMode: false } as never,
+        transcriptMessages: [],
+        persistSession: false,
+        replayedUserMessages: [],
+        mutableMessages: [],
+        totalUsage: EMPTY_USAGE,
+        permissionDenials: [],
+        startTime: Date.now(),
+        requestApproval: async () => ({ allow: true }),
+      }, {
+        buildUserLoopbackProviderConfigOverrides: () => [],
+        runAppServer: options => {
+          observedOptions = options
+          return runCodexNativeAppServer({ ...options, extraEnv: { CODEX_HOME: cwd } }, fake.deps)
+        },
+      }))
+      expect(observedOptions?.prompt).toBe('protocol\n\nAttached file: note.txt\n\nПривіт 世界')
+      expect(observedOptions?.imagePaths).toEqual([path.join(cwd, 'first.png'), path.join(cwd, 'last.png')])
+      const expectedInput: CodexManualTurnStartParams['input'] = [
+        { type: 'text', text: 'protocol\n', text_elements: [] },
+        { type: 'localImage', path: path.join(cwd, 'first.png') },
+        { type: 'text', text: 'Attached file: note.txt\n\nПривіт 世界\n', text_elements: [] },
+        { type: 'localImage', path: path.join(cwd, 'last.png') },
+      ]
+      expect(observedOptions?.input).toEqual(expectedInput)
+      expect(fake.sent.find(message => message.method === 'turn/start')?.params?.input).toEqual(expectedInput)
+    } finally {
+      await rm(cwd, { recursive: true, force: true })
+    }
+  })
+
   for (const allow of [true, false]) {
     test(`routes ${allow ? 'allow' : 'deny'} through the scoped prompt and actual executor`, async () => {
       const cwd = await mkdtemp(path.join(tmpdir(), 'repl-approval-test-'))

@@ -30,6 +30,7 @@ export type NativeAttachmentFailureReason =
   | 'attachment_path_invalid'
   | 'attachment_root_missing'
   | 'attachment_size_mismatch'
+  | 'attachment_text_invalid_utf8'
   | 'attachment_type_unsupported'
   | 'duplicate_attachment_id'
   | 'recipient_runtime_mismatch'
@@ -316,7 +317,8 @@ function assertProviderMime(
 ): void {
   const supported =
     provider === 'codex'
-      ? CODEX_IMAGE_MIME_TYPES.has(attachment.mimeType)
+      ? CODEX_IMAGE_MIME_TYPES.has(attachment.mimeType) ||
+        attachment.mimeType === 'text/plain'
       : CLAUDE_IMAGE_MIME_TYPES.has(attachment.mimeType) ||
         attachment.mimeType === 'application/pdf' ||
         attachment.mimeType === 'text/plain'
@@ -335,6 +337,21 @@ function buildProviderContentBlock(
 ): ContentBlockParam {
   assertProviderMime(attachment, provider)
   if (provider === 'codex') {
+    if (attachment.mimeType === 'text/plain') {
+      let text: string
+      try {
+        text = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+      } catch {
+        throw new NativeAttachmentPreparationError(
+          'attachment_text_invalid_utf8',
+          'native text attachment is not valid UTF-8',
+        )
+      }
+      return {
+        type: 'text',
+        text: `Attached file: ${attachment.filename}\n\n${text}`,
+      }
+    }
     return {
       type: 'image',
       source: {

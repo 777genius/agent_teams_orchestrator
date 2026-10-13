@@ -29,6 +29,7 @@ import {
   type CodexAppServerApprovalRequestHandler,
   type CodexAppServerRequest,
   type CodexAppServerRequestId,
+  type CodexManualTurnStartParams,
 } from './appServerApproval.js'
 import {
   type CodexNativeBinaryIdentity,
@@ -67,6 +68,7 @@ type SpawnedCodexAppServerProcess = Pick<
 export type CodexNativeAppServerRunnerOptions = {
   prompt: string
   imagePaths?: string[]
+  input?: CodexManualTurnStartParams['input']
   cwd: string
   model?: string | null
   reasoningEffort?:
@@ -877,6 +879,7 @@ export async function* runCodexNativeAppServer(
       threadId,
       prompt: options.prompt,
       imagePaths: options.imagePaths,
+      input: options.input,
       cwd: options.cwd,
       model: options.model,
       effort: options.reasoningEffort,

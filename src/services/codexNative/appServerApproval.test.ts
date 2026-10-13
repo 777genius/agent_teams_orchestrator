@@ -66,12 +66,16 @@ describe('Codex app-server approvals', () => {
       buildCodexManualTurnStartParams({
         threadId: 'thread-1',
         prompt: 'Ship it',
+        imagePaths: ['/repo/image.png'],
         cwd: '/repo',
         effort: 'minimal',
       }),
     ).toEqual({
       threadId: 'thread-1',
-      input: [{ type: 'text', text: 'Ship it', text_elements: [] }],
+      input: [
+        { type: 'text', text: 'Ship it', text_elements: [] },
+        { type: 'localImage', path: '/repo/image.png' },
+      ],
       cwd: '/repo',
       approvalPolicy: 'on-request',
       approvalsReviewer: 'user',

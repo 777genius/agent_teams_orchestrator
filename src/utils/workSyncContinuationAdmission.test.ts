@@ -63,29 +63,29 @@ function reserveCommand(
 }
 
 describe('work-sync continuation admission', () => {
-  test('attachment readiness is monotonic only within the current runtime instance', async () => {
+  test.each([1, 2] as const)('attachment readiness version %s is monotonic only within the current runtime instance', async (version) => {
     const teamsDir = await mkdtemp(join(tmpdir(), 'native-capability-instance-'))
     try {
       const capability: WorkSyncAdmissionCapability = {
         schemaVersion: 1, recoveryProtocolVersion: 2, teamName: 'sandbox-team',
         teamIncarnation: 'unspecified', memberName: 'native-member', providerId: 'codex',
         runtimeMode: 'app-server', runtimeInstanceId: 'runtime-a', generation: 0,
-        processorReady: true, nativeInboxAttachmentsVersion: 1,
+        processorReady: true, nativeInboxAttachmentsVersion: version,
         publishedAt: '2026-10-12T00:00:00Z', pid: 101, bootstrapRunId: 'run-a',
       }
       const path = await writeWorkSyncAdmissionCapability(capability, teamsDir)
       const { nativeInboxAttachmentsVersion: _ready, ...notReady } = capability
       await writeWorkSyncAdmissionCapability(notReady, teamsDir)
-      expect(JSON.parse(await readFile(path, 'utf8')).nativeInboxAttachmentsVersion).toBe(1)
+      expect(JSON.parse(await readFile(path, 'utf8')).nativeInboxAttachmentsVersion).toBe(version)
       await writeWorkSyncAdmissionCapability({ ...notReady, runtimeInstanceId: 'runtime-b', pid: 202, bootstrapRunId: 'run-b' }, teamsDir)
       const updated = { ...notReady, runtimeInstanceId: 'runtime-b', pid: 202, bootstrapRunId: 'run-b', generation: 1 }
       await writeWorkSyncAdmissionCapability(updated, teamsDir)
       expect(JSON.parse(await readFile(path, 'utf8'))).toEqual(updated)
       await Promise.all([
-        writeWorkSyncAdmissionCapability({ ...updated, nativeInboxAttachmentsVersion: 1 }, teamsDir),
+        writeWorkSyncAdmissionCapability({ ...updated, nativeInboxAttachmentsVersion: version }, teamsDir),
         writeWorkSyncAdmissionCapability({ ...updated, generation: 2 }, teamsDir),
       ])
-      expect(JSON.parse(await readFile(path, 'utf8')).nativeInboxAttachmentsVersion).toBe(1)
+      expect(JSON.parse(await readFile(path, 'utf8')).nativeInboxAttachmentsVersion).toBe(version)
     } finally {
       await rm(teamsDir, { recursive: true, force: true })
     }
