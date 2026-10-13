@@ -104,7 +104,7 @@ public static class TestAppSid {
 $native=[IntPtr]::Zero
 if([TestAppSid]::DeriveAppContainerSidFromAppContainerName(('AgentTeams.OpenCodeV2.'+$env:TEST_NONCE),[ref]$native)-ne 0){throw 'TEST SID derivation failed'}
 try{$sid=[System.Security.Principal.SecurityIdentifier]::new($native).Value}finally{[TestAppSid]::FreeSid($native)|Out-Null}
-$rule=[System.Security.AccessControl.FileSystemAccessRule]::new($sid,'ReadAndExecute','None','None','Allow')
+$rule=[System.Security.AccessControl.FileSystemAccessRule]::new([System.Security.Principal.SecurityIdentifier]::new($sid),'ReadAndExecute','None','None','Allow')
 $planned=[System.Collections.Generic.List[string]]::new();$ancestor=$env:TEST_ROOT
 while($ancestor){$planned.Add($ancestor);$info=[System.IO.DirectoryInfo]::new($ancestor).Parent;if(!$info){break};$ancestor=$info.FullName}
 [IO.File]::WriteAllText($env:TEST_JOURNAL,(ConvertTo-Json -InputObject @($planned)),[Text.UTF8Encoding]::new($false))
