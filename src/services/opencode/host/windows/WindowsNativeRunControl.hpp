@@ -26,7 +26,7 @@
 // issuer can construct this object. All observable identifiers are registry
 // generations; HANDLE and PID values never cross the JSON boundary.
 static constexpr DWORD RUN_CONTROL_MAX_FRAME_BYTES = 512 * 1024;
-static std::string runControlCanonicalJson(const JsonValue &value) {
+static std::string runControlCanonicalJson(const IJsonValue &value) {
   switch (value.ValueType()) {
   case JsonValueType::Null:
     return "null";
@@ -48,7 +48,7 @@ static std::string runControlCanonicalJson(const JsonValue &value) {
   }
   case JsonValueType::Object: {
     const auto object = value.GetObject();
-    std::vector<std::pair<std::wstring, JsonValue>> entries;
+    std::vector<std::pair<std::wstring, IJsonValue>> entries;
     for (auto pair : object)
       entries.emplace_back(std::wstring(pair.Key()), pair.Value());
     std::sort(entries.begin(), entries.end(),
@@ -220,7 +220,7 @@ struct WindowsNativeRunControl {
   JsonObject endpointRecord(const JsonObject &binding, const std::wstring &directory,
                             std::uint64_t deadline, const std::wstring &sourceSha256) const {
     std::lock_guard<std::recursive_mutex> lock(controlMutex_);
-    require(listener_, "run_control_foreign");
+    require(static_cast<bool>(listener_), "run_control_foreign");
     JsonObject record;
     num(record, L"schema", 1);
     num(record, L"protocol", 1);
@@ -1141,7 +1141,10 @@ private:
     value.SetNamedValue(L"processCreationTime", creation);
     str(value, L"executablePath", runControlImagePath(process));
     str(value, L"executableSha256", runControlHashHex(pin.image.sha256));
-    str(value, L"userSid", runControlSidString(pin.sid.data()));
+    require(!pin.sid.empty() && IsValidSid(const_cast<BYTE *>(pin.sid.data())),
+            "run_control_owner_identity");
+    str(value, L"userSid",
+        runControlSidString(const_cast<BYTE *>(pin.sid.data())));
     flag(value, L"appContainer", false);
     return value;
   }

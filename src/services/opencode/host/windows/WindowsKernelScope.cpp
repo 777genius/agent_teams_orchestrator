@@ -1489,7 +1489,7 @@ struct WindowsNativeRunStateIssuer {
     held.sealedPath = config.path;
     const auto bindingBytes = narrow(std::wstring(state.binding().Stringify()));
     held.sealedBinding.assign(bindingBytes.begin(), bindingBytes.end());
-    held.expected.bytes = held.sealedBinding;
+    held.expected.bytes.assign(bindingBytes.begin(), bindingBytes.end());
     held.expected.root = Control::runControlObserveFile(config.root.value, true);
     held.expected.config = Control::runControlObserveFile(config.config.value, false);
     held.expected.image = Control::runControlObserveFile(executable.value, false);

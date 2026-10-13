@@ -242,7 +242,7 @@ struct WindowsNativeRunState {
     require(DuplicateHandle(GetCurrentProcess(), process, GetCurrentProcess(), &duplicate, 0,
                             FALSE, DUPLICATE_SAME_ACCESS),
             "run_state_unknown");
-    serverProcess_.reset(duplicate);
+    serverProcess_ = Handle(duplicate);
   }
 
   bool validatePayload(const JsonObject &payload) const {
