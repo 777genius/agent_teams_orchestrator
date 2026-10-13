@@ -3,10 +3,58 @@ import { resolveOpenCodeV2ExecutionDelivery } from '../host/OpenCodeV2ExecutionD
 import { assertExecutionPlatformAvailable } from '../host/OpenCodeV2ExecutionPlatform.js'
 import { validateExecutionNative } from '../host/OpenCodeV2ExecutionBinding.js'
 import { createHash } from 'node:crypto'
-import { readFile, realpath, readdir, lstat } from 'node:fs/promises'
+import { open, readFile, realpath, readdir, lstat } from 'node:fs/promises'
 import { executionHash, executionAssert, executionRecord } from '../execution/OpenCodeV2ExecutionContracts.js'
 import type { ExecutionMcpConfig } from '../transport/OpenCodeV2ExecutionClientFactory.js'
 import type { ValidatedExecutionNative } from '../host/OpenCodeV2ExecutionBinding.js'
+
+type PeExecutableFailure = 'native_selection_changed' | 'controller_runtime_invalid'
+
+/** Qualify one canonical x64 PE executable from a bounded, stable byte snapshot. */
+async function inspectOpenCodeV2WindowsPeExecutable(file: string, expectedName: string,
+  failure: PeExecutableFailure): Promise<Readonly<{ path: string; sha256: string }>> {
+  const invalid = failure === 'controller_runtime_invalid' ? 'controller_runtime_pe_invalid' : failure
+  const architecture = failure === 'controller_runtime_invalid' ? 'controller_runtime_architecture_invalid' : failure
+  executionAssert(path.isAbsolute(file) && path.basename(file) === expectedName && await realpath(file) === file, invalid)
+  const leaf = await lstat(file)
+  executionAssert(leaf.isFile() && !leaf.isSymbolicLink(), invalid)
+  const handle = await open(file, 'r')
+  try {
+    const before = await handle.stat()
+    executionAssert(before.dev === leaf.dev && before.ino === leaf.ino && before.isFile() &&
+      before.size > 0 && before.size <= 256 * 1024 * 1024, invalid)
+    const captured = Buffer.alloc(Math.min(before.size, 1024 * 1024))
+    const chunk = Buffer.alloc(64 * 1024), hash = createHash('sha256')
+    for (let offset = 0; offset < before.size;) {
+      const { bytesRead } = await handle.read(chunk, 0, Math.min(chunk.length, before.size - offset), offset)
+      executionAssert(bytesRead > 0, invalid)
+      if (offset < captured.length)
+        chunk.copy(captured, offset, 0, Math.min(bytesRead, captured.length - offset))
+      hash.update(chunk.subarray(0, bytesRead)); offset += bytesRead
+    }
+    const after = await handle.stat(), current = await lstat(file)
+    executionAssert(await realpath(file) === file && current.isFile() && !current.isSymbolicLink() &&
+      before.dev === after.dev && before.ino === after.ino && before.size === after.size &&
+      before.mtimeMs === after.mtimeMs && after.dev === current.dev && after.ino === current.ino &&
+      after.size === current.size && after.mtimeMs === current.mtimeMs, invalid)
+
+    executionAssert(captured.length >= 0x40 && captured.readUInt16LE(0) === 0x5a4d, invalid)
+    const peOffset = captured.readUInt32LE(0x3c)
+    executionAssert(peOffset >= 0x40 && peOffset <= captured.length - 24, invalid)
+    executionAssert(captured.readUInt32LE(peOffset) === 0x00004550, invalid)
+    const coff = peOffset + 4, machine = captured.readUInt16LE(coff), sections = captured.readUInt16LE(coff + 2)
+    const optionalSize = captured.readUInt16LE(coff + 16), characteristics = captured.readUInt16LE(coff + 18)
+    executionAssert(sections > 0 && sections <= 96 && optionalSize >= 112 && optionalSize <= 1024, invalid)
+    const optional = coff + 20, sectionTableEnd = optional + optionalSize + sections * 40
+    executionAssert(sectionTableEnd <= captured.length && sectionTableEnd <= before.size, invalid)
+    executionAssert(captured.readUInt16LE(optional) === 0x20b, invalid)
+    executionAssert((characteristics & 0x0002) !== 0 && (characteristics & 0x2000) === 0, invalid)
+    executionAssert(machine === 0x8664, architecture)
+    return Object.freeze({ path: file, sha256: hash.digest('hex') })
+  } finally {
+    await handle.close()
+  }
+}
 
 /** Read-only installed graph receipt; no server import, CLI execution, or output file. */
 export async function createOpenCodeV2ExecutionReceipt(_sourceRoot: string, identity: import('../compatibility/OpenCodeNativeIdentity.js').OpenCodeV2NativeIdentity, controller?: ExecutionMcpConfig): Promise<ValidatedExecutionNative> {
@@ -14,7 +62,9 @@ assertExecutionPlatformAvailable()
 executionAssert(process.versions.bun === '1.3.11' && identity.generation === 'v2', 'source_bun_required')
 const cli = await realpath(identity.executablePath), bun = await realpath(process.execPath), pin = identity.version
 const sha = async (file: string) => createHash('sha256').update(await readFile(file)).digest('hex')
-const cliSha256 = await sha(cli)
+const cliSha256 = process.platform === 'win32'
+  ? (await inspectOpenCodeV2WindowsPeExecutable(cli, 'opencode.exe', 'native_selection_changed')).sha256
+  : await sha(cli)
 executionAssert(cliSha256 === identity.executableSha256, 'native_selection_changed')
 const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'execution')
 // Legacy callers supply a source root; delivery is derived from this module, never that hint.
@@ -80,13 +130,18 @@ await visit(await resolveOpenCodeV2ReceiptPackageRoot(mcpSdk), '@modelcontextpro
 if (controller?.type === 'local') {
   executionAssert(controller.command.length >= 2 && path.isAbsolute(controller.command[0]!), 'controller_runtime_missing')
   const runtime = await realpath(controller.command[0]!)
-  const magic = (await readFile(runtime)).subarray(0, 4).toString('hex')
-  executionAssert(runtime === controller.command[0] && (await lstat(runtime)).isFile() &&
-    (process.platform === 'linux' ? magic === '7f454c46' :
-      ['cffaedfe', 'cefaedfe', 'feedfacf', 'feedface', 'cafebabe', 'bebafeca', 'cafebabf', 'bfbafeca'].includes(magic)), 'controller_runtime_invalid')
-  const runtimeFiles = process.platform === 'darwin'
-    ? (await resolveOpenCodeV2DarwinControllerRuntimeClosure(runtime)).files
-    : [{ path: runtime, sha256: await sha(runtime) }]
+  executionAssert(runtime === controller.command[0] && (await lstat(runtime)).isFile(), 'controller_runtime_invalid')
+  let runtimeFiles: readonly Readonly<{ path: string; sha256: string }>[]
+  if (process.platform === 'win32')
+    runtimeFiles = [await inspectOpenCodeV2WindowsPeExecutable(runtime, 'node.exe', 'controller_runtime_invalid')]
+  else {
+    const magic = (await readFile(runtime)).subarray(0, 4).toString('hex')
+    executionAssert(process.platform === 'linux' ? magic === '7f454c46' :
+      ['cffaedfe', 'cefaedfe', 'feedfacf', 'feedface', 'cafebabe', 'bebafeca', 'cafebabf', 'bfbafeca'].includes(magic), 'controller_runtime_invalid')
+    runtimeFiles = process.platform === 'darwin'
+      ? (await resolveOpenCodeV2DarwinControllerRuntimeClosure(runtime)).files
+      : [{ path: runtime, sha256: await sha(runtime) }]
+  }
   for (const row of runtimeFiles) {
     const previous = files.find(file => file.path === row.path)
     executionAssert(!previous || previous.sha256 === row.sha256, 'controller_runtime_changed')

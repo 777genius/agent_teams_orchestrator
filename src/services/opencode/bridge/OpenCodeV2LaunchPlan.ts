@@ -25,6 +25,41 @@ import type { BridgeEnvelope } from './OpenCodeBridgeProtocol.js'
 import type { RunLaunchPlan, RunMemberPlan } from './OpenCodeV2RunTypes.js'
 
 const text = (value: unknown): string => { executionAssert(typeof value === 'string' && value.trim().length > 0, 'run_launch_input_invalid'); return value }
+const SUPERVISOR_ENVIRONMENT_NAMES = new Map([
+  ['PATH', 'PATH'], ['HOME', 'HOME'], ['USER', 'USER'], ['LOGNAME', 'LOGNAME'],
+  ['TMPDIR', 'TMPDIR'], ['LANG', 'LANG'], ['LC_ALL', 'LC_ALL'],
+  ['LOCALAPPDATA', 'LOCALAPPDATA'], ['SYSTEMROOT', 'SystemRoot'], ['WINDIR', 'WINDIR'],
+])
+const WINDOWS_SUPERVISOR_ENVIRONMENT_NAMES = new Set(['LOCALAPPDATA', 'SYSTEMROOT', 'WINDIR'])
+const SUPERVISOR_ENVIRONMENT_INJECTION = /^(?:NODE_OPTIONS|NODE_PATH|BUN_.*|LD_.*|DYLD_.*|BASH_ENV|ENV|ZDOTDIR|SHELLOPTS)$/i
+
+/** Reject loader-option injection in any plan-like supervisor replacement. */
+export function assertOpenCodeV2SupervisorEnvironment(environment: Readonly<Record<string, string>>): void {
+  executionAssert(!Object.keys(environment).some(key => SUPERVISOR_ENVIRONMENT_INJECTION.test(key)), 'run_environment_injection')
+}
+
+/** Build the explicit supervisor replacement environment. Windows retains only
+ * the native broker's three trusted path essentials; no request environment is
+ * merged and loader-option names remain excluded. */
+export function createOpenCodeV2SupervisorEnvironment(source: NodeJS.ProcessEnv = process.env): Record<string, string> {
+  const selected = new Map<string, Readonly<{ name: string; value: string }>>(), result: Record<string, string> = {}
+  for (const [key, value] of Object.entries(source)) {
+    const normalized = process.platform === 'win32' ? key.toUpperCase() : key, name = SUPERVISOR_ENVIRONMENT_NAMES.get(normalized)
+    if (!name || typeof value !== 'string' || (WINDOWS_SUPERVISOR_ENVIRONMENT_NAMES.has(normalized) && process.platform !== 'win32')) continue
+    executionAssert(!SUPERVISOR_ENVIRONMENT_INJECTION.test(name), 'run_environment_injection')
+    if (WINDOWS_SUPERVISOR_ENVIRONMENT_NAMES.has(normalized))
+      executionAssert(path.win32.isAbsolute(value) && !value.includes('/') && path.win32.normalize(value) === value &&
+        path.win32.parse(value).root !== value, 'run_environment_path_invalid')
+    const previous = selected.get(normalized)
+    if (previous) {
+      executionAssert(previous.name === name && previous.value === value, 'run_environment_alias')
+      continue
+    }
+    selected.set(normalized, Object.freeze({ name, value })); result[name] = value
+  }
+  assertOpenCodeV2SupervisorEnvironment(result)
+  return result
+}
 
 export async function inspectOpenCodeV2LaunchSelection(envelope: BridgeEnvelope) {
   assertExecutionPlatformAvailable()
@@ -180,8 +215,7 @@ async function buildOpenCodeV2InternalRunPlanWithNative(selection: Awaited<Retur
   }
   files.sort((a, b) => a.path.localeCompare(b.path))
   const entryPath = delivery.entryPath
-  const env = Object.fromEntries(Object.entries(process.env).filter((pair): pair is [string, string] =>
-    ['PATH', 'HOME', 'USER', 'LOGNAME', 'TMPDIR', 'LANG', 'LC_ALL'].includes(pair[0]) && typeof pair[1] === 'string'))
+  const env = createOpenCodeV2SupervisorEnvironment()
   env.CLAUDE_MULTIMODEL_DATA_HOME = dataRoot
   if (selection.controller.type === 'local' && selection.controller.environment?.AGENT_TEAMS_MCP_CLAUDE_DIR)
     env.AGENT_TEAMS_MCP_CLAUDE_DIR = selection.controller.environment.AGENT_TEAMS_MCP_CLAUDE_DIR
