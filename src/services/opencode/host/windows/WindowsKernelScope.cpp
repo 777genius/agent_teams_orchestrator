@@ -613,6 +613,7 @@ static Handle ownerDirectory(const std::wstring &path, bool create, const std::w
 struct OwnerDirectory {
   Handle file;
   std::vector<Handle> parents;
+  std::vector<JsonObject> parentIdentities;
   std::wstring path, owner;
   JsonObject identity;
   bool writable = false;
@@ -651,39 +652,125 @@ static bool controllerInboxEmpty(const std::wstring &path) {
 struct SelectedControllerInbox {
   std::vector<RetainedAnchorComponent> directories;
   std::vector<JsonObject> directoryIdentities;
-  Handle user;
-  JsonObject userIdentity;
-  std::wstring userPath, state, missingPath, emptyPath;
-  std::uint64_t userSize = 0;
+  std::vector<std::wstring> directoryPaths;
+  std::wstring inboxPath, userPath;
 
-  void assertLive() const {
-    require(directories.size() == directoryIdentities.size(),
+  std::wstring assertLive(PSID package) const {
+    require(directories.size() == directoryIdentities.size() && directoryPaths.size() == 3,
             "run_controller_inbox_unknown");
     for (size_t i = 0; i < directories.size(); ++i) {
       directories[i].assertLive();
-      require(fileIdentity(directories[i].handle.value, currentSid(), true).Stringify() ==
+      require(fileIdentity(directories[i].handle.value, currentSid(), true, package).Stringify() ==
                   directoryIdentities[i].Stringify(),
               "run_controller_inbox_unknown");
     }
-    if (!missingPath.empty()) {
-      const DWORD attributes = GetFileAttributesW(extended(missingPath).c_str());
+    std::vector<Handle> laterDirectories;
+    std::vector<JsonObject> laterIdentities;
+    size_t firstMissing = directories.size();
+    for (size_t i = firstMissing; i < directoryPaths.size(); ++i) {
+      Handle directory(CreateFileW(extended(directoryPaths[i]).c_str(),
+                                   FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL,
+                                   FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                                   FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                                   nullptr));
+      if (!directory) {
+        const DWORD error = GetLastError();
+        require(error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND,
+                "run_controller_inbox_unknown");
+        firstMissing = i;
+        break;
+      }
+      require(equalPath(finalPath(directory.value), extended(directoryPaths[i])),
+              "run_controller_inbox_unknown");
+      laterIdentities.push_back(fileIdentity(directory.value, currentSid(), true, package));
+      laterDirectories.emplace_back(std::move(directory));
+      firstMissing = i + 1;
+    }
+    std::wstring state = L"absent";
+    if (firstMissing == 3) {
+      Handle user(CreateFileW(extended(userPath).c_str(), GENERIC_READ | READ_CONTROL,
+                              FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                              FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+      if (user) {
+        FILE_STANDARD_INFO before{};
+        require(equalPath(finalPath(user.value), extended(userPath)) &&
+                    GetFileInformationByHandleEx(user.value, FileStandardInfo, &before,
+                                                 sizeof(before)) &&
+                    before.EndOfFile.QuadPart > 0 &&
+                    before.EndOfFile.QuadPart <= 4 * 1024 * 1024,
+                "run_controller_inbox_unknown");
+        const auto identity = fileIdentity(user.value, currentSid(), false, package);
+        const auto bytes = heldFileBytes(user.value, 4 * 1024 * 1024);
+        FILE_STANDARD_INFO after{};
+        require(GetFileInformationByHandleEx(user.value, FileStandardInfo, &after, sizeof(after)) &&
+                    before.EndOfFile.QuadPart == after.EndOfFile.QuadPart &&
+                    after.EndOfFile.QuadPart == static_cast<LONGLONG>(bytes.size()) &&
+                    fileIdentity(user.value, currentSid(), false, package).Stringify() ==
+                        identity.Stringify(),
+                "run_controller_inbox_unknown");
+        Handle named(CreateFileW(extended(userPath).c_str(),
+                                 GENERIC_READ | FILE_READ_ATTRIBUTES | READ_CONTROL,
+                                 FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                                 FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+        require(static_cast<bool>(named) &&
+                    equalPath(finalPath(named.value), extended(userPath)) &&
+                    fileIdentity(named.value, currentSid(), false, package).Stringify() ==
+                        identity.Stringify() &&
+                    fileIdentity(user.value, currentSid(), false, package).Stringify() ==
+                        identity.Stringify(),
+                "run_controller_inbox_unknown");
+        state = L"regular";
+      } else {
+        const DWORD error = GetLastError();
+        require(error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND,
+                "run_controller_inbox_unknown");
+        state = controllerInboxEmpty(inboxPath) ? L"empty" : L"absent";
+        Handle named(CreateFileW(extended(userPath).c_str(),
+                                 FILE_READ_ATTRIBUTES | READ_CONTROL,
+                                 FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                                 FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+        require(!named, "run_controller_inbox_unknown");
+        const DWORD recheckError = GetLastError();
+        require(recheckError == ERROR_FILE_NOT_FOUND || recheckError == ERROR_PATH_NOT_FOUND,
+                "run_controller_inbox_unknown");
+      }
+    }
+    for (size_t i = 0; i < directories.size(); ++i) {
+      directories[i].assertLive();
+      require(fileIdentity(directories[i].handle.value, currentSid(), true, package).Stringify() ==
+                  directoryIdentities[i].Stringify(),
+              "run_controller_inbox_unknown");
+    }
+    for (size_t i = 0; i < laterDirectories.size(); ++i) {
+      require(fileIdentity(laterDirectories[i].value, currentSid(), true, package).Stringify() ==
+                  laterIdentities[i].Stringify(),
+              "run_controller_inbox_unknown");
+      auto reopened = verificationDirectory(directoryPaths[directories.size() + i]);
+      require(fileIdentity(reopened.value, currentSid(), true, package).Stringify() ==
+                  laterIdentities[i].Stringify(),
+              "run_controller_inbox_unknown");
+    }
+    for (size_t i = firstMissing; i < directoryPaths.size(); ++i) {
+      Handle named(CreateFileW(extended(directoryPaths[i]).c_str(),
+                               FILE_READ_ATTRIBUTES | READ_CONTROL,
+                               FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                               FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                               nullptr));
+      require(!named, "run_controller_inbox_unknown");
       const DWORD error = GetLastError();
-      require(attributes == INVALID_FILE_ATTRIBUTES &&
-                  (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND),
+      require(error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND,
               "run_controller_inbox_unknown");
     }
-    if (!emptyPath.empty())
-      require(controllerInboxEmpty(emptyPath), "run_controller_inbox_unknown");
-    if (user) {
-      FILE_STANDARD_INFO standard{};
-      require(fileIdentity(user.value, currentSid(), false).Stringify() ==
-                  userIdentity.Stringify() &&
-                  GetFileInformationByHandleEx(user.value, FileStandardInfo, &standard,
-                                               sizeof(standard)) &&
-                  standard.EndOfFile.QuadPart >= 0 &&
-                  static_cast<std::uint64_t>(standard.EndOfFile.QuadPart) == userSize,
+    if (firstMissing == 3 && state != L"regular") {
+      Handle named(CreateFileW(extended(userPath).c_str(), FILE_READ_ATTRIBUTES | READ_CONTROL,
+                               FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                               FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+      require(!named, "run_controller_inbox_unknown");
+      const DWORD error = GetLastError();
+      require(error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND,
               "run_controller_inbox_unknown");
     }
+    return state;
   }
 };
 struct WindowsNativeRunControlIssuer;
@@ -696,6 +783,8 @@ class SelectedControllerConfig {
   friend struct WindowsNativeRunStateIssuer;
   Handle root, config;
   std::wstring rootPath, path, owner, sha256, mcpRootPath;
+  bool remoteController = false;
+  PSID package = nullptr;
   JsonObject identity;
   std::unique_ptr<RetainedAnchorComponent> mcpRoot;
   JsonObject mcpRootIdentity;
@@ -705,11 +794,11 @@ class SelectedControllerConfig {
   SelectedControllerConfig(Handle heldRoot, Handle heldConfig, std::wstring selectedRootPath,
                            std::wstring selectedPath,
                            std::wstring selectedOwner, std::wstring selectedHash,
-                           const std::wstring &teamId)
+                           const std::wstring &teamId, PSID selectedPackage)
       : root(std::move(heldRoot)), config(std::move(heldConfig)),
         rootPath(std::move(selectedRootPath)), path(std::move(selectedPath)),
         owner(std::move(selectedOwner)), sha256(std::move(selectedHash)),
-        identity(fileIdentity(config.value, owner, false)) {
+        package(selectedPackage), identity(fileIdentity(config.value, owner, false, package)) {
     bindInbox(teamId);
   }
   void bindInbox(const std::wstring &teamId) {
@@ -724,7 +813,17 @@ class SelectedControllerConfig {
                              ? object(document, L"mcpServers")
                              : object(object(document, L"mcp"), L"servers");
     const auto server = object(servers, L"agent-teams");
-    require(text(server, L"type") == L"local", "run_controller_config_unknown");
+    const auto type = text(server, L"type");
+    require(type == L"local" || type == L"remote", "run_controller_config_unknown");
+    if (type == L"remote") {
+      remoteController = true;
+      require(server.HasKey(L"url") && text(server, L"url").size() > 0 &&
+                  (!server.HasKey(L"oauth") ||
+                   (server.GetNamedValue(L"oauth").ValueType() == JsonValueType::Boolean &&
+                    !server.GetNamedBoolean(L"oauth"))),
+              "run_controller_config_unknown");
+      return;
+    }
     const auto environment = server.HasKey(L"env") ? object(server, L"env")
                                                    : object(server, L"environment");
     mcpRootPath = text(environment, L"AGENT_TEAMS_MCP_CLAUDE_DIR");
@@ -734,15 +833,18 @@ class SelectedControllerConfig {
     mcpRoot = std::make_unique<RetainedAnchorComponent>(verificationDirectory(mcpRootPath));
     require(equalPath(mcpRoot->path, mcpRootPath), "run_controller_inbox_unknown");
     mcpRoot->assertLive();
-    mcpRootIdentity = fileIdentity(mcpRoot->handle.value, owner, true);
+    mcpRootIdentity = fileIdentity(mcpRoot->handle.value, owner, true, package);
     mcpAncestors = verificationAncestors(mcpRootPath);
     for (auto &parent : mcpAncestors)
       mcpAncestorIdentities.push_back(anchorIdentity(parent.value));
     SelectedControllerInbox inbox;
-    const std::wstring segments[] = {L"teams", teamId, L"inboxes"};
-    std::wstring current = mcpRootPath;
-    for (const auto &segment : segments) {
-      current += L"\\" + segment;
+    inbox.directoryPaths = {
+        mcpRootPath + L"\\teams",
+        mcpRootPath + L"\\teams\\" + teamId,
+        mcpRootPath + L"\\teams\\" + teamId + L"\\inboxes"};
+    inbox.inboxPath = inbox.directoryPaths.back();
+    inbox.userPath = inbox.inboxPath + L"\\user.json";
+    for (const auto &current : inbox.directoryPaths) {
       Handle directory(CreateFileW(extended(current).c_str(),
                                    FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL,
                                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
@@ -753,49 +855,15 @@ class SelectedControllerConfig {
         const DWORD error = GetLastError();
         require(error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND,
                 "run_controller_inbox_unknown");
-        inbox.state = L"absent";
-        inbox.missingPath = current;
         break;
       }
       require(equalPath(finalPath(directory.value), extended(current)),
               "run_controller_inbox_unknown");
-      inbox.directoryIdentities.push_back(fileIdentity(directory.value, owner, true));
+      inbox.directoryIdentities.push_back(fileIdentity(directory.value, owner, true, package));
       inbox.directories.emplace_back(std::move(directory));
       require(equalPath(inbox.directories.back().path, current), "run_controller_inbox_unknown");
     }
-    inbox.userPath = current + L"\\user.json";
-    if (inbox.state.empty() && inbox.directories.size() == 3) {
-      const bool empty = controllerInboxEmpty(current);
-      Handle user(CreateFileW(extended(inbox.userPath).c_str(), GENERIC_READ | READ_CONTROL,
-                              FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                              FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
-      if (!user) {
-        const DWORD error = GetLastError();
-        require(error == ERROR_FILE_NOT_FOUND, "run_controller_inbox_unknown");
-        inbox.state = empty ? L"empty" : L"absent";
-        inbox.missingPath = inbox.userPath;
-        if (empty) inbox.emptyPath = current;
-      } else {
-        FILE_STANDARD_INFO before{};
-        require(equalPath(finalPath(user.value), extended(inbox.userPath)) &&
-                    GetFileInformationByHandleEx(user.value, FileStandardInfo, &before,
-                                                 sizeof(before)) &&
-                    before.EndOfFile.QuadPart > 0 && before.EndOfFile.QuadPart <= 4 * 1024 * 1024,
-                "run_controller_inbox_unknown");
-        inbox.userIdentity = fileIdentity(user.value, owner, false);
-        (void)heldFileBytes(user.value, 4 * 1024 * 1024);
-        FILE_STANDARD_INFO after{};
-        require(GetFileInformationByHandleEx(user.value, FileStandardInfo, &after, sizeof(after)) &&
-                    before.EndOfFile.QuadPart == after.EndOfFile.QuadPart &&
-                    fileIdentity(user.value, owner, false).Stringify() ==
-                        inbox.userIdentity.Stringify(),
-                "run_controller_inbox_unknown");
-        inbox.userSize = static_cast<std::uint64_t>(before.EndOfFile.QuadPart);
-        inbox.user = std::move(user);
-        inbox.state = L"regular";
-      }
-    }
-    inbox.assertLive();
+    inbox.assertLive(package);
     mcpRoot->assertLive();
     require(equalPath(mcpRoot->path, mcpRootPath), "run_controller_inbox_unknown");
     inboxes.emplace(teamId, std::move(inbox));
@@ -807,21 +875,28 @@ public:
                 fileIdentity(config.value, owner, false, package).Stringify() == identity.Stringify() &&
                 heldFileSha256(config.value) == sha256,
             "run_control_config_identity");
+    if (remoteController) {
+      require(!mcpRoot && mcpRootPath.empty() && mcpAncestors.empty() && inboxes.empty(),
+              "run_controller_config_unknown");
+      return;
+    }
     require(mcpAncestors.size() == mcpAncestorIdentities.size(),
             "run_controller_inbox_unknown");
     mcpRoot->assertLive();
-    require(fileIdentity(mcpRoot->handle.value, owner, true).Stringify() == mcpRootIdentity.Stringify(),
+    require(fileIdentity(mcpRoot->handle.value, owner, true, package).Stringify() ==
+                mcpRootIdentity.Stringify(),
             "run_controller_inbox_unknown");
     for (size_t i = 0; i < mcpAncestors.size(); ++i)
       require(anchorIdentity(mcpAncestors[i].value).Stringify() ==
                   mcpAncestorIdentities[i].Stringify(),
               "run_controller_inbox_unknown");
-    for (const auto &entry : inboxes) entry.second.assertLive();
+    for (const auto &entry : inboxes) entry.second.assertLive(package);
   }
-  const std::wstring &inboxState(const std::wstring &teamId) const {
+  std::wstring inboxState(const std::wstring &teamId, PSID package) const {
+    if (remoteController) return L"not_applicable";
     auto found = inboxes.find(teamId);
     require(found != inboxes.end(), "run_controller_inbox_unknown");
-    return found->second.state;
+    return found->second.assertLive(package);
   }
 };
 struct OwnerStore {
@@ -846,7 +921,7 @@ public:
       if (!equalPath(entry.second.path, path))
         continue;
       require(equalPath(finalPath(entry.second.file.value), extended(path)) &&
-                  fileIdentity(entry.second.file.value, entry.second.owner, true).Stringify() ==
+                  fileIdentity(entry.second.file.value, entry.second.owner, true, selectedPackage).Stringify() ==
                       entry.second.identity.Stringify(),
               "execution_owner_unknown");
       HANDLE duplicate = nullptr;
@@ -875,7 +950,7 @@ public:
         if (!directory.writable || !equalPath(directory.path, selected))
           continue;
         require(equalPath(finalPath(directory.file.value), extended(directory.path)) &&
-                    fileIdentity(directory.file.value, directory.owner, true).Stringify() ==
+                    fileIdentity(directory.file.value, directory.owner, true, selectedPackage).Stringify() ==
                         directory.identity.Stringify(),
                 "execution_owner_unknown");
         auto path = directory.path + L"\\native-stdio-" + nonce;
@@ -1124,7 +1199,7 @@ public:
     const auto id = decimal(++next);
     selectedConfigs.emplace(id, std::unique_ptr<SelectedControllerConfig>(
         new SelectedControllerConfig(Handle(rootDuplicate), std::move(config), root, configPath,
-                                     selected.owner, expectedHash, teamId)));
+                                     selected.owner, expectedHash, teamId, selectedPackage)));
     JsonObject result;
     num(result, L"schema", 1);
     flag(result, L"ok", true);
@@ -1133,7 +1208,7 @@ public:
     str(result, L"path", configPath);
     str(result, L"sha256", expectedHash);
     str(result, L"mcpRoot", selectedConfigs.at(id)->mcpRootPath);
-    str(result, L"inboxState", selectedConfigs.at(id)->inboxState(teamId));
+    str(result, L"inboxState", selectedConfigs.at(id)->inboxState(teamId, selectedPackage));
     return result;
   }
   JsonObject describe(OwnerDirectory &directory) {
@@ -1163,7 +1238,7 @@ public:
       if (!equalPath(entry.second.path, parentPath))
         continue;
       require(equalPath(finalPath(entry.second.file.value), extended(parentPath)) &&
-                  fileIdentity(entry.second.file.value, owner, true).Stringify() ==
+                  fileIdentity(entry.second.file.value, owner, true, selectedPackage).Stringify() ==
                       entry.second.identity.Stringify(),
               "execution_owner_unknown");
       HANDLE duplicate = nullptr;
@@ -1178,9 +1253,12 @@ public:
           canonicalDirectory(parentPath, FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL);
     parents.back() = std::move(targetParent);
     auto file = ownerDirectory(path, create, owner);
-    auto id = fileIdentity(file.value, owner, true);
+    auto id = fileIdentity(file.value, owner, true, selectedPackage);
     auto key = decimal(++next);
-    OwnerDirectory held{std::move(file), std::move(parents), path, owner, id, create};
+    std::vector<JsonObject> parentIdentities;
+    for (const auto &parent : parents) parentIdentities.push_back(anchorIdentity(parent.value));
+    OwnerDirectory held{std::move(file), std::move(parents), std::move(parentIdentities), path,
+                        owner, id, create};
     auto inserted = directories.emplace(key, std::move(held));
     auto result = describe(inserted.first->second);
     str(result, L"handleId", key);
@@ -1190,12 +1268,249 @@ public:
     auto it = directories.find(text(input, L"handleId"));
     require(it != directories.end(), "execution_owner_unknown");
     auto &directory = it->second;
+    require(directory.parents.size() == directory.parentIdentities.size(),
+            "execution_owner_unknown");
+    for (size_t i = 0; i < directory.parents.size(); ++i) {
+      const auto parentIdentity = anchorIdentity(directory.parents[i].value);
+      require(parentIdentity.Stringify() == directory.parentIdentities[i].Stringify(),
+              "execution_owner_unknown");
+      const auto heldPath = text(parentIdentity, L"dosPath");
+      require(heldPath.rfind(L"\\\\?\\", 0) == 0, "execution_path_alias");
+      auto reopened = verificationDirectory(heldPath.substr(4));
+      require(anchorIdentity(reopened.value).Stringify() ==
+                  directory.parentIdentities[i].Stringify(),
+              "execution_owner_unknown");
+    }
     require(equalPath(finalPath(directory.file.value), extended(directory.path)) &&
-                fileIdentity(directory.file.value, directory.owner, true).Stringify() ==
-                    directory.identity.Stringify(),
+                fileIdentity(directory.file.value, directory.owner, true, selectedPackage)
+                        .Stringify() == directory.identity.Stringify(),
+            "execution_owner_unknown");
+    auto reopened = verificationDirectory(directory.path);
+    require(fileIdentity(reopened.value, directory.owner, true, selectedPackage).Stringify() ==
+                directory.identity.Stringify(),
             "execution_owner_unknown");
     directoryMode(directory.file.value);
     return directory;
+  }
+  JsonObject readMetadata(const JsonObject &input) {
+    require(input.Size() == 3 && input.HasKey(L"op"), "execution_invalid_response");
+    require(text(input, L"op") == L"ownerReadMetadata", "execution_invalid_response");
+    const auto purpose = text(input, L"purpose");
+    if (purpose == L"SelectedAuth") {
+      require(input.HasKey(L"selectionId") && !input.HasKey(L"handleId") &&
+                  input.GetNamedValue(L"selectionId").ValueType() == JsonValueType::String,
+              "execution_invalid_response");
+      const auto selectionId = text(input, L"selectionId");
+      auto selected = selectedConfigs.find(selectionId);
+      require(selected != selectedConfigs.end(), "run_control_selection_missing");
+      auto &config = *selected->second;
+      config.assertLive(selectedPackage);
+      SelectedProfile *profile = nullptr;
+      for (auto &entry : selectedProfiles) {
+        auto &candidate = entry.second;
+        if (candidate.rootPath != config.rootPath || candidate.owner != config.owner)
+          continue;
+        require(fileIdentity(candidate.root.value, candidate.owner, true, selectedPackage)
+                        .Stringify() == candidate.rootIdentity.Stringify() &&
+                    fileIdentity(config.root.value, config.owner, true, selectedPackage)
+                            .Stringify() == fileIdentity(candidate.root.value, candidate.owner,
+                                                         true, selectedPackage).Stringify(),
+                "run_control_selection_changed");
+        profile = &candidate;
+        break;
+      }
+      require(profile != nullptr, "run_control_selection_missing");
+      const auto root = profile->rootPath;
+      const auto dataPath = root + L"\\data";
+      const auto opencodePath = dataPath + L"\\opencode";
+      const auto authPath = opencodePath + L"\\auth.json";
+      require(std::find(profile->admittedDirectories.begin(),
+                        profile->admittedDirectories.end(), dataPath) !=
+                      profile->admittedDirectories.end() ||
+                  std::find(profile->admittedDirectories.begin(),
+                            profile->admittedDirectories.end(), opencodePath) !=
+                      profile->admittedDirectories.end(),
+              "run_control_selection_missing");
+      std::vector<JsonObject> parentProof;
+      auto verificationParents = verificationAncestors(authPath);
+      for (const auto &parent : verificationParents)
+        parentProof.push_back(anchorIdentity(parent.value));
+      auto dataDirectory = verificationDirectory(dataPath);
+      auto opencodeDirectory = verificationDirectory(opencodePath);
+      const auto dataIdentity = fileIdentity(dataDirectory.value, profile->owner, true,
+                                             selectedPackage);
+      const auto opencodeIdentity = fileIdentity(opencodeDirectory.value, profile->owner, true,
+                                                 selectedPackage);
+      auto assertSelectionLive = [&]() {
+        config.assertLive(selectedPackage);
+        require(profile->directories.size() == profile->admittedDirectories.size(),
+                "run_control_selection_changed");
+        for (size_t i = 0; i < profile->directories.size(); ++i) {
+          const auto &directory = profile->directories[i];
+          require(directory.path == profile->admittedDirectories[i] &&
+                      fileIdentity(directory.file.value, profile->owner, true, selectedPackage)
+                              .Stringify() == directory.identity.Stringify(),
+                  "run_control_selection_changed");
+        }
+        require(fileIdentity(profile->root.value, profile->owner, true, selectedPackage)
+                        .Stringify() == profile->rootIdentity.Stringify() &&
+                    fileIdentity(config.root.value, config.owner, true, selectedPackage)
+                            .Stringify() == profile->rootIdentity.Stringify(),
+                "run_control_selection_changed");
+        require(fileIdentity(dataDirectory.value, profile->owner, true, selectedPackage)
+                        .Stringify() == dataIdentity.Stringify() &&
+                    fileIdentity(opencodeDirectory.value, profile->owner, true, selectedPackage)
+                            .Stringify() == opencodeIdentity.Stringify(),
+                "run_control_selection_changed");
+        auto reopened = verificationAncestors(authPath);
+        require(reopened.size() == parentProof.size(), "run_control_selection_changed");
+        for (size_t i = 0; i < reopened.size(); ++i)
+          require(anchorIdentity(reopened[i].value).Stringify() == parentProof[i].Stringify(),
+                  "run_control_selection_changed");
+      };
+      assertSelectionLive();
+      for (int attempt = 0; attempt < 3; ++attempt) {
+        Handle file(CreateFileW(extended(authPath).c_str(), GENERIC_READ | READ_CONTROL,
+                                FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                                FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+        if (!file) {
+          const DWORD error = GetLastError();
+          require(error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND,
+                  "execution_owner_metadata_missing");
+          require(attempt < 2, "execution_owner_metadata_changed");
+          continue;
+        }
+        require(equalPath(finalPath(file.value), extended(authPath)),
+                "execution_owner_metadata_changed");
+        FILE_STANDARD_INFO before{};
+        require(GetFileInformationByHandleEx(file.value, FileStandardInfo, &before, sizeof(before)) &&
+                    before.EndOfFile.QuadPart > 0 &&
+                    before.EndOfFile.QuadPart <= 128 * 1024,
+                "execution_owner_metadata_budget");
+        const auto identity = fileIdentity(file.value, profile->owner, false, selectedPackage);
+        const auto bytes = heldFileBytes(file.value, 128 * 1024);
+        FILE_STANDARD_INFO after{};
+        require(GetFileInformationByHandleEx(file.value, FileStandardInfo, &after, sizeof(after)) &&
+                    before.EndOfFile.QuadPart == after.EndOfFile.QuadPart &&
+                    after.EndOfFile.QuadPart == static_cast<LONGLONG>(bytes.size()),
+                "execution_owner_metadata_changed");
+        Handle named(CreateFileW(extended(authPath).c_str(),
+                                 GENERIC_READ | FILE_READ_ATTRIBUTES | READ_CONTROL,
+                                 FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                                 FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+        const auto authSha256 = heldFileSha256(file.value);
+        require(static_cast<bool>(named) && equalPath(finalPath(named.value), extended(authPath)) &&
+                    fileIdentity(named.value, profile->owner, false, selectedPackage).Stringify() ==
+                        identity.Stringify() &&
+                    fileIdentity(file.value, profile->owner, false, selectedPackage).Stringify() ==
+                        identity.Stringify(),
+                "execution_owner_metadata_changed");
+        assertSelectionLive();
+        JsonObject result;
+        num(result, L"schema", 1);
+        flag(result, L"ok", true);
+        str(result, L"purpose", purpose);
+        str(result, L"path", authPath);
+        result.SetNamedValue(L"fileIdentity", identity);
+        num(result, L"bytes", bytes.size());
+        str(result, L"sha256", authSha256);
+        flag(result, L"privateAcl", true);
+        flag(result, L"reparse", false);
+        num(result, L"links", 1);
+        result.SetNamedValue(L"rootIdentity", profile->rootIdentity);
+        result.SetNamedValue(L"directoryIdentity",
+                             fileIdentity(opencodeDirectory.value, profile->owner, true,
+                                          selectedPackage));
+        return result;
+      }
+      throw NativeError{"execution_owner_metadata_changed"};
+    }
+    require(input.HasKey(L"handleId") && !input.HasKey(L"selectionId") &&
+                input.GetNamedValue(L"handleId").ValueType() == JsonValueType::String,
+            "execution_invalid_response");
+    require(purpose == L"ProbeGuard" || purpose == L"ProbeRecord",
+            "execution_owner_metadata_purpose_invalid");
+    auto &directory = held(input);
+    require(directory.owner == currentSid(), "execution_owner_unknown");
+    const std::wstring name = purpose == L"ProbeGuard" ? L"owner.lock" : L"probe.json";
+    const DWORD limit = purpose == L"ProbeGuard" ? 0 : 128 * 1024 - 1;
+    const auto target = directory.path + L"\\" + name;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+      Handle file(CreateFileW(extended(target).c_str(), GENERIC_READ | READ_CONTROL,
+                              FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                              FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+      JsonObject result;
+      num(result, L"schema", 1);
+      flag(result, L"ok", true);
+      str(result, L"purpose", purpose);
+      str(result, L"path", target);
+      result.SetNamedValue(L"directoryIdentity", directory.identity);
+      if (!file) {
+        const DWORD error = GetLastError();
+        require(purpose == L"ProbeRecord" &&
+                    (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND),
+                "execution_owner_metadata_missing");
+       held(input);
+       if (attempt < 2) continue;
+        Handle named(CreateFileW(extended(target).c_str(), FILE_READ_ATTRIBUTES | READ_CONTROL,
+                               FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                               FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+        require(!named, "execution_owner_metadata_changed");
+        const DWORD absentError = GetLastError();
+        require(absentError == ERROR_FILE_NOT_FOUND || absentError == ERROR_PATH_NOT_FOUND,
+                "execution_owner_metadata_changed");
+       result.SetNamedValue(L"fileIdentity", JsonValue::CreateNullValue());
+        num(result, L"bytes", 0);
+        flag(result, L"absent", true);
+        flag(result, L"privateAcl", true);
+        flag(result, L"reparse", false);
+        num(result, L"links", 1);
+        return result;
+      }
+      require(equalPath(finalPath(file.value), extended(target)),
+              "execution_owner_metadata_changed");
+      FILE_STANDARD_INFO before{};
+      require(GetFileInformationByHandleEx(file.value, FileStandardInfo, &before, sizeof(before)) &&
+                  before.EndOfFile.QuadPart >= 0 &&
+                  before.EndOfFile.QuadPart <= static_cast<LONGLONG>(limit) &&
+                  (purpose != L"ProbeGuard" || before.EndOfFile.QuadPart == 0),
+              "execution_owner_metadata_budget");
+      const auto identity = fileIdentity(file.value, directory.owner, false, selectedPackage);
+      const auto bytes = heldFileBytes(file.value, limit);
+      FILE_STANDARD_INFO after{};
+      require(GetFileInformationByHandleEx(file.value, FileStandardInfo, &after, sizeof(after)) &&
+                  before.EndOfFile.QuadPart == after.EndOfFile.QuadPart &&
+                  after.EndOfFile.QuadPart == static_cast<LONGLONG>(bytes.size()),
+              "execution_owner_metadata_changed");
+      Handle named(CreateFileW(extended(target).c_str(),
+                               GENERIC_READ | FILE_READ_ATTRIBUTES | READ_CONTROL,
+                               FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                               FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+      require(static_cast<bool>(named) && equalPath(finalPath(named.value), extended(target)) &&
+                  fileIdentity(named.value, directory.owner, false, selectedPackage).Stringify() ==
+                      identity.Stringify() &&
+                  fileIdentity(file.value, directory.owner, false, selectedPackage).Stringify() ==
+                      identity.Stringify(),
+              "execution_owner_metadata_changed");
+      held(input);
+      if (purpose == L"ProbeRecord") {
+        require(!bytes.empty() && bytes.size() < 128 * 1024,
+                "execution_owner_metadata_budget");
+        try {
+          (void)JsonObject::Parse(wide(std::string(bytes.begin(), bytes.end())));
+        } catch (...) {
+          throw NativeError{"execution_owner_metadata_invalid"};
+        }
+        str(result, L"bytesBase64", wide(base64(bytes)));
+      }
+      result.SetNamedValue(L"fileIdentity", identity);
+      num(result, L"bytes", bytes.size());
+      flag(result, L"privateAcl", true);
+      flag(result, L"reparse", false);
+      num(result, L"links", 1);
+      return result;
+    }
+    throw NativeError{"execution_owner_metadata_changed"};
   }
   JsonObject request(const std::wstring &operation, const JsonObject &input);
   JsonObject requestAfterRunStateIssuer(const std::wstring &operation, const JsonObject &input) {
@@ -1207,6 +1522,8 @@ public:
       return validateSelectedProfile(input);
     if (operation == L"ownerOpenDirectory")
       return open(input);
+    if (operation == L"ownerReadMetadata")
+      return readMetadata(input);
     // Close remains possible after identity/mutation uncertainty. It only drops
     // this native capability and never erases or adopts an acquisition fence.
     if (operation == L"ownerCloseDirectory") {
@@ -1260,7 +1577,7 @@ public:
       directory.path = destination;
       require(equalPath(finalPath(directory.file.value), extended(destination)),
               "execution_owner_archive_path_mismatch");
-      require(fileIdentity(directory.file.value, directory.owner, true).Stringify() ==
+      require(fileIdentity(directory.file.value, directory.owner, true, selectedPackage).Stringify() ==
                   directory.identity.Stringify(),
               "execution_owner_archive_identity_mismatch");
       auto reopened = ownerDirectory(destination, false, directory.owner);
@@ -1757,7 +2074,7 @@ struct WindowsNativeRunStateIssuer {
       require(selectedRoot == root || selectedRoot.rfind(root + L"\\", 0) == 0,
               "run_control_selection_missing");
       selected.assertLive(owners.selectedPackage);
-      (void)selected.inboxState(teamId);
+      (void)selected.inboxState(teamId, owners.selectedPackage);
       if (!first.second)
         first = {id, &selected};
     }
