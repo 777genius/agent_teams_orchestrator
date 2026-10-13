@@ -451,7 +451,10 @@ if (compile) {
     platform: portablePlatform?.split('-')[0], arch: portablePlatform?.split('-')[1] })
   await stageOpenCodeV2DarwinHelper(process.cwd(), stagingOutdir, {
     platform: portablePlatform?.split('-')[0], arch: portablePlatform?.split('-')[1] })
-  if ((portablePlatform?.split('-')[0] ?? process.platform) === 'win32') {
+  // Native Windows producers are required only for explicit portable/native
+  // release delivery. Ordinary build:dev bundles remain independent of that
+  // optional native staging input.
+  if ((args.includes('--portable-graph') || portablePlatform !== undefined) && (portablePlatform?.split('-')[0] ?? process.platform) === 'win32') {
     const arch = portablePlatform?.split('-')[1] ?? process.arch
     if (arch !== 'x64' && arch !== 'arm64') throw new Error('execution_containment_native_build_required')
     // Native V2 is qualified for x64 only; ARM64 retains the existing V1 delivery.

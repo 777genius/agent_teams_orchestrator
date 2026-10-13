@@ -25,6 +25,30 @@ export type WindowsLaunchPlan = Readonly<{ helper: WindowsNativeArtifact; realpa
 const plans = new WeakSet<WindowsLaunchPlan>(), mappings = new WeakSet<WindowsExecutionMapping>(), retirements = new WeakSet<WindowsKernelRetirement>()
 const selectedConfigs = new WeakMap<WindowsLaunchPlan, string>(), selectingConfigs = new WeakSet<WindowsLaunchPlan>()
 const brokers = new WeakMap<WindowsLaunchPlan, WindowsNativeBroker>(), binaries = new WeakMap<WindowsLaunchPlan, Readonly<{ path: string; sha256: string }>>()
+export type WindowsCommandRequestReplay = Readonly<{
+  admit(id: string, operation: string): object
+  settle(id: string, authority: object): void
+}>
+/** Bounded request identity: live work is never displaced by replay retention. */
+export function createWindowsCommandRequestReplay(): WindowsCommandRequestReplay {
+  const pending = new Map<string, object>(), finished = new Map<string, object>()
+  const lifecycle = new Set(['commandRetire', 'commandClose'])
+  return Object.freeze({
+    admit(id: string, operation: string) {
+      if (pending.has(id) || finished.has(id)) throw new Error('execution_native_command_unknown')
+      // Reserve two lifecycle slots so close/retire remain available after the
+      // ordinary sixty-four request slots are full.
+      if (!(lifecycle.has(operation) ? pending.size < 66 : pending.size < 64)) throw new Error('execution_native_command_unknown')
+      const authority = Object.freeze({}); pending.set(id, authority); return authority
+    },
+    settle(id: string, authority: object) {
+      // A late completion can only release the authority it was admitted with.
+      if (pending.get(id) !== authority) return
+      pending.delete(id); finished.set(id, authority)
+      if (finished.size > 4096) finished.delete(finished.keys().next().value!)
+    },
+  })
+}
 export function isWindowsExecutionMapping(value: unknown): value is WindowsExecutionMapping { return !!value && typeof value === 'object' && mappings.has(value as WindowsExecutionMapping) }
 export function isWindowsKernelRetirement(value: unknown): value is WindowsKernelRetirement { return !!value && typeof value === 'object' && retirements.has(value as WindowsKernelRetirement) }
 async function identity(value: unknown): Promise<WindowsExecutionIdentity> {
@@ -66,7 +90,16 @@ export async function windowsBirth(pid: number): Promise<ExecutionBirth | null> 
   assert(Number.isSafeInteger(pid) && pid > 0, 'execution_identity_mismatch')
   const broker = createWindowsNativeBroker(await resolveWindowsNativeArtifact())
   broker.events.on('error', () => {})
-  try { const value = row(await broker.request('identity', { pid }, Date.now() + 3000)); return value.absent === true ? null : birth(value.birth) }
+  try {
+    const value = row(await broker.request('identity', { pid }, Date.now() + 3000))
+    // OpenProcess can prove a process is gone only when the native API reports
+    // a positively observed exit. A missing PID is an unknown identity, never
+    // a liveness bypass or a cleanup receipt.
+    assert(value.absent === undefined || value.absent === false, 'execution_identity_unknown')
+    assert(value.exited === true || value.exited === false, 'execution_identity_unknown')
+    const observed = birth(value.birth)
+    return value.exited === true ? null : observed
+  }
   finally { await broker.close() }
 }
 // Every raw root is canonicalized before this step. Select only already
@@ -141,8 +174,10 @@ export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, l
     value => broker.request('send', { value: { ...value, nonce, leaseOwnerId } }).then(() => undefined),
     error => { child.emit('error', error); void broker.request('retire').catch(() => child.emit('error', new Error('cleanup_unknown'))) },
   )
-  const commandRequests = new Set<string>(), commandOperations = new Set(['commandStart', 'commandRead', 'commandStatus', 'commandWriteStdin', 'commandEndStdin', 'commandRetire', 'commandClose'])
-  let commandPending = 0
+  // Command request IDs are replayed only while their operation is pending or
+  // retained in a small settled window.
+  const commandReplay = createWindowsCommandRequestReplay()
+  const commandOperations = new Set(['commandStart', 'commandRead', 'commandStatus', 'commandWriteStdin', 'commandEndStdin', 'commandRetire', 'commandClose'])
   let mapping: WindowsExecutionMapping | undefined, nativeMapping: unknown, stopped = false, started = false, closed = false
   let connectedResolve!: (value: unknown) => void, connectedReject!: (error: Error) => void
   const connected = new Promise<unknown>((resolve, reject) => { connectedResolve = resolve; connectedReject = reject }); void connected.catch(() => undefined)
@@ -162,9 +197,9 @@ export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, l
         http.bindOrigin(record.baseUrl)
       }
       if (record.type === 'commandRequest') {
-        assert(mapping && started && !stopped && record.nonce === nonce && record.leaseOwnerId === leaseOwnerId && typeof record.id === 'string' && /^[a-f0-9-]{36}$/.test(record.id) && !commandRequests.has(record.id) && commandRequests.size < 65536 && commandPending < 64 && typeof record.operation === 'string' && commandOperations.has(record.operation), 'execution_native_command_unknown')
-        const input = row(record.input), operation = record.operation, id = record.id
-        commandRequests.add(id); commandPending++
+        assert(mapping && started && !stopped && record.nonce === nonce && record.leaseOwnerId === leaseOwnerId && typeof record.id === 'string' && /^[a-f0-9-]{36}$/.test(record.id) && typeof record.operation === 'string' && commandOperations.has(record.operation), 'execution_native_command_unknown')
+        const input = row(record.input), operation = record.operation as string, id = record.id as string
+        const authority = commandReplay.admit(id, operation)
         void (async () => {
           try {
             await assertLive()
@@ -172,7 +207,7 @@ export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, l
             await broker!.request('send', { value: { type: 'commandResult', id, nonce, leaseOwnerId, ok: true, value: result } })
           } catch {
             if (!stopped && !broker!.ended()) await broker!.request('send', { value: { type: 'commandResult', id, nonce, leaseOwnerId, ok: false } }).catch(() => child.emit('error', new Error('execution_native_command_unknown')))
-          } finally { commandPending-- }
+          } finally { commandReplay.settle(id, authority) }
         })()
         return
       }

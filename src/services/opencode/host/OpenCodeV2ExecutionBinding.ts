@@ -2,7 +2,6 @@ import path from 'node:path'
 import { readExecutionPlatformBirth } from './OpenCodeV2ExecutionPlatform.js'
 import { lstat, open, readFile, readdir, realpath } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
-import { readProcessStartTimeMs } from '../../../utils/processKill.js'
 import { hashOpenCodeFile, readOpenCodePackageManifest, type OpenCodeV2NativeIdentity } from '../compatibility/OpenCodeNativeIdentity.js'
 import { assertExecutionSelectedModel, executionAssert, executionHash, executionRecord,
   type ExecutionSelectedModel, type ExecutionBirth } from '../execution/OpenCodeV2ExecutionContracts.js'
@@ -193,7 +192,12 @@ export type { ExecutionBirth } from '../execution/OpenCodeV2ExecutionContracts.j
 /** Native Linux ticks and Darwin process versions are never compared with a wall clock. */
 export async function readExecutionBirth(pid: number): Promise<ExecutionBirth | null> {
   if (process.platform === 'linux' || process.platform === 'darwin') return readExecutionPlatformBirth(pid)
-  const value = await readProcessStartTimeMs(pid)
-  if (value === null) return null
-  return Object.freeze({ format: 'utc-ms', value: String(value), bootId: null })
+  // Windows birth is a native FILETIME identity. Do not substitute a POSIX
+  // process-start clock or treat a missing PID as proof that a process exited.
+  if (pid === process.pid && process.env.OPENCODE_V2_WINDOWS_PIPE) {
+    const { windowsExecutionSelfBirth } = await import('./windows/OpenCodeV2WindowsChildControl.js')
+    return windowsExecutionSelfBirth()
+  }
+  const { windowsBirth } = await import('./windows/OpenCodeV2WindowsExecution.js')
+  return windowsBirth(pid)
 }
