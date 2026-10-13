@@ -1,4 +1,4 @@
-import { test, expect } from 'bun:test'
+import { test, expect, mock } from 'bun:test'
 import path from 'node:path'
 import { tmpdir } from 'node:os'
 import { mkdir, mkdtemp, readFile, realpath, writeFile, rm, symlink } from 'node:fs/promises'
@@ -6,6 +6,13 @@ import { fileURLToPath } from 'node:url'
 import { createHash } from 'node:crypto'
 import { createOpenCodeV2ExecutionReceipt, resolveOpenCodeV2ReceiptPackageRoot, resolveOpenCodeV2DarwinControllerRuntimeClosure } from './OpenCodeV2ExecutionReceipt.js'
 import { DARWIN_SCOPE_POLICY } from '../host/darwin/OpenCodeV2DarwinPolicy.js'
+import { OpenCodeRuntimeDeadlineError } from '../OpenCodeRuntimeDeadline.js'
+import * as executionDelivery from '../host/OpenCodeV2ExecutionDelivery.js'
+import * as fsPromises from 'node:fs/promises'
+
+const actualFs = { ...fsPromises }
+const actualDelivery = { ...executionDelivery }
+const deliveryModule = new URL('../host/OpenCodeV2ExecutionDelivery.js', import.meta.url).href
 
 test.skipIf(process.platform !== 'darwin')('selected native Node closure executes while an unrelated TEST sibling stays unreadable', async () => {
   const selected = Bun.which('node')
@@ -171,3 +178,177 @@ test.skipIf(process.platform !== 'darwin' || !process.env.OPENCODE_E2E_TEST_NODE
     for (const alias of closure.aliases) expect(await realpath(alias.target)).toBe(alias.source)
   } finally { await rm(f.root, { recursive: true, force: true }) }
 }, 120_000)
+
+async function receiptFixture() {
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), 'TEST-v2-receipt-admission-')))
+  const writePackage = async (directory: string, name: string, entry: string, version = '1.0.0') => {
+    await mkdir(path.join(directory, path.dirname(entry)), { recursive: true })
+    await writeFile(path.join(directory, 'package.json'), JSON.stringify({ name, version, dependencies: {} }))
+    await writeFile(path.join(directory, entry), `export {} // ${name}`)
+    return path.join(directory, entry)
+  }
+  const server = await writePackage(path.join(root, 'packages/server'), '@opencode/server', 'process.js', '2.0.21')
+  const client = await writePackage(path.join(root, 'packages/client'), '@opencode/client', 'index.js', '2.0.21')
+  const effect = await writePackage(path.join(root, 'packages/effect'), 'effect', 'index.js', '4.0.0-rc.112')
+  const mcpSdk = await writePackage(path.join(root, 'packages/mcp'), '@modelcontextprotocol/sdk', 'client/index.js')
+  await writePackage(path.join(root, 'controller'), 'TEST-controller-entry', 'dist/controller.js')
+  const nativeRoot = path.join(root, 'native/package'), executablePath = path.join(nativeRoot, 'bin/opencode')
+  await mkdir(path.dirname(executablePath), { recursive: true })
+  await writeFile(path.join(nativeRoot, 'package.json'), JSON.stringify({
+    name: `@opencode/cli-darwin-${process.arch}`, version: '2.0.21',
+  }))
+  await writeFile(executablePath, macho([]))
+  const identity = {
+    generation: 'v2' as const, version: '2.0.21' as const, dialect: 'v2-2.0.21' as const,
+    executablePath, executableSha256: createHash('sha256').update(await readFile(executablePath)).digest('hex'),
+    packageName: `@opencode/cli-darwin-${process.arch}`,
+  }
+  const resolution = {
+    '@opencode/server/process': server,
+    '@opencode/client': client,
+    'effect': effect,
+    '@modelcontextprotocol/sdk/client/index.js': mcpSdk,
+  }
+  return {
+    root, identity, resolution,
+    controllerEntry: path.join(root, 'controller/dist/controller.js'),
+  }
+}
+
+async function importReceiptHarness(readFile?: typeof fsPromises.readFile) {
+  const receiptModule = new URL('./OpenCodeV2ExecutionReceipt.ts', import.meta.url).href
+  mock.module(deliveryModule, () => ({
+    ...actualDelivery,
+    resolveOpenCodeV2ExecutionDelivery: async () => ({
+      runtimeMode: 'source' as const, root: '/TEST-receipt-root',
+      entryPath: '/TEST-receipt-root/src/entrypoints/opencodeV2ExecutionServer.ts',
+      entrySha256: '0'.repeat(64),
+    }),
+  }))
+  mock.module('node:fs/promises', () => ({
+    ...actualFs,
+    ...(readFile ? { readFile } : {}),
+  }))
+  return await import(`${receiptModule}?optional-node-admission=${Math.random().toString(36).slice(2)}`)
+}
+
+async function callReceipt<T>(
+  fixture: Awaited<ReturnType<typeof receiptFixture>>,
+  which: () => string | null,
+  operation: (receipt: typeof import('./OpenCodeV2ExecutionReceipt.js')) => Promise<T>,
+  readFile?: typeof fsPromises.readFile,
+): Promise<T> {
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform')!
+  const versions = process.versions as Record<string, unknown>
+  const bunVersion = Object.getOwnPropertyDescriptor(process.versions, 'bun')
+  const originalWhich = Bun.which, originalResolve = Bun.resolveSync
+  Object.defineProperty(process, 'platform', { ...platform, value: 'darwin' })
+  Object.defineProperty(process.versions, 'bun', { configurable: true, value: '1.3.11' })
+  Bun.which = which as typeof Bun.which
+  Bun.resolveSync = ((name: string) => {
+    const resolved = fixture.resolution[name as keyof typeof fixture.resolution]
+    if (!resolved) throw new Error(`TEST unexpected resolution: ${name}`)
+    return resolved
+  }) as typeof Bun.resolveSync
+  try {
+    const receipt = await importReceiptHarness(readFile)
+    return await operation(receipt)
+  } finally {
+    try {
+      mock.module(deliveryModule, () => ({ ...actualDelivery }))
+      mock.module('node:fs/promises', () => ({ ...actualFs }))
+    } finally {
+      Bun.which = originalWhich
+      Bun.resolveSync = originalResolve
+      Object.defineProperty(process, 'platform', platform)
+      if (bunVersion) Object.defineProperty(process.versions, 'bun', bunVersion)
+      else Reflect.deleteProperty(versions, 'bun')
+    }
+  }
+}
+
+test('missing or unusable optional PATH Node omits taskNode and leaves no partial closure rows', async () => {
+  const f = await receiptFixture()
+  try {
+    for (const selected of [null, path.join(f.root, 'TEST-absent-node')]) {
+      const receipt = await callReceipt(f, () => selected, module => module.createOpenCodeV2ExecutionReceipt('/TEST-unused', f.identity))
+      expect(receipt.taskNode).toBeUndefined()
+    }
+    const existing = path.join(f.root, 'optional-existing.dylib'), missing = path.join(f.root, 'optional-missing.dylib')
+    await writeFile(path.join(f.root, 'optional-partial-node'), macho([existing, missing]))
+    await writeFile(existing, macho([]))
+    const receipt = await callReceipt(f, () => path.join(f.root, 'optional-partial-node'),
+      module => module.createOpenCodeV2ExecutionReceipt('/TEST-unused', f.identity))
+    expect(receipt.taskNode).toBeUndefined()
+    expect(receipt.graph.files.some(row => row.path === existing)).toBe(false)
+    expect(receipt.graph.files.some(row => row.path === missing)).toBe(false)
+  } finally { await rm(f.root, { recursive: true, force: true }) }
+})
+
+test('complete qualified optional PATH Node closure is fully hashed and admitted', async () => {
+  const f = await receiptFixture()
+  const node = path.join(f.root, 'optional-complete-node'), dependency = path.join(f.root, 'liboptional.dylib')
+  try {
+    await writeFile(node, macho(['@loader_path/liboptional.dylib']))
+    await writeFile(dependency, macho([]))
+    const receipt = await callReceipt(f, () => node,
+      module => module.createOpenCodeV2ExecutionReceipt('/TEST-unused', f.identity))
+    expect(receipt.taskNode).toEqual({
+      path: node,
+      sha256: createHash('sha256').update(await readFile(node)).digest('hex'),
+    })
+    for (const file of [node, dependency]) {
+      expect(receipt.graph.files).toContainEqual({
+        path: file,
+        sha256: createHash('sha256').update(await readFile(file)).digest('hex'),
+      })
+    }
+  } finally { await rm(f.root, { recursive: true, force: true }) }
+})
+
+test('optional admission preserves unknown, abort and deadline failures', async () => {
+  const f = await receiptFixture()
+  const failures = [
+    new Error('TEST unknown optional discovery failure'),
+    new DOMException('controller_runtime_dependency_missing', 'AbortError'),
+    new OpenCodeRuntimeDeadlineError('host_start', 10, 11),
+  ]
+  try {
+    for (const failure of failures) {
+      let caught: unknown
+      try {
+        await callReceipt(f, () => { throw failure },
+          module => module.createOpenCodeV2ExecutionReceipt('/TEST-unused', f.identity))
+      } catch (error) { caught = error }
+      expect(caught).toBe(failure)
+    }
+  } finally { await rm(f.root, { recursive: true, force: true }) }
+})
+
+test('mandatory controller qualification and optional graph hash conflicts remain fail-closed', async () => {
+  const f = await receiptFixture()
+  const node = path.join(f.root, 'conflicting-node'), dependency = path.join(f.root, 'mandatory-missing.dylib')
+  try {
+    await writeFile(node, macho([dependency]))
+    await expect(callReceipt(f, () => node,
+      module => module.createOpenCodeV2ExecutionReceipt('/TEST-unused', f.identity, {
+        type: 'local', command: [node, f.controllerEntry],
+      }))).rejects.toThrow('controller_runtime_dependency_missing')
+
+    const replacement = macho(['/usr/lib/libSystem.B.dylib'])
+    const trigger = path.join(f.root, 'controller/package.json')
+    const readFile = (async (...args: unknown[]) => {
+      const value = await (actualFs.readFile as unknown as (...values: unknown[]) => Promise<unknown>)(...args)
+      if (String(args[0]) === trigger) await actualFs.writeFile(node, replacement)
+      return value
+    }) as typeof fsPromises.readFile
+    await writeFile(node, macho([]))
+    await expect(callReceipt(f, () => node,
+      module => module.createOpenCodeV2ExecutionReceipt('/TEST-unused', f.identity, {
+        type: 'local', command: [node, f.controllerEntry],
+      }), readFile)).rejects.toThrow('controller_runtime_changed')
+    expect(fsPromises.readFile).toBe(actualFs.readFile)
+    expect(fsPromises.writeFile).toBe(actualFs.writeFile)
+    expect(executionDelivery.resolveOpenCodeV2ExecutionDelivery).toBe(actualDelivery.resolveOpenCodeV2ExecutionDelivery)
+  } finally { await rm(f.root, { recursive: true, force: true }) }
+})

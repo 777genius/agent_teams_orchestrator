@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events'
 import type { ChildProcess } from 'node:child_process'
-import { access, mkdir, mkdtemp, readFile, rm, symlink, utimes, writeFile } from 'node:fs/promises'
+import { access, chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { PassThrough } from 'node:stream'
@@ -3049,6 +3049,65 @@ test('cleanup resolves exact persistent ownership across restart without profile
     await write()
     startedAt = 101
     await expect(manager().resolveOwnedSessionEndpoint('owned', { ...lease, projectPath: root })).rejects.toThrow('process ownership')
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('isolated umask0002 missing host directory is created private without relaxing unsafe existing directories', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-host-directory-mode-'))
+  const lease = { teamId: 'team', laneId: 'primary', memberName: 'alice', runId: 'run', sessionId: 'session' }
+  const resolveInSubprocess = async (registryPath: string, projectPath: string) => {
+    const module = new URL('./OpenCodeHostManager.ts', import.meta.url).href
+    const source = `process.umask(0o0002);
+      const { OpenCodeHostManager } = await import(${JSON.stringify(module)});
+      const manager = new OpenCodeHostManager({
+        persistentRegistryPath: ${JSON.stringify(registryPath)},
+        prepareProfile: async () => { throw new Error('TEST profile must not run') },
+        fetchJson: async () => { throw new Error('TEST network must not run') },
+        spawnHostProcess: () => { throw new Error('TEST host must not start') },
+      });
+      try {
+        await manager.resolveOwnedSessionEndpoint('owned', ${JSON.stringify({ ...lease, projectPath })});
+        console.log(JSON.stringify({ kind: 'resolved' }));
+      } catch (error) {
+        console.log(JSON.stringify({ kind: 'rejected', name: error?.name, message: error?.message }));
+      }`
+    const child = Bun.spawn([process.execPath, '-e', source], { stdout: 'pipe', stderr: 'pipe' })
+    const [exitCode, stdout, stderr] = await Promise.all([
+      child.exited, new Response(child.stdout).text(), new Response(child.stderr).text(),
+    ])
+    expect(exitCode, stderr).toBe(0)
+    return JSON.parse(stdout) as { kind: string; name?: string; message?: string }
+  }
+  try {
+    const missingHost = path.join(root, 'TEST-missing-host', 'private', 'session')
+    const missingRegistry = path.join(missingHost, 'hosts.json')
+    expect(await resolveInSubprocess(missingRegistry, root)).toEqual({
+      kind: 'rejected', name: 'Error', message: 'OpenCode cleanup host ownership is unavailable',
+    })
+    for (const directory of [
+      path.join(root, 'TEST-missing-host'),
+      path.join(root, 'TEST-missing-host', 'private'),
+      missingHost,
+    ]) {
+      expect((await stat(directory)).mode & 0o777).toBe(0o700)
+    }
+
+    const unsafeHost = path.join(root, 'TEST-existing-unsafe-host', 'private', 'session')
+    await mkdir(unsafeHost, { recursive: true, mode: 0o777 })
+    await chmod(unsafeHost, 0o777)
+    expect(await resolveInSubprocess(path.join(unsafeHost, 'hosts.json'), root)).toEqual({
+      kind: 'rejected', name: 'Error', message: 'OpenCode cleanup host ownership is unavailable',
+    })
+    expect((await stat(unsafeHost)).mode & 0o777).toBe(0o777)
+
+    const unsafeAuthority = path.join(root, 'TEST-existing-authority-directory', 'hosts.json')
+    await mkdir(unsafeAuthority, { recursive: true, mode: 0o777 })
+    await chmod(unsafeAuthority, 0o777)
+    expect(await resolveInSubprocess(
+      unsafeAuthority, root,
+    )).toMatchObject({
+      kind: 'rejected', name: 'OpenCodeAuthorityVetoError',
+    })
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 

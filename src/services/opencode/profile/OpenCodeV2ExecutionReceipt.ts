@@ -102,18 +102,56 @@ if (controller?.type === 'local') {
   }
   executionAssert(entries > 0, 'controller_entry_missing')
 }
+type OptionalTaskNodeAdmission = Readonly<{
+  taskNode: Readonly<{ path: string; sha256: string }>
+  rows: readonly Readonly<{ path: string; sha256: string }>[]
+}>
+async function qualifyOptionalTaskNode(): Promise<OptionalTaskNodeAdmission | undefined> {
+  let selected: string | null
+  try { selected = Bun.which('node') } catch (error) {
+    if (isOptionalNodeFileUnavailableFailure(error)) return undefined
+    throw error
+  }
+  if (!selected) return undefined
+  let runtime: string
+  try { runtime = await realpath(selected) } catch (error) {
+    if (isOptionalNodeFileUnavailableFailure(error)) return undefined
+    throw error
+  }
+  try {
+    const closure = await resolveOpenCodeV2DarwinControllerRuntimeClosure(runtime)
+    const node = closure.files.find(row => row.path === runtime)
+    executionAssert(node, 'controller_runtime_dependency_missing')
+    executionAssert(node.sha256 === await sha(runtime), 'controller_runtime_changed')
+    return Object.freeze({
+      taskNode: Object.freeze({ path: runtime, sha256: node.sha256 }),
+      rows: closure.files,
+    })
+  } catch (error) {
+    if (isOptionalNodeClosureFailure(error)) return undefined
+    throw error
+  }
+}
 let taskNode: Readonly<{ path: string; sha256: string }> | undefined
 if (process.platform === 'darwin') {
-  const selected = Bun.which('node')
-  if (selected) {
-    const runtime = await realpath(selected)
-    const closure = await resolveOpenCodeV2DarwinControllerRuntimeClosure(runtime)
-    for (const row of closure.files) {
-      const previous = files.find(file => file.path === row.path)
+  const optional = await qualifyOptionalTaskNode()
+  if (optional) {
+    const merged = new Map<string, Readonly<{ path: string; sha256: string }>>()
+    for (const row of files) {
+      const previous = merged.get(row.path)
       executionAssert(!previous || previous.sha256 === row.sha256, 'controller_runtime_changed')
-      if (!previous) files.push(row)
+      merged.set(row.path, row)
     }
-    taskNode = { path: runtime, sha256: await sha(runtime) }
+    const additions: Readonly<{ path: string; sha256: string }>[] = []
+    for (const row of optional.rows) {
+      const previous = merged.get(row.path)
+      executionAssert(!previous || previous.sha256 === row.sha256, 'controller_runtime_changed')
+      if (!previous) { merged.set(row.path, row); additions.push(row) }
+    }
+    const node = merged.get(optional.taskNode.path)
+    executionAssert(node && node.sha256 === optional.taskNode.sha256, 'controller_runtime_changed')
+    files.push(...additions)
+    taskNode = optional.taskNode
   }
 }
 files.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0)
@@ -133,6 +171,35 @@ export type DarwinControllerRuntimeClosure = Readonly<{
   files: readonly Readonly<{ path: string; sha256: string }>[]
   aliases: readonly Readonly<{ source: string; target: string }>[]
 }>
+
+const OPTIONAL_NODE_FILE_UNAVAILABLE_CODES = new Set(['ENOENT', 'ENOTDIR', 'EACCES', 'EPERM', 'ELOOP'])
+const OPTIONAL_NODE_CLOSURE_FAILURES = new Set([
+  'controller_runtime_invalid',
+  'controller_runtime_architecture_invalid',
+  'controller_runtime_dependency_budget',
+  'controller_runtime_dependency_missing',
+  'controller_runtime_dependency_unknown',
+  'controller_runtime_macho_invalid',
+  'controller_runtime_changed',
+])
+
+function isOptionalNodeAbortOrDeadlineFailure(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false
+  return ('name' in error && (error.name === 'AbortError' || error.name === 'OpenCodeRuntimeDeadlineError'))
+    || ('kind' in error && error.kind === 'timeout')
+}
+function isOptionalNodeFileUnavailableFailure(error: unknown): boolean {
+  if (isOptionalNodeAbortOrDeadlineFailure(error)) return false
+  if (!error || typeof error !== 'object') return false
+  const code = 'code' in error && typeof error.code === 'string' ? error.code : undefined
+  return Boolean(code && OPTIONAL_NODE_FILE_UNAVAILABLE_CODES.has(code))
+}
+function isOptionalNodeClosureFailure(error: unknown): boolean {
+  if (isOptionalNodeAbortOrDeadlineFailure(error)) return false
+  return isOptionalNodeFileUnavailableFailure(error)
+    || (Boolean(error) && typeof error === 'object' && error instanceof Error
+      && OPTIONAL_NODE_CLOSURE_FAILURES.has(error.message))
+}
 
 /** Bind the selected Mach-O runtime's load commands and their exact file aliases.
  * System shared-cache images retain the existing Darwin system-policy scope. */
