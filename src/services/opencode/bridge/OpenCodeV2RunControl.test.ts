@@ -7,6 +7,11 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { discoverOpenCodeV2Run, awaitOpenCodeV2RunMemberReadiness, parseRunControlRequest, readRunProcessIdentity, requestOpenCodeV2Run, reserveRunControlDirectory, serveOpenCodeV2RunControl, writeRunControlFile } from './OpenCodeV2RunControl.js'
 import { boundOpenCodeRead } from '../transport/OpenCodeBoundedFetch.js'
+import type { RunControlRecord, RunUnixControlRecord } from './OpenCodeV2RunTypes.js'
+
+function requireUnixControl(record: RunControlRecord | null): asserts record is RunUnixControlRecord {
+  if (!record || !('socketPath' in record)) throw new Error('TEST_unix_control_required')
+}
 
 const peer = fileURLToPath(new URL('./fixtures/OpenCodeV2RunControlPeer.ts', import.meta.url))
 const binding = { teamId: 'TEST-team', runId: 'TEST-run', controllerInstanceId: 'controller', ownerId: 'owner' }
@@ -74,6 +79,7 @@ describe('private run control with separate synthetic CLI processes', () => {
     const directory = await reserveRunControlDirectory(root, binding, 'a'.repeat(64)), cwd = process.cwd(), deadline = Date.now() + 20_000
     const control = await serveOpenCodeV2RunControl(directory, binding, deadline, 'a'.repeat(64),
       async () => ({ kind: 'status', state: 'starting', members: [], deadline }))
+    requireUnixControl(control.record)
     try {
       expect(Buffer.byteLength(control.record.socketPath)).toBeGreaterThan(103)
       expect(process.cwd()).toBe(cwd)
@@ -120,6 +126,7 @@ describe('private run control with separate synthetic CLI processes', () => {
     try {
       await Promise.all([ready(owner), ready(foreign)])
       const record = await discoverOpenCodeV2Run(root, binding.teamId, binding.runId)
+      requireUnixControl(record)
       expect(record?.process.pid).toBe(owner.pid)
       expect(record?.socketPath).toBe(path.join(directory, 'control.sock'))
       const observed = await execute(process.execPath, [peer, 'call', root, JSON.stringify(binding), JSON.stringify({ operation: 'status' })], { timeout: 20_000 })
@@ -266,6 +273,7 @@ describe('private run control with separate synthetic CLI processes', () => {
       const record = await discoverOpenCodeV2Run(root, binding.teamId, binding.runId)
       expect(record).not.toBeNull()
       if (!record) throw new Error('TEST_record_missing')
+      requireUnixControl(record)
       await expect(requestOpenCodeV2Run({ ...record, binding: { ...binding, ownerId: 'foreign' } }, { operation: 'stop' }, 1000)).rejects.toThrow('run_control_changed')
       const challenge = path.join(directory, 'challenge')
       await chmod(challenge, 0o644)
@@ -283,6 +291,7 @@ describe('private run control with separate synthetic CLI processes', () => {
     const directory = await reserveRunControlDirectory(root, binding, 'a'.repeat(64))
     const control = await serveOpenCodeV2RunControl(directory, binding, Date.now() + 5000, 'a'.repeat(64),
       async () => { throw new Error('TEST_no_operation') })
+    requireUnixControl(control.record)
     const original = `${control.record.socketPath}.original`
     try {
       await rename(control.record.socketPath, original)

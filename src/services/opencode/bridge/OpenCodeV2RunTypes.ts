@@ -8,12 +8,23 @@ import type { ExecutionBridgeClient, ExecutionLog, ExecutionMessagePage, Executi
 import type { OpenCodeV2TurnProjection } from './OpenCodeV2TurnProjection.js'
 
 export type RunBinding = Readonly<{ teamId: string; runId: string; controllerInstanceId: string; ownerId: string }>
-export type RunProcessIdentity = Readonly<{ pid: number; startTicks: string; bootId: string; executablePath: string; executableSha256: string }>
-export type RunControlRecord = Readonly<{
-  schema: 1; protocol: 1; binding: RunBinding; process: RunProcessIdentity
-  directory: string; socketPath: string; socketDevice: number; socketInode: number
-  deadline: number; uid: number; sourceSha256: string
+export type RunFiletimeIdentity = Readonly<{ kind: 'windows-filetime'; value: string; bootId: null }>
+export type RunWindowsProcessIdentity = Readonly<{
+  pid: number; processCreationTime: RunFiletimeIdentity
+  executablePath: string; executableSha256: string; userSid: string; appContainer: false
 }>
+export type RunProcessIdentity = Readonly<{ pid: number; startTicks: string; bootId: string; executablePath: string; executableSha256: string }>
+export type RunWindowsEndpoint = Readonly<{ kind: 'windows-native-pipe'; name: string; helper: RunWindowsProcessIdentity; bun: RunWindowsProcessIdentity }>
+type RunControlRecordBase = Readonly<{ schema: 1; protocol: 1; binding: RunBinding; directory: string; deadline: number; sourceSha256: string }>
+export type RunUnixControlRecord = RunControlRecordBase & Readonly<{
+  process: RunProcessIdentity
+  socketPath: string; socketDevice: number; socketInode: number; uid: number
+}>
+export type RunWindowsControlRecord = RunControlRecordBase & Readonly<{
+  platform: 'win32'; process: RunWindowsProcessIdentity; endpoint: RunWindowsEndpoint
+}>
+export type RunControlRecord = RunUnixControlRecord | RunWindowsControlRecord
+export type RunAnyProcessIdentity = RunProcessIdentity | RunWindowsProcessIdentity
 export type InstructionReceipt = Readonly<{
   strategy: 'instruction-entry'; key: string; contextHash: string; briefingHash: string
   verified: boolean; missingNativeMessageID: true

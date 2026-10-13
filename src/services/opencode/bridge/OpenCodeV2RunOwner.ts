@@ -18,7 +18,7 @@ import { createOpenCodeV2ExecutionClient, type ExecutionBridgeClient, type Execu
 import { boundOpenCodeRead } from '../transport/OpenCodeBoundedFetch.js'
 import { projectOpenCodeV2Turn } from './OpenCodeV2TurnProjection.js'
 import { verifyOpenCodeV2SilentBootstrap } from './OpenCodeV2BootstrapProjection.js'
-import { OPEN_CODE_V2_RUN_INITIALIZATION_MS, discoverOpenCodeV2Run, parseRunControlRequest, reserveRunControlDirectory, runControlDirectory, serveOpenCodeV2RunControl, writeRunControlFile } from './OpenCodeV2RunControl.js'
+import { OPEN_CODE_V2_RUN_INITIALIZATION_MS, discoverOpenCodeV2Run, parseRunControlRequest, readRunProcessIdentity, reserveRunControlDirectory, runControlDirectory, serveOpenCodeV2RunControl, writeRunControlFile } from './OpenCodeV2RunControl.js'
 import type { InstructionReceipt, RunControlRecord, RunControlRequest, RunControlResult, RunExecutionPorts, RunLaunchPlan, RunMemberPlan, RunMemberStatus, RunOwnerState, RunStopMember } from './OpenCodeV2RunTypes.js'
 
 const productionPorts: RunExecutionPorts = { acquire: acquireExecutionLease, client: createOpenCodeV2ExecutionClient }
@@ -528,7 +528,8 @@ export async function launchExplicitOpenCodeV2Run(plan: RunLaunchPlan): Promise<
   executionAssert(plan.source.files.some(file => file.path === entry && file.sha256 === plan.source.entrySha256), 'run_source_incomplete')
   executionAssert(!Object.keys(plan.source.env).some(key => /^(?:NODE_OPTIONS|NODE_PATH|BUN_.*|LD_.*|DYLD_.*|BASH_ENV|ENV|ZDOTDIR|SHELLOPTS)$/i.test(key)), 'run_environment_injection')
   const sourceSha256 = executionHash(plan.source.files)
-  const directory = await reserveRunControlDirectory(plan.dataRoot, plan.binding, sourceSha256)
+  const directory = await reserveRunControlDirectory(plan.dataRoot, plan.binding, sourceSha256,
+    plan.members.map(member => member.profile))
   const child = spawn(plan.source.bunPath, [entry], { detached: true, cwd: plan.dataRoot, env: { ...plan.source.env }, stdio: ['ignore', 'ignore', 'ignore', 'ipc'] })
   const ready = new Promise<void>((resolve, reject) => {
     child.once('error', () => reject(new Error('run_owner_unknown')))
@@ -542,7 +543,19 @@ export async function launchExplicitOpenCodeV2Run(plan: RunLaunchPlan): Promise<
     child.send({ type: 'start', plan, directory, sourceSha256 })
     await boundOpenCodeRead(ready, Math.min(process.platform === 'darwin' ? OPEN_CODE_V2_RUN_INITIALIZATION_MS : 30_000, plan.deadline - Date.now()))
     const record = await discoverOpenCodeV2Run(plan.dataRoot, plan.binding.teamId, plan.binding.runId)
-    executionAssert(record && child.pid === record.process.pid && executionHash(record.binding) === executionHash(plan.binding) && record.sourceSha256 === sourceSha256, 'run_owner_unknown')
+    executionAssert(record && executionHash(record.binding) === executionHash(plan.binding) && record.sourceSha256 === sourceSha256, 'run_owner_unknown')
+    if (process.platform === 'win32') {
+      executionAssert('endpoint' in record, 'run_owner_unknown')
+      // Native control publishes the helper in record.process and the separately
+      // measured Bun supervisor in endpoint.bun. Match the spawned supervisor
+      // only to that measured owner identity; a supplied PID is not proof.
+      const supervisor = await readRunProcessIdentity(child.pid)
+      executionAssert(child.pid === record.endpoint.bun.pid &&
+        executionHash(supervisor) === executionHash(record.endpoint.bun) &&
+        record.process.pid !== record.endpoint.bun.pid, 'run_owner_unknown')
+    } else {
+      executionAssert(!('endpoint' in record) && child.pid === record.process.pid, 'run_owner_unknown')
+    }
     child.disconnect(); child.unref(); return record
   } catch (error) {
     // Unknown startup cannot be replayed, reclaimed or PID-killed. The exact
@@ -564,9 +577,10 @@ export async function startOpenCodeV2RunSupervisor(plan: RunLaunchPlan, director
     await realpath(process.argv[1]!) === delivery.entryPath, 'run_source_changed')
   for (const file of plan.source.files) executionAssert(await realpath(file.path) === file.path && sha(await readFile(file.path)) === file.sha256, 'run_source_changed')
   let owner: OpenCodeV2RunOwner | undefined
-  const control = await serveOpenCodeV2RunControl(directory, plan.binding, plan.deadline, sourceSha256, (request, deadline) => {
-    executionAssert(owner, 'run_owner_starting'); return owner.execute(request, deadline)
-  })
+  const control = await serveOpenCodeV2RunControl(directory, plan.binding, plan.deadline, sourceSha256,
+    (request, deadline) => {
+      executionAssert(owner, 'run_owner_starting'); return owner.execute(request, deadline)
+    }, plan.members.map(member => member.profile))
   try { owner = new OpenCodeV2RunOwner(plan, directory) }
   catch (error) { await control.close(); throw error }
   const owned = owner

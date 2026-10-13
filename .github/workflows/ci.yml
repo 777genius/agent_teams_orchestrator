@@ -348,6 +348,18 @@ jobs:
       - name: Compile Windows x64 native assets
         if: matrix.platform == 'win32-x64'
         run: bun scripts/opencode-v2/compile-windows.ts
+      - name: Qualify native Windows owner and command retirement
+        if: matrix.platform == 'win32-x64'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ownerRoot = Join-Path $env:RUNNER_TEMP ("TEST-windows-owner-" + [guid]::NewGuid().ToString('N'))
+          bun scripts/opencode-v2/windows-owner-probe.ts $ownerRoot
+          if ($LASTEXITCODE -ne 0) { throw 'Native held-directory contract failed' }
+          $commandRoot = Join-Path $env:RUNNER_TEMP ("TEST-windows-command-" + [guid]::NewGuid().ToString('N'))
+          $commandReceipt = Join-Path $env:RUNNER_TEMP 'TEST-windows-command-receipt.json'
+          bun scripts/opencode-v2/windows-command-probe.ts $commandRoot $commandReceipt
+          if ($LASTEXITCODE -ne 0) { throw 'Native command and descendant retirement contract failed' }
       - name: Produce physical JS and native front door
         run: bun scripts/package-runtime.ts --platform ${{ matrix.platform }}
       - name: Verify and archive complete candidate delivery
