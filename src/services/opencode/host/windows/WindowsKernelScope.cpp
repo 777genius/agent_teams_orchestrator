@@ -249,6 +249,32 @@ static Handle canonicalDirectory(const std::wstring &value,
           "execution_path_alias");
   return handle;
 }
+// A named verification open must coexist with the retained DELETE-capable
+// owner. It grants no mutation right and still proves the same physical path.
+static Handle verificationDirectory(const std::wstring &value) {
+  const auto full = extended(value);
+  Handle handle(CreateFileW(full.c_str(), FILE_READ_ATTRIBUTES | READ_CONTROL,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                            OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                            nullptr));
+  if (!handle)
+    throw NativeError{"execution_owner_unknown", GetLastError(), "owner_verification_open"};
+  FILE_ATTRIBUTE_TAG_INFO tag{};
+  require(GetFileInformationByHandleEx(handle.value, FileAttributeTagInfo, &tag, sizeof(tag)) &&
+              (tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+              !(tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
+              equalPath(finalPath(handle.value), full), "execution_path_alias");
+  return handle;
+}
+static std::vector<Handle> verificationAncestors(const std::wstring &path) {
+  require(path.size() >= 3 && GetDriveTypeW(path.substr(0, 3).c_str()) == DRIVE_FIXED,
+          "execution_owner_local_volume_required");
+  std::vector<Handle> values;
+  values.push_back(verificationDirectory(path.substr(0, 3)));
+  for (size_t i = 3; i < path.size(); i++)
+    if (path[i] == L'\\') values.push_back(verificationDirectory(path.substr(0, i)));
+  return values;
+}
 static std::vector<Handle> ancestors(const std::wstring &path) {
   require(path.size() >= 3 && GetDriveTypeW(path.substr(0, 3).c_str()) == DRIVE_FIXED,
           "execution_owner_local_volume_required");
@@ -298,7 +324,7 @@ struct RetainedAnchorComponent {
   void assertLive() const {
     require(anchorIdentity(handle.value).Stringify() == identity.Stringify(),
             "execution_path_alias");
-    auto reopened = canonicalDirectory(path);
+    auto reopened = verificationDirectory(path);
     require(anchorIdentity(reopened.value).Stringify() == identity.Stringify(),
             "execution_path_alias");
   }
@@ -307,11 +333,11 @@ struct RetainedRealpathAnchor {
   std::wstring kind, path;
   std::vector<RetainedAnchorComponent> components;
   RetainedRealpathAnchor(const std::wstring &root, const std::wstring &accessKind,
-                         std::vector<Handle> parents)
+                         std::vector<Handle> parents, Handle heldRoot)
       : kind(accessKind), path(root) {
     for (auto &parent : parents)
       components.emplace_back(std::move(parent));
-    components.emplace_back(canonicalDirectory(root));
+    components.emplace_back(std::move(heldRoot));
   }
   void assertLive() const {
     for (const auto &component : components)
@@ -705,9 +731,11 @@ class SelectedControllerConfig {
     require(mcpRootPath.size() >= 3 && mcpRootPath[1] == L':' && mcpRootPath[2] == L'\\',
             "run_controller_config_unknown");
     (void)extended(mcpRootPath);
-    mcpRoot = std::make_unique<RetainedAnchorComponent>(canonicalDirectory(mcpRootPath, FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL));
+    mcpRoot = std::make_unique<RetainedAnchorComponent>(verificationDirectory(mcpRootPath));
+    require(equalPath(mcpRoot->path, mcpRootPath), "run_controller_inbox_unknown");
+    mcpRoot->assertLive();
     mcpRootIdentity = fileIdentity(mcpRoot->handle.value, owner, true);
-    mcpAncestors = ancestors(mcpRootPath);
+    mcpAncestors = verificationAncestors(mcpRootPath);
     for (auto &parent : mcpAncestors)
       mcpAncestorIdentities.push_back(anchorIdentity(parent.value));
     SelectedControllerInbox inbox;
@@ -733,6 +761,7 @@ class SelectedControllerConfig {
               "run_controller_inbox_unknown");
       inbox.directoryIdentities.push_back(fileIdentity(directory.value, owner, true));
       inbox.directories.emplace_back(std::move(directory));
+      require(equalPath(inbox.directories.back().path, current), "run_controller_inbox_unknown");
     }
     inbox.userPath = current + L"\\user.json";
     if (inbox.state.empty() && inbox.directories.size() == 3) {
@@ -767,6 +796,8 @@ class SelectedControllerConfig {
       }
     }
     inbox.assertLive();
+    mcpRoot->assertLive();
+    require(equalPath(mcpRoot->path, mcpRootPath), "run_controller_inbox_unknown");
     inboxes.emplace(teamId, std::move(inbox));
   }
 public:
@@ -826,6 +857,15 @@ public:
     }
     return canonicalDirectory(path, FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL);
   }
+  std::vector<Handle> holdSelectedAncestors(const std::wstring &path) {
+    require(path.size() >= 3 && GetDriveTypeW(path.substr(0, 3).c_str()) == DRIVE_FIXED,
+            "execution_owner_local_volume_required");
+    std::vector<Handle> values;
+    values.push_back(holdSelectedDirectory(path.substr(0, 3)));
+    for (size_t i = 3; i < path.size(); i++)
+      if (path[i] == L'\\') values.push_back(holdSelectedDirectory(path.substr(0, i)));
+    return values;
+  }
   std::pair<Handle, std::wstring> createSpool(const JsonObject &input, const std::wstring &nonce) {
     for (auto root : input.GetNamedArray(L"protectedRoots")) {
       require(root.ValueType() == JsonValueType::String, "execution_owner_unknown");
@@ -875,7 +915,7 @@ public:
       value.rootPath = root;
       value.parentPath = parent;
       value.databasePath = database;
-      value.ancestors = ancestors(database);
+      value.ancestors = holdSelectedAncestors(database);
       value.root = holdSelectedDirectory(root);
       value.parent = holdSelectedDirectory(parent);
       value.rootIdentity = fileIdentity(value.root.value, value.owner, true, selectedPackage);
@@ -884,7 +924,7 @@ public:
       for (const auto &path : admitted) {
         SelectedProfileDirectory directory;
         directory.path = path;
-        directory.ancestors = ancestors(path);
+        directory.ancestors = holdSelectedAncestors(path);
         directory.file = holdSelectedDirectory(path);
         directory.identity = fileIdentity(directory.file.value, value.owner, true, selectedPackage);
         value.directories.push_back(std::move(directory));
@@ -944,11 +984,11 @@ public:
                 database[root.size()] == L'\\',
             "execution_database_alias");
     const auto owner = currentSid();
-    Handle heldRoot(canonicalDirectory(root, FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL));
+    Handle heldRoot(holdSelectedDirectory(root));
     const auto rootIdentity = fileIdentity(heldRoot.value, owner, true, selectedPackage);
     const auto configDirectory = root + L"\\config\\opencode";
     const auto configPath = configDirectory + L"\\opencode.json";
-    auto checkedParents = ancestors(root);
+    auto checkedParents = holdSelectedAncestors(root);
     struct Retained {
       std::vector<Handle> parents;
       std::vector<JsonObject> identities;
@@ -958,7 +998,7 @@ public:
           require(anchorIdentity(parents[i].value).Stringify() == identities[i].Stringify(),
                   "execution_owner_unknown");
           const auto heldPath = finalPath(parents[i].value);
-          auto reopened = canonicalDirectory(heldPath.substr(4));
+          auto reopened = verificationDirectory(heldPath.substr(4));
           require(anchorIdentity(reopened.value).Stringify() == identities[i].Stringify(),
                   "execution_owner_unknown");
         }
@@ -1064,7 +1104,7 @@ public:
                 selected.rootIdentity.Stringify(), "run_control_selection_changed");
     // The config pathname is fixed by the existing private selected profile,
     // never an arbitrary basename, serialized HANDLE or ExpectedBinding DTO.
-    auto checkedParents = ancestors(configPath);
+    auto checkedParents = holdSelectedAncestors(configPath);
     Handle config(CreateFileW(extended(configPath).c_str(), GENERIC_READ | READ_CONTROL,
                                FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                                FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
@@ -1112,7 +1152,7 @@ public:
   JsonObject open(const JsonObject &input) {
     auto path = text(input, L"path"), owner = currentSid();
     bool create = input.GetNamedBoolean(L"createExclusive", false);
-    auto parents = ancestors(path);
+    auto parents = holdSelectedAncestors(path);
     require(!parents.empty(), "execution_owner_path_invalid");
     auto parentPath = path.substr(0, path.find_last_of(L'\\'));
     Handle targetParent;
@@ -1360,7 +1400,7 @@ struct Scope {
   std::atomic<bool> stopping{false}, mainExitPublished{false};
   std::thread reader, mainExit;
   std::mutex pipeMutex;
-  std::vector<std::wstring> aclRoots;
+  std::vector<RetainedAnchorComponent> aclRoots;
   std::vector<RetainedRealpathAnchor> realpathAnchors;
   std::unique_ptr<RetainedRealpathDll> realpathDll;
   void assertRealpathAnchorsLive() const {
@@ -1565,8 +1605,20 @@ struct Scope {
     return value;
   }
 };
-static void grantRoot(Scope &scope, const std::wstring &path, DWORD mask, ACCESS_MODE mode) {
-  auto handle = canonicalDirectory(path, READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES);
+static Handle scopeAclDirectory(const RetainedAnchorComponent &anchor) {
+  anchor.assertLive();
+  Handle handle(CreateFileW(extended(anchor.path).c_str(),
+                            READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                            OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                            nullptr));
+  require(handle && anchorIdentity(handle.value).Stringify() == anchor.identity.Stringify(),
+          "execution_containment_filesystem_denied");
+  return handle;
+}
+static void grantRoot(Scope &scope, Handle heldRoot, DWORD mask, ACCESS_MODE mode) {
+  RetainedAnchorComponent anchor(std::move(heldRoot));
+  auto handle = scopeAclDirectory(anchor);
   PACL previous = nullptr;
   PSECURITY_DESCRIPTOR descriptor = nullptr;
   require(GetSecurityInfo(handle.value, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr,
@@ -1582,19 +1634,24 @@ static void grantRoot(Scope &scope, const std::wstring &path, DWORD mask, ACCESS
   require(SetEntriesInAclW(1, &entry, previous, &next) == ERROR_SUCCESS,
           "execution_containment_filesystem_denied");
   LocalMemory nextMemory{next};
-  scope.aclRoots.push_back(path);
-  require(SetSecurityInfo(handle.value, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr,
+  const HANDLE heldAcl = handle.value;
+  scope.aclRoots.emplace_back(std::move(handle));
+  require(SetSecurityInfo(heldAcl, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr,
                           next, nullptr) == ERROR_SUCCESS,
+          "execution_containment_filesystem_denied");
+  scope.aclRoots.back().assertLive();
+  require(anchorIdentity(heldAcl).Stringify() == scope.aclRoots.back().identity.Stringify(),
           "execution_containment_filesystem_denied");
 }
 static void removeGrants(Scope &scope) {
   if (scope.realpathDll && scope.realpathDll->granted)
     scope.realpathDll->changeAce(REVOKE_ACCESS);
   for (auto it = scope.aclRoots.rbegin(); it != scope.aclRoots.rend(); ++it) {
-    auto handle = canonicalDirectory(*it, READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES);
+    it->assertLive();
+    const HANDLE handle = it->handle.value;
     PACL previous = nullptr;
     PSECURITY_DESCRIPTOR descriptor = nullptr;
-    require(GetSecurityInfo(handle.value, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr,
+    require(GetSecurityInfo(handle, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr,
                             nullptr, &previous, nullptr, &descriptor) == ERROR_SUCCESS,
             "cleanup_unknown");
     LocalMemory original{descriptor};
@@ -1604,9 +1661,11 @@ static void removeGrants(Scope &scope) {
     PACL next = nullptr;
     require(SetEntriesInAclW(1, &entry, previous, &next) == ERROR_SUCCESS, "cleanup_unknown");
     LocalMemory nextMemory{next};
-    require(SetSecurityInfo(handle.value, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr,
+    require(SetSecurityInfo(handle, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr,
                             nullptr, next, nullptr) == ERROR_SUCCESS,
             "cleanup_unknown");
+    it->assertLive();
+    require(anchorIdentity(handle).Stringify() == it->identity.Stringify(), "cleanup_unknown");
   }
   scope.aclRoots.clear();
 }
@@ -1722,7 +1781,7 @@ struct WindowsNativeRunStateIssuer {
     const std::wstring owner = currentSid();
     auto root = owners.holdSelectedDirectory(dataRoot);
     const JsonObject rootIdentity = fileIdentity(root.value, owner, true);
-    std::vector<Handle> parents = ancestors(directory);
+    std::vector<Handle> parents = owners.holdSelectedAncestors(directory);
     require(parents.size() >= 4, "run_state_held_inputs");
     Handle run;
     try {
@@ -2117,7 +2176,7 @@ static std::unique_ptr<Scope> launch(const JsonObject &input, OwnerStore &owners
   require(nonce.size() == 36 && lease.size() == 36, "execution_identity_mismatch");
   scope->profile = L"AgentTeams.OpenCodeV2." + nonce;
   scope->cwd = text(input, L"cwd");
-  auto parents = ancestors(scope->cwd);
+  auto parents = owners.holdSelectedAncestors(scope->cwd);
   HRESULT result = CreateAppContainerProfile(scope->profile.c_str(), scope->profile.c_str(),
                                              L"OpenCode V2 private execution", nullptr, 0,
                                              reinterpret_cast<PSID *>(&scope->sid.value));
@@ -2133,12 +2192,12 @@ static std::unique_ptr<Scope> launch(const JsonObject &input, OwnerStore &owners
     for (auto value : input.GetNamedArray(kind)) {
       require(value.ValueType() == JsonValueType::String, "execution_invalid_response");
       std::wstring root(value.GetString());
-      auto checked = ancestors(root);
+      auto checked = owners.holdSelectedAncestors(root);
       if (kind != std::wstring(L"protectedRoots"))
         scope->realpathAnchors.emplace_back(
             root, kind == std::wstring(L"writableRoots") ? L"writable" : L"readOnly",
-            std::move(checked));
-      grantRoot(*scope, root,
+            std::move(checked), owners.holdSelectedDirectory(root));
+      grantRoot(*scope, owners.holdSelectedDirectory(root),
                 kind == std::wstring(L"protectedRoots") ? FILE_ALL_ACCESS
                 : kind == std::wstring(L"writableRoots")
                     ? (FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE)
