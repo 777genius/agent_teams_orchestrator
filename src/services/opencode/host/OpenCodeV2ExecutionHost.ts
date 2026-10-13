@@ -15,8 +15,9 @@ import { assertExecutionPlatformAvailable, launchExecutionPlatform, planExecutio
 import { acquireExecutionProfileOwner } from './OpenCodeV2ExecutionOwner.js'
 import { initializeOpenCodeV2ExecutionAuth } from './OpenCodeV2ExecutionAuth.js'
 import { readOpenCodeV2SelectedAuth } from './OpenCodeV2ExecutionOAuth.js'
-import { bindWindowsExecutionSelectedConfig, closeWindowsExecutionPlan, ownerFilesystemForWindowsPlan,
+import { bindWindowsExecutionSelectedConfig, closeWindowsExecutionPlan, consumeWindowsExecutionLaunchNonce, ownerFilesystemForWindowsPlan, preflightWindowsMemberExecution,
   type WindowsSelectedAuthMetadata } from './windows/OpenCodeV2WindowsExecution.js'
+import { selectWindowsRunMemberPreflightForPlan } from '../bridge/OpenCodeV2RunControl.js'
 import { resolveOpenCodeV2DarwinControllerRuntimeClosure } from '../profile/OpenCodeV2ExecutionReceipt.js'
 import { recordOpenCodeV2ProviderFailure, type ExecutionAcquisitionPhase } from '../execution/OpenCodeV2Diagnostics.js'
 
@@ -144,7 +145,9 @@ export async function prepareOwnedNativeExecutionPlan(validatedNative: Validated
   }
   const selectedCliRoot = await realpath(path.dirname(path.dirname(native.executablePath))); check()
   const controllerStateRoots = await deriveSelectedOpenCodeV2ControllerState(profile, context); check(); progress?.('controller-prepared')
-  await assertSelectedOpenCodeV2ControllerState(profile, context, controllerStateRoots); check()
+  // Windows physical controller qualification is ordered after the one plan,
+  // selected-profile qualification and member preflight. POSIX remains eager.
+  if (process.platform !== 'win32') { await assertSelectedOpenCodeV2ControllerState(profile, context, controllerStateRoots); check() }
   const profileDirectories = [...new Set([profile.root, profile.config.directory, path.dirname(profile.databasePath),
     ...['HOME', 'USERPROFILE', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME',
       'TMPDIR', 'TMP', 'TEMP', 'APPDATA', 'LOCALAPPDATA'].map(key => profile.env[key]!)])]
@@ -180,8 +183,9 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
   catch (failure) { await recordOpenCodeV2ProviderFailure('execution-host-startup', failure, true, undefined, timing()); throw failure }
   mark('prepared')
   const { native, profile, entry, plan, controllerStateRoots } = prepared
-  const nonce = randomUUID(), leaseOwnerId = randomUUID(), password = randomBytes(32).toString('base64url')
-  const ownerIdentity = { hostInstanceId: nonce, leaseOwnerId, graphSha256: native.graph.sha256 }
+  let nonce: string | undefined
+  const leaseOwnerId = randomUUID(), password = randomBytes(32).toString('base64url')
+  let ownerIdentity: { hostInstanceId: string; leaseOwnerId: string; graphSha256: string }
   let owner: Awaited<ReturnType<typeof acquireExecutionProfileOwner>>
   let windowsFilesystem: ReturnType<typeof ownerFilesystemForWindowsPlan> | undefined
   let selectedAuth: WindowsSelectedAuthMetadata | undefined
@@ -202,13 +206,24 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
       windowsFilesystem = ownerFilesystemForWindowsPlan(plan.concrete)
       await windowsFilesystem.validateSelectedProfile(profile.root, profile.databasePath, context.deadline, context.signal)
       check()
+      const memberPreflight = !('purpose' in profile.selection)
+        ? await selectWindowsRunMemberPreflightForPlan(plan.concrete, context, profile as SelectedExecutionProfile) : null
+      if (memberPreflight) {
+        await preflightWindowsMemberExecution(plan.concrete, memberPreflight, context.deadline, context.signal)
+        check()
+      }
       for (const root of controllerStateRoots) {
         const held = await windowsFilesystem.openDirectory(root, context.deadline, context.signal)
         retainedRoots.push(held)
         await held.assertOwned(context.deadline, context.signal)
         check()
       }
+      nonce = consumeWindowsExecutionLaunchNonce(plan.concrete)
+    } else {
+      nonce = randomUUID()
     }
+    executionAssert(typeof nonce === 'string', 'execution_identity_mismatch')
+    ownerIdentity = { hostInstanceId: nonce, leaseOwnerId, graphSha256: native.graph.sha256 }
     owner = await acquireExecutionProfileOwner(profile, ownerIdentity,
       plan.platform === 'win32' ? { windowsPlan: plan.concrete } : undefined)
   } catch (failure) {

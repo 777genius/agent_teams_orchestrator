@@ -3,8 +3,10 @@ import { lstat, realpath } from 'node:fs/promises'
 import { executionAssert, executionRecord, type ExecutionContext } from '../execution/OpenCodeV2ExecutionContracts.js'
 import type { OwnedNativeProfile } from './OpenCodeV2ExecutionBinding.js'
 
-/** Derive the selected controller's candidate roots from the production config.
- * These are paths only: native ownership qualification is a separate boundary. */
+/** Derive the selected controller's candidate roots from exact production
+ * config/environment joins. POSIX retains eager canonical checks; Windows
+ * deliberately returns lexical candidates for later same-plan native
+ * qualification after sealed state/cohort attachment. */
 export async function deriveSelectedOpenCodeV2ControllerState(profile: OwnedNativeProfile, context: ExecutionContext): Promise<readonly string[]> {
   const document = executionRecord(JSON.parse(profile.config.content))
   if (document.mcp === undefined) return []
@@ -14,22 +16,27 @@ export async function deriveSelectedOpenCodeV2ControllerState(profile: OwnedNati
   if (server.type !== 'local') return []
   const environment = executionRecord(server.environment ?? {})
   const claudeDir = environment.AGENT_TEAMS_MCP_CLAUDE_DIR
-  executionAssert(typeof claudeDir === 'string' && path.isAbsolute(claudeDir) &&
-    profile.env.AGENT_TEAMS_MCP_CLAUDE_DIR === claudeDir && await realpath(claudeDir) === claudeDir, 'controller_state_unowned')
+  executionAssert(typeof claudeDir === 'string' &&
+    (process.platform === 'win32' ? path.win32.isAbsolute(claudeDir) : path.isAbsolute(claudeDir)) &&
+    profile.env.AGENT_TEAMS_MCP_CLAUDE_DIR === claudeDir, 'controller_state_unowned')
+  if (process.platform !== 'win32') executionAssert(await realpath(claudeDir) === claudeDir, 'controller_state_unowned')
   executionAssert(/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,199}$/.test(context.teamId), 'controller_team_invalid')
   // This process inherited the selected boundary from the production launcher.
   // Public command bodies and profile DTOs cannot select a different base.
   executionAssert(process.env.AGENT_TEAMS_MCP_CLAUDE_DIR === claudeDir, 'controller_state_unowned')
   const roots = [path.join(claudeDir, 'teams', context.teamId), path.join(claudeDir, 'tasks', context.teamId)]
-  for (const root of roots) {
-    const stat = await lstat(root)
-    executionAssert(await realpath(root) === root && stat.isDirectory() && !stat.isSymbolicLink(), 'controller_state_unowned')
+  if (process.platform !== 'win32') {
+    for (const root of roots) {
+      const stat = await lstat(root)
+      executionAssert(await realpath(root) === root && stat.isDirectory() && !stat.isSymbolicLink(), 'controller_state_unowned')
+    }
   }
   return Object.freeze(roots)
 }
 
-/** POSIX keeps its existing uid qualification. Windows uses native metadata
- * from the same private broker instead of a profile DTO or POSIX mode. */
+/** POSIX keeps its existing uid qualification. Windows performs no lexical
+ * substitution: its native held-directory qualification is explicitly ordered
+ * after selected-profile qualification and member preflight. */
 export async function assertSelectedOpenCodeV2ControllerState(profile: OwnedNativeProfile, context: ExecutionContext,
   candidates?: readonly string[]): Promise<void> {
   const roots = candidates ?? await deriveSelectedOpenCodeV2ControllerState(profile, context)

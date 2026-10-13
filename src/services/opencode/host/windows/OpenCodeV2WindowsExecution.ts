@@ -28,6 +28,19 @@ export type WindowsSelectedAuthMetadata = Readonly<{
 const plans = new WeakSet<WindowsLaunchPlan>(), mappings = new WeakSet<WindowsExecutionMapping>(), retirements = new WeakSet<WindowsKernelRetirement>()
 const selectedConfigs = new WeakMap<WindowsLaunchPlan, string>(), selectingConfigs = new WeakSet<WindowsLaunchPlan>()
 const brokers = new WeakMap<WindowsLaunchPlan, WindowsNativeBroker>(), binaries = new WeakMap<WindowsLaunchPlan, Readonly<{ path: string; sha256: string }>>()
+type WindowsMemberPreflightSelection = Readonly<{
+  selectors: Readonly<{
+    mode: 'memberPreflight'; directory: string; dataRoot: string
+    binding: Readonly<{ teamId: string; runId: string; controllerInstanceId: string; ownerId: string }>
+    root: string; databasePath: string; sha256: string
+  }>
+}>
+type WindowsMemberPreflightResult = Readonly<{ stateId: string; launchNonce: string }>
+type WindowsMemberPreflightAttempt = {
+  broker: WindowsNativeBroker; selectors: WindowsMemberPreflightSelection['selectors']
+  state: 'consumed' | 'ready' | 'poisoned'; result?: WindowsMemberPreflightResult; nonceConsumed?: true
+}
+const memberPreflights = new WeakMap<WindowsLaunchPlan, WindowsMemberPreflightAttempt>()
 export type WindowsCommandRequestReplay = Readonly<{
   admit(id: string, operation: string): object
   settle(id: string, authority: object): void
@@ -133,6 +146,19 @@ function compactReadOnlyGrantUnion(roots: readonly string[]): readonly string[] 
   }
   return Object.freeze(selected)
 }
+/** Exact production config/environment joins select controller candidates.
+ * Keep them in the complete plan, but defer their filesystem qualification
+ * until the same broker has attached the sealed cohort and preflighted the
+ * member. Every other writable/profile/read-only root remains eagerly checked. */
+function deferredWindowsControllerRoots(requested: Readonly<{ writableRoots: readonly string[]; env: Readonly<Record<string, string>> }>): ReadonlySet<string> {
+  const base = requested.env.AGENT_TEAMS_MCP_CLAUDE_DIR
+  if (typeof base !== 'string' || !path.win32.isAbsolute(base)) return new Set()
+  return new Set(requested.writableRoots.filter(root => {
+    const relative = path.win32.relative(base, root), parts = relative.split('\\')
+    return parts.length === 2 && (parts[0] === 'teams' || parts[0] === 'tasks') &&
+      /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,199}$/.test(parts[1]!)
+  }))
+}
 export async function planWindowsExecution(requested: Readonly<{
   bun: Readonly<{ path: string; sha256: string }>; entry: string; cwd: string; writableRoots: readonly string[]; readOnlyRoots: readonly string[]; protectedRoots?: readonly string[]; profileDirectories?: readonly string[]; readOnlyMounts?: readonly Readonly<{ source: string; target: string }>[]; env: Readonly<Record<string, string>>
 }>): Promise<WindowsLaunchPlan> {
@@ -142,7 +168,14 @@ export async function planWindowsExecution(requested: Readonly<{
   assert(await realpath(input.bun.path) === input.bun.path && await hash(input.bun.path) === input.bun.sha256, 'execution_identity_mismatch')
   assert(input.profileDirectories && input.profileDirectories.length > 0, 'execution_profile_changed')
   assert(!input.readOnlyMounts?.length, 'execution_containment_path_alias_pending')
-  for (const root of [...input.writableRoots, ...input.readOnlyRoots, ...input.profileDirectories, input.cwd]) assert(path.isAbsolute(root) && /^[A-Za-z]:\\/.test(root) && !root.includes('/') && path.parse(root).root !== root && await realpath(root) === root, 'execution_path_alias')
+  const rawRoots = [...new Set([...input.writableRoots, ...input.readOnlyRoots, ...input.profileDirectories, input.cwd])]
+  for (const root of rawRoots) assert(path.isAbsolute(root) && /^[A-Za-z]:\\/.test(root) && !root.includes('/') && path.parse(root).root !== root, 'execution_path_alias')
+  const deferredControllers = deferredWindowsControllerRoots(input)
+  for (const root of rawRoots) {
+    if (!deferredControllers.has(root) || input.readOnlyRoots.includes(root) ||
+      input.profileDirectories.includes(root) || root === input.cwd)
+      assert(await realpath(root) === root, 'execution_path_alias')
+  }
   for (const key of Object.keys(input.env)) assert(!/^(?:NODE_CHANNEL_|OPENCODE_V2_WINDOWS_|DYLD_|LD_)/.test(key), 'execution_profile_changed')
   const helper = await resolveWindowsNativeArtifact(), realpathDll = await resolveWindowsRealpathArtifact()
   assert(helper.arch === 'x64' && realpathDll.arch === 'x64' &&
@@ -179,6 +212,52 @@ export function ownerFilesystemForWindowsPlan(plan: WindowsLaunchPlan) {
     },
   })
 }
+/** Member membership came only from the retained serving-record/profile tuple.
+ * The attempt is consumed before native preflight; uncertainty poisons it. */
+export async function preflightWindowsMemberExecution(plan: WindowsLaunchPlan,
+  selection: WindowsMemberPreflightSelection, deadline: number, signal?: AbortSignal): Promise<void> {
+  signal?.throwIfAborted()
+  assert(Number.isFinite(deadline) && deadline > Date.now(), 'execution_timeout')
+  assert(plans.has(plan) && !memberPreflights.has(plan), 'execution_owner_unknown')
+  const broker = brokers.get(plan); assert(broker && !broker.ended(), 'execution_owner_unknown')
+  const selectors = selection.selectors
+  assert(selectors.mode === 'memberPreflight' &&
+    typeof selectors.directory === 'string' && typeof selectors.dataRoot === 'string' &&
+    typeof selectors.root === 'string' && typeof selectors.databasePath === 'string' &&
+    /^[a-f0-9]{64}$/.test(selectors.sha256) &&
+    Object.keys(selectors.binding).sort().join(',') === 'controllerInstanceId,ownerId,runId,teamId' &&
+    Object.values(selectors.binding).every(value => typeof value === 'string' && value.length > 0 && !value.includes('\0')),
+    'run_state_start_changed')
+  const attempt: WindowsMemberPreflightAttempt = { broker, selectors, state: 'consumed' }
+  memberPreflights.set(plan, attempt) // Once requested, native consumption cannot be replayed.
+  try {
+    const response = row(await broker.request('runStateSelect', {
+      ...selectors,
+    }, deadline, signal))
+    signal?.throwIfAborted()
+    assert(Object.keys(response).sort().join(',') === 'launchNonce,stateId' &&
+      typeof response.stateId === 'string' && /^run-state-[a-f0-9]{32}$/.test(response.stateId) &&
+      typeof response.launchNonce === 'string' &&
+      /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(response.launchNonce),
+      'run_state_start_changed')
+    attempt.result = Object.freeze({ stateId: response.stateId as string, launchNonce: response.launchNonce as string })
+    attempt.state = 'ready'
+  } catch (error) {
+    attempt.state = 'poisoned'; attempt.result = undefined; throw error
+  }
+}
+/** Native member nonce is consumed before ownerIdentity and physical fences.
+ * A nonmember plan retains the existing private random launch nonce policy. */
+export function consumeWindowsExecutionLaunchNonce(plan: WindowsLaunchPlan): string {
+  assert(plans.has(plan), 'execution_owner_unknown')
+  const attempt = memberPreflights.get(plan)
+  if (!attempt) return randomUUID()
+  const broker = brokers.get(plan)
+  assert(attempt.state === 'ready' && attempt.result && !attempt.nonceConsumed &&
+    attempt.broker === broker && broker && !broker.ended(), 'run_state_start_changed')
+  attempt.nonceConsumed = true
+  return attempt.result.launchNonce
+}
 /** Root composition calls this after native selected-profile validation and
  * fence acquisition, before launch. The private plan/cache admits the exact
  * managed config; scalar caller process/FileID/binding DTOs are never accepted. */
@@ -188,6 +267,11 @@ export async function bindWindowsExecutionSelectedConfig(plan: WindowsLaunchPlan
   assert(plans.has(plan) && !selectingConfigs.has(plan), 'execution_owner_unknown')
   selectingConfigs.add(plan) // A mutation with unknown completion cannot replay.
   const broker = brokers.get(plan); assert(broker && !broker.ended(), 'execution_owner_unknown')
+  const member = memberPreflights.get(plan)
+  if (member) assert(member.state === 'ready' && member.result && member.nonceConsumed === true && member.broker === broker &&
+    member.selectors.root === profile.root && member.selectors.databasePath === profile.databasePath &&
+    member.selectors.sha256 === profile.config.sha256 && member.selectors.binding.teamId === teamId,
+    'run_state_start_changed')
   await validateExecutionProfile(profile)
   signal?.throwIfAborted(); assert(deadline > Date.now(), 'execution_timeout')
   assert(plan.writableRoots.includes(profile.root) && plan.profileDirectories.includes(profile.root) &&
@@ -199,6 +283,9 @@ export async function bindWindowsExecutionSelectedConfig(plan: WindowsLaunchPlan
 }
 export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, leaseOwnerId: string, bun: Readonly<{ path: string; sha256: string }>) {
   assert(plans.has(plan) && selectedConfigs.has(plan) && equal(binaries.get(plan), bun) && /^[a-f0-9-]{36}$/.test(nonce) && /^[a-f0-9-]{36}$/.test(leaseOwnerId))
+  const member = memberPreflights.get(plan)
+  if (member) assert(member.state === 'ready' && member.result && member.nonceConsumed === true &&
+    nonce === member.result.launchNonce && brokers.get(plan) === member.broker, 'run_state_start_changed')
   const broker = brokers.get(plan); assert(broker && !broker.ended())
   const child = new EventEmitter() as EventEmitter & { pid?: number }
   const http = createWindowsExecutionHttpClient(

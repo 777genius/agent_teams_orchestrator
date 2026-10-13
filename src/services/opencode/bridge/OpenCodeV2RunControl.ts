@@ -3,7 +3,7 @@ import { constants } from 'node:fs'
 import { chmod, lstat, mkdir, open, readFile, readdir, realpath, rename, unlink } from 'node:fs/promises'
 import { createConnection, createServer, type Socket } from 'node:net'
 import path from 'node:path'
-import { canonicalExecutionJSON, executionAssert, executionHash, executionRecord, assertIntentIdentity } from '../execution/OpenCodeV2ExecutionContracts.js'
+import { canonicalExecutionJSON, executionAssert, executionHash, executionRecord, assertIntentIdentity, type ExecutionContext } from '../execution/OpenCodeV2ExecutionContracts.js'
 import type { QueueIntent } from '../execution/OpenCodeV2AdmissionService.js'
 import type { ExecutionMention } from '../transport/OpenCodeV2ExecutionClientFactory.js'
 import type { RunAnyProcessIdentity, RunBinding, RunControlRecord, RunControlRequest, RunControlResult, RunMemberStatus, RunProcessIdentity, RunStopMember, RunUnixControlRecord, RunWindowsControlRecord } from './OpenCodeV2RunTypes.js'
@@ -11,6 +11,7 @@ import type { SelectedExecutionProfile } from '../host/OpenCodeV2ExecutionBindin
 import { OpenCodeV2RunNonces } from './OpenCodeV2RunNonces.js'
 import { retainedControllerPath } from './OpenCodeV2ControllerTools.js'
 import { createWindowsNativeBroker, resolveWindowsNativeArtifact, type WindowsNativeBroker } from '../host/windows/OpenCodeV2WindowsNativeBroker.js'
+import type { WindowsLaunchPlan } from '../host/windows/OpenCodeV2WindowsExecution.js'
 export type { RunBinding, RunControlRecord, RunControlRequest, RunControlResult, RunLaunchPlan } from './OpenCodeV2RunTypes.js'
 
 const MAX_FRAME = 512 * 1024
@@ -18,9 +19,14 @@ const MAX_FRAME = 512 * 1024
 export const OPEN_CODE_V2_RUN_INITIALIZATION_MS = process.platform === 'darwin' ? 180_000 : 90_000
 const MAX_OPERATION_MS = 30_000
 const digest = (bytes: string | Buffer) => createHash('sha256').update(bytes).digest('hex')
-type WindowsRunComposition = Readonly<{ broker: WindowsNativeBroker; stateId: string }>
+type WindowsServingAdmission = Readonly<{ record: RunWindowsControlRecord; profiles: readonly WindowsProfileAdmission[] }>
+type WindowsRunComposition = { readonly broker: WindowsNativeBroker; readonly stateId: string; serving?: WindowsServingAdmission }
 const windowsRuns = new Map<string, Promise<WindowsRunComposition>>()
 type WindowsProfileAdmission = Readonly<{ root: string; databasePath: string; sha256: string; directories: readonly string[] }>
+const WINDOWS_PROFILE_DIRECTORY_ENV_KEYS = [
+  'HOME', 'USERPROFILE', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME',
+  'TMPDIR', 'TMP', 'TEMP', 'APPDATA', 'LOCALAPPDATA',
+] as const
 type WindowsProfileConfigInspection = Readonly<{
   schema: 1; ok: true; state: 'complete' | 'absent' | 'incomplete'; root: string; databasePath: string
   configPath: string; privateAcl: true; reparse: false; rootIdentity: unknown; configIdentity: unknown
@@ -54,11 +60,15 @@ type WindowsCompositionSelection =
   | Readonly<{ mode: 'reserve' | 'serve' | 'client'; dataRoot: string; binding: RunBinding; profiles: readonly WindowsProfileAdmission[] }>
   | Readonly<{ mode: 'discover'; dataRoot: string; teamId: string; runId: string; profiles: readonly WindowsProfileAdmission[] }>
 function windowsProfileAdmission(profile: SelectedExecutionProfile): WindowsProfileAdmission {
-  const directories = [...new Set([profile.root, profile.config.directory, ...Object.values(profile.env)])]
+  const environmentDirectories = WINDOWS_PROFILE_DIRECTORY_ENV_KEYS.map(key => profile.env[key])
+  const directories = Object.freeze([...new Set([
+    profile.root, profile.config.directory, path.win32.dirname(profile.databasePath), ...environmentDirectories,
+  ])])
   executionAssert(process.platform === 'win32' && path.win32.isAbsolute(profile.root) &&
     path.win32.isAbsolute(profile.databasePath) && /^[a-f0-9]{64}$/.test(profile.config.sha256) &&
-    directories.length > 0 && directories.length <= 64 && directories.every(value => path.win32.isAbsolute(value)), 'run_control_selection_missing')
-  return { root: profile.root, databasePath: profile.databasePath, sha256: profile.config.sha256, directories }
+    directories.length > 0 && directories.length <= 64 && directories.every(value =>
+      typeof value === 'string' && value.length > 0 && !value.includes('\0') && path.win32.isAbsolute(value)), 'run_control_selection_missing')
+  return Object.freeze({ root: profile.root, databasePath: profile.databasePath, sha256: profile.config.sha256, directories })
 }
 function parseWindowsProfileConfigInspection(value: unknown, root: string, databasePath: string): WindowsProfileConfigInspection {
   const row = executionRecord(value)
@@ -104,6 +114,8 @@ async function windowsProfileAdmissionsForDataRoot(dataRoot: string, broker: Win
 async function windowsAdmitProfiles(broker: WindowsNativeBroker, profiles: readonly WindowsProfileAdmission[],
   deadline: number, teamId: string): Promise<readonly string[]> {
   executionAssert(profiles.length > 0 && profiles.length <= 32, 'run_control_selection_missing')
+  executionAssert(new Set(profiles.map(profile => `${profile.root}|${profile.databasePath}|${profile.sha256}`)).size === profiles.length,
+    'run_control_selection_missing')
   const ids: string[] = []
   for (const profile of profiles) {
     await broker.request('ownerValidateSelectedProfile', {
@@ -135,7 +147,7 @@ async function windowsComposition(directory: string, select?: WindowsComposition
       const selectionIds = await windowsAdmitProfiles(broker, select.profiles, deadline,
         select.mode === 'discover' ? select.teamId : select.binding.teamId)
       const input = select.mode === 'reserve'
-        ? { directory, dataRoot: select.dataRoot, binding: select.binding, selectionIds }
+        ? { directory, dataRoot: select.dataRoot, binding: select.binding, selectionIds, sharedControllerRootCohort: true }
         : select.mode === 'discover'
           ? { directory, dataRoot: select.dataRoot, mode: select.mode, teamId: select.teamId, runId: select.runId, selectionIds }
           : { directory, dataRoot: select.dataRoot, mode: select.mode, binding: select.binding, selectionIds }
@@ -192,6 +204,40 @@ async function windowsCompositionFor(record: RunWindowsControlRecord): Promise<W
   return windowsComposition(record.directory, {
     mode: 'client', dataRoot: windowsDataRoot(record.directory), binding: record.binding,
     profiles,
+  })
+}
+/** Called only after the one Windows execution plan and selected-profile
+ * qualification exist. This lookup supplies comparison values; it cannot mint
+ * or convey filesystem authority. */
+export async function selectWindowsRunMemberPreflightForPlan(plan: WindowsLaunchPlan,
+  context: ExecutionContext, profile: SelectedExecutionProfile): Promise<Readonly<{
+    selectors: Readonly<{ mode: 'memberPreflight'; directory: string; dataRoot: string
+      binding: RunBinding; root: string; databasePath: string; sha256: string }>
+  }> | null> {
+  executionAssert(process.platform === 'win32' && plan && context.teamId.length > 0 && context.runId.length > 0,
+    'run_control_native_unknown')
+  const known: WindowsServingAdmission[] = []
+  const matches: Array<Readonly<{ serving: WindowsServingAdmission; profile: WindowsProfileAdmission }>> = []
+  for (const pending of windowsRuns.values()) {
+    const state = await pending, serving = state.serving
+    if (!serving || serving.record.binding.teamId !== context.teamId || serving.record.binding.runId !== context.runId) continue
+    known.push(serving)
+    const profiles = serving.profiles.filter(candidate => candidate.root === profile.root &&
+      candidate.databasePath === profile.databasePath && candidate.sha256 === profile.config.sha256)
+    executionAssert(profiles.length <= 1, 'run_state_start_changed')
+    if (profiles.length === 1) matches.push({ serving, profile: profiles[0]! })
+  }
+  // A known team/run serving state is never an ordinary no-cohort lookup:
+  // missing, changed, or ambiguous profile/record state fails closed.
+  executionAssert(known.length === 0 || known.length === 1 && matches.length === 1, 'run_state_start_changed')
+  const match = matches[0]
+  if (!match) return null
+  const directory = match.serving.record.directory
+  return Object.freeze({
+    selectors: Object.freeze({
+      mode: 'memberPreflight', directory, dataRoot: windowsDataRoot(directory),
+      binding: match.serving.record.binding, root: match.profile.root, databasePath: match.profile.databasePath, sha256: match.profile.sha256,
+    }),
   })
 }
 const keys = (row: Record<string, unknown>, names: readonly string[]) => executionAssert(
@@ -501,7 +547,7 @@ export async function reserveRunControlDirectory(dataRoot: string, binding: RunB
       mode: 'reserve', dataRoot, binding, profiles: profiles.map(windowsProfileAdmission),
     })
     await state.broker.request('runStateReserve', {
-      stateId: state.stateId, binding, sourceSha256, directory, dataRoot,
+      stateId: state.stateId, binding, sourceSha256, directory, dataRoot, sharedControllerRootCohort: true,
     }, Date.now() + MAX_OPERATION_MS)
     return directory
   }
@@ -779,8 +825,9 @@ async function serveWindowsRunControl(directory: string, binding: RunBinding, de
   execute: (request: RunControlRequest, deadline: number) => Promise<RunControlResult>,
   profiles: readonly SelectedExecutionProfile[] = []): Promise<{ record: RunControlRecord; close(): Promise<void> }> {
   executionAssert(profiles.length > 0, 'run_control_selection_missing')
+  const admittedProfiles = Object.freeze(profiles.map(windowsProfileAdmission))
   const state = await windowsComposition(directory, {
-    mode: 'serve', dataRoot: windowsDataRoot(directory), binding, profiles: profiles.map(windowsProfileAdmission),
+    mode: 'serve', dataRoot: windowsDataRoot(directory), binding, profiles: admittedProfiles,
   })
   const listened = await state.broker.request('runStateListen', {
     stateId: state.stateId, directory, binding, deadline, sourceSha256,
@@ -788,6 +835,12 @@ async function serveWindowsRunControl(directory: string, binding: RunBinding, de
   const record = parseRecord(listened.record)
   const native = windowsRecord(record), usedNonces = new OpenCodeV2RunNonces()
   executionAssert(executionHash(native.binding) === executionHash(binding) && native.directory === directory, 'run_control_foreign')
+  // Native serving ACK plus parseRecord validation publishes the only retained
+  // record/profile comparison state used by later member preflight.
+  state.serving = Object.freeze({
+    record: native,
+    profiles: admittedProfiles,
+  })
   const active = new Set<Promise<void>>()
   const onRequest = (event: unknown) => {
     const task = (async () => {
