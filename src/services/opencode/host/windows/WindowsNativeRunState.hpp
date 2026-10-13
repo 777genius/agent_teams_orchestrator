@@ -217,9 +217,9 @@ struct WindowsNativeRunState {
             "run_control_endpoint_changed");
     runStateVerifyHeldLocked();
     runStateValidateEndpointLocked(endpointRecord_);
-    runStateAssertRetirementWitnessLocked(serverProcess_, helperPid_, helperBirth_,
+    runStateAssertRetirementWitnessLocked(serverProcess_.value, helperPid_, helperBirth_,
                                           "run_control_endpoint_changed");
-    runStateAssertRetirementWitnessLocked(parentProcess_, bunPid_, bunBirth_,
+    runStateAssertRetirementWitnessLocked(parentProcess_.value, bunPid_, bunBirth_,
                                           "run_control_endpoint_changed");
     JsonObject result;
     num(result, L"schema", 1);
@@ -240,9 +240,9 @@ struct WindowsNativeRunState {
     require(!poisoned_ && reserved_, "run_state_unknown");
     runStateVerifyHeldLocked();
     require(endpointSealed_, "run_state_endpoint_missing");
-    runStateAssertRetirementWitnessLocked(serverProcess_, helperPid_, helperBirth_,
+    runStateAssertRetirementWitnessLocked(serverProcess_.value, helperPid_, helperBirth_,
                                           "run_control_endpoint_changed");
-    runStateAssertRetirementWitnessLocked(parentProcess_, bunPid_, bunBirth_,
+    runStateAssertRetirementWitnessLocked(parentProcess_.value, bunPid_, bunBirth_,
                                           "run_control_endpoint_changed");
     // These are the two original held process handles. Helper command/control
     // closure and control.json absence are never sources of MAIN completion.
@@ -352,9 +352,9 @@ private:
     helperBirth_ = runStateProcessBirthLocked(helper, "run_control_endpoint_changed");
     bunBirth_ = runStateProcessBirthLocked(bun, "run_control_endpoint_changed");
     if (requireHeld) {
-      runStateAssertRetirementWitnessLocked(serverProcess_, helperPid_, helperBirth_,
+      runStateAssertRetirementWitnessLocked(serverProcess_.value, helperPid_, helperBirth_,
                                             "run_control_endpoint_changed");
-      runStateAssertRetirementWitnessLocked(parentProcess_, bunPid_, bunBirth_,
+      runStateAssertRetirementWitnessLocked(parentProcess_.value, bunPid_, bunBirth_,
                                             "run_control_endpoint_changed");
     }
   }
