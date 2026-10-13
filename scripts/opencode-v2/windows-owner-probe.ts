@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
+import { writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { createWindowsNativeBroker, resolveWindowsNativeArtifact } from '../../src/services/opencode/host/windows/OpenCodeV2WindowsNativeBroker.js'
 import { createWindowsOwnerFilesystem, type WindowsOwnerDirectory } from '../../src/services/opencode/host/windows/OpenCodeV2WindowsOwnerFilesystem.js'
+import { executionRecord } from '../../src/services/opencode/execution/OpenCodeV2ExecutionContracts.js'
 
 // Actual native helper only. Supply a NEW TEST directory under the CI scratch
 // root. Retain its fences/records after both success and failure; no adoption,
@@ -26,25 +28,25 @@ try {
   await setupRoot.close()
   const originalPath = path.win32.join(requestedRoot, '.opencode-v2-execution-owner')
   const original = retain(await filesystem.createDirectory(originalPath))
-  const record = { schema: 1, synthetic: true, leaseOwnerId: lease, marker: 'retained-original-é' }
-  await original.writeExclusive('owner.json', record)
+  const originalOwnerRecord = { schema: 1, synthetic: true, leaseOwnerId: lease, marker: 'retained-original-é' }
+  await original.writeExclusive('owner.json', originalOwnerRecord)
   await assert.rejects(filesystem.createDirectory(originalPath))
-  await assert.rejects(original.writeExclusive('owner.json', record))
+  await assert.rejects(original.writeExclusive('owner.json', originalOwnerRecord))
   // An uncertain/failed mutation poisons this capability, so acquire a separate
   // original directory for the successful archive instead of replaying it.
   await original.close()
   const successPath = path.win32.join(requestedRoot, '.successful-owner')
   const successArchive = successPath + '.released.' + lease
   const success = retain(await filesystem.createDirectory(successPath))
-  await success.writeExclusive('owner.json', record)
+  await success.writeExclusive('owner.json', originalOwnerRecord)
   const before = success.identity
   await success.archive(successArchive)
   await success.assertOwned()
   assert.deepEqual(success.identity, before)
-  assert.deepEqual(await success.readRecord('owner.json'), record)
+  assert.deepEqual(await success.readRecord('owner.json'), originalOwnerRecord)
   const archived = retain(await filesystem.openDirectory(successArchive))
   assert.deepEqual(archived.identity, before)
-  assert.deepEqual(await archived.readRecord('owner.json'), record)
+  assert.deepEqual(await archived.readRecord('owner.json'), originalOwnerRecord)
   await assert.rejects(archived.writeExclusive('release.json', { forbidden: true }))
   const next = retain(await filesystem.createDirectory(successPath))
   assert.notDeepEqual(next.identity, before)
@@ -52,7 +54,7 @@ try {
   await next.writeExclusive('owner.json', nextRecord)
   // Target collision must retain BOTH source and preexisting destination bytes.
   await assert.rejects(next.archive(successArchive))
-  assert.deepEqual(await archived.readRecord('owner.json'), record)
+  assert.deepEqual(await archived.readRecord('owner.json'), originalOwnerRecord)
   const sourceAfterCollision = retain(await filesystem.openDirectory(successPath))
   assert.deepEqual(sourceAfterCollision.identity, next.identity)
   assert.deepEqual(await sourceAfterCollision.readRecord('owner.json'), nextRecord)
@@ -62,7 +64,7 @@ try {
   await partial.close()
   await assert.rejects(filesystem.createDirectory(partialPath))
   const retainedOriginal = retain(await filesystem.openDirectory(originalPath))
-  assert.deepEqual(await retainedOriginal.readRecord('owner.json'), record)
+  assert.deepEqual(await retainedOriginal.readRecord('owner.json'), originalOwnerRecord)
   const inspect = async (name: string, config?: string) => {
     const profile = path.win32.join(requestedRoot, name)
     retain(await filesystem.createDirectory(profile))
@@ -71,7 +73,7 @@ try {
     const opencodeDirectory = path.win32.join(configDirectory, "opencode")
     retain(await filesystem.createDirectory(opencodeDirectory))
     if (config !== undefined) await writeFile(path.win32.join(opencodeDirectory, "opencode.json"), config)
-    return record(await broker.request("ownerInspectProfileConfig", {
+    return executionRecord(await broker.request("ownerInspectProfileConfig", {
       root: profile, databasePath: path.win32.join(profile, "data", "opencode", "opencode.db"),
     }))
   }
@@ -102,7 +104,7 @@ try {
   const databasePath = path.win32.join(selectedDataDirectory, "opencode.db")
   await broker.request("ownerValidateSelectedProfile", { root: selectedRoot, databasePath,
     directories: [selectedRoot, selectedConfigDirectory] })
-  const selected = record(await broker.request("ownerSelectConfig", { root: selectedRoot, databasePath,
+  const selected = executionRecord(await broker.request("ownerSelectConfig", { root: selectedRoot, databasePath,
     sha256: createHash("sha256").update(selectedContent).digest("hex"), teamId: "TEST-team" }))
   assert.equal(selected.mcpRoot, claudeRoot); assert.equal(selected.inboxState, "regular")
   const inboxRoot = path.win32.join(claudeRoot, "teams")
@@ -111,7 +113,7 @@ try {
     const directory = path.win32.join(inboxRoot, team, "inboxes")
     retain(await filesystem.createDirectory(directory))
     if (state === "absent") await writeFile(path.win32.join(directory, "other.json"), "[]")
-    const result = record(await broker.request("ownerSelectConfig", { root: selectedRoot, databasePath,
+    const result = executionRecord(await broker.request("ownerSelectConfig", { root: selectedRoot, databasePath,
       sha256: createHash("sha256").update(selectedContent).digest("hex"), teamId: team }))
     assert.equal(result.inboxState, state)
   }
