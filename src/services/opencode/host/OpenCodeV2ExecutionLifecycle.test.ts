@@ -9,7 +9,8 @@ const broker = {
   close: async () => undefined,
   ended: () => false,
 }
-mock.module('./windows/OpenCodeV2WindowsNativeBroker.js', () => ({
+const isolatedBirthProbe = process.env.TEST_OPENCODE_WINDOWS_BIRTH_ISOLATED === '1'
+if (isolatedBirthProbe) mock.module('./windows/OpenCodeV2WindowsNativeBroker.js', () => ({
   createWindowsNativeBroker: () => broker,
   resolveWindowsNativeArtifact: async () => ({ path: 'C:\\\\TEST\\\\helper.exe', sha256: 'a'.repeat(64), arch: 'x64' }),
   resolveWindowsRealpathArtifact: async () => ({ path: 'C:\\\\TEST\\\\realpath.dll', sha256: 'b'.repeat(64), arch: 'x64' }),
@@ -18,6 +19,16 @@ mock.module('./windows/OpenCodeV2WindowsNativeBroker.js', () => ({
 const { isExecutionCleanupReceipt, retireExecutionChild } = await import('./OpenCodeV2ExecutionLifecycle.js')
 const { createWindowsCommandRequestReplay, windowsBirth } = await import('./windows/OpenCodeV2WindowsExecution.js')
 const { readExecutionBirth } = await import('./OpenCodeV2ExecutionBinding.js')
+
+async function runIsolatedBirthProbe(name: string): Promise<void> {
+  const child = Bun.spawn([process.execPath, 'test', import.meta.path, '--test-name-pattern', name], {
+    env: { ...process.env, TEST_OPENCODE_WINDOWS_BIRTH_ISOLATED: '1' }, stdout: 'pipe', stderr: 'pipe',
+  })
+  try {
+    const [stdout, stderr, exit] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited])
+    expect({ exit, output: exit === 0 ? '' : stdout + stderr }).toEqual({ exit: 0, output: '' })
+  } finally { if (child.exitCode === null) child.kill(); await child.exited }
+}
 
 const birth = { format: 'darwin-pidversion' as const, value: '123:4', bootId: '11111111-1111-1111-1111-111111111111' }
 function retirement(work: Promise<unknown>): ExecutionRetirementPort {
@@ -45,6 +56,7 @@ test('hung native retirement is bounded and remains unknown', async () => {
 }, process.platform === 'darwin' ? 18_000 : 6000)
 
 test('Windows birth uses positive native exit evidence and keeps missing PIDs fail-closed', async () => {
+  if (!isolatedBirthProbe) return runIsolatedBirthProbe('Windows birth uses positive native exit evidence')
   identityResponse = { absent: true }
   await expect(windowsBirth(73)).rejects.toThrow('execution_identity_unknown')
   identityResponse = { absent: 'true', exited: true, birth: { format: 'windows-filetime', value: '42', bootId: null } }
@@ -64,6 +76,7 @@ test('Windows birth uses positive native exit evidence and keeps missing PIDs fa
 })
 
 test('the common birth reader dispatches Windows to the native FILETIME reader', async () => {
+  if (!isolatedBirthProbe) return runIsolatedBirthProbe('the common birth reader dispatches Windows')
   const descriptor = Object.getOwnPropertyDescriptor(process, 'platform')!
   identityResponse = { exited: false, birth: { format: 'windows-filetime', value: '77', bootId: null } }
   Object.defineProperty(process, 'platform', { value: 'win32' })
