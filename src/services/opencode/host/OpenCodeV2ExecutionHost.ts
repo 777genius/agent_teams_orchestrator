@@ -1,4 +1,4 @@
-import { readSelectedOpenCodeV2ControllerState } from './OpenCodeV2Profile.js'
+import { assertSelectedOpenCodeV2ControllerState, deriveSelectedOpenCodeV2ControllerState } from './OpenCodeV2Profile.js'
 import path from 'node:path'
 import { randomBytes, randomUUID } from 'node:crypto'
 import { lstat, realpath } from 'node:fs/promises'
@@ -14,15 +14,18 @@ import { assertExecutionPlatformAvailable, launchExecutionPlatform, planExecutio
   type ExecutionPlatformLaunch, type ExecutionPlatformMapping } from './OpenCodeV2ExecutionPlatform.js'
 import { acquireExecutionProfileOwner } from './OpenCodeV2ExecutionOwner.js'
 import { initializeOpenCodeV2ExecutionAuth } from './OpenCodeV2ExecutionAuth.js'
-import { bindWindowsExecutionSelectedConfig, closeWindowsExecutionPlan } from './windows/OpenCodeV2WindowsExecution.js'
+import { readOpenCodeV2SelectedAuth } from './OpenCodeV2ExecutionOAuth.js'
+import { bindWindowsExecutionSelectedConfig, closeWindowsExecutionPlan, ownerFilesystemForWindowsPlan,
+  type WindowsSelectedAuthMetadata } from './windows/OpenCodeV2WindowsExecution.js'
 import { resolveOpenCodeV2DarwinControllerRuntimeClosure } from '../profile/OpenCodeV2ExecutionReceipt.js'
 import { recordOpenCodeV2ProviderFailure, type ExecutionAcquisitionPhase } from '../execution/OpenCodeV2Diagnostics.js'
 
 export type { SelectedExecutionProfile, ValidatedExecutionNative } from './OpenCodeV2ExecutionBinding.js'
-type PrivateEndpoint = Readonly<{ baseUrl: string; password: string; signal: AbortSignal; nativePID: number; fetch?: ExecutionPlatformLaunch['fetch'] }>
+type PrivateEndpointFields = { baseUrl: string; password: string; signal: AbortSignal; nativePID: number; fetch?: ExecutionPlatformLaunch['fetch']; selectedAuth?: WindowsSelectedAuthMetadata }
+type PrivateEndpoint = Readonly<PrivateEndpointFields>
 const catalogAuthorities = new WeakSet<ExecutionAuthority>()
 export function executionAuthorityIsCatalogOnly(authority: ExecutionAuthority): boolean { return catalogAuthorities.has(authority) }
-const endpoints = new WeakMap<ExecutionAuthority, PrivateEndpoint>()
+const endpoints = new WeakMap<ExecutionAuthority, PrivateEndpointFields>()
 const graphs = new WeakMap<ExecutionAuthority, ExecutionGraph>()
 const disposers = new WeakMap<ExecutionAuthority, Set<() => Promise<void>>>()
 export function requireExecutionEndpoint(authority: ExecutionAuthority): PrivateEndpoint {
@@ -140,7 +143,8 @@ export async function prepareOwnedNativeExecutionPlan(validatedNative: Validated
     }
   }
   const selectedCliRoot = await realpath(path.dirname(path.dirname(native.executablePath))); check()
-  const controllerStateRoots = await readSelectedOpenCodeV2ControllerState(profile, context); check(); progress?.('controller-prepared')
+  const controllerStateRoots = await deriveSelectedOpenCodeV2ControllerState(profile, context); check(); progress?.('controller-prepared')
+  await assertSelectedOpenCodeV2ControllerState(profile, context, controllerStateRoots); check()
   const profileDirectories = [...new Set([profile.root, profile.config.directory, path.dirname(profile.databasePath),
     ...['HOME', 'USERPROFILE', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME',
       'TMPDIR', 'TMP', 'TEMP', 'APPDATA', 'LOCALAPPDATA'].map(key => profile.env[key]!)])]
@@ -156,7 +160,7 @@ export async function prepareOwnedNativeExecutionPlan(validatedNative: Validated
     if (plan.platform === 'win32') await closeWindowsExecutionPlan(plan.concrete).catch(() => undefined)
     throw failure
   }
-  return { native, profile, entry, plan }
+  return { native, profile, entry, plan, controllerStateRoots }
 }
 
 async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative,
@@ -175,17 +179,44 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
   try { prepared = await prepareOwnedNativeExecutionPlan(validatedNative, selectedProfile, context, lifetime.signal, mark) }
   catch (failure) { await recordOpenCodeV2ProviderFailure('execution-host-startup', failure, true, undefined, timing()); throw failure }
   mark('prepared')
-  const { native, profile, entry, plan } = prepared
+  const { native, profile, entry, plan, controllerStateRoots } = prepared
   const nonce = randomUUID(), leaseOwnerId = randomUUID(), password = randomBytes(32).toString('base64url')
   const ownerIdentity = { hostInstanceId: nonce, leaseOwnerId, graphSha256: native.graph.sha256 }
   let owner: Awaited<ReturnType<typeof acquireExecutionProfileOwner>>
+  let windowsFilesystem: ReturnType<typeof ownerFilesystemForWindowsPlan> | undefined
+  let selectedAuth: WindowsSelectedAuthMetadata | undefined
+  const retainedRoots: Array<Readonly<{ assertOwned(): Promise<void>; close(): Promise<void> }>> = []
+  const closeRetainedRoots = async () => {
+    const results = await Promise.allSettled(retainedRoots.splice(0).map(root => root.close()))
+    if (results.some(result => result.status === 'rejected')) throw new Error('cleanup_unknown')
+  }
+  let planClosed = false
+  const closePlanOnce = async () => {
+    if (plan.platform === 'win32' && !planClosed) {
+      planClosed = true; await closeWindowsExecutionPlan(plan.concrete)
+    }
+  }
   try {
     check()
+    if (plan.platform === 'win32') {
+      windowsFilesystem = ownerFilesystemForWindowsPlan(plan.concrete)
+      await windowsFilesystem.validateSelectedProfile(profile.root, profile.databasePath, context.deadline, context.signal)
+      check()
+      for (const root of controllerStateRoots) {
+        const held = await windowsFilesystem.openDirectory(root, context.deadline, context.signal)
+        retainedRoots.push(held)
+        await held.assertOwned(context.deadline, context.signal)
+        check()
+      }
+    }
     owner = await acquireExecutionProfileOwner(profile, ownerIdentity,
       plan.platform === 'win32' ? { windowsPlan: plan.concrete } : undefined)
   } catch (failure) {
     await recordOpenCodeV2ProviderFailure('execution-host-startup', failure, true, undefined, timing())
-    if (plan.platform === 'win32') await closeWindowsExecutionPlan(plan.concrete).catch(() => undefined)
+    if (plan.platform === 'win32') {
+      await closeRetainedRoots().catch(() => undefined)
+      await closePlanOnce().catch(() => undefined)
+    }
     throw failure
   }
   let launch: ExecutionPlatformLaunch | undefined, child: ExecutionPlatformLaunch['child'] | undefined, authority: ExecutionAuthority | undefined
@@ -207,6 +238,8 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
     if (!birth || !mapping || !launch) {
       try { launch?.sendClose() } catch { /* Still attempt exact wrapper retirement. */ }
       try { if (launch) await boundOpenCodeRead(launch.retire(), 7000) } catch { /* Retain physical owner on uncertainty. */ }
+      await closeRetainedRoots().catch(() => undefined)
+      await closePlanOnce().catch(() => undefined)
       throw new Error('cleanup_unknown')
     }
     const receipt = await retireExecutionChild({ pid: mapping.bun.hostPID, birth, exited: () => exited,
@@ -221,7 +254,8 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
       retireOwnedDescendants: () => launch!.retire() })
     // UNKNOWN never releases the physical profile/database fence.
     await owner.release(receipt)
-    if (plan.platform === 'win32') await closeWindowsExecutionPlan(plan.concrete)
+    await closeRetainedRoots()
+    await closePlanOnce()
     return receipt
   })()
   const abort = () => { lifetime.abort(); void close().catch(() => undefined) }
@@ -233,6 +267,14 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
     if (plan.platform === 'win32') {
       await bindWindowsExecutionSelectedConfig(plan.concrete, profile, context.teamId, context.deadline, context.signal)
       check()
+      if (!('purpose' in profile.selection) && profile.authSha256 !== undefined) {
+        // This is the initial SelectedAuth qualification. It uses the live
+        // private plan broker's cached selection and local fixed auth bytes,
+        // before any owner spawn or provider/catalog connection.
+        selectedAuth = windowsFilesystem!.selectedAuthMetadata()
+        await readOpenCodeV2SelectedAuth(profile, selectedAuth, context.deadline, context.signal)
+        check()
+      }
     }
     await owner.beforeSpawn(); check()
     launch = launchExecutionPlatform(plan, nonce, leaseOwnerId, native.bun)
@@ -272,13 +314,19 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
       hostInstanceId: nonce, profileEpoch: profile.epoch, profileRoot: profile.root, directory: profile.directory, leaseOwnerId })
     if ('purpose' in profile.selection) catalogAuthorities.add(authority)
     executionAssert(process.platform !== 'win32' || typeof launch.fetch === 'function', 'execution_native_transport_unqualified')
-    const endpoint = Object.freeze({ baseUrl: row.baseUrl, password, signal: lifetime.signal, nativePID: mapping.bun.nativePID,
-      fetch: launch.fetch })
+    const endpoint: PrivateEndpointFields = { baseUrl: row.baseUrl, password, signal: lifetime.signal, nativePID: mapping.bun.nativePID,
+      fetch: launch.fetch }
     endpoints.set(authority, endpoint)
     disposers.set(authority, new Set())
     graphs.set(authority, Object.freeze({ sha256: native.graph.sha256, files: Object.freeze(native.graph.files.map(row => Object.freeze(row))) }))
     mark('ready')
     await awaitOpenCodeV2CatalogReadiness(endpoint, authority, context); mark('catalog-ready')
+    if (selectedAuth) {
+      const observed = await selectedAuth.read(context.deadline, context.signal)
+      executionAssert(observed.sha256 === profile.authSha256, 'execution_selected_auth_changed')
+      endpoint.selectedAuth = selectedAuth
+    }
+    Object.freeze(endpoint)
     if (!('purpose' in profile.selection)) {
       await initializeOpenCodeV2ExecutionAuth(authority, profile, context); mark('auth-ready')
       await awaitOpenCodeV2ExecutionReadiness(endpoint, authority, context, profile.selection); mark('selection-ready')
@@ -292,8 +340,12 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
       await recordOpenCodeV2ProviderFailure('execution-host-startup', failure, true, launch?.output?.().stderr, acquisitionTiming)
       // Once spawn is attempted even a synchronous error has no retirement
       // proof. Preserve ownership; only pre-launch cancellation may release.
-      try { await owner.abandonBeforeSpawn() } catch { throw new Error('execution_owner_unknown', { cause: failure }) }
-      if (plan.platform === 'win32') await closeWindowsExecutionPlan(plan.concrete)
+      try { await owner.abandonBeforeSpawn() } catch (ownerFailure) {
+        await closeRetainedRoots().catch(() => undefined); await closePlanOnce().catch(() => undefined)
+        throw new Error('execution_owner_unknown', { cause: ownerFailure })
+      }
+      await closeRetainedRoots().catch(() => undefined)
+      await closePlanOnce().catch(() => undefined)
       throw failure
     }
     try { await close() } catch { throw new Error('cleanup_unknown', { cause: failure }) }

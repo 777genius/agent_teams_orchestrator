@@ -3,9 +3,9 @@ import { lstat, realpath } from 'node:fs/promises'
 import { executionAssert, executionRecord, type ExecutionContext } from '../execution/OpenCodeV2ExecutionContracts.js'
 import type { OwnedNativeProfile } from './OpenCodeV2ExecutionBinding.js'
 
-/** Only the SDK-selected controller's exact owned TEST team/tasks directories.
- * This is derived from the production selected config, never a public mount DTO. */
-export async function readSelectedOpenCodeV2ControllerState(profile: OwnedNativeProfile, context: ExecutionContext): Promise<readonly string[]> {
+/** Derive the selected controller's candidate roots from the production config.
+ * These are paths only: native ownership qualification is a separate boundary. */
+export async function deriveSelectedOpenCodeV2ControllerState(profile: OwnedNativeProfile, context: ExecutionContext): Promise<readonly string[]> {
   const document = executionRecord(JSON.parse(profile.config.content))
   if (document.mcp === undefined) return []
   const servers = executionRecord(executionRecord(document.mcp).servers)
@@ -23,8 +23,26 @@ export async function readSelectedOpenCodeV2ControllerState(profile: OwnedNative
   const roots = [path.join(claudeDir, 'teams', context.teamId), path.join(claudeDir, 'tasks', context.teamId)]
   for (const root of roots) {
     const stat = await lstat(root)
-    executionAssert(await realpath(root) === root && stat.isDirectory() && !stat.isSymbolicLink() &&
-      stat.uid === process.getuid?.(), 'controller_state_unowned')
+    executionAssert(await realpath(root) === root && stat.isDirectory() && !stat.isSymbolicLink(), 'controller_state_unowned')
   }
   return Object.freeze(roots)
+}
+
+/** POSIX keeps its existing uid qualification. Windows uses native metadata
+ * from the same private broker instead of a profile DTO or POSIX mode. */
+export async function assertSelectedOpenCodeV2ControllerState(profile: OwnedNativeProfile, context: ExecutionContext,
+  candidates?: readonly string[]): Promise<void> {
+  const roots = candidates ?? await deriveSelectedOpenCodeV2ControllerState(profile, context)
+  if (process.platform === 'win32') return
+  for (const root of roots) {
+    const stat = await lstat(root)
+    executionAssert(stat.uid === process.getuid?.(), 'controller_state_unowned')
+  }
+}
+
+/** Compatibility entry point preserves the original POSIX caller contract. */
+export async function readSelectedOpenCodeV2ControllerState(profile: OwnedNativeProfile, context: ExecutionContext): Promise<readonly string[]> {
+  const roots = await deriveSelectedOpenCodeV2ControllerState(profile, context)
+  await assertSelectedOpenCodeV2ControllerState(profile, context, roots)
+  return roots
 }

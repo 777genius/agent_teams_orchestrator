@@ -9,23 +9,37 @@ import type { ExecutionGraph, OwnedNativeProfile } from './OpenCodeV2ExecutionBi
 type SelectedCredential = Readonly<{ type: 'api'; key: string }> | Readonly<{
   type: 'oauth'; access: string; refresh: string; expires: number; accountId?: string; enterpriseUrl?: string
 }>
+export type SelectedAuthMetadata = Readonly<{
+  read(deadline: number, signal?: AbortSignal): Promise<Readonly<{ sha256: string; bytes: number }>>
+}>
 
 /** Both the parent admission guard and sealed child consume the same bound file. */
-export async function readOpenCodeV2SelectedAuth(profile: OwnedNativeProfile) {
+export async function readOpenCodeV2SelectedAuth(profile: OwnedNativeProfile,
+  metadata?: SelectedAuthMetadata, deadline = Date.now() + 15_000, signal?: AbortSignal) {
   executionAssert(!('purpose' in profile.selection), 'execution_selected_auth_required')
   const providerId = profile.selection.model.providerID
   const file = path.join(profile.root, 'data/opencode/auth.json'), fingerprint = profile.authSha256
   executionAssert(typeof fingerprint === 'string' && /^[a-f0-9]{64}$/.test(fingerprint), 'execution_selected_auth_unbound')
   const check = async () => {
+    signal?.throwIfAborted()
+    executionAssert(Number.isFinite(deadline) && deadline > Date.now(), 'execution_timeout')
     const stat = await lstat(file)
-    executionAssert(stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1 && stat.uid === process.getuid?.() &&
-      (stat.mode & 0o077) === 0 && stat.size <= 128 * 1024 && await realpath(file) === file &&
-      await hashOpenCodeFile(file) === fingerprint, 'execution_selected_auth_changed')
+    executionAssert(stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1 &&
+      (process.platform === 'win32' || stat.uid === process.getuid?.()) &&
+      (process.platform === 'win32' || (stat.mode & 0o077) === 0) && stat.size <= 128 * 1024 &&
+      await realpath(file) === file && await hashOpenCodeFile(file) === fingerprint, 'execution_selected_auth_changed')
+    if (metadata) {
+      const observed = await metadata.read(deadline, signal)
+      executionAssert(observed.sha256 === fingerprint && observed.bytes === stat.size, 'execution_selected_auth_changed')
+    }
   }
+  if (process.platform === 'win32') executionAssert(metadata, 'execution_selected_auth_metadata_required')
   await check()
   const bytes = await readFile(file)
   executionAssert(createHash('sha256').update(bytes).digest('hex') === fingerprint, 'execution_selected_auth_changed')
-  const store = executionRecord(JSON.parse(bytes.toString('utf8')))
+  let store: Record<string, unknown>
+  try { store = executionRecord(JSON.parse(bytes.toString('utf8'))) }
+  catch { throw new Error('execution_selected_auth_unsupported') }
   executionAssert(Object.keys(store).length === 1 && Object.hasOwn(store, providerId), 'execution_selected_auth_missing')
   const row = executionRecord(store[providerId])
   let credential: SelectedCredential
@@ -44,6 +58,7 @@ export async function readOpenCodeV2SelectedAuth(profile: OwnedNativeProfile) {
       ...(typeof row.accountId === 'string' ? { accountId: row.accountId } : {}),
       ...(typeof row.enterpriseUrl === 'string' ? { enterpriseUrl: row.enterpriseUrl } : {}) }
   }
+  await check()
   return { file, credential, check }
 }
 
@@ -52,9 +67,24 @@ export async function readOpenCodeV2SelectedAuth(profile: OwnedNativeProfile) {
 export async function importOpenCodeV2SelectedOAuth(profile: OwnedNativeProfile, graph: ExecutionGraph,
   modulePath: string, effect: typeof import('effect'), signal?: AbortSignal): Promise<void> {
   if ('purpose' in profile.selection || profile.authSha256 === undefined) return
+  if (process.platform === 'win32') {
+    // SHA-only native metadata cannot authorize the POSIX-only migration.
+    // Classify the bound store without returning or persisting credential bytes.
+    const file = path.join(profile.root, 'data/opencode/auth.json')
+    const bytes = await readFile(file)
+    executionAssert(createHash('sha256').update(bytes).digest('hex') === profile.authSha256, 'execution_selected_auth_changed')
+    let store: Record<string, unknown>
+    try { store = executionRecord(JSON.parse(bytes.toString('utf8'))) }
+    catch { throw new Error('execution_selected_auth_unsupported') }
+    const providerId = profile.selection.model.providerID
+    executionAssert(Object.keys(store).length === 1 && Object.hasOwn(store, providerId), 'execution_selected_auth_missing')
+    const row = executionRecord(store[providerId])
+    if (row.type === 'oauth') throw new Error('execution_selected_oauth_windows_unqualified')
+    executionAssert(row.type === 'api' && typeof row.key === 'string' && row.key.length > 0, 'execution_selected_auth_unsupported')
+    return
+  }
   const selected = await readOpenCodeV2SelectedAuth(profile)
   if (selected.credential.type === 'api') return
-  executionAssert(process.platform !== 'win32', 'execution_selected_oauth_windows_unqualified')
   executionAssert(profile.databasePath.startsWith(profile.root + path.sep) &&
     await realpath(path.dirname(profile.databasePath)) === path.dirname(profile.databasePath), 'execution_profile_changed')
   const parent = await lstat(path.dirname(profile.databasePath))

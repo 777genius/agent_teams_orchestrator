@@ -10,6 +10,7 @@ import type { ExecutionGraph, SelectedExecutionProfile } from './OpenCodeV2Execu
 import type { ExecutionAuthority } from '../execution/OpenCodeV2ExecutionContracts.js'
 import { attachOpenCodeV2SelectedKey, initializeOpenCodeV2ExecutionAuth } from './OpenCodeV2ExecutionAuth.js'
 import { importOpenCodeV2SelectedOAuth } from './OpenCodeV2ExecutionOAuth.js'
+import { createWindowsOwnerFilesystem, type WindowsOwnerNativeRequest } from './windows/OpenCodeV2WindowsOwnerFilesystem.js'
 
 const legacy = { type: 'oauth', access: 'TEST-DUMMY-ACCESS', refresh: 'TEST-DUMMY-REFRESH', expires: 4_000_000_000_000,
   accountId: 'TEST-DUMMY-ACCOUNT', enterpriseUrl: 'https://TEST.invalid' }
@@ -202,7 +203,9 @@ test('initial auth waits for the pin-specific native activation barrier before r
     child: { pid: 1, birth: { format: 'utc-ms', value: '1', bootId: null }, executablePath: '/TEST-bun', sha256: 'c'.repeat(64) },
     hostInstanceId: 'TEST-host', profileRoot: f.profile.root, profileEpoch: f.profile.epoch,
     directory: f.profile.directory, leaseOwnerId: 'TEST-owner' }
-  mock.module(pathToFileURL(import.meta.dir + '/OpenCodeV2ExecutionHost.ts').href, () => ({
+  const hostModuleUrl = pathToFileURL(import.meta.dir + '/OpenCodeV2ExecutionHost.ts').href
+  const originalHostModule = await import(hostModuleUrl)
+  mock.module(hostModuleUrl, () => ({
     requireExecutionEndpoint: () => endpoint,
     registerExecutionDisposer: () => { disposers++; return () => { disposers-- } },
   }))
@@ -215,5 +218,166 @@ test('initial auth waits for the pin-specific native activation barrier before r
     release.resolve(); await work
     expect(calls).toEqual([expectedBarrier, 'GET /api/provider', 'GET /api/integration/openai', 'GET /api/model'])
     expect(disposers).toBe(0)
-  } finally { release.resolve(); await work?.catch(() => undefined); await f.remove() }
+  } finally {
+    release.resolve()
+    await work?.catch(() => undefined)
+    mock.module(hostModuleUrl, () => originalHostModule)
+    await f.remove()
+  }
 }, 15_000)
+
+test('native ProbeRecord metadata accepts only canonical JSON bytes and exact held identities', async () => {
+  const originalPlatform = process.platform
+  const directoryIdentity = { volumeSerial: '1', fileId: 'a'.repeat(32), ownerSid: 'S-1-5-21-1' }
+  const fileIdentity = { volumeSerial: '1', fileId: 'b'.repeat(32), ownerSid: 'S-1-5-21-1' }
+  const base = () => ({
+    schema: 1, ok: true, purpose: 'ProbeRecord', path: 'C:\\TEST\\held\\probe.json',
+    directoryIdentity: { ...directoryIdentity }, fileIdentity: { ...fileIdentity },
+    bytes: 11, privateAcl: true, reparse: false, links: 1,
+    bytesBase64: Buffer.from('{"ok":true}').toString('base64'),
+  })
+  const cases: Array<[string, (row: Record<string, unknown>) => void]> = [
+    ['private ACL', row => { row.privateAcl = false }],
+    ['reparse', row => { row.reparse = true }],
+    ['link count', row => { row.links = 2 }],
+    ['byte count', row => { row.bytes = 10 }],
+    ['non-canonical base64', row => { row.bytesBase64 = String(row.bytesBase64) + '=' }],
+    ['fatal UTF-8', row => { row.bytesBase64 = Buffer.from([0xff]).toString('base64'); row.bytes = 1 }],
+    ['JSON array', row => { row.bytesBase64 = Buffer.from('[]').toString('base64'); row.bytes = 2 }],
+    ['directory identity', row => { row.directoryIdentity = { ...directoryIdentity, fileId: 'c'.repeat(32) } }],
+    ['file identity keys', row => { row.fileIdentity = { ...fileIdentity, extra: 1 } }],
+    ['payload field', row => { row.absent = false }],
+  ]
+  Object.defineProperty(process, 'platform', { value: 'win32', configurable: true })
+  try {
+    for (const [label, change] of cases) {
+      const metadata = base() as Record<string, unknown>
+      change(metadata)
+      const native = async (request: WindowsOwnerNativeRequest): Promise<unknown> => {
+        if (request.op === 'ownerOpenDirectory') return { schema: 1, ok: true, path: request.path, directory: true,
+          reparse: false, privateAcl: true, identity: directoryIdentity, handleId: 'TEST-held' }
+        if (request.op === 'ownerAssertDirectory') return { schema: 1, ok: true, path: request.path, directory: true,
+          reparse: false, privateAcl: true, identity: directoryIdentity }
+        if (request.op === 'ownerReadMetadata') return metadata
+        if (request.op === 'ownerCloseDirectory') return { schema: 1, ok: true, closed: true }
+        throw new Error('TEST-unexpected-native-request')
+      }
+      const filesystem = createWindowsOwnerFilesystem(native)
+      const directory = await filesystem.openDirectory('C:\\TEST\\held')
+      await expect(directory.readMetadata('ProbeRecord', Date.now() + 1000)).rejects.toThrow('execution_owner_unknown')
+      await directory.close()
+      expect(label).toBeTruthy()
+    }
+  } finally {
+    await Promise.resolve()
+    Object.defineProperty(process, 'platform', { value: originalPlatform, configurable: true })
+  }
+})
+
+test('SelectedAuth metadata is fixed to the selected root and refuses payload or selection-id echoes', async () => {
+  const originalPlatform = process.platform
+  const rootIdentity = { volumeSerial: '2', fileId: 'd'.repeat(32), ownerSid: 'S-1-5-21-2' }
+  const parentIdentity = { volumeSerial: '2', fileId: 'e'.repeat(32), ownerSid: 'S-1-5-21-2' }
+  const directoryIdentity = { volumeSerial: '2', fileId: 'f'.repeat(32), ownerSid: 'S-1-5-21-2' }
+  const fileIdentity = { volumeSerial: '2', fileId: '1'.repeat(32), ownerSid: 'S-1-5-21-2' }
+  let metadata: Record<string, unknown> = {
+    schema: 1, ok: true, purpose: 'SelectedAuth', path: 'C:\\TEST\\data\\opencode\\auth.json',
+    directoryIdentity, fileIdentity, bytes: 2, privateAcl: true, reparse: false, links: 1,
+    rootIdentity, sha256: 'a'.repeat(64),
+  }
+  const requests: WindowsOwnerNativeRequest[] = []
+  Object.defineProperty(process, 'platform', { value: 'win32', configurable: true })
+  try {
+    const native = async (request: WindowsOwnerNativeRequest): Promise<unknown> => {
+      requests.push(request)
+      if (request.op === 'ownerValidateSelectedProfile') return { schema: 1, ok: true, root: request.root,
+        databasePath: request.databasePath, privateAcl: true, reparse: false, filesystem: 'NTFS',
+        rootIdentity, parentIdentity, databaseIdentity: null }
+      if (request.op === 'ownerReadMetadata') return metadata
+      throw new Error('TEST-unexpected-native-request')
+    }
+    const filesystem = createWindowsOwnerFilesystem(native, ['C:\\TEST'])
+    await filesystem.validateSelectedProfile('C:\\TEST', 'C:\\TEST\\data\\opencode\\opencode.db')
+    await expect(filesystem.readSelectedAuthMetadata('7', Date.now() + 1000)).resolves.toMatchObject({ sha256: 'a'.repeat(64) })
+    expect(requests.at(-1)).toEqual({ op: 'ownerReadMetadata', purpose: 'SelectedAuth', selectionId: '7' })
+    metadata = { ...metadata, selectionId: '7' }
+    await expect(filesystem.readSelectedAuthMetadata('7', Date.now() + 1000)).rejects.toThrow('execution_owner_unknown')
+    metadata = { ...metadata, selectionId: undefined, bytesBase64: Buffer.from('secret').toString('base64') }
+    await expect(filesystem.readSelectedAuthMetadata('7', Date.now() + 1000)).rejects.toThrow('execution_owner_unknown')
+  } finally {
+    await Promise.resolve()
+    Object.defineProperty(process, 'platform', { value: originalPlatform, configurable: true })
+  }
+})
+
+test('selected auth SHA metadata gates consumption and never leaks credential fragments', async () => {
+  const f = await fixture()
+  let providerCalls = 0, connectCalls = 0
+  const port = {
+    providers: async () => { providerCalls++; throw new Error('TEST-connect-before-qualification') },
+    integration: async () => { throw new Error('TEST-connect-before-qualification') },
+    models: async () => { throw new Error('TEST-connect-before-qualification') },
+    connect: async () => { connectCalls++ },
+  }
+  try {
+    let message = ''
+    try {
+      await attachOpenCodeV2SelectedKey(f.profile, port, {
+        metadata: { read: async () => ({ sha256: digest(f.content), bytes: f.content.length + 1 }) }, deadline: Date.now() + 1000,
+      })
+    } catch (error) { message = error instanceof Error ? error.message : String(error) }
+    expect(message).toBe('execution_selected_auth_changed')
+    expect(message).not.toContain('TEST-DUMMY-ACCESS')
+    expect(providerCalls).toBe(0)
+    expect(connectCalls).toBe(0)
+
+    await writeFile(f.auth, `${f.content}TEST-LOCAL-CHANGE`)
+    await expect(attachOpenCodeV2SelectedKey(f.profile, port, {
+      metadata: { read: async () => ({ sha256: digest(f.content), bytes: f.content.length }) }, deadline: Date.now() + 1000,
+    })).rejects.toThrow('execution_selected_auth_changed')
+    expect(providerCalls).toBe(0)
+    expect(connectCalls).toBe(0)
+
+    const apiContent = JSON.stringify({ openai: { type: 'api', key: 'TEST-DUMMY-KEY' } })
+    await writeFile(f.auth, apiContent)
+    const profile = { ...f.profile, authSha256: digest(apiContent) }
+    let connected: Record<string, unknown> | null = null, integrationCalls = 0, metadataCalls = 0
+    await attachOpenCodeV2SelectedKey(profile, {
+      providers: async () => ({ location: { directory: profile.directory }, data: [{ id: 'openai', integrationID: 'openai', activation: 'enabled' }] }),
+      integration: async () => {
+        integrationCalls++
+        return { location: { directory: profile.directory }, data: {
+          id: 'openai', methods: [{ type: 'key' }], connections: connected ? [connected] : [],
+        } }
+      },
+      connect: async (_id, key) => {
+        expect(key).toBe('TEST-DUMMY-KEY')
+        expect(connected).toBeNull()
+        connected = { type: 'credential', id: 'cred_TESTselected' }
+        connectCalls++
+      },
+    }, { metadata: { read: async () => {
+      metadataCalls++
+      return { sha256: digest(apiContent), bytes: apiContent.length }
+    } }, deadline: Date.now() + 1000 })
+    expect(connectCalls).toBe(1)
+    expect(integrationCalls).toBe(2)
+    expect(metadataCalls).toBeGreaterThanOrEqual(4)
+
+    connected = null
+    let freshnessMetadataCalls = 0
+    await expect(attachOpenCodeV2SelectedKey(profile, {
+      providers: async () => ({ location: { directory: profile.directory }, data: [{ id: 'openai', integrationID: 'openai', activation: 'enabled' }] }),
+      integration: async () => ({ location: { directory: profile.directory }, data: {
+        id: 'openai', methods: [{ type: 'key' }], connections: connected ? [connected] : [],
+      } }),
+      connect: async () => { connected = { type: 'credential', id: 'cred_TESTunexpected' }; connectCalls++ },
+    }, { metadata: { read: async () => {
+      freshnessMetadataCalls++
+      return freshnessMetadataCalls < 3
+        ? { sha256: digest(apiContent), bytes: apiContent.length }
+        : { sha256: digest(apiContent), bytes: apiContent.length + 1 }
+    } }, deadline: Date.now() + 1000 })).rejects.toThrow('execution_selected_auth_changed')
+    expect(connectCalls).toBe(1)
+  } finally { await f.remove() }
+})

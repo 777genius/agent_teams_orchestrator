@@ -22,6 +22,9 @@ export type WindowsRealpathDllReceipt = Readonly<{ receiptId: string; nonce: str
 export type WindowsExecutionMapping = Readonly<{ bun: WindowsExecutionIdentity; supervisor: WindowsExecutionIdentity; namespace: Readonly<{ name: string }>; containerSid: string; leaseOwnerId: string; realpathAnchors: WindowsRealpathAnchorReceipt; realpathDll: WindowsRealpathDllReceipt }>
 export type WindowsKernelRetirement = Readonly<{ pid: number; birth: ExecutionBirth; scopeClosed: boolean; mapping: WindowsExecutionMapping; activeProcesses: 0; heldProcessExited: true; ownAcesRemoved: true }>
 export type WindowsLaunchPlan = Readonly<{ helper: WindowsNativeArtifact; realpathDll: WindowsRealpathArtifact; executable: string; entry: string; cwd: string; writableRoots: readonly string[]; readOnlyRoots: readonly string[]; protectedRoots: readonly string[]; profileDirectories: readonly string[]; env: Readonly<Record<string, string>> }>
+export type WindowsSelectedAuthMetadata = Readonly<{
+  read(deadline: number, signal?: AbortSignal): Promise<Readonly<{ sha256: string; bytes: number }>>
+}>
 const plans = new WeakSet<WindowsLaunchPlan>(), mappings = new WeakSet<WindowsExecutionMapping>(), retirements = new WeakSet<WindowsKernelRetirement>()
 const selectedConfigs = new WeakMap<WindowsLaunchPlan, string>(), selectingConfigs = new WeakSet<WindowsLaunchPlan>()
 const brokers = new WeakMap<WindowsLaunchPlan, WindowsNativeBroker>(), binaries = new WeakMap<WindowsLaunchPlan, Readonly<{ path: string; sha256: string }>>()
@@ -161,7 +164,20 @@ export async function closeWindowsExecutionPlan(plan: WindowsLaunchPlan): Promis
 }
 export function ownerFilesystemForWindowsPlan(plan: WindowsLaunchPlan) {
   assert(plans.has(plan)); const broker = brokers.get(plan); assert(broker && !broker.ended(), 'execution_owner_unknown')
-  return createWindowsOwnerFilesystem(request => broker.request(request.op, request), plan.profileDirectories)
+  const filesystem = createWindowsOwnerFilesystem((request, deadline, signal) =>
+    broker.request(request.op, request, deadline, signal), plan.profileDirectories)
+  const { readSelectedAuthMetadata: readSelected, ...owned } = filesystem
+  return Object.freeze({
+    ...owned,
+    selectedAuthMetadata(): WindowsSelectedAuthMetadata {
+      const selectionId = selectedConfigs.get(plan)
+      assert(selectionId && brokers.get(plan) === broker && !broker.ended(), 'execution_owner_unknown')
+      return Object.freeze({ read: (deadline, signal) => {
+        assert(selectedConfigs.get(plan) === selectionId && brokers.get(plan) === broker && !broker.ended(), 'execution_owner_unknown')
+        return readSelected(selectionId, deadline, signal).then(({ sha256, bytes }) => Object.freeze({ sha256, bytes }))
+      } })
+    },
+  })
 }
 /** Root composition calls this after native selected-profile validation and
  * fence acquisition, before launch. The private plan/cache admits the exact

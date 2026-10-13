@@ -4,7 +4,7 @@ import { executionAssert, executionRecord, type ExecutionAuthority, type Executi
 import { OpenCodeV2ProviderWire } from '../transport/OpenCodeV2ProviderWire.js'
 import { requireExecutionEndpoint, registerExecutionDisposer } from './OpenCodeV2ExecutionHost.js'
 import type { OwnedNativeProfile } from './OpenCodeV2ExecutionBinding.js'
-import { readOpenCodeV2SelectedAuth } from './OpenCodeV2ExecutionOAuth.js'
+import { readOpenCodeV2SelectedAuth, type SelectedAuthMetadata } from './OpenCodeV2ExecutionOAuth.js'
 
 type SelectedKeyPort = {
   providers(): Promise<unknown>; integration(id: string): Promise<unknown>
@@ -14,7 +14,8 @@ type SelectedKeyPort = {
 
 /** Fresh native databases bootstrap their schema without running the legacy auth migration.
  * Attach sealed keys through the API; read back OAuth imported by the sealed child. */
-export async function attachOpenCodeV2SelectedKey(profile: OwnedNativeProfile, port: SelectedKeyPort): Promise<void> {
+export async function attachOpenCodeV2SelectedKey(profile: OwnedNativeProfile, port: SelectedKeyPort,
+  auth?: Readonly<{ metadata?: SelectedAuthMetadata; deadline: number; signal?: AbortSignal }>): Promise<void> {
   executionAssert(!('purpose' in profile.selection), 'execution_selected_auth_required')
   const selectedModel = profile.selection.model
   const providerId = selectedModel.providerID
@@ -48,7 +49,8 @@ export async function attachOpenCodeV2SelectedKey(profile: OwnedNativeProfile, p
       }), 'execution_selected_auth_anonymous_unproven')
     return
   }
-  const { credential, check } = await readOpenCodeV2SelectedAuth(profile)
+  const { credential, check } = await readOpenCodeV2SelectedAuth(profile, auth?.metadata,
+    auth?.deadline ?? Date.now() + 15_000, auth?.signal)
   const scoped = (value: unknown) => {
     const row = executionRecord(value)
     executionAssert(executionRecord(row.location).directory === profile.directory, 'execution_selected_auth_location_changed')
@@ -124,6 +126,6 @@ export async function initializeOpenCodeV2ExecutionAuth(authority: ExecutionAuth
       models: () => sdk.model.list({ location }),
       integration: integrationID => sdk.integration.get({ location, integrationID }),
       connect: (integrationID, key) => sdk.integration.connect.key({ location, integrationID, key }),
-    })
+    }, { metadata: endpoint.selectedAuth, deadline: context.deadline, signal: context.signal })
   } finally { await wire.dispose(); unregister() }
 }
