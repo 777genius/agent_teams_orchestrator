@@ -96,7 +96,10 @@ if (require.main === module) {
 
   if (args[0] === '--version') {
     write('1.18.34');
-    process.exit(0);
+    // This success fixture must remain alive for the asynchronous native birth
+    // lookup. Fast unanchored exits are covered by the helper-budget tests.
+    setTimeout(() => process.exit(0), 1000);
+    return;
   }
 
   if (args[0] === 'providers' && args[1] === 'list') {
