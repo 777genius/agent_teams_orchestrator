@@ -1,7 +1,9 @@
 #pragma once
 
 #include <bcrypt.h>
+#include <algorithm>
 #include <array>
+#include <map>
 #include <mutex>
 #include <vector>
 
@@ -21,11 +23,13 @@ struct WindowsNativeRunState {
     return poisoned_;
   }
 
-  void reserve(const JsonObject &binding, const std::wstring &sourceSha256) {
+  void reserve(const JsonObject &binding, const std::wstring &sourceSha256,
+               const JsonObject *cohort = nullptr) {
     std::lock_guard<std::mutex> lock(mutex_);
     require(!poisoned_ && !reserved_ && !endpointSealed_, "run_state_unknown");
     try {
-      const std::string canonical = runStateStartBytes(binding, sourceSha256) + "\n";
+      if (cohort) runStateValidateCohortLocked(*cohort);
+      const std::string canonical = runStateStartBytes(binding, sourceSha256, cohort) + "\n";
       const std::vector<BYTE> start(canonical.begin(), canonical.end());
       runStateWriteExclusive(L"start.json", start);
       std::vector<BYTE> challenge(32);
@@ -36,6 +40,8 @@ struct WindowsNativeRunState {
       challenge_ = std::move(challenge);
       binding_ = binding;
       sourceSha256_ = sourceSha256;
+      cohort_ = cohort ? *cohort : JsonObject();
+      cohortSealed_ = cohort != nullptr;
       reserved_ = true;
     } catch (...) {
       poisoned_ = true;
@@ -43,17 +49,21 @@ struct WindowsNativeRunState {
     }
   }
 
-  void discover(const JsonObject &binding, const std::wstring &sourceSha256) {
+  void discover(const JsonObject &binding, const std::wstring &sourceSha256,
+                const JsonObject *cohort = nullptr) {
     std::lock_guard<std::mutex> lock(mutex_);
     require(!poisoned_ && !reserved_ && !endpointSealed_, "run_state_unknown");
     const auto start = runStateReadLocked(L"start.json", 512 * 1024);
-    const std::string expected = runStateStartBytes(binding, sourceSha256);
+    if (cohort) runStateValidateCohortLocked(*cohort);
+    const std::string expected = runStateStartBytes(binding, sourceSha256, cohort);
     require(std::string(start.begin(), start.end()) == expected + "\n", "run_state_start_changed");
     try {
       challenge_ = runStateReadLocked(L"challenge", 32);
       require(challenge_.size() == 32, "run_state_challenge_changed");
       binding_ = binding;
       sourceSha256_ = sourceSha256;
+      cohort_ = cohort ? *cohort : JsonObject();
+      cohortSealed_ = cohort != nullptr;
       reserved_ = true;
     } catch (...) {
       poisoned_ = true;
@@ -78,6 +88,18 @@ struct WindowsNativeRunState {
       require(challenge_.size() == 32, "run_state_challenge_changed");
       binding_ = binding;
       sourceSha256_ = sourceSha256;
+      if (value.HasKey(L"cohort")) {
+        runStateExactObject(value, {L"binding", L"sourceSha256", L"cohort"},
+                            "run_state_start_changed");
+        cohort_ = object(value, L"cohort");
+        runStateValidateCohortLocked(cohort_);
+        cohortSealed_ = true;
+      } else {
+        runStateExactObject(value, {L"binding", L"sourceSha256"},
+                            "run_state_start_changed");
+        cohort_ = JsonObject();
+        cohortSealed_ = false;
+      }
       reserved_ = true;
     } catch (...) {
       poisoned_ = true;
@@ -108,6 +130,47 @@ struct WindowsNativeRunState {
     std::lock_guard<std::mutex> lock(mutex_);
     require(!poisoned_ && reserved_, "run_state_unknown");
     return sourceSha256_;
+  }
+
+  JsonObject cohort() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    require(!poisoned_ && reserved_ && cohortSealed_, "run_state_start_changed");
+    return cohort_;
+  }
+
+  bool cohortSealed() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return !poisoned_ && reserved_ && cohortSealed_;
+  }
+
+  JsonObject memberPreflightWitness() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    require(!poisoned_ && reserved_ && endpointSealed_, "run_state_endpoint_missing");
+    runStateVerifyHeldLocked();
+    runStateValidateEndpointLocked(endpointRecord_);
+    const auto start = runStateReadLocked(L"start.json", 512 * 1024);
+    const std::string expected = runStateStartBytes(binding_, sourceSha256_,
+                                                     cohortSealed_ ? &cohort_ : nullptr);
+    require(std::string(start.begin(), start.end()) == expected + "\n",
+            "run_state_start_changed");
+    const auto challenge = runStateReadLocked(L"challenge", 32);
+    require(challenge == challenge_, "run_state_challenge_changed");
+    runStateVerifyHeldLocked();
+    JsonObject result;
+    result.SetNamedValue(L"endpoint", endpointRecord_);
+    result.SetNamedValue(
+        L"startBytes",
+        JsonValue::CreateStringValue(wide(std::string(start.begin(), start.end()))));
+    return result;
+  }
+
+  void consumeMemberPreflight(const std::wstring &launchNonce) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    require(!poisoned_ && reserved_ && endpointSealed_ && cohortSealed_ &&
+                !memberPreflightConsumed_ && launchNonce.size() == 36,
+            "run_state_start_changed");
+    memberPreflightConsumed_ = true;
+    memberPreflightNonce_ = launchNonce;
   }
 
   void write(const std::wstring &name, const std::vector<BYTE> &bytes) {
@@ -417,15 +480,89 @@ private:
   }
 
   static std::string runStateStartBytes(const JsonObject &binding,
-                                        const std::wstring &sourceSha256) {
+                                        const std::wstring &sourceSha256,
+                                        const JsonObject *cohort = nullptr) {
     const auto controller = narrow(text(binding, L"controllerInstanceId"));
     const auto owner = narrow(text(binding, L"ownerId"));
     const auto run = narrow(text(binding, L"runId"));
     const auto team = narrow(text(binding, L"teamId"));
-    return "{\"binding\":{\"controllerInstanceId\":\"" + controller +
+    std::string result = "{\"binding\":{\"controllerInstanceId\":\"" + controller +
            "\",\"ownerId\":\"" + owner + "\",\"runId\":\"" + run +
            "\",\"teamId\":\"" + team + "\"},\"sourceSha256\":\"" +
-           narrow(sourceSha256) + "\"}";
+           narrow(sourceSha256) + "\"";
+    if (cohort) result += ",\"cohort\":" + narrow(std::wstring(cohort->Stringify()));
+    return result + "}";
+  }
+
+  static void runStateExactKeys(const JsonObject &value,
+                                const std::vector<std::wstring> &names,
+                                const char *code) {
+    size_t count = 0;
+    for (auto pair : value) {
+      const std::wstring key(pair.Key());
+      require(std::find(names.begin(), names.end(), key) != names.end(), code);
+      ++count;
+    }
+    require(count == names.size(), code);
+  }
+
+  static void runStateValidateIdentity(const JsonObject &value, const char *code) {
+    runStateExactKeys(value, {L"volumeSerial", L"fileId", L"ownerSid"}, code);
+    const auto volume = text(value, L"volumeSerial");
+    const auto file = text(value, L"fileId");
+    const auto owner = text(value, L"ownerSid");
+    require(!volume.empty() && volume.find_first_not_of(L"0123456789") == std::wstring::npos &&
+                file.size() == 32 &&
+                file.find_first_not_of(L"0123456789abcdef") == std::wstring::npos &&
+                !owner.empty() && owner.size() <= 256,
+            code);
+  }
+
+  static void runStateValidateCohortLocked(const JsonObject &cohort) {
+    runStateExactKeys(cohort, {L"version", L"selectionId", L"members"},
+                      "run_state_start_changed");
+    require(cohort.GetNamedNumber(L"version") == 1 &&
+                text(cohort, L"selectionId").size() > 0 &&
+                text(cohort, L"selectionId").size() <= 32 &&
+                text(cohort, L"selectionId").find_first_not_of(L"0123456789") ==
+                    std::wstring::npos &&
+                cohort.GetNamedValue(L"members").ValueType() == JsonValueType::Array,
+            "run_state_start_changed");
+    const auto members = cohort.GetNamedArray(L"members");
+    require(members.Size() > 0 && members.Size() <= 32, "run_state_start_changed");
+    std::map<std::wstring, std::wstring> ids, nonces;
+    for (const auto value : members) {
+      require(value.ValueType() == JsonValueType::Object, "run_state_start_changed");
+      const auto member = value.GetObject();
+      runStateExactKeys(
+          member, {L"memberId", L"launchNonce", L"profile", L"config", L"controllerRoot"},
+          "run_state_start_changed");
+      const auto memberId = text(member, L"memberId");
+      const auto nonce = text(member, L"launchNonce");
+      const bool nonceShape = nonce.size() == 36 && nonce[8] == L'-' && nonce[13] == L'-' &&
+                              nonce[18] == L'-' && nonce[23] == L'-';
+      require(memberId.size() > 0 && memberId.size() <= 64 && nonceShape &&
+                  nonce.find_first_not_of(L"0123456789abcdef-") == std::wstring::npos &&
+                  ids.emplace(memberId, nonce).second && nonces.emplace(nonce, memberId).second,
+              "run_state_start_changed");
+      const auto profile = object(member, L"profile");
+      runStateExactKeys(profile, {L"root", L"parent", L"database"}, "run_state_start_changed");
+      runStateValidateIdentity(object(profile, L"root"), "run_state_start_changed");
+      runStateValidateIdentity(object(profile, L"parent"), "run_state_start_changed");
+      runStateValidateIdentity(object(profile, L"database"), "run_state_start_changed");
+      const auto config = object(member, L"config");
+      runStateExactKeys(config, {L"identity", L"sha256"}, "run_state_start_changed");
+      runStateValidateIdentity(object(config, L"identity"), "run_state_start_changed");
+      const auto sha = text(config, L"sha256");
+      require(sha.size() == 64 &&
+                  sha.find_first_not_of(L"0123456789abcdef") == std::wstring::npos,
+              "run_state_start_changed");
+      const auto controllerRoot = member.GetNamedValue(L"controllerRoot");
+      if (controllerRoot.ValueType() == JsonValueType::Null) continue;
+      require(controllerRoot.ValueType() == JsonValueType::Object,
+              "run_state_start_changed");
+      runStateValidateIdentity(controllerRoot.GetObject(), "run_state_start_changed");
+    }
   }
 
   static bool runStateStrictUtf8(const std::string &value) {
@@ -601,6 +738,10 @@ private:
   std::wstring owner_, rootPath_, directory_, id_;
   JsonObject binding_;
   std::wstring sourceSha256_;
+  JsonObject cohort_;
+  bool cohortSealed_ = false;
+  bool memberPreflightConsumed_ = false;
+  std::wstring memberPreflightNonce_;
   std::wstring endpointHash_;
   JsonObject endpointRecord_;
   DWORD helperPid_ = 0, bunPid_ = 0;
