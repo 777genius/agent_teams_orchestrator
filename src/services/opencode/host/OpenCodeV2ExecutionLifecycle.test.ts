@@ -24,10 +24,11 @@ async function runIsolatedBirthProbe(name: string): Promise<void> {
   const child = Bun.spawn([process.execPath, 'test', import.meta.path, '--test-name-pattern', name], {
     env: { ...process.env, TEST_OPENCODE_WINDOWS_BIRTH_ISOLATED: '1' }, stdout: 'pipe', stderr: 'pipe',
   })
+  const deadline = setTimeout(() => { if (child.exitCode === null) child.kill() }, 4000)
   try {
     const [stdout, stderr, exit] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited])
     expect({ exit, output: exit === 0 ? '' : stdout + stderr }).toEqual({ exit: 0, output: '' })
-  } finally { if (child.exitCode === null) child.kill(); await child.exited }
+  } finally { clearTimeout(deadline); if (child.exitCode === null) child.kill(); await child.exited }
 }
 
 const birth = { format: 'darwin-pidversion' as const, value: '123:4', bootId: '11111111-1111-1111-1111-111111111111' }
