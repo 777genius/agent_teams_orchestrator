@@ -31,6 +31,8 @@ async function ps(script: string, extra: Record<string, string> = {}) {
 function record(value: unknown): Record<string, unknown> { assert.ok(value && typeof value === 'object' && !Array.isArray(value)); return value as Record<string, unknown> }
 const messages: Record<string, unknown>[] = []
 broker.events.on('message', value => messages.push(record(value)))
+let nativePeer: Record<string, unknown> | undefined
+broker.events.on('connected', value => { nativePeer = record(value) })
 async function until<T>(read: () => T | undefined, milliseconds = 10000): Promise<T> {
   const end = Date.now() + milliseconds
   for (;;) { const result = read(); if (result !== undefined) return result; assert.ok(Date.now() < end, `windows_command_timeout:${stage}`); await Bun.sleep(10) }
@@ -119,10 +121,14 @@ $sid
   const mapping = record(await broker.request('launch', { executable: path.join(root, 'bun.exe'), entry: path.join(root, 'main.ts'), cwd: root, env: environment, writableRoots: [root], readOnlyRoots: [], protectedRoots: [fencePath], nonce, leaseOwnerId }))
   assert.equal(mapping.containerSid, sid)
   const main = record(mapping.bun)
-  const connected = await until(() => messages.find(value => value.type === 'prepared'))
-  // Preparation is sent only once the native pipe reports its held main PID.
-  // Native event listener below measures that peer rather than a caller flag.
-  assert.equal(connected.pid, main.nativePID)
+  const connected = await until(() => nativePeer)
+  assert.equal(connected.clientPID, main.nativePID)
+  assert.deepEqual(connected, { ...mapping, clientPID: main.nativePID })
+  await broker.request('send', { value: { type: 'prepare', nonce, leaseOwnerId, birth: main.birth, namespace: mapping.namespace } })
+  const prepared = await until(() => messages.find(value => value.type === 'prepared'))
+  assert.equal(prepared.pid, main.nativePID)
+  assert.equal(prepared.nonce, nonce); assert.equal(prepared.leaseOwnerId, leaseOwnerId)
+  assert.deepEqual(prepared.birth, main.birth); assert.equal(prepared.namespace, mapping.namespace)
   stage = 'native-file-output'
   const command = await start(path.join(root, 'output.ts'), 'ignore')
   const [stdout, stderr] = await Promise.all([output(command.commandId, 'stdout'), output(command.commandId, 'stderr')])
