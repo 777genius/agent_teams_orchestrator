@@ -23,7 +23,7 @@ export type WorkSyncAdmissionCapability = {
   bootstrapRunId?: string
   runtimeRunId?: string
   pid?: number
-  nativeInboxAttachmentsVersion?: 1
+  nativeInboxAttachmentsVersion?: 1 | 2
   publishedAt: string
 }
 
@@ -60,10 +60,13 @@ export async function writeWorkSyncAdmissionCapability(
     teamsDir,
   })
   const previous = capabilityPublications.get(path)
+  const attachmentReady =
+    capability.nativeInboxAttachmentsVersion === 1 ||
+    capability.nativeInboxAttachmentsVersion === 2
   if (
     previous?.sawAttachmentReady &&
     previous.runtimeInstanceId === capability.runtimeInstanceId &&
-    capability.nativeInboxAttachmentsVersion !== 1
+    !attachmentReady
   ) {
     return path
   }
@@ -72,7 +75,7 @@ export async function writeWorkSyncAdmissionCapability(
     sawAttachmentReady:
       (previous?.runtimeInstanceId === capability.runtimeInstanceId &&
         previous.sawAttachmentReady) ||
-      capability.nativeInboxAttachmentsVersion === 1,
+      attachmentReady,
     tail: previous?.tail ?? Promise.resolve(),
   }
   capabilityPublications.set(path, state)
