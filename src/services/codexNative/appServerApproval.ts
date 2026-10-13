@@ -202,13 +202,14 @@ export function buildCodexManualTurnStartParams(options: {
   threadId: string
   prompt: string
   imagePaths?: string[]
+  input?: CodexManualTurnStartParams['input']
   cwd?: string | null
   model?: string | null
   effort?: CodexAppServerEffort | null
 }): CodexManualTurnStartParams {
   return {
     threadId: options.threadId,
-    input: [
+    input: options.input ?? [
       { type: 'text', text: options.prompt, text_elements: [] },
       ...(options.imagePaths ?? []).map(path => ({ type: 'localImage' as const, path })),
     ],

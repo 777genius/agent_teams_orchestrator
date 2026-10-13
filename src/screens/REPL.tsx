@@ -979,7 +979,7 @@ export function REPL({
       bootstrapRunId: runIdentity.bootstrapRunId,
       runtimeRunId: runIdentity.runtimeRunId,
       ...(nativeInboxAttachmentsReady
-        ? { nativeInboxAttachmentsVersion: 1 as const }
+        ? { nativeInboxAttachmentsVersion: 2 as const }
         : {}),
       ...(groupChatToolsReady ? {
         groupChatProtocolVersion: 1 as const,

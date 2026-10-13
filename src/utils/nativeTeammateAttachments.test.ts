@@ -102,6 +102,60 @@ describe('native teammate attachment content', () => {
     ])
   })
 
+  it('prepares Codex Unicode text and images in order, including BOM and empty text', async () => {
+    const text = await writeAttachment('attachment-1--note.md', Buffer.from('\uFEFFПривіт 世界'), {
+      filename: 'note.md',
+      mimeType: 'text/plain',
+    })
+    const image = await writeAttachment('attachment-2--image.png', Buffer.from('image-bytes'), {
+      id: 'attachment-2',
+    })
+    const empty = await writeAttachment('attachment-3--empty.txt', Buffer.alloc(0), {
+      id: 'attachment-3',
+      filename: 'empty.txt',
+      mimeType: 'text/plain',
+    })
+    const content: unknown = await prepareNativeAttachmentPromptContent({
+      message: { ...message, attachments: [text, image, empty] },
+      provider: 'codex',
+      replyProtocolText: 'protocol',
+      runtimeInstanceId: 'runtime-1',
+    })
+    expect(content).toEqual([
+      { type: 'text', text: 'protocol' },
+      { type: 'text', text: 'Attached file: note.md\n\nПривіт 世界' },
+      { type: 'image', source: { type: 'file', path: image.filePath, media_type: 'image/png' } },
+      { type: 'text', text: 'Attached file: empty.txt\n\n' },
+    ])
+  })
+
+  it('rejects a mixed Codex batch with malformed UTF-8, changed bytes, or non-exact text MIME', async () => {
+    const image = await writeAttachment('attachment-1--image.png', Buffer.from('image-bytes'))
+    const text = await writeAttachment('attachment-2--note.txt', Buffer.from([0xc3]), {
+      id: 'attachment-2',
+      filename: 'note.txt',
+      mimeType: 'text/plain',
+    })
+    const input = {
+      message: { ...message, attachments: [image, text] },
+      provider: 'codex' as const,
+      replyProtocolText: 'protocol',
+      runtimeInstanceId: 'runtime-1',
+    }
+    await expect(prepareNativeAttachmentPromptContent(input)).rejects.toMatchObject({
+      reasonCode: 'attachment_text_invalid_utf8',
+    })
+    await writeFile(text.filePath, Buffer.from('x'))
+    await expect(prepareNativeAttachmentPromptContent(input)).rejects.toMatchObject({
+      reasonCode: 'attachment_digest_mismatch',
+    })
+    const unsupported = { ...text, sha256: createHash('sha256').update('x').digest('hex'),
+      mimeType: 'text/plain;charset=utf-8' }
+    await expect(prepareNativeAttachmentPromptContent({
+      ...input, message: { ...message, attachments: [image, unsupported] },
+    })).rejects.toMatchObject({ reasonCode: 'attachment_type_unsupported' })
+  })
+
   it('keeps Claude text and PDF content structured', async () => {
     const text = await writeAttachment('attachment-1--note.txt', Buffer.from('hello'), {
       filename: 'note.txt',
