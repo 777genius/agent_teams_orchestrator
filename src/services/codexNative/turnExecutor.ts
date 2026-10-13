@@ -41,6 +41,7 @@ import {
 import { runCodexNativeAppServer } from './appServerRunner.js'
 import { buildCodexNativeCustomProviderConfigOverrides } from './customProviderConfigOverrides.js'
 import { buildCodexNativeLaunchConfigOverrides } from './launchConfigOverrides.js'
+import { buildCodexNativeStartupContextPrompt } from './nativeStartupContextPrompt.js'
 import {
   buildCodexNativeUserLoopbackProviderConfigOverrides,
   resolveCodexNativeUserLoopbackLaunchConfig,
@@ -644,6 +645,10 @@ export async function* executeCodexNativeTurn(
     null
 
   try {
+    const contextualPrompt = await buildCodexNativeStartupContextPrompt(
+      resolvedPrompt.text,
+      resolvedPrompt.input,
+    )
     const timeoutPolicy = resolveCodexNativeExecTimeoutPolicy(
       resolvedPrompt.text,
     )
@@ -659,7 +664,7 @@ export async function* executeCodexNativeTurn(
         ? resolveLoopbackLaunchConfig(deps)
         : EMPTY_LOOPBACK_LAUNCH_CONFIG
     const commonOptions = {
-      prompt: resolvedPrompt.text,
+      prompt: contextualPrompt.prompt,
       imagePaths: resolvedPrompt.imagePaths,
       cwd: params.cwd,
       model: params.model,
@@ -692,7 +697,7 @@ export async function* executeCodexNativeTurn(
       launchPolicy.transport === 'app-server'
         ? runAppServer({
             ...commonOptions,
-            input: resolvedPrompt.input,
+            input: contextualPrompt.input,
             loopbackOverlayToml: loopbackLaunch.overlayToml,
             requestApproval:
               params.requestApproval ??
