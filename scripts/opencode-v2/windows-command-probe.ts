@@ -32,6 +32,7 @@ function record(value: unknown): Record<string, unknown> { assert.ok(value && ty
 const messages: Record<string, unknown>[] = []
 broker.events.on('message', value => messages.push(record(value)))
 let nativePeer: Record<string, unknown> | undefined
+let originalMain: Record<string, unknown> | undefined
 broker.events.on('connected', value => { nativePeer = record(value) })
 async function until<T>(read: () => T | undefined, milliseconds = 10000): Promise<T> {
   const end = Date.now() + milliseconds
@@ -120,7 +121,7 @@ $sid
   await fence.assertOwned()
   const mapping = record(await broker.request('launch', { executable: path.join(root, 'bun.exe'), entry: path.join(root, 'main.ts'), cwd: root, env: environment, writableRoots: [root], readOnlyRoots: [], protectedRoots: [fencePath], nonce, leaseOwnerId }))
   assert.equal(mapping.containerSid, sid)
-  const main = record(mapping.bun)
+  const main = record(mapping.bun); originalMain = main
   const connected = await until(() => nativePeer)
   assert.equal(connected.clientPID, main.nativePID)
   assert.deepEqual(connected, { ...mapping, clientPID: main.nativePID })
@@ -169,7 +170,11 @@ finally {
   if (launched) {
     try {
       const receipt = record(await broker.request('retire')); assert.equal(receipt.activeProcesses, 0); assert.equal(receipt.heldProcessExited, true); assert.equal(receipt.ownAcesRemoved, true)
-      facts.retirement = receipt; retired = true
+      assert.ok(originalMain)
+      const afterMain = record(await broker.request('identity', { pid: Number(originalMain.nativePID) }))
+      assert.ok(afterMain.absent === true || afterMain.exited === true)
+      if (afterMain.absent !== true) assert.deepEqual(afterMain.birth, originalMain.birth)
+      facts.retirement = receipt; facts.originalMainRetirement = afterMain; retired = true
     } catch { cleanupErrors.push('native_scope_retirement_unknown') }
   }
   if (sid && (!launched || retired)) {

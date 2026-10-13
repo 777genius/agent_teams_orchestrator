@@ -87,8 +87,10 @@ struct WindowsNativeRunState {
 
   void bindOwner(const JsonObject &binding, const std::wstring &sourceSha256) {
     std::lock_guard<std::mutex> lock(mutex_);
-    require(!poisoned_ && reserved_ && !endpointSealed_ &&
-                text(binding_, L"controllerInstanceId") == text(binding, L"controllerInstanceId") &&
+    require(!poisoned_ && reserved_ && !endpointSealed_, "run_state_unknown");
+    runStateExactBindingLocked(binding, "run_state_start_changed");
+    runStateExactBindingLocked(binding_, "run_state_start_changed");
+    require(text(binding_, L"controllerInstanceId") == text(binding, L"controllerInstanceId") &&
                 text(binding_, L"ownerId") == text(binding, L"ownerId") &&
                 text(binding_, L"runId") == text(binding, L"runId") &&
                 text(binding_, L"teamId") == text(binding, L"teamId") &&
@@ -154,6 +156,7 @@ struct WindowsNativeRunState {
     try {
       runStateVerifyHeldLocked();
       runStateValidateEndpointLocked(endpoint);
+      runStateCaptureEndpointLocked(endpoint, true);
       const std::string bytes = narrow(std::wstring(endpoint.Stringify())) + "\n";
       runStateReplaceLocked(L"control.json",
                             std::vector<BYTE>(bytes.begin(), bytes.end()));
@@ -179,6 +182,7 @@ struct WindowsNativeRunState {
       const std::string json(bytes.begin(), bytes.end());
       auto endpoint = JsonObject::Parse(wide(json));
       runStateValidateEndpointLocked(endpoint);
+      runStateCaptureEndpointLocked(endpoint, false);
       endpointSealed_ = true;
       endpointRecord_ = endpoint;
       return endpoint;
@@ -207,32 +211,46 @@ struct WindowsNativeRunState {
     endpointHash_ = endpointHash;
   }
 
-  void validateEndpointHash(const std::wstring &endpointHash) const {
+  JsonObject validateEndpointHash(const std::wstring &endpointHash) {
     std::lock_guard<std::mutex> lock(mutex_);
     require(!poisoned_ && reserved_ && endpointSealed_ && endpointHash_ == endpointHash,
             "run_control_endpoint_changed");
+    runStateVerifyHeldLocked();
+    runStateValidateEndpointLocked(endpointRecord_);
+    runStateAssertRetirementWitnessLocked(serverProcess_, helperPid_, helperBirth_,
+                                          "run_control_endpoint_changed");
+    runStateAssertRetirementWitnessLocked(parentProcess_, bunPid_, bunBirth_,
+                                          "run_control_endpoint_changed");
+    JsonObject result;
+    num(result, L"schema", 1);
+    flag(result, L"valid", true);
+    str(result, L"ownerSid", owner_);
+    str(result, L"endpointHash", endpointHash_);
+    result.SetNamedValue(L"rootIdentity", rootIdentity_);
+    result.SetNamedValue(L"runIdentity", runIdentity_);
+    result.SetNamedValue(L"binding", binding_);
+    result.SetNamedValue(L"helper", object(endpointRecord_.GetNamedObject(L"endpoint"), L"helper"));
+    result.SetNamedValue(L"bun", object(endpointRecord_.GetNamedObject(L"endpoint"), L"bun"));
+    flag(result, L"held", true);
+    return result;
   }
 
   bool ownerRetired() {
     std::lock_guard<std::mutex> lock(mutex_);
     require(!poisoned_ && reserved_, "run_state_unknown");
     runStateVerifyHeldLocked();
-    if (endpointSealed_) {
-      const auto process = object(endpointRecord_, L"process");
-      const double raw = process.GetNamedNumber(L"pid");
-      require(raw > 0 && raw <= MAXDWORD && raw == static_cast<DWORD>(raw), "run_state_unknown");
-      Handle server(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE,
-                               static_cast<DWORD>(raw)));
-      if (!server && GetLastError() == ERROR_INVALID_PARAMETER)
-        return runStateAbsentLocked(L"control.json");
-      require(static_cast<bool>(server), "run_state_unknown");
-      if (WaitForSingleObject(server.value, 0) == WAIT_OBJECT_0)
-        return runStateAbsentLocked(L"control.json");
-      return false;
-    }
-    if (WaitForSingleObject(serverProcess_.value, 0) == WAIT_OBJECT_0)
-      return true;
-    return false;
+    require(endpointSealed_, "run_state_endpoint_missing");
+    runStateAssertRetirementWitnessLocked(serverProcess_, helperPid_, helperBirth_,
+                                          "run_control_endpoint_changed");
+    runStateAssertRetirementWitnessLocked(parentProcess_, bunPid_, bunBirth_,
+                                          "run_control_endpoint_changed");
+    // These are the two original held process handles. Helper command/control
+    // closure and control.json absence are never sources of MAIN completion.
+    const DWORD helperWait = WaitForSingleObject(serverProcess_.value, 0);
+    const DWORD bunWait = WaitForSingleObject(parentProcess_.value, 0);
+    require(helperWait == WAIT_OBJECT_0 || helperWait == WAIT_TIMEOUT, "run_state_unknown");
+    require(bunWait == WAIT_OBJECT_0 || bunWait == WAIT_TIMEOUT, "run_state_unknown");
+    return helperWait == WAIT_OBJECT_0 && bunWait == WAIT_OBJECT_0;
   }
 
   void retainServerProcess(HANDLE process) {
@@ -248,6 +266,8 @@ struct WindowsNativeRunState {
   bool validatePayload(const JsonObject &payload) const {
     std::lock_guard<std::mutex> lock(mutex_);
     const auto binding = object(payload, L"binding");
+    runStateExactBindingLocked(binding, "run_control_foreign");
+    runStateExactBindingLocked(binding_, "run_control_foreign");
     return !poisoned_ && reserved_ &&
            text(binding, L"controllerInstanceId") == text(binding_, L"controllerInstanceId") &&
            text(binding, L"ownerId") == text(binding_, L"ownerId") &&
@@ -320,6 +340,54 @@ private:
             "run_state_endpoint_changed");
   }
 
+  void runStateCaptureEndpointLocked(const JsonObject &endpoint, bool requireHeld) {
+    const auto process = object(endpoint, L"process");
+    const auto endpointObject = object(endpoint, L"endpoint");
+    const auto helper = object(endpointObject, L"helper");
+    const auto bun = object(endpointObject, L"bun");
+    require(std::wstring(process.Stringify()) == std::wstring(helper.Stringify()),
+            "run_control_endpoint_changed");
+    helperPid_ = runStateProcessIdLocked(helper, "run_control_endpoint_changed");
+    bunPid_ = runStateProcessIdLocked(bun, "run_control_endpoint_changed");
+    helperBirth_ = runStateProcessBirthLocked(helper, "run_control_endpoint_changed");
+    bunBirth_ = runStateProcessBirthLocked(bun, "run_control_endpoint_changed");
+    if (requireHeld) {
+      runStateAssertRetirementWitnessLocked(serverProcess_, helperPid_, helperBirth_,
+                                            "run_control_endpoint_changed");
+      runStateAssertRetirementWitnessLocked(parentProcess_, bunPid_, bunBirth_,
+                                            "run_control_endpoint_changed");
+    }
+  }
+
+  static DWORD runStateProcessIdLocked(const JsonObject &process, const char *code) {
+    const double raw = process.GetNamedNumber(L"pid");
+    require(raw > 0 && raw <= MAXDWORD && raw == static_cast<DWORD>(raw), code);
+    return static_cast<DWORD>(raw);
+  }
+
+  static std::uint64_t runStateProcessBirthLocked(const JsonObject &process,
+                                                  const char *code) {
+    const auto creation = object(process, L"processCreationTime");
+    runStateExactObject(creation, {L"kind", L"value", L"bootId"}, code);
+    const auto value = text(creation, L"value");
+    require(text(creation, L"kind") == L"windows-filetime" &&
+                creation.GetNamedValue(L"bootId").ValueType() == JsonValueType::Null &&
+                !value.empty() && value.size() <= 20 &&
+                value.find_first_not_of(L"0123456789") == std::wstring::npos,
+            code);
+    return std::stoull(value);
+  }
+
+  static void runStateAssertRetirementWitnessLocked(HANDLE process, DWORD pid,
+                                                    std::uint64_t creation,
+                                                    const char *code) {
+    require(process && GetProcessId(process) == pid, code);
+    FILETIME created{}, exited{}, kernel{}, user{};
+    require(GetProcessTimes(process, &created, &exited, &kernel, &user) != 0,
+            "run_state_unknown");
+    require(filetime(created) == creation, code);
+  }
+
   static void runStateExactObject(const JsonObject &value,
                                   const std::vector<std::wstring> &names,
                                   const char *code) {
@@ -333,6 +401,10 @@ private:
       ++count;
     }
     require(count == names.size(), code);
+  }
+
+  static void runStateExactBindingLocked(const JsonObject &binding, const char *code) {
+    runStateExactObject(binding, {L"teamId", L"runId", L"controllerInstanceId", L"ownerId"}, code);
   }
 
   static bool runStateAllowed(const std::wstring &name, bool json) {
@@ -531,6 +603,8 @@ private:
   std::wstring sourceSha256_;
   std::wstring endpointHash_;
   JsonObject endpointRecord_;
+  DWORD helperPid_ = 0, bunPid_ = 0;
+  std::uint64_t helperBirth_ = 0, bunBirth_ = 0;
   std::vector<BYTE> challenge_;
   std::map<std::wstring, std::uint64_t> generations_;
   bool reserved_ = false;

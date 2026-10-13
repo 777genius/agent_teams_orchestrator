@@ -17,7 +17,7 @@ if (isolatedBirthProbe) mock.module('./windows/OpenCodeV2WindowsNativeBroker.js'
   requireWindowsRealpathArtifact: () => undefined,
 }))
 const { isExecutionCleanupReceipt, retireExecutionChild } = await import('./OpenCodeV2ExecutionLifecycle.js')
-const { createWindowsCommandRequestReplay, windowsBirth } = await import('./windows/OpenCodeV2WindowsExecution.js')
+const { createWindowsCommandRequestReplay, observeWindowsHeldMainExit, windowsBirth } = await import('./windows/OpenCodeV2WindowsExecution.js')
 const { readExecutionBirth } = await import('./OpenCodeV2ExecutionBinding.js')
 
 async function runIsolatedBirthProbe(name: string): Promise<void> {
@@ -114,4 +114,29 @@ test('command replay retains pending authority, a finite settled window, and lif
   expect(() => windowReplay.admit('window-held', 'commandStart')).toThrow('execution_native_command_unknown')
   windowReplay.settle('window-held', windowHeld)
   expect(() => windowReplay.admit('window-held', 'commandStart')).toThrow('execution_native_command_unknown')
+})
+
+
+test('Windows MAIN closes once only from its authenticated held exit, independently of helper closure', async () => {
+  const events = new EventEmitter(), child = new EventEmitter()
+  const mapping = { nonce: 'TEST-nonce', leaseOwnerId: 'TEST-lease',
+    bun: { nativePID: 73, birth: { format: 'windows-filetime', value: '42', bootId: null } },
+    supervisor: { nativePID: 74 }, namespace: 'windows-job:TEST-nonce' }
+  const closes: unknown[] = [], errors: Error[] = []
+  child.on('close', code => closes.push(code)); child.on('error', error => errors.push(error))
+  const exited = observeWindowsHeldMainExit(events, child, Promise.resolve(mapping))
+  const flush = () => new Promise<void>(resolve => setImmediate(resolve))
+  events.emit('close', 0); await flush()
+  expect(closes).toEqual([]); expect(exited()).toBe(false)
+  for (const receipt of [
+    { heldProcessExited: false, mapping, exitCode: 0 },
+    { heldProcessExited: true, mapping: { ...mapping, nonce: 'foreign' }, exitCode: 0 },
+    { heldProcessExited: true, mapping: { ...mapping, bun: { ...mapping.bun, nativePID: 75 } }, exitCode: 0 },
+    { heldProcessExited: true, mapping: { ...mapping, bun: { ...mapping.bun, birth: { ...mapping.bun.birth, value: '43' } } }, exitCode: 0 },
+    { heldProcessExited: true, mapping, exitCode: -1 },
+  ]) { events.emit('mainExited', receipt); await flush() }
+  expect(closes).toEqual([]); expect(errors).toHaveLength(5); expect(exited()).toBe(false)
+  events.emit('mainExited', { heldProcessExited: true, mapping, exitCode: 7 }); await flush()
+  events.emit('mainExited', { heldProcessExited: true, mapping, exitCode: 7 }); await flush()
+  expect(closes).toEqual([7]); expect(exited()).toBe(true)
 })

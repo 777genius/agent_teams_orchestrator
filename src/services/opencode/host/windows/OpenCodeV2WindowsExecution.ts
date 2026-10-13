@@ -49,6 +49,18 @@ export function createWindowsCommandRequestReplay(): WindowsCommandRequestReplay
     },
   })
 }
+/** Only the launch's native held-process event can close MAIN. Helper failure
+ * remains an error and never supplies a MAIN exit code. */
+export function observeWindowsHeldMainExit(events: EventEmitter, child: EventEmitter, launch: Promise<unknown>) {
+  let exited = false
+  events.on('mainExited', value => { void (async () => {
+    const receipt = row(value), mapping = row(await launch)
+    assert(receipt.heldProcessExited === true && equal(receipt.mapping, mapping) &&
+      Number.isSafeInteger(receipt.exitCode) && Number(receipt.exitCode) >= 0 && Number(receipt.exitCode) <= 0xffffffff, 'execution_identity_mismatch')
+    if (!exited) { exited = true; child.emit('close', receipt.exitCode) }
+  })().catch(() => child.emit('error', new Error('execution_identity_mismatch'))) })
+  return () => exited
+}
 export function isWindowsExecutionMapping(value: unknown): value is WindowsExecutionMapping { return !!value && typeof value === 'object' && mappings.has(value as WindowsExecutionMapping) }
 export function isWindowsKernelRetirement(value: unknown): value is WindowsKernelRetirement { return !!value && typeof value === 'object' && retirements.has(value as WindowsKernelRetirement) }
 async function identity(value: unknown): Promise<WindowsExecutionIdentity> {
@@ -121,7 +133,8 @@ function compactReadOnlyGrantUnion(roots: readonly string[]): readonly string[] 
 export async function planWindowsExecution(requested: Readonly<{
   bun: Readonly<{ path: string; sha256: string }>; entry: string; cwd: string; writableRoots: readonly string[]; readOnlyRoots: readonly string[]; protectedRoots?: readonly string[]; profileDirectories?: readonly string[]; readOnlyMounts?: readonly Readonly<{ source: string; target: string }>[]; env: Readonly<Record<string, string>>
 }>): Promise<WindowsLaunchPlan> {
-  assert(process.platform === 'win32' && process.versions.bun === '1.3.11', 'execution_containment_runtime_pending')
+  assert(process.platform === 'win32' && process.arch === 'x64' && process.versions.bun === '1.3.11',
+    'execution_containment_runtime_pending')
   const input = structuredClone(requested)
   assert(await realpath(input.bun.path) === input.bun.path && await hash(input.bun.path) === input.bun.sha256, 'execution_identity_mismatch')
   assert(input.profileDirectories && input.profileDirectories.length > 0, 'execution_profile_changed')
@@ -129,6 +142,8 @@ export async function planWindowsExecution(requested: Readonly<{
   for (const root of [...input.writableRoots, ...input.readOnlyRoots, ...input.profileDirectories, input.cwd]) assert(path.isAbsolute(root) && /^[A-Za-z]:\\/.test(root) && !root.includes('/') && path.parse(root).root !== root && await realpath(root) === root, 'execution_path_alias')
   for (const key of Object.keys(input.env)) assert(!/^(?:NODE_CHANNEL_|OPENCODE_V2_WINDOWS_|DYLD_|LD_)/.test(key), 'execution_profile_changed')
   const helper = await resolveWindowsNativeArtifact(), realpathDll = await resolveWindowsRealpathArtifact()
+  assert(helper.arch === 'x64' && realpathDll.arch === 'x64' &&
+    await hash(realpathDll.path) === realpathDll.sha256, 'execution_containment_helper_identity')
   for (const root of [...input.writableRoots, ...(input.protectedRoots ?? [])]) {
     const relative = path.win32.relative(root, realpathDll.path)
     assert(relative !== '' && (relative === '..' || relative.startsWith('..\\') || path.win32.isAbsolute(relative)), 'execution_containment_dll_identity')
@@ -151,7 +166,7 @@ export function ownerFilesystemForWindowsPlan(plan: WindowsLaunchPlan) {
 /** Root composition calls this after native selected-profile validation and
  * fence acquisition, before launch. The private plan/cache admits the exact
  * managed config; scalar caller process/FileID/binding DTOs are never accepted. */
-export async function bindWindowsExecutionSelectedConfig(plan: WindowsLaunchPlan, profile: OwnedNativeProfile, deadline: number, signal?: AbortSignal): Promise<void> {
+export async function bindWindowsExecutionSelectedConfig(plan: WindowsLaunchPlan, profile: OwnedNativeProfile, teamId: string, deadline: number, signal?: AbortSignal): Promise<void> {
   signal?.throwIfAborted()
   assert(Number.isFinite(deadline) && deadline > Date.now(), 'execution_timeout')
   assert(plans.has(plan) && !selectingConfigs.has(plan), 'execution_owner_unknown')
@@ -161,7 +176,7 @@ export async function bindWindowsExecutionSelectedConfig(plan: WindowsLaunchPlan
   signal?.throwIfAborted(); assert(deadline > Date.now(), 'execution_timeout')
   assert(plan.writableRoots.includes(profile.root) && plan.profileDirectories.includes(profile.root) &&
     plan.profileDirectories.includes(profile.config.directory) && profile.config.directory === path.win32.join(profile.root, 'config', 'opencode'), 'execution_profile_changed')
-  const selected = row(await broker.request('ownerSelectConfig', { root: profile.root, databasePath: profile.databasePath, sha256: profile.config.sha256 }, deadline, signal))
+  const selected = row(await broker.request('ownerSelectConfig', { root: profile.root, databasePath: profile.databasePath, sha256: profile.config.sha256, teamId }, deadline, signal))
   assert(selected.schema === 1 && selected.ok === true && typeof selected.selectionId === 'string' && /^[1-9]\d{0,19}$/.test(selected.selectionId) && selected.root === profile.root &&
     selected.path === path.win32.join(profile.config.directory, 'opencode.json') && selected.sha256 === profile.config.sha256, 'execution_profile_changed')
   selectedConfigs.set(plan, selected.selectionId)
@@ -179,12 +194,13 @@ export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, l
   const commandReplay = createWindowsCommandRequestReplay()
   const commandOperations = new Set(['commandStart', 'commandRead', 'commandStatus', 'commandWriteStdin', 'commandEndStdin', 'commandRetire', 'commandClose'])
   let mapping: WindowsExecutionMapping | undefined, nativeMapping: unknown, stopped = false, started = false, closed = false
+  let mainExited = () => false
   let connectedResolve!: (value: unknown) => void, connectedReject!: (error: Error) => void
   const connected = new Promise<unknown>((resolve, reject) => { connectedResolve = resolve; connectedReject = reject }); void connected.catch(() => undefined)
   broker.events.on('connected', connectedResolve)
   broker.events.on('failed', () => { const error = new Error('execution_containment_launcher_denied'); connectedReject(error); http.fail(error); child.emit('error', error) })
   broker.events.on('error', error => { connectedReject(error); http.fail(error); child.emit('error', error) })
-  broker.events.on('close', code => { const error = new Error('execution_containment_helper_closed'); connectedReject(error); http.fail(error); child.emit('close', code) })
+  broker.events.on('close', () => { const error = new Error('execution_containment_helper_closed'); connectedReject(error); http.fail(error); if (!mainExited()) child.emit('error', error) })
   broker.events.on('message', value => {
     try {
       const record = row(value)
@@ -217,6 +233,7 @@ export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, l
   })
   const launch = broker.request('launch', { executable: plan.executable, entry: plan.entry, cwd: plan.cwd, env: plan.env,
     writableRoots: plan.writableRoots, readOnlyRoots: plan.readOnlyRoots, protectedRoots: plan.protectedRoots, realpathDll: plan.realpathDll, selectedConfigId: selectedConfigs.get(plan), nonce, leaseOwnerId })
+  mainExited = observeWindowsHeldMainExit(broker.events, child, launch)
   void launch.catch(connectedReject)
   async function bounded<T>(work: Promise<T>, deadline: number, signal?: AbortSignal): Promise<T> {
     signal?.throwIfAborted(); assert(deadline > Date.now(), 'execution_timeout')

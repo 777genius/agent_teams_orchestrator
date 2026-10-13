@@ -33,7 +33,8 @@ type ExecutionPlatformPlan =
 // Closed composition, not a caller-registerable adapter registry. Unsupported
 // systems cannot cross admission before native containment and delivery exist.
 export function isExecutionPlatformAvailable(): boolean {
-  return process.platform === 'linux' || process.platform === 'darwin'
+  return process.platform === 'linux' || process.platform === 'darwin' ||
+    process.platform === 'win32' && process.arch === 'x64'
 }
 export function assertExecutionPlatformAvailable(): void {
   executionAssert(isExecutionPlatformAvailable(), 'execution_containment_platform_pending')

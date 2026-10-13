@@ -560,7 +560,7 @@ export async function executeSelectedOpenCodeBridgeCommandEnvelope(input: unknow
     return executeV1(input)
   }
   const bridge = binding ? new OpenCodeV2TeamBridge(resolveClaudeMultimodelPaths().data, binding) : null
-  if (bridge && isExecutionPlatformAvailable() && process.getuid) {
+  if (bridge && isExecutionPlatformAvailable() && (process.platform === 'win32' || process.getuid)) {
     try { if (await bridge.discover()) return executeV2(envelope, null, bridge) }
     catch (error) {
       if (envelope.command === 'opencode.commandStatus' || envelope.command === 'opencode.recoverDeliveryJournal')

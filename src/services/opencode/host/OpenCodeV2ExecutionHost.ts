@@ -231,7 +231,7 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
     // both physical fences. Bind the fixed managed config before marking a
     // launch attempt, so known pre-launch failures still use normal abandonment.
     if (plan.platform === 'win32') {
-      await bindWindowsExecutionSelectedConfig(plan.concrete, profile, context.deadline, context.signal)
+      await bindWindowsExecutionSelectedConfig(plan.concrete, profile, context.teamId, context.deadline, context.signal)
       check()
     }
     await owner.beforeSpawn(); check()

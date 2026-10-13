@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import path from 'node:path'
 import { createWindowsNativeBroker, resolveWindowsNativeArtifact } from '../../src/services/opencode/host/windows/OpenCodeV2WindowsNativeBroker.js'
 import { createWindowsOwnerFilesystem, type WindowsOwnerDirectory } from '../../src/services/opencode/host/windows/OpenCodeV2WindowsOwnerFilesystem.js'
@@ -62,10 +63,73 @@ try {
   await assert.rejects(filesystem.createDirectory(partialPath))
   const retainedOriginal = retain(await filesystem.openDirectory(originalPath))
   assert.deepEqual(await retainedOriginal.readRecord('owner.json'), record)
+  const inspect = async (name: string, config?: string) => {
+    const profile = path.win32.join(requestedRoot, name)
+    retain(await filesystem.createDirectory(profile))
+    const configDirectory = path.win32.join(profile, "config")
+    retain(await filesystem.createDirectory(configDirectory))
+    const opencodeDirectory = path.win32.join(configDirectory, "opencode")
+    retain(await filesystem.createDirectory(opencodeDirectory))
+    if (config !== undefined) await writeFile(path.win32.join(opencodeDirectory, "opencode.json"), config)
+    return record(await broker.request("ownerInspectProfileConfig", {
+      root: profile, databasePath: path.win32.join(profile, "data", "opencode", "opencode.db"),
+    }))
+  }
+  const absent = await inspect("TEST-profile-absent", undefined)
+  const incomplete = await inspect("TEST-profile-incomplete", "")
+  const malformedComplete = await inspect("TEST-profile-malformed-complete", "{TEST-malformed")
+  assert.equal(absent.state, "absent"); assert.equal(absent.configIdentity, null)
+  assert.equal(incomplete.state, "incomplete"); assert.notEqual(incomplete.configIdentity, null)
+  assert.equal(malformedComplete.state, "complete"); assert.notEqual(malformedComplete.configIdentity, null)
+  const selectedRoot = path.win32.join(requestedRoot, "TEST-selected-profile")
+  retain(await filesystem.createDirectory(selectedRoot))
+  for (const name of ["home", "config", "data", "cache", "state", "tmp", "appdata", "localappdata"])
+    retain(await filesystem.createDirectory(path.win32.join(selectedRoot, name)))
+  const selectedConfigDirectory = path.win32.join(selectedRoot, "config", "opencode")
+  retain(await filesystem.createDirectory(selectedConfigDirectory))
+  const selectedDataDirectory = path.win32.join(selectedRoot, "data", "opencode")
+  retain(await filesystem.createDirectory(selectedDataDirectory))
+  const claudeRoot = path.win32.join(requestedRoot, "TEST-claude")
+  retain(await filesystem.createDirectory(claudeRoot))
+  retain(await filesystem.createDirectory(path.win32.join(claudeRoot, "teams")))
+  retain(await filesystem.createDirectory(path.win32.join(claudeRoot, "teams", "TEST-team")))
+  const inboxes = path.win32.join(claudeRoot, "teams", "TEST-team", "inboxes")
+  retain(await filesystem.createDirectory(inboxes))
+  await writeFile(path.win32.join(inboxes, "user.json"), "[]")
+  const selectedContent = JSON.stringify({ mcpServers: { "agent-teams": { type: "local",
+    env: { AGENT_TEAMS_MCP_CLAUDE_DIR: claudeRoot } } } })
+  await writeFile(path.win32.join(selectedConfigDirectory, "opencode.json"), selectedContent)
+  const databasePath = path.win32.join(selectedDataDirectory, "opencode.db")
+  await broker.request("ownerValidateSelectedProfile", { root: selectedRoot, databasePath,
+    directories: [selectedRoot, selectedConfigDirectory] })
+  const selected = record(await broker.request("ownerSelectConfig", { root: selectedRoot, databasePath,
+    sha256: createHash("sha256").update(selectedContent).digest("hex"), teamId: "TEST-team" }))
+  assert.equal(selected.mcpRoot, claudeRoot); assert.equal(selected.inboxState, "regular")
+  const inboxRoot = path.win32.join(claudeRoot, "teams")
+  for (const [team, state] of [["TEST-empty", "empty"], ["TEST-absent", "absent"]] as const) {
+    retain(await filesystem.createDirectory(path.win32.join(inboxRoot, team)))
+    const directory = path.win32.join(inboxRoot, team, "inboxes")
+    retain(await filesystem.createDirectory(directory))
+    if (state === "absent") await writeFile(path.win32.join(directory, "other.json"), "[]")
+    const result = record(await broker.request("ownerSelectConfig", { root: selectedRoot, databasePath,
+      sha256: createHash("sha256").update(selectedContent).digest("hex"), teamId: team }))
+    assert.equal(result.inboxState, state)
+  }
+  const oversizeTeam = "TEST-oversize"
+  retain(await filesystem.createDirectory(path.win32.join(inboxRoot, oversizeTeam)))
+  const oversizeDirectory = path.win32.join(inboxRoot, oversizeTeam, "inboxes")
+  retain(await filesystem.createDirectory(oversizeDirectory))
+  await writeFile(path.win32.join(oversizeDirectory, "user.json"), Buffer.alloc(4 * 1024 * 1024 + 1))
+  await assert.rejects(broker.request("ownerSelectConfig", { root: selectedRoot, databasePath,
+    sha256: createHash("sha256").update(selectedContent).digest("hex"), teamId: oversizeTeam }))
   Object.assign(facts, { archivedIdentity: before, archivedPath: successArchive,
     originalPathFreeForNewFence: true, nextIdentity: next.identity,
     noReplaceCollisionPreserved: true, partialFenceBlocksAcquisition: true,
-    existingRecordNotOverwritten: true, readOnlyReopenCannotMutate: true })
+    existingRecordNotOverwritten: true, readOnlyReopenCannotMutate: true,
+    incompleteProfileConfigSkipProof: { absent: absent.state, zeroLength: incomplete.state,
+      malformedComplete: malformedComplete.state },
+    selectedControllerInbox: { mcpRoot: selected.mcpRoot, regular: selected.inboxState,
+      empty: "empty", absent: "absent", oversizeRejected: true } })
 } catch (error) { failure = error }
 finally {
   const closeFailures: string[] = []

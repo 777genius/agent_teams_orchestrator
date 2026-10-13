@@ -369,6 +369,20 @@ static std::wstring heldFileSha256(HANDLE file) {
   }
   return value;
 }
+static std::vector<BYTE> heldFileBytes(HANDLE file, DWORD limit) {
+  LARGE_INTEGER zero{};
+  require(SetFilePointerEx(file, zero, nullptr, FILE_BEGIN), "run_controller_config_unknown");
+  std::vector<BYTE> bytes;
+  BYTE buffer[65536];
+  DWORD count = 0;
+  do {
+    require(ReadFile(file, buffer, sizeof(buffer), &count, nullptr) &&
+                bytes.size() + count <= limit,
+            "run_controller_config_unknown");
+    bytes.insert(bytes.end(), buffer, buffer + count);
+  } while (count != 0);
+  return bytes;
+}
 struct RetainedRealpathDll {
   Handle file;
   std::vector<RetainedAnchorComponent> parents;
@@ -591,6 +605,61 @@ struct SelectedProfile {
   std::vector<SelectedProfileDirectory> directories;
   std::vector<std::wstring> admittedDirectories;
 };
+static bool controllerInboxEmpty(const std::wstring &path) {
+  WIN32_FIND_DATAW entry{};
+  struct Search {
+    HANDLE value;
+    ~Search() { if (value != INVALID_HANDLE_VALUE) FindClose(value); }
+  } search{FindFirstFileW(extended(path + L"\\*").c_str(), &entry)};
+  if (search.value == INVALID_HANDLE_VALUE) {
+    require(GetLastError() == ERROR_FILE_NOT_FOUND, "run_controller_inbox_unknown");
+    return true;
+  }
+  do {
+    const std::wstring name(entry.cFileName);
+    if (name != L"." && name != L"..") return false;
+  } while (FindNextFileW(search.value, &entry));
+  require(GetLastError() == ERROR_NO_MORE_FILES, "run_controller_inbox_unknown");
+  return true;
+}
+struct SelectedControllerInbox {
+  std::vector<RetainedAnchorComponent> directories;
+  std::vector<JsonObject> directoryIdentities;
+  Handle user;
+  JsonObject userIdentity;
+  std::wstring userPath, state, missingPath, emptyPath;
+  std::uint64_t userSize = 0;
+
+  void assertLive() const {
+    require(directories.size() == directoryIdentities.size(),
+            "run_controller_inbox_unknown");
+    for (size_t i = 0; i < directories.size(); ++i) {
+      directories[i].assertLive();
+      require(fileIdentity(directories[i].handle.value, currentSid(), true).Stringify() ==
+                  directoryIdentities[i].Stringify(),
+              "run_controller_inbox_unknown");
+    }
+    if (!missingPath.empty()) {
+      const DWORD attributes = GetFileAttributesW(extended(missingPath).c_str());
+      const DWORD error = GetLastError();
+      require(attributes == INVALID_FILE_ATTRIBUTES &&
+                  (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND),
+              "run_controller_inbox_unknown");
+    }
+    if (!emptyPath.empty())
+      require(controllerInboxEmpty(emptyPath), "run_controller_inbox_unknown");
+    if (user) {
+      FILE_STANDARD_INFO standard{};
+      require(fileIdentity(user.value, currentSid(), false).Stringify() ==
+                  userIdentity.Stringify() &&
+                  GetFileInformationByHandleEx(user.value, FileStandardInfo, &standard,
+                                               sizeof(standard)) &&
+                  standard.EndOfFile.QuadPart >= 0 &&
+                  static_cast<std::uint64_t>(standard.EndOfFile.QuadPart) == userSize,
+              "run_controller_inbox_unknown");
+    }
+  }
+};
 struct WindowsNativeRunControlIssuer;
 struct WindowsNativeRunState;
 struct WindowsNativeRunControl;
@@ -600,15 +669,106 @@ class SelectedControllerConfig {
   friend struct WindowsNativeRunControlIssuer;
   friend struct WindowsNativeRunStateIssuer;
   Handle root, config;
-  std::wstring rootPath, path, owner, sha256;
+  std::wstring rootPath, path, owner, sha256, mcpRootPath;
   JsonObject identity;
+  std::unique_ptr<RetainedAnchorComponent> mcpRoot;
+  JsonObject mcpRootIdentity;
+  std::vector<Handle> mcpAncestors;
+  std::vector<JsonObject> mcpAncestorIdentities;
+  std::map<std::wstring, SelectedControllerInbox> inboxes;
   SelectedControllerConfig(Handle heldRoot, Handle heldConfig, std::wstring selectedRootPath,
                            std::wstring selectedPath,
-                           std::wstring selectedOwner, std::wstring selectedHash)
+                           std::wstring selectedOwner, std::wstring selectedHash,
+                           const std::wstring &teamId)
       : root(std::move(heldRoot)), config(std::move(heldConfig)),
         rootPath(std::move(selectedRootPath)), path(std::move(selectedPath)),
         owner(std::move(selectedOwner)), sha256(std::move(selectedHash)),
-        identity(fileIdentity(config.value, owner, false)) {}
+        identity(fileIdentity(config.value, owner, false)) {
+    bindInbox(teamId);
+  }
+  void bindInbox(const std::wstring &teamId) {
+    require(teamId.size() > 0 && teamId.size() <= 200 &&
+                teamId.find_first_of(L"\\/:*?\"<>|") == std::wstring::npos,
+            "run_controller_inbox_unknown");
+    const auto bytes = heldFileBytes(config.value, 4 * 1024 * 1024);
+    require(!bytes.empty() && heldFileSha256(config.value) == sha256,
+            "run_controller_config_unknown");
+    const auto document = JsonObject::Parse(wide(std::string(bytes.begin(), bytes.end())));
+    const auto servers = document.HasKey(L"mcpServers")
+                             ? object(document, L"mcpServers")
+                             : object(object(document, L"mcp"), L"servers");
+    const auto server = object(servers, L"agent-teams");
+    require(text(server, L"type") == L"local", "run_controller_config_unknown");
+    const auto environment = server.HasKey(L"env") ? object(server, L"env")
+                                                   : object(server, L"environment");
+    mcpRootPath = text(environment, L"AGENT_TEAMS_MCP_CLAUDE_DIR");
+    require(mcpRootPath.size() >= 3 && mcpRootPath[1] == L':' && mcpRootPath[2] == L'\\',
+            "run_controller_config_unknown");
+    (void)extended(mcpRootPath);
+    mcpRoot = std::make_unique<RetainedAnchorComponent>(canonicalDirectory(mcpRootPath, FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL));
+    mcpRootIdentity = fileIdentity(mcpRoot->handle.value, owner, true);
+    mcpAncestors = ancestors(mcpRootPath);
+    for (auto &parent : mcpAncestors)
+      mcpAncestorIdentities.push_back(anchorIdentity(parent.value));
+    SelectedControllerInbox inbox;
+    const std::wstring segments[] = {L"teams", teamId, L"inboxes"};
+    std::wstring current = mcpRootPath;
+    for (const auto &segment : segments) {
+      current += L"\\" + segment;
+      Handle directory(CreateFileW(extended(current).c_str(),
+                                   FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                   OPEN_EXISTING,
+                                   FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                                   nullptr));
+      if (!directory) {
+        const DWORD error = GetLastError();
+        require(error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND,
+                "run_controller_inbox_unknown");
+        inbox.state = L"absent";
+        inbox.missingPath = current;
+        break;
+      }
+      require(equalPath(finalPath(directory.value), extended(current)),
+              "run_controller_inbox_unknown");
+      inbox.directoryIdentities.push_back(fileIdentity(directory.value, owner, true));
+      inbox.directories.emplace_back(std::move(directory));
+    }
+    inbox.userPath = current + L"\\user.json";
+    if (inbox.state.empty() && inbox.directories.size() == 3) {
+      const bool empty = controllerInboxEmpty(current);
+      Handle user(CreateFileW(extended(inbox.userPath).c_str(), GENERIC_READ | READ_CONTROL,
+                              FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                              FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+      if (!user) {
+        const DWORD error = GetLastError();
+        require(error == ERROR_FILE_NOT_FOUND, "run_controller_inbox_unknown");
+        inbox.state = empty ? L"empty" : L"absent";
+        inbox.missingPath = inbox.userPath;
+        if (empty) inbox.emptyPath = current;
+      } else {
+        FILE_STANDARD_INFO before{};
+        require(equalPath(finalPath(user.value), extended(inbox.userPath)) &&
+                    GetFileInformationByHandleEx(user.value, FileStandardInfo, &before,
+                                                 sizeof(before)) &&
+                    before.EndOfFile.QuadPart > 0 && before.EndOfFile.QuadPart <= 4 * 1024 * 1024,
+                "run_controller_inbox_unknown");
+        inbox.userIdentity = fileIdentity(user.value, owner, false);
+        (void)heldFileBytes(user.value, 4 * 1024 * 1024);
+        FILE_STANDARD_INFO after{};
+        require(GetFileInformationByHandleEx(user.value, FileStandardInfo, &after, sizeof(after)) &&
+                    before.EndOfFile.QuadPart == after.EndOfFile.QuadPart &&
+                    fileIdentity(user.value, owner, false).Stringify() ==
+                        inbox.userIdentity.Stringify(),
+                "run_controller_inbox_unknown");
+        inbox.userSize = static_cast<std::uint64_t>(before.EndOfFile.QuadPart);
+        inbox.user = std::move(user);
+        inbox.state = L"regular";
+      }
+    }
+    inbox.assertLive();
+    inboxes.emplace(teamId, std::move(inbox));
+  }
 public:
   void assertLive(PSID package) const {
     require(equalPath(finalPath(root.value), extended(rootPath)) &&
@@ -616,6 +776,21 @@ public:
                 fileIdentity(config.value, owner, false, package).Stringify() == identity.Stringify() &&
                 heldFileSha256(config.value) == sha256,
             "run_control_config_identity");
+    require(mcpAncestors.size() == mcpAncestorIdentities.size(),
+            "run_controller_inbox_unknown");
+    mcpRoot->assertLive();
+    require(fileIdentity(mcpRoot->handle.value, owner, true).Stringify() == mcpRootIdentity.Stringify(),
+            "run_controller_inbox_unknown");
+    for (size_t i = 0; i < mcpAncestors.size(); ++i)
+      require(anchorIdentity(mcpAncestors[i].value).Stringify() ==
+                  mcpAncestorIdentities[i].Stringify(),
+              "run_controller_inbox_unknown");
+    for (const auto &entry : inboxes) entry.second.assertLive();
+  }
+  const std::wstring &inboxState(const std::wstring &teamId) const {
+    auto found = inboxes.find(teamId);
+    require(found != inboxes.end(), "run_controller_inbox_unknown");
+    return found->second.state;
   }
 };
 struct OwnerStore {
@@ -691,6 +866,7 @@ public:
       if (std::find(admitted.begin(), admitted.end(), path) == admitted.end())
         admitted.push_back(path);
     }
+    require(admitted.size() <= 64, "run_control_selection_budget");
     auto key = root + L"|" + database;
     auto found = selectedProfiles.find(key);
     if (found == selectedProfiles.end()) {
@@ -762,9 +938,116 @@ public:
     str(result, L"filesystem", L"NTFS");
     return result;
   }
+  JsonObject inspectProfileConfig(const JsonObject &input) {
+    const auto root = text(input, L"root"), database = text(input, L"databasePath");
+    require(database.size() > root.size() + 1 && equalPath(database.substr(0, root.size()), root) &&
+                database[root.size()] == L'\\',
+            "execution_database_alias");
+    const auto owner = currentSid();
+    Handle heldRoot(canonicalDirectory(root, FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL));
+    const auto rootIdentity = fileIdentity(heldRoot.value, owner, true, selectedPackage);
+    const auto configDirectory = root + L"\\config\\opencode";
+    const auto configPath = configDirectory + L"\\opencode.json";
+    auto checkedParents = ancestors(root);
+    struct Retained {
+      std::vector<Handle> parents;
+      std::vector<JsonObject> identities;
+      void assertLive() const {
+        require(parents.size() == identities.size(), "execution_owner_unknown");
+        for (size_t i = 0; i < parents.size(); ++i) {
+          require(anchorIdentity(parents[i].value).Stringify() == identities[i].Stringify(),
+                  "execution_owner_unknown");
+          const auto heldPath = finalPath(parents[i].value);
+          auto reopened = canonicalDirectory(heldPath.substr(4));
+          require(anchorIdentity(reopened.value).Stringify() == identities[i].Stringify(),
+                  "execution_owner_unknown");
+        }
+      }
+    } retained;
+    retained.parents = std::move(checkedParents);
+    for (auto &parent : retained.parents)
+      retained.identities.push_back(anchorIdentity(parent.value));
+
+    auto open = [&](const std::wstring &path, bool directory) {
+      Handle value(CreateFileW(extended(path).c_str(), GENERIC_READ | READ_CONTROL,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                               OPEN_EXISTING,
+                               (directory ? FILE_FLAG_BACKUP_SEMANTICS : 0) |
+                                   FILE_FLAG_OPEN_REPARSE_POINT,
+                               nullptr));
+      if (!value) {
+        const DWORD error = GetLastError();
+        require(error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND,
+                "run_control_selection_missing");
+        return Handle();
+      }
+      require(equalPath(finalPath(value.value), extended(path)), "execution_path_alias");
+      fileIdentity(value.value, owner, directory, selectedPackage);
+      return value;
+    };
+
+    JsonObject result;
+    num(result, L"schema", 1);
+    flag(result, L"ok", true);
+    str(result, L"root", root);
+    str(result, L"databasePath", database);
+    str(result, L"configPath", configPath);
+    flag(result, L"privateAcl", true);
+    flag(result, L"reparse", false);
+    result.SetNamedValue(L"rootIdentity", rootIdentity);
+    retained.identities.push_back(anchorIdentity(heldRoot.value));
+    retained.parents.push_back(std::move(heldRoot));
+    Handle configParent(open(root + L"\\config", true));
+    if (configParent) {
+      retained.identities.push_back(anchorIdentity(configParent.value));
+      retained.parents.push_back(std::move(configParent));
+    }
+    Handle directory;
+    if (retained.parents.back().value && equalPath(finalPath(retained.parents.back().value), extended(root + L"\\config")))
+      directory = open(configDirectory, true);
+    if (!directory) {
+      str(result, L"state", L"absent");
+      result.SetNamedValue(L"configIdentity", JsonValue::CreateNullValue());
+      retained.assertLive();
+      const DWORD attributes = GetFileAttributesW(extended(configDirectory).c_str());
+      const DWORD error = GetLastError();
+      require(attributes == INVALID_FILE_ATTRIBUTES &&
+                  (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND),
+              "run_control_selection_missing");
+      return result;
+    }
+    retained.identities.push_back(anchorIdentity(directory.value));
+    retained.parents.push_back(std::move(directory));
+    Handle config(open(configPath, false));
+    if (!config) {
+      str(result, L"state", L"absent");
+      result.SetNamedValue(L"configIdentity", JsonValue::CreateNullValue());
+      retained.assertLive();
+      const DWORD attributes = GetFileAttributesW(extended(configPath).c_str());
+      const DWORD error = GetLastError();
+      require(attributes == INVALID_FILE_ATTRIBUTES &&
+                  (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND),
+              "run_control_selection_missing");
+      return result;
+    }
+    FILE_STANDARD_INFO before{};
+    require(GetFileInformationByHandleEx(config.value, FileStandardInfo, &before, sizeof(before)) &&
+                before.EndOfFile.QuadPart >= 0 && before.EndOfFile.QuadPart <= 4 * 1024 * 1024,
+            "run_control_config_budget");
+    const auto configIdentity = fileIdentity(config.value, owner, false, selectedPackage);
+    FILE_STANDARD_INFO after{};
+    require(GetFileInformationByHandleEx(config.value, FileStandardInfo, &after, sizeof(after)) &&
+                before.EndOfFile.QuadPart == after.EndOfFile.QuadPart,
+            "run_control_config_identity");
+    str(result, L"state", before.EndOfFile.QuadPart == 0 ? L"incomplete" : L"complete");
+    result.SetNamedValue(L"configIdentity", configIdentity);
+    retained.assertLive();
+    return result;
+  }
   JsonObject selectConfig(const JsonObject &input) {
     require(selectedConfigs.size() < 64, "run_control_selection_budget");
     auto root = text(input, L"root"), database = text(input, L"databasePath");
+    auto teamId = text(input, L"teamId");
     auto found = selectedProfiles.find(root + L"|" + database);
     require(found != selectedProfiles.end(), "run_control_selection_missing");
     auto &selected = found->second;
@@ -801,7 +1084,7 @@ public:
     const auto id = decimal(++next);
     selectedConfigs.emplace(id, std::unique_ptr<SelectedControllerConfig>(
         new SelectedControllerConfig(Handle(rootDuplicate), std::move(config), root, configPath,
-                                     selected.owner, expectedHash)));
+                                     selected.owner, expectedHash, teamId)));
     JsonObject result;
     num(result, L"schema", 1);
     flag(result, L"ok", true);
@@ -809,6 +1092,8 @@ public:
     str(result, L"root", root);
     str(result, L"path", configPath);
     str(result, L"sha256", expectedHash);
+    str(result, L"mcpRoot", selectedConfigs.at(id)->mcpRootPath);
+    str(result, L"inboxState", selectedConfigs.at(id)->inboxState(teamId));
     return result;
   }
   JsonObject describe(OwnerDirectory &directory) {
@@ -874,6 +1159,8 @@ public:
   }
   JsonObject request(const std::wstring &operation, const JsonObject &input);
   JsonObject requestAfterRunStateIssuer(const std::wstring &operation, const JsonObject &input) {
+    if (operation == L"ownerInspectProfileConfig")
+      return inspectProfileConfig(input);
     if (operation == L"ownerSelectConfig")
       return selectConfig(input);
     if (operation == L"ownerValidateSelectedProfile")
@@ -1062,7 +1349,7 @@ struct AttributeList {
 struct Scope;
 static void removeGrants(Scope &scope);
 struct Scope {
-  Handle job, process, thread, pipe, cancel, spool, inputFile, outputFile, errorFile;
+  Handle job, process, thread, pipe, cancel, readerFinished, spool, inputFile, outputFile, errorFile;
   std::unique_ptr<NativeCommandStore> commands;
   std::unique_ptr<WindowsNativeRunControl> ownedPairControl;
   bool ownedPairClosed = false;
@@ -1070,8 +1357,8 @@ struct Scope {
   std::wstring profile, pipeName, cwd;
   DWORD pid = 0;
   JsonObject mapping;
-  std::atomic<bool> stopping{false};
-  std::thread reader;
+  std::atomic<bool> stopping{false}, mainExitPublished{false};
+  std::thread reader, mainExit;
   std::mutex pipeMutex;
   std::vector<std::wstring> aclRoots;
   std::vector<RetainedRealpathAnchor> realpathAnchors;
@@ -1094,6 +1381,8 @@ struct Scope {
       WaitForSingleObject(process.value, 5000);
     if (reader.joinable())
       reader.join();
+    if (mainExit.joinable())
+      mainExit.join();
     if (ownedPairControl) {
       try {
         auto closed = ownedPairControl->shutdown();
@@ -1201,14 +1490,14 @@ struct Scope {
         for (size_t newline; (newline = buffer.find('\n')) != std::string::npos;) {
           auto packet = JsonObject::Parse(wide(buffer.substr(0, newline)));
           buffer.erase(0, newline + 1);
-          require(!exited(), "execution_identity_mismatch");
+          require(!exited() || text(packet, L"type") == L"closed", "execution_identity_mismatch");
           event(L"message", packet);
         }
       }
     } catch (...) {
       // The same terminal event covers rejected frames and unexpected EOF.
     }
-    if (!stopping) {
+    if (!stopping && !exited()) {
       JsonObject value = JsonObject::Parse(mapping.Stringify());
       str(value, L"code", L"execution_containment_pipe_denied");
       num(value, L"clientPID", pid);
@@ -1216,6 +1505,29 @@ struct Scope {
       if (job)
         TerminateJobObject(job.value, 99);
     }
+  }
+  void publishMainExit() {
+    require(WaitForSingleObject(process.value, 0) == WAIT_OBJECT_0, "execution_identity_unknown");
+    DWORD code = 0;
+    require(GetExitCodeProcess(process.value, &code) != 0, "execution_identity_unknown");
+    if (mainExitPublished.exchange(true)) return;
+    JsonObject value;
+    value.SetNamedValue(L"mapping", mapping);
+    flag(value, L"heldProcessExited", true);
+    num(value, L"exitCode", code);
+    event(L"mainExited", value);
+  }
+  void observeMainExit() {
+    HANDLE events[] = {process.value, cancel.value};
+    const DWORD waited = WaitForMultipleObjects(2, events, FALSE, INFINITE);
+    if (waited == WAIT_OBJECT_0) {
+      // Drain the authenticated reader's final closed ACK before notifying the
+      // host. Cancellation instead leaves publication to retire after its join.
+      HANDLE drained[] = {readerFinished.value, cancel.value};
+      const DWORD ready = WaitForMultipleObjects(2, drained, FALSE, INFINITE);
+      if (ready == WAIT_OBJECT_0) publishMainExit();
+      else require(ready == WAIT_OBJECT_0 + 1, "execution_identity_unknown");
+    } else require(waited == WAIT_OBJECT_0 + 1, "execution_identity_unknown");
   }
   JsonObject retire() {
     stopping = true;
@@ -1228,6 +1540,9 @@ struct Scope {
     require(exited() && active() == 0, "cleanup_unknown");
     if (reader.joinable())
       reader.join();
+    if (mainExit.joinable())
+      mainExit.join();
+    publishMainExit();
     if (ownedPairControl) {
       auto closed = ownedPairControl->shutdown();
       require(closed.GetNamedBoolean(L"complete", false) &&
@@ -1371,7 +1686,8 @@ struct WindowsNativeRunStateIssuer {
     return ids;
   }
   static std::pair<std::wstring, SelectedControllerConfig *> selectionFor(
-      OwnerStore &owners, const std::wstring &dataRoot, const std::vector<std::wstring> &ids) {
+      OwnerStore &owners, const std::wstring &dataRoot, const std::vector<std::wstring> &ids,
+      const std::wstring &teamId) {
     const std::wstring root = extended(dataRoot);
     std::pair<std::wstring, SelectedControllerConfig *> first{L"", nullptr};
     for (const auto &id : ids) {
@@ -1382,6 +1698,7 @@ struct WindowsNativeRunStateIssuer {
       require(selectedRoot == root || selectedRoot.rfind(root + L"\\", 0) == 0,
               "run_control_selection_missing");
       selected.assertLive(owners.selectedPackage);
+      (void)selected.inboxState(teamId);
       if (!first.second)
         first = {id, &selected};
     }
@@ -1391,8 +1708,9 @@ struct WindowsNativeRunStateIssuer {
 
   static State &issueState(OwnerStore &owners, const std::wstring &dataRoot,
                            const std::wstring &directory, bool create,
-                           bool &created, const std::vector<std::wstring> &selectionIds) {
-    (void)selectionFor(owners, dataRoot, selectionIds);
+                           bool &created, const std::vector<std::wstring> &selectionIds,
+                           const std::wstring &teamId) {
+    (void)selectionFor(owners, dataRoot, selectionIds, teamId);
     for (auto &entry : owners.runStates) {
       if (entry.second->directory() != directory)
         continue;
@@ -1444,7 +1762,10 @@ struct WindowsNativeRunStateIssuer {
     require(basename.size() == 32 &&
                 basename.find_first_not_of(L"0123456789abcdef") == std::wstring::npos,
             "run_state_identity_changed");
-    return issueState(owners, dataRoot, directory, create, created, selectionIds(input));
+    const auto teamId = input.HasKey(L"teamId")
+                            ? text(input, L"teamId")
+                            : text(object(input, L"binding"), L"teamId");
+    return issueState(owners, dataRoot, directory, create, created, selectionIds(input), teamId);
   }
 
   static State &namedState(OwnerStore &owners, const JsonObject &input) {
@@ -1527,6 +1848,8 @@ struct WindowsNativeRunStateIssuer {
             "run_state_record_changed");
     const auto members = receipt.GetNamedArray(L"members");
     require(members.Size() <= 32, "run_state_record_changed");
+    if (text(receipt, L"state") == L"stopped")
+      require(members.Size() > 0, "run_state_record_changed");
     for (const auto memberValue : members) {
       require(memberValue.ValueType() == JsonValueType::Object, "run_state_record_changed");
       const auto member = memberValue.GetObject();
@@ -1540,6 +1863,10 @@ struct WindowsNativeRunStateIssuer {
         require(error.ValueType() == JsonValueType::String &&
                     std::wstring(error.GetString()).size() > 0 &&
                     std::wstring(error.GetString()).size() <= 256,
+                "run_state_record_changed");
+      if (text(receipt, L"state") == L"stopped")
+        require(errors.Size() == 0 &&
+                    member.GetNamedValue(L"cleanup").ValueType() == JsonValueType::Object,
                 "run_state_record_changed");
       const auto cleanupValue = member.GetNamedValue(L"cleanup");
       if (cleanupValue.ValueType() == JsonValueType::Null)
@@ -1565,23 +1892,28 @@ struct WindowsNativeRunStateIssuer {
     }
   }
 
+  static void retainOriginalEndpointOwners(State &state, const JsonObject &record) {
+    const auto endpoint = object(record, L"endpoint");
+    const auto helper = object(endpoint, L"helper"), bun = object(endpoint, L"bun");
+    const DWORD helperPid = State::runStateProcessIdLocked(helper, "run_control_endpoint_changed");
+    const DWORD bunPid = State::runStateProcessIdLocked(bun, "run_control_endpoint_changed");
+    Handle heldHelper(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, helperPid));
+    Handle heldBun(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, bunPid));
+    require(heldHelper && heldBun &&
+                runControlCanonicalJson(Control::runControlNativeIdentity(heldHelper.value, helperPid)) == runControlCanonicalJson(helper) &&
+                runControlCanonicalJson(Control::runControlNativeIdentity(heldBun.value, bunPid)) == runControlCanonicalJson(bun),
+            "run_control_endpoint_changed");
+    std::lock_guard<std::mutex> lock(state.mutex_);
+    State::runStateAssertRetirementWitnessLocked(heldHelper.value, state.helperPid_, state.helperBirth_, "run_control_endpoint_changed");
+    State::runStateAssertRetirementWitnessLocked(heldBun.value, state.bunPid_, state.bunBirth_, "run_control_endpoint_changed");
+    state.serverProcess_ = std::move(heldHelper);
+    state.parentProcess_ = std::move(heldBun);
+  }
+
   static bool physicalOwnerRetired(OwnerStore &owners, State &state) {
     (void)owners;
-    const auto endpoint = state.endpointRecord();
-    const auto process = endpoint.GetNamedObject(L"process");
-    const double raw = process.GetNamedNumber(L"pid");
-    require(raw > 0 && raw <= MAXDWORD && raw == static_cast<DWORD>(raw), "run_state_unknown");
-    Handle server(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE,
-                              static_cast<DWORD>(raw)));
-    if (!server && GetLastError() == ERROR_INVALID_PARAMETER)
-      return state.ownerRetired();
-    require(static_cast<bool>(server), "run_state_unknown");
-    require(Control::runControlRequireFullToken(server.value), "run_state_unknown");
-    const auto before = Control::runControlNativeIdentity(server.value, static_cast<DWORD>(raw));
-    require(runControlCanonicalJson(before) == runControlCanonicalJson(process),
-            "run_state_unknown");
-    if (WaitForSingleObject(server.value, 0) != WAIT_OBJECT_0)
-      return false;
+    // The State owns the original helper and Bun MAIN process handles. A PID
+    // reopen, helper/control closure or replacement observer cannot qualify it.
     return state.ownerRetired();
   }
 
@@ -1620,6 +1952,7 @@ struct WindowsNativeRunStateIssuer {
         state.select();
         try {
           const auto endpoint = state.readEndpoint();
+          retainOriginalEndpointOwners(state, endpoint);
           state.adoptEndpointHash(runControlSha256Hex(runControlCanonicalJson(endpoint)));
         } catch (const NativeError &error) {
           if (error.code != "run_state_endpoint_missing")
@@ -1648,6 +1981,7 @@ struct WindowsNativeRunStateIssuer {
         if (created)
           state.select();
         const auto endpoint = state.readEndpoint();
+        if (created) retainOriginalEndpointOwners(state, endpoint);
         state.adoptEndpointHash(runControlSha256Hex(runControlCanonicalJson(endpoint)));
         JsonObject result;
         str(result, L"stateId", state.id());
@@ -1684,10 +2018,7 @@ struct WindowsNativeRunStateIssuer {
     }
     if (operation == L"runStateValidateEndpoint") {
       auto &state = namedState(owners, input);
-      state.validateEndpointHash(text(input, L"endpointHash"));
-      JsonObject result;
-      flag(result, L"valid", true);
-      return result;
+      return state.validateEndpointHash(text(input, L"endpointHash"));
     }
     if (operation == L"runStateOwnerRetired") {
       auto &state = namedState(owners, input);
@@ -1927,9 +2258,18 @@ static std::unique_ptr<Scope> launch(const JsonObject &input, OwnerStore &owners
   require(winrt::to_string(mapping.Stringify()).size() <= CONTROL_PACKET_LIMIT - 1024,
           "execution_invalid_response");
   scope->mapping = mapping;
+  scope->readerFinished = Handle(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+  require(static_cast<bool>(scope->readerFinished), "execution_native_unknown");
   scope->reader = std::thread([value = scope.get()] {
     winrt::init_apartment(winrt::apartment_type::multi_threaded);
-    value->read();
+    try { value->read(); }
+    catch (...) { event(L"failed", value->mapping); }
+    SetEvent(value->readerFinished.value);
+  });
+  scope->mainExit = std::thread([value = scope.get()] {
+    winrt::init_apartment(winrt::apartment_type::multi_threaded);
+    try { value->observeMainExit(); }
+    catch (...) { event(L"failed", value->mapping); }
   });
   require(ResumeThread(scope->thread.value) == 1, "execution_containment_launcher_denied");
   scope->thread.reset();
