@@ -343,11 +343,11 @@ jobs:
           node-version: '24'
       - name: Install frozen portable dependencies
         run: bun install --frozen-lockfile --linker hoisted
-      - name: Test native compiled delegation and cancellation
-        run: bun test src/cli/packagedOpenCodeDelivery.test.ts
       - name: Compile Windows x64 native assets
         if: matrix.platform == 'win32-x64'
         run: bun scripts/opencode-v2/compile-windows.ts
+      - name: Test native compiled delegation and cancellation
+        run: bun test src/cli/packagedOpenCodeDelivery.test.ts
       - name: Select qualified Windows runtime Bun
         if: matrix.platform == 'win32-x64'
         uses: oven-sh/setup-bun@v2

@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { copyFile, lstat, mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { copyFile, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { isPackagedOpenCodeCommand, validatePackagedOpenCodeIdentity } from './packagedOpenCodeDelivery.js'
@@ -10,7 +10,7 @@ const sha = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('he
 const abruptCallerTermination = (code: number | null, signal: string | null) =>
   (Number.isInteger(code) && code !== 0 && signal === null) || (code === null && signal === 'SIGTERM')
 beforeAll(async () => {
-  root = await mkdtemp(path.join(tmpdir(), 'TEST-packaged-opencode-'))
+  root = await realpath(await mkdtemp(path.join(tmpdir(), 'TEST-packaged-opencode-')))
   binary = path.join(root, process.platform === 'win32' ? 'frontdoor.exe' : 'frontdoor')
   bun = path.join(root, 'bun', process.platform === 'win32' ? 'bun.exe' : 'bun')
   entry = path.join(root, 'local-cli/cli.js')
@@ -92,10 +92,13 @@ test('missing Bun refuses without using inherited Bun/PATH', async () => {
   finally {await rename(bun+'.owned-quarantine',bun)}
 })
 test('changed Bun refuses before executing the sidecar', async () => {
-  const original=await readFile(bun)
-  await writeFile(bun,'invalid-bun-bytes')
-  try {const result=await run(['runtime','status']);expect(result.exit).not.toBe(0);expect(result.stderr).toContain('packaged_opencode_delivery_changed');expect(result.stdout).toBe('')}
-  finally {await writeFile(bun,original)}
+  const original=bun+'.owned-quarantine'
+  await rename(bun,original)
+  try {
+    await writeFile(bun,'invalid-bun-bytes')
+    const result=await run(['runtime','status']);expect(result.exit).not.toBe(0);expect(result.stderr).toContain('packaged_opencode_delivery_changed');expect(result.stdout).toBe('')
+  }
+  finally {await rm(bun,{force:true});await rename(original,bun)}
 })
 if (process.platform !== 'win32') {
 async function readDeliveryReady(reader: ReadableStreamDefaultReader<Uint8Array>): Promise<string> {
