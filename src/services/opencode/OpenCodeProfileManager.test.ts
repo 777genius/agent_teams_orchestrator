@@ -117,7 +117,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
   let tempDir: string
   const isolatedEnvKeys = [
     'HOME', 'USERPROFILE', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME',
-    'PATH', 'CURSOR_ACP_HOME_DIR',
+    'PATH', 'CURSOR_ACP_HOME_DIR', 'CLAUDE_AGENT_TEAMS_ATTACHMENT_ROOT',
     CLAUDE_MULTIMODEL_DATA_HOME_ENV, CLAUDE_MULTIMODEL_CACHE_HOME_ENV,
     'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND',
     'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON',
@@ -128,6 +128,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
 
   beforeEach(async () => {
     tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-profile-'))
+    delete process.env.CLAUDE_AGENT_TEAMS_ATTACHMENT_ROOT
     process.env.HOME = path.join(tempDir, 'home')
     process.env.USERPROFILE = process.env.HOME
     process.env.XDG_CONFIG_HOME = path.join(tempDir, 'xdg-config')
@@ -201,6 +202,192 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       customCatalog.profileRootPath,
       legacy.profileRootPath,
     ]).size).toBe(6)
+  })
+
+  test.each(['auto', 'manual'] as const)('grants only the scoped attachment subtree in %s profiles', async toolApprovalMode => {
+    const projectPath = path.join(tempDir, 'attachment-project')
+    const attachmentRoot = path.join(tempDir, 'attachments')
+    await mkdir(projectPath)
+    await mkdir(attachmentRoot)
+    const root = await realpath(attachmentRoot)
+    const pattern = path.join(root, '**')
+    const scope = await resolveOpenCodeProfileScope({
+      projectPath, purpose: 'catalog', selectedModel: 'custom/model',
+      env: { ...process.env, CLAUDE_AGENT_TEAMS_ATTACHMENT_ROOT: attachmentRoot },
+    })
+    // Preparation must use the retained scoped environment, not a later process value.
+    process.env.CLAUDE_AGENT_TEAMS_ATTACHMENT_ROOT = path.join(tempDir, 'different-root')
+    const profile = await new OpenCodeProfileManager().prepareProfile(projectPath, { profileScope: scope, toolApprovalMode })
+    const agents = profile.managedConfig.agent as Record<string, { permission: Record<string, unknown> }>
+    expect(agents.teammate.permission.external_directory).toEqual({ '*': 'deny', [pattern]: 'allow' })
+    expect(agents.teammate.permission.edit).toEqual({
+      '*': toolApprovalMode === 'manual' ? 'ask' : 'allow', [pattern]: 'deny',
+      [path.join(path.relative(path.parse(profile.canonicalProjectPath).root, root), '**')]: 'deny',
+    })
+    expect(agents.teammate.permission['*']).toBe(toolApprovalMode === 'manual' ? 'ask' : 'deny')
+    expect(agents.teammate.permission.read).toBe(toolApprovalMode === 'manual' ? undefined : 'allow')
+    expect(agents.teammate.permission.bash).toBe(toolApprovalMode === 'manual' ? undefined : 'allow')
+    expect(agents['teammate-bootstrap'].permission).not.toHaveProperty('external_directory')
+    expect(agents['teammate-model-probe'].permission).toEqual({ '*': 'deny' })
+  })
+
+  test.each(['regular', 'linked'] as const)('denies the native worktree-relative attachment resource in a %s Git project', async kind => {
+    const repository = path.join(tempDir, 'repository')
+    await runCommandCapture('git', ['init', '--quiet', repository], process.env)
+    let worktree = repository
+    if (kind === 'linked') {
+      const commitEnv = {
+        ...process.env,
+        GIT_AUTHOR_NAME: 'iliya', GIT_AUTHOR_EMAIL: 'iliyazelenkog@gmail.com',
+        GIT_COMMITTER_NAME: 'iliya', GIT_COMMITTER_EMAIL: 'iliyazelenkog@gmail.com',
+      }
+      for (const identity of ['GIT_AUTHOR_IDENT', 'GIT_COMMITTER_IDENT']) {
+        expect(await runCommandCapture('git', ['-C', repository, 'var', identity], commitEnv))
+          .toMatch(/^iliya <iliyazelenkog@gmail\.com> /)
+      }
+      await runCommandCapture('git', ['-C', repository, 'commit', '--quiet', '--allow-empty', '-m', 'test: seed permission fixture'], commitEnv)
+      expect(await runCommandCapture('git', ['-C', repository, 'log', '-1', '--format=%an <%ae>%n%cn <%ce>'], commitEnv))
+        .toBe('iliya <iliyazelenkog@gmail.com>\niliya <iliyazelenkog@gmail.com>\n')
+      worktree = path.join(tempDir, 'linked', 'worktree')
+      await mkdir(path.dirname(worktree))
+      await runCommandCapture('git', ['-C', repository, 'worktree', 'add', '--quiet', '--detach', worktree], process.env)
+    }
+    const projectPath = path.join(worktree, 'nested-project')
+    const attachmentRoot = path.join(tempDir, 'attachments')
+    await mkdir(projectPath)
+    await mkdir(attachmentRoot)
+    const canonicalRoot = await realpath(attachmentRoot)
+    const canonicalWorktree = await realpath(worktree)
+    const scope = await resolveOpenCodeProfileScope({
+      projectPath, purpose: 'catalog', selectedModel: 'custom/model',
+      env: { ...process.env, CLAUDE_AGENT_TEAMS_ATTACHMENT_ROOT: attachmentRoot },
+    })
+    const profile = await new OpenCodeProfileManager().prepareProfile(projectPath, { profileScope: scope })
+    const agents = profile.managedConfig.agent as Record<string, { permission: Record<string, unknown> }>
+    expect(agents.teammate.permission.edit).toEqual({
+      '*': 'allow', [path.join(canonicalRoot, '**')]: 'deny',
+      [path.join(path.relative(canonicalWorktree, canonicalRoot), '**')]: 'deny',
+    })
+    expect(agents.teammate.permission.external_directory).toEqual({
+      '*': 'deny', [path.join(canonicalRoot, '**')]: 'allow',
+    })
+  })
+
+  test('changes cached profile identity and grants when the supplied attachment root changes', async () => {
+    const projectPath = path.join(tempDir, 'root-change-project')
+    await mkdir(projectPath)
+    const manager = new OpenCodeProfileManager()
+    const profiles = []
+    for (const name of ['root-a', 'root-b', null]) {
+      const attachmentRoot = name ? path.join(tempDir, name) : undefined
+      if (attachmentRoot) await mkdir(attachmentRoot)
+      const scope = await resolveOpenCodeProfileScope({
+        projectPath, purpose: 'catalog', selectedModel: 'custom/model',
+        env: { ...process.env, CLAUDE_AGENT_TEAMS_ATTACHMENT_ROOT: attachmentRoot },
+      })
+      profiles.push(await manager.prepareProfile(projectPath, { profileScope: scope }))
+    }
+    expect(new Set(profiles.map(profile => profile.scopeToken)).size).toBe(3)
+    expect(new Set(profiles.map(profile => profile.managedConfigFingerprint)).size).toBe(3)
+    for (const [index, name] of ['root-a', 'root-b'].entries()) {
+      const agents = profiles[index]!.managedConfig.agent as Record<string, { permission: Record<string, unknown> }>
+      expect(agents.teammate.permission.external_directory).toEqual({
+        '*': 'deny', [path.join(await realpath(path.join(tempDir, name)), '**')]: 'allow',
+      })
+    }
+    const agents = profiles[2]!.managedConfig.agent as Record<string, { permission: Record<string, unknown> }>
+    expect(agents.teammate.permission.external_directory).toBe('deny')
+    expect(agents.teammate.permission.edit).toBe('allow')
+  })
+
+  test('imports project config without accepting its attachment permission grants', async () => {
+    const projectPath = path.join(tempDir, 'imported-policy-project')
+    const attachmentRoot = path.join(tempDir, 'attachments')
+    await mkdir(projectPath)
+    await mkdir(attachmentRoot)
+    const pattern = path.join(await realpath(attachmentRoot), '**')
+    await writeFile(path.join(projectPath, 'opencode.json'), JSON.stringify({
+      provider: { custom: { options: { route: 'project-import-marker' } } },
+      agent: { teammate: { permission: {
+        external_directory: { '*': 'allow', '/outside/**': 'allow' },
+        edit: { [pattern]: 'allow', '*': 'allow', '/outside/**': 'deny' },
+      } } },
+    }))
+    const scope = await resolveOpenCodeProfileScope({
+      projectPath, purpose: 'catalog', selectedModel: 'custom/model',
+      env: { ...process.env, CLAUDE_AGENT_TEAMS_ATTACHMENT_ROOT: attachmentRoot },
+    })
+    const profile = await new OpenCodeProfileManager().prepareProfile(projectPath, {
+      profileScope: scope, toolApprovalMode: 'manual',
+    })
+    expect(profile.managedConfig.provider).toMatchObject({ custom: { options: { route: 'project-import-marker' } } })
+    const agents = profile.managedConfig.agent as Record<string, { permission: Record<string, unknown> }>
+    expect(agents.teammate.permission.external_directory).toEqual({ '*': 'deny', [pattern]: 'allow' })
+    expect(Object.entries(agents.teammate.permission.edit as Record<string, unknown>)).toEqual([
+      ['*', 'ask'], [pattern, 'deny'],
+      [path.join(path.relative(path.parse(profile.canonicalProjectPath).root, await realpath(attachmentRoot)), '**'), 'deny'],
+    ])
+  })
+
+  test('rejects a direct attachment-root symlink and retains the directory deny', async () => {
+    const projectPath = path.join(tempDir, 'symlink-root-project')
+    const target = path.join(tempDir, 'unrelated-directory')
+    const rootLink = path.join(tempDir, 'attachments-link')
+    await mkdir(projectPath)
+    await mkdir(target)
+    await symlink(target, rootLink, process.platform === 'win32' ? 'junction' : 'dir')
+    const scope = await resolveOpenCodeProfileScope({
+      projectPath, purpose: 'catalog', selectedModel: 'custom/model',
+      env: { ...process.env, CLAUDE_AGENT_TEAMS_ATTACHMENT_ROOT: `${rootLink}${path.sep}` },
+    })
+    const profile = await new OpenCodeProfileManager().prepareProfile(projectPath, { profileScope: scope })
+    const agents = profile.managedConfig.agent as Record<string, { permission: Record<string, unknown> }>
+    expect(agents.teammate.permission.external_directory).toBe('deny')
+    expect(profile.env.CLAUDE_AGENT_TEAMS_ATTACHMENT_ROOT).toBeUndefined()
+  })
+
+  test('binds the canonical scoped root across parent aliases and refuses later redirection', async () => {
+    const projectPath = path.join(tempDir, 'canonical-root-project')
+    const parentA = path.join(tempDir, 'parent-a')
+    const parentB = path.join(tempDir, 'parent-b')
+    const alias = path.join(tempDir, 'parent-alias')
+    await mkdir(projectPath)
+    await mkdir(path.join(parentA, 'attachments'), { recursive: true })
+    await mkdir(path.join(parentB, 'attachments'), { recursive: true })
+    const linkType = process.platform === 'win32' ? 'junction' : 'dir'
+    await symlink(parentA, alias, linkType)
+    const canonicalRoot = await realpath(path.join(parentA, 'attachments'))
+    const scope = await resolveOpenCodeProfileScope({
+      projectPath, purpose: 'catalog', selectedModel: 'custom/model',
+      env: { ...process.env, CLAUDE_AGENT_TEAMS_ATTACHMENT_ROOT: path.join(alias, 'attachments') },
+    })
+    await rm(alias)
+    await symlink(parentB, alias, linkType)
+    const manager = new OpenCodeProfileManager()
+    const profile = await manager.prepareProfile(projectPath, { profileScope: scope })
+    const agents = profile.managedConfig.agent as Record<string, { permission: Record<string, unknown> }>
+    expect(profile.env.CLAUDE_AGENT_TEAMS_ATTACHMENT_ROOT).toBe(canonicalRoot)
+    expect(agents.teammate.permission.external_directory).toEqual({ '*': 'deny', [path.join(canonicalRoot, '**')]: 'allow' })
+    await rm(canonicalRoot, { recursive: true })
+    await symlink(path.join(parentB, 'attachments'), canonicalRoot, linkType)
+    await expect(manager.prepareProfile(projectPath, { profileScope: scope }))
+      .rejects.toThrow('canonical attachment root changed')
+  })
+
+  test.each(['missing', 'relative', 'wildcard', 'file'] as const)('keeps the old directory deny for a %s attachment root', async kind => {
+    const projectPath = path.join(tempDir, 'invalid-root-project')
+    await mkdir(projectPath)
+    const attachmentRoot = kind === 'relative' ? 'attachments' : path.join(tempDir, kind === 'wildcard' ? 'attach*ments' : kind)
+    if (kind === 'wildcard' && process.platform !== 'win32') await mkdir(attachmentRoot)
+    if (kind === 'file') await writeFile(attachmentRoot, 'not a directory')
+    const scope = await resolveOpenCodeProfileScope({
+      projectPath, purpose: 'catalog', selectedModel: 'custom/model',
+      env: { ...process.env, CLAUDE_AGENT_TEAMS_ATTACHMENT_ROOT: attachmentRoot },
+    })
+    const profile = await new OpenCodeProfileManager().prepareProfile(projectPath, { profileScope: scope })
+    const agents = profile.managedConfig.agent as Record<string, { permission: Record<string, unknown> }>
+    expect(agents.teammate.permission.external_directory).toBe('deny')
+    expect(agents.teammate.permission.edit).toBe('allow')
   })
 
   test('prepares and retries an existing workspace despite Windows mkdir EEXIST', async () => {
