@@ -335,7 +335,7 @@ test('mandatory controller qualification and optional graph hash conflicts remai
         type: 'local', command: [node, f.controllerEntry],
       }))).rejects.toThrow('controller_runtime_dependency_missing')
 
-    const replacement = macho(['/usr/lib/libSystem.B.dylib'])
+    const replacement = Buffer.concat([macho([]), Buffer.alloc(8)])
     const trigger = path.join(f.root, 'controller/package.json')
     const readFile = (async (...args: unknown[]) => {
       const value = await (actualFs.readFile as unknown as (...values: unknown[]) => Promise<unknown>)(...args)

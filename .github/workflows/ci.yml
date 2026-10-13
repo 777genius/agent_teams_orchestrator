@@ -365,6 +365,11 @@ jobs:
           $commandReceipt = Join-Path $env:RUNNER_TEMP 'TEST-windows-command-receipt.json'
           bun scripts/opencode-v2/windows-command-probe.ts $commandRoot $commandReceipt
           if ($LASTEXITCODE -ne 0) { throw 'Native command and descendant retirement contract failed' }
+      - name: Restore Windows release compiler Bun
+        if: matrix.platform == 'win32-x64'
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.2'
       - name: Produce physical JS and native front door
         run: bun scripts/package-runtime.ts --platform ${{ matrix.platform }}
       - name: Verify and archive complete candidate delivery
