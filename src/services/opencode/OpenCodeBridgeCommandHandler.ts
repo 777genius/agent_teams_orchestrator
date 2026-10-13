@@ -2456,6 +2456,8 @@ function preHostCursorFailureReadinessData(input: {
 function describeAuthorityRejection(diagnostic: OpenCodeAuthorityRejection): string {
   return diagnostic.check === 'exception'
     ? ` (${diagnostic.check}:${diagnostic.phase}:${diagnostic.errorClass})`
+    : diagnostic.check === 'behavior_match' && diagnostic.fields
+      ? ` (${diagnostic.check}:${diagnostic.fields.join(',')})`
     : diagnostic.check === 'selected_config_match'
       ? ` (${diagnostic.check}:${diagnostic.fields.join(',')})`
       : ` (${diagnostic.check})`
@@ -2666,6 +2668,7 @@ async function runReadiness(
         host: retainedHost,
         selectedModel: qualifiedSelectedModel.raw,
         expectedBehaviorFingerprint: initialEvidence.expectedBehaviorFingerprint,
+        initialExpectedBehaviorEvidence: initialEvidence,
         contractConfigIdentity: toolProof.contractConfigIdentity,
         onRejection,
         phaseContext,
@@ -2691,6 +2694,7 @@ async function runReadiness(
           && executionOutcome.observedModelId === qualifiedSelectedModel.modelId
           ? completedOAuthProbe : undefined,
         expectedBehaviorFingerprint: initialEvidence.expectedBehaviorFingerprint,
+        initialExpectedBehaviorEvidence: initialEvidence,
         contractConfigIdentity: toolProof.contractConfigIdentity,
         onRejection,
         phaseContext,

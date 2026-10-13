@@ -8,9 +8,12 @@ import { openCodeClientFactory } from './OpenCodeClientFactory.js'
 import { OPEN_CODE_APP_MCP_SERVER_NAME, openCodeMcpManager } from './OpenCodeMcpManager.js'
 import { parseOpenCodeProviderScopedModelRef } from './OpenCodeModelRef.js'
 import { buildManagedConfigFingerprint, collectProjectBehaviorMetadata, resolveOpenCodeProfileScope, openCodeProfileManager } from './OpenCodeProfileManager.js'
-import { buildOpenCodeExpectedBehaviorEvidence } from './OpenCodeExpectedBehaviorFingerprint.js'
+import {
+  buildOpenCodeExpectedBehaviorEvidence,
+  validateOpenCodeExpectedBehaviorEvidence,
+} from './OpenCodeExpectedBehaviorFingerprint.js'
 import type { OpenCodePhaseContext } from './OpenCodeRuntimeDeadline.js'
-import type { OpenCodeHostHandle, OpenCodeSessionRecord } from './types.js'
+import type { OpenCodeExpectedBehaviorEvidence, OpenCodeHostHandle, OpenCodeSessionRecord } from './types.js'
 
 type OpenCodeSelectedProfileAuthorityDeps = {
   clientFactory?: Pick<typeof openCodeClientFactory, 'create'>
@@ -24,7 +27,8 @@ export type OpenCodeAuthorityRejection =
   | { check: 'selected_model' | 'profile_scope' | 'mcp_name' | 'mcp_connected'
       | 'live_mcp_present' | 'mcp_config_match' | 'contract_config_match'
       | 'scope_token_match' | 'scope_config_match'
-      | 'selected_auth_identity_match' | 'behavior_match' }
+      | 'selected_auth_identity_match' }
+  | { check: 'behavior_match'; fields?: readonly OpenCodeBehaviorDifferenceField[] }
   | { check: 'selected_config_match'; fields: OpenCodeSelectedConfigField[] }
   | { check: 'exception'; phase: OpenCodeAuthorityRefreshPhase
       errorClass: 'TypeError' | 'RangeError' | 'SyntaxError' | 'Error' | 'non_error' }
@@ -35,6 +39,9 @@ type OpenCodeAuthorityRefreshPhase = 'initial' | 'live_config' | 'app_mcp'
 const SELECTED_CONFIG_FIELDS = ['provider', 'model', 'small_model', 'plugin', 'agent',
   'default_agent', 'permission', 'command', 'share', 'snapshot', 'autoupdate', 'mcp'] as const
 type OpenCodeSelectedConfigField = typeof SELECTED_CONFIG_FIELDS[number]
+const BEHAVIOR_DIFFERENCE_FIELDS = ['canonicalProjectPathFingerprint', 'modelProviderId', 'fullModelId',
+  'projectBehaviorFingerprint', 'effectiveConfigFingerprint', 'effectiveSelectedAuthFingerprint'] as const
+type OpenCodeBehaviorDifferenceField = typeof BEHAVIOR_DIFFERENCE_FIELDS[number]
 
 class OpenCodeAuthorityReadError {
   constructor(readonly phase: OpenCodeAuthorityRefreshPhase, readonly error: unknown) {}
@@ -68,6 +75,7 @@ export async function refreshSelectedProfileAuthority(input: {
     host: OpenCodeHostHandle
     selectedModel: string
     expectedBehaviorFingerprint: string
+    initialExpectedBehaviorEvidence?: OpenCodeExpectedBehaviorEvidence
     contractConfigIdentity?: string | null
     // Only the successful post-execution readiness check may compare an owned
     // committed rotation. The retained profile is never resealed or reusable.
@@ -227,8 +235,16 @@ export async function refreshSelectedProfileAuthority(input: {
         || input.expectedBehaviorFingerprint !== expectedFingerprint || input.contractConfigIdentity !== contractIdentity) {
         return reject({ check: 'selected_config_match', fields: [] })
       }
-      return evidence.expectedBehaviorFingerprint === expectedFingerprint
-        ? refreshed : reject({ check: 'behavior_match' })
+      if (evidence.expectedBehaviorFingerprint === expectedFingerprint) return refreshed
+      const initial = input.initialExpectedBehaviorEvidence
+      const usableInitial = initial && initial.expectedBehaviorFingerprint === expectedFingerprint
+        && initial.modelProviderId === selected.providerId
+        && initial.fullModelId === selected.raw
+        && validateOpenCodeExpectedBehaviorEvidence(initial) ? initial : undefined
+      const fields = usableInitial
+        ? BEHAVIOR_DIFFERENCE_FIELDS.filter(field => usableInitial[field] !== evidence[field])
+        : undefined
+      return reject({ check: 'behavior_match', ...(fields?.length ? { fields } : {}) })
     } catch (caught) {
       const error = caught instanceof OpenCodeAuthorityReadError ? caught.error : caught
       return reject({

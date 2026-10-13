@@ -2,7 +2,10 @@ import type { OpenCodeOAuthNativeProbeOwner } from './OpenCodeAuthStore.js'
 import * as processIdentity from '../../utils/processKill.js'
 import { OpenCodeExecutionProbe } from './OpenCodeExecutionProbe.js'
 import { buildOpenCodeExecutionProof, validateOpenCodeExecutionProof } from './OpenCodeExecutionProof.js'
-import { buildOpenCodeExpectedBehaviorEvidence } from './OpenCodeExpectedBehaviorFingerprint.js'
+import {
+  buildOpenCodeExpectedBehaviorEvidence,
+  computeOpenCodeExpectedBehaviorFingerprint,
+} from './OpenCodeExpectedBehaviorFingerprint.js'
 import { openCodeOAuthSuccessorPath, readOpenCodeAuthCredential, upsertOpenCodeAuthCredential } from './OpenCodeAuthStore.js'
 import { effectiveAgentsFixture } from './OpenCodeEffectiveAgents.test-support.js'
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
@@ -12,7 +15,7 @@ import path from 'node:path'
 import { OpenCodeProfileManager, assertOpenCodePreparedProfileScope, resolveOpenCodeProfileScope, buildManagedConfigFingerprint } from './OpenCodeProfileManager.js'
 import { refreshSelectedProfileAuthority, type OpenCodeAuthorityRejection } from './OpenCodeSelectedProfileAuthority.js'
 import type { OpenCodePhaseContext } from './OpenCodeRuntimeDeadline.js'
-import type { OpenCodeHostHandle } from './types.js'
+import type { OpenCodeExpectedBehaviorEvidence, OpenCodeHostHandle } from './types.js'
 
 function fixture() {
   const config = {
@@ -38,8 +41,10 @@ function fixture() {
   let resolveScope: typeof resolveOpenCodeProfileScope = async () => structuredClone(scope) as never
   let buildEvidence = async () => ({ expectedBehaviorFingerprint: 'expected' }) as any
   const diagnostics: unknown[] = []
-  const refresh = (phaseContext?: OpenCodePhaseContext) => refreshSelectedProfileAuthority({ host,
-    selectedModel: 'custom/team/model', expectedBehaviorFingerprint: 'expected',
+  const refresh = (phaseContext?: OpenCodePhaseContext,
+    initialExpectedBehaviorEvidence?: OpenCodeExpectedBehaviorEvidence,
+    expectedBehaviorFingerprint = 'expected') => refreshSelectedProfileAuthority({ host,
+    selectedModel: 'custom/team/model', expectedBehaviorFingerprint, initialExpectedBehaviorEvidence,
     phaseContext, onRejection: value => diagnostics.push(value),
   }, { clientFactory: { create: () => ({ getConfig: () => getConfig(), listAgents: () => { agentReads += 1; return listAgents() } }) as never },
     mcpManager: { ensureAppMcp: async () => ({ summary: { matchedServerName: 'agent-teams', connected: true } }) as never },
@@ -300,6 +305,75 @@ describe('selected launch authority contract', () => {
       expect(JSON.stringify(f.diagnostics)).not.toContain('sensitive')
       expect(JSON.stringify(f.diagnostics)).not.toContain('secret')
     }
+  })
+})
+
+function syntheticBehaviorEvidence(
+  overrides: Partial<Omit<OpenCodeExpectedBehaviorEvidence, 'expectedBehaviorFingerprint'>> = {},
+  expectedBehaviorFingerprint?: string,
+): OpenCodeExpectedBehaviorEvidence {
+  const unsigned = {
+    canonicalProjectPathFingerprint: 'a'.repeat(64),
+    modelProviderId: 'custom',
+    fullModelId: 'custom/team/model',
+    projectBehaviorFingerprint: 'b'.repeat(64),
+    effectiveConfigFingerprint: 'c'.repeat(64),
+    effectiveSelectedAuthFingerprint: 'd'.repeat(64),
+    ...overrides,
+  }
+  return { ...unsigned, expectedBehaviorFingerprint:
+    expectedBehaviorFingerprint ?? computeOpenCodeExpectedBehaviorFingerprint(unsigned) }
+}
+
+describe('selected behavior mismatch diagnostics', () => {
+  test('exposes exact differing field names without evidence values or sensitive model payload', async () => {
+    const initial = syntheticBehaviorEvidence()
+    const fresh = syntheticBehaviorEvidence({
+      fullModelId: 'custom/team/SECRET-model',
+      projectBehaviorFingerprint: 'e'.repeat(64),
+      effectiveConfigFingerprint: 'f'.repeat(64),
+      effectiveSelectedAuthFingerprint: '1'.repeat(64),
+    })
+    const f = fixture()
+    f.evidence = async () => fresh
+    expect(await f.refresh(undefined, initial, initial.expectedBehaviorFingerprint)).toBeNull()
+    expect(f.diagnostics.at(-1)).toEqual({
+      check: 'behavior_match',
+      fields: ['fullModelId', 'projectBehaviorFingerprint', 'effectiveConfigFingerprint',
+        'effectiveSelectedAuthFingerprint'],
+    })
+    const rendered = JSON.stringify(f.diagnostics)
+    expect(rendered).not.toContain('SECRET-model')
+    for (const value of ['e'.repeat(64), 'f'.repeat(64), '1'.repeat(64)]) expect(rendered).not.toContain(value)
+  })
+
+  test('missing, malformed or inconsistent optional evidence preserves behavior_match rejection without field details', async () => {
+    const initial = syntheticBehaviorEvidence()
+    const foreign = syntheticBehaviorEvidence({ fullModelId: 'custom/team/foreign-secret' })
+    const cases: Array<[OpenCodeExpectedBehaviorEvidence | undefined, string]> = [
+      [undefined, initial.expectedBehaviorFingerprint],
+      [{ expectedBehaviorFingerprint: initial.expectedBehaviorFingerprint } as OpenCodeExpectedBehaviorEvidence,
+        initial.expectedBehaviorFingerprint],
+      [initial, syntheticBehaviorEvidence({ modelProviderId: 'other' }).expectedBehaviorFingerprint],
+      [foreign, foreign.expectedBehaviorFingerprint],
+    ]
+    for (const [initialEvidence, expected] of cases) {
+      const f = fixture()
+      f.evidence = async () => syntheticBehaviorEvidence({
+        projectBehaviorFingerprint: 'e'.repeat(64), effectiveSelectedAuthFingerprint: '1'.repeat(64),
+      })
+      expect(await f.refresh(undefined, initialEvidence, expected)).toBeNull()
+      expect(f.diagnostics.at(-1)).toEqual({ check: 'behavior_match' })
+      expect(JSON.stringify(f.diagnostics)).not.toContain('foreign-secret')
+    }
+  })
+
+  test('valid optional evidence remains diagnostic-only and does not alter matching authority', async () => {
+    const initial = syntheticBehaviorEvidence()
+    const f = fixture()
+    f.evidence = async () => initial
+    expect(await f.refresh(undefined, initial, initial.expectedBehaviorFingerprint)).not.toBeNull()
+    expect(f.diagnostics).toEqual([])
   })
 })
 

@@ -170,7 +170,7 @@ for (const mode of ['open', 'exit-only', 'late-close', 'abort'] as const) {
 // never become signal authority, nor hide an orphan in the next full census.
 function additionFixture(mode: 'gone' | 'alive' | 'unknown' | 'orphan' | 'reused' | 'older' | 'expired' |
   'confirmation-gone' | 'confirmation-live' | 'confirmation-reused' | 'stale-gone' | 'stale-live' |
-  'late-orphan' | 'open', platform: NodeJS.Platform = 'win32') {
+  'late-orphan' | 'open' | 'captured-orphan-alive' | 'captured-orphan-unknown', platform: NodeJS.Platform = 'win32') {
   Object.defineProperty(process, 'platform', { value: platform })
   const root = 900_010, relay = 900_011, leaf = 900_012
   let clock = 1_000_000, removed = 0, trees = 0, closed = false, leafReads = 0
@@ -183,6 +183,14 @@ function additionFixture(mode: 'gone' | 'alive' | 'unknown' | 'orphan' | 'reused
   const readRows = (budget: number) => {
     budgets.push(budget)
     trees++
+    if (mode.startsWith('captured-orphan-')) {
+      if (trees <= 2) return rows.slice(0, 2)
+      if (trees === 3) {
+        child.emit('exit', 0); child.emit('close', 0); closed = true
+        return [rows[0]!, { pid: leaf, ppid: root }, { pid: relay, ppid: 900_099 }]
+      }
+      return [{ pid: relay, ppid: 900_099 }]
+    }
     if (trees === 1) return rows
     if (trees === 2 && (mode === 'orphan' || mode === 'late-orphan')) return mode === 'orphan' ? [{ pid: 900_013, ppid: leaf }] : []
     if (trees === 2 && mode === 'reused') return [{ pid: leaf, ppid: 900_099 }]
@@ -201,6 +209,7 @@ function additionFixture(mode: 'gone' | 'alive' | 'unknown' | 'orphan' | 'reused
     birth: async (target, budget) => {
       budgets.push(budget)
       clock += 10
+      if (mode.startsWith('captured-orphan-') && target === relay) return 20
       if (target === leaf) {
         leafReads++
         if (leafReads === 1 && mode !== 'open') {
@@ -217,6 +226,9 @@ function additionFixture(mode: 'gone' | 'alive' | 'unknown' | 'orphan' | 'reused
     tree: async budget => readRows(budget),
     alive: target => {
       aliveReads.push(target)
+      if (mode.startsWith('captured-orphan-') && target === relay) {
+        return mode === 'captured-orphan-alive' ? 'alive' : 'unknown'
+      }
       return target === leaf && (mode === 'alive' || mode === 'confirmation-live' || mode === 'confirmation-reused' || mode === 'stale-live') ? 'alive'
         : target === leaf && mode === 'unknown' ? 'unknown' : 'gone'
     },
@@ -264,6 +276,18 @@ for (const mode of ['alive', 'unknown', 'orphan', 'reused', 'older', 'expired',
   })
 }
 
+for (const mode of ['captured-orphan-alive', 'captured-orphan-unknown'] as const) {
+  test(`Windows observe-only ${mode} refuses without signalling retained births`, async () => {
+    const f = additionFixture(mode)
+    await expect(f.run()).rejects.toThrow('cleanup_unknown')
+    expect(f.trees()).toBeGreaterThanOrEqual(3)
+    expect(f.leafReads()).toBe(0)
+    expect(f.removed()).toBe(0)
+    expect(f.signalled).toEqual([])
+    expect(f.budgets.every(budget => budget > 0 && budget <= 5000)).toBe(true)
+  })
+}
+
 test('darwin gone group member with reparented PPID requires absence and final census before retirement', async () => {
   const f = additionFixture('gone', 'darwin')
   expect(await f.run()).toBe('1.19.0\n')
@@ -278,7 +302,8 @@ test('darwin gone group member with reparented PPID requires absence and final c
 
 // The wrapper can close before the first birth helper completes while WMI still
 // returns its old tree. These rows must never confer birth or signal authority.
-function unanchoredFixture(mode: 'gone' | 'alive' | 'unknown' | 'orphan' | 'reused' | 'persistent' | 'final-reappeared' | 'absence-before-close') {
+function unanchoredFixture(mode: 'gone' | 'alive' | 'unknown' | 'orphan' | 'reused' | 'persistent' |
+  'final-reappeared' | 'absence-before-close' | 'stale-captured') {
   Object.defineProperty(process, 'platform', { value: 'win32' })
   const root = 900_020, relay = 900_021, leaf = 900_022, orphan = 900_023, grandchild = 900_024
   let clock = 1_000_000, removed = 0, trees = 0, births = 0
@@ -299,7 +324,10 @@ function unanchoredFixture(mode: 'gone' | 'alive' | 'unknown' | 'orphan' | 'reus
   })
   const ports = spyOn(native, 'nativePorts').mockImplementation(() => ({
     platform: 'win32', selfPid: process.pid, now: () => clock,
-    birth: async (_target, budget) => { births++; budgets.push(budget); clock += 350; return null },
+    birth: async (target, budget) => {
+      births++; budgets.push(budget); clock += 350
+      return mode === 'stale-captured' && target === root && births === 1 ? 100 : null
+    },
     tree: async budget => {
       budgets.push(budget); trees++
       let rows = trees === 1 || mode === 'persistent' ? initialRows : []
@@ -341,6 +369,18 @@ test('Windows unanchored gone rows require independent gone checks, raw absence 
   expect(f.signals).toEqual([])
   expect(f.taskkills).toEqual([])
   expect(f.budgets).toEqual([5000, 5000, 5000, 5000])
+  expect(f.removed()).toBe(1)
+})
+
+test('Windows stale captured anchor retires only after gone checks, fresh absence, close and strict final census', async () => {
+  const f = unanchoredFixture('stale-captured')
+  expect(await f.run()).toBe('1.19.0\n')
+  expect(f.aliveReads).toEqual([f.root, f.root, f.relay, f.leaf])
+  expect(f.events).toEqual(['census:rows', 'census:empty', 'census:empty', 'remove'])
+  expect(f.births()).toBe(2)
+  expect(f.signals).toEqual([])
+  expect(f.taskkills).toEqual([])
+  expect(f.budgets).toEqual([5000, 5000, 5000, 5000, 5000])
   expect(f.removed()).toBe(1)
 })
 

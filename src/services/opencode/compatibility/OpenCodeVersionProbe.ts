@@ -224,18 +224,28 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
         // A live birth-checked member anchors group continuity. If the initial
         // leader vanished before identity capture, do not infer orphan ownership.
         let anchor: Member | undefined
+        let knownAnchorGone = false
         phase = 'anchor_identity'
         for (const row of group) {
           const expected = births.get(row.pid)
           if (expected !== undefined && await sameBirth(row.pid, expected)) { anchor = row; break }
+          if (expected !== undefined) knownAnchorGone = true
         }
         const additions = group.filter(row => !births.has(row.pid))
         if (additions.length && !anchor) {
-          if (process.platform !== 'win32' || births.size) throw cleanupUnknown('anchor_missing')
+          // A stale Windows table may outlive a captured anchor. sameBirth only
+          // returns false after an independent gone observation, which is the
+          // sole exception to the empty-birth-map retirement path. Preserve the
+          // known birth map; it remains final-table evidence and never becomes
+          // authority for an uncaptured numeric census candidate.
+          if (process.platform !== 'win32' || (births.size > 0 && !knownAnchorGone)) {
+            throw cleanupUnknown('anchor_missing')
+          }
           // A fast wrapper may close before its initial birth can be read.
           // Gone observations permit waiting only: raw census absence, child
           // close and a strict final full table still gate physical retirement.
           unanchoredRetirement = true
+          for (const target of births.keys()) unownedCandidates.add(target)
           if (pid) unownedCandidates.add(pid)
           for (const row of group) unownedCandidates.add(row.pid)
           phase = 'candidate_validation'
@@ -296,11 +306,13 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
           await boundOpenCodeRead(close, cap())
           await boundOpenCodeRead(Promise.allSettled([...pending]), cap())
           if (pending.size) throw cleanupUnknown('final_pending')
-          if (unownedCandidates.size) {
+          if (unownedCandidates.size || unanchoredRetirement) {
             const finalRows = await table()
             phase = 'retirement'
             assertCandidatesAbsent(finalRows, true)
-            if (members(finalRows).length || finalRows.some(row => !row.retired && births.has(row.pid))) {
+            if (members(finalRows).length
+              || finalRows.some(row => process.platform === 'win32'
+                ? births.has(row.pid) : !row.retired && births.has(row.pid))) {
               throw cleanupUnknown('final_retirement')
             }
             await boundOpenCodeRead(Promise.allSettled([...pending]), cap())
