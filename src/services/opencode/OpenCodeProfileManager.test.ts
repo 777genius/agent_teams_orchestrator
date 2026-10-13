@@ -1,4 +1,4 @@
-import { lstat, mkdtemp, mkdir, readFile, readlink, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises'
+import { lstat, mkdtemp, mkdir, readFile, readlink, realpath, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises'
 import { spawn } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import os from 'node:os'
@@ -361,7 +361,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       projectPath, purpose: 'catalog', selectedModel: 'custom/model',
       env: { ...process.env, CLAUDE_AGENT_TEAMS_ATTACHMENT_ROOT: path.join(alias, 'attachments') },
     })
-    await rm(alias)
+    await unlink(alias)
     await symlink(parentB, alias, linkType)
     const manager = new OpenCodeProfileManager()
     const profile = await manager.prepareProfile(projectPath, { profileScope: scope })
