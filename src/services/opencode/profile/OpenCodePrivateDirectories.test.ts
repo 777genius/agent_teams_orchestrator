@@ -3,6 +3,7 @@ import { lstat, mkdir, mkdtemp, realpath, rm, writeFile, readFile } from 'node:f
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
+import { createOpenCodeVersionReadRoots } from './OpenCodeV2ManagedConfig.js'
 import { hasWindowsPrivateProfileDirectoryDelivery, prepareWindowsPrivateDirectories } from './OpenCodePrivateDirectories.js'
 import type { WindowsOwnerDirectory } from '../host/windows/OpenCodeV2WindowsOwnerFilesystem.js'
 
@@ -115,4 +116,18 @@ test('private directory failures retain finite native classification and request
     } catch (error) { failure = error }
     expect(failure instanceof Error && failure.message).toBe('TEST-sensitive-arbitrary-failure')
   } finally { await f.remove() }
+})
+
+
+test('generation-unknown version census gets isolated usable roots and removes only its own allocation', async () => {
+  const roots = await createOpenCodeVersionReadRoots()
+  try {
+    for (const key of ['HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'TMPDIR']) {
+      const directory = roots.env[key]!
+      expect(directory.startsWith(roots.root + path.sep)).toBe(true)
+      expect((await lstat(directory)).isDirectory()).toBe(true)
+    }
+    expect(roots.env.OPENROUTER_API_KEY).toBeUndefined()
+  } finally { await roots.remove() }
+  expect(await lstat(roots.root).catch((error: NodeJS.ErrnoException) => error.code)).toBe('ENOENT')
 })

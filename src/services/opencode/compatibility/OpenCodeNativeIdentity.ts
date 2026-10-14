@@ -3,7 +3,7 @@ import { lstat, open, realpath, stat } from 'node:fs/promises'
 import path from 'node:path'
 import { resolveOpenCodeBinaryPath } from '../OpenCodeBinaryResolver.js'
 import { classifyOpenCodeReadGeneration, type OpenCodeReadGeneration, type OpenCodeV2Pin } from './OpenCodeGenerationPolicy.js'
-import { createOpenCodeV2ReadRoots } from '../profile/OpenCodeV2ManagedConfig.js'
+import { createOpenCodeVersionReadRoots } from '../profile/OpenCodeV2ManagedConfig.js'
 import { readOpenCodeOwnedVersion } from './OpenCodeVersionProbe.js'
 
 export type OpenCodeV2NativeIdentity = {
@@ -75,7 +75,7 @@ export async function inspectOpenCodeReadSelection(signal?: AbortSignal, onAcqui
   signal?.throwIfAborted()
   const executableSha256 = await hashOpenCodeFile(executablePath)
   signal?.throwIfAborted()
-  const roots = await createOpenCodeV2ReadRoots()
+  const roots = await createOpenCodeVersionReadRoots()
   const output = await readOpenCodeOwnedVersion(executablePath, roots, signal)
   signal?.throwIfAborted()
   const policy = classifyOpenCodeReadGeneration(output)

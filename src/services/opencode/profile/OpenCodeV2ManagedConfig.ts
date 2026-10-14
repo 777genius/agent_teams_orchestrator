@@ -14,13 +14,26 @@ export const openCodeV2ReadOverrides = {
 
 export type OpenCodeV2ReadRoots = Awaited<ReturnType<typeof createOpenCodeV2ReadRoots>>
 
+/** V2 host/catalog acquisition always requires the strict native Windows path. */
 export async function createOpenCodeV2ReadRoots() {
-  const candidate = process.platform === 'win32' ? path.join(await realpath(tmpdir()), `opencode-v2-read-${randomUUID()}`) : null
+  return allocateOpenCodeReadRoots(process.platform === 'win32')
+}
+
+/** Generation is unknown until --version returns. V1 standalone/ARM64 census
+ * must not acquire a V2 capability; selected V2 still passes its strict adapter. */
+export async function createOpenCodeVersionReadRoots() {
+  const nativeWindows = process.platform === 'win32' &&
+    await (await import('./OpenCodePrivateDirectories.js')).hasWindowsPrivateProfileDirectoryDelivery()
+  return allocateOpenCodeReadRoots(nativeWindows)
+}
+
+async function allocateOpenCodeReadRoots(nativeWindows: boolean) {
+  const candidate = nativeWindows ? path.join(await realpath(tmpdir()), `opencode-v2-read-${randomUUID()}`) : null
   const root = candidate ?? await realpath(await mkdtemp(path.join(tmpdir(), 'opencode-v2-read-')))
   const roots = Object.fromEntries(['home', 'config', 'data', 'cache', 'state', 'tmp', 'appdata', 'localappdata']
     .map(key => [key, path.join(root, key)]))
   try {
-    if (process.platform === 'win32') {
+    if (nativeWindows) {
       const { ensureWindowsPrivateDirectories } = await import('./OpenCodePrivateDirectories.js')
       await ensureWindowsPrivateDirectories([root, ...Object.values(roots),
         path.join(root, 'data', 'opencode'), path.join(root, 'config', 'opencode')], [root])
@@ -29,7 +42,7 @@ export async function createOpenCodeV2ReadRoots() {
     return { root, env: privateOpenCodeReadEnvironment(root), remove: () => rm(root, { recursive: true, force: true }) }
   } catch (error) {
     // An uncertain Windows native acquisition remains available for diagnosis.
-    if (process.platform !== 'win32') await rm(root, { recursive: true, force: true })
+    if (!nativeWindows) await rm(root, { recursive: true, force: true })
     throw error
   }
 }
