@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { lstat, rename, writeFile } from 'node:fs/promises'
+import { writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { createWindowsNativeBroker, resolveWindowsNativeArtifact } from '../../src/services/opencode/host/windows/OpenCodeV2WindowsNativeBroker.js'
 import { createWindowsOwnerFilesystem, type WindowsOwnerDirectory } from '../../src/services/opencode/host/windows/OpenCodeV2WindowsOwnerFilesystem.js'
@@ -32,21 +32,32 @@ const handles: WindowsOwnerDirectory[] = []
 const retain = (handle: WindowsOwnerDirectory): WindowsOwnerDirectory => { handles.push(handle); return handle }
 const writeOwnedFixture = async (directory: WindowsOwnerDirectory, directoryPath: string,
   name: 'opencode.json' | 'user.json' | 'other.json', bytes: string | Uint8Array) => {
-  // The native record creator sets TokenUser ownership and a private DACL.
-  // Rename its fresh file within this TEST directory, then truncate that same
-  // inode to retain genuine zero-length, malformed, and oversized fixture bytes.
+  const relative = path.win32.relative(requestedRoot, directoryPath)
+  assert.ok(relative && relative !== '..' && !relative.startsWith('..\\') && !path.win32.isAbsolute(relative))
+  // Copy only the native reference's exact owner and protected DACL onto this
+  // fresh fixture, retaining genuine zero-length, malformed, and oversized bytes.
   await directory.writeExclusive('owner.json', { schema: 1, synthetic: true })
   const source = path.win32.join(directoryPath, 'owner.json')
   const target = path.win32.join(directoryPath, name)
-  for (let attempt = 0; attempt < 6; attempt++) {
-    await assert.rejects(lstat(target), { code: 'ENOENT' })
-    try { await rename(source, target); break }
-    catch (error) {
-      if (attempt === 5 || typeof error !== 'object' || error === null || !('code' in error) || error.code !== 'EBUSY') throw error
-      await Bun.sleep((attempt + 1) * 100)
-    }
-  }
-  await writeFile(target, bytes)
+  await writeFile(target, bytes, { flag: 'wx' })
+  assert.ok(process.env.ProgramFiles && path.win32.isAbsolute(process.env.ProgramFiles))
+  const powershellRoot = path.win32.join(process.env.ProgramFiles, 'PowerShell', '7')
+  const child = Bun.spawn([path.win32.join(powershellRoot, 'pwsh.exe'), '-NoProfile', '-NonInteractive', '-Command', `
+$ErrorActionPreference='Stop'
+$sections=[System.Security.AccessControl.AccessControlSections]::Owner -bor [System.Security.AccessControl.AccessControlSections]::Access
+$reference=Get-Acl -LiteralPath $env:TEST_REFERENCE
+$owner=[System.Security.Principal.WindowsIdentity]::GetCurrent().User
+if(!$reference.AreAccessRulesProtected -or $reference.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $owner.Value){throw 'TEST reference is not private'}
+$exact=$reference.GetSecurityDescriptorSddlForm($sections)
+$target=Get-Acl -LiteralPath $env:TEST_TARGET
+$target.SetSecurityDescriptorSddlForm($exact,$sections)
+Set-Acl -LiteralPath $env:TEST_TARGET -AclObject $target
+$actual=Get-Acl -LiteralPath $env:TEST_TARGET
+if(!$actual.AreAccessRulesProtected -or $actual.GetSecurityDescriptorSddlForm($sections) -cne $exact){throw 'TEST fixture security copy changed'}
+`], { env: { SystemRoot: process.env.SystemRoot, WINDIR: process.env.WINDIR,
+    PSModulePath: path.win32.join(powershellRoot, 'Modules'), TEST_REFERENCE: source, TEST_TARGET: target },
+    stdout: 'ignore', stderr: 'ignore' })
+  assert.equal(await child.exited, 0, 'windows_fixture_security_copy_failed')
 }
 const lease = 'b04ca87c-d84d-4b55-a89a-9c8fa7bd1f16'
 let failure: unknown
