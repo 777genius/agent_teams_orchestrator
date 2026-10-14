@@ -1891,8 +1891,7 @@ public:
     std::vector<std::wstring> cohortSids;
     const std::vector<std::wstring> *cohortSidsPtr = nullptr;
     if (!create) {
-      Handle probe = canonicalDirectory(path, FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL,
-                                        nullptr, selectedPackage, false);
+      Handle probe = verificationDirectory(path);
       cohortSids = exactControllerCohortSids(probe.value, path);
       cohortSidsPtr = cohortSids.empty() ? nullptr : &cohortSids;
     }
