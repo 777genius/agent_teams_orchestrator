@@ -3103,21 +3103,38 @@ private:
     for (auto &parent : owners.holdSelectedAncestors(dataRoot))
       ancestors.emplace_back(std::move(parent));
     std::vector<RetainedAnchorComponent> prefix;
-    prefix.emplace_back(owners.holdSelectedDirectory(dataRoot));
-    const auto rootIdentity = fileIdentity(prefix.front().handle.value, owner, true);
+    // Closed role labels only; preserve the original failed predicate and codes.
+    auto inRole = [](const char *role, auto action) {
+      try { return action(); }
+      catch (const NativeError &error) {
+        if (error.stage && std::strcmp(error.stage, "private_acl_owner") == 0)
+          throw NativeError{error.code, error.win32, role, error.nativeStatus};
+        throw;
+      }
+    };
+    const char *roles[] = {"private_acl_owner_run_data_root", "private_acl_owner_run_opencode",
+                          "private_acl_owner_run_v2", "private_acl_owner_run_runs",
+                          "private_acl_owner_run_leaf"};
+    prefix.emplace_back(inRole(roles[0], [&] { return owners.holdSelectedDirectory(dataRoot); }));
+    auto identified = [&](HANDLE file, size_t index) {
+      require(index < 5, "run_state_identity_changed");
+      return inRole(roles[index], [&] { return fileIdentity(file, owner, true); });
+    };
+    const auto rootIdentity = identified(prefix.front().handle.value, 0);
     auto recheck = [&](bool absence) {
       for (const auto &parent : ancestors) parent.assertLive();
-      for (const auto &part : prefix) {
+      for (size_t index = 0; index < prefix.size(); ++index) {
+        const auto &part = prefix[index];
         part.assertLive();
         if (absence) {
-          (void)fileIdentity(part.handle.value, owner, true);
+          (void)identified(part.handle.value, index);
           auto named = verificationDirectory(part.path);
-          require(fileIdentity(named.value, owner, true).Stringify() ==
-                      fileIdentity(part.handle.value, owner, true).Stringify(),
+          require(identified(named.value, index).Stringify() ==
+                      identified(part.handle.value, index).Stringify(),
                   "run_state_identity_changed");
         }
       }
-      require(fileIdentity(prefix.front().handle.value, owner, true).Stringify() ==
+      require(identified(prefix.front().handle.value, 0).Stringify() ==
                   rootIdentity.Stringify(), "run_state_identity_changed");
     };
     auto openChild = [](HANDLE parent, const std::wstring &name) {
