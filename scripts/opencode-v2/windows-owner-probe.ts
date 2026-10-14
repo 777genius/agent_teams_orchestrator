@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { rename, writeFile } from 'node:fs/promises'
+import { lstat, rename, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { createWindowsNativeBroker, resolveWindowsNativeArtifact } from '../../src/services/opencode/host/windows/OpenCodeV2WindowsNativeBroker.js'
 import { createWindowsOwnerFilesystem, type WindowsOwnerDirectory } from '../../src/services/opencode/host/windows/OpenCodeV2WindowsOwnerFilesystem.js'
@@ -36,8 +36,16 @@ const writeOwnedFixture = async (directory: WindowsOwnerDirectory, directoryPath
   // Rename its fresh file within this TEST directory, then truncate that same
   // inode to retain genuine zero-length, malformed, and oversized fixture bytes.
   await directory.writeExclusive('owner.json', { schema: 1, synthetic: true })
+  const source = path.win32.join(directoryPath, 'owner.json')
   const target = path.win32.join(directoryPath, name)
-  await rename(path.win32.join(directoryPath, 'owner.json'), target)
+  for (let attempt = 0; attempt < 6; attempt++) {
+    await assert.rejects(lstat(target), { code: 'ENOENT' })
+    try { await rename(source, target); break }
+    catch (error) {
+      if (attempt === 5 || typeof error !== 'object' || error === null || !('code' in error) || error.code !== 'EBUSY') throw error
+      await Bun.sleep((attempt + 1) * 100)
+    }
+  }
   await writeFile(target, bytes)
 }
 const lease = 'b04ca87c-d84d-4b55-a89a-9c8fa7bd1f16'
