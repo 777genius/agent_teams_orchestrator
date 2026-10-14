@@ -572,8 +572,16 @@ function filterModelOptionsByAllowlist(options: ModelOption[]): ModelOption[] {
   if (!settings.availableModels) {
     return options // No restrictions
   }
+  const explicitlySelectedModels = new Set(
+    [getUserSpecifiedModelSetting(), getInitialMainLoopModel()].filter(
+      (model): model is Exclude<ModelSetting, null | undefined> =>
+        model !== null && model !== undefined,
+    ),
+  )
   return options.filter(
     opt =>
-      opt.value === null || (opt.value !== null && isModelAllowed(opt.value)),
+      opt.value === null ||
+      explicitlySelectedModels.has(opt.value) ||
+      isModelAllowed(opt.value),
   )
 }

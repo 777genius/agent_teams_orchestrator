@@ -50,6 +50,7 @@ export function getAntModels(): AntModel[] {
 
 export function resolveAntModel(
   model: string | undefined,
+  options: { exactAliasOnly?: boolean } = {},
 ): AntModel | undefined {
   if (process.env.USER_TYPE !== 'ant') {
     return undefined
@@ -58,7 +59,9 @@ export function resolveAntModel(
     return undefined
   }
   const lower = model.toLowerCase()
-  return getAntModels().find(
-    m => m.alias === model || lower.includes(m.model.toLowerCase()),
+  return getAntModels().find(m =>
+    options.exactAliasOnly
+      ? m.alias.toLowerCase() === lower
+      : m.alias === model || lower.includes(m.model.toLowerCase()),
   )
 }

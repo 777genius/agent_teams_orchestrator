@@ -2198,18 +2198,22 @@ async function run(): Promise<CommanderCommand> {
       }
     }
 
-    // Compute effective model early so hooks can run in parallel with MCP
-    // If user didn't specify a model but agent has one, use the agent's model
-    let effectiveModel = userSpecifiedModel;
+    // Compute effective model early so hooks can run in parallel with MCP.
+    // CLI, ANTHROPIC_MODEL, and settings are explicit selection policy and win
+    // over an agent model. Only an unconfigured model may adopt the agent's.
+    const explicitlyConfiguredModel = userSpecifiedModel ?? getUserSpecifiedModelSetting();
+    let effectiveModel = explicitlyConfiguredModel;
     if (!effectiveModel && mainThreadAgentDefinition?.model && mainThreadAgentDefinition.model !== 'inherit') {
       effectiveModel = resolveAllowedModelSetting(mainThreadAgentDefinition.model);
     }
     setMainLoopModelOverride(effectiveModel);
 
-    // Compute resolved model for hooks (use user-specified model at launch)
-    setInitialMainLoopModel(getUserSpecifiedModelSetting() || null);
+    // Preserve the launch selection separately from an agent default.
+    setInitialMainLoopModel(explicitlyConfiguredModel || null);
     const initialMainLoopModel = getInitialMainLoopModel();
-    const resolvedInitialModel = resolveAllowedModelSetting(initialMainLoopModel);
+    const resolvedInitialModel = resolveAllowedModelSetting(
+      effectiveModel ?? initialMainLoopModel,
+    );
     let advisorModel: string | undefined;
     if (isAdvisorEnabled()) {
       const advisorOption = canUserConfigureAdvisor() ? (options as {
@@ -3044,7 +3048,7 @@ async function run(): Promise<CommanderCommand> {
       tasks: {},
       agentNameRegistry: new Map(),
       verbose: verbose ?? getGlobalConfig().verbose ?? false,
-      mainLoopModel: initialMainLoopModel,
+      mainLoopModel: effectiveModel ?? initialMainLoopModel,
       mainLoopModelForSession: null,
       isBriefOnly: initialIsBriefOnly,
       expandedView: getGlobalConfig().showSpinnerTree ? 'teammates' : getGlobalConfig().showExpandedTodos ? 'tasks' : 'none',

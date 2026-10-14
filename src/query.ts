@@ -78,8 +78,11 @@ import {
 } from './utils/messageQueueManager.js'
 import { notifyCommandLifecycle } from './utils/commandLifecycle.js'
 import { headlessProfilerCheckpoint } from './utils/headlessProfiler.js'
+import { resolveGenerationModelSetting } from './utils/model/generation.js'
 import {
+  assertModelSelectionAllowed,
   getRuntimeMainLoopModel,
+  parseUserSpecifiedModel,
   renderModelName,
 } from './utils/model/model.js'
 import {
@@ -591,6 +594,11 @@ async function* queryLoop(
     let currentModel = getRuntimeMainLoopModel({
       permissionMode,
       mainLoopModel: toolUseContext.options.mainLoopModel,
+      modelSetting: resolveGenerationModelSetting(
+        toolUseContext.options.mainLoopModel,
+        undefined,
+        toolUseContext.agentId !== undefined,
+      ),
       exceeds200kTokens:
         permissionMode === 'plan' &&
         doesMostRecentAssistantMessageExceed200k(messagesForQuery),
@@ -673,6 +681,11 @@ async function* queryLoop(
       while (attemptWithFallback) {
         attemptWithFallback = false
         try {
+          // Session/member generation is the policy boundary: retain an
+          // explicitly selected ID and reject it before any provider dispatch.
+          // Utility-model side queries use direct API helpers and remain
+          // separate roles rather than replacing this generation model.
+          assertModelSelectionAllowed(currentModel)
           let streamingFallbackOccured = false
           queryCheckpoint('query_api_streaming_start')
           for await (const message of deps.callModel({
@@ -917,7 +930,15 @@ async function* queryLoop(
         } catch (innerError) {
           if (innerError instanceof FallbackTriggeredError && fallbackModel) {
             // Fallback was triggered - switch model and retry
-            currentModel = fallbackModel
+            const resolvedFallbackModel = getRuntimeMainLoopModel({
+              permissionMode,
+              modelSetting: fallbackModel,
+              mainLoopModel: parseUserSpecifiedModel(fallbackModel),
+              exceeds200kTokens:
+                permissionMode === 'plan' &&
+                doesMostRecentAssistantMessageExceed200k(messagesForQuery),
+            })
+            currentModel = resolvedFallbackModel
             attemptWithFallback = true
 
             // Clear assistant messages since we'll retry the entire request
@@ -943,7 +964,7 @@ async function* queryLoop(
             }
 
             // Update tool use context with new model
-            toolUseContext.options.mainLoopModel = fallbackModel
+            toolUseContext.options.mainLoopModel = resolvedFallbackModel
 
             // Thinking signatures are model-bound: replaying a protected-thinking
             // block (e.g. capybara) to an unprotected fallback (e.g. opus) 400s.

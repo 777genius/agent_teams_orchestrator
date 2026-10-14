@@ -121,8 +121,8 @@ function isStaleConnectionError(error: unknown): boolean {
 
 export interface RetryContext {
   maxTokensOverride?: number
-  model: string
-  thinkingConfig: ThinkingConfig
+  readonly model: string
+  readonly thinkingConfig: ThinkingConfig
   fastMode?: boolean
 }
 

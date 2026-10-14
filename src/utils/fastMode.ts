@@ -175,6 +175,31 @@ export function isFastModeSupportedByModel(
   return parsedModel.toLowerCase().includes('opus-4-8')
 }
 
+export type FastModeToggleDecision =
+  | { ok: true }
+  | { ok: false; message: string }
+
+/**
+ * Decide whether fast mode can be enabled for a model without rewriting the
+ * model. Unsupported models fail closed and keep their exact generation ID.
+ */
+export function getFastModeToggleDecision(
+  modelSetting: ModelSetting,
+  enable: boolean,
+): FastModeToggleDecision {
+  if (!enable) {
+    return { ok: true }
+  }
+  if (!isFastModeSupportedByModel(modelSetting)) {
+    const model = parseUserSpecifiedModel(modelSetting)
+    return {
+      ok: false,
+      message: `Fast mode is not supported by model "${model}"; keeping the selected model unchanged.`,
+    }
+  }
+  return { ok: true }
+}
+
 // --- Fast mode runtime state ---
 // Separate from user preference (settings.fastMode). This tracks the actual
 // operational state: whether we're actively sending fast speed or in cooldown
