@@ -15,6 +15,7 @@ export type WindowsOwnerNativeRequest =
   | Readonly<{ op: 'ownerReadRecord'; handleId: string; name: string; maxBytes: number }>
   | Readonly<{ op: 'ownerReadMetadata'; purpose: 'ProbeGuard' | 'ProbeRecord'; handleId: string }>
   | Readonly<{ op: 'ownerReadMetadata'; purpose: 'SelectedAuth'; selectionId: string }>
+  | Readonly<{ op: 'ownerWriteMetadata'; purpose: 'ProbeGuard' | 'ProbeRecord'; handleId: string; bytesBase64: string }>
   | Readonly<{ op: 'ownerArchive'; handleId: string; source: string; destination: string }>
   | Readonly<{ op: 'ownerCloseDirectory'; handleId: string }>
 
@@ -112,6 +113,7 @@ export type WindowsOwnerDirectory = Readonly<{
     purpose: 'ProbeGuard' | 'ProbeRecord'; path: string; directoryIdentity: WindowsOwnerFileIdentity
     fileIdentity: WindowsOwnerFileIdentity | null; bytes: number; absent?: true; value?: Record<string, unknown>
   }>>
+  writeMetadata(purpose: 'ProbeGuard' | 'ProbeRecord', value: unknown, deadline?: number, signal?: AbortSignal): Promise<void>
   archive(destination: string): Promise<void>
   close(): Promise<void>
 }>
@@ -189,6 +191,28 @@ export function createWindowsOwnerFilesystem(native: WindowsOwnerNativePort, sel
           ...(row.absent === true ? { absent: true as const } : {}),
           ...(purpose === 'ProbeRecord' && row.absent !== true ? { value: executionRecord(JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(metadataBytes(row)))) } : {}),
         })
+      }),
+      // Only the two fixed probe metadata files can be written through a retained
+      // directory. The native producer supplies explicit owner SID/private DACL.
+      writeMetadata: (purpose: 'ProbeGuard' | 'ProbeRecord', value: unknown, deadline?: number, signal?: AbortSignal) => serialize(async () => {
+        executionAssert(purpose === 'ProbeGuard' || purpose === 'ProbeRecord', 'execution_owner_unknown')
+        executionAssert(purpose !== 'ProbeGuard' || value === null, 'execution_owner_unknown')
+        const bytes = purpose === 'ProbeGuard' ? Buffer.alloc(0) :
+          Buffer.from(canonicalExecutionJSON(executionRecord(value)) + '\n', 'utf8')
+        executionAssert(bytes.length < 131072, 'execution_owner_metadata_budget')
+        await assertOwned(deadline, signal)
+        const expectedPath = path.win32.join(currentPath, purpose === 'ProbeGuard' ? 'owner.lock' : 'probe.json')
+        try {
+          const row = metadataResponse(await native({ op: 'ownerWriteMetadata', purpose, handleId,
+            bytesBase64: bytes.toString('base64') }, deadline, signal), purpose, expectedPath)
+          const directoryIdentity = identity(row.directoryIdentity), fileIdentity = identity(row.fileIdentity)
+          executionAssert(sameIdentity(directoryIdentity, originalIdentity) &&
+            fileIdentity.volumeSerial === directoryIdentity.volumeSerial &&
+            fileIdentity.ownerSid === directoryIdentity.ownerSid && row.absent !== true &&
+            Number(row.bytes) === bytes.length &&
+            (purpose !== 'ProbeRecord' || metadataBytes(row).equals(bytes)), 'execution_owner_unknown')
+          await assertOwned(deadline, signal)
+        } catch (error) { uncertain = true; throw error }
       }),
       archive: (requestedDestination: string) => serialize(async () => {
         const destination = canonicalPath(requestedDestination)

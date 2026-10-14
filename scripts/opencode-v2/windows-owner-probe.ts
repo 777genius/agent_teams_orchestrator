@@ -253,6 +253,42 @@ try {
   // The scratch parent is setup only. Actual source fences below retain their
   // original DELETE-capable handles; the existing parent needs traversal only.
   await setupRoot.close()
+  // Exercise the production fixed-purpose writer through an existing-only
+  // retained directory, including its strict veto of unsafe existing metadata.
+  const probeBase = path.win32.join(requestedRoot, 'opencode', 'v2', 'execution-probes')
+  for (const directory of [path.win32.join(requestedRoot, 'opencode'),
+    path.win32.join(requestedRoot, 'opencode', 'v2'), probeBase])
+    retain(await filesystem.createDirectory(directory))
+  const probePath = path.win32.join(probeBase, 'b'.repeat(64))
+  const createdProbe = await filesystem.createDirectory(probePath)
+  await createdProbe.close()
+  const probeDirectory = retain(await filesystem.openDirectory(probePath))
+  await probeDirectory.writeMetadata('ProbeGuard', null)
+  const guardBefore = await probeDirectory.readMetadata('ProbeGuard')
+  assert.equal(guardBefore.bytes, 0)
+  assert.equal(guardBefore.fileIdentity?.ownerSid, probeDirectory.identity.ownerSid)
+  await probeDirectory.writeMetadata('ProbeGuard', null)
+  assert.deepEqual((await probeDirectory.readMetadata('ProbeGuard')).fileIdentity, guardBefore.fileIdentity)
+  const firstRecord = { schema: 1, synthetic: true, marker: 'first-é' }
+  await probeDirectory.writeMetadata('ProbeRecord', firstRecord)
+  const recordBefore = await probeDirectory.readMetadata('ProbeRecord')
+  assert.deepEqual(recordBefore.value, firstRecord)
+  assert.equal(recordBefore.fileIdentity?.ownerSid, probeDirectory.identity.ownerSid)
+  const secondRecord = { schema: 1, synthetic: true, marker: 'second-é' }
+  await probeDirectory.writeMetadata('ProbeRecord', secondRecord)
+  const recordAfter = await probeDirectory.readMetadata('ProbeRecord')
+  assert.deepEqual(recordAfter.value, secondRecord)
+  assert.notEqual(recordAfter.fileIdentity?.fileId, recordBefore.fileIdentity?.fileId)
+  assert.deepEqual((await probeDirectory.readMetadata('ProbeGuard')).fileIdentity, guardBefore.fileIdentity)
+  await powershell(`$a=Get-Acl -LiteralPath $env:TEST_TARGET;
+    $sid=[System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-545');
+    $r=[System.Security.AccessControl.FileSystemAccessRule]::new($sid,'Read','Allow');
+    $a.AddAccessRule($r);Set-Acl -LiteralPath $env:TEST_TARGET -AclObject $a`, path.win32.join(probePath, 'probe.json'))
+  const unsafeProbeBefore = await snapshot(probePath)
+  await assert.rejects(probeDirectory.writeMetadata('ProbeRecord', firstRecord), /execution_owner_not_private/)
+  assert.deepEqual(await snapshot(probePath), unsafeProbeBefore)
+  facts.probeMetadata = { guardPrivateZeroByte: true, guardIdempotentIdentity: true,
+    recordPrivateCreateAndAtomicReplacement: true, unsafeExistingVetoWithoutMutation: true }
   const discoveryRoot = path.win32.join(requestedRoot, 'TEST-discovery')
   retain(await filesystem.createDirectory(discoveryRoot))
   const absenceStages: string[] = []

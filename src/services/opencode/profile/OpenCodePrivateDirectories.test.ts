@@ -20,6 +20,7 @@ async function fixture() {
       close: async () => { calls.push(`close:${directory}`); live.delete(directory) },
       writeExclusive: async () => { throw new Error('unused') }, readRecord: async () => { throw new Error('unused') },
       readMetadata: async () => { throw new Error('unused') }, archive: async () => { throw new Error('unused') },
+      writeMetadata: async () => { throw new Error('unused') },
     }
   }
   const filesystem = {

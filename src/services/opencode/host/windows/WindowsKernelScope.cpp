@@ -643,8 +643,9 @@ static std::string base64(const std::vector<BYTE> &bytes) {
   }
   return out;
 }
-static std::vector<BYTE> unbase64(const std::wstring &value) {
-  require(value.size() % 4 == 0 && value.size() <= 21848, "execution_owner_unknown");
+static std::vector<BYTE> unbase64(const std::wstring &value, size_t maxBytes = 16384) {
+  require(maxBytes <= 128 * 1024 && value.size() % 4 == 0 &&
+              value.size() <= ((maxBytes + 2) / 3) * 4, "execution_owner_unknown");
   std::vector<BYTE> out;
   auto digit = [](wchar_t c) -> int {
     if (c >= L'A' && c <= L'Z')
@@ -674,7 +675,7 @@ static std::vector<BYTE> unbase64(const std::wstring &value) {
     if (value[i + 3] != L'=')
       out.push_back(static_cast<BYTE>(v));
   }
-  require(out.size() <= 16384, "execution_owner_unknown");
+  require(out.size() <= maxBytes, "execution_owner_unknown");
   return out;
 }
 using NtCreateFileFunction = NTSTATUS(NTAPI *)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES,
@@ -1948,6 +1949,155 @@ public:
     directoryMode(directory.file.value);
     return directory;
   }
+  JsonObject writeMetadata(const JsonObject &input) {
+    require(input.Size() == 4 && text(input, L"op") == L"ownerWriteMetadata" &&
+                input.HasKey(L"handleId") && input.HasKey(L"purpose") &&
+                input.HasKey(L"bytesBase64"), "execution_invalid_response");
+    const auto purpose = text(input, L"purpose");
+    require(purpose == L"ProbeGuard" || purpose == L"ProbeRecord",
+            "execution_owner_metadata_purpose_invalid");
+    auto data = unbase64(text(input, L"bytesBase64"), 128 * 1024 - 1);
+    require(wide(base64(data)) == text(input, L"bytesBase64"),
+            "execution_owner_metadata_invalid");
+    if (purpose == L"ProbeGuard") {
+      require(data.empty(), "execution_owner_metadata_budget");
+    } else {
+      require(!data.empty(), "execution_owner_metadata_budget");
+      try {
+        (void)JsonObject::Parse(wide(std::string(data.begin(), data.end())));
+      } catch (...) { throw NativeError{"execution_owner_metadata_invalid"}; }
+    }
+    auto &directory = held(input);
+    require(directory.owner == currentSid(), "execution_owner_unknown");
+    const std::wstring probeNamespace = L"\\opencode\\v2\\execution-probes\\";
+    require(directory.path.size() > probeNamespace.size() + 64,
+            "execution_owner_metadata_purpose_invalid");
+    const auto sourceKey = directory.path.substr(directory.path.size() - 64);
+    require(sourceKey.find_first_not_of(L"0123456789abcdef") == std::wstring::npos &&
+                equalPath(directory.path.substr(directory.path.size() - 64 - probeNamespace.size(),
+                                                probeNamespace.size()), probeNamespace),
+            "execution_owner_metadata_purpose_invalid");
+    SharedAclMutex mutation(directory.identity);
+    held(input);
+    const std::wstring name = purpose == L"ProbeGuard" ? L"owner.lock" : L"probe.json";
+    LocalMemory descriptor;
+    const auto sddl = L"O:" + directory.owner + L"D:P(A;;FA;;;SY)(A;;FA;;;" + directory.owner + L")";
+    require(ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.c_str(), SDDL_REVISION_1, &descriptor.value, nullptr) != 0,
+            "execution_owner_unknown");
+    auto create = reinterpret_cast<NtCreateFileFunction>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtCreateFile"));
+    auto set = reinterpret_cast<NtSetFileFunction>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtSetInformationFile"));
+    auto convert = reinterpret_cast<NtStatusErrorFunction>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlNtStatusToDosError"));
+    require(create && set && convert, "execution_owner_unknown");
+    const auto open = [&](const std::wstring &basename, bool fresh) {
+      UNICODE_STRING relative{};
+      relative.Buffer = const_cast<wchar_t *>(basename.data());
+      relative.Length = static_cast<USHORT>(basename.size() * sizeof(wchar_t));
+      relative.MaximumLength = relative.Length;
+      OBJECT_ATTRIBUTES attributes{};
+      attributes.Length = sizeof(attributes);
+      attributes.RootDirectory = directory.file.value;
+      attributes.ObjectName = &relative;
+      attributes.Attributes = 0x40;
+      attributes.SecurityDescriptor = fresh ? descriptor.value : nullptr;
+      IO_STATUS_BLOCK completion{};
+      HANDLE raw = nullptr;
+      const auto status = create(&raw, GENERIC_READ | READ_CONTROL | SYNCHRONIZE |
+          (fresh ? GENERIC_WRITE | DELETE : 0), &attributes, &completion, nullptr,
+          FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ | FILE_SHARE_DELETE,
+          fresh ? FILE_CREATE : FILE_OPEN,
+          0x40 | 0x20 | 0x200000 | (fresh ? 0x2 : 0), nullptr, 0);
+      Handle file(raw);
+      if (status != 0 || completion.Status != 0) {
+        const auto native = status != 0 ? status : completion.Status;
+        if (!fresh && static_cast<DWORD>(native) == 0xc0000034UL) return Handle();
+        throw NativeError{"execution_owner_unknown", convert(native),
+                          "owner_metadata_open", static_cast<DWORD>(native)};
+      }
+      require(equalPath(finalPath(file.value), extended(directory.path + L"\\" + basename)),
+              "execution_owner_metadata_changed");
+      fileIdentity(file.value, directory.owner, false, selectedPackage);
+      return file;
+    };
+    auto existing = open(name, false);
+    JsonObject previousIdentity;
+    if (existing) {
+      previousIdentity = fileIdentity(existing.value, directory.owner, false, selectedPackage);
+      FILE_STANDARD_INFO size{};
+      require(GetFileInformationByHandleEx(existing.value, FileStandardInfo, &size, sizeof(size)) &&
+                  size.EndOfFile.QuadPart >= 0 && size.EndOfFile.QuadPart < 128 * 1024 &&
+                  (purpose != L"ProbeGuard" || size.EndOfFile.QuadPart == 0),
+              "execution_owner_metadata_budget");
+      if (purpose == L"ProbeRecord") {
+        const auto old = heldFileBytes(existing.value, 128 * 1024 - 1);
+        try { (void)JsonObject::Parse(wide(std::string(old.begin(), old.end()))); }
+        catch (...) { throw NativeError{"execution_owner_metadata_invalid"}; }
+      }
+    }
+    if (purpose == L"ProbeGuard") {
+      if (!existing) {
+        auto file = open(name, true);
+        require(FlushFileBuffers(file.value), "execution_owner_unknown");
+      }
+    } else {
+      const auto temporary = L".probe." + nativeLaunchNonce() + L".tmp";
+      auto file = open(temporary, true);
+      const auto identity = fileIdentity(file.value, directory.owner, false, selectedPackage);
+      bool published = false;
+      try {
+        DWORD written = 0;
+        require(WriteFile(file.value, data.data(), static_cast<DWORD>(data.size()), &written, nullptr) &&
+                    written == data.size() && FlushFileBuffers(file.value), "execution_owner_unknown");
+        held(input);
+        auto named = open(name, false);
+        require(static_cast<bool>(named) == static_cast<bool>(existing) &&
+                    (!named || fileIdentity(named.value, directory.owner, false, selectedPackage)
+                        .Stringify() == previousIdentity.Stringify()), "execution_owner_metadata_changed");
+        const size_t size = offsetof(FILE_RENAME_INFO, FileName) + name.size() * sizeof(wchar_t);
+        std::vector<BYTE> bytes(size);
+        auto rename = reinterpret_cast<FILE_RENAME_INFO *>(bytes.data());
+        rename->ReplaceIfExists = existing ? TRUE : FALSE;
+        rename->RootDirectory = directory.file.value;
+        rename->FileNameLength = static_cast<DWORD>(name.size() * sizeof(wchar_t));
+        memcpy(rename->FileName, name.data(), rename->FileNameLength);
+        IO_STATUS_BLOCK completion{};
+        const auto status = set(file.value, &completion, rename, static_cast<ULONG>(size),
+                                static_cast<FILE_INFORMATION_CLASS>(10));
+        if (status != 0 || completion.Status != 0) {
+          const auto native = status != 0 ? status : completion.Status;
+          throw NativeError{"execution_owner_unknown", convert(native),
+                            "owner_metadata_publish", static_cast<DWORD>(native)};
+        }
+        published = true;
+        require(FlushFileBuffers(file.value) &&
+                    equalPath(finalPath(file.value), extended(directory.path + L"\\" + name)) &&
+                    fileIdentity(file.value, directory.owner, false, selectedPackage).Stringify() ==
+                        identity.Stringify(), "execution_owner_metadata_changed");
+      } catch (...) {
+        // Delete only the exact unexposed temporary file we created. A failed
+        // rename with an uncertain new name must never unlink probe.json.
+        if (!published && equalPath(finalPath(file.value),
+                                    extended(directory.path + L"\\" + temporary))) {
+          require(fileIdentity(file.value, directory.owner, false, selectedPackage).Stringify() ==
+                      identity.Stringify(), "execution_owner_metadata_changed");
+          FILE_DISPOSITION_INFO disposition{TRUE};
+          require(SetFileInformationByHandle(file.value, FileDispositionInfo, &disposition,
+                                              sizeof(disposition)) != 0,
+                  "execution_owner_unknown", "owner_metadata_cleanup");
+        }
+        throw;
+      }
+    }
+    held(input);
+    JsonObject read;
+    str(read, L"op", L"ownerReadMetadata");
+    str(read, L"handleId", text(input, L"handleId"));
+    str(read, L"purpose", purpose);
+    return readMetadata(read);
+  }
   JsonObject readMetadata(const JsonObject &input) {
     require(input.Size() == 3 && input.HasKey(L"op"), "execution_invalid_response");
     require(text(input, L"op") == L"ownerReadMetadata", "execution_invalid_response");
@@ -2180,6 +2330,8 @@ public:
       return open(input);
     if (operation == L"ownerReadMetadata")
       return readMetadata(input);
+    if (operation == L"ownerWriteMetadata")
+      return writeMetadata(input);
     // Close remains possible after identity/mutation uncertainty. It only drops
     // this native capability and never erases or adopts an acquisition fence.
     if (operation == L"ownerCloseDirectory") {

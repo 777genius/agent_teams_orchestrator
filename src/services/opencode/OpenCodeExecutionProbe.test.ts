@@ -185,6 +185,59 @@ describe('OpenCodeV2 Windows probe owner adapter', () => {
     }
   })
 
+  test('native probe metadata writers preserve empty guards and exact JSON with retained ownership', async () => {
+    const originalPlatform = process.platform
+    Object.defineProperty(process, 'platform', { value: 'win32', configurable: true })
+    const writes: WindowsOwnerNativeRequest[] = []
+    const refusal = new Error('execution_owner_not_private:private_acl_owner:0')
+    let refuse = false, forged = false
+    try {
+      const native = async (request: WindowsOwnerNativeRequest): Promise<unknown> => {
+        if (request.op === 'ownerOpenDirectory') return { schema: 1, ok: true, path: request.path,
+          directory: true, reparse: false, privateAcl: true, identity: identityA, handleId: 'TEST-probe' }
+        if (request.op === 'ownerAssertDirectory') return { schema: 1, ok: true, path: request.path,
+          directory: true, reparse: false, privateAcl: true, identity: identityA }
+        if (request.op === 'ownerCloseDirectory') return { schema: 1, ok: true, closed: true }
+        if (request.op !== 'ownerWriteMetadata') throw new Error('TEST-unexpected-native-request')
+        writes.push(request)
+        if (refuse) throw refusal
+        const bytes = Buffer.from(request.bytesBase64, 'base64')
+        return { schema: 1, ok: true, purpose: request.purpose,
+          path: 'C:\\TEST\\held\\' + (request.purpose === 'ProbeGuard' ? 'owner.lock' : 'probe.json'),
+          directoryIdentity: identityA, fileIdentity: { ...identityA, fileId: 'c'.repeat(32) },
+          bytes: bytes.length, privateAcl: !forged, reparse: false, links: 1,
+          ...(request.purpose === 'ProbeRecord' ? { bytesBase64: request.bytesBase64 } : {}) }
+      }
+      const filesystem = createWindowsOwnerFilesystem(native)
+      const held = await filesystem.openDirectory('C:\\TEST\\held')
+      await held.writeMetadata('ProbeGuard', null, Date.now() + 1000)
+      await held.writeMetadata('ProbeRecord', { sourceKey: 'TEST-original', submitted: false }, Date.now() + 1000)
+      expect(writes).toEqual([
+        { op: 'ownerWriteMetadata', handleId: 'TEST-probe', purpose: 'ProbeGuard', bytesBase64: '' },
+        { op: 'ownerWriteMetadata', handleId: 'TEST-probe', purpose: 'ProbeRecord',
+          bytesBase64: Buffer.from('{"sourceKey":"TEST-original","submitted":false}\n').toString('base64') },
+      ])
+      await expect(held.writeMetadata('ProbeGuard', {}, Date.now() + 1000)).rejects.toThrow('execution_owner_unknown')
+      await expect(held.writeMetadata('ProbeRecord', { text: 'x'.repeat(131072) }, Date.now() + 1000))
+        .rejects.toThrow('execution_owner_metadata_budget')
+      await expect(held.writeMetadata('ProbeGuard', null, Date.now() - 1)).rejects.toThrow('execution_timeout')
+      expect(writes.length).toBe(2)
+      refuse = true
+      await expect(held.writeMetadata('ProbeRecord', {}, Date.now() + 1000)).rejects.toBe(refusal)
+      await expect(held.writeMetadata('ProbeRecord', {}, Date.now() + 1000)).rejects.toThrow('execution_owner_unknown')
+      expect(writes.length).toBe(3)
+      await held.close()
+      refuse = false; forged = true
+      const invalid = await filesystem.openDirectory('C:\\TEST\\held')
+      await expect(invalid.writeMetadata('ProbeGuard', null, Date.now() + 1000)).rejects.toThrow('execution_owner_unknown')
+      await expect(invalid.writeMetadata('ProbeGuard', null, Date.now() + 1000)).rejects.toThrow('execution_owner_unknown')
+      expect(writes.length).toBe(4)
+      await invalid.close()
+    } finally {
+      Object.defineProperty(process, 'platform', { value: originalPlatform, configurable: true })
+    }
+  })
+
   test('fresh Windows ProbeRecord path creates its private chain and keeps one original submission', async () => {
     if (process.platform !== 'win32') return
     const temp = await mkdtemp(path.join(os.tmpdir(), 'TEST-v2-probe-chain-'))
@@ -219,11 +272,13 @@ describe('OpenCodeV2 Windows probe owner adapter', () => {
       }
       if (request.op === 'ownerAssertDirectory') return { schema: 1, ok: true, path: request.path,
         directory: true, reparse: false, privateAcl: true, identity }
-      if (request.op === 'ownerReadMetadata') {
+      if (request.op === 'ownerReadMetadata' || request.op === 'ownerWriteMetadata') {
         const handleId = 'handleId' in request ? request.handleId : undefined
         const directory = handleId === undefined ? undefined : handles.get(handleId)
         expect(directory).toBeDefined()
         const file = path.join(directory!, request.purpose === 'ProbeGuard' ? 'owner.lock' : 'probe.json')
+        if (request.op === 'ownerWriteMetadata')
+          await writeFile(file, Buffer.from(request.bytesBase64, 'base64'), { mode: 0o600 })
         if (request.purpose === 'ProbeGuard') return { schema: 1, ok: true, purpose: 'ProbeGuard', path: file,
           directoryIdentity: identity, fileIdentity, bytes: 0, privateAcl: true, reparse: false, links: 1 }
         try {
@@ -400,11 +455,13 @@ describe('OpenCodeV2 Windows probe owner adapter', () => {
         return { schema: 1, ok: true, path: request.path, directory: true, reparse: false,
           privateAcl: true, identity }
       }
-      if (request.op === 'ownerReadMetadata') {
+      if (request.op === 'ownerReadMetadata' || request.op === 'ownerWriteMetadata') {
         const handleId = 'handleId' in request ? request.handleId : undefined
         const directory = handleId === undefined ? undefined : handles.get(handleId)
         expect(directory).toBeDefined()
         const file = path.join(directory!, request.purpose === 'ProbeGuard' ? 'owner.lock' : 'probe.json')
+        if (request.op === 'ownerWriteMetadata')
+          await writeFile(file, Buffer.from(request.bytesBase64, 'base64'), { mode: 0o600 })
         if (request.purpose === 'ProbeGuard') return { schema: 1, ok: true, purpose: 'ProbeGuard', path: file,
           directoryIdentity: identity, fileIdentity, bytes: 0, privateAcl: true, reparse: false, links: 1 }
         try {

@@ -79,9 +79,7 @@ async function openWindowsProbeStore(dataRoot: string, sourceKey: string, deadli
       assertDirectories,
       async ensureGuard(deadline: number) {
         await assertDirectories(deadline)
-        await writeFile(guard, '', { flag: 'ax', mode: 0o600 }).catch(error => {
-          if (executionRecord(error).code !== 'EEXIST') throw error
-        })
+        await held.at(-1)!.writeMetadata('ProbeGuard', null, deadline)
         const metadata = await held.at(-1)!.readMetadata('ProbeGuard', deadline)
         executionAssert(metadata.path === guard && metadata.bytes === 0 && metadata.fileIdentity !== null, 'probe_store_foreign')
         await assertDirectories(deadline)
@@ -96,9 +94,7 @@ async function openWindowsProbeStore(dataRoot: string, sourceKey: string, deadli
       },
       async save(record: ProbeRecord, deadline: number) {
         await assertDirectories(deadline)
-        const temporary = path.join(directory, `.${randomUUID()}.tmp`)
-        await writeFile(temporary, JSON.stringify(record), { flag: 'wx', mode: 0o600 })
-        await rename(temporary, file)
+        await held.at(-1)!.writeMetadata('ProbeRecord', record, deadline)
         await assertDirectories(deadline)
         const metadata = await held.at(-1)!.readMetadata('ProbeRecord', deadline)
         executionAssert(!metadata.absent && metadata.value && executionHash(metadata.value) === executionHash(record), 'probe_store_invalid')
