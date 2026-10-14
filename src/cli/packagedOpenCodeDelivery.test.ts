@@ -131,16 +131,21 @@ test('Windows abrupt caller termination closes the exact immediate sidecar proce
 $ErrorActionPreference='Stop'
 $p=$null
 $owned=$false
+function Stage([string]$value) { [Console]::WriteLine(('STAGE '+$value)); [Console]::Out.Flush() }
 try {
+  Stage 'observer_started'
   $p=[System.Diagnostics.Process]::GetProcessById([int]$args[0])
   $handle=$p.Handle
   $birth=$p.StartTime.ToUniversalTime().Ticks.ToString()
+  Stage 'process_held'
   # Query WMI directly without CimCmdlets autoimport, retaining the held handle.
   [void][System.Reflection.Assembly]::Load('System.Management, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a')
+  Stage 'wmi_loaded'
   $searcher=[System.Management.ManagementObjectSearcher]::new('SELECT ProcessId, ParentProcessId FROM Win32_Process WHERE ProcessId='+[int]$args[0])
   $results=$null
   $row=$null
   try {
+    Stage 'wmi_query_started'
     $results=$searcher.Get()
     foreach ($entry in $results) {
       try {
@@ -151,7 +156,9 @@ try {
     if ($null -ne $results) { $results.Dispose() }
     $searcher.Dispose()
   }
+  Stage 'wmi_query_completed'
   $observedPath=$p.MainModule.FileName
+  Stage 'image_observed'
   if ($null -eq $row -or $row.ProcessId -ne $p.Id -or $row.ParentProcessId -ne [int]$args[1] -or $observedPath -ne $args[2]) { throw ('owned_sidecar_identity_mismatch '+(@{pid=$p.Id;parentPid=$row.ParentProcessId;expectedParentPid=$args[1];path=$observedPath;expectedPath=$args[2]}|ConvertTo-Json -Compress)) }
   $owned=$true
   [Console]::WriteLine(('READY '+(@{pid=$p.Id;birth=$birth;parentPid=$row.ParentProcessId}|ConvertTo-Json -Compress)))
@@ -176,13 +183,13 @@ let data='';process.stdin.on('data',x=>data+=x);process.stdin.on('end',async()=>
   const pid=JSON.parse(line).pid;if(!Number.isSafeInteger(pid)||pid<=0)throw Error('sidecar_pid_invalid');
   w=spawn(r.powershell,['-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',r.watcher,String(pid),String(c.pid),realpathSync.native(r.bun)],{stdio:'pipe'});
   w.stdout.on('data',x=>watchout+=x);w.stderr.on('data',x=>watcherr+=x);
-  const ready=await Promise.race([new Promise((resolve,reject)=>{const read=()=>{if(watchout.includes('\\n')){w.stdout.off('data',read);resolve(watchout.split('\\n')[0])}};w.stdout.on('data',read);w.once('error',reject);w.once('close',()=>reject(Error('identity_observer_failed')))}),new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('identity_observer_timeout')),8000)})]);clearTimeout(timer);
+  const ready=await Promise.race([new Promise((resolve,reject)=>{const read=()=>{const ready=watchout.split('\\n').slice(0,-1).find(x=>x.startsWith('READY '));if(ready){w.stdout.off('data',read);resolve(ready)}};w.stdout.on('data',read);w.once('error',reject);w.once('close',()=>reject(Error('identity_observer_failed')))}),new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('identity_observer_timeout')),8000)})]);clearTimeout(timer);
   const identity=JSON.parse(ready.slice(6));if(!ready.startsWith('READY ')||identity.pid!==pid||identity.parentPid!==c.pid||!/^\\d+$/.test(identity.birth))throw Error('sidecar_identity_invalid');
   const closed=once(c,'close'),observed=once(w,'close');if(!c.kill('SIGTERM'))throw Error('caller_termination_failed');w.stdin.end('WAIT\\n');
   const [[exit,signal],[watchExit]]=await Promise.race([Promise.all([closed,observed]),new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('termination_observation_timeout')),8000)})]);clearTimeout(timer);
   const result=JSON.parse(watchout.split('\\n').find(x=>x.startsWith('RESULT ')).slice(7));
   console.log(JSON.stringify({exit,signal,watchExit,identity,result,stdout,stderr,watcherr}));
- } catch(e){console.error(JSON.stringify({phase:e.message,watchout:watchout.slice(0,8192),watcherr:watcherr.slice(0,8192),frontendStderr:stderr.slice(0,8192)}));process.exitCode=1}
+ } catch(e){const stages=['observer_started','process_held','wmi_loaded','wmi_query_started','wmi_query_completed','image_observed'];const observerStage=watchout.split('\\n').slice(0,-1).map(x=>x.trim()).filter(x=>x.startsWith('STAGE ')).map(x=>x.slice(6)).filter(x=>stages.includes(x)).at(-1)??null;console.error(JSON.stringify({phase:e.message,observerStage,watchout:watchout.slice(0,8192),watcherr:watcherr.slice(0,8192),frontendStderr:stderr.slice(0,8192)}));process.exitCode=1}
  finally {clearTimeout(timer);if(c&&c.exitCode===null&&c.signalCode===null)c.kill('SIGKILL');if(w&&w.exitCode===null&&w.signalCode===null){if(!w.stdin.writableEnded)w.stdin.end('WAIT\\n');const cleanup=setTimeout(()=>w.kill('SIGKILL'),3000);await once(w,'close').catch(()=>{});clearTimeout(cleanup)}if(c){c.stdout.destroy();c.stderr.destroy()}}
 })`
   const oracle=Bun.spawn([Bun.which('node')!,'-e',program],{stdin:'pipe',stdout:'pipe',stderr:'pipe'})
