@@ -37,6 +37,7 @@ import {
   openCodeProfileManager,
 } from './OpenCodeProfileManager.js'
 import { resolveClaudeMultimodelPaths } from './OpenCodeManagedPaths.js'
+import { ensureWindowsPrivateDirectories, hasWindowsPrivateProfileDirectoryDelivery } from './profile/OpenCodePrivateDirectories.js'
 import {
   buildProcessAttributionSpawnEnv,
   mintProcessAttributionId,
@@ -925,6 +926,10 @@ export class OpenCodeHostManager {
     const registryPath = this.persistentRegistryPath
     if (!registryPath) {
       return null
+    }
+    if (path.relative(defaultPersistentRegistryPath(), path.resolve(registryPath)) === '' &&
+      await hasWindowsPrivateProfileDirectoryDelivery()) {
+      await ensureWindowsPrivateDirectories([resolveClaudeMultimodelPaths().data, path.dirname(registryPath)])
     }
     await mkdir(path.dirname(registryPath), { recursive: true, mode: 0o700 })
     const lockPath = `${registryPath}.lock`

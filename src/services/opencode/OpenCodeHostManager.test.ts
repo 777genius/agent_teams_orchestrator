@@ -3,6 +3,7 @@ import type { ChildProcess } from 'node:child_process'
 import { access, chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { PassThrough } from 'node:stream'
 
 import { describe, expect, test } from 'bun:test'
@@ -3585,3 +3586,65 @@ describe('OpenCodeHostManager process attribution', () => {
     }
   })
 })
+
+
+test('first SDK registry reconciliation creates the private namespace before locking or profile preparation', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'TEST-host-registry-private-'))
+  const scriptPath = path.join(root, 'registry-order.ts')
+  const hostManagerUrl = pathToFileURL(path.resolve('src/services/opencode/OpenCodeHostManager.ts')).href
+  const privateDirectoriesUrl = pathToFileURL(path.resolve('src/services/opencode/profile/OpenCodePrivateDirectories.ts')).href
+  try {
+    await writeFile(scriptPath, `
+import assert from 'node:assert/strict'
+import { mock } from 'bun:test'
+import { access, mkdir } from 'node:fs/promises'
+import path from 'node:path'
+let data = path.join(process.argv[2], 'managed-data'), calls = 0, refuse = false
+process.env.CLAUDE_MULTIMODEL_DATA_HOME = data
+const original = new Error('execution_owner_not_private:private_acl_owner:0')
+mock.module(${JSON.stringify(privateDirectoriesUrl)}, () => ({
+  hasWindowsPrivateProfileDirectoryDelivery: async () => true,
+  ensureWindowsPrivateDirectories: async (directories: readonly string[]) => {
+    assert.deepEqual(directories, [data, path.join(data, 'opencode')])
+    if (refuse) throw original
+    assert.equal(await access(path.join(data, 'opencode', 'host-registry.json.lock')).then(() => true, () => false), false)
+    calls++
+    await mkdir(path.join(data, 'opencode'), { recursive: true })
+  },
+}))
+const { OpenCodeHostManager } = await import(${JSON.stringify(hostManagerUrl)})
+const manager = new OpenCodeHostManager({ processAttributionDirectory: null })
+const result = await manager.reconcilePersistentHosts({ reason: 'startup' })
+assert.equal(result.remaining, 0)
+assert.equal(calls, 1)
+const custom = path.join(process.argv[2], 'custom', 'registry.json')
+await new OpenCodeHostManager({ persistentRegistryPath: custom, processAttributionDirectory: null }).reconcilePersistentHosts()
+assert.equal(calls, 1)
+await access(custom + '.lock')
+data = path.join(process.argv[2], 'fresh-ensure-data')
+process.env.CLAUDE_MULTIMODEL_DATA_HOME = data
+const profileStopped = new Error('TEST-before-host-spawn')
+await assert.rejects(new OpenCodeHostManager({ processAttributionDirectory: null, prepareProfile: async () => {
+  assert.equal(calls, 2)
+  await access(path.join(data, 'opencode', 'host-registry.json.lock'))
+  throw profileStopped
+} }).ensureHost(), error => error === profileStopped)
+data = path.join(process.argv[2], 'refused-data')
+process.env.CLAUDE_MULTIMODEL_DATA_HOME = data
+refuse = true
+await assert.rejects(new OpenCodeHostManager({ processAttributionDirectory: null }).reconcilePersistentHosts(), error => error === original)
+assert.equal(await access(path.join(data, 'opencode', 'host-registry.json.lock')).then(() => true, () => false), false)
+`, 'utf8')
+    // Keep the allocation ordering double private to this subprocess.
+    const child = Bun.spawn([process.execPath, scriptPath, root], { stdout: 'ignore', stderr: 'pipe' })
+    let ended = false
+    try {
+      const [code, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()])
+      ended = true
+      expect(stderr).toBe('')
+      expect(code).toBe(0)
+    } finally {
+      if (!ended) { child.kill(); await child.exited }
+    }
+  } finally { await rm(root, { recursive: true, force: true }) }
+}, 15_000)
