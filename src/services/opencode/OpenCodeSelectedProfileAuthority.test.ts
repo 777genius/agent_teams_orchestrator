@@ -12,7 +12,7 @@ import path from 'node:path'
 import { OpenCodeProfileManager, assertOpenCodePreparedProfileScope, resolveOpenCodeProfileScope, buildManagedConfigFingerprint } from './OpenCodeProfileManager.js'
 import { refreshSelectedProfileAuthority, type OpenCodeAuthorityRejection } from './OpenCodeSelectedProfileAuthority.js'
 import type { OpenCodePhaseContext } from './OpenCodeRuntimeDeadline.js'
-import type { OpenCodeHostHandle } from './types.js'
+import type { OpenCodeExpectedBehaviorEvidence, OpenCodeHostHandle } from './types.js'
 
 function fixture() {
   const config = {
@@ -311,6 +311,7 @@ const readBirth = processIdentity.readProcessStartTimeMs
 describe('selected readiness owned OAuth rotation', () => {
   let root: string, project: string, env: NodeJS.ProcessEnv, saved: NodeJS.ProcessEnv
   let host: OpenCodeHostHandle, live: Record<string, unknown>, expected: string
+  let initialEvidence: OpenCodeExpectedBehaviorEvidence
   let manager: OpenCodeProfileManager, global: string, successorPath: string
   let birthMock: { mockRestore(): void } | undefined
   let submitted: string | undefined
@@ -354,8 +355,9 @@ describe('selected readiness owned OAuth rotation', () => {
       resolvedConfigFingerprint: profile.managedConfigFingerprint, diagnostics: [] }
     live = JSON.parse(JSON.stringify(profile.managedConfig)
       .replace(/\{env:([^}]+)\}/g, (_match, name: string) => profile.env[name] || ''))
-    expected = (await buildOpenCodeExpectedBehaviorEvidence({ profile, fullModelId: selectedModel,
-      effectiveConfigFingerprint: profile.managedConfigFingerprint })).expectedBehaviorFingerprint
+    initialEvidence = await buildOpenCodeExpectedBehaviorEvidence({ profile, fullModelId: selectedModel,
+      effectiveConfigFingerprint: profile.managedConfigFingerprint })
+    expected = initialEvidence.expectedBehaviorFingerprint
     submitted = undefined
     afterNative = undefined
     evidenceHook = undefined
@@ -395,7 +397,7 @@ describe('selected readiness owned OAuth rotation', () => {
     await rm(root, { recursive: true, force: true })
   })
   const refresh = (allowOwnedOAuthRotation = false, phaseContext?: import('./OpenCodeRuntimeDeadline.js').OpenCodePhaseContext) => refreshSelectedProfileAuthority({
-    host, selectedModel, expectedBehaviorFingerprint: expected, completedOAuthProbe: allowOwnedOAuthRotation ? completedProbe : undefined, phaseContext,
+    host, selectedModel, expectedBehaviorFingerprint: expected, initialExpectedBehaviorEvidence: initialEvidence, completedOAuthProbe: allowOwnedOAuthRotation ? completedProbe : undefined, phaseContext,
     onRejection: value => diagnostics.push(value),
   }, {
     clientFactory: { create: () => ({ getConfig: async () => live,
@@ -543,11 +545,43 @@ describe('selected readiness owned OAuth rotation', () => {
     expect(await refresh(true)).toBeNull()
   })
 
+  test('behavior rejection distinguishes retained project sources from reread selected auth without exposing either', async () => {
+    expect(await refresh()).not.toBeNull()
+    expect(diagnostics).toEqual([])
+    await writeFile(path.join(project, 'AGENTS.md'), 'TEST-PRIVATE project instructions')
+    await mkdir(path.join(project, '.opencode', 'tools'), { recursive: true })
+    await writeFile(path.join(project, '.opencode', 'tools', 'TEST-PRIVATE-tool.ts'), 'TEST-PRIVATE tool contents')
+    expect(await refresh()).toBeNull()
+    expect(diagnostics.at(-1)).toEqual({ check: 'behavior_match', comparison: {
+      initialEvidenceMatchesExpectation: true, projectBehaviorChanged: true,
+      effectiveSelectedAuthChanged: false, otherEvidenceChanged: false,
+      sourcesAvailable: true, changedSourceCount: 2,
+      sources: [
+        { label: '.opencode/tools', initial: 'missing', refreshed: 'present' },
+        { label: 'AGENTS.md', initial: 'missing', refreshed: 'present' },
+      ],
+    } })
+    expect(JSON.stringify(diagnostics)).not.toContain('TEST-PRIVATE')
+    expect(JSON.stringify(diagnostics)).not.toContain(project)
+    await rm(path.join(project, 'AGENTS.md'))
+    await rm(path.join(project, '.opencode', 'tools'), { recursive: true })
+    await writeFile(host.profile.managedAuthPath, JSON.stringify({ xai: { ...c0, access: 'TEST-PRIVATE credential' } }))
+    expect(await refresh()).toBeNull()
+    expect(diagnostics.at(-1)).toEqual({ check: 'behavior_match', comparison: {
+      initialEvidenceMatchesExpectation: true, projectBehaviorChanged: false,
+      effectiveSelectedAuthChanged: true, otherEvidenceChanged: false,
+      sourcesAvailable: true, changedSourceCount: 0, sources: [],
+    } })
+    expect(JSON.stringify(diagnostics)).not.toContain('TEST-PRIVATE')
+    expect(JSON.stringify(diagnostics)).not.toContain(c0.access)
+    expect(JSON.stringify(diagnostics)).not.toContain(initialEvidence.effectiveSelectedAuthFingerprint)
+  })
+
   test('rotation cannot replace a different initial behavior expectation', async () => {
     await execute()
     expected = 'f'.repeat(64)
     expect(await refresh(true)).toBeNull()
-    expect(diagnostics.at(-1)).toEqual({ check: 'behavior_match' })
+    expect(diagnostics.at(-1)).toMatchObject({ check: 'behavior_match', comparison: { initialEvidenceMatchesExpectation: false } })
   })
 
   test('cancellation of the postcheck preserves committed saved authority and rejects', async () => {

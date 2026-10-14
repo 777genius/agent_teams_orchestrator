@@ -2458,7 +2458,9 @@ function describeAuthorityRejection(diagnostic: OpenCodeAuthorityRejection): str
     ? ` (${diagnostic.check}:${diagnostic.phase}:${diagnostic.errorClass})`
     : diagnostic.check === 'selected_config_match'
       ? ` (${diagnostic.check}:${diagnostic.fields.join(',')})`
-      : ` (${diagnostic.check})`
+      : diagnostic.check === 'behavior_match' && diagnostic.comparison
+        ? ` (${diagnostic.check}:${JSON.stringify(diagnostic.comparison)})`
+        : ` (${diagnostic.check})`
 }
 
 function unsupportedExtensionBoundReadinessData(
@@ -2666,6 +2668,7 @@ async function runReadiness(
         host: retainedHost,
         selectedModel: qualifiedSelectedModel.raw,
         expectedBehaviorFingerprint: initialEvidence.expectedBehaviorFingerprint,
+        initialExpectedBehaviorEvidence: initialEvidence,
         contractConfigIdentity: toolProof.contractConfigIdentity,
         onRejection,
         phaseContext,
@@ -2691,6 +2694,7 @@ async function runReadiness(
           && executionOutcome.observedModelId === qualifiedSelectedModel.modelId
           ? completedOAuthProbe : undefined,
         expectedBehaviorFingerprint: initialEvidence.expectedBehaviorFingerprint,
+        initialExpectedBehaviorEvidence: initialEvidence,
         contractConfigIdentity: toolProof.contractConfigIdentity,
         onRejection,
         phaseContext,
