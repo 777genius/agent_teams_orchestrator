@@ -219,7 +219,7 @@ type Fixture = Awaited<ReturnType<typeof fixture>>
 
 // A new Bun process has no parent's effective-config snapshot map. Default
 // production recovery must use the exited writer's canonical SQLite history.
-async function fresh(f: Fixture, env = f.env, purpose = f.purpose, project = f.project, fault?: { path: string, after: boolean }) {
+async function fresh(f: Fixture, env = f.env, purpose = f.purpose, project = f.project, fault?: { path: string, after: boolean }, role: 'fault' | 'recovery' | 'idempotent' = fault ? 'fault' : 'recovery') {
   const modulePath = path.resolve(import.meta.dir, './OpenCodeProfileManager.ts')
   const inject = fault ? `const { mock } = await import('bun:test');
     const atomicPath = ${JSON.stringify(path.resolve(import.meta.dir, '../../utils/atomicWrite.ts'))};
@@ -238,7 +238,7 @@ async function fresh(f: Fixture, env = f.env, purpose = f.purpose, project = f.p
     try { const scope = await resolveOpenCodeProfileScope({ projectPath: process.argv[1], selectedModel: 'xai/grok-4.3', purpose: process.argv[2] });
       process.stdout.write(JSON.stringify({ ok: true, scope }));
     } catch (e) { process.stdout.write(JSON.stringify({ ok: false, error: e.message })); }`
-  const entry = startOwnedChild(script, [project, purpose], env, 'fresh recovery natural exit')
+  const entry = startOwnedChild(script, [project, purpose], env, `fresh ${role} natural exit`)
   entry.child.stdin.end()
   await entry.closed
   if (entry.state.cleaning) await stopInterruptedContinuation()
@@ -522,9 +522,10 @@ for (const target of ['capture', 'sidecar']) for (const after of [false, true]) 
     expect(captured.owner).toEqual(f.receipt.owner)
     expect((await fresh(f, changed)).ok).toBe(true)
     expect((await saved(f, changed)).xai).toEqual(c1)
-    expect((await fresh(f, changed)).ok).toBe(true)
+    expect((await fresh(f, changed, f.purpose, f.project, undefined, 'idempotent')).ok).toBe(true)
     expect(await read(f.global)).toEqual(c0)
-  })
+    // Three fresh imports plus 3–5 bounded Windows birth queries share this case budget.
+  }, process.platform === 'win32' ? 60_000 : undefined)
 }
 
 test('foreign project cannot authorize a pending or published restart transition', async () => {
