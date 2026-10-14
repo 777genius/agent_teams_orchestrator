@@ -90,3 +90,29 @@ test('V1 compiled, ARM64 and source-only deliveries do not require V2 native ass
     expect(await hasWindowsPrivateProfileDirectoryDelivery({ ...context, entrypoint: '/$bunfs/root/cli' })).toBe(false)
   } finally { await f.remove() }
 })
+
+
+test('private directory failures retain finite native classification and requested ordinal only', async () => {
+  const f = await fixture()
+  try {
+    const directory = path.join(f.root, 'opencode')
+    await mkdir(directory)
+    let failure: unknown
+    try {
+      await prepareWindowsPrivateDirectories([f.root, directory], {
+        ...f.filesystem, openDirectory: async value => {
+          if (value === directory) throw new Error('execution_owner_not_private:private_acl_owner:0')
+          return f.filesystem.openDirectory(value)
+        },
+      })
+    } catch (error) { failure = error }
+    expect(failure instanceof Error && failure.message).toBe('execution_owner_not_private:private_acl_owner:0:private_dir_1')
+    expect(f.live.size).toBe(0)
+    try {
+      await prepareWindowsPrivateDirectories([directory], {
+        ...f.filesystem, openDirectory: async () => { throw new Error('TEST-sensitive-arbitrary-failure') },
+      })
+    } catch (error) { failure = error }
+    expect(failure instanceof Error && failure.message).toBe('TEST-sensitive-arbitrary-failure')
+  } finally { await f.remove() }
+})

@@ -51,7 +51,17 @@ export async function prepareWindowsPrivateDirectories(directories: readonly str
     await handle.assertOwned()
   }
   try {
-    for (const directory of directories) await acquire(directory)
+    if (directories.length > 64) throw new Error('execution_owner_path_invalid')
+    for (let index = 0; index < directories.length; index++) {
+      try { await acquire(directories[index]!) }
+      catch (error) {
+        if (error instanceof Error && error.message.length <= 200 &&
+          /^(?:execution_owner_(?:not_private|unknown|path_invalid|platform_pending)|execution_path_alias|execution_profile_owned)(?::[a-z_0-9]+(?::[0-9]{1,10})?)?$/.test(error.message)) {
+          error.message += `:private_dir_${index}`
+        }
+        throw error
+      }
+    }
     for (const handle of held.values()) await handle.assertOwned()
   } finally {
     const results = await Promise.allSettled([...held.values()].reverse().map(handle => handle.close()))
