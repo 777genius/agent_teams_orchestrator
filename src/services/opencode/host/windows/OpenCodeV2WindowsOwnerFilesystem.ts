@@ -9,7 +9,7 @@ export type WindowsOwnerFileIdentity = Readonly<{
 }>
 export type WindowsOwnerNativeRequest =
   | Readonly<{ op: 'ownerValidateSelectedProfile'; root: string; databasePath: string; directories: readonly string[] }>
-  | Readonly<{ op: 'ownerOpenDirectory'; path: string; createExclusive: boolean }>
+  | Readonly<{ op: 'ownerOpenDirectory' | 'ownerPreparePrivateDirectory'; path: string; createExclusive: boolean }>
   | Readonly<{ op: 'ownerAssertDirectory'; handleId: string; path: string }>
   | Readonly<{ op: 'ownerWriteExclusive'; handleId: string; name: string; bytesBase64: string }>
   | Readonly<{ op: 'ownerReadRecord'; handleId: string; name: string; maxBytes: number }>
@@ -123,11 +123,11 @@ export type WindowsOwnerDirectory = Readonly<{
  * Open is read-only authority acquisition, not ownership/adoption of a fence. */
 export function createWindowsOwnerFilesystem(native: WindowsOwnerNativePort, selectedDirectories: readonly string[] = []) {
   const directoryPaths = Object.freeze([...new Set(selectedDirectories.map(canonicalPath))])
-  const acquire = async (requestedPath: string, createExclusive: boolean, deadline?: number, signal?: AbortSignal): Promise<WindowsOwnerDirectory> => {
+  const acquire = async (requestedPath: string, createExclusive: boolean, deadline?: number, signal?: AbortSignal, prepareOnly = false): Promise<WindowsOwnerDirectory> => {
     executionAssert(process.platform === 'win32', 'execution_owner_platform_pending')
     requestLive(deadline, signal)
     let currentPath = canonicalPath(requestedPath)
-    const opened = response(await native({ op: 'ownerOpenDirectory', path: currentPath, createExclusive }, deadline, signal))
+    const opened = response(await native({ op: prepareOnly ? 'ownerPreparePrivateDirectory' : 'ownerOpenDirectory', path: currentPath, createExclusive }, deadline, signal))
     const originalIdentity = directory(opened, currentPath)
     executionAssert(typeof opened.handleId === 'string' && /^[a-zA-Z0-9_-]{1,128}$/.test(opened.handleId), 'execution_owner_unknown')
     const handleId = opened.handleId
@@ -146,7 +146,7 @@ export function createWindowsOwnerFilesystem(native: WindowsOwnerNativePort, sel
     }
     const mutate = async (action: () => Promise<void>, deadline?: number, signal?: AbortSignal): Promise<void> => {
       await assertOwned(deadline, signal)
-      executionAssert(createExclusive && !archived, 'execution_owner_read_only')
+      executionAssert(createExclusive && !prepareOnly && !archived, 'execution_owner_read_only')
       try { await action() } catch (error) { uncertain = true; throw error }
     }
     return Object.freeze({ identity: originalIdentity,
@@ -247,6 +247,7 @@ export function createWindowsOwnerFilesystem(native: WindowsOwnerNativePort, sel
       executionAssert(!previous || (sameIdentity(previous.root, rootIdentity) && sameIdentity(previous.parent, parentIdentity)), 'execution_owner_unknown')
       selected.set(key, Object.freeze({ root: rootIdentity, parent: parentIdentity }))
     },
+    prepareDirectory: (directoryPath: string, createExclusive: boolean, deadline?: number, signal?: AbortSignal) => acquire(directoryPath, createExclusive, deadline, signal, true),
     createDirectory: (directoryPath: string, deadline?: number, signal?: AbortSignal) => acquire(directoryPath, true, deadline, signal),
     openDirectory: (directoryPath: string, deadline?: number, signal?: AbortSignal) => acquire(directoryPath, false, deadline, signal),
     readSelectedAuthMetadata: async (selectionId: string, deadline?: number, signal?: AbortSignal) => {

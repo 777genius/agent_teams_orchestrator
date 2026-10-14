@@ -5,6 +5,7 @@ import path from 'node:path'
 import { createWindowsNativeBroker, resolveWindowsNativeArtifact } from '../../src/services/opencode/host/windows/OpenCodeV2WindowsNativeBroker.js'
 import { createWindowsOwnerFilesystem, type WindowsOwnerDirectory } from '../../src/services/opencode/host/windows/OpenCodeV2WindowsOwnerFilesystem.js'
 import { executionRecord } from '../../src/services/opencode/execution/OpenCodeV2ExecutionContracts.js'
+import { prepareWindowsPrivateDirectories } from '../../src/services/opencode/profile/OpenCodePrivateDirectories.js'
 import { runControlDirectory } from '../../src/services/opencode/bridge/OpenCodeV2RunControl.js'
 
 // Actual native helper only. Supply a NEW TEST directory under the CI scratch
@@ -253,6 +254,61 @@ try {
   // The scratch parent is setup only. Actual source fences below retain their
   // original DELETE-capable handles; the existing parent needs traversal only.
   await setupRoot.close()
+  // Independent helper processes must coexist while a preparatory creator
+  // retains the parent. Execution-owner creators deliberately remain exclusive.
+  const peerBroker = createWindowsNativeBroker(helper)
+  peerBroker.events.on('error', () => {})
+  const peerFilesystem = createWindowsOwnerFilesystem(input => peerBroker.request(input.op, input))
+  const preparedRoot = path.win32.join(requestedRoot, 'TEST-private-preparation')
+  let prepared: Record<string, unknown> | undefined
+  const creatorFilesystem = createWindowsOwnerFilesystem(async input => {
+    const result = await broker.request(input.op, input)
+    if (input.op === 'ownerPreparePrivateDirectory' && input.path === preparedRoot && input.createExclusive)
+      prepared = executionRecord(result)
+    return result
+  })
+  let creatorReady!: () => void, releaseCreator!: () => void
+  const ready = new Promise<void>(resolve => { creatorReady = resolve })
+  const released = new Promise<void>(resolve => { releaseCreator = resolve })
+  // Pause the public producer's final close, not its native admission or checks.
+  const preparation = prepareWindowsPrivateDirectories([preparedRoot], {
+    prepareDirectory: async (directory, create) => {
+      const held = await creatorFilesystem.prepareDirectory(directory, create)
+      return { ...held, close: async () => { creatorReady(); await released; await held.close() } }
+    },
+  })
+  let ordinaryCreator: WindowsOwnerDirectory | undefined
+  try {
+    await Promise.race([ready, preparation.then(() => { throw new Error('TEST_creator_not_retained') })])
+    assert.ok(prepared && typeof prepared.handleId === 'string')
+    const preparedId = prepared.handleId
+    await assert.rejects(broker.request('ownerArchive', { handleId: preparedId,
+      source: preparedRoot, destination: preparedRoot + '.released.' + crypto.randomUUID() }), /execution_owner_read_only/)
+    await assert.rejects(broker.request('ownerWriteExclusive', { handleId: preparedId,
+      name: 'owner.json', bytesBase64: Buffer.from('{}\n').toString('base64') }), /execution_owner_read_only/)
+    const child = path.win32.join(preparedRoot, 'TEST-child')
+    await prepareWindowsPrivateDirectories([preparedRoot, child], peerFilesystem)
+    const independentlyOpened = await peerFilesystem.openDirectory(preparedRoot)
+    try {
+      assert.deepEqual(independentlyOpened.identity, prepared.identity)
+      await independentlyOpened.assertOwned()
+    } finally { await independentlyOpened.close() }
+    const ordinaryPath = path.win32.join(requestedRoot, 'TEST-ordinary-owner-fence')
+    ordinaryCreator = await filesystem.createDirectory(ordinaryPath)
+    await assert.rejects(prepareWindowsPrivateDirectories([path.win32.join(ordinaryPath, 'TEST-child')],
+      peerFilesystem), /execution_owner_unknown:owner_canonical_open:32/)
+    await ordinaryCreator.assertOwned()
+    assert.equal((await readdir(ordinaryPath)).length, 0)
+    facts.privateDirectoryPreparation = { twoIndependentBrokers: true, retainedCreatorDuringPeerAdmission: true,
+      sameIdentity: true, childCreated: true, preparatoryArchiveAndExclusiveWriteDenied: true,
+      ordinaryOwnerStillDeniesConflictingAncestorOpen: true }
+  } finally {
+    releaseCreator()
+    const closed = await Promise.allSettled([preparation, ordinaryCreator?.close()])
+    await peerBroker.close()
+    assert.equal(peerBroker.ended(), true)
+    assert.equal(closed.every(result => result.status === 'fulfilled'), true)
+  }
   // Exercise the production fixed-purpose writer through an existing-only
   // retained directory, including its strict veto of unsafe existing metadata.
   const probeBase = path.win32.join(requestedRoot, 'opencode', 'v2', 'execution-probes')

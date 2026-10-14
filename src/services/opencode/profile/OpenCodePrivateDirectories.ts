@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url'
 import { createWindowsNativeBroker, resolveWindowsNativeArtifact } from '../host/windows/OpenCodeV2WindowsNativeBroker.js'
 import { createWindowsOwnerFilesystem, type WindowsOwnerDirectory } from '../host/windows/OpenCodeV2WindowsOwnerFilesystem.js'
 
-type PrivateDirectories = Pick<ReturnType<typeof createWindowsOwnerFilesystem>, 'createDirectory' | 'openDirectory'>
+type PrivateDirectories = Pick<ReturnType<typeof createWindowsOwnerFilesystem>, 'prepareDirectory'>
 
 /** V1 also ships without V2 native assets (standalone Bun and Windows ARM64).
  * This is delivery routing only. Present/partial assets must pass the existing
@@ -46,7 +46,7 @@ export async function prepareWindowsPrivateDirectories(directories: readonly str
     }
     // Native OPEN rechecks ownership, private ACL, reparse and exact identity.
     // CREATE is exclusive: a competing creator is not silently adopted.
-    const handle = info ? await filesystem.openDirectory(directory) : await filesystem.createDirectory(directory)
+    const handle = await filesystem.prepareDirectory(directory, !info)
     held.set(directory, handle)
     await handle.assertOwned()
   }

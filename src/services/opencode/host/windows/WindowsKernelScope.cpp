@@ -1860,7 +1860,7 @@ public:
     str(result, L"filesystem", L"NTFS");
     return result;
   }
-  JsonObject open(const JsonObject &input) {
+  JsonObject open(const JsonObject &input, bool prepareOnly = false) {
     auto path = text(input, L"path"), owner = currentSid();
     bool create = input.GetNamedBoolean(L"createExclusive", false);
     auto parents = holdSelectedAncestors(path);
@@ -1900,7 +1900,8 @@ public:
       cohortSids = exactControllerCohortSids(probe.value, path);
       cohortSidsPtr = cohortSids.empty() ? nullptr : &cohortSids;
     }
-    auto file = ownerDirectory(path, create, owner, cohortSidsPtr, selectedPackage);
+    // Preparatory directories never need DELETE; ordinary owner fences retain it.
+    auto file = ownerDirectory(path, create, owner, cohortSidsPtr, selectedPackage, !prepareOnly);
     require(exactControllerRoot(file.value, path) == !cohortSids.empty(),
             "execution_containment_filesystem_denied");
     auto id = fileIdentity(file.value, owner, true, selectedPackage, cohortSidsPtr);
@@ -1908,7 +1909,7 @@ public:
     std::vector<JsonObject> parentIdentities;
     for (const auto &parent : parents) parentIdentities.push_back(anchorIdentity(parent.value));
     OwnerDirectory held{std::move(file), std::move(parents), std::move(parentIdentities), path,
-                        owner, id, create};
+                        owner, id, create && !prepareOnly};
     auto inserted = directories.emplace(key, std::move(held));
     auto result = describe(inserted.first->second);
     str(result, L"handleId", key);
@@ -2335,6 +2336,8 @@ public:
       return validateSelectedProfile(input);
     if (operation == L"ownerOpenDirectory")
       return open(input);
+    if (operation == L"ownerPreparePrivateDirectory")
+      return open(input, true);
     if (operation == L"ownerReadMetadata")
       return readMetadata(input);
     if (operation == L"ownerWriteMetadata")
