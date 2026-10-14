@@ -255,6 +255,7 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
           continue
         }
         const capturedAdditions: Member[] = []
+        const additionBirths = new Map<number, number>()
         phase = 'addition_identity'
         for (const row of additions) {
           if (row.pid === process.pid || row.pid === process.ppid) throw cleanupUnknown('protected_addition')
@@ -265,11 +266,17 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
             unownedCandidates.add(row.pid)
             continue
           }
-          const parentBirth = process.platform === 'win32' ? births.get(row.ppid) : births.get(anchor!.pid)
-          if (parentBirth === undefined || identity < parentBirth) throw cleanupUnknown('parent_identity')
-          births.set(row.pid, identity)
+          additionBirths.set(row.pid, identity)
           capturedAdditions.push(row)
         }
+        // Native census order does not guarantee parents precede children.
+        // Validate the complete capture before publishing any signal authority.
+        for (const row of capturedAdditions) {
+          const parentBirth = process.platform === 'win32'
+            ? births.get(row.ppid) ?? additionBirths.get(row.ppid) : births.get(anchor!.pid)
+          if (parentBirth === undefined || additionBirths.get(row.pid)! < parentBirth) throw cleanupUnknown('parent_identity')
+        }
+        for (const [target, identity] of additionBirths) births.set(target, identity)
         if (additions.length) {
           const confirmationRows = await table()
           phase = 'candidate_validation'

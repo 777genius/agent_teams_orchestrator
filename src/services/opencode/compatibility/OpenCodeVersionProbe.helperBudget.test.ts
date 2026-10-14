@@ -170,7 +170,7 @@ for (const mode of ['open', 'exit-only', 'late-close', 'abort'] as const) {
 // never become signal authority, nor hide an orphan in the next full census.
 function additionFixture(mode: 'gone' | 'alive' | 'unknown' | 'orphan' | 'reused' | 'older' | 'expired' |
   'confirmation-gone' | 'confirmation-live' | 'confirmation-reused' | 'stale-gone' | 'stale-live' |
-  'late-orphan' | 'open' | 'captured-orphan-alive' | 'captured-orphan-unknown', platform: NodeJS.Platform = 'win32') {
+  'late-orphan' | 'open' | 'captured-orphan-alive' | 'captured-orphan-unknown' | 'unordered' | 'unordered-older', platform: NodeJS.Platform = 'win32') {
   Object.defineProperty(process, 'platform', { value: platform })
   const root = 900_010, relay = 900_011, leaf = 900_012
   let clock = 1_000_000, removed = 0, trees = 0, closed = false, leafReads = 0
@@ -183,6 +183,11 @@ function additionFixture(mode: 'gone' | 'alive' | 'unknown' | 'orphan' | 'reused
   const readRows = (budget: number) => {
     budgets.push(budget)
     trees++
+    if (mode.startsWith('unordered')) {
+      if (trees <= 2) return [rows[0]!, rows[2]!, rows[1]!]
+      child.emit('exit', 0); child.emit('close', 0); closed = true
+      return []
+    }
     if (mode.startsWith('captured-orphan-')) {
       if (trees <= 2) return rows.slice(0, 2)
       if (trees === 3) {
@@ -209,6 +214,10 @@ function additionFixture(mode: 'gone' | 'alive' | 'unknown' | 'orphan' | 'reused
     birth: async (target, budget) => {
       budgets.push(budget)
       clock += 10
+      if (mode.startsWith('unordered')) {
+        if (target === leaf) leafReads++
+        return target === root ? 10 : target === relay ? 20 : mode === 'unordered-older' ? 5 : 30
+      }
       if (mode.startsWith('captured-orphan-') && target === relay) return 20
       if (target === leaf) {
         leafReads++
@@ -265,7 +274,16 @@ for (const mode of ['gone', 'confirmation-gone', 'stale-gone'] as const) {
   })
 }
 
-for (const mode of ['alive', 'unknown', 'orphan', 'reused', 'older', 'expired',
+test('Windows unordered grandchild and parent births are confirmed before private roots retire', async () => {
+  const f = additionFixture('unordered')
+  expect(await f.run()).toBe('1.19.0\n')
+  expect(f.leafReads()).toBe(2)
+  expect(f.trees()).toBe(3)
+  expect(f.removed()).toBe(1)
+  expect(f.signalled).toEqual([])
+})
+
+for (const mode of ['alive', 'unknown', 'orphan', 'reused', 'older', 'unordered-older', 'expired',
   'confirmation-live', 'confirmation-reused', 'stale-live', 'late-orphan', 'open'] as const) {
   test(`Windows ${mode} snapshot addition remains unknown without deleting private roots or signalling candidates`, async () => {
     const f = additionFixture(mode)
