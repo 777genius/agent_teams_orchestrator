@@ -181,6 +181,7 @@ struct WindowsNativeRunControl {
 
   friend struct WindowsNativeRunControlIssuer;
   friend struct WindowsNativeRunStateIssuer;
+  friend struct NativeSelfImageCustody;
   friend JsonObject windowsNativeRunControlIssue(const HeldInputs &, const JsonObject &);
 
   WindowsNativeRunControl(const WindowsNativeRunControl &) = delete;

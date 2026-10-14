@@ -36,7 +36,19 @@ async function resolveWindowsProducerAsset(name: string, manifestName: string, d
 }
 /** Helper-only owner and spike paths never require the realpath DLL. */
 export async function resolveWindowsNativeArtifact(): Promise<WindowsNativeArtifact> {
-  const artifact = await resolveWindowsProducerAsset('opencode-v2-windows-helper.exe', 'windows-helper.json', false)
+  const source = await resolveWindowsProducerAsset('opencode-v2-windows-helper.exe', 'windows-helper.json', false)
+  // Only the producer-selected helper can place its own held image in custody.
+  // Every fresh CLI selects the same SHA-addressed file, including FileID.
+  const bootstrap = launchWindowsNativeBroker(source, true)
+  bootstrap.events.on('error', () => {})
+  let receipt: unknown
+  try { receipt = await bootstrap.request('selfImageCustody') }
+  finally { await bootstrap.close() }
+  assert(receipt && typeof receipt === 'object' && !Array.isArray(receipt), 'execution_containment_helper_identity')
+  const value = receipt as Record<string, unknown>
+  const selected = path.win32.join(process.env.LOCALAPPDATA!, 'AgentTeams.OpenCodeV2.Native', source.sha256, 'opencode-v2-windows-helper.exe')
+  assert(value.sourcePath === source.path && value.path === selected && value.sha256 === source.sha256 && value.privateAcl === true && value.protectedDacl === true, 'execution_containment_helper_identity')
+  const artifact = Object.freeze({ ...source, path: selected })
   artifacts.add(artifact); return artifact
 }
 export type WindowsRealpathArtifact = WindowsNativeArtifact
@@ -57,9 +69,12 @@ export type WindowsNativeBroker = Readonly<{
  * reference; no HANDLE values are serialized or inherited by user commands. */
 export function createWindowsNativeBroker(artifact: WindowsNativeArtifact): WindowsNativeBroker {
   assert(artifacts.has(artifact), 'execution_containment_helper_identity')
+  return launchWindowsNativeBroker(artifact, false)
+}
+function launchWindowsNativeBroker(artifact: WindowsNativeArtifact, custodyOnly: boolean): WindowsNativeBroker {
   assert(typeof process.env.LOCALAPPDATA === 'string' && path.win32.isAbsolute(process.env.LOCALAPPDATA), 'execution_containment_profile_denied')
   const events = new EventEmitter(), pending = new Map<number, { resolve(value: unknown): void; reject(error: Error): void; dispose(): void }>()
-  const child = spawn(artifact.path, ['--broker'], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], env: { SystemRoot: process.env.SystemRoot, WINDIR: process.env.WINDIR, LOCALAPPDATA: process.env.LOCALAPPDATA } })
+  const child = spawn(artifact.path, [custodyOnly ? '--self-image-custody' : '--broker', artifact.sha256], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], env: { SystemRoot: process.env.SystemRoot, WINDIR: process.env.WINDIR, LOCALAPPDATA: process.env.LOCALAPPDATA } })
   let ended = false, sequence = 0, buffer = '', stderr = ''
   const decoder = new StringDecoder('utf8')
   let resolveExit!: () => void

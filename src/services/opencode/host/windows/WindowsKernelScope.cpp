@@ -2358,6 +2358,161 @@ struct AttributeList {
 #include "WindowsNativeCommand.hpp"
 #include "WindowsNativeRunState.hpp"
 #include "WindowsNativeRunControl.hpp"
+// Self-image custody is deliberately not a general copy/path operation. Its
+// only source is this process, its only destination is a fixed producer-SHA
+// slot, and all writes use the existing native private creation primitives.
+struct NativeSelfImageCustody {
+  std::vector<RetainedAnchorComponent> parents;
+  Handle source, selected;
+  std::wstring owner, sourcePath, path, sha256;
+
+  static void protectedPrivate(HANDLE file, const std::wstring &owner, bool directory) {
+    (void)fileIdentity(file, owner, directory); // No package/cohort grants here.
+    PSECURITY_DESCRIPTOR raw = nullptr;
+    require(GetSecurityInfo(file, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                            nullptr, nullptr, nullptr, nullptr, &raw) == ERROR_SUCCESS,
+            "execution_owner_not_private");
+    LocalMemory descriptor{raw};
+    SECURITY_DESCRIPTOR_CONTROL control = 0;
+    DWORD revision = 0;
+    require(GetSecurityDescriptorControl(raw, &control, &revision) &&
+                (control & SE_DACL_PROTECTED), "execution_owner_not_private",
+            "private_image_protected_dacl");
+  }
+
+  explicit NativeSelfImageCustody(const std::wstring &producerSha, bool bootstrap)
+      : owner(currentSid()), sourcePath(image(GetCurrentProcess())), sha256(producerSha) {
+    using Control = WindowsNativeRunControl;
+    require(sha256.size() == 64 &&
+                sha256.find_first_not_of(L"0123456789abcdef") == std::wstring::npos,
+            "execution_containment_helper_identity");
+    for (auto &parent : ancestors(sourcePath)) parents.emplace_back(std::move(parent));
+    source = Handle(CreateFileW(extended(sourcePath).c_str(), GENERIC_READ | READ_CONTROL,
+                               FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                               FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+    require(source && equalPath(finalPath(source.value), extended(sourcePath)),
+            "execution_containment_helper_identity");
+    auto sourcePin = Control::runControlObserveFile(source.value, false);
+    sourcePin.sha256 = Control::runControlSha256(source.value);
+    require(Control::runControlHashHex(sourcePin.sha256) == sha256 &&
+                Control::runControlSameFile(sourcePin,
+                    Control::runControlProcessImagePin(GetCurrentProcess())),
+            "execution_containment_helper_identity");
+    std::vector<wchar_t> environment(32768);
+    const DWORD count = GetEnvironmentVariableW(L"LOCALAPPDATA", environment.data(),
+                                               static_cast<DWORD>(environment.size()));
+    require(count > 0 && count < environment.size(), "execution_containment_profile_denied");
+    const std::wstring local(environment.data(), count);
+    for (auto &parent : ancestors(local)) parents.emplace_back(std::move(parent));
+    parents.emplace_back(canonicalDirectory(local));
+    // Reuse the owner-checked native mutex to serialize publication. A slot is
+    // never replaced or repaired, including a partial slot from a failed write.
+    SharedAclMutex publication(anchorIdentity(parents.back().handle.value));
+    auto directory = local;
+    for (const auto &name : {std::wstring(L"AgentTeams.OpenCodeV2.Native"), sha256}) {
+      directory += L"\\" + name;
+      try {
+        auto existing = canonicalDirectory(directory);
+      } catch (const NativeError &error) {
+        require(bootstrap && error.win32 == ERROR_FILE_NOT_FOUND,
+                "execution_containment_helper_identity");
+        auto created = ownerDirectory(directory, true, owner);
+      }
+      auto held = ownerDirectory(directory, false, owner);
+      protectedPrivate(held.value, owner, true);
+      parents.emplace_back(std::move(held));
+    }
+    const std::wstring name = L"opencode-v2-windows-helper.exe";
+    path = directory + L"\\" + name;
+    require(bootstrap || equalPath(sourcePath, path), "execution_containment_helper_identity");
+    auto create = reinterpret_cast<NtCreateFileFunction>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtCreateFile"));
+    require(create != nullptr, "execution_containment_helper_identity");
+    LocalMemory descriptor;
+    const std::wstring sddl = L"O:" + owner + L"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;" + owner + L")";
+    require(ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.c_str(), SDDL_REVISION_1, &descriptor.value, nullptr),
+            "execution_owner_unknown");
+    UNICODE_STRING relative{};
+    relative.Buffer = const_cast<wchar_t *>(name.data());
+    relative.Length = static_cast<USHORT>(name.size() * sizeof(wchar_t));
+    relative.MaximumLength = relative.Length;
+    OBJECT_ATTRIBUTES attributes{};
+    attributes.Length = sizeof(attributes);
+    attributes.RootDirectory = parents.back().handle.value;
+    attributes.ObjectName = &relative;
+    attributes.Attributes = 0x40;
+    attributes.SecurityDescriptor = descriptor.value;
+    const auto open = [&](bool exclusiveCreate) {
+      IO_STATUS_BLOCK completion{};
+      HANDLE raw = nullptr;
+      const NTSTATUS status = create(
+          &raw, GENERIC_READ | READ_CONTROL | SYNCHRONIZE |
+                    (exclusiveCreate ? GENERIC_WRITE : 0),
+          &attributes, &completion, nullptr, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ,
+          exclusiveCreate ? FILE_CREATE : FILE_OPEN,
+          0x40 | 0x20 | 0x200000, nullptr, 0); // regular, synchronous, no reparse
+      if (status != 0 || completion.Status != 0) {
+        Handle failed(raw);
+        const NTSTATUS native = status != 0 ? status : completion.Status;
+        if (!exclusiveCreate && static_cast<DWORD>(native) == 0xc0000034UL) return Handle();
+        auto convert = reinterpret_cast<NtStatusErrorFunction>(
+            GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlNtStatusToDosError"));
+        throw NativeError{"execution_containment_helper_identity", convert ? convert(native) : 0,
+                          "private_image_open", static_cast<DWORD>(native)};
+      }
+      return Handle(raw);
+    };
+    selected = open(false);
+    if (!selected) {
+      require(bootstrap, "execution_containment_helper_identity");
+      auto target = open(true);
+      protectedPrivate(target.value, owner, false);
+      require(SetFilePointerEx(source.value, LARGE_INTEGER{}, nullptr, FILE_BEGIN),
+              "execution_containment_helper_identity");
+      BYTE buffer[65536];
+      for (;;) {
+        DWORD read = 0, written = 0;
+        require(ReadFile(source.value, buffer, sizeof(buffer), &read, nullptr),
+                "execution_containment_helper_identity");
+        if (!read) break;
+        require(WriteFile(target.value, buffer, read, &written, nullptr) && written == read,
+                "execution_containment_helper_identity");
+      }
+      require(FlushFileBuffers(target.value), "execution_containment_helper_identity");
+      const auto writtenPin = Control::runControlObserveFile(target.value, false);
+      require(Control::runControlSha256(target.value) == sourcePin.sha256,
+              "execution_containment_helper_identity");
+      target.reset(); // Drop the writer before retaining deny-write/delete custody.
+      selected = open(false);
+      require(selected && Control::runControlSameFile(writtenPin,
+                  Control::runControlObserveFile(selected.value, false)),
+              "execution_containment_helper_identity");
+    }
+    protectedPrivate(selected.value, owner, false);
+    auto pin = Control::runControlObserveFile(selected.value, false);
+    pin.sha256 = sourcePin.sha256;
+    require(equalPath(finalPath(selected.value), extended(path)) &&
+                pin.size == sourcePin.size,
+            "execution_containment_helper_identity");
+    (void)Control::runControlVerifyImage(selected.value, pin);
+    (void)Control::runControlVerifyImage(source.value, sourcePin);
+    for (const auto &parent : parents) parent.assertLive();
+    if (!bootstrap)
+      require(Control::runControlSameFile(sourcePin, pin),
+              "execution_containment_helper_identity");
+  }
+  JsonObject receipt() const {
+    JsonObject value;
+    str(value, L"sourcePath", sourcePath);
+    str(value, L"path", path);
+    str(value, L"sha256", sha256);
+    value.SetNamedValue(L"identity", fileIdentity(selected.value, owner, false));
+    flag(value, L"privateAcl", true);
+    flag(value, L"protectedDacl", true);
+    return value;
+  }
+};
 struct Scope;
 static void removeGrants(Scope &scope);
 struct Scope {
@@ -3882,10 +4037,15 @@ static bool readControlLine(std::string &line) {
   return false;
 }
 int wmain(int argc, wchar_t **argv) {
-  if (argc != 2 || std::wstring(argv[1]) != L"--broker")
+  if (argc != 3 || (std::wstring(argv[1]) != L"--broker" &&
+                    std::wstring(argv[1]) != L"--self-image-custody"))
     return 64;
   try {
     winrt::init_apartment(winrt::apartment_type::multi_threaded);
+    const bool custodyOnly = std::wstring(argv[1]) == L"--self-image-custody";
+    // Acquire custody inside the reply error boundary, before any operation
+    // effect, then retain the image and physical ancestors until broker exit.
+    std::unique_ptr<NativeSelfImageCustody> custody;
     OwnerStore owners;
     std::unique_ptr<Scope> scope;
     std::string line;
@@ -3903,7 +4063,14 @@ int wmain(int argc, wchar_t **argv) {
         auto operation = text(request, L"operation");
         auto input = object(request, L"input");
         JsonObject value;
-        if (operation.rfind(L"owner", 0) == 0 || operation.rfind(L"runState", 0) == 0)
+        if (custodyOnly)
+          require(operation == L"selfImageCustody" && input.Size() == 0,
+                  "execution_invalid_response");
+        if (!custody)
+          custody = std::make_unique<NativeSelfImageCustody>(argv[2], custodyOnly);
+        if (custodyOnly) {
+          value = custody->receipt();
+        } else if (operation.rfind(L"owner", 0) == 0 || operation.rfind(L"runState", 0) == 0)
           value = owners.request(operation, input);
         else if (operation == L"identity") {
           double raw = input.GetNamedNumber(L"pid");

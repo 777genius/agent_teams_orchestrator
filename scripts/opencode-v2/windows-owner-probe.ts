@@ -17,7 +17,16 @@ const requestedRoot = process.argv[2]
 assert.ok(requestedRoot && path.win32.isAbsolute(requestedRoot))
 assert.match(path.win32.basename(requestedRoot), /^TEST-windows-owner-[a-zA-Z0-9-]+$/)
 const facts: Record<string, unknown> = { schema: 1, qualified: false, primitive: 'held-directory-rename', runRoot: requestedRoot }
-const broker = createWindowsNativeBroker(await resolveWindowsNativeArtifact())
+const producerPath = path.resolve(import.meta.dir, '../../native/win32-x64/opencode-v2-windows-helper.exe')
+const imageSnapshot = async (file: string) => {
+  const info = await lstat(file)
+  assert.equal(info.isFile(), true); assert.equal(info.isSymbolicLink(), false); assert.equal(info.nlink, 1)
+  return { dev: info.dev, ino: info.ino, birth: info.birthtimeMs, mtime: info.mtimeMs,
+    size: info.size, sha256: createHash('sha256').update(await readFile(file)).digest('hex') }
+}
+const producerBefore = await imageSnapshot(producerPath)
+const helper = await resolveWindowsNativeArtifact()
+const broker = createWindowsNativeBroker(helper)
 broker.events.on('error', () => {})
 const request = (operation: string, input: Readonly<Record<string, unknown>>) => {
   facts.lastOperation = operation
@@ -197,6 +206,42 @@ exit 1
 const lease = 'b04ca87c-d84d-4b55-a89a-9c8fa7bd1f16'
 let failure: unknown
 try {
+  const selectedBefore = await imageSnapshot(helper.path)
+  const freshSelection = await resolveWindowsNativeArtifact()
+  assert.equal(freshSelection.path, helper.path)
+  assert.equal(freshSelection.sha256, helper.sha256)
+  assert.deepEqual(await imageSnapshot(freshSelection.path), selectedBefore)
+  assert.equal(selectedBefore.sha256, producerBefore.sha256)
+  assert.notEqual(helper.path, producerPath)
+  assert.equal(helper.path, path.win32.join(process.env.LOCALAPPDATA!,
+    'AgentTeams.OpenCodeV2.Native', helper.sha256, 'opencode-v2-windows-helper.exe'))
+  // Raw bootstrap transport cannot create owner/run state or accept a caller
+  // supplied source/destination. A wrong producer SHA cannot select an image.
+  const bootstrap = Bun.spawn([producerPath, '--self-image-custody', helper.sha256], {
+    env: { SystemRoot: process.env.SystemRoot, WINDIR: process.env.WINDIR, LOCALAPPDATA: process.env.LOCALAPPDATA },
+    stdin: new Blob([JSON.stringify({ schema: 1, id: 1, operation: 'ownerCreateDirectory',
+      input: { path: path.win32.join(requestedRoot, 'TEST-bootstrap-forbidden') } }) + '\n',
+      JSON.stringify({ schema: 1, id: 2, operation: 'selfImageCustody', input: { path: producerPath } }) + '\n']),
+    stdout: 'pipe', stderr: 'ignore',
+  })
+  const replies = (await new Response(bootstrap.stdout).text()).trim().split('\n').map(line => executionRecord(JSON.parse(line)))
+  assert.equal(await bootstrap.exited, 0)
+  assert.equal(replies.length, 2)
+  for (const reply of replies) { assert.equal(reply.ok, false); assert.equal(reply.error, 'execution_invalid_response') }
+  await assert.rejects(lstat(path.win32.join(requestedRoot, 'TEST-bootstrap-forbidden')), { code: 'ENOENT' })
+  const wrongSha = (helper.sha256[0] === '0' ? '1' : '0') + helper.sha256.slice(1)
+  const wrongProducer = Bun.spawn([producerPath, '--self-image-custody', wrongSha], {
+    env: { SystemRoot: process.env.SystemRoot, WINDIR: process.env.WINDIR, LOCALAPPDATA: process.env.LOCALAPPDATA },
+    stdin: new Blob([JSON.stringify({ schema: 1, id: 1, operation: 'selfImageCustody', input: {} }) + '\n']),
+    stdout: 'pipe', stderr: 'ignore',
+  })
+  const wrongReply = executionRecord(JSON.parse(await new Response(wrongProducer.stdout).text()))
+  assert.equal(await wrongProducer.exited, 0)
+  assert.equal(wrongReply.ok, false)
+  assert.equal(wrongReply.error, 'execution_containment_helper_identity')
+  facts.nativeImageCustody = { producerSha256: helper.sha256, stableSelectedFile: true,
+    selectedImageIsPrivateSlot: true, bootstrapRejectsUnrelatedOperationsAndPaths: true,
+    wrongProducerShaRejected: true }
   const setupRoot = await filesystem.createDirectory(requestedRoot)
   // The scratch parent is setup only. Actual source fences below retain their
   // original DELETE-capable handles; the existing parent needs traversal only.
@@ -474,6 +519,10 @@ try {
   facts.failureContext = { operation: facts.lastOperation, relativePath: facts.lastRelativePath }
 }
 finally {
+  try {
+    assert.deepEqual(await imageSnapshot(producerPath), producerBefore)
+    facts.producerImageBytesAndMetadataUnchanged = true
+  } catch (error) { failure ??= error; facts.producerImageBytesAndMetadataUnchanged = false }
   const closeFailures: string[] = []
   for (const handle of handles.reverse()) {
     try { await handle.close() } catch { closeFailures.push('native_handle_close_failed') }
