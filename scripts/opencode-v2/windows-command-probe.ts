@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { copyFile, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
+import { isDeepStrictEqual } from 'node:util'
 import { createWindowsNativeBroker, resolveWindowsNativeArtifact } from '../../src/services/opencode/host/windows/OpenCodeV2WindowsNativeBroker.js'
 import { createWindowsOwnerFilesystem, type WindowsOwnerDirectory } from '../../src/services/opencode/host/windows/OpenCodeV2WindowsOwnerFilesystem.js'
 
@@ -32,8 +33,10 @@ function record(value: unknown): Record<string, unknown> { assert.ok(value && ty
 const messages: Record<string, unknown>[] = []
 broker.events.on('message', value => messages.push(record(value)))
 let nativePeer: Record<string, unknown> | undefined
-let originalMain: Record<string, unknown> | undefined
+let originalMapping: Record<string, unknown> | undefined
+let mainExited: Record<string, unknown> | undefined
 broker.events.on('connected', value => { nativePeer = record(value) })
+broker.events.on('mainExited', value => { mainExited = record(value) })
 async function until<T>(read: () => T | undefined, milliseconds = 10000): Promise<T> {
   const end = Date.now() + milliseconds
   for (;;) { const result = read(); if (result !== undefined) return result; assert.ok(Date.now() < end, `windows_command_timeout:${stage}`); await Bun.sleep(10) }
@@ -121,7 +124,7 @@ $sid
   await fence.assertOwned()
   const mapping = record(await broker.request('launch', { executable: path.join(root, 'bun.exe'), entry: path.join(root, 'main.ts'), cwd: root, env: environment, writableRoots: [root], readOnlyRoots: [], protectedRoots: [fencePath], nonce, leaseOwnerId }))
   assert.equal(mapping.containerSid, sid)
-  const main = record(mapping.bun); originalMain = main
+  const main = record(mapping.bun); originalMapping = mapping
   const connected = await until(() => nativePeer)
   assert.equal(connected.clientPID, main.nativePID)
   assert.deepEqual(connected, { ...mapping, clientPID: main.nativePID })
@@ -168,14 +171,30 @@ finally {
   facts.failedStage = failure ? stage : undefined
   const cleanupErrors: string[] = []
   if (launched) {
+    let retirementPhase = 'retire_rpc'
+    const retirementFacts: Record<string, unknown> = {}
     try {
-      const receipt = record(await broker.request('retire')); assert.equal(receipt.activeProcesses, 0); assert.equal(receipt.heldProcessExited, true); assert.equal(receipt.ownAcesRemoved, true)
-      assert.ok(originalMain)
-      const afterMain = record(await broker.request('identity', { pid: Number(originalMain.nativePID) }))
-      assert.ok(afterMain.absent === true || afterMain.exited === true)
-      if (afterMain.absent !== true) assert.deepEqual(afterMain.birth, originalMain.birth)
-      facts.retirement = receipt; facts.originalMainRetirement = afterMain; retired = true
-    } catch { cleanupErrors.push('native_scope_retirement_unknown') }
+      const receipt = record(await broker.request('retire'))
+      retirementPhase = 'retire_receipt'
+      for (const key of ['empty', 'activeProcesses', 'heldProcessExited', 'ownAcesRemoved']) {
+        if (typeof receipt[key] === 'boolean' || typeof receipt[key] === 'number') retirementFacts[key] = receipt[key]
+      }
+      retirementFacts.receiptMappingMatches = isDeepStrictEqual(receipt.mapping, originalMapping)
+      assert.equal(receipt.empty, true); assert.equal(receipt.activeProcesses, 0); assert.equal(receipt.heldProcessExited, true); assert.equal(receipt.ownAcesRemoved, true)
+      assert.ok(originalMapping); assert.deepEqual(receipt.mapping, originalMapping)
+      retirementPhase = 'main_exit_event'
+      assert.ok(mainExited)
+      retirementPhase = 'main_exit_proof'
+      retirementFacts.mainExitHeldProcessExited = mainExited.heldProcessExited === true
+      retirementFacts.mainExitMappingMatches = isDeepStrictEqual(mainExited.mapping, originalMapping)
+      assert.equal(mainExited.heldProcessExited, true); assert.deepEqual(mainExited.mapping, originalMapping)
+      facts.retirement = receipt; facts.originalMainRetirement = mainExited; retired = true
+    } catch (error) {
+      const code = error instanceof Error && /^[a-z_]{1,96}(?::[a-z_]{1,64}:\d{1,10})?$/.test(error.message)
+        ? error.message : error instanceof Error && error.name === 'AssertionError' ? 'retirement_assertion_failed' : 'retirement_unknown'
+      facts.retirementFailure = { phase: retirementPhase, code, ...retirementFacts }
+      cleanupErrors.push('native_scope_retirement_unknown')
+    }
   }
   if (sid && (!launched || retired)) {
     try {
