@@ -639,9 +639,13 @@ private:
     require(create != nullptr, "run_state_record_unknown");
     IO_STATUS_BLOCK status{};
     HANDLE raw = nullptr;
+    constexpr ULONG recordOptions =
+        0x40 /* FILE_NON_DIRECTORY_FILE */ |
+        0x20 /* FILE_SYNCHRONOUS_IO_NONALERT */ |
+        0x200000 /* FILE_OPEN_REPARSE_POINT */;
     const NTSTATUS result = create(
         &raw, GENERIC_READ | GENERIC_WRITE | READ_CONTROL | SYNCHRONIZE, &attributes, &status,
-        nullptr, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_CREATE, 0x1 | 0x200000, nullptr, 0);
+        nullptr, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_CREATE, recordOptions, nullptr, 0);
     if (result != 0 || status.Status != 0) {
       auto convert = reinterpret_cast<NtStatusErrorFunction>(
           GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlNtStatusToDosError"));

@@ -362,6 +362,14 @@ try {
   const acquired = executionRecord(await request('runStateAcquire', { dataRoot: discoveryRoot, directory, binding, selectionIds }))
   const stateId = String(acquired.stateId), sourceSha256 = 'a'.repeat(64)
   await request('runStateReserve', { stateId, directory, binding, sourceSha256, sharedControllerRootCohort: true })
+  for (const name of ['start.json', 'challenge']) {
+    const record = await lstat(path.win32.join(directory, name))
+    assert.equal(record.isFile(), true)
+    assert.equal(record.isSymbolicLink(), false)
+    assert.equal(record.nlink, 1)
+    if (name === 'challenge') assert.equal(record.size, 32)
+  }
+  facts.discoveryReservedRecordsAreFiles = true
   const unpublishedBefore = await snapshot(discoveryRoot)
   // This fails on the old native endpoint_missing -> absent conversion even
   // with valid selections, valid start/challenge and a sealed cohort.
