@@ -467,7 +467,7 @@ describe('OpenCodeV2 Windows probe owner adapter', () => {
         spyOn(profileManager, 'collectProjectBehaviorMetadata').mockImplementation(async () =>
           ({ projectBehaviorFingerprint: 'b'.repeat(64), behaviorSources: [] })),
         spyOn(launchPlan, 'buildOpenCodeV2InternalRunPlan').mockImplementation(async () =>
-          ({ binding, members: [{ originalSessionId: 'ses_ambient_TEST' }] }) as never),
+          ({ binding, members: [{ originalSessionId: 'ses_ambientTEST' }] }) as never),
         spyOn(runOwner, 'launchExplicitOpenCodeV2Run').mockImplementation(async () => {
           expect(recordSavedOriginal).toBe(true)
           launchCalls++
