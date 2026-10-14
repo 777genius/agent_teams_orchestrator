@@ -32,6 +32,28 @@ export class OpenCodeVersionProbeCleanupError extends Error {
   }
 }
 
+/** Public projection excludes raw causes, stderr, paths and unrecognized fields. */
+export function getOpenCodeVersionProbeDiagnostics(error: unknown) {
+  if (!(error instanceof OpenCodeVersionProbeCleanupError)) return []
+  const helper = error.helperFailure, terminal = error.terminalDiagnostic
+  const diagnostics = []
+  if (helper) diagnostics.push({
+    code: 'opencode_version_probe_helper_failed', evidence: 'last_observed',
+    operation: helper.operation, reason: helper.reason, exitCode: helper.exitCode, elapsedMs: helper.elapsedMs,
+    ...(helper.helperCause ? { helperCause: {
+      stage: helper.helperCause.stage, category: helper.helperCause.category,
+      hresult: helper.helperCause.hresult, nativeErrorCode: helper.helperCause.nativeErrorCode,
+    } } : {}),
+  })
+  if (terminal) diagnostics.push({
+    code: 'opencode_version_probe_cleanup_unknown', phase: terminal.phase, guard: terminal.guard,
+    closed: terminal.closed, ended: terminal.ended, exitCode: terminal.exitCode,
+    birthsCount: terminal.birthsCount, candidatesCount: terminal.candidatesCount, pendingCount: terminal.pendingCount,
+    lastGroupCount: terminal.lastGroupCount, lastSurvivorCount: terminal.lastSurvivorCount, remainingMs: terminal.remainingMs,
+  })
+  return diagnostics
+}
+
 type Member = NativeRow & { group: number | null; retired: boolean }
 // An observation deadline is not a retirement receipt. Keep unresolved owners
 // reachable, including native queries whose close has not yet been observed.
