@@ -383,6 +383,7 @@ try {
       assert.equal(executionRecord(payload.request).operation, 'status')
       statusRequests++
       await request('runStateRespond', { stateId, directory, connection: envelope.connection,
+        timeoutMs: Math.max(1, Math.min(5000, Number(payload.deadline) - Date.now())),
         response: { nonce: payload.nonce, endpoint: payload.endpoint,
           result: { kind: 'status', state: 'stopped', members: [], deadline: executionRecord(published).deadline } } })
     })().catch(error => { statusFailures.push(error) }).finally(() => { statusResponses.delete(work) })
