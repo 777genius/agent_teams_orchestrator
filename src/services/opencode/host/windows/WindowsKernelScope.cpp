@@ -29,9 +29,9 @@ struct NativeError {
   const char *stage = nullptr;
   DWORD nativeStatus = 0;
 };
-static void require(bool value, const char *code) {
+static void require(bool value, const char *code, const char *stage = nullptr) {
   if (!value)
-    throw NativeError{code};
+    throw NativeError{code, 0, stage};
 }
 struct Handle {
   HANDLE value = nullptr;
@@ -208,7 +208,7 @@ static AclCustody aclCustody(HANDLE file, const std::wstring &owner, PSID select
   LPWSTR ownerString = nullptr;
   require(ConvertSidToStringSidW(ownerSid, &ownerString) != 0, code);
   LocalMemory ownerMemory{ownerString};
-  require(owner == ownerString, code);
+  require(owner == ownerString, code, "private_acl_owner");
   AclCustody result;
   std::vector<std::wstring> siblings;
   for (DWORD i = 0; i < acl->AceCount; i++) {
@@ -229,7 +229,7 @@ static AclCustody aclCustody(HANDLE file, const std::wstring &owner, PSID select
                           cohortSids->end();
     require(owner == trusteeSid || trusteeSid == L"S-1-5-18" ||
                 currentMember || sealedCohortSid,
-            code);
+            code, "private_acl_foreign_allow");
     result.memberAllowed = result.memberAllowed || currentMember;
     if (sealedCohortSid && !currentMember) {
       siblings.push_back(decimal(header->AceFlags) + L":" + decimal(ace->Mask) + L":" +

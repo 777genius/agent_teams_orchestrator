@@ -13,13 +13,24 @@ assert.equal(process.platform, 'win32')
 const requestedRoot = process.argv[2]
 assert.ok(requestedRoot && path.win32.isAbsolute(requestedRoot))
 assert.match(path.win32.basename(requestedRoot), /^TEST-windows-owner-[a-zA-Z0-9-]+$/)
+const facts: Record<string, unknown> = { schema: 1, qualified: false, primitive: 'held-directory-rename', runRoot: requestedRoot }
 const broker = createWindowsNativeBroker(await resolveWindowsNativeArtifact())
 broker.events.on('error', () => {})
-const filesystem = createWindowsOwnerFilesystem(request => broker.request(request.op, request))
+const request = (operation: string, input: Readonly<Record<string, unknown>>) => {
+  facts.lastOperation = operation
+  delete facts.lastRelativePath
+  const target = typeof input.path === 'string' ? input.path : typeof input.root === 'string' ? input.root : undefined
+  if (target !== undefined) {
+    const relative = path.win32.relative(requestedRoot, target)
+    if (relative !== '..' && !relative.startsWith('..\\') && !path.win32.isAbsolute(relative) && !/[\x00-\x1f]/.test(relative))
+      facts.lastRelativePath = relative || '.'
+  }
+  return broker.request(operation, input)
+}
+const filesystem = createWindowsOwnerFilesystem(input => request(input.op, input))
 const handles: WindowsOwnerDirectory[] = []
 const retain = (handle: WindowsOwnerDirectory): WindowsOwnerDirectory => { handles.push(handle); return handle }
 const lease = 'b04ca87c-d84d-4b55-a89a-9c8fa7bd1f16'
-const facts: Record<string, unknown> = { schema: 1, qualified: false, primitive: 'held-directory-rename', runRoot: requestedRoot }
 let failure: unknown
 try {
   const setupRoot = await filesystem.createDirectory(requestedRoot)
@@ -73,7 +84,7 @@ try {
     const opencodeDirectory = path.win32.join(configDirectory, "opencode")
     retain(await filesystem.createDirectory(opencodeDirectory))
     if (config !== undefined) await writeFile(path.win32.join(opencodeDirectory, "opencode.json"), config)
-    return executionRecord(await broker.request("ownerInspectProfileConfig", {
+    return executionRecord(await request("ownerInspectProfileConfig", {
       root: profile, databasePath: path.win32.join(profile, "data", "opencode", "opencode.db"),
     }))
   }
@@ -102,27 +113,34 @@ try {
     env: { AGENT_TEAMS_MCP_CLAUDE_DIR: claudeRoot } } } })
   await writeFile(path.win32.join(selectedConfigDirectory, "opencode.json"), selectedContent)
   const databasePath = path.win32.join(selectedDataDirectory, "opencode.db")
-  await broker.request("ownerValidateSelectedProfile", { root: selectedRoot, databasePath,
+  await request("ownerValidateSelectedProfile", { root: selectedRoot, databasePath,
     directories: [selectedRoot, selectedConfigDirectory] })
-  const selected = executionRecord(await broker.request("ownerSelectConfig", { root: selectedRoot, databasePath,
+  const assertConfigOnlySelection = (value: unknown) => {
+    const selected = executionRecord(value)
+    assert.ok(typeof selected.selectionId === "string" && /^[1-9]\d*$/.test(selected.selectionId))
+    assert.deepEqual(selected, { schema: 1, ok: true, selectionId: selected.selectionId,
+      root: selectedRoot, path: path.win32.join(selectedConfigDirectory, "opencode.json"),
+      sha256: createHash("sha256").update(selectedContent).digest("hex") })
+  }
+  // Inbox binding and reads begin only after native cohort/team join. Config
+  // selection returns no controller or inbox authority for any fixture below.
+  assertConfigOnlySelection(await request("ownerSelectConfig", { root: selectedRoot, databasePath,
     sha256: createHash("sha256").update(selectedContent).digest("hex"), teamId: "TEST-team" }))
-  assert.equal(selected.mcpRoot, claudeRoot); assert.equal(selected.inboxState, "regular")
   const inboxRoot = path.win32.join(claudeRoot, "teams")
   for (const [team, state] of [["TEST-empty", "empty"], ["TEST-absent", "absent"]] as const) {
     retain(await filesystem.createDirectory(path.win32.join(inboxRoot, team)))
     const directory = path.win32.join(inboxRoot, team, "inboxes")
     retain(await filesystem.createDirectory(directory))
     if (state === "absent") await writeFile(path.win32.join(directory, "other.json"), "[]")
-    const result = executionRecord(await broker.request("ownerSelectConfig", { root: selectedRoot, databasePath,
+    assertConfigOnlySelection(await request("ownerSelectConfig", { root: selectedRoot, databasePath,
       sha256: createHash("sha256").update(selectedContent).digest("hex"), teamId: team }))
-    assert.equal(result.inboxState, state)
   }
   const oversizeTeam = "TEST-oversize"
   retain(await filesystem.createDirectory(path.win32.join(inboxRoot, oversizeTeam)))
   const oversizeDirectory = path.win32.join(inboxRoot, oversizeTeam, "inboxes")
   retain(await filesystem.createDirectory(oversizeDirectory))
   await writeFile(path.win32.join(oversizeDirectory, "user.json"), Buffer.alloc(4 * 1024 * 1024 + 1))
-  await assert.rejects(broker.request("ownerSelectConfig", { root: selectedRoot, databasePath,
+  assertConfigOnlySelection(await request("ownerSelectConfig", { root: selectedRoot, databasePath,
     sha256: createHash("sha256").update(selectedContent).digest("hex"), teamId: oversizeTeam }))
   Object.assign(facts, { archivedIdentity: before, archivedPath: successArchive,
     originalPathFreeForNewFence: true, nextIdentity: next.identity,
@@ -130,9 +148,12 @@ try {
     existingRecordNotOverwritten: true, readOnlyReopenCannotMutate: true,
     incompleteProfileConfigSkipProof: { absent: absent.state, zeroLength: incomplete.state,
       malformedComplete: malformedComplete.state },
-    selectedControllerInbox: { mcpRoot: selected.mcpRoot, regular: selected.inboxState,
-      empty: "empty", absent: "absent", oversizeRejected: true } })
-} catch (error) { failure = error }
+    configOnlySelection: { fixtures: ["regular", "empty", "absent", "oversize"],
+      inboxAuthority: "deferred", postJoinInboxProof: false } })
+} catch (error) {
+  failure = error
+  facts.failureContext = { operation: facts.lastOperation, relativePath: facts.lastRelativePath }
+}
 finally {
   const closeFailures: string[] = []
   for (const handle of handles.reverse()) {
