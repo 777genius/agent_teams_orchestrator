@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { writeFile } from 'node:fs/promises'
+import { rename, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { createWindowsNativeBroker, resolveWindowsNativeArtifact } from '../../src/services/opencode/host/windows/OpenCodeV2WindowsNativeBroker.js'
 import { createWindowsOwnerFilesystem, type WindowsOwnerDirectory } from '../../src/services/opencode/host/windows/OpenCodeV2WindowsOwnerFilesystem.js'
@@ -30,6 +30,16 @@ const request = (operation: string, input: Readonly<Record<string, unknown>>) =>
 const filesystem = createWindowsOwnerFilesystem(input => request(input.op, input))
 const handles: WindowsOwnerDirectory[] = []
 const retain = (handle: WindowsOwnerDirectory): WindowsOwnerDirectory => { handles.push(handle); return handle }
+const writeOwnedFixture = async (directory: WindowsOwnerDirectory, directoryPath: string,
+  name: 'opencode.json' | 'user.json' | 'other.json', bytes: string | Uint8Array) => {
+  // The native record creator sets TokenUser ownership and a private DACL.
+  // Rename its fresh file within this TEST directory, then truncate that same
+  // inode to retain genuine zero-length, malformed, and oversized fixture bytes.
+  await directory.writeExclusive('owner.json', { schema: 1, synthetic: true })
+  const target = path.win32.join(directoryPath, name)
+  await rename(path.win32.join(directoryPath, 'owner.json'), target)
+  await writeFile(target, bytes)
+}
 const lease = 'b04ca87c-d84d-4b55-a89a-9c8fa7bd1f16'
 let failure: unknown
 try {
@@ -82,8 +92,8 @@ try {
     const configDirectory = path.win32.join(profile, "config")
     retain(await filesystem.createDirectory(configDirectory))
     const opencodeDirectory = path.win32.join(configDirectory, "opencode")
-    retain(await filesystem.createDirectory(opencodeDirectory))
-    if (config !== undefined) await writeFile(path.win32.join(opencodeDirectory, "opencode.json"), config)
+    const ownedConfig = retain(await filesystem.createDirectory(opencodeDirectory))
+    if (config !== undefined) await writeOwnedFixture(ownedConfig, opencodeDirectory, "opencode.json", config)
     return executionRecord(await request("ownerInspectProfileConfig", {
       root: profile, databasePath: path.win32.join(profile, "data", "opencode", "opencode.db"),
     }))
@@ -99,7 +109,7 @@ try {
   for (const name of ["home", "config", "data", "cache", "state", "tmp", "appdata", "localappdata"])
     retain(await filesystem.createDirectory(path.win32.join(selectedRoot, name)))
   const selectedConfigDirectory = path.win32.join(selectedRoot, "config", "opencode")
-  retain(await filesystem.createDirectory(selectedConfigDirectory))
+  const ownedSelectedConfig = retain(await filesystem.createDirectory(selectedConfigDirectory))
   const selectedDataDirectory = path.win32.join(selectedRoot, "data", "opencode")
   retain(await filesystem.createDirectory(selectedDataDirectory))
   const claudeRoot = path.win32.join(requestedRoot, "TEST-claude")
@@ -107,11 +117,11 @@ try {
   retain(await filesystem.createDirectory(path.win32.join(claudeRoot, "teams")))
   retain(await filesystem.createDirectory(path.win32.join(claudeRoot, "teams", "TEST-team")))
   const inboxes = path.win32.join(claudeRoot, "teams", "TEST-team", "inboxes")
-  retain(await filesystem.createDirectory(inboxes))
-  await writeFile(path.win32.join(inboxes, "user.json"), "[]")
+  const ownedInbox = retain(await filesystem.createDirectory(inboxes))
+  await writeOwnedFixture(ownedInbox, inboxes, "user.json", "[]")
   const selectedContent = JSON.stringify({ mcpServers: { "agent-teams": { type: "local",
     env: { AGENT_TEAMS_MCP_CLAUDE_DIR: claudeRoot } } } })
-  await writeFile(path.win32.join(selectedConfigDirectory, "opencode.json"), selectedContent)
+  await writeOwnedFixture(ownedSelectedConfig, selectedConfigDirectory, "opencode.json", selectedContent)
   const databasePath = path.win32.join(selectedDataDirectory, "opencode.db")
   await request("ownerValidateSelectedProfile", { root: selectedRoot, databasePath,
     directories: [selectedRoot, selectedConfigDirectory] })
@@ -130,16 +140,16 @@ try {
   for (const [team, state] of [["TEST-empty", "empty"], ["TEST-absent", "absent"]] as const) {
     retain(await filesystem.createDirectory(path.win32.join(inboxRoot, team)))
     const directory = path.win32.join(inboxRoot, team, "inboxes")
-    retain(await filesystem.createDirectory(directory))
-    if (state === "absent") await writeFile(path.win32.join(directory, "other.json"), "[]")
+    const ownedDirectory = retain(await filesystem.createDirectory(directory))
+    if (state === "absent") await writeOwnedFixture(ownedDirectory, directory, "other.json", "[]")
     assertConfigOnlySelection(await request("ownerSelectConfig", { root: selectedRoot, databasePath,
       sha256: createHash("sha256").update(selectedContent).digest("hex"), teamId: team }))
   }
   const oversizeTeam = "TEST-oversize"
   retain(await filesystem.createDirectory(path.win32.join(inboxRoot, oversizeTeam)))
   const oversizeDirectory = path.win32.join(inboxRoot, oversizeTeam, "inboxes")
-  retain(await filesystem.createDirectory(oversizeDirectory))
-  await writeFile(path.win32.join(oversizeDirectory, "user.json"), Buffer.alloc(4 * 1024 * 1024 + 1))
+  const ownedOversize = retain(await filesystem.createDirectory(oversizeDirectory))
+  await writeOwnedFixture(ownedOversize, oversizeDirectory, "user.json", Buffer.alloc(4 * 1024 * 1024 + 1))
   assertConfigOnlySelection(await request("ownerSelectConfig", { root: selectedRoot, databasePath,
     sha256: createHash("sha256").update(selectedContent).digest("hex"), teamId: oversizeTeam }))
   Object.assign(facts, { archivedIdentity: before, archivedPath: successArchive,
