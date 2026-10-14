@@ -83,7 +83,7 @@ function running(pid) {
   // explicitly recorded PID is inspected; no process-list/global PID scan.
   if (process.platform === 'linux') {
     try { return !/^\d+ \(.*\) Z /.test(readFileSync(`/proc/${pid}/stat`, 'utf8')); }
-    catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+    catch (error) { if (error.code === 'ENOENT' || error.code === 'ESRCH') return false; throw error; }
   }
   return true;
 }
