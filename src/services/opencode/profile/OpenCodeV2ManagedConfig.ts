@@ -1,6 +1,5 @@
 import { mkdtemp, mkdir, realpath, rm } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
-import { ensureWindowsPrivateDirectories } from './OpenCodePrivateDirectories.js'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import type { ConfigEntry as FloorEntry } from '@opencode/client-v2-floor'
@@ -21,8 +20,11 @@ export async function createOpenCodeV2ReadRoots() {
   const roots = Object.fromEntries(['home', 'config', 'data', 'cache', 'state', 'tmp', 'appdata', 'localappdata']
     .map(key => [key, path.join(root, key)]))
   try {
-    if (process.platform === 'win32') await ensureWindowsPrivateDirectories([root, ...Object.values(roots),
-      path.join(root, 'data', 'opencode'), path.join(root, 'config', 'opencode')], [root])
+    if (process.platform === 'win32') {
+      const { ensureWindowsPrivateDirectories } = await import('./OpenCodePrivateDirectories.js')
+      await ensureWindowsPrivateDirectories([root, ...Object.values(roots),
+        path.join(root, 'data', 'opencode'), path.join(root, 'config', 'opencode')], [root])
+    }
     else await Promise.all(Object.values(roots).map(dir => mkdir(dir, { mode: 0o700 })))
     return { root, env: privateOpenCodeReadEnvironment(root), remove: () => rm(root, { recursive: true, force: true }) }
   } catch (error) {
