@@ -33,7 +33,7 @@ function native(): ValidatedExecutionNative {
 }
 function envelope(): BridgeEnvelope {
   return { schemaVersion: 1, requestId: 'TEST-request', command: 'opencode.launchTeam', cwd: project,
-    startedAt: new Date().toISOString(), timeoutMs: 8000,
+    startedAt: new Date().toISOString(), timeoutMs: 30_000,
     body: { teamId: 'TEST-team', teamName: 'TEST-team', runId: 'TEST-run', laneId: 'primary',
       selectedModel: 'provider/model', skipPermissions: true, members: [{ name: 'worker' }] } }
 }
@@ -186,6 +186,31 @@ for (const version of ['2.0.0', '2.0.21'] as const) test(`${version} team launch
   await expect(createOpenCodeV2LaunchPlan({ ...launch, body: { ...launch.body, executionProof: changedPolicyProof,
     preconditions: { ...preconditions, expectedBehaviorFingerprint: changedPolicyProof.expectedBehaviorEvidence.expectedBehaviorFingerprint } } }))
     .rejects.toThrow('run_launch_config_variant_changed')
+  probe.mockImplementation(async () => ({ state: 'available', proof: samePolicyProof, reason: null }))
+  const originalHash = nativeIdentity.hashOpenCodeFile
+  let active = 0, maximum = 0, sourceReads = 0, expireDuringSourceRead = false
+  const beforeExpiry = Date.parse(samePolicyProof.expiresAt) - 1
+  let now = beforeExpiry
+  const clock = spyOn(Date, 'now').mockImplementation(() => now)
+  const hashes = spyOn(nativeIdentity, 'hashOpenCodeFile').mockImplementation(async file => {
+    const source = file.includes(`${path.sep}src${path.sep}`)
+    if (!source) return originalHash(file)
+    sourceReads++; active++; maximum = Math.max(maximum, active)
+    if (expireDuringSourceRead) now = beforeExpiry + 1
+    try { return await originalHash(file) } finally { active-- }
+  })
+  restores.push(clock, hashes)
+  await createOpenCodeV2LaunchPlan(launch)
+  expect(sourceReads).toBeGreaterThan(1)
+  expect(maximum).toBeGreaterThan(1)
+  expect(maximum).toBeLessThanOrEqual(16)
+  expireDuringSourceRead = true
+  await expect(createOpenCodeV2LaunchPlan(launch)).rejects.toThrow('run_launch_project_behavior_or_proof_changed')
+  now = beforeExpiry; expireDuringSourceRead = false
+  const behaviorRead = spyOn(profiles, 'collectProjectBehaviorMetadata')
+    .mockImplementation(async () => ({ projectBehaviorFingerprint: 'e'.repeat(64), behaviorSources: ['AGENTS.md'] }))
+  restores.push(behaviorRead)
+  await expect(createOpenCodeV2LaunchPlan(launch)).rejects.toThrow('run_launch_project_behavior_or_proof_changed')
 }, 30_000)
 
 test('generic unresolved probes retain their original cache key while team policy has a separate key', async () => {

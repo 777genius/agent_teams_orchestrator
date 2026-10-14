@@ -17,6 +17,7 @@ import { resolveOpenCodeAppMcpLaunchConfig } from '../OpenCodeMcpManager.js'
 import { createOpenCodeV2ExecutionConfig } from '../profile/OpenCodeV2ExecutionConfig.js'
 import { createOpenCodeV2ExecutionReceipt } from '../profile/OpenCodeV2ExecutionReceipt.js'
 import { privateOpenCodeReadEnvironment } from '../profile/OpenCodeV2ManagedConfig.js'
+import { ensureWindowsPrivateDirectories } from '../profile/OpenCodePrivateDirectories.js'
 import { buildOpenCodeAppManagedBootstrapContextText } from '../OpenCodeBridgeCommandHandler.js'
 import { parseOpenCodeBridgePreconditions, requireOpenCodeExpectedBehaviorFingerprint, validateOpenCodeBridgeStateChangingPreconditions } from '../OpenCodeBridgePreconditions.js'
 import type { ExecutionMcpConfig } from '../transport/OpenCodeV2ExecutionClientFactory.js'
@@ -175,10 +176,12 @@ async function buildOpenCodeV2InternalRunPlanWithNative(selection: Awaited<Retur
   const rawMembers = body.members.map(executionRecord)
   executionAssert(new Set(rawMembers.map(member => text(member.name))).size === rawMembers.length, 'run_member_conflict')
   const paths = resolveClaudeMultimodelPaths()
-  await mkdir(paths.data, { recursive: true, mode: 0o700 })
+  if (process.platform === 'win32') await ensureWindowsPrivateDirectories([paths.data])
+  else await mkdir(paths.data, { recursive: true, mode: 0o700 })
   const dataRoot = await realpath(paths.data)
   const profileParent = path.join(dataRoot, 'opencode', 'v2', 'profiles')
-  await mkdir(profileParent, { recursive: true, mode: 0o700 })
+  if (process.platform === 'win32') await ensureWindowsPrivateDirectories([dataRoot, path.join(dataRoot, 'opencode'), path.join(dataRoot, 'opencode', 'v2'), profileParent])
+  else await mkdir(profileParent, { recursive: true, mode: 0o700 })
   const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'run-owner')
   const members: RunMemberPlan[] = []
   let probePrepared: OpenCodePreparedProfile | undefined
@@ -196,15 +199,23 @@ async function buildOpenCodeV2InternalRunPlanWithNative(selection: Awaited<Retur
       controllerMcpName: 'agent-teams', advertisedTools: [] })
   }
   const files: { path: string; sha256: string }[] = []
+  const sourceFiles: string[] = []
   async function walk(directory: string): Promise<void> {
     for (const row of await readdir(directory, { withFileTypes: true })) {
       executionAssert(!row.isSymbolicLink(), 'run_source_symlink')
       const file = path.join(directory, row.name)
       if (row.isDirectory()) await walk(file)
-      else { executionAssert(row.isFile() && files.length < 20_000, 'run_source_budget'); files.push({ path: file, sha256: await hashOpenCodeFile(file) }) }
+      else { executionAssert(row.isFile() && sourceFiles.length < 20_000, 'run_source_budget'); sourceFiles.push(file) }
     }
   }
-  if (delivery.runtimeMode === 'source') await walk(path.join(delivery.root, 'src'))
+  if (delivery.runtimeMode === 'source') {
+    await walk(path.join(delivery.root, 'src'))
+    // Match the installed-graph reader's bounded concurrency. Each source file
+    // still receives the same stable-handle byte and identity verification.
+    for (let offset = 0; offset < sourceFiles.length; offset += 16)
+      files.push(...await Promise.all(sourceFiles.slice(offset, offset + 16)
+        .map(async file => ({ path: file, sha256: await hashOpenCodeFile(file) }))))
+  }
   else {
     // Bun emits self-contained JS entries. Official packages are independently graph-bound.
     for (const name of ['cli.js', 'opencodeV2RunOwner.js', 'opencodeV2ExecutionServer.js']) {
@@ -231,10 +242,16 @@ async function hashText(value: string): Promise<string> { const { createHash } =
 export async function createOpenCodeV2PreparedMember(selection: Awaited<ReturnType<typeof inspectOpenCodeV2LaunchSelection>>,
   native: ValidatedExecutionNative, profileParent: string, input: { teamId: string; runId: string; memberId: string; variant?: string; unattendedTeam?: boolean }) {
   const { teamId, runId, memberId, variant } = input
-    const root = await realpath(await mkdtemp(path.join(profileParent, `${executionHash({ teamId, runId, memberId }).slice(0, 16)}-`)))
-    for (const name of ['home', 'config', 'data', 'cache', 'state', 'tmp', 'appdata', 'localappdata']) await mkdir(path.join(root, name), { mode: 0o700 })
+    const prefix = `${executionHash({ teamId, runId, memberId }).slice(0, 16)}-`
+    const candidate = process.platform === 'win32' ? path.join(profileParent, prefix + randomUUID()) : null
+    const root = candidate ?? await realpath(await mkdtemp(path.join(profileParent, prefix)))
+    const directories = ['home', 'config', 'data', 'cache', 'state', 'tmp', 'appdata', 'localappdata'].map(name => path.join(root, name))
     const configDirectory = path.join(root, 'config', 'opencode'), nativeData = path.join(root, 'data', 'opencode')
-    await mkdir(configDirectory, { mode: 0o700 }); await mkdir(nativeData, { mode: 0o700 })
+    if (process.platform === 'win32') await ensureWindowsPrivateDirectories([root, ...directories, configDirectory, nativeData], [root])
+    else {
+      for (const directory of directories) await mkdir(directory, { mode: 0o700 })
+      await mkdir(configDirectory, { mode: 0o700 }); await mkdir(nativeData, { mode: 0o700 })
+    }
     const provider = await materializeOpenCodeSelectedScopeAuth(selection.scope, selection.project, path.join(nativeData, 'auth.json'), selection.model.id)
     const managedAuthPath = path.join(nativeData, 'auth.json')
     const managedAuthFingerprint = await hashOpenCodeFile(managedAuthPath)

@@ -1,4 +1,6 @@
 import { mkdtemp, mkdir, realpath, rm } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
+import { ensureWindowsPrivateDirectories } from './OpenCodePrivateDirectories.js'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import type { ConfigEntry as FloorEntry } from '@opencode/client-v2-floor'
@@ -14,13 +16,20 @@ export const openCodeV2ReadOverrides = {
 export type OpenCodeV2ReadRoots = Awaited<ReturnType<typeof createOpenCodeV2ReadRoots>>
 
 export async function createOpenCodeV2ReadRoots() {
-  const root = await realpath(await mkdtemp(path.join(tmpdir(), 'opencode-v2-read-')))
+  const candidate = process.platform === 'win32' ? path.join(await realpath(tmpdir()), `opencode-v2-read-${randomUUID()}`) : null
+  const root = candidate ?? await realpath(await mkdtemp(path.join(tmpdir(), 'opencode-v2-read-')))
   const roots = Object.fromEntries(['home', 'config', 'data', 'cache', 'state', 'tmp', 'appdata', 'localappdata']
     .map(key => [key, path.join(root, key)]))
   try {
-    await Promise.all(Object.values(roots).map(dir => mkdir(dir, { mode: 0o700 })))
+    if (process.platform === 'win32') await ensureWindowsPrivateDirectories([root, ...Object.values(roots),
+      path.join(root, 'data', 'opencode'), path.join(root, 'config', 'opencode')], [root])
+    else await Promise.all(Object.values(roots).map(dir => mkdir(dir, { mode: 0o700 })))
     return { root, env: privateOpenCodeReadEnvironment(root), remove: () => rm(root, { recursive: true, force: true }) }
-  } catch (error) { await rm(root, { recursive: true, force: true }); throw error }
+  } catch (error) {
+    // An uncertain Windows native acquisition remains available for diagnosis.
+    if (process.platform !== 'win32') await rm(root, { recursive: true, force: true })
+    throw error
+  }
 }
 
 export function privateOpenCodeReadEnvironment(root: string): NodeJS.ProcessEnv {
