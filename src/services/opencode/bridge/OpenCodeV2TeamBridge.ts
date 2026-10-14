@@ -348,7 +348,7 @@ async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: O
         state: probe.proof ? 'ready' : 'model_unavailable', launchAllowed: probe.proof !== null, modelId: `${selection.model.providerID}/${selection.model.id}`,
         availableModels: [], opencodeVersion: selection.native.version, binaryPath: selection.native.executablePath,
         hostHealthy: qualified, appMcpConnected: qualified, requiredToolsPresent: qualified, permissionBridgeReady: false,
-        runtimeStoresReady: owner !== null, supportLevel: qualified ? 'source_linux' : null,
+        runtimeStoresReady: owner !== null, supportLevel: qualified ? 'production_supported' : null,
         missing: probe.proof ? [] : [probe.reason ?? 'Selected-model native execution proof is required.'],
         diagnostics: ['Source availability is verified. No execution proof is claimed until the normal owned native probe observes the original terminal and physical cleanup.'],
         executionProof: probe.proof, expectedBehaviorEvidence: probe.proof?.expectedBehaviorEvidence ?? null,

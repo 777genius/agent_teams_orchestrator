@@ -151,7 +151,7 @@ test('foreign binding, excessive deadline and expired budget refuse before any s
   const f = fixture(), now = Date.now()
   await expect(f.bridge.awaitLaunchReady({ ...f.record, binding: { ...f.record.binding, ownerId: 'other' } }, f.plan, now + 1000))
     .rejects.toThrow('run_readiness_changed')
-  await expect(f.bridge.awaitLaunchReady(f.record, f.plan, now + 100_000)).rejects.toThrow('run_readiness_changed')
+  await expect(f.bridge.awaitLaunchReady(f.record, f.plan, now + 130_000)).rejects.toThrow('run_readiness_changed')
   await expect(f.bridge.awaitLaunchReady(f.record, f.plan, now - 1)).rejects.toThrow('run_readiness_unknown')
   expect(f.counts).toEqual({ launched: 0, discovered: 0, reads: 0, sends: 0 })
 })
