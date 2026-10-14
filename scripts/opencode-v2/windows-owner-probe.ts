@@ -372,8 +372,32 @@ try {
   const published = executionRecord(await request('runStateListen', {
     stateId, directory, binding, sourceSha256, deadline: Date.now() + 120_000,
   })).record
-  await route(discoveryRoot, binding.runId, 'owner', 'unsupported', published)
-  await route(discoveryRoot, binding.runId, 'owner', 'missing', published)
+  const statusResponses = new Set<Promise<void>>()
+  const statusFailures: unknown[] = []
+  let statusRequests = 0
+  const respondToStatus = (event: unknown) => {
+    const work = (async () => {
+      const envelope = executionRecord(event), payload = executionRecord(envelope.payload)
+      assert.equal(payload.protocol, 1)
+      assert.deepEqual(payload.binding, binding)
+      assert.equal(executionRecord(payload.request).operation, 'status')
+      statusRequests++
+      await request('runStateRespond', { stateId, directory, connection: envelope.connection,
+        response: { nonce: payload.nonce, endpoint: payload.endpoint,
+          result: { kind: 'status', state: 'stopped', members: [], deadline: executionRecord(published).deadline } } })
+    })().catch(error => { statusFailures.push(error) }).finally(() => { statusResponses.delete(work) })
+    statusResponses.add(work)
+  }
+  broker.events.on('runControlRequest', respondToStatus)
+  try {
+    await route(discoveryRoot, binding.runId, 'owner', 'unsupported', published)
+    await route(discoveryRoot, binding.runId, 'owner', 'missing', published)
+  } finally {
+    broker.events.off('runControlRequest', respondToStatus)
+    await Promise.all(statusResponses)
+  }
+  assert.deepEqual(statusFailures, [])
+  assert.equal(statusRequests, 2)
   // Same physical fence with a foreign requested binding must remain UNKNOWN.
   await assert.rejects(request('runStateDiscover', { dataRoot: discoveryRoot, directory,
     teamId: 'TEST-foreign', runId: binding.runId, selectionIds }), /run_state_start_changed/)
@@ -384,6 +408,22 @@ try {
   await request('runStateClose', { stateId, directory })
   facts.discoveryPresent = { unpublishedVeto: true, malformedFenceVeto: true, foreignBindingVeto: true,
     originalOwnerRecoveredAfterUnsupportedOrMissingCLI: true, originalEndpointMatched: true }
+  const reparseInventoryRoot = path.win32.join(requestedRoot, 'TEST-reparse-profile-inventory')
+  for (const directory of [reparseInventoryRoot, path.win32.join(reparseInventoryRoot, 'opencode'),
+    path.win32.join(reparseInventoryRoot, 'opencode', 'v2'),
+    path.win32.join(reparseInventoryRoot, 'opencode', 'v2', 'profiles')])
+    retain(await filesystem.createDirectory(directory))
+  const profileJunction = path.win32.join(reparseInventoryRoot, 'opencode', 'v2', 'profiles', 'TEST-junction')
+  await symlink(selectedRoot, profileJunction, 'junction')
+  const junctionBefore = await lstat(profileJunction)
+  const profileBefore = await readFile(path.win32.join(selectedConfigDirectory, 'opencode.json'))
+  await route(reparseInventoryRoot, 'TEST-fresh', 'veto')
+  const junctionAfter = await lstat(profileJunction)
+  assert.equal(junctionAfter.isSymbolicLink(), true)
+  assert.equal(junctionAfter.ino, junctionBefore.ino)
+  assert.equal(junctionAfter.dev, junctionBefore.dev)
+  assert.deepEqual(await readFile(path.win32.join(selectedConfigDirectory, 'opencode.json')), profileBefore)
+  facts.discoveryReparseProfileInventoryVeto = true
   const inboxRoot = path.win32.join(claudeRoot, "teams")
   for (const [team, state] of [["TEST-empty", "empty"], ["TEST-absent", "absent"]] as const) {
     retain(await filesystem.createDirectory(path.win32.join(inboxRoot, team)))

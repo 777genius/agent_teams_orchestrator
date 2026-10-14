@@ -88,6 +88,7 @@ async function windowsProfileAdmissionsForDataRoot(dataRoot: string, broker: Win
     if (executionRecord(error).code === 'ENOENT') return [] as Dirent[]; throw error
   })
   const profiles: WindowsProfileAdmission[] = []
+  executionAssert(entries.every(entry => !entry.isSymbolicLink()), 'run_control_selection_missing')
   const candidates = entries.filter(entry => entry.isDirectory()).slice(0, 32)
   for (const entry of candidates) {
     executionAssert(Date.now() < deadline, 'run_control_selection_missing')
