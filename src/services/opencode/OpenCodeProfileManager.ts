@@ -28,7 +28,7 @@ import { findGitRoot } from '../../utils/git.js'
 import { safeParseJSONC } from '../../utils/json.js'
 import * as lockfile from '../../utils/lockfile.js'
 import { ensureOpenCodeDirectory } from './ensureOpenCodeDirectory.js'
-import { ensureWindowsPrivateDirectories } from './profile/OpenCodePrivateDirectories.js'
+import { ensureWindowsPrivateDirectories, hasWindowsPrivateProfileDirectoryDelivery } from './profile/OpenCodePrivateDirectories.js'
 import {
   applyOpenCodeAutoUpdatePolicy,
   isOpenCodeAutoUpdateAllowed,
@@ -3690,7 +3690,7 @@ export class OpenCodeProfileManager {
     if (options.abortSignal?.aborted) throwOpenCodeAbortReason(options.abortSignal)
 
     enterStep('create profile directories')
-    if (process.platform === 'win32') {
+    if (await hasWindowsPrivateProfileDirectoryDelivery()) {
       await ensureWindowsPrivateDirectories([
         managedPaths.data, path.join(managedPaths.data, 'opencode'),
         path.join(managedPaths.data, 'opencode', 'profiles'), profileRootPath,

@@ -2,7 +2,8 @@ import { expect, test } from 'bun:test'
 import { lstat, mkdir, mkdtemp, realpath, rm, writeFile, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { prepareWindowsPrivateDirectories } from './OpenCodePrivateDirectories.js'
+import { pathToFileURL } from 'node:url'
+import { hasWindowsPrivateProfileDirectoryDelivery, prepareWindowsPrivateDirectories } from './OpenCodePrivateDirectories.js'
 import type { WindowsOwnerDirectory } from '../host/windows/OpenCodeV2WindowsOwnerFilesystem.js'
 
 // This contract exercises the creation/retention boundary on real temporary
@@ -70,5 +71,22 @@ test('uncertain partial creation is retained and a competing creator is never re
     expect((await lstat(namespace)).isDirectory()).toBe(true)
     expect(f.calls).toEqual([])
     expect(f.live.size).toBe(0)
+  } finally { await f.remove() }
+})
+
+
+test('V1 compiled, ARM64 and source-only deliveries do not require V2 native assets', async () => {
+  const f = await fixture()
+  try {
+    const context = { platform: 'win32', arch: 'x64',
+      moduleUrl: pathToFileURL(path.join(f.root, 'src/services/opencode/profile/OpenCodePrivateDirectories.ts')).href,
+      entrypoint: path.join(f.root, 'cli-source') }
+    expect(await hasWindowsPrivateProfileDirectoryDelivery(context)).toBe(false)
+    await mkdir(path.join(f.root, 'native', 'win32-x64'), { recursive: true })
+    // Even incomplete delivery selects mandatory native validation, not fallback.
+    expect(await hasWindowsPrivateProfileDirectoryDelivery(context)).toBe(true)
+    expect(await hasWindowsPrivateProfileDirectoryDelivery({ ...context, arch: 'arm64' })).toBe(false)
+    expect(await hasWindowsPrivateProfileDirectoryDelivery({ ...context, moduleUrl: 'file:///C:/~BUN/root/cli.js' })).toBe(false)
+    expect(await hasWindowsPrivateProfileDirectoryDelivery({ ...context, entrypoint: '/$bunfs/root/cli' })).toBe(false)
   } finally { await f.remove() }
 })

@@ -1,9 +1,28 @@
 import { lstat } from 'node:fs/promises'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { createWindowsNativeBroker, resolveWindowsNativeArtifact } from '../host/windows/OpenCodeV2WindowsNativeBroker.js'
 import { createWindowsOwnerFilesystem, type WindowsOwnerDirectory } from '../host/windows/OpenCodeV2WindowsOwnerFilesystem.js'
 
 type PrivateDirectories = Pick<ReturnType<typeof createWindowsOwnerFilesystem>, 'createDirectory' | 'openDirectory'>
+
+/** V1 also ships without V2 native assets (standalone Bun and Windows ARM64).
+ * This is delivery routing only. Present/partial assets must pass the existing
+ * native resolver; identity, ACL and native failures never enable fallback. */
+export async function hasWindowsPrivateProfileDirectoryDelivery(context = {
+  platform: process.platform as string, arch: process.arch as string,
+  moduleUrl: import.meta.url, entrypoint: Bun.main,
+}): Promise<boolean> {
+  if (context.platform !== 'win32' || context.arch !== 'x64' ||
+    [context.moduleUrl, context.entrypoint].some(value => value.includes('$bunfs') || /[/\\]~BUN[/\\]/.test(value))) return false
+  const location = fileURLToPath(context.moduleUrl), marker = `${path.sep}src${path.sep}`
+  const root = location.includes(marker) ? location.slice(0, location.lastIndexOf(marker)) : path.dirname(location)
+  try { await lstat(path.join(root, 'native', 'win32-x64')); return true }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+    throw error
+  }
+}
 
 /** Only SDK-owned namespaces call this boundary. Existing directories are
  * validated, never repaired; uncertain/partial native creations are preserved. */
