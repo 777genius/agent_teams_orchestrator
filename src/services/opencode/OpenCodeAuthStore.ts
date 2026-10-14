@@ -6,6 +6,8 @@ import path from 'node:path'
 import { writeJsonFileAtomic } from '../../utils/atomicWrite.js'
 import { resolveOpenCodeAuthCoordinationPath, withOpenCodeAuthCoordinationLock } from './OpenCodeAuthCoordinationLock.js'
 import { throwOpenCodeAbortReason } from './OpenCodeRuntimeDeadline.js'
+import { resolveClaudeMultimodelPaths } from './OpenCodeManagedPaths.js'
+import { ensureWindowsPrivateDirectories, hasWindowsPrivateProfileDirectoryDelivery } from './profile/OpenCodePrivateDirectories.js'
 
 import type { OpenCodeApiAuthInput, OpenCodeConnectedProvider, OpenCodeSessionRecord } from './types.js'
 
@@ -610,6 +612,15 @@ async function withAuthStoreWriteLock<T>(
   operation: () => Promise<T>,
   abortSignal?: AbortSignal,
 ): Promise<T> {
+  if (abortSignal?.aborted) throwOpenCodeAbortReason(abortSignal)
+  const dataRoot = resolveClaudeMultimodelPaths().data
+  const globalAuthPath = path.join(dataRoot, 'opencode', 'auth.json')
+  // Only this SDK-owned global destination may create the private namespace.
+  // Arbitrary user stores retain their original directory/permission semantics.
+  if (path.relative(globalAuthPath, path.resolve(filePath)) === '' &&
+    await hasWindowsPrivateProfileDirectoryDelivery()) {
+    await ensureWindowsPrivateDirectories([dataRoot, path.join(dataRoot, 'opencode')])
+  }
   return withOpenCodeAuthCoordinationLock({
     authPath: filePath,
     operation,
