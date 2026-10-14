@@ -256,9 +256,12 @@ static JsonObject fileObjectIdentity(HANDLE file, const std::wstring &owner, boo
               GetFileInformationByHandleEx(file, FileAttributeTagInfo, &tag, sizeof(tag)) &&
               GetFileInformationByHandleEx(file, FileStandardInfo, &standard, sizeof(standard)),
           "execution_owner_unknown");
-  require(!(tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
-              !!standard.Directory == directory && standard.NumberOfLinks == 1,
-          "execution_owner_alias");
+  require(!(tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT),
+          "execution_owner_alias", "owner_identity_reparse");
+  require(!!standard.Directory == directory,
+          "execution_owner_alias", "owner_identity_type");
+  require(standard.NumberOfLinks == 1,
+          "execution_owner_alias", "owner_identity_links");
   PSID ownerSid = nullptr;
   PSECURITY_DESCRIPTOR descriptor = nullptr;
   require(GetSecurityInfo(file, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, &ownerSid, nullptr,
