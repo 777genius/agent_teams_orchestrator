@@ -44,7 +44,7 @@ const writeOwnedFixture = async (directory: WindowsOwnerDirectory, directoryPath
   const powershellRoot = path.win32.join(process.env.ProgramFiles, 'PowerShell', '7')
   const child = Bun.spawn([path.win32.join(powershellRoot, 'pwsh.exe'), '-NoProfile', '-NonInteractive', '-Command', `
 $ErrorActionPreference='Stop'
-$diagnostic=[ordered]@{phase='startup';referenceProtected=$null;referenceOwnerMatches=$null;targetProtected=$null;descriptorMatches=$null;exceptionType=$null;hResult=$null}
+$diagnostic=[ordered]@{phase='startup';referenceProtected=$null;referenceOwnerMatches=$null;targetProtected=$null;descriptorMatches=$null;targetOwnerMatches=$null;rawDaclMatches=$null;referenceControlFlags=$null;targetControlFlags=$null;exceptionType=$null;hResult=$null}
 try{
 $sections=[System.Security.AccessControl.AccessControlSections]::Owner -bor [System.Security.AccessControl.AccessControlSections]::Access
 $diagnostic.phase='reference_read'
@@ -67,8 +67,21 @@ $diagnostic.phase='target_verify'
 $actual=Get-Acl -LiteralPath $env:TEST_TARGET
 $diagnostic.targetProtected=$actual.AreAccessRulesProtected
 $diagnostic.descriptorMatches=$actual.GetSecurityDescriptorSddlForm($sections) -ceq $exact
+$diagnostic.targetOwnerMatches=$actual.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -eq $reference.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+$diagnostic.phase='target_binary'
+$referenceRaw=[System.Security.AccessControl.RawSecurityDescriptor]::new($reference.GetSecurityDescriptorBinaryForm(),0)
+$actualRaw=[System.Security.AccessControl.RawSecurityDescriptor]::new($actual.GetSecurityDescriptorBinaryForm(),0)
+$diagnostic.referenceControlFlags=[int]$referenceRaw.ControlFlags
+$diagnostic.targetControlFlags=[int]$actualRaw.ControlFlags
+$present=[System.Security.AccessControl.ControlFlags]::DiscretionaryAclPresent
+if($null -eq $referenceRaw.DiscretionaryAcl -or $null -eq $actualRaw.DiscretionaryAcl -or ($referenceRaw.ControlFlags -band $present) -eq 0 -or ($actualRaw.ControlFlags -band $present) -eq 0){throw 'TEST fixture DACL missing'}
+$referenceBytes=[byte[]]::new($referenceRaw.DiscretionaryAcl.BinaryLength)
+$actualBytes=[byte[]]::new($actualRaw.DiscretionaryAcl.BinaryLength)
+$referenceRaw.DiscretionaryAcl.GetBinaryForm($referenceBytes,0)
+$actualRaw.DiscretionaryAcl.GetBinaryForm($actualBytes,0)
+$diagnostic.rawDaclMatches=[Convert]::ToBase64String($referenceBytes) -ceq [Convert]::ToBase64String($actualBytes)
 $diagnostic.phase='target_check'
-if(!$diagnostic.targetProtected -or !$diagnostic.descriptorMatches){throw 'TEST fixture security copy changed'}
+if(!$diagnostic.targetProtected -or !$diagnostic.targetOwnerMatches -or !$diagnostic.rawDaclMatches){throw 'TEST fixture security copy changed'}
 }catch{
 $failure=$_.Exception
 if($failure.InnerException){$failure=$failure.InnerException}
@@ -89,8 +102,11 @@ exit 1
       if (typeof observed.phase === 'string' && /^[a-z_]{1,32}$/.test(observed.phase)) diagnostic.phase = observed.phase
       if (typeof observed.exceptionType === 'string' && /^[A-Za-z_]{1,96}$/.test(observed.exceptionType)) diagnostic.exceptionType = observed.exceptionType
       if (typeof observed.hResult === 'number' && Number.isInteger(observed.hResult) && observed.hResult >= -2147483648 && observed.hResult <= 2147483647) diagnostic.hResult = observed.hResult
-      for (const key of ['referenceProtected', 'referenceOwnerMatches', 'targetProtected', 'descriptorMatches']) {
+      for (const key of ['referenceProtected', 'referenceOwnerMatches', 'targetProtected', 'descriptorMatches', 'targetOwnerMatches', 'rawDaclMatches']) {
         if (typeof observed[key] === 'boolean') diagnostic[key] = observed[key]
+      }
+      for (const key of ['referenceControlFlags', 'targetControlFlags']) {
+        if (typeof observed[key] === 'number' && Number.isInteger(observed[key]) && observed[key] >= 0 && observed[key] <= 65535) diagnostic[key] = observed[key]
       }
     } catch { /* Invalid or absent structured diagnostics retain only exit status. */ }
     facts.fixtureSecurityFailure = diagnostic
