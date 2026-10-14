@@ -24,6 +24,7 @@ import path from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
 
 import { getCwd } from '../../utils/cwd.js'
+import { findGitRoot } from '../../utils/git.js'
 import { safeParseJSONC } from '../../utils/json.js'
 import * as lockfile from '../../utils/lockfile.js'
 import { ensureOpenCodeDirectory } from './ensureOpenCodeDirectory.js'
@@ -339,6 +340,44 @@ function buildOpenCodeTeammatePermission(
     'mcp__agent-teams__*': 'allow',
     'mcp__agent_teams__*': 'allow',
   }
+}
+
+async function resolveOpenCodeAttachmentRoot(env: NodeJS.ProcessEnv): Promise<string | null> {
+  const configuredRoot = env.CLAUDE_AGENT_TEAMS_ATTACHMENT_ROOT?.trim()
+  if (!configuredRoot || !path.isAbsolute(configuredRoot) || /[\0*?]/.test(configuredRoot)) return null
+  try {
+    const normalizedRoot = path.resolve(configuredRoot)
+    const entry = await lstat(normalizedRoot)
+    if (entry.isSymbolicLink() || !entry.isDirectory()) return null
+    const root = await realpath(normalizedRoot)
+    if (/[\0*?]/.test(root) || root === path.parse(root).root || !(await stat(root)).isDirectory()) return null
+    return root
+  } catch {
+    return null
+  }
+}
+
+function applyOpenCodeAttachmentRootPermission(
+  config: Record<string, unknown>,
+  root: string | null,
+  projectPath: string,
+  toolApprovalMode: OpenCodeToolApprovalMode | undefined,
+): void {
+  if (!root) return
+  const permission = asRecord(asRecord(asRecord(config.agent)[OPEN_CODE_TEAMMATE_AGENT_NAME]).permission)
+  const pattern = path.join(root, '**')
+  // Replace the imported external-directory map; its patterns cannot widen this grant.
+  permission.external_directory = { '*': 'deny', [pattern]: 'allow' }
+  const edit: Record<string, unknown> = typeof permission.edit === 'string'
+    ? { '*': permission.edit }
+    : { '*': toolApprovalMode === 'manual' ? 'ask' : 'allow', ...asRecord(permission.edit) }
+  // Native edit/write ask against the Git worktree, or the current drive root without Git.
+  const worktree = findGitRoot(projectPath) ?? path.parse(projectPath).root
+  const relativePattern = path.join(path.relative(worktree, root), '**')
+  // Keep both native-relative and absolute rules last without widening other edit policy.
+  delete edit[pattern]
+  delete edit[relativePattern]
+  permission.edit = { ...edit, [pattern]: 'deny', [relativePattern]: 'deny' }
 }
 
 function downgradeAllowToAsk(value: unknown): unknown {
@@ -2518,6 +2557,9 @@ async function resolveOpenCodeProfileScopeInternal(
   catalogProviderId?: string,
 ): Promise<OpenCodeProfileScope> {
   const envSnapshot = scopeSourceEnvironment(input.env ?? process.env)
+  const attachmentRoot = await resolveOpenCodeAttachmentRoot(envSnapshot)
+  if (attachmentRoot) envSnapshot.CLAUDE_AGENT_TEAMS_ATTACHMENT_ROOT = attachmentRoot
+  else delete envSnapshot.CLAUDE_AGENT_TEAMS_ATTACHMENT_ROOT
   const projectPath = await canonicalizeOpenCodeProjectPath(input.projectPath)
   if (isStrictAuthorityPurpose(input.purpose)
     && canonicalizeOpenCodeProviderId(input.selectedModel.split('/')[0] ?? '') === 'cursor-acp') {
@@ -2679,6 +2721,7 @@ async function resolveOpenCodeProfileScopeInternal(
     authoritySourceFingerprint,
     managedPaths: snapshotManagedPaths,
     appMcpLaunchIdentity,
+    ...(attachmentRoot ? { attachmentRoot } : {}),
   }))
   // The token is persisted in session and host identities, so it must survive a
   // one-shot bridge process exit. Bind only the effective, redacted inputs that
@@ -3453,6 +3496,10 @@ export class OpenCodeProfileManager {
     const resolvedProjectPath = configSnapshot?.projectPath ?? currentProjectPath
     const managedPaths = configSnapshot?.managedPaths ?? this.paths
     let runtimeEnv = configSnapshot?.runtimeEnv ?? process.env
+    const attachmentRoot = await resolveOpenCodeAttachmentRoot(runtimeEnv)
+    if (configSnapshot && attachmentRoot !== (runtimeEnv.CLAUDE_AGENT_TEAMS_ATTACHMENT_ROOT ?? null)) {
+      throw new Error('OpenCode scoped profile canonical attachment root changed')
+    }
     const snapshotHome = runtimeEnv.HOME?.trim() || runtimeEnv.USERPROFILE?.trim() || os.homedir()
     // Verified staging is the only switch that turns on the managed Cursor path.
     // Anything unavailable keeps the upstream plugin and today's launch behaviour.
@@ -3548,6 +3595,12 @@ export class OpenCodeProfileManager {
         managedProviderId: policy?.scope.providerId,
         toolApprovalMode: options.toolApprovalMode,
       }),
+    )
+    applyOpenCodeAttachmentRootPermission(
+      managedConfig,
+      attachmentRoot,
+      resolvedProjectPath,
+      options.toolApprovalMode,
     )
     applyOpenCodeModelLimitOverrides(managedConfig, effectiveModelOutputLimitOverrides)
     const managedSubscriptionPlugins = policy?.managedSubscriptionPlugins
