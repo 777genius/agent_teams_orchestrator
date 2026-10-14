@@ -2059,13 +2059,20 @@ public:
         const size_t size = offsetof(FILE_RENAME_INFO, FileName) + name.size() * sizeof(wchar_t);
         std::vector<BYTE> bytes(size);
         auto rename = reinterpret_cast<FILE_RENAME_INFO *>(bytes.data());
-        rename->ReplaceIfExists = existing ? TRUE : FALSE;
+        rename->ReplaceIfExists = FALSE;
+        // An existing destination stays HANDLE-pinned through publication.
+        // FileRenameInformationEx POSIX replacement preserves those old-object
+        // handles; classic FileRenameInformation rejects an open destination.
+        if (existing) {
+          const DWORD flags = 0x1 | 0x2; // REPLACE_IF_EXISTS | POSIX_SEMANTICS
+          memcpy(bytes.data(), &flags, sizeof(flags));
+        }
         rename->RootDirectory = directory.file.value;
         rename->FileNameLength = static_cast<DWORD>(name.size() * sizeof(wchar_t));
         memcpy(rename->FileName, name.data(), rename->FileNameLength);
         IO_STATUS_BLOCK completion{};
         const auto status = set(file.value, &completion, rename, static_cast<ULONG>(size),
-                                static_cast<FILE_INFORMATION_CLASS>(10));
+                                static_cast<FILE_INFORMATION_CLASS>(existing ? 65 : 10));
         if (status != 0 || completion.Status != 0) {
           const auto native = status != 0 ? status : completion.Status;
           throw NativeError{"execution_owner_unknown", convert(native),
