@@ -155,3 +155,56 @@ test('foreign binding, excessive deadline and expired budget refuse before any s
   await expect(f.bridge.awaitLaunchReady(f.record, f.plan, now - 1)).rejects.toThrow('run_readiness_unknown')
   expect(f.counts).toEqual({ launched: 0, discovered: 0, reads: 0, sends: 0 })
 })
+
+// Serialize the typed fixture after Bun transpilation so its module mocks stay
+// isolated from other readiness tests in this process.
+async function missingReadinessFixture(urls: { target: string; factory: string; planner: string; probe: string }) {
+  const assert: typeof import('node:assert/strict') = (await import('node:assert/strict')).default
+  const { mock } = await import('bun:test')
+  const factory: typeof import('./OpenCodeRuntimeAdapterFactory.js') = await import(urls.factory)
+  mock.module(urls.factory, () => ({ ...factory,
+    inspectOpenCodeRuntimeAdapterSelection: async () => ({ policy: { generation: 'v2', version: '2.0.21' } }),
+  }))
+  let stage: 'source_availability' | 'execution_probe' = 'source_availability'
+  let code = 'ENOENT', probes = 0
+  const failure = () => Object.assign(new Error('TEST-private-path must never appear'), { code, path: 'C:/TEST-private-path' })
+  const planner: typeof import('./OpenCodeV2LaunchPlan.js') = await import(urls.planner)
+  mock.module(urls.planner, () => ({ ...planner, inspectOpenCodeV2SourceAvailability: async () => {
+    if (stage === 'source_availability') throw failure()
+    return { project: '/TEST-project', model: { providerID: 'openrouter', id: 'TEST-model' } }
+  } }))
+  mock.module(urls.probe, () => ({ resolveOpenCodeV2ExecutionProbe: async (_envelope: unknown, _selection: unknown, run: boolean) => {
+    assert.equal(run, false); probes++; throw failure()
+  } }))
+  const { executeSelectedOpenCodeBridgeCommandEnvelope: execute, OpenCodeV2TeamBridge }:
+    typeof import('./OpenCodeV2TeamBridge.js') = await import(urls.target)
+  const envelope = { schemaVersion: 1, requestId: 'TEST-ready', command: 'opencode.readiness', cwd: '/TEST-project',
+    startedAt: new Date().toISOString(), timeoutMs: 120000,
+    body: { selectedModel: 'openrouter/TEST-model', requireExecutionProbe: false } }
+  type Refusal = { ok: boolean; error: { kind: string; message: string } }
+  const noV1 = async () => { throw Error('V1 forbidden') }
+  for (const phase of ['source_availability', 'execution_probe'] as const) {
+    stage = phase
+    const response = await execute(envelope, noV1) as Refusal
+    assert.equal(response.ok, false); assert.equal(response.error.kind, 'runtime_not_ready')
+    assert.equal(response.error.message, 'readiness_file_missing:' + stage)
+    assert.equal(JSON.stringify(response).includes('TEST-private-path'), false)
+  }
+  assert.equal(probes, 1)
+  OpenCodeV2TeamBridge.prototype.discover = async () => { throw failure() }
+  const bound = await execute({ ...envelope, body: { ...envelope.body, teamId: 'TEST-team', runId: 'TEST-run' } }, noV1) as Refusal
+  assert.equal(bound.error.message, 'readiness_file_missing:owner_discovery')
+  assert.equal(JSON.stringify(bound).includes('TEST-private-path'), false)
+  code = 'EACCES'; stage = 'source_availability'
+  const denied = await execute(envelope, noV1) as Refusal
+  assert.equal(denied.error.message, 'TEST-private-path must never appear')
+}
+
+test('model-free public readiness refuses missing inputs with closed preparation phases and no path', async () => {
+  const urls = { target: import.meta.resolve('./OpenCodeV2TeamBridge.ts'), factory: import.meta.resolve('./OpenCodeRuntimeAdapterFactory.ts'),
+    planner: import.meta.resolve('./OpenCodeV2LaunchPlan.ts'), probe: import.meta.resolve('./OpenCodeV2ExecutionProbe.ts') }
+  const child = Bun.spawn([process.execPath, '-e', `(${missingReadinessFixture.toString()})(${JSON.stringify(urls)})`],
+    { cwd: import.meta.dir, stdout: 'ignore', stderr: 'pipe' })
+  const [code, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()])
+  expect({ code, stderr }).toEqual({ code: 0, stderr: '' })
+}, 15_000)

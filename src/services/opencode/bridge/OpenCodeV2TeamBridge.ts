@@ -276,6 +276,7 @@ async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: O
   let measured: RunQualification | undefined
   let originalStatus: Extract<RunControlResult, { kind: 'status' }> | undefined
   let acceptedIdempotencyKey: string | undefined
+  let readinessStage: 'owner_discovery' | 'source_availability' | 'execution_probe' | undefined
   const respond = (env: BridgeEnvelope, at: number, data: unknown, version: string | null) => response(env, at,
     acceptedIdempotencyKey && data !== null && typeof data === 'object' && !Array.isArray(data)
       ? { ...data, idempotencyKey: acceptedIdempotencyKey } : data, version, measured)
@@ -293,6 +294,7 @@ async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: O
       return respond(envelope, started, { ...projectV2TeamStatus(status, plan.binding.runId), expectedBehaviorFingerprint: measured?.expectedBehaviorFingerprint }, pin)
     }
     if (envelope.command === 'opencode.readiness' || envelope.command === 'opencode.handshake') {
+      readinessStage = 'owner_discovery'
       let owner: Extract<RunControlResult, { kind: 'status' }> | null = null
       if (bridge && await bridge.discover()) {
         const found = await bridge.call({ operation: 'status' }, 8000)
@@ -319,12 +321,15 @@ async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: O
         return respond(envelope, started, { ...originalHandshake, identityHash: executionHash(originalHandshake) }, measured.version)
       }
       const ownerModel = owner?.members[0]?.selectedModel
+      readinessStage = 'source_availability'
       const selection = await inspectOpenCodeV2SourceAvailability({ ...envelope,
         body: { ...body, selectedModel: body.selectedModel ?? ownerModel } })
       if (owner) executionAssert(owner.members.every(member => member.selectedModel === `${selection.model.providerID}/${selection.model.id}`), 'run_selected_model_changed')
       const qualified = owner !== null && openCodeV2SupportedSourcePredicate(owner)
       const sourceCapabilities = { teamLaunch: true, memberSession: qualified, permission: false }
+      readinessStage = 'execution_probe'
       const probe = await resolveOpenCodeV2ExecutionProbe(envelope, selection, envelope.command === 'opencode.readiness' && body.requireExecutionProbe === true, { unattendedTeam: true })
+      readinessStage = undefined
       measured = owner?.qualification ?? { capabilitySnapshotId: selection.capabilitySnapshotId,
         expectedBehaviorFingerprint: probe.proof?.expectedBehaviorEvidence.expectedBehaviorFingerprint ?? '',
         binaryPath: probe.proof?.binaryPath ?? selection.native.executablePath,
@@ -512,7 +517,14 @@ async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: O
       return respond(envelope, started, normalizeV2Transcript(result, request.originalSessionId), pin)
     }
     return respond(envelope, started, result, pin)
-  } catch (error) { return refusal(envelope, started, error instanceof Error ? error.message : 'V2 bridge operation unknown') }
+  } catch (error) {
+    // Missing-file diagnostics must identify the closed preparation phase, never
+    // publish a filesystem path. Missing inputs remain a hard readiness refusal.
+    const missing = readinessStage && error !== null && typeof error === 'object'
+      && 'code' in error && error.code === 'ENOENT'
+    return refusal(envelope, started, missing ? `readiness_file_missing:${readinessStage}`
+      : error instanceof Error ? error.message : 'V2 bridge operation unknown')
+  }
 }
 
 // Recovery follows persisted original ownership even if the installed CLI changes.
@@ -565,6 +577,9 @@ export async function executeSelectedOpenCodeBridgeCommandEnvelope(input: unknow
     catch (error) {
       if (envelope.command === 'opencode.commandStatus' || envelope.command === 'opencode.recoverDeliveryJournal')
         return executeV2(envelope, null, bridge)
+      if ((envelope.command === 'opencode.readiness' || envelope.command === 'opencode.handshake')
+        && error !== null && typeof error === 'object' && 'code' in error && error.code === 'ENOENT')
+        return refusal(envelope, Date.now(), 'readiness_file_missing:owner_discovery')
       return refusal(envelope, Date.now(), error instanceof Error ? error.message : 'run_owner_unknown')
     }
   }
