@@ -710,7 +710,7 @@ static DWORD directoryMode(HANDLE file) {
 }
 static Handle ownerDirectory(const std::wstring &path, bool create, const std::wstring &owner,
                              const std::vector<std::wstring> *cohortSids = nullptr,
-                             PSID selectedPackage = nullptr) {
+                             PSID selectedPackage = nullptr, bool archiveCapable = true) {
   auto createFile = reinterpret_cast<NtCreateFileFunction>(
       GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtCreateFile"));
   require(createFile != nullptr, "execution_owner_unknown");
@@ -739,7 +739,8 @@ static Handle ownerDirectory(const std::wstring &path, bool create, const std::w
   HANDLE raw = nullptr;
   NTSTATUS result = createFile(
       &raw,
-      FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE | (create ? DELETE : 0),
+      FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE |
+          (create && archiveCapable ? DELETE : 0),
       &attributes, &status, nullptr, FILE_ATTRIBUTE_DIRECTORY,
       FILE_SHARE_READ | FILE_SHARE_WRITE | (create ? 0 : FILE_SHARE_DELETE), create ? 2 : 1,
       0x1 | 0x2 | 0x20 | 0x200000, nullptr, 0);
@@ -3259,7 +3260,10 @@ public:
     require(parents.size() >= 4, "run_state_held_inputs");
     Handle run;
     try {
-      run = ownerDirectory(directory, create, owner);
+      // Run state mutates child records, never renames its directory. Keep the
+      // original deny-delete sharing fence, without unused DELETE access that
+      // can conflict with the filesystem's relative rename target-directory open.
+      run = ownerDirectory(directory, create, owner, nullptr, nullptr, false);
     } catch (const NativeError &error) {
       if (!create && error.win32 == ERROR_FILE_NOT_FOUND)
         throw NativeError{"run_state_absent", error.win32, "run_state_directory"};

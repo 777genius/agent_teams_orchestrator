@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { lstat, readdir, readFile, symlink, writeFile } from 'node:fs/promises'
+import { lstat, readdir, readFile, rename, symlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { createWindowsNativeBroker, resolveWindowsNativeArtifact } from '../../src/services/opencode/host/windows/OpenCodeV2WindowsNativeBroker.js'
 import { createWindowsOwnerFilesystem, type WindowsOwnerDirectory } from '../../src/services/opencode/host/windows/OpenCodeV2WindowsOwnerFilesystem.js'
@@ -413,6 +413,14 @@ try {
   const directory = runControlDirectory(discoveryRoot, binding.teamId, binding.runId)
   const acquired = executionRecord(await request('runStateAcquire', { dataRoot: discoveryRoot, directory, binding, selectionIds }))
   const stateId = String(acquired.stateId), sourceSha256 = 'a'.repeat(64)
+  const runDirectoryBefore = await lstat(directory)
+  await assert.rejects(rename(directory, directory + '.TEST-forbidden-rename'),
+    (error: unknown) => !!error && typeof error === 'object' && 'code' in error &&
+      ['EACCES', 'EPERM', 'EBUSY'].includes(String(error.code)))
+  const runDirectoryAfter = await lstat(directory)
+  assert.equal(runDirectoryAfter.dev, runDirectoryBefore.dev)
+  assert.equal(runDirectoryAfter.ino, runDirectoryBefore.ino)
+  facts.runStateDirectoryStillDeniesExternalRename = true
   await request('runStateReserve', { stateId, directory, binding, sourceSha256, sharedControllerRootCohort: true })
   for (const name of ['start.json', 'challenge']) {
     const record = await lstat(path.win32.join(directory, name))
