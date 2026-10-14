@@ -231,12 +231,15 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
         }
         const additions = group.filter(row => !births.has(row.pid))
         if (additions.length && !anchor) {
-          if (process.platform !== 'win32' || births.size) throw cleanupUnknown('anchor_missing')
-          // A fast wrapper may close before its initial birth can be read.
-          // Gone observations permit waiting only: raw census absence, child
-          // close and a strict final full table still gate physical retirement.
+          const capturedRetirement = process.platform === 'win32' && closed && ended && code === 0 && !failure && !signal?.aborted &&
+            [...births.keys()].every(target => target !== process.pid && target !== process.ppid && ports.alive(target) === 'gone')
+          if (process.platform !== 'win32' || births.size && !capturedRetirement) throw cleanupUnknown('anchor_missing')
+          // A fast wrapper may close before birth capture, or leave a stale
+          // census after its captured identities are independently gone.
+          // Waiting confers no signals; strict fresh full tables gate retirement.
           unanchoredRetirement = true
           if (pid) unownedCandidates.add(pid)
+          for (const target of births.keys()) unownedCandidates.add(target)
           for (const row of group) unownedCandidates.add(row.pid)
           phase = 'candidate_validation'
           assertCandidatesAbsent(rows)
