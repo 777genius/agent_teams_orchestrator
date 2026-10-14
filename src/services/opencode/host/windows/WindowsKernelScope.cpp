@@ -1180,7 +1180,7 @@ struct ControllerRunAuthority {
 
   bool exactRoot(HANDLE file, const std::wstring &path) const {
     for (const auto &root : roots) {
-      if (!equalPath(root.path, path)) continue;
+      if (!equalPath(root.root.path, path)) continue;
       require(samePhysicalIdentity(root.identity,
                                    fileObjectIdentity(file, currentSid(), true)),
               "execution_path_alias");
@@ -1206,6 +1206,8 @@ static std::vector<std::wstring> closedControllerCohortSids(
   }
   return values;
 }
+struct OwnerStore;
+static bool privateProfileOverlap(const OwnerStore &owners, HANDLE heldRoot);
 struct OwnerStore {
 private:
   friend struct WindowsNativeRunControlIssuer;
