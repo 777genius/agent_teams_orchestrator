@@ -2930,12 +2930,96 @@ struct WindowsNativeRunStateIssuer {
             "run_state_identity_changed");
   }
 
-  static std::vector<std::wstring> selectionIds(const JsonObject &input) {
+private:
+  // Read-only discovery of one missing namespace component. All opens are
+  // existing-only and relative to a retained parent; no state/control is issued.
+  static bool namespaceAbsent(OwnerStore &owners, const std::wstring &directory,
+                              const std::wstring &dataRoot) {
+    validateRunNamespace(directory, dataRoot);
+    const auto basename = directory.substr(directory.find_last_of(L'\\') + 1);
+    require(directory == dataRoot + L"\\opencode\\v2\\runs\\" + basename,
+            "run_state_identity_changed");
+    const auto owner = currentSid();
+    std::vector<RetainedAnchorComponent> ancestors;
+    for (auto &parent : owners.holdSelectedAncestors(dataRoot))
+      ancestors.emplace_back(std::move(parent));
+    std::vector<RetainedAnchorComponent> prefix;
+    prefix.emplace_back(owners.holdSelectedDirectory(dataRoot));
+    const auto rootIdentity = fileIdentity(prefix.front().handle.value, owner, true);
+    auto recheck = [&](bool absence) {
+      for (const auto &parent : ancestors) parent.assertLive();
+      for (const auto &part : prefix) {
+        part.assertLive();
+        if (absence) {
+          (void)fileIdentity(part.handle.value, owner, true);
+          auto named = verificationDirectory(part.path);
+          require(fileIdentity(named.value, owner, true).Stringify() ==
+                      fileIdentity(part.handle.value, owner, true).Stringify(),
+                  "run_state_identity_changed");
+        }
+      }
+      require(fileIdentity(prefix.front().handle.value, owner, true).Stringify() ==
+                  rootIdentity.Stringify(), "run_state_identity_changed");
+    };
+    auto openChild = [](HANDLE parent, const std::wstring &name) {
+      auto create = reinterpret_cast<NtCreateFileFunction>(
+          GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtCreateFile"));
+      require(create != nullptr, "run_state_unknown");
+      UNICODE_STRING relative{};
+      relative.Buffer = const_cast<wchar_t *>(name.data());
+      relative.Length = static_cast<USHORT>(name.size() * sizeof(wchar_t));
+      relative.MaximumLength = relative.Length;
+      OBJECT_ATTRIBUTES attributes{};
+      attributes.Length = sizeof(attributes);
+      attributes.RootDirectory = parent;
+      attributes.ObjectName = &relative;
+      attributes.Attributes = 0x40;
+      IO_STATUS_BLOCK completion{};
+      HANDLE raw = nullptr;
+      const NTSTATUS status = create(
+          &raw, FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE,
+          &attributes, &completion, nullptr, FILE_ATTRIBUTE_DIRECTORY,
+          FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+          1 /* FILE_OPEN */, 0x1 | 0x20 | 0x200000, nullptr, 0);
+      if (status != 0 || completion.Status != 0) {
+        Handle failed(raw);
+        const auto native = status != 0 ? status : completion.Status;
+        // A single basename under a held parent admits NAME_NOT_FOUND only.
+        // Access, path, sharing and identity failures are never absence.
+        if (static_cast<DWORD>(native) == 0xc0000034UL) return Handle();
+        auto convert = reinterpret_cast<NtStatusErrorFunction>(
+            GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlNtStatusToDosError"));
+        throw NativeError{"run_state_unknown", convert ? convert(native) : 0,
+                          "run_namespace_open", static_cast<DWORD>(native)};
+      }
+      return Handle(raw);
+    };
+    for (const auto &name : std::vector<std::wstring>{L"opencode", L"v2", L"runs", basename}) {
+      recheck(false);
+      auto child = openChild(prefix.back().handle.value, name);
+      if (!child) {
+        recheck(true);
+        auto repeated = openChild(prefix.back().handle.value, name);
+        require(!repeated, "run_state_identity_changed");
+        recheck(true);
+        return true;
+      }
+      require(equalPath(finalPath(child.value), extended(prefix.back().path + L"\\" + name)),
+              "run_state_identity_changed");
+      prefix.emplace_back(std::move(child));
+    }
+    recheck(false);
+    return false;
+  }
+
+public:
+  static std::vector<std::wstring> selectionIds(const JsonObject &input,
+                                               bool discovery = false) {
     require(input.HasKey(L"selectionIds") && input.GetNamedValue(L"selectionIds").ValueType() ==
                                                 JsonValueType::Array,
             "run_control_selection_missing");
     const auto values = input.GetNamedArray(L"selectionIds");
-    require(values.Size() > 0 && values.Size() <= 32, "run_control_selection_missing");
+    require((discovery || values.Size() > 0) && values.Size() <= 32, "run_control_selection_missing");
     std::vector<std::wstring> ids;
     for (const auto value : values) {
       require(value.ValueType() == JsonValueType::String, "run_control_selection_missing");
@@ -3455,35 +3539,39 @@ struct WindowsNativeRunStateIssuer {
       return result;
     }
     if (operation == L"runStateDiscover") {
-      try {
-        bool created = false;
-        auto &state = stateFor(owners, input, false, created);
-        if (created)
-          state.select();
-        const auto ids = selectionIds(input);
-        if (state.cohortSealed()) owners.attachSealedCohort(state.cohort());
-        owners.runStateSelections[state.id()] = ids;
-        const auto endpoint = state.readEndpoint();
-        if (created) retainOriginalEndpointOwners(state, endpoint);
-        state.adoptEndpointHash(runControlSha256Hex(runControlCanonicalJson(endpoint)));
-        const auto binding = state.binding();
-        require(validTeamId(text(input, L"teamId")) &&
-                    text(binding, L"teamId") == text(input, L"teamId") &&
-                    text(binding, L"runId") == text(input, L"runId"),
-                "run_state_start_changed");
-        (void)selectionFor(owners, owners.runStateRoots[state.id()], ids, binding);
+      const auto ids = selectionIds(input, true);
+      const auto dataRoot = text(input, L"dataRoot"), directory = text(input, L"directory");
+      require(validTeamId(text(input, L"teamId")) && !text(input, L"runId").empty(),
+              "run_state_start_changed");
+      if (!ids.empty()) (void)selectionForConfigOnly(owners, dataRoot, ids);
+      // Cached state is never replaced with absence evidence.
+      const bool retained = std::any_of(owners.runStates.begin(), owners.runStates.end(),
+          [&](const auto &entry) { return entry.second->directory() == directory; });
+      if (!retained && namespaceAbsent(owners, directory, dataRoot)) {
         JsonObject result;
-        str(result, L"stateId", state.id());
-        result.SetNamedValue(L"record", endpoint);
+        flag(result, L"absent", true);
         return result;
-      } catch (const NativeError &error) {
-        if (error.code == "run_state_absent" || error.code == "run_state_endpoint_missing") {
-          JsonObject result;
-          flag(result, L"absent", true);
-          return result;
-        }
-        throw;
       }
+      require(!ids.empty(), "run_control_selection_missing");
+      bool created = false;
+      auto &state = stateFor(owners, input, false, created);
+      if (created)
+        state.select();
+      if (state.cohortSealed()) owners.attachSealedCohort(state.cohort());
+      owners.runStateSelections[state.id()] = ids;
+      const auto endpoint = state.readEndpoint();
+      if (created) retainOriginalEndpointOwners(state, endpoint);
+      state.adoptEndpointHash(runControlSha256Hex(runControlCanonicalJson(endpoint)));
+      const auto binding = state.binding();
+      require(validTeamId(text(input, L"teamId")) &&
+                  text(binding, L"teamId") == text(input, L"teamId") &&
+                  text(binding, L"runId") == text(input, L"runId"),
+              "run_state_start_changed");
+      (void)selectionFor(owners, owners.runStateRoots[state.id()], ids, binding);
+      JsonObject result;
+      str(result, L"stateId", state.id());
+      result.SetNamedValue(L"record", endpoint);
+      return result;
     }
     if (operation == L"runStateReadRecord") {
       auto &state = namedState(owners, input);

@@ -1,5 +1,5 @@
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
-import { constants } from 'node:fs'
+import { constants, type Dirent } from 'node:fs'
 import { chmod, lstat, mkdir, open, readFile, readdir, realpath, rename, unlink } from 'node:fs/promises'
 import { createConnection, createServer, type Socket } from 'node:net'
 import path from 'node:path'
@@ -85,7 +85,7 @@ async function windowsProfileAdmissionsForDataRoot(dataRoot: string, broker: Win
   deadline: number): Promise<readonly WindowsProfileAdmission[]> {
   const profilesRoot = path.win32.join(dataRoot, 'opencode', 'v2', 'profiles')
   const entries = await readdir(profilesRoot, { withFileTypes: true }).catch((error: unknown) => {
-    if (executionRecord(error).code === 'ENOENT') return [] as never[]; throw error
+    if (executionRecord(error).code === 'ENOENT') return [] as Dirent[]; throw error
   })
   const profiles: WindowsProfileAdmission[] = []
   const candidates = entries.filter(entry => entry.isDirectory()).slice(0, 32)
@@ -108,7 +108,6 @@ async function windowsProfileAdmissionsForDataRoot(dataRoot: string, broker: Win
       .map(name => path.win32.join(root, name)), configDirectory])]
     profiles.push({ root, databasePath, sha256: digest(configBytes), directories })
   }
-  executionAssert(profiles.length > 0, 'run_control_selection_missing')
   return profiles
 }
 async function windowsAdmitProfiles(broker: WindowsNativeBroker, profiles: readonly WindowsProfileAdmission[],
@@ -166,8 +165,10 @@ async function windowsDiscover(directory: string, dataRoot: string, teamId: stri
   broker.events.on('error', () => {})
   try {
     const deadline = Date.now() + MAX_OPERATION_MS
-    const selectionIds = await windowsAdmitProfiles(broker,
-      await windowsProfileAdmissionsForDataRoot(dataRoot, broker, deadline), deadline, teamId)
+    const profiles = await windowsProfileAdmissionsForDataRoot(dataRoot, broker, deadline)
+    // Only discovery may submit zero selections. Native code must certify a
+    // missing namespace without issuing state; a present fence still vetoes it.
+    const selectionIds = profiles.length === 0 ? [] : await windowsAdmitProfiles(broker, profiles, deadline, teamId)
     const result = await broker.request('runStateDiscover', {
       directory, dataRoot, teamId, runId, selectionIds,
     }, Date.now() + MAX_OPERATION_MS) as { absent?: true; stateId?: string; record?: unknown }

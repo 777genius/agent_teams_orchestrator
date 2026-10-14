@@ -1,15 +1,18 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { writeFile } from 'node:fs/promises'
+import { lstat, readdir, readFile, symlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { createWindowsNativeBroker, resolveWindowsNativeArtifact } from '../../src/services/opencode/host/windows/OpenCodeV2WindowsNativeBroker.js'
 import { createWindowsOwnerFilesystem, type WindowsOwnerDirectory } from '../../src/services/opencode/host/windows/OpenCodeV2WindowsOwnerFilesystem.js'
 import { executionRecord } from '../../src/services/opencode/execution/OpenCodeV2ExecutionContracts.js'
+import { runControlDirectory } from '../../src/services/opencode/bridge/OpenCodeV2RunControl.js'
 
 // Actual native helper only. Supply a NEW TEST directory under the CI scratch
 // root. Retain its fences/records after both success and failure; no adoption,
 // deletion, native model, provider, credential or user-project effects.
 assert.equal(process.platform, 'win32')
+assert.equal(process.arch, 'x64')
+assert.equal(process.versions.bun, '1.3.11')
 const requestedRoot = process.argv[2]
 assert.ok(requestedRoot && path.win32.isAbsolute(requestedRoot))
 assert.match(path.win32.basename(requestedRoot), /^TEST-windows-owner-[a-zA-Z0-9-]+$/)
@@ -30,8 +33,86 @@ const request = (operation: string, input: Readonly<Record<string, unknown>>) =>
 const filesystem = createWindowsOwnerFilesystem(input => request(input.op, input))
 const handles: WindowsOwnerDirectory[] = []
 const retain = (handle: WindowsOwnerDirectory): WindowsOwnerDirectory => { handles.push(handle); return handle }
+const closeFixtureWriters = async () => {
+  // Fixture creators hold DELETE and intentionally deny sharing it. Release
+  // these setup handles before a fresh CLI's normal existing-only admission.
+  for (const handle of [...handles].reverse()) await handle.close()
+}
+const powershell = async (script: string, target: string): Promise<string> => {
+  assert.ok(process.env.ProgramFiles && path.win32.isAbsolute(process.env.ProgramFiles))
+  const powershellRoot = path.win32.join(process.env.ProgramFiles, 'PowerShell', '7')
+  const child = Bun.spawn([path.win32.join(powershellRoot, 'pwsh.exe'), '-NoProfile', '-NonInteractive',
+    '-Command', "$ErrorActionPreference='Stop';" + script], {
+    env: { SystemRoot: process.env.SystemRoot, WINDIR: process.env.WINDIR,
+      PSModulePath: path.win32.join(powershellRoot, 'Modules'), TEST_TARGET: target }, stdout: 'pipe', stderr: 'ignore',
+  })
+  const [output, code] = await Promise.all([new Response(child.stdout).text(), child.exited])
+  assert.equal(code, 0, 'TEST_fixture_powershell_failed')
+  return output.trim()
+}
+// Observe only this new synthetic tree: native VolumeSerial/FileID/SID,
+// complete owner/DACL descriptors, names and file bytes. Discovery must preserve it.
+const snapshot = async (root: string): Promise<unknown[]> => {
+  const rows: unknown[] = []
+  const descriptors: Array<{ path: string; sddl: string }> = JSON.parse(await powershell(`
+    $items=@((Get-Item -LiteralPath $env:TEST_TARGET);(Get-ChildItem -LiteralPath $env:TEST_TARGET -Recurse -Force));
+    $rows=@($items | ForEach-Object {[ordered]@{path=$_.FullName;sddl=(Get-Acl -LiteralPath $_.FullName).Sddl}});
+    [Console]::Write((ConvertTo-Json -InputObject $rows -Compress))`, root))
+  const acls = new Map(descriptors.map(row => [row.path.toLowerCase(), row.sddl]))
+  const aclFor = (file: string) => { const acl = acls.get(file.toLowerCase()); assert.ok(acl); return acl }
+  const walk = async (directory: string): Promise<void> => {
+    const held = await filesystem.openDirectory(directory)
+    try {
+      const entries = (await readdir(directory)).sort()
+      rows.push({ relative: path.win32.relative(root, directory), identity: held.identity, acl: aclFor(directory), entries })
+      for (const name of entries) {
+        const file = path.win32.join(directory, name), info = await lstat(file)
+        assert.equal(info.isSymbolicLink(), false)
+        if (info.isDirectory()) await walk(file)
+        else rows.push({ relative: path.win32.relative(root, file), acl: aclFor(file), device: info.dev,
+          inode: info.ino, birth: info.birthtimeMs, mtime: info.mtimeMs,
+          bytes: createHash('sha256').update(await readFile(file)).digest('hex') })
+      }
+    } finally { await held.close() }
+  }
+  await walk(root)
+  return rows
+}
+type RouterExpectation = 'v1' | 'veto' | 'owner'
+const route = async (dataRoot: string, runId: string, expected: RouterExpectation,
+  selection: 'v1' | 'unsupported' | 'missing' = 'v1', ownerRecord?: unknown) => {
+  await closeFixtureWriters()
+  // A fresh CLI owns its retained discovery brokers until process exit, as in
+  // production. Only selection and the V1 executor are stubbed; native discovery
+  // and the router are real. No source-discovery or native-helper mocks.
+  const script = `import {mock} from 'bun:test';import assert from 'node:assert/strict';
+    let probes=0,legacy=0;const selection=${JSON.stringify(selection)};
+    const factory=${JSON.stringify(import.meta.resolve('../../src/services/opencode/bridge/OpenCodeRuntimeAdapterFactory.ts'))};
+    const f=await import(factory);mock.module(factory,()=>({...f,inspectOpenCodeRuntimeAdapterSelection:async()=>{
+      probes++;if(selection==='missing')throw Error('TEST_selected_CLI_removed');
+      return {policy:{generation:selection==='v1'?'v1':'unsupported',version:selection==='v1'?'1.19.0':'2.0.1'}};
+    }}));
+    const root=${JSON.stringify(dataRoot)},runId=${JSON.stringify(runId)},expected=${JSON.stringify(expected)};
+    const {discoverOpenCodeV2Run}=await import(${JSON.stringify(import.meta.resolve('../../src/services/opencode/bridge/OpenCodeV2RunControl.ts'))});
+    if(expected==='v1')assert.equal(await discoverOpenCodeV2Run(root,'TEST-team',runId),null);
+    if(expected==='owner')assert.deepEqual(await discoverOpenCodeV2Run(root,'TEST-team',runId),${JSON.stringify(ownerRecord ?? null)});
+    process.env.CLAUDE_MULTIMODEL_DATA_HOME=root;
+    const {executeSelectedOpenCodeBridgeCommandEnvelope:execute}=await import(${JSON.stringify(import.meta.resolve('../../src/services/opencode/bridge/OpenCodeV2TeamBridge.ts'))});
+    const result=await execute({schemaVersion:1,requestId:'TEST-discovery',command:expected==='owner'?'opencode.commandStatus':'opencode.handshake',
+      cwd:root,startedAt:new Date().toISOString(),timeoutMs:5000,body:{teamId:'TEST-team',expectedRunId:runId}},
+      async()=>{legacy++;return 'TEST-V1'});
+    if(expected==='v1'){assert.equal(result,'TEST-V1');assert.equal(probes,1);assert.equal(legacy,1)}
+    else{assert.equal(legacy,0);assert.equal(probes,expected==='owner'||selection==='v1'?0:1);
+      if(expected==='veto')assert.equal(result.ok,false);
+      if(expected==='owner'){assert.equal(result.ok,true);assert.equal(result.data.status,'unknown')}}
+    console.log(JSON.stringify({expected,selection,probes,legacy}));process.exit(0);`
+  const child = Bun.spawn([process.execPath, '-e', script], { cwd: requestedRoot, stdout: 'pipe', stderr: 'ignore' })
+  const [output, code] = await Promise.all([new Response(child.stdout).text(), child.exited])
+  assert.equal(code, 0, 'TEST_real_windows_discovery_route_failed')
+  return executionRecord(JSON.parse(output))
+}
 const writeOwnedFixture = async (directory: WindowsOwnerDirectory, directoryPath: string,
-  name: 'opencode.json' | 'user.json' | 'other.json', bytes: string | Uint8Array) => {
+  name: 'opencode.json' | 'opencode.db' | 'start.json' | 'user.json' | 'other.json', bytes: string | Uint8Array) => {
   const relative = path.win32.relative(requestedRoot, directoryPath)
   assert.ok(relative && relative !== '..' && !relative.startsWith('..\\') && !path.win32.isAbsolute(relative))
   // Copy only the native reference's exact owner and protected DACL onto this
@@ -120,6 +201,65 @@ try {
   // The scratch parent is setup only. Actual source fences below retain their
   // original DELETE-capable handles; the existing parent needs traversal only.
   await setupRoot.close()
+  const discoveryRoot = path.win32.join(requestedRoot, 'TEST-discovery')
+  retain(await filesystem.createDirectory(discoveryRoot))
+  const absenceStages: string[] = []
+  const proveAbsence = async (stage: string) => {
+    const before = await snapshot(discoveryRoot)
+    const directory = runControlDirectory(discoveryRoot, 'TEST-team', 'TEST-fresh')
+    const absent = await request('runStateDiscover', { dataRoot: discoveryRoot, directory,
+      teamId: 'TEST-team', runId: 'TEST-fresh', selectionIds: [] })
+    assert.deepEqual(absent, { absent: true }) // No state/control/selection authority.
+    await assert.rejects(request('runStateDiscover', { dataRoot: discoveryRoot, directory,
+      teamId: 'TEST-team', runId: 'TEST-fresh', selectionIds: ['TEST-invalid'] }))
+    // An absence response cannot be used as a state capability.
+    await assert.rejects(request('runStateReadRecord', { directory, stateId: '', name: 'start.json' }))
+    await assert.rejects(request('runStateAcquire', { dataRoot: discoveryRoot, directory,
+      binding: { teamId: 'TEST-team', runId: 'TEST-fresh', controllerInstanceId: 'TEST-controller', ownerId: 'TEST-owner' },
+      selectionIds: [] }))
+    await route(discoveryRoot, 'TEST-fresh', 'v1')
+    assert.deepEqual(await snapshot(discoveryRoot), before)
+    absenceStages.push(stage)
+  }
+  await proveAbsence('missing-opencode-no-profiles')
+  const discoveryOpencode = path.win32.join(discoveryRoot, 'opencode')
+  retain(await filesystem.createDirectory(discoveryOpencode))
+  await proveAbsence('missing-v2-no-profiles')
+  const discoveryV2 = path.win32.join(discoveryOpencode, 'v2')
+  retain(await filesystem.createDirectory(discoveryV2))
+  retain(await filesystem.createDirectory(path.win32.join(discoveryV2, 'profiles')))
+  await proveAbsence('missing-runs-empty-profiles')
+  const discoveryRuns = path.win32.join(discoveryV2, 'runs')
+  retain(await filesystem.createDirectory(discoveryRuns))
+  await proveAbsence('missing-final-empty-profiles')
+  await route(discoveryRoot, 'TEST-fresh', 'veto', 'unsupported')
+  const emptyFence = runControlDirectory(discoveryRoot, 'TEST-team', 'TEST-empty-fence')
+  retain(await filesystem.createDirectory(emptyFence))
+  const emptyBefore = await snapshot(discoveryRoot)
+  await route(discoveryRoot, 'TEST-empty-fence', 'veto')
+  assert.deepEqual(await snapshot(discoveryRoot), emptyBefore)
+  // Reparse and DACL fixtures affect only NEW isolated synthetic data roots.
+  const reparseRoot = path.win32.join(requestedRoot, 'TEST-reparse-discovery')
+  retain(await filesystem.createDirectory(reparseRoot))
+  await symlink(discoveryOpencode, path.win32.join(reparseRoot, 'opencode'), 'junction')
+  await route(reparseRoot, 'TEST-fresh', 'veto')
+  for (const guard of ['foreign-allow', 'access-denied'] as const) {
+    const guardedRoot = path.win32.join(requestedRoot, 'TEST-' + guard)
+    const ownedRoot = await filesystem.createDirectory(guardedRoot)
+    await ownedRoot.close()
+    await powershell(`$a=Get-Acl -LiteralPath $env:TEST_TARGET;
+      $sid=${guard === 'foreign-allow' ? "[System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-545')" : '[System.Security.Principal.WindowsIdentity]::GetCurrent().User'};
+      $r=[System.Security.AccessControl.FileSystemAccessRule]::new($sid,'ReadAndExecute','${guard === 'foreign-allow' ? 'Allow' : 'Deny'}');
+      $a.AddAccessRule($r);Set-Acl -LiteralPath $env:TEST_TARGET -AclObject $a`, guardedRoot)
+    await route(guardedRoot, 'TEST-fresh', 'veto')
+  }
+  // Canonical-name evidence must reject an alias even on an absent run.
+  await assert.rejects(request('runStateDiscover', { dataRoot: discoveryRoot + '\\.',
+    directory: discoveryRoot + '\\.\\opencode\\v2\\runs\\' + 'a'.repeat(32),
+    teamId: 'TEST-team', runId: 'TEST-fresh', selectionIds: [] }))
+  facts.discoveryAbsence = { stages: absenceStages, namespaceAclIdentityAndBytesUnchanged: true,
+    noStateAuthority: true, emptyFenceVeto: true, reparseVeto: true, foreignAclVeto: true,
+    accessDeniedVeto: true, canonicalAliasVeto: true, unsupportedNeverFallsBack: true }
   const originalPath = path.win32.join(requestedRoot, '.opencode-v2-execution-owner')
   const original = retain(await filesystem.createDirectory(originalPath))
   const originalOwnerRecord = { schema: 1, synthetic: true, leaseOwnerId: lease, marker: 'retained-original-é' }
@@ -177,18 +317,22 @@ try {
   assert.equal(absent.state, "absent"); assert.equal(absent.configIdentity, null)
   assert.equal(incomplete.state, "incomplete"); assert.notEqual(incomplete.configIdentity, null)
   assert.equal(malformedComplete.state, "complete"); assert.notEqual(malformedComplete.configIdentity, null)
-  const selectedRoot = path.win32.join(requestedRoot, "TEST-selected-profile")
+  const selectedRoot = path.win32.join(discoveryV2, 'profiles', "TEST-selected-profile")
   retain(await filesystem.createDirectory(selectedRoot))
   for (const name of ["home", "config", "data", "cache", "state", "tmp", "appdata", "localappdata"])
     retain(await filesystem.createDirectory(path.win32.join(selectedRoot, name)))
   const selectedConfigDirectory = path.win32.join(selectedRoot, "config", "opencode")
   const ownedSelectedConfig = retain(await filesystem.createDirectory(selectedConfigDirectory))
   const selectedDataDirectory = path.win32.join(selectedRoot, "data", "opencode")
-  retain(await filesystem.createDirectory(selectedDataDirectory))
+  const ownedSelectedData = retain(await filesystem.createDirectory(selectedDataDirectory))
+  // Metadata-only synthetic database; no SQL/provider/auth is opened by this probe.
+  await writeOwnedFixture(ownedSelectedData, selectedDataDirectory, 'opencode.db', 'TEST-synthetic-database')
   const claudeRoot = path.win32.join(requestedRoot, "TEST-claude")
   retain(await filesystem.createDirectory(claudeRoot))
   retain(await filesystem.createDirectory(path.win32.join(claudeRoot, "teams")))
   retain(await filesystem.createDirectory(path.win32.join(claudeRoot, "teams", "TEST-team")))
+  retain(await filesystem.createDirectory(path.win32.join(claudeRoot, "tasks")))
+  retain(await filesystem.createDirectory(path.win32.join(claudeRoot, "tasks", "TEST-team")))
   const inboxes = path.win32.join(claudeRoot, "teams", "TEST-team", "inboxes")
   const ownedInbox = retain(await filesystem.createDirectory(inboxes))
   await writeOwnedFixture(ownedInbox, inboxes, "user.json", "[]")
@@ -196,6 +340,7 @@ try {
     env: { AGENT_TEAMS_MCP_CLAUDE_DIR: claudeRoot } } } })
   await writeOwnedFixture(ownedSelectedConfig, selectedConfigDirectory, "opencode.json", selectedContent)
   const databasePath = path.win32.join(selectedDataDirectory, "opencode.db")
+  await closeFixtureWriters()
   await request("ownerValidateSelectedProfile", { root: selectedRoot, databasePath,
     directories: [selectedRoot, selectedConfigDirectory] })
   const assertConfigOnlySelection = (value: unknown) => {
@@ -207,8 +352,38 @@ try {
   }
   // Inbox binding and reads begin only after native cohort/team join. Config
   // selection returns no controller or inbox authority for any fixture below.
-  assertConfigOnlySelection(await request("ownerSelectConfig", { root: selectedRoot, databasePath,
-    sha256: createHash("sha256").update(selectedContent).digest("hex"), teamId: "TEST-team" }))
+  const configSelection = await request("ownerSelectConfig", { root: selectedRoot, databasePath,
+    sha256: createHash("sha256").update(selectedContent).digest("hex"), teamId: "TEST-team" })
+  assertConfigOnlySelection(configSelection)
+  const selectionIds = [String(executionRecord(configSelection).selectionId)]
+  await proveAbsence('missing-final-complete-profile')
+  const binding = { teamId: 'TEST-team', runId: 'TEST-unpublished', controllerInstanceId: 'TEST-controller', ownerId: 'TEST-owner' }
+  const directory = runControlDirectory(discoveryRoot, binding.teamId, binding.runId)
+  const acquired = executionRecord(await request('runStateAcquire', { dataRoot: discoveryRoot, directory, binding, selectionIds }))
+  const stateId = String(acquired.stateId), sourceSha256 = 'a'.repeat(64)
+  await request('runStateReserve', { stateId, directory, binding, sourceSha256, sharedControllerRootCohort: true })
+  const unpublishedBefore = await snapshot(discoveryRoot)
+  // This fails on the old native endpoint_missing -> absent conversion even
+  // with valid selections, valid start/challenge and a sealed cohort.
+  await assert.rejects(request('runStateDiscover', { dataRoot: discoveryRoot, directory,
+    teamId: binding.teamId, runId: binding.runId, selectionIds }), /run_state_endpoint_missing/)
+  await route(discoveryRoot, binding.runId, 'veto')
+  assert.deepEqual(await snapshot(discoveryRoot), unpublishedBefore)
+  const published = executionRecord(await request('runStateListen', {
+    stateId, directory, binding, sourceSha256, deadline: Date.now() + 120_000,
+  })).record
+  await route(discoveryRoot, binding.runId, 'owner', 'unsupported', published)
+  await route(discoveryRoot, binding.runId, 'owner', 'missing', published)
+  // Same physical fence with a foreign requested binding must remain UNKNOWN.
+  await assert.rejects(request('runStateDiscover', { dataRoot: discoveryRoot, directory,
+    teamId: 'TEST-foreign', runId: binding.runId, selectionIds }), /run_state_start_changed/)
+  const malformedRun = 'TEST-malformed-fence', malformedDirectory = runControlDirectory(discoveryRoot, 'TEST-team', malformedRun)
+  const ownedMalformed = retain(await filesystem.createDirectory(malformedDirectory))
+  await writeOwnedFixture(ownedMalformed, malformedDirectory, 'start.json', '{TEST-malformed\n')
+  await route(discoveryRoot, malformedRun, 'veto')
+  await request('runStateClose', { stateId, directory })
+  facts.discoveryPresent = { unpublishedVeto: true, malformedFenceVeto: true, foreignBindingVeto: true,
+    originalOwnerRecoveredAfterUnsupportedOrMissingCLI: true, originalEndpointMatched: true }
   const inboxRoot = path.win32.join(claudeRoot, "teams")
   for (const [team, state] of [["TEST-empty", "empty"], ["TEST-absent", "absent"]] as const) {
     retain(await filesystem.createDirectory(path.win32.join(inboxRoot, team)))
@@ -225,6 +400,18 @@ try {
   await writeOwnedFixture(ownedOversize, oversizeDirectory, "user.json", Buffer.alloc(4 * 1024 * 1024 + 1))
   assertConfigOnlySelection(await request("ownerSelectConfig", { root: selectedRoot, databasePath,
     sha256: createHash("sha256").update(selectedContent).digest("hex"), teamId: oversizeTeam }))
+  // Complete malformed profiles must veto even a genuinely absent run; they
+  // cannot be silently dropped to obtain the zero-selection absence path.
+  const malformedProfile = path.win32.join(discoveryV2, 'profiles', 'TEST-malformed-profile')
+  retain(await filesystem.createDirectory(malformedProfile))
+  for (const name of ['home', 'config', 'data', 'cache', 'state', 'tmp', 'appdata', 'localappdata'])
+    retain(await filesystem.createDirectory(path.win32.join(malformedProfile, name)))
+  const malformedConfigDirectory = path.win32.join(malformedProfile, 'config', 'opencode')
+  const malformedConfig = retain(await filesystem.createDirectory(malformedConfigDirectory))
+  retain(await filesystem.createDirectory(path.win32.join(malformedProfile, 'data', 'opencode')))
+  await writeOwnedFixture(malformedConfig, malformedConfigDirectory, 'opencode.json', '{TEST-malformed')
+  await route(discoveryRoot, 'TEST-fresh', 'veto')
+  facts.malformedCompleteProfileVeto = true
   Object.assign(facts, { archivedIdentity: before, archivedPath: successArchive,
     originalPathFreeForNewFence: true, nextIdentity: next.identity,
     noReplaceCollisionPreserved: true, partialFenceBlocksAcquisition: true,
