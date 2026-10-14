@@ -95,7 +95,9 @@ const route = async (dataRoot: string, runId: string, expected: RouterExpectatio
   // production. Only selection and the V1 executor are stubbed; native discovery
   // and the router are real. No source-discovery or native-helper mocks.
   const script = `import {mock} from 'bun:test';import assert from 'node:assert/strict';
-    let probes=0,legacy=0;const selection=${JSON.stringify(selection)};
+    let phase='imports';const diagnostic={expected:${JSON.stringify(expected)},selection:${JSON.stringify(selection)}};
+    const safeCode=value=>{const match=typeof value==='string'?/^(?:execution_|run_|cleanup_)[a-z_]+(?::[a-z_]+)?(?::[0-9]+)?$/.exec(value):null;return match?match[0]:'TEST_route_assertion'};
+    try { let probes=0,legacy=0;const selection=${JSON.stringify(selection)};
     const factory=${JSON.stringify(import.meta.resolve('../../src/services/opencode/bridge/OpenCodeRuntimeAdapterFactory.ts'))};
     const f=await import(factory);mock.module(factory,()=>({...f,inspectOpenCodeRuntimeAdapterSelection:async()=>{
       probes++;if(selection==='missing')throw Error('TEST_selected_CLI_removed');
@@ -103,20 +105,25 @@ const route = async (dataRoot: string, runId: string, expected: RouterExpectatio
     }}));
     const root=${JSON.stringify(dataRoot)},runId=${JSON.stringify(runId)},expected=${JSON.stringify(expected)};
     const {discoverOpenCodeV2Run}=await import(${JSON.stringify(import.meta.resolve('../../src/services/opencode/bridge/OpenCodeV2RunControl.ts'))});
+    phase='native_discovery';
     if(expected==='v1')assert.equal(await discoverOpenCodeV2Run(root,'TEST-team',runId),null);
     if(expected==='owner')assert.deepEqual(await discoverOpenCodeV2Run(root,'TEST-team',runId),${JSON.stringify(ownerRecord ?? null)});
     process.env.CLAUDE_MULTIMODEL_DATA_HOME=root;
     const {executeSelectedOpenCodeBridgeCommandEnvelope:execute}=await import(${JSON.stringify(import.meta.resolve('../../src/services/opencode/bridge/OpenCodeV2TeamBridge.ts'))});
+    phase='bridge_execute';
     const result=await execute({schemaVersion:1,requestId:'TEST-discovery',command:expected==='owner'?'opencode.commandStatus':'opencode.handshake',
       cwd:root,startedAt:new Date().toISOString(),timeoutMs:5000,body:{teamId:'TEST-team',expectedRunId:runId}},
       async()=>{legacy++;return 'TEST-V1'});
+    phase='bridge_assert';diagnostic.bridgeCode=safeCode(result?.error?.message);
     if(expected==='v1'){assert.equal(result,'TEST-V1');assert.equal(probes,1);assert.equal(legacy,1)}
     else{assert.equal(legacy,0);assert.equal(probes,expected==='owner'||selection==='v1'?0:1);
       if(expected==='veto')assert.equal(result.ok,false);
       if(expected==='owner'){assert.equal(result.ok,true);assert.equal(result.data.status,'unknown')}}
-    console.log(JSON.stringify({expected,selection,probes,legacy}));process.exit(0);`
+    console.log(JSON.stringify({expected,selection,probes,legacy}));process.exit(0);
+    }catch(error){console.log(JSON.stringify({...diagnostic,phase,errorCode:safeCode(error?.message)}));process.exit(1)}`
   const child = Bun.spawn([process.execPath, '-e', script], { cwd: requestedRoot, stdout: 'pipe', stderr: 'ignore' })
   const [output, code] = await Promise.all([new Response(child.stdout).text(), child.exited])
+  if (code !== 0) facts.routerFailure = executionRecord(JSON.parse(output))
   assert.equal(code, 0, 'TEST_real_windows_discovery_route_failed')
   return executionRecord(JSON.parse(output))
 }
