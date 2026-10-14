@@ -44,20 +44,58 @@ const writeOwnedFixture = async (directory: WindowsOwnerDirectory, directoryPath
   const powershellRoot = path.win32.join(process.env.ProgramFiles, 'PowerShell', '7')
   const child = Bun.spawn([path.win32.join(powershellRoot, 'pwsh.exe'), '-NoProfile', '-NonInteractive', '-Command', `
 $ErrorActionPreference='Stop'
+$diagnostic=[ordered]@{phase='startup';referenceProtected=$null;referenceOwnerMatches=$null;targetProtected=$null;descriptorMatches=$null;exceptionType=$null;hResult=$null}
+try{
 $sections=[System.Security.AccessControl.AccessControlSections]::Owner -bor [System.Security.AccessControl.AccessControlSections]::Access
+$diagnostic.phase='reference_read'
 $reference=Get-Acl -LiteralPath $env:TEST_REFERENCE
+$diagnostic.referenceProtected=$reference.AreAccessRulesProtected
+$diagnostic.phase='reference_owner'
 $owner=[System.Security.Principal.WindowsIdentity]::GetCurrent().User
-if(!$reference.AreAccessRulesProtected -or $reference.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $owner.Value){throw 'TEST reference is not private'}
+$diagnostic.referenceOwnerMatches=$reference.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -eq $owner.Value
+$diagnostic.phase='reference_check'
+if(!$diagnostic.referenceProtected -or !$diagnostic.referenceOwnerMatches){throw 'TEST reference is not private'}
+$diagnostic.phase='reference_descriptor'
 $exact=$reference.GetSecurityDescriptorSddlForm($sections)
+$diagnostic.phase='target_read'
 $target=Get-Acl -LiteralPath $env:TEST_TARGET
+$diagnostic.phase='target_prepare'
 $target.SetSecurityDescriptorSddlForm($exact,$sections)
+$diagnostic.phase='target_write'
 Set-Acl -LiteralPath $env:TEST_TARGET -AclObject $target
+$diagnostic.phase='target_verify'
 $actual=Get-Acl -LiteralPath $env:TEST_TARGET
-if(!$actual.AreAccessRulesProtected -or $actual.GetSecurityDescriptorSddlForm($sections) -cne $exact){throw 'TEST fixture security copy changed'}
+$diagnostic.targetProtected=$actual.AreAccessRulesProtected
+$diagnostic.descriptorMatches=$actual.GetSecurityDescriptorSddlForm($sections) -ceq $exact
+$diagnostic.phase='target_check'
+if(!$diagnostic.targetProtected -or !$diagnostic.descriptorMatches){throw 'TEST fixture security copy changed'}
+}catch{
+$failure=$_.Exception
+if($failure.InnerException){$failure=$failure.InnerException}
+$diagnostic.exceptionType=$failure.GetType().Name
+$diagnostic.hResult=$failure.HResult
+[Console]::Out.WriteLine((ConvertTo-Json -InputObject $diagnostic -Compress))
+exit 1
+}
 `], { env: { SystemRoot: process.env.SystemRoot, WINDIR: process.env.WINDIR,
     PSModulePath: path.win32.join(powershellRoot, 'Modules'), TEST_REFERENCE: source, TEST_TARGET: target },
-    stdout: 'ignore', stderr: 'ignore' })
-  assert.equal(await child.exited, 0, 'windows_fixture_security_copy_failed')
+    stdout: 'pipe', stderr: 'ignore' })
+  const [out, code] = await Promise.all([new Response(child.stdout).text(), child.exited])
+  if (code !== 0) {
+    const diagnostic: Record<string, unknown> = { exitCode: code, phase: 'unavailable' }
+    try {
+      assert.ok(out.length <= 2048)
+      const observed = executionRecord(JSON.parse(out))
+      if (typeof observed.phase === 'string' && /^[a-z_]{1,32}$/.test(observed.phase)) diagnostic.phase = observed.phase
+      if (typeof observed.exceptionType === 'string' && /^[A-Za-z_]{1,96}$/.test(observed.exceptionType)) diagnostic.exceptionType = observed.exceptionType
+      if (typeof observed.hResult === 'number' && Number.isInteger(observed.hResult) && observed.hResult >= -2147483648 && observed.hResult <= 2147483647) diagnostic.hResult = observed.hResult
+      for (const key of ['referenceProtected', 'referenceOwnerMatches', 'targetProtected', 'descriptorMatches']) {
+        if (typeof observed[key] === 'boolean') diagnostic[key] = observed[key]
+      }
+    } catch { /* Invalid or absent structured diagnostics retain only exit status. */ }
+    facts.fixtureSecurityFailure = diagnostic
+  }
+  assert.equal(code, 0, 'windows_fixture_security_copy_failed')
 }
 const lease = 'b04ca87c-d84d-4b55-a89a-9c8fa7bd1f16'
 let failure: unknown
