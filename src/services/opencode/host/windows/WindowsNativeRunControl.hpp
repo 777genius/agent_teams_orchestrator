@@ -265,7 +265,7 @@ struct WindowsNativeRunControl {
     return result;
   }
 
-  JsonObject accept(const JsonObject &input) {
+  JsonObject accept(const JsonObject &input, bool retainIdleWait = false) {
     std::unique_lock<std::recursive_mutex> lock(controlMutex_);
     require(listener_ && !shutdown_, "run_control_foreign");
     require(!listener_->poisoned && !listener_->acceptOperation, "run_control_foreign");
@@ -295,7 +295,13 @@ struct WindowsNativeRunControl {
     }
     if (!connected && error == ERROR_IO_PENDING) {
       lock.unlock();
-      const auto wait = runControlWaitOperation(*operation, timeout);
+      auto wait = runControlWaitOperation(*operation, timeout);
+      // The owner pump has no request deadline while waiting for a client.
+      // Keep the same held HANDLE and OVERLAPPED across idle observation ticks.
+      // Shutdown still enters the existing cancel-and-drain path within a tick;
+      // explicit low-level accept requests retain their bounded timeout.
+      while (!wait.completed && retainIdleWait && !requestPumpStop_ && !shutdown_)
+        wait = runControlWaitOperation(*operation, timeout);
       if (!wait.completed) {
         const auto cancelled = runControlCancelAndDrain(*operation);
         lock.lock();
@@ -1758,7 +1764,7 @@ inline void WindowsNativeRunControl::startRequestPump() {
       try {
         JsonObject acceptedInput;
         num(acceptedInput, L"timeoutMs", 1000);
-        const auto accepted = accept(acceptedInput);
+        const auto accepted = accept(acceptedInput, true);
         const auto number = accepted.GetNamedNumber(L"id");
         const auto id = static_cast<std::uint64_t>(number);
         activeId = id;

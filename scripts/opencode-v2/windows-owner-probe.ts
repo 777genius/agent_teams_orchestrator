@@ -451,7 +451,10 @@ try {
   }
   broker.events.on('runControlRequest', respondToStatus)
   try {
+    // A published owner must survive idle ticks before and between fresh peers.
+    await new Promise(resolve => setTimeout(resolve, 2500))
     await route(discoveryRoot, binding.runId, 'owner', 'unsupported', published)
+    await new Promise(resolve => setTimeout(resolve, 2500))
     await route(discoveryRoot, binding.runId, 'owner', 'missing', published)
   } finally {
     broker.events.off('runControlRequest', respondToStatus)
