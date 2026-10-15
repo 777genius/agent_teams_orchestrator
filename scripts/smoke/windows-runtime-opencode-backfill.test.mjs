@@ -56,6 +56,14 @@ test('actual provider comparison rejects static fallback and requires the select
   assert.equal(projected.deepinfraState, 'available');
   assert.equal(projected.deepInfraDisplayState, 'connected');
   assert.ok(!JSON.stringify(projected).includes('TEST-secret'));
+  diagnostic.view.diagnostics = [
+    'OpenCode host did not become healthy within 10000ms Diagnostics: TEST-secret',
+    'OpenCode host did not become healthy within 10000ms',
+    'Selected OpenCode identity is unavailable TEST-secret', 'TEST-secret',
+  ];
+  const classified = actualProviderResult(diagnostic, 'view', binary);
+  assert.deepEqual(classified.diagnosticKinds, ['host_health_timeout', 'selected_identity', 'other']);
+  assert.ok(!JSON.stringify(classified).includes('TEST-secret'));
   for (const [step, phase] of [['install managed OpenCode provider plugins', 'managed_plugins'],
     ['prepare managed OpenCode profile: create profile directories', 'profile'],
     ['opencode --version', 'version'], ['opencode providers list', 'providers'],

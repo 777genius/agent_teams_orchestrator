@@ -26,6 +26,15 @@ export function actualProviderResult(payload, operation, binaryPath, exitCode = 
   const inventoryPhase = inventoryTimedOut ? phases.find(([, step]) => diagnostics.some(value =>
     typeof value === 'string' && value.startsWith('OpenCode inventory probe timed out') &&
     (value.includes(` during ${step}`) || value.includes(` during ${step} `))))?.[0] ?? 'other' : null;
+  // Closed classifications only: messages can contain paths, URLs or credentials.
+  const failureKinds = [['host_health_timeout', /OpenCode host did not become healthy within/],
+    ['host_process_identity', /process identity could not be captured after startup/],
+    ['settings_timeout', /OpenCode provider settings timed out/],
+    ['http_failure', /OpenCode API request failed|OpenCode request failed|HTTP [45][0-9]{2}/],
+    ['selected_identity', /Selected OpenCode identity (?:is )?unavailable/]];
+  const diagnosticKinds = Array.isArray(diagnostics) ? [...new Set(diagnostics.slice(0, 64)
+    .filter(value => typeof value === 'string')
+    .map(value => failureKinds.find(([, pattern]) => pattern.test(value))?.[0] ?? 'other'))] : [];
   const version = view?.runtime?.version;
   const providerState = id => {
     const entry = Array.isArray(view?.providers) ? view.providers.find(value => value?.providerId === id) : null;
@@ -46,7 +55,7 @@ export function actualProviderResult(payload, operation, binaryPath, exitCode = 
     : models?.providerId === actualProvider && models.catalogState === 'fresh' &&
       qualifiedModelPresent);
   return { passed: passed === true, capabilitiesPending: pending, identityUnavailable,
-    inventoryTimedOut, inventoryPhase,
+    inventoryTimedOut, inventoryPhase, diagnosticKinds,
     runtimeIdPresent: payload?.runtimeId === 'opencode', viewPresent: !!view && typeof view === 'object',
     runtimeDetected: typeof view?.runtime?.cliPath === 'string', cliBinaryMatched: view?.runtime?.cliPath === binaryPath,
     versionMatched: view?.runtime?.version === '1.18.31',
