@@ -835,7 +835,8 @@ private:
                                       PIPE_REJECT_REMOTE_CLIENTS,
                                   static_cast<DWORD>(MAX_CONNECTIONS), MAX_FRAME_BYTES,
                                   MAX_FRAME_BYTES, 0, &attributes);
-    require(raw != INVALID_HANDLE_VALUE, "run_control_listen_unknown");
+    if (raw == INVALID_HANDLE_VALUE)
+      throw NativeError{"run_control_listen_unknown", GetLastError(), "listen"};
     return Handle(raw);
   }
   static Handle runControlDuplicateHandle(HANDLE source,
