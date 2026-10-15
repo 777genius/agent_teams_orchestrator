@@ -3107,6 +3107,44 @@ struct Scope {
         TerminateJobObject(job.value, 99);
     }
   }
+  const wchar_t *mainStderrKind() noexcept {
+    try {
+      const auto owner = currentSid();
+      const auto held = fileObjectIdentity(errorFile.value, owner, false);
+      auto selected = commands->reader(L"main.stderr");
+      require(fileObjectIdentity(selected.value, owner, false).Stringify() == held.Stringify(),
+              "execution_identity_unknown");
+      char bytes[16384]{};
+      DWORD count = 0;
+      require(ReadFile(selected.value, bytes, sizeof(bytes), &count, nullptr) && count <= sizeof(bytes),
+              "execution_identity_unknown");
+      require(fileObjectIdentity(errorFile.value, owner, false).Stringify() == held.Stringify() &&
+                  fileObjectIdentity(selected.value, owner, false).Stringify() == held.Stringify(),
+              "execution_identity_unknown");
+      if (count == 0) return L"empty";
+      const std::string output(bytes, count);
+      bool errorLine = false;
+      for (size_t begin = 0; begin < output.size();) {
+        const size_t end = output.find('\n', begin);
+        const std::string line = output.substr(begin, end == std::string::npos ? end : end - begin);
+        begin = end == std::string::npos ? output.size() : end + 1;
+        const size_t first = line.find_first_not_of(" \t\r");
+        if (first == std::string::npos) continue;
+        const auto message = line.substr(first);
+        if (message.rfind("error: ", 0) != 0 && message.rfind("Error: ", 0) != 0) continue;
+        errorLine = true;
+        if (message.find("Unable to resolve entry point") != std::string::npos) return L"entry_resolution";
+        if (message.find("Cannot find module") != std::string::npos) return L"module_resolution";
+        if (message.find("execution_containment_identity_mismatch") != std::string::npos) return L"child_identity";
+        if (message.find("execution_containment_pipe_denied") != std::string::npos) return L"child_pipe";
+        if (message.find("EACCES") != std::string::npos || message.find("EPERM") != std::string::npos ||
+            message.find("Access is denied") != std::string::npos) return L"access_denied";
+        if (message.find("ECONNREFUSED") != std::string::npos) return L"pipe_refused";
+        if (message.find("connect ENOENT") != std::string::npos) return L"pipe_missing";
+      }
+      return errorLine ? L"bun_error" : L"unclassified";
+    } catch (...) { return L"unavailable"; }
+  }
   void publishMainExit() {
     require(WaitForSingleObject(process.value, 0) == WAIT_OBJECT_0, "execution_identity_unknown");
     DWORD code = 0;
@@ -3116,6 +3154,7 @@ struct Scope {
     value.SetNamedValue(L"mapping", mapping);
     flag(value, L"heldProcessExited", true);
     num(value, L"exitCode", code);
+    str(value, L"stderrKind", mainStderrKind());
     event(L"mainExited", value);
   }
   void observeMainExit() {

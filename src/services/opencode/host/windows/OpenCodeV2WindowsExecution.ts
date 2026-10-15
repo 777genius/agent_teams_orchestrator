@@ -67,13 +67,18 @@ export function createWindowsCommandRequestReplay(): WindowsCommandRequestReplay
 }
 /** Only the launch's native held-process event can close MAIN. Helper failure
  * remains an error and never supplies a MAIN exit code. */
-export function observeWindowsHeldMainExit(events: EventEmitter, child: EventEmitter, launch: Promise<unknown>) {
+const mainStderrKinds = ['empty', 'entry_resolution', 'module_resolution', 'child_identity', 'child_pipe', 'access_denied', 'pipe_refused', 'pipe_missing', 'bun_error', 'unclassified', 'unavailable']
+export function observeWindowsHeldMainExit(events: EventEmitter, child: EventEmitter, launch: Promise<unknown>, onExit?: (code: number, stderrKind: string | undefined) => void) {
   let exited = false
   events.on('mainExited', value => { void (async () => {
     const receipt = row(value), mapping = row(await launch)
     assert(receipt.heldProcessExited === true && equal(receipt.mapping, mapping) &&
       Number.isSafeInteger(receipt.exitCode) && Number(receipt.exitCode) >= 0 && Number(receipt.exitCode) <= 0xffffffff, 'execution_identity_mismatch')
-    if (!exited) { exited = true; child.emit('close', receipt.exitCode) }
+    if (!exited) {
+      exited = true
+      onExit?.(Number(receipt.exitCode), typeof receipt.stderrKind === 'string' && mainStderrKinds.includes(receipt.stderrKind) ? receipt.stderrKind : undefined)
+      child.emit('close', receipt.exitCode)
+    }
   })().catch(() => child.emit('error', new Error('execution_identity_mismatch'))) })
   return () => exited
 }
@@ -343,10 +348,7 @@ export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, l
       child.emit('message', value)
     } catch { child.emit('error', new Error('execution_invalid_response')) }
   })
-  let heldMainExitCode: number | undefined
-  child.on('close', code => {
-    if (Number.isSafeInteger(code) && code >= 0 && code <= 0xffffffff) heldMainExitCode = code
-  })
+  let heldMainExitCode: number | undefined, heldMainStderrKind: string | undefined
   const launchStarted = Date.now()
   const launchHistory: { stage: string; elapsedMs: number }[] = []
   const launchStages = ['windows-cohort', 'windows-profile', 'windows-roots', 'windows-dll',
@@ -363,7 +365,9 @@ export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, l
   })
   const launch = broker.request('launch', { executable: plan.executable, entry: plan.entry, cwd: plan.cwd, env: plan.env,
     writableRoots: plan.writableRoots, readOnlyRoots: plan.readOnlyRoots, protectedRoots: plan.protectedRoots, realpathDll: plan.realpathDll, selectedConfigId: selectedConfigs.get(plan), nonce, leaseOwnerId }, deadline)
-  mainExited = observeWindowsHeldMainExit(broker.events, child, launch)
+  mainExited = observeWindowsHeldMainExit(broker.events, child, launch, (code, stderrKind) => {
+    heldMainExitCode = code; heldMainStderrKind = stderrKind
+  })
   void launch.catch(connectedReject)
   async function bounded<T>(work: Promise<T>, deadline: number, signal?: AbortSignal): Promise<T> {
     signal?.throwIfAborted(); assert(deadline > Date.now(), 'execution_timeout')
@@ -379,6 +383,7 @@ export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, l
       event: 'opencode-v2-startup', reason: 'failed', stage: launchHistory.at(-1)!.stage,
       elapsedMs: Math.max(launchHistory.at(-1)!.elapsedMs, Date.now() - launchStarted), history: launchHistory,
       ...(heldMainExitCode === undefined ? {} : { nativeExitCode: heldMainExitCode }),
+      ...(heldMainStderrKind === undefined ? {} : { nativeStderrKind: heldMainStderrKind }),
     }) }),
     prepare(deadline: number, signal?: AbortSignal): Promise<WindowsExecutionMapping> {
       return preparation ??= (async () => {

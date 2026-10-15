@@ -15,7 +15,8 @@ function startupDiagnostic(output: string | undefined) {
     try {
       const row = JSON.parse(line) as Record<string, unknown>
       if (!row || Array.isArray(row) || !['elapsedMs,event,reason,stage', 'elapsedMs,event,history,reason,stage',
-        'elapsedMs,event,graph,reason,stage', 'elapsedMs,event,graph,history,reason,stage'].includes(Object.keys(row).filter(key => key !== 'nativeExitCode').sort().join(',')) ||
+        'elapsedMs,event,graph,reason,stage', 'elapsedMs,event,graph,history,reason,stage'].includes(Object.keys(row).filter(key => key !== 'nativeExitCode' && key !== 'nativeStderrKind').sort().join(',')) ||
+        ('nativeStderrKind' in row && (typeof row.nativeStderrKind !== 'string' || !['empty', 'entry_resolution', 'module_resolution', 'child_identity', 'child_pipe', 'access_denied', 'pipe_refused', 'pipe_missing', 'bun_error', 'unclassified', 'unavailable'].includes(row.nativeStderrKind))) ||
         ('nativeExitCode' in row && (!Number.isSafeInteger(row.nativeExitCode) || Number(row.nativeExitCode) < 0 || Number(row.nativeExitCode) > 0xffffffff)) ||
         row.event !== 'opencode-v2-startup' || typeof row.reason !== 'string' || !['timeout', 'failed'].includes(row.reason) ||
         typeof row.stage !== 'string' || !startupStages.has(row.stage) ||
@@ -46,6 +47,7 @@ function startupDiagnostic(output: string | undefined) {
       }
       return { reason: row.reason, stage: row.stage, elapsedMs: row.elapsedMs,
         ...('nativeExitCode' in row ? { nativeExitCode: Number(row.nativeExitCode) } : {}),
+        ...('nativeStderrKind' in row ? { nativeStderrKind: row.nativeStderrKind as string } : {}),
         ...('history' in row ? { history } : {}), ...(graph ? { graph } : {}) }
     } catch { /* Arbitrary native output is never a diagnostic payload. */ }
   }
