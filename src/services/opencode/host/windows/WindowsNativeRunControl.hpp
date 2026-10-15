@@ -241,7 +241,7 @@ struct WindowsNativeRunControl {
     return record;
   }
 
-  JsonObject connect(const JsonObject &input) {
+  JsonObject connect(const JsonObject &input, std::uint64_t deadline = 0) {
     std::lock_guard<std::recursive_mutex> lock(controlMutex_);
     require(!shutdown_, "run_control_foreign");
     const auto endpoint = text(input, L"endpoint");
@@ -252,9 +252,24 @@ struct WindowsNativeRunControl {
                 registry_.size() < MAX_CAPABILITIES,
             "run_control_connection_limit");
     const DWORD timeout = runControlTimeoutMs(input, L"timeoutMs");
-    Handle pipe(CreateFileW(endpoint.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
-                            OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr));
-    require(static_cast<bool>(pipe), "run_control_connect_unknown");
+    if (deadline == 0) deadline = GetTickCount64() + timeout;
+    Handle pipe;
+    for (;;) {
+      require(runControlRemaining(deadline) > 0, "run_deadline_expired");
+      const HANDLE raw = CreateFileW(endpoint.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                                     OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
+      const DWORD error = raw == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
+      pipe = Handle(raw);
+      if (pipe) break;
+      if (error != ERROR_PIPE_BUSY)
+        throw NativeError{"run_control_connect_unknown", error, "connect"};
+      const DWORD remaining = runControlRemaining(deadline);
+      require(remaining > 0, "run_deadline_expired");
+      // Another client can win the next open; wait only for this same endpoint
+      // and consume the original budget before any request bytes are submitted.
+      if (!WaitNamedPipeW(endpoint.c_str(), remaining))
+        throw NativeError{"run_control_connect_unknown", GetLastError(), "connect"};
+    }
     auto connection = runControlMakeConnection(std::move(pipe), Role::client, timeout);
     connection->endpoint = endpoint;
     runControlAuthenticate(*connection);
@@ -542,7 +557,7 @@ struct WindowsNativeRunControl {
     JsonObject connectInput;
     str(connectInput, L"endpoint", expected_.endpoint);
     num(connectInput, L"timeoutMs", remaining());
-    const auto connected = connect(connectInput);
+    const auto connected = connect(connectInput, ioDeadline);
     auto &connection = runControlConnectionFor(connected);
     try {
       const auto mac = runControlHmacHex(runState_->challenge(), payloadBytes);

@@ -615,6 +615,10 @@ try {
     await route(discoveryRoot, binding.runId, 'owner', 'unsupported', published)
     await new Promise(resolve => setTimeout(resolve, 2500))
     await route(discoveryRoot, binding.runId, 'owner', 'missing', published)
+    // Fresh authenticated peers contend for this one original published owner.
+    await Promise.all(Array.from({ length: 3 }, () =>
+      route(discoveryRoot, binding.runId, 'owner', 'missing', published)))
+    facts.concurrentFreshStatusPeers = 3
     withholdNextStatus = true
     const recovered = await route(discoveryRoot, binding.runId, 'owner', 'missing', published, true)
     assert.equal(recovered.heldReadRetired, true)
@@ -627,7 +631,7 @@ try {
     await Promise.all(statusResponses)
   }
   assert.deepEqual(statusFailures, [])
-  assert.equal(statusRequests, 4)
+  assert.equal(statusRequests, 7)
   // Same physical fence with a foreign requested binding must remain UNKNOWN.
   await assert.rejects(request('runStateDiscover', { dataRoot: discoveryRoot, directory,
     teamId: 'TEST-foreign', runId: binding.runId, selectionIds }), /run_state_start_changed/)
