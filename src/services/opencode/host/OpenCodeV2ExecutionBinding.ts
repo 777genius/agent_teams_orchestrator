@@ -34,6 +34,11 @@ export async function canonicalExecutionDirectory(directory: string): Promise<vo
   executionAssert(info.isDirectory() && !info.isSymbolicLink(), 'execution_identity_mismatch')
 }
 const inside = (root: string, file: string) => file.startsWith(root + path.sep)
+export const executionProfileGuards = ['environment_hash', 'config_hash', 'home_mapping', 'path_containment',
+  'database_type', 'models_type', 'models_hash', 'process_cwd', 'process_pwd', 'process_environment'] as const
+export function assertExecutionProfile(value: unknown, profileGuard: typeof executionProfileGuards[number]): asserts value {
+  if (!value) throw Object.assign(new Error('execution_profile_changed'), { profileGuard })
+}
 export async function validateExecutionProfile(profile: OwnedNativeProfile): Promise<void> {
   executionAssert(profile.epoch.length > 0)
   if ('purpose' in profile.selection) executionAssert(profile.selection.purpose === 'catalog')
@@ -41,19 +46,19 @@ export async function validateExecutionProfile(profile: OwnedNativeProfile): Pro
   await canonicalExecutionDirectory(profile.root)
   await canonicalExecutionDirectory(profile.directory)
   executionAssert(await lstat(profile.root).then(info => process.platform === 'win32' || (info.mode & 0o077) === 0), 'execution_profile_not_private')
-  executionAssert(executionHash(profile.env) === profile.envSha256, 'execution_profile_changed')
+  assertExecutionProfile(executionHash(profile.env) === profile.envSha256, 'environment_hash')
   executionAssert(Object.entries(profile.env).every(([key, value]) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(key) && typeof value === 'string' && !value.includes('\0')))
   executionAssert(!Object.keys(profile.env).some(key => /^(?:NODE_OPTIONS|NODE_PATH|BUN_.*|LD_.*|DYLD_.*|BASH_ENV|ENV|ZDOTDIR|SHELLOPTS)$/i.test(key)), 'execution_environment_injection')
-  executionAssert(createHash('sha256').update(profile.config.content).digest('hex') === profile.config.sha256, 'execution_profile_changed')
+  assertExecutionProfile(createHash('sha256').update(profile.config.content).digest('hex') === profile.config.sha256, 'config_hash')
   executionRecord(JSON.parse(profile.config.content))
   for (const [key, relative] of Object.entries({ HOME: 'home', USERPROFILE: 'home', XDG_CONFIG_HOME: 'config',
     XDG_DATA_HOME: 'data', XDG_CACHE_HOME: 'cache', XDG_STATE_HOME: 'state', TMPDIR: 'tmp', TMP: 'tmp', TEMP: 'tmp',
     APPDATA: 'appdata', LOCALAPPDATA: 'localappdata' })) {
-    executionAssert(profile.env[key] === path.join(profile.root, relative), 'execution_profile_changed')
+    assertExecutionProfile(profile.env[key] === path.join(profile.root, relative), 'home_mapping')
     await canonicalExecutionDirectory(profile.env[key]!)
     executionAssert(await lstat(profile.env[key]!).then(info => process.platform === 'win32' || (info.mode & 0o077) === 0), 'execution_profile_not_private')
   }
-  executionAssert(inside(profile.root, profile.config.directory) && inside(profile.root, profile.databasePath), 'execution_profile_changed')
+  assertExecutionProfile(inside(profile.root, profile.config.directory) && inside(profile.root, profile.databasePath), 'path_containment')
   await canonicalExecutionDirectory(profile.config.directory)
   await canonicalExecutionDirectory(path.dirname(profile.databasePath))
   for (const directory of [profile.config.directory, path.dirname(profile.databasePath)]) {
@@ -63,11 +68,11 @@ export async function validateExecutionProfile(profile: OwnedNativeProfile): Pro
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
     return null
   })
-  executionAssert(!db || (db.isFile() && !db.isSymbolicLink()), 'execution_profile_changed')
+  assertExecutionProfile(!db || (db.isFile() && !db.isSymbolicLink()), 'database_type')
   if (profile.models) {
     executionAssert(inside(profile.root, profile.models.path) && await filesystem.realpath(profile.models.path) === profile.models.path)
-    executionAssert(await lstat(profile.models.path).then(info => info.isFile() && !info.isSymbolicLink()), 'execution_profile_changed')
-    executionAssert(await hashOpenCodeFile(profile.models.path) === profile.models.sha256, 'execution_profile_changed')
+    assertExecutionProfile(await lstat(profile.models.path).then(info => info.isFile() && !info.isSymbolicLink()), 'models_type')
+    assertExecutionProfile(await hashOpenCodeFile(profile.models.path) === profile.models.sha256, 'models_hash')
   }
 }
 

@@ -45,8 +45,8 @@ describe('execution host ownership and cleanup', () => {
   test('changed selected profile bytes are refused without altering the execution DB', async () => {
     const { profile, remove } = await fixture()
     try {
-      await expect(validateExecutionProfile({ ...profile, env: { ...profile.env, HOME: '/foreign' } })).rejects.toThrow('execution_profile_changed')
-      await expect(validateExecutionProfile({ ...profile, config: { ...profile.config, content: '{"foreign":true}' } })).rejects.toThrow('execution_profile_changed')
+      await expect(validateExecutionProfile({ ...profile, env: { ...profile.env, HOME: '/foreign' } })).rejects.toMatchObject({ message: 'execution_profile_changed', profileGuard: 'environment_hash' })
+      await expect(validateExecutionProfile({ ...profile, config: { ...profile.config, content: '{"foreign":true}' } })).rejects.toMatchObject({ message: 'execution_profile_changed', profileGuard: 'config_hash' })
       expect(await readFile(profile.databasePath, 'utf8')).toBe('TEST-retained-journal')
     } finally { await remove() }
   })

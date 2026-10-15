@@ -5,7 +5,7 @@ import { pathToFileURL } from 'node:url'
 import { resolveOpenCodeV2ExecutionDelivery } from '../services/opencode/host/OpenCodeV2ExecutionDelivery.js'
 import { hashOpenCodeFile } from '../services/opencode/compatibility/OpenCodeNativeIdentity.js'
 import { executionAssert, executionHash, executionRecord } from '../services/opencode/execution/OpenCodeV2ExecutionContracts.js'
-import { validateExecutionGraph, validateExecutionNative, validateExecutionProfile,
+import { assertExecutionProfile, executionProfileGuards, validateExecutionGraph, validateExecutionNative, validateExecutionProfile,
   type ExecutionGraphProgress, type OwnedNativeProfile, type ValidatedExecutionNative } from '../services/opencode/host/OpenCodeV2ExecutionBinding.js'
 import { boundOpenCodeRead } from '../services/opencode/transport/OpenCodeBoundedFetch.js'
 import { importOpenCodeV2SelectedOAuth } from '../services/opencode/host/OpenCodeV2ExecutionOAuth.js'
@@ -36,6 +36,7 @@ let startupStage = 'waiting-for-prepare'
 const startupHistory = [{ stage: startupStage, elapsedMs: 0 }]
 let graphProgress: ExecutionGraphProgress | undefined
 let runtimeReady = false, startupFailureReported = false
+let environmentMismatchKeys: string[] = []
 function enterStartupStage(stage: string): void {
   startupStage = stage
   startupHistory.push({ stage, elapsedMs: Math.max(startupHistory.at(-1)!.elapsedMs, Date.now() - startupStartedAt) })
@@ -48,12 +49,13 @@ function reportStartupFailure(reason: 'timeout' | 'failed', error?: unknown): vo
     'execution_graph_changed', 'execution_graph_incomplete', 'execution_graph_dependency_missing',
     'execution_containment_identity_mismatch', 'execution_timeout', 'execution_cancelled']
   const cause = error instanceof Error && causes.includes(error.message) ? error.message : undefined
-  const detail = error instanceof Error ? error as Error & { code?: unknown; syscall?: unknown } : undefined
+  const detail = error instanceof Error ? error as Error & { code?: unknown; syscall?: unknown; profileGuard?: unknown } : undefined
   const errno = ['EPERM', 'EACCES', 'ENOENT', 'ENOTDIR', 'EISDIR', 'EINVAL', 'UNKNOWN', 'EIO', 'ENOSYS'].find(value => value === detail?.code)
   const operation = ['realpath', 'open', 'read', 'lstat', 'stat'].find(value => value === detail?.syscall)
   const errorName = ['Error', 'TypeError', 'ReferenceError', 'RangeError', 'AbortError'].find(value => value === detail?.name)
+  const profileGuard = executionProfileGuards.find(value => value === detail?.profileGuard)
   // Fixed stages, closed cause codes and elapsed time; no credentials or payloads.
-  process.stderr.write(JSON.stringify({ event: 'opencode-v2-startup', reason, stage: startupStage, ...(cause ? { cause } : {}), ...(errno ? { errno } : {}), ...(operation ? { operation } : {}), ...(errorName ? { errorName } : {}),
+  process.stderr.write(JSON.stringify({ event: 'opencode-v2-startup', reason, stage: startupStage, ...(cause ? { cause } : {}), ...(errno ? { errno } : {}), ...(operation ? { operation } : {}), ...(errorName ? { errorName } : {}), ...(profileGuard ? { profileGuard } : {}), ...(environmentMismatchKeys.length ? { environmentMismatchKeys } : {}),
     elapsedMs: Math.max(startupHistory.at(-1)!.elapsedMs, Date.now() - startupStartedAt), history: startupHistory, ...(graphProgress ? { graph: graphProgress } : {}) }) + '\n')
 }
 // A source graph can legitimately take more than 30 seconds under concurrent
@@ -97,8 +99,14 @@ async function start(input: Record<string, unknown>): Promise<void> {
     process.versions.bun === openCodeBunVersion(), 'execution_identity_mismatch')
   enterStartupStage('profile-validation')
   await validateExecutionProfile(profile); controller.signal.throwIfAborted()
-  executionAssert(profile.directory === process.cwd() && process.env.PWD === profile.directory &&
-    Object.entries(profile.env).every(([key, value]) => process.env[key] === value), 'execution_profile_changed')
+  assertExecutionProfile(profile.directory === process.cwd(), 'process_cwd')
+  assertExecutionProfile(process.env.PWD === profile.directory, 'process_pwd')
+  const knownKeys = ['HOME', 'USERPROFILE', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME',
+    'TMPDIR', 'TMP', 'TEMP', 'APPDATA', 'LOCALAPPDATA', 'PATH', 'NO_COLOR', 'SystemRoot', 'SYSTEMROOT', 'WINDIR',
+    'COMSPEC', 'PATHEXT', 'HOMEDRIVE', 'HOMEPATH', 'OPENCODE_CONFIG_DIR', 'AGENT_TEAMS_MCP_CLAUDE_DIR', 'OPENSSL_CONF']
+  environmentMismatchKeys = [...new Set(Object.entries(profile.env).filter(([key, value]) => process.env[key] !== value)
+    .map(([key]) => knownKeys.includes(key) ? key : 'other'))]
+  assertExecutionProfile(environmentMismatchKeys.length === 0, 'process_environment')
   executionAssert(process.execPath === native.bun.path && await hashOpenCodeFile(process.execPath) === native.bun.sha256 &&
     await hashOpenCodeFile(process.argv[1]!) === native.entrySha256, 'execution_identity_mismatch')
   enterStartupStage('native-validation')
