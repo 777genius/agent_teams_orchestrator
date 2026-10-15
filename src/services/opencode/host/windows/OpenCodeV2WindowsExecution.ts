@@ -66,6 +66,41 @@ export function createWindowsCommandRequestReplay(): WindowsCommandRequestReplay
     },
   })
 }
+/** The child keeps using the original command channel while its Scope closes.
+ * Only native retained command IDs may retire/close; no new work is admitted. */
+export function createWindowsCommandRequestHandler(options: Readonly<{
+  nonce: string; leaseOwnerId: string; ready(): boolean; closing(): boolean
+  assertLive(allowClosing: boolean): Promise<void>; request: WindowsNativeBroker['request']; failed(): void
+}>) {
+  const replay = createWindowsCommandRequestReplay()
+  const operations = new Set(['commandStart', 'commandRead', 'commandStatus', 'commandWriteStdin', 'commandEndStdin', 'commandRetire', 'commandClose'])
+  const lifecycle = new Set(['commandRetire', 'commandClose'])
+  const failed = () => { try { options.failed() } catch { /* Error observers cannot poison the native frame parser. */ } }
+  return async (value: unknown): Promise<void> => {
+    let id: string | undefined, authority: object | undefined
+    const reply = (ok: boolean, result?: unknown) => options.request('send', {
+      value: { type: 'commandResult', id, nonce: options.nonce, leaseOwnerId: options.leaseOwnerId, ok,
+        ...(ok ? { value: result } : {}) },
+    })
+    try {
+      const record = row(value)
+      assert(options.ready() && record.type === 'commandRequest' &&
+        record.nonce === options.nonce && record.leaseOwnerId === options.leaseOwnerId &&
+        typeof record.id === 'string' && /^[a-f0-9-]{36}$/.test(record.id) &&
+        typeof record.operation === 'string' && operations.has(record.operation), 'execution_native_command_unknown')
+      const input = row(record.input), operation = record.operation as string
+      id = record.id as string; authority = replay.admit(id, operation)
+      if (options.closing() && !lifecycle.has(operation)) { await reply(false); return }
+      await options.assertLive(lifecycle.has(operation))
+      if (options.closing() && !lifecycle.has(operation)) { await reply(false); return }
+      const result = await options.request(operation, operation === 'commandStart' ? { ...input, commandId: randomUUID() } : input)
+      await reply(true, result)
+    } catch {
+      if (id && authority) { try { await reply(false) } catch { failed() } }
+      else failed()
+    } finally { if (id && authority) replay.settle(id, authority) }
+  }
+}
 /** Only the launch's native held-process event can close MAIN. Helper failure
  * remains an error and never supplies a MAIN exit code. */
 const mainStderrKinds = ['empty', 'entry_resolution', 'module_resolution', 'child_identity', 'child_pipe', 'access_denied', 'pipe_refused', 'pipe_missing', 'bun_error', 'unclassified', 'unavailable']
@@ -319,9 +354,12 @@ export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, l
   )
   // Command request IDs are replayed only while their operation is pending or
   // retained in a small settled window.
-  const commandReplay = createWindowsCommandRequestReplay()
-  const commandOperations = new Set(['commandStart', 'commandRead', 'commandStatus', 'commandWriteStdin', 'commandEndStdin', 'commandRetire', 'commandClose'])
   let mapping: WindowsExecutionMapping | undefined, nativeMapping: unknown, stopped = false, started = false, closed = false
+  const commandRequest = createWindowsCommandRequestHandler({ nonce, leaseOwnerId,
+    ready: () => !!mapping && started, closing: () => stopped,
+    assertLive: allowClosing => assertLive(allowClosing), request: (operation, input) => broker!.request(operation, input),
+    failed: () => child.emit('error', new Error('execution_native_command_unknown')),
+  })
   let mainExit: ReturnType<typeof observeWindowsHeldMainExit> | undefined
   let connectedResolve!: (value: unknown) => void, connectedReject!: (error: Error) => void
   const connected = new Promise<unknown>((resolve, reject) => { connectedResolve = resolve; connectedReject = reject }); void connected.catch(() => undefined)
@@ -341,18 +379,7 @@ export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, l
         http.bindOrigin(record.baseUrl)
       }
       if (record.type === 'commandRequest') {
-        assert(mapping && started && !stopped && record.nonce === nonce && record.leaseOwnerId === leaseOwnerId && typeof record.id === 'string' && /^[a-f0-9-]{36}$/.test(record.id) && typeof record.operation === 'string' && commandOperations.has(record.operation), 'execution_native_command_unknown')
-        const input = row(record.input), operation = record.operation as string, id = record.id as string
-        const authority = commandReplay.admit(id, operation)
-        void (async () => {
-          try {
-            await assertLive()
-            const result = await broker!.request(operation, operation === 'commandStart' ? { ...input, commandId: randomUUID() } : input)
-            await broker!.request('send', { value: { type: 'commandResult', id, nonce, leaseOwnerId, ok: true, value: result } })
-          } catch {
-            if (!stopped && !broker!.ended()) await broker!.request('send', { value: { type: 'commandResult', id, nonce, leaseOwnerId, ok: false } }).catch(() => child.emit('error', new Error('execution_native_command_unknown')))
-          } finally { commandReplay.settle(id, authority) }
-        })()
+        void commandRequest(record)
         return
       }
       if (mapping && record.type === 'closed' && record.nonce === nonce && record.leaseOwnerId === leaseOwnerId && record.namespace === mapping.namespace.name && record.pid === mapping.bun.nativePID && equal(record.birth, mapping.bun.birth) && record.scopeClosed === true && record.realpathClosed === mapping.realpathDll.receiptId) closed = true
@@ -387,7 +414,7 @@ export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, l
       timer = setTimeout(() => reject(new Error('execution_timeout')), deadline - Date.now()); abort = () => reject(new Error('execution_cancelled')); signal?.addEventListener('abort', abort, { once: true }); if (signal?.aborted) abort()
     })]) } finally { clearTimeout(timer); if (abort) signal?.removeEventListener('abort', abort) }
   }
-  async function assertLive() { assert(mapping && !stopped && !broker!.ended()); assert(equal(await broker!.request('assertLive'), nativeMapping), 'execution_identity_mismatch') }
+  async function assertLive(allowClosing = false) { assert(mapping && (!stopped || allowClosing) && !broker!.ended()); assert(equal(await broker!.request('assertLive'), nativeMapping), 'execution_identity_mismatch') }
   let preparation: Promise<WindowsExecutionMapping> | undefined, retirement: Promise<WindowsKernelRetirement> | undefined
   return Object.freeze({ child, fetch: http.fetch,
     output: () => ({ stdout: '', stderr: launchHistory.length === 0 ? '' : JSON.stringify({

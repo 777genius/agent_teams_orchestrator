@@ -18,7 +18,7 @@ if (isolatedBirthProbe) mock.module('./windows/OpenCodeV2WindowsNativeBroker.js'
   requireWindowsRealpathArtifact: () => undefined,
 }))
 const { isExecutionCleanupReceipt, retireExecutionChild } = await import('./OpenCodeV2ExecutionLifecycle.js')
-const { createWindowsCommandRequestReplay, observeWindowsHeldMainExit, windowsBirth } = await import('./windows/OpenCodeV2WindowsExecution.js')
+const { createWindowsCommandRequestHandler, createWindowsCommandRequestReplay, observeWindowsHeldMainExit, windowsBirth } = await import('./windows/OpenCodeV2WindowsExecution.js')
 const { readExecutionBirth } = await import('./OpenCodeV2ExecutionBinding.js')
 
 async function runIsolatedBirthProbe(name: string): Promise<void> {
@@ -156,6 +156,58 @@ test('command replay retains pending authority, a finite settled window, and lif
   expect(() => windowReplay.admit('window-held', 'commandStart')).toThrow('execution_native_command_unknown')
   windowReplay.settle('window-held', windowHeld)
   expect(() => windowReplay.admit('window-held', 'commandStart')).toThrow('execution_native_command_unknown')
+})
+
+test('closing Windows command handler drains retained commands and refuses new work without poisoning transport', async () => {
+  let closing = false, nativeLive = true, failed = 0
+  let liveBarrier: Promise<void> | undefined
+  const calls: { operation: string; input: Record<string, unknown> }[] = []
+  const nonce = 'TEST-nonce', leaseOwnerId = 'TEST-lease', commandId = 'TEST-owned-command'
+  let counter = 0
+  const packet = (operation: string, input: Record<string, unknown> = { commandId }) => ({
+    type: 'commandRequest', nonce, leaseOwnerId, id: `00000000-0000-4000-8000-${String(++counter).padStart(12, '0')}`, operation, input,
+  })
+  const handler = createWindowsCommandRequestHandler({ nonce, leaseOwnerId,
+    ready: () => true, closing: () => closing,
+    assertLive: async allowClosing => { if (!nativeLive || closing && !allowClosing) throw new Error('TEST native scope unavailable'); await liveBarrier },
+    request: async (operation, input = {}) => {
+      calls.push({ operation, input })
+      if (operation === 'commandStart') return { commandId }
+      if (operation === 'commandRetire' || operation === 'commandClose') {
+        if (input.commandId !== commandId) throw new Error('TEST unowned command')
+        return { empty: true, activeProcesses: 0, heldProcessExited: true }
+      }
+      return {}
+    },
+    failed: () => { failed++; throw new Error('TEST consumed error observer') },
+  })
+  await handler(packet('commandStart', {}))
+  let release!: () => void
+  liveBarrier = new Promise<void>(resolve => { release = resolve })
+  const racing = packet('commandStart', {}), pending = handler(racing)
+  closing = true
+  release(); await pending; liveBarrier = undefined
+  expect(calls.at(-1)?.input.value).toMatchObject({ id: racing.id, ok: false })
+  const retire = packet('commandRetire'), close = packet('commandClose')
+  await handler(retire); await handler(close)
+  expect(calls.filter(call => call.operation !== 'send').map(call => call.operation)).toEqual(['commandStart', 'commandRetire', 'commandClose'])
+  for (const request of [retire, close]) expect(calls.find(call => call.operation === 'send' &&
+    (call.input.value as Record<string, unknown>).id === request.id)?.input.value).toMatchObject({ id: request.id, nonce, leaseOwnerId, ok: true })
+  const before = calls.filter(call => call.operation !== 'send').length
+  for (const operation of ['commandStart', 'commandRead', 'commandStatus', 'commandWriteStdin', 'commandEndStdin']) {
+    const request = packet(operation)
+    await handler(request)
+    expect(calls.at(-1)?.input.value).toMatchObject({ id: request.id, nonce, leaseOwnerId, ok: false })
+  }
+  expect(calls.filter(call => call.operation !== 'send')).toHaveLength(before)
+  await handler(packet('commandRetire', { commandId: 'TEST-foreign' }))
+  expect(calls.at(-1)?.input.value).toMatchObject({ ok: false })
+  nativeLive = false
+  await handler(packet('commandClose'))
+  expect(calls.at(-1)?.input.value).toMatchObject({ ok: false })
+  await expect(handler({ ...packet('commandClose'), nonce: 'TEST-foreign' })).resolves.toBeUndefined()
+  await expect(handler(retire)).resolves.toBeUndefined()
+  expect(failed).toBe(2)
 })
 
 
