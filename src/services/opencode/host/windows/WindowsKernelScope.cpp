@@ -4265,8 +4265,28 @@ int wmain(int argc, wchar_t **argv) {
             require(GetLastError() == ERROR_INVALID_PARAMETER, "execution_identity_unknown");
             flag(value, L"absent", true);
           } else {
-            value = identity(process.value, static_cast<DWORD>(raw));
-            flag(value, L"exited", WaitForSingleObject(process.value, 0) == WAIT_OBJECT_0);
+            // A signaled process object can outlive its executable image. The
+            // same retained HANDLE still supplies its immutable creation time;
+            // an unavailable live image never proves exit or PID absence.
+            num(value, L"hostPID", static_cast<DWORD>(raw));
+            num(value, L"nativePID", static_cast<DWORD>(raw));
+            value.SetNamedValue(L"birth", birth(process.value));
+            DWORD state = WaitForSingleObject(process.value, 0);
+            require(state == WAIT_OBJECT_0 || state == WAIT_TIMEOUT,
+                    "execution_identity_unknown");
+            if (state == WAIT_TIMEOUT) {
+              try {
+                str(value, L"executablePath", image(process.value));
+              } catch (const NativeError &) {
+                // Only positive exit on this exact HANDLE permits the terminal
+                // response when termination raced the image query.
+                state = WaitForSingleObject(process.value, 0);
+                require(state == WAIT_OBJECT_0 || state == WAIT_TIMEOUT,
+                        "execution_identity_unknown");
+                if (state != WAIT_OBJECT_0) throw;
+              }
+            }
+            flag(value, L"exited", state == WAIT_OBJECT_0);
           }
         } else if (operation == L"launch") {
           require(!scope, "execution_containment_unavailable");

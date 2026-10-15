@@ -63,9 +63,18 @@ async function start(script: string, stdin: 'ignore' | 'pipe') {
   assert.match(String(value.birthFiletime), /^[1-9]\d{0,19}$/)
   return { commandId, pid: Number(value.pid), birthFiletime: String(value.birthFiletime) }
 }
-async function closeCommand(commandId: string) {
+async function closeCommand(commandId: string, expected?: { pid: number; birthFiletime: string }) {
   const value = record(await broker.request('commandRetire', { commandId }))
   assert.equal(value.empty, true); assert.equal(value.activeProcesses, 0); assert.equal(value.heldProcessExited, true)
+  if (expected) {
+    // commandRetire retains its process HANDLE until commandClose. This makes
+    // observation of a signaled but still-existing process object deterministic.
+    const held = record(await broker.request('identity', { pid: expected.pid }))
+    assert.equal(held.absent, undefined); assert.equal(held.exited, true)
+    assert.equal(held.hostPID, expected.pid); assert.equal(held.nativePID, expected.pid)
+    assert.deepEqual(held.birth, { format: 'windows-filetime', value: expected.birthFiletime, bootId: null })
+    facts.retiredCommandIdentity = held
+  }
   const closed = record(await broker.request('commandClose', { commandId })); assert.equal(closed.closed, true)
   activeCommands.delete(commandId); return value
 }
@@ -162,9 +171,17 @@ $sid
   const descendantPID = Number(await readFile(path.join(root, 'grandchild-live.txt'), 'utf8'))
   assert.ok(Number.isSafeInteger(descendantPID) && descendantPID > 0)
   const descendantBirth = record(await broker.request('identity', { pid: descendantPID }))
+  assert.equal(descendantBirth.hostPID, descendantPID); assert.equal(descendantBirth.nativePID, descendantPID)
+  assert.equal(descendantBirth.exited, false); assert.equal(descendantBirth.executablePath, path.join(root, 'bun.exe'))
   facts.cancelCommand = cancellation; facts.descendant = descendantBirth; facts.activeBeforeCancel = live.activeProcesses
-  await closeCommand(cancellation.commandId)
-  const after = record(await broker.request('identity', { pid: descendantPID })); assert.equal(after.absent, true)
+  await closeCommand(cancellation.commandId, cancellation)
+  const after = record(await broker.request('identity', { pid: descendantPID }))
+  if (after.absent !== true) {
+    assert.equal(after.exited, true)
+    assert.equal(after.hostPID, descendantPID); assert.equal(after.nativePID, descendantPID)
+    assert.deepEqual(after.birth, descendantBirth.birth)
+  }
+  facts.descendantAfterCancel = after
   facts.fileOutputPassed = true; facts.stdinEchoEofPassed = true; facts.descendantCancelPassed = true
 } catch (error) { failure = error }
 finally {

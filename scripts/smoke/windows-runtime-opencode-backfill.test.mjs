@@ -105,8 +105,8 @@ test('cleanup script inventory covers known fixtures without admitting dependenc
 });
 
 
-// Real SQLite reader + attribution/reconstruction, without loading the full CLI,
-// installing dependencies, compiling, starting a provider, or modifying a project.
+// Real SQLite reader + attribution/reconstruction using preinstalled dependencies,
+// without loading the full CLI, compiling, starting a provider, or modifying a project.
 test('fixture is readable and reconstructs one strictly attributed write through production readers', () => {
   const root = mkdtempSync(path.join(os.tmpdir(), 'backfill-fixture-check-'));
   try {
