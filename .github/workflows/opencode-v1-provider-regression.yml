@@ -1,0 +1,69 @@
+name: OpenCode 1.18.31 provider regression
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - scripts/opencode-v1-provider-regression.ts
+      - .github/workflows/opencode-v1-provider-regression.yml
+permissions:
+  contents: read
+jobs:
+  windows-provider:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - name: Prepare isolated genuine npm shim and verified public runtimes
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP "TEST-opencode-provider-$env:GITHUB_RUN_ID"
+          New-Item -ItemType Directory $root | Out-Null
+          npm install --prefix "$root/npm" --no-audit --no-fund opencode-ai@1.18.31
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned npm install failed' }
+          foreach ($version in @('0.0.118', '0.0.120')) {
+            $dest = Join-Path $root $version
+            New-Item -ItemType Directory $dest | Out-Null
+            $archive = "agent-teams-runtime-win32-x64-v$version.zip"
+            $sums = "agent-teams-runtime-SHA256SUMS-v$version"
+            gh release download "runtime-v$version" --repo 777genius/agent_teams_orchestrator_binaries --pattern $archive --pattern $sums --dir $dest
+            if ($LASTEXITCODE -ne 0) { throw 'Public runtime download failed' }
+            $line = Get-Content "$dest/$sums" | Where-Object { $_ -match "  $([regex]::Escape($archive))$" }
+            if (@($line).Count -ne 1) { throw 'Missing exact archive checksum' }
+            $expected = ($line -split '\s+')[0]
+            if ((Get-FileHash "$dest/$archive" -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) { throw 'Archive checksum mismatch' }
+            Expand-Archive "$dest/$archive" "$dest/payload"
+            $binary = @(Get-ChildItem "$dest/payload" -Filter claude-multimodel.exe -Recurse)
+            if ($binary.Count -ne 1) { throw 'Ambiguous runtime executable' }
+            if ($version -eq '0.0.118') { "BASELINE=$($binary[0].FullName)" >> $env:GITHUB_ENV }
+            else { "CANDIDATE=$($binary[0].FullName)" >> $env:GITHUB_ENV }
+          }
+          "TEST_ROOT=$root" >> $env:GITHUB_ENV
+          "TEST_SHIM=$root/npm/node_modules/.bin/opencode.cmd" >> $env:GITHUB_ENV
+      - name: Typecheck the standalone regression harness
+        shell: pwsh
+        run: |
+          npm install --prefix "$env:TEST_ROOT/types" --no-audit --no-fund typescript@6.0.2 @types/node@24.19.2
+          if ($LASTEXITCODE -ne 0) { throw 'Typecheck dependency install failed' }
+          node "$env:TEST_ROOT/types/node_modules/typescript/bin/tsc" --ignoreConfig --noEmit --strict --skipLibCheck --target esnext --module nodenext --types node --typeRoots "$env:TEST_ROOT/types/node_modules/@types" scripts/opencode-v1-provider-regression.ts
+          if ($LASTEXITCODE -ne 0) { throw 'Harness typecheck failed' }
+      - name: Compare public runtime 118 and 120 without inference
+        run: node scripts/opencode-v1-provider-regression.ts "$env:TEST_ROOT" "$env:TEST_SHIM" "$env:CANDIDATE" "$env:BASELINE"
+      - name: Preserve all outcomes including failed baseline
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencode-11831-provider-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/TEST-opencode-provider-*/*-summary.json
+            ${{ runner.temp }}/TEST-opencode-provider-*/baseline-118/status.json
+            ${{ runner.temp }}/TEST-opencode-provider-*/baseline-118/view.json
+            ${{ runner.temp }}/TEST-opencode-provider-*/baseline-118/models.json
+            ${{ runner.temp }}/TEST-opencode-provider-*/candidate-120/status.json
+            ${{ runner.temp }}/TEST-opencode-provider-*/candidate-120/view.json
+            ${{ runner.temp }}/TEST-opencode-provider-*/candidate-120/models.json
+          if-no-files-found: warn
