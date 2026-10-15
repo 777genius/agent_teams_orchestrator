@@ -612,7 +612,8 @@ struct RetainedRealpathDll {
     sourceIdentity = fileObjectIdentity(source.value, sourceOwner, false);
     require(heldFileSha256(source.value) == sha256, "execution_containment_dll_identity");
     for (auto &parent : ancestors(privateDirectory)) parents.emplace_back(std::move(parent));
-    parents.emplace_back(canonicalDirectory(privateDirectory));
+    parents.emplace_back(canonicalDirectory(privateDirectory,
+        FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL));
     const auto directoryIdentity = fileIdentity(parents.back().handle.value, owner, true, package);
     (void)directoryIdentity;
     protectedDllObject(parents.back().handle.value);
