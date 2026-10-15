@@ -343,6 +343,20 @@ export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, l
       child.emit('message', value)
     } catch { child.emit('error', new Error('execution_invalid_response')) }
   })
+  const launchStarted = Date.now()
+  const launchHistory: { stage: string; elapsedMs: number }[] = []
+  const launchStages = ['windows-cohort', 'windows-profile', 'windows-roots', 'windows-dll',
+    'windows-process', 'windows-owned-pair', 'windows-published', 'windows-connected',
+    'windows-prepare', 'windows-assert']
+  const markLaunch = (stage: string) => {
+    if (!launchStages.includes(stage) || launchHistory.some(value => value.stage === stage)) return
+    launchHistory.push({ stage, elapsedMs: Math.max(launchHistory.at(-1)?.elapsedMs ?? 0, Date.now() - launchStarted) })
+  }
+  broker.events.on('launchProgress', value => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return
+    const entry = value as Record<string, unknown>
+    if (entry.nonce === nonce && typeof entry.stage === 'string') markLaunch(entry.stage)
+  })
   const launch = broker.request('launch', { executable: plan.executable, entry: plan.entry, cwd: plan.cwd, env: plan.env,
     writableRoots: plan.writableRoots, readOnlyRoots: plan.readOnlyRoots, protectedRoots: plan.protectedRoots, realpathDll: plan.realpathDll, selectedConfigId: selectedConfigs.get(plan), nonce, leaseOwnerId }, deadline)
   mainExited = observeWindowsHeldMainExit(broker.events, child, launch)
@@ -357,10 +371,15 @@ export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, l
   async function assertLive() { assert(mapping && !stopped && !broker!.ended()); assert(equal(await broker!.request('assertLive'), nativeMapping), 'execution_identity_mismatch') }
   let preparation: Promise<WindowsExecutionMapping> | undefined, retirement: Promise<WindowsKernelRetirement> | undefined
   return Object.freeze({ child, fetch: http.fetch,
+    output: () => ({ stdout: '', stderr: launchHistory.length === 0 ? '' : JSON.stringify({
+      event: 'opencode-v2-startup', reason: 'failed', stage: launchHistory.at(-1)!.stage,
+      elapsedMs: Math.max(launchHistory.at(-1)!.elapsedMs, Date.now() - launchStarted), history: launchHistory,
+    }) }),
     prepare(deadline: number, signal?: AbortSignal): Promise<WindowsExecutionMapping> {
       return preparation ??= (async () => {
         signal?.throwIfAborted(); assert(Date.now() < deadline, 'execution_timeout')
         const observed = row(await bounded(launch, deadline, signal)), peer = row(await bounded(connected, deadline, signal))
+        markLaunch('windows-connected')
         const actual = await identity(observed.bun), supervisor = await identity(observed.supervisor)
         assert(peer.clientPID === actual.hostPID && equal(peer, { ...observed, clientPID: actual.hostPID }) && actual.executablePath === bun.path && actual.executableSha256 === bun.sha256 && supervisor.executablePath === plan.helper.path && supervisor.executableSha256 === plan.helper.sha256 && observed.namespace === `windows-job:${nonce}` && observed.leaseOwnerId === leaseOwnerId && typeof observed.containerSid === 'string' && /^S-1-15-2-/.test(observed.containerSid), 'execution_identity_mismatch')
         const { clientPID: _clientPID, ...peerMapping } = peer
@@ -370,12 +389,13 @@ export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, l
         const prepared = new Promise<Record<string, unknown>>((resolve, reject) => {
           const listener = (value: unknown) => { try { const record = row(value); if (record.type === 'prepared') { child.removeListener('message', listener); resolve(record) } } catch (error) { reject(error) } }; child.on('message', listener)
         })
+        markLaunch('windows-prepare')
         await broker!.request('send', { value: { type: 'prepare', nonce, leaseOwnerId, namespace: observed.namespace, birth: actual.birth, executableSha256: actual.executableSha256, supervisor, containerSid: observed.containerSid, realpathAnchors, realpathDll } }, deadline, signal)
         const response = await bounded(prepared, deadline, signal)
         assert(response.nonce === nonce && response.leaseOwnerId === leaseOwnerId && response.pid === actual.nativePID && equal(response.birth, actual.birth) && response.namespace === observed.namespace && response.executableSha256 === actual.executableSha256 && response.realpathInstalled === realpathDll.receiptId, 'execution_identity_mismatch')
         nativeMapping = observed; child.pid = actual.hostPID
         mapping = Object.freeze({ bun: actual, supervisor, namespace: Object.freeze({ name: String(observed.namespace) }), containerSid: observed.containerSid, leaseOwnerId, realpathAnchors, realpathDll })
-        mappings.add(mapping); await assertLive(); signal?.throwIfAborted(); assert(Date.now() < deadline, 'execution_timeout'); return mapping
+        mappings.add(mapping); markLaunch('windows-assert'); await assertLive(); signal?.throwIfAborted(); assert(Date.now() < deadline, 'execution_timeout'); return mapping
       })()
     },
     assertLive,

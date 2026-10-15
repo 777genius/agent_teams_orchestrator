@@ -4476,6 +4476,15 @@ static std::unique_ptr<Scope> launch(const JsonObject &input, OwnerStore &owners
     return true;
   };
   require(safeNonce(nonce) && lease.size() == 36, "execution_identity_mismatch");
+  const auto progress = [&](const wchar_t *stage) {
+    try {
+      JsonObject value;
+      str(value, L"nonce", nonce);
+      str(value, L"stage", stage);
+      event(L"launchProgress", value);
+    } catch (...) { /* Diagnostic emission cannot change launch authority. */ }
+  };
+  progress(L"windows-cohort");
   scope->cohort = WindowsNativeRunControlIssuer::prepareLaunchCohort(owners, nonce);
   scope->launchNonce = nonce;
   if (input.HasKey(L"selectedConfigId"))
@@ -4484,6 +4493,7 @@ static std::unique_ptr<Scope> launch(const JsonObject &input, OwnerStore &owners
   scope->profile = L"AgentTeams.OpenCodeV2." + nonce;
   scope->cwd = text(input, L"cwd");
   auto parents = owners.holdSelectedAncestors(scope->cwd);
+  progress(L"windows-profile");
   HRESULT result = CreateAppContainerProfile(scope->profile.c_str(), scope->profile.c_str(),
                                              L"OpenCode V2 private execution", nullptr, 0,
                                              reinterpret_cast<PSID *>(&scope->sid.value));
@@ -4493,6 +4503,7 @@ static std::unique_ptr<Scope> launch(const JsonObject &input, OwnerStore &owners
           "execution_containment_unavailable");
   SID_AND_ATTRIBUTES capability{scope->network.value, SE_GROUP_ENABLED};
   SECURITY_CAPABILITIES capabilities{scope->sid.value, &capability, 1, 0};
+  progress(L"windows-roots");
   for (auto kind : {L"readOnlyRoots", L"writableRoots", L"protectedRoots"}) {
     require(input.HasKey(kind) && input.GetNamedValue(kind).ValueType() == JsonValueType::Array,
             "execution_invalid_response");
@@ -4530,6 +4541,7 @@ static std::unique_ptr<Scope> launch(const JsonObject &input, OwnerStore &owners
   }
   // Helper-only native owner/command probes do not select a DLL. Production
   // composition requires this selection and its authenticated prepare receipt.
+  progress(L"windows-dll");
   if (input.HasKey(L"realpathDll")) {
     const auto dllCohortSids =
         scope->cohort ? closedControllerCohortSids(*scope->cohort) : std::vector<std::wstring>();
@@ -4604,6 +4616,7 @@ static std::unique_ptr<Scope> launch(const JsonObject &input, OwnerStore &owners
   require(block.size() <= 32767, "execution_invalid_response");
   std::wstring command = quote(executable) + L" " + quote(entry);
   PROCESS_INFORMATION process{};
+  progress(L"windows-process");
   require(CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, TRUE,
                          EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED |
                              CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
@@ -4616,6 +4629,7 @@ static std::unique_ptr<Scope> launch(const JsonObject &input, OwnerStore &owners
   require(IsProcessInJob(scope->process.value, scope->job.value, &member) && member &&
               scope->active() == 1,
           "execution_identity_mismatch");
+  progress(L"windows-owned-pair");
   if (input.HasKey(L"selectedConfigId"))
     scope->ownedPairControl = WindowsNativeRunControlIssuer::issueOwnedPair(
         owners, *scope, text(input, L"selectedConfigId"), nonce, lease);
@@ -4645,6 +4659,7 @@ static std::unique_ptr<Scope> launch(const JsonObject &input, OwnerStore &owners
   require(winrt::to_string(mapping.Stringify()).size() <= CONTROL_PACKET_LIMIT - 1024,
           "execution_invalid_response");
   scope->mapping = mapping;
+  progress(L"windows-published");
   scope->readerFinished = Handle(CreateEventW(nullptr, TRUE, FALSE, nullptr));
   require(static_cast<bool>(scope->readerFinished), "execution_native_unknown");
   scope->reader = std::thread([value = scope.get()] {

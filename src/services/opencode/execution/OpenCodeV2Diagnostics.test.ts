@@ -14,6 +14,11 @@ test('startup diagnostics retain only finite native fields and reject payload-be
   const history = [{ stage: 'waiting-for-prepare', elapsedMs: 0 },
     { stage: 'graph-validation', elapsedMs: 1200 }]
   const historical = { ...valid, history }
+  const windowsHistory = ['windows-cohort', 'windows-profile', 'windows-roots', 'windows-dll',
+    'windows-process', 'windows-owned-pair', 'windows-published', 'windows-connected',
+    'windows-prepare', 'windows-assert'].map((stage, elapsedMs) => ({ stage, elapsedMs }))
+  const windowsFrame = { event: 'opencode-v2-startup', reason: 'failed', stage: 'windows-assert',
+    elapsedMs: 10, history: windowsHistory }
   const invalidHistory = [[], Array(11).fill(history[0]),
     [{ ...history[0], body: secret }], [{ stage: secret, elapsedMs: 0 }],
     [{ stage: ['graph-validation'], elapsedMs: 0 }], [{ stage: 'graph-validation', elapsedMs: -1 }],
@@ -28,7 +33,7 @@ test('startup diagnostics retain only finite native fields and reject payload-be
     { ...graph, path: secret }, { ...graph, completed: -1 }, { ...graph, completed: 0.5 },
     { ...graph, completed: 101 }, { ...graph, total: 0 }, { ...graph, total: 65_537 },
     { ...graph, completed: Number.MAX_SAFE_INTEGER + 1 }, { ...closure, completed: 99 }]
-  const frames = [valid, historical, { ...valid, graph }, { ...historical, graph: closure },
+  const frames = [valid, historical, windowsFrame, { ...valid, graph }, { ...historical, graph: closure },
     ...invalidGraph.map(graph => ({ ...historical, graph })), ...invalidHistory.map(history => ({ ...valid, history })),
     { ...historical, body: secret },
     { ...valid, body: secret }, { ...valid, stage: secret },
@@ -68,8 +73,9 @@ test('startup diagnostics retain only finite native fields and reject payload-be
       { reason: 'timeout', stage: 'graph-validation', elapsedMs: 30_123, history },
       { reason: 'timeout', stage: 'graph-validation', elapsedMs: 30_123, graph },
       { reason: 'timeout', stage: 'graph-validation', elapsedMs: 30_123, history, graph: closure },
+      { reason: 'failed', stage: 'windows-assert', elapsedMs: 10, history: windowsHistory },
     ]))
-    expect(rows.filter(row => row.startup)).toHaveLength(4)
+    expect(rows.filter(row => row.startup)).toHaveLength(5)
   } finally {
     if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_DATA_HOME
     else process.env.CLAUDE_MULTIMODEL_DATA_HOME = previous

@@ -6,7 +6,8 @@ import { executionAssert } from './OpenCodeV2ExecutionContracts.js'
 import { readOpenCodeV2ProviderWireFailure } from '../transport/OpenCodeV2ProviderWire.js'
 import { ensureWindowsPrivateDirectories } from '../profile/OpenCodePrivateDirectories.js'
 
-const startupStages = new Set(['waiting-for-prepare', 'profile-validation', 'native-validation', 'graph-validation',
+const startupStages = new Set(['windows-cohort', 'windows-profile', 'windows-roots', 'windows-dll',
+  'windows-process', 'windows-owned-pair', 'windows-published', 'windows-connected', 'windows-prepare', 'windows-assert', 'waiting-for-prepare', 'profile-validation', 'native-validation', 'graph-validation',
   'runtime-import', 'server-start', 'effect-import', 'selected-oauth-import', 'scope-acquisition', 'ready-identity'])
 function startupDiagnostic(output: string | undefined) {
   if (!output || output.length > 16_384) return undefined

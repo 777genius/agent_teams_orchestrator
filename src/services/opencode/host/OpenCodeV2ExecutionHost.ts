@@ -363,11 +363,17 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
       await closePlanOnce().catch(() => undefined)
       throw failure
     }
+    // Begin finite failure persistence before potentially unresolved retirement.
+    // Do not delay physical cleanup on diagnostic I/O.
+    const earlyDiagnostic = process.platform === 'win32'
+      ? recordOpenCodeV2ProviderFailure('execution-host-startup', failure, true, launch?.output?.().stderr, acquisitionTiming)
+      : undefined
     try { await close() } catch { throw new Error('cleanup_unknown', { cause: failure }) }
     finally {
-      // Closing an unfinished child publishes its finite stage. Capture after
-      // joining that attempt without changing original failure or cleanup proof.
-      await recordOpenCodeV2ProviderFailure('execution-host-startup', failure, true, launch?.output?.().stderr, acquisitionTiming)
+      if (earlyDiagnostic) await earlyDiagnostic
+      // Unix children publish their finite stage while closing. Windows retains
+      // the native phase measured before potentially unresolved retirement.
+      else await recordOpenCodeV2ProviderFailure('execution-host-startup', failure, true, launch?.output?.().stderr, acquisitionTiming)
     }
     throw failure
   }
