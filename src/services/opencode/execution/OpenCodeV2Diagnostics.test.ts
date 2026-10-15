@@ -270,7 +270,8 @@ test('native diagnostics retain only closed producer codes and stages with uint3
   const secret = 'TEST_PRIVATE_NATIVE_PAYLOAD'
   const cases: { error: Error; category: string; native?: { stage: string; nativeCode: number } }[] = [
     ...['retire_broker_state', 'retire_broker_write', 'retire_job', 'retire_wait', 'retire_io_join',
-      'retire_main_exit', 'retire_owned_pair', 'retire_commands', 'retire_receipt', 'retire_grants']
+      'retire_main_exit', 'retire_owned_pair', 'retire_commands', 'retire_receipt', 'retire_grants',
+      'retire_grants_dll', 'retire_grants_roots', 'retire_grants_metadata']
       .map(stage => ({ error: new Error('cleanup_unknown', { cause: new Error(`execution_native_unknown:${stage}:2147483659`) }),
         category: 'execution_native_unknown', native: { stage, nativeCode: 2147483659 } })),
     { error: new Error('cleanup_unknown', { cause: new Error('cleanup_unknown:retire_wait:0') }),

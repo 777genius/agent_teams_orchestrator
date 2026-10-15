@@ -215,13 +215,15 @@ test('native retirement timeout retains only the original nonce and finite clean
   const request = async (operation: string) => {
     expect(operation).toBe('retire')
     events.emit('retireProgress', { nonce: 'TEST-original', phase: 'retire_grants' })
+    for (const phase of ['retire_grants_dll', 'retire_grants_roots', 'retire_grants_metadata'])
+      events.emit('retireProgress', { nonce: 'TEST-original', phase })
     for (const value of [{ nonce: 'TEST-foreign', phase: 'retire_wait' },
       { nonce: 'TEST-original', phase: 'TEST_PRIVATE_PAYLOAD' },
       { nonce: 'TEST-original', phase: 'retire_wait', body: 'TEST_PRIVATE_PAYLOAD' }]) events.emit('retireProgress', value)
     throw original
   }
   const error = await retireWindowsNativeScope({ events, request }, 'TEST-original').then(() => undefined, error => error)
-  expect(error?.message).toBe('execution_native_timeout:retire_grants:0')
+  expect(error?.message).toBe('execution_native_timeout:retire_grants_metadata:0')
   expect(error?.cause).toBe(original)
   expect(events.listenerCount('retireProgress')).toBe(0)
   const failure = new Error('cleanup_unknown:retire_wait:0')

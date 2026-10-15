@@ -155,7 +155,8 @@ const privateNativeFailureStages = new Set([
   'shared_readonly_grant_open', 'shared_readonly_grant_read', 'shared_readonly_grant_merge', 'shared_readonly_grant_write',
   'shared_readonly_owner_changed', 'shared_readonly_control_changed', 'shared_readonly_foreign_changed', 'shared_readonly_member_missing',
   'retire_broker_state', 'retire_broker_write', 'retire_job', 'retire_wait', 'retire_io_join',
-  'retire_main_exit', 'retire_owned_pair', 'retire_commands', 'retire_receipt', 'retire_grants'])
+  'retire_main_exit', 'retire_owned_pair', 'retire_commands', 'retire_receipt', 'retire_grants',
+  'retire_grants_dll', 'retire_grants_roots', 'retire_grants_metadata'])
 function nativeFailure(error: unknown): { category: string; native?: { stage: string; nativeCode: number } } | undefined {
   if (!(error instanceof Error)) return undefined
   if (privateNativeFailureCodes.has(error.message)) return { category: error.message }

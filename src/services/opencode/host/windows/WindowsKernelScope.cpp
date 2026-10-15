@@ -3577,8 +3577,20 @@ static void retainMetadataAncestor(Scope &scope, Handle held) {
     }
   scope.metadataAncestors.emplace_back(std::move(held));
 }
-static void assertAncestorMetadataPinsLive(const Scope &scope) {
-  for (const auto &ancestor : scope.metadataAncestors) ancestor.anchor.assertLive();
+static bool ancestorMetadataPathContains(const std::wstring &volume, const std::wstring &path,
+                                         const std::wstring &targetVolume, const std::wstring &targetPath) {
+  return volume == targetVolume && !path.empty() && targetPath.size() >= path.size() &&
+      equalPath(path, targetPath.substr(0, path.size())) &&
+      (targetPath.size() == path.size() || path.back() == L'\\' || targetPath[path.size()] == L'\\');
+}
+static void assertAncestorMetadataPinsLive(const Scope &scope,
+                                         const RetainedAncestorMetadata *target = nullptr) {
+  const auto targetVolume = target ? text(target->anchor.identity, L"volumeSerial") : std::wstring();
+  const auto targetPath = target ? text(target->anchor.identity, L"ntPath") : std::wstring();
+  for (const auto &ancestor : scope.metadataAncestors)
+    if (!target || ancestorMetadataPathContains(text(ancestor.anchor.identity, L"volumeSerial"),
+                                                text(ancestor.anchor.identity, L"ntPath"),
+                                                targetVolume, targetPath)) ancestor.anchor.assertLive();
 }
 static void assertAncestorMetadataLive(const Scope &scope) {
   assertAncestorMetadataPinsLive(scope);
@@ -3597,7 +3609,9 @@ static void changeAncestorMetadata(Scope &scope, RetainedAncestorMetadata &ances
   require(grant || scope.physicalCleanupProof || scope.metadataNoChildCleanupProof,
           code, "ancestor_metadata_cleanup_unproven");
   SharedAclMutex mutex(ancestor.anchor.identity);
-  assertAncestorMetadataPinsLive(scope);
+  // Target-only, non-inheriting writes need this target's complete physical
+  // prefix chain. Unrelated package pins are checked at both batch boundaries.
+  assertAncestorMetadataPinsLive(scope, &ancestor);
   const auto path = extended(ancestor.anchor.path);
   const HANDLE rawHandle = CreateFileW(path.c_str(), READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES,
       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
@@ -3653,7 +3667,7 @@ static void changeAncestorMetadata(Scope &scope, RetainedAncestorMetadata &ances
                           owner.data(), &ownerSize, group.data(), &groupSize) &&
               SetSecurityDescriptorDacl(absolute.data(), TRUE, next, defaulted),
           code, "ancestor_metadata_descriptor");
-  assertAncestorMetadataPinsLive(scope);
+  assertAncestorMetadataPinsLive(scope, &ancestor);
   // Unlike SetSecurityInfo/SetNamedSecurityInfo, SetFileSecurityW does not
   // propagate existing inheritable foreign ACEs into the directory's children.
   // https://learn.microsoft.com/windows/win32/api/securitybaseapi/nf-securitybaseapi-setfilesecurityw
@@ -3661,7 +3675,7 @@ static void changeAncestorMetadata(Scope &scope, RetainedAncestorMetadata &ances
     const DWORD error = GetLastError();
     throw NativeError{code, error, "ancestor_metadata_write"};
   }
-  assertAncestorMetadataPinsLive(scope);
+  assertAncestorMetadataPinsLive(scope, &ancestor);
   require(anchorIdentity(handle.value).Stringify() == ancestor.anchor.identity.Stringify(),
           code, "ancestor_metadata_identity");
   const auto after = ancestorMetadataAcl(handle.value, scope.sid.value, code);
@@ -3681,6 +3695,7 @@ static void grantAncestorMetadata(Scope &scope) {
       retainMetadataAncestor(scope, Handle(duplicate));
     }
   }
+  assertAncestorMetadataPinsLive(scope);
   for (auto &ancestor : scope.metadataAncestors) {
     bool covered = false;
     const auto path = text(ancestor.anchor.identity, L"ntPath");
@@ -3697,6 +3712,7 @@ static void grantAncestorMetadata(Scope &scope) {
     }
     if (!covered) changeAncestorMetadata(scope, ancestor, true);
   }
+  assertAncestorMetadataPinsLive(scope);
 }
 static void grantRoot(Scope &scope, Handle heldRoot, DWORD mask, ACCESS_MODE mode,
                       bool sharedRoot = false) {
@@ -3786,8 +3802,10 @@ static void grantRoot(Scope &scope, Handle heldRoot, DWORD mask, ACCESS_MODE mod
   }
 }
 static void removeGrants(Scope &scope) {
+  scope.retirementProgress("retire_grants_dll");
   if (scope.realpathDll && scope.realpathDll->granted && scope.physicalCleanupProof)
     scope.realpathDll->changeAce(REVOKE_ACCESS);
+  scope.retirementProgress("retire_grants_roots");
   std::vector<RetainedAnchorComponent> retained;
   for (auto it = scope.aclRoots.rbegin(); it != scope.aclRoots.rend(); ++it) {
     const auto owner = currentSid();
@@ -3845,12 +3863,18 @@ static void removeGrants(Scope &scope) {
     }
   }
   scope.aclRoots = std::move(retained);
-  if (scope.physicalCleanupProof || scope.metadataNoChildCleanupProof)
+  if (scope.physicalCleanupProof || scope.metadataNoChildCleanupProof) {
+    scope.retirementProgress("retire_grants_metadata");
+    assertAncestorMetadataPinsLive(scope);
     for (size_t i = scope.metadataAncestors.size(); i > 0; --i) {
       auto &ancestor = scope.metadataAncestors[i - 1];
       if (!ancestor.originalDescriptor.empty()) changeAncestorMetadata(scope, ancestor, false);
-      scope.metadataAncestors.erase(scope.metadataAncestors.begin() + (i - 1));
     }
+    // Keep every pin and measured write intent through final union validation.
+    // Failure retains the entire batch and cannot earn ownAcesRemoved.
+    assertAncestorMetadataPinsLive(scope);
+    scope.metadataAncestors.clear();
+  }
 }
 struct Scope;
 static std::unique_ptr<Scope> launch(const JsonObject &input, OwnerStore &owners);

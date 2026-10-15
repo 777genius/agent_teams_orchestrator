@@ -106,7 +106,8 @@ export function createWindowsCommandRequestHandler(options: Readonly<{
 export async function retireWindowsNativeScope(broker: Pick<WindowsNativeBroker, 'events' | 'request'>,
   nonce: string): Promise<unknown> {
   const phases = new Set(['retire_job', 'retire_wait', 'retire_io_join', 'retire_main_exit',
-    'retire_owned_pair', 'retire_commands', 'retire_receipt', 'retire_grants'])
+    'retire_owned_pair', 'retire_commands', 'retire_receipt', 'retire_grants',
+    'retire_grants_dll', 'retire_grants_roots', 'retire_grants_metadata'])
   let phase: string | undefined
   const progress = (value: unknown) => {
     if (!value || typeof value !== 'object' || Array.isArray(value)) return
