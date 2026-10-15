@@ -1,7 +1,7 @@
 import { openCodeBunVersion } from '../../src/constants/openCodeBunVersion.js'
 import assert from 'node:assert/strict'
 import { createHash, randomUUID } from 'node:crypto'
-import { copyFile, readFile, writeFile } from 'node:fs/promises'
+import { copyFile, readFile, realpath, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
 import { createWindowsNativeBroker, resolveWindowsNativeArtifact } from '../../src/services/opencode/host/windows/OpenCodeV2WindowsNativeBroker.js'
@@ -14,6 +14,17 @@ assert.equal(process.versions.bun, openCodeBunVersion())
 const root = process.argv[2], receiptPath = process.argv[3]
 assert.ok(root && receiptPath && path.win32.isAbsolute(root) && path.win32.isAbsolute(receiptPath))
 assert.match(path.win32.basename(root), /^TEST-windows-command-[a-zA-Z0-9-]+$/)
+// Explicit measurement mode is confined to this exact disposable SDK checkout.
+// Product retirement deadlines and the ordinary native probe remain unchanged.
+const fullGraphRoot = process.argv[4]
+if (fullGraphRoot) {
+  assert.equal(path.win32.basename(fullGraphRoot), 'TEST-native-sdk')
+  assert.equal(fullGraphRoot, await realpath(path.resolve(import.meta.dir, '../..')))
+}
+const fullGraphFile = fullGraphRoot && path.join(fullGraphRoot, 'node_modules', '@modelcontextprotocol', 'sdk', 'dist', 'esm', 'server', 'index.js')
+if (fullGraphFile) assert.ok((await realpath(fullGraphFile)).startsWith(fullGraphRoot! + path.sep))
+const fullGraphReadHash = fullGraphFile && createHash('sha256').update(await readFile(fullGraphFile)).digest('hex')
+let fullGraphAclBaseline: string | undefined
 const sharedReadRoot = root + '-shared-readonly'
 const sharedReadFile = path.join(sharedReadRoot, 'vendor-input.txt')
 let sharedReadBaseline: string | undefined
@@ -44,6 +55,15 @@ async function ps(script: string, extra: Record<string, string> = {}) {
   const [out, err, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited])
   if (code !== 0) throw new Error(`windows_command_setup_failed:${code}:${err.slice(-2048)}`)
   return out.trim()
+}
+async function fullGraphAcls(): Promise<string> {
+  // Exclude only the historical AUTO_INHERITED marker; all ACE bytes, owner,
+  // group, protection and other descriptor controls must compare exactly.
+  return ps(`$ErrorActionPreference='Stop';$rows=@(foreach($p in @($env:TEST_GRAPH_ROOT,$env:TEST_GRAPH_FILE)){
+$acl=Get-Acl -LiteralPath $p;$raw=[Security.AccessControl.RawSecurityDescriptor]::new($acl.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Owner-bor [Security.AccessControl.AccessControlSections]::Group-bor [Security.AccessControl.AccessControlSections]::Access))
+$aces=@(foreach($ace in $raw.DiscretionaryAcl){$bytes=[byte[]]::new($ace.BinaryLength);$ace.GetBinaryForm($bytes,0);[Convert]::ToBase64String($bytes)})
+[ordered]@{owner=$raw.Owner.Value;group=$raw.Group.Value;control=([int]$raw.ControlFlags-band (-bnot 1024));aces=$aces}});[Console]::Write(($rows|ConvertTo-Json -Compress -Depth 4))`,
+    { TEST_GRAPH_ROOT: fullGraphRoot!, TEST_GRAPH_FILE: fullGraphFile! })
 }
 function record(value: unknown): Record<string, unknown> { assert.ok(value && typeof value === 'object' && !Array.isArray(value)); return value as Record<string, unknown> }
 const messages: Record<string, unknown>[] = []
@@ -356,7 +376,10 @@ $sid
   facts.ancestorAclBeforeLaunchSHA256 = ancestorBefore.sha256
   stage = 'native-main-launch'; launched = true
   await fence.assertOwned()
-  const mapping = record(await broker.request('launch', { executable: path.join(root, 'bun.exe'), entry: path.join(root, 'main.ts'), cwd: root, env: environment, writableRoots: [root, profileRoot, ancestorSelected], readOnlyRoots: [sharedReadRoot], protectedRoots: [fencePath], nonce, leaseOwnerId }))
+  if (fullGraphRoot) fullGraphAclBaseline = await fullGraphAcls()
+  const launchStarted = Date.now()
+  const mapping = record(await broker.request('launch', { executable: path.join(root, 'bun.exe'), entry: path.join(root, 'main.ts'), cwd: root, env: environment, writableRoots: [root, profileRoot, ancestorSelected], readOnlyRoots: [sharedReadRoot, ...(fullGraphRoot ? [fullGraphRoot] : [])], protectedRoots: [fencePath], nonce, leaseOwnerId }, fullGraphRoot ? Date.now() + 150_000 : undefined))
+  if (fullGraphRoot) facts.fullGraphLaunchElapsedMs = Date.now() - launchStarted
   assert.equal(mapping.containerSid, sid)
   const main = record(mapping.bun); originalMapping = mapping
   const connected = await until(() => nativePeer)
@@ -367,6 +390,15 @@ $sid
   assert.equal(prepared.pid, main.nativePID)
   assert.equal(prepared.nonce, nonce); assert.equal(prepared.leaseOwnerId, leaseOwnerId)
   assert.deepEqual(prepared.birth, main.birth); assert.equal(prepared.namespace, mapping.namespace)
+  if (fullGraphFile) {
+    stage = 'native-full-graph-read'
+    await writeFile(path.join(root, 'full-graph-read.ts'), `const fs=await import('node:fs/promises');const crypto=await import('node:crypto');const file=${JSON.stringify(fullGraphFile)};const bytes=await fs.readFile(file);let denied=false;try{const writer=await fs.open(file,'r+');await writer.close()}catch(error){denied=['EACCES','EPERM'].includes((error as NodeJS.ErrnoException).code??'')}if(!denied)throw Error('TEST_full_graph_write_admitted');await Bun.stdout.write(crypto.createHash('sha256').update(bytes).digest('hex'))`)
+    const read = await start(path.join(root, 'full-graph-read.ts'), 'ignore')
+    const [bytes, errors] = await Promise.all([output(read.commandId, 'stdout'), output(read.commandId, 'stderr')])
+    assert.equal(bytes.toString(), fullGraphReadHash); assert.equal(errors.length, 0)
+    await closeCommand(read.commandId)
+    facts.fullGraphReadPassed = true; facts.fullGraphWriteDenied = true
+  }
   stage = 'native-ancestor-boundary'
   const ancestorDuring = await assertAncestorAcls(true)
   facts.ancestorAclDuringLaunchSHA256 = ancestorDuring.sha256
@@ -445,7 +477,9 @@ finally {
     let retirementPhase = 'retire_rpc'
     const retirementFacts: Record<string, unknown> = {}
     try {
-      const receipt = record(await broker.request('retire'))
+      const retirementStarted = Date.now()
+      const receipt = record(await broker.request('retire', {}, fullGraphRoot ? Date.now() + 150_000 : undefined))
+      if (fullGraphRoot) facts.fullGraphRetirementElapsedMs = Date.now() - retirementStarted
       retirementPhase = 'retire_receipt'
       for (const key of ['empty', 'activeProcesses', 'heldProcessExited', 'ownAcesRemoved']) {
         if (typeof receipt[key] === 'boolean' || typeof receipt[key] === 'number') retirementFacts[key] = receipt[key]
@@ -478,6 +512,11 @@ finally {
       assert.equal(await readFile(sharedReadFile, 'utf8'), 'TEST-readonly-vendor')
       facts.sharedReadOnlyOwnerAndAclPreserved = true
       facts.sharedReadOnlyAclSHA256 = createHash('sha256').update(after).digest('hex')
+      if (fullGraphRoot) {
+        assert.equal(await fullGraphAcls(), fullGraphAclBaseline)
+        facts.fullGraphForeignAcesOwnerGroupAndProtectionPreserved = true
+        facts.fullGraphAclSHA256 = createHash('sha256').update(fullGraphAclBaseline!).digest('hex')
+      }
     } catch (error) {
       const code = error instanceof Error && /^[a-z_]{1,96}(?::[a-z_]{1,64}:\d{1,10})?$/.test(error.message)
         ? error.message : error instanceof Error && error.name === 'AssertionError' ? 'retirement_assertion_failed' : 'retirement_unknown'
