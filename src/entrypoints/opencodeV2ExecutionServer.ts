@@ -48,8 +48,12 @@ function reportStartupFailure(reason: 'timeout' | 'failed', error?: unknown): vo
     'execution_graph_changed', 'execution_graph_incomplete', 'execution_graph_dependency_missing',
     'execution_containment_identity_mismatch', 'execution_timeout', 'execution_cancelled']
   const cause = error instanceof Error && causes.includes(error.message) ? error.message : undefined
+  const detail = error instanceof Error ? error as Error & { code?: unknown; syscall?: unknown } : undefined
+  const errno = ['EPERM', 'EACCES', 'ENOENT', 'ENOTDIR', 'EISDIR', 'EINVAL', 'UNKNOWN', 'EIO', 'ENOSYS'].find(value => value === detail?.code)
+  const operation = ['realpath', 'open', 'read', 'lstat', 'stat'].find(value => value === detail?.syscall)
+  const errorName = ['Error', 'TypeError', 'ReferenceError', 'RangeError', 'AbortError'].find(value => value === detail?.name)
   // Fixed stages, closed cause codes and elapsed time; no credentials or payloads.
-  process.stderr.write(JSON.stringify({ event: 'opencode-v2-startup', reason, stage: startupStage, ...(cause ? { cause } : {}),
+  process.stderr.write(JSON.stringify({ event: 'opencode-v2-startup', reason, stage: startupStage, ...(cause ? { cause } : {}), ...(errno ? { errno } : {}), ...(operation ? { operation } : {}), ...(errorName ? { errorName } : {}),
     elapsedMs: Math.max(startupHistory.at(-1)!.elapsedMs, Date.now() - startupStartedAt), history: startupHistory, ...(graphProgress ? { graph: graphProgress } : {}) }) + '\n')
 }
 // A source graph can legitimately take more than 30 seconds under concurrent
