@@ -9,6 +9,7 @@ import { readOpenCodeV2SelectedAuth, type SelectedAuthMetadata } from './OpenCod
 type SelectedKeyPort = {
   providers(): Promise<unknown>; integration(id: string): Promise<unknown>
   connect(id: string, key: string): Promise<void>
+  provider?(id: string): Promise<unknown>
   models?(): Promise<unknown>
 }
 
@@ -59,8 +60,21 @@ export async function attachOpenCodeV2SelectedKey(profile: OwnedNativeProfile, p
   const providers = scoped(await port.providers())
   executionAssert(Array.isArray(providers), 'execution_selected_auth_provider_unknown')
   const matches = providers.map(executionRecord).filter(row => row.id === providerId)
-  const integrationId = matches[0]?.integrationID
-  executionAssert(matches.length === 1 && typeof integrationId === 'string' && integrationId.length > 0, 'execution_selected_auth_provider_unknown')
+  executionAssert(matches.length <= 1, 'execution_selected_auth_provider_unknown')
+  let provider = matches[0]
+  if (matches.length === 0 && credential.type === 'api' && typeof port.provider === 'function') {
+    const detail = scoped(await port.provider(providerId))
+    executionAssert(detail !== null && typeof detail === 'object' && !Array.isArray(detail),
+      'execution_selected_auth_provider_unknown')
+    provider = executionRecord(detail)
+    executionAssert(provider.id === providerId && (provider.activation === 'auto' || provider.activation === 'enabled'),
+      'execution_selected_auth_provider_unknown')
+  }
+  // Both native catalogs default an omitted integrationID to this exact provider ID.
+  const integrationId = credential.type === 'api' && provider?.integrationID === undefined
+    ? provider?.id : provider?.integrationID
+  executionAssert(provider !== undefined && typeof integrationId === 'string' && integrationId.length > 0,
+    'execution_selected_auth_provider_unknown')
   const before = executionRecord(scoped(await port.integration(integrationId)))
   if (credential.type === 'oauth') {
     // Provider.Info settings are optional; the official OAuth plugin owns Codex routing.
@@ -123,6 +137,7 @@ export async function initializeOpenCodeV2ExecutionAuth(authority: ExecutionAuth
       })()
     await attachOpenCodeV2SelectedKey(profile, {
       providers: () => sdk.provider.list({ location }),
+      provider: providerID => sdk.provider.get({ location, providerID }),
       models: () => sdk.model.list({ location }),
       integration: integrationID => sdk.integration.get({ location, integrationID }),
       connect: (integrationID, key) => sdk.integration.connect.key({ location, integrationID, key }),

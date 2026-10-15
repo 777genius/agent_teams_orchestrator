@@ -39,8 +39,46 @@ test('fresh official database skips legacy key import; native key attachment mak
     expect(connections()).toEqual([])
     expect(db.query("select id from migration where id='20260805200742_import_legacy_credentials'").get()).not.toBeNull()
     let posts = 0
+    let providerGets = 0
+    const location = { directory: f.profile.directory }
+    const selectedProvider = { id: 'groq', activation: 'auto' }
+    const visible = { providers: async () => ({ location, data: [] }) }
+    const exact = {
+      ...visible,
+      provider: async () => { providerGets++; return { location, data: selectedProvider } },
+    }
+    const strict = {
+      integration: async (id: string) =>
+        ({ location, data: { id, methods: [{ type: 'key' }], connections: connections() } }),
+      connect: async () => { posts++ },
+    }
+    for (const [changed, code] of [
+      ...['disabled', undefined, 'unexpected'].map(activation => [
+        { ...exact, ...strict, provider: async () => ({ location, data: { ...selectedProvider, integrationID: 'groq', activation } }) },
+        'execution_selected_auth_provider_unknown',
+      ] as const),
+      ...[null, '', 42].map(integrationID => [
+        { ...exact, ...strict, provider: async () => ({ location, data: { ...selectedProvider, integrationID } }) },
+        'execution_selected_auth_provider_unknown',
+      ] as const),
+      [{ ...exact, ...strict, provider: async () => ({ location, data: { ...selectedProvider, id: 'other' } }) },
+        'execution_selected_auth_provider_unknown'],
+      [{ ...exact, ...strict, provider: async () => ({ location, data: undefined }) },
+        'execution_selected_auth_provider_unknown'],
+      [{ ...exact, ...strict,
+        provider: async () => ({ location: { directory: f.profile.directory + '-other' }, data: selectedProvider }) },
+        'execution_selected_auth_location_changed'],
+      [{ ...exact, ...strict, providers: async () => ({ location, data: [selectedProvider, selectedProvider] }) },
+        'execution_selected_auth_provider_unknown'],
+      [{ ...exact, ...strict, integration: async () =>
+        ({ location, data: { id: 'groq', methods: [{ type: 'oauth' }], connections: [] } }) },
+        'execution_selected_auth_existing_or_unsupported'],
+    ] as const) {
+      await expect(attachOpenCodeV2SelectedKey(f.profile, changed)).rejects.toThrow(code)
+    }
+    expect(posts).toBe(0); expect(connections()).toEqual([]); expect(providerGets).toBe(1)
     await attachOpenCodeV2SelectedKey(f.profile, {
-      providers: async () => ({ location: { directory: f.profile.directory }, data: [{ id: 'groq', integrationID: 'groq' }] }),
+      ...exact,
       integration: async id => ({ location: { directory: f.profile.directory }, data: { id, methods: [{ type: 'key' }], connections: connections() } }),
       connect: async (id, key) => {
         expect(id).toBe('groq'); expect(key).toBe('TEST-DUMMY-KEY'); posts++
@@ -49,10 +87,11 @@ test('fresh official database skips legacy key import; native key attachment mak
       },
     })
     expect(posts).toBe(1); expect(connections()).toEqual([{ type: 'credential', id: 'cred_TESToriginal' }])
+    expect(providerGets).toBe(2)
     expect(await readFile(f.auth, 'utf8')).toBe(f.content)
     // Existing native connection never permits another POST or replacement.
     await expect(attachOpenCodeV2SelectedKey(f.profile, {
-      providers: async () => ({ location: { directory: f.profile.directory }, data: [{ id: 'groq', integrationID: 'groq' }] }),
+      ...exact,
       integration: async id => ({ location: { directory: f.profile.directory }, data: { id, methods: [{ type: 'key' }], connections: connections() } }),
       connect: async () => { posts++; },
     })).rejects.toThrow('execution_selected_auth_existing_or_unsupported')
