@@ -2948,7 +2948,8 @@ static void assertSharedReadRootsLive(const Scope &scope);
 static void assertAncestorMetadataLive(const Scope &scope);
 struct RetainedAncestorMetadata {
   RetainedAnchorComponent anchor;
-  // Retain intent before the named write, including an indeterminate failure.
+  // Retain intent before the named write, including an indeterminate failure;
+  // replace it with measured custody only after every post-write check passes.
   std::vector<BYTE> originalDescriptor;
   explicit RetainedAncestorMetadata(Handle held) : anchor(std::move(held)) {}
 };
@@ -3457,11 +3458,22 @@ static AncestorMetadataAcl ancestorMetadataAcl(HANDLE file, PSID package, const 
   return ancestorMetadataAcl(std::vector<BYTE>(bytes, bytes + GetSecurityDescriptorLength(descriptor)),
                               package, code);
 }
+static bool ancestorMetadataControlAfterOwnWrite(SECURITY_DESCRIPTOR_CONTROL before,
+                                                  SECURITY_DESCRIPTOR_CONTROL after) {
+  // Native probe 38742106536 observed 0x9404 -> 0x9004 after SetFileSecurityW:
+  // the DACL loses only its historical AUTO_INHERITED marker. Protection
+  // and every other bit stay exact, including on unprotected ancestors.
+  constexpr auto required = SE_DACL_PRESENT | SE_DACL_AUTO_INHERITED;
+  return before == after || ((before & required) == required &&
+                             after == (before & ~SE_DACL_AUTO_INHERITED));
+}
 static void assertAncestorMetadataAuthority(const AncestorMetadataAcl &before,
-                                             const AncestorMetadataAcl &after, const char *code) {
+                                             const AncestorMetadataAcl &after, const char *code,
+                                             bool afterOwnWrite = false) {
   require(before.owner == after.owner, code, "ancestor_metadata_owner");
   require(before.group == after.group, code, "ancestor_metadata_group");
-  if (before.control != after.control)
+  if (before.control != after.control &&
+      !(afterOwnWrite && ancestorMetadataControlAfterOwnWrite(before.control, after.control)))
     throw NativeError{code, (static_cast<DWORD>(before.control) << 16) |
                                static_cast<DWORD>(after.control), "ancestor_metadata_control"};
 }
@@ -3562,9 +3574,10 @@ static void changeAncestorMetadata(Scope &scope, RetainedAncestorMetadata &ances
   require(anchorIdentity(handle.value).Stringify() == ancestor.anchor.identity.Stringify(),
           code, "ancestor_metadata_identity");
   const auto after = ancestorMetadataAcl(handle.value, scope.sid.value, code);
-  assertAncestorMetadataAuthority(before, after, code);
+  assertAncestorMetadataAuthority(before, after, code, true);
   require(after.foreignAces == before.foreignAces, code, "ancestor_metadata_foreign");
   require(after.memberAllowed == grant, code, "ancestor_metadata_member");
+  ancestor.originalDescriptor = after.descriptor;
 }
 static void grantAncestorMetadata(Scope &scope) {
   for (const auto &root : scope.realpathAnchors) {

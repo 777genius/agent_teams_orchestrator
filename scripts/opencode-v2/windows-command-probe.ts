@@ -22,6 +22,7 @@ const ancestorSibling = path.join(ancestorRoot, 'ungranted-sibling')
 const ancestorSecret = path.join(ancestorSibling, 'secret.txt')
 const ancestorAclPaths = [ancestorRoot, ancestorSibling, ancestorSecret]
 let ancestorAclBaseline: Record<string, unknown>[] | undefined
+let ancestorControlObserved: number | undefined
 const profileRoot = path.join(root, 'opencode', 'v2', 'profiles', 'TEST-prepared')
 const databasePath = path.join(profileRoot, 'data', 'opencode', 'opencode.db')
 const profileChildren = ['home', 'config', 'data', 'cache', 'state', 'tmp', 'appdata', 'localappdata', 'config/opencode', 'data/opencode'].map(value => path.join(profileRoot, value))
@@ -131,10 +132,20 @@ if($ace -isnot [Security.AccessControl.CommonAce]){throw 'TEST unexpected ACE ty
   assert.ok(Array.isArray(rows)); assert.equal(rows.length, ancestorAclPaths.length)
   return rows.map((value: unknown, index: number) => { const row = record(value); assert.equal(row.path, ancestorAclPaths[index]); assert.ok(Array.isArray(row.aces)); return row })
 }
-async function assertAncestorAcls(granted: boolean): Promise<string> {
+async function assertAncestorAcls(granted: boolean): Promise<{ sha256: string; parentControl: number }> {
   assert.ok(sid && ancestorAclBaseline)
   const baseline = ancestorAclBaseline
   const rows = await readAncestorAcls()
+  const baselineControl = Number(baseline[0].control), parentControl = Number(rows[0].control)
+  const firstGrant = granted && ancestorControlObserved === undefined
+  let expectedControl = ancestorControlObserved ?? baselineControl
+  if (firstGrant) {
+    // SetFileSecurityW may clear this historical marker on its own first
+    // non-propagating write. Pin that actual result; never mask later changes.
+    assert.ok(parentControl === baselineControl ||
+      ((baselineControl & 0x404) === 0x404 && parentControl === (baselineControl & ~0x400)))
+    expectedControl = parentControl
+  }
   rows.forEach((row, index) => {
     const aces = (row.aces as unknown[]).map(record)
     const own = aces.filter(ace => ace.sid === sid)
@@ -143,9 +154,11 @@ async function assertAncestorAcls(granted: boolean): Promise<string> {
       assert.equal(own[0].type, 0); assert.equal(own[0].flags, 0)
       assert.equal(own[0].mask, 0x1200a9) // FILE_GENERIC_READ | FILE_GENERIC_EXECUTE, target only.
     }
-    assert.deepEqual({ ...row, aces: aces.filter(ace => ace.sid !== sid) }, baseline[index])
+    assert.deepEqual({ ...row, aces: aces.filter(ace => ace.sid !== sid) },
+      index === 0 ? { ...baseline[index], control: expectedControl } : baseline[index])
   })
-  return createHash('sha256').update(JSON.stringify(rows)).digest('hex')
+  if (firstGrant) ancestorControlObserved = parentControl
+  return { sha256: createHash('sha256').update(JSON.stringify(rows)).digest('hex'), parentControl }
 }
 const activeCommands = new Set<string>()
 async function start(script: string, stdin: 'ignore' | 'pipe') {
@@ -338,7 +351,8 @@ $sid
 `)
   assert.match(sid, /^S-1-15-2-/)
   ancestorAclBaseline = await readAncestorAcls()
-  facts.ancestorAclBeforeLaunchSHA256 = await assertAncestorAcls(false)
+  const ancestorBefore = await assertAncestorAcls(false)
+  facts.ancestorAclBeforeLaunchSHA256 = ancestorBefore.sha256
   stage = 'native-main-launch'; launched = true
   await fence.assertOwned()
   const mapping = record(await broker.request('launch', { executable: path.join(root, 'bun.exe'), entry: path.join(root, 'main.ts'), cwd: root, env: environment, writableRoots: [root, profileRoot, ancestorSelected], readOnlyRoots: [sharedReadRoot], protectedRoots: [fencePath], nonce, leaseOwnerId }))
@@ -353,7 +367,10 @@ $sid
   assert.equal(prepared.nonce, nonce); assert.equal(prepared.leaseOwnerId, leaseOwnerId)
   assert.deepEqual(prepared.birth, main.birth); assert.equal(prepared.namespace, mapping.namespace)
   stage = 'native-ancestor-boundary'
-  facts.ancestorAclDuringLaunchSHA256 = await assertAncestorAcls(true)
+  const ancestorDuring = await assertAncestorAcls(true)
+  facts.ancestorAclDuringLaunchSHA256 = ancestorDuring.sha256
+  facts.ancestorMetadataControl = { before: ancestorBefore.parentControl, observed: ancestorDuring.parentControl,
+    ownWriteClearedAutoInherited: ancestorBefore.parentControl !== ancestorDuring.parentControl }
   const boundary = await start(path.join(root, 'ancestor-boundary.ts'), 'ignore')
   const [boundaryOutput, boundaryError] = await Promise.all([output(boundary.commandId, 'stdout'), output(boundary.commandId, 'stderr')])
   assert.equal(boundaryOutput.toString(), 'ancestor-boundary-passed'); assert.equal(boundaryError.length, 0)
@@ -418,7 +435,7 @@ $sid
   assert.equal(await readFile(sharedReadFile, 'utf8'), 'TEST-readonly-vendor')
   facts.sharedReadOnlyReadPassed = true; facts.sharedReadOnlyWriteDenied = true
   facts.fileOutputPassed = true; facts.stdinEchoEofPassed = true; facts.descendantCancelPassed = true
-  assert.equal(await assertAncestorAcls(true), facts.ancestorAclDuringLaunchSHA256)
+  assert.equal((await assertAncestorAcls(true)).sha256, facts.ancestorAclDuringLaunchSHA256)
 } catch (error) { failure = error }
 finally {
   facts.failedStage = failure ? stage : undefined
@@ -445,8 +462,9 @@ finally {
       // Observe removal only after the existing held-process/empty-job proof.
       // The test never grants or removes any package SID ACE on ancestors.
       retirementPhase = 'ancestor_aces_removed'
-      facts.ancestorAclAfterRetirementSHA256 = await assertAncestorAcls(false)
-      assert.equal(facts.ancestorAclAfterRetirementSHA256, facts.ancestorAclBeforeLaunchSHA256)
+      const ancestorAfter = await assertAncestorAcls(false)
+      facts.ancestorAclAfterRetirementSHA256 = ancestorAfter.sha256
+      facts.ancestorMetadataControlAfterRetirement = ancestorAfter.parentControl
       facts.ancestorOwnAcesRemoved = true
       facts.ancestorOwnerForeignAndChildAclsPreserved = true
       retirementPhase = 'prepared_profile_aces_removed'
