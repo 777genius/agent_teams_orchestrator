@@ -127,10 +127,12 @@ export class OpenCodeV2AdmissionStore {
       executionAssert(Buffer.byteLength(canonicalExecutionJSON(s)) <= MAX_BYTES, 'store_full')
       await writeJsonFileAtomic(this.file, s, { mode: 0o600, assertCommitEligible: () => executionAssert(!compromised, 'lock_compromised') })
       // A sent journal must survive process death before the first request.
-      const handle = await open(this.file, 'r')
+      const handle = await open(this.file, process.platform === 'win32' ? 'r+' : 'r')
       try { await handle.sync() } finally { await handle.close() }
-      const directory = await open(this.directory, 'r')
-      try { await directory.sync() } finally { await directory.close() }
+      if (process.platform !== 'win32') {
+        const directory = await open(this.directory, 'r')
+        try { await directory.sync() } finally { await directory.close() }
+      }
       executionAssert(!compromised, 'lock_compromised')
       return structuredClone(result)
     } finally { await release() }

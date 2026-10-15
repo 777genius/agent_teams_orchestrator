@@ -1,7 +1,7 @@
 import { readOriginalTerminal, readExecutionCut } from './OpenCodeV2TerminalSettlement.js'
 import { describe, expect, test } from 'bun:test'
 import { createServer } from 'node:http'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { OpenCodeV2AdmissionStore } from './OpenCodeV2AdmissionStore.js'
@@ -64,6 +64,18 @@ async function setup(selectedAuthority = authority) {
 }
 
 describe('durable V2 admission ownership', () => {
+  test('host filesystem admission journal syncs on every transaction', async () => {
+    const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'TEST-journal-sync-')))
+    try {
+      const store = await OpenCodeV2AdmissionStore.open(root, authority)
+      await store.reserveSession()
+      await store.markCreation(0, 'submitting')
+      expect(await store.fenceStop()).toEqual([])
+      const snapshot = await store.snapshot()
+      expect(snapshot.tombstone).toBe(true)
+      expect(snapshot.creation).toEqual({ state: 'submitting', revision: 1 })
+    } finally { await rm(root, { recursive: true, force: true }) }
+  })
   test('opening a store retains original authority despite caller mutation during filesystem work', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'TEST-r237-store-authority-'))
     const selected = structuredClone({ ...authority, host: { ...authority.host }, model: { ...authority.model, variant: 'high' } })
