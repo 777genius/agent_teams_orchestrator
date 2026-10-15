@@ -76,6 +76,7 @@ async function inspect(label: string, executable: string) {
   const models = responses.models!.value?.models
   const checks = {
     statusSucceeded: responses.status!.code === 0,
+    viewSucceeded: responses.view!.code === 0,
     selectionDetected: Boolean(view?.runtime?.cliPath),
     exactVersion: view?.runtime?.version === '1.18.31',
     providerConnected: view?.providers?.some((item: Json) => item.providerId === 'deep-infra' && item.state === 'connected') === true,
