@@ -1,7 +1,8 @@
-import { test, expect } from 'bun:test'
-import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
+import { test, expect, spyOn } from 'bun:test'
+import { mkdir, mkdtemp, readdir, readFile, rm, lstat } from 'node:fs/promises'
 import path from 'node:path'
 import { tmpdir } from 'node:os'
+import * as privateDirectories from '../profile/OpenCodePrivateDirectories.js'
 import { recordOpenCodeV2ProviderFailure, retainOpenCodeV2InitializationPhase, type RunInitializationPhase } from './OpenCodeV2Diagnostics.js'
 
 test('startup diagnostics retain only finite native fields and reject payload-bearing or invalid frames', async () => {
@@ -140,6 +141,76 @@ test('owner initialization diagnostics retain only trusted finite sideband witho
     expect(rows.filter(row => row.initialization).every(row => row.category === 'invalid_response' && row.retainedOriginal)).toBe(true)
     expect(rows.filter(row => !row.initialization)).toHaveLength(7)
   } finally {
+    if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_DATA_HOME
+    else process.env.CLAUDE_MULTIMODEL_DATA_HOME = previous
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+// These check branch ordering and refusal only. The real native directory
+// custody and Windows file publication are qualified by the Windows source gate.
+test('Windows diagnostics await native directory admission before exclusive publication', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'TEST-v2-windows-diagnostics-'))
+  const previous = process.env.CLAUDE_MULTIMODEL_DATA_HOME
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform')!
+  const getuid = Object.getOwnPropertyDescriptor(process, 'getuid')
+  const directory = path.join(root, 'opencode/v2/provider-diagnostics')
+  let release!: () => void, entered!: () => void
+  const admission = new Promise<void>(resolve => { release = resolve })
+  const requested = new Promise<void>(resolve => { entered = resolve })
+  const prepare = spyOn(privateDirectories, 'ensureWindowsPrivateDirectories').mockImplementation(async directories => {
+    expect(directories).toEqual([directory])
+    entered()
+    await admission
+    await mkdir(directory, { recursive: true, mode: 0o700 })
+  })
+  let pending: Promise<void> | undefined
+  try {
+    process.env.CLAUDE_MULTIMODEL_DATA_HOME = root
+    Object.defineProperty(process, 'platform', { ...platform, value: 'win32' })
+    Object.defineProperty(process, 'getuid', { configurable: true, value: undefined })
+    pending = recordOpenCodeV2ProviderFailure('run-owner-initialization', new Error('execution_host_unavailable'), true)
+    await requested
+    expect(await lstat(directory).catch((error: NodeJS.ErrnoException) => error.code)).toBe('ENOENT')
+    release()
+    await pending
+    expect(prepare).toHaveBeenCalledTimes(1)
+    const names = await readdir(directory)
+    expect(names).toHaveLength(1)
+    const row = JSON.parse(await readFile(path.join(directory, names[0]!), 'utf8'))
+    expect(row.category).toBe('execution_host_unavailable')
+    expect(row.retainedOriginal).toBe(true)
+    expect(Object.keys(row).sort()).toEqual(['category', 'phase', 'recordedAt', 'retainedOriginal', 'schemaVersion'])
+  } finally {
+    release()
+    await pending
+    prepare.mockRestore()
+    Object.defineProperty(process, 'platform', platform)
+    if (getuid) Object.defineProperty(process, 'getuid', getuid)
+    else delete (process as { getuid?: unknown }).getuid
+    if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_DATA_HOME
+    else process.env.CLAUDE_MULTIMODEL_DATA_HOME = previous
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('Windows directory admission refusal emits nothing and cannot replace the original failure', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'TEST-v2-windows-diagnostics-refused-'))
+  const previous = process.env.CLAUDE_MULTIMODEL_DATA_HOME
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform')!
+  const original = new Error('execution_host_unavailable')
+  const before = Object.getOwnPropertyDescriptors(original)
+  const prepare = spyOn(privateDirectories, 'ensureWindowsPrivateDirectories').mockRejectedValue(new Error('execution_owner_not_private'))
+  try {
+    process.env.CLAUDE_MULTIMODEL_DATA_HOME = root
+    Object.defineProperty(process, 'platform', { ...platform, value: 'win32' })
+    await expect(recordOpenCodeV2ProviderFailure('run-owner-initialization', original, true)).resolves.toBeUndefined()
+    expect(prepare).toHaveBeenCalledTimes(1)
+    expect(await readdir(root)).toEqual([])
+    expect(Object.getOwnPropertyDescriptors(original)).toEqual(before)
+  } finally {
+    prepare.mockRestore()
+    Object.defineProperty(process, 'platform', platform)
     if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_DATA_HOME
     else process.env.CLAUDE_MULTIMODEL_DATA_HOME = previous
     await rm(root, { recursive: true, force: true })

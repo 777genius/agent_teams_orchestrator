@@ -4,6 +4,7 @@ import { mkdir, lstat, writeFile } from 'node:fs/promises'
 import { resolveClaudeMultimodelPaths } from '../OpenCodeManagedPaths.js'
 import { executionAssert } from './OpenCodeV2ExecutionContracts.js'
 import { readOpenCodeV2ProviderWireFailure } from '../transport/OpenCodeV2ProviderWire.js'
+import { ensureWindowsPrivateDirectories } from '../profile/OpenCodePrivateDirectories.js'
 
 const startupStages = new Set(['waiting-for-prepare', 'profile-validation', 'native-validation', 'graph-validation',
   'runtime-import', 'server-start', 'effect-import', 'selected-oauth-import', 'scope-acquisition', 'ready-identity'])
@@ -117,9 +118,15 @@ export async function recordOpenCodeV2ProviderFailure(phase: string, error: unkn
   const initialization = phase === 'run-owner-initialization' && error instanceof Error ? initializationFailures.get(error) : undefined
   try {
     const directory = path.join(resolveClaudeMultimodelPaths().data, 'opencode/v2/provider-diagnostics')
-    await mkdir(directory, { recursive: true, mode: 0o700 })
-    const info = await lstat(directory)
-    executionAssert(info.isDirectory() && !info.isSymbolicLink() && info.uid === process.getuid?.() && (info.mode & 0o077) === 0, 'provider_diagnostics_foreign')
+    if (process.platform === 'win32') {
+      await ensureWindowsPrivateDirectories([directory])
+    } else {
+      await mkdir(directory, { recursive: true, mode: 0o700 })
+      const info = await lstat(directory)
+      executionAssert(info.isDirectory() && !info.isSymbolicLink() && info.uid === process.getuid?.() && (info.mode & 0o077) === 0, 'provider_diagnostics_foreign')
+    }
+    // Nonsecret observational data only: this file is not native ownership or
+    // cleanup authority, even when an elevated Windows writer owns the file.
     await writeFile(path.join(directory, randomUUID() + '.json'), JSON.stringify({ schemaVersion: 1, phase, category, retainedOriginal,
       ...(operation ? { operation } : {}), ...(startup ? { startup } : {}), ...(acquisition ? { acquisition } : {}), ...(initialization ? { initialization } : {}), recordedAt: new Date().toISOString() }), { flag: 'wx', mode: 0o600 })
   } catch { /* Diagnostics cannot replace or retry the unresolved original operation. */ }
