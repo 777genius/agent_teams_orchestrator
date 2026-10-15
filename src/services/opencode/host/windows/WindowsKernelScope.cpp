@@ -575,7 +575,9 @@ struct RetainedRealpathDll {
                               FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                               FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
     require(static_cast<bool>(file), "execution_containment_dll_identity");
-    identity = fileObjectIdentity(file.value, owner, false);
+    identity = inRole("private_dll_owner", [&] {
+      return fileObjectIdentity(file.value, owner, false);
+    });
     SharedAclMutex aclMutex(identity);
     const auto before =
         aclCustody(file.value, owner, package, &cohortSids, "execution_containment_dll_identity");
