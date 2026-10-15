@@ -105,13 +105,49 @@ const privateProviderFailureCodes = new Set(['provider_missing', 'provider_key_m
   'execution_timeout', 'execution_owner_unknown', 'cleanup_unknown', 'selection_mismatch', 'authority_mismatch',
   'graph_mismatch', 'identity_mismatch', 'unqualified_version', 'invalid_response', 'invalid_model',
   'http_failure', 'transport_failure', 'media_type', 'deadline', 'authority_or_deadline', 'disposed'])
+// Exact native producer literals only; neither an arbitrary message nor a
+// syntactically plausible unknown stage is persisted as diagnostic data.
+const privateNativeFailureCodes = new Set([
+  'execution_cancelled', 'execution_containment_dll_identity', 'execution_containment_filesystem_denied',
+  'execution_containment_helper_closed', 'execution_containment_helper_failed', 'execution_containment_helper_identity',
+  'execution_containment_launcher_denied', 'execution_containment_pipe_denied', 'execution_containment_profile_denied',
+  'execution_containment_unavailable', 'execution_native_command_unknown', 'execution_native_stdio_owner_unknown',
+  'execution_native_timeout', 'execution_native_unknown', 'execution_owner_alias',
+  'execution_owner_archive_identity_mismatch', 'execution_owner_archive_path_mismatch', 'execution_owner_archive_reopen_identity_mismatch',
+  'execution_owner_archive_unknown', 'execution_owner_local_volume_required', 'execution_owner_metadata_budget',
+  'execution_owner_metadata_changed', 'execution_owner_metadata_invalid', 'execution_owner_metadata_missing',
+  'execution_owner_metadata_purpose_invalid', 'execution_owner_not_private', 'execution_owner_ntfs_required',
+  'execution_owner_path_invalid', 'execution_owner_prepared_invalid', 'execution_owner_prepared_purpose_invalid',
+  'execution_owner_read_only', 'execution_owner_unknown', 'execution_owner_write_through_pending'])
+const privateNativeFailureStages = new Set([
+  'owner_archive_nt_rename', 'owner_canonical_open', 'owner_directory_create',
+  'owner_directory_open', 'owner_identity_links', 'owner_identity_reparse',
+  'owner_identity_type', 'owner_metadata_cleanup', 'owner_metadata_open',
+  'owner_metadata_publish', 'owner_parent_duplicate', 'owner_prepared_create',
+  'owner_verification_open', 'private_acl_foreign_allow', 'private_acl_owner',
+  'private_acl_owner_run_data_root', 'private_acl_owner_run_leaf', 'private_acl_owner_run_opencode',
+  'private_acl_owner_run_runs', 'private_acl_owner_run_v2', 'private_image_open',
+  'private_image_protected_dacl', 'private_owner_acquire', 'private_owner_cohort',
+  'private_owner_controller_tasks', 'private_owner_controller_teams', 'private_owner_discover_selection',
+  'private_owner_reserve_selection', 'private_owner_selected_selection'])
+function nativeFailure(error: unknown): { category: string; native?: { stage: string; nativeCode: number } } | undefined {
+  if (!(error instanceof Error)) return undefined
+  if (privateNativeFailureCodes.has(error.message)) return { category: error.message }
+  const match = /^([a-z_]{1,96}):([a-z_]{1,64}):(0|[1-9][0-9]{0,9})$/.exec(error.message)
+  if (!match || !privateNativeFailureCodes.has(match[1]!)) return undefined
+  const nativeCode = Number(match[3])
+  if (!Number.isSafeInteger(nativeCode) || nativeCode > 0xffffffff) return undefined
+  return { category: match[1]!, ...(privateNativeFailureStages.has(match[2]!)
+    ? { native: { stage: match[2]!, nativeCode } } : {}) }
+}
 /** Private static phase/category only: never an arbitrary SDK message, body, credential or key. */
 export async function recordOpenCodeV2ProviderFailure(phase: string, error: unknown, retainedOriginal: boolean, startupOutput?: string, acquisitionTiming?: unknown): Promise<void> {
   // Only our finite cleanup wrappers may preserve one exact known cause.
   const cause = error instanceof Error && (error.message === 'cleanup_unknown' || error.message === 'execution_owner_unknown')
     ? error.cause : undefined
+  const native = nativeFailure(cause) ?? nativeFailure(error)
   const category = cause instanceof Error && privateProviderFailureCodes.has(cause.message) ? cause.message
-    : error instanceof Error && privateProviderFailureCodes.has(error.message) ? error.message : 'provider_operation_unknown'
+    : native?.category ?? (error instanceof Error && privateProviderFailureCodes.has(error.message) ? error.message : 'provider_operation_unknown')
   const operation = readOpenCodeV2ProviderWireFailure(error)
   const startup = startupDiagnostic(startupOutput)
   const acquisition = acquisitionDiagnostic(acquisitionTiming)
@@ -128,6 +164,6 @@ export async function recordOpenCodeV2ProviderFailure(phase: string, error: unkn
     // Nonsecret observational data only: this file is not native ownership or
     // cleanup authority, even when an elevated Windows writer owns the file.
     await writeFile(path.join(directory, randomUUID() + '.json'), JSON.stringify({ schemaVersion: 1, phase, category, retainedOriginal,
-      ...(operation ? { operation } : {}), ...(startup ? { startup } : {}), ...(acquisition ? { acquisition } : {}), ...(initialization ? { initialization } : {}), recordedAt: new Date().toISOString() }), { flag: 'wx', mode: 0o600 })
+      ...(native?.native ? { native: native.native } : {}), ...(operation ? { operation } : {}), ...(startup ? { startup } : {}), ...(acquisition ? { acquisition } : {}), ...(initialization ? { initialization } : {}), recordedAt: new Date().toISOString() }), { flag: 'wx', mode: 0o600 })
   } catch { /* Diagnostics cannot replace or retry the unresolved original operation. */ }
 }

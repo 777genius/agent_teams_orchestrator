@@ -216,3 +216,52 @@ test('Windows directory admission refusal emits nothing and cannot replace the o
     await rm(root, { recursive: true, force: true })
   }
 })
+
+test('native diagnostics retain only closed producer codes and stages with uint32 status', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'TEST-v2-native-diagnostics-'))
+  const previous = process.env.CLAUDE_MULTIMODEL_DATA_HOME
+  const secret = 'TEST_PRIVATE_NATIVE_PAYLOAD'
+  const cases: { error: Error; category: string; native?: { stage: string; nativeCode: number } }[] = [
+    { error: new Error('execution_owner_unknown:owner_canonical_open:32'), category: 'execution_owner_unknown',
+      native: { stage: 'owner_canonical_open', nativeCode: 32 } },
+    { error: new Error('execution_owner_not_private:private_acl_owner:0'), category: 'execution_owner_not_private',
+      native: { stage: 'private_acl_owner', nativeCode: 0 } },
+    { error: new Error('cleanup_unknown', { cause: new Error('execution_owner_not_private:private_owner_acquire:5') }),
+      category: 'execution_owner_not_private', native: { stage: 'private_owner_acquire', nativeCode: 5 } },
+    { error: new Error('execution_owner_unknown:unknown_private_stage:5'), category: 'execution_owner_unknown' },
+    { error: new Error('execution_native_timeout'), category: 'execution_native_timeout' },
+    { error: new Error('execution_owner_unknown:owner_canonical_open:4294967295'), category: 'execution_owner_unknown',
+      native: { stage: 'owner_canonical_open', nativeCode: 0xffffffff } },
+    ...['execution_owner_unknown:owner_canonical_open:4294967296',
+      'execution_owner_unknown:owner_canonical_open:-1', 'execution_owner_unknown:owner_canonical_open:1.5',
+      'execution_owner_unknown:owner_canonical_open:00', `execution_owner_unknown:${secret}:5`,
+      `${secret}:owner_canonical_open:5`, `execution_owner_unknown:owner_canonical_open:5:${secret}`]
+      .map(message => ({ error: new Error(message), category: 'provider_operation_unknown' })),
+    // Only the existing exact cleanup wrappers unwrap one cause, never arbitrary chains.
+    { error: new Error('unrelated', { cause: new Error('execution_owner_unknown:owner_canonical_open:32') }),
+      category: 'provider_operation_unknown' },
+    { error: new Error('cleanup_unknown', { cause: new Error('cleanup_unknown', {
+      cause: new Error('execution_owner_unknown:owner_canonical_open:32') }) }), category: 'cleanup_unknown' },
+  ]
+  try {
+    process.env.CLAUDE_MULTIMODEL_DATA_HOME = root
+    const directory = path.join(root, 'opencode/v2/provider-diagnostics')
+    for (const expected of cases) {
+      const before = await readdir(directory).catch(() => [] as string[])
+      await recordOpenCodeV2ProviderFailure('execution-host-startup', expected.error, true)
+      const added = (await readdir(directory)).filter(name => !before.includes(name))
+      expect(added).toHaveLength(1)
+      const bytes = await readFile(path.join(directory, added[0]!), 'utf8')
+      expect(bytes).not.toContain(secret)
+      expect(bytes).not.toContain('unknown_private_stage')
+      const row = JSON.parse(bytes)
+      expect(row.category).toBe(expected.category)
+      expect(row.native).toEqual(expected.native)
+      expect(row.retainedOriginal).toBe(true)
+    }
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_DATA_HOME
+    else process.env.CLAUDE_MULTIMODEL_DATA_HOME = previous
+    await rm(root, { recursive: true, force: true })
+  }
+})
