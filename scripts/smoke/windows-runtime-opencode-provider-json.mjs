@@ -18,6 +18,13 @@ export function actualProviderResult(payload, operation, binaryPath, exitCode = 
   const pending = Array.isArray(diagnostics) && diagnostics.some(value => typeof value === 'string' && value.includes('capabilities_pending'));
   const identityUnavailable = typeof payload?.error?.message === 'string' && /Selected OpenCode identity (?:is )?unavailable/.test(payload.error.message);
   const view = payload?.view, models = payload?.models;
+  const version = view?.runtime?.version;
+  const providerState = id => {
+    const entry = Array.isArray(view?.providers) ? view.providers.find(value => value?.providerId === id) : null;
+    if (!entry) return 'absent';
+    if (entry.state === 'not-connected') return 'disconnected';
+    return ['connected', 'available', 'error'].find(state => state === entry.state) ?? null;
+  };
   const qualifiedModelPresent = Array.isArray(models?.models) && models.models.some(value =>
     value?.providerId === actualProvider && value.modelId === `${actualProvider}/${actualModel}`);
   const passed = exitCode === 0 && payload?.runtimeId === 'opencode' && !payload.error && !pending && (operation === 'view'
@@ -29,6 +36,10 @@ export function actualProviderResult(payload, operation, binaryPath, exitCode = 
     runtimeIdPresent: payload?.runtimeId === 'opencode', viewPresent: !!view && typeof view === 'object',
     runtimeDetected: typeof view?.runtime?.cliPath === 'string', cliBinaryMatched: view?.runtime?.cliPath === binaryPath,
     versionMatched: view?.runtime?.version === '1.18.31',
+    versionClass: version === '1.18.31' ? 'expected' : version === 'opencode v1.18.31'
+      ? 'branded_expected' : version === null || version === undefined || version === '' ? 'absent' : 'other',
+    runtimeState: ['ready', 'needs-auth', 'needs-setup', 'degraded'].find(state => state === view?.runtime?.state) ?? null,
+    deepinfraState: providerState('deepinfra'), deepInfraDisplayState: providerState('deep-infra'),
     providerMatched: operation === 'view' ? Array.isArray(view?.providers) && view.providers.some(value => value?.providerId === actualProvider && value.state === 'connected') : models?.providerId === actualProvider,
     qualifiedModelPresent,
     errorCode: ['runtime-unhealthy', 'runtime-missing', 'provider-missing'].find(code => code === payload?.error?.code) ?? null };

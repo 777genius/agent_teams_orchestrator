@@ -263,12 +263,14 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
         }
         const additions = group.filter(row => !births.has(row.pid))
         if (additions.length && !anchor) {
-          const capturedRetirement = process.platform === 'win32' && closed && ended && code === 0 && !failure && !signal?.aborted &&
+          const capturedGone = process.platform === 'win32' && !failure && !signal?.aborted && (!ended || code === 0) &&
             [...births.keys()].every(target => target !== process.pid && target !== process.ppid && ports.alive(target) === 'gone')
-          if (process.platform !== 'win32' || births.size && !capturedRetirement) throw cleanupUnknown('anchor_missing')
+          if (process.platform !== 'win32' || births.size && !capturedGone) throw cleanupUnknown('anchor_missing')
           // A fast wrapper may close before birth capture, or leave a stale
           // census after its captured identities are independently gone.
-          // Waiting confers no signals; strict fresh full tables gate retirement.
+          // OS retirement may precede delivery of Node exit/close events.
+          // Waiting confers no signals; the original final close/exit checks
+          // and strict fresh full tables still gate successful retirement.
 
           unanchoredRetirement = true
           if (pid) unownedCandidates.add(pid)

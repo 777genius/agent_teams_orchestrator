@@ -32,6 +32,18 @@ test('actual provider comparison rejects static fallback and requires the select
   assert.equal(actualProviderResult(view, 'view', binary).passed, true);
   assert.equal(actualProviderResult(models, 'models', binary).passed, true);
   assert.equal(actualProviderResult(models, 'models', binary, 1).passed, false);
+  const diagnostic = structuredClone(view);
+  diagnostic.view.runtime.version = 'opencode v1.18.31';
+  diagnostic.view.runtime.state = 'ready';
+  diagnostic.view.providers = [{ providerId: 'deepinfra', state: 'available' },
+    { providerId: 'deep-infra', state: 'connected' }, { providerId: 'TEST-secret', state: 'TEST-secret' }];
+  const projected = actualProviderResult(diagnostic, 'view', binary);
+  assert.equal(projected.passed, false);
+  assert.equal(projected.versionClass, 'branded_expected');
+  assert.equal(projected.runtimeState, 'ready');
+  assert.equal(projected.deepinfraState, 'available');
+  assert.equal(projected.deepInfraDisplayState, 'connected');
+  assert.ok(!JSON.stringify(projected).includes('TEST-secret'));
   for (const mutate of [value => { value.view.runtime.cliPath = null; },
     value => { value.view.runtime.version = '1.19.0'; },
     value => { value.view.providers[0].state = 'available'; },
