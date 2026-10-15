@@ -60,7 +60,9 @@ function reportStartupFailure(reason: 'timeout' | 'failed', error?: unknown): vo
 }
 // A source graph can legitimately take more than 30 seconds under concurrent
 // startup. The owner still enforces its original shared initialization deadline.
-const startupTimer = setTimeout(() => { reportStartupFailure('timeout'); void close() }, 60_000)
+// Windows validates over 53,000 graph files after native setup; keep its
+// child watchdog inside the measured, shared 180-second initialization budget.
+const startupTimer = setTimeout(() => { reportStartupFailure('timeout'); void close() }, process.platform === 'win32' ? 120_000 : 60_000)
 function close(): Promise<void> {
   return closeWork ??= (async () => {
     if (!runtimeReady) reportStartupFailure('failed')
