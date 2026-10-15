@@ -301,6 +301,8 @@ export type OpenCodeRuntimeModelProofState = 'not_required' | 'needs_probe' | 'v
 export type RuntimeProviderModel = {
   modelId: string
   providerId: string
+  /** Absent/null is unknown; an explicit empty array declares no input support. */
+  declaredInputModalities?: readonly string[] | null
   displayName: string
   sourceLabel: string
   free: boolean

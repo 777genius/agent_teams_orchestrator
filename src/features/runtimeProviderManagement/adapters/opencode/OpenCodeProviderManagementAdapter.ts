@@ -1,5 +1,6 @@
 import { selectedProviderUsesOpenCodeV2, connectOpenCodeV2Provider, loadOpenCodeV2ProviderModels, testOpenCodeV2ProviderModel } from './OpenCodeV2ProviderManagement.js'
 import path from 'node:path'
+import { getOpenCodeModelDeclaredInputModalities } from '../../../../services/opencode/OpenCodeDeclaredInputModalities.js'
 import { getOpenCodeVersionProbeDiagnostics, OpenCodeVersionProbeCleanupError } from '../../../../services/opencode/compatibility/OpenCodeVersionProbe.js'
 
 import {
@@ -2914,6 +2915,9 @@ function buildRuntimeProviderModel(input: {
     modelId: input.modelId,
     providerId: input.providerId,
     displayName: nestedModelId || input.modelId,
+    declaredInputModalities: getOpenCodeModelDeclaredInputModalities(
+      input.inventory.modelMetadata?.find(metadata => metadata.id === input.modelId),
+    ),
     sourceLabel,
     free: isOpenCodeModelFree(input.modelId, input.inventory.modelMetadata),
     default: input.defaultModelId === input.modelId,

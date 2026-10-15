@@ -2,10 +2,23 @@ import { mkdtemp, readdir, readFile, rm, stat } from 'node:fs/promises'
 import path from 'node:path'
 import { tmpdir } from 'node:os'
 import { test, expect } from 'bun:test'
-import { openCodeV2ConnectionIDs, requireOpenCodeV2OwnedConnection, rollbackOpenCodeV2OwnedConnection, retireOpenCodeV2CatalogOwner, recordOpenCodeV2ProviderFailure } from './OpenCodeV2ProviderManagement.js'
+import { buildOpenCodeV2RuntimeProviderModel, openCodeV2ConnectionIDs, requireOpenCodeV2OwnedConnection, rollbackOpenCodeV2OwnedConnection, retireOpenCodeV2CatalogOwner, recordOpenCodeV2ProviderFailure } from './OpenCodeV2ProviderManagement.js'
 import type { OpenCodeAuthCredential } from '../../../../services/opencode/OpenCodeAuthStore.js'
 const empty = { id: 'groq', methods: [{ type: 'key' }], connections: [] }
 const connection = { ...empty, connections: [{ type: 'credential', id: 'cred_original', label: 'Groq' }] }
+test('V2 native model mapping carries array declarations without the legacy record interpretation or text fallback', () => {
+  const row = { id: 'Novel/ExactCase', name: 'Novel model', limit: { context: 32000, output: 4000 } }
+  const map = (capabilities?: unknown) => buildOpenCodeV2RuntimeProviderModel({ ...row, capabilities }, 'novel-provider', 'novel-provider/Novel/ExactCase')
+  expect(map({ input: ['text', 'image', 'video'] })).toMatchObject({
+    modelId: 'novel-provider/Novel/ExactCase', providerId: 'novel-provider', default: true,
+    declaredInputModalities: ['text', 'image', 'video'], catalogContextTokens: 32000, catalogOutputTokens: 4000,
+  })
+  expect(map({ input: [] }).declaredInputModalities).toEqual([])
+  for (const capabilities of [undefined, null, {}, { input: ['image', 1] }, { input: { image: true } }]) {
+    expect(map(capabilities).declaredInputModalities).toBeNull()
+  }
+})
+
 for (const pin of ['2.0.0', '2.0.21']) test(`${pin} actual public connection readback qualifies exact new ID without a fabricated active/secret field`, () => {
   const after = pin === '2.0.0' ? connection : { ...connection, connections: connection.connections.map(row => ({ ...row, method: 'key' })) }
   expect(requireOpenCodeV2OwnedConnection(empty, after, 'groq')).toBe('cred_original')
