@@ -3457,9 +3457,13 @@ static AncestorMetadataAcl ancestorMetadataAcl(HANDLE file, PSID package, const 
   return ancestorMetadataAcl(std::vector<BYTE>(bytes, bytes + GetSecurityDescriptorLength(descriptor)),
                               package, code);
 }
-static bool sameAncestorMetadataAuthority(const AncestorMetadataAcl &before,
-                                          const AncestorMetadataAcl &after) {
-  return before.owner == after.owner && before.group == after.group && before.control == after.control;
+static void assertAncestorMetadataAuthority(const AncestorMetadataAcl &before,
+                                             const AncestorMetadataAcl &after, const char *code) {
+  require(before.owner == after.owner, code, "ancestor_metadata_owner");
+  require(before.group == after.group, code, "ancestor_metadata_group");
+  if (before.control != after.control)
+    throw NativeError{code, (static_cast<DWORD>(before.control) << 16) |
+                               static_cast<DWORD>(after.control), "ancestor_metadata_control"};
 }
 static void retainMetadataAncestor(Scope &scope, Handle held) {
   const auto identity = anchorIdentity(held.value);
@@ -3481,8 +3485,8 @@ static void assertAncestorMetadataLive(const Scope &scope) {
                                               "execution_containment_filesystem_denied");
     const auto current = ancestorMetadataAcl(ancestor.anchor.handle.value, scope.sid.value,
                                              "execution_containment_filesystem_denied");
-    require(sameAncestorMetadataAuthority(original, current) && current.memberAllowed,
-            "execution_containment_filesystem_denied", "ancestor_metadata_changed");
+    assertAncestorMetadataAuthority(original, current, "execution_containment_filesystem_denied");
+    require(current.memberAllowed, "execution_containment_filesystem_denied", "ancestor_metadata_member");
   }
 }
 static void changeAncestorMetadata(Scope &scope, RetainedAncestorMetadata &ancestor, bool grant) {
@@ -3491,7 +3495,15 @@ static void changeAncestorMetadata(Scope &scope, RetainedAncestorMetadata &ances
           code, "ancestor_metadata_cleanup_unproven");
   SharedAclMutex mutex(ancestor.anchor.identity);
   assertAncestorMetadataPinsLive(scope);
-  auto handle = scopeAclDirectory(ancestor.anchor); // Explicit access, never MAXIMUM_ALLOWED/DELETE.
+  const auto path = extended(ancestor.anchor.path);
+  const HANDLE rawHandle = CreateFileW(path.c_str(), READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+      FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+  const DWORD openError = GetLastError();
+  Handle handle(rawHandle); // Explicit access, never MAXIMUM_ALLOWED/DELETE.
+  if (!handle) throw NativeError{code, openError, "ancestor_metadata_open"};
+  require(anchorIdentity(handle.value).Stringify() == ancestor.anchor.identity.Stringify(),
+          code, "ancestor_metadata_identity");
   const auto before = ancestorMetadataAcl(handle.value, scope.sid.value, code);
   if (grant) {
     require(ancestor.originalDescriptor.empty() && !before.memberAllowed, code, "ancestor_metadata_package");
@@ -3499,7 +3511,7 @@ static void changeAncestorMetadata(Scope &scope, RetainedAncestorMetadata &ances
   } else {
     require(!ancestor.originalDescriptor.empty(), code, "ancestor_metadata_intent");
     const auto original = ancestorMetadataAcl(ancestor.originalDescriptor, scope.sid.value, code);
-    require(sameAncestorMetadataAuthority(original, before), code, "ancestor_metadata_changed");
+    assertAncestorMetadataAuthority(original, before, code);
     if (!before.memberAllowed) return; // A failed named write may have had no effect.
   }
   PACL previous = nullptr;
@@ -3550,8 +3562,9 @@ static void changeAncestorMetadata(Scope &scope, RetainedAncestorMetadata &ances
   require(anchorIdentity(handle.value).Stringify() == ancestor.anchor.identity.Stringify(),
           code, "ancestor_metadata_identity");
   const auto after = ancestorMetadataAcl(handle.value, scope.sid.value, code);
-  require(sameAncestorMetadataAuthority(before, after) && after.foreignAces == before.foreignAces &&
-              after.memberAllowed == grant, code, "ancestor_metadata_changed");
+  assertAncestorMetadataAuthority(before, after, code);
+  require(after.foreignAces == before.foreignAces, code, "ancestor_metadata_foreign");
+  require(after.memberAllowed == grant, code, "ancestor_metadata_member");
 }
 static void grantAncestorMetadata(Scope &scope) {
   for (const auto &root : scope.realpathAnchors) {

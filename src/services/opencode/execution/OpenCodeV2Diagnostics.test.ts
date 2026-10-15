@@ -236,6 +236,9 @@ test('native diagnostics retain only closed producer codes and stages with uint3
       'shared_acl_mutex_encoding', 'shared_acl_mutex_authority', 'shared_acl_mutex_wait', 'shared_acl_mutex']
       .map(stage => ({ error: new Error(`execution_containment_filesystem_denied:${stage}:5`),
         category: 'execution_containment_filesystem_denied', native: { stage, nativeCode: 5 } })),
+    ...['ancestor_metadata_control', 'ancestor_metadata_foreign', 'ancestor_metadata_group', 'ancestor_metadata_member', 'ancestor_metadata_open', 'ancestor_metadata_owner', 'ancestor_metadata_ace', 'ancestor_metadata_descriptor', 'ancestor_metadata_security', 'ancestor_metadata_package', 'ancestor_metadata_read', 'ancestor_metadata_changed', 'ancestor_metadata_cleanup_unproven', 'ancestor_metadata_intent', 'ancestor_metadata_acl_size', 'ancestor_metadata_acl', 'ancestor_metadata_write', 'ancestor_metadata_identity', 'ancestor_metadata_pin']
+      .map(stage => ({ error: new Error(`execution_containment_filesystem_denied:${stage}:5`),
+        category: 'execution_containment_filesystem_denied', native: { stage, nativeCode: 5 } })),
     { error: new Error('execution_owner_unknown:owner_canonical_open:32'), category: 'execution_owner_unknown',
       native: { stage: 'owner_canonical_open', nativeCode: 32 } },
     { error: new Error('execution_owner_not_private:private_acl_owner:0'), category: 'execution_owner_not_private',
