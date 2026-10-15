@@ -15,7 +15,8 @@ function startupDiagnostic(output: string | undefined) {
     try {
       const row = JSON.parse(line) as Record<string, unknown>
       if (!row || Array.isArray(row) || !['elapsedMs,event,reason,stage', 'elapsedMs,event,history,reason,stage',
-        'elapsedMs,event,graph,reason,stage', 'elapsedMs,event,graph,history,reason,stage'].includes(Object.keys(row).sort().join(',')) ||
+        'elapsedMs,event,graph,reason,stage', 'elapsedMs,event,graph,history,reason,stage'].includes(Object.keys(row).filter(key => key !== 'nativeExitCode').sort().join(',')) ||
+        ('nativeExitCode' in row && (!Number.isSafeInteger(row.nativeExitCode) || Number(row.nativeExitCode) < 0 || Number(row.nativeExitCode) > 0xffffffff)) ||
         row.event !== 'opencode-v2-startup' || typeof row.reason !== 'string' || !['timeout', 'failed'].includes(row.reason) ||
         typeof row.stage !== 'string' || !startupStages.has(row.stage) ||
         !Number.isSafeInteger(row.elapsedMs) || Number(row.elapsedMs) < 0 || Number(row.elapsedMs) > 86_400_000) continue
@@ -44,6 +45,7 @@ function startupDiagnostic(output: string | undefined) {
         graph = { phase: value.phase, completed: Number(value.completed), total: Number(value.total) }
       }
       return { reason: row.reason, stage: row.stage, elapsedMs: row.elapsedMs,
+        ...('nativeExitCode' in row ? { nativeExitCode: Number(row.nativeExitCode) } : {}),
         ...('history' in row ? { history } : {}), ...(graph ? { graph } : {}) }
     } catch { /* Arbitrary native output is never a diagnostic payload. */ }
   }

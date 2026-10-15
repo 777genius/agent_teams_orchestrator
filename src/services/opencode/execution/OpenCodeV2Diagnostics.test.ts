@@ -33,7 +33,8 @@ test('startup diagnostics retain only finite native fields and reject payload-be
     { ...graph, path: secret }, { ...graph, completed: -1 }, { ...graph, completed: 0.5 },
     { ...graph, completed: 101 }, { ...graph, total: 0 }, { ...graph, total: 65_537 },
     { ...graph, completed: Number.MAX_SAFE_INTEGER + 1 }, { ...closure, completed: 99 }]
-  const frames = [valid, historical, windowsFrame, { ...valid, graph }, { ...historical, graph: closure },
+  const frames = [valid, historical, windowsFrame, { ...windowsFrame, nativeExitCode: 0xc0000135 },
+    { ...windowsFrame, nativeExitCode: secret }, { ...windowsFrame, nativeExitCode: -1 }, { ...valid, graph }, { ...historical, graph: closure },
     ...invalidGraph.map(graph => ({ ...historical, graph })), ...invalidHistory.map(history => ({ ...valid, history })),
     { ...historical, body: secret },
     { ...valid, body: secret }, { ...valid, stage: secret },
@@ -74,8 +75,9 @@ test('startup diagnostics retain only finite native fields and reject payload-be
       { reason: 'timeout', stage: 'graph-validation', elapsedMs: 30_123, graph },
       { reason: 'timeout', stage: 'graph-validation', elapsedMs: 30_123, history, graph: closure },
       { reason: 'failed', stage: 'windows-assert', elapsedMs: 10, history: windowsHistory },
+      { reason: 'failed', stage: 'windows-assert', elapsedMs: 10, history: windowsHistory, nativeExitCode: 0xc0000135 },
     ]))
-    expect(rows.filter(row => row.startup)).toHaveLength(5)
+    expect(rows.filter(row => row.startup)).toHaveLength(6)
   } finally {
     if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_DATA_HOME
     else process.env.CLAUDE_MULTIMODEL_DATA_HOME = previous

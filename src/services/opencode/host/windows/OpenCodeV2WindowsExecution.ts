@@ -343,6 +343,10 @@ export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, l
       child.emit('message', value)
     } catch { child.emit('error', new Error('execution_invalid_response')) }
   })
+  let heldMainExitCode: number | undefined
+  child.on('close', code => {
+    if (Number.isSafeInteger(code) && code >= 0 && code <= 0xffffffff) heldMainExitCode = code
+  })
   const launchStarted = Date.now()
   const launchHistory: { stage: string; elapsedMs: number }[] = []
   const launchStages = ['windows-cohort', 'windows-profile', 'windows-roots', 'windows-dll',
@@ -374,6 +378,7 @@ export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, l
     output: () => ({ stdout: '', stderr: launchHistory.length === 0 ? '' : JSON.stringify({
       event: 'opencode-v2-startup', reason: 'failed', stage: launchHistory.at(-1)!.stage,
       elapsedMs: Math.max(launchHistory.at(-1)!.elapsedMs, Date.now() - launchStarted), history: launchHistory,
+      ...(heldMainExitCode === undefined ? {} : { nativeExitCode: heldMainExitCode }),
     }) }),
     prepare(deadline: number, signal?: AbortSignal): Promise<WindowsExecutionMapping> {
       return preparation ??= (async () => {
