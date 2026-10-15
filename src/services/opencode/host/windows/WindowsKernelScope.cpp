@@ -3245,24 +3245,37 @@ struct Scope {
       else require(ready == WAIT_OBJECT_0 + 1, "execution_identity_unknown");
     } else require(waited == WAIT_OBJECT_0 + 1, "execution_identity_unknown");
   }
+  void retirementProgress(const char *phase) const noexcept {
+    try {
+      JsonObject value;
+      str(value, L"nonce", launchNonce);
+      str(value, L"phase", wide(phase));
+      event(L"retireProgress", value);
+    } catch (...) { /* Progress cannot alter physical cleanup or its evidence. */ }
+  }
   JsonObject retire() {
     stopping = true;
+    retirementProgress("retire_job");
     inRetirementPhase("retire_job", [&] {
       SetEvent(cancel.value);
       CancelIoEx(pipe.value, nullptr);
       require(TerminateJobObject(job.value, 99) != 0, "cleanup_unknown");
     });
+    retirementProgress("retire_wait");
     inRetirementPhase("retire_wait", [&] {
       ULONGLONG deadline = GetTickCount64() + 12000;
       while ((!exited() || active() != 0) && GetTickCount64() < deadline)
         Sleep(10);
       require(exited() && active() == 0, "cleanup_unknown");
     });
+    retirementProgress("retire_io_join");
     inRetirementPhase("retire_io_join", [&] {
       if (reader.joinable()) reader.join();
       if (mainExit.joinable()) mainExit.join();
     });
+    retirementProgress("retire_main_exit");
     inRetirementPhase("retire_main_exit", [&] { publishMainExit(); });
+    retirementProgress("retire_owned_pair");
     inRetirementPhase("retire_owned_pair", [&] {
       if (ownedPairControl) {
         auto closed = ownedPairControl->shutdown();
@@ -3272,11 +3285,13 @@ struct Scope {
         ownedPairClosed = true;
       }
     });
+    retirementProgress("retire_commands");
     inRetirementPhase("retire_commands", [&] { if (commands) commands->retireAll(); });
     inputFile.reset();
     outputFile.reset();
     errorFile.reset();
     spool.reset();
+    retirementProgress("retire_receipt");
     return inRetirementPhase("retire_receipt", [&] {
       JsonObject value;
       flag(value, L"empty", true);
@@ -5334,6 +5349,7 @@ int wmain(int argc, wchar_t **argv) {
         } else if (operation == L"retire") {
           require(static_cast<bool>(scope), "cleanup_unknown");
           value = scope->retire();
+          scope->retirementProgress("retire_grants");
           inRetirementPhase("retire_grants", [&] { removeGrants(*scope); });
           flag(value, L"ownAcesRemoved", true);
         } else

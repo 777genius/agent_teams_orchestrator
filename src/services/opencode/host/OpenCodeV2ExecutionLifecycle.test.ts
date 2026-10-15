@@ -18,7 +18,7 @@ if (isolatedBirthProbe) mock.module('./windows/OpenCodeV2WindowsNativeBroker.js'
   requireWindowsRealpathArtifact: () => undefined,
 }))
 const { isExecutionCleanupReceipt, retireExecutionChild } = await import('./OpenCodeV2ExecutionLifecycle.js')
-const { createWindowsCommandRequestHandler, createWindowsCommandRequestReplay, observeWindowsHeldMainExit, windowsBirth } = await import('./windows/OpenCodeV2WindowsExecution.js')
+const { createWindowsCommandRequestHandler, createWindowsCommandRequestReplay, observeWindowsHeldMainExit, retireWindowsNativeScope, windowsBirth } = await import('./windows/OpenCodeV2WindowsExecution.js')
 const { readExecutionBirth } = await import('./OpenCodeV2ExecutionBinding.js')
 
 async function runIsolatedBirthProbe(name: string): Promise<void> {
@@ -208,6 +208,27 @@ test('closing Windows command handler drains retained commands and refuses new w
   await expect(handler({ ...packet('commandClose'), nonce: 'TEST-foreign' })).resolves.toBeUndefined()
   await expect(handler(retire)).resolves.toBeUndefined()
   expect(failed).toBe(2)
+})
+
+test('native retirement timeout retains only the original nonce and finite cleanup progress', async () => {
+  const events = new EventEmitter(), original = new Error('execution_native_timeout')
+  const request = async (operation: string) => {
+    expect(operation).toBe('retire')
+    events.emit('retireProgress', { nonce: 'TEST-original', phase: 'retire_grants' })
+    for (const value of [{ nonce: 'TEST-foreign', phase: 'retire_wait' },
+      { nonce: 'TEST-original', phase: 'TEST_PRIVATE_PAYLOAD' },
+      { nonce: 'TEST-original', phase: 'retire_wait', body: 'TEST_PRIVATE_PAYLOAD' }]) events.emit('retireProgress', value)
+    throw original
+  }
+  const error = await retireWindowsNativeScope({ events, request }, 'TEST-original').then(() => undefined, error => error)
+  expect(error?.message).toBe('execution_native_timeout:retire_grants:0')
+  expect(error?.cause).toBe(original)
+  expect(events.listenerCount('retireProgress')).toBe(0)
+  const failure = new Error('cleanup_unknown:retire_wait:0')
+  await expect(retireWindowsNativeScope({ events, request: async () => { throw failure } }, 'TEST-original')).rejects.toBe(failure)
+  const receipt = { empty: true }
+  expect(await retireWindowsNativeScope({ events, request: async () => receipt }, 'TEST-original')).toBe(receipt)
+  expect(events.listenerCount('retireProgress')).toBe(0)
 })
 
 

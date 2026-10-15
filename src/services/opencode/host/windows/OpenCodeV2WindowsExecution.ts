@@ -101,6 +101,27 @@ export function createWindowsCommandRequestHandler(options: Readonly<{
     } finally { if (id && authority) replay.settle(id, authority) }
   }
 }
+/** Progress is diagnostic only and belongs to the original launch nonce. It
+ * cannot qualify a receipt or extend the existing native request deadline. */
+export async function retireWindowsNativeScope(broker: Pick<WindowsNativeBroker, 'events' | 'request'>,
+  nonce: string): Promise<unknown> {
+  const phases = new Set(['retire_job', 'retire_wait', 'retire_io_join', 'retire_main_exit',
+    'retire_owned_pair', 'retire_commands', 'retire_receipt', 'retire_grants'])
+  let phase: string | undefined
+  const progress = (value: unknown) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return
+    const record = value as Record<string, unknown>
+    if (Object.keys(record).sort().join(',') === 'nonce,phase' && record.nonce === nonce &&
+      typeof record.phase === 'string' && phases.has(record.phase)) phase = record.phase
+  }
+  broker.events.on('retireProgress', progress)
+  try { return await broker.request('retire') }
+  catch (error) {
+    if (error instanceof Error && error.message === 'execution_native_timeout' && phase)
+      throw new Error(`execution_native_timeout:${phase}:0`, { cause: error })
+    throw error
+  } finally { broker.events.off('retireProgress', progress) }
+}
 /** Only the launch's native held-process event can close MAIN. Helper failure
  * remains an error and never supplies a MAIN exit code. */
 const mainStderrKinds = ['empty', 'entry_resolution', 'module_resolution', 'child_identity', 'child_pipe', 'access_denied', 'pipe_refused', 'pipe_missing', 'bun_error', 'unclassified', 'unavailable']
@@ -454,7 +475,7 @@ export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, l
     async kill() { stopped = true; await broker!.request('retire') },
     retire(): Promise<WindowsKernelRetirement> {
       return retirement ??= (async () => {
-        stopped = true; const observed = row(await launch), receipt = row(await broker!.request('retire'))
+        stopped = true; const observed = row(await launch), receipt = row(await retireWindowsNativeScope(broker!, nonce))
         assert(mapping && equal(receipt.mapping, observed) && receipt.empty === true && receipt.activeProcesses === 0 && receipt.heldProcessExited === true && receipt.ownedPairClosed === true && receipt.ownAcesRemoved === true, 'cleanup_unknown')
         const value = Object.freeze({ pid: mapping.bun.hostPID, birth: mapping.bun.birth, mapping, scopeClosed: closed, activeProcesses: 0 as const, heldProcessExited: true as const, ownAcesRemoved: true as const })
         retirements.add(value); return value
