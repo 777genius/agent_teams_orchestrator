@@ -1151,8 +1151,8 @@ private:
   }
   static FILETIME runControlBirth(HANDLE process) {
     FILETIME creation{}, exitTime{}, kernel{}, user{};
-    require(GetProcessTimes(process, &creation, &exitTime, &kernel, &user) != 0,
-            "run_control_process_identity");
+    if (!GetProcessTimes(process, &creation, &exitTime, &kernel, &user))
+      throw NativeError{"run_control_process_identity", GetLastError(), "process_birth"};
     return creation;
   }
   static bool runControlAlive(HANDLE process) {
@@ -1161,8 +1161,9 @@ private:
   static std::wstring runControlImagePath(HANDLE process) {
     std::vector<wchar_t> path(32768);
     DWORD size = static_cast<DWORD>(path.size());
-    require(QueryFullProcessImageNameW(process, 0, path.data(), &size) != 0 && size > 0,
-            "run_control_process_identity");
+    if (!QueryFullProcessImageNameW(process, 0, path.data(), &size))
+      throw NativeError{"run_control_process_identity", GetLastError(), "process_image_path"};
+    require(size > 0, "run_control_process_identity", "process_image_path");
     return std::wstring(path.data(), size);
   }
   static FilePin runControlProcessImagePin(HANDLE process) {
@@ -1173,7 +1174,8 @@ private:
     Handle image(CreateFileW(extended.c_str(), GENERIC_READ,
                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                             OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
-    require(static_cast<bool>(image), "run_control_process_identity");
+    if (!image)
+      throw NativeError{"run_control_process_identity", GetLastError(), "process_image_open"};
     auto pin = runControlObserveFile(image.value, false);
     pin.sha256 = runControlSha256(image.value);
     return pin;
@@ -1201,10 +1203,13 @@ private:
     return static_cast<std::uint64_t>(information.inheritedFromUniqueProcessId);
   }
   static ProcessPin runControlObserveProcess(HANDLE process) {
-    require(runControlAlive(process), "run_control_process_identity");
+    const DWORD status = WaitForSingleObject(process, 0);
+    if (status != WAIT_TIMEOUT)
+      throw NativeError{"run_control_process_identity", status == WAIT_FAILED ? GetLastError() : status,
+                        status == WAIT_FAILED ? "process_alive_wait" : "process_alive"};
     const FILETIME first = runControlBirth(process);
     const FILETIME second = runControlBirth(process);
-    require(runControlSameBirth(first, second), "run_control_process_identity");
+    require(runControlSameBirth(first, second), "run_control_process_identity", "process_birth_changed");
     ProcessPin pin;
     pin.pid = GetProcessId(process);
     pin.birth = first;
