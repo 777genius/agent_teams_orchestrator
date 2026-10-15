@@ -1,3 +1,4 @@
+import { openCodeBunVersion } from '../../../../constants/openCodeBunVersion.js'
 import { EventEmitter } from 'node:events'
 import { StringDecoder } from 'node:string_decoder'
 import { createConnection, type Socket } from 'node:net'
@@ -16,7 +17,7 @@ const authenticatedPrepares = new WeakMap<object, Record<string, unknown>>()
  * overriding process.send, process.on, fetch or the official package source. */
 export function windowsExecutionChildControl(): WindowsChildControl {
   if (owned) return owned
-  assert(process.platform === 'win32' && process.versions.bun === '1.3.11')
+  assert(process.platform === 'win32' && process.versions.bun === openCodeBunVersion())
   const pipe = process.env.OPENCODE_V2_WINDOWS_PIPE, nonce = process.env.OPENCODE_V2_WINDOWS_NONCE, lease = process.env.OPENCODE_V2_WINDOWS_LEASE
   assert(typeof nonce === 'string' && /^[a-f0-9-]{36}$/.test(nonce) && typeof lease === 'string' && /^[a-f0-9-]{36}$/.test(lease) && pipe === `\\\\.\\pipe\\agt-v2-${nonce}`)
   const events = new EventEmitter(), socket: Socket = createConnection(pipe)

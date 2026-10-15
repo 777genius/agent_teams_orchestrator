@@ -1,3 +1,4 @@
+import { openCodeBunVersion } from '../../../constants/openCodeBunVersion.js'
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { constants, type Dirent } from 'node:fs'
 import { chmod, lstat, mkdir, open, readFile, readdir, realpath, rename, unlink } from 'node:fs/promises'
@@ -139,7 +140,7 @@ async function windowsComposition(directory: string, select?: WindowsComposition
   if (existing) return existing
   if (!select) throw new Error('run_control_native_pending')
   const created = (async () => {
-    executionAssert(process.platform === 'win32' && process.versions.bun === '1.3.11', 'run_control_native_pending')
+    executionAssert(process.platform === 'win32' && process.versions.bun === openCodeBunVersion(), 'run_control_native_pending')
     // Concrete native composition is private to this module. Neither the
     // artifact nor a caller port can qualify a run or mint retained authority.
     const broker = createWindowsNativeBroker(await resolveWindowsNativeArtifact())
@@ -162,7 +163,7 @@ async function windowsComposition(directory: string, select?: WindowsComposition
   try { return await created } catch (error) { windowsRuns.delete(directory); throw error }
 }
 async function windowsDiscover(directory: string, dataRoot: string, teamId: string, runId: string): Promise<RunControlRecord | null> {
-  executionAssert(process.platform === 'win32' && process.versions.bun === '1.3.11', 'run_control_native_pending')
+  executionAssert(process.platform === 'win32' && process.versions.bun === openCodeBunVersion(), 'run_control_native_pending')
   const broker = createWindowsNativeBroker(await resolveWindowsNativeArtifact())
   broker.events.on('error', () => {})
   try {

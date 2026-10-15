@@ -1,3 +1,4 @@
+import { openCodeBunVersion } from '../constants/openCodeBunVersion.js'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { lstat, readFile, realpath } from 'node:fs/promises'
@@ -5,7 +6,7 @@ import { constants } from 'node:os'
 import path from 'node:path'
 
 export type PackagedOpenCodeDeliveryIdentity = Readonly<{
-  schema: 1; platform: string; arch: string; bunVersion: '1.3.11'
+  schema: 1; platform: string; arch: string; bunVersion: '1.3.11' | '1.4.3'
   bunSha256: string; entrySha256: string
 }>
 
@@ -16,7 +17,7 @@ export function isPackagedOpenCodeCommand(args: readonly string[]): boolean {
 export function validatePackagedOpenCodeIdentity(value: unknown): PackagedOpenCodeDeliveryIdentity {
   if (!value || typeof value !== 'object') throw new Error('packaged_opencode_delivery_identity_invalid')
   const row = value as Record<string, unknown>
-  if (row.schema !== 1 || row.bunVersion !== '1.3.11' || typeof row.platform !== 'string' ||
+  if (row.schema !== 1 || row.bunVersion !== openCodeBunVersion(String(row.platform)) || typeof row.platform !== 'string' ||
     typeof row.arch !== 'string' || ![row.bunSha256, row.entrySha256].every(v => typeof v === 'string' && /^[a-f0-9]{64}$/.test(v))) {
     throw new Error('packaged_opencode_delivery_identity_invalid')
   }

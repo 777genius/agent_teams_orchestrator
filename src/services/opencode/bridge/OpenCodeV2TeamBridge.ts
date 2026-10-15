@@ -1,3 +1,4 @@
+import { openCodeBunVersion } from '../../../constants/openCodeBunVersion.js'
 import path from 'node:path'
 import { canonicalizeOpenCodeProjectPath } from '../OpenCodeProfileManager.js'
 import { readOpenCodeAuthority, isKnownSessionStore, requireOpenCodeAuthority, type SessionStoreShape } from '../OpenCodeAuthorityStoreRead.js'
@@ -245,7 +246,7 @@ function refusal(envelope: BridgeEnvelope, started: number, message: string) {
  * Exported product defaults remain false; caller booleans cannot activate these capabilities. */
 export function openCodeV2SupportedSourcePredicate(status: Extract<RunControlResult, { kind: 'status' }>): boolean {
   try { classifyOpenCodeV2ExecutionDelivery(import.meta.url) } catch { return false }
-  return isExecutionPlatformAvailable() && process.versions.bun === '1.3.11' &&
+  return isExecutionPlatformAvailable() && process.versions.bun === openCodeBunVersion() &&
     status.qualification !== undefined && status.state === 'active' && status.deadline > Date.now() && status.members.length > 0 &&
     status.members.every(member => ['2.0.0', '2.0.21'].includes(member.pin) && member.state === 'accepted' &&
       member.originalSessionId === member.opencodeSessionId && member.originalSessionId === member.runtimeSessionId &&

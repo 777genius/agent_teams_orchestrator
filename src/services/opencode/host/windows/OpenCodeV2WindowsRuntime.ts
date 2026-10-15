@@ -1,3 +1,4 @@
+import { openCodeBunVersion } from '../../../../constants/openCodeBunVersion.js'
 import { createServer } from 'node:http'
 import { realpath, stat } from 'node:fs/promises'
 import path from 'node:path'
@@ -20,7 +21,7 @@ const CONTROL_ENV = /^OPENCODE_V2_/i
  * Environment comes from the private child composition, not an ambient merge. */
 export async function loadOpenCodeV2WindowsRuntime(pin: OpenCodeV2Pin, expectedModuleSha256: string,
   commands: WindowsCommandPort, profile: OwnedNativeProfile) {
-  requireValue(process.platform === 'win32' && process.versions.bun === '1.3.11')
+  requireValue(process.platform === 'win32' && process.versions.bun === openCodeBunVersion())
   requireValue(pin === '2.0.0' || pin === '2.0.21')
   requireValue(isWindowsCommandPort(commands))
   const trustedEnvironment = Object.freeze({ ...profile.env })

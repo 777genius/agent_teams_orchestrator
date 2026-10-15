@@ -1,3 +1,4 @@
+import { openCodeBunVersion } from '../constants/openCodeBunVersion.js'
 import { windowsExecutionChildControl } from '../services/opencode/host/windows/OpenCodeV2WindowsChildControl.js'
 import { prepareExecutionPlatformChild, readExecutionPlatformBirth } from '../services/opencode/host/OpenCodeV2ExecutionPlatform.js'
 import { pathToFileURL } from 'node:url'
@@ -83,7 +84,7 @@ async function start(input: Record<string, unknown>): Promise<void> {
   executionAssert(native.runtimeMode === delivery.runtimeMode && native.entrySha256 === delivery.entrySha256 &&
     native.generation === 'v2' &&
     (native.version === '2.0.0' || native.version === '2.0.21') && native.dialect === `v2-${native.version}` &&
-    process.versions.bun === '1.3.11', 'execution_identity_mismatch')
+    process.versions.bun === openCodeBunVersion(), 'execution_identity_mismatch')
   enterStartupStage('profile-validation')
   await validateExecutionProfile(profile); controller.signal.throwIfAborted()
   executionAssert(profile.directory === process.cwd() && process.env.PWD === profile.directory &&

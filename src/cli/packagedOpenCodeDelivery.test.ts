@@ -1,3 +1,4 @@
+import { openCodeBunVersion } from '../constants/openCodeBunVersion.js'
 import { afterAll, beforeAll, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
 import { copyFile, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises'
@@ -27,7 +28,7 @@ if(waiting){
 console.log(JSON.stringify({args:process.argv.slice(2),input,cwd:process.cwd(),marker:process.env.TEST_DELIVERY_MARKER,bun:process.execPath,...(waiting?{pid:process.pid,ready:true}:{})}));
 if(!waiting)process.exit(Number(process.env.TEST_DELIVERY_EXIT??0));`
   await writeFile(entry, content)
-  const identity = { schema: 1, platform: process.platform, arch: process.arch, bunVersion: '1.3.11',
+  const identity = { schema: 1, platform: process.platform, arch: process.arch, bunVersion: openCodeBunVersion(),
     bunSha256: sha(await readFile(bun)), entrySha256: sha(await readFile(entry)) }
   const source = path.join(root, 'frontdoor.ts')
   await writeFile(source, `import {runPackagedOpenCodeDelivery} from ${JSON.stringify(path.join(import.meta.dir,'packagedOpenCodeDelivery.ts'))};declare const IDENTITY:any;process.exit(await runPackagedOpenCodeDelivery(process.argv.slice(2),IDENTITY));`)

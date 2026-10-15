@@ -1,3 +1,4 @@
+import { openCodeBunVersion } from '../../src/constants/openCodeBunVersion.js'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { lstat, readdir, readFile, rename, symlink, writeFile } from 'node:fs/promises'
@@ -13,7 +14,7 @@ import { runControlDirectory } from '../../src/services/opencode/bridge/OpenCode
 // deletion, native model, provider, credential or user-project effects.
 assert.equal(process.platform, 'win32')
 assert.equal(process.arch, 'x64')
-assert.equal(process.versions.bun, '1.3.11')
+assert.equal(process.versions.bun, openCodeBunVersion())
 const requestedRoot = process.argv[2]
 assert.ok(requestedRoot && path.win32.isAbsolute(requestedRoot))
 assert.match(path.win32.basename(requestedRoot), /^TEST-windows-owner-[a-zA-Z0-9-]+$/)

@@ -1,3 +1,4 @@
+import { openCodeBunVersion } from '../../../constants/openCodeBunVersion.js'
 import { assertSelectedOpenCodeV2ControllerState, deriveSelectedOpenCodeV2ControllerState } from './OpenCodeV2Profile.js'
 import path from 'node:path'
 import { randomBytes, randomUUID } from 'node:crypto'
@@ -102,7 +103,7 @@ export async function prepareOwnedNativeExecutionPlan(validatedNative: Validated
   check()
   assertExecutionPlatformAvailable()
   executionAssert(native.generation === 'v2' && (native.version === '2.0.0' || native.version === '2.0.21') &&
-    native.dialect === `v2-${native.version}` && process.versions.bun === '1.3.11', 'execution_identity_mismatch')
+    native.dialect === `v2-${native.version}` && process.versions.bun === openCodeBunVersion(), 'execution_identity_mismatch')
   executionAssert([context.teamId, context.runId, context.laneId, context.memberId].every(value => value.length > 0))
   await validateExecutionProfile(profile); check()
   await canonicalExecutionDirectory(profile.directory); check(); progress?.('profile-validated')

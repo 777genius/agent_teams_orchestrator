@@ -1,3 +1,4 @@
+import { openCodeBunVersion } from '../../../constants/openCodeBunVersion.js'
 import { resolveOpenCodeV2ExecutionProbe } from './OpenCodeV2ExecutionProbe.js'
 import { parseOpenCodeExecutionProof } from '../OpenCodeExecutionProof.js'
 import type { OpenCodePreparedProfile } from '../types.js'
@@ -66,7 +67,7 @@ export function createOpenCodeV2SupervisorEnvironment(source: NodeJS.ProcessEnv 
 
 export async function inspectOpenCodeV2LaunchSelection(envelope: BridgeEnvelope) {
   assertExecutionPlatformAvailable()
-  executionAssert(process.versions.bun === '1.3.11', 'run_source_bun_required')
+  executionAssert(process.versions.bun === openCodeBunVersion(), 'run_source_bun_required')
   const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'run-owner')
   const selected = await inspectOpenCodeReadSelection()
   executionAssert(selected.native && selected.policy.generation === 'v2', 'run_selected_native_unknown')

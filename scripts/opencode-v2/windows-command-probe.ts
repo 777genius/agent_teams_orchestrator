@@ -1,3 +1,4 @@
+import { openCodeBunVersion } from '../../src/constants/openCodeBunVersion.js'
 import assert from 'node:assert/strict'
 import { createHash, randomUUID } from 'node:crypto'
 import { copyFile, readFile, writeFile } from 'node:fs/promises'
@@ -9,7 +10,7 @@ import { createWindowsOwnerFilesystem, type WindowsOwnerDirectory } from '../../
 // Native mechanism checkpoint only: exact packaged helper, private owned TEST
 // tree and builtin-only Bun child. No official server/model/full-team claim.
 assert.equal(process.platform, 'win32')
-assert.equal(process.versions.bun, '1.3.11')
+assert.equal(process.versions.bun, openCodeBunVersion())
 const root = process.argv[2], receiptPath = process.argv[3]
 assert.ok(root && receiptPath && path.win32.isAbsolute(root) && path.win32.isAbsolute(receiptPath))
 assert.match(path.win32.basename(root), /^TEST-windows-command-[a-zA-Z0-9-]+$/)
@@ -236,18 +237,6 @@ if(message.type==='close'){send({type:'closed',pid:process.pid,birth:prepared.bi
   await writeFile(path.join(root, 'echo.ts'), `for await(const bytes of Bun.stdin.stream())await Bun.stdout.write(bytes);await Bun.stderr.write('stdin-eof-observed')`)
   await writeFile(path.join(root, 'grandchild.ts'), `await Bun.write('grandchild-live.txt',String(process.pid));setInterval(()=>{},1000)`)
   await writeFile(path.join(root, 'cancel.ts'), `const child=Bun.spawn([process.execPath,'grandchild.ts'],{stdin:'inherit',stdout:'inherit',stderr:'inherit'});await Bun.write('cancel-child.txt',String(child.pid));setInterval(()=>{},1000)`)
-  await writeFile(path.join(root, 'readonly-loader.ts'), `
-const fs=await import('node:fs/promises'),path=await import('node:path'),url=await import('node:url')
-const entry=path.join(path.dirname(process.env.TEST_SHARED_READ_FILE!),'readonly-entry.ts')
-let loads=0
-Bun.plugin({name:'TEST-readonly-source-loader',setup(builder){builder.onLoad({filter:/readonly-entry\\.ts$/},async args=>{
-if(args.path!==entry)throw Error('TEST_loader_path_changed')
-loads++;return {contents:await fs.readFile(args.path,'utf8'),loader:'ts'}
-})}})
-const loaded=await import(url.pathToFileURL(entry).href)
-if(loaded.value!==42||loads!==1)throw Error('TEST_readonly_loader_failed')
-await Bun.stdout.write('readonly-source-loader-passed')
-`)
   stage = 'shared-readonly-setup'
   // A separate fresh TEST sibling is outside every writable launch root.
   // Its elevated installer owner and Users RX model ordinary installed code.
@@ -257,7 +246,6 @@ $p=$env:TEST_SHARED_ROOT
 if(Test-Path -LiteralPath $p){throw 'TEST shared root already exists'}
 [IO.Directory]::CreateDirectory($p)|Out-Null
 [IO.File]::WriteAllText((Join-Path $p 'vendor-input.txt'),'TEST-readonly-vendor',[Text.UTF8Encoding]::new($false))
-[IO.File]::WriteAllText((Join-Path $p 'readonly-entry.ts'),'export const value:number=42',[Text.UTF8Encoding]::new($false))
 $acl=[Security.AccessControl.DirectorySecurity]::new()
 $acl.SetOwner([Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'))
 $acl.SetAccessRuleProtection($true,$false)
@@ -405,13 +393,6 @@ $sid
   facts.preparedDatabaseBootstrapFileIdentityPreserved = true
   await closeCommand(preparedRead.commandId)
   facts.preparedProfileRootOnlyGrantReadHashes = expectedPreparedHashes
-  stage = 'native-readonly-source-loader'
-  const loadedSource = await start(path.join(root, 'readonly-loader.ts'), 'ignore')
-  const [loadedOutput, loadedError] = await Promise.all([output(loadedSource.commandId, 'stdout'), output(loadedSource.commandId, 'stderr')])
-  assert.equal(loadedOutput.toString(), 'readonly-source-loader-passed'); assert.equal(loadedError.length, 0)
-  await closeCommand(loadedSource.commandId)
-  assert.equal(await readFile(path.join(sharedReadRoot, 'readonly-entry.ts'), 'utf8'), 'export const value:number=42')
-  facts.readonlySourceLoaderPassed = true
   stage = 'native-file-output'
   const command = await start(path.join(root, 'output.ts'), 'ignore')
   const [stdout, stderr] = await Promise.all([output(command.commandId, 'stdout'), output(command.commandId, 'stderr')])

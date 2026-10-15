@@ -1,3 +1,4 @@
+import { openCodeBunVersion } from '../../../constants/openCodeBunVersion.js'
 import { retainOpenCodeV2InitializationPhase, type RunInitializationPhase } from '../execution/OpenCodeV2Diagnostics.js'
 import { captureOwnedV2ProbeAuthority, buildOwnedV2ProbeProof, type ProbeAuthority } from './OpenCodeV2ProbeProof.js'
 import { readOwnedControllerInbox, readOwnedControllerTools, type ControllerToolProof } from './OpenCodeV2ControllerTools.js'
@@ -518,7 +519,7 @@ export async function launchExplicitOpenCodeV2Run(plan: RunLaunchPlan): Promise<
   plan = structuredClone(plan)
   validateRunLaunchPlan(plan)
   assertExecutionPlatformAvailable()
-  executionAssert(process.versions.bun === '1.3.11', 'run_source_bun_required')
+  executionAssert(process.versions.bun === openCodeBunVersion(), 'run_source_bun_required')
   executionAssert(await realpath(plan.source.bunPath) === plan.source.bunPath && sha(await readFile(plan.source.bunPath)) === plan.source.bunSha256, 'run_source_changed')
   const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'run-owner')
   const entry = delivery.entryPath
@@ -569,7 +570,7 @@ export async function startOpenCodeV2RunSupervisor(plan: RunLaunchPlan, director
   plan = structuredClone(plan)
   validateRunLaunchPlan(plan)
   executionAssert(directory === runControlDirectory(plan.dataRoot, plan.binding.teamId, plan.binding.runId) &&
-    executionHash(plan.source.files) === sourceSha256 && process.versions.bun === '1.3.11' &&
+    executionHash(plan.source.files) === sourceSha256 && process.versions.bun === openCodeBunVersion() &&
     await realpath(process.execPath) === plan.source.bunPath && sha(await readFile(process.execPath)) === plan.source.bunSha256, 'run_source_changed')
   const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'run-owner')
   executionAssert(plan.members.every(member => member.native.runtimeMode === delivery.runtimeMode) &&

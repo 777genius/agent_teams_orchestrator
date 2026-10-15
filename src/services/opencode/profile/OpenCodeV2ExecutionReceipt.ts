@@ -1,3 +1,4 @@
+import { openCodeBunVersion } from '../../../constants/openCodeBunVersion.js'
 import path from 'node:path'
 import { resolveOpenCodeV2ExecutionDelivery } from '../host/OpenCodeV2ExecutionDelivery.js'
 import { assertExecutionPlatformAvailable } from '../host/OpenCodeV2ExecutionPlatform.js'
@@ -59,7 +60,7 @@ async function inspectOpenCodeV2WindowsPeExecutable(file: string, expectedName: 
 /** Read-only installed graph receipt; no server import, CLI execution, or output file. */
 export async function createOpenCodeV2ExecutionReceipt(_sourceRoot: string, identity: import('../compatibility/OpenCodeNativeIdentity.js').OpenCodeV2NativeIdentity, controller?: ExecutionMcpConfig): Promise<ValidatedExecutionNative> {
 assertExecutionPlatformAvailable()
-executionAssert(process.versions.bun === '1.3.11' && identity.generation === 'v2', 'source_bun_required')
+executionAssert(process.versions.bun === openCodeBunVersion() && identity.generation === 'v2', 'source_bun_required')
 const cli = await realpath(identity.executablePath), bun = await realpath(process.execPath), pin = identity.version
 const sha = async (file: string) => createHash('sha256').update(await readFile(file)).digest('hex')
 const cliSha256 = process.platform === 'win32'

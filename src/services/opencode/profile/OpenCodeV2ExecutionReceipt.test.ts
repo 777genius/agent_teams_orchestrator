@@ -1,3 +1,4 @@
+import { openCodeBunVersion } from '../../../constants/openCodeBunVersion.js'
 import { test, expect, mock } from 'bun:test'
 import path from 'node:path'
 import { tmpdir } from 'node:os'
@@ -263,7 +264,7 @@ async function callReceipt<T>(
   const bunVersion = Object.getOwnPropertyDescriptor(process.versions, 'bun')
   const originalWhich = Bun.which, originalResolve = Bun.resolveSync
   Object.defineProperty(process, 'platform', { ...platformDescriptor, value: platform })
-  Object.defineProperty(process.versions, 'bun', { configurable: true, value: '1.3.11' })
+  Object.defineProperty(process.versions, 'bun', { configurable: true, value: openCodeBunVersion() })
   Bun.which = which as typeof Bun.which
   Bun.resolveSync = ((name: string) => {
     const resolved = fixture.resolution[name as keyof typeof fixture.resolution]

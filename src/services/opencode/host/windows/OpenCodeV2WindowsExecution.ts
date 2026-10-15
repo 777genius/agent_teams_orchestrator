@@ -1,3 +1,4 @@
+import { openCodeBunVersion } from '../../../../constants/openCodeBunVersion.js'
 import { createHash, randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { readFile, realpath } from 'node:fs/promises'
@@ -171,7 +172,7 @@ function deferredWindowsControllerRoots(requested: Readonly<{ writableRoots: rea
 export async function planWindowsExecution(requested: Readonly<{
   bun: Readonly<{ path: string; sha256: string }>; entry: string; cwd: string; writableRoots: readonly string[]; readOnlyRoots: readonly string[]; protectedRoots?: readonly string[]; profileDirectories?: readonly string[]; readOnlyMounts?: readonly Readonly<{ source: string; target: string }>[]; env: Readonly<Record<string, string>>
 }>): Promise<WindowsLaunchPlan> {
-  assert(process.platform === 'win32' && process.arch === 'x64' && process.versions.bun === '1.3.11',
+  assert(process.platform === 'win32' && process.arch === 'x64' && process.versions.bun === openCodeBunVersion(),
     'execution_containment_runtime_pending')
   const input = structuredClone(requested)
   assert(await realpath(input.bun.path) === input.bun.path && await hash(input.bun.path) === input.bun.sha256, 'execution_identity_mismatch')
