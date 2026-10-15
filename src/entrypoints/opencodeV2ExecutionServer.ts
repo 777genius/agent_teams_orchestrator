@@ -99,6 +99,14 @@ async function start(input: Record<string, unknown>): Promise<void> {
     process.versions.bun === openCodeBunVersion(), 'execution_identity_mismatch')
   enterStartupStage('profile-validation')
   await validateExecutionProfile(profile); controller.signal.throwIfAborted()
+  // AppContainer reroutes its temporary/local-data environment at creation.
+  // Rebind only these observed OS overrides to the authenticated private profile
+  // before importing the official runtime; every environment check still runs.
+  if (process.platform === 'win32') for (const key of ['TMP', 'TEMP', 'LOCALAPPDATA', 'PATH'] as const) {
+    const value = profile.env[key]
+    assertExecutionProfile(typeof value === 'string', 'process_environment')
+    process.env[key] = value
+  }
   assertExecutionProfile(profile.directory === process.cwd(), 'process_cwd')
   assertExecutionProfile(process.env.PWD === profile.directory, 'process_pwd')
   const knownKeys = ['HOME', 'USERPROFILE', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME',
