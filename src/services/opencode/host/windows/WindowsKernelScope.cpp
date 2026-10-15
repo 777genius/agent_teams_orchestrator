@@ -4219,9 +4219,24 @@ public:
       // Run state mutates child records, never renames its directory. Keep the
       // original deny-delete sharing fence, without unused DELETE access that
       // can conflict with the filesystem's relative rename target-directory open.
-      run = create ? ownerDirectory(directory, true, owner, nullptr, nullptr, false)
-                   : canonicalDirectory(directory, FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL);
-      if (!create) directoryMode(run.value);
+      if (create) run = ownerDirectory(directory, true, owner, nullptr, nullptr, false);
+      else {
+        // FileModeInformation belongs to this HANDLE. A fresh discovery open
+        // must request the same write-through mode as the native creator.
+        const auto path = extended(directory);
+        const HANDLE raw = CreateFileW(path.c_str(), FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+            FILE_FLAG_WRITE_THROUGH | FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        const DWORD error = GetLastError();
+        run = Handle(raw);
+        if (!run) throw NativeError{"execution_owner_unknown", error, "owner_directory_open"};
+        FILE_ATTRIBUTE_TAG_INFO tag{};
+        require(GetFileInformationByHandleEx(run.value, FileAttributeTagInfo, &tag, sizeof(tag)) &&
+                    (tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+                    !(tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
+                    equalPath(finalPath(run.value), path), "execution_path_alias");
+        directoryMode(run.value);
+      }
     } catch (const NativeError &error) {
       if (!create && error.win32 == ERROR_FILE_NOT_FOUND)
         throw NativeError{"run_state_absent", error.win32, "run_state_directory"};
