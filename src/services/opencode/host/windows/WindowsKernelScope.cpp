@@ -393,6 +393,8 @@ struct RetainedAnchorComponent {
   JsonObject identity;
   bool sharedRoot = false;
   bool cohortPolicy = false;
+  std::wstring sharedOwnerSid;
+  SECURITY_DESCRIPTOR_CONTROL sharedDaclControl = 0;
   explicit RetainedAnchorComponent(Handle owned, bool shared = false,
                                    bool cohort = false)
       : handle(std::move(owned)), identity(anchorIdentity(handle.value)), sharedRoot(shared),
@@ -2850,6 +2852,7 @@ struct NativeSelfImageCustody {
 };
 struct Scope;
 static void removeGrants(Scope &scope);
+static void assertSharedReadRootsLive(const Scope &scope);
 struct Scope {
   Handle job, process, thread, pipe, cancel, readerFinished, spool, inputFile, outputFile, errorFile;
   std::unique_ptr<NativeCommandStore> commands;
@@ -2872,6 +2875,7 @@ struct Scope {
     require(!stopping, "execution_identity_mismatch");
     for (const auto &anchor : realpathAnchors)
       anchor.assertLive();
+    assertSharedReadRootsLive(*this);
     if (realpathDll) realpathDll->assertLive();
   }
   ~Scope() {
@@ -3103,8 +3107,6 @@ static bool pathOverlap(const std::wstring &left, const std::wstring &right) {
 }
 static bool privateProfileOverlap(const OwnerStore &owners, HANDLE heldRoot) {
   const auto rootIdentity = anchorIdentity(heldRoot);
-  const auto rootPhysical = fileObjectIdentity(heldRoot, currentSid(), true);
-  require(samePhysicalIdentity(rootIdentity, rootPhysical), "execution_path_alias");
   for (const auto &entry : owners.selectedProfiles) {
     const auto &profile = entry.second;
     const auto privateIdentity = anchorIdentity(profile.root.value);
@@ -3147,30 +3149,117 @@ static bool privateCohortRoot(const Scope &scope,
   return controllerRoot ||
          (anchor.sharedRoot && samePhysicalIdentity(identity, anchor.identity));
 }
+// Shared execution-read roots retain their actual trusted installer owner.
+// This does not qualify a private profile/controller or permit a foreign writer.
+struct SharedReadAclCustody {
+  std::wstring ownerSid;
+  std::vector<std::string> foreignAces;
+  SECURITY_DESCRIPTOR_CONTROL daclControl = 0;
+  bool memberAllowed = false;
+};
+static bool trustedSharedMutator(PSID sid, const std::wstring &current) {
+  LPWSTR value = nullptr;
+  require(IsValidSid(sid) && ConvertSidToStringSidW(sid, &value),
+          "execution_containment_filesystem_denied");
+  LocalMemory memory{value};
+  return current == value || IsWellKnownSid(sid, WinLocalSystemSid) ||
+         IsWellKnownSid(sid, WinBuiltinAdministratorsSid);
+}
+static SharedReadAclCustody sharedReadAclCustody(HANDLE file, const std::wstring &current,
+                                                PSID package, const char *code) {
+  PACL acl = nullptr;
+  PSID owner = nullptr;
+  PSECURITY_DESCRIPTOR descriptor = nullptr;
+  require(GetSecurityInfo(file, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                          &owner, nullptr, &acl, nullptr, &descriptor) == ERROR_SUCCESS,
+          code);
+  LocalMemory memory{descriptor};
+  require(acl && IsValidAcl(acl) && owner && trustedSharedMutator(owner, current), code);
+  FILE_STANDARD_INFO standard{};
+  require(GetFileInformationByHandleEx(file, FileStandardInfo, &standard, sizeof(standard)) &&
+              standard.Directory && standard.NumberOfLinks == 1, code);
+  LPWSTR ownerText = nullptr;
+  require(ConvertSidToStringSidW(owner, &ownerText), code);
+  LocalMemory ownerMemory{ownerText};
+  SharedReadAclCustody result;
+  result.ownerSid = ownerText;
+  SECURITY_DESCRIPTOR_CONTROL control = 0;
+  DWORD revision = 0;
+  require(GetSecurityDescriptorControl(descriptor, &control, &revision), code);
+  result.daclControl = static_cast<SECURITY_DESCRIPTOR_CONTROL>(control &
+      (SE_DACL_PRESENT | SE_DACL_DEFAULTED | SE_DACL_PROTECTED | SE_DACL_AUTO_INHERITED | SE_DACL_AUTO_INHERIT_REQ));
+  constexpr DWORD readAccess = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
+  constexpr DWORD readable = readAccess | GENERIC_READ | GENERIC_EXECUTE;
+  for (DWORD index = 0; index < acl->AceCount; ++index) {
+    void *raw = nullptr;
+    require(GetAce(acl, index, &raw), code);
+    const auto *header = static_cast<const ACE_HEADER *>(raw);
+    require((header->AceType == ACCESS_ALLOWED_ACE_TYPE || header->AceType == ACCESS_DENIED_ACE_TYPE) &&
+                header->AceSize >= sizeof(ACCESS_ALLOWED_ACE), code);
+    const auto *ace = static_cast<const ACCESS_ALLOWED_ACE *>(raw);
+    PSID trustee = const_cast<DWORD *>(&ace->SidStart);
+    require(IsValidSid(trustee) && offsetof(ACCESS_ALLOWED_ACE, SidStart) + GetLengthSid(trustee) <= header->AceSize, code);
+    if (EqualSid(trustee, package)) {
+      require(header->AceType == ACCESS_ALLOWED_ACE_TYPE && !result.memberAllowed &&
+                  ace->Mask == readAccess &&
+                  !(header->AceFlags & ~(OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE | INHERITED_ACE)), code);
+      result.memberAllowed = true;
+    } else {
+      if (header->AceType == ACCESS_ALLOWED_ACE_TYPE) {
+        // CREATOR OWNER is a template, not a mutator on this root. Only the
+        // trusted writers admitted above can create a future inheriting child.
+        const bool creatorTemplate = IsWellKnownSid(trustee, WinCreatorOwnerSid) &&
+            (header->AceFlags & INHERIT_ONLY_ACE) &&
+            (header->AceFlags & (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE)) &&
+            !(header->AceFlags & ~(OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE | INHERIT_ONLY_ACE | INHERITED_ACE));
+        require(!(ace->Mask & ~readable) || creatorTemplate || trustedSharedMutator(trustee, current), code);
+      }
+      result.foreignAces.emplace_back(static_cast<const char *>(raw), header->AceSize);
+    }
+  }
+  return result;
+}
+static void assertSharedReadRootsLive(const Scope &scope) {
+  for (const auto &root : scope.aclRoots) if (root.sharedRoot) {
+    root.assertLive();
+    SharedAclMutex mutex(root.identity);
+    const auto custody = sharedReadAclCustody(root.handle.value, currentSid(), scope.sid.value,
+                                              "execution_containment_filesystem_denied");
+    require(custody.ownerSid == root.sharedOwnerSid && custody.daclControl == root.sharedDaclControl && custody.memberAllowed,
+            "execution_containment_filesystem_denied");
+  }
+}
+static JsonObject grantObjectIdentity(HANDLE file, const std::wstring &owner, bool shared) {
+  return shared ? anchorIdentity(file) : fileObjectIdentity(file, owner, true);
+}
 static void grantRoot(Scope &scope, Handle heldRoot, DWORD mask, ACCESS_MODE mode,
                       bool sharedRoot = false) {
   RetainedAnchorComponent anchor(std::move(heldRoot), sharedRoot);
   const auto owner = currentSid();
-  const auto physicalIdentity = fileObjectIdentity(anchor.handle.value, owner, true);
+  require(!sharedRoot || (mode == GRANT_ACCESS && mask == (FILE_GENERIC_READ | FILE_GENERIC_EXECUTE) &&
+                         !privateProfileOverlap(*scope.owners, anchor.handle.value)),
+          "execution_containment_filesystem_denied");
+  const auto physicalIdentity = grantObjectIdentity(anchor.handle.value, owner, sharedRoot);
   // Any retained root may be shared with another native-held scope. Serialize
   // its short DACL transaction even when it is not a sealed controller root.
   SharedAclMutex aclMutex(physicalIdentity);
   auto handle = scopeAclDirectory(anchor);
   require(anchorIdentity(handle.value).Stringify() == anchor.identity.Stringify(),
           "execution_containment_filesystem_denied");
-  require(fileObjectIdentity(handle.value, owner, true).Stringify() ==
+  require(grantObjectIdentity(handle.value, owner, sharedRoot).Stringify() ==
               physicalIdentity.Stringify(),
           "execution_containment_filesystem_denied");
   const bool privateGrant =
-      mode == GRANT_ACCESS && privateCohortRoot(scope, anchor);
+      !sharedRoot && mode == GRANT_ACCESS && privateCohortRoot(scope, anchor);
   const auto cohortSids =
       privateGrant ? closedControllerCohortSids(*scope.cohort) : std::vector<std::wstring>();
   const auto *cohortSidsPtr = privateGrant ? &cohortSids : nullptr;
-  const auto before =
-      aclCustody(handle.value, owner, scope.sid.value, cohortSidsPtr,
-                 "execution_containment_filesystem_denied");
-  require(fileObjectIdentity(handle.value, owner, true).Stringify() ==
-              fileObjectIdentity(anchor.handle.value, owner, true).Stringify(),
+  AclCustody before;
+  SharedReadAclCustody sharedBefore;
+  if (sharedRoot) sharedBefore = sharedReadAclCustody(handle.value, owner, scope.sid.value, "execution_containment_filesystem_denied");
+  else before = aclCustody(handle.value, owner, scope.sid.value, cohortSidsPtr, "execution_containment_filesystem_denied");
+  require(grantObjectIdentity(handle.value, owner, sharedRoot).Stringify() ==
+              grantObjectIdentity(anchor.handle.value, owner, sharedRoot).Stringify(),
           "execution_containment_filesystem_denied");
   PACL previous = nullptr;
   PSECURITY_DESCRIPTOR descriptor = nullptr;
@@ -3189,23 +3278,30 @@ static void grantRoot(Scope &scope, Handle heldRoot, DWORD mask, ACCESS_MODE mod
   LocalMemory nextMemory{next};
   const HANDLE heldAcl = handle.value;
   scope.aclRoots.emplace_back(std::move(handle), sharedRoot, privateGrant);
+  if (sharedRoot) {
+    scope.aclRoots.back().sharedOwnerSid = sharedBefore.ownerSid;
+    scope.aclRoots.back().sharedDaclControl = sharedBefore.daclControl;
+  }
   require(SetSecurityInfo(heldAcl, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr,
                           next, nullptr) == ERROR_SUCCESS,
           "execution_containment_filesystem_denied");
   scope.aclRoots.back().assertLive();
   require(anchorIdentity(heldAcl).Stringify() == scope.aclRoots.back().identity.Stringify(),
           "execution_containment_filesystem_denied");
-  require(fileObjectIdentity(heldAcl, owner, true).Stringify() ==
-              fileObjectIdentity(anchor.handle.value, owner, true).Stringify(),
+  require(grantObjectIdentity(heldAcl, owner, sharedRoot).Stringify() ==
+              grantObjectIdentity(anchor.handle.value, owner, sharedRoot).Stringify(),
           "execution_containment_filesystem_denied");
-  const auto after =
-      aclCustody(heldAcl, owner, scope.sid.value, cohortSidsPtr,
-                 "execution_containment_filesystem_denied");
-  require(after.siblings == before.siblings, "execution_containment_filesystem_denied");
-  require(mode != GRANT_ACCESS || after.memberAllowed,
-          "execution_containment_filesystem_denied");
-  require(mode != DENY_ACCESS || after.memberAllowed == before.memberAllowed,
-          "execution_containment_filesystem_denied");
+  if (sharedRoot) {
+    const auto after = sharedReadAclCustody(heldAcl, owner, scope.sid.value, "execution_containment_filesystem_denied");
+    require(after.ownerSid == sharedBefore.ownerSid && after.daclControl == sharedBefore.daclControl &&
+                after.foreignAces == sharedBefore.foreignAces && after.memberAllowed,
+            "execution_containment_filesystem_denied");
+  } else {
+    const auto after = aclCustody(heldAcl, owner, scope.sid.value, cohortSidsPtr, "execution_containment_filesystem_denied");
+    require(after.siblings == before.siblings, "execution_containment_filesystem_denied");
+    require(mode != GRANT_ACCESS || after.memberAllowed, "execution_containment_filesystem_denied");
+    require(mode != DENY_ACCESS || after.memberAllowed == before.memberAllowed, "execution_containment_filesystem_denied");
+  }
 }
 static void removeGrants(Scope &scope) {
   if (scope.realpathDll && scope.realpathDll->granted && scope.physicalCleanupProof)
@@ -3215,7 +3311,7 @@ static void removeGrants(Scope &scope) {
     const auto owner = currentSid();
     const auto identity = it->identity;
     const HANDLE handle = it->handle.value;
-    const auto physicalIdentity = fileObjectIdentity(handle, owner, true);
+    const auto physicalIdentity = grantObjectIdentity(handle, owner, it->sharedRoot);
     const bool privateGrant =
         it->cohortPolicy && privateCohortRoot(scope, *it);
     const bool shared = it->sharedRoot || privateGrant;
@@ -3226,11 +3322,16 @@ static void removeGrants(Scope &scope) {
     SharedAclMutex aclMutex(physicalIdentity);
     it->assertLive();
     require(anchorIdentity(handle).Stringify() == identity.Stringify(), "cleanup_unknown");
-    const auto heldIdentity = fileObjectIdentity(handle, owner, true);
+    const auto heldIdentity = grantObjectIdentity(handle, owner, it->sharedRoot);
     const auto cohortSids =
         privateGrant ? closedControllerCohortSids(*scope.cohort) : std::vector<std::wstring>();
     const auto *cohortSidsPtr = privateGrant ? &cohortSids : nullptr;
-    const auto before = aclCustody(handle, owner, scope.sid.value, cohortSidsPtr, "cleanup_unknown");
+    AclCustody before;
+    SharedReadAclCustody sharedBefore;
+    if (it->sharedRoot) {
+      sharedBefore = sharedReadAclCustody(handle, owner, scope.sid.value, "cleanup_unknown");
+      require(sharedBefore.ownerSid == it->sharedOwnerSid && sharedBefore.daclControl == it->sharedDaclControl, "cleanup_unknown");
+    } else before = aclCustody(handle, owner, scope.sid.value, cohortSidsPtr, "cleanup_unknown");
     PACL previous = nullptr;
     PSECURITY_DESCRIPTOR descriptor = nullptr;
     require(GetSecurityInfo(handle, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr,
@@ -3248,10 +3349,17 @@ static void removeGrants(Scope &scope) {
             "cleanup_unknown");
     it->assertLive();
     require(anchorIdentity(handle).Stringify() == it->identity.Stringify(), "cleanup_unknown");
-    require(fileObjectIdentity(handle, owner, true).Stringify() == heldIdentity.Stringify(),
+    require(grantObjectIdentity(handle, owner, it->sharedRoot).Stringify() == heldIdentity.Stringify(),
             "cleanup_unknown");
-    const auto after = aclCustody(handle, owner, scope.sid.value, cohortSidsPtr, "cleanup_unknown");
-    require(after.siblings == before.siblings && !after.memberAllowed, "cleanup_unknown");
+    if (it->sharedRoot) {
+      const auto after = sharedReadAclCustody(handle, owner, scope.sid.value, "cleanup_unknown");
+      require(after.ownerSid == sharedBefore.ownerSid && after.daclControl == sharedBefore.daclControl &&
+                after.foreignAces == sharedBefore.foreignAces && !after.memberAllowed,
+              "cleanup_unknown");
+    } else {
+      const auto after = aclCustody(handle, owner, scope.sid.value, cohortSidsPtr, "cleanup_unknown");
+      require(after.siblings == before.siblings && !after.memberAllowed, "cleanup_unknown");
+    }
   }
   scope.aclRoots = std::move(retained);
 }
@@ -4239,6 +4347,7 @@ static std::unique_ptr<Scope> launch(const JsonObject &input, OwnerStore &owners
     for (auto value : input.GetNamedArray(kind)) {
       require(value.ValueType() == JsonValueType::String, "execution_invalid_response");
       std::wstring root(value.GetString());
+      try {
       auto checked = owners.holdSelectedAncestors(root);
       if (kind != std::wstring(L"protectedRoots"))
         scope->realpathAnchors.emplace_back(
@@ -4256,6 +4365,15 @@ static std::unique_ptr<Scope> launch(const JsonObject &input, OwnerStore &owners
                     : (FILE_GENERIC_READ | FILE_GENERIC_EXECUTE),
                 kind == std::wstring(L"protectedRoots") ? DENY_ACCESS : GRANT_ACCESS,
                 sharedRoot);
+      } catch (const NativeError &error) {
+        if (!error.stage)
+          throw NativeError{error.code, error.win32,
+              kind == std::wstring(L"readOnlyRoots") ? "private_readonly_root"
+              : kind == std::wstring(L"writableRoots") ? "private_writable_root"
+                                                    : "private_protected_root",
+              error.nativeStatus};
+        throw;
+      }
     }
   }
   // Helper-only native owner/command probes do not select a DLL. Production

@@ -13,6 +13,9 @@ assert.equal(process.versions.bun, '1.3.11')
 const root = process.argv[2], receiptPath = process.argv[3]
 assert.ok(root && receiptPath && path.win32.isAbsolute(root) && path.win32.isAbsolute(receiptPath))
 assert.match(path.win32.basename(root), /^TEST-windows-command-[a-zA-Z0-9-]+$/)
+const sharedReadRoot = root + '-shared-readonly'
+const sharedReadFile = path.join(sharedReadRoot, 'vendor-input.txt')
+let sharedReadBaseline: string | undefined
 const profileRoot = path.join(root, 'opencode', 'v2', 'profiles', 'TEST-prepared')
 const databasePath = path.join(profileRoot, 'data', 'opencode', 'opencode.db')
 const profileChildren = ['home', 'config', 'data', 'cache', 'state', 'tmp', 'appdata', 'localappdata', 'config/opencode', 'data/opencode'].map(value => path.join(profileRoot, value))
@@ -133,6 +136,7 @@ async function closeCommand(commandId: string, expected?: { pid: number; birthFi
 }
 const environment: Record<string, string> = {
   SystemRoot: process.env.SystemRoot!, WINDIR: process.env.WINDIR!, LOCALAPPDATA: root,
+  TEST_SHARED_READ_FILE: sharedReadFile,
   PATH: `${root};${path.join(process.env.SystemRoot!, 'System32')}`, USERPROFILE: root, HOME: root, TEMP: root, TMP: root, PWD: root,
 }
 try {
@@ -176,11 +180,56 @@ if(message.type==='prepare'){prepared=message;send({...message,type:'prepared',p
 if(message.type==='close'){send({type:'closed',pid:process.pid,birth:prepared.birth,namespace:prepared.namespace,scopeClosed:true});socket.end()}
 }})
 `)
-  await writeFile(path.join(root, 'output.ts'), `await Bun.write('actual-command.txt','native-command-written');await Bun.stdout.write(new TextEncoder().encode('native-output-é'));await Bun.stderr.write('native-error-marker')`)
+  await writeFile(path.join(root, 'output.ts'), `const fs=await import('node:fs/promises');const file=process.env.TEST_SHARED_READ_FILE!;if(await fs.readFile(file,'utf8')!=='TEST-readonly-vendor')throw Error('TEST_shared_read_failed');let denied=false;try{await fs.writeFile(file,'TEST-must-not-write')}catch(error){denied=['EACCES','EPERM'].includes((error as NodeJS.ErrnoException).code??'')}if(!denied)throw Error('TEST_shared_write_not_denied');await Bun.write('actual-command.txt','native-command-written');await Bun.stdout.write(new TextEncoder().encode('native-output-é'));await Bun.stderr.write('native-error-marker')`)
   await writeFile(path.join(root, 'echo.ts'), `for await(const bytes of Bun.stdin.stream())await Bun.stdout.write(bytes);await Bun.stderr.write('stdin-eof-observed')`)
   await writeFile(path.join(root, 'grandchild.ts'), `await Bun.write('grandchild-live.txt',String(process.pid));setInterval(()=>{},1000)`)
   await writeFile(path.join(root, 'cancel.ts'), `const child=Bun.spawn([process.execPath,'grandchild.ts'],{stdin:'inherit',stdout:'inherit',stderr:'inherit'});await Bun.write('cancel-child.txt',String(child.pid));setInterval(()=>{},1000)`)
   await writeFile(journal, '[]')
+  stage = 'shared-readonly-setup'
+  // A separate fresh TEST sibling is outside every writable launch root.
+  // Its elevated installer owner and Users RX model ordinary installed code.
+  sharedReadBaseline = await ps(`
+$ErrorActionPreference='Stop'
+$p=$env:TEST_SHARED_ROOT
+if(Test-Path -LiteralPath $p){throw 'TEST shared root already exists'}
+[IO.Directory]::CreateDirectory($p)|Out-Null
+[IO.File]::WriteAllText((Join-Path $p 'vendor-input.txt'),'TEST-readonly-vendor',[Text.UTF8Encoding]::new($false))
+$acl=[Security.AccessControl.DirectorySecurity]::new()
+$acl.SetOwner([Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'))
+$acl.SetAccessRuleProtection($true,$false)
+foreach($sid in @([Security.Principal.WindowsIdentity]::GetCurrent().User.Value,'S-1-5-18','S-1-5-32-544')){
+$acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new($sid),'FullControl','ContainerInherit,ObjectInherit','None','Allow'))}
+$acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new('S-1-5-32-545'),'ReadAndExecute','ContainerInherit,ObjectInherit','None','Allow'))
+$acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new('S-1-3-0'),'FullControl','ContainerInherit,ObjectInherit','InheritOnly','Allow'))
+Set-Acl -LiteralPath $p -AclObject $acl
+$actual=Get-Acl -LiteralPath $p
+if($actual.GetOwner([Security.Principal.SecurityIdentifier]).Value-ne 'S-1-5-32-544'){throw 'TEST shared owner not measured'}
+[Console]::Write($actual.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Owner-bor [Security.AccessControl.AccessControlSections]::Access))
+`, { TEST_SHARED_ROOT: sharedReadRoot })
+  const readSharedAcl = () => ps(`$ErrorActionPreference='Stop';[Console]::Write((Get-Acl -LiteralPath $env:TEST_SHARED_ROOT).GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Owner-bor [Security.AccessControl.AccessControlSections]::Access))`, { TEST_SHARED_ROOT: sharedReadRoot })
+  const restoreSharedFixture = () => ps(`$ErrorActionPreference='Stop';$acl=[Security.AccessControl.DirectorySecurity]::new();$acl.SetSecurityDescriptorSddlForm($env:TEST_SHARED_BASELINE);Set-Acl -LiteralPath $env:TEST_SHARED_ROOT -AclObject $acl`, { TEST_SHARED_ROOT: sharedReadRoot, TEST_SHARED_BASELINE: sharedReadBaseline! })
+  const refuseSharedFixture = async (writable = false) => {
+    const denied = createWindowsNativeBroker(await resolveWindowsNativeArtifact())
+    denied.events.on('error', () => {})
+    const before = await readSharedAcl()
+    try {
+      await assert.rejects(denied.request('launch', { executable: path.join(root, 'bun.exe'), entry: path.join(root, 'main.ts'), cwd: root, env: environment,
+        writableRoots: writable ? [sharedReadRoot] : [root, profileRoot], readOnlyRoots: writable ? [] : [sharedReadRoot],
+        protectedRoots: [], nonce: randomUUID(), leaseOwnerId: randomUUID() }),
+        /^(?:execution_owner_not_private|execution_containment_filesystem_denied)(?::[a-z_]+:\d+)?$/)
+      assert.equal(await readSharedAcl(), before)
+    } finally { await denied.close() }
+  }
+  stage = 'shared-readonly-private-refusal'
+  await refuseSharedFixture(true) // Administrators ownership must NOT qualify a writable root.
+  stage = 'shared-readonly-foreign-write-refusal'
+  await ps(`$ErrorActionPreference='Stop';$acl=Get-Acl -LiteralPath $env:TEST_SHARED_ROOT;$acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new('S-1-5-32-545'),'Write','ContainerInherit,ObjectInherit','None','Allow'));Set-Acl -LiteralPath $env:TEST_SHARED_ROOT -AclObject $acl`, { TEST_SHARED_ROOT: sharedReadRoot })
+  try { await refuseSharedFixture() } finally { await restoreSharedFixture() }
+  stage = 'shared-readonly-effective-creator-refusal'
+  await ps(`$ErrorActionPreference='Stop';$acl=Get-Acl -LiteralPath $env:TEST_SHARED_ROOT;$acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new('S-1-3-0'),'Write','None','None','Allow'));Set-Acl -LiteralPath $env:TEST_SHARED_ROOT -AclObject $acl`, { TEST_SHARED_ROOT: sharedReadRoot })
+  try { await refuseSharedFixture() } finally { await restoreSharedFixture() }
+  assert.equal(await readSharedAcl(), sharedReadBaseline)
+  facts.sharedReadOnlyRefusals = { privateOwnershipPreserved: true, foreignWriteRejected: true, effectiveCreatorWriteRejected: true, deniedAclUnchanged: true }
   stage = 'test-ancestor-setup'
   sid = await ps(`
 $ErrorActionPreference='Stop'
@@ -206,7 +255,7 @@ $sid
   assert.match(sid, /^S-1-15-2-/)
   stage = 'native-main-launch'; launched = true
   await fence.assertOwned()
-  const mapping = record(await broker.request('launch', { executable: path.join(root, 'bun.exe'), entry: path.join(root, 'main.ts'), cwd: root, env: environment, writableRoots: [root, profileRoot], readOnlyRoots: [], protectedRoots: [fencePath], nonce, leaseOwnerId }))
+  const mapping = record(await broker.request('launch', { executable: path.join(root, 'bun.exe'), entry: path.join(root, 'main.ts'), cwd: root, env: environment, writableRoots: [root, profileRoot], readOnlyRoots: [sharedReadRoot], protectedRoots: [fencePath], nonce, leaseOwnerId }))
   assert.equal(mapping.containerSid, sid)
   const main = record(mapping.bun); originalMapping = mapping
   const connected = await until(() => nativePeer)
@@ -269,6 +318,8 @@ $sid
     assert.deepEqual(after.birth, descendantBirth.birth)
   }
   facts.descendantAfterCancel = after
+  assert.equal(await readFile(sharedReadFile, 'utf8'), 'TEST-readonly-vendor')
+  facts.sharedReadOnlyReadPassed = true; facts.sharedReadOnlyWriteDenied = true
   facts.fileOutputPassed = true; facts.stdinEchoEofPassed = true; facts.descendantCancelPassed = true
 } catch (error) { failure = error }
 finally {
@@ -296,6 +347,13 @@ finally {
       retirementPhase = 'prepared_profile_aces_removed'
       await assertProfilePackageAces(false)
       facts.preparedProfileOwnAcesRemoved = true
+      retirementPhase = 'shared_readonly_aces_removed'
+      assert.ok(sharedReadBaseline)
+      const after = await ps(`$ErrorActionPreference='Stop';[Console]::Write((Get-Acl -LiteralPath $env:TEST_SHARED_ROOT).GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Owner-bor [Security.AccessControl.AccessControlSections]::Access))`, { TEST_SHARED_ROOT: sharedReadRoot })
+      assert.equal(after, sharedReadBaseline)
+      assert.equal(await readFile(sharedReadFile, 'utf8'), 'TEST-readonly-vendor')
+      facts.sharedReadOnlyOwnerAndAclPreserved = true
+      facts.sharedReadOnlyAclSHA256 = createHash('sha256').update(after).digest('hex')
     } catch (error) {
       const code = error instanceof Error && /^[a-z_]{1,96}(?::[a-z_]{1,64}:\d{1,10})?$/.test(error.message)
         ? error.message : error instanceof Error && error.name === 'AssertionError' ? 'retirement_assertion_failed' : 'retirement_unknown'

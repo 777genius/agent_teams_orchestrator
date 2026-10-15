@@ -129,7 +129,8 @@ const privateNativeFailureStages = new Set([
   'private_acl_owner_run_runs', 'private_acl_owner_run_v2', 'private_image_open',
   'private_image_protected_dacl', 'private_owner_acquire', 'private_owner_cohort',
   'private_owner_controller_tasks', 'private_owner_controller_teams', 'private_owner_discover_selection',
-  'private_owner_reserve_selection', 'private_owner_selected_selection'])
+  'private_owner_reserve_selection', 'private_owner_selected_selection',
+  'private_readonly_root', 'private_writable_root', 'private_protected_root'])
 function nativeFailure(error: unknown): { category: string; native?: { stage: string; nativeCode: number } } | undefined {
   if (!(error instanceof Error)) return undefined
   if (privateNativeFailureCodes.has(error.message)) return { category: error.message }
