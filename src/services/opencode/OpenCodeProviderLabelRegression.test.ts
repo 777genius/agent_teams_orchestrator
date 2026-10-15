@@ -54,12 +54,15 @@ describe('OpenCode provider display labels', () => {
     ])
   })
 
-  test('publishes connected Zen under the catalog ID without a phantom source', async () => {
+  test.each([
+    ['OpenCode Zen', 'opencode', 'opencode-zen'],
+    ['Deep Infra', 'deepinfra', 'deep-infra'],
+  ])('publishes connected %s under the catalog ID without a phantom source', async (label, canonicalId, customId) => {
     const projectPath = await mkdtemp(path.join(tmpdir(), 'opencode-provider-label-test-'))
     try {
       const parsed = parseOpenCodeProvidersOutput(`
 ┌  Credentials ${projectPath}/auth.json
-●  OpenCode Zen api
+●  ${label} api
 ●  OpenRouter api
 └  2 credentials
 `)
@@ -97,11 +100,25 @@ describe('OpenCode provider display labels', () => {
       const connectedIds = result.value.entries
         .filter(entry => entry.state === 'connected')
         .map(entry => entry.providerId)
-      expect(connectedIds).toEqual(['opencode', 'openrouter'])
-      expect(result.value.entries.some(entry => entry.providerId === 'opencode-zen')).toBe(false)
-      expect(result.value.entries.filter(entry => entry.providerId === 'opencode')).toHaveLength(1)
+      expect(connectedIds).toEqual([canonicalId, 'openrouter'])
+      expect(result.value.entries.some(entry => entry.providerId === customId)).toBe(false)
+      expect(result.value.entries.filter(entry => entry.providerId === canonicalId)).toHaveLength(1)
     } finally {
       await rm(projectPath, { recursive: true, force: true })
     }
+  })
+
+  test('keeps explicit DeepInfra-like IDs distinct from the spaced CLI display label', () => {
+    const parsed = parseOpenCodeProvidersOutput(`
+┌  Environment
+●  Deep Infra DEEPINFRA_API_KEY
+●  deep-infra CUSTOM_API_KEY
+●  deepinfra DEEPINFRA_API_KEY
+`)
+    expect(parsed.connectedProviders).toEqual([
+      { id: 'deepinfra', authHint: 'deepinfra_api_key', source: 'environment' },
+      { id: 'deep-infra', authHint: 'custom_api_key', source: 'environment' },
+      { id: 'deepinfra', authHint: 'deepinfra_api_key', source: 'environment' },
+    ])
   })
 })
