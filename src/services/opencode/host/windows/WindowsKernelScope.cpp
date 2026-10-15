@@ -3550,8 +3550,13 @@ static bool ancestorMetadataControlAfterOwnWrite(SECURITY_DESCRIPTOR_CONTROL bef
   // the DACL loses only its historical AUTO_INHERITED marker. Protection
   // and every other bit stay exact, including on unprotected ancestors.
   constexpr auto required = SE_DACL_PRESENT | SE_DACL_AUTO_INHERITED;
+  // Run 38818543582 also observed 0x800e -> 0x8006: this own explicit
+  // DACL write clears only DEFAULTED provenance. Never mask later live checks.
+  // https://learn.microsoft.com/windows/win32/secauthz/security-descriptor-control
+  constexpr auto defaulted = SE_DACL_PRESENT | SE_DACL_DEFAULTED;
   return before == after || ((before & required) == required &&
-                             after == (before & ~SE_DACL_AUTO_INHERITED));
+                             after == (before & ~SE_DACL_AUTO_INHERITED)) ||
+      ((before & defaulted) == defaulted && after == (before & ~SE_DACL_DEFAULTED));
 }
 static void assertAncestorMetadataAuthority(const AncestorMetadataAcl &before,
                                              const AncestorMetadataAcl &after, const char *code,
