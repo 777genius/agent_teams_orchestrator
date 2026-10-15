@@ -113,9 +113,11 @@ export async function runActualProviderComparison(baseline, candidate, binaryPat
         configSha256: createHash('sha256').update(JSON.stringify(config)).digest('hex'), checks: [], cleanupConfirmed: false };
       report.runs.push(run); flush();
       try {
-        for (const operation of ['view', 'models']) {
-          const argv = ['runtime', 'providers', operation, '--runtime', 'opencode', '--json', '--project-path', project,
-            ...(operation === 'view' ? ['--compact'] : ['--provider', actualProvider])];
+        for (const operation of ['view', 'models', 'models_reported_id']) {
+          const command = operation === 'models_reported_id' ? 'models' : operation;
+          const requestedProvider = operation === 'models_reported_id' ? 'deep-infra' : actualProvider;
+          const argv = ['runtime', 'providers', command, '--runtime', 'opencode', '--json', '--project-path', project,
+            ...(operation === 'view' ? ['--compact'] : ['--provider', requestedProvider])];
           let payload, exitCode = 0, transport = actualProviderTransport(null);
           // Public settings/models budgets are 75s/60s; allow their existing
           // finalizers 15s before the TEST transport observation expires.
@@ -146,8 +148,8 @@ export async function runActualProviderComparison(baseline, candidate, binaryPat
     report.baselineReproduced = report.runs[0].checks.some(check => check.capabilitiesPending) &&
       report.runs[0].checks.some(check => check.identityUnavailable);
     report.providerRequestOverflow = observations.overflow === true;
-    report.passed = report.runs[1].checks.length === 2 && report.runs[1].checks.every(check => check.passed) &&
-      report.runs.every(run => run.checks.length === 2 && run.cleanupConfirmed) && !observations.overflow && observations.every(row => row.allowed);
+    report.passed = report.runs[1].checks.length === 3 && report.runs[1].checks.every(check => check.passed) &&
+      report.runs.every(run => run.checks.length === 3 && run.cleanupConfirmed) && !observations.overflow && observations.every(row => row.allowed);
   } finally {
     server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); flush();
   }

@@ -31,6 +31,13 @@ test('actual provider comparison rejects static fallback and requires the select
     models: [{ providerId: 'deepinfra', modelId: 'deepinfra/TEST-local-catalog-model' }], diagnostics: [] } };
   assert.equal(actualProviderResult(view, 'view', binary).passed, true);
   assert.equal(actualProviderResult(models, 'models', binary).passed, true);
+  // The reported spelling is sent unchanged; only a genuine public response
+  // containing the canonical configured model can qualify its separate check.
+  assert.equal(actualProviderResult(models, 'models_reported_id', binary).passed, true);
+  const reportedMismatch = structuredClone(models);
+  reportedMismatch.models.providerId = 'deep-infra';
+  reportedMismatch.models.models[0].modelId = 'deep-infra/TEST-local-catalog-model';
+  assert.equal(actualProviderResult(reportedMismatch, 'models_reported_id', binary).passed, false);
   assert.equal(actualProviderResult(models, 'models', binary, 1).passed, false);
   const diagnostic = structuredClone(view);
   diagnostic.view.runtime.version = 'opencode v1.18.31';
