@@ -31,7 +31,12 @@ export function actualProviderResult(payload, operation, binaryPath, exitCode = 
     ['host_process_identity', /process identity could not be captured after startup/],
     ['settings_timeout', /OpenCode provider settings timed out/],
     ['http_failure', /OpenCode API request failed|OpenCode request failed|HTTP [45][0-9]{2}/],
-    ['selected_identity', /Selected OpenCode identity (?:is )?unavailable/]];
+    ['selected_identity', /Selected OpenCode identity (?:is )?unavailable/],
+    ['request_timeout', /OpenCode (?:host )?request timed out/],
+    ['filesystem', /\b(?:ENOENT|EACCES|EPERM|EEXIST|ENOTDIR|ELOOP)\b/],
+    ['profile_scope', /profile|scope/i], ['registry_lock', /registry|lock/i],
+    ['host_command', /spawn|executable|binary|command/i],
+    ['json_response', /JSON|Unexpected token/], ['aborted', /abort|cancel/i]];
   const diagnosticKinds = Array.isArray(diagnostics) ? [...new Set(diagnostics.slice(0, 64)
     .filter(value => typeof value === 'string')
     .map(value => failureKinds.find(([, pattern]) => pattern.test(value))?.[0] ?? 'other'))] : [];

@@ -503,32 +503,38 @@ public:
     const std::wstring sddl =
         L"O:" + owner + L"G:" + owner + L"D:P(A;;GA;;;" + owner + L")(A;;GA;;;SY)";
     LocalMemory descriptor;
-    require(ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                sddl.c_str(), SDDL_REVISION_1, &descriptor.value, nullptr) != 0,
-            "execution_containment_filesystem_denied");
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.c_str(), SDDL_REVISION_1, &descriptor.value, nullptr))
+      throw NativeError{"execution_containment_filesystem_denied", GetLastError(),
+                        "shared_acl_mutex_descriptor"};
     SECURITY_ATTRIBUTES attributes{sizeof(attributes), descriptor.value, FALSE};
     mutex = Handle(CreateMutexW(&attributes, FALSE, name.c_str()));
-    require(static_cast<bool>(mutex), "execution_containment_filesystem_denied");
+    if (!mutex)
+      throw NativeError{"execution_containment_filesystem_denied", GetLastError(),
+                        "shared_acl_mutex_create"};
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
       PSID rawOwner = nullptr;
       PACL dacl = nullptr;
       PSECURITY_DESCRIPTOR rawDescriptor = nullptr;
-      require(GetSecurityInfo(mutex.value, SE_KERNEL_OBJECT,
-                              OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-                              &rawOwner, nullptr, &dacl, nullptr, &rawDescriptor) == ERROR_SUCCESS,
-              "execution_containment_filesystem_denied");
+      const DWORD securityStatus = GetSecurityInfo(
+          mutex.value, SE_KERNEL_OBJECT, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+          &rawOwner, nullptr, &dacl, nullptr, &rawDescriptor);
+      if (securityStatus != ERROR_SUCCESS)
+        throw NativeError{"execution_containment_filesystem_denied", securityStatus,
+                          "shared_acl_mutex_security"};
       LocalMemory ownedDescriptor{rawDescriptor};
       LPWSTR ownerText = nullptr, daclText = nullptr;
-      require(ConvertSidToStringSidW(rawOwner, &ownerText) != 0 &&
+      if (!(ConvertSidToStringSidW(rawOwner, &ownerText) != 0 &&
                   ConvertSecurityDescriptorToStringSecurityDescriptorW(
                       rawDescriptor, SDDL_REVISION_1, DACL_SECURITY_INFORMATION, &daclText,
-                      nullptr) != 0,
-              "execution_containment_filesystem_denied");
+                      nullptr) != 0))
+        throw NativeError{"execution_containment_filesystem_denied", GetLastError(),
+                          "shared_acl_mutex_encoding"};
       LocalMemory ownerMemory{ownerText}, daclMemory{daclText};
       require(owner == ownerText &&
                   std::wstring(daclText) ==
                       L"D:P(A;;GA;;;" + owner + L")(A;;GA;;;SY)",
-              "execution_containment_filesystem_denied");
+              "execution_containment_filesystem_denied", "shared_acl_mutex_authority");
     }
     const DWORD waited = WaitForSingleObject(mutex.value, 10000);
     if (waited == WAIT_ABANDONED) {
@@ -536,7 +542,9 @@ public:
       throw NativeError{"execution_containment_filesystem_denied", ERROR_ABANDONED_WAIT_0,
                         "shared_acl_mutex"};
     }
-    require(waited == WAIT_OBJECT_0, "execution_containment_filesystem_denied");
+    if (waited != WAIT_OBJECT_0)
+      throw NativeError{"execution_containment_filesystem_denied",
+                        waited == WAIT_FAILED ? GetLastError() : waited, "shared_acl_mutex_wait"};
   }
   ~SharedAclMutex() {
     if (mutex) ReleaseMutex(mutex.value);

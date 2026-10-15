@@ -222,6 +222,10 @@ test('native diagnostics retain only closed producer codes and stages with uint3
   const previous = process.env.CLAUDE_MULTIMODEL_DATA_HOME
   const secret = 'TEST_PRIVATE_NATIVE_PAYLOAD'
   const cases: { error: Error; category: string; native?: { stage: string; nativeCode: number } }[] = [
+    ...['shared_acl_mutex_descriptor', 'shared_acl_mutex_create', 'shared_acl_mutex_security',
+      'shared_acl_mutex_encoding', 'shared_acl_mutex_authority', 'shared_acl_mutex_wait', 'shared_acl_mutex']
+      .map(stage => ({ error: new Error(`execution_containment_filesystem_denied:${stage}:5`),
+        category: 'execution_containment_filesystem_denied', native: { stage, nativeCode: 5 } })),
     { error: new Error('execution_owner_unknown:owner_canonical_open:32'), category: 'execution_owner_unknown',
       native: { stage: 'owner_canonical_open', nativeCode: 32 } },
     { error: new Error('execution_owner_not_private:private_acl_owner:0'), category: 'execution_owner_not_private',
