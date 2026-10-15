@@ -3402,13 +3402,14 @@ static SharedReadAclCustody sharedReadAclCustody(HANDLE file, const std::wstring
   }
   return result;
 }
-// SetSecurityInfo converts an unprotected legacy DACL to automatic inheritance.
-// Permit only the observed PRESENT -> PRESENT|AUTO_INHERITED normalization
-// during our own write; retained custody checks still compare every control bit.
+// SetSecurityInfo can mark either protected or unprotected DACLs as automatic
+// inheritance during our own write. Accept only this single-bit normalization;
+// owner, foreign ACE bytes/order and protection still have exact custody checks.
 static bool sharedReadControlAfterOwnWrite(SECURITY_DESCRIPTOR_CONTROL before,
                                            SECURITY_DESCRIPTOR_CONTROL after) {
   return after == before ||
-      (before == SE_DACL_PRESENT && after == (SE_DACL_PRESENT | SE_DACL_AUTO_INHERITED));
+      ((before == SE_DACL_PRESENT || before == (SE_DACL_PRESENT | SE_DACL_PROTECTED)) &&
+       after == (before | SE_DACL_AUTO_INHERITED));
 }
 static void assertSharedReadRootsLive(const Scope &scope) {
   for (const auto &root : scope.aclRoots) if (root.sharedRoot) {
