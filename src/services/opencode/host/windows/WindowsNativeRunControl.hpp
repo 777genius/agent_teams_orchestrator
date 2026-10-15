@@ -248,6 +248,7 @@ struct WindowsNativeRunControl {
     require(runControlValidPipeEndpoint(endpoint) &&
                 (expected_.endpoint.empty() || endpoint == expected_.endpoint),
             "run_control_foreign");
+    runControlReapCompleted();
     require(runControlActiveCount() < MAX_CONNECTIONS &&
                 registry_.size() < MAX_CAPABILITIES,
             "run_control_connection_limit");
@@ -285,6 +286,19 @@ struct WindowsNativeRunControl {
     std::unique_lock<std::recursive_mutex> lock(controlMutex_);
     require(listener_ && !shutdown_, "run_control_foreign");
     require(!listener_->poisoned && !listener_->acceptOperation, "run_control_foreign");
+    runControlReapCompleted();
+    // A saturated live owner keeps all held requests. Only its internal pump
+    // waits for a free slot; an explicit low-level accept still refuses capacity.
+    while (retainIdleWait && (runControlActiveCount() >= MAX_CONNECTIONS ||
+                             registry_.size() >= MAX_CAPABILITIES)) {
+      require(!requestPumpStop_ && !shutdown_, "run_control_accept_timeout");
+      lock.unlock();
+      Sleep(10);
+      lock.lock();
+      runControlReapCompleted();
+    }
+    require(listener_ && !shutdown_ && (!retainIdleWait || !requestPumpStop_),
+            "run_control_accept_timeout");
     require(runControlActiveCount() < MAX_CONNECTIONS &&
                 registry_.size() < MAX_CAPABILITIES,
             "run_control_connection_limit");
@@ -363,6 +377,7 @@ struct WindowsNativeRunControl {
     // listener is independently retained and immediately offers a fresh server
     // instance; no DisconnectNamedPipe call destroys the accepted endpoint.
     if (phase) *phase = "accept_replenish";
+    runControlReapCompleted();
     listener_->pending = runControlCreateServer(listener_->name, false);
     JsonObject result;
     num(result, L"id", id);
@@ -370,11 +385,11 @@ struct WindowsNativeRunControl {
   }
 
   JsonObject read(const JsonObject &input) {
-    Connection *connection = nullptr;
+    std::shared_ptr<Connection> connection;
     DWORD timeout = 0;
     {
       std::lock_guard<std::recursive_mutex> lock(controlMutex_);
-      connection = &runControlConnectionFor(input);
+      connection = runControlConnectionFor(input);
       runControlAuthenticate(*connection);
       timeout = runControlTimeoutMs(input, L"timeoutMs");
     }
@@ -386,12 +401,12 @@ struct WindowsNativeRunControl {
   }
 
   JsonObject write(const JsonObject &input) {
-    Connection *connection = nullptr;
+    std::shared_ptr<Connection> connection;
     DWORD timeout = 0;
     std::string bytes;
     {
       std::lock_guard<std::recursive_mutex> lock(controlMutex_);
-      connection = &runControlConnectionFor(input);
+      connection = runControlConnectionFor(input);
       runControlAuthenticate(*connection);
       timeout = runControlTimeoutMs(input, L"timeoutMs");
       const auto value = text(input, L"frame");
@@ -409,7 +424,7 @@ struct WindowsNativeRunControl {
   }
 
   JsonObject close(const JsonObject &input, std::uint64_t cleanupDeadline = 0) {
-    Connection *connection = nullptr;
+    std::shared_ptr<Connection> connection;
     bool foreign = false;
     {
       std::lock_guard<std::recursive_mutex> lock(controlMutex_);
@@ -421,7 +436,7 @@ struct WindowsNativeRunControl {
       auto found = registry_.find(id);
       foreign = found == registry_.end();
       if (!foreign)
-        connection = found->second.get();
+        connection = found->second;
     }
     if (connection && !runControlRetire(*connection, cleanupDeadline))
       throw NativeError{"cleanup_unknown", ERROR_OPERATION_ABORTED, "close"};
@@ -484,12 +499,12 @@ struct WindowsNativeRunControl {
       }
       listener_.reset();
     }
-    std::vector<Connection *> connections;
+    std::vector<std::shared_ptr<Connection>> connections;
     for (auto &entry : registry_)
       if (!entry.second->retired)
-        connections.push_back(entry.second.get());
+        connections.push_back(entry.second);
     lock.unlock();
-    for (auto *connection : connections)
+    for (const auto &connection : connections)
       complete = runControlRetire(*connection) && complete;
     lock.lock();
     shutdownComplete_ = complete;
@@ -561,7 +576,7 @@ struct WindowsNativeRunControl {
     str(connectInput, L"endpoint", expected_.endpoint);
     num(connectInput, L"timeoutMs", remaining());
     const auto connected = connect(connectInput, ioDeadline);
-    auto &connection = runControlConnectionFor(connected);
+    const auto connection = runControlConnectionFor(connected);
     try {
       const auto mac = runControlHmacHex(runState_->challenge(), payloadBytes);
       JsonObject frame;
@@ -569,8 +584,8 @@ struct WindowsNativeRunControl {
                                                                      payloadBytes.end()))));
       str(frame, L"mac", mac);
       const std::string frameBytes = narrow(std::wstring(frame.Stringify())) + "\n";
-      runControlWriteFrame(connection, frameBytes, remaining(), cleanupDeadline);
-      const std::string responseBytes = runControlReadFrame(connection, remaining(), cleanupDeadline);
+      runControlWriteFrame(*connection, frameBytes, remaining(), cleanupDeadline);
+      const std::string responseBytes = runControlReadFrame(*connection, remaining(), cleanupDeadline);
       const auto responseFrame = JsonObject::Parse(wide(responseBytes));
       const auto responseMac = text(responseFrame, L"mac");
       const auto responsePayload = runControlDecodeFrameBase64(text(responseFrame, L"payloadBytesBase64"));
@@ -584,7 +599,7 @@ struct WindowsNativeRunControl {
       close(connected, cleanupDeadline);
       return result;
     } catch (...) {
-      if (!runControlRetire(connection, cleanupDeadline))
+      if (!runControlRetire(*connection, cleanupDeadline))
         throw NativeError{"cleanup_unknown", ERROR_OPERATION_ABORTED, "close"};
       throw;
     }
@@ -595,12 +610,12 @@ struct WindowsNativeRunControl {
   }
 
   void respond(const JsonObject &input) {
-    Connection *connection = nullptr;
+    std::shared_ptr<Connection> connection;
     DWORD timeout = 0;
     std::string frameBytes;
     {
       std::lock_guard<std::recursive_mutex> lock(controlMutex_);
-      connection = &runControlConnectionFor(input);
+      connection = runControlConnectionFor(input);
       require(input.HasKey(L"response") && input.GetNamedValue(L"response").ValueType() == JsonValueType::Object,
               "run_control_frame_invalid");
       const std::string bytes = runControlCanonicalJson(input.GetNamedValue(L"response"));
@@ -612,6 +627,8 @@ struct WindowsNativeRunControl {
       timeout = runControlTimeoutMs(input, L"timeoutMs");
     }
     runControlWriteFrame(*connection, frameBytes, timeout);
+    std::lock_guard<std::recursive_mutex> lock(controlMutex_);
+    connection->responseWritten = true;
   }
 
   void validateRequestPayload(std::uint64_t id, const JsonObject &payload) {
@@ -638,10 +655,10 @@ struct WindowsNativeRunControl {
   }
 
   void poisonConnection(const JsonObject &input) {
-    Connection *connection = nullptr;
+    std::shared_ptr<Connection> connection;
     {
       std::lock_guard<std::recursive_mutex> lock(controlMutex_);
-      connection = &runControlConnectionFor(input);
+      connection = runControlConnectionFor(input);
       connection->poisoned = true;
     }
     (void)runControlRetire(*connection);
@@ -728,6 +745,7 @@ private:
     Handle pipe;
     DWORD timeout = 0;
     std::wstring endpoint;
+    bool responseWritten = false;
     bool authenticated = false;
     bool poisoned = false;
     bool retired = false;
@@ -833,7 +851,7 @@ private:
     HANDLE raw = CreateNamedPipeW(name.c_str(), mode,
                                   PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT |
                                       PIPE_REJECT_REMOTE_CLIENTS,
-                                  static_cast<DWORD>(MAX_CONNECTIONS), MAX_FRAME_BYTES,
+                                  static_cast<DWORD>(MAX_CONNECTIONS + 1), MAX_FRAME_BYTES,
                                   MAX_FRAME_BYTES, 0, &attributes);
     if (raw == INVALID_HANDLE_VALUE)
       throw NativeError{"run_control_listen_unknown", GetLastError(), "listen"};
@@ -850,16 +868,16 @@ private:
     require(static_cast<bool>(acquired), code);
     return acquired;
   }
-  std::unique_ptr<Connection> runControlMakeConnection(Handle pipe, Role side, DWORD timeout) {
+  std::shared_ptr<Connection> runControlMakeConnection(Handle pipe, Role side, DWORD timeout) {
     require(static_cast<bool>(pipe), "run_control_foreign");
-    std::unique_ptr<Connection> connection(new Connection);
+    std::shared_ptr<Connection> connection(new Connection);
     connection->id = runControlNewId();
     connection->side = side;
     connection->pipe = std::move(pipe);
     connection->timeout = timeout;
     return connection;
   }
-  Connection &runControlConnectionFor(const JsonObject &input) {
+  std::shared_ptr<Connection> runControlConnectionFor(const JsonObject &input) {
     std::lock_guard<std::recursive_mutex> lock(controlMutex_);
     require(input.HasKey(L"id") && input.GetNamedValue(L"id").ValueType() == JsonValueType::Number,
             "run_control_foreign");
@@ -869,14 +887,35 @@ private:
     auto found = registry_.find(id);
     require(found != registry_.end() && !found->second->retired && !found->second->poisoned,
             "run_control_foreign");
-    return *found->second;
+    return found->second;
   }
-  Connection &runControlConnectionById(std::uint64_t id) {
+  std::shared_ptr<Connection> runControlConnectionById(std::uint64_t id) {
     std::lock_guard<std::recursive_mutex> lock(controlMutex_);
     auto found = registry_.find(id);
     require(found != registry_.end() && !found->second->retired && !found->second->poisoned,
             "run_control_foreign");
-    return *found->second;
+    return found->second;
+  }
+  // No unread reply is discarded: a completed server response is retired only
+  // after the kernel positively reports that its client closed this instance.
+  // Pins held by in-flight callers outlive removal from this generation map.
+  void runControlReapCompleted() {
+    std::lock_guard<std::recursive_mutex> lock(controlMutex_);
+    for (auto it = registry_.begin(); it != registry_.end();) {
+      const auto connection = it->second;
+      if (!connection->retired && connection->side == Role::server &&
+          connection->responseWritten && connection->pending.empty()) {
+        const BOOL connected = PeekNamedPipe(connection->pipe.value, nullptr, 0,
+                                             nullptr, nullptr, nullptr);
+        const DWORD error = connected ? ERROR_SUCCESS : GetLastError();
+        if (!connected && (error == ERROR_BROKEN_PIPE || error == ERROR_PIPE_NOT_CONNECTED))
+          (void)runControlRetire(*connection);
+      }
+      if (connection->retired && connection->pending.empty())
+        it = registry_.erase(it);
+      else
+        ++it;
+    }
   }
   size_t runControlActiveCount() const {
     std::lock_guard<std::recursive_mutex> lock(controlMutex_);
@@ -1786,7 +1825,7 @@ private:
   std::vector<BYTE> expectedPackageSid_;
   std::wstring packageSid_;
   std::unique_ptr<Listener> listener_;
-  std::map<std::uint64_t, std::unique_ptr<Connection>> registry_;
+  std::map<std::uint64_t, std::shared_ptr<Connection>> registry_;
   std::array<std::shared_ptr<IoOperation>, MAX_RETAINED_OPERATIONS> retainedIo_;
   std::thread requestPump_;
   std::atomic<bool> requestPumpStop_{false};
@@ -1821,12 +1860,12 @@ inline void WindowsNativeRunControl::startRequestPump() {
         const auto number = accepted.GetNamedNumber(L"id");
         const auto id = static_cast<std::uint64_t>(number);
         activeId = id;
-        auto &connection = runControlConnectionById(id);
+        const auto connection = runControlConnectionById(id);
         JsonObject readInput;
         num(readInput, L"id", id);
         num(readInput, L"timeoutMs", 30000);
         phase = "read_frame";
-        const std::string frameBytes = runControlReadFrame(connection, 30000);
+        const std::string frameBytes = runControlReadFrame(*connection, 30000);
         phase = "verify_frame";
         const auto frame = JsonObject::Parse(wide(frameBytes));
         const auto mac = text(frame, L"mac");

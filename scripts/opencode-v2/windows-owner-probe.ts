@@ -90,7 +90,7 @@ const snapshot = async (root: string): Promise<unknown[]> => {
 }
 type RouterExpectation = 'v1' | 'veto' | 'owner'
 const route = async (dataRoot: string, runId: string, expected: RouterExpectation,
-  selection: 'v1' | 'unsupported' | 'missing' = 'v1', ownerRecord?: unknown, heldRead = false) => {
+  selection: 'v1' | 'unsupported' | 'missing' = 'v1', ownerRecord?: unknown, heldRead = false, statusBatch = 0) => {
   await closeFixtureWriters()
   // A fresh CLI owns its retained discovery brokers until process exit, as in
   // production. Only selection and the V1 executor are stubbed; native discovery
@@ -109,6 +109,16 @@ const route = async (dataRoot: string, runId: string, expected: RouterExpectatio
     phase='native_discovery';
     if(expected==='v1')assert.equal(await discoverOpenCodeV2Run(root,'TEST-team',runId),null);
     if(expected==='owner')assert.deepEqual(await discoverOpenCodeV2Run(root,'TEST-team',runId),${JSON.stringify(ownerRecord ?? null)});
+    if(${JSON.stringify(statusBatch)}>0){
+      phase='same_client_status_batch';const owner=await discoverOpenCodeV2Run(root,'TEST-team',runId);
+      assert.ok(owner);
+      for(let index=0;index<${JSON.stringify(statusBatch)};index++){
+        const remaining=Math.min(30000,owner.deadline-Date.now());assert.ok(remaining>0);
+        const response=await requestOpenCodeV2Run(owner,{operation:'status'},remaining);
+        assert.equal(response.kind,'status');assert.equal(response.state,'stopped');
+      }
+      console.log(JSON.stringify({expected,selection,statusBatch:${JSON.stringify(statusBatch)}}));process.exit(0);
+    }
     if(${JSON.stringify(heldRead)}){
       phase='held_read';const owner=await discoverOpenCodeV2Run(root,'TEST-team',runId);
       assert.ok(owner);const started=Date.now();
@@ -619,6 +629,9 @@ try {
     await Promise.all(Array.from({ length: 3 }, () =>
       route(discoveryRoot, binding.runId, 'owner', 'missing', published)))
     facts.concurrentFreshStatusPeers = 3
+    const repeated = await route(discoveryRoot, binding.runId, 'owner', 'missing', published, false, 65)
+    assert.equal(repeated.statusBatch, 65)
+    facts.sameClientSequentialStatuses = 65
     withholdNextStatus = true
     const recovered = await route(discoveryRoot, binding.runId, 'owner', 'missing', published, true)
     assert.equal(recovered.heldReadRetired, true)
@@ -631,7 +644,7 @@ try {
     await Promise.all(statusResponses)
   }
   assert.deepEqual(statusFailures, [])
-  assert.equal(statusRequests, 7)
+  assert.equal(statusRequests, 72)
   // Same physical fence with a foreign requested binding must remain UNKNOWN.
   await assert.rejects(request('runStateDiscover', { dataRoot: discoveryRoot, directory,
     teamId: 'TEST-foreign', runId: binding.runId, selectionIds }), /run_state_start_changed/)
