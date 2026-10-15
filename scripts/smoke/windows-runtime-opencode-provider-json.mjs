@@ -35,9 +35,14 @@ export function actualProviderResult(payload, operation, binaryPath, exitCode = 
   };
   const qualifiedModelPresent = Array.isArray(models?.models) && models.models.some(value =>
     value?.providerId === actualProvider && value.modelId === `${actualProvider}/${actualModel}`);
-  const passed = exitCode === 0 && payload?.runtimeId === 'opencode' && !payload.error && !pending && (operation === 'view'
+  const passed = operation === 'models_reported_id'
+    // This fixture declares only deepinfra. An explicit custom ID is not an alias.
+    ? exitCode === 1 && payload?.runtimeId === 'opencode' && payload?.error?.code === 'provider-missing' &&
+      !identityUnavailable && !pending && models === undefined
+    : exitCode === 0 && payload?.runtimeId === 'opencode' && !payload.error && !pending && (operation === 'view'
     ? view?.runtime?.cliPath === binaryPath && view.runtime.version === '1.18.31' &&
-      view.providers?.some(value => value.providerId === actualProvider && value.state === 'connected')
+      view.providers?.some(value => value.providerId === actualProvider && value.state === 'connected') &&
+      !view.providers.some(value => value.providerId === 'deep-infra')
     : models?.providerId === actualProvider && models.catalogState === 'fresh' &&
       qualifiedModelPresent);
   return { passed: passed === true, capabilitiesPending: pending, identityUnavailable,
@@ -145,8 +150,10 @@ export async function runActualProviderComparison(baseline, candidate, binaryPat
         flush();
       }
     }
-    report.baselineReproduced = report.runs[0].checks.some(check => check.capabilitiesPending) &&
-      report.runs[0].checks.some(check => check.identityUnavailable);
+    report.baselineCapabilitiesPendingObserved = report.runs[0].checks.some(check => check.capabilitiesPending);
+    report.baselineReportedIdentityUnavailableObserved = report.runs[0].checks.some(check =>
+      check.operation === 'models_reported_id' && check.identityUnavailable);
+    report.baselineReproduced = report.baselineReportedIdentityUnavailableObserved;
     report.providerRequestOverflow = observations.overflow === true;
     report.passed = report.runs[1].checks.length === 3 && report.runs[1].checks.every(check => check.passed) &&
       report.runs.every(run => run.checks.length === 3 && run.cleanupConfirmed) && !observations.overflow && observations.every(row => row.allowed);

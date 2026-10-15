@@ -452,6 +452,36 @@ describe('OpenCodeProviderManagementAdapter', () => {
     })
   }
 
+  test('settings obtains providers and models from HTTP without a V1 CLI inventory sweep', async () => {
+    let releases = 0
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: { probe: async (_project, options) => {
+        expect(options?.v1SettingsOnly).toBe(true)
+        return inventory({ connectedProviders: [], availableProviders: [], models: [] })
+      } },
+      hostManager: {
+        ensureHost: async options => {
+          expect(options?.prewarmManagedSubscriptionPlugins).toBe(false)
+          expect(options?.preparedProfile).toBeTruthy()
+          return host()
+        },
+        releaseHost: async () => { releases++ },
+      },
+      clientFactory: { create: () => ({
+        getConfigProviders: async () => ({ providers: [{ id: 'deepinfra', models: { test: {} } }], default: { deepinfra: 'test' } }),
+        getProviders: async () => ({ all: [{ id: 'deepinfra', models: { test: {} } }], connected: ['deepinfra'] }),
+        getProviderAuth: async () => ({ deepinfra: [{ type: 'api' }] }),
+      }) },
+    })
+    const result = await adapter.loadView('opencode')
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.value.runtime.state).toBe('ready')
+    expect(result.value.providers.find(value => value.providerId === 'deepinfra')?.state).toBe('connected')
+    expect(result.value.configuredModels.some(value => value.modelId === 'deepinfra/test')).toBe(true)
+    expect(releases).toBe(1)
+  })
+
   test('uses a bounded host startup budget only for read-only provider management views', async () => {
     const ensureHostCalls: Array<{
       projectPath?: string | null

@@ -331,6 +331,28 @@ describe('OpenCodeInventoryService parsers', () => {
     }
   })
 
+  test('settings profile retains the admitted version without CLI probes or invented auth', async () => {
+    const calls: string[][] = []
+    const result = await collectOpenCodeInventoryCommandResults({
+      mode: 'profile', verifiedVersion: '1.18.31',
+      execOpenCode: async args => {
+        calls.push(args)
+        throw new Error('settings must read the catalog through its managed HTTP host')
+      },
+    })
+    expect(calls).toEqual([])
+    expect(result.versionResult).toEqual({ code: 0, stdout: '1.18.31', stderr: '' })
+    const profile = { ...scopedProfile('deepinfra', 'known:auth'), profileScope: null }
+    expect(deriveOpenCodeProfileConnectedProviders({ profile, settingsOnly: true }))
+      .toEqual({ providers: [], profileScopeError: false })
+    expect(deriveOpenCodeProfileConnectedProviders({ profile }))
+      .toEqual({ providers: [], profileScopeError: true })
+    const scoped = scopedProfile('deepinfra', 'error')
+    expect(deriveOpenCodeProfileConnectedProviders({
+      profile: scoped, profileScope: scoped.profileScope!, settingsOnly: true,
+    })).toEqual({ providers: [], profileScopeError: true })
+  })
+
   test('profile auth inventory accepts explicit selected identity absence', async () => {
     const profile = scopedProfile('opencode', 'absent')
     expect(deriveOpenCodeProfileConnectedProviders({

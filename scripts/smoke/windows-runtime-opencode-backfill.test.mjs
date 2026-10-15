@@ -31,9 +31,14 @@ test('actual provider comparison rejects static fallback and requires the select
     models: [{ providerId: 'deepinfra', modelId: 'deepinfra/TEST-local-catalog-model' }], diagnostics: [] } };
   assert.equal(actualProviderResult(view, 'view', binary).passed, true);
   assert.equal(actualProviderResult(models, 'models', binary).passed, true);
-  // The reported spelling is sent unchanged; only a genuine public response
-  // containing the canonical configured model can qualify its separate check.
-  assert.equal(actualProviderResult(models, 'models_reported_id', binary).passed, true);
+  // An explicit custom ID must not alias the canonical ID declared by this fixture.
+  assert.equal(actualProviderResult(models, 'models_reported_id', binary).passed, false);
+  const missing = { runtimeId: 'opencode', error: { code: 'provider-missing' } };
+  assert.equal(actualProviderResult(missing, 'models_reported_id', binary, 1).passed, true);
+  assert.equal(actualProviderResult(missing, 'models_reported_id', binary).passed, false);
+  assert.equal(actualProviderResult({ ...missing, models: models.models }, 'models_reported_id', binary, 1).passed, false);
+  assert.equal(actualProviderResult({ runtimeId: 'opencode', error: { code: 'provider-missing',
+    message: 'Selected OpenCode identity is unavailable' } }, 'models_reported_id', binary, 1).passed, false);
   const reportedMismatch = structuredClone(models);
   reportedMismatch.models.providerId = 'deep-infra';
   reportedMismatch.models.models[0].modelId = 'deep-infra/TEST-local-catalog-model';
@@ -62,6 +67,7 @@ test('actual provider comparison rejects static fallback and requires the select
     assert.ok(!JSON.stringify(result).includes('TEST-secret'));
   }
   for (const mutate of [value => { value.view.runtime.cliPath = null; },
+    value => { value.view.providers.push({ providerId: 'deep-infra', state: 'connected' }); },
     value => { value.view.runtime.version = '1.19.0'; },
     value => { value.view.providers[0].state = 'available'; },
     value => { value.view.diagnostics.push('capabilities_pending'); }]) {

@@ -3938,6 +3938,7 @@ export class OpenCodeProviderManagementAdapter
   ): Promise<ProviderManagementResult<ProviderManagementView>> {
     const inventoryService = this.deps.inventoryService ?? openCodeInventoryService
     const inventory = await this.probeInventory(inventoryService, request.projectPath, {
+      v1SettingsOnly: true,
       abortSignal: deadline.signal,
       progress,
     })
@@ -3981,6 +3982,7 @@ export class OpenCodeProviderManagementAdapter
       host = await hostManager.ensureHost({
         projectPath: inventory.projectPath,
         preparedProfile: inventory.profile ?? undefined,
+        prewarmManagedSubscriptionPlugins: false,
         profileOptions: {
           includeAppMcp: false,
         },
