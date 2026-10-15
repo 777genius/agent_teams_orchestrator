@@ -450,10 +450,6 @@ inline bool queryNormalizedDos(HANDLE handle, std::wstring& result, DWORD& win32
 
 inline bool queryFileIdentity(HANDLE handle, FileIdentity& result, Failure& failureOut,
                               Operation stage) {
-  BY_HANDLE_FILE_INFORMATION basic{};
-  if (GetFileInformationByHandle(handle, &basic) == 0)
-    return failureOut = nativeFailure(stage, GetLastError()), false;
-
   FILE_ATTRIBUTE_TAG_INFO tag{};
   if (GetFileInformationByHandleEx(handle, FileAttributeTagInfo, &tag, sizeof(tag)) == 0)
     return failureOut = nativeFailure(stage, GetLastError()), false;
@@ -464,12 +460,12 @@ inline bool queryFileIdentity(HANDLE handle, FileIdentity& result, Failure& fail
 
   if (GetFileType(handle) != FILE_TYPE_DISK)
     return failureOut = denied(stage), false;
-  if ((basic.dwFileAttributes & (FILE_ATTRIBUTE_DEVICE | FILE_ATTRIBUTE_REPARSE_POINT)) != 0 ||
+  if ((tag.FileAttributes & (FILE_ATTRIBUTE_DEVICE | FILE_ATTRIBUTE_REPARSE_POINT)) != 0 ||
       tag.ReparseTag != 0)
     return failureOut = denied(stage), false;
   result.volumeSerial = fileId.VolumeSerialNumber;
   std::memcpy(result.fileId, &fileId.FileId, sizeof(result.fileId));
-  result.directory = (basic.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+  result.directory = (tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
   if (!queryNormalizedNt(handle, result.ntPath, failureOut.win32))
     return failureOut = nativeFailure(stage, failureOut.win32), false;
   return true;
@@ -844,10 +840,7 @@ inline int32_t resolveImpl(uint64_t contextId, const wchar_t* input, uint32_t in
   if (dosWin32 != ERROR_ACCESS_DENIED)
     return finishFailure(failure(NOT_APPLICABLE, OperationResolveDosFallback, dosWin32), outError);
 
-  std::wstring targetNt;
-  DWORD ntWin32 = ERROR_SUCCESS;
-  if (!queryNormalizedNt(inputPath.handles.back().get(), targetNt, ntWin32))
-    return finishFailure(nativeFailure(OperationResolveNtQuery, ntWin32), outError);
+  const std::wstring& targetNt = heldTarget.ntPath;
 
   const HeldAnchor* selected = nullptr;
   for (const HeldAnchor& anchor : context->anchors) {
@@ -890,13 +883,10 @@ inline int32_t resolveImpl(uint64_t contextId, const wchar_t* input, uint32_t in
   if (!queryFileIdentity(inputPath.handles.back().get(), refreshedTarget, failureOut,
                          OperationResolveTargetIdentity))
     return finishFailure(failureOut, outError);
-  std::wstring refreshedTargetNt;
-  DWORD refreshedWin32 = ERROR_SUCCESS;
-  if (!queryNormalizedNt(inputPath.handles.back().get(), refreshedTargetNt, refreshedWin32))
-    return finishFailure(nativeFailure(OperationResolveTargetIdentity, refreshedWin32), outError);
+
   if (refreshedTarget.volumeSerial != heldTarget.volumeSerial ||
       !sameFileId(refreshedTarget.fileId, heldTarget.fileId) ||
-      !equalOrdinal(refreshedTargetNt, heldTarget.ntPath, false))
+      !equalOrdinal(refreshedTarget.ntPath, heldTarget.ntPath, false))
     return finishFailure(denied(OperationResolveTargetIdentity), outError);
   if (!revalidateAnchor(*selected, failureOut))
     return finishFailure(failureOut, outError);

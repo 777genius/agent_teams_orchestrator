@@ -79,7 +79,8 @@ export async function validateExecutionProfile(profile: OwnedNativeProfile): Pro
 /** Receipt covers the owner's reviewed graph, including generated client and server dependencies. */
 export type ExecutionGraphProgress = Readonly<{ phase: 'hash' | 'closure'; completed: number; total: number }>
 export async function validateExecutionGraph(pin: '2.0.0' | '2.0.21', receipt: ExecutionGraph,
-  progress?: (value: ExecutionGraphProgress) => void) {
+  progress?: (value: ExecutionGraphProgress) => void, signal?: AbortSignal) {
+  signal?.throwIfAborted()
   executionAssert(receipt.files.length > 0 && receipt.files.length <= 65_536)
   const rows = [...receipt.files].sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0)
   executionAssert(new Set(rows.map(row => row.path)).size === rows.length && executionHash(rows) === receipt.sha256, 'execution_graph_changed')
@@ -91,10 +92,13 @@ export async function validateExecutionGraph(pin: '2.0.0' | '2.0.21', receipt: E
   const worker = async () => {
     try {
       while (!failed) {
+        signal?.throwIfAborted()
         const row = rows[next++]
         if (!row) return
         executionAssert(/^[a-f0-9]{64}$/.test(row.sha256) && path.isAbsolute(row.path) && await filesystem.realpath(row.path) === row.path)
-        executionAssert(await hashOpenCodeFile(row.path) === row.sha256, 'execution_graph_changed')
+        signal?.throwIfAborted()
+        executionAssert(await hashOpenCodeFile(row.path, signal) === row.sha256, 'execution_graph_changed')
+        signal?.throwIfAborted()
         completed++
         if (completed % 16 === 0 || completed === rows.length) progress?.({ phase: 'hash', completed, total: rows.length })
       }
@@ -106,14 +110,18 @@ export async function validateExecutionGraph(pin: '2.0.0' | '2.0.21', receipt: E
   // A failed row stops new claims; join every already claimed read before reject.
   await Promise.allSettled(Array.from({ length: Math.min(16, rows.length) }, worker))
   if (failed) throw failure
+  signal?.throwIfAborted()
   progress?.({ phase: 'closure', completed: rows.length, total: rows.length })
+  signal?.throwIfAborted()
   const graph = await verifyOpenCodeV2ServerGraph(pin)
+  signal?.throwIfAborted()
   executionAssert(rows.some(row => row.path === graph.modulePath && row.sha256 === graph.moduleSha256) &&
     rows.some(row => row.path === graph.effectPath), 'execution_graph_incomplete')
   const listed = new Set(rows.map(row => row.path)), visited = new Set<string>()
   const locate = async (name: string, from: string): Promise<string> => {
     executionAssert(/^(?:@[a-z0-9._-]+\/)?[a-z0-9._-]+$/.test(name), 'execution_graph_incomplete')
     for (let directory = from; ; directory = path.dirname(directory)) {
+      signal?.throwIfAborted()
       const candidate = path.join(directory, 'node_modules', name)
       try { return await filesystem.realpath(candidate) } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
@@ -123,6 +131,7 @@ export async function validateExecutionGraph(pin: '2.0.0' | '2.0.21', receipt: E
   }
   const packageRoot = async (entry: string): Promise<string> => {
     for (let directory = path.dirname(entry); ; directory = path.dirname(directory)) {
+      signal?.throwIfAborted()
       try { await lstat(path.join(directory, 'package.json')); return directory } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
       }
@@ -130,6 +139,7 @@ export async function validateExecutionGraph(pin: '2.0.0' | '2.0.21', receipt: E
     }
   }
   const visit = async (root: string, expectedName: string): Promise<void> => {
+    signal?.throwIfAborted()
     const metadata = executionRecord(await readOpenCodePackageManifest(path.join(root, 'package.json')))
     executionAssert(metadata.name === expectedName && typeof metadata.version === 'string', 'execution_graph_changed')
     if (visited.has(root)) return
@@ -137,7 +147,9 @@ export async function validateExecutionGraph(pin: '2.0.0' | '2.0.21', receipt: E
     if (/^@opencode\/(?:client|server|core|schema|protocol|util|simulation)$/.test(metadata.name)) executionAssert(metadata.version === pin, 'execution_graph_changed')
     if (metadata.name === 'effect') executionAssert(metadata.version === '4.0.0-rc.112', 'execution_graph_changed')
     const walk = async (directory: string): Promise<void> => {
+      signal?.throwIfAborted()
       for (const item of await readdir(directory, { withFileTypes: true })) {
+        signal?.throwIfAborted()
         if (item.name === 'node_modules') continue
         const file = path.join(directory, item.name)
         executionAssert(!item.isSymbolicLink(), 'execution_graph_incomplete')
@@ -160,6 +172,7 @@ export async function validateExecutionGraph(pin: '2.0.0' | '2.0.21', receipt: E
       await visit(resolved, dependencyPackageName(name, optional[name]))
     }
   }
+  signal?.throwIfAborted()
   const client = await filesystem.realpath(Bun.resolveSync(pin === '2.0.0' ? '@opencode/client-v2-floor' : '@opencode/client', import.meta.dir))
   await visit(await packageRoot(graph.modulePath), '@opencode/server')
   await visit(await packageRoot(graph.effectPath), 'effect')

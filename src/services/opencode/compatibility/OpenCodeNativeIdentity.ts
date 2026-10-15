@@ -25,24 +25,30 @@ export async function readOpenCodePackageManifest(file: string): Promise<unknown
   } finally { await handle.close() }
 }
 
-export async function hashOpenCodeFile(file: string): Promise<string> {
+export async function hashOpenCodeFile(file: string, signal?: AbortSignal): Promise<string> {
+  signal?.throwIfAborted()
   const handle = await open(file, 'r')
   try {
+    signal?.throwIfAborted()
     const before = await handle.stat()
     if (!before.isFile() || before.size > 256 * 1024 * 1024) throw new Error('identity_mismatch')
     const hash = createHash('sha256')
     // Keep one explicit handle owner. Bun 1.3.11's streamed FileHandle reads
     // can invalidate later child stdio after hashing a large package graph.
     const bytes = Buffer.alloc(Math.max(1, Math.min(64 * 1024, before.size)))
-    for (let offset = 0;;) {
-      const { bytesRead } = await handle.read(bytes, 0, bytes.length, offset)
-      if (bytesRead === 0) break
+    for (let offset = 0; offset < before.size;) {
+      signal?.throwIfAborted()
+      const { bytesRead } = await handle.read(bytes, 0, Math.min(bytes.length, before.size - offset), offset)
+      signal?.throwIfAborted()
+      if (bytesRead === 0) throw new Error('identity_mismatch')
       offset += bytesRead
       if (offset > 256 * 1024 * 1024) throw new Error('identity_mismatch')
       hash.update(bytes.subarray(0, bytesRead))
     }
+    signal?.throwIfAborted()
     const after = await handle.stat()
     const current = await stat(file)
+    signal?.throwIfAborted()
     if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size ||
       before.mtimeMs !== after.mtimeMs || after.ino !== current.ino || after.dev !== current.dev) {
       throw new Error('identity_mismatch')

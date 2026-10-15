@@ -67,3 +67,11 @@ test('file hashing matches independent SHA for empty, tiny and multiple read chu
     }
   } finally { await rm(root, { recursive: true, force: true }) }
 })
+
+
+test('cancelled file hashing rejects the caller reason before opening a missing path', async () => {
+  const controller = new AbortController()
+  const reason = new Error('TEST-hash-cancelled')
+  controller.abort(reason)
+  await expect(hashOpenCodeFile(path.join(tmpdir(), 'TEST-missing-cancelled-hash'), controller.signal)).rejects.toBe(reason)
+})

@@ -121,7 +121,7 @@ async function start(input: Record<string, unknown>): Promise<void> {
   await validateExecutionNative(native)
   controller.signal.throwIfAborted()
   enterStartupStage('graph-validation')
-  const graph = await validateExecutionGraph(native.version, native.graph, value => { graphProgress = value })
+  const graph = await validateExecutionGraph(native.version, native.graph, value => { graphProgress = value }, controller.signal)
   controller.signal.throwIfAborted()
   const options = {
     hostname: '127.0.0.1', port: 0, password: input.password,
