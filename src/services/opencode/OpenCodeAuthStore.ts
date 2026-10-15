@@ -20,6 +20,7 @@ type OpenCodeOAuthCredential = OpenCodeAuthCredential & {
 }
 type OpenCodeAuthEntry = OpenCodeAuthCredential
 export type OpenCodeAuthStore = Record<string, OpenCodeAuthEntry>
+export type OpenCodeInitialSelectedAuthPublisher = (content: string, sha256: string, signal?: AbortSignal) => Promise<void>
 
 export type OpenCodeOAuthSaveOwner = {
   projectPath: string
@@ -1238,6 +1239,7 @@ export async function materializeOpenCodeSelectedAuthCredential(input: {
   providerId: string
   credential: OpenCodeAuthCredential | null
   abortSignal?: AbortSignal
+  initialPublish?: OpenCodeInitialSelectedAuthPublisher
 }): Promise<void> {
   const providerId = normalizeProviderId(input.providerId)
   if (!providerId) {
@@ -1256,7 +1258,11 @@ export async function materializeOpenCodeSelectedAuthCredential(input: {
         throw new Error('OpenCode scoped authentication store is unavailable')
       }
       if (input.abortSignal?.aborted) throwOpenCodeAbortReason(input.abortSignal)
-      await writeOpenCodeAuthStore(input.authPath, expected)
+      if (input.initialPublish) {
+        const content = JSON.stringify(expected, null, 2)
+        await input.initialPublish(content, createHash('sha256').update(content).digest('hex'), input.abortSignal)
+        if (input.abortSignal?.aborted) throwOpenCodeAbortReason(input.abortSignal)
+      } else await writeOpenCodeAuthStore(input.authPath, expected)
       return
     }
     if (input.abortSignal?.aborted) throwOpenCodeAbortReason(input.abortSignal)

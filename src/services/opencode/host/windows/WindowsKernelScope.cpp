@@ -643,8 +643,8 @@ static std::string base64(const std::vector<BYTE> &bytes) {
   }
   return out;
 }
-static std::vector<BYTE> unbase64(const std::wstring &value, size_t maxBytes = 16384) {
-  require(maxBytes <= 128 * 1024 && value.size() % 4 == 0 &&
+static std::vector<BYTE> unbase64Bounded(const std::wstring &value, size_t maxBytes) {
+  require(maxBytes <= 4 * 1024 * 1024 && value.size() % 4 == 0 &&
               value.size() <= ((maxBytes + 2) / 3) * 4, "execution_owner_unknown");
   std::vector<BYTE> out;
   auto digit = [](wchar_t c) -> int {
@@ -677,6 +677,11 @@ static std::vector<BYTE> unbase64(const std::wstring &value, size_t maxBytes = 1
   }
   require(out.size() <= maxBytes, "execution_owner_unknown");
   return out;
+}
+// Existing record/metadata callers retain their original independent ceiling.
+static std::vector<BYTE> unbase64(const std::wstring &value, size_t maxBytes = 16384) {
+  require(maxBytes <= 128 * 1024, "execution_owner_unknown");
+  return unbase64Bounded(value, maxBytes);
 }
 using NtCreateFileFunction = NTSTATUS(NTAPI *)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES,
                                                PIO_STATUS_BLOCK, PLARGE_INTEGER, ULONG, ULONG,
@@ -1950,6 +1955,91 @@ public:
     directoryMode(directory.file.value);
     return directory;
   }
+  // Fixed fresh-profile publications. Ordinary creator authority is required;
+  // preparatory and reopened handles never acquire file creation rights.
+  JsonObject writePrepared(const JsonObject &input, bool config) {
+    require(input.Size() == 4 &&
+                text(input, L"op") == (config ? L"ownerWritePreparedConfig" : L"ownerWritePreparedAuth") &&
+                input.HasKey(L"handleId") && input.HasKey(L"bytesBase64") && input.HasKey(L"sha256"),
+            "execution_invalid_response");
+    auto &directory = held(input);
+    require(directory.writable && directory.owner == currentSid(), "execution_owner_read_only");
+    const std::wstring suffix = config ? L"\\config\\opencode" : L"\\data\\opencode";
+    const std::wstring profileNamespace = L"\\opencode\\v2\\profiles\\";
+    require(directory.path.size() > suffix.size() &&
+                equalPath(directory.path.substr(directory.path.size() - suffix.size()), suffix),
+            "execution_owner_prepared_purpose_invalid");
+    const auto root = directory.path.substr(0, directory.path.size() - suffix.size());
+    const auto split = root.find_last_of(L'\\');
+    require(split != std::wstring::npos && split >= profileNamespace.size() - 1 &&
+                equalPath(root.substr(split + 1 - profileNamespace.size(), profileNamespace.size()),
+                          profileNamespace) && validTeamId(root.substr(split + 1)),
+            "execution_owner_prepared_purpose_invalid");
+    const auto expectedHash = text(input, L"sha256");
+    require(expectedHash.size() == 64 &&
+                expectedHash.find_first_not_of(L"0123456789abcdef") == std::wstring::npos,
+            "execution_owner_prepared_invalid");
+    const size_t limit = config ? 4 * 1024 * 1024 : 128 * 1024;
+    const auto data = config ? unbase64Bounded(text(input, L"bytesBase64"), limit) :
+                               unbase64(text(input, L"bytesBase64"), limit);
+    require(!data.empty() && wide(base64(data)) == text(input, L"bytesBase64"),
+            "execution_owner_prepared_invalid");
+    try { (void)JsonObject::Parse(wide(std::string(data.begin(), data.end()))); }
+    catch (...) { throw NativeError{"execution_owner_prepared_invalid"}; }
+    SharedAclMutex mutation(directory.identity);
+    held(input);
+    const std::wstring name = config ? L"opencode.json" : L"auth.json";
+    LocalMemory descriptor;
+    const auto sddl = L"O:" + directory.owner + L"D:P(A;;FA;;;SY)(A;;FA;;;" + directory.owner + L")";
+    require(ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.c_str(), SDDL_REVISION_1, &descriptor.value, nullptr) != 0,
+            "execution_owner_unknown");
+    auto create = reinterpret_cast<NtCreateFileFunction>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtCreateFile"));
+    auto convert = reinterpret_cast<NtStatusErrorFunction>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlNtStatusToDosError"));
+    require(create && convert, "execution_owner_unknown");
+    UNICODE_STRING relative{};
+    relative.Buffer = const_cast<wchar_t *>(name.data());
+    relative.Length = static_cast<USHORT>(name.size() * sizeof(wchar_t));
+    relative.MaximumLength = relative.Length;
+    OBJECT_ATTRIBUTES attributes{};
+    attributes.Length = sizeof(attributes);
+    attributes.RootDirectory = directory.file.value;
+    attributes.ObjectName = &relative;
+    attributes.Attributes = 0x40;
+    attributes.SecurityDescriptor = descriptor.value;
+    IO_STATUS_BLOCK completion{};
+    HANDLE raw = nullptr;
+    const auto status = create(&raw, GENERIC_READ | GENERIC_WRITE | READ_CONTROL | SYNCHRONIZE,
+        &attributes, &completion, nullptr, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ,
+        FILE_CREATE, 0x40 | 0x20 | 0x200000 | 0x2, nullptr, 0);
+    Handle file(raw);
+    if (status != 0 || completion.Status != 0) {
+      const auto native = status != 0 ? status : completion.Status;
+      throw NativeError{"execution_owner_unknown", convert(native),
+                        "owner_prepared_create", static_cast<DWORD>(native)};
+    }
+    require(equalPath(finalPath(file.value), extended(directory.path + L"\\" + name)),
+            "execution_owner_unknown");
+    const auto identity = fileIdentity(file.value, directory.owner, false, selectedPackage);
+    DWORD written = 0;
+    require(WriteFile(file.value, data.data(), static_cast<DWORD>(data.size()), &written, nullptr) &&
+                written == data.size() && FlushFileBuffers(file.value), "execution_owner_unknown");
+    require(heldFileSha256(file.value) == expectedHash && heldFileBytes(file.value, static_cast<DWORD>(limit)) == data &&
+                fileIdentity(file.value, directory.owner, false, selectedPackage).Stringify() == identity.Stringify(),
+            "execution_owner_prepared_invalid");
+    held(input);
+    JsonObject result;
+    num(result, L"schema", 1); flag(result, L"ok", true);
+    str(result, L"path", directory.path + L"\\" + name);
+    result.SetNamedValue(L"directoryIdentity", directory.identity);
+    result.SetNamedValue(L"fileIdentity", identity);
+    num(result, L"bytes", written); str(result, L"sha256", expectedHash);
+    flag(result, L"flushed", true); flag(result, L"privateAcl", true);
+    flag(result, L"reparse", false); num(result, L"links", 1);
+    return result;
+  }
   JsonObject writeMetadata(const JsonObject &input) {
     require(input.Size() == 4 && text(input, L"op") == L"ownerWriteMetadata" &&
                 input.HasKey(L"handleId") && input.HasKey(L"purpose") &&
@@ -2342,6 +2432,8 @@ public:
       return readMetadata(input);
     if (operation == L"ownerWriteMetadata")
       return writeMetadata(input);
+    if (operation == L"ownerWritePreparedConfig" || operation == L"ownerWritePreparedAuth")
+      return writePrepared(input, operation == L"ownerWritePreparedConfig");
     // Close remains possible after identity/mutation uncertainty. It only drops
     // this native capability and never erases or adopts an acquisition fence.
     if (operation == L"ownerCloseDirectory") {

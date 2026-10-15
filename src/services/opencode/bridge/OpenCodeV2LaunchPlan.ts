@@ -18,6 +18,8 @@ import { createOpenCodeV2ExecutionConfig } from '../profile/OpenCodeV2ExecutionC
 import { createOpenCodeV2ExecutionReceipt } from '../profile/OpenCodeV2ExecutionReceipt.js'
 import { privateOpenCodeReadEnvironment } from '../profile/OpenCodeV2ManagedConfig.js'
 import { ensureWindowsPrivateDirectories } from '../profile/OpenCodePrivateDirectories.js'
+import { createWindowsNativeBroker, resolveWindowsNativeArtifact } from '../host/windows/OpenCodeV2WindowsNativeBroker.js'
+import { createWindowsOwnerFilesystem, type WindowsOwnerDirectory } from '../host/windows/OpenCodeV2WindowsOwnerFilesystem.js'
 import { buildOpenCodeAppManagedBootstrapContextText } from '../OpenCodeBridgeCommandHandler.js'
 import { parseOpenCodeBridgePreconditions, requireOpenCodeExpectedBehaviorFingerprint, validateOpenCodeBridgeStateChangingPreconditions } from '../OpenCodeBridgePreconditions.js'
 import type { ExecutionMcpConfig } from '../transport/OpenCodeV2ExecutionClientFactory.js'
@@ -247,25 +249,45 @@ export async function createOpenCodeV2PreparedMember(selection: Awaited<ReturnTy
     const root = candidate ?? await realpath(await mkdtemp(path.join(profileParent, prefix)))
     const directories = ['home', 'config', 'data', 'cache', 'state', 'tmp', 'appdata', 'localappdata'].map(name => path.join(root, name))
     const configDirectory = path.join(root, 'config', 'opencode'), nativeData = path.join(root, 'data', 'opencode')
-    if (process.platform === 'win32') await ensureWindowsPrivateDirectories([root, ...directories, configDirectory, nativeData], [root])
+    if (process.platform === 'win32') await ensureWindowsPrivateDirectories([root, ...directories], [root])
     else {
       for (const directory of directories) await mkdir(directory, { mode: 0o700 })
       await mkdir(configDirectory, { mode: 0o700 }); await mkdir(nativeData, { mode: 0o700 })
     }
-    const provider = await materializeOpenCodeSelectedScopeAuth(selection.scope, selection.project, path.join(nativeData, 'auth.json'), selection.model.id)
     const managedAuthPath = path.join(nativeData, 'auth.json')
-    const managedAuthFingerprint = await hashOpenCodeFile(managedAuthPath)
     const anonymous = selection.scope.selectedAuthIdentity === 'absent'
-    // An empty sealed store binds the normal proof without pretending the native
-    // public marker is a credential. The host's read-only catalog guard must still
-    // qualify this exact free model before admitting any native session.
-    if (anonymous) executionAssert(Object.keys(executionRecord(JSON.parse(await readFile(managedAuthPath, 'utf8')))).length === 0,
-      'run_selected_auth_changed')
     const model = { ...selection.model, variant: variant ?? 'default' }
     const selected = { agent: 'build', model, permissions: [{ action: '*', resource: '*', effect: 'allow' as const }] }
-    const config = createOpenCodeV2ExecutionConfig({ pin: native.version, selection: selected,
-      controller: { server: 'agent-teams', config: selection.controller }, provider, unattendedTeam: input.unattendedTeam })
-    await writeFile(path.join(configDirectory, 'opencode.json'), config.content, { flag: 'wx', mode: 0o600 })
+    const publisher = process.platform === 'win32'
+      ? createWindowsNativeBroker(await resolveWindowsNativeArtifact()) : undefined
+    publisher?.events.on('error', () => {})
+    const held: WindowsOwnerDirectory[] = []
+    let config: ReturnType<typeof createOpenCodeV2ExecutionConfig>
+    let managedAuthFingerprint: string
+    try {
+      const filesystem = publisher ? createWindowsOwnerFilesystem(request => publisher.request(request.op, request)) : undefined
+      const configOwner = filesystem ? await filesystem.createDirectory(configDirectory) : undefined
+      if (configOwner) held.push(configOwner)
+      const authOwner = filesystem ? await filesystem.createDirectory(nativeData) : undefined
+      if (authOwner) held.push(authOwner)
+      const provider = await materializeOpenCodeSelectedScopeAuth(selection.scope, selection.project, managedAuthPath,
+        selection.model.id, undefined, authOwner ? (content, sha256, signal) =>
+          authOwner.writePreparedAuth(content, sha256, undefined, signal) : undefined)
+      managedAuthFingerprint = await hashOpenCodeFile(managedAuthPath)
+      // An empty sealed store binds the normal proof without pretending the native
+      // public marker is a credential. The host's read-only catalog guard must still
+      // qualify this exact free model before admitting any native session.
+      if (anonymous) executionAssert(Object.keys(executionRecord(JSON.parse(await readFile(managedAuthPath, 'utf8')))).length === 0,
+        'run_selected_auth_changed')
+      config = createOpenCodeV2ExecutionConfig({ pin: native.version, selection: selected,
+        controller: { server: 'agent-teams', config: selection.controller }, provider, unattendedTeam: input.unattendedTeam })
+      if (configOwner) await configOwner.writePreparedConfig(config.content, config.sha256)
+      else await writeFile(path.join(configDirectory, 'opencode.json'), config.content, { flag: 'wx', mode: 0o600 })
+    } finally {
+      const closed = await Promise.allSettled(held.reverse().map(directory => directory.close()))
+      await publisher?.close()
+      executionAssert(closed.every(result => result.status === 'fulfilled'), 'cleanup_unknown')
+    }
     const env = createOpenCodeV2OwnedProfileEnvironment(root)
     if (process.platform === 'darwin' && native.taskNode)
       env.PATH = [path.dirname(native.taskNode.path), env.PATH].join(path.delimiter)

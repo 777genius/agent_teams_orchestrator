@@ -480,9 +480,21 @@ try {
   const inboxes = path.win32.join(claudeRoot, "teams", "TEST-team", "inboxes")
   const ownedInbox = retain(await filesystem.createDirectory(inboxes))
   await writeOwnedFixture(ownedInbox, inboxes, "user.json", "[]")
-  const selectedContent = JSON.stringify({ mcpServers: { "agent-teams": { type: "local",
+  const selectedContent = JSON.stringify({ 'TEST-padding': 'x'.repeat(128 * 1024), mcpServers: { "agent-teams": { type: "local",
     env: { AGENT_TEAMS_MCP_CLAUDE_DIR: claudeRoot } } } })
-  await writeOwnedFixture(ownedSelectedConfig, selectedConfigDirectory, "opencode.json", selectedContent)
+  assert.ok(Buffer.byteLength(selectedContent) > 128 * 1024)
+  const selectedHash = createHash('sha256').update(selectedContent).digest('hex')
+  await ownedSelectedConfig.writePreparedConfig(selectedContent, selectedHash)
+  assert.equal(await readFile(path.win32.join(selectedConfigDirectory, 'opencode.json'), 'utf8'), selectedContent)
+  const authContent = JSON.stringify({ 'TEST-provider': { type: 'api', key: 'TEST-never-used' } }, null, 2)
+  const authHash = createHash('sha256').update(authContent).digest('hex')
+  await ownedSelectedData.writePreparedAuth(authContent, authHash)
+  assert.equal(await readFile(path.win32.join(selectedDataDirectory, 'auth.json'), 'utf8'), authContent)
+  // CREATE_NEW must refuse even an identical replacement; no repair/adoption.
+  await assert.rejects(ownedSelectedConfig.writePreparedConfig(selectedContent, selectedHash))
+  await assert.rejects(ownedSelectedData.writePreparedAuth(authContent, authHash))
+  assert.equal(await readFile(path.win32.join(selectedConfigDirectory, 'opencode.json'), 'utf8'), selectedContent)
+  assert.equal(await readFile(path.win32.join(selectedDataDirectory, 'auth.json'), 'utf8'), authContent)
   const databasePath = path.win32.join(selectedDataDirectory, "opencode.db")
   await closeFixtureWriters()
   await request("ownerValidateSelectedProfile", { root: selectedRoot, databasePath,
@@ -499,6 +511,27 @@ try {
   const configSelection = await request("ownerSelectConfig", { root: selectedRoot, databasePath,
     sha256: createHash("sha256").update(selectedContent).digest("hex"), teamId: "TEST-team" })
   assertConfigOnlySelection(configSelection)
+  const authMetadata = executionRecord(await request('ownerReadMetadata', {
+    op: 'ownerReadMetadata', purpose: 'SelectedAuth', selectionId: executionRecord(configSelection).selectionId }))
+  assert.equal(authMetadata.sha256, authHash)
+  assert.equal(authMetadata.bytes, Buffer.byteLength(authContent))
+  assert.equal(authMetadata.privateAcl, true)
+  assert.equal(executionRecord(authMetadata.fileIdentity).ownerSid, executionRecord(authMetadata.directoryIdentity).ownerSid)
+  // Bypass the TS capability guard to test the native read-only boundary too.
+  for (const [directory, op, bytes, sha256] of [
+    [selectedConfigDirectory, 'ownerWritePreparedConfig', selectedContent, selectedHash],
+    [selectedDataDirectory, 'ownerWritePreparedAuth', authContent, authHash],
+  ] as const) {
+    for (const openOp of ['ownerOpenDirectory', 'ownerPreparePrivateDirectory'] as const) {
+      const opened = executionRecord(await request(openOp, { path: directory, createExclusive: false }))
+      try {
+        await assert.rejects(request(op, { op, handleId: opened.handleId,
+          bytesBase64: Buffer.from(bytes).toString('base64'), sha256 }), /execution_owner_read_only/)
+      } finally { await request('ownerCloseDirectory', { handleId: opened.handleId }) }
+    }
+  }
+  facts.preparedConfigAndAuthNativePublication = true
+  facts.preparedFilesRefuseReplacementAndReadOnlyPublication = true
   const selectionIds = [String(executionRecord(configSelection).selectionId)]
   await proveAbsence('missing-final-complete-profile')
   const binding = { teamId: 'TEST-team', runId: 'TEST-unpublished', controllerInstanceId: 'TEST-controller', ownerId: 'TEST-owner' }

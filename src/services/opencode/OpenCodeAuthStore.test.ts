@@ -1,4 +1,5 @@
 import { access, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
 import os from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -32,6 +33,56 @@ describe('OpenCodeAuthStore', () => {
 
   afterEach(async () => {
     await rm(tempDir, { recursive: true, force: true })
+  })
+
+  for (const credential of [null, { type: 'api', key: 'TEST-only-initial-key' }]) {
+    test(`publishes initial selected ${credential ? 'credential' : 'anonymous store'} once with exact bytes`, async () => {
+      const authPath = path.join(tempDir, 'initial-auth.json')
+      const expected = JSON.stringify(credential ? { test: credential } : {}, null, 2)
+      let publications = 0
+      const input = { authPath, providerId: 'test', credential, initialPublish: async (content: string, sha256: string) => {
+        publications++
+        expect(content).toBe(expected)
+        expect(sha256).toBe(createHash('sha256').update(expected).digest('hex'))
+        await writeFile(authPath, content, { flag: 'wx', mode: 0o600 })
+      } }
+      await materializeOpenCodeSelectedAuthCredential(input)
+      await materializeOpenCodeSelectedAuthCredential(input)
+      expect(publications).toBe(1)
+      expect(await readFile(authPath, 'utf8')).toBe(expected)
+      await expect(materializeOpenCodeSelectedAuthCredential({ ...input,
+        credential: { type: 'api', key: 'TEST-changed-key' } })).rejects.toThrow('changed since scope resolution')
+      expect(publications).toBe(1)
+      expect(await readFile(authPath, 'utf8')).toBe(expected)
+    })
+  }
+
+  test('initial publisher remains inside the auth lock and a queued abort never publishes', async () => {
+    const authPath = path.join(tempDir, 'locked-initial-auth.json')
+    let entered!: () => void, release!: () => void, publications = 0
+    const ready = new Promise<void>(resolve => { entered = resolve })
+    const held = new Promise<void>(resolve => { release = resolve })
+    const input = { authPath, providerId: 'test', credential: null, initialPublish: async (content: string) => {
+      publications++
+      entered()
+      await held
+      await writeFile(authPath, content, { flag: 'wx', mode: 0o600 })
+    } }
+    const first = materializeOpenCodeSelectedAuthCredential(input)
+    await ready
+    const second = materializeOpenCodeSelectedAuthCredential(input)
+    const controller = new AbortController()
+    const aborted = materializeOpenCodeSelectedAuthCredential({ ...input, abortSignal: controller.signal })
+      .then(() => null, error => error)
+    try {
+      await new Promise(resolve => setTimeout(resolve, 30))
+      expect(publications).toBe(1)
+      controller.abort(new Error('TEST-initial-auth-aborted'))
+    } finally { release() }
+    await Promise.all([first, second])
+    expect(await aborted).toBe(controller.signal.reason)
+    expect(publications).toBe(1)
+    expect(await readFile(authPath, 'utf8')).toBe('{}')
   })
 
   for (const operationName of ['upsert', 'remove', 'materialize'] as const) {

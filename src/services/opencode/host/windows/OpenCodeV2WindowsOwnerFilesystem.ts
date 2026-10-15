@@ -1,4 +1,5 @@
 import path from 'node:path'
+import { createHash } from 'node:crypto'
 import { canonicalExecutionJSON, executionAssert, executionRecord } from '../../execution/OpenCodeV2ExecutionContracts.js'
 
 const MAX_BYTES = 16 * 1024
@@ -11,6 +12,7 @@ export type WindowsOwnerNativeRequest =
   | Readonly<{ op: 'ownerValidateSelectedProfile'; root: string; databasePath: string; directories: readonly string[] }>
   | Readonly<{ op: 'ownerOpenDirectory' | 'ownerPreparePrivateDirectory'; path: string; createExclusive: boolean }>
   | Readonly<{ op: 'ownerAssertDirectory'; handleId: string; path: string }>
+  | Readonly<{ op: 'ownerWritePreparedConfig' | 'ownerWritePreparedAuth'; handleId: string; bytesBase64: string; sha256: string }>
   | Readonly<{ op: 'ownerWriteExclusive'; handleId: string; name: string; bytesBase64: string }>
   | Readonly<{ op: 'ownerReadRecord'; handleId: string; name: string; maxBytes: number }>
   | Readonly<{ op: 'ownerReadMetadata'; purpose: 'ProbeGuard' | 'ProbeRecord'; handleId: string }>
@@ -108,6 +110,8 @@ export type WindowsOwnerDirectory = Readonly<{
   identity: WindowsOwnerFileIdentity
   assertOwned(deadline?: number, signal?: AbortSignal): Promise<void>
   writeExclusive(name: string, value: unknown, deadline?: number, signal?: AbortSignal): Promise<void>
+  writePreparedConfig(content: string, sha256: string, deadline?: number, signal?: AbortSignal): Promise<void>
+  writePreparedAuth(content: string, sha256: string, deadline?: number, signal?: AbortSignal): Promise<void>
   readRecord(name: string, deadline?: number, signal?: AbortSignal): Promise<unknown>
   readMetadata(purpose: 'ProbeGuard' | 'ProbeRecord', deadline?: number, signal?: AbortSignal): Promise<Readonly<{
     purpose: 'ProbeGuard' | 'ProbeRecord'; path: string; directoryIdentity: WindowsOwnerFileIdentity
@@ -149,6 +153,30 @@ export function createWindowsOwnerFilesystem(native: WindowsOwnerNativePort, sel
       executionAssert(createExclusive && !prepareOnly && !archived, 'execution_owner_read_only')
       try { await action() } catch (error) { uncertain = true; throw error }
     }
+    const writePrepared = (kind: 'Config' | 'Auth', content: string, sha256: string,
+      deadline?: number, signal?: AbortSignal): Promise<void> => serialize(async () => {
+      const bytes = Buffer.from(content, 'utf8'), limit = kind === 'Config' ? 4 * 1024 * 1024 : 128 * 1024
+      executionAssert(bytes.length > 0 && bytes.length <= limit && bytes.toString('utf8') === content &&
+        /^[a-f0-9]{64}$/.test(sha256) && createHash('sha256').update(bytes).digest('hex') === sha256,
+      'execution_owner_prepared_invalid')
+      executionRecord(JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)))
+      const scope = kind === 'Config' ? 'config' : 'data'
+      executionAssert(new RegExp('\\\\opencode\\\\v2\\\\profiles\\\\[^\\\\]+\\\\' + scope + '\\\\opencode$', 'i').test(currentPath),
+        'execution_owner_prepared_purpose_invalid')
+      await mutate(async () => {
+        const row = response(await native({ op: kind === 'Config' ? 'ownerWritePreparedConfig' : 'ownerWritePreparedAuth',
+          handleId, bytesBase64: bytes.toString('base64'), sha256 }, deadline, signal))
+        const expectedPath = path.win32.join(currentPath, kind === 'Config' ? 'opencode.json' : 'auth.json')
+        executionAssert(Object.keys(row).sort().join(',') ===
+          'bytes,directoryIdentity,fileIdentity,flushed,links,ok,path,privateAcl,reparse,schema,sha256' &&
+          row.path === expectedPath && row.bytes === bytes.length && row.sha256 === sha256 && row.flushed === true &&
+          row.privateAcl === true && row.reparse === false && row.links === 1, 'execution_owner_unknown')
+        const dir = identity(row.directoryIdentity), file = identity(row.fileIdentity)
+        executionAssert(sameIdentity(dir, originalIdentity) && file.ownerSid === dir.ownerSid &&
+          file.volumeSerial === dir.volumeSerial, 'execution_owner_unknown')
+        await assertOwned(deadline, signal)
+      }, deadline, signal)
+    })
     return Object.freeze({ identity: originalIdentity,
       assertOwned: (deadline?: number, signal?: AbortSignal) => serialize(() => assertOwned(deadline, signal)),
       writeExclusive: (recordName: string, value: unknown, deadline?: number, signal?: AbortSignal) => serialize(async () => {
@@ -162,6 +190,8 @@ export function createWindowsOwnerFilesystem(native: WindowsOwnerNativePort, sel
           await assertOwned(deadline, signal)
         }, deadline, signal)
       }),
+      writePreparedConfig: (content: string, sha256: string, deadline?: number, signal?: AbortSignal) => writePrepared('Config', content, sha256, deadline, signal),
+      writePreparedAuth: (content: string, sha256: string, deadline?: number, signal?: AbortSignal) => writePrepared('Auth', content, sha256, deadline, signal),
       readRecord: (recordName: string, deadline?: number, signal?: AbortSignal) => serialize(async () => {
         name(recordName); await assertOwned(deadline, signal)
         const row = response(await native({ op: 'ownerReadRecord', handleId, name: recordName, maxBytes: MAX_BYTES }, deadline, signal))
