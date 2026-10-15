@@ -155,14 +155,15 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
           }
         }
         const candidates = rows.filter(row => unownedCandidates.has(row.pid))
-        for (const row of candidates) {
-          const state = row.pid === process.pid || row.pid === process.ppid ? 'protected' : ports.alive(row.pid)
-          if (state !== 'gone') {
-            throw cleanupUnknown(state === 'protected' ? 'protected_candidate'
-              : state === 'alive' ? 'candidate_alive' : 'candidate_unknown')
-          }
+        let waiting = false
+        // A live candidate may outlast its stale census row. Observe every
+        // enrolled PID until independently gone; waiting grants no authority.
+        for (const target of unownedCandidates) {
+          const state = target === process.pid || target === process.ppid ? 'protected' : ports.alive(target)
+          if (state === 'alive') waiting = true
+          else if (state !== 'gone') throw cleanupUnknown(state === 'protected' ? 'protected_candidate' : 'candidate_unknown')
         }
-        return candidates.length > 0
+        return candidates.length > 0 || waiting
       }
       if (rows.some(row => !row.retired &&
         (unownedCandidates.has(row.pid) || unownedCandidates.has(row.ppid)))) throw cleanupUnknown('strict_candidate_census')

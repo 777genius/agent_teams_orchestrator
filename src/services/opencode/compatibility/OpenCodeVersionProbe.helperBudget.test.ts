@@ -324,7 +324,7 @@ test('darwin gone group member with reparented PPID requires absence and final c
 // The wrapper can close before the first birth helper completes while WMI still
 // returns its old tree. These rows must never confer birth or signal authority.
 function unanchoredFixture(mode: 'gone' | 'alive' | 'unknown' | 'orphan' | 'reused' | 'persistent' |
-  'final-reappeared' | 'absence-before-close' | 'stale-captured' | 'stale-queryable' | 'stale-queryable-unknown' | 'stale-queryable-final-reappeared') {
+  'final-reappeared' | 'absence-before-close' | 'stale-captured' | 'stale-queryable' | 'stale-queryable-unknown' | 'stale-queryable-final-reappeared' | 'transient-live-candidate' | 'persistent-live-after-absence') {
   Object.defineProperty(process, 'platform', { value: 'win32' })
   const root = 900_020, relay = 900_021, leaf = 900_022, orphan = 900_023, grandchild = 900_024
   let clock = 1_000_000, removed = 0, trees = 0, births = 0
@@ -352,7 +352,8 @@ function unanchoredFixture(mode: 'gone' | 'alive' | 'unknown' | 'orphan' | 'reus
     },
     tree: async budget => {
       budgets.push(budget); trees++
-      let rows = trees === 1 || mode === 'persistent' ? initialRows : []
+      let rows = trees === 1 || mode === 'persistent' ||
+        (mode === 'transient-live-candidate' && trees <= 3) ? initialRows : []
       if (trees === 2 && mode === 'orphan') rows = [{ pid: grandchild, ppid: orphan }, { pid: orphan, ppid: leaf }]
       if (trees === 2 && mode === 'reused') rows = [{ pid: leaf, ppid: 900_099 }]
       if (trees === 3 && (mode === 'final-reappeared' || mode === 'stale-queryable-final-reappeared')) rows = [{ pid: orphan, ppid: leaf }]
@@ -362,8 +363,10 @@ function unanchoredFixture(mode: 'gone' | 'alive' | 'unknown' | 'orphan' | 'reus
     alive: target => {
       aliveReads.push(target)
       if (mode === 'stale-queryable-unknown' && target === root) return 'unknown'
+      if (target === leaf && (mode === 'persistent-live-after-absence' ||
+        (mode === 'transient-live-candidate' && trees <= 2))) return 'alive'
       if ((mode === 'alive' && target === leaf) || (mode === 'orphan' && target === grandchild) ||
-        (mode === 'reused' && trees === 2 && target === leaf)) return 'alive'
+        (mode === 'reused' && trees >= 2 && target === leaf)) return 'alive'
       return mode === 'unknown' && target === leaf ? 'unknown' : 'gone'
     },
     signal: target => { signals.push(target) },
@@ -386,7 +389,7 @@ function unanchoredFixture(mode: 'gone' | 'alive' | 'unknown' | 'orphan' | 'reus
 test('Windows unanchored gone rows require independent gone checks, raw absence and strict final census', async () => {
   const f = unanchoredFixture('gone')
   expect(await f.run()).toBe('1.19.0\n')
-  expect(f.aliveReads).toEqual([f.root, f.relay, f.leaf])
+  expect(f.aliveReads).toEqual([f.root, f.relay, f.leaf, f.root, f.relay, f.leaf])
   expect(f.events).toEqual(['census:rows', 'census:empty', 'census:empty', 'remove'])
   expect(f.births()).toBe(1)
   expect(f.signals).toEqual([])
@@ -398,7 +401,7 @@ test('Windows unanchored gone rows require independent gone checks, raw absence 
 test('Windows stale captured anchor retires only after gone checks, fresh absence, close and strict final census', async () => {
   const f = unanchoredFixture('stale-captured')
   expect(await f.run()).toBe('1.19.0\n')
-  expect(f.aliveReads).toEqual([f.root, f.root, f.relay, f.leaf])
+  expect(f.aliveReads).toEqual([f.root, f.root, f.relay, f.leaf, f.root, f.relay, f.leaf])
   expect(f.events).toEqual(['census:rows', 'census:empty', 'census:empty', 'remove'])
   expect(f.births()).toBe(2)
   expect(f.signals).toEqual([])
@@ -428,6 +431,27 @@ for (const mode of ['stale-queryable-unknown', 'stale-queryable-final-reappeared
   })
 }
 
+test('Windows observe-only transient live candidate waits for gone, raw absence and strict final census', async () => {
+  const f = unanchoredFixture('transient-live-candidate')
+  expect(await f.run()).toBe('1.19.0\n')
+  expect(f.events).toEqual(['census:rows', 'census:rows', 'census:rows', 'census:empty', 'census:empty', 'remove'])
+  expect(f.birthTargets).toEqual([f.root])
+  expect(f.signals).toEqual([])
+  expect(f.taskkills).toEqual([])
+  expect(f.removed()).toBe(1)
+})
+
+test('Windows observe-only live candidate remains pending after census absence until the original deadline', async () => {
+  const f = unanchoredFixture('persistent-live-after-absence')
+  await expect(f.run()).rejects.toThrow('cleanup_unknown')
+  expect(f.trees()).toBeGreaterThan(2)
+  expect(f.elapsed()).toBe(8000)
+  expect(f.birthTargets).toEqual([f.root])
+  expect(f.signals).toEqual([])
+  expect(f.taskkills).toEqual([])
+  expect(f.removed()).toBe(0)
+})
+
 test('Windows unanchored census absence waits for child close before strict final census and removal', async () => {
   const f = unanchoredFixture('absence-before-close')
   expect(await f.run()).toBe('1.19.0\n')
@@ -448,8 +472,11 @@ for (const mode of ['alive', 'unknown', 'orphan', 'reused', 'persistent', 'final
     expect(f.births()).toBe(1)
     expect(f.aliveReads).toContain(f.leaf)
     expect(f.budgets.every(budget => budget > 0 && budget <= 5000)).toBe(true)
-    if (mode === 'orphan') { expect(f.trees()).toBe(2); expect(f.aliveReads).toContain(f.grandchild) }
-    if (mode === 'reused') expect(f.trees()).toBe(2)
+    if (mode === 'orphan') {
+      expect(f.trees()).toBeGreaterThan(2); expect(f.elapsed()).toBe(8000)
+      expect(f.aliveReads).toContain(f.grandchild)
+    }
+    if (mode === 'reused') { expect(f.trees()).toBeGreaterThan(2); expect(f.elapsed()).toBe(8000) }
     if (mode === 'final-reappeared') expect(f.trees()).toBe(3)
     if (mode === 'persistent') expect(f.elapsed()).toBe(8000)
   })
