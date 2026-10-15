@@ -3311,8 +3311,11 @@ static void grantRoot(Scope &scope, Handle heldRoot, DWORD mask, ACCESS_MODE mod
     const auto after = sharedReadAclCustody(heldAcl, owner, scope.sid.value, "execution_containment_filesystem_denied");
     require(after.ownerSid == sharedBefore.ownerSid,
             "execution_containment_filesystem_denied", "shared_readonly_owner_changed");
-    require(after.daclControl == sharedBefore.daclControl,
-            "execution_containment_filesystem_denied", "shared_readonly_control_changed");
+    if (after.daclControl != sharedBefore.daclControl)
+      throw NativeError{"execution_containment_filesystem_denied",
+                        (static_cast<DWORD>(sharedBefore.daclControl) << 16) |
+                            static_cast<DWORD>(after.daclControl),
+                        "shared_readonly_control_changed"};
     require(after.foreignAces == sharedBefore.foreignAces,
             "execution_containment_filesystem_denied", "shared_readonly_foreign_changed");
     require(after.memberAllowed,
