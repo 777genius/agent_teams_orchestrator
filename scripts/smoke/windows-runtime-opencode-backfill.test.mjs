@@ -13,7 +13,7 @@ import { PassThrough } from 'node:stream';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { assertBackfillEnvelope, assertImportedLedger, buildWindowsTeardownCommand, createBackfillFixture, finishSmokeCleanup, fixtureScriptPaths, runSmokeGroups, sandboxEnvironment, stageRuntimeDelivery, teardownOwnedProcesses, trustedSearchPath, windowsNodeScriptPattern } from './windows-runtime-opencode-backfill.mjs';
 
-import { assertReadinessHost, runProviderSmoke, runRecordedCheck } from './windows-runtime-opencode-provider-json.mjs';
+import { actualProviderResult, catalogGuard, assertReadinessHost, runProviderSmoke, runRecordedCheck } from './windows-runtime-opencode-provider-json.mjs';
 import { environmentSummary, traceSpawn } from './windows-process-identity-probe.mjs';
 
 const repository = fileURLToPath(new URL('../../', import.meta.url));
@@ -22,6 +22,47 @@ const hash = value => createHash('sha256').update(value).digest('hex');
 const existingBun = () => (process.env.PATH || '').split(path.delimiter)
   .map(dir => path.join(dir, process.platform === 'win32' ? 'bun.exe' : 'bun'))
   .find(candidate => existsSync(candidate));
+
+test('actual provider comparison rejects static fallback and requires the selected native identity and model', () => {
+  const binary = 'C:\\TEST\\node_modules\\.bin\\opencode.cmd';
+  const view = { runtimeId: 'opencode', view: { runtime: { cliPath: binary, version: '1.18.31' },
+    providers: [{ providerId: 'deepinfra', state: 'connected' }], diagnostics: [] } };
+  const models = { runtimeId: 'opencode', models: { providerId: 'deepinfra', catalogState: 'fresh',
+    models: [{ providerId: 'deepinfra', modelId: 'TEST-local-catalog-model' }], diagnostics: [] } };
+  assert.equal(actualProviderResult(view, 'view', binary).passed, true);
+  assert.equal(actualProviderResult(models, 'models', binary).passed, true);
+  assert.equal(actualProviderResult(models, 'models', binary, 1).passed, false);
+  for (const mutate of [value => { value.view.runtime.cliPath = null; },
+    value => { value.view.runtime.version = '1.19.0'; },
+    value => { value.view.providers[0].state = 'available'; },
+    value => { value.view.diagnostics.push('capabilities_pending'); }]) {
+    const invalid = structuredClone(view); mutate(invalid);
+    assert.equal(actualProviderResult(invalid, 'view', binary).passed, false);
+  }
+  for (const mutate of [value => { value.models.catalogState = 'stale'; },
+    value => { value.models.models[0].modelId = 'other-model'; },
+    value => { value.models.providerId = 'other-provider'; }]) {
+    const invalid = structuredClone(models); mutate(invalid);
+    assert.equal(actualProviderResult(invalid, 'models', binary).passed, false);
+  }
+  const refused = actualProviderResult({ runtimeId: 'opencode', error: { code: 'runtime-unhealthy',
+    message: 'Selected OpenCode identity is unavailable TEST-secret-do-not-persist' } }, 'models', binary);
+  assert.equal(refused.identityUnavailable, true);
+  assert.equal(refused.passed, false);
+  assert.ok(!JSON.stringify(refused).includes('TEST-secret'));
+});
+
+test('catalog guard permits only exact read-only catalog/auth routes and rejects inference', () => {
+  const observations = [];
+  for (const [method, url, expected] of [['GET', '/v1/models', 200], ['GET', '/auth', 200],
+    ['POST', '/v1/chat/completions', 405], ['POST', '/session/prompt', 405], ['GET', '/session', 405]]) {
+    let status;
+    catalogGuard({ method, url, resume() {} }, { writeHead(value) { status = value; }, end() {} }, observations);
+    assert.equal(status, expected);
+  }
+  assert.deepEqual(observations, [{ allowed: true }, { allowed: true },
+    { allowed: false }, { allowed: false }, { allowed: false }]);
+});
 
 test('runtime relocation preserves packaged Bun and executable physical graph across every path shape', () => {
   const root = mkdtempSync(path.join(os.tmpdir(), 'runtime-relocation-'));
