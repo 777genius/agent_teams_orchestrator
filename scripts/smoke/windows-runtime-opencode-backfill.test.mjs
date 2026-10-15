@@ -44,6 +44,16 @@ test('actual provider comparison rejects static fallback and requires the select
   assert.equal(projected.deepinfraState, 'available');
   assert.equal(projected.deepInfraDisplayState, 'connected');
   assert.ok(!JSON.stringify(projected).includes('TEST-secret'));
+  for (const [step, phase] of [['install managed OpenCode provider plugins', 'managed_plugins'],
+    ['prepare managed OpenCode profile: create profile directories', 'profile'],
+    ['opencode --version', 'version'], ['opencode providers list', 'providers'],
+    ['opencode models --verbose', 'models'], ['opencode agent list', 'agents'], ['TEST-secret', 'other']]) {
+    const snapshot = structuredClone(view);
+    snapshot.view.diagnostics = [`OpenCode inventory probe timed out after 60000ms during ${step}`];
+    const result = actualProviderResult(snapshot, 'view', binary);
+    assert.equal(result.inventoryTimedOut, true); assert.equal(result.inventoryPhase, phase);
+    assert.ok(!JSON.stringify(result).includes('TEST-secret'));
+  }
   for (const mutate of [value => { value.view.runtime.cliPath = null; },
     value => { value.view.runtime.version = '1.19.0'; },
     value => { value.view.providers[0].state = 'available'; },

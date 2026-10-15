@@ -18,6 +18,14 @@ export function actualProviderResult(payload, operation, binaryPath, exitCode = 
   const pending = Array.isArray(diagnostics) && diagnostics.some(value => typeof value === 'string' && value.includes('capabilities_pending'));
   const identityUnavailable = typeof payload?.error?.message === 'string' && /Selected OpenCode identity (?:is )?unavailable/.test(payload.error.message);
   const view = payload?.view, models = payload?.models;
+  const inventoryTimedOut = Array.isArray(diagnostics) && diagnostics.some(value =>
+    typeof value === 'string' && value.startsWith('OpenCode inventory probe timed out'));
+  const phases = [['managed_plugins', 'install managed OpenCode provider plugins'],
+    ['profile', 'prepare managed OpenCode profile:'], ['version', 'opencode --version'],
+    ['providers', 'opencode providers list'], ['models', 'opencode models'], ['agents', 'opencode agent list']];
+  const inventoryPhase = inventoryTimedOut ? phases.find(([, step]) => diagnostics.some(value =>
+    typeof value === 'string' && value.startsWith('OpenCode inventory probe timed out') &&
+    (value.includes(` during ${step}`) || value.includes(` during ${step} `))))?.[0] ?? 'other' : null;
   const version = view?.runtime?.version;
   const providerState = id => {
     const entry = Array.isArray(view?.providers) ? view.providers.find(value => value?.providerId === id) : null;
@@ -33,6 +41,7 @@ export function actualProviderResult(payload, operation, binaryPath, exitCode = 
     : models?.providerId === actualProvider && models.catalogState === 'fresh' &&
       qualifiedModelPresent);
   return { passed: passed === true, capabilitiesPending: pending, identityUnavailable,
+    inventoryTimedOut, inventoryPhase,
     runtimeIdPresent: payload?.runtimeId === 'opencode', viewPresent: !!view && typeof view === 'object',
     runtimeDetected: typeof view?.runtime?.cliPath === 'string', cliBinaryMatched: view?.runtime?.cliPath === binaryPath,
     versionMatched: view?.runtime?.version === '1.18.31',
