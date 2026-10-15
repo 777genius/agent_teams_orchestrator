@@ -500,19 +500,26 @@ public:
                               text(identity, L"volumeSerial") + L"." +
                               text(identity, L"fileId");
     const auto owner = currentSid();
+    static_assert(MUTEX_ALL_ACCESS == 0x1f0001);
+    // Object creation maps GA to concrete mutex rights. Validate the binary
+    // authority rather than an SDDL spelling that changes during that mapping.
     const std::wstring sddl =
-        L"O:" + owner + L"G:" + owner + L"D:P(A;;GA;;;" + owner + L")(A;;GA;;;SY)";
+        L"O:" + owner + L"G:" + owner + L"D:P(A;;0x1f0001;;;" + owner + L")(A;;0x1f0001;;;SY)";
     LocalMemory descriptor;
     if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            sddl.c_str(), SDDL_REVISION_1, &descriptor.value, nullptr))
-      throw NativeError{"execution_containment_filesystem_denied", GetLastError(),
+            sddl.c_str(), SDDL_REVISION_1, &descriptor.value, nullptr)) {
+      const DWORD error = GetLastError();
+      throw NativeError{"execution_containment_filesystem_denied", error,
                         "shared_acl_mutex_descriptor"};
+    }
     SECURITY_ATTRIBUTES attributes{sizeof(attributes), descriptor.value, FALSE};
-    mutex = Handle(CreateMutexW(&attributes, FALSE, name.c_str()));
+    const HANDLE rawMutex = CreateMutexW(&attributes, FALSE, name.c_str());
+    const DWORD createError = GetLastError();
+    mutex = Handle(rawMutex);
     if (!mutex)
-      throw NativeError{"execution_containment_filesystem_denied", GetLastError(),
+      throw NativeError{"execution_containment_filesystem_denied", createError,
                         "shared_acl_mutex_create"};
-    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+    if (createError == ERROR_ALREADY_EXISTS) {
       PSID rawOwner = nullptr;
       PACL dacl = nullptr;
       PSECURITY_DESCRIPTOR rawDescriptor = nullptr;
@@ -523,18 +530,49 @@ public:
         throw NativeError{"execution_containment_filesystem_denied", securityStatus,
                           "shared_acl_mutex_security"};
       LocalMemory ownedDescriptor{rawDescriptor};
-      LPWSTR ownerText = nullptr, daclText = nullptr;
-      if (!(ConvertSidToStringSidW(rawOwner, &ownerText) != 0 &&
-                  ConvertSecurityDescriptorToStringSecurityDescriptorW(
-                      rawDescriptor, SDDL_REVISION_1, DACL_SECURITY_INFORMATION, &daclText,
-                      nullptr) != 0))
-        throw NativeError{"execution_containment_filesystem_denied", GetLastError(),
-                          "shared_acl_mutex_encoding"};
-      LocalMemory ownerMemory{ownerText}, daclMemory{daclText};
-      require(owner == ownerText &&
-                  std::wstring(daclText) ==
-                      L"D:P(A;;GA;;;" + owner + L")(A;;GA;;;SY)",
-              "execution_containment_filesystem_denied", "shared_acl_mutex_authority");
+      PSID expectedOwner = nullptr;
+      BOOL defaulted = FALSE;
+      require(GetSecurityDescriptorOwner(descriptor.value, &expectedOwner, &defaulted) &&
+                  expectedOwner && rawOwner && IsValidSid(rawOwner) && EqualSid(rawOwner, expectedOwner),
+              "execution_containment_filesystem_denied", "shared_acl_mutex_owner");
+      SECURITY_DESCRIPTOR_CONTROL control = 0;
+      DWORD revision = 0;
+      constexpr auto daclControls = SE_DACL_PRESENT | SE_DACL_PROTECTED | SE_DACL_DEFAULTED |
+                                     SE_DACL_AUTO_INHERIT_REQ | SE_DACL_AUTO_INHERITED;
+      require(GetSecurityDescriptorControl(rawDescriptor, &control, &revision),
+              "execution_containment_filesystem_denied", "shared_acl_mutex_control");
+      if ((control & daclControls) != (SE_DACL_PRESENT | SE_DACL_PROTECTED))
+        throw NativeError{"execution_containment_filesystem_denied", static_cast<DWORD>(control),
+                          "shared_acl_mutex_control"};
+      require(dacl && IsValidAcl(dacl) && dacl->AceCount == 2,
+              "execution_containment_filesystem_denied", "shared_acl_mutex_ace_role");
+      bool ownerAllowed = false, systemAllowed = false;
+      PSID previous = nullptr;
+      for (DWORD index = 0; index < dacl->AceCount; ++index) {
+        void *raw = nullptr;
+        require(GetAce(dacl, index, &raw), "execution_containment_filesystem_denied", "shared_acl_mutex_ace_role");
+        const auto *header = static_cast<const ACE_HEADER *>(raw);
+        constexpr auto sidOffset = offsetof(ACCESS_ALLOWED_ACE, SidStart);
+        require(header->AceType == ACCESS_ALLOWED_ACE_TYPE && header->AceFlags == 0 &&
+                    header->AceSize >= sidOffset + offsetof(SID, SubAuthority),
+                "execution_containment_filesystem_denied", "shared_acl_mutex_ace_role");
+        const auto *ace = static_cast<const ACCESS_ALLOWED_ACE *>(raw);
+        const auto *sid = reinterpret_cast<const SID *>(&ace->SidStart);
+        require(sid->SubAuthorityCount <= SID_MAX_SUB_AUTHORITIES &&
+                    GetSidLengthRequired(sid->SubAuthorityCount) == header->AceSize - sidOffset,
+                "execution_containment_filesystem_denied", "shared_acl_mutex_ace_role");
+        auto trustee = const_cast<DWORD *>(&ace->SidStart);
+        require(IsValidSid(trustee) && (!previous || !EqualSid(previous, trustee)),
+                "execution_containment_filesystem_denied", "shared_acl_mutex_ace_role");
+        if (ace->Mask != MUTEX_ALL_ACCESS)
+          throw NativeError{"execution_containment_filesystem_denied", ace->Mask, "shared_acl_mutex_mask"};
+        if (EqualSid(trustee, expectedOwner) && !ownerAllowed) ownerAllowed = true;
+        else if (IsWellKnownSid(trustee, WinLocalSystemSid) && !systemAllowed) systemAllowed = true;
+        else require(false, "execution_containment_filesystem_denied", "shared_acl_mutex_ace_role");
+        previous = trustee;
+      }
+      require(ownerAllowed && systemAllowed,
+              "execution_containment_filesystem_denied", "shared_acl_mutex_ace_role");
     }
     const DWORD waited = WaitForSingleObject(mutex.value, 10000);
     if (waited == WAIT_ABANDONED) {
