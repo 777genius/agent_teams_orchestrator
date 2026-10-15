@@ -4,6 +4,7 @@ import { mkdir, readFile, realpath, lstat, writeFile, rename } from 'node:fs/pro
 import * as lockfile from '../../../utils/lockfile.js'
 import { parseOpenCodeExecutionProof } from '../OpenCodeExecutionProof.js'
 import { resolveClaudeMultimodelPaths } from '../OpenCodeManagedPaths.js'
+import { ensureWindowsPrivateDirectories } from '../profile/OpenCodePrivateDirectories.js'
 import { collectProjectBehaviorMetadata } from '../OpenCodeProfileManager.js'
 import { executionAssert, executionHash, executionRecord } from '../execution/OpenCodeV2ExecutionContracts.js'
 import { createWindowsNativeBroker, resolveWindowsNativeArtifact } from '../host/windows/OpenCodeV2WindowsNativeBroker.js'
@@ -207,13 +208,17 @@ export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, 
         const localClaudeStat = await lstat(localClaude)
         executionAssert(await realpath(localClaude) === localClaude && localClaudeStat.isDirectory() &&
           !localClaudeStat.isSymbolicLink() && (process.platform === 'win32' || localClaudeStat.uid === process.getuid?.()), 'probe_controller_state_foreign')
+        if (process.platform === 'win32') {
+          const leaves = ['teams', 'tasks'].map(kind => path.join(localClaude, kind, teamId))
+          await ensureWindowsPrivateDirectories(leaves, leaves)
+        }
         for (const kind of ['teams', 'tasks']) {
           const parent = path.join(localClaude, kind)
-          await mkdir(parent, { recursive: true, mode: 0o700 })
+          if (process.platform !== 'win32') await mkdir(parent, { recursive: true, mode: 0o700 })
           const parentStat = await lstat(parent)
           executionAssert(await realpath(parent) === parent && parentStat.isDirectory() &&
             !parentStat.isSymbolicLink() && (process.platform === 'win32' || parentStat.uid === process.getuid?.()), 'probe_controller_state_foreign')
-          await mkdir(path.join(parent, teamId), { mode: 0o700 })
+          if (process.platform !== 'win32') await mkdir(path.join(parent, teamId), { mode: 0o700 })
         }
       }
       const expectedText = `STRICT_LAUNCH_${randomUUID()}`

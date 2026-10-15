@@ -6,6 +6,7 @@
 #include <bcrypt.h>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -32,6 +33,18 @@ struct NativeError {
 static void require(bool value, const char *code, const char *stage = nullptr) {
   if (!value)
     throw NativeError{code, 0, stage};
+}
+// Closed admission context only. Preserve specific predicates and native status;
+// neither a filesystem path nor a caller-provided string becomes a role.
+template <typename Action>
+static decltype(auto) inRole(const char *role, Action action) {
+  try { return action(); }
+  catch (const NativeError &error) {
+    if (error.code == "execution_owner_not_private" &&
+        (!error.stage || std::strcmp(error.stage, "private_acl_owner") == 0))
+      throw NativeError{error.code, error.win32, role, error.nativeStatus};
+    throw;
+  }
 }
 struct Handle {
   HANDLE value = nullptr;
@@ -1579,20 +1592,22 @@ private:
     authority.teamId = teamId;
     authority.controllerBaseIdentity = basePhysical;
     for (const auto &name : {std::wstring(L"teams"), std::wstring(L"tasks")}) {
-      const auto path = config.mcpRootPath + L"\\" + name + L"\\" + teamId;
-      auto heldAncestors = verificationAncestors(path);
-      Handle heldRoot = verificationDirectory(path);
-      require(equalPath(finalPath(heldRoot.value), extended(path)),
-              "execution_path_alias");
-      require(!privateProfileOverlap(*this, heldRoot.value),
-              "execution_containment_filesystem_denied");
-      const auto heldIdentity = anchorIdentity(heldRoot.value);
-      require(heldIdentity.Stringify() ==
-                  anchorIdentity(verificationDirectory(path).value).Stringify() &&
-                  samePhysicalIdentity(
-                      heldIdentity, fileObjectIdentity(heldRoot.value, currentSid(), true)),
-              "execution_path_alias");
-      authority.roots.emplace_back(std::move(heldAncestors), std::move(heldRoot));
+      inRole(name == L"teams" ? "private_owner_controller_teams" : "private_owner_controller_tasks", [&] {
+        const auto path = config.mcpRootPath + L"\\" + name + L"\\" + teamId;
+        auto heldAncestors = verificationAncestors(path);
+        Handle heldRoot = verificationDirectory(path);
+        require(equalPath(finalPath(heldRoot.value), extended(path)),
+                "execution_path_alias");
+        require(!privateProfileOverlap(*this, heldRoot.value),
+                "execution_containment_filesystem_denied");
+        const auto heldIdentity = anchorIdentity(heldRoot.value);
+        require(heldIdentity.Stringify() ==
+                    anchorIdentity(verificationDirectory(path).value).Stringify() &&
+                    samePhysicalIdentity(
+                        heldIdentity, fileObjectIdentity(heldRoot.value, currentSid(), true)),
+                "execution_path_alias");
+        authority.roots.emplace_back(std::move(heldAncestors), std::move(heldRoot));
+      });
     }
     controllerAuthorities.push_back(std::move(authority));
     for (const auto &root : controllerAuthorities.back().roots) {
@@ -3423,14 +3438,6 @@ private:
       ancestors.emplace_back(std::move(parent));
     std::vector<RetainedAnchorComponent> prefix;
     // Closed role labels only; preserve the original failed predicate and codes.
-    auto inRole = [](const char *role, auto action) {
-      try { return action(); }
-      catch (const NativeError &error) {
-        if (error.stage && std::strcmp(error.stage, "private_acl_owner") == 0)
-          throw NativeError{error.code, error.win32, role, error.nativeStatus};
-        throw;
-      }
-    };
     const char *roles[] = {"private_acl_owner_run_data_root", "private_acl_owner_run_opencode",
                           "private_acl_owner_run_v2", "private_acl_owner_run_runs",
                           "private_acl_owner_run_leaf"};
@@ -3978,7 +3985,9 @@ public:
     }
     if (operation == L"runStateAcquire") {
       bool created = false;
-      auto &state = stateFor(owners, input, true, created);
+      auto &state = inRole("private_owner_acquire", [&]() -> State & {
+        return stateFor(owners, input, true, created);
+      });
       JsonObject result;
       str(result, L"stateId", state.id());
       return result;
@@ -3992,13 +4001,19 @@ public:
       if (input.GetNamedBoolean(L"sharedControllerRootCohort", false)) {
         const auto audit = input.HasKey(L"selectionId") ? text(input, L"selectionId")
                                                        : std::wstring(L"1");
-        const auto cohort = owners.sealedCohortDocument(audit, ids);
-        state.reserve(binding, text(input, L"sourceSha256"), &cohort);
+        const auto cohort = inRole("private_owner_cohort", [&] {
+          return owners.sealedCohortDocument(audit, ids);
+        });
+        inRole("private_owner_cohort", [&] {
+          state.reserve(binding, text(input, L"sourceSha256"), &cohort);
+        });
         owners.attachSealedCohort(cohort);
       } else
         state.reserve(binding, text(input, L"sourceSha256"));
       owners.runStateSelections[state.id()] = ids;
-      (void)selectionFor(owners, owners.runStateRoots[state.id()], ids, state.binding());
+      (void)inRole("private_owner_reserve_selection", [&] {
+        return selectionFor(owners, owners.runStateRoots[state.id()], ids, state.binding());
+      });
       JsonObject result;
       str(result, L"stateId", state.id());
       return result;
@@ -4006,7 +4021,9 @@ public:
     if (operation == L"runStateSelect") {
       const auto mode = text(input, L"mode");
       bool created = false;
-      auto &state = stateFor(owners, input, false, created);
+      auto &state = inRole("private_owner_selected_selection", [&]() -> State & {
+        return stateFor(owners, input, false, created);
+      });
       if (created) {
         state.select();
         try {
@@ -4031,7 +4048,9 @@ public:
                     runControlCanonicalJson(object(input, L"binding")),
                 "run_state_start_changed");
       }
-      (void)selectionFor(owners, owners.runStateRoots[state.id()], ids, state.binding());
+      (void)inRole("private_owner_selected_selection", [&] {
+        return selectionFor(owners, owners.runStateRoots[state.id()], ids, state.binding());
+      });
       JsonObject result;
       str(result, L"stateId", state.id());
       return result;
@@ -4041,7 +4060,9 @@ public:
       const auto dataRoot = text(input, L"dataRoot"), directory = text(input, L"directory");
       require(validTeamId(text(input, L"teamId")) && !text(input, L"runId").empty(),
               "run_state_start_changed");
-      if (!ids.empty()) (void)selectionForConfigOnly(owners, dataRoot, ids);
+      if (!ids.empty()) (void)inRole("private_owner_discover_selection", [&] {
+        return selectionForConfigOnly(owners, dataRoot, ids);
+      });
       // Cached state is never replaced with absence evidence.
       const bool retained = std::any_of(owners.runStates.begin(), owners.runStates.end(),
           [&](const auto &entry) { return entry.second->directory() == directory; });
@@ -4052,7 +4073,9 @@ public:
       }
       require(!ids.empty(), "run_control_selection_missing");
       bool created = false;
-      auto &state = stateFor(owners, input, false, created);
+      auto &state = inRole("private_owner_discover_selection", [&]() -> State & {
+        return stateFor(owners, input, false, created);
+      });
       if (created)
         state.select();
       if (state.cohortSealed()) owners.attachSealedCohort(state.cohort());
@@ -4065,7 +4088,9 @@ public:
                   text(binding, L"teamId") == text(input, L"teamId") &&
                   text(binding, L"runId") == text(input, L"runId"),
               "run_state_start_changed");
-      (void)selectionFor(owners, owners.runStateRoots[state.id()], ids, binding);
+      (void)inRole("private_owner_discover_selection", [&] {
+        return selectionFor(owners, owners.runStateRoots[state.id()], ids, binding);
+      });
       JsonObject result;
       str(result, L"stateId", state.id());
       result.SetNamedValue(L"record", endpoint);

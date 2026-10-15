@@ -9,6 +9,7 @@ import * as nativeIdentity from '../compatibility/OpenCodeNativeIdentity.js'
 import * as receipts from '../profile/OpenCodeV2ExecutionReceipt.js'
 import * as mcp from '../OpenCodeMcpManager.js'
 import * as probes from './OpenCodeV2ExecutionProbe.js'
+import * as launchPlans from './OpenCodeV2LaunchPlan.js'
 import * as privateDirectories from '../profile/OpenCodePrivateDirectories.js'
 import * as windowsBroker from '../host/windows/OpenCodeV2WindowsNativeBroker.js'
 import * as windowsFilesystem from '../host/windows/OpenCodeV2WindowsOwnerFilesystem.js'
@@ -318,5 +319,67 @@ for (const refuse of [false, true]) test(`Windows prepared member creates its da
       expect(await readFile(result.profile.databasePath)).toHaveLength(0)
     }
     expect(events).toEqual(['config', 'database', 'close-data', 'close-config', 'broker-close'])
+  } finally { Object.defineProperty(process, 'platform', platform) }
+})
+
+for (const refuse of [false, true]) test(`Windows probe privately creates only its two exclusive controller leaves before planning (refused=${refuse})`, async () => {
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform')!
+  const stoppedBeforeLaunch = new Error('TEST complete controller preparation')
+  const refusal = new Error('execution_profile_owned')
+  const identity = { volumeSerial: '1', fileId: '1'.repeat(32), ownerSid: 'S-1-5-21-1' }
+  let allocations = 0, planned = 0, closed = false
+  try {
+    Object.defineProperty(process, 'platform', { ...platform, value: 'darwin' })
+    const selection = await inspectOpenCodeV2SourceAvailability(envelope())
+    const controller = path.join(root, 'controller'); await mkdir(controller)
+    for (const kind of ['teams', 'tasks']) await mkdir(path.join(controller, kind))
+    const unused = async (): Promise<never> => { throw new Error('TEST unexpected owner operation') }
+    const filesystem = windowsFilesystem.createWindowsOwnerFilesystem(unused)
+    restores.push(
+      spyOn(windowsBroker, 'resolveWindowsNativeArtifact').mockResolvedValue({ path: '/TEST/helper.exe', sha256: 'a'.repeat(64), arch: 'x64' }),
+      spyOn(windowsBroker, 'createWindowsNativeBroker').mockReturnValue({
+        events: new EventEmitter(), ended: () => closed, request: unused,
+        close: async () => { closed = true },
+      }),
+      spyOn(windowsFilesystem, 'createWindowsOwnerFilesystem').mockReturnValue({ ...filesystem,
+        prepareDirectory: async (directory: string) => {
+          await mkdir(directory, { recursive: true })
+          return { identity, assertOwned: async () => {}, close: async () => {},
+            writeMetadata: async (purpose) => {
+              if (purpose !== 'ProbeGuard') throw new Error('TEST unexpected probe submission')
+              await writeFile(path.join(directory, 'owner.lock'), '', { flag: 'wx' })
+            },
+            readMetadata: async (purpose) => ({ purpose, directoryIdentity: identity,
+              path: path.join(directory, purpose === 'ProbeGuard' ? 'owner.lock' : 'probe.json'),
+              fileIdentity: purpose === 'ProbeGuard' ? identity : null, bytes: 0,
+              ...(purpose === 'ProbeRecord' ? { absent: true as const } : {}) }),
+            writeExclusive: unused, createPreparedDatabase: unused, writePreparedConfig: unused,
+            writePreparedAuth: unused, readRecord: unused, archive: unused,
+          } satisfies windowsFilesystem.WindowsOwnerDirectory
+        },
+      }),
+      spyOn(privateDirectories, 'ensureWindowsPrivateDirectories').mockImplementation(async (leaves, exclusive) => {
+        allocations++
+        if (!exclusive) throw new Error('TEST exclusive controller leaves required')
+        expect(leaves).toEqual(exclusive)
+        expect(leaves).toHaveLength(2)
+        expect(leaves.map(leaf => path.dirname(leaf))).toEqual([path.join(controller, 'teams'), path.join(controller, 'tasks')])
+        expect(path.basename(leaves[0]!)).toMatch(/^TEST-execution-probe-[a-f0-9]{32}$/)
+        expect(path.basename(leaves[1]!)).toBe(path.basename(leaves[0]!))
+        if (refuse) throw refusal
+        for (const leaf of leaves) await mkdir(leaf) // Exclusive: the fixture never repairs an existing leaf.
+      }),
+      spyOn(launchPlans, 'buildOpenCodeV2InternalRunPlan').mockImplementation(async (_selection, body) => {
+        planned++
+        expect(allocations).toBe(1)
+        for (const kind of ['teams', 'tasks']) expect(await readdir(path.join(controller, kind))).toEqual([body.teamId as string])
+        throw stoppedBeforeLaunch
+      }),
+    )
+    Object.defineProperty(process, 'platform', { ...platform, value: 'win32' })
+    await expect(probes.resolveOpenCodeV2ExecutionProbe(envelope(), { ...selection,
+      controller: { type: 'local', command: [process.execPath, '/TEST/controller.mjs'],
+        environment: { AGENT_TEAMS_MCP_CLAUDE_DIR: controller } } }, true)).rejects.toBe(refuse ? refusal : stoppedBeforeLaunch)
+    expect(allocations).toBe(1); expect(planned).toBe(refuse ? 0 : 1); expect(closed).toBe(true)
   } finally { Object.defineProperty(process, 'platform', platform) }
 })
