@@ -224,7 +224,14 @@ export async function acquireExecutionProfileOwner(requestedProfile: OwnedNative
         if (mapping) {
           executionAssert(isExecutionPlatformMapping(mapping) && mapping.leaseOwnerId === record.leaseOwnerId &&
             mapping.bun.hostPID === pid && executionHash(mapping.bun.birth) === executionHash(childBirth), 'execution_owner_unknown')
-          await writeOwned('containment.json', mapping)
+          // This audit file is never read as launch/release authority. Keep the
+          // complete branded mapping in its native adapter; commit every field
+          // without expanding the 16KiB owner-record ceiling for anchor arrays.
+          await writeOwned('containment.json', windows ? {
+            schema: 1, platform: 'win32', mappingSha256: executionHash(mapping),
+            child: { pid, birth: childBirth }, namespace: mapping.namespace.name,
+            leaseOwnerId: mapping.leaseOwnerId,
+          } : mapping)
         }
         child = { pid, birth: childBirth }
         await writeOwned('child.json', child)

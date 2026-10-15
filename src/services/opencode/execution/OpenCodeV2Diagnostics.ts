@@ -115,7 +115,7 @@ const privateProviderFailureCodes = new Set(['provider_missing', 'provider_key_m
   'execution_selected_oauth_connection_unknown', 'execution_selected_oauth_model_unknown',
   'execution_lease_not_owned', 'execution_host_unavailable', 'execution_containment_unqualified', 'execution_invalid_response', 'execution_identity_mismatch', 'execution_identity_unknown',
   'execution_profile_changed', 'execution_graph_changed', 'execution_graph_incomplete', 'execution_graph_dependency_missing',
-  'execution_timeout', 'execution_owner_unknown', 'cleanup_unknown', 'selection_mismatch', 'authority_mismatch',
+  'execution_timeout', 'execution_owner_unknown', 'execution_owner_record_invalid', 'cleanup_unknown', 'selection_mismatch', 'authority_mismatch',
   'graph_mismatch', 'identity_mismatch', 'unqualified_version', 'invalid_response', 'invalid_model',
   'http_failure', 'transport_failure', 'media_type', 'deadline', 'authority_or_deadline', 'disposed', 'timeout'])
 // Exact native producer literals only; neither an arbitrary message nor a
