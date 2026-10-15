@@ -8,6 +8,7 @@ import {
 } from './OpenCodeAgentModelCompatibility.js'
 
 import type { OpenCodeModelMetadata } from './types.js'
+import { getOpenCodeModelDeclaredInputModalities } from './OpenCodeDeclaredInputModalities.js'
 
 function metadata(id: string, raw: Record<string, unknown>): OpenCodeModelMetadata {
   return {
@@ -21,6 +22,32 @@ function metadata(id: string, raw: Record<string, unknown>): OpenCodeModelMetada
 }
 
 describe('OpenCode agent model compatibility', () => {
+  test('declaration authority preserves explicit none and refuses malformed or conflicting metadata', () => {
+    const declared = (raw: Record<string, unknown>) =>
+      getOpenCodeModelDeclaredInputModalities(metadata('novel/MixedCase-model', raw))
+
+    expect(getOpenCodeModelDeclaredInputModalities(null)).toBeNull()
+    expect(declared({})).toBeNull()
+    expect(declared({ modalities: { input: [] } })).toEqual([])
+    expect(declared({ capabilities: { input: { text: false, image: false, video: false } } })).toEqual([])
+    expect(declared({ modalities: { input: [' TEXT ', 'IMAGE', 'image'] } })).toEqual(['text', 'image'])
+    expect(declared({ capabilities: { input: { text: true, image: false, video: true } } })).toEqual(['text', 'video'])
+    for (const input of [null, ['image', false], ['image', ' '], 'image']) {
+      expect(declared({ modalities: { input } })).toBeNull()
+    }
+    for (const input of [null, ['image'], { image: 'true' }, { image: true, video: 1 }, { image: true, IMAGE: false }]) {
+      expect(declared({ capabilities: { input } })).toBeNull()
+    }
+    expect(declared({ modalities: { input: ['image'] }, capabilities: { input: { image: false } } })).toBeNull()
+    expect(declared({ modalities: { input: [] }, capabilities: { input: { video: true } } })).toBeNull()
+    expect(declared({ modalities: { input: ['image'] }, capabilities: { input: { image: true, text: true } } })).toEqual(['image'])
+    expect(declared({ modalities: { input: ['image', null] }, capabilities: { input: { image: true } } })).toBeNull()
+
+    // Declaration authority must not change the legacy presentation/launch contract.
+    expect(getOpenCodeModelInputModalities(metadata('novel/model', {}))).toEqual(['text'])
+    expect(getOpenCodeModelInputModalities(metadata('novel/model', { modalities: { input: ['image', false] } }))).toEqual(['image'])
+  })
+
   test('rejects explicit image and video output models', () => {
     const image = metadata('xai/grok-imagine-image-quality', {
       capabilities: {

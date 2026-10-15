@@ -6066,6 +6066,48 @@ describe('OpenCodeProviderManagementAdapter', () => {
     })
   })
 
+  test('provider models retain exact scoped declarations and leave missing metadata unknown', async () => {
+    const models = ['custom/ExactCase', 'custom/video', 'custom/none', 'custom/missing', 'custom/conflict']
+    const rawById: Record<string, Record<string, unknown>> = {
+      'custom/ExactCase': { modalities: { input: ['text', 'image'] } },
+      'custom/video': { capabilities: { input: { text: true, video: true } } },
+      'custom/none': { capabilities: { input: { text: false, image: false, video: false } } },
+      'custom/conflict': { modalities: { input: ['image'] }, capabilities: { input: { image: false } } },
+      'foreign/missing': { modalities: { input: ['image', 'video'] } },
+      'custom/exactcase': { modalities: { input: ['video'] } },
+    }
+    const adapter = new OpenCodeProviderManagementAdapter({
+      ...catalogIdentityDependencies(),
+      profileManager: {
+        listManagedAuthPaths: async () => [],
+        readCatalogSelectedAuthIdentity: async ({ profileScope }: { profileScope: OpenCodeProfileScope }) => ({
+          source: profileScope.selectedAuthIdentity,
+          managed: profileScope.selectedAuthIdentity,
+          preferences: 'known:test-preferences' as const,
+        }),
+      },
+      inventoryService: { probe: async () => inventory({
+        availableProviders: ['custom'], models,
+        modelMetadata: Object.entries(rawById).map(([id, raw]) => ({
+          id, raw, cost: null, context: null, limits: null, free: false,
+        })),
+      }) },
+      hostManager: { ensureHost: async () => host(), releaseHost: async () => {} },
+      clientFactory: { create: () => ({
+        getConfigProviders: async () => ({ providers: [{ id: 'custom', models: Object.fromEntries(models.map(id => [id.slice('custom/'.length), {}])) }], default: {} }),
+        getProviders: async () => ({ all: [{ id: 'custom', name: 'Custom' }], connected: [], default: {} }),
+        getProviderAuth: async () => ({}),
+      }) },
+    })
+    const result = await adapter.loadModels({ runtimeId: 'opencode', providerId: 'custom' })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(Object.fromEntries(result.value.models.map(model => [model.modelId, model.declaredInputModalities]))).toEqual({
+      'custom/ExactCase': ['text', 'image'], 'custom/video': ['text', 'video'],
+      'custom/none': [], 'custom/missing': null, 'custom/conflict': null,
+    })
+  })
+
   test('paginates the filtered union of inventory, config, and live provider models', async () => {
     const adapter = new OpenCodeProviderManagementAdapter({
       ...catalogIdentityDependencies(),
