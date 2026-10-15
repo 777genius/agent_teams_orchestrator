@@ -40,7 +40,11 @@ test('launch waits for original native members under one deadline before returni
         return scenario === 'noPid' ? { ...member, runtimePid: undefined } : member
       },
       requestOpenCodeV2Run: async (record, request, timeout) => {
-        assert.strictEqual(record, owner); assert.equal(request.operation, 'status'); assert.equal(timeout, 750); finalReads++
+        assert.strictEqual(record, owner); assert.equal(request.operation, 'status'); assert.equal(timeout, finalReads === 0 ? 750 : 730); finalReads++
+        if (scenario === 'foreignOwner') throw Error('run_control_foreign')
+        if (['transientTimeout', 'transientDisconnected'].includes(scenario) && finalReads === 1) {
+          clock += 20; throw Error(scenario === 'transientTimeout' ? 'run_control_timeout' : 'run_control_disconnected')
+        }
         return { kind: 'status', state: scenario === 'stoppedAfterReady' ? 'stopped' : 'active', deadline: owner.deadline, qualification,
           members: scenario === 'changed' ? nativeMembers.map(member => ({ ...member, originalSessionId: 'ses_replacement' })) : nativeMembers }
       },
@@ -51,7 +55,7 @@ test('launch waits for original native members under one deadline before returni
     // The old launch path returned this endpoint-only snapshot immediately.
     OpenCodeV2TeamBridge.prototype.call = async () => ({ kind: 'status', state: 'starting', deadline: owner.deadline,
       members: nativeMembers.map(member => ({ ...member, state: 'unknown', runtimePid: undefined, bootstrap: null, controllerTools: undefined })) })
-    for (scenario of ['ready', 'stopped', 'expired', 'changed', 'stoppedAfterReady', 'noPid']) {
+    for (scenario of ['ready', 'stopped', 'expired', 'changed', 'stoppedAfterReady', 'noPid', 'transientTimeout', 'transientDisconnected', 'foreignOwner']) {
       clock = 1000; waits = []; finalReads = 0; launches = 0; release = undefined
       let settled = false
       const pending = execute({ schemaVersion: 1, requestId: 'TEST-launch', command: 'opencode.launchTeam', cwd: '/TEST',
@@ -64,8 +68,8 @@ test('launch waits for original native members under one deadline before returni
       }
       const result = await pending
       assert.equal(launches, 1)
-      if (scenario === 'ready') {
-        assert.equal(result.ok, true); assert.deepEqual(waits, [950, 850]); assert.equal(finalReads, 1)
+      if (['ready', 'transientTimeout', 'transientDisconnected'].includes(scenario)) {
+        assert.equal(result.ok, true); assert.deepEqual(waits, [950, 850]); assert.equal(finalReads, scenario === 'ready' ? 1 : 2)
         for (const [name, pid] of [['one', 123], ['two', 124]]) {
           assert.equal(result.data.members[name].launchState, 'confirmed_alive')
           assert.equal(result.data.members[name].runtimePid, pid)
@@ -74,13 +78,13 @@ test('launch waits for original native members under one deadline before returni
         assert.equal(result.data.expectedBehaviorFingerprint, qualification.expectedBehaviorFingerprint)
       } else {
         assert.equal(result.ok, false); assert.equal(result.error.retryable, false)
-        assert.equal(finalReads, ['changed', 'stoppedAfterReady'].includes(scenario) ? 1 : 0)
+        assert.equal(finalReads, ['changed', 'stoppedAfterReady', 'foreignOwner'].includes(scenario) ? 1 : 0)
       }
     }
-    console.log(JSON.stringify({ scenarios: 6 }))
+    console.log(JSON.stringify({ scenarios: 9 }))
   `
   const child = Bun.spawn([process.execPath, '-e', script], { cwd: import.meta.dir, stdout: 'pipe', stderr: 'pipe' })
   const [exit, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()])
   expect({ exit, stderr }).toEqual({ exit: 0, stderr: '' })
-  expect(JSON.parse(stdout)).toEqual({ scenarios: 6 })
+  expect(JSON.parse(stdout)).toEqual({ scenarios: 9 })
 }, 15_000)

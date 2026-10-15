@@ -266,8 +266,17 @@ async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: O
           ready.bootstrap?.verified && ready.controllerTools, 'run_readiness_unknown')
         readyMembers.push(ready)
       }
-      const status = await requestOpenCodeV2Run(owner, { operation: 'status' }, Math.min(30_000, remaining()))
-      remaining()
+      let status: RunControlResult
+      for (;;) {
+        try {
+          status = await requestOpenCodeV2Run(owner, { operation: 'status' }, Math.min(30_000, remaining()))
+          remaining()
+          break
+        } catch (error) {
+          if (!isTransientOpenCodeV2ControlRead(error) || Date.now() >= deadline) throw error
+          await new Promise(resolve => setTimeout(resolve, Math.min(100, remaining())))
+        }
+      }
       executionAssert(status.kind === 'status' && status.state === 'active' && status.deadline === owner.deadline &&
         executionHash(status.members) === executionHash(readyMembers) &&
         executionHash(status.qualification) === executionHash(plan.qualification), 'run_readiness_changed')
