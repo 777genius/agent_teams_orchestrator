@@ -34,8 +34,13 @@ function parseInputCapabilityRecord(value: unknown): string[] | null {
 export function getOpenCodeModelDeclaredInputModalities(
   metadata: OpenCodeModelMetadata | null | undefined,
 ): string[] | null {
-  const arrayInput = asRecord(metadata?.raw.modalities)?.input
-  const recordInput = asRecord(metadata?.raw.capabilities)?.input
+  const rawModalities = metadata?.raw.modalities
+  const rawCapabilities = metadata?.raw.capabilities
+  const modalities = asRecord(rawModalities)
+  const capabilities = asRecord(rawCapabilities)
+  if ((rawModalities !== undefined && !modalities) || (rawCapabilities !== undefined && !capabilities)) return null
+  const arrayInput = modalities?.input
+  const recordInput = capabilities?.input
   const array = arrayInput === undefined ? undefined : parseInputModalityArray(arrayInput)
   const record = recordInput === undefined ? undefined : parseInputCapabilityRecord(recordInput)
   if (array === null || record === null) return null

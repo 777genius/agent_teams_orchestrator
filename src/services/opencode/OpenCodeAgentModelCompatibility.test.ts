@@ -38,6 +38,10 @@ describe('OpenCode agent model compatibility', () => {
     for (const input of [null, ['image'], { image: 'true' }, { image: true, video: 1 }, { image: true, IMAGE: false }]) {
       expect(declared({ capabilities: { input } })).toBeNull()
     }
+    for (const malformed of ['bad', null, []]) {
+      expect(declared({ modalities: malformed, capabilities: { input: { image: true } } })).toBeNull()
+      expect(declared({ modalities: { input: ['image'] }, capabilities: malformed })).toBeNull()
+    }
     expect(declared({ modalities: { input: ['image'] }, capabilities: { input: { image: false } } })).toBeNull()
     expect(declared({ modalities: { input: [] }, capabilities: { input: { video: true } } })).toBeNull()
     expect(declared({ modalities: { input: ['image'] }, capabilities: { input: { image: true, text: true } } })).toBeNull()
