@@ -132,13 +132,15 @@ export function modelSupportsAdaptiveThinking(model: string): boolean {
   ) {
     return true
   }
-  // Exclude any other known legacy models (allowlist above catches 4-6 variants first)
-  if (
-    canonical.includes('opus') ||
-    canonical.includes('sonnet') ||
-    canonical.includes('haiku')
-  ) {
-    return false
+  // Exclude known legacy family versions without adaptive thinking. Future
+  // family IDs fall through to the launch default below instead of being
+  // mistaken for legacy models merely because they contain a family name.
+  const familyVersion = canonical.match(
+    /(?:^|-)(?:claude-)?(opus|sonnet|haiku)-(\d+)(?:-(\d+))?/,
+  )
+  if (familyVersion) {
+    const major = Number(familyVersion[2])
+    if (major <= 4) return false
   }
   // IMPORTANT: Do not change adaptive thinking support without notifying the
   // model launch DRI and research. This can greatly affect model quality and

@@ -7,11 +7,12 @@ import { raceOpenCodeAbortSignal } from './OpenCodeRuntimeDeadline.js'
 import { openCodeClientFactory } from './OpenCodeClientFactory.js'
 import { OPEN_CODE_APP_MCP_SERVER_NAME, openCodeMcpManager } from './OpenCodeMcpManager.js'
 import { parseOpenCodeProviderScopedModelRef } from './OpenCodeModelRef.js'
-import { buildManagedConfigFingerprint, collectProjectBehaviorMetadata, resolveOpenCodeProfileScope, openCodeProfileManager } from './OpenCodeProfileManager.js'
+import { buildManagedConfigFingerprint, collectProjectBehaviorMetadata, resolveOpenCodeProfileScope, openCodeProfileManager, PROJECT_BEHAVIOR_FILES, PROJECT_BEHAVIOR_DIRS } from './OpenCodeProfileManager.js'
 import {
   buildOpenCodeExpectedBehaviorEvidence,
   validateOpenCodeExpectedBehaviorEvidence,
 } from './OpenCodeExpectedBehaviorFingerprint.js'
+
 import type { OpenCodePhaseContext } from './OpenCodeRuntimeDeadline.js'
 import type { OpenCodeExpectedBehaviorEvidence, OpenCodeHostHandle, OpenCodeSessionRecord } from './types.js'
 
@@ -28,7 +29,16 @@ export type OpenCodeAuthorityRejection =
       | 'live_mcp_present' | 'mcp_config_match' | 'contract_config_match'
       | 'scope_token_match' | 'scope_config_match'
       | 'selected_auth_identity_match' }
-  | { check: 'behavior_match'; fields?: readonly OpenCodeBehaviorDifferenceField[] }
+  | { check: 'behavior_match'; fields?: readonly OpenCodeBehaviorDifferenceField[]; comparison?: {
+      initialEvidenceMatchesExpectation: boolean
+      projectBehaviorChanged: boolean
+      effectiveSelectedAuthChanged: boolean | null
+      otherEvidenceChanged: boolean | null
+      sourcesAvailable: boolean
+      changedSourceCount: number
+      sources: { label: string; initial: 'present' | 'missing'; refreshed: 'present' | 'missing' }[]
+    } }
+
   | { check: 'selected_config_match'; fields: OpenCodeSelectedConfigField[] }
   | { check: 'exception'; phase: OpenCodeAuthorityRefreshPhase
       errorClass: 'TypeError' | 'RangeError' | 'SyntaxError' | 'Error' | 'non_error' }
@@ -130,6 +140,7 @@ export async function refreshSelectedProfileAuthority(input: {
       profile = structuredClone(sourceProfile)
       const original = rawEntries(profile)
       const expectedFingerprint = input.expectedBehaviorFingerprint
+      const initialEvidence = input.initialExpectedBehaviorEvidence ? structuredClone(input.initialExpectedBehaviorEvidence) : undefined
       const contractIdentity = input.contractConfigIdentity
       const completedProbe = input.completedOAuthProbe ? { ...input.completedOAuthProbe } : undefined
       const ownedSession = input.ownedOAuthSession ? structuredClone(input.ownedOAuthSession) : undefined
@@ -216,7 +227,8 @@ export async function refreshSelectedProfileAuthority(input: {
       if (scope.scopeToken !== profile.profileScope.scopeToken && !rotation) return reject({ check: 'scope_token_match' })
       if (scope.configFingerprint !== profile.profileScope.configFingerprint) return reject({ check: 'scope_config_match' })
       if (scope.selectedAuthIdentity !== profile.profileScope.selectedAuthIdentity && !rotation) return reject({ check: 'selected_auth_identity_match' })
-      const refreshed = { ...profile, projectBehaviorFingerprint: behavior.projectBehaviorFingerprint }
+      const refreshed = { ...profile, projectBehaviorFingerprint: behavior.projectBehaviorFingerprint,
+        behaviorSourceFingerprints: behavior.behaviorSourceFingerprints }
       phase = 'behavior_evidence'
       const evidence = await raceOpenCodeAbortSignal((deps.buildEvidence ?? buildOpenCodeExpectedBehaviorEvidence)({
         profile: refreshed, fullModelId: selected.raw,
@@ -236,7 +248,7 @@ export async function refreshSelectedProfileAuthority(input: {
         return reject({ check: 'selected_config_match', fields: [] })
       }
       if (evidence.expectedBehaviorFingerprint === expectedFingerprint) return refreshed
-      const initial = input.initialExpectedBehaviorEvidence
+      const initial = initialEvidence
       const usableInitial = initial && initial.expectedBehaviorFingerprint === expectedFingerprint
         && initial.modelProviderId === selected.providerId
         && initial.fullModelId === selected.raw
@@ -244,7 +256,27 @@ export async function refreshSelectedProfileAuthority(input: {
       const fields = usableInitial
         ? BEHAVIOR_DIFFERENCE_FIELDS.filter(field => usableInitial[field] !== evidence[field])
         : undefined
-      return reject({ check: 'behavior_match', ...(fields?.length ? { fields } : {}) })
+      // Only compare retained initial evidence with this refresh, never a third read.
+      const before = profile.behaviorSourceFingerprints, after = behavior.behaviorSourceFingerprints
+      const sourceNames = before && after ? [...new Set([...Object.keys(before), ...Object.keys(after)])].sort() : []
+      const changedSources = sourceNames.filter(name => before?.[name] !== after?.[name])
+      return reject({ check: 'behavior_match', ...(fields?.length ? { fields } : {}), comparison: {
+        initialEvidenceMatchesExpectation: initialEvidence?.expectedBehaviorFingerprint === expectedFingerprint,
+        projectBehaviorChanged: (initialEvidence?.projectBehaviorFingerprint ?? profile.projectBehaviorFingerprint) !== evidence.projectBehaviorFingerprint,
+        effectiveSelectedAuthChanged: initialEvidence
+          ? initialEvidence.effectiveSelectedAuthFingerprint !== evidence.effectiveSelectedAuthFingerprint : null,
+        otherEvidenceChanged: initialEvidence ? (['canonicalProjectPathFingerprint', 'modelProviderId', 'fullModelId',
+          'effectiveConfigFingerprint'] as const).some(key => initialEvidence[key] !== evidence[key]) : null,
+        sourcesAvailable: Boolean(before && after), changedSourceCount: changedSources.length,
+        sources: changedSources.slice(0, 20).map(name => {
+          const normalized = name.replace(/\\/g, '/')
+          const fixed = PROJECT_BEHAVIOR_FILES.some(file => file === normalized)
+          return { label: fixed ? normalized : PROJECT_BEHAVIOR_DIRS.find(dir => normalized.startsWith(`${dir}/`)) ?? 'other',
+            initial: before?.[name] === undefined ? 'missing' : 'present',
+            refreshed: after?.[name] === undefined ? 'missing' : 'present' }
+        }),
+      } })
+
     } catch (caught) {
       const error = caught instanceof OpenCodeAuthorityReadError ? caught.error : caught
       return reject({

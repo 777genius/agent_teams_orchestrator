@@ -1,7 +1,7 @@
 import path from 'node:path'
 import { canonicalizeOpenCodeProjectPath } from '../OpenCodeProfileManager.js'
 import { readOpenCodeAuthority, isKnownSessionStore, requireOpenCodeAuthority, type SessionStoreShape } from '../OpenCodeAuthorityStoreRead.js'
-import { OpenCodeVersionProbeCleanupError } from '../compatibility/OpenCodeVersionProbe.js'
+import { getOpenCodeVersionProbeDiagnostics } from '../compatibility/OpenCodeVersionProbe.js'
 import { classifyOpenCodeV2ExecutionDelivery } from '../host/OpenCodeV2ExecutionDelivery.js'
 import { isExecutionPlatformAvailable } from '../host/OpenCodeV2ExecutionPlatform.js'
 import { resolveOpenCodeBinaryHostIdentity } from '../OpenCodeHostIdentity.js'
@@ -598,23 +598,7 @@ export async function executeSelectedOpenCodeBridgeCommandEnvelope(input: unknow
   try { selection = await inspectOpenCodeRuntimeAdapterSelection() }
   catch (error) {
     const result = refusal(envelope, Date.now(), error instanceof Error ? error.message : 'selection_unavailable')
-    if (!(error instanceof OpenCodeVersionProbeCleanupError)) return result
-    const helper = error.helperFailure, terminal = error.terminalDiagnostic
-    const diagnostics = []
-    if (helper) diagnostics.push({
-      code: 'opencode_version_probe_helper_failed', evidence: 'last_observed',
-      operation: helper.operation, reason: helper.reason, exitCode: helper.exitCode, elapsedMs: helper.elapsedMs,
-      ...(helper.helperCause ? { helperCause: {
-        stage: helper.helperCause.stage, category: helper.helperCause.category,
-        hresult: helper.helperCause.hresult, nativeErrorCode: helper.helperCause.nativeErrorCode,
-      } } : {}),
-    })
-    if (terminal) diagnostics.push({
-      code: 'opencode_version_probe_cleanup_unknown', phase: terminal.phase, guard: terminal.guard,
-      closed: terminal.closed, ended: terminal.ended, exitCode: terminal.exitCode,
-      birthsCount: terminal.birthsCount, candidatesCount: terminal.candidatesCount, pendingCount: terminal.pendingCount,
-      lastGroupCount: terminal.lastGroupCount, lastSurvivorCount: terminal.lastSurvivorCount, remainingMs: terminal.remainingMs,
-    })
+    const diagnostics = getOpenCodeVersionProbeDiagnostics(error)
     return diagnostics.length ? { ...result, diagnostics } : result
   }
   const selected = selectOpenCodeRuntimeAdapter(selection.policy, {

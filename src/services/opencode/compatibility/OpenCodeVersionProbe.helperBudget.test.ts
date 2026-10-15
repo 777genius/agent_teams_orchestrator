@@ -324,7 +324,8 @@ test('darwin gone group member with reparented PPID requires absence and final c
 // The wrapper can close before the first birth helper completes while WMI still
 // returns its old tree. These rows must never confer birth or signal authority.
 function unanchoredFixture(mode: 'gone' | 'alive' | 'unknown' | 'orphan' | 'reused' | 'persistent' |
-  'final-reappeared' | 'absence-before-close' | 'stale-captured' | 'stale-queryable' | 'stale-queryable-unknown' | 'stale-queryable-final-reappeared' | 'transient-live-candidate' | 'persistent-live-after-absence') {
+  'final-reappeared' | 'absence-before-close' | 'stale-captured' | 'stale-queryable' | 'stale-queryable-unknown' | 'stale-queryable-final-reappeared' | 'transient-live-candidate' | 'persistent-live-after-absence' | 'root-reused' | 'protected' | 'unsuccessful', captured = false) {
+
   Object.defineProperty(process, 'platform', { value: 'win32' })
   const root = 900_020, relay = 900_021, leaf = 900_022, orphan = 900_023, grandchild = 900_024
   let clock = 1_000_000, removed = 0, trees = 0, births = 0
@@ -332,14 +333,15 @@ function unanchoredFixture(mode: 'gone' | 'alive' | 'unknown' | 'orphan' | 'reus
   const events: string[] = [], birthTargets: number[] = []
   const child = new EventEmitter() as ChildProcess
   Object.assign(child, { pid: root, stdout: new PassThrough() })
-  const initialRows = [{ pid: root, ppid: process.pid }, { pid: relay, ppid: root }, { pid: leaf, ppid: relay }]
+  const initialRows = [{ pid: root, ppid: process.pid }, { pid: relay, ppid: root }, { pid: mode === 'protected' ? process.pid : leaf, ppid: relay }]
   const date = spyOn(Date, 'now').mockImplementation(() => clock)
   const launcher = spyOn(portable, 'resolveDirectWindowsLauncher').mockReturnValue({ command: '/TEST/native', argsPrefix: [] })
   const spawn = spyOn(portable, 'spawnPortableCli').mockImplementation(() => {
     queueMicrotask(() => {
       child.stdout!.emit('data', Buffer.from('1.19.0\n'))
-      child.emit('exit', 0)
-      if (mode !== 'absence-before-close') child.emit('close', 0)
+      const exitCode = mode === 'unsuccessful' ? 1 : 0
+      child.emit('exit', exitCode)
+      if (mode !== 'absence-before-close') child.emit('close', exitCode)
     })
     return child
   })
@@ -348,15 +350,18 @@ function unanchoredFixture(mode: 'gone' | 'alive' | 'unknown' | 'orphan' | 'reus
     birth: async (target, budget) => {
       births++; birthTargets.push(target); budgets.push(budget); clock += 350
       if (mode.startsWith('stale-queryable') && target === root) return 100
-      return mode === 'stale-captured' && target === root && births === 1 ? 100 : null
+      return (mode === 'stale-captured' || captured) && target === root && births === 1 ? 100 : null
     },
+
     tree: async budget => {
       budgets.push(budget); trees++
       let rows = trees === 1 || mode === 'persistent' ||
         (mode === 'transient-live-candidate' && trees <= 3) ? initialRows : []
       if (trees === 2 && mode === 'orphan') rows = [{ pid: grandchild, ppid: orphan }, { pid: orphan, ppid: leaf }]
       if (trees === 2 && mode === 'reused') rows = [{ pid: leaf, ppid: 900_099 }]
+      if (trees === 2 && mode === 'root-reused') rows = [{ pid: root, ppid: 900_099 }]
       if (trees === 3 && (mode === 'final-reappeared' || mode === 'stale-queryable-final-reappeared')) rows = [{ pid: orphan, ppid: leaf }]
+
       events.push(rows.length ? 'census:rows' : 'census:empty')
       return rows
     },
@@ -366,7 +371,9 @@ function unanchoredFixture(mode: 'gone' | 'alive' | 'unknown' | 'orphan' | 'reus
       if (target === leaf && (mode === 'persistent-live-after-absence' ||
         (mode === 'transient-live-candidate' && trees <= 2))) return 'alive'
       if ((mode === 'alive' && target === leaf) || (mode === 'orphan' && target === grandchild) ||
-        (mode === 'reused' && trees >= 2 && target === leaf)) return 'alive'
+        (mode === 'reused' && trees >= 2 && target === leaf) ||
+        (mode === 'root-reused' && trees >= 2 && target === root)) return 'alive'
+
       return mode === 'unknown' && target === leaf ? 'unknown' : 'gone'
     },
     signal: target => { signals.push(target) },
@@ -401,7 +408,7 @@ test('Windows unanchored gone rows require independent gone checks, raw absence 
 test('Windows stale captured anchor retires only after gone checks, fresh absence, close and strict final census', async () => {
   const f = unanchoredFixture('stale-captured')
   expect(await f.run()).toBe('1.19.0\n')
-  expect(f.aliveReads).toEqual([f.root, f.root, f.relay, f.leaf, f.root, f.relay, f.leaf])
+  expect(f.aliveReads).toEqual([f.root, f.root, f.root, f.relay, f.leaf, f.root, f.relay, f.leaf])
   expect(f.events).toEqual(['census:rows', 'census:empty', 'census:empty', 'remove'])
   expect(f.births()).toBe(2)
   expect(f.signals).toEqual([])
@@ -479,5 +486,34 @@ for (const mode of ['alive', 'unknown', 'orphan', 'reused', 'persistent', 'final
     if (mode === 'reused') { expect(f.trees()).toBeGreaterThan(2); expect(f.elapsed()).toBe(8000) }
     if (mode === 'final-reappeared') expect(f.trees()).toBe(3)
     if (mode === 'persistent') expect(f.elapsed()).toBe(8000)
+  })
+}
+
+// Actual Windows trace: captured owner exited0/closed, birth lookup then found
+// it gone, but WMI still included that owner and two already-gone descendants.
+test('Windows captured successful owner waits out stale gone descendants without acquiring signal authority', async () => {
+  const f = unanchoredFixture('gone', true)
+  expect(await f.run()).toBe('1.19.0\n')
+  expect(f.births()).toBe(2)
+  for (const target of [f.root, f.relay, f.leaf]) expect(f.aliveReads).toContain(target)
+  expect(f.events).toEqual(['census:rows', 'census:empty', 'census:empty', 'remove'])
+  expect(f.signals).toEqual([])
+  expect(f.taskkills).toEqual([])
+  expect(f.budgets.every(budget => budget > 0 && budget <= 5000)).toBe(true)
+  expect(f.removed()).toBe(1)
+})
+
+for (const mode of ['root-reused', 'protected', 'absence-before-close', 'unsuccessful'] as const) {
+  test(`Windows captured ${mode} owner cannot use stale-census waiting to retire or signal`, async () => {
+    const f = unanchoredFixture(mode, true)
+    await expect(f.run()).rejects.toThrow('cleanup_unknown')
+    expect(f.removed()).toBe(0)
+    expect(f.signals).toEqual([])
+    expect(f.taskkills).toEqual([])
+    expect(f.births()).toBe(2)
+    if (mode === 'root-reused') {
+      expect(f.elapsed()).toBe(8000)
+      expect(f.aliveReads).toContain(f.root)
+    }
   })
 }

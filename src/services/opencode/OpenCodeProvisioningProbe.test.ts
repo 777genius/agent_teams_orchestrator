@@ -420,7 +420,12 @@ describe('OpenCodeProvisioningProbe', () => {
       liveConfig = livePrepared()
       await writeFile(path.join(projectPath, 'AGENTS.md'), 'changed behavior')
       expect(await refresh()).toBeNull()
-      expect(diagnostics.pop()).toEqual({ check: 'behavior_match' })
+      expect(diagnostics.pop()).toMatchObject({ check: 'behavior_match', comparison: {
+        initialEvidenceMatchesExpectation: false, projectBehaviorChanged: true,
+        effectiveSelectedAuthChanged: null, otherEvidenceChanged: null,
+        sourcesAvailable: true, changedSourceCount: 1,
+        sources: [{ label: 'AGENTS.md', initial: 'present', refreshed: 'present' }],
+      } })
       await writeFile(path.join(projectPath, 'AGENTS.md'), 'stable behavior')
       await upsertOpenCodeAuthCredential({
         authPath: prepared.managedAuthPath, providerId: 'deepinfra',

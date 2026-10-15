@@ -40,7 +40,6 @@ import {
   is1mContextDisabled,
   modelSupports1M,
 } from '../context.js'
-import { isEnvTruthy } from '../envUtils.js'
 import { getModelStrings, resolveOverriddenModel } from './modelStrings.js'
 import { formatModelPricing, getOpus46CostTier } from '../modelCost.js'
 import { getSettings_DEPRECATED } from '../settings/settings.js'
@@ -96,7 +95,7 @@ function getAccessPolicyFallbackCandidates(): string[] {
   ].filter(Boolean)
 }
 
-function getAllowedModelOrFallback(model: string): string {
+function getAllowedDefaultModelOrFallback(model: string): string {
   if (
     isModelAllowed(model) &&
     (!shouldUseCodexProviderRoutingForCurrentProcess() ||
@@ -143,8 +142,9 @@ export function isNonCustomOpusModel(model: ModelName): boolean {
 /**
  * Helper to get the model from /model (including via /config), the --model flag, environment variable,
  * or the saved settings. The returned value can be a model alias if that's what the user specified.
- * Undefined if the user didn't configure anything, in which case we fall back to
- * the default (null).
+ * Undefined if the user didn't configure anything. Explicit values are
+ * returned verbatim even when policy will reject them; callers must not turn a
+ * denied user selection into an implicit model fallback.
  *
  * Priority order within this function:
  * 1. Model override during session (from /model command) - highest priority
@@ -163,12 +163,33 @@ export function getUserSpecifiedModelSetting(): ModelSetting | undefined {
     specifiedModel = process.env.ANTHROPIC_MODEL || settings.model || undefined
   }
 
-  // Ignore the user-specified model if it's not in the availableModels allowlist.
-  if (specifiedModel && !isModelAllowed(specifiedModel)) {
-    return undefined
-  }
-
   return specifiedModel
+}
+
+/**
+ * Return a clear policy error for a user/member model without changing its
+ * identity. Default-only fallback remains in getDefaultMainLoopModel(), while
+ * explicit selections are retained here and rejected before a provider call.
+ */
+export function getModelSelectionPolicyError(model: ModelName): string | null {
+  if (!isModelAllowed(model)) {
+    return `Model "${model}" is not allowed by the availableModels policy; refusing to change it or call the provider.`
+  }
+  if (
+    shouldUseCodexProviderRoutingForCurrentProcess() &&
+    isCodexModel(model) &&
+    !isCodexModelSupportedForCurrentProcess(model)
+  ) {
+    return `Model "${model}" is unavailable for the current Codex runtime; refusing to change it or call the provider.`
+  }
+  return null
+}
+
+export function assertModelSelectionAllowed(model: ModelName): void {
+  const error = getModelSelectionPolicyError(model)
+  if (error) {
+    throw new Error(error)
+  }
 }
 
 /**
@@ -186,13 +207,13 @@ export function getUserSpecifiedModelSetting(): ModelSetting | undefined {
 export function getMainLoopModel(): ModelName {
   const model = getUserSpecifiedModelSetting()
   if (model !== undefined && model !== null) {
-    return getAllowedModelOrFallback(parseUserSpecifiedModel(model))
+    return parseUserSpecifiedModel(model)
   }
   return getDefaultMainLoopModel()
 }
 
 export function getBestModel(): ModelName {
-  return getAllowedModelOrFallback(getDefaultOpusModel())
+  return getAllowedDefaultModelOrFallback(getDefaultOpusModel())
 }
 
 // @[MODEL LAUNCH]: Update the default Opus model (3P providers may lag so keep defaults unchanged).
@@ -248,13 +269,19 @@ export function getDefaultHaikuModel(): ModelName {
 export function getRuntimeMainLoopModel(params: {
   permissionMode: PermissionMode
   mainLoopModel: string
+  modelSetting?: ModelSetting
   exceeds200kTokens?: boolean
 }): ModelName {
-  const { permissionMode, mainLoopModel, exceeds200kTokens = false } = params
+  const {
+    permissionMode,
+    mainLoopModel,
+    modelSetting = getUserSpecifiedModelSetting(),
+    exceeds200kTokens = false,
+  } = params
 
   // opusplan uses Opus in plan mode without [1m] suffix.
   if (
-    getUserSpecifiedModelSetting() === 'opusplan' &&
+    modelSetting === 'opusplan' &&
     permissionMode === 'plan' &&
     !exceeds200kTokens
   ) {
@@ -262,7 +289,7 @@ export function getRuntimeMainLoopModel(params: {
   }
 
   // sonnetplan by default
-  if (getUserSpecifiedModelSetting() === 'haiku' && permissionMode === 'plan') {
+  if (modelSetting === 'haiku' && permissionMode === 'plan') {
     return getDefaultSonnetModel()
   }
 
@@ -317,7 +344,7 @@ export function getDefaultMainLoopModelSetting(): ModelName | ModelAlias {
  * (bypassing any user-specified values).
  */
 export function getDefaultMainLoopModel(): ModelName {
-  return getAllowedModelOrFallback(
+  return getAllowedDefaultModelOrFallback(
     parseUserSpecifiedModel(getDefaultMainLoopModelSetting()),
   )
 }
@@ -325,9 +352,10 @@ export function getDefaultMainLoopModel(): ModelName {
 export function resolveAllowedModelSetting(
   model: ModelSetting | undefined | null,
 ): ModelName {
-  return getAllowedModelOrFallback(
-    parseUserSpecifiedModel(model ?? getDefaultMainLoopModel()),
-  )
+  if (model === undefined || model === null) {
+    return getDefaultMainLoopModel()
+  }
+  return parseUserSpecifiedModel(model)
 }
 
 // @[MODEL LAUNCH]: Add a canonical name mapping for the new model below.
@@ -708,24 +736,13 @@ export function parseUserSpecifiedModel(
     }
   }
 
-  // Opus 4/4.1 are no longer available on the first-party API (same as
-  // Claude.ai) — silently remap to the current Opus default. The 'opus'
-  // alias already resolves to 4.7, so the only users on these explicit
-  // strings pinned them in settings/env/--model/SDK before 4.5 launched.
-  // 3P providers may not yet have 4.6 capacity, so pass through unchanged.
-  if (
-    getAPIProvider() === 'firstParty' &&
-    isLegacyOpusFirstParty(modelString) &&
-    isLegacyModelRemapEnabled()
-  ) {
-    return getDefaultOpusModel() + (has1mTag ? '[1m]' : '')
-  }
-
   if (process.env.USER_TYPE === 'ant') {
     const has1mAntTag = has1mContext(normalizedModel)
     const baseAntModel = normalizedModel.replace(/\[1m]$/i, '').trim()
 
-    const antModel = resolveAntModel(baseAntModel)
+    // Dynamic Ant metadata may resolve an explicitly named alias, but it must
+    // never rewrite a concrete/custom model ID by substring matching.
+    const antModel = resolveAntModel(baseAntModel, { exactAliasOnly: true })
     if (antModel) {
       const suffix = has1mAntTag ? '[1m]' : ''
       return antModel.model + suffix
@@ -771,28 +788,15 @@ export function resolveSkillModelOverride(
   }
   // modelSupports1M matches on canonical IDs ('claude-opus-4-6', 'claude-sonnet-4');
   // a bare 'opus' alias falls through getCanonicalName unmatched. Resolve first.
-  if (modelSupports1M(parseUserSpecifiedModel(skillModel))) {
+  const resolvedSkillModel = parseUserSpecifiedModel(skillModel)
+  const resolvedCurrentModel = parseUserSpecifiedModel(currentModel)
+  const sameBaseModel =
+    normalizeModelStringForAPI(resolvedSkillModel) ===
+    normalizeModelStringForAPI(resolvedCurrentModel)
+  if (sameBaseModel || modelSupports1M(resolvedSkillModel)) {
     return skillModel + '[1m]'
   }
   return skillModel
-}
-
-const LEGACY_OPUS_FIRSTPARTY = [
-  'claude-opus-4-20250514',
-  'claude-opus-4-1-20250805',
-  'claude-opus-4-0',
-  'claude-opus-4-1',
-]
-
-function isLegacyOpusFirstParty(model: string): boolean {
-  return LEGACY_OPUS_FIRSTPARTY.includes(model)
-}
-
-/**
- * Opt-out for the legacy Opus 4.0/4.1 → current Opus remap.
- */
-export function isLegacyModelRemapEnabled(): boolean {
-  return !isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_LEGACY_MODEL_REMAP)
 }
 
 export function modelDisplayString(model: ModelSetting): string {

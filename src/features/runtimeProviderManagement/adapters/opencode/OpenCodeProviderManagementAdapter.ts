@@ -1,6 +1,7 @@
 import { selectedProviderUsesOpenCodeV2, connectOpenCodeV2Provider, loadOpenCodeV2ProviderModels, testOpenCodeV2ProviderModel } from './OpenCodeV2ProviderManagement.js'
 import path from 'node:path'
 import { realpath } from 'node:fs/promises'
+import { getOpenCodeVersionProbeDiagnostics, OpenCodeVersionProbeCleanupError } from '../../../../services/opencode/compatibility/OpenCodeVersionProbe.js'
 
 import {
   openCodeClientFactory,
@@ -671,6 +672,29 @@ function providerManagementError(
       recoverable,
     },
   }
+}
+
+function selectedIdentityFailureMessage(error: unknown): string {
+  const classify = (value: unknown) => {
+    const category = value instanceof OpenCodeVersionProbeCleanupError ? 'OpenCodeVersionProbeCleanupError'
+      : value instanceof TypeError ? 'TypeError' : value instanceof SyntaxError ? 'SyntaxError'
+        : value instanceof RangeError ? 'RangeError' : value instanceof URIError ? 'URIError'
+          : value instanceof Error ? 'Error' : 'Unknown'
+    const code = value instanceof Error && ['cleanup_unknown', 'identity_mismatch', 'selection_unavailable'].includes(value.message)
+      ? value.message : undefined
+    const errno = value instanceof Error && 'code' in value && typeof value.code === 'string'
+      && ['ENOENT', 'EACCES', 'EPERM', 'EINVAL', 'EIO', 'ENOTDIR', 'ELOOP'].includes(value.code)
+      ? value.code : undefined
+    return { category, ...(code ? { code } : {}), ...(errno ? { errno } : {}) }
+  }
+  const original = classify(error)
+  const cause = error instanceof Error && error.cause !== undefined ? classify(error.cause) : undefined
+  const diagnostics = getOpenCodeVersionProbeDiagnostics(error)
+  const summary = { original, ...(cause ? { cause } : {}), ...(diagnostics.length ? { diagnostics } : {}) }
+  const serialized = JSON.stringify(summary)
+  // Preserve valid bounded JSON even if an unexpected typed producer supplies oversized values.
+  const bounded = serialized.length <= 2048 ? serialized : JSON.stringify({ original, ...(cause ? { cause } : {}), diagnosticsOmitted: true })
+  return `Selected OpenCode identity is unavailable [identityDiagnostic=${bounded}]`
 }
 
 function redactSecret(message: string, secret: string | null | undefined): string {
@@ -4315,7 +4339,7 @@ export class OpenCodeProviderManagementAdapter
   ): Promise<ProviderManagementResult<RuntimeProviderModelsView>> {
     let selectedV2 = false
     try { selectedV2 = input.runtimeId === 'opencode' && await selectedProviderUsesOpenCodeV2() }
-    catch { return providerManagementError('runtime-unhealthy', 'Selected OpenCode identity is unavailable') }
+    catch (error) { return providerManagementError('runtime-unhealthy', selectedIdentityFailureMessage(error)) }
     if (selectedV2) {
       const providerId = normalizeProviderId(canonicalizeOpenCodeProviderId(input.providerId))
       if (!providerId) return providerManagementError('provider-missing', 'Provider id is invalid')

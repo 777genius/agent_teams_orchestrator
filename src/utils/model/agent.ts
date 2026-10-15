@@ -1,6 +1,6 @@
 import type { PermissionMode } from '../permissions/PermissionMode.js'
 import { capitalize } from '../stringUtils.js'
-import { MODEL_ALIASES, type ModelAlias } from './aliases.js'
+import { MODEL_ALIASES, type ModelAlias, isModelAlias } from './aliases.js'
 import { applyBedrockRegionPrefix, getBedrockRegionPrefix } from './bedrock.js'
 import {
   getAuthlessProviderDefaultModel,
@@ -88,7 +88,8 @@ export function getAgentModel(
     // This ensures agents using 'inherit' get opusplan→Opus resolution in plan mode
     return getRuntimeMainLoopModel({
       permissionMode: permissionMode ?? 'default',
-      mainLoopModel: resolvedParentModel,
+      modelSetting: resolvedParentModel,
+      mainLoopModel: parseUserSpecifiedModel(resolvedParentModel),
       exceeds200kTokens: false,
     })
   }
@@ -97,6 +98,11 @@ export function getAgentModel(
     return resolvedParentModel
   }
   const model = parseUserSpecifiedModel(agentModelWithExp)
+  // Concrete/custom agent IDs are explicit policy. Region inheritance applies
+  // only to aliases that need to resolve against the parent's provider profile.
+  if (!isModelAlias(agentModelWithExp)) {
+    return model
+  }
   return applyParentRegionPrefix(model, agentModelWithExp)
 }
 

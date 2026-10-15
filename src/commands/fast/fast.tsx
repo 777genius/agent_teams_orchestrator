@@ -9,7 +9,7 @@ import { useKeybindings } from '../../keybindings/useKeybinding.js';
 import { type AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS, logEvent } from '../../services/analytics/index.js';
 import { type AppState, useAppState, useSetAppState } from '../../state/AppState.js';
 import type { LocalJSXCommandOnDone } from '../../types/command.js';
-import { clearFastModeCooldown, FAST_MODE_MODEL_DISPLAY, getFastModeModel, getFastModeRuntimeState, getFastModeUnavailableReason, isFastModeEnabled, isFastModeSupportedByModel, prefetchFastModeStatus } from '../../utils/fastMode.js';
+import { clearFastModeCooldown, FAST_MODE_MODEL_DISPLAY, getFastModeRuntimeState, getFastModeToggleDecision, getFastModeUnavailableReason, isFastModeEnabled, prefetchFastModeStatus } from '../../utils/fastMode.js';
 import { formatDuration } from '../../utils/format.js';
 import { formatModelPricing, getOpus48CostTier } from '../../utils/modelCost.js';
 import { updateSettingsForSource } from '../../utils/settings/settings.js';
@@ -19,18 +19,7 @@ function applyFastMode(enable: boolean, setAppState: (f: (prev: AppState) => App
     fastMode: enable ? true : undefined
   });
   if (enable) {
-    setAppState(prev => {
-      // Only switch model if current model doesn't support fast mode
-      const needsModelSwitch = !isFastModeSupportedByModel(prev.mainLoopModel);
-      return {
-        ...prev,
-        ...(needsModelSwitch ? {
-          mainLoopModel: getFastModeModel(),
-          mainLoopModelForSession: null
-        } : {}),
-        fastMode: true
-      };
-    });
+    setAppState(prev => ({ ...prev, fastMode: true }));
   } else {
     setAppState(prev => ({
       ...prev,
@@ -72,6 +61,11 @@ export function FastModePicker(t0) {
       if (isUnavailable) {
         return;
       }
+      const decision = getFastModeToggleDecision(model, enableFastMode);
+      if (decision.ok === false) {
+        onDone(decision.message, { display: "system" });
+        return;
+      }
       applyFastMode(enableFastMode, setAppState);
       logEvent("tengu_fast_mode_toggled", {
         enabled: enableFastMode,
@@ -79,8 +73,7 @@ export function FastModePicker(t0) {
       });
       if (enableFastMode) {
         const fastIcon = getFastIconString(enableFastMode);
-        const modelUpdated = !isFastModeSupportedByModel(model) ? ` · model set to ${FAST_MODE_MODEL_DISPLAY}` : "";
-        onDone(`${fastIcon} Fast mode ON${modelUpdated} · ${pricing}`);
+        onDone(`${fastIcon} Fast mode ON · ${pricing}`);
       } else {
         setAppState(_temp3);
         onDone("Fast mode OFF");
@@ -231,6 +224,10 @@ async function handleFastModeShortcut(enable: boolean, getAppState: () => AppSta
   const {
     mainLoopModel
   } = getAppState();
+  const decision = getFastModeToggleDecision(mainLoopModel, enable);
+  if (decision.ok === false) {
+    return decision.message;
+  }
   applyFastMode(enable, setAppState);
   logEvent('tengu_fast_mode_toggled', {
     enabled: enable,
@@ -238,9 +235,8 @@ async function handleFastModeShortcut(enable: boolean, getAppState: () => AppSta
   });
   if (enable) {
     const fastIcon = getFastIconString(true);
-    const modelUpdated = !isFastModeSupportedByModel(mainLoopModel) ? ` · model set to ${FAST_MODE_MODEL_DISPLAY}` : '';
     const pricing = formatModelPricing(getOpus48CostTier(true));
-    return `${fastIcon} Fast mode ON${modelUpdated} · ${pricing}`;
+    return `${fastIcon} Fast mode ON · ${pricing}`;
   } else {
     return `Fast mode OFF`;
   }
