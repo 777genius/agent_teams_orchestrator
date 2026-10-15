@@ -2945,6 +2945,13 @@ struct NativeSelfImageCustody {
 struct Scope;
 static void removeGrants(Scope &scope);
 static void assertSharedReadRootsLive(const Scope &scope);
+static void assertAncestorMetadataLive(const Scope &scope);
+struct RetainedAncestorMetadata {
+  RetainedAnchorComponent anchor;
+  // Retain intent before the named write, including an indeterminate failure.
+  std::vector<BYTE> originalDescriptor;
+  explicit RetainedAncestorMetadata(Handle held) : anchor(std::move(held)) {}
+};
 struct Scope {
   Handle job, process, thread, pipe, cancel, readerFinished, spool, inputFile, outputFile, errorFile;
   std::unique_ptr<NativeCommandStore> commands;
@@ -2958,19 +2965,23 @@ struct Scope {
   std::thread reader, mainExit;
   std::mutex pipeMutex;
   std::vector<RetainedAnchorComponent> aclRoots;
+  std::vector<RetainedAncestorMetadata> metadataAncestors;
   std::vector<RetainedRealpathAnchor> realpathAnchors;
   std::unique_ptr<RetainedRealpathDll> realpathDll;
   std::shared_ptr<const ClosedControllerCohort> cohort;
   OwnerStore *owners = nullptr;
   bool physicalCleanupProof = false;
+  bool metadataNoChildCleanupProof = false;
   void assertRealpathAnchorsLive() const {
     require(!stopping, "execution_identity_mismatch");
     for (const auto &anchor : realpathAnchors)
       anchor.assertLive();
     assertSharedReadRootsLive(*this);
+    assertAncestorMetadataLive(*this);
     if (realpathDll) realpathDll->assertLive();
   }
   ~Scope() {
+    const bool mainNeverCreated = !process;
     stopping = true;
     if (cancel)
       SetEvent(cancel.value);
@@ -3001,6 +3012,7 @@ struct Scope {
     bool empty = false;
     try {
       empty = !job || active() == 0;
+      if (empty && mainNeverCreated) metadataNoChildCleanupProof = true;
       if (empty)
         removeGrants(*this);
     } catch (...) {
@@ -3372,6 +3384,203 @@ static void assertSharedReadRootsLive(const Scope &scope) {
 static JsonObject grantObjectIdentity(HANDLE file, const std::wstring &owner, bool shared) {
   return shared ? anchorIdentity(file) : fileObjectIdentity(file, owner, true);
 }
+// Bun opens each resolver ancestor for directory RX, not just traversal. This
+// authority lists that directory's names/metadata only: it never inherits onto
+// sibling files and never admits an ancestor as a realpath/content root.
+static std::string ancestorMetadataAce(PSID package) {
+  constexpr DWORD access = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
+  static_assert(access == 0x1200a9);
+  const DWORD size = sizeof(ACL) + offsetof(ACCESS_ALLOWED_ACE, SidStart) + GetLengthSid(package);
+  std::vector<BYTE> bytes(size);
+  auto acl = reinterpret_cast<PACL>(bytes.data());
+  require(InitializeAcl(acl, size, ACL_REVISION) &&
+              AddAccessAllowedAceEx(acl, ACL_REVISION, 0, access, package),
+          "execution_containment_filesystem_denied", "ancestor_metadata_ace");
+  void *raw = nullptr;
+  require(GetAce(acl, 0, &raw), "execution_containment_filesystem_denied", "ancestor_metadata_ace");
+  return std::string(static_cast<const char *>(raw), static_cast<ACE_HEADER *>(raw)->AceSize);
+}
+struct AncestorMetadataAcl {
+  std::vector<BYTE> descriptor;
+  std::string owner, group;
+  SECURITY_DESCRIPTOR_CONTROL control = 0;
+  std::vector<std::string> foreignAces;
+  bool memberAllowed = false;
+};
+static AncestorMetadataAcl ancestorMetadataAcl(std::vector<BYTE> bytes, PSID package,
+                                               const char *code) {
+  AncestorMetadataAcl result;
+  result.descriptor = std::move(bytes);
+  auto descriptor = result.descriptor.data();
+  require(IsValidSecurityDescriptor(descriptor), code, "ancestor_metadata_descriptor");
+  PSID owner = nullptr, group = nullptr;
+  PACL acl = nullptr;
+  BOOL defaulted = FALSE, present = FALSE;
+  DWORD revision = 0;
+  require(GetSecurityDescriptorOwner(descriptor, &owner, &defaulted) && owner && IsValidSid(owner) &&
+              GetSecurityDescriptorGroup(descriptor, &group, &defaulted) && group && IsValidSid(group) &&
+              GetSecurityDescriptorDacl(descriptor, &present, &acl, &defaulted) && present && acl && IsValidAcl(acl) &&
+              GetSecurityDescriptorControl(descriptor, &result.control, &revision),
+          code, "ancestor_metadata_security");
+  result.owner.assign(static_cast<const char *>(owner), GetLengthSid(owner));
+  result.group.assign(static_cast<const char *>(group), GetLengthSid(group));
+  const auto ownAce = ancestorMetadataAce(package);
+  const auto *sidBegin = static_cast<const char *>(package);
+  for (DWORD index = 0; index < acl->AceCount; ++index) {
+    void *raw = nullptr;
+    require(GetAce(acl, index, &raw), code, "ancestor_metadata_ace");
+    const auto *header = static_cast<const ACE_HEADER *>(raw);
+    const auto *begin = static_cast<const char *>(raw);
+    std::string ace(begin, header->AceSize);
+    if (ace == ownAce) {
+      require(!result.memberAllowed, code, "ancestor_metadata_package");
+      result.memberAllowed = true;
+    } else {
+      // Preserve all foreign ACE types verbatim. Fail closed on any other ACE
+      // containing our SID, including object/callback ACEs or changed flags.
+      require(std::search(begin, begin + header->AceSize, sidBegin,
+                          sidBegin + GetLengthSid(package)) == begin + header->AceSize,
+              code, "ancestor_metadata_package");
+      result.foreignAces.push_back(std::move(ace));
+    }
+  }
+  return result;
+}
+static AncestorMetadataAcl ancestorMetadataAcl(HANDLE file, PSID package, const char *code) {
+  PSECURITY_DESCRIPTOR descriptor = nullptr;
+  const DWORD status = GetSecurityInfo(file, SE_FILE_OBJECT,
+      OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+      nullptr, nullptr, nullptr, nullptr, &descriptor);
+  if (status != ERROR_SUCCESS) throw NativeError{code, status, "ancestor_metadata_read"};
+  LocalMemory memory{descriptor};
+  const auto *bytes = static_cast<const BYTE *>(descriptor);
+  return ancestorMetadataAcl(std::vector<BYTE>(bytes, bytes + GetSecurityDescriptorLength(descriptor)),
+                              package, code);
+}
+static bool sameAncestorMetadataAuthority(const AncestorMetadataAcl &before,
+                                          const AncestorMetadataAcl &after) {
+  return before.owner == after.owner && before.group == after.group && before.control == after.control;
+}
+static void retainMetadataAncestor(Scope &scope, Handle held) {
+  const auto identity = anchorIdentity(held.value);
+  for (const auto &existing : scope.metadataAncestors)
+    if (samePhysicalIdentity(identity, existing.anchor.identity)) {
+      require(identity.Stringify() == existing.anchor.identity.Stringify(), "execution_path_alias");
+      return;
+    }
+  scope.metadataAncestors.emplace_back(std::move(held));
+}
+static void assertAncestorMetadataPinsLive(const Scope &scope) {
+  for (const auto &ancestor : scope.metadataAncestors) ancestor.anchor.assertLive();
+}
+static void assertAncestorMetadataLive(const Scope &scope) {
+  assertAncestorMetadataPinsLive(scope);
+  for (const auto &ancestor : scope.metadataAncestors) if (!ancestor.originalDescriptor.empty()) {
+    SharedAclMutex mutex(ancestor.anchor.identity);
+    const auto original = ancestorMetadataAcl(ancestor.originalDescriptor, scope.sid.value,
+                                              "execution_containment_filesystem_denied");
+    const auto current = ancestorMetadataAcl(ancestor.anchor.handle.value, scope.sid.value,
+                                             "execution_containment_filesystem_denied");
+    require(sameAncestorMetadataAuthority(original, current) && current.memberAllowed,
+            "execution_containment_filesystem_denied", "ancestor_metadata_changed");
+  }
+}
+static void changeAncestorMetadata(Scope &scope, RetainedAncestorMetadata &ancestor, bool grant) {
+  const char *code = grant ? "execution_containment_filesystem_denied" : "cleanup_unknown";
+  require(grant || scope.physicalCleanupProof || scope.metadataNoChildCleanupProof,
+          code, "ancestor_metadata_cleanup_unproven");
+  SharedAclMutex mutex(ancestor.anchor.identity);
+  assertAncestorMetadataPinsLive(scope);
+  auto handle = scopeAclDirectory(ancestor.anchor); // Explicit access, never MAXIMUM_ALLOWED/DELETE.
+  const auto before = ancestorMetadataAcl(handle.value, scope.sid.value, code);
+  if (grant) {
+    require(ancestor.originalDescriptor.empty() && !before.memberAllowed, code, "ancestor_metadata_package");
+    ancestor.originalDescriptor = before.descriptor;
+  } else {
+    require(!ancestor.originalDescriptor.empty(), code, "ancestor_metadata_intent");
+    const auto original = ancestorMetadataAcl(ancestor.originalDescriptor, scope.sid.value, code);
+    require(sameAncestorMetadataAuthority(original, before), code, "ancestor_metadata_changed");
+    if (!before.memberAllowed) return; // A failed named write may have had no effect.
+  }
+  PACL previous = nullptr;
+  BOOL present = FALSE, defaulted = FALSE;
+  require(GetSecurityDescriptorDacl(const_cast<BYTE *>(before.descriptor.data()), &present, &previous,
+                                    &defaulted) && present && previous, code, "ancestor_metadata_read");
+  const auto ownAce = ancestorMetadataAce(scope.sid.value);
+  size_t size = sizeof(ACL) + (grant ? ownAce.size() : 0);
+  for (const auto &ace : before.foreignAces) size += ace.size();
+  require(size <= MAXWORD, code, "ancestor_metadata_acl_size");
+  std::vector<BYTE> aclBytes(size);
+  auto next = reinterpret_cast<PACL>(aclBytes.data());
+  require(InitializeAcl(next, static_cast<DWORD>(size), previous->AclRevision), code, "ancestor_metadata_acl");
+  bool inserted = !grant;
+  const auto append = [&](const std::string &ace) {
+    require(AddAce(next, previous->AclRevision, MAXDWORD, const_cast<char *>(ace.data()),
+                    static_cast<DWORD>(ace.size())), code, "ancestor_metadata_acl");
+  };
+  for (const auto &ace : before.foreignAces) {
+    if (!inserted && (reinterpret_cast<const ACE_HEADER *>(ace.data())->AceFlags & INHERITED_ACE)) {
+      append(ownAce);
+      inserted = true;
+    }
+    append(ace);
+  }
+  if (!inserted) append(ownAce);
+  DWORD descriptorSize = 0, daclSize = 0, saclSize = 0, ownerSize = 0, groupSize = 0;
+  auto relative = const_cast<BYTE *>(before.descriptor.data());
+  require(!MakeAbsoluteSD(relative, nullptr, &descriptorSize, nullptr, &daclSize, nullptr, &saclSize,
+                          nullptr, &ownerSize, nullptr, &groupSize) && GetLastError() == ERROR_INSUFFICIENT_BUFFER,
+          code, "ancestor_metadata_descriptor");
+  std::vector<BYTE> absolute(descriptorSize), dacl(daclSize), sacl(saclSize), owner(ownerSize), group(groupSize);
+  require(MakeAbsoluteSD(relative, absolute.data(), &descriptorSize,
+                          reinterpret_cast<PACL>(dacl.data()), &daclSize,
+                          reinterpret_cast<PACL>(sacl.data()), &saclSize,
+                          owner.data(), &ownerSize, group.data(), &groupSize) &&
+              SetSecurityDescriptorDacl(absolute.data(), TRUE, next, defaulted),
+          code, "ancestor_metadata_descriptor");
+  assertAncestorMetadataPinsLive(scope);
+  // Unlike SetSecurityInfo/SetNamedSecurityInfo, SetFileSecurityW does not
+  // propagate existing inheritable foreign ACEs into the directory's children.
+  // https://learn.microsoft.com/windows/win32/api/securitybaseapi/nf-securitybaseapi-setfilesecurityw
+  if (!SetFileSecurityW(extended(ancestor.anchor.path).c_str(), DACL_SECURITY_INFORMATION, absolute.data())) {
+    const DWORD error = GetLastError();
+    throw NativeError{code, error, "ancestor_metadata_write"};
+  }
+  assertAncestorMetadataPinsLive(scope);
+  require(anchorIdentity(handle.value).Stringify() == ancestor.anchor.identity.Stringify(),
+          code, "ancestor_metadata_identity");
+  const auto after = ancestorMetadataAcl(handle.value, scope.sid.value, code);
+  require(sameAncestorMetadataAuthority(before, after) && after.foreignAces == before.foreignAces &&
+              after.memberAllowed == grant, code, "ancestor_metadata_changed");
+}
+static void grantAncestorMetadata(Scope &scope) {
+  for (const auto &root : scope.realpathAnchors) {
+    root.assertLive();
+    for (size_t i = 0; i + 1 < root.components.size(); ++i) {
+      HANDLE duplicate = nullptr;
+      require(DuplicateHandle(GetCurrentProcess(), root.components[i].handle.value,
+                              GetCurrentProcess(), &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS),
+              "execution_containment_filesystem_denied", "ancestor_metadata_pin");
+      retainMetadataAncestor(scope, Handle(duplicate));
+    }
+  }
+  for (auto &ancestor : scope.metadataAncestors) {
+    bool covered = false;
+    const auto path = text(ancestor.anchor.identity, L"ntPath");
+    for (const auto &root : scope.realpathAnchors) {
+      const auto &identity = root.components.back().identity;
+      const auto rootPath = text(identity, L"ntPath");
+      if (samePhysicalIdentity(identity, ancestor.anchor.identity) ||
+          (text(identity, L"volumeSerial") == text(ancestor.anchor.identity, L"volumeSerial") &&
+           path.size() > rootPath.size() && equalPath(path.substr(0, rootPath.size()), rootPath) &&
+           (rootPath.back() == L'\\' || path[rootPath.size()] == L'\\'))) {
+        covered = true;
+        break;
+      }
+    }
+    if (!covered) changeAncestorMetadata(scope, ancestor, true);
+  }
+}
 static void grantRoot(Scope &scope, Handle heldRoot, DWORD mask, ACCESS_MODE mode,
                       bool sharedRoot = false) {
   RetainedAnchorComponent anchor(std::move(heldRoot), sharedRoot);
@@ -3519,6 +3728,12 @@ static void removeGrants(Scope &scope) {
     }
   }
   scope.aclRoots = std::move(retained);
+  if (scope.physicalCleanupProof || scope.metadataNoChildCleanupProof)
+    for (size_t i = scope.metadataAncestors.size(); i > 0; --i) {
+      auto &ancestor = scope.metadataAncestors[i - 1];
+      if (!ancestor.originalDescriptor.empty()) changeAncestorMetadata(scope, ancestor, false);
+      scope.metadataAncestors.erase(scope.metadataAncestors.begin() + (i - 1));
+    }
 }
 struct Scope;
 static std::unique_ptr<Scope> launch(const JsonObject &input, OwnerStore &owners);
@@ -4532,6 +4747,7 @@ static std::unique_ptr<Scope> launch(const JsonObject &input, OwnerStore &owners
   scope->profile = L"AgentTeams.OpenCodeV2." + nonce;
   scope->cwd = text(input, L"cwd");
   auto parents = owners.holdSelectedAncestors(scope->cwd);
+  for (auto &parent : parents) retainMetadataAncestor(*scope, std::move(parent));
   progress(L"windows-profile");
   HRESULT result = CreateAppContainerProfile(scope->profile.c_str(), scope->profile.c_str(),
                                              L"OpenCode V2 private execution", nullptr, 0,
@@ -4578,6 +4794,7 @@ static std::unique_ptr<Scope> launch(const JsonObject &input, OwnerStore &owners
       }
     }
   }
+  grantAncestorMetadata(*scope);
   // Helper-only native owner/command probes do not select a DLL. Production
   // composition requires this selection and its authenticated prepare receipt.
   progress(L"windows-dll");

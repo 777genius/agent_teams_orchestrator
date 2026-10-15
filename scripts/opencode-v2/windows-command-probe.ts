@@ -16,12 +16,18 @@ assert.match(path.win32.basename(root), /^TEST-windows-command-[a-zA-Z0-9-]+$/)
 const sharedReadRoot = root + '-shared-readonly'
 const sharedReadFile = path.join(sharedReadRoot, 'vendor-input.txt')
 let sharedReadBaseline: string | undefined
+const ancestorRoot = root + '-ancestor-metadata'
+const ancestorSelected = path.join(ancestorRoot, 'selected')
+const ancestorSibling = path.join(ancestorRoot, 'ungranted-sibling')
+const ancestorSecret = path.join(ancestorSibling, 'secret.txt')
+const ancestorAclPaths = [ancestorRoot, ancestorSibling, ancestorSecret]
+let ancestorAclBaseline: Record<string, unknown>[] | undefined
 const profileRoot = path.join(root, 'opencode', 'v2', 'profiles', 'TEST-prepared')
 const databasePath = path.join(profileRoot, 'data', 'opencode', 'opencode.db')
 const profileChildren = ['home', 'config', 'data', 'cache', 'state', 'tmp', 'appdata', 'localappdata', 'config/opencode', 'data/opencode'].map(value => path.join(profileRoot, value))
 const configContent = JSON.stringify({ 'TEST-only': 'config-read-é' }), authContent = JSON.stringify({ 'TEST-provider': { type: 'api', key: 'TEST-never-used' } }, null, 2)
 const expectedPreparedHashes = { configSHA256: createHash('sha256').update(configContent).digest('hex'), authSHA256: createHash('sha256').update(authContent).digest('hex') }
-const nonce = randomUUID(), leaseOwnerId = randomUUID(), journal = path.join(root, 'ancestor-journal.json')
+const nonce = randomUUID(), leaseOwnerId = randomUUID()
 const broker = createWindowsNativeBroker(await resolveWindowsNativeArtifact())
 broker.events.on('error', () => {})
 const filesystem = createWindowsOwnerFilesystem(value => broker.request(value.op, value))
@@ -31,7 +37,7 @@ let failure: unknown, stage = 'setup', launched = false, retired = false, sid: s
 const powershell = path.join(process.env.ProgramFiles!, 'PowerShell', '7', 'pwsh.exe')
 async function ps(script: string, extra: Record<string, string> = {}) {
   const child = Bun.spawn([powershell, '-NoProfile', '-NonInteractive', '-Command', script], {
-    env: { ...process.env, PSModulePath: path.join(process.env.ProgramFiles!, 'PowerShell', '7', 'Modules'), TEST_ROOT: root, TEST_NONCE: nonce, TEST_JOURNAL: journal, ...extra }, stdout: 'pipe', stderr: 'pipe',
+    env: { ...process.env, PSModulePath: path.join(process.env.ProgramFiles!, 'PowerShell', '7', 'Modules'), TEST_ROOT: root, TEST_NONCE: nonce, ...extra }, stdout: 'pipe', stderr: 'pipe',
   })
   const [out, err, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited])
   if (code !== 0) throw new Error(`windows_command_setup_failed:${code}:${err.slice(-2048)}`)
@@ -110,6 +116,37 @@ foreach($rule in @($acl.Access)){if($rule.IdentityReference.Translate([System.Se
     assert.equal(row.protected, index === 0)
   })
 }
+async function readAncestorAcls(): Promise<Record<string, unknown>[]> {
+  const rows: unknown = JSON.parse(await ps(`
+$ErrorActionPreference='Stop'
+$rows=@(foreach($p in @($env:TEST_ACL_PATHS|ConvertFrom-Json)){
+$acl=Get-Acl -LiteralPath $p
+$descriptor=[Security.AccessControl.RawSecurityDescriptor]::new($acl.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Owner-bor [Security.AccessControl.AccessControlSections]::Access))
+$aces=@(foreach($ace in $descriptor.DiscretionaryAcl){
+$bytes=[byte[]]::new($ace.BinaryLength);$ace.GetBinaryForm($bytes,0)
+if($ace -isnot [Security.AccessControl.CommonAce]){throw 'TEST unexpected ACE type'}
+[ordered]@{sid=$ace.SecurityIdentifier.Value;type=[int]$ace.AceType;flags=[int]$ace.AceFlags;mask=$ace.AccessMask;bytes=[Convert]::ToBase64String($bytes)}})
+[ordered]@{path=$p;owner=$descriptor.Owner.Value;control=[int]$descriptor.ControlFlags;aces=$aces}})
+[Console]::Write((ConvertTo-Json -InputObject $rows -Depth 5 -Compress))`, { TEST_ACL_PATHS: JSON.stringify(ancestorAclPaths) }))
+  assert.ok(Array.isArray(rows)); assert.equal(rows.length, ancestorAclPaths.length)
+  return rows.map((value: unknown, index: number) => { const row = record(value); assert.equal(row.path, ancestorAclPaths[index]); assert.ok(Array.isArray(row.aces)); return row })
+}
+async function assertAncestorAcls(granted: boolean): Promise<string> {
+  assert.ok(sid && ancestorAclBaseline)
+  const baseline = ancestorAclBaseline
+  const rows = await readAncestorAcls()
+  rows.forEach((row, index) => {
+    const aces = (row.aces as unknown[]).map(record)
+    const own = aces.filter(ace => ace.sid === sid)
+    assert.equal(own.length, granted && index === 0 ? 1 : 0)
+    if (own.length) {
+      assert.equal(own[0].type, 0); assert.equal(own[0].flags, 0)
+      assert.equal(own[0].mask, 0x1200a9) // FILE_GENERIC_READ | FILE_GENERIC_EXECUTE, target only.
+    }
+    assert.deepEqual({ ...row, aces: aces.filter(ace => ace.sid !== sid) }, baseline[index])
+  })
+  return createHash('sha256').update(JSON.stringify(rows)).digest('hex')
+}
 const activeCommands = new Set<string>()
 async function start(script: string, stdin: 'ignore' | 'pipe') {
   const commandId = randomUUID()
@@ -137,6 +174,8 @@ async function closeCommand(commandId: string, expected?: { pid: number; birthFi
 const environment: Record<string, string> = {
   SystemRoot: process.env.SystemRoot!, WINDIR: process.env.WINDIR!, LOCALAPPDATA: root,
   TEST_SHARED_READ_FILE: sharedReadFile,
+  TEST_ANCESTOR_ROOT: ancestorRoot, TEST_ANCESTOR_SELECTED: ancestorSelected,
+  TEST_ANCESTOR_SIBLING: ancestorSibling, TEST_ANCESTOR_SECRET: ancestorSecret,
   PATH: `${root};${path.join(process.env.SystemRoot!, 'System32')}`, USERPROFILE: root, HOME: root, TEMP: root, TMP: root, PWD: root,
 }
 try {
@@ -184,7 +223,6 @@ if(message.type==='close'){send({type:'closed',pid:process.pid,birth:prepared.bi
   await writeFile(path.join(root, 'echo.ts'), `for await(const bytes of Bun.stdin.stream())await Bun.stdout.write(bytes);await Bun.stderr.write('stdin-eof-observed')`)
   await writeFile(path.join(root, 'grandchild.ts'), `await Bun.write('grandchild-live.txt',String(process.pid));setInterval(()=>{},1000)`)
   await writeFile(path.join(root, 'cancel.ts'), `const child=Bun.spawn([process.execPath,'grandchild.ts'],{stdin:'inherit',stdout:'inherit',stderr:'inherit'});await Bun.write('cancel-child.txt',String(child.pid));setInterval(()=>{},1000)`)
-  await writeFile(journal, '[]')
   stage = 'shared-readonly-setup'
   // A separate fresh TEST sibling is outside every writable launch root.
   // Its elevated installer owner and Users RX model ordinary installed code.
@@ -251,7 +289,37 @@ $ace.SecurityIdentifier.Value-eq 'S-1-3-0' -and ($ace.AceFlags-band [Security.Ac
   facts.sharedReadOnlyRefusals = { privateOwnershipPreserved: true, foreignWriteRejected: true,
     effectiveCreatorWritePresent: creator.effectiveCreatorWritePresent,
     effectiveCreatorWriteRejected: creator.effectiveCreatorWritePresent ? true : null, deniedAclUnchanged: true }
-  stage = 'test-ancestor-setup'
+  stage = 'test-ancestor-fixture'
+  // This fresh TEST parent is never a recursive launch root. Its existing
+  // inheriting ACL lets the probe detect accidental grants to sibling children.
+  await ps(`
+$ErrorActionPreference='Stop'
+$p=$env:TEST_ANCESTOR_ROOT
+if(Test-Path -LiteralPath $p){throw 'TEST ancestor fixture already exists'}
+[IO.Directory]::CreateDirectory($p)|Out-Null
+$acl=[Security.AccessControl.DirectorySecurity]::new()
+$acl.SetOwner([Security.Principal.WindowsIdentity]::GetCurrent().User)
+$acl.SetAccessRuleProtection($true,$false)
+foreach($identity in @([Security.Principal.WindowsIdentity]::GetCurrent().User.Value,'S-1-5-18','S-1-5-32-544')){
+$acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new($identity),'FullControl','ContainerInherit,ObjectInherit','None','Allow'))}
+Set-Acl -LiteralPath $p -AclObject $acl
+[IO.Directory]::CreateDirectory($env:TEST_ANCESTOR_SIBLING)|Out-Null
+[IO.File]::WriteAllText($env:TEST_ANCESTOR_SECRET,'TEST-ungranted-secret',[Text.UTF8Encoding]::new($false))
+# Low integrity keeps the access-denial checks focused on the DACL boundary.
+& icacls.exe $p /setintegritylevel '(OI)(CI)L' /T /Q | Out-Null
+if($LASTEXITCODE-ne 0){throw 'TEST ancestor low label failed'}
+`, { TEST_ANCESTOR_ROOT: ancestorRoot, TEST_ANCESTOR_SIBLING: ancestorSibling, TEST_ANCESTOR_SECRET: ancestorSecret })
+  const selected = await filesystem.createDirectory(ancestorSelected); await selected.close()
+  await writeFile(path.join(root, 'ancestor-boundary.ts'), `
+const fs=await import('node:fs/promises'),path=await import('node:path')
+const denied=async(action:()=>Promise<unknown>)=>{try{await action()}catch(error){if(['EACCES','EPERM'].includes((error as NodeJS.ErrnoException).code??''))return;throw error}throw Error('TEST_ancestor_access_not_denied')}
+await denied(()=>fs.readFile(process.env.TEST_ANCESTOR_SECRET!))
+await denied(()=>fs.writeFile(path.join(process.env.TEST_ANCESTOR_ROOT!,'forbidden-write.txt'),'TEST-must-not-write'))
+await denied(()=>fs.writeFile(path.join(process.env.TEST_ANCESTOR_SIBLING!,'forbidden-write.txt'),'TEST-must-not-write'))
+await fs.writeFile(path.join(process.env.TEST_ANCESTOR_SELECTED!,'granted-write.txt'),'TEST-selected-write')
+await Bun.stdout.write('ancestor-boundary-passed')
+`)
+  stage = 'test-sid-derivation'
   sid = await ps(`
 $ErrorActionPreference='Stop'
 Add-Type -TypeDefinition @'
@@ -264,19 +332,16 @@ public static class TestAppSid {
 $native=[IntPtr]::Zero
 if([TestAppSid]::DeriveAppContainerSidFromAppContainerName(('AgentTeams.OpenCodeV2.'+$env:TEST_NONCE),[ref]$native)-ne 0){throw 'TEST SID derivation failed'}
 try{$sid=[System.Security.Principal.SecurityIdentifier]::new($native).Value}finally{[TestAppSid]::FreeSid($native)|Out-Null}
-$rule=[System.Security.AccessControl.FileSystemAccessRule]::new([System.Security.Principal.SecurityIdentifier]::new($sid),'ReadAndExecute','None','None','Allow')
-$planned=[System.Collections.Generic.List[string]]::new();$ancestor=$env:TEST_ROOT
-while($ancestor){$planned.Add($ancestor);$info=[System.IO.DirectoryInfo]::new($ancestor).Parent;if(!$info){break};$ancestor=$info.FullName}
-[IO.File]::WriteAllText($env:TEST_JOURNAL,(ConvertTo-Json -InputObject @($planned)),[Text.UTF8Encoding]::new($false))
-foreach($ancestor in $planned){$acl=Get-Acl -LiteralPath $ancestor;$acl.AddAccessRule($rule);Set-Acl -LiteralPath $ancestor -AclObject $acl}
 & icacls.exe $env:TEST_ROOT /setintegritylevel '(OI)(CI)L' /T /Q | Out-Null
 if($LASTEXITCODE-ne 0){throw 'TEST low label failed'}
 $sid
 `)
   assert.match(sid, /^S-1-15-2-/)
+  ancestorAclBaseline = await readAncestorAcls()
+  facts.ancestorAclBeforeLaunchSHA256 = await assertAncestorAcls(false)
   stage = 'native-main-launch'; launched = true
   await fence.assertOwned()
-  const mapping = record(await broker.request('launch', { executable: path.join(root, 'bun.exe'), entry: path.join(root, 'main.ts'), cwd: root, env: environment, writableRoots: [root, profileRoot], readOnlyRoots: [sharedReadRoot], protectedRoots: [fencePath], nonce, leaseOwnerId }))
+  const mapping = record(await broker.request('launch', { executable: path.join(root, 'bun.exe'), entry: path.join(root, 'main.ts'), cwd: root, env: environment, writableRoots: [root, profileRoot, ancestorSelected], readOnlyRoots: [sharedReadRoot], protectedRoots: [fencePath], nonce, leaseOwnerId }))
   assert.equal(mapping.containerSid, sid)
   const main = record(mapping.bun); originalMapping = mapping
   const connected = await until(() => nativePeer)
@@ -287,6 +352,17 @@ $sid
   assert.equal(prepared.pid, main.nativePID)
   assert.equal(prepared.nonce, nonce); assert.equal(prepared.leaseOwnerId, leaseOwnerId)
   assert.deepEqual(prepared.birth, main.birth); assert.equal(prepared.namespace, mapping.namespace)
+  stage = 'native-ancestor-boundary'
+  facts.ancestorAclDuringLaunchSHA256 = await assertAncestorAcls(true)
+  const boundary = await start(path.join(root, 'ancestor-boundary.ts'), 'ignore')
+  const [boundaryOutput, boundaryError] = await Promise.all([output(boundary.commandId, 'stdout'), output(boundary.commandId, 'stderr')])
+  assert.equal(boundaryOutput.toString(), 'ancestor-boundary-passed'); assert.equal(boundaryError.length, 0)
+  assert.equal(await readFile(path.join(ancestorSelected, 'granted-write.txt'), 'utf8'), 'TEST-selected-write')
+  assert.equal(await readFile(ancestorSecret, 'utf8'), 'TEST-ungranted-secret')
+  await closeCommand(boundary.commandId)
+  facts.ancestorMetadata = { originalMainLaunchedWithoutTestAncestorGrants: true, targetOnlyReadExecuteAce: true,
+    foreignAcesAndOwnerPreserved: true, siblingAclsUnchanged: true, siblingReadDenied: true,
+    ancestorAndSiblingWriteDenied: true, selectedWritePassed: true }
   stage = 'native-prepared-profile-read'
   await assertProfilePackageAces(true)
   const preparedRead = await start(path.join(root, 'prepared-read.ts'), 'ignore')
@@ -342,6 +418,7 @@ $sid
   assert.equal(await readFile(sharedReadFile, 'utf8'), 'TEST-readonly-vendor')
   facts.sharedReadOnlyReadPassed = true; facts.sharedReadOnlyWriteDenied = true
   facts.fileOutputPassed = true; facts.stdinEchoEofPassed = true; facts.descendantCancelPassed = true
+  assert.equal(await assertAncestorAcls(true), facts.ancestorAclDuringLaunchSHA256)
 } catch (error) { failure = error }
 finally {
   facts.failedStage = failure ? stage : undefined
@@ -365,6 +442,13 @@ finally {
       retirementFacts.mainExitMappingMatches = isDeepStrictEqual(mainExited.mapping, originalMapping)
       assert.equal(mainExited.heldProcessExited, true); assert.deepEqual(mainExited.mapping, originalMapping)
       facts.retirement = receipt; facts.originalMainRetirement = mainExited; retired = true
+      // Observe removal only after the existing held-process/empty-job proof.
+      // The test never grants or removes any package SID ACE on ancestors.
+      retirementPhase = 'ancestor_aces_removed'
+      facts.ancestorAclAfterRetirementSHA256 = await assertAncestorAcls(false)
+      assert.equal(facts.ancestorAclAfterRetirementSHA256, facts.ancestorAclBeforeLaunchSHA256)
+      facts.ancestorOwnAcesRemoved = true
+      facts.ancestorOwnerForeignAndChildAclsPreserved = true
       retirementPhase = 'prepared_profile_aces_removed'
       await assertProfilePackageAces(false)
       facts.preparedProfileOwnAcesRemoved = true
@@ -381,12 +465,6 @@ finally {
       facts.retirementFailure = { phase: retirementPhase, code, ...retirementFacts }
       cleanupErrors.push('native_scope_retirement_unknown')
     }
-  }
-  if (sid && (!launched || retired)) {
-    try {
-      await ps(`$ErrorActionPreference='Stop';$paths=@(Get-Content -LiteralPath $env:TEST_JOURNAL -Raw|ConvertFrom-Json);foreach($p in $paths){$acl=Get-Acl -LiteralPath $p;foreach($rule in @($acl.Access)){if($rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value-eq $env:TEST_SID){$acl.RemoveAccessRuleAll($rule)}};Set-Acl -LiteralPath $p -AclObject $acl;$check=Get-Acl -LiteralPath $p;foreach($rule in @($check.Access)){if($rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value-eq $env:TEST_SID){throw 'TEST own ACE remains'}}}`, { TEST_SID: sid })
-      facts.ancestorOwnAcesRemoved = true
-    } catch { cleanupErrors.push('test_ancestor_cleanup_unknown') }
   }
   for (const handle of handles.reverse()) try { await handle.close() } catch { cleanupErrors.push('native_owner_handle_close_unknown') }
   try { await broker.close() } catch { cleanupErrors.push('native_broker_close_unknown') }
