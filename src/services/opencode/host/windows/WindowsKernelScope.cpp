@@ -3931,6 +3931,104 @@ struct WindowsNativeRunStateIssuer {
   using State = WindowsNativeRunState;
   using Control = WindowsNativeRunControl;
 
+  static JsonObject directoryIdentity(HANDLE file, const std::wstring &owner,
+                                       const std::wstring &dataRoot, const std::wstring &directory,
+                                       const std::vector<std::wstring> &currentSids, bool shared) {
+    auto allowed = currentSids;
+    std::vector<std::wstring> needed;
+    for (const auto &sid : State::runStateDirectoryMetadataCandidates(file, owner))
+      if (std::find(allowed.begin(), allowed.end(), sid) == allowed.end()) needed.push_back(sid);
+    // Only shared namespace directories may compose with another live run.
+    // The caller retains the selected namespace's entire no-delete chain.
+    std::vector<Handle> records, witnesses;
+    std::vector<RetainedAnchorComponent> runPins;
+    if (shared && !needed.empty()) {
+      const auto runsPath = dataRoot + L"\\opencode\\v2\\runs";
+      WIN32_FIND_DATAW entry{};
+      struct Search {
+        HANDLE value;
+        ~Search() { if (value != INVALID_HANDLE_VALUE) FindClose(value); }
+      } search{FindFirstFileW(extended(runsPath + L"\\*").c_str(), &entry)};
+      if (search.value != INVALID_HANDLE_VALUE) do {
+        const std::wstring name(entry.cFileName);
+        if (name.size() != 32 || name.find_first_not_of(L"0123456789abcdef") != std::wstring::npos ||
+            !(entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
+            (entry.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) continue;
+        const auto candidatePath = runsPath + L"\\" + name;
+        if (equalPath(candidatePath, directory)) continue;
+        try {
+          RetainedAnchorComponent candidate(canonicalDirectory(candidatePath));
+          Handle startFile, endpointFile, stopFile;
+          const auto startBytes = State::runStateReadAt(candidatePath, owner, L"start.json", 512 * 1024, &startFile);
+          const auto start = State::runStateStartDocument(startBytes);
+          if (!start.HasKey(L"cohort")) continue;
+          const auto memberSids = State::runStateMetadataSids(object(start, L"cohort"));
+          if (std::none_of(memberSids.begin(), memberSids.end(), [&](const auto &sid) {
+                return std::find(needed.begin(), needed.end(), sid) != needed.end();
+              })) continue;
+          // A sibling's leaf admits only its own cohort, never our shared union.
+          (void)State::runStateDirectoryIdentity(candidate.handle.value, owner, memberSids);
+          const auto endpointBytes = State::runStateReadAt(candidatePath, owner, L"control.json", 512 * 1024, &endpointFile);
+          require(!endpointBytes.empty() && endpointBytes.back() == '\n', "run_state_endpoint_changed");
+          const auto endpoint = JsonObject::Parse(wide(std::string(endpointBytes.begin(), endpointBytes.end() - 1)));
+          State::runStateValidateEndpointFor(endpoint, object(start, L"binding"), text(start, L"sourceSha256"), candidatePath);
+          require(endpoint.GetNamedNumber(L"schema") == 1 && endpoint.GetNamedNumber(L"protocol") == 1 &&
+                      text(endpoint, L"platform") == L"win32", "run_state_endpoint_changed");
+          const auto endpointValue = object(endpoint, L"endpoint");
+          require(text(endpointValue, L"kind") == L"windows-native-pipe" &&
+                      Control::runControlValidPipeEndpoint(text(endpointValue, L"name")) &&
+                      runControlCanonicalJson(object(endpoint, L"process")) ==
+                          runControlCanonicalJson(object(endpointValue, L"helper")), "run_control_endpoint_changed");
+          std::vector<Handle> peers;
+          for (const auto *role : {L"helper", L"bun"}) {
+            const auto value = object(endpointValue, role);
+            const auto pid = State::runStateProcessIdLocked(value, "run_control_endpoint_changed");
+            Handle process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid));
+            require(process && Control::runControlRequireFullToken(process.value) &&
+                        WaitForSingleObject(process.value, 0) == WAIT_TIMEOUT,
+                    "run_control_endpoint_changed");
+            State::runStateAssertRetirementWitnessLocked(process.value, pid,
+                State::runStateProcessBirthLocked(value, "run_control_endpoint_changed"), "run_control_endpoint_changed");
+            const auto measured = Control::runControlNativeIdentity(process.value, pid);
+            require(text(measured, L"userSid") == owner &&
+                        runControlCanonicalJson(measured) == runControlCanonicalJson(value), "run_control_endpoint_changed");
+            peers.push_back(std::move(process));
+          }
+          require(Control::runControlParentPid(peers.front().value) == GetProcessId(peers.back().value),
+                  "run_control_endpoint_changed");
+          try {
+            const auto stop = State::runStateReadAt(candidatePath, owner, L"stop.json", 512 * 1024, &stopFile);
+            require(!stop.empty() && stop.back() == '\n', "run_state_record_changed");
+            const auto archive = JsonObject::Parse(wide(std::string(stop.begin(), stop.end() - 1)));
+            validateStopReceipt(archive, object(start, L"binding"));
+            if (text(object(archive, L"receipt"), L"state") == L"stopped") continue;
+          } catch (const NativeError &error) {
+            if (error.code != "run_state_record_absent") throw;
+          }
+          candidate.assertLive();
+          records.push_back(std::move(startFile));
+          records.push_back(std::move(endpointFile));
+          if (stopFile) records.push_back(std::move(stopFile));
+          for (auto &peer : peers) witnesses.push_back(std::move(peer));
+          runPins.push_back(std::move(candidate));
+          for (const auto &sid : memberSids) {
+            const auto found = std::find(needed.begin(), needed.end(), sid);
+            if (found != needed.end()) { allowed.push_back(sid); needed.erase(found); }
+          }
+        } catch (...) {
+          // An unrelated stale/malformed run supplies no authority. Any SID
+          // still unmatched below remains a closed admission failure.
+        }
+      } while (!needed.empty() && FindNextFileW(search.value, &entry));
+    }
+    const auto result = State::runStateDirectoryIdentity(file, owner, allowed);
+    for (const auto &pin : runPins) pin.assertLive();
+    for (const auto &process : witnesses)
+      require(WaitForSingleObject(process.value, 0) == WAIT_TIMEOUT,
+              "execution_owner_not_private", "private_acl_foreign_allow");
+    return result;
+  }
+
   static void validateRunNamespace(const std::wstring &directory,
                                    const std::wstring &dataRoot) {
     require(directory.rfind(dataRoot + L"\\opencode\\v2\\runs\\", 0) == 0,
@@ -3960,25 +4058,21 @@ private:
                           "private_acl_owner_run_v2", "private_acl_owner_run_runs",
                           "private_acl_owner_run_leaf"};
     prefix.emplace_back(inRole(roles[0], [&] { return owners.holdSelectedDirectory(dataRoot); }));
-    auto identified = [&](HANDLE file, size_t index) {
-      require(index < 5, "run_state_identity_changed");
-      return inRole(roles[index], [&] { return fileIdentity(file, owner, true); });
-    };
-    const auto rootIdentity = identified(prefix.front().handle.value, 0);
+    const auto rootIdentity = fileObjectIdentity(prefix.front().handle.value, owner, true);
     auto recheck = [&](bool absence) {
       for (const auto &parent : ancestors) parent.assertLive();
       for (size_t index = 0; index < prefix.size(); ++index) {
         const auto &part = prefix[index];
         part.assertLive();
         if (absence) {
-          (void)identified(part.handle.value, index);
+          (void)directoryIdentity(part.handle.value, owner, dataRoot, directory, {}, index != 4);
           auto named = verificationDirectory(part.path);
-          require(identified(named.value, index).Stringify() ==
-                      identified(part.handle.value, index).Stringify(),
+          require(directoryIdentity(named.value, owner, dataRoot, directory, {}, index != 4).Stringify() ==
+                      directoryIdentity(part.handle.value, owner, dataRoot, directory, {}, index != 4).Stringify(),
                   "run_state_identity_changed");
         }
       }
-      require(identified(prefix.front().handle.value, 0).Stringify() ==
+      require(fileObjectIdentity(prefix.front().handle.value, owner, true).Stringify() ==
                   rootIdentity.Stringify(), "run_state_identity_changed");
     };
     auto openChild = [](HANDLE parent, const std::wstring &name) {
@@ -4116,15 +4210,18 @@ public:
     }
     const std::wstring owner = currentSid();
     auto root = owners.holdSelectedDirectory(dataRoot);
-    const JsonObject rootIdentity = fileIdentity(root.value, owner, true);
     std::vector<Handle> parents = owners.holdSelectedAncestors(directory);
     require(parents.size() >= 4, "run_state_held_inputs");
+    const JsonObject rootIdentity = fileObjectIdentity(root.value, owner, true);
+    if (create) (void)directoryIdentity(root.value, owner, dataRoot, directory, {}, true);
     Handle run;
     try {
       // Run state mutates child records, never renames its directory. Keep the
       // original deny-delete sharing fence, without unused DELETE access that
       // can conflict with the filesystem's relative rename target-directory open.
-      run = ownerDirectory(directory, create, owner, nullptr, nullptr, false);
+      run = create ? ownerDirectory(directory, true, owner, nullptr, nullptr, false)
+                   : canonicalDirectory(directory, FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL);
+      if (!create) directoryMode(run.value);
     } catch (const NativeError &error) {
       if (!create && error.win32 == ERROR_FILE_NOT_FOUND)
         throw NativeError{"run_state_absent", error.win32, "run_state_directory"};
@@ -4141,7 +4238,7 @@ public:
     require(rawParent != nullptr, "run_state_held_inputs");
     auto state = std::unique_ptr<State>(new State(
         std::move(parents), std::move(root), std::move(run), rootIdentity, owner,
-        directory, dataRoot, Handle(rawServer), Handle(rawParent)));
+        directory, dataRoot, Handle(rawServer), Handle(rawParent), create));
     const auto id = state->id();
     if (!selectionIds.empty()) owners.runStateSelections[id] = selectionIds;
     owners.runStateRoots[id] = dataRoot;
@@ -4736,6 +4833,10 @@ public:
     throw NativeError{"execution_invalid_response"};
   }
 };
+JsonObject WindowsNativeRunState::runStateDirectoryIdentityLocked(HANDLE directory, bool shared) {
+  return WindowsNativeRunStateIssuer::directoryIdentity(
+      directory, owner_, rootPath_, directory_, directoryMetadataSids_, shared);
+}
 JsonObject OwnerStore::request(const std::wstring &operation, const JsonObject &input) {
   if (operation.rfind(L"runState", 0) == 0)
     return WindowsNativeRunStateIssuer::request(*this, operation, input);

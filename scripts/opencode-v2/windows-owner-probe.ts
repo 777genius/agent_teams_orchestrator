@@ -4,7 +4,7 @@ import { lstat, readdir, readFile, rename, symlink, writeFile } from 'node:fs/pr
 import path from 'node:path'
 import { createWindowsNativeBroker, resolveWindowsNativeArtifact } from '../../src/services/opencode/host/windows/OpenCodeV2WindowsNativeBroker.js'
 import { createWindowsOwnerFilesystem, type WindowsOwnerDirectory } from '../../src/services/opencode/host/windows/OpenCodeV2WindowsOwnerFilesystem.js'
-import { executionRecord } from '../../src/services/opencode/execution/OpenCodeV2ExecutionContracts.js'
+import { executionHash, executionRecord } from '../../src/services/opencode/execution/OpenCodeV2ExecutionContracts.js'
 import { prepareWindowsPrivateDirectories } from '../../src/services/opencode/profile/OpenCodePrivateDirectories.js'
 import { runControlDirectory } from '../../src/services/opencode/bridge/OpenCodeV2RunControl.js'
 
@@ -48,13 +48,13 @@ const closeFixtureWriters = async () => {
   // these setup handles before a fresh CLI's normal existing-only admission.
   for (const handle of [...handles].reverse()) await handle.close()
 }
-const powershell = async (script: string, target: string): Promise<string> => {
+const powershell = async (script: string, target: string, extra: Record<string, string> = {}): Promise<string> => {
   assert.ok(process.env.ProgramFiles && path.win32.isAbsolute(process.env.ProgramFiles))
   const powershellRoot = path.win32.join(process.env.ProgramFiles, 'PowerShell', '7')
   const child = Bun.spawn([path.win32.join(powershellRoot, 'pwsh.exe'), '-NoProfile', '-NonInteractive',
     '-Command', "$ErrorActionPreference='Stop';" + script], {
     env: { SystemRoot: process.env.SystemRoot, WINDIR: process.env.WINDIR,
-      PSModulePath: path.win32.join(powershellRoot, 'Modules'), TEST_TARGET: target }, stdout: 'pipe', stderr: 'ignore',
+      PSModulePath: path.win32.join(powershellRoot, 'Modules'), TEST_TARGET: target, ...extra }, stdout: 'pipe', stderr: 'ignore',
   })
   const [output, code] = await Promise.all([new Response(child.stdout).text(), child.exited])
   assert.equal(code, 0, 'TEST_fixture_powershell_failed')
@@ -645,6 +645,138 @@ try {
   }
   assert.deepEqual(statusFailures, [])
   assert.equal(statusRequests, 72)
+  // Use the actual native-sealed nonce, never a mocked cohort or caller-chosen
+  // member identity. These ACL fixtures exercise admission, not a member launch;
+  // the source integration probe covers the native launch's actual grants.
+  const sealedLaunchNonce = async (runDirectory: string) => {
+    const start = executionRecord(JSON.parse(await readFile(path.win32.join(runDirectory, 'start.json'), 'utf8')))
+    const members = executionRecord(start.cohort).members
+    assert.ok(Array.isArray(members) && members.length === 1)
+    const nonce = executionRecord(members[0]).launchNonce
+    assert.equal(typeof nonce, 'string'); assert.match(String(nonce), /^[a-f0-9-]{36}$/)
+    return String(nonce)
+  }
+  const deriveMetadataSids = async (launchNonce: string) => executionRecord(JSON.parse(await powershell(`
+Add-Type -TypeDefinition @'
+using System; using System.Runtime.InteropServices;
+public static class TestRunMetadataSid {
+[DllImport("userenv.dll",CharSet=CharSet.Unicode)] public static extern int DeriveAppContainerSidFromAppContainerName(string name,out IntPtr sid);
+[DllImport("advapi32.dll")] public static extern IntPtr FreeSid(IntPtr sid);
+}
+'@
+function Derive([string]$nonce){$native=[IntPtr]::Zero
+if([TestRunMetadataSid]::DeriveAppContainerSidFromAppContainerName(('AgentTeams.OpenCodeV2.'+$nonce),[ref]$native)-ne 0){throw 'TEST SID derivation failed'}
+try{return [Security.Principal.SecurityIdentifier]::new($native).Value}finally{[TestRunMetadataSid]::FreeSid($native)|Out-Null}}
+[Console]::Write((@{member=(Derive $env:TEST_LAUNCH_NONCE);stale=(Derive ([guid]::NewGuid().ToString()))}|ConvertTo-Json -Compress))
+`, directory, { TEST_LAUNCH_NONCE: launchNonce })))
+  const metadataSids = await deriveMetadataSids(await sealedLaunchNonce(directory))
+  assert.match(String(metadataSids.member), /^S-1-15-2-/)
+  assert.match(String(metadataSids.stale), /^S-1-15-2-/)
+  assert.notEqual(metadataSids.member, metadataSids.stale)
+  const endpointHash = executionHash(published)
+  const validateEndpoint = async () => {
+    const result = executionRecord(await request('runStateValidateEndpoint', { stateId, directory, endpointHash }))
+    assert.equal(result.valid, true); assert.equal(result.endpointHash, endpointHash)
+  }
+  const privateMetadataDenied = (error: unknown) => error instanceof Error &&
+    /^execution_owner_not_private(?::private_acl_foreign_allow:\d+)?$/.test(error.message)
+  const metadataBefore = await snapshot(discoveryRoot)
+  const withMetadataAce = async (target: string, sid: string, rights: string, inheritance: string,
+    verify: () => Promise<void>) => {
+    const original = await powershell(`[Console]::Write((Get-Acl -LiteralPath $env:TEST_TARGET).Sddl)`, target)
+    const installed = await powershell(`$acl=Get-Acl -LiteralPath $env:TEST_TARGET
+$acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new($env:TEST_SID),$env:TEST_RIGHTS,$env:TEST_INHERITANCE,'None','Allow'))
+Set-Acl -LiteralPath $env:TEST_TARGET -AclObject $acl
+[Console]::Write((Get-Acl -LiteralPath $env:TEST_TARGET).Sddl)`, target,
+      { TEST_SID: sid, TEST_RIGHTS: rights, TEST_INHERITANCE: inheritance })
+    try {
+      await verify()
+      assert.equal(await powershell(`[Console]::Write((Get-Acl -LiteralPath $env:TEST_TARGET).Sddl)`, target), installed)
+    } finally {
+      const restored = await powershell(`$acl=Get-Acl -LiteralPath $env:TEST_TARGET
+$acl.SetSecurityDescriptorSddlForm($env:TEST_ORIGINAL_ACL)
+Set-Acl -LiteralPath $env:TEST_TARGET -AclObject $acl
+[Console]::Write((Get-Acl -LiteralPath $env:TEST_TARGET).Sddl)`, target, { TEST_ORIGINAL_ACL: original })
+      assert.equal(restored, original)
+    }
+  }
+  for (const target of [discoveryRoot, directory])
+    await withMetadataAce(target, String(metadataSids.member), 'ReadAndExecute', 'None', validateEndpoint)
+  for (const [sid, rights, inheritance] of [
+    ['S-1-5-32-545', 'ReadAndExecute', 'None'],
+    [String(metadataSids.stale), 'ReadAndExecute', 'None'],
+    [String(metadataSids.member), 'Write', 'None'],
+    [String(metadataSids.member), 'ReadAndExecute', 'ContainerInherit,ObjectInherit'],
+  ]) {
+    await withMetadataAce(directory, sid, rights, inheritance, async () => {
+      await assert.rejects(validateEndpoint(), privateMetadataDenied)
+    })
+    await validateEndpoint()
+  }
+  // Fresh discovery reads the native-sealed start/cohort before control.json.
+  // Even that exact member's metadata ACE must never authorize record files.
+  await withMetadataAce(path.win32.join(directory, 'control.json'), String(metadataSids.member), 'ReadAndExecute', 'None',
+    async () => { await route(discoveryRoot, binding.runId, 'veto') })
+  await validateEndpoint()
+  assert.deepEqual(await snapshot(discoveryRoot), metadataBefore)
+  facts.runNamespaceMetadataAcl = { nativeSealedMemberTargetOnlyReadExecuteAccepted: true,
+    foreignAndStaleSidRejected: true, memberWriteAndInheritanceRejected: true,
+    controlRecordStillOwnerOnly: true, aclIdentityAndBytesUnchanged: true }
+  // A second real native publisher supplies the other run's cohort and held
+  // live owner witnesses. Only the shared namespace may admit its metadata SID.
+  const concurrentBroker = createWindowsNativeBroker(helper)
+  concurrentBroker.events.on('error', () => {})
+  try {
+    await concurrentBroker.request('ownerValidateSelectedProfile', { root: selectedRoot, databasePath,
+      directories: [selectedRoot, selectedConfigDirectory] })
+    const concurrentSelection = executionRecord(await concurrentBroker.request('ownerSelectConfig', {
+      root: selectedRoot, databasePath, sha256: selectedHash, teamId: 'TEST-team' }))
+    const concurrentBinding = { ...binding, runId: 'TEST-concurrent-cohort',
+      controllerInstanceId: 'TEST-concurrent-controller', ownerId: 'TEST-concurrent-owner' }
+    const concurrentDirectory = runControlDirectory(discoveryRoot, concurrentBinding.teamId, concurrentBinding.runId)
+    const concurrentAcquired = executionRecord(await concurrentBroker.request('runStateAcquire', {
+      dataRoot: discoveryRoot, directory: concurrentDirectory, binding: concurrentBinding,
+      selectionIds: [String(concurrentSelection.selectionId)] }))
+    const concurrentState = { stateId: String(concurrentAcquired.stateId), directory: concurrentDirectory }
+    await concurrentBroker.request('runStateReserve', { ...concurrentState, binding: concurrentBinding,
+      sourceSha256, sharedControllerRootCohort: true })
+    const concurrentPublished = executionRecord(await concurrentBroker.request('runStateListen', {
+      ...concurrentState, binding: concurrentBinding, sourceSha256, deadline: Date.now() + 120_000 })).record
+    // These native reads enforce strict owner-only security on both records.
+    for (const name of ['start.json', 'control.json'])
+      await concurrentBroker.request('runStateReadRecord', { ...concurrentState, name })
+    await concurrentBroker.request('runStateValidateEndpoint', {
+      ...concurrentState, endpointHash: executionHash(concurrentPublished) })
+    const concurrentSids = await deriveMetadataSids(await sealedLaunchNonce(concurrentDirectory))
+    const concurrentSid = String(concurrentSids.member)
+    assert.match(concurrentSid, /^S-1-15-2-/); assert.notEqual(concurrentSid, metadataSids.member)
+    const concurrentBefore = await snapshot(discoveryRoot)
+    await withMetadataAce(discoveryRoot, concurrentSid, 'ReadAndExecute', 'None', validateEndpoint)
+    for (const [sid, rights, inheritance] of [
+      [String(metadataSids.stale), 'ReadAndExecute', 'None'],
+      [concurrentSid, 'Write', 'None'],
+      [concurrentSid, 'ReadAndExecute', 'ContainerInherit,ObjectInherit'],
+    ]) {
+      await withMetadataAce(discoveryRoot, sid, rights, inheritance, async () => {
+        await assert.rejects(validateEndpoint(), privateMetadataDenied)
+      })
+    }
+    await withMetadataAce(directory, concurrentSid, 'ReadAndExecute', 'None', async () => {
+      await assert.rejects(validateEndpoint(), privateMetadataDenied)
+    })
+    await concurrentBroker.close()
+    assert.equal(concurrentBroker.ended(), true)
+    await withMetadataAce(discoveryRoot, concurrentSid, 'ReadAndExecute', 'None', async () => {
+      await assert.rejects(validateEndpoint(), privateMetadataDenied)
+    })
+    await validateEndpoint()
+    assert.deepEqual(await snapshot(discoveryRoot), concurrentBefore)
+    facts.concurrentRunNamespaceMetadataAcl = { independentNativeSealedCohortAndPublisher: true,
+      nativeStartAndControlRecordsOwnerOnly: true, liveOtherRunSharedRootAccepted: true,
+      sharedRootUnmatchedWriteAndInheritanceRejected: true, otherRunOwnLeafRejected: true,
+      physicallyExitedOtherPublisherRejected: true,
+      aclIdentityAndBytesUnchanged: true }
+  } finally { await concurrentBroker.close() }
   // Same physical fence with a foreign requested binding must remain UNKNOWN.
   await assert.rejects(request('runStateDiscover', { dataRoot: discoveryRoot, directory,
     teamId: 'TEST-foreign', runId: binding.runId, selectionIds }), /run_state_start_changed/)

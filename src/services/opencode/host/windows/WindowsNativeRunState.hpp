@@ -42,6 +42,7 @@ struct WindowsNativeRunState {
       sourceSha256_ = sourceSha256;
       cohort_ = cohort ? *cohort : JsonObject();
       cohortSealed_ = cohort != nullptr;
+      directoryMetadataSids_ = cohort ? runStateMetadataSids(*cohort) : std::vector<std::wstring>();
       reserved_ = true;
     } catch (...) {
       poisoned_ = true;
@@ -54,6 +55,7 @@ struct WindowsNativeRunState {
     std::lock_guard<std::mutex> lock(mutex_);
     require(!poisoned_ && !reserved_ && !endpointSealed_, "run_state_unknown");
     const auto start = runStateReadLocked(L"start.json", 512 * 1024);
+    require(bootstrapStart_.empty() || start == bootstrapStart_, "run_state_start_changed");
     if (cohort) runStateValidateCohortLocked(*cohort);
     const std::string expected = runStateStartBytes(binding, sourceSha256, cohort);
     require(std::string(start.begin(), start.end()) == expected + "\n", "run_state_start_changed");
@@ -64,6 +66,7 @@ struct WindowsNativeRunState {
       sourceSha256_ = sourceSha256;
       cohort_ = cohort ? *cohort : JsonObject();
       cohortSealed_ = cohort != nullptr;
+      directoryMetadataSids_ = cohort ? runStateMetadataSids(*cohort) : std::vector<std::wstring>();
       reserved_ = true;
     } catch (...) {
       poisoned_ = true;
@@ -76,6 +79,7 @@ struct WindowsNativeRunState {
     require(!poisoned_ && !reserved_ && !endpointSealed_, "run_state_unknown");
     try {
       const auto start = runStateReadLocked(L"start.json", 512 * 1024);
+      require(bootstrapStart_.empty() || start == bootstrapStart_, "run_state_start_changed");
       require(!start.empty() && start.back() == '\n', "run_state_start_changed");
       const std::string json(start.begin(), start.end() - 1);
       const auto value = JsonObject::Parse(wide(json));
@@ -100,6 +104,7 @@ struct WindowsNativeRunState {
         cohort_ = JsonObject();
         cohortSealed_ = false;
       }
+      directoryMetadataSids_ = cohortSealed_ ? runStateMetadataSids(cohort_) : std::vector<std::wstring>();
       reserved_ = true;
     } catch (...) {
       poisoned_ = true;
@@ -344,7 +349,7 @@ private:
   explicit WindowsNativeRunState(std::vector<Handle> parents, Handle root, Handle run,
                                  JsonObject rootIdentity, std::wstring owner,
                                  std::wstring directory, std::wstring rootPath,
-                                 Handle serverProcess, Handle parentProcess)
+                                 Handle serverProcess, Handle parentProcess, bool create)
       : parents_(std::move(parents)), root_(std::move(root)), run_(std::move(run)),
         rootIdentity_(std::move(rootIdentity)), owner_(std::move(owner)),
         directory_(std::move(directory)), rootPath_(std::move(rootPath)),
@@ -352,9 +357,17 @@ private:
     require(parents_.size() >= 4 && root_ && run_ && root_.value != run_.value &&
                 serverProcess_ && parentProcess_,
             "run_state_held_inputs");
-    runIdentity_ = fileIdentity(run_.value, owner_, true);
+    runIdentity_ = fileObjectIdentity(run_.value, owner_, true);
     for (auto &parent : parents_)
       parentIdentity_.push_back(anchorIdentity(parent.value));
+    if (!create) {
+      // Bootstrap only from the fixed, owner-only regular record under these
+      // already pinned physical directories. No directory ACE is authority.
+      bootstrapStart_ = runStateReadLocked(L"start.json", 512 * 1024);
+      const auto start = runStateStartDocument(bootstrapStart_);
+      if (start.HasKey(L"cohort")) directoryMetadataSids_ = runStateMetadataSids(object(start, L"cohort"));
+    }
+    runStateVerifyHeldLocked();
     BYTE random[16]{};
     require(BCryptGenRandom(nullptr, random, sizeof(random),
                             BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0,
@@ -372,8 +385,8 @@ private:
     require(equalPath(finalPath(root_.value), extended(rootPath_)) &&
                 equalPath(finalPath(run_.value), extended(directory_)),
             "run_state_identity_changed");
-    require(fileIdentity(root_.value, owner_, true).Stringify() == rootIdentity_.Stringify() &&
-                fileIdentity(run_.value, owner_, true).Stringify() == runIdentity_.Stringify(),
+    require(runStateDirectoryIdentityLocked(root_.value, true).Stringify() == rootIdentity_.Stringify() &&
+                runStateDirectoryIdentityLocked(run_.value, false).Stringify() == runIdentity_.Stringify(),
             "run_state_identity_changed");
     for (size_t i = 0; i < parents_.size(); ++i)
       require(anchorIdentity(parents_[i].value).Stringify() ==
@@ -381,7 +394,81 @@ private:
               "run_state_identity_changed");
   }
 
+  JsonObject runStateDirectoryIdentityLocked(HANDLE directory, bool shared);
+
+  static std::vector<std::wstring> runStateDirectoryMetadataCandidates(HANDLE directory,
+                                                                      const std::wstring &owner) {
+    PACL acl = nullptr;
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    require(GetSecurityInfo(directory, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                            nullptr, nullptr, &acl, nullptr, &descriptor) == ERROR_SUCCESS,
+            "execution_owner_not_private");
+    LocalMemory memory{descriptor};
+    require(acl && IsValidAcl(acl), "execution_owner_not_private");
+    std::vector<std::wstring> candidates;
+    for (DWORD i = 0; i < acl->AceCount; ++i) {
+      void *raw = nullptr;
+      require(GetAce(acl, i, &raw), "execution_owner_not_private");
+      const auto *header = static_cast<const ACE_HEADER *>(raw);
+      if (header->AceType == ACCESS_DENIED_ACE_TYPE) continue;
+      require(header->AceType == ACCESS_ALLOWED_ACE_TYPE && header->AceSize >= sizeof(ACCESS_ALLOWED_ACE),
+              "execution_owner_not_private", "private_acl_foreign_allow");
+      const auto *ace = static_cast<const ACCESS_ALLOWED_ACE *>(raw);
+      auto sid = const_cast<DWORD *>(&ace->SidStart);
+      require(IsValidSid(sid) && offsetof(ACCESS_ALLOWED_ACE, SidStart) + GetLengthSid(sid) <= header->AceSize,
+              "execution_owner_not_private", "private_acl_foreign_allow");
+      LPWSTR trustee = nullptr;
+      require(ConvertSidToStringSidW(sid, &trustee), "execution_owner_not_private");
+      LocalMemory trusteeMemory{trustee};
+      const std::wstring value(trustee);
+      if (value == owner || value == L"S-1-5-18") continue;
+      require(header->AceFlags == 0 && ace->Mask == 0x1200a9 &&
+                  std::find(candidates.begin(), candidates.end(), value) == candidates.end(),
+              "execution_owner_not_private", "private_acl_foreign_allow");
+      candidates.push_back(value);
+    }
+    return candidates;
+  }
+
+  static JsonObject runStateDirectoryIdentity(HANDLE directory, const std::wstring &owner,
+                                              const std::vector<std::wstring> &allowed) {
+    for (const auto &sid : runStateDirectoryMetadataCandidates(directory, owner))
+      require(std::find(allowed.begin(), allowed.end(), sid) != allowed.end(),
+              "execution_owner_not_private", "private_acl_foreign_allow");
+    return fileObjectIdentity(directory, owner, true);
+  }
+
+  static std::vector<std::wstring> runStateMetadataSids(const JsonObject &document) {
+    runStateValidateCohortLocked(document);
+    ClosedControllerCohort cohort;
+    for (const auto value : document.GetNamedArray(L"members")) {
+      ClosedControllerCohortMember member;
+      member.launchNonce = text(value.GetObject(), L"launchNonce");
+      cohort.members.push_back(std::move(member));
+    }
+    return closedControllerCohortSids(cohort);
+  }
+
+  static JsonObject runStateStartDocument(const std::vector<BYTE> &bytes) {
+    require(!bytes.empty() && bytes.back() == '\n', "run_state_start_changed");
+    const auto value = JsonObject::Parse(wide(std::string(bytes.begin(), bytes.end() - 1)));
+    runStateExactObject(value, value.HasKey(L"cohort")
+        ? std::vector<std::wstring>{L"binding", L"sourceSha256", L"cohort"}
+        : std::vector<std::wstring>{L"binding", L"sourceSha256"}, "run_state_start_changed");
+    runStateExactBindingLocked(object(value, L"binding"), "run_state_start_changed");
+    const auto sha = text(value, L"sourceSha256");
+    require(sha.size() == 64 && sha.find_first_not_of(L"0123456789abcdef") == std::wstring::npos,
+            "run_state_start_changed");
+    if (value.HasKey(L"cohort")) runStateValidateCohortLocked(object(value, L"cohort"));
+    return value;
+  }
+
   void runStateValidateEndpointLocked(const JsonObject &endpoint) const {
+    runStateValidateEndpointFor(endpoint, binding_, sourceSha256_, directory_);
+  }
+
+  static void runStateValidateEndpointFor(const JsonObject &endpoint, const JsonObject &expectedBinding,
+                                           const std::wstring &sourceSha256, const std::wstring &directory) {
     runStateExactObject(endpoint,
                         {L"schema", L"protocol", L"binding", L"directory", L"deadline",
                          L"sourceSha256", L"platform", L"process", L"endpoint"},
@@ -390,16 +477,16 @@ private:
     runStateExactObject(binding,
                         {L"teamId", L"runId", L"controllerInstanceId", L"ownerId"},
                         "run_state_endpoint_changed");
-    runStateExactObject(binding_,
+    runStateExactObject(expectedBinding,
                         {L"teamId", L"runId", L"controllerInstanceId", L"ownerId"},
                         "run_state_endpoint_changed");
-    require(text(endpoint, L"directory") == directory_ &&
-                text(endpoint, L"sourceSha256") == sourceSha256_ &&
-                text(binding, L"teamId") == text(binding_, L"teamId") &&
-                text(binding, L"runId") == text(binding_, L"runId") &&
+    require(text(endpoint, L"directory") == directory &&
+                text(endpoint, L"sourceSha256") == sourceSha256 &&
+                text(binding, L"teamId") == text(expectedBinding, L"teamId") &&
+                text(binding, L"runId") == text(expectedBinding, L"runId") &&
                 text(binding, L"controllerInstanceId") ==
-                    text(binding_, L"controllerInstanceId") &&
-                text(binding, L"ownerId") == text(binding_, L"ownerId"),
+                    text(expectedBinding, L"controllerInstanceId") &&
+                text(binding, L"ownerId") == text(expectedBinding, L"ownerId"),
             "run_state_endpoint_changed");
   }
 
@@ -590,9 +677,14 @@ private:
   }
 
   std::vector<BYTE> runStateReadLocked(const std::wstring &name, DWORD limit) {
+    return runStateReadAt(directory_, owner_, name, limit);
+  }
+
+  static std::vector<BYTE> runStateReadAt(const std::wstring &directory, const std::wstring &owner,
+                                          const std::wstring &name, DWORD limit, Handle *retained = nullptr) {
     require(runStateAllowed(name, name != L"challenge") &&
                 ((name == L"challenge") == (limit == 32)), "run_state_record_name");
-    const std::wstring target = directory_ + L"\\" + name;
+    const std::wstring target = directory + L"\\" + name;
     Handle file(CreateFileW(extended(target).c_str(), GENERIC_READ | READ_CONTROL,
                             FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                             FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
@@ -603,7 +695,7 @@ private:
                                                : "run_state_record_absent",
                         error, "record_open"};
     }
-    fileIdentity(file.value, owner_, false);
+    fileIdentity(file.value, owner, false);
     FILE_STANDARD_INFO info{};
     require(GetFileInformationByHandleEx(file.value, FileStandardInfo, &info, sizeof(info)) &&
                 info.EndOfFile.QuadPart >= 0 && info.EndOfFile.QuadPart <= limit,
@@ -619,6 +711,7 @@ private:
     require(name == L"challenge" || runStateStrictUtf8(
               std::string(reinterpret_cast<const char *>(bytes.data()), bytes.size())),
             "run_state_record_encoding");
+    if (retained) *retained = std::move(file);
     return bytes;
   }
 
@@ -751,6 +844,8 @@ private:
   DWORD helperPid_ = 0, bunPid_ = 0;
   std::uint64_t helperBirth_ = 0, bunBirth_ = 0;
   std::vector<BYTE> challenge_;
+  std::vector<BYTE> bootstrapStart_;
+  std::vector<std::wstring> directoryMetadataSids_;
   std::map<std::wstring, std::uint64_t> generations_;
   bool reserved_ = false;
   bool endpointSealed_ = false;
