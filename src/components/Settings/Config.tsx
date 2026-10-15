@@ -46,7 +46,7 @@ import { getCliTeammateModeOverride, clearCliTeammateModeOverride } from '../../
 import { getHardcodedTeammateModelFallback } from '../../utils/swarm/teammateModel.js';
 import { useSearchInput } from '../../hooks/useSearchInput.js';
 import { useTerminalSize } from '../../hooks/useTerminalSize.js';
-import { clearFastModeCooldown, FAST_MODE_MODEL_DISPLAY, isFastModeAvailable, isFastModeEnabled, getFastModeModel, isFastModeSupportedByModel } from '../../utils/fastMode.js';
+import { clearFastModeCooldown, FAST_MODE_MODEL_DISPLAY, isFastModeAvailable, isFastModeEnabled, isFastModeSupportedByModel } from '../../utils/fastMode.js';
 import { isFullscreenEnvEnabled } from '../../utils/fullscreen.js';
 type Props = {
   onClose: (result?: string, options?: {
@@ -343,7 +343,7 @@ export function Config({
     }
   },
   // Fast mode toggle (ant-only, eliminated from external builds)
-  ...(isFastModeEnabled() && isFastModeAvailable() ? [{
+  ...(isFastModeEnabled() && isFastModeAvailable() && isFastModeSupportedByModel(mainLoopModel) ? [{
     id: 'fastMode',
     label: `Fast mode (${FAST_MODE_MODEL_DISPLAY} only)`,
     value: !!isFastMode,
@@ -354,15 +354,9 @@ export function Config({
         fastMode: enabled_0 ? true : undefined
       });
       if (enabled_0) {
-        setAppState(prev_7 => ({
-          ...prev_7,
-          mainLoopModel: getFastModeModel(),
-          mainLoopModelForSession: null,
-          fastMode: true
-        }));
+        setAppState(prev_7 => ({ ...prev_7, fastMode: true }));
         setChanges(prev_8 => ({
           ...prev_8,
-          model: getFastModeModel(),
           'Fast mode': 'ON'
         }));
       } else {

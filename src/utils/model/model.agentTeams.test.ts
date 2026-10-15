@@ -3,18 +3,37 @@ import { clearAgentTeamsStateForTesting, setAgentTeamsCapabilitiesForTesting } f
 import type { AgentTeamsCapabilitiesRecord } from '../../services/agentTeams/types.js';
 import {
   getFlagSettingsInline,
+  getMainLoopModelOverride,
   setFlagSettingsInline,
+  setMainLoopModelOverride,
 } from '../../bootstrap/state.js';
 import {
   getDefaultMainLoopModel,
   getDefaultOpusModel,
+  getDefaultSonnetModel,
+  getModelSelectionPolicyError,
   getMainLoopModel,
   getMarketingNameForModel,
   getPublicModelDisplayName,
+  getRuntimeMainLoopModel,
+  getUserSpecifiedModelSetting,
+  normalizeModelStringForAPI,
   parseUserSpecifiedModel,
+  resolveAllowedModelSetting,
+  resolveSkillModelOverride,
 } from './model.js';
 import { getAPIProvider } from './providers.js';
-import { getFastModeModel, isFastModeSupportedByModel } from '../fastMode.js';
+import { getModelOptions } from './modelOptions.js';
+import { getContextWindowForModel } from '../context.js';
+import {
+  modelSupportsAdaptiveThinking,
+  modelSupportsThinking,
+} from '../thinking.js';
+import {
+  getFastModeModel,
+  getFastModeToggleDecision,
+  isFastModeSupportedByModel,
+} from '../fastMode.js';
 import { AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV } from '../anthropicConnectionMode.js';
 import { CODEX_MODELS, DEFAULT_CODEX_MODEL, isCodexModel } from './codex.js';
 
@@ -61,6 +80,8 @@ function createCodexCapabilities(
 }
 
 afterEach(() => {
+  delete process.env.USER_TYPE;
+  setMainLoopModelOverride(undefined);
   clearAgentTeamsStateForTesting();
   setFlagSettingsInline(null);
   delete process.env.CLAUDE_CODE_USE_OPENAI;
@@ -69,8 +90,12 @@ afterEach(() => {
   delete process.env.CLAUDE_CODE_USE_VERTEX;
   delete process.env.CLAUDE_CODE_USE_FOUNDRY;
   delete process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT;
+  delete process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS;
   delete process.env.ANTHROPIC_MODEL;
   delete process.env.ANTHROPIC_DEFAULT_OPUS_MODEL;
+  delete process.env.ANTHROPIC_DEFAULT_SONNET_MODEL;
+  delete process.env.ANTHROPIC_DEFAULT_HAIKU_MODEL;
+  delete process.env.CLAUDE_CODE_SUBAGENT_MODEL;
   delete process.env.ANTHROPIC_AWS_WORKSPACE_ID;
   delete process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST;
   delete process.env.CLAUDE_CODE_ENTRY_PROVIDER;
@@ -146,7 +171,7 @@ describe('model access fallback with agent_teams capabilities', () => {
     expect(getDefaultMainLoopModel()).toBe('gpt-5.2');
   });
 
-  it('falls back when a user-selected codex model becomes disallowed', () => {
+  it('retains and rejects a user-selected codex model when it becomes disallowed', () => {
     process.env.CLAUDE_CODE_USE_OPENAI = '1';
     process.env.ANTHROPIC_MODEL = 'gpt-5.4';
     setAgentTeamsCapabilitiesForTesting(
@@ -163,10 +188,17 @@ describe('model access fallback with agent_teams capabilities', () => {
       }),
     );
 
-    expect(getMainLoopModel()).toBe('gpt-5.3-codex');
+    expect(getUserSpecifiedModelSetting()).toBe('gpt-5.4');
+    expect(getMainLoopModel()).toBe('gpt-5.4');
+    expect(getModelSelectionPolicyError('gpt-5.4')).toContain(
+      'not allowed by the availableModels policy',
+    );
+    expect(
+      getModelOptions().some(option => option.value === 'gpt-5.4'),
+    ).toBe(true);
   });
 
-  it('falls back from gpt-5.1-codex-max when host-managed Codex is pinned to ChatGPT auth', () => {
+  it('retains and rejects a concrete model when Codex runtime support is forbidden', () => {
     process.env.CLAUDE_CODE_ENTRY_PROVIDER = 'codex';
     process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1';
     process.env.ANTHROPIC_MODEL = 'gpt-5.1-codex-max';
@@ -177,7 +209,10 @@ describe('model access fallback with agent_teams capabilities', () => {
       },
     });
 
-    expect(getMainLoopModel()).toBe('gpt-5.6-sol');
+    expect(getMainLoopModel()).toBe('gpt-5.1-codex-max');
+    expect(getModelSelectionPolicyError('gpt-5.1-codex-max')).toContain(
+      'unavailable for the current Codex runtime',
+    );
     setFlagSettingsInline(previousSettings);
   });
 });
@@ -234,5 +269,124 @@ describe('Opus 4.8 defaults', () => {
     expect(isFastModeSupportedByModel('opus')).toBe(true);
     expect(isFastModeSupportedByModel('claude-opus-4-8')).toBe(true);
     expect(isFastModeSupportedByModel('claude-opus-4-6')).toBe(false);
+  });
+});
+
+describe('explicit model identity preservation', () => {
+  const EXACT_MODELS = [
+    'claude-opus-5',
+    'claude-opus-5-5',
+    'claude-opus-6-future',
+    'claude-sonnet-5',
+    'claude-haiku-5',
+    'custom-provider/model',
+    'mimo-v2.6-pro',
+    'claude-opus-4-1',
+    'claude-opus-5[1m]',
+  ] as const;
+
+  it.each(EXACT_MODELS)(
+    'keeps %s through startup, parse, plan, and context-cap paths',
+    model => {
+      setMainLoopModelOverride(model);
+
+      expect(getUserSpecifiedModelSetting()).toBe(model);
+      expect(getMainLoopModel()).toBe(
+        model.endsWith('[1m]')
+          ? `${model.slice(0, -'[1m]'.length)}[1m]`
+          : model,
+      );
+      expect(resolveAllowedModelSetting(model)).toBe(
+        model.endsWith('[1m]')
+          ? `${model.slice(0, -'[1m]'.length)}[1m]`
+          : model,
+      );
+      expect(
+        getRuntimeMainLoopModel({
+          permissionMode: 'plan',
+          mainLoopModel: model,
+          exceeds200kTokens: true,
+        }),
+      ).toBe(model);
+    },
+  );
+
+  it('normalizes only the context suffix at the API boundary', () => {
+    expect(normalizeModelStringForAPI('claude-opus-5-5[1m]')).toBe(
+      'claude-opus-5-5',
+    );
+    expect(resolveSkillModelOverride(
+      'claude-opus-5-5',
+      'claude-opus-5-5[1m]',
+    )).toBe('claude-opus-5-5[1m]');
+  });
+
+  it('applies context caps and future-model thinking metadata without changing model identity', () => {
+    const model = 'claude-opus-6-future[1m]'
+    process.env.USER_TYPE = 'ant'
+    process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS = '123456'
+
+    expect(getContextWindowForModel(model, [])).toBe(123456)
+    expect(normalizeModelStringForAPI(model)).toBe('claude-opus-6-future')
+    expect(modelSupportsThinking(model)).toBe(true)
+    expect(modelSupportsAdaptiveThinking(model)).toBe(true)
+  });
+
+  it('keeps intentional conditional alias transitions distinct from concrete IDs', () => {
+    process.env.ANTHROPIC_MODEL = 'opusplan';
+    expect(
+      getRuntimeMainLoopModel({
+        permissionMode: 'plan',
+        mainLoopModel: 'claude-sonnet-5',
+        exceeds200kTokens: false,
+      }),
+    ).toBe(getDefaultOpusModel());
+
+    process.env.ANTHROPIC_MODEL = 'haiku';
+    expect(
+      getRuntimeMainLoopModel({
+        permissionMode: 'plan',
+        mainLoopModel: 'claude-haiku-5',
+        exceeds200kTokens: false,
+      }),
+    ).toBe(getDefaultSonnetModel());
+  });
+
+  it('applies conditional alias semantics to explicit fallback models without changing concrete fallback IDs', () => {
+    expect(
+      getRuntimeMainLoopModel({
+        permissionMode: 'plan',
+        modelSetting: 'opusplan',
+        mainLoopModel: parseUserSpecifiedModel('opusplan'),
+        exceeds200kTokens: false,
+      }),
+    ).toBe(getDefaultOpusModel());
+
+    for (const fallbackModel of [
+      'claude-opus-5',
+      'claude-opus-5-5',
+      'custom-provider/model',
+    ]) {
+      expect(
+        getRuntimeMainLoopModel({
+          permissionMode: 'plan',
+          modelSetting: fallbackModel,
+          mainLoopModel: parseUserSpecifiedModel(fallbackModel),
+          exceeds200kTokens: true,
+        }),
+      ).toBe(fallbackModel);
+    }
+  });
+
+  it('rejects unsupported fast mode without changing the selected model', () => {
+    const model = 'claude-opus-5-5';
+    const decision = getFastModeToggleDecision(model, true);
+    expect(decision.ok).toBe(false);
+    if (!decision.ok) {
+      expect(decision.message).toContain(model);
+      expect(decision.message).toContain('unchanged');
+    }
+    expect(getFastModeToggleDecision(model, false)).toEqual({ ok: true });
+    expect(model).toBe('claude-opus-5-5');
   });
 });

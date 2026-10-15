@@ -277,6 +277,22 @@ describe('shouldClearAnthropicApiKeyForTeammateSpawn', () => {
     expect(env).toContain("CLAUDE_CODE_USE_GEMINI=''")
   })
 
+  it('forwards the native model context cap through process and tmux teammate env', () => {
+    const original = process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT
+    process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT = '1'
+    try {
+      expect(buildInheritedEnvObject({ provider: 'anthropic' })).toHaveProperty(
+        'CLAUDE_CODE_DISABLE_1M_CONTEXT', '1',
+      )
+      expect(buildInheritedEnvVars({ provider: 'anthropic' })).toContain(
+        'CLAUDE_CODE_DISABLE_1M_CONTEXT=1',
+      )
+    } finally {
+      if (original === undefined) delete process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT
+      else process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT = original
+    }
+  })
+
   it('forwards Anthropic connection intent through Anthropic and non-Anthropic teammates', () => {
     const original = process.env[AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV]
     process.env[AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV] = 'subscription'

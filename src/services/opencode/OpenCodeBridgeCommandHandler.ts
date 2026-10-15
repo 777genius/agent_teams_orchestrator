@@ -1221,6 +1221,10 @@ function success<TData>(
   }
 }
 
+function nonblankFailureMessage(message: unknown): string {
+  return typeof message === 'string' && message.trim() ? message : 'OpenCode bridge operation failed'
+}
+
 function failure(
   envelope: BridgeEnvelope,
   kind: 'unsupported_schema' | 'unsupported_command' | 'invalid_input' | 'runtime_not_ready' | 'provider_error' | 'timeout' | 'contract_violation' | 'internal_error',
@@ -1239,7 +1243,7 @@ function failure(
     durationMs: Math.max(0, Date.now() - startedAtMs),
     error: {
       kind,
-      message,
+      message: nonblankFailureMessage(message),
       retryable,
       ...(details ? { details } : {}),
     },
@@ -6259,9 +6263,9 @@ export async function executeOpenCodeBridgeCommandEnvelope(
   } catch (error) {
     const deadlineError = isOpenCodeRuntimeDeadlineError(error) ? error : null
     const lockFailure = deadlineError ? null : safeOpenCodeLockFailure(error)
-    const message = lockFailure
+    const message = nonblankFailureMessage(lockFailure
       ? formatOpenCodeLockFailure(lockFailure)
-      : error instanceof Error ? error.message : String(error)
+      : error instanceof Error ? error.message : String(error))
     return failure(
       envelope,
       deadlineError ? 'timeout' : 'provider_error',
