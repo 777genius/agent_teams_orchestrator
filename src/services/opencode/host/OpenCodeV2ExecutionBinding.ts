@@ -1,6 +1,6 @@
 import path from 'node:path'
 import { readExecutionPlatformBirth } from './OpenCodeV2ExecutionPlatform.js'
-import { lstat, open, readFile, readdir, realpath } from 'node:fs/promises'
+import filesystem, { lstat, open, readFile, readdir } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
 import { hashOpenCodeFile, readOpenCodePackageManifest, type OpenCodeV2NativeIdentity } from '../compatibility/OpenCodeNativeIdentity.js'
 import { assertExecutionSelectedModel, executionAssert, executionHash, executionRecord,
@@ -29,7 +29,7 @@ export type CatalogExecutionProfile = Omit<SelectedExecutionProfile, 'selection'
 export type OwnedNativeProfile = SelectedExecutionProfile | CatalogExecutionProfile
 
 export async function canonicalExecutionDirectory(directory: string): Promise<void> {
-  executionAssert(path.isAbsolute(directory) && await realpath(directory) === directory, 'execution_identity_mismatch')
+  executionAssert(path.isAbsolute(directory) && await filesystem.realpath(directory) === directory, 'execution_identity_mismatch')
   const info = await lstat(directory)
   executionAssert(info.isDirectory() && !info.isSymbolicLink(), 'execution_identity_mismatch')
 }
@@ -65,7 +65,7 @@ export async function validateExecutionProfile(profile: OwnedNativeProfile): Pro
   })
   executionAssert(!db || (db.isFile() && !db.isSymbolicLink()), 'execution_profile_changed')
   if (profile.models) {
-    executionAssert(inside(profile.root, profile.models.path) && await realpath(profile.models.path) === profile.models.path)
+    executionAssert(inside(profile.root, profile.models.path) && await filesystem.realpath(profile.models.path) === profile.models.path)
     executionAssert(await lstat(profile.models.path).then(info => info.isFile() && !info.isSymbolicLink()), 'execution_profile_changed')
     executionAssert(await hashOpenCodeFile(profile.models.path) === profile.models.sha256, 'execution_profile_changed')
   }
@@ -88,7 +88,7 @@ export async function validateExecutionGraph(pin: '2.0.0' | '2.0.21', receipt: E
       while (!failed) {
         const row = rows[next++]
         if (!row) return
-        executionAssert(/^[a-f0-9]{64}$/.test(row.sha256) && path.isAbsolute(row.path) && await realpath(row.path) === row.path)
+        executionAssert(/^[a-f0-9]{64}$/.test(row.sha256) && path.isAbsolute(row.path) && await filesystem.realpath(row.path) === row.path)
         executionAssert(await hashOpenCodeFile(row.path) === row.sha256, 'execution_graph_changed')
         completed++
         if (completed % 16 === 0 || completed === rows.length) progress?.({ phase: 'hash', completed, total: rows.length })
@@ -110,7 +110,7 @@ export async function validateExecutionGraph(pin: '2.0.0' | '2.0.21', receipt: E
     executionAssert(/^(?:@[a-z0-9._-]+\/)?[a-z0-9._-]+$/.test(name), 'execution_graph_incomplete')
     for (let directory = from; ; directory = path.dirname(directory)) {
       const candidate = path.join(directory, 'node_modules', name)
-      try { return await realpath(candidate) } catch (error) {
+      try { return await filesystem.realpath(candidate) } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
       }
       executionAssert(path.dirname(directory) !== directory, 'execution_graph_dependency_missing')
@@ -155,7 +155,7 @@ export async function validateExecutionGraph(pin: '2.0.0' | '2.0.21', receipt: E
       await visit(resolved, dependencyPackageName(name, optional[name]))
     }
   }
-  const client = await realpath(Bun.resolveSync(pin === '2.0.0' ? '@opencode/client-v2-floor' : '@opencode/client', import.meta.dir))
+  const client = await filesystem.realpath(Bun.resolveSync(pin === '2.0.0' ? '@opencode/client-v2-floor' : '@opencode/client', import.meta.dir))
   await visit(await packageRoot(graph.modulePath), '@opencode/server')
   await visit(await packageRoot(graph.effectPath), 'effect')
   await visit(await packageRoot(client), '@opencode/client')
@@ -173,7 +173,7 @@ function dependencyPackageName(name: string, specification: unknown): string {
 }
 
 export async function validateExecutionNative(native: ValidatedExecutionNative): Promise<void> {
-  executionAssert(await realpath(native.executablePath) === native.executablePath && /^opencode(?:\.exe)?$/.test(path.basename(native.executablePath)), 'execution_identity_mismatch')
+  executionAssert(await filesystem.realpath(native.executablePath) === native.executablePath && /^opencode(?:\.exe)?$/.test(path.basename(native.executablePath)), 'execution_identity_mismatch')
   const metadata = executionRecord(await readOpenCodePackageManifest(path.join(path.dirname(path.dirname(native.executablePath)), 'package.json')))
   const platform = process.platform === 'win32' ? 'windows' : process.platform
   executionAssert(metadata.name === native.packageName && metadata.version === native.version &&

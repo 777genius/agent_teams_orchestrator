@@ -1,6 +1,6 @@
 import { openCodeBunVersion } from '../../../../constants/openCodeBunVersion.js'
 import { createServer } from 'node:http'
-import { realpath, stat } from 'node:fs/promises'
+import filesystem, { stat } from 'node:fs/promises'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import type { OpenCodeV2Pin } from '../../compatibility/OpenCodeGenerationPolicy.js'
@@ -39,7 +39,7 @@ export async function loadOpenCodeV2WindowsRuntime(pin: OpenCodeV2Pin, expectedM
   requireValue(graph.moduleSha256 === expectedModuleSha256)
   const directory = path.dirname(graph.modulePath)
   async function load<T>(specifier: string, packageName: string, version: string): Promise<T> {
-    const entry = await realpath(Bun.resolveSync(specifier, directory))
+    const entry = await filesystem.realpath(Bun.resolveSync(specifier, directory))
     await verifyOpenCodePackage(entry, packageName, version)
     return import(pathToFileURL(entry).href) as Promise<T>
   }
@@ -97,11 +97,11 @@ export async function loadOpenCodeV2WindowsRuntime(pin: OpenCodeV2Pin, expectedM
     }
     const input = yield* attempt('resolve', async () => {
       const env = command.options.env ? commandEnvironment(command.options.env, command.options.extendEnv) : { ...baseline }
-      const cwd = await realpath(command.options.cwd ?? process.cwd())
+      const cwd = await filesystem.realpath(command.options.cwd ?? process.cwd())
       requireValue(path.isAbsolute(cwd) && (await stat(cwd)).isDirectory())
       requireValue(command.command.length > 0 && !command.command.includes('\0') && command.args.every(arg => !arg.includes('\0')))
       let executable: string | undefined
-      if (path.isAbsolute(command.command)) executable = await realpath(command.command)
+      if (path.isAbsolute(command.command)) executable = await filesystem.realpath(command.command)
       else {
         // Only ordinary PATH names; never search the current directory or use
         // cmd.exe AutoRun/shell resolution as a substitute for an executable.
@@ -109,7 +109,7 @@ export async function loadOpenCodeV2WindowsRuntime(pin: OpenCodeV2Pin, expectedM
         const search = Object.entries(env).find(([name]) => name.toUpperCase() === 'PATH')?.[1] ?? ''
         for (const root of search.split(';').filter(value => path.isAbsolute(value))) {
           const candidate = path.join(root, command.command + (path.extname(command.command) ? '' : '.exe'))
-          try { if ((await stat(candidate)).isFile()) { executable = await realpath(candidate); break } }
+          try { if ((await stat(candidate)).isFile()) { executable = await filesystem.realpath(candidate); break } }
           catch (cause) { if ((cause as NodeJS.ErrnoException).code !== 'ENOENT') throw cause }
         }
       }

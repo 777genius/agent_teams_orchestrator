@@ -1,4 +1,4 @@
-import { realpath } from 'node:fs/promises'
+import filesystem from 'node:fs/promises'
 import path from 'node:path'
 import { hashOpenCodeFile, readOpenCodePackageManifest } from '../compatibility/OpenCodeNativeIdentity.js'
 import type { OpenCodeV2Pin } from '../compatibility/OpenCodeGenerationPolicy.js'
@@ -7,15 +7,15 @@ import { openCodeReadAssert } from '../transport/OpenCodeBoundedFetch.js'
 
 export async function verifyOpenCodeV2ServerGraph(pin: OpenCodeV2Pin) {
   const name = pin === '2.0.0' ? '@opencode/server-v2-floor' : '@opencode/server'
-  const modulePath = await realpath(Bun.resolveSync(`${name}/process`, import.meta.dir))
+  const modulePath = await filesystem.realpath(Bun.resolveSync(`${name}/process`, import.meta.dir))
   const metadata = readRecord(await readOpenCodePackageManifest(path.join(path.dirname(modulePath), '..', 'package.json')))
   openCodeReadAssert(metadata.name === '@opencode/server' && metadata.version === pin, 'identity_mismatch')
   for (const [dependency, subpath] of [['core', 'bus'], ['protocol', 'groups/pty'],
     ['schema', 'installation-event'], ['util', 'effect/layer-node'], ['simulation', 'backend']]) {
-    const entry = await realpath(Bun.resolveSync(`@opencode/${dependency}/${subpath}`, path.dirname(modulePath)))
+    const entry = await filesystem.realpath(Bun.resolveSync(`@opencode/${dependency}/${subpath}`, path.dirname(modulePath)))
     await verifyOpenCodePackage(entry, `@opencode/${dependency}`, pin)
   }
-  const effectPath = await realpath(Bun.resolveSync('effect', path.dirname(modulePath)))
+  const effectPath = await filesystem.realpath(Bun.resolveSync('effect', path.dirname(modulePath)))
   const effectInfo = readRecord(await readOpenCodePackageManifest(path.join(path.dirname(effectPath), '..', 'package.json')))
   openCodeReadAssert(effectInfo.name === 'effect' && effectInfo.version === '4.0.0-rc.112', 'identity_mismatch')
   return { modulePath, effectPath, moduleSha256: await hashOpenCodeFile(modulePath) }

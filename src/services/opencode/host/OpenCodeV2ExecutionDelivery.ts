@@ -1,5 +1,5 @@
 import path from 'node:path'
-import { realpath, readFile } from 'node:fs/promises'
+import filesystem, { readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import { createHash } from 'node:crypto'
 import { executionAssert } from '../execution/OpenCodeV2ExecutionContracts.js'
@@ -19,9 +19,9 @@ export function classifyOpenCodeV2ExecutionDelivery(location: string) {
 
 export async function resolveOpenCodeV2ExecutionDelivery(location: string, child: 'execution' | 'run-owner') {
   const { file, source } = classifyOpenCodeV2ExecutionDelivery(location)
-  const root = await realpath(source ? file.slice(0, file.lastIndexOf(`${path.sep}src${path.sep}`)) : path.dirname(file))
+  const root = await filesystem.realpath(source ? file.slice(0, file.lastIndexOf(`${path.sep}src${path.sep}`)) : path.dirname(file))
   const name = child === 'execution' ? 'opencodeV2ExecutionServer' : 'opencodeV2RunOwner'
-  const entryPath = await realpath(path.join(root, source ? `src/entrypoints/${name}.ts` : `${name}.js`))
+  const entryPath = await filesystem.realpath(path.join(root, source ? `src/entrypoints/${name}.ts` : `${name}.js`))
   executionAssert(entryPath === path.join(root, source ? `src/entrypoints/${name}.ts` : `${name}.js`), 'execution_entry_changed')
   return { runtimeMode: source ? 'source' as const : 'packaged' as const, root, entryPath,
     entrySha256: createHash('sha256').update(await readFile(entryPath)).digest('hex') }

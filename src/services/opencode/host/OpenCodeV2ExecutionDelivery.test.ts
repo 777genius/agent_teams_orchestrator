@@ -63,3 +63,24 @@ test('actual compiled Bun executable refuses embedded delivery before resolving 
     expect(await new Response(child.stderr).text()).toContain('v2_compiled_runtime_unsupported')
   } finally { await rm(root, { recursive: true, force: true }) }
 }, 30_000)
+
+// Bun caches named/namespace builtin exports even after syncBuiltinESMExports.
+// Native Windows installs its permission-error fallback after these imports.
+test('early delivery/profile consumers observe the subsequently installed realpath facade', async () => {
+  const script = `
+    const {resolveOpenCodeV2ExecutionDelivery}=await import(${JSON.stringify(new URL('./OpenCodeV2ExecutionDelivery.ts', import.meta.url).href)});
+    const {canonicalExecutionDirectory}=await import(${JSON.stringify(new URL('./OpenCodeV2ExecutionBinding.ts', import.meta.url).href)});
+    const fs=require('node:fs/promises'), original=fs.realpath;
+    let observed=0;
+    fs.realpath=(...args)=>{observed++;return original(...args)};
+    require('node:module').syncBuiltinESMExports();
+    try {
+      const delivery=await resolveOpenCodeV2ExecutionDelivery(${JSON.stringify(new URL('./OpenCodeV2ExecutionDelivery.ts', import.meta.url).href)},'execution');
+      await canonicalExecutionDirectory(delivery.root);
+      if(observed!==3)throw Error('TEST realpath facade bypassed');
+    } finally { fs.realpath=original;require('node:module').syncBuiltinESMExports(); }
+  `
+  const child = Bun.spawn([process.execPath, '-e', script], { stdout: 'pipe', stderr: 'pipe' })
+  const [code, output] = await Promise.all([child.exited, new Response(child.stderr).text()])
+  expect({ code, output }).toEqual({ code: 0, output: '' })
+})

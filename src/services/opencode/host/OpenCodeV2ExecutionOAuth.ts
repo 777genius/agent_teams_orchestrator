@@ -1,6 +1,6 @@
 import path from 'node:path'
 import { createHash } from 'node:crypto'
-import { lstat, readFile, realpath } from 'node:fs/promises'
+import filesystem, { lstat, readFile } from 'node:fs/promises'
 import { pathToFileURL } from 'node:url'
 import { hashOpenCodeFile } from '../compatibility/OpenCodeNativeIdentity.js'
 import { executionAssert, executionHash, executionRecord } from '../execution/OpenCodeV2ExecutionContracts.js'
@@ -27,7 +27,7 @@ export async function readOpenCodeV2SelectedAuth(profile: OwnedNativeProfile,
     executionAssert(stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1 &&
       (process.platform === 'win32' || stat.uid === process.getuid?.()) &&
       (process.platform === 'win32' || (stat.mode & 0o077) === 0) && stat.size <= 128 * 1024 &&
-      await realpath(file) === file && await hashOpenCodeFile(file) === fingerprint, 'execution_selected_auth_changed')
+      await filesystem.realpath(file) === file && await hashOpenCodeFile(file) === fingerprint, 'execution_selected_auth_changed')
     if (metadata) {
       const observed = await metadata.read(deadline, signal)
       executionAssert(observed.sha256 === fingerprint && observed.bytes === stat.size, 'execution_selected_auth_changed')
@@ -86,7 +86,7 @@ export async function importOpenCodeV2SelectedOAuth(profile: OwnedNativeProfile,
   const selected = await readOpenCodeV2SelectedAuth(profile)
   if (selected.credential.type === 'api') return
   executionAssert(profile.databasePath.startsWith(profile.root + path.sep) &&
-    await realpath(path.dirname(profile.databasePath)) === path.dirname(profile.databasePath), 'execution_profile_changed')
+    await filesystem.realpath(path.dirname(profile.databasePath)) === path.dirname(profile.databasePath), 'execution_profile_changed')
   const parent = await lstat(path.dirname(profile.databasePath))
   executionAssert(parent.isDirectory() && !parent.isSymbolicLink() && parent.uid === process.getuid?.() &&
     (parent.mode & 0o077) === 0, 'execution_profile_changed')
@@ -96,9 +96,9 @@ export async function importOpenCodeV2SelectedOAuth(profile: OwnedNativeProfile,
   })
   executionAssert(!database || (database.isFile() && !database.isSymbolicLink() && database.nlink === 1 &&
     database.uid === process.getuid?.() &&
-    await realpath(profile.databasePath) === profile.databasePath), 'execution_profile_changed')
+    await filesystem.realpath(profile.databasePath) === profile.databasePath), 'execution_profile_changed')
   const locate = async (specifier: string) => {
-    const file = await realpath(Bun.resolveSync(specifier, modulePath))
+    const file = await filesystem.realpath(Bun.resolveSync(specifier, modulePath))
     const row = graph.files.find(value => value.path === file)
     executionAssert(row && await hashOpenCodeFile(file) === row.sha256, 'execution_graph_incomplete')
     signal?.throwIfAborted()

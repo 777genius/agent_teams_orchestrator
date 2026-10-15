@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { lstat, open, realpath, stat } from 'node:fs/promises'
+import filesystem, { lstat, open, stat } from 'node:fs/promises'
 import path from 'node:path'
 import { resolveOpenCodeBinaryPath } from '../OpenCodeBinaryResolver.js'
 import { classifyOpenCodeReadGeneration, type OpenCodeReadGeneration, type OpenCodeV2Pin } from './OpenCodeGenerationPolicy.js'
@@ -71,7 +71,7 @@ export async function inspectOpenCodeReadSelection(signal?: AbortSignal, onAcqui
   if (!selected) return { path: null, policy: { generation: 'unsupported', version: null }, native: null, fingerprint: null }
   onAcquisitionStarted?.()
   signal?.throwIfAborted()
-  const executablePath = await realpath(selected)
+  const executablePath = await filesystem.realpath(selected)
   signal?.throwIfAborted()
   const executableSha256 = await hashOpenCodeFile(executablePath)
   signal?.throwIfAborted()
