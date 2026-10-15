@@ -681,23 +681,57 @@ try{return [Security.Principal.SecurityIdentifier]::new($native).Value}finally{[
   const privateMetadataDenied = (error: unknown) => error instanceof Error &&
     /^execution_owner_not_private(?::private_acl_foreign_allow:\d+)?$/.test(error.message)
   const metadataBefore = await snapshot(discoveryRoot)
+  const fixtureSecurity = `
+Add-Type -TypeDefinition @'
+using System.Runtime.InteropServices;
+public static class TestFixtureSecurity {
+[DllImport("advapi32.dll",EntryPoint="SetFileSecurityW",ExactSpelling=true,CharSet=CharSet.Unicode,SetLastError=true)]
+[return:MarshalAs(UnmanagedType.Bool)] public static extern bool SetFileSecurity(string path,uint information,byte[] descriptor);
+}
+'@
+function Set-TestDacl([byte[]]$descriptor){
+# DACL-only SetFileSecurityW does not propagate inheritable ACEs to children.
+if(![TestFixtureSecurity]::SetFileSecurity($env:TEST_TARGET,4,$descriptor)){throw ('TEST ACL write failed:'+ [Runtime.InteropServices.Marshal]::GetLastWin32Error())}}
+`
+  const fixtureFailureCode = (error: unknown) => error instanceof Error &&
+    /^[a-z_]{1,96}(?::[a-z_]{1,64}:\d{1,10})?$/.test(error.message) ? error.message
+    : error instanceof assert.AssertionError ? 'assertion_failed' : 'fixture_operation_failed'
   const withMetadataAce = async (target: string, sid: string, rights: string, inheritance: string,
     verify: () => Promise<void>) => {
-    const original = await powershell(`[Console]::Write((Get-Acl -LiteralPath $env:TEST_TARGET).Sddl)`, target)
-    const installed = await powershell(`$acl=Get-Acl -LiteralPath $env:TEST_TARGET
+    // Capture/install together, then observe/restore together: two PowerShell
+    // startups per fixture, without changing the published endpoint deadline.
+    const fixture = executionRecord(JSON.parse(await powershell(fixtureSecurity + `
+$acl=Get-Acl -LiteralPath $env:TEST_TARGET
+$original=$acl.Sddl;$descriptor=$acl.GetSecurityDescriptorBinaryForm()
 $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new($env:TEST_SID),$env:TEST_RIGHTS,$env:TEST_INHERITANCE,'None','Allow'))
-Set-Acl -LiteralPath $env:TEST_TARGET -AclObject $acl
-[Console]::Write((Get-Acl -LiteralPath $env:TEST_TARGET).Sddl)`, target,
-      { TEST_SID: sid, TEST_RIGHTS: rights, TEST_INHERITANCE: inheritance })
+Set-TestDacl ($acl.GetSecurityDescriptorBinaryForm())
+[Console]::Write((@{original=$original;descriptor=[Convert]::ToBase64String($descriptor);installed=(Get-Acl -LiteralPath $env:TEST_TARGET).Sddl}|ConvertTo-Json -Compress))`, target,
+      { TEST_SID: sid, TEST_RIGHTS: rights, TEST_INHERITANCE: inheritance })))
+    assert.equal(typeof fixture.original, 'string'); assert.equal(typeof fixture.descriptor, 'string')
+    assert.equal(typeof fixture.installed, 'string')
+    let verificationFailure: unknown
     try {
       await verify()
-      assert.equal(await powershell(`[Console]::Write((Get-Acl -LiteralPath $env:TEST_TARGET).Sddl)`, target), installed)
+    } catch (error) {
+      verificationFailure = error
+      facts.metadataAclVerificationFailure = fixtureFailureCode(error)
+      throw error
     } finally {
-      const restored = await powershell(`$acl=Get-Acl -LiteralPath $env:TEST_TARGET
-$acl.SetSecurityDescriptorSddlForm($env:TEST_ORIGINAL_ACL)
-Set-Acl -LiteralPath $env:TEST_TARGET -AclObject $acl
-[Console]::Write((Get-Acl -LiteralPath $env:TEST_TARGET).Sddl)`, target, { TEST_ORIGINAL_ACL: original })
-      assert.equal(restored, original)
+      let phase = 'observe_and_restore'
+      try {
+        const after = executionRecord(JSON.parse(await powershell(fixtureSecurity + `
+try{$observed=(Get-Acl -LiteralPath $env:TEST_TARGET).Sddl}
+finally{Set-TestDacl ([Convert]::FromBase64String($env:TEST_ORIGINAL_DESCRIPTOR));$restored=(Get-Acl -LiteralPath $env:TEST_TARGET).Sddl}
+[Console]::Write((@{observed=$observed;restored=$restored}|ConvertTo-Json -Compress))`, target,
+          { TEST_ORIGINAL_DESCRIPTOR: String(fixture.descriptor) })))
+        phase = 'staged_acl_unchanged'; assert.equal(after.observed, fixture.installed)
+        phase = 'restored_acl_exact'; assert.equal(after.restored, fixture.original)
+      } catch (error) {
+        facts.metadataAclFinalizationFailure = { phase, code: fixtureFailureCode(error) }
+        if (verificationFailure !== undefined)
+          throw new AggregateError([verificationFailure, error], 'TEST metadata verification and restoration failed')
+        throw error
+      }
     }
   }
   for (const target of [discoveryRoot, directory])
