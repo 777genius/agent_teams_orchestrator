@@ -81,7 +81,17 @@ export function observeWindowsHeldMainExit(events: EventEmitter, child: EventEmi
       child.emit('close', receipt.exitCode)
     }
   })().catch(() => child.emit('error', new Error('execution_identity_mismatch'))) })
-  return () => exited
+  // Preserve the authenticated held-process observation for retirement. A new
+  // OpenProcess lookup may no longer resolve this PID after the held MAIN exits.
+  return Object.freeze(Object.assign(() => exited, {
+    async readBirth(): Promise<ExecutionBirth | null> {
+      const native = row(row(await launch).bun)
+      if (exited) return null
+      assert(Number.isSafeInteger(native.hostPID) && Number(native.hostPID) > 0 &&
+        native.hostPID === native.nativePID, 'execution_identity_mismatch')
+      return windowsBirth(Number(native.hostPID))
+    },
+  }))
 }
 export function isWindowsExecutionMapping(value: unknown): value is WindowsExecutionMapping { return !!value && typeof value === 'object' && mappings.has(value as WindowsExecutionMapping) }
 export function isWindowsKernelRetirement(value: unknown): value is WindowsKernelRetirement { return !!value && typeof value === 'object' && retirements.has(value as WindowsKernelRetirement) }
@@ -312,13 +322,13 @@ export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, l
   const commandReplay = createWindowsCommandRequestReplay()
   const commandOperations = new Set(['commandStart', 'commandRead', 'commandStatus', 'commandWriteStdin', 'commandEndStdin', 'commandRetire', 'commandClose'])
   let mapping: WindowsExecutionMapping | undefined, nativeMapping: unknown, stopped = false, started = false, closed = false
-  let mainExited = () => false
+  let mainExit: ReturnType<typeof observeWindowsHeldMainExit> | undefined
   let connectedResolve!: (value: unknown) => void, connectedReject!: (error: Error) => void
   const connected = new Promise<unknown>((resolve, reject) => { connectedResolve = resolve; connectedReject = reject }); void connected.catch(() => undefined)
   broker.events.on('connected', connectedResolve)
   broker.events.on('failed', () => { const error = new Error('execution_containment_launcher_denied'); connectedReject(error); http.fail(error); child.emit('error', error) })
   broker.events.on('error', error => { connectedReject(error); http.fail(error); child.emit('error', error) })
-  broker.events.on('close', () => { const error = new Error('execution_containment_helper_closed'); connectedReject(error); http.fail(error); if (!mainExited()) child.emit('error', error) })
+  broker.events.on('close', () => { const error = new Error('execution_containment_helper_closed'); connectedReject(error); http.fail(error); if (!mainExit?.()) child.emit('error', error) })
   broker.events.on('message', value => {
     try {
       const record = row(value)
@@ -366,7 +376,7 @@ export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, l
   })
   const launch = broker.request('launch', { executable: plan.executable, entry: plan.entry, cwd: plan.cwd, env: plan.env,
     writableRoots: plan.writableRoots, readOnlyRoots: plan.readOnlyRoots, protectedRoots: plan.protectedRoots, realpathDll: plan.realpathDll, selectedConfigId: selectedConfigs.get(plan), nonce, leaseOwnerId }, deadline)
-  mainExited = observeWindowsHeldMainExit(broker.events, child, launch, (code, stderrKind) => {
+  mainExit = observeWindowsHeldMainExit(broker.events, child, launch, (code, stderrKind) => {
     heldMainExitCode = code; heldMainStderrKind = stderrKind
   })
   void launch.catch(connectedReject)
@@ -413,6 +423,7 @@ export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, l
     async start(payload: Readonly<Record<string, unknown>>, deadline: number, signal?: AbortSignal) { assert(mapping && !started && !stopped); await assertLive(); started = true; await broker!.request('send', { value: { ...payload, type: 'start', nonce, leaseOwnerId, namespace: mapping.namespace.name } }, deadline, signal) },
     sendClose() { assert(mapping); stopped = true; void http.close().then(() => broker!.request('send', { value: { type: 'close', nonce, leaseOwnerId } })).catch(() => child.emit('error', new Error('cleanup_unknown'))) },
     acknowledged: () => closed,
+    readBirth() { assert(mapping && mainExit, 'execution_identity_mismatch'); return mainExit.readBirth() },
     async kill() { stopped = true; await broker!.request('retire') },
     retire(): Promise<WindowsKernelRetirement> {
       return retirement ??= (async () => {

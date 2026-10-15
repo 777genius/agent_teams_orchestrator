@@ -3,9 +3,10 @@ import { expect, mock, test } from 'bun:test'
 import type { ExecutionRetirementPort } from './OpenCodeV2ExecutionLifecycle.js'
 
 let identityResponse: Record<string, unknown> = {}
+let identityRequests = 0
 const broker = {
   events: new EventEmitter(),
-  request: async () => identityResponse,
+  request: async () => { identityRequests++; return identityResponse },
   close: async () => undefined,
   ended: () => false,
 }
@@ -38,6 +39,17 @@ function retirement(work: Promise<unknown>): ExecutionRetirementPort {
     waitExit: Promise.resolve(), readBirth: async () => null, kill: () => undefined,
     retireOwnedDescendants: () => work }
 }
+
+test('retirement keeps the original identity failure while still attempting kernel cleanup', async () => {
+  const failure = new Error('execution_identity_unknown'), calls: string[] = []
+  const port = retirement(Promise.resolve(undefined))
+  port.readBirth = async () => { calls.push('birth'); throw failure }
+  port.retireOwnedDescendants = async () => { calls.push('kernel'); return undefined }
+  const error = await retireExecutionChild(port).then(() => undefined, error => error)
+  expect(error?.message).toBe('cleanup_unknown')
+  expect(error?.cause).toBe(failure)
+  expect(calls).toEqual(['birth', 'kernel'])
+})
 
 // Previously the outer four-second timeout abandoned native reaping before its
 // concrete twelve-second RPC finished. Waiting longer must not confer authority.
@@ -86,6 +98,36 @@ test('the common birth reader dispatches Windows to the native FILETIME reader',
   } finally {
     Object.defineProperty(process, 'platform', descriptor)
   }
+})
+
+test('Windows launch birth retains only the authenticated held MAIN exit when its PID cannot reopen', async () => {
+  if (!isolatedBirthProbe) return runIsolatedBirthProbe('Windows launch birth retains only')
+  const events = new EventEmitter(), child = new EventEmitter()
+  const nativeBirth = { format: 'windows-filetime', value: '42', bootId: null } as const
+  const mapping = { nonce: 'TEST-nonce', leaseOwnerId: 'TEST-lease',
+    bun: { hostPID: 73, nativePID: 73, birth: nativeBirth },
+    supervisor: { nativePID: 74 }, namespace: 'windows-job:TEST-nonce' }
+  const errors: Error[] = []
+  child.on('error', error => errors.push(error))
+  const exited = observeWindowsHeldMainExit(events, child, Promise.resolve(mapping))
+  const flush = () => new Promise<void>(resolve => setImmediate(resolve))
+  identityResponse = { exited: false, birth: nativeBirth }
+  expect(await exited.readBirth()).toEqual(nativeBirth)
+  identityResponse = { absent: true }
+  await expect(windowsBirth(73)).rejects.toThrow('execution_identity_unknown')
+  events.emit('close', 0)
+  events.emit('mainExited', { heldProcessExited: true,
+    mapping: { ...mapping, nonce: 'TEST-foreign' }, exitCode: 0 })
+  await flush()
+  expect(exited()).toBe(false)
+  await expect(exited.readBirth()).rejects.toThrow('execution_identity_unknown')
+  expect(errors).toHaveLength(1)
+  events.emit('mainExited', { heldProcessExited: true, mapping, exitCode: 0 })
+  await flush()
+  const before = identityRequests
+  expect(exited()).toBe(true)
+  expect(await exited.readBirth()).toBeNull()
+  expect(identityRequests).toBe(before)
 })
 
 test('command replay retains pending authority, a finite settled window, and lifecycle capacity', () => {

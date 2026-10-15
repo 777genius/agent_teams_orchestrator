@@ -247,6 +247,8 @@ test('native diagnostics retain only closed producer codes and stages with uint3
       native: { stage: 'private_dll_owner', nativeCode: 0 } },
     { error: new Error('cleanup_unknown', { cause: new Error('execution_owner_not_private:private_owner_acquire:5') }),
       category: 'execution_owner_not_private', native: { stage: 'private_owner_acquire', nativeCode: 5 } },
+    { error: new Error('cleanup_unknown', { cause: new Error('execution_identity_unknown') }),
+      category: 'execution_identity_unknown' },
     { error: new Error('execution_owner_unknown:unknown_private_stage:5'), category: 'execution_owner_unknown' },
     { error: new Error('execution_native_timeout'), category: 'execution_native_timeout' },
     { error: new Error('execution_owner_unknown:owner_canonical_open:4294967295'), category: 'execution_owner_unknown',

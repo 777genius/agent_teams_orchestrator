@@ -266,7 +266,7 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
         executionAssert(results.every(result => result.status === 'fulfilled'), 'cleanup_unknown')
       },
       sendClose: () => launch!.sendClose(), waitExit: exit,
-      readBirth: () => readExecutionBirth(mapping!.bun.hostPID), kill: () => launch!.kill(),
+      readBirth: () => launch!.readBirth ? launch!.readBirth() : readExecutionBirth(mapping!.bun.hostPID), kill: () => launch!.kill(),
       retireOwnedDescendants: () => launch!.retire() })
     // UNKNOWN never releases the physical profile/database fence.
     await owner.release(receipt)

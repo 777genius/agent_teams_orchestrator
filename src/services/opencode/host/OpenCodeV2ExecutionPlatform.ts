@@ -23,6 +23,7 @@ export type ExecutionPlatformLaunch = Readonly<{
   prepare(deadline: number, signal?: AbortSignal): Promise<ExecutionPlatformMapping>
   start(payload: Readonly<Record<string, unknown>>, deadline: number, signal?: AbortSignal): Promise<void>
   assertLive(): Promise<void>; sendClose(): void; acknowledged(): boolean
+  readBirth?(): Promise<ExecutionBirth | null>
   kill(): void | Promise<void>; retire(): Promise<unknown>
 }>
 type ExecutionPlatformPlan =

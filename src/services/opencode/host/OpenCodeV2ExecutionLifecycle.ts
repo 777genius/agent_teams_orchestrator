@@ -45,7 +45,8 @@ export async function retireExecutionChild(port: ExecutionRetirementPort): Promi
   } catch (error) { failures.push(error) }
   let kernel: unknown
   try { kernel = await boundOpenCodeRead(port.retireOwnedDescendants(), executionPlatformRetirementBudgetMs()) } catch (error) { failures.push(error) }
-  executionAssert(failures.length === 0 && retired && port.acknowledged(), 'cleanup_unknown')
+  if (failures.length > 0) throw new Error('cleanup_unknown', { cause: failures[0] })
+  executionAssert(retired && port.acknowledged(), 'cleanup_unknown')
   const evidence = requireExecutionPlatformRetirement(kernel)
   executionAssert(evidence.pid === port.pid && executionHash(evidence.birth) === executionHash(port.birth), 'cleanup_unknown')
   const receipt: ExecutionCleanupReceipt = Object.freeze({ scopeClosed: true, processRetired: true,
