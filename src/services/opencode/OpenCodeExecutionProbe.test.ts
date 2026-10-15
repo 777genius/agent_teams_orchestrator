@@ -256,7 +256,7 @@ describe('OpenCodeV2 Windows probe owner adapter', () => {
     const identity = { volumeSerial: '4', fileId: 'a'.repeat(32), ownerSid: 'S-1-5-21-4' }
     const fileIdentity = { volumeSerial: '4', fileId: 'b'.repeat(32), ownerSid: 'S-1-5-21-4' }
     const native = async (request: WindowsOwnerNativeRequest): Promise<unknown> => {
-      if (request.op === 'ownerOpenDirectory') {
+      if (request.op === 'ownerPreparePrivateDirectory') {
         if (request.createExclusive) {
           if (failExclusive) throw new Error('execution_native_owned')
           await mkdir(request.path)
@@ -364,6 +364,8 @@ describe('OpenCodeV2 Windows probe owner adapter', () => {
       expect(second.state).toBe('available')
       expect(launchCalls).toBe(1)
       expect(sendCalls).toBe(1)
+      expect(events.some(event => event.startsWith('create:'))).toBe(true)
+      expect(events.some(event => event.startsWith('open:'))).toBe(true)
       expect(events.indexOf('record-absent')).toBeLessThan(events.indexOf('record-original'))
       expect(events.indexOf('record-original')).toBeLessThan(events.indexOf('launch'))
       expect(events.indexOf('record-submitted')).toBeLessThan(events.indexOf('send'))
@@ -426,7 +428,7 @@ describe('OpenCodeV2 Windows probe owner adapter', () => {
       return ancestry
     }
     const native = async (request: WindowsOwnerNativeRequest): Promise<unknown> => {
-      if (request.op === 'ownerOpenDirectory') {
+      if (request.op === 'ownerPreparePrivateDirectory') {
         if (request.path === ambientParent && ambientAdministratorsAcl.administrators &&
           ambientAdministratorsAcl.inherited) {
           ambientPrivateOpenRefusals++

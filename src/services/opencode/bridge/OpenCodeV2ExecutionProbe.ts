@@ -61,12 +61,11 @@ async function openWindowsProbeStore(dataRoot: string, sourceKey: string, deadli
       if (stat) {
         executionAssert(stat.isDirectory() && !stat.isSymbolicLink(), 'probe_store_foreign')
         if (candidate === intermediateParent) continue
-        held.push(await filesystem.openDirectory(candidate, deadline))
-      } else {
-        // createExclusive is the acquisition transaction. EEXIST is never
-        // adopted or retried after an uncertain native result.
-        held.push(await filesystem.createDirectory(candidate, deadline))
       }
+      // Store directories never archive. Retain the preparatory capability so
+      // sibling launch-plan brokers can verify these same pinned ancestors.
+      // Missing paths still create exclusively; uncertain results never adopt.
+      held.push(await filesystem.prepareDirectory(candidate, !stat, deadline))
       await held.at(-1)!.assertOwned(deadline)
     }
     const guard = path.join(directory, 'owner.lock'), file = path.join(directory, 'probe.json')
