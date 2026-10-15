@@ -1,0 +1,27 @@
+import { expect, test } from 'bun:test'
+import { assertExecutionAuthority, type ExecutionAuthority, type ExecutionBirth } from './OpenCodeV2ExecutionContracts.js'
+
+function authority(birth: ExecutionBirth): ExecutionAuthority {
+  return { generation: 'v2', pin: '2.0.21', dialect: 'v2-2.0.21', graphSha256: 'a'.repeat(64),
+    selectedCli: { path: '/TEST/opencode', sha256: 'b'.repeat(64), version: '2.0.21' },
+    child: { pid: 73, birth, executablePath: '/TEST/bun', sha256: 'c'.repeat(64) },
+    hostInstanceId: 'TEST-host', profileEpoch: 'TEST-profile', profileRoot: '/TEST/profile',
+    directory: '/TEST/project', leaseOwnerId: 'TEST-lease' }
+}
+
+test('Windows authority accepts only the native positive uint64 FILETIME birth domain', () => {
+  for (const value of ['1', '42', '18446744073709551615'])
+    expect(() => assertExecutionAuthority(authority({ format: 'windows-filetime', value, bootId: null }))).not.toThrow()
+  for (const value of ['0', '01', '-1', '1e3', 'NaN', '18446744073709551616', '999999999999999999999'])
+    expect(() => assertExecutionAuthority(authority({ format: 'windows-filetime', value, bootId: null }))).toThrow('execution_contract_invalid')
+  expect(() => assertExecutionAuthority(authority({ format: 'windows-filetime', value: '42', bootId: 'TEST-foreign' }))).toThrow('execution_contract_invalid')
+})
+
+test('existing birth domains remain distinct from Windows FILETIME', () => {
+  for (const birth of [
+    { format: 'linux-start-ticks', value: '42', bootId: 'TEST-boot' },
+    { format: 'darwin-pidversion', value: '42:7', bootId: '8dcf19b2-d295-4bc0-a4e2-80c15b99cbd8' },
+    { format: 'utc-ms', value: '42', bootId: null },
+  ] satisfies ExecutionBirth[]) expect(() => assertExecutionAuthority(authority(birth))).not.toThrow()
+  expect(() => assertExecutionAuthority(authority({ format: 'win32-filetime' as ExecutionBirth['format'], value: '42', bootId: null }))).toThrow('execution_contract_invalid')
+})

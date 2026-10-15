@@ -58,6 +58,8 @@ export function assertExecutionAuthority(host: ExecutionAuthority): void {
   exactKeys(host.child.birth, ['format', 'value', 'bootId'])
   executionAssert(host.child.birth.format === 'linux-start-ticks' ? typeof host.child.birth.bootId === 'string' && host.child.birth.bootId.length > 0 :
     host.child.birth.format === 'darwin-pidversion' ? /^\d+:\d+$/.test(host.child.birth.value) && typeof host.child.birth.bootId === 'string' && /^[a-f0-9-]{36}$/i.test(host.child.birth.bootId) :
+    host.child.birth.format === 'windows-filetime' ? /^[1-9]\d{0,19}$/.test(host.child.birth.value) &&
+      BigInt(host.child.birth.value) <= 0xffffffffffffffffn && host.child.birth.bootId === null :
     host.child.birth.format === 'utc-ms' && host.child.birth.bootId === null)
   executionAssert(host.generation === 'v2' && (host.pin === '2.0.0' || host.pin === '2.0.21'))
   executionAssert(host.dialect === `v2-${host.pin}` && host.selectedCli.version === host.pin)
