@@ -807,8 +807,6 @@ inline int32_t resolveImpl(uint64_t contextId, const wchar_t* input, uint32_t in
   if (!processIdentityMatches(context->expectedPid, context->expectedCreationFiletime,
                               failureOut, OperationResolveProcessIdentity))
     return finishFailure(failureOut, outError);
-  if (!revalidateContext(*context, failureOut))
-    return finishFailure(failureOut, outError);
 
   const std::wstring rawInput(input, inputChars);
   if (!validateRawPath(rawInput))
@@ -862,6 +860,12 @@ inline int32_t resolveImpl(uint64_t contextId, const wchar_t* input, uint32_t in
   if (selected == nullptr)
     return finishFailure(denied(OperationResolveAnchorSelection), outError);
 
+  // Only this longest-prefix anchor authorizes the result. Revalidate its
+  // complete held/reopened chain before and after target identity checks;
+  // unrelated anchors do not authorize this path.
+  if (!revalidateAnchor(*selected, failureOut))
+    return finishFailure(failureOut, outError);
+
   const std::wstring suffix = targetNt.substr(selected->ntPath.size());
   const std::wstring candidatePath = joinDos(selected->dosPath, suffix);
   if (candidatePath.size() > kMaxStringChars || !validateCanonicalInput(candidatePath))
@@ -894,7 +898,7 @@ inline int32_t resolveImpl(uint64_t contextId, const wchar_t* input, uint32_t in
       !sameFileId(refreshedTarget.fileId, heldTarget.fileId) ||
       !equalOrdinal(refreshedTargetNt, heldTarget.ntPath, false))
     return finishFailure(denied(OperationResolveTargetIdentity), outError);
-  if (!revalidateContext(*context, failureOut))
+  if (!revalidateAnchor(*selected, failureOut))
     return finishFailure(failureOut, outError);
 
   std::copy(candidatePath.begin(), candidatePath.end(), output);
