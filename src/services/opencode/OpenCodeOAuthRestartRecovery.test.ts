@@ -131,9 +131,11 @@ async function fixture(options: { session?: boolean, purpose?: 'launch_runtime' 
   }) })
   mark('prepare-profile end')
   // Real OS birth and ESRCH; this child is only a synthetic writer lifetime.
-  const writer = startOwnedChild(`process.stdin.resume();
-    process.stdin.on('end', () => process.exit(0));
-    process.stdin.on('error', () => process.exit(1));`, [], env, 'synthetic writer EOF')
+  const writer = startOwnedChild(`process.stdin.once('data', chunk =>
+      process.exit(chunk.length === 1 && chunk[0] === 4 ? 0 : 1));
+    process.stdin.on('end', () => process.exit(1));
+    process.stdin.on('error', () => process.exit(1));
+    process.stdin.resume();`, [], env, 'synthetic writer stop')
   const { child } = writer
   let native: any
   try {
@@ -203,7 +205,7 @@ async function fixture(options: { session?: boolean, purpose?: 'launch_runtime' 
   } finally {
     writer.state.phase = 'writer-eof-wait'
     mark('writer-eof-wait begin')
-    child.stdin.end()
+    child.stdin.end(Buffer.from([4]))
     await writer.closed
     if (writer.state.cleaning) await stopInterruptedContinuation()
     mark('writer-eof-wait end')
