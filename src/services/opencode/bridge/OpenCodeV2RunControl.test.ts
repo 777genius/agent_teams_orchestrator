@@ -5,7 +5,7 @@ import { mkdtemp, rm, readFile, rename, chmod, writeFile, mkdir, symlink, lstat,
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { discoverOpenCodeV2Run, awaitOpenCodeV2RunMemberReadiness, parseRunControlRequest, readRunProcessIdentity, requestOpenCodeV2Run, reserveRunControlDirectory, serveOpenCodeV2RunControl, writeRunControlFile } from './OpenCodeV2RunControl.js'
+import { discoverOpenCodeV2Run, awaitOpenCodeV2RunMemberReadiness, isTransientOpenCodeV2ControlRead, parseRunControlRequest, readRunProcessIdentity, requestOpenCodeV2Run, reserveRunControlDirectory, serveOpenCodeV2RunControl, writeRunControlFile } from './OpenCodeV2RunControl.js'
 import { boundOpenCodeRead } from '../transport/OpenCodeBoundedFetch.js'
 import type { RunControlRecord, RunUnixControlRecord } from './OpenCodeV2RunTypes.js'
 
@@ -16,6 +16,19 @@ function requireUnixControl(record: RunControlRecord | null): asserts record is 
 const peer = fileURLToPath(new URL('./fixtures/OpenCodeV2RunControlPeer.ts', import.meta.url))
 const binding = { teamId: 'TEST-team', runId: 'TEST-run', controllerInstanceId: 'controller', ownerId: 'owner' }
 const execute = promisify(execFile)
+test('readiness retries only proven read transport failures and preserves fatal custody errors', () => {
+  for (const message of ['run_control_timeout', 'run_control_disconnected',
+    'run_control_timeout:read:995', 'run_control_disconnected:read:109']) {
+    expect(isTransientOpenCodeV2ControlRead(new Error(message))).toBe(true)
+  }
+  for (const message of ['execution_native_timeout', 'cleanup_unknown', 'run_control_foreign',
+    'run_control_timeout:write:995', 'run_control_timeout:read:5',
+    'run_control_disconnected:read:995', 'run_control_timeout:foreign:995',
+    'run_control_timeout:read:0995', 'run_control_timeout:read:995:SECRET']) {
+    expect(isTransientOpenCodeV2ControlRead(new Error(message))).toBe(false)
+  }
+  expect(isTransientOpenCodeV2ControlRead({ message: 'run_control_timeout' })).toBe(false)
+})
 test.skipIf(process.platform === 'win32')('shared owned V1 ancestor permits private V2 runs but writable or symlink ancestors fail', async () => {
   const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'TEST-shared-opencode-')))
   const ancestor = path.join(root, 'opencode')

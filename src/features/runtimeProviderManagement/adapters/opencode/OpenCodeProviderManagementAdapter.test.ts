@@ -482,6 +482,48 @@ describe('OpenCodeProviderManagementAdapter', () => {
     expect(releases).toBe(1)
   })
 
+  test('settings initializes the cold instance before reading provider and plugin auth metadata', async () => {
+    let initialized = false, initializeRequested = false, configReads = 0, earlyReads = 0
+    let release!: () => void, started!: () => void
+    const initialization = new Promise<void>(resolve => { release = resolve })
+    const configStarted = new Promise<void>(resolve => { started = resolve })
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: { probe: async () => inventory({ connectedProviders: [], models: [] }) },
+      hostManager: { ensureHost: async () => host(), releaseHost: async () => {} },
+      clientFactory: { create: () => ({
+        getConfigProviders: async options => {
+          configReads++; initializeRequested = options?.initializeInstance === true; started()
+          await initialization; initialized = true
+          return { providers: [{ id: 'deepinfra', models: { test: {} } }, { id: 'kiro', models: {} }], default: {} }
+        },
+        getProviders: async () => {
+          if (!initialized) { earlyReads++; throw new Error('TEST instance is cold') }
+          return { all: [{ id: 'deepinfra', models: { test: {} } }, { id: 'kiro', models: {} }], connected: ['deepinfra'] }
+        },
+        getProviderAuth: async () => {
+          if (!initialized) { earlyReads++; throw new Error('TEST plugin auth is cold') }
+          return { deepinfra: [{ type: 'api' }], kiro: [{ type: 'oauth', label: 'TEST plugin sign in' }] }
+        },
+        getServerDoc: async () => {
+          if (!initialized) { earlyReads++; throw new Error('TEST server schema is cold') }
+          return { paths: {} }
+        },
+      }) },
+    })
+    const pending = adapter.loadView('opencode')
+    await configStarted
+    let result: Awaited<typeof pending>
+    try { expect(earlyReads).toBe(0) }
+    finally { release(); result = await pending }
+    expect(initializeRequested).toBe(true)
+    expect(configReads).toBe(1)
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.value.runtime.state).toBe('ready')
+    expect(result.value.providers.find(value => value.providerId === 'deepinfra')?.state).toBe('connected')
+    expect(result.value.providers.find(value => value.providerId === 'kiro')?.authMethods.includes('oauth')).toBe(true)
+  })
+
   test('uses a bounded host startup budget only for read-only provider management views', async () => {
     const ensureHostCalls: Array<{
       projectPath?: string | null

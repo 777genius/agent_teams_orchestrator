@@ -4293,13 +4293,26 @@ public:
       return result;
     }
     if (operation == L"runStateRequest") {
+      const auto payload = object(input, L"payload");
+      const double wallDeadline = payload.GetNamedNumber(L"deadline");
+      require(wallDeadline > 0 && wallDeadline <= 9007199254740991.0 &&
+                  wallDeadline == static_cast<double>(static_cast<std::uint64_t>(wallDeadline)),
+              "run_control_invalid");
+      FILETIME wallTime{};
+      GetSystemTimeAsFileTime(&wallTime);
+      const std::uint64_t nowMs = filetime(wallTime) / 10000 - 11644473600000ULL;
+      require(static_cast<std::uint64_t>(wallDeadline) > nowMs, "run_deadline_expired");
+      // Queue and stdio transit already consumed the caller's original budget.
+      const std::uint64_t remaining = std::min<std::uint64_t>(
+          Control::runControlTimeoutMs(input, L"timeoutMs"),
+          static_cast<std::uint64_t>(wallDeadline) - nowMs);
+      const std::uint64_t deadline = GetTickCount64() + remaining;
       auto &state = namedState(owners, input);
       auto &control = owners.runControls[state.id()];
       if (!control)
         control = issueControl(owners, state, Control::Role::client);
       return control->clientRequest(
-          runControlCanonicalJson(object(input, L"payload")),
-          static_cast<DWORD>(input.GetNamedNumber(L"timeoutMs")));
+          runControlCanonicalJson(payload), deadline);
     }
     if (operation == L"runStateRespond") {
       auto &state = namedState(owners, input);

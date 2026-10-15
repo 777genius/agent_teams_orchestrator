@@ -390,7 +390,7 @@ struct WindowsNativeRunControl {
     return result;
   }
 
-  JsonObject close(const JsonObject &input) {
+  JsonObject close(const JsonObject &input, std::uint64_t cleanupDeadline = 0) {
     Connection *connection = nullptr;
     bool foreign = false;
     {
@@ -405,7 +405,7 @@ struct WindowsNativeRunControl {
       if (!foreign)
         connection = found->second.get();
     }
-    if (connection && !runControlRetire(*connection))
+    if (connection && !runControlRetire(*connection, cleanupDeadline))
       throw NativeError{"cleanup_unknown", ERROR_OPERATION_ABORTED, "close"};
     JsonObject result;
     flag(result, L"closed", true);
@@ -523,36 +523,53 @@ struct WindowsNativeRunControl {
     expectedEndpoint_.present = true;
   }
 
-  JsonObject clientRequest(const std::string &payloadBytes, DWORD timeout) {
+  JsonObject clientRequest(const std::string &payloadBytes, std::uint64_t deadline) {
+    const DWORD available = runControlRemaining(deadline);
+    require(available > 1, "run_deadline_expired");
+    const DWORD replyAllowance = std::min<DWORD>(100, std::max<DWORD>(1, available / 8));
+    const DWORD cleanupAllowance = std::min<DWORD>(CANCEL_DRAIN_MS, available / 4);
+    const std::uint64_t cleanupDeadline = deadline - replyAllowance;
+    const std::uint64_t ioDeadline = cleanupDeadline - cleanupAllowance;
+    const auto remaining = [&] {
+      const DWORD value = runControlRemaining(ioDeadline);
+      require(value > 0, "run_deadline_expired");
+      return value;
+    };
     prepareExpectedEndpoint();
     require(runState_ && expectedEndpoint_.present && payloadBytes.size() <= MAX_FRAME_BYTES &&
                 runControlStrictUtf8(payloadBytes),
             "run_control_frame_invalid");
     JsonObject connectInput;
     str(connectInput, L"endpoint", expected_.endpoint);
-    num(connectInput, L"timeoutMs", timeout);
+    num(connectInput, L"timeoutMs", remaining());
     const auto connected = connect(connectInput);
-    const auto id = connected.GetNamedNumber(L"id");
-    const auto mac = runControlHmacHex(runState_->challenge(), payloadBytes);
-    JsonObject frame;
-    str(frame, L"payloadBytesBase64", wide(base64(std::vector<BYTE>(payloadBytes.begin(),
-                                                                   payloadBytes.end()))));
-    str(frame, L"mac", mac);
-    const std::string frameBytes = narrow(std::wstring(frame.Stringify())) + "\n";
-    runControlWriteFrame(runControlConnectionFor(connected), frameBytes, timeout);
-    const std::string responseBytes = runControlReadFrame(runControlConnectionFor(connected), timeout);
-    const auto responseFrame = JsonObject::Parse(wide(responseBytes));
-    const auto responseMac = text(responseFrame, L"mac");
-    const auto responsePayload = runControlDecodeFrameBase64(text(responseFrame, L"payloadBytesBase64"));
-    require(responsePayload.size() <= MAX_FRAME_BYTES &&
-                responseMac == runControlHmacHex(runState_->challenge(),
-                                                 std::string(responsePayload.begin(), responsePayload.end())),
-            "run_control_foreign");
-    const auto response = JsonObject::Parse(wide(std::string(responsePayload.begin(), responsePayload.end())));
-    JsonObject result;
-    result.SetNamedValue(L"response", response);
-    close(connected);
-    return result;
+    auto &connection = runControlConnectionFor(connected);
+    try {
+      const auto mac = runControlHmacHex(runState_->challenge(), payloadBytes);
+      JsonObject frame;
+      str(frame, L"payloadBytesBase64", wide(base64(std::vector<BYTE>(payloadBytes.begin(),
+                                                                     payloadBytes.end()))));
+      str(frame, L"mac", mac);
+      const std::string frameBytes = narrow(std::wstring(frame.Stringify())) + "\n";
+      runControlWriteFrame(connection, frameBytes, remaining(), cleanupDeadline);
+      const std::string responseBytes = runControlReadFrame(connection, remaining(), cleanupDeadline);
+      const auto responseFrame = JsonObject::Parse(wide(responseBytes));
+      const auto responseMac = text(responseFrame, L"mac");
+      const auto responsePayload = runControlDecodeFrameBase64(text(responseFrame, L"payloadBytesBase64"));
+      require(responsePayload.size() <= MAX_FRAME_BYTES &&
+                  responseMac == runControlHmacHex(runState_->challenge(),
+                                                   std::string(responsePayload.begin(), responsePayload.end())),
+              "run_control_foreign");
+      const auto response = JsonObject::Parse(wide(std::string(responsePayload.begin(), responsePayload.end())));
+      JsonObject result;
+      result.SetNamedValue(L"response", response);
+      close(connected, cleanupDeadline);
+      return result;
+    } catch (...) {
+      if (!runControlRetire(connection, cleanupDeadline))
+        throw NativeError{"cleanup_unknown", ERROR_OPERATION_ABORTED, "close"};
+      throw;
+    }
   }
 
   JsonObject currentBunIdentity() const {
@@ -1417,9 +1434,12 @@ private:
     // sole authority for both success and terminal failure of the kernel I/O.
     return runControlPollOperation(operation);
   }
-  static IoResult runControlCancelAndDrain(IoOperation &operation) {
+  static IoResult runControlCancelAndDrain(IoOperation &operation,
+                                           std::uint64_t cleanupDeadline = 0) {
     CancelIoEx(operation.issuingHandle.value, &operation.overlap);
-    const std::uint64_t deadline = GetTickCount64() + CANCEL_DRAIN_MS;
+    const std::uint64_t deadline = cleanupDeadline == 0
+        ? GetTickCount64() + CANCEL_DRAIN_MS
+        : std::min<std::uint64_t>(GetTickCount64() + CANCEL_DRAIN_MS, cleanupDeadline);
     for (;;) {
       const auto result = runControlPollOperation(operation);
       if (result.completed)
@@ -1474,7 +1494,8 @@ private:
     static std::vector<std::shared_ptr<IoOperation>> abandoned;
     return abandoned;
   }
-  std::string runControlReadFrame(Connection &connection, DWORD timeout) {
+  std::string runControlReadFrame(Connection &connection, DWORD timeout,
+                                  std::uint64_t cleanupDeadline = 0) {
     const std::uint64_t deadline = GetTickCount64() + timeout;
     for (;;) {
       std::shared_ptr<IoOperation> io;
@@ -1517,7 +1538,7 @@ private:
 
       const auto waited = runControlWaitOperation(*io, runControlRemaining(deadline));
       if (!waited.completed) {
-        const auto cancelled = runControlCancelAndDrain(*io);
+        const auto cancelled = runControlCancelAndDrain(*io, cleanupDeadline);
         bool unresolved = false;
         {
           std::lock_guard<std::recursive_mutex> lock(controlMutex_);
@@ -1542,7 +1563,7 @@ private:
         }
         if (unresolved)
           throw NativeError{"cleanup_unknown", ERROR_OPERATION_ABORTED, "read"};
-        if (!runControlRetire(connection))
+        if (!runControlRetire(connection, cleanupDeadline))
           throw NativeError{"cleanup_unknown", ERROR_OPERATION_ABORTED, "read"};
         throw NativeError{"run_control_timeout", ERROR_OPERATION_ABORTED, "read"};
       }
@@ -1583,7 +1604,8 @@ private:
     }
   }
 
-  void runControlWriteFrame(Connection &connection, const std::string &bytes, DWORD timeout) {
+  void runControlWriteFrame(Connection &connection, const std::string &bytes, DWORD timeout,
+                            std::uint64_t cleanupDeadline = 0) {
     const std::uint64_t deadline = GetTickCount64() + timeout;
     size_t offset = 0;
     while (offset < bytes.size()) {
@@ -1620,7 +1642,7 @@ private:
 
       const auto waited = runControlWaitOperation(*io, runControlRemaining(deadline));
       if (!waited.completed) {
-        const auto cancelled = runControlCancelAndDrain(*io);
+        const auto cancelled = runControlCancelAndDrain(*io, cleanupDeadline);
         bool unresolved = false;
         {
           std::lock_guard<std::recursive_mutex> lock(controlMutex_);
@@ -1643,7 +1665,7 @@ private:
         }
         if (unresolved)
           throw NativeError{"cleanup_unknown", ERROR_OPERATION_ABORTED, "write"};
-        if (!runControlRetire(connection))
+        if (!runControlRetire(connection, cleanupDeadline))
           throw NativeError{"cleanup_unknown", ERROR_OPERATION_ABORTED, "write"};
         throw NativeError{"run_control_timeout", ERROR_OPERATION_ABORTED, "write"};
       }
@@ -1682,7 +1704,7 @@ private:
     }
   }
 
-  bool runControlRetire(Connection &connection) {
+  bool runControlRetire(Connection &connection, std::uint64_t cleanupDeadline = 0) {
     std::vector<std::shared_ptr<IoOperation>> pending;
     {
       std::lock_guard<std::recursive_mutex> lock(controlMutex_);
@@ -1698,7 +1720,7 @@ private:
       }
     }
     for (const auto &operation : pending) {
-      const auto cancelled = runControlCancelAndDrain(*operation);
+      const auto cancelled = runControlCancelAndDrain(*operation, cleanupDeadline);
       std::lock_guard<std::recursive_mutex> lock(controlMutex_);
       if (cancelled.completed) {
         if (!operation->complete) {

@@ -90,7 +90,7 @@ const snapshot = async (root: string): Promise<unknown[]> => {
 }
 type RouterExpectation = 'v1' | 'veto' | 'owner'
 const route = async (dataRoot: string, runId: string, expected: RouterExpectation,
-  selection: 'v1' | 'unsupported' | 'missing' = 'v1', ownerRecord?: unknown) => {
+  selection: 'v1' | 'unsupported' | 'missing' = 'v1', ownerRecord?: unknown, heldRead = false) => {
   await closeFixtureWriters()
   // A fresh CLI owns its retained discovery brokers until process exit, as in
   // production. Only selection and the V1 executor are stubbed; native discovery
@@ -105,10 +105,21 @@ const route = async (dataRoot: string, runId: string, expected: RouterExpectatio
       return {policy:{generation:selection==='v1'?'v1':'unsupported',version:selection==='v1'?'1.19.0':'2.0.1'}};
     }}));
     const root=${JSON.stringify(dataRoot)},runId=${JSON.stringify(runId)},expected=${JSON.stringify(expected)};
-    const {discoverOpenCodeV2Run}=await import(${JSON.stringify(import.meta.resolve('../../src/services/opencode/bridge/OpenCodeV2RunControl.ts'))});
+    const {discoverOpenCodeV2Run,requestOpenCodeV2Run}=await import(${JSON.stringify(import.meta.resolve('../../src/services/opencode/bridge/OpenCodeV2RunControl.ts'))});
     phase='native_discovery';
     if(expected==='v1')assert.equal(await discoverOpenCodeV2Run(root,'TEST-team',runId),null);
     if(expected==='owner')assert.deepEqual(await discoverOpenCodeV2Run(root,'TEST-team',runId),${JSON.stringify(ownerRecord ?? null)});
+    if(${JSON.stringify(heldRead)}){
+      phase='held_read';const owner=await discoverOpenCodeV2Run(root,'TEST-team',runId);
+      assert.ok(owner);const started=Date.now();
+      await assert.rejects(requestOpenCodeV2Run(owner,{operation:'status'},30000),
+        error=>error instanceof Error&&error.message==='run_control_timeout:read:995');
+      assert.ok(Date.now()-started<30000,'TEST_native_read_exceeded_original_budget');
+      phase='same_client_after_timeout';
+      const recovered=await requestOpenCodeV2Run(owner,{operation:'status'},30000);
+      assert.equal(recovered.kind,'status');assert.equal(recovered.state,'stopped');
+      console.log(JSON.stringify({expected,selection,heldReadRetired:true,sameClientRecovered:true}));process.exit(0);
+    }
     process.env.CLAUDE_MULTIMODEL_DATA_HOME=root;
     const {executeSelectedOpenCodeBridgeCommandEnvelope:execute}=await import(${JSON.stringify(import.meta.resolve('../../src/services/opencode/bridge/OpenCodeV2TeamBridge.ts'))});
     phase='bridge_execute';
@@ -571,6 +582,8 @@ try {
   const statusResponses = new Set<Promise<void>>()
   const statusFailures: unknown[] = []
   let statusRequests = 0
+  let withholdNextStatus = false
+  let heldConnection: string | undefined
   const respondToStatus = (event: unknown) => {
     const work = (async () => {
       const envelope = executionRecord(event), payload = executionRecord(envelope.payload)
@@ -578,6 +591,16 @@ try {
       assert.deepEqual(payload.binding, binding)
       assert.equal(executionRecord(payload.request).operation, 'status')
       statusRequests++
+      if (withholdNextStatus) {
+        withholdNextStatus = false
+        assert.equal(typeof envelope.connection, 'string')
+        heldConnection = String(envelope.connection)
+        return // The authenticated frame arrived; deliberately withhold only its reply.
+      }
+      if (heldConnection !== undefined) {
+        await request('runStatePoisonConnection', { stateId, directory, connection: heldConnection })
+        heldConnection = undefined
+      }
       await request('runStateRespond', { stateId, directory, connection: envelope.connection,
         timeoutMs: Math.max(1, Math.min(5000, Number(payload.deadline) - Date.now())),
         response: { nonce: payload.nonce, endpoint: payload.endpoint,
@@ -592,12 +615,19 @@ try {
     await route(discoveryRoot, binding.runId, 'owner', 'unsupported', published)
     await new Promise(resolve => setTimeout(resolve, 2500))
     await route(discoveryRoot, binding.runId, 'owner', 'missing', published)
+    withholdNextStatus = true
+    const recovered = await route(discoveryRoot, binding.runId, 'owner', 'missing', published, true)
+    assert.equal(recovered.heldReadRetired, true)
+    assert.equal(recovered.sameClientRecovered, true)
+    assert.equal(withholdNextStatus, false)
+    assert.equal(heldConnection, undefined)
+    facts.authenticatedReadTimeoutRetiresAndSameClientRecovers = true
   } finally {
     broker.events.off('runControlRequest', respondToStatus)
     await Promise.all(statusResponses)
   }
   assert.deepEqual(statusFailures, [])
-  assert.equal(statusRequests, 2)
+  assert.equal(statusRequests, 4)
   // Same physical fence with a foreign requested binding must remain UNKNOWN.
   await assert.rejects(request('runStateDiscover', { dataRoot: discoveryRoot, directory,
     teamId: 'TEST-foreign', runId: binding.runId, selectionIds }), /run_state_start_changed/)

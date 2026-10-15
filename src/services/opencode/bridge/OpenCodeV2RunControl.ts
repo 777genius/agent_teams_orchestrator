@@ -133,7 +133,8 @@ async function windowsAdmitProfiles(broker: WindowsNativeBroker, profiles: reado
   }
   return ids
 }
-async function windowsComposition(directory: string, select?: WindowsCompositionSelection): Promise<WindowsRunComposition> {
+async function windowsComposition(directory: string, select?: WindowsCompositionSelection,
+  deadline = Date.now() + MAX_OPERATION_MS): Promise<WindowsRunComposition> {
   const existing = windowsRuns.get(directory)
   if (existing) return existing
   if (!select) throw new Error('run_control_native_pending')
@@ -144,7 +145,6 @@ async function windowsComposition(directory: string, select?: WindowsComposition
     const broker = createWindowsNativeBroker(await resolveWindowsNativeArtifact())
     broker.events.on('error', () => {})
     try {
-      const deadline = Date.now() + MAX_OPERATION_MS
       const selectionIds = await windowsAdmitProfiles(broker, select.profiles, deadline,
         select.mode === 'discover' ? select.teamId : select.binding.teamId)
       const input = select.mode === 'reserve'
@@ -153,7 +153,7 @@ async function windowsComposition(directory: string, select?: WindowsComposition
           ? { directory, dataRoot: select.dataRoot, mode: select.mode, teamId: select.teamId, runId: select.runId, selectionIds }
           : { directory, dataRoot: select.dataRoot, mode: select.mode, binding: select.binding, selectionIds }
       const value = await broker.request(select.mode === 'reserve' ? 'runStateAcquire' : 'runStateSelect',
-        input, Date.now() + MAX_OPERATION_MS) as { stateId: string }
+        input, deadline) as { stateId: string }
       executionAssert(value && typeof value.stateId === 'string', 'run_control_native_unknown')
       return { broker, stateId: value.stateId }
     } catch (error) { await broker.close().catch(() => {}); throw error }
@@ -194,20 +194,20 @@ async function windowsWrite(directory: string, name: string, value: unknown): Pr
     stateId: state.stateId, directory, name, bytes: canonicalExecutionJSON(value) + '\n',
   }, Date.now() + MAX_OPERATION_MS)
 }
-async function windowsCompositionFor(record: RunWindowsControlRecord): Promise<WindowsRunComposition> {
+async function windowsCompositionFor(record: RunWindowsControlRecord,
+  deadline = Date.now() + MAX_OPERATION_MS): Promise<WindowsRunComposition> {
   const existing = windowsRuns.get(record.directory)
   if (existing) return existing
   const discoveryBroker = createWindowsNativeBroker(await resolveWindowsNativeArtifact())
   discoveryBroker.events.on('error', () => {})
   let profiles: readonly WindowsProfileAdmission[]
   try {
-    const deadline = Date.now() + MAX_OPERATION_MS
     profiles = await windowsProfileAdmissionsForDataRoot(windowsDataRoot(record.directory), discoveryBroker, deadline)
   } finally { await discoveryBroker.close() }
   return windowsComposition(record.directory, {
     mode: 'client', dataRoot: windowsDataRoot(record.directory), binding: record.binding,
     profiles,
-  })
+  }, deadline)
 }
 /** Called only after the one Windows execution plan and selected-profile
  * qualification exist. This lookup supplies comparison values; it cannot mint
@@ -598,12 +598,13 @@ export async function discoverOpenCodeV2Run(dataRoot: string, teamId: string, ru
   executionAssert(unix.directory === directory && unix.binding.teamId === teamId && unix.binding.runId === runId && unix.uid === uid, 'run_control_foreign')
   return record
 }
-async function validateEndpoint(record: RunControlRecord): Promise<void> {
+async function validateEndpoint(record: RunControlRecord, deadline = Date.now() + MAX_OPERATION_MS,
+  composition?: WindowsRunComposition): Promise<void> {
   if (process.platform === 'win32') {
-    const native = windowsRecord(record), state = await windowsCompositionFor(native)
+    const native = windowsRecord(record), state = composition ?? await windowsCompositionFor(native, deadline)
     const proof = await state.broker.request('runStateValidateEndpoint', {
       stateId: state.stateId, directory: native.directory, endpointHash: executionHash(record),
-    }, Date.now() + MAX_OPERATION_MS)
+    }, deadline)
     parseWindowsEndpointProof(proof, native)
     return
   }
@@ -650,7 +651,7 @@ function writeFrame(socket: Socket, value: unknown): void {
 }
 async function runOwnerRetired(record: RunControlRecord, deadline = Date.now() + MAX_OPERATION_MS): Promise<boolean> {
   if (process.platform === 'win32') {
-    const native = windowsRecord(record), state = await windowsCompositionFor(native)
+    const native = windowsRecord(record), state = await windowsCompositionFor(native, deadline)
     return (await state.broker.request('runStateOwnerRetired', {
       stateId: state.stateId, directory: native.directory,
     }, deadline) as { retired: boolean }).retired
@@ -676,7 +677,7 @@ async function observeRunOwnerRetired(record: RunControlRecord, deadline: number
 export async function readOpenCodeV2RunStop(record: RunControlRecord,
   deadline = Date.now() + MAX_OPERATION_MS): Promise<Extract<RunControlResult, { kind: 'stop' }> | null> {
   if (process.platform === 'win32') {
-    const native = windowsRecord(record), state = await windowsCompositionFor(native)
+    const native = windowsRecord(record), state = await windowsCompositionFor(native, deadline)
     const value = await state.broker.request('runStateReadStop', {
       stateId: state.stateId, directory: native.directory, endpointHash: executionHash(record),
     }, deadline) as { absent?: true; receipt?: unknown }
@@ -705,7 +706,8 @@ export async function readOpenCodeV2RunStop(record: RunControlRecord,
 /** Endpoint publication precedes native initialization. Observe only this authenticated
  * original owner until its original member is ready; this never submits or replaces input. */
 export function isTransientOpenCodeV2ControlRead(error: unknown): boolean {
-  return error instanceof Error && (error.message === 'run_control_timeout' || error.message === 'run_control_disconnected')
+  return error instanceof Error && (error.message === 'run_control_timeout' || error.message === 'run_control_disconnected' ||
+    error.message === 'run_control_timeout:read:995' || error.message === 'run_control_disconnected:read:109')
 }
 export async function awaitOpenCodeV2RunMemberReadiness(record: RunControlRecord,
   target: Pick<RunMemberStatus, 'memberId' | 'originalSessionId' | 'selectedModel' | 'selectedVariant' | 'pin'>,
@@ -714,7 +716,8 @@ export async function awaitOpenCodeV2RunMemberReadiness(record: RunControlRecord
   const deadline = Math.min(record.deadline, Date.now() + timeoutMs)
   while (Date.now() < deadline) {
     let status: RunControlResult
-    try { status = await requestOpenCodeV2Run(record, { operation: 'status' }, Math.min(5000, deadline - Date.now())) }
+    try { status = await requestOpenCodeV2Run(record, { operation: 'status' },
+      Math.min(process.platform === 'win32' ? MAX_OPERATION_MS : 5000, deadline - Date.now())) }
     catch (error) {
       // Authentication and framing share this budget. Expiry can close the
       // final read before a reply; expiry never authorizes input submission.
@@ -753,10 +756,13 @@ export async function requestOpenCodeV2Run(record: RunControlRecord, request: Ru
       if (archived) return archived
     }
     executionAssert(deadline > Date.now(), 'run_deadline_expired')
-    await validateEndpoint(record)
-    const state = await windowsCompositionFor(native)
+    const state = await windowsCompositionFor(native, deadline)
+    await validateEndpoint(record, deadline, state)
+    const client = parseWindowsIdentity(await state.broker.request('runStateProcessIdentity', { pid: process.pid }, deadline))
+    executionAssert(client.appContainer === false, 'run_process_appcontainer')
+    executionAssert(deadline > Date.now(), 'run_deadline_expired')
     const payload = { protocol: 1, binding: native.binding, endpoint: executionHash(record),
-      client: await readRunProcessIdentity(), nonce: randomBytes(32).toString('hex'), deadline, request }
+      client, nonce: randomBytes(32).toString('hex'), deadline, request }
     // The fresh caller identity is measured here and independently compared by
     // native pipe peer proofs. It never borrows the published server PID.
     const received = await state.broker.request('runStateRequest', {
@@ -775,7 +781,7 @@ export async function requestOpenCodeV2Run(record: RunControlRecord, request: Ru
       executionAssert(archived !== null && sameStopReceipt(stop, archived), 'run_control_invalid')
       return archived
     }
-    await validateEndpoint(record)
+    await validateEndpoint(record, deadline, state)
     return value as RunControlResult
   }
   const unix = unixRecord(record)

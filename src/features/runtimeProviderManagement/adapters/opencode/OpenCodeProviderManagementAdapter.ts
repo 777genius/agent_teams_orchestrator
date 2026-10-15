@@ -2637,7 +2637,14 @@ async function readLiveView(input: {
   client: OpenCodeProviderManagementClient
   diagnostics?: readonly string[]
   degradeOnReadFailure?: boolean
+  initializeInstance?: boolean
 }): Promise<ProviderManagementView> {
+  const configProvidersRead = safeRead(() => input.client.getConfigProviders(
+    input.initializeInstance ? { initializeInstance: true } : undefined,
+  ))
+  // A cold instance loads its configured plugins before metadata endpoints are ready.
+  // Reuse the existing bounded initialization read rather than timing out parallel reads.
+  if (input.initializeInstance) await configProvidersRead
   const serverDocRead = input.client.getServerDoc
     ? safeRead(() => input.client.getServerDoc!())
     : Promise.resolve({
@@ -2647,7 +2654,7 @@ async function readLiveView(input: {
 
   const [configProvidersResult, providersResult, providerAuthResult, serverDocResult] =
     await Promise.all([
-      safeRead(() => input.client.getConfigProviders()),
+      configProvidersRead,
       safeRead(() => input.client.getProviders()),
       safeRead(() => input.client.getProviderAuth()),
       serverDocRead,
@@ -4006,6 +4013,7 @@ export class OpenCodeProviderManagementAdapter
 
       liveView = await readLiveView({
           degradeOnReadFailure: true,
+          initializeInstance: true,
           inventory,
           host,
           client,
