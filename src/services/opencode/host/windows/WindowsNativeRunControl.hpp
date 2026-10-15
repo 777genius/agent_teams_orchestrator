@@ -280,7 +280,8 @@ struct WindowsNativeRunControl {
     return result;
   }
 
-  JsonObject accept(const JsonObject &input, bool retainIdleWait = false) {
+  JsonObject accept(const JsonObject &input, bool retainIdleWait = false, const char **phase = nullptr) {
+    if (phase) *phase = "accept_wait";
     std::unique_lock<std::recursive_mutex> lock(controlMutex_);
     require(listener_ && !shutdown_, "run_control_foreign");
     require(!listener_->poisoned && !listener_->acceptOperation, "run_control_foreign");
@@ -353,6 +354,7 @@ struct WindowsNativeRunControl {
 
     auto connection = runControlMakeConnection(std::move(accepted), Role::server, timeout);
     connection->endpoint = listener_->name;
+    if (phase) *phase = "accept_authenticate";
     runControlAuthenticate(*connection);
     const auto id = connection->id;
     registry_.emplace(id, std::move(connection));
@@ -360,6 +362,7 @@ struct WindowsNativeRunControl {
     // The accepted instance remains connected and owned by the registry. The
     // listener is independently retained and immediately offers a fresh server
     // instance; no DisconnectNamedPipe call destroys the accepted endpoint.
+    if (phase) *phase = "accept_replenish";
     listener_->pending = runControlCreateServer(listener_->name, false);
     JsonObject result;
     num(result, L"id", id);
@@ -1799,10 +1802,21 @@ inline void WindowsNativeRunControl::startRequestPump() {
     winrt::init_apartment(winrt::apartment_type::multi_threaded);
     while (!requestPumpStop_ && !shutdown_) {
       std::uint64_t activeId = 0;
+      const char *phase = "accept_wait";
+      const auto reportFailure = [&](const char *code, DWORD nativeCode) {
+        if (requestPumpStop_ || shutdown_) return;
+        try {
+          JsonObject failure;
+          str(failure, L"phase", wide(phase));
+          str(failure, L"code", wide(code));
+          num(failure, L"nativeCode", nativeCode);
+          event(L"runControlFailure", failure);
+        } catch (...) { /* Diagnostics cannot change retirement or authority. */ }
+      };
       try {
         JsonObject acceptedInput;
         num(acceptedInput, L"timeoutMs", 1000);
-        const auto accepted = accept(acceptedInput, true);
+        const auto accepted = accept(acceptedInput, true, &phase);
         const auto number = accepted.GetNamedNumber(L"id");
         const auto id = static_cast<std::uint64_t>(number);
         activeId = id;
@@ -1810,7 +1824,9 @@ inline void WindowsNativeRunControl::startRequestPump() {
         JsonObject readInput;
         num(readInput, L"id", id);
         num(readInput, L"timeoutMs", 30000);
+        phase = "read_frame";
         const std::string frameBytes = runControlReadFrame(connection, 30000);
+        phase = "verify_frame";
         const auto frame = JsonObject::Parse(wide(frameBytes));
         const auto mac = text(frame, L"mac");
         const auto signedBytes = runControlDecodeFrameBase64(text(frame, L"payloadBytesBase64"));
@@ -1819,12 +1835,16 @@ inline void WindowsNativeRunControl::startRequestPump() {
         require(mac == runControlHmacHex(runState_->challenge(), payloadBytes),
                 "run_control_foreign");
         const auto payload = JsonObject::Parse(wide(payloadBytes));
+        phase = "validate_payload";
         validateRequestPayload(id, payload);
         JsonObject envelope;
         str(envelope, L"connection", decimal(id));
         envelope.SetNamedValue(L"payload", payload);
+        phase = "publish_request";
         event(L"runControlRequest", envelope);
       } catch (const NativeError &failure) {
+        if (std::strcmp(failure.code.c_str(), "run_control_accept_timeout") != 0)
+          reportFailure(failure.code.c_str(), failure.win32);
         if (activeId != 0) {
           JsonObject poison;
           num(poison, L"id", activeId);
@@ -1835,6 +1855,7 @@ inline void WindowsNativeRunControl::startRequestPump() {
         if (std::strcmp(failure.code.c_str(), "run_control_accept_timeout") != 0)
           break;
       } catch (...) {
+        reportFailure("run_control_pump_unknown", 0);
         if (activeId != 0) {
           JsonObject poison;
           num(poison, L"id", activeId);

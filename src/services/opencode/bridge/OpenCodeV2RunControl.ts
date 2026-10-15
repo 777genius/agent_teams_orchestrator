@@ -843,12 +843,42 @@ async function serveWindowsRunControl(directory: string, binding: RunBinding, de
   const state = await windowsComposition(directory, {
     mode: 'serve', dataRoot: windowsDataRoot(directory), binding, profiles: admittedProfiles,
   })
-  const listened = await state.broker.request('runStateListen', {
-    stateId: state.stateId, directory, binding, deadline, sourceSha256,
-  }, Date.now() + MAX_OPERATION_MS) as { record: unknown }
-  const record = parseRecord(listened.record)
+  // Capture the first terminal pump failure even when it precedes the listen ACK.
+  // This is diagnostic only: no retry, request result, or authority changes.
+  let pumpFailureRecorded = false
+  const onPumpFailure = (event: unknown) => {
+    if (pumpFailureRecorded) return
+    if (!event || typeof event !== 'object' || Array.isArray(event)) return
+    const value = event as Record<string, unknown>
+    const codes: readonly unknown[] = ['cleanup_unknown', 'run_control_accept_timeout', 'run_control_accept_unknown', 'run_control_connect_unknown', 'run_control_connection_limit', 'run_control_disconnected', 'run_control_endpoint_changed', 'run_control_foreign', 'run_control_frame_invalid', 'run_control_frame_oversize', 'run_control_held_identity', 'run_control_held_inputs', 'run_control_hmac_unknown', 'run_control_image_changed', 'run_control_image_hash', 'run_control_listen_unknown', 'run_control_owner_identity', 'run_control_package_peer_identity', 'run_control_parent_birth', 'run_control_parent_join', 'run_control_path_alias', 'run_control_peer_identity', 'run_control_pipe_name', 'run_control_pipe_security', 'run_control_process_identity', 'run_control_pump_unknown', 'run_control_read_unknown', 'run_control_timeout', 'run_control_write_partial', 'run_control_write_unknown', 'run_process_changed', 'run_state_acl_unknown', 'run_state_challenge_changed', 'run_state_challenge_unknown', 'run_state_endpoint_changed', 'run_state_endpoint_missing', 'run_state_held_inputs', 'run_state_identity_changed', 'run_state_record_absent', 'run_state_record_changed', 'run_state_record_collision', 'run_state_record_encoding', 'run_state_record_name', 'run_state_record_read', 'run_state_record_rename', 'run_state_record_size', 'run_state_record_temporary', 'run_state_record_unknown', 'run_state_record_write', 'run_state_start_changed', 'run_state_unknown']
+    const phases = ['accept_wait', 'accept_authenticate', 'accept_replenish', 'read_frame',
+      'verify_frame', 'validate_payload', 'publish_request']
+    if (typeof value.phase !== 'string' || !phases.includes(value.phase) ||
+      !codes.includes(value.code) || !Number.isSafeInteger(value.nativeCode) ||
+      Number(value.nativeCode) < 0 || Number(value.nativeCode) > 0xffffffff) return
+    pumpFailureRecorded = true
+    void writeRunControlFile(directory, 'operation-failure.json', {
+      schemaVersion: 1, event: 'opencode_v2_run_control_failure', binding,
+      category: 'run_control_pump_failed',
+      controlPhase: value.phase, controlCode: value.code, nativeCode: value.nativeCode,
+      timestamp: new Date().toISOString(),
+    }).catch(() => {})
+  }
+  state.broker.events.on('runControlFailure', onPumpFailure)
+  const record = await (async () => {
+    try {
+      const listened = await state.broker.request('runStateListen', {
+        stateId: state.stateId, directory, binding, deadline, sourceSha256,
+      }, Date.now() + MAX_OPERATION_MS) as { record: unknown }
+      const record = parseRecord(listened.record), native = windowsRecord(record)
+      executionAssert(executionHash(native.binding) === executionHash(binding) && native.directory === directory, 'run_control_foreign')
+      return record
+    } catch (error) {
+      state.broker.events.off('runControlFailure', onPumpFailure)
+      throw error
+    }
+  })()
   const native = windowsRecord(record), usedNonces = new OpenCodeV2RunNonces()
-  executionAssert(executionHash(native.binding) === executionHash(binding) && native.directory === directory, 'run_control_foreign')
   // Native serving ACK plus parseRecord validation publishes the only retained
   // record/profile comparison state used by later member preflight.
   state.serving = Object.freeze({
@@ -905,6 +935,7 @@ async function serveWindowsRunControl(directory: string, binding: RunBinding, de
   let closing: Promise<void> | undefined
   const close = () => closing ??= (async () => {
     state.broker.events.off('runControlRequest', onRequest)
+    state.broker.events.off('runControlFailure', onPumpFailure)
     try { await Promise.allSettled(active) }
     finally {
       let refusal: unknown
