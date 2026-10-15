@@ -491,14 +491,14 @@ describe('OpenCodeV2 Windows probe owner adapter', () => {
       }
       throw new Error('TEST-unexpected-native-request')
     }
-    await expect(native({ op: 'ownerOpenDirectory', path: ambientParent, createExclusive: false }))
+    await expect(native({ op: 'ownerPreparePrivateDirectory', path: ambientParent, createExclusive: false }))
       .rejects.toThrow('execution_owner_private_acl_refused')
     expect(ambientPrivateOpenRefusals).toBe(1)
 
     const broker = {
       events: new EventEmitter(),
       request: async (_op: string, request: WindowsOwnerNativeRequest) => {
-        if (request.op === 'ownerOpenDirectory' && request.path === ambientParent) ambientBrokerRequests++
+        if (request.op === 'ownerPreparePrivateDirectory' && request.path === ambientParent) ambientBrokerRequests++
         return native(request)
       },
       close: async () => { brokerCloseCalls++ },
