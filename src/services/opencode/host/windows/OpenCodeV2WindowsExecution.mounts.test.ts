@@ -10,7 +10,7 @@ import { closeWindowsExecutionPlan, planWindowsExecution } from './OpenCodeV2Win
 
 // Isolated plan-boundary test only. Native HANDLE/ACL/containment qualification
 // belongs to Windows CI; these spies cannot supply production launch authority.
-test('Windows plan admits canonical identity mounts and retains genuine alias refusal', async () => {
+test('Windows plan validates identity resolution mounts without granting unselected ancestor contents', async () => {
   if (process.env.TEST_WINDOWS_IDENTITY_MOUNTS_ISOLATED !== '1') {
     const child = Bun.spawn([process.execPath, 'test', import.meta.path], {
       env: { ...process.env, TEST_WINDOWS_IDENTITY_MOUNTS_ISOLATED: '1' }, stdout: 'pipe', stderr: 'pipe',
@@ -47,15 +47,17 @@ test('Windows plan admits canonical identity mounts and retains genuine alias re
     Object.defineProperty(process, 'platform', { ...platform, value: 'win32' })
     Object.defineProperty(process, 'arch', { ...arch, value: 'x64' })
     Object.defineProperty(process.versions, 'bun', { ...bunVersion, value: '1.4.3' })
+    const selectedPackage = 'C:\\TEST\\node_modules\\.pnpm\\selected\\node_modules\\selected'
     const input = { bun: { path: 'C:\\TEST\\bun.exe', sha256 }, entry: 'C:\\TEST\\source\\entry.ts',
-      cwd: 'C:\\TEST\\project', writableRoots: ['C:\\TEST\\profile'], readOnlyRoots: ['C:\\TEST\\source'],
+      cwd: 'C:\\TEST\\project', writableRoots: ['C:\\TEST\\profile'], readOnlyRoots: ['C:\\TEST\\source', selectedPackage],
       profileDirectories: ['C:\\TEST\\profile'], env: {},
-      readOnlyMounts: [{ source: 'C:\\TEST\\dependencies', target: 'C:\\TEST\\dependencies' }] }
+      readOnlyMounts: [{ source: 'C:\\TEST\\node_modules', target: 'C:\\TEST\\node_modules' }] }
     const plan = await planWindowsExecution(input)
     try {
-      expect(plan.readOnlyRoots).toEqual(['C:\\TEST\\source', 'C:\\TEST\\dependencies'])
-      expect(observed).toContain('C:\\TEST\\dependencies')
-      expect(input.readOnlyRoots).toEqual(['C:\\TEST\\source'])
+      expect(plan.readOnlyRoots).toEqual(['C:\\TEST\\source', selectedPackage])
+      expect(observed).toContain('C:\\TEST\\node_modules')
+      expect(observed).toContain(selectedPackage)
+      expect(input.readOnlyRoots).toEqual(['C:\\TEST\\source', selectedPackage])
       expect(Object.isFrozen(plan.readOnlyRoots)).toBe(true)
     } finally { await closeWindowsExecutionPlan(plan) }
     expect(closed).toBe(1)

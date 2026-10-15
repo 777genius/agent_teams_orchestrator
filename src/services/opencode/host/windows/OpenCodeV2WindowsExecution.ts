@@ -244,14 +244,17 @@ export async function planWindowsExecution(requested: Readonly<{
   assert(await realpath(input.bun.path) === input.bun.path && await hash(input.bun.path) === input.bun.sha256, 'execution_identity_mismatch')
   assert(input.profileDirectories && input.profileDirectories.length > 0, 'execution_profile_changed')
   assert((input.readOnlyMounts ?? []).every(mount => mount.source === mount.target), 'execution_containment_path_alias_pending')
-  // An identity mount is an ordinary read grant, not a filesystem alias.
-  // Preserve its root in the canonical checks, compacted grants and anchors.
-  const readOnlyRoots = [...new Set([...input.readOnlyRoots, ...(input.readOnlyMounts ?? []).map(mount => mount.source)])]
-  const rawRoots = [...new Set([...input.writableRoots, ...readOnlyRoots, ...input.profileDirectories, input.cwd])]
+  // Source and canonical graph-file directories supply content grants. Identity
+  // resolver mounts still require canonical validation; promoting an ancestor
+  // node_modules here would recursively grant every unselected sibling package.
+  // Native graph anchors provide target-only metadata access to their ancestors.
+  const readOnlyRoots = [...new Set(input.readOnlyRoots)]
+  const resolutionRoots = new Set((input.readOnlyMounts ?? []).map(mount => mount.source))
+  const rawRoots = [...new Set([...input.writableRoots, ...readOnlyRoots, ...resolutionRoots, ...input.profileDirectories, input.cwd])]
   for (const root of rawRoots) assert(path.isAbsolute(root) && /^[A-Za-z]:\\/.test(root) && !root.includes('/') && path.parse(root).root !== root, 'execution_path_alias')
   const deferredControllers = deferredWindowsControllerRoots(input)
   for (const root of rawRoots) {
-    if (!deferredControllers.has(root) || readOnlyRoots.includes(root) ||
+    if (!deferredControllers.has(root) || readOnlyRoots.includes(root) || resolutionRoots.has(root) ||
       input.profileDirectories.includes(root) || root === input.cwd)
       assert(await realpath(root) === root, 'execution_path_alias')
   }
