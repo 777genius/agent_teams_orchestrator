@@ -130,7 +130,11 @@ const privateNativeFailureStages = new Set([
   'private_image_protected_dacl', 'private_owner_acquire', 'private_owner_cohort',
   'private_owner_controller_tasks', 'private_owner_controller_teams', 'private_owner_discover_selection',
   'private_owner_reserve_selection', 'private_owner_selected_selection',
-  'private_readonly_root', 'private_writable_root', 'private_protected_root'])
+  'private_readonly_root', 'private_writable_root', 'private_protected_root',
+  'shared_readonly_security', 'shared_readonly_acl', 'shared_readonly_owner', 'shared_readonly_file',
+  'shared_readonly_control', 'shared_readonly_ace', 'shared_readonly_package', 'shared_readonly_foreign_write',
+  'shared_readonly_grant_open', 'shared_readonly_grant_read', 'shared_readonly_grant_merge', 'shared_readonly_grant_write',
+  'shared_readonly_owner_changed', 'shared_readonly_control_changed', 'shared_readonly_foreign_changed', 'shared_readonly_member_missing'])
 function nativeFailure(error: unknown): { category: string; native?: { stage: string; nativeCode: number } } | undefined {
   if (!(error instanceof Error)) return undefined
   if (privateNativeFailureCodes.has(error.message)) return { category: error.message }

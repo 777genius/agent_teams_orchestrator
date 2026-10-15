@@ -13,7 +13,7 @@ import { PassThrough } from 'node:stream';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { assertBackfillEnvelope, assertImportedLedger, buildWindowsTeardownCommand, createBackfillFixture, finishSmokeCleanup, fixtureScriptPaths, runSmokeGroups, sandboxEnvironment, stageRuntimeDelivery, teardownOwnedProcesses, trustedSearchPath, windowsNodeScriptPattern } from './windows-runtime-opencode-backfill.mjs';
 
-import { actualProviderResult, catalogGuard, assertReadinessHost, runProviderSmoke, runRecordedCheck } from './windows-runtime-opencode-provider-json.mjs';
+import { actualProviderResult, actualProviderTransport, catalogGuard, assertReadinessHost, runProviderSmoke, runRecordedCheck } from './windows-runtime-opencode-provider-json.mjs';
 import { environmentSummary, traceSpawn } from './windows-process-identity-probe.mjs';
 
 const repository = fileURLToPath(new URL('../../', import.meta.url));
@@ -28,7 +28,7 @@ test('actual provider comparison rejects static fallback and requires the select
   const view = { runtimeId: 'opencode', view: { runtime: { cliPath: binary, version: '1.18.31' },
     providers: [{ providerId: 'deepinfra', state: 'connected' }], diagnostics: [] } };
   const models = { runtimeId: 'opencode', models: { providerId: 'deepinfra', catalogState: 'fresh',
-    models: [{ providerId: 'deepinfra', modelId: 'TEST-local-catalog-model' }], diagnostics: [] } };
+    models: [{ providerId: 'deepinfra', modelId: 'deepinfra/TEST-local-catalog-model' }], diagnostics: [] } };
   assert.equal(actualProviderResult(view, 'view', binary).passed, true);
   assert.equal(actualProviderResult(models, 'models', binary).passed, true);
   assert.equal(actualProviderResult(models, 'models', binary, 1).passed, false);
@@ -50,6 +50,10 @@ test('actual provider comparison rejects static fallback and requires the select
   assert.equal(refused.identityUnavailable, true);
   assert.equal(refused.passed, false);
   assert.ok(!JSON.stringify(refused).includes('TEST-secret'));
+  assert.deepEqual(actualProviderTransport({ code: 'ETIMEDOUT', killed: true, message: 'TEST-secret' }),
+    { transport: 'ETIMEDOUT', killed: true });
+  assert.deepEqual(actualProviderTransport({ code: 'TEST-secret', stderr: 'TEST-secret' }),
+    { transport: 'other', killed: false });
 });
 
 test('catalog guard permits only exact read-only catalog/auth routes and rejects inference', () => {

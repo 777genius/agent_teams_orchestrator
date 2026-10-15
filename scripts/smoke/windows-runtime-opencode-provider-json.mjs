@@ -18,13 +18,25 @@ export function actualProviderResult(payload, operation, binaryPath, exitCode = 
   const pending = Array.isArray(diagnostics) && diagnostics.some(value => typeof value === 'string' && value.includes('capabilities_pending'));
   const identityUnavailable = typeof payload?.error?.message === 'string' && /Selected OpenCode identity (?:is )?unavailable/.test(payload.error.message);
   const view = payload?.view, models = payload?.models;
+  const qualifiedModelPresent = Array.isArray(models?.models) && models.models.some(value =>
+    value?.providerId === actualProvider && value.modelId === `${actualProvider}/${actualModel}`);
   const passed = exitCode === 0 && payload?.runtimeId === 'opencode' && !payload.error && !pending && (operation === 'view'
     ? view?.runtime?.cliPath === binaryPath && view.runtime.version === '1.18.31' &&
       view.providers?.some(value => value.providerId === actualProvider && value.state === 'connected')
     : models?.providerId === actualProvider && models.catalogState === 'fresh' &&
-      models.models?.some(value => value.providerId === actualProvider && value.modelId === actualModel));
+      qualifiedModelPresent);
   return { passed: passed === true, capabilitiesPending: pending, identityUnavailable,
+    runtimeIdPresent: payload?.runtimeId === 'opencode', viewPresent: !!view && typeof view === 'object',
+    runtimeDetected: typeof view?.runtime?.cliPath === 'string', cliBinaryMatched: view?.runtime?.cliPath === binaryPath,
+    versionMatched: view?.runtime?.version === '1.18.31',
+    providerMatched: operation === 'view' ? Array.isArray(view?.providers) && view.providers.some(value => value?.providerId === actualProvider && value.state === 'connected') : models?.providerId === actualProvider,
+    qualifiedModelPresent,
     errorCode: ['runtime-unhealthy', 'runtime-missing', 'provider-missing'].find(code => code === payload?.error?.code) ?? null };
+}
+
+export function actualProviderTransport(error) {
+  return { transport: ['ETIMEDOUT', 'ENOENT', 'EACCES', 'EPERM', 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER']
+    .find(code => code === error?.code) ?? (error ? 'other' : 'completed'), killed: error?.killed === true };
 }
 
 export function catalogGuard(request, response, observations) {
@@ -84,15 +96,18 @@ export async function runActualProviderComparison(baseline, candidate, binaryPat
         for (const operation of ['view', 'models']) {
           const argv = ['runtime', 'providers', operation, '--runtime', 'opencode', '--json', '--project-path', project,
             ...(operation === 'view' ? ['--compact'] : ['--provider', actualProvider])];
-          let payload, exitCode = 0;
-          try { const result = await execute(runtime, argv, { cwd: project, env, timeout: 45000, windowsHide: true, maxBuffer: 10 * 1024 * 1024 });
+          let payload, exitCode = 0, transport = actualProviderTransport(null);
+          // Public settings/models budgets are 75s/60s; allow their existing
+          // finalizers 15s before the TEST transport observation expires.
+          try { const result = await execute(runtime, argv, { cwd: project, env, timeout: operation === 'view' ? 90000 : 75000, windowsHide: true, maxBuffer: 10 * 1024 * 1024 });
             payload = JSON.parse(result.stdout.trim()); } catch (error) {
+            transport = actualProviderTransport(error);
             exitCode = Number.isInteger(error.code) ? error.code : null;
             // Public provider errors intentionally exit1 with a JSON envelope.
             // Project its fixed classification, never retain raw output/body.
             try { payload = JSON.parse(error.stdout.trim()); } catch { /* Invalid output remains unavailable. */ }
           }
-          run.checks.push({ operation, exitCode, ...actualProviderResult(payload, operation, binaryPath, exitCode) }); flush();
+          run.checks.push({ operation, exitCode, ...transport, ...actualProviderResult(payload, operation, binaryPath, exitCode) }); flush();
         }
       } catch { run.setupFailed = true; }
       finally {

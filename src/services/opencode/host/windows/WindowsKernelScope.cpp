@@ -3172,37 +3172,38 @@ static SharedReadAclCustody sharedReadAclCustody(HANDLE file, const std::wstring
   PSECURITY_DESCRIPTOR descriptor = nullptr;
   require(GetSecurityInfo(file, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
                           &owner, nullptr, &acl, nullptr, &descriptor) == ERROR_SUCCESS,
-          code);
+          code, "shared_readonly_security");
   LocalMemory memory{descriptor};
-  require(acl && IsValidAcl(acl) && owner && trustedSharedMutator(owner, current), code);
+  require(acl && IsValidAcl(acl) && owner, code, "shared_readonly_acl");
+  require(trustedSharedMutator(owner, current), code, "shared_readonly_owner");
   FILE_STANDARD_INFO standard{};
   require(GetFileInformationByHandleEx(file, FileStandardInfo, &standard, sizeof(standard)) &&
-              standard.Directory && standard.NumberOfLinks == 1, code);
+              standard.Directory && standard.NumberOfLinks == 1, code, "shared_readonly_file");
   LPWSTR ownerText = nullptr;
-  require(ConvertSidToStringSidW(owner, &ownerText), code);
+  require(ConvertSidToStringSidW(owner, &ownerText), code, "shared_readonly_owner");
   LocalMemory ownerMemory{ownerText};
   SharedReadAclCustody result;
   result.ownerSid = ownerText;
   SECURITY_DESCRIPTOR_CONTROL control = 0;
   DWORD revision = 0;
-  require(GetSecurityDescriptorControl(descriptor, &control, &revision), code);
+  require(GetSecurityDescriptorControl(descriptor, &control, &revision), code, "shared_readonly_control");
   result.daclControl = static_cast<SECURITY_DESCRIPTOR_CONTROL>(control &
       (SE_DACL_PRESENT | SE_DACL_DEFAULTED | SE_DACL_PROTECTED | SE_DACL_AUTO_INHERITED | SE_DACL_AUTO_INHERIT_REQ));
   constexpr DWORD readAccess = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
   constexpr DWORD readable = readAccess | GENERIC_READ | GENERIC_EXECUTE;
   for (DWORD index = 0; index < acl->AceCount; ++index) {
     void *raw = nullptr;
-    require(GetAce(acl, index, &raw), code);
+    require(GetAce(acl, index, &raw), code, "shared_readonly_ace");
     const auto *header = static_cast<const ACE_HEADER *>(raw);
     require((header->AceType == ACCESS_ALLOWED_ACE_TYPE || header->AceType == ACCESS_DENIED_ACE_TYPE) &&
-                header->AceSize >= sizeof(ACCESS_ALLOWED_ACE), code);
+                header->AceSize >= sizeof(ACCESS_ALLOWED_ACE), code, "shared_readonly_ace");
     const auto *ace = static_cast<const ACCESS_ALLOWED_ACE *>(raw);
     PSID trustee = const_cast<DWORD *>(&ace->SidStart);
-    require(IsValidSid(trustee) && offsetof(ACCESS_ALLOWED_ACE, SidStart) + GetLengthSid(trustee) <= header->AceSize, code);
+    require(IsValidSid(trustee) && offsetof(ACCESS_ALLOWED_ACE, SidStart) + GetLengthSid(trustee) <= header->AceSize, code, "shared_readonly_ace");
     if (EqualSid(trustee, package)) {
       require(header->AceType == ACCESS_ALLOWED_ACE_TYPE && !result.memberAllowed &&
                   ace->Mask == readAccess &&
-                  !(header->AceFlags & ~(OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE | INHERITED_ACE)), code);
+                  !(header->AceFlags & ~(OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE | INHERITED_ACE)), code, "shared_readonly_package");
       result.memberAllowed = true;
     } else {
       if (header->AceType == ACCESS_ALLOWED_ACE_TYPE) {
@@ -3212,7 +3213,7 @@ static SharedReadAclCustody sharedReadAclCustody(HANDLE file, const std::wstring
             (header->AceFlags & INHERIT_ONLY_ACE) &&
             (header->AceFlags & (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE)) &&
             !(header->AceFlags & ~(OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE | INHERIT_ONLY_ACE | INHERITED_ACE));
-        require(!(ace->Mask & ~readable) || creatorTemplate || trustedSharedMutator(trustee, current), code);
+        require(!(ace->Mask & ~readable) || creatorTemplate || trustedSharedMutator(trustee, current), code, "shared_readonly_foreign_write");
       }
       result.foreignAces.emplace_back(static_cast<const char *>(raw), header->AceSize);
     }
@@ -3243,7 +3244,14 @@ static void grantRoot(Scope &scope, Handle heldRoot, DWORD mask, ACCESS_MODE mod
   // Any retained root may be shared with another native-held scope. Serialize
   // its short DACL transaction even when it is not a sealed controller root.
   SharedAclMutex aclMutex(physicalIdentity);
-  auto handle = scopeAclDirectory(anchor);
+  auto handle = [&]() {
+    try { return scopeAclDirectory(anchor); }
+    catch (const NativeError &error) {
+      if (sharedRoot && !error.stage)
+        throw NativeError{error.code, error.win32, "shared_readonly_grant_open", error.nativeStatus};
+      throw;
+    }
+  }();
   require(anchorIdentity(handle.value).Stringify() == anchor.identity.Stringify(),
           "execution_containment_filesystem_denied");
   require(grantObjectIdentity(handle.value, owner, sharedRoot).Stringify() ==
@@ -3265,7 +3273,7 @@ static void grantRoot(Scope &scope, Handle heldRoot, DWORD mask, ACCESS_MODE mod
   PSECURITY_DESCRIPTOR descriptor = nullptr;
   require(GetSecurityInfo(handle.value, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr,
                           &previous, nullptr, &descriptor) == ERROR_SUCCESS,
-          "execution_containment_filesystem_denied");
+          "execution_containment_filesystem_denied", sharedRoot ? "shared_readonly_grant_read" : nullptr);
   LocalMemory original{descriptor};
   EXPLICIT_ACCESSW entry{};
   entry.grfAccessPermissions = mask;
@@ -3274,7 +3282,7 @@ static void grantRoot(Scope &scope, Handle heldRoot, DWORD mask, ACCESS_MODE mod
   BuildTrusteeWithSidW(&entry.Trustee, scope.sid.value);
   PACL next = nullptr;
   require(SetEntriesInAclW(1, &entry, previous, &next) == ERROR_SUCCESS,
-          "execution_containment_filesystem_denied");
+          "execution_containment_filesystem_denied", sharedRoot ? "shared_readonly_grant_merge" : nullptr);
   LocalMemory nextMemory{next};
   const HANDLE heldAcl = handle.value;
   scope.aclRoots.emplace_back(std::move(handle), sharedRoot, privateGrant);
@@ -3284,7 +3292,7 @@ static void grantRoot(Scope &scope, Handle heldRoot, DWORD mask, ACCESS_MODE mod
   }
   require(SetSecurityInfo(heldAcl, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr,
                           next, nullptr) == ERROR_SUCCESS,
-          "execution_containment_filesystem_denied");
+          "execution_containment_filesystem_denied", sharedRoot ? "shared_readonly_grant_write" : nullptr);
   scope.aclRoots.back().assertLive();
   require(anchorIdentity(heldAcl).Stringify() == scope.aclRoots.back().identity.Stringify(),
           "execution_containment_filesystem_denied");
@@ -3293,9 +3301,14 @@ static void grantRoot(Scope &scope, Handle heldRoot, DWORD mask, ACCESS_MODE mod
           "execution_containment_filesystem_denied");
   if (sharedRoot) {
     const auto after = sharedReadAclCustody(heldAcl, owner, scope.sid.value, "execution_containment_filesystem_denied");
-    require(after.ownerSid == sharedBefore.ownerSid && after.daclControl == sharedBefore.daclControl &&
-                after.foreignAces == sharedBefore.foreignAces && after.memberAllowed,
-            "execution_containment_filesystem_denied");
+    require(after.ownerSid == sharedBefore.ownerSid,
+            "execution_containment_filesystem_denied", "shared_readonly_owner_changed");
+    require(after.daclControl == sharedBefore.daclControl,
+            "execution_containment_filesystem_denied", "shared_readonly_control_changed");
+    require(after.foreignAces == sharedBefore.foreignAces,
+            "execution_containment_filesystem_denied", "shared_readonly_foreign_changed");
+    require(after.memberAllowed,
+            "execution_containment_filesystem_denied", "shared_readonly_member_missing");
   } else {
     const auto after = aclCustody(heldAcl, owner, scope.sid.value, cohortSidsPtr, "execution_containment_filesystem_denied");
     require(after.siblings == before.siblings, "execution_containment_filesystem_denied");
