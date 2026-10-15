@@ -107,8 +107,12 @@ function realpathAnchorReceipt(value: unknown, plan: WindowsLaunchPlan, nonce: s
 function realpathDllReceipt(value: unknown, plan: WindowsLaunchPlan, nonce: string, actual: WindowsExecutionIdentity, supervisor: WindowsExecutionIdentity): WindowsRealpathDllReceipt {
   const input = row(value)
   requireWindowsRealpathArtifact(plan.realpathDll)
+  const tmp = plan.env.TMP
+  assert(typeof tmp === 'string' && path.win32.isAbsolute(tmp), 'execution_identity_mismatch')
   assert(input.held === true && input.nonce === nonce && input.receiptId === `windows-dll:${supervisor.nativePID}:${actual.nativePID}:${actual.birth.value}` &&
-    input.path === plan.realpathDll.path && input.sha256 === plan.realpathDll.sha256, 'execution_identity_mismatch')
+    input.sourcePath === plan.realpathDll.path &&
+    input.path === path.win32.join(tmp, `native-realpath-${nonce}`, 'opencode-v2-windows-realpath.dll') &&
+    input.sha256 === plan.realpathDll.sha256, 'execution_identity_mismatch')
   assert(typeof input.volumeSerial === 'string' && /^(?:0|[1-9]\d{0,19})$/.test(input.volumeSerial) && BigInt(input.volumeSerial) <= 0xffffffffffffffffn &&
     typeof input.fileId === 'string' && /^[a-f0-9]{32}$/.test(input.fileId) && typeof input.ownerSid === 'string' && /^S-1-5-/.test(input.ownerSid), 'execution_identity_mismatch')
   return Object.freeze({ receiptId: String(input.receiptId), nonce, path: input.path as string, sha256: input.sha256 as string,

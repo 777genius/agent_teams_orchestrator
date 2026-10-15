@@ -552,43 +552,122 @@ public:
   SharedAclMutex(const SharedAclMutex &) = delete;
   SharedAclMutex &operator=(const SharedAclMutex &) = delete;
 };
+using NtCreateFileFunction = NTSTATUS(NTAPI *)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES,
+                                               PIO_STATUS_BLOCK, PLARGE_INTEGER, ULONG, ULONG,
+                                               ULONG, ULONG, PVOID, ULONG);
+static bool trustedSharedMutator(PSID sid, const std::wstring &current);
 struct RetainedRealpathDll {
-  Handle file;
+  Handle file, source;
+  std::wstring sourcePath, sourceOwner;
+  JsonObject sourceIdentity;
   std::vector<RetainedAnchorComponent> parents;
   std::wstring path, owner, sha256;
   JsonObject identity;
   PSID package = nullptr; // Scope's SID outlives this capability.
   std::vector<std::wstring> cohortSids;
   bool granted = false;
+  static void protectedDllObject(HANDLE value) {
+    PSECURITY_DESCRIPTOR raw = nullptr;
+    require(GetSecurityInfo(value, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                            nullptr, nullptr, nullptr, nullptr, &raw) == ERROR_SUCCESS,
+            "execution_containment_dll_identity");
+    LocalMemory descriptor{raw};
+    SECURITY_DESCRIPTOR_CONTROL control = 0;
+    DWORD revision = 0;
+    require(GetSecurityDescriptorControl(raw, &control, &revision) &&
+                (control & SE_DACL_PROTECTED), "execution_containment_dll_identity");
+  }
   RetainedRealpathDll(const JsonObject &selection, PSID selectedPackage,
+                      const std::wstring &privateDirectory,
                       const std::vector<std::wstring> *selectedCohortSids = nullptr)
-      : path(text(selection, L"path")), owner(currentSid()),
+      : sourcePath(text(selection, L"path")),
+        path(privateDirectory + L"\\opencode-v2-windows-realpath.dll"), owner(currentSid()),
         sha256(text(selection, L"sha256")), package(selectedPackage),
         cohortSids(selectedCohortSids ? *selectedCohortSids
                                       : std::vector<std::wstring>()) {
     require(sha256.size() == 64 &&
                 sha256.find_first_not_of(L"0123456789abcdef") == std::wstring::npos,
             "execution_containment_dll_identity");
-    for (auto &parent : ancestors(path))
-      parents.emplace_back(std::move(parent));
+    // The installer/compiler's DLL may have an administrator owner. Keep its
+    // immutable producer bytes separate from the private execution image.
+    for (auto &parent : ancestors(sourcePath)) parents.emplace_back(std::move(parent));
+    source = Handle(CreateFileW(extended(sourcePath).c_str(), GENERIC_READ | READ_CONTROL,
+                                FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+    require(source && equalPath(finalPath(source.value), extended(sourcePath)),
+            "execution_containment_dll_identity");
+    PSID sourceOwnerSid = nullptr;
+    PSECURITY_DESCRIPTOR sourceDescriptor = nullptr;
+    require(GetSecurityInfo(source.value, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
+                            &sourceOwnerSid, nullptr, nullptr, nullptr, &sourceDescriptor) == ERROR_SUCCESS,
+            "execution_containment_dll_identity");
+    LocalMemory sourceSecurity{sourceDescriptor};
+    require(sourceOwnerSid && trustedSharedMutator(sourceOwnerSid, owner),
+            "execution_containment_dll_identity");
+    LPWSTR sourceOwnerText = nullptr;
+    require(ConvertSidToStringSidW(sourceOwnerSid, &sourceOwnerText),
+            "execution_containment_dll_identity");
+    LocalMemory sourceOwnerMemory{sourceOwnerText};
+    sourceOwner = sourceOwnerText;
+    sourceIdentity = fileObjectIdentity(source.value, sourceOwner, false);
+    require(heldFileSha256(source.value) == sha256, "execution_containment_dll_identity");
+    for (auto &parent : ancestors(privateDirectory)) parents.emplace_back(std::move(parent));
+    parents.emplace_back(canonicalDirectory(privateDirectory));
+    const auto directoryIdentity = fileIdentity(parents.back().handle.value, owner, true, package);
+    (void)directoryIdentity;
+    protectedDllObject(parents.back().handle.value);
+    auto create = reinterpret_cast<NtCreateFileFunction>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtCreateFile"));
+    require(create != nullptr, "execution_containment_dll_identity");
+    LocalMemory descriptor;
+    const std::wstring sddl = L"O:" + owner + L"D:P(A;;FA;;;SY)(A;;FA;;;" + owner + L")";
+    require(ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.c_str(), SDDL_REVISION_1, &descriptor.value, nullptr),
+            "execution_containment_dll_identity");
+    const std::wstring name = L"opencode-v2-windows-realpath.dll";
+    UNICODE_STRING relative{};
+    relative.Buffer = const_cast<wchar_t *>(name.data());
+    relative.Length = static_cast<USHORT>(name.size() * sizeof(wchar_t));
+    relative.MaximumLength = relative.Length;
+    OBJECT_ATTRIBUTES attributes{};
+    attributes.Length = sizeof(attributes);
+    attributes.RootDirectory = parents.back().handle.value;
+    attributes.ObjectName = &relative;
+    attributes.Attributes = 0x40;
+    attributes.SecurityDescriptor = descriptor.value;
+    IO_STATUS_BLOCK completion{};
+    HANDLE raw = nullptr;
+    const auto status = create(&raw, GENERIC_READ | GENERIC_WRITE | READ_CONTROL | SYNCHRONIZE,
+        &attributes, &completion, nullptr, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_CREATE,
+        0x40 | 0x20 | 0x200000, nullptr, 0); // regular, synchronous, no reparse; never adopt.
+    Handle writer(raw);
+    require(status == 0 && completion.Status == 0 && writer, "execution_containment_dll_identity");
+    const auto writtenIdentity = fileIdentity(writer.value, owner, false);
+    protectedDllObject(writer.value);
+    require(SetFilePointerEx(source.value, LARGE_INTEGER{}, nullptr, FILE_BEGIN),
+            "execution_containment_dll_identity");
+    BYTE bytes[65536];
+    for (;;) {
+      DWORD read = 0, written = 0;
+      require(ReadFile(source.value, bytes, sizeof(bytes), &read, nullptr),
+              "execution_containment_dll_identity");
+      if (read == 0) break;
+      require(WriteFile(writer.value, bytes, read, &written, nullptr) && written == read,
+              "execution_containment_dll_identity");
+    }
+    require(FlushFileBuffers(writer.value) && heldFileSha256(writer.value) == sha256 &&
+                fileObjectIdentity(source.value, sourceOwner, false).Stringify() == sourceIdentity.Stringify(),
+            "execution_containment_dll_identity");
+    writer.reset(); // The execution handle denies all content writes and deletion.
     file = Handle(CreateFileW(extended(path).c_str(), GENERIC_READ | READ_CONTROL | WRITE_DAC,
                               FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                               FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
     require(static_cast<bool>(file), "execution_containment_dll_identity");
-    identity = inRole("private_dll_owner", [&] {
-      return fileObjectIdentity(file.value, owner, false);
-    });
-    SharedAclMutex aclMutex(identity);
-    const auto before =
-        aclCustody(file.value, owner, package, &cohortSids, "execution_containment_dll_identity");
-    require(fileIdentity(file.value, owner, false, package, &cohortSids).Stringify() ==
-                identity.Stringify(),
+    identity = inRole("private_dll_owner", [&] { return fileIdentity(file.value, owner, false); });
+    protectedDllObject(file.value);
+    require(identity.Stringify() == writtenIdentity.Stringify() &&
+                equalPath(finalPath(file.value), extended(path)) && heldFileSha256(file.value) == sha256,
             "execution_containment_dll_identity");
-    (void)before;
-    auto canonical = finalPath(file.value);
-    require(equalPath(canonical, extended(path)), "execution_containment_dll_identity");
-    path = canonical.substr(4);
-    require(heldFileSha256(file.value) == sha256, "execution_containment_dll_identity");
   }
   void changeAce(ACCESS_MODE mode) {
     SharedAclMutex aclMutex(identity);
@@ -628,6 +707,10 @@ struct RetainedRealpathDll {
   }
   void assertLive() const {
     for (const auto &parent : parents) parent.assertLive();
+    protectedDllObject(file.value);
+    require(equalPath(finalPath(source.value), extended(sourcePath)) &&
+                fileObjectIdentity(source.value, sourceOwner, false).Stringify() == sourceIdentity.Stringify() &&
+                heldFileSha256(source.value) == sha256, "execution_containment_dll_identity");
     require(equalPath(finalPath(file.value), extended(path)) &&
                 fileIdentity(file.value, owner, false, package, &cohortSids).Stringify() ==
                     identity.Stringify() &&
@@ -644,6 +727,7 @@ struct RetainedRealpathDll {
   JsonObject receipt(const std::wstring &nonce, DWORD pid, const std::wstring &creation) const {
     auto result = JsonObject::Parse(identity.Stringify());
     str(result, L"path", path);
+    str(result, L"sourcePath", sourcePath);
     str(result, L"sha256", sha256);
     str(result, L"nonce", nonce);
     str(result, L"receiptId", L"windows-dll:" + decimal(GetCurrentProcessId()) + L":" +
@@ -708,9 +792,6 @@ static std::vector<BYTE> unbase64(const std::wstring &value, size_t maxBytes = 1
   require(maxBytes <= 128 * 1024, "execution_owner_unknown");
   return unbase64Bounded(value, maxBytes);
 }
-using NtCreateFileFunction = NTSTATUS(NTAPI *)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES,
-                                               PIO_STATUS_BLOCK, PLARGE_INTEGER, ULONG, ULONG,
-                                               ULONG, ULONG, PVOID, ULONG);
 using NtQueryFileFunction = NTSTATUS(NTAPI *)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG,
                                               FILE_INFORMATION_CLASS);
 // Native FileRenameInformation(10) accepts the already-held source HANDLE
@@ -3480,6 +3561,18 @@ private:
   }
 
 public:
+  static std::wstring prepareRealpathDllDirectory(OwnerStore &owners, Scope &scope,
+                                                 const std::wstring &nonce) {
+    const auto selected = owners.selectedConfigs.find(scope.ownedPairSelectionId);
+    require(selected != owners.selectedConfigs.end(), "run_control_selection_missing");
+    // Destination comes only from the retained native profile, never caller env.
+    const auto tmp = selected->second->rootPath + L"\\tmp";
+    auto heldTmp = owners.holdSelectedDirectory(tmp);
+    const auto directory = tmp + L"\\native-realpath-" + nonce;
+    auto leaf = ownerDirectory(directory, true, currentSid());
+    grantRoot(scope, std::move(leaf), FILE_GENERIC_READ | FILE_GENERIC_EXECUTE, GRANT_ACCESS);
+    return directory;
+  }
   static std::unique_ptr<WindowsNativeRunControl> issueOwnedPair(
       OwnerStore &owners, Scope &scope, const std::wstring &selectionId,
       const std::wstring &nonce, const std::wstring &lease) {
@@ -4372,7 +4465,16 @@ static std::unique_ptr<Scope> launch(const JsonObject &input, OwnerStore &owners
   scope->owners = &owners;
   auto nonce = text(input, L"nonce"), lease = text(input, L"leaseOwnerId"),
        executable = text(input, L"executable"), entry = text(input, L"entry");
-  require(nonce.size() == 36 && lease.size() == 36, "execution_identity_mismatch");
+  const auto safeNonce = [](const std::wstring &value) {
+    if (value.size() != 36) return false;
+    for (size_t i = 0; i < value.size(); ++i) {
+      if (i == 8 || i == 13 || i == 18 || i == 23) { if (value[i] != L'-') return false; }
+      else if (!((value[i] >= L'0' && value[i] <= L'9') ||
+                 (value[i] >= L'a' && value[i] <= L'f'))) return false;
+    }
+    return true;
+  };
+  require(safeNonce(nonce) && lease.size() == 36, "execution_identity_mismatch");
   scope->cohort = WindowsNativeRunControlIssuer::prepareLaunchCohort(owners, nonce);
   scope->launchNonce = nonce;
   if (input.HasKey(L"selectedConfigId"))
@@ -4430,8 +4532,10 @@ static std::unique_ptr<Scope> launch(const JsonObject &input, OwnerStore &owners
   if (input.HasKey(L"realpathDll")) {
     const auto dllCohortSids =
         scope->cohort ? closedControllerCohortSids(*scope->cohort) : std::vector<std::wstring>();
+    const auto dllDirectory = WindowsNativeRunControlIssuer::prepareRealpathDllDirectory(
+        owners, *scope, nonce);
     scope->realpathDll = std::make_unique<RetainedRealpathDll>(
-        object(input, L"realpathDll"), scope->sid.value,
+        object(input, L"realpathDll"), scope->sid.value, dllDirectory,
         scope->cohort ? &dllCohortSids : nullptr);
     scope->realpathDll->changeAce(GRANT_ACCESS);
   }
