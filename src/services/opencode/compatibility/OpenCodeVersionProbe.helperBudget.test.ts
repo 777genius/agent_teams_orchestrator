@@ -170,7 +170,7 @@ for (const mode of ['open', 'exit-only', 'late-close', 'abort'] as const) {
 // never become signal authority, nor hide an orphan in the next full census.
 function additionFixture(mode: 'gone' | 'alive' | 'unknown' | 'orphan' | 'reused' | 'older' | 'expired' |
   'confirmation-gone' | 'confirmation-live' | 'confirmation-reused' | 'stale-gone' | 'stale-live' |
-  'late-orphan' | 'open' | 'captured-orphan-alive' | 'captured-orphan-unknown' | 'unordered' | 'unordered-older', platform: NodeJS.Platform = 'win32') {
+  'late-orphan' | 'open' | 'captured-orphan-alive' | 'captured-orphan-unknown' | 'unordered' | 'unordered-older', platform: NodeJS.Platform = 'win32', reverseRows = false) {
   Object.defineProperty(process, 'platform', { value: platform })
   const root = 900_010, relay = 900_011, leaf = 900_012
   let clock = 1_000_000, removed = 0, trees = 0, closed = false, leafReads = 0
@@ -196,7 +196,7 @@ function additionFixture(mode: 'gone' | 'alive' | 'unknown' | 'orphan' | 'reused
       }
       return [{ pid: relay, ppid: 900_099 }]
     }
-    if (trees === 1) return rows
+    if (trees === 1) return reverseRows ? [...rows].reverse() : rows
     if (trees === 2 && (mode === 'orphan' || mode === 'late-orphan')) return mode === 'orphan' ? [{ pid: 900_013, ppid: leaf }] : []
     if (trees === 2 && mode === 'reused') return [{ pid: leaf, ppid: 900_099 }]
     if (trees === 2 && (mode === 'confirmation-reused' || mode.startsWith('stale-'))) return rows
@@ -539,4 +539,29 @@ test('Windows gone captured owner without close stays unknown at the original de
   expect(f.elapsed()).toBe(8000)
   expect(f.signals).toEqual([]); expect(f.taskkills).toEqual([])
   expect(f.removed()).toBe(0)
+})
+
+// Native Windows process tables need not list a parent before its child.
+test('Windows reverse census acquires parent births before a valid descendant and still proves retirement', async () => {
+  const f = additionFixture('confirmation-gone', 'win32', true)
+  expect(await f.run()).toBe('1.19.0\n')
+  expect(f.leafReads()).toBe(1)
+  expect(f.aliveReads).toContain(f.leaf)
+  expect(f.trees()).toBeGreaterThanOrEqual(4)
+  expect(f.removed()).toBe(1)
+  expect(f.signalled).toEqual([])
+  expect(f.budgets.every(budget => budget > 0 && budget <= 5000)).toBe(true)
+})
+
+test('Windows reverse census still refuses a child born before its captured parent', async () => {
+  const f = additionFixture('older', 'win32', true)
+  let failure: unknown
+  try { await f.run() } catch (error) { failure = error }
+  expect(failure).toBeInstanceOf(OpenCodeVersionProbeCleanupError)
+  expect((failure as OpenCodeVersionProbeCleanupError).terminalDiagnostic).toMatchObject({
+    // Candidate capture publishes no new birth authority before the entire batch validates.
+    phase: 'addition_identity', guard: 'parent_identity', birthsCount: 1,
+  })
+  expect(f.removed()).toBe(0)
+  expect(f.signalled).toEqual([])
 })

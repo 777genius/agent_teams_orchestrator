@@ -233,7 +233,10 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
         changed = false
         for (const row of rows) if (selected.has(row.ppid) && !selected.has(row.pid)) { selected.add(row.pid); changed = true }
       }
+      // Acquire parent births first without discarding any census rows.
+      const rank = new Map([...selected].map((target, index) => [target, index]))
       return rows.filter(row => selected.has(row.pid))
+        .sort((left, right) => rank.get(left.pid)! - rank.get(right.pid)!)
     }
     try {
       if (signal?.aborted) fail()

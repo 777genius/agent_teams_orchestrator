@@ -7,6 +7,7 @@ import { mkdir, mkdtemp, realpath, writeFile, readFile, lstat } from 'node:fs/pr
 import { isDeepStrictEqual } from 'node:util'
 import { OpenCode as Current } from '@opencode/client'
 import { OpenCode as Floor } from '@opencode/client-v2-floor'
+import { getOpenCodeV2DeclaredInputModalities } from '../../../../services/opencode/OpenCodeDeclaredInputModalities.js'
 import { inspectOpenCodeReadSelection } from '../../../../services/opencode/compatibility/OpenCodeNativeIdentity.js'
 import { canonicalizeOpenCodeProjectPath, resolveOpenCodeV2CatalogProfileScope, materializeOpenCodeV2CatalogScope } from '../../../../services/opencode/OpenCodeProfileManager.js'
 import { resolveClaudeMultimodelPaths } from '../../../../services/opencode/OpenCodeManagedPaths.js'
@@ -22,7 +23,7 @@ import { resolveOpenCodeV2ExecutionProbe } from '../../../../services/opencode/b
 import { parseOpenCodeExecutionProof } from '../../../../services/opencode/OpenCodeExecutionProof.js'
 import type { OpenCodeExecutionProof } from '../../../../services/opencode/types.js'
 import type { BridgeEnvelope } from '../../../../services/opencode/bridge/OpenCodeBridgeProtocol.js'
-import type { ConnectProviderInput, LoadProviderModelsInput, TestProviderModelInput, ProviderConnection, RuntimeProviderModelsView, ProviderModelTestResult, ProviderManagementResult } from '../../domain/types.js'
+import type { ConnectProviderInput, LoadProviderModelsInput, TestProviderModelInput, ProviderConnection, RuntimeProviderModel, RuntimeProviderModelsView, ProviderModelTestResult, ProviderManagementResult } from '../../domain/types.js'
 
 const sourceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../../..')
 const text = (value: unknown): string => { executionAssert(typeof value === 'string' && value.length > 0, 'provider_response_invalid'); return value }
@@ -216,16 +217,21 @@ export async function loadOpenCodeV2ProviderModels(input: LoadProviderModelsInpu
       if (limit) rows = rows.slice(0, limit)
       return { runtimeId: 'opencode' as const, providerId: input.providerId, totalCount, returnedCount: rows.length, limit, cursor: null, nextCursor: null,
         defaultModelId: owner.preferredModel, diagnostics: [], catalogState: 'fresh' as const,
-        models: rows.map(row => ({ modelId: `${input.providerId}/${text(row.id)}`, providerId: input.providerId, displayName: text(row.name), sourceLabel: 'OpenCode V2 native catalog',
-          free: false, default: `${input.providerId}/${row.id}` === owner.preferredModel, catalogStatus: 'active' as const,
-          availability: row.enabled === false ? 'unavailable' as const : 'untested' as const, accessKind: 'credentialed' as const, routeKind: 'catalog_provider' as const,
-          proofState: 'needs_probe' as const, requiresExecutionProof: true, accessReason: 'Selected-model execution proof is required.',
-          catalogContextTokens: finiteNumber(executionRecord(row.limit).context),
-          catalogOutputTokens: finiteNumber(executionRecord(row.limit).output),
-          managedContextTokens: null, managedOutputTokens: null, managedUpdatedAt: null })) }
+        models: rows.map(row => buildOpenCodeV2RuntimeProviderModel(row, input.providerId, owner.preferredModel)) }
     })
     return { ok: true, value }
   } catch { return resultError('runtime-unhealthy', 'V2 native provider catalog is unavailable; no legacy CLI catalog command was invoked.') }
+}
+
+export function buildOpenCodeV2RuntimeProviderModel(row: Record<string, unknown>, providerId: string, preferredModel: string | null): RuntimeProviderModel {
+  return { modelId: `${providerId}/${text(row.id)}`, providerId, displayName: text(row.name), sourceLabel: 'OpenCode V2 native catalog',
+    declaredInputModalities: getOpenCodeV2DeclaredInputModalities(row.capabilities),
+    free: false, default: `${providerId}/${row.id}` === preferredModel, catalogStatus: 'active',
+    availability: row.enabled === false ? 'unavailable' : 'untested', accessKind: 'credentialed', routeKind: 'catalog_provider',
+    proofState: 'needs_probe', requiresExecutionProof: true, accessReason: 'Selected-model execution proof is required.',
+    catalogContextTokens: finiteNumber(executionRecord(row.limit).context),
+    catalogOutputTokens: finiteNumber(executionRecord(row.limit).output),
+    managedContextTokens: null, managedOutputTokens: null, managedUpdatedAt: null }
 }
 
 function finiteNumber(value: unknown): number | null { return typeof value === 'number' && Number.isFinite(value) ? value : null }
@@ -263,4 +269,3 @@ export async function retireOpenCodeV2CatalogOwner(wire: { dispose(): Promise<vo
   }
   if (transportError || retirementError) throw new AggregateError([transportError, retirementError].filter(Boolean), 'provider_physical_cleanup_unknown')
 }
-
