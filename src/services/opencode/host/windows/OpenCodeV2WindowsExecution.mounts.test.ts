@@ -21,6 +21,7 @@ test('Windows plan admits canonical identity mounts and retains genuine alias re
   }
   const platform = Object.getOwnPropertyDescriptor(process, 'platform')!
   const arch = Object.getOwnPropertyDescriptor(process, 'arch')!
+  const bunVersion = Object.getOwnPropertyDescriptor(process.versions, 'bun')!
   const bytes = Buffer.from('TEST pinned executable bytes'), sha256 = createHash('sha256').update(bytes).digest('hex')
   const observed: string[] = []
   function physicalPath(value: PathLike, options?: ObjectEncodingOptions | BufferEncoding | null): Promise<string>
@@ -45,6 +46,7 @@ test('Windows plan admits canonical identity mounts and retains genuine alias re
   try {
     Object.defineProperty(process, 'platform', { ...platform, value: 'win32' })
     Object.defineProperty(process, 'arch', { ...arch, value: 'x64' })
+    Object.defineProperty(process.versions, 'bun', { ...bunVersion, value: '1.4.3' })
     const input = { bun: { path: 'C:\\TEST\\bun.exe', sha256 }, entry: 'C:\\TEST\\source\\entry.ts',
       cwd: 'C:\\TEST\\project', writableRoots: ['C:\\TEST\\profile'], readOnlyRoots: ['C:\\TEST\\source'],
       profileDirectories: ['C:\\TEST\\profile'], env: {},
@@ -66,5 +68,6 @@ test('Windows plan admits canonical identity mounts and retains genuine alias re
     physical.mockRestore(); read.mockRestore(); absolute.mockRestore(); parse.mockRestore()
     helper.mockRestore(); dll.mockRestore(); broker.mockRestore()
     Object.defineProperty(process, 'platform', platform); Object.defineProperty(process, 'arch', arch)
+    Object.defineProperty(process.versions, 'bun', bunVersion)
   }
 })
