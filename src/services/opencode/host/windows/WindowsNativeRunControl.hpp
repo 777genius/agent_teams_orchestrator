@@ -1759,6 +1759,7 @@ inline void WindowsNativeRunControl::startRequestPump() {
   require(listener_ && !requestPump_.joinable(), "run_control_foreign");
   requestPumpStop_ = false;
   requestPump_ = std::thread([this] {
+    winrt::init_apartment(winrt::apartment_type::multi_threaded);
     while (!requestPumpStop_ && !shutdown_) {
       std::uint64_t activeId = 0;
       try {
