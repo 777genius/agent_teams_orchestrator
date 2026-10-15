@@ -40,7 +40,10 @@ describe('OpenCode agent model compatibility', () => {
     }
     expect(declared({ modalities: { input: ['image'] }, capabilities: { input: { image: false } } })).toBeNull()
     expect(declared({ modalities: { input: [] }, capabilities: { input: { video: true } } })).toBeNull()
-    expect(declared({ modalities: { input: ['image'] }, capabilities: { input: { image: true, text: true } } })).toEqual(['image'])
+    expect(declared({ modalities: { input: ['image'] }, capabilities: { input: { image: true, text: true } } })).toBeNull()
+    expect(declared({ modalities: { input: ['audio'] }, capabilities: { input: { audio: false } } })).toBeNull()
+    expect(declared({ modalities: { input: [] }, capabilities: { input: { audio: true } } })).toBeNull()
+    expect(declared({ modalities: { input: [' AUDIO ', 'image'] }, capabilities: { input: { image: true, audio: true, text: false } } })).toEqual(['audio', 'image'])
     expect(declared({ modalities: { input: ['image', null] }, capabilities: { input: { image: true } } })).toBeNull()
 
     // Declaration authority must not change the legacy presentation/launch contract.

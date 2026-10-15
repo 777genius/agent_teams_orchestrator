@@ -39,7 +39,7 @@ export function getOpenCodeModelDeclaredInputModalities(
   const array = arrayInput === undefined ? undefined : parseInputModalityArray(arrayInput)
   const record = recordInput === undefined ? undefined : parseInputCapabilityRecord(recordInput)
   if (array === null || record === null) return null
-  if (array && record && ['image', 'video'].some(modality => array.includes(modality) !== record.includes(modality))) {
+  if (array && record && (array.length !== record.length || array.some(modality => !record.includes(modality)))) {
     return null
   }
   return array ?? record ?? null
