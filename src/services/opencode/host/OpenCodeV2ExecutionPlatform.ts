@@ -46,9 +46,9 @@ export async function planExecutionPlatform(input: Parameters<typeof planLinuxEx
   return Object.freeze({ platform: 'linux', concrete: await planLinuxExecution(input) })
 }
 export function launchExecutionPlatform(plan: ExecutionPlatformPlan, nonce: string, leaseOwnerId: string,
-  bun: Readonly<{ path: string; sha256: string }>): ExecutionPlatformLaunch {
+  bun: Readonly<{ path: string; sha256: string }>, deadline: number): ExecutionPlatformLaunch {
   executionAssert(plan.platform === process.platform, 'execution_containment_unqualified')
-  if (plan.platform === 'win32') return launchWindowsExecution(plan.concrete, nonce, leaseOwnerId, bun)
+  if (plan.platform === 'win32') return launchWindowsExecution(plan.concrete, nonce, leaseOwnerId, bun, deadline)
   if (plan.platform === 'darwin') return launchDarwinExecution(plan.concrete, nonce, leaseOwnerId, bun)
   return launchLinuxExecution(plan.concrete, nonce, leaseOwnerId, bun)
 }

@@ -292,7 +292,7 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
       }
     }
     await owner.beforeSpawn(); check()
-    launch = launchExecutionPlatform(plan, nonce, leaseOwnerId, native.bun)
+    launch = launchExecutionPlatform(plan, nonce, leaseOwnerId, native.bun, context.deadline)
     child = launch.child
     child.once('close', () => { exited = true; lifetime.abort(); exitResolve(); void close().catch(() => undefined) })
     const ready = new Promise<Record<string, unknown>>((resolve, reject) => {

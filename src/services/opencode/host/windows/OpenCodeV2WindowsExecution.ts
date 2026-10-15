@@ -284,7 +284,9 @@ export async function bindWindowsExecutionSelectedConfig(plan: WindowsLaunchPlan
     selected.path === path.win32.join(profile.config.directory, 'opencode.json') && selected.sha256 === profile.config.sha256, 'execution_profile_changed')
   selectedConfigs.set(plan, selected.selectionId)
 }
-export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, leaseOwnerId: string, bun: Readonly<{ path: string; sha256: string }>) {
+export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, leaseOwnerId: string,
+  bun: Readonly<{ path: string; sha256: string }>, deadline: number) {
+  assert(Number.isFinite(deadline) && deadline > Date.now(), 'execution_timeout')
   assert(plans.has(plan) && selectedConfigs.has(plan) && equal(binaries.get(plan), bun) && /^[a-f0-9-]{36}$/.test(nonce) && /^[a-f0-9-]{36}$/.test(leaseOwnerId))
   const member = memberPreflights.get(plan)
   if (member) assert(member.state === 'ready' && member.result && member.nonceConsumed === true &&
@@ -338,7 +340,7 @@ export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, l
     } catch { child.emit('error', new Error('execution_invalid_response')) }
   })
   const launch = broker.request('launch', { executable: plan.executable, entry: plan.entry, cwd: plan.cwd, env: plan.env,
-    writableRoots: plan.writableRoots, readOnlyRoots: plan.readOnlyRoots, protectedRoots: plan.protectedRoots, realpathDll: plan.realpathDll, selectedConfigId: selectedConfigs.get(plan), nonce, leaseOwnerId })
+    writableRoots: plan.writableRoots, readOnlyRoots: plan.readOnlyRoots, protectedRoots: plan.protectedRoots, realpathDll: plan.realpathDll, selectedConfigId: selectedConfigs.get(plan), nonce, leaseOwnerId }, deadline)
   mainExited = observeWindowsHeldMainExit(broker.events, child, launch)
   void launch.catch(connectedReject)
   async function bounded<T>(work: Promise<T>, deadline: number, signal?: AbortSignal): Promise<T> {
