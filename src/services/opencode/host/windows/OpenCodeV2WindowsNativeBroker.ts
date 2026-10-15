@@ -106,7 +106,8 @@ function launchWindowsNativeBroker(artifact: WindowsNativeArtifact, custodyOnly:
   })
   return Object.freeze({ events, ended: () => ended,
     request(operation: string, input: Readonly<Record<string, unknown>> = {}, deadline = Date.now() + 15000, signal?: AbortSignal) {
-      assert(!ended && /^[a-zA-Z][a-zA-Z0-9]{0,63}$/.test(operation) && deadline > Date.now(), 'execution_native_unknown')
+      assert(!ended && /^[a-zA-Z][a-zA-Z0-9]{0,63}$/.test(operation) && deadline > Date.now(),
+        operation === 'retire' ? 'execution_native_unknown:retire_broker_state:0' : 'execution_native_unknown')
       signal?.throwIfAborted()
       const id = ++sequence, bytes = JSON.stringify({ schema: 1, id, operation, input }) + '\n'
       assert(Buffer.byteLength(bytes) <= CONTROL_PACKET_LIMIT, 'execution_invalid_response')
@@ -115,7 +116,8 @@ function launchWindowsNativeBroker(artifact: WindowsNativeArtifact, custodyOnly:
         const abort = () => { pending.delete(id); dispose(); reject(new Error('execution_cancelled')); child.stdin.end() }
         const dispose = () => { clearTimeout(timer); signal?.removeEventListener('abort', abort) }
         pending.set(id, { resolve, reject, dispose }); signal?.addEventListener('abort', abort, { once: true })
-        child.stdin.write(bytes, error => { if (error) { pending.delete(id); dispose(); reject(new Error('execution_native_unknown')); child.stdin.end() } })
+        child.stdin.write(bytes, error => { if (error) { pending.delete(id); dispose(); reject(new Error(
+          operation === 'retire' ? 'execution_native_unknown:retire_broker_write:0' : 'execution_native_unknown')); child.stdin.end() } })
         if (signal?.aborted) abort()
       })
     },

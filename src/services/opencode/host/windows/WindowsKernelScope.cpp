@@ -13,6 +13,7 @@
 #include <mutex>
 #include <sddl.h>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <userenv.h>
 #include <vector>
@@ -45,6 +46,23 @@ static decltype(auto) inRole(const char *role, Action action) {
       throw NativeError{error.code, error.win32, role, error.nativeStatus};
     throw;
   }
+}
+// Retirement must retain the failed native substep without serializing exception
+// text. Existing NativeError codes/status survive; WinRT contributes only HRESULT.
+template <typename Action>
+static decltype(auto) inRetirementPhase(const char *phase, Action action) {
+  try { return action(); }
+  catch (const NativeError &error) {
+    throw NativeError{error.code, error.win32, error.stage ? error.stage : phase,
+                      error.nativeStatus};
+  }
+  catch (const winrt::hresult_error &error) {
+    throw NativeError{"execution_native_unknown", static_cast<DWORD>(error.code().value), phase};
+  }
+  catch (const std::system_error &error) {
+    throw NativeError{"execution_native_unknown", static_cast<DWORD>(error.code().value()), phase};
+  }
+  catch (...) { throw NativeError{"execution_native_unknown", 0, phase}; }
 }
 struct Handle {
   HANDLE value = nullptr;
@@ -3229,39 +3247,46 @@ struct Scope {
   }
   JsonObject retire() {
     stopping = true;
-    SetEvent(cancel.value);
-    CancelIoEx(pipe.value, nullptr);
-    require(TerminateJobObject(job.value, 99) != 0, "cleanup_unknown");
-    ULONGLONG deadline = GetTickCount64() + 12000;
-    while ((!exited() || active() != 0) && GetTickCount64() < deadline)
-      Sleep(10);
-    require(exited() && active() == 0, "cleanup_unknown");
-    if (reader.joinable())
-      reader.join();
-    if (mainExit.joinable())
-      mainExit.join();
-    publishMainExit();
-    if (ownedPairControl) {
-      auto closed = ownedPairControl->shutdown();
-      require(closed.GetNamedBoolean(L"complete", false) &&
-                  !closed.GetNamedBoolean(L"cleanupUnknown", true), "cleanup_unknown");
-      ownedPairControl.reset();
-      ownedPairClosed = true;
-    }
-    if (commands)
-      commands->retireAll();
+    inRetirementPhase("retire_job", [&] {
+      SetEvent(cancel.value);
+      CancelIoEx(pipe.value, nullptr);
+      require(TerminateJobObject(job.value, 99) != 0, "cleanup_unknown");
+    });
+    inRetirementPhase("retire_wait", [&] {
+      ULONGLONG deadline = GetTickCount64() + 12000;
+      while ((!exited() || active() != 0) && GetTickCount64() < deadline)
+        Sleep(10);
+      require(exited() && active() == 0, "cleanup_unknown");
+    });
+    inRetirementPhase("retire_io_join", [&] {
+      if (reader.joinable()) reader.join();
+      if (mainExit.joinable()) mainExit.join();
+    });
+    inRetirementPhase("retire_main_exit", [&] { publishMainExit(); });
+    inRetirementPhase("retire_owned_pair", [&] {
+      if (ownedPairControl) {
+        auto closed = ownedPairControl->shutdown();
+        require(closed.GetNamedBoolean(L"complete", false) &&
+                    !closed.GetNamedBoolean(L"cleanupUnknown", true), "cleanup_unknown");
+        ownedPairControl.reset();
+        ownedPairClosed = true;
+      }
+    });
+    inRetirementPhase("retire_commands", [&] { if (commands) commands->retireAll(); });
     inputFile.reset();
     outputFile.reset();
     errorFile.reset();
     spool.reset();
-    JsonObject value;
-    flag(value, L"empty", true);
-    flag(value, L"heldProcessExited", true);
-    if (ownedPairClosed) flag(value, L"ownedPairClosed", true);
-    physicalCleanupProof = true;
-    num(value, L"activeProcesses", 0);
-    value.SetNamedValue(L"mapping", mapping);
-    return value;
+    return inRetirementPhase("retire_receipt", [&] {
+      JsonObject value;
+      flag(value, L"empty", true);
+      flag(value, L"heldProcessExited", true);
+      if (ownedPairClosed) flag(value, L"ownedPairClosed", true);
+      physicalCleanupProof = true;
+      num(value, L"activeProcesses", 0);
+      value.SetNamedValue(L"mapping", mapping);
+      return value;
+    });
   }
 };
 static Handle scopeAclDirectory(const RetainedAnchorComponent &anchor) {
@@ -5309,7 +5334,7 @@ int wmain(int argc, wchar_t **argv) {
         } else if (operation == L"retire") {
           require(static_cast<bool>(scope), "cleanup_unknown");
           value = scope->retire();
-          removeGrants(*scope);
+          inRetirementPhase("retire_grants", [&] { removeGrants(*scope); });
           flag(value, L"ownAcesRemoved", true);
         } else
           throw NativeError{"execution_invalid_response"};

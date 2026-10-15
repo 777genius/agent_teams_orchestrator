@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readdir, readFile, rm, lstat } from 'node:fs/promises'
 import path from 'node:path'
 import { tmpdir } from 'node:os'
 import * as privateDirectories from '../profile/OpenCodePrivateDirectories.js'
-import { recordOpenCodeV2ProviderFailure, retainOpenCodeV2InitializationPhase, type RunInitializationPhase } from './OpenCodeV2Diagnostics.js'
+import { recordOpenCodeV2ProviderFailure, retainOpenCodeV2CleanupPhase, retainOpenCodeV2InitializationPhase, type RunInitializationPhase } from './OpenCodeV2Diagnostics.js'
 
 test('startup diagnostics retain only finite native fields and reject payload-bearing or invalid frames', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'TEST-v2-startup-diagnostics-'))
@@ -232,6 +232,12 @@ test('native diagnostics retain only closed producer codes and stages with uint3
   const previous = process.env.CLAUDE_MULTIMODEL_DATA_HOME
   const secret = 'TEST_PRIVATE_NATIVE_PAYLOAD'
   const cases: { error: Error; category: string; native?: { stage: string; nativeCode: number } }[] = [
+    ...['retire_broker_state', 'retire_broker_write', 'retire_job', 'retire_wait', 'retire_io_join',
+      'retire_main_exit', 'retire_owned_pair', 'retire_commands', 'retire_receipt', 'retire_grants']
+      .map(stage => ({ error: new Error('cleanup_unknown', { cause: new Error(`execution_native_unknown:${stage}:2147483659`) }),
+        category: 'execution_native_unknown', native: { stage, nativeCode: 2147483659 } })),
+    { error: new Error('cleanup_unknown', { cause: new Error('cleanup_unknown:retire_wait:0') }),
+      category: 'cleanup_unknown', native: { stage: 'retire_wait', nativeCode: 0 } },
     ...['shared_acl_mutex_descriptor', 'shared_acl_mutex_create', 'shared_acl_mutex_security',
       'shared_acl_mutex_encoding', 'shared_acl_mutex_authority', 'shared_acl_mutex_wait', 'shared_acl_mutex']
       .map(stage => ({ error: new Error(`execution_containment_filesystem_denied:${stage}:5`),
@@ -294,6 +300,10 @@ test('retirement diagnostics retain bounded timing and native failure without pr
   process.env.CLAUDE_MULTIMODEL_DATA_HOME = root
   const secret = 'TEST-PRIVATE-CLOSE-PAYLOAD'
   try {
+    const retirement = new Error('cleanup_unknown', { cause: new Error('execution_native_unknown:retire_owned_pair:2147483659') })
+    retainOpenCodeV2CleanupPhase(retirement, 'kernel-retirement')
+    retainOpenCodeV2CleanupPhase(retirement, secret as never)
+    await recordOpenCodeV2ProviderFailure('run-member-retirement', retirement, true, undefined, undefined, { elapsedMs: 74, dataRoot: root })
     await recordOpenCodeV2ProviderFailure('run-member-retirement', new Error('timeout', { cause: new Error(secret) }), true, undefined, undefined, { elapsedMs: 22001, dataRoot: root })
     await recordOpenCodeV2ProviderFailure('run-member-retirement', new Error('run_control_process_identity:process_image_path:31'), true, undefined, undefined, { elapsedMs: 7 })
     await recordOpenCodeV2ProviderFailure('run-member-retirement', new Error(secret), true, undefined, undefined, { elapsedMs: -1 })
@@ -302,7 +312,9 @@ test('retirement diagnostics retain bounded timing and native failure without pr
       expect(bytes).not.toContain(secret)
       return JSON.parse(bytes)
     }))
-    expect(rows).toHaveLength(3)
+    expect(rows).toHaveLength(4)
+    expect(rows.find(row => row.category === 'execution_native_unknown')).toMatchObject({
+      native: { stage: 'retire_owned_pair', nativeCode: 2147483659 }, cleanup: { elapsedMs: 74, phase: 'kernel-retirement' } })
     expect(rows.find(row => row.category === 'timeout').cleanup).toEqual({ elapsedMs: 22001 })
     expect(rows.find(row => row.category === 'run_control_process_identity')).toMatchObject({ native: { stage: 'process_image_path', nativeCode: 31 }, cleanup: { elapsedMs: 7 } })
     expect(rows.find(row => row.category === 'provider_operation_unknown').cleanup).toBeUndefined()

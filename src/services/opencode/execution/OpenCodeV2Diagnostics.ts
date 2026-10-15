@@ -81,6 +81,14 @@ function acquisitionDiagnostic(value: unknown) {
 export type RunInitializationPhase = 'MCP-connect' | 'MCP-readback' | 'controller-tools' | 'probe-authority'
 const initializationPhases = new Set<RunInitializationPhase>(['MCP-connect', 'MCP-readback', 'controller-tools', 'probe-authority'])
 const initializationFailures = new WeakMap<Error, Readonly<{ phase: RunInitializationPhase; elapsedMs: number }>>()
+export type ExecutionCleanupPhase = 'dispose-transport' | 'send-close' | 'force-kill' | 'wait-exit' | 'read-birth' | 'kernel-retirement' |
+  'process-retirement' | 'closed-ack' | 'kernel-proof' | 'kernel-binding'
+const cleanupPhases = new Set<ExecutionCleanupPhase>(['dispose-transport', 'send-close', 'force-kill', 'wait-exit', 'read-birth', 'kernel-retirement',
+  'process-retirement', 'closed-ack', 'kernel-proof', 'kernel-binding'])
+const cleanupFailures = new WeakMap<Error, ExecutionCleanupPhase>()
+export function retainOpenCodeV2CleanupPhase(error: Error, phase: ExecutionCleanupPhase): void {
+  if (cleanupPhases.has(phase) && !cleanupFailures.has(error)) cleanupFailures.set(error, phase)
+}
 /** Preserve the original rejection object; private finite context is never error payload. */
 export function retainOpenCodeV2InitializationPhase(error: unknown, phase: RunInitializationPhase, elapsedMs: number): void {
   if (error instanceof Error && initializationPhases.has(phase) && Number.isSafeInteger(elapsedMs) &&
@@ -113,6 +121,7 @@ const privateProviderFailureCodes = new Set(['provider_missing', 'provider_key_m
 // Exact native producer literals only; neither an arbitrary message nor a
 // syntactically plausible unknown stage is persisted as diagnostic data.
 const privateNativeFailureCodes = new Set([
+  'cleanup_unknown', 'execution_identity_unknown', 'execution_path_alias',
   'execution_cancelled', 'execution_containment_dll_identity', 'execution_containment_filesystem_denied',
   'execution_containment_helper_closed', 'execution_containment_helper_failed', 'execution_containment_helper_identity',
   'execution_containment_launcher_denied', 'execution_containment_pipe_denied', 'execution_containment_profile_denied',
@@ -143,7 +152,9 @@ const privateNativeFailureStages = new Set([
   'shared_readonly_security', 'shared_readonly_acl', 'shared_readonly_owner', 'shared_readonly_file',
   'shared_readonly_control', 'shared_readonly_ace', 'shared_readonly_package', 'shared_readonly_foreign_write',
   'shared_readonly_grant_open', 'shared_readonly_grant_read', 'shared_readonly_grant_merge', 'shared_readonly_grant_write',
-  'shared_readonly_owner_changed', 'shared_readonly_control_changed', 'shared_readonly_foreign_changed', 'shared_readonly_member_missing'])
+  'shared_readonly_owner_changed', 'shared_readonly_control_changed', 'shared_readonly_foreign_changed', 'shared_readonly_member_missing',
+  'retire_broker_state', 'retire_broker_write', 'retire_job', 'retire_wait', 'retire_io_join',
+  'retire_main_exit', 'retire_owned_pair', 'retire_commands', 'retire_receipt', 'retire_grants'])
 function nativeFailure(error: unknown): { category: string; native?: { stage: string; nativeCode: number } } | undefined {
   if (!(error instanceof Error)) return undefined
   if (privateNativeFailureCodes.has(error.message)) return { category: error.message }
@@ -167,7 +178,8 @@ export async function recordOpenCodeV2ProviderFailure(phase: string, error: unkn
   const acquisition = acquisitionDiagnostic(acquisitionTiming)
   const cleanup = phase === 'run-member-retirement' && Number.isSafeInteger(cleanupTiming?.elapsedMs) &&
     Number(cleanupTiming?.elapsedMs) >= 0 && Number(cleanupTiming?.elapsedMs) <= 86_400_000
-    ? { elapsedMs: Number(cleanupTiming?.elapsedMs) } : undefined
+    ? { elapsedMs: Number(cleanupTiming?.elapsedMs), ...(error instanceof Error && cleanupFailures.has(error)
+      ? { phase: cleanupFailures.get(error)! } : {}) } : undefined
   const initialization = phase === 'run-owner-initialization' && error instanceof Error ? initializationFailures.get(error) : undefined
   if (cleanupTiming?.dataRoot !== undefined && (!cleanup || typeof cleanupTiming.dataRoot !== 'string' || !path.isAbsolute(cleanupTiming.dataRoot))) return
   try {
