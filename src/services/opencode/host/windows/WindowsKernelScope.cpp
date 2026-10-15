@@ -714,9 +714,47 @@ static DWORD directoryMode(HANDLE file) {
       "execution_owner_ntfs_required");
   return mode;
 }
+// Only these fresh private-profile children may inherit a later package grant.
+// The profile root itself and every generic/private fence remain protected.
+static std::wstring preparedProfileRoot(const std::wstring &path) {
+  const std::wstring prefix = L"\\opencode\\v2\\profiles\\";
+  const auto start = path.rfind(prefix);
+  if (start == std::wstring::npos) return {};
+  const auto memberStart = start + prefix.size();
+  const auto split = path.find(L'\\', memberStart);
+  if (split == std::wstring::npos || !validTeamId(path.substr(memberStart, split - memberStart)))
+    return {};
+  const auto child = path.substr(split + 1);
+  for (const auto allowed : {L"home", L"config", L"data", L"cache", L"state", L"tmp",
+                             L"appdata", L"localappdata", L"config\\opencode", L"data\\opencode"})
+    if (equalPath(child, allowed)) return path.substr(0, split);
+  return {};
+}
+static JsonObject protectedProfileRoot(const std::wstring &path,
+                                      const std::vector<Handle> &parents,
+                                      const std::wstring &owner) {
+  require(!path.empty(), "execution_owner_prepared_purpose_invalid");
+  for (const auto &parent : parents) {
+    if (!equalPath(finalPath(parent.value), extended(path))) continue;
+    const auto identity = fileIdentity(parent.value, owner, true);
+    PACL acl = nullptr;
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    require(GetSecurityInfo(parent.value, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                            nullptr, nullptr, &acl, nullptr, &descriptor) == ERROR_SUCCESS,
+            "execution_owner_not_private");
+    LocalMemory memory{descriptor};
+    SECURITY_DESCRIPTOR_CONTROL control{};
+    DWORD revision = 0;
+    require(acl && GetSecurityDescriptorControl(descriptor, &control, &revision) &&
+                (control & SE_DACL_PROTECTED) != 0, "execution_owner_not_private");
+    return identity;
+  }
+  throw NativeError{"execution_owner_prepared_purpose_invalid"};
+}
 static Handle ownerDirectory(const std::wstring &path, bool create, const std::wstring &owner,
                              const std::vector<std::wstring> *cohortSids = nullptr,
-                             PSID selectedPackage = nullptr, bool archiveCapable = true) {
+                             PSID selectedPackage = nullptr, bool archiveCapable = true,
+                             bool inheritProfileChild = false) {
   auto createFile = reinterpret_cast<NtCreateFileFunction>(
       GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtCreateFile"));
   require(createFile != nullptr, "execution_owner_unknown");
@@ -724,7 +762,8 @@ static Handle ownerDirectory(const std::wstring &path, bool create, const std::w
   if (create) {
     // Newly created private directories preserve trusted owner access in child files.
     // Existing project ACLs and explicit private record descriptors are unchanged.
-    std::wstring sddl = L"O:" + owner + L"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;" + owner + L")";
+    std::wstring sddl = L"O:" + owner + (inheritProfileChild ? L"D:" : L"D:P") +
+                        L"(A;OICI;FA;;;SY)(A;OICI;FA;;;" + owner + L")";
     require(ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1,
                                                                  &descriptor.value, nullptr) != 0,
             "execution_owner_unknown");
@@ -1905,8 +1944,15 @@ public:
       cohortSids = exactControllerCohortSids(probe.value, path);
       cohortSidsPtr = cohortSids.empty() ? nullptr : &cohortSids;
     }
+    const auto profileRoot = create ? preparedProfileRoot(path) : std::wstring();
+    JsonObject rootIdentity;
+    if (!profileRoot.empty()) rootIdentity = protectedProfileRoot(profileRoot, parents, owner);
     // Preparatory directories never need DELETE; ordinary owner fences retain it.
-    auto file = ownerDirectory(path, create, owner, cohortSidsPtr, selectedPackage, !prepareOnly);
+    auto file = ownerDirectory(path, create, owner, cohortSidsPtr, selectedPackage, !prepareOnly,
+                               !profileRoot.empty());
+    if (!profileRoot.empty())
+      require(protectedProfileRoot(profileRoot, parents, owner).Stringify() == rootIdentity.Stringify(),
+              "execution_owner_unknown");
     require(exactControllerRoot(file.value, path) == !cohortSids.empty(),
             "execution_containment_filesystem_denied");
     auto id = fileIdentity(file.value, owner, true, selectedPackage, cohortSidsPtr);
@@ -1975,6 +2021,8 @@ public:
                 equalPath(root.substr(split + 1 - profileNamespace.size(), profileNamespace.size()),
                           profileNamespace) && validTeamId(root.substr(split + 1)),
             "execution_owner_prepared_purpose_invalid");
+    require(preparedProfileRoot(directory.path) == root, "execution_owner_prepared_purpose_invalid");
+    const auto rootIdentity = protectedProfileRoot(root, directory.parents, directory.owner);
     const auto expectedHash = text(input, L"sha256");
     require(expectedHash.size() == 64 &&
                 expectedHash.find_first_not_of(L"0123456789abcdef") == std::wstring::npos,
@@ -1990,7 +2038,7 @@ public:
     held(input);
     const std::wstring name = config ? L"opencode.json" : L"auth.json";
     LocalMemory descriptor;
-    const auto sddl = L"O:" + directory.owner + L"D:P(A;;FA;;;SY)(A;;FA;;;" + directory.owner + L")";
+    const auto sddl = L"O:" + directory.owner + L"D:(A;;FA;;;SY)(A;;FA;;;" + directory.owner + L")";
     require(ConvertStringSecurityDescriptorToSecurityDescriptorW(
                 sddl.c_str(), SDDL_REVISION_1, &descriptor.value, nullptr) != 0,
             "execution_owner_unknown");
@@ -2030,6 +2078,8 @@ public:
                 fileIdentity(file.value, directory.owner, false, selectedPackage).Stringify() == identity.Stringify(),
             "execution_owner_prepared_invalid");
     held(input);
+    require(protectedProfileRoot(root, directory.parents, directory.owner).Stringify() == rootIdentity.Stringify(),
+            "execution_owner_unknown");
     JsonObject result;
     num(result, L"schema", 1); flag(result, L"ok", true);
     str(result, L"path", directory.path + L"\\" + name);

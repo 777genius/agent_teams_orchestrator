@@ -11,6 +11,7 @@ import type { SelectedExecutionProfile } from '../host/OpenCodeV2ExecutionBindin
 import { OpenCodeV2RunNonces } from './OpenCodeV2RunNonces.js'
 import { retainedControllerPath } from './OpenCodeV2ControllerTools.js'
 import { createWindowsNativeBroker, resolveWindowsNativeArtifact, type WindowsNativeBroker } from '../host/windows/OpenCodeV2WindowsNativeBroker.js'
+import { ensureWindowsPrivateDirectories } from '../profile/OpenCodePrivateDirectories.js'
 import type { WindowsLaunchPlan } from '../host/windows/OpenCodeV2WindowsExecution.js'
 export type { RunBinding, RunControlRecord, RunControlRequest, RunControlResult, RunLaunchPlan } from './OpenCodeV2RunTypes.js'
 
@@ -545,8 +546,13 @@ export async function reserveRunControlDirectory(dataRoot: string, binding: RunB
     executionAssert(await realpath(dataRoot) === dataRoot, 'run_control_native_unknown')
     const directory = runControlDirectory(dataRoot, binding.teamId, binding.runId)
     executionAssert(profiles.length > 0, 'run_control_selection_missing')
+    const admittedProfiles = profiles.map(windowsProfileAdmission)
+    // Explicit reservation prepares parents only. Native acquisition below is
+    // still the sole exclusive creator of the non-expiring run leaf/fence.
+    await ensureWindowsPrivateDirectories([dataRoot, path.join(dataRoot, 'opencode'),
+      path.join(dataRoot, 'opencode', 'v2'), path.dirname(directory)])
     const state = await windowsComposition(directory, {
-      mode: 'reserve', dataRoot, binding, profiles: profiles.map(windowsProfileAdmission),
+      mode: 'reserve', dataRoot, binding, profiles: admittedProfiles,
     })
     await state.broker.request('runStateReserve', {
       stateId: state.stateId, binding, sourceSha256, directory, dataRoot, sharedControllerRootCohort: true,

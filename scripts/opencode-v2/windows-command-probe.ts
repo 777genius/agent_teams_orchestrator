@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { copyFile, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
@@ -13,6 +13,10 @@ assert.equal(process.versions.bun, '1.3.11')
 const root = process.argv[2], receiptPath = process.argv[3]
 assert.ok(root && receiptPath && path.win32.isAbsolute(root) && path.win32.isAbsolute(receiptPath))
 assert.match(path.win32.basename(root), /^TEST-windows-command-[a-zA-Z0-9-]+$/)
+const profileRoot = path.join(root, 'opencode', 'v2', 'profiles', 'TEST-prepared')
+const profileChildren = ['home', 'config', 'data', 'cache', 'state', 'tmp', 'appdata', 'localappdata', 'config/opencode', 'data/opencode'].map(value => path.join(profileRoot, value))
+const configContent = JSON.stringify({ 'TEST-only': 'config-read-é' }), authContent = JSON.stringify({ 'TEST-provider': { type: 'api', key: 'TEST-never-used' } }, null, 2)
+const expectedPreparedHashes = { configSHA256: createHash('sha256').update(configContent).digest('hex'), authSHA256: createHash('sha256').update(authContent).digest('hex') }
 const nonce = randomUUID(), leaseOwnerId = randomUUID(), journal = path.join(root, 'ancestor-journal.json')
 const broker = createWindowsNativeBroker(await resolveWindowsNativeArtifact())
 broker.events.on('error', () => {})
@@ -54,6 +58,37 @@ async function output(commandId: string, stream: 'stdout' | 'stderr') {
     assert.equal(value.eof, false); await Bun.sleep(10)
   }
 }
+// Serialized after Bun removes TypeScript syntax. This actual AppContainer
+// child reads only synthetic prepared files and emits digests, never auth bytes.
+async function verifyPreparedProfileFiles(): Promise<void> {
+  const { readFile } = await import('node:fs/promises')
+  const { createHash } = await import('node:crypto')
+  const path = await import('node:path')
+  const root = process.env.TEST_PREPARED_PROFILE
+  if (!root) throw new Error('TEST_profile_missing')
+  const config = await readFile(path.join(root, 'config', 'opencode', 'opencode.json'))
+  const auth = await readFile(path.join(root, 'data', 'opencode', 'auth.json'))
+  await Bun.stdout.write(JSON.stringify({ configSHA256: createHash('sha256').update(config).digest('hex'),
+    authSHA256: createHash('sha256').update(auth).digest('hex') }))
+}
+async function assertProfilePackageAces(expected: boolean): Promise<void> {
+  assert.ok(sid)
+  const paths = [profileRoot, ...profileChildren, path.join(profileRoot, 'config', 'opencode', 'opencode.json'),
+    path.join(profileRoot, 'data', 'opencode', 'auth.json')]
+  const rows: unknown = JSON.parse(await ps(`
+$ErrorActionPreference='Stop'
+$paths=@($env:TEST_PROFILE_PATHS|ConvertFrom-Json)
+$rows=@(foreach($p in $paths){$acl=Get-Acl -LiteralPath $p;$present=$false
+foreach($rule in @($acl.Access)){if($rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value-eq $env:TEST_SID){$present=$true}}
+[ordered]@{path=$p;present=$present;protected=$acl.AreAccessRulesProtected}})
+[Console]::Write((ConvertTo-Json -InputObject $rows -Compress))`, { TEST_SID: sid, TEST_PROFILE_PATHS: JSON.stringify(paths) }))
+  assert.ok(Array.isArray(rows)); assert.equal(rows.length, paths.length)
+  rows.forEach((value: unknown, index: number) => {
+    const row = record(value)
+    assert.equal(row.path, paths[index]); assert.equal(row.present, expected)
+    assert.equal(row.protected, index === 0)
+  })
+}
 const activeCommands = new Set<string>()
 async function start(script: string, stdin: 'ignore' | 'pipe') {
   const commandId = randomUUID()
@@ -84,6 +119,19 @@ const environment: Record<string, string> = {
 }
 try {
   const parent = await filesystem.createDirectory(root); await parent.close()
+  // Exact native profile hierarchy; only its ROOT receives a launch grant.
+  for (const directory of [path.join(root, 'opencode'), path.join(root, 'opencode', 'v2'),
+    path.join(root, 'opencode', 'v2', 'profiles'), profileRoot, ...profileChildren.slice(0, 8)]) {
+    const prepared = await filesystem.prepareDirectory(directory, true); await prepared.close()
+  }
+  const configDirectory = await filesystem.createDirectory(path.join(profileRoot, 'config', 'opencode'))
+  try { await configDirectory.writePreparedConfig(configContent, expectedPreparedHashes.configSHA256) }
+  finally { await configDirectory.close() }
+  const dataDirectory = await filesystem.createDirectory(path.join(profileRoot, 'data', 'opencode'))
+  try { await dataDirectory.writePreparedAuth(authContent, expectedPreparedHashes.authSHA256) }
+  finally { await dataDirectory.close() }
+  environment.TEST_PREPARED_PROFILE = profileRoot
+  await writeFile(path.join(root, 'prepared-read.ts'), `(${verifyPreparedProfileFiles.toString()})()`)
   const fencePath = path.join(root, '.native-owner')
   const fence = await filesystem.createDirectory(fencePath); handles.push(fence)
   await fence.writeExclusive('owner.json', { schema: 1, testOnly: true, nonce, leaseOwnerId })
@@ -131,7 +179,7 @@ $sid
   assert.match(sid, /^S-1-15-2-/)
   stage = 'native-main-launch'; launched = true
   await fence.assertOwned()
-  const mapping = record(await broker.request('launch', { executable: path.join(root, 'bun.exe'), entry: path.join(root, 'main.ts'), cwd: root, env: environment, writableRoots: [root], readOnlyRoots: [], protectedRoots: [fencePath], nonce, leaseOwnerId }))
+  const mapping = record(await broker.request('launch', { executable: path.join(root, 'bun.exe'), entry: path.join(root, 'main.ts'), cwd: root, env: environment, writableRoots: [root, profileRoot], readOnlyRoots: [], protectedRoots: [fencePath], nonce, leaseOwnerId }))
   assert.equal(mapping.containerSid, sid)
   const main = record(mapping.bun); originalMapping = mapping
   const connected = await until(() => nativePeer)
@@ -142,6 +190,14 @@ $sid
   assert.equal(prepared.pid, main.nativePID)
   assert.equal(prepared.nonce, nonce); assert.equal(prepared.leaseOwnerId, leaseOwnerId)
   assert.deepEqual(prepared.birth, main.birth); assert.equal(prepared.namespace, mapping.namespace)
+  stage = 'native-prepared-profile-read'
+  await assertProfilePackageAces(true)
+  const preparedRead = await start(path.join(root, 'prepared-read.ts'), 'ignore')
+  const [preparedOutput, preparedError] = await Promise.all([output(preparedRead.commandId, 'stdout'), output(preparedRead.commandId, 'stderr')])
+  assert.equal(preparedError.length, 0)
+  assert.deepEqual(JSON.parse(preparedOutput.toString('utf8')), expectedPreparedHashes)
+  await closeCommand(preparedRead.commandId)
+  facts.preparedProfileRootOnlyGrantReadHashes = expectedPreparedHashes
   stage = 'native-file-output'
   const command = await start(path.join(root, 'output.ts'), 'ignore')
   const [stdout, stderr] = await Promise.all([output(command.commandId, 'stdout'), output(command.commandId, 'stderr')])
@@ -206,6 +262,9 @@ finally {
       retirementFacts.mainExitMappingMatches = isDeepStrictEqual(mainExited.mapping, originalMapping)
       assert.equal(mainExited.heldProcessExited, true); assert.deepEqual(mainExited.mapping, originalMapping)
       facts.retirement = receipt; facts.originalMainRetirement = mainExited; retired = true
+      retirementPhase = 'prepared_profile_aces_removed'
+      await assertProfilePackageAces(false)
+      facts.preparedProfileOwnAcesRemoved = true
     } catch (error) {
       const code = error instanceof Error && /^[a-z_]{1,96}(?::[a-z_]{1,64}:\d{1,10})?$/.test(error.message)
         ? error.message : error instanceof Error && error.name === 'AssertionError' ? 'retirement_assertion_failed' : 'retirement_unknown'
