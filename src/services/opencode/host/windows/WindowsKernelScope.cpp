@@ -3228,6 +3228,14 @@ static SharedReadAclCustody sharedReadAclCustody(HANDLE file, const std::wstring
   }
   return result;
 }
+// SetSecurityInfo converts an unprotected legacy DACL to automatic inheritance.
+// Permit only the observed PRESENT -> PRESENT|AUTO_INHERITED normalization
+// during our own write; retained custody checks still compare every control bit.
+static bool sharedReadControlAfterOwnWrite(SECURITY_DESCRIPTOR_CONTROL before,
+                                           SECURITY_DESCRIPTOR_CONTROL after) {
+  return after == before ||
+      (before == SE_DACL_PRESENT && after == (SE_DACL_PRESENT | SE_DACL_AUTO_INHERITED));
+}
 static void assertSharedReadRootsLive(const Scope &scope) {
   for (const auto &root : scope.aclRoots) if (root.sharedRoot) {
     root.assertLive();
@@ -3311,7 +3319,7 @@ static void grantRoot(Scope &scope, Handle heldRoot, DWORD mask, ACCESS_MODE mod
     const auto after = sharedReadAclCustody(heldAcl, owner, scope.sid.value, "execution_containment_filesystem_denied");
     require(after.ownerSid == sharedBefore.ownerSid,
             "execution_containment_filesystem_denied", "shared_readonly_owner_changed");
-    if (after.daclControl != sharedBefore.daclControl)
+    if (!sharedReadControlAfterOwnWrite(sharedBefore.daclControl, after.daclControl))
       throw NativeError{"execution_containment_filesystem_denied",
                         (static_cast<DWORD>(sharedBefore.daclControl) << 16) |
                             static_cast<DWORD>(after.daclControl),
@@ -3320,6 +3328,7 @@ static void grantRoot(Scope &scope, Handle heldRoot, DWORD mask, ACCESS_MODE mod
             "execution_containment_filesystem_denied", "shared_readonly_foreign_changed");
     require(after.memberAllowed,
             "execution_containment_filesystem_denied", "shared_readonly_member_missing");
+    scope.aclRoots.back().sharedDaclControl = after.daclControl;
   } else {
     const auto after = aclCustody(heldAcl, owner, scope.sid.value, cohortSidsPtr, "execution_containment_filesystem_denied");
     require(after.siblings == before.siblings, "execution_containment_filesystem_denied");
@@ -3377,7 +3386,8 @@ static void removeGrants(Scope &scope) {
             "cleanup_unknown");
     if (it->sharedRoot) {
       const auto after = sharedReadAclCustody(handle, owner, scope.sid.value, "cleanup_unknown");
-      require(after.ownerSid == sharedBefore.ownerSid && after.daclControl == sharedBefore.daclControl &&
+      require(after.ownerSid == sharedBefore.ownerSid &&
+                sharedReadControlAfterOwnWrite(sharedBefore.daclControl, after.daclControl) &&
                 after.foreignAces == sharedBefore.foreignAces && !after.memberAllowed,
               "cleanup_unknown");
     } else {
