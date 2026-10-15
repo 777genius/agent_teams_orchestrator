@@ -1,5 +1,5 @@
 import { openCodeBunVersion } from '../../../constants/openCodeBunVersion.js'
-import { retainOpenCodeV2InitializationPhase, type RunInitializationPhase } from '../execution/OpenCodeV2Diagnostics.js'
+import { recordOpenCodeV2ProviderFailure, retainOpenCodeV2InitializationPhase, type RunInitializationPhase } from '../execution/OpenCodeV2Diagnostics.js'
 import { captureOwnedV2ProbeAuthority, buildOwnedV2ProbeProof, type ProbeAuthority } from './OpenCodeV2ProbeProof.js'
 import { readOwnedControllerInbox, readOwnedControllerTools, type ControllerToolProof } from './OpenCodeV2ControllerTools.js'
 import { spawn } from 'node:child_process'
@@ -27,7 +27,7 @@ const sha = (value: string | Buffer) => createHash('sha256').update(value).diges
 type Member = {
   plan: RunMemberPlan; lease: ExecutionLease; client: ExecutionBridgeClient; authority: SessionAuthority
   store: OpenCodeV2AdmissionStore; session: OpenCodeV2SessionService; state: RunMemberStatus['state']
-  probeAuthority?: ProbeAuthority; bootstrap: InstructionReceipt | null; mcpConnected: boolean; controllerTools?: ControllerToolProof; intents: Map<string, QueueIntent>; deliveryTail: Promise<void>; refusals: Map<string, QueueIntent>
+  creationWrapperEntered: boolean; probeAuthority?: ProbeAuthority; bootstrap: InstructionReceipt | null; mcpConnected: boolean; controllerTools?: ControllerToolProof; intents: Map<string, QueueIntent>; deliveryTail: Promise<void>; refusals: Map<string, QueueIntent>
 }
 
 export function validateRunLaunchPlan(plan: RunLaunchPlan): void {
@@ -158,12 +158,14 @@ export class OpenCodeV2RunOwner {
         agent: memberPlan.profile.selection.agent, model: memberPlan.profile.selection.model }
       const store = await OpenCodeV2AdmissionStore.open(this.plan.dataRoot, authority)
       const session = new OpenCodeV2SessionService(client, store, authority)
-      member = { plan: memberPlan, lease, client, authority, store, session, state: 'unknown', bootstrap: null, mcpConnected: false, intents: new Map(), deliveryTail: Promise.resolve(), refusals: new Map() }
+      member = { plan: memberPlan, lease, client, authority, store, session, state: 'unknown', creationWrapperEntered: false,
+        bootstrap: null, mcpConnected: false, intents: new Map(), deliveryTail: Promise.resolve(), refusals: new Map() }
       this.members.set(memberPlan.memberId, member)
       this.pendingLeases.delete(memberPlan.memberId)
       executionAssert(this.state === 'starting' && !this.initializationAbort.signal.aborted &&
         Date.now() < initializationDeadline, 'run_stopped')
       await session.reserveSession()
+      member.creationWrapperEntered = true
       const created = await session.createSession(memberPlan.title)
       member.state = created.disposition
       await this.persistState()
@@ -435,61 +437,71 @@ export class OpenCodeV2RunOwner {
           }
         }
       }
-      const errors: string[] = [], ids: readonly string[] = await boundOpenCodeRead(fence(), Math.max(1, fenceDeadline - Date.now()))
-        .catch(() => { errors.push('tombstone_unknown'); return [] })
+      const errors: string[] = []
+      const ids: readonly string[] = member.creationWrapperEntered
+        ? await boundOpenCodeRead(fence(), Math.max(1, fenceDeadline - Date.now())).catch(() => { errors.push('tombstone_unknown'); return [] })
+        : []
       let cleanupClient: ExecutionBridgeClient | undefined
-      try {
-        // Cleanup has its own operation context. It never extends a prompt's
-        // deadline or reopens lease/session authority after the run tombstone.
-        cleanupClient = await boundOpenCodeRead(this.ports.client(member.lease.authority,
-          this.context(member.plan, Math.min(cleanupDeadline, Date.now() + 5000))), remaining(2000))
-        const native = cleanupClient, admissions = new OpenCodeV2AdmissionService(native, member.store, member.authority)
-        const candidates = ids.map(nativeInputID => ({ nativeInputID, deadline: Date.now() + remaining(2000) }))
-        // Read terminal cuts before interrupt can change their native log. Classification
-        // and any remaining cancellation share the original per-input deadline.
-        const dispositions = await Promise.all(candidates.map(async ({ nativeInputID, deadline }) => {
-          const original = member.intents.get(nativeInputID)
-          const disposition = original ? await boundOpenCodeRead(admissions.dispositionAfterStop(original), Math.max(1, deadline - Date.now()))
-            .catch(() => 'unknown' as const) : 'unknown'
-          return Date.now() < deadline ? disposition : 'unknown'
-        }))
-        const routing = await Promise.allSettled(candidates.map(async ({ nativeInputID, deadline }, index) => {
-          const disposition = dispositions[index]
-          executionAssert(disposition !== 'unknown', 'stop_original_unknown')
-          if (disposition !== 'pending') return disposition
-          try {
-            const budget = deadline - Date.now()
-            executionAssert(budget > 0, 'authority_or_deadline')
-            await boundOpenCodeRead(native.cancelInbox(member.authority.sessionID, nativeInputID), budget)
-            return 'cancelled' as const
-          } catch {
-            // A pending input can promote between the read and cancellation.
-            // No HTTP error itself proves delivery; independently bind the
-            // original projected USER/terminal cut before routing to interrupt.
-            const original = member.intents.get(nativeInputID), budget = deadline - Date.now()
-            executionAssert(original && budget > 0, 'stop_original_unknown')
-            const raced = await boundOpenCodeRead(admissions.dispositionAfterStop(original), budget)
-            executionAssert(raced === 'projected' || raced === 'terminal', 'stop_original_unknown')
-            return raced
+      if (member.creationWrapperEntered) {
+        try {
+          // Cleanup has its own operation context. It never extends a prompt's
+          // deadline or reopens lease/session authority after the run tombstone.
+          cleanupClient = await boundOpenCodeRead(this.ports.client(member.lease.authority,
+            this.context(member.plan, Math.min(cleanupDeadline, Date.now() + 5000))), remaining(2000))
+          const native = cleanupClient, admissions = new OpenCodeV2AdmissionService(native, member.store, member.authority)
+          const candidates = ids.map(nativeInputID => ({ nativeInputID, deadline: Date.now() + remaining(2000) }))
+          // Read terminal cuts before interrupt can change their native log. Classification
+          // and any remaining cancellation share the original per-input deadline.
+          const dispositions = await Promise.all(candidates.map(async ({ nativeInputID, deadline }) => {
+            const original = member.intents.get(nativeInputID)
+            const disposition = original ? await boundOpenCodeRead(admissions.dispositionAfterStop(original), Math.max(1, deadline - Date.now()))
+              .catch(() => 'unknown' as const) : 'unknown'
+            return Date.now() < deadline ? disposition : 'unknown'
+          }))
+          const routing = await Promise.allSettled(candidates.map(async ({ nativeInputID, deadline }, index) => {
+            const disposition = dispositions[index]
+            executionAssert(disposition !== 'unknown', 'stop_original_unknown')
+            if (disposition !== 'pending') return disposition
+            try {
+              const budget = deadline - Date.now()
+              executionAssert(budget > 0, 'authority_or_deadline')
+              await boundOpenCodeRead(native.cancelInbox(member.authority.sessionID, nativeInputID), budget)
+              return 'cancelled' as const
+            } catch {
+              // A pending input can promote between the read and cancellation.
+              // No HTTP error itself proves delivery; independently bind the
+              // original projected USER/terminal cut before routing to interrupt.
+              const original = member.intents.get(nativeInputID), budget = deadline - Date.now()
+              executionAssert(original && budget > 0, 'stop_original_unknown')
+              const raced = await boundOpenCodeRead(admissions.dispositionAfterStop(original), budget)
+              executionAssert(raced === 'projected' || raced === 'terminal', 'stop_original_unknown')
+              return raced
+            }
+          }))
+          const interruption = await boundOpenCodeRead(native.interrupt(member.authority.sessionID), remaining(2000))
+          executionAssert(routing.every(result => result.status === 'fulfilled'), 'stop_original_unknown')
+          if (!interruption.interrupted) {
+            for (let index = 0; index < routing.length; index++) {
+              const result = routing[index], candidate = candidates[index]!
+              if (result?.status !== 'fulfilled' || result.value !== 'projected') continue
+              const original = member.intents.get(candidate.nativeInputID), budget = candidate.deadline - Date.now()
+              executionAssert(original && budget > 0 &&
+                await boundOpenCodeRead(admissions.terminalAfterStop(original), budget), 'stop_interrupt_unknown')
+            }
           }
-        }))
-        const interruption = await boundOpenCodeRead(native.interrupt(member.authority.sessionID), remaining(2000))
-        executionAssert(routing.every(result => result.status === 'fulfilled'), 'stop_original_unknown')
-        if (!interruption.interrupted) {
-          for (let index = 0; index < routing.length; index++) {
-            const result = routing[index], candidate = candidates[index]!
-            if (result?.status !== 'fulfilled' || result.value !== 'projected') continue
-            const original = member.intents.get(candidate.nativeInputID), budget = candidate.deadline - Date.now()
-            executionAssert(original && budget > 0 &&
-              await boundOpenCodeRead(admissions.terminalAfterStop(original), budget), 'stop_interrupt_unknown')
-          }
-        }
-      } catch { errors.push('cancel_or_interrupt_unknown') }
+        } catch { errors.push('cancel_or_interrupt_unknown') }
+      }
       try { await boundOpenCodeRead(Promise.all([member.client.dispose(), ...(cleanupClient ? [cleanupClient.dispose()] : [])]), remaining(2000)) }
       catch { errors.push('readers_unknown') }
       let cleanup: RunStopMember['cleanup'] = null
+      const cleanupStartedAt = Date.now()
       try { cleanup = await boundOpenCodeRead(this.closeLease(member.lease), remaining(22_000)) }
-      catch { errors.push('physical_cleanup_unknown') }
+      catch (failure) {
+        errors.push('physical_cleanup_unknown')
+        // Best-effort observation never extends the original physical stop budget.
+        void recordOpenCodeV2ProviderFailure('run-member-retirement', failure, true, undefined, undefined,
+          { elapsedMs: Date.now() - cleanupStartedAt, dataRoot: this.plan.dataRoot }).catch(() => undefined)
+      }
       if (!durable) errors.push('run_tombstone_unknown')
       return { memberId: member.plan.memberId, cleanup, errors }
     }))

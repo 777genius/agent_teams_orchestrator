@@ -109,7 +109,7 @@ const privateProviderFailureCodes = new Set(['provider_missing', 'provider_key_m
   'execution_profile_changed', 'execution_graph_changed', 'execution_graph_incomplete', 'execution_graph_dependency_missing',
   'execution_timeout', 'execution_owner_unknown', 'cleanup_unknown', 'selection_mismatch', 'authority_mismatch',
   'graph_mismatch', 'identity_mismatch', 'unqualified_version', 'invalid_response', 'invalid_model',
-  'http_failure', 'transport_failure', 'media_type', 'deadline', 'authority_or_deadline', 'disposed'])
+  'http_failure', 'transport_failure', 'media_type', 'deadline', 'authority_or_deadline', 'disposed', 'timeout'])
 // Exact native producer literals only; neither an arbitrary message nor a
 // syntactically plausible unknown stage is persisted as diagnostic data.
 const privateNativeFailureCodes = new Set([
@@ -117,7 +117,7 @@ const privateNativeFailureCodes = new Set([
   'execution_containment_helper_closed', 'execution_containment_helper_failed', 'execution_containment_helper_identity',
   'execution_containment_launcher_denied', 'execution_containment_pipe_denied', 'execution_containment_profile_denied',
   'execution_containment_unavailable', 'execution_native_command_unknown', 'execution_native_stdio_owner_unknown',
-  'execution_native_timeout', 'execution_native_unknown', 'execution_owner_alias',
+  'execution_native_timeout', 'execution_native_unknown', 'execution_owner_alias', 'run_control_process_identity',
   'execution_owner_archive_identity_mismatch', 'execution_owner_archive_path_mismatch', 'execution_owner_archive_reopen_identity_mismatch',
   'execution_owner_archive_unknown', 'execution_owner_local_volume_required', 'execution_owner_metadata_budget',
   'execution_owner_metadata_changed', 'execution_owner_metadata_invalid', 'execution_owner_metadata_missing',
@@ -125,6 +125,7 @@ const privateNativeFailureCodes = new Set([
   'execution_owner_path_invalid', 'execution_owner_prepared_invalid', 'execution_owner_prepared_purpose_invalid',
   'execution_owner_read_only', 'execution_owner_unknown', 'execution_owner_write_through_pending'])
 const privateNativeFailureStages = new Set([
+  'process_birth', 'process_image_path', 'process_image_open', 'process_birth_changed',
   'shared_acl_mutex_descriptor', 'shared_acl_mutex_create', 'shared_acl_mutex_security',
   'shared_acl_mutex_encoding', 'shared_acl_mutex_authority', 'shared_acl_mutex_wait', 'shared_acl_mutex',
   'owner_archive_nt_rename', 'owner_canonical_open', 'owner_directory_create',
@@ -154,7 +155,7 @@ function nativeFailure(error: unknown): { category: string; native?: { stage: st
     ? { native: { stage: match[2]!, nativeCode } } : {}) }
 }
 /** Private static phase/category only: never an arbitrary SDK message, body, credential or key. */
-export async function recordOpenCodeV2ProviderFailure(phase: string, error: unknown, retainedOriginal: boolean, startupOutput?: string, acquisitionTiming?: unknown): Promise<void> {
+export async function recordOpenCodeV2ProviderFailure(phase: string, error: unknown, retainedOriginal: boolean, startupOutput?: string, acquisitionTiming?: unknown, cleanupTiming?: Readonly<{ elapsedMs: number; dataRoot?: string }>): Promise<void> {
   // Only our finite cleanup wrappers may preserve one exact known cause.
   const cause = error instanceof Error && (error.message === 'cleanup_unknown' || error.message === 'execution_owner_unknown')
     ? error.cause : undefined
@@ -164,9 +165,13 @@ export async function recordOpenCodeV2ProviderFailure(phase: string, error: unkn
   const operation = readOpenCodeV2ProviderWireFailure(error)
   const startup = startupDiagnostic(startupOutput)
   const acquisition = acquisitionDiagnostic(acquisitionTiming)
+  const cleanup = phase === 'run-member-retirement' && Number.isSafeInteger(cleanupTiming?.elapsedMs) &&
+    Number(cleanupTiming?.elapsedMs) >= 0 && Number(cleanupTiming?.elapsedMs) <= 86_400_000
+    ? { elapsedMs: Number(cleanupTiming?.elapsedMs) } : undefined
   const initialization = phase === 'run-owner-initialization' && error instanceof Error ? initializationFailures.get(error) : undefined
+  if (cleanupTiming?.dataRoot !== undefined && (!cleanup || typeof cleanupTiming.dataRoot !== 'string' || !path.isAbsolute(cleanupTiming.dataRoot))) return
   try {
-    const directory = path.join(resolveClaudeMultimodelPaths().data, 'opencode/v2/provider-diagnostics')
+    const directory = path.join(cleanupTiming?.dataRoot ?? resolveClaudeMultimodelPaths().data, 'opencode/v2/provider-diagnostics')
     if (process.platform === 'win32') {
       await ensureWindowsPrivateDirectories([directory])
     } else {
@@ -177,6 +182,6 @@ export async function recordOpenCodeV2ProviderFailure(phase: string, error: unkn
     // Nonsecret observational data only: this file is not native ownership or
     // cleanup authority, even when an elevated Windows writer owns the file.
     await writeFile(path.join(directory, randomUUID() + '.json'), JSON.stringify({ schemaVersion: 1, phase, category, retainedOriginal,
-      ...(native?.native ? { native: native.native } : {}), ...(operation ? { operation } : {}), ...(startup ? { startup } : {}), ...(acquisition ? { acquisition } : {}), ...(initialization ? { initialization } : {}), recordedAt: new Date().toISOString() }), { flag: 'wx', mode: 0o600 })
+      ...(native?.native ? { native: native.native } : {}), ...(operation ? { operation } : {}), ...(startup ? { startup } : {}), ...(acquisition ? { acquisition } : {}), ...(cleanup ? { cleanup } : {}), ...(initialization ? { initialization } : {}), recordedAt: new Date().toISOString() }), { flag: 'wx', mode: 0o600 })
   } catch { /* Diagnostics cannot replace or retry the unresolved original operation. */ }
 }

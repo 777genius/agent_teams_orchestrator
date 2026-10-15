@@ -284,3 +284,29 @@ test('native diagnostics retain only closed producer codes and stages with uint3
     await rm(root, { recursive: true, force: true })
   }
 })
+
+// Cleanup diagnostics preserve only finite reasons and elapsed time, never error payloads.
+test('retirement diagnostics retain bounded timing and native failure without private payload', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'TEST-v2-close-diagnostic-'))
+  const previous = process.env.CLAUDE_MULTIMODEL_DATA_HOME
+  process.env.CLAUDE_MULTIMODEL_DATA_HOME = root
+  const secret = 'TEST-PRIVATE-CLOSE-PAYLOAD'
+  try {
+    await recordOpenCodeV2ProviderFailure('run-member-retirement', new Error('timeout', { cause: new Error(secret) }), true, undefined, undefined, { elapsedMs: 22001, dataRoot: root })
+    await recordOpenCodeV2ProviderFailure('run-member-retirement', new Error('run_control_process_identity:process_image_path:31'), true, undefined, undefined, { elapsedMs: 7 })
+    await recordOpenCodeV2ProviderFailure('run-member-retirement', new Error(secret), true, undefined, undefined, { elapsedMs: -1 })
+    const rows = await Promise.all((await readdir(path.join(root, 'opencode/v2/provider-diagnostics'))).map(async name => {
+      const bytes = await readFile(path.join(root, 'opencode/v2/provider-diagnostics', name), 'utf8')
+      expect(bytes).not.toContain(secret)
+      return JSON.parse(bytes)
+    }))
+    expect(rows).toHaveLength(3)
+    expect(rows.find(row => row.category === 'timeout').cleanup).toEqual({ elapsedMs: 22001 })
+    expect(rows.find(row => row.category === 'run_control_process_identity')).toMatchObject({ native: { stage: 'process_image_path', nativeCode: 31 }, cleanup: { elapsedMs: 7 } })
+    expect(rows.find(row => row.category === 'provider_operation_unknown').cleanup).toBeUndefined()
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_DATA_HOME
+    else process.env.CLAUDE_MULTIMODEL_DATA_HOME = previous
+    await rm(root, { recursive: true, force: true })
+  }
+})
