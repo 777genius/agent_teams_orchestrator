@@ -4,9 +4,53 @@ import { mkdtemp, mkdir, writeFile, symlink, rm, chmod, realpath } from 'node:fs
 import path from 'node:path'
 import { executionHash } from '../execution/OpenCodeV2ExecutionContracts.js'
 import type { SelectedExecutionProfile } from '../host/OpenCodeV2ExecutionHost.js'
-import { readOwnedControllerInbox, type ControllerToolProof } from './OpenCodeV2ControllerTools.js'
+import { CONTROLLER_INBOX_MAX_BYTES, parseControllerInboxBytes, readOwnedControllerInbox,
+  type ControllerToolProof } from './OpenCodeV2ControllerTools.js'
 
-test('selected local canonical inbox reader binds exact config, schema and bounded owned regular bytes', async () => {
+const originalBinding = { teamId: 'TEST-team', runId: 'TEST-run', memberId: 'worker', sessionID: 'ses_TESToriginal' }
+const message = { from: 'worker', to: 'user', text: 'TEST reply', timestamp: '2026-10-10T00:00:00Z',
+  read: false, source: 'runtime_delivery', relayOfMessageId: 'TEST-inbound', messageId: 'TEST-real' }
+
+test('shared controller inbox parser preserves messages and only the original member/session binding', () => {
+  const binding = { ...originalBinding }
+  const result = parseControllerInboxBytes(Buffer.from(JSON.stringify([{ ...message,
+    binding: { ...binding, sessionID: 'ses_TESTforeign' }, unexpected: 'TEST-ignored' }])), binding)
+  expect(result).toEqual({ binding: originalBinding, messages: [message] })
+  binding.sessionID = 'ses_TESTlater'
+  expect(result?.binding.sessionID).toBe('ses_TESToriginal')
+  expect(Object.isFrozen(result)).toBe(true)
+  expect(Object.isFrozen(result?.binding)).toBe(true)
+  expect(Object.isFrozen(result?.messages)).toBe(true)
+  expect(Object.isFrozen(result?.messages[0])).toBe(true)
+  expect(parseControllerInboxBytes(null, originalBinding)).toBeNull()
+  expect(parseControllerInboxBytes(Buffer.from('[]'), originalBinding)).toEqual({ binding: originalBinding, messages: [] })
+  const { source: _, relayOfMessageId: __, ...required } = message
+  expect(parseControllerInboxBytes(Buffer.from(JSON.stringify([required])), originalBinding)?.messages).toEqual([required])
+})
+
+test('shared controller inbox parser refuses malformed JSON, rows and required or optional field types', () => {
+  const invalid: unknown[] = [null, {}, [null], [[]], [true], [{ ...message, read: 'false' }],
+    [{ ...message, source: null }], [{ ...message, relayOfMessageId: 1 }]]
+  for (const field of ['messageId', 'from', 'to', 'text', 'timestamp']) {
+    const missing: Record<string, unknown> = { ...message }; delete missing[field]
+    invalid.push([missing], [{ ...message, [field]: '' }], [{ ...message, [field]: 1 }])
+  }
+  for (const value of invalid)
+    expect(() => parseControllerInboxBytes(Buffer.from(JSON.stringify(value)), originalBinding)).toThrow('run_controller_inbox_unknown')
+  for (const value of ['', '{', '[{}'])
+    expect(() => parseControllerInboxBytes(Buffer.from(value), originalBinding)).toThrow('run_controller_inbox_unknown')
+})
+
+test('shared controller inbox parser bounds raw bytes and message count on every platform', () => {
+  const encode = (count: number) => Buffer.from(JSON.stringify(Array.from({ length: count }, () => message)))
+  expect(parseControllerInboxBytes(encode(4096), originalBinding)?.messages.length).toBe(4096)
+  expect(() => parseControllerInboxBytes(encode(4097), originalBinding)).toThrow('run_controller_inbox_unknown')
+  const maximum = Buffer.alloc(CONTROLLER_INBOX_MAX_BYTES, ' '); maximum.write('[]')
+  expect(parseControllerInboxBytes(maximum, originalBinding)?.messages).toEqual([])
+  expect(() => parseControllerInboxBytes(Buffer.concat([maximum, Buffer.from(' ')]), originalBinding)).toThrow('run_controller_inbox_unknown')
+})
+
+test.skipIf(process.platform === 'win32')('selected local canonical inbox reader binds exact config, schema and bounded owned regular bytes', async () => {
   const root = await realpath(await mkdtemp(path.join(process.env.TMPDIR!, 'TEST-controller-inbox-')))
   const directory = path.join(root, 'teams/TEST-team/inboxes')
   const binding = { teamId: 'TEST-team', runId: 'TEST-run', memberId: 'worker', sessionID: 'ses_TESToriginal' }

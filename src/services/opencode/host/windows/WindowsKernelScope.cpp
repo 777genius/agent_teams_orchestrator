@@ -1004,7 +1004,8 @@ struct SelectedControllerInbox {
   }
 
   std::wstring assertLive(PSID package,
-                          const std::vector<std::wstring> *cohortSids = nullptr) const {
+                          const std::vector<std::wstring> *cohortSids = nullptr,
+                          std::vector<BYTE> *output = nullptr) const {
     require(directories.size() == directoryIdentities.size() && directoryPaths.size() == 3,
             "run_controller_inbox_unknown");
     for (size_t i = 0; i < directories.size(); ++i) {
@@ -1039,6 +1040,7 @@ struct SelectedControllerInbox {
       firstMissing = i + 1;
     }
     std::wstring state = L"absent";
+    std::vector<BYTE> verifiedBytes;
     if (firstMissing == 3) {
       Handle user(CreateFileW(extended(userPath).c_str(), GENERIC_READ | READ_CONTROL,
                               FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
@@ -1053,7 +1055,7 @@ struct SelectedControllerInbox {
                 "run_controller_inbox_unknown");
         const auto identity =
             fileIdentity(user.value, currentSid(), false, package, rootSids(userPath, cohortSids));
-        const auto bytes = heldFileBytes(user.value, 4 * 1024 * 1024);
+        auto bytes = heldFileBytes(user.value, 4 * 1024 * 1024);
         FILE_STANDARD_INFO after{};
         require(GetFileInformationByHandleEx(user.value, FileStandardInfo, &after, sizeof(after)) &&
                     before.EndOfFile.QuadPart == after.EndOfFile.QuadPart &&
@@ -1078,6 +1080,7 @@ struct SelectedControllerInbox {
                         identity.Stringify(),
                 "run_controller_inbox_unknown");
         state = L"regular";
+        if (output) verifiedBytes = std::move(bytes);
       } else {
         const DWORD error = GetLastError();
         require(error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND,
@@ -1132,6 +1135,9 @@ struct SelectedControllerInbox {
       require(error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND,
               "run_controller_inbox_unknown");
     }
+    // No bytes escape before the held/named file and every retained directory
+    // have passed their final identity and absence checks.
+    if (output) *output = std::move(verifiedBytes);
     return state;
   }
 };
@@ -1310,11 +1316,12 @@ public:
     for (const auto &entry : inboxes) entry.second.assertLive(package, cohortSids);
   }
   std::wstring inboxState(const std::wstring &teamId, PSID package,
-                          const std::vector<std::wstring> *cohortSids = nullptr) const {
+                          const std::vector<std::wstring> *cohortSids = nullptr,
+                          std::vector<BYTE> *output = nullptr) const {
     if (remoteController) return L"not_applicable";
     auto found = inboxes.find(teamId);
     require(found != inboxes.end(), "run_controller_inbox_unknown");
-    return found->second.assertLive(package, cohortSids);
+    return found->second.assertLive(package, cohortSids, output);
   }
 };
 struct ClosedControllerCohortMember {
@@ -4763,6 +4770,93 @@ public:
       JsonObject result;
       str(result, L"stateId", state.id());
       result.SetNamedValue(L"record", endpoint);
+      return result;
+    }
+    if (operation == L"runStateReadControllerInbox") {
+      exactObject(input, {L"stateId", L"directory", L"teamId", L"runId", L"root",
+                          L"databasePath", L"sha256"}, "run_controller_inbox_unknown");
+      auto &state = namedState(owners, input);
+      const auto binding = state.binding();
+      validateRequestBinding(binding);
+      const auto teamId = text(binding, L"teamId");
+      require(teamId == text(input, L"teamId") &&
+                  text(binding, L"runId") == text(input, L"runId"),
+              "run_state_start_changed");
+      // This read cannot upgrade a config-only selection or join a new run.
+      // The existing endpoint/start/challenge witness requires the retained join.
+      const auto before = state.memberPreflightWitness();
+      const auto selections = owners.runStateSelections.find(state.id());
+      const auto runRoot = owners.runStateRoots.find(state.id());
+      require(selections != owners.runStateSelections.end() &&
+                  !selections->second.empty() && selections->second.size() <= 32 &&
+                  runRoot != owners.runStateRoots.end(),
+              "run_controller_inbox_unknown");
+      (void)selectionForConfigOnly(owners, runRoot->second, selections->second);
+      SelectedControllerConfig *selected = nullptr;
+      for (const auto &id : selections->second) {
+        const auto found = owners.selectedConfigs.find(id);
+        require(found != owners.selectedConfigs.end(), "run_controller_inbox_unknown");
+        auto &candidate = *found->second;
+        if (candidate.rootPath != text(input, L"root") ||
+            candidate.databasePath != text(input, L"databasePath") ||
+            candidate.sha256 != text(input, L"sha256")) continue;
+        require(selected == nullptr, "run_controller_inbox_unknown");
+        selected = &candidate;
+      }
+      require(selected && selected->selectionTeamId == teamId,
+              "run_controller_inbox_unknown");
+      require(selected->remoteController ||
+                  (selected->mcpRoot && selected->boundTeamId == teamId &&
+                   selected->inboxes.find(teamId) != selected->inboxes.end()),
+              "run_controller_inbox_unknown");
+      const bool cohortSealed = state.cohortSealed();
+      require(cohortSealed == static_cast<bool>(owners.sealedCohort),
+              "run_state_start_changed");
+      if (cohortSealed)
+        require(runControlCanonicalJson(state.cohort()) ==
+                    runControlCanonicalJson(owners.sealedCohort->identity),
+                "run_state_start_changed");
+      const auto cohortSids = cohortSealed ? owners.sealedCohortSids()
+                                          : std::vector<std::wstring>();
+      const auto *cohortSidsPtr = cohortSealed ? &cohortSids : nullptr;
+      auto assertSelection = [&] {
+        selected->assertLive(owners.selectedPackage, cohortSidsPtr);
+        if (!cohortSealed) return;
+        const auto profile = owners.selectedProfiles.find(selected->rootPath + L"|" +
+                                                          selected->databasePath);
+        require(profile != owners.selectedProfiles.end(), "run_state_start_changed");
+        IJsonValue controllerRoot = JsonValue::CreateNullValue();
+        if (!selected->remoteController) controllerRoot = selected->mcpRootIdentity;
+        (void)owners.assertConfigIsSealed(profile->second, selected->identity,
+                                          controllerRoot, selected->sha256, L"");
+        if (selected->remoteController) return;
+        bool retainedRoot = false;
+        for (const auto &authority : owners.controllerAuthorities) {
+          if (authority.teamId != teamId ||
+              authority.controllerBaseIdentity.Stringify() !=
+                  selected->mcpRootIdentity.Stringify()) continue;
+          for (const auto &root : authority.roots)
+            root.assertLive(owners.selectedPackage, cohortSidsPtr);
+          retainedRoot = true;
+        }
+        require(retainedRoot, "run_controller_inbox_unknown");
+      };
+      assertSelection();
+      std::vector<BYTE> bytes;
+      const auto inboxState = selected->inboxState(teamId, owners.selectedPackage,
+                                                   cohortSidsPtr, &bytes);
+      assertSelection();
+      require(runControlCanonicalJson(state.memberPreflightWitness()) ==
+                  runControlCanonicalJson(before), "run_state_start_changed");
+      require(inboxState == L"regular" || inboxState == L"empty" ||
+                  inboxState == L"absent" || inboxState == L"not_applicable",
+              "run_controller_inbox_unknown");
+      JsonObject result;
+      num(result, L"schema", 1);
+      flag(result, L"ok", true);
+      str(result, L"state", inboxState == L"empty" ? L"absent" : inboxState);
+      if (inboxState == L"regular") str(result, L"bytesBase64", wide(base64(bytes)));
+      else result.SetNamedValue(L"bytesBase64", JsonValue::CreateNullValue());
       return result;
     }
     if (operation == L"runStateReadRecord") {

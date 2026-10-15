@@ -109,9 +109,11 @@ export type ControllerInboxProof = Readonly<{
     timestamp: string; read: boolean; relayOfMessageId?: string; source?: string }>[]
 }>
 
-/** Read only the canonical selected local controller inbox. Native output cannot supply this proof. */
-export async function readOwnedControllerInbox(profile: SelectedExecutionProfile, proof: ControllerToolProof,
-  binding: ControllerInboxBinding, deadline: number, signal?: AbortSignal): Promise<ControllerInboxProof | null> {
+export const CONTROLLER_INBOX_MAX_BYTES = 4 * 1024 * 1024
+
+/** Shared config comparison; the hash here covers the MCP object, not the profile file. */
+export function selectedControllerInboxRoot(profile: SelectedExecutionProfile, proof: ControllerToolProof,
+  binding: ControllerInboxBinding): string | null {
   const config = executionRecord(executionRecord(executionRecord(JSON.parse(profile.config.content)).mcp).servers)[proof.server] as ExecutionMcpConfig
   executionAssert(proof.server === 'agent-teams' && config && executionHash(config) === proof.configHash, 'run_controller_config_unknown')
   if (config.type !== 'local') return null
@@ -119,9 +121,40 @@ export async function readOwnedControllerInbox(profile: SelectedExecutionProfile
   if (!root) return null
   executionAssert(path.isAbsolute(root) && path.resolve(root) === root &&
     /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,199}$/.test(binding.teamId), 'run_controller_inbox_unknown')
+  return root
+}
+
+/** Bytes carry no member/session authority. Only the owner's original binding supplies it. */
+export function parseControllerInboxBytes(bytes: Uint8Array | null,
+  binding: ControllerInboxBinding): ControllerInboxProof | null {
+  if (bytes === null) return null
+  executionAssert(bytes instanceof Uint8Array && bytes.byteLength <= CONTROLLER_INBOX_MAX_BYTES, 'run_controller_inbox_unknown')
+  let rows: unknown
+  try { rows = JSON.parse(Buffer.from(bytes).toString('utf8')) }
+  catch { throw new Error('run_controller_inbox_unknown') }
+  executionAssert(Array.isArray(rows) && rows.length <= 4096, 'run_controller_inbox_unknown')
+  const messages = rows.map(value => {
+    executionAssert(value !== null && typeof value === 'object' && !Array.isArray(value), 'run_controller_inbox_unknown')
+    const row = executionRecord(value)
+    executionAssert(['messageId', 'from', 'to', 'text', 'timestamp'].every(key => typeof row[key] === 'string' && row[key].length > 0) &&
+      typeof row.read === 'boolean' && (row.relayOfMessageId === undefined || typeof row.relayOfMessageId === 'string') &&
+      (row.source === undefined || typeof row.source === 'string'), 'run_controller_inbox_unknown')
+    return Object.freeze({ messageId: row.messageId as string, from: row.from as string, to: row.to as string,
+      text: row.text as string, timestamp: row.timestamp as string, read: row.read as boolean,
+      ...(row.relayOfMessageId === undefined ? {} : { relayOfMessageId: row.relayOfMessageId as string }),
+      ...(row.source === undefined ? {} : { source: row.source as string }) })
+  })
+  return Object.freeze({ binding: Object.freeze({ ...binding }), messages: Object.freeze(messages) })
+}
+
+/** Read only the canonical selected local controller inbox through retained POSIX descriptors. */
+export async function readOwnedControllerInbox(profile: SelectedExecutionProfile, proof: ControllerToolProof,
+  binding: ControllerInboxBinding, deadline: number, signal?: AbortSignal): Promise<ControllerInboxProof | null> {
+  const root = selectedControllerInboxRoot(profile, proof, binding)
+  if (root === null) return null
   const check = () => { signal?.throwIfAborted(); executionAssert(Date.now() < deadline, 'run_controller_timeout') }
   const handles: FileHandle[] = []
-  const limit = 4 * 1024 * 1024
+  const limit = CONTROLLER_INBOX_MAX_BYTES
   try {
     let expected = root
     let address = root
@@ -153,20 +186,9 @@ export async function readOwnedControllerInbox(profile: SelectedExecutionProfile
     executionAssert(length <= limit && before.size === length && after.size === before.size &&
       after.mtimeMs === before.mtimeMs && await retainedControllerPath(file) === expected,
       'run_controller_inbox_unknown')
-    const rows: unknown = JSON.parse(bytes.subarray(0, length).toString('utf8'))
-    executionAssert(Array.isArray(rows) && rows.length <= 4096, 'run_controller_inbox_unknown')
-    const messages = rows.map(value => {
-      const row = executionRecord(value)
-      executionAssert(['messageId', 'from', 'to', 'text', 'timestamp'].every(key => typeof row[key] === 'string' && row[key].length > 0) &&
-        typeof row.read === 'boolean' && (row.relayOfMessageId === undefined || typeof row.relayOfMessageId === 'string') &&
-        (row.source === undefined || typeof row.source === 'string'), 'run_controller_inbox_unknown')
-      return Object.freeze({ messageId: row.messageId as string, from: row.from as string, to: row.to as string,
-        text: row.text as string, timestamp: row.timestamp as string, read: row.read as boolean,
-        ...(row.relayOfMessageId === undefined ? {} : { relayOfMessageId: row.relayOfMessageId as string }),
-        ...(row.source === undefined ? {} : { source: row.source as string }) })
-    })
+    const result = parseControllerInboxBytes(bytes.subarray(0, length), binding)
     check()
-    return Object.freeze({ binding: Object.freeze({ ...binding }), messages: Object.freeze(messages) })
+    return result
   } catch (error) {
     // A pending native turn need not have created its inbox yet. No missing file grants a receipt.
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return Object.freeze({ binding: Object.freeze({ ...binding }), messages: [] })

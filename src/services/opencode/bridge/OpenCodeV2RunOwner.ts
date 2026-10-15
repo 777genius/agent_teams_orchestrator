@@ -1,7 +1,7 @@
 import { openCodeBunVersion } from '../../../constants/openCodeBunVersion.js'
 import { recordOpenCodeV2ProviderFailure, retainOpenCodeV2InitializationPhase, type RunInitializationPhase } from '../execution/OpenCodeV2Diagnostics.js'
 import { captureOwnedV2ProbeAuthority, buildOwnedV2ProbeProof, type ProbeAuthority } from './OpenCodeV2ProbeProof.js'
-import { readOwnedControllerInbox, readOwnedControllerTools, type ControllerToolProof } from './OpenCodeV2ControllerTools.js'
+import { parseControllerInboxBytes, readOwnedControllerInbox, readOwnedControllerTools, type ControllerToolProof } from './OpenCodeV2ControllerTools.js'
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { readFile, realpath } from 'node:fs/promises'
@@ -19,7 +19,7 @@ import { createOpenCodeV2ExecutionClient, type ExecutionBridgeClient, type Execu
 import { boundOpenCodeRead } from '../transport/OpenCodeBoundedFetch.js'
 import { projectOpenCodeV2Turn } from './OpenCodeV2TurnProjection.js'
 import { verifyOpenCodeV2SilentBootstrap } from './OpenCodeV2BootstrapProjection.js'
-import { OPEN_CODE_V2_RUN_INITIALIZATION_MS, discoverOpenCodeV2Run, parseRunControlRequest, readRunProcessIdentity, reserveRunControlDirectory, runControlDirectory, serveOpenCodeV2RunControl, writeRunControlFile } from './OpenCodeV2RunControl.js'
+import { OPEN_CODE_V2_RUN_INITIALIZATION_MS, discoverOpenCodeV2Run, readWindowsRunControllerInbox, parseRunControlRequest, readRunProcessIdentity, reserveRunControlDirectory, runControlDirectory, serveOpenCodeV2RunControl, writeRunControlFile } from './OpenCodeV2RunControl.js'
 import type { InstructionReceipt, RunControlRecord, RunControlRequest, RunControlResult, RunExecutionPorts, RunLaunchPlan, RunMemberPlan, RunMemberStatus, RunOwnerState, RunStopMember } from './OpenCodeV2RunTypes.js'
 
 const productionPorts: RunExecutionPorts = { acquire: acquireExecutionLease, client: createOpenCodeV2ExecutionClient }
@@ -392,8 +392,10 @@ export class OpenCodeV2RunOwner {
       member.controllerTools = await readOwnedControllerTools(client, member.plan.profile, member.plan.controllerMcpName, deadline, signal)
       const controllerBinding = { teamId: this.plan.binding.teamId, runId: this.plan.binding.runId,
         memberId: member.plan.memberId, sessionID: id }
-      const controllerInbox = await readOwnedControllerInbox(member.plan.profile, member.controllerTools,
-        controllerBinding, deadline, signal)
+      const controllerInbox = process.platform === 'win32'
+        ? parseControllerInboxBytes(await readWindowsRunControllerInbox(this.directory, member.plan.profile,
+          member.controllerTools, controllerBinding, deadline, signal), controllerBinding)
+        : await readOwnedControllerInbox(member.plan.profile, member.controllerTools, controllerBinding, deadline, signal)
       const turn = projectOpenCodeV2Turn({ pin: client.authority.pin, sessionID: id, nativeInputID: intent.identity.nativeInputID,
         beforeCursor: admission.beforeCursor, originalText: intent.input.text, ...cut,
         inboundMessageId: intent.identity.localMessageId, advertisedTools: member.controllerTools.nativeNames,

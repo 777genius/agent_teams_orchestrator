@@ -502,7 +502,9 @@ try {
   retain(await filesystem.createDirectory(path.win32.join(claudeRoot, "tasks", "TEST-team")))
   const inboxes = path.win32.join(claudeRoot, "teams", "TEST-team", "inboxes")
   const ownedInbox = retain(await filesystem.createDirectory(inboxes))
-  await writeOwnedFixture(ownedInbox, inboxes, "user.json", "[]")
+  const inboxContent = JSON.stringify([{ messageId: 'TEST-inbox-message', from: 'worker', to: 'user',
+    text: 'TEST-native-inbox-read', timestamp: '2026-10-15T00:00:00.000Z', read: false }])
+  await writeOwnedFixture(ownedInbox, inboxes, "user.json", inboxContent)
   const selectedContent = JSON.stringify({ 'TEST-padding': 'x'.repeat(128 * 1024), mcpServers: { "agent-teams": { type: "local",
     env: { AGENT_TEAMS_MCP_CLAUDE_DIR: claudeRoot } } } })
   assert.ok(Buffer.byteLength(selectedContent) > 128 * 1024)
@@ -590,6 +592,38 @@ try {
   const published = executionRecord(await request('runStateListen', {
     stateId, directory, binding, sourceSha256, deadline: Date.now() + 120_000,
   })).record
+  // Only the retained, joined run may read the selected controller inbox.
+  const inboxRequest = { stateId, directory, teamId: binding.teamId, runId: binding.runId,
+    root: selectedRoot, databasePath, sha256: selectedHash }
+  const readInbox = () => request('runStateReadControllerInbox', inboxRequest)
+  const expectedInbox = { schema: 1, ok: true, state: 'regular',
+    bytesBase64: Buffer.from(inboxContent).toString('base64') }
+  assert.deepEqual(await readInbox(), expectedInbox)
+  for (const changed of [
+    { runId: 'TEST-foreign-run' }, { teamId: 'TEST-foreign-team' },
+    { root: selectedRoot + '-foreign' }, { databasePath: databasePath + '-foreign' },
+    { sha256: '0'.repeat(64) },
+  ]) await assert.rejects(request('runStateReadControllerInbox', { ...inboxRequest, ...changed }),
+    /run_controller_inbox_unknown|run_state_start_changed/)
+  const userInbox = path.win32.join(inboxes, 'user.json')
+  const originalInbox = path.win32.join(inboxes, 'TEST-original-user.json')
+  await rename(userInbox, originalInbox)
+  assert.deepEqual(await readInbox(), { schema: 1, ok: true, state: 'absent', bytesBase64: null })
+  const aliasTarget = path.win32.join(requestedRoot, 'TEST-inbox-alias-target')
+  retain(await filesystem.createDirectory(aliasTarget))
+  await symlink(aliasTarget, userInbox, 'junction')
+  assert.equal((await lstat(userInbox)).isSymbolicLink(), true)
+  await assert.rejects(readInbox(), /run_controller_inbox_unknown/)
+  // Retain each attack fixture separately; restore only the original TEST file.
+  await rename(userInbox, path.win32.join(requestedRoot, 'TEST-inbox-reparse-evidence'))
+  await writeFile(userInbox, Buffer.alloc(4 * 1024 * 1024 + 1), { flag: 'wx', mode: 0o600 })
+  await assert.rejects(readInbox(), /run_controller_inbox_unknown/)
+  await rename(userInbox, path.win32.join(inboxes, 'TEST-oversize-user.json'))
+  await rename(originalInbox, userInbox)
+  assert.deepEqual(await readInbox(), expectedInbox)
+  facts.joinedControllerInboxRead = { exactBytes: true, positiveAbsence: true,
+    foreignRunTeamProfileDatabaseAndConfigRefused: true, reparseRefused: true, oversizeRefused: true,
+    originalReadRestored: true }
   const statusResponses = new Set<Promise<void>>()
   const statusFailures: unknown[] = []
   let statusRequests = 0

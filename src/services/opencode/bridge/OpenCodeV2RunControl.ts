@@ -10,7 +10,8 @@ import type { ExecutionMention } from '../transport/OpenCodeV2ExecutionClientFac
 import type { RunAnyProcessIdentity, RunBinding, RunControlRecord, RunControlRequest, RunControlResult, RunMemberStatus, RunProcessIdentity, RunStopMember, RunUnixControlRecord, RunWindowsControlRecord } from './OpenCodeV2RunTypes.js'
 import type { SelectedExecutionProfile } from '../host/OpenCodeV2ExecutionBinding.js'
 import { OpenCodeV2RunNonces } from './OpenCodeV2RunNonces.js'
-import { retainedControllerPath } from './OpenCodeV2ControllerTools.js'
+import { CONTROLLER_INBOX_MAX_BYTES, retainedControllerPath, selectedControllerInboxRoot,
+  type ControllerInboxBinding, type ControllerToolProof } from './OpenCodeV2ControllerTools.js'
 import { createWindowsNativeBroker, resolveWindowsNativeArtifact, type WindowsNativeBroker } from '../host/windows/OpenCodeV2WindowsNativeBroker.js'
 import { ensureWindowsPrivateDirectories } from '../profile/OpenCodePrivateDirectories.js'
 import type { WindowsLaunchPlan } from '../host/windows/OpenCodeV2WindowsExecution.js'
@@ -209,6 +210,53 @@ async function windowsCompositionFor(record: RunWindowsControlRecord,
     mode: 'client', dataRoot: windowsDataRoot(record.directory), binding: record.binding,
     profiles,
   }, deadline)
+}
+/** Read through the already serving native owner. Comparison values never select
+ * another profile, run state, broker or controller path. */
+export async function readWindowsRunControllerInbox(directory: string, profile: SelectedExecutionProfile,
+  proof: ControllerToolProof, binding: ControllerInboxBinding, deadline: number, signal?: AbortSignal): Promise<Buffer | null> {
+  const check = () => { signal?.throwIfAborted(); executionAssert(Date.now() < deadline, 'run_controller_timeout') }
+  check()
+  executionAssert(process.platform === 'win32', 'run_controller_inbox_unknown')
+  const root = selectedControllerInboxRoot(profile, proof, binding)
+  const pending = windowsRuns.get(directory)
+  executionAssert(pending, 'run_controller_inbox_unknown')
+  const state = await pending, serving = state.serving
+  check()
+  executionAssert(serving && serving.record.directory === directory &&
+    serving.record.binding.teamId === binding.teamId && serving.record.binding.runId === binding.runId,
+    'run_state_start_changed')
+  const selected = serving.profiles.filter(candidate => candidate.root === profile.root &&
+    candidate.databasePath === profile.databasePath && candidate.sha256 === profile.config.sha256)
+  executionAssert(selected.length === 1 && digest(profile.config.content) === selected[0]!.sha256,
+    'run_state_start_changed')
+  const admitted = selected[0]!
+  const value = await state.broker.request('runStateReadControllerInbox', {
+    stateId: state.stateId, directory, teamId: serving.record.binding.teamId, runId: serving.record.binding.runId,
+    root: admitted.root, databasePath: admitted.databasePath, sha256: admitted.sha256,
+  }, Math.min(deadline, Date.now() + MAX_OPERATION_MS), signal)
+  check()
+  executionAssert(value !== null && typeof value === 'object' && !Array.isArray(value), 'run_controller_inbox_unknown')
+  const row = executionRecord(value)
+  executionAssert(Object.keys(row).sort().join(',') === 'bytesBase64,ok,schema,state' &&
+    row.schema === 1 && row.ok === true, 'run_controller_inbox_unknown')
+  if (row.state === 'not_applicable') {
+    executionAssert(root === null && row.bytesBase64 === null, 'run_controller_inbox_unknown')
+    return null
+  }
+  executionAssert(root !== null, 'run_controller_inbox_unknown')
+  if (row.state === 'absent') {
+    executionAssert(row.bytesBase64 === null, 'run_controller_inbox_unknown')
+    return Buffer.from('[]')
+  }
+  executionAssert(row.state === 'regular' && typeof row.bytesBase64 === 'string' &&
+    row.bytesBase64.length > 0 && row.bytesBase64.length <= 4 * Math.ceil(CONTROLLER_INBOX_MAX_BYTES / 3),
+    'run_controller_inbox_unknown')
+  const bytes = Buffer.from(row.bytesBase64, 'base64')
+  executionAssert(bytes.length > 0 && bytes.length <= CONTROLLER_INBOX_MAX_BYTES &&
+    bytes.toString('base64') === row.bytesBase64, 'run_controller_inbox_unknown')
+  check()
+  return bytes
 }
 /** Called only after the one Windows execution plan and selected-profile
  * qualification exist. This lookup supplies comparison values; it cannot mint
