@@ -40,11 +40,16 @@ function enterStartupStage(stage: string): void {
   startupStage = stage
   startupHistory.push({ stage, elapsedMs: Math.max(startupHistory.at(-1)!.elapsedMs, Date.now() - startupStartedAt) })
 }
-function reportStartupFailure(reason: 'timeout' | 'failed'): void {
+function reportStartupFailure(reason: 'timeout' | 'failed', error?: unknown): void {
   if (runtimeReady || startupFailureReported) return
   startupFailureReported = true
-  // Fixed stage names and elapsed time only; never include credentials or payloads.
-  process.stderr.write(JSON.stringify({ event: 'opencode-v2-startup', reason, stage: startupStage,
+  const causes = ['execution_contract_invalid', 'execution_identity_mismatch', 'execution_entry_changed',
+    'v2_compiled_runtime_unsupported', 'v2_execution_layout_unsupported', 'execution_profile_changed',
+    'execution_graph_changed', 'execution_graph_incomplete', 'execution_graph_dependency_missing',
+    'execution_containment_identity_mismatch', 'execution_timeout', 'execution_cancelled']
+  const cause = error instanceof Error && causes.includes(error.message) ? error.message : undefined
+  // Fixed stages, closed cause codes and elapsed time; no credentials or payloads.
+  process.stderr.write(JSON.stringify({ event: 'opencode-v2-startup', reason, stage: startupStage, ...(cause ? { cause } : {}),
     elapsedMs: Math.max(startupHistory.at(-1)!.elapsedMs, Date.now() - startupStartedAt), history: startupHistory, ...(graphProgress ? { graph: graphProgress } : {}) }) + '\n')
 }
 // A source graph can legitimately take more than 30 seconds under concurrent
@@ -80,6 +85,7 @@ async function start(input: Record<string, unknown>): Promise<void> {
   executionRecord(input.native); executionRecord(input.profile)
   const native = input.native as ValidatedExecutionNative
   const profile = input.profile as OwnedNativeProfile
+  enterStartupStage('delivery-resolution')
   const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'execution')
   executionAssert(native.runtimeMode === delivery.runtimeMode && native.entrySha256 === delivery.entrySha256 &&
     native.generation === 'v2' &&
@@ -177,6 +183,6 @@ childControl.events.on('message', (message: unknown) => {
     executionAssert(preparation && !started && !closing && input.type === 'start' && childControl.connected())
     started = true; nonce = input.nonce
     startup = start(input)
-    void startup.catch(() => { if (!closing) reportStartupFailure('failed'); if (!closing) void childControl.send({ type: 'failed', nonce, leaseOwnerId }).catch(() => undefined); void close() })
-  } catch { void close() }
+    void startup.catch(error => { if (!closing) reportStartupFailure('failed', error); if (!closing) void childControl.send({ type: 'failed', nonce, leaseOwnerId }).catch(() => undefined); void close() })
+  } catch (error) { reportStartupFailure('failed', error); void close() }
 })
