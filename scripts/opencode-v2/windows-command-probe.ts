@@ -216,7 +216,8 @@ if($actual.GetOwner([Security.Principal.SecurityIdentifier]).Value-ne 'S-1-5-32-
       await assert.rejects(denied.request('launch', { executable: path.join(root, 'bun.exe'), entry: path.join(root, 'main.ts'), cwd: root, env: environment,
         writableRoots: writable ? [sharedReadRoot] : [root, profileRoot], readOnlyRoots: writable ? [] : [sharedReadRoot],
         protectedRoots: [], nonce: randomUUID(), leaseOwnerId: randomUUID() }),
-        /^(?:execution_owner_not_private|execution_containment_filesystem_denied)(?::[a-z_]+:\d+)?$/)
+        (error: unknown) => error instanceof Error &&
+          /^(?:execution_owner_not_private|execution_containment_filesystem_denied)(?::[a-z_]+:\d+)?$/.test(error.message))
       assert.equal(await readSharedAcl(), before)
     } finally { await denied.close() }
   }
