@@ -195,7 +195,7 @@ childControl.events.on('message', (message: unknown) => {
       executionAssert(typeof input.leaseOwnerId === 'string')
       nonce = input.nonce; leaseOwnerId = input.leaseOwnerId
       preparation = prepareExecutionPlatformChild(input)
-      void preparation.then(value => { prepared = value }, () => { void close() })
+      void preparation.then(value => { prepared = value }, error => { reportStartupFailure('failed', error); void close() })
       return
     }
     if (input.type === 'close') {

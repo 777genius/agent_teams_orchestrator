@@ -438,7 +438,12 @@ export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, l
       timer = setTimeout(() => reject(new Error('execution_timeout')), deadline - Date.now()); abort = () => reject(new Error('execution_cancelled')); signal?.addEventListener('abort', abort, { once: true }); if (signal?.aborted) abort()
     })]) } finally { clearTimeout(timer); if (abort) signal?.removeEventListener('abort', abort) }
   }
-  async function assertLive(allowClosing = false) { assert(mapping && (!stopped || allowClosing) && !broker!.ended()); assert(equal(await broker!.request('assertLive'), nativeMapping), 'execution_identity_mismatch') }
+  async function assertLive(allowClosing = false) {
+    assert(mapping, 'execution_containment_unqualified:assert_mapping:0')
+    assert(!stopped || allowClosing, 'execution_containment_unqualified:assert_stopped:0')
+    assert(!broker!.ended(), 'execution_containment_unqualified:assert_broker:0')
+    assert(equal(await broker!.request('assertLive'), nativeMapping), 'execution_identity_mismatch')
+  }
   let preparation: Promise<WindowsExecutionMapping> | undefined, retirement: Promise<WindowsKernelRetirement> | undefined
   return Object.freeze({ child, fetch: http.fetch,
     output: () => ({ stdout: '', stderr: launchHistory.length === 0 ? '' : JSON.stringify({

@@ -5,6 +5,40 @@ import { tmpdir } from 'node:os'
 import * as privateDirectories from '../profile/OpenCodePrivateDirectories.js'
 import { recordOpenCodeV2ProviderFailure, retainOpenCodeV2CleanupPhase, retainOpenCodeV2InitializationPhase, type RunInitializationPhase } from './OpenCodeV2Diagnostics.js'
 
+test('startup failures preserve finite original error facts and local Windows guard stages', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'TEST-v2-original-startup-failure-'))
+  const previous = process.env.CLAUDE_MULTIMODEL_DATA_HOME
+  process.env.CLAUDE_MULTIMODEL_DATA_HOME = root
+  const secret = 'TEST-PRIVATE-ERROR-PAYLOAD'
+  const original = Object.assign(new TypeError(secret), { code: 'EACCES', syscall: 'open', path: secret })
+  const descriptors = Object.getOwnPropertyDescriptors(original)
+  try {
+    await recordOpenCodeV2ProviderFailure('execution-host-startup', new Error('cleanup_unknown', { cause: original }), true)
+    for (const stage of ['assert_mapping', 'assert_stopped', 'assert_broker'])
+      await recordOpenCodeV2ProviderFailure('execution-host-startup', new Error(`execution_containment_unqualified:${stage}:0`), true)
+    await recordOpenCodeV2ProviderFailure('execution-host-startup', new Error('execution_host_unavailable'), true)
+    await recordOpenCodeV2ProviderFailure('execution-host-startup', Object.assign(new Error(secret), {
+      name: secret, code: secret, syscall: secret,
+    }), true)
+    const rows = await Promise.all((await readdir(path.join(root, 'opencode/v2/provider-diagnostics'))).map(async name => {
+      const bytes = await readFile(path.join(root, 'opencode/v2/provider-diagnostics', name), 'utf8')
+      expect(bytes).not.toContain(secret)
+      return JSON.parse(bytes)
+    }))
+    expect(Object.getOwnPropertyDescriptors(original)).toEqual(descriptors)
+    expect(rows).toHaveLength(6)
+    expect(rows.find(row => row.category === 'cleanup_unknown').failure).toEqual({ name: 'TypeError', errno: 'EACCES', operation: 'open' })
+    expect(rows.filter(row => row.category === 'execution_containment_unqualified').map(row => row.native))
+      .toEqual(expect.arrayContaining(['assert_mapping', 'assert_stopped', 'assert_broker'].map(stage => ({ stage, nativeCode: 0 }))))
+    expect(rows.find(row => row.category === 'execution_host_unavailable').failure).toEqual({ name: 'Error' })
+    expect(rows.find(row => row.category === 'provider_operation_unknown').failure).toBeUndefined()
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_DATA_HOME
+    else process.env.CLAUDE_MULTIMODEL_DATA_HOME = previous
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('startup diagnostics retain only finite native fields and reject payload-bearing or invalid frames', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'TEST-v2-startup-diagnostics-'))
   const previous = process.env.CLAUDE_MULTIMODEL_DATA_HOME
@@ -108,7 +142,8 @@ test('late pre-ready close frame retains its finite stage while original cleanup
     expect(row.startup).toEqual(startup)
     expect(row.category).toBe('cleanup_unknown')
     expect(row.retainedOriginal).toBe(true)
-    expect(Object.keys(row).sort()).toEqual(['category', 'phase', 'recordedAt', 'retainedOriginal', 'schemaVersion', 'startup'])
+    expect(row.failure).toEqual({ name: 'Error' })
+    expect(Object.keys(row).sort()).toEqual(['category', 'failure', 'phase', 'recordedAt', 'retainedOriginal', 'schemaVersion', 'startup'])
   } finally {
     if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_DATA_HOME
     else process.env.CLAUDE_MULTIMODEL_DATA_HOME = previous

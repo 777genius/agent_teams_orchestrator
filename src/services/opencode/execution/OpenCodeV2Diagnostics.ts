@@ -113,7 +113,7 @@ const privateProviderFailureCodes = new Set(['provider_missing', 'provider_key_m
   'execution_selected_oauth_readback_unknown', 'execution_selected_oauth_recovery_required', 'execution_selected_oauth_windows_unqualified',
   'execution_selected_oauth_provider_unknown', 'execution_selected_oauth_integration_unknown',
   'execution_selected_oauth_connection_unknown', 'execution_selected_oauth_model_unknown',
-  'execution_lease_not_owned', 'execution_host_unavailable', 'execution_invalid_response', 'execution_identity_mismatch', 'execution_identity_unknown',
+  'execution_lease_not_owned', 'execution_host_unavailable', 'execution_containment_unqualified', 'execution_invalid_response', 'execution_identity_mismatch', 'execution_identity_unknown',
   'execution_profile_changed', 'execution_graph_changed', 'execution_graph_incomplete', 'execution_graph_dependency_missing',
   'execution_timeout', 'execution_owner_unknown', 'cleanup_unknown', 'selection_mismatch', 'authority_mismatch',
   'graph_mismatch', 'identity_mismatch', 'unqualified_version', 'invalid_response', 'invalid_model',
@@ -122,7 +122,7 @@ const privateProviderFailureCodes = new Set(['provider_missing', 'provider_key_m
 // syntactically plausible unknown stage is persisted as diagnostic data.
 const privateNativeFailureCodes = new Set([
   'cleanup_unknown', 'execution_identity_unknown', 'execution_path_alias',
-  'execution_cancelled', 'execution_containment_dll_identity', 'execution_containment_filesystem_denied',
+  'execution_cancelled', 'execution_containment_unqualified', 'execution_containment_dll_identity', 'execution_containment_filesystem_denied',
   'execution_containment_helper_closed', 'execution_containment_helper_failed', 'execution_containment_helper_identity',
   'execution_containment_launcher_denied', 'execution_containment_pipe_denied', 'execution_containment_profile_denied',
   'execution_containment_unavailable', 'execution_native_command_unknown', 'execution_native_stdio_owner_unknown',
@@ -134,6 +134,7 @@ const privateNativeFailureCodes = new Set([
   'execution_owner_path_invalid', 'execution_owner_prepared_invalid', 'execution_owner_prepared_purpose_invalid',
   'execution_owner_read_only', 'execution_owner_unknown', 'execution_owner_write_through_pending'])
 const privateNativeFailureStages = new Set([
+  'assert_mapping', 'assert_stopped', 'assert_broker',
   'process_birth', 'process_image_path', 'process_image_open', 'process_birth_changed',
   'shared_acl_mutex_descriptor', 'shared_acl_mutex_create', 'shared_acl_mutex_security',
   'shared_acl_mutex_encoding', 'shared_acl_mutex_authority', 'shared_acl_mutex_wait', 'shared_acl_mutex',
@@ -173,6 +174,15 @@ export async function recordOpenCodeV2ProviderFailure(phase: string, error: unkn
   const native = nativeFailure(cause) ?? nativeFailure(error)
   const category = cause instanceof Error && privateProviderFailureCodes.has(cause.message) ? cause.message
     : native?.category ?? (error instanceof Error && privateProviderFailureCodes.has(error.message) ? error.message : 'provider_operation_unknown')
+  // Preserve only fixed original exception facts when a startup guard is not a
+  // known category. Never persist its message, path, stack or arbitrary fields.
+  const detail = (cause instanceof Error ? cause : error instanceof Error ? error : undefined) as
+    { name?: unknown; code?: unknown; syscall?: unknown } | undefined
+  const name = ['Error', 'TypeError', 'ReferenceError', 'RangeError', 'AbortError'].find(value => value === detail?.name)
+  const errno = ['EPERM', 'EACCES', 'ENOENT', 'ENOTDIR', 'EISDIR', 'EINVAL', 'UNKNOWN', 'EIO', 'ENOSYS'].find(value => value === detail?.code)
+  const syscall = ['realpath', 'open', 'read', 'lstat', 'stat'].find(value => value === detail?.syscall)
+  const failure = phase === 'execution-host-startup' && (name || errno || syscall)
+    ? { ...(name ? { name } : {}), ...(errno ? { errno } : {}), ...(syscall ? { operation: syscall } : {}) } : undefined
   const operation = readOpenCodeV2ProviderWireFailure(error)
   const startup = startupDiagnostic(startupOutput)
   const acquisition = acquisitionDiagnostic(acquisitionTiming)
@@ -194,6 +204,6 @@ export async function recordOpenCodeV2ProviderFailure(phase: string, error: unkn
     // Nonsecret observational data only: this file is not native ownership or
     // cleanup authority, even when an elevated Windows writer owns the file.
     await writeFile(path.join(directory, randomUUID() + '.json'), JSON.stringify({ schemaVersion: 1, phase, category, retainedOriginal,
-      ...(native?.native ? { native: native.native } : {}), ...(operation ? { operation } : {}), ...(startup ? { startup } : {}), ...(acquisition ? { acquisition } : {}), ...(cleanup ? { cleanup } : {}), ...(initialization ? { initialization } : {}), recordedAt: new Date().toISOString() }), { flag: 'wx', mode: 0o600 })
+      ...(native?.native ? { native: native.native } : {}), ...(failure ? { failure } : {}), ...(operation ? { operation } : {}), ...(startup ? { startup } : {}), ...(acquisition ? { acquisition } : {}), ...(cleanup ? { cleanup } : {}), ...(initialization ? { initialization } : {}), recordedAt: new Date().toISOString() }), { flag: 'wx', mode: 0o600 })
   } catch { /* Diagnostics cannot replace or retry the unresolved original operation. */ }
 }
