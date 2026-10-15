@@ -171,7 +171,16 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
     const birth = (target: number) => observe(ports.birth(target, Math.min(helperTimeout, cap())))
     const sameBirth = async (target: number, expected: number): Promise<boolean> => {
       const current = await birth(target)
-      if (current === expected) return true
+      if (current === expected) {
+        if (process.platform === 'win32') {
+          // A terminated Windows process object can retain its creation time.
+          // Matching birth alone cannot anchor new census or signal authority.
+          const state = ports.alive(target)
+          if (state === 'gone') return false
+          if (state !== 'alive') throw cleanupUnknown('candidate_unknown')
+        }
+        return true
+      }
       // Exiting between a table snapshot and the birth read is retirement,
       // whereas a live replacement or unreadable live identity is unknown.
       if (ports.alive(target) === 'gone') return false

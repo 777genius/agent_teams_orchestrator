@@ -235,6 +235,8 @@ function additionFixture(mode: 'gone' | 'alive' | 'unknown' | 'orphan' | 'reused
     tree: async budget => readRows(budget),
     alive: target => {
       aliveReads.push(target)
+      // Captured root/relay are live until this fixture emits their exit/close.
+      if (!closed && (target === root || target === relay)) return 'alive'
       if (mode.startsWith('captured-orphan-') && target === relay) {
         return mode === 'captured-orphan-alive' ? 'alive' : 'unknown'
       }
@@ -278,7 +280,8 @@ test('Windows unordered grandchild and parent births are confirmed before privat
   const f = additionFixture('unordered')
   expect(await f.run()).toBe('1.19.0\n')
   expect(f.leafReads()).toBe(2)
-  expect(f.trees()).toBe(3)
+  // Its final exited root still has a queryable birth, so require the strict final census.
+  expect(f.trees()).toBe(4)
   expect(f.removed()).toBe(1)
   expect(f.signalled).toEqual([])
 })
@@ -321,12 +324,12 @@ test('darwin gone group member with reparented PPID requires absence and final c
 // The wrapper can close before the first birth helper completes while WMI still
 // returns its old tree. These rows must never confer birth or signal authority.
 function unanchoredFixture(mode: 'gone' | 'alive' | 'unknown' | 'orphan' | 'reused' | 'persistent' |
-  'final-reappeared' | 'absence-before-close' | 'stale-captured') {
+  'final-reappeared' | 'absence-before-close' | 'stale-captured' | 'stale-queryable' | 'stale-queryable-unknown' | 'stale-queryable-final-reappeared') {
   Object.defineProperty(process, 'platform', { value: 'win32' })
   const root = 900_020, relay = 900_021, leaf = 900_022, orphan = 900_023, grandchild = 900_024
   let clock = 1_000_000, removed = 0, trees = 0, births = 0
   const budgets: number[] = [], signals: number[] = [], taskkills: number[] = [], aliveReads: number[] = []
-  const events: string[] = []
+  const events: string[] = [], birthTargets: number[] = []
   const child = new EventEmitter() as ChildProcess
   Object.assign(child, { pid: root, stdout: new PassThrough() })
   const initialRows = [{ pid: root, ppid: process.pid }, { pid: relay, ppid: root }, { pid: leaf, ppid: relay }]
@@ -343,7 +346,8 @@ function unanchoredFixture(mode: 'gone' | 'alive' | 'unknown' | 'orphan' | 'reus
   const ports = spyOn(native, 'nativePorts').mockImplementation(() => ({
     platform: 'win32', selfPid: process.pid, now: () => clock,
     birth: async (target, budget) => {
-      births++; budgets.push(budget); clock += 350
+      births++; birthTargets.push(target); budgets.push(budget); clock += 350
+      if (mode.startsWith('stale-queryable') && target === root) return 100
       return mode === 'stale-captured' && target === root && births === 1 ? 100 : null
     },
     tree: async budget => {
@@ -351,12 +355,13 @@ function unanchoredFixture(mode: 'gone' | 'alive' | 'unknown' | 'orphan' | 'reus
       let rows = trees === 1 || mode === 'persistent' ? initialRows : []
       if (trees === 2 && mode === 'orphan') rows = [{ pid: grandchild, ppid: orphan }, { pid: orphan, ppid: leaf }]
       if (trees === 2 && mode === 'reused') rows = [{ pid: leaf, ppid: 900_099 }]
-      if (trees === 3 && mode === 'final-reappeared') rows = [{ pid: orphan, ppid: leaf }]
+      if (trees === 3 && (mode === 'final-reappeared' || mode === 'stale-queryable-final-reappeared')) rows = [{ pid: orphan, ppid: leaf }]
       events.push(rows.length ? 'census:rows' : 'census:empty')
       return rows
     },
     alive: target => {
       aliveReads.push(target)
+      if (mode === 'stale-queryable-unknown' && target === root) return 'unknown'
       if ((mode === 'alive' && target === leaf) || (mode === 'orphan' && target === grandchild) ||
         (mode === 'reused' && trees === 2 && target === leaf)) return 'alive'
       return mode === 'unknown' && target === leaf ? 'unknown' : 'gone'
@@ -375,7 +380,7 @@ function unanchoredFixture(mode: 'gone' | 'alive' | 'unknown' | 'orphan' | 'reus
   const roots = { root: '/TEST/private', env: {}, remove: async () => { events.push('remove'); removed++ } } as OpenCodeV2ReadRoots
   return { run: () => readOpenCodeOwnedVersion('/TEST/native', roots), removed: () => removed,
     trees: () => trees, births: () => births, elapsed: () => clock - 1_000_000,
-    budgets, signals, taskkills, aliveReads, events, root, relay, leaf, orphan, grandchild }
+    budgets, signals, taskkills, aliveReads, birthTargets, events, root, relay, leaf, orphan, grandchild }
 }
 
 test('Windows unanchored gone rows require independent gone checks, raw absence and strict final census', async () => {
@@ -401,6 +406,27 @@ test('Windows stale captured anchor retires only after gone checks, fresh absenc
   expect(f.budgets).toEqual([5000, 5000, 5000, 5000, 5000])
   expect(f.removed()).toBe(1)
 })
+
+test('Windows closed root with queryable same birth cannot authorize descendant birth reads or signals', async () => {
+  const f = unanchoredFixture('stale-queryable')
+  expect(await f.run()).toBe('1.19.0\n')
+  expect(f.birthTargets).toEqual([f.root, f.root])
+  expect(f.signals).toEqual([])
+  expect(f.taskkills).toEqual([])
+  expect(f.events).toEqual(['census:rows', 'census:empty', 'census:empty', 'remove'])
+  expect(f.removed()).toBe(1)
+})
+
+for (const mode of ['stale-queryable-unknown', 'stale-queryable-final-reappeared'] as const) {
+  test(`Windows queryable closed-root ${mode} remains unknown without new authority`, async () => {
+    const f = unanchoredFixture(mode)
+    await expect(f.run()).rejects.toThrow('cleanup_unknown')
+    expect(f.birthTargets).toEqual([f.root, f.root])
+    expect(f.signals).toEqual([])
+    expect(f.taskkills).toEqual([])
+    expect(f.removed()).toBe(0)
+  })
+}
 
 test('Windows unanchored census absence waits for child close before strict final census and removal', async () => {
   const f = unanchoredFixture('absence-before-close')
