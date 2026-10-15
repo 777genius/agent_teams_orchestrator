@@ -227,10 +227,30 @@ if($actual.GetOwner([Security.Principal.SecurityIdentifier]).Value-ne 'S-1-5-32-
   await ps(`$ErrorActionPreference='Stop';$acl=Get-Acl -LiteralPath $env:TEST_SHARED_ROOT;$acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new('S-1-5-32-545'),'Write','ContainerInherit,ObjectInherit','None','Allow'));Set-Acl -LiteralPath $env:TEST_SHARED_ROOT -AclObject $acl`, { TEST_SHARED_ROOT: sharedReadRoot })
   try { await refuseSharedFixture() } finally { await restoreSharedFixture() }
   stage = 'shared-readonly-effective-creator-refusal'
-  await ps(`$ErrorActionPreference='Stop';$acl=Get-Acl -LiteralPath $env:TEST_SHARED_ROOT;$acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new('S-1-3-0'),'Write','None','None','Allow'));Set-Acl -LiteralPath $env:TEST_SHARED_ROOT -AclObject $acl`, { TEST_SHARED_ROOT: sharedReadRoot })
-  try { await refuseSharedFixture() } finally { await restoreSharedFixture() }
+  const creator = record(JSON.parse(await ps(`
+$ErrorActionPreference='Stop'
+$acl=Get-Acl -LiteralPath $env:TEST_SHARED_ROOT
+$acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new('S-1-3-0'),'Write','None','None','Allow'))
+Set-Acl -LiteralPath $env:TEST_SHARED_ROOT -AclObject $acl
+# Inspect the installed raw DACL, not the requested .NET rule: Windows can
+# substitute the actual owner for an effective CREATOR OWNER ACE.
+$actual=Get-Acl -LiteralPath $env:TEST_SHARED_ROOT
+$descriptor=[Security.AccessControl.RawSecurityDescriptor]::new($actual.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Access))
+$present=$false
+foreach($ace in $descriptor.DiscretionaryAcl){
+if($ace -is [Security.AccessControl.CommonAce] -and $ace.AceQualifier-eq [Security.AccessControl.AceQualifier]::AccessAllowed -and
+$ace.SecurityIdentifier.Value-eq 'S-1-3-0' -and ($ace.AceFlags-band [Security.AccessControl.AceFlags]::InheritOnly)-eq 0 -and
+($ace.AccessMask-band 278)-ne 0){$present=$true}}
+[Console]::Write((@{effectiveCreatorWritePresent=$present}|ConvertTo-Json -Compress))
+`, { TEST_SHARED_ROOT: sharedReadRoot })))
+  assert.equal(typeof creator.effectiveCreatorWritePresent, 'boolean')
+  try {
+    if (creator.effectiveCreatorWritePresent) await refuseSharedFixture()
+  } finally { await restoreSharedFixture() }
   assert.equal(await readSharedAcl(), sharedReadBaseline)
-  facts.sharedReadOnlyRefusals = { privateOwnershipPreserved: true, foreignWriteRejected: true, effectiveCreatorWriteRejected: true, deniedAclUnchanged: true }
+  facts.sharedReadOnlyRefusals = { privateOwnershipPreserved: true, foreignWriteRejected: true,
+    effectiveCreatorWritePresent: creator.effectiveCreatorWritePresent,
+    effectiveCreatorWriteRejected: creator.effectiveCreatorWritePresent ? true : null, deniedAclUnchanged: true }
   stage = 'test-ancestor-setup'
   sid = await ps(`
 $ErrorActionPreference='Stop'

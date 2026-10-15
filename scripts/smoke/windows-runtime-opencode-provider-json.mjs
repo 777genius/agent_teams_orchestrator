@@ -5,7 +5,8 @@ import { execFile, spawnSync } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createServer } from 'node:http';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { realpath } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -44,14 +45,17 @@ export async function runActualProviderComparison(baseline, candidate, binaryPat
   assert.equal(path.basename(aclHelper), 'opencode-native-test-auth.ts');
   assert.match(evidencePath, /(?:^|[\\/])TEST-[^\\/]+(?:[\\/]|$)/);
   assert.equal(path.basename(binaryPath).toLowerCase(), 'opencode.cmd');
-  const npmRoot = path.join(path.dirname(binaryPath), '..', 'opencode-ai');
+  const shimDirectory = path.dirname(binaryPath);
+  const shimLayout = path.basename(shimDirectory).toLowerCase() === '.bin' ? 'local' : 'global';
+  const npmRoot = shimLayout === 'local' ? path.join(shimDirectory, '..', 'opencode-ai')
+    : path.join(shimDirectory, 'node_modules', 'opencode-ai');
   const npmPackage = JSON.parse(readFileSync(path.join(npmRoot, 'package.json'), 'utf8'));
   assert.equal(npmPackage.name, 'opencode-ai'); assert.equal(npmPackage.version, '1.18.31');
   const observations = [], server = createServer((req, res) => catalogGuard(req, res, observations));
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
-  const root = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'TEST-real-opencode-provider-')));
+  const root = await realpath(mkdtempSync(path.join(os.tmpdir(), 'TEST-real-opencode-provider-')));
   const report = { schemaVersion: 1, scope: 'actual npm V1 metadata only; no inference', root,
-    nativeVersion: '1.18.31', npmShimSha256: createHash('sha256').update(readFileSync(binaryPath)).digest('hex'),
+    nativeVersion: '1.18.31', shimLayout, npmShimSha256: createHash('sha256').update(readFileSync(binaryPath)).digest('hex'),
     runs: [], providerRequests: observations, passed: false };
   const flush = () => writeFileSync(evidencePath, JSON.stringify(report, null, 2) + '\n');
   const execute = promisify(execFile);
