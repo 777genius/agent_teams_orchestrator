@@ -278,7 +278,7 @@ test('darwin gone group member with reparented PPID requires absence and final c
 
 // The wrapper can close before the first birth helper completes while WMI still
 // returns its old tree. These rows must never confer birth or signal authority.
-function unanchoredFixture(mode: 'gone' | 'alive' | 'unknown' | 'orphan' | 'reused' | 'persistent' | 'final-reappeared' | 'absence-before-close') {
+function unanchoredFixture(mode: 'gone' | 'alive' | 'unknown' | 'orphan' | 'reused' | 'persistent' | 'final-reappeared' | 'absence-before-close' | 'root-reused' | 'protected' | 'unsuccessful', captured = false) {
   Object.defineProperty(process, 'platform', { value: 'win32' })
   const root = 900_020, relay = 900_021, leaf = 900_022, orphan = 900_023, grandchild = 900_024
   let clock = 1_000_000, removed = 0, trees = 0, births = 0
@@ -286,25 +286,27 @@ function unanchoredFixture(mode: 'gone' | 'alive' | 'unknown' | 'orphan' | 'reus
   const events: string[] = []
   const child = new EventEmitter() as ChildProcess
   Object.assign(child, { pid: root, stdout: new PassThrough() })
-  const initialRows = [{ pid: root, ppid: process.pid }, { pid: relay, ppid: root }, { pid: leaf, ppid: relay }]
+  const initialRows = [{ pid: root, ppid: process.pid }, { pid: relay, ppid: root }, { pid: mode === 'protected' ? process.pid : leaf, ppid: relay }]
   const date = spyOn(Date, 'now').mockImplementation(() => clock)
   const launcher = spyOn(portable, 'resolveDirectWindowsLauncher').mockReturnValue({ command: '/TEST/native', argsPrefix: [] })
   const spawn = spyOn(portable, 'spawnPortableCli').mockImplementation(() => {
     queueMicrotask(() => {
       child.stdout!.emit('data', Buffer.from('1.19.0\n'))
-      child.emit('exit', 0)
-      if (mode !== 'absence-before-close') child.emit('close', 0)
+      const exitCode = mode === 'unsuccessful' ? 1 : 0
+      child.emit('exit', exitCode)
+      if (mode !== 'absence-before-close') child.emit('close', exitCode)
     })
     return child
   })
   const ports = spyOn(native, 'nativePorts').mockImplementation(() => ({
     platform: 'win32', selfPid: process.pid, now: () => clock,
-    birth: async (_target, budget) => { births++; budgets.push(budget); clock += 350; return null },
+    birth: async (_target, budget) => { births++; budgets.push(budget); clock += 350; return captured && births === 1 ? 10 : null },
     tree: async budget => {
       budgets.push(budget); trees++
       let rows = trees === 1 || mode === 'persistent' ? initialRows : []
       if (trees === 2 && mode === 'orphan') rows = [{ pid: grandchild, ppid: orphan }, { pid: orphan, ppid: leaf }]
       if (trees === 2 && mode === 'reused') rows = [{ pid: leaf, ppid: 900_099 }]
+      if (trees === 2 && mode === 'root-reused') rows = [{ pid: root, ppid: 900_099 }]
       if (trees === 3 && mode === 'final-reappeared') rows = [{ pid: orphan, ppid: leaf }]
       events.push(rows.length ? 'census:rows' : 'census:empty')
       return rows
@@ -312,7 +314,8 @@ function unanchoredFixture(mode: 'gone' | 'alive' | 'unknown' | 'orphan' | 'reus
     alive: target => {
       aliveReads.push(target)
       if ((mode === 'alive' && target === leaf) || (mode === 'orphan' && target === grandchild) ||
-        (mode === 'reused' && trees === 2 && target === leaf)) return 'alive'
+        (mode === 'reused' && trees === 2 && target === leaf) ||
+        (mode === 'root-reused' && trees === 2 && target === root)) return 'alive'
       return mode === 'unknown' && target === leaf ? 'unknown' : 'gone'
     },
     signal: target => { signals.push(target) },
@@ -368,5 +371,34 @@ for (const mode of ['alive', 'unknown', 'orphan', 'reused', 'persistent', 'final
     if (mode === 'reused') expect(f.trees()).toBe(2)
     if (mode === 'final-reappeared') expect(f.trees()).toBe(3)
     if (mode === 'persistent') expect(f.elapsed()).toBe(8000)
+  })
+}
+
+// Actual Windows trace: captured owner exited0/closed, birth lookup then found
+// it gone, but WMI still included that owner and two already-gone descendants.
+test('Windows captured successful owner waits out stale gone descendants without acquiring signal authority', async () => {
+  const f = unanchoredFixture('gone', true)
+  expect(await f.run()).toBe('1.19.0\n')
+  expect(f.births()).toBe(2)
+  for (const target of [f.root, f.relay, f.leaf]) expect(f.aliveReads).toContain(target)
+  expect(f.events).toEqual(['census:rows', 'census:empty', 'census:empty', 'remove'])
+  expect(f.signals).toEqual([])
+  expect(f.taskkills).toEqual([])
+  expect(f.budgets.every(budget => budget > 0 && budget <= 5000)).toBe(true)
+  expect(f.removed()).toBe(1)
+})
+
+for (const mode of ['root-reused', 'protected', 'absence-before-close', 'unsuccessful'] as const) {
+  test(`Windows captured ${mode} owner cannot use stale-census waiting to retire or signal`, async () => {
+    const f = unanchoredFixture(mode, true)
+    await expect(f.run()).rejects.toThrow('cleanup_unknown')
+    expect(f.removed()).toBe(0)
+    expect(f.signals).toEqual([])
+    expect(f.taskkills).toEqual([])
+    expect(f.births()).toBe(2)
+    if (mode === 'root-reused') {
+      expect(f.trees()).toBe(2)
+      expect(f.aliveReads).toContain(f.root)
+    }
   })
 }

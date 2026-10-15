@@ -996,6 +996,31 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(JSON.stringify(result)).not.toContain('lockCode')
   })
 
+  test('outer provider failures publish matching nonblank error and diagnostic messages', async () => {
+    for (const message of ['', ' \t\r\n', undefined, 42, '  Known provider failure  ']) {
+      openCodeProvisioningProbe.probe = async () => {
+        throw Object.assign(new Error(), { message })
+      }
+      const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.handshake', {}))
+      if (!('error' in result)) throw new Error('Expected provider failure')
+      const expected = message === '  Known provider failure  ' ? message : 'OpenCode bridge operation failed'
+      expect(result.error).toEqual({ kind: 'provider_error', message: expected, retryable: true })
+      expect(result.diagnostics).toEqual([expect.objectContaining({
+        type: 'opencode_bridge', providerId: 'opencode', severity: 'error', message: expected,
+      })])
+      expect(result.error.message.trim().length).toBeGreaterThan(0)
+      expect(result.diagnostics[0]!.message.trim().length).toBeGreaterThan(0)
+    }
+  })
+
+  test('outer validation failure also publishes a nonblank message', async () => {
+    const input = Object.defineProperty({}, 'schemaVersion', { get() { throw new Error(' \t') } })
+    const result = await executeOpenCodeBridgeCommandEnvelope(input)
+    if (!('error' in result)) throw new Error('Expected validation failure')
+    expect(result.error).toEqual({ kind: 'invalid_input', message: 'OpenCode bridge operation failed', retryable: false })
+    expect(result.diagnostics).toEqual([])
+  })
+
   test('keeps non-lock provider failure message and diagnostic unchanged', async () => {
     const message = 'Known provider failure'
     openCodeProvisioningProbe.probe = async () => { throw Object.assign(new Error(message), { code: 'OTHER' }) }

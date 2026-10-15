@@ -717,7 +717,7 @@ async function runAfterSettled(previous: Promise<void> | undefined): Promise<voi
   }
 }
 
-const PROJECT_BEHAVIOR_FILES = [
+export const PROJECT_BEHAVIOR_FILES = [
   'opencode.json',
   'opencode.jsonc',
   'AGENTS.md',
@@ -731,7 +731,7 @@ const PROJECT_BEHAVIOR_FILES = [
   '.opencode/bun.lockb',
 ] as const
 
-const PROJECT_BEHAVIOR_DIRS = [
+export const PROJECT_BEHAVIOR_DIRS = [
   '.opencode/plugins',
   '.opencode/tools',
   '.opencode/agents',
@@ -785,6 +785,7 @@ export async function collectProjectBehaviorMetadata(
 ): Promise<{
   projectBehaviorFingerprint: string
   behaviorSources: string[]
+  behaviorSourceFingerprints?: Record<string, string>
 }> {
   const entries: string[] = []
   const behaviorSources = new Set<string>()
@@ -820,6 +821,10 @@ export async function collectProjectBehaviorMetadata(
   return {
     projectBehaviorFingerprint: hashString(entries.join('\n')),
     behaviorSources: Array.from(behaviorSources).sort(),
+    behaviorSourceFingerprints: Object.fromEntries(entries.map(entry => {
+      const separator = entry.lastIndexOf(':')
+      return [entry.slice(0, separator), entry.slice(separator + 1)]
+    })),
   }
 }
 
@@ -3534,7 +3539,7 @@ export class OpenCodeProfileManager {
       'profiles',
       profileRootKey,
     )
-    const { projectBehaviorFingerprint, behaviorSources } =
+    const { projectBehaviorFingerprint, behaviorSources, behaviorSourceFingerprints } =
       await collectProjectBehaviorMetadata(
         resolvedProjectPath,
         configSnapshot?.runtimeEnv ?? process.env,
@@ -3935,6 +3940,7 @@ export class OpenCodeProfileManager {
       effectiveManagedDefaultSource,
       projectBehaviorFingerprint,
       behaviorSources,
+      behaviorSourceFingerprints,
       managedConfig,
       managedConfigFingerprint,
       homePath,

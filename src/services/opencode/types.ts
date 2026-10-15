@@ -53,6 +53,8 @@ export type OpenCodePreparedProfile = {
   effectiveManagedDefaultSource?: 'project' | 'all_projects' | null
   projectBehaviorFingerprint: string
   behaviorSources: string[]
+  /** Diagnostic source identities from the same collection, never a new read. */
+  behaviorSourceFingerprints?: Record<string, string>
   managedConfig: Record<string, unknown>
   managedConfigFingerprint: string
   homePath: string
