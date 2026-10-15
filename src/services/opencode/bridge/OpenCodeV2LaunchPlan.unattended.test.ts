@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test'
 import { createHash } from 'node:crypto'
+import { EventEmitter } from 'node:events'
 import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -8,6 +9,9 @@ import * as nativeIdentity from '../compatibility/OpenCodeNativeIdentity.js'
 import * as receipts from '../profile/OpenCodeV2ExecutionReceipt.js'
 import * as mcp from '../OpenCodeMcpManager.js'
 import * as probes from './OpenCodeV2ExecutionProbe.js'
+import * as privateDirectories from '../profile/OpenCodePrivateDirectories.js'
+import * as windowsBroker from '../host/windows/OpenCodeV2WindowsNativeBroker.js'
+import * as windowsFilesystem from '../host/windows/OpenCodeV2WindowsOwnerFilesystem.js'
 import { buildOpenCodeExecutionProof } from '../OpenCodeExecutionProof.js'
 import { executionHash } from '../execution/OpenCodeV2ExecutionContracts.js'
 import { attachOpenCodeV2SelectedKey } from '../host/OpenCodeV2ExecutionAuth.js'
@@ -254,4 +258,65 @@ test('retired original terminal failure is retained across read and run requests
       .toEqual({ state: 'failed', proof: null, reason: 'native_execution_failed' })
     expect(await readFile(file, 'utf8')).toBe(saved)
   }
+})
+
+for (const refuse of [false, true]) test(`Windows prepared member creates its database before closing native publishers (refused=${refuse})`, async () => {
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform')!
+  const events: string[] = []
+  const refusal = new Error('execution_owner_unknown:prepared_database_exists:80')
+  let databasePath: string | undefined
+  try {
+    Object.defineProperty(process, 'platform', { ...platform, value: 'darwin' })
+    const selection = await inspectOpenCodeV2SourceAvailability(envelope())
+    const parent = path.join(root, 'profiles'); await mkdir(parent)
+    const unused = async (): Promise<never> => { throw new Error('TEST unexpected owner operation') }
+    const unusedFilesystem = windowsFilesystem.createWindowsOwnerFilesystem(unused)
+    restores.push(
+      spyOn(privateDirectories, 'ensureWindowsPrivateDirectories').mockImplementation(async directories => {
+        for (const directory of directories) await mkdir(directory, { recursive: true })
+      }),
+      spyOn(windowsBroker, 'resolveWindowsNativeArtifact').mockResolvedValue({ path: '/TEST/helper.exe', sha256: 'a'.repeat(64), arch: 'x64' }),
+      spyOn(windowsBroker, 'createWindowsNativeBroker').mockReturnValue({
+        events: new EventEmitter(), ended: () => false,
+        request: async () => { throw new Error('TEST unexpected native request') },
+        close: async () => { events.push('broker-close') },
+      }),
+      spyOn(windowsFilesystem, 'createWindowsOwnerFilesystem').mockReturnValue({
+        ...unusedFilesystem,
+        createDirectory: async (directory: string) => {
+          await mkdir(directory)
+          const role = directory.endsWith(path.join('config', 'opencode')) ? 'config' : 'data'
+          return {
+            identity: { volumeSerial: '1', fileId: '1'.repeat(32), ownerSid: 'S-1-5-21-1' },
+            assertOwned: unused, writeExclusive: unused, writePreparedAuth: unused,
+            readRecord: unused, readMetadata: unused, writeMetadata: unused, archive: unused,
+            writePreparedConfig: async (content: string) => {
+              events.push('config'); await writeFile(path.join(directory, 'opencode.json'), content, { flag: 'wx' })
+            },
+            createPreparedDatabase: async () => {
+              expect(role).toBe('data')
+              expect(await readFile(path.join(directory, 'auth.json'), 'utf8')).toBe(authContent)
+              expect(events).toEqual(['config'])
+              events.push('database')
+              databasePath = path.join(directory, 'opencode.db')
+              if (refuse) throw refusal
+              await writeFile(databasePath, '', { flag: 'wx' })
+            },
+            close: async () => { events.push(`close-${role}`) },
+          } satisfies windowsFilesystem.WindowsOwnerDirectory
+        },
+      }),
+    )
+    Object.defineProperty(process, 'platform', { ...platform, value: 'win32' })
+    const prepared = createOpenCodeV2PreparedMember(selection, native(), parent,
+      { teamId: 'TEST-team', runId: 'TEST-run', memberId: 'worker', unattendedTeam: true })
+    if (refuse) await expect(prepared).rejects.toBe(refusal)
+    else {
+      const result = await prepared
+      if (databasePath === undefined) throw new Error('TEST native database creation was not called')
+      expect(result.profile.databasePath).toBe(databasePath)
+      expect(await readFile(result.profile.databasePath)).toHaveLength(0)
+    }
+    expect(events).toEqual(['config', 'database', 'close-data', 'close-config', 'broker-close'])
+  } finally { Object.defineProperty(process, 'platform', platform) }
 })

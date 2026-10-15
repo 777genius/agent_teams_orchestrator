@@ -283,6 +283,7 @@ export async function createOpenCodeV2PreparedMember(selection: Awaited<ReturnTy
         controller: { server: 'agent-teams', config: selection.controller }, provider, unattendedTeam: input.unattendedTeam })
       if (configOwner) await configOwner.writePreparedConfig(config.content, config.sha256)
       else await writeFile(path.join(configDirectory, 'opencode.json'), config.content, { flag: 'wx', mode: 0o600 })
+      if (authOwner) await authOwner.createPreparedDatabase()
     } finally {
       const closed = await Promise.allSettled(held.reverse().map(directory => directory.close()))
       await publisher?.close()

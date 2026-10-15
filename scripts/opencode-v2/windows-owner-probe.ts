@@ -469,8 +469,9 @@ try {
   const ownedSelectedConfig = retain(await filesystem.createDirectory(selectedConfigDirectory))
   const selectedDataDirectory = path.win32.join(selectedRoot, "data", "opencode")
   const ownedSelectedData = retain(await filesystem.createDirectory(selectedDataDirectory))
-  // Metadata-only synthetic database; no SQL/provider/auth is opened by this probe.
-  await writeOwnedFixture(ownedSelectedData, selectedDataDirectory, 'opencode.db', 'TEST-synthetic-database')
+  // Real exclusive zero-byte DB custody; the official runtime owns schema bootstrap.
+  await ownedSelectedData.createPreparedDatabase()
+  assert.equal((await readFile(path.win32.join(selectedDataDirectory, 'opencode.db'))).length, 0)
   const claudeRoot = path.win32.join(requestedRoot, "TEST-claude")
   retain(await filesystem.createDirectory(claudeRoot))
   retain(await filesystem.createDirectory(path.win32.join(claudeRoot, "teams")))
@@ -525,11 +526,13 @@ try {
     for (const openOp of ['ownerOpenDirectory', 'ownerPreparePrivateDirectory'] as const) {
       const opened = executionRecord(await request(openOp, { path: directory, createExclusive: false }))
       try {
+        await assert.rejects(request('ownerCreatePreparedDatabase', { op: 'ownerCreatePreparedDatabase', handleId: opened.handleId }), /execution_owner_read_only/)
         await assert.rejects(request(op, { op, handleId: opened.handleId,
           bytesBase64: Buffer.from(bytes).toString('base64'), sha256 }), /execution_owner_read_only/)
       } finally { await request('ownerCloseDirectory', { handleId: opened.handleId }) }
     }
   }
+  facts.preparedZeroDatabaseNativePublication = true
   facts.preparedConfigAndAuthNativePublication = true
   facts.preparedFilesRefuseReplacementAndReadOnlyPublication = true
   const selectionIds = [String(executionRecord(configSelection).selectionId)]

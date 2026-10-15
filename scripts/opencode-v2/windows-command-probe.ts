@@ -14,6 +14,7 @@ const root = process.argv[2], receiptPath = process.argv[3]
 assert.ok(root && receiptPath && path.win32.isAbsolute(root) && path.win32.isAbsolute(receiptPath))
 assert.match(path.win32.basename(root), /^TEST-windows-command-[a-zA-Z0-9-]+$/)
 const profileRoot = path.join(root, 'opencode', 'v2', 'profiles', 'TEST-prepared')
+const databasePath = path.join(profileRoot, 'data', 'opencode', 'opencode.db')
 const profileChildren = ['home', 'config', 'data', 'cache', 'state', 'tmp', 'appdata', 'localappdata', 'config/opencode', 'data/opencode'].map(value => path.join(profileRoot, value))
 const configContent = JSON.stringify({ 'TEST-only': 'config-read-é' }), authContent = JSON.stringify({ 'TEST-provider': { type: 'api', key: 'TEST-never-used' } }, null, 2)
 const expectedPreparedHashes = { configSHA256: createHash('sha256').update(configContent).digest('hex'), authSHA256: createHash('sha256').update(authContent).digest('hex') }
@@ -61,20 +62,37 @@ async function output(commandId: string, stream: 'stdout' | 'stderr') {
 // Serialized after Bun removes TypeScript syntax. This actual AppContainer
 // child reads only synthetic prepared files and emits digests, never auth bytes.
 async function verifyPreparedProfileFiles(): Promise<void> {
-  const { readFile } = await import('node:fs/promises')
+  const { readFile, stat } = await import('node:fs/promises')
+  const { Database } = await import('bun:sqlite')
   const { createHash } = await import('node:crypto')
   const path = await import('node:path')
   const root = process.env.TEST_PREPARED_PROFILE
   if (!root) throw new Error('TEST_profile_missing')
   const config = await readFile(path.join(root, 'config', 'opencode', 'opencode.json'))
   const auth = await readFile(path.join(root, 'data', 'opencode', 'auth.json'))
-  await Bun.stdout.write(JSON.stringify({ configSHA256: createHash('sha256').update(config).digest('hex'),
+  const databasePath = path.join(root, 'data', 'opencode', 'opencode.db')
+  const before = await stat(databasePath, { bigint: true })
+  if (before.size !== 0n) throw new Error('TEST_database_not_empty')
+  // Same constructor/options and WAL initialization as BOTH installed official
+  // sqlite.bun layers. Only this TEST table is ours; no official schema is faked.
+  const db = new Database(databasePath, { readwrite: true, create: true })
+  try {
+    db.run('PRAGMA journal_mode = WAL;')
+    db.run('CREATE TABLE TEST_bootstrap (value TEXT NOT NULL)')
+    db.run("INSERT INTO TEST_bootstrap VALUES ('TEST-initialized')")
+    const row = db.query<{ value: string }, []>('SELECT value FROM TEST_bootstrap').get()
+    if (row?.value !== 'TEST-initialized') throw new Error('TEST_database_bootstrap_failed')
+  } finally { db.close() }
+  const after = await stat(databasePath, { bigint: true })
+  if (after.dev !== before.dev || after.ino !== before.ino || after.size <= 0n)
+    throw new Error('TEST_database_identity_changed')
+  await Bun.stdout.write(JSON.stringify({ databaseInitialized: true, databaseFilePreserved: true, configSHA256: createHash('sha256').update(config).digest('hex'),
     authSHA256: createHash('sha256').update(auth).digest('hex') }))
 }
 async function assertProfilePackageAces(expected: boolean): Promise<void> {
   assert.ok(sid)
   const paths = [profileRoot, ...profileChildren, path.join(profileRoot, 'config', 'opencode', 'opencode.json'),
-    path.join(profileRoot, 'data', 'opencode', 'auth.json')]
+    path.join(profileRoot, 'data', 'opencode', 'auth.json'), databasePath]
   const rows: unknown = JSON.parse(await ps(`
 $ErrorActionPreference='Stop'
 $paths=@($env:TEST_PROFILE_PATHS|ConvertFrom-Json)
@@ -128,8 +146,17 @@ try {
   try { await configDirectory.writePreparedConfig(configContent, expectedPreparedHashes.configSHA256) }
   finally { await configDirectory.close() }
   const dataDirectory = await filesystem.createDirectory(path.join(profileRoot, 'data', 'opencode'))
-  try { await dataDirectory.writePreparedAuth(authContent, expectedPreparedHashes.authSHA256) }
+  try {
+    await dataDirectory.writePreparedAuth(authContent, expectedPreparedHashes.authSHA256)
+    await dataDirectory.createPreparedDatabase()
+    assert.equal((await readFile(databasePath)).length, 0)
+    await assert.rejects(dataDirectory.createPreparedDatabase())
+    assert.equal((await readFile(databasePath)).length, 0)
+  }
   finally { await dataDirectory.close() }
+  const beforeDatabaseAdmission = record(await broker.request('ownerValidateSelectedProfile', {
+    root: profileRoot, databasePath, directories: profileChildren }))
+  const beforeDatabaseIdentity = record(beforeDatabaseAdmission.databaseIdentity)
   environment.TEST_PREPARED_PROFILE = profileRoot
   await writeFile(path.join(root, 'prepared-read.ts'), `(${verifyPreparedProfileFiles.toString()})()`)
   const fencePath = path.join(root, '.native-owner')
@@ -195,7 +222,11 @@ $sid
   const preparedRead = await start(path.join(root, 'prepared-read.ts'), 'ignore')
   const [preparedOutput, preparedError] = await Promise.all([output(preparedRead.commandId, 'stdout'), output(preparedRead.commandId, 'stderr')])
   assert.equal(preparedError.length, 0)
-  assert.deepEqual(JSON.parse(preparedOutput.toString('utf8')), expectedPreparedHashes)
+  assert.deepEqual(JSON.parse(preparedOutput.toString('utf8')), { ...expectedPreparedHashes, databaseInitialized: true, databaseFilePreserved: true })
+  const afterDatabaseAdmission = record(await broker.request('ownerValidateSelectedProfile', {
+    root: profileRoot, databasePath, directories: profileChildren }))
+  assert.deepEqual(afterDatabaseAdmission.databaseIdentity, beforeDatabaseIdentity)
+  facts.preparedDatabaseBootstrapFileIdentityPreserved = true
   await closeCommand(preparedRead.commandId)
   facts.preparedProfileRootOnlyGrantReadHashes = expectedPreparedHashes
   stage = 'native-file-output'

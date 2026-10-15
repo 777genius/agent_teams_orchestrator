@@ -2003,10 +2003,15 @@ public:
   }
   // Fixed fresh-profile publications. Ordinary creator authority is required;
   // preparatory and reopened handles never acquire file creation rights.
-  JsonObject writePrepared(const JsonObject &input, bool config) {
-    require(input.Size() == 4 &&
-                text(input, L"op") == (config ? L"ownerWritePreparedConfig" : L"ownerWritePreparedAuth") &&
-                input.HasKey(L"handleId") && input.HasKey(L"bytesBase64") && input.HasKey(L"sha256"),
+  enum class PreparedPublication { Config, Auth, Database };
+  JsonObject writePrepared(const JsonObject &input, PreparedPublication purpose) {
+    const bool config = purpose == PreparedPublication::Config;
+    const bool database = purpose == PreparedPublication::Database;
+    require(input.Size() == (database ? 2U : 4U) &&
+                text(input, L"op") == (database ? L"ownerCreatePreparedDatabase" :
+                    config ? L"ownerWritePreparedConfig" : L"ownerWritePreparedAuth") &&
+                input.HasKey(L"handleId") &&
+                (database || (input.HasKey(L"bytesBase64") && input.HasKey(L"sha256"))),
             "execution_invalid_response");
     auto &directory = held(input);
     require(directory.writable && directory.owner == currentSid(), "execution_owner_read_only");
@@ -2023,20 +2028,26 @@ public:
             "execution_owner_prepared_purpose_invalid");
     require(preparedProfileRoot(directory.path) == root, "execution_owner_prepared_purpose_invalid");
     const auto rootIdentity = protectedProfileRoot(root, directory.parents, directory.owner);
-    const auto expectedHash = text(input, L"sha256");
+    // SQLite initializes its own schema later; this establishes only the
+    // exclusive real file's custody before sealing the existing DB identity.
+    const auto expectedHash = database ?
+        std::wstring(L"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855") :
+        text(input, L"sha256");
     require(expectedHash.size() == 64 &&
                 expectedHash.find_first_not_of(L"0123456789abcdef") == std::wstring::npos,
             "execution_owner_prepared_invalid");
-    const size_t limit = config ? 4 * 1024 * 1024 : 128 * 1024;
-    const auto data = config ? unbase64Bounded(text(input, L"bytesBase64"), limit) :
+    const size_t limit = database ? 0 : config ? 4 * 1024 * 1024 : 128 * 1024;
+    const auto data = database ? std::vector<BYTE>() : config ? unbase64Bounded(text(input, L"bytesBase64"), limit) :
                                unbase64(text(input, L"bytesBase64"), limit);
-    require(!data.empty() && wide(base64(data)) == text(input, L"bytesBase64"),
-            "execution_owner_prepared_invalid");
-    try { (void)JsonObject::Parse(wide(std::string(data.begin(), data.end()))); }
-    catch (...) { throw NativeError{"execution_owner_prepared_invalid"}; }
+    if (!database) {
+      require(!data.empty() && wide(base64(data)) == text(input, L"bytesBase64"),
+              "execution_owner_prepared_invalid");
+      try { (void)JsonObject::Parse(wide(std::string(data.begin(), data.end()))); }
+      catch (...) { throw NativeError{"execution_owner_prepared_invalid"}; }
+    }
     SharedAclMutex mutation(directory.identity);
     held(input);
-    const std::wstring name = config ? L"opencode.json" : L"auth.json";
+    const std::wstring name = database ? L"opencode.db" : config ? L"opencode.json" : L"auth.json";
     LocalMemory descriptor;
     const auto sddl = L"O:" + directory.owner + L"D:(A;;FA;;;SY)(A;;FA;;;" + directory.owner + L")";
     require(ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -2072,8 +2083,10 @@ public:
             "execution_owner_unknown");
     const auto identity = fileIdentity(file.value, directory.owner, false, selectedPackage);
     DWORD written = 0;
-    require(WriteFile(file.value, data.data(), static_cast<DWORD>(data.size()), &written, nullptr) &&
-                written == data.size() && FlushFileBuffers(file.value), "execution_owner_unknown");
+    require(data.empty() ||
+                (WriteFile(file.value, data.data(), static_cast<DWORD>(data.size()), &written, nullptr) &&
+                 written == data.size()), "execution_owner_unknown");
+    require(FlushFileBuffers(file.value), "execution_owner_unknown");
     require(heldFileSha256(file.value) == expectedHash && heldFileBytes(file.value, static_cast<DWORD>(limit)) == data &&
                 fileIdentity(file.value, directory.owner, false, selectedPackage).Stringify() == identity.Stringify(),
             "execution_owner_prepared_invalid");
@@ -2482,8 +2495,10 @@ public:
       return readMetadata(input);
     if (operation == L"ownerWriteMetadata")
       return writeMetadata(input);
-    if (operation == L"ownerWritePreparedConfig" || operation == L"ownerWritePreparedAuth")
-      return writePrepared(input, operation == L"ownerWritePreparedConfig");
+    if (operation == L"ownerWritePreparedConfig" || operation == L"ownerWritePreparedAuth" ||
+        operation == L"ownerCreatePreparedDatabase")
+      return writePrepared(input, operation == L"ownerCreatePreparedDatabase" ? PreparedPublication::Database :
+          operation == L"ownerWritePreparedConfig" ? PreparedPublication::Config : PreparedPublication::Auth);
     // Close remains possible after identity/mutation uncertainty. It only drops
     // this native capability and never erases or adopts an acquisition fence.
     if (operation == L"ownerCloseDirectory") {
