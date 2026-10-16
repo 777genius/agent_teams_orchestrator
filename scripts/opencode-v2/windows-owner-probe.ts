@@ -786,6 +786,18 @@ using System.Runtime.InteropServices;
 public static class TestFixtureSecurity {
 [DllImport("advapi32.dll",EntryPoint="SetFileSecurityW",ExactSpelling=true,CharSet=CharSet.Unicode,SetLastError=true)]
 [return:MarshalAs(UnmanagedType.Bool)] public static extern bool SetFileSecurity(string path,uint information,byte[] descriptor);
+[DllImport("advapi32.dll",EntryPoint="GetFileSecurityW",ExactSpelling=true,CharSet=CharSet.Unicode,SetLastError=true)]
+[return:MarshalAs(UnmanagedType.Bool)] private static extern bool GetFileSecurity(string path,uint information,[Out] byte[] descriptor,uint size,out uint needed);
+public static byte[] ReadSecurityDescriptor(string path){
+uint needed;
+if(GetFileSecurity(path,7,null,0,out needed)||Marshal.GetLastWin32Error()!=122||needed==0||needed>131072)
+throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+byte[] descriptor=new byte[(int)needed];uint actual;
+if(!GetFileSecurity(path,7,descriptor,needed,out actual))
+throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+if(actual!=needed)throw new System.InvalidOperationException("TEST raw descriptor size changed");
+return descriptor;
+}
 }
 '@
 function Set-TestDacl([byte[]]$descriptor){
@@ -1028,16 +1040,19 @@ finally{Set-TestDacl ([Convert]::FromBase64String($env:TEST_ORIGINAL_DESCRIPTOR)
   const projectAclRestorations: Array<{ beforeControl: number | null; afterControl: number | null;
     ownerUnchanged: boolean; groupUnchanged: boolean; daclBytesUnchanged: boolean; identityUnchanged: boolean }> = []
   facts.projectAclRestorations = projectAclRestorations
-  const projectAcl = async () => JSON.parse(await powershell('project_acl_snapshot', `
+  const projectAcl = async (includeDacl = false): Promise<Array<Record<string, unknown>>> => {
+    const rows = JSON.parse(await powershell('project_acl_snapshot', fixtureSecurity + `
 $rows=@(foreach($item in @((Get-Item -LiteralPath $env:TEST_TARGET);(Get-ChildItem -LiteralPath $env:TEST_TARGET -Recurse -Force | Sort-Object FullName))){
-$acl=Get-Acl -LiteralPath $item.FullName
-$raw=[Security.AccessControl.RawSecurityDescriptor]::new($acl.GetSecurityDescriptorBinaryForm(),0)
+$raw=[Security.AccessControl.RawSecurityDescriptor]::new([TestFixtureSecurity]::ReadSecurityDescriptor($item.FullName),0)
+$daclBytes=[byte[]]::new($raw.DiscretionaryAcl.BinaryLength);$raw.DiscretionaryAcl.GetBinaryForm($daclBytes,0)
 $aces=@(foreach($ace in $raw.DiscretionaryAcl){
 if($ace -isnot [Security.AccessControl.CommonAce]){throw 'TEST unexpected project ACE'}
 $bytes=[byte[]]::new($ace.BinaryLength);$ace.GetBinaryForm($bytes,0)
 [ordered]@{sid=$ace.SecurityIdentifier.Value;mask=$ace.AccessMask;flags=[int]$ace.AceFlags;type=[int]$ace.AceType;bytes=[Convert]::ToBase64String($bytes)}})
-[ordered]@{relative=$item.FullName.Substring($env:TEST_TARGET.Length);owner=$raw.Owner.Value;group=$raw.Group.Value;control=[int]$raw.ControlFlags;aces=$aces}})
+[ordered]@{relative=$item.FullName.Substring($env:TEST_TARGET.Length);owner=$raw.Owner.Value;group=$raw.Group.Value;control=[int]$raw.ControlFlags;dacl=[Convert]::ToBase64String($daclBytes);aces=$aces}})
 [Console]::Write((ConvertTo-Json -InputObject $rows -Depth 5 -Compress))`, sharedProject)) as Array<Record<string, unknown>>
+    return includeDacl ? rows : rows.map(({ dacl, ...row }) => row)
+  }
   const rootIdentity = async () => { const info = await lstat(sharedProject); return { dev: info.dev, ino: info.ino, birth: info.birthtimeMs } }
   const lowerProjectIntegrity = async () => {
     assert.ok(process.env.SystemRoot && path.win32.isAbsolute(process.env.SystemRoot))
@@ -1285,6 +1300,7 @@ await Bun.stdout.write(actor+':written')
     }
     // Mutate only the target DACL, never propagate a synthetic ACE. Every
     // refusal must preserve the installed tree and the original physical pin.
+    let duplicateOutcome: 'duplicate_refused' | 'duplicate_normalized_before_admission' | undefined
     for (const [sid, mask, flags, replace] of [
       [foreignProjectCohortSid, 0x1301bf, 3, false],
       [otherSid, 0x1301bf, 3, false],
@@ -1295,9 +1311,9 @@ await Bun.stdout.write(actor+':written')
       facts.projectCohortStage = replace ? mask === 0x1f01ff ? 'broad_mask_refusal' : 'inheritance_refusal'
         : sid === otherSid ? 'other_project_sid_refusal'
           : sid === foreignProjectCohortSid ? 'foreign_cohort_sid_refusal' : 'duplicate_ace_refusal'
+      const duplicateFixture = !replace && sid === memberSids[0] && mask === 0x1301bf && flags === 3
       const original = executionRecord(JSON.parse(await powershell('project_acl_install', fixtureSecurity + `
-$acl=Get-Acl -LiteralPath $env:TEST_TARGET
-$bytes=$acl.GetSecurityDescriptorBinaryForm();$raw=[Security.AccessControl.RawSecurityDescriptor]::new($bytes,0)
+$bytes=[TestFixtureSecurity]::ReadSecurityDescriptor($env:TEST_TARGET);$raw=[Security.AccessControl.RawSecurityDescriptor]::new($bytes,0)
 $daclBytes=[byte[]]::new($raw.DiscretionaryAcl.BinaryLength);$raw.DiscretionaryAcl.GetBinaryForm($daclBytes,0)
 $security=[ordered]@{owner=$raw.Owner.Value;group=$raw.Group.Value;control=[int]$raw.ControlFlags;dacl=[Convert]::ToBase64String($daclBytes)}
 $sid=[Security.Principal.SecurityIdentifier]::new($env:TEST_SID)
@@ -1313,15 +1329,38 @@ $changed=[byte[]]::new($raw.BinaryLength);$raw.GetBinaryForm($changed,0);Set-Tes
       let verificationPhase = 'staged_acl_snapshot'
       let verificationMember: number | null = null
       try {
-        const staged = await projectAcl()
-        verificationPhase = 'member_refusal'
-        for (const [index, peer] of peers.entries()) {
-          verificationMember = index
-          await assert.rejects(peer.broker.request('assertLive'),
-            /^Error: execution_containment_filesystem_denied(?::[a-z_]+:\d+)?$/)
+        const staged = await projectAcl(true)
+        const matching = (staged[0]!.aces as unknown[]).map(executionRecord).filter(ace => ace.sid === sid)
+        if (duplicateFixture) {
+          verificationPhase = 'duplicate_native_precondition'
+          assert.ok(matching.length === 1 || matching.length === 2)
+          for (const ace of matching) { assert.equal(ace.type, 0); assert.equal(ace.mask, 0x1301bf); assert.equal(ace.flags, 3) }
+        }
+        if (duplicateFixture && matching.length === 1) {
+          // Some setters normalize equivalent ACEs. This is live acceptance
+          // only when the complete native DACL is exactly the original one.
+          verificationPhase = 'duplicate_normalized_before_admission'
+          assertRestoredProjectAcl(original.security, staged[0])
+          assert.deepEqual(await rootIdentity(), beforeIdentity)
+          for (const [index, peer] of peers.entries()) {
+            verificationMember = index
+            assert.ok(executionHash(await peer.broker.request('assertLive')) === executionHash(peer.mapping),
+              'TEST_project_normalized_mapping_changed')
+          }
+          duplicateOutcome = 'duplicate_normalized_before_admission'
+        } else {
+          if (duplicateFixture) assert.ok(typeof matching[0]!.bytes === 'string' && matching[0]!.bytes === matching[1]!.bytes,
+            'TEST_project_duplicate_ace_bytes_changed')
+          verificationPhase = 'member_refusal'
+          for (const [index, peer] of peers.entries()) {
+            verificationMember = index
+            await assert.rejects(peer.broker.request('assertLive'),
+              /^Error: execution_containment_filesystem_denied(?::[a-z_]+:\d+)?$/)
+          }
+          if (duplicateFixture) duplicateOutcome = 'duplicate_refused'
         }
         verificationMember = null; verificationPhase = 'refusal_acl_unchanged'
-        assert.deepEqual(await projectAcl(), staged)
+        assert.ok(executionHash(await projectAcl(true)) === executionHash(staged), 'TEST_project_staged_acl_changed')
         verificationPhase = 'refusal_identity_unchanged'
         assert.deepEqual(await rootIdentity(), beforeIdentity)
       } catch (error) {
@@ -1336,7 +1375,7 @@ $changed=[byte[]]::new($raw.BinaryLength);$raw.GetBinaryForm($changed,0);Set-Tes
         try {
           const restored = executionRecord(JSON.parse(await powershell('project_acl_restore', fixtureSecurity + `
 Set-TestDacl ([Convert]::FromBase64String($env:TEST_DESCRIPTOR))
-$raw=[Security.AccessControl.RawSecurityDescriptor]::new((Get-Acl -LiteralPath $env:TEST_TARGET).GetSecurityDescriptorBinaryForm(),0)
+$raw=[Security.AccessControl.RawSecurityDescriptor]::new([TestFixtureSecurity]::ReadSecurityDescriptor($env:TEST_TARGET),0)
 $daclBytes=[byte[]]::new($raw.DiscretionaryAcl.BinaryLength);$raw.DiscretionaryAcl.GetBinaryForm($daclBytes,0)
 [Console]::Write((@{owner=$raw.Owner.Value;group=$raw.Group.Value;control=[int]$raw.ControlFlags;dacl=[Convert]::ToBase64String($daclBytes)}|ConvertTo-Json -Compress))`,
             sharedProject, { TEST_DESCRIPTOR: String(original.descriptor) })))
@@ -1362,7 +1401,8 @@ $daclBytes=[byte[]]::new($raw.DiscretionaryAcl.BinaryLength);$raw.DiscretionaryA
     facts.selectedProjectCohort = { sealedMembers: 3, actualLaunchedMembers: 2, sharedProjectCommandsPassed: true,
       originalNativeNoncesUsed: true, wrongProjectPreflightRefused: true, foreignCohortRefused: true,
       sameCohortOtherProjectRefused: true, broadMaskRefused: true, inheritanceRefused: true,
-      duplicateAceRefused: true, refusalDaclAndIdentityUnchanged: true }
+      duplicateAceRefused: duplicateOutcome === 'duplicate_refused', duplicateAceOutcome: duplicateOutcome,
+      refusalDaclAndIdentityUnchanged: true }
   } catch (error) {
     projectProofFailure = error
     facts.projectCohortFailure = fixtureFailureCode(error)
