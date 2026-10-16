@@ -446,6 +446,7 @@ export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, l
     assert(equal(await broker!.request('assertLive'), nativeMapping), 'execution_identity_mismatch')
   }
   let preparation: Promise<WindowsExecutionMapping> | undefined, retirement: Promise<WindowsKernelRetirement> | undefined
+  let deferredRuntime = false, activated = false
   return Object.freeze({ child, fetch: http.fetch,
     output: () => ({ stdout: '', stderr: launchHistory.length === 0 ? '' : JSON.stringify({
       event: 'opencode-v2-startup', reason: 'failed', stage: launchHistory.at(-1)!.stage,
@@ -477,7 +478,14 @@ export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, l
       })()
     },
     assertLive,
-    async start(payload: Readonly<Record<string, unknown>>, deadline: number, signal?: AbortSignal) { assert(mapping && !started && !stopped); await assertLive(); started = true; await broker!.request('send', { value: { ...payload, type: 'start', nonce, leaseOwnerId, namespace: mapping.namespace.name } }, deadline, signal) },
+    async start(payload: Readonly<Record<string, unknown>>, deadline: number, signal?: AbortSignal) { assert(mapping && !started && !stopped); await assertLive(); signal?.throwIfAborted(); assert(!stopped && Date.now() < deadline); deferredRuntime = payload.deferRuntime === true; started = true; await broker!.request('send', { value: { ...payload, type: 'start', nonce, leaseOwnerId, namespace: mapping.namespace.name } }, deadline, signal) },
+    async activate(deadline: number, signal?: AbortSignal) {
+      signal?.throwIfAborted(); assert(mapping && started && deferredRuntime && !activated && !stopped && Date.now() < deadline)
+      await assertLive(); signal?.throwIfAborted(); assert(!stopped && Date.now() < deadline)
+      activated = true
+      await broker!.request('send', { value: { type: 'activate', nonce, leaseOwnerId, namespace: mapping.namespace.name,
+        pid: mapping.bun.nativePID, birth: mapping.bun.birth } }, deadline, signal)
+    },
     sendClose() { assert(mapping); stopped = true; void http.close().then(() => broker!.request('send', { value: { type: 'close', nonce, leaseOwnerId } })).catch(() => child.emit('error', new Error('cleanup_unknown'))) },
     acknowledged: () => closed,
     readBirth() { assert(mapping && mainExit, 'execution_identity_mismatch'); return mainExit.readBirth() },

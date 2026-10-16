@@ -1,6 +1,6 @@
 import { readExecutionGraphFailure } from '../services/opencode/host/OpenCodeV2ExecutionBinding.js'
 import { openCodeBunVersion } from '../constants/openCodeBunVersion.js'
-import { windowsExecutionChildControl } from '../services/opencode/host/windows/OpenCodeV2WindowsChildControl.js'
+import { windowsExecutionChildControl, windowsGraphActivation } from '../services/opencode/host/windows/OpenCodeV2WindowsChildControl.js'
 import { prepareExecutionPlatformChild, readExecutionPlatformBirth } from '../services/opencode/host/OpenCodeV2ExecutionPlatform.js'
 import { pathToFileURL } from 'node:url'
 import { resolveOpenCodeV2ExecutionDelivery } from '../services/opencode/host/OpenCodeV2ExecutionDelivery.js'
@@ -31,6 +31,7 @@ let preparation: ReturnType<typeof prepareExecutionPlatformChild> | undefined
 let leaseOwnerId: string | undefined
 let nonce: string | undefined, started = false, closing = false
 let startup: Promise<void> | undefined, finalize: (() => Promise<void>) | undefined
+let graphActivation: ReturnType<typeof windowsGraphActivation> | undefined
 let closeWork: Promise<void> | undefined
 const startupStartedAt = Date.now()
 let startupStage = 'waiting-for-prepare'
@@ -94,6 +95,11 @@ async function start(input: Record<string, unknown>): Promise<void> {
   executionRecord(input.native); executionRecord(input.profile)
   const native = input.native as ValidatedExecutionNative
   const profile = input.profile as OwnedNativeProfile
+  if (input.deferRuntime !== undefined) {
+    executionAssert(process.platform === 'win32' && input.deferRuntime === true && Number.isFinite(input.activationDeadline) && Number(input.activationDeadline) > Date.now(), 'execution_identity_mismatch')
+    graphActivation = windowsGraphActivation({ nonce: prepared.nonce, leaseOwnerId: prepared.leaseOwnerId,
+      namespace: prepared.namespace, pid: process.pid, birth: prepared.birth }, Number(input.activationDeadline))
+  } else executionAssert(input.activationDeadline === undefined, 'execution_identity_mismatch')
   enterStartupStage('delivery-resolution')
   const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'execution')
   executionAssert(native.runtimeMode === delivery.runtimeMode && native.entrySha256 === delivery.entrySha256 &&
@@ -126,6 +132,18 @@ async function start(input: Record<string, unknown>): Promise<void> {
   enterStartupStage('graph-validation')
   const graph = await validateExecutionGraph(native.version, native.graph, value => { graphProgress = value }, controller.signal)
   controller.signal.throwIfAborted()
+  if (graphActivation) {
+    const birth = await readExecutionPlatformBirth(process.pid)
+    executionAssert(birth && executionHash(birth) === executionHash(prepared.birth), 'execution_identity_mismatch')
+    graphActivation.ready()
+    await boundOpenCodeRead(childControl.send({ type: 'graph-ready', nonce, leaseOwnerId: prepared.leaseOwnerId,
+      namespace: prepared.namespace, pid: process.pid, birth, pin: native.version, graphSha256: native.graph.sha256,
+      executableSha256: native.bun.sha256, profileEpoch: profile.epoch, selectionSha256: executionHash(profile.selection) }),
+      Math.min(1000, Number(input.activationDeadline) - Date.now()), controller.signal)
+    await boundOpenCodeRead(graphActivation.wait(), Number(input.activationDeadline) - Date.now(), controller.signal)
+    controller.signal.throwIfAborted()
+    executionAssert(Date.now() < Number(input.activationDeadline), 'execution_timeout')
+  }
   const options = {
     hostname: '127.0.0.1', port: 0, password: input.password,
     app: { name: 'agent-teams-execution', version: native.version },
@@ -202,6 +220,10 @@ childControl.events.on('message', (message: unknown) => {
     if (input.type === 'close') {
       if (!started && !closing && nonce === undefined) nonce = input.nonce
       executionAssert(input.nonce === nonce && (leaseOwnerId === undefined || input.leaseOwnerId === leaseOwnerId), 'execution_identity_mismatch'); void close(); return
+    }
+    if (input.type === 'activate') {
+      executionAssert(started && !closing && childControl.connected() && graphActivation, 'execution_identity_mismatch')
+      graphActivation.activate(input, controller.signal); return
     }
     executionAssert(preparation && !started && !closing && input.type === 'start' && childControl.connected())
     started = true; nonce = input.nonce

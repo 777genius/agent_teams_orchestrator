@@ -3,6 +3,7 @@ import { EventEmitter } from 'node:events'
 import { StringDecoder } from 'node:string_decoder'
 import { createConnection, type Socket } from 'node:net'
 import path from 'node:path'
+import { executionHash } from '../../execution/OpenCodeV2ExecutionContracts.js'
 import type { WindowsRealpathInstallation, WindowsRealpathSelection } from './OpenCodeV2WindowsRealpath.js'
 import type { ExecutionBirth } from '../OpenCodeV2ExecutionBinding.js'
 
@@ -13,6 +14,26 @@ export type WindowsChildControl = Readonly<{
 const CONTROL_PACKET_LIMIT = 16 * 1024 * 1024
 let owned: WindowsChildControl | undefined
 const authenticatedPrepares = new WeakMap<object, Record<string, unknown>>()
+/** One authenticated Windows startup pause after the complete read-only graph.
+ * This carries the owner's original absolute initialization deadline. */
+export function windowsGraphActivation(expected: Readonly<{ nonce: string; leaseOwnerId: string; namespace: string; pid: number; birth: ExecutionBirth }>, deadline: number) {
+  assert(Number.isFinite(deadline) && deadline > Date.now())
+  const identity = Object.freeze({ ...expected, birth: Object.freeze({ ...expected.birth }) })
+  let ready = false, activated = false
+  let resolve!: () => void
+  const activation = new Promise<void>(done => { resolve = done })
+  return Object.freeze({
+    ready() { assert(!ready && !activated && Date.now() < deadline); ready = true },
+    activate(input: Record<string, unknown>, signal: AbortSignal) {
+      signal.throwIfAborted()
+      assert(ready && !activated && Date.now() < deadline && input.type === 'activate' &&
+        input.nonce === identity.nonce && input.leaseOwnerId === identity.leaseOwnerId && input.namespace === identity.namespace &&
+        input.pid === identity.pid && executionHash(input.birth) === executionHash(identity.birth))
+      activated = true; resolve()
+    },
+    wait: () => activation,
+  })
+}
 /** Explicit child transport. Shared entry composition can select this without
  * overriding process.send, process.on, fetch or the official package source. */
 export function windowsExecutionChildControl(): WindowsChildControl {

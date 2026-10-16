@@ -69,8 +69,8 @@ export class OpenCodeV2RunOwner {
   private readonly deferredWindowsControllers = process.platform === 'win32'
   private readonly pendingLeases = new Map<string, ExecutionLease>()
   private startupTail: Promise<void> = Promise.resolve()
-  private readonly startupGate = async (start: () => Promise<ExecutionLease>, signal: AbortSignal | undefined,
-    deadline: number): Promise<ExecutionLease> => {
+  private readonly startupGate = async <T>(start: () => Promise<T>, signal: AbortSignal | undefined,
+    deadline: number): Promise<T> => {
     const previous = this.startupTail
     let release!: () => void
     const ticket = new Promise<void>(resolve => { release = resolve })
@@ -150,8 +150,8 @@ export class OpenCodeV2RunOwner {
         }
       }
     }
-    // Parent graph reads overlap, but the per-run gate preserves native/start
-    // ordering. No MCP transport starts before every original lease is ready.
+    // Parent/child graph reads overlap; the same queue serializes native setup
+    // and runtime/Git. No MCP transport starts before every lease is ready.
     if (this.deferredWindowsControllers) {
       await Promise.allSettled(Array.from({ length: Math.min(3, this.plan.members.length) }, () => initializeWorker(true)))
       if (failed) throw firstFailure
@@ -173,7 +173,8 @@ export class OpenCodeV2RunOwner {
     const acquisitionTimer = setTimeout(() => acquiring.abort(new Error('run_acquisition_timeout')), initializationDeadline - Date.now())
     let lease: ExecutionLease
     try {
-      lease = await this.ports.acquire(memberPlan.native, memberPlan.profile, this.context(memberPlan, this.plan.deadline, acquiring.signal),
+      lease = await this.ports.acquire(memberPlan.native, memberPlan.profile, this.context(memberPlan,
+        this.deferredWindowsControllers ? initializationDeadline : this.plan.deadline, acquiring.signal),
         this.deferredWindowsControllers ? (start, signal) => this.startupGate(start, signal, initializationDeadline) : undefined)
     } finally { clearTimeout(acquisitionTimer); this.acquisitions.delete(acquiring) }
     this.pendingLeases.set(memberPlan.memberId, lease)

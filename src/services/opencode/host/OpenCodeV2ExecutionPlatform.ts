@@ -22,6 +22,7 @@ export type ExecutionPlatformLaunch = Readonly<{
   child: Pick<EventEmitter, 'on' | 'once'> & Readonly<{ pid?: number }>
   prepare(deadline: number, signal?: AbortSignal): Promise<ExecutionPlatformMapping>
   start(payload: Readonly<Record<string, unknown>>, deadline: number, signal?: AbortSignal): Promise<void>
+  activate?(deadline: number, signal?: AbortSignal): Promise<void>
   assertLive(): Promise<void>; sendClose(): void; acknowledged(): boolean
   readBirth?(): Promise<ExecutionBirth | null>
   kill(deadline?: number): void | Promise<void>; retire(deadline?: number): Promise<unknown>

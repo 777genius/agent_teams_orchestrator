@@ -51,8 +51,8 @@ export function registerExecutionDisposer(authority: ExecutionAuthority, dispose
 export type ExecutionLease = Readonly<{
   authority: ExecutionAuthority; signal: AbortSignal; close(deadline?: number): Promise<ExecutionCleanupReceipt>
 }>
-/** One run may serialize its native/start slice while preparing graphs in parallel. */
-export type ExecutionStartupGate = (start: () => Promise<ExecutionLease>, signal?: AbortSignal) => Promise<ExecutionLease>
+/** A run serializes native and runtime work; child graph reads may overlap. */
+export type ExecutionStartupGate = <T>(start: () => Promise<T>, signal?: AbortSignal) => Promise<T>
 
 /** Startup must retain the owner's original cancellation before cleanup runs.
  * The shared read helper keeps its existing generic cancellation contract. */
@@ -197,12 +197,13 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
   try { prepared = await prepareOwnedNativeExecutionPlan(validatedNative, selectedProfile, context, lifetime.signal, mark) }
   catch (failure) { await recordOpenCodeV2ProviderFailure('execution-host-startup', failure, true, undefined, timing()); throw failure }
   mark('prepared')
-  const acquirePrepared = async (): Promise<ExecutionLease> => {
   const { native, profile, entry, plan, controllerStateRoots } = prepared
+  const gatedWindows = plan.platform === 'win32' && !!startupGate
+  const serial = async <T>(work: () => Promise<T>): Promise<T> => startupGate ? startupGate(work, context.signal) : work()
   let nonce: string | undefined
   const leaseOwnerId = randomUUID(), password = randomBytes(32).toString('base64url')
   let ownerIdentity: { hostInstanceId: string; leaseOwnerId: string; graphSha256: string }
-  let owner: Awaited<ReturnType<typeof acquireExecutionProfileOwner>>
+  let owner: Awaited<ReturnType<typeof acquireExecutionProfileOwner>> | undefined
   let windowsFilesystem: ReturnType<typeof ownerFilesystemForWindowsPlan> | undefined
   let selectedAuth: WindowsSelectedAuthMetadata | undefined
   const retainedRoots: Array<Readonly<{ assertOwned(): Promise<void>; close(): Promise<void> }>> = []
@@ -216,7 +217,7 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
       planClosed = true; await closeWindowsExecutionPlan(plan.concrete)
     }
   }
-  try {
+  const prepareOwner = async () => {
     check()
     if (plan.platform === 'win32') {
       windowsFilesystem = ownerFilesystemForWindowsPlan(plan.concrete)
@@ -242,13 +243,6 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
     ownerIdentity = { hostInstanceId: nonce, leaseOwnerId, graphSha256: native.graph.sha256 }
     owner = await acquireExecutionProfileOwner(profile, ownerIdentity,
       plan.platform === 'win32' ? { windowsPlan: plan.concrete } : undefined)
-  } catch (failure) {
-    await recordOpenCodeV2ProviderFailure('execution-host-startup', failure, true, undefined, timing())
-    if (plan.platform === 'win32') {
-      await closeRetainedRoots().catch(() => undefined)
-      await closePlanOnce().catch(() => undefined)
-    }
-    throw failure
   }
   let launch: ExecutionPlatformLaunch | undefined, child: ExecutionPlatformLaunch['child'] | undefined, authority: ExecutionAuthority | undefined
   let birth: Awaited<ReturnType<typeof readExecutionBirth>> = null
@@ -284,95 +278,120 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
       readBirth: () => launch!.readBirth ? launch!.readBirth() : readExecutionBirth(mapping!.bun.hostPID), kill: deadline => launch!.kill(deadline),
       retireOwnedDescendants: deadline => launch!.retire(deadline) }, deadline)
     // UNKNOWN never releases the physical profile/database fence.
-    await owner.release(receipt)
+    await owner!.release(receipt)
     await closeRetainedRoots()
     await closePlanOnce()
     executionAssert(process.platform !== 'win32' || deadline === undefined || Date.now() < deadline, 'execution_timeout')
     return receipt
   })()
   const abort = () => { lifetime.abort(); void close().catch(() => undefined) }
+  let ready: Promise<Record<string, unknown>>, graphReady: Promise<Record<string, unknown>>
   try {
-    check()
-    // Native owner acquisition has already retained the selected profile and
-    // both physical fences. Bind the fixed managed config before marking a
-    // launch attempt, so known pre-launch failures still use normal abandonment.
-    if (plan.platform === 'win32') {
-      await bindWindowsExecutionSelectedConfig(plan.concrete, profile, context.teamId, context.deadline, context.signal)
-      check()
-      if (!('purpose' in profile.selection) && profile.authSha256 !== undefined) {
-        // This is the initial SelectedAuth qualification. It uses the live
-        // private plan broker's cached selection and local fixed auth bytes,
-        // before any owner spawn or provider/catalog connection.
-        selectedAuth = windowsFilesystem!.selectedAuthMetadata()
-        await readOpenCodeV2SelectedAuth(profile, selectedAuth, context.deadline, context.signal)
+    await serial(async () => {
+      await prepareOwner(); check()
+      // Native owner acquisition has already retained the selected profile and
+      // both physical fences. Bind the fixed managed config before marking a
+      // launch attempt, so known pre-launch failures still use normal abandonment.
+      if (plan.platform === 'win32') {
+        await bindWindowsExecutionSelectedConfig(plan.concrete, profile, context.teamId, context.deadline, context.signal)
         check()
+        if (!('purpose' in profile.selection) && profile.authSha256 !== undefined) {
+          // This is the initial SelectedAuth qualification. It uses the live
+          // private plan broker's cached selection and local fixed auth bytes,
+          // before any owner spawn or provider/catalog connection.
+          selectedAuth = windowsFilesystem!.selectedAuthMetadata()
+          await readOpenCodeV2SelectedAuth(profile, selectedAuth, context.deadline, context.signal)
+          check()
+        }
       }
-    }
-    await owner.beforeSpawn(); check()
-    launch = launchExecutionPlatform(plan, nonce, leaseOwnerId, native.bun, context.deadline)
-    child = launch.child
-    child.once('close', () => { exited = true; lifetime.abort(); exitResolve(); void close().catch(() => undefined) })
-    const ready = new Promise<Record<string, unknown>>((resolve, reject) => {
-      child!.once('error', (error: unknown) => reject(error instanceof Error ? error : new Error('execution_host_unavailable')))
-      child!.once('close', () => reject(new Error('execution_host_unavailable')))
-      child!.on('message', (message: unknown) => {
-        try {
-          const row = executionRecord(message)
-          if (row.nonce === nonce && row.type === 'ready') resolve(row)
-          if (row.nonce === nonce && row.type === 'failed') reject(new Error('execution_host_unavailable'))
-        } catch { reject(new Error('execution_invalid_response')) }
+      await owner!.beforeSpawn(); check()
+      executionAssert(typeof nonce === 'string', 'execution_identity_mismatch')
+      launch = launchExecutionPlatform(plan, nonce, leaseOwnerId, native.bun, context.deadline)
+      child = launch.child
+      child.once('close', () => { exited = true; lifetime.abort(); exitResolve(); void close().catch(() => undefined) })
+      let graphResolve!: (value: Record<string, unknown>) => void, graphReject!: (error: unknown) => void
+      graphReady = new Promise((resolve, reject) => { graphResolve = resolve; graphReject = reject })
+      void graphReady.catch(() => undefined)
+      ready = new Promise<Record<string, unknown>>((resolve, reject) => {
+        child!.once('error', (error: unknown) => { const failure = error instanceof Error ? error : new Error('execution_host_unavailable'); reject(failure); graphReject(failure) })
+        child!.once('close', () => { const failure = new Error('execution_host_unavailable'); reject(failure); graphReject(failure) })
+        child!.on('message', (message: unknown) => {
+          try {
+            const row = executionRecord(message)
+            if (row.nonce === nonce && row.type === 'ready') resolve(row)
+            if (row.nonce === nonce && row.type === 'graph-ready') graphResolve(row)
+            if (row.nonce === nonce && row.type === 'failed') { const failure = new Error('execution_host_unavailable'); reject(failure); graphReject(failure) }
+          } catch { const failure = new Error('execution_invalid_response'); reject(failure); graphReject(failure) }
+        })
       })
+      void ready.catch(() => undefined)
+      context.signal?.addEventListener('abort', abort, { once: true }); check()
+      mark('mapping')
+      mappingWork = launch.prepare(context.deadline, lifetime.signal)
+      mapping = await boundOpenCodeRead(mappingWork, context.deadline - Date.now(), context.signal); check()
+      birth = mapping.bun.birth
+      executionAssert(!closeWork && !exited, 'execution_identity_mismatch')
+      await owner!.bindChild(mapping.bun.hostPID, birth, mapping); check(); mark('child-bound')
+      await launch.assertLive(); check()
+      await launch.start({ password, native, profile, ...(gatedWindows ? { deferRuntime: true, activationDeadline: context.deadline } : {}) }, context.deadline, lifetime.signal); check(); mark('start-sent')
     })
-    void ready.catch(() => undefined)
-    context.signal?.addEventListener('abort', abort, { once: true }); check()
-    mark('mapping')
-    mappingWork = launch.prepare(context.deadline, lifetime.signal)
-    mapping = await boundOpenCodeRead(mappingWork, context.deadline - Date.now(), context.signal); check()
-    birth = mapping.bun.birth
-    executionAssert(!closeWork && !exited, 'execution_identity_mismatch')
-    await owner.bindChild(mapping.bun.hostPID, birth, mapping); check(); mark('child-bound')
-    await launch.assertLive(); check()
-    await launch.start({ password, native, profile }, context.deadline, lifetime.signal); check(); mark('start-sent')
-    const row = await awaitExecutionHostReady(ready, context.deadline - Date.now(), context.signal); check()
-    executionAssert(row.pid === mapping.bun.nativePID && row.leaseOwnerId === leaseOwnerId && row.namespace === mapping.namespace.name && row.pin === native.version && row.graphSha256 === native.graph.sha256 &&
-      row.executableSha256 === native.bun.sha256 && row.profileEpoch === profile.epoch &&
-      row.selectionSha256 === executionHash(profile.selection) && executionHash(row.birth) === executionHash(birth) &&
-      executionHash(await readExecutionBirth(mapping.bun.hostPID)) === executionHash(birth), 'execution_identity_mismatch')
-    executionAssert(typeof row.baseUrl === 'string' && /^http:\/\/127\.0\.0\.1:[1-9]\d*$/.test(row.baseUrl), 'execution_identity_mismatch')
-    authority = Object.freeze({ generation: 'v2', pin: native.version, dialect: native.dialect, graphSha256: native.graph.sha256,
-      selectedCli: Object.freeze({ path: native.executablePath, sha256: native.executableSha256, version: native.version }),
-      // Published child PID and birth use the controller namespace; /info PID stays private.
-      child: Object.freeze({ pid: mapping.bun.hostPID, birth: Object.freeze(birth), executablePath: native.bun.path, sha256: native.bun.sha256 }),
-      hostInstanceId: nonce, profileEpoch: profile.epoch, profileRoot: profile.root, directory: profile.directory, leaseOwnerId })
-    if ('purpose' in profile.selection) catalogAuthorities.add(authority)
-    executionAssert(process.platform !== 'win32' || typeof launch.fetch === 'function', 'execution_native_transport_unqualified')
-    const endpoint: PrivateEndpointFields = { baseUrl: row.baseUrl, password, signal: lifetime.signal, nativePID: mapping.bun.nativePID,
-      fetch: launch.fetch }
-    endpoints.set(authority, endpoint)
-    disposers.set(authority, new Set())
-    graphs.set(authority, Object.freeze({ sha256: native.graph.sha256, files: Object.freeze(native.graph.files.map(row => Object.freeze(row))) }))
-    mark('ready')
-    await awaitOpenCodeV2CatalogReadiness(endpoint, authority, context); mark('catalog-ready')
-    if (selectedAuth) {
-      const observed = await selectedAuth.read(context.deadline, context.signal)
-      executionAssert(observed.sha256 === profile.authSha256, 'execution_selected_auth_changed')
-      endpoint.selectedAuth = selectedAuth
+    const assertReadyIdentity = async (row: Record<string, unknown>) => {
+      executionAssert(mapping && !closeWork && !exited, 'execution_identity_mismatch')
+      executionAssert(row.pid === mapping.bun.nativePID && row.leaseOwnerId === leaseOwnerId && row.namespace === mapping.namespace.name && row.pin === native.version && row.graphSha256 === native.graph.sha256 &&
+        row.executableSha256 === native.bun.sha256 && row.profileEpoch === profile.epoch &&
+        row.selectionSha256 === executionHash(profile.selection) && executionHash(row.birth) === executionHash(birth) &&
+        executionHash(await readExecutionBirth(mapping.bun.hostPID)) === executionHash(birth), 'execution_identity_mismatch')
     }
-    Object.freeze(endpoint)
-    if (!('purpose' in profile.selection)) {
-      await initializeOpenCodeV2ExecutionAuth(authority, profile, context); mark('auth-ready')
-      await awaitOpenCodeV2ExecutionReadiness(endpoint, authority, context, profile.selection); mark('selection-ready')
+    if (gatedWindows) {
+      // Only the authenticated child's complete graph validation runs without
+      // a ticket. It cannot import/start the runtime until the next ticket.
+      const graph = await awaitExecutionHostReady(graphReady!, context.deadline - Date.now(), context.signal); check()
+      await assertReadyIdentity(graph); check()
     }
-    check()
-    executionAssert(!closeWork && !exited, 'execution_host_unavailable')
-    return Object.freeze({ authority, signal: lifetime.signal, close })
+    return await serial(async () => {
+      check()
+      if (gatedWindows) {
+        executionAssert(launch?.activate && !closeWork && !exited, 'execution_identity_mismatch')
+        await launch.activate(context.deadline, lifetime.signal); check()
+      }
+      const row = await awaitExecutionHostReady(ready!, context.deadline - Date.now(), context.signal); check()
+      await assertReadyIdentity(row); check()
+      executionAssert(typeof row.baseUrl === 'string' && /^http:\/\/127\.0\.0\.1:[1-9]\d*$/.test(row.baseUrl), 'execution_identity_mismatch')
+      authority = Object.freeze({ generation: 'v2', pin: native.version, dialect: native.dialect, graphSha256: native.graph.sha256,
+        selectedCli: Object.freeze({ path: native.executablePath, sha256: native.executableSha256, version: native.version }),
+        // Published child PID and birth use the controller namespace; /info PID stays private.
+        child: Object.freeze({ pid: mapping.bun.hostPID, birth: Object.freeze(birth), executablePath: native.bun.path, sha256: native.bun.sha256 }),
+        hostInstanceId: nonce, profileEpoch: profile.epoch, profileRoot: profile.root, directory: profile.directory, leaseOwnerId })
+      if ('purpose' in profile.selection) catalogAuthorities.add(authority)
+      executionAssert(process.platform !== 'win32' || typeof launch.fetch === 'function', 'execution_native_transport_unqualified')
+      const endpoint: PrivateEndpointFields = { baseUrl: row.baseUrl, password, signal: lifetime.signal, nativePID: mapping.bun.nativePID,
+        fetch: launch.fetch }
+      endpoints.set(authority, endpoint)
+      disposers.set(authority, new Set())
+      graphs.set(authority, Object.freeze({ sha256: native.graph.sha256, files: Object.freeze(native.graph.files.map(row => Object.freeze(row))) }))
+      mark('ready')
+      await awaitOpenCodeV2CatalogReadiness(endpoint, authority, context); mark('catalog-ready')
+      if (selectedAuth) {
+        const observed = await selectedAuth.read(context.deadline, context.signal)
+        executionAssert(observed.sha256 === profile.authSha256, 'execution_selected_auth_changed')
+        endpoint.selectedAuth = selectedAuth
+      }
+      Object.freeze(endpoint)
+      if (!('purpose' in profile.selection)) {
+        await initializeOpenCodeV2ExecutionAuth(authority, profile, context); mark('auth-ready')
+        await awaitOpenCodeV2ExecutionReadiness(endpoint, authority, context, profile.selection); mark('selection-ready')
+      }
+      check()
+      executionAssert(!closeWork && !exited, 'execution_host_unavailable')
+      return Object.freeze({ authority, signal: lifetime.signal, close })
+      })
   } catch (failure) {
     const acquisitionTiming = timing()
     if (!child) {
       await recordOpenCodeV2ProviderFailure('execution-host-startup', failure, true, launch?.output?.().stderr, acquisitionTiming)
       // Once spawn is attempted even a synchronous error has no retirement
       // proof. Preserve ownership; only pre-launch cancellation may release.
-      try { await owner.abandonBeforeSpawn() } catch (ownerFailure) {
+      try { if (owner) await owner.abandonBeforeSpawn() } catch (ownerFailure) {
         await closeRetainedRoots().catch(() => undefined); await closePlanOnce().catch(() => undefined)
         throw new Error('execution_owner_unknown', { cause: ownerFailure })
       }
@@ -392,15 +411,6 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
       // the native phase measured before potentially unresolved retirement.
       else await recordOpenCodeV2ProviderFailure('execution-host-startup', failure, true, launch?.output?.().stderr, acquisitionTiming)
     }
-    throw failure
-  }
-  }
-  if (!startupGate) return acquirePrepared()
-  let entered = false
-  try { return await startupGate(() => { entered = true; return acquirePrepared() }, context.signal) }
-  catch (failure) {
-    if (!entered && prepared.plan.platform === 'win32')
-      await closeWindowsExecutionPlan(prepared.plan.concrete).catch(() => undefined)
     throw failure
   }
 }

@@ -1,4 +1,5 @@
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, test, spyOn } from 'bun:test'
+import { EventEmitter } from 'node:events'
 import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -7,6 +8,7 @@ import { executionHash } from '../execution/OpenCodeV2ExecutionContracts.js'
 import { acquireExecutionLease, awaitExecutionHostReady } from './OpenCodeV2ExecutionHost.js'
 import { validateExecutionProfile, type ExecutionBirth, type SelectedExecutionProfile, type ValidatedExecutionNative } from './OpenCodeV2ExecutionBinding.js'
 import { executionClosedAck, retireExecutionChild, type ExecutionRetirementPort } from './OpenCodeV2ExecutionLifecycle.js'
+import { windowsGraphActivation } from './windows/OpenCodeV2WindowsChildControl.js'
 
 const birth: ExecutionBirth = { format: 'linux-start-ticks', value: '420', bootId: 'TEST-boot-domain' }
 const context = { teamId: 'TEST-team', runId: 'TEST-run', laneId: 'TEST-lane', memberId: 'TEST-member', deadline: Number.MAX_SAFE_INTEGER }
@@ -33,6 +35,115 @@ function retirement(overrides: Partial<ExecutionRetirementPort> = {}): Execution
 }
 
 describe('execution host ownership and cleanup', () => {
+  test('Windows graph activation is one-shot and binds the original deadline and physical child', async () => {
+    const expected = { nonce: 'TEST-nonce', leaseOwnerId: 'TEST-lease', namespace: 'windows-job:TEST-nonce', pid: 42,
+      birth: { format: 'windows-filetime' as const, value: '42', bootId: null } }
+    const signal = new AbortController(), input = { type: 'activate', ...expected }
+    const barrier = windowsGraphActivation(expected, Date.now() + 5000)
+    expect(() => barrier.activate(input, signal.signal)).toThrow()
+    barrier.ready()
+    for (const drift of [{ nonce: 'foreign' }, { leaseOwnerId: 'foreign' }, { namespace: 'foreign' }, { pid: 43 }, { birth: { ...expected.birth, value: '43' } }])
+      expect(() => barrier.activate({ ...input, ...drift }, signal.signal)).toThrow()
+    barrier.activate(input, signal.signal)
+    await barrier.wait()
+    expect(() => barrier.activate(input, signal.signal)).toThrow()
+    const expired = windowsGraphActivation(expected, Date.now() + 5000)
+    expired.ready()
+    const clock = spyOn(Date, 'now').mockReturnValue(Date.now() + 6000)
+    try { expect(() => expired.activate(input, signal.signal)).toThrow() } finally { clock.mockRestore() }
+    const cancelled = windowsGraphActivation(expected, Date.now() + 5000)
+    cancelled.ready()
+    const original = new Error('run_stopped')
+    const waiting = awaitExecutionHostReady(cancelled.wait(), 1000, signal.signal)
+    signal.abort(original)
+    await expect(waiting).rejects.toBe(original)
+    expect(() => cancelled.activate(input, signal.signal)).toThrow('run_stopped')
+  })
+  test('actual host overlaps only child graph waits and reacquires the same serial ticket before runtime', async () => {
+    // Execute the private production function body with physical ports replaced;
+    // this checks its actual ticket boundaries without launching a native child.
+    const source = await readFile(new URL('./OpenCodeV2ExecutionHost.ts', import.meta.url), 'utf8')
+    const body = new Bun.Transpiler({ loader: 'ts' }).transformSync(source.slice(source.indexOf('async function acquireOwnedNativeLease(')))
+    let tail = Promise.resolve(), critical = 0, maximum = 0
+    const gate = async <T>(work: () => Promise<T>) => {
+      const previous = tail; let release!: () => void
+      tail = new Promise<void>(resolve => { release = resolve })
+      await previous; critical++; maximum = Math.max(maximum, critical)
+      try { return await work() } finally { critical--; release() }
+    }
+    const launches: Array<{ emitGraph(drift?: Record<string, unknown>): void; activate: number; closed: number; release: number }> = []
+    let currentOwner: { release: number } | undefined
+    const scope = { executionAssert: (value: unknown, message?: string) => { if (!value) throw new Error(message ?? 'invalid') },
+      executionRecord: (value: unknown) => value, executionHash, randomUUID: () => `TEST-${launches.length}`, randomBytes: () => ({ toString: () => 'TEST-password' }),
+      prepareOwnedNativeExecutionPlan: async (native: ValidatedExecutionNative, profile: SelectedExecutionProfile) => ({ native, profile, entry: '/TEST-entry', plan: { platform: 'win32', concrete: {} }, controllerStateRoots: [] }),
+      ownerFilesystemForWindowsPlan: () => ({ validateSelectedProfile: async () => {} }), selectWindowsRunMemberPreflightForPlan: async () => null,
+      consumeWindowsExecutionLaunchNonce: () => `TEST-${launches.length}`, bindWindowsExecutionSelectedConfig: async () => {},
+      closeWindowsExecutionPlan: async () => {}, recordOpenCodeV2ProviderFailure: async () => {},
+      acquireExecutionProfileOwner: async () => { const owner = { release: 0 }; currentOwner = owner; return {
+        beforeSpawn: async () => {}, bindChild: async () => {}, abandonBeforeSpawn: async () => {}, release: async () => { owner.release++ },
+      } },
+      launchExecutionPlatform: (_plan: unknown, nonce: string, leaseOwnerId: string) => {
+        expect(critical).toBe(1)
+        const child = new EventEmitter(), owner = currentOwner!, mapping = { bun: { hostPID: 42, nativePID: 42, birth, executablePath: '/TEST-bun', executableSha256: 'b'.repeat(64) }, namespace: { name: 'TEST-ns' }, leaseOwnerId }
+        let payload: Record<string, any>
+        const tuple = () => ({ nonce, leaseOwnerId, namespace: mapping.namespace.name, pid: 42, birth,
+          pin: native.version, graphSha256: native.graph.sha256, executableSha256: native.bun.sha256,
+          profileEpoch: 'TEST-epoch', selectionSha256: executionHash(payload.profile.selection) })
+        const observation = { activate: 0, closed: 0, get release() { return owner.release },
+          emitGraph: (drift = {}) => child.emit('message', { type: 'graph-ready', ...tuple(), ...drift }) }
+        launches.push(observation)
+        return { child, prepare: async () => mapping, assertLive: async () => {},
+          start: async (value: Record<string, unknown>) => { payload = value; expect(value.deferRuntime).toBe(true); expect(critical).toBe(1) },
+          activate: async () => { expect(critical).toBe(1); observation.activate++; child.emit('message', { type: 'ready', ...tuple(), baseUrl: 'http://127.0.0.1:1' }) },
+          sendClose: () => { observation.closed++; child.emit('close') }, acknowledged: () => true, retire: async () => {}, kill: async () => {} }
+      },
+      readExecutionBirth: async () => birth, awaitExecutionHostReady,
+      boundOpenCodeRead: async <T>(work: Promise<T>) => work,
+      retireExecutionChild: async (input: ExecutionRetirementPort) => { await Promise.resolve(); input.sendClose(); return {} },
+      awaitOpenCodeV2CatalogReadiness: async () => { expect(critical).toBe(1) }, initializeOpenCodeV2ExecutionAuth: async () => { expect(critical).toBe(1) },
+      awaitOpenCodeV2ExecutionReadiness: async () => { expect(critical).toBe(1) },
+      endpoints: new WeakMap(), graphs: new WeakMap(), disposers: new WeakMap(), catalogAuthorities: new WeakSet(),
+    }
+    const acquire = new Function('scope', `const {${Object.keys(scope).join(',')}}=scope;${body};return acquireOwnedNativeLease;`)(scope) as typeof acquireExecutionLease
+    const selected: SelectedExecutionProfile = { root: '/TEST-profile', epoch: 'TEST-epoch', directory: '/TEST-project', databasePath: '/TEST-profile/data/opencode.db',
+      env: {}, envSha256: 'f'.repeat(64), config: { directory: '/TEST-profile/config', content: '{}', sha256: 'f'.repeat(64) },
+      selection: { agent: 'worker', model: { providerID: 'TEST', id: 'model' }, permissions: [] } }
+    const controller = new AbortController(), deadline = Date.now() + 5000
+    const work = [acquire(native, selected, { ...context, deadline }, gate), acquire(native, selected, { ...context, deadline }, gate)]
+    const wait = async (condition: () => boolean) => { for (let i = 0; i < 100 && !condition(); i++) await Bun.sleep(1); expect(condition()).toBe(true) }
+    await wait(() => launches.length === 2)
+    expect(launches.map(value => value.activate)).toEqual([0, 0]); expect(critical).toBe(0)
+    launches[1]!.emitGraph(); launches[0]!.emitGraph()
+    const leases = await Promise.all(work)
+    expect(maximum).toBe(1); expect(launches.map(value => value.activate)).toEqual([1, 1])
+    await Promise.all(leases.map(lease => lease.close()))
+    expect(launches.map(value => [value.closed, value.release])).toEqual([[1, 1], [1, 1]])
+    const cancelled = acquire(native, selected, { ...context, deadline, signal: controller.signal }, gate)
+    await wait(() => launches.length === 3)
+    controller.abort(new Error('run_stopped'))
+    await expect(cancelled).rejects.toThrow('run_stopped')
+    expect(launches[2]).toMatchObject({ activate: 0, closed: 1, release: 1 })
+    for (const drift of [{ leaseOwnerId: 'foreign' }, { namespace: 'foreign' }, { pid: 43 }, { birth: { ...birth, value: '43' } },
+      { pin: '2.0.0' }, { graphSha256: 'foreign' }, { executableSha256: 'foreign' }, { profileEpoch: 'foreign' }, { selectionSha256: 'foreign' }]) {
+      const index = launches.length, foreign = acquire(native, selected, { ...context, deadline }, gate)
+      await wait(() => launches.length === index + 1)
+      launches[index]!.emitGraph(drift)
+      await expect(foreign).rejects.toThrow('execution_identity_mismatch')
+      expect(launches[index]).toMatchObject({ activate: 0, closed: 1, release: 1 })
+    }
+    const queuedSignal = new AbortController(), index = launches.length
+    const queued = acquire(native, selected, { ...context, deadline, signal: queuedSignal.signal }, gate)
+    await wait(() => launches.length === index + 1)
+    let unblock!: () => void
+    const blocker = gate(() => new Promise<void>(resolve => { unblock = resolve }))
+    await wait(() => critical === 1)
+    launches[index]!.emitGraph()
+    await Bun.sleep(1)
+    queuedSignal.abort(new Error('run_stopped'))
+    unblock(); await blocker
+    await expect(queued).rejects.toThrow('run_stopped')
+    expect(launches[index]).toMatchObject({ activate: 0, closed: 1, release: 1 })
+  })
   test('startup readiness preserves the exact acquisition cancellation and original rejection before cleanup', async () => {
     const signal = new AbortController(), original = new Error('run_acquisition_timeout')
     const waiting = awaitExecutionHostReady(new Promise<never>(() => {}), 1000, signal.signal)

@@ -41,6 +41,8 @@ async function fixture(options: { unknown?: boolean; foreignClient?: boolean; cr
   leaseClose?: (deadline: number | undefined) => void;
   parentPreparation?: (memberId: string, signal: AbortSignal | undefined) => Promise<void>;
   acquisition?: (memberId: string, signal: AbortSignal | undefined) => Promise<void>;
+  readonlyGraph?: (memberId: string, signal: AbortSignal | undefined) => Promise<void>;
+  runtime?: (memberId: string) => Promise<void>;
   permissions?: import('../host/OpenCodeV2ExecutionBinding.js').ExecutionSelection['permissions'] } = {}) {
   const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'TEST-r249-owner-')))
   const authority: ExecutionAuthority = { generation: 'v2', pin: '2.0.21', dialect: 'v2-2.0.21',
@@ -139,6 +141,21 @@ async function fixture(options: { unknown?: boolean; foreignClient?: boolean; cr
           resolveClosing(); await options.closeBarrier
           return { scopeClosed: true, processRetired: true, descendantsRetired: true, pid: authority.child.pid, birth: authority.child.birth }
         } }
+      }
+      if (startupGate && options.readonlyGraph) {
+        await startupGate(async () => {
+          counters.acquired++
+          await options.acquisition?.(context.memberId!, context.signal)
+        }, context.signal)
+        let cleanup: ReturnType<ExecutionLease['close']> | undefined
+        const lease: ExecutionLease = { authority: owned, signal: new AbortController().signal, close: deadline => cleanup ??= (async () => {
+            counters.closed++; options.leaseClose?.(deadline); resolveClosing(); await options.closeBarrier
+            return { scopeClosed: true, processRetired: true, descendantsRetired: true, pid: authority.child.pid, birth: authority.child.birth }
+        })() }
+        try {
+          await options.readonlyGraph(context.memberId!, context.signal)
+          return await startupGate(async () => { await options.runtime?.(context.memberId!); return lease }, context.signal)
+        } catch (error) { await lease.close(); throw error }
       }
       return startupGate ? startupGate(start, context.signal) : start()
     },
@@ -259,6 +276,51 @@ test('Windows overlaps three parent preparations while serializing every full na
     expect(started).toHaveLength(6)
     expect(f.counters).toMatchObject({ acquired: 6, clients: 6, sessions: 6, prompted: 0 })
   } finally { parent.release(); physical.release(); await f.close() }
+})
+
+test('Windows pipelines read-only graphs across native/runtime tickets and retains all-leases-before-MCP beyond three members', async () => {
+  const graph = acquisitionGate(), runtime = acquisitionGate(), reading: string[] = [], phases: string[] = []
+  let critical = 0, maximum = 0
+  const enter = async (phase: string, member: string, work?: Promise<void>) => {
+    critical++; maximum = Math.max(maximum, critical); phases.push(`${phase}:${member}`)
+    try { await work } finally { critical-- }
+  }
+  const f = await fixture({ windowsAcquisitions: true, memberCount: 6,
+    acquisition: member => enter('native', member),
+    readonlyGraph: async member => { reading.push(member); if (reading.length <= 3) await graph.promise },
+    runtime: member => enter('runtime', member, runtime.promise) })
+  try {
+    await waitForTestAcquisitions(() => reading.length === 3)
+    expect(phases).toEqual(['native:worker', 'native:worker-2', 'native:worker-3'])
+    expect(f.counters).toMatchObject({ acquired: 3, clients: 0, sessions: 0 })
+    graph.release()
+    await waitForTestAcquisitions(() => phases.some(phase => phase.startsWith('runtime:')))
+    expect(maximum).toBe(1); expect(f.counters.clients).toBe(0)
+    runtime.release()
+    await f.owner.ready()
+    expect(maximum).toBe(1); expect(reading).toHaveLength(6)
+    expect(phases.filter(phase => phase.startsWith('runtime:'))).toHaveLength(6)
+    expect(f.counters).toMatchObject({ acquired: 6, clients: 6, sessions: 6, prompted: 0 })
+  } finally { graph.release(); runtime.release(); await f.close() }
+})
+
+test('Windows Stop aborts queued graph activations and closes held and late original leases once', async () => {
+  const graphs = acquisitionGate(), runtime = acquisitionGate(), reading: string[] = [], activated: string[] = []
+  const f = await fixture({ windowsAcquisitions: true, memberCount: 3,
+    readonlyGraph: async member => { reading.push(member); await graphs.promise },
+    runtime: async member => { activated.push(member); await runtime.promise } })
+  try {
+    await waitForTestAcquisitions(() => reading.length === 3)
+    graphs.release()
+    await waitForTestAcquisitions(() => activated.length === 1)
+    const stopping = f.owner.stop()
+    await Bun.sleep(5)
+    runtime.release()
+    await stopping
+    await expect(f.owner.ready()).rejects.toThrow()
+    expect(activated).toHaveLength(1)
+    expect(f.counters).toMatchObject({ acquired: 3, closed: 3, clients: 0, sessions: 0, prompted: 0 })
+  } finally { graphs.release(); runtime.release(); await f.close() }
 })
 
 test('Windows parent failure aborts queued native starts and drains the late original lease exactly once', async () => {
