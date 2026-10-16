@@ -782,6 +782,25 @@ finally{Set-TestDacl ([Convert]::FromBase64String($env:TEST_ORIGINAL_DESCRIPTOR)
     })
     await validateEndpoint()
   }
+  // A previously launched cohort member adds RX metadata only to the
+  // retained teams parent. Native inbox revalidation must accept precisely
+  // that sealed member while keeping unrelated teams and broader ACEs closed.
+  const controllerTeamsParent = path.win32.join(claudeRoot, 'teams')
+  const readExactControllerInbox = async () => { assert.deepEqual(await readInbox(), expectedInbox) }
+  await withMetadataAce(controllerTeamsParent, String(metadataSids.member), 'ReadAndExecute', 'None', readExactControllerInbox)
+  for (const [sid, rights, inheritance] of [
+    ['S-1-5-32-545', 'ReadAndExecute', 'None'],
+    [String(metadataSids.stale), 'ReadAndExecute', 'None'],
+    [String(metadataSids.member), 'Write', 'None'],
+    [String(metadataSids.member), 'ReadAndExecute', 'ContainerInherit,ObjectInherit'],
+  ]) {
+    await withMetadataAce(controllerTeamsParent, sid, rights, inheritance, async () => {
+      await assert.rejects(readExactControllerInbox(), privateMetadataDenied)
+    })
+    await readExactControllerInbox()
+  }
+  facts.controllerTeamsParentMetadata = { sealedRxAccepted: true, foreignSidRefused: true,
+    staleSidRefused: true, writeRefused: true, inheritanceRefused: true }
   // Fresh discovery reads the native-sealed start/cohort before control.json.
   // Even that exact member's metadata ACE must never authorize record files.
   await withMetadataAce(path.win32.join(directory, 'control.json'), String(metadataSids.member), 'ReadAndExecute', 'None',

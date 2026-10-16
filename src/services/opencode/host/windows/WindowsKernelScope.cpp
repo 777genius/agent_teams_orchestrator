@@ -1010,6 +1010,10 @@ static bool controllerInboxEmpty(const std::wstring &path) {
   require(GetLastError() == ERROR_NO_MORE_FILES, "run_controller_inbox_unknown");
   return true;
 }
+// Only the exact retained controller teams-parent may admit sealed member
+// metadata ACEs. Its implementation reuses the native run-state RX-only check.
+static JsonObject controllerParentMetadataIdentity(HANDLE file, const std::wstring &owner,
+                                                   const std::vector<std::wstring> &sealedSids);
 struct SelectedControllerInbox {
   std::vector<RetainedAnchorComponent> directories;
   std::vector<JsonObject> directoryIdentities;
@@ -1026,6 +1030,15 @@ struct SelectedControllerInbox {
                : nullptr;
   }
 
+  JsonObject directoryIdentity(HANDLE file, const std::wstring &path,
+                               const std::wstring &owner, PSID package,
+                               const std::vector<std::wstring> *cohortSids) const {
+    require(directoryPaths.size() == 3, "run_controller_inbox_unknown");
+    if (equalPath(path, directoryPaths[0]) && cohortSids)
+      return controllerParentMetadataIdentity(file, owner, *cohortSids);
+    return fileIdentity(file, owner, true, package, rootSids(path, cohortSids));
+  }
+
   std::wstring assertLive(PSID package,
                           const std::vector<std::wstring> *cohortSids = nullptr,
                           std::vector<BYTE> *output = nullptr) const {
@@ -1033,8 +1046,7 @@ struct SelectedControllerInbox {
             "run_controller_inbox_unknown");
     for (size_t i = 0; i < directories.size(); ++i) {
       directories[i].assertLive();
-      require(fileIdentity(directories[i].handle.value, currentSid(), true, package,
-                           rootSids(directoryPaths[i], cohortSids))
+      require(directoryIdentity(directories[i].handle.value, directoryPaths[i], currentSid(), package, cohortSids)
                   .Stringify() == directoryIdentities[i].Stringify(),
               "run_controller_inbox_unknown");
     }
@@ -1056,9 +1068,8 @@ struct SelectedControllerInbox {
       }
       require(equalPath(finalPath(directory.value), extended(directoryPaths[i])),
               "run_controller_inbox_unknown");
-      laterIdentities.push_back(fileIdentity(
-          directory.value, currentSid(), true, package,
-          rootSids(directoryPaths[directories.size() + laterDirectories.size()], cohortSids)));
+      laterIdentities.push_back(directoryIdentity(
+          directory.value, directoryPaths[directories.size() + laterDirectories.size()], currentSid(), package, cohortSids));
       laterDirectories.emplace_back(std::move(directory));
       firstMissing = i + 1;
     }
@@ -1121,19 +1132,16 @@ struct SelectedControllerInbox {
     }
     for (size_t i = 0; i < directories.size(); ++i) {
       directories[i].assertLive();
-      require(fileIdentity(directories[i].handle.value, currentSid(), true, package,
-                           rootSids(directoryPaths[i], cohortSids))
+      require(directoryIdentity(directories[i].handle.value, directoryPaths[i], currentSid(), package, cohortSids)
                   .Stringify() == directoryIdentities[i].Stringify(),
               "run_controller_inbox_unknown");
     }
     for (size_t i = 0; i < laterDirectories.size(); ++i) {
-      require(fileIdentity(laterDirectories[i].value, currentSid(), true, package,
-                           rootSids(directoryPaths[directories.size() + i], cohortSids))
+      require(directoryIdentity(laterDirectories[i].value, directoryPaths[directories.size() + i], currentSid(), package, cohortSids)
                   .Stringify() == laterIdentities[i].Stringify(),
               "run_controller_inbox_unknown");
       auto reopened = verificationDirectory(directoryPaths[directories.size() + i]);
-      require(fileIdentity(reopened.value, currentSid(), true, package,
-                           rootSids(directoryPaths[directories.size() + i], cohortSids))
+      require(directoryIdentity(reopened.value, directoryPaths[directories.size() + i], currentSid(), package, cohortSids)
                   .Stringify() ==
                   laterIdentities[i].Stringify(),
               "run_controller_inbox_unknown");
@@ -1275,8 +1283,7 @@ class SelectedControllerConfig {
       }
       require(equalPath(finalPath(directory.value), extended(current)),
               "run_controller_inbox_unknown");
-      inbox.directoryIdentities.push_back(fileIdentity(
-          directory.value, owner, true, package, inbox.rootSids(current, cohortSids)));
+      inbox.directoryIdentities.push_back(inbox.directoryIdentity(directory.value, current, owner, package, cohortSids));
       inbox.directories.emplace_back(std::move(directory));
       require(equalPath(inbox.directories.back().path, current), "run_controller_inbox_unknown");
     }
@@ -4051,6 +4058,12 @@ struct WindowsNativeRunStateIssuer {
   using State = WindowsNativeRunState;
   using Control = WindowsNativeRunControl;
 
+  static JsonObject controllerParentIdentity(HANDLE file, const std::wstring &owner,
+                                               const std::vector<std::wstring> &sealedSids) {
+    require(!sealedSids.empty(), "run_state_start_changed");
+    return State::runStateDirectoryIdentity(file, owner, sealedSids);
+  }
+
   static JsonObject directoryIdentity(HANDLE file, const std::wstring &owner,
                                        const std::wstring &dataRoot, const std::wstring &directory,
                                        const std::vector<std::wstring> &currentSids, bool shared) {
@@ -5055,6 +5068,11 @@ public:
     throw NativeError{"execution_invalid_response"};
   }
 };
+static JsonObject controllerParentMetadataIdentity(HANDLE file, const std::wstring &owner,
+                                                   const std::vector<std::wstring> &sealedSids) {
+  return WindowsNativeRunStateIssuer::controllerParentIdentity(file, owner, sealedSids);
+}
+
 JsonObject WindowsNativeRunState::runStateDirectoryIdentityLocked(HANDLE directory, bool shared) {
   return WindowsNativeRunStateIssuer::directoryIdentity(
       directory, owner_, rootPath_, directory_, directoryMetadataSids_, shared);
