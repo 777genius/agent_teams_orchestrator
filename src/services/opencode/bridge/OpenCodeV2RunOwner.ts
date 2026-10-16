@@ -14,6 +14,7 @@ import { OpenCodeV2AdmissionStore } from '../execution/OpenCodeV2AdmissionStore.
 import { OpenCodeV2SessionService, verifyExecutionSession } from '../execution/OpenCodeV2SessionService.js'
 import { canonicalExecutionJSON, executionAssert, executionHash, executionRecord, OPEN_CODE_V2_WINDOWS_CLOSE_MS, type ExecutionContext, type SessionAuthority } from '../execution/OpenCodeV2ExecutionContracts.js'
 import { acquireExecutionLease, awaitExecutionHostReady, readExecutionCleanupObservation, readExecutionLeaseObservation, type ExecutionLease } from '../host/OpenCodeV2ExecutionHost.js'
+import { createExecutionGraphValidationCohort } from '../host/OpenCodeV2ExecutionBinding.js'
 import { isExecutionCleanupReceipt, type ExecutionCleanupReceipt } from '../host/OpenCodeV2ExecutionLifecycle.js'
 import { createOpenCodeV2ExecutionClient, type ExecutionBridgeClient, type ExecutionLog, type ExecutionMessagePage } from '../transport/OpenCodeV2ExecutionClientFactory.js'
 import { boundOpenCodeRead } from '../transport/OpenCodeBoundedFetch.js'
@@ -70,6 +71,9 @@ export class OpenCodeV2RunOwner {
   private readonly acquisitions = new Set<AbortController>()
   private readonly deferredWindowsControllers = process.platform === 'win32'
   private readonly pendingLeases = new Map<string, ExecutionLease>()
+  // Members share one official graph receipt; their concurrent owner checks
+  // join one in-flight validation. Children keep independent validation.
+  private readonly graphValidation = createExecutionGraphValidationCohort()
   private startupTail: Promise<void> = Promise.resolve()
   private readonly startupGate = async <T>(start: () => Promise<T>, signal: AbortSignal | undefined,
     deadline: number): Promise<T> => {
@@ -181,7 +185,8 @@ export class OpenCodeV2RunOwner {
     try {
       lease = await this.ports.acquire(memberPlan.native, memberPlan.profile, this.context(memberPlan,
         this.deferredWindowsControllers ? initializationDeadline : this.plan.deadline, acquiring.signal),
-        this.deferredWindowsControllers ? (start, signal) => this.startupGate(start, signal, initializationDeadline) : undefined)
+        this.deferredWindowsControllers ? (start, signal) => this.startupGate(start, signal, initializationDeadline) : undefined,
+        this.graphValidation)
     } finally { clearTimeout(acquisitionTimer); this.acquisitions.delete(acquiring) }
     this.pendingLeases.set(memberPlan.memberId, lease)
     if (this.state !== 'starting' || this.initializationAbort.signal.aborted || acquiring.signal.aborted ||

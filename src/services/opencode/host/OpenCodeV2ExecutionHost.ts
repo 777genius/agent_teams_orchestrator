@@ -9,7 +9,7 @@ import { executionAssert, executionHash, executionRecord, type ExecutionAuthorit
 import { boundOpenCodeRead } from '../transport/OpenCodeBoundedFetch.js'
 import { awaitOpenCodeV2ExecutionReadiness, awaitOpenCodeV2CatalogReadiness } from '../transport/OpenCodeV2ExecutionClientFactory.js'
 import { canonicalExecutionDirectory, readExecutionBirth, validateExecutionGraph, validateExecutionNative, validateExecutionProfile,
-  type ExecutionGraph, type OwnedNativeProfile, type CatalogExecutionProfile, type SelectedExecutionProfile, type ValidatedExecutionNative } from './OpenCodeV2ExecutionBinding.js'
+  type ExecutionGraph, type ExecutionGraphValidation, type OwnedNativeProfile, type CatalogExecutionProfile, type SelectedExecutionProfile, type ValidatedExecutionNative } from './OpenCodeV2ExecutionBinding.js'
 import { retireExecutionChild, type ExecutionCleanupReceipt } from './OpenCodeV2ExecutionLifecycle.js'
 import { assertExecutionPlatformAvailable, launchExecutionPlatform, planExecutionPlatform,
   type ExecutionPlatformLaunch, type ExecutionPlatformMapping } from './OpenCodeV2ExecutionPlatform.js'
@@ -103,8 +103,9 @@ async function executionResolutionMounts(sourceRoot: string, graph: ExecutionGra
 
 /** Source execution uses a dedicated official-server child and caller-owned durable data. */
 export async function acquireExecutionLease(validatedNative: ValidatedExecutionNative,
-  selectedProfile: SelectedExecutionProfile, context: ExecutionContext, startupGate?: ExecutionStartupGate): Promise<ExecutionLease> {
-  return acquireOwnedNativeLease(validatedNative, selectedProfile, context, startupGate)
+  selectedProfile: SelectedExecutionProfile, context: ExecutionContext, startupGate?: ExecutionStartupGate,
+  graphValidation?: ExecutionGraphValidation): Promise<ExecutionLease> {
+  return acquireOwnedNativeLease(validatedNative, selectedProfile, context, startupGate, graphValidation)
 }
 
 /** Finite catalog owner has no session/model admission and creates no execution proof. */
@@ -116,7 +117,8 @@ export async function acquireOpenCodeV2CatalogLease(native: ValidatedExecutionNa
 
 /** Internal preparation performs the real guards/plan without acquiring an owner or starting a server. */
 export async function prepareOwnedNativeExecutionPlan(validatedNative: ValidatedExecutionNative,
-  selectedProfile: OwnedNativeProfile, context: ExecutionContext, lifetimeSignal?: AbortSignal, progress?: (phase: ExecutionAcquisitionPhase) => void) {
+  selectedProfile: OwnedNativeProfile, context: ExecutionContext, lifetimeSignal?: AbortSignal, progress?: (phase: ExecutionAcquisitionPhase) => void,
+  graphValidation?: ExecutionGraphValidation) {
   // Delivery mode is explicit. No packaged/source fallback and no acquisition effect before this fence.
   const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'execution')
   executionAssert(validatedNative.runtimeMode === delivery.runtimeMode, 'v2_execution_delivery_mismatch')
@@ -137,7 +139,11 @@ export async function prepareOwnedNativeExecutionPlan(validatedNative: Validated
   executionAssert(await realpath(process.execPath) === native.bun.path &&
     await hashOpenCodeFile(native.bun.path) === native.bun.sha256, 'execution_identity_mismatch'); check(); progress?.('native-validated')
   const graphSignal = context.signal && lifetimeSignal ? AbortSignal.any([context.signal, lifetimeSignal]) : context.signal ?? lifetimeSignal
-  await validateExecutionGraph(native.version, native.graph, undefined, graphSignal); check(); progress?.('graph-validated')
+  // A run cohort validates one exact receipt once for its concurrently
+  // preparing members; every child still validates its own graph.
+  if (graphValidation) await graphValidation(native.version, native.graph, graphSignal)
+  else await validateExecutionGraph(native.version, native.graph, undefined, graphSignal)
+  check(); progress?.('graph-validated')
   const entry = delivery.entryPath; check()
   executionAssert(delivery.entrySha256 === native.entrySha256, 'execution_entry_changed'); check()
   const sourceRoot = delivery.root
@@ -199,7 +205,8 @@ export async function prepareOwnedNativeExecutionPlan(validatedNative: Validated
 }
 
 async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative,
-  selectedProfile: OwnedNativeProfile, context: ExecutionContext, startupGate?: ExecutionStartupGate): Promise<ExecutionLease> {
+  selectedProfile: OwnedNativeProfile, context: ExecutionContext, startupGate?: ExecutionStartupGate,
+  graphValidation?: ExecutionGraphValidation): Promise<ExecutionLease> {
   const lifetime = new AbortController()
   const check = () => {
     context.signal?.throwIfAborted(); lifetime.signal.throwIfAborted()
@@ -211,7 +218,7 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
     elapsedMs: Math.max(history.at(-1)!.elapsedMs, Date.now() - acquisitionStartedAt) })
   const timing = () => ({ elapsedMs: Math.max(history.at(-1)!.elapsedMs, Date.now() - acquisitionStartedAt), history })
   let prepared: Awaited<ReturnType<typeof prepareOwnedNativeExecutionPlan>>
-  try { prepared = await prepareOwnedNativeExecutionPlan(validatedNative, selectedProfile, context, lifetime.signal, mark) }
+  try { prepared = await prepareOwnedNativeExecutionPlan(validatedNative, selectedProfile, context, lifetime.signal, mark, graphValidation) }
   catch (failure) { await recordOpenCodeV2ProviderFailure('execution-host-startup', failure, true, undefined, timing()); throw failure }
   mark('prepared')
   const { native, profile, entry, plan, controllerStateRoots } = prepared

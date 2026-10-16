@@ -40,7 +40,7 @@ const intent: QueueIntent = { delivery: 'queue', identity: {
 async function fixture(options: { unknown?: boolean; foreignClient?: boolean; createUnknown?: boolean;
   probe?: boolean; promptBarrier?: Promise<void>; closeBarrier?: Promise<void>; permissionResources?: string[];
   lifetimeMs?: number; twoMembers?: boolean; memberCount?: number; preparation?: () => void; startup?: () => void;
-  windowsAcquisitions?: boolean;
+  windowsAcquisitions?: boolean; graphValidations?: unknown[];
   leaseClose?: (deadline: number | undefined) => void;
   nativeRetirement?: (memberId: string, deadline: number | undefined) => Promise<void>;
   parentPreparation?: (memberId: string, signal: AbortSignal | undefined) => Promise<void>;
@@ -129,7 +129,8 @@ async function fixture(options: { unknown?: boolean; foreignClient?: boolean; cr
     replyPermission: async () => { counters.replied++ },
   }
   const ports: RunExecutionPorts = {
-    acquire: async (_native, _profile, context, startupGate) => {
+    acquire: async (_native, _profile, context, startupGate, graphValidation) => {
+      options.graphValidations?.push(graphValidation)
       expect(context).toMatchObject({ teamId: binding.teamId, runId: binding.runId, laneId: 'primary' })
       expect(plan.members.some(member => member.memberId === context.memberId)).toBe(true)
       const profile = plan.members.find(member => member.memberId === context.memberId)!.profile
@@ -344,7 +345,8 @@ test('Windows acquires all leases before any client or controller bootstrap, wit
 test('Windows overlaps three parent preparations while serializing every full native startup before MCP', async () => {
   const parent = acquisitionGate(), physical = acquisitionGate(), prepared: string[] = [], started: string[] = []
   let active = 0, maximum = 0, nativeActive = 0, nativeMaximum = 0
-  const f = await fixture({ windowsAcquisitions: true, memberCount: 6,
+  const graphValidations: unknown[] = []
+  const f = await fixture({ windowsAcquisitions: true, memberCount: 6, graphValidations,
     parentPreparation: async member => {
       prepared.push(member); active++; maximum = Math.max(maximum, active)
       try { if (prepared.length <= 3) await parent.promise } finally { active-- }
@@ -362,6 +364,10 @@ test('Windows overlaps three parent preparations while serializing every full na
     await f.owner.ready()
     expect(maximum).toBe(3); expect(nativeMaximum).toBe(1)
     expect(started).toHaveLength(6)
+    // Every member's owner graph check goes through the run's one cohort.
+    expect(graphValidations).toHaveLength(6)
+    expect(typeof graphValidations[0]).toBe('function')
+    expect(graphValidations.every(value => value === graphValidations[0])).toBe(true)
     expect(f.counters).toMatchObject({ acquired: 6, clients: 6, sessions: 6, prompted: 0 })
   } finally { parent.release(); physical.release(); await f.close() }
 })

@@ -84,12 +84,74 @@ export function readExecutionGraphFailure(error: unknown): ExecutionGraphFailure
   return error instanceof Error ? originalGraphFailures.get(error) : undefined
 }
 export type ExecutionGraphProgress = Readonly<{ phase: 'hash' | 'closure'; completed: number; total: number }>
-export async function validateExecutionGraph(pin: '2.0.0' | '2.0.21', receipt: ExecutionGraph,
-  progress?: (value: ExecutionGraphProgress) => void, signal?: AbortSignal) {
-  signal?.throwIfAborted()
+/** Sorted rows bound to the receipt digest; the digest alone never identifies a graph. */
+function admittedExecutionGraphRows(receipt: ExecutionGraph) {
   executionAssert(receipt.files.length > 0 && receipt.files.length <= 65_536)
   const rows = [...receipt.files].sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0)
   executionAssert(new Set(rows.map(row => row.path)).size === rows.length && executionHash(rows) === receipt.sha256, 'execution_graph_changed')
+  return rows
+}
+/** Owner-side complete graph check for one run cohort. */
+export type ExecutionGraphValidation = (pin: '2.0.0' | '2.0.21', receipt: ExecutionGraph, signal?: AbortSignal) => Promise<void>
+/** Members of one run prepare concurrently and carry the same official graph.
+ * A caller joins only an in-flight validation of its own byte-identical rows
+ * (recomputed from its receipt) and pin; a settled result is never reused, so
+ * a later caller reads every file again. Child processes keep their own
+ * independent validation. The shared read is cancelled only when every joined
+ * caller has cancelled, and that last caller waits for its claimed reads. */
+export function createExecutionGraphValidationCohort(): ExecutionGraphValidation {
+  type Shared = { work: Promise<unknown>; controller: AbortController; callers: number }
+  const running = new Map<string, Shared>()
+  return async (pin, receipt, signal) => {
+    signal?.throwIfAborted()
+    admittedExecutionGraphRows(receipt)
+    const key = `${pin}\0${receipt.sha256}`
+    let shared = running.get(key)
+    if (!shared) {
+      const controller = new AbortController()
+      const created: Shared = { work: validateExecutionGraph(pin, receipt, undefined, controller.signal), controller, callers: 0 }
+      const forget = () => { if (running.get(key) === created) running.delete(key) }
+      created.work.then(forget, forget)
+      running.set(key, created)
+      shared = created
+    }
+    const joined = shared
+    joined.callers++
+    let left = false
+    const leave = () => {
+      if (left) return false
+      left = true
+      return --joined.callers === 0
+    }
+    if (!signal) {
+      try { await joined.work } finally { leave() }
+      return
+    }
+    await new Promise<void>((resolve, reject) => {
+      let cancelled = false
+      const cancel = () => {
+        cancelled = true
+        if (!leave()) { reject(signal.reason); return }
+        // Last interested caller: stop new claims and join already claimed reads.
+        if (running.get(key) === joined) running.delete(key)
+        joined.controller.abort(signal.reason)
+        joined.work.then(() => reject(signal.reason), () => reject(signal.reason))
+      }
+      signal.addEventListener('abort', cancel, { once: true })
+      joined.work.then(() => {
+        if (cancelled) return
+        signal.removeEventListener('abort', cancel); leave(); resolve()
+      }, error => {
+        if (cancelled) return
+        signal.removeEventListener('abort', cancel); leave(); reject(error)
+      })
+    })
+  }
+}
+export async function validateExecutionGraph(pin: '2.0.0' | '2.0.21', receipt: ExecutionGraph,
+  progress?: (value: ExecutionGraphProgress) => void, signal?: AbortSignal) {
+  signal?.throwIfAborted()
+  const rows = admittedExecutionGraphRows(receipt)
   progress?.({ phase: 'hash', completed: 0, total: rows.length })
   // Official graphs contain tens of thousands of independent files. Bound
   // concurrent reads instead of serializing each filesystem round trip.

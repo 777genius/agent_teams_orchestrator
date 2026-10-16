@@ -60,14 +60,18 @@ describe('execution host ownership and cleanup', () => {
           executionRecord: (value: unknown) => value, assertExecutionPlatformAvailable: () => {},
           validateExecutionProfile: async () => {}, canonicalExecutionDirectory: async () => {}, validateExecutionNative: async () => {},
           realpath: async (value: string) => value, hashOpenCodeFile: async () => selected.bun.sha256,
-          validateExecutionGraph: async () => {},
+          validateExecutionGraph: async () => { throw new Error('TEST owner graph read bypassed the run cohort') },
           executionResolutionMounts: async (value: string) => { resolutionRoots.push(value); return mounts },
           deriveSelectedOpenCodeV2ControllerState: async () => controllerRoots,
           assertSelectedOpenCodeV2ControllerState: async () => { eager++ },
           planExecutionPlatform: async (value: Record<string, unknown>) => { request = value; return { platform, concrete: {} } },
         }
         const prepare = new Function('scope', `const {${Object.keys(scope).join(',')}}=scope;${body};return prepareOwnedNativeExecutionPlan;`)(scope)
-        await prepare(selected, f.profile, context)
+        const cohort: unknown[][] = []
+        await prepare(selected, f.profile, context, undefined, undefined,
+          async (...args: unknown[]) => { cohort.push(args) })
+        // The run cohort replaces only the owner's complete graph read, never its inputs.
+        expect(cohort).toEqual([[selected.version, selected.graph, undefined]])
         expect(request?.readOnlyRoots).toEqual([platform === 'win32' && runtimeMode === 'source' ? root + '/src' : root,
           '/TEST-bun', '/TEST-cli', '/TEST-official/module', '/TEST-controller/dist'])
         expect(request?.readOnlyMounts).toEqual(mounts)
