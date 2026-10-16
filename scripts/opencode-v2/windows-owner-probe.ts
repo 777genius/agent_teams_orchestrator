@@ -1070,6 +1070,7 @@ $bytes=[byte[]]::new($ace.BinaryLength);$ace.GetBinaryForm($bytes,0)
     for (const target of [projectDataRoot, path.win32.join(projectDataRoot, 'opencode'),
       path.win32.join(projectDataRoot, 'opencode', 'v2'),
       path.win32.join(projectDataRoot, 'opencode', 'v2', 'profiles'),
+      path.win32.join(projectDataRoot, 'opencode', 'v2', 'runs'),
       sharedProject, otherProject, projectController, path.win32.join(projectController, 'teams'),
       path.win32.join(projectController, 'teams', projectTeam),
       path.win32.join(projectController, 'teams', projectTeam, 'inboxes'),
@@ -1128,15 +1129,18 @@ await Bun.stdout.write(actor+':written')
     projectOriginalIdentity = beforeIdentity; projectBaseline = await projectAcl()
     const beforeAcl = projectBaseline[0]!
     const directory = runControlDirectory(projectDataRoot, projectTeam, projectBinding.runId)
-    facts.projectCohortStage = 'seal'
+    facts.projectCohortStage = 'run_state_acquire'
     const acquired = executionRecord(await projectBroker.request('runStateAcquire', {
       dataRoot: projectDataRoot, directory, binding: projectBinding,
       selectionIds: profiles.map(profile => profile.selectionId) }))
     projectState = { stateId: String(acquired.stateId), directory }
+    facts.projectCohortStage = 'run_state_reserve'
     await projectBroker.request('runStateReserve', { ...projectState, binding: projectBinding,
       sourceSha256, sharedControllerRootCohort: true })
+    facts.projectCohortStage = 'run_state_listen'
     await projectBroker.request('runStateListen', { ...projectState, binding: projectBinding,
       sourceSha256, deadline: Date.now() + 120_000 })
+    facts.projectCohortStage = 'sealed_rows'
     const sealed = executionRecord(JSON.parse(await readFile(path.win32.join(directory, 'start.json'), 'utf8')))
     const rows = executionRecord(sealed.cohort).members
     assert.ok(Array.isArray(rows) && rows.length === 3)
