@@ -3,6 +3,8 @@ import os from 'node:os'
 import path from 'node:path'
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { Database } from 'bun:sqlite'
+import { OpenCodeOfflineSessionReader } from './OpenCodeOfflineSessionReader.js'
 
 import * as lockfile from '../../utils/lockfile.js'
 import {
@@ -4145,4 +4147,53 @@ describe('OpenCodeSessionBridge', () => {
     expect(result.summary.streamConnected).toBe(false)
   })
 
+})
+
+
+test('V1 stored native tool history projects without re-preparing the dynamic MCP profile', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'TEST-v1-offline-projection-'))
+  try {
+    const record = buildRecord({ opencodeVersion: '1.19.0', runId: 'TEST-run' })
+    const store = new OpenCodeSessionStore(path.join(root, 'session-store.json'))
+    await store.upsert(record)
+    const stored = await store.get(record.teamId, record.laneId!, record.memberName)
+    expect(stored).not.toBeNull()
+    const reader = new OpenCodeOfflineSessionReader(root)
+    const dbPath = reader.resolveDbPath(record.profileRootKey)!
+    await mkdir(path.dirname(dbPath), { recursive: true })
+    const db = new Database(dbPath)
+    db.exec(`
+      create table session (id text primary key, project_id text, directory text);
+      create table project (id text primary key, worktree text, vcs text);
+      create table message (id text primary key, session_id text, time_created integer, time_updated integer, data text);
+      create table part (id text primary key, message_id text, session_id text, time_created integer, time_updated integer, data text);
+    `)
+    db.query('insert into session values (?, ?, ?)').run(record.opencodeSessionId, 'project-1', record.projectPath)
+    db.query('insert into project values (?, ?, ?)').run('project-1', record.projectPath, 'git')
+    db.query('insert into message values (?, ?, ?, ?, ?)').run('assistant-1', record.opencodeSessionId, 100, 110,
+      JSON.stringify({ role: 'assistant', time: { created: 100, completed: 110 }, providerID: 'openrouter', modelID: 'test' }))
+    db.query('insert into part values (?, ?, ?, ?, ?, ?)').run('part-1', 'assistant-1', record.opencodeSessionId, 101, 109,
+      JSON.stringify({ type: 'tool', tool: 'bash', callID: 'call-1', state: { status: 'completed', input: { command: 'node -e TEST' }, output: 'TEST-command-marker', time: { start: 101, end: 109 } } }))
+    db.close()
+    let prepares = 0
+    const originalError = new Error('dynamic MCP profile unavailable')
+    const bridge = new OpenCodeSessionBridge({
+      sessionStore: store,
+      offlineReader: reader,
+      prepareProfile: async () => { prepares++; throw originalError },
+    })
+    const result = await bridge.projectLogMessages(stored!)
+    expect(prepares).toBe(0)
+    expect(result.summary.toolCallCount).toBe(1)
+    expect(JSON.stringify(result.logProjection.messages)).toContain('TEST-command-marker')
+    expect(JSON.stringify(result.logProjection.messages)).toContain('node -e TEST')
+    bridge.reconcileSession = async () => { throw originalError }
+    // A different stored project/session may not borrow the local transcript.
+    for (const foreign of [{ projectPath: '/tmp/foreign-project' }, { opencodeSessionId: 'foreign-session' }]) {
+      await expect(bridge.projectLogMessages({ ...stored!, ...foreign })).rejects.toBe(originalError)
+    }
+    expect(prepares).toBe(0)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
 })
