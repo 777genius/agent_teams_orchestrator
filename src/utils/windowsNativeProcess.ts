@@ -15,7 +15,12 @@ const PROCESS_ENTRY_SIZE = 568
 const FILETIME_TICKS_PER_MS = 10_000n
 const FILETIME_UNIX_EPOCH_MS = 11_644_473_600_000
 
-async function loadKernel32() {
+export type WindowsNativeProcess = Readonly<{
+  table: () => WindowsProcessRow[]
+  birth: (pid: number) => number | null
+}>
+
+async function loadKernel32(): Promise<WindowsNativeProcess> {
   if (process.platform !== 'win32' || (process.arch !== 'x64' && process.arch !== 'arm64')) {
     throw new Error('windows_native_process_unavailable')
   }
@@ -65,8 +70,9 @@ async function loadKernel32() {
   return Object.freeze({ table, birth })
 }
 
-let kernel32: ReturnType<typeof loadKernel32> | undefined
+let kernel32: Promise<WindowsNativeProcess | null> | undefined
 
-export function windowsNativeProcess(): ReturnType<typeof loadKernel32> {
-  return kernel32 ??= loadKernel32()
+/** Null when this Bun build has no bun:ffi dlopen, as for Windows ARM64 before 1.4.0. */
+export function windowsNativeProcess(): Promise<WindowsNativeProcess | null> {
+  return kernel32 ??= loadKernel32().catch(() => null)
 }

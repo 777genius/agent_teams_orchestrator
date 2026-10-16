@@ -18,8 +18,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # windows-2022 is omitted: under the same contention `opencode --version`
+        # alone took 21-43 s there, beyond any version acquisition window.
         include:
-          - { os: windows-2022, platform: win32-x64 }
           - { os: windows-2025, platform: win32-x64 }
           - { os: windows-11-arm, platform: win32-arm64 }
     runs-on: ${{ matrix.os }}

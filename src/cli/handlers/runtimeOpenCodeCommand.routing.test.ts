@@ -91,8 +91,9 @@ test('selection cleanup refusal projects finite helper evidence without raw caus
     import assert from 'node:assert/strict'
     const {OpenCodeVersionProbeCleanupError}=await import(${JSON.stringify(probe)})
     const factory=await import(${JSON.stringify(factory)})
+    const helperCause={stage:'process_lookup',category:'ArgumentException',hresult:-2147024809,nativeErrorCode:null}
     const helperFailure={operation:'birth',reason:'helper_nonzero',exitCode:1,elapsedMs:35,
-      privatePath:'TEST-PRIVATE-HELPER',privateStderr:'TEST-PRIVATE-STDERR'}
+      helperCause:{...helperCause,privatePath:'TEST-PRIVATE-HELPER'},privateStderr:'TEST-PRIVATE-STDERR'}
     const terminalDiagnostic={phase:'candidate_validation',guard:'candidate_unknown',closed:true,ended:true,exitCode:0,
       birthsCount:0,candidatesCount:1,pendingCount:0,lastGroupCount:1,lastSurvivorCount:null,remainingMs:7200}
     let includeHelper=true
@@ -109,7 +110,7 @@ test('selection cleanup refusal projects finite helper evidence without raw caus
       assert.equal(result.ok,false)
       assert.deepEqual(result.error,{kind:'runtime_not_ready',message:'cleanup_unknown',retryable:false})
       assert.deepEqual(result.diagnostics,[...(includeHelper?[{code:'opencode_version_probe_helper_failed',evidence:'last_observed',
-        operation:'birth',reason:'helper_nonzero',exitCode:1,elapsedMs:35}]:[]),
+        operation:'birth',reason:'helper_nonzero',exitCode:1,elapsedMs:35,helperCause}]:[]),
         {code:'opencode_version_probe_cleanup_unknown',...terminalDiagnostic}])
       assert(!JSON.stringify(result).includes('TEST-PRIVATE'))
     }

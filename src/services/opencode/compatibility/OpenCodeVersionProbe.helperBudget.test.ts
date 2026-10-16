@@ -6,7 +6,8 @@ import * as portable from '../../../utils/portableCli.js'
 import * as native from '../OpenCodeCursorAgentTreeKill.js'
 import type { NativeHelperFailure } from '../OpenCodeCursorAgentTreeKill.js'
 import type { OpenCodeV2ReadRoots } from '../profile/OpenCodeV2ManagedConfig.js'
-import { OpenCodeVersionProbeCleanupError, readOpenCodeOwnedVersion } from './OpenCodeVersionProbe.js'
+import { OpenCodeVersionProbeCleanupError, readOpenCodeOwnedVersion, VERSION_ACQUISITION_MS,
+  VERSION_PROBE_DEADLINE_MS } from './OpenCodeVersionProbe.js'
 
 const originalPlatform = process.platform
 const restore: Array<() => void> = []
@@ -63,15 +64,31 @@ function fixture(platform: NodeJS.Platform, durations: number[], closeAt = 1, in
     removed: () => removed, elapsed: () => clock - 1_000_000 }
 }
 
-test('a hung helper refuses retirement and keeps private roots', async () => {
-  const f = fixture('linux', [1500, 5000], 3)
+test('Windows cold process-table read beyond two seconds still requires physical close', async () => {
+  const f = fixture('win32', [2200])
+  expect(await f.run()).toBe('1.18.34\n')
+  expect(f.budgets[0]).toBeGreaterThanOrEqual(2200)
+  expect(f.budgets[0]).toBeLessThanOrEqual(5000)
+  expect(f.removed()).toBe(1)
+})
+
+test('Windows helper headroom is clipped by the original probe remainder', async () => {
+  const f = fixture('win32', [1500], 1, VERSION_PROBE_DEADLINE_MS - 4000)
+  expect(await f.run()).toBe('1.18.34\n')
+  expect(f.budgets).toEqual([4000])
+  expect(f.elapsed()).toBe(VERSION_PROBE_DEADLINE_MS - 2500)
+  expect(f.removed()).toBe(1)
+})
+
+test('a hung Windows helper exhausts the original remainder without a retirement receipt', async () => {
+  const f = fixture('win32', [5000, 5000, 5000, 4000], 5)
   let failure: unknown
   try { await f.run() } catch (error) { failure = error }
   expect(failure).toBeInstanceOf(OpenCodeVersionProbeCleanupError)
   expect((failure as OpenCodeVersionProbeCleanupError).message).toBe('cleanup_unknown')
   expect((failure as OpenCodeVersionProbeCleanupError).helperFailure).toMatchObject({ operation: 'tree', reason: 'helper_timeout' })
-  expect(f.budgets).toEqual([2000, 2000])
-  expect(f.elapsed()).toBe(3525)
+  expect(f.budgets).toEqual([5000, 5000, 5000, VERSION_PROBE_DEADLINE_MS - 15_075])
+  expect(f.elapsed()).toBe(VERSION_PROBE_DEADLINE_MS)
   expect(f.removed()).toBe(0)
 })
 
@@ -94,7 +111,7 @@ function acquisitionFixture(mode: 'closed' | 'open' | 'exit-only' | 'late-close'
   const close = () => { child.emit('exit', 0); child.emit('close', 0) }
   const date = spyOn(Date, 'now').mockImplementation(() => clock)
   const timers = spyOn(globalThis, 'setTimeout').mockImplementation(Object.assign((...[callback, ms, ...args]: Parameters<typeof setTimeout>) => {
-    if (ms !== 5000 || acquisitionHandle !== undefined) return realSetTimeout(callback, ms, ...args)
+    if (ms !== VERSION_ACQUISITION_MS || acquisitionHandle !== undefined) return realSetTimeout(callback, ms, ...args)
     acquisitionActive = true
     fireAcquisition = () => { if (acquisitionActive) callback(...args) }
     acquisitionHandle = realSetTimeout(() => undefined, 60_000)
@@ -115,9 +132,10 @@ function acquisitionFixture(mode: 'closed' | 'open' | 'exit-only' | 'late-close'
   })
   const ports = spyOn(native, 'nativePorts').mockImplementation(() => ({
     platform: 'win32', selfPid: process.pid, now: () => clock,
-    birth: async () => { clock += 3000; return null },
+    // Birth and census together reach the acquisition deadline at a late close.
+    birth: async () => { clock += VERSION_ACQUISITION_MS / 2; return null },
     tree: async () => {
-      clock += 3000
+      clock += VERSION_ACQUISITION_MS / 2
       // Exercise the acquisition callback while a successful OS cleanup read
       // is still outstanding; advancing Date.now alone cannot catch this race.
       if (mode !== 'late-close') fireAcquisition!()
@@ -190,7 +208,7 @@ function additionFixture(mode: 'gone' | 'alive' | 'unknown' | 'orphan' | 'reused
         if (leafReads === 1 && mode !== 'open') {
           child.emit('exit', 0); child.emit('close', 0); closed = true
         }
-        if (mode === 'expired') clock += 8000
+        if (mode === 'expired') clock += VERSION_PROBE_DEADLINE_MS
         if (mode === 'older') return 5
         if (mode.startsWith('confirmation-')) return leafReads === 1 ? 30 : mode === 'confirmation-reused' ? 31 : null
         if (mode.startsWith('stale-')) return leafReads === 1 ? 30 : null
@@ -232,7 +250,7 @@ for (const mode of ['gone', 'confirmation-gone', 'stale-gone'] as const) {
     expect(f.trees()).toBeGreaterThanOrEqual(4)
     expect(f.removed()).toBe(1)
     expect(f.signalled).toEqual([])
-    expect(f.budgets.every(budget => budget > 0 && budget <= 2000)).toBe(true)
+    expect(f.budgets.every(budget => budget > 0 && budget <= 5000)).toBe(true)
     if (mode === 'stale-gone') expect(f.leafReads()).toBe(2)
   })
 }
@@ -327,7 +345,7 @@ test('Windows unanchored gone rows require independent gone checks, raw absence 
   expect(f.births()).toBe(1)
   expect(f.signals).toEqual([])
   expect(f.taskkills).toEqual([])
-  expect(f.budgets).toEqual([2000, 2000, 2000, 2000])
+  expect(f.budgets).toEqual([5000, 5000, 5000, 5000])
   expect(f.removed()).toBe(1)
 })
 
@@ -350,11 +368,11 @@ for (const mode of ['alive', 'unknown', 'orphan', 'reused', 'persistent', 'final
     expect(f.taskkills).toEqual([])
     expect(f.births()).toBe(1)
     expect(f.aliveReads).toContain(f.leaf)
-    expect(f.budgets.every(budget => budget > 0 && budget <= 2000)).toBe(true)
+    expect(f.budgets.every(budget => budget > 0 && budget <= 5000)).toBe(true)
     if (mode === 'orphan') { expect(f.trees()).toBe(2); expect(f.aliveReads).toContain(f.grandchild) }
     if (mode === 'reused') expect(f.trees()).toBe(2)
     if (mode === 'final-reappeared') expect(f.trees()).toBe(3)
-    if (mode === 'persistent') expect(f.elapsed()).toBe(8000)
+    if (mode === 'persistent') expect(f.elapsed()).toBe(VERSION_PROBE_DEADLINE_MS)
   })
 }
 
@@ -368,7 +386,7 @@ test('Windows captured successful owner waits out stale gone descendants without
   expect(f.events).toEqual(['census:rows', 'census:empty', 'census:empty', 'remove'])
   expect(f.signals).toEqual([])
   expect(f.taskkills).toEqual([])
-  expect(f.budgets.every(budget => budget > 0 && budget <= 2000)).toBe(true)
+  expect(f.budgets.every(budget => budget > 0 && budget <= 5000)).toBe(true)
   expect(f.removed()).toBe(1)
 })
 
@@ -396,7 +414,7 @@ test('Windows reverse census acquires parent births before a valid descendant an
   expect(f.trees()).toBeGreaterThanOrEqual(4)
   expect(f.removed()).toBe(1)
   expect(f.signalled).toEqual([])
-  expect(f.budgets.every(budget => budget > 0 && budget <= 2000)).toBe(true)
+  expect(f.budgets.every(budget => budget > 0 && budget <= 5000)).toBe(true)
 })
 
 test('Windows reverse census still refuses a child born before its captured parent', async () => {

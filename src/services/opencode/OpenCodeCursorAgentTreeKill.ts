@@ -16,12 +16,45 @@ export type CursorAgentNativePorts = {
   sleep: (ms: number) => Promise<void>
 }
 
+export type NativeHelperCause = Readonly<{
+  stage: 'process_lookup' | 'start_time'
+  category: 'ArgumentException' | 'InvalidOperationException' | 'Win32Exception' | 'UnauthorizedAccessException' | 'other'
+  hresult: number
+  nativeErrorCode: number | null
+}>
+
+function parseHelperCause(line: string): NativeHelperCause | undefined {
+  const prefix = 'native-helper-cause:'
+  if (!line.startsWith(prefix)) return undefined
+  try {
+    const value: unknown = JSON.parse(line.slice(prefix.length))
+    if (!value || typeof value !== 'object' || !('stage' in value) || !('category' in value)
+      || !('hresult' in value) || !('nativeErrorCode' in value)) return undefined
+    const { stage, category, hresult, nativeErrorCode } = value
+    if (stage !== 'process_lookup' && stage !== 'start_time') return undefined
+    if (category !== 'ArgumentException' && category !== 'InvalidOperationException'
+      && category !== 'Win32Exception' && category !== 'UnauthorizedAccessException' && category !== 'other') return undefined
+    const integer = (field: unknown): field is number => typeof field === 'number'
+      && Number.isInteger(field) && field >= -0x80000000 && field <= 0x7fffffff
+    if (!integer(hresult) || (nativeErrorCode !== null && !integer(nativeErrorCode))) return undefined
+    return { stage, category, hresult, nativeErrorCode }
+  } catch { return undefined }
+}
+
+class NativeHelperQueryError extends Error {
+  constructor(code: number | null, readonly helperCause?: NativeHelperCause) {
+    super(`Native helper exited ${code}`)
+  }
+}
+
 /** Errors do not prove a launched helper has exited: wait for close. */
 export function query(command: string, args: string[], timeout: number,
-  launch: typeof spawn = spawn): Promise<string> {
+  launch: typeof spawn = spawn, captureHelperCause = false): Promise<string> {
   return new Promise((resolve, reject) => {
-    const child = launch(command, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] })
+    const child = launch(command, args, { windowsHide: true, stdio: ['ignore', 'pipe', captureHelperCause ? 'pipe' : 'ignore'] })
     let output = ''
+    let helperCause: NativeHelperCause | undefined
+    let diagnosticOutput = '', diagnosticBytes = 0
     let failure: Error | undefined
     const stop = (error: Error) => {
       failure ??= error
@@ -35,6 +68,14 @@ export function query(command: string, args: string[], timeout: number,
       output += String(data)
       if (output.length > 4 * 1024 * 1024) stop(new Error('Native helper output exceeded limit'))
     })
+    child.stderr?.on('data', (data: Buffer | string) => {
+      if (!captureHelperCause || diagnosticBytes >= 1024 || helperCause) return
+      const bytes = Buffer.isBuffer(data) ? data : Buffer.from(data)
+      const bounded = bytes.subarray(0, 1024 - diagnosticBytes)
+      diagnosticBytes += bounded.byteLength
+      diagnosticOutput += bounded.toString('utf8')
+      for (const line of diagnosticOutput.split(/\r?\n/)) helperCause ??= parseHelperCause(line)
+    })
     child.on('error', error => {
       failure ??= error
       // No PID means spawn failed, so no helper can execute later.
@@ -42,7 +83,7 @@ export function query(command: string, args: string[], timeout: number,
     })
     child.once('close', code => {
       clearTimeout(timer)
-      if (failure || code !== 0) reject(failure ?? new Error(`Native helper exited ${code}`))
+      if (failure || code !== 0) reject(failure ?? new NativeHelperQueryError(code, helperCause))
       else resolve(output)
     })
   })
@@ -53,20 +94,22 @@ export type NativeHelperFailure = Readonly<{
   reason: 'helper_timeout' | 'helper_nonzero' | 'helper_spawn_error' | 'helper_output_limit' | 'helper_error'
   exitCode: number | null
   elapsedMs: number
+  helperCause?: NativeHelperCause
 }>
 
 export function nativePorts(overrides: Partial<CursorAgentNativePorts> = {},
   onHelperFailure?: (failure: NativeHelperFailure) => void): CursorAgentNativePorts {
   const observedQuery = async (operation: NativeHelperFailure['operation'], command: string, args: string[], timeout: number) => {
     const started = Date.now()
-    try { return await query(command, args, timeout) }
+    try { return await query(command, args, timeout, spawn, operation === 'birth' && process.platform === 'win32') }
     catch (error) {
       const message = error instanceof Error ? error.message : ''
       const exit = /^Native helper exited (-?\d+)$/.exec(message)
       const reason: NativeHelperFailure['reason'] = message === 'Native helper timed out' ? 'helper_timeout'
         : exit ? 'helper_nonzero' : message === 'Native helper output exceeded limit' ? 'helper_output_limit'
           : error instanceof Error && 'code' in error ? 'helper_spawn_error' : 'helper_error'
-      onHelperFailure?.({ operation, reason, exitCode: exit ? Number(exit[1]) : null, elapsedMs: Math.max(0, Date.now() - started) })
+      onHelperFailure?.({ operation, reason, exitCode: exit ? Number(exit[1]) : null, elapsedMs: Math.max(0, Date.now() - started),
+        ...(error instanceof NativeHelperQueryError && error.helperCause ? { helperCause: error.helperCause } : {}) })
       throw error
     }
   }
@@ -75,19 +118,63 @@ export function nativePorts(overrides: Partial<CursorAgentNativePorts> = {},
     birth: async (pid, timeout) => {
       if (!Number.isSafeInteger(pid) || pid <= 0) return null
       if (process.platform === 'linux') return readProcessStartTimeMs(pid, 'linux', timeout)
-      if (process.platform === 'win32') {
-        try { return (await windowsNativeProcess()).birth(pid) } catch { return null }
-      }
-      if (process.platform !== 'darwin') return null
+      if (process.platform !== 'darwin' && process.platform !== 'win32') return null
+      const kernel32 = process.platform === 'win32' ? await windowsNativeProcess() : null
       try {
-        const output = await observedQuery('birth', 'ps', ['-p', String(pid), '-o', 'lstart='], timeout)
+        if (kernel32) return kernel32.birth(pid)
+        const output = process.platform === 'darwin'
+          ? await observedQuery('birth', 'ps', ['-p', String(pid), '-o', 'lstart='], timeout)
+          : await observedQuery('birth', path.win32.join(process.env.SystemRoot || 'C:\\Windows',
+            'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
+            ['-NoProfile', '-NonInteractive', '-Command',
+              `$ErrorActionPreference = "Stop"; $p = $null; $stage = 'process_lookup';
+try {
+  $p = [System.Diagnostics.Process]::GetProcessById(${pid});
+  $stage = 'start_time'; $p.StartTime.ToUniversalTime().ToString("o")
+} catch {
+  $cause = $_.Exception.GetBaseException();
+  $category = switch ($cause.GetType().Name) {
+    'ArgumentException' { 'ArgumentException' }
+    'InvalidOperationException' { 'InvalidOperationException' }
+    'Win32Exception' { 'Win32Exception' }
+    'UnauthorizedAccessException' { 'UnauthorizedAccessException' }
+    default { 'other' }
+  };
+  $nativeCode = 'null';
+  if ($cause -is [System.ComponentModel.Win32Exception]) { $nativeCode = $cause.NativeErrorCode.ToString([System.Globalization.CultureInfo]::InvariantCulture) };
+  [Console]::Error.WriteLine('native-helper-cause:{"stage":"' + $stage + '","category":"' + $category + '","hresult":' + $cause.HResult.ToString([System.Globalization.CultureInfo]::InvariantCulture) + ',"nativeErrorCode":' + $nativeCode + '}');
+  exit 1
+} finally { if ($null -ne $p) { $p.Dispose() } }`], timeout)
         const value = Date.parse(output.trim())
         return Number.isFinite(value) ? value : null
       } catch { return null }
     },
     tree: async timeout => {
-      if (process.platform === 'win32') return (await windowsNativeProcess()).table().filter(row => row.pid !== 0)
-      const output = await observedQuery('tree', 'ps', ['-e', '-o', 'pid=', '-o', 'ppid='], timeout)
+      // Each PowerShell/WMI helper below is a cold process start, seconds on a
+      // busy host. The shipped Bun 1.3.11 has no bun:ffi dlopen on Windows ARM64
+      // (TinyCC is disabled before 1.4.0), so only those hosts still use them.
+      // Remove the Windows helpers once scripts/runtime-bun-pins.json ships Bun
+      // 1.4.0 or newer for every Windows target.
+      const kernel32 = process.platform === 'win32' ? await windowsNativeProcess() : null
+      if (kernel32) return kernel32.table().filter(row => row.pid !== 0)
+      const output = process.platform === 'win32'
+        ? await observedQuery('tree', path.win32.join(process.env.SystemRoot || 'C:\\Windows',
+          'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
+          ['-NoProfile', '-NonInteractive', '-Command',
+            // Avoid loading CimCmdlets in the private Windows environment.
+            // Keep the same PID/parent projection and dispose every WMI resource.
+            `$ErrorActionPreference = 'Stop';
+[void][System.Reflection.Assembly]::Load('System.Management, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a');
+$searcher = [System.Management.ManagementObjectSearcher]::new('SELECT ProcessId, ParentProcessId FROM Win32_Process');
+$results = $null;
+try {
+  $results = $searcher.Get();
+  foreach ($row in $results) {
+    try { [Console]::Out.WriteLine('{0} {1}', $row.GetPropertyValue('ProcessId'), $row.GetPropertyValue('ParentProcessId')) }
+    finally { $row.Dispose() }
+  }
+} finally { if ($null -ne $results) { $results.Dispose() }; $searcher.Dispose() }`], timeout)
+        : await observedQuery('tree', 'ps', ['-e', '-o', 'pid=', '-o', 'ppid='], timeout)
       const rows = output.trim().split('\n').filter(Boolean).map(line => {
         const match = /^\s*(\d+)\s+(\d+)\s*$/.exec(line)
         if (!match) throw new Error('Unreadable process tree')
