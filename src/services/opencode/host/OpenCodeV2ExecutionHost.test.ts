@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promi
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { createHash } from 'node:crypto'
-import { executionHash } from '../execution/OpenCodeV2ExecutionContracts.js'
+import { executionHash, openCodeV2RunInitializationMs } from '../execution/OpenCodeV2ExecutionContracts.js'
 import { boundOpenCodeRead } from '../transport/OpenCodeBoundedFetch.js'
 import { acquireExecutionLease, awaitExecutionHostReady } from './OpenCodeV2ExecutionHost.js'
 import { validateExecutionProfile, type ExecutionBirth, type SelectedExecutionProfile, type ValidatedExecutionNative } from './OpenCodeV2ExecutionBinding.js'
@@ -36,12 +36,17 @@ function retirement(overrides: Partial<ExecutionRetirementPort> = {}): Execution
 }
 
 describe('execution host ownership and cleanup', () => {
-  for (const mode of ['deferred-expiry', 'deferred-stop', 'deferred-premature', 'deferred-expired', 'deferred-overflow', 'standalone-windows', 'standalone-posix'] as const)
+  test('owner initialization budget is platform-specific without changing other platforms', () => {
+    expect(openCodeV2RunInitializationMs('win32')).toBe(300_000)
+    expect(openCodeV2RunInitializationMs('darwin')).toBe(180_000)
+    expect(openCodeV2RunInitializationMs('linux')).toBe(90_000)
+  })
+  for (const mode of ['deferred-extended-expiry', 'deferred-expiry', 'deferred-stop', 'deferred-premature', 'deferred-expired', 'deferred-overflow', 'standalone-windows', 'standalone-posix'] as const)
     test(`actual child watchdog retains its original deadline and activation barrier (${mode})`, async () => {
       const source = await readFile(path.resolve(import.meta.dir, '../../../entrypoints/opencodeV2ExecutionServer.ts'), 'utf8')
       const body = new Bun.Transpiler({ loader: 'ts' }).transformSync(source.slice(source.indexOf('const controller = new AbortController()'))
         .replaceAll('import.meta.url', JSON.stringify('/TEST-entry')))
-      const base = 1_000_000, originalDeadline = base + 150_000
+      const base = 1_000_000, originalDeadline = base + (mode === 'deferred-extended-expiry' ? 250_000 : 150_000)
       let now = base, sequence = 0, completeGraph!: () => void
       const clock = spyOn(Date, 'now').mockImplementation(() => now)
       const timers = new Map<number, { at: number; run: () => void }>()
@@ -54,7 +59,7 @@ describe('execution host ownership and cleanup', () => {
         env: {}, envSha256: 'f'.repeat(64), config: { directory: '/TEST-profile/config', content: '{}', sha256: 'f'.repeat(64) },
         selection: { agent: 'worker', model: { providerID: 'TEST', id: 'model' }, permissions: [] } }
       const platform = mode === 'standalone-posix' ? 'darwin' : 'win32'
-      const scope = { AbortController, Date, windowsGraphActivation, boundOpenCodeRead,
+      const scope = { AbortController, Date, windowsGraphActivation, boundOpenCodeRead, openCodeV2RunInitializationMs,
         process: { platform, pid: 42, env: { PWD: profile.directory }, versions: { bun: 'TEST-bun' },
           execPath: native.bun.path, argv: ['TEST-bun', '/TEST-entry'], cwd: () => profile.directory,
           stderr: { write: (text: string) => { reports.push(JSON.parse(text)) } }, once: () => {}, exit: (code: number) => { exits.push(code) } },
@@ -87,7 +92,7 @@ describe('execution host ownership and cleanup', () => {
         now = base + 20_000
         const deferred = mode.startsWith('deferred')
         events.emit('message', { type: 'start', nonce, leaseOwnerId, namespace: prepared.namespace, password: 'A'.repeat(43), native, profile,
-          ...(deferred ? { deferRuntime: true, activationDeadline: mode === 'deferred-expired' ? now : mode === 'deferred-overflow' ? base + 180_001 : originalDeadline } : {}) })
+          ...(deferred ? { deferRuntime: true, activationDeadline: mode === 'deferred-expired' ? now : mode === 'deferred-overflow' ? base + 300_001 : originalDeadline } : {}) })
         await settle()
         if (mode === 'deferred-expired' || mode === 'deferred-overflow') {
           expect(armed).toEqual([base + 120_000])
@@ -118,8 +123,14 @@ describe('execution host ownership and cleanup', () => {
         expect(sent.some(value => value.type === 'ready')).toBe(false)
         expect(exits).toEqual([0])
         expect(reports).toHaveLength(1)
-        if (mode.endsWith('expiry')) expect(reports[0]).toMatchObject({ reason: 'timeout', stage: 'waiting-for-activation', elapsedMs: 150_000 })
+        if (mode.endsWith('expiry')) expect(reports[0]).toMatchObject({ reason: 'timeout', stage: 'waiting-for-activation', elapsedMs: originalDeadline - base })
         if (!deferred) expect(reports[0]).toMatchObject({ reason: 'timeout', stage: 'graph-validation', elapsedMs: platform === 'win32' ? 120_000 : 60_000 })
+        if (mode === 'deferred-extended-expiry') {
+          events.emit('message', { type: 'activate', ...prepared }); await settle()
+          expect(inspect()).toMatchObject({ closing: true, runtimeReady: false })
+          expect(sent.some(value => value.type === 'ready')).toBe(false)
+          expect(exits).toEqual([0])
+        }
       } finally { clock.mockRestore() }
     })
   test('Windows graph activation is one-shot and binds the original deadline and physical child', async () => {

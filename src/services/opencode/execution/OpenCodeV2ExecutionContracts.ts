@@ -1,5 +1,10 @@
 import { createHash } from 'node:crypto'
 
+/** One absolute owner startup ceiling; callers may clip it to an earlier deadline. */
+export function openCodeV2RunInitializationMs(platform: NodeJS.Platform): number {
+  return platform === 'win32' ? 300_000 : platform === 'darwin' ? 180_000 : 90_000
+}
+
 export type ExecutionPin = '2.0.0' | '2.0.21'
 export type ExecutionBirth = Readonly<{ format: 'linux-start-ticks' | 'darwin-pidversion' | 'windows-filetime' | 'utc-ms'; value: string; bootId: string | null }>
 export type ExecutionAuthority = Readonly<{

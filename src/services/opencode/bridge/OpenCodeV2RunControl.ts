@@ -4,7 +4,7 @@ import { constants, type Dirent } from 'node:fs'
 import { chmod, lstat, mkdir, open, readFile, readdir, realpath, rename, unlink } from 'node:fs/promises'
 import { createConnection, createServer, type Socket } from 'node:net'
 import path from 'node:path'
-import { canonicalExecutionJSON, executionAssert, executionHash, executionRecord, assertIntentIdentity, type ExecutionContext } from '../execution/OpenCodeV2ExecutionContracts.js'
+import { canonicalExecutionJSON, executionAssert, executionHash, executionRecord, assertIntentIdentity, openCodeV2RunInitializationMs, type ExecutionContext } from '../execution/OpenCodeV2ExecutionContracts.js'
 import type { QueueIntent } from '../execution/OpenCodeV2AdmissionService.js'
 import type { ExecutionMention } from '../transport/OpenCodeV2ExecutionClientFactory.js'
 import type { RunAnyProcessIdentity, RunBinding, RunControlRecord, RunControlRequest, RunControlResult, RunMemberStatus, RunProcessIdentity, RunStopMember, RunUnixControlRecord, RunWindowsControlRecord } from './OpenCodeV2RunTypes.js'
@@ -19,7 +19,7 @@ export type { RunBinding, RunControlRecord, RunControlRequest, RunControlResult,
 
 const MAX_FRAME = 512 * 1024
 // Graph preparation and native startup share one absolute budget. Individual control operations remain capped at 30s.
-export const OPEN_CODE_V2_RUN_INITIALIZATION_MS = process.platform === 'darwin' || process.platform === 'win32' ? 180_000 : 90_000
+export const OPEN_CODE_V2_RUN_INITIALIZATION_MS = openCodeV2RunInitializationMs(process.platform)
 const MAX_OPERATION_MS = 30_000
 const digest = (bytes: string | Buffer) => createHash('sha256').update(bytes).digest('hex')
 type WindowsServingAdmission = Readonly<{ record: RunWindowsControlRecord; profiles: readonly WindowsProfileAdmission[] }>

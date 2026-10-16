@@ -5,7 +5,7 @@ import { prepareExecutionPlatformChild, readExecutionPlatformBirth } from '../se
 import { pathToFileURL } from 'node:url'
 import { resolveOpenCodeV2ExecutionDelivery } from '../services/opencode/host/OpenCodeV2ExecutionDelivery.js'
 import { hashOpenCodeFile } from '../services/opencode/compatibility/OpenCodeNativeIdentity.js'
-import { executionAssert, executionHash, executionRecord } from '../services/opencode/execution/OpenCodeV2ExecutionContracts.js'
+import { executionAssert, executionHash, executionRecord, openCodeV2RunInitializationMs } from '../services/opencode/execution/OpenCodeV2ExecutionContracts.js'
 import { assertExecutionProfile, executionProfileGuards, validateExecutionGraph, validateExecutionNative, validateExecutionProfile,
   type ExecutionGraphProgress, type OwnedNativeProfile, type ValidatedExecutionNative } from '../services/opencode/host/OpenCodeV2ExecutionBinding.js'
 import { boundOpenCodeRead } from '../services/opencode/transport/OpenCodeBoundedFetch.js'
@@ -98,7 +98,7 @@ async function start(input: Record<string, unknown>): Promise<void> {
   let activationDeadline: number | undefined
   if (input.deferRuntime !== undefined) {
     executionAssert(process.platform === 'win32' && input.deferRuntime === true && Number.isSafeInteger(input.activationDeadline) &&
-      Number(input.activationDeadline) > Date.now() && Number(input.activationDeadline) <= startupStartedAt + 180_000, 'execution_identity_mismatch')
+      Number(input.activationDeadline) > Date.now() && Number(input.activationDeadline) <= startupStartedAt + openCodeV2RunInitializationMs(process.platform), 'execution_identity_mismatch')
     activationDeadline = Number(input.activationDeadline)
     graphActivation = windowsGraphActivation({ nonce: prepared.nonce, leaseOwnerId: prepared.leaseOwnerId,
       namespace: prepared.namespace, pid: process.pid, birth: prepared.birth }, activationDeadline)
