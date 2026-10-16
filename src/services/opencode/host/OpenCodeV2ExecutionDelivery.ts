@@ -19,7 +19,15 @@ export function classifyOpenCodeV2ExecutionDelivery(location: string) {
 
 export async function resolveOpenCodeV2ExecutionDelivery(location: string, child: 'execution' | 'run-owner') {
   const { file, source } = classifyOpenCodeV2ExecutionDelivery(location)
-  const root = await filesystem.realpath(source ? file.slice(0, file.lastIndexOf(`${path.sep}src${path.sep}`)) : path.dirname(file))
+  const directory = source ? file.slice(0, file.lastIndexOf(`${path.sep}src${path.sep}`)) : path.dirname(file)
+  let root: string
+  if (process.platform === 'win32' && source) {
+    // The source subtree is admitted; its parent has metadata access only.
+    const expected = path.join(directory, 'src')
+    const canonical = await filesystem.realpath(expected)
+    executionAssert(canonical === expected, 'execution_entry_changed')
+    root = path.dirname(canonical)
+  } else root = await filesystem.realpath(directory)
   const name = child === 'execution' ? 'opencodeV2ExecutionServer' : 'opencodeV2RunOwner'
   const entryPath = await filesystem.realpath(path.join(root, source ? `src/entrypoints/${name}.ts` : `${name}.js`))
   executionAssert(entryPath === path.join(root, source ? `src/entrypoints/${name}.ts` : `${name}.js`), 'execution_entry_changed')

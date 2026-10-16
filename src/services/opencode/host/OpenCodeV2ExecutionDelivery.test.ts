@@ -8,6 +8,44 @@ import { resolveOpenCodeV2ExecutionDelivery } from './OpenCodeV2ExecutionDeliver
 const sha = (value: string | Buffer) => createHash('sha256').update(value).digest('hex')
 const workspace = path.resolve(import.meta.dir, '../../../..')
 
+test('Windows source delivery canonicalizes only its admitted src subtree and refuses aliases', async () => {
+  const source = await readFile(new URL('./OpenCodeV2ExecutionDelivery.ts', import.meta.url), 'utf8')
+  const body = new Bun.Transpiler({ loader: 'ts' }).transformSync(source.slice(source.indexOf('/** Resolve only'))
+    .replaceAll('export ', ''))
+  for (const platform of ['win32', 'darwin'] as const) for (const mode of ['source', 'packaged'] as const) {
+    const paths = platform === 'win32' ? path.win32 : path.posix
+    const root = platform === 'win32' ? 'C:\\TEST-sdk' : '/TEST-sdk'
+    const src = paths.join(root, 'src'), location = mode === 'source'
+      ? paths.join(src, 'services/opencode/host/OpenCodeV2ExecutionDelivery.ts') : paths.join(root, 'cli.js')
+    for (const alias of [false, ...(platform === 'win32' && mode === 'source' ? [true] : [])]) {
+      const observed: string[] = [], reads: string[] = []
+      const scope = { path: paths, process: { platform }, Bun: { main: 'TEST-bun' }, createHash,
+        fileURLToPath: () => location,
+        executionAssert: (value: unknown, code: string) => { if (!value) throw new Error(code) },
+        filesystem: { realpath: async (file: string) => {
+          observed.push(file)
+          if (platform === 'win32' && mode === 'source' && file === root)
+            throw Object.assign(new Error('TEST_unadmitted_parent'), { code: 'EPERM', syscall: 'lstat' })
+          return alias && file === src ? paths.join(root, 'TEST-alias/src') : file
+        } },
+        readFile: async (file: string) => { reads.push(file); return Buffer.from('TEST-entry-bytes') },
+      }
+      const resolve = new Function('scope', `const {${Object.keys(scope).join(',')}}=scope;${body};return resolveOpenCodeV2ExecutionDelivery;`)(scope)
+      if (alias) {
+        await expect(resolve('file:///TEST-location', 'execution')).rejects.toThrow('execution_entry_changed')
+        expect(observed).toEqual([src]); expect(reads).toEqual([])
+      } else for (const [child, name] of [['execution', 'opencodeV2ExecutionServer'], ['run-owner', 'opencodeV2RunOwner']] as const) {
+        observed.length = 0; reads.length = 0
+        const entry = paths.join(root, mode === 'source' ? `src/entrypoints/${name}.ts` : `${name}.js`)
+        expect(await resolve('file:///TEST-location', child)).toEqual({ runtimeMode: mode, root, entryPath: entry,
+          entrySha256: sha('TEST-entry-bytes') })
+        expect(observed).toEqual([platform === 'win32' && mode === 'source' ? src : root, entry])
+        expect(reads).toEqual([entry])
+      }
+    }
+  }
+})
+
 // A hardcoded TS child path or source-only fence makes the actual JS bundle fail.
 test('actual Bun JS bundle resolves and hashes both adjacent children without a source tree', async () => {
   const root = await realpath(await mkdtemp(path.join(tmpdir(), 'TEST-v2-js-delivery-')))
