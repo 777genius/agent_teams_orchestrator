@@ -20,6 +20,28 @@ async function fixture(credential: unknown = { type: 'api', key: 'TEST-DUMMY-KEY
   return { profile, auth, content, remove: () => rm(root, { recursive: true, force: true }) }
 }
 
+test('execution auth module loads without importing either official client before selection', async () => {
+  const f = await fixture()
+  try {
+    const source = new URL('./OpenCodeV2ExecutionAuth.ts', import.meta.url).href
+    const script = `Bun.plugin({name:'TEST-client-selection',setup(build){
+      build.onResolve({filter:/^@opencode\\/client(?:-v2-floor)?$/},()=>{throw Error('TEST_client_import_before_selection')})
+      build.onLoad({filter:/[/\\\\]@opencode[/\\\\]client(?:-v2-floor)?[/\\\\]/},()=>{throw Error('TEST_client_import_before_selection')})
+    }});try{const value=await import(${JSON.stringify(source)});
+    if(typeof value.initializeOpenCodeV2ExecutionAuth!=='function'||typeof value.attachOpenCodeV2SelectedKey!=='function')throw Error('TEST_auth_exports_missing');
+    await Bun.stdout.write('TEST-auth-module-selected-lazy');
+    }catch(error){if(error instanceof Error&&error.message==='TEST_client_import_before_selection')process.exitCode=91;else throw error}`
+    const env = Object.fromEntries(Object.entries({ HOME: f.profile.root, USERPROFILE: f.profile.root,
+      TMPDIR: f.profile.root, TMP: f.profile.root, TEMP: f.profile.root,
+      SystemRoot: process.env.SystemRoot, WINDIR: process.env.WINDIR }).filter((row): row is [string, string] => row[1] !== undefined))
+    const child = Bun.spawn([process.execPath, '--no-env-file', '--eval', script],
+      { cwd: f.profile.root, env, stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' })
+    const [code, stdout] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()])
+    expect(code).toBe(0)
+    expect(stdout).toBe('TEST-auth-module-selected-lazy')
+  } finally { await f.remove() }
+})
+
 test('fresh official database skips legacy key import; native key attachment makes the selected credential available', async () => {
   const f = await fixture()
   let db: SQLite | undefined

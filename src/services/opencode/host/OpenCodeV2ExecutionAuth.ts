@@ -1,5 +1,3 @@
-import { OpenCode as Floor } from '@opencode/client-v2-floor'
-import { OpenCode as Current } from '@opencode/client'
 import { executionAssert, executionRecord, type ExecutionAuthority, type ExecutionContext } from '../execution/OpenCodeV2ExecutionContracts.js'
 import { OpenCodeV2ProviderWire } from '../transport/OpenCodeV2ProviderWire.js'
 import { requireExecutionEndpoint, registerExecutionDisposer } from './OpenCodeV2ExecutionHost.js'
@@ -126,11 +124,13 @@ export async function initializeOpenCodeV2ExecutionAuth(authority: ExecutionAuth
     // Listener readiness precedes plugin transforms; await each pin's official activation barrier.
     const sdk = authority.pin === '2.0.0'
       ? await (async () => {
+        const { OpenCode: Floor } = await import('@opencode/client-v2-floor')
         const sdk = Floor.make({ baseUrl: endpoint.baseUrl, fetch: wire.fetch })
         await sdk.plugin.awaitActivation({ location })
         return sdk
       })()
       : await (async () => {
+        const { OpenCode: Current } = await import('@opencode/client')
         const sdk = Current.make({ baseUrl: endpoint.baseUrl, fetch: wire.fetch })
         await sdk.integration.list({ location })
         return sdk
