@@ -8,19 +8,50 @@ import { ensureWindowsPrivateDirectories } from '../profile/OpenCodePrivateDirec
 
 const startupStages = new Set(['run-owner-entry', 'windows-cohort', 'windows-profile', 'windows-roots', 'windows-dll',
   'windows-process', 'windows-owned-pair', 'windows-published', 'windows-connected', 'windows-prepare', 'windows-assert', 'waiting-for-prepare', 'profile-validation', 'native-validation', 'graph-validation',
-  'runtime-import', 'server-start', 'effect-import', 'selected-oauth-import', 'scope-acquisition', 'ready-identity'])
+  'delivery-resolution', 'runtime-import', 'server-start', 'effect-import', 'selected-oauth-import', 'scope-acquisition', 'ready-identity'])
 function startupDiagnostic(output: string | undefined) {
   if (!output || output.length > 16_384) return undefined
   for (const line of output.split('\n').reverse()) {
     try {
       const row = JSON.parse(line) as Record<string, unknown>
+      const optionalFacts: Record<string, unknown> = {}
+      const closedFields: Record<string, readonly string[]> = {
+        errno: ['EPERM', 'EACCES', 'ENOENT', 'ENOTDIR', 'EISDIR', 'EINVAL', 'UNKNOWN', 'EIO', 'ENOSYS'],
+        operation: ['realpath', 'open', 'read', 'lstat', 'stat'], errorName: ['Error', 'TypeError', 'ReferenceError', 'RangeError', 'AbortError'],
+        cause: ['execution_contract_invalid', 'execution_identity_mismatch', 'execution_entry_changed', 'v2_compiled_runtime_unsupported', 'v2_execution_layout_unsupported', 'execution_profile_changed', 'execution_graph_changed', 'execution_graph_incomplete', 'execution_graph_dependency_missing', 'execution_containment_identity_mismatch', 'execution_timeout', 'execution_cancelled'],
+        profileGuard: ['environment_hash', 'config_hash', 'home_mapping', 'path_containment', 'database_type', 'models_type', 'models_hash', 'process_cwd', 'process_pwd', 'process_environment'],
+      }
+      if (!row || Array.isArray(row)) continue
+      if (Object.entries(closedFields).some(([key, allowed]) => key in row && !allowed.includes(row[key] as string))) continue
+      for (const key of Object.keys(closedFields)) if (key in row) optionalFacts[key] = row[key]
+      if ('environmentMismatchKeys' in row) {
+        const allowed = ['HOME', 'USERPROFILE', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME', 'TMPDIR', 'TMP', 'TEMP', 'APPDATA', 'LOCALAPPDATA', 'PATH', 'NO_COLOR', 'SystemRoot', 'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATHEXT', 'HOMEDRIVE', 'HOMEPATH', 'OPENCODE_CONFIG_DIR', 'AGENT_TEAMS_MCP_CLAUDE_DIR', 'OPENSSL_CONF', 'other']
+        if (!Array.isArray(row.environmentMismatchKeys) || row.environmentMismatchKeys.length > allowed.length ||
+            !row.environmentMismatchKeys.every(key => typeof key === 'string' && allowed.includes(key))) continue
+        optionalFacts.environmentMismatchKeys = row.environmentMismatchKeys
+      }
       if (!row || Array.isArray(row) || !['elapsedMs,event,reason,stage', 'elapsedMs,event,history,reason,stage',
-        'elapsedMs,event,graph,reason,stage', 'elapsedMs,event,graph,history,reason,stage'].includes(Object.keys(row).filter(key => key !== 'nativeExitCode' && key !== 'nativeStderrKind').sort().join(',')) ||
+        'elapsedMs,event,graph,reason,stage', 'elapsedMs,event,graph,history,reason,stage'].includes(Object.keys(row).filter(key => key !== 'nativeExitCode' && key !== 'nativeStderrKind' && key !== 'graphFailure' && !Object.hasOwn(closedFields, key) && key !== 'environmentMismatchKeys').sort().join(',')) ||
         ('nativeStderrKind' in row && (typeof row.nativeStderrKind !== 'string' || !['empty', 'entry_resolution', 'module_resolution', 'child_identity', 'child_pipe', 'access_denied', 'pipe_refused', 'pipe_missing', 'bun_error', 'unclassified', 'unavailable'].includes(row.nativeStderrKind))) ||
         ('nativeExitCode' in row && (!Number.isSafeInteger(row.nativeExitCode) || Number(row.nativeExitCode) < 0 || Number(row.nativeExitCode) > 0xffffffff)) ||
         row.event !== 'opencode-v2-startup' || typeof row.reason !== 'string' || !['timeout', 'failed'].includes(row.reason) ||
         typeof row.stage !== 'string' || !startupStages.has(row.stage) ||
         !Number.isSafeInteger(row.elapsedMs) || Number(row.elapsedMs) < 0 || Number(row.elapsedMs) > 86_400_000) continue
+      let graphFailure: Record<string, unknown> | undefined
+      if ('graphFailure' in row) {
+        const value = row.graphFailure as Record<string, unknown> | null
+        if (!value || typeof value !== 'object' || Array.isArray(value) ||
+            !['contentSha256,index,pathSha256,readPhase,total', 'contentSha256,index,pathSha256,readPhase,realpath,total'].includes(Object.keys(value).sort().join(',')) ||
+            (value.readPhase !== 'realpath' && value.readPhase !== 'hash') || !Number.isSafeInteger(value.index) || !Number.isSafeInteger(value.total) || Number(value.index) < 0 || Number(value.index) >= Number(value.total) || Number(value.total) > 65536 ||
+            typeof value.pathSha256 !== 'string' || !/^[a-f0-9]{64}$/.test(value.pathSha256) || typeof value.contentSha256 !== 'string' || !/^[a-f0-9]{64}$/.test(value.contentSha256)) continue
+        if (value.realpath !== undefined) {
+          const native = value.realpath as Record<string, unknown> | null
+          if (!native || typeof native !== 'object' || Array.isArray(native) || Object.keys(native).sort().join(',') !== 'anchorCount,matchingAnchorIndex,operation,status,win32' ||
+              !Object.values(native).every(Number.isSafeInteger) || Number(native.status) < 1 || Number(native.status) > 4 || Number(native.operation) < 0 || Number(native.operation) > 25 ||
+              Number(native.win32) < 0 || Number(native.win32) > 0xffffffff || Number(native.anchorCount) < 0 || Number(native.anchorCount) > 4096 || Number(native.matchingAnchorIndex) < -1 || Number(native.matchingAnchorIndex) >= Number(native.anchorCount)) continue
+        }
+        graphFailure = value
+      }
       const history: { stage: string; elapsedMs: number }[] = []
       if ('history' in row) {
         if (!Array.isArray(row.history) || row.history.length < 1 || row.history.length > 10) continue
@@ -45,10 +76,10 @@ function startupDiagnostic(output: string | undefined) {
           (value.phase === 'closure' && value.completed !== value.total)) continue
         graph = { phase: value.phase, completed: Number(value.completed), total: Number(value.total) }
       }
-      return { reason: row.reason, stage: row.stage, elapsedMs: row.elapsedMs,
+      return { reason: row.reason, stage: row.stage, elapsedMs: row.elapsedMs, ...optionalFacts,
         ...('nativeExitCode' in row ? { nativeExitCode: Number(row.nativeExitCode) } : {}),
         ...('nativeStderrKind' in row ? { nativeStderrKind: row.nativeStderrKind as string } : {}),
-        ...('history' in row ? { history } : {}), ...(graph ? { graph } : {}) }
+        ...('history' in row ? { history } : {}), ...(graph ? { graph } : {}), ...(graphFailure ? { graphFailure } : {}) }
     } catch { /* Arbitrary native output is never a diagnostic payload. */ }
   }
   return undefined

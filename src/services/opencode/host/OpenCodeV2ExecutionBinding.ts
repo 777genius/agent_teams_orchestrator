@@ -1,3 +1,4 @@
+import { readWindowsRealpathFailure, type WindowsRealpathFailure } from './windows/OpenCodeV2WindowsRealpath.js'
 import path from 'node:path'
 import { readExecutionPlatformBirth } from './OpenCodeV2ExecutionPlatform.js'
 import filesystem, { lstat, open, readFile, readdir } from 'node:fs/promises'
@@ -77,6 +78,11 @@ export async function validateExecutionProfile(profile: OwnedNativeProfile): Pro
 }
 
 /** Receipt covers the owner's reviewed graph, including generated client and server dependencies. */
+export type ExecutionGraphFailure = Readonly<{ index: number; total: number; readPhase: 'realpath' | 'hash'; pathSha256: string; contentSha256: string; realpath?: WindowsRealpathFailure }>
+const originalGraphFailures = new WeakMap<Error, ExecutionGraphFailure>()
+export function readExecutionGraphFailure(error: unknown): ExecutionGraphFailure | undefined {
+  return error instanceof Error ? originalGraphFailures.get(error) : undefined
+}
 export type ExecutionGraphProgress = Readonly<{ phase: 'hash' | 'closure'; completed: number; total: number }>
 export async function validateExecutionGraph(pin: '2.0.0' | '2.0.21', receipt: ExecutionGraph,
   progress?: (value: ExecutionGraphProgress) => void, signal?: AbortSignal) {
@@ -93,12 +99,22 @@ export async function validateExecutionGraph(pin: '2.0.0' | '2.0.21', receipt: E
     try {
       while (!failed) {
         signal?.throwIfAborted()
-        const row = rows[next++]
+        const index = next++
+        const row = rows[index]
         if (!row) return
+        let readPhase: 'realpath' | 'hash' = 'realpath'
+        try {
         executionAssert(/^[a-f0-9]{64}$/.test(row.sha256) && path.isAbsolute(row.path) && await filesystem.realpath(row.path) === row.path)
         signal?.throwIfAborted()
+        readPhase = 'hash'
         executionAssert(await hashOpenCodeFile(row.path, signal) === row.sha256, 'execution_graph_changed')
         signal?.throwIfAborted()
+        } catch (error) {
+          if (error instanceof Error && typeof row.path === 'string' && !originalGraphFailures.has(error)) originalGraphFailures.set(error, Object.freeze({ index, total: rows.length, readPhase,
+            pathSha256: createHash('sha256').update(row.path).digest('hex'), contentSha256: /^[a-f0-9]{64}$/.test(row.sha256) ? row.sha256 : '0'.repeat(64),
+            ...(readWindowsRealpathFailure(error) ? { realpath: readWindowsRealpathFailure(error) } : {}) }))
+          throw error
+        }
         completed++
         if (completed % 16 === 0 || completed === rows.length) progress?.({ phase: 'hash', completed, total: rows.length })
       }

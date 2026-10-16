@@ -1,3 +1,4 @@
+import { readExecutionGraphFailure } from '../services/opencode/host/OpenCodeV2ExecutionBinding.js'
 import { openCodeBunVersion } from '../constants/openCodeBunVersion.js'
 import { windowsExecutionChildControl } from '../services/opencode/host/windows/OpenCodeV2WindowsChildControl.js'
 import { prepareExecutionPlatformChild, readExecutionPlatformBirth } from '../services/opencode/host/OpenCodeV2ExecutionPlatform.js'
@@ -56,7 +57,7 @@ function reportStartupFailure(reason: 'timeout' | 'failed', error?: unknown): vo
   const profileGuard = executionProfileGuards.find(value => value === detail?.profileGuard)
   // Fixed stages, closed cause codes and elapsed time; no credentials or payloads.
   process.stderr.write(JSON.stringify({ event: 'opencode-v2-startup', reason, stage: startupStage, ...(cause ? { cause } : {}), ...(errno ? { errno } : {}), ...(operation ? { operation } : {}), ...(errorName ? { errorName } : {}), ...(profileGuard ? { profileGuard } : {}), ...(environmentMismatchKeys.length ? { environmentMismatchKeys } : {}),
-    elapsedMs: Math.max(startupHistory.at(-1)!.elapsedMs, Date.now() - startupStartedAt), history: startupHistory, ...(graphProgress ? { graph: graphProgress } : {}) }) + '\n')
+    elapsedMs: Math.max(startupHistory.at(-1)!.elapsedMs, Date.now() - startupStartedAt), history: startupHistory, ...(graphProgress ? { graph: graphProgress } : {}), ...(readExecutionGraphFailure(error) ? { graphFailure: readExecutionGraphFailure(error) } : {}) }) + '\n')
 }
 // A source graph can legitimately take more than 30 seconds under concurrent
 // startup. The owner still enforces its original shared initialization deadline.

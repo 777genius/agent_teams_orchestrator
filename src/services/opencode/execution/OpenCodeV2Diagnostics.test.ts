@@ -1,3 +1,4 @@
+import { runInNewContext } from 'node:vm'
 import { test, expect, spyOn } from 'bun:test'
 import { mkdir, mkdtemp, readdir, readFile, rm, lstat } from 'node:fs/promises'
 import path from 'node:path'
@@ -356,6 +357,54 @@ test('retirement diagnostics retain bounded timing and native failure without pr
     expect(rows.find(row => row.category === 'timeout').cleanup).toEqual({ elapsedMs: 22001 })
     expect(rows.find(row => row.category === 'run_control_process_identity')).toMatchObject({ native: { stage: 'process_image_path', nativeCode: 31 }, cleanup: { elapsedMs: 7 } })
     expect(rows.find(row => row.category === 'provider_operation_unknown').cleanup).toBeUndefined()
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_DATA_HOME
+    else process.env.CLAUDE_MULTIMODEL_DATA_HOME = previous
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('graph original native packet survives persistence but unknown fields are rejected', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'TEST-v2-graph-native-facts-'))
+  const previous = process.env.CLAUDE_MULTIMODEL_DATA_HOME
+  process.env.CLAUDE_MULTIMODEL_DATA_HOME = root
+  const graphFailure = { index: 3, total: 53237, readPhase: 'realpath', pathSha256: 'a'.repeat(64), contentSha256: 'b'.repeat(64),
+    realpath: { status: 1, operation: 15, win32: 0, anchorCount: 4, matchingAnchorIndex: 2 } }
+  // Execute the actual producer, not a hand-maintained approximation of its schema.
+  const source = await readFile(path.resolve(import.meta.dir, '../../../entrypoints/opencodeV2ExecutionServer.ts'), 'utf8')
+  const start = source.indexOf('function reportStartupFailure('), end = source.indexOf('\n// A source graph', start)
+  expect(start >= 0 && end > start).toBe(true)
+  const stages = ['waiting-for-prepare', ...Array.from(source.matchAll(/enterStartupStage\('([^']+)'\)/g), match => match[1]!)]
+  const history = stages.slice(0, stages.indexOf('graph-validation') + 1).map((stage, elapsedMs) => ({ stage, elapsedMs }))
+  expect(history.at(-1)?.stage).toBe('graph-validation')
+  let emitted = ''
+  const context = { Error, Date, runtimeReady: false, startupFailureReported: false, startupStage: 'graph-validation',
+    startupStartedAt: Date.now() - 41, startupHistory: history, environmentMismatchKeys: [], executionProfileGuards: [],
+    graphProgress: { phase: 'hash', completed: 0, total: graphFailure.total }, readExecutionGraphFailure: () => graphFailure,
+    process: { stderr: { write: (value: string) => { emitted += value } } },
+    original: Object.assign(new Error('DO-NOT-EMIT'), { code: 'EPERM', syscall: 'lstat' }) }
+  runInNewContext(new Bun.Transpiler({ loader: 'ts' }).transformSync(source.slice(start, end)) + "\nreportStartupFailure('failed', original)", context)
+  const startup = JSON.parse(emitted)
+  expect(startup.errno).toBe('EPERM')
+  expect(startup.history).toEqual(history)
+  expect(emitted).not.toContain('DO-NOT-EMIT')
+  try {
+    await recordOpenCodeV2ProviderFailure('execution-host-startup', new Error('execution_host_unavailable'), true, JSON.stringify(startup))
+    emitted = ''
+    context.startupFailureReported = false
+    runInNewContext(new Bun.Transpiler({ loader: 'ts' }).transformSync(source.slice(start, end)) + "\nreadExecutionGraphFailure = () => ({index:3,total:53237,readPhase:'realpath',pathSha256:'a'.repeat(64),contentSha256:'b'.repeat(64)}); reportStartupFailure('failed', original)", context)
+    await recordOpenCodeV2ProviderFailure('execution-host-startup', new Error('execution_host_unavailable'), true, emitted)
+    await recordOpenCodeV2ProviderFailure('execution-host-startup', new Error('execution_host_unavailable'), true,
+      JSON.stringify({ ...startup, graphFailure: { ...graphFailure, secret: 'DO-NOT-EMIT' } }))
+    await recordOpenCodeV2ProviderFailure('execution-host-startup', new Error('execution_host_unavailable'), true, JSON.stringify({ ...startup, constructor: 'DO-NOT-EMIT' }))
+    const rows = await Promise.all((await readdir(path.join(root, 'opencode/v2/provider-diagnostics'))).map(async name => JSON.parse(await readFile(path.join(root, 'opencode/v2/provider-diagnostics', name), 'utf8'))))
+    expect(rows.find(row => row.startup?.graphFailure?.realpath)?.startup.graphFailure).toEqual(graphFailure)
+    expect(rows.find(row => row.startup)?.startup).toMatchObject({ errno: 'EPERM', operation: 'lstat', errorName: 'Error' })
+    expect(startup.graphFailure.readPhase).toBe('realpath')
+    expect(rows.filter(row => row.startup)).toHaveLength(2)
+    expect(rows.find(row => row.startup && !row.startup.graphFailure.realpath)?.startup.graphFailure).toMatchObject({ index: 3, total: 53237, readPhase: 'realpath' })
+    expect(rows.filter(row => !row.startup)).toHaveLength(2)
+    expect(JSON.stringify(rows)).not.toContain('DO-NOT-EMIT')
   } finally {
     if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_DATA_HOME
     else process.env.CLAUDE_MULTIMODEL_DATA_HOME = previous

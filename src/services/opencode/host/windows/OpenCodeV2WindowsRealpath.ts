@@ -1,4 +1,5 @@
 /** Child-local Windows realpath fallback. Root owns selection custody and DLL delivery. */
+import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 type Callable = (...args: any[]) => any
@@ -16,11 +17,33 @@ type Encoding = { kind: 'default' } | { kind: 'buffer' } | { kind: 'encoding'; e
 type Diagnostics = Readonly<{ status: number; operation: number; win32: number }>
 type Installation = {
   readonly native: NativeLibrary
+  readonly anchors: WindowsRealpathSelection['anchors']
   readonly context: bigint
   active: boolean
   retiring: boolean
   state: 'installed' | 'retired' | 'unknown'
   closeError?: Diagnostics
+}
+
+export type WindowsRealpathFailure = Readonly<{ status: number; operation: number; win32: number; anchorCount: number; matchingAnchorIndex: number }>
+const originalRealpathFailures = new WeakMap<Error, WindowsRealpathFailure>()
+export function readWindowsRealpathFailure(error: unknown): WindowsRealpathFailure | undefined {
+  return error instanceof Error ? originalRealpathFailures.get(error) : undefined
+}
+export function projectWindowsRealpathFailure(status: number, operation: number, win32: number,
+  anchors: WindowsRealpathSelection['anchors'], routed: string): WindowsRealpathFailure | undefined {
+  if (!Number.isSafeInteger(status) || status < 1 || status > 4 || !Number.isSafeInteger(operation) || operation < 0 || operation > 25 ||
+      !Number.isSafeInteger(win32) || win32 < 0 || win32 > 0xffffffff || anchors.length > 4096) return undefined
+  const matchingAnchorIndex = anchors.findIndex(anchor => {
+    const relative = path.win32.relative(anchor.dosPath, routed)
+    return relative === '' || (relative !== '..' && !relative.startsWith('..\\') && !path.win32.isAbsolute(relative))
+  })
+  return Object.freeze({ status, operation, win32, anchorCount: anchors.length, matchingAnchorIndex })
+}
+function retainNativeRealpathFailure(error: unknown, install: Installation, routed: string, status: number, bytes: Buffer) {
+  if (!(error instanceof Error)) return
+  const facts = errorFacts(bytes), projected = projectWindowsRealpathFailure(status, facts.operation, facts.win32, install.anchors, routed)
+  if (projected) originalRealpathFailures.set(error, projected)
 }
 
 const MAX_CHARS = 32767
@@ -133,6 +156,7 @@ function resolveNative(
   input: unknown,
   invocationCwd: string | undefined,
   encoding: Encoding,
+  originalError: unknown,
 ): { handled: true; value: string | Buffer } | { handled: false } {
   if (!install.active || encoding.kind === 'unsupported') return { handled: false }
   const text = inputText(input)
@@ -153,7 +177,7 @@ function resolveNative(
       ffi.ptr(countBuffer),
       ffi.ptr(errorBuffer),
     )
-    if (status !== 0) return { handled: false }
+    if (status !== 0) { retainNativeRealpathFailure(originalError, install, routed, status, errorBuffer); return { handled: false } }
     const count = countBuffer.readUInt32LE(0)
     if (!validBoundedUtf16(outputBuffer, count)) return { handled: false }
     return { handled: true, value: encode(outputBuffer.subarray(0, count * 2).toString('utf16le'), encoding) }
@@ -170,7 +194,7 @@ function fallback(
 ): { handled: true; value: string | Buffer } | { handled: false } {
   if (!active?.active || !isPermissionError(originalError)) return { handled: false }
   const encoding = captureEncoding(callbackStyle && args.length < 3 ? undefined : args[1])
-  return resolveNative(active, args[0], invocationCwd, encoding)
+  return resolveNative(active, args[0], invocationCwd, encoding, originalError)
 }
 
 function callbackFallback(args: readonly unknown[], invocationCwd: string | undefined): Callable {
@@ -334,7 +358,7 @@ export function installWindowsRealpathFallback(selection: WindowsRealpathSelecti
       try { closeNative(native.library, native.context) } catch { /* retain */ }
       throw error
     }
-    active = { native: native.library, context: native.context, active: true, retiring: false, state: 'installed' }
+    active = { anchors: selection.anchors, native: native.library, context: native.context, active: true, retiring: false, state: 'installed' }
     return Object.freeze({
       uninstall(): void {
         const current = active
