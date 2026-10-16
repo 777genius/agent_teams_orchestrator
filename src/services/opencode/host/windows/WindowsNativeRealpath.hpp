@@ -7,6 +7,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <winternl.h>
 
 #include <algorithm>
 #include <array>
@@ -422,8 +423,11 @@ struct FileIdentity {
   std::wstring ntPath;
 };
 
+// Query buffers are not zero-filled: only the `count` characters written by
+// the successful call are read, and each file resolution issues dozens of
+// these 64 KiB queries.
 inline bool queryNormalizedNt(HANDLE handle, std::wstring& result, DWORD& win32) {
-  std::array<wchar_t, kFixedQueryCapacity> buffer{};
+  std::array<wchar_t, kFixedQueryCapacity> buffer;
   SetLastError(ERROR_SUCCESS);
   const DWORD count = GetFinalPathNameByHandleW(
       handle, buffer.data(), static_cast<DWORD>(buffer.size()), VOLUME_NAME_NT);
@@ -436,7 +440,7 @@ inline bool queryNormalizedNt(HANDLE handle, std::wstring& result, DWORD& win32)
 
 inline bool queryNormalizedDos(HANDLE handle, std::wstring& result, DWORD& win32,
                                DWORD& countOut) {
-  std::array<wchar_t, kFixedQueryCapacity> buffer{};
+  std::array<wchar_t, kFixedQueryCapacity> buffer;
   SetLastError(ERROR_SUCCESS);
   const DWORD count = GetFinalPathNameByHandleW(
       handle, buffer.data(), static_cast<DWORD>(buffer.size()), VOLUME_NAME_DOS);
@@ -504,6 +508,125 @@ inline bool optionalCanonicalDosMatches(HANDLE handle, std::wstring_view expecte
   return false;
 }
 
+using NtCreateFileFunction = NTSTATUS(NTAPI*)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES,
+                                              PIO_STATUS_BLOCK, PLARGE_INTEGER, ULONG, ULONG,
+                                              ULONG, ULONG, PVOID, ULONG);
+using NtStatusErrorFunction = ULONG(NTAPI*)(NTSTATUS);
+
+struct NativeFileApi {
+  NtCreateFileFunction create = nullptr;
+  NtStatusErrorFunction statusError = nullptr;
+};
+
+inline const NativeFileApi& nativeFileApi() noexcept {
+  static const NativeFileApi api = []() noexcept {
+    NativeFileApi value;
+    const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (ntdll != nullptr) {
+      value.create = reinterpret_cast<NtCreateFileFunction>(GetProcAddress(ntdll, "NtCreateFile"));
+      value.statusError = reinterpret_cast<NtStatusErrorFunction>(
+          GetProcAddress(ntdll, "RtlNtStatusToDosError"));
+    }
+    return value;
+  }();
+  return api;
+}
+
+constexpr ULONG kObjectCaseInsensitive = 0x00000040;  // OBJ_CASE_INSENSITIVE, as CreateFileW
+constexpr ULONG kFileOpen = 0x00000001;               // FILE_OPEN, as OPEN_EXISTING
+constexpr ULONG kSynchronousNonAlert = 0x00000020;    // FILE_SYNCHRONOUS_IO_NONALERT
+constexpr ULONG kOpenForBackupIntent = 0x00004000;    // FILE_FLAG_BACKUP_SEMANTICS
+constexpr ULONG kOpenReparsePoint = 0x00200000;       // FILE_FLAG_OPEN_REPARSE_POINT
+
+// Opens one already validated component relative to the directory HANDLE
+// opened and identity-checked just before it. The access, share, disposition
+// and options equal the former CreateFileW call. FILE_OPEN_REPARSE_POINT now
+// applies to every component because each one is the final name of its own
+// open, so no intermediate reparse point is ever traversed by the kernel.
+inline bool openRelativeComponent(HANDLE parent, const std::wstring& component, DWORD share,
+                                  Operation stage, Handle& result, Failure& failureOut) noexcept {
+  const NativeFileApi& api = nativeFileApi();
+  if (api.create == nullptr || api.statusError == nullptr)
+    return failureOut = nativeFailure(stage, ERROR_PROC_NOT_FOUND), false;
+  if (parent == nullptr || component.empty() || component.size() > kMaxStringChars)
+    return failureOut = invalid(stage), false;
+  UNICODE_STRING name{};
+  name.Buffer = const_cast<wchar_t*>(component.data());
+  name.Length = static_cast<USHORT>(component.size() * sizeof(wchar_t));
+  name.MaximumLength = name.Length;
+  OBJECT_ATTRIBUTES attributes{};
+  attributes.Length = sizeof(attributes);
+  attributes.RootDirectory = parent;
+  attributes.ObjectName = &name;
+  attributes.Attributes = kObjectCaseInsensitive;
+  IO_STATUS_BLOCK completion{};
+  HANDLE raw = nullptr;
+  const NTSTATUS status = api.create(
+      &raw, FILE_READ_ATTRIBUTES | SYNCHRONIZE, &attributes, &completion, nullptr, 0, share,
+      kFileOpen, kOpenForBackupIntent | kOpenReparsePoint | kSynchronousNonAlert, nullptr, 0);
+  Handle handle(raw);
+  if (status != 0 || completion.Status != 0 || !handle) {
+    const NTSTATUS native = status != 0 ? status : completion.Status;
+    const ULONG code = native == 0 ? ERROR_GEN_FAILURE : api.statusError(native);
+    failureOut = failure(REJECTED, stage,
+                         code == ERROR_SUCCESS ? ERROR_GEN_FAILURE : static_cast<DWORD>(code));
+    return false;
+  }
+  result = std::move(handle);
+  return true;
+}
+
+// Every opened object keeps the former per-object checks: disk file, no
+// device/reparse attribute or tag, FileID and normalized NT path capture,
+// directory requirement and the exact expected component name.
+inline bool admitOpenedObject(Handle handle, bool requireDirectory,
+                              std::wstring_view expectedComponent, Operation objectStage,
+                              Operation componentStage, OpenedPath& opened,
+                              Failure& failureOut) {
+  FileIdentity identity;
+  if (!queryFileIdentity(handle.get(), identity, failureOut, objectStage))
+    return false;
+  if (requireDirectory && !identity.directory)
+    return failureOut = invalid(objectStage), false;
+  if (!expectedComponent.empty() &&
+      !equalOrdinal(lastNtComponent(identity.ntPath), expectedComponent, true))
+    return failureOut = denied(componentStage), false;
+
+  opened.handles.emplace_back(std::move(handle));
+  Identity retained;
+  retained.ntPath = std::move(identity.ntPath);
+  retained.volumeSerial = identity.volumeSerial;
+  std::memcpy(retained.fileId, identity.fileId, sizeof(retained.fileId));
+  retained.directory = identity.directory;
+  opened.identities.emplace_back(std::move(retained));
+  return true;
+}
+
+// Opens each component relative to the held HANDLE of its parent. Only the
+// held chain is followed, so a later component cannot be re-routed through a
+// changed ancestor name. `parent` must remain open until this call returns.
+inline bool openHeldRelativeChain(HANDLE parent, const std::vector<std::wstring>& components,
+                                  bool finalDirectory, DWORD finalShare, Operation objectStage,
+                                  Operation componentStage, OpenedPath& opened,
+                                  Failure& failureOut) {
+  if (components.empty() || components.size() > kMaxHeldHandles ||
+      opened.handles.size() + components.size() > kMaxHeldHandles)
+    return failureOut = invalid(objectStage), false;
+  for (size_t index = 0; index < components.size(); ++index) {
+    const bool object = index + 1 == components.size();
+    const DWORD share = object ? finalShare : (FILE_SHARE_READ | FILE_SHARE_WRITE);
+    const Operation stage = object ? objectStage : componentStage;
+    Handle handle;
+    if (!openRelativeComponent(parent, components[index], share, stage, handle, failureOut))
+      return false;
+    if (!admitOpenedObject(std::move(handle), !object || finalDirectory, components[index],
+                           stage, componentStage, opened, failureOut))
+      return false;
+    parent = opened.handles.back().get();
+  }
+  return true;
+}
+
 inline bool openCheckedPath(std::wstring_view path, bool finalDirectory, DWORD finalShare,
                             Operation openStage, Operation componentStage,
                             OpenedPath& opened, Failure& failureOut) {
@@ -520,47 +643,28 @@ inline bool openCheckedPath(std::wstring_view path, bool finalDirectory, DWORD f
       opened.handles.size() + objectCount > kMaxHeldHandles)
     return failureOut = invalid(openStage), false;
 
-  std::wstring current = root;
-  for (size_t index = 0; index < objectCount; ++index) {
-    if (index != 0) {
-      if (current.back() != L'\\')
-        current.push_back(L'\\');
-      current.append(parts[index - 1]);
-    }
-    const bool object = index + 1 == objectCount;
-    const bool requireDirectory = !object || finalDirectory;
-    const DWORD share = object ? finalShare : (FILE_SHARE_READ | FILE_SHARE_WRITE);
-    const DWORD flags = FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT;
-    const std::wstring kernelPath = L"\\\\?\\" + current;
-    HANDLE raw = CreateFileW(kernelPath.c_str(), FILE_READ_ATTRIBUTES, share, nullptr,
-                             OPEN_EXISTING, flags, nullptr);
-    if (raw == INVALID_HANDLE_VALUE) {
-      const DWORD code = GetLastError();
-      failureOut = failure(REJECTED, object ? openStage : componentStage, code);
-      return false;
-    }
-    Handle handle(raw);
-    FileIdentity identity;
-    if (!queryFileIdentity(handle.get(), identity, failureOut,
-                           object ? openStage : componentStage))
-      return false;
-    if (requireDirectory && !identity.directory)
-      return failureOut = invalid(object ? openStage : componentStage), false;
-
-    const std::wstring expectedComponent = index == 0 ? std::wstring() : parts[index - 1];
-    if (!expectedComponent.empty() &&
-        !equalOrdinal(lastNtComponent(identity.ntPath), expectedComponent, true))
-      return failureOut = denied(componentStage), false;
-
-    opened.handles.emplace_back(std::move(handle));
-    Identity retained;
-    retained.ntPath = std::move(identity.ntPath);
-    retained.volumeSerial = identity.volumeSerial;
-    std::memcpy(retained.fileId, identity.fileId, sizeof(retained.fileId));
-    retained.directory = identity.directory;
-    opened.identities.emplace_back(std::move(retained));
+  // Only the drive root is opened by its DOS name. Each later component is
+  // opened relative to the component HANDLE opened before it in this chain,
+  // instead of re-parsing the whole prefix from the drive root again.
+  const bool rootIsObject = objectCount == 1;
+  const DWORD rootShare = rootIsObject ? finalShare : (FILE_SHARE_READ | FILE_SHARE_WRITE);
+  const std::wstring kernelRoot = L"\\\\?\\" + root;
+  HANDLE raw = CreateFileW(kernelRoot.c_str(), FILE_READ_ATTRIBUTES, rootShare, nullptr,
+                           OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                           nullptr);
+  if (raw == INVALID_HANDLE_VALUE) {
+    const DWORD code = GetLastError();
+    failureOut = failure(REJECTED, rootIsObject ? openStage : componentStage, code);
+    return false;
   }
-  return true;
+  if (!admitOpenedObject(Handle(raw), !rootIsObject || finalDirectory, std::wstring_view(),
+                         rootIsObject ? openStage : componentStage, componentStage, opened,
+                         failureOut))
+    return false;
+  if (rootIsObject)
+    return true;
+  return openHeldRelativeChain(opened.handles.back().get(), parts, finalDirectory, finalShare,
+                               openStage, componentStage, opened, failureOut);
 }
 
 inline bool processIdentityMatches(uint32_t expectedPid, uint64_t expectedCreation,
@@ -778,6 +882,116 @@ inline std::shared_ptr<Context> lookupContext(uint64_t id) {
   return found == contextTable().end() ? std::shared_ptr<Context>() : found->second;
 }
 
+// Longest held anchor whose canonical DOS path is a strict component prefix
+// of the routed input. The prefix is never opened by name on this path, so it
+// must be spelled exactly as the anchor that revalidateAnchor reopens; only
+// the drive letter is case-insensitive. Any other spelling, drive-root
+// anchors and the anchor itself use the complete root walk below.
+inline const HeldAnchor* lexicalAnchor(const Context& context,
+                                       std::wstring_view routed) noexcept {
+  const HeldAnchor* selected = nullptr;
+  for (const HeldAnchor& anchor : context.anchors) {
+    const std::wstring_view prefix = anchor.dosPath;
+    if (prefix.size() <= 3 || routed.size() <= prefix.size() + 1 ||
+        routed[prefix.size()] != L'\\' ||
+        compareOrdinal(routed.substr(0, 1), prefix.substr(0, 1), true) != CSTR_EQUAL ||
+        compareOrdinal(routed.substr(1, prefix.size() - 1), prefix.substr(1), false) != CSTR_EQUAL)
+      continue;
+    if (selected == nullptr || prefix.size() > selected->dosPath.size())
+      selected = &anchor;
+  }
+  return selected;
+}
+
+// Resolves an input inside `anchor` from the anchor's held HANDLE instead of
+// opening the input and then its canonical spelling from the drive root.
+// The authorizing anchor's complete held/reopened chain is revalidated before
+// and after; the target components keep the per-object no-reparse, identity
+// and name checks, and the existing DOS-denied and target-identity gates.
+// Returns false only when the NT longest-prefix authorization would select a
+// different anchor; the caller then uses the complete root walk unchanged.
+inline bool resolveFromHeldAnchor(const Context& context, const HeldAnchor& anchor,
+                                  const std::wstring& routedPath, wchar_t* output,
+                                  uint32_t outputCapacity, uint32_t* outChars, ErrorV1* outError,
+                                  int32_t& status) {
+  const auto finish = [&](const Failure& value) {
+    status = finishFailure(value, outError);
+    return true;
+  };
+  Failure failureOut;
+  if (!revalidateAnchor(anchor, failureOut))
+    return finish(failureOut);
+
+  std::vector<std::wstring> components;
+  const std::wstring_view rest = std::wstring_view(routedPath).substr(anchor.dosPath.size() + 1);
+  for (size_t begin = 0, index = 0; index <= rest.size(); ++index) {
+    if (index != rest.size() && rest[index] != L'\\')
+      continue;
+    if (index == begin)
+      return finish(invalid(OperationResolveInput));
+    components.emplace_back(rest.substr(begin, index - begin));
+    begin = index + 1;
+  }
+
+  OpenedPath inputPath;
+  if (!openHeldRelativeChain(anchor.handles.back().get(), components, false,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                             OperationResolveTarget, OperationResolveInputAncestor, inputPath,
+                             failureOut))
+    return finish(failureOut);
+  const Identity heldTarget = inputPath.object();
+
+  std::wstring dosName;
+  DWORD dosWin32 = ERROR_SUCCESS;
+  DWORD dosCount = 0;
+  if (queryNormalizedDos(inputPath.handles.back().get(), dosName, dosWin32, dosCount))
+    return finish(failure(NOT_APPLICABLE, OperationResolveDosQuery, ERROR_SUCCESS));
+  if (dosCount != 0)
+    return finish(nativeFailure(OperationResolveDosQuery, ERROR_INSUFFICIENT_BUFFER));
+  if (dosWin32 != ERROR_ACCESS_DENIED)
+    return finish(failure(NOT_APPLICABLE, OperationResolveDosFallback, dosWin32));
+
+  const std::wstring& targetNt = heldTarget.ntPath;
+  const HeldAnchor* selected = nullptr;
+  for (const HeldAnchor& candidate : context.anchors) {
+    if (candidate.volumeSerial != heldTarget.volumeSerial ||
+        !ntPrefixContains(targetNt, candidate.ntPath))
+      continue;
+    if (selected == nullptr || candidate.ntPath.size() > selected->ntPath.size())
+      selected = &candidate;
+  }
+  if (selected == nullptr)
+    return finish(denied(OperationResolveAnchorSelection));
+  if (selected != &anchor)
+    return false;
+
+  const std::wstring suffix = targetNt.substr(anchor.ntPath.size());
+  const std::wstring candidatePath = joinDos(anchor.dosPath, suffix);
+  if (candidatePath.size() > kMaxStringChars || !validateCanonicalInput(candidatePath) ||
+      !equalOrdinal(candidatePath, routedPath, true))
+    return finish(invalid(OperationResolveCandidateJoin));
+  const size_t candidateChars = candidatePath.size();
+  if (candidateChars + 1 > outputCapacity)
+    return finish(failure(REJECTED, OperationResolveOutput, ERROR_INSUFFICIENT_BUFFER));
+
+  FileIdentity refreshedTarget;
+  if (!queryFileIdentity(inputPath.handles.back().get(), refreshedTarget, failureOut,
+                         OperationResolveTargetIdentity))
+    return finish(failureOut);
+  if (refreshedTarget.volumeSerial != heldTarget.volumeSerial ||
+      !sameFileId(refreshedTarget.fileId, heldTarget.fileId) ||
+      !equalOrdinal(refreshedTarget.ntPath, heldTarget.ntPath, false))
+    return finish(denied(OperationResolveTargetIdentity));
+  if (!revalidateAnchor(anchor, failureOut))
+    return finish(failureOut);
+
+  std::copy(candidatePath.begin(), candidatePath.end(), output);
+  output[candidateChars] = L'\0';
+  *outChars = static_cast<uint32_t>(candidateChars);
+  status = OK;
+  return true;
+}
+
 inline int32_t resolveImpl(uint64_t contextId, const wchar_t* input, uint32_t inputChars,
                            wchar_t* output, uint32_t outputCapacity, uint32_t* outChars,
                            ErrorV1* outError) {
@@ -807,7 +1021,7 @@ inline int32_t resolveImpl(uint64_t contextId, const wchar_t* input, uint32_t in
   const std::wstring rawInput(input, inputChars);
   if (!validateRawPath(rawInput))
     return finishFailure(invalid(OperationResolveInput), outError);
-  std::array<wchar_t, kMaxOutputChars> routed{};
+  std::array<wchar_t, kMaxOutputChars> routed;  // Only routedCount characters are read.
   const DWORD routedCount = GetFullPathNameW(
       rawInput.c_str(), static_cast<DWORD>(routed.size()), routed.data(), nullptr);
   if (routedCount == 0)
@@ -817,6 +1031,13 @@ inline int32_t resolveImpl(uint64_t contextId, const wchar_t* input, uint32_t in
   const std::wstring routedPath(routed.data(), routedCount);
   if (!validateCanonicalInput(routedPath))
     return finishFailure(invalid(OperationResolveInput), outError);
+
+  if (const HeldAnchor* lexical = lexicalAnchor(*context, routedPath)) {
+    int32_t status = NATIVE_FAILURE;
+    if (resolveFromHeldAnchor(*context, *lexical, routedPath, output, outputCapacity, outChars,
+                              outError, status))
+      return status;
+  }
 
   OpenedPath inputPath;
   if (!openCheckedPath(routedPath, false, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
