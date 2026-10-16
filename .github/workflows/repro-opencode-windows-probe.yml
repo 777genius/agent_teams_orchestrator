@@ -90,6 +90,7 @@ jobs:
           npm install --prefix "$env:RUNNER_TEMP/oc" --no-audit --no-fund opencode-ai@1.19.2
           node scripts/repro/opencode-windows-calibrate.mjs "$env:RUNNER_TEMP/oc/node_modules/.bin/opencode.cmd" "$env:RUNNER_TEMP/oc/node_modules/opencode-ai/bin/opencode.exe"
   ffi-arm:
+    if: false
     strategy:
       fail-fast: false
       matrix:
@@ -110,3 +111,38 @@ jobs:
           Expand-Archive a.zip arm
           & .\arm\bun-windows-aarch64\bun.exe --version
           & .\arm\bun-windows-aarch64\bun.exe scripts/repro/ffi-probe.ts
+  verify-published:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - name: Install OpenCode like a user and stage published runtimes in the dev cache layout
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          npm install -g --no-audit --no-fund opencode-ai@latest
+          if ($LASTEXITCODE -ne 0) { throw 'global npm install failed' }
+          $shim = Join-Path (npm prefix -g) 'opencode.cmd'
+          if (-not (Test-Path $shim)) { throw "missing $shim" }
+          & $shim --version
+          "SHIM=$shim" >> $env:GITHUB_ENV
+          foreach ($v in @('0.0.120', '0.0.123')) {
+            $tmp = Join-Path $env:RUNNER_TEMP "rt-$v"; New-Item -ItemType Directory $tmp | Out-Null
+            gh release download "runtime-v$v" --repo 777genius/agent_teams_orchestrator_binaries --pattern "agent-teams-runtime-win32-x64-v$v.zip" --pattern "agent-teams-runtime-SHA256SUMS-v$v" --dir $tmp
+            if ($LASTEXITCODE -ne 0) { throw "download $v failed" }
+            $zip = "$tmp/agent-teams-runtime-win32-x64-v$v.zip"
+            $line = Get-Content "$tmp/agent-teams-runtime-SHA256SUMS-v$v" | Where-Object { $_ -match "win32-x64-v$v.zip$" }
+            if ((Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant() -ne ($line -split '\s+')[0]) { throw "checksum $v" }
+            $payload = Join-Path $env:USERPROFILE ".agent-teams/runtime-cache/$v/win32-x64/payload-v1"
+            Expand-Archive $zip "$tmp/x"
+            $exe = @(Get-ChildItem "$tmp/x" -Filter claude-multimodel.exe -Recurse)[0]
+            New-Item -ItemType Directory -Force $payload | Out-Null
+            Copy-Item -Recurse "$($exe.Directory.FullName)/*" $payload
+            Get-ChildItem $payload | Select-Object Name
+          }
+      - name: Exact user command, published 0.0.120 vs 0.0.123, idle and under contention
+        run: node scripts/repro/verify-published.mjs "$env:SHIM" 0.0.120 0.0.123
