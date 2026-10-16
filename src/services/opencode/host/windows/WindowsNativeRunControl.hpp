@@ -557,10 +557,28 @@ struct WindowsNativeRunControl {
   }
 
   JsonObject clientRequest(const std::string &payloadBytes, std::uint64_t deadline) {
+    require(payloadBytes.size() <= MAX_FRAME_BYTES && runControlStrictUtf8(payloadBytes),
+            "run_control_frame_invalid");
+    auto payload = JsonObject::Parse(wide(payloadBytes));
+    bool stop = false;
+    if (payload.HasKey(L"request") && payload.GetNamedValue(L"request").ValueType() == JsonValueType::Object) {
+      const auto request = payload.GetNamedObject(L"request");
+      stop = request.Size() == 1 && request.HasKey(L"operation") &&
+          request.GetNamedValue(L"operation").ValueType() == JsonValueType::String &&
+          request.GetNamedString(L"operation") == L"stop";
+    }
+    std::uint64_t originalWallDeadline = 0;
+    if (stop) {
+      const double value = payload.GetNamedNumber(L"deadline");
+      require(value > 0 && value <= 9007199254740991.0 &&
+                  value == static_cast<double>(static_cast<std::uint64_t>(value)),
+              "run_control_invalid");
+      originalWallDeadline = static_cast<std::uint64_t>(value);
+    }
     const DWORD available = runControlRemaining(deadline);
     require(available > 1, "run_deadline_expired");
     const DWORD replyAllowance = std::min<DWORD>(100, std::max<DWORD>(1, available / 8));
-    const DWORD cleanupAllowance = std::min<DWORD>(CANCEL_DRAIN_MS, available / 4);
+    const DWORD cleanupAllowance = std::min<DWORD>(stop ? 1000 : CANCEL_DRAIN_MS, available / 4);
     const std::uint64_t cleanupDeadline = deadline - replyAllowance;
     const std::uint64_t ioDeadline = cleanupDeadline - cleanupAllowance;
     const auto remaining = [&] {
@@ -578,10 +596,26 @@ struct WindowsNativeRunControl {
     const auto connected = connect(connectInput, ioDeadline);
     const auto connection = runControlConnectionFor(connected);
     try {
-      const auto mac = runControlHmacHex(runState_->challenge(), payloadBytes);
+      std::string signedPayload = payloadBytes;
+      if (stop) {
+        FILETIME wallTime{};
+        GetSystemTimeAsFileTime(&wallTime);
+        const auto wallNow = filetime(wallTime) / 10000 - 11644473600000ULL;
+        const DWORD activeRemaining = remaining();
+        require(activeRemaining > replyAllowance, "run_deadline_expired");
+        // Only shrink the caller's original deadline, leaving the existing
+        // response-flush margin inside the active read window. Sign it AFTER
+        // endpoint/connect work consumed its portion of the same30s budget.
+        num(payload, L"deadline", std::min<std::uint64_t>(originalWallDeadline,
+            wallNow + activeRemaining - replyAllowance));
+        signedPayload = runControlCanonicalJson(payload);
+        require(signedPayload.size() <= MAX_FRAME_BYTES && runControlStrictUtf8(signedPayload),
+                "run_control_frame_invalid");
+      }
+      const auto mac = runControlHmacHex(runState_->challenge(), signedPayload);
       JsonObject frame;
-      str(frame, L"payloadBytesBase64", wide(base64(std::vector<BYTE>(payloadBytes.begin(),
-                                                                     payloadBytes.end()))));
+      str(frame, L"payloadBytesBase64", wide(base64(std::vector<BYTE>(signedPayload.begin(),
+                                                                     signedPayload.end()))));
       str(frame, L"mac", mac);
       const std::string frameBytes = narrow(std::wstring(frame.Stringify())) + "\n";
       runControlWriteFrame(*connection, frameBytes, remaining(), cleanupDeadline);

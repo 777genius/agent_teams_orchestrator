@@ -447,6 +447,40 @@ test('Windows Stop clips physical work and finalization to the same original 29s
   }
 })
 
+test('Windows authenticated Stop consumes its original active cutoff and retries never refresh it', async () => {
+  for (const mode of ['within', 'late', 'expired'] as const) {
+    const gate = acquisitionGate(), deadlines: (number | undefined)[] = []
+    let now = Date.now(), origin = now, attempted = 0
+    const f = await fixture({ windowsAcquisitions: true, leaseClose: deadline => { deadlines.push(deadline) },
+      nativeRetirement: async () => { attempted++; await gate.promise } })
+    let clock: ReturnType<typeof spyOn> | undefined, trusted: ReturnType<typeof spyOn> | undefined
+    let bounded: ReturnType<typeof spyOn> | undefined
+    try {
+      await f.owner.ready(); origin = Date.now(); now = origin + 4000 // Original client/native preflight already consumed4s.
+      clock = spyOn(Date, 'now').mockImplementation(() => now)
+      bounded = spyOn(boundedFetch, 'boundOpenCodeRead').mockImplementation(function<T>(work: Promise<T>) { return work })
+      // Trusted TEST port only; production receipts still require their private brand.
+      trusted = spyOn(executionLifecycle, 'isExecutionCleanupReceipt').mockReturnValue(true)
+      const cutoff = origin + (mode === 'expired' ? 3000 : 28_800)
+      const first = f.owner.execute({ operation: 'stop' }, cutoff)
+      await waitForTestAcquisitions(() => attempted === 1)
+      expect(deadlines).toEqual([cutoff - 2000]) // Same active cutoff, not now+29 or now+27.
+      const original = f.owner.stop()
+      now += 1000
+      const retry = f.owner.execute({ operation: 'stop' }, now + 30_000)
+      expect(f.owner.stop(now + 30_000)).toBe(original)
+      now = mode === 'within' ? origin + 25_000 : Math.max(now, cutoff - 2000)
+      gate.release()
+      const stopped = await first
+      expect(stopped.state).toBe(mode === 'within' ? 'stopped' : 'cleanup_unknown')
+      expect(await retry).toBe(stopped)
+      expect(f.counters.closed).toBe(1); expect(attempted).toBe(1)
+    } finally {
+      gate.release(); trusted?.mockRestore(); bounded?.mockRestore(); clock?.mockRestore(); await f.close()
+    }
+  }
+})
+
 test('Windows cohort native retirement begins in parallel with original deadlines and no replay after failure', async () => {
   const cuts = Array.from({ length: 3 }, acquisitionGate), started: string[] = [], deadlines: (number | undefined)[] = []
   let active = 0, maximum = 0

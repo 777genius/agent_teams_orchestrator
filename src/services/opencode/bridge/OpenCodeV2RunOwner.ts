@@ -315,7 +315,7 @@ export class OpenCodeV2RunOwner {
   }
   async execute(request: RunControlRequest, deadline: number): Promise<RunControlResult> {
     request = parseRunControlRequest(structuredClone(request))
-    if (request.operation === 'stop') return this.stop()
+    if (request.operation === 'stop') return this.stop(deadline)
     if (request.operation === 'status') return { kind: 'status', ...(this.plan.qualification ? { qualification: this.plan.qualification } : {}), state: this.state, deadline: this.plan.deadline, members: this.statuses() }
     executionAssert(this.state === 'active' && Date.now() < this.plan.deadline && deadline > Date.now() &&
       deadline <= this.plan.deadline && deadline - Date.now() <= 30_000, 'run_not_active')
@@ -453,14 +453,19 @@ export class OpenCodeV2RunOwner {
       return { kind: 'observe', admission, turn }
     } finally { await client.dispose() }
   }
-  stop(): Promise<Extract<RunControlResult, { kind: 'stop' }>> {
+  stop(deadline?: number): Promise<Extract<RunControlResult, { kind: 'stop' }>> {
     if (this.stopping) return this.stopping
+    executionAssert(!this.deferredWindowsControllers || deadline === undefined ||
+      Number.isSafeInteger(deadline) && deadline > 0, 'run_control_invalid')
     this.state = 'stopping'; clearTimeout(this.timer)
     this.cleanupGraceDeadline = Date.now() + 60_000
-    this.stopping = this.performStop(); return this.stopping
+    this.stopping = this.performStop(deadline); return this.stopping
   }
-  private async performStop(): Promise<Extract<RunControlResult, { kind: 'stop' }>> {
-    const cleanupDeadline = Date.now() + 29_000
+  private async performStop(deadline?: number): Promise<Extract<RunControlResult, { kind: 'stop' }>> {
+    // The authenticated Windows cutoff already spent time in client/native
+    // preflight. First Stop owns it; neither delivery nor retries restart29s.
+    const cleanupDeadline = Math.min(Date.now() + 29_000,
+      this.deferredWindowsControllers ? deadline ?? Infinity : Infinity)
     const remaining = (maximum: number) => Math.max(1, Math.min(maximum, cleanupDeadline - Date.now()))
     let durable = true
     try {

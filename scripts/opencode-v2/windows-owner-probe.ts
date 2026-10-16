@@ -154,6 +154,7 @@ const snapshot = async (root: string): Promise<unknown[]> => {
   return rows
 }
 type RouterExpectation = 'v1' | 'veto' | 'owner'
+let heldRoutePid: number | undefined
 const route = async (dataRoot: string, runId: string, expected: RouterExpectation,
   selection: 'v1' | 'unsupported' | 'missing' = 'v1', ownerRecord?: unknown, heldRead = false, statusBatch = 0) => {
   await closeFixtureWriters()
@@ -193,7 +194,10 @@ const route = async (dataRoot: string, runId: string, expected: RouterExpectatio
       phase='same_client_after_timeout';
       const recovered=await requestOpenCodeV2Run(owner,{operation:'status'},30000);
       assert.equal(recovered.kind,'status');assert.equal(recovered.state,'stopped');
-      console.log(JSON.stringify({expected,selection,heldReadRetired:true,sameClientRecovered:true}));process.exit(0);
+      phase='stop_active_cutoff';const stopStarted=Date.now();
+      const stop=requestOpenCodeV2Run(owner,{operation:'stop'},30000),stopSubmitted=Date.now();
+      await assert.rejects(stop,error=>error instanceof Error&&error.message==='TEST_stop_transport_observed');
+      console.log(JSON.stringify({expected,selection,heldReadRetired:true,sameClientRecovered:true,stopStarted,stopSubmitted}));process.exit(0);
     }
     process.env.CLAUDE_MULTIMODEL_DATA_HOME=root;
     const {executeSelectedOpenCodeBridgeCommandEnvelope:execute}=await import(${JSON.stringify(import.meta.resolve('../../src/services/opencode/bridge/OpenCodeV2TeamBridge.ts'))});
@@ -209,6 +213,7 @@ const route = async (dataRoot: string, runId: string, expected: RouterExpectatio
     console.log(JSON.stringify({expected,selection,probes,legacy}));process.exit(0);
     }catch(error){console.log(JSON.stringify({...diagnostic,phase,errorCode:safeCode(error?.message)}));process.exit(1)}`
   const child = Bun.spawn([process.execPath, '-e', script], { cwd: requestedRoot, stdout: 'pipe', stderr: 'ignore' })
+  if (heldRead) heldRoutePid = child.pid
   const [output, code] = await Promise.all([new Response(child.stdout).text(), child.exited])
   if (code !== 0) facts.routerFailure = executionRecord(JSON.parse(output))
   assert.equal(code, 0, 'TEST_real_windows_discovery_route_failed')
@@ -693,12 +698,29 @@ try {
   let statusRequests = 0
   let withholdNextStatus = false
   let heldConnection: string | undefined
+  let stopTransportDeadline: number | undefined
   const respondToStatus = (event: unknown) => {
     const work = (async () => {
       const envelope = executionRecord(event), payload = executionRecord(envelope.payload)
       assert.equal(payload.protocol, 1)
       assert.deepEqual(payload.binding, binding)
-      assert.equal(executionRecord(payload.request).operation, 'status')
+      const operation = executionRecord(payload.request).operation
+      if (operation === 'stop') {
+        assert.deepEqual(payload.request, { operation: 'stop' })
+        assert.ok(typeof payload.nonce === 'string')
+        assert.match(payload.nonce, /^[a-f0-9]{64}$/)
+        assert.equal(payload.endpoint, executionHash(published))
+        assert.equal(executionRecord(payload.client).pid, heldRoutePid)
+        assert.ok(Number.isSafeInteger(payload.deadline) && Number(payload.deadline) > Date.now())
+        stopTransportDeadline = Number(payload.deadline)
+        // A fixed refusal proves the authenticated response and nonce echo;
+        // this transport fixture never invents a physical Stop receipt.
+        await request('runStateRespond', { stateId, directory, connection: envelope.connection,
+          timeoutMs: Math.max(1, Math.min(5000, stopTransportDeadline - Date.now())),
+          response: { nonce: payload.nonce, endpoint: payload.endpoint, error: 'TEST_stop_transport_observed' } })
+        return
+      }
+      assert.equal(operation, 'status')
       statusRequests++
       if (withholdNextStatus) {
         withholdNextStatus = false
@@ -738,6 +760,14 @@ try {
     assert.equal(withholdNextStatus, false)
     assert.equal(heldConnection, undefined)
     facts.authenticatedReadTimeoutRetiresAndSameClientRecovers = true
+    assert.ok(stopTransportDeadline !== undefined && Number.isSafeInteger(recovered.stopStarted) && Number.isSafeInteger(recovered.stopSubmitted))
+    const originalUpper = Math.min(Number(recovered.stopSubmitted) + 30_000, Number(executionRecord(published).deadline) + 30_000)
+    // Native reserves1s drain +100ms reply +100ms owner flush. Allow100ms
+    // wall/monotonic quantization; preflight may only shrink this further.
+    assert.ok(stopTransportDeadline <= originalUpper - 1100)
+    assert.ok(stopTransportDeadline > Number(recovered.stopStarted))
+    facts.authenticatedStopActiveCutoff = { deadlineShrunk: true, originalClientAndEndpointMatched: true,
+      nonceEchoValidated: true, physicalReceiptInvented: false }
   } finally {
     broker.events.off('runControlRequest', respondToStatus)
     await Promise.all(statusResponses)
