@@ -14,8 +14,14 @@ test.skipIf(!kernel32)('kernel32 table and birth match the PowerShell StartTime 
   // Durable registries recorded through processKill must keep comparing equal.
   const birth = native.birth(process.pid)
   expect(birth).not.toBeNull()
-  expect(birth).toBe(await readProcessStartTimeMs(process.pid, 'win32', 15_000))
-}, 30_000)
+  // The PowerShell oracle itself can exceed its budget on a loaded runner,
+  // which is the slowness kernel32 replaces. Retry only the oracle.
+  let oracle: number | null = null
+  for (let attempt = 0; attempt < 3 && oracle === null; attempt++) {
+    oracle = await readProcessStartTimeMs(process.pid, 'win32', 20_000)
+  }
+  expect(birth).toBe(oracle)
+}, 90_000)
 
 test.skipIf(!kernel32)('an exited process held open elsewhere has no table row or birth', async () => {
   const { dlopen, FFIType } = await import('bun:ffi')
