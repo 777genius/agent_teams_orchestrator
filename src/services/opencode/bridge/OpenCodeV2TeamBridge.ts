@@ -19,7 +19,7 @@ import type { OpenCodeNormalizedPermission } from '../types.js'
 import { parseOpenCodeStopRequest, type OpenCodeStopData } from '../OpenCodeStopRecovery.js'
 import { openCodeDeliveryJournalRecoveryData, commandStatusFromOutcomeStatus, isAcceptedOutcomeStatus, commandStatusMismatchReason, outcomeSendMessageDataToCommandData, type SendMessageOutcomeBase, type SendMessageCommandData } from './OpenCodeBridgeDeliveryJournal.js'
 import { OpenCodeV2DeliveryJournal } from './OpenCodeV2DeliveryJournal.js'
-import { discoverOpenCodeV2Run, requestOpenCodeV2Run, isTransientOpenCodeV2ControlRead } from './OpenCodeV2RunControl.js'
+import { discoverOpenCodeV2Run, requestOpenCodeV2Run, isTransientOpenCodeV2ControlRead, awaitOpenCodeV2RunMemberReadiness, OPEN_CODE_V2_RUN_INITIALIZATION_MS } from './OpenCodeV2RunControl.js'
 import { launchExplicitOpenCodeV2Run } from './OpenCodeV2RunOwner.js'
 import type { RunBinding, RunControlRecord, RunControlRequest, RunControlResult, RunLaunchPlan } from './OpenCodeV2RunTypes.js'
 import type { OpenCodeV2TurnProjection } from './OpenCodeV2TurnProjection.js'
@@ -248,9 +248,38 @@ async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: O
       const plan = await createOpenCodeV2LaunchPlan(envelope)
       measured = plan.qualification
       acceptedIdempotencyKey = parseOpenCodeBridgePreconditions(body.preconditions)?.idempotencyKey
-      await bridge.launchExplicit(plan)
-      const status = await bridge.call({ operation: 'status' }, 30_000)
-      executionAssert(status.kind === 'status', 'run_status_unknown')
+      const owner = await bridge.launchExplicit(plan)
+      executionAssert(executionHash(owner.binding) === executionHash(plan.binding), 'run_owner_changed')
+      // Endpoint publication precedes native initialization. Every original member
+      // shares the command/initialization budget; no wait can renew it or relaunch.
+      const deadline = Math.min(started + (envelope.timeoutMs || OPEN_CODE_V2_RUN_INITIALIZATION_MS),
+        Date.now() + OPEN_CODE_V2_RUN_INITIALIZATION_MS, owner.deadline)
+      const remaining = () => { const budget = deadline - Date.now(); executionAssert(budget > 0, 'run_readiness_timeout'); return budget }
+      const readyMembers = []
+      for (const member of plan.members) {
+        const model = member.profile.selection.model
+        const ready = await awaitOpenCodeV2RunMemberReadiness(owner, {
+          memberId: member.memberId, originalSessionId: member.originalSessionId,
+          selectedModel: `${model.providerID}/${model.id}`, selectedVariant: model.variant, pin: member.native.version,
+        }, Math.min(OPEN_CODE_V2_RUN_INITIALIZATION_MS, remaining()))
+        executionAssert(ready && typeof ready.runtimePid === 'number' && Number.isSafeInteger(ready.runtimePid) && ready.runtimePid > 0 &&
+          ready.bootstrap?.verified && ready.controllerTools, 'run_readiness_unknown')
+        readyMembers.push(ready)
+      }
+      let status: RunControlResult
+      for (;;) {
+        try {
+          status = await requestOpenCodeV2Run(owner, { operation: 'status' }, Math.min(30_000, remaining()))
+          remaining()
+          break
+        } catch (error) {
+          if (!isTransientOpenCodeV2ControlRead(error) || Date.now() >= deadline) throw error
+          await new Promise(resolve => setTimeout(resolve, Math.min(100, remaining())))
+        }
+      }
+      executionAssert(status.kind === 'status' && status.state === 'active' && status.deadline === owner.deadline &&
+        executionHash(status.members) === executionHash(readyMembers) &&
+        executionHash(status.qualification) === executionHash(plan.qualification), 'run_readiness_changed')
       return respond(envelope, started, { ...projectV2TeamStatus(status, plan.binding.runId), expectedBehaviorFingerprint: measured?.expectedBehaviorFingerprint }, pin)
     }
     if (envelope.command === 'opencode.readiness' || envelope.command === 'opencode.handshake') {
