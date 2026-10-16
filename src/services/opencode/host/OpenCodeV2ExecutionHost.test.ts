@@ -37,6 +37,48 @@ function retirement(overrides: Partial<ExecutionRetirementPort> = {}): Execution
 }
 
 describe('execution host ownership and cleanup', () => {
+  test('actual Windows source preparation narrows only the SDK content grant', async () => {
+    const source = await readFile(new URL('./OpenCodeV2ExecutionHost.ts', import.meta.url), 'utf8')
+    const body = new Bun.Transpiler({ loader: 'ts' }).transformSync(source.slice(
+      source.indexOf('export async function prepareOwnedNativeExecutionPlan('), source.indexOf('\nasync function acquireOwnedNativeLease('))
+      .replace('export ', '').replaceAll('import.meta.url', JSON.stringify('/TEST-host')))
+    const f = await fixture()
+    try {
+      for (const platform of ['win32', 'darwin'] as const) for (const runtimeMode of ['source', 'packaged'] as const) {
+        const root = runtimeMode === 'source' ? '/TEST-sdk' : '/TEST-delivery'
+        const selected: ValidatedExecutionNative = { ...native, runtimeMode,
+          executablePath: '/TEST-cli/bin/opencode.exe', bun: { ...native.bun, path: '/TEST-bun/bun.exe' },
+          graph: { ...native.graph, files: [{ path: '/TEST-official/module/index.js', sha256: 'a'.repeat(64) },
+            { path: '/TEST-controller/dist/index.js', sha256: 'b'.repeat(64) }] } }
+        const mounts = [{ source: '/TEST-module-target', target: '/TEST-node_modules' }]
+        const controllerRoots = ['/TEST-controller-state'], resolutionRoots: string[] = []
+        let request: Record<string, unknown> | undefined, eager = 0
+        const scope = { path, process: { platform, versions: { bun: 'TEST-bun' }, execPath: selected.bun.path },
+          resolveOpenCodeV2ExecutionDelivery: async () => ({ root, runtimeMode, entryPath: root + '/TEST-entry', entrySha256: selected.entrySha256 }),
+          openCodeBunVersion: () => 'TEST-bun',
+          executionAssert: (value: unknown, code = 'execution_contract_invalid') => { if (!value) throw new Error(code) },
+          executionRecord: (value: unknown) => value, assertExecutionPlatformAvailable: () => {},
+          validateExecutionProfile: async () => {}, canonicalExecutionDirectory: async () => {}, validateExecutionNative: async () => {},
+          realpath: async (value: string) => value, hashOpenCodeFile: async () => selected.bun.sha256,
+          validateExecutionGraph: async () => {},
+          executionResolutionMounts: async (value: string) => { resolutionRoots.push(value); return mounts },
+          deriveSelectedOpenCodeV2ControllerState: async () => controllerRoots,
+          assertSelectedOpenCodeV2ControllerState: async () => { eager++ },
+          planExecutionPlatform: async (value: Record<string, unknown>) => { request = value; return { platform, concrete: {} } },
+        }
+        const prepare = new Function('scope', `const {${Object.keys(scope).join(',')}}=scope;${body};return prepareOwnedNativeExecutionPlan;`)(scope)
+        await prepare(selected, f.profile, context)
+        expect(request?.readOnlyRoots).toEqual([platform === 'win32' && runtimeMode === 'source' ? root + '/src' : root,
+          '/TEST-bun', '/TEST-cli', '/TEST-official/module', '/TEST-controller/dist'])
+        expect(request?.readOnlyMounts).toEqual(mounts)
+        expect(request?.writableRoots).toEqual([f.profile.root, f.profile.directory, ...controllerRoots])
+        expect(request?.protectedRoots).toEqual([path.join(f.profile.root, '.opencode-v2-execution-owner'),
+          path.join(path.dirname(f.profile.databasePath), `.${path.basename(f.profile.databasePath)}.opencode-v2-execution-owner`)])
+        expect(resolutionRoots).toEqual([root]) // Delivery/root resolver custody is unchanged.
+        expect(eager).toBe(platform === 'win32' ? 0 : 1)
+      }
+    } finally { await f.remove() }
+  })
   test('owner initialization budget is platform-specific without changing other platforms', () => {
     expect(openCodeV2RunInitializationMs('win32')).toBe(300_000)
     expect(openCodeV2RunInitializationMs('darwin')).toBe(180_000)

@@ -32,6 +32,9 @@ const ancestorRoot = root + '-ancestor-metadata'
 const ancestorSelected = path.join(ancestorRoot, 'selected')
 const ancestorSibling = path.join(ancestorRoot, 'ungranted-sibling')
 const ancestorSecret = path.join(ancestorSibling, 'secret.txt')
+const sourceBoundaryRoot = root + '-source-boundary'
+const sourceDirectory = path.join(sourceBoundaryRoot, 'src')
+const sourceEntry = path.join(sourceDirectory, 'entry.ts')
 const ancestorAclPaths = [ancestorRoot, ancestorSibling, ancestorSecret]
 let ancestorAclBaseline: Record<string, unknown>[] | undefined
 let ancestorControlObserved: number | undefined
@@ -240,6 +243,29 @@ try {
   const fence = await filesystem.createDirectory(fencePath); handles.push(fence)
   await fence.writeExclusive('owner.json', { schema: 1, testOnly: true, nonce, leaseOwnerId })
   await copyFile(process.execPath, path.join(root, 'bun.exe'))
+  // Fresh sibling outside EVERY writable root. The actual source boundary
+  // must resolve aliases without reading package/config metadata above src.
+  assert.ok(path.relative(root, sourceBoundaryRoot).startsWith('..' + path.sep))
+  for (const directory of [sourceBoundaryRoot, sourceDirectory]) {
+    const held = await filesystem.createDirectory(directory); await held.close()
+  }
+  for (const name of ['package.json', 'tsconfig.json']) {
+    await writeFile(path.join(sourceBoundaryRoot, name), await readFile(path.resolve(import.meta.dir, '../../', name)))
+    await writeFile(path.join(sourceDirectory, name), await readFile(path.resolve(import.meta.dir, '../../src', name)))
+  }
+  await writeFile(path.join(sourceDirectory, 'alias-proof.ts'), await readFile(path.resolve(import.meta.dir, '../../src/utils/uuid.ts')))
+  await writeFile(sourceEntry, `
+import { validateUuid } from 'src/alias-proof.js'
+import { readFile, open } from 'node:fs/promises'
+import { fileURLToPath } from 'node:url'
+const denied=async(work:()=>Promise<unknown>)=>{try{await work()}catch(error){if(['EACCES','EPERM'].includes((error as NodeJS.ErrnoException).code??''))return;throw error}throw Error('TEST_source_boundary_access_admitted')}
+await denied(()=>readFile(fileURLToPath(new URL('../package.json',import.meta.url))))
+await denied(()=>readFile(fileURLToPath(new URL('../tsconfig.json',import.meta.url))))
+await denied(async()=>{const file=await open(fileURLToPath(new URL('alias-proof.ts',import.meta.url)),'r+');await file.close()})
+const value='11111111-1111-4111-8111-111111111111'
+if(validateUuid(value)!==value)throw Error('TEST_source_alias_import_failed')
+await Bun.stdout.write('source-boundary-passed')
+`)
   await writeFile(path.join(root, 'main.ts'), `
 import net from 'node:net'
 const nonce=process.env.OPENCODE_V2_WINDOWS_NONCE,leaseOwnerId=process.env.OPENCODE_V2_WINDOWS_LEASE
@@ -378,7 +404,7 @@ $sid
   await fence.assertOwned()
   if (fullGraphRoot) fullGraphAclBaseline = await fullGraphAcls()
   const launchStarted = Date.now()
-  const mapping = record(await broker.request('launch', { executable: path.join(root, 'bun.exe'), entry: path.join(root, 'main.ts'), cwd: root, env: environment, writableRoots: [root, profileRoot, ancestorSelected], readOnlyRoots: [sharedReadRoot, ...(fullGraphRoot ? [fullGraphRoot] : [])], protectedRoots: [fencePath], nonce, leaseOwnerId }, fullGraphRoot ? Date.now() + 150_000 : undefined))
+  const mapping = record(await broker.request('launch', { executable: path.join(root, 'bun.exe'), entry: path.join(root, 'main.ts'), cwd: root, env: environment, writableRoots: [root, profileRoot, ancestorSelected], readOnlyRoots: [sharedReadRoot, sourceDirectory, ...(fullGraphRoot ? [fullGraphRoot] : [])], protectedRoots: [fencePath], nonce, leaseOwnerId }, fullGraphRoot ? Date.now() + 150_000 : undefined))
   if (fullGraphRoot) facts.fullGraphLaunchElapsedMs = Date.now() - launchStarted
   assert.equal(mapping.containerSid, sid)
   const main = record(mapping.bun); originalMapping = mapping
@@ -390,6 +416,14 @@ $sid
   assert.equal(prepared.pid, main.nativePID)
   assert.equal(prepared.nonce, nonce); assert.equal(prepared.leaseOwnerId, leaseOwnerId)
   assert.deepEqual(prepared.birth, main.birth); assert.equal(prepared.namespace, mapping.namespace)
+  stage = 'native-source-boundary'
+  const sourceCommand = await start(sourceEntry, 'ignore')
+  const [sourceOutput, sourceError] = await Promise.all([output(sourceCommand.commandId, 'stdout'), output(sourceCommand.commandId, 'stderr')])
+  assert.equal(sourceOutput.toString(), 'source-boundary-passed'); assert.equal(sourceError.length, 0)
+  await closeCommand(sourceCommand.commandId)
+  facts.sourceBoundary = { actualPinnedBun: true, actualSourceAliasModuleImported: true,
+    parentPackageReadDenied: true, parentTsconfigReadDenied: true, sourceWriteDenied: true,
+    sourceOutsideWritableRoots: true }
   if (fullGraphFile) {
     stage = 'native-full-graph-read'
     await writeFile(path.join(root, 'full-graph-read.ts'), `const fs=await import('node:fs/promises');const crypto=await import('node:crypto');const file=${JSON.stringify(fullGraphFile)};const bytes=await fs.readFile(file);let denied=false;try{const writer=await fs.open(file,'r+');await writer.close()}catch(error){denied=['EACCES','EPERM'].includes((error as NodeJS.ErrnoException).code??'')}if(!denied)throw Error('TEST_full_graph_write_admitted');await Bun.stdout.write(crypto.createHash('sha256').update(bytes).digest('hex'))`)

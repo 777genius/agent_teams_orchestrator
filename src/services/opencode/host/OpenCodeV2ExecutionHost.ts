@@ -134,6 +134,10 @@ export async function prepareOwnedNativeExecutionPlan(validatedNative: Validated
   const entry = delivery.entryPath; check()
   executionAssert(delivery.entrySha256 === native.entrySha256, 'execution_entry_changed'); check()
   const sourceRoot = delivery.root
+  // Source carries its own module/alias boundary. Windows needs only that
+  // measured subtree, rather than recursive access to checkout/build history.
+  const contentRoot = process.platform === 'win32' && delivery.runtimeMode === 'source'
+    ? path.join(sourceRoot, 'src') : sourceRoot
   const resolutionMounts = await executionResolutionMounts(sourceRoot, native.graph); check(); progress?.('resolution-prepared')
   const controllerLoaderFiles = new Set<string>()
   const controllerLoaderAliases: { source: string; target: string }[] = []
@@ -174,7 +178,7 @@ export async function prepareOwnedNativeExecutionPlan(validatedNative: Validated
       'TMPDIR', 'TMP', 'TEMP', 'APPDATA', 'LOCALAPPDATA'].map(key => profile.env[key]!)])]
   const plan = await planExecutionPlatform({ bun: native.bun, entry, cwd: profile.directory, profileDirectories,
     writableRoots: [profile.root, profile.directory, ...controllerStateRoots],
-    readOnlyRoots: [sourceRoot, path.dirname(native.bun.path), selectedCliRoot,
+    readOnlyRoots: [contentRoot, path.dirname(native.bun.path), selectedCliRoot,
       ...native.graph.files.map(file => controllerLoaderFiles.has(file.path) ? file.path : path.dirname(file.path))],
     readOnlyMounts: [...resolutionMounts, ...controllerLoaderAliases],
     protectedRoots: [path.join(profile.root, '.opencode-v2-execution-owner'),
