@@ -1007,6 +1007,27 @@ finally{Set-TestDacl ([Convert]::FromBase64String($env:TEST_ORIGINAL_DESCRIPTOR)
   let projectOriginalIdentity: { dev: number; ino: number; birth: number } | undefined
   const projectControlAfterOwnWrite = (before: unknown, after: unknown) => before === after ||
     ((before === 0x8004 || before === 0x9004) && after === (Number(before) | 0x400))
+  const projectControlAfterFixtureWrite = (before: unknown, after: unknown) =>
+    Number.isSafeInteger(before) && Number(before) >= 0 && Number(before) <= 0xffff &&
+    Number.isSafeInteger(after) && Number(after) >= 0 && Number(after) <= 0xffff &&
+    (Number(before) & 4) === 4 && (Number(after) & 4) === 4 &&
+    (before === after ||
+      (before === 0x9404 && after === 0x9004) || (before === 0x9004 && after === 0x9404) ||
+      (before === 0x8404 && after === 0x8004) || (before === 0x8004 && after === 0x8404))
+  const assertRestoredProjectAcl = (before: unknown, after: unknown) => {
+    const original = executionRecord(before), restored = executionRecord(after)
+    assert.ok(typeof original.owner === 'string' && original.owner === restored.owner, 'TEST_project_acl_owner_changed')
+    assert.ok(typeof original.group === 'string' && original.group === restored.group, 'TEST_project_acl_group_changed')
+    assert.ok(typeof original.dacl === 'string' && original.dacl === restored.dacl, 'TEST_project_acl_bytes_changed')
+    // SetFileSecurityW can clear AUTO_INHERITED; SetSecurityInfo can add it.
+    // Only the already-observed finite pairs are accepted after our own writes.
+    assert.ok(projectControlAfterFixtureWrite(original.control, restored.control), 'TEST_project_acl_control_changed')
+  }
+  const projectControlFact = (value: unknown): number | null =>
+    Number.isSafeInteger(value) && Number(value) >= 0 && Number(value) <= 0xffff ? Number(value) : null
+  const projectAclRestorations: Array<{ beforeControl: number | null; afterControl: number | null;
+    ownerUnchanged: boolean; groupUnchanged: boolean; daclBytesUnchanged: boolean; identityUnchanged: boolean }> = []
+  facts.projectAclRestorations = projectAclRestorations
   const projectAcl = async () => JSON.parse(await powershell('project_acl_snapshot', `
 $rows=@(foreach($item in @((Get-Item -LiteralPath $env:TEST_TARGET);(Get-ChildItem -LiteralPath $env:TEST_TARGET -Recurse -Force | Sort-Object FullName))){
 $acl=Get-Acl -LiteralPath $item.FullName
@@ -1277,6 +1298,8 @@ await Bun.stdout.write(actor+':written')
       const original = executionRecord(JSON.parse(await powershell('project_acl_install', fixtureSecurity + `
 $acl=Get-Acl -LiteralPath $env:TEST_TARGET
 $bytes=$acl.GetSecurityDescriptorBinaryForm();$raw=[Security.AccessControl.RawSecurityDescriptor]::new($bytes,0)
+$daclBytes=[byte[]]::new($raw.DiscretionaryAcl.BinaryLength);$raw.DiscretionaryAcl.GetBinaryForm($daclBytes,0)
+$security=[ordered]@{owner=$raw.Owner.Value;group=$raw.Group.Value;control=[int]$raw.ControlFlags;dacl=[Convert]::ToBase64String($daclBytes)}
 $sid=[Security.Principal.SecurityIdentifier]::new($env:TEST_SID)
 $indices=@(for($i=0;$i-lt $raw.DiscretionaryAcl.Count;$i++){if($raw.DiscretionaryAcl[$i].SecurityIdentifier.Value-eq $sid.Value){$i}})
 $index=$raw.DiscretionaryAcl.Count
@@ -1284,18 +1307,55 @@ if($env:TEST_REPLACE-eq 'true'){if($indices.Count-ne 1){throw 'TEST project ACE 
 $ace=[Security.AccessControl.CommonAce]::new([Security.AccessControl.AceFlags][int]$env:TEST_FLAGS,[Security.AccessControl.AceQualifier]::AccessAllowed,[int]$env:TEST_MASK,$sid,$false,$null)
 $raw.DiscretionaryAcl.InsertAce($index,$ace)
 $changed=[byte[]]::new($raw.BinaryLength);$raw.GetBinaryForm($changed,0);Set-TestDacl $changed
-[Console]::Write((@{descriptor=[Convert]::ToBase64String($bytes);sddl=$acl.Sddl}|ConvertTo-Json -Compress))`, sharedProject,
+[Console]::Write((@{descriptor=[Convert]::ToBase64String($bytes);security=$security}|ConvertTo-Json -Compress))`, sharedProject,
         { TEST_SID: sid, TEST_MASK: String(mask), TEST_FLAGS: String(flags), TEST_REPLACE: String(replace) })))
-      const staged = await projectAcl()
+      let verificationFailure: unknown
+      let verificationPhase = 'staged_acl_snapshot'
+      let verificationMember: number | null = null
       try {
-        for (const peer of peers) await assert.rejects(peer.broker.request('assertLive'),
-          /^Error: execution_containment_filesystem_denied(?::[a-z_]+:\d+)?$/)
-        assert.deepEqual(await projectAcl(), staged); assert.deepEqual(await rootIdentity(), beforeIdentity)
+        const staged = await projectAcl()
+        verificationPhase = 'member_refusal'
+        for (const [index, peer] of peers.entries()) {
+          verificationMember = index
+          await assert.rejects(peer.broker.request('assertLive'),
+            /^Error: execution_containment_filesystem_denied(?::[a-z_]+:\d+)?$/)
+        }
+        verificationMember = null; verificationPhase = 'refusal_acl_unchanged'
+        assert.deepEqual(await projectAcl(), staged)
+        verificationPhase = 'refusal_identity_unchanged'
+        assert.deepEqual(await rootIdentity(), beforeIdentity)
+      } catch (error) {
+        verificationFailure = error
+        facts.projectAclVerificationFailure = { stage: facts.projectCohortStage, phase: verificationPhase,
+          memberIndex: verificationMember, code: fixtureFailureCode(error),
+          actualNativeCode: error instanceof assert.AssertionError && error.actual instanceof Error
+            ? fixtureFailureCode(error.actual) : null }
+        throw error
       } finally {
-        await powershell('project_acl_restore', fixtureSecurity + `
+        let phase = 'restore_write'
+        try {
+          const restored = executionRecord(JSON.parse(await powershell('project_acl_restore', fixtureSecurity + `
 Set-TestDacl ([Convert]::FromBase64String($env:TEST_DESCRIPTOR))
-if((Get-Acl -LiteralPath $env:TEST_TARGET).Sddl-cne $env:TEST_SDDL){throw 'TEST project DACL restoration changed'}`,
-          sharedProject, { TEST_DESCRIPTOR: String(original.descriptor), TEST_SDDL: String(original.sddl) })
+$raw=[Security.AccessControl.RawSecurityDescriptor]::new((Get-Acl -LiteralPath $env:TEST_TARGET).GetSecurityDescriptorBinaryForm(),0)
+$daclBytes=[byte[]]::new($raw.DiscretionaryAcl.BinaryLength);$raw.DiscretionaryAcl.GetBinaryForm($daclBytes,0)
+[Console]::Write((@{owner=$raw.Owner.Value;group=$raw.Group.Value;control=[int]$raw.ControlFlags;dacl=[Convert]::ToBase64String($daclBytes)}|ConvertTo-Json -Compress))`,
+            sharedProject, { TEST_DESCRIPTOR: String(original.descriptor) })))
+          const security = executionRecord(original.security)
+          const identityAfter = await rootIdentity()
+          projectAclRestorations.push({ beforeControl: projectControlFact(security.control), afterControl: projectControlFact(restored.control),
+            ownerUnchanged: security.owner === restored.owner, groupUnchanged: security.group === restored.group,
+            daclBytesUnchanged: security.dacl === restored.dacl,
+            identityUnchanged: executionHash(identityAfter) === executionHash(beforeIdentity) })
+          phase = 'restore_security'
+          assertRestoredProjectAcl(security, restored)
+          phase = 'restore_identity'
+          assert.deepEqual(identityAfter, beforeIdentity)
+        } catch (error) {
+          facts.projectAclRestorationFailure = { stage: facts.projectCohortStage, phase, code: fixtureFailureCode(error) }
+          if (verificationFailure !== undefined)
+            throw new AggregateError([verificationFailure, error], 'TEST_project_verification_and_restoration_failed')
+          throw error
+        }
       }
       for (const peer of peers) assert.deepEqual(await peer.broker.request('assertLive'), peer.mapping)
     }
@@ -1342,7 +1402,9 @@ if((Get-Acl -LiteralPath $env:TEST_TARGET).Sddl-cne $env:TEST_SDDL){throw 'TEST 
   assert.ok(projectBaseline && projectGrantedBaseline && projectOriginalIdentity)
   for (const original of projectBaseline) {
     const granted = projectGrantedBaseline.find(row => row.relative === original.relative)!
-    assert.deepEqual(projectAfter.find(row => row.relative === original.relative), { ...original, control: granted.control })
+    const after = projectAfter.find(row => row.relative === original.relative)
+    assert.ok(after); assert.ok(projectControlAfterFixtureWrite(granted.control, after.control))
+    assert.deepEqual(after, { ...original, control: after.control })
   }
   assert.deepEqual(await rootIdentity(), projectOriginalIdentity)
   Object.assign(executionRecord(facts.selectedProjectCohort), { bothPhysicalRetirementsProved: true,
