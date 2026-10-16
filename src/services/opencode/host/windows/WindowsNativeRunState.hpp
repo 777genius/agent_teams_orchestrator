@@ -622,7 +622,7 @@ private:
       require(value.ValueType() == JsonValueType::Object, "run_state_start_changed");
       const auto member = value.GetObject();
       runStateExactKeys(
-          member, {L"memberId", L"launchNonce", L"profile", L"config", L"controllerRoot"},
+          member, {L"memberId", L"launchNonce", L"profile", L"config", L"controllerRoot", L"projectRoot"},
           "run_state_start_changed");
       const auto memberId = text(member, L"memberId");
       const auto nonce = text(member, L"launchNonce");
@@ -644,6 +644,11 @@ private:
       require(sha.size() == 64 &&
                   sha.find_first_not_of(L"0123456789abcdef") == std::wstring::npos,
               "run_state_start_changed");
+      const auto projectRoot = member.GetNamedValue(L"projectRoot");
+      require(projectRoot.ValueType() == JsonValueType::Null || projectRoot.ValueType() == JsonValueType::Object,
+              "run_state_start_changed");
+      if (projectRoot.ValueType() == JsonValueType::Object)
+        runStateValidateIdentity(projectRoot.GetObject(), "run_state_start_changed");
       const auto controllerRoot = member.GetNamedValue(L"controllerRoot");
       if (controllerRoot.ValueType() == JsonValueType::Null) continue;
       require(controllerRoot.ValueType() == JsonValueType::Object,

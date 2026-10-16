@@ -205,7 +205,7 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
     check()
     if (plan.platform === 'win32') {
       windowsFilesystem = ownerFilesystemForWindowsPlan(plan.concrete)
-      await windowsFilesystem.validateSelectedProfile(profile.root, profile.databasePath, context.deadline, context.signal)
+      await windowsFilesystem.validateSelectedProfile(profile.root, profile.databasePath, context.deadline, context.signal, profile.directory)
       check()
       const memberPreflight = !('purpose' in profile.selection)
         ? await selectWindowsRunMemberPreflightForPlan(plan.concrete, context, profile as SelectedExecutionProfile) : null

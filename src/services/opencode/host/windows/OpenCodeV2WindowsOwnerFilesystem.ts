@@ -268,12 +268,12 @@ export function createWindowsOwnerFilesystem(native: WindowsOwnerNativePort, sel
   }
   const selected = new Map<string, Readonly<{ root: WindowsOwnerFileIdentity; parent: WindowsOwnerFileIdentity }>>()
   return Object.freeze({
-    async validateSelectedProfile(requestedRoot: string, requestedDatabase: string, deadline?: number, signal?: AbortSignal): Promise<void> {
+    async validateSelectedProfile(requestedRoot: string, requestedDatabase: string, deadline?: number, signal?: AbortSignal, projectDirectory?: string): Promise<void> {
       executionAssert(process.platform === 'win32', 'execution_owner_platform_pending')
       requestLive(deadline, signal)
       const root = canonicalPath(requestedRoot), databasePath = canonicalPath(requestedDatabase)
       executionAssert(databasePath.toLowerCase().startsWith(root.toLowerCase() + '\\'), 'execution_database_alias')
-      const row = response(await native({ op: 'ownerValidateSelectedProfile', root, databasePath, directories: directoryPaths }, deadline, signal))
+      const row = response(await native({ op: 'ownerValidateSelectedProfile', root, databasePath, directories: directoryPaths, ...(projectDirectory ? { projectDirectory: canonicalPath(projectDirectory) } : {}) }, deadline, signal))
       executionAssert(row.root === root && row.databasePath === databasePath && row.privateAcl === true && row.reparse === false && row.filesystem === 'NTFS', 'execution_owner_unknown')
       const rootIdentity = identity(row.rootIdentity), parentIdentity = identity(row.parentIdentity)
       if (row.databaseIdentity !== null) identity(row.databaseIdentity)

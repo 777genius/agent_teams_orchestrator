@@ -1,7 +1,7 @@
 import { openCodeBunVersion } from '../../src/constants/openCodeBunVersion.js'
 import assert from 'node:assert/strict'
-import { createHash } from 'node:crypto'
-import { lstat, readdir, readFile, rename, symlink, writeFile } from 'node:fs/promises'
+import { createHash, randomUUID } from 'node:crypto'
+import { copyFile, lstat, readdir, readFile, rename, symlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { createWindowsNativeBroker, resolveWindowsNativeArtifact } from '../../src/services/opencode/host/windows/OpenCodeV2WindowsNativeBroker.js'
 import { createWindowsOwnerFilesystem, type WindowsOwnerDirectory } from '../../src/services/opencode/host/windows/OpenCodeV2WindowsOwnerFilesystem.js'
@@ -812,6 +812,7 @@ finally{Set-TestDacl ([Convert]::FromBase64String($env:TEST_ORIGINAL_DESCRIPTOR)
     controlRecordStillOwnerOnly: true, aclIdentityAndBytesUnchanged: true }
   // A second real native publisher supplies the other run's cohort and held
   // live owner witnesses. Only the shared namespace may admit its metadata SID.
+  let foreignProjectCohortSid: string | undefined
   const concurrentBroker = createWindowsNativeBroker(helper)
   concurrentBroker.events.on('error', () => {})
   try {
@@ -837,6 +838,7 @@ finally{Set-TestDacl ([Convert]::FromBase64String($env:TEST_ORIGINAL_DESCRIPTOR)
       ...concurrentState, endpointHash: executionHash(concurrentPublished) })
     const concurrentSids = await deriveMetadataSids(await sealedLaunchNonce(concurrentDirectory))
     const concurrentSid = String(concurrentSids.member)
+    foreignProjectCohortSid = concurrentSid
     assert.match(concurrentSid, /^S-1-15-2-/); assert.notEqual(concurrentSid, metadataSids.member)
     const concurrentBefore = await snapshot(discoveryRoot)
     await withMetadataAce(discoveryRoot, concurrentSid, 'ReadAndExecute', 'None', validateEndpoint)
@@ -919,6 +921,327 @@ finally{Set-TestDacl ([Convert]::FromBase64String($env:TEST_ORIGINAL_DESCRIPTOR)
   await writeOwnedFixture(malformedConfig, malformedConfigDirectory, 'opencode.json', '{TEST-malformed')
   await route(discoveryRoot, 'TEST-fresh', 'veto')
   facts.malformedCompleteProfileVeto = true
+  // Two actual AppContainers join one original native seal and overlap on only
+  // its selected project. A third sealed row selects another project and never
+  // launches: membership alone must not authorize its SID on this project.
+  const projectDataRoot = path.win32.join(requestedRoot, 'TEST-project-cohort-data')
+  const sharedProject = path.win32.join(requestedRoot, 'TEST-project-cohort-shared')
+  const otherProject = path.win32.join(requestedRoot, 'TEST-project-cohort-other')
+  const projectController = path.win32.join(requestedRoot, 'TEST-project-cohort-controller')
+  const projectTeam = 'TEST-project-cohort'
+  const projectBinding = { teamId: projectTeam, runId: 'TEST-project-cohort-run',
+    controllerInstanceId: 'TEST-project-controller', ownerId: 'TEST-project-owner' }
+  const projectBroker = createWindowsNativeBroker(helper)
+  projectBroker.events.on('error', () => {})
+  const projectFilesystem = createWindowsOwnerFilesystem(input => projectBroker.request(input.op, input))
+  const peers: Array<{ broker: ReturnType<typeof createWindowsNativeBroker>; fence?: WindowsOwnerDirectory;
+    mapping?: Record<string, unknown>; mainExited?: Record<string, unknown>; connected?: Record<string, unknown>;
+    messages: Record<string, unknown>[]; retired: boolean }> = []
+  let projectState: { stateId: string; directory: string } | undefined
+  let projectBaseline: Array<Record<string, unknown>> | undefined
+  let projectGrantedBaseline: Array<Record<string, unknown>> | undefined
+  let projectOriginalIdentity: { dev: number; ino: number; birth: number } | undefined
+  const projectControlAfterOwnWrite = (before: unknown, after: unknown) => before === after ||
+    ((before === 0x8004 || before === 0x9004) && after === (Number(before) | 0x400))
+  const projectAcl = async () => JSON.parse(await powershell(`
+$rows=@(foreach($item in @((Get-Item -LiteralPath $env:TEST_TARGET);(Get-ChildItem -LiteralPath $env:TEST_TARGET -Recurse -Force | Sort-Object FullName))){
+$acl=Get-Acl -LiteralPath $item.FullName
+$raw=[Security.AccessControl.RawSecurityDescriptor]::new($acl.GetSecurityDescriptorBinaryForm(),0)
+$aces=@(foreach($ace in $raw.DiscretionaryAcl){
+if($ace -isnot [Security.AccessControl.CommonAce]){throw 'TEST unexpected project ACE'}
+$bytes=[byte[]]::new($ace.BinaryLength);$ace.GetBinaryForm($bytes,0)
+[ordered]@{sid=$ace.SecurityIdentifier.Value;mask=$ace.AccessMask;flags=[int]$ace.AceFlags;type=[int]$ace.AceType;bytes=[Convert]::ToBase64String($bytes)}})
+[ordered]@{relative=$item.FullName.Substring($env:TEST_TARGET.Length);owner=$raw.Owner.Value;group=$raw.Group.Value;control=[int]$raw.ControlFlags;aces=$aces}})
+[Console]::Write((ConvertTo-Json -InputObject $rows -Depth 5 -Compress))`, sharedProject)) as Array<Record<string, unknown>>
+  const rootIdentity = async () => { const info = await lstat(sharedProject); return { dev: info.dev, ino: info.ino, birth: info.birthtimeMs } }
+  const waitProjectPeer = async <T>(read: () => T | undefined): Promise<T> => {
+    const deadline = Date.now() + 10_000
+    for (;;) { const value = read(); if (value !== undefined) return value
+      assert.ok(Date.now() < deadline, 'TEST_project_peer_timeout'); await Bun.sleep(10) }
+  }
+  let projectProofFailure: unknown
+  const projectCleanupFailures: string[] = []
+  try {
+    facts.projectCohortStage = 'setup'
+    for (const target of [projectDataRoot, path.win32.join(projectDataRoot, 'opencode'),
+      path.win32.join(projectDataRoot, 'opencode', 'v2'),
+      path.win32.join(projectDataRoot, 'opencode', 'v2', 'profiles'),
+      sharedProject, otherProject, projectController, path.win32.join(projectController, 'teams'),
+      path.win32.join(projectController, 'teams', projectTeam),
+      path.win32.join(projectController, 'teams', projectTeam, 'inboxes'),
+      path.win32.join(projectController, 'tasks'), path.win32.join(projectController, 'tasks', projectTeam)]) {
+      const created = await projectFilesystem.createDirectory(target); await created.close()
+    }
+    const config = JSON.stringify({ mcpServers: { 'agent-teams': { type: 'local',
+      env: { AGENT_TEAMS_MCP_CLAUDE_DIR: projectController } } } })
+    const sha256 = createHash('sha256').update(config).digest('hex')
+    const profiles = []
+    for (const name of ['first', 'second', 'other-project']) {
+      const root = path.win32.join(projectDataRoot, 'opencode', 'v2', 'profiles', 'TEST-' + name)
+      const directories = [root, ...['home', 'config', 'data', 'cache', 'state', 'tmp', 'appdata', 'localappdata',
+        'config/opencode', 'data/opencode'].map(value => path.win32.join(root, value))]
+      for (const target of directories.slice(0, -2)) { const created = await projectFilesystem.createDirectory(target); await created.close() }
+      const heldConfig = await projectFilesystem.createDirectory(path.win32.join(root, 'config', 'opencode'))
+      try { await heldConfig.writePreparedConfig(config, sha256) } finally { await heldConfig.close() }
+      const heldData = await projectFilesystem.createDirectory(path.win32.join(root, 'data', 'opencode'))
+      try {
+        await heldData.writePreparedAuth(authContent, authHash)
+        await heldData.createPreparedDatabase()
+      } finally { await heldData.close() }
+      const profile = { root, databasePath: path.win32.join(root, 'data', 'opencode', 'opencode.db'),
+        directories, projectDirectory: name === 'other-project' ? otherProject : sharedProject, sha256 }
+      const validated = executionRecord(await projectBroker.request('ownerValidateSelectedProfile', {
+        root, databasePath: profile.databasePath, directories, projectDirectory: profile.projectDirectory }))
+      const selected = executionRecord(await projectBroker.request('ownerSelectConfig', {
+        root, databasePath: profile.databasePath, sha256, teamId: projectTeam }))
+      profiles.push({ ...profile, rootIdentity: validated.rootIdentity, selectionId: String(selected.selectionId) })
+    }
+    await copyFile(process.execPath, path.win32.join(sharedProject, 'bun.exe'))
+    await writeFile(path.win32.join(sharedProject, 'main.ts'), `
+import net from 'node:net'
+const nonce=process.env.OPENCODE_V2_WINDOWS_NONCE,leaseOwnerId=process.env.OPENCODE_V2_WINDOWS_LEASE
+const socket=net.createConnection(process.env.OPENCODE_V2_WINDOWS_PIPE!)
+let buffer='',prepared:any
+const send=(value:any)=>socket.write(JSON.stringify({...value,nonce,leaseOwnerId})+'\\n')
+socket.on('error',()=>process.exit(9));socket.on('close',()=>process.exit(0))
+socket.on('data',part=>{buffer+=part.toString();while(buffer.includes('\\n')){const end=buffer.indexOf('\\n'),message=JSON.parse(buffer.slice(0,end));buffer=buffer.slice(end+1)
+if(message.nonce!==nonce||message.leaseOwnerId!==leaseOwnerId)process.exit(10)
+if(message.type==='prepare'){prepared=message;send({...message,type:'prepared',pid:process.pid})}
+if(message.type==='close'){send({type:'closed',pid:process.pid,birth:prepared.birth,namespace:prepared.namespace,scopeClosed:true});socket.end()}
+}})
+`)
+    await writeFile(path.win32.join(sharedProject, 'project-command.ts'), `
+const fs=await import('node:fs/promises'),path=await import('node:path')
+const actor=process.env.TEST_PROJECT_MEMBER!,peer=process.env.TEST_PROJECT_PEER
+if(!['first','second'].includes(actor))throw Error('TEST_project_member_invalid')
+if(peer&&await fs.readFile(path.join(process.cwd(),peer+'.txt'),'utf8')!==peer)throw Error('TEST_project_peer_file_invalid')
+await fs.writeFile(path.join(process.cwd(),actor+'.txt'),actor)
+await Bun.stdout.write(actor+':written')
+`)
+    await powershell(`
+foreach($p in @($env:TEST_TARGET,$env:TEST_DATA_ROOT,$env:TEST_OTHER_PROJECT)){
+& icacls.exe $p /setintegritylevel '(OI)(CI)L' /T /Q | Out-Null
+if($LASTEXITCODE-ne 0){throw 'TEST project low label failed'}}`, sharedProject,
+      { TEST_DATA_ROOT: projectDataRoot, TEST_OTHER_PROJECT: otherProject })
+    const beforeIdentity = await rootIdentity()
+    projectOriginalIdentity = beforeIdentity; projectBaseline = await projectAcl()
+    const beforeAcl = projectBaseline[0]!
+    const directory = runControlDirectory(projectDataRoot, projectTeam, projectBinding.runId)
+    facts.projectCohortStage = 'seal'
+    const acquired = executionRecord(await projectBroker.request('runStateAcquire', {
+      dataRoot: projectDataRoot, directory, binding: projectBinding,
+      selectionIds: profiles.map(profile => profile.selectionId) }))
+    projectState = { stateId: String(acquired.stateId), directory }
+    await projectBroker.request('runStateReserve', { ...projectState, binding: projectBinding,
+      sourceSha256, sharedControllerRootCohort: true })
+    await projectBroker.request('runStateListen', { ...projectState, binding: projectBinding,
+      sourceSha256, deadline: Date.now() + 120_000 })
+    const sealed = executionRecord(JSON.parse(await readFile(path.win32.join(directory, 'start.json'), 'utf8')))
+    const rows = executionRecord(sealed.cohort).members
+    assert.ok(Array.isArray(rows) && rows.length === 3)
+    const memberRows = profiles.map(profile => {
+      const matches = rows.map(executionRecord).filter(row =>
+        executionHash(executionRecord(row.profile).root) === executionHash(profile.rootIdentity))
+      assert.equal(matches.length, 1)
+      const member = matches[0]!
+      assert.equal(typeof member.launchNonce, 'string')
+      assert.equal(executionRecord(member.config).sha256, sha256)
+      return member
+    })
+    assert.equal(new Set(memberRows.map(row => row.launchNonce)).size, 3)
+    assert.deepEqual(memberRows[0]!.projectRoot, memberRows[1]!.projectRoot)
+    assert.notDeepEqual(memberRows[0]!.projectRoot, memberRows[2]!.projectRoot)
+    const otherSid = String((await deriveMetadataSids(String(memberRows[2]!.launchNonce))).member)
+    assert.ok(foreignProjectCohortSid)
+    // A different captured CWD cannot select the original sealed member.
+    const wrongProjectBroker = createWindowsNativeBroker(helper)
+    wrongProjectBroker.events.on('error', () => {})
+    try {
+      facts.projectCohortStage = 'wrong_project_preflight'
+      const profile = profiles[1]!
+      await wrongProjectBroker.request('ownerValidateSelectedProfile', { root: profile.root,
+        databasePath: profile.databasePath, directories: profile.directories, projectDirectory: otherProject })
+      const before = await projectAcl()
+      await assert.rejects(wrongProjectBroker.request('runStateSelect', { mode: 'memberPreflight',
+        dataRoot: projectDataRoot, directory, binding: projectBinding,
+        root: profile.root, databasePath: profile.databasePath, sha256 }), /run_state_start_changed/)
+      assert.deepEqual(await projectAcl(), before); assert.deepEqual(await rootIdentity(), beforeIdentity)
+    } finally { await wrongProjectBroker.close() }
+    const memberSids: string[] = []
+    for (const [index, profile] of profiles.slice(0, 2).entries()) {
+      facts.projectCohortStage = index === 0 ? 'first_member' : 'second_member'
+      const peer = { broker: createWindowsNativeBroker(helper), messages: [] as Record<string, unknown>[],
+        retired: false } as (typeof peers)[number]
+      peers.push(peer); peer.broker.events.on('error', () => {})
+      peer.broker.events.on('message', value => peer.messages.push(executionRecord(value)))
+      peer.broker.events.on('connected', value => { peer.connected = executionRecord(value) })
+      peer.broker.events.on('mainExited', value => { peer.mainExited = executionRecord(value) })
+      const filesystem = createWindowsOwnerFilesystem(input => peer.broker.request(input.op, input))
+      await peer.broker.request('ownerValidateSelectedProfile', { root: profile.root,
+        databasePath: profile.databasePath, directories: profile.directories, projectDirectory: profile.projectDirectory })
+      const preflight = executionRecord(await peer.broker.request('runStateSelect', { mode: 'memberPreflight',
+        dataRoot: projectDataRoot, directory, binding: projectBinding,
+        root: profile.root, databasePath: profile.databasePath, sha256 }))
+      assert.equal(preflight.launchNonce, memberRows[index]!.launchNonce)
+      const selected = executionRecord(await peer.broker.request('ownerSelectConfig', {
+        root: profile.root, databasePath: profile.databasePath, sha256, teamId: projectTeam }))
+      const fencePath = path.win32.join(profile.root, '.native-project-owner')
+      peer.fence = await filesystem.createDirectory(fencePath)
+      const leaseOwnerId = randomUUID(), nonce = String(preflight.launchNonce)
+      await peer.fence.writeExclusive('owner.json', { schema: 1, testOnly: true, nonce, leaseOwnerId })
+      const environment = { SystemRoot: process.env.SystemRoot!, WINDIR: process.env.WINDIR!,
+        PATH: sharedProject + ';' + path.win32.join(process.env.SystemRoot!, 'System32'),
+        HOME: path.win32.join(profile.root, 'home'), USERPROFILE: path.win32.join(profile.root, 'home'),
+        LOCALAPPDATA: path.win32.join(profile.root, 'localappdata'), TEMP: path.win32.join(profile.root, 'tmp'),
+        TMP: path.win32.join(profile.root, 'tmp'), PWD: sharedProject }
+      peer.mapping = executionRecord(await peer.broker.request('launch', {
+        executable: path.win32.join(sharedProject, 'bun.exe'), entry: path.win32.join(sharedProject, 'main.ts'),
+        cwd: sharedProject, env: environment, writableRoots: [sharedProject, profile.root], readOnlyRoots: [],
+        protectedRoots: [fencePath], nonce, leaseOwnerId, selectedConfigId: String(selected.selectionId) }))
+      const main = executionRecord(peer.mapping.bun)
+      const connected = await waitProjectPeer(() => peer.connected)
+      assert.deepEqual(connected, { ...peer.mapping, clientPID: main.nativePID })
+      await peer.broker.request('send', { value: { type: 'prepare', nonce, leaseOwnerId,
+        birth: main.birth, namespace: peer.mapping.namespace } })
+      const prepared = await waitProjectPeer(() => peer.messages.find(value => value.type === 'prepared'))
+      assert.equal(prepared.pid, main.nativePID); assert.equal(prepared.nonce, nonce)
+      assert.equal(prepared.leaseOwnerId, leaseOwnerId); assert.deepEqual(prepared.birth, main.birth)
+      assert.equal(prepared.namespace, peer.mapping.namespace)
+      memberSids.push(String(peer.mapping.containerSid))
+      const commandId = randomUUID(), actor = index === 0 ? 'first' : 'second'
+      const command = executionRecord(await peer.broker.request('commandStart', { commandId,
+        executable: path.win32.join(sharedProject, 'bun.exe'), args: [path.win32.join(sharedProject, 'project-command.ts')],
+        cwd: sharedProject, env: { ...environment, TEST_PROJECT_MEMBER: actor, TEST_PROJECT_PEER: index ? 'first' : '' },
+        stdin: 'ignore' }))
+      assert.equal(command.commandId, commandId)
+      const output = async (stream: 'stdout' | 'stderr') => {
+        let offset = 0; const chunks: Buffer[] = []
+        const deadline = Date.now() + 10_000
+        for (;;) {
+          assert.ok(Date.now() < deadline, 'TEST_project_command_timeout')
+          const value = executionRecord(await peer.broker.request('commandRead', { commandId, stream, offset, maxBytes: 8192 }))
+          const bytes = Buffer.from(String(value.bytesBase64), 'base64')
+          assert.equal(bytes.toString('base64'), value.bytesBase64); assert.equal(value.nextOffset, offset + bytes.length)
+          offset += bytes.length; assert.ok(offset <= 65536); chunks.push(bytes)
+          if (value.eof === true) return Buffer.concat(chunks)
+          await Bun.sleep(10)
+        }
+      }
+      const [stdout, stderr] = await Promise.all([output('stdout'), output('stderr')])
+      assert.equal(stdout.toString(), actor + ':written'); assert.equal(stderr.length, 0)
+      const retired = executionRecord(await peer.broker.request('commandRetire', { commandId }))
+      assert.equal(retired.empty, true); assert.equal(retired.activeProcesses, 0); assert.equal(retired.heldProcessExited, true)
+      assert.equal(executionRecord(await peer.broker.request('commandClose', { commandId })).closed, true)
+      assert.equal(await readFile(path.win32.join(sharedProject, actor + '.txt'), 'utf8'), actor)
+      for (const member of peers) assert.deepEqual(await member.broker.request('assertLive'), member.mapping)
+    }
+    assert.notEqual(memberSids[0], memberSids[1])
+    for (const sid of memberSids) assert.notEqual(sid, otherSid)
+    facts.projectCohortStage = 'granted_acl'
+    projectGrantedBaseline = await projectAcl()
+    const granted = projectGrantedBaseline[0]!
+    const projectAces = (granted.aces as unknown[]).map(executionRecord)
+    for (const sid of memberSids) {
+      const matching = projectAces.filter(ace => ace.sid === sid)
+      assert.equal(matching.length, 1); assert.equal(matching[0]!.mask, 0x1301bf)
+      assert.equal(matching[0]!.flags, 3); assert.equal(matching[0]!.type, 0)
+    }
+    // SetSecurityInfo may add only AUTO_INHERITED during our own write. Pin
+    // the resulting controls; negative checks below still compare exactly.
+    assert.ok(projectControlAfterOwnWrite(beforeAcl.control, granted.control))
+    assert.deepEqual({ ...granted, aces: projectAces.filter(ace => !memberSids.includes(String(ace.sid))) },
+      { ...beforeAcl, control: granted.control })
+    for (const original of projectBaseline) {
+      const actual = projectGrantedBaseline.find(row => row.relative === original.relative)
+      assert.ok(actual); assert.ok(projectControlAfterOwnWrite(original.control, actual.control))
+      assert.deepEqual({ ...actual, aces: (actual.aces as unknown[]).map(executionRecord)
+        .filter(ace => !memberSids.includes(String(ace.sid))) }, { ...original, control: actual.control })
+    }
+    // Mutate only the target DACL, never propagate a synthetic ACE. Every
+    // refusal must preserve the installed tree and the original physical pin.
+    for (const [sid, mask, flags, replace] of [
+      [foreignProjectCohortSid, 0x1301bf, 3, false],
+      [otherSid, 0x1301bf, 3, false],
+      [memberSids[0]!, 0x1f01ff, 3, true],
+      [memberSids[0]!, 0x1301bf, 0, true],
+      [memberSids[0]!, 0x1301bf, 3, false],
+    ] as const) {
+      facts.projectCohortStage = replace ? mask === 0x1f01ff ? 'broad_mask_refusal' : 'inheritance_refusal'
+        : sid === otherSid ? 'other_project_sid_refusal'
+          : sid === foreignProjectCohortSid ? 'foreign_cohort_sid_refusal' : 'duplicate_ace_refusal'
+      const original = executionRecord(JSON.parse(await powershell(fixtureSecurity + `
+$acl=Get-Acl -LiteralPath $env:TEST_TARGET
+$bytes=$acl.GetSecurityDescriptorBinaryForm();$raw=[Security.AccessControl.RawSecurityDescriptor]::new($bytes,0)
+$sid=[Security.Principal.SecurityIdentifier]::new($env:TEST_SID)
+$indices=@(for($i=0;$i-lt $raw.DiscretionaryAcl.Count;$i++){if($raw.DiscretionaryAcl[$i].SecurityIdentifier.Value-eq $sid.Value){$i}})
+$index=$raw.DiscretionaryAcl.Count
+if($env:TEST_REPLACE-eq 'true'){if($indices.Count-ne 1){throw 'TEST project ACE missing'};$index=$indices[0];$raw.DiscretionaryAcl.RemoveAce($index)}
+$ace=[Security.AccessControl.CommonAce]::new([Security.AccessControl.AceFlags][int]$env:TEST_FLAGS,[Security.AccessControl.AceQualifier]::AccessAllowed,[int]$env:TEST_MASK,$sid,$false,$null)
+$raw.DiscretionaryAcl.InsertAce($index,$ace)
+$changed=[byte[]]::new($raw.BinaryLength);$raw.GetBinaryForm($changed,0);Set-TestDacl $changed
+[Console]::Write((@{descriptor=[Convert]::ToBase64String($bytes);sddl=$acl.Sddl}|ConvertTo-Json -Compress))`, sharedProject,
+        { TEST_SID: sid, TEST_MASK: String(mask), TEST_FLAGS: String(flags), TEST_REPLACE: String(replace) })))
+      const staged = await projectAcl()
+      try {
+        for (const peer of peers) await assert.rejects(peer.broker.request('assertLive'),
+          /^Error: execution_containment_filesystem_denied(?::[a-z_]+:\d+)?$/)
+        assert.deepEqual(await projectAcl(), staged); assert.deepEqual(await rootIdentity(), beforeIdentity)
+      } finally {
+        await powershell(fixtureSecurity + `
+Set-TestDacl ([Convert]::FromBase64String($env:TEST_DESCRIPTOR))
+if((Get-Acl -LiteralPath $env:TEST_TARGET).Sddl-cne $env:TEST_SDDL){throw 'TEST project DACL restoration changed'}`,
+          sharedProject, { TEST_DESCRIPTOR: String(original.descriptor), TEST_SDDL: String(original.sddl) })
+      }
+      for (const peer of peers) assert.deepEqual(await peer.broker.request('assertLive'), peer.mapping)
+    }
+    facts.selectedProjectCohort = { sealedMembers: 3, actualLaunchedMembers: 2, sharedProjectCommandsPassed: true,
+      originalNativeNoncesUsed: true, wrongProjectPreflightRefused: true, foreignCohortRefused: true,
+      sameCohortOtherProjectRefused: true, broadMaskRefused: true, inheritanceRefused: true,
+      duplicateAceRefused: true, refusalDaclAndIdentityUnchanged: true }
+  } catch (error) {
+    projectProofFailure = error
+    facts.projectCohortFailure = fixtureFailureCode(error)
+  }
+  finally {
+    // Neither broker closure nor a PID lookup substitutes for these original
+    // mapping/held-main/empty-job/own-ACE retirement proofs.
+    for (const peer of peers) {
+      try {
+        if (peer.mapping) {
+          facts.projectCohortCleanupStage = 'member_retirement'
+          const receipt = executionRecord(await peer.broker.request('retire'))
+          assert.equal(receipt.empty, true); assert.equal(receipt.activeProcesses, 0)
+          assert.equal(receipt.heldProcessExited, true); assert.equal(receipt.ownAcesRemoved, true)
+          assert.deepEqual(receipt.mapping, peer.mapping)
+          assert.equal(peer.mainExited?.heldProcessExited, true); assert.deepEqual(peer.mainExited?.mapping, peer.mapping)
+          peer.retired = true
+          const remaining = peers.filter(value => value.mapping && !value.retired)
+          for (const live of remaining) assert.deepEqual(await live.broker.request('assertLive'), live.mapping)
+        }
+      } catch (error) { projectCleanupFailures.push(fixtureFailureCode(error)) }
+      try { await peer.fence?.close() } catch (error) { projectCleanupFailures.push(fixtureFailureCode(error)) }
+      try { await peer.broker.close() } catch (error) { projectCleanupFailures.push(fixtureFailureCode(error)) }
+    }
+    try { if (projectState) await projectBroker.request('runStateClose', projectState) }
+    catch (error) { projectCleanupFailures.push(fixtureFailureCode(error)) }
+    try { await projectBroker.close() } catch (error) { projectCleanupFailures.push(fixtureFailureCode(error)) }
+    facts.projectCohortCleanupFailures = projectCleanupFailures
+  }
+  assert.deepEqual(projectCleanupFailures, [])
+  if (projectProofFailure !== undefined) throw projectProofFailure
+  assert.equal(peers.length, 2); assert.equal(peers.every(peer => peer.retired), true)
+  const projectAfter = await projectAcl()
+  const launchedSids = peers.map(peer => String(peer.mapping!.containerSid))
+  for (const row of projectAfter)
+    assert.equal((row.aces as unknown[]).map(executionRecord).some(ace => launchedSids.includes(String(ace.sid))), false)
+  assert.ok(projectBaseline && projectGrantedBaseline && projectOriginalIdentity)
+  for (const original of projectBaseline) {
+    const granted = projectGrantedBaseline.find(row => row.relative === original.relative)!
+    assert.deepEqual(projectAfter.find(row => row.relative === original.relative), { ...original, control: granted.control })
+  }
+  assert.deepEqual(await rootIdentity(), projectOriginalIdentity)
+  Object.assign(executionRecord(facts.selectedProjectCohort), { bothPhysicalRetirementsProved: true,
+    allOwnProjectAcesRemoved: true, originalOwnerGroupForeignAcesAndIdentityPreserved: true })
   Object.assign(facts, { archivedIdentity: before, archivedPath: successArchive,
     originalPathFreeForNewFence: true, nextIdentity: next.identity,
     noReplaceCollisionPreserved: true, partialFenceBlocksAcquisition: true,

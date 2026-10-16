@@ -25,7 +25,7 @@ const digest = (bytes: string | Buffer) => createHash('sha256').update(bytes).di
 type WindowsServingAdmission = Readonly<{ record: RunWindowsControlRecord; profiles: readonly WindowsProfileAdmission[] }>
 type WindowsRunComposition = { readonly broker: WindowsNativeBroker; readonly stateId: string; serving?: WindowsServingAdmission }
 const windowsRuns = new Map<string, Promise<WindowsRunComposition>>()
-type WindowsProfileAdmission = Readonly<{ root: string; databasePath: string; sha256: string; directories: readonly string[] }>
+type WindowsProfileAdmission = Readonly<{ projectDirectory?: string; root: string; databasePath: string; sha256: string; directories: readonly string[] }>
 const WINDOWS_PROFILE_DIRECTORY_ENV_KEYS = [
   'HOME', 'USERPROFILE', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME',
   'TMPDIR', 'TMP', 'TEMP', 'APPDATA', 'LOCALAPPDATA',
@@ -71,7 +71,7 @@ function windowsProfileAdmission(profile: SelectedExecutionProfile): WindowsProf
     path.win32.isAbsolute(profile.databasePath) && /^[a-f0-9]{64}$/.test(profile.config.sha256) &&
     directories.length > 0 && directories.length <= 64 && directories.every(value =>
       typeof value === 'string' && value.length > 0 && !value.includes('\0') && path.win32.isAbsolute(value)), 'run_control_selection_missing')
-  return Object.freeze({ root: profile.root, databasePath: profile.databasePath, sha256: profile.config.sha256, directories })
+  return Object.freeze({ projectDirectory: profile.directory, root: profile.root, databasePath: profile.databasePath, sha256: profile.config.sha256, directories })
 }
 function parseWindowsProfileConfigInspection(value: unknown, root: string, databasePath: string): WindowsProfileConfigInspection {
   const row = executionRecord(value)
@@ -123,6 +123,7 @@ async function windowsAdmitProfiles(broker: WindowsNativeBroker, profiles: reado
   for (const profile of profiles) {
     await broker.request('ownerValidateSelectedProfile', {
       root: profile.root, databasePath: profile.databasePath, directories: profile.directories,
+      ...(profile.projectDirectory ? { projectDirectory: profile.projectDirectory } : {}),
     }, deadline)
     const selected = await broker.request('ownerSelectConfig', {
       root: profile.root, databasePath: profile.databasePath, sha256: profile.sha256, teamId,

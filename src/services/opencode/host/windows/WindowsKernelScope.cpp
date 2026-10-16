@@ -232,7 +232,7 @@ struct AclCustody {
   bool memberAllowed = false;
 };
 static AclCustody aclCustody(HANDLE file, const std::wstring &owner, PSID selectedPackage,
-                             const std::vector<std::wstring> *cohortSids, const char *code) {
+                             const std::vector<std::wstring> *cohortSids, const char *code, bool projectPolicy = false) {
   PACL acl = nullptr;
   PSID ownerSid = nullptr;
   PSECURITY_DESCRIPTOR descriptor = nullptr;
@@ -247,7 +247,7 @@ static AclCustody aclCustody(HANDLE file, const std::wstring &owner, PSID select
   LocalMemory ownerMemory{ownerString};
   require(owner == ownerString, code, "private_acl_owner");
   AclCustody result;
-  std::vector<std::wstring> siblings;
+  std::vector<std::wstring> siblings, projectMembers;
   for (DWORD i = 0; i < acl->AceCount; i++) {
     void *raw = nullptr;
     require(GetAce(acl, i, &raw) != 0, code);
@@ -267,6 +267,15 @@ static AclCustody aclCustody(HANDLE file, const std::wstring &owner, PSID select
     require(owner == trusteeSid || trusteeSid == L"S-1-5-18" ||
                 currentMember || sealedCohortSid,
             code, "private_acl_foreign_allow");
+    if (projectPolicy && (currentMember || sealedCohortSid)) {
+      constexpr DWORD projectAccess = FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE;
+      static_assert(projectAccess == 0x1301bf);
+      require(sealedCohortSid && ace->Mask == projectAccess &&
+                  header->AceFlags == SUB_CONTAINERS_AND_OBJECTS_INHERIT &&
+                  std::find(projectMembers.begin(), projectMembers.end(), trusteeSid) == projectMembers.end(),
+              code, "private_acl_foreign_allow");
+      projectMembers.push_back(trusteeSid);
+    }
     result.memberAllowed = result.memberAllowed || currentMember;
     if (sealedCohortSid && !currentMember) {
       siblings.push_back(decimal(header->AceFlags) + L":" + decimal(ace->Mask) + L":" +
@@ -987,6 +996,8 @@ struct SelectedProfileDirectory {
 };
 struct SelectedProfile {
   Handle root, parent, database;
+  std::unique_ptr<RetainedAnchorComponent> project;
+  JsonObject projectIdentity;
   std::vector<Handle> ancestors;
   std::wstring rootPath, parentPath, databasePath, owner;
   JsonObject rootIdentity, parentIdentity, databaseIdentity;
@@ -1614,6 +1625,17 @@ private:
                                       text(databaseIdentity, L"fileId");
       require(profiles.emplace(profileKey, true).second, "run_state_start_changed");
 
+      IJsonValue projectRootValue = JsonValue::CreateNullValue();
+      if (profile.project) {
+        profile.project->assertLive();
+        require(fileObjectIdentity(profile.project->handle.value, profile.owner, true).Stringify() ==
+                    profile.projectIdentity.Stringify(), "run_control_selection_changed");
+        // At original sealing this store retains EVERY selected private
+        // profile, so the shared-project witness excludes all of them.
+        require(!privateProfileOverlap(*this, profile.project->handle.value),
+                "execution_containment_filesystem_denied");
+        projectRootValue = profile.projectIdentity;
+      }
       IJsonValue controllerRootValue = JsonValue::CreateNullValue();
       Handle controllerRoot;
       if (!config.remoteController) {
@@ -1648,6 +1670,7 @@ private:
       row.SetNamedValue(L"profile", profileRow);
       row.SetNamedValue(L"config", configRow);
       row.SetNamedValue(L"controllerRoot", controllerRootValue);
+      row.SetNamedValue(L"projectRoot", projectRootValue);
       held.row = row;
       members.Append(row);
       cohort->members.push_back(std::move(held));
@@ -1707,6 +1730,7 @@ private:
       if (object(member.row, L"profile").Stringify() != expectedProfile.Stringify() ||
           object(configRow, L"identity").Stringify() != configIdentity.Stringify() ||
           text(configRow, L"sha256") != sha256 ||
+          (profile.project && member.row.GetNamedValue(L"projectRoot").Stringify() != profile.projectIdentity.Stringify()) ||
           member.row.GetNamedValue(L"controllerRoot").Stringify() !=
               controllerRoot.Stringify())
         continue;
@@ -1870,6 +1894,20 @@ public:
       found = selectedProfiles.emplace(key, std::move(value)).first;
     }
     auto &selected = found->second;
+    if (input.HasKey(L"projectDirectory")) {
+      const auto projectPath = text(input, L"projectDirectory");
+      auto candidate = std::make_unique<RetainedAnchorComponent>(verificationDirectory(projectPath));
+      require(equalPath(candidate->path, projectPath), "execution_profile_changed");
+      const auto identity = fileObjectIdentity(candidate->handle.value, selected.owner, true);
+      if (selected.project) {
+        selected.project->assertLive();
+        require(equalPath(selected.project->path, projectPath) &&
+                    identity.Stringify() == selected.projectIdentity.Stringify(), "run_control_selection_changed");
+      } else {
+        selected.project = std::move(candidate);
+        selected.projectIdentity = identity;
+      }
+    }
     require(
         equalPath(finalPath(selected.root.value), extended(root)) &&
             equalPath(finalPath(selected.parent.value), extended(parent)) &&
@@ -3020,6 +3058,7 @@ struct NativeSelfImageCustody {
 struct Scope;
 static void removeGrants(Scope &scope);
 static void assertSharedReadRootsLive(const Scope &scope);
+static void assertProjectRootsLive(const Scope &scope);
 static void assertAncestorMetadataLive(const Scope &scope);
 struct RetainedAncestorMetadata {
   RetainedAnchorComponent anchor;
@@ -3053,6 +3092,7 @@ struct Scope {
     for (const auto &anchor : realpathAnchors)
       anchor.assertLive();
     assertSharedReadRootsLive(*this);
+    assertProjectRootsLive(*this);
     assertAncestorMetadataLive(*this);
     if (realpathDll) realpathDll->assertLive();
   }
@@ -3372,6 +3412,51 @@ bool sealedControllerRoot(const Scope &scope,
   return scope.cohort && scope.owners &&
          scope.owners->exactControllerRoot(anchor, *scope.cohort);
 }
+static std::vector<std::wstring> sealedProjectSids(const Scope &scope,
+                                                   const RetainedAnchorComponent &anchor) {
+  if (!scope.cohort || !scope.owners || scope.ownedPairSelectionId.empty()) return {};
+  const auto config = scope.owners->selectedConfigs.find(scope.ownedPairSelectionId);
+  require(config != scope.owners->selectedConfigs.end(), "run_control_selection_missing");
+  const auto profile = scope.owners->selectedProfiles.find(config->second->rootPath + L"|" + config->second->databasePath);
+  require(profile != scope.owners->selectedProfiles.end(), "run_control_selection_missing");
+  const auto &selected = profile->second;
+  if (!selected.project || !equalPath(anchor.path, selected.project->path)) return {};
+  selected.project->assertLive();
+  anchor.assertLive();
+  require(equalPath(scope.cwd, selected.project->path) &&
+              fileObjectIdentity(anchor.handle.value, selected.owner, true).Stringify() == selected.projectIdentity.Stringify() &&
+              fileObjectIdentity(selected.project->handle.value, selected.owner, true).Stringify() == selected.projectIdentity.Stringify() &&
+              !privateProfileOverlap(*scope.owners, anchor.handle.value),
+          "execution_containment_filesystem_denied");
+  const auto allSids = closedControllerCohortSids(*scope.cohort);
+  std::vector<std::wstring> allowed;
+  bool current = false;
+  for (size_t i = 0; i < scope.cohort->members.size(); ++i) {
+    const auto &member = scope.cohort->members[i];
+    if (member.row.GetNamedValue(L"projectRoot").Stringify() != selected.projectIdentity.Stringify()) continue;
+    allowed.push_back(allSids[i]);
+    if (member.launchNonce == scope.launchNonce) current = true;
+  }
+  require(current, "run_state_start_changed");
+  return allowed;
+}
+
+static AclCustody projectAclCustody(HANDLE file, const std::wstring &owner, PSID package,
+                                    const std::vector<std::wstring> &allowed, const char *code) {
+  return aclCustody(file, owner, package, &allowed, code, true);
+}
+
+static void assertProjectRootsLive(const Scope &scope) {
+  for (const auto &root : scope.aclRoots) {
+    const auto sids = sealedProjectSids(scope, root);
+    if (sids.empty()) continue;
+    SharedAclMutex mutex(root.identity);
+    const auto custody = projectAclCustody(root.handle.value, currentSid(), scope.sid.value, sids,
+                                           "execution_containment_filesystem_denied");
+    require(custody.memberAllowed, "execution_containment_filesystem_denied");
+  }
+}
+
 static bool privateCohortRoot(const Scope &scope,
                               const RetainedAnchorComponent &anchor) {
   if (!scope.cohort) return false;
@@ -3387,7 +3472,7 @@ static bool privateCohortRoot(const Scope &scope,
   const bool controllerRoot = sealedControllerRoot(scope, anchor);
   require(!(privateOverlap && controllerRoot), "execution_containment_filesystem_denied");
   if (privateOverlap) return false;
-  return controllerRoot ||
+  return controllerRoot || !sealedProjectSids(scope, anchor).empty() ||
          (anchor.sharedRoot && samePhysicalIdentity(identity, anchor.identity));
 }
 // Shared execution-read roots retain their actual trusted installer owner.
@@ -3752,13 +3837,16 @@ static void grantRoot(Scope &scope, Handle heldRoot, DWORD mask, ACCESS_MODE mod
           "execution_containment_filesystem_denied");
   const bool privateGrant =
       !sharedRoot && mode == GRANT_ACCESS && privateCohortRoot(scope, anchor);
-  const auto cohortSids =
+  const auto projectSids = privateGrant ? sealedProjectSids(scope, anchor) : std::vector<std::wstring>();
+  require(projectSids.empty() || (mode == GRANT_ACCESS && mask == 0x1301bf), "execution_containment_filesystem_denied");
+  const auto cohortSids = !projectSids.empty() ? projectSids :
       privateGrant ? closedControllerCohortSids(*scope.cohort) : std::vector<std::wstring>();
   const auto *cohortSidsPtr = privateGrant ? &cohortSids : nullptr;
   AclCustody before;
   SharedReadAclCustody sharedBefore;
   if (sharedRoot) sharedBefore = sharedReadAclCustody(handle.value, owner, scope.sid.value, "execution_containment_filesystem_denied");
-  else before = aclCustody(handle.value, owner, scope.sid.value, cohortSidsPtr, "execution_containment_filesystem_denied");
+  else before = projectSids.empty() ? aclCustody(handle.value, owner, scope.sid.value, cohortSidsPtr, "execution_containment_filesystem_denied")
+      : projectAclCustody(handle.value, owner, scope.sid.value, projectSids, "execution_containment_filesystem_denied");
   require(grantObjectIdentity(handle.value, owner, sharedRoot).Stringify() ==
               grantObjectIdentity(anchor.handle.value, owner, sharedRoot).Stringify(),
           "execution_containment_filesystem_denied");
@@ -3807,7 +3895,8 @@ static void grantRoot(Scope &scope, Handle heldRoot, DWORD mask, ACCESS_MODE mod
             "execution_containment_filesystem_denied", "shared_readonly_member_missing");
     scope.aclRoots.back().sharedDaclControl = after.daclControl;
   } else {
-    const auto after = aclCustody(heldAcl, owner, scope.sid.value, cohortSidsPtr, "execution_containment_filesystem_denied");
+    const auto after = projectSids.empty() ? aclCustody(heldAcl, owner, scope.sid.value, cohortSidsPtr, "execution_containment_filesystem_denied")
+        : projectAclCustody(heldAcl, owner, scope.sid.value, projectSids, "execution_containment_filesystem_denied");
     require(after.siblings == before.siblings, "execution_containment_filesystem_denied");
     require(mode != GRANT_ACCESS || after.memberAllowed, "execution_containment_filesystem_denied");
     require(mode != DENY_ACCESS || after.memberAllowed == before.memberAllowed, "execution_containment_filesystem_denied");
@@ -3835,7 +3924,8 @@ static void removeGrants(Scope &scope) {
     it->assertLive();
     require(anchorIdentity(handle).Stringify() == identity.Stringify(), "cleanup_unknown");
     const auto heldIdentity = grantObjectIdentity(handle, owner, it->sharedRoot);
-    const auto cohortSids =
+    const auto projectSids = privateGrant ? sealedProjectSids(scope, *it) : std::vector<std::wstring>();
+    const auto cohortSids = !projectSids.empty() ? projectSids :
         privateGrant ? closedControllerCohortSids(*scope.cohort) : std::vector<std::wstring>();
     const auto *cohortSidsPtr = privateGrant ? &cohortSids : nullptr;
     AclCustody before;
@@ -3843,7 +3933,8 @@ static void removeGrants(Scope &scope) {
     if (it->sharedRoot) {
       sharedBefore = sharedReadAclCustody(handle, owner, scope.sid.value, "cleanup_unknown");
       require(sharedBefore.ownerSid == it->sharedOwnerSid && sharedBefore.daclControl == it->sharedDaclControl, "cleanup_unknown");
-    } else before = aclCustody(handle, owner, scope.sid.value, cohortSidsPtr, "cleanup_unknown");
+    } else before = projectSids.empty() ? aclCustody(handle, owner, scope.sid.value, cohortSidsPtr, "cleanup_unknown")
+        : projectAclCustody(handle, owner, scope.sid.value, projectSids, "cleanup_unknown");
     PACL previous = nullptr;
     PSECURITY_DESCRIPTOR descriptor = nullptr;
     require(GetSecurityInfo(handle, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr,
@@ -3870,7 +3961,8 @@ static void removeGrants(Scope &scope) {
                 after.foreignAces == sharedBefore.foreignAces && !after.memberAllowed,
               "cleanup_unknown");
     } else {
-      const auto after = aclCustody(handle, owner, scope.sid.value, cohortSidsPtr, "cleanup_unknown");
+      const auto after = projectSids.empty() ? aclCustody(handle, owner, scope.sid.value, cohortSidsPtr, "cleanup_unknown")
+          : projectAclCustody(handle, owner, scope.sid.value, projectSids, "cleanup_unknown");
       require(after.siblings == before.siblings && !after.memberAllowed, "cleanup_unknown");
     }
   }
@@ -4667,6 +4759,8 @@ public:
           object(profileRow, L"database").Stringify() != databaseIdentity.Stringify() ||
           object(configRow, L"identity").Stringify() != configIdentity.Stringify() ||
           text(configRow, L"sha256") != expectedHash ||
+          row.GetNamedValue(L"projectRoot").Stringify() !=
+              (profile.project ? profile.projectIdentity.Stringify() : JsonValue::CreateNullValue().Stringify()) ||
           row.GetNamedValue(L"controllerRoot").Stringify() !=
               std::wstring(controllerRootValue.Stringify()))
         continue;
