@@ -335,27 +335,32 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
       await launch.assertLive(); check()
       await launch.start({ password, native, profile, ...(gatedWindows ? { deferRuntime: true, activationDeadline: context.deadline } : {}) }, context.deadline, lifetime.signal); check(); mark('start-sent')
     })
-    const assertReadyIdentity = async (row: Record<string, unknown>) => {
+    const assertReadyIdentity = (row: Record<string, unknown>) => {
       executionAssert(mapping && !closeWork && !exited, 'execution_identity_mismatch')
       executionAssert(row.pid === mapping.bun.nativePID && row.leaseOwnerId === leaseOwnerId && row.namespace === mapping.namespace.name && row.pin === native.version && row.graphSha256 === native.graph.sha256 &&
         row.executableSha256 === native.bun.sha256 && row.profileEpoch === profile.epoch &&
-        row.selectionSha256 === executionHash(profile.selection) && executionHash(row.birth) === executionHash(birth) &&
-        executionHash(await readExecutionBirth(mapping.bun.hostPID)) === executionHash(birth), 'execution_identity_mismatch')
+        row.selectionSha256 === executionHash(profile.selection) && executionHash(row.birth) === executionHash(birth), 'execution_identity_mismatch')
     }
     if (gatedWindows) {
       // Only the authenticated child's complete graph validation runs without
       // a ticket. It cannot import/start the runtime until the next ticket.
       const graph = await awaitExecutionHostReady(graphReady!, context.deadline - Date.now(), context.signal); check()
-      await assertReadyIdentity(graph); check()
+      assertReadyIdentity(graph); check()
     }
     return await serial(async () => {
       check()
       if (gatedWindows) {
         executionAssert(launch?.activate && !closeWork && !exited, 'execution_identity_mismatch')
-        await launch.activate(context.deadline, lifetime.signal); check()
+        await awaitExecutionHostReady(launch.activate(context.deadline, lifetime.signal), context.deadline - Date.now(), context.signal); check()
       }
       const row = await awaitExecutionHostReady(ready!, context.deadline - Date.now(), context.signal); check()
-      await assertReadyIdentity(row); check()
+      assertReadyIdentity(row); check()
+      // Windows rechecks the original held MAIN HANDLE and exact native mapping
+      // inside this ticket. A new PID-lookup helper adds no identity authority.
+      if (plan.platform === 'win32') {
+        await awaitExecutionHostReady(launch!.assertLive(), context.deadline - Date.now(), context.signal)
+      } else executionAssert(executionHash(await readExecutionBirth(mapping!.bun.hostPID)) === executionHash(birth), 'execution_identity_mismatch')
+      check()
       executionAssert(typeof row.baseUrl === 'string' && /^http:\/\/127\.0\.0\.1:[1-9]\d*$/.test(row.baseUrl), 'execution_identity_mismatch')
       authority = Object.freeze({ generation: 'v2', pin: native.version, dialect: native.dialect, graphSha256: native.graph.sha256,
         selectedCli: Object.freeze({ path: native.executablePath, sha256: native.executableSha256, version: native.version }),

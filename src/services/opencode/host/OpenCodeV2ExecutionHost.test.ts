@@ -151,18 +151,20 @@ describe('execution host ownership and cleanup', () => {
     // this checks its actual ticket boundaries without launching a native child.
     const source = await readFile(new URL('./OpenCodeV2ExecutionHost.ts', import.meta.url), 'utf8')
     const body = new Bun.Transpiler({ loader: 'ts' }).transformSync(source.slice(source.indexOf('async function acquireOwnedNativeLease(')))
-    let tail = Promise.resolve(), critical = 0, maximum = 0
+    let tail = Promise.resolve(), critical = 0, maximum = 0, birthReads = 0, catalogs = 0
+    let platform: 'win32' | 'darwin' = 'win32'
     const gate = async <T>(work: () => Promise<T>) => {
       const previous = tail; let release!: () => void
       tail = new Promise<void>(resolve => { release = resolve })
       await previous; critical++; maximum = Math.max(maximum, critical)
       try { return await work() } finally { critical--; release() }
     }
-    const launches: Array<{ emitGraph(drift?: Record<string, unknown>): void; activate: number; closed: number; release: number }> = []
+    const launches: Array<{ emitGraph(drift?: Record<string, unknown>): void; activate: number; closed: number; release: number;
+      readyChecks: number; readyError?: Error; readyGate?: Promise<void> }> = []
     let currentOwner: { release: number } | undefined
     const scope = { executionAssert: (value: unknown, message?: string) => { if (!value) throw new Error(message ?? 'invalid') },
       executionRecord: (value: unknown) => value, executionHash, randomUUID: () => `TEST-${launches.length}`, randomBytes: () => ({ toString: () => 'TEST-password' }),
-      prepareOwnedNativeExecutionPlan: async (native: ValidatedExecutionNative, profile: SelectedExecutionProfile) => ({ native, profile, entry: '/TEST-entry', plan: { platform: 'win32', concrete: {} }, controllerStateRoots: [] }),
+      prepareOwnedNativeExecutionPlan: async (native: ValidatedExecutionNative, profile: SelectedExecutionProfile) => ({ native, profile, entry: '/TEST-entry', plan: { platform, concrete: {} }, controllerStateRoots: [] }),
       ownerFilesystemForWindowsPlan: () => ({ validateSelectedProfile: async () => {} }), selectWindowsRunMemberPreflightForPlan: async () => null,
       consumeWindowsExecutionLaunchNonce: () => `TEST-${launches.length}`, bindWindowsExecutionSelectedConfig: async () => {},
       closeWindowsExecutionPlan: async () => {}, recordOpenCodeV2ProviderFailure: async () => {},
@@ -172,22 +174,29 @@ describe('execution host ownership and cleanup', () => {
       launchExecutionPlatform: (_plan: unknown, nonce: string, leaseOwnerId: string) => {
         expect(critical).toBe(1)
         const child = new EventEmitter(), owner = currentOwner!, mapping = { bun: { hostPID: 42, nativePID: 42, birth, executablePath: '/TEST-bun', executableSha256: 'b'.repeat(64) }, namespace: { name: 'TEST-ns' }, leaseOwnerId }
-        let payload: Record<string, any>
+        let payload: Record<string, any>, atReady = false
         const tuple = () => ({ nonce, leaseOwnerId, namespace: mapping.namespace.name, pid: 42, birth,
           pin: native.version, graphSha256: native.graph.sha256, executableSha256: native.bun.sha256,
           profileEpoch: 'TEST-epoch', selectionSha256: executionHash(payload.profile.selection) })
-        const observation = { activate: 0, closed: 0, get release() { return owner.release },
+        const observation: typeof launches[number] = { activate: 0, closed: 0, readyChecks: 0, get release() { return owner.release },
           emitGraph: (drift = {}) => child.emit('message', { type: 'graph-ready', ...tuple(), ...drift }) }
         launches.push(observation)
-        return { child, prepare: async () => mapping, assertLive: async () => {},
-          start: async (value: Record<string, unknown>) => { payload = value; expect(value.deferRuntime).toBe(true); expect(critical).toBe(1) },
-          activate: async () => { expect(critical).toBe(1); observation.activate++; child.emit('message', { type: 'ready', ...tuple(), baseUrl: 'http://127.0.0.1:1' }) },
+        const assertLive = async () => {
+          expect(critical).toBe(1)
+          if (atReady) { observation.readyChecks++; if (observation.readyError) throw observation.readyError; await observation.readyGate }
+        }
+        return { child, prepare: async () => mapping, assertLive,
+          start: async (value: Record<string, unknown>) => {
+            payload = value; expect(value.deferRuntime).toBe(platform === 'win32' ? true : undefined); expect(critical).toBe(1)
+            if (platform !== 'win32') { atReady = true; child.emit('message', { type: 'ready', ...tuple(), baseUrl: 'http://127.0.0.1:1' }) }
+          },
+          activate: async () => { await assertLive(); observation.activate++; atReady = true; child.emit('message', { type: 'ready', ...tuple(), baseUrl: 'http://127.0.0.1:1' }) },
           sendClose: () => { observation.closed++; child.emit('close') }, acknowledged: () => true, retire: async () => {}, kill: async () => {} }
       },
-      readExecutionBirth: async () => birth, awaitExecutionHostReady,
+      readExecutionBirth: async () => { birthReads++; expect(critical).toBe(1); return birth }, awaitExecutionHostReady,
       boundOpenCodeRead: async <T>(work: Promise<T>) => work,
       retireExecutionChild: async (input: ExecutionRetirementPort) => { await Promise.resolve(); input.sendClose(); return {} },
-      awaitOpenCodeV2CatalogReadiness: async () => { expect(critical).toBe(1) }, initializeOpenCodeV2ExecutionAuth: async () => { expect(critical).toBe(1) },
+      awaitOpenCodeV2CatalogReadiness: async () => { catalogs++; expect(critical).toBe(1) }, initializeOpenCodeV2ExecutionAuth: async () => { expect(critical).toBe(1) },
       awaitOpenCodeV2ExecutionReadiness: async () => { expect(critical).toBe(1) },
       endpoints: new WeakMap(), graphs: new WeakMap(), disposers: new WeakMap(), catalogAuthorities: new WeakSet(),
     }
@@ -203,6 +212,7 @@ describe('execution host ownership and cleanup', () => {
     launches[1]!.emitGraph(); launches[0]!.emitGraph()
     const leases = await Promise.all(work)
     expect(maximum).toBe(1); expect(launches.map(value => value.activate)).toEqual([1, 1])
+    expect(birthReads).toBe(0); expect(launches.map(value => value.readyChecks)).toEqual([1, 1])
     await Promise.all(leases.map(lease => lease.close()))
     expect(launches.map(value => [value.closed, value.release])).toEqual([[1, 1], [1, 1]])
     const cancelled = acquire(native, selected, { ...context, deadline, signal: controller.signal }, gate)
@@ -230,6 +240,28 @@ describe('execution host ownership and cleanup', () => {
     unblock(); await blocker
     await expect(queued).rejects.toThrow('run_stopped')
     expect(launches[index]).toMatchObject({ activate: 0, closed: 1, release: 1 })
+    const deadIndex = launches.length, original = new Error('execution_identity_mismatch')
+    const dead = acquire(native, selected, { ...context, deadline }, gate)
+    await wait(() => launches.length === deadIndex + 1)
+    launches[deadIndex]!.readyError = original; launches[deadIndex]!.emitGraph()
+    await expect(dead).rejects.toBe(original)
+    expect(launches[deadIndex]).toMatchObject({ activate: 1, readyChecks: 1, closed: 1, release: 1 })
+    expect(catalogs).toBe(2) // A ready frame cannot publish authority after the held process check fails.
+    const blockedSignal = new AbortController(), blockedIndex = launches.length
+    let releaseCheck!: () => void
+    const blocked = acquire(native, selected, { ...context, deadline, signal: blockedSignal.signal }, gate)
+    await wait(() => launches.length === blockedIndex + 1)
+    launches[blockedIndex]!.readyGate = new Promise<void>(resolve => { releaseCheck = resolve })
+    launches[blockedIndex]!.emitGraph(); await wait(() => launches[blockedIndex]!.readyChecks === 1)
+    blockedSignal.abort(original)
+    await expect(blocked).rejects.toBe(original)
+    expect(launches[blockedIndex]).toMatchObject({ closed: 1, release: 1 })
+    expect(critical).toBe(0); expect(catalogs).toBe(2); expect(birthReads).toBe(0)
+    releaseCheck(); await Bun.sleep(0); expect(catalogs).toBe(2)
+    platform = 'darwin'
+    const posix = await acquire(native, selected, { ...context, deadline }, gate)
+    expect(birthReads).toBe(1); expect(catalogs).toBe(3)
+    await posix.close()
   })
   test('startup readiness preserves the exact acquisition cancellation and original rejection before cleanup', async () => {
     const signal = new AbortController(), original = new Error('run_acquisition_timeout')
