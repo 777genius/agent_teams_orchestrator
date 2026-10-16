@@ -1,0 +1,48 @@
+name: Repro OpenCode Windows probe budget
+on:
+  push:
+    branches: [repro/opencode-windows-probe]
+permissions:
+  contents: read
+jobs:
+  probe-cost:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - name: Prepare genuine npm OpenCode and public runtime
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP "TEST-opencode-probe-$env:GITHUB_RUN_ID"
+          New-Item -ItemType Directory $root | Out-Null
+          npm install --prefix "$root/npm" --no-audit --no-fund opencode-ai@1.19.2
+          if ($LASTEXITCODE -ne 0) { throw 'npm install failed' }
+          Get-ChildItem "$root/npm/node_modules/.bin" | Select-Object Name, Length
+          Get-Content "$root/npm/node_modules/.bin/opencode.cmd"
+          $dest = Join-Path $root 'runtime'
+          New-Item -ItemType Directory $dest | Out-Null
+          gh release download runtime-v0.0.122 --repo 777genius/agent_teams_orchestrator_binaries --pattern 'agent-teams-runtime-win32-x64-v0.0.122.zip' --dir $dest
+          if ($LASTEXITCODE -ne 0) { throw 'runtime download failed' }
+          Expand-Archive "$dest/agent-teams-runtime-win32-x64-v0.0.122.zip" "$dest/payload"
+          $binary = @(Get-ChildItem "$dest/payload" -Filter claude-multimodel.exe -Recurse)[0].FullName
+          "TEST_ROOT=$root" >> $env:GITHUB_ENV
+          "RUNTIME=$binary" >> $env:GITHUB_ENV
+          "SHIM=$root/npm/node_modules/.bin/opencode.cmd" >> $env:GITHUB_ENV
+          "NATIVE=$root/npm/node_modules/opencode-ai/bin/opencode.exe" >> $env:GITHUB_ENV
+      - name: Measure helpers and runtime command
+        run: node scripts/repro/opencode-windows-probe-cost.mjs "$env:TEST_ROOT" "$env:RUNTIME" "shim=$env:SHIM" "native=$env:NATIVE"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: probe-cost-${{ matrix.os }}
+          path: ${{ runner.temp }}/TEST-opencode-probe-*/probe-cost-report.json
+          if-no-files-found: warn
