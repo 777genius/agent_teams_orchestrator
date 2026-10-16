@@ -411,3 +411,27 @@ test('graph original native packet survives persistence but unknown fields are r
     await rm(root, { recursive: true, force: true })
   }
 })
+
+test('actual native broker alias reply decoder persists original operation and source predicate', async () => {
+  const { decodeWindowsNativeFailure } = await import('../host/windows/OpenCodeV2WindowsNativeBroker.js')
+  const root = await mkdtemp(path.join(tmpdir(), 'TEST-native-alias-packet-'))
+  const previous = process.env.CLAUDE_MULTIMODEL_DATA_HOME
+  process.env.CLAUDE_MULTIMODEL_DATA_HOME = root
+  try {
+    const original = decodeWindowsNativeFailure({ error: 'execution_path_alias', stage: 'alias_predicate', nativeCode: 0,
+      alias: { operation: 'runStateSelect', sourceLine: 392, predicates: 2 } }, 'runStateSelect')
+    const before = Object.getOwnPropertyDescriptors(original)
+    await recordOpenCodeV2ProviderFailure('execution-host-startup', original, true)
+    const directory = path.join(root, 'opencode/v2/provider-diagnostics'), names = await readdir(directory)
+    expect(names).toHaveLength(1)
+    const value = JSON.parse(await readFile(path.join(directory, names[0]!), 'utf8'))
+    expect(value.category).toBe('execution_path_alias')
+    expect(value.alias).toEqual({ operation: 'runStateSelect', sourceLine: 392, predicate: 2, passed: false })
+    expect(value.native).toEqual({ stage: 'alias_predicate', nativeCode: 0 })
+    expect(Object.getOwnPropertyDescriptors(original)).toEqual(before)
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_DATA_HOME
+    else process.env.CLAUDE_MULTIMODEL_DATA_HOME = previous
+    await rm(root, { recursive: true, force: true })
+  }
+})

@@ -30,10 +30,16 @@ struct NativeError {
   DWORD win32 = 0;
   const char *stage = nullptr;
   DWORD nativeStatus = 0;
+  DWORD aliasSourceLine = 0;
+  DWORD aliasPredicates = 0;
 };
 static void require(bool value, const char *code, const char *stage = nullptr) {
   if (!value)
     throw NativeError{code, 0, stage};
+}
+// Exact failed source predicate, never a path or caller-supplied error label.
+static void requireAlias(bool value, const char *code, DWORD sourceLine, DWORD predicate = 0) {
+  if (!value) throw NativeError{code, 0, "alias_predicate", 0, sourceLine, predicate};
 }
 // Closed admission context only. Preserve specific predicates and native status;
 // neither a filesystem path nor a caller-provided string becomes a role.
@@ -54,7 +60,7 @@ static decltype(auto) inRetirementPhase(const char *phase, Action action) {
   try { return action(); }
   catch (const NativeError &error) {
     throw NativeError{error.code, error.win32, error.stage ? error.stage : phase,
-                      error.nativeStatus};
+                      error.nativeStatus, error.aliasSourceLine, error.aliasPredicates};
   }
   catch (const winrt::hresult_error &error) {
     throw NativeError{"execution_native_unknown", static_cast<DWORD>(error.code().value), phase};
@@ -175,17 +181,17 @@ static JsonObject identity(HANDLE process, DWORD pid) {
   return value;
 }
 static std::wstring extended(const std::wstring &value) {
-  require(value.size() >= 3 && value[1] == L':' && value[2] == L'\\' &&
+  requireAlias(value.size() >= 3 && value[1] == L':' && value[2] == L'\\' &&
               value.find(L"\\..") == std::wstring::npos &&
               value.find(L"\\.\\") == std::wstring::npos,
-          "execution_path_alias");
+          "execution_path_alias", __LINE__);
   return L"\\\\?\\" + value;
 }
 static std::wstring finalPath(HANDLE file, DWORD volume = VOLUME_NAME_DOS) {
   std::vector<wchar_t> bytes(32768);
   DWORD count = GetFinalPathNameByHandleW(file, bytes.data(), static_cast<DWORD>(bytes.size()),
                                           FILE_NAME_NORMALIZED | volume);
-  require(count > 0 && count < bytes.size(), "execution_path_alias");
+  requireAlias(count > 0 && count < bytes.size(), "execution_path_alias", __LINE__);
   return std::wstring(bytes.data(), count);
 }
 static bool equalPath(const std::wstring &a, const std::wstring &b) {
@@ -334,11 +340,10 @@ static Handle canonicalDirectory(const std::wstring &value,
   if (!handle)
     throw NativeError{"execution_owner_unknown", GetLastError(), "owner_canonical_open"};
   FILE_ATTRIBUTE_TAG_INFO tag{};
-  require(GetFileInformationByHandleEx(handle.value, FileAttributeTagInfo, &tag, sizeof(tag)) &&
-              (tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
-              !(tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
-              equalPath(finalPath(handle.value), full),
-          "execution_path_alias");
+  requireAlias(GetFileInformationByHandleEx(handle.value, FileAttributeTagInfo, &tag, sizeof(tag)), "execution_path_alias", __LINE__, 1);
+  requireAlias((tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0, "execution_path_alias", __LINE__, 2);
+  requireAlias(!(tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT), "execution_path_alias", __LINE__, 3);
+  requireAlias(equalPath(finalPath(handle.value), full), "execution_path_alias", __LINE__, 4);
   if (qualifyAcl)
     fileIdentity(handle.value, currentSid(), true, selectedPackage, cohortSids);
   return handle;
@@ -354,10 +359,10 @@ static Handle verificationDirectory(const std::wstring &value) {
   if (!handle)
     throw NativeError{"execution_owner_unknown", GetLastError(), "owner_verification_open"};
   FILE_ATTRIBUTE_TAG_INFO tag{};
-  require(GetFileInformationByHandleEx(handle.value, FileAttributeTagInfo, &tag, sizeof(tag)) &&
-              (tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
-              !(tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
-              equalPath(finalPath(handle.value), full), "execution_path_alias");
+  requireAlias(GetFileInformationByHandleEx(handle.value, FileAttributeTagInfo, &tag, sizeof(tag)), "execution_path_alias", __LINE__, 1);
+  requireAlias((tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0, "execution_path_alias", __LINE__, 2);
+  requireAlias(!(tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT), "execution_path_alias", __LINE__, 3);
+  requireAlias(equalPath(finalPath(handle.value), full), "execution_path_alias", __LINE__, 4);
   return handle;
 }
 static std::vector<Handle> verificationAncestors(const std::wstring &path) {
@@ -385,11 +390,11 @@ static JsonObject anchorIdentity(HANDLE file) {
   FILE_ID_INFO id{};
   FILE_ATTRIBUTE_TAG_INFO tag{};
   FILE_STANDARD_INFO standard{};
-  require(GetFileInformationByHandleEx(file, FileIdInfo, &id, sizeof(id)) &&
-              GetFileInformationByHandleEx(file, FileAttributeTagInfo, &tag, sizeof(tag)) &&
-              GetFileInformationByHandleEx(file, FileStandardInfo, &standard, sizeof(standard)) &&
-              standard.Directory && !(tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT),
-          "execution_path_alias");
+  requireAlias(GetFileInformationByHandleEx(file, FileIdInfo, &id, sizeof(id)), "execution_path_alias", __LINE__, 1);
+  requireAlias(GetFileInformationByHandleEx(file, FileAttributeTagInfo, &tag, sizeof(tag)), "execution_path_alias", __LINE__, 1);
+  requireAlias(GetFileInformationByHandleEx(file, FileStandardInfo, &standard, sizeof(standard)), "execution_path_alias", __LINE__, 1);
+  requireAlias(standard.Directory, "execution_path_alias", __LINE__, 2);
+  requireAlias(!(tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT), "execution_path_alias", __LINE__, 3);
   static const wchar_t hex[] = L"0123456789abcdef";
   std::wstring fileId;
   for (BYTE byte : id.FileId.Identifier) {
@@ -401,7 +406,7 @@ static JsonObject anchorIdentity(HANDLE file) {
   str(value, L"fileId", fileId);
   str(value, L"dosPath", finalPath(file));
   auto nt = finalPath(file, VOLUME_NAME_NT);
-  require(nt.rfind(L"\\Device\\", 0) == 0, "execution_path_alias");
+  requireAlias(nt.rfind(L"\\Device\\", 0) == 0, "execution_path_alias", __LINE__);
   str(value, L"ntPath", nt);
   return value;
 }
@@ -418,15 +423,15 @@ struct RetainedAnchorComponent {
       : handle(std::move(owned)), identity(anchorIdentity(handle.value)), sharedRoot(shared),
         cohortPolicy(cohort) {
     auto dos = text(identity, L"dosPath");
-    require(dos.rfind(L"\\\\?\\", 0) == 0, "execution_path_alias");
+    requireAlias(dos.rfind(L"\\\\?\\", 0) == 0, "execution_path_alias", __LINE__);
     path = dos.substr(4);
   }
   void assertLive() const {
-    require(anchorIdentity(handle.value).Stringify() == identity.Stringify(),
-            "execution_path_alias");
+    requireAlias(anchorIdentity(handle.value).Stringify() == identity.Stringify(),
+            "execution_path_alias", __LINE__);
     auto reopened = verificationDirectory(path);
-    require(anchorIdentity(reopened.value).Stringify() == identity.Stringify(),
-            "execution_path_alias");
+    requireAlias(anchorIdentity(reopened.value).Stringify() == identity.Stringify(),
+            "execution_path_alias", __LINE__);
   }
 };
 struct RetainedRealpathAnchor {
@@ -444,7 +449,7 @@ struct RetainedRealpathAnchor {
       component.assertLive();
   }
   JsonObject receipt() const {
-    require(!components.empty(), "execution_path_alias");
+    requireAlias(!components.empty(), "execution_path_alias", __LINE__);
     auto value = JsonObject::Parse(components.back().identity.Stringify());
     // Child path mapping uses ordinary DOS syntax; its NT suffix retains case.
     str(value, L"dosPath", components.back().path);
@@ -961,7 +966,7 @@ static Handle ownerDirectory(const std::wstring &path, bool create, const std::w
                       static_cast<DWORD>(native)};
   }
   Handle handle(raw);
-  require(equalPath(finalPath(handle.value), checked), "execution_path_alias");
+  requireAlias(equalPath(finalPath(handle.value), checked), "execution_path_alias", __LINE__);
   directoryMode(handle.value);
   fileIdentity(handle.value, owner, true, selectedPackage, create ? nullptr : cohortSids);
   return handle;
@@ -1298,7 +1303,7 @@ public:
                   configAncestorIdentities[i].Stringify(),
               "run_control_selection_changed");
       const auto heldPath = text(configAncestorIdentities[i], L"dosPath");
-      require(heldPath.rfind(L"\\\\?\\", 0) == 0, "execution_path_alias");
+      requireAlias(heldPath.rfind(L"\\\\?\\", 0) == 0, "execution_path_alias", __LINE__);
       auto reopened = verificationDirectory(heldPath.substr(4));
       require(anchorIdentity(reopened.value).Stringify() ==
                   configAncestorIdentities[i].Stringify(),
@@ -1370,21 +1375,21 @@ struct ControllerRunRootAuthority {
 
   void assertLive(PSID package,
                   const std::vector<std::wstring> *cohortSids) const {
-    require(ancestors.size() == ancestorIdentities.size(), "execution_path_alias");
+    requireAlias(ancestors.size() == ancestorIdentities.size(), "execution_path_alias", __LINE__);
     root.assertLive();
     require(fileIdentity(root.handle.value, currentSid(), true, package, cohortSids)
                 .Stringify() == identity.Stringify(),
             "execution_containment_filesystem_denied");
     for (size_t i = 0; i < ancestors.size(); ++i) {
-      require(anchorIdentity(ancestors[i].value).Stringify() ==
+      requireAlias(anchorIdentity(ancestors[i].value).Stringify() ==
                   ancestorIdentities[i].Stringify(),
-              "execution_path_alias");
+              "execution_path_alias", __LINE__);
       const auto heldPath = text(ancestorIdentities[i], L"dosPath");
-      require(heldPath.rfind(L"\\\\?\\", 0) == 0, "execution_path_alias");
+      requireAlias(heldPath.rfind(L"\\\\?\\", 0) == 0, "execution_path_alias", __LINE__);
       auto reopened = verificationDirectory(heldPath.substr(4));
-      require(anchorIdentity(reopened.value).Stringify() ==
+      requireAlias(anchorIdentity(reopened.value).Stringify() ==
                   ancestorIdentities[i].Stringify(),
-              "execution_path_alias");
+              "execution_path_alias", __LINE__);
     }
     auto reopened = verificationDirectory(root.path);
     require(fileIdentity(reopened.value, currentSid(), true, package, cohortSids)
@@ -1400,9 +1405,9 @@ struct ControllerRunAuthority {
   bool exactRoot(HANDLE file, const std::wstring &path) const {
     for (const auto &root : roots) {
       if (!equalPath(root.root.path, path)) continue;
-      require(samePhysicalIdentity(root.identity,
+      requireAlias(samePhysicalIdentity(root.identity,
                                    fileObjectIdentity(file, currentSid(), true)),
-              "execution_path_alias");
+              "execution_path_alias", __LINE__);
       return true;
     }
     return false;
@@ -1486,7 +1491,7 @@ public:
                     directory.parentIdentities[i].Stringify(),
                 "execution_owner_unknown");
         const auto heldPath = text(directory.parentIdentities[i], L"dosPath");
-        require(heldPath.rfind(L"\\\\?\\", 0) == 0, "execution_path_alias");
+        requireAlias(heldPath.rfind(L"\\\\?\\", 0) == 0, "execution_path_alias", __LINE__);
         auto reopened = verificationDirectory(heldPath.substr(4));
         require(anchorIdentity(reopened.value).Stringify() ==
                     directory.parentIdentities[i].Stringify(),
@@ -1753,16 +1758,16 @@ private:
         const auto path = config.mcpRootPath + L"\\" + name + L"\\" + teamId;
         auto heldAncestors = verificationAncestors(path);
         Handle heldRoot = verificationDirectory(path);
-        require(equalPath(finalPath(heldRoot.value), extended(path)),
-                "execution_path_alias");
+        requireAlias(equalPath(finalPath(heldRoot.value), extended(path)),
+                "execution_path_alias", __LINE__);
         require(!privateProfileOverlap(*this, heldRoot.value),
                 "execution_containment_filesystem_denied");
         const auto heldIdentity = anchorIdentity(heldRoot.value);
-        require(heldIdentity.Stringify() ==
+        requireAlias(heldIdentity.Stringify() ==
                     anchorIdentity(verificationDirectory(path).value).Stringify() &&
                     samePhysicalIdentity(
                         heldIdentity, fileObjectIdentity(heldRoot.value, currentSid(), true)),
-                "execution_path_alias");
+                "execution_path_alias", __LINE__);
         authority.roots.emplace_back(std::move(heldAncestors), std::move(heldRoot));
       });
     }
@@ -1942,7 +1947,7 @@ public:
                 "run_control_selection_missing");
         return Handle();
       }
-      require(equalPath(finalPath(value.value), extended(path)), "execution_path_alias");
+      requireAlias(equalPath(finalPath(value.value), extended(path)), "execution_path_alias", __LINE__);
       fileIdentity(value.value, owner, directory, selectedPackage);
       return value;
     };
@@ -2149,7 +2154,7 @@ public:
       require(parentIdentity.Stringify() == directory.parentIdentities[i].Stringify(),
               "execution_owner_unknown");
       const auto heldPath = text(parentIdentity, L"dosPath");
-      require(heldPath.rfind(L"\\\\?\\", 0) == 0, "execution_path_alias");
+      requireAlias(heldPath.rfind(L"\\\\?\\", 0) == 0, "execution_path_alias", __LINE__);
       auto reopened = verificationDirectory(heldPath.substr(4));
       require(anchorIdentity(reopened.value).Stringify() ==
                   directory.parentIdentities[i].Stringify(),
@@ -3321,7 +3326,7 @@ static bool samePhysicalIdentity(const JsonObject &left, const JsonObject &right
 }
 static std::wstring identityPath(const JsonObject &identity) {
   auto value = text(identity, L"dosPath");
-  require(value.rfind(L"\\\\?\\", 0) == 0, "execution_path_alias");
+  requireAlias(value.rfind(L"\\\\?\\", 0) == 0, "execution_path_alias", __LINE__);
   return value.substr(4);
 }
 static bool pathOverlap(const std::wstring &left, const std::wstring &right) {
@@ -3340,15 +3345,15 @@ static bool privateProfileOverlap(const OwnerStore &owners, HANDLE heldRoot) {
     const auto &profile = entry.second;
     const auto privateIdentity = anchorIdentity(profile.root.value);
     auto reopened = verificationDirectory(profile.rootPath);
-    require(anchorIdentity(reopened.value).Stringify() == privateIdentity.Stringify(),
-            "execution_path_alias");
+    requireAlias(anchorIdentity(reopened.value).Stringify() == privateIdentity.Stringify(),
+            "execution_path_alias", __LINE__);
     const auto privatePhysical = fileObjectIdentity(profile.root.value, profile.owner, true);
-    require(samePhysicalIdentity(privateIdentity, privatePhysical) &&
+    requireAlias(samePhysicalIdentity(privateIdentity, privatePhysical) &&
                 samePhysicalIdentity(privatePhysical, profile.rootIdentity) &&
                 text(privatePhysical, L"ownerSid") ==
                     text(profile.rootIdentity, L"ownerSid") &&
                 equalPath(identityPath(privateIdentity), profile.rootPath),
-            "execution_path_alias");
+            "execution_path_alias", __LINE__);
     if (samePhysicalIdentity(rootIdentity, privateIdentity) ||
         pathOverlap(identityPath(rootIdentity), identityPath(privateIdentity)))
       return true;
@@ -3366,11 +3371,11 @@ static bool privateCohortRoot(const Scope &scope,
   require(scope.owners, "execution_containment_filesystem_denied");
   anchor.assertLive();
   const auto identity = anchorIdentity(anchor.handle.value);
-  require(identity.Stringify() == anchor.identity.Stringify() &&
+  requireAlias(identity.Stringify() == anchor.identity.Stringify() &&
               samePhysicalIdentity(
                   identity,
                   fileObjectIdentity(anchor.handle.value, currentSid(), true)),
-          "execution_path_alias");
+          "execution_path_alias", __LINE__);
   const bool privateOverlap = privateProfileOverlap(*scope.owners, anchor.handle.value);
   const bool controllerRoot = sealedControllerRoot(scope, anchor);
   require(!(privateOverlap && controllerRoot), "execution_containment_filesystem_denied");
@@ -3572,7 +3577,7 @@ static void retainMetadataAncestor(Scope &scope, Handle held) {
   const auto identity = anchorIdentity(held.value);
   for (const auto &existing : scope.metadataAncestors)
     if (samePhysicalIdentity(identity, existing.anchor.identity)) {
-      require(identity.Stringify() == existing.anchor.identity.Stringify(), "execution_path_alias");
+      requireAlias(identity.Stringify() == existing.anchor.identity.Stringify(), "execution_path_alias", __LINE__);
       return;
     }
   scope.metadataAncestors.emplace_back(std::move(held));
@@ -4346,10 +4351,10 @@ public:
         run = Handle(raw);
         if (!run) throw NativeError{"execution_owner_unknown", error, "owner_directory_open"};
         FILE_ATTRIBUTE_TAG_INFO tag{};
-        require(GetFileInformationByHandleEx(run.value, FileAttributeTagInfo, &tag, sizeof(tag)) &&
+        requireAlias(GetFileInformationByHandleEx(run.value, FileAttributeTagInfo, &tag, sizeof(tag)) &&
                     (tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
                     !(tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
-                    equalPath(finalPath(run.value), path), "execution_path_alias");
+                    equalPath(finalPath(run.value), path), "execution_path_alias", __LINE__);
         directoryMode(run.value);
       }
     } catch (const NativeError &error) {
@@ -4689,7 +4694,7 @@ public:
                   memberConfig->configAncestorIdentities[i].Stringify(),
               "run_control_selection_changed");
       const auto heldPath = text(memberConfig->configAncestorIdentities[i], L"dosPath");
-      require(heldPath.rfind(L"\\\\?\\", 0) == 0, "execution_path_alias");
+      requireAlias(heldPath.rfind(L"\\\\?\\", 0) == 0, "execution_path_alias", __LINE__);
       auto reopened = verificationDirectory(heldPath.substr(4));
       require(anchorIdentity(reopened.value).Stringify() ==
                   memberConfig->configAncestorIdentities[i].Stringify(),
@@ -5305,6 +5310,7 @@ int wmain(int argc, wchar_t **argv) {
       require(line.size() <= CONTROL_PACKET_LIMIT, "execution_invalid_response");
       double id = 0;
       JsonObject reply;
+      std::wstring requestedOperation;
       num(reply, L"schema", 1);
       str(reply, L"kind", L"reply");
       try {
@@ -5313,6 +5319,7 @@ int wmain(int argc, wchar_t **argv) {
         require(id > 0 && id <= 9007199254740991.0 && id == static_cast<std::uint64_t>(id),
                 "execution_invalid_response");
         auto operation = text(request, L"operation");
+        requestedOperation = operation;
         auto input = object(request, L"input");
         JsonObject value;
         if (custodyOnly)
@@ -5388,6 +5395,13 @@ int wmain(int argc, wchar_t **argv) {
       } catch (const NativeError &error) {
         flag(reply, L"ok", false);
         str(reply, L"error", wide(error.code));
+        if (error.aliasSourceLine) {
+          JsonObject alias;
+          str(alias, L"operation", requestedOperation);
+          num(alias, L"sourceLine", error.aliasSourceLine);
+          num(alias, L"predicates", error.aliasPredicates);
+          reply.SetNamedValue(L"alias", alias);
+        }
         if (error.stage) {
           str(reply, L"stage", wide(error.stage));
           num(reply, L"nativeCode", error.win32);

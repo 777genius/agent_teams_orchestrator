@@ -38,3 +38,31 @@ test('Windows packaging requires both exact producer identities and preserves de
       .toBe(createHash('sha256').update(dll).digest('hex'))
   } finally { await rm(root, { recursive: true, force: true }) }
 })
+
+test('native directory alias predicate source preserves short circuit and closed original reply', async () => {
+  const { runInNewContext } = await import('node:vm')
+  const { decodeWindowsNativeFailure, readWindowsNativeAliasFailure } = await import('../../src/services/opencode/host/windows/OpenCodeV2WindowsNativeBroker.js')
+  const source = await readFile(path.resolve(import.meta.dir, '../../src/services/opencode/host/windows/WindowsKernelScope.cpp'), 'utf8')
+  const start = source.indexOf('static Handle canonicalDirectory('), begin = source.indexOf('  FILE_ATTRIBUTE_TAG_INFO tag{};', start), end = source.indexOf('  if (qualifyAcl)', begin)
+  const body = source.slice(begin, end).replace('FILE_ATTRIBUTE_TAG_INFO tag{};', 'const tag = { FileAttributes: attributes };').replaceAll('sizeof(tag)', '0').replaceAll('&tag', 'tag').replaceAll('__LINE__', '1')
+  for (const query of [false, true]) for (const directory of [false, true]) for (const reparse of [false, true]) for (const canonical of [false, true]) {
+    const checks: number[] = [], original = new Error('original-alias')
+    const context = { attributes: (directory ? 16 : 0) | (reparse ? 1024 : 0), handle: { value: 1 }, full: 'expected',
+      FILE_ATTRIBUTE_DIRECTORY: 16, FILE_ATTRIBUTE_REPARSE_POINT: 1024, FileAttributeTagInfo: 0,
+      GetFileInformationByHandleEx: () => query, finalPath: () => 'observed', equalPath: () => canonical,
+      requireAlias: (value: unknown, _code: string, _line: number, predicate: number) => { checks.push(predicate); if (!value) throw original } }
+    let caught: unknown
+    try { runInNewContext(body, context) } catch (error) { caught = error }
+    expect(caught).toBe(query && directory && !reparse && canonical ? undefined : original)
+    expect(checks).toEqual(!query ? [1] : !directory ? [1, 2] : reparse ? [1, 2, 3] : [1, 2, 3, 4])
+  }
+  expect(source).toContain('error.nativeStatus, error.aliasSourceLine, error.aliasPredicates}')
+  expect(source).toContain('str(alias, L"operation", requestedOperation)')
+  expect(source).toContain('num(alias, L"sourceLine", error.aliasSourceLine)')
+  expect(source).toContain('num(alias, L"predicates", error.aliasPredicates)')
+  const reply = { error: 'execution_path_alias', stage: 'alias_predicate', nativeCode: 0, alias: { operation: 'runStateSelect', sourceLine: 400, predicates: 2 } }
+  const error = decodeWindowsNativeFailure(reply, 'runStateSelect')
+  expect(readWindowsNativeAliasFailure(error)).toEqual({ operation: 'runStateSelect', sourceLine: 400, predicate: 2, passed: false })
+  expect(readWindowsNativeAliasFailure(decodeWindowsNativeFailure(reply, 'ownerOpenDirectory'))).toBeUndefined()
+  expect(readWindowsNativeAliasFailure(decodeWindowsNativeFailure({ ...reply, alias: { ...reply.alias, path: 'SECRET' } }, 'runStateSelect'))).toBeUndefined()
+})

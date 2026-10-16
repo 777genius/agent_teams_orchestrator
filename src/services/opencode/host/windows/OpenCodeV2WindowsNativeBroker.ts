@@ -9,6 +9,32 @@ import { fileURLToPath } from 'node:url'
 function assert(value: unknown, code: string): asserts value { if (!value) throw new Error(code) }
 export type WindowsNativeArtifact = Readonly<{ path: string; sha256: string; arch: 'x64' | 'arm64' }>
 const artifacts = new WeakSet<WindowsNativeArtifact>()
+export type WindowsNativeAliasFailure = Readonly<{ operation: string; sourceLine: number; predicate: number; passed: false }>
+const nativeAliasFailures = new WeakMap<Error, WindowsNativeAliasFailure>()
+const aliasOperations = ["assertLive", "identity", "launch", "ownerArchive", "ownerAssertDirectory", "ownerCloseDirectory", "ownerCreatePreparedDatabase", "ownerInspectProfileConfig", "ownerOpenDirectory", "ownerPreparePrivateDirectory", "ownerReadMetadata", "ownerReadRecord", "ownerSelectConfig", "ownerValidateSelectedProfile", "ownerWriteExclusive", "ownerWriteMetadata", "ownerWritePreparedAuth", "ownerWritePreparedConfig", "retire", "runStateAcquire", "runStateClose", "runStateDiscover", "runStateListen", "runStateOwnerRetired", "runStatePoisonConnection", "runStateProcessIdentity", "runStateReadControllerInbox", "runStateReadRecord", "runStateReadStop", "runStateRequest", "runStateReserve", "runStateRespond", "runStateSelect", "runStateValidateEndpoint", "runStateWriteRecord", "selfImageCustody", "send"] as const
+export function projectWindowsNativeAliasFailure(value: unknown): WindowsNativeAliasFailure | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const row = value as Record<string, unknown>
+  if (Object.keys(row).sort().join(',') !== 'operation,predicates,sourceLine' ||
+      !aliasOperations.some(operation => operation === row.operation) || !Number.isSafeInteger(row.sourceLine) ||
+      Number(row.sourceLine) < 1 || Number(row.sourceLine) > 100000 || !Number.isSafeInteger(row.predicates) ||
+      Number(row.predicates) < 0 || Number(row.predicates) > 4) return undefined
+  return Object.freeze({ operation: String(row.operation), sourceLine: Number(row.sourceLine), predicate: Number(row.predicates), passed: false })
+}
+export function readWindowsNativeAliasFailure(error: unknown): WindowsNativeAliasFailure | undefined {
+  return error instanceof Error ? nativeAliasFailures.get(error) : undefined
+}
+/** The normal reply decoder keeps the original finite failure as an Error. */
+export function decodeWindowsNativeFailure(value: Readonly<Record<string, unknown>>, operation: string): Error {
+  const code = typeof value.error === 'string' && /^[a-z_]{1,96}$/.test(value.error) ? value.error : 'execution_native_unknown'
+  const context = typeof value.stage === 'string' && /^[a-z_]{1,64}$/.test(value.stage) && Number.isSafeInteger(value.nativeCode) && Number(value.nativeCode) >= 0 && Number(value.nativeCode) <= 0xffffffff ? `:${value.stage}:${value.nativeCode}` : ''
+  const error = new Error(code + context)
+  if (code === 'execution_path_alias') {
+    const alias = projectWindowsNativeAliasFailure(value.alias)
+    if (alias && alias.operation === operation) nativeAliasFailures.set(error, alias)
+  }
+  return error
+}
 const CONTROL_PACKET_LIMIT = 16 * 1024 * 1024
 /** Resolve only producer-selected assets from the installed architecture directory. */
 async function resolveWindowsProducerAsset(name: string, manifestName: string, dll: boolean): Promise<WindowsNativeArtifact> {
@@ -73,7 +99,7 @@ export function createWindowsNativeBroker(artifact: WindowsNativeArtifact): Wind
 }
 function launchWindowsNativeBroker(artifact: WindowsNativeArtifact, custodyOnly: boolean): WindowsNativeBroker {
   assert(typeof process.env.LOCALAPPDATA === 'string' && path.win32.isAbsolute(process.env.LOCALAPPDATA), 'execution_containment_profile_denied')
-  const events = new EventEmitter(), pending = new Map<number, { resolve(value: unknown): void; reject(error: Error): void; dispose(): void }>()
+  const events = new EventEmitter(), pending = new Map<number, { operation: string; resolve(value: unknown): void; reject(error: Error): void; dispose(): void }>()
   const child = spawn(artifact.path, [custodyOnly ? '--self-image-custody' : '--broker', artifact.sha256], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], env: { SystemRoot: process.env.SystemRoot, WINDIR: process.env.WINDIR, LOCALAPPDATA: process.env.LOCALAPPDATA } })
   let ended = false, sequence = 0, buffer = '', stderr = ''
   const decoder = new StringDecoder('utf8')
@@ -95,9 +121,7 @@ function launchWindowsNativeBroker(artifact: WindowsNativeArtifact, custodyOnly:
           const waiter = pending.get(Number(value.id)); assert(waiter, 'execution_invalid_response'); pending.delete(Number(value.id)); waiter.dispose()
           if (value.ok === true) waiter.resolve(value.value)
           else {
-            const code = typeof value.error === 'string' && /^[a-z_]{1,96}$/.test(value.error) ? value.error : 'execution_native_unknown'
-            const context = typeof value.stage === 'string' && /^[a-z_]{1,64}$/.test(value.stage) && Number.isSafeInteger(value.nativeCode) && Number(value.nativeCode) >= 0 && Number(value.nativeCode) <= 0xffffffff ? `:${value.stage}:${value.nativeCode}` : ''
-            waiter.reject(new Error(code + context))
+            waiter.reject(decodeWindowsNativeFailure(value, waiter.operation))
           }
         } else if (value.kind === 'event' && typeof value.event === 'string') events.emit(value.event, value.value)
         else throw new Error('execution_invalid_response')
@@ -115,7 +139,7 @@ function launchWindowsNativeBroker(artifact: WindowsNativeArtifact, custodyOnly:
         const timer = setTimeout(() => { pending.delete(id); dispose(); reject(new Error('execution_native_timeout')); child.stdin.end() }, deadline - Date.now())
         const abort = () => { pending.delete(id); dispose(); reject(new Error('execution_cancelled')); child.stdin.end() }
         const dispose = () => { clearTimeout(timer); signal?.removeEventListener('abort', abort) }
-        pending.set(id, { resolve, reject, dispose }); signal?.addEventListener('abort', abort, { once: true })
+        pending.set(id, { operation, resolve, reject, dispose }); signal?.addEventListener('abort', abort, { once: true })
         child.stdin.write(bytes, error => { if (error) { pending.delete(id); dispose(); reject(new Error(
           operation === 'retire' ? 'execution_native_unknown:retire_broker_write:0' : 'execution_native_unknown')); child.stdin.end() } })
         if (signal?.aborted) abort()

@@ -1,3 +1,4 @@
+import { readWindowsNativeAliasFailure } from '../host/windows/OpenCodeV2WindowsNativeBroker.js'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { mkdir, lstat, writeFile } from 'node:fs/promises'
@@ -165,6 +166,7 @@ const privateNativeFailureCodes = new Set([
   'execution_owner_path_invalid', 'execution_owner_prepared_invalid', 'execution_owner_prepared_purpose_invalid',
   'execution_owner_read_only', 'execution_owner_unknown', 'execution_owner_write_through_pending'])
 const privateNativeFailureStages = new Set([
+  'alias_predicate',
   'assert_mapping', 'assert_stopped', 'assert_broker',
   'process_birth', 'process_image_path', 'process_image_open', 'process_birth_changed',
   'shared_acl_mutex_descriptor', 'shared_acl_mutex_create', 'shared_acl_mutex_security',
@@ -215,6 +217,7 @@ export async function recordOpenCodeV2ProviderFailure(phase: string, error: unkn
   const syscall = ['realpath', 'open', 'read', 'lstat', 'stat'].find(value => value === detail?.syscall)
   const failure = phase === 'execution-host-startup' && (name || errno || syscall)
     ? { ...(name ? { name } : {}), ...(errno ? { errno } : {}), ...(syscall ? { operation: syscall } : {}) } : undefined
+  const alias = readWindowsNativeAliasFailure(cause) ?? readWindowsNativeAliasFailure(error)
   const operation = readOpenCodeV2ProviderWireFailure(error)
   const startup = startupDiagnostic(startupOutput)
   const acquisition = acquisitionDiagnostic(acquisitionTiming)
@@ -236,6 +239,6 @@ export async function recordOpenCodeV2ProviderFailure(phase: string, error: unkn
     // Nonsecret observational data only: this file is not native ownership or
     // cleanup authority, even when an elevated Windows writer owns the file.
     await writeFile(path.join(directory, randomUUID() + '.json'), JSON.stringify({ schemaVersion: 1, phase, category, retainedOriginal,
-      ...(native?.native ? { native: native.native } : {}), ...(failure ? { failure } : {}), ...(operation ? { operation } : {}), ...(startup ? { startup } : {}), ...(acquisition ? { acquisition } : {}), ...(cleanup ? { cleanup } : {}), ...(initialization ? { initialization } : {}), recordedAt: new Date().toISOString() }), { flag: 'wx', mode: 0o600 })
+      ...(native?.native ? { native: native.native } : {}), ...(alias ? { alias } : {}), ...(failure ? { failure } : {}), ...(operation ? { operation } : {}), ...(startup ? { startup } : {}), ...(acquisition ? { acquisition } : {}), ...(cleanup ? { cleanup } : {}), ...(initialization ? { initialization } : {}), recordedAt: new Date().toISOString() }), { flag: 'wx', mode: 0o600 })
   } catch { /* Diagnostics cannot replace or retry the unresolved original operation. */ }
 }
