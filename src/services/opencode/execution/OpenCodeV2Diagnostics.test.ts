@@ -354,15 +354,35 @@ test('retirement diagnostics retain bounded timing and native failure without pr
     await recordOpenCodeV2ProviderFailure('run-member-retirement', new Error('timeout', { cause: new Error(secret) }), true, undefined, undefined, { elapsedMs: 22001, dataRoot: root })
     await recordOpenCodeV2ProviderFailure('run-member-retirement', new Error('run_control_process_identity:process_image_path:31'), true, undefined, undefined, { elapsedMs: 7 })
     await recordOpenCodeV2ProviderFailure('run-member-retirement', new Error(secret), true, undefined, undefined, { elapsedMs: -1 })
+    const outer = new Error('timeout', { cause: new Error(secret) })
+    const originalCause = outer.cause
+    await recordOpenCodeV2ProviderFailure('run-member-retirement', outer, true, undefined, undefined,
+      { elapsedMs: 22002, dataRoot: root, observation: { phase: 'kernel-retirement', nativePhase: 'retire_grants_roots' } })
+    for (const phase of ['owner-release', 'retained-roots', 'plan-close'] as const)
+      await recordOpenCodeV2ProviderFailure('run-member-retirement', outer, true, undefined, undefined,
+        { elapsedMs: 22003, dataRoot: root, observation: { phase, nativePhase: 'retire_grants_roots' } })
+    await recordOpenCodeV2ProviderFailure('run-member-retirement', outer, true, undefined, undefined,
+      { elapsedMs: 22004, dataRoot: root, observation: { phase: secret as never, nativePhase: secret as never } })
+    const earlier = new Error('cleanup_unknown')
+    retainOpenCodeV2CleanupPhase(earlier, 'dispose-transport')
+    await recordOpenCodeV2ProviderFailure('run-member-retirement', earlier, true, undefined, undefined,
+      { elapsedMs: 22005, dataRoot: root, observation: { phase: 'kernel-retirement', nativePhase: 'retire_grants_roots' } })
+    expect(outer.message).toBe('timeout'); expect(outer.cause).toBe(originalCause)
     const rows = await Promise.all((await readdir(path.join(root, 'opencode/v2/provider-diagnostics'))).map(async name => {
       const bytes = await readFile(path.join(root, 'opencode/v2/provider-diagnostics', name), 'utf8')
       expect(bytes).not.toContain(secret)
       return JSON.parse(bytes)
     }))
-    expect(rows).toHaveLength(4)
+    expect(rows).toHaveLength(10)
     expect(rows.find(row => row.category === 'execution_native_unknown')).toMatchObject({
       native: { stage: 'retire_owned_pair', nativeCode: 2147483659 }, cleanup: { elapsedMs: 74, phase: 'kernel-retirement' } })
-    expect(rows.find(row => row.category === 'timeout').cleanup).toEqual({ elapsedMs: 22001 })
+    expect(rows.find(row => row.cleanup?.elapsedMs === 22001)).toMatchObject({ category: 'timeout', cleanup: { elapsedMs: 22001 } })
+    expect(rows.find(row => row.cleanup?.elapsedMs === 22002)).toMatchObject({ category: 'timeout',
+      cleanup: { elapsedMs: 22002, phase: 'kernel-retirement', nativePhase: 'retire_grants_roots' } })
+    expect(rows.filter(row => row.cleanup?.elapsedMs === 22003).map(row => row.cleanup).sort((a, b) => a.phase.localeCompare(b.phase)))
+      .toEqual(['owner-release', 'plan-close', 'retained-roots'].map(phase => ({ elapsedMs: 22003, phase })))
+    expect(rows.find(row => row.cleanup?.elapsedMs === 22004).cleanup).toEqual({ elapsedMs: 22004 })
+    expect(rows.find(row => row.cleanup?.elapsedMs === 22005).cleanup).toEqual({ elapsedMs: 22005, phase: 'dispose-transport' })
     expect(rows.find(row => row.category === 'run_control_process_identity')).toMatchObject({ native: { stage: 'process_image_path', nativeCode: 31 }, cleanup: { elapsedMs: 7 } })
     expect(rows.find(row => row.category === 'provider_operation_unknown').cleanup).toBeUndefined()
   } finally {

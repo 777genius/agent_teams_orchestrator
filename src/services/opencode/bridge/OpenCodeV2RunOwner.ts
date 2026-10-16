@@ -13,7 +13,7 @@ import { isMutableExecutionReadback } from '../execution/OpenCodeV2TerminalSettl
 import { OpenCodeV2AdmissionStore } from '../execution/OpenCodeV2AdmissionStore.js'
 import { OpenCodeV2SessionService, verifyExecutionSession } from '../execution/OpenCodeV2SessionService.js'
 import { canonicalExecutionJSON, executionAssert, executionHash, executionRecord, type ExecutionContext, type SessionAuthority } from '../execution/OpenCodeV2ExecutionContracts.js'
-import { acquireExecutionLease, awaitExecutionHostReady, type ExecutionLease } from '../host/OpenCodeV2ExecutionHost.js'
+import { acquireExecutionLease, awaitExecutionHostReady, readExecutionCleanupObservation, type ExecutionLease } from '../host/OpenCodeV2ExecutionHost.js'
 import { isExecutionCleanupReceipt, type ExecutionCleanupReceipt } from '../host/OpenCodeV2ExecutionLifecycle.js'
 import { createOpenCodeV2ExecutionClient, type ExecutionBridgeClient, type ExecutionLog, type ExecutionMessagePage } from '../transport/OpenCodeV2ExecutionClientFactory.js'
 import { boundOpenCodeRead } from '../transport/OpenCodeBoundedFetch.js'
@@ -551,9 +551,10 @@ export class OpenCodeV2RunOwner {
       try { cleanup = await boundOpenCodeRead(this.closeLease(member.lease, closeDeadline), Math.max(1, closeDeadline - Date.now())) }
       catch (failure) {
         errors.push('physical_cleanup_unknown')
+        const observation = readExecutionCleanupObservation(member.lease)
         // Best-effort observation never extends the original physical stop budget.
         void recordOpenCodeV2ProviderFailure('run-member-retirement', failure, true, undefined, undefined,
-          { elapsedMs: Date.now() - cleanupStartedAt, dataRoot: this.plan.dataRoot }).catch(() => undefined)
+          { elapsedMs: Date.now() - cleanupStartedAt, dataRoot: this.plan.dataRoot, observation }).catch(() => undefined)
       }
       if (!durable) errors.push('run_tombstone_unknown')
       return { memberId: member.plan.memberId, cleanup, errors }

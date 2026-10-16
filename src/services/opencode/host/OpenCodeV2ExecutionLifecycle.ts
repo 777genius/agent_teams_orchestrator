@@ -28,7 +28,9 @@ export function executionClosedAck(value: unknown, nonce: string, pid: number, b
  * Scope cleanup. Positive receipts additionally require a concrete launch-owned
  * kernel receipt that carries the privately verified close acknowledgment.
  */
-export async function retireExecutionChild(port: ExecutionRetirementPort, deadline?: number): Promise<ExecutionCleanupReceipt> {
+export async function retireExecutionChild(port: ExecutionRetirementPort, deadline?: number,
+  observe?: (phase: ExecutionCleanupPhase) => void): Promise<ExecutionCleanupReceipt> {
+  const mark = (phase: ExecutionCleanupPhase) => { try { observe?.(phase) } catch { /* Observation cannot alter cleanup. */ } }
   // Windows Stop already owns a 22s physical-close window. Pass that SAME
   // absolute deadline through every wait and the native RPC; never restart it.
   // Standalone and POSIX retirement retain their original adapter budgets.
@@ -45,25 +47,33 @@ export async function retireExecutionChild(port: ExecutionRetirementPort, deadli
     throw error
   }
   const failures: { error: unknown; phase: ExecutionCleanupPhase }[] = []
+  mark('dispose-transport')
   try { await boundOpenCodeRead(port.disposeTransport(), remaining(3000)) } catch (error) { failures.push({ error, phase: 'dispose-transport' }) }
+  mark('send-close')
   try { if (!port.exited()) port.sendClose() } catch (error) { failures.push({ error, phase: 'send-close' }) }
+  mark('wait-exit')
   try { await boundOpenCodeRead(port.waitExit, remaining(10_000)) } catch {
     try {
+      mark('read-birth')
       const birth = await boundOpenCodeRead(port.readBirth(), remaining(1500))
       if (!port.exited() && birth !== null && executionHash(birth) === executionHash(port.birth)) {
+        mark('force-kill')
         const work = port.kill(nativeDeadline())
         if (closeDeadline === undefined) await work
         else await boundOpenCodeRead(Promise.resolve(work), remaining(Infinity))
       }
     } catch (error) { failures.push({ error, phase: 'force-kill' }) }
+    mark('wait-exit')
     try { await boundOpenCodeRead(port.waitExit, remaining(2000)) } catch (error) { failures.push({ error, phase: 'wait-exit' }) }
   }
   let retired = false
+  mark('read-birth')
   try {
     const birth = await boundOpenCodeRead(port.readBirth(), remaining(1500))
     retired = port.exited() && (birth === null || executionHash(birth) !== executionHash(port.birth))
   } catch (error) { failures.push({ error, phase: 'read-birth' }) }
   let kernel: unknown
+  mark('kernel-retirement')
   try {
     kernel = await boundOpenCodeRead(port.retireOwnedDescendants(nativeDeadline()),
       closeDeadline === undefined ? executionPlatformRetirementBudgetMs() : remaining(Infinity))

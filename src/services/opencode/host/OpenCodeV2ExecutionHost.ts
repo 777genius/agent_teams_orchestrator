@@ -20,7 +20,8 @@ import { bindWindowsExecutionSelectedConfig, closeWindowsExecutionPlan, consumeW
   type WindowsSelectedAuthMetadata } from './windows/OpenCodeV2WindowsExecution.js'
 import { selectWindowsRunMemberPreflightForPlan } from '../bridge/OpenCodeV2RunControl.js'
 import { resolveOpenCodeV2DarwinControllerRuntimeClosure } from '../profile/OpenCodeV2ExecutionReceipt.js'
-import { recordOpenCodeV2ProviderFailure, type ExecutionAcquisitionPhase } from '../execution/OpenCodeV2Diagnostics.js'
+import { recordOpenCodeV2ProviderFailure, executionNativeRetirementPhases, type ExecutionAcquisitionPhase,
+  type ExecutionCleanupPhase, type ExecutionCleanupObservation, type ExecutionNativeRetirementPhase } from '../execution/OpenCodeV2Diagnostics.js'
 
 export type { SelectedExecutionProfile, ValidatedExecutionNative } from './OpenCodeV2ExecutionBinding.js'
 type PrivateEndpointFields = { baseUrl: string; password: string; signal: AbortSignal; nativePID: number; fetch?: ExecutionPlatformLaunch['fetch']; selectedAuth?: WindowsSelectedAuthMetadata }
@@ -30,6 +31,11 @@ export function executionAuthorityIsCatalogOnly(authority: ExecutionAuthority): 
 const endpoints = new WeakMap<ExecutionAuthority, PrivateEndpointFields>()
 const graphs = new WeakMap<ExecutionAuthority, ExecutionGraph>()
 const disposers = new WeakMap<ExecutionAuthority, Set<() => Promise<void>>>()
+const cleanupObservations = new WeakMap<ExecutionLease, () => ExecutionCleanupObservation | undefined>()
+/** Exact acquired lease only. This snapshot is diagnostic and grants no cleanup authority. */
+export function readExecutionCleanupObservation(lease: ExecutionLease): ExecutionCleanupObservation | undefined {
+  try { return cleanupObservations.get(lease)?.() } catch { return undefined }
+}
 export function requireExecutionEndpoint(authority: ExecutionAuthority): PrivateEndpoint {
   const endpoint = endpoints.get(authority)
   executionAssert(endpoint && !endpoint.signal.aborted, 'execution_lease_not_owned')
@@ -249,6 +255,7 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
   let mapping: ExecutionPlatformMapping | undefined
   let mappingWork: Promise<ExecutionPlatformMapping> | undefined
   let exited = false, closeWork: Promise<ExecutionCleanupReceipt> | undefined
+  let cleanupPhase: ExecutionCleanupPhase | undefined, nativeCleanupPhase: ExecutionNativeRetirementPhase | undefined
   let exitResolve: () => void = () => undefined
   const exit = new Promise<void>(resolve => { exitResolve = resolve })
   const close = (deadline?: number): Promise<ExecutionCleanupReceipt> => closeWork ??= (async () => {
@@ -276,10 +283,13 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
       },
       sendClose: () => launch!.sendClose(), waitExit: exit,
       readBirth: () => launch!.readBirth ? launch!.readBirth() : readExecutionBirth(mapping!.bun.hostPID), kill: deadline => launch!.kill(deadline),
-      retireOwnedDescendants: deadline => launch!.retire(deadline) }, deadline)
+      retireOwnedDescendants: deadline => launch!.retire(deadline) }, deadline, phase => { cleanupPhase = phase })
     // UNKNOWN never releases the physical profile/database fence.
+    cleanupPhase = 'owner-release'
     await owner!.release(receipt)
+    cleanupPhase = 'retained-roots'
     await closeRetainedRoots()
+    cleanupPhase = 'plan-close'
     await closePlanOnce()
     executionAssert(process.platform !== 'win32' || deadline === undefined || Date.now() < deadline, 'execution_timeout')
     return receipt
@@ -308,6 +318,9 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
       executionAssert(typeof nonce === 'string', 'execution_identity_mismatch')
       launch = launchExecutionPlatform(plan, nonce, leaseOwnerId, native.bun, context.deadline)
       child = launch.child
+      child.on('retireProgress', (phase: unknown) => {
+        nativeCleanupPhase = executionNativeRetirementPhases.find(value => value === phase)
+      })
       child.once('close', () => { exited = true; lifetime.abort(); exitResolve(); void close().catch(() => undefined) })
       let graphResolve!: (value: Record<string, unknown>) => void, graphReject!: (error: unknown) => void
       graphReady = new Promise((resolve, reject) => { graphResolve = resolve; graphReject = reject })
@@ -388,7 +401,11 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
       }
       check()
       executionAssert(!closeWork && !exited, 'execution_host_unavailable')
-      return Object.freeze({ authority, signal: lifetime.signal, close })
+      const lease = Object.freeze({ authority, signal: lifetime.signal, close })
+      cleanupObservations.set(lease, () => cleanupPhase ? Object.freeze({ phase: cleanupPhase,
+        ...((cleanupPhase === 'kernel-retirement' || cleanupPhase === 'force-kill') && nativeCleanupPhase
+          ? { nativePhase: nativeCleanupPhase } : {}) }) : undefined)
+      return lease
       })
   } catch (failure) {
     const acquisitionTiming = timing()

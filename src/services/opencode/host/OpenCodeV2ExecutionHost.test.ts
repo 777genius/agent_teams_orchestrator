@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { createHash } from 'node:crypto'
 import { executionHash, openCodeV2RunInitializationMs } from '../execution/OpenCodeV2ExecutionContracts.js'
+import { executionNativeRetirementPhases, type ExecutionCleanupObservation, type ExecutionCleanupPhase } from '../execution/OpenCodeV2Diagnostics.js'
 import { boundOpenCodeRead } from '../transport/OpenCodeBoundedFetch.js'
 import { acquireExecutionLease, awaitExecutionHostReady } from './OpenCodeV2ExecutionHost.js'
 import { validateExecutionProfile, type ExecutionBirth, type SelectedExecutionProfile, type ValidatedExecutionNative } from './OpenCodeV2ExecutionBinding.js'
@@ -162,6 +163,10 @@ describe('execution host ownership and cleanup', () => {
     // this checks its actual ticket boundaries without launching a native child.
     const source = await readFile(new URL('./OpenCodeV2ExecutionHost.ts', import.meta.url), 'utf8')
     const body = new Bun.Transpiler({ loader: 'ts' }).transformSync(source.slice(source.indexOf('async function acquireOwnedNativeLease(')))
+    const reader = new Bun.Transpiler({ loader: 'ts' }).transformSync(source.slice(source.indexOf('export function readExecutionCleanupObservation('),
+      source.indexOf('export function requireExecutionEndpoint(')).replace('export ', ''))
+    const cleanupObservations = new WeakMap<object, () => ExecutionCleanupObservation | undefined>()
+    let heldRetirement: Promise<void> | undefined, heldRelease: Promise<void> | undefined
     let tail = Promise.resolve(), critical = 0, maximum = 0, birthReads = 0, catalogs = 0
     let platform: 'win32' | 'darwin' = 'win32'
     const gate = async <T>(work: () => Promise<T>) => {
@@ -170,7 +175,7 @@ describe('execution host ownership and cleanup', () => {
       await previous; critical++; maximum = Math.max(maximum, critical)
       try { return await work() } finally { critical--; release() }
     }
-    const launches: Array<{ emitGraph(drift?: Record<string, unknown>): void; activate: number; closed: number; release: number;
+    const launches: Array<{ emitGraph(drift?: Record<string, unknown>): void; emitNative(phase: unknown): void; activate: number; closed: number; release: number;
       readyChecks: number; readyError?: Error; readyGate?: Promise<void> }> = []
     let currentOwner: { release: number } | undefined
     const scope = { executionAssert: (value: unknown, message?: string) => { if (!value) throw new Error(message ?? 'invalid') },
@@ -180,7 +185,7 @@ describe('execution host ownership and cleanup', () => {
       consumeWindowsExecutionLaunchNonce: () => `TEST-${launches.length}`, bindWindowsExecutionSelectedConfig: async () => {},
       closeWindowsExecutionPlan: async () => {}, recordOpenCodeV2ProviderFailure: async () => {},
       acquireExecutionProfileOwner: async () => { const owner = { release: 0 }; currentOwner = owner; return {
-        beforeSpawn: async () => {}, bindChild: async () => {}, abandonBeforeSpawn: async () => {}, release: async () => { owner.release++ },
+        beforeSpawn: async () => {}, bindChild: async () => {}, abandonBeforeSpawn: async () => {}, release: async () => { owner.release++; await heldRelease },
       } },
       launchExecutionPlatform: (_plan: unknown, nonce: string, leaseOwnerId: string) => {
         expect(critical).toBe(1)
@@ -190,6 +195,7 @@ describe('execution host ownership and cleanup', () => {
           pin: native.version, graphSha256: native.graph.sha256, executableSha256: native.bun.sha256,
           profileEpoch: 'TEST-epoch', selectionSha256: executionHash(payload.profile.selection) })
         const observation: typeof launches[number] = { activate: 0, closed: 0, readyChecks: 0, get release() { return owner.release },
+          emitNative: phase => { child.emit('retireProgress', phase) },
           emitGraph: (drift = {}) => child.emit('message', { type: 'graph-ready', ...tuple(), ...drift }) }
         launches.push(observation)
         const assertLive = async () => {
@@ -206,12 +212,17 @@ describe('execution host ownership and cleanup', () => {
       },
       readExecutionBirth: async () => { birthReads++; expect(critical).toBe(1); return birth }, awaitExecutionHostReady,
       boundOpenCodeRead: async <T>(work: Promise<T>) => work,
-      retireExecutionChild: async (input: ExecutionRetirementPort) => { await Promise.resolve(); input.sendClose(); return {} },
+      retireExecutionChild: async (input: ExecutionRetirementPort, _deadline: number | undefined, observe?: (phase: ExecutionCleanupPhase) => void) => {
+        observe?.('kernel-retirement'); await Promise.resolve(); input.sendClose(); await heldRetirement; return {}
+      },
       awaitOpenCodeV2CatalogReadiness: async () => { catalogs++; expect(critical).toBe(1) }, initializeOpenCodeV2ExecutionAuth: async () => { expect(critical).toBe(1) },
       awaitOpenCodeV2ExecutionReadiness: async () => { expect(critical).toBe(1) },
       endpoints: new WeakMap(), graphs: new WeakMap(), disposers: new WeakMap(), catalogAuthorities: new WeakSet(),
+      cleanupObservations, executionNativeRetirementPhases,
     }
     const acquire = new Function('scope', `const {${Object.keys(scope).join(',')}}=scope;${body};return acquireOwnedNativeLease;`)(scope) as typeof acquireExecutionLease
+    const readObservation = new Function('scope', `const {cleanupObservations}=scope;${reader};return readExecutionCleanupObservation;`)(scope) as
+      (lease: import('./OpenCodeV2ExecutionHost.js').ExecutionLease) => ExecutionCleanupObservation | undefined
     const selected: SelectedExecutionProfile = { root: '/TEST-profile', epoch: 'TEST-epoch', directory: '/TEST-project', databasePath: '/TEST-profile/data/opencode.db',
       env: {}, envSha256: 'f'.repeat(64), config: { directory: '/TEST-profile/config', content: '{}', sha256: 'f'.repeat(64) },
       selection: { agent: 'worker', model: { providerID: 'TEST', id: 'model' }, permissions: [] } }
@@ -224,6 +235,24 @@ describe('execution host ownership and cleanup', () => {
     const leases = await Promise.all(work)
     expect(maximum).toBe(1); expect(launches.map(value => value.activate)).toEqual([1, 1])
     expect(birthReads).toBe(0); expect(launches.map(value => value.readyChecks)).toEqual([1, 1])
+    let releaseNative!: () => void, releaseOwner!: () => void
+    heldRetirement = new Promise<void>(resolve => { releaseNative = resolve })
+    heldRelease = new Promise<void>(resolve => { releaseOwner = resolve })
+    const closing = leases[0]!.close()
+    await wait(() => readObservation(leases[0]!)?.phase === 'kernel-retirement')
+    launches[0]!.emitNative('retire_grants_roots')
+    const snapshot = readObservation(leases[0]!)
+    await expect(boundOpenCodeRead(closing, 1)).rejects.toThrow('timeout') // Owner's outer timer wins while original cleanup is pending.
+    expect(snapshot).toEqual({ phase: 'kernel-retirement', nativePhase: 'retire_grants_roots' })
+    expect(Object.isFrozen(snapshot)).toBe(true)
+    expect(readObservation({ ...leases[0]! })).toBeUndefined() // Same-fields objects cannot borrow the original observation.
+    launches[0]!.emitNative('TEST-private-path-secret')
+    expect(readObservation(leases[0]!)).toEqual({ phase: 'kernel-retirement' })
+    launches[0]!.emitNative(undefined); releaseNative(); heldRetirement = undefined
+    await wait(() => readObservation(leases[0]!)?.phase === 'owner-release')
+    expect(readObservation(leases[0]!)).toEqual({ phase: 'owner-release' })
+    expect(snapshot).toEqual({ phase: 'kernel-retirement', nativePhase: 'retire_grants_roots' })
+    releaseOwner(); heldRelease = undefined; await closing
     await Promise.all(leases.map(lease => lease.close()))
     expect(launches.map(value => [value.closed, value.release])).toEqual([[1, 1], [1, 1]])
     const cancelled = acquire(native, selected, { ...context, deadline, signal: controller.signal }, gate)

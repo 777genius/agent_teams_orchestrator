@@ -114,9 +114,14 @@ export type RunInitializationPhase = 'MCP-connect' | 'MCP-readback' | 'controlle
 const initializationPhases = new Set<RunInitializationPhase>(['MCP-connect', 'MCP-readback', 'controller-tools', 'probe-authority'])
 const initializationFailures = new WeakMap<Error, Readonly<{ phase: RunInitializationPhase; elapsedMs: number }>>()
 export type ExecutionCleanupPhase = 'dispose-transport' | 'send-close' | 'force-kill' | 'wait-exit' | 'read-birth' | 'kernel-retirement' |
-  'process-retirement' | 'closed-ack' | 'kernel-proof' | 'kernel-binding'
+  'process-retirement' | 'closed-ack' | 'kernel-proof' | 'kernel-binding' | 'owner-release' | 'retained-roots' | 'plan-close'
 const cleanupPhases = new Set<ExecutionCleanupPhase>(['dispose-transport', 'send-close', 'force-kill', 'wait-exit', 'read-birth', 'kernel-retirement',
-  'process-retirement', 'closed-ack', 'kernel-proof', 'kernel-binding'])
+  'process-retirement', 'closed-ack', 'kernel-proof', 'kernel-binding', 'owner-release', 'retained-roots', 'plan-close'])
+export const executionNativeRetirementPhases = ['retire_job', 'retire_wait', 'retire_io_join', 'retire_main_exit',
+  'retire_owned_pair', 'retire_commands', 'retire_receipt', 'retire_grants', 'retire_grants_dll',
+  'retire_grants_roots', 'retire_grants_metadata'] as const
+export type ExecutionNativeRetirementPhase = typeof executionNativeRetirementPhases[number]
+export type ExecutionCleanupObservation = Readonly<{ phase: ExecutionCleanupPhase; nativePhase?: ExecutionNativeRetirementPhase }>
 const cleanupFailures = new WeakMap<Error, ExecutionCleanupPhase>()
 export function retainOpenCodeV2CleanupPhase(error: Error, phase: ExecutionCleanupPhase): void {
   if (cleanupPhases.has(phase) && !cleanupFailures.has(error)) cleanupFailures.set(error, phase)
@@ -202,7 +207,7 @@ function nativeFailure(error: unknown): { category: string; native?: { stage: st
     ? { native: { stage: match[2]!, nativeCode } } : {}) }
 }
 /** Private static phase/category only: never an arbitrary SDK message, body, credential or key. */
-export async function recordOpenCodeV2ProviderFailure(phase: string, error: unknown, retainedOriginal: boolean, startupOutput?: string, acquisitionTiming?: unknown, cleanupTiming?: Readonly<{ elapsedMs: number; dataRoot?: string }>): Promise<void> {
+export async function recordOpenCodeV2ProviderFailure(phase: string, error: unknown, retainedOriginal: boolean, startupOutput?: string, acquisitionTiming?: unknown, cleanupTiming?: Readonly<{ elapsedMs: number; dataRoot?: string; observation?: ExecutionCleanupObservation }>): Promise<void> {
   // Only our finite cleanup wrappers may preserve one exact known cause.
   const cause = error instanceof Error && (error.message === 'cleanup_unknown' || error.message === 'execution_owner_unknown')
     ? error.cause : undefined
@@ -222,10 +227,15 @@ export async function recordOpenCodeV2ProviderFailure(phase: string, error: unkn
   const operation = readOpenCodeV2ProviderWireFailure(error)
   const startup = startupDiagnostic(startupOutput)
   const acquisition = acquisitionDiagnostic(acquisitionTiming)
+  const observed = cleanupTiming?.observation
+  const observedPhase = observed && cleanupPhases.has(observed.phase) ? observed.phase : undefined
+  const cleanupPhase = error instanceof Error ? cleanupFailures.get(error) ?? observedPhase : observedPhase
+  const nativePhase = cleanupPhase === observedPhase && (cleanupPhase === 'kernel-retirement' || cleanupPhase === 'force-kill')
+    ? executionNativeRetirementPhases.find(value => value === observed?.nativePhase) : undefined
   const cleanup = phase === 'run-member-retirement' && Number.isSafeInteger(cleanupTiming?.elapsedMs) &&
     Number(cleanupTiming?.elapsedMs) >= 0 && Number(cleanupTiming?.elapsedMs) <= 86_400_000
-    ? { elapsedMs: Number(cleanupTiming?.elapsedMs), ...(error instanceof Error && cleanupFailures.has(error)
-      ? { phase: cleanupFailures.get(error)! } : {}) } : undefined
+    ? { elapsedMs: Number(cleanupTiming?.elapsedMs), ...(cleanupPhase ? { phase: cleanupPhase } : {}),
+      ...(nativePhase ? { nativePhase } : {}) } : undefined
   const initialization = phase === 'run-owner-initialization' && error instanceof Error ? initializationFailures.get(error) : undefined
   if (cleanupTiming?.dataRoot !== undefined && (!cleanup || typeof cleanupTiming.dataRoot !== 'string' || !path.isAbsolute(cleanupTiming.dataRoot))) return
   try {

@@ -307,6 +307,7 @@ test('closing Windows command handler drains retained commands and refuses new w
 
 test('native retirement timeout retains only the original nonce and finite cleanup progress', async () => {
   const events = new EventEmitter(), original = new Error('execution_native_timeout')
+  const observed: unknown[] = []
   const request = async (operation: string) => {
     expect(operation).toBe('retire')
     events.emit('retireProgress', { nonce: 'TEST-original', phase: 'retire_grants' })
@@ -317,10 +318,12 @@ test('native retirement timeout retains only the original nonce and finite clean
       { nonce: 'TEST-original', phase: 'retire_wait', body: 'TEST_PRIVATE_PAYLOAD' }]) events.emit('retireProgress', value)
     throw original
   }
-  const error = await retireWindowsNativeScope({ events, request }, 'TEST-original').then(() => undefined, error => error)
+  const error = await retireWindowsNativeScope({ events, request }, 'TEST-original', undefined,
+    phase => { observed.push(phase) }).then(() => undefined, error => error)
   expect(error?.message).toBe('execution_native_timeout:retire_grants_metadata:0')
   expect(error?.cause).toBe(original)
   expect(events.listenerCount('retireProgress')).toBe(0)
+  expect(observed).toEqual(['retire_grants', 'retire_grants_dll', 'retire_grants_roots', 'retire_grants_metadata', undefined])
   const failure = new Error('cleanup_unknown:retire_wait:0')
   await expect(retireWindowsNativeScope({ events, request: async () => { throw failure } }, 'TEST-original')).rejects.toBe(failure)
   const receipt = { empty: true }

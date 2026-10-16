@@ -7,6 +7,7 @@ import { validateExecutionProfile, type OwnedNativeProfile, type ExecutionBirth 
 import { createWindowsNativeBroker, resolveWindowsNativeArtifact, resolveWindowsRealpathArtifact, requireWindowsRealpathArtifact, type WindowsRealpathArtifact, type WindowsNativeArtifact, type WindowsNativeBroker } from './OpenCodeV2WindowsNativeBroker.js'
 import { createWindowsOwnerFilesystem } from './OpenCodeV2WindowsOwnerFilesystem.js'
 import { createWindowsExecutionHttpClient } from './OpenCodeV2WindowsHTTP.js'
+import { executionNativeRetirementPhases, type ExecutionNativeRetirementPhase } from '../../execution/OpenCodeV2Diagnostics.js'
 
 function assert(value: unknown, code = 'execution_containment_unqualified'): asserts value { if (!value) throw new Error(code) }
 function row(value: unknown): Record<string, unknown> { assert(value && typeof value === 'object' && !Array.isArray(value), 'execution_invalid_response'); return value as Record<string, unknown> }
@@ -104,16 +105,16 @@ export function createWindowsCommandRequestHandler(options: Readonly<{
 /** Progress is diagnostic only and belongs to the original launch nonce. It
  * cannot qualify a receipt or extend the caller's original close deadline. */
 export async function retireWindowsNativeScope(broker: Pick<WindowsNativeBroker, 'events' | 'request'>,
-  nonce: string, deadline?: number): Promise<unknown> {
-  const phases = new Set(['retire_job', 'retire_wait', 'retire_io_join', 'retire_main_exit',
-    'retire_owned_pair', 'retire_commands', 'retire_receipt', 'retire_grants',
-    'retire_grants_dll', 'retire_grants_roots', 'retire_grants_metadata'])
-  let phase: string | undefined
+  nonce: string, deadline?: number, observe?: (phase: ExecutionNativeRetirementPhase | undefined) => void): Promise<unknown> {
+  const notify = (value: ExecutionNativeRetirementPhase | undefined) => { try { observe?.(value) } catch { /* Diagnostic only. */ } }
+  let phase: ExecutionNativeRetirementPhase | undefined
   const progress = (value: unknown) => {
     if (!value || typeof value !== 'object' || Array.isArray(value)) return
     const record = value as Record<string, unknown>
-    if (Object.keys(record).sort().join(',') === 'nonce,phase' && record.nonce === nonce &&
-      typeof record.phase === 'string' && phases.has(record.phase)) phase = record.phase
+    const accepted = executionNativeRetirementPhases.find(value => value === record.phase)
+    if (Object.keys(record).sort().join(',') === 'nonce,phase' && record.nonce === nonce && accepted) {
+      phase = accepted; notify(phase)
+    }
   }
   assert(deadline === undefined || (Number.isSafeInteger(deadline) && deadline > 0), 'cleanup_unknown')
   const input = deadline === undefined ? {} : { deadline, timeoutMs: Math.max(0, Math.min(22_000, deadline - Date.now())) }
@@ -123,7 +124,7 @@ export async function retireWindowsNativeScope(broker: Pick<WindowsNativeBroker,
     if (error instanceof Error && error.message === 'execution_native_timeout' && phase)
       throw new Error(`execution_native_timeout:${phase}:0`, { cause: error })
     throw error
-  } finally { broker.events.off('retireProgress', progress) }
+  } finally { broker.events.off('retireProgress', progress); notify(undefined) }
 }
 /** Only the launch's native held-process event can close MAIN. Helper failure
  * remains an error and never supplies a MAIN exit code. */
@@ -377,7 +378,8 @@ export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, l
   // All exit paths share the first native attempt and its original budget.
   // Only retire() below can validate and mint a branded physical receipt.
   let nativeRetirement: Promise<unknown> | undefined
-  const retireNative = (deadline?: number) => nativeRetirement ??= retireWindowsNativeScope(broker, nonce, deadline)
+  const retireNative = (deadline?: number) => nativeRetirement ??= retireWindowsNativeScope(broker, nonce, deadline,
+    phase => child.emit('retireProgress', phase))
   const child = new EventEmitter() as EventEmitter & { pid?: number }
   const http = createWindowsExecutionHttpClient(
     value => broker.request('send', { value: { ...value, nonce, leaseOwnerId } }).then(() => undefined),
