@@ -19,6 +19,7 @@ type Installation = {
   readonly native: NativeLibrary
   readonly anchors: WindowsRealpathSelection['anchors']
   readonly context: bigint
+  readonly scratch: Readonly<{ output: Buffer; count: Buffer; error: Buffer }>
   active: boolean
   retiring: boolean
   state: 'installed' | 'retired' | 'unknown'
@@ -165,9 +166,10 @@ function resolveNative(
   try {
     const ffi = require('bun:ffi') as typeof import('bun:ffi')
     const inputBuffer = utf16(routed)
-    const outputBuffer = Buffer.alloc(OUTPUT_CAPACITY * 2)
-    const countBuffer = Buffer.alloc(4)
-    const errorBuffer = Buffer.alloc(ERROR_SIZE)
+    // This non-callback FFI call and decoding are synchronous. Keep its bounded
+    // scratch with this installation; no view escapes before the next call.
+    const { output: outputBuffer, count: countBuffer, error: errorBuffer } = install.scratch
+    outputBuffer.fill(0); countBuffer.fill(0); errorBuffer.fill(0)
     const status = install.native.symbols.RP_ResolveV1(
       install.context,
       ffi.ptr(inputBuffer),
@@ -347,6 +349,7 @@ export function installWindowsRealpathFallback(selection: WindowsRealpathSelecti
     if (process.platform !== 'win32') throw new Error('windows_realpath_platform_unsupported')
     validateSelection(selection)
     if (selection.expectedPid !== process.pid) throw new Error('windows_realpath_selection_invalid')
+    const scratch = { output: Buffer.alloc(OUTPUT_CAPACITY * 2), count: Buffer.alloc(4), error: Buffer.alloc(ERROR_SIZE) }
     const native = openNative(selection)
     let items: Surface[] = []
     try {
@@ -358,7 +361,8 @@ export function installWindowsRealpathFallback(selection: WindowsRealpathSelecti
       try { closeNative(native.library, native.context) } catch { /* retain */ }
       throw error
     }
-    active = { anchors: selection.anchors, native: native.library, context: native.context, active: true, retiring: false, state: 'installed' }
+    active = { anchors: selection.anchors, native: native.library, context: native.context, scratch,
+      active: true, retiring: false, state: 'installed' }
     return Object.freeze({
       uninstall(): void {
         const current = active
