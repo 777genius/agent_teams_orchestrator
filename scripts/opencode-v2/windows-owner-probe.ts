@@ -51,7 +51,7 @@ const closeFixtureWriters = async () => {
 }
 type FixturePowerShellPhase = 'tree_acl_snapshot' | 'probe_metadata_acl' | 'discovery_acl_fixture' |
   'appcontainer_sid_derivation' | 'metadata_acl_install' | 'metadata_acl_restore' |
-  'project_acl_snapshot' | 'project_low_integrity' | 'project_acl_install' | 'project_acl_restore'
+  'project_acl_snapshot' | 'project_acl_install' | 'project_acl_restore'
 const powershell = async (phase: FixturePowerShellPhase, script: string, target: string,
   extra: Record<string, string> = {}): Promise<string> => {
   assert.ok(process.env.ProgramFiles && path.win32.isAbsolute(process.env.ProgramFiles))
@@ -1018,6 +1018,46 @@ $bytes=[byte[]]::new($ace.BinaryLength);$ace.GetBinaryForm($bytes,0)
 [ordered]@{relative=$item.FullName.Substring($env:TEST_TARGET.Length);owner=$raw.Owner.Value;group=$raw.Group.Value;control=[int]$raw.ControlFlags;aces=$aces}})
 [Console]::Write((ConvertTo-Json -InputObject $rows -Depth 5 -Compress))`, sharedProject)) as Array<Record<string, unknown>>
   const rootIdentity = async () => { const info = await lstat(sharedProject); return { dev: info.dev, ino: info.ino, birth: info.birthtimeMs } }
+  const lowerProjectIntegrity = async () => {
+    assert.ok(process.env.SystemRoot && path.win32.isAbsolute(process.env.SystemRoot))
+    const executable = path.win32.join(process.env.SystemRoot, 'System32', 'icacls.exe')
+    const countOutput = async (stream: ReadableStream<Uint8Array>) => {
+      const reader = stream.getReader(); let bytes = 0
+      for (;;) { const part = await reader.read(); if (part.done) return bytes; bytes += part.value.byteLength }
+    }
+    for (const [index, target] of [sharedProject, projectDataRoot, otherProject].entries()) {
+      let operation: 'spawn' | 'output_read' | 'exit' = 'spawn'
+      let exitCode: number | null = null, stdoutBytes: number | null = null, stderrBytes: number | null = null
+      try {
+        // Bypass PowerShell's native-command activation entirely. Invoke only
+        // the exact system image and these three fresh TEST roots.
+        const child = Bun.spawn([executable, target, '/setintegritylevel', '(OI)(CI)L', '/T', '/Q'], {
+          env: { SystemRoot: process.env.SystemRoot, WINDIR: process.env.WINDIR },
+          stdin: 'ignore', stdout: 'pipe', stderr: 'pipe',
+        })
+        operation = 'output_read'
+        const [stdout, stderr, exit] = await Promise.allSettled([
+          countOutput(child.stdout), countOutput(child.stderr), child.exited,
+        ])
+        if (exit.status === 'fulfilled') exitCode = exit.value
+        if (stdout.status === 'fulfilled') stdoutBytes = stdout.value
+        if (stderr.status === 'fulfilled') stderrBytes = stderr.value
+        for (const result of [stdout, stderr, exit]) if (result.status === 'rejected') throw result.reason
+        operation = 'exit'
+        assert.equal(exitCode, 0, 'TEST_project_low_integrity_failed')
+      } catch (error) {
+        const failure: Partial<NodeJS.ErrnoException> = error !== null && typeof error === 'object' ? error : {}
+        const codes = ['E2BIG', 'EACCES', 'EBADF', 'EBUSY', 'EFAULT', 'EINVAL', 'EIO', 'EMFILE',
+          'ENAMETOOLONG', 'ENFILE', 'ENOENT', 'ENOEXEC', 'ENOMEM', 'ENOTDIR', 'EPERM', 'EPIPE', 'UNKNOWN']
+        facts.projectLowIntegrityFailure = { rootIndex: index, operation, exitCode, stdoutBytes, stderrBytes,
+          spawnErrno: codes.find(code => code === failure.code) ?? null,
+          errno: Number.isSafeInteger(failure.errno) && Number(failure.errno) >= -0x80000000 &&
+            Number(failure.errno) <= 0x7fffffff ? Number(failure.errno) : null }
+        throw new Error('TEST_project_low_integrity_failed')
+      }
+    }
+    facts.projectLowIntegrityRoots = 3
+  }
   const waitProjectPeer = async <T>(read: () => T | undefined): Promise<T> => {
     const deadline = Date.now() + 10_000
     for (;;) { const value = read(); if (value !== undefined) return value
@@ -1082,11 +1122,8 @@ if(peer&&await fs.readFile(path.join(process.cwd(),peer+'.txt'),'utf8')!==peer)t
 await fs.writeFile(path.join(process.cwd(),actor+'.txt'),actor)
 await Bun.stdout.write(actor+':written')
 `)
-    await powershell('project_low_integrity', `
-foreach($p in @($env:TEST_TARGET,$env:TEST_DATA_ROOT,$env:TEST_OTHER_PROJECT)){
-& (Join-Path $env:SystemRoot 'System32/icacls.exe') $p /setintegritylevel '(OI)(CI)L' /T /Q | Out-Null
-if($LASTEXITCODE-ne 0){throw 'TEST project low label failed'}}`, sharedProject,
-      { TEST_DATA_ROOT: projectDataRoot, TEST_OTHER_PROJECT: otherProject })
+    facts.projectCohortStage = 'project_low_integrity'
+    await lowerProjectIntegrity()
     const beforeIdentity = await rootIdentity()
     projectOriginalIdentity = beforeIdentity; projectBaseline = await projectAcl()
     const beforeAcl = projectBaseline[0]!
