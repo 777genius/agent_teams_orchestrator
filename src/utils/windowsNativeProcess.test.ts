@@ -24,14 +24,16 @@ test.skipIf(!kernel32)('an exited process held open elsewhere has no table row o
     CloseHandle: { args: [FFIType.u64], returns: FFIType.i32 },
   })
   const native = kernel32!
-  const child = Bun.spawn([process.execPath, '-e', 'setTimeout(() => {}, 300)'], { stdio: ['ignore', 'ignore', 'ignore'] })
+  // The child stays alive until stdin closes, independent of scheduling delays.
+  const child = Bun.spawn([process.execPath, '-e', 'await Bun.stdin.text()'], { stdin: 'pipe', stdout: 'ignore', stderr: 'ignore' })
   // A security product or monitor holding this handle keeps the process object and its PID.
   const holder = symbols.OpenProcess(0x1000 | 0x0010_0000, 0, child.pid)
   expect(holder).not.toBe(0n)
   try {
     expect(native.table().find(row => row.pid === child.pid)).toEqual({ pid: child.pid, ppid: process.pid })
     expect(native.birth(child.pid)).toBeGreaterThan(0)
-    await child.exited
+    await child.stdin.end()
+    expect(await child.exited).toBe(0)
     expect(native.table().some(row => row.pid === child.pid)).toBe(false)
     expect(native.birth(child.pid)).toBeNull()
   } finally { symbols.CloseHandle(holder) }

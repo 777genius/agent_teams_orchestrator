@@ -9,6 +9,7 @@ const TH32CS_SNAPPROCESS = 0x2
 const PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 const SYNCHRONIZE = 0x0010_0000
 const WAIT_TIMEOUT = 0x102
+const ERROR_NO_MORE_FILES = 18
 const INVALID_HANDLE_VALUE = 0xffff_ffff_ffff_ffffn
 // 64-bit PROCESSENTRY32W: th32ProcessID at 8, th32ParentProcessID at 32.
 const PROCESS_ENTRY_SIZE = 568
@@ -32,6 +33,7 @@ async function loadKernel32(): Promise<WindowsNativeProcess> {
     OpenProcess: { args: [FFIType.u32, FFIType.i32, FFIType.u32], returns: FFIType.u64 },
     GetProcessTimes: { args: [FFIType.u64, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
     WaitForSingleObject: { args: [FFIType.u64, FFIType.u32], returns: FFIType.u32 },
+    GetLastError: { args: [], returns: FFIType.u32 },
     CloseHandle: { args: [FFIType.u64], returns: FFIType.i32 },
   })
 
@@ -58,11 +60,16 @@ async function loadKernel32(): Promise<WindowsNativeProcess> {
       const entry = Buffer.alloc(PROCESS_ENTRY_SIZE)
       entry.writeUInt32LE(PROCESS_ENTRY_SIZE, 0)
       const rows: WindowsProcessRow[] = []
-      for (let more = symbols.Process32FirstW(snapshot, ptr(entry)); more; more = symbols.Process32NextW(snapshot, ptr(entry))) {
+      let more = symbols.Process32FirstW(snapshot, ptr(entry))
+      while (more) {
         rows.push({ pid: entry.readUInt32LE(8), ppid: entry.readUInt32LE(32) })
+        more = symbols.Process32NextW(snapshot, ptr(entry))
       }
-      // The snapshot is an atomic kernel copy; an unusable one omits this process.
-      if (!rows.some(row => row.pid === process.pid)) throw new Error('Unreadable process tree')
+      // Read the error before any other call. A truncated table could omit a
+      // protected or live descendant, so only normal completion is accepted.
+      if (symbols.GetLastError() !== ERROR_NO_MORE_FILES || !rows.some(row => row.pid === process.pid)) {
+        throw new Error('Unreadable process tree')
+      }
       return rows
     } finally { symbols.CloseHandle(snapshot) }
   }
