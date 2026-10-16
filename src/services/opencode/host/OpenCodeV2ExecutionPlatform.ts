@@ -1,5 +1,6 @@
 import type { EventEmitter } from 'node:events'
 import { executionAssert } from '../execution/OpenCodeV2ExecutionContracts.js'
+import type { ExecutionCommandObservation } from '../execution/OpenCodeV2Diagnostics.js'
 import type { ExecutionBirth } from './OpenCodeV2ExecutionBinding.js'
 import { isKernelRetirement, isLinuxExecutionMapping, launchLinuxExecution, linuxBirth,
   planLinuxExecution, prepareLinuxExecutionChild } from './OpenCodeV2ExecutionLauncher.js'
@@ -18,6 +19,8 @@ export type ExecutionPlatformMapping = Readonly<{
 }>
 export type ExecutionPlatformLaunch = Readonly<{
   output?(): Readonly<{ stdout: string; stderr: string }>
+  /** Diagnostic-only native command channel snapshot; grants no authority. */
+  commands?(): ExecutionCommandObservation
   fetch?: (input: Parameters<typeof globalThis.fetch>[0], init?: Parameters<typeof globalThis.fetch>[1]) => Promise<Response>
   child: Pick<EventEmitter, 'on' | 'once'> & Readonly<{ pid?: number }>
   prepare(deadline: number, signal?: AbortSignal): Promise<ExecutionPlatformMapping>

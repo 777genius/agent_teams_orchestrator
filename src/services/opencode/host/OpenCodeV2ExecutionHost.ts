@@ -20,8 +20,8 @@ import { bindWindowsExecutionSelectedConfig, closeWindowsExecutionPlan, consumeW
   type WindowsSelectedAuthMetadata } from './windows/OpenCodeV2WindowsExecution.js'
 import { selectWindowsRunMemberPreflightForPlan } from '../bridge/OpenCodeV2RunControl.js'
 import { resolveOpenCodeV2DarwinControllerRuntimeClosure } from '../profile/OpenCodeV2ExecutionReceipt.js'
-import { recordOpenCodeV2ProviderFailure, executionNativeRetirementPhases, type ExecutionAcquisitionPhase,
-  type ExecutionCleanupPhase, type ExecutionCleanupObservation, type ExecutionNativeRetirementPhase } from '../execution/OpenCodeV2Diagnostics.js'
+import { recordOpenCodeV2ProviderFailure, executionNativeRetirementPhases, type ExecutionAcquisitionPhase, type ExecutionAcquisitionTiming,
+  type ExecutionCleanupPhase, type ExecutionCleanupObservation, type ExecutionCommandObservation, type ExecutionNativeRetirementPhase } from '../execution/OpenCodeV2Diagnostics.js'
 
 export type { SelectedExecutionProfile, ValidatedExecutionNative } from './OpenCodeV2ExecutionBinding.js'
 type PrivateEndpointFields = { baseUrl: string; password: string; signal: AbortSignal; nativePID: number; fetch?: ExecutionPlatformLaunch['fetch']; selectedAuth?: WindowsSelectedAuthMetadata }
@@ -35,6 +35,13 @@ const cleanupObservations = new WeakMap<ExecutionLease, () => ExecutionCleanupOb
 /** Exact acquired lease only. This snapshot is diagnostic and grants no cleanup authority. */
 export function readExecutionCleanupObservation(lease: ExecutionLease): ExecutionCleanupObservation | undefined {
   try { return cleanupObservations.get(lease)?.() } catch { return undefined }
+}
+export type ExecutionLeaseObservation = Readonly<{ acquisition: ExecutionAcquisitionTiming; commands?: ExecutionCommandObservation }>
+const leaseObservations = new WeakMap<ExecutionLease, () => ExecutionLeaseObservation>()
+/** Exact acquired lease only: its successful acquisition timing and native
+ * command channel facts. Diagnostic data; it grants no lease or cleanup authority. */
+export function readExecutionLeaseObservation(lease: ExecutionLease): ExecutionLeaseObservation | undefined {
+  try { return leaseObservations.get(lease)?.() } catch { return undefined }
 }
 export function requireExecutionEndpoint(authority: ExecutionAuthority): PrivateEndpoint {
   const endpoint = endpoints.get(authority)
@@ -409,6 +416,13 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
       cleanupObservations.set(lease, () => cleanupPhase ? Object.freeze({ phase: cleanupPhase,
         ...((cleanupPhase === 'kernel-retirement' || cleanupPhase === 'force-kill') && nativeCleanupPhase
           ? { nativePhase: nativeCleanupPhase } : {}) }) : undefined)
+      // Successful acquisition timing is otherwise written only on refusal.
+      const acquired = timing(), acquisition: ExecutionAcquisitionTiming = Object.freeze({ elapsedMs: acquired.elapsedMs,
+        history: Object.freeze(acquired.history.map(entry => Object.freeze({ ...entry }))) })
+      leaseObservations.set(lease, () => {
+        const commands = launch?.commands?.()
+        return Object.freeze({ acquisition, ...(commands ? { commands } : {}) })
+      })
       return lease
       })
   } catch (failure) {

@@ -7,7 +7,8 @@ import { validateExecutionProfile, type OwnedNativeProfile, type ExecutionBirth 
 import { createWindowsNativeBroker, resolveWindowsNativeArtifact, resolveWindowsRealpathArtifact, requireWindowsRealpathArtifact, type WindowsRealpathArtifact, type WindowsNativeArtifact, type WindowsNativeBroker } from './OpenCodeV2WindowsNativeBroker.js'
 import { createWindowsOwnerFilesystem } from './OpenCodeV2WindowsOwnerFilesystem.js'
 import { createWindowsExecutionHttpClient } from './OpenCodeV2WindowsHTTP.js'
-import { executionNativeRetirementPhases, type ExecutionNativeRetirementPhase } from '../../execution/OpenCodeV2Diagnostics.js'
+import { executionCommandOperations, executionNativeRetirementPhases, type ExecutionCommandObservation, type ExecutionCommandOperation,
+  type ExecutionNativeRetirementPhase } from '../../execution/OpenCodeV2Diagnostics.js'
 import { OPEN_CODE_V2_WINDOWS_CLOSE_MS } from '../../execution/OpenCodeV2ExecutionContracts.js'
 
 function assert(value: unknown, code = 'execution_containment_unqualified'): asserts value { if (!value) throw new Error(code) }
@@ -68,18 +69,76 @@ export function createWindowsCommandRequestReplay(): WindowsCommandRequestReplay
     },
   })
 }
+/** Diagnostic-only facts for one lease's command channel: closed operation
+ * names, counts, latencies, byte offsets and exit state. It never retains
+ * arguments, environment, paths or stream bytes and cannot affect a reply. */
+function createWindowsCommandObservation() {
+  type Command = { -readonly [K in keyof ExecutionCommandObservation['commands'][number]]: ExecutionCommandObservation['commands'][number][K] }
+  const operations = new Map<ExecutionCommandOperation, { requests: number; failures: number; maxLatencyMs: number }>()
+  const commands = new Map<string, Command>()
+  let starts = 0, firstFailedOperation: ExecutionCommandOperation | null = null
+  const offset = (value: unknown) => Number.isSafeInteger(value) && Number(value) >= 0 ? Number(value) : 0
+  return Object.freeze({
+    settle(operation: ExecutionCommandOperation, input: Record<string, unknown>, result: unknown, startedAt: number, ok: boolean) {
+      try {
+        const latency = Math.max(0, Date.now() - startedAt)
+        const stats = operations.get(operation) ?? { requests: 0, failures: 0, maxLatencyMs: 0 }
+        stats.requests++; stats.maxLatencyMs = Math.max(stats.maxLatencyMs, latency)
+        if (!ok) { stats.failures++; firstFailedOperation ??= operation }
+        operations.set(operation, stats)
+        const value = result && typeof result === 'object' && !Array.isArray(result) ? result as Record<string, unknown> : {}
+        if (operation === 'commandStart') {
+          if (!ok) return
+          starts++
+          if (typeof value.commandId === 'string' && commands.size < 8 && !commands.has(value.commandId))
+            commands.set(value.commandId, { startedAt, startLatencyMs: latency, stdin: input.stdin === 'pipe' ? 'pipe' : 'ignore',
+              stdinBytes: 0, stdoutBytes: 0, stderrBytes: 0, stdoutEof: false, stderrEof: false, running: null, exitCode: null, failedOperation: null })
+          return
+        }
+        const command = typeof input.commandId === 'string' ? commands.get(input.commandId) : undefined
+        if (!command) return
+        if (!ok) { command.failedOperation ??= operation; return }
+        if (operation === 'commandWriteStdin') command.stdinBytes = Math.max(command.stdinBytes, offset(value.nextOffset))
+        if (operation === 'commandRead' && input.stream === 'stdout') {
+          command.stdoutBytes = Math.max(command.stdoutBytes, offset(value.nextOffset)); command.stdoutEof ||= value.eof === true
+        }
+        if (operation === 'commandRead' && input.stream === 'stderr') {
+          command.stderrBytes = Math.max(command.stderrBytes, offset(value.nextOffset)); command.stderrEof ||= value.eof === true
+        }
+        if (operation === 'commandStatus' && typeof value.running === 'boolean') {
+          command.running = value.running
+          command.exitCode = !value.running && Number.isSafeInteger(value.exitCode) ? Number(value.exitCode) : null
+        }
+      } catch { /* Observation never changes the native command result. */ }
+    },
+    snapshot(): ExecutionCommandObservation {
+      return Object.freeze({ starts, firstFailedOperation,
+        operations: Object.freeze(executionCommandOperations.flatMap(operation => {
+          const stats = operations.get(operation)
+          return stats ? [Object.freeze({ operation, ...stats })] : []
+        })),
+        commands: Object.freeze([...commands.values()].map(command => Object.freeze({ ...command }))) })
+    },
+  })
+}
 /** The child keeps using the original command channel while its Scope closes.
  * Only native retained command IDs may retire/close; no new work is admitted. */
 export function createWindowsCommandRequestHandler(options: Readonly<{
   nonce: string; leaseOwnerId: string; ready(): boolean; closing(): boolean
   assertLive(allowClosing: boolean): Promise<void>; request: WindowsNativeBroker['request']; failed(): void
 }>) {
-  const replay = createWindowsCommandRequestReplay()
-  const operations = new Set(['commandStart', 'commandRead', 'commandStatus', 'commandWriteStdin', 'commandEndStdin', 'commandRetire', 'commandClose'])
+  const replay = createWindowsCommandRequestReplay(), observation = createWindowsCommandObservation()
+  const operations = new Set<string>(executionCommandOperations)
   const lifecycle = new Set(['commandRetire', 'commandClose'])
   const failed = () => { try { options.failed() } catch { /* Error observers cannot poison the native frame parser. */ } }
-  return async (value: unknown): Promise<void> => {
+  return Object.assign(async (value: unknown): Promise<void> => {
     let id: string | undefined, authority: object | undefined
+    let observed: Readonly<{ operation: ExecutionCommandOperation; input: Record<string, unknown> }> | undefined
+    const startedAt = Date.now()
+    const settle = (ok: boolean, result?: unknown) => {
+      if (observed) observation.settle(observed.operation, observed.input, result, startedAt, ok)
+      observed = undefined
+    }
     const reply = (ok: boolean, result?: unknown) => options.request('send', {
       value: { type: 'commandResult', id, nonce: options.nonce, leaseOwnerId: options.leaseOwnerId, ok,
         ...(ok ? { value: result } : {}) },
@@ -90,18 +149,21 @@ export function createWindowsCommandRequestHandler(options: Readonly<{
         record.nonce === options.nonce && record.leaseOwnerId === options.leaseOwnerId &&
         typeof record.id === 'string' && /^[a-f0-9-]{36}$/.test(record.id) &&
         typeof record.operation === 'string' && operations.has(record.operation), 'execution_native_command_unknown')
-      const input = row(record.input), operation = record.operation as string
+      const input = row(record.input), operation = record.operation as ExecutionCommandOperation
+      observed = { operation, input }
       id = record.id as string; authority = replay.admit(id, operation)
-      if (options.closing() && !lifecycle.has(operation)) { await reply(false); return }
+      if (options.closing() && !lifecycle.has(operation)) { settle(false); await reply(false); return }
       await options.assertLive(lifecycle.has(operation))
-      if (options.closing() && !lifecycle.has(operation)) { await reply(false); return }
+      if (options.closing() && !lifecycle.has(operation)) { settle(false); await reply(false); return }
       const result = await options.request(operation, operation === 'commandStart' ? { ...input, commandId: randomUUID() } : input)
+      settle(true, result)
       await reply(true, result)
     } catch {
+      settle(false)
       if (id && authority) { try { await reply(false) } catch { failed() } }
       else failed()
     } finally { if (id && authority) replay.settle(id, authority) }
-  }
+  }, { observation: (): ExecutionCommandObservation => observation.snapshot() })
 }
 /** Progress is diagnostic only and belongs to the original launch nonce. It
  * cannot qualify a receipt or extend the caller's original close deadline. */
@@ -456,7 +518,7 @@ export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, l
   }
   let preparation: Promise<WindowsExecutionMapping> | undefined, retirement: Promise<WindowsKernelRetirement> | undefined
   let deferredRuntime = false, activated = false
-  return Object.freeze({ child, fetch: http.fetch,
+  return Object.freeze({ child, fetch: http.fetch, commands: () => commandRequest.observation(),
     output: () => ({ stdout: '', stderr: launchHistory.length === 0 ? '' : JSON.stringify({
       event: 'opencode-v2-startup', reason: 'failed', stage: launchHistory.at(-1)!.stage,
       elapsedMs: Math.max(launchHistory.at(-1)!.elapsedMs, Date.now() - launchStarted), history: launchHistory,

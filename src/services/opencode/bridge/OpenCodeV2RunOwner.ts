@@ -13,7 +13,7 @@ import { isMutableExecutionReadback } from '../execution/OpenCodeV2TerminalSettl
 import { OpenCodeV2AdmissionStore } from '../execution/OpenCodeV2AdmissionStore.js'
 import { OpenCodeV2SessionService, verifyExecutionSession } from '../execution/OpenCodeV2SessionService.js'
 import { canonicalExecutionJSON, executionAssert, executionHash, executionRecord, OPEN_CODE_V2_WINDOWS_CLOSE_MS, type ExecutionContext, type SessionAuthority } from '../execution/OpenCodeV2ExecutionContracts.js'
-import { acquireExecutionLease, awaitExecutionHostReady, readExecutionCleanupObservation, type ExecutionLease } from '../host/OpenCodeV2ExecutionHost.js'
+import { acquireExecutionLease, awaitExecutionHostReady, readExecutionCleanupObservation, readExecutionLeaseObservation, type ExecutionLease } from '../host/OpenCodeV2ExecutionHost.js'
 import { isExecutionCleanupReceipt, type ExecutionCleanupReceipt } from '../host/OpenCodeV2ExecutionLifecycle.js'
 import { createOpenCodeV2ExecutionClient, type ExecutionBridgeClient, type ExecutionLog, type ExecutionMessagePage } from '../transport/OpenCodeV2ExecutionClientFactory.js'
 import { boundOpenCodeRead } from '../transport/OpenCodeBoundedFetch.js'
@@ -62,6 +62,7 @@ export function validateRunLaunchPlan(plan: RunLaunchPlan): void {
 /** One bounded run, in the process that acquired every lease. No durable DTO
  * or caller-supplied ExecutionAuthority is ever converted into lease authority. */
 export class OpenCodeV2RunOwner {
+  private readonly ownerStartedAt = Date.now()
   private readonly members = new Map<string, Member>()
   private readonly active = new Set<Promise<unknown>>()
   private readonly operations = new Set<AbortController>()
@@ -196,6 +197,7 @@ export class OpenCodeV2RunOwner {
   private async initializeMember(memberPlan: RunMemberPlan, initializationDeadline: number): Promise<void> {
     const initializationStartedAt = Date.now()
     let initializationPhase: RunInitializationPhase | undefined
+    const initializationHistory: { phase: RunInitializationPhase; at: number }[] = []
     executionAssert(this.state === 'starting' && !this.initializationAbort.signal.aborted &&
       Date.now() < initializationDeadline, 'run_stopped')
     const lease = this.pendingLeases.get(memberPlan.memberId) ?? await this.acquireMember(memberPlan, initializationDeadline)
@@ -225,8 +227,11 @@ export class OpenCodeV2RunOwner {
       executionAssert(created.disposition === 'accepted' && created.session, 'run_original_session_unknown')
       const initializingMember = member
       const markInitialization = (phase: RunInitializationPhase): void => {
+        const at = Date.now()
         initializationPhase = phase
-        initializingMember.initialization = { phase, startedAt: Date.now() }
+        // First entry per phase; transcript pages repeat the same read phase.
+        if (!initializationHistory.some(entry => entry.phase === phase)) initializationHistory.push({ phase, at })
+        initializingMember.initialization = { phase, startedAt: at }
       }
       // Actual native persistent context, never a queue/resume:false model
       // turn. There is no published messageID for an instruction entry.
@@ -260,7 +265,20 @@ export class OpenCodeV2RunOwner {
       delete member.initialization
       await this.persistState()
     } catch (failure) {
-      if (initializationPhase) retainOpenCodeV2InitializationPhase(failure, initializationPhase, Date.now() - initializationStartedAt)
+      if (initializationPhase) {
+        // Diagnostic snapshot of this exact lease at the original failure. The
+        // controller MCP child is reached only through its command channel.
+        const observation = readExecutionLeaseObservation(lease)
+        const mcpStartedAt = initializationHistory.find(entry => entry.phase === 'MCP-connect')?.at
+        const commands = observation?.commands && mcpStartedAt !== undefined &&
+          (initializationPhase.startsWith('MCP-') || initializationPhase === 'controller-tools')
+          ? { observation: observation.commands, originAt: mcpStartedAt } : undefined
+        retainOpenCodeV2InitializationPhase(failure, initializationPhase, Date.now() - initializationStartedAt, {
+          ownerElapsedMs: initializationStartedAt - this.ownerStartedAt,
+          history: initializationHistory.map(({ phase, at }) => ({ phase, elapsedMs: at - initializationStartedAt })),
+          ...(observation ? { acquisition: observation.acquisition } : {}), ...(commands ? { commands } : {}),
+        })
+      }
       // If an object was not yet registered, no lease may escape cleanup.
       if (!member || this.state !== 'starting') {
         const closing = this.closeLease(lease)

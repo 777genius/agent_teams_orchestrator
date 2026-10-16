@@ -201,6 +201,80 @@ test('owner initialization diagnostics retain only trusted finite sideband witho
   }
 })
 
+test('owner MCP initialization retains closed command channel facts from the actual Windows handler', async () => {
+  const { createWindowsCommandRequestHandler } = await import('../host/windows/OpenCodeV2WindowsExecution.js')
+  const root = await mkdtemp(path.join(tmpdir(), 'TEST-v2-owner-commands-'))
+  const previous = process.env.CLAUDE_MULTIMODEL_DATA_HOME
+  process.env.CLAUDE_MULTIMODEL_DATA_HOME = root
+  const secret = 'TEST-PRIVATE-COMMAND-PAYLOAD', nonce = 'TEST-nonce', leaseOwnerId = 'TEST-lease'
+  let now = 1_000_000, counter = 0, commandId = ''
+  const replies: Record<string, unknown>[] = []
+  const clock = spyOn(Date, 'now').mockImplementation(() => now)
+  try {
+    const handler = createWindowsCommandRequestHandler({ nonce, leaseOwnerId, ready: () => true, closing: () => false,
+      assertLive: async () => undefined, failed: () => undefined,
+      request: async (operation, input = {}) => {
+        const value = input as Record<string, unknown>
+        if (operation === 'send') { replies.push(value.value as Record<string, unknown>); return undefined }
+        now += 7
+        if (operation === 'commandStart') { commandId = String(value.commandId); return { commandId, pid: 4, birthFiletime: '1' } }
+        if (operation === 'commandWriteStdin') return { writtenBytes: 120, nextOffset: 120 }
+        if (operation === 'commandRead' && value.stream === 'stderr') return { bytesBase64: secret, nextOffset: 42, eof: false }
+        if (operation === 'commandRead' && value.offset === 1) throw new Error(secret)
+        if (operation === 'commandRead') return { bytesBase64: '', nextOffset: 0, eof: false }
+        if (operation === 'commandStatus') return { running: true, exitCode: null }
+        throw new Error(secret)
+      } })
+    const send = (operation: string, input: Record<string, unknown>) => handler({ type: 'commandRequest', nonce, leaseOwnerId,
+      id: `00000000-0000-4000-8000-${String(++counter).padStart(12, '0')}`, operation, input })
+    const mcpStartedAt = now
+    now += 5
+    await send('commandStart', { executable: `C:\\${secret}\\node.exe`, args: [secret], cwd: 'C:\\', env: { TOKEN: secret }, stdin: 'pipe' })
+    await send('commandWriteStdin', { commandId, offset: 0, bytesBase64: secret })
+    await send('commandRead', { commandId, stream: 'stdout', offset: 0, maxBytes: 8192 })
+    await send('commandRead', { commandId, stream: 'stderr', offset: 0, maxBytes: 8192 })
+    await send('commandStatus', { commandId })
+    await send('commandRead', { commandId, stream: 'stdout', offset: 1, maxBytes: 8192 })
+    expect(replies.map(reply => reply.ok)).toEqual([true, true, true, true, true, false])
+    const error = new Error('invalid_response'), history = [{ phase: 'bootstrap-before-log' as const, elapsedMs: 9 }, { phase: 'MCP-connect' as const, elapsedMs: 40 }]
+    const acquisition = { elapsedMs: 120, history: [{ phase: 'preparing' as const, elapsedMs: 0 }, { phase: 'selection-ready' as const, elapsedMs: 110 }] }
+    retainOpenCodeV2InitializationPhase(error, 'MCP-connect', 30_041, { ownerElapsedMs: 150, history, acquisition,
+      commands: { observation: handler.observation(), originAt: mcpStartedAt } })
+    await recordOpenCodeV2ProviderFailure('run-owner-initialization', error, true)
+    // Each invalid optional fact is omitted; the original phase is still retained.
+    const invalid = new Error('invalid_response')
+    retainOpenCodeV2InitializationPhase(invalid, 'MCP-readback', 5, { ownerElapsedMs: -1,
+      history: [{ phase: secret as RunInitializationPhase, elapsedMs: 1 }],
+      acquisition: { elapsedMs: 1, history: [{ phase: 'mapping', elapsedMs: 0 }] },
+      commands: { observation: { operations: null } as never, originAt: 0 } })
+    await recordOpenCodeV2ProviderFailure('run-owner-initialization', invalid, true)
+    const rows = await Promise.all((await readdir(path.join(root, 'opencode/v2/provider-diagnostics'))).map(async name => {
+      const bytes = await readFile(path.join(root, 'opencode/v2/provider-diagnostics', name), 'utf8')
+      expect(bytes).not.toContain(secret)
+      expect(bytes).not.toContain(commandId)
+      return JSON.parse(bytes)
+    }))
+    const observed = rows.find(row => row.initialization.phase === 'MCP-connect')
+    expect(observed.acquisition).toEqual(acquisition)
+    expect(observed.initialization).toEqual({ phase: 'MCP-connect', elapsedMs: 30_041, ownerElapsedMs: 150, history, commands: {
+      starts: 1, firstFailedOperation: 'commandRead',
+      operations: [{ operation: 'commandStart', requests: 1, failures: 0, maxLatencyMs: 7 },
+        { operation: 'commandRead', requests: 3, failures: 1, maxLatencyMs: 7 },
+        { operation: 'commandStatus', requests: 1, failures: 0, maxLatencyMs: 7 },
+        { operation: 'commandWriteStdin', requests: 1, failures: 0, maxLatencyMs: 7 }],
+      commands: [{ startOffsetMs: 5, startLatencyMs: 7, stdin: 'pipe', stdinBytes: 120, stdoutBytes: 0, stderrBytes: 42,
+        stdoutEof: false, stderrEof: false, running: true, exitCode: null, failedOperation: 'commandRead' }] } })
+    const omitted = rows.find(row => row.initialization.phase === 'MCP-readback')
+    expect(omitted.initialization).toEqual({ phase: 'MCP-readback', elapsedMs: 5 })
+    expect(Object.hasOwn(omitted, 'acquisition')).toBe(false)
+  } finally {
+    clock.mockRestore()
+    if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_DATA_HOME
+    else process.env.CLAUDE_MULTIMODEL_DATA_HOME = previous
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 // These check branch ordering and refusal only. The real native directory
 // custody and Windows file publication are qualified by the Windows source gate.
 test('Windows diagnostics await native directory admission before exclusive publication', async () => {

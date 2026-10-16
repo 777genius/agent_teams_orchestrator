@@ -109,6 +109,40 @@ function acquisitionDiagnostic(value: unknown) {
   if (history[0]?.phase !== 'preparing' || history[0].elapsedMs !== 0) return undefined
   return { elapsedMs: Number(row.elapsedMs), history }
 }
+export type ExecutionAcquisitionTiming = Readonly<{ elapsedMs: number; history: readonly Readonly<{ phase: ExecutionAcquisitionPhase; elapsedMs: number }>[] }>
+
+export const executionCommandOperations = ['commandStart', 'commandRead', 'commandStatus', 'commandWriteStdin',
+  'commandEndStdin', 'commandRetire', 'commandClose'] as const
+export type ExecutionCommandOperation = typeof executionCommandOperations[number]
+/** In-process snapshot of one lease's native command channel. Counts, byte
+ * totals and closed classes only; absolute times are projected before writing. */
+export type ExecutionCommandObservation = Readonly<{
+  starts: number; firstFailedOperation: ExecutionCommandOperation | null
+  operations: readonly Readonly<{ operation: ExecutionCommandOperation; requests: number; failures: number; maxLatencyMs: number }>[]
+  commands: readonly Readonly<{ startedAt: number; startLatencyMs: number; stdin: 'pipe' | 'ignore'
+    stdinBytes: number; stdoutBytes: number; stderrBytes: number; stdoutEof: boolean; stderrEof: boolean
+    running: boolean | null; exitCode: number | null; failedOperation: ExecutionCommandOperation | null }>[]
+}>
+const finiteElapsed = (value: unknown) => Number.isSafeInteger(value) && Number(value) >= 0 && Number(value) <= 86_400_000
+const commandOffset = (value: number) => Math.max(-86_400_000, Math.min(86_400_000, Math.trunc(value)))
+const commandOperation = (value: unknown) => executionCommandOperations.find(item => item === value) ?? null
+function commandDiagnostic(value: ExecutionCommandObservation, originAt: number) {
+  const count = (input: unknown) => Number.isSafeInteger(input) && Number(input) >= 0 ? Number(input) : 0
+  return {
+    starts: count(value.starts), firstFailedOperation: commandOperation(value.firstFailedOperation),
+    operations: value.operations.slice(0, executionCommandOperations.length).flatMap(item => commandOperation(item.operation) ? [{
+      operation: commandOperation(item.operation)!, requests: count(item.requests), failures: count(item.failures),
+      maxLatencyMs: finiteElapsed(item.maxLatencyMs) ? item.maxLatencyMs : 86_400_000 }] : []),
+    commands: value.commands.slice(0, 8).map(item => ({
+      startOffsetMs: Number.isFinite(item.startedAt) ? commandOffset(item.startedAt - originAt) : 0,
+      startLatencyMs: finiteElapsed(item.startLatencyMs) ? item.startLatencyMs : 86_400_000, stdin: item.stdin === 'pipe' ? 'pipe' : 'ignore',
+      stdinBytes: count(item.stdinBytes), stdoutBytes: count(item.stdoutBytes), stderrBytes: count(item.stderrBytes),
+      stdoutEof: item.stdoutEof === true, stderrEof: item.stderrEof === true,
+      running: typeof item.running === 'boolean' ? item.running : null,
+      exitCode: Number.isSafeInteger(item.exitCode) && Number(item.exitCode) >= 0 && Number(item.exitCode) <= 0xffffffff ? item.exitCode : null,
+      failedOperation: commandOperation(item.failedOperation) })),
+  }
+}
 
 export type RunInitializationPhase = 'bootstrap-before-log' | 'bootstrap-before-messages' | 'bootstrap-before-log-confirm' |
   'bootstrap-instruction-put' | 'bootstrap-instruction-readback' | 'bootstrap-after-log' | 'bootstrap-after-messages' |
@@ -116,7 +150,17 @@ export type RunInitializationPhase = 'bootstrap-before-log' | 'bootstrap-before-
 const initializationPhases = new Set<RunInitializationPhase>(['bootstrap-before-log', 'bootstrap-before-messages', 'bootstrap-before-log-confirm',
   'bootstrap-instruction-put', 'bootstrap-instruction-readback', 'bootstrap-after-log', 'bootstrap-after-messages',
   'bootstrap-after-log-confirm', 'bootstrap-verify', 'MCP-connect', 'MCP-readback', 'controller-tools', 'probe-authority'])
-const initializationFailures = new WeakMap<Error, Readonly<{ phase: RunInitializationPhase; elapsedMs: number }>>()
+type InitializationDiagnostic = Readonly<{ phase: RunInitializationPhase; elapsedMs: number; ownerElapsedMs?: number
+  history?: readonly Readonly<{ phase: RunInitializationPhase; elapsedMs: number }>[]
+  commands?: ReturnType<typeof commandDiagnostic> }>
+const initializationFailures = new WeakMap<Error, Readonly<{ initialization: InitializationDiagnostic; acquisition?: ExecutionAcquisitionTiming }>>()
+/** Finite facts retained with the original initialization rejection. Command
+ * observations are projected relative to the original MCP-connect start. */
+export type RunInitializationFacts = Readonly<{
+  ownerElapsedMs: number; history: readonly Readonly<{ phase: RunInitializationPhase; elapsedMs: number }>[]
+  acquisition?: ExecutionAcquisitionTiming
+  commands?: Readonly<{ observation: ExecutionCommandObservation; originAt: number }>
+}>
 export type ExecutionCleanupPhase = 'dispose-transport' | 'send-close' | 'force-kill' | 'wait-exit' | 'read-birth' | 'kernel-retirement' |
   'process-retirement' | 'closed-ack' | 'kernel-proof' | 'kernel-binding' | 'owner-release' | 'retained-roots' | 'plan-close'
 const cleanupPhases = new Set<ExecutionCleanupPhase>(['dispose-transport', 'send-close', 'force-kill', 'wait-exit', 'read-birth', 'kernel-retirement',
@@ -131,10 +175,26 @@ export function retainOpenCodeV2CleanupPhase(error: Error, phase: ExecutionClean
   if (cleanupPhases.has(phase) && !cleanupFailures.has(error)) cleanupFailures.set(error, phase)
 }
 /** Preserve the original rejection object; private finite context is never error payload. */
-export function retainOpenCodeV2InitializationPhase(error: unknown, phase: RunInitializationPhase, elapsedMs: number): void {
-  if (error instanceof Error && initializationPhases.has(phase) && Number.isSafeInteger(elapsedMs) &&
-    elapsedMs >= 0 && elapsedMs <= 86_400_000 && !initializationFailures.has(error))
-    initializationFailures.set(error, Object.freeze({ phase, elapsedMs }))
+export function retainOpenCodeV2InitializationPhase(error: unknown, phase: RunInitializationPhase, elapsedMs: number, facts?: RunInitializationFacts): void {
+  if (!(error instanceof Error) || !initializationPhases.has(phase) || !finiteElapsed(elapsedMs) || initializationFailures.has(error)) return
+  // Every optional fact is independently closed; an invalid one is omitted and
+  // never prevents retaining the original phase.
+  let history: { phase: RunInitializationPhase; elapsedMs: number }[] | undefined = []
+  for (const entry of facts?.history?.slice(0, initializationPhases.size + 1) ?? []) {
+    if (!initializationPhases.has(entry.phase) || !finiteElapsed(entry.elapsedMs) || entry.elapsedMs > elapsedMs ||
+      entry.elapsedMs < (history.at(-1)?.elapsedMs ?? 0) || history.some(item => item.phase === entry.phase)) { history = undefined; break }
+    history.push({ phase: entry.phase, elapsedMs: entry.elapsedMs })
+  }
+  if (history?.length === 0) history = undefined
+  let commands: ReturnType<typeof commandDiagnostic> | undefined
+  try { commands = facts?.commands && Number.isFinite(facts.commands.originAt) ? commandDiagnostic(facts.commands.observation, facts.commands.originAt) : undefined }
+  catch { commands = undefined }
+  const acquisition = acquisitionDiagnostic(facts?.acquisition)
+  initializationFailures.set(error, Object.freeze({
+    initialization: Object.freeze({ phase, elapsedMs, ...(facts && finiteElapsed(facts.ownerElapsedMs) ? { ownerElapsedMs: facts.ownerElapsedMs } : {}),
+      ...(history ? { history } : {}), ...(commands ? { commands } : {}) }),
+    ...(acquisition ? { acquisition } : {}),
+  }))
 }
 
 const privateProviderFailureCodes = new Set(['provider_missing', 'provider_key_method_unsupported', 'provider_existing_credentials_unsupported',
@@ -230,7 +290,9 @@ export async function recordOpenCodeV2ProviderFailure(phase: string, error: unkn
   const alias = readWindowsNativeAliasFailure(cause) ?? readWindowsNativeAliasFailure(error)
   const operation = readOpenCodeV2ProviderWireFailure(error)
   const startup = startupDiagnostic(startupOutput)
-  const acquisition = acquisitionDiagnostic(acquisitionTiming)
+  const retainedInitialization = phase === 'run-owner-initialization' && error instanceof Error ? initializationFailures.get(error) : undefined
+  const initialization = retainedInitialization?.initialization
+  const acquisition = acquisitionDiagnostic(acquisitionTiming ?? retainedInitialization?.acquisition)
   const observed = cleanupTiming?.observation
   const observedPhase = observed && cleanupPhases.has(observed.phase) ? observed.phase : undefined
   const cleanupPhase = error instanceof Error ? cleanupFailures.get(error) ?? observedPhase : observedPhase
@@ -240,7 +302,6 @@ export async function recordOpenCodeV2ProviderFailure(phase: string, error: unkn
     Number(cleanupTiming?.elapsedMs) >= 0 && Number(cleanupTiming?.elapsedMs) <= 86_400_000
     ? { elapsedMs: Number(cleanupTiming?.elapsedMs), ...(cleanupPhase ? { phase: cleanupPhase } : {}),
       ...(nativePhase ? { nativePhase } : {}) } : undefined
-  const initialization = phase === 'run-owner-initialization' && error instanceof Error ? initializationFailures.get(error) : undefined
   if (cleanupTiming?.dataRoot !== undefined && (!cleanup || typeof cleanupTiming.dataRoot !== 'string' || !path.isAbsolute(cleanupTiming.dataRoot))) return
   try {
     const directory = path.join(cleanupTiming?.dataRoot ?? resolveClaudeMultimodelPaths().data, 'opencode/v2/provider-diagnostics')
