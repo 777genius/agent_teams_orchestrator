@@ -24,8 +24,11 @@ allowlisted inline video MIME headers are retained; all existing image/text/PDF
 MIME detection remains unchanged. Runner conversion carries video into native
 media IR rather than dropping it.
 
-Only the explicitly selected `openai-compatible-chat` protocol opts into the
-OpenRouter-compatible `video_url: { url: "data:video/...;base64,..." }` body.
+The explicitly selected `openai-compatible-chat` protocol and native
+`openrouter` provider's `openrouter-chat` protocol opt into the OpenRouter
+`video_url: { url: "data:video/...;base64,..." }` body. The latter is patched in
+the published `dist/providers/openrouter.js`, preserving its cache-control and
+provider-option handling.
 Native OpenAI Chat retains its explicit video refusal. Other provider codecs
 retain their own support/refusal contracts. No inference is made from a model
 name, host name, or provider display name. Models still need declared video

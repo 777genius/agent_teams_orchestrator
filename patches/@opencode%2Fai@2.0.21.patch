@@ -18,7 +18,7 @@ diff --git a/dist/protocols/openai-chat.js b/dist/protocols/openai-chat.js
  });
 -const lowerMedia = Effect.fn("OpenAIChat.lowerMedia")(function* (part) {
 +const lowerMedia = Effect.fn("OpenAIChat.lowerMedia")(function* (part, videoInput = false) {
-+    // Only the explicitly selected compatible-chat codec opts into video_url.
++    // Only explicitly supported provider codecs opt into video_url.
 +    if (part.media.kind === "video" && videoInput && ["video/mp4", "video/webm", "video/mpeg", "video/quicktime"].includes(part.media.mediaType.toLowerCase()))
 +        return { type: "video_url", video_url: { url: (yield* ProviderShared.requireInlineMedia("OpenAI-compatible Chat video", part.media)).dataUrl } };
      // Chat Completions accepts PDFs, and no other documents, as inline `file` parts; file URLs are not supported.
@@ -48,3 +48,15 @@ diff --git a/dist/protocols/openai-compatible-chat.js b/dist/protocols/openai-co
      endpoint: Endpoint.path("/chat/completions"),
      framing: OpenAIChat.framing,
  });
+diff --git a/dist/providers/openrouter.js b/dist/providers/openrouter.js
+--- a/dist/providers/openrouter.js
++++ b/dist/providers/openrouter.js
+@@ -18,7 +18,7 @@
+     id: "openrouter-chat",
+     body: {
+         schema: OpenRouterBody,
+-        from: (request) => OpenAIChat.fromRequest(request, { cacheControl: cacheControl() }).pipe(Effect.map((body) => {
++        from: (request) => OpenAIChat.fromRequest(request, { cacheControl: cacheControl(), videoInput: true }).pipe(Effect.map((body) => {
+             const sourceAssistants = request.messages.filter((message) => message.role === "assistant");
+             let assistantIndex = 0;
+             const messages = body.messages.map((message) => {

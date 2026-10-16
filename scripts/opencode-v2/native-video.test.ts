@@ -3,6 +3,7 @@ import { Effect, Schema } from 'effect'
 import { LLMRequest } from '@opencode/ai'
 import { compileRequest } from '@opencode/ai/route/client'
 import { OpenAICompatible } from '@opencode/ai/providers/openai-compatible'
+import * as OpenRouter from '@opencode/ai/providers/openrouter'
 import { OpenAIChat } from '@opencode/ai/protocols/openai-chat'
 import { Model } from '@opencode/schema/model'
 import { SessionMessage } from '@opencode/schema/session-message'
@@ -11,14 +12,15 @@ import { toLLMMessages } from '@opencode/core/session/runner/to-llm-message'
 const bytes = Buffer.from('000000186674797069736f6d0000020069736f6d69736f32', 'hex')
 const data = bytes.toString('base64')
 const compatible = OpenAICompatible.configure({ provider: 'TEST-openrouter-video', baseURL: 'http://127.0.0.1:1/v1', apiKey: 'TEST-not-a-real-credential' }).model('novel-video')
+const openrouter = OpenRouter.configure({ baseURL: 'http://127.0.0.1:1/v1', apiKey: 'TEST-not-a-real-credential' }).model('novel-video')
 
-function request(mime: string, payload = data) {
+function request(mime: string, payload = data, provider: 'compatible' | 'openrouter' = 'compatible') {
   const projected = Schema.decodeUnknownSync(SessionMessage.User)({
     type: 'user', id: 'msg_TESTvideo', text: 'Inspect this clip.', time: { created: 0 },
     files: [{ data: payload, mime, source: { type: 'inline' }, name: 'clip' }],
   })
-  const messages = toLLMMessages([projected], Model.Ref.parse('TEST-openrouter-video/novel-video'))
-  return new LLMRequest({ model: compatible, system: [], messages, tools: [] })
+  const messages = toLLMMessages([projected], Model.Ref.parse(`${provider === 'openrouter' ? 'openrouter' : 'TEST-openrouter-video'}/novel-video`))
+  return new LLMRequest({ model: provider === 'openrouter' ? openrouter : compatible, system: [], messages, tools: [] })
 }
 
 // Actual installed core conversion and configured provider compiler, including
@@ -26,6 +28,12 @@ function request(mime: string, payload = data) {
 for (const mime of ['video/mp4', 'video/webm', 'video/quicktime', 'video/mpeg']) {
   test(`native compatible codec retains ${mime} bytes as video_url`, async () => {
     const result = await Effect.runPromise(compileRequest(request(mime)))
+    expect(result.body).toMatchObject({ messages: [{ role: 'user', content: [
+      { type: 'text', text: 'Inspect this clip.' }, { type: 'video_url', video_url: { url: `data:${mime};base64,${data}` } },
+    ] }] })
+  })
+  test(`native OpenRouter codec retains ${mime} bytes as video_url`, async () => {
+    const result = await Effect.runPromise(compileRequest(request(mime, data, 'openrouter')))
     expect(result.body).toMatchObject({ messages: [{ role: 'user', content: [
       { type: 'text', text: 'Inspect this clip.' }, { type: 'video_url', video_url: { url: `data:${mime};base64,${data}` } },
     ] }] })
