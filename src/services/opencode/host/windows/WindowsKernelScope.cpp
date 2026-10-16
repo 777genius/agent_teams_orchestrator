@@ -523,11 +523,24 @@ static std::vector<BYTE> heldFileBytes(HANDLE file, DWORD limit) {
   } while (count != 0);
   return bytes;
 }
+// One original public budget and, only after its expiry during revocation,
+// one shared private ACL-wait grace. Neither is renewed per object.
+struct RetirementAclBudget {
+  ULONGLONG originalDeadline;
+  ULONGLONG privateDeadline = 0;
+  DWORD waitMs() {
+    const auto now = GetTickCount64();
+    if (now < originalDeadline)
+      return static_cast<DWORD>(std::min<ULONGLONG>(originalDeadline - now, MAXDWORD));
+    if (!privateDeadline) privateDeadline = now + 10000;
+    return static_cast<DWORD>(privateDeadline > now ? privateDeadline - now : 0);
+  }
+};
 class SharedAclMutex {
   Handle mutex;
 
 public:
-  explicit SharedAclMutex(const JsonObject &identity) {
+  explicit SharedAclMutex(const JsonObject &identity, RetirementAclBudget *retirementBudget = nullptr) {
     const std::wstring name = L"Global\\AgentTeams.OpenCodeV2.ACL." +
                               text(identity, L"volumeSerial") + L"." +
                               text(identity, L"fileId");
@@ -606,7 +619,10 @@ public:
       require(ownerAllowed && systemAllowed,
               "execution_containment_filesystem_denied", "shared_acl_mutex_ace_role");
     }
-    const DWORD waited = WaitForSingleObject(mutex.value, 10000);
+    DWORD waited = WaitForSingleObject(mutex.value, retirementBudget ? retirementBudget->waitMs() : 10000);
+    if (waited == WAIT_TIMEOUT && retirementBudget && !retirementBudget->privateDeadline &&
+        GetTickCount64() >= retirementBudget->originalDeadline)
+      waited = WaitForSingleObject(mutex.value, retirementBudget->waitMs());
     if (waited == WAIT_ABANDONED) {
       ReleaseMutex(mutex.value);
       throw NativeError{"execution_containment_filesystem_denied", ERROR_ABANDONED_WAIT_0,
@@ -740,8 +756,8 @@ struct RetainedRealpathDll {
                 equalPath(finalPath(file.value), extended(path)) && heldFileSha256(file.value) == sha256,
             "execution_containment_dll_identity");
   }
-  void changeAce(ACCESS_MODE mode) {
-    SharedAclMutex aclMutex(identity);
+  void changeAce(ACCESS_MODE mode, RetirementAclBudget *retirementBudget = nullptr) {
+    SharedAclMutex aclMutex(identity, retirementBudget);
     require(fileObjectIdentity(file.value, owner, false).Stringify() == identity.Stringify(),
             "execution_containment_dll_identity");
     const auto before =
@@ -3059,7 +3075,7 @@ struct NativeSelfImageCustody {
   }
 };
 struct Scope;
-static void removeGrants(Scope &scope);
+static void removeGrants(Scope &scope, RetirementAclBudget *retirementBudget = nullptr);
 static void assertSharedReadRootsLive(const Scope &scope);
 static void assertProjectRootsLive(const Scope &scope);
 static void assertAncestorMetadataLive(const Scope &scope);
@@ -3710,11 +3726,12 @@ static void assertAncestorMetadataLive(const Scope &scope) {
     require(current.memberAllowed, "execution_containment_filesystem_denied", "ancestor_metadata_member");
   }
 }
-static void changeAncestorMetadata(Scope &scope, RetainedAncestorMetadata &ancestor, bool grant) {
+static void changeAncestorMetadata(Scope &scope, RetainedAncestorMetadata &ancestor, bool grant,
+                                   RetirementAclBudget *retirementBudget = nullptr) {
   const char *code = grant ? "execution_containment_filesystem_denied" : "cleanup_unknown";
   require(grant || scope.physicalCleanupProof || scope.metadataNoChildCleanupProof,
           code, "ancestor_metadata_cleanup_unproven");
-  SharedAclMutex mutex(ancestor.anchor.identity);
+  SharedAclMutex mutex(ancestor.anchor.identity, retirementBudget);
   // Target-only, non-inheriting writes need this target's complete physical
   // prefix chain. Unrelated package pins are checked at both batch boundaries.
   assertAncestorMetadataPinsLive(scope, &ancestor);
@@ -3911,10 +3928,10 @@ static void grantRoot(Scope &scope, Handle heldRoot, DWORD mask, ACCESS_MODE mod
     require(mode != DENY_ACCESS || after.memberAllowed == before.memberAllowed, "execution_containment_filesystem_denied");
   }
 }
-static void removeGrants(Scope &scope) {
+static void removeGrants(Scope &scope, RetirementAclBudget *retirementBudget) {
   scope.retirementProgress("retire_grants_dll");
   if (scope.realpathDll && scope.realpathDll->granted && scope.physicalCleanupProof)
-    scope.realpathDll->changeAce(REVOKE_ACCESS);
+    scope.realpathDll->changeAce(REVOKE_ACCESS, retirementBudget);
   scope.retirementProgress("retire_grants_roots");
   std::vector<RetainedAnchorComponent> retained;
   for (auto it = scope.aclRoots.rbegin(); it != scope.aclRoots.rend(); ++it) {
@@ -3929,7 +3946,7 @@ static void removeGrants(Scope &scope) {
       retained.insert(retained.begin(), std::move(*it));
       continue;
     }
-    SharedAclMutex aclMutex(physicalIdentity);
+    SharedAclMutex aclMutex(physicalIdentity, retirementBudget);
     it->assertLive();
     require(anchorIdentity(handle).Stringify() == identity.Stringify(), "cleanup_unknown");
     const auto heldIdentity = grantObjectIdentity(handle, owner, it->sharedRoot);
@@ -3981,7 +3998,7 @@ static void removeGrants(Scope &scope) {
     assertAncestorMetadataPinsLive(scope);
     for (size_t i = scope.metadataAncestors.size(); i > 0; --i) {
       auto &ancestor = scope.metadataAncestors[i - 1];
-      if (!ancestor.originalDescriptor.empty()) changeAncestorMetadata(scope, ancestor, false);
+      if (!ancestor.originalDescriptor.empty()) changeAncestorMetadata(scope, ancestor, false, retirementBudget);
     }
     // Keep every pin and measured write intent through final union validation.
     // Failure retains the entire batch and cannot earn ownAcesRemoved.
@@ -5505,9 +5522,32 @@ int wmain(int argc, wchar_t **argv) {
           value = scope->mapping;
         } else if (operation == L"retire") {
           require(static_cast<bool>(scope), "cleanup_unknown");
+          ULONGLONG retirementDeadline = 0;
+          if (input.HasKey(L"deadline") || input.HasKey(L"timeoutMs")) {
+            require(input.Size() == 2 && input.HasKey(L"deadline") && input.HasKey(L"timeoutMs"), "cleanup_unknown");
+            const double wallDeadline = input.GetNamedNumber(L"deadline");
+            const double timeoutMs = input.GetNamedNumber(L"timeoutMs");
+            require(wallDeadline > 0 && wallDeadline <= 9007199254740991.0 &&
+                        wallDeadline == static_cast<double>(static_cast<std::uint64_t>(wallDeadline)) &&
+                        timeoutMs >= 0 && timeoutMs <= 22000 &&
+                        timeoutMs == static_cast<double>(static_cast<std::uint64_t>(timeoutMs)), "cleanup_unknown");
+            FILETIME wallTime{};
+            GetSystemTimeAsFileTime(&wallTime);
+            const auto nowMs = filetime(wallTime) / 10000 - 11644473600000ULL;
+            const auto original = static_cast<std::uint64_t>(wallDeadline);
+            const auto remaining = std::min<std::uint64_t>(static_cast<std::uint64_t>(timeoutMs), original > nowMs ? original - nowMs : 0);
+            retirementDeadline = GetTickCount64() + remaining;
+          }
+          // Even an expired original budget must attempt the owned Job kill.
+          // Revocation may continue under one private ACL grace, while an
+          // expired original public deadline can never qualify late success.
           value = scope->retire();
           scope->retirementProgress("retire_grants");
-          inRetirementPhase("retire_grants", [&] { removeGrants(*scope); });
+          RetirementAclBudget retirementBudget{retirementDeadline};
+          inRetirementPhase("retire_grants", [&] {
+            removeGrants(*scope, retirementDeadline ? &retirementBudget : nullptr);
+            require(!retirementDeadline || GetTickCount64() < retirementDeadline, "cleanup_unknown");
+          });
           flag(value, L"ownAcesRemoved", true);
         } else
           throw NativeError{"execution_invalid_response"};

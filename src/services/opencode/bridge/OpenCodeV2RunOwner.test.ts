@@ -39,8 +39,7 @@ async function fixture(options: { unknown?: boolean; foreignClient?: boolean; cr
   lifetimeMs?: number; twoMembers?: boolean; memberCount?: number; preparation?: () => void; startup?: () => void;
   windowsAcquisitions?: boolean;
   leaseClose?: (deadline: number | undefined) => void;
-  nativeRetirement?: (memberId: string, deadline: number | undefined,
-    gate: import('../host/OpenCodeV2ExecutionPlatform.js').ExecutionNativeRetirementGate | undefined) => Promise<void>;
+  nativeRetirement?: (memberId: string, deadline: number | undefined) => Promise<void>;
   parentPreparation?: (memberId: string, signal: AbortSignal | undefined) => Promise<void>;
   acquisition?: (memberId: string, signal: AbortSignal | undefined) => Promise<void>;
   readonlyGraph?: (memberId: string, signal: AbortSignal | undefined) => Promise<void>;
@@ -126,7 +125,7 @@ async function fixture(options: { unknown?: boolean; foreignClient?: boolean; cr
     replyPermission: async () => { counters.replied++ },
   }
   const ports: RunExecutionPorts = {
-    acquire: async (_native, _profile, context, startupGate, retirementGate) => {
+    acquire: async (_native, _profile, context, startupGate) => {
       expect(context).toMatchObject({ teamId: binding.teamId, runId: binding.runId, laneId: 'primary' })
       expect(plan.members.some(member => member.memberId === context.memberId)).toBe(true)
       const profile = plan.members.find(member => member.memberId === context.memberId)!.profile
@@ -140,7 +139,7 @@ async function fixture(options: { unknown?: boolean; foreignClient?: boolean; cr
         return { authority: owned, signal: new AbortController().signal, close: async deadline => {
           counters.closed++
           options.leaseClose?.(deadline)
-          await options.nativeRetirement?.(context.memberId!, deadline, retirementGate)
+          await options.nativeRetirement?.(context.memberId!, deadline)
           resolveClosing(); await options.closeBarrier
           return { scopeClosed: true, processRetired: true, descendantsRetired: true, pid: authority.child.pid, birth: authority.child.birth }
         } }
@@ -152,7 +151,7 @@ async function fixture(options: { unknown?: boolean; foreignClient?: boolean; cr
         }, context.signal)
         let cleanup: ReturnType<ExecutionLease['close']> | undefined
         const lease: ExecutionLease = { authority: owned, signal: new AbortController().signal, close: deadline => cleanup ??= (async () => {
-            counters.closed++; options.leaseClose?.(deadline); await options.nativeRetirement?.(context.memberId!, deadline, retirementGate); resolveClosing(); await options.closeBarrier
+            counters.closed++; options.leaseClose?.(deadline); await options.nativeRetirement?.(context.memberId!, deadline); resolveClosing(); await options.closeBarrier
             return { scopeClosed: true, processRetired: true, descendantsRetired: true, pid: authority.child.pid, birth: authority.child.birth }
         })() }
         try {
@@ -402,59 +401,31 @@ test('Windows Stop forwards its original 22s physical close deadline once while 
   }
 })
 
-test('Windows cohort native retirement is serial after Stop and releases the original ticket after failure', async () => {
+test('Windows cohort native retirement begins in parallel with original deadlines and no replay after failure', async () => {
   const cuts = Array.from({ length: 3 }, acquisitionGate), started: string[] = [], deadlines: (number | undefined)[] = []
   let active = 0, maximum = 0
   const f = await fixture({ windowsAcquisitions: true, memberCount: 3,
-    nativeRetirement: async (member, deadline, gate) => {
-      expect(gate).toBeFunction()
-      await gate!(async () => {
-        const index = started.length; started.push(member); deadlines.push(deadline)
-        active++; maximum = Math.max(maximum, active)
-        try { await cuts[index]!.promise } finally { active-- }
-      })
+    nativeRetirement: async (member, deadline) => {
+      const index = started.length; started.push(member); deadlines.push(deadline)
+      active++; maximum = Math.max(maximum, active)
+      try { await cuts[index]!.promise } finally { active-- }
     } })
+  let clock: ReturnType<typeof spyOn> | undefined
   try {
     await f.owner.ready()
+    clock = spyOn(Date, 'now').mockReturnValue(Date.now())
     const stopped = f.owner.stop()
-    await waitForTestAcquisitions(() => f.counters.closed === 3 && started.length === 1)
-    expect(started).toHaveLength(1); expect(active).toBe(1)
-    cuts[0]!.reject(new Error('execution_native_unknown'))
-    await waitForTestAcquisitions(() => started.length === 2)
-    cuts[1]!.release(); await waitForTestAcquisitions(() => started.length === 3)
-    cuts[2]!.release()
+    await waitForTestAcquisitions(() => started.length === 3)
+    expect(active).toBe(3)
+    cuts[0]!.reject(new Error('execution_native_unknown')); cuts[1]!.release(); cuts[2]!.release()
     const receipt = await stopped
-    expect(maximum).toBe(1); expect(new Set(started).size).toBe(3); expect(f.counters.closed).toBe(3)
+    expect(maximum).toBe(3); expect(new Set(started).size).toBe(3); expect(f.counters.closed).toBe(3)
     expect(deadlines.every(deadline => Number.isSafeInteger(deadline))).toBe(true)
+    expect(new Set(deadlines).size).toBe(1)
     expect(receipt.state).toBe('cleanup_unknown') // Same-fields fake receipts confer no physical proof.
     expect(receipt.members).toHaveLength(3)
     expect(await f.owner.stop()).toBe(receipt); expect(f.counters.closed).toBe(3)
-  } finally { for (const cut of cuts) cut.release(); await f.close() }
-})
-
-test('Windows terminal cleanup joins original queued native work after public close failures', async () => {
-  const cuts = Array.from({ length: 3 }, acquisitionGate), started: string[] = []
-  const queued: Promise<unknown>[] = []
-  const f = await fixture({ windowsAcquisitions: true, memberCount: 3,
-    nativeRetirement: async (member, _deadline, gate) => {
-      const work = gate!(async () => { const index = started.length; started.push(member); await cuts[index]!.promise })
-      queued.push(work); void work.catch(() => undefined)
-      throw new Error('cleanup_unknown') // The public lifecycle may finish before the retained native RPC.
-    } })
-  try {
-    await f.owner.ready()
-    expect((await f.owner.stop()).state).toBe('cleanup_unknown')
-    expect(queued).toHaveLength(3); expect(started).toHaveLength(1)
-    let joined = false
-    const terminal = f.owner.awaitCleanupTerminal().then(() => { joined = true })
-    await Bun.sleep(1); expect(joined).toBe(false)
-    cuts[0]!.release(); await waitForTestAcquisitions(() => started.length === 2)
-    expect(joined).toBe(false)
-    cuts[1]!.release(); await waitForTestAcquisitions(() => started.length === 3)
-    expect(joined).toBe(false)
-    cuts[2]!.release(); await terminal
-    expect(joined).toBe(true); expect(new Set(started).size).toBe(3); expect(f.counters.closed).toBe(3)
-  } finally { for (const cut of cuts) cut.release(); await Promise.allSettled(queued); await f.close() }
+  } finally { clock?.mockRestore(); for (const cut of cuts) cut.release(); await f.close() }
 })
 
 test('Windows queued acquisition retains the original deadline and refuses expired work', async () => {

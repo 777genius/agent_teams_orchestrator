@@ -80,8 +80,7 @@ export type RunControlResult =
 export type RunExecutionPorts = Readonly<{
   acquire: (native: ValidatedExecutionNative, profile: SelectedExecutionProfile,
     context: import('../execution/OpenCodeV2ExecutionContracts.js').ExecutionContext,
-    startupGate?: import('../host/OpenCodeV2ExecutionHost.js').ExecutionStartupGate,
-    retirementGate?: import('../host/OpenCodeV2ExecutionPlatform.js').ExecutionNativeRetirementGate) => Promise<ExecutionLease>
+    startupGate?: import('../host/OpenCodeV2ExecutionHost.js').ExecutionStartupGate) => Promise<ExecutionLease>
   client: (authority: ExecutionLease['authority'],
     context: import('../execution/OpenCodeV2ExecutionContracts.js').ExecutionContext) => Promise<ExecutionBridgeClient>
 }>

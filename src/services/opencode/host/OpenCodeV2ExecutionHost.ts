@@ -12,7 +12,7 @@ import { canonicalExecutionDirectory, readExecutionBirth, validateExecutionGraph
   type ExecutionGraph, type OwnedNativeProfile, type CatalogExecutionProfile, type SelectedExecutionProfile, type ValidatedExecutionNative } from './OpenCodeV2ExecutionBinding.js'
 import { retireExecutionChild, type ExecutionCleanupReceipt } from './OpenCodeV2ExecutionLifecycle.js'
 import { assertExecutionPlatformAvailable, launchExecutionPlatform, planExecutionPlatform,
-  type ExecutionNativeRetirementGate, type ExecutionPlatformLaunch, type ExecutionPlatformMapping } from './OpenCodeV2ExecutionPlatform.js'
+  type ExecutionPlatformLaunch, type ExecutionPlatformMapping } from './OpenCodeV2ExecutionPlatform.js'
 import { acquireExecutionProfileOwner } from './OpenCodeV2ExecutionOwner.js'
 import { initializeOpenCodeV2ExecutionAuth } from './OpenCodeV2ExecutionAuth.js'
 import { readOpenCodeV2SelectedAuth } from './OpenCodeV2ExecutionOAuth.js'
@@ -90,8 +90,8 @@ async function executionResolutionMounts(sourceRoot: string, graph: ExecutionGra
 
 /** Source execution uses a dedicated official-server child and caller-owned durable data. */
 export async function acquireExecutionLease(validatedNative: ValidatedExecutionNative,
-  selectedProfile: SelectedExecutionProfile, context: ExecutionContext, startupGate?: ExecutionStartupGate, retirementGate?: ExecutionNativeRetirementGate): Promise<ExecutionLease> {
-  return acquireOwnedNativeLease(validatedNative, selectedProfile, context, startupGate, retirementGate)
+  selectedProfile: SelectedExecutionProfile, context: ExecutionContext, startupGate?: ExecutionStartupGate): Promise<ExecutionLease> {
+  return acquireOwnedNativeLease(validatedNative, selectedProfile, context, startupGate)
 }
 
 /** Finite catalog owner has no session/model admission and creates no execution proof. */
@@ -182,7 +182,7 @@ export async function prepareOwnedNativeExecutionPlan(validatedNative: Validated
 }
 
 async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative,
-  selectedProfile: OwnedNativeProfile, context: ExecutionContext, startupGate?: ExecutionStartupGate, retirementGate?: ExecutionNativeRetirementGate): Promise<ExecutionLease> {
+  selectedProfile: OwnedNativeProfile, context: ExecutionContext, startupGate?: ExecutionStartupGate): Promise<ExecutionLease> {
   const lifetime = new AbortController()
   const check = () => {
     context.signal?.throwIfAborted(); lifetime.signal.throwIfAborted()
@@ -306,7 +306,7 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
       }
       await owner!.beforeSpawn(); check()
       executionAssert(typeof nonce === 'string', 'execution_identity_mismatch')
-      launch = launchExecutionPlatform(plan, nonce, leaseOwnerId, native.bun, context.deadline, retirementGate)
+      launch = launchExecutionPlatform(plan, nonce, leaseOwnerId, native.bun, context.deadline)
       child = launch.child
       child.once('close', () => { exited = true; lifetime.abort(); exitResolve(); void close().catch(() => undefined) })
       let graphResolve!: (value: Record<string, unknown>) => void, graphReject!: (error: unknown) => void

@@ -1396,6 +1396,11 @@ $daclBytes=[byte[]]::new($raw.DiscretionaryAcl.BinaryLength);$raw.DiscretionaryA
           throw error
         }
       }
+      // Invalid optional budgets must refuse before mutating the live Scope.
+      const budgetPeer = peers[0]!
+      await assert.rejects(budgetPeer.broker.request('retire', { deadline: Date.now() + 22_000, timeoutMs: 22_001 }), /cleanup_unknown/)
+      assert.deepEqual(await budgetPeer.broker.request('assertLive'), budgetPeer.mapping)
+      facts.retirementBudgetMalformedRefused = true
       for (const peer of peers) assert.deepEqual(await peer.broker.request('assertLive'), peer.mapping)
     }
     facts.selectedProjectCohort = { sealedMembers: 3, actualLaunchedMembers: 2, sharedProjectCommandsPassed: true,

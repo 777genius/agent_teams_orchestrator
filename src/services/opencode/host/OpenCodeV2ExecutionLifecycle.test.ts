@@ -41,21 +41,20 @@ function retirement(work: Promise<unknown>): ExecutionRetirementPort {
     retireOwnedDescendants: () => work }
 }
 
-test('actual Windows adapter gates kill, retirement and fire-and-forget HTTP failure until their native turn', async () => {
+test('actual Windows adapter shares one original native retirement across kill, retire and HTTP failure', async () => {
   const source = await Bun.file(new URL('windows/OpenCodeV2WindowsExecution.ts', import.meta.url)).text()
   const body = new Bun.Transpiler({ loader: 'ts' }).transformSync(source.slice(source.indexOf('export function launchWindowsExecution(')).replace('export ', ''))
   const bun = { path: 'C:\\TEST\\bun.exe', sha256: 'a'.repeat(64) }
   const plan = { executable: bun.path, entry: 'C:\\TEST\\entry.js', cwd: 'C:\\TEST', env: {}, writableRoots: [], readOnlyRoots: [], protectedRoots: [], realpathDll: {} }
-  const jobs: (() => Promise<void>)[] = [], requests: (number | undefined)[] = []
-  const gate = <T>(work: () => Promise<T>) => new Promise<T>((resolve, reject) => {
-    jobs.push(async () => { try { resolve(await work()) } catch (error) { reject(error) } })
-  })
+  const requests: { deadline: number | undefined; input: unknown }[] = []
+  let release!: () => void
+  const pending = new Promise<void>(resolve => { release = resolve })
   let fatal!: (error: Error) => void, now = 1_000_000
   const clock = spyOn(Date, 'now').mockImplementation(() => now)
   const native = { events: new EventEmitter(), ended: () => false,
-    request: async (operation: string, _input?: unknown, deadline?: number) => {
+    request: async (operation: string, input?: unknown, deadline?: number) => {
       if (operation === 'launch') return {}
-      expect(operation).toBe('retire'); requests.push(deadline); return {}
+      expect(operation).toBe('retire'); requests.push({ deadline, input }); await pending; return {}
     } }
   const scope = { plans: new WeakSet([plan]), selectedConfigs: new WeakMap([[plan, 'TEST-config']]),
     binaries: new WeakMap([[plan, bun]]), memberPreflights: new WeakMap(), brokers: new WeakMap([[plan, native]]),
@@ -69,17 +68,17 @@ test('actual Windows adapter gates kill, retirement and fire-and-forget HTTP fai
     } }
   try {
     const launch = new Function('scope', `const {${Object.keys(scope).join(',')}}=scope;${body};return launchWindowsExecution;`)(scope)(plan,
-      '11111111-1111-4111-8111-111111111111', '22222222-2222-4222-8222-222222222222', bun, now + 5000, gate)
+      '11111111-1111-4111-8111-111111111111', '22222222-2222-4222-8222-222222222222', bun, now + 5000)
     const errors: Error[] = []; launch.child.on('error', (error: Error) => { errors.push(error) })
-    const deadline = now + 22_000, killed = launch.kill(deadline), retired = launch.retire(deadline).catch((error: Error) => error)
+    const deadline = now + 22_000, killed = launch.kill(deadline), retired = launch.retire(deadline + 1000).catch((error: Error) => error)
     const transport = new Error('TEST-http-failure'); fatal(transport)
     for (let i = 0; i < 10; i++) await Promise.resolve()
-    expect(jobs).toHaveLength(3); expect(requests).toHaveLength(0); expect(errors).toEqual([transport])
+    expect(requests).toEqual([{ deadline, input: { deadline, timeoutMs: 22_000 } }]); expect(errors).toEqual([transport])
     now = deadline + 1
-    for (const job of jobs) await job()
+    release()
     await killed
     expect((await retired).message).toBe('cleanup_unknown') // Unprepared fake mappings cannot mint native proof.
-    expect(requests).toEqual([undefined, undefined, undefined]) // Actual execution reevaluates the original expired deadline.
+    expect(requests).toEqual([{ deadline, input: { deadline, timeoutMs: 22_000 } }]) // No replay or deadline replenishment.
   } finally { clock.mockRestore() }
 })
 
@@ -327,6 +326,13 @@ test('native retirement timeout retains only the original nonce and finite clean
   const receipt = { empty: true }
   expect(await retireWindowsNativeScope({ events, request: async () => receipt }, 'TEST-original')).toBe(receipt)
   expect(events.listenerCount('retireProgress')).toBe(0)
+  const expired = Date.now() - 100
+  let actualInput: unknown, actualDeadline: number | undefined
+  await retireWindowsNativeScope({ events, request: async (_operation, input, deadline) => {
+    actualInput = input; actualDeadline = deadline; return receipt
+  } }, 'TEST-original', expired)
+  expect(actualInput).toEqual({ deadline: expired, timeoutMs: 0 })
+  expect(actualDeadline).toBeUndefined() // Send owned cleanup, retaining expiry in the native payload.
 })
 
 
