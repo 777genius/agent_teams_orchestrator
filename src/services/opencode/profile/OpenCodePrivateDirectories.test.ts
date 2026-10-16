@@ -124,6 +124,32 @@ test('private directory failures retain finite native classification and request
   } finally { await f.remove() }
 })
 
+test('private directory cleanup keeps the exact primary and every original rejection while closing all handles', async () => {
+  const f = await fixture()
+  const primary = new Error('execution_owner_not_private:private_acl_owner:5')
+  const cleanup = new Error('execution_native_unknown:owner_metadata_cleanup:6')
+  try {
+    const directory = path.join(f.root, 'opencode')
+    let failure: unknown
+    try {
+      await prepareWindowsPrivateDirectories([f.root, directory], {
+        prepareDirectory: async (value, create) => {
+          const held = await f.prepareFilesystem.prepareDirectory(value, create)
+          return { ...held, assertOwned: async () => { if (value === directory) throw primary },
+            close: async () => { await held.close(); if (value === directory) throw cleanup } }
+        },
+      })
+    } catch (error) { failure = error }
+    expect(failure).toBeInstanceOf(AggregateError)
+    expect((failure as AggregateError).message).toBe('cleanup_unknown')
+    expect((failure as AggregateError).cause).toBe(primary)
+    expect((failure as AggregateError).errors).toEqual([primary, cleanup])
+    expect((failure as AggregateError).errors[1]).toBe(cleanup)
+    expect(f.live.size).toBe(0)
+    expect(f.calls.slice(-2)).toEqual([`close:${directory}`, `close:${f.root}`])
+  } finally { await f.remove() }
+})
+
 
 test('generation-unknown version census gets isolated usable roots and removes only its own allocation', async () => {
   const roots = await createOpenCodeVersionReadRoots()

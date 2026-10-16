@@ -265,6 +265,7 @@ export async function createOpenCodeV2PreparedMember(selection: Awaited<ReturnTy
     const held: WindowsOwnerDirectory[] = []
     let config: ReturnType<typeof createOpenCodeV2ExecutionConfig>
     let managedAuthFingerprint: string
+    let primary: unknown, failed = false
     try {
       const filesystem = publisher ? createWindowsOwnerFilesystem(request => publisher.request(request.op, request)) : undefined
       const configOwner = filesystem ? await filesystem.createDirectory(configDirectory) : undefined
@@ -285,10 +286,13 @@ export async function createOpenCodeV2PreparedMember(selection: Awaited<ReturnTy
       if (configOwner) await configOwner.writePreparedConfig(config.content, config.sha256)
       else await writeFile(path.join(configDirectory, 'opencode.json'), config.content, { flag: 'wx', mode: 0o600 })
       if (authOwner) await authOwner.createPreparedDatabase()
-    } finally {
+    } catch (error) { primary = error; failed = true; throw error }
+    finally {
       const closed = await Promise.allSettled(held.reverse().map(directory => directory.close()))
-      await publisher?.close()
-      executionAssert(closed.every(result => result.status === 'fulfilled'), 'cleanup_unknown')
+      const errors = closed.flatMap(result => result.status === 'rejected' ? [result.reason] : [])
+      try { await publisher?.close() } catch (error) { errors.push(error) }
+      if (errors.length) throw Object.assign(new AggregateError([...(failed ? [primary] : []), ...errors], 'cleanup_unknown',
+        { cause: failed ? primary : errors[0] }), { cleanupBoundary: 'prepared_member_close', primaryFailure: failed })
     }
     const env = createOpenCodeV2OwnedProfileEnvironment(root)
     if (process.platform === 'darwin' && native.taskNode)

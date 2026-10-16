@@ -50,6 +50,7 @@ export async function prepareWindowsPrivateDirectories(directories: readonly str
     held.set(directory, handle)
     await handle.assertOwned()
   }
+  let primary: unknown, failed = false
   try {
     if (directories.length > 64) throw new Error('execution_owner_path_invalid')
     for (let index = 0; index < directories.length; index++) {
@@ -63,9 +64,12 @@ export async function prepareWindowsPrivateDirectories(directories: readonly str
       }
     }
     for (const handle of held.values()) await handle.assertOwned()
-  } finally {
+  } catch (error) { primary = error; failed = true; throw error }
+  finally {
     const results = await Promise.allSettled([...held.values()].reverse().map(handle => handle.close()))
-    if (results.some(result => result.status === 'rejected')) throw new Error('cleanup_unknown')
+    const errors = results.flatMap(result => result.status === 'rejected' ? [result.reason] : [])
+    if (errors.length) throw Object.assign(new AggregateError([...(failed ? [primary] : []), ...errors], 'cleanup_unknown',
+      { cause: failed ? primary : errors[0] }), { cleanupBoundary: 'private_directories_close', primaryFailure: failed })
   }
 }
 
@@ -73,8 +77,14 @@ export async function ensureWindowsPrivateDirectories(directories: readonly stri
   if (process.platform !== 'win32') throw new Error('execution_owner_platform_pending')
   const broker = createWindowsNativeBroker(await resolveWindowsNativeArtifact())
   broker.events.on('error', () => {})
+  let primary: unknown, failed = false
   try {
     const filesystem = createWindowsOwnerFilesystem((request, deadline, signal) => broker.request(request.op, request, deadline, signal))
     await prepareWindowsPrivateDirectories(directories, filesystem, exclusive)
-  } finally { await broker.close() }
+  } catch (error) { primary = error; failed = true; throw error }
+  finally {
+    try { await broker.close() }
+    catch (error) { throw Object.assign(new AggregateError([...(failed ? [primary] : []), error], 'cleanup_unknown',
+      { cause: failed ? primary : error }), { cleanupBoundary: 'private_directory_broker_close', primaryFailure: failed }) }
+  }
 }

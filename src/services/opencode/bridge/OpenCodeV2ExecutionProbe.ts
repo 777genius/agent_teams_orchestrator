@@ -102,13 +102,18 @@ async function openWindowsProbeStore(dataRoot: string, sourceKey: string, deadli
       },
       async close() {
         const closed = await Promise.allSettled(held.splice(0).map(root => root.close()))
-        await broker.close()
-        if (closed.some(result => result.status === 'rejected')) throw new Error('cleanup_unknown')
+        const errors = closed.flatMap(result => result.status === 'rejected' ? [result.reason] : [])
+        try { await broker.close() } catch (error) { errors.push(error) }
+        if (errors.length) throw Object.assign(new AggregateError(errors, 'cleanup_unknown', { cause: errors[0] }),
+          { cleanupBoundary: 'probe_store_close', primaryFailure: false })
       },
     })
   } catch (error) {
-    await Promise.allSettled(held.splice(0).map(root => root.close()))
-    await broker.close().catch(() => undefined)
+    const closed = await Promise.allSettled(held.splice(0).map(root => root.close()))
+    const errors = closed.flatMap(result => result.status === 'rejected' ? [result.reason] : [])
+    try { await broker.close() } catch (failure) { errors.push(failure) }
+    if (errors.length) throw Object.assign(new AggregateError([error, ...errors], 'cleanup_unknown', { cause: error }),
+      { cleanupBoundary: 'probe_store_open', primaryFailure: true })
     throw error
   }
 }
@@ -161,7 +166,12 @@ export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, 
   }
   if (windowsStore) {
     try { await windowsStore.ensureGuard(deadline); assertDeadline() }
-    catch (error) { await windowsStore.close().catch(() => undefined); throw error }
+    catch (error) {
+      try { await windowsStore.close() }
+      catch (failure) { throw Object.assign(new AggregateError([error, failure], 'cleanup_unknown', { cause: error }),
+        { cleanupBoundary: 'probe_guard_close', primaryFailure: true }) }
+      throw error
+    }
   } else assertDeadline()
   let release: (() => Promise<void>) | undefined
   const save = async (record: ProbeRecord) => {
@@ -173,6 +183,7 @@ export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, 
     await writeFile(temporary, recordBytes, { flag: 'wx', mode: 0o600 }); await rename(temporary, file)
     assertDeadline()
   }
+  let primary: unknown, failed = false
   try {
     release = await lockfile.lock(guard, { retries: { retries: 10, minTimeout: 20, maxTimeout: 200 } })
     assertDeadline()
@@ -292,7 +303,14 @@ export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, 
       await new Promise(resolve => setTimeout(resolve, Math.min(300, Math.max(1, deadline - Date.now()))))
     }
     return { state: 'pending' as const, proof: null, reason: 'Original native input has no qualifying terminal; only readback is authorized.' }
-  } finally {
-    try { await release?.() } finally { await windowsStore?.close() }
+  } catch (error) { primary = error; failed = true; throw error }
+  finally {
+    if (windowsStore) {
+      const errors: unknown[] = []
+      try { await release?.() } catch (error) { errors.push(error) }
+      try { await windowsStore.close() } catch (error) { errors.push(error) }
+      if (errors.length) throw Object.assign(new AggregateError([...(failed ? [primary] : []), ...errors], 'cleanup_unknown',
+        { cause: failed ? primary : errors[0] }), { cleanupBoundary: 'probe_release', primaryFailure: failed })
+    } else await release?.()
   }
 }

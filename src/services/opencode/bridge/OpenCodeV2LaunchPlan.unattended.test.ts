@@ -261,10 +261,12 @@ test('retired original terminal failure is retained across read and run requests
   }
 })
 
-for (const refuse of [false, true]) test(`Windows prepared member creates its database before closing native publishers (refused=${refuse})`, async () => {
+for (const refuse of [false, true]) for (const cleanupRefused of [false, true]) test(`Windows prepared member creates its database before closing native publishers (refused=${refuse}, cleanupRefused=${cleanupRefused})`, async () => {
   const platform = Object.getOwnPropertyDescriptor(process, 'platform')!
   const events: string[] = []
   const refusal = new Error('execution_owner_unknown:prepared_database_exists:80')
+  const closeData = windowsBroker.decodeWindowsNativeFailure({ error: 'execution_native_unknown', stage: 'owner_metadata_cleanup', nativeCode: 5 }, 'ownerCloseDirectory')
+  const closeConfig = new Error('execution_owner_unknown'), closeBroker = new Error('cleanup_unknown')
   let databasePath: string | undefined
   try {
     Object.defineProperty(process, 'platform', { ...platform, value: 'darwin' })
@@ -280,7 +282,7 @@ for (const refuse of [false, true]) test(`Windows prepared member creates its da
       spyOn(windowsBroker, 'createWindowsNativeBroker').mockReturnValue({
         events: new EventEmitter(), ended: () => false,
         request: async () => { throw new Error('TEST unexpected native request') },
-        close: async () => { events.push('broker-close') },
+        close: async () => { events.push('broker-close'); if (cleanupRefused) throw closeBroker },
       }),
       spyOn(windowsFilesystem, 'createWindowsOwnerFilesystem').mockReturnValue({
         ...unusedFilesystem,
@@ -303,7 +305,7 @@ for (const refuse of [false, true]) test(`Windows prepared member creates its da
               if (refuse) throw refusal
               await writeFile(databasePath, '', { flag: 'wx' })
             },
-            close: async () => { events.push(`close-${role}`) },
+            close: async () => { events.push(`close-${role}`); if (cleanupRefused) throw role === 'data' ? closeData : closeConfig },
           } satisfies windowsFilesystem.WindowsOwnerDirectory
         },
       }),
@@ -311,7 +313,15 @@ for (const refuse of [false, true]) test(`Windows prepared member creates its da
     Object.defineProperty(process, 'platform', { ...platform, value: 'win32' })
     const prepared = createOpenCodeV2PreparedMember(selection, native(), parent,
       { teamId: 'TEST-team', runId: 'TEST-run', memberId: 'worker', unattendedTeam: true })
-    if (refuse) await expect(prepared).rejects.toBe(refusal)
+    if (cleanupRefused) {
+      const failure = await prepared.catch(error => error)
+      expect(failure).toBeInstanceOf(AggregateError)
+      expect(failure.message).toBe('cleanup_unknown')
+      expect(failure.cause).toBe(refuse ? refusal : closeData)
+      expect(failure.errors).toEqual([...(refuse ? [refusal] : []), closeData, closeConfig, closeBroker])
+      expect(failure.errors[refuse ? 1 : 0]).toBe(closeData)
+      expect(Reflect.get(closeData, 'nativeOperation')).toBe('ownerCloseDirectory')
+    } else if (refuse) await expect(prepared).rejects.toBe(refusal)
     else {
       const result = await prepared
       if (databasePath === undefined) throw new Error('TEST native database creation was not called')
@@ -322,10 +332,12 @@ for (const refuse of [false, true]) test(`Windows prepared member creates its da
   } finally { Object.defineProperty(process, 'platform', platform) }
 })
 
-for (const refuse of [false, true]) test(`Windows probe privately creates only its two exclusive controller leaves before planning (refused=${refuse})`, async () => {
+for (const refuse of [false, true]) for (const cleanupRefused of [false, true]) test(`Windows probe privately creates only its two exclusive controller leaves before planning (refused=${refuse}, cleanupRefused=${cleanupRefused})`, async () => {
   const platform = Object.getOwnPropertyDescriptor(process, 'platform')!
   const stoppedBeforeLaunch = new Error('TEST complete controller preparation')
   const refusal = new Error('execution_profile_owned')
+  const closeDirectory = windowsBroker.decodeWindowsNativeFailure({ error: 'execution_native_unknown', stage: 'owner_metadata_cleanup', nativeCode: 6 }, 'ownerCloseDirectory')
+  const closeBroker = new Error('cleanup_unknown')
   const identity = { volumeSerial: '1', fileId: '1'.repeat(32), ownerSid: 'S-1-5-21-1' }
   let allocations = 0, planned = 0, closed = false
   try {
@@ -339,12 +351,12 @@ for (const refuse of [false, true]) test(`Windows probe privately creates only i
       spyOn(windowsBroker, 'resolveWindowsNativeArtifact').mockResolvedValue({ path: '/TEST/helper.exe', sha256: 'a'.repeat(64), arch: 'x64' }),
       spyOn(windowsBroker, 'createWindowsNativeBroker').mockReturnValue({
         events: new EventEmitter(), ended: () => closed, request: unused,
-        close: async () => { closed = true },
+        close: async () => { closed = true; if (cleanupRefused) throw closeBroker },
       }),
       spyOn(windowsFilesystem, 'createWindowsOwnerFilesystem').mockReturnValue({ ...filesystem,
         prepareDirectory: async (directory: string) => {
           await mkdir(directory, { recursive: true })
-          return { identity, assertOwned: async () => {}, close: async () => {},
+          return { identity, assertOwned: async () => {}, close: async () => { if (cleanupRefused) throw closeDirectory },
             writeMetadata: async (purpose) => {
               if (purpose !== 'ProbeGuard') throw new Error('TEST unexpected probe submission')
               await writeFile(path.join(directory, 'owner.lock'), '', { flag: 'wx' })
@@ -377,9 +389,21 @@ for (const refuse of [false, true]) test(`Windows probe privately creates only i
       }),
     )
     Object.defineProperty(process, 'platform', { ...platform, value: 'win32' })
-    await expect(probes.resolveOpenCodeV2ExecutionProbe(envelope(), { ...selection,
+    const result = probes.resolveOpenCodeV2ExecutionProbe(envelope(), { ...selection,
       controller: { type: 'local', command: [process.execPath, '/TEST/controller.mjs'],
-        environment: { AGENT_TEAMS_MCP_CLAUDE_DIR: controller } } }, true)).rejects.toBe(refuse ? refusal : stoppedBeforeLaunch)
+        environment: { AGENT_TEAMS_MCP_CLAUDE_DIR: controller } } }, true)
+    if (cleanupRefused) {
+      const failure = await result.catch(error => error)
+      expect(failure).toBeInstanceOf(AggregateError)
+      expect(failure.cause).toBe(refuse ? refusal : stoppedBeforeLaunch)
+      expect(failure.errors[0]).toBe(failure.cause)
+      const cleanup = failure.errors[1]
+      expect(cleanup).toBeInstanceOf(AggregateError)
+      expect(cleanup.cause).toBe(closeDirectory)
+      expect(cleanup.errors.length).toBeGreaterThan(1)
+      expect(cleanup.errors.slice(0, -1).every((error: unknown) => error === closeDirectory)).toBe(true)
+      expect(cleanup.errors.at(-1)).toBe(closeBroker)
+    } else await expect(result).rejects.toBe(refuse ? refusal : stoppedBeforeLaunch)
     expect(allocations).toBe(1); expect(planned).toBe(refuse ? 0 : 1); expect(closed).toBe(true)
   } finally { Object.defineProperty(process, 'platform', platform) }
 })

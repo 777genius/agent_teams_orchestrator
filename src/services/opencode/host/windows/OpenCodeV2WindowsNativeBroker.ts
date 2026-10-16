@@ -27,8 +27,12 @@ export function readWindowsNativeAliasFailure(error: unknown): WindowsNativeAlia
 /** The normal reply decoder keeps the original finite failure as an Error. */
 export function decodeWindowsNativeFailure(value: Readonly<Record<string, unknown>>, operation: string): Error {
   const code = typeof value.error === 'string' && /^[a-z_]{1,96}$/.test(value.error) ? value.error : 'execution_native_unknown'
-  const context = typeof value.stage === 'string' && /^[a-z_]{1,64}$/.test(value.stage) && Number.isSafeInteger(value.nativeCode) && Number(value.nativeCode) >= 0 && Number(value.nativeCode) <= 0xffffffff ? `:${value.stage}:${value.nativeCode}` : ''
-  const error = new Error(code + context)
+  const context = typeof value.stage === 'string' && /^[a-z_][a-z_0-9]{0,63}$/.test(value.stage) && Number.isSafeInteger(value.nativeCode) && Number(value.nativeCode) >= 0 && Number(value.nativeCode) <= 0xffffffff ? `:${value.stage}:${value.nativeCode}` : ''
+  const error = Object.assign(new Error(code + context), {
+    nativeOperation: aliasOperations.find(candidate => candidate === operation) ?? 'unknown',
+    ...(Number.isSafeInteger(value.nativeStatus) && Number(value.nativeStatus) >= 0 && Number(value.nativeStatus) <= 0xffffffff
+      ? { nativeStatus: Number(value.nativeStatus) } : {}),
+  })
   if (code === 'execution_path_alias') {
     const alias = projectWindowsNativeAliasFailure(value.alias)
     if (alias && alias.operation === operation) nativeAliasFailures.set(error, alias)
@@ -68,8 +72,20 @@ export async function resolveWindowsNativeArtifact(): Promise<WindowsNativeArtif
   const bootstrap = launchWindowsNativeBroker(source, true)
   bootstrap.events.on('error', () => {})
   let receipt: unknown
+  let primary: unknown, failed = false
   try { receipt = await bootstrap.request('selfImageCustody') }
-  finally { await bootstrap.close() }
+  catch (error) {
+    try {
+      if (error instanceof Error && !Object.hasOwn(error, 'nativeOperation'))
+        Object.assign(error, { nativeOperation: 'selfImageCustody' })
+    } catch { /* Diagnostic context cannot replace the original failure. */ }
+    primary = error; failed = true; throw error
+  }
+  finally {
+    try { await bootstrap.close() }
+    catch (error) { throw Object.assign(new AggregateError([...(failed ? [primary] : []), error], 'cleanup_unknown',
+      { cause: failed ? primary : error }), { cleanupBoundary: 'native_artifact_close', primaryFailure: failed }) }
+  }
   assert(receipt && typeof receipt === 'object' && !Array.isArray(receipt), 'execution_containment_helper_identity')
   const value = receipt as Record<string, unknown>
   const selected = path.win32.join(process.env.LOCALAPPDATA!, 'AgentTeams.OpenCodeV2.Native', source.sha256, 'opencode-v2-windows-helper.exe')

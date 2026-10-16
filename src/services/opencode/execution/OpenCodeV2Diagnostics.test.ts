@@ -274,6 +274,8 @@ test('native diagnostics retain only closed producer codes and stages with uint3
   const previous = process.env.CLAUDE_MULTIMODEL_DATA_HOME
   const secret = 'TEST_PRIVATE_NATIVE_PAYLOAD'
   const cases: { error: Error; category: string; native?: { stage: string; nativeCode: number } }[] = [
+    { error: new Error('execution_owner_not_private:private_acl_owner_run_v2:5'), category: 'execution_owner_not_private',
+      native: { stage: 'private_acl_owner_run_v2', nativeCode: 5 } },
     ...['retire_broker_state', 'retire_broker_write', 'retire_job', 'retire_wait', 'retire_io_join',
       'retire_main_exit', 'retire_owned_pair', 'retire_commands', 'retire_receipt', 'retire_grants',
       'retire_grants_dll', 'retire_grants_roots', 'retire_grants_metadata']
@@ -422,9 +424,15 @@ test('actual native broker alias reply decoder persists original operation and s
   const previous = process.env.CLAUDE_MULTIMODEL_DATA_HOME
   process.env.CLAUDE_MULTIMODEL_DATA_HOME = root
   try {
-    const original = decodeWindowsNativeFailure({ error: 'execution_path_alias', stage: 'alias_predicate', nativeCode: 0,
+    const original = decodeWindowsNativeFailure({ error: 'execution_path_alias', stage: 'alias_predicate', nativeCode: 0, nativeStatus: 0xc0000022,
       alias: { operation: 'runStateSelect', sourceLine: 392, predicates: 2 } }, 'runStateSelect')
     const before = Object.getOwnPropertyDescriptors(original)
+    expect(Reflect.get(original, 'nativeOperation')).toBe('runStateSelect')
+    expect(Reflect.get(original, 'nativeStatus')).toBe(0xc0000022)
+    expect(Reflect.get(decodeWindowsNativeFailure({ error: 'execution_native_unknown', nativeStatus: 0x100000000 }, 'TEST_arbitrary'), 'nativeStatus')).toBeUndefined()
+    expect(Reflect.get(decodeWindowsNativeFailure({ error: 'execution_native_unknown' }, 'TEST_arbitrary'), 'nativeOperation')).toBe('unknown')
+    expect(decodeWindowsNativeFailure({ error: 'execution_owner_not_private', stage: 'private_acl_owner_run_v2', nativeCode: 5 }, 'ownerPreparePrivateDirectory').message)
+      .toBe('execution_owner_not_private:private_acl_owner_run_v2:5')
     await recordOpenCodeV2ProviderFailure('execution-host-startup', original, true)
     const directory = path.join(root, 'opencode/v2/provider-diagnostics'), names = await readdir(directory)
     expect(names).toHaveLength(1)

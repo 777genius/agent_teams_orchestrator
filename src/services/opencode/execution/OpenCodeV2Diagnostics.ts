@@ -194,7 +194,7 @@ const privateNativeFailureStages = new Set([
 function nativeFailure(error: unknown): { category: string; native?: { stage: string; nativeCode: number } } | undefined {
   if (!(error instanceof Error)) return undefined
   if (privateNativeFailureCodes.has(error.message)) return { category: error.message }
-  const match = /^([a-z_]{1,96}):([a-z_]{1,64}):(0|[1-9][0-9]{0,9})$/.exec(error.message)
+  const match = /^([a-z_]{1,96}):([a-z_][a-z_0-9]{0,63}):(0|[1-9][0-9]{0,9})$/.exec(error.message)
   if (!match || !privateNativeFailureCodes.has(match[1]!)) return undefined
   const nativeCode = Number(match[3])
   if (!Number.isSafeInteger(nativeCode) || nativeCode > 0xffffffff) return undefined
