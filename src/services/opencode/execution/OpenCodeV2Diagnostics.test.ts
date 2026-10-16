@@ -207,7 +207,7 @@ test('owner MCP initialization retains closed command channel facts from the act
   const previous = process.env.CLAUDE_MULTIMODEL_DATA_HOME
   process.env.CLAUDE_MULTIMODEL_DATA_HOME = root
   const secret = 'TEST-PRIVATE-COMMAND-PAYLOAD', nonce = 'TEST-nonce', leaseOwnerId = 'TEST-lease'
-  let now = 1_000_000, counter = 0, commandId = ''
+  let now = 1_000_000, counter = 0, commandId = '', hang = false, failReply = false
   const replies: Record<string, unknown>[] = []
   const clock = spyOn(Date, 'now').mockImplementation(() => now)
   try {
@@ -215,8 +215,13 @@ test('owner MCP initialization retains closed command channel facts from the act
       assertLive: async () => undefined, failed: () => undefined,
       request: async (operation, input = {}) => {
         const value = input as Record<string, unknown>
-        if (operation === 'send') { replies.push(value.value as Record<string, unknown>); return undefined }
+        if (operation === 'send') {
+          if (failReply) { failReply = false; throw new Error(secret) }
+          replies.push(value.value as Record<string, unknown>); return undefined
+        }
         now += 7
+        if (operation === 'commandStart' && hang) return new Promise(() => undefined)
+        if (operation === 'commandEndStdin') return { closed: true, nextOffset: 120 }
         if (operation === 'commandStart') { commandId = String(value.commandId); return { commandId, pid: 4, birthFiletime: '1' } }
         if (operation === 'commandWriteStdin') return { writtenBytes: 120, nextOffset: 120 }
         if (operation === 'commandRead' && value.stream === 'stderr') return { bytesBase64: secret, nextOffset: 42, eof: false }
@@ -235,11 +240,22 @@ test('owner MCP initialization retains closed command channel facts from the act
     await send('commandRead', { commandId, stream: 'stderr', offset: 0, maxBytes: 8192 })
     await send('commandStatus', { commandId })
     await send('commandRead', { commandId, stream: 'stdout', offset: 1, maxBytes: 8192 })
-    expect(replies.map(reply => reply.ok)).toEqual([true, true, true, true, true, false])
+    // A native result whose reply cannot be delivered is a reply failure, not a native failure.
+    failReply = true
+    await send('commandEndStdin', { commandId, offset: 120 })
+    expect(replies.map(reply => reply.ok)).toEqual([true, true, true, true, true, false, false])
+    // An in-flight native start is visible with its stage and age, not as an absent spawn.
+    hang = true
+    const hungAt = now
+    void send('commandStart', { executable: 'C:\\TEST\\git.exe', args: [], cwd: 'C:\\', env: {}, stdin: 'ignore' })
+    await new Promise(resolve => setImmediate(resolve))
+    now += 100
+    const observation = handler.observation()
+    clock.mockRestore()
     const error = new Error('invalid_response'), history = [{ phase: 'bootstrap-before-log' as const, elapsedMs: 9 }, { phase: 'MCP-connect' as const, elapsedMs: 40 }]
     const acquisition = { elapsedMs: 120, history: [{ phase: 'preparing' as const, elapsedMs: 0 }, { phase: 'selection-ready' as const, elapsedMs: 110 }] }
     retainOpenCodeV2InitializationPhase(error, 'MCP-connect', 30_041, { ownerElapsedMs: 150, history, acquisition,
-      commands: { observation: handler.observation(), originAt: mcpStartedAt } })
+      commands: { observation, originAt: mcpStartedAt } })
     await recordOpenCodeV2ProviderFailure('run-owner-initialization', error, true)
     // Each invalid optional fact is omitted; the original phase is still retained.
     const invalid = new Error('invalid_response')
@@ -258,10 +274,11 @@ test('owner MCP initialization retains closed command channel facts from the act
     expect(observed.acquisition).toEqual(acquisition)
     expect(observed.initialization).toEqual({ phase: 'MCP-connect', elapsedMs: 30_041, ownerElapsedMs: 150, history, commands: {
       starts: 1, firstFailedOperation: 'commandRead',
-      operations: [{ operation: 'commandStart', requests: 1, failures: 0, maxLatencyMs: 7 },
-        { operation: 'commandRead', requests: 3, failures: 1, maxLatencyMs: 7 },
-        { operation: 'commandStatus', requests: 1, failures: 0, maxLatencyMs: 7 },
-        { operation: 'commandWriteStdin', requests: 1, failures: 0, maxLatencyMs: 7 }],
+      operations: [{ operation: 'commandStart', requests: 2, failures: 0, replyFailures: 0, maxLatencyMs: 7, pending: 1,
+          oldestPendingAgeMs: now - hungAt, oldestPendingStage: 'native' },
+        ...[['commandRead', 3, 1, 0], ['commandStatus', 1, 0, 0], ['commandWriteStdin', 1, 0, 0], ['commandEndStdin', 1, 0, 1]].map(
+          ([operation, requests, failures, replyFailures]) => ({ operation, requests, failures, replyFailures, maxLatencyMs: 7,
+            pending: 0, oldestPendingAgeMs: null, oldestPendingStage: null }))],
       commands: [{ startOffsetMs: 5, startLatencyMs: 7, stdin: 'pipe', stdinBytes: 120, stdoutBytes: 0, stderrBytes: 42,
         stdoutEof: false, stderrEof: false, running: true, exitCode: null, failedOperation: 'commandRead' }] } })
     const omitted = rows.find(row => row.initialization.phase === 'MCP-readback')

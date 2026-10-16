@@ -70,54 +70,82 @@ export function createWindowsCommandRequestReplay(): WindowsCommandRequestReplay
   })
 }
 /** Diagnostic-only facts for one lease's command channel: closed operation
- * names, counts, latencies, byte offsets and exit state. It never retains
- * arguments, environment, paths or stream bytes and cannot affect a reply. */
+ * names, counts, in-flight stages, latencies, byte offsets and exit state. It
+ * never retains arguments, environment, paths or stream bytes and cannot affect
+ * a reply. Only the most recent 32 command records are retained. */
 function createWindowsCommandObservation() {
   type Command = { -readonly [K in keyof ExecutionCommandObservation['commands'][number]]: ExecutionCommandObservation['commands'][number][K] }
-  const operations = new Map<ExecutionCommandOperation, { requests: number; failures: number; maxLatencyMs: number }>()
-  const commands = new Map<string, Command>()
+  type Stage = 'assert-live' | 'native' | 'reply'
+  type Token = { operation: ExecutionCommandOperation; input: Record<string, unknown>; startedAt: number; stage: Stage; done: boolean }
+  const operations = new Map<ExecutionCommandOperation, { requests: number; failures: number; replyFailures: number; maxLatencyMs: number }>()
+  const commands = new Map<string, Command>(), pending = new Set<Token>()
   let starts = 0, firstFailedOperation: ExecutionCommandOperation | null = null
   const offset = (value: unknown) => Number.isSafeInteger(value) && Number(value) >= 0 ? Number(value) : 0
+  const stats = (operation: ExecutionCommandOperation) => {
+    let value = operations.get(operation)
+    if (!value) { value = { requests: 0, failures: 0, replyFailures: 0, maxLatencyMs: 0 }; operations.set(operation, value) }
+    return value
+  }
+  const latency = (token: Token) => { const value = stats(token.operation); value.maxLatencyMs = Math.max(value.maxLatencyMs, Date.now() - token.startedAt) }
+  const command = (token: Token) => typeof token.input.commandId === 'string' ? commands.get(token.input.commandId) : undefined
   return Object.freeze({
-    settle(operation: ExecutionCommandOperation, input: Record<string, unknown>, result: unknown, startedAt: number, ok: boolean) {
+    admit(operation: ExecutionCommandOperation, input: Record<string, unknown>): Token {
+      const token: Token = { operation, input, startedAt: Date.now(), stage: 'assert-live', done: false }
+      try { stats(operation).requests++; pending.add(token) } catch { /* Diagnostic only. */ }
+      return token
+    },
+    native(token: Token) { token.stage = 'native' },
+    succeeded(token: Token, result: unknown) {
       try {
-        const latency = Math.max(0, Date.now() - startedAt)
-        const stats = operations.get(operation) ?? { requests: 0, failures: 0, maxLatencyMs: 0 }
-        stats.requests++; stats.maxLatencyMs = Math.max(stats.maxLatencyMs, latency)
-        if (!ok) { stats.failures++; firstFailedOperation ??= operation }
-        operations.set(operation, stats)
+        token.stage = 'reply'; latency(token)
         const value = result && typeof result === 'object' && !Array.isArray(result) ? result as Record<string, unknown> : {}
-        if (operation === 'commandStart') {
-          if (!ok) return
+        if (token.operation === 'commandStart') {
           starts++
-          if (typeof value.commandId === 'string' && commands.size < 8 && !commands.has(value.commandId))
-            commands.set(value.commandId, { startedAt, startLatencyMs: latency, stdin: input.stdin === 'pipe' ? 'pipe' : 'ignore',
-              stdinBytes: 0, stdoutBytes: 0, stderrBytes: 0, stdoutEof: false, stderrEof: false, running: null, exitCode: null, failedOperation: null })
+          if (typeof value.commandId !== 'string' || commands.has(value.commandId)) return
+          if (commands.size >= 32) commands.delete(commands.keys().next().value!)
+          commands.set(value.commandId, { startedAt: token.startedAt, startLatencyMs: Math.max(0, Date.now() - token.startedAt),
+            stdin: token.input.stdin === 'pipe' ? 'pipe' : 'ignore', stdinBytes: 0, stdoutBytes: 0, stderrBytes: 0,
+            stdoutEof: false, stderrEof: false, running: null, exitCode: null, failedOperation: null })
           return
         }
-        const command = typeof input.commandId === 'string' ? commands.get(input.commandId) : undefined
-        if (!command) return
-        if (!ok) { command.failedOperation ??= operation; return }
-        if (operation === 'commandWriteStdin') command.stdinBytes = Math.max(command.stdinBytes, offset(value.nextOffset))
-        if (operation === 'commandRead' && input.stream === 'stdout') {
-          command.stdoutBytes = Math.max(command.stdoutBytes, offset(value.nextOffset)); command.stdoutEof ||= value.eof === true
+        const owned = command(token)
+        if (!owned) return
+        if (token.operation === 'commandWriteStdin') owned.stdinBytes = Math.max(owned.stdinBytes, offset(value.nextOffset))
+        if (token.operation === 'commandRead' && token.input.stream === 'stdout') {
+          owned.stdoutBytes = Math.max(owned.stdoutBytes, offset(value.nextOffset)); owned.stdoutEof ||= value.eof === true
         }
-        if (operation === 'commandRead' && input.stream === 'stderr') {
-          command.stderrBytes = Math.max(command.stderrBytes, offset(value.nextOffset)); command.stderrEof ||= value.eof === true
+        if (token.operation === 'commandRead' && token.input.stream === 'stderr') {
+          owned.stderrBytes = Math.max(owned.stderrBytes, offset(value.nextOffset)); owned.stderrEof ||= value.eof === true
         }
-        if (operation === 'commandStatus' && typeof value.running === 'boolean') {
-          command.running = value.running
-          command.exitCode = !value.running && Number.isSafeInteger(value.exitCode) ? Number(value.exitCode) : null
+        if (token.operation === 'commandStatus' && typeof value.running === 'boolean') {
+          owned.running = value.running
+          owned.exitCode = !value.running && Number.isSafeInteger(value.exitCode) ? Number(value.exitCode) : null
         }
       } catch { /* Observation never changes the native command result. */ }
     },
+    /** A result already obtained but not delivered is a reply failure only. */
+    failed(token: Token) {
+      if (token.done) return
+      token.done = true; pending.delete(token)
+      try {
+        if (token.stage === 'reply') { stats(token.operation).replyFailures++; return }
+        latency(token); stats(token.operation).failures++; firstFailedOperation ??= token.operation
+        const owned = command(token)
+        if (owned) owned.failedOperation ??= token.operation
+      } catch { /* Diagnostic only. */ }
+    },
+    replied(token: Token) { token.done = true; pending.delete(token) },
     snapshot(): ExecutionCommandObservation {
+      const now = Date.now()
       return Object.freeze({ starts, firstFailedOperation,
         operations: Object.freeze(executionCommandOperations.flatMap(operation => {
-          const stats = operations.get(operation)
-          return stats ? [Object.freeze({ operation, ...stats })] : []
+          const value = operations.get(operation)
+          if (!value) return []
+          const open = [...pending].filter(token => token.operation === operation), oldest = open[0]
+          return [Object.freeze({ operation, ...value, pending: open.length,
+            oldestPendingAgeMs: oldest ? Math.max(0, now - oldest.startedAt) : null, oldestPendingStage: oldest?.stage ?? null })]
         })),
-        commands: Object.freeze([...commands.values()].map(command => Object.freeze({ ...command }))) })
+        commands: Object.freeze([...commands.values()].slice(-8).map(value => Object.freeze({ ...value }))) })
     },
   })
 }
@@ -128,17 +156,12 @@ export function createWindowsCommandRequestHandler(options: Readonly<{
   assertLive(allowClosing: boolean): Promise<void>; request: WindowsNativeBroker['request']; failed(): void
 }>) {
   const replay = createWindowsCommandRequestReplay(), observation = createWindowsCommandObservation()
-  const operations = new Set<string>(executionCommandOperations)
+  const operations = new Set(['commandStart', 'commandRead', 'commandStatus', 'commandWriteStdin', 'commandEndStdin', 'commandRetire', 'commandClose'])
   const lifecycle = new Set(['commandRetire', 'commandClose'])
   const failed = () => { try { options.failed() } catch { /* Error observers cannot poison the native frame parser. */ } }
   return Object.assign(async (value: unknown): Promise<void> => {
     let id: string | undefined, authority: object | undefined
-    let observed: Readonly<{ operation: ExecutionCommandOperation; input: Record<string, unknown> }> | undefined
-    const startedAt = Date.now()
-    const settle = (ok: boolean, result?: unknown) => {
-      if (observed) observation.settle(observed.operation, observed.input, result, startedAt, ok)
-      observed = undefined
-    }
+    let observed: ReturnType<typeof observation.admit> | undefined
     const reply = (ok: boolean, result?: unknown) => options.request('send', {
       value: { type: 'commandResult', id, nonce: options.nonce, leaseOwnerId: options.leaseOwnerId, ok,
         ...(ok ? { value: result } : {}) },
@@ -150,16 +173,18 @@ export function createWindowsCommandRequestHandler(options: Readonly<{
         typeof record.id === 'string' && /^[a-f0-9-]{36}$/.test(record.id) &&
         typeof record.operation === 'string' && operations.has(record.operation), 'execution_native_command_unknown')
       const input = row(record.input), operation = record.operation as ExecutionCommandOperation
-      observed = { operation, input }
       id = record.id as string; authority = replay.admit(id, operation)
-      if (options.closing() && !lifecycle.has(operation)) { settle(false); await reply(false); return }
+      observed = observation.admit(operation, input)
+      if (options.closing() && !lifecycle.has(operation)) { observation.failed(observed); await reply(false); return }
       await options.assertLive(lifecycle.has(operation))
-      if (options.closing() && !lifecycle.has(operation)) { settle(false); await reply(false); return }
+      if (options.closing() && !lifecycle.has(operation)) { observation.failed(observed); await reply(false); return }
+      observation.native(observed)
       const result = await options.request(operation, operation === 'commandStart' ? { ...input, commandId: randomUUID() } : input)
-      settle(true, result)
+      observation.succeeded(observed, result)
       await reply(true, result)
+      observation.replied(observed)
     } catch {
-      settle(false)
+      if (observed) observation.failed(observed)
       if (id && authority) { try { await reply(false) } catch { failed() } }
       else failed()
     } finally { if (id && authority) replay.settle(id, authority) }

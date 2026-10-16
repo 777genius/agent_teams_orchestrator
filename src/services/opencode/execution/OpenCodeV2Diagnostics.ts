@@ -118,7 +118,8 @@ export type ExecutionCommandOperation = typeof executionCommandOperations[number
  * totals and closed classes only; absolute times are projected before writing. */
 export type ExecutionCommandObservation = Readonly<{
   starts: number; firstFailedOperation: ExecutionCommandOperation | null
-  operations: readonly Readonly<{ operation: ExecutionCommandOperation; requests: number; failures: number; maxLatencyMs: number }>[]
+  operations: readonly Readonly<{ operation: ExecutionCommandOperation; requests: number; failures: number; replyFailures: number
+    maxLatencyMs: number; pending: number; oldestPendingAgeMs: number | null; oldestPendingStage: 'assert-live' | 'native' | 'reply' | null }>[]
   commands: readonly Readonly<{ startedAt: number; startLatencyMs: number; stdin: 'pipe' | 'ignore'
     stdinBytes: number; stdoutBytes: number; stderrBytes: number; stdoutEof: boolean; stderrEof: boolean
     running: boolean | null; exitCode: number | null; failedOperation: ExecutionCommandOperation | null }>[]
@@ -132,7 +133,10 @@ function commandDiagnostic(value: ExecutionCommandObservation, originAt: number)
     starts: count(value.starts), firstFailedOperation: commandOperation(value.firstFailedOperation),
     operations: value.operations.slice(0, executionCommandOperations.length).flatMap(item => commandOperation(item.operation) ? [{
       operation: commandOperation(item.operation)!, requests: count(item.requests), failures: count(item.failures),
-      maxLatencyMs: finiteElapsed(item.maxLatencyMs) ? item.maxLatencyMs : 86_400_000 }] : []),
+      replyFailures: count(item.replyFailures), maxLatencyMs: finiteElapsed(item.maxLatencyMs) ? item.maxLatencyMs : 86_400_000,
+      pending: count(item.pending), oldestPendingAgeMs: item.oldestPendingAgeMs === null ? null
+        : finiteElapsed(item.oldestPendingAgeMs) ? item.oldestPendingAgeMs : 86_400_000,
+      oldestPendingStage: (['assert-live', 'native', 'reply'] as const).find(stage => stage === item.oldestPendingStage) ?? null }] : []),
     commands: value.commands.slice(0, 8).map(item => ({
       startOffsetMs: Number.isFinite(item.startedAt) ? commandOffset(item.startedAt - originAt) : 0,
       startLatencyMs: finiteElapsed(item.startLatencyMs) ? item.startLatencyMs : 86_400_000, stdin: item.stdin === 'pipe' ? 'pipe' : 'ignore',

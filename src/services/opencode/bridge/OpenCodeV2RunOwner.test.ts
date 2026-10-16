@@ -1,7 +1,7 @@
 import { fileURLToPath } from 'node:url'
 import { describe, expect, test, spyOn } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { OpenCodeV2RunOwner, projectRunOwnerEntryFailure } from './OpenCodeV2RunOwner.js'
@@ -19,6 +19,7 @@ import * as atomicWrite from '../../../utils/atomicWrite.js'
 import type { ExecutionLease } from '../host/OpenCodeV2ExecutionHost.js'
 import * as executionLifecycle from '../host/OpenCodeV2ExecutionLifecycle.js'
 import * as boundedFetch from '../transport/OpenCodeBoundedFetch.js'
+import { recordOpenCodeV2ProviderFailure } from '../execution/OpenCodeV2Diagnostics.js'
 
 // These tests cross the real durable session/admission boundary with fake
 // native/lease ports. They neither import an official server nor mint a native
@@ -294,6 +295,33 @@ test('live status locates every pending bootstrap API while accepted and verifie
     expect(f.counters).toMatchObject({ sessions: 1, prompted: 0 })
   } finally { for (const gate of waiting) gate.release.release(); await f.close() }
 }, 15_000)
+
+test('MCP-connect failure retains the original phase history for the owner initialization record', async () => {
+  const failure = new ExecutionTransportFailure('invalid_response', 'unknown')
+  const f = await fixture({ initializationCall: async operation => { if (operation === 'connectMcp') throw failure } })
+  const previous = process.env.CLAUDE_MULTIMODEL_DATA_HOME
+  try {
+    const error = await f.owner.ready().then(() => undefined, (rejection: unknown) => rejection)
+    expect(error).toBe(failure)
+    process.env.CLAUDE_MULTIMODEL_DATA_HOME = f.root
+    await recordOpenCodeV2ProviderFailure('run-owner-initialization', error, true)
+    const directory = path.join(f.root, 'opencode/v2/provider-diagnostics'), names = await readdir(directory)
+    expect(names).toHaveLength(1)
+    const initialization = JSON.parse(await readFile(path.join(directory, names[0]!), 'utf8')).initialization
+    expect(initialization.phase).toBe('MCP-connect')
+    expect(initialization.history.map((entry: { phase: string }) => entry.phase)).toEqual(['bootstrap-before-log',
+      'bootstrap-before-messages', 'bootstrap-before-log-confirm', 'bootstrap-instruction-put', 'bootstrap-instruction-readback',
+      'bootstrap-after-log', 'bootstrap-after-messages', 'bootstrap-after-log-confirm', 'bootstrap-verify', 'MCP-connect'])
+    expect(initialization.history.at(-1).elapsedMs).toBeLessThanOrEqual(initialization.elapsedMs)
+    expect(initialization.ownerElapsedMs).toBeGreaterThanOrEqual(0)
+    // A fake lease has no native command channel; no command facts are invented.
+    expect(Object.hasOwn(initialization, 'commands')).toBe(false)
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_DATA_HOME
+    else process.env.CLAUDE_MULTIMODEL_DATA_HOME = previous
+    await f.close()
+  }
+})
 
 test('Windows acquires all leases before any client or controller bootstrap, with no model input', async () => {
   const gates = [acquisitionGate(), acquisitionGate()], started: string[] = []
