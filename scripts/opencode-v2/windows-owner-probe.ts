@@ -49,23 +49,87 @@ const closeFixtureWriters = async () => {
   // these setup handles before a fresh CLI's normal existing-only admission.
   for (const handle of [...handles].reverse()) await handle.close()
 }
-const powershell = async (script: string, target: string, extra: Record<string, string> = {}): Promise<string> => {
+type FixturePowerShellPhase = 'tree_acl_snapshot' | 'probe_metadata_acl' | 'discovery_acl_fixture' |
+  'appcontainer_sid_derivation' | 'metadata_acl_install' | 'metadata_acl_restore' |
+  'project_acl_snapshot' | 'project_low_integrity' | 'project_acl_install' | 'project_acl_restore'
+const powershell = async (phase: FixturePowerShellPhase, script: string, target: string,
+  extra: Record<string, string> = {}): Promise<string> => {
   assert.ok(process.env.ProgramFiles && path.win32.isAbsolute(process.env.ProgramFiles))
   const powershellRoot = path.win32.join(process.env.ProgramFiles, 'PowerShell', '7')
+  // Compile inside the error boundary so parser failures also retain finite
+  // original facts. Never forward ErrorRecord text, targets or raw stderr.
+  const wrapped = `
+$ErrorActionPreference='Stop'
+try{
+$source=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${Buffer.from(script).toString('base64')}'))
+& ([ScriptBlock]::Create($source))
+}catch{
+$failure=$_;$exception=$failure.Exception;$inner=$exception.InnerException
+$line=$failure.InvocationInfo.ScriptLineNumber;$column=$failure.InvocationInfo.OffsetInLine
+$parse=$exception;if($inner -is [System.Management.Automation.ParseException]){$parse=$inner}
+if($parse -is [System.Management.Automation.ParseException] -and $parse.Errors.Count-gt 0){
+$line=$parse.Errors[0].Extent.StartLineNumber;$column=$parse.Errors[0].Extent.StartColumnNumber}
+$packet=[ordered]@{category=[int]$failure.CategoryInfo.Category;exceptionType=$exception.GetType().Name;hResult=$exception.HResult;innerExceptionType=$null;innerHResult=$null;nativeExitCode=$LASTEXITCODE;line=$line;column=$column}
+if($null-ne $inner){$packet.innerExceptionType=$inner.GetType().Name;$packet.innerHResult=$inner.HResult}
+[Console]::Error.WriteLine(('TEST_fixture_powershell_packet:'+(ConvertTo-Json -InputObject $packet -Compress)))
+exit 1
+}`
   const child = Bun.spawn([path.win32.join(powershellRoot, 'pwsh.exe'), '-NoProfile', '-NonInteractive',
-    '-Command', "$ErrorActionPreference='Stop';" + script], {
+    '-Command', wrapped], {
     env: { SystemRoot: process.env.SystemRoot, WINDIR: process.env.WINDIR,
-      PSModulePath: path.win32.join(powershellRoot, 'Modules'), TEST_TARGET: target, ...extra }, stdout: 'pipe', stderr: 'ignore',
+      PSModulePath: path.win32.join(powershellRoot, 'Modules'), TEST_TARGET: target, ...extra }, stdout: 'pipe', stderr: 'pipe',
   })
-  const [output, code] = await Promise.all([new Response(child.stdout).text(), child.exited])
-  assert.equal(code, 0, 'TEST_fixture_powershell_failed')
+  const readDiagnostic = async () => {
+    const reader = child.stderr.getReader()
+    let retained = Buffer.alloc(0), total = 0
+    for (;;) {
+      const part = await reader.read(); if (part.done) break
+      total += part.value.byteLength
+      retained = Buffer.concat([retained, Buffer.from(part.value)]).subarray(-4096)
+    }
+    return { text: retained.toString('utf8'), truncated: total > retained.length }
+  }
+  const [output, diagnostic, code] = await Promise.all([new Response(child.stdout).text(), readDiagnostic(), child.exited])
+  if (code !== 0) {
+    let row: Record<string, unknown> = {}
+    try {
+      const packet = diagnostic.text.split('\n').reverse().find(line => line.startsWith('TEST_fixture_powershell_packet:'))
+      if (packet) row = executionRecord(JSON.parse(packet.slice('TEST_fixture_powershell_packet:'.length)))
+    } catch { /* Closed unknown fields below. */ }
+    const categories = ['NotSpecified', 'OpenError', 'CloseError', 'DeviceError', 'DeadlockDetected',
+      'InvalidArgument', 'InvalidData', 'InvalidOperation', 'InvalidResult', 'InvalidType', 'MetadataError',
+      'NotImplemented', 'NotInstalled', 'ObjectNotFound', 'OperationStopped', 'OperationTimeout',
+      'SyntaxError', 'ParserError', 'PermissionDenied', 'ResourceBusy', 'ResourceExists', 'ResourceUnavailable',
+      'ReadError', 'WriteError', 'FromStdErr', 'SecurityError', 'ProtocolError', 'ConnectionError',
+      'AuthenticationError', 'LimitsExceeded', 'QuotaExceeded', 'NotEnabled']
+    const exceptionTypes = ['CommandNotFoundException', 'MethodInvocationException', 'RuntimeException',
+      'ItemNotFoundException', 'UnauthorizedAccessException', 'IOException', 'FileNotFoundException',
+      'DirectoryNotFoundException', 'ArgumentException', 'ArgumentNullException', 'InvalidOperationException',
+      'NotSupportedException', 'Win32Exception', 'ParseException', 'ActionPreferenceStopException',
+      'SecurityException', 'ProviderInvocationException', 'ParameterBindingException', 'PSArgumentException',
+      'PSInvalidOperationException', 'PSNotSupportedException', 'PSInvalidCastException', 'CmdletInvocationException',
+      'ParentContainsErrorRecordException', 'ApplicationFailedException', 'NativeCommandExitException']
+    const number = (value: unknown, minimum: number, maximum: number) =>
+      Number.isSafeInteger(value) && Number(value) >= minimum && Number(value) <= maximum ? Number(value) : null
+    const category = number(row.category, 0, categories.length - 1)
+    facts.powershellFailure ??= { phase, exitCode: code, scriptSha256: createHash('sha256').update(script).digest('hex'),
+      category: category === null ? null : categories[category], categoryId: category,
+      exceptionType: exceptionTypes.find(name => name === row.exceptionType) ?? null,
+      hResult: number(row.hResult, -0x80000000, 0x7fffffff),
+      innerExceptionType: exceptionTypes.find(name => name === row.innerExceptionType) ?? null,
+      innerHResult: number(row.innerHResult, -0x80000000, 0x7fffffff),
+      nativeExitCode: number(row.nativeExitCode, -0x80000000, 0x7fffffff),
+      generatedScriptLine: number(row.line, 1, Math.min(100000, script.split('\n').length)),
+      generatedScriptColumn: number(row.column, 1, 100000), diagnosticTruncated: diagnostic.truncated }
+    throw new Error('TEST_fixture_powershell_failed')
+  }
   return output.trim()
 }
 // Observe only this new synthetic tree: native VolumeSerial/FileID/SID,
 // complete owner/DACL descriptors, names and file bytes. Discovery must preserve it.
 const snapshot = async (root: string): Promise<unknown[]> => {
   const rows: unknown[] = []
-  const descriptors: Array<{ path: string; sddl: string }> = JSON.parse(await powershell(`
+  const descriptors: Array<{ path: string; sddl: string }> = JSON.parse(await powershell('tree_acl_snapshot', `
     $items=@((Get-Item -LiteralPath $env:TEST_TARGET);(Get-ChildItem -LiteralPath $env:TEST_TARGET -Recurse -Force));
     $rows=@($items | ForEach-Object {[ordered]@{path=$_.FullName;sddl=(Get-Acl -LiteralPath $_.FullName).Sddl}});
     [Console]::Write((ConvertTo-Json -InputObject $rows -Compress))`, root))
@@ -358,7 +422,7 @@ try {
   assert.deepEqual(recordAfter.value, secondRecord)
   assert.notEqual(recordAfter.fileIdentity?.fileId, recordBefore.fileIdentity?.fileId)
   assert.deepEqual((await probeDirectory.readMetadata('ProbeGuard')).fileIdentity, guardBefore.fileIdentity)
-  await powershell(`$a=Get-Acl -LiteralPath $env:TEST_TARGET;
+  await powershell('probe_metadata_acl', `$a=Get-Acl -LiteralPath $env:TEST_TARGET;
     $sid=[System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-545');
     $r=[System.Security.AccessControl.FileSystemAccessRule]::new($sid,'Read','Allow');
     $a.AddAccessRule($r);Set-Acl -LiteralPath $env:TEST_TARGET -AclObject $a`, path.win32.join(probePath, 'probe.json'))
@@ -413,7 +477,7 @@ try {
     const guardedRoot = path.win32.join(requestedRoot, 'TEST-' + guard)
     const ownedRoot = await filesystem.createDirectory(guardedRoot)
     await ownedRoot.close()
-    await powershell(`$a=Get-Acl -LiteralPath $env:TEST_TARGET;
+    await powershell('discovery_acl_fixture', `$a=Get-Acl -LiteralPath $env:TEST_TARGET;
       $sid=${guard === 'foreign-allow' ? "[System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-545')" : '[System.Security.Principal.WindowsIdentity]::GetCurrent().User'};
       $r=[System.Security.AccessControl.FileSystemAccessRule]::new($sid,'ReadAndExecute','${guard === 'foreign-allow' ? 'Allow' : 'Deny'}');
       $a.AddAccessRule($r);Set-Acl -LiteralPath $env:TEST_TARGET -AclObject $a`, guardedRoot)
@@ -691,7 +755,7 @@ try {
     assert.equal(typeof nonce, 'string'); assert.match(String(nonce), /^[a-f0-9-]{36}$/)
     return String(nonce)
   }
-  const deriveMetadataSids = async (launchNonce: string) => executionRecord(JSON.parse(await powershell(`
+  const deriveMetadataSids = async (launchNonce: string) => executionRecord(JSON.parse(await powershell('appcontainer_sid_derivation', `
 Add-Type -TypeDefinition @'
 using System; using System.Runtime.InteropServices;
 public static class TestRunMetadataSid {
@@ -735,7 +799,7 @@ if(![TestFixtureSecurity]::SetFileSecurity($env:TEST_TARGET,4,$descriptor)){thro
     verify: () => Promise<void>) => {
     // Capture/install together, then observe/restore together: two PowerShell
     // startups per fixture, without changing the published endpoint deadline.
-    const fixture = executionRecord(JSON.parse(await powershell(fixtureSecurity + `
+    const fixture = executionRecord(JSON.parse(await powershell('metadata_acl_install', fixtureSecurity + `
 $acl=Get-Acl -LiteralPath $env:TEST_TARGET
 $original=$acl.Sddl;$descriptor=$acl.GetSecurityDescriptorBinaryForm()
 $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new($env:TEST_SID),$env:TEST_RIGHTS,$env:TEST_INHERITANCE,'None','Allow'))
@@ -754,7 +818,7 @@ Set-TestDacl ($acl.GetSecurityDescriptorBinaryForm())
     } finally {
       let phase = 'observe_and_restore'
       try {
-        const after = executionRecord(JSON.parse(await powershell(fixtureSecurity + `
+        const after = executionRecord(JSON.parse(await powershell('metadata_acl_restore', fixtureSecurity + `
 try{$observed=(Get-Acl -LiteralPath $env:TEST_TARGET).Sddl}
 finally{Set-TestDacl ([Convert]::FromBase64String($env:TEST_ORIGINAL_DESCRIPTOR));$restored=(Get-Acl -LiteralPath $env:TEST_TARGET).Sddl}
 [Console]::Write((@{observed=$observed;restored=$restored}|ConvertTo-Json -Compress))`, target,
@@ -943,7 +1007,7 @@ finally{Set-TestDacl ([Convert]::FromBase64String($env:TEST_ORIGINAL_DESCRIPTOR)
   let projectOriginalIdentity: { dev: number; ino: number; birth: number } | undefined
   const projectControlAfterOwnWrite = (before: unknown, after: unknown) => before === after ||
     ((before === 0x8004 || before === 0x9004) && after === (Number(before) | 0x400))
-  const projectAcl = async () => JSON.parse(await powershell(`
+  const projectAcl = async () => JSON.parse(await powershell('project_acl_snapshot', `
 $rows=@(foreach($item in @((Get-Item -LiteralPath $env:TEST_TARGET);(Get-ChildItem -LiteralPath $env:TEST_TARGET -Recurse -Force | Sort-Object FullName))){
 $acl=Get-Acl -LiteralPath $item.FullName
 $raw=[Security.AccessControl.RawSecurityDescriptor]::new($acl.GetSecurityDescriptorBinaryForm(),0)
@@ -1018,9 +1082,9 @@ if(peer&&await fs.readFile(path.join(process.cwd(),peer+'.txt'),'utf8')!==peer)t
 await fs.writeFile(path.join(process.cwd(),actor+'.txt'),actor)
 await Bun.stdout.write(actor+':written')
 `)
-    await powershell(`
+    await powershell('project_low_integrity', `
 foreach($p in @($env:TEST_TARGET,$env:TEST_DATA_ROOT,$env:TEST_OTHER_PROJECT)){
-& icacls.exe $p /setintegritylevel '(OI)(CI)L' /T /Q | Out-Null
+& (Join-Path $env:SystemRoot 'System32/icacls.exe') $p /setintegritylevel '(OI)(CI)L' /T /Q | Out-Null
 if($LASTEXITCODE-ne 0){throw 'TEST project low label failed'}}`, sharedProject,
       { TEST_DATA_ROOT: projectDataRoot, TEST_OTHER_PROJECT: otherProject })
     const beforeIdentity = await rootIdentity()
@@ -1169,7 +1233,7 @@ if($LASTEXITCODE-ne 0){throw 'TEST project low label failed'}}`, sharedProject,
       facts.projectCohortStage = replace ? mask === 0x1f01ff ? 'broad_mask_refusal' : 'inheritance_refusal'
         : sid === otherSid ? 'other_project_sid_refusal'
           : sid === foreignProjectCohortSid ? 'foreign_cohort_sid_refusal' : 'duplicate_ace_refusal'
-      const original = executionRecord(JSON.parse(await powershell(fixtureSecurity + `
+      const original = executionRecord(JSON.parse(await powershell('project_acl_install', fixtureSecurity + `
 $acl=Get-Acl -LiteralPath $env:TEST_TARGET
 $bytes=$acl.GetSecurityDescriptorBinaryForm();$raw=[Security.AccessControl.RawSecurityDescriptor]::new($bytes,0)
 $sid=[Security.Principal.SecurityIdentifier]::new($env:TEST_SID)
@@ -1187,7 +1251,7 @@ $changed=[byte[]]::new($raw.BinaryLength);$raw.GetBinaryForm($changed,0);Set-Tes
           /^Error: execution_containment_filesystem_denied(?::[a-z_]+:\d+)?$/)
         assert.deepEqual(await projectAcl(), staged); assert.deepEqual(await rootIdentity(), beforeIdentity)
       } finally {
-        await powershell(fixtureSecurity + `
+        await powershell('project_acl_restore', fixtureSecurity + `
 Set-TestDacl ([Convert]::FromBase64String($env:TEST_DESCRIPTOR))
 if((Get-Acl -LiteralPath $env:TEST_TARGET).Sddl-cne $env:TEST_SDDL){throw 'TEST project DACL restoration changed'}`,
           sharedProject, { TEST_DESCRIPTOR: String(original.descriptor), TEST_SDDL: String(original.sddl) })
