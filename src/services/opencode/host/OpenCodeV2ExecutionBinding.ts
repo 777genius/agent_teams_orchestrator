@@ -95,10 +95,12 @@ function admittedExecutionGraphRows(receipt: ExecutionGraph) {
 export type ExecutionGraphValidation = (pin: '2.0.0' | '2.0.21', receipt: ExecutionGraph, signal?: AbortSignal) => Promise<void>
 /** Members of one run prepare concurrently and carry the same official graph.
  * A caller joins only an in-flight validation of its own byte-identical rows
- * (recomputed from its receipt) and pin; a settled result is never reused, so
- * a later caller reads every file again. Child processes keep their own
- * independent validation. The shared read is cancelled only when every joined
- * caller has cancelled, and that last caller waits for its claimed reads. */
+ * (recomputed from its receipt) and pin. The entry is dropped when that
+ * validation settles, so a later caller reads every file again. A joined
+ * owner check may start before this caller reached its graph phase; the
+ * decisive pre-import check stays each child's own independent validation.
+ * The shared read is cancelled only when every joined caller has cancelled,
+ * and that last caller waits for its claimed reads and keeps their failure. */
 export function createExecutionGraphValidationCohort(): ExecutionGraphValidation {
   type Shared = { work: Promise<unknown>; controller: AbortController; callers: number }
   const running = new Map<string, Shared>()
@@ -135,7 +137,8 @@ export function createExecutionGraphValidationCohort(): ExecutionGraphValidation
         // Last interested caller: stop new claims and join already claimed reads.
         if (running.get(key) === joined) running.delete(key)
         joined.controller.abort(signal.reason)
-        joined.work.then(() => reject(signal.reason), () => reject(signal.reason))
+        joined.work.then(() => reject(signal.reason),
+          error => reject(error === joined.controller.signal.reason ? signal.reason : error))
       }
       signal.addEventListener('abort', cancel, { once: true })
       joined.work.then(() => {

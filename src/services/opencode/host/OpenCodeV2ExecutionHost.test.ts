@@ -224,9 +224,14 @@ describe('execution host ownership and cleanup', () => {
     const launches: Array<{ emitGraph(drift?: Record<string, unknown>): void; emitNative(phase: unknown): void; activate: number; closed: number; release: number;
       readyChecks: number; readyError?: Error; readyGate?: Promise<void> }> = []
     let currentOwner: { release: number } | undefined
+    const preparedGraphValidations: unknown[] = []
     const scope = { executionAssert: (value: unknown, message?: string) => { if (!value) throw new Error(message ?? 'invalid') },
       executionRecord: (value: unknown) => value, executionHash, randomUUID: () => `TEST-${launches.length}`, randomBytes: () => ({ toString: () => 'TEST-password' }),
-      prepareOwnedNativeExecutionPlan: async (native: ValidatedExecutionNative, profile: SelectedExecutionProfile) => ({ native, profile, entry: '/TEST-entry', plan: { platform, concrete: {} }, controllerStateRoots: [] }),
+      prepareOwnedNativeExecutionPlan: async (native: ValidatedExecutionNative, profile: SelectedExecutionProfile, _context: unknown,
+        _lifetime: unknown, _progress: unknown, graphValidation: unknown) => {
+        preparedGraphValidations.push(graphValidation)
+        return { native, profile, entry: '/TEST-entry', plan: { platform, concrete: {} }, controllerStateRoots: [] }
+      },
       ownerFilesystemForWindowsPlan: () => ({ validateSelectedProfile: async () => {} }), selectWindowsRunMemberPreflightForPlan: async () => null,
       consumeWindowsExecutionLaunchNonce: () => `TEST-${launches.length}`, bindWindowsExecutionSelectedConfig: async () => {},
       closeWindowsExecutionPlan: async () => {}, recordOpenCodeV2ProviderFailure: async () => {},
@@ -273,7 +278,11 @@ describe('execution host ownership and cleanup', () => {
       env: {}, envSha256: 'f'.repeat(64), config: { directory: '/TEST-profile/config', content: '{}', sha256: 'f'.repeat(64) },
       selection: { agent: 'worker', model: { providerID: 'TEST', id: 'model' }, permissions: [] } }
     const controller = new AbortController(), deadline = Date.now() + 5000
-    const work = [acquire(native, selected, { ...context, deadline }, gate), acquire(native, selected, { ...context, deadline }, gate)]
+    const cohort = async () => {}
+    const work = [acquire(native, selected, { ...context, deadline }, gate, cohort), acquire(native, selected, { ...context, deadline }, gate)]
+    // The run cohort reaches the owner's actual preparation unchanged.
+    expect(preparedGraphValidations).toHaveLength(2)
+    expect(preparedGraphValidations[0]).toBe(cohort); expect(preparedGraphValidations[1]).toBeUndefined()
     const wait = async (condition: () => boolean) => { for (let i = 0; i < 100 && !condition(); i++) await Bun.sleep(1); expect(condition()).toBe(true) }
     await wait(() => launches.length === 2)
     expect(launches.map(value => value.activate)).toEqual([0, 0]); expect(critical).toBe(0)

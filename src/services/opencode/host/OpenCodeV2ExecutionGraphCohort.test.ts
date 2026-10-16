@@ -18,13 +18,14 @@ async function graphFixture(count = 40) {
   const receipt = (files: ExecutionGraph['files']): ExecutionGraph =>
     ({ files, sha256: executionHash([...files].sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0)) })
   const paths = new Set(rows.map(row => row.path))
-  let reads = 0, barrier: Promise<void> | undefined
+  let reads = 0, barrier: Promise<void> | undefined, blocked: (file: string) => boolean = () => true
   const original = filesystem.realpath
   const probe = spyOn(filesystem, 'realpath').mockImplementation((async (...args: Parameters<typeof original>) => {
-    if (paths.has(String(args[0]))) { reads++; if (barrier) await barrier }
+    if (paths.has(String(args[0]))) { reads++; if (barrier && blocked(String(args[0]))) await barrier }
     return original(...args)
   }) as typeof original)
-  return { rows, receipt, reads: () => reads, block: (value: Promise<void> | undefined) => { barrier = value },
+  return { rows, receipt, reads: () => reads,
+    block: (value: Promise<void> | undefined, filter: (file: string) => boolean = () => true) => { barrier = value; blocked = filter },
     close: async () => { probe.mockRestore(); await rm(root, { recursive: true, force: true }) } }
 }
 const settle = async () => { for (let index = 0; index < 20; index++) await new Promise(resolve => setTimeout(resolve, 1)) }
@@ -85,6 +86,18 @@ test('cohort cancels shared reads only after every joined caller cancels and the
     const later = await validate('2.0.0', exact).then(() => null, error => error)
     expect(later).not.toBe(secondReason)
     expect(f.reads() - claimed).toBe(f.rows.length)
+
+    // A real failure found before the last cancellation survives the drain of
+    // still claimed reads, as the direct validator reports its first failure.
+    const failing = f.receipt(f.rows.map((row, index) => index === 3 ? { ...row, sha256: 'd'.repeat(64) } : row))
+    let finish!: () => void
+    f.block(new Promise<void>(resolve => { finish = resolve }), file => f.rows.findIndex(row => row.path === file) >= 8)
+    const last = new AbortController()
+    const e = validate('2.0.0', failing, last.signal)
+    await settle()
+    last.abort(new Error('TEST-last-cancelled'))
+    finish(); f.block(undefined)
+    await expect(e).rejects.toMatchObject({ message: 'execution_graph_changed' })
 
     // One cancelled caller does not cancel a peer that still needs the result.
     let unblock!: () => void
