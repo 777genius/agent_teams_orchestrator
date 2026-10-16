@@ -419,11 +419,15 @@ $sid
   stage = 'native-source-boundary'
   const sourceCommand = await start(sourceEntry, 'ignore')
   const [sourceOutput, sourceError] = await Promise.all([output(sourceCommand.commandId, 'stdout'), output(sourceCommand.commandId, 'stderr')])
-  assert.equal(sourceOutput.toString(), 'source-boundary-passed'); assert.equal(sourceError.length, 0)
+  assert.equal(sourceOutput.toString(), 'source-boundary-passed')
+  const sourceStatus = record(await broker.request('commandStatus', { commandId: sourceCommand.commandId }))
+  assert.equal(sourceStatus.running, false); assert.equal(sourceStatus.exitCode, 0)
+  assert.equal(sourceStatus.outputLimitExceeded, false); assert.equal(sourceStatus.activeProcesses, 0)
   await closeCommand(sourceCommand.commandId)
   facts.sourceBoundary = { actualPinnedBun: true, actualSourceAliasModuleImported: true,
     parentPackageReadDenied: true, parentTsconfigReadDenied: true, sourceWriteDenied: true,
-    sourceOutsideWritableRoots: true }
+    sourceOutsideWritableRoots: true, exitCode: sourceStatus.exitCode,
+    stderrBytes: sourceError.length, stderrSha256: createHash('sha256').update(sourceError).digest('hex') }
   if (fullGraphFile) {
     stage = 'native-full-graph-read'
     await writeFile(path.join(root, 'full-graph-read.ts'), `const fs=await import('node:fs/promises');const crypto=await import('node:crypto');const file=${JSON.stringify(fullGraphFile)};const bytes=await fs.readFile(file);let denied=false;try{const writer=await fs.open(file,'r+');await writer.close()}catch(error){denied=['EACCES','EPERM'].includes((error as NodeJS.ErrnoException).code??'')}if(!denied)throw Error('TEST_full_graph_write_admitted');await Bun.stdout.write(crypto.createHash('sha256').update(bytes).digest('hex'))`)
