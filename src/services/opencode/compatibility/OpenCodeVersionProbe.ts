@@ -56,10 +56,12 @@ export function getOpenCodeVersionProbeDiagnostics(error: unknown) {
 
 /** `--version` must print and close within this window. On a busy Windows
  * runner the native exe alone took 3-4 s and more than 5 s through the
- * runtime; the app's own version check allows 30 s. */
-export const VERSION_ACQUISITION_MS = 15_000
+ * runtime; the app's own version check allows 30 s. POSIX keeps 5 s. */
+export function versionAcquisitionMs(platform: NodeJS.Platform = process.platform): number {
+  return platform === 'win32' ? 15_000 : 5_000
+}
 /** Ownership cleanup keeps at least 3 s after acquisition. */
-export const VERSION_PROBE_DEADLINE_MS = VERSION_ACQUISITION_MS + 3_000
+export const VERSION_CLEANUP_MS = 3_000
 
 type Member = NativeRow & { group: number | null; retired: boolean }
 // An observation deadline is not a retirement receipt. Keep unresolved owners
@@ -115,7 +117,8 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
     owner.child = child
     const ports = nativePorts({}, failure => { helperFailure = failure })
     const pid = child.pid
-    const started = Date.now(), deadline = started + VERSION_PROBE_DEADLINE_MS
+    const acquisitionMs = versionAcquisitionMs(), deadlineMs = acquisitionMs + VERSION_CLEANUP_MS
+    const started = Date.now(), deadline = started + deadlineMs
     // Match processKill.ts's 5s Windows process-birth query budget: cold
     // PowerShell/WMI startup can exceed 2s. Every helper still uses the
     // probe remainder; POSIX queries keep their 2s cap.
@@ -128,8 +131,8 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
     let stopping = false
     const fail = () => { failure ??= new Error('selection_unavailable'); stopping = true }
     const abort = () => fail()
-    const acquisitionDeadline = started + VERSION_ACQUISITION_MS
-    const timer = setTimeout(fail, VERSION_ACQUISITION_MS)
+    const acquisitionDeadline = started + acquisitionMs
+    const timer = setTimeout(fail, acquisitionMs)
     signal?.addEventListener('abort', abort, { once: true })
     child.stdout?.on('data', (chunk: Buffer) => {
       bytes += chunk.byteLength
@@ -165,7 +168,7 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
       phase: at, guard, closed, ended, exitCode: code,
       birthsCount: Math.min(4096, births.size), candidatesCount: Math.min(4096, unownedCandidates.size),
       pendingCount: Math.min(4096, pending.size), lastGroupCount, lastSurvivorCount,
-      remainingMs: Math.max(0, Math.min(VERSION_PROBE_DEADLINE_MS, deadline - Date.now())),
+      remainingMs: Math.max(0, Math.min(deadlineMs, deadline - Date.now())),
     })
     snapshotCleanup = snapshot
     const cleanupUnknown = (guard: OpenCodeProbeTerminalDiagnostic['guard']): Error => {

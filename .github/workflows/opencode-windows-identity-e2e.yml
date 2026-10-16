@@ -7,9 +7,14 @@ on:
       - src/services/opencode/OpenCodeCursorAgentTreeKill.ts
       - src/services/opencode/compatibility/OpenCodeVersionProbe.ts
       - scripts/opencode-windows-identity-e2e.ts
+      - scripts/package-runtime.ts
+      - scripts/runtime-bun-pins.json
       - .github/workflows/opencode-windows-identity-e2e.yml
 permissions:
   contents: read
+concurrency:
+  group: opencode-windows-identity-e2e-${{ github.ref }}
+  cancel-in-progress: true
 env:
   OPENCODE_NPM_VERSION: '1.19.2'
   BASELINE_RUNTIME: '0.0.122'
