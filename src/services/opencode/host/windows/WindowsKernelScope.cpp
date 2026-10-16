@@ -1459,6 +1459,9 @@ private:
   std::map<std::wstring, std::wstring> memberPreflights;
   std::vector<ControllerRunAuthority> controllerAuthorities;
 public:
+  std::vector<std::wstring> projectSids(const Scope &scope,
+                                      const RetainedAnchorComponent &anchor) const;
+
   std::map<std::wstring, std::unique_ptr<WindowsNativeRunState>> runStates;
   std::map<std::wstring, std::vector<std::wstring>> runStateSelections;
   std::map<std::wstring, std::wstring> runStateRoots;
@@ -3412,13 +3415,14 @@ bool sealedControllerRoot(const Scope &scope,
   return scope.cohort && scope.owners &&
          scope.owners->exactControllerRoot(anchor, *scope.cohort);
 }
-static std::vector<std::wstring> sealedProjectSids(const Scope &scope,
-                                                   const RetainedAnchorComponent &anchor) {
-  if (!scope.cohort || !scope.owners || scope.ownedPairSelectionId.empty()) return {};
-  const auto config = scope.owners->selectedConfigs.find(scope.ownedPairSelectionId);
-  require(config != scope.owners->selectedConfigs.end(), "run_control_selection_missing");
-  const auto profile = scope.owners->selectedProfiles.find(config->second->rootPath + L"|" + config->second->databasePath);
-  require(profile != scope.owners->selectedProfiles.end(), "run_control_selection_missing");
+std::vector<std::wstring> OwnerStore::projectSids(const Scope &scope,
+                                                   const RetainedAnchorComponent &anchor) const {
+  if (!scope.cohort || scope.ownedPairSelectionId.empty()) return {};
+  require(scope.owners == this, "run_control_selection_missing");
+  const auto config = selectedConfigs.find(scope.ownedPairSelectionId);
+  require(config != selectedConfigs.end(), "run_control_selection_missing");
+  const auto profile = selectedProfiles.find(config->second->rootPath + L"|" + config->second->databasePath);
+  require(profile != selectedProfiles.end(), "run_control_selection_missing");
   const auto &selected = profile->second;
   if (!selected.project || !equalPath(anchor.path, selected.project->path)) return {};
   selected.project->assertLive();
@@ -3439,6 +3443,11 @@ static std::vector<std::wstring> sealedProjectSids(const Scope &scope,
   }
   require(current, "run_state_start_changed");
   return allowed;
+}
+
+static std::vector<std::wstring> sealedProjectSids(const Scope &scope,
+                                                   const RetainedAnchorComponent &anchor) {
+  return scope.owners ? scope.owners->projectSids(scope, anchor) : std::vector<std::wstring>();
 }
 
 static AclCustody projectAclCustody(HANDLE file, const std::wstring &owner, PSID package,
