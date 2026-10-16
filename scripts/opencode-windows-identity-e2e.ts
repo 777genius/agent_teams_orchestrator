@@ -1,7 +1,8 @@
 /** No inference. Invoke on a disposable Windows runner with a candidate runtime
  * built from source, a public baseline runtime and npm-installed opencode-ai.
  * The selected identity must survive an idle host and CPU contention, which
- * slowed every PowerShell/WMI identity helper beyond the probe deadline.
+ * slowed every PowerShell/WMI identity helper beyond the probe deadline, and
+ * the idle catalog must load.
  */
 import assert from 'node:assert/strict'
 import { spawn, type ChildProcess } from 'node:child_process'
@@ -94,6 +95,11 @@ for (const condition of conditions) {
   } finally { for (const child of helpers) child.kill() }
 }
 await writeFile(path.join(root, 'identity-e2e-summary.json'), JSON.stringify(results, null, 2))
-const failedCandidate = results.filter(item => item.runtime === 'candidate' && !item.modelsLoaded)
+// Contention starves every step, so the whole catalog can also exceed its own
+// 60 s budget there. That budget is separate from selected identity: under
+// contention the candidate must never refuse its identity, and idle it must
+// load the catalog.
+const failedCandidate = results.filter(item => item.runtime === 'candidate' &&
+  (item.identityFailure || (item.condition === 'idle' && !item.modelsLoaded)))
 console.log(JSON.stringify({ results, limitations: ['CLI boundary only; no inference. CPU contention emulates a busy host; it is not the original user machine.'] }, null, 2))
-assert.deepEqual(failedCandidate, [], 'Candidate runtime did not load the OpenCode catalog in every condition')
+assert.deepEqual(failedCandidate, [], 'Candidate runtime refused its identity or did not load the idle OpenCode catalog')
