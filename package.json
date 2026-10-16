@@ -1,6 +1,6 @@
 {
   "name": "claude-multimodel",
-  "version": "0.0.123",
+  "version": "0.0.124",
   "private": true,
   "description": "Reconstructed Bun CLI workspace for the Claude Code source snapshot.",
   "type": "module",
@@ -131,5 +131,9 @@
     "typescript": "^6.0.2",
     "@types/node": "26.6.4",
     "@types/proper-lockfile": "4.1.4"
+  },
+  "patchedDependencies": {
+    "@opencode/core@2.0.21": "patches/@opencode%2Fcore@2.0.21.patch",
+    "@opencode/ai@2.0.21": "patches/@opencode%2Fai@2.0.21.patch"
   }
 }

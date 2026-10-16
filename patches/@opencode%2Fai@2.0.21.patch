@@ -1,0 +1,50 @@
+diff --git a/dist/protocols/openai-chat.js b/dist/protocols/openai-chat.js
+--- a/dist/protocols/openai-chat.js
++++ b/dist/protocols/openai-chat.js
+@@ -90,6 +90,10 @@
+ });
+ const OpenAIChatUserContent = Schema.Union([
+     OpenAIChatTextContent,
++    Schema.Struct({
++        type: Schema.Literal("video_url"),
++        video_url: Schema.Struct({ url: Schema.String }),
++    }),
+     Schema.Struct({
+         type: Schema.Literal("image_url"),
+         image_url: Schema.Struct({ url: Schema.String }),
+@@ -236,7 +240,10 @@
+     },
+     extra_content: decodeExtraContent(part.providerMetadata?.[options.providerMetadataKey]?.extraContent),
+ });
+-const lowerMedia = Effect.fn("OpenAIChat.lowerMedia")(function* (part) {
++const lowerMedia = Effect.fn("OpenAIChat.lowerMedia")(function* (part, videoInput = false) {
++    // Only the explicitly selected compatible-chat codec opts into video_url.
++    if (part.media.kind === "video" && videoInput && ["video/mp4", "video/webm", "video/mpeg", "video/quicktime"].includes(part.media.mediaType.toLowerCase()))
++        return { type: "video_url", video_url: { url: (yield* ProviderShared.requireInlineMedia("OpenAI-compatible Chat video", part.media)).dataUrl } };
+     // Chat Completions accepts PDFs, and no other documents, as inline `file` parts; file URLs are not supported.
+     if (part.media.mediaType.toLowerCase() === "application/pdf")
+         return {
+@@ -284,7 +291,7 @@
+             continue;
+         }
+         if (part.type === "media") {
+-            content.push(yield* lowerMedia(part));
++            content.push(yield* lowerMedia(part, options.videoInput === true));
+             continue;
+         }
+         return yield* ProviderShared.unsupportedContent("OpenAI Chat", "user", ["text", "media"]);
+diff --git a/dist/protocols/openai-compatible-chat.js b/dist/protocols/openai-compatible-chat.js
+--- a/dist/protocols/openai-compatible-chat.js
++++ b/dist/protocols/openai-compatible-chat.js
+@@ -12,7 +12,10 @@
+ export const route = Route.make({
+     id: ADAPTER,
+     providerMetadataKey: "openai",
+-    protocol: OpenAIChat.protocol,
++    protocol: {
++        ...OpenAIChat.protocol,
++        body: { ...OpenAIChat.protocol.body, from: (request) => OpenAIChat.fromRequest(request, { videoInput: true }) },
++    },
+     endpoint: Endpoint.path("/chat/completions"),
+     framing: OpenAIChat.framing,
+ });

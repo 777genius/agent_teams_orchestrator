@@ -1,0 +1,24 @@
+diff --git a/dist/chunks/job-ma9c1wd2.js b/dist/chunks/job-ma9c1wd2.js
+--- a/dist/chunks/job-ma9c1wd2.js
++++ b/dist/chunks/job-ma9c1wd2.js
+@@ -102,7 +102,7 @@
+     start: undefined,
+     end: undefined,
+     name: undefined,
+-    mime: undefined
++    mime: /^data:(video\/(?:mp4|webm|quicktime|mpeg));base64,/i.exec(input.uri)?.[1]?.toLowerCase()
+   } : yield* readFileAttachment(input.uri);
+   if (resolved.bytes.byteLength > MAX_ATTACHMENT_BYTES)
+     return yield* new AttachmentError2({
+diff --git a/dist/chunks/job-rk1r2hx8.js b/dist/chunks/job-rk1r2hx8.js
+--- a/dist/chunks/job-rk1r2hx8.js
++++ b/dist/chunks/job-rk1r2hx8.js
+@@ -75,7 +75,7 @@
+     return [textAttachment(file)];
+   if (file.mime === "application/x-directory")
+     return [directoryAttachment(file)];
+-  if (imageMimes.has(file.mime) || file.mime === "application/pdf") {
++  if (imageMimes.has(file.mime) || file.mime.startsWith("video/") || file.mime === "application/pdf") {
+     const location = attachmentLocation(file);
+     return [...location === undefined ? [] : [Message.text(`Attached file: ${location}`)], media(file)];
+   }
