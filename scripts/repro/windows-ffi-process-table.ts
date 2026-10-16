@@ -58,13 +58,27 @@ const child = Bun.spawn([process.execPath, '-e', 'setTimeout(()=>{}, 300)'], { s
 const childBirth = birth(child.pid)
 await child.exited
 const afterExit = birth(child.pid)
+// Zombie semantics: hold a handle to an exited process and check both tables.
+const held = Bun.spawn([process.execPath, '-e', 'setTimeout(()=>{}, 200)'], { stdio: ['ignore', 'ignore', 'ignore'] })
+const heldHandle = kernel32.symbols.OpenProcess(0x1000 | 0x100000, 0, held.pid)
+await held.exited
+await Bun.sleep(300)
+const zombieInToolhelp = table().some(row => row.pid === held.pid)
+const wmi = spawnSync(powershell, ['-NoProfile', '-NonInteractive', '-Command',
+  `[void][System.Reflection.Assembly]::Load('System.Management, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a'); $s = [System.Management.ManagementObjectSearcher]::new('SELECT ProcessId FROM Win32_Process WHERE ProcessId = ${held.pid}'); @($s.Get()).Count`], { encoding: 'utf8', windowsHide: true })
+const zombieInWmi = wmi.stdout.trim()
+const dotnet = spawnSync(powershell, ['-NoProfile', '-NonInteractive', '-Command',
+  `try { [void][System.Diagnostics.Process]::GetProcessById(${held.pid}); 'found' } catch { $_.Exception.GetBaseException().GetType().Name }`], { encoding: 'utf8', windowsHide: true })
+const zombieInDotnet = dotnet.stdout.trim()
+const zombieBirth = birth(held.pid)
+kernel32.symbols.CloseHandle(heldHandle)
 const report = {
   bun: Bun.version, arch: process.arch, compiled: !process.execPath.toLowerCase().endsWith('bun.exe'),
   rows: rows.length, tableMs: Math.round(tableMs * 100) / 100, perBirthMs: Math.round(birthMs * 1000) / 1000,
   readableBirths: births.filter(value => value !== null).length,
   selfRow: self, selfParentMatches: self?.ppid === process.ppid,
   comparisons, equal: comparisons.every(item => item.ffi === item.powershell),
-  childBirth, afterExit,
+  childBirth, afterExit, heldHandleOpened: heldHandle !== 0n, zombieInToolhelp, zombieInWmi, zombieInDotnet, zombieBirth,
 }
 console.log(JSON.stringify(report, null, 2))
 if (!report.equal || report.afterExit !== null || report.childBirth === null || !report.selfParentMatches) process.exit(1)
