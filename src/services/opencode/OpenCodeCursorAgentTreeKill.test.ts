@@ -84,12 +84,17 @@ test('failed helper timeout kill retains the operation until helper close', asyn
 })
 
 
+const nativeModule = import.meta.resolve('../../utils/windowsNativeProcess.ts')
+// Windows ARM64 Bun 1.3.11 has no bun:ffi dlopen and keeps the PowerShell helpers.
+const withoutKernel32 = `mock.module(${JSON.stringify(nativeModule)},()=>({windowsNativeProcess:async()=>null}))`
+
 test('native birth failures retain finite helper evidence before returning null', async () => {
   const module = import.meta.resolve('./OpenCodeCursorAgentTreeKill.ts')
   const script = `
     import {mock} from 'bun:test'
     import assert from 'node:assert/strict'
     import {EventEmitter} from 'node:events'
+    ${withoutKernel32}
     const original=await import('node:child_process')
     let mode='exit'
     mock.module('node:child_process',()=>({...original,spawn:()=>{
@@ -119,12 +124,13 @@ test('native birth failures retain finite helper evidence before returning null'
 },15000)
 
 
-test('Windows census uses direct WMI rows and retains strict process table parsing', async () => {
+test('Windows census without bun:ffi uses direct WMI rows and retains strict process table parsing', async () => {
   const module=import.meta.resolve('./OpenCodeCursorAgentTreeKill.ts')
   const script=`
     import {mock} from 'bun:test'
     import assert from 'node:assert/strict'
     import {EventEmitter} from 'node:events'
+    ${withoutKernel32}
     const original=await import('node:child_process')
     let malformed=false,calls=0
     mock.module('node:child_process',()=>({...original,spawn:(command,args,options)=>{
@@ -154,4 +160,32 @@ test('Windows census uses direct WMI rows and retains strict process table parsi
   const [exit,stdout,stderr]=await Promise.all([child.exited,new Response(child.stdout).text(),new Response(child.stderr).text()])
   expect({exit,stderr}).toEqual({exit:0,stderr:''})
   expect(stdout.trim()).toBe('TEST Windows census contract qualified; native execution unclaimed')
+},15000)
+
+test('Windows ports read kernel32 without spawning helpers when bun:ffi is available', async () => {
+  const module=import.meta.resolve('./OpenCodeCursorAgentTreeKill.ts')
+  const script=`
+    import {mock} from 'bun:test'
+    import assert from 'node:assert/strict'
+    const original=await import('node:child_process')
+    mock.module('node:child_process',()=>({...original,spawn:()=>{throw new Error('TEST helper spawn forbidden')}}))
+    mock.module(${JSON.stringify(nativeModule)},()=>({windowsNativeProcess:async()=>({
+      table:()=>[{pid:0,ppid:0},{pid:12,ppid:0},{pid:34,ppid:12}],
+      birth:pid=>{if(pid===56)throw new Error('TEST native failure');return pid===12?1700000000123:null},
+    })}))
+    Object.defineProperty(process,'platform',{value:'win32'})
+    const {nativePorts}=await import(${JSON.stringify(module)})
+    const failures=[]
+    const ports=nativePorts({},failure=>failures.push(failure))
+    assert.deepEqual(await ports.tree(2000),[{pid:12,ppid:0},{pid:34,ppid:12}])
+    assert.equal(await ports.birth(12,2000),1700000000123)
+    assert.equal(await ports.birth(34,2000),null)
+    assert.equal(await ports.birth(56,2000),null)
+    assert.deepEqual(failures,[])
+    console.log('TEST Windows native ports qualified')
+  `
+  const child=Bun.spawn([process.execPath,'-e',script],{cwd:import.meta.dir,stdout:'pipe',stderr:'pipe'})
+  const [exit,stdout,stderr]=await Promise.all([child.exited,new Response(child.stdout).text(),new Response(child.stderr).text()])
+  expect({exit,stderr}).toEqual({exit:0,stderr:''})
+  expect(stdout.trim()).toBe('TEST Windows native ports qualified')
 },15000)

@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process'
 import path from 'node:path'
 import { readProcessStartTimeMs } from '../../utils/processKill.js'
+import { windowsNativeProcess } from '../../utils/windowsNativeProcess.js'
 
 export type NativeRow = { pid: number; ppid: number }
 export type CursorAgentNativePorts = {
@@ -118,7 +119,9 @@ export function nativePorts(overrides: Partial<CursorAgentNativePorts> = {},
       if (!Number.isSafeInteger(pid) || pid <= 0) return null
       if (process.platform === 'linux') return readProcessStartTimeMs(pid, 'linux', timeout)
       if (process.platform !== 'darwin' && process.platform !== 'win32') return null
+      const kernel32 = process.platform === 'win32' ? await windowsNativeProcess() : null
       try {
+        if (kernel32) return kernel32.birth(pid)
         const output = process.platform === 'darwin'
           ? await observedQuery('birth', 'ps', ['-p', String(pid), '-o', 'lstart='], timeout)
           : await observedQuery('birth', path.win32.join(process.env.SystemRoot || 'C:\\Windows',
@@ -147,6 +150,13 @@ try {
       } catch { return null }
     },
     tree: async timeout => {
+      // Each PowerShell/WMI helper below is a cold process start, seconds on a
+      // busy host. The shipped Bun 1.3.11 has no bun:ffi dlopen on Windows ARM64
+      // (TinyCC is disabled before 1.4.0), so only those hosts still use them.
+      // Remove the Windows helpers once scripts/runtime-bun-pins.json ships Bun
+      // 1.4.0 or newer for every Windows target.
+      const kernel32 = process.platform === 'win32' ? await windowsNativeProcess() : null
+      if (kernel32) return kernel32.table().filter(row => row.pid !== 0)
       const output = process.platform === 'win32'
         ? await observedQuery('tree', path.win32.join(process.env.SystemRoot || 'C:\\Windows',
           'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
