@@ -30,20 +30,26 @@ jobs:
           persist-credentials: false
       - name: Enable long paths
         run: git config --global core.longpaths true
-      # Same Bun and compile command as the published runtime.
+      # Same Bun and packaging as the published runtime: `runtime` commands run
+      # in the pinned shipped Bun with the physical JS graph, as on user hosts.
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.2
       - uses: actions/setup-node@v6
         with:
           node-version: '24'
-      - name: Compile candidate runtime from this commit
+      - name: Package candidate runtime from this commit
         shell: pwsh
+        env:
+          PLATFORM: ${{ matrix.platform }}
         run: |
           bun install --frozen-lockfile --linker hoisted
           if ($LASTEXITCODE -ne 0) { throw 'Dependency install failed' }
-          bun run compile
-          if ($LASTEXITCODE -ne 0) { throw 'Candidate compile failed' }
+          bun scripts/package-runtime.ts --platform $env:PLATFORM
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate packaging failed' }
+          foreach ($file in @('dist/cli.exe', 'dist/opencode-delivery.json', 'dist/bun/bun.exe', 'dist/local-cli/cli.js')) {
+            if (-not (Test-Path $file)) { throw "Missing packaged delivery file $file" }
+          }
           "CANDIDATE=$((Resolve-Path dist/cli.exe).Path)" >> $env:GITHUB_ENV
       - name: Prepare genuine npm OpenCode and verified public baseline
         shell: pwsh
