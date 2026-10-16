@@ -140,6 +140,11 @@ export async function planLinuxExecution(requested: Readonly<{
     'execution_identity_mismatch')
   assert(await linuxLauncherVersion(launcher) === 'bubblewrap 0.13.0', 'execution_containment_launcher_version_pending')
   const mountinfo = await readFile('/proc/self/mountinfo', 'utf8')
+  const authorityMounts = mountinfo.trim().split('\n').flatMap(line => {
+    const fields = line.split(' '), split = fields.indexOf('-')
+    const mount = fields[4]?.replace(/\\([0-7]{3})/g, (_, octal: string) => String.fromCharCode(parseInt(octal, 8)))
+    return mount && ['proc', 'sysfs', 'cgroup', 'cgroup2', 'nsfs'].includes(fields[split + 1] ?? '') ? [mount] : []
+  })
   const roots = [...new Set([...input.writableRoots, ...input.readOnlyRoots,
     ...(input.readOnlyMounts ?? []).map(mount => mount.source)])]
   for (const mount of input.readOnlyMounts ?? []) {
@@ -149,11 +154,8 @@ export async function planLinuxExecution(requested: Readonly<{
   for (const root of roots) {
     assert(path.isAbsolute(root) && root !== '/' && await realpath(root) === root)
     assert(!['/proc', '/sys', '/dev'].some(authority => root === authority || root.startsWith(authority + '/')))
-    for (const line of mountinfo.trim().split('\n')) {
-      const fields = line.split(' '), split = fields.indexOf('-')
-      const mount = fields[4]?.replace(/\\([0-7]{3})/g, (_, octal: string) => String.fromCharCode(parseInt(octal, 8)))
-      assert(!mount || !(mount === root || mount.startsWith(root + '/')) ||
-        !['proc', 'sysfs', 'cgroup', 'cgroup2', 'nsfs'].includes(fields[split + 1] ?? ''), 'execution_containment_authority_mount')
+    for (const mount of authorityMounts) {
+      assert(!(mount === root || mount.startsWith(root + '/')), 'execution_containment_authority_mount')
     }
   }
   const args = ['--unshare-user', '--disable-userns', '--assert-userns-disabled', '--unshare-pid', '--as-pid-1',

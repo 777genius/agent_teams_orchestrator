@@ -9398,6 +9398,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     ['video/mp4', 'clip.mp4'],
     ['video/webm', 'clip.webm'],
     ['video/quicktime', 'clip.mov'],
+    ['video/mpeg', 'clip.mpeg'],
   ])('accepts %s file parts and forwards them to OpenCode', async (mime, filename) => {
     const promptParts: unknown[] = []
     const record = buildRecord({

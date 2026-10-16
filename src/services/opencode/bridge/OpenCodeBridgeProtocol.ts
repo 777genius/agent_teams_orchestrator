@@ -83,6 +83,7 @@ const SUPPORTED_OPENCODE_PROMPT_FILE_MIME_TYPES = new Set([
   'video/mp4',
   'video/webm',
   'video/quicktime',
+  'video/mpeg',
 ])
 
 export function parseOpenCodePromptFileParts(value: unknown): OpenCodePromptPart[] {
