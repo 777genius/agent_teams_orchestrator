@@ -65,6 +65,7 @@ async function models(label: string, runtime: string, selection: string) {
     label, code: result.code, ms: result.ms, errorCode: result.value?.error?.code ?? null,
     identityFailure: message.includes('Selected OpenCode identity is unavailable') || message.includes('not detected on PATH'),
     modelsLoaded: result.code === 0 && result.value?.models?.models?.some((item: Json) => item.providerId === 'opencode') === true,
+    catalogBudgetExpired: message.startsWith('OpenCode catalog overall deadline exceeded'),
     error: result.value?.error ?? null,
   }
 }
@@ -96,10 +97,9 @@ for (const condition of conditions) {
 }
 await writeFile(path.join(root, 'identity-e2e-summary.json'), JSON.stringify(results, null, 2))
 // Contention starves every step, so the whole catalog can also exceed its own
-// 60 s budget there. That budget is separate from selected identity: under
-// contention the candidate must never refuse its identity, and idle it must
-// load the catalog.
-const failedCandidate = results.filter(item => item.runtime === 'candidate' &&
-  (item.identityFailure || (item.condition === 'idle' && !item.modelsLoaded)))
+// 60 s budget after identity passed. Only that known outcome is tolerated
+// there; idle runs must load the catalog.
+const failedCandidate = results.filter(item => item.runtime === 'candidate' && !item.modelsLoaded &&
+  (item.condition === 'idle' || item.identityFailure || !item.catalogBudgetExpired))
 console.log(JSON.stringify({ results, limitations: ['CLI boundary only; no inference. CPU contention emulates a busy host; it is not the original user machine.'] }, null, 2))
 assert.deepEqual(failedCandidate, [], 'Candidate runtime refused its identity or did not load the idle OpenCode catalog')
