@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { createHash } from 'node:crypto'
 import { executionHash } from '../execution/OpenCodeV2ExecutionContracts.js'
-import { acquireExecutionLease } from './OpenCodeV2ExecutionHost.js'
+import { acquireExecutionLease, awaitExecutionHostReady } from './OpenCodeV2ExecutionHost.js'
 import { validateExecutionProfile, type ExecutionBirth, type SelectedExecutionProfile, type ValidatedExecutionNative } from './OpenCodeV2ExecutionBinding.js'
 import { executionClosedAck, retireExecutionChild, type ExecutionRetirementPort } from './OpenCodeV2ExecutionLifecycle.js'
 
@@ -33,6 +33,19 @@ function retirement(overrides: Partial<ExecutionRetirementPort> = {}): Execution
 }
 
 describe('execution host ownership and cleanup', () => {
+  test('startup readiness preserves the exact acquisition cancellation and original rejection before cleanup', async () => {
+    const signal = new AbortController(), original = new Error('run_acquisition_timeout')
+    const waiting = awaitExecutionHostReady(new Promise<never>(() => {}), 1000, signal.signal)
+    signal.abort(original)
+    await expect(waiting).rejects.toBe(original)
+    const native = new Error('execution_path_alias:alias_predicate:0')
+    await expect(awaitExecutionHostReady(Promise.reject(native), 1000)).rejects.toBe(native)
+    await expect(awaitExecutionHostReady(Promise.resolve('TEST-ready'), 1000)).resolves.toBe('TEST-ready')
+    const unclassified = new AbortController()
+    const unknown = awaitExecutionHostReady(new Promise<never>(() => {}), 1000, unclassified.signal)
+    unclassified.abort('TEST-private-reason')
+    await expect(unknown).rejects.toThrow('cancelled')
+  })
   // A packaged source fallback would reach missing binaries or change caller data.
   test('packaged receipt cannot fall back to source execution before identity reads or data changes', async () => {
     const { profile, remove } = await fixture()

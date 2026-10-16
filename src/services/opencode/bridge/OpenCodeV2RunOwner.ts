@@ -13,7 +13,7 @@ import { isMutableExecutionReadback } from '../execution/OpenCodeV2TerminalSettl
 import { OpenCodeV2AdmissionStore } from '../execution/OpenCodeV2AdmissionStore.js'
 import { OpenCodeV2SessionService, verifyExecutionSession } from '../execution/OpenCodeV2SessionService.js'
 import { canonicalExecutionJSON, executionAssert, executionHash, executionRecord, type ExecutionContext, type SessionAuthority } from '../execution/OpenCodeV2ExecutionContracts.js'
-import { acquireExecutionLease, type ExecutionLease } from '../host/OpenCodeV2ExecutionHost.js'
+import { acquireExecutionLease, awaitExecutionHostReady, type ExecutionLease } from '../host/OpenCodeV2ExecutionHost.js'
 import { isExecutionCleanupReceipt, type ExecutionCleanupReceipt } from '../host/OpenCodeV2ExecutionLifecycle.js'
 import { createOpenCodeV2ExecutionClient, type ExecutionBridgeClient, type ExecutionLog, type ExecutionMessagePage } from '../transport/OpenCodeV2ExecutionClientFactory.js'
 import { boundOpenCodeRead } from '../transport/OpenCodeBoundedFetch.js'
@@ -68,6 +68,25 @@ export class OpenCodeV2RunOwner {
   private readonly acquisitions = new Set<AbortController>()
   private readonly deferredWindowsControllers = process.platform === 'win32'
   private readonly pendingLeases = new Map<string, ExecutionLease>()
+  private startupTail: Promise<void> = Promise.resolve()
+  private readonly startupGate = async (start: () => Promise<ExecutionLease>, signal: AbortSignal | undefined,
+    deadline: number): Promise<ExecutionLease> => {
+    const previous = this.startupTail
+    let release!: () => void
+    const ticket = new Promise<void>(resolve => { release = resolve })
+    this.startupTail = previous.then(() => ticket)
+    try {
+      await awaitExecutionHostReady(previous, deadline - Date.now(), signal)
+      signal?.throwIfAborted()
+      executionAssert(Date.now() < deadline, 'run_stopped')
+      return await start()
+    } catch (error) {
+      // Abort queued physical starts before releasing this original ticket.
+      this.initializationAbort.abort(error)
+      for (const acquisition of this.acquisitions) acquisition.abort(error)
+      throw error
+    } finally { release() }
+  }
   private readonly closing = new Map<ExecutionLease, Promise<ExecutionCleanupReceipt>>()
   private cleanupGraceDeadline = 0
   private state: RunOwnerState = 'starting'
@@ -114,28 +133,34 @@ export class OpenCodeV2RunOwner {
   }
   private async initialize(): Promise<void> {
     const initializationDeadline = Math.min(this.plan.deadline, Date.now() + OPEN_CODE_V2_RUN_INITIALIZATION_MS)
-    // Windows MCP transports continuously poll native command custody once
-    // connected. Finish all shared-root grants before any transport can start.
-    if (this.deferredWindowsControllers) {
-      for (const member of this.plan.members) await this.acquireMember(member, initializationDeadline)
-    }
-    let nextMember = 0
-    const initializeWorker = async () => {
+    let nextMember = 0, failed = false
+    let firstFailure: unknown
+    const initializeWorker = async (acquireOnly: boolean) => {
       while (nextMember < this.plan.members.length && !this.initializationAbort.signal.aborted) {
         const memberPlan = this.plan.members[nextMember++]!
-        try { await this.initializeMember(memberPlan, initializationDeadline) }
+        try {
+          if (acquireOnly) await this.acquireMember(memberPlan, initializationDeadline)
+          else await this.initializeMember(memberPlan, initializationDeadline)
+        }
         catch (error) {
+          if (!failed) { failed = true; firstFailure = error }
           this.initializationAbort.abort(error)
           for (const acquisition of this.acquisitions) acquisition.abort(error)
           throw error
         }
       }
     }
+    // Parent graph reads overlap, but the per-run gate preserves native/start
+    // ordering. No MCP transport starts before every original lease is ready.
+    if (this.deferredWindowsControllers) {
+      await Promise.allSettled(Array.from({ length: Math.min(3, this.plan.members.length) }, () => initializeWorker(true)))
+      if (failed) throw firstFailure
+      nextMember = 0
+    }
     // Profiles and session identities are disjoint. Bound startup concurrency
     // while retaining one run deadline and joining every original acquisition.
-    const results = await Promise.allSettled(Array.from({ length: Math.min(3, this.plan.members.length) }, initializeWorker))
-    const rejected = results.find(result => result.status === 'rejected')
-    if (rejected?.status === 'rejected') throw rejected.reason
+    await Promise.allSettled(Array.from({ length: Math.min(3, this.plan.members.length) }, () => initializeWorker(false)))
+    if (failed) throw firstFailure
     executionAssert(this.state === 'starting' && !this.initializationAbort.signal.aborted &&
       Date.now() < initializationDeadline, 'run_stopped')
     this.state = 'active'; await this.persistState()
@@ -148,9 +173,18 @@ export class OpenCodeV2RunOwner {
     const acquisitionTimer = setTimeout(() => acquiring.abort(new Error('run_acquisition_timeout')), initializationDeadline - Date.now())
     let lease: ExecutionLease
     try {
-      lease = await this.ports.acquire(memberPlan.native, memberPlan.profile, this.context(memberPlan, this.plan.deadline, acquiring.signal))
+      lease = await this.ports.acquire(memberPlan.native, memberPlan.profile, this.context(memberPlan, this.plan.deadline, acquiring.signal),
+        this.deferredWindowsControllers ? (start, signal) => this.startupGate(start, signal, initializationDeadline) : undefined)
     } finally { clearTimeout(acquisitionTimer); this.acquisitions.delete(acquiring) }
     this.pendingLeases.set(memberPlan.memberId, lease)
+    if (this.state !== 'starting' || this.initializationAbort.signal.aborted || acquiring.signal.aborted ||
+        Date.now() >= initializationDeadline) {
+      // Stop may already have taken its pending-lease snapshot. This exact late
+      // owner must start its memoized close before initialization can settle.
+      await this.closeLease(lease).then(() => this.pendingLeases.delete(memberPlan.memberId)).catch(() => undefined)
+      throw acquiring.signal.reason instanceof Error ? acquiring.signal.reason
+        : this.initializationAbort.signal.reason instanceof Error ? this.initializationAbort.signal.reason : new Error('run_stopped')
+    }
     return lease
   }
   private async initializeMember(memberPlan: RunMemberPlan, initializationDeadline: number): Promise<void> {

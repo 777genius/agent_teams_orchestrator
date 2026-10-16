@@ -19,6 +19,8 @@ test('startup failures preserve finite original error facts and local Windows gu
       await recordOpenCodeV2ProviderFailure('execution-host-startup', new Error(`execution_containment_unqualified:${stage}:0`), true)
     await recordOpenCodeV2ProviderFailure('execution-host-startup', new Error('execution_host_unavailable'), true)
     await recordOpenCodeV2ProviderFailure('execution-host-startup', new Error('execution_owner_record_invalid'), true)
+    for (const reason of ['run_acquisition_timeout', 'run_initialization_timeout', 'run_stopped', 'cancelled'])
+      await recordOpenCodeV2ProviderFailure('execution-host-startup', new Error(reason), true)
     await recordOpenCodeV2ProviderFailure('execution-host-startup', Object.assign(new Error(secret), {
       name: secret, code: secret, syscall: secret,
     }), true)
@@ -28,12 +30,14 @@ test('startup failures preserve finite original error facts and local Windows gu
       return JSON.parse(bytes)
     }))
     expect(Object.getOwnPropertyDescriptors(original)).toEqual(descriptors)
-    expect(rows).toHaveLength(7)
+    expect(rows).toHaveLength(11)
     expect(rows.find(row => row.category === 'cleanup_unknown').failure).toEqual({ name: 'TypeError', errno: 'EACCES', operation: 'open' })
     expect(rows.filter(row => row.category === 'execution_containment_unqualified').map(row => row.native))
       .toEqual(expect.arrayContaining(['assert_mapping', 'assert_stopped', 'assert_broker'].map(stage => ({ stage, nativeCode: 0 }))))
     expect(rows.find(row => row.category === 'execution_host_unavailable').failure).toEqual({ name: 'Error' })
     expect(rows.find(row => row.category === 'execution_owner_record_invalid').failure).toEqual({ name: 'Error' })
+    for (const reason of ['run_acquisition_timeout', 'run_initialization_timeout', 'run_stopped', 'cancelled'])
+      expect(rows.find(row => row.category === reason).failure).toEqual({ name: 'Error' })
     expect(rows.find(row => row.category === 'provider_operation_unknown').failure).toBeUndefined()
   } finally {
     if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_DATA_HOME

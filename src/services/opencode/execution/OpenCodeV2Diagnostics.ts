@@ -138,6 +138,7 @@ const privateProviderFailureCodes = new Set(['provider_missing', 'provider_key_m
   'run_control_timeout', 'run_control_disconnected', 'run_control_changed', 'run_control_foreign', 'run_control_invalid',
   'run_control_frame_too_large', 'run_owner_stale', 'run_process_unknown', 'run_process_changed',
   'run_deadline_expired', 'run_readiness_changed', 'run_readiness_unknown', 'run_operation_unknown',
+  'run_acquisition_timeout', 'run_initialization_timeout', 'run_stopped', 'cancelled',
   'execution_selected_auth_required', 'execution_selected_auth_unbound', 'execution_selected_auth_changed',
   'execution_selected_auth_missing', 'execution_selected_auth_unsupported', 'execution_selected_auth_location_changed',
   'execution_selected_auth_provider_unknown', 'execution_selected_auth_existing_or_unsupported',

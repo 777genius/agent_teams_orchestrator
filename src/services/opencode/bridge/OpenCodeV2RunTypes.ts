@@ -79,7 +79,8 @@ export type RunControlResult =
 /** These ports preserve real process-owned objects. They are never control DTOs. */
 export type RunExecutionPorts = Readonly<{
   acquire: (native: ValidatedExecutionNative, profile: SelectedExecutionProfile,
-    context: import('../execution/OpenCodeV2ExecutionContracts.js').ExecutionContext) => Promise<ExecutionLease>
+    context: import('../execution/OpenCodeV2ExecutionContracts.js').ExecutionContext,
+    startupGate?: import('../host/OpenCodeV2ExecutionHost.js').ExecutionStartupGate) => Promise<ExecutionLease>
   client: (authority: ExecutionLease['authority'],
     context: import('../execution/OpenCodeV2ExecutionContracts.js').ExecutionContext) => Promise<ExecutionBridgeClient>
 }>

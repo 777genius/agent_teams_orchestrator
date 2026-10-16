@@ -16,6 +16,7 @@ import { ExecutionTransportFailure, OpenCodeV2ExecutionFetch } from '../transpor
 import type { QueueIntent } from '../execution/OpenCodeV2AdmissionService.js'
 import * as runControl from './OpenCodeV2RunControl.js'
 import * as atomicWrite from '../../../utils/atomicWrite.js'
+import type { ExecutionLease } from '../host/OpenCodeV2ExecutionHost.js'
 
 // These tests cross the real durable session/admission boundary with fake
 // native/lease ports. They neither import an official server nor mint a native
@@ -37,6 +38,7 @@ async function fixture(options: { unknown?: boolean; foreignClient?: boolean; cr
   probe?: boolean; promptBarrier?: Promise<void>; closeBarrier?: Promise<void>; permissionResources?: string[];
   lifetimeMs?: number; twoMembers?: boolean; memberCount?: number; preparation?: () => void; startup?: () => void;
   windowsAcquisitions?: boolean;
+  parentPreparation?: (memberId: string, signal: AbortSignal | undefined) => Promise<void>;
   acquisition?: (memberId: string, signal: AbortSignal | undefined) => Promise<void>;
   permissions?: import('../host/OpenCodeV2ExecutionBinding.js').ExecutionSelection['permissions'] } = {}) {
   const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'TEST-r249-owner-')))
@@ -119,20 +121,24 @@ async function fixture(options: { unknown?: boolean; foreignClient?: boolean; cr
     replyPermission: async () => { counters.replied++ },
   }
   const ports: RunExecutionPorts = {
-    acquire: async (_native, _profile, context) => {
+    acquire: async (_native, _profile, context, startupGate) => {
       expect(context).toMatchObject({ teamId: binding.teamId, runId: binding.runId, laneId: 'primary' })
       expect(plan.members.some(member => member.memberId === context.memberId)).toBe(true)
       const profile = plan.members.find(member => member.memberId === context.memberId)!.profile
       const owned = context.memberId === 'worker' ? authority : { ...authority,
         profileRoot: profile.root, profileEpoch: profile.epoch }
-      counters.acquired++
       options.preparation?.()
-      await options.acquisition?.(context.memberId!, context.signal)
-      return { authority: owned, signal: new AbortController().signal, close: async () => {
-        counters.closed++
-        resolveClosing(); await options.closeBarrier
-        return { scopeClosed: true, processRetired: true, descendantsRetired: true, pid: authority.child.pid, birth: authority.child.birth }
-      } }
+      await options.parentPreparation?.(context.memberId!, context.signal)
+      const start = async (): Promise<ExecutionLease> => {
+        counters.acquired++
+        await options.acquisition?.(context.memberId!, context.signal)
+        return { authority: owned, signal: new AbortController().signal, close: async () => {
+          counters.closed++
+          resolveClosing(); await options.closeBarrier
+          return { scopeClosed: true, processRetired: true, descendantsRetired: true, pid: authority.child.pid, birth: authority.child.birth }
+        } }
+      }
+      return startupGate ? startupGate(start, context.signal) : start()
     },
     client: async (owned, context) => {
       counters.clients++
@@ -228,6 +234,51 @@ test('Windows acquires all leases before any client or controller bootstrap, wit
   } finally { gates.forEach(gate => gate.release()); await f.close() }
 })
 
+test('Windows overlaps three parent preparations while serializing every full native startup before MCP', async () => {
+  const parent = acquisitionGate(), physical = acquisitionGate(), prepared: string[] = [], started: string[] = []
+  let active = 0, maximum = 0, nativeActive = 0, nativeMaximum = 0
+  const f = await fixture({ windowsAcquisitions: true, memberCount: 6,
+    parentPreparation: async member => {
+      prepared.push(member); active++; maximum = Math.max(maximum, active)
+      try { if (prepared.length <= 3) await parent.promise } finally { active-- }
+    }, acquisition: async member => {
+      started.push(member); nativeActive++; nativeMaximum = Math.max(nativeMaximum, nativeActive)
+      try { if (started.length === 1) await physical.promise } finally { nativeActive-- }
+    } })
+  try {
+    await waitForTestAcquisitions(() => prepared.length === 3)
+    expect(maximum).toBe(3); expect(f.counters.acquired).toBe(0)
+    parent.release()
+    await waitForTestAcquisitions(() => started.length === 1)
+    expect(f.counters).toMatchObject({ acquired: 1, clients: 0, sessions: 0, prompted: 0 })
+    physical.release()
+    await f.owner.ready()
+    expect(maximum).toBe(3); expect(nativeMaximum).toBe(1)
+    expect(started).toHaveLength(6)
+    expect(f.counters).toMatchObject({ acquired: 6, clients: 6, sessions: 6, prompted: 0 })
+  } finally { parent.release(); physical.release(); await f.close() }
+})
+
+test('Windows parent failure aborts queued native starts and drains the late original lease exactly once', async () => {
+  const physical = acquisitionGate(), failParent = acquisitionGate(), started: string[] = []
+  const signals: AbortSignal[] = [], original = new Error('TEST first parent preparation failure')
+  const f = await fixture({ windowsAcquisitions: true, memberCount: 6,
+    parentPreparation: async (member, signal) => {
+      signals.push(signal!)
+      if (member === 'worker-3') await failParent.promise
+    }, acquisition: async member => { started.push(member); await physical.promise } })
+  try {
+    await waitForTestAcquisitions(() => started.length === 1 && signals.length === 3)
+    failParent.reject(original)
+    await waitForTestAcquisitions(() => signals.slice(0, 2).every(signal => signal.aborted))
+    physical.release()
+    await expect(f.owner.ready()).rejects.toBe(original)
+    await f.owner.stop()
+    expect(started).toHaveLength(1)
+    expect(f.counters).toMatchObject({ acquired: 1, closed: 1, clients: 0, sessions: 0, prompted: 0 })
+  } finally { physical.release(); failParent.release(); await f.close() }
+})
+
 test('Windows stop refuses queued acquisition and joins the late original lease', async () => {
   const gate = acquisitionGate(), started: string[] = [], signals: AbortSignal[] = []
   const f = await fixture({ windowsAcquisitions: true, memberCount: 3, acquisition: async (member, signal) => {
@@ -243,6 +294,25 @@ test('Windows stop refuses queued acquisition and joins the late original lease'
     await stopping
     expect(started).toEqual(['worker', 'worker-2'])
     expect(f.counters).toMatchObject({ acquired: 2, closed: 2, clients: 0, sessions: 0, prompted: 0 })
+  } finally { gate.release(); await f.close() }
+})
+
+test('Windows original lease arriving after the public stop snapshot is still closed exactly once', async () => {
+  const gate = acquisitionGate(), started: string[] = []
+  const f = await fixture({ windowsAcquisitions: true, memberCount: 3, acquisition: async member => {
+    started.push(member); await gate.promise
+  } })
+  try {
+    await waitForTestAcquisitions(() => started.length === 1)
+    expect((await f.owner.stop()).state).toBe('cleanup_unknown')
+    expect(f.counters.closed).toBe(0)
+    gate.release()
+    await expect(f.owner.ready()).rejects.toThrow('run_stopped')
+    await f.owner.awaitCleanupTerminal()
+    expect(started).toEqual(['worker'])
+    expect(f.counters).toMatchObject({ acquired: 1, closed: 1, clients: 0, sessions: 0, prompted: 0 })
+    await f.owner.stop()
+    expect(f.counters.closed).toBe(1)
   } finally { gate.release(); await f.close() }
 })
 

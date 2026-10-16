@@ -51,6 +51,19 @@ export function registerExecutionDisposer(authority: ExecutionAuthority, dispose
 export type ExecutionLease = Readonly<{
   authority: ExecutionAuthority; signal: AbortSignal; close(): Promise<ExecutionCleanupReceipt>
 }>
+/** One run may serialize its native/start slice while preparing graphs in parallel. */
+export type ExecutionStartupGate = (start: () => Promise<ExecutionLease>, signal?: AbortSignal) => Promise<ExecutionLease>
+
+/** Startup must retain the owner's original cancellation before cleanup runs.
+ * The shared read helper keeps its existing generic cancellation contract. */
+export async function awaitExecutionHostReady<T>(work: Promise<T>, ms: number, signal?: AbortSignal): Promise<T> {
+  try { return await boundOpenCodeRead(work, ms, signal) }
+  catch (error) {
+    if (error instanceof Error && error.message === 'cancelled' && signal?.aborted && signal.reason instanceof Error)
+      throw signal.reason
+    throw error
+  }
+}
 
 /** Keep package aliases at their lexical locations and mount their canonical
  * targets read-only. Canonical file directories alone omit node_modules links. */
@@ -77,8 +90,8 @@ async function executionResolutionMounts(sourceRoot: string, graph: ExecutionGra
 
 /** Source execution uses a dedicated official-server child and caller-owned durable data. */
 export async function acquireExecutionLease(validatedNative: ValidatedExecutionNative,
-  selectedProfile: SelectedExecutionProfile, context: ExecutionContext): Promise<ExecutionLease> {
-  return acquireOwnedNativeLease(validatedNative, selectedProfile, context)
+  selectedProfile: SelectedExecutionProfile, context: ExecutionContext, startupGate?: ExecutionStartupGate): Promise<ExecutionLease> {
+  return acquireOwnedNativeLease(validatedNative, selectedProfile, context, startupGate)
 }
 
 /** Finite catalog owner has no session/model admission and creates no execution proof. */
@@ -110,7 +123,8 @@ export async function prepareOwnedNativeExecutionPlan(validatedNative: Validated
   await validateExecutionNative(native); check()
   executionAssert(await realpath(process.execPath) === native.bun.path &&
     await hashOpenCodeFile(native.bun.path) === native.bun.sha256, 'execution_identity_mismatch'); check(); progress?.('native-validated')
-  await validateExecutionGraph(native.version, native.graph); check(); progress?.('graph-validated')
+  const graphSignal = context.signal && lifetimeSignal ? AbortSignal.any([context.signal, lifetimeSignal]) : context.signal ?? lifetimeSignal
+  await validateExecutionGraph(native.version, native.graph, undefined, graphSignal); check(); progress?.('graph-validated')
   const entry = delivery.entryPath; check()
   executionAssert(delivery.entrySha256 === native.entrySha256, 'execution_entry_changed'); check()
   const sourceRoot = delivery.root
@@ -168,7 +182,7 @@ export async function prepareOwnedNativeExecutionPlan(validatedNative: Validated
 }
 
 async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative,
-  selectedProfile: OwnedNativeProfile, context: ExecutionContext): Promise<ExecutionLease> {
+  selectedProfile: OwnedNativeProfile, context: ExecutionContext, startupGate?: ExecutionStartupGate): Promise<ExecutionLease> {
   const lifetime = new AbortController()
   const check = () => {
     context.signal?.throwIfAborted(); lifetime.signal.throwIfAborted()
@@ -183,6 +197,7 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
   try { prepared = await prepareOwnedNativeExecutionPlan(validatedNative, selectedProfile, context, lifetime.signal, mark) }
   catch (failure) { await recordOpenCodeV2ProviderFailure('execution-host-startup', failure, true, undefined, timing()); throw failure }
   mark('prepared')
+  const acquirePrepared = async (): Promise<ExecutionLease> => {
   const { native, profile, entry, plan, controllerStateRoots } = prepared
   let nonce: string | undefined
   const leaseOwnerId = randomUUID(), password = randomBytes(32).toString('base64url')
@@ -297,7 +312,7 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
     child = launch.child
     child.once('close', () => { exited = true; lifetime.abort(); exitResolve(); void close().catch(() => undefined) })
     const ready = new Promise<Record<string, unknown>>((resolve, reject) => {
-      child!.once('error', () => reject(new Error('execution_host_unavailable')))
+      child!.once('error', (error: unknown) => reject(error instanceof Error ? error : new Error('execution_host_unavailable')))
       child!.once('close', () => reject(new Error('execution_host_unavailable')))
       child!.on('message', (message: unknown) => {
         try {
@@ -317,7 +332,7 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
     await owner.bindChild(mapping.bun.hostPID, birth, mapping); check(); mark('child-bound')
     await launch.assertLive(); check()
     await launch.start({ password, native, profile }, context.deadline, lifetime.signal); check(); mark('start-sent')
-    const row = await boundOpenCodeRead(ready, context.deadline - Date.now(), context.signal); check()
+    const row = await awaitExecutionHostReady(ready, context.deadline - Date.now(), context.signal); check()
     executionAssert(row.pid === mapping.bun.nativePID && row.leaseOwnerId === leaseOwnerId && row.namespace === mapping.namespace.name && row.pin === native.version && row.graphSha256 === native.graph.sha256 &&
       row.executableSha256 === native.bun.sha256 && row.profileEpoch === profile.epoch &&
       row.selectionSha256 === executionHash(profile.selection) && executionHash(row.birth) === executionHash(birth) &&
@@ -376,6 +391,15 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
       // the native phase measured before potentially unresolved retirement.
       else await recordOpenCodeV2ProviderFailure('execution-host-startup', failure, true, launch?.output?.().stderr, acquisitionTiming)
     }
+    throw failure
+  }
+  }
+  if (!startupGate) return acquirePrepared()
+  let entered = false
+  try { return await startupGate(() => { entered = true; return acquirePrepared() }, context.signal) }
+  catch (failure) {
+    if (!entered && prepared.plan.platform === 'win32')
+      await closeWindowsExecutionPlan(prepared.plan.concrete).catch(() => undefined)
     throw failure
   }
 }
