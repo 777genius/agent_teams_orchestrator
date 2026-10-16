@@ -46,6 +46,7 @@ async function fixture(options: { unknown?: boolean; foreignClient?: boolean; cr
   acquisition?: (memberId: string, signal: AbortSignal | undefined) => Promise<void>;
   readonlyGraph?: (memberId: string, signal: AbortSignal | undefined) => Promise<void>;
   runtime?: (memberId: string) => Promise<void>;
+  initializationCall?: (operation: 'log' | 'messages' | 'putInstruction' | 'instructions' | 'connectMcp' | 'mcp') => Promise<void>;
   permissions?: import('../host/OpenCodeV2ExecutionBinding.js').ExecutionSelection['permissions'] } = {}) {
   const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'TEST-r249-owner-')))
   const authority: ExecutionAuthority = { generation: 'v2', pin: '2.0.21', dialect: 'v2-2.0.21',
@@ -114,13 +115,13 @@ async function fixture(options: { unknown?: boolean; foreignClient?: boolean; cr
       return { id: input.nativeInputID, sessionID, type: 'user', timeCreated: 1, delivery: 'queue', payload: { text: input.text } }
     },
     config: async () => [{ type: 'document', info: JSON.parse(plan.members[0]!.profile.config.content) }],
-    log: async () => ({ events: [], synced: true, watermark: null }),
-    messages: async () => ({ data: [], next: null, previous: null }), inbox: async () => [],
+    log: async () => { await options.initializationCall?.('log'); return { events: [], synced: true, watermark: null } },
+    messages: async () => { await options.initializationCall?.('messages'); return { data: [], next: null, previous: null } }, inbox: async () => [],
     dispose: async () => { counters.disposed++ },
-    putInstruction: async (id, _key, input) => { instructions.set(id, input) },
-    instructions: async id => [{ key: 'test.context', value: instructions.get(id)! }],
-    connectMcp: async () => {}, disconnectMcp: async () => {}, addMcp: async () => {},
-    mcp: async () => [{ name: 'agent-teams', status: 'connected' }],
+    putInstruction: async (id, _key, input) => { await options.initializationCall?.('putInstruction'); instructions.set(id, input) },
+    instructions: async id => { await options.initializationCall?.('instructions'); return [{ key: 'test.context', value: instructions.get(id)! }] },
+    connectMcp: async () => { await options.initializationCall?.('connectMcp') }, disconnectMcp: async () => {}, addMcp: async () => {},
+    mcp: async () => { await options.initializationCall?.('mcp'); return [{ name: 'agent-teams', status: 'connected' }] },
     interrupt: async () => { counters.interrupted++; return { interrupted: true } },
     cancelInbox: async () => { counters.cancelled++ },
     permissions: async () => [], permission: async (sessionID, id) => ({ id, sessionID, action: 'edit', resources: options.permissionResources ?? ['TEST-file'] }),
@@ -238,6 +239,61 @@ async function waitForTestAcquisitions(observe: () => boolean) {
   while (!observe() && Date.now() < deadline) await Bun.sleep(5)
   expect(observe()).toBe(true)
 }
+
+test('live status locates every pending bootstrap API while accepted and verified bootstrap remain separate evidence', async () => {
+  const steps = [
+    ['log', 'bootstrap-before-log'], ['messages', 'bootstrap-before-messages'], ['log', 'bootstrap-before-log-confirm'],
+    ['putInstruction', 'bootstrap-instruction-put'], ['instructions', 'bootstrap-instruction-readback'],
+    ['log', 'bootstrap-after-log'], ['messages', 'bootstrap-after-messages'], ['log', 'bootstrap-after-log-confirm'],
+    ['connectMcp', 'MCP-connect'], ['mcp', 'MCP-readback'],
+  ] as const
+  const waiting = steps.map(() => ({ entered: acquisitionGate(), release: acquisitionGate() }))
+  const calls: string[] = []
+  const f = await fixture({ initializationCall: async operation => {
+    const index = calls.length
+    const gate = waiting[index]
+    if (!gate) return // Controller-schema readback later repeats mcp() in its own phase.
+    calls.push(operation)
+    gate.entered.release(); await gate.release.promise
+  } })
+  try {
+    for (const [index, [operation, phase]] of steps.entries()) {
+      await Promise.race([waiting[index]!.entered.promise, f.owner.ready().then(() => {
+        throw Error('TEST initialization completed before paused API')
+      })])
+      expect(calls.at(-1)).toBe(operation)
+      const status = await f.owner.execute({ operation: 'status' }, Date.now() + 1000)
+      if (status.kind !== 'status') throw Error('TEST status missing')
+      expect(status.state).toBe('starting')
+      expect(status.members[0]).toMatchObject({ ...f.selected, state: 'accepted', initialization: { phase } })
+      expect(status.members[0]!.initialization!.elapsedMs).toBeGreaterThanOrEqual(0)
+      expect(status.members[0]!.initialization!.elapsedMs).toBeLessThanOrEqual(86_400_000)
+      expect(status.members[0]!.bootstrap?.verified ?? false).toBe(index >= 8)
+      expect(f.counters.prompted).toBe(0)
+      await expect(f.owner.execute({ operation: 'send', ...f.selected, intent }, Date.now() + 1000)).rejects.toThrow('run_not_active')
+      if (index === 0) {
+        const observedAt = Date.now(), clock = spyOn(Date, 'now')
+        try {
+          for (const [now, expected] of [[observedAt + 86_400_001, 86_400_000], [0, 0]] as const) {
+            clock.mockReturnValue(now)
+            const aged = await f.owner.execute({ operation: 'status' }, observedAt + 1000)
+            if (aged.kind !== 'status') throw Error('TEST status missing')
+            expect(aged.members[0]!.initialization).toEqual({ phase, elapsedMs: expected })
+          }
+        } finally { clock.mockRestore() }
+      }
+      waiting[index]!.release.release()
+    }
+    await f.owner.ready()
+    const status = await f.owner.execute({ operation: 'status' }, Date.now() + 1000)
+    if (status.kind !== 'status') throw Error('TEST status missing')
+    expect(status.state).toBe('active')
+    expect(status.members[0]!.bootstrap?.verified).toBe(true)
+    expect(Object.hasOwn(status.members[0]!, 'initialization')).toBe(false)
+    expect(calls).toEqual(steps.map(([operation]) => operation))
+    expect(f.counters).toMatchObject({ sessions: 1, prompted: 0 })
+  } finally { for (const gate of waiting) gate.release.release(); await f.close() }
+}, 15_000)
 
 test('Windows acquires all leases before any client or controller bootstrap, with no model input', async () => {
   const gates = [acquisitionGate(), acquisitionGate()], started: string[] = []

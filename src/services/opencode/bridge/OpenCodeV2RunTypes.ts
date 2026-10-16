@@ -2,6 +2,7 @@ import type { OpenCodePreparedProfile, OpenCodeExecutionProof } from '../types.j
 import type { ControllerToolProof } from './OpenCodeV2ControllerTools.js'
 import type { QueueIntent } from '../execution/OpenCodeV2AdmissionService.js'
 import type { AdmissionRecord, SessionAuthority } from '../execution/OpenCodeV2ExecutionContracts.js'
+import type { RunInitializationPhase } from '../execution/OpenCodeV2Diagnostics.js'
 import type { ExecutionLease, SelectedExecutionProfile, ValidatedExecutionNative } from '../host/OpenCodeV2ExecutionHost.js'
 import type { ExecutionCleanupReceipt } from '../host/OpenCodeV2ExecutionLifecycle.js'
 import type { ExecutionBridgeClient, ExecutionLog, ExecutionMessagePage, ExecutionPermission, ExecutionMcpServer } from '../transport/OpenCodeV2ExecutionClientFactory.js'
@@ -61,6 +62,8 @@ export type RunMemberStatus = Readonly<{
   opencodeSessionId: string; runtimeSessionId: string
   profileEpoch: string; profileRoot: string; pin: '2.0.0' | '2.0.21'; runtimePid?: number
   state: 'accepted' | 'unknown' | 'rejected'; bootstrap: InstructionReceipt | null
+  /** Observational age of the current initialization phase, never readiness evidence. */
+  initialization?: Readonly<{ phase: RunInitializationPhase; elapsedMs: number }>
   controllerTools?: ControllerToolProof
 }>
 export type RunStopMember = Readonly<{ memberId: string; cleanup: ExecutionCleanupReceipt | null; errors: readonly string[] }>

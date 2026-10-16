@@ -110,8 +110,12 @@ function acquisitionDiagnostic(value: unknown) {
   return { elapsedMs: Number(row.elapsedMs), history }
 }
 
-export type RunInitializationPhase = 'MCP-connect' | 'MCP-readback' | 'controller-tools' | 'probe-authority'
-const initializationPhases = new Set<RunInitializationPhase>(['MCP-connect', 'MCP-readback', 'controller-tools', 'probe-authority'])
+export type RunInitializationPhase = 'bootstrap-before-log' | 'bootstrap-before-messages' | 'bootstrap-before-log-confirm' |
+  'bootstrap-instruction-put' | 'bootstrap-instruction-readback' | 'bootstrap-after-log' | 'bootstrap-after-messages' |
+  'bootstrap-after-log-confirm' | 'bootstrap-verify' | 'MCP-connect' | 'MCP-readback' | 'controller-tools' | 'probe-authority'
+const initializationPhases = new Set<RunInitializationPhase>(['bootstrap-before-log', 'bootstrap-before-messages', 'bootstrap-before-log-confirm',
+  'bootstrap-instruction-put', 'bootstrap-instruction-readback', 'bootstrap-after-log', 'bootstrap-after-messages',
+  'bootstrap-after-log-confirm', 'bootstrap-verify', 'MCP-connect', 'MCP-readback', 'controller-tools', 'probe-authority'])
 const initializationFailures = new WeakMap<Error, Readonly<{ phase: RunInitializationPhase; elapsedMs: number }>>()
 export type ExecutionCleanupPhase = 'dispose-transport' | 'send-close' | 'force-kill' | 'wait-exit' | 'read-birth' | 'kernel-retirement' |
   'process-retirement' | 'closed-ack' | 'kernel-proof' | 'kernel-binding' | 'owner-release' | 'retained-roots' | 'plan-close'

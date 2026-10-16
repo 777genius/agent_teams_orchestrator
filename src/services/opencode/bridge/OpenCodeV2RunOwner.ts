@@ -28,6 +28,7 @@ type Member = {
   plan: RunMemberPlan; lease: ExecutionLease; client: ExecutionBridgeClient; authority: SessionAuthority
   store: OpenCodeV2AdmissionStore; session: OpenCodeV2SessionService; state: RunMemberStatus['state']
   creationWrapperEntered: boolean; probeAuthority?: ProbeAuthority; bootstrap: InstructionReceipt | null; mcpConnected: boolean; controllerTools?: ControllerToolProof; intents: Map<string, QueueIntent>; deliveryTail: Promise<void>; refusals: Map<string, QueueIntent>
+  initialization?: Readonly<{ phase: RunInitializationPhase; startedAt: number }>
 }
 
 export function validateRunLaunchPlan(plan: RunLaunchPlan): void {
@@ -109,6 +110,8 @@ export class OpenCodeV2RunOwner {
   private statuses(): RunMemberStatus[] {
     return this.plan.members.map(plan => {
       const member = this.members.get(plan.memberId)
+      const initialization = this.state === 'starting' ? member?.initialization : undefined
+      const age = initialization ? Date.now() - initialization.startedAt : 0
       return { memberId: plan.memberId, laneId: plan.laneId, originalSessionId: plan.originalSessionId,
         opencodeSessionId: plan.originalSessionId, runtimeSessionId: plan.originalSessionId,
         profileEpoch: plan.profile.epoch, profileRoot: plan.profile.root, pin: plan.native.version,
@@ -116,6 +119,8 @@ export class OpenCodeV2RunOwner {
         selectedModel: `${plan.profile.selection.model.providerID}/${plan.profile.selection.model.id}`,
         ...(plan.profile.selection.model.variant === undefined ? {} : { selectedVariant: plan.profile.selection.model.variant }),
         state: member?.state ?? 'unknown', bootstrap: member?.bootstrap ?? null,
+        ...(initialization ? { initialization: { phase: initialization.phase,
+          elapsedMs: Number.isFinite(age) ? Math.max(0, Math.min(86_400_000, Math.trunc(age))) : 0 } } : {}),
         ...(member?.controllerTools ? { controllerTools: member.controllerTools } : {}) }
     })
   }
@@ -218,32 +223,41 @@ export class OpenCodeV2RunOwner {
       member.state = created.disposition
       await this.persistState()
       executionAssert(created.disposition === 'accepted' && created.session, 'run_original_session_unknown')
+      const initializingMember = member
+      const markInitialization = (phase: RunInitializationPhase): void => {
+        initializationPhase = phase
+        initializingMember.initialization = { phase, startedAt: Date.now() }
+      }
       // Actual native persistent context, never a queue/resume:false model
       // turn. There is no published messageID for an instruction entry.
       const value = { context: memberPlan.bootstrap.value, contextHash: memberPlan.bootstrap.contextHash,
         briefingHash: memberPlan.bootstrap.briefingHash, teamId: authority.teamId, runId: authority.runId,
         laneId: authority.laneId, memberId: authority.memberId, originalSessionId: authority.sessionID }
-      const before = await this.cut(client, authority.sessionID)
+      const before = await this.cut(client, authority.sessionID, phase => markInitialization(`bootstrap-before-${phase}`))
+      markInitialization('bootstrap-instruction-put')
       await client.putInstruction(authority.sessionID, memberPlan.bootstrap.key, value)
+      markInitialization('bootstrap-instruction-readback')
       const entries = await client.instructions(authority.sessionID)
-      const after = await this.cut(client, authority.sessionID)
+      const after = await this.cut(client, authority.sessionID, phase => markInitialization(`bootstrap-after-${phase}`))
+      markInitialization('bootstrap-verify')
       verifyOpenCodeV2SilentBootstrap({ before, after, entries, key: memberPlan.bootstrap.key, value })
       member.bootstrap = { strategy: 'instruction-entry', key: memberPlan.bootstrap.key,
         contextHash: memberPlan.bootstrap.contextHash, briefingHash: memberPlan.bootstrap.briefingHash,
         verified: true, missingNativeMessageID: true }
-      initializationPhase = 'MCP-connect'
+      markInitialization('MCP-connect')
       await client.connectMcp(memberPlan.controllerMcpName)
-      initializationPhase = 'MCP-readback'
+      markInitialization('MCP-readback')
       const servers = await client.mcp()
       member.mcpConnected = servers.filter(server => server.name === memberPlan.controllerMcpName && server.status === 'connected').length === 1
       executionAssert(member.mcpConnected, 'run_controller_mcp_unknown')
-      initializationPhase = 'controller-tools'
+      markInitialization('controller-tools')
       member.controllerTools = await readOwnedControllerTools(client, memberPlan.profile, memberPlan.controllerMcpName, initializationDeadline, this.initializationAbort.signal)
       if (this.plan.executionProbe?.memberId === memberPlan.memberId) {
-        initializationPhase = 'probe-authority'
+        markInitialization('probe-authority')
         member.probeAuthority = await captureOwnedV2ProbeAuthority(client, this.plan.executionProbe.prepared)
       }
       initializationPhase = undefined
+      delete member.initialization
       await this.persistState()
     } catch (failure) {
       if (initializationPhase) retainOpenCodeV2InitializationPhase(failure, initializationPhase, Date.now() - initializationStartedAt)
@@ -297,11 +311,14 @@ export class OpenCodeV2RunOwner {
       !member.lease.signal.aborted, 'run_original_session_changed')
     return member
   }
-  private async cut(client: ExecutionBridgeClient, id: string): Promise<{ messages: ExecutionMessagePage; log: ExecutionLog }> {
+  private async cut(client: ExecutionBridgeClient, id: string,
+    onRead?: (phase: 'log' | 'messages' | 'log-confirm') => void): Promise<{ messages: ExecutionMessagePage; log: ExecutionLog }> {
+    onRead?.('log')
     const before = await client.log(id)
     const messages: ExecutionMessagePage = { data: [], previous: null, next: null }
     const cursors = new Set<string>(); let cursor: string | undefined, complete = false
     for (let page = 0; page < 8; page++) {
+      onRead?.('messages')
       const value = await client.messages(id, cursor)
       messages.data.push(...value.data)
       executionAssert(messages.data.length <= 1600 && new Set(messages.data.map(message => message.id)).size === messages.data.length, 'run_transcript_unknown')
@@ -309,6 +326,7 @@ export class OpenCodeV2RunOwner {
       executionAssert(!cursors.has(value.next), 'run_transcript_unknown'); cursors.add(value.next); cursor = value.next
     }
     executionAssert(complete, 'run_transcript_unknown')
+    onRead?.('log-confirm')
     const log = await client.log(id)
     executionAssert(executionHash(before) === executionHash(log), 'run_mutable_cut')
     return { messages, log }
