@@ -6,6 +6,7 @@ permissions:
   contents: read
 jobs:
   probe-cost:
+    if: false
     strategy:
       fail-fast: false
       matrix:
@@ -47,6 +48,7 @@ jobs:
           path: ${{ runner.temp }}/TEST-opencode-probe-*/probe-cost-report.json
           if-no-files-found: warn
   ffi-spike:
+    if: false
     strategy:
       fail-fast: false
       matrix:
@@ -70,3 +72,19 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'compile failed' }
           .\ffi-spike.exe
           if ($LASTEXITCODE -ne 0) { throw 'compiled spike failed' }
+  calibrate:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - shell: pwsh
+        run: |
+          npm install --prefix "$env:RUNNER_TEMP/oc" --no-audit --no-fund opencode-ai@1.19.2
+          node scripts/repro/opencode-windows-calibrate.mjs "$env:RUNNER_TEMP/oc/node_modules/.bin/opencode.cmd" "$env:RUNNER_TEMP/oc/node_modules/opencode-ai/bin/opencode.exe"
