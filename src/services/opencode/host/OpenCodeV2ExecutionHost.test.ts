@@ -210,7 +210,7 @@ describe('execution host ownership and cleanup', () => {
     const source = await readFile(new URL('./OpenCodeV2ExecutionHost.ts', import.meta.url), 'utf8')
     const body = new Bun.Transpiler({ loader: 'ts' }).transformSync(source.slice(source.indexOf('async function acquireOwnedNativeLease(')))
     const reader = new Bun.Transpiler({ loader: 'ts' }).transformSync(source.slice(source.indexOf('export function readExecutionCleanupObservation('),
-      source.indexOf('export function requireExecutionEndpoint(')).replace('export ', ''))
+      source.indexOf('export function requireExecutionEndpoint(')).replaceAll('export ', ''))
     const cleanupObservations = new WeakMap<object, () => ExecutionCleanupObservation | undefined>()
     let heldRetirement: Promise<void> | undefined, heldRelease: Promise<void> | undefined
     let tail = Promise.resolve(), critical = 0, maximum = 0, birthReads = 0, catalogs = 0
@@ -264,7 +264,7 @@ describe('execution host ownership and cleanup', () => {
       awaitOpenCodeV2CatalogReadiness: async () => { catalogs++; expect(critical).toBe(1) }, initializeOpenCodeV2ExecutionAuth: async () => { expect(critical).toBe(1) },
       awaitOpenCodeV2ExecutionReadiness: async () => { expect(critical).toBe(1) },
       endpoints: new WeakMap(), graphs: new WeakMap(), disposers: new WeakMap(), catalogAuthorities: new WeakSet(),
-      cleanupObservations, executionNativeRetirementPhases,
+      cleanupObservations, leaseObservations: new WeakMap(), executionNativeRetirementPhases,
     }
     const acquire = new Function('scope', `const {${Object.keys(scope).join(',')}}=scope;${body};return acquireOwnedNativeLease;`)(scope) as typeof acquireExecutionLease
     const readObservation = new Function('scope', `const {cleanupObservations}=scope;${reader};return readExecutionCleanupObservation;`)(scope) as
