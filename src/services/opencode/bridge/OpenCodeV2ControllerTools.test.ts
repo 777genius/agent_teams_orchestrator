@@ -1,3 +1,7 @@
+import { createHash } from 'node:crypto'
+import { fileURLToPath } from 'node:url'
+import { createOpenCodeV2ExecutionConfig } from '../profile/OpenCodeV2ExecutionConfig.js'
+import type { ExecutionBridgeClient } from '../transport/OpenCodeV2ExecutionClientFactory.js'
 import { execFileSync } from 'node:child_process'
 import { expect, test } from 'bun:test'
 import { mkdtemp, mkdir, writeFile, symlink, rm, chmod, realpath } from 'node:fs/promises'
@@ -5,7 +9,7 @@ import path from 'node:path'
 import { executionHash } from '../execution/OpenCodeV2ExecutionContracts.js'
 import type { SelectedExecutionProfile } from '../host/OpenCodeV2ExecutionHost.js'
 import { CONTROLLER_INBOX_MAX_BYTES, parseControllerInboxBytes, readOwnedControllerInbox,
-  type ControllerToolProof } from './OpenCodeV2ControllerTools.js'
+  readOwnedControllerTools, type ControllerToolProof } from './OpenCodeV2ControllerTools.js'
 
 const originalBinding = { teamId: 'TEST-team', runId: 'TEST-run', memberId: 'worker', sessionID: 'ses_TESToriginal' }
 const message = { from: 'worker', to: 'user', text: 'TEST reply', timestamp: '2026-10-10T00:00:00Z',
@@ -89,4 +93,37 @@ test.skipIf(process.platform === 'win32')('selected local canonical inbox reader
     expect(await readOwnedControllerInbox({ config: { content: JSON.stringify({ mcp: { servers: { 'agent-teams': remote } } }) } } as SelectedExecutionProfile,
       { ...proof, configHash: executionHash(remote) }, binding, Date.now() + 5000)).toBeNull()
   } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+
+test('managed Windows deferred controller requires exact owned config and live connection before direct schema proof', async () => {
+  const selection: SelectedExecutionProfile['selection'] = { agent: 'worker', model: { providerID: 'TEST', id: 'TEST' },
+    permissions: [{ action: '*', resource: '*', effect: 'ask' }] }
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform')!
+  const windows = <T>(run: () => T): T => {
+    try { Object.defineProperty(process, 'platform', { ...platform, value: 'win32' }); return run() }
+    finally { Object.defineProperty(process, 'platform', platform) }
+  }
+  const config = windows(() => createOpenCodeV2ExecutionConfig({ pin: '2.0.21', selection,
+    controller: { server: 'agent-teams', config: { type: 'local', command: [process.execPath,
+      fileURLToPath(new URL('./fixtures/OpenCodeV2ControllerToolsPeer.ts', import.meta.url))] } } }))
+  const profile: SelectedExecutionProfile = { epoch: 'TEST-epoch', root: '/TEST-root', directory: '/TEST-project',
+    databasePath: '/TEST-db', env: {}, envSha256: 'a'.repeat(64), selection,
+    config: { directory: '/TEST-config', content: config.content, sha256: config.sha256 } }
+  const client = { authority: { profileRoot: profile.root, profileEpoch: profile.epoch, directory: profile.directory },
+    mcp: async () => [{ name: 'agent-teams', status: 'connected' }],
+    config: async () => [{ type: 'document', info: config.info }],
+  } as unknown as ExecutionBridgeClient
+  const read = (selected = profile, wire = client) => windows(() => readOwnedControllerTools(wire, selected,
+    'agent-teams', Date.now() + 5000))
+  await expect(read({ ...profile, config: { ...profile.config, sha256: 'b'.repeat(64) } })).rejects.toThrow('run_controller_config_unknown')
+  await expect(read(profile, { ...client, authority: { ...client.authority, profileEpoch: 'TEST-foreign' } })).rejects.toThrow('run_controller_config_unknown')
+  await expect(read(profile, { ...client, config: async () => [{ type: 'document', info: {} }] })).rejects.toThrow('run_controller_config_unknown')
+  await expect(read(profile, { ...client, mcp: async () => [] })).rejects.toThrow('run_controller_mcp_unknown')
+  // Same disabled document is never accepted outside the managed Windows path.
+  if (process.platform !== 'win32') await expect(readOwnedControllerTools(client, profile, 'agent-teams', Date.now() + 5000)).rejects.toThrow('run_controller_config_unknown')
+  const proof = await read()
+  expect(proof.configHash).toBe(executionHash(config.info.mcp!.servers!['agent-teams']))
+  expect(proof.nativeNames).toEqual(['agent-teams_message_send'])
+  expect(createHash('sha256').update(config.content).digest('hex')).toBe(profile.config.sha256)
 })

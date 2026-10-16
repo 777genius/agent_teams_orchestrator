@@ -49,8 +49,8 @@ export function createOpenCodeV2ExecutionConfig(input: ExecutionConfigInput): {
   const selectedModel = { providerID: selection.model.providerID, model: selection.model.id,
     ...(selection.model.variant === undefined ? {} : { variant: selection.model.variant }) }
   const nativeMcp = mcp.type === 'local'
-    ? { ...mcp, command: [...mcp.command] }
-    : { ...mcp }
+    ? { ...mcp, command: [...mcp.command], ...(process.platform === 'win32' ? { disabled: true } : {}) }
+    : { ...mcp, ...(process.platform === 'win32' ? { disabled: true } : {}) }
   const info = {
     update: 'disable', share: 'disabled', snapshots: false, warming: false,
     plugins: input.unattendedTeam === true ? ['-opencode.tool.question'] : [],

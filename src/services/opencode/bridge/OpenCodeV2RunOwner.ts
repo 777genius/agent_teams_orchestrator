@@ -66,6 +66,7 @@ export class OpenCodeV2RunOwner {
   private readonly operations = new Set<AbortController>()
   private readonly initializationAbort = new AbortController()
   private readonly acquisitions = new Set<AbortController>()
+  private readonly deferredWindowsControllers = process.platform === 'win32'
   private readonly pendingLeases = new Map<string, ExecutionLease>()
   private readonly closing = new Map<ExecutionLease, Promise<ExecutionCleanupReceipt>>()
   private cleanupGraceDeadline = 0
@@ -113,6 +114,11 @@ export class OpenCodeV2RunOwner {
   }
   private async initialize(): Promise<void> {
     const initializationDeadline = Math.min(this.plan.deadline, Date.now() + OPEN_CODE_V2_RUN_INITIALIZATION_MS)
+    // Windows MCP transports continuously poll native command custody once
+    // connected. Finish all shared-root grants before any transport can start.
+    if (this.deferredWindowsControllers) {
+      for (const member of this.plan.members) await this.acquireMember(member, initializationDeadline)
+    }
     let nextMember = 0
     const initializeWorker = async () => {
       while (nextMember < this.plan.members.length && !this.initializationAbort.signal.aborted) {
@@ -134,18 +140,25 @@ export class OpenCodeV2RunOwner {
       Date.now() < initializationDeadline, 'run_stopped')
     this.state = 'active'; await this.persistState()
   }
-  private async initializeMember(memberPlan: RunMemberPlan, initializationDeadline: number): Promise<void> {
-    const initializationStartedAt = Date.now()
-    let initializationPhase: RunInitializationPhase | undefined
+  private async acquireMember(memberPlan: RunMemberPlan, initializationDeadline: number): Promise<ExecutionLease> {
     executionAssert(this.state === 'starting' && !this.initializationAbort.signal.aborted &&
       Date.now() < initializationDeadline, 'run_stopped')
     const acquiring = new AbortController()
     this.acquisitions.add(acquiring)
     const acquisitionTimer = setTimeout(() => acquiring.abort(new Error('run_acquisition_timeout')), initializationDeadline - Date.now())
     let lease: ExecutionLease
-    try { lease = await this.ports.acquire(memberPlan.native, memberPlan.profile, this.context(memberPlan, this.plan.deadline, acquiring.signal)) }
-    finally { clearTimeout(acquisitionTimer); this.acquisitions.delete(acquiring) }
+    try {
+      lease = await this.ports.acquire(memberPlan.native, memberPlan.profile, this.context(memberPlan, this.plan.deadline, acquiring.signal))
+    } finally { clearTimeout(acquisitionTimer); this.acquisitions.delete(acquiring) }
     this.pendingLeases.set(memberPlan.memberId, lease)
+    return lease
+  }
+  private async initializeMember(memberPlan: RunMemberPlan, initializationDeadline: number): Promise<void> {
+    const initializationStartedAt = Date.now()
+    let initializationPhase: RunInitializationPhase | undefined
+    executionAssert(this.state === 'starting' && !this.initializationAbort.signal.aborted &&
+      Date.now() < initializationDeadline, 'run_stopped')
+    const lease = this.pendingLeases.get(memberPlan.memberId) ?? await this.acquireMember(memberPlan, initializationDeadline)
     let member: Member | undefined
     const initializationTimer = setTimeout(() => this.initializationAbort.abort(new Error('run_initialization_timeout')), initializationDeadline - Date.now())
     try {

@@ -36,6 +36,7 @@ const intent: QueueIntent = { delivery: 'queue', identity: {
 async function fixture(options: { unknown?: boolean; foreignClient?: boolean; createUnknown?: boolean;
   probe?: boolean; promptBarrier?: Promise<void>; closeBarrier?: Promise<void>; permissionResources?: string[];
   lifetimeMs?: number; twoMembers?: boolean; memberCount?: number; preparation?: () => void; startup?: () => void;
+  windowsAcquisitions?: boolean;
   acquisition?: (memberId: string, signal: AbortSignal | undefined) => Promise<void>;
   permissions?: import('../host/OpenCodeV2ExecutionBinding.js').ExecutionSelection['permissions'] } = {}) {
   const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'TEST-r249-owner-')))
@@ -142,7 +143,12 @@ async function fixture(options: { unknown?: boolean; foreignClient?: boolean; cr
     },
   }
   const directory = await reserveRunControlDirectory(root, binding, 'f'.repeat(64))
-  const owner = new OpenCodeV2RunOwner(plan, directory, ports)
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform')!
+  let owner: OpenCodeV2RunOwner
+  try {
+    Object.defineProperty(process, 'platform', { ...platform, value: options.windowsAcquisitions ? 'win32' : 'linux' })
+    owner = new OpenCodeV2RunOwner(plan, directory, ports)
+  } finally { Object.defineProperty(process, 'platform', platform) }
   const selected = { memberId: 'worker', originalSessionId: 'ses_TESToriginal' }
   const sessionAuthority: SessionAuthority = { host: authority, teamId: binding.teamId, runId: binding.runId, laneId: 'primary', memberId: 'worker',
     sessionID: 'ses_TESToriginal', agent: 'worker', model: { providerID: 'TEST-provider', id: 'TEST-model' } }
@@ -203,6 +209,90 @@ async function waitForTestAcquisitions(observe: () => boolean) {
   while (!observe() && Date.now() < deadline) await Bun.sleep(5)
   expect(observe()).toBe(true)
 }
+
+test('Windows acquires all leases before any client or controller bootstrap, with no model input', async () => {
+  const gates = [acquisitionGate(), acquisitionGate()], started: string[] = []
+  const f = await fixture({ windowsAcquisitions: true, twoMembers: true, acquisition: async member => {
+    const index = started.length; started.push(member); await gates[index]!.promise
+  } })
+  try {
+    await waitForTestAcquisitions(() => started.length === 1)
+    expect(f.counters.acquired).toBe(1)
+    gates[0]!.release()
+    await waitForTestAcquisitions(() => started.length === 2)
+    expect(f.counters).toMatchObject({ clients: 0, sessions: 0, prompted: 0 })
+    gates[1]!.release()
+    await f.owner.ready()
+    expect(started).toEqual(['worker', 'worker-2'])
+    expect(f.counters).toMatchObject({ acquired: 2, clients: 2, sessions: 2, prompted: 0 })
+  } finally { gates.forEach(gate => gate.release()); await f.close() }
+})
+
+test('Windows stop refuses queued acquisition and joins the late original lease', async () => {
+  const gate = acquisitionGate(), started: string[] = [], signals: AbortSignal[] = []
+  const f = await fixture({ windowsAcquisitions: true, memberCount: 3, acquisition: async (member, signal) => {
+    started.push(member)
+    if (member === 'worker-2') { signals.push(signal!); await gate.promise }
+  } })
+  try {
+    await waitForTestAcquisitions(() => started.length === 2)
+    const stopping = f.owner.stop()
+    await waitForTestAcquisitions(() => signals.every(signal => signal.aborted))
+    gate.release()
+    await expect(f.owner.ready()).rejects.toThrow('run_stopped')
+    await stopping
+    expect(started).toEqual(['worker', 'worker-2'])
+    expect(f.counters).toMatchObject({ acquired: 2, closed: 2, clients: 0, sessions: 0, prompted: 0 })
+  } finally { gate.release(); await f.close() }
+})
+
+test('Windows queued acquisition retains the original deadline and refuses expired work', async () => {
+  const gate = acquisitionGate(), started: string[] = []
+  const f = await fixture({ windowsAcquisitions: true, twoMembers: true, acquisition: async member => {
+    started.push(member); await gate.promise
+  } })
+  let clock: ReturnType<typeof spyOn> | undefined
+  try {
+    await waitForTestAcquisitions(() => started.length === 1)
+    const expired = Date.now() + 20_000
+    clock = spyOn(Date, 'now').mockReturnValue(expired)
+    gate.release()
+    await expect(f.owner.ready()).rejects.toThrow('run_stopped')
+    expect(started).toEqual(['worker'])
+    expect(f.counters).toMatchObject({ acquired: 1, clients: 0, sessions: 0, prompted: 0 })
+  } finally { clock?.mockRestore(); gate.release(); await f.close() }
+})
+
+test('Windows later acquisition failure closes every already acquired original lease', async () => {
+  const gate = acquisitionGate(), started: string[] = []
+  const f = await fixture({ windowsAcquisitions: true, memberCount: 3, acquisition: async member => {
+    started.push(member)
+    if (member === 'worker-2') await gate.promise
+  } })
+  try {
+    await waitForTestAcquisitions(() => started.length === 2)
+    expect(f.counters.clients).toBe(0)
+    gate.reject(new Error('TEST second Windows acquisition failure'))
+    await expect(f.owner.ready()).rejects.toThrow('TEST second Windows acquisition failure')
+    await f.owner.stop()
+    expect(started).toEqual(['worker', 'worker-2'])
+    expect(f.counters).toMatchObject({ acquired: 2, closed: 1, clients: 0, sessions: 0, prompted: 0 })
+  } finally { gate.release(); await f.close() }
+})
+
+test('Windows original acquisition rejection never starts queued acquisitions', async () => {
+  const gate = acquisitionGate(), started: string[] = []
+  const f = await fixture({ windowsAcquisitions: true, memberCount: 3, acquisition: async member => {
+    started.push(member); await gate.promise
+  } })
+  try {
+    await waitForTestAcquisitions(() => started.length === 1)
+    gate.reject(new Error('TEST original Windows acquisition failure'))
+    await expect(f.owner.ready()).rejects.toThrow('TEST original Windows acquisition failure')
+    expect(started).toEqual(['worker'])
+    expect(f.counters).toMatchObject({ acquired: 1, closed: 0, clients: 0, sessions: 0, prompted: 0 })
+  } finally { gate.release(); await f.close() }
+})
 
 test('three original acquisitions overlap, the fourth stays queued, and all six become ready without model input', async () => {
   const gate = acquisitionGate(), started: string[] = []
