@@ -52,6 +52,7 @@ test('startup diagnostics retain only finite native fields and reject payload-be
   process.env.CLAUDE_MULTIMODEL_DATA_HOME = root
   const secret = 'TEST-PRIVATE-PAYLOAD'
   const valid = { event: 'opencode-v2-startup', reason: 'timeout', stage: 'graph-validation', elapsedMs: 30_123 }
+  const activationWait = { ...valid, stage: 'waiting-for-activation' }
   const history = [{ stage: 'waiting-for-prepare', elapsedMs: 0 },
     { stage: 'graph-validation', elapsedMs: 1200 }]
   const historical = { ...valid, history }
@@ -74,7 +75,7 @@ test('startup diagnostics retain only finite native fields and reject payload-be
     { ...graph, path: secret }, { ...graph, completed: -1 }, { ...graph, completed: 0.5 },
     { ...graph, completed: 101 }, { ...graph, total: 0 }, { ...graph, total: 65_537 },
     { ...graph, completed: Number.MAX_SAFE_INTEGER + 1 }, { ...closure, completed: 99 }]
-  const frames = [valid, historical, windowsFrame, { ...windowsFrame, nativeExitCode: 1, nativeStderrKind: 'module_resolution' },
+  const frames = [valid, activationWait, historical, windowsFrame, { ...windowsFrame, nativeExitCode: 1, nativeStderrKind: 'module_resolution' },
     { ...windowsFrame, nativeStderrKind: secret }, { ...windowsFrame, nativeStderrKind: ['empty'] }, { ...windowsFrame, nativeExitCode: 0xc0000135 },
     { ...windowsFrame, nativeExitCode: secret }, { ...windowsFrame, nativeExitCode: -1 }, { ...valid, graph }, { ...historical, graph: closure },
     ...invalidGraph.map(graph => ({ ...historical, graph })), ...invalidHistory.map(history => ({ ...valid, history })),
@@ -113,6 +114,7 @@ test('startup diagnostics retain only finite native fields and reject payload-be
     expect(rows.filter(row => row.acquisition).map(row => row.acquisition)).toEqual([acquisition])
     expect(rows.filter(row => row.startup).map(row => row.startup)).toEqual(expect.arrayContaining([
       { reason: 'timeout', stage: 'graph-validation', elapsedMs: 30_123 },
+      { reason: 'timeout', stage: 'waiting-for-activation', elapsedMs: 30_123 },
       { reason: 'timeout', stage: 'graph-validation', elapsedMs: 30_123, history },
       { reason: 'timeout', stage: 'graph-validation', elapsedMs: 30_123, graph },
       { reason: 'timeout', stage: 'graph-validation', elapsedMs: 30_123, history, graph: closure },
@@ -120,7 +122,7 @@ test('startup diagnostics retain only finite native fields and reject payload-be
       { reason: 'failed', stage: 'windows-assert', elapsedMs: 10, history: windowsHistory, nativeExitCode: 0xc0000135 },
       { reason: 'failed', stage: 'windows-assert', elapsedMs: 10, history: windowsHistory, nativeExitCode: 1, nativeStderrKind: 'module_resolution' },
     ]))
-    expect(rows.filter(row => row.startup)).toHaveLength(7)
+    expect(rows.filter(row => row.startup)).toHaveLength(8)
   } finally {
     if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_DATA_HOME
     else process.env.CLAUDE_MULTIMODEL_DATA_HOME = previous

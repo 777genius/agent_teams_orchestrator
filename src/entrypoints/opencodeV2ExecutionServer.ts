@@ -62,9 +62,9 @@ function reportStartupFailure(reason: 'timeout' | 'failed', error?: unknown): vo
 }
 // A source graph can legitimately take more than 30 seconds under concurrent
 // startup. The owner still enforces its original shared initialization deadline.
-// Windows validates over 53,000 graph files after native setup; keep its
-// child watchdog inside the measured, shared 180-second initialization budget.
-const startupTimer = setTimeout(() => { reportStartupFailure('timeout'); void close() }, process.platform === 'win32' ? 120_000 : 60_000)
+// Standalone children retain their local watchdog. Authenticated deferred
+// Windows startup instead uses the owner's original absolute deadline below.
+let startupTimer = setTimeout(() => { reportStartupFailure('timeout'); void close() }, process.platform === 'win32' ? 120_000 : 60_000)
 function close(): Promise<void> {
   return closeWork ??= (async () => {
     if (!runtimeReady) reportStartupFailure('failed')
@@ -95,10 +95,15 @@ async function start(input: Record<string, unknown>): Promise<void> {
   executionRecord(input.native); executionRecord(input.profile)
   const native = input.native as ValidatedExecutionNative
   const profile = input.profile as OwnedNativeProfile
+  let activationDeadline: number | undefined
   if (input.deferRuntime !== undefined) {
-    executionAssert(process.platform === 'win32' && input.deferRuntime === true && Number.isFinite(input.activationDeadline) && Number(input.activationDeadline) > Date.now(), 'execution_identity_mismatch')
+    executionAssert(process.platform === 'win32' && input.deferRuntime === true && Number.isSafeInteger(input.activationDeadline) &&
+      Number(input.activationDeadline) > Date.now() && Number(input.activationDeadline) <= startupStartedAt + 180_000, 'execution_identity_mismatch')
+    activationDeadline = Number(input.activationDeadline)
     graphActivation = windowsGraphActivation({ nonce: prepared.nonce, leaseOwnerId: prepared.leaseOwnerId,
-      namespace: prepared.namespace, pid: process.pid, birth: prepared.birth }, Number(input.activationDeadline))
+      namespace: prepared.namespace, pid: process.pid, birth: prepared.birth }, activationDeadline)
+    clearTimeout(startupTimer)
+    startupTimer = setTimeout(() => { reportStartupFailure('timeout'); void close() }, activationDeadline - Date.now())
   } else executionAssert(input.activationDeadline === undefined, 'execution_identity_mismatch')
   enterStartupStage('delivery-resolution')
   const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'execution')
@@ -132,17 +137,18 @@ async function start(input: Record<string, unknown>): Promise<void> {
   enterStartupStage('graph-validation')
   const graph = await validateExecutionGraph(native.version, native.graph, value => { graphProgress = value }, controller.signal)
   controller.signal.throwIfAborted()
-  if (graphActivation) {
+  if (graphActivation && activationDeadline !== undefined) {
+    enterStartupStage('waiting-for-activation')
     const birth = await readExecutionPlatformBirth(process.pid)
     executionAssert(birth && executionHash(birth) === executionHash(prepared.birth), 'execution_identity_mismatch')
     graphActivation.ready()
     await boundOpenCodeRead(childControl.send({ type: 'graph-ready', nonce, leaseOwnerId: prepared.leaseOwnerId,
       namespace: prepared.namespace, pid: process.pid, birth, pin: native.version, graphSha256: native.graph.sha256,
       executableSha256: native.bun.sha256, profileEpoch: profile.epoch, selectionSha256: executionHash(profile.selection) }),
-      Math.min(1000, Number(input.activationDeadline) - Date.now()), controller.signal)
-    await boundOpenCodeRead(graphActivation.wait(), Number(input.activationDeadline) - Date.now(), controller.signal)
+      Math.min(1000, activationDeadline - Date.now()), controller.signal)
+    await boundOpenCodeRead(graphActivation.wait(), activationDeadline - Date.now(), controller.signal)
     controller.signal.throwIfAborted()
-    executionAssert(Date.now() < Number(input.activationDeadline), 'execution_timeout')
+    executionAssert(Date.now() < activationDeadline, 'execution_timeout')
   }
   const options = {
     hostname: '127.0.0.1', port: 0, password: input.password,

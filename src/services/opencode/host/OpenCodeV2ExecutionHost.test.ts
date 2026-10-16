@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { createHash } from 'node:crypto'
 import { executionHash } from '../execution/OpenCodeV2ExecutionContracts.js'
+import { boundOpenCodeRead } from '../transport/OpenCodeBoundedFetch.js'
 import { acquireExecutionLease, awaitExecutionHostReady } from './OpenCodeV2ExecutionHost.js'
 import { validateExecutionProfile, type ExecutionBirth, type SelectedExecutionProfile, type ValidatedExecutionNative } from './OpenCodeV2ExecutionBinding.js'
 import { executionClosedAck, retireExecutionChild, type ExecutionRetirementPort } from './OpenCodeV2ExecutionLifecycle.js'
@@ -35,6 +36,92 @@ function retirement(overrides: Partial<ExecutionRetirementPort> = {}): Execution
 }
 
 describe('execution host ownership and cleanup', () => {
+  for (const mode of ['deferred-expiry', 'deferred-stop', 'deferred-premature', 'deferred-expired', 'deferred-overflow', 'standalone-windows', 'standalone-posix'] as const)
+    test(`actual child watchdog retains its original deadline and activation barrier (${mode})`, async () => {
+      const source = await readFile(path.resolve(import.meta.dir, '../../../entrypoints/opencodeV2ExecutionServer.ts'), 'utf8')
+      const body = new Bun.Transpiler({ loader: 'ts' }).transformSync(source.slice(source.indexOf('const controller = new AbortController()'))
+        .replaceAll('import.meta.url', JSON.stringify('/TEST-entry')))
+      const base = 1_000_000, originalDeadline = base + 150_000
+      let now = base, sequence = 0, completeGraph!: () => void
+      const clock = spyOn(Date, 'now').mockImplementation(() => now)
+      const timers = new Map<number, { at: number; run: () => void }>()
+      const armed: number[] = []
+      const events = new EventEmitter(), sent: Readonly<Record<string, unknown>>[] = [], reports: Record<string, any>[] = [], exits: number[] = []
+      const nonce = '11111111-1111-4111-8111-111111111111', leaseOwnerId = '22222222-2222-4222-8222-222222222222'
+      const childBirth: ExecutionBirth = { format: 'windows-filetime', value: '42', bootId: null }
+      const prepared = { nonce, leaseOwnerId, namespace: `windows-job:${nonce}`, pid: 42, birth: childBirth, executableSha256: native.bun.sha256 }
+      const profile: SelectedExecutionProfile = { root: '/TEST-profile', epoch: 'TEST-epoch', directory: '/TEST-project', databasePath: '/TEST-profile/data/opencode.db',
+        env: {}, envSha256: 'f'.repeat(64), config: { directory: '/TEST-profile/config', content: '{}', sha256: 'f'.repeat(64) },
+        selection: { agent: 'worker', model: { providerID: 'TEST', id: 'model' }, permissions: [] } }
+      const platform = mode === 'standalone-posix' ? 'darwin' : 'win32'
+      const scope = { AbortController, Date, windowsGraphActivation, boundOpenCodeRead,
+        process: { platform, pid: 42, env: { PWD: profile.directory }, versions: { bun: 'TEST-bun' },
+          execPath: native.bun.path, argv: ['TEST-bun', '/TEST-entry'], cwd: () => profile.directory,
+          stderr: { write: (text: string) => { reports.push(JSON.parse(text)) } }, once: () => {}, exit: (code: number) => { exits.push(code) } },
+        childControl: { events, connected: () => true, send: async (value: Readonly<Record<string, unknown>>) => { sent.push(value) }, disconnect: () => {} },
+        setTimeout: (run: () => void, ms: number) => { const id = ++sequence; armed.push(now + ms); timers.set(id, { at: now + ms, run }); return id },
+        clearTimeout: (id: number) => { timers.delete(id) },
+        executionAssert: (value: unknown, message = 'execution_contract_invalid') => { if (!value) throw new Error(message) },
+        executionRecord: (value: unknown) => value, executionHash, executionProfileGuards: [], readExecutionGraphFailure: () => undefined,
+        prepareExecutionPlatformChild: async () => prepared, readExecutionPlatformBirth: async () => childBirth,
+        resolveOpenCodeV2ExecutionDelivery: async () => ({ runtimeMode: native.runtimeMode, entrySha256: native.entrySha256 }),
+        validateExecutionProfile: async () => {}, assertExecutionProfile: () => {}, openCodeBunVersion: () => 'TEST-bun',
+        hashOpenCodeFile: async (file: string) => file === native.bun.path ? native.bun.sha256 : native.entrySha256,
+        validateExecutionNative: async () => {},
+        validateExecutionGraph: (_pin: unknown, _graph: unknown, progress: (value: unknown) => void, signal: AbortSignal) => new Promise<void>((resolve, reject) => {
+          progress({ phase: 'closure', completed: 53237, total: 53237 })
+          completeGraph = resolve
+          signal.addEventListener('abort', () => reject(signal.reason), { once: true })
+        }),
+      }
+      try {
+        const inspect = new Function('scope', `const {${Object.keys(scope).join(',')}}=scope;${body};return () => ({startupStage, closing, runtimeReady});`)(scope) as () => { startupStage: string; closing: boolean; runtimeReady: boolean }
+        const settle = async () => { for (let i = 0; i < 40; i++) await Promise.resolve() }
+        const advance = async (time: number) => {
+          now = time
+          for (const [id, timer] of [...timers]) if (timer.at <= now) { timers.delete(id); timer.run() }
+          await settle()
+        }
+        expect([...timers.values()].map(timer => timer.at)).toEqual([base + (platform === 'win32' ? 120_000 : 60_000)])
+        events.emit('message', { type: 'prepare', nonce, leaseOwnerId }); await settle()
+        now = base + 20_000
+        const deferred = mode.startsWith('deferred')
+        events.emit('message', { type: 'start', nonce, leaseOwnerId, namespace: prepared.namespace, password: 'A'.repeat(43), native, profile,
+          ...(deferred ? { deferRuntime: true, activationDeadline: mode === 'deferred-expired' ? now : mode === 'deferred-overflow' ? base + 180_001 : originalDeadline } : {}) })
+        await settle()
+        if (mode === 'deferred-expired' || mode === 'deferred-overflow') {
+          expect(armed).toEqual([base + 120_000])
+          expect(inspect()).toMatchObject({ closing: true, runtimeReady: false })
+          expect(reports[0]).toMatchObject({ reason: 'failed', cause: 'execution_identity_mismatch' })
+          expect(sent.some(value => value.type === 'graph-ready' || value.type === 'ready')).toBe(false)
+          expect(exits).toEqual([0])
+          return
+        }
+        expect(inspect().startupStage).toBe('graph-validation')
+        expect(sent.some(value => value.type === 'graph-ready')).toBe(false) // Closure-start progress is not a completed validation.
+        if (deferred) {
+          expect([...timers.values()].map(timer => timer.at)).toEqual([originalDeadline])
+          if (mode === 'deferred-premature') events.emit('message', { type: 'activate', ...prepared })
+          else {
+            now = base + 110_000; completeGraph(); await settle()
+            expect(inspect().startupStage).toBe('waiting-for-activation')
+            expect(sent.some(value => value.type === 'graph-ready')).toBe(true)
+            await advance(base + 120_001)
+            expect(inspect().closing).toBe(false)
+            expect(reports).toEqual([])
+            if (mode === 'deferred-stop') events.emit('message', { type: 'close', nonce, leaseOwnerId })
+            else await advance(originalDeadline)
+          }
+        } else await advance(base + (platform === 'win32' ? 120_000 : 60_000))
+        await settle()
+        expect(inspect()).toMatchObject({ closing: true, runtimeReady: false })
+        expect(sent.some(value => value.type === 'ready')).toBe(false)
+        expect(exits).toEqual([0])
+        expect(reports).toHaveLength(1)
+        if (mode.endsWith('expiry')) expect(reports[0]).toMatchObject({ reason: 'timeout', stage: 'waiting-for-activation', elapsedMs: 150_000 })
+        if (!deferred) expect(reports[0]).toMatchObject({ reason: 'timeout', stage: 'graph-validation', elapsedMs: platform === 'win32' ? 120_000 : 60_000 })
+      } finally { clock.mockRestore() }
+    })
   test('Windows graph activation is one-shot and binds the original deadline and physical child', async () => {
     const expected = { nonce: 'TEST-nonce', leaseOwnerId: 'TEST-lease', namespace: 'windows-job:TEST-nonce', pid: 42,
       birth: { format: 'windows-filetime' as const, value: '42', bootId: null } }

@@ -8,7 +8,7 @@ import { readOpenCodeV2ProviderWireFailure } from '../transport/OpenCodeV2Provid
 import { ensureWindowsPrivateDirectories } from '../profile/OpenCodePrivateDirectories.js'
 
 const startupStages = new Set(['run-owner-entry', 'windows-cohort', 'windows-profile', 'windows-roots', 'windows-dll',
-  'windows-process', 'windows-owned-pair', 'windows-published', 'windows-connected', 'windows-prepare', 'windows-assert', 'waiting-for-prepare', 'profile-validation', 'native-validation', 'graph-validation',
+  'windows-process', 'windows-owned-pair', 'windows-published', 'windows-connected', 'windows-prepare', 'windows-assert', 'waiting-for-prepare', 'profile-validation', 'native-validation', 'graph-validation', 'waiting-for-activation',
   'delivery-resolution', 'runtime-import', 'server-start', 'effect-import', 'selected-oauth-import', 'scope-acquisition', 'ready-identity'])
 function startupDiagnostic(output: string | undefined) {
   if (!output || output.length > 16_384) return undefined
