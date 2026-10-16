@@ -7,6 +7,7 @@ import { validateExecutionProfile, type OwnedNativeProfile, type ExecutionBirth 
 import { createWindowsNativeBroker, resolveWindowsNativeArtifact, resolveWindowsRealpathArtifact, requireWindowsRealpathArtifact, type WindowsRealpathArtifact, type WindowsNativeArtifact, type WindowsNativeBroker } from './OpenCodeV2WindowsNativeBroker.js'
 import { createWindowsOwnerFilesystem } from './OpenCodeV2WindowsOwnerFilesystem.js'
 import { createWindowsExecutionHttpClient } from './OpenCodeV2WindowsHTTP.js'
+import type { ExecutionNativeRetirementGate } from '../OpenCodeV2ExecutionPlatform.js'
 
 function assert(value: unknown, code = 'execution_containment_unqualified'): asserts value { if (!value) throw new Error(code) }
 function row(value: unknown): Record<string, unknown> { assert(value && typeof value === 'object' && !Array.isArray(value), 'execution_invalid_response'); return value as Record<string, unknown> }
@@ -365,17 +366,18 @@ export async function bindWindowsExecutionSelectedConfig(plan: WindowsLaunchPlan
   selectedConfigs.set(plan, selected.selectionId)
 }
 export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, leaseOwnerId: string,
-  bun: Readonly<{ path: string; sha256: string }>, deadline: number) {
+  bun: Readonly<{ path: string; sha256: string }>, deadline: number, retirementGate?: ExecutionNativeRetirementGate) {
   assert(Number.isFinite(deadline) && deadline > Date.now(), 'execution_timeout')
   assert(plans.has(plan) && selectedConfigs.has(plan) && equal(binaries.get(plan), bun) && /^[a-f0-9-]{36}$/.test(nonce) && /^[a-f0-9-]{36}$/.test(leaseOwnerId))
   const member = memberPreflights.get(plan)
   if (member) assert(member.state === 'ready' && member.result && member.nonceConsumed === true &&
     nonce === member.result.launchNonce && brokers.get(plan) === member.broker, 'run_state_start_changed')
   const broker = brokers.get(plan); assert(broker && !broker.ended())
+  const nativeRetirement = <T>(work: () => Promise<T>) => retirementGate ? retirementGate(work) : work()
   const child = new EventEmitter() as EventEmitter & { pid?: number }
   const http = createWindowsExecutionHttpClient(
     value => broker.request('send', { value: { ...value, nonce, leaseOwnerId } }).then(() => undefined),
-    error => { child.emit('error', error); void broker.request('retire').catch(() => child.emit('error', new Error('cleanup_unknown'))) },
+    error => { child.emit('error', error); void nativeRetirement(() => broker.request('retire')).catch(() => child.emit('error', new Error('cleanup_unknown'))) },
   )
   // Command request IDs are replayed only while their operation is pending or
   // retained in a small settled window.
@@ -489,11 +491,11 @@ export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, l
     sendClose() { assert(mapping); stopped = true; void http.close().then(() => broker!.request('send', { value: { type: 'close', nonce, leaseOwnerId } })).catch(() => child.emit('error', new Error('cleanup_unknown'))) },
     acknowledged: () => closed,
     readBirth() { assert(mapping && mainExit, 'execution_identity_mismatch'); return mainExit.readBirth() },
-    async kill(deadline?: number) { stopped = true; await broker!.request('retire', {}, deadline !== undefined && deadline > Date.now() ? deadline : undefined) },
+    async kill(deadline?: number) { stopped = true; await nativeRetirement(() => broker!.request('retire', {}, deadline !== undefined && deadline > Date.now() ? deadline : undefined)) },
     retire(deadline?: number): Promise<WindowsKernelRetirement> {
       return retirement ??= (async () => {
-        stopped = true; const observed = row(await launch), receipt = row(await retireWindowsNativeScope(broker!, nonce,
-          deadline !== undefined && deadline > Date.now() ? deadline : undefined))
+        stopped = true; const observed = row(await launch), receipt = row(await nativeRetirement(() => retireWindowsNativeScope(broker!, nonce,
+          deadline !== undefined && deadline > Date.now() ? deadline : undefined)))
         assert(mapping && equal(receipt.mapping, observed) && receipt.empty === true && receipt.activeProcesses === 0 && receipt.heldProcessExited === true && receipt.ownedPairClosed === true && receipt.ownAcesRemoved === true, 'cleanup_unknown')
         const value = Object.freeze({ pid: mapping.bun.hostPID, birth: mapping.bun.birth, mapping, scopeClosed: closed, activeProcesses: 0 as const, heldProcessExited: true as const, ownAcesRemoved: true as const })
         retirements.add(value); return value

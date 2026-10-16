@@ -41,6 +41,48 @@ function retirement(work: Promise<unknown>): ExecutionRetirementPort {
     retireOwnedDescendants: () => work }
 }
 
+test('actual Windows adapter gates kill, retirement and fire-and-forget HTTP failure until their native turn', async () => {
+  const source = await Bun.file(new URL('windows/OpenCodeV2WindowsExecution.ts', import.meta.url)).text()
+  const body = new Bun.Transpiler({ loader: 'ts' }).transformSync(source.slice(source.indexOf('export function launchWindowsExecution(')).replace('export ', ''))
+  const bun = { path: 'C:\\TEST\\bun.exe', sha256: 'a'.repeat(64) }
+  const plan = { executable: bun.path, entry: 'C:\\TEST\\entry.js', cwd: 'C:\\TEST', env: {}, writableRoots: [], readOnlyRoots: [], protectedRoots: [], realpathDll: {} }
+  const jobs: (() => Promise<void>)[] = [], requests: (number | undefined)[] = []
+  const gate = <T>(work: () => Promise<T>) => new Promise<T>((resolve, reject) => {
+    jobs.push(async () => { try { resolve(await work()) } catch (error) { reject(error) } })
+  })
+  let fatal!: (error: Error) => void, now = 1_000_000
+  const clock = spyOn(Date, 'now').mockImplementation(() => now)
+  const native = { events: new EventEmitter(), ended: () => false,
+    request: async (operation: string, _input?: unknown, deadline?: number) => {
+      if (operation === 'launch') return {}
+      expect(operation).toBe('retire'); requests.push(deadline); return {}
+    } }
+  const scope = { plans: new WeakSet([plan]), selectedConfigs: new WeakMap([[plan, 'TEST-config']]),
+    binaries: new WeakMap([[plan, bun]]), memberPreflights: new WeakMap(), brokers: new WeakMap([[plan, native]]),
+    mappings: new WeakSet(), retirements: new WeakSet(), EventEmitter,
+    assert: (value: unknown, code = 'execution_containment_unqualified') => { if (!value) throw new Error(code) },
+    row: (value: unknown) => { if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('execution_invalid_response'); return value },
+    equal: (left: unknown, right: unknown) => JSON.stringify(left) === JSON.stringify(right),
+    createWindowsCommandRequestHandler, observeWindowsHeldMainExit, retireWindowsNativeScope,
+    createWindowsExecutionHttpClient: (_send: unknown, fail: (error: Error) => void) => {
+      fatal = fail; return { fetch: async () => new Response(), fail: () => {}, bindOrigin: () => {}, close: async () => {} }
+    } }
+  try {
+    const launch = new Function('scope', `const {${Object.keys(scope).join(',')}}=scope;${body};return launchWindowsExecution;`)(scope)(plan,
+      '11111111-1111-4111-8111-111111111111', '22222222-2222-4222-8222-222222222222', bun, now + 5000, gate)
+    const errors: Error[] = []; launch.child.on('error', (error: Error) => { errors.push(error) })
+    const deadline = now + 22_000, killed = launch.kill(deadline), retired = launch.retire(deadline).catch((error: Error) => error)
+    const transport = new Error('TEST-http-failure'); fatal(transport)
+    for (let i = 0; i < 10; i++) await Promise.resolve()
+    expect(jobs).toHaveLength(3); expect(requests).toHaveLength(0); expect(errors).toEqual([transport])
+    now = deadline + 1
+    for (const job of jobs) await job()
+    await killed
+    expect((await retired).message).toBe('cleanup_unknown') // Unprepared fake mappings cannot mint native proof.
+    expect(requests).toEqual([undefined, undefined, undefined]) // Actual execution reevaluates the original expired deadline.
+  } finally { clock.mockRestore() }
+})
+
 test('retirement keeps the original identity failure while still attempting kernel cleanup', async () => {
   const failure = new Error('execution_identity_unknown'), calls: string[] = []
   const port = retirement(Promise.resolve(undefined))

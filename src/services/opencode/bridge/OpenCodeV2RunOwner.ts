@@ -88,6 +88,16 @@ export class OpenCodeV2RunOwner {
     } finally { release() }
   }
   private readonly closing = new Map<ExecutionLease, Promise<ExecutionCleanupReceipt>>()
+  private readonly retirementGate = async <T>(retire: () => Promise<T>): Promise<T> => {
+    const previous = this.startupTail
+    let release!: () => void
+    const ticket = new Promise<void>(resolve => { release = resolve })
+    this.startupTail = previous.then(() => ticket)
+    // Owned native cleanup survives Stop/expiry. Hold the original ticket until
+    // its actual RPC settles, including after the public close wait times out.
+    await previous
+    try { return await retire() } finally { release() }
+  }
   private cleanupGraceDeadline = 0
   private state: RunOwnerState = 'starting'
   private stopping: Promise<Extract<RunControlResult, { kind: 'stop' }>> | undefined
@@ -175,7 +185,8 @@ export class OpenCodeV2RunOwner {
     try {
       lease = await this.ports.acquire(memberPlan.native, memberPlan.profile, this.context(memberPlan,
         this.deferredWindowsControllers ? initializationDeadline : this.plan.deadline, acquiring.signal),
-        this.deferredWindowsControllers ? (start, signal) => this.startupGate(start, signal, initializationDeadline) : undefined)
+        this.deferredWindowsControllers ? (start, signal) => this.startupGate(start, signal, initializationDeadline) : undefined,
+        this.deferredWindowsControllers ? this.retirementGate : undefined)
     } finally { clearTimeout(acquisitionTimer); this.acquisitions.delete(acquiring) }
     this.pendingLeases.set(memberPlan.memberId, lease)
     if (this.state !== 'starting' || this.initializationAbort.signal.aborted || acquiring.signal.aborted ||
@@ -282,6 +293,7 @@ export class OpenCodeV2RunOwner {
       await boundOpenCodeRead(this.initialization.catch(() => undefined), remaining())
       await boundOpenCodeRead(Promise.allSettled([...this.closing.values()]), remaining())
       await boundOpenCodeRead(Promise.allSettled([...this.active]), remaining())
+      await boundOpenCodeRead(this.startupTail, remaining())
     } catch {
       this.state = 'cleanup_unknown'
       await boundOpenCodeRead(writeRunControlFile(this.directory, 'orphan.json', { binding: this.plan.binding,
