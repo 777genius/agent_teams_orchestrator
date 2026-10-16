@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto'
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { OpenCodeV2RunOwner } from './OpenCodeV2RunOwner.js'
+import { OpenCodeV2RunOwner, projectRunOwnerEntryFailure } from './OpenCodeV2RunOwner.js'
 import { reserveRunControlDirectory, serveOpenCodeV2RunControl, requestOpenCodeV2Run } from './OpenCodeV2RunControl.js'
 import type { RunControlRequest, RunExecutionPorts, RunLaunchPlan } from './OpenCodeV2RunTypes.js'
 import type { ExecutionAuthority, SessionAuthority } from '../execution/OpenCodeV2ExecutionContracts.js'
@@ -944,3 +944,14 @@ requireExecutionEndpoint: authority => {
     expect(f.counters.prompted).toBe(1)
   } finally { f.native.log = async () => ({ events: [], synced: true, watermark: null }); await f.close() }
 }, 15_000)
+
+
+test('owner entry diagnostics preserve exit without changing ignored stderr ownership', () => {
+  expect(JSON.parse(projectRunOwnerEntryFailure(123, 17))).toEqual({
+    event: 'opencode-v2-startup', reason: 'failed', stage: 'run-owner-entry', elapsedMs: 123,
+    nativeStderrKind: 'unavailable', nativeExitCode: 17,
+  })
+  expect(JSON.parse(projectRunOwnerEntryFailure(5, null))).not.toHaveProperty('nativeExitCode')
+  expect(JSON.parse(projectRunOwnerEntryFailure(5, -1))).not.toHaveProperty('nativeExitCode')
+  expect(JSON.parse(projectRunOwnerEntryFailure(5, 0)).nativeExitCode).toBe(0)
+})

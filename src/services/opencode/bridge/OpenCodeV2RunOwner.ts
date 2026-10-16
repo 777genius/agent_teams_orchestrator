@@ -527,6 +527,15 @@ export class OpenCodeV2RunOwner {
   }
 }
 
+/** Original owner process facts only; ignored stderr remains ignored so a
+ * detached Bun supervisor cannot inherit a pipe closed by its launcher. */
+export function projectRunOwnerEntryFailure(elapsedMs: number, exitCode: number | null) {
+  return JSON.stringify({ event: 'opencode-v2-startup', reason: 'failed', stage: 'run-owner-entry',
+    elapsedMs: Math.max(0, Math.min(86_400_000, Math.trunc(elapsedMs))), nativeStderrKind: 'unavailable',
+    ...(Number.isSafeInteger(exitCode) && Number(exitCode) >= 0 && Number(exitCode) <= 0xffffffff
+      ? { nativeExitCode: exitCode } : {}) })
+}
+
 /** Explicit launch alone may spawn. Config/native objects travel over inherited
  * private IPC, never via protocol stdout or a durable authority descriptor. */
 export async function launchExplicitOpenCodeV2Run(plan: RunLaunchPlan): Promise<RunControlRecord> {
@@ -545,7 +554,11 @@ export async function launchExplicitOpenCodeV2Run(plan: RunLaunchPlan): Promise<
   const sourceSha256 = executionHash(plan.source.files)
   const directory = await reserveRunControlDirectory(plan.dataRoot, plan.binding, sourceSha256,
     plan.members.map(member => member.profile))
+  const entryStarted = Date.now()
   const child = spawn(plan.source.bunPath, [entry], { detached: true, cwd: plan.dataRoot, env: { ...plan.source.env }, stdio: ['ignore', 'ignore', 'ignore', 'ipc'] })
+  let entryExit: number | null = null, entryFailure: unknown
+  child.once('error', error => { entryFailure = error })
+  child.once('close', code => { entryExit = code })
   const ready = new Promise<void>((resolve, reject) => {
     child.once('error', () => reject(new Error('run_owner_unknown')))
     child.once('close', () => reject(new Error('run_owner_unknown')))
@@ -573,6 +586,8 @@ export async function launchExplicitOpenCodeV2Run(plan: RunLaunchPlan): Promise<
     }
     child.disconnect(); child.unref(); return record
   } catch (error) {
+    await recordOpenCodeV2ProviderFailure('execution-host-startup', entryFailure ?? error, true,
+      projectRunOwnerEntryFailure(Date.now() - entryStarted, entryExit))
     // Unknown startup cannot be replayed, reclaimed or PID-killed. The exact
     // launched supervisor owns its bounded deadline and cleanup.
     if (child.connected) child.disconnect(); child.unref(); throw error
