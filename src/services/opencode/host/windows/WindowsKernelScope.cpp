@@ -5529,7 +5529,7 @@ int wmain(int argc, wchar_t **argv) {
             const double timeoutMs = input.GetNamedNumber(L"timeoutMs");
             require(wallDeadline > 0 && wallDeadline <= 9007199254740991.0 &&
                         wallDeadline == static_cast<double>(static_cast<std::uint64_t>(wallDeadline)) &&
-                        timeoutMs >= 0 && timeoutMs <= 22000 &&
+                        timeoutMs >= 0 && timeoutMs <= 27000 &&
                         timeoutMs == static_cast<double>(static_cast<std::uint64_t>(timeoutMs)), "cleanup_unknown");
             FILETIME wallTime{};
             GetSystemTimeAsFileTime(&wallTime);

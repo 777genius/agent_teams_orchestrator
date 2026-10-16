@@ -1,5 +1,5 @@
 import { boundOpenCodeRead } from '../transport/OpenCodeBoundedFetch.js'
-import { executionHash, executionRecord } from '../execution/OpenCodeV2ExecutionContracts.js'
+import { executionHash, executionRecord, OPEN_CODE_V2_WINDOWS_CLOSE_MS } from '../execution/OpenCodeV2ExecutionContracts.js'
 import type { ExecutionBirth } from './OpenCodeV2ExecutionBinding.js'
 import { executionPlatformRetirementBudgetMs, requireExecutionPlatformRetirement } from './OpenCodeV2ExecutionPlatform.js'
 import { retainOpenCodeV2CleanupPhase, type ExecutionCleanupPhase } from '../execution/OpenCodeV2Diagnostics.js'
@@ -31,11 +31,11 @@ export function executionClosedAck(value: unknown, nonce: string, pid: number, b
 export async function retireExecutionChild(port: ExecutionRetirementPort, deadline?: number,
   observe?: (phase: ExecutionCleanupPhase) => void): Promise<ExecutionCleanupReceipt> {
   const mark = (phase: ExecutionCleanupPhase) => { try { observe?.(phase) } catch { /* Observation cannot alter cleanup. */ } }
-  // Windows Stop already owns a 22s physical-close window. Pass that SAME
+  // Windows Stop supplies a physical-close slice of its original 29s. Pass that SAME
   // absolute deadline through every wait and the native RPC; never restart it.
   // Standalone and POSIX retirement retain their original adapter budgets.
   const closeDeadline = process.platform === 'win32' && Number.isSafeInteger(deadline)
-    ? Math.min(deadline!, Date.now() + 22_000) : undefined
+    ? Math.min(deadline!, Date.now() + OPEN_CODE_V2_WINDOWS_CLOSE_MS) : undefined
   const remaining = (maximum: number) => closeDeadline === undefined ? maximum
     : Math.max(1, Math.min(maximum, closeDeadline - Date.now()))
   // Expiry cannot skip the owned job-stop attempt. Its existing private default

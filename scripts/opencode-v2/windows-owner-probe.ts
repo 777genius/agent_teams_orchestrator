@@ -1398,7 +1398,7 @@ $daclBytes=[byte[]]::new($raw.DiscretionaryAcl.BinaryLength);$raw.DiscretionaryA
       }
       // Invalid optional budgets must refuse before mutating the live Scope.
       const budgetPeer = peers[0]!
-      await assert.rejects(budgetPeer.broker.request('retire', { deadline: Date.now() + 22_000, timeoutMs: 22_001 }), /cleanup_unknown/)
+      await assert.rejects(budgetPeer.broker.request('retire', { deadline: Date.now() + 27_000, timeoutMs: 27_001 }), /cleanup_unknown/)
       assert.deepEqual(await budgetPeer.broker.request('assertLive'), budgetPeer.mapping)
       facts.retirementBudgetMalformedRefused = true
       for (const peer of peers) assert.deepEqual(await peer.broker.request('assertLive'), peer.mapping)
@@ -1419,7 +1419,10 @@ $daclBytes=[byte[]]::new($raw.DiscretionaryAcl.BinaryLength);$raw.DiscretionaryA
       try {
         if (peer.mapping) {
           facts.projectCohortCleanupStage = 'member_retirement'
-          const receipt = executionRecord(await peer.broker.request('retire'))
+          const retirementDeadline = Date.now() + 27_000
+          const receipt = executionRecord(await peer.broker.request('retire',
+            { deadline: retirementDeadline, timeoutMs: 27_000 }, retirementDeadline))
+          assert.ok(Date.now() < retirementDeadline)
           assert.equal(receipt.empty, true); assert.equal(receipt.activeProcesses, 0)
           assert.equal(receipt.heldProcessExited, true); assert.equal(receipt.ownAcesRemoved, true)
           assert.deepEqual(receipt.mapping, peer.mapping)

@@ -12,7 +12,7 @@ import { OpenCodeV2AdmissionService, type QueueIntent } from '../execution/OpenC
 import { isMutableExecutionReadback } from '../execution/OpenCodeV2TerminalSettlement.js'
 import { OpenCodeV2AdmissionStore } from '../execution/OpenCodeV2AdmissionStore.js'
 import { OpenCodeV2SessionService, verifyExecutionSession } from '../execution/OpenCodeV2SessionService.js'
-import { canonicalExecutionJSON, executionAssert, executionHash, executionRecord, type ExecutionContext, type SessionAuthority } from '../execution/OpenCodeV2ExecutionContracts.js'
+import { canonicalExecutionJSON, executionAssert, executionHash, executionRecord, OPEN_CODE_V2_WINDOWS_CLOSE_MS, type ExecutionContext, type SessionAuthority } from '../execution/OpenCodeV2ExecutionContracts.js'
 import { acquireExecutionLease, awaitExecutionHostReady, readExecutionCleanupObservation, type ExecutionLease } from '../host/OpenCodeV2ExecutionHost.js'
 import { isExecutionCleanupReceipt, type ExecutionCleanupReceipt } from '../host/OpenCodeV2ExecutionLifecycle.js'
 import { createOpenCodeV2ExecutionClient, type ExecutionBridgeClient, type ExecutionLog, type ExecutionMessagePage } from '../transport/OpenCodeV2ExecutionClientFactory.js'
@@ -547,7 +547,11 @@ export class OpenCodeV2RunOwner {
       catch { errors.push('readers_unknown') }
       let cleanup: RunStopMember['cleanup'] = null
       const cleanupStartedAt = Date.now()
-      const closeDeadline = Date.now() + remaining(22_000)
+      // The same 29s owner deadline funds physical close AND finalization.
+      // Windows may use up to27s, leaving one shared2s receipt-write reserve.
+      const closeDeadline = this.deferredWindowsControllers
+        ? Math.min(Date.now() + OPEN_CODE_V2_WINDOWS_CLOSE_MS, cleanupDeadline - 2000)
+        : Date.now() + remaining(22_000)
       try { cleanup = await boundOpenCodeRead(this.closeLease(member.lease, closeDeadline), Math.max(1, closeDeadline - Date.now())) }
       catch (failure) {
         errors.push('physical_cleanup_unknown')
@@ -564,7 +568,16 @@ export class OpenCodeV2RunOwner {
     }))
     if (pendingCleanup.some(result => result.status === 'rejected') || this.acquisitions.size) durable = false
     await boundOpenCodeRead(Promise.allSettled([...this.active]), remaining(1000)).catch(() => { durable = false })
-    this.state = durable && results.length === this.plan.members.length && results.every(result => result.cleanup !== null && result.errors.length === 0) ? 'stopped' : 'cleanup_unknown'
+    this.state = durable && (!this.deferredWindowsControllers || Date.now() < cleanupDeadline) &&
+      results.length === this.plan.members.length && results.every(result => result.cleanup !== null && result.errors.length === 0) ? 'stopped' : 'cleanup_unknown'
+    if (this.deferredWindowsControllers) {
+      // Persist the final state before publishing a positive stop archive.
+      // Both writes consume the SAME remaining29s, never a new2s allowance.
+      try {
+        await boundOpenCodeRead(this.persistState(), remaining(2000))
+        executionAssert(Date.now() < cleanupDeadline, 'cleanup_unknown')
+      } catch { this.state = 'cleanup_unknown' }
+    }
     const receipt: Extract<RunControlResult, { kind: 'stop' }> = { kind: 'stop', state: this.state, members: results }
     try { await boundOpenCodeRead(writeRunControlFile(this.directory, 'stop.json', { binding: this.plan.binding, receipt }), remaining(2000)) }
     catch {
@@ -573,7 +586,14 @@ export class OpenCodeV2RunOwner {
       await boundOpenCodeRead(this.persistState(), remaining(2000)).catch(() => undefined)
       this.resolveStopped(unknown); return unknown
     }
-    await boundOpenCodeRead(this.persistState(), remaining(2000)).catch(() => undefined)
+    if (!this.deferredWindowsControllers) await boundOpenCodeRead(this.persistState(), remaining(2000)).catch(() => undefined)
+    // A timely physical receipt may be read later with independent owner-exit
+    // proof, but a late write completion cannot earn THIS public success.
+    if (this.deferredWindowsControllers && Date.now() >= cleanupDeadline) {
+      this.state = 'cleanup_unknown'
+      const unknown: Extract<RunControlResult, { kind: 'stop' }> = { ...receipt, state: 'cleanup_unknown' }
+      this.resolveStopped(unknown); return unknown
+    }
     this.resolveStopped(receipt)
     return receipt
   }

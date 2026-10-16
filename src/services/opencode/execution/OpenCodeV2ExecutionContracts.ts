@@ -4,6 +4,9 @@ import { createHash } from 'node:crypto'
 export function openCodeV2RunInitializationMs(platform: NodeJS.Platform): number {
   return platform === 'win32' ? 300_000 : platform === 'darwin' ? 180_000 : 90_000
 }
+// Windows physical close shares the existing 29s owner Stop envelope. The
+// owner clips this ceiling to leave 2s for the final durable run receipt.
+export const OPEN_CODE_V2_WINDOWS_CLOSE_MS = 27_000
 
 export type ExecutionPin = '2.0.0' | '2.0.21'
 export type ExecutionBirth = Readonly<{ format: 'linux-start-ticks' | 'darwin-pidversion' | 'windows-filetime' | 'utc-ms'; value: string; bootId: string | null }>

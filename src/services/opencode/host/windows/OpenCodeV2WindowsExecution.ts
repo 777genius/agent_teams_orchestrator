@@ -8,6 +8,7 @@ import { createWindowsNativeBroker, resolveWindowsNativeArtifact, resolveWindows
 import { createWindowsOwnerFilesystem } from './OpenCodeV2WindowsOwnerFilesystem.js'
 import { createWindowsExecutionHttpClient } from './OpenCodeV2WindowsHTTP.js'
 import { executionNativeRetirementPhases, type ExecutionNativeRetirementPhase } from '../../execution/OpenCodeV2Diagnostics.js'
+import { OPEN_CODE_V2_WINDOWS_CLOSE_MS } from '../../execution/OpenCodeV2ExecutionContracts.js'
 
 function assert(value: unknown, code = 'execution_containment_unqualified'): asserts value { if (!value) throw new Error(code) }
 function row(value: unknown): Record<string, unknown> { assert(value && typeof value === 'object' && !Array.isArray(value), 'execution_invalid_response'); return value as Record<string, unknown> }
@@ -117,7 +118,7 @@ export async function retireWindowsNativeScope(broker: Pick<WindowsNativeBroker,
     }
   }
   assert(deadline === undefined || (Number.isSafeInteger(deadline) && deadline > 0), 'cleanup_unknown')
-  const input = deadline === undefined ? {} : { deadline, timeoutMs: Math.max(0, Math.min(22_000, deadline - Date.now())) }
+  const input = deadline === undefined ? {} : { deadline, timeoutMs: Math.max(0, Math.min(OPEN_CODE_V2_WINDOWS_CLOSE_MS, deadline - Date.now())) }
   broker.events.on('retireProgress', progress)
   try { return await broker.request('retire', input, deadline !== undefined && deadline > Date.now() ? deadline : undefined) }
   catch (error) {

@@ -93,7 +93,7 @@ test('retirement keeps the original identity failure while still attempting kern
   expect(calls).toEqual(['birth', 'kernel'])
 })
 
-test('Windows uses the original 22s close deadline through native retirement and refuses expired or forged proof', async () => {
+test('Windows uses its original close slice up to27s through native retirement and refuses expired or forged proof', async () => {
   const platform = Object.getOwnPropertyDescriptor(process, 'platform')!, arch = Object.getOwnPropertyDescriptor(process, 'arch')!
   const originalBound = boundedFetch.boundOpenCodeRead, timeouts: number[] = []
   let now = 1_000_000
@@ -106,18 +106,18 @@ test('Windows uses the original 22s close deadline through native retirement and
   try {
     for (const mode of ['within', 'late', 'late_reply', 'expired', 'default'] as const) {
       now = 1_000_000; timeouts.length = 0
-      const start = now, deadline = start + 22_000, events = new EventEmitter()
+      const start = now, deadline = start + 27_000, events = new EventEmitter()
       const receipt = { pid: 73, birth, scopeClosed: true }
       let observed: number | undefined, finished = false, attempted = false
       const port = retirement(Promise.resolve(receipt))
-      port.disposeTransport = async () => { now += mode === 'expired' ? 23_000 : 2000 }
+      port.disposeTransport = async () => { now += mode === 'expired' ? 28_000 : 2000 }
       port.readBirth = async () => { now += 500; return null }
       port.retireOwnedDescendants = nativeDeadline => retireWindowsNativeScope({ events,
         request: async (_operation, _input, requestedDeadline) => {
           attempted = true; observed = requestedDeadline
           const actualDeadline = requestedDeadline ?? now + 15_000
           await Promise.resolve() // The lifecycle installs its outer wait BEFORE the native reply.
-          now = Math.max(now, start + (mode === 'late' || mode === 'late_reply' ? 22_001 : mode === 'within' ? 20_500 : 18_000))
+          now = Math.max(now, start + (mode === 'late' || mode === 'late_reply' ? 27_001 : mode === 'within' ? 25_000 : 18_000))
           if (mode !== 'late_reply' && now >= actualDeadline) throw new Error('execution_native_timeout')
           finished = true; return receipt
         } }, 'TEST-original', nativeDeadline)
@@ -127,8 +127,8 @@ test('Windows uses the original 22s close deadline through native retirement and
       expect(error?.message).toBe('cleanup_unknown')
       if (mode === 'within') {
         expect(observed).toBe(deadline); expect(finished).toBe(true)
-        expect(now - start).toBe(20_500) // 18s native work after2.5s preparation, inside the SAME22s.
-        expect(timeouts.at(-1)).toBe(19_500) // Remaining original22s, beyond the old16s outer cap.
+        expect(now - start).toBe(25_000) // 22.5s native work after2.5s preparation, inside the SAME27s slice.
+        expect(timeouts.at(-1)).toBe(24_500) // Remaining original slice, beyond the old22s cap.
         expect(error?.cause?.message).toBe('cleanup_unknown') // Only the unbranded receipt is refused.
       } else if (mode === 'default') {
         expect(observed).toBeUndefined(); expect(finished).toBe(false)

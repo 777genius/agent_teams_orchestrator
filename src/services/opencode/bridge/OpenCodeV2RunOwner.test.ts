@@ -17,6 +17,8 @@ import type { QueueIntent } from '../execution/OpenCodeV2AdmissionService.js'
 import * as runControl from './OpenCodeV2RunControl.js'
 import * as atomicWrite from '../../../utils/atomicWrite.js'
 import type { ExecutionLease } from '../host/OpenCodeV2ExecutionHost.js'
+import * as executionLifecycle from '../host/OpenCodeV2ExecutionLifecycle.js'
+import * as boundedFetch from '../transport/OpenCodeBoundedFetch.js'
 
 // These tests cross the real durable session/admission boundary with fake
 // native/lease ports. They neither import an official server nor mint a native
@@ -383,7 +385,7 @@ test('Windows original lease arriving after the public stop snapshot is still cl
   } finally { gate.release(); await f.close() }
 })
 
-test('Windows Stop forwards its original 22s physical close deadline once while POSIX keeps adapter defaults', async () => {
+test('Windows Stop shares its original 29s envelope with a 27s physical slice while POSIX keeps adapter defaults', async () => {
   for (const windowsAcquisitions of [true, false]) {
     const closes: (number | undefined)[] = []
     const f = await fixture({ windowsAcquisitions, leaseClose: deadline => { closes.push(deadline) } })
@@ -393,11 +395,55 @@ test('Windows Stop forwards its original 22s physical close deadline once while 
       const start = Date.now()
       clock = spyOn(Date, 'now').mockReturnValue(start)
       const stopped = await f.owner.stop()
-      expect(closes).toEqual([windowsAcquisitions ? start + 22_000 : undefined])
+      expect(closes).toEqual([windowsAcquisitions ? start + 27_000 : undefined])
       expect(stopped.state).toBe('cleanup_unknown') // Same-fields fake receipts still confer no physical proof.
       expect((await f.owner.stop())).toBe(stopped)
       expect(f.counters.closed).toBe(1)
     } finally { clock?.mockRestore(); await f.close() }
+  }
+})
+
+test('Windows Stop clips physical work and finalization to the same original 29s deadline', async () => {
+  for (const mode of ['within', 'expired_close', 'persist_failed', 'persist_late', 'archive_late'] as const) {
+    let now = Date.now(), start = now, observed: number | undefined
+    const writes: string[] = []
+    const f = await fixture({ windowsAcquisitions: true, leaseClose: deadline => { observed = deadline },
+      nativeRetirement: async () => { await Promise.resolve(); now = start + (mode === 'expired_close' ? 27_000 : 25_000) } })
+    let clock: ReturnType<typeof spyOn> | undefined, write: ReturnType<typeof spyOn> | undefined
+    let trusted: ReturnType<typeof spyOn> | undefined, bounded: ReturnType<typeof spyOn> | undefined
+    try {
+      await f.owner.ready(); start = now = Date.now()
+      clock = spyOn(Date, 'now').mockImplementation(() => now)
+      // Deliberately let waits resolve: the original absolute expiry guards
+      // must also reject when a timer callback loses to a late completion.
+      bounded = spyOn(boundedFetch, 'boundOpenCodeRead').mockImplementation(function<T>(work: Promise<T>) { return work })
+      // Exercise owner orchestration with a trusted TEST port. This stub cannot
+      // mint a production physical receipt or replace native proof tests.
+      trusted = spyOn(executionLifecycle, 'isExecutionCleanupReceipt').mockReturnValue(true)
+      const interrupt = f.native.interrupt
+      f.native.interrupt = async id => { now += 3000; return interrupt(id) }
+      const originalWrite = runControl.writeRunControlFile
+      write = spyOn(runControl, 'writeRunControlFile').mockImplementation(async (directory, name, value) => {
+        if (f.counters.closed && name === 'state.json') {
+          writes.push('state')
+          if (mode === 'persist_failed') throw new Error('TEST_persist_failed')
+        }
+        if (name === 'stop.json') writes.push('stop')
+        await originalWrite(directory, name, value)
+        if (f.counters.closed && (mode === 'persist_late' && name === 'state.json' || mode === 'archive_late' && name === 'stop.json')) now = start + 29_000
+        else if (f.counters.closed) now += 500
+      })
+      const stopped = await f.owner.stop()
+      expect(observed).toBe(start + 27_000) // Three pre-close seconds consume this slice, never add to it.
+      expect(f.counters.closed).toBe(1)
+      expect(writes).toEqual(['state', 'stop']) // Shared finalization reserve, no second public persistence window.
+      expect(stopped.state).toBe(mode === 'within' ? 'stopped' : 'cleanup_unknown')
+      const archived = JSON.parse(await readFile(path.join(f.directory, 'stop.json'), 'utf8'))
+      expect(archived.receipt.state).toBe(mode === 'within' || mode === 'archive_late' ? 'stopped' : 'cleanup_unknown')
+      expect(await f.owner.stop()).toBe(stopped); expect(f.counters.closed).toBe(1)
+    } finally {
+      write?.mockRestore(); trusted?.mockRestore(); bounded?.mockRestore(); clock?.mockRestore(); await f.close()
+    }
   }
 })
 
