@@ -14,7 +14,7 @@ export function isExecutionCleanupReceipt(value: unknown): value is ExecutionCle
 export type ExecutionRetirementPort = {
   pid: number; birth: ExecutionBirth; exited(): boolean; acknowledged(): boolean
   disposeTransport(): Promise<void>; sendClose(): void; waitExit: Promise<void>
-  readBirth(): Promise<ExecutionBirth | null>; kill(): void | Promise<void>; retireOwnedDescendants(): Promise<unknown>
+  readBirth(): Promise<ExecutionBirth | null>; kill(deadline?: number): void | Promise<void>; retireOwnedDescendants(deadline?: number): Promise<unknown>
 }
 export function executionClosedAck(value: unknown, nonce: string, pid: number, birth: ExecutionBirth): boolean {
   try {
@@ -28,29 +28,47 @@ export function executionClosedAck(value: unknown, nonce: string, pid: number, b
  * Scope cleanup. Positive receipts additionally require a concrete launch-owned
  * kernel receipt that carries the privately verified close acknowledgment.
  */
-export async function retireExecutionChild(port: ExecutionRetirementPort): Promise<ExecutionCleanupReceipt> {
+export async function retireExecutionChild(port: ExecutionRetirementPort, deadline?: number): Promise<ExecutionCleanupReceipt> {
+  // Windows Stop already owns a 22s physical-close window. Pass that SAME
+  // absolute deadline through every wait and the native RPC; never restart it.
+  // Standalone and POSIX retirement retain their original adapter budgets.
+  const closeDeadline = process.platform === 'win32' && Number.isSafeInteger(deadline)
+    ? Math.min(deadline!, Date.now() + 22_000) : undefined
+  const remaining = (maximum: number) => closeDeadline === undefined ? maximum
+    : Math.max(1, Math.min(maximum, closeDeadline - Date.now()))
+  // Expiry cannot skip the owned job-stop attempt. Its existing private default
+  // may finish in the background, but expired public evidence stays UNKNOWN.
+  const nativeDeadline = () => closeDeadline !== undefined && Date.now() < closeDeadline ? closeDeadline : undefined
   const fail = (phase: ExecutionCleanupPhase, cause?: unknown): never => {
     const error = new Error('cleanup_unknown', { cause })
     retainOpenCodeV2CleanupPhase(error, phase)
     throw error
   }
   const failures: { error: unknown; phase: ExecutionCleanupPhase }[] = []
-  try { await boundOpenCodeRead(port.disposeTransport(), 3000) } catch (error) { failures.push({ error, phase: 'dispose-transport' }) }
+  try { await boundOpenCodeRead(port.disposeTransport(), remaining(3000)) } catch (error) { failures.push({ error, phase: 'dispose-transport' }) }
   try { if (!port.exited()) port.sendClose() } catch (error) { failures.push({ error, phase: 'send-close' }) }
-  try { await boundOpenCodeRead(port.waitExit, 10_000) } catch {
+  try { await boundOpenCodeRead(port.waitExit, remaining(10_000)) } catch {
     try {
-      const birth = await boundOpenCodeRead(port.readBirth(), 1500)
-      if (!port.exited() && birth !== null && executionHash(birth) === executionHash(port.birth)) await port.kill()
+      const birth = await boundOpenCodeRead(port.readBirth(), remaining(1500))
+      if (!port.exited() && birth !== null && executionHash(birth) === executionHash(port.birth)) {
+        const work = port.kill(nativeDeadline())
+        if (closeDeadline === undefined) await work
+        else await boundOpenCodeRead(Promise.resolve(work), remaining(Infinity))
+      }
     } catch (error) { failures.push({ error, phase: 'force-kill' }) }
-    try { await boundOpenCodeRead(port.waitExit, 2000) } catch (error) { failures.push({ error, phase: 'wait-exit' }) }
+    try { await boundOpenCodeRead(port.waitExit, remaining(2000)) } catch (error) { failures.push({ error, phase: 'wait-exit' }) }
   }
   let retired = false
   try {
-    const birth = await boundOpenCodeRead(port.readBirth(), 1500)
+    const birth = await boundOpenCodeRead(port.readBirth(), remaining(1500))
     retired = port.exited() && (birth === null || executionHash(birth) !== executionHash(port.birth))
   } catch (error) { failures.push({ error, phase: 'read-birth' }) }
   let kernel: unknown
-  try { kernel = await boundOpenCodeRead(port.retireOwnedDescendants(), executionPlatformRetirementBudgetMs()) } catch (error) { failures.push({ error, phase: 'kernel-retirement' }) }
+  try {
+    kernel = await boundOpenCodeRead(port.retireOwnedDescendants(nativeDeadline()),
+      closeDeadline === undefined ? executionPlatformRetirementBudgetMs() : remaining(Infinity))
+    if (closeDeadline !== undefined && Date.now() >= closeDeadline) throw new Error('execution_timeout')
+  } catch (error) { failures.push({ error, phase: 'kernel-retirement' }) }
   if (failures.length > 0) {
     fail(failures[0]!.phase, failures[0]!.error)
   }
@@ -60,6 +78,7 @@ export async function retireExecutionChild(port: ExecutionRetirementPort): Promi
   try { evidence = requireExecutionPlatformRetirement(kernel) }
   catch (error) { fail('kernel-proof', error) }
   if (evidence.pid !== port.pid || executionHash(evidence.birth) !== executionHash(port.birth)) fail('kernel-binding')
+  if (closeDeadline !== undefined && Date.now() >= closeDeadline) fail('kernel-retirement', new Error('execution_timeout'))
   const receipt: ExecutionCleanupReceipt = Object.freeze({ scopeClosed: true, processRetired: true,
     descendantsRetired: true, pid: evidence.pid, birth: evidence.birth })
   cleanupReceipts.add(receipt)

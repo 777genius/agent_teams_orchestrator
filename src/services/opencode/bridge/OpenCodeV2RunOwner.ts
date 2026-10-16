@@ -256,10 +256,11 @@ export class OpenCodeV2RunOwner {
     } finally { clearTimeout(initializationTimer) }
   }
   async ready(): Promise<void> { await this.initialization }
-  private closeLease(lease: ExecutionLease): Promise<ExecutionCleanupReceipt> {
+  private closeLease(lease: ExecutionLease, deadline?: number): Promise<ExecutionCleanupReceipt> {
     const existing = this.closing.get(lease)
     if (existing) return existing
-    const work = Promise.resolve().then(() => lease.close()).then(receipt => {
+    const work = Promise.resolve().then(() => lease.close(this.deferredWindowsControllers ? deadline : undefined)).then(receipt => {
+      executionAssert(!this.deferredWindowsControllers || deadline === undefined || Date.now() < deadline, 'cleanup_unknown')
       // A returned acknowledgement or same-fields object is not a measured
       // R247 physical retirement receipt. Check the process-owned receipt
       // before serialization and bind it to this exact lease's child birth.
@@ -544,7 +545,8 @@ export class OpenCodeV2RunOwner {
       catch { errors.push('readers_unknown') }
       let cleanup: RunStopMember['cleanup'] = null
       const cleanupStartedAt = Date.now()
-      try { cleanup = await boundOpenCodeRead(this.closeLease(member.lease), remaining(22_000)) }
+      const closeDeadline = Date.now() + remaining(22_000)
+      try { cleanup = await boundOpenCodeRead(this.closeLease(member.lease, closeDeadline), Math.max(1, closeDeadline - Date.now())) }
       catch (failure) {
         errors.push('physical_cleanup_unknown')
         // Best-effort observation never extends the original physical stop budget.

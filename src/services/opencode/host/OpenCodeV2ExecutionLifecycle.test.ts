@@ -1,6 +1,7 @@
 import { EventEmitter } from 'node:events'
-import { expect, mock, test } from 'bun:test'
+import { expect, mock, spyOn, test } from 'bun:test'
 import type { ExecutionRetirementPort } from './OpenCodeV2ExecutionLifecycle.js'
+import * as boundedFetch from '../transport/OpenCodeBoundedFetch.js'
 
 let identityResponse: Record<string, unknown> = {}
 let identityRequests = 0
@@ -49,6 +50,59 @@ test('retirement keeps the original identity failure while still attempting kern
   expect(error?.message).toBe('cleanup_unknown')
   expect(error?.cause).toBe(failure)
   expect(calls).toEqual(['birth', 'kernel'])
+})
+
+test('Windows uses the original 22s close deadline through native retirement and refuses expired or forged proof', async () => {
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform')!, arch = Object.getOwnPropertyDescriptor(process, 'arch')!
+  const originalBound = boundedFetch.boundOpenCodeRead, timeouts: number[] = []
+  let now = 1_000_000
+  const clock = spyOn(Date, 'now').mockImplementation(() => now)
+  const bounded = spyOn(boundedFetch, 'boundOpenCodeRead').mockImplementation(function<T>(work: Promise<T>, ms: number, signal?: AbortSignal) {
+    timeouts.push(ms); return originalBound(work, ms, signal)
+  })
+  Object.defineProperty(process, 'platform', { ...platform, value: 'win32' })
+  Object.defineProperty(process, 'arch', { ...arch, value: 'x64' })
+  try {
+    for (const mode of ['within', 'late', 'late_reply', 'expired', 'default'] as const) {
+      now = 1_000_000; timeouts.length = 0
+      const start = now, deadline = start + 22_000, events = new EventEmitter()
+      const receipt = { pid: 73, birth, scopeClosed: true }
+      let observed: number | undefined, finished = false, attempted = false
+      const port = retirement(Promise.resolve(receipt))
+      port.disposeTransport = async () => { now += mode === 'expired' ? 23_000 : 2000 }
+      port.readBirth = async () => { now += 500; return null }
+      port.retireOwnedDescendants = nativeDeadline => retireWindowsNativeScope({ events,
+        request: async (_operation, _input, requestedDeadline) => {
+          attempted = true; observed = requestedDeadline
+          const actualDeadline = requestedDeadline ?? now + 15_000
+          await Promise.resolve() // The lifecycle installs its outer wait BEFORE the native reply.
+          now = Math.max(now, start + (mode === 'late' || mode === 'late_reply' ? 22_001 : mode === 'within' ? 20_500 : 18_000))
+          if (mode !== 'late_reply' && now >= actualDeadline) throw new Error('execution_native_timeout')
+          finished = true; return receipt
+        } }, 'TEST-original', nativeDeadline)
+      const error = await retireExecutionChild(port, mode === 'default' ? undefined : deadline).then(() => undefined, error => error)
+      expect(attempted).toBe(true)
+      expect(isExecutionCleanupReceipt(receipt)).toBe(false)
+      expect(error?.message).toBe('cleanup_unknown')
+      if (mode === 'within') {
+        expect(observed).toBe(deadline); expect(finished).toBe(true)
+        expect(now - start).toBe(20_500) // 18s native work after2.5s preparation, inside the SAME22s.
+        expect(timeouts.at(-1)).toBe(19_500) // Remaining original22s, beyond the old16s outer cap.
+        expect(error?.cause?.message).toBe('cleanup_unknown') // Only the unbranded receipt is refused.
+      } else if (mode === 'default') {
+        expect(observed).toBeUndefined(); expect(finished).toBe(false)
+        expect(timeouts.at(-1)).toBe(16_000)
+        expect(error?.cause?.message).toBe('execution_native_timeout')
+      } else {
+        expect(finished).toBe(mode === 'expired' || mode === 'late_reply')
+        expect(observed).toBe(mode === 'expired' ? undefined : deadline)
+        expect(error?.cause?.message).toBe(mode === 'expired' || mode === 'late_reply' ? 'execution_timeout' : 'execution_native_timeout')
+      }
+    }
+  } finally {
+    bounded.mockRestore(); clock.mockRestore()
+    Object.defineProperty(process, 'platform', platform); Object.defineProperty(process, 'arch', arch)
+  }
 })
 
 // Previously the outer four-second timeout abandoned native reaping before its

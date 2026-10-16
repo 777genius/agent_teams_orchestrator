@@ -38,6 +38,7 @@ async function fixture(options: { unknown?: boolean; foreignClient?: boolean; cr
   probe?: boolean; promptBarrier?: Promise<void>; closeBarrier?: Promise<void>; permissionResources?: string[];
   lifetimeMs?: number; twoMembers?: boolean; memberCount?: number; preparation?: () => void; startup?: () => void;
   windowsAcquisitions?: boolean;
+  leaseClose?: (deadline: number | undefined) => void;
   parentPreparation?: (memberId: string, signal: AbortSignal | undefined) => Promise<void>;
   acquisition?: (memberId: string, signal: AbortSignal | undefined) => Promise<void>;
   permissions?: import('../host/OpenCodeV2ExecutionBinding.js').ExecutionSelection['permissions'] } = {}) {
@@ -132,8 +133,9 @@ async function fixture(options: { unknown?: boolean; foreignClient?: boolean; cr
       const start = async (): Promise<ExecutionLease> => {
         counters.acquired++
         await options.acquisition?.(context.memberId!, context.signal)
-        return { authority: owned, signal: new AbortController().signal, close: async () => {
+        return { authority: owned, signal: new AbortController().signal, close: async deadline => {
           counters.closed++
+          options.leaseClose?.(deadline)
           resolveClosing(); await options.closeBarrier
           return { scopeClosed: true, processRetired: true, descendantsRetired: true, pid: authority.child.pid, birth: authority.child.birth }
         } }
@@ -298,8 +300,8 @@ test('Windows stop refuses queued acquisition and joins the late original lease'
 })
 
 test('Windows original lease arriving after the public stop snapshot is still closed exactly once', async () => {
-  const gate = acquisitionGate(), started: string[] = []
-  const f = await fixture({ windowsAcquisitions: true, memberCount: 3, acquisition: async member => {
+  const gate = acquisitionGate(), started: string[] = [], deadlines: (number | undefined)[] = []
+  const f = await fixture({ windowsAcquisitions: true, memberCount: 3, leaseClose: deadline => { deadlines.push(deadline) }, acquisition: async member => {
     started.push(member); await gate.promise
   } })
   try {
@@ -313,7 +315,26 @@ test('Windows original lease arriving after the public stop snapshot is still cl
     expect(f.counters).toMatchObject({ acquired: 1, closed: 1, clients: 0, sessions: 0, prompted: 0 })
     await f.owner.stop()
     expect(f.counters.closed).toBe(1)
+    expect(deadlines).toEqual([undefined]) // Late owned cleanup retains its original private attempt.
   } finally { gate.release(); await f.close() }
+})
+
+test('Windows Stop forwards its original 22s physical close deadline once while POSIX keeps adapter defaults', async () => {
+  for (const windowsAcquisitions of [true, false]) {
+    const closes: (number | undefined)[] = []
+    const f = await fixture({ windowsAcquisitions, leaseClose: deadline => { closes.push(deadline) } })
+    let clock: ReturnType<typeof spyOn> | undefined
+    try {
+      await f.owner.ready()
+      const start = Date.now()
+      clock = spyOn(Date, 'now').mockReturnValue(start)
+      const stopped = await f.owner.stop()
+      expect(closes).toEqual([windowsAcquisitions ? start + 22_000 : undefined])
+      expect(stopped.state).toBe('cleanup_unknown') // Same-fields fake receipts still confer no physical proof.
+      expect((await f.owner.stop())).toBe(stopped)
+      expect(f.counters.closed).toBe(1)
+    } finally { clock?.mockRestore(); await f.close() }
+  }
 })
 
 test('Windows queued acquisition retains the original deadline and refuses expired work', async () => {

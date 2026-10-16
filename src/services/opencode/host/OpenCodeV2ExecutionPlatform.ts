@@ -24,7 +24,7 @@ export type ExecutionPlatformLaunch = Readonly<{
   start(payload: Readonly<Record<string, unknown>>, deadline: number, signal?: AbortSignal): Promise<void>
   assertLive(): Promise<void>; sendClose(): void; acknowledged(): boolean
   readBirth?(): Promise<ExecutionBirth | null>
-  kill(): void | Promise<void>; retire(): Promise<unknown>
+  kill(deadline?: number): void | Promise<void>; retire(deadline?: number): Promise<unknown>
 }>
 type ExecutionPlatformPlan =
   | Readonly<{ platform: 'linux'; concrete: Awaited<ReturnType<typeof planLinuxExecution>> }>

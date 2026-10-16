@@ -49,7 +49,7 @@ export function registerExecutionDisposer(authority: ExecutionAuthority, dispose
   return () => { rows.delete(dispose) }
 }
 export type ExecutionLease = Readonly<{
-  authority: ExecutionAuthority; signal: AbortSignal; close(): Promise<ExecutionCleanupReceipt>
+  authority: ExecutionAuthority; signal: AbortSignal; close(deadline?: number): Promise<ExecutionCleanupReceipt>
 }>
 /** One run may serialize its native/start slice while preparing graphs in parallel. */
 export type ExecutionStartupGate = (start: () => Promise<ExecutionLease>, signal?: AbortSignal) => Promise<ExecutionLease>
@@ -257,7 +257,7 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
   let exited = false, closeWork: Promise<ExecutionCleanupReceipt> | undefined
   let exitResolve: () => void = () => undefined
   const exit = new Promise<void>(resolve => { exitResolve = resolve })
-  const close = (): Promise<ExecutionCleanupReceipt> => closeWork ??= (async () => {
+  const close = (deadline?: number): Promise<ExecutionCleanupReceipt> => closeWork ??= (async () => {
     lifetime.abort()
     if (authority) { endpoints.delete(authority); graphs.delete(authority) }
     context.signal?.removeEventListener('abort', abort)
@@ -281,12 +281,13 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
         executionAssert(results.every(result => result.status === 'fulfilled'), 'cleanup_unknown')
       },
       sendClose: () => launch!.sendClose(), waitExit: exit,
-      readBirth: () => launch!.readBirth ? launch!.readBirth() : readExecutionBirth(mapping!.bun.hostPID), kill: () => launch!.kill(),
-      retireOwnedDescendants: () => launch!.retire() })
+      readBirth: () => launch!.readBirth ? launch!.readBirth() : readExecutionBirth(mapping!.bun.hostPID), kill: deadline => launch!.kill(deadline),
+      retireOwnedDescendants: deadline => launch!.retire(deadline) }, deadline)
     // UNKNOWN never releases the physical profile/database fence.
     await owner.release(receipt)
     await closeRetainedRoots()
     await closePlanOnce()
+    executionAssert(process.platform !== 'win32' || deadline === undefined || Date.now() < deadline, 'execution_timeout')
     return receipt
   })()
   const abort = () => { lifetime.abort(); void close().catch(() => undefined) }

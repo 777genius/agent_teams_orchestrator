@@ -102,9 +102,9 @@ export function createWindowsCommandRequestHandler(options: Readonly<{
   }
 }
 /** Progress is diagnostic only and belongs to the original launch nonce. It
- * cannot qualify a receipt or extend the existing native request deadline. */
+ * cannot qualify a receipt or extend the caller's original close deadline. */
 export async function retireWindowsNativeScope(broker: Pick<WindowsNativeBroker, 'events' | 'request'>,
-  nonce: string): Promise<unknown> {
+  nonce: string, deadline?: number): Promise<unknown> {
   const phases = new Set(['retire_job', 'retire_wait', 'retire_io_join', 'retire_main_exit',
     'retire_owned_pair', 'retire_commands', 'retire_receipt', 'retire_grants',
     'retire_grants_dll', 'retire_grants_roots', 'retire_grants_metadata'])
@@ -116,7 +116,7 @@ export async function retireWindowsNativeScope(broker: Pick<WindowsNativeBroker,
       typeof record.phase === 'string' && phases.has(record.phase)) phase = record.phase
   }
   broker.events.on('retireProgress', progress)
-  try { return await broker.request('retire') }
+  try { return await broker.request('retire', {}, deadline) }
   catch (error) {
     if (error instanceof Error && error.message === 'execution_native_timeout' && phase)
       throw new Error(`execution_native_timeout:${phase}:0`, { cause: error })
@@ -481,10 +481,11 @@ export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, l
     sendClose() { assert(mapping); stopped = true; void http.close().then(() => broker!.request('send', { value: { type: 'close', nonce, leaseOwnerId } })).catch(() => child.emit('error', new Error('cleanup_unknown'))) },
     acknowledged: () => closed,
     readBirth() { assert(mapping && mainExit, 'execution_identity_mismatch'); return mainExit.readBirth() },
-    async kill() { stopped = true; await broker!.request('retire') },
-    retire(): Promise<WindowsKernelRetirement> {
+    async kill(deadline?: number) { stopped = true; await broker!.request('retire', {}, deadline !== undefined && deadline > Date.now() ? deadline : undefined) },
+    retire(deadline?: number): Promise<WindowsKernelRetirement> {
       return retirement ??= (async () => {
-        stopped = true; const observed = row(await launch), receipt = row(await retireWindowsNativeScope(broker!, nonce))
+        stopped = true; const observed = row(await launch), receipt = row(await retireWindowsNativeScope(broker!, nonce,
+          deadline !== undefined && deadline > Date.now() ? deadline : undefined))
         assert(mapping && equal(receipt.mapping, observed) && receipt.empty === true && receipt.activeProcesses === 0 && receipt.heldProcessExited === true && receipt.ownedPairClosed === true && receipt.ownAcesRemoved === true, 'cleanup_unknown')
         const value = Object.freeze({ pid: mapping.bun.hostPID, birth: mapping.bun.birth, mapping, scopeClosed: closed, activeProcesses: 0 as const, heldProcessExited: true as const, ownAcesRemoved: true as const })
         retirements.add(value); return value
