@@ -1,0 +1,91 @@
+name: OpenCode Windows identity e2e
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - src/utils/windowsNativeProcess.ts
+      - src/services/opencode/OpenCodeCursorAgentTreeKill.ts
+      - src/services/opencode/compatibility/OpenCodeVersionProbe.ts
+      - scripts/opencode-windows-identity-e2e.ts
+      - .github/workflows/opencode-windows-identity-e2e.yml
+permissions:
+  contents: read
+env:
+  OPENCODE_NPM_VERSION: '1.19.2'
+  BASELINE_RUNTIME: '0.0.122'
+jobs:
+  windows-identity:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-2022, platform: win32-x64 }
+          - { os: windows-2025, platform: win32-x64 }
+          - { os: windows-11-arm, platform: win32-arm64 }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Enable long paths
+        run: git config --global core.longpaths true
+      # Same Bun and compile command as the published runtime.
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - name: Compile candidate runtime from this commit
+        shell: pwsh
+        run: |
+          bun install --frozen-lockfile --linker hoisted
+          if ($LASTEXITCODE -ne 0) { throw 'Dependency install failed' }
+          bun run compile
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate compile failed' }
+          "CANDIDATE=$((Resolve-Path dist/cli.exe).Path)" >> $env:GITHUB_ENV
+      - name: Prepare genuine npm OpenCode and verified public baseline
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP "TEST-opencode-identity-$env:GITHUB_RUN_ID"
+          New-Item -ItemType Directory $root | Out-Null
+          npm install --prefix "$root/npm" --no-audit --no-fund "opencode-ai@$env:OPENCODE_NPM_VERSION"
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned npm install failed' }
+          $dest = Join-Path $root 'baseline'
+          New-Item -ItemType Directory $dest | Out-Null
+          $archive = "agent-teams-runtime-$env:PLATFORM-v$env:BASELINE_RUNTIME.zip"
+          $sums = "agent-teams-runtime-SHA256SUMS-v$env:BASELINE_RUNTIME"
+          gh release download "runtime-v$env:BASELINE_RUNTIME" --repo 777genius/agent_teams_orchestrator_binaries --pattern $archive --pattern $sums --dir $dest
+          if ($LASTEXITCODE -ne 0) { throw 'Public runtime download failed' }
+          $line = Get-Content "$dest/$sums" | Where-Object { $_ -match "  $([regex]::Escape($archive))$" }
+          if (@($line).Count -ne 1) { throw 'Missing exact archive checksum' }
+          if ((Get-FileHash "$dest/$archive" -Algorithm SHA256).Hash.ToLowerInvariant() -ne ($line -split '\s+')[0]) { throw 'Archive checksum mismatch' }
+          Expand-Archive "$dest/$archive" "$dest/payload"
+          $binary = @(Get-ChildItem "$dest/payload" -Filter claude-multimodel.exe -Recurse)
+          if ($binary.Count -ne 1) { throw 'Ambiguous runtime executable' }
+          "BASELINE=$($binary[0].FullName)" >> $env:GITHUB_ENV
+          "TEST_ROOT=$root" >> $env:GITHUB_ENV
+          "TEST_SHIM=$root/npm/node_modules/.bin/opencode.cmd" >> $env:GITHUB_ENV
+          "TEST_NATIVE=$root/npm/node_modules/opencode-ai/bin/opencode.exe" >> $env:GITHUB_ENV
+      - name: Typecheck the standalone e2e harness
+        shell: pwsh
+        run: |
+          npm install --prefix "$env:TEST_ROOT/types" --no-audit --no-fund typescript@6.0.2 @types/node@24.19.2
+          if ($LASTEXITCODE -ne 0) { throw 'Typecheck dependency install failed' }
+          node "$env:TEST_ROOT/types/node_modules/typescript/bin/tsc" --ignoreConfig --noEmit --strict --skipLibCheck --target esnext --module nodenext --types node --typeRoots "$env:TEST_ROOT/types/node_modules/@types" scripts/opencode-windows-identity-e2e.ts
+          if ($LASTEXITCODE -ne 0) { throw 'Harness typecheck failed' }
+      - name: Load the OpenCode catalog idle and under CPU contention
+        run: node scripts/opencode-windows-identity-e2e.ts "$env:TEST_ROOT" "$env:TEST_SHIM" "$env:TEST_NATIVE" "$env:CANDIDATE" "$env:BASELINE"
+      - name: Preserve all outcomes including the baseline
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencode-windows-identity-${{ matrix.os }}-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/TEST-opencode-identity-*/identity-e2e-summary.json
+            ${{ runner.temp }}/TEST-opencode-identity-*/*/models.json
+          if-no-files-found: warn

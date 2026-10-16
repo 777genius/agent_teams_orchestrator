@@ -63,31 +63,15 @@ function fixture(platform: NodeJS.Platform, durations: number[], closeAt = 1, in
     removed: () => removed, elapsed: () => clock - 1_000_000 }
 }
 
-test('Windows cold process-table read beyond two seconds still requires physical close', async () => {
-  const f = fixture('win32', [2200])
-  expect(await f.run()).toBe('1.18.34\n')
-  expect(f.budgets[0]).toBeGreaterThanOrEqual(2200)
-  expect(f.budgets[0]).toBeLessThanOrEqual(5000)
-  expect(f.removed()).toBe(1)
-})
-
-test('Windows helper headroom is clipped by the original eight-second probe remainder', async () => {
-  const f = fixture('win32', [1500], 1, 4000)
-  expect(await f.run()).toBe('1.18.34\n')
-  expect(f.budgets).toEqual([4000])
-  expect(f.elapsed()).toBe(5500)
-  expect(f.removed()).toBe(1)
-})
-
-test('a hung Windows helper exhausts the original remainder without a retirement receipt', async () => {
-  const f = fixture('win32', [5000, 4000], 2)
+test('a hung helper refuses retirement and keeps private roots', async () => {
+  const f = fixture('linux', [1500, 5000], 3)
   let failure: unknown
   try { await f.run() } catch (error) { failure = error }
   expect(failure).toBeInstanceOf(OpenCodeVersionProbeCleanupError)
   expect((failure as OpenCodeVersionProbeCleanupError).message).toBe('cleanup_unknown')
   expect((failure as OpenCodeVersionProbeCleanupError).helperFailure).toMatchObject({ operation: 'tree', reason: 'helper_timeout' })
-  expect(f.budgets).toEqual([5000, 2975])
-  expect(f.elapsed()).toBe(8000)
+  expect(f.budgets).toEqual([2000, 2000])
+  expect(f.elapsed()).toBe(3525)
   expect(f.removed()).toBe(0)
 })
 
@@ -248,7 +232,7 @@ for (const mode of ['gone', 'confirmation-gone', 'stale-gone'] as const) {
     expect(f.trees()).toBeGreaterThanOrEqual(4)
     expect(f.removed()).toBe(1)
     expect(f.signalled).toEqual([])
-    expect(f.budgets.every(budget => budget > 0 && budget <= 5000)).toBe(true)
+    expect(f.budgets.every(budget => budget > 0 && budget <= 2000)).toBe(true)
     if (mode === 'stale-gone') expect(f.leafReads()).toBe(2)
   })
 }
@@ -343,7 +327,7 @@ test('Windows unanchored gone rows require independent gone checks, raw absence 
   expect(f.births()).toBe(1)
   expect(f.signals).toEqual([])
   expect(f.taskkills).toEqual([])
-  expect(f.budgets).toEqual([5000, 5000, 5000, 5000])
+  expect(f.budgets).toEqual([2000, 2000, 2000, 2000])
   expect(f.removed()).toBe(1)
 })
 
@@ -366,7 +350,7 @@ for (const mode of ['alive', 'unknown', 'orphan', 'reused', 'persistent', 'final
     expect(f.taskkills).toEqual([])
     expect(f.births()).toBe(1)
     expect(f.aliveReads).toContain(f.leaf)
-    expect(f.budgets.every(budget => budget > 0 && budget <= 5000)).toBe(true)
+    expect(f.budgets.every(budget => budget > 0 && budget <= 2000)).toBe(true)
     if (mode === 'orphan') { expect(f.trees()).toBe(2); expect(f.aliveReads).toContain(f.grandchild) }
     if (mode === 'reused') expect(f.trees()).toBe(2)
     if (mode === 'final-reappeared') expect(f.trees()).toBe(3)
@@ -384,7 +368,7 @@ test('Windows captured successful owner waits out stale gone descendants without
   expect(f.events).toEqual(['census:rows', 'census:empty', 'census:empty', 'remove'])
   expect(f.signals).toEqual([])
   expect(f.taskkills).toEqual([])
-  expect(f.budgets.every(budget => budget > 0 && budget <= 5000)).toBe(true)
+  expect(f.budgets.every(budget => budget > 0 && budget <= 2000)).toBe(true)
   expect(f.removed()).toBe(1)
 })
 
@@ -412,7 +396,7 @@ test('Windows reverse census acquires parent births before a valid descendant an
   expect(f.trees()).toBeGreaterThanOrEqual(4)
   expect(f.removed()).toBe(1)
   expect(f.signalled).toEqual([])
-  expect(f.budgets.every(budget => budget > 0 && budget <= 5000)).toBe(true)
+  expect(f.budgets.every(budget => budget > 0 && budget <= 2000)).toBe(true)
 })
 
 test('Windows reverse census still refuses a child born before its captured parent', async () => {

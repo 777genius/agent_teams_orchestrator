@@ -40,10 +40,6 @@ export function getOpenCodeVersionProbeDiagnostics(error: unknown) {
   if (helper) diagnostics.push({
     code: 'opencode_version_probe_helper_failed', evidence: 'last_observed',
     operation: helper.operation, reason: helper.reason, exitCode: helper.exitCode, elapsedMs: helper.elapsedMs,
-    ...(helper.helperCause ? { helperCause: {
-      stage: helper.helperCause.stage, category: helper.helperCause.category,
-      hresult: helper.helperCause.hresult, nativeErrorCode: helper.helperCause.nativeErrorCode,
-    } } : {}),
   })
   if (terminal) diagnostics.push({
     code: 'opencode_version_probe_cleanup_unknown', phase: terminal.phase, guard: terminal.guard,
@@ -109,10 +105,9 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
     const ports = nativePorts({}, failure => { helperFailure = failure })
     const pid = child.pid
     const started = Date.now(), deadline = started + 8000
-    // Match processKill.ts's 5s Windows process-birth query budget: cold
-    // PowerShell/WMI startup can exceed 2s. Every helper still uses the
-    // original 8s probe remainder; POSIX queries keep their 2s cap.
-    const helperTimeout = process.platform === 'win32' ? 5000 : 2000
+    // POSIX ps queries keep a 2s cap within the 8s probe remainder. Windows
+    // reads kernel32 directly: cold PowerShell/WMI helpers exhausted it.
+    const helperTimeout = 2000
     let ended = false, closed = false, code: number | null = null
     let phase: OpenCodeProbeTerminalDiagnostic['phase'] = 'initial_birth'
     let terminalDiagnostic: OpenCodeProbeTerminalDiagnostic | undefined

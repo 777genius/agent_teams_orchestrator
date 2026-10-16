@@ -55,13 +55,10 @@ test('V1 selection still enters existing managed inventory rather than V2 key tr
 
 test("public models failure retains only this invocation's bounded identity evidence", async () => {
   const beforeLegacy = legacyReads, beforeModels = modelCalls.length
-  const helperCause = { stage: 'process_lookup' as const, category: 'ArgumentException' as const,
-    hresult: -2147024809, nativeErrorCode: null }
   const terminal = { phase: 'anchor_identity' as const, guard: 'anchor_missing' as const,
     closed: true, ended: true, exitCode: 0, birthsCount: 1, candidatesCount: 0, pendingCount: 0,
     lastGroupCount: 3, lastSurvivorCount: null, remainingMs: 6515 }
-  const helper = { operation: 'birth' as const, reason: 'helper_nonzero' as const, exitCode: 1, elapsedMs: 330,
-    helperCause: Object.assign({}, helperCause, { message: 'TEST-PRIVATE helper message', path: '/TEST-PRIVATE/helper' }) }
+  const helper = { operation: 'birth' as const, reason: 'helper_nonzero' as const, exitCode: 1, elapsedMs: 330 }
   const input = { runtimeId: 'opencode' as const, providerId: 'kiro', projectPath: '/TEST-PRIVATE/project' }
   const readDiagnostic = async () => {
     const result = await adapter.loadModels(input)
@@ -86,7 +83,7 @@ test("public models failure retains only this invocation's bounded identity evid
       original: { category: 'OpenCodeVersionProbeCleanupError', code: 'cleanup_unknown' }, cause: { category: 'Error' },
       diagnostics: [
         { code: 'opencode_version_probe_helper_failed', evidence: 'last_observed', operation: 'birth', reason: 'helper_nonzero',
-          exitCode: 1, elapsedMs: 330, helperCause },
+          exitCode: 1, elapsedMs: 330 },
         { code: 'opencode_version_probe_cleanup_unknown', ...terminal },
       ],
     })
