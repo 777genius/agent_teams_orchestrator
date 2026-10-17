@@ -5,6 +5,7 @@ import { mkdir, lstat, writeFile } from 'node:fs/promises'
 import { resolveClaudeMultimodelPaths } from '../OpenCodeManagedPaths.js'
 import { executionAssert } from './OpenCodeV2ExecutionContracts.js'
 import { readOpenCodeV2ProviderWireFailure } from '../transport/OpenCodeV2ProviderWire.js'
+import type { ExecutionMcpFailure } from '../transport/OpenCodeV2ExecutionClientFactory.js'
 import { ensureWindowsPrivateDirectories } from '../profile/OpenCodePrivateDirectories.js'
 
 const startupStages = new Set(['run-owner-entry', 'windows-cohort', 'windows-profile', 'windows-roots', 'windows-dll',
@@ -154,9 +155,22 @@ export type RunInitializationPhase = 'bootstrap-before-log' | 'bootstrap-before-
 const initializationPhases = new Set<RunInitializationPhase>(['bootstrap-before-log', 'bootstrap-before-messages', 'bootstrap-before-log-confirm',
   'bootstrap-instruction-put', 'bootstrap-instruction-readback', 'bootstrap-after-log', 'bootstrap-after-messages',
   'bootstrap-after-log-confirm', 'bootstrap-verify', 'MCP-connect', 'MCP-readback', 'controller-tools', 'probe-authority'])
+const controllerMcpStatuses = ['connected', 'pending', 'disabled', 'failed', 'needs_auth', 'absent', 'ambiguous'] as const
+const controllerMcpFailures = ['relay_upstream', 'relay_transport', 'connection_refused', 'timeout',
+  'http_client', 'http_server', 'protocol', 'other'] as const satisfies readonly ExecutionMcpFailure[]
+/** Closed native readback of the selected controller server; never its message. */
+export type ControllerMcpObservation = Readonly<{ status: typeof controllerMcpStatuses[number]; failure?: typeof controllerMcpFailures[number] }>
+function controllerMcpDiagnostic(value: unknown): ControllerMcpObservation | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const row = value as Record<string, unknown>
+  const status = controllerMcpStatuses.find(item => item === row.status)
+  const failure = controllerMcpFailures.find(item => item === row.failure)
+  if (!status || (row.failure !== undefined && !failure)) return undefined
+  return Object.freeze({ status, ...(failure ? { failure } : {}) })
+}
 type InitializationDiagnostic = Readonly<{ phase: RunInitializationPhase; elapsedMs: number; ownerElapsedMs?: number
   history?: readonly Readonly<{ phase: RunInitializationPhase; elapsedMs: number }>[]
-  commands?: ReturnType<typeof commandDiagnostic> }>
+  commands?: ReturnType<typeof commandDiagnostic>; controllerMcp?: ControllerMcpObservation }>
 const initializationFailures = new WeakMap<Error, Readonly<{ initialization: InitializationDiagnostic; acquisition?: ExecutionAcquisitionTiming }>>()
 /** Finite facts retained with the original initialization rejection. Command
  * observations are projected relative to the original MCP-connect start. */
@@ -164,6 +178,7 @@ export type RunInitializationFacts = Readonly<{
   ownerElapsedMs: number; history: readonly Readonly<{ phase: RunInitializationPhase; elapsedMs: number }>[]
   acquisition?: ExecutionAcquisitionTiming
   commands?: Readonly<{ observation: ExecutionCommandObservation; originAt: number }>
+  controllerMcp?: ControllerMcpObservation
 }>
 export type ExecutionCleanupPhase = 'dispose-transport' | 'send-close' | 'force-kill' | 'wait-exit' | 'read-birth' | 'kernel-retirement' |
   'process-retirement' | 'closed-ack' | 'kernel-proof' | 'kernel-binding' | 'owner-release' | 'retained-roots' | 'plan-close'
@@ -194,9 +209,10 @@ export function retainOpenCodeV2InitializationPhase(error: unknown, phase: RunIn
   try { commands = facts?.commands && Number.isFinite(facts.commands.originAt) ? commandDiagnostic(facts.commands.observation, facts.commands.originAt) : undefined }
   catch { commands = undefined }
   const acquisition = acquisitionDiagnostic(facts?.acquisition)
+  const controllerMcp = controllerMcpDiagnostic(facts?.controllerMcp)
   initializationFailures.set(error, Object.freeze({
     initialization: Object.freeze({ phase, elapsedMs, ...(facts && finiteElapsed(facts.ownerElapsedMs) ? { ownerElapsedMs: facts.ownerElapsedMs } : {}),
-      ...(history ? { history } : {}), ...(commands ? { commands } : {}) }),
+      ...(history ? { history } : {}), ...(commands ? { commands } : {}), ...(controllerMcp ? { controllerMcp } : {}) }),
     ...(acquisition ? { acquisition } : {}),
   }))
 }
@@ -211,7 +227,7 @@ const privateProviderFailureCodes = new Set(['provider_missing', 'provider_key_m
   'run_control_timeout', 'run_control_disconnected', 'run_control_changed', 'run_control_foreign', 'run_control_invalid',
   'run_control_frame_too_large', 'run_owner_stale', 'run_process_unknown', 'run_process_changed',
   'run_deadline_expired', 'run_readiness_changed', 'run_readiness_unknown', 'run_operation_unknown',
-  'run_acquisition_timeout', 'run_initialization_timeout', 'run_stopped', 'cancelled',
+  'run_acquisition_timeout', 'run_initialization_timeout', 'run_stopped', 'cancelled', 'run_controller_mcp_unknown', 'execution_http_transport_unknown',
   'execution_selected_auth_required', 'execution_selected_auth_unbound', 'execution_selected_auth_changed',
   'execution_selected_auth_missing', 'execution_selected_auth_unsupported', 'execution_selected_auth_location_changed',
   'execution_selected_auth_provider_unknown', 'execution_selected_auth_existing_or_unsupported',

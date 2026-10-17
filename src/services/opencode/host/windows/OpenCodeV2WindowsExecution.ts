@@ -6,7 +6,7 @@ import path from 'node:path'
 import { validateExecutionProfile, type OwnedNativeProfile, type ExecutionBirth } from '../OpenCodeV2ExecutionBinding.js'
 import { createWindowsNativeBroker, resolveWindowsNativeArtifact, resolveWindowsRealpathArtifact, requireWindowsRealpathArtifact, type WindowsRealpathArtifact, type WindowsNativeArtifact, type WindowsNativeBroker } from './OpenCodeV2WindowsNativeBroker.js'
 import { createWindowsOwnerFilesystem } from './OpenCodeV2WindowsOwnerFilesystem.js'
-import { createWindowsExecutionHttpClient } from './OpenCodeV2WindowsHTTP.js'
+import { createWindowsControllerRelayServer, createWindowsExecutionHttpClient, readWindowsRemoteController, type WindowsRemoteController } from './OpenCodeV2WindowsHTTP.js'
 import { executionCommandOperations, executionNativeRetirementPhases, type ExecutionCommandObservation, type ExecutionCommandOperation,
   type ExecutionNativeRetirementPhase } from '../../execution/OpenCodeV2Diagnostics.js'
 import { OPEN_CODE_V2_WINDOWS_CLOSE_MS } from '../../execution/OpenCodeV2ExecutionContracts.js'
@@ -31,6 +31,8 @@ export type WindowsSelectedAuthMetadata = Readonly<{
 }>
 const plans = new WeakSet<WindowsLaunchPlan>(), mappings = new WeakSet<WindowsExecutionMapping>(), retirements = new WeakSet<WindowsKernelRetirement>()
 const selectedConfigs = new WeakMap<WindowsLaunchPlan, string>(), selectingConfigs = new WeakSet<WindowsLaunchPlan>()
+// Remote controller endpoint read from the same sealed config bytes native selected.
+const controllerRelays = new WeakMap<WindowsLaunchPlan, WindowsRemoteController>()
 const brokers = new WeakMap<WindowsLaunchPlan, WindowsNativeBroker>(), binaries = new WeakMap<WindowsLaunchPlan, Readonly<{ path: string; sha256: string }>>()
 type WindowsMemberPreflightSelection = Readonly<{
   selectors: Readonly<{
@@ -451,9 +453,12 @@ export async function bindWindowsExecutionSelectedConfig(plan: WindowsLaunchPlan
   signal?.throwIfAborted(); assert(deadline > Date.now(), 'execution_timeout')
   assert(plan.writableRoots.includes(profile.root) && plan.profileDirectories.includes(profile.root) &&
     plan.profileDirectories.includes(profile.config.directory) && profile.config.directory === path.win32.join(profile.root, 'config', 'opencode'), 'execution_profile_changed')
+  // Parsed before the native selection, which cannot be replayed.
+  const remoteController = readWindowsRemoteController(profile.config.content)
   const selected = row(await broker.request('ownerSelectConfig', { root: profile.root, databasePath: profile.databasePath, sha256: profile.config.sha256, teamId }, deadline, signal))
   assert(selected.schema === 1 && selected.ok === true && typeof selected.selectionId === 'string' && /^[1-9]\d{0,19}$/.test(selected.selectionId) && selected.root === profile.root &&
     selected.path === path.win32.join(profile.config.directory, 'opencode.json') && selected.sha256 === profile.config.sha256, 'execution_profile_changed')
+  if (remoteController) controllerRelays.set(plan, remoteController)
   selectedConfigs.set(plan, selected.selectionId)
 }
 export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, leaseOwnerId: string,
@@ -477,6 +482,11 @@ export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, l
   // Command request IDs are replayed only while their operation is pending or
   // retained in a small settled window.
   let mapping: WindowsExecutionMapping | undefined, nativeMapping: unknown, stopped = false, started = false, closed = false
+  // A refused relay frame means this contained member broke the protocol.
+  const remoteController = controllerRelays.get(plan)
+  const controllerRelay = remoteController && createWindowsControllerRelayServer(remoteController,
+    value => broker.request('send', { value: { ...value, nonce, leaseOwnerId } }).then(() => undefined),
+    () => { if (!stopped) { child.emit('error', new Error('execution_http_transport_unknown')); void retireNative().catch(() => child.emit('error', new Error('cleanup_unknown'))) } })
   const commandRequest = createWindowsCommandRequestHandler({ nonce, leaseOwnerId,
     ready: () => !!mapping && started, closing: () => stopped,
     assertLive: (allowClosing, operation) => assertCommandLive(allowClosing, operation), request: (operation, input) => broker!.request(operation, input),
@@ -486,15 +496,19 @@ export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, l
   let connectedResolve!: (value: unknown) => void, connectedReject!: (error: Error) => void
   const connected = new Promise<unknown>((resolve, reject) => { connectedResolve = resolve; connectedReject = reject }); void connected.catch(() => undefined)
   broker.events.on('connected', connectedResolve)
-  broker.events.on('failed', () => { const error = new Error('execution_containment_launcher_denied'); connectedReject(error); http.fail(error); child.emit('error', error) })
-  broker.events.on('error', error => { connectedReject(error); http.fail(error); child.emit('error', error) })
-  broker.events.on('close', () => { const error = new Error('execution_containment_helper_closed'); connectedReject(error); http.fail(error); if (!mainExit?.()) child.emit('error', error) })
+  broker.events.on('failed', () => { const error = new Error('execution_containment_launcher_denied'); connectedReject(error); http.fail(error); controllerRelay?.disconnect(); child.emit('error', error) })
+  broker.events.on('error', error => { connectedReject(error); http.fail(error); controllerRelay?.disconnect(); child.emit('error', error) })
+  broker.events.on('close', () => { const error = new Error('execution_containment_helper_closed'); connectedReject(error); http.fail(error); controllerRelay?.disconnect(); if (!mainExit?.()) child.emit('error', error) })
   broker.events.on('message', value => {
     try {
       const record = row(value)
       if (record.type === 'windowsHTTP') {
         assert(mapping && started && record.nonce === nonce && record.leaseOwnerId === leaseOwnerId, 'execution_identity_mismatch')
         http.accept(record); return
+      }
+      if (record.type === 'windowsControllerHTTP') {
+        assert(controllerRelay && mapping && started && record.nonce === nonce && record.leaseOwnerId === leaseOwnerId, 'execution_identity_mismatch')
+        controllerRelay.accept(record); return
       }
       if (record.type === 'ready') {
         assert(mapping && started && !stopped && record.nonce === nonce && record.leaseOwnerId === leaseOwnerId && record.namespace === mapping.namespace.name && record.pid === mapping.bun.nativePID && equal(record.birth, mapping.bun.birth) && record.executableSha256 === mapping.bun.executableSha256 && typeof record.baseUrl === 'string', 'execution_identity_mismatch')
@@ -599,10 +613,10 @@ export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, l
     sendClose() { assert(mapping); stopped = true; void http.close().then(() => broker!.request('send', { value: { type: 'close', nonce, leaseOwnerId } })).catch(() => child.emit('error', new Error('cleanup_unknown'))) },
     acknowledged: () => closed,
     readBirth() { assert(mapping && mainExit, 'execution_identity_mismatch'); return mainExit.readBirth() },
-    async kill(deadline?: number) { stopped = true; await retireNative(deadline) },
+    async kill(deadline?: number) { stopped = true; try { await retireNative(deadline) } finally { controllerRelay?.disconnect() } },
     retire(deadline?: number): Promise<WindowsKernelRetirement> {
       return retirement ??= (async () => {
-        stopped = true; const observed = row(await launch), receipt = row(await retireNative(deadline))
+        stopped = true; const observed = row(await launch), receipt = row(await retireNative(deadline).finally(() => controllerRelay?.disconnect()))
         assert(mapping && equal(receipt.mapping, observed) && receipt.empty === true && receipt.activeProcesses === 0 && receipt.heldProcessExited === true && receipt.ownedPairClosed === true && receipt.ownAcesRemoved === true, 'cleanup_unknown')
         const value = Object.freeze({ pid: mapping.bun.hostPID, birth: mapping.bun.birth, mapping, scopeClosed: closed, activeProcesses: 0 as const, heldProcessExited: true as const, ownAcesRemoved: true as const })
         retirements.add(value); return value

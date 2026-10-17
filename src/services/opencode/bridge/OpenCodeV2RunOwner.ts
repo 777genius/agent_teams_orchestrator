@@ -1,5 +1,5 @@
 import { openCodeBunVersion } from '../../../constants/openCodeBunVersion.js'
-import { recordOpenCodeV2ProviderFailure, retainOpenCodeV2InitializationPhase, type RunInitializationPhase } from '../execution/OpenCodeV2Diagnostics.js'
+import { recordOpenCodeV2ProviderFailure, retainOpenCodeV2InitializationPhase, type RunInitializationFacts, type RunInitializationPhase } from '../execution/OpenCodeV2Diagnostics.js'
 import { captureOwnedV2ProbeAuthority, buildOwnedV2ProbeProof, type ProbeAuthority } from './OpenCodeV2ProbeProof.js'
 import { parseControllerInboxBytes, readOwnedControllerInbox, readOwnedControllerTools, type ControllerToolProof } from './OpenCodeV2ControllerTools.js'
 import { spawn } from 'node:child_process'
@@ -203,6 +203,7 @@ export class OpenCodeV2RunOwner {
     const initializationStartedAt = Date.now()
     let initializationPhase: RunInitializationPhase | undefined
     const initializationHistory: { phase: RunInitializationPhase; at: number }[] = []
+    let controllerMcp: RunInitializationFacts['controllerMcp']
     executionAssert(this.state === 'starting' && !this.initializationAbort.signal.aborted &&
       Date.now() < initializationDeadline, 'run_stopped')
     const lease = this.pendingLeases.get(memberPlan.memberId) ?? await this.acquireMember(memberPlan, initializationDeadline)
@@ -258,7 +259,10 @@ export class OpenCodeV2RunOwner {
       await client.connectMcp(memberPlan.controllerMcpName)
       markInitialization('MCP-readback')
       const servers = await client.mcp()
-      member.mcpConnected = servers.filter(server => server.name === memberPlan.controllerMcpName && server.status === 'connected').length === 1
+      const selected = servers.filter(server => server.name === memberPlan.controllerMcpName)
+      controllerMcp = selected.length === 1 ? { status: selected[0]!.status, ...(selected[0]!.failure ? { failure: selected[0]!.failure } : {}) }
+        : { status: selected.length === 0 ? 'absent' : 'ambiguous' }
+      member.mcpConnected = selected.length === 1 && selected[0]!.status === 'connected'
       executionAssert(member.mcpConnected, 'run_controller_mcp_unknown')
       markInitialization('controller-tools')
       member.controllerTools = await readOwnedControllerTools(client, memberPlan.profile, memberPlan.controllerMcpName, initializationDeadline, this.initializationAbort.signal)
@@ -282,6 +286,7 @@ export class OpenCodeV2RunOwner {
           ownerElapsedMs: initializationStartedAt - this.ownerStartedAt,
           history: initializationHistory.map(({ phase, at }) => ({ phase, elapsedMs: at - initializationStartedAt })),
           ...(observation ? { acquisition: observation.acquisition } : {}), ...(commands ? { commands } : {}),
+          ...(controllerMcp ? { controllerMcp } : {}),
         })
       }
       // If an object was not yet registered, no lease may escape cleanup.

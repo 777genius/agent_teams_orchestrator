@@ -201,6 +201,28 @@ test('owner initialization diagnostics retain only trusted finite sideband witho
   }
 })
 
+test('MCP readback retains the exact category and only the closed controller status', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'TEST-v2-owner-mcp-'))
+  const previous = process.env.CLAUDE_MULTIMODEL_DATA_HOME
+  process.env.CLAUDE_MULTIMODEL_DATA_HOME = root
+  try {
+    const kept = new Error('run_controller_mcp_unknown'), forged = new Error('run_controller_mcp_unknown')
+    retainOpenCodeV2InitializationPhase(kept, 'MCP-readback', 5, { ownerElapsedMs: 1, history: [],
+      controllerMcp: { status: 'failed', failure: 'relay_upstream' } })
+    retainOpenCodeV2InitializationPhase(forged, 'MCP-readback', 5, { ownerElapsedMs: 1, history: [],
+      controllerMcp: { status: 'failed', failure: 'TEST-PRIVATE-MESSAGE' } as never })
+    for (const error of [kept, forged]) await recordOpenCodeV2ProviderFailure('run-owner-initialization', error, true)
+    const rows = await Promise.all((await readdir(path.join(root, 'opencode/v2/provider-diagnostics'))).map(async name =>
+      JSON.parse(await readFile(path.join(root, 'opencode/v2/provider-diagnostics', name), 'utf8'))))
+    expect(rows.every(row => row.category === 'run_controller_mcp_unknown')).toBe(true)
+    expect(rows.map(row => row.initialization.controllerMcp ?? null).sort()).toEqual([{ status: 'failed', failure: 'relay_upstream' }, null])
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_DATA_HOME
+    else process.env.CLAUDE_MULTIMODEL_DATA_HOME = previous
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('owner MCP initialization retains closed command channel facts from the actual Windows handler', async () => {
   const { createWindowsCommandRequestHandler } = await import('../host/windows/OpenCodeV2WindowsExecution.js')
   const root = await mkdtemp(path.join(tmpdir(), 'TEST-v2-owner-commands-'))

@@ -58,6 +58,8 @@ test('actual Windows adapter shares one original native retirement across kill, 
     } }
   const scope = { plans: new WeakSet([plan]), selectedConfigs: new WeakMap([[plan, 'TEST-config']]),
     binaries: new WeakMap([[plan, bun]]), memberPreflights: new WeakMap(), brokers: new WeakMap([[plan, native]]),
+    // A local controller selects no remote relay for this plan.
+    controllerRelays: new WeakMap(), createWindowsControllerRelayServer: () => { throw new Error('TEST-unexpected-controller-relay') },
     mappings: new WeakSet(), retirements: new WeakSet(), EventEmitter,
     assert: (value: unknown, code = 'execution_containment_unqualified') => { if (!value) throw new Error(code) },
     row: (value: unknown) => { if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('execution_invalid_response'); return value },
@@ -80,6 +82,45 @@ test('actual Windows adapter shares one original native retirement across kill, 
     expect((await retired).message).toBe('cleanup_unknown') // Unprepared fake mappings cannot mint native proof.
     expect(requests).toEqual([{ deadline, input: { deadline, timeoutMs: 22_000 } }]) // No replay or deadline replenishment.
   } finally { clock.mockRestore() }
+})
+
+test('a refused controller relay frame retires the member once and is inert after Stop', async () => {
+  const source = await Bun.file(new URL('windows/OpenCodeV2WindowsExecution.ts', import.meta.url)).text()
+  const body = new Bun.Transpiler({ loader: 'ts' }).transformSync(source.slice(source.indexOf('export function launchWindowsExecution(')).replace('export ', ''))
+  const bun = { path: 'C:\\TEST\\bun.exe', sha256: 'a'.repeat(64) }
+  const plan = { executable: bun.path, entry: 'C:\\TEST\\entry.js', cwd: 'C:\\TEST', env: {}, writableRoots: [], readOnlyRoots: [], protectedRoots: [], realpathDll: {} }
+  const retires: unknown[] = []
+  const native = { events: new EventEmitter(), ended: () => false,
+    request: async (operation: string, input?: unknown) => {
+      if (operation === 'launch') return {}
+      expect(operation).toBe('retire'); retires.push(input); return {}
+    } }
+  const controller = { url: 'http://127.0.0.1:1/mcp', origin: 'http://127.0.0.1:1', pathname: '/mcp', headerNames: [] }
+  let refused!: () => void, disconnects = 0
+  const scope = { plans: new WeakSet([plan]), selectedConfigs: new WeakMap([[plan, 'TEST-config']]),
+    binaries: new WeakMap([[plan, bun]]), memberPreflights: new WeakMap(), brokers: new WeakMap([[plan, native]]),
+    controllerRelays: new WeakMap([[plan, controller]]),
+    createWindowsControllerRelayServer: (selected: unknown, _post: unknown, failed: () => void) => {
+      expect(selected).toBe(controller); refused = failed
+      return { accept: () => {}, disconnect: () => { disconnects++ }, close: async () => {} }
+    },
+    mappings: new WeakSet(), retirements: new WeakSet(), EventEmitter,
+    assert: (value: unknown, code = 'execution_containment_unqualified') => { if (!value) throw new Error(code) },
+    row: (value: unknown) => { if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('execution_invalid_response'); return value },
+    equal: (left: unknown, right: unknown) => JSON.stringify(left) === JSON.stringify(right),
+    createWindowsCommandRequestHandler, observeWindowsHeldMainExit, retireWindowsNativeScope,
+    createWindowsExecutionHttpClient: () => ({ fetch: async () => new Response(), fail: () => {}, bindOrigin: () => {}, close: async () => {} }) }
+  const launch = new Function('scope', `const {${Object.keys(scope).join(',')}}=scope;${body};return launchWindowsExecution;`)(scope)(plan,
+    '11111111-1111-4111-8111-111111111111', '22222222-2222-4222-8222-222222222222', bun, Date.now() + 5000)
+  const errors: string[] = []; launch.child.on('error', (error: Error) => { errors.push(error.message) })
+  refused()
+  for (let i = 0; i < 10; i++) await Promise.resolve()
+  expect(errors).toEqual(['execution_http_transport_unknown']); expect(retires).toHaveLength(1)
+  await launch.kill(Date.now() + 22_000)
+  expect(disconnects).toBe(1)
+  refused()
+  for (let i = 0; i < 10; i++) await Promise.resolve()
+  expect(errors).toEqual(['execution_http_transport_unknown']); expect(retires).toHaveLength(1)
 })
 
 test('retirement keeps the original identity failure while still attempting kernel cleanup', async () => {

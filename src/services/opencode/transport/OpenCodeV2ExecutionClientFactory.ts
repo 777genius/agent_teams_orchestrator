@@ -47,7 +47,23 @@ export type ExecutionInstruction = { key: string; value: ExecutionJson }
 export type ExecutionMcpConfig =
   | { type: 'local'; command: readonly string[]; cwd?: string; environment?: { [key: string]: string }; disabled?: boolean }
   | { type: 'remote'; url: string; headers?: { [key: string]: string }; oauth?: false; disabled?: boolean }
-export type ExecutionMcpServer = { name: string; status: 'connected' | 'pending' | 'disabled' | 'failed' | 'needs_auth' }
+/** Closed class of a native MCP failure message. The message itself never leaves this parser. */
+export type ExecutionMcpFailure = 'relay_upstream' | 'relay_transport' | 'connection_refused' | 'timeout' |
+  'http_client' | 'http_server' | 'protocol' | 'other'
+export type ExecutionMcpServer = { name: string; status: 'connected' | 'pending' | 'disabled' | 'failed' | 'needs_auth'
+  failure?: ExecutionMcpFailure }
+function mcpFailure(message: unknown): ExecutionMcpFailure {
+  if (typeof message !== 'string') return 'other'
+  if (message.includes('execution_http_request_failed')) return 'relay_upstream'
+  if (/execution_http_/.test(message)) return 'relay_transport'
+  if (/ECONNREFUSED|ConnectionRefused|connection refused|Unable to connect/i.test(message)) return 'connection_refused'
+  if (/timed? ?out|ETIMEDOUT|TimeoutError|AbortError/i.test(message)) return 'timeout'
+  const status = /\b(?:HTTP|status(?: code)?)[ :/]*([45])\d\d\b/i.exec(message)?.[1]
+  if (status === '5') return 'http_server'
+  if (status === '4') return 'http_client'
+  if (/protocol/i.test(message)) return 'protocol'
+  return 'other'
+}
 export type ExecutionPermission = { id: string; sessionID: string; action: string; resources: string[];
   source?: { type: 'tool'; messageID: string; id: string } }
 export type ExecutionBridgeClient = ExecutionClient & {
@@ -500,9 +516,9 @@ export async function createOpenCodeV2ExecutionClient(authority: ExecutionAuthor
     mcp: () => invoke(false, async () => {
       const raw = record(await ops.mcp())
       executionAssert(record(raw.location).directory === authority.directory && Array.isArray(raw.data) && raw.data.length <= 256, 'authority_mismatch')
-      const values: ExecutionMcpServer[] = raw.data.map(value => { const entry = record(value), status = record(entry.status).status
+      const values: ExecutionMcpServer[] = raw.data.map(value => { const entry = record(value), state = record(entry.status), status = state.status
         executionAssert(status === 'connected' || status === 'pending' || status === 'disabled' || status === 'failed' || status === 'needs_auth')
-        return { name: text(entry.name), status } satisfies ExecutionMcpServer })
+        return { name: text(entry.name), status, ...(status === 'failed' || status === 'needs_auth' ? { failure: mcpFailure(state.error) } : {}) } satisfies ExecutionMcpServer })
       executionAssert(new Set(values.map(value => value.name)).size === values.length)
       return values
     }),

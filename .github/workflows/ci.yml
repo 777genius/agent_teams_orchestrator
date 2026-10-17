@@ -217,7 +217,7 @@ jobs:
         # Production operation deadlines remain enforced inside the tests.
         run: bun run test:opencode-authority --timeout ${{ runner.os == 'Windows' && '30000' || '5000' }}
       - name: Test provider settings and HTTP body deadlines
-        run: bun test src/features/runtimeProviderManagement/adapters/opencode/OpenCodeProviderManagementAdapter.test.ts src/services/opencode/OpenCodeProviderIdentity.test.ts src/services/opencode/OpenCodeInventoryService.test.ts src/services/opencode/OpenCodeProviderLabelRegression.test.ts src/services/opencode/OpenCodeClientFactory.test.ts --timeout 30000
+        run: bun test src/features/runtimeProviderManagement/adapters/opencode/OpenCodeProviderManagementAdapter.test.ts src/services/opencode/OpenCodeProviderIdentity.test.ts src/services/opencode/OpenCodeInventoryService.test.ts src/services/opencode/OpenCodeProviderLabelRegression.test.ts src/services/opencode/OpenCodeClientFactory.test.ts src/services/opencode/host/windows/OpenCodeV2WindowsControllerRelay.test.ts --timeout 30000
       - name: Test Windows startup cleanup completion contracts
         run: bun test src/utils/processKill.test.ts src/services/opencode/OpenCodeStartupCleanupBudget.test.ts src/services/opencode/OpenCodeStartupCleanup.test.ts --timeout 30000
       - name: Test native Windows startup termination

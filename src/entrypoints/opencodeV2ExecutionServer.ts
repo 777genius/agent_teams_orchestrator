@@ -15,7 +15,8 @@ import type { ServerOptions as CurrentOptions } from '@opencode/server/options'
 
 // Dedicated IPC child. The execution DB/profile are retained, including failed acquisition.
 // Native Windows uses an authenticated named pipe; POSIX keeps its inherited
-// process IPC. The official runtime sees no process-global transport overrides.
+// process IPC. The official runtime sees no process-global IPC overrides; its
+// only Windows fetch relay is the sealed remote controller origin below.
 const childControl = process.platform === 'win32' ? windowsExecutionChildControl() : {
   events: process,
   connected: () => !!process.send && process.connected === true,
@@ -163,7 +164,14 @@ async function start(input: Record<string, unknown>): Promise<void> {
     enterStartupStage('runtime-import')
     const { loadOpenCodeV2WindowsRuntime } = await import('../services/opencode/host/windows/OpenCodeV2WindowsRuntime.js')
     const { windowsExecutionCommandPort } = await import('../services/opencode/host/windows/OpenCodeV2WindowsCommand.js')
-    const { bindWindowsExecutionHttp } = await import('../services/opencode/host/windows/OpenCodeV2WindowsHTTP.js')
+    const { bindWindowsControllerRelay, bindWindowsExecutionHttp, readWindowsRemoteController } =
+      await import('../services/opencode/host/windows/OpenCodeV2WindowsHTTP.js')
+    // Before any official module can capture fetch: a loopback remote
+    // controller is reachable from this AppContainer only through the owner.
+    const remoteController = readWindowsRemoteController(profile.config.content)
+    const relay = remoteController && bindWindowsControllerRelay(remoteController)
+    const closeRelay = async () => { await relay?.close() }
+    finalize = closeRelay
     const runtime = await loadOpenCodeV2WindowsRuntime(native.version, graph.moduleSha256,
       windowsExecutionCommandPort(), profile)
     controller.signal.throwIfAborted()
@@ -171,9 +179,9 @@ async function start(input: Record<string, unknown>): Promise<void> {
     const server = await runtime.start(options, controller.signal)
     // Register ownership before binding so a failed bridge bind still closes
     // the acquired official server, without acknowledging partial cleanup.
-    finalize = server.close
+    finalize = async () => { try { await server.close() } finally { await closeRelay() } }
     const bridge = bindWindowsExecutionHttp(server.baseUrl, controller.signal)
-    finalize = async () => { try { await bridge.close() } finally { await server.close() } }
+    finalize = async () => { try { await bridge.close() } finally { try { await server.close() } finally { await closeRelay() } } }
     baseUrl = server.baseUrl
   } else {
     // Effect and runtime resolve from the same verified official package graph.
@@ -214,7 +222,7 @@ childControl.events.on('message', (message: unknown) => {
   try {
     const input = executionRecord(message)
     executionAssert(typeof input.nonce === 'string' && /^[a-f0-9-]{36}$/.test(input.nonce))
-    if (process.platform === 'win32' && (input.type === 'windowsHTTP' || input.type === 'commandResult')) return
+    if (process.platform === 'win32' && (input.type === 'windowsHTTP' || input.type === 'windowsControllerHTTP' || input.type === 'commandResult')) return
     if (input.type === 'prepare') {
       executionAssert(!preparation && !started && !closing)
       executionAssert(typeof input.leaseOwnerId === 'string')

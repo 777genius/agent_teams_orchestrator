@@ -5,13 +5,51 @@ const WINDOW = 32768, CHUNK = 3072, MAX_ACTIVE = 16
 const UUID = /^[a-f0-9-]{36}$/
 type Frame = Record<string, unknown>
 type Send = (frame: Frame) => Promise<void>
+/** `windowsHTTP`: owner -> child-local official server. `windowsControllerHTTP`:
+ * contained member -> the sealed remote controller endpoint, served by its owner. */
+export type WindowsHttpFrameType = 'windowsHTTP' | 'windowsControllerHTTP'
+const CONTROLLER_FRAME = 'windowsControllerHTTP' satisfies WindowsHttpFrameType
+const CONTROLLER_DRAIN_MS = 500
+// Streamable HTTP MCP uses exactly these methods and request fields on its
+// single endpoint. Framing, hop-by-hop and Host fields never cross the relay.
+const CONTROLLER_METHODS: ReadonlySet<string> = new Set(['GET', 'POST', 'DELETE'])
+const CONTROLLER_HEADERS = ['accept', 'content-type', 'mcp-session-id', 'mcp-protocol-version', 'last-event-id'] as const
+type ControllerPolicy = Readonly<{ pathname: string; methods: ReadonlySet<string>; headers: ReadonlySet<string> }>
+/** The sealed remote endpoint this member may reach through its owner. */
+export type WindowsRemoteController = Readonly<{ url: string; origin: string; pathname: string; headerNames: readonly string[] }>
 function assert(value: unknown): asserts value { if (!value) throw new Error('execution_http_transport_unknown') }
 function row(value: unknown): Frame { assert(value && typeof value === 'object' && !Array.isArray(value)); return value as Frame }
-function origin(value: string): string {
+function loopbackUrl(value: string): URL {
   const url = new URL(value)
   assert(url.protocol === 'http:' && url.hostname === '127.0.0.1' && Number(url.port) > 0 && Number(url.port) <= 65535 &&
-    !url.username && !url.password && url.pathname === '/' && !url.search && !url.hash)
+    !url.username && !url.password)
+  return url
+}
+function origin(value: string): string {
+  const url = loopbackUrl(value)
+  assert(url.pathname === '/' && !url.search && !url.hash)
   return url.origin
+}
+const field = (value: unknown, key: string): unknown =>
+  value && typeof value === 'object' && !Array.isArray(value) ? (value as Frame)[key] : undefined
+/** Sealed config bytes select the relay. Only a remote `agent-teams` controller
+ * on plain-HTTP 127.0.0.1 needs it; anything else keeps its direct transport.
+ * The fragment never reaches the wire; the endpoint path is the relay policy. */
+export function readWindowsRemoteController(content: string): WindowsRemoteController | undefined {
+  let document: unknown
+  try { document = JSON.parse(content) } catch { return undefined }
+  const server = field(field(field(document, 'mcp'), 'servers'), 'agent-teams')
+  const url = field(server, 'url'), sealedHeaders = field(server, 'headers')
+  if (field(server, 'type') !== 'remote' || typeof url !== 'string') return undefined
+  let target: URL
+  try { target = loopbackUrl(url) } catch { return undefined }
+  const headerNames = sealedHeaders && typeof sealedHeaders === 'object' && !Array.isArray(sealedHeaders)
+    ? Object.keys(sealedHeaders).map(name => name.toLowerCase()) : []
+  return Object.freeze({ url, origin: target.origin, pathname: target.pathname, headerNames: Object.freeze(headerNames) })
+}
+function controllerPolicy(controller: WindowsRemoteController): ControllerPolicy {
+  return Object.freeze({ pathname: controller.pathname, methods: CONTROLLER_METHODS,
+    headers: new Set([...CONTROLLER_HEADERS, ...controller.headerNames]) })
 }
 function headers(value: unknown): [string, string][] {
   assert(Array.isArray(value) && value.length <= 256)
@@ -136,7 +174,8 @@ type ParentTransaction = {
   headReceived: boolean
   cancel(): Promise<void>; dispose(): Promise<void>
 }
-export function createWindowsExecutionHttpClient(sendFrame: Send, failTransport: (error: Error) => void) {
+export function createWindowsExecutionHttpClient(sendFrame: Send, failTransport: (error: Error) => void,
+  frameType: WindowsHttpFrameType = 'windowsHTTP') {
   const active = new Map<string, ParentTransaction>(), finished = new Set<string>()
   let selectedOrigin: string | undefined, closing = false, broken = false
   function forget(id: string) { active.delete(id); finished.add(id); if (finished.size > 4096) finished.delete(finished.values().next().value!) }
@@ -153,7 +192,7 @@ export function createWindowsExecutionHttpClient(sendFrame: Send, failTransport:
   return Object.freeze({
     bindOrigin(value: string) { assert(!selectedOrigin && !closing); selectedOrigin = origin(value) },
     accept(value: unknown): boolean {
-      const frame = row(value); if (frame.type !== 'windowsHTTP') return false
+      const frame = row(value); if (frame.type !== frameType) return false
       try {
         assert(typeof frame.id === 'string' && UUID.test(frame.id))
         const transaction = active.get(frame.id)
@@ -163,7 +202,10 @@ export function createWindowsExecutionHttpClient(sendFrame: Send, failTransport:
           transaction.headReceived = true
           headers(frame.headers); transaction.head.resolve(frame)
         } else if (frame.action === 'done' || frame.action === 'cancelled') {
-          assert(frame.action === 'cancelled' ? transaction.controller.signal.aborted : transaction.headReceived && transaction.response.hasEnded())
+          // A local cancel can cross the peer's normal completion; its later
+          // `cancelled` reply is then accepted from the finished window.
+          assert(frame.action === 'cancelled' ? transaction.controller.signal.aborted
+            : transaction.controller.signal.aborted || (transaction.headReceived && transaction.response.hasEnded()))
           transaction.done.resolve()
           void transaction.request.stopPump().catch(fatal)
           if (frame.action === 'cancelled') void transaction.dispose().catch(fatal)
@@ -185,7 +227,7 @@ export function createWindowsExecutionHttpClient(sendFrame: Send, failTransport:
       const id = randomUUID(), controller = new AbortController(), head = deferred<Frame>(), done = deferred<void>()
       const uploaded = deferred<void>()
       let uploadStarted = false
-      const send: Send = frame => sendFrame({ ...frame, type: 'windowsHTTP', id })
+      const send: Send = frame => sendFrame({ ...frame, type: frameType, id })
       let cancellation: Promise<void> | undefined
       const cancel = () => cancellation ??= (async () => {
         controller.abort(new DOMException('Request aborted', 'AbortError')); head.reject(controller.signal.reason)
@@ -220,26 +262,27 @@ export function createWindowsExecutionHttpClient(sendFrame: Send, failTransport:
   })
 }
 
-/** Child-local HTTP only; no host-loopback exemption or global fetch override.
- * Prepared native PID/FILETIME pipe identity is required before construction. */
-export function bindWindowsExecutionHttp(baseUrl: string, signal?: AbortSignal): Readonly<{ close(): Promise<void> }> {
-  assert(windowsExecutionSelfBirth().format === 'windows-filetime')
-  const selectedOrigin = origin(baseUrl), control = windowsExecutionChildControl()
-  assert(control.connected())
-  const nonce = process.env.OPENCODE_V2_WINDOWS_NONCE!, leaseOwnerId = process.env.OPENCODE_V2_WINDOWS_LEASE!
-  const active = new Map<string, { controller: AbortController; request: Direction; response: Direction; task: Promise<void> }>()
+type ServerTransaction = { controller: AbortController; request: Direction; response: Direction; task: Promise<void> }
+/** Responding side of one frame type. The caller authenticates the frame's
+ * lease before `accept`; `post` adds that lease. An optional policy narrows the
+ * target to one endpoint path and its method set. */
+function createWindowsExecutionHttpServer(selectedOrigin: string, frameType: WindowsHttpFrameType,
+  post: (message: Frame) => Promise<void>, failed: () => void, policy?: ControllerPolicy) {
+  const active = new Map<string, ServerTransaction>()
   const finished = new Map<string, number>()
   let closing = false, closure: Promise<void> | undefined
-  function failed() { control.disconnect() }
   function accept(value: unknown) {
     try {
-      const frame = row(value); if (frame.type !== 'windowsHTTP') return
-      assert(frame.nonce === nonce && frame.leaseOwnerId === leaseOwnerId && typeof frame.id === 'string' && UUID.test(frame.id))
-      const id = frame.id, send: Send = message => control.send({ ...message, type: 'windowsHTTP', id, nonce, leaseOwnerId }, Date.now() + 15000)
+      const frame = row(value); if (frame.type !== frameType) return
+      assert(typeof frame.id === 'string' && UUID.test(frame.id))
+      const id = frame.id, send: Send = message => post({ ...message, type: frameType, id })
       if (frame.action === 'request') {
         assert(!closing && !active.has(id) && !finished.has(id) && active.size < MAX_ACTIVE && typeof frame.method === 'string' && /^[A-Z]{1,32}$/.test(frame.method) && typeof frame.path === 'string' && Buffer.byteLength(frame.path) <= 8192 && frame.path.startsWith('/') && !frame.path.startsWith('//') && typeof frame.body === 'boolean')
         const target = new URL(frame.path, selectedOrigin); assert(target.origin === selectedOrigin && !target.hash && !target.username && !target.password)
-        const requestHeaders = headers(frame.headers), controller = new AbortController()
+        assert(!policy || (target.pathname === policy.pathname && policy.methods.has(frame.method)))
+        const supplied = headers(frame.headers)
+        const requestHeaders = policy ? supplied.filter(([name]) => policy.headers.has(name.toLowerCase())) : supplied
+        const controller = new AbortController()
         const request = new Direction(send, 'request', 8 * 1024 * 1024, controller.signal, () => {})
         const response = new Direction(send, 'response', 64 * 1024 * 1024, controller.signal, () => {})
         const body = frame.body ? request.stream(reason => controller.abort(reason)) : null
@@ -248,8 +291,9 @@ export function bindWindowsExecutionHttp(baseUrl: string, signal?: AbortSignal):
           let result: Response | undefined
           try {
             // Bun 1.3.11 can reuse an unfinished streamed upload after an
-            // early response. Keep these requests out of its shared pool.
-            result = await fetch(target, { method: String(frame.method), headers: requestHeaders, body, signal: controller.signal, redirect: 'manual', ...(body ? { duplex: 'half' as const, keepalive: false } : {}) })
+            // early response. Keep these requests out of its shared pool; a
+            // relayed member never shares an upstream connection with another.
+            result = await fetch(target, { method: String(frame.method), headers: requestHeaders, body, signal: controller.signal, redirect: 'manual', ...(body ? { duplex: 'half' as const } : {}), ...(body || policy ? { keepalive: false } : {}) })
             await send({ action: 'head', status: result.status, statusText: result.statusText, headers: headers([...result.headers]), body: result.body !== null })
             await response.pump(result.body)
             await send({ action: 'done' })
@@ -288,15 +332,111 @@ export function bindWindowsExecutionHttp(baseUrl: string, signal?: AbortSignal):
       }
     } catch { failed() }
   }
-  const disconnect = () => { for (const transaction of active.values()) transaction.controller.abort(new Error('execution_http_disconnected')) }
-  control.events.on('message', accept); control.events.on('disconnect', disconnect)
+  const disconnect = () => { closing = true; for (const transaction of active.values()) transaction.controller.abort(new Error('execution_http_disconnected')) }
   const close = () => closure ??= (async () => {
-    closing = true; signal?.removeEventListener('abort', onAbort)
+    closing = true
     for (const transaction of active.values()) transaction.controller.abort(new DOMException('Server closing', 'AbortError'))
-    try { await Promise.all([...active.values()].map(value => value.task)) }
-    finally { control.events.removeListener('message', accept); control.events.removeListener('disconnect', disconnect) }
+    await Promise.all([...active.values()].map(value => value.task))
+  })()
+  return Object.freeze({ accept, disconnect, close })
+}
+
+/** Child-local HTTP only; no host-loopback exemption or global fetch override.
+ * Prepared native PID/FILETIME pipe identity is required before construction. */
+export function bindWindowsExecutionHttp(baseUrl: string, signal?: AbortSignal): Readonly<{ close(): Promise<void> }> {
+  assert(windowsExecutionSelfBirth().format === 'windows-filetime')
+  const selectedOrigin = origin(baseUrl), control = windowsExecutionChildControl()
+  assert(control.connected())
+  const nonce = process.env.OPENCODE_V2_WINDOWS_NONCE!, leaseOwnerId = process.env.OPENCODE_V2_WINDOWS_LEASE!
+  let closure: Promise<void> | undefined
+  function failed() { control.disconnect() }
+  const server = createWindowsExecutionHttpServer(selectedOrigin, 'windowsHTTP',
+    message => control.send({ ...message, nonce, leaseOwnerId }, Date.now() + 15000), failed)
+  function accept(value: unknown) {
+    try {
+      const frame = row(value); if (frame.type !== 'windowsHTTP') return
+      assert(frame.nonce === nonce && frame.leaseOwnerId === leaseOwnerId)
+      server.accept(frame)
+    } catch { failed() }
+  }
+  control.events.on('message', accept); control.events.on('disconnect', server.disconnect)
+  const close = () => closure ??= (async () => {
+    signal?.removeEventListener('abort', onAbort)
+    try { await server.close() }
+    finally { control.events.removeListener('message', accept); control.events.removeListener('disconnect', server.disconnect) }
   })()
   const onAbort = () => { void close().catch(failed) }
   signal?.addEventListener('abort', onAbort, { once: true }); if (signal?.aborted) onAbort()
+  return Object.freeze({ close })
+}
+
+/** Owner side of a contained member's remote controller. Windows network
+ * isolation blocks loopback between processes, so the member reaches the
+ * desktop endpoint only through its authenticated control pipe. This server
+ * fetches nothing but the sealed endpoint: one 127.0.0.1 origin, its exact
+ * path, the Streamable HTTP methods and request fields, on a fresh upstream
+ * connection per request. No loopback exemption is installed. The member gains
+ * exactly the app controller endpoint POSIX members reach directly; it is not
+ * narrowed to the member's own team the way the local stdio controller is. */
+export function createWindowsControllerRelayServer(controller: WindowsRemoteController, post: (message: Frame) => Promise<void>,
+  failed: () => void) {
+  return createWindowsExecutionHttpServer(controller.origin, CONTROLLER_FRAME, post, failed, controllerPolicy(controller))
+}
+
+/** Only the sealed controller endpoint and its methods reach `relay`, without
+ * the fragment. Every other call, including another path on that origin,
+ * keeps the original fetch and its original arguments. */
+export function routeWindowsControllerFetch(original: typeof globalThis.fetch, controller: WindowsRemoteController,
+  relay: (request: Request) => Promise<Response>): typeof globalThis.fetch {
+  return Object.assign((input: Parameters<typeof globalThis.fetch>[0], init?: Parameters<typeof globalThis.fetch>[1]) => {
+    let url: URL
+    try { url = new URL(input instanceof Request ? input.url : String(input)) } catch { return original(input, init) }
+    const method = String(init?.method ?? (input instanceof Request ? input.method : 'GET')).toUpperCase()
+    if (url.origin !== controller.origin || url.pathname !== controller.pathname || !CONTROLLER_METHODS.has(method))
+      return original(input, init)
+    return (async () => {
+      const request = new Request(input, init)
+      const exact = new URL(request.url); exact.hash = ''
+      return relay(new Request(exact, { method: request.method, headers: request.headers, body: request.body,
+        signal: request.signal, redirect: request.redirect, ...(request.body ? { duplex: 'half' as const } : {}) }))
+    })()
+  }, { preconnect: original.preconnect })
+}
+
+/** Contained member side. Same-process loopback is permitted inside the
+ * AppContainer, cross-process loopback is not, and the sealed member config is
+ * byte-identical across the cohort, so no per-member listener can carry the
+ * endpoint. Requests for exactly the sealed controller origin cross the
+ * authenticated pipe; every other call reaches the original fetch with its
+ * original arguments. The relay is restored and drained on close. */
+export function bindWindowsControllerRelay(controller: WindowsRemoteController): Readonly<{ close(): Promise<void> }> {
+  assert(windowsExecutionSelfBirth().format === 'windows-filetime')
+  const control = windowsExecutionChildControl()
+  assert(control.connected())
+  const nonce = process.env.OPENCODE_V2_WINDOWS_NONCE!, leaseOwnerId = process.env.OPENCODE_V2_WINDOWS_LEASE!
+  const client = createWindowsExecutionHttpClient(
+    frame => control.send({ ...frame, nonce, leaseOwnerId }, Date.now() + 15000), () => control.disconnect(), CONTROLLER_FRAME)
+  client.bindOrigin(controller.origin)
+  // The child control pipe already authenticated this frame's lease.
+  const accept = (value: unknown) => { try { client.accept(value) } catch { control.disconnect() } }
+  const disconnect = () => { client.fail(new Error('execution_http_disconnected')) }
+  control.events.on('message', accept); control.events.on('disconnect', disconnect)
+  const original = globalThis.fetch
+  const relayed = routeWindowsControllerFetch(original, controller, request => client.fetch(request))
+  globalThis.fetch = relayed
+  let closure: Promise<void> | undefined
+  // Drain inside the child's existing close budget; a late owner reply then
+  // fails the remaining transactions instead of withholding the closed ACK.
+  const close = () => closure ??= (async () => {
+    if (globalThis.fetch === relayed) globalThis.fetch = original
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      await Promise.race([client.close().catch(() => undefined),
+        new Promise<void>(resolve => { timer = setTimeout(resolve, CONTROLLER_DRAIN_MS) })])
+    } finally {
+      clearTimeout(timer); client.fail(new Error('execution_http_cancelled'))
+      control.events.removeListener('message', accept); control.events.removeListener('disconnect', disconnect)
+    }
+  })()
   return Object.freeze({ close })
 }
