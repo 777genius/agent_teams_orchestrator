@@ -153,7 +153,8 @@ function createWindowsCommandObservation() {
  * Only native retained command IDs may retire/close; no new work is admitted. */
 export function createWindowsCommandRequestHandler(options: Readonly<{
   nonce: string; leaseOwnerId: string; ready(): boolean; closing(): boolean
-  assertLive(allowClosing: boolean): Promise<void>; request: WindowsNativeBroker['request']; failed(): void
+  assertLive(allowClosing: boolean, operation: ExecutionCommandOperation): Promise<void>
+  request: WindowsNativeBroker['request']; failed(): void
 }>) {
   const replay = createWindowsCommandRequestReplay(), observation = createWindowsCommandObservation()
   const operations = new Set(['commandStart', 'commandRead', 'commandStatus', 'commandWriteStdin', 'commandEndStdin', 'commandRetire', 'commandClose'])
@@ -176,7 +177,7 @@ export function createWindowsCommandRequestHandler(options: Readonly<{
       id = record.id as string; authority = replay.admit(id, operation)
       observed = observation.admit(operation, input)
       if (options.closing() && !lifecycle.has(operation)) { observation.failed(observed); await reply(false); return }
-      await options.assertLive(lifecycle.has(operation))
+      await options.assertLive(lifecycle.has(operation), operation)
       if (options.closing() && !lifecycle.has(operation)) { observation.failed(observed); await reply(false); return }
       observation.native(observed)
       const result = await options.request(operation, operation === 'commandStart' ? { ...input, commandId: randomUUID() } : input)
@@ -478,7 +479,7 @@ export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, l
   let mapping: WindowsExecutionMapping | undefined, nativeMapping: unknown, stopped = false, started = false, closed = false
   const commandRequest = createWindowsCommandRequestHandler({ nonce, leaseOwnerId,
     ready: () => !!mapping && started, closing: () => stopped,
-    assertLive: allowClosing => assertLive(allowClosing), request: (operation, input) => broker!.request(operation, input),
+    assertLive: (allowClosing, operation) => assertCommandLive(allowClosing, operation), request: (operation, input) => broker!.request(operation, input),
     failed: () => child.emit('error', new Error('execution_native_command_unknown')),
   })
   let mainExit: ReturnType<typeof observeWindowsHeldMainExit> | undefined
@@ -535,11 +536,23 @@ export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, l
       timer = setTimeout(() => reject(new Error('execution_timeout')), deadline - Date.now()); abort = () => reject(new Error('execution_cancelled')); signal?.addEventListener('abort', abort, { once: true }); if (signal?.aborted) abort()
     })]) } finally { clearTimeout(timer); if (abort) signal?.removeEventListener('abort', abort) }
   }
-  async function assertLive(allowClosing = false) {
+  function liveMapping(allowClosing: boolean): WindowsExecutionMapping {
     assert(mapping, 'execution_containment_unqualified:assert_mapping:0')
     assert(!stopped || allowClosing, 'execution_containment_unqualified:assert_stopped:0')
     assert(!broker!.ended(), 'execution_containment_unqualified:assert_broker:0')
+    return mapping
+  }
+  async function assertLive(allowClosing = false) {
+    liveMapping(allowClosing)
     assert(equal(await broker!.request('assertLive'), nativeMapping), 'execution_identity_mismatch')
+  }
+  // Native classifies the command operation and may reuse its bounded complete
+  // proof only for stdio data; the compact receipt still binds this exact scope.
+  async function assertCommandLive(allowClosing: boolean, commandOperation: ExecutionCommandOperation) {
+    const current = liveMapping(allowClosing)
+    const live = row(await broker!.request('assertLive', { commandOperation }))
+    assert(Object.keys(live).sort().join(',') === 'anchorsReceiptId,nonce' && live.nonce === nonce &&
+      live.anchorsReceiptId === current.realpathAnchors.receiptId, 'execution_identity_mismatch')
   }
   let preparation: Promise<WindowsExecutionMapping> | undefined, retirement: Promise<WindowsKernelRetirement> | undefined
   let deferredRuntime = false, activated = false

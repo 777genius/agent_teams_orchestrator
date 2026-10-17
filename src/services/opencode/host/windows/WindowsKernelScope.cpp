@@ -2917,6 +2917,7 @@ struct AttributeList {
   }
 };
 #include "WindowsNativeCommand.hpp"
+#include "WindowsNativeCommandLiveness.hpp"
 #include "WindowsNativeRunState.hpp"
 #include "WindowsNativeRunControl.hpp"
 // Self-image custody is deliberately not a general copy/path operation. Its
@@ -3106,6 +3107,7 @@ struct Scope {
   OwnerStore *owners = nullptr;
   bool physicalCleanupProof = false;
   bool metadataNoChildCleanupProof = false;
+  CommandLivenessGate commandLiveness;
   void assertRealpathAnchorsLive() const {
     require(!stopping, "execution_identity_mismatch");
     for (const auto &anchor : realpathAnchors)
@@ -3114,6 +3116,15 @@ struct Scope {
     assertProjectRootsLive(*this);
     assertAncestorMetadataLive(*this);
     if (realpathDll) realpathDll->assertLive();
+  }
+  // The original live preconditions, then every anchor and ACL proof.
+  void assertLiveComplete() {
+    require(!stopping && !exited() && active() > 0, "execution_identity_mismatch");
+    assertRealpathAnchorsLive();
+  }
+  // The same constant-time preconditions; an error refuses proof reuse.
+  bool liveWithoutReconciliation() noexcept {
+    try { return !stopping && !exited() && active() > 0; } catch (...) { return false; }
   }
   ~Scope() {
     const bool mainNeverCreated = !process;
@@ -5516,10 +5527,25 @@ int wmain(int argc, wchar_t **argv) {
           scope->send(object(input, L"value"));
           flag(value, L"sent", true);
         } else if (operation == L"assertLive") {
-          require(scope && !scope->stopping && !scope->exited() && scope->active() > 0,
-                  "execution_identity_mismatch");
-          scope->assertRealpathAnchorsLive();
-          value = scope->mapping;
+          require(static_cast<bool>(scope), "execution_identity_mismatch");
+          // Every reconciliation after launch passes this one gate, so any
+          // failure also discards the proof command stdio data may reuse. The
+          // native policy, never the caller, selects which operations reuse it.
+          const bool command = input.Size() != 0;
+          require(!command || input.Size() == 1, "execution_invalid_response");
+          scope->commandLiveness.admit(
+              command ? commandLivenessKind(text(input, L"commandOperation"))
+                      : CommandLivenessKind::complete,
+              [] { return static_cast<std::uint64_t>(GetTickCount64()); },
+              [&] { return scope->liveWithoutReconciliation(); },
+              [&] { scope->assertLiveComplete(); });
+          if (!command) {
+            value = scope->mapping;
+          } else {
+            str(value, L"nonce", scope->launchNonce);
+            str(value, L"anchorsReceiptId",
+                text(object(scope->mapping, L"realpathAnchors"), L"receiptId"));
+          }
         } else if (operation == L"retire") {
           require(static_cast<bool>(scope), "cleanup_unknown");
           ULONGLONG retirementDeadline = 0;
