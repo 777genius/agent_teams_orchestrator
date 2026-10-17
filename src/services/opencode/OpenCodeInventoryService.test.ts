@@ -501,7 +501,8 @@ describe('OpenCodeInventoryService parsers', () => {
     })
 
     expect(result.code).toBe(1)
-    expect(result.error).toContain('ENOENT')
+    // Bun on Windows reports a missing executable without the errno text.
+    expect(result.error).toContain(process.platform === 'win32' ? 'Executable not found' : 'ENOENT')
     expect(result.stdout).toBe('')
     expect(result.stderr).toBe('')
   })

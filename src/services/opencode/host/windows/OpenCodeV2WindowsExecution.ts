@@ -546,8 +546,9 @@ export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, l
     liveMapping(allowClosing)
     assert(equal(await broker!.request('assertLive'), nativeMapping), 'execution_identity_mismatch')
   }
-  // Native classifies the command operation and may reuse its bounded complete
-  // proof only for stdio data; the compact receipt still binds this exact scope.
+  // Native classifies the command operation: stdio data may reuse its bounded
+  // complete proof and retire/close need only its constant-time checks; the
+  // compact receipt still binds this exact scope.
   async function assertCommandLive(allowClosing: boolean, commandOperation: ExecutionCommandOperation) {
     const current = liveMapping(allowClosing)
     const live = row(await broker!.request('assertLive', { commandOperation }))
