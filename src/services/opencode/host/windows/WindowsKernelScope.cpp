@@ -1325,10 +1325,12 @@ class SelectedControllerConfig {
     boundTeamId = teamId;
   }
 public:
-  void assertConfigLive(PSID package) const {
+  void assertConfigLive(PSID package,
+                        const std::vector<std::wstring> *cohortSids = nullptr) const {
     require(equalPath(finalPath(root.value), extended(rootPath)) &&
                 equalPath(finalPath(config.value), extended(path)) &&
-                fileIdentity(config.value, owner, false, package).Stringify() == identity.Stringify() &&
+                fileIdentity(config.value, owner, false, package, cohortSids).Stringify() ==
+                    identity.Stringify() &&
                 heldFileSha256(config.value) == sha256,
             "run_control_config_identity");
     require(configAncestors.size() == configAncestorIdentities.size(),
@@ -1346,7 +1348,7 @@ public:
     }
     if (database) {
       require(equalPath(finalPath(database.value), extended(databasePath)) &&
-                  fileIdentity(database.value, owner, false, package).Stringify() ==
+                  fileIdentity(database.value, owner, false, package, cohortSids).Stringify() ==
                       databaseIdentity.Stringify(),
               "execution_database_alias");
     } else
@@ -1355,7 +1357,7 @@ public:
   }
   void assertLive(PSID package,
                   const std::vector<std::wstring> *cohortSids = nullptr) const {
-    assertConfigLive(package);
+    assertConfigLive(package, cohortSids);
     if (remoteController) {
       require(!mcpRoot && mcpRootPath.empty() && mcpAncestors.empty() && inboxes.empty(),
               "run_controller_config_unknown");
@@ -1863,6 +1865,8 @@ public:
   }
   JsonObject validateSelectedProfile(const JsonObject &input) {
     auto root = text(input, L"root"), database = text(input, L"databasePath");
+    const auto cohortSids = sealedCohort ? sealedCohortSids() : std::vector<std::wstring>();
+    const auto *cohortSidsPtr = sealedCohort ? &cohortSids : nullptr;
     require(database.size() > root.size() + 1 && equalPath(database.substr(0, root.size()), root) &&
                 database[root.size()] == L'\\',
             "execution_database_alias");
@@ -1895,15 +1899,18 @@ public:
       value.ancestors = holdSelectedAncestors(database);
       value.root = holdSelectedDirectory(root);
       value.parent = holdSelectedDirectory(parent);
-      value.rootIdentity = fileIdentity(value.root.value, value.owner, true, selectedPackage);
-      value.parentIdentity = fileIdentity(value.parent.value, value.owner, true, selectedPackage);
+      value.rootIdentity =
+          fileIdentity(value.root.value, value.owner, true, selectedPackage, cohortSidsPtr);
+      value.parentIdentity =
+          fileIdentity(value.parent.value, value.owner, true, selectedPackage, cohortSidsPtr);
       value.admittedDirectories = admitted;
       for (const auto &path : admitted) {
         SelectedProfileDirectory directory;
         directory.path = path;
         directory.ancestors = holdSelectedAncestors(path);
         directory.file = holdSelectedDirectory(path);
-        directory.identity = fileIdentity(directory.file.value, value.owner, true, selectedPackage);
+        directory.identity =
+            fileIdentity(directory.file.value, value.owner, true, selectedPackage, cohortSidsPtr);
         value.directories.push_back(std::move(directory));
       }
       wchar_t filesystem[64]{};
@@ -1931,9 +1938,9 @@ public:
     require(
         equalPath(finalPath(selected.root.value), extended(root)) &&
             equalPath(finalPath(selected.parent.value), extended(parent)) &&
-            fileIdentity(selected.root.value, selected.owner, true, selectedPackage).Stringify() ==
-                selected.rootIdentity.Stringify() &&
-            fileIdentity(selected.parent.value, selected.owner, true, selectedPackage)
+            fileIdentity(selected.root.value, selected.owner, true, selectedPackage, cohortSidsPtr)
+                    .Stringify() == selected.rootIdentity.Stringify() &&
+            fileIdentity(selected.parent.value, selected.owner, true, selectedPackage, cohortSidsPtr)
                     .Stringify() == selected.parentIdentity.Stringify(),
         "execution_owner_unknown");
     if (!selected.database) {
@@ -1945,12 +1952,13 @@ public:
       else {
         require(equalPath(finalPath(file.value), extended(database)), "execution_database_alias");
         selected.databaseIdentity =
-            fileIdentity(file.value, selected.owner, false, selectedPackage);
+            fileIdentity(file.value, selected.owner, false, selectedPackage, cohortSidsPtr);
         selected.database = std::move(file);
       }
     } else
       require(equalPath(finalPath(selected.database.value), extended(database)) &&
-                  fileIdentity(selected.database.value, selected.owner, false, selectedPackage)
+                  fileIdentity(selected.database.value, selected.owner, false, selectedPackage,
+                               cohortSidsPtr)
                           .Stringify() == selected.databaseIdentity.Stringify(),
               "execution_database_alias");
     JsonObject result;
@@ -1975,8 +1983,11 @@ public:
                 database[root.size()] == L'\\',
             "execution_database_alias");
     const auto owner = currentSid();
+    const auto cohortSids = sealedCohort ? sealedCohortSids() : std::vector<std::wstring>();
+    const auto *cohortSidsPtr = sealedCohort ? &cohortSids : nullptr;
     Handle heldRoot(holdSelectedDirectory(root));
-    const auto rootIdentity = fileIdentity(heldRoot.value, owner, true, selectedPackage);
+    const auto rootIdentity =
+        fileIdentity(heldRoot.value, owner, true, selectedPackage, cohortSidsPtr);
     const auto configDirectory = root + L"\\config\\opencode";
     const auto configPath = configDirectory + L"\\opencode.json";
     auto checkedParents = holdSelectedAncestors(root);
@@ -2013,7 +2024,7 @@ public:
         return Handle();
       }
       requireAlias(equalPath(finalPath(value.value), extended(path)), "execution_path_alias", __LINE__);
-      fileIdentity(value.value, owner, directory, selectedPackage);
+      fileIdentity(value.value, owner, directory, selectedPackage, cohortSidsPtr);
       return value;
     };
 
@@ -2065,7 +2076,8 @@ public:
     require(GetFileInformationByHandleEx(config.value, FileStandardInfo, &before, sizeof(before)) &&
                 before.EndOfFile.QuadPart >= 0 && before.EndOfFile.QuadPart <= 4 * 1024 * 1024,
             "run_control_config_budget");
-    const auto configIdentity = fileIdentity(config.value, owner, false, selectedPackage);
+    const auto configIdentity =
+        fileIdentity(config.value, owner, false, selectedPackage, cohortSidsPtr);
     FILE_STANDARD_INFO after{};
     require(GetFileInformationByHandleEx(config.value, FileStandardInfo, &after, sizeof(after)) &&
                 before.EndOfFile.QuadPart == after.EndOfFile.QuadPart,
@@ -2079,6 +2091,8 @@ public:
     require(selectedConfigs.size() < 64, "run_control_selection_budget");
     auto root = text(input, L"root"), database = text(input, L"databasePath");
     auto teamId = text(input, L"teamId");
+    const auto cohortSids = sealedCohort ? sealedCohortSids() : std::vector<std::wstring>();
+    const auto *cohortSidsPtr = sealedCohort ? &cohortSids : nullptr;
     require(validTeamId(teamId), "run_control_selection_missing");
     auto found = selectedProfiles.find(root + L"|" + database);
     require(found != selectedProfiles.end(), "run_control_selection_missing");
@@ -2092,8 +2106,9 @@ public:
     require(std::find(selected.admittedDirectories.begin(), selected.admittedDirectories.end(),
                       directory) != selected.admittedDirectories.end(),
             "run_control_selection_missing");
-    require(fileIdentity(selected.root.value, selected.owner, true, selectedPackage).Stringify() ==
-                selected.rootIdentity.Stringify(), "run_control_selection_changed");
+    require(fileIdentity(selected.root.value, selected.owner, true, selectedPackage, cohortSidsPtr)
+                    .Stringify() == selected.rootIdentity.Stringify(),
+            "run_control_selection_changed");
     // The config pathname is fixed by the existing private selected profile,
     // never an arbitrary basename, serialized HANDLE or ExpectedBinding DTO.
     auto checkedParents = holdSelectedAncestors(configPath);
@@ -2102,7 +2117,7 @@ public:
                                FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
     require(static_cast<bool>(config) && equalPath(finalPath(config.value), extended(configPath)),
             "run_control_config_identity");
-    fileIdentity(config.value, selected.owner, false, selectedPackage);
+    fileIdentity(config.value, selected.owner, false, selectedPackage, cohortSidsPtr);
     FILE_STANDARD_INFO configSize{};
     require(GetFileInformationByHandleEx(config.value, FileStandardInfo, &configSize,
                                          sizeof(configSize)) &&
@@ -4438,6 +4453,9 @@ public:
       OwnerStore &owners, const std::wstring &dataRoot,
       const std::vector<std::wstring> &ids) {
     const std::wstring root = extended(dataRoot);
+    const auto cohortSids =
+        owners.sealedCohort ? owners.sealedCohortSids() : std::vector<std::wstring>();
+    const auto *cohortSidsPtr = owners.sealedCohort ? &cohortSids : nullptr;
     std::pair<std::wstring, SelectedControllerConfig *> first{L"", nullptr};
     for (const auto &id : ids) {
       auto found = owners.selectedConfigs.find(id);
@@ -4446,7 +4464,7 @@ public:
       const std::wstring selectedRoot = extended(selected.rootPath);
       require(selectedRoot == root || selectedRoot.rfind(root + L"\\", 0) == 0,
               "run_control_selection_missing");
-      selected.assertConfigLive(owners.selectedPackage);
+      selected.assertConfigLive(owners.selectedPackage, cohortSidsPtr);
       if (!first.second)
         first = {id, &selected};
     }
@@ -4465,9 +4483,15 @@ public:
       if (entry.second->directory() != directory)
         continue;
       require(owners.runStateRoots[entry.first] == dataRoot, "run_state_identity_changed");
-      if (!selectionIds.empty())
-        require(owners.runStateSelections[entry.first] == selectionIds,
-                "run_control_selection_missing");
+      if (!selectionIds.empty()) {
+        // A state first issued attach-only carries no selections yet. The first
+        // qualified selection list is adopted once; later lists must match it.
+        auto &recorded = owners.runStateSelections[entry.first];
+        if (recorded.empty())
+          recorded = selectionIds;
+        else
+          require(recorded == selectionIds, "run_control_selection_missing");
+      }
       created = false;
       return *entry.second;
     }
@@ -4689,6 +4713,55 @@ public:
     state.parentProcess_ = std::move(heldBun);
   }
 
+  // Discovery and composition join the sealed cohort before any custody
+  // re-check: member launch grants the cohort's package SIDs on the same
+  // selected profile paths this broker is about to inspect and admit. No
+  // selectionIds key exists here, so no selection state is ever issued, and
+  // a missing namespace is certified exactly as discovery certifies it.
+  static JsonObject attachCohort(OwnerStore &owners, const JsonObject &input) {
+    exactObject(input, {L"mode", L"directory", L"dataRoot", L"teamId", L"runId"},
+                "run_state_start_changed");
+    require(text(input, L"mode") == L"attach", "run_state_start_changed");
+    const auto directory = text(input, L"directory"), dataRoot = text(input, L"dataRoot");
+    validateRunNamespace(directory, dataRoot);
+    require(validTeamId(text(input, L"teamId")) && !text(input, L"runId").empty(),
+            "run_state_start_changed");
+    const bool retained = std::any_of(owners.runStates.begin(), owners.runStates.end(),
+        [&](const auto &entry) { return entry.second->directory() == directory; });
+    if (!retained && namespaceAbsent(owners, directory, dataRoot)) {
+      JsonObject result;
+      flag(result, L"absent", true);
+      return result;
+    }
+    bool created = false;
+    auto &state = inRole("private_owner_discover_selection", [&]() -> State & {
+      return issueState(owners, dataRoot, directory, false, created, {});
+    });
+    if (created) state.select();
+    const auto binding = state.binding();
+    require(validTeamId(text(binding, L"teamId")) &&
+                text(binding, L"teamId") == text(input, L"teamId") &&
+                text(binding, L"runId") == text(input, L"runId"),
+            "run_state_start_changed");
+    if (state.cohortSealed()) owners.attachSealedCohort(state.cohort());
+    if (created) {
+      // The endpoint witness runs when this broker first opens the state, so
+      // the later select/discover call that skips its created branch still
+      // gets witnessed owners. A not-yet-written endpoint stays the serving
+      // composition's own tolerance, never an attach failure.
+      try {
+        const auto endpoint = state.readEndpoint();
+        retainOriginalEndpointOwners(state, endpoint);
+        state.adoptEndpointHash(runControlSha256Hex(runControlCanonicalJson(endpoint)));
+      } catch (const NativeError &error) {
+        if (error.code != "run_state_endpoint_missing") throw;
+      }
+    }
+    JsonObject result;
+    str(result, L"stateId", state.id());
+    return result;
+  }
+
   static JsonObject memberPreflight(OwnerStore &owners, const JsonObject &input) {
     exactObject(input,
                 {L"mode", L"directory", L"dataRoot", L"binding", L"root", L"databasePath",
@@ -4711,12 +4784,35 @@ public:
     require(std::find(profile.admittedDirectories.begin(), profile.admittedDirectories.end(),
                       configDirectory) != profile.admittedDirectories.end(),
             "run_control_selection_missing");
-    require(fileIdentity(profile.root.value, profile.owner, true, owners.selectedPackage)
+    // The sealed cohort is joined before any custody re-check: member launch
+    // grants the cohort's package SIDs on these same selected profile paths.
+    bool created = false;
+    auto &state = issueState(owners, dataRoot, directory, false, created, {});
+    if (created) state.select();
+    const auto selectedEndpoint = state.readEndpoint();
+    retainOriginalEndpointOwners(state, selectedEndpoint);
+    state.adoptEndpointHash(runControlSha256Hex(runControlCanonicalJson(selectedEndpoint)));
+    const auto before = state.memberPreflightWitness();
+    const auto endpoint = object(before, L"endpoint");
+    const auto startBefore = text(before, L"startBytes");
+    require(runControlCanonicalJson(state.binding()) ==
+                runControlCanonicalJson(object(input, L"binding")),
+            "run_state_start_changed");
+    require(state.cohortSealed(), "run_state_start_changed");
+    const auto cohort = state.cohort();
+    owners.attachSealedCohort(cohort);
+    const auto cohortSids = owners.sealedCohortSids();
+
+    // Native selected-profile and fixed-config qualification is complete
+    // before any selectedConfigIds or controller cache.
+    require(fileIdentity(profile.root.value, profile.owner, true, owners.selectedPackage,
+                         &cohortSids)
                     .Stringify() == profile.rootIdentity.Stringify() &&
-                fileIdentity(profile.parent.value, profile.owner, true, owners.selectedPackage)
+                fileIdentity(profile.parent.value, profile.owner, true, owners.selectedPackage,
+                             &cohortSids)
                     .Stringify() == profile.parentIdentity.Stringify() &&
                 fileIdentity(profile.database.value, profile.owner, false,
-                             owners.selectedPackage)
+                             owners.selectedPackage, &cohortSids)
                     .Stringify() == profile.databaseIdentity.Stringify(),
             "run_control_selection_changed");
     auto configAncestors = owners.holdSelectedAncestors(configPath);
@@ -4736,26 +4832,7 @@ public:
                 heldFileSha256(config.value) == expectedHash,
             "run_control_config_identity");
     const auto configIdentity =
-        fileIdentity(config.value, profile.owner, false, owners.selectedPackage);
-
-    // Native selected-profile and fixed-config qualification is complete. The
-    // run state is selected before any selectedConfigIds or controller cache.
-    bool created = false;
-    auto &state = issueState(owners, dataRoot, directory, false, created, {});
-    if (created) state.select();
-    const auto selectedEndpoint = state.readEndpoint();
-    retainOriginalEndpointOwners(state, selectedEndpoint);
-    state.adoptEndpointHash(runControlSha256Hex(runControlCanonicalJson(selectedEndpoint)));
-    const auto before = state.memberPreflightWitness();
-    const auto endpoint = object(before, L"endpoint");
-    const auto startBefore = text(before, L"startBytes");
-    require(runControlCanonicalJson(state.binding()) ==
-                runControlCanonicalJson(object(input, L"binding")),
-            "run_state_start_changed");
-    require(state.cohortSealed(), "run_state_start_changed");
-    const auto cohort = state.cohort();
-    owners.attachSealedCohort(cohort);
-    const auto cohortSids = owners.sealedCohortSids();
+        fileIdentity(config.value, profile.owner, false, owners.selectedPackage, &cohortSids);
 
     HANDLE rootDuplicate = nullptr, databaseDuplicate = nullptr;
     require(DuplicateHandle(GetCurrentProcess(), profile.root.value, GetCurrentProcess(),
@@ -4775,11 +4852,12 @@ public:
     if (!memberConfig->remoteController) memberConfig->bindInbox(teamId, &cohortSids);
     memberConfig->assertLive(owners.selectedPackage, &cohortSids);
     const auto rootIdentity =
-        fileIdentity(profile.root.value, profile.owner, true, owners.selectedPackage);
+        fileIdentity(profile.root.value, profile.owner, true, owners.selectedPackage, &cohortSids);
     const auto parentIdentity =
-        fileIdentity(profile.parent.value, profile.owner, true, owners.selectedPackage);
+        fileIdentity(profile.parent.value, profile.owner, true, owners.selectedPackage, &cohortSids);
     const auto databaseIdentity =
-        fileIdentity(profile.database.value, profile.owner, false, owners.selectedPackage);
+        fileIdentity(profile.database.value, profile.owner, false, owners.selectedPackage,
+                     &cohortSids);
     IJsonValue controllerRootValue = JsonValue::CreateNullValue();
     if (memberConfig->mcpRoot) {
       const auto physical =
@@ -4864,6 +4942,9 @@ public:
 
   static JsonObject request(OwnerStore &owners, const std::wstring &operation,
                             const JsonObject &input) {
+    if (operation == L"runStateSelect" && input.HasKey(L"mode") &&
+        text(input, L"mode") == L"attach")
+      return attachCohort(owners, input);
     if (operation == L"runStateSelect" && input.HasKey(L"mode") &&
         text(input, L"mode") == L"memberPreflight")
       return memberPreflight(owners, input);

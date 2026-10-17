@@ -136,6 +136,19 @@ async function windowsAdmitProfiles(broker: WindowsNativeBroker, profiles: reado
   }
   return ids
 }
+/** Join the sealed cohort on this fresh broker before any native custody
+ * re-check. Member launch grants the cohort's package SIDs on the selected
+ * profile paths; without the attach, a broker created for discovery or
+ * composition would refuse those grants as foreign. Never submits
+ * selectionIds — selection state stays the admitted selection's own. */
+async function attachWindowsRunCohort(broker: WindowsNativeBroker, directory: string,
+  dataRoot: string, teamId: string, runId: string, deadline: number): Promise<void> {
+  const value = await broker.request('runStateSelect', {
+    mode: 'attach', directory, dataRoot, teamId, runId,
+  }, deadline) as { absent?: true; stateId?: string }
+  executionAssert(value && (value.absent === true || typeof value.stateId === 'string'),
+    'run_control_native_unknown')
+}
 async function windowsComposition(directory: string, select?: WindowsCompositionSelection,
   deadline = Date.now() + MAX_OPERATION_MS): Promise<WindowsRunComposition> {
   const existing = windowsRuns.get(directory)
@@ -148,6 +161,9 @@ async function windowsComposition(directory: string, select?: WindowsComposition
     const broker = createWindowsNativeBroker(await resolveWindowsNativeArtifact())
     broker.events.on('error', () => {})
     try {
+      await attachWindowsRunCohort(broker, directory, select.dataRoot,
+        select.mode === 'discover' ? select.teamId : select.binding.teamId,
+        select.mode === 'discover' ? select.runId : select.binding.runId, deadline)
       const selectionIds = await windowsAdmitProfiles(broker, select.profiles, deadline,
         select.mode === 'discover' ? select.teamId : select.binding.teamId)
       const input = select.mode === 'reserve'
@@ -170,6 +186,7 @@ async function windowsDiscover(directory: string, dataRoot: string, teamId: stri
   broker.events.on('error', () => {})
   try {
     const deadline = Date.now() + MAX_OPERATION_MS
+    await attachWindowsRunCohort(broker, directory, dataRoot, teamId, runId, deadline)
     const profiles = await windowsProfileAdmissionsForDataRoot(dataRoot, broker, deadline)
     // Only discovery may submit zero selections. Native code must certify a
     // missing namespace without issuing state; a present fence still vetoes it.
@@ -205,6 +222,8 @@ async function windowsCompositionFor(record: RunWindowsControlRecord,
   discoveryBroker.events.on('error', () => {})
   let profiles: readonly WindowsProfileAdmission[]
   try {
+    await attachWindowsRunCohort(discoveryBroker, record.directory, windowsDataRoot(record.directory),
+      record.binding.teamId, record.binding.runId, deadline)
     profiles = await windowsProfileAdmissionsForDataRoot(windowsDataRoot(record.directory), discoveryBroker, deadline)
   } finally { await discoveryBroker.close() }
   return windowsComposition(record.directory, {

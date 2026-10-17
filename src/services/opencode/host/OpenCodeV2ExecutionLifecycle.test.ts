@@ -17,6 +17,7 @@ if (isolatedBirthProbe) mock.module('./windows/OpenCodeV2WindowsNativeBroker.js'
   resolveWindowsNativeArtifact: async () => ({ path: 'C:\\\\TEST\\\\helper.exe', sha256: 'a'.repeat(64), arch: 'x64' }),
   resolveWindowsRealpathArtifact: async () => ({ path: 'C:\\\\TEST\\\\realpath.dll', sha256: 'b'.repeat(64), arch: 'x64' }),
   requireWindowsRealpathArtifact: () => undefined,
+  readWindowsNativeAliasFailure: () => undefined,
 }))
 const { isExecutionCleanupReceipt, retireExecutionChild } = await import('./OpenCodeV2ExecutionLifecycle.js')
 const { createWindowsCommandRequestHandler, createWindowsCommandRequestReplay, observeWindowsHeldMainExit, retireWindowsNativeScope, windowsBirth } = await import('./windows/OpenCodeV2WindowsExecution.js')

@@ -16,7 +16,7 @@ import { assertExecutionPlatformAvailable, launchExecutionPlatform, planExecutio
 import { acquireExecutionProfileOwner } from './OpenCodeV2ExecutionOwner.js'
 import { initializeOpenCodeV2ExecutionAuth } from './OpenCodeV2ExecutionAuth.js'
 import { readOpenCodeV2SelectedAuth } from './OpenCodeV2ExecutionOAuth.js'
-import { bindWindowsExecutionSelectedConfig, closeWindowsExecutionPlan, consumeWindowsExecutionLaunchNonce, ownerFilesystemForWindowsPlan, preflightWindowsMemberExecution,
+import { attachWindowsRunMemberCohort, bindWindowsExecutionSelectedConfig, closeWindowsExecutionPlan, consumeWindowsExecutionLaunchNonce, ownerFilesystemForWindowsPlan, preflightWindowsMemberExecution,
   type WindowsSelectedAuthMetadata } from './windows/OpenCodeV2WindowsExecution.js'
 import { selectWindowsRunMemberPreflightForPlan } from '../bridge/OpenCodeV2RunControl.js'
 import { resolveOpenCodeV2DarwinControllerRuntimeClosure } from '../profile/OpenCodeV2ExecutionReceipt.js'
@@ -245,10 +245,17 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
     check()
     if (plan.platform === 'win32') {
       windowsFilesystem = ownerFilesystemForWindowsPlan(plan.concrete)
-      await windowsFilesystem.validateSelectedProfile(profile.root, profile.databasePath, context.deadline, context.signal, profile.directory)
-      check()
       const memberPreflight = !('purpose' in profile.selection)
         ? await selectWindowsRunMemberPreflightForPlan(plan.concrete, context, profile as SelectedExecutionProfile) : null
+      if (memberPreflight) {
+        // The sealed cohort is joined on this plan broker before selected
+        // profile custody: an earlier member launch has already granted its
+        // package SIDs on these same profile paths.
+        await attachWindowsRunMemberCohort(plan.concrete, memberPreflight, context.deadline, context.signal)
+        check()
+      }
+      await windowsFilesystem.validateSelectedProfile(profile.root, profile.databasePath, context.deadline, context.signal, profile.directory)
+      check()
       if (memberPreflight) {
         await preflightWindowsMemberExecution(plan.concrete, memberPreflight, context.deadline, context.signal)
         check()

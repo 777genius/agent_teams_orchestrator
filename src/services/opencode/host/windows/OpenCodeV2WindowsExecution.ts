@@ -423,6 +423,22 @@ export async function preflightWindowsMemberExecution(plan: WindowsLaunchPlan,
     attempt.state = 'poisoned'; attempt.result = undefined; throw error
   }
 }
+/** Native member cohort join before selected-profile custody: an earlier
+ * member launch has already granted the cohort's package SIDs on these same
+ * profile paths, and the plan broker has no cohort attached yet. */
+export async function attachWindowsRunMemberCohort(plan: WindowsLaunchPlan,
+  selection: WindowsMemberPreflightSelection, deadline: number, signal?: AbortSignal): Promise<void> {
+  signal?.throwIfAborted()
+  assert(Number.isFinite(deadline) && deadline > Date.now(), 'execution_timeout')
+  assert(plans.has(plan), 'execution_owner_unknown')
+  const broker = brokers.get(plan); assert(broker && !broker.ended(), 'execution_owner_unknown')
+  const selectors = selection.selectors
+  const value = row(await broker.request('runStateSelect', {
+    mode: 'attach', directory: selectors.directory, dataRoot: selectors.dataRoot,
+    teamId: selectors.binding.teamId, runId: selectors.binding.runId,
+  }, deadline, signal))
+  assert(value.absent === true || typeof value.stateId === 'string', 'run_control_native_unknown')
+}
 /** Native member nonce is consumed before ownerIdentity and physical fences.
  * A nonmember plan retains the existing private random launch nonce policy. */
 export function consumeWindowsExecutionLaunchNonce(plan: WindowsLaunchPlan): string {
