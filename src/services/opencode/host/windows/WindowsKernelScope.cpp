@@ -1282,6 +1282,7 @@ class SelectedControllerConfig {
   }
   void bindInbox(const std::wstring &teamId,
                  const std::vector<std::wstring> *cohortSids) {
+    require(!remoteController, "run_controller_config_unknown");
     require(validTeamId(teamId), "run_controller_inbox_unknown");
     bindControllerBase();
     if (!boundTeamId.empty()) {
@@ -4770,7 +4771,8 @@ public:
                                      profile.owner, expectedHash, teamId,
                                      owners.selectedPackage, std::move(configAncestors)));
     owners.ensureControllerAuthority(*memberConfig, teamId);
-    memberConfig->bindInbox(teamId, &cohortSids);
+    // A remote controller has no local inbox, and its assertLive requires none.
+    if (!memberConfig->remoteController) memberConfig->bindInbox(teamId, &cohortSids);
     memberConfig->assertLive(owners.selectedPackage, &cohortSids);
     const auto rootIdentity =
         fileIdentity(profile.root.value, profile.owner, true, owners.selectedPackage);
