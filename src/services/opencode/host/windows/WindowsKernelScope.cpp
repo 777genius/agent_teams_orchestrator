@@ -3175,8 +3175,14 @@ struct Scope {
     try {
       empty = !job || active() == 0;
       if (empty && mainNeverCreated) metadataNoChildCleanupProof = true;
-      if (empty)
+      if (empty) {
+        // The killed job's empty accounting is the physical cleanup proof:
+        // with no surviving member process, retaining these own grants on
+        // shared profile roots would leave foreign ACEs that every later
+        // cohort-less custody check refuses as private_acl_foreign_allow.
+        physicalCleanupProof = true;
         removeGrants(*this);
+      }
     } catch (...) {
       empty = false;
     }
