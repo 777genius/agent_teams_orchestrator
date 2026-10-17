@@ -12,6 +12,7 @@
 #include <memory>
 #include <mutex>
 #include <sddl.h>
+#include <source_location>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -180,11 +181,14 @@ static JsonObject identity(HANDLE process, DWORD pid) {
   str(value, L"executablePath", image(process));
   return value;
 }
-static std::wstring extended(const std::wstring &value) {
-  requireAlias(value.size() >= 3 && value[1] == L':' && value[2] == L'\\' &&
-              value.find(L"\\..") == std::wstring::npos &&
-              value.find(L"\\.\\") == std::wstring::npos,
-          "execution_path_alias", __LINE__);
+// TEST diagnostic: the same refusal names its calling line and the refused
+// form (1 drive-absolute, 2 parent segment, 3 current segment).
+static std::wstring extended(const std::wstring &value,
+                             const std::source_location caller = std::source_location::current()) {
+  const auto line = static_cast<DWORD>(caller.line());
+  requireAlias(value.size() >= 3 && value[1] == L':' && value[2] == L'\\', "execution_path_alias", line, 1);
+  requireAlias(value.find(L"\\..") == std::wstring::npos, "execution_path_alias", line, 2);
+  requireAlias(value.find(L"\\.\\") == std::wstring::npos, "execution_path_alias", line, 3);
   return L"\\\\?\\" + value;
 }
 static std::wstring finalPath(HANDLE file, DWORD volume = VOLUME_NAME_DOS) {
