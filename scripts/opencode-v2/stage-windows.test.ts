@@ -82,21 +82,23 @@ test('native command liveness reuses one bounded complete proof only for stdio d
   }
   const kinds = (body: string) => body.replaceAll('L"', '"')
     .replaceAll('CommandLivenessKind::data', "'data'").replaceAll('CommandLivenessKind::complete', "'complete'")
+    .replaceAll('CommandLivenessKind::teardown', "'teardown'")
+  const require = (value: unknown, code: string) => { if (!value) throw new Error(code) }
   const classify = slice(header, 'static CommandLivenessKind commandLivenessKind(const std::wstring &operation) {', '\n}\n')
-  const kind = (operation: string) => runInNewContext(`(function () {${kinds(classify)}})()`, {
-    operation, require: (value: unknown, code: string) => { if (!value) throw new Error(code) } })
+  const kind = (operation: string) => runInNewContext(`(function () {${kinds(classify)}})()`, { operation, require })
   for (const operation of ['commandRead', 'commandWriteStdin', 'commandEndStdin', 'commandStatus']) expect(kind(operation)).toBe('data')
-  for (const operation of ['commandStart', 'commandRetire', 'commandClose']) expect(kind(operation)).toBe('complete')
-  for (const operation of ['assertLive', 'commandread', '']) expect(() => kind(operation)).toThrow('execution_invalid_response')
+  expect(kind('commandStart')).toBe('complete')
+  for (const operation of ['commandRetire', 'commandClose']) expect(kind(operation)).toBe('teardown')
+  for (const operation of ['assertLive', 'commandread', 'commandretire', '']) expect(() => kind(operation)).toThrow('execution_invalid_response')
 
   const reuseMs = Number(/static constexpr std::uint64_t reuseMs = (\d+);/.exec(header)?.[1])
   expect(reuseMs).toBe(5000)
   const admit = kinds(slice(header, 'void admit(CommandLivenessKind kind, Now now, Cheap cheap, Complete complete) {', '\n  }\n'))
-    .replace('const std::uint64_t at', 'const at')
+    .replace('const std::uint64_t at', 'const at').replace('const bool live', 'const live')
   const gate = { proven: false, provenAt: 0 }
   let clock = 1_000, cheapLive = true, completeFails = false, completes = 0, cheaps = 0
-  const run = (operation: 'data' | 'complete') => {
-    const context = { ...gate, kind: operation, reuseMs, now: () => clock, cheap: () => { cheaps++; return cheapLive },
+  const run = (operation: 'data' | 'complete' | 'teardown') => {
+    const context = { ...gate, kind: operation, reuseMs, require, now: () => clock, cheap: () => { cheaps++; return cheapLive },
       complete: () => { completes++; clock += 1_300; if (completeFails) throw new Error('anchor_changed') } }
     try { runInNewContext(`(function () {${admit}})()`, context) }
     finally { gate.proven = context.proven; gate.provenAt = context.provenAt }
@@ -109,13 +111,23 @@ test('native command liveness reuses one bounded complete proof only for stdio d
   clock += 4_999; expectComplete('data', false) // Inside the interval, after cheap checks.
   expect(cheaps).toBe(1)
   clock += 1; expectComplete('data', true) // Interval elapsed exactly: complete again.
-  expectComplete('complete', true) // Start/retire/close never reuse a proof.
+  expectComplete('complete', true) // Start never reuses a proof.
   cheapLive = false; expectComplete('data', true) // Cheap refusal falls through to complete.
   cheapLive = true
   completeFails = true; expect(() => run('complete')).toThrow('anchor_changed')
   expect(gate.proven).toBe(false)
   completeFails = false; expectComplete('data', true) // A failed proof is never reused, even in time.
   clock = gate.provenAt - 1; expectComplete('data', true) // Monotonic step back never extends it.
+  // Retire/close never reconcile and neither create nor extend a proof, even
+  // after it expired; a refused constant-time check fails closed and discards it.
+  const proof = { ...gate }, reconciled = completes, checked = cheaps
+  run('teardown'); expect(gate).toEqual(proof)
+  clock += 10_000; run('teardown'); expect(gate).toEqual(proof)
+  expect(completes).toBe(reconciled); expect(cheaps).toBe(checked + 2)
+  cheapLive = false; expect(() => run('teardown')).toThrow('execution_identity_mismatch')
+  expect(gate.proven).toBe(false); expect(completes).toBe(reconciled)
+  cheapLive = true; run('teardown'); expect(gate.proven).toBe(false)
+  expectComplete('data', true) // Teardown left no proof for data to reuse.
 
   // Lifecycle callers (empty input) pass the same gate, so their failure also
   // discards the proof; no other post-launch path reconciles outside it.
