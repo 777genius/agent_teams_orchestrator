@@ -1,21 +1,26 @@
+import { openCodeBunVersion } from '../../../constants/openCodeBunVersion.js'
+import { recordOpenCodeV2ProviderFailure, retainOpenCodeV2InitializationPhase, type RunInitializationPhase } from '../execution/OpenCodeV2Diagnostics.js'
 import { captureOwnedV2ProbeAuthority, buildOwnedV2ProbeProof, type ProbeAuthority } from './OpenCodeV2ProbeProof.js'
-import { readOwnedControllerInbox, readOwnedControllerTools, type ControllerToolProof } from './OpenCodeV2ControllerTools.js'
+import { parseControllerInboxBytes, readOwnedControllerInbox, readOwnedControllerTools, type ControllerToolProof } from './OpenCodeV2ControllerTools.js'
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { readFile, realpath } from 'node:fs/promises'
 import path from 'node:path'
 import { resolveOpenCodeV2ExecutionDelivery } from '../host/OpenCodeV2ExecutionDelivery.js'
+import { assertExecutionPlatformAvailable } from '../host/OpenCodeV2ExecutionPlatform.js'
 import { OpenCodeV2AdmissionService, type QueueIntent } from '../execution/OpenCodeV2AdmissionService.js'
+import { isMutableExecutionReadback } from '../execution/OpenCodeV2TerminalSettlement.js'
 import { OpenCodeV2AdmissionStore } from '../execution/OpenCodeV2AdmissionStore.js'
 import { OpenCodeV2SessionService, verifyExecutionSession } from '../execution/OpenCodeV2SessionService.js'
-import { canonicalExecutionJSON, executionAssert, executionHash, executionRecord, type ExecutionContext, type SessionAuthority } from '../execution/OpenCodeV2ExecutionContracts.js'
-import { acquireExecutionLease, type ExecutionLease } from '../host/OpenCodeV2ExecutionHost.js'
+import { canonicalExecutionJSON, executionAssert, executionHash, executionRecord, OPEN_CODE_V2_WINDOWS_CLOSE_MS, type ExecutionContext, type SessionAuthority } from '../execution/OpenCodeV2ExecutionContracts.js'
+import { acquireExecutionLease, awaitExecutionHostReady, readExecutionCleanupObservation, readExecutionLeaseObservation, type ExecutionLease } from '../host/OpenCodeV2ExecutionHost.js'
+import { createExecutionGraphValidationCohort } from '../host/OpenCodeV2ExecutionBinding.js'
 import { isExecutionCleanupReceipt, type ExecutionCleanupReceipt } from '../host/OpenCodeV2ExecutionLifecycle.js'
 import { createOpenCodeV2ExecutionClient, type ExecutionBridgeClient, type ExecutionLog, type ExecutionMessagePage } from '../transport/OpenCodeV2ExecutionClientFactory.js'
 import { boundOpenCodeRead } from '../transport/OpenCodeBoundedFetch.js'
 import { projectOpenCodeV2Turn } from './OpenCodeV2TurnProjection.js'
 import { verifyOpenCodeV2SilentBootstrap } from './OpenCodeV2BootstrapProjection.js'
-import { OPEN_CODE_V2_RUN_INITIALIZATION_MS, discoverOpenCodeV2Run, parseRunControlRequest, reserveRunControlDirectory, runControlDirectory, serveOpenCodeV2RunControl, writeRunControlFile } from './OpenCodeV2RunControl.js'
+import { OPEN_CODE_V2_RUN_INITIALIZATION_MS, discoverOpenCodeV2Run, readWindowsRunControllerInbox, parseRunControlRequest, readRunProcessIdentity, reserveRunControlDirectory, runControlDirectory, serveOpenCodeV2RunControl, writeRunControlFile } from './OpenCodeV2RunControl.js'
 import type { InstructionReceipt, RunControlRecord, RunControlRequest, RunControlResult, RunExecutionPorts, RunLaunchPlan, RunMemberPlan, RunMemberStatus, RunOwnerState, RunStopMember } from './OpenCodeV2RunTypes.js'
 
 const productionPorts: RunExecutionPorts = { acquire: acquireExecutionLease, client: createOpenCodeV2ExecutionClient }
@@ -23,7 +28,8 @@ const sha = (value: string | Buffer) => createHash('sha256').update(value).diges
 type Member = {
   plan: RunMemberPlan; lease: ExecutionLease; client: ExecutionBridgeClient; authority: SessionAuthority
   store: OpenCodeV2AdmissionStore; session: OpenCodeV2SessionService; state: RunMemberStatus['state']
-  probeAuthority?: ProbeAuthority; bootstrap: InstructionReceipt | null; mcpConnected: boolean; controllerTools?: ControllerToolProof; intents: Map<string, QueueIntent>; deliveryTail: Promise<void>; refusals: Map<string, QueueIntent>
+  creationWrapperEntered: boolean; probeAuthority?: ProbeAuthority; bootstrap: InstructionReceipt | null; mcpConnected: boolean; controllerTools?: ControllerToolProof; intents: Map<string, QueueIntent>; deliveryTail: Promise<void>; refusals: Map<string, QueueIntent>
+  initialization?: Readonly<{ phase: RunInitializationPhase; startedAt: number }>
 }
 
 export function validateRunLaunchPlan(plan: RunLaunchPlan): void {
@@ -57,12 +63,36 @@ export function validateRunLaunchPlan(plan: RunLaunchPlan): void {
 /** One bounded run, in the process that acquired every lease. No durable DTO
  * or caller-supplied ExecutionAuthority is ever converted into lease authority. */
 export class OpenCodeV2RunOwner {
+  private readonly ownerStartedAt = Date.now()
   private readonly members = new Map<string, Member>()
   private readonly active = new Set<Promise<unknown>>()
   private readonly operations = new Set<AbortController>()
   private readonly initializationAbort = new AbortController()
   private readonly acquisitions = new Set<AbortController>()
+  private readonly deferredWindowsControllers = process.platform === 'win32'
   private readonly pendingLeases = new Map<string, ExecutionLease>()
+  // Members share one official graph receipt; their concurrent owner checks
+  // join one in-flight validation. Children keep independent validation.
+  private readonly graphValidation = createExecutionGraphValidationCohort()
+  private startupTail: Promise<void> = Promise.resolve()
+  private readonly startupGate = async <T>(start: () => Promise<T>, signal: AbortSignal | undefined,
+    deadline: number): Promise<T> => {
+    const previous = this.startupTail
+    let release!: () => void
+    const ticket = new Promise<void>(resolve => { release = resolve })
+    this.startupTail = previous.then(() => ticket)
+    try {
+      await awaitExecutionHostReady(previous, deadline - Date.now(), signal)
+      signal?.throwIfAborted()
+      executionAssert(Date.now() < deadline, 'run_stopped')
+      return await start()
+    } catch (error) {
+      // Abort queued physical starts before releasing this original ticket.
+      this.initializationAbort.abort(error)
+      for (const acquisition of this.acquisitions) acquisition.abort(error)
+      throw error
+    } finally { release() }
+  }
   private readonly closing = new Map<ExecutionLease, Promise<ExecutionCleanupReceipt>>()
   private cleanupGraceDeadline = 0
   private state: RunOwnerState = 'starting'
@@ -85,6 +115,8 @@ export class OpenCodeV2RunOwner {
   private statuses(): RunMemberStatus[] {
     return this.plan.members.map(plan => {
       const member = this.members.get(plan.memberId)
+      const initialization = this.state === 'starting' ? member?.initialization : undefined
+      const age = initialization ? Date.now() - initialization.startedAt : 0
       return { memberId: plan.memberId, laneId: plan.laneId, originalSessionId: plan.originalSessionId,
         opencodeSessionId: plan.originalSessionId, runtimeSessionId: plan.originalSessionId,
         profileEpoch: plan.profile.epoch, profileRoot: plan.profile.root, pin: plan.native.version,
@@ -92,6 +124,8 @@ export class OpenCodeV2RunOwner {
         selectedModel: `${plan.profile.selection.model.providerID}/${plan.profile.selection.model.id}`,
         ...(plan.profile.selection.model.variant === undefined ? {} : { selectedVariant: plan.profile.selection.model.variant }),
         state: member?.state ?? 'unknown', bootstrap: member?.bootstrap ?? null,
+        ...(initialization ? { initialization: { phase: initialization.phase,
+          elapsedMs: Number.isFinite(age) ? Math.max(0, Math.min(86_400_000, Math.trunc(age))) : 0 } } : {}),
         ...(member?.controllerTools ? { controllerTools: member.controllerTools } : {}) }
     })
   }
@@ -109,74 +143,162 @@ export class OpenCodeV2RunOwner {
   }
   private async initialize(): Promise<void> {
     const initializationDeadline = Math.min(this.plan.deadline, Date.now() + OPEN_CODE_V2_RUN_INITIALIZATION_MS)
-    for (const memberPlan of this.plan.members) {
-      executionAssert(this.state === 'starting' && Date.now() < initializationDeadline, 'run_stopped')
-      const acquiring = new AbortController()
-      this.acquisitions.add(acquiring)
-      const acquisitionTimer = setTimeout(() => acquiring.abort(new Error('run_acquisition_timeout')), initializationDeadline - Date.now())
-      let lease: ExecutionLease
-      try { lease = await this.ports.acquire(memberPlan.native, memberPlan.profile, this.context(memberPlan, this.plan.deadline, acquiring.signal)) }
-      finally { clearTimeout(acquisitionTimer); this.acquisitions.delete(acquiring) }
-      this.pendingLeases.set(memberPlan.memberId, lease)
-      let member: Member | undefined
-      const initializationTimer = setTimeout(() => this.initializationAbort.abort(new Error('run_initialization_timeout')), initializationDeadline - Date.now())
-      try {
-        executionAssert(this.state === 'starting', 'run_stopped')
-        const client = await this.ports.client(lease.authority, this.context(memberPlan, initializationDeadline, this.initializationAbort.signal))
-        executionAssert(client.authority === lease.authority, 'run_lease_not_owned')
-        const authority: SessionAuthority = { host: lease.authority, teamId: this.plan.binding.teamId, runId: this.plan.binding.runId,
-          laneId: memberPlan.laneId, memberId: memberPlan.memberId, sessionID: memberPlan.originalSessionId,
-          agent: memberPlan.profile.selection.agent, model: memberPlan.profile.selection.model }
-        const store = await OpenCodeV2AdmissionStore.open(this.plan.dataRoot, authority)
-        const session = new OpenCodeV2SessionService(client, store, authority)
-        member = { plan: memberPlan, lease, client, authority, store, session, state: 'unknown', bootstrap: null, mcpConnected: false, intents: new Map(), deliveryTail: Promise.resolve(), refusals: new Map() }
-        this.members.set(memberPlan.memberId, member)
-        this.pendingLeases.delete(memberPlan.memberId)
-        executionAssert(this.state === 'starting', 'run_stopped')
-        await session.reserveSession()
-        const created = await session.createSession(memberPlan.title)
-        member.state = created.disposition
-        await this.persistState()
-        executionAssert(created.disposition === 'accepted' && created.session, 'run_original_session_unknown')
-        // Actual native persistent context, never a queue/resume:false model
-        // turn. There is no published messageID for an instruction entry.
-        const value = { context: memberPlan.bootstrap.value, contextHash: memberPlan.bootstrap.contextHash,
-          briefingHash: memberPlan.bootstrap.briefingHash, teamId: authority.teamId, runId: authority.runId,
-          laneId: authority.laneId, memberId: authority.memberId, originalSessionId: authority.sessionID }
-        const before = await this.cut(client, authority.sessionID)
-        await client.putInstruction(authority.sessionID, memberPlan.bootstrap.key, value)
-        const entries = await client.instructions(authority.sessionID)
-        const after = await this.cut(client, authority.sessionID)
-        verifyOpenCodeV2SilentBootstrap({ before, after, entries, key: memberPlan.bootstrap.key, value })
-        member.bootstrap = { strategy: 'instruction-entry', key: memberPlan.bootstrap.key,
-          contextHash: memberPlan.bootstrap.contextHash, briefingHash: memberPlan.bootstrap.briefingHash,
-          verified: true, missingNativeMessageID: true }
-        await client.connectMcp(memberPlan.controllerMcpName)
-        const servers = await client.mcp()
-        member.mcpConnected = servers.filter(server => server.name === memberPlan.controllerMcpName && server.status === 'connected').length === 1
-        executionAssert(member.mcpConnected, 'run_controller_mcp_unknown')
-        member.controllerTools = await readOwnedControllerTools(client, memberPlan.profile, memberPlan.controllerMcpName, initializationDeadline, this.initializationAbort.signal)
-        if (this.plan.executionProbe?.memberId === memberPlan.memberId)
-          member.probeAuthority = await captureOwnedV2ProbeAuthority(client, this.plan.executionProbe.prepared)
-        await this.persistState()
-      } catch (failure) {
-        // If an object was not yet registered, no lease may escape cleanup.
-        if (!member || this.state !== 'starting') {
-          const closing = this.closeLease(lease)
-          if (member) await boundOpenCodeRead(member.client.dispose(), 2000).catch(() => undefined)
-          await closing.then(() => this.pendingLeases.delete(memberPlan.memberId)).catch(() => undefined)
+    let nextMember = 0, failed = false
+    let firstFailure: unknown
+    const initializeWorker = async (acquireOnly: boolean) => {
+      while (nextMember < this.plan.members.length && !this.initializationAbort.signal.aborted) {
+        const memberPlan = this.plan.members[nextMember++]!
+        try {
+          if (acquireOnly) await this.acquireMember(memberPlan, initializationDeadline)
+          else await this.initializeMember(memberPlan, initializationDeadline)
         }
-        throw failure
-      } finally { clearTimeout(initializationTimer) }
+        catch (error) {
+          if (!failed) { failed = true; firstFailure = error }
+          this.initializationAbort.abort(error)
+          for (const acquisition of this.acquisitions) acquisition.abort(error)
+          throw error
+        }
+      }
     }
-    executionAssert(this.state === 'starting', 'run_stopped')
+    // Parent/child graph reads overlap; the same queue serializes native setup
+    // and runtime/Git. No MCP transport starts before every lease is ready.
+    if (this.deferredWindowsControllers) {
+      await Promise.allSettled(Array.from({ length: Math.min(3, this.plan.members.length) }, () => initializeWorker(true)))
+      if (failed) throw firstFailure
+      nextMember = 0
+    }
+    // Profiles and session identities are disjoint. Bound startup concurrency
+    // while retaining one run deadline and joining every original acquisition.
+    await Promise.allSettled(Array.from({ length: Math.min(3, this.plan.members.length) }, () => initializeWorker(false)))
+    if (failed) throw firstFailure
+    executionAssert(this.state === 'starting' && !this.initializationAbort.signal.aborted &&
+      Date.now() < initializationDeadline, 'run_stopped')
     this.state = 'active'; await this.persistState()
   }
+  private async acquireMember(memberPlan: RunMemberPlan, initializationDeadline: number): Promise<ExecutionLease> {
+    executionAssert(this.state === 'starting' && !this.initializationAbort.signal.aborted &&
+      Date.now() < initializationDeadline, 'run_stopped')
+    const acquiring = new AbortController()
+    this.acquisitions.add(acquiring)
+    const acquisitionTimer = setTimeout(() => acquiring.abort(new Error('run_acquisition_timeout')), initializationDeadline - Date.now())
+    let lease: ExecutionLease
+    try {
+      lease = await this.ports.acquire(memberPlan.native, memberPlan.profile, this.context(memberPlan,
+        this.deferredWindowsControllers ? initializationDeadline : this.plan.deadline, acquiring.signal),
+        this.deferredWindowsControllers ? (start, signal) => this.startupGate(start, signal, initializationDeadline) : undefined,
+        this.graphValidation)
+    } finally { clearTimeout(acquisitionTimer); this.acquisitions.delete(acquiring) }
+    this.pendingLeases.set(memberPlan.memberId, lease)
+    if (this.state !== 'starting' || this.initializationAbort.signal.aborted || acquiring.signal.aborted ||
+        Date.now() >= initializationDeadline) {
+      // Stop may already have taken its pending-lease snapshot. This exact late
+      // owner must start its memoized close before initialization can settle.
+      await this.closeLease(lease).then(() => this.pendingLeases.delete(memberPlan.memberId)).catch(() => undefined)
+      throw acquiring.signal.reason instanceof Error ? acquiring.signal.reason
+        : this.initializationAbort.signal.reason instanceof Error ? this.initializationAbort.signal.reason : new Error('run_stopped')
+    }
+    return lease
+  }
+  private async initializeMember(memberPlan: RunMemberPlan, initializationDeadline: number): Promise<void> {
+    const initializationStartedAt = Date.now()
+    let initializationPhase: RunInitializationPhase | undefined
+    const initializationHistory: { phase: RunInitializationPhase; at: number }[] = []
+    executionAssert(this.state === 'starting' && !this.initializationAbort.signal.aborted &&
+      Date.now() < initializationDeadline, 'run_stopped')
+    const lease = this.pendingLeases.get(memberPlan.memberId) ?? await this.acquireMember(memberPlan, initializationDeadline)
+    let member: Member | undefined
+    const initializationTimer = setTimeout(() => this.initializationAbort.abort(new Error('run_initialization_timeout')), initializationDeadline - Date.now())
+    try {
+      executionAssert(this.state === 'starting' && !this.initializationAbort.signal.aborted &&
+        Date.now() < initializationDeadline, 'run_stopped')
+      const client = await this.ports.client(lease.authority, this.context(memberPlan, initializationDeadline, this.initializationAbort.signal))
+      executionAssert(client.authority === lease.authority, 'run_lease_not_owned')
+      const authority: SessionAuthority = { host: lease.authority, teamId: this.plan.binding.teamId, runId: this.plan.binding.runId,
+        laneId: memberPlan.laneId, memberId: memberPlan.memberId, sessionID: memberPlan.originalSessionId,
+        agent: memberPlan.profile.selection.agent, model: memberPlan.profile.selection.model }
+      const store = await OpenCodeV2AdmissionStore.open(this.plan.dataRoot, authority)
+      const session = new OpenCodeV2SessionService(client, store, authority)
+      member = { plan: memberPlan, lease, client, authority, store, session, state: 'unknown', creationWrapperEntered: false,
+        bootstrap: null, mcpConnected: false, intents: new Map(), deliveryTail: Promise.resolve(), refusals: new Map() }
+      this.members.set(memberPlan.memberId, member)
+      this.pendingLeases.delete(memberPlan.memberId)
+      executionAssert(this.state === 'starting' && !this.initializationAbort.signal.aborted &&
+        Date.now() < initializationDeadline, 'run_stopped')
+      await session.reserveSession()
+      member.creationWrapperEntered = true
+      const created = await session.createSession(memberPlan.title)
+      member.state = created.disposition
+      await this.persistState()
+      executionAssert(created.disposition === 'accepted' && created.session, 'run_original_session_unknown')
+      const initializingMember = member
+      const markInitialization = (phase: RunInitializationPhase): void => {
+        const at = Date.now()
+        initializationPhase = phase
+        // First entry per phase; transcript pages repeat the same read phase.
+        if (!initializationHistory.some(entry => entry.phase === phase)) initializationHistory.push({ phase, at })
+        initializingMember.initialization = { phase, startedAt: at }
+      }
+      // Actual native persistent context, never a queue/resume:false model
+      // turn. There is no published messageID for an instruction entry.
+      const value = { context: memberPlan.bootstrap.value, contextHash: memberPlan.bootstrap.contextHash,
+        briefingHash: memberPlan.bootstrap.briefingHash, teamId: authority.teamId, runId: authority.runId,
+        laneId: authority.laneId, memberId: authority.memberId, originalSessionId: authority.sessionID }
+      const before = await this.cut(client, authority.sessionID, phase => markInitialization(`bootstrap-before-${phase}`))
+      markInitialization('bootstrap-instruction-put')
+      await client.putInstruction(authority.sessionID, memberPlan.bootstrap.key, value)
+      markInitialization('bootstrap-instruction-readback')
+      const entries = await client.instructions(authority.sessionID)
+      const after = await this.cut(client, authority.sessionID, phase => markInitialization(`bootstrap-after-${phase}`))
+      markInitialization('bootstrap-verify')
+      verifyOpenCodeV2SilentBootstrap({ before, after, entries, key: memberPlan.bootstrap.key, value })
+      member.bootstrap = { strategy: 'instruction-entry', key: memberPlan.bootstrap.key,
+        contextHash: memberPlan.bootstrap.contextHash, briefingHash: memberPlan.bootstrap.briefingHash,
+        verified: true, missingNativeMessageID: true }
+      markInitialization('MCP-connect')
+      await client.connectMcp(memberPlan.controllerMcpName)
+      markInitialization('MCP-readback')
+      const servers = await client.mcp()
+      member.mcpConnected = servers.filter(server => server.name === memberPlan.controllerMcpName && server.status === 'connected').length === 1
+      executionAssert(member.mcpConnected, 'run_controller_mcp_unknown')
+      markInitialization('controller-tools')
+      member.controllerTools = await readOwnedControllerTools(client, memberPlan.profile, memberPlan.controllerMcpName, initializationDeadline, this.initializationAbort.signal)
+      if (this.plan.executionProbe?.memberId === memberPlan.memberId) {
+        markInitialization('probe-authority')
+        member.probeAuthority = await captureOwnedV2ProbeAuthority(client, this.plan.executionProbe.prepared)
+      }
+      initializationPhase = undefined
+      delete member.initialization
+      await this.persistState()
+    } catch (failure) {
+      if (initializationPhase) {
+        // Diagnostic snapshot of this exact lease at the original failure. The
+        // controller MCP child is reached only through its command channel.
+        const observation = readExecutionLeaseObservation(lease)
+        const mcpStartedAt = initializationHistory.find(entry => entry.phase === 'MCP-connect')?.at
+        const commands = observation?.commands && mcpStartedAt !== undefined &&
+          (initializationPhase.startsWith('MCP-') || initializationPhase === 'controller-tools')
+          ? { observation: observation.commands, originAt: mcpStartedAt } : undefined
+        retainOpenCodeV2InitializationPhase(failure, initializationPhase, Date.now() - initializationStartedAt, {
+          ownerElapsedMs: initializationStartedAt - this.ownerStartedAt,
+          history: initializationHistory.map(({ phase, at }) => ({ phase, elapsedMs: at - initializationStartedAt })),
+          ...(observation ? { acquisition: observation.acquisition } : {}), ...(commands ? { commands } : {}),
+        })
+      }
+      // If an object was not yet registered, no lease may escape cleanup.
+      if (!member || this.state !== 'starting') {
+        const closing = this.closeLease(lease)
+        if (member) await boundOpenCodeRead(member.client.dispose(), 2000).catch(() => undefined)
+        await closing.then(() => this.pendingLeases.delete(memberPlan.memberId)).catch(() => undefined)
+      }
+      throw failure
+    } finally { clearTimeout(initializationTimer) }
+  }
   async ready(): Promise<void> { await this.initialization }
-  private closeLease(lease: ExecutionLease): Promise<ExecutionCleanupReceipt> {
+  private closeLease(lease: ExecutionLease, deadline?: number): Promise<ExecutionCleanupReceipt> {
     const existing = this.closing.get(lease)
     if (existing) return existing
-    const work = Promise.resolve().then(() => lease.close()).then(receipt => {
+    const work = Promise.resolve().then(() => lease.close(this.deferredWindowsControllers ? deadline : undefined)).then(receipt => {
+      executionAssert(!this.deferredWindowsControllers || deadline === undefined || Date.now() < deadline, 'cleanup_unknown')
       // A returned acknowledgement or same-fields object is not a measured
       // R247 physical retirement receipt. Check the process-owned receipt
       // before serialization and bind it to this exact lease's child birth.
@@ -197,6 +319,7 @@ export class OpenCodeV2RunOwner {
       await boundOpenCodeRead(this.initialization.catch(() => undefined), remaining())
       await boundOpenCodeRead(Promise.allSettled([...this.closing.values()]), remaining())
       await boundOpenCodeRead(Promise.allSettled([...this.active]), remaining())
+      await boundOpenCodeRead(this.startupTail, remaining())
     } catch {
       this.state = 'cleanup_unknown'
       await boundOpenCodeRead(writeRunControlFile(this.directory, 'orphan.json', { binding: this.plan.binding,
@@ -211,11 +334,14 @@ export class OpenCodeV2RunOwner {
       !member.lease.signal.aborted, 'run_original_session_changed')
     return member
   }
-  private async cut(client: ExecutionBridgeClient, id: string): Promise<{ messages: ExecutionMessagePage; log: ExecutionLog }> {
+  private async cut(client: ExecutionBridgeClient, id: string,
+    onRead?: (phase: 'log' | 'messages' | 'log-confirm') => void): Promise<{ messages: ExecutionMessagePage; log: ExecutionLog }> {
+    onRead?.('log')
     const before = await client.log(id)
     const messages: ExecutionMessagePage = { data: [], previous: null, next: null }
     const cursors = new Set<string>(); let cursor: string | undefined, complete = false
     for (let page = 0; page < 8; page++) {
+      onRead?.('messages')
       const value = await client.messages(id, cursor)
       messages.data.push(...value.data)
       executionAssert(messages.data.length <= 1600 && new Set(messages.data.map(message => message.id)).size === messages.data.length, 'run_transcript_unknown')
@@ -223,13 +349,14 @@ export class OpenCodeV2RunOwner {
       executionAssert(!cursors.has(value.next), 'run_transcript_unknown'); cursors.add(value.next); cursor = value.next
     }
     executionAssert(complete, 'run_transcript_unknown')
+    onRead?.('log-confirm')
     const log = await client.log(id)
     executionAssert(executionHash(before) === executionHash(log), 'run_mutable_cut')
     return { messages, log }
   }
   async execute(request: RunControlRequest, deadline: number): Promise<RunControlResult> {
     request = parseRunControlRequest(structuredClone(request))
-    if (request.operation === 'stop') return this.stop()
+    if (request.operation === 'stop') return this.stop(deadline)
     if (request.operation === 'status') return { kind: 'status', ...(this.plan.qualification ? { qualification: this.plan.qualification } : {}), state: this.state, deadline: this.plan.deadline, members: this.statuses() }
     executionAssert(this.state === 'active' && Date.now() < this.plan.deadline && deadline > Date.now() &&
       deadline <= this.plan.deadline && deadline - Date.now() <= 30_000, 'run_not_active')
@@ -290,10 +417,17 @@ export class OpenCodeV2RunOwner {
         const probe = this.plan.executionProbe
         executionAssert(probe && probe.memberId === member.plan.memberId && member.probeAuthority, 'probe_not_owned')
         const service = new OpenCodeV2AdmissionService(client, member.store, member.authority)
-        const admission = await service.settleOriginalInput(probe.intent)
-        const proof = await buildOwnedV2ProbeProof({ client, authority: member.authority, captured: member.probeAuthority,
-          intent: probe.intent, admission, expectedText: probe.expectedText, capabilitySnapshotId: probe.capabilitySnapshotId })
-        return { kind: 'probeEvidence', proof }
+        try {
+          const admission = await service.settleOriginalInput(probe.intent)
+          const evidence = await buildOwnedV2ProbeProof({ client, authority: member.authority, captured: member.probeAuthority,
+            intent: probe.intent, admission, expectedText: probe.expectedText, capabilitySnapshotId: probe.capabilitySnapshotId })
+          return { kind: 'probeEvidence', ...evidence }
+        } catch (failure) {
+          // The same original may still be streaming. No resubmission, release
+          // or catch-side journal write; the next bounded read retains its IDs.
+          if (isMutableExecutionReadback(failure)) return { kind: 'probeEvidence', proof: null, failure: null }
+          throw failure
+        }
       }
       if (request.operation === 'transcript') return { kind: 'transcript', ...await this.cut(client, id) }
       if (request.operation === 'mcp') return { kind: 'mcp', servers: await client.mcp() }
@@ -349,8 +483,10 @@ export class OpenCodeV2RunOwner {
       member.controllerTools = await readOwnedControllerTools(client, member.plan.profile, member.plan.controllerMcpName, deadline, signal)
       const controllerBinding = { teamId: this.plan.binding.teamId, runId: this.plan.binding.runId,
         memberId: member.plan.memberId, sessionID: id }
-      const controllerInbox = await readOwnedControllerInbox(member.plan.profile, member.controllerTools,
-        controllerBinding, deadline, signal)
+      const controllerInbox = process.platform === 'win32'
+        ? parseControllerInboxBytes(await readWindowsRunControllerInbox(this.directory, member.plan.profile,
+          member.controllerTools, controllerBinding, deadline, signal), controllerBinding)
+        : await readOwnedControllerInbox(member.plan.profile, member.controllerTools, controllerBinding, deadline, signal)
       const turn = projectOpenCodeV2Turn({ pin: client.authority.pin, sessionID: id, nativeInputID: intent.identity.nativeInputID,
         beforeCursor: admission.beforeCursor, originalText: intent.input.text, ...cut,
         inboundMessageId: intent.identity.localMessageId, advertisedTools: member.controllerTools.nativeNames,
@@ -358,14 +494,19 @@ export class OpenCodeV2RunOwner {
       return { kind: 'observe', admission, turn }
     } finally { await client.dispose() }
   }
-  stop(): Promise<Extract<RunControlResult, { kind: 'stop' }>> {
+  stop(deadline?: number): Promise<Extract<RunControlResult, { kind: 'stop' }>> {
     if (this.stopping) return this.stopping
+    executionAssert(!this.deferredWindowsControllers || deadline === undefined ||
+      Number.isSafeInteger(deadline) && deadline > 0, 'run_control_invalid')
     this.state = 'stopping'; clearTimeout(this.timer)
     this.cleanupGraceDeadline = Date.now() + 60_000
-    this.stopping = this.performStop(); return this.stopping
+    this.stopping = this.performStop(deadline); return this.stopping
   }
-  private async performStop(): Promise<Extract<RunControlResult, { kind: 'stop' }>> {
-    const cleanupDeadline = Date.now() + 29_000
+  private async performStop(deadline?: number): Promise<Extract<RunControlResult, { kind: 'stop' }>> {
+    // The authenticated Windows cutoff already spent time in client/native
+    // preflight. First Stop owns it; neither delivery nor retries restart29s.
+    const cleanupDeadline = Math.min(Date.now() + 29_000,
+      this.deferredWindowsControllers ? deadline ?? Infinity : Infinity)
     const remaining = (maximum: number) => Math.max(1, Math.min(maximum, cleanupDeadline - Date.now()))
     let durable = true
     try {
@@ -380,39 +521,91 @@ export class OpenCodeV2RunOwner {
     // it before initialization settles. Do not launch a replacement owner.
     await boundOpenCodeRead(this.initialization.catch(() => undefined), remaining(2000)).catch(() => { durable = false })
     const results = await Promise.all([...this.members.values()].map(async (member): Promise<RunStopMember> => {
-      const errors: string[] = [], ids: readonly string[] = await boundOpenCodeRead(member.store.fenceStop(), remaining(2000))
-        .catch(() => { errors.push('tombstone_unknown'); return [] })
+      const fenceDeadline = Date.now() + remaining(2000)
+      const fence = async (): Promise<readonly string[]> => {
+        for (;;) {
+          executionAssert(Date.now() < fenceDeadline, 'run_stop_fence_timeout')
+          try { return await member.store.fenceStop() }
+          catch (error) {
+            // An already admitted update can briefly hold the same lock. Only
+            // lock contention may retry this monotonic fence; no native input
+            // is repeated and the original stop budget never moves.
+            if (!error || typeof error !== 'object' || !('code' in error) || error.code !== 'ELOCKED' || Date.now() >= fenceDeadline) throw error
+            await new Promise(resolve => setTimeout(resolve, Math.min(10, fenceDeadline - Date.now())))
+          }
+        }
+      }
+      const errors: string[] = []
+      const ids: readonly string[] = member.creationWrapperEntered
+        ? await boundOpenCodeRead(fence(), Math.max(1, fenceDeadline - Date.now())).catch(() => { errors.push('tombstone_unknown'); return [] })
+        : []
       let cleanupClient: ExecutionBridgeClient | undefined
-      try {
-        // Cleanup has its own operation context. It never extends a prompt's
-        // deadline or reopens lease/session authority after the run tombstone.
-        cleanupClient = await boundOpenCodeRead(this.ports.client(member.lease.authority,
-          this.context(member.plan, Math.min(cleanupDeadline, Date.now() + 5000))), remaining(2000))
-        const native = cleanupClient, admissions = new OpenCodeV2AdmissionService(native, member.store, member.authority)
-        const candidates = ids.map(nativeInputID => ({ nativeInputID, deadline: Date.now() + remaining(2000) }))
-        // Read terminal cuts before interrupt can change their native log. Classification
-        // and any remaining cancellation share the original per-input deadline.
-        const terminal = await Promise.all(candidates.map(async ({ nativeInputID, deadline }) => {
-          const original = member.intents.get(nativeInputID)
-          const proved = original ? await boundOpenCodeRead(admissions.terminalAfterStop(original), Math.max(1, deadline - Date.now()))
-            .catch(() => false) : false
-          return proved && Date.now() < deadline
-        }))
-        const cancellation = await Promise.allSettled([
-          ...candidates.filter((_candidate, index) => !terminal[index]).map(async ({ nativeInputID, deadline }) => {
-            const budget = deadline - Date.now()
-            executionAssert(budget > 0, 'authority_or_deadline')
-            await boundOpenCodeRead(native.cancelInbox(member.authority.sessionID, nativeInputID), budget)
-          }),
-          boundOpenCodeRead(native.interrupt(member.authority.sessionID), remaining(2000)),
-        ])
-        if (cancellation.some(result => result.status === 'rejected')) errors.push('cancel_or_interrupt_unknown')
-      } catch { errors.push('cancel_or_interrupt_unknown') }
+      if (member.creationWrapperEntered) {
+        try {
+          // Cleanup has its own operation context. It never extends a prompt's
+          // deadline or reopens lease/session authority after the run tombstone.
+          cleanupClient = await boundOpenCodeRead(this.ports.client(member.lease.authority,
+            this.context(member.plan, Math.min(cleanupDeadline, Date.now() + 5000))), remaining(2000))
+          const native = cleanupClient, admissions = new OpenCodeV2AdmissionService(native, member.store, member.authority)
+          const candidates = ids.map(nativeInputID => ({ nativeInputID, deadline: Date.now() + remaining(2000) }))
+          // Read terminal cuts before interrupt can change their native log. Classification
+          // and any remaining cancellation share the original per-input deadline.
+          const dispositions = await Promise.all(candidates.map(async ({ nativeInputID, deadline }) => {
+            const original = member.intents.get(nativeInputID)
+            const disposition = original ? await boundOpenCodeRead(admissions.dispositionAfterStop(original), Math.max(1, deadline - Date.now()))
+              .catch(() => 'unknown' as const) : 'unknown'
+            return Date.now() < deadline ? disposition : 'unknown'
+          }))
+          const routing = await Promise.allSettled(candidates.map(async ({ nativeInputID, deadline }, index) => {
+            const disposition = dispositions[index]
+            executionAssert(disposition !== 'unknown', 'stop_original_unknown')
+            if (disposition !== 'pending') return disposition
+            try {
+              const budget = deadline - Date.now()
+              executionAssert(budget > 0, 'authority_or_deadline')
+              await boundOpenCodeRead(native.cancelInbox(member.authority.sessionID, nativeInputID), budget)
+              return 'cancelled' as const
+            } catch {
+              // A pending input can promote between the read and cancellation.
+              // No HTTP error itself proves delivery; independently bind the
+              // original projected USER/terminal cut before routing to interrupt.
+              const original = member.intents.get(nativeInputID), budget = deadline - Date.now()
+              executionAssert(original && budget > 0, 'stop_original_unknown')
+              const raced = await boundOpenCodeRead(admissions.dispositionAfterStop(original), budget)
+              executionAssert(raced === 'projected' || raced === 'terminal', 'stop_original_unknown')
+              return raced
+            }
+          }))
+          const interruption = await boundOpenCodeRead(native.interrupt(member.authority.sessionID), remaining(2000))
+          executionAssert(routing.every(result => result.status === 'fulfilled'), 'stop_original_unknown')
+          if (!interruption.interrupted) {
+            for (let index = 0; index < routing.length; index++) {
+              const result = routing[index], candidate = candidates[index]!
+              if (result?.status !== 'fulfilled' || result.value !== 'projected') continue
+              const original = member.intents.get(candidate.nativeInputID), budget = candidate.deadline - Date.now()
+              executionAssert(original && budget > 0 &&
+                await boundOpenCodeRead(admissions.terminalAfterStop(original), budget), 'stop_interrupt_unknown')
+            }
+          }
+        } catch { errors.push('cancel_or_interrupt_unknown') }
+      }
       try { await boundOpenCodeRead(Promise.all([member.client.dispose(), ...(cleanupClient ? [cleanupClient.dispose()] : [])]), remaining(2000)) }
       catch { errors.push('readers_unknown') }
       let cleanup: RunStopMember['cleanup'] = null
-      try { cleanup = await boundOpenCodeRead(this.closeLease(member.lease), remaining(22_000)) }
-      catch { errors.push('physical_cleanup_unknown') }
+      const cleanupStartedAt = Date.now()
+      // The same 29s owner deadline funds physical close AND finalization.
+      // Windows may use up to27s, leaving one shared2s receipt-write reserve.
+      const closeDeadline = this.deferredWindowsControllers
+        ? Math.min(Date.now() + OPEN_CODE_V2_WINDOWS_CLOSE_MS, cleanupDeadline - 2000)
+        : Date.now() + remaining(22_000)
+      try { cleanup = await boundOpenCodeRead(this.closeLease(member.lease, closeDeadline), Math.max(1, closeDeadline - Date.now())) }
+      catch (failure) {
+        errors.push('physical_cleanup_unknown')
+        const observation = readExecutionCleanupObservation(member.lease)
+        // Best-effort observation never extends the original physical stop budget.
+        void recordOpenCodeV2ProviderFailure('run-member-retirement', failure, true, undefined, undefined,
+          { elapsedMs: Date.now() - cleanupStartedAt, dataRoot: this.plan.dataRoot, observation }).catch(() => undefined)
+      }
       if (!durable) errors.push('run_tombstone_unknown')
       return { memberId: member.plan.memberId, cleanup, errors }
     }))
@@ -421,7 +614,16 @@ export class OpenCodeV2RunOwner {
     }))
     if (pendingCleanup.some(result => result.status === 'rejected') || this.acquisitions.size) durable = false
     await boundOpenCodeRead(Promise.allSettled([...this.active]), remaining(1000)).catch(() => { durable = false })
-    this.state = durable && results.length === this.plan.members.length && results.every(result => result.cleanup !== null && result.errors.length === 0) ? 'stopped' : 'cleanup_unknown'
+    this.state = durable && (!this.deferredWindowsControllers || Date.now() < cleanupDeadline) &&
+      results.length === this.plan.members.length && results.every(result => result.cleanup !== null && result.errors.length === 0) ? 'stopped' : 'cleanup_unknown'
+    if (this.deferredWindowsControllers) {
+      // Persist the final state before publishing a positive stop archive.
+      // Both writes consume the SAME remaining29s, never a new2s allowance.
+      try {
+        await boundOpenCodeRead(this.persistState(), remaining(2000))
+        executionAssert(Date.now() < cleanupDeadline, 'cleanup_unknown')
+      } catch { this.state = 'cleanup_unknown' }
+    }
     const receipt: Extract<RunControlResult, { kind: 'stop' }> = { kind: 'stop', state: this.state, members: results }
     try { await boundOpenCodeRead(writeRunControlFile(this.directory, 'stop.json', { binding: this.plan.binding, receipt }), remaining(2000)) }
     catch {
@@ -430,10 +632,26 @@ export class OpenCodeV2RunOwner {
       await boundOpenCodeRead(this.persistState(), remaining(2000)).catch(() => undefined)
       this.resolveStopped(unknown); return unknown
     }
-    await boundOpenCodeRead(this.persistState(), remaining(2000)).catch(() => undefined)
+    if (!this.deferredWindowsControllers) await boundOpenCodeRead(this.persistState(), remaining(2000)).catch(() => undefined)
+    // A timely physical receipt may be read later with independent owner-exit
+    // proof, but a late write completion cannot earn THIS public success.
+    if (this.deferredWindowsControllers && Date.now() >= cleanupDeadline) {
+      this.state = 'cleanup_unknown'
+      const unknown: Extract<RunControlResult, { kind: 'stop' }> = { ...receipt, state: 'cleanup_unknown' }
+      this.resolveStopped(unknown); return unknown
+    }
     this.resolveStopped(receipt)
     return receipt
   }
+}
+
+/** Original owner process facts only; ignored stderr remains ignored so a
+ * detached Bun supervisor cannot inherit a pipe closed by its launcher. */
+export function projectRunOwnerEntryFailure(elapsedMs: number, exitCode: number | null) {
+  return JSON.stringify({ event: 'opencode-v2-startup', reason: 'failed', stage: 'run-owner-entry',
+    elapsedMs: Math.max(0, Math.min(86_400_000, Math.trunc(elapsedMs))), nativeStderrKind: 'unavailable',
+    ...(Number.isSafeInteger(exitCode) && Number(exitCode) >= 0 && Number(exitCode) <= 0xffffffff
+      ? { nativeExitCode: exitCode } : {}) })
 }
 
 /** Explicit launch alone may spawn. Config/native objects travel over inherited
@@ -441,7 +659,8 @@ export class OpenCodeV2RunOwner {
 export async function launchExplicitOpenCodeV2Run(plan: RunLaunchPlan): Promise<RunControlRecord> {
   plan = structuredClone(plan)
   validateRunLaunchPlan(plan)
-  executionAssert(process.platform === 'linux' && process.versions.bun === '1.3.11', 'run_source_linux_bun_required')
+  assertExecutionPlatformAvailable()
+  executionAssert(process.versions.bun === openCodeBunVersion(), 'run_source_bun_required')
   executionAssert(await realpath(plan.source.bunPath) === plan.source.bunPath && sha(await readFile(plan.source.bunPath)) === plan.source.bunSha256, 'run_source_changed')
   const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'run-owner')
   const entry = delivery.entryPath
@@ -451,8 +670,13 @@ export async function launchExplicitOpenCodeV2Run(plan: RunLaunchPlan): Promise<
   executionAssert(plan.source.files.some(file => file.path === entry && file.sha256 === plan.source.entrySha256), 'run_source_incomplete')
   executionAssert(!Object.keys(plan.source.env).some(key => /^(?:NODE_OPTIONS|NODE_PATH|BUN_.*|LD_.*|DYLD_.*|BASH_ENV|ENV|ZDOTDIR|SHELLOPTS)$/i.test(key)), 'run_environment_injection')
   const sourceSha256 = executionHash(plan.source.files)
-  const directory = await reserveRunControlDirectory(plan.dataRoot, plan.binding, sourceSha256)
+  const directory = await reserveRunControlDirectory(plan.dataRoot, plan.binding, sourceSha256,
+    plan.members.map(member => member.profile))
+  const entryStarted = Date.now()
   const child = spawn(plan.source.bunPath, [entry], { detached: true, cwd: plan.dataRoot, env: { ...plan.source.env }, stdio: ['ignore', 'ignore', 'ignore', 'ipc'] })
+  let entryExit: number | null = null, entryFailure: unknown
+  child.once('error', error => { entryFailure = error })
+  child.once('close', code => { entryExit = code })
   const ready = new Promise<void>((resolve, reject) => {
     child.once('error', () => reject(new Error('run_owner_unknown')))
     child.once('close', () => reject(new Error('run_owner_unknown')))
@@ -463,11 +687,25 @@ export async function launchExplicitOpenCodeV2Run(plan: RunLaunchPlan): Promise<
   })
   try {
     child.send({ type: 'start', plan, directory, sourceSha256 })
-    await boundOpenCodeRead(ready, Math.min(30_000, plan.deadline - Date.now()))
+    await boundOpenCodeRead(ready, Math.min(process.platform === 'darwin' ? OPEN_CODE_V2_RUN_INITIALIZATION_MS : 30_000, plan.deadline - Date.now()))
     const record = await discoverOpenCodeV2Run(plan.dataRoot, plan.binding.teamId, plan.binding.runId)
-    executionAssert(record && child.pid === record.process.pid && executionHash(record.binding) === executionHash(plan.binding) && record.sourceSha256 === sourceSha256, 'run_owner_unknown')
+    executionAssert(record && executionHash(record.binding) === executionHash(plan.binding) && record.sourceSha256 === sourceSha256, 'run_owner_unknown')
+    if (process.platform === 'win32') {
+      executionAssert('endpoint' in record, 'run_owner_unknown')
+      // Native control publishes the helper in record.process and the separately
+      // measured Bun supervisor in endpoint.bun. Match the spawned supervisor
+      // only to that measured owner identity; a supplied PID is not proof.
+      const supervisor = await readRunProcessIdentity(child.pid)
+      executionAssert(child.pid === record.endpoint.bun.pid &&
+        executionHash(supervisor) === executionHash(record.endpoint.bun) &&
+        record.process.pid !== record.endpoint.bun.pid, 'run_owner_unknown')
+    } else {
+      executionAssert(!('endpoint' in record) && child.pid === record.process.pid, 'run_owner_unknown')
+    }
     child.disconnect(); child.unref(); return record
   } catch (error) {
+    await recordOpenCodeV2ProviderFailure('execution-host-startup', entryFailure ?? error, true,
+      projectRunOwnerEntryFailure(Date.now() - entryStarted, entryExit))
     // Unknown startup cannot be replayed, reclaimed or PID-killed. The exact
     // launched supervisor owns its bounded deadline and cleanup.
     if (child.connected) child.disconnect(); child.unref(); throw error
@@ -475,10 +713,11 @@ export async function launchExplicitOpenCodeV2Run(plan: RunLaunchPlan): Promise<
 }
 
 export async function startOpenCodeV2RunSupervisor(plan: RunLaunchPlan, directory: string, sourceSha256: string): Promise<{ record: RunControlRecord; owner: OpenCodeV2RunOwner; retire(): Promise<void> }> {
+  assertExecutionPlatformAvailable()
   plan = structuredClone(plan)
   validateRunLaunchPlan(plan)
   executionAssert(directory === runControlDirectory(plan.dataRoot, plan.binding.teamId, plan.binding.runId) &&
-    executionHash(plan.source.files) === sourceSha256 && process.versions.bun === '1.3.11' &&
+    executionHash(plan.source.files) === sourceSha256 && process.versions.bun === openCodeBunVersion() &&
     await realpath(process.execPath) === plan.source.bunPath && sha(await readFile(process.execPath)) === plan.source.bunSha256, 'run_source_changed')
   const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'run-owner')
   executionAssert(plan.members.every(member => member.native.runtimeMode === delivery.runtimeMode) &&
@@ -486,9 +725,10 @@ export async function startOpenCodeV2RunSupervisor(plan: RunLaunchPlan, director
     await realpath(process.argv[1]!) === delivery.entryPath, 'run_source_changed')
   for (const file of plan.source.files) executionAssert(await realpath(file.path) === file.path && sha(await readFile(file.path)) === file.sha256, 'run_source_changed')
   let owner: OpenCodeV2RunOwner | undefined
-  const control = await serveOpenCodeV2RunControl(directory, plan.binding, plan.deadline, sourceSha256, (request, deadline) => {
-    executionAssert(owner, 'run_owner_starting'); return owner.execute(request, deadline)
-  })
+  const control = await serveOpenCodeV2RunControl(directory, plan.binding, plan.deadline, sourceSha256,
+    (request, deadline) => {
+      executionAssert(owner, 'run_owner_starting'); return owner.execute(request, deadline)
+    }, plan.members.map(member => member.profile))
   try { owner = new OpenCodeV2RunOwner(plan, directory) }
   catch (error) { await control.close(); throw error }
   const owned = owner

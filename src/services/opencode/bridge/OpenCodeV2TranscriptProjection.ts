@@ -52,6 +52,30 @@ function projectTool(part: Record<string, unknown>): { call: OpenCodeCanonicalTo
     isError: call.isError, startedAt: call.startedAt, completedAt: call.completedAt })
   return { call, blocks }
 }
+function projectCodeModeCalls(part: Record<string, unknown>, messageID: string, diagnostics: string[]): OpenCodeCanonicalToolCall[] {
+  if (part.name !== 'execute') return []
+  const state = record(part.state), metadata = record(state?.metadata)
+  if (!metadata || !Object.hasOwn(metadata, 'toolCalls')) return []
+  const calls = metadata.toolCalls, input = record(state?.input), outerCallId = string(part.id)
+  executionAssert(Array.isArray(calls) && calls.length <= 4096 && outerCallId && typeof input?.code === 'string',
+    'v2_transcript_invalid_code_mode_calls')
+  // Both official pins persist only tool/status/input through runtime progress
+  // hooks. A completed row records successful invocation, not its business
+  // result. The composite execute output cannot be assigned to any child call.
+  const projected = calls.map((value, index): OpenCodeCanonicalToolCall => {
+    const row = record(value)
+    executionAssert(row && string(row.tool) && typeof row.status === 'string' && ['running', 'completed', 'error'].includes(row.status) &&
+      Object.keys(row).every(key => ['tool', 'status', 'input'].includes(key)) &&
+      (!Object.hasOwn(row, 'input') || record(row.input)), 'v2_transcript_invalid_code_mode_call')
+    return { callId: null, toolName: string(row.tool), title: null,
+      source: { kind: 'opencode-v2-code-mode-metadata', outerCallId, index },
+      status: row.status === 'completed' ? 'completed' : row.status === 'error' ? 'errored' : 'running',
+      input: record(row.input), output: null, outputText: null, outputPreview: null,
+      startedAt: null, completedAt: null, isError: row.status === 'error' }
+  })
+  if (projected.length) diagnostics.push(`v2_transcript_code_mode_nested_ids_results_unavailable:${messageID}:${outerCallId}`)
+  return projected
+}
 function projectMessage(message: ExecutionMessage, diagnostics: string[], sessionID: string): OpenCodeCanonicalMessage {
   const row = message.data, time = record(row.time), model = record(row.model), failure = error(row.error)
   executionAssert(row.id === message.id && row.type === message.type && (row.sessionID === undefined || row.sessionID === sessionID) &&
@@ -76,6 +100,11 @@ function projectMessage(message: ExecutionMessage, diagnostics: string[], sessio
         const tool = projectTool(part)
         executionAssert(tool.call.callId && !toolIDs.has(tool.call.callId), 'v2_transcript_duplicate_tool')
         toolIDs.add(tool.call.callId); toolCalls.push(tool.call); contentBlocks.push(...tool.blocks)
+        for (const nested of projectCodeModeCalls(part, message.id, diagnostics)) {
+          toolCalls.push(nested)
+          contentBlocks.push({ type: 'tool_use', id: null, name: nested.toolName, title: null,
+            status: nested.status, input: nested.input, startedAt: null, completedAt: null })
+        }
       } else diagnostics.push(`v2_transcript_unknown_assistant_content:${message.id}:${kind}`)
     }
   } else if (['user', 'system', 'synthetic', 'skill'].includes(message.type)) {

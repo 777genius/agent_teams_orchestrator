@@ -6,6 +6,8 @@ import path from 'node:path'
 import { writeJsonFileAtomic } from '../../utils/atomicWrite.js'
 import { resolveOpenCodeAuthCoordinationPath, withOpenCodeAuthCoordinationLock } from './OpenCodeAuthCoordinationLock.js'
 import { throwOpenCodeAbortReason } from './OpenCodeRuntimeDeadline.js'
+import { resolveClaudeMultimodelPaths } from './OpenCodeManagedPaths.js'
+import { ensureWindowsPrivateDirectories, hasWindowsPrivateProfileDirectoryDelivery } from './profile/OpenCodePrivateDirectories.js'
 
 import type { OpenCodeApiAuthInput, OpenCodeConnectedProvider, OpenCodeSessionRecord } from './types.js'
 
@@ -18,6 +20,7 @@ type OpenCodeOAuthCredential = OpenCodeAuthCredential & {
 }
 type OpenCodeAuthEntry = OpenCodeAuthCredential
 export type OpenCodeAuthStore = Record<string, OpenCodeAuthEntry>
+export type OpenCodeInitialSelectedAuthPublisher = (content: string, sha256: string, signal?: AbortSignal) => Promise<void>
 
 export type OpenCodeOAuthSaveOwner = {
   projectPath: string
@@ -610,6 +613,15 @@ async function withAuthStoreWriteLock<T>(
   operation: () => Promise<T>,
   abortSignal?: AbortSignal,
 ): Promise<T> {
+  if (abortSignal?.aborted) throwOpenCodeAbortReason(abortSignal)
+  const dataRoot = resolveClaudeMultimodelPaths().data
+  const globalAuthPath = path.join(dataRoot, 'opencode', 'auth.json')
+  // Only this SDK-owned global destination may create the private namespace.
+  // Arbitrary user stores retain their original directory/permission semantics.
+  if (path.relative(globalAuthPath, path.resolve(filePath)) === '' &&
+    await hasWindowsPrivateProfileDirectoryDelivery()) {
+    await ensureWindowsPrivateDirectories([dataRoot, path.join(dataRoot, 'opencode')])
+  }
   return withOpenCodeAuthCoordinationLock({
     authPath: filePath,
     operation,
@@ -1227,6 +1239,7 @@ export async function materializeOpenCodeSelectedAuthCredential(input: {
   providerId: string
   credential: OpenCodeAuthCredential | null
   abortSignal?: AbortSignal
+  initialPublish?: OpenCodeInitialSelectedAuthPublisher
 }): Promise<void> {
   const providerId = normalizeProviderId(input.providerId)
   if (!providerId) {
@@ -1245,7 +1258,11 @@ export async function materializeOpenCodeSelectedAuthCredential(input: {
         throw new Error('OpenCode scoped authentication store is unavailable')
       }
       if (input.abortSignal?.aborted) throwOpenCodeAbortReason(input.abortSignal)
-      await writeOpenCodeAuthStore(input.authPath, expected)
+      if (input.initialPublish) {
+        const content = JSON.stringify(expected, null, 2)
+        await input.initialPublish(content, createHash('sha256').update(content).digest('hex'), input.abortSignal)
+        if (input.abortSignal?.aborted) throwOpenCodeAbortReason(input.abortSignal)
+      } else await writeOpenCodeAuthStore(input.authPath, expected)
       return
     }
     if (input.abortSignal?.aborted) throwOpenCodeAbortReason(input.abortSignal)

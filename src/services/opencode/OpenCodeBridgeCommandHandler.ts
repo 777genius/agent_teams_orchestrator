@@ -2460,6 +2460,8 @@ function preHostCursorFailureReadinessData(input: {
 function describeAuthorityRejection(diagnostic: OpenCodeAuthorityRejection): string {
   return diagnostic.check === 'exception'
     ? ` (${diagnostic.check}:${diagnostic.phase}:${diagnostic.errorClass})`
+    : diagnostic.check === 'behavior_match' && diagnostic.fields
+      ? ` (${diagnostic.check}:${diagnostic.fields.join(',')})`
     : diagnostic.check === 'selected_config_match'
       ? ` (${diagnostic.check}:${diagnostic.fields.join(',')})`
       : diagnostic.check === 'behavior_match' && diagnostic.comparison

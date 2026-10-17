@@ -1,3 +1,4 @@
+import { openCodeBunVersion } from '../../src/constants/openCodeBunVersion.js'
 import { createHash } from 'node:crypto'
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { validatePackagedOpenCodeIdentity } from '../../src/cli/packagedOpenCodeDelivery.js'
@@ -6,7 +7,7 @@ const candidate = process.env.CANDIDATE_PLATFORM
 if (candidate !== 'linux-x64' && candidate !== 'win32-x64') throw new Error('Unsupported candidate platform')
 const [platform, arch] = candidate.split('-')
 const identity = validatePackagedOpenCodeIdentity(JSON.parse(readFileSync('dist/opencode-delivery.json', 'utf8')))
-if (identity.platform !== platform || identity.arch !== arch || identity.bunVersion !== '1.3.11') {
+if (identity.platform !== platform || identity.arch !== arch || identity.bunVersion !== openCodeBunVersion(platform)) {
   throw new Error('Delivery identity mismatch')
 }
 const digests: readonly (readonly [string, string])[] = [

@@ -16,7 +16,7 @@ describe('selected V2 execution document', () => {
       expect<unknown>(result.info.agents?.['bridge-worker']?.permissions).toEqual(source.selection.permissions)
       expect<unknown>(result.info.permissions).toEqual(source.selection.permissions)
       expect(result.info.model).toEqual({ providerID: 'provider', model: 'model', variant: 'selected' })
-      expect<unknown>(result.info.mcp?.servers?.['agent-teams']).toEqual(source.controller.config)
+      expect<unknown>(result.info.mcp?.servers?.['agent-teams']).toEqual({ ...source.controller.config, ...(process.platform === 'win32' ? { disabled: true } : {}) })
       expect(result.sha256).toBe(createHash('sha256').update(result.content).digest('hex'))
       expect(JSON.parse(result.content)).toEqual(result.info)
       expect(source.selection.permissions).toHaveLength(2)
@@ -43,6 +43,23 @@ describe('selected V2 execution document', () => {
     const oauth = input('2.0.0'); oauth.controller.config = { type: 'remote', url: 'https://controller.example/mcp' }
     expect(() => createOpenCodeV2ExecutionConfig(oauth)).toThrow('v2_execution_mcp_invalid')
   })
+})
+
+for (const pin of ['2.0.0', '2.0.21'] as const) test(`${pin} Windows managed MCP defers autostart without accepting a disabled selection`, () => {
+  const original = Object.getOwnPropertyDescriptor(process, 'platform')!
+  try {
+    Object.defineProperty(process, 'platform', { ...original, value: 'win32' })
+    const source = input(pin)
+    const result = createOpenCodeV2ExecutionConfig(source)
+    const selectedController = source.controller.config
+    const expected = selectedController.type === 'local'
+      ? { ...selectedController, command: [...selectedController.command], disabled: true }
+      : { ...selectedController, disabled: true }
+    expect(result.info.mcp?.servers?.['agent-teams']).toEqual(expected)
+    expect(source.controller.config.disabled).toBeUndefined()
+    source.controller.config.disabled = true
+    expect(() => createOpenCodeV2ExecutionConfig(source)).toThrow('v2_execution_mcp_disabled')
+  } finally { Object.defineProperty(process, 'platform', original) }
 })
 
 import { mapLegacyOpenCodeV2Package, mapSelectedOpenCodeV2Model } from './OpenCodeV2ExecutionConfig.js'

@@ -41,6 +41,14 @@ export function validateCut(log: ExecutionLog, sessionID: string): void {
   }
   executionAssert(log.watermark === (log.events.at(-1)?.seq ?? null), 'incomplete_log')
 }
+const mutableReadbacks = new WeakSet<object>()
+class MutableReadbackError extends Error {
+  constructor() { super('mutable_readback'); mutableReadbacks.add(this) }
+}
+/** Only this module's validated before/after cut mismatch can qualify. */
+export function isMutableExecutionReadback(error: unknown): boolean {
+  return error instanceof Error && mutableReadbacks.has(error)
+}
 export async function readExecutionCut(client: Pick<ExecutionClient, 'log' | 'messages'>, sessionID: string): Promise<{ log: ExecutionLog; messages: ExecutionMessage[] }> {
   const before = await client.log(sessionID); validateCut(before, sessionID)
   const messages: ExecutionMessage[] = [], cursors = new Set<string>(); let cursor: string | undefined, complete = false
@@ -56,7 +64,7 @@ export async function readExecutionCut(client: Pick<ExecutionClient, 'log' | 'me
   }
   executionAssert(complete, 'incomplete_transcript')
   const after = await client.log(sessionID); validateCut(after, sessionID)
-  executionAssert(executionHash(before) === executionHash(after), 'mutable_readback')
+  if (executionHash(before) !== executionHash(after)) throw new MutableReadbackError()
   return { log: after, messages }
 }
 

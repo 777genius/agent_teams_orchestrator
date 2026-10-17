@@ -1,9 +1,9 @@
 import { createHash } from 'node:crypto'
-import { lstat, open, realpath, stat } from 'node:fs/promises'
+import filesystem, { lstat, open, stat } from 'node:fs/promises'
 import path from 'node:path'
 import { resolveOpenCodeBinaryPath } from '../OpenCodeBinaryResolver.js'
 import { classifyOpenCodeReadGeneration, type OpenCodeReadGeneration, type OpenCodeV2Pin } from './OpenCodeGenerationPolicy.js'
-import { createOpenCodeV2ReadRoots } from '../profile/OpenCodeV2ManagedConfig.js'
+import { createOpenCodeVersionReadRoots } from '../profile/OpenCodeV2ManagedConfig.js'
 import { readOpenCodeOwnedVersion } from './OpenCodeVersionProbe.js'
 
 export type OpenCodeV2NativeIdentity = {
@@ -25,15 +25,30 @@ export async function readOpenCodePackageManifest(file: string): Promise<unknown
   } finally { await handle.close() }
 }
 
-export async function hashOpenCodeFile(file: string): Promise<string> {
+export async function hashOpenCodeFile(file: string, signal?: AbortSignal): Promise<string> {
+  signal?.throwIfAborted()
   const handle = await open(file, 'r')
   try {
+    signal?.throwIfAborted()
     const before = await handle.stat()
     if (!before.isFile() || before.size > 256 * 1024 * 1024) throw new Error('identity_mismatch')
     const hash = createHash('sha256')
-    for await (const chunk of handle.createReadStream({ autoClose: false })) hash.update(chunk)
+    // Keep one explicit handle owner. Bun 1.3.11's streamed FileHandle reads
+    // can invalidate later child stdio after hashing a large package graph.
+    const bytes = Buffer.alloc(Math.max(1, Math.min(64 * 1024, before.size)))
+    for (let offset = 0; offset < before.size;) {
+      signal?.throwIfAborted()
+      const { bytesRead } = await handle.read(bytes, 0, Math.min(bytes.length, before.size - offset), offset)
+      signal?.throwIfAborted()
+      if (bytesRead === 0) throw new Error('identity_mismatch')
+      offset += bytesRead
+      if (offset > 256 * 1024 * 1024) throw new Error('identity_mismatch')
+      hash.update(bytes.subarray(0, bytesRead))
+    }
+    signal?.throwIfAborted()
     const after = await handle.stat()
     const current = await stat(file)
+    signal?.throwIfAborted()
     if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size ||
       before.mtimeMs !== after.mtimeMs || after.ino !== current.ino || after.dev !== current.dev) {
       throw new Error('identity_mismatch')
@@ -62,11 +77,11 @@ export async function inspectOpenCodeReadSelection(signal?: AbortSignal, onAcqui
   if (!selected) return { path: null, policy: { generation: 'unsupported', version: null }, native: null, fingerprint: null }
   onAcquisitionStarted?.()
   signal?.throwIfAborted()
-  const executablePath = await realpath(selected)
+  const executablePath = await filesystem.realpath(selected)
   signal?.throwIfAborted()
   const executableSha256 = await hashOpenCodeFile(executablePath)
   signal?.throwIfAborted()
-  const roots = await createOpenCodeV2ReadRoots()
+  const roots = await createOpenCodeVersionReadRoots()
   const output = await readOpenCodeOwnedVersion(executablePath, roots, signal)
   signal?.throwIfAborted()
   const policy = classifyOpenCodeReadGeneration(output)

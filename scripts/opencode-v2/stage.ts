@@ -9,6 +9,9 @@ const selections = [
   ['@opencode/client-v2-floor', '@opencode/client', '2.0.0'],
   ['@opencode/client', '@opencode/client', '2.0.21'],
   ['effect', 'effect', '4.0.0-rc.112'],
+  // Official core chunks import NodeSocket without declaring this package.
+  // Preserve the installed root resolution in the standalone runtime bundle.
+  ['@effect/platform-node', '@effect/platform-node', '4.0.0-rc.112'],
   ['@opencode/schema', '@opencode/schema', '2.0.21'],
   ['@modelcontextprotocol/sdk', '@modelcontextprotocol/sdk', '1.29.0'],
 ] as const
@@ -74,6 +77,7 @@ async function assertEntry(specifier: string, from: string, name: string, versio
 async function verifyGraphs(from: string, ownedRoot?: string): Promise<void> {
   // Root model mapping and its schemas must share one physical Effect instance.
   const effect = await assertEntry('effect', from, 'effect', '4.0.0-rc.112', ownedRoot)
+  await assertEntry('@effect/platform-node/NodeSocket', from, '@effect/platform-node', '4.0.0-rc.112', ownedRoot)
   for (const specifier of ['@opencode/schema/config/provider', '@opencode/schema/model']) {
     const schema = await assertEntry(specifier, from, '@opencode/schema', '2.0.21', ownedRoot)
     if (await assertEntry('effect', path.dirname(schema), 'effect', '4.0.0-rc.112', ownedRoot) !== effect) {

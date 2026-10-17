@@ -19,7 +19,7 @@ export function executionFloorOperations(baseUrl: string, directory: string, wir
     prompt: (sessionID, input) => sdk.session.prompt({ sessionID, id: input.nativeInputID, text: input.text,
       files: input.files, agents: input.agents, skills: input.skills, delivery: 'queue', resume: input.resume }),
     inbox: sessionID => sdk.session.inbox.list({ sessionID }),
-    messages: (sessionID, cursor) => sdk.message.list({ sessionID, cursor, limit: 200 }),
+    messages: (sessionID, cursor) => sdk.message.list({ sessionID, cursor, limit: 200, ...(cursor === undefined ? { order: 'asc' as const } : {}) }),
     log: (sessionID, after) => sdk.session.log({ sessionID, after, follow: false }),
     putInstruction: (sessionID, key, value) => bridge.session.instructions.entry.put({ sessionID, key, value }),
     instructions: sessionID => bridge.session.instructions.entry.list({ sessionID }),

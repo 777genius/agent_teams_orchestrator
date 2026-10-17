@@ -175,7 +175,7 @@ for (const mode of ['open', 'exit-only', 'late-close', 'abort'] as const) {
 // never become signal authority, nor hide an orphan in the next full census.
 function additionFixture(mode: 'gone' | 'alive' | 'unknown' | 'orphan' | 'reused' | 'older' | 'expired' |
   'confirmation-gone' | 'confirmation-live' | 'confirmation-reused' | 'stale-gone' | 'stale-live' |
-  'late-orphan' | 'open', platform: NodeJS.Platform = 'win32', reverseRows = false) {
+  'late-orphan' | 'open' | 'captured-orphan-alive' | 'captured-orphan-unknown' | 'unordered' | 'unordered-older', platform: NodeJS.Platform = 'win32', reverseRows = false) {
   Object.defineProperty(process, 'platform', { value: platform })
   const root = 900_010, relay = 900_011, leaf = 900_012
   let clock = 1_000_000, removed = 0, trees = 0, closed = false, leafReads = 0
@@ -188,6 +188,19 @@ function additionFixture(mode: 'gone' | 'alive' | 'unknown' | 'orphan' | 'reused
   const readRows = (budget: number) => {
     budgets.push(budget)
     trees++
+    if (mode.startsWith('unordered')) {
+      if (trees <= 2) return [rows[0]!, rows[2]!, rows[1]!]
+      child.emit('exit', 0); child.emit('close', 0); closed = true
+      return []
+    }
+    if (mode.startsWith('captured-orphan-')) {
+      if (trees <= 2) return rows.slice(0, 2)
+      if (trees === 3) {
+        child.emit('exit', 0); child.emit('close', 0); closed = true
+        return [rows[0]!, { pid: leaf, ppid: root }, { pid: relay, ppid: 900_099 }]
+      }
+      return [{ pid: relay, ppid: 900_099 }]
+    }
     if (trees === 1) return reverseRows ? [...rows].reverse() : rows
     if (trees === 2 && (mode === 'orphan' || mode === 'late-orphan')) return mode === 'orphan' ? [{ pid: 900_013, ppid: leaf }] : []
     if (trees === 2 && mode === 'reused') return [{ pid: leaf, ppid: 900_099 }]
@@ -206,12 +219,17 @@ function additionFixture(mode: 'gone' | 'alive' | 'unknown' | 'orphan' | 'reused
     birth: async (target, budget) => {
       budgets.push(budget)
       clock += 10
+      if (mode.startsWith('unordered')) {
+        if (target === leaf) leafReads++
+        return target === root ? 10 : target === relay ? 20 : mode === 'unordered-older' ? 5 : 30
+      }
+      if (mode.startsWith('captured-orphan-') && target === relay) return 20
       if (target === leaf) {
         leafReads++
         if (leafReads === 1 && mode !== 'open') {
           child.emit('exit', 0); child.emit('close', 0); closed = true
         }
-        if (mode === 'expired') clock += WINDOWS_DEADLINE_MS
+        if (mode === 'expired') clock += versionAcquisitionMs(platform) + VERSION_CLEANUP_MS
         if (mode === 'older') return 5
         if (mode.startsWith('confirmation-')) return leafReads === 1 ? 30 : mode === 'confirmation-reused' ? 31 : null
         if (mode.startsWith('stale-')) return leafReads === 1 ? 30 : null
@@ -222,6 +240,11 @@ function additionFixture(mode: 'gone' | 'alive' | 'unknown' | 'orphan' | 'reused
     tree: async budget => readRows(budget),
     alive: target => {
       aliveReads.push(target)
+      // Captured root/relay are live until this fixture emits their exit/close.
+      if (!closed && (target === root || target === relay)) return 'alive'
+      if (mode.startsWith('captured-orphan-') && target === relay) {
+        return mode === 'captured-orphan-alive' ? 'alive' : 'unknown'
+      }
       return target === leaf && (mode === 'alive' || mode === 'confirmation-live' || mode === 'confirmation-reused' || mode === 'stale-live') ? 'alive'
         : target === leaf && mode === 'unknown' ? 'unknown' : 'gone'
     },
@@ -258,7 +281,17 @@ for (const mode of ['gone', 'confirmation-gone', 'stale-gone'] as const) {
   })
 }
 
-for (const mode of ['alive', 'unknown', 'orphan', 'reused', 'older', 'expired',
+test('Windows unordered grandchild and parent births are confirmed before private roots retire', async () => {
+  const f = additionFixture('unordered')
+  expect(await f.run()).toBe('1.19.0\n')
+  expect(f.leafReads()).toBe(2)
+  // Its final exited root still has a queryable birth, so require the strict final census.
+  expect(f.trees()).toBe(4)
+  expect(f.removed()).toBe(1)
+  expect(f.signalled).toEqual([])
+})
+
+for (const mode of ['alive', 'unknown', 'orphan', 'reused', 'older', 'unordered-older', 'expired',
   'confirmation-live', 'confirmation-reused', 'stale-live', 'late-orphan', 'open'] as const) {
   test(`Windows ${mode} snapshot addition remains unknown without deleting private roots or signalling candidates`, async () => {
     const f = additionFixture(mode)
@@ -266,6 +299,18 @@ for (const mode of ['alive', 'unknown', 'orphan', 'reused', 'older', 'expired',
     expect(f.removed()).toBe(0)
     expect(f.signalled).toEqual([])
     if (mode === 'stale-live') expect(f.leafReads()).toBe(2)
+  })
+}
+
+for (const mode of ['captured-orphan-alive', 'captured-orphan-unknown'] as const) {
+  test(`Windows observe-only ${mode} refuses without signalling retained births`, async () => {
+    const f = additionFixture(mode)
+    await expect(f.run()).rejects.toThrow('cleanup_unknown')
+    expect(f.trees()).toBeGreaterThanOrEqual(3)
+    expect(f.leafReads()).toBe(0)
+    expect(f.removed()).toBe(0)
+    expect(f.signalled).toEqual([])
+    expect(f.budgets.every(budget => budget > 0 && budget <= 5000)).toBe(true)
   })
 }
 
@@ -283,12 +328,14 @@ test('darwin gone group member with reparented PPID requires absence and final c
 
 // The wrapper can close before the first birth helper completes while WMI still
 // returns its old tree. These rows must never confer birth or signal authority.
-function unanchoredFixture(mode: 'gone' | 'alive' | 'unknown' | 'orphan' | 'reused' | 'persistent' | 'final-reappeared' | 'absence-before-close' | 'root-reused' | 'protected' | 'unsuccessful', captured = false) {
+function unanchoredFixture(mode: 'gone' | 'alive' | 'unknown' | 'orphan' | 'reused' | 'persistent' |
+  'final-reappeared' | 'absence-before-close' | 'stale-captured' | 'stale-queryable' | 'stale-queryable-unknown' | 'stale-queryable-final-reappeared' | 'transient-live-candidate' | 'persistent-live-after-absence' | 'root-reused' | 'protected' | 'unsuccessful' | 'queued-close' | 'never-close', captured = false) {
+
   Object.defineProperty(process, 'platform', { value: 'win32' })
   const root = 900_020, relay = 900_021, leaf = 900_022, orphan = 900_023, grandchild = 900_024
   let clock = 1_000_000, removed = 0, trees = 0, births = 0
   const budgets: number[] = [], signals: number[] = [], taskkills: number[] = [], aliveReads: number[] = []
-  const events: string[] = []
+  const events: string[] = [], birthTargets: number[] = []
   const child = new EventEmitter() as ChildProcess
   Object.assign(child, { pid: root, stdout: new PassThrough() })
   const initialRows = [{ pid: root, ppid: process.pid }, { pid: relay, ppid: root }, { pid: mode === 'protected' ? process.pid : leaf, ppid: relay }]
@@ -298,38 +345,49 @@ function unanchoredFixture(mode: 'gone' | 'alive' | 'unknown' | 'orphan' | 'reus
     queueMicrotask(() => {
       child.stdout!.emit('data', Buffer.from('1.19.0\n'))
       const exitCode = mode === 'unsuccessful' ? 1 : 0
-      child.emit('exit', exitCode)
-      if (mode !== 'absence-before-close') child.emit('close', exitCode)
+      if (mode !== 'queued-close' && mode !== 'never-close') child.emit('exit', exitCode)
+      if (mode !== 'absence-before-close' && mode !== 'queued-close' && mode !== 'never-close') child.emit('close', exitCode)
     })
     return child
   })
   const ports = spyOn(native, 'nativePorts').mockImplementation(() => ({
     platform: 'win32', selfPid: process.pid, now: () => clock,
-    birth: async (_target, budget) => { births++; budgets.push(budget); clock += 350; return captured && births === 1 ? 10 : null },
+    birth: async (target, budget) => {
+      births++; birthTargets.push(target); budgets.push(budget); clock += 350
+      if (mode.startsWith('stale-queryable') && target === root) return 100
+      return (mode === 'stale-captured' || captured) && target === root && births === 1 ? 100 : null
+    },
+
     tree: async budget => {
       budgets.push(budget); trees++
-      let rows = trees === 1 || mode === 'persistent' ? initialRows : []
+      let rows = trees === 1 || mode === 'persistent' ||
+        (mode === 'transient-live-candidate' && trees <= 3) ? initialRows : []
       if (trees === 2 && mode === 'orphan') rows = [{ pid: grandchild, ppid: orphan }, { pid: orphan, ppid: leaf }]
       if (trees === 2 && mode === 'reused') rows = [{ pid: leaf, ppid: 900_099 }]
       if (trees === 2 && mode === 'root-reused') rows = [{ pid: root, ppid: 900_099 }]
-      if (trees === 3 && mode === 'final-reappeared') rows = [{ pid: orphan, ppid: leaf }]
+      if (trees === 3 && (mode === 'final-reappeared' || mode === 'stale-queryable-final-reappeared')) rows = [{ pid: orphan, ppid: leaf }]
+
       events.push(rows.length ? 'census:rows' : 'census:empty')
       return rows
     },
     alive: target => {
       aliveReads.push(target)
+      if (mode === 'stale-queryable-unknown' && target === root) return 'unknown'
+      if (target === leaf && (mode === 'persistent-live-after-absence' ||
+        (mode === 'transient-live-candidate' && trees <= 2))) return 'alive'
       if ((mode === 'alive' && target === leaf) || (mode === 'orphan' && target === grandchild) ||
-        (mode === 'reused' && trees === 2 && target === leaf) ||
-        (mode === 'root-reused' && trees === 2 && target === root)) return 'alive'
+        (mode === 'reused' && trees >= 2 && target === leaf) ||
+        (mode === 'root-reused' && trees >= 2 && target === root)) return 'alive'
+
       return mode === 'unknown' && target === leaf ? 'unknown' : 'gone'
     },
     signal: target => { signals.push(target) },
     taskkill: async target => { taskkills.push(target); throw new Error('TEST unowned process kill') },
     sleep: async ms => {
       clock += ms
-      if (mode === 'absence-before-close' && trees === 2) {
+      if ((mode === 'absence-before-close' && trees === 2) || (mode === 'queued-close' && trees === 1)) {
         expect(removed).toBe(0)
-        events.push('close'); child.emit('close', 0)
+        events.push('close'); if (mode === 'queued-close') child.emit('exit', 0); child.emit('close', 0)
       }
     },
   }))
@@ -337,19 +395,73 @@ function unanchoredFixture(mode: 'gone' | 'alive' | 'unknown' | 'orphan' | 'reus
   const roots = { root: '/TEST/private', env: {}, remove: async () => { events.push('remove'); removed++ } } as OpenCodeV2ReadRoots
   return { run: () => readOpenCodeOwnedVersion('/TEST/native', roots), removed: () => removed,
     trees: () => trees, births: () => births, elapsed: () => clock - 1_000_000,
-    budgets, signals, taskkills, aliveReads, events, root, relay, leaf, orphan, grandchild }
+    budgets, signals, taskkills, aliveReads, birthTargets, events, root, relay, leaf, orphan, grandchild }
 }
 
 test('Windows unanchored gone rows require independent gone checks, raw absence and strict final census', async () => {
   const f = unanchoredFixture('gone')
   expect(await f.run()).toBe('1.19.0\n')
-  expect(f.aliveReads).toEqual([f.root, f.relay, f.leaf])
+  expect(f.aliveReads).toEqual([f.root, f.relay, f.leaf, f.root, f.relay, f.leaf])
   expect(f.events).toEqual(['census:rows', 'census:empty', 'census:empty', 'remove'])
   expect(f.births()).toBe(1)
   expect(f.signals).toEqual([])
   expect(f.taskkills).toEqual([])
   expect(f.budgets).toEqual([5000, 5000, 5000, 5000])
   expect(f.removed()).toBe(1)
+})
+
+test('Windows stale captured anchor retires only after gone checks, fresh absence, close and strict final census', async () => {
+  const f = unanchoredFixture('stale-captured')
+  expect(await f.run()).toBe('1.19.0\n')
+  expect(f.aliveReads).toEqual([f.root, f.root, f.root, f.relay, f.leaf, f.root, f.relay, f.leaf])
+  expect(f.events).toEqual(['census:rows', 'census:empty', 'census:empty', 'remove'])
+  expect(f.births()).toBe(2)
+  expect(f.signals).toEqual([])
+  expect(f.taskkills).toEqual([])
+  expect(f.budgets).toEqual([5000, 5000, 5000, 5000, 5000])
+  expect(f.removed()).toBe(1)
+})
+
+test('Windows closed root with queryable same birth cannot authorize descendant birth reads or signals', async () => {
+  const f = unanchoredFixture('stale-queryable')
+  expect(await f.run()).toBe('1.19.0\n')
+  expect(f.birthTargets).toEqual([f.root, f.root])
+  expect(f.signals).toEqual([])
+  expect(f.taskkills).toEqual([])
+  expect(f.events).toEqual(['census:rows', 'census:empty', 'census:empty', 'remove'])
+  expect(f.removed()).toBe(1)
+})
+
+for (const mode of ['stale-queryable-unknown', 'stale-queryable-final-reappeared'] as const) {
+  test(`Windows queryable closed-root ${mode} remains unknown without new authority`, async () => {
+    const f = unanchoredFixture(mode)
+    await expect(f.run()).rejects.toThrow('cleanup_unknown')
+    expect(f.birthTargets).toEqual([f.root, f.root])
+    expect(f.signals).toEqual([])
+    expect(f.taskkills).toEqual([])
+    expect(f.removed()).toBe(0)
+  })
+}
+
+test('Windows observe-only transient live candidate waits for gone, raw absence and strict final census', async () => {
+  const f = unanchoredFixture('transient-live-candidate')
+  expect(await f.run()).toBe('1.19.0\n')
+  expect(f.events).toEqual(['census:rows', 'census:rows', 'census:rows', 'census:empty', 'census:empty', 'remove'])
+  expect(f.birthTargets).toEqual([f.root])
+  expect(f.signals).toEqual([])
+  expect(f.taskkills).toEqual([])
+  expect(f.removed()).toBe(1)
+})
+
+test('Windows observe-only live candidate remains pending after census absence until the original deadline', async () => {
+  const f = unanchoredFixture('persistent-live-after-absence')
+  await expect(f.run()).rejects.toThrow('cleanup_unknown')
+  expect(f.trees()).toBeGreaterThan(2)
+  expect(f.elapsed()).toBe(WINDOWS_DEADLINE_MS)
+  expect(f.birthTargets).toEqual([f.root])
+  expect(f.signals).toEqual([])
+  expect(f.taskkills).toEqual([])
+  expect(f.removed()).toBe(0)
 })
 
 test('Windows unanchored census absence waits for child close before strict final census and removal', async () => {
@@ -372,8 +484,11 @@ for (const mode of ['alive', 'unknown', 'orphan', 'reused', 'persistent', 'final
     expect(f.births()).toBe(1)
     expect(f.aliveReads).toContain(f.leaf)
     expect(f.budgets.every(budget => budget > 0 && budget <= 5000)).toBe(true)
-    if (mode === 'orphan') { expect(f.trees()).toBe(2); expect(f.aliveReads).toContain(f.grandchild) }
-    if (mode === 'reused') expect(f.trees()).toBe(2)
+    if (mode === 'orphan') {
+      expect(f.trees()).toBeGreaterThan(2); expect(f.elapsed()).toBe(WINDOWS_DEADLINE_MS)
+      expect(f.aliveReads).toContain(f.grandchild)
+    }
+    if (mode === 'reused') { expect(f.trees()).toBeGreaterThan(2); expect(f.elapsed()).toBe(WINDOWS_DEADLINE_MS) }
     if (mode === 'final-reappeared') expect(f.trees()).toBe(3)
     if (mode === 'persistent') expect(f.elapsed()).toBe(WINDOWS_DEADLINE_MS)
   })
@@ -393,7 +508,7 @@ test('Windows captured successful owner waits out stale gone descendants without
   expect(f.removed()).toBe(1)
 })
 
-for (const mode of ['root-reused', 'protected', 'absence-before-close', 'unsuccessful'] as const) {
+for (const mode of ['root-reused', 'protected', 'unsuccessful'] as const) {
   test(`Windows captured ${mode} owner cannot use stale-census waiting to retire or signal`, async () => {
     const f = unanchoredFixture(mode, true)
     await expect(f.run()).rejects.toThrow('cleanup_unknown')
@@ -402,11 +517,34 @@ for (const mode of ['root-reused', 'protected', 'absence-before-close', 'unsucce
     expect(f.taskkills).toEqual([])
     expect(f.births()).toBe(2)
     if (mode === 'root-reused') {
-      expect(f.trees()).toBe(2)
+      expect(f.elapsed()).toBe(WINDOWS_DEADLINE_MS)
       expect(f.aliveReads).toContain(f.root)
     }
   })
 }
+
+
+for (const mode of ['queued-close', 'absence-before-close'] as const) {
+  test(`Windows gone captured owner waits for ${mode} without acquiring new authority`, async () => {
+    const f = unanchoredFixture(mode, true)
+    expect(await f.run()).toBe('1.19.0\n')
+    expect(f.birthTargets).toEqual([f.root, f.root])
+    expect(f.events).toEqual(mode === 'queued-close'
+      ? ['census:rows', 'close', 'census:empty', 'census:empty', 'remove']
+      : ['census:rows', 'census:empty', 'close', 'census:empty', 'census:empty', 'remove'])
+    expect(f.signals).toEqual([]); expect(f.taskkills).toEqual([])
+    expect(f.removed()).toBe(1)
+  })
+}
+
+test('Windows gone captured owner without close stays unknown at the original deadline', async () => {
+  const f = unanchoredFixture('never-close', true)
+  await expect(f.run()).rejects.toThrow('cleanup_unknown')
+  expect(f.birthTargets).toEqual([f.root, f.root])
+  expect(f.elapsed()).toBe(WINDOWS_DEADLINE_MS)
+  expect(f.signals).toEqual([]); expect(f.taskkills).toEqual([])
+  expect(f.removed()).toBe(0)
+})
 
 // Native Windows process tables need not list a parent before its child.
 test('Windows reverse census acquires parent births before a valid descendant and still proves retirement', async () => {
@@ -426,7 +564,8 @@ test('Windows reverse census still refuses a child born before its captured pare
   try { await f.run() } catch (error) { failure = error }
   expect(failure).toBeInstanceOf(OpenCodeVersionProbeCleanupError)
   expect((failure as OpenCodeVersionProbeCleanupError).terminalDiagnostic).toMatchObject({
-    phase: 'addition_identity', guard: 'parent_identity', birthsCount: 2,
+    // Candidate capture publishes no new birth authority before the entire batch validates.
+    phase: 'addition_identity', guard: 'parent_identity', birthsCount: 1,
   })
   expect(f.removed()).toBe(0)
   expect(f.signalled).toEqual([])
