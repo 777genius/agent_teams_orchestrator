@@ -4333,6 +4333,9 @@ private:
     require(directory == dataRoot + L"\\opencode\\v2\\runs\\" + basename,
             "run_state_identity_changed");
     const auto owner = currentSid();
+    // The session's sealed cohort may already hold this namespace's metadata grants.
+    const auto cohortSids =
+        owners.sealedCohort ? owners.sealedCohortSids() : std::vector<std::wstring>();
     std::vector<RetainedAnchorComponent> ancestors;
     for (auto &parent : owners.holdSelectedAncestors(dataRoot))
       ancestors.emplace_back(std::move(parent));
@@ -4349,10 +4352,10 @@ private:
         const auto &part = prefix[index];
         part.assertLive();
         if (absence) {
-          (void)directoryIdentity(part.handle.value, owner, dataRoot, directory, {}, index != 4);
+          (void)directoryIdentity(part.handle.value, owner, dataRoot, directory, cohortSids, index != 4);
           auto named = verificationDirectory(part.path);
-          require(directoryIdentity(named.value, owner, dataRoot, directory, {}, index != 4).Stringify() ==
-                      directoryIdentity(part.handle.value, owner, dataRoot, directory, {}, index != 4).Stringify(),
+          require(directoryIdentity(named.value, owner, dataRoot, directory, cohortSids, index != 4).Stringify() ==
+                      directoryIdentity(part.handle.value, owner, dataRoot, directory, cohortSids, index != 4).Stringify(),
                   "run_state_identity_changed");
         }
       }
@@ -4506,7 +4509,13 @@ public:
     std::vector<Handle> parents = owners.holdSelectedAncestors(directory);
     require(parents.size() >= 4, "run_state_held_inputs");
     const JsonObject rootIdentity = fileObjectIdentity(root.value, owner, true);
-    if (create) (void)directoryIdentity(root.value, owner, dataRoot, directory, {}, true);
+    // Mirrors the absent-discover allowance: the sealed cohort's own metadata
+    // grants on the shared ancestors predate this run's directory creation.
+    if (create)
+      (void)directoryIdentity(root.value, owner, dataRoot, directory,
+                              owners.sealedCohort ? owners.sealedCohortSids()
+                                                  : std::vector<std::wstring>(),
+                              true);
     Handle run;
     try {
       // Run state mutates child records, never renames its directory. Keep the
