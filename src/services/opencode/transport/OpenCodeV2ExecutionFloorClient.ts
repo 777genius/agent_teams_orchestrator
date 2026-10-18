@@ -1,6 +1,9 @@
-import { OpenCode } from '@opencode/client-v2-floor'
+import { ClientError, OpenCode } from '@opencode/client-v2-floor'
 import type { ExecutionOperations } from './OpenCodeV2ExecutionClientFactory.js'
 import type { OpenCodeV2ExecutionFetch } from './OpenCodeV2ExecutionFetch.js'
+
+// Loaded only after the factory qualifies this selected pin's installed graph.
+export const executionFloorClientErrorPrototype: object = ClientError.prototype
 
 /** Exact floor Promise API stays private to this adapter. */
 export function executionFloorOperations(baseUrl: string, directory: string, wire: OpenCodeV2ExecutionFetch, bridgeFetch: typeof globalThis.fetch): ExecutionOperations {

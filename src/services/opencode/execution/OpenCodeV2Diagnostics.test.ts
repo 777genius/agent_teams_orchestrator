@@ -4,7 +4,74 @@ import { mkdir, mkdtemp, readdir, readFile, rm, lstat } from 'node:fs/promises'
 import path from 'node:path'
 import { tmpdir } from 'node:os'
 import * as privateDirectories from '../profile/OpenCodePrivateDirectories.js'
-import { recordOpenCodeV2ProviderFailure, retainOpenCodeV2CleanupPhase, retainOpenCodeV2InitializationPhase, type RunInitializationPhase } from './OpenCodeV2Diagnostics.js'
+import { ClientError as CurrentClientError } from '@opencode/client'
+import { ClientError as FloorClientError } from '@opencode/client-v2-floor'
+import { ExecutionTransportFailure } from '../transport/OpenCodeV2ExecutionFetch.js'
+import { recordOpenCodeV2ProviderFailure, retainOpenCodeV2CatalogFailure, retainOpenCodeV2CleanupPhase, retainOpenCodeV2InitializationPhase, type RunInitializationPhase } from './OpenCodeV2Diagnostics.js'
+
+test('catalog diagnostics preserve selected official client reasons, numeric status and immutable owned wire codes only', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'TEST-v2-catalog-diagnostics-'))
+  const previous = process.env.CLAUDE_MULTIMODEL_DATA_HOME
+  process.env.CLAUDE_MULTIMODEL_DATA_HOME = root
+  const secret = 'TEST-PRIVATE-CATALOG-PAYLOAD'
+  try {
+    for (const ClientError of [CurrentClientError, FloorClientError]) {
+      const original = new ExecutionTransportFailure('media_type', 'unknown')
+      Object.defineProperty(original, 'code', { value: secret })
+      Object.assign(original, { status: 500, wireStatus: 500 })
+      const error = new ClientError('Transport', { cause: original })
+      const before = Object.getOwnPropertyDescriptors(error)
+      retainOpenCodeV2CatalogFailure(error, 'info', ClientError.prototype)
+      await recordOpenCodeV2ProviderFailure('execution-host-startup', error, true)
+      expect(Object.getOwnPropertyDescriptors(error)).toEqual(before)
+      for (const status of [503, 99, 600, 200.5, secret]) {
+        const failure = new ClientError('UnexpectedStatus', { cause: { status, body: secret } })
+        retainOpenCodeV2CatalogFailure(failure, 'location', ClientError.prototype)
+        await recordOpenCodeV2ProviderFailure('execution-host-startup', failure, true)
+      }
+      const otherPin = ClientError === CurrentClientError ? FloorClientError : CurrentClientError
+      retainOpenCodeV2CatalogFailure(error, 'client-setup', otherPin.prototype)
+      await recordOpenCodeV2ProviderFailure('execution-host-startup', error, true)
+    }
+    const spoof = Object.assign(new Error(secret), { name: 'ClientError', reason: 'UnexpectedStatus', cause: { status: 503 },
+      code: 'http_failure', status: 500, wireStatus: 500 })
+    retainOpenCodeV2CatalogFailure(spoof, 'integration-ready', CurrentClientError.prototype)
+    await recordOpenCodeV2ProviderFailure('execution-host-startup', spoof, true)
+    const rows = await Promise.all((await readdir(path.join(root, 'opencode/v2/provider-diagnostics'))).map(async name => {
+      const bytes = await readFile(path.join(root, 'opencode/v2/provider-diagnostics', name), 'utf8')
+      expect(bytes).not.toContain(secret)
+      return JSON.parse(bytes)
+    }))
+    expect(rows.filter(row => row.catalog?.phase === 'info').map(row => row.catalog)).toEqual([
+      { phase: 'info', client: { reason: 'Transport' }, wireCode: 'media_type' },
+      { phase: 'info', client: { reason: 'Transport' }, wireCode: 'media_type' },
+    ])
+    expect(rows.filter(row => row.catalog?.client?.status !== undefined).map(row => row.catalog.client.status)).toEqual([503, 503])
+    expect(rows.filter(row => row.catalog?.phase === 'location')).toHaveLength(10)
+    expect(rows.filter(row => row.catalog?.phase === 'client-setup').every(row => row.catalog.client === undefined)).toBe(true)
+    expect(rows.find(row => row.catalog?.phase === 'integration-ready').catalog).toEqual({ phase: 'integration-ready' })
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_DATA_HOME
+    else process.env.CLAUDE_MULTIMODEL_DATA_HOME = previous
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('catalog collection rejects accessors and proxy prototypes without executing them or replacing refusal', () => {
+  let calls = 0
+  const forbidden = () => { calls++; throw new Error('TEST diagnostic accessor executed') }
+  const proxy = new Proxy({}, { get: forbidden, getPrototypeOf: forbidden, getOwnPropertyDescriptor: forbidden })
+  const native = Object.setPrototypeOf(new Error('TEST original refusal'), proxy)
+  const proxied = new Proxy(new Error('TEST original refusal'), { getPrototypeOf: forbidden, getOwnPropertyDescriptor: forbidden })
+  const reason = new CurrentClientError('Transport')
+  Object.defineProperty(reason, 'reason', { get: forbidden })
+  const cause = new CurrentClientError('UnexpectedStatus')
+  Object.defineProperty(cause, 'cause', { get: forbidden })
+  const status = new CurrentClientError('UnexpectedStatus', { cause: Object.defineProperty({}, 'status', { get: forbidden }) })
+  for (const error of [native, proxied, reason, cause, status])
+    expect(() => retainOpenCodeV2CatalogFailure(error, 'info', CurrentClientError.prototype)).not.toThrow()
+  expect(calls).toBe(0)
+})
 
 test('startup failures preserve finite original error facts and local Windows guard stages', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'TEST-v2-original-startup-failure-'))

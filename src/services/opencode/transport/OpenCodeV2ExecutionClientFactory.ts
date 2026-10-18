@@ -1,4 +1,5 @@
 import { assertExecutionSelectedModel, type ExecutionAuthority, type ExecutionContext } from '../execution/OpenCodeV2ExecutionContracts.js'
+import { retainOpenCodeV2CatalogFailure, type ExecutionCatalogPhase } from '../execution/OpenCodeV2Diagnostics.js'
 import path from 'node:path'
 import { realpath } from 'node:fs/promises'
 import { hashOpenCodeFile } from '../compatibility/OpenCodeNativeIdentity.js'
@@ -310,25 +311,47 @@ async function operations(authority: ExecutionAuthority, context: ExecutionConte
   const bridgeWire = new OpenCodeV2BridgeFetch(authority, context, endpoint)
   try {
     wire.check()
-    const ops = authority.pin === '2.0.0'
-      ? (await import('./OpenCodeV2ExecutionFloorClient.js')).executionFloorOperations(endpoint.baseUrl, authority.directory, wire, bridgeWire.fetch)
-      : (await import('./OpenCodeV2ExecutionCurrentClient.js')).executionCurrentOperations(endpoint.baseUrl, authority.directory, wire, bridgeWire.fetch)
-    return { ops, wire, bridgeWire }
+    let ops: ExecutionOperations, clientErrorPrototype: object
+    if (authority.pin === '2.0.0') {
+      const adapter = await import('./OpenCodeV2ExecutionFloorClient.js')
+      ops = adapter.executionFloorOperations(endpoint.baseUrl, authority.directory, wire, bridgeWire.fetch)
+      clientErrorPrototype = adapter.executionFloorClientErrorPrototype
+    } else {
+      const adapter = await import('./OpenCodeV2ExecutionCurrentClient.js')
+      ops = adapter.executionCurrentOperations(endpoint.baseUrl, authority.directory, wire, bridgeWire.fetch)
+      clientErrorPrototype = adapter.executionCurrentClientErrorPrototype
+    }
+    return { ops, wire, bridgeWire, clientErrorPrototype }
   } catch (failure) { await Promise.allSettled([wire.dispose(), bridgeWire.dispose()]); throw failure }
 }
 
 export async function awaitOpenCodeV2CatalogReadiness(endpoint: ExecutionEndpoint,
   authority: ExecutionAuthority, context: ExecutionContext): Promise<void> {
-  const { ops, wire, bridgeWire } = await operations(authority, context, endpoint)
+  let phase: ExecutionCatalogPhase = 'client-setup'
+  let clientErrorPrototype: object | undefined
   try {
-    const identity = record(await ops.identity())
-    executionAssert(identity.pid === requireExecutionEndpoint(authority).nativePID && identity.version === authority.pin &&
-      (authority.pin !== '2.0.0' || identity.healthy === true), 'authority_mismatch')
-    executionAssert(record(await ops.location()).directory === authority.directory, 'authority_mismatch')
-    const ready = await ops.ready()
-    if (authority.pin === '2.0.32') executionAssert(record(record(ready).location).directory === authority.directory, 'authority_mismatch')
-    wire.check()
-  } finally { await Promise.all([wire.dispose(), bridgeWire.dispose()]) }
+    const prepared = await operations(authority, context, endpoint)
+    const { ops, wire, bridgeWire } = prepared
+    clientErrorPrototype = prepared.clientErrorPrototype
+    let primary: unknown
+    try {
+      phase = 'info'
+      const identity = record(await ops.identity())
+      executionAssert(identity.pid === requireExecutionEndpoint(authority).nativePID && identity.version === authority.pin &&
+        (authority.pin !== '2.0.0' || identity.healthy === true), 'authority_mismatch')
+      phase = 'location'
+      executionAssert(record(await ops.location()).directory === authority.directory, 'authority_mismatch')
+      phase = 'integration-ready'
+      const ready = await ops.ready()
+      if (authority.pin === '2.0.32') executionAssert(record(record(ready).location).directory === authority.directory, 'authority_mismatch')
+      wire.check()
+    } catch (failure) {
+      primary = failure; retainOpenCodeV2CatalogFailure(failure, phase, clientErrorPrototype); throw failure
+    } finally {
+      try { await Promise.all([wire.dispose(), bridgeWire.dispose()]) }
+      catch (failure) { retainOpenCodeV2CatalogFailure(failure, phase, clientErrorPrototype, primary); throw failure }
+    }
+  } catch (failure) { retainOpenCodeV2CatalogFailure(failure, phase, clientErrorPrototype, failure); throw failure }
 }
 
 export async function awaitOpenCodeV2ExecutionReadiness(endpoint: ExecutionEndpoint,

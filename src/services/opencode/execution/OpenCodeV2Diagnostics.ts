@@ -1,12 +1,51 @@
 import { readWindowsNativeAliasFailure } from '../host/windows/OpenCodeV2WindowsNativeBroker.js'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
+import { types } from 'node:util'
 import { mkdir, lstat, writeFile } from 'node:fs/promises'
 import { resolveClaudeMultimodelPaths } from '../OpenCodeManagedPaths.js'
 import { executionAssert } from './OpenCodeV2ExecutionContracts.js'
 import { readOpenCodeV2ProviderWireFailure } from '../transport/OpenCodeV2ProviderWire.js'
+import { readOpenCodeV2ExecutionWireFailure } from '../transport/OpenCodeV2ExecutionFetch.js'
 import type { ExecutionMcpFailure } from '../transport/OpenCodeV2ExecutionClientFactory.js'
 import { ensureWindowsPrivateDirectories } from '../profile/OpenCodePrivateDirectories.js'
+
+export type ExecutionCatalogPhase = 'client-setup' | 'info' | 'location' | 'integration-ready'
+const catalogPhases = new Set<ExecutionCatalogPhase>(['client-setup', 'info', 'location', 'integration-ready'])
+const clientReasons = ['Transport', 'UnexpectedStatus', 'UnsupportedContentType', 'MalformedResponse', 'SseEventTooLarge'] as const
+type CatalogFailure = Readonly<{ phase: ExecutionCatalogPhase
+  client?: Readonly<{ reason: typeof clientReasons[number]; status?: number }>; wireCode?: string; wireStatus?: number }>
+const catalogFailures = new WeakMap<object, CatalogFailure>()
+function ownData(value: object, key: string): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(value, key)
+  return descriptor && 'value' in descriptor ? descriptor.value : undefined
+}
+/** Observation only. Neither caller fields nor an Error-shaped DTO can mint
+ * SDK provenance, and diagnostic collection must never invoke getters. */
+export function retainOpenCodeV2CatalogFailure(error: unknown, phase: ExecutionCatalogPhase,
+  clientErrorPrototype?: object, primary?: unknown): void {
+  try {
+    if (!catalogPhases.has(phase) || error === null || typeof error !== 'object' ||
+        types.isProxy(error) || !types.isNativeError(error)) return
+    const retained = primary !== null && typeof primary === 'object' ? catalogFailures.get(primary) : undefined
+    if (retained) { catalogFailures.set(error, retained); return }
+    let client: CatalogFailure['client']
+    const prototype = Object.getPrototypeOf(error)
+    if (clientErrorPrototype && !types.isProxy(clientErrorPrototype) && prototype === clientErrorPrototype) {
+      const reason = clientReasons.find(value => value === ownData(error, 'reason'))
+      if (reason) {
+        const cause = ownData(error, 'cause')
+        const status = reason === 'UnexpectedStatus' && cause !== null && typeof cause === 'object' && !types.isProxy(cause)
+          ? ownData(cause, 'status') : undefined
+        client = Object.freeze({ reason, ...(Number.isSafeInteger(status) && Number(status) >= 100 && Number(status) <= 599
+          ? { status: Number(status) } : {}) })
+      }
+    }
+    const wire = readOpenCodeV2ExecutionWireFailure(error)
+    catalogFailures.set(error, Object.freeze({ phase, ...(client ? { client } : {}), ...(wire ? { wireCode: wire.code,
+      ...(wire.code === 'http_failure' && wire.status !== undefined ? { wireStatus: wire.status } : {}) } : {}) }))
+  } catch { /* Observation cannot replace the original refusal, even for hostile error objects. */ }
+}
 
 const startupStages = new Set(['run-owner-entry', 'windows-cohort', 'windows-profile', 'windows-roots', 'windows-dll',
   'windows-process', 'windows-owned-pair', 'windows-published', 'windows-connected', 'windows-prepare', 'windows-assert', 'waiting-for-prepare', 'profile-validation', 'native-validation', 'graph-validation', 'waiting-for-activation',
@@ -309,6 +348,7 @@ export async function recordOpenCodeV2ProviderFailure(phase: string, error: unkn
     ? { ...(name ? { name } : {}), ...(errno ? { errno } : {}), ...(syscall ? { operation: syscall } : {}) } : undefined
   const alias = readWindowsNativeAliasFailure(cause) ?? readWindowsNativeAliasFailure(error)
   const operation = readOpenCodeV2ProviderWireFailure(error)
+  const catalog = error !== null && typeof error === 'object' ? catalogFailures.get(error) : undefined
   const startup = startupDiagnostic(startupOutput)
   const retainedInitialization = phase === 'run-owner-initialization' && error instanceof Error ? initializationFailures.get(error) : undefined
   const initialization = retainedInitialization?.initialization
@@ -335,6 +375,6 @@ export async function recordOpenCodeV2ProviderFailure(phase: string, error: unkn
     // Nonsecret observational data only: this file is not native ownership or
     // cleanup authority, even when an elevated Windows writer owns the file.
     await writeFile(path.join(directory, randomUUID() + '.json'), JSON.stringify({ schemaVersion: 1, phase, category, retainedOriginal,
-      ...(native?.native ? { native: native.native } : {}), ...(alias ? { alias } : {}), ...(failure ? { failure } : {}), ...(operation ? { operation } : {}), ...(startup ? { startup } : {}), ...(acquisition ? { acquisition } : {}), ...(cleanup ? { cleanup } : {}), ...(initialization ? { initialization } : {}), recordedAt: new Date().toISOString() }), { flag: 'wx', mode: 0o600 })
+      ...(native?.native ? { native: native.native } : {}), ...(alias ? { alias } : {}), ...(failure ? { failure } : {}), ...(operation ? { operation } : {}), ...(catalog ? { catalog } : {}), ...(startup ? { startup } : {}), ...(acquisition ? { acquisition } : {}), ...(cleanup ? { cleanup } : {}), ...(initialization ? { initialization } : {}), recordedAt: new Date().toISOString() }), { flag: 'wx', mode: 0o600 })
   } catch { /* Diagnostics cannot replace or retry the unresolved original operation. */ }
 }

@@ -1,6 +1,9 @@
-import { OpenCode } from '@opencode/client'
+import { ClientError, OpenCode } from '@opencode/client'
 import type { ExecutionOperations } from './OpenCodeV2ExecutionClientFactory.js'
 import type { OpenCodeV2ExecutionFetch } from './OpenCodeV2ExecutionFetch.js'
+
+// Loaded only after the factory qualifies this selected pin's installed graph.
+export const executionCurrentClientErrorPrototype: object = ClientError.prototype
 
 /** Exact current Promise API stays private to this adapter. */
 export function executionCurrentOperations(baseUrl: string, directory: string, wire: OpenCodeV2ExecutionFetch, bridgeFetch: typeof globalThis.fetch): ExecutionOperations {
