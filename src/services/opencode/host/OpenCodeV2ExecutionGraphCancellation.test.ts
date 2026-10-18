@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto'
 import { mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+import { types } from 'node:util'
 import { executionHash } from '../execution/OpenCodeV2ExecutionContracts.js'
 import filesystem from 'node:fs/promises'
 import { projectWindowsRealpathFailure } from './windows/OpenCodeV2WindowsRealpath.js'
@@ -25,11 +26,14 @@ async function actualRealpathInstallation(resolve: RealpathNativeCall) {
     surfaces = () => []; syncExports = () => {};
     return { install: installWindowsRealpathFallback,
       resolve: (input, encoding, error) => resolveNative(active, input, undefined, encoding, error),
-      failure: readWindowsRealpathFailure };
+      promise: (original, input) => callPromise(original, undefined, [input]),
+      retain: retainWindowsRealpathFailure, failure: readWindowsRealpathFailure };
   `)(path, () => { throw new Error('TEST-url-not-used') }, buffers, { platform: 'win32', pid: 1 },
     () => ({ ptr: (bytes: Buffer) => bytes }), { symbols: { RP_ResolveV1: resolve, RP_CloseV1: () => 0 }, close() {} }) as {
       install(selection: unknown): { uninstall(): void }
       resolve(input: string, encoding: { kind: 'default' | 'buffer' }, error: Error): { handled: boolean; value?: string | Buffer }
+      promise(original: (input: string) => Promise<string>, input: string): Promise<string>
+      retain(source: unknown, target: unknown): void
       failure(error: Error): unknown
     }
   const owned = create.install({ dllPath: 'C:\\TEST\\realpath.dll', expectedPid: 1, expectedCreationFiletime: 1n,
@@ -61,6 +65,40 @@ test('actual Windows realpath clears reused scratch and refuses partial or malfo
     expect(install.resolve(expected, { kind: 'default' }, original)).toEqual({ handled: false })
     expect(outputBuffers.every(output => output === outputBuffers[0])).toBe(true)
     expect(install.allocations.filter(size => size === 65536)).toHaveLength(1)
+  } finally { install.close() }
+})
+
+test('native realpath install/uninstall and immutable copied refusal facts survive the same selected cause chain', async () => {
+  const admitted = 'C:\\TEST\\project', outside = 'C:\\outside\\project'
+  let denied = false
+  const install = await actualRealpathInstallation((_context, input, chars, output, _capacity, count, error) => {
+    const target = input.subarray(0, chars * 2).toString('utf16le')
+    if (denied || target !== admitted) { error.writeUInt32LE(18); error.writeUInt32LE(5, 4); return 2 }
+    output.write(target, 'utf16le'); count.writeUInt32LE(target.length); return 0
+  })
+  const original = Object.assign(new Error('TEST-private-native-refusal'), { code: 'EPERM' })
+  const legacy = async () => { throw original }
+  try {
+    expect(await install.promise(legacy, admitted)).toBe(admitted)
+    await expect(install.promise(legacy, outside)).rejects.toBe(original)
+    denied = true
+    await expect(install.promise(legacy, admitted)).rejects.toBe(original)
+    const selected = Object.assign(new Error('TEST-original-selected-refusal'), { _tag: 'PlatformError', reason: { _tag: 'Unknown', cause: original } })
+    const descriptors = Object.getOwnPropertyDescriptors(selected)
+    install.retain(original, selected)
+    const expected = { status: 2, operation: 18, win32: 5, anchorCount: 1, matchingAnchorIndex: 0 }
+    expect(install.failure(selected)).toEqual(expected)
+    expect(Object.getOwnPropertyDescriptors(selected)).toEqual(descriptors)
+    const source = await Bun.file(new URL('../execution/OpenCodeV2ServerFailure.ts', import.meta.url)).text()
+    const body = new Bun.Transpiler({ loader: 'ts' }).transformSync(source.replace(/^import .*\n/gm, '').replace(/^export /gm, ''))
+    const project = new Function('types', 'readWindowsRealpathFailure', `${body};return projectOpenCodeV2LocationCause;`)(types, install.failure)
+    expect(project({ reasons: [{ _tag: 'Fail', error: selected }, { _tag: 'Die', defect: { code: 'ENOENT' } }] }).realpath).toEqual(expected)
+    expect(project({ reasons: [{ _tag: 'Fail', error: { realpath: expected } }] }).realpath).toBeUndefined()
+    const forged = Object.assign(new Error('TEST-forged'), { realpath: expected, ...expected })
+    const target = new Error('TEST-target')
+    install.retain(forged, target); expect(install.failure(target)).toBeUndefined()
+    install.close()
+    await expect(install.promise(legacy, admitted)).rejects.toBe(original)
   } finally { install.close() }
 })
 

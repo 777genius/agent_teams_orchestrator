@@ -4,6 +4,7 @@ import { createServer } from 'node:http'
 import filesystem, { stat } from 'node:fs/promises'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
+import { types } from 'node:util'
 import { openCodeV2EffectVersion, type OpenCodeV2Pin } from '../../compatibility/OpenCodeGenerationPolicy.js'
 import { verifyOpenCodePackage, verifyOpenCodeV2GraphEffect, verifyOpenCodeV2ServerGraph } from '../OpenCodeV2ServerGraph.js'
 import type { ServerOptions as FloorOptions } from '@opencode/server-v2-floor/options'
@@ -11,6 +12,7 @@ import type { ServerOptions as CurrentOptions } from '@opencode/server/options'
 import { isWindowsCommandPort, type WindowsCommandPort } from './OpenCodeV2WindowsCommand.js'
 import type { OwnedNativeProfile } from '../OpenCodeV2ExecutionBinding.js'
 import { createOpenCodeV2ColdLocationObservation } from '../../execution/OpenCodeV2ServerFailure.js'
+import { retainWindowsRealpathFailure } from './OpenCodeV2WindowsRealpath.js'
 
 function requireValue(value: unknown): asserts value {
   if (!value) throw new Error('execution_windows_runtime_invalid')
@@ -55,9 +57,29 @@ export async function loadOpenCodeV2WindowsRuntime(pin: OpenCodeV2Pin, expectedM
   const cross = await load<typeof import('@opencode/util/cross-spawn-spawner')>(
     '@opencode/util/cross-spawn-spawner', '@opencode/util', pin)
   const global = await load<typeof import('@opencode/util/global')>('@opencode/util/global', '@opencode/util', pin)
+  const platform = await load<typeof import('@opencode/util/effect/app-node-platform')>(
+    '@opencode/util/effect/app-node-platform', '@opencode/util', pin)
   const http = await load<typeof import('@effect/platform-node/NodeHttpServer')>(
     '@effect/platform-node/NodeHttpServer', '@effect/platform-node', openCodeV2EffectVersion(pin))
-  const { Effect, Layer, PlatformError, Stream, Sink, Scope, Exit, Context } = effect
+  const { Effect, Layer, PlatformError, Stream, Sink, Scope, Exit, Context, FileSystem } = effect
+  // Bun keeps captured builtin namespace callbacks when syncBuiltinESMExports
+  // runs. Preserve the selected official normalizer, then route only its
+  // permission refusal through the live, authenticated realpath installation.
+  const filesystemNode = platform.filesystem.mapLayer(layer => Layer.effect(FileSystem.FileSystem, Effect.gen(function* () {
+    const original = yield* FileSystem.FileSystem
+    return FileSystem.FileSystem.of({ ...original, realPath: input => original.realPath(input).pipe(Effect.catchIf(
+      error => {
+        const data = (value: unknown, key: string): unknown => value !== null && typeof value === 'object' && !types.isProxy(value)
+          ? Object.getOwnPropertyDescriptor(value, key)?.value : undefined
+        const reason = data(error, 'reason'), tag = data(reason, '_tag')
+        return tag === 'PermissionDenied' || tag === 'Unknown' && data(data(reason, 'cause'), 'code') === 'EPERM'
+      },
+      error => Effect.tryPromise({ try: () => filesystem.realpath(input), catch: failure => {
+        retainWindowsRealpathFailure(failure, error)
+        return error
+      } }),
+    )) })
+  })).pipe(Layer.provide(layer)))
   const error = (method: string) => PlatformError.systemError({
     _tag: 'Unknown', module: 'ChildProcess', method, description: 'Windows owned command operation failed',
   })
@@ -201,7 +223,7 @@ export async function loadOpenCodeV2WindowsRuntime(pin: OpenCodeV2Pin, expectedM
     requireValue(typeof options.password === 'string' && options.password.length === 43 && !options.simulation &&
       options.database?.path === databasePath && options.config?.directory === configDirectory)
     return routes.createRoutes(options, urls, [cross.node.replace(Layer.succeed(spawn.ChildProcessSpawner, spawner)),
-      global.node.replace(global.layerWith(globalPaths))])
+      global.node.replace(global.layerWith(globalPaths)), platform.filesystem.replace(filesystemNode)])
   }
   async function start(options: FloorOptions & CurrentOptions, signal?: AbortSignal) {
     requireValue(typeof options.password === 'string' && options.password.length === 43 && !options.simulation)

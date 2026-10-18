@@ -60,7 +60,8 @@ test(`catalog refusal retains ${phase} with original thrown identity and bounded
     if (phase === 'client-setup' || phase === 'cleanup') expect(caught).toBe(original)
     if (caught === null || typeof caught !== 'object') throw new Error('TEST expected catalog Error')
     const before = Object.getOwnPropertyDescriptors(caught)
-    const serverFailure = { operation: 'location', kind: 'Fail', tag: 'SqlError', reason: 'AuthorizationError', sqlCode: 'SQLITE_AUTH' }
+    const serverFailure = { operation: 'location', kind: 'Fail', tag: 'SqlError', reason: 'AuthorizationError', sqlCode: 'SQLITE_AUTH',
+      realpath: { status: 2, operation: 18, win32: 5, anchorCount: 2, matchingAnchorIndex: 1 } }
     retainOpenCodeV2CatalogServerFailure(caught, { ...serverFailure, body: 'TEST-PRIVATE-CATALOG-PAYLOAD' })
     // Later observations cannot replace the first matching private fact.
     retainOpenCodeV2CatalogServerFailure(caught, { operation: 'location', kind: 'Die' })

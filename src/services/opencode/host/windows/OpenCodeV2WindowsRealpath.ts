@@ -27,9 +27,14 @@ type Installation = {
 }
 
 export type WindowsRealpathFailure = Readonly<{ status: number; operation: number; win32: number; anchorCount: number; matchingAnchorIndex: number }>
-const originalRealpathFailures = new WeakMap<Error, WindowsRealpathFailure>()
+const originalRealpathFailures = new WeakMap<object, WindowsRealpathFailure>()
 export function readWindowsRealpathFailure(error: unknown): WindowsRealpathFailure | undefined {
-  return error instanceof Error ? originalRealpathFailures.get(error) : undefined
+  return error !== null && typeof error === 'object' ? originalRealpathFailures.get(error) : undefined
+}
+/** Copy only an already observed native refusal; caller properties mint no fact. */
+export function retainWindowsRealpathFailure(source: unknown, target: unknown): void {
+  const failure = readWindowsRealpathFailure(source)
+  if (failure && target !== null && typeof target === 'object') originalRealpathFailures.set(target, failure)
 }
 export function projectWindowsRealpathFailure(status: number, operation: number, win32: number,
   anchors: WindowsRealpathSelection['anchors'], routed: string): WindowsRealpathFailure | undefined {

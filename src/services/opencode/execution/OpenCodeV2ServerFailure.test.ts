@@ -53,6 +53,19 @@ test('finite reader and cause projection never execute getters, proxies or enume
   expect(calls).toBe(0)
 })
 
+test('server native realpath projection accepts only the existing bounded integers and omits invalid nested metadata', () => {
+  const native = { status: 2, operation: 18, win32: 5, anchorCount: 2, matchingAnchorIndex: 1 }
+  expect(readOpenCodeV2ServerFailure({ ...finite, realpath: { ...native, path: secret } })?.realpath).toEqual(native)
+  let calls = 0
+  const forbidden = () => { calls++; throw new Error(secret) }
+  for (const changed of [{ status: 0 }, { status: 5 }, { operation: 26 }, { operation: -1 }, { win32: 0x100000000 },
+    { anchorCount: 4097 }, { matchingAnchorIndex: 2 }, { matchingAnchorIndex: -2 }, { win32: 5.5 }])
+    expect(readOpenCodeV2ServerFailure({ ...finite, realpath: { ...native, ...changed } })).toEqual(finite)
+  expect(readOpenCodeV2ServerFailure({ ...finite, realpath: Object.defineProperty({ ...native }, 'win32', { get: forbidden }) })).toEqual(finite)
+  expect(readOpenCodeV2ServerFailure({ ...finite, realpath: new Proxy(native, { getOwnPropertyDescriptor: forbidden }) })).toEqual(finite)
+  expect(calls).toBe(0)
+})
+
 test('cold observation binds exactly one handler entry and consumes or disarms on every outcome', () => {
   const observation = createOpenCodeV2ColdLocationObservation()
   const early = observation.enter()
