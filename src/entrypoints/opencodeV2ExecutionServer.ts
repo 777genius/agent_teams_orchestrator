@@ -181,7 +181,7 @@ async function start(input: Record<string, unknown>): Promise<void> {
     // Register ownership before binding so a failed bridge bind still closes
     // the acquired official server, without acknowledging partial cleanup.
     finalize = async () => { try { await server.close() } finally { await closeRelay() } }
-    const bridge = bindWindowsExecutionHttp(server.baseUrl, controller.signal)
+    const bridge = bindWindowsExecutionHttp(server.baseUrl, controller.signal, server.locationObservation)
     finalize = async () => { try { await bridge.close() } finally { try { await server.close() } finally { await closeRelay() } } }
     baseUrl = server.baseUrl
   } else {

@@ -2,6 +2,7 @@ import { openCodeBunVersion } from '../../../constants/openCodeBunVersion.js'
 import { assertSelectedOpenCodeV2ControllerState, deriveSelectedOpenCodeV2ControllerState } from './OpenCodeV2Profile.js'
 import path from 'node:path'
 import { randomBytes, randomUUID } from 'node:crypto'
+import { types } from 'node:util'
 import { lstat, realpath } from 'node:fs/promises'
 import { resolveOpenCodeV2ExecutionDelivery } from './OpenCodeV2ExecutionDelivery.js'
 import { hashOpenCodeFile } from '../compatibility/OpenCodeNativeIdentity.js'
@@ -20,8 +21,9 @@ import { attachWindowsRunMemberCohort, bindWindowsExecutionSelectedConfig, close
   type WindowsSelectedAuthMetadata } from './windows/OpenCodeV2WindowsExecution.js'
 import { selectWindowsRunMemberPreflightForPlan } from '../bridge/OpenCodeV2RunControl.js'
 import { resolveOpenCodeV2DarwinControllerRuntimeClosure } from '../profile/OpenCodeV2ExecutionReceipt.js'
-import { recordOpenCodeV2ProviderFailure, executionNativeRetirementPhases, type ExecutionAcquisitionPhase, type ExecutionAcquisitionTiming,
+import { recordOpenCodeV2ProviderFailure, retainOpenCodeV2CatalogServerFailure, executionNativeRetirementPhases, type ExecutionAcquisitionPhase, type ExecutionAcquisitionTiming,
   type ExecutionCleanupPhase, type ExecutionCleanupObservation, type ExecutionCommandObservation, type ExecutionNativeRetirementPhase } from '../execution/OpenCodeV2Diagnostics.js'
+import { readOpenCodeV2ServerFailure, type OpenCodeV2ServerFailure } from '../execution/OpenCodeV2ServerFailure.js'
 
 export type { SelectedExecutionProfile, ValidatedExecutionNative } from './OpenCodeV2ExecutionBinding.js'
 type PrivateEndpointFields = { baseUrl: string; password: string; signal: AbortSignal; nativePID: number; fetch?: ExecutionPlatformLaunch['fetch']; selectedAuth?: WindowsSelectedAuthMetadata }
@@ -278,6 +280,7 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
   let launch: ExecutionPlatformLaunch | undefined, child: ExecutionPlatformLaunch['child'] | undefined, authority: ExecutionAuthority | undefined
   let birth: Awaited<ReturnType<typeof readExecutionBirth>> = null
   let mapping: ExecutionPlatformMapping | undefined
+  let serverFailure: OpenCodeV2ServerFailure | undefined
   let mappingWork: Promise<ExecutionPlatformMapping> | undefined
   let exited = false, closeWork: Promise<ExecutionCleanupReceipt> | undefined
   let cleanupPhase: ExecutionCleanupPhase | undefined, nativeCleanupPhase: ExecutionNativeRetirementPhase | undefined
@@ -343,6 +346,20 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
       executionAssert(typeof nonce === 'string', 'execution_identity_mismatch')
       launch = launchExecutionPlatform(plan, nonce, leaseOwnerId, native.bun, context.deadline)
       child = launch.child
+      child.on('serverFailure', (message: unknown) => {
+        // This event is diagnostic only. Recheck the original held child;
+        // malformed metadata must neither execute getters nor refuse readiness.
+        try {
+          const data = (value: unknown, key: string): unknown => value !== null && typeof value === 'object' && !types.isProxy(value)
+            ? Object.getOwnPropertyDescriptor(value, key)?.value : undefined
+          const observedBirth = data(message, 'birth')
+          if (!serverFailure && plan.platform === 'win32' && mapping && data(message, 'nonce') === nonce &&
+            data(message, 'leaseOwnerId') === leaseOwnerId && data(message, 'namespace') === mapping.namespace.name &&
+            data(message, 'pid') === mapping.bun.nativePID && data(observedBirth, 'format') === mapping.bun.birth.format &&
+            data(observedBirth, 'value') === mapping.bun.birth.value && data(observedBirth, 'bootId') === mapping.bun.birth.bootId)
+            serverFailure = readOpenCodeV2ServerFailure(data(message, 'serverFailure'))
+        } catch { /* Untrusted observations never alter acquisition. */ }
+      })
       child.on('retireProgress', (phase: unknown) => {
         nativeCleanupPhase = executionNativeRetirementPhases.find(value => value === phase)
       })
@@ -440,6 +457,7 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
       return lease
       })
   } catch (failure) {
+    retainOpenCodeV2CatalogServerFailure(failure, serverFailure)
     const acquisitionTiming = timing()
     if (!child) {
       await recordOpenCodeV2ProviderFailure('execution-host-startup', failure, true, launch?.output?.().stderr, acquisitionTiming)

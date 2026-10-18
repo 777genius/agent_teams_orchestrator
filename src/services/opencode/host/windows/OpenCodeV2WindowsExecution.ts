@@ -494,6 +494,10 @@ export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, l
   const http = createWindowsExecutionHttpClient(
     value => broker.request('send', { value: { ...value, nonce, leaseOwnerId } }).then(() => undefined),
     error => { child.emit('error', error); void retireNative().catch(() => child.emit('error', new Error('cleanup_unknown'))) },
+    'windowsHTTP', serverFailure => {
+      if (mapping && started && !stopped) child.emit('serverFailure', Object.freeze({ serverFailure, nonce, leaseOwnerId,
+        namespace: mapping.namespace.name, pid: mapping.bun.nativePID, birth: mapping.bun.birth }))
+    },
   )
   // Command request IDs are replayed only while their operation is pending or
   // retained in a small settled window.

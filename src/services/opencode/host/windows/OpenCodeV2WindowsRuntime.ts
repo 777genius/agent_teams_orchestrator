@@ -10,6 +10,7 @@ import type { ServerOptions as FloorOptions } from '@opencode/server-v2-floor/op
 import type { ServerOptions as CurrentOptions } from '@opencode/server/options'
 import { isWindowsCommandPort, type WindowsCommandPort } from './OpenCodeV2WindowsCommand.js'
 import type { OwnedNativeProfile } from '../OpenCodeV2ExecutionBinding.js'
+import { createOpenCodeV2ColdLocationObservation } from '../../execution/OpenCodeV2ServerFailure.js'
 
 function requireValue(value: unknown): asserts value {
   if (!value) throw new Error('execution_windows_runtime_invalid')
@@ -206,6 +207,7 @@ export async function loadOpenCodeV2WindowsRuntime(pin: OpenCodeV2Pin, expectedM
     requireValue(typeof options.password === 'string' && options.password.length === 43 && !options.simulation)
     signal?.throwIfAborted()
     const scope = await Effect.runPromise(Scope.make())
+    const locationObservation = createOpenCodeV2ColdLocationObservation()
     let closing: Promise<void> | undefined
     const close = () => closing ??= Effect.runPromise(Scope.close(scope, Exit.void))
     try {
@@ -218,14 +220,23 @@ export async function loadOpenCodeV2WindowsRuntime(pin: OpenCodeV2Pin, expectedM
         const url = openCodeV2ServerLoopbackUrl(pin, server.address)
         const services = yield* Layer.build(createRoutes({ ...options, hostname: '127.0.0.1', port: 0 }, () => [url])
           .pipe(Layer.provideMerge(http.layerHttpServices)))
-        const handler = Context.get(services, httpTypes.HttpRouter.HttpRouter).asHttpEffect().pipe(Effect.provide(services))
+        const routes = Context.get(services, httpTypes.HttpRouter.HttpRouter).asHttpEffect()
+        const handler = Effect.withFiber(fiber => {
+          let token: object | undefined
+          try {
+            const request = Context.getUnsafe(fiber.context, httpTypes.HttpServerRequest.HttpServerRequest)
+            if (request.method === 'GET' && new URL(request.url, 'http://localhost').pathname === '/api/location')
+              token = locationObservation.enter()
+          } catch { /* Observation cannot change an official request. */ }
+          return routes.pipe(Effect.tapCause(cause => Effect.sync(() => locationObservation.retain(token, cause))))
+        }).pipe(Effect.provide(services))
         yield* server.serve(handler).pipe(Effect.provide(http.layerHttpServices))
         return url
       }).pipe(Effect.provideService(Scope.Scope, scope)), { signal })
       signal?.throwIfAborted()
       // URL is child-local. Parent must use the authenticated bounded streaming
       // transport; returning it never qualifies direct loopback access.
-      return Object.freeze({ baseUrl, close, reachability: 'child-self-http-only' as const })
+      return Object.freeze({ baseUrl, close, locationObservation, reachability: 'child-self-http-only' as const })
     } catch (cause) {
       try { await close() } catch (cleanup) { throw new AggregateError([cause, cleanup], 'execution_cleanup_unknown') }
       throw cause

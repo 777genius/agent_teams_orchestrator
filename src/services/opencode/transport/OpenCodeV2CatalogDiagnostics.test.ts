@@ -4,14 +4,14 @@ import { mkdtemp, readFile, readdir, realpath, rm } from 'node:fs/promises'
 import path from 'node:path'
 import { tmpdir } from 'node:os'
 import * as host from '../host/OpenCodeV2ExecutionHost.js'
-import { recordOpenCodeV2ProviderFailure } from '../execution/OpenCodeV2Diagnostics.js'
+import { recordOpenCodeV2ProviderFailure, retainOpenCodeV2CatalogServerFailure } from '../execution/OpenCodeV2Diagnostics.js'
 import type { ExecutionAuthority, ExecutionContext } from '../execution/OpenCodeV2ExecutionContracts.js'
 import { awaitOpenCodeV2CatalogReadiness } from './OpenCodeV2ExecutionClientFactory.js'
 import { OpenCodeV2ExecutionFetch } from './OpenCodeV2ExecutionFetch.js'
 
 // Synthetic transport only. The genuine selected Promise decoder and installed
 // client/schema/protocol bytes are exercised; no host, native process or model.
-for (const phase of ['client-setup', 'info', 'location', 'integration-ready', 'cleanup', 'http-401', 'http-500', 'status-low', 'status-high', 'status-fraction'] as const)
+for (const phase of ['client-setup', 'info', 'location', 'integration-ready', 'cleanup', 'http-401', 'http-500', 'status-low', 'status-high', 'status-fraction', 'server-location'] as const)
 test(`catalog refusal retains ${phase} with original thrown identity and bounded cause`, async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'TEST-v2-catalog-phase-'))
   const previous = process.env.CLAUDE_MULTIMODEL_DATA_HOME
@@ -38,6 +38,7 @@ test(`catalog refusal retains ${phase} with original thrown identity and bounded
       const httpStatuses: Partial<Record<typeof phase, number>> = { 'http-401': 401, 'http-500': 500,
         'status-low': 99, 'status-high': 600, 'status-fraction': 401.5 }
       const httpStatus = httpStatuses[phase]
+      if (phase === 'server-location' && url.pathname === '/api/location') return new Response(null, { status: 500 })
       if (httpStatus !== undefined) {
         const valid = httpStatus === 401 || httpStatus === 500
         const response = Response.json({ private: 'TEST-PRIVATE-CATALOG-PAYLOAD' }, valid ? { status: httpStatus } : {})
@@ -57,6 +58,13 @@ test(`catalog refusal retains ${phase} with original thrown identity and bounded
     try { await awaitOpenCodeV2CatalogReadiness(endpoint, authority, context) } catch (failure) { caught = failure }
     expect(caught).toBeDefined()
     if (phase === 'client-setup' || phase === 'cleanup') expect(caught).toBe(original)
+    if (caught === null || typeof caught !== 'object') throw new Error('TEST expected catalog Error')
+    const before = Object.getOwnPropertyDescriptors(caught)
+    const serverFailure = { operation: 'location', kind: 'Fail', tag: 'SqlError', reason: 'AuthorizationError', sqlCode: 'SQLITE_AUTH' }
+    retainOpenCodeV2CatalogServerFailure(caught, { ...serverFailure, body: 'TEST-PRIVATE-CATALOG-PAYLOAD' })
+    // Later observations cannot replace the first matching private fact.
+    retainOpenCodeV2CatalogServerFailure(caught, { operation: 'location', kind: 'Die' })
+    expect(Object.getOwnPropertyDescriptors(caught)).toEqual(before)
     await recordOpenCodeV2ProviderFailure('execution-host-startup', caught, true)
     const names = await readdir(path.join(root, 'opencode/v2/provider-diagnostics'))
     expect(names).toHaveLength(1)
@@ -64,9 +72,10 @@ test(`catalog refusal retains ${phase} with original thrown identity and bounded
     expect(bytes).not.toContain('TEST-PRIVATE-CATALOG-PAYLOAD')
     const catalog = JSON.parse(bytes).catalog
     const http = phase.startsWith('http-') || phase.startsWith('status-')
-    expect(catalog).toEqual(phase === 'client-setup' ? { phase } : { phase: phase === 'cleanup' || http ? 'info' : phase,
-      client: { reason: 'Transport' }, wireCode: http ? 'http_failure' : 'media_type',
-      ...(phase === 'http-401' ? { wireStatus: 401 } : phase === 'http-500' ? { wireStatus: 500 } : {}) })
+    expect(catalog).toEqual(phase === 'client-setup' ? { phase } : phase === 'server-location'
+      ? { phase: 'location', client: { reason: 'Transport' }, wireCode: 'http_failure', wireStatus: 500, serverFailure }
+      : { phase: phase === 'cleanup' || http ? 'info' : phase, client: { reason: 'Transport' }, wireCode: http ? 'http_failure' : 'media_type',
+        ...(phase === 'http-401' ? { wireStatus: 401 } : phase === 'http-500' ? { wireStatus: 500 } : {}) })
   } finally {
     dispose?.mockRestore(); owning.mockRestore(); graph.mockRestore()
     if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_DATA_HOME

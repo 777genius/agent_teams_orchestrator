@@ -9,12 +9,14 @@ import { readOpenCodeV2ProviderWireFailure } from '../transport/OpenCodeV2Provid
 import { readOpenCodeV2ExecutionWireFailure } from '../transport/OpenCodeV2ExecutionFetch.js'
 import type { ExecutionMcpFailure } from '../transport/OpenCodeV2ExecutionClientFactory.js'
 import { ensureWindowsPrivateDirectories } from '../profile/OpenCodePrivateDirectories.js'
+import { readOpenCodeV2ServerFailure, type OpenCodeV2ServerFailure } from './OpenCodeV2ServerFailure.js'
 
 export type ExecutionCatalogPhase = 'client-setup' | 'info' | 'location' | 'integration-ready'
 const catalogPhases = new Set<ExecutionCatalogPhase>(['client-setup', 'info', 'location', 'integration-ready'])
 const clientReasons = ['Transport', 'UnexpectedStatus', 'UnsupportedContentType', 'MalformedResponse', 'SseEventTooLarge'] as const
 type CatalogFailure = Readonly<{ phase: ExecutionCatalogPhase
-  client?: Readonly<{ reason: typeof clientReasons[number]; status?: number }>; wireCode?: string; wireStatus?: number }>
+  client?: Readonly<{ reason: typeof clientReasons[number]; status?: number }>; wireCode?: string; wireStatus?: number
+  serverFailure?: OpenCodeV2ServerFailure }>
 const catalogFailures = new WeakMap<object, CatalogFailure>()
 function ownData(value: object, key: string): unknown {
   const descriptor = Object.getOwnPropertyDescriptor(value, key)
@@ -45,6 +47,15 @@ export function retainOpenCodeV2CatalogFailure(error: unknown, phase: ExecutionC
     catalogFailures.set(error, Object.freeze({ phase, ...(client ? { client } : {}), ...(wire ? { wireCode: wire.code,
       ...(wire.code === 'http_failure' && wire.status !== undefined ? { wireStatus: wire.status } : {}) } : {}) }))
   } catch { /* Observation cannot replace the original refusal, even for hostile error objects. */ }
+}
+/** Only a matching original location HTTP500 may acquire the private child
+ * observation; another error or a caller-supplied DTO earns no catalog fact. */
+export function retainOpenCodeV2CatalogServerFailure(error: unknown, value: unknown): void {
+  if (error === null || typeof error !== 'object') return
+  const catalog = catalogFailures.get(error), serverFailure = readOpenCodeV2ServerFailure(value)
+  if (!catalog || catalog.phase !== 'location' || catalog.wireCode !== 'http_failure' || catalog.wireStatus !== 500 ||
+      catalog.serverFailure || !serverFailure) return
+  catalogFailures.set(error, Object.freeze({ ...catalog, serverFailure }))
 }
 
 const startupStages = new Set(['run-owner-entry', 'windows-cohort', 'windows-profile', 'windows-roots', 'windows-dll',

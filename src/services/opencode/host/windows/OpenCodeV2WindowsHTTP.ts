@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { windowsExecutionChildControl, windowsExecutionSelfBirth } from './OpenCodeV2WindowsChildControl.js'
+import { readOpenCodeV2ServerFailure, type OpenCodeV2ServerFailure, type createOpenCodeV2ColdLocationObservation } from '../../execution/OpenCodeV2ServerFailure.js'
 
 const WINDOW = 32768, CHUNK = 3072, MAX_ACTIVE = 16
 const UUID = /^[a-f0-9-]{36}$/
@@ -171,11 +172,11 @@ class Direction {
 type ParentTransaction = {
   controller: AbortController; request: Direction; response: Direction
   head: ReturnType<typeof deferred<Frame>>; done: ReturnType<typeof deferred<void>>
-  headReceived: boolean
+  headReceived: boolean; location: boolean
   cancel(): Promise<void>; dispose(): Promise<void>
 }
 export function createWindowsExecutionHttpClient(sendFrame: Send, failTransport: (error: Error) => void,
-  frameType: WindowsHttpFrameType = 'windowsHTTP') {
+  frameType: WindowsHttpFrameType = 'windowsHTTP', observeServerFailure?: (failure: OpenCodeV2ServerFailure) => void) {
   const active = new Map<string, ParentTransaction>(), finished = new Set<string>()
   let selectedOrigin: string | undefined, closing = false, broken = false
   function forget(id: string) { active.delete(id); finished.add(id); if (finished.size > 4096) finished.delete(finished.values().next().value!) }
@@ -200,7 +201,14 @@ export function createWindowsExecutionHttpClient(sendFrame: Send, failTransport:
         if (frame.action === 'head') {
           assert(!transaction.headReceived && Number.isInteger(frame.status) && Number(frame.status) >= 200 && Number(frame.status) <= 599 && typeof frame.statusText === 'string' && frame.statusText.length <= 1024 && typeof frame.body === 'boolean')
           transaction.headReceived = true
-          headers(frame.headers); transaction.head.resolve(frame)
+          headers(frame.headers)
+          // The original transaction, not a peer-supplied operation label,
+          // binds this diagnostic to location. Retain before resolving head.
+          if (frameType === 'windowsHTTP' && transaction.location && frame.status === 500) {
+            const failure = readOpenCodeV2ServerFailure(Object.getOwnPropertyDescriptor(frame, 'serverFailure')?.value)
+            if (failure) try { observeServerFailure?.(failure) } catch { /* Observation grants no transport authority. */ }
+          }
+          transaction.head.resolve(frame)
         } else if (frame.action === 'done' || frame.action === 'cancelled') {
           // A local cancel can cross the peer's normal completion; its later
           // `cancelled` reply is then accepted from the finished window.
@@ -244,7 +252,8 @@ export function createWindowsExecutionHttpClient(sendFrame: Send, failTransport:
       }
       const response = new Direction(send, 'response', 64 * 1024 * 1024, controller.signal, dispose)
       const upload = new Direction(send, 'request', 8 * 1024 * 1024, controller.signal, () => {})
-      active.set(id, { controller, request: upload, response, head, done, headReceived: false, cancel, dispose })
+      active.set(id, { controller, request: upload, response, head, done, headReceived: false,
+        location: request.method === 'GET' && url.pathname === '/api/location', cancel, dispose })
       request.signal.addEventListener('abort', onAbort, { once: true })
       try {
         await send({ action: 'request', method: request.method, path: url.pathname + url.search, headers: headers([...request.headers]), body: request.body !== null })
@@ -267,7 +276,8 @@ type ServerTransaction = { controller: AbortController; request: Direction; resp
  * lease before `accept`; `post` adds that lease. An optional policy narrows the
  * target to one endpoint path and its method set. */
 function createWindowsExecutionHttpServer(selectedOrigin: string, frameType: WindowsHttpFrameType,
-  post: (message: Frame) => Promise<void>, failed: () => void, policy?: ControllerPolicy) {
+  post: (message: Frame) => Promise<void>, failed: () => void, policy?: ControllerPolicy,
+  locationObservation?: ReturnType<typeof createOpenCodeV2ColdLocationObservation>) {
   const active = new Map<string, ServerTransaction>()
   const finished = new Map<string, number>()
   let closing = false, closure: Promise<void> | undefined
@@ -286,15 +296,19 @@ function createWindowsExecutionHttpServer(selectedOrigin: string, frameType: Win
         const request = new Direction(send, 'request', 8 * 1024 * 1024, controller.signal, () => {})
         const response = new Direction(send, 'response', 64 * 1024 * 1024, controller.signal, () => {})
         const body = frame.body ? request.stream(reason => controller.abort(reason)) : null
+        const location = frameType === 'windowsHTTP' && frame.method === 'GET' && target.pathname === '/api/location'
         // Schedule after registration so immediate cancellation cannot lose it.
         const task = Promise.resolve().then(async () => {
           let result: Response | undefined
           try {
+            if (location) locationObservation?.begin(id)
             // Bun 1.3.11 can reuse an unfinished streamed upload after an
             // early response. Keep these requests out of its shared pool; a
             // relayed member never shares an upstream connection with another.
             result = await fetch(target, { method: String(frame.method), headers: requestHeaders, body, signal: controller.signal, redirect: 'manual', ...(body ? { duplex: 'half' as const } : {}), ...(body || policy ? { keepalive: false } : {}) })
-            await send({ action: 'head', status: result.status, statusText: result.statusText, headers: headers([...result.headers]), body: result.body !== null })
+            const serverFailure = location ? locationObservation?.consume(id, result.status) : undefined
+            await send({ action: 'head', status: result.status, statusText: result.statusText, headers: headers([...result.headers]), body: result.body !== null,
+              ...(serverFailure ? { serverFailure } : {}) })
             await response.pump(result.body)
             await send({ action: 'done' })
           } catch {
@@ -304,6 +318,7 @@ function createWindowsExecutionHttpServer(selectedOrigin: string, frameType: Win
             if (result?.body && !result.body.locked) await result.body.cancel().catch(() => undefined)
             await send({ action: cancelled ? 'cancelled' : 'error' })
           } finally {
+            if (location) locationObservation?.end(id)
             controller.abort(new Error('execution_http_transaction_closed')); active.delete(id); finished.set(id, WINDOW)
             if (finished.size > 4096) finished.delete(finished.keys().next().value!)
           }
@@ -343,7 +358,8 @@ function createWindowsExecutionHttpServer(selectedOrigin: string, frameType: Win
 
 /** Child-local HTTP only; no host-loopback exemption or global fetch override.
  * Prepared native PID/FILETIME pipe identity is required before construction. */
-export function bindWindowsExecutionHttp(baseUrl: string, signal?: AbortSignal): Readonly<{ close(): Promise<void> }> {
+export function bindWindowsExecutionHttp(baseUrl: string, signal?: AbortSignal,
+  locationObservation?: ReturnType<typeof createOpenCodeV2ColdLocationObservation>): Readonly<{ close(): Promise<void> }> {
   assert(windowsExecutionSelfBirth().format === 'windows-filetime')
   const selectedOrigin = origin(baseUrl), control = windowsExecutionChildControl()
   assert(control.connected())
@@ -351,7 +367,7 @@ export function bindWindowsExecutionHttp(baseUrl: string, signal?: AbortSignal):
   let closure: Promise<void> | undefined
   function failed() { control.disconnect() }
   const server = createWindowsExecutionHttpServer(selectedOrigin, 'windowsHTTP',
-    message => control.send({ ...message, nonce, leaseOwnerId }, Date.now() + 15000), failed)
+    message => control.send({ ...message, nonce, leaseOwnerId }, Date.now() + 15000), failed, undefined, locationObservation)
   function accept(value: unknown) {
     try {
       const frame = row(value); if (frame.type !== 'windowsHTTP') return
