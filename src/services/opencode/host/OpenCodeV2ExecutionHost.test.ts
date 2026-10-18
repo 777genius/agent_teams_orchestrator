@@ -14,7 +14,7 @@ import { windowsGraphActivation } from './windows/OpenCodeV2WindowsChildControl.
 
 const birth: ExecutionBirth = { format: 'linux-start-ticks', value: '420', bootId: 'TEST-boot-domain' }
 const context = { teamId: 'TEST-team', runId: 'TEST-run', laneId: 'TEST-lane', memberId: 'TEST-member', deadline: Number.MAX_SAFE_INTEGER }
-const native: ValidatedExecutionNative = { generation: 'v2', version: '2.0.21', dialect: 'v2-2.0.21',
+const native: ValidatedExecutionNative = { generation: 'v2', version: '2.0.32', dialect: 'v2-2.0.32',
   runtimeMode: 'packaged', entrySha256: 'd'.repeat(64), executablePath: '/TEST-missing-selection', executableSha256: 'a'.repeat(64), packageName: '@opencode/cli-linux-x64',
   bun: { path: '/TEST-missing-bun', sha256: 'b'.repeat(64) }, graph: { sha256: 'c'.repeat(64), files: [] } }
 async function fixture() {

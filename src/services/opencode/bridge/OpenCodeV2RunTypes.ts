@@ -60,7 +60,7 @@ export type RunMemberStatus = Readonly<{
   memberId: string; laneId: string; originalSessionId: string
   selectedModel: string; selectedVariant?: string
   opencodeSessionId: string; runtimeSessionId: string
-  profileEpoch: string; profileRoot: string; pin: '2.0.0' | '2.0.21'; runtimePid?: number
+  profileEpoch: string; profileRoot: string; pin: '2.0.0' | '2.0.32'; runtimePid?: number
   state: 'accepted' | 'unknown' | 'rejected'; bootstrap: InstructionReceipt | null
   /** Observational age of the current initialization phase, never readiness evidence. */
   initialization?: Readonly<{ phase: RunInitializationPhase; elapsedMs: number }>

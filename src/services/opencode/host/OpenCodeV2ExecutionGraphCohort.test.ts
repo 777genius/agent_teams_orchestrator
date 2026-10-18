@@ -41,7 +41,7 @@ test('cohort joins only concurrent byte-identical receipts and never reuses a se
     const changedRows = f.rows.map((row, index) => index === 7 ? { ...row, sha256: 'e'.repeat(64) } : row)
     const changed = f.receipt(changedRows)
     const results = await Promise.allSettled([validate('2.0.0', exact), validate('2.0.0', reordered),
-      validate('2.0.0', structuredClone(exact)), validate('2.0.0', forged), validate('2.0.0', changed), validate('2.0.21', exact)])
+      validate('2.0.0', structuredClone(exact)), validate('2.0.0', forged), validate('2.0.0', changed), validate('2.0.32', exact)])
     const reasons = results.map(result => result.status === 'rejected' ? result.reason : undefined)
     expect(results.every(result => result.status === 'rejected')).toBe(true)
     // One complete pass for the three exact receipts, one for the changed rows and

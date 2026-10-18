@@ -1,3 +1,4 @@
+import { openCodeV2ServerLoopbackUrl } from '../services/opencode/host/OpenCodeV2ServerAddress.js'
 import { readExecutionGraphFailure } from '../services/opencode/host/OpenCodeV2ExecutionBinding.js'
 import { openCodeBunVersion } from '../constants/openCodeBunVersion.js'
 import { windowsExecutionChildControl, windowsGraphActivation } from '../services/opencode/host/windows/OpenCodeV2WindowsChildControl.js'
@@ -110,7 +111,7 @@ async function start(input: Record<string, unknown>): Promise<void> {
   const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'execution')
   executionAssert(native.runtimeMode === delivery.runtimeMode && native.entrySha256 === delivery.entrySha256 &&
     native.generation === 'v2' &&
-    (native.version === '2.0.0' || native.version === '2.0.21') && native.dialect === `v2-${native.version}` &&
+    (native.version === '2.0.0' || native.version === '2.0.32') && native.dialect === `v2-${native.version}` &&
     process.versions.bun === openCodeBunVersion(), 'execution_identity_mismatch')
   enterStartupStage('profile-validation')
   await validateExecutionProfile(profile); controller.signal.throwIfAborted()
@@ -201,8 +202,7 @@ async function start(input: Record<string, unknown>): Promise<void> {
     controller.signal.throwIfAborted()
     enterStartupStage('server-start')
     const server = await Effect.runPromise(runtime.start<never, never>(options).pipe(Effect.provideService(Scope.Scope, scope)), { signal: controller.signal })
-    executionAssert(server.address._tag === 'TcpAddress' && server.address.hostname === '127.0.0.1')
-    baseUrl = `http://127.0.0.1:${server.address.port}`
+    baseUrl = openCodeV2ServerLoopbackUrl(native.version, server.address)
   }
   controller.signal.throwIfAborted()
   enterStartupStage('ready-identity')

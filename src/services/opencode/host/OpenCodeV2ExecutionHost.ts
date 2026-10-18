@@ -130,7 +130,7 @@ export async function prepareOwnedNativeExecutionPlan(validatedNative: Validated
   }
   check()
   assertExecutionPlatformAvailable()
-  executionAssert(native.generation === 'v2' && (native.version === '2.0.0' || native.version === '2.0.21') &&
+  executionAssert(native.generation === 'v2' && (native.version === '2.0.0' || native.version === '2.0.32') &&
     native.dialect === `v2-${native.version}` && process.versions.bun === openCodeBunVersion(), 'execution_identity_mismatch')
   executionAssert([context.teamId, context.runId, context.laneId, context.memberId].every(value => value.length > 0))
   await validateExecutionProfile(profile); check()

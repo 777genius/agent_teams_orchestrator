@@ -44,12 +44,12 @@ export class OpenCodeV2ExecutionFetch {
   private readonly controllers = new Set<AbortController>()
   private readonly pending = new Set<Promise<unknown>>()
   private readonly io = new Set<Promise<unknown>>()
-  constructor(private readonly endpoint: string, private readonly pin: '2.0.0' | '2.0.21',
+  constructor(private readonly endpoint: string, private readonly pin: '2.0.0' | '2.0.32',
     private readonly directory: string, private readonly password: string,
     private readonly context: ExecutionWireContext,
     private readonly fetchImpl: (input: ExecutionFetchInput, init?: ExecutionFetchInit) => Promise<Response> = globalThis.fetch) {
     executionAssert(/^http:\/\/127\.0\.0\.1:[1-9]\d*$/.test(endpoint), 'authority_mismatch')
-    executionAssert(pin === '2.0.0' || pin === '2.0.21', 'unqualified_version')
+    executionAssert(pin === '2.0.0' || pin === '2.0.32', 'unqualified_version')
     executionAssert(Number.isFinite(context.deadline), 'deadline')
   }
   check(): void {

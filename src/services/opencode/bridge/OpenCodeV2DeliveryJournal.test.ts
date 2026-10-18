@@ -24,8 +24,8 @@ function admission(state: AdmissionRecord['state']): AdmissionRecord {
   return { identity, payloadHash: 'b'.repeat(64), state, disposition: state === 'accepted' ? 'accepted' : 'unknown',
     beforeCursor: null, beforeUserIDs: [], cursor: null, complete: false, revision: 1,
     authority: { teamId: 'TEST', runId: 'run', laneId: 'primary', memberId: 'worker', sessionID: sessionId,
-      agent: 'worker', model: { providerID: 'TEST', id: 'TEST' }, host: { generation: 'v2', pin: '2.0.21', dialect: 'v2-2.0.21',
-        graphSha256: 'a'.repeat(64), selectedCli: { path: '/TEST-native', sha256: 'b'.repeat(64), version: '2.0.21' },
+      agent: 'worker', model: { providerID: 'TEST', id: 'TEST' }, host: { generation: 'v2', pin: '2.0.32', dialect: 'v2-2.0.32',
+        graphSha256: 'a'.repeat(64), selectedCli: { path: '/TEST-native', sha256: 'b'.repeat(64), version: '2.0.32' },
         child: { pid: 123, birth: { format: 'linux-start-ticks', value: '123', bootId: 'TEST' }, executablePath: '/TEST-bun', sha256: 'c'.repeat(64) },
         hostInstanceId: 'TEST', profileEpoch: 'TEST', profileRoot: '/TEST-profile', directory: '/TEST-project', leaseOwnerId: 'TEST' } } }
 }

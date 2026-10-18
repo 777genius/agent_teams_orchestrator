@@ -1,3 +1,4 @@
+import { openCodeV2EffectVersion } from '../compatibility/OpenCodeGenerationPolicy.js'
 import { openCodeBunVersion } from '../../../constants/openCodeBunVersion.js'
 import path from 'node:path'
 import { resolveOpenCodeV2ExecutionDelivery } from '../host/OpenCodeV2ExecutionDelivery.js'
@@ -87,8 +88,8 @@ async function visit(root: string, expectedName?: string): Promise<void> {
   const metadata = executionRecord(JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8')))
   executionAssert(typeof metadata.name === 'string' && typeof metadata.version === 'string')
   if (expectedName) executionAssert(metadata.name === expectedName, 'package_name_mismatch')
-  if (/^@opencode\/(?:client|server|core|schema|protocol|util|simulation)$/.test(metadata.name)) executionAssert(metadata.version === pin, 'package_pin_mismatch')
-  if (metadata.name === 'effect') executionAssert(metadata.version === '4.0.0-rc.112', 'effect_pin_mismatch')
+  if (/^@opencode\//.test(metadata.name)) executionAssert(metadata.version === pin, 'package_pin_mismatch')
+  if (metadata.name === 'effect' || metadata.name === '@effect/platform-node' || metadata.name === '@effect/platform-node-shared') executionAssert(metadata.version === openCodeV2EffectVersion(pin), 'effect_pin_mismatch')
   async function walk(directory: string): Promise<void> {
     const pending: string[] = []
     for (const item of await readdir(directory, { withFileTypes: true })) {

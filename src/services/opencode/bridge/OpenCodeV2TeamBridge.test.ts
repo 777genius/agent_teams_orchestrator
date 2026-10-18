@@ -87,9 +87,9 @@ describe('V2 semantic control adapter', () => {
   })
   test('changed original session and stopped run cannot obtain send target', async () => {
     const counts = { launched: 0, requested: 0 }
-    const active: RunControlResult = { kind: 'status', state: 'active', qualification: { capabilitySnapshotId: 'TEST-original', expectedBehaviorFingerprint: 'a'.repeat(64), binaryPath: '/TEST/native', binaryFingerprint: 'b'.repeat(64), version: '2.0.21' }, deadline: record.deadline,
+    const active: RunControlResult = { kind: 'status', state: 'active', qualification: { capabilitySnapshotId: 'TEST-original', expectedBehaviorFingerprint: 'a'.repeat(64), binaryPath: '/TEST/native', binaryFingerprint: 'b'.repeat(64), version: '2.0.32' }, deadline: record.deadline,
       members: [{ memberId: 'worker', laneId: 'primary', originalSessionId: 'ses_original', selectedModel: 'test/model',
-        opencodeSessionId: 'ses_original', runtimeSessionId: 'ses_original', profileEpoch: 'TEST', profileRoot: '/TEST', pin: '2.0.21',
+        opencodeSessionId: 'ses_original', runtimeSessionId: 'ses_original', profileEpoch: 'TEST', profileRoot: '/TEST', pin: '2.0.32',
         state: 'accepted', bootstrap: null }] }
     const bridge = new OpenCodeV2TeamBridge('/TEST', { teamId: 'TEST', runId: 'run' }, ports(record, active, counts))
     await expect(bridge.resolveMember('worker', 'primary', 'ses_changed', 1000)).rejects.toThrow('original_session_changed')

@@ -14,8 +14,8 @@ import { executionFloorOperations } from '../transport/OpenCodeV2ExecutionFloorC
 import { executionCurrentOperations } from '../transport/OpenCodeV2ExecutionCurrentClient.js'
 
 const authority: SessionAuthority = {
-  host: { generation: 'v2', pin: '2.0.21', dialect: 'v2-2.0.21', graphSha256: '1'.repeat(64),
-    selectedCli: { path: '/TEST-cli', sha256: '2'.repeat(64), version: '2.0.21' },
+  host: { generation: 'v2', pin: '2.0.32', dialect: 'v2-2.0.32', graphSha256: '1'.repeat(64),
+    selectedCli: { path: '/TEST-cli', sha256: '2'.repeat(64), version: '2.0.32' },
     child: { pid: 10, birth: { format: 'linux-start-ticks', value: '11', bootId: 'TEST-boot' }, executablePath: '/TEST-bun', sha256: '3'.repeat(64) },
     hostInstanceId: 'TEST-host', profileEpoch: 'TEST-epoch', profileRoot: '/TEST-profile', directory: '/TEST-project', leaseOwnerId: 'TEST-owner' },
   teamId: 'TEST-team', runId: 'TEST-run', laneId: 'TEST-lane', memberId: 'TEST-member', sessionID: 'ses_TEST1', agent: 'TEST-agent', model: { providerID: 'TEST-provider', id: 'catalog-model' },
@@ -163,7 +163,7 @@ describe('durable V2 admission ownership', () => {
   })
   // Red if selection construction drops variant, if create loses it, or if
   // variant-only native drift reaches prompt mutation through readback.
-  for (const pin of ['2.0.0', '2.0.21'] as const) {
+  for (const pin of ['2.0.0', '2.0.32'] as const) {
     // Real generated adapters must preserve variant in both wire directions;
     // a service-only fake cannot detect dialect mapping silently dropping it.
     test(`${pin} generated create/get roundtrip preserves variant on the wire`, async () => {
@@ -487,9 +487,9 @@ describe('qualified original terminal slot settlement', () => {
     native.log.watermark = 14
     return native
   }
-  for (const pin of ['2.0.0', '2.0.21'] as const) {
+  for (const pin of ['2.0.0', '2.0.32'] as const) {
     const selectedAuthority: SessionAuthority = { ...authority, host: { ...authority.host, pin,
-      dialect: pin === '2.0.0' ? 'v2-2.0.0' : 'v2-2.0.21', selectedCli: { ...authority.host.selectedCli, version: pin } } }
+      dialect: pin === '2.0.0' ? 'v2-2.0.0' : 'v2-2.0.32', selectedCli: { ...authority.host.selectedCli, version: pin } } }
     test(`${pin} clean native retry lineage releases only the original accepted slot`, async () => {
       const f = await setup(selectedAuthority), native = withCleanRetries(terminalFixture(selectedAuthority))
       try {
@@ -562,9 +562,9 @@ describe('qualified original terminal slot settlement', () => {
       expect(await f.store.fenceStop()).toEqual([intent(2).identity.nativeInputID])
     } finally { await f.close() }
   })
-  for (const pin of ['2.0.0', '2.0.21'] as const) test(`${pin} wrong assistant model cannot mint an original terminal proof`, async () => {
+  for (const pin of ['2.0.0', '2.0.32'] as const) test(`${pin} wrong assistant model cannot mint an original terminal proof`, async () => {
     const selectedAuthority: SessionAuthority = { ...authority, host: { ...authority.host, pin,
-      dialect: pin === '2.0.0' ? 'v2-2.0.0' : 'v2-2.0.21', selectedCli: { ...authority.host.selectedCli, version: pin } } }
+      dialect: pin === '2.0.0' ? 'v2-2.0.0' : 'v2-2.0.32', selectedCli: { ...authority.host.selectedCli, version: pin } } }
     const f = await setup(selectedAuthority), native = terminalFixture(selectedAuthority)
     try {
       const service = new OpenCodeV2AdmissionService(native.owned, f.store, selectedAuthority)

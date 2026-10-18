@@ -2,8 +2,8 @@ import { expect, test } from 'bun:test'
 import { assertExecutionAuthority, type ExecutionAuthority, type ExecutionBirth } from './OpenCodeV2ExecutionContracts.js'
 
 function authority(birth: ExecutionBirth): ExecutionAuthority {
-  return { generation: 'v2', pin: '2.0.21', dialect: 'v2-2.0.21', graphSha256: 'a'.repeat(64),
-    selectedCli: { path: '/TEST/opencode', sha256: 'b'.repeat(64), version: '2.0.21' },
+  return { generation: 'v2', pin: '2.0.32', dialect: 'v2-2.0.32', graphSha256: 'a'.repeat(64),
+    selectedCli: { path: '/TEST/opencode', sha256: 'b'.repeat(64), version: '2.0.32' },
     child: { pid: 73, birth, executablePath: '/TEST/bun', sha256: 'c'.repeat(64) },
     hostInstanceId: 'TEST-host', profileEpoch: 'TEST-profile', profileRoot: '/TEST/profile',
     directory: '/TEST/project', leaseOwnerId: 'TEST-lease' }

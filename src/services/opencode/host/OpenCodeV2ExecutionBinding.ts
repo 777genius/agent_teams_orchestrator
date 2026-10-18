@@ -1,3 +1,4 @@
+import { openCodeV2EffectVersion } from '../compatibility/OpenCodeGenerationPolicy.js'
 import { readWindowsRealpathFailure, type WindowsRealpathFailure } from './windows/OpenCodeV2WindowsRealpath.js'
 import path from 'node:path'
 import { readExecutionPlatformBirth } from './OpenCodeV2ExecutionPlatform.js'
@@ -92,7 +93,7 @@ function admittedExecutionGraphRows(receipt: ExecutionGraph) {
   return rows
 }
 /** Owner-side complete graph check for one run cohort. */
-export type ExecutionGraphValidation = (pin: '2.0.0' | '2.0.21', receipt: ExecutionGraph, signal?: AbortSignal) => Promise<void>
+export type ExecutionGraphValidation = (pin: '2.0.0' | '2.0.32', receipt: ExecutionGraph, signal?: AbortSignal) => Promise<void>
 /** Members of one run prepare concurrently and carry the same official graph.
  * A caller joins only an in-flight validation of its own byte-identical rows
  * (recomputed from its receipt) and pin. The entry is dropped when that
@@ -151,7 +152,7 @@ export function createExecutionGraphValidationCohort(): ExecutionGraphValidation
     })
   }
 }
-export async function validateExecutionGraph(pin: '2.0.0' | '2.0.21', receipt: ExecutionGraph,
+export async function validateExecutionGraph(pin: '2.0.0' | '2.0.32', receipt: ExecutionGraph,
   progress?: (value: ExecutionGraphProgress) => void, signal?: AbortSignal) {
   signal?.throwIfAborted()
   const rows = admittedExecutionGraphRows(receipt)
@@ -225,8 +226,8 @@ export async function validateExecutionGraph(pin: '2.0.0' | '2.0.21', receipt: E
     executionAssert(metadata.name === expectedName && typeof metadata.version === 'string', 'execution_graph_changed')
     if (visited.has(root)) return
     executionAssert(visited.size < 1000, 'execution_graph_incomplete'); visited.add(root)
-    if (/^@opencode\/(?:client|server|core|schema|protocol|util|simulation)$/.test(metadata.name)) executionAssert(metadata.version === pin, 'execution_graph_changed')
-    if (metadata.name === 'effect') executionAssert(metadata.version === '4.0.0-rc.112', 'execution_graph_changed')
+    if (/^@opencode\//.test(metadata.name)) executionAssert(metadata.version === pin, 'execution_graph_changed')
+    if (metadata.name === 'effect' || metadata.name === '@effect/platform-node' || metadata.name === '@effect/platform-node-shared') executionAssert(metadata.version === openCodeV2EffectVersion(pin), 'execution_graph_changed')
     const walk = async (directory: string): Promise<void> => {
       signal?.throwIfAborted()
       for (const item of await readdir(directory, { withFileTypes: true })) {

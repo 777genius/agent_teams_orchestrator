@@ -1,6 +1,6 @@
-diff --git a/dist/chunks/job-ma9c1wd2.js b/dist/chunks/job-ma9c1wd2.js
---- a/dist/chunks/job-ma9c1wd2.js
-+++ b/dist/chunks/job-ma9c1wd2.js
+diff --git a/dist/chunks/instance-c01nkdt4.js b/dist/chunks/instance-c01nkdt4.js
+--- a/dist/chunks/instance-c01nkdt4.js
++++ b/dist/chunks/instance-c01nkdt4.js
 @@ -102,7 +102,7 @@
      start: undefined,
      end: undefined,
@@ -10,9 +10,9 @@ diff --git a/dist/chunks/job-ma9c1wd2.js b/dist/chunks/job-ma9c1wd2.js
    } : yield* readFileAttachment(input.uri);
    if (resolved.bytes.byteLength > MAX_ATTACHMENT_BYTES)
      return yield* new AttachmentError2({
-diff --git a/dist/chunks/job-rk1r2hx8.js b/dist/chunks/job-rk1r2hx8.js
---- a/dist/chunks/job-rk1r2hx8.js
-+++ b/dist/chunks/job-rk1r2hx8.js
+diff --git a/dist/chunks/instance-xt4njr3s.js b/dist/chunks/instance-xt4njr3s.js
+--- a/dist/chunks/instance-xt4njr3s.js
++++ b/dist/chunks/instance-xt4njr3s.js
 @@ -75,7 +75,7 @@
      return [textAttachment(file)];
    if (file.mime === "application/x-directory")

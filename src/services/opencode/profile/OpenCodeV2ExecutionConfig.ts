@@ -12,7 +12,7 @@ export type ExecutionConfigInfo = Extract<FloorEntry, { type: 'document' }>['inf
   Extract<CurrentEntry, { type: 'document' }>['info']
 export type ExecutionProviderModels = NonNullable<NonNullable<ExecutionConfigInfo['providers']>[string]['models']>
 export type ExecutionConfigInput = {
-  pin: '2.0.0' | '2.0.21'
+  pin: '2.0.0' | '2.0.32'
   selection: ExecutionSelection
   /** Autonomous team profiles cannot wait for an interactive form response. */
   unattendedTeam?: boolean
@@ -26,7 +26,7 @@ export function createOpenCodeV2ExecutionConfig(input: ExecutionConfigInput): {
   info: ExecutionConfigInfo; content: string; sha256: string
 } {
   const { pin, selection, controller } = input
-  if ((pin !== '2.0.0' && pin !== '2.0.21') || !/^[A-Za-z0-9_-]{1,256}$/.test(selection.agent) ||
+  if ((pin !== '2.0.0' && pin !== '2.0.32') || !/^[A-Za-z0-9_-]{1,256}$/.test(selection.agent) ||
     controller.server !== 'agent-teams' || !selection.model.providerID || !selection.model.id ||
     selection.permissions.length === 0) throw new Error('v2_execution_selection_invalid')
   if (selection.model.variant !== undefined && !selection.model.variant) throw new Error('v2_execution_selection_invalid')
@@ -120,7 +120,7 @@ export function mapSelectedOpenCodeV2Model(modelID: string, legacy: unknown): Ex
   const models: ExecutionProviderModels = {}
   for (const [id, definition] of Object.entries(encoded.models ?? {})) {
     const { settings, variants, body, capabilities, cost, ...rest } = definition
-    models[id] = { ...rest, ...(cost === undefined ? {} : { cost: 'input' in cost ? cost : cost.map(entry => ({ ...entry })) }), ...(capabilities === undefined ? {} : { capabilities: { ...capabilities, input: [...capabilities.input], output: [...capabilities.output] } }), ...(body === undefined ? {} : { body: mutableJsonRecord(body) }), ...(settings === undefined ? {} : { settings: definedSettings(settings) }),
+    models[id] = { ...rest, ...(cost === undefined ? {} : { cost: 'input' in cost ? cost : cost.map(entry => ({ ...entry })) }), ...(capabilities === undefined ? {} : { capabilities: commonCapabilities(capabilities) }), ...(body === undefined ? {} : { body: mutableJsonRecord(body) }), ...(settings === undefined ? {} : { settings: definedSettings(settings) }),
       ...(variants === undefined ? {} : { variants: variants.map(variant => {
         const { settings: variantSettings, body: variantBody, ...variantRest } = variant
         return { ...variantRest, ...(variantBody === undefined ? {} : { body: mutableJsonRecord(variantBody) }), ...(variantSettings === undefined ? {} : { settings: definedSettings(variantSettings) }) }
@@ -132,6 +132,21 @@ export function mapSelectedOpenCodeV2Model(modelID: string, legacy: unknown): Ex
 
 const encodeNativeProviderInfo = Schema.encodeSync(NativeProviderInfo)
 type NativeModels = NonNullable<ReturnType<typeof encodeNativeProviderInfo>['models']>
+// Explicit native descriptors retain the existing complete capability contract.
+// Filling the new partial schema's absent fields would override base model values.
+function commonCapabilities(value: NonNullable<NativeModels[string]['capabilities']>) {
+  const { tools, input, output, reasoning, ...rest } = value
+  if (typeof tools !== 'boolean' || input === undefined || output === undefined)
+    throw new Error('v2_selected_model_capabilities_invalid')
+  return { ...rest, tools, input: [...input], output: [...output],
+    ...(reasoning === undefined ? {} : { reasoning: reasoning.supported === false ? { supported: false as const } : {
+      supported: true as const,
+      ...(reasoning.toggle === undefined ? {} : { toggle: reasoning.toggle }),
+      ...(reasoning.effort === undefined ? {} : { effort: [...reasoning.effort] }),
+      ...(reasoning.budget === undefined ? {} : { budget: { ...reasoning.budget } }),
+    } }),
+  }
+}
 type MutableJson = NonNullable<ExecutionProviderModels[string]['body']>[string]
 
 function mutableJson(value: Schema.Json): MutableJson {

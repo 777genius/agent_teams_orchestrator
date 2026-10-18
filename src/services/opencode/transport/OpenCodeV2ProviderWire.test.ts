@@ -16,7 +16,7 @@ test('provider failures retain only privately minted operation/status and preser
       const original = new Error(secret);
       endpoint.fetch = async () => { if (network) throw original;
         return new Response(secret, { status: 503, headers: { 'content-type': 'application/json' } }); };
-      const port = new OpenCodeV2ProviderWire({ pin: '2.0.21', directory: '/TEST-private-directory' }, Date.now() + 5000);
+      const port = new OpenCodeV2ProviderWire({ pin: '2.0.32', directory: '/TEST-private-directory' }, Date.now() + 5000);
       try { await port.fetch(endpoint.baseUrl + '/api/provider?location%5Bdirectory%5D=%2FTEST-private-directory'); }
       catch (error) { failures.push({ metadata: read(error), sameError: network ? error === original : true,
         wrapped: read(new Error('cleanup_unknown', { cause: error })) }); }
@@ -53,7 +53,7 @@ test('floor activation admits only the exact selected location and empty204 resp
     const url = endpoint.baseUrl + '/api/plugin/await-activation?location%5Bdirectory%5D=%2FTEST';
     const rejected = [];
     for (const [pin, target, init] of [
-      ['2.0.21', url, { method: 'POST' }],
+      ['2.0.32', url, { method: 'POST' }],
       ['2.0.0', url.replace('%2FTEST', '%2Fother'), { method: 'POST' }],
       ['2.0.0', url + '&extra=1', { method: 'POST' }],
       ['2.0.0', url + '&location%5Bdirectory%5D=%2FTEST', { method: 'POST' }],

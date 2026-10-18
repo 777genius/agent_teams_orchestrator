@@ -7,7 +7,7 @@ import { createOpenCodeVersionReadRoots } from '../profile/OpenCodeV2ManagedConf
 import { readOpenCodeOwnedVersion } from './OpenCodeVersionProbe.js'
 
 export type OpenCodeV2NativeIdentity = {
-  generation: 'v2'; version: OpenCodeV2Pin; dialect: 'v2-2.0.0' | 'v2-2.0.21'
+  generation: 'v2'; version: OpenCodeV2Pin; dialect: 'v2-2.0.0' | 'v2-2.0.32'
   executablePath: string; executableSha256: string; packageName: string
 }
 

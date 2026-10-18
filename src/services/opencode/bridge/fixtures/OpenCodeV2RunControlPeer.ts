@@ -16,8 +16,8 @@ import { createHash } from 'node:crypto'
 // Only its native and lease ports are synthetic. No accepted AdmissionRecord
 // is fabricated by the control fixture and no kernel cleanup proof is minted.
 function syntheticOwner(dataRoot: string, binding: RunBinding, directory: string, deadline: number, delayed = false): OpenCodeV2RunOwner {
-  const authority: ExecutionAuthority = { generation: 'v2', pin: '2.0.21', dialect: 'v2-2.0.21', graphSha256: 'a'.repeat(64),
-    selectedCli: { path: '/TEST-native', sha256: 'b'.repeat(64), version: '2.0.21' },
+  const authority: ExecutionAuthority = { generation: 'v2', pin: '2.0.32', dialect: 'v2-2.0.32', graphSha256: 'a'.repeat(64),
+    selectedCli: { path: '/TEST-native', sha256: 'b'.repeat(64), version: '2.0.32' },
     child: { pid: process.pid, birth: { format: 'linux-start-ticks', value: '1', bootId: 'TEST' },
       executablePath: process.execPath, sha256: 'c'.repeat(64) }, hostInstanceId: 'TEST', profileEpoch: 'TEST',
     profileRoot: '/TEST-profile', directory: '/TEST-project', leaseOwnerId: 'TEST' }
@@ -27,7 +27,7 @@ function syntheticOwner(dataRoot: string, binding: RunBinding, directory: string
     source: { entryPath: '/TEST-entry.ts', entrySha256: 'd'.repeat(64), bunPath: '/TEST-bun', bunSha256: 'c'.repeat(64),
       files: [{ path: '/TEST-entry.ts', sha256: 'd'.repeat(64) }], env: {} },
     members: [{ memberId: 'worker', laneId: 'primary', originalSessionId: 'ses_TESToriginal',
-      native: { generation: 'v2', version: '2.0.21', dialect: 'v2-2.0.21', executablePath: '/TEST-native',
+      native: { generation: 'v2', version: '2.0.32', dialect: 'v2-2.0.32', executablePath: '/TEST-native',
         executableSha256: 'b'.repeat(64), packageName: '@opencode/cli-linux-x64', runtimeMode: 'source', entrySha256: 'e'.repeat(64),
         bun: { path: '/TEST-bun', sha256: 'c'.repeat(64) }, graph: { sha256: 'a'.repeat(64), files: [] } },
       profile: { epoch: 'TEST', root: '/TEST-profile', directory: '/TEST-project', databasePath: '/TEST-profile/data/db',
@@ -43,7 +43,7 @@ function syntheticOwner(dataRoot: string, binding: RunBinding, directory: string
     getSession: async id => {
       if (!created) {
         const endpoint = 'http://127.0.0.1:1'
-        const wire = new OpenCodeV2ExecutionFetch(endpoint, '2.0.21', '/TEST-project', 'TEST-only', { deadline: Date.now() + 5000 },
+        const wire = new OpenCodeV2ExecutionFetch(endpoint, '2.0.32', '/TEST-project', 'TEST-only', { deadline: Date.now() + 5000 },
           async () => new Response(JSON.stringify({ _tag: 'SessionNotFoundError', sessionID: id, message: 'synthetic missing' }),
             { status: 404, headers: { 'content-type': 'application/json' } }))
         try { await wire.fetch(`${endpoint}/api/session/${id}`); throw new Error('TEST_missing_not_classified') }

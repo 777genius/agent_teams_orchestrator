@@ -1,7 +1,7 @@
 diff --git a/dist/protocols/openai-chat.js b/dist/protocols/openai-chat.js
 --- a/dist/protocols/openai-chat.js
 +++ b/dist/protocols/openai-chat.js
-@@ -90,6 +90,10 @@
+@@ -86,6 +86,10 @@
  });
  const OpenAIChatUserContent = Schema.Union([
      OpenAIChatTextContent,
@@ -12,19 +12,19 @@ diff --git a/dist/protocols/openai-chat.js b/dist/protocols/openai-chat.js
      Schema.Struct({
          type: Schema.Literal("image_url"),
          image_url: Schema.Struct({ url: Schema.String }),
-@@ -236,7 +240,10 @@
+@@ -234,7 +238,10 @@
      },
      extra_content: decodeExtraContent(part.providerMetadata?.[options.providerMetadataKey]?.extraContent),
  });
--const lowerMedia = Effect.fn("OpenAIChat.lowerMedia")(function* (part) {
-+const lowerMedia = Effect.fn("OpenAIChat.lowerMedia")(function* (part, videoInput = false) {
+-const lowerMedia = Effect.fnUntraced(function* (part) {
++const lowerMedia = Effect.fnUntraced(function* (part, videoInput = false) {
 +    // Only explicitly supported provider codecs opt into video_url.
 +    if (part.media.kind === "video" && videoInput && ["video/mp4", "video/webm", "video/mpeg", "video/quicktime"].includes(part.media.mediaType.toLowerCase()))
 +        return { type: "video_url", video_url: { url: (yield* ProviderShared.requireInlineMedia("OpenAI-compatible Chat video", part.media)).dataUrl } };
      // Chat Completions accepts PDFs, and no other documents, as inline `file` parts; file URLs are not supported.
      if (part.media.mediaType.toLowerCase() === "application/pdf")
          return {
-@@ -284,7 +291,7 @@
+@@ -282,7 +289,7 @@
              continue;
          }
          if (part.type === "media") {

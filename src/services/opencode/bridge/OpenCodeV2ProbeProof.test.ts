@@ -2,7 +2,7 @@ import { expect, test } from 'bun:test'
 
 // The endpoint stub is confined to a child, so it cannot replace the registered
 // lease boundary in other tests. No native server, model or real auth is used.
-for (const pin of ['2.0.0', '2.0.21'] as const) {
+for (const pin of ['2.0.0', '2.0.32'] as const) {
   test(`${pin} original native terminal cuts preserve probe failures and success`, async () => {
     const script = `
       import { mock } from 'bun:test'
@@ -69,7 +69,7 @@ for (const pin of ['2.0.0', '2.0.21'] as const) {
           }
           messages.push({ id: assistant.id, type: 'assistant', timeCreated: 1, data: assistant })
         }
-        if (pin === '2.0.21') messages.push({ id: events.at(-1).id.replace(/^evt_/, 'msg_'), type: 'idle', timeCreated: 1,
+        if (pin === '2.0.32') messages.push({ id: events.at(-1).id.replace(/^evt_/, 'msg_'), type: 'idle', timeCreated: 1,
           data: { outcome: state === 'cancelled' ? 'interrupted' : state } })
         const log = { synced: true, watermark: events.at(-1).seq, events }
         const client = { authority: host, getSession: async () => ({ id, directory: project, agent: authority.agent, model: authority.model }),
@@ -119,7 +119,7 @@ for (const pin of ['2.0.0', '2.0.21'] as const) {
         await assert.rejects(buildOwnedV2ProbeProof({ client: fixture('failed').client, authority,
           captured: structuredClone(captured), intent, admission: fixture('failed').admission, expectedText,
           capabilitySnapshotId: 'TEST-capability' }), /probe_capture_not_owned/); cases++
-        if (pin === '2.0.21') {
+        if (pin === '2.0.32') {
           const missingIdle = fixture('failed'); missingIdle.messages.pop()
           assert.deepEqual(await build(missingIdle), { proof: null, failure: null }); cases++
         }
@@ -131,6 +131,6 @@ for (const pin of ['2.0.0', '2.0.21'] as const) {
     const [exit, stdout, stderr] = await Promise.all([child.exited,
       new Response(child.stdout).text(), new Response(child.stderr).text()])
     expect({ exit, stderr }).toEqual({ exit: 0, stderr: '' })
-    expect(JSON.parse(stdout)).toEqual({ pin, cases: pin === '2.0.21' ? 10 : 9, fixtureRemoved: true })
+    expect(JSON.parse(stdout)).toEqual({ pin, cases: pin === '2.0.32' ? 10 : 9, fixtureRemoved: true })
   }, 15_000)
 }

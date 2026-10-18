@@ -6,7 +6,7 @@ import { OpenCodeV2ExecutionFetch } from './OpenCodeV2ExecutionFetch.js'
 const endpoint = 'http://127.0.0.1:32123'
 const sessionID = 'ses_TESTchronology'
 const cursor = Buffer.from(JSON.stringify({ id: 'msg_TESTcomment', order: 'asc', direction: 'next' })).toString('base64url')
-for (const pin of ['2.0.0', '2.0.21'] as const) {
+for (const pin of ['2.0.0', '2.0.32'] as const) {
   test(`${pin} official generated client requests ascending first page and follows cursor without order`, async () => {
     const requests: URL[] = []
     const wire = new OpenCodeV2ExecutionFetch(endpoint, pin, '/TEST/project', 'TEST-only-password',

@@ -104,7 +104,7 @@ test('managed Windows deferred controller requires exact owned config and live c
     try { Object.defineProperty(process, 'platform', { ...platform, value: 'win32' }); return run() }
     finally { Object.defineProperty(process, 'platform', platform) }
   }
-  const config = windows(() => createOpenCodeV2ExecutionConfig({ pin: '2.0.21', selection,
+  const config = windows(() => createOpenCodeV2ExecutionConfig({ pin: '2.0.32', selection,
     controller: { server: 'agent-teams', config: { type: 'local', command: [process.execPath,
       fileURLToPath(new URL('./fixtures/OpenCodeV2ControllerToolsPeer.ts', import.meta.url))] } } }))
   const profile: SelectedExecutionProfile = { epoch: 'TEST-epoch', root: '/TEST-root', directory: '/TEST-project',

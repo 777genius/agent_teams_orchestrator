@@ -8,13 +8,13 @@ import { hashOpenCodeFile, selectedOpenCodeReadPath } from './OpenCodeNativeIden
 
 test('strict family/dialect classification preserves V1 floor and refuses ambiguous output', () => {
   for (const version of ['1.16.0', '1.18.34']) expect(classifyOpenCodeReadGeneration(version).generation).toBe('v1')
-  for (const version of ['2.0.0', '2.0.21']) expect(classifyOpenCodeReadGeneration(version).generation).toBe('v2')
-  for (const version of ['2.0.1', '3.0.0', '2.0.21-rc.1', 'opencode 2.0.21', '1.18.34\n2.0.21', '02.0.21']) {
+  for (const version of ['2.0.0', '2.0.32']) expect(classifyOpenCodeReadGeneration(version).generation).toBe('v2')
+  for (const version of ['2.0.1', '2.0.21', '2.0.31', '2.0.33', '3.0.0', '2.0.32-rc.1', 'opencode 2.0.32', '1.18.34\n2.0.32', '02.0.32']) {
     expect(classifyOpenCodeReadGeneration(version).generation).toBe('unsupported')
   }
 })
 
-for (const pin of ['2.0.0', '2.0.21'] as const) {
+for (const pin of ['2.0.0', '2.0.32'] as const) {
   test(`official native --version stdout admits exact V2 ${pin} dialect`, () => {
     // Exact stdout observed from the canonical official CLI package, exit 0.
     expect(classifyOpenCodeReadGeneration(`opencode v${pin}\n`)).toEqual({
@@ -25,11 +25,11 @@ for (const pin of ['2.0.0', '2.0.21'] as const) {
 
 test('decorated, multiline and unqualified branded versions remain unsupported', () => {
   for (const output of [
-    'warning: opencode v2.0.21\n', 'opencode v2.0.21 extra\n',
-    'banner\nopencode v2.0.21\n', 'opencode v2.0.21\nbanner\n',
-    'opencode v2.0.0\nopencode v2.0.21\n', 'opencode v2.0.21\n\n',
-    '\nopencode v2.0.21\n', ' opencode v2.0.21\n', 'opencode 2.0.21\n',
-    'opencode v02.0.21\n', 'opencode v2.0.21-rc.1\n',
+    'warning: opencode v2.0.32\n', 'opencode v2.0.32 extra\n',
+    'banner\nopencode v2.0.32\n', 'opencode v2.0.32\nbanner\n',
+    'opencode v2.0.0\nopencode v2.0.32\n', 'opencode v2.0.32\n\n',
+    '\nopencode v2.0.32\n', ' opencode v2.0.32\n', 'opencode 2.0.32\n',
+    'opencode v02.0.32\n', 'opencode v2.0.32-rc.1\n',
     'opencode v2.0.1\n', 'opencode v2.0.26\n', 'opencode v2.1.0\n', 'opencode v3.0.0\n',
   ]) expect(classifyOpenCodeReadGeneration(output).generation).toBe('unsupported')
 })

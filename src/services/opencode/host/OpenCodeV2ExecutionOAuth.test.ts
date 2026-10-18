@@ -32,7 +32,7 @@ async function fixture() {
   return { profile, auth, content, remove: () => rm(root, { recursive: true, force: true }) }
 }
 
-async function official(pin: '2.0.0' | '2.0.21') {
+async function official(pin: '2.0.0' | '2.0.32') {
   const modulePath = await realpath(Bun.resolveSync(pin === '2.0.0' ? '@opencode/server-v2-floor/process' : '@opencode/server/process', import.meta.dir))
   const locate = async (name: string) => realpath(Bun.resolveSync(name, modulePath))
   const effect: typeof import('effect') = await import(pathToFileURL(await locate('effect')).href)
@@ -66,7 +66,7 @@ async function official(pin: '2.0.0' | '2.0.21') {
   return { graph, modulePath, effect, records }
 }
 
-for (const pin of ['2.0.0', '2.0.21'] as const) {
+for (const pin of ['2.0.0', '2.0.32'] as const) {
   test(`${pin}: official OAuth importer binds a fresh DB, preserves exact reuse and refuses recovery mismatches`, async () => {
     const f = await fixture(), native = await official(pin)
     try {
@@ -160,9 +160,9 @@ test('OAuth admission accepts optional public Codex settings and requires one co
 
 test('initial auth waits for the pin-specific native activation barrier before reading OAuth metadata', async () => {
   const pin = process.env.TEST_OPENCODE_V2_AUTH_BARRIER_PIN
-  if (pin !== '2.0.0' && pin !== '2.0.21') {
+  if (pin !== '2.0.0' && pin !== '2.0.32') {
     // The endpoint mock stays in isolated processes, matching the existing Wire test seam.
-    for (const selected of ['2.0.21', '2.0.0']) {
+    for (const selected of ['2.0.32', '2.0.0']) {
       const child = Bun.spawn([process.execPath, 'test', import.meta.path, '--test-name-pattern', 'initial auth waits'], {
         env: { ...process.env, TEST_OPENCODE_V2_AUTH_BARRIER_PIN: selected }, stdout: 'pipe', stderr: 'pipe',
       })
@@ -176,7 +176,7 @@ test('initial auth waits for the pin-specific native activation barrier before r
   const f = await fixture(), seen = Promise.withResolvers<void>(), release = Promise.withResolvers<void>()
   const location = { directory: f.profile.directory }, calls: string[] = []
   const integration = { id: 'openai', methods: [{ type: 'oauth', id: 'chatgpt-browser' }],
-    connections: [{ type: 'credential', id: 'cred_TESToriginal', ...(pin === '2.0.21' ? { method: 'oauth' } : {}) }] }
+    connections: [{ type: 'credential', id: 'cred_TESToriginal', ...(pin === '2.0.32' ? { method: 'oauth' } : {}) }] }
   const expectedBarrier = pin === '2.0.0' ? 'POST /api/plugin/await-activation' : 'GET /api/integration'
   let activated = false, disposers = 0
   const endpoint = { baseUrl: 'http://127.0.0.1:1', password: 'TEST-DUMMY-ENDPOINT', signal: new AbortController().signal,

@@ -58,14 +58,14 @@ test.skipIf(process.platform !== 'darwin')('Darwin receipt binds installed nativ
   const packageName = `@opencode/cli-darwin-${process.arch}`
   const metadataPath = Bun.resolveSync(`${packageName}/package.json`, import.meta.dir)
   const metadata: unknown = JSON.parse(await readFile(metadataPath, 'utf8'))
-  expect(metadata).toMatchObject({ name: packageName, version: '2.0.21' })
+  expect(metadata).toMatchObject({ name: packageName, version: '2.0.32' })
   const executablePath = path.join(path.dirname(metadataPath), 'bin/opencode')
   const executableSha256 = createHash('sha256').update(await readFile(executablePath)).digest('hex')
   const f = await fixture()
   try {
     await writeFile(path.join(f.root, 'package.json'), JSON.stringify({ name: 'TEST-receipt-controller', version: '1.0.0' }))
     const receipt = await createOpenCodeV2ExecutionReceipt('/TEST-unused-source-hint', {
-      generation: 'v2', version: '2.0.21', dialect: 'v2-2.0.21', executablePath, executableSha256, packageName,
+      generation: 'v2', version: '2.0.32', dialect: 'v2-2.0.32', executablePath, executableSha256, packageName,
     }, { type: 'local', command: [process.execPath, f.entry] })
     expect(receipt.packageName).toBe(packageName)
     expect(receipt.executableSha256).toBe(executableSha256)
@@ -73,7 +73,7 @@ test.skipIf(process.platform !== 'darwin')('Darwin receipt binds installed nativ
     expect(receipt.graph.files.some(row => row.path === f.entry)).toBe(true)
     // The same installed package cannot acquire a receipt after selected bytes drift.
     await expect(createOpenCodeV2ExecutionReceipt('/TEST-unused-source-hint', {
-      generation: 'v2', version: '2.0.21', dialect: 'v2-2.0.21', executablePath,
+      generation: 'v2', version: '2.0.32', dialect: 'v2-2.0.32', executablePath,
       executableSha256: '0'.repeat(64), packageName,
     })).rejects.toThrow('native_selection_changed')
   } finally { await rm(f.root, { recursive: true, force: true }) }
@@ -190,7 +190,7 @@ test.skipIf(process.platform !== 'darwin' || !process.env.OPENCODE_E2E_TEST_NODE
     const closure = await resolveOpenCodeV2DarwinControllerRuntimeClosure(runtime)
     expect(closure.files.length).toBeGreaterThan(1); expect(closure.aliases.length).toBeGreaterThan(0)
     const receipt = await createOpenCodeV2ExecutionReceipt('/TEST-unused-source-hint', {
-      generation: 'v2', version: '2.0.21', dialect: 'v2-2.0.21', executablePath, executableSha256, packageName,
+      generation: 'v2', version: '2.0.32', dialect: 'v2-2.0.32', executablePath, executableSha256, packageName,
     }, { type: 'local', command: [runtime, f.entry] })
     for (const row of closure.files) expect(receipt.graph.files).toContainEqual(row)
     for (const alias of closure.aliases) expect(await realpath(alias.target)).toBe(alias.source)
@@ -205,9 +205,9 @@ async function receiptFixture(platform: NodeJS.Platform = 'darwin') {
     await writeFile(path.join(directory, entry), `export {} // ${name}`)
     return path.join(directory, entry)
   }
-  const server = await writePackage(path.join(root, 'packages/server'), '@opencode/server', 'process.js', '2.0.21')
-  const client = await writePackage(path.join(root, 'packages/client'), '@opencode/client', 'index.js', '2.0.21')
-  const effect = await writePackage(path.join(root, 'packages/effect'), 'effect', 'index.js', '4.0.0-rc.112')
+  const server = await writePackage(path.join(root, 'packages/server'), '@opencode/server', 'process.js', '2.0.32')
+  const client = await writePackage(path.join(root, 'packages/client'), '@opencode/client', 'index.js', '2.0.32')
+  const effect = await writePackage(path.join(root, 'packages/effect'), 'effect', 'index.js', '4.0.1')
   const mcpSdk = await writePackage(path.join(root, 'packages/mcp'), '@modelcontextprotocol/sdk', 'client/index.js')
   await writePackage(path.join(root, 'controller'), 'TEST-controller-entry', 'dist/controller.js')
   const nativeRoot = path.join(root, 'native/package')
@@ -215,11 +215,11 @@ async function receiptFixture(platform: NodeJS.Platform = 'darwin') {
   const executablePath = path.join(nativeRoot, 'bin', executableName)
   await mkdir(path.dirname(executablePath), { recursive: true })
   await writeFile(path.join(nativeRoot, 'package.json'), JSON.stringify({
-    name: `@opencode/cli-${platform === 'win32' ? 'windows' : platform}-${process.arch}`, version: '2.0.21',
+    name: `@opencode/cli-${platform === 'win32' ? 'windows' : platform}-${process.arch}`, version: '2.0.32',
   }))
   await writeFile(executablePath, platform === 'win32' ? peExecutable('TEST selected opencode.exe') : macho([]))
   const identity = {
-    generation: 'v2' as const, version: '2.0.21' as const, dialect: 'v2-2.0.21' as const,
+    generation: 'v2' as const, version: '2.0.32' as const, dialect: 'v2-2.0.32' as const,
     executablePath, executableSha256: createHash('sha256').update(await readFile(executablePath)).digest('hex'),
     packageName: `@opencode/cli-${platform === 'win32' ? 'windows' : platform}-${process.arch}`,
   }

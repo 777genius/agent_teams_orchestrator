@@ -4,7 +4,7 @@ import { emptyOpenCodeV2ReadStatus } from '../catalog/OpenCodeV2ReadStatus.js'
 import { openCodeV2InventorySnapshot } from '../catalog/OpenCodeV2InventoryService.js'
 import type { OpenCodeV2NativeIdentity } from './OpenCodeNativeIdentity.js'
 
-const native: OpenCodeV2NativeIdentity = { generation: 'v2', version: '2.0.21', dialect: 'v2-2.0.21',
+const native: OpenCodeV2NativeIdentity = { generation: 'v2', version: '2.0.32', dialect: 'v2-2.0.32',
   executablePath: '/TEST/native/opencode', executableSha256: 'a'.repeat(64), packageName: '@opencode/cli-linux-x64' }
 
 test('full status never derives V2 authentication or team launch from catalog or stale V1 auth', async () => {

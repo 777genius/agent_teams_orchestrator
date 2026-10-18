@@ -46,7 +46,7 @@ export function validateRunLaunchPlan(plan: RunLaunchPlan): void {
     executionAssert(member.memberId.length > 0 && member.laneId.length > 0 && /^ses_[a-zA-Z0-9]+$/.test(member.originalSessionId), 'run_member_invalid')
     executionAssert(['source', 'packaged'].includes(member.native.runtimeMode) &&
       member.native.runtimeMode === plan.members[0]!.native.runtimeMode && member.native.generation === 'v2' &&
-      ['2.0.0', '2.0.21'].includes(member.native.version), 'run_pin_unsupported')
+      ['2.0.0', '2.0.32'].includes(member.native.version), 'run_pin_unsupported')
     executionAssert(member.native.bun.path === plan.source.bunPath && member.native.bun.sha256 === plan.source.bunSha256, 'run_source_changed')
     executionAssert(/^[a-z0-9][a-z0-9._-]{0,199}$/.test(member.bootstrap.key) &&
       Buffer.byteLength(member.bootstrap.value) <= 256 * 1024 && sha(member.bootstrap.value) === member.bootstrap.contextHash &&

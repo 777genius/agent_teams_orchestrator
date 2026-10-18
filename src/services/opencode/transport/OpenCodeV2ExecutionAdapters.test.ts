@@ -5,7 +5,7 @@ import { OpenCodeV2ExecutionFetch } from './OpenCodeV2ExecutionFetch.js'
 
 // Exercise the installed generated SDK, including its HTTP-envelope decoding.
 // This controlled HTTP port mints no lease/endpoint or native admission authority.
-for (const pin of ['2.0.0', '2.0.21'] as const) {
+for (const pin of ['2.0.0', '2.0.32'] as const) {
   test(`${pin} exact execution adapter preserves each published finite response contract`, async () => {
     const base = 'http://127.0.0.1:31999', directory = '/TEST/project', id = 'ses_TESToriginal'
     const location = { directory }

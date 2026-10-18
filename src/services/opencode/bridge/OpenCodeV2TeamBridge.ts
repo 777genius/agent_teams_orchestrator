@@ -248,7 +248,7 @@ export function openCodeV2SupportedSourcePredicate(status: Extract<RunControlRes
   try { classifyOpenCodeV2ExecutionDelivery(import.meta.url) } catch { return false }
   return isExecutionPlatformAvailable() && process.versions.bun === openCodeBunVersion() &&
     status.qualification !== undefined && status.state === 'active' && status.deadline > Date.now() && status.members.length > 0 &&
-    status.members.every(member => ['2.0.0', '2.0.21'].includes(member.pin) && member.state === 'accepted' &&
+    status.members.every(member => ['2.0.0', '2.0.32'].includes(member.pin) && member.state === 'accepted' &&
       member.originalSessionId === member.opencodeSessionId && member.originalSessionId === member.runtimeSessionId &&
       member.bootstrap?.verified === true && member.bootstrap.strategy === 'instruction-entry' &&
       member.bootstrap.missingNativeMessageID === true && member.controllerTools?.server === 'agent-teams' &&

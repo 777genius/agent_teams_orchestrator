@@ -94,7 +94,7 @@ test('journal recovery selects the current generation even when a saved V1 lane 
   await writeFile(path.join(root,'opencode/session-store.json'),JSON.stringify({schemaVersion:1,records:{'TEST::primary::worker':record}}));
   OpenCodeV2TeamBridge.prototype.discover=async()=>null;let legacy=0;
   const legacyExecutor=async()=>{legacy++;return 'V1'};
-  for(const version of ['2.0.0','2.0.21']){
+  for(const version of ['2.0.0','2.0.32']){
    mock.module(${JSON.stringify(factory)},()=>({...f,inspectOpenCodeRuntimeAdapterSelection:async()=>({policy:{generation:'v2',version}})}));
    const result=await execute(envelope('opencode.recoverDeliveryJournal',{teamId:'TEST',runId:'original',laneId:'primary'}),legacyExecutor);
    assert.equal(result.ok,true);assert.equal(result.runtime.version,version);assert.equal(legacy,0);

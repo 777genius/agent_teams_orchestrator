@@ -11,19 +11,19 @@ test('launch waits for original native members under one deadline before returni
     Date.now = () => clock
     const binding = { teamId: 'TEST-launch', runId: 'TEST-run', controllerInstanceId: 'TEST-controller', ownerId: 'TEST-owner' }
     const qualification = { capabilitySnapshotId: 'TEST-capability', expectedBehaviorFingerprint: 'a'.repeat(64),
-      binaryPath: '/TEST/native', binaryFingerprint: 'TEST-binary', version: '2.0.21' }
+      binaryPath: '/TEST/native', binaryFingerprint: 'TEST-binary', version: '2.0.32' }
     const owner = { binding, deadline: 10000 }
     const members = ['one', 'two'].map(memberId => ({ memberId, laneId: 'primary', originalSessionId: 'ses_' + memberId,
-      native: { version: '2.0.21' }, profile: { selection: { model: { providerID: 'TEST', id: 'model', variant: 'default' } } } }))
+      native: { version: '2.0.32' }, profile: { selection: { model: { providerID: 'TEST', id: 'model', variant: 'default' } } } }))
     const nativeMembers = members.map(member => ({ memberId: member.memberId, laneId: member.laneId,
       originalSessionId: member.originalSessionId, opencodeSessionId: member.originalSessionId, runtimeSessionId: member.originalSessionId,
-      selectedModel: 'TEST/model', selectedVariant: 'default', pin: '2.0.21', runtimePid: member.memberId === 'one' ? 123 : 124,
+      selectedModel: 'TEST/model', selectedVariant: 'default', pin: '2.0.32', runtimePid: member.memberId === 'one' ? 123 : 124,
       state: 'accepted', bootstrap: { verified: true, strategy: 'instruction-entry', missingNativeMessageID: true },
       controllerTools: { server: 'agent-teams', nativeNames: ['message_send'], schemasHash: 'b'.repeat(64) } }))
     let budgets = [], launches = 0, discoveries = 0
     const factoryModule = await import(${JSON.stringify(factory)})
     mock.module(${JSON.stringify(factory)}, () => ({ ...factoryModule,
-      inspectOpenCodeRuntimeAdapterSelection: async () => ({ policy: { generation: 'v2', version: '2.0.21' } }) }))
+      inspectOpenCodeRuntimeAdapterSelection: async () => ({ policy: { generation: 'v2', version: '2.0.32' } }) }))
     mock.module(${JSON.stringify(plans)}, () => ({ createOpenCodeV2LaunchPlan: async () => {
       clock += 20; return { binding, members, deadline: owner.deadline, qualification }
     }, inspectOpenCodeV2SourceAvailability: async () => { throw Error('TEST source requalification forbidden') },

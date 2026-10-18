@@ -1,10 +1,11 @@
+import { openCodeV2ServerLoopbackUrl } from '../OpenCodeV2ServerAddress.js'
 import { openCodeBunVersion } from '../../../../constants/openCodeBunVersion.js'
 import { createServer } from 'node:http'
 import filesystem, { stat } from 'node:fs/promises'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
-import type { OpenCodeV2Pin } from '../../compatibility/OpenCodeGenerationPolicy.js'
-import { verifyOpenCodePackage, verifyOpenCodeV2ServerGraph } from '../OpenCodeV2ServerGraph.js'
+import { openCodeV2EffectVersion, type OpenCodeV2Pin } from '../../compatibility/OpenCodeGenerationPolicy.js'
+import { verifyOpenCodePackage, verifyOpenCodeV2GraphEffect, verifyOpenCodeV2ServerGraph } from '../OpenCodeV2ServerGraph.js'
 import type { ServerOptions as FloorOptions } from '@opencode/server-v2-floor/options'
 import type { ServerOptions as CurrentOptions } from '@opencode/server/options'
 import { isWindowsCommandPort, type WindowsCommandPort } from './OpenCodeV2WindowsCommand.js'
@@ -22,7 +23,7 @@ const CONTROL_ENV = /^OPENCODE_V2_/i
 export async function loadOpenCodeV2WindowsRuntime(pin: OpenCodeV2Pin, expectedModuleSha256: string,
   commands: WindowsCommandPort, profile: OwnedNativeProfile) {
   requireValue(process.platform === 'win32' && process.versions.bun === openCodeBunVersion())
-  requireValue(pin === '2.0.0' || pin === '2.0.21')
+  requireValue(pin === '2.0.0' || pin === '2.0.32')
   requireValue(isWindowsCommandPort(commands))
   const trustedEnvironment = Object.freeze({ ...profile.env })
   const databasePath = profile.databasePath, configDirectory = profile.config.directory
@@ -41,19 +42,20 @@ export async function loadOpenCodeV2WindowsRuntime(pin: OpenCodeV2Pin, expectedM
   async function load<T>(specifier: string, packageName: string, version: string): Promise<T> {
     const entry = await filesystem.realpath(Bun.resolveSync(specifier, directory))
     await verifyOpenCodePackage(entry, packageName, version)
+    await verifyOpenCodeV2GraphEffect(entry, graph.effectPath, pin)
     return import(pathToFileURL(entry).href) as Promise<T>
   }
   // No Effect values from a different physical graph enter this layer.
   const effect: typeof import('effect') = await import(pathToFileURL(graph.effectPath).href)
-  const spawn = await load<typeof import('effect/unstable/process/ChildProcessSpawner')>(
-    'effect/unstable/process/ChildProcessSpawner', 'effect', '4.0.0-rc.112')
-  const httpTypes = await load<typeof import('effect/unstable/http')>('effect/unstable/http', 'effect', '4.0.0-rc.112')
+  const spawn = await load<typeof import('effect/process/ChildProcessSpawner')>(
+    pin === '2.0.0' ? 'effect/unstable/process/ChildProcessSpawner' : 'effect/process/ChildProcessSpawner', 'effect', openCodeV2EffectVersion(pin))
+  const httpTypes = await load<typeof import('effect/http')>(pin === '2.0.0' ? 'effect/unstable/http' : 'effect/http', 'effect', openCodeV2EffectVersion(pin))
   const routes = await load<typeof import('@opencode/server/routes')>('@opencode/server/routes', '@opencode/server', pin)
   const cross = await load<typeof import('@opencode/util/cross-spawn-spawner')>(
     '@opencode/util/cross-spawn-spawner', '@opencode/util', pin)
   const global = await load<typeof import('@opencode/util/global')>('@opencode/util/global', '@opencode/util', pin)
   const http = await load<typeof import('@effect/platform-node/NodeHttpServer')>(
-    '@effect/platform-node/NodeHttpServer', '@effect/platform-node', '4.0.0-rc.112')
+    '@effect/platform-node/NodeHttpServer', '@effect/platform-node', openCodeV2EffectVersion(pin))
   const { Effect, Layer, PlatformError, Stream, Sink, Scope, Exit, Context } = effect
   const error = (method: string) => PlatformError.systemError({
     _tag: 'Unknown', module: 'ChildProcess', method, description: 'Windows owned command operation failed',
@@ -213,10 +215,7 @@ export async function loadOpenCodeV2WindowsRuntime(pin: OpenCodeV2Pin, expectedM
         // connections before awaiting the listener's close callback.
         const server = yield* http.make(() => node, { host: '127.0.0.1', port: 0, gracefulShutdownTimeout: '2 seconds' })
         yield* Effect.addFinalizer(() => Effect.sync(() => node.closeAllConnections()))
-        requireValue(server.address._tag === 'TcpAddress' && server.address.hostname === '127.0.0.1')
-        const address = server.address
-        requireValue(address._tag === 'TcpAddress')
-        const url = `http://127.0.0.1:${address.port}`
+        const url = openCodeV2ServerLoopbackUrl(pin, server.address)
         const services = yield* Layer.build(createRoutes({ ...options, hostname: '127.0.0.1', port: 0 }, () => [url])
           .pipe(Layer.provideMerge(http.layerHttpServices)))
         const handler = Context.get(services, httpTypes.HttpRouter.HttpRouter).asHttpEffect().pipe(Effect.provide(services))

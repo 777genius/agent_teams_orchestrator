@@ -232,7 +232,7 @@ describe('private run control with separate synthetic CLI processes', () => {
       await ready(owner)
       const record = await discoverOpenCodeV2Run(root, binding.teamId, binding.runId)
       if (!record) throw new Error('TEST_record_missing')
-      const target = { memberId: 'worker', originalSessionId: 'ses_TESToriginal', selectedModel: 'TEST/TEST', pin: '2.0.21' as const }
+      const target = { memberId: 'worker', originalSessionId: 'ses_TESToriginal', selectedModel: 'TEST/TEST', pin: '2.0.32' as const }
       const send = { operation: 'send' as const, memberId: target.memberId, originalSessionId: target.originalSessionId,
         intent: { delivery: 'queue' as const, identity: { requestId: 'request', deliveryAttemptId: 'attempt', localMessageId: 'local', nativeInputID: 'msg_TESToriginal' },
           input: { nativeInputID: 'msg_TESToriginal', text: 'TEST delayed original', resume: true } } }
@@ -263,7 +263,7 @@ describe('private run control with separate synthetic CLI processes', () => {
       await ready(owner)
       const record = await discoverOpenCodeV2Run(root, binding.teamId, binding.runId)
       if (!record) throw new Error('TEST_record_missing')
-      const target = { memberId: 'worker', originalSessionId: 'ses_TESToriginal', selectedModel: 'TEST/TEST', pin: '2.0.21' as const }
+      const target = { memberId: 'worker', originalSessionId: 'ses_TESToriginal', selectedModel: 'TEST/TEST', pin: '2.0.32' as const }
       expect(await awaitOpenCodeV2RunMemberReadiness(record, target, 1000)).toBeNull()
       await expect(lstat(path.join(directory, 'synthetic-effects.json'))).rejects.toMatchObject({ code: 'ENOENT' })
       const waiting = awaitOpenCodeV2RunMemberReadiness(record, target, 5000).catch(() => null)

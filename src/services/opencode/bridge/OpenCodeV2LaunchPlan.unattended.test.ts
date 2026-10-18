@@ -23,7 +23,7 @@ import type { BridgeEnvelope } from './OpenCodeBridgeProtocol.js'
 import type { OpenCodePreparedProfile, OpenCodeProfileScope, OpenCodeProvisioningSnapshot } from '../types.js'
 import type { ValidatedExecutionNative } from '../host/OpenCodeV2ExecutionHost.js'
 
-let root: string, project: string, pin: '2.0.0' | '2.0.21' = '2.0.21'
+let root: string, project: string, pin: '2.0.0' | '2.0.32' = '2.0.32'
 let saved: NodeJS.ProcessEnv
 let nativeSelectionCalls = 0, nativeReceiptCalls = 0
 let authContent = '{}\n'
@@ -32,7 +32,7 @@ const restores: { mockRestore(): void }[] = []
 const behavior = 'b'.repeat(64)
 const digest = (value: string) => createHash('sha256').update(value).digest('hex')
 function native(): ValidatedExecutionNative {
-  return { generation: 'v2', version: pin, dialect: pin === '2.0.0' ? 'v2-2.0.0' : 'v2-2.0.21',
+  return { generation: 'v2', version: pin, dialect: pin === '2.0.0' ? 'v2-2.0.0' : 'v2-2.0.32',
     executablePath: '/TEST/qualified/opencode', executableSha256: 'a'.repeat(64), packageName: '@opencode/cli-linux-x64',
     runtimeMode: 'source', entrySha256: 'a'.repeat(64), bun: { path: process.execPath, sha256: 'a'.repeat(64) },
     graph: { sha256: 'a'.repeat(64), files: [{ path: import.meta.path, sha256: 'a'.repeat(64) }] } }
@@ -82,7 +82,7 @@ async function proof(prepared: OpenCodePreparedProfile, capabilitySnapshotId: st
   return buildOpenCodeExecutionProof({ selectedModel: 'provider/model', snapshot, capabilitySnapshotId }, {
     resolveBinaryPath: () => native().executablePath, resolveBinaryIdentity: async () => 'TEST-native-identity', readCredential: async () => null, platform })
 }
-for (const version of ['2.0.0', '2.0.21'] as const) test(`${version} absent selected auth routes prepared profiles through native free-model readback while sealing paid keys`, async () => {
+for (const version of ['2.0.0', '2.0.32'] as const) test(`${version} absent selected auth routes prepared profiles through native free-model readback while sealing paid keys`, async () => {
   pin = version
   const selection = await inspectOpenCodeV2SourceAvailability(envelope())
   const parent = path.join(root, 'profiles'); await mkdir(parent)
@@ -129,7 +129,7 @@ for (const version of ['2.0.0', '2.0.21'] as const) test(`${version} absent sele
   authContent = '{}\n'
   await expect(createOpenCodeV2PreparedMember(selection, native(), parent, member)).rejects.toThrow('run_selected_auth_changed')
 })
-for (const version of ['2.0.0', '2.0.21'] as const) test(`${version} admits Linux and Darwin selection but fences unsupported hosts before identity reads`, async () => {
+for (const version of ['2.0.0', '2.0.32'] as const) test(`${version} admits Linux and Darwin selection but fences unsupported hosts before identity reads`, async () => {
   pin = version
   const platform = Object.getOwnPropertyDescriptor(process, 'platform')!
   const bun = Object.getOwnPropertyDescriptor(process.versions, 'bun')!
@@ -153,7 +153,7 @@ for (const version of ['2.0.0', '2.0.21'] as const) test(`${version} admits Linu
     Object.defineProperty(process.versions, 'bun', bun)
   }
 })
-for (const version of ['2.0.0', '2.0.21'] as const) test(`${version} team launch requires the same unattended profile as its strict proof`, async () => {
+for (const version of ['2.0.0', '2.0.32'] as const) test(`${version} team launch requires the same unattended profile as its strict proof`, async () => {
   pin = version
   const request = envelope(), selection = await inspectOpenCodeV2SourceAvailability(request)
   const parent = path.join(root, 'profiles'); await mkdir(parent)

@@ -290,7 +290,7 @@ class OpenCodeV2BridgeFetch {
 
 async function operations(authority: ExecutionAuthority, context: ExecutionContext,
   endpoint: ExecutionEndpoint) {
-  executionAssert(authority.generation === 'v2' && (authority.pin === '2.0.0' || authority.pin === '2.0.21') &&
+  executionAssert(authority.generation === 'v2' && (authority.pin === '2.0.0' || authority.pin === '2.0.32') &&
     authority.dialect === `v2-${authority.pin}`, 'unqualified_version')
   const graph = requireExecutionGraph(authority)
   executionAssert(graph.sha256 === authority.graphSha256, 'authority_mismatch')
@@ -326,7 +326,7 @@ export async function awaitOpenCodeV2CatalogReadiness(endpoint: ExecutionEndpoin
       (authority.pin !== '2.0.0' || identity.healthy === true), 'authority_mismatch')
     executionAssert(record(await ops.location()).directory === authority.directory, 'authority_mismatch')
     const ready = await ops.ready()
-    if (authority.pin === '2.0.21') executionAssert(record(record(ready).location).directory === authority.directory, 'authority_mismatch')
+    if (authority.pin === '2.0.32') executionAssert(record(record(ready).location).directory === authority.directory, 'authority_mismatch')
     wire.check()
   } finally { await Promise.all([wire.dispose(), bridgeWire.dispose()]) }
 }
@@ -341,11 +341,11 @@ export async function awaitOpenCodeV2ExecutionReadiness(endpoint: ExecutionEndpo
       (authority.pin !== '2.0.0' || identity.healthy === true), 'authority_mismatch')
     executionAssert(record(await ops.location()).directory === authority.directory, 'authority_mismatch')
     const ready = await ops.ready()
-    if (authority.pin === '2.0.21') executionAssert(record(record(ready).location).directory === authority.directory, 'authority_mismatch')
+    if (authority.pin === '2.0.32') executionAssert(record(record(ready).location).directory === authority.directory, 'authority_mismatch')
     const agents = record(await ops.agent(selection.agent)), agent = record(agents.data)
     executionAssert(record(agents.location).directory === authority.directory && agent.id === selection.agent, 'selection_mismatch')
     executionAssert(JSON.stringify(model(agent.model)) === JSON.stringify(model(selection.model)), 'selection_mismatch')
-    const expected = [...selection.permissions, ...(authority.pin === '2.0.21' ? [{ action: 'browser', resource: '*', effect: 'deny' }] : [])]
+    const expected = [...selection.permissions, ...(authority.pin === '2.0.32' ? [{ action: 'browser', resource: '*', effect: 'deny' }] : [])]
     executionAssert(Array.isArray(agent.permissions) && agent.permissions.length >= expected.length && JSON.stringify((expected.length ? agent.permissions.slice(-expected.length) : []).map(value => {
       const rule = record(value); return { action: rule.action, resource: rule.resource, effect: rule.effect }
     })) === JSON.stringify(expected.map(rule => ({ action: rule.action, resource: rule.resource, effect: rule.effect }))), 'selection_mismatch')
