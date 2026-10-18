@@ -463,12 +463,12 @@ describe('OpenCodeV2 Windows probe owner adapter', () => {
         spyOn(runControl, 'discoverOpenCodeV2Run').mockImplementation(async () => ({ binding }) as never),
         spyOn(runControl, 'awaitOpenCodeV2RunMemberReadiness').mockImplementation(async () => {
           changedLeaf = changePrivateLeaf
-          return true
+          return true as never
         }),
         spyOn(runControl, 'requestOpenCodeV2Run').mockImplementation(async (_owner, request) => {
           if (request.operation === 'send') {
             sends++
-            expect(request.intent).toEqual(originalIntent)
+            expect(originalIntent).toEqual(request.intent)
             return { kind: 'send' } as never
           }
           if (request.operation === 'probeEvidence') return { kind: 'probeEvidence', proof: {
