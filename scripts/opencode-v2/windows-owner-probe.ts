@@ -1037,14 +1037,21 @@ finally{Set-TestDacl ([Convert]::FromBase64String($env:TEST_ORIGINAL_DESCRIPTOR)
         if (target === storePaths[3]) await assert.rejects(storeRoot.assertOwned(), privateMetadataDenied)
         else await assert.rejects(storeLeaf.writeMetadata('ProbeRecord', { generation: 'forbidden' }), privateMetadataDenied)
       })
-      await storeRoot.assertOwned(); await storeLeaf.assertOwned()
+      await storeRoot.assertOwned()
+      if (target === recordPath) {
+        // A rejected native record write permanently retires the adapter's
+        // authority, even after the fixture restores the original private ACL.
+        await assert.rejects(storeLeaf.assertOwned(),
+          (error: unknown) => error instanceof Error && error.message === 'execution_owner_unknown')
+      } else await storeLeaf.assertOwned()
       assert.deepEqual(await imageSnapshot(recordPath), recordBefore)
     }
     assert.deepEqual(storeLeaf.identity, storeIdentity)
     facts.probeStoreAncestorMetadata = { retainedPrivateStoreReadableAndWritable: true,
       ancestorPrivateAssertionStillRefused: true, ancestorReplacementDenied: true,
       storeRootLeafAndRecordForeignAllowRefused: true, guardIdentityStable: true,
-      freshStoreAdmissionDuringPendingStillRefused: true }
+      rejectedRecordWritePermanentlyPoisonsHandle: true,
+      freshManagedAncestorAdmissionWithMetadataStillRefused: true }
   } finally {
     const closed = await Promise.allSettled(storeHandles.reverse().map(handle => handle.close()))
     await storeBroker.close()
