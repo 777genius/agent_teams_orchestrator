@@ -4866,7 +4866,7 @@ public:
                                      std::move(config), root, database, configPath,
                                      profile.owner, expectedHash, teamId,
                                      owners.selectedPackage, std::move(configAncestors),
-                                     &cohortSids)));
+                                     &cohortSids));
     owners.ensureControllerAuthority(*memberConfig, teamId);
     // A remote controller has no local inbox, and its assertLive requires none.
     if (!memberConfig->remoteController) memberConfig->bindInbox(teamId, &cohortSids);
