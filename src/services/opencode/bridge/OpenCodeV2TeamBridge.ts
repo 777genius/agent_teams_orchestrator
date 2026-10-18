@@ -523,8 +523,15 @@ async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: O
     // publish a filesystem path. Missing inputs remain a hard readiness refusal.
     const missing = readinessStage && error !== null && typeof error === 'object'
       && 'code' in error && error.code === 'ENOENT'
-    return refusal(envelope, started, missing ? `readiness_file_missing:${readinessStage}`
-      : error instanceof Error ? error.message : 'V2 bridge operation unknown')
+    if (missing) return refusal(envelope, started, `readiness_file_missing:${readinessStage}`)
+    const message = error instanceof Error ? error.message : 'V2 bridge operation unknown'
+    // A native custody refusal inside readiness must keep its finite operation
+    // name: the shared stage string alone cannot identify the throwing request.
+    const operation = error !== null && typeof error === 'object' && 'nativeOperation' in error &&
+      typeof (error as { nativeOperation?: unknown }).nativeOperation === 'string'
+      ? (error as { nativeOperation: string }).nativeOperation : null
+    return refusal(envelope, started, operation && !message.includes('@native:')
+      ? `${message} @native:${operation}` : message)
   }
 }
 
