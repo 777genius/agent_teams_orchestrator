@@ -13,6 +13,7 @@ import * as launchPlans from './OpenCodeV2LaunchPlan.js'
 import * as privateDirectories from '../profile/OpenCodePrivateDirectories.js'
 import * as windowsBroker from '../host/windows/OpenCodeV2WindowsNativeBroker.js'
 import * as windowsFilesystem from '../host/windows/OpenCodeV2WindowsOwnerFilesystem.js'
+import * as projectIdentity from '../OpenCodeProjectIdentity.js'
 import { buildOpenCodeExecutionProof } from '../OpenCodeExecutionProof.js'
 import { executionHash } from '../execution/OpenCodeV2ExecutionContracts.js'
 import { attachOpenCodeV2SelectedKey } from '../host/OpenCodeV2ExecutionAuth.js'
@@ -75,11 +76,11 @@ afterEach(async () => {
   for (const [key, value] of Object.entries(saved)) if (value === undefined) delete process.env[key]; else process.env[key] = value
   await rm(root, { recursive: true, force: true })
 })
-async function proof(prepared: OpenCodePreparedProfile, capabilitySnapshotId: string) {
+async function proof(prepared: OpenCodePreparedProfile, capabilitySnapshotId: string, platform?: NodeJS.Platform) {
   const snapshot = { projectPath: project, profile: prepared, hostHealthy: true, host: { profile: prepared, version: pin,
     resolvedConfigFingerprint: prepared.managedConfigFingerprint } } as OpenCodeProvisioningSnapshot
   return buildOpenCodeExecutionProof({ selectedModel: 'provider/model', snapshot, capabilitySnapshotId }, {
-    resolveBinaryPath: () => native().executablePath, resolveBinaryIdentity: async () => 'TEST-native-identity', readCredential: async () => null })
+    resolveBinaryPath: () => native().executablePath, resolveBinaryIdentity: async () => 'TEST-native-identity', readCredential: async () => null, platform })
 }
 for (const version of ['2.0.0', '2.0.21'] as const) test(`${version} absent selected auth routes prepared profiles through native free-model readback while sealing paid keys`, async () => {
   pin = version
@@ -216,6 +217,58 @@ for (const version of ['2.0.0', '2.0.21'] as const) test(`${version} team launch
     .mockImplementation(async () => ({ projectBehaviorFingerprint: 'e'.repeat(64), behaviorSources: ['AGENTS.md'] }))
   restores.push(behaviorRead)
   await expect(createOpenCodeV2LaunchPlan(launch)).rejects.toThrow('run_launch_project_behavior_or_proof_changed')
+}, 30_000)
+
+for (const platform of ['win32', 'linux'] as const) test(`${platform} cached probe and launch compare the issuer's project identity without replay`, async () => {
+  const request = envelope(), selection = await inspectOpenCodeV2SourceAvailability(request)
+  const parent = path.join(root, 'profiles'); await mkdir(parent)
+  const team = await createOpenCodeV2PreparedMember(selection, native(), parent,
+    { teamId: 'TEST-team', runId: 'TEST-run', memberId: 'worker', unattendedTeam: true })
+  const issued = await proof(team.prepared, selection.capabilitySnapshotId, platform)
+  const normalize = projectIdentity.normalizeOpenCodeProjectIdentity
+  // Exercise the real platform identity policy while keeping fixture filesystem
+  // and native-adapter selection on the host platform.
+  restores.push(spyOn(projectIdentity, 'normalizeOpenCodeProjectIdentity')
+    .mockImplementation(value => normalize(value, platform)))
+  expect(issued.projectPath).toBe(normalize(project, platform))
+  if (platform === 'win32') expect(issued.projectPath).not.toBe(project)
+  const sourceKey = executionHash({ project, scopeToken: selection.scope.scopeToken,
+    selectedAuthIdentity: selection.scope.selectedAuthIdentity, source: selection.behaviorFingerprint,
+    graph: selection.installedGraphSHA256, projectBehavior: behavior, variant: 'default', unattendedTeam: true })
+  const directory = path.join(root, 'app-data/opencode/v2/execution-probes', sourceKey)
+  await mkdir(directory, { recursive: true, mode: 0o700 })
+  const file = path.join(directory, 'probe.json'), nonce = 'TEST-original-qualified'
+  const original = { sourceKey, binding: { teamId: 'TEST-probe', runId: nonce, controllerInstanceId: nonce, ownerId: nonce },
+    sessionID: 'ses_TEST', intent: { identity: { requestId: nonce, deliveryAttemptId: nonce, localMessageId: nonce, nativeInputID: 'msg_TEST' },
+      delivery: 'queue', input: { nativeInputID: 'msg_TEST', resume: true, text: 'Original qualified TEST input' } },
+    submitted: true, retired: true, proof: issued }
+  const saved = JSON.stringify(original)
+  await writeFile(file, saved, { mode: 0o600 })
+  const probe = await probes.resolveOpenCodeV2ExecutionProbe(request, selection, false, { unattendedTeam: true })
+  expect(probe).toEqual({ state: 'available', proof: issued, reason: null })
+  const preconditions = { handshakeIdentityHash: 'TEST-handshake', laneId: 'primary', expectedRunId: 'TEST-run',
+    expectedCapabilitySnapshotId: selection.capabilitySnapshotId,
+    expectedBehaviorFingerprint: issued.expectedBehaviorEvidence.expectedBehaviorFingerprint,
+    expectedManifestHighWatermark: null, commandLeaseId: 'TEST-lease', idempotencyKey: 'TEST-launch' }
+  const launch = { ...request, body: { ...request.body, executionProof: issued, preconditions } }
+  const plan = await createOpenCodeV2LaunchPlan(launch)
+  expect(plan.members[0]?.profile.directory).toBe(project)
+  expect(await readFile(file, 'utf8')).toBe(saved)
+  expect(await readdir(path.join(root, 'app-data/opencode/v2'))).not.toContain('runs')
+  for (const change of [
+    { projectPath: normalize(path.join(project, 'other'), platform) },
+    ...(platform === 'linux' ? [{ projectPath: project.toUpperCase() }] : []),
+    { modelId: 'provider/other' }, { capabilitySnapshotId: 'TEST-other-capability' },
+    { opencodeVersion: '2.0.99' }, { binaryPath: '/TEST/other/opencode' },
+    { projectBehaviorFingerprint: 'e'.repeat(64) },
+  ]) {
+    const changed = { ...issued, ...change }
+    const bytes = JSON.stringify({ ...original, proof: changed })
+    await writeFile(file, bytes, { mode: 0o600 })
+    await expect(probes.resolveOpenCodeV2ExecutionProbe(request, selection, false, { unattendedTeam: true }))
+      .rejects.toThrow('probe_cached_target_changed')
+    expect(await readFile(file, 'utf8')).toBe(bytes)
+  }
 }, 30_000)
 
 test('generic unresolved probes retain their original cache key while team policy has a separate key', async () => {

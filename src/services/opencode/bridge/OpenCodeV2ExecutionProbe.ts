@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, realpath, lstat, writeFile, rename } from 'node:fs/promises'
 import * as lockfile from '../../../utils/lockfile.js'
 import { parseOpenCodeExecutionProof } from '../OpenCodeExecutionProof.js'
+import { normalizeOpenCodeProjectIdentity } from '../OpenCodeProjectIdentity.js'
 import { resolveClaudeMultimodelPaths } from '../OpenCodeManagedPaths.js'
 import { ensureWindowsPrivateDirectories } from '../profile/OpenCodePrivateDirectories.js'
 import { collectProjectBehaviorMetadata } from '../OpenCodeProfileManager.js'
@@ -205,7 +206,7 @@ export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, 
       assertDeadline()
       if (record) executionAssert(record.sourceKey === sourceKey, 'probe_source_changed')
     } catch (error) { if (executionRecord(error).code !== 'ENOENT') throw error }
-    if (record?.proof) executionAssert(record.proof.projectPath === selection.project && record.proof.modelId === `${selection.model.providerID}/${selection.model.id}` &&
+    if (record?.proof) executionAssert(record.proof.projectPath === normalizeOpenCodeProjectIdentity(selection.project) && record.proof.modelId === `${selection.model.providerID}/${selection.model.id}` &&
       record.proof.capabilitySnapshotId === selection.capabilitySnapshotId && record.proof.opencodeVersion === selection.native.version &&
       record.proof.binaryPath === selection.native.executablePath && record.proof.projectBehaviorFingerprint === behavior.projectBehaviorFingerprint, 'probe_cached_target_changed')
     if (record?.proof && record.retired && Date.parse(record.proof.expiresAt) > Date.now())

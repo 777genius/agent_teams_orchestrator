@@ -14,6 +14,7 @@ import { executionAssert, executionHash, executionRecord } from '../execution/Op
 import { hashOpenCodeFile, inspectOpenCodeReadSelection } from '../compatibility/OpenCodeNativeIdentity.js'
 import { resolveClaudeMultimodelPaths } from '../OpenCodeManagedPaths.js'
 import { collectProjectBehaviorMetadata, canonicalizeOpenCodeProjectPath, materializeOpenCodeSelectedScopeAuth, resolveOpenCodeProfileScope, readOpenCodeSelectedScopeMetadata } from '../OpenCodeProfileManager.js'
+import { normalizeOpenCodeProjectIdentity } from '../OpenCodeProjectIdentity.js'
 import { resolveOpenCodeAppMcpLaunchConfig } from '../OpenCodeMcpManager.js'
 import { createOpenCodeV2ExecutionConfig } from '../profile/OpenCodeV2ExecutionConfig.js'
 import { createOpenCodeV2ExecutionReceipt } from '../profile/OpenCodeV2ExecutionReceipt.js'
@@ -144,7 +145,7 @@ export async function createOpenCodeV2LaunchPlan(envelope: BridgeEnvelope): Prom
   const { native, availability } = await prepareSelectedOpenCodeV2SourceAvailability(selection)
   const verified = await resolveOpenCodeV2ExecutionProbe(envelope, availability, false, { unattendedTeam: true })
   const supplied = parseOpenCodeExecutionProof(body.executionProof)
-  executionAssert(verified.proof && verified.proof.projectPath === selection.project &&
+  executionAssert(verified.proof && verified.proof.projectPath === normalizeOpenCodeProjectIdentity(selection.project) &&
     verified.proof.modelId === `${selection.model.providerID}/${selection.model.id}` &&
     verified.proof.capabilitySnapshotId === selection.capabilitySnapshotId && verified.proof.opencodeVersion === selection.native.version &&
     verified.proof.binaryPath === selection.native.executablePath && supplied && executionHash(supplied) === executionHash(verified.proof) &&
