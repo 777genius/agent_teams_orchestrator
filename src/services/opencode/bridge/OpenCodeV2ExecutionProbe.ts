@@ -53,6 +53,7 @@ async function openWindowsProbeStore(dataRoot: string, sourceKey: string, deadli
   const chain = [...new Set([intermediateParent, dataRoot, path.join(dataRoot, 'opencode'),
     path.join(dataRoot, 'opencode/v2'), path.join(dataRoot, 'opencode/v2/execution-probes'), directory])]
   const held: WindowsOwnerDirectory[] = []
+  const storeRoots: WindowsOwnerDirectory[] = []
   try {
     for (const candidate of chain) {
       const stat = await lstat(candidate).catch(error => {
@@ -68,10 +69,15 @@ async function openWindowsProbeStore(dataRoot: string, sourceKey: string, deadli
       // Missing paths still create exclusively; uncertain results never adopt.
       held.push(await filesystem.prepareDirectory(candidate, !stat, deadline))
       await held.at(-1)!.assertOwned(deadline)
+      if (candidate === path.dirname(directory) || candidate === directory) storeRoots.push(held.at(-1)!)
     }
     const guard = path.join(directory, 'owner.lock'), file = path.join(directory, 'probe.json')
     const assertDirectories = async (deadline?: number) => {
-      for (const root of held) await root.assertOwned(deadline)
+      // Launch adds metadata-only member grants to shared data ancestors. Their
+      // initial private qualification and retained handles remain in force;
+      // native held() rechecks the complete physical ancestry on each store
+      // assertion. The probe root and source leaf still require private ACLs.
+      for (const root of storeRoots) await root.assertOwned(deadline)
       if (deadline !== undefined) executionAssert(Date.now() < deadline, 'execution_timeout')
     }
     return Object.freeze({

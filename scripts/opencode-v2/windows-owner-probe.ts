@@ -838,7 +838,7 @@ if(![TestFixtureSecurity]::SetFileSecurity($env:TEST_TARGET,4,$descriptor)){thro
     /^[a-z_]{1,96}(?::[a-z_]{1,64}:\d{1,10})?$/.test(error.message) ? error.message
     : error instanceof assert.AssertionError ? 'assertion_failed' : 'fixture_operation_failed'
   const withMetadataAce = async (target: string, sid: string, rights: string, inheritance: string,
-    verify: () => Promise<void>) => {
+    verify: () => Promise<void>, expectedRule?: { mask: number; flags: number }) => {
     // Capture/install together, then observe/restore together: two PowerShell
     // startups per fixture, without changing the published endpoint deadline.
     const fixture = executionRecord(JSON.parse(await powershell('metadata_acl_install', fixtureSecurity + `
@@ -846,12 +846,15 @@ $acl=Get-Acl -LiteralPath $env:TEST_TARGET
 $original=$acl.Sddl;$descriptor=$acl.GetSecurityDescriptorBinaryForm()
 $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new($env:TEST_SID),$env:TEST_RIGHTS,$env:TEST_INHERITANCE,'None','Allow'))
 Set-TestDacl ($acl.GetSecurityDescriptorBinaryForm())
-[Console]::Write((@{original=$original;descriptor=[Convert]::ToBase64String($descriptor);installed=(Get-Acl -LiteralPath $env:TEST_TARGET).Sddl}|ConvertTo-Json -Compress))`, target,
+$installed=[Security.AccessControl.RawSecurityDescriptor]::new([TestFixtureSecurity]::ReadSecurityDescriptor($env:TEST_TARGET),0)
+$rules=@($installed.DiscretionaryAcl|Where-Object{$_.SecurityIdentifier.Value-eq $env:TEST_SID}|ForEach-Object{@{mask=[long]$_.AccessMask;flags=[int]$_.AceFlags}})
+[Console]::Write((@{original=$original;descriptor=[Convert]::ToBase64String($descriptor);installed=(Get-Acl -LiteralPath $env:TEST_TARGET).Sddl;rules=$rules}|ConvertTo-Json -Depth 5 -Compress))`, target,
       { TEST_SID: sid, TEST_RIGHTS: rights, TEST_INHERITANCE: inheritance })))
     assert.equal(typeof fixture.original, 'string'); assert.equal(typeof fixture.descriptor, 'string')
     assert.equal(typeof fixture.installed, 'string')
     let verificationFailure: unknown
     try {
+      if (expectedRule) assert.deepEqual(fixture.rules, [expectedRule])
       await verify()
     } catch (error) {
       verificationFailure = error
@@ -983,6 +986,71 @@ finally{Set-TestDacl ([Convert]::FromBase64String($env:TEST_ORIGINAL_DESCRIPTOR)
   await request('runStateClose', { stateId, directory })
   facts.discoveryPresent = { unpublishedVeto: true, malformedFenceVeto: true, foreignBindingVeto: true,
     originalOwnerRecoveredAfterUnsupportedOrMissingCLI: true, originalEndpointMatched: true }
+  // The readiness store retains a separate broker before launch. Its common
+  // namespace becomes metadata ancestry; its producer root and source leaf
+  // remain private. Exercise the actual native handles/writer across that ACL
+  // transition, without adding a cohort exception to ownerAssertDirectory.
+  const storeBroker = createWindowsNativeBroker(helper)
+  storeBroker.events.on('error', () => {})
+  const storeFilesystem = createWindowsOwnerFilesystem(input => storeBroker.request(input.op, input))
+  const storeHandles: WindowsOwnerDirectory[] = []
+  const storeDataRoot = path.win32.join(requestedRoot, 'TEST-probe-store-ancestry')
+  const storePaths = [storeDataRoot, path.win32.join(storeDataRoot, 'opencode'),
+    path.win32.join(storeDataRoot, 'opencode', 'v2'),
+    path.win32.join(storeDataRoot, 'opencode', 'v2', 'execution-probes')]
+  const storeLeafPath = path.win32.join(storePaths[3]!, 'c'.repeat(64))
+  try {
+    for (const target of [...storePaths, storeLeafPath])
+      storeHandles.push(await storeFilesystem.prepareDirectory(target, true))
+    const storeRoot = storeHandles[3]!, storeLeaf = storeHandles[4]!
+    const storeIdentity = storeLeaf.identity
+    await storeLeaf.writeMetadata('ProbeGuard', null)
+    const guard = await storeLeaf.readMetadata('ProbeGuard')
+    let generation = 0
+    await storeLeaf.writeMetadata('ProbeRecord', { generation })
+    for (let index = 0; index < 3; index++) {
+      const ancestor = storeHandles[index]!, target = storePaths[index]!
+      const before = await lstat(target)
+      await withMetadataAce(target, String(metadataSids.member), 'ReadAndExecute', 'None', async () => {
+        // The old readiness loop reasserted these exact ancestor capabilities
+        // as private producer roots and failed here after a normal launch.
+        await assert.rejects(ancestor.assertOwned(), privateMetadataDenied)
+        await storeRoot.assertOwned(); await storeLeaf.assertOwned()
+        await storeLeaf.writeMetadata('ProbeRecord', { generation: ++generation })
+        assert.deepEqual((await storeLeaf.readMetadata('ProbeRecord')).value, { generation })
+        assert.deepEqual((await storeLeaf.readMetadata('ProbeGuard')).fileIdentity, guard.fileIdentity)
+        await assert.rejects(rename(target, target + '.TEST-forbidden-replacement'),
+          (error: unknown) => !!error && typeof error === 'object' && 'code' in error &&
+            ['EACCES', 'EPERM', 'EBUSY'].includes(String(error.code)))
+        const after = await lstat(target)
+        assert.equal(after.dev, before.dev); assert.equal(after.ino, before.ino)
+        // Existing-only admission is still strict. A new store while the run
+        // is pending needs its own lifecycle solution, never foreign-SID trust.
+        await assert.rejects(storeFilesystem.prepareDirectory(target, false), privateMetadataDenied)
+      }, { mask: 0x1200a9, flags: 0 })
+      await ancestor.assertOwned()
+    }
+    const recordPath = path.win32.join(storeLeafPath, 'probe.json')
+    const recordBefore = await imageSnapshot(recordPath)
+    for (const target of [storePaths[3]!, storeLeafPath, recordPath]) {
+      await withMetadataAce(target, String(metadataSids.member), 'ReadAndExecute', 'None', async () => {
+        if (target === storePaths[3]) await assert.rejects(storeRoot.assertOwned(), privateMetadataDenied)
+        else await assert.rejects(storeLeaf.writeMetadata('ProbeRecord', { generation: 'forbidden' }), privateMetadataDenied)
+      })
+      await storeRoot.assertOwned(); await storeLeaf.assertOwned()
+      assert.deepEqual(await imageSnapshot(recordPath), recordBefore)
+    }
+    assert.deepEqual(storeLeaf.identity, storeIdentity)
+    facts.probeStoreAncestorMetadata = { retainedPrivateStoreReadableAndWritable: true,
+      ancestorPrivateAssertionStillRefused: true, ancestorReplacementDenied: true,
+      storeRootLeafAndRecordForeignAllowRefused: true, guardIdentityStable: true,
+      freshStoreAdmissionDuringPendingStillRefused: true }
+  } finally {
+    const closed = await Promise.allSettled(storeHandles.reverse().map(handle => handle.close()))
+    await storeBroker.close()
+    assert.equal(closed.every(result => result.status === 'fulfilled'), true)
+    assert.equal(storeBroker.ended(), true)
+  }
   const reparseInventoryRoot = path.win32.join(requestedRoot, 'TEST-reparse-profile-inventory')
   for (const directory of [reparseInventoryRoot, path.win32.join(reparseInventoryRoot, 'opencode'),
     path.win32.join(reparseInventoryRoot, 'opencode', 'v2'),

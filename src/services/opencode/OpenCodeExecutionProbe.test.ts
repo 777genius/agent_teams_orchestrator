@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { EventEmitter } from 'node:events'
 import os from 'node:os'
 import path from 'node:path'
@@ -30,6 +30,7 @@ import * as launchPlan from './bridge/OpenCodeV2LaunchPlan.js'
 import * as runOwner from './bridge/OpenCodeV2RunOwner.js'
 import * as runControl from './bridge/OpenCodeV2RunControl.js'
 import * as windowsBroker from './host/windows/OpenCodeV2WindowsNativeBroker.js'
+import * as windowsOwnerFilesystem from './host/windows/OpenCodeV2WindowsOwnerFilesystem.js'
 import { resolveOpenCodeV2ExecutionProbe } from './bridge/OpenCodeV2ExecutionProbe.js'
 
 import type {
@@ -381,6 +382,131 @@ describe('OpenCodeV2 Windows probe owner adapter', () => {
         if (value === undefined) delete process.env[key]
         else process.env[key] = value
       }
+      await rm(temp, { recursive: true, force: true })
+    }
+  })
+
+  test.each([false, true])('Windows probe retains ancestor pins across launch grants and checks private leaf before send (changed=%s)', async (changePrivateLeaf) => {
+    const temp = await mkdtemp(path.join(os.tmpdir(), 'TEST-v2-probe-live-ancestors-'))
+    const dataRoot = path.join(temp, 'runtime-data')
+    const probesRoot = path.join(dataRoot, 'opencode', 'v2', 'execution-probes')
+    const originalPlatform = process.platform
+    const originalDataHome = process.env.CLAUDE_MULTIMODEL_DATA_HOME
+    const held = new Set<string>(), openedAncestorsAfterLaunch: string[] = []
+    let liveGrants = false, changedLeaf = false, launches = 0, sends = 0, writes = 0, launchWrites = 0
+    let originalIntent: unknown
+    let original: unknown, recordFile = ''
+    const storePath = (root: string) => root === probesRoot || path.dirname(root) === probesRoot
+    const filesystem = {
+      async prepareDirectory(root: string, create: boolean) {
+        if (liveGrants && !storePath(root)) {
+          openedAncestorsAfterLaunch.push(root)
+          throw new Error('execution_owner_not_private:private_acl_foreign_allow:0')
+        }
+        if (create) await mkdir(root)
+        else await stat(root)
+        held.add(root)
+        const assertOwned = async () => {
+          if (changedLeaf && path.dirname(root) === probesRoot) throw new Error('execution_owner_unknown')
+          if (liveGrants && !storePath(root)) throw new Error('execution_owner_not_private:private_acl_foreign_allow:0')
+        }
+        const metadataPath = (purpose: string) => path.join(root, purpose === 'ProbeGuard' ? 'owner.lock' : 'probe.json')
+        return {
+          assertOwned,
+          async writeMetadata(purpose: string, value: unknown) {
+            await assertOwned()
+            writes++
+            await writeFile(metadataPath(purpose), purpose === 'ProbeGuard' ? '' : JSON.stringify(value))
+          },
+          async readMetadata(purpose: string) {
+            await assertOwned()
+            const file = metadataPath(purpose)
+            try {
+              const bytes = await readFile(file)
+              return { path: file, bytes: bytes.length, fileIdentity: identityA,
+                ...(purpose === 'ProbeRecord' ? { value: JSON.parse(bytes.toString()) } : {}) }
+            } catch (error) {
+              if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+              return { absent: true }
+            }
+          },
+          async close() { held.delete(root) },
+        }
+      },
+    }
+    const selection = { project: path.join(temp, 'project'), scope: { scopeToken: 'TEST-live', selectedAuthIdentity: 'absent' },
+      behaviorFingerprint: 'b'.repeat(64), installedGraphSHA256: 'c'.repeat(64), capabilitySnapshotId: 'TEST-capability',
+      model: { providerID: 'provider', id: 'model' }, native: { version: '2.0.21', executablePath: '/TEST/opencode' },
+      controller: { type: 'remote' } } as Parameters<typeof resolveOpenCodeV2ExecutionProbe>[1]
+    const binding = { teamId: 'TEST-probe', runId: 'TEST-run', controllerInstanceId: 'TEST-controller', ownerId: 'TEST-owner' }
+    const restores: Array<{ mockRestore(): void }> = []
+    try {
+      Object.defineProperty(process, 'platform', { value: 'win32', configurable: true })
+      process.env.CLAUDE_MULTIMODEL_DATA_HOME = dataRoot
+      restores.push(
+        spyOn(profileManager, 'collectProjectBehaviorMetadata').mockImplementation(async () =>
+          ({ projectBehaviorFingerprint: 'b'.repeat(64), behaviorSources: [] })),
+        spyOn(windowsOwnerFilesystem, 'createWindowsOwnerFilesystem').mockImplementation(() => filesystem as never),
+        spyOn(windowsBroker, 'resolveWindowsNativeArtifact').mockImplementation(async () => ({}) as never),
+        spyOn(windowsBroker, 'createWindowsNativeBroker').mockImplementation(() =>
+          ({ events: new EventEmitter(), close: async () => undefined }) as never),
+        spyOn(launchPlan, 'buildOpenCodeV2InternalRunPlan').mockImplementation(async () =>
+          ({ binding, members: [{ originalSessionId: 'ses_TEST' }] }) as never),
+        spyOn(runOwner, 'launchExplicitOpenCodeV2Run').mockImplementation(async () => {
+          const [sourceKey] = await readdir(probesRoot)
+          recordFile = path.join(probesRoot, sourceKey!, 'probe.json')
+          const record = JSON.parse(await readFile(recordFile, 'utf8'))
+          original = record; originalIntent = record.intent; launchWrites = writes
+          launches++; liveGrants = true
+          return undefined as never
+        }),
+        spyOn(runControl, 'discoverOpenCodeV2Run').mockImplementation(async () => ({ binding }) as never),
+        spyOn(runControl, 'awaitOpenCodeV2RunMemberReadiness').mockImplementation(async () => {
+          changedLeaf = changePrivateLeaf
+          return true
+        }),
+        spyOn(runControl, 'requestOpenCodeV2Run').mockImplementation(async (_owner, request) => {
+          if (request.operation === 'send') {
+            sends++
+            expect(request.intent).toEqual(originalIntent)
+            return { kind: 'send' } as never
+          }
+          if (request.operation === 'probeEvidence') return { kind: 'probeEvidence', proof: {
+            projectPath: selection.project, modelId: 'provider/model', capabilitySnapshotId: 'TEST-capability',
+            opencodeVersion: '2.0.21', binaryPath: '/TEST/opencode', projectBehaviorFingerprint: 'b'.repeat(64),
+            expiresAt: new Date(Date.now() + 60_000).toISOString(),
+          }, failure: null } as never
+          if (request.operation === 'stop') { liveGrants = false; return { kind: 'stop', state: 'stopped',
+            ownerRetired: true, members: [{ memberId: 'probe', cleanup: {}, errors: [] }] } as never }
+          throw new Error('TEST-unexpected-run-operation')
+        }),
+      )
+      const envelope = { timeoutMs: 26_000, body: { effort: 'default' } } as never
+      if (changePrivateLeaf) {
+        await expect(resolveOpenCodeV2ExecutionProbe(envelope, selection, true)).rejects.toThrow('execution_owner_unknown')
+        expect(writes).toBe(launchWrites)
+        expect(JSON.parse(await readFile(recordFile, 'utf8'))).toEqual(original)
+        expect(sends).toBe(0)
+      } else {
+        expect((await resolveOpenCodeV2ExecutionProbe(envelope, selection, true)).state).toBe('available')
+        expect(sends).toBe(1)
+      }
+      expect(launches).toBe(1)
+      expect(openedAncestorsAfterLaunch).toEqual([])
+      expect(held.size).toBe(0)
+      // A new broker cannot adopt managed ancestors while private qualification
+      // refuses their grants. This pre-existing fail-closed boundary is retained.
+      liveGrants = true
+      const beforeReopenWrites = writes
+      await expect(resolveOpenCodeV2ExecutionProbe(envelope, selection, true))
+        .rejects.toThrow('execution_owner_not_private:private_acl_foreign_allow:0')
+      expect(writes).toBe(beforeReopenWrites)
+      expect(launches).toBe(1)
+    } finally {
+      for (const restore of restores) restore.mockRestore()
+      Object.defineProperty(process, 'platform', { value: originalPlatform, configurable: true })
+      if (originalDataHome === undefined) delete process.env.CLAUDE_MULTIMODEL_DATA_HOME
+      else process.env.CLAUDE_MULTIMODEL_DATA_HOME = originalDataHome
       await rm(temp, { recursive: true, force: true })
     }
   })
