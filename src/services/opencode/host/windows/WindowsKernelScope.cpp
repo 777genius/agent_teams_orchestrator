@@ -1228,7 +1228,8 @@ class SelectedControllerConfig {
                            std::wstring selectedPath,
                            std::wstring selectedOwner, std::wstring selectedHash,
                            std::wstring selectedTeamId, PSID selectedPackage,
-                           std::vector<Handle> heldConfigAncestors)
+                           std::vector<Handle> heldConfigAncestors,
+                           const std::vector<std::wstring> *selectedCohortSids = nullptr)
       : root(std::move(heldRoot)), database(std::move(heldDatabase)),
         config(std::move(heldConfig)), configAncestors(std::move(heldConfigAncestors)),
         rootPath(std::move(selectedRootPath)),
@@ -1236,8 +1237,11 @@ class SelectedControllerConfig {
         owner(std::move(selectedOwner)), sha256(std::move(selectedHash)),
         selectionTeamId(std::move(selectedTeamId)), package(selectedPackage) {
     require(root && config && !databasePath.empty(), "run_control_selection_changed");
-    identity = fileIdentity(config.value, owner, false, package);
-    if (database) databaseIdentity = fileIdentity(database.value, owner, false, package);
+    // Member launch grants the sealed cohort allow-ACEs on these same held
+    // files, so this recheck must join its callers' cohort.
+    identity = fileIdentity(config.value, owner, false, package, selectedCohortSids);
+    if (database)
+      databaseIdentity = fileIdentity(database.value, owner, false, package, selectedCohortSids);
     for (const auto &ancestor : configAncestors)
       configAncestorIdentities.push_back(anchorIdentity(ancestor.value));
     loadConfig();
@@ -2138,7 +2142,7 @@ public:
         new SelectedControllerConfig(Handle(rootDuplicate), Handle(databaseDuplicate),
                                      std::move(config), root, database, configPath,
                                      selected.owner, expectedHash, teamId, selectedPackage,
-                                     std::move(checkedParents))));
+                                     std::move(checkedParents), cohortSidsPtr)));
     JsonObject result;
     num(result, L"schema", 1);
     flag(result, L"ok", true);
@@ -4861,7 +4865,8 @@ public:
         new SelectedControllerConfig(Handle(rootDuplicate), Handle(databaseDuplicate),
                                      std::move(config), root, database, configPath,
                                      profile.owner, expectedHash, teamId,
-                                     owners.selectedPackage, std::move(configAncestors)));
+                                     owners.selectedPackage, std::move(configAncestors),
+                                     &cohortSids)));
     owners.ensureControllerAuthority(*memberConfig, teamId);
     // A remote controller has no local inbox, and its assertLive requires none.
     if (!memberConfig->remoteController) memberConfig->bindInbox(teamId, &cohortSids);

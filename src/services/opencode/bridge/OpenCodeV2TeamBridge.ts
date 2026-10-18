@@ -581,7 +581,13 @@ export async function executeSelectedOpenCodeBridgeCommandEnvelope(input: unknow
       if ((envelope.command === 'opencode.readiness' || envelope.command === 'opencode.handshake')
         && error !== null && typeof error === 'object' && 'code' in error && error.code === 'ENOENT')
         return refusal(envelope, Date.now(), 'readiness_file_missing:owner_discovery')
-      return refusal(envelope, Date.now(), error instanceof Error ? error.message : 'run_owner_unknown')
+      // A native custody refusal must keep its finite operation name: the
+      // shared stage string cannot identify the throwing native request.
+      const message = error instanceof Error ? error.message : 'run_owner_unknown'
+      const operation = error !== null && typeof error === 'object' && 'nativeOperation' in error &&
+        typeof (error as { nativeOperation?: unknown }).nativeOperation === 'string'
+        ? (error as { nativeOperation: string }).nativeOperation : null
+      return refusal(envelope, Date.now(), operation ? `${message} @native:${operation}` : message)
     }
   }
   // This command touches only the legacy registry and never creates a host.
