@@ -3,7 +3,7 @@ import { pathToFileURL } from 'node:url'
 import path from 'node:path'
 import { realpath } from 'node:fs/promises'
 import { verifyOpenCodePackage, verifyOpenCodeV2GraphEffect, verifyOpenCodeV2ServerGraph } from '../../src/services/opencode/host/OpenCodeV2ServerGraph.js'
-import { readShellProbeResult, shellProbeConfig, shellProbeFailure, type ShellProbeResult } from './windows-shell-tool-contract.js'
+import { readShellProbeResult, createShellProbeConfig, shellProbeFailure, type ShellProbeResult } from './windows-shell-tool-contract.js'
 
 test('the exact no-model document decodes with the verified selected config schema', async () => {
   const graph = await verifyOpenCodeV2ServerGraph('2.0.32')
@@ -12,9 +12,16 @@ test('the exact no-model document decodes with the verified selected config sche
   await verifyOpenCodeV2GraphEffect(entry, graph.effectPath, '2.0.32')
   const { Schema }: typeof import('effect') = await import(pathToFileURL(graph.effectPath).href)
   const { Config }: typeof import('@opencode/schema/config') = await import(pathToFileURL(entry).href)
-  const decoded = Schema.decodeUnknownSync(Config.Info)(shellProbeConfig)
+  const controllerRoot = 'C:\\TEST\\TEST-claude', bun = 'C:\\TEST\\bun.exe'
+  const config = createShellProbeConfig(controllerRoot, bun)
+  const decoded = Schema.decodeUnknownSync(Config.Info)(config)
   expect(decoded.default_agent).toBe('TEST-shell-agent')
-  expect(decoded.agents?.['TEST-shell-agent']?.permissions).toEqual(shellProbeConfig.agents['TEST-shell-agent'].permissions)
+  expect(decoded.agents?.['TEST-shell-agent']?.permissions).toEqual(config.agents['TEST-shell-agent'].permissions)
+  const controller = decoded.mcp?.servers?.['agent-teams']
+  expect(controller?.type).toBe('local'); expect(controller?.disabled).toBe(true)
+  if (controller?.type !== 'local') throw new Error('TEST_expected_local_controller')
+  expect(controller.environment?.AGENT_TEAMS_MCP_CLAUDE_DIR).toBe(controllerRoot)
+  expect(controller.command).toEqual([bun, '--version'])
 })
 
 test('selected stable Effect failure retains only the adapter method through tool/process wrappers', async () => {

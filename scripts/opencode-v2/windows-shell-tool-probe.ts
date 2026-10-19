@@ -15,7 +15,7 @@ import { validateExecutionProfile, type SelectedExecutionProfile } from '../../s
 import { verifyOpenCodeV2ServerGraph } from '../../src/services/opencode/host/OpenCodeV2ServerGraph.js'
 import { planWindowsExecution, ownerFilesystemForWindowsPlan, bindWindowsExecutionSelectedConfig,
   launchWindowsExecution, closeWindowsExecutionPlan } from '../../src/services/opencode/host/windows/OpenCodeV2WindowsExecution.js'
-import { readShellProbeResult, shellProbeConfig, shellProbePermissions } from './windows-shell-tool-contract.js'
+import { readShellProbeResult, createShellProbeConfig, shellProbePermissions } from './windows-shell-tool-contract.js'
 
 // Actual registered ShellTool checkpoint, with no LLM or production launch
 // qualification claim. Run only in the disposable native-source SDK checkout.
@@ -39,11 +39,12 @@ const childEntry = await realpath(path.join(import.meta.dir, 'windows-shell-tool
 const entrySha256 = await digest(childEntry), bun = { path: await realpath(process.execPath), sha256: await digest(process.execPath) }
 const nonce = randomUUID(), leaseOwnerId = randomUUID(), deadline = Date.now() + 180_000
 const project = path.join(root, 'TEST-project'), profileRoot = path.join(root, 'opencode', 'v2', 'profiles', 'TEST-shell')
+const controllerRoot = path.join(root, 'TEST-claude')
 const configDirectory = path.join(profileRoot, 'config', 'opencode'), dataDirectory = path.join(profileRoot, 'data', 'opencode')
 const databasePath = path.join(dataDirectory, 'opencode.db')
-const directories = [root, project, profileRoot, ...['home', 'config', 'data', 'cache', 'state', 'tmp', 'appdata', 'localappdata']
+const directories = [root, project, controllerRoot, profileRoot, ...['home', 'config', 'data', 'cache', 'state', 'tmp', 'appdata', 'localappdata']
   .map(name => path.join(profileRoot, name))]
-const configContent = JSON.stringify(shellProbeConfig)
+const configContent = JSON.stringify(createShellProbeConfig(controllerRoot, bun.path))
 const setup = createWindowsNativeBroker(await resolveWindowsNativeArtifact())
 setup.events.on('error', () => {})
 const setupFilesystem = createWindowsOwnerFilesystem((input, until, signal) => setup.request(input.op, input, until, signal))
@@ -133,6 +134,7 @@ try {
   const filesystem = ownerFilesystemForWindowsPlan(plan)
   await filesystem.validateSelectedProfile(profileRoot, databasePath, deadline, undefined, project)
   owner = await acquireExecutionProfileOwner(profile, { hostInstanceId: nonce, leaseOwnerId, graphSha256: graph.moduleSha256 }, { windowsPlan: plan })
+  stage = 'config-select'
   await bindWindowsExecutionSelectedConfig(plan, profile, 'TEST-shell-tool', deadline)
   stage = 'launch'
   await owner.beforeSpawn(); spawned = true

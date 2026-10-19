@@ -5,7 +5,7 @@ export const shellProbePermissions = [{ action: '*', resource: '*', effect: 'den
   { action: 'shell', resource: '*', effect: 'allow' }] as const
 // Actual selected Config.Info decodes this document in the portable contract
 // test, before any Windows runtime is launched. No provider request is made.
-export const shellProbeConfig = {
+const shellProbeConfig = {
   update: 'disable', share: 'disabled', snapshots: false, warming: false, plugins: [],
   model: 'TEST-provider/TEST-model', default_agent: 'TEST-shell-agent',
   providers: { 'TEST-provider': { name: 'TEST no-model provider', env: [], package: 'aisdk:@ai-sdk/openai-compatible',
@@ -14,6 +14,13 @@ export const shellProbeConfig = {
         limit: { context: 8192, output: 512 } } } } },
   agents: { 'TEST-shell-agent': { mode: 'primary', model: 'TEST-provider/TEST-model', permissions: [...shellProbePermissions] } },
 } satisfies Extract<ConfigEntry, { type: 'document' }>['info']
+
+export function createShellProbeConfig(controllerRoot: string, bun: string) {
+  return { ...shellProbeConfig, mcp: { servers: { 'agent-teams': {
+    type: 'local', command: [bun, '--version'], disabled: true,
+    environment: { AGENT_TEAMS_MCP_CLAUDE_DIR: controllerRoot },
+  } } } } satisfies Extract<ConfigEntry, { type: 'document' }>['info']
+}
 
 // TEST-only observations. Neither strings nor Error objects cross the child
 // pipe; the parent receives only these source-owned finite values.
