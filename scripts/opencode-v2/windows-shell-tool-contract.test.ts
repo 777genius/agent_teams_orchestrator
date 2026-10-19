@@ -1,7 +1,8 @@
 import { expect, test } from 'bun:test'
 import { pathToFileURL } from 'node:url'
 import path from 'node:path'
-import { realpath } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { mkdtemp, mkdir, realpath, rm } from 'node:fs/promises'
 import { verifyOpenCodePackage, verifyOpenCodeV2GraphEffect, verifyOpenCodeV2ServerGraph } from '../../src/services/opencode/host/OpenCodeV2ServerGraph.js'
 import { readShellProbeResult, createShellProbeConfig, shellProbeFailure, shellProbeSetupFailure, type ShellProbeResult } from './windows-shell-tool-contract.js'
 
@@ -121,3 +122,62 @@ test('instance defects keep one selected Cause leaf and the existing closed file
     .toEqual({ kind: 'Die', method: null })
   expect(reads).toBe(0)
 })
+
+
+test('registered TEST agent and shell snapshot follow actual plugin activation without executing a tool', async () => {
+  const root = await mkdtemp(path.join(process.env.TMPDIR ?? tmpdir(), 'TEST-shell-activation-'))
+  const paths = Object.fromEntries(['home', 'data', 'cache', 'config', 'state', 'tmp', 'bin', 'log', 'repos'].map(key => [key, path.join(root, key)]))
+  const project = path.join(root, 'TEST-project'), controller = path.join(root, 'TEST-claude')
+  await Promise.all([project, controller, ...Object.values(paths)].map(directory => mkdir(directory, { mode: 0o700 })))
+  const config = createShellProbeConfig(controller, process.execPath)
+  const script = `
+    let commands=0,network=0;globalThis.fetch=()=>{network=Math.min(4096,network+1);return Promise.reject(new Error('TEST-network-refused'))};
+    const path=require('node:path'),{pathToFileURL}=require('node:url');
+    const {verifyOpenCodeV2ServerGraph,verifyOpenCodePackage,verifyOpenCodeV2GraphEffect}=await import('./src/services/opencode/host/OpenCodeV2ServerGraph.ts');
+    const graph=await verifyOpenCodeV2ServerGraph('2.0.32'),base=path.dirname(graph.modulePath);
+    const selected=async(specifier,name)=>{const entry=await require('node:fs').promises.realpath(Bun.resolveSync(specifier,base));await verifyOpenCodePackage(entry,name,name==='effect'||name.startsWith('@effect/')?'4.0.1':'2.0.32');await verifyOpenCodeV2GraphEffect(entry,graph.effectPath,'2.0.32');return import(pathToFileURL(entry).href)};
+    const {Effect,Layer,Scope,Exit,Context,Schema}=await import(pathToFileURL(graph.effectPath).href);
+    const [routes,global,cross,spawn,http,sessions,instances,agents,plugins,tools,permissions,schema]=await Promise.all([
+      ['@opencode/server/routes','@opencode/server'],['@opencode/util/global','@opencode/util'],['@opencode/util/cross-spawn-spawner','@opencode/util'],
+      ['effect/process/ChildProcessSpawner','effect'],['@effect/platform-node/NodeHttpServer','@effect/platform-node'],['@opencode/core/session','@opencode/core'],
+      ['@opencode/core/instance/service','@opencode/core'],['@opencode/core/agent','@opencode/core'],['@opencode/core/plugin/service','@opencode/core'],
+      ['@opencode/core/tool','@opencode/core'],['@opencode/core/permission','@opencode/core'],['@opencode/schema/schema','@opencode/schema']
+    ].map(([specifier,name])=>selected(specifier,name)));
+    const spawner=spawn.make(()=>{commands++;return Effect.die(new Error('TEST-command-refused'))});
+    const scope=await Effect.runPromise(Scope.make());let result;
+    try{result=await Effect.runPromise(Effect.gen(function*(){
+      const services=yield* Layer.build(routes.createRoutes({password:'x'.repeat(43),app:{name:'TEST-shell-activation',version:'2.0.32'},
+        database:{path:${JSON.stringify(path.join(paths.data!, 'opencode.db'))}},events:{persist:true},
+        config:{directory:${JSON.stringify(paths.config)},project:true,content:${JSON.stringify(JSON.stringify(config))}},
+        models:{fetch:false,snapshot:true},fs:{filewatcher:false,fff:false}},()=>[],[
+          cross.node.replace(Layer.succeed(spawn.ChildProcessSpawner,spawner)),global.node.replace(global.layerWith(${JSON.stringify(paths)}))
+        ]).pipe(Layer.provideMerge(http.layerHttpServices)));
+      const session=yield* Context.get(services,sessions.Session.Service).create({location:{directory:Schema.decodeUnknownSync(schema.AbsolutePath)(${JSON.stringify(project)})},
+        agent:agents.Agent.ID.make('TEST-shell-agent'),permissions:${JSON.stringify(config.agents['TEST-shell-agent'].permissions)}});
+      return yield* Context.get(services,instances.Instance.Service).provide(session)(Effect.gen(function*(){
+        yield* plugins.Plugin.awaitActivation;
+        const agent=yield* (yield* agents.Agent.Service).get(agents.Agent.ID.make('TEST-shell-agent'));
+        if(!agent||agent.id!==session.agent)throw new Error('TEST-agent-identity');
+        const snapshot=yield* (yield* tools.Tool.Service).snapshot(permissions.Permission.merge(agent.permissions,session.permissions??[]));
+        return {agentMatches:true,modelMatches:agent.model?.id==='TEST-model'&&agent.model?.providerID==='TEST-provider',
+          permissionsMatch:${JSON.stringify(config.agents['TEST-shell-agent'].permissions)}.every(rule=>agent.permissions.some(actual=>actual.action===rule.action&&actual.resource===rule.resource&&actual.effect===rule.effect)),
+          registeredShell:snapshot.definitions.some(definition=>definition.name==='shell')};
+      })).pipe(Effect.provide(services));
+    }).pipe(Effect.provideService(Scope.Scope,scope)))}finally{await Effect.runPromise(Scope.close(scope,Exit.void))}
+    console.log('TEST-RESULT '+JSON.stringify({...result,commands,network}));
+  `
+  const child = Bun.spawn([process.execPath, '-e', script], { cwd: process.cwd(), stdout: 'pipe', stderr: 'pipe',
+    env: { HOME: paths.home!, USERPROFILE: paths.home!, XDG_DATA_HOME: paths.data!, XDG_CACHE_HOME: paths.cache!, XDG_CONFIG_HOME: paths.config!,
+      XDG_STATE_HOME: paths.state!, TMPDIR: paths.tmp!, TMP: paths.tmp!, TEMP: paths.tmp!, OPENCODE_CONFIG_DIR: paths.config!, PATH: path.dirname(process.execPath), NO_COLOR: '1' } })
+  const timer = setTimeout(() => child.kill(), 15_000)
+  try {
+    const [output, _stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited])
+    expect(code).toBe(0)
+    const line = output.split('\n').find(value => value.startsWith('TEST-RESULT '))
+    expect(line).toBeDefined()
+    const { network, ...facts } = JSON.parse(line!.slice('TEST-RESULT '.length))
+    expect(facts).toEqual({ agentMatches: true, modelMatches: true, permissionsMatch: true, registeredShell: true, commands: 0 })
+    expect(Number.isSafeInteger(network) && network >= 0 && network <= 4096).toBe(true)
+    console.log(JSON.stringify({ event: 'TEST-plugin-activation', ...facts, blockedFetchAttempts: network }))
+  } finally { clearTimeout(timer); await child.exited; await rm(root, { recursive: true, force: true }) }
+}, 20_000)

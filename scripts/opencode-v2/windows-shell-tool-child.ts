@@ -97,13 +97,14 @@ async function execute(input: Record<string, unknown>): Promise<void> {
     }
     const effect: typeof import('effect') = await import(pathToFileURL(graph.effectPath).href)
     const { Effect, Layer, Context, Scope, Exit, Schema } = effect
-    const [sessionModule, instanceModule, toolModule, agentModule, messageModule, permissionModule, shellModule, schemaModule, http] = await Promise.all([
+    const [sessionModule, instanceModule, toolModule, agentModule, messageModule, permissionModule, pluginModule, shellModule, schemaModule, http] = await Promise.all([
       selected<typeof import('@opencode/core/session')>('@opencode/core/session', '@opencode/core'),
       selected<typeof import('@opencode/core/instance/service')>('@opencode/core/instance/service', '@opencode/core'),
       selected<typeof import('@opencode/core/tool')>('@opencode/core/tool', '@opencode/core'),
       selected<typeof import('@opencode/core/agent')>('@opencode/core/agent', '@opencode/core'),
       selected<typeof import('@opencode/core/session/message')>('@opencode/core/session/message', '@opencode/core'),
       selected<typeof import('@opencode/core/permission')>('@opencode/core/permission', '@opencode/core'),
+      selected<typeof import('@opencode/core/plugin/service')>('@opencode/core/plugin/service', '@opencode/core'),
       selected<typeof import('@opencode/core/shell/select')>('@opencode/core/shell/select', '@opencode/core'),
       selected<typeof import('@opencode/schema/schema')>('@opencode/schema/schema', '@opencode/schema'),
       selected<typeof import('@effect/platform-node/NodeHttpServer')>('@effect/platform-node/NodeHttpServer', '@effect/platform-node'),
@@ -130,6 +131,10 @@ async function execute(input: Record<string, unknown>): Promise<void> {
       stage = 'instance'
       return yield* instance.provide(session)(Effect.gen(function* () {
         stage = 'instance-body'
+        // Instance construction starts plugin activation asynchronously. Match
+        // official SessionShell/SessionRunner before reading configured agents.
+        stage = 'plugin-activation'
+        yield* pluginModule.Plugin.awaitActivation
         stage = 'agent-service'
         const agents = yield* agentModule.Agent.Service
         stage = 'agent-get'

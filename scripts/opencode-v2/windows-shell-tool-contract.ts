@@ -29,7 +29,7 @@ export function createShellProbeConfig(controllerRoot: string, bun: string) {
 // pipe; the parent receives only these source-owned finite values.
 export const shellProbeStages = ['prepare', 'profile-validation', 'profile-cwd', 'project-name', 'entry-digest',
   'bun-digest', 'profile-environment', 'node-realpath', 'node-parent', 'program-realpath', 'program-parent',
-  'node-digest', 'program-digest', 'marker', 'graph', 'runtime', 'services', 'session', 'instance', 'instance-body', 'agent-service', 'agent-get', 'agent-identity',
+  'node-digest', 'program-digest', 'marker', 'graph', 'runtime', 'services', 'session', 'instance', 'instance-body', 'plugin-activation', 'agent-service', 'agent-get', 'agent-identity',
   'shell-select', 'tool-snapshot', 'tool-execute', 'complete'] as const
 export const shellProbeMethods = ['close', 'endStdin', 'identity', 'kill', 'outputLimit', 'readOutput', 'resolve',
   'retire', 'spawn', 'status', 'stdinAlreadyBound', 'unsupportedCommand', 'unsupportedDescriptor',
