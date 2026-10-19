@@ -4615,6 +4615,7 @@ public:
     held.intendedBun = parent.value;
     held.processImage = executable.value;
     held.selectedPackage = owners.selectedPackage;
+    held.selectedCohort = owners.sealedCohort;
     held.localRole = role;
     held.runState = &state;
     held.fixedPeer = false;

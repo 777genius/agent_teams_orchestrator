@@ -1279,8 +1279,8 @@ await Bun.stdout.write(actor+':written')
     await projectBroker.request('runStateReserve', { ...projectState, binding: projectBinding,
       sourceSha256, sharedControllerRootCohort: true })
     facts.projectCohortStage = 'run_state_listen'
-    await projectBroker.request('runStateListen', { ...projectState, binding: projectBinding,
-      sourceSha256, deadline: Date.now() + 120_000 })
+    const projectPublished = executionRecord(await projectBroker.request('runStateListen', {
+      ...projectState, binding: projectBinding, sourceSha256, deadline: Date.now() + 120_000 })).record
     facts.projectCohortStage = 'sealed_rows'
     const sealed = executionRecord(JSON.parse(await readFile(path.win32.join(directory, 'start.json'), 'utf8')))
     const rows = executionRecord(sealed.cohort).members
@@ -1354,6 +1354,117 @@ await Bun.stdout.write(actor+':written')
       assert.equal(prepared.leaseOwnerId, leaseOwnerId); assert.deepEqual(prepared.birth, main.birth)
       assert.equal(prepared.namespace, peer.mapping.namespace)
       memberSids.push(String(peer.mapping.containerSid))
+      if (index === 0) {
+        // The first/only selection below is this actually granted live profile.
+        // An unlaunched profile ahead of it cannot mask a fresh Control's ACL recheck.
+        const grants = JSON.parse(await powershell('project_acl_snapshot', fixtureSecurity + `
+$rows=@(foreach($path in @($env:TEST_TARGET,$env:TEST_CONFIG)){
+$raw=[Security.AccessControl.RawSecurityDescriptor]::new([TestFixtureSecurity]::ReadSecurityDescriptor($path),0)
+$matching=@($raw.DiscretionaryAcl|Where-Object{$_.AceQualifier-eq [Security.AccessControl.AceQualifier]::AccessAllowed -and $_.SecurityIdentifier.Value-eq $env:TEST_SID -and $_.AccessMask-ne 0})
+[ordered]@{granted=$matching.Count-gt 0}})
+[Console]::Write((ConvertTo-Json -InputObject $rows -Compress))`, profile.root,
+          { TEST_CONFIG: path.win32.join(profile.root, 'config', 'opencode', 'opencode.json'),
+            TEST_SID: String(peer.mapping.containerSid) }))
+        assert.deepEqual(grants, [{ granted: true }, { granted: true }])
+        const freshControlDeadline = Math.min(Date.now() + 40_000,
+          Number(executionRecord(projectPublished).deadline))
+        const freshActiveControl = async (expected: 'status' | 'foreign_acl' | 'config_identity') => {
+          const responses = new Set<Promise<void>>(), failures: unknown[] = []
+          let requests = 0, childPid: number | undefined
+          assert.ok(Date.now() < freshControlDeadline, 'TEST_fresh_active_profile_deadline')
+          const respond = (event: unknown) => {
+            const work = (async () => {
+              const envelope = executionRecord(event), payload = executionRecord(envelope.payload)
+              assert.equal(expected, 'status'); requests++
+              assert.equal(payload.protocol, 1)
+              assert.deepEqual(payload.binding, projectBinding)
+              assert.equal(payload.endpoint, executionHash(projectPublished))
+              assert.equal(executionRecord(payload.client).pid, childPid)
+              assert.deepEqual(payload.request, { operation: 'status' })
+              assert.match(String(payload.nonce), /^[a-f0-9]{64}$/)
+              assert.ok(Number.isSafeInteger(payload.deadline) && Number(payload.deadline) > Date.now() &&
+                Number(payload.deadline) <= freshControlDeadline)
+              await projectBroker.request('runStateRespond', { ...projectState,
+                connection: envelope.connection,
+                timeoutMs: Math.max(1, Math.min(5000, Number(payload.deadline) - Date.now())),
+                response: { nonce: payload.nonce, endpoint: payload.endpoint,
+                  result: { kind: 'status', state: 'active', members: [],
+                    deadline: executionRecord(projectPublished).deadline } } }, Number(payload.deadline))
+            })().catch(error => { failures.push(error) }).finally(() => { responses.delete(work) })
+            responses.add(work)
+          }
+          const script = `
+import assert from 'node:assert/strict';import {randomBytes} from 'node:crypto'
+import {createWindowsNativeBroker,resolveWindowsNativeArtifact} from ${JSON.stringify(import.meta.resolve('../../src/services/opencode/host/windows/OpenCodeV2WindowsNativeBroker.ts'))}
+import {executionHash,executionRecord} from ${JSON.stringify(import.meta.resolve('../../src/services/opencode/execution/OpenCodeV2ExecutionContracts.ts'))}
+const profile=${JSON.stringify(profile)},binding=${JSON.stringify(projectBinding)},expected=${JSON.stringify(expected)}
+const dataRoot=${JSON.stringify(projectDataRoot)},directory=${JSON.stringify(directory)},published=${JSON.stringify(projectPublished)}
+const deadline=${JSON.stringify(freshControlDeadline)}
+let broker,phase='artifact',outcome,failed=false
+try{
+ broker=createWindowsNativeBroker(await resolveWindowsNativeArtifact());broker.events.on('error',()=>{})
+ phase='attach';await broker.request('runStateSelect',{mode:'attach',directory,dataRoot,teamId:binding.teamId,runId:binding.runId},deadline)
+ phase='profile';await broker.request('ownerValidateSelectedProfile',{root:profile.root,databasePath:profile.databasePath,directories:profile.directories,projectDirectory:profile.projectDirectory},deadline)
+ phase='config';const selected=executionRecord(await broker.request('ownerSelectConfig',{root:profile.root,databasePath:profile.databasePath,sha256:expected==='config_identity'?'0'.repeat(64):profile.sha256,teamId:binding.teamId},deadline))
+ phase='discover';const discovered=executionRecord(await broker.request('runStateDiscover',{directory,dataRoot,teamId:binding.teamId,runId:binding.runId,selectionIds:[selected.selectionId]},deadline))
+ assert.deepEqual(discovered.record,published)
+ phase='status';const requestDeadline=Math.min(deadline,Date.now()+10000)
+ const client=await broker.request('runStateProcessIdentity',{pid:process.pid},requestDeadline)
+ const payload={protocol:1,binding,endpoint:executionHash(published),client,nonce:randomBytes(32).toString('hex'),deadline:requestDeadline,request:{operation:'status'}}
+ const response=executionRecord(executionRecord(await broker.request('runStateRequest',{stateId:discovered.stateId,directory,endpointHash:payload.endpoint,payload,timeoutMs:Math.max(1,requestDeadline-Date.now())},requestDeadline)).response)
+ assert.equal(response.nonce,payload.nonce);assert.equal(response.endpoint,payload.endpoint)
+ assert.deepEqual(response.result,{kind:'status',state:'active',members:[],deadline:executionRecord(published).deadline})
+ assert.equal(expected,'status');outcome={expected,authenticatedStatus:true,selectedProfiles:1}
+}catch(error){
+ const message=error instanceof Error?error.message:''
+ const refused=expected==='foreign_acl'&&phase==='profile'&&/^execution_owner_not_private(?::private_acl_foreign_allow:\\d+)?$/.test(message)
+  ||expected==='config_identity'&&phase==='config'&&/^run_control_config_identity(?::[a-z_]+:\\d+)?$/.test(message)
+ if(refused)outcome={expected,refused:true,selectedProfiles:1}
+ else{
+  const codes=['execution_owner_not_private','execution_path_alias','execution_native_timeout','execution_native_unknown','cleanup_unknown','run_control_held_inputs','run_control_held_identity','run_control_config_identity','run_control_selection_changed','run_control_peer_identity','run_control_parent_join','run_control_connect_unknown','run_control_timeout']
+  const code=/^([a-z_]+)(?::[a-z_]+:[0-9]{1,10})?$/.exec(message)?.[1]
+  const operations=['selfImageCustody','runStateSelect','ownerValidateSelectedProfile','ownerSelectConfig','runStateDiscover','runStateProcessIdentity','runStateRequest']
+  outcome={expected,phase,errorCode:codes.find(value=>value===code)??null,nativeOperation:operations.find(value=>value===error?.nativeOperation)??null};failed=true
+ }
+}finally{try{await broker?.close()}catch{outcome={...outcome,cleanupFailed:true};failed=true}}
+console.log(JSON.stringify(outcome));if(failed)process.exit(1)
+`
+          projectBroker.events.on('runControlRequest', respond)
+          const child = Bun.spawn([process.execPath, '-e', script], {
+            cwd: requestedRoot, stdout: 'pipe', stderr: 'ignore' })
+          childPid = child.pid
+          const timeout = setTimeout(() => { child.kill('SIGTERM') },
+            Math.max(1, freshControlDeadline - Date.now()))
+          try {
+            const [output, exit] = await Promise.all([new Response(child.stdout).text(), child.exited])
+            if (exit !== 0) {
+              try { facts.freshActiveProfileControlFailure = executionRecord(JSON.parse(output)) }
+              catch { facts.freshActiveProfileControlFailure = { expected, phase: 'child_output' } }
+            }
+            assert.equal(exit, 0, 'TEST_fresh_active_profile_control_failed')
+            assert.deepEqual(executionRecord(JSON.parse(output)), expected === 'status'
+              ? { expected, authenticatedStatus: true, selectedProfiles: 1 }
+              : { expected, refused: true, selectedProfiles: 1 })
+          } finally {
+            clearTimeout(timeout)
+            projectBroker.events.off('runControlRequest', respond)
+            await Promise.all(responses)
+          }
+          assert.deepEqual(failures, []); assert.equal(requests, expected === 'status' ? 1 : 0)
+        }
+        facts.projectCohortStage = 'fresh_active_profile_status'
+        await freshActiveControl('status')
+        facts.projectCohortStage = 'fresh_active_profile_foreign_acl'
+        await withMetadataAce(profile.root, foreignProjectCohortSid, 'ReadAndExecute', 'None',
+          () => freshActiveControl('foreign_acl'))
+        facts.projectCohortStage = 'fresh_active_profile_restored_status'
+        await freshActiveControl('status')
+        facts.projectCohortStage = 'fresh_active_profile_config_identity'
+        await freshActiveControl('config_identity')
+        facts.freshActiveProfileControl = { actualNativeGrant: true, selectedProfiles: 1,
+          authenticatedStatus: true, foreignSidRefused: true, exactAclRestored: true,
+          statusAfterRestoration: true, wrongConfigHashRefused: true }
+      }
       const commandId = randomUUID(), actor = index === 0 ? 'first' : 'second'
       const command = executionRecord(await peer.broker.request('commandStart', { commandId,
         executable: path.win32.join(sharedProject, 'bun.exe'), args: [path.win32.join(sharedProject, 'project-command.ts')],

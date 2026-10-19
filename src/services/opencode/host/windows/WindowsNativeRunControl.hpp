@@ -166,6 +166,8 @@ struct WindowsNativeRunControl {
     HANDLE intendedBun = nullptr;
     HANDLE processImage = nullptr;
     PSID selectedPackage = nullptr;
+    // Retained only by the native run-state issuer after its sealed join.
+    std::shared_ptr<const ClosedControllerCohort> selectedCohort;
     // Optional AppContainer peer access is derived only from this retained
     // PROCESS and matched against the native Scope's own generated package SID.
     HANDLE packagePeerProcess = nullptr;
@@ -1309,10 +1311,13 @@ private:
                 runControlSameFile(image, expected_.image) && root.fileId != config.fileId &&
                 root.fileId != image.fileId && config.fileId != image.fileId,
             "run_control_held_identity");
+    const auto cohortSids = held_.selectedCohort
+        ? closedControllerCohortSids(*held_.selectedCohort) : std::vector<std::wstring>();
+    const auto *cohortSidsPtr = held_.selectedCohort ? &cohortSids : nullptr;
     const JsonObject rootIdentity =
-        fileIdentity(selectedDirectory_.value, ownerSid_, true, held_.selectedPackage);
+        fileIdentity(selectedDirectory_.value, ownerSid_, true, held_.selectedPackage, cohortSidsPtr);
     const JsonObject configIdentity =
-        fileIdentity(config_.value, ownerSid_, false, held_.selectedPackage);
+        fileIdentity(config_.value, ownerSid_, false, held_.selectedPackage, cohortSidsPtr);
     const JsonObject imageIdentity =
         fileIdentity(processImage_.value, ownerSid_, false, held_.selectedPackage);
     require(rootIdentity.HasKey(L"fileId") && configIdentity.HasKey(L"fileId") &&
