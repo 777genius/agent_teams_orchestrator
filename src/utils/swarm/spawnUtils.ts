@@ -21,6 +21,7 @@ import {
   AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV,
   ANTHROPIC_DIRECT_ROUTE_ENV_KEYS,
   ANTHROPIC_EXTERNAL_ROUTE_ENV_KEYS,
+  ANTHROPIC_MODEL_ENV_KEYS,
   APP_MANAGED_ANTHROPIC_AUTH_MODE_API_KEY_HELPER,
   APP_MANAGED_ANTHROPIC_AUTH_MODE_ENV,
   APP_MANAGED_ANTHROPIC_SETTINGS_PATH_ENV,
@@ -321,6 +322,8 @@ const PROVIDER_SELECTION_ENV_VARS = [
   'CLAUDE_CODE_ENTRY_PROVIDER',
 ] as const
 
+const ANTHROPIC_MODEL_ENV_KEY_SET = new Set<string>(ANTHROPIC_MODEL_ENV_KEYS)
+
 function getExplicitEntryProvider(provider: TeammateProvider): string {
   return provider === 'codex' || provider === 'gemini' ? provider : 'anthropic'
 }
@@ -350,6 +353,10 @@ function applyAnthropicTeammateConnectionPolicy(
   }
 
   for (const key of ANTHROPIC_EXTERNAL_ROUTE_ENV_KEYS) {
+    if (connectionMode === 'compatible' && ANTHROPIC_MODEL_ENV_KEY_SET.has(key)) {
+      envVars[key] = envVars[key] ?? process.env[key] ?? ''
+      continue
+    }
     envVars[key] = ''
   }
   if (connectionMode !== 'compatible') {

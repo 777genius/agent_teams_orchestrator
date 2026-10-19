@@ -313,7 +313,7 @@ describe('shouldClearAnthropicApiKeyForTeammateSpawn', () => {
     }
   })
 
-  it('scrubs inherited gateway routing for explicit direct Anthropic teammates', () => {
+  it.each(['api_key', 'subscription'] as const)('scrubs inherited gateway models and routing for %s Anthropic teammates', mode => {
     const keys = [
       AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV,
       'ANTHROPIC_API_KEY',
@@ -321,6 +321,8 @@ describe('shouldClearAnthropicApiKeyForTeammateSpawn', () => {
       'ANTHROPIC_BASE_URL',
       'ANTHROPIC_CUSTOM_HEADERS',
       'ANTHROPIC_AWS_WORKSPACE_ID',
+      'ANTHROPIC_MODEL',
+      'ANTHROPIC_SMALL_FAST_MODEL',
       'ANTHROPIC_DEFAULT_SONNET_MODEL',
       'CLAUDE_CODE_OAUTH_TOKEN',
       'CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST',
@@ -328,7 +330,7 @@ describe('shouldClearAnthropicApiKeyForTeammateSpawn', () => {
     const original = new Map(keys.map(key => [key, process.env[key]]))
 
     try {
-      process.env[AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV] = 'api_key'
+      process.env[AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV] = mode
       process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1'
       process.env.ANTHROPIC_API_KEY = 'sk-ant-direct'
       process.env.ANTHROPIC_AUTH_TOKEN = 'ambient-token'
@@ -336,18 +338,22 @@ describe('shouldClearAnthropicApiKeyForTeammateSpawn', () => {
       process.env.ANTHROPIC_CUSTOM_HEADERS =
         'Authorization: Bearer ambient-token'
       process.env.ANTHROPIC_AWS_WORKSPACE_ID = 'wrkspc_should_not_win'
+      process.env.ANTHROPIC_MODEL = 'gateway-main'
+      process.env.ANTHROPIC_SMALL_FAST_MODEL = 'gateway-small'
       process.env.ANTHROPIC_DEFAULT_SONNET_MODEL = 'bedrock-model-id'
       process.env.CLAUDE_CODE_OAUTH_TOKEN = 'ambient-oauth-token'
 
       const env = buildInheritedEnvObject({ provider: 'anthropic' })
 
-      expect(env.ANTHROPIC_API_KEY).toBe('sk-ant-direct')
+      expect(env.ANTHROPIC_API_KEY).toBe(mode === 'api_key' ? 'sk-ant-direct' : '')
       expect(env.ANTHROPIC_AUTH_TOKEN).toBe('')
       expect(env.ANTHROPIC_BASE_URL).toBe('')
       expect(env.ANTHROPIC_CUSTOM_HEADERS).toBe('')
       expect(env.ANTHROPIC_AWS_WORKSPACE_ID).toBe('')
+      expect(env.ANTHROPIC_MODEL).toBe('')
+      expect(env.ANTHROPIC_SMALL_FAST_MODEL).toBe('')
       expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('')
-      expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe('')
+      expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe(mode === 'api_key' ? '' : undefined)
     } finally {
       for (const key of keys) {
         const value = original.get(key)
@@ -357,13 +363,19 @@ describe('shouldClearAnthropicApiKeyForTeammateSpawn', () => {
     }
   })
 
-  it('preserves compatible endpoint auth while clearing external model aliases', () => {
+  it('preserves compatible endpoint models and auth while clearing cloud backend routing', () => {
     const keys = [
       AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV,
       'ANTHROPIC_AUTH_TOKEN',
       'ANTHROPIC_BASE_URL',
       'ANTHROPIC_CUSTOM_HEADERS',
+      'ANTHROPIC_MODEL',
+      'ANTHROPIC_SMALL_FAST_MODEL',
       'ANTHROPIC_DEFAULT_OPUS_MODEL',
+      'ANTHROPIC_DEFAULT_OPUS_MODEL_NAME',
+      'CLAUDE_CODE_SUBAGENT_MODEL',
+      'ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION',
+      'ANTHROPIC_AWS_WORKSPACE_ID',
     ] as const
     const original = new Map(keys.map(key => [key, process.env[key]]))
 
@@ -372,14 +384,60 @@ describe('shouldClearAnthropicApiKeyForTeammateSpawn', () => {
       process.env.ANTHROPIC_AUTH_TOKEN = 'local-token'
       process.env.ANTHROPIC_BASE_URL = 'http://localhost:1234'
       process.env.ANTHROPIC_CUSTOM_HEADERS = 'X-Gateway-Tenant: team-1'
-      process.env.ANTHROPIC_DEFAULT_OPUS_MODEL = 'bedrock-opus-id'
+      process.env.ANTHROPIC_MODEL = 'gateway-main'
+      process.env.ANTHROPIC_SMALL_FAST_MODEL = 'gateway-small'
+      process.env.ANTHROPIC_DEFAULT_OPUS_MODEL = 'gateway-opus'
+      process.env.ANTHROPIC_DEFAULT_OPUS_MODEL_NAME = 'Gateway Opus'
+      process.env.CLAUDE_CODE_SUBAGENT_MODEL = 'gateway-subagent'
+      process.env.ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION = 'us-east-1'
+      process.env.ANTHROPIC_AWS_WORKSPACE_ID = 'ambient-workspace'
 
       const env = buildInheritedEnvObject({ provider: 'anthropic' })
 
       expect(env.ANTHROPIC_AUTH_TOKEN).toBe('local-token')
       expect(env.ANTHROPIC_BASE_URL).toBe('http://localhost:1234')
       expect(env.ANTHROPIC_CUSTOM_HEADERS).toBe('X-Gateway-Tenant: team-1')
-      expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('')
+      expect(env.ANTHROPIC_MODEL).toBe('gateway-main')
+      expect(env.ANTHROPIC_SMALL_FAST_MODEL).toBe('gateway-small')
+      expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('gateway-opus')
+      expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL_NAME).toBe('Gateway Opus')
+      expect(env.CLAUDE_CODE_SUBAGENT_MODEL).toBe('gateway-subagent')
+      expect(env.ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION).toBe('')
+      expect(env.ANTHROPIC_AWS_WORKSPACE_ID).toBe('')
+    } finally {
+      for (const key of keys) {
+        const value = original.get(key)
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+    }
+  })
+
+  it('keeps compatible model overrides ahead of inherited models, including explicit clears', () => {
+    const keys = [
+      AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV,
+      'ANTHROPIC_MODEL',
+      'ANTHROPIC_SMALL_FAST_MODEL',
+      'CLAUDE_CODE_SUBAGENT_MODEL',
+    ] as const
+    const original = new Map(keys.map(key => [key, process.env[key]]))
+    try {
+      process.env[AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV] = 'compatible'
+      process.env.ANTHROPIC_MODEL = 'inherited-main'
+      process.env.ANTHROPIC_SMALL_FAST_MODEL = 'inherited-small'
+      delete process.env.CLAUDE_CODE_SUBAGENT_MODEL
+
+      const env = buildInheritedEnvObject({
+        provider: 'anthropic',
+        extraEnv: {
+          ANTHROPIC_MODEL: 'overridden-main',
+          ANTHROPIC_SMALL_FAST_MODEL: '',
+        },
+      })
+
+      expect(env.ANTHROPIC_MODEL).toBe('overridden-main')
+      expect(env.ANTHROPIC_SMALL_FAST_MODEL).toBe('')
+      expect(env.CLAUDE_CODE_SUBAGENT_MODEL).toBe('')
     } finally {
       for (const key of keys) {
         const value = original.get(key)
