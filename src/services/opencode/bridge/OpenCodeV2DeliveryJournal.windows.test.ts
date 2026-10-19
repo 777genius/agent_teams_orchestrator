@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto'
 import { link, lstat, readFile, readlink, realpath, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import { types } from 'node:util'
 import { executionHash, executionRecord } from '../execution/OpenCodeV2ExecutionContracts.js'
 import { createWindowsNativeBroker, resolveWindowsNativeArtifact } from '../host/windows/OpenCodeV2WindowsNativeBroker.js'
 import { createWindowsOwnerFilesystem, type WindowsOwnerDirectory } from '../host/windows/OpenCodeV2WindowsOwnerFilesystem.js'
@@ -217,21 +218,44 @@ $fixtureStep='read_restored';[Console]::Write([Convert]::ToBase64String([TestDel
   }
 }
 
+const fixtureFailureCodes = ['execution_native_unknown', 'execution_native_timeout', 'execution_invalid_response',
+  'execution_containment_helper_closed', 'execution_containment_helper_failed', 'execution_owner_unknown',
+  'execution_owner_metadata_missing', 'execution_owner_metadata_budget', 'execution_owner_metadata_purpose_invalid',
+  'execution_owner_not_private', 'execution_owner_alias', 'delivery_root_invalid', 'execution_timeout', 'cleanup_unknown'] as const
+function fixtureFailureCode(error: unknown): string {
+  if (!error || typeof error !== 'object' || types.isProxy(error)) return 'unknown'
+  try {
+    const message = Object.getOwnPropertyDescriptor(error, 'message')
+    return message && 'value' in message ? fixtureFailureCodes.find(code => code === message.value) ?? 'unknown' : 'unknown'
+  } catch { return 'unknown' }
+}
+
 test.skipIf(process.platform !== 'win32')('Windows delivery guard holds exact private files and refuses foreign or substituted custody', async () => {
   const deadline = Date.now() + 90_000
   const cutoff = () => Math.min(deadline, Date.now() + 30_000)
   const root = path.join(await realpath(os.tmpdir()), `TEST-v2-delivery-guard-${randomUUID()}`)
-  const broker = createWindowsNativeBroker(await resolveWindowsNativeArtifact(cutoff()))
+  const artifact = await resolveWindowsNativeArtifact(cutoff())
+  const broker = createWindowsNativeBroker(artifact)
   broker.events.on('error', () => {})
+  let brokerExitCode: number | null | undefined
+  broker.events.on('close', (code: unknown) => {
+    if (code === null || Number.isSafeInteger(code) && Number(code) >= -0x80000000 && Number(code) <= 0xffffffff)
+      brokerExitCode = code === null ? null : Number(code)
+  })
   const filesystem = createWindowsOwnerFilesystem((request, requestDeadline, signal) =>
     broker.request(request.op, request, requestDeadline, signal))
   let held: WindowsOwnerDirectory | undefined
   let guard: Awaited<ReturnType<typeof openWindowsDeliveryJournalGuard>> | undefined
+  let section: 'private-root' | 'compatible-handles' | 'concurrent-reserve' | 'held-acl' | 'reopened-acl' |
+    'nonempty-file' | 'hardlink' | 'file-symlink' | 'directory-junction' | 'local-payload' |
+    'read-before-write' | 'raw-payload' | 'raw-name' | 'wrong-namespace' | 'outcome-bytes' = 'private-root'
+  let primary: unknown, primaryFailed = false, observedNativeFailure: unknown
   try {
     held = await filesystem.prepareDirectory(root, true, cutoff())
     guard = await openWindowsDeliveryJournalGuard(root, cutoff())
     const directory = path.dirname(guard.path), originalFile = path.join(root, 'TEST-original-guard')
     const initial = await lstat(guard.path)
+    section = 'compatible-handles'
     const peer = await openWindowsDeliveryJournalGuard(root, cutoff())
     try {
       await expect(rename(guard.path, originalFile)).rejects.toBeDefined()
@@ -239,6 +263,7 @@ test.skipIf(process.platform !== 'win32')('Windows delivery guard holds exact pr
       await guard.assertOwned(); await peer.assertOwned()
       expect((await lstat(guard.path)).ino).toBe(initial.ino)
     } finally { await peer.close() }
+    section = 'concurrent-reserve'
     const identity = { requestId: 'TEST-concurrent-request', deliveryAttemptId: 'TEST-concurrent-attempt',
       localMessageId: 'TEST-concurrent-message', nativeInputID: 'msg_TESTconcurrentjournal' }
     const base: SendMessageOutcomeBase = { requestId: identity.requestId, teamId: 'TEST-team', teamName: 'TEST-team',
@@ -252,6 +277,7 @@ test.skipIf(process.platform !== 'win32')('Windows delivery guard holds exact pr
     const outcomePath = path.join(root, 'opencode', 'command-outcomes.json')
     const originalOutcome = await readFile(outcomePath)
     // An existing pinned guard cannot change trustee, protection, or owner.
+    section = 'held-acl'
     for (const mode of ['foreign-ace', 'unprotected', 'foreign-owner'] as const) {
       await securityFixture(guard.path, mode, deadline, async () => {
         await expect(guard!.assertOwned()).rejects.toThrow('execution_owner_not_private')
@@ -259,6 +285,7 @@ test.skipIf(process.platform !== 'win32')('Windows delivery guard holds exact pr
       await guard.assertOwned()
     }
     await guard.close(); guard = undefined
+    section = 'reopened-acl'
     for (const target of [directory, path.join(directory, 'owner.lock')]) {
       for (const mode of ['foreign-ace', 'unprotected', 'foreign-owner'] as const) {
         await securityFixture(target, mode, deadline, async () => {
@@ -266,13 +293,16 @@ test.skipIf(process.platform !== 'win32')('Windows delivery guard holds exact pr
         })
       }
     }
+    section = 'nonempty-file'
     await writeFile(path.join(directory, 'owner.lock'), 'TEST nonempty guard')
     try { await expect(openWindowsDeliveryJournalGuard(root, cutoff())).rejects.toThrow('execution_owner_metadata_budget') }
     finally { await writeFile(path.join(directory, 'owner.lock'), '') }
+    section = 'hardlink'
     const hardlink = path.join(root, 'TEST-hardlink')
     await link(path.join(directory, 'owner.lock'), hardlink)
     try { await expect(openWindowsDeliveryJournalGuard(root, cutoff())).rejects.toThrow('execution_owner_alias') }
     finally { await unlink(hardlink) }
+    section = 'file-symlink'
     const sentinel = path.join(root, 'TEST-sentinel')
     await writeFile(sentinel, 'TEST sentinel survives', { flag: 'wx' })
     const sentinelIdentity = await lstat(sentinel)
@@ -305,6 +335,7 @@ test.skipIf(process.platform !== 'win32')('Windows delivery guard holds exact pr
     expect([restoredIdentity.dev, restoredIdentity.ino]).toEqual([initial.dev, initial.ino])
     const restoredGuard = await openWindowsDeliveryJournalGuard(root, cutoff())
     try { await restoredGuard.assertOwned() } finally { await restoredGuard.close() }
+    section = 'directory-junction'
     const originalDirectory = path.join(root, 'TEST-original-directory')
     await rename(directory, originalDirectory)
     await symlink(originalDirectory, directory, 'junction')
@@ -312,28 +343,96 @@ test.skipIf(process.platform !== 'win32')('Windows delivery guard holds exact pr
     finally { await unlink(directory); await rename(originalDirectory, directory) }
     guard = await openWindowsDeliveryJournalGuard(root, cutoff())
     await guard.assertOwned()
+    section = 'local-payload'
     const leaf = await filesystem.prepareDirectory(directory, false, cutoff())
+    let leafPrimary: unknown, leafFailed = false
     try {
-      await expect(leaf.readMetadata('DeliveryGuard', cutoff())).rejects.toThrow('execution_owner_metadata_missing')
-      await expect(leaf.writeMetadata('DeliveryGuard', {}, cutoff())).rejects.toThrow('execution_owner_unknown')
-    } finally { await leaf.close() }
-    const rawLeaf = executionRecord(await broker.request('ownerPreparePrivateDirectory',
-      { path: directory, createExclusive: false }, cutoff()))
-    expect(typeof rawLeaf.handleId).toBe('string')
-    try {
-      await expect(broker.request('ownerWriteMetadata', { op: 'ownerWriteMetadata', purpose: 'DeliveryGuard',
-        handleId: rawLeaf.handleId, bytesBase64: Buffer.from('TEST').toString('base64') }, cutoff()))
-        .rejects.toThrow('execution_owner_metadata_budget')
-      await expect(broker.request('ownerWriteMetadata', { op: 'ownerWriteMetadata', purpose: 'DeliveryGuard',
-        handleId: rawLeaf.handleId, bytesBase64: '', name: 'TEST-arbitrary-file' }, cutoff()))
-        .rejects.toThrow('execution_invalid_response')
-    } finally { await broker.request('ownerCloseDirectory', { handleId: rawLeaf.handleId }, cutoff()) }
-    await expect(held.writeMetadata('DeliveryGuard', null, cutoff())).rejects.toThrow('execution_owner_metadata_purpose_invalid')
-    expect((await readFile(outcomePath)).equals(originalOutcome)).toBe(true)
-  } finally {
-    try { await guard?.close() } finally {
-      try { await held?.close() } finally { await broker.close() }
+      await expect(leaf.writeMetadata('DeliveryGuard', {}, cutoff()).catch(error => {
+        observedNativeFailure = error; throw error
+      })).rejects.toThrow('execution_owner_unknown')
+      observedNativeFailure = undefined
+    } catch (error) { leafFailed = true; leafPrimary = error; throw error }
+    finally {
+      try { await leaf.close() }
+      catch (error) {
+        console.error(JSON.stringify({ event: 'TEST_windows_delivery_guard_cleanup_failure', section, cleanup: 'local-leaf',
+          code: fixtureFailureCode(error), ended: broker.ended(), closeObserved: brokerExitCode !== undefined,
+          ...(brokerExitCode !== undefined ? { exitCode: brokerExitCode } : {}) }))
+        throw new AggregateError(leafFailed ? [leafPrimary, error] : [error], 'TEST_delivery_leaf_cleanup_failed',
+          { cause: leafFailed ? leafPrimary : error })
+      }
     }
-    await rm(root, { recursive: true, force: true })
+    // Each raw negative owns a fresh broker. EOF releases only that case's
+    // native handles, independently of the retained root/guard capabilities.
+    for (const negative of ['read-before-write', 'raw-payload', 'raw-name'] as const) {
+      section = negative
+      const isolated = createWindowsNativeBroker(artifact)
+      isolated.events.on('error', () => {})
+      let isolatedExitCode: number | null | undefined, isolatedPrimary: unknown, isolatedFailed = false
+      let nativeFailure: unknown, nativeFailed = false
+      const captureNativeFailure = (error: unknown): never => { nativeFailed = true; nativeFailure = error; throw error }
+      isolated.events.on('close', (code: unknown) => {
+        if (code === null || Number.isSafeInteger(code) && Number(code) >= -0x80000000 && Number(code) <= 0xffffffff)
+          isolatedExitCode = code === null ? null : Number(code)
+      })
+      try {
+        const rawLeaf = executionRecord(await isolated.request('ownerPreparePrivateDirectory',
+          { path: directory, createExclusive: false }, cutoff()))
+        expect(typeof rawLeaf.handleId).toBe('string')
+        if (negative === 'read-before-write') {
+          await expect(isolated.request('ownerReadMetadata', { op: 'ownerReadMetadata', purpose: 'DeliveryGuard',
+            handleId: rawLeaf.handleId }, cutoff()).catch(captureNativeFailure)).rejects.toThrow('execution_owner_metadata_missing')
+        } else {
+          await expect(isolated.request('ownerWriteMetadata', { op: 'ownerWriteMetadata', purpose: 'DeliveryGuard',
+            handleId: rawLeaf.handleId, bytesBase64: negative === 'raw-payload' ? Buffer.from('TEST').toString('base64') : '',
+            ...(negative === 'raw-name' ? { name: 'TEST-arbitrary-file' } : {}) }, cutoff()).catch(captureNativeFailure))
+            .rejects.toThrow(negative === 'raw-payload' ? 'execution_owner_metadata_budget' : 'execution_invalid_response')
+        }
+      } catch (error) {
+        isolatedFailed = true; isolatedPrimary = error
+        console.error(JSON.stringify({ event: 'TEST_windows_delivery_guard_failure', section, broker: 'negative',
+          code: fixtureFailureCode(nativeFailed ? nativeFailure : error), ended: isolated.ended(), closeObserved: isolatedExitCode !== undefined,
+          ...(isolatedExitCode !== undefined ? { exitCode: isolatedExitCode } : {}) }))
+        throw error
+      } finally {
+        try { await isolated.close() }
+        catch (error) {
+          console.error(JSON.stringify({ event: 'TEST_windows_delivery_guard_cleanup_failure', section, cleanup: 'negative-broker',
+            code: fixtureFailureCode(error), ended: isolated.ended(), closeObserved: isolatedExitCode !== undefined,
+            ...(isolatedExitCode !== undefined ? { exitCode: isolatedExitCode } : {}) }))
+          throw new AggregateError(isolatedFailed ? [isolatedPrimary, error] : [error],
+            'TEST_delivery_negative_cleanup_failed', { cause: isolatedFailed ? isolatedPrimary : error })
+        }
+      }
+    }
+    section = 'wrong-namespace'
+    await expect(held.writeMetadata('DeliveryGuard', null, cutoff()).catch(error => {
+      observedNativeFailure = error; throw error
+    })).rejects.toThrow('execution_owner_metadata_purpose_invalid')
+    observedNativeFailure = undefined
+    section = 'outcome-bytes'
+    expect((await readFile(outcomePath)).equals(originalOutcome)).toBe(true)
+  } catch (error) {
+    primaryFailed = true; primary = error
+    console.error(JSON.stringify({ event: 'TEST_windows_delivery_guard_failure', section, broker: 'root',
+      code: fixtureFailureCode(observedNativeFailure ?? error), ended: broker.ended(), closeObserved: brokerExitCode !== undefined,
+      ...(brokerExitCode !== undefined ? { exitCode: brokerExitCode } : {}) }))
+    throw error
+  } finally {
+    const cleanupFailures: unknown[] = []
+    for (const [cleanup, action] of [
+      ['guard', async () => { await guard?.close() }], ['root', async () => { await held?.close() }],
+      ['broker', async () => { await broker.close() }], ['test-root', async () => { await rm(root, { recursive: true, force: true }) }],
+    ] as const) {
+      try { await action() }
+      catch (error) {
+        cleanupFailures.push(error)
+        console.error(JSON.stringify({ event: 'TEST_windows_delivery_guard_cleanup_failure', section, cleanup,
+          code: fixtureFailureCode(error), ended: broker.ended(), closeObserved: brokerExitCode !== undefined,
+          ...(brokerExitCode !== undefined ? { exitCode: brokerExitCode } : {}) }))
+      }
+    }
+    if (cleanupFailures.length) throw new AggregateError(primaryFailed ? [primary, ...cleanupFailures] : cleanupFailures,
+      'TEST_delivery_fixture_cleanup_failed', { cause: primaryFailed ? primary : cleanupFailures[0] })
   }
 }, 120_000)
