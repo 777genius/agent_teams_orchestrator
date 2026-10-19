@@ -3260,6 +3260,10 @@ struct Scope {
   std::vector<RetainedAnchorComponent> aclRoots;
   std::vector<RetainedAncestorMetadata> metadataAncestors;
   std::vector<RetainedRealpathAnchor> realpathAnchors;
+  // Separate from every ACL list: these anchors only bind physical identity
+  // for OS-refused realpath resolution. They never grant, deny, pin ancestors
+  // or count as metadata coverage for any other root.
+  std::vector<RetainedRealpathAnchor> metadataRealpathAnchors;
   std::unique_ptr<RetainedRealpathDll> realpathDll;
   std::shared_ptr<const ClosedControllerCohort> cohort;
   OwnerStore *owners = nullptr;
@@ -3269,6 +3273,8 @@ struct Scope {
   void assertRealpathAnchorsLive() const {
     require(!stopping, "execution_identity_mismatch");
     for (const auto &anchor : realpathAnchors)
+      anchor.assertLive();
+    for (const auto &anchor : metadataRealpathAnchors)
       anchor.assertLive();
     assertSharedReadRootsLive(*this);
     assertProjectRootsLive(*this);
@@ -5565,6 +5571,29 @@ static std::unique_ptr<Scope> launch(const JsonObject &input, OwnerStore &owners
       }
     }
   }
+  // The system directory is admitted for physical path resolution only: the
+  // selected shell and other system tools resolve there, and the child realpath
+  // fallback authenticates them from this anchor. It is held like every other
+  // anchor but stays out of every ACL grant, deny, ancestor pin and coverage
+  // decision below.
+  if (input.HasKey(L"metadataRoots")) {
+    require(input.GetNamedValue(L"metadataRoots").ValueType() == JsonValueType::Array,
+            "execution_invalid_response");
+    for (auto value : input.GetNamedArray(L"metadataRoots")) {
+      require(value.ValueType() == JsonValueType::String, "execution_invalid_response");
+      std::wstring root(value.GetString());
+      try {
+        auto checked = owners.holdSelectedAncestors(root);
+        scope->metadataRealpathAnchors.emplace_back(
+            root, L"metadata", std::move(checked), owners.holdSelectedDirectory(root));
+      } catch (const NativeError &error) {
+        if (!error.stage)
+          throw NativeError{error.code, error.win32, "private_metadata_anchor",
+                            error.nativeStatus};
+        throw;
+      }
+    }
+  }
   grantAncestorMetadata(*scope);
   // Helper-only native owner/command probes do not select a DLL. Production
   // composition requires this selection and its authenticated prepare receipt.
@@ -5674,6 +5703,8 @@ static std::unique_ptr<Scope> launch(const JsonObject &input, OwnerStore &owners
   JsonArray entries;
   scope->assertRealpathAnchorsLive();
   for (const auto &anchor : scope->realpathAnchors)
+    entries.Append(anchor.receipt());
+  for (const auto &anchor : scope->metadataRealpathAnchors)
     entries.Append(anchor.receipt());
   anchors.SetNamedValue(L"anchors", entries);
   mapping.SetNamedValue(L"realpathAnchors", anchors);

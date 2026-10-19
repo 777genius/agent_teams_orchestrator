@@ -112,7 +112,7 @@ function childRealpathSelection(input: Record<string, unknown>, nativeBirth: Rec
   const seen = new Set<string>()
   const anchors = receipt.anchors.map(value => {
     const anchor = record(value)
-    assert((anchor.kind === 'readOnly' || anchor.kind === 'writable') && typeof anchor.admittedPath === 'string' && typeof anchor.dosPath === 'string' && path.win32.isAbsolute(anchor.dosPath) && path.win32.relative(anchor.admittedPath, anchor.dosPath) === '')
+    assert((anchor.kind === 'readOnly' || anchor.kind === 'writable' || anchor.kind === 'metadata') && typeof anchor.admittedPath === 'string' && typeof anchor.dosPath === 'string' && path.win32.isAbsolute(anchor.dosPath) && path.win32.relative(anchor.admittedPath, anchor.dosPath) === '')
     assert(typeof anchor.ntPath === 'string' && anchor.ntPath.startsWith('\\Device\\') && anchor.ntPath.length <= 32767 && !anchor.ntPath.includes('\0') && anchor.ntPath.slice(1).split('\\').every(segment => segment !== '' && segment !== '.' && segment !== '..'))
     assert(typeof anchor.fileId === 'string' && /^[a-f0-9]{32}$/.test(anchor.fileId))
     const key = `${anchor.kind}:${anchor.admittedPath}`; assert(!seen.has(key)); seen.add(key)

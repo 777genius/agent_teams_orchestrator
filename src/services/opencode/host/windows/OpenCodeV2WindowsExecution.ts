@@ -22,11 +22,11 @@ function birth(value: unknown): ExecutionBirth {
   return Object.freeze({ format: 'windows-filetime', value: record.value, bootId: null })
 }
 export type WindowsExecutionIdentity = Readonly<{ hostPID: number; nativePID: number; birth: ExecutionBirth; executablePath: string; executableSha256: string }>
-export type WindowsRealpathAnchorReceipt = Readonly<{ receiptId: string; nonce: string; anchors: readonly Readonly<{ kind: 'readOnly' | 'writable'; admittedPath: string; dosPath: string; ntPath: string; volumeSerial: string; fileId: string }>[] }>
+export type WindowsRealpathAnchorReceipt = Readonly<{ receiptId: string; nonce: string; anchors: readonly Readonly<{ kind: 'readOnly' | 'writable' | 'metadata'; admittedPath: string; dosPath: string; ntPath: string; volumeSerial: string; fileId: string }>[] }>
 export type WindowsRealpathDllReceipt = Readonly<{ receiptId: string; nonce: string; path: string; sha256: string; volumeSerial: string; fileId: string; ownerSid: string; held: true }>
 export type WindowsExecutionMapping = Readonly<{ bun: WindowsExecutionIdentity; supervisor: WindowsExecutionIdentity; namespace: Readonly<{ name: string }>; containerSid: string; leaseOwnerId: string; realpathAnchors: WindowsRealpathAnchorReceipt; realpathDll: WindowsRealpathDllReceipt }>
 export type WindowsKernelRetirement = Readonly<{ pid: number; birth: ExecutionBirth; scopeClosed: boolean; mapping: WindowsExecutionMapping; activeProcesses: 0; heldProcessExited: true; ownAcesRemoved: true }>
-export type WindowsLaunchPlan = Readonly<{ helper: WindowsNativeArtifact; realpathDll: WindowsRealpathArtifact; executable: string; entry: string; cwd: string; writableRoots: readonly string[]; readOnlyRoots: readonly string[]; protectedRoots: readonly string[]; profileDirectories: readonly string[]; env: Readonly<Record<string, string>> }>
+export type WindowsLaunchPlan = Readonly<{ helper: WindowsNativeArtifact; realpathDll: WindowsRealpathArtifact; executable: string; entry: string; cwd: string; writableRoots: readonly string[]; readOnlyRoots: readonly string[]; protectedRoots: readonly string[]; metadataRoots: readonly string[]; profileDirectories: readonly string[]; env: Readonly<Record<string, string>> }>
 export type WindowsSelectedAuthMetadata = Readonly<{
   read(deadline: number, signal?: AbortSignal): Promise<Readonly<{ sha256: string; bytes: number }>>
 }>
@@ -268,11 +268,11 @@ async function identity(value: unknown): Promise<WindowsExecutionIdentity> {
 function realpathAnchorReceipt(value: unknown, plan: WindowsLaunchPlan, nonce: string, actual: WindowsExecutionIdentity, supervisor: WindowsExecutionIdentity): WindowsRealpathAnchorReceipt {
   const input = row(value)
   assert(input.nonce === nonce && input.receiptId === `windows-anchors:${supervisor.nativePID}:${actual.nativePID}:${actual.birth.value}` && Array.isArray(input.anchors), 'execution_identity_mismatch')
-  const expected = new Set([...plan.readOnlyRoots.map(root => `readOnly:${root}`), ...plan.writableRoots.map(root => `writable:${root}`)])
+  const expected = new Set([...plan.readOnlyRoots.map(root => `readOnly:${root}`), ...plan.writableRoots.map(root => `writable:${root}`), ...plan.metadataRoots.map(root => `metadata:${root}`)])
   assert(input.anchors.length === expected.size && input.anchors.length <= 4096, 'execution_path_alias')
   const anchors = input.anchors.map(item => {
     const anchor = row(item)
-    assert((anchor.kind === 'readOnly' || anchor.kind === 'writable') && typeof anchor.admittedPath === 'string' && expected.delete(`${anchor.kind}:${anchor.admittedPath}`) && typeof anchor.dosPath === 'string' && path.win32.relative(anchor.admittedPath, anchor.dosPath) === '', 'execution_path_alias')
+    assert((anchor.kind === 'readOnly' || anchor.kind === 'writable' || anchor.kind === 'metadata') && typeof anchor.admittedPath === 'string' && expected.delete(`${anchor.kind}:${anchor.admittedPath}`) && typeof anchor.dosPath === 'string' && path.win32.relative(anchor.admittedPath, anchor.dosPath) === '', 'execution_path_alias')
     assert(typeof anchor.ntPath === 'string' && anchor.ntPath.length <= 32767 && anchor.ntPath.startsWith('\\Device\\') && !anchor.ntPath.includes('\0'), 'execution_path_alias')
     assert(anchor.ntPath.slice(1).split('\\').every(segment => segment.length > 0 && segment !== '.' && segment !== '..'), 'execution_path_alias')
     assert(typeof anchor.volumeSerial === 'string' && /^(?:0|[1-9]\d{0,19})$/.test(anchor.volumeSerial) && BigInt(anchor.volumeSerial) <= 0xffffffffffffffffn && typeof anchor.fileId === 'string' && /^[a-f0-9]{32}$/.test(anchor.fileId), 'execution_path_alias')
@@ -372,9 +372,16 @@ export async function planWindowsExecution(requested: Readonly<{
     const relative = path.win32.relative(root, realpathDll.path)
     assert(relative !== '' && (relative === '..' || relative.startsWith('..\\') || path.win32.isAbsolute(relative)), 'execution_containment_dll_identity')
   }
+  // Machine-derived system directory, never a caller root: the selected shell
+  // and other system tools resolve under it, and the child realpath fallback
+  // authenticates them from this metadata anchor without any ACL change.
+  const systemRoot = ['SystemRoot', 'SYSTEMROOT', 'WINDIR'].map(name => input.env[name])
+    .find(value => typeof value === 'string' && /^[A-Za-z]:\\/.test(value)) ?? 'C:\\Windows'
+  const metadataRoots = Object.freeze([path.win32.join(systemRoot, 'System32')])
+  for (const root of metadataRoots) assert(path.isAbsolute(root) && /^[A-Za-z]:\\/.test(root) && !root.includes('/') && path.parse(root).root !== root, 'execution_path_alias')
   const plan: WindowsLaunchPlan = Object.freeze({ helper, realpathDll, executable: input.bun.path, entry: input.entry, cwd: input.cwd,
-    writableRoots: Object.freeze([...new Set(input.writableRoots)]), readOnlyRoots: compactReadOnlyGrantUnion(readOnlyRoots), protectedRoots: Object.freeze([...new Set(input.protectedRoots ?? [])]), profileDirectories: Object.freeze([...new Set(input.profileDirectories)]), env: Object.freeze(input.env) })
-  assert(plan.readOnlyRoots.length + plan.writableRoots.length <= 4096, 'execution_containment_anchor_budget')
+    writableRoots: Object.freeze([...new Set(input.writableRoots)]), readOnlyRoots: compactReadOnlyGrantUnion(readOnlyRoots), protectedRoots: Object.freeze([...new Set(input.protectedRoots ?? [])]), metadataRoots, profileDirectories: Object.freeze([...new Set(input.profileDirectories)]), env: Object.freeze(input.env) })
+  assert(plan.readOnlyRoots.length + plan.writableRoots.length + plan.metadataRoots.length <= 4096, 'execution_containment_anchor_budget')
   const broker = createWindowsNativeBroker(helper); broker.events.on('error', () => {})
   plans.add(plan); brokers.set(plan, broker); binaries.set(plan, Object.freeze(input.bun)); return plan
 }
@@ -569,7 +576,7 @@ export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, l
     if (entry.nonce === nonce && typeof entry.stage === 'string') markLaunch(entry.stage)
   })
   const launch = broker.request('launch', { executable: plan.executable, entry: plan.entry, cwd: plan.cwd, env: plan.env,
-    writableRoots: plan.writableRoots, readOnlyRoots: plan.readOnlyRoots, protectedRoots: plan.protectedRoots, realpathDll: plan.realpathDll, selectedConfigId: selectedConfigs.get(plan), nonce, leaseOwnerId }, deadline)
+    writableRoots: plan.writableRoots, readOnlyRoots: plan.readOnlyRoots, protectedRoots: plan.protectedRoots, metadataRoots: plan.metadataRoots, realpathDll: plan.realpathDll, selectedConfigId: selectedConfigs.get(plan), nonce, leaseOwnerId }, deadline)
   mainExit = observeWindowsHeldMainExit(broker.events, child, launch, (code, stderrKind) => {
     heldMainExitCode = code; heldMainStderrKind = stderrKind
   })

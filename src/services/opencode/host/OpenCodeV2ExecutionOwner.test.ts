@@ -114,7 +114,7 @@ describe('canonical durable execution owner', () => {
         helper: { path: 'C:\\TEST\\helper.exe', sha256: 'c'.repeat(64), arch: 'x64' },
         realpathDll: { path: 'C:\\TEST\\realpath.dll', sha256: 'd'.repeat(64), arch: 'x64' },
         executable: 'C:\\TEST\\bun.exe', entry: 'C:\\TEST\\source\\entry.ts', cwd: root,
-        writableRoots: [root], readOnlyRoots: ['C:\\TEST\\source'], protectedRoots: [],
+        writableRoots: [root], readOnlyRoots: ['C:\\TEST\\source'], protectedRoots: [], metadataRoots: [],
         profileDirectories: [root], env: {},
       }
       const owner = await acquireExecutionProfileOwner({ root, databasePath, epoch: 'TEST-epoch' } as SelectedExecutionProfile,
