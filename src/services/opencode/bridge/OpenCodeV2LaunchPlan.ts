@@ -7,7 +7,7 @@ import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { resolveOpenCodeV2ExecutionDelivery } from '../host/OpenCodeV2ExecutionDelivery.js'
 import { assertExecutionPlatformAvailable } from '../host/OpenCodeV2ExecutionPlatform.js'
-import { mkdir, mkdtemp, readFile, readdir, realpath, writeFile, access } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, realpath, writeFile, access, lstat } from 'node:fs/promises'
 import { constants } from 'node:fs'
 
 import { executionAssert, executionHash, executionRecord } from '../execution/OpenCodeV2ExecutionContracts.js'
@@ -97,6 +97,19 @@ export async function inspectOpenCodeV2LaunchSelection(envelope: BridgeEnvelope)
       try { await access(candidate, constants.X_OK); binary = await realpath(candidate); break } catch { /* Try the next selected PATH entry. */ }
     }
     executionAssert(binary, 'run_controller_runtime_missing'); command[0] = binary
+    // Package layouts can reach entry files through store links (for example
+    // node_modules/tsx/dist/cli.mjs under pnpm). The execution receipt binds
+    // canonical file identities (realpath(entry) === entry), so resolve each
+    // non-flag entry to its real file before fingerprinting, spawning and
+    // receipt verification all observe the same canonical command.
+    for (let index = 1; index < command.length; index += 1) {
+      const argument = command[index]!
+      if (argument.startsWith('-')) continue
+      executionAssert(path.isAbsolute(argument), 'controller_entry_not_absolute')
+      const entry = await realpath(argument).catch(() => null)
+      executionAssert(entry !== null && (await lstat(entry)).isFile(), 'controller_entry_invalid')
+      command[index] = entry
+    }
     // The native private profile supplies HOME/PATH/TMP. Only the selected
     // controller's team boundary and owned transport identity are forwarded.
     const environment: Record<string, string> = {}

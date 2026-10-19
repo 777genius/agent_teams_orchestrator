@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test'
 import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
-import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import * as profiles from '../OpenCodeProfileManager.js'
@@ -26,6 +26,9 @@ import type { ValidatedExecutionNative } from '../host/OpenCodeV2ExecutionHost.j
 let root: string, project: string, pin: '2.0.0' | '2.0.32' = '2.0.32'
 let saved: NodeJS.ProcessEnv
 let nativeSelectionCalls = 0, nativeReceiptCalls = 0
+let receiptControllers: unknown[] = []
+let launchConfig: Awaited<ReturnType<typeof mcp.resolveOpenCodeAppMcpLaunchConfig>> = {
+  config: { type: 'remote', enabled: true, url: 'http://127.0.0.1:1/mcp' }, source: 'env-override' }
 let authContent = '{}\n'
 let metadataAuthIdentity: OpenCodeProfileScope['selectedAuthIdentity'] = 'absent'
 const restores: { mockRestore(): void }[] = []
@@ -44,7 +47,8 @@ function envelope(): BridgeEnvelope {
       selectedModel: 'provider/model', skipPermissions: true, members: [{ name: 'worker' }] } }
 }
 beforeEach(async () => {
-  nativeSelectionCalls = 0; nativeReceiptCalls = 0
+  nativeSelectionCalls = 0; nativeReceiptCalls = 0; receiptControllers = []
+  launchConfig = { config: { type: 'remote', enabled: true, url: 'http://127.0.0.1:1/mcp' }, source: 'env-override' }
   authContent = '{}\n'; metadataAuthIdentity = 'absent'
   root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'TEST-v2-unattended-')))
   project = path.join(root, 'project'); await mkdir(project)
@@ -67,9 +71,10 @@ beforeEach(async () => {
       return { path: native().executablePath,
         policy: { generation: 'v2', version: pin, dialect: native().dialect }, native: native(), fingerprint: native().executableSha256 }
     }),
-    spyOn(receipts, 'createOpenCodeV2ExecutionReceipt').mockImplementation(async () => { nativeReceiptCalls++; return native() }),
-    spyOn(mcp, 'resolveOpenCodeAppMcpLaunchConfig').mockImplementation(async () => ({ config: {
-      type: 'remote', enabled: true, url: 'http://127.0.0.1:1/mcp' }, source: 'env-override' })))
+    spyOn(receipts, 'createOpenCodeV2ExecutionReceipt').mockImplementation(async (_root, _identity, controller) => {
+      nativeReceiptCalls++; receiptControllers.push(controller); return native()
+    }),
+    spyOn(mcp, 'resolveOpenCodeAppMcpLaunchConfig').mockImplementation(async () => launchConfig))
 })
 afterEach(async () => {
   for (const restore of restores.splice(0)) restore.mockRestore()
@@ -128,6 +133,31 @@ for (const version of ['2.0.0', '2.0.32'] as const) test(`${version} absent sele
   expect(posts).toBe(1)
   authContent = '{}\n'
   await expect(createOpenCodeV2PreparedMember(selection, native(), parent, member)).rejects.toThrow('run_selected_auth_changed')
+})
+test('local controller entries bind canonical real files while flags pass through unchanged', async () => {
+  const packageRoot = path.join(root, 'pkg'); await mkdir(packageRoot)
+  const realEntry = path.join(packageRoot, 'entry.mjs'); await writeFile(realEntry, 'export {}\n')
+  const linkedEntry = path.join(packageRoot, 'linked.mjs'); await symlink(realEntry, linkedEntry)
+  launchConfig = { config: { type: 'local', enabled: true, command: [process.execPath, linkedEntry, realEntry, '--no-warnings'] },
+    source: 'env-override' }
+  const selection = await inspectOpenCodeV2SourceAvailability(envelope())
+  // The store-link path resolves to the same canonical file before the receipt
+  // binds it, so fingerprint, spawned command and receipt identity agree.
+  expect(selection.controller).toEqual({ type: 'local', environment: {},
+    command: [await realpath(process.execPath), realEntry, realEntry, '--no-warnings'] })
+  expect(receiptControllers).toEqual([selection.controller])
+})
+test('controller entries refuse directories, missing and non-absolute targets before receipt identity', async () => {
+  const packageRoot = path.join(root, 'pkg'); await mkdir(packageRoot)
+  await writeFile(path.join(packageRoot, 'entry.mjs'), 'export {}\n')
+  launchConfig = { config: { type: 'local', enabled: true, command: [process.execPath, packageRoot] }, source: 'env-override' }
+  await expect(inspectOpenCodeV2SourceAvailability(envelope())).rejects.toThrow('controller_entry_invalid')
+  launchConfig = { config: { type: 'local', enabled: true, command: [process.execPath, path.join(packageRoot, 'missing.mjs')] },
+    source: 'env-override' }
+  await expect(inspectOpenCodeV2SourceAvailability(envelope())).rejects.toThrow('controller_entry_invalid')
+  launchConfig = { config: { type: 'local', enabled: true, command: [process.execPath, 'entry.mjs'] }, source: 'env-override' }
+  await expect(inspectOpenCodeV2SourceAvailability(envelope())).rejects.toThrow('controller_entry_not_absolute')
+  expect(receiptControllers).toEqual([])
 })
 for (const version of ['2.0.0', '2.0.32'] as const) test(`${version} admits Linux and Darwin selection but fences unsupported hosts before identity reads`, async () => {
   pin = version
