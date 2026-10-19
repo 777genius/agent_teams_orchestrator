@@ -258,11 +258,21 @@ function setNative(value: Callable, native: Callable): void {
 function openNative(selection: WindowsRealpathSelection): { library: NativeLibrary; context: bigint } {
   const ffi = require('bun:ffi') as typeof import('bun:ffi')
   const FFIType = ffi.FFIType
-  const library = ffi.dlopen(selection.dllPath, {
+  const open = () => ffi.dlopen(selection.dllPath, {
     RP_OpenV1: { args: [FFIType.u32, FFIType.u64, FFIType.ptr, FFIType.u32, FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
     RP_ResolveV1: { args: [FFIType.u64, FFIType.ptr, FFIType.u32, FFIType.ptr, FFIType.u32, FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
     RP_CloseV1: { args: [FFIType.u64, FFIType.ptr], returns: FFIType.i32 },
   }) as unknown as NativeLibrary
+  // A real-time AV scan can transiently deny the helper DLL at LoadLibrary
+  // right after it is materialized; bounded retries absorb only that class.
+  let library: NativeLibrary | undefined, dlopenError: unknown
+  for (let attempt = 0; attempt < 3 && library === undefined; attempt++) {
+    try { library = open() } catch (error) {
+      dlopenError = error
+      if (attempt < 2) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100)
+    }
+  }
+  if (library === undefined) throw dlopenError
   const anchors = Buffer.alloc(selection.anchors.length * ANCHOR_SIZE)
   const retained: Buffer[] = []
   try {
