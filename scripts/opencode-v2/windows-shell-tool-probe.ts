@@ -42,12 +42,12 @@ const project = path.join(root, 'TEST-project'), profileRoot = path.join(root, '
 const configDirectory = path.join(profileRoot, 'config', 'opencode'), dataDirectory = path.join(profileRoot, 'data', 'opencode')
 const databasePath = path.join(dataDirectory, 'opencode.db')
 const directories = [root, project, profileRoot, ...['home', 'config', 'data', 'cache', 'state', 'tmp', 'appdata', 'localappdata']
-  .map(name => path.join(profileRoot, name)), configDirectory, dataDirectory]
+  .map(name => path.join(profileRoot, name))]
 const configContent = JSON.stringify(shellProbeConfig)
 const setup = createWindowsNativeBroker(await resolveWindowsNativeArtifact())
 setup.events.on('error', () => {})
 const setupFilesystem = createWindowsOwnerFilesystem((input, until, signal) => setup.request(input.op, input, until, signal))
-let stage = 'private-profile', primary: unknown, failed = false
+let stage = 'private-directories', primary: unknown, failed = false
 let plan: Awaited<ReturnType<typeof planWindowsExecution>> | undefined
 let owner: Awaited<ReturnType<typeof acquireExecutionProfileOwner>> | undefined
 let launch: ReturnType<typeof launchWindowsExecution> | undefined
@@ -81,21 +81,39 @@ function retire(): Promise<void> {
 }
 try {
   await prepareWindowsPrivateDirectories(directories, setupFilesystem, [root])
+  facts.privateDirectoriesPrepared = true
   for (const [directory, write] of [[configDirectory, 'config'], [dataDirectory, 'database']] as const) {
-    const held = await setupFilesystem.openDirectory(directory, deadline)
+    // Prepared writers require the same exclusive creator handle. Leave these
+    // fixed leaves missing above; reopening an existing directory is read-only.
+    stage = `${write}-directory-create`
+    const held = await setupFilesystem.createDirectory(directory, deadline)
+    let writeFailed = false
     try {
+      stage = `${write}-write`
       if (write === 'config') await held.writePreparedConfig(configContent, createHash('sha256').update(configContent).digest('hex'), deadline)
       else await held.createPreparedDatabase(deadline)
-    } finally { await held.close() }
+    } catch (error) { writeFailed = true; throw error }
+    finally {
+      if (!writeFailed) stage = `${write}-directory-close`
+      try { await held.close() }
+      catch (error) {
+        cleanupFailed(`${write}-directory-close`, error)
+        if (!writeFailed) throw error
+      }
+    }
+    facts[write === 'config' ? 'configPrepared' : 'databasePrepared'] = true
   }
+  stage = 'setup-broker-close'
   await setup.close(); setupClosed = true
   const node = path.join(project, 'TEST-node.exe'), program = path.join(project, 'TEST-verify.cjs')
   const output = path.join(project, 'TEST-command-result.json'), marker = `TEST_SHELL_TOOL_${nonce}`
+  stage = 'node-copy'
   await copyFile(sourceNode, node, constants.COPYFILE_EXCL)
   assert.equal(await digest(node), sourceNodeSha256)
   const nodeBefore = await lstat(node)
   const expectedOutput = JSON.stringify({ schema: 1, nonce, marker })
   const programContent = `require('node:fs').writeFileSync(${JSON.stringify(output)},${JSON.stringify(expectedOutput)},{flag:'wx'});console.log(${JSON.stringify(marker)});\n`
+  stage = 'verifier-write'
   await writeFile(program, programContent, { flag: 'wx', mode: 0o600 })
   const { NODE_ENV: _nodeEnv, ...privateEnv } = privateOpenCodeReadEnvironment(profileRoot)
   const env = Object.freeze({ ...privateEnv, PWD: project, OPENCODE_CONFIG_DIR: configDirectory }) as Readonly<Record<string, string>>
@@ -103,6 +121,7 @@ try {
     databasePath, env, envSha256: executionHash(env), config: { directory: configDirectory, content: configContent,
       sha256: createHash('sha256').update(configContent).digest('hex') },
     selection: { agent: 'TEST-shell-agent', model: { providerID: 'TEST-provider', id: 'TEST-model' }, permissions: shellProbePermissions } })
+  stage = 'profile-validate'
   await validateExecutionProfile(profile)
   stage = 'plan'
   const profileDirectories = [...new Set([profileRoot, configDirectory, dataDirectory,
