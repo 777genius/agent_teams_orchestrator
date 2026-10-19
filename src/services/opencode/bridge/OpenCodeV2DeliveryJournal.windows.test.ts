@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test'
 import { randomUUID } from 'node:crypto'
-import { link, lstat, readFile, realpath, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises'
+import { link, lstat, readFile, readlink, realpath, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { executionHash, executionRecord } from '../execution/OpenCodeV2ExecutionContracts.js'
@@ -275,11 +275,36 @@ test.skipIf(process.platform !== 'win32')('Windows delivery guard holds exact pr
     finally { await unlink(hardlink) }
     const sentinel = path.join(root, 'TEST-sentinel')
     await writeFile(sentinel, 'TEST sentinel survives', { flag: 'wx' })
+    const sentinelIdentity = await lstat(sentinel)
+    expect(sentinelIdentity.isFile()).toBe(true)
     await rename(path.join(directory, 'owner.lock'), originalFile)
-    await symlink(sentinel, path.join(directory, 'owner.lock'), 'file')
-    try { await expect(openWindowsDeliveryJournalGuard(root, cutoff())).rejects.toThrow('execution_owner_alias') }
-    finally { await unlink(path.join(directory, 'owner.lock')); await rename(originalFile, path.join(directory, 'owner.lock')) }
+    const symlinkPath = path.join(directory, 'owner.lock')
+    await symlink(sentinel, symlinkPath, 'file')
+    let unexpectedGuard: Awaited<ReturnType<typeof openWindowsDeliveryJournalGuard>> | undefined
+    try {
+      const linkIdentity = await lstat(symlinkPath), linkTarget = await readlink(symlinkPath)
+      expect(linkIdentity.isSymbolicLink()).toBe(true)
+      // Native custody checks the link's owner before its reparse attribute.
+      await expect(openWindowsDeliveryJournalGuard(root, cutoff()).then(opened => {
+        unexpectedGuard = opened; return opened
+      })).rejects.toThrow(
+        /^(?:execution_owner_not_private:private_acl_owner:0|execution_owner_alias:owner_identity_reparse:0)$/)
+      const retainedLink = await lstat(symlinkPath), retainedSentinel = await lstat(sentinel)
+      expect(retainedLink.isSymbolicLink()).toBe(true)
+      expect([retainedLink.dev, retainedLink.ino]).toEqual([linkIdentity.dev, linkIdentity.ino])
+      expect(await readlink(symlinkPath)).toBe(linkTarget)
+      expect(retainedSentinel.isFile()).toBe(true)
+      expect([retainedSentinel.dev, retainedSentinel.ino]).toEqual([sentinelIdentity.dev, sentinelIdentity.ino])
+      expect(await readFile(sentinel, 'utf8')).toBe('TEST sentinel survives')
+    } finally {
+      try { await unexpectedGuard?.close() }
+      finally { await unlink(symlinkPath); await rename(originalFile, symlinkPath) }
+    }
     expect(await readFile(sentinel, 'utf8')).toBe('TEST sentinel survives')
+    const restoredIdentity = await lstat(symlinkPath)
+    expect([restoredIdentity.dev, restoredIdentity.ino]).toEqual([initial.dev, initial.ino])
+    const restoredGuard = await openWindowsDeliveryJournalGuard(root, cutoff())
+    try { await restoredGuard.assertOwned() } finally { await restoredGuard.close() }
     const originalDirectory = path.join(root, 'TEST-original-directory')
     await rename(directory, originalDirectory)
     await symlink(originalDirectory, directory, 'junction')
