@@ -64,12 +64,32 @@ const fixtureSecurity = `
 Add-Type -TypeDefinition @'
 using System; using System.Runtime.InteropServices;
 public static class TestDeliverySecurity {
-[DllImport("advapi32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern bool GetFileSecurityW(string p,uint i,[Out] byte[] b,uint n,out uint needed);
-[DllImport("advapi32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern bool SetFileSecurityW(string p,uint i,byte[] b);
-[DllImport("advapi32.dll",SetLastError=true)] static extern bool GetSecurityDescriptorControl(byte[] b,out ushort c,out uint r);
-[DllImport("advapi32.dll",SetLastError=true)] static extern bool SetSecurityDescriptorControl([In,Out] byte[] b,ushort mask,ushort bits);
-public static byte[] Read(string p) { uint n; GetFileSecurityW(p,5,null,0,out n); if(n==0)throw new Exception("TEST_security_read"); var b=new byte[n]; if(!GetFileSecurityW(p,5,b,n,out n))throw new Exception("TEST_security_read"); return b; }
-public static void Write(string p,byte[] original,uint sections) {var b=(byte[])original.Clone();ushort c;uint r;if(!GetSecurityDescriptorControl(b,out c,out r))throw new Exception("TEST_security_control");if((sections&4)!=0&&(c&0x400)!=0&&!SetSecurityDescriptorControl(b,0x100,0x100))throw new Exception("TEST_security_control");if(!SetFileSecurityW(p,sections,b))throw new Exception("TEST_security_write");}
+public static string Step = "unknown";
+[DllImport("advapi32.dll",EntryPoint="GetFileSecurityW",ExactSpelling=true,CharSet=CharSet.Unicode,SetLastError=true)]
+[return:MarshalAs(UnmanagedType.Bool)] static extern bool GetFileSecurity(string p,uint i,[Out] byte[] b,uint n,out uint needed);
+[DllImport("advapi32.dll",EntryPoint="SetFileSecurityW",ExactSpelling=true,CharSet=CharSet.Unicode,SetLastError=true)]
+[return:MarshalAs(UnmanagedType.Bool)] static extern bool SetFileSecurity(string p,uint i,byte[] b);
+[DllImport("advapi32.dll",ExactSpelling=true,SetLastError=true)]
+[return:MarshalAs(UnmanagedType.Bool)] static extern bool GetSecurityDescriptorControl(byte[] b,out ushort c,out uint r);
+[DllImport("advapi32.dll",ExactSpelling=true,SetLastError=true)]
+[return:MarshalAs(UnmanagedType.Bool)] static extern bool SetSecurityDescriptorControl([In,Out] byte[] b,ushort mask,ushort bits);
+public static byte[] Read(string p) {
+Step="read_size"; uint n;
+bool result=GetFileSecurity(p,5,null,0,out n);int error=Marshal.GetLastWin32Error();
+if(!result&&error!=122)throw new System.ComponentModel.Win32Exception(error);
+if(result||n==0||n>131072)throw new InvalidOperationException("TEST_descriptor_size_changed");
+Step="read_descriptor";var b=new byte[(int)n];uint actual;
+if(!GetFileSecurity(p,5,b,n,out actual))throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+if(actual!=n)throw new InvalidOperationException("TEST_descriptor_size_changed");return b;
+}
+public static void Write(string p,byte[] original,uint sections) {
+var b=(byte[])original.Clone();ushort c;uint r;Step="read_control";
+if(!GetSecurityDescriptorControl(b,out c,out r))throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+Step="write_control";
+if((sections&4)!=0&&(c&0x400)!=0&&!SetSecurityDescriptorControl(b,0x100,0x100))throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+Step="write_descriptor";
+if(!SetFileSecurity(p,sections,b))throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+}
 }
 '@
 `
@@ -79,37 +99,108 @@ async function securityFixture(target: string, mode: 'foreign-ace' | 'unprotecte
   const execute = async (phase: 'install' | 'restore', script: string, extra: Record<string, string> = {}) => {
     const budget = Math.min(10_000, deadline - Date.now())
     expect(budget).toBeGreaterThan(0)
-    const child = Bun.spawn(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', fixtureSecurity + script], {
+    // A single encoded UTF-16LE argument preserves the exact C#/PowerShell
+    // source across Bun's Windows argv quoting; Stop includes Add-Type failures.
+    const command = `
+$ErrorActionPreference='Stop'
+$fixtureStep='add_type';$primaryFailure=$null;$primaryStep=$null;$primaryNativeStep=$null;$rollbackFailed=$false
+try {
+${fixtureSecurity}
+${script}
+} catch {
+$failure=if($null -ne $primaryFailure){$primaryFailure}else{$_}
+$step=if($null -ne $primaryStep){$primaryStep}else{$fixtureStep}
+if($step -in @('read_original','write_mutation','write_restore','read_restored')){
+$step=if($null -ne $primaryNativeStep){$primaryNativeStep}else{[TestDeliverySecurity]::Step}}
+$steps=@('add_type','read_original','acl_read','rule_construct','verify_mutation','write_mutation','write_restore','read_restored','read_size','read_descriptor','read_control','write_control','write_descriptor')
+if($step -notin $steps){$step='unknown'}
+$types=@('System.Management.Automation.MethodInvocationException','System.Management.Automation.RuntimeException','System.Management.Automation.PSInvalidOperationException','System.EntryPointNotFoundException','System.DllNotFoundException','System.ComponentModel.Win32Exception','System.UnauthorizedAccessException','System.Security.SecurityException','System.ArgumentException','System.InvalidOperationException')
+$exceptionType='unknown';$nativeCode=$null;$exception=$failure.Exception
+for($i=0;$i -lt 4 -and $null -ne $exception;$i++){
+$name=$exception.GetType().FullName;if($name -in $types){$exceptionType=$name}
+if($exception -is [System.ComponentModel.Win32Exception]){$nativeCode=[long]$exception.NativeErrorCode}
+$exception=$exception.InnerException}
+$ids=@('COMPILER_ERRORS','SOURCE_CODE_ERROR','TYPE_ALREADY_EXISTS','TypeNotFound','MethodNotFound','MethodInvocationException','Exception','ArgumentException','UnauthorizedAccessException','TEST_fixture_mutation_missing')
+$id=if(([string]$failure.FullyQualifiedErrorId).Length -le 256){([string]$failure.FullyQualifiedErrorId).Split(',')[0]}else{'unknown'}
+$errorId=if($id -in $ids){$id}else{'unknown'}
+$facts=@{step=$step;exceptionType=$exceptionType;errorId=$errorId;rollbackFailed=[bool]$rollbackFailed}
+if($null -ne $nativeCode -and $nativeCode -ge 0 -and $nativeCode -le 4294967295){$facts.nativeCode=$nativeCode}
+[Console]::Out.Write('TEST_SECURITY_FAILURE:'+($facts|ConvertTo-Json -Compress));throw
+}`
+    const child = Bun.spawn(['powershell.exe', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(command, 'utf16le').toString('base64')], {
       env: { ...process.env, TEST_TARGET: target, ...extra }, stdin: 'ignore', stdout: 'pipe', stderr: 'pipe', timeout: budget,
     })
-    const [code, stdout] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()])
-    if (code !== 0) console.error(JSON.stringify({ event: 'TEST_windows_journal_security_fixture_failed', phase, mode,
-      targetKind: path.basename(target) === 'owner.lock' ? 'guard' : 'leaf' }))
-    expect(code).toBe(0) // Never print raw PowerShell messages, paths or descriptors.
+    const stderr = (async () => {
+      const chunks: Uint8Array[] = []; let retained = 0
+      for await (const chunk of child.stderr) {
+        const part = chunk.subarray(0, Math.max(0, 65_536 - retained))
+        if (part.length) { chunks.push(part); retained += part.length }
+      }
+      return Buffer.concat(chunks).toString('utf8')
+    })()
+    const [code, stdout] = await Promise.all([child.exited, new Response(child.stdout).text(), stderr])
+    if (code !== 0) {
+      let facts: Record<string, unknown> = {}
+      if (stdout.startsWith('TEST_SECURITY_FAILURE:') && stdout.length <= 4096) {
+        try { facts = executionRecord(JSON.parse(stdout.slice('TEST_SECURITY_FAILURE:'.length))) } catch { /* Closed unknowns below. */ }
+      }
+      const steps = ['add_type', 'read_original', 'acl_read', 'rule_construct', 'verify_mutation', 'write_mutation', 'write_restore',
+        'read_restored', 'read_size', 'read_descriptor', 'read_control', 'write_control', 'write_descriptor']
+      const types = ['System.Management.Automation.MethodInvocationException', 'System.Management.Automation.RuntimeException',
+        'System.Management.Automation.PSInvalidOperationException', 'System.EntryPointNotFoundException', 'System.DllNotFoundException',
+        'System.ComponentModel.Win32Exception', 'System.UnauthorizedAccessException', 'System.Security.SecurityException',
+        'System.ArgumentException', 'System.InvalidOperationException']
+      const ids = ['COMPILER_ERRORS', 'SOURCE_CODE_ERROR', 'TYPE_ALREADY_EXISTS', 'TypeNotFound', 'MethodNotFound',
+        'MethodInvocationException', 'Exception', 'ArgumentException', 'UnauthorizedAccessException', 'TEST_fixture_mutation_missing']
+      console.error(JSON.stringify({ event: 'TEST_windows_journal_security_fixture_failed', phase, mode,
+        targetKind: path.basename(target) === 'owner.lock' ? 'guard' : 'leaf',
+        ...(typeof facts.rollbackFailed === 'boolean' ? { rollbackFailed: facts.rollbackFailed } : {}),
+        step: typeof facts.step === 'string' && steps.includes(facts.step) ? facts.step : 'unknown',
+        exceptionType: typeof facts.exceptionType === 'string' && types.includes(facts.exceptionType) ? facts.exceptionType : 'unknown',
+        errorId: typeof facts.errorId === 'string' && ids.includes(facts.errorId) ? facts.errorId : 'unknown',
+        ...(Number.isSafeInteger(facts.nativeCode) && Number(facts.nativeCode) >= 0 && Number(facts.nativeCode) <= 0xffffffff
+          ? { nativeCode: Number(facts.nativeCode) } : {}) }))
+    }
+    expect(code).toBe(0) // Raw PowerShell messages, paths and descriptors stay private.
     return stdout.trim()
   }
   const original = await execute('install', `
-$original=[TestDeliverySecurity]::Read($env:TEST_TARGET)
-$sections=if($env:TEST_MODE-eq 'foreign-owner'){1}else{4}
+$fixtureStep='read_original';$original=[TestDeliverySecurity]::Read($env:TEST_TARGET)
+$sections=if($env:TEST_MODE -eq 'foreign-owner'){1}else{4}
 try{
-$acl=Get-Acl -LiteralPath $env:TEST_TARGET
-switch($env:TEST_MODE){
-'foreign-ace'{$acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new('S-1-1-0'),'Read','None','None','Allow'))}
+$fixtureStep='acl_read';$acl=Get-Acl -LiteralPath $env:TEST_TARGET
+$fixtureStep='rule_construct';switch($env:TEST_MODE){
+'foreign-ace'{$rule=[Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new('S-1-1-0'),'Read','None','None','Allow');$expectedMask=[long]$rule.FileSystemRights;$acl.AddAccessRule($rule)}
 'unprotected'{$acl.SetAccessRuleProtection($false,$false)}
 'foreign-owner'{$acl.SetOwner([Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'))}
 }
-[TestDeliverySecurity]::Write($env:TEST_TARGET,$acl.GetSecurityDescriptorBinaryForm(),$sections)
+$fixtureStep='write_mutation';[TestDeliverySecurity]::Write($env:TEST_TARGET,$acl.GetSecurityDescriptorBinaryForm(),$sections)
+$fixtureStep='verify_mutation';$installed=[Security.AccessControl.RawSecurityDescriptor]::new([TestDeliverySecurity]::Read($env:TEST_TARGET),0)
+$matches=switch($env:TEST_MODE){
+'foreign-ace'{@($installed.DiscretionaryAcl|Where-Object{$_.AceType -eq 'AccessAllowed' -and $_.SecurityIdentifier.Value -eq 'S-1-1-0' -and [long]$_.AccessMask -eq $expectedMask -and [int]$_.AceFlags -eq 0}).Count -eq 1}
+'unprotected'{([int]$installed.ControlFlags -band 0x1000) -eq 0}
+'foreign-owner'{$installed.Owner.Value -eq 'S-1-5-32-544'}
+}
+if(!$matches){throw [InvalidOperationException]::new('TEST_fixture_mutation_missing')}
 [Console]::Write([Convert]::ToBase64String($original))
-}catch{[TestDeliverySecurity]::Write($env:TEST_TARGET,$original,$sections);throw}
+}catch{
+$primaryFailure=$_;$primaryStep=$fixtureStep;$primaryNativeStep=[TestDeliverySecurity]::Step
+try{
+$fixtureStep='write_restore';[TestDeliverySecurity]::Write($env:TEST_TARGET,$original,$sections)
+$fixtureStep='read_restored';$restored=[TestDeliverySecurity]::Read($env:TEST_TARGET)
+if([Convert]::ToBase64String($restored) -ne [Convert]::ToBase64String($original)){throw [InvalidOperationException]::new('TEST_fixture_restore_changed')}
+}catch{$rollbackFailed=$true}
+throw $primaryFailure
+}
 `, { TEST_MODE: mode })
   let primary: unknown
   try { await verify() } catch (error) { primary = error; throw error }
   finally {
     try {
       expect(await execute('restore', `
-$sections=if($env:TEST_MODE-eq 'foreign-owner'){1}else{4}
-[TestDeliverySecurity]::Write($env:TEST_TARGET,[Convert]::FromBase64String($env:TEST_DESCRIPTOR),$sections)
-[Console]::Write([Convert]::ToBase64String([TestDeliverySecurity]::Read($env:TEST_TARGET)))
+$sections=if($env:TEST_MODE -eq 'foreign-owner'){1}else{4}
+$fixtureStep='write_restore';[TestDeliverySecurity]::Write($env:TEST_TARGET,[Convert]::FromBase64String($env:TEST_DESCRIPTOR),$sections)
+$fixtureStep='read_restored';[Console]::Write([Convert]::ToBase64String([TestDeliverySecurity]::Read($env:TEST_TARGET)))
 `, { TEST_MODE: mode, TEST_DESCRIPTOR: original }) === original).toBe(true)
     } catch (error) {
       if (primary !== undefined) throw new AggregateError([primary, error], 'TEST_journal_fixture_restore_failed')
