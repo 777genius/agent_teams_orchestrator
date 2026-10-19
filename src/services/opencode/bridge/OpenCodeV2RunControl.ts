@@ -356,25 +356,45 @@ async function readUnixProcessIdentity(pid = process.pid): Promise<RunProcessIde
       __error: { args: [], returns: FFIType.ptr },
     })
     try {
-      const before = Buffer.alloc(56), after = Buffer.alloc(56), executable = Buffer.alloc(4096), boot = Buffer.alloc(128), length = Buffer.alloc(8)
+      const executable = Buffer.alloc(4096), boot = Buffer.alloc(128), length = Buffer.alloc(8)
       length.writeBigUInt64LE(128n)
-      if (native.symbols.proc_pidinfo(pid, 17, 0, ptr(before), before.length) !== before.length) {
-        const pointer = native.symbols.__error()
-        executionAssert(pointer !== null, 'run_process_unknown')
-        const errno = new DataView(toArrayBuffer(pointer, 0, 4)).getInt32(0, true)
-        // Only the kernel's ESRCH establishes absence; access/query failures
-        // remain UNKNOWN and cannot qualify retirement or authorize takeover.
-        throw Object.assign(new Error('run_process_unknown'), { code: errno === 3 ? 'ESRCH' : 'EACCES' })
+      for (let attempt = 0; ; attempt += 1) {
+        const before = Buffer.alloc(56), after = Buffer.alloc(56)
+        if (native.symbols.proc_pidinfo(pid, 17, 0, ptr(before), before.length) !== before.length) {
+          const pointer = native.symbols.__error()
+          executionAssert(pointer !== null, 'run_process_unknown')
+          const errno = new DataView(toArrayBuffer(pointer, 0, 4)).getInt32(0, true)
+          // Only the kernel's ESRCH establishes absence; access/query failures
+          // remain UNKNOWN and cannot qualify retirement or authorize takeover.
+          throw Object.assign(new Error('run_process_unknown'), { code: errno === 3 ? 'ESRCH' : 'EACCES' })
+        }
+        const uniqueId = before.readBigUInt64LE(0)
+        executionAssert(native.symbols.proc_pidpath(pid, ptr(executable), executable.length) > 0 &&
+          native.symbols.sysctlbyname(ptr(Buffer.from('kern.bootsessionuuid\0')), ptr(boot), ptr(length), null, 0) === 0, 'run_process_unknown')
+        const executablePath = executable.toString('utf8').split('\0')[0]!, bootId = boot.toString('utf8').split('\0')[0]!.toLowerCase()
+        executionAssert(await realpath(executablePath) === executablePath && /^[a-f0-9-]{36}$/.test(bootId), 'run_process_unknown')
+        const executableSha256 = digest(await readFile(executablePath))
+        const afterLength = native.symbols.proc_pidinfo(pid, 17, 0, ptr(after), after.length)
+        // The kernel-assigned unique ID is the process instance identity: PID
+        // reuse must never authenticate a replacement process.
+        executionAssert(afterLength === after.length && after.readBigUInt64LE(0) === uniqueId, 'run_process_changed')
+        // Bytes 8-15 are the parent's unique ID: reparenting (launchd adoption
+        // when the spawner exits) does not change the instance or its image.
+        let stableIgnoringParent = true
+        for (let i = 0; i < before.length; i += 1) {
+          if (i >= 8 && i < 16) continue
+          if (before[i] !== after[i]) { stableIgnoringParent = false; break }
+        }
+        if (before.equals(after) || stableIgnoringParent) {
+          const source = before.equals(after) ? before : after
+          // Stable record field; on Darwin this is unique process ID:PID version,
+          // not a fabricated Linux clock tick. Every reader uses the same parser.
+          return { pid, startTicks: `${source.readBigUInt64LE(16)}:${source.readInt32LE(32)}`, bootId, executablePath, executableSha256 }
+        }
+        // Remaining drift is a lifecycle event mid-hash (e.g. exec); a fresh
+        // bracket over the settled process authenticates one image epoch.
+        if (attempt >= 2) executionAssert(false, 'run_process_changed')
       }
-      executionAssert(native.symbols.proc_pidpath(pid, ptr(executable), executable.length) > 0 &&
-        native.symbols.sysctlbyname(ptr(Buffer.from('kern.bootsessionuuid\0')), ptr(boot), ptr(length), null, 0) === 0, 'run_process_unknown')
-      const executablePath = executable.toString('utf8').split('\0')[0]!, bootId = boot.toString('utf8').split('\0')[0]!.toLowerCase()
-      executionAssert(await realpath(executablePath) === executablePath && /^[a-f0-9-]{36}$/.test(bootId), 'run_process_unknown')
-      const executableSha256 = digest(await readFile(executablePath))
-      executionAssert(native.symbols.proc_pidinfo(pid, 17, 0, ptr(after), after.length) === after.length && before.equals(after), 'run_process_changed')
-      // Stable record field; on Darwin this is unique process ID:PID version,
-      // not a fabricated Linux clock tick. Every reader uses the same parser.
-      return { pid, startTicks: `${before.readBigUInt64LE(16)}:${before.readInt32LE(32)}`, bootId, executablePath, executableSha256 }
     } finally { native.close() }
   }
   executionAssert(process.platform === 'linux' && Number.isSafeInteger(pid) && pid > 0, 'run_source_linux_required')
