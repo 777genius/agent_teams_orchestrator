@@ -85,6 +85,7 @@ function close(): Promise<void> {
     } catch { process.exit(1) }
   })()
 }
+childControl.events.on('error', (error: unknown) => { reportStartupFailure('failed', error); void close() })
 childControl.events.once('disconnect', () => { void close() })
 process.once('SIGTERM', () => { void close() })
 
@@ -98,15 +99,21 @@ async function start(input: Record<string, unknown>): Promise<void> {
   const native = input.native as ValidatedExecutionNative
   const profile = input.profile as OwnedNativeProfile
   let activationDeadline: number | undefined
-  if (input.deferRuntime !== undefined) {
-    executionAssert(process.platform === 'win32' && input.deferRuntime === true && Number.isSafeInteger(input.activationDeadline) &&
+  if (input.activationDeadline !== undefined) {
+    // The owner's absolute initialization deadline replaces the local startup
+    // watchdog on every platform; deferred Windows additionally gates runtime
+    // import behind the authenticated activation barrier.
+    executionAssert(Number.isSafeInteger(input.activationDeadline) &&
       Number(input.activationDeadline) > Date.now() && Number(input.activationDeadline) <= startupStartedAt + openCodeV2RunInitializationMs(process.platform), 'execution_identity_mismatch')
     activationDeadline = Number(input.activationDeadline)
-    graphActivation = windowsGraphActivation({ nonce: prepared.nonce, leaseOwnerId: prepared.leaseOwnerId,
-      namespace: prepared.namespace, pid: process.pid, birth: prepared.birth }, activationDeadline)
+    if (input.deferRuntime !== undefined) {
+      executionAssert(process.platform === 'win32' && input.deferRuntime === true, 'execution_identity_mismatch')
+      graphActivation = windowsGraphActivation({ nonce: prepared.nonce, leaseOwnerId: prepared.leaseOwnerId,
+        namespace: prepared.namespace, pid: process.pid, birth: prepared.birth }, activationDeadline)
+    }
     clearTimeout(startupTimer)
     startupTimer = setTimeout(() => { reportStartupFailure('timeout'); void close() }, activationDeadline - Date.now())
-  } else executionAssert(input.activationDeadline === undefined, 'execution_identity_mismatch')
+  } else executionAssert(input.deferRuntime === undefined, 'execution_identity_mismatch')
   enterStartupStage('delivery-resolution')
   const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'execution')
   executionAssert(native.runtimeMode === delivery.runtimeMode && native.entrySha256 === delivery.entrySha256 &&

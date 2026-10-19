@@ -392,7 +392,7 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
       executionAssert(!closeWork && !exited, 'execution_identity_mismatch')
       await owner!.bindChild(mapping.bun.hostPID, birth, mapping); check(); mark('child-bound')
       await launch.assertLive(); check()
-      await launch.start({ password, native, profile, ...(gatedWindows ? { deferRuntime: true, activationDeadline: context.deadline } : {}) }, context.deadline, lifetime.signal); check(); mark('start-sent')
+      await launch.start({ password, native, profile, activationDeadline: context.deadline, ...(gatedWindows ? { deferRuntime: true } : {}) }, context.deadline, lifetime.signal); check(); mark('start-sent')
     })
     const assertReadyIdentity = (row: Record<string, unknown>) => {
       executionAssert(mapping && !closeWork && !exited, 'execution_identity_mismatch')

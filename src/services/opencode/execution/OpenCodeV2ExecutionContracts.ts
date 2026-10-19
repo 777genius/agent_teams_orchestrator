@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 
 /** One absolute owner startup ceiling; callers may clip it to an earlier deadline. */
 export function openCodeV2RunInitializationMs(platform: NodeJS.Platform): number {
-  return platform === 'win32' ? 300_000 : platform === 'darwin' ? 180_000 : 90_000
+  return platform === 'win32' ? 300_000 : platform === 'darwin' ? 300_000 : 90_000
 }
 // Windows physical close shares the existing 29s owner Stop envelope. The
 // owner clips this ceiling to leave 2s for the final durable run receipt.

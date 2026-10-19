@@ -86,10 +86,10 @@ describe('execution host ownership and cleanup', () => {
   })
   test('owner initialization budget is platform-specific without changing other platforms', () => {
     expect(openCodeV2RunInitializationMs('win32')).toBe(300_000)
-    expect(openCodeV2RunInitializationMs('darwin')).toBe(180_000)
+    expect(openCodeV2RunInitializationMs('darwin')).toBe(300_000)
     expect(openCodeV2RunInitializationMs('linux')).toBe(90_000)
   })
-  for (const mode of ['deferred-extended-expiry', 'deferred-expiry', 'deferred-stop', 'deferred-premature', 'deferred-expired', 'deferred-overflow', 'standalone-windows', 'standalone-posix'] as const)
+  for (const mode of ['deferred-extended-expiry', 'deferred-expiry', 'deferred-stop', 'deferred-premature', 'deferred-expired', 'deferred-overflow', 'standalone-windows', 'standalone-posix', 'owner-deadline-posix', 'transport-error'] as const)
     test(`actual child watchdog retains its original deadline and activation barrier (${mode})`, async () => {
       const source = await readFile(path.resolve(import.meta.dir, '../../../entrypoints/opencodeV2ExecutionServer.ts'), 'utf8')
       const body = new Bun.Transpiler({ loader: 'ts' }).transformSync(source.slice(source.indexOf('const controller = new AbortController()'))
@@ -106,7 +106,7 @@ describe('execution host ownership and cleanup', () => {
       const profile: SelectedExecutionProfile = { root: '/TEST-profile', epoch: 'TEST-epoch', directory: '/TEST-project', databasePath: '/TEST-profile/data/opencode.db',
         env: {}, envSha256: 'f'.repeat(64), config: { directory: '/TEST-profile/config', content: '{}', sha256: 'f'.repeat(64) },
         selection: { agent: 'worker', model: { providerID: 'TEST', id: 'model' }, permissions: [] } }
-      const platform = mode === 'standalone-posix' ? 'darwin' : 'win32'
+      const platform = mode === 'standalone-posix' || mode === 'owner-deadline-posix' ? 'darwin' : 'win32'
       const scope = { AbortController, Date, windowsGraphActivation, boundOpenCodeRead, openCodeV2RunInitializationMs,
         process: { platform, pid: 42, env: { PWD: profile.directory }, versions: { bun: 'TEST-bun' },
           execPath: native.bun.path, argv: ['TEST-bun', '/TEST-entry'], cwd: () => profile.directory,
@@ -136,11 +136,26 @@ describe('execution host ownership and cleanup', () => {
           await settle()
         }
         expect([...timers.values()].map(timer => timer.at)).toEqual([base + (platform === 'win32' ? 120_000 : 60_000)])
+        if (mode === 'transport-error') {
+          // An unhandled transport 'error' must not become an uncaught emitter
+          // throw: the entry reports its controlled failure and closes once.
+          events.emit('message', { type: 'prepare', nonce, leaseOwnerId }); await settle()
+          expect(() => events.emit('error', new Error('TEST-transport-drop'))).not.toThrow()
+          await settle()
+          expect(inspect()).toMatchObject({ closing: true, runtimeReady: false })
+          expect(reports).toHaveLength(1)
+          expect(reports[0]).toMatchObject({ reason: 'failed', stage: 'waiting-for-prepare', errorName: 'Error' })
+          expect(sent.some(value => value.type === 'ready' || value.type === 'graph-ready')).toBe(false)
+          expect(sent.some(value => value.type === 'closed')).toBe(true)
+          expect(exits).toEqual([0])
+          return
+        }
         events.emit('message', { type: 'prepare', nonce, leaseOwnerId }); await settle()
         now = base + 20_000
         const deferred = mode.startsWith('deferred')
         events.emit('message', { type: 'start', nonce, leaseOwnerId, namespace: prepared.namespace, password: 'A'.repeat(43), native, profile,
-          ...(deferred ? { deferRuntime: true, activationDeadline: mode === 'deferred-expired' ? now : mode === 'deferred-overflow' ? base + 300_001 : originalDeadline } : {}) })
+          ...(deferred ? { deferRuntime: true, activationDeadline: mode === 'deferred-expired' ? now : mode === 'deferred-overflow' ? base + 300_001 : originalDeadline }
+            : mode === 'owner-deadline-posix' ? { activationDeadline: originalDeadline } : {}) })
         await settle()
         if (mode === 'deferred-expired' || mode === 'deferred-overflow') {
           expect(armed).toEqual([base + 120_000])
@@ -165,6 +180,14 @@ describe('execution host ownership and cleanup', () => {
             if (mode === 'deferred-stop') events.emit('message', { type: 'close', nonce, leaseOwnerId })
             else await advance(originalDeadline)
           }
+        } else if (mode === 'owner-deadline-posix') {
+          // The local 60s watchdog is replaced by the owner's absolute
+          // initialization deadline, not merely pushed behind it.
+          expect([...timers.values()].map(timer => timer.at)).toEqual([originalDeadline])
+          await advance(base + 60_001)
+          expect(inspect().closing).toBe(false)
+          expect(reports).toEqual([])
+          await advance(originalDeadline)
         } else await advance(base + (platform === 'win32' ? 120_000 : 60_000))
         await settle()
         expect(inspect()).toMatchObject({ closing: true, runtimeReady: false })
@@ -172,7 +195,8 @@ describe('execution host ownership and cleanup', () => {
         expect(exits).toEqual([0])
         expect(reports).toHaveLength(1)
         if (mode.endsWith('expiry')) expect(reports[0]).toMatchObject({ reason: 'timeout', stage: 'waiting-for-activation', elapsedMs: originalDeadline - base })
-        if (!deferred) expect(reports[0]).toMatchObject({ reason: 'timeout', stage: 'graph-validation', elapsedMs: platform === 'win32' ? 120_000 : 60_000 })
+        if (mode === 'owner-deadline-posix') expect(reports[0]).toMatchObject({ reason: 'timeout', stage: 'graph-validation', elapsedMs: originalDeadline - base })
+        if (!deferred && mode !== 'owner-deadline-posix') expect(reports[0]).toMatchObject({ reason: 'timeout', stage: 'graph-validation', elapsedMs: platform === 'win32' ? 120_000 : 60_000 })
         if (mode === 'deferred-extended-expiry') {
           events.emit('message', { type: 'activate', ...prepared }); await settle()
           expect(inspect()).toMatchObject({ closing: true, runtimeReady: false })
@@ -257,7 +281,7 @@ describe('execution host ownership and cleanup', () => {
         }
         return { child, prepare: async () => mapping, assertLive,
           start: async (value: Record<string, unknown>) => {
-            payload = value; expect(value.deferRuntime).toBe(platform === 'win32' ? true : undefined); expect(critical).toBe(1)
+            payload = value; expect(value.deferRuntime).toBe(platform === 'win32' ? true : undefined); expect(value.activationDeadline).toBe(deadline); expect(critical).toBe(1)
             if (platform !== 'win32') { atReady = true; child.emit('message', { type: 'ready', ...tuple(), baseUrl: 'http://127.0.0.1:1' }) }
           },
           activate: async () => { await assertLive(); observation.activate++; atReady = true; child.emit('message', { type: 'ready', ...tuple(), baseUrl: 'http://127.0.0.1:1' }) },

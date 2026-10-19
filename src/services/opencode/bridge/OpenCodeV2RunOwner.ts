@@ -184,7 +184,10 @@ export class OpenCodeV2RunOwner {
     let lease: ExecutionLease
     try {
       lease = await this.ports.acquire(memberPlan.native, memberPlan.profile, this.context(memberPlan,
-        this.deferredWindowsControllers ? initializationDeadline : this.plan.deadline, acquiring.signal),
+        // The acquisition context deadline is the initialization deadline on
+        // every platform: it is the deadline the child receives as its startup
+        // watchdog, and the timer above already enforces the same bound.
+        initializationDeadline, acquiring.signal),
         this.deferredWindowsControllers ? (start, signal) => this.startupGate(start, signal, initializationDeadline) : undefined,
         this.graphValidation)
     } finally { clearTimeout(acquisitionTimer); this.acquisitions.delete(acquiring) }
