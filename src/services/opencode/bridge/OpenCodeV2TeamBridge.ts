@@ -466,6 +466,9 @@ async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: O
       case 'opencode.listRuntimePermissions': case 'opencode.getRuntimeTranscript': {
         const memberId = required(body.memberName, 'memberName')
         const member = await bridge.resolveMember(memberId, text(body.laneId), text(body.runtimeSessionId ?? body.sessionId), remaining())
+        if (envelope.command === 'opencode.getRuntimeTranscript') executionAssert(
+          ['2.0.0', '2.0.32'].includes(member.pin) && originalStatus?.qualification?.version === member.pin,
+          'v2_transcript_version_unsupported')
         request = { operation: envelope.command === 'opencode.listRuntimePermissions' ? 'permissions' : 'transcript',
           memberId, originalSessionId: member.originalSessionId }
         break
@@ -557,6 +560,16 @@ const legacyRecoveryCommands = new Set([
   'opencode.stopTeam', 'opencode.stopOutcome', 'opencode.reconcileStop',
   'opencode.commandStatus',
 ])
+
+/** Read an already-owned V2 transcript without selecting or qualifying a runtime.
+ * A missing original owner stays a refusal; this entry has no V1 callback. */
+export async function executeExistingOpenCodeV2TranscriptEnvelope(input: unknown): Promise<unknown> {
+  const envelope = validateEnvelope(input)
+  executionAssert(envelope.command === 'opencode.getRuntimeTranscript', 'v2_transcript_command_invalid')
+  const binding = resolveOpenCodeV2RunBinding(envelope.body)
+  executionAssert(binding, 'v2_transcript_binding_missing')
+  return executeV2(envelope, null, new OpenCodeV2TeamBridge(resolveClaudeMultimodelPaths().data, binding))
+}
 
 /** Public protocol1 routing. The existing V1 executor is passed unchanged. */
 export async function executeSelectedOpenCodeBridgeCommandEnvelope(input: unknown,
