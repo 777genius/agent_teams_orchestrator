@@ -112,7 +112,7 @@ $failure=if($null -ne $primaryFailure){$primaryFailure}else{$_}
 $step=if($null -ne $primaryStep){$primaryStep}else{$fixtureStep}
 if($step -in @('read_original','write_mutation','write_restore','read_restored')){
 $step=if($null -ne $primaryNativeStep){$primaryNativeStep}else{[TestDeliverySecurity]::Step}}
-$steps=@('add_type','read_original','acl_read','rule_construct','verify_mutation','write_mutation','write_restore','read_restored','read_size','read_descriptor','read_control','write_control','write_descriptor')
+$steps=@('add_type','read_original','acl_construct','rule_construct','verify_mutation','write_mutation','write_restore','read_restored','read_size','read_descriptor','read_control','write_control','write_descriptor')
 if($step -notin $steps){$step='unknown'}
 $types=@('System.Management.Automation.MethodInvocationException','System.Management.Automation.RuntimeException','System.Management.Automation.PSInvalidOperationException','System.EntryPointNotFoundException','System.DllNotFoundException','System.ComponentModel.Win32Exception','System.UnauthorizedAccessException','System.Security.SecurityException','System.ArgumentException','System.InvalidOperationException')
 $exceptionType='unknown';$nativeCode=$null;$exception=$failure.Exception
@@ -128,7 +128,9 @@ if($null -ne $nativeCode -and $nativeCode -ge 0 -and $nativeCode -le 4294967295)
 [Console]::Out.Write('TEST_SECURITY_FAILURE:'+($facts|ConvertTo-Json -Compress));throw
 }`
     const child = Bun.spawn(['powershell.exe', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(command, 'utf16le').toString('base64')], {
-      env: { ...process.env, TEST_TARGET: target, ...extra }, stdin: 'ignore', stdout: 'pipe', stderr: 'pipe', timeout: budget,
+      env: { ...process.env, ...extra, TEST_TARGET: target,
+        TEST_TARGET_KIND: path.basename(target) === 'owner.lock' ? 'guard' : 'leaf' },
+      stdin: 'ignore', stdout: 'pipe', stderr: 'pipe', timeout: budget,
     })
     const stderr = (async () => {
       const chunks: Uint8Array[] = []; let retained = 0
@@ -144,7 +146,7 @@ if($null -ne $nativeCode -and $nativeCode -ge 0 -and $nativeCode -le 4294967295)
       if (stdout.startsWith('TEST_SECURITY_FAILURE:') && stdout.length <= 4096) {
         try { facts = executionRecord(JSON.parse(stdout.slice('TEST_SECURITY_FAILURE:'.length))) } catch { /* Closed unknowns below. */ }
       }
-      const steps = ['add_type', 'read_original', 'acl_read', 'rule_construct', 'verify_mutation', 'write_mutation', 'write_restore',
+      const steps = ['add_type', 'read_original', 'acl_construct', 'rule_construct', 'verify_mutation', 'write_mutation', 'write_restore',
         'read_restored', 'read_size', 'read_descriptor', 'read_control', 'write_control', 'write_descriptor']
       const types = ['System.Management.Automation.MethodInvocationException', 'System.Management.Automation.RuntimeException',
         'System.Management.Automation.PSInvalidOperationException', 'System.EntryPointNotFoundException', 'System.DllNotFoundException',
@@ -168,7 +170,13 @@ if($null -ne $nativeCode -and $nativeCode -ge 0 -and $nativeCode -le 4294967295)
 $fixtureStep='read_original';$original=[TestDeliverySecurity]::Read($env:TEST_TARGET)
 $sections=if($env:TEST_MODE -eq 'foreign-owner'){1}else{4}
 try{
-$fixtureStep='acl_read';$acl=Get-Acl -LiteralPath $env:TEST_TARGET
+$fixtureStep='acl_construct'
+# Populate only from the descriptor already read by the native API. This
+# requires no PowerShell provider/module lookup or second pathname read.
+$raw=[Security.AccessControl.RawSecurityDescriptor]::new($original,0)
+if($null -eq $raw.DiscretionaryAcl){throw [InvalidOperationException]::new('TEST_fixture_source_descriptor_invalid')}
+$acl=if($env:TEST_TARGET_KIND -eq 'guard'){[Security.AccessControl.FileSecurity]::new()}else{[Security.AccessControl.DirectorySecurity]::new()}
+$acl.SetSecurityDescriptorBinaryForm($original)
 $fixtureStep='rule_construct';switch($env:TEST_MODE){
 'foreign-ace'{$rule=[Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new('S-1-1-0'),'Read','None','None','Allow');$expectedMask=[long]$rule.FileSystemRights;$acl.AddAccessRule($rule)}
 'unprotected'{$acl.SetAccessRuleProtection($false,$false)}
