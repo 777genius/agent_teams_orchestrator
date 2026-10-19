@@ -1207,6 +1207,7 @@ struct WindowsNativeRunControlIssuer;
 struct WindowsNativeRunState;
 struct WindowsNativeRunControl;
 struct WindowsNativeRunStateIssuer;
+static void deliveryGuardReadProgress(const wchar_t *stage) noexcept;
 struct Scope;
 class SelectedControllerConfig {
   friend struct OwnerStore;
@@ -2308,11 +2309,16 @@ public:
             "execution_owner_metadata_changed");
   }
   JsonObject deliveryGuardMetadata(const JsonObject &input, bool create) {
+    if (!create) deliveryGuardReadProgress(L"held_begin");
     auto &directory = held(input);
+    if (!create) deliveryGuardReadProgress(L"held_end");
     const std::wstring suffix = L"\\opencode\\v2\\delivery-journal";
     require(directory.owner == currentSid() && directory.path.size() > suffix.size() + 3 &&
                 directory.path.substr(directory.path.size() - suffix.size()) == suffix,
             "execution_owner_metadata_purpose_invalid");
+    if (!create) deliveryGuardReadProgress(L"namespace_checked");
+    if (!create && !directory.deliveryGuard)
+      deliveryGuardReadProgress(L"missing_guard_refused");
     require(create || directory.deliveryGuard, "execution_owner_metadata_missing");
     SharedAclMutex mutation(directory.identity);
     (void)deliveryPrivateIdentity(directory.file.value, directory.owner, true);
@@ -2642,6 +2648,7 @@ public:
     const auto purpose = text(input, L"purpose");
     if (purpose == L"DeliveryGuard") {
       require(input.HasKey(L"handleId") && !input.HasKey(L"selectionId"), "execution_invalid_response");
+      deliveryGuardReadProgress(L"dispatched");
       return deliveryGuardMetadata(input, false);
     }
     if (purpose == L"SelectedAuth") {
@@ -3010,6 +3017,15 @@ static void event(const wchar_t *name, JsonObject value) {
   str(packet, L"event", name);
   packet.SetNamedValue(L"value", value);
   output(packet);
+}
+// Finite read-only progress on the existing broker stream. A
+// failed observation must never replace the original request/error/reply.
+static void deliveryGuardReadProgress(const wchar_t *stage) noexcept {
+  try {
+    JsonObject value;
+    str(value, L"stage", stage);
+    event(L"deliveryGuardReadProgress", value);
+  } catch (...) {}
 }
 static std::wstring quote(const std::wstring &value) {
   std::wstring out = L"\"";
@@ -5684,6 +5700,7 @@ int wmain(int argc, wchar_t **argv) {
       double id = 0;
       JsonObject reply;
       std::wstring requestedOperation;
+      bool deliveryGuardRead = false;
       num(reply, L"schema", 1);
       str(reply, L"kind", L"reply");
       try {
@@ -5694,6 +5711,9 @@ int wmain(int argc, wchar_t **argv) {
         auto operation = text(request, L"operation");
         requestedOperation = operation;
         auto input = object(request, L"input");
+        deliveryGuardRead = operation == L"ownerReadMetadata" && input.HasKey(L"purpose") &&
+            input.GetNamedValue(L"purpose").ValueType() == JsonValueType::String &&
+            std::wstring(input.GetNamedString(L"purpose")) == L"DeliveryGuard";
         JsonObject value;
         if (custodyOnly)
           require(operation == L"selfImageCustody" && input.Size() == 0,
@@ -5804,6 +5824,7 @@ int wmain(int argc, wchar_t **argv) {
         flag(reply, L"ok", true);
         reply.SetNamedValue(L"value", value);
       } catch (const NativeError &error) {
+        if (deliveryGuardRead) deliveryGuardReadProgress(L"error_caught");
         flag(reply, L"ok", false);
         str(reply, L"error", wide(error.code));
         if (error.aliasSourceLine) {
@@ -5820,11 +5841,13 @@ int wmain(int argc, wchar_t **argv) {
             num(reply, L"nativeStatus", error.nativeStatus);
         }
       } catch (...) {
+        if (deliveryGuardRead) deliveryGuardReadProgress(L"error_caught");
         flag(reply, L"ok", false);
         str(reply, L"error", L"execution_native_unknown");
       }
       reply.SetNamedValue(L"id", JsonValue::CreateNumberValue(id));
       output(reply);
+      if (deliveryGuardRead) deliveryGuardReadProgress(L"reply_written");
     }
     if (scope) {
       auto receipt = scope->retire();

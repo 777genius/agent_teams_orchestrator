@@ -370,6 +370,18 @@ test.skipIf(process.platform !== 'win32')('Windows delivery guard holds exact pr
       isolated.events.on('error', () => {})
       let isolatedExitCode: number | null | undefined, isolatedPrimary: unknown, isolatedFailed = false
       let nativeFailure: unknown, nativeFailed = false
+      let nativeReadStage = 'none', nativeReadEvents = 0, nativeReadOverflow = false
+      isolated.events.on('deliveryGuardReadProgress', (value: unknown) => {
+        if (!value || typeof value !== 'object' || types.isProxy(value)) return
+        try {
+          const stage = Object.getOwnPropertyDescriptor(value, 'stage')
+          if (!stage || !('value' in stage) || !['dispatched', 'held_begin', 'held_end', 'namespace_checked',
+            'missing_guard_refused', 'error_caught', 'reply_written'].includes(stage.value)) return
+          nativeReadStage = stage.value
+          if (nativeReadEvents < 7) nativeReadEvents++
+          else nativeReadOverflow = true
+        } catch {}
+      })
       const captureNativeFailure = (error: unknown): never => { nativeFailed = true; nativeFailure = error; throw error }
       isolated.events.on('close', (code: unknown) => {
         if (code === null || Number.isSafeInteger(code) && Number(code) >= -0x80000000 && Number(code) <= 0xffffffff)
@@ -392,6 +404,7 @@ test.skipIf(process.platform !== 'win32')('Windows delivery guard holds exact pr
         isolatedFailed = true; isolatedPrimary = error
         console.error(JSON.stringify({ event: 'TEST_windows_delivery_guard_failure', section, broker: 'negative',
           code: fixtureFailureCode(nativeFailed ? nativeFailure : error), ended: isolated.ended(), closeObserved: isolatedExitCode !== undefined,
+          nativeReadStage, nativeReadEvents, nativeReadOverflow,
           ...(isolatedExitCode !== undefined ? { exitCode: isolatedExitCode } : {}) }))
         throw error
       } finally {
@@ -399,6 +412,7 @@ test.skipIf(process.platform !== 'win32')('Windows delivery guard holds exact pr
         catch (error) {
           console.error(JSON.stringify({ event: 'TEST_windows_delivery_guard_cleanup_failure', section, cleanup: 'negative-broker',
             code: fixtureFailureCode(error), ended: isolated.ended(), closeObserved: isolatedExitCode !== undefined,
+            nativeReadStage, nativeReadEvents, nativeReadOverflow,
             ...(isolatedExitCode !== undefined ? { exitCode: isolatedExitCode } : {}) }))
           throw new AggregateError(isolatedFailed ? [isolatedPrimary, error] : [error],
             'TEST_delivery_negative_cleanup_failed', { cause: isolatedFailed ? isolatedPrimary : error })
