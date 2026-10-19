@@ -2313,6 +2313,7 @@ public:
     require(directory.owner == currentSid() && directory.path.size() > suffix.size() + 3 &&
                 directory.path.substr(directory.path.size() - suffix.size()) == suffix,
             "execution_owner_metadata_purpose_invalid");
+    require(create || directory.deliveryGuard, "execution_owner_metadata_missing");
     SharedAclMutex mutation(directory.identity);
     (void)deliveryPrivateIdentity(directory.file.value, directory.owner, true);
     if (!directory.deliveryDirectory) {
@@ -2322,7 +2323,6 @@ public:
       directory.deliveryDirectory = std::move(pin);
     }
     if (!directory.deliveryGuard) {
-      require(create, "execution_owner_metadata_missing");
       auto file = openDeliveryGuard(directory, false);
       if (!file) file = openDeliveryGuard(directory, true); // Exclusive positive absence only.
       directory.deliveryGuardIdentity = deliveryPrivateIdentity(file.value, directory.owner, false);
