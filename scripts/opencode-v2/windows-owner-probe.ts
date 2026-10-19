@@ -816,6 +816,8 @@ using System.Runtime.InteropServices;
 public static class TestFixtureSecurity {
 [DllImport("advapi32.dll",EntryPoint="SetFileSecurityW",ExactSpelling=true,CharSet=CharSet.Unicode,SetLastError=true)]
 [return:MarshalAs(UnmanagedType.Bool)] public static extern bool SetFileSecurity(string path,uint information,byte[] descriptor);
+[DllImport("advapi32.dll",ExactSpelling=true,SetLastError=true)]
+[return:MarshalAs(UnmanagedType.Bool)] public static extern bool SetSecurityDescriptorControl([In,Out] byte[] descriptor,ushort mask,ushort bits);
 [DllImport("advapi32.dll",EntryPoint="GetFileSecurityW",ExactSpelling=true,CharSet=CharSet.Unicode,SetLastError=true)]
 [return:MarshalAs(UnmanagedType.Bool)] private static extern bool GetFileSecurity(string path,uint information,[Out] byte[] descriptor,uint size,out uint needed);
 public static byte[] ReadSecurityDescriptor(string path){
@@ -832,7 +834,12 @@ return descriptor;
 '@
 function Set-TestDacl([byte[]]$descriptor){
 # DACL-only SetFileSecurityW does not propagate inheritable ACEs to children.
-if(![TestFixtureSecurity]::SetFileSecurity($env:TEST_TARGET,4,$descriptor)){throw ('TEST ACL write failed:'+ [Runtime.InteropServices.Marshal]::GetLastWin32Error())}}
+# Its low-level setter requires AUTO_INHERIT_REQ to preserve AUTO_INHERITED.
+[byte[]]$write=$descriptor.Clone()
+$control=[int]([Security.AccessControl.RawSecurityDescriptor]::new($write,0).ControlFlags)
+if(($control-band 0x0400)-ne 0){
+if(![TestFixtureSecurity]::SetSecurityDescriptorControl($write,0x0100,0x0100)){throw ('TEST ACL control preservation failed:'+ [Runtime.InteropServices.Marshal]::GetLastWin32Error())}}
+if(![TestFixtureSecurity]::SetFileSecurity($env:TEST_TARGET,4,$write)){throw ('TEST ACL write failed:'+ [Runtime.InteropServices.Marshal]::GetLastWin32Error())}}
 `
   const fixtureFailureCode = (error: unknown) => error instanceof Error &&
     /^[a-z_]{1,96}(?::[a-z_]{1,64}:\d{1,10})?$/.test(error.message) ? error.message
