@@ -75,7 +75,9 @@ retain('preload_ready')
   const selected = omitted ? args.filter((_, i) => i !== args.indexOf(omitted) && i !== args.indexOf(omitted) + 1) : args
   const child = Bun.spawn([process.execPath, '--preload', preload, entry, 'runtime', 'transcript', ...selected, '--output', output],
     { cwd: project, env, stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' })
-  const timeout = setTimeout(() => { child.kill() }, 12_000)
+  // A cold Windows runner scanning the fresh clone takes far longer than a
+  // warm local spawn; only a genuinely hung child may be killed here.
+  const timeout = setTimeout(() => { child.kill() }, 30_000)
   try {
     const [exit, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()])
     expect(exit).toBe(1)
@@ -94,4 +96,4 @@ retain('preload_ready')
     if (child.exitCode === null) { child.kill(); await child.exited }
     await rm(root, { recursive: true, force: true })
   }
-}, 20_000)
+}, 45_000)
