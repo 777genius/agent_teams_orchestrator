@@ -14,6 +14,27 @@ import type { OwnedNativeProfile } from '../OpenCodeV2ExecutionBinding.js'
 import { createOpenCodeV2ColdLocationObservation } from '../../execution/OpenCodeV2ServerFailure.js'
 import { readWindowsRealpathFailure, retainWindowsRealpathFailure } from './OpenCodeV2WindowsRealpath.js'
 
+export const windowsCommandResolvePhases = ['environment', 'cwd-realpath', 'cwd-stat', 'command-shape',
+  'executable-realpath', 'path-name', 'path-candidate-stat', 'path-candidate-realpath', 'executable-stat'] as const
+export type WindowsCommandResolveFailure = Readonly<{ phase: typeof windowsCommandResolvePhases[number];
+  errno?: 'EPERM' | 'EACCES' | 'ENOENT' | 'ENOTDIR' | 'EISDIR' | 'EINVAL' | 'UNKNOWN' | 'EIO' | 'ENOSYS'
+  operation?: 'realpath' | 'stat' | 'open' }>
+const commandResolveFailures = new WeakMap<object, WindowsCommandResolveFailure>()
+/** Observations are private and identity-bound; they never authorize a command. */
+export function readWindowsCommandResolveFailure(error: unknown): WindowsCommandResolveFailure | undefined {
+  return error !== null && typeof error === 'object' ? commandResolveFailures.get(error) : undefined
+}
+function retainCommandResolveFailure(error: object, phase: WindowsCommandResolveFailure['phase'], cause: unknown): void {
+  try {
+    const data = (key: string): unknown => cause !== null && typeof cause === 'object' && !types.isProxy(cause)
+      ? Object.getOwnPropertyDescriptor(cause, key)?.value : undefined
+    const errno = (['EPERM', 'EACCES', 'ENOENT', 'ENOTDIR', 'EISDIR', 'EINVAL', 'UNKNOWN', 'EIO', 'ENOSYS'] as const).find(value => value === data('code'))
+    const operation = (['realpath', 'stat', 'open'] as const).find(value => value === data('syscall'))
+    commandResolveFailures.set(error, Object.freeze({ phase, ...(errno ? { errno } : {}), ...(operation ? { operation } : {}) }))
+    retainWindowsRealpathFailure(cause, error)
+  } catch { /* Observing a refusal cannot replace its normalized failure. */ }
+}
+
 function requireValue(value: unknown): asserts value {
   if (!value) throw new Error('execution_windows_runtime_invalid')
 }
@@ -127,31 +148,49 @@ export async function loadOpenCodeV2WindowsRuntime(pin: OpenCodeV2Pin, expectedM
       [command.options.stdout, command.options.stderr].some(value => value !== undefined && value !== 'pipe')) {
       return yield* Effect.fail(error('unsupportedCommand'))
     }
-    const input = yield* attempt('resolve', async () => {
+    let resolutionPhase: WindowsCommandResolveFailure['phase'] = 'environment'
+    const input = yield* Effect.tryPromise({ try: async () => {
       const env = command.options.env ? commandEnvironment(command.options.env, command.options.extendEnv) : { ...baseline }
+      resolutionPhase = 'cwd-realpath'
       const cwd = await filesystem.realpath(command.options.cwd ?? process.cwd())
+      resolutionPhase = 'cwd-stat'
       requireValue(path.isAbsolute(cwd) && (await stat(cwd)).isDirectory())
+      resolutionPhase = 'command-shape'
       requireValue(command.command.length > 0 && !command.command.includes('\0') && command.args.every(arg => !arg.includes('\0')))
       let executable: string | undefined
-      if (path.isAbsolute(command.command)) executable = await filesystem.realpath(command.command)
-      else {
+      if (path.isAbsolute(command.command)) {
+        resolutionPhase = 'executable-realpath'
+        executable = await filesystem.realpath(command.command)
+      } else {
         // Only ordinary PATH names; never search the current directory or use
         // cmd.exe AutoRun/shell resolution as a substitute for an executable.
+        resolutionPhase = 'path-name'
         requireValue(!/[\\/]/.test(command.command))
         const search = Object.entries(env).find(([name]) => name.toUpperCase() === 'PATH')?.[1] ?? ''
         for (const root of search.split(';').filter(value => path.isAbsolute(value))) {
           const candidate = path.join(root, command.command + (path.extname(command.command) ? '' : '.exe'))
-          try { if ((await stat(candidate)).isFile()) { executable = await filesystem.realpath(candidate); break } }
+          try {
+            resolutionPhase = 'path-candidate-stat'
+            if ((await stat(candidate)).isFile()) {
+              resolutionPhase = 'path-candidate-realpath'
+              executable = await filesystem.realpath(candidate); break
+            }
+          }
           catch (cause) { if ((cause as NodeJS.ErrnoException).code !== 'ENOENT') throw cause }
         }
       }
+      resolutionPhase = 'executable-stat'
       requireValue(executable && (await stat(executable)).isFile())
       // The native port serializes this cmd tail using cmd's outer quote pair,
       // rather than CRT argv quoting. /d disables host AutoRun registry hooks.
       const args = path.basename(executable).toLowerCase() === 'cmd.exe' && command.args.length === 2 &&
         command.args[0]?.toLowerCase() === '/c' ? ['/d', '/s', '/c', command.args[1]!] : command.args
       return { executable, args, cwd, env, stdin: streamInput ? 'pipe' as const : 'ignore' as const }
-    })
+    }, catch: cause => {
+      const failure = error('resolve')
+      retainCommandResolveFailure(failure, resolutionPhase, cause)
+      return failure
+    } })
     let retired: Promise<void> | undefined
     const owned = yield* Effect.acquireRelease(attempt('spawn', signal => commands.start(input, signal)), value =>
       attempt('close', async () => { await retire(value.commandId); await commands.close({ commandId: value.commandId }) }).pipe(Effect.orDie))

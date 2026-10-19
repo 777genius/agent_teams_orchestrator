@@ -1,6 +1,7 @@
 import { types } from 'node:util'
 import type { ConfigEntry } from '@opencode/client'
 import { projectOpenCodeV2LocationCause, readOpenCodeV2ServerFailure, type OpenCodeV2ServerFailure } from '../../src/services/opencode/execution/OpenCodeV2ServerFailure.js'
+import { readWindowsCommandResolveFailure, windowsCommandResolvePhases, type WindowsCommandResolveFailure } from '../../src/services/opencode/host/windows/OpenCodeV2WindowsRuntime.js'
 import { executionProfileGuards } from '../../src/services/opencode/host/OpenCodeV2ExecutionBinding.js'
 import { readWindowsRealpathFailure, type WindowsRealpathFailure } from '../../src/services/opencode/host/windows/OpenCodeV2WindowsRealpath.js'
 
@@ -36,10 +37,11 @@ export const shellProbeMethods = ['close', 'endStdin', 'identity', 'kill', 'outp
   'unsupportedSignal', 'unsupportedUnref', 'validateOutput', 'writeStdin'] as const
 const shellProbeErrnos = ['EPERM', 'EACCES', 'ENOENT', 'ENOTDIR', 'EISDIR', 'EINVAL', 'UNKNOWN', 'EIO', 'ENOSYS'] as const
 const shellProbeOperations = ['realpath', 'open', 'read', 'lstat', 'stat'] as const
+type ShellProbeResolution = WindowsCommandResolveFailure & Readonly<{ realpath?: WindowsRealpathFailure }>
 type ShellProbeCauseDetail = Omit<OpenCodeV2ServerFailure, 'operation' | 'kind'>
 export type ShellProbeFailure = Readonly<{ kind: 'Fail' | 'Die' | 'Interrupt' | 'unknown';
   method: typeof shellProbeMethods[number] | null; profileGuard?: typeof executionProfileGuards[number]
-  errno?: typeof shellProbeErrnos[number]; operation?: typeof shellProbeOperations[number]; realpath?: WindowsRealpathFailure; detail?: ShellProbeCauseDetail }>
+  errno?: typeof shellProbeErrnos[number]; operation?: typeof shellProbeOperations[number]; realpath?: WindowsRealpathFailure; detail?: ShellProbeCauseDetail; resolution?: ShellProbeResolution }>
 export type ShellProbeResult = Readonly<{
   stage: typeof shellProbeStages[number]; succeeded: boolean; sessionCreated: boolean
   registeredShell: boolean; shell: 'cmd' | 'powershell' | 'pwsh' | 'bash' | 'other' | null
@@ -69,6 +71,15 @@ function readRealpathFailure(value: unknown): WindowsRealpathFailure | undefined
       Number(win32) < 0 || Number(win32) > 0xffffffff || Number(anchorCount) < 0 || Number(anchorCount) > 4096 ||
       Number(matchingAnchorIndex) < -1 || Number(matchingAnchorIndex) >= Number(anchorCount)) return undefined
   return Object.freeze({ status, operation, win32, anchorCount, matchingAnchorIndex }) as WindowsRealpathFailure
+}
+
+function readCommandResolution(value: unknown): ShellProbeResolution | undefined {
+  const phase = windowsCommandResolvePhases.find(phase => phase === data(value, 'phase'))
+  if (!phase) return undefined
+  const errno = shellProbeErrnos.find(errno => errno === data(value, 'errno'))
+  const operation = (['realpath', 'stat', 'open'] as const).find(operation => operation === data(value, 'operation'))
+  const realpath = readRealpathFailure(data(value, 'realpath'))
+  return Object.freeze({ phase, ...(errno ? { errno } : {}), ...(operation ? { operation } : {}), ...(realpath ? { realpath } : {}) })
 }
 
 const causeDetailFields = ['tag', 'name', 'module', 'method', 'reason', 'errno', 'sqlCode', 'realpath'] as const
@@ -103,7 +114,11 @@ export function shellProbeFailure(cause: unknown): ShellProbeFailure {
           data(reason, 'module') === 'ChildProcess' && data(reason, 'pathOrDescriptor') === undefined &&
           data(reason, 'description') === 'Windows owned command operation failed') {
         const method = shellProbeMethods.find(value => value === data(reason, 'method'))
-        if (method) return Object.freeze({ kind, method })
+        if (method) {
+          const observed = readWindowsCommandResolveFailure(error)
+          const resolution = observed && readCommandResolution({ ...observed, realpath: readWindowsRealpathFailure(error) })
+          return Object.freeze({ kind, method, ...(resolution ? { resolution } : {}) })
+        }
       }
       error = [reason, data(error, 'error'), data(error, 'cause')].find(value => value !== null && typeof value === 'object')
     }
@@ -133,8 +148,9 @@ export function readShellProbeResult(value: unknown): ShellProbeResult | undefin
       const operation = shellProbeOperations.find(value => value === data(source, 'operation'))
       const realpath = readRealpathFailure(data(source, 'realpath'))
       const detail = readCauseDetail(data(source, 'detail'), kind as ShellProbeFailure['kind'])
+      const resolution = readCommandResolution(data(source, 'resolution'))
       failure = Object.freeze({ kind, method, ...(profileGuard ? { profileGuard } : {}), ...(errno ? { errno } : {}),
-        ...(operation ? { operation } : {}), ...(realpath ? { realpath } : {}), ...(detail ? { detail } : {}) }) as ShellProbeFailure
+        ...(operation ? { operation } : {}), ...(realpath ? { realpath } : {}), ...(detail ? { detail } : {}), ...(resolution ? { resolution } : {}) }) as ShellProbeFailure
     }
     if (succeeded && (stage !== 'complete' || !sessionCreated || !registeredShell || !markerPresent || failure !== null)) return undefined
     return Object.freeze({ stage, succeeded, sessionCreated, registeredShell, shell, markerPresent, failure }) as ShellProbeResult

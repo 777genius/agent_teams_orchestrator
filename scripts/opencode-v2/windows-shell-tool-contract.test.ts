@@ -181,3 +181,21 @@ test('registered TEST agent and shell snapshot follow actual plugin activation w
     console.log(JSON.stringify({ event: 'TEST-plugin-activation', ...facts, blockedFetchAttempts: network }))
   } finally { clearTimeout(timer); await child.exited; await rm(root, { recursive: true, force: true }) }
 }, 20_000)
+
+
+test('command resolution receipt retains finite phases and strips untrusted extras', () => {
+  const result = { stage: 'tool-execute', succeeded: false, sessionCreated: true, registeredShell: true,
+    shell: 'cmd', markerPresent: false, failure: { kind: 'Fail', method: 'resolve', resolution: {
+      phase: 'executable-realpath', errno: 'EPERM', operation: 'realpath', path: 'TEST-private', message: 'TEST-private',
+      realpath: { status: 1, operation: 19, win32: 5, anchorCount: 2, matchingAnchorIndex: -1 } } } }
+  expect(readShellProbeResult(result)?.failure).toEqual({ kind: 'Fail', method: 'resolve', resolution: {
+    phase: 'executable-realpath', errno: 'EPERM', operation: 'realpath',
+    realpath: { status: 1, operation: 19, win32: 5, anchorCount: 2, matchingAnchorIndex: -1 } } })
+  expect(readShellProbeResult({ ...result, failure: { kind: 'Fail', method: 'resolve', resolution: { phase: 'TEST-private' } } })?.failure)
+    .toEqual({ kind: 'Fail', method: 'resolve' })
+  let reads = 0
+  const hostile = Object.defineProperty({}, 'phase', { get() { reads++; throw new Error('TEST_getter') } })
+  expect(readShellProbeResult({ ...result, failure: { kind: 'Fail', method: 'resolve', resolution: hostile } })?.failure)
+    .toEqual({ kind: 'Fail', method: 'resolve' })
+  expect(reads).toBe(0)
+})
