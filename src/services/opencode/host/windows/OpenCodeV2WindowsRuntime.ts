@@ -12,7 +12,7 @@ import type { ServerOptions as CurrentOptions } from '@opencode/server/options'
 import { isWindowsCommandPort, type WindowsCommandPort } from './OpenCodeV2WindowsCommand.js'
 import type { OwnedNativeProfile } from '../OpenCodeV2ExecutionBinding.js'
 import { createOpenCodeV2ColdLocationObservation } from '../../execution/OpenCodeV2ServerFailure.js'
-import { retainWindowsRealpathFailure } from './OpenCodeV2WindowsRealpath.js'
+import { readWindowsRealpathFailure, retainWindowsRealpathFailure } from './OpenCodeV2WindowsRealpath.js'
 
 function requireValue(value: unknown): asserts value {
   if (!value) throw new Error('execution_windows_runtime_invalid')
@@ -76,6 +76,13 @@ export async function loadOpenCodeV2WindowsRuntime(pin: OpenCodeV2Pin, expectedM
       },
       error => Effect.tryPromise({ try: () => filesystem.realpath(input), catch: failure => {
         retainWindowsRealpathFailure(failure, error)
+        // Config discovery resolves absent candidates too. Restore the
+        // selected normalizer's NotFound only for the live OS ENOENT; a native
+        // containment refusal keeps the original permission error unchanged.
+        if (failure !== null && typeof failure === 'object' && !types.isProxy(failure) && types.isNativeError(failure) &&
+            Object.getOwnPropertyDescriptor(failure, 'code')?.value === 'ENOENT' && !readWindowsRealpathFailure(failure))
+          return PlatformError.systemError({ _tag: 'NotFound', module: 'FileSystem', method: 'realPath',
+            pathOrDescriptor: input, cause: failure })
         return error
       } }),
     )) })
