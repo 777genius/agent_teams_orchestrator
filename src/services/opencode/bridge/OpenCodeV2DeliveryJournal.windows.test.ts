@@ -382,7 +382,6 @@ test.skipIf(process.platform !== 'win32')('Windows delivery guard holds exact pr
           else nativeReadOverflow = true
         } catch {}
       })
-      const captureNativeFailure = (error: unknown): never => { nativeFailed = true; nativeFailure = error; throw error }
       isolated.events.on('close', (code: unknown) => {
         if (code === null || Number.isSafeInteger(code) && Number(code) >= -0x80000000 && Number(code) <= 0xffffffff)
           isolatedExitCode = code === null ? null : Number(code)
@@ -391,15 +390,20 @@ test.skipIf(process.platform !== 'win32')('Windows delivery guard holds exact pr
         const rawLeaf = executionRecord(await isolated.request('ownerPreparePrivateDirectory',
           { path: directory, createExclusive: false }, cutoff()))
         expect(typeof rawLeaf.handleId).toBe('string')
-        if (negative === 'read-before-write') {
-          await expect(isolated.request('ownerReadMetadata', { op: 'ownerReadMetadata', purpose: 'DeliveryGuard',
-            handleId: rawLeaf.handleId }, cutoff()).catch(captureNativeFailure)).rejects.toThrow('execution_owner_metadata_missing')
-        } else {
-          await expect(isolated.request('ownerWriteMetadata', { op: 'ownerWriteMetadata', purpose: 'DeliveryGuard',
-            handleId: rawLeaf.handleId, bytesBase64: negative === 'raw-payload' ? Buffer.from('TEST').toString('base64') : '',
-            ...(negative === 'raw-name' ? { name: 'TEST-arbitrary-file' } : {}) }, cutoff()).catch(captureNativeFailure))
-            .rejects.toThrow(negative === 'raw-payload' ? 'execution_owner_metadata_budget' : 'execution_invalid_response')
-        }
+        // Let native stdio settle under ordinary await before entering a matcher.
+        try {
+          if (negative === 'read-before-write') {
+            await isolated.request('ownerReadMetadata', { op: 'ownerReadMetadata', purpose: 'DeliveryGuard',
+              handleId: rawLeaf.handleId }, cutoff())
+          } else {
+            await isolated.request('ownerWriteMetadata', { op: 'ownerWriteMetadata', purpose: 'DeliveryGuard',
+              handleId: rawLeaf.handleId, bytesBase64: negative === 'raw-payload' ? Buffer.from('TEST').toString('base64') : '',
+              ...(negative === 'raw-name' ? { name: 'TEST-arbitrary-file' } : {}) }, cutoff())
+          }
+        } catch (error) { nativeFailed = true; nativeFailure = error }
+        expect(nativeFailed).toBe(true)
+        expect(fixtureFailureCode(nativeFailure)).toBe(negative === 'read-before-write' ? 'execution_owner_metadata_missing' :
+          negative === 'raw-payload' ? 'execution_owner_metadata_budget' : 'execution_invalid_response')
       } catch (error) {
         isolatedFailed = true; isolatedPrimary = error
         console.error(JSON.stringify({ event: 'TEST_windows_delivery_guard_failure', section, broker: 'negative',
