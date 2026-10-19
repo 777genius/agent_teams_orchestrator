@@ -425,6 +425,8 @@ struct RetainedAnchorComponent {
   JsonObject identity;
   bool sharedRoot = false;
   bool cohortPolicy = false;
+  // Closed launch-derived label used only by root retirement diagnostics.
+  const char *retirementRole = "private_writable";
   std::wstring sharedOwnerSid;
   SECURITY_DESCRIPTOR_CONTROL sharedDaclControl = 0;
   explicit RetainedAnchorComponent(Handle owned, bool shared = false,
@@ -3497,6 +3499,20 @@ struct Scope {
       event(L"retireProgress", value);
     } catch (...) { /* Progress cannot alter physical cleanup or its evidence. */ }
   }
+  void retirementRootProgress(const char *phase, const char *role, size_t index,
+                              size_t count, ULONGLONG started) const noexcept {
+    try {
+      if (!index || index > count || count > 4096) return;
+      JsonObject value;
+      str(value, L"nonce", launchNonce);
+      str(value, L"phase", wide(phase));
+      str(value, L"role", wide(role));
+      num(value, L"index", index);
+      num(value, L"count", count);
+      num(value, L"elapsedMs", std::min<ULONGLONG>(GetTickCount64() - started, 86400000));
+      event(L"retireRootProgress", value);
+    } catch (...) { /* Diagnostic only; never changes the lock or cleanup budget. */ }
+  }
   JsonObject retire() {
     stopping = true;
     retirementProgress("retire_job");
@@ -4066,6 +4082,10 @@ static void grantRoot(Scope &scope, Handle heldRoot, DWORD mask, ACCESS_MODE mod
   LocalMemory nextMemory{next};
   const HANDLE heldAcl = handle.value;
   scope.aclRoots.emplace_back(std::move(handle), sharedRoot, privateGrant);
+  scope.aclRoots.back().retirementRole = sharedRoot ? "shared_read"
+      : mode == DENY_ACCESS ? "protected_deny"
+      : !projectSids.empty() ? "sealed_project"
+      : privateGrant ? "sealed_controller" : "private_writable";
   if (sharedRoot) {
     scope.aclRoots.back().sharedOwnerSid = sharedBefore.ownerSid;
     scope.aclRoots.back().sharedDaclControl = sharedBefore.daclControl;
@@ -4107,7 +4127,15 @@ static void removeGrants(Scope &scope, RetirementAclBudget *retirementBudget) {
     scope.realpathDll->changeAce(REVOKE_ACCESS, retirementBudget);
   scope.retirementProgress("retire_grants_roots");
   std::vector<RetainedAnchorComponent> retained;
+  const size_t rootCount = scope.aclRoots.size();
+  size_t rootIndex = 0;
   for (auto it = scope.aclRoots.rbegin(); it != scope.aclRoots.rend(); ++it) {
+    ++rootIndex;
+    const auto rootStarted = GetTickCount64();
+    const auto progress = [&](const char *phase) {
+      scope.retirementRootProgress(phase, it->retirementRole, rootIndex, rootCount, rootStarted);
+    };
+    progress("root_validate");
     const auto owner = currentSid();
     const auto identity = it->identity;
     const HANDLE handle = it->handle.value;
@@ -4119,7 +4147,9 @@ static void removeGrants(Scope &scope, RetirementAclBudget *retirementBudget) {
       retained.insert(retained.begin(), std::move(*it));
       continue;
     }
+    progress("root_mutex_wait");
     SharedAclMutex aclMutex(physicalIdentity, retirementBudget);
+    progress("root_precheck");
     it->assertLive();
     require(anchorIdentity(handle).Stringify() == identity.Stringify(), "cleanup_unknown");
     const auto heldIdentity = grantObjectIdentity(handle, owner, it->sharedRoot);
@@ -4146,9 +4176,11 @@ static void removeGrants(Scope &scope, RetirementAclBudget *retirementBudget) {
     PACL next = nullptr;
     require(SetEntriesInAclW(1, &entry, previous, &next) == ERROR_SUCCESS, "cleanup_unknown");
     LocalMemory nextMemory{next};
+    progress("root_dacl_write");
     require(SetSecurityInfo(handle, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr,
                             nullptr, next, nullptr) == ERROR_SUCCESS,
             "cleanup_unknown");
+    progress("root_postcheck");
     it->assertLive();
     require(anchorIdentity(handle).Stringify() == it->identity.Stringify(), "cleanup_unknown");
     require(grantObjectIdentity(handle, owner, it->sharedRoot).Stringify() == heldIdentity.Stringify(),
@@ -4164,6 +4196,7 @@ static void removeGrants(Scope &scope, RetirementAclBudget *retirementBudget) {
           : projectAclCustody(handle, owner, scope.sid.value, projectSids, "cleanup_unknown");
       require(after.siblings == before.siblings && !after.memberAllowed, "cleanup_unknown");
     }
+    progress("root_complete");
   }
   scope.aclRoots = std::move(retained);
   if (scope.physicalCleanupProof || scope.metadataNoChildCleanupProof) {

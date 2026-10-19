@@ -279,6 +279,13 @@ async function main(): Promise<void> {
 
   if (await runRuntimeStatusFastPath(args)) return
 
+  if (args[0] === 'runtime' && args[1] === 'transcript' && !hasHelpOption(args)) {
+    profileCheckpoint('cli_runtime_transcript_path')
+    const { runRuntimeTranscriptCommand } = await import('../cli/runtimeTranscriptCommand.js')
+    await runRuntimeTranscriptCommand(args.slice(2))
+    process.exit(0)
+  }
+
   if (await runRuntimeProvidersFastPath(args)) {
     profileCheckpoint('cli_runtime_providers_fast_path')
     return

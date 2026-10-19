@@ -238,7 +238,28 @@ export const executionNativeRetirementPhases = ['retire_job', 'retire_wait', 're
   'retire_owned_pair', 'retire_commands', 'retire_receipt', 'retire_grants', 'retire_grants_dll',
   'retire_grants_roots', 'retire_grants_metadata'] as const
 export type ExecutionNativeRetirementPhase = typeof executionNativeRetirementPhases[number]
-export type ExecutionCleanupObservation = Readonly<{ phase: ExecutionCleanupPhase; nativePhase?: ExecutionNativeRetirementPhase }>
+export const executionNativeRootPhases = ['root_validate', 'root_mutex_wait', 'root_precheck',
+  'root_dacl_write', 'root_postcheck', 'root_complete'] as const
+export const executionNativeRootRoles = ['shared_read', 'private_writable', 'sealed_project', 'sealed_controller', 'protected_deny'] as const
+export type ExecutionNativeRootObservation = Readonly<{ phase: typeof executionNativeRootPhases[number]
+  role: typeof executionNativeRootRoles[number]; index: number; count: number; elapsedMs: number }>
+/** Closed observations contain neither file authority nor filesystem names. */
+export function readExecutionNativeRootObservation(value: unknown, nonce?: string): ExecutionNativeRootObservation | undefined {
+  try {
+    if (!value || typeof value !== 'object' || Array.isArray(value) || types.isProxy(value) ||
+        Object.keys(value).sort().join(',') !== (nonce === undefined ? 'count,elapsedMs,index,phase,role' : 'count,elapsedMs,index,nonce,phase,role') ||
+        (nonce !== undefined && ownData(value, 'nonce') !== nonce)) return undefined
+    const phase = executionNativeRootPhases.find(phase => phase === ownData(value, 'phase'))
+    const role = executionNativeRootRoles.find(role => role === ownData(value, 'role'))
+    const index = ownData(value, 'index'), count = ownData(value, 'count'), elapsedMs = ownData(value, 'elapsedMs')
+    if (!phase || !role || !Number.isSafeInteger(index) || !Number.isSafeInteger(count) ||
+        Number(index) < 1 || Number(index) > Number(count) || Number(count) > 4096 ||
+        !Number.isSafeInteger(elapsedMs) || Number(elapsedMs) < 0 || Number(elapsedMs) > 86_400_000) return undefined
+    return Object.freeze({ phase, role, index: Number(index), count: Number(count), elapsedMs: Number(elapsedMs) })
+  } catch { return undefined }
+}
+export type ExecutionCleanupObservation = Readonly<{ phase: ExecutionCleanupPhase; nativePhase?: ExecutionNativeRetirementPhase
+  nativeRoot?: ExecutionNativeRootObservation }>
 const cleanupFailures = new WeakMap<Error, ExecutionCleanupPhase>()
 export function retainOpenCodeV2CleanupPhase(error: Error, phase: ExecutionCleanupPhase): void {
   if (cleanupPhases.has(phase) && !cleanupFailures.has(error)) cleanupFailures.set(error, phase)
@@ -369,10 +390,11 @@ export async function recordOpenCodeV2ProviderFailure(phase: string, error: unkn
   const cleanupPhase = error instanceof Error ? cleanupFailures.get(error) ?? observedPhase : observedPhase
   const nativePhase = cleanupPhase === observedPhase && (cleanupPhase === 'kernel-retirement' || cleanupPhase === 'force-kill')
     ? executionNativeRetirementPhases.find(value => value === observed?.nativePhase) : undefined
+  const nativeRoot = nativePhase === 'retire_grants_roots' ? readExecutionNativeRootObservation(observed?.nativeRoot) : undefined
   const cleanup = phase === 'run-member-retirement' && Number.isSafeInteger(cleanupTiming?.elapsedMs) &&
     Number(cleanupTiming?.elapsedMs) >= 0 && Number(cleanupTiming?.elapsedMs) <= 86_400_000
     ? { elapsedMs: Number(cleanupTiming?.elapsedMs), ...(cleanupPhase ? { phase: cleanupPhase } : {}),
-      ...(nativePhase ? { nativePhase } : {}) } : undefined
+      ...(nativePhase ? { nativePhase } : {}), ...(nativeRoot ? { nativeRoot } : {}) } : undefined
   if (cleanupTiming?.dataRoot !== undefined && (!cleanup || typeof cleanupTiming.dataRoot !== 'string' || !path.isAbsolute(cleanupTiming.dataRoot))) return
   try {
     const directory = path.join(cleanupTiming?.dataRoot ?? resolveClaudeMultimodelPaths().data, 'opencode/v2/provider-diagnostics')

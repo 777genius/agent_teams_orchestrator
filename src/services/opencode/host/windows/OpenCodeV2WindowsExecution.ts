@@ -7,7 +7,8 @@ import { validateExecutionProfile, type OwnedNativeProfile, type ExecutionBirth 
 import { createWindowsNativeBroker, resolveWindowsNativeArtifact, resolveWindowsRealpathArtifact, requireWindowsRealpathArtifact, type WindowsRealpathArtifact, type WindowsNativeArtifact, type WindowsNativeBroker } from './OpenCodeV2WindowsNativeBroker.js'
 import { createWindowsOwnerFilesystem } from './OpenCodeV2WindowsOwnerFilesystem.js'
 import { createWindowsControllerRelayServer, createWindowsExecutionHttpClient, readWindowsRemoteController, type WindowsRemoteController } from './OpenCodeV2WindowsHTTP.js'
-import { executionCommandOperations, executionNativeRetirementPhases, type ExecutionCommandObservation, type ExecutionCommandOperation,
+import { executionCommandOperations, executionNativeRetirementPhases, readExecutionNativeRootObservation,
+  type ExecutionCommandObservation, type ExecutionCommandOperation, type ExecutionNativeRootObservation,
   type ExecutionNativeRetirementPhase } from '../../execution/OpenCodeV2Diagnostics.js'
 import { OPEN_CODE_V2_WINDOWS_CLOSE_MS } from '../../execution/OpenCodeV2ExecutionContracts.js'
 
@@ -196,26 +197,36 @@ export function createWindowsCommandRequestHandler(options: Readonly<{
 /** Progress is diagnostic only and belongs to the original launch nonce. It
  * cannot qualify a receipt or extend the caller's original close deadline. */
 export async function retireWindowsNativeScope(broker: Pick<WindowsNativeBroker, 'events' | 'request'>,
-  nonce: string, deadline?: number, observe?: (phase: ExecutionNativeRetirementPhase | undefined) => void): Promise<unknown> {
+  nonce: string, deadline?: number, observe?: (phase: ExecutionNativeRetirementPhase | undefined) => void,
+  observeRoot?: (root: ExecutionNativeRootObservation | undefined) => void): Promise<unknown> {
   const notify = (value: ExecutionNativeRetirementPhase | undefined) => { try { observe?.(value) } catch { /* Diagnostic only. */ } }
+  const notifyRoot = (value: ExecutionNativeRootObservation | undefined) => { try { observeRoot?.(value) } catch { /* Diagnostic only. */ } }
+  const rootProgress = (value: unknown) => {
+    const root = readExecutionNativeRootObservation(value, nonce)
+    if (root && phase === 'retire_grants_roots') notifyRoot(root)
+  }
   let phase: ExecutionNativeRetirementPhase | undefined
   const progress = (value: unknown) => {
     if (!value || typeof value !== 'object' || Array.isArray(value)) return
     const record = value as Record<string, unknown>
     const accepted = executionNativeRetirementPhases.find(value => value === record.phase)
     if (Object.keys(record).sort().join(',') === 'nonce,phase' && record.nonce === nonce && accepted) {
-      phase = accepted; notify(phase)
+      phase = accepted; notify(phase); notifyRoot(undefined)
     }
   }
   assert(deadline === undefined || (Number.isSafeInteger(deadline) && deadline > 0), 'cleanup_unknown')
   const input = deadline === undefined ? {} : { deadline, timeoutMs: Math.max(0, Math.min(OPEN_CODE_V2_WINDOWS_CLOSE_MS, deadline - Date.now())) }
   broker.events.on('retireProgress', progress)
+  broker.events.on('retireRootProgress', rootProgress)
   try { return await broker.request('retire', input, deadline !== undefined && deadline > Date.now() ? deadline : undefined) }
   catch (error) {
     if (error instanceof Error && error.message === 'execution_native_timeout' && phase)
       throw new Error(`execution_native_timeout:${phase}:0`, { cause: error })
     throw error
-  } finally { broker.events.off('retireProgress', progress); notify(undefined) }
+  } finally {
+    broker.events.off('retireProgress', progress); broker.events.off('retireRootProgress', rootProgress)
+    notify(undefined); notifyRoot(undefined)
+  }
 }
 /** Only the launch's native held-process event can close MAIN. Helper failure
  * remains an error and never supplies a MAIN exit code. */
@@ -489,7 +500,7 @@ export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, l
   // Only retire() below can validate and mint a branded physical receipt.
   let nativeRetirement: Promise<unknown> | undefined
   const retireNative = (deadline?: number) => nativeRetirement ??= retireWindowsNativeScope(broker, nonce, deadline,
-    phase => child.emit('retireProgress', phase))
+    phase => child.emit('retireProgress', phase), root => child.emit('retireRootProgress', root))
   const child = new EventEmitter() as EventEmitter & { pid?: number }
   const http = createWindowsExecutionHttpClient(
     value => broker.request('send', { value: { ...value, nonce, leaseOwnerId } }).then(() => undefined),

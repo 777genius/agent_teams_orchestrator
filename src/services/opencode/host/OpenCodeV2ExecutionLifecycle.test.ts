@@ -380,6 +380,32 @@ test('native retirement timeout retains only the original nonce and finite clean
   expect(actualDeadline).toBeUndefined() // Send owned cleanup, retaining expiry in the native payload.
 })
 
+test('root retirement observations bind the original nonce and expose only bounded substeps', async () => {
+  const events = new EventEmitter(), observed: unknown[] = []
+  const root = { phase: 'root_dacl_write', role: 'shared_read', index: 2, count: 3, elapsedMs: 714 }
+  let getterCalls = 0
+  const request = async () => {
+    events.emit('retireRootProgress', { nonce: 'TEST-original', ...root }) // Wrong native phase.
+    events.emit('retireProgress', { nonce: 'TEST-original', phase: 'retire_grants_roots' })
+    for (const value of [{ nonce: 'TEST-foreign', ...root },
+      { nonce: 'TEST-original', ...root, index: 0 }, { nonce: 'TEST-original', ...root, index: 4 },
+      { nonce: 'TEST-original', ...root, count: 4097 }, { nonce: 'TEST-original', ...root, elapsedMs: Infinity },
+      { nonce: 'TEST-original', ...root, role: 'TEST-private-path' },
+      { nonce: 'TEST-original', ...root, phase: 'TEST-private-path' },
+      { nonce: 'TEST-original', ...root, path: 'TEST-private-path' },
+      { nonce: 'TEST-original', ...root, get elapsedMs() { getterCalls++; return 714 } }])
+      events.emit('retireRootProgress', value)
+    events.emit('retireRootProgress', { nonce: 'TEST-original', ...root })
+    throw new Error('execution_native_timeout')
+  }
+  await expect(retireWindowsNativeScope({ events, request }, 'TEST-original', undefined, undefined,
+    value => observed.push(value))).rejects.toThrow('execution_native_timeout:retire_grants_roots:0')
+  expect(observed).toEqual([undefined, root, undefined])
+  expect(Object.isFrozen(observed[1])).toBe(true)
+  expect(getterCalls).toBe(0)
+  expect(events.listenerCount('retireRootProgress')).toBe(0)
+})
+
 
 test('Windows MAIN closes once only from its authenticated held exit, independently of helper closure', async () => {
   const events = new EventEmitter(), child = new EventEmitter()

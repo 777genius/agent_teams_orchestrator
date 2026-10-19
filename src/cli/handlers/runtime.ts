@@ -823,7 +823,7 @@ export async function runtimeTranscript(opts: {
   runId?: string
   projectionOnly?: boolean
   output?: string
-}): Promise<void> {
+}, deps: { exit?: (code: number) => void } = {}): Promise<void> {
   const provider = opts.provider ?? 'all'
   if (provider !== 'opencode' && provider !== 'all') {
     throw new Error(
@@ -870,11 +870,11 @@ export async function runtimeTranscript(opts: {
     if (opts.output?.trim()) {
       await writeFile(opts.output.trim(), payload, 'utf8')
     } else {
-      process.stdout.write(payload)
+      await writeStdoutAndDrain(payload)
     }
   }
 
-  process.exit(0)
+  ;(deps.exit ?? process.exit)(0)
 }
 
 export async function runtimeOpenCodeCommand(opts: {

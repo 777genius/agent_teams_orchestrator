@@ -1,13 +1,14 @@
 import { openCodeBunVersion } from '../../src/constants/openCodeBunVersion.js'
 import assert from 'node:assert/strict'
 import { createHash, randomUUID } from 'node:crypto'
-import { copyFile, lstat, readdir, readFile, rename, symlink, writeFile } from 'node:fs/promises'
+import { copyFile, lstat, mkdir, readdir, readFile, rename, symlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { createWindowsNativeBroker, resolveWindowsNativeArtifact } from '../../src/services/opencode/host/windows/OpenCodeV2WindowsNativeBroker.js'
 import { createWindowsOwnerFilesystem, type WindowsOwnerDirectory } from '../../src/services/opencode/host/windows/OpenCodeV2WindowsOwnerFilesystem.js'
 import { executionHash, executionRecord } from '../../src/services/opencode/execution/OpenCodeV2ExecutionContracts.js'
 import { prepareWindowsPrivateDirectories } from '../../src/services/opencode/profile/OpenCodePrivateDirectories.js'
 import { runControlDirectory } from '../../src/services/opencode/bridge/OpenCodeV2RunControl.js'
+import { executionNativeRootPhases, readExecutionNativeRootObservation, type ExecutionNativeRootObservation } from '../../src/services/opencode/execution/OpenCodeV2Diagnostics.js'
 
 // Actual native helper only. Supply a NEW TEST directory under the CI scratch
 // root. Retain its fences/records after both success and failure; no adoption,
@@ -18,6 +19,9 @@ assert.equal(process.versions.bun, openCodeBunVersion())
 const requestedRoot = process.argv[2]
 assert.ok(requestedRoot && path.win32.isAbsolute(requestedRoot))
 assert.match(path.win32.basename(requestedRoot), /^TEST-windows-owner-[a-zA-Z0-9-]+$/)
+const requestedRetirementFiles = process.env.TEST_NATIVE_ROOT_RETIREMENT_FILES
+assert.ok(requestedRetirementFiles === undefined || requestedRetirementFiles === '256' || requestedRetirementFiles === '32768')
+const retirementFiles = requestedRetirementFiles === '32768' ? 32768 : 256
 const facts: Record<string, unknown> = { schema: 1, qualified: false, primitive: 'held-directory-rename', runRoot: requestedRoot }
 const producerPath = path.resolve(import.meta.dir, '../../native/win32-x64/opencode-v2-windows-helper.exe')
 const imageSnapshot = async (file: string) => {
@@ -1680,6 +1684,139 @@ $daclBytes=[byte[]]::new($raw.DiscretionaryAcl.BinaryLength);$raw.DiscretionaryA
   assert.deepEqual(await rootIdentity(), projectOriginalIdentity)
   Object.assign(executionRecord(facts.selectedProjectCohort), { bothPhysicalRetirementsProved: true,
     allOwnProjectAcesRemoved: true, originalOwnerGroupForeignAcesAndIdentityPreserved: true })
+  // Three same-plan native scopes share one recursive read grant and retire
+  // concurrently. No provider/model is involved; every original Job receipt
+  // and the entire descendant ACL tree are checked after the competing revokes.
+  const contentionSetupStarted = Date.now(), launchElapsedMs: number[] = []
+  const rootObservations: ExecutionNativeRootObservation[][] = []
+  facts.concurrentRootRetirement = { scopes: 3, sharedDescendantFiles: retirementFiles,
+    setupElapsedMs: 0, launchElapsedMs, roots: rootObservations }
+  const contentionTree = path.win32.join(sharedProject, 'TEST-retirement-tree')
+  await mkdir(contentionTree)
+  // Stream the complete TEST tree into one length-prefixed digest. Never emit
+  // tens of thousands of descriptors or compare descendant rows quadratically.
+  const contentionCensus = async (sids: readonly string[] = []) => executionRecord(JSON.parse(
+    await powershell('project_acl_snapshot', fixtureSecurity + `
+Add-Type -TypeDefinition @'
+using System; using System.Runtime.InteropServices; using Microsoft.Win32.SafeHandles;
+public static class TestRootCensus {
+[StructLayout(LayoutKind.Sequential)] public struct Info {public uint Attributes,CreationLow,CreationHigh,AccessLow,AccessHigh,WriteLow,WriteHigh,Volume,SizeHigh,SizeLow,Links,FileHigh,FileLow;}
+[DllImport("kernel32.dll",EntryPoint="CreateFileW",ExactSpelling=true,CharSet=CharSet.Unicode,SetLastError=true)]
+static extern SafeFileHandle Open(string path,uint access,uint share,IntPtr security,uint disposition,uint flags,IntPtr template);
+[DllImport("kernel32.dll",SetLastError=true)] [return:MarshalAs(UnmanagedType.Bool)]
+static extern bool GetFileInformationByHandle(SafeFileHandle file,out Info info);
+public static string Identity(string path){using(var file=Open(path,0x80,7,IntPtr.Zero,3,0x02200000,IntPtr.Zero)){
+Info info;if(file.IsInvalid||!GetFileInformationByHandle(file,out info)||(info.Attributes&0x400)!=0||info.Links!=1)throw new InvalidOperationException("TEST census alias");
+return info.Volume.ToString("x8")+":"+info.FileHigh.ToString("x8")+info.FileLow.ToString("x8");}}
+}
+'@
+$clock=[Diagnostics.Stopwatch]::StartNew();$paths=[Collections.Generic.List[string]]::new();$pending=[Collections.Generic.Stack[string]]::new();$pending.Push($env:TEST_TARGET)
+while($pending.Count){if($clock.ElapsedMilliseconds-gt 120000-or $paths.Count-ge 65536){throw 'TEST census bound'}
+$path=$pending.Pop();$item=Get-Item -LiteralPath $path -Force;if(($item.Attributes-band [IO.FileAttributes]::ReparsePoint)-ne 0){throw 'TEST census reparse'}
+$paths.Add($item.FullName);if($item.PSIsContainer){foreach($child in [IO.Directory]::EnumerateFileSystemEntries($item.FullName)){$pending.Push($child)}}}
+$ordered=$paths.ToArray();[Array]::Sort($ordered,[StringComparer]::Ordinal)
+$own=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal);foreach($sid in (ConvertFrom-Json $env:TEST_SIDS)){$own.Add([string]$sid)|Out-Null}
+$hash=[Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256);$ownAceCount=0
+try{foreach($path in $ordered){if($clock.ElapsedMilliseconds-gt 120000){throw 'TEST census bound'}
+$identity=[TestRootCensus]::Identity($path)
+$raw=[Security.AccessControl.RawSecurityDescriptor]::new([TestFixtureSecurity]::ReadSecurityDescriptor($path),0)
+if($null-eq $raw.DiscretionaryAcl){throw 'TEST census null DACL'}
+foreach($ace in $raw.DiscretionaryAcl){if($ace-isnot [Security.AccessControl.CommonAce]){throw 'TEST census ACE'};if($own.Contains($ace.SecurityIdentifier.Value)){$ownAceCount++}}
+foreach($text in @($path.Substring($env:TEST_TARGET.Length),$identity,$raw.Owner.Value,$raw.Group.Value)){
+$bytes=[Text.Encoding]::UTF8.GetBytes($text);$hash.AppendData([BitConverter]::GetBytes([int]$bytes.Length));$hash.AppendData($bytes)}
+# The only normalized control bit is the already allowed AUTO_INHERITED own-write transition.
+$hash.AppendData([BitConverter]::GetBytes([int]([int]$raw.ControlFlags-band 0xfbff)))
+$dacl=[byte[]]::new($raw.DiscretionaryAcl.BinaryLength);$raw.DiscretionaryAcl.GetBinaryForm($dacl,0)
+$hash.AppendData([BitConverter]::GetBytes([int]$dacl.Length));$hash.AppendData($dacl)}
+[Console]::Write((@{count=$ordered.Length;sha256=[Convert]::ToHexString($hash.GetHashAndReset()).ToLowerInvariant();ownAceCount=$ownAceCount}|ConvertTo-Json -Compress))
+}finally{$hash.Dispose()}`, sharedProject, { TEST_SIDS: JSON.stringify(sids) })))
+  const contentionDirectories = retirementFiles === 32768 ? 256 : 32
+  const filesPerDirectory = retirementFiles / contentionDirectories
+  for (let index = 0; index < contentionDirectories; index++) {
+    assert.ok(Date.now() - contentionSetupStarted < 180_000, 'TEST_retirement_setup_timeout')
+    const directory = path.win32.join(contentionTree, String(index))
+    await mkdir(directory)
+    for (let offset = 0; offset < filesPerDirectory; offset += 8)
+      await Promise.all(Array.from({ length: 8 }, (_, file) => writeFile(path.win32.join(directory, `${offset + file}.txt`), 'TEST-retirement')))
+  }
+  const contentionBaseline = await contentionCensus()
+  assert.ok(Number(contentionBaseline.count) > retirementFiles)
+  assert.match(String(contentionBaseline.sha256), /^[a-f0-9]{64}$/)
+  executionRecord(facts.concurrentRootRetirement).setupElapsedMs = Math.min(86_400_000, Date.now() - contentionSetupStarted)
+  const contenders: Array<{ broker: ReturnType<typeof createWindowsNativeBroker>; nonce: string
+    fence?: WindowsOwnerDirectory; mapping?: Record<string, unknown>; connected?: unknown
+    progress: ExecutionNativeRootObservation[]; failure?: string; retired: boolean; retirement?: Promise<unknown> }> = []
+  let contentionFailed = false
+  try {
+    for (let index = 0; index < 3; index++) {
+      const contender = { broker: createWindowsNativeBroker(helper), nonce: randomUUID(),
+        progress: [] as ExecutionNativeRootObservation[], retired: false } as (typeof contenders)[number]
+      contenders.push(contender); contender.broker.events.on('error', () => {})
+      rootObservations.push(contender.progress)
+      contender.broker.events.on('connected', value => { contender.connected = value })
+      contender.broker.events.on('retireRootProgress', value => {
+        const observation = readExecutionNativeRootObservation(value, contender.nonce)
+        if (!observation || contender.progress.length >= 18) { contender.failure = 'invalid_root_progress'; return }
+        contender.progress.push(observation)
+      })
+      const filesystem = createWindowsOwnerFilesystem(input => contender.broker.request(input.op, input))
+      const root = path.win32.join(requestedRoot, `TEST-retirement-member-${index}`)
+      const created = await filesystem.createDirectory(root); await created.close()
+      const fencePath = path.win32.join(root, 'owner')
+      contender.fence = await filesystem.createDirectory(fencePath)
+      const leaseOwnerId = randomUUID()
+      const launchStarted = Date.now()
+      try {
+        const mapping = await contender.broker.request('launch', { executable: path.win32.join(sharedProject, 'bun.exe'),
+          entry: path.win32.join(sharedProject, 'main.ts'), cwd: sharedProject,
+          env: { SystemRoot: process.env.SystemRoot!, WINDIR: process.env.WINDIR!,
+            HOME: root, USERPROFILE: root, LOCALAPPDATA: root, TEMP: root, TMP: root, PWD: sharedProject },
+          writableRoots: [root], readOnlyRoots: [sharedProject], protectedRoots: [fencePath],
+          nonce: contender.nonce, leaseOwnerId }, retirementFiles === 32768 ? launchStarted + 90_000 : undefined)
+        contender.mapping = executionRecord(mapping)
+      } finally { launchElapsedMs.push(Math.min(86_400_000, Date.now() - launchStarted)) }
+      await waitProjectPeer(() => contender.connected)
+    }
+    const results = await Promise.allSettled(contenders.map(async contender => {
+      const deadline = Date.now() + 27_000
+      contender.retirement = contender.broker.request('retire', { deadline, timeoutMs: 27_000 }, deadline)
+      const receipt = executionRecord(await contender.retirement)
+      assert.equal(receipt.empty, true); assert.equal(receipt.heldProcessExited, true)
+      assert.equal(receipt.activeProcesses, 0); assert.equal(receipt.ownAcesRemoved, true)
+      assert.deepEqual(receipt.mapping, contender.mapping); contender.retired = true
+      assert.equal(contender.failure, undefined)
+      assert.equal(contender.progress.length, 18)
+      for (const [index, role] of ['protected_deny', 'private_writable', 'shared_read'].entries()) {
+        const observations = contender.progress.filter(value => value.index === index + 1)
+        assert.deepEqual(observations.map(value => value.phase), executionNativeRootPhases)
+        assert.equal(observations.every(value => value.count === 3 && value.role === role), true)
+        assert.equal(observations.every((value, index) => index === 0 || value.elapsedMs >= observations[index - 1]!.elapsedMs), true)
+      }
+    }))
+    executionRecord(facts.concurrentRootRetirement).failures = results.map(value => value.status === 'fulfilled' ? null : fixtureFailureCode(value.reason))
+    assert.equal(results.every(value => value.status === 'fulfilled'), true)
+    const sids = contenders.map(value => String(value.mapping!.containerSid))
+    const after = await contentionCensus(sids)
+    assert.equal(after.ownAceCount, 0)
+    assert.equal(after.count, contentionBaseline.count); assert.equal(after.sha256, contentionBaseline.sha256)
+    Object.assign(executionRecord(facts.concurrentRootRetirement), {
+      allOriginalJobsEmptyAndOwnAcesRemoved: true, descendantForeignAclsPreserved: true })
+  } catch (error) {
+    contentionFailed = true
+    throw error
+  } finally {
+    // Always attempt owned cleanup after partial launch; no fresh process lookup.
+    const cleanup = await Promise.allSettled(contenders.map(async contender => {
+      try {
+        if (contender.mapping) await (contender.retirement ??= contender.broker.request('retire'))
+      } finally {
+        try { await contender.fence?.close() } finally { await contender.broker.close() }
+      }
+    }))
+    facts.concurrentRootRetirementCleanupFailures = cleanup.filter(value => value.status === 'rejected')
+      .map(value => fixtureFailureCode(value.reason))
+    if (!contentionFailed) assert.equal(cleanup.every(value => value.status === 'fulfilled'), true)
+  }
   Object.assign(facts, { archivedIdentity: before, archivedPath: successArchive,
     originalPathFreeForNewFence: true, nextIdentity: next.identity,
     noReplaceCollisionPreserved: true, partialFenceBlocksAcquisition: true,

@@ -22,6 +22,7 @@ import { attachWindowsRunMemberCohort, bindWindowsExecutionSelectedConfig, close
 import { selectWindowsRunMemberPreflightForPlan } from '../bridge/OpenCodeV2RunControl.js'
 import { resolveOpenCodeV2DarwinControllerRuntimeClosure } from '../profile/OpenCodeV2ExecutionReceipt.js'
 import { recordOpenCodeV2ProviderFailure, retainOpenCodeV2CatalogServerFailure, executionNativeRetirementPhases, type ExecutionAcquisitionPhase, type ExecutionAcquisitionTiming,
+  readExecutionNativeRootObservation, type ExecutionNativeRootObservation,
   type ExecutionCleanupPhase, type ExecutionCleanupObservation, type ExecutionCommandObservation, type ExecutionNativeRetirementPhase } from '../execution/OpenCodeV2Diagnostics.js'
 import { readOpenCodeV2ServerFailure, type OpenCodeV2ServerFailure } from '../execution/OpenCodeV2ServerFailure.js'
 
@@ -284,6 +285,7 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
   let mappingWork: Promise<ExecutionPlatformMapping> | undefined
   let exited = false, closeWork: Promise<ExecutionCleanupReceipt> | undefined
   let cleanupPhase: ExecutionCleanupPhase | undefined, nativeCleanupPhase: ExecutionNativeRetirementPhase | undefined
+  let nativeCleanupRoot: ExecutionNativeRootObservation | undefined
   let exitResolve: () => void = () => undefined
   const exit = new Promise<void>(resolve => { exitResolve = resolve })
   const close = (deadline?: number): Promise<ExecutionCleanupReceipt> => closeWork ??= (async () => {
@@ -362,7 +364,9 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
       })
       child.on('retireProgress', (phase: unknown) => {
         nativeCleanupPhase = executionNativeRetirementPhases.find(value => value === phase)
+        nativeCleanupRoot = undefined
       })
+      child.on('retireRootProgress', (root: unknown) => { nativeCleanupRoot = readExecutionNativeRootObservation(root) })
       child.once('close', () => { exited = true; lifetime.abort(); exitResolve(); void close().catch(() => undefined) })
       let graphResolve!: (value: Record<string, unknown>) => void, graphReject!: (error: unknown) => void
       graphReady = new Promise((resolve, reject) => { graphResolve = resolve; graphReject = reject })
@@ -446,7 +450,8 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
       const lease = Object.freeze({ authority, signal: lifetime.signal, close })
       cleanupObservations.set(lease, () => cleanupPhase ? Object.freeze({ phase: cleanupPhase,
         ...((cleanupPhase === 'kernel-retirement' || cleanupPhase === 'force-kill') && nativeCleanupPhase
-          ? { nativePhase: nativeCleanupPhase } : {}) }) : undefined)
+          ? { nativePhase: nativeCleanupPhase,
+            ...(nativeCleanupPhase === 'retire_grants_roots' && nativeCleanupRoot ? { nativeRoot: nativeCleanupRoot } : {}) } : {}) }) : undefined)
       // Successful acquisition timing is otherwise written only on refusal.
       const acquired = timing(), acquisition: ExecutionAcquisitionTiming = Object.freeze({ elapsedMs: acquired.elapsedMs,
         history: Object.freeze(acquired.history.map(entry => Object.freeze({ ...entry }))) })

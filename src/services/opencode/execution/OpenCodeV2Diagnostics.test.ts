@@ -536,11 +536,12 @@ test('retirement diagnostics retain bounded timing and native failure without pr
     await recordOpenCodeV2ProviderFailure('run-member-retirement', new Error(secret), true, undefined, undefined, { elapsedMs: -1 })
     const outer = new Error('timeout', { cause: new Error(secret) })
     const originalCause = outer.cause
+    const nativeRoot = { phase: 'root_mutex_wait', role: 'shared_read', index: 2, count: 3, elapsedMs: 22_000 } as const
     await recordOpenCodeV2ProviderFailure('run-member-retirement', outer, true, undefined, undefined,
-      { elapsedMs: 22002, dataRoot: root, observation: { phase: 'kernel-retirement', nativePhase: 'retire_grants_roots' } })
+      { elapsedMs: 22002, dataRoot: root, observation: { phase: 'kernel-retirement', nativePhase: 'retire_grants_roots', nativeRoot } })
     for (const phase of ['owner-release', 'retained-roots', 'plan-close'] as const)
       await recordOpenCodeV2ProviderFailure('run-member-retirement', outer, true, undefined, undefined,
-        { elapsedMs: 22003, dataRoot: root, observation: { phase, nativePhase: 'retire_grants_roots' } })
+        { elapsedMs: 22003, dataRoot: root, observation: { phase, nativePhase: 'retire_grants_roots', nativeRoot } })
     await recordOpenCodeV2ProviderFailure('run-member-retirement', outer, true, undefined, undefined,
       { elapsedMs: 22004, dataRoot: root, observation: { phase: secret as never, nativePhase: secret as never } })
     const earlier = new Error('cleanup_unknown')
@@ -558,7 +559,7 @@ test('retirement diagnostics retain bounded timing and native failure without pr
       native: { stage: 'retire_owned_pair', nativeCode: 2147483659 }, cleanup: { elapsedMs: 74, phase: 'kernel-retirement' } })
     expect(rows.find(row => row.cleanup?.elapsedMs === 22001)).toMatchObject({ category: 'timeout', cleanup: { elapsedMs: 22001 } })
     expect(rows.find(row => row.cleanup?.elapsedMs === 22002)).toMatchObject({ category: 'timeout',
-      cleanup: { elapsedMs: 22002, phase: 'kernel-retirement', nativePhase: 'retire_grants_roots' } })
+      cleanup: { elapsedMs: 22002, phase: 'kernel-retirement', nativePhase: 'retire_grants_roots', nativeRoot } })
     expect(rows.filter(row => row.cleanup?.elapsedMs === 22003).map(row => row.cleanup).sort((a, b) => a.phase.localeCompare(b.phase)))
       .toEqual(['owner-release', 'plan-close', 'retained-roots'].map(phase => ({ elapsedMs: 22003, phase })))
     expect(rows.find(row => row.cleanup?.elapsedMs === 22004).cleanup).toEqual({ elapsedMs: 22004 })
