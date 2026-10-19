@@ -16,9 +16,9 @@ export type WindowsOwnerNativeRequest =
   | Readonly<{ op: 'ownerWritePreparedConfig' | 'ownerWritePreparedAuth'; handleId: string; bytesBase64: string; sha256: string }>
   | Readonly<{ op: 'ownerWriteExclusive'; handleId: string; name: string; bytesBase64: string }>
   | Readonly<{ op: 'ownerReadRecord'; handleId: string; name: string; maxBytes: number }>
-  | Readonly<{ op: 'ownerReadMetadata'; purpose: 'ProbeGuard' | 'ProbeRecord'; handleId: string }>
+  | Readonly<{ op: 'ownerReadMetadata'; purpose: 'ProbeGuard' | 'ProbeRecord' | 'DeliveryGuard'; handleId: string }>
   | Readonly<{ op: 'ownerReadMetadata'; purpose: 'SelectedAuth'; selectionId: string }>
-  | Readonly<{ op: 'ownerWriteMetadata'; purpose: 'ProbeGuard' | 'ProbeRecord'; handleId: string; bytesBase64: string }>
+  | Readonly<{ op: 'ownerWriteMetadata'; purpose: 'ProbeGuard' | 'ProbeRecord' | 'DeliveryGuard'; handleId: string; bytesBase64: string }>
   | Readonly<{ op: 'ownerArchive'; handleId: string; source: string; destination: string }>
   | Readonly<{ op: 'ownerCloseDirectory'; handleId: string }>
 
@@ -59,21 +59,21 @@ function directory(row: Record<string, unknown>, expectedPath: string): WindowsO
 }
 function name(value: string): void { executionAssert(RECORD_NAMES.has(value), 'execution_owner_record_invalid') }
 
-function metadataResponse(value: unknown, purpose: 'ProbeGuard' | 'ProbeRecord' | 'SelectedAuth',
+function metadataResponse(value: unknown, purpose: 'ProbeGuard' | 'ProbeRecord' | 'DeliveryGuard' | 'SelectedAuth',
   expectedPath: string | null): Record<string, unknown> {
   const row = response(value)
   const common = ['schema', 'ok', 'purpose', 'path', 'directoryIdentity', 'fileIdentity', 'bytes', 'privateAcl', 'reparse', 'links']
   const expected = purpose === 'SelectedAuth' ? [...common, 'rootIdentity', 'sha256'] :
-    purpose === 'ProbeGuard' ? common : undefined
+    purpose === 'DeliveryGuard' ? [...common, 'protectedDacl'] : purpose === 'ProbeGuard' ? common : undefined
   executionAssert(row.purpose === purpose && typeof row.path === 'string' && canonicalPath(row.path) &&
     (expectedPath === null || row.path === expectedPath) &&
     row.privateAcl === true && row.reparse === false && row.links === 1 &&
     Number.isSafeInteger(row.bytes) && Number(row.bytes) >= 0, 'execution_owner_unknown')
   identity(row.directoryIdentity)
   const fileIdentity = row.fileIdentity === null ? null : identity(row.fileIdentity)
-  if (purpose === 'ProbeGuard') {
+  if (purpose === 'ProbeGuard' || purpose === 'DeliveryGuard') {
     executionAssert(expected && Object.keys(row).sort().join(',') === [...expected].sort().join(',') &&
-      row.bytes === 0 && fileIdentity !== null, 'execution_owner_unknown')
+      row.bytes === 0 && fileIdentity !== null && (purpose !== 'DeliveryGuard' || row.protectedDacl === true), 'execution_owner_unknown')
   } else if (purpose === 'ProbeRecord') {
     if (row.absent === true) {
       executionAssert(Object.keys(row).sort().join(',') === [...common, 'absent'].sort().join(',') &&
@@ -115,11 +115,11 @@ export type WindowsOwnerDirectory = Readonly<{
   writePreparedConfig(content: string, sha256: string, deadline?: number, signal?: AbortSignal): Promise<void>
   writePreparedAuth(content: string, sha256: string, deadline?: number, signal?: AbortSignal): Promise<void>
   readRecord(name: string, deadline?: number, signal?: AbortSignal): Promise<unknown>
-  readMetadata(purpose: 'ProbeGuard' | 'ProbeRecord', deadline?: number, signal?: AbortSignal): Promise<Readonly<{
-    purpose: 'ProbeGuard' | 'ProbeRecord'; path: string; directoryIdentity: WindowsOwnerFileIdentity
+  readMetadata(purpose: 'ProbeGuard' | 'ProbeRecord' | 'DeliveryGuard', deadline?: number, signal?: AbortSignal): Promise<Readonly<{
+    purpose: 'ProbeGuard' | 'ProbeRecord' | 'DeliveryGuard'; path: string; directoryIdentity: WindowsOwnerFileIdentity
     fileIdentity: WindowsOwnerFileIdentity | null; bytes: number; absent?: true; value?: Record<string, unknown>
   }>>
-  writeMetadata(purpose: 'ProbeGuard' | 'ProbeRecord', value: unknown, deadline?: number, signal?: AbortSignal): Promise<void>
+  writeMetadata(purpose: 'ProbeGuard' | 'ProbeRecord' | 'DeliveryGuard', value: unknown, deadline?: number, signal?: AbortSignal): Promise<void>
   archive(destination: string): Promise<void>
   close(): Promise<void>
 }>
@@ -207,10 +207,10 @@ export function createWindowsOwnerFilesystem(native: WindowsOwnerNativePort, sel
         executionAssert(Buffer.from(canonicalExecutionJSON(value) + '\n').equals(bytes), 'execution_owner_unknown')
         await assertOwned(deadline, signal); return value
       }),
-      readMetadata: (purpose: 'ProbeGuard' | 'ProbeRecord', deadline?: number, signal?: AbortSignal) => serialize(async () => {
-        executionAssert(purpose === 'ProbeGuard' || purpose === 'ProbeRecord', 'execution_owner_unknown')
+      readMetadata: (purpose: 'ProbeGuard' | 'ProbeRecord' | 'DeliveryGuard', deadline?: number, signal?: AbortSignal) => serialize(async () => {
+        executionAssert(purpose === 'ProbeGuard' || purpose === 'ProbeRecord' || purpose === 'DeliveryGuard', 'execution_owner_unknown')
         await assertOwned(deadline, signal)
-        const expectedPath = path.win32.join(currentPath, purpose === 'ProbeGuard' ? 'owner.lock' : 'probe.json')
+        const expectedPath = path.win32.join(currentPath, purpose === 'ProbeRecord' ? 'probe.json' : 'owner.lock')
         const request: WindowsOwnerNativeRequest = { op: 'ownerReadMetadata', purpose, handleId }
         const row = metadataResponse(await native(request, deadline, signal), purpose, expectedPath)
         const directoryIdentity = identity(row.directoryIdentity)
@@ -226,16 +226,17 @@ export function createWindowsOwnerFilesystem(native: WindowsOwnerNativePort, sel
           ...(purpose === 'ProbeRecord' && row.absent !== true ? { value: executionRecord(JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(metadataBytes(row)))) } : {}),
         })
       }),
-      // Only the two fixed probe metadata files can be written through a retained
-      // directory. The native producer supplies explicit owner SID/private DACL.
-      writeMetadata: (purpose: 'ProbeGuard' | 'ProbeRecord', value: unknown, deadline?: number, signal?: AbortSignal) => serialize(async () => {
-        executionAssert(purpose === 'ProbeGuard' || purpose === 'ProbeRecord', 'execution_owner_unknown')
-        executionAssert(purpose !== 'ProbeGuard' || value === null, 'execution_owner_unknown')
-        const bytes = purpose === 'ProbeGuard' ? Buffer.alloc(0) :
+      // Only fixed probe metadata and the empty DeliveryGuard can be written
+      // through retained directories. Native code fixes each purpose namespace
+      // and supplies the owner SID/private DACL; DeliveryGuard also pins its file.
+      writeMetadata: (purpose: 'ProbeGuard' | 'ProbeRecord' | 'DeliveryGuard', value: unknown, deadline?: number, signal?: AbortSignal) => serialize(async () => {
+        executionAssert(purpose === 'ProbeGuard' || purpose === 'ProbeRecord' || purpose === 'DeliveryGuard', 'execution_owner_unknown')
+        executionAssert(purpose === 'ProbeRecord' || value === null, 'execution_owner_unknown')
+        const bytes = purpose !== 'ProbeRecord' ? Buffer.alloc(0) :
           Buffer.from(canonicalExecutionJSON(executionRecord(value)) + '\n', 'utf8')
         executionAssert(bytes.length < 131072, 'execution_owner_metadata_budget')
         await assertOwned(deadline, signal)
-        const expectedPath = path.win32.join(currentPath, purpose === 'ProbeGuard' ? 'owner.lock' : 'probe.json')
+        const expectedPath = path.win32.join(currentPath, purpose === 'ProbeRecord' ? 'probe.json' : 'owner.lock')
         try {
           const row = metadataResponse(await native({ op: 'ownerWriteMetadata', purpose, handleId,
             bytesBase64: bytes.toString('base64') }, deadline, signal), purpose, expectedPath)

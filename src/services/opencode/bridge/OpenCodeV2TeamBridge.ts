@@ -153,20 +153,20 @@ export class OpenCodeV2TeamBridge {
       base.memberName === request.memberId && base.requestId === identity.requestId &&
       base.body.deliveryAttemptId === identity.deliveryAttemptId && base.body.messageId === identity.localMessageId,
     'delivery_identity_conflict')
-    const claim = await boundOpenCodeRead(this.journal.reserve(base, request.originalSessionId, identity, executionHash(request.intent)), remaining())
+    const claim = await boundOpenCodeRead(this.journal.reserve(base, request.originalSessionId, identity, executionHash(request.intent), deadline), remaining())
     // A retained submitting/UNKNOWN owner is read-only. Carry the immutable
     // intent for conflict checking, never invoke another admission/send.
     const generation = claim.submissionOwner ? { submissionOwner: claim.submissionOwner } : {}
     const result = await this.call(claim.action === 'submit' ? { ...request, ...generation } : { operation: 'observe', memberId: request.memberId,
       originalSessionId: request.originalSessionId, nativeInputID: identity.nativeInputID, intent: request.intent, ...generation }, remaining())
     if (result.kind === 'send_refused') return boundOpenCodeRead(
-      this.journal.refuse(base, request.originalSessionId, request.intent, result, claim.submissionOwner), remaining())
+      this.journal.refuse(base, request.originalSessionId, request.intent, result, claim.submissionOwner, deadline), remaining())
     executionAssert((result.kind === 'send' || result.kind === 'observe') && result.admission.authority.sessionID === request.originalSessionId &&
       result.admission.authority.teamId === base.teamId && result.admission.authority.runId === base.runId &&
       result.admission.authority.memberId === base.memberName && result.admission.authority.laneId === base.laneId &&
       executionHash(result.admission.identity) === executionHash(identity), 'original_input_conflict')
     return boundOpenCodeRead(this.journal.commit(base, request.originalSessionId, identity, result,
-      projectV2DeliveryObservation(result.turn, identity.nativeInputID, identity.localMessageId)), remaining())
+      projectV2DeliveryObservation(result.turn, identity.nativeInputID, identity.localMessageId), deadline), remaining())
   }
 
   commitObservation(result: Extract<RunControlResult, { kind: 'send' | 'observe' }>, body: Record<string, unknown>, timeoutMs: number) {
@@ -174,7 +174,7 @@ export class OpenCodeV2TeamBridge {
     executionAssert(result.admission.authority.teamId === this.binding.teamId &&
       result.admission.authority.runId === this.binding.runId, 'original_input_conflict')
     return boundOpenCodeRead(this.journal.commitObservation(result, body, projectV2DeliveryObservation(result.turn,
-      result.admission.identity.nativeInputID, result.admission.identity.localMessageId)), timeoutMs)
+      result.admission.identity.nativeInputID, result.admission.identity.localMessageId), Date.now() + timeoutMs), timeoutMs)
   }
 }
 

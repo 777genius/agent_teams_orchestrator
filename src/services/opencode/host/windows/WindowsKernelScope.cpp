@@ -1003,6 +1003,10 @@ struct OwnerDirectory {
   std::wstring path, owner;
   JsonObject identity;
   bool writable = false;
+  // Fixed DeliveryGuard only: this kernel file object denies delete sharing
+  // until the owning directory capability closes. Never serialized.
+  Handle deliveryDirectory, deliveryGuard;
+  JsonObject deliveryGuardIdentity;
 };
 struct SelectedProfileDirectory {
   Handle file;
@@ -2227,6 +2231,113 @@ public:
     str(result, L"handleId", key);
     return result;
   }
+  static JsonObject deliveryPrivateIdentity(HANDLE file, const std::wstring &owner,
+                                             bool directory) {
+    const auto identity = fileIdentity(file, owner, directory);
+    PACL acl = nullptr;
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    require(GetSecurityInfo(file, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                            nullptr, nullptr, &acl, nullptr, &descriptor) == ERROR_SUCCESS,
+            "execution_owner_not_private");
+    LocalMemory memory{descriptor};
+    SECURITY_DESCRIPTOR_CONTROL control{};
+    DWORD revision = 0;
+    require(acl && GetSecurityDescriptorControl(descriptor, &control, &revision) &&
+                (control & SE_DACL_PROTECTED) != 0, "execution_owner_not_private");
+    return identity;
+  }
+  static Handle openDeliveryGuard(OwnerDirectory &directory, bool create) {
+    LocalMemory descriptor;
+    if (create) {
+      const auto sddl = L"O:" + directory.owner + L"D:P(A;;FA;;;SY)(A;;FA;;;" + directory.owner + L")";
+      require(ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                  sddl.c_str(), SDDL_REVISION_1, &descriptor.value, nullptr), "execution_owner_unknown");
+    }
+    auto nativeCreate = reinterpret_cast<NtCreateFileFunction>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtCreateFile"));
+    auto convert = reinterpret_cast<NtStatusErrorFunction>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlNtStatusToDosError"));
+    require(nativeCreate && convert, "execution_owner_unknown");
+    std::wstring name = L"owner.lock";
+    UNICODE_STRING relative{};
+    relative.Buffer = name.data();
+    relative.Length = static_cast<USHORT>(name.size() * sizeof(wchar_t));
+    relative.MaximumLength = relative.Length;
+    OBJECT_ATTRIBUTES attributes{};
+    attributes.Length = sizeof(attributes);
+    attributes.RootDirectory = directory.deliveryDirectory.value;
+    attributes.ObjectName = &relative;
+    attributes.Attributes = 0x40;
+    attributes.SecurityDescriptor = descriptor.value;
+    IO_STATUS_BLOCK completion{};
+    HANDLE raw = nullptr;
+    const auto status = nativeCreate(&raw, GENERIC_READ | READ_CONTROL | SYNCHRONIZE |
+        (create ? GENERIC_WRITE : 0), &attributes, &completion, nullptr, FILE_ATTRIBUTE_NORMAL,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, create ? FILE_CREATE : FILE_OPEN,
+        0x40 | 0x20 | 0x200000 | (create ? 0x2 : 0), nullptr, 0);
+    Handle file(raw);
+    if (status != 0 || completion.Status != 0) {
+      const auto native = status != 0 ? status : completion.Status;
+      if (!create && static_cast<DWORD>(native) == 0xc0000034UL) return Handle();
+      throw NativeError{"execution_owner_unknown", convert(native), "owner_delivery_guard_open",
+                        static_cast<DWORD>(native)};
+    }
+    require(equalPath(finalPath(file.value), extended(directory.path + L"\\owner.lock")),
+            "execution_owner_metadata_changed");
+    (void)deliveryPrivateIdentity(file.value, directory.owner, false);
+    FILE_STANDARD_INFO size{};
+    require(GetFileInformationByHandleEx(file.value, FileStandardInfo, &size, sizeof(size)) &&
+                size.EndOfFile.QuadPart == 0, "execution_owner_metadata_budget");
+    if (create) require(FlushFileBuffers(file.value), "execution_owner_unknown");
+    return file;
+  }
+  static void assertDeliveryGuard(OwnerDirectory &directory) {
+    const auto identity = deliveryPrivateIdentity(directory.file.value, directory.owner, true);
+    require(identity.Stringify() == directory.identity.Stringify() && directory.deliveryDirectory &&
+                directory.deliveryGuard &&
+                deliveryPrivateIdentity(directory.deliveryDirectory.value, directory.owner, true).Stringify() ==
+                    directory.identity.Stringify() &&
+                equalPath(finalPath(directory.deliveryDirectory.value), extended(directory.path)),
+            "execution_owner_metadata_changed");
+    auto named = openDeliveryGuard(directory, false);
+    require(named && deliveryPrivateIdentity(named.value, directory.owner, false).Stringify() ==
+                         directory.deliveryGuardIdentity.Stringify() &&
+                deliveryPrivateIdentity(directory.deliveryGuard.value, directory.owner, false).Stringify() ==
+                         directory.deliveryGuardIdentity.Stringify() &&
+                equalPath(finalPath(directory.deliveryGuard.value), extended(directory.path + L"\\owner.lock")),
+            "execution_owner_metadata_changed");
+  }
+  JsonObject deliveryGuardMetadata(const JsonObject &input, bool create) {
+    auto &directory = held(input);
+    const std::wstring suffix = L"\\opencode\\v2\\delivery-journal";
+    require(directory.owner == currentSid() && directory.path.size() > suffix.size() + 3 &&
+                directory.path.substr(directory.path.size() - suffix.size()) == suffix,
+            "execution_owner_metadata_purpose_invalid");
+    SharedAclMutex mutation(directory.identity);
+    (void)deliveryPrivateIdentity(directory.file.value, directory.owner, true);
+    if (!directory.deliveryDirectory) {
+      auto pin = canonicalDirectory(directory.path, FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE);
+      require(deliveryPrivateIdentity(pin.value, directory.owner, true).Stringify() == directory.identity.Stringify(),
+              "execution_owner_metadata_changed");
+      directory.deliveryDirectory = std::move(pin);
+    }
+    if (!directory.deliveryGuard) {
+      require(create, "execution_owner_metadata_missing");
+      auto file = openDeliveryGuard(directory, false);
+      if (!file) file = openDeliveryGuard(directory, true); // Exclusive positive absence only.
+      directory.deliveryGuardIdentity = deliveryPrivateIdentity(file.value, directory.owner, false);
+      directory.deliveryGuard = std::move(file);
+    }
+    held(input);
+    JsonObject result;
+    num(result, L"schema", 1); flag(result, L"ok", true);
+    str(result, L"purpose", L"DeliveryGuard"); str(result, L"path", directory.path + L"\\owner.lock");
+    result.SetNamedValue(L"directoryIdentity", directory.identity);
+    result.SetNamedValue(L"fileIdentity", directory.deliveryGuardIdentity);
+    num(result, L"bytes", 0); num(result, L"links", 1);
+    flag(result, L"privateAcl", true); flag(result, L"protectedDacl", true); flag(result, L"reparse", false);
+    return result;
+  }
   OwnerDirectory &held(const JsonObject &input) {
     auto it = directories.find(text(input, L"handleId"));
     require(it != directories.end(), "execution_owner_unknown");
@@ -2260,6 +2371,7 @@ public:
                 directory.identity.Stringify(),
             "execution_owner_unknown");
     directoryMode(directory.file.value);
+    if (directory.deliveryGuard) assertDeliveryGuard(directory);
     return directory;
   }
   // Fixed fresh-profile publications. Ordinary creator authority is required;
@@ -2369,6 +2481,10 @@ public:
                 input.HasKey(L"handleId") && input.HasKey(L"purpose") &&
                 input.HasKey(L"bytesBase64"), "execution_invalid_response");
     const auto purpose = text(input, L"purpose");
+    if (purpose == L"DeliveryGuard") {
+      require(text(input, L"bytesBase64").empty(), "execution_owner_metadata_budget");
+      return deliveryGuardMetadata(input, true);
+    }
     require(purpose == L"ProbeGuard" || purpose == L"ProbeRecord",
             "execution_owner_metadata_purpose_invalid");
     auto data = unbase64(text(input, L"bytesBase64"), 128 * 1024 - 1);
@@ -2524,6 +2640,10 @@ public:
     require(input.Size() == 3 && input.HasKey(L"op"), "execution_invalid_response");
     require(text(input, L"op") == L"ownerReadMetadata", "execution_invalid_response");
     const auto purpose = text(input, L"purpose");
+    if (purpose == L"DeliveryGuard") {
+      require(input.HasKey(L"handleId") && !input.HasKey(L"selectionId"), "execution_invalid_response");
+      return deliveryGuardMetadata(input, false);
+    }
     if (purpose == L"SelectedAuth") {
       require(input.HasKey(L"selectionId") && !input.HasKey(L"handleId") &&
                   input.GetNamedValue(L"selectionId").ValueType() == JsonValueType::String,

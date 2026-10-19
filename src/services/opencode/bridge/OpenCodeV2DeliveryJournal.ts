@@ -8,6 +8,7 @@ import { assertIntentIdentity, executionAssert, executionHash, executionRecord }
 import type { OpenCodeDeliveryResponseObservation } from '../OpenCodeDeliveryResponseObserver.js'
 import { commandStatusMismatchReason, markSendMessageOutcome, type SendMessageCommandData, type SendMessageOutcomeBase } from './OpenCodeBridgeDeliveryJournal.js'
 import type { RunControlResult } from './OpenCodeV2RunTypes.js'
+import { openWindowsDeliveryJournalGuard } from './OpenCodeV2WindowsDeliveryGuard.js'
 
 type DeliveryResult = Extract<RunControlResult, { kind: 'send' | 'observe' }>
 
@@ -24,7 +25,28 @@ export class OpenCodeV2DeliveryJournal {
   }
   query(input: Parameters<OpenCodeCommandOutcomeStore['query']>[0]) { return this.store.query(input) }
 
-  private async withLock<T>(operation: () => Promise<T>): Promise<T> {
+  private async withLock<T>(operation: () => Promise<T>, deadline?: number): Promise<T> {
+    if (process.platform === 'win32') {
+      const guard = await openWindowsDeliveryJournalGuard(this.dataRoot, deadline ?? Date.now() + 30_000)
+      let release: (() => Promise<void>) | undefined
+      let primary: unknown, failed = false
+      try {
+        await guard.assertOwned()
+        release = await lockfile.lock(guard.path, { retries: { retries: 30, minTimeout: 5, maxTimeout: 100 } })
+        await guard.assertOwned()
+        const result = await operation()
+        await guard.assertOwned()
+        return result
+      } catch (error) { primary = error; failed = true; throw error }
+      finally {
+        const errors: unknown[] = []
+        try { if (release) await release() } catch (error) { errors.push(error) }
+        try { await guard.assertOwned() } catch (error) { errors.push(error) }
+        try { await guard.close() } catch (error) { errors.push(error) }
+        if (errors.length) throw new AggregateError([...(failed ? [primary] : []), ...errors],
+          'cleanup_unknown', { cause: failed ? primary : errors[0] })
+      }
+    }
     // Serialize V2 observation merge decisions across fresh CLI processes,
     // then use the unchanged shared store's own atomic identity/write lock.
     // There is still one app outcome file, including for V1 consumers.
@@ -43,8 +65,8 @@ export class OpenCodeV2DeliveryJournal {
   }
 
   reserve(base: SendMessageOutcomeBase, sessionId: string, identity: IntentIdentity): Promise<'submit' | 'observe'>
-  reserve(base: SendMessageOutcomeBase, sessionId: string, identity: IntentIdentity, intentHash: string): Promise<{ action: 'submit' | 'observe'; submissionOwner: string }>
-  async reserve(base: SendMessageOutcomeBase, sessionId: string, identity: IntentIdentity, intentHash?: string): Promise<'submit' | 'observe' | { action: 'submit' | 'observe'; submissionOwner: string }> {
+  reserve(base: SendMessageOutcomeBase, sessionId: string, identity: IntentIdentity, intentHash: string, deadline?: number): Promise<{ action: 'submit' | 'observe'; submissionOwner: string }>
+  async reserve(base: SendMessageOutcomeBase, sessionId: string, identity: IntentIdentity, intentHash?: string, deadline?: number): Promise<'submit' | 'observe' | { action: 'submit' | 'observe'; submissionOwner: string }> {
     assertIntentIdentity(identity)
     executionAssert(base.requestId === identity.requestId && base.body.deliveryAttemptId === identity.deliveryAttemptId &&
       base.body.messageId === identity.localMessageId && /^ses_[a-zA-Z0-9]+$/.test(sessionId), 'delivery_identity_conflict')
@@ -80,12 +102,12 @@ export class OpenCodeV2DeliveryJournal {
       await markSendMessageOutcome(base, { status: 'prompt_submitting', sessionId,
         runtimePromptMessageId: identity.nativeInputID }, this.store)
       return decision('submit', submissionOwner)
-    })
+    }, deadline)
   }
 
 
   async refuse(base: SendMessageOutcomeBase, sessionId: string, intent: import('../execution/OpenCodeV2AdmissionService.js').QueueIntent,
-    result: Extract<RunControlResult, { kind: 'send_refused' }>, submissionOwner: string): Promise<SendMessageCommandData> {
+    result: Extract<RunControlResult, { kind: 'send_refused' }>, submissionOwner: string, deadline?: number): Promise<SendMessageCommandData> {
     return this.withLock(async () => {
       executionAssert(result.disposition === 'not_reserved' && result.submissionOwner === submissionOwner && executionHash(result.intent) === executionHash(intent) &&
         result.authority.sessionID === sessionId && result.authority.teamId === base.teamId &&
@@ -104,7 +126,7 @@ export class OpenCodeV2DeliveryJournal {
       return { accepted: false, runId: base.runId ?? undefined, sessionId, memberName: base.memberName,
         runtimePromptMessageId: intent.identity.nativeInputID,
         diagnostics: [{ code: 'native_input_not_reserved', severity: 'warning', message: 'The original input was not reserved or submitted.' }] }
-    })
+    }, deadline)
   }
 
   private assertOriginal(record: OpenCodeCommandOutcomeRecord, base: SendMessageOutcomeBase,
@@ -122,7 +144,7 @@ export class OpenCodeV2DeliveryJournal {
   }
 
   async commit(base: SendMessageOutcomeBase, sessionId: string, identity: IntentIdentity,
-    result: DeliveryResult, observation: OpenCodeDeliveryResponseObservation): Promise<SendMessageCommandData> {
+    result: DeliveryResult, observation: OpenCodeDeliveryResponseObservation, deadline?: number): Promise<SendMessageCommandData> {
     return this.withLock(async () => {
       const admission = result.admission
       executionAssert(executionHash(admission.identity) === executionHash(identity) &&
@@ -155,11 +177,11 @@ export class OpenCodeV2DeliveryJournal {
       // A prepared/UNKNOWN DTO is not classified pre-invocation failure evidence;
       // keep the existing prompt submission fence without making it retryable.
       return data
-    })
+    }, deadline)
   }
 
   async commitObservation(result: DeliveryResult, body: Record<string, unknown>,
-    observation: OpenCodeDeliveryResponseObservation): Promise<SendMessageCommandData> {
+    observation: OpenCodeDeliveryResponseObservation, deadline?: number): Promise<SendMessageCommandData> {
     const identity = result.admission.identity
     const found = await this.query({ requestId: identity.requestId, deliveryAttemptId: identity.deliveryAttemptId })
     executionAssert(found.record && found.diagnostics.length === 0, 'delivery_journal_unknown')
@@ -170,6 +192,6 @@ export class OpenCodeV2DeliveryJournal {
     return this.commit({ requestId: record.requestId, teamId: record.teamId, teamName: record.teamName,
       laneId: record.laneId, memberName: record.memberName, projectPath: record.projectPath, runId: record.runId,
       body: { ...body, deliveryAttemptId: record.deliveryAttemptId, messageId: record.messageId, payloadHash: record.payloadHash } },
-    result.admission.authority.sessionID, identity, result, observation)
+    result.admission.authority.sessionID, identity, result, observation, deadline)
   }
 }

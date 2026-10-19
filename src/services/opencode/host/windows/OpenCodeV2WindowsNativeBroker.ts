@@ -65,7 +65,7 @@ async function resolveWindowsProducerAsset(name: string, manifestName: string, d
   return Object.freeze({ path: executable, sha256: value.sha256, arch: process.arch as 'x64' | 'arm64' })
 }
 /** Helper-only owner and spike paths never require the realpath DLL. */
-export async function resolveWindowsNativeArtifact(): Promise<WindowsNativeArtifact> {
+export async function resolveWindowsNativeArtifact(deadline?: number): Promise<WindowsNativeArtifact> {
   const source = await resolveWindowsProducerAsset('opencode-v2-windows-helper.exe', 'windows-helper.json', false)
   // Only the producer-selected helper can place its own held image in custody.
   // Every fresh CLI selects the same SHA-addressed file, including FileID.
@@ -73,7 +73,7 @@ export async function resolveWindowsNativeArtifact(): Promise<WindowsNativeArtif
   bootstrap.events.on('error', () => {})
   let receipt: unknown
   let primary: unknown, failed = false
-  try { receipt = await bootstrap.request('selfImageCustody') }
+  try { receipt = await bootstrap.request('selfImageCustody', {}, deadline) }
   catch (error) {
     try {
       if (error instanceof Error && !Object.hasOwn(error, 'nativeOperation'))
