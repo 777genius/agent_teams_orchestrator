@@ -129,8 +129,12 @@ async function execute(input: Record<string, unknown>): Promise<void> {
       sessionCreated = true
       stage = 'instance'
       return yield* instance.provide(session)(Effect.gen(function* () {
+        stage = 'instance-body'
+        stage = 'agent-service'
         const agents = yield* agentModule.Agent.Service
+        stage = 'agent-get'
         const agent = yield* agents.get(agentModule.Agent.ID.make(profile.selection.agent))
+        stage = 'agent-identity'
         assert.ok(agent && agent.id === session.agent)
         stage = 'shell-select'
         const selectedShell = yield* (yield* shellModule.ShellSelect.Service).resolve({ priority: 'compat' })

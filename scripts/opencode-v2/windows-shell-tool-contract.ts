@@ -1,5 +1,6 @@
 import { types } from 'node:util'
 import type { ConfigEntry } from '@opencode/client'
+import { projectOpenCodeV2LocationCause, readOpenCodeV2ServerFailure, type OpenCodeV2ServerFailure } from '../../src/services/opencode/execution/OpenCodeV2ServerFailure.js'
 import { executionProfileGuards } from '../../src/services/opencode/host/OpenCodeV2ExecutionBinding.js'
 import { readWindowsRealpathFailure, type WindowsRealpathFailure } from '../../src/services/opencode/host/windows/OpenCodeV2WindowsRealpath.js'
 
@@ -28,16 +29,17 @@ export function createShellProbeConfig(controllerRoot: string, bun: string) {
 // pipe; the parent receives only these source-owned finite values.
 export const shellProbeStages = ['prepare', 'profile-validation', 'profile-cwd', 'project-name', 'entry-digest',
   'bun-digest', 'profile-environment', 'node-realpath', 'node-parent', 'program-realpath', 'program-parent',
-  'node-digest', 'program-digest', 'marker', 'graph', 'runtime', 'services', 'session', 'instance',
+  'node-digest', 'program-digest', 'marker', 'graph', 'runtime', 'services', 'session', 'instance', 'instance-body', 'agent-service', 'agent-get', 'agent-identity',
   'shell-select', 'tool-snapshot', 'tool-execute', 'complete'] as const
 export const shellProbeMethods = ['close', 'endStdin', 'identity', 'kill', 'outputLimit', 'readOutput', 'resolve',
   'retire', 'spawn', 'status', 'stdinAlreadyBound', 'unsupportedCommand', 'unsupportedDescriptor',
   'unsupportedSignal', 'unsupportedUnref', 'validateOutput', 'writeStdin'] as const
 const shellProbeErrnos = ['EPERM', 'EACCES', 'ENOENT', 'ENOTDIR', 'EISDIR', 'EINVAL', 'UNKNOWN', 'EIO', 'ENOSYS'] as const
 const shellProbeOperations = ['realpath', 'open', 'read', 'lstat', 'stat'] as const
+type ShellProbeCauseDetail = Omit<OpenCodeV2ServerFailure, 'operation' | 'kind'>
 export type ShellProbeFailure = Readonly<{ kind: 'Fail' | 'Die' | 'Interrupt' | 'unknown';
   method: typeof shellProbeMethods[number] | null; profileGuard?: typeof executionProfileGuards[number]
-  errno?: typeof shellProbeErrnos[number]; operation?: typeof shellProbeOperations[number]; realpath?: WindowsRealpathFailure }>
+  errno?: typeof shellProbeErrnos[number]; operation?: typeof shellProbeOperations[number]; realpath?: WindowsRealpathFailure; detail?: ShellProbeCauseDetail }>
 export type ShellProbeResult = Readonly<{
   stage: typeof shellProbeStages[number]; succeeded: boolean; sessionCreated: boolean
   registeredShell: boolean; shell: 'cmd' | 'powershell' | 'pwsh' | 'bash' | 'other' | null
@@ -69,6 +71,18 @@ function readRealpathFailure(value: unknown): WindowsRealpathFailure | undefined
   return Object.freeze({ status, operation, win32, anchorCount, matchingAnchorIndex }) as WindowsRealpathFailure
 }
 
+const causeDetailFields = ['tag', 'name', 'module', 'method', 'reason', 'errno', 'sqlCode', 'realpath'] as const
+function readCauseDetail(value: unknown, kind: ShellProbeFailure['kind']): ShellProbeCauseDetail | undefined {
+  const fields = Object.fromEntries(causeDetailFields.map(key => [key, data(value, key)]).filter(([, value]) => value !== undefined))
+  if (Object.keys(fields).length === 0) return undefined
+  const checked = readOpenCodeV2ServerFailure({ operation: 'location', kind, ...fields })
+  if (!checked) return undefined
+  // Reuse only the closed error vocabulary; this TEST observation does not
+  // claim that the failure came from an HTTP location request.
+  const { operation: _operation, kind: _kind, ...detail } = checked
+  return Object.freeze(detail)
+}
+
 /** One selected Effect cause leaf, then that leaf's own-data error chain.
  * Match only the exact selected PlatformError formatter used by the adapter.
  * Never retain a raw message, path, command, stack, or unrelated cause leaf. */
@@ -93,7 +107,11 @@ export function shellProbeFailure(cause: unknown): ShellProbeFailure {
       }
       error = [reason, data(error, 'error'), data(error, 'cause')].find(value => value !== null && typeof value === 'object')
     }
-    return Object.freeze({ kind, method: null })
+    // The production projector normally chooses the first noninterrupt leaf.
+    // Give it only our already chosen leaf, so fields can never cross leaves.
+    const projected = projectOpenCodeV2LocationCause({ reasons: leaf === undefined ? [] : [leaf] })
+    const detail = readCauseDetail(projected, kind)
+    return Object.freeze({ kind, method: null, ...(detail ? { detail } : {}) })
   } catch { return Object.freeze({ kind: 'unknown', method: null }) }
 }
 
@@ -114,8 +132,9 @@ export function readShellProbeResult(value: unknown): ShellProbeResult | undefin
       const errno = shellProbeErrnos.find(value => value === data(source, 'errno'))
       const operation = shellProbeOperations.find(value => value === data(source, 'operation'))
       const realpath = readRealpathFailure(data(source, 'realpath'))
+      const detail = readCauseDetail(data(source, 'detail'), kind as ShellProbeFailure['kind'])
       failure = Object.freeze({ kind, method, ...(profileGuard ? { profileGuard } : {}), ...(errno ? { errno } : {}),
-        ...(operation ? { operation } : {}), ...(realpath ? { realpath } : {}) }) as ShellProbeFailure
+        ...(operation ? { operation } : {}), ...(realpath ? { realpath } : {}), ...(detail ? { detail } : {}) }) as ShellProbeFailure
     }
     if (succeeded && (stage !== 'complete' || !sessionCreated || !registeredShell || !markerPresent || failure !== null)) return undefined
     return Object.freeze({ stage, succeeded, sessionCreated, registeredShell, shell, markerPresent, failure }) as ShellProbeResult

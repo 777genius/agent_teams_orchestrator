@@ -92,3 +92,32 @@ test('pregraph diagnostics retain only closed own-data guards and privately mint
       .toEqual({ kind: 'unknown', method: null })
   }
 })
+
+
+test('instance defects keep one selected Cause leaf and the existing closed filesystem vocabulary', async () => {
+  const graph = await verifyOpenCodeV2ServerGraph('2.0.32')
+  const { Effect, Exit, PlatformError }: typeof import('effect') = await import(pathToFileURL(graph.effectPath).href)
+  const native = Object.assign(new Error('TEST-private-path'), { code: 'EPERM', path: 'TEST-private' })
+  const error = PlatformError.systemError({ _tag: 'Unknown', module: 'FileSystem', method: 'realPath',
+    pathOrDescriptor: 'TEST-private', cause: native })
+  const exit = await Effect.runPromiseExit(Effect.die(error))
+  if (!Exit.isFailure(exit)) throw new Error('TEST_expected_defect')
+  const observed = shellProbeFailure(exit.cause)
+  expect(observed).toEqual({ kind: 'Die', method: null, detail: { tag: 'PlatformError', module: 'FileSystem',
+    method: 'realPath', reason: 'Unknown', errno: 'EPERM', name: 'Error' } })
+  const result = { stage: 'instance', succeeded: false, sessionCreated: true, registeredShell: false,
+    shell: null, markerPresent: false, failure: { ...observed, detail: { ...observed.detail,
+      message: 'TEST-private', pathOrDescriptor: 'TEST-private' } } }
+  expect(readShellProbeResult(result)?.failure).toEqual(observed)
+  expect(shellProbeFailure({ reasons: [{ _tag: 'Interrupt' }, ...exit.cause.reasons] }))
+    .toEqual({ kind: 'Interrupt', method: null })
+  expect(shellProbeFailure({ reasons: [{ _tag: 'Die', defect: {} }, ...exit.cause.reasons] }))
+    .toEqual({ kind: 'Die', method: null })
+  expect(readShellProbeResult({ ...result, failure: { kind: 'Die', method: null, detail: { method: 'TEST-raw-method' } } })?.failure)
+    .toEqual({ kind: 'Die', method: null })
+  let reads = 0
+  const hostile = Object.defineProperty({}, 'method', { get() { reads++; throw new Error('TEST_getter') } })
+  expect(readShellProbeResult({ ...result, failure: { kind: 'Die', method: null, detail: hostile } })?.failure)
+    .toEqual({ kind: 'Die', method: null })
+  expect(reads).toBe(0)
+})
