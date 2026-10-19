@@ -1,5 +1,7 @@
 import { types } from 'node:util'
 import type { ConfigEntry } from '@opencode/client'
+import { executionProfileGuards } from '../../src/services/opencode/host/OpenCodeV2ExecutionBinding.js'
+import { readWindowsRealpathFailure, type WindowsRealpathFailure } from '../../src/services/opencode/host/windows/OpenCodeV2WindowsRealpath.js'
 
 export const shellProbePermissions = [{ action: '*', resource: '*', effect: 'deny' },
   { action: 'shell', resource: '*', effect: 'allow' }] as const
@@ -24,13 +26,18 @@ export function createShellProbeConfig(controllerRoot: string, bun: string) {
 
 // TEST-only observations. Neither strings nor Error objects cross the child
 // pipe; the parent receives only these source-owned finite values.
-export const shellProbeStages = ['prepare', 'profile', 'graph', 'runtime', 'services', 'session', 'instance',
+export const shellProbeStages = ['prepare', 'profile-validation', 'profile-cwd', 'project-name', 'entry-digest',
+  'bun-digest', 'profile-environment', 'node-realpath', 'node-parent', 'program-realpath', 'program-parent',
+  'node-digest', 'program-digest', 'marker', 'graph', 'runtime', 'services', 'session', 'instance',
   'shell-select', 'tool-snapshot', 'tool-execute', 'complete'] as const
 export const shellProbeMethods = ['close', 'endStdin', 'identity', 'kill', 'outputLimit', 'readOutput', 'resolve',
   'retire', 'spawn', 'status', 'stdinAlreadyBound', 'unsupportedCommand', 'unsupportedDescriptor',
   'unsupportedSignal', 'unsupportedUnref', 'validateOutput', 'writeStdin'] as const
+const shellProbeErrnos = ['EPERM', 'EACCES', 'ENOENT', 'ENOTDIR', 'EISDIR', 'EINVAL', 'UNKNOWN', 'EIO', 'ENOSYS'] as const
+const shellProbeOperations = ['realpath', 'open', 'read', 'lstat', 'stat'] as const
 export type ShellProbeFailure = Readonly<{ kind: 'Fail' | 'Die' | 'Interrupt' | 'unknown';
-  method: typeof shellProbeMethods[number] | null }>
+  method: typeof shellProbeMethods[number] | null; profileGuard?: typeof executionProfileGuards[number]
+  errno?: typeof shellProbeErrnos[number]; operation?: typeof shellProbeOperations[number]; realpath?: WindowsRealpathFailure }>
 export type ShellProbeResult = Readonly<{
   stage: typeof shellProbeStages[number]; succeeded: boolean; sessionCreated: boolean
   registeredShell: boolean; shell: 'cmd' | 'powershell' | 'pwsh' | 'bash' | 'other' | null
@@ -38,6 +45,29 @@ export type ShellProbeResult = Readonly<{
 }>
 const data = (value: unknown, key: string): unknown => value !== null && typeof value === 'object' && !types.isProxy(value)
   ? Object.getOwnPropertyDescriptor(value, key)?.value : undefined
+
+/** Pregraph diagnostics describe the exact thrown error only. Native facts
+ * come from the existing private WeakMap, never caller-supplied properties. */
+export function shellProbeSetupFailure(error: unknown): ShellProbeFailure {
+  try {
+    const profileGuard = executionProfileGuards.find(value => value === data(error, 'profileGuard'))
+    const errno = shellProbeErrnos.find(value => value === data(error, 'code'))
+    const operation = shellProbeOperations.find(value => value === data(error, 'syscall'))
+    const realpath = readWindowsRealpathFailure(error)
+    return Object.freeze({ kind: 'unknown', method: null, ...(profileGuard ? { profileGuard } : {}),
+      ...(errno ? { errno } : {}), ...(operation ? { operation } : {}), ...(realpath ? { realpath } : {}) })
+  } catch { return Object.freeze({ kind: 'unknown', method: null }) }
+}
+
+function readRealpathFailure(value: unknown): WindowsRealpathFailure | undefined {
+  const status = data(value, 'status'), operation = data(value, 'operation'), win32 = data(value, 'win32')
+  const anchorCount = data(value, 'anchorCount'), matchingAnchorIndex = data(value, 'matchingAnchorIndex')
+  if (![status, operation, win32, anchorCount, matchingAnchorIndex].every(Number.isSafeInteger) ||
+      Number(status) < 1 || Number(status) > 4 || Number(operation) < 0 || Number(operation) > 25 ||
+      Number(win32) < 0 || Number(win32) > 0xffffffff || Number(anchorCount) < 0 || Number(anchorCount) > 4096 ||
+      Number(matchingAnchorIndex) < -1 || Number(matchingAnchorIndex) >= Number(anchorCount)) return undefined
+  return Object.freeze({ status, operation, win32, anchorCount, matchingAnchorIndex }) as WindowsRealpathFailure
+}
 
 /** One selected Effect cause leaf, then that leaf's own-data error chain.
  * Match only the exact selected PlatformError formatter used by the adapter.
@@ -80,7 +110,12 @@ export function readShellProbeResult(value: unknown): ShellProbeResult | undefin
       const kind = data(source, 'kind'), method = data(source, 'method')
       if (!(typeof kind === 'string' && ['Fail', 'Die', 'Interrupt', 'unknown'].includes(kind)) ||
           !(method === null || shellProbeMethods.includes(method as typeof shellProbeMethods[number]))) return undefined
-      failure = Object.freeze({ kind, method }) as ShellProbeFailure
+      const profileGuard = executionProfileGuards.find(value => value === data(source, 'profileGuard'))
+      const errno = shellProbeErrnos.find(value => value === data(source, 'errno'))
+      const operation = shellProbeOperations.find(value => value === data(source, 'operation'))
+      const realpath = readRealpathFailure(data(source, 'realpath'))
+      failure = Object.freeze({ kind, method, ...(profileGuard ? { profileGuard } : {}), ...(errno ? { errno } : {}),
+        ...(operation ? { operation } : {}), ...(realpath ? { realpath } : {}) }) as ShellProbeFailure
     }
     if (succeeded && (stage !== 'complete' || !sessionCreated || !registeredShell || !markerPresent || failure !== null)) return undefined
     return Object.freeze({ stage, succeeded, sessionCreated, registeredShell, shell, markerPresent, failure }) as ShellProbeResult

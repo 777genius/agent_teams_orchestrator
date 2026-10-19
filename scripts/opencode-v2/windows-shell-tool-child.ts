@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import path from 'node:path'
-import { readFile, realpath } from 'node:fs/promises'
+import filesystem, { readFile } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
 import { pathToFileURL } from 'node:url'
 import { openCodeBunVersion } from '../../src/constants/openCodeBunVersion.js'
@@ -10,7 +10,7 @@ import { loadOpenCodeV2WindowsRuntime } from '../../src/services/opencode/host/w
 import { validateExecutionProfile, type SelectedExecutionProfile } from '../../src/services/opencode/host/OpenCodeV2ExecutionBinding.js'
 import { verifyOpenCodePackage, verifyOpenCodeV2GraphEffect, verifyOpenCodeV2ServerGraph } from '../../src/services/opencode/host/OpenCodeV2ServerGraph.js'
 import { boundOpenCodeRead } from '../../src/services/opencode/transport/OpenCodeBoundedFetch.js'
-import { shellProbeFailure, type ShellProbeResult } from './windows-shell-tool-contract.js'
+import { shellProbeFailure, shellProbeSetupFailure, type ShellProbeResult } from './windows-shell-tool-contract.js'
 
 // This entry is launched only by the TEST probe through the normal native plan.
 // It creates one real local session and invokes one registered tool; no prompt,
@@ -51,29 +51,46 @@ async function execute(input: Record<string, unknown>): Promise<void> {
   const deadline = Number(input.deadline)
   const profile = input.profile as SelectedExecutionProfile
   const node = String(input.node), program = String(input.program), marker = String(input.marker)
-  let stage: ShellProbeResult['stage'] = 'profile', sessionCreated = false, registeredShell = false
+  let stage: ShellProbeResult['stage'] = 'profile-validation', sessionCreated = false, registeredShell = false
   let shell: ShellProbeResult['shell'] = null, markerPresent = false
   let failure: ShellProbeResult['failure'] = null
   let succeeded = false
   const timer = setTimeout(() => controller.abort(), Math.max(1, deadline - Date.now()))
   try {
     await validateExecutionProfile(profile)
+    stage = 'profile-cwd'
     assert.equal(profile.directory, process.cwd())
+    stage = 'project-name'
     assert.match(path.basename(profile.directory), /^TEST-project$/)
+    stage = 'entry-digest'
     assert.equal(await digest(process.argv[1]!), input.entrySha256)
+    stage = 'bun-digest'
     assert.equal(await digest(process.execPath), prepared.executableSha256)
+    stage = 'profile-environment'
     for (const key of ['TMP', 'TEMP', 'LOCALAPPDATA', 'PATH'] as const) process.env[key] = profile.env[key]
     for (const [key, value] of Object.entries(profile.env)) assert.equal(process.env[key], value)
-    assert.equal(await realpath(node), node); assert.equal(path.dirname(node), profile.directory)
-    assert.equal(await realpath(program), program); assert.equal(path.dirname(program), profile.directory)
-    assert.equal(await digest(node), input.nodeSha256); assert.equal(await digest(program), input.programSha256)
+    // Read the default promise surface after authenticated DLL installation.
+    // A named builtin import can retain the earlier, unwrapped binding in Bun.
+    stage = 'node-realpath'
+    assert.equal(await filesystem.realpath(node), node)
+    stage = 'node-parent'
+    assert.equal(path.dirname(node), profile.directory)
+    stage = 'program-realpath'
+    assert.equal(await filesystem.realpath(program), program)
+    stage = 'program-parent'
+    assert.equal(path.dirname(program), profile.directory)
+    stage = 'node-digest'
+    assert.equal(await digest(node), input.nodeSha256)
+    stage = 'program-digest'
+    assert.equal(await digest(program), input.programSha256)
+    stage = 'marker'
     assert.match(marker, /^TEST_SHELL_TOOL_[a-f0-9-]{36}$/)
     const command = `"${node}" "${program}"`
     stage = 'graph'
     const graph = await verifyOpenCodeV2ServerGraph('2.0.32')
     assert.equal(graph.moduleSha256, input.moduleSha256)
     async function selected<T>(specifier: string, packageName: string): Promise<T> {
-      const entry = await realpath(Bun.resolveSync(specifier, path.dirname(graph.modulePath)))
+      const entry = await filesystem.realpath(Bun.resolveSync(specifier, path.dirname(graph.modulePath)))
       await verifyOpenCodePackage(entry, packageName, packageName.startsWith('@effect/') ? '4.0.1' : '2.0.32')
       await verifyOpenCodeV2GraphEffect(entry, graph.effectPath, '2.0.32')
       return import(pathToFileURL(entry).href) as Promise<T>
@@ -134,7 +151,7 @@ async function execute(input: Record<string, unknown>): Promise<void> {
     }).pipe(Effect.provideService(Scope.Scope, scope)), { signal: controller.signal })
     if (Exit.isFailure(exit)) failure = shellProbeFailure(exit.cause)
     else { stage = 'complete'; succeeded = true }
-  } catch { failure ??= Object.freeze({ kind: 'unknown', method: null }) }
+  } catch (error) { failure ??= shellProbeSetupFailure(error) }
   finally { clearTimeout(timer) }
   assert.ok(prepared && control.connected())
   await control.send({ type: 'TEST-shell-tool-result', nonce: prepared.nonce, leaseOwnerId: prepared.leaseOwnerId,

@@ -3,7 +3,7 @@ import { pathToFileURL } from 'node:url'
 import path from 'node:path'
 import { realpath } from 'node:fs/promises'
 import { verifyOpenCodePackage, verifyOpenCodeV2GraphEffect, verifyOpenCodeV2ServerGraph } from '../../src/services/opencode/host/OpenCodeV2ServerGraph.js'
-import { readShellProbeResult, createShellProbeConfig, shellProbeFailure, type ShellProbeResult } from './windows-shell-tool-contract.js'
+import { readShellProbeResult, createShellProbeConfig, shellProbeFailure, shellProbeSetupFailure, type ShellProbeResult } from './windows-shell-tool-contract.js'
 
 test('the exact no-model document decodes with the verified selected config schema', async () => {
   const graph = await verifyOpenCodeV2ServerGraph('2.0.32')
@@ -65,4 +65,30 @@ test('child result admission strips extras and requires actual complete evidence
   expect(readShellProbeResult({ ...positive, failure: { kind: 'Fail', method: 'resolve' } })).toBeUndefined()
   expect(readShellProbeResult({ ...positive, shell: { toString() { throw new Error('TEST_coercion') } } })).toBeUndefined()
   expect(readShellProbeResult({ ...positive, failure: { kind: 'Fail', method: 'raw-method' }, succeeded: false })).toBeUndefined()
+})
+
+
+test('pregraph diagnostics retain only closed own-data guards and privately minted native facts', () => {
+  const realpath = { status: 1, operation: 2, win32: 5, anchorCount: 2, matchingAnchorIndex: 0 }
+  const original = Object.assign(new Error('TEST-private-path-and-message'), {
+    profileGuard: 'process_environment', code: 'EPERM', syscall: 'realpath', realpath, path: 'TEST-private',
+  })
+  expect(shellProbeSetupFailure(original)).toEqual({ kind: 'unknown', method: null,
+    profileGuard: 'process_environment', errno: 'EPERM', operation: 'realpath' })
+  let reads = 0
+  const hostile = Object.defineProperty({}, 'profileGuard', { get() { reads++; throw new Error('TEST_getter') } })
+  expect(shellProbeSetupFailure(hostile)).toEqual({ kind: 'unknown', method: null })
+  expect(reads).toBe(0)
+  expect(shellProbeSetupFailure(new Proxy({}, { getOwnPropertyDescriptor() { throw new Error('TEST_proxy') } })))
+    .toEqual({ kind: 'unknown', method: null })
+  const result = { stage: 'profile-validation', succeeded: false, sessionCreated: false, registeredShell: false,
+    shell: null, markerPresent: false, failure: { kind: 'unknown', method: null,
+      profileGuard: 'home_mapping', errno: 'EPERM', operation: 'realpath', realpath, message: 'TEST-private' } }
+  expect(readShellProbeResult(result)?.failure).toEqual({ kind: 'unknown', method: null,
+    profileGuard: 'home_mapping', errno: 'EPERM', operation: 'realpath', realpath })
+  for (const invalid of [{ ...realpath, matchingAnchorIndex: 2 }, { ...realpath, status: 0 }, { ...realpath, operation: 26 },
+    { ...realpath, win32: 0x100000000 }, { ...realpath, anchorCount: 4097 }]) {
+    expect(readShellProbeResult({ ...result, failure: { kind: 'unknown', method: null, realpath: invalid } })?.failure)
+      .toEqual({ kind: 'unknown', method: null })
+  }
 })
