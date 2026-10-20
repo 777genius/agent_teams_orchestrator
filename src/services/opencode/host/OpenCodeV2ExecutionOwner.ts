@@ -1,7 +1,7 @@
 import path from 'node:path'
 import { ownerFilesystemForWindowsPlan, windowsBirth, type WindowsLaunchPlan } from './windows/OpenCodeV2WindowsExecution.js'
 import type { WindowsOwnerDirectory } from './windows/OpenCodeV2WindowsOwnerFilesystem.js'
-import { isExecutionPlatformMapping, type ExecutionPlatformMapping } from './OpenCodeV2ExecutionPlatform.js'
+import { isExecutionPlatformMapping, isExecutionUnboundRetirement, type ExecutionPlatformMapping, type ExecutionUnboundRetirement } from './OpenCodeV2ExecutionPlatform.js'
 import { constants } from 'node:fs'
 import { lstat, mkdir, open, realpath, rename } from 'node:fs/promises'
 import { executionAssert, executionHash, executionRecord } from '../execution/OpenCodeV2ExecutionContracts.js'
@@ -240,6 +240,18 @@ export async function acquireExecutionProfileOwner(requestedProfile: OwnedNative
     abandonBeforeSpawn(): Promise<void> { return serialize(async () => {
       executionAssert(!launchAttempted, 'execution_owner_unknown')
       await retire({ state: 'not_submitted', hostInstanceId: record.hostInstanceId, leaseOwnerId: record.leaseOwnerId })
+    }) },
+    /** A spawn was attempted but no child identity was ever committed, and the
+     * launch-owned retirement proved its native scope empty with the held MAIN
+     * exited. Only that branded claim may free this fence; an unbound spawn
+     * without it stays UNKNOWN and blocks acquisition indefinitely. */
+    abandonAfterUnboundSpawn(evidence: unknown): Promise<void> { return serialize(async () => {
+      executionAssert(launchAttempted && !child, 'execution_owner_unknown')
+      executionAssert(isExecutionUnboundRetirement(evidence), 'execution_owner_unknown')
+      const proof = evidence as ExecutionUnboundRetirement
+      executionAssert(proof.scopeEmpty === true && proof.heldProcessExited === true && typeof proof.scopeClosed === 'boolean', 'execution_owner_unknown')
+      await retire({ state: 'spawn_unbound', hostInstanceId: record.hostInstanceId, leaseOwnerId: record.leaseOwnerId,
+        retirement: { scopeEmpty: true, heldProcessExited: true, scopeClosed: proof.scopeClosed } })
     }) },
     release(receipt: ExecutionCleanupReceipt): Promise<void> { return serialize(async () => {
       executionAssert(isExecutionCleanupReceipt(receipt) && child && receipt.scopeClosed === true && receipt.processRetired === true && receipt.descendantsRetired === true &&

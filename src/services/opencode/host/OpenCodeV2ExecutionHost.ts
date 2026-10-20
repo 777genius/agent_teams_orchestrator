@@ -288,7 +288,7 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
   let mapping: ExecutionPlatformMapping | undefined
   let serverFailure: OpenCodeV2ServerFailure | undefined
   let mappingWork: Promise<ExecutionPlatformMapping> | undefined
-  let exited = false, closeWork: Promise<ExecutionCleanupReceipt> | undefined
+  let exited = false, unboundRetired = false, closeWork: Promise<ExecutionCleanupReceipt> | undefined
   let cleanupPhase: ExecutionCleanupPhase | undefined, nativeCleanupPhase: ExecutionNativeRetirementPhase | undefined
   let nativeCleanupRoot: ExecutionNativeRootObservation | undefined
   let exitResolve: () => void = () => undefined
@@ -304,7 +304,13 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
     }
     if (!birth || !mapping || !launch) {
       try { launch?.sendClose() } catch { /* Still attempt exact wrapper retirement. */ }
-      try { if (launch) await boundOpenCodeRead(launch.retire(), 7000) } catch { /* Retain physical owner on uncertainty. */ }
+      try {
+        // Without a committed child identity no cleanup receipt can exist. The
+        // launch-owned empty-scope retirement is the only proof that may free
+        // this owner; anything else retains the physical fence on uncertainty.
+        const proof = await boundOpenCodeRead(launch.retire(), 7000)
+        if (owner) { await owner.abandonAfterUnboundSpawn(proof); unboundRetired = true }
+      } catch { /* Retain physical owner on uncertainty. */ }
       await closeRetainedRoots().catch(() => undefined)
       await closePlanOnce().catch(() => undefined)
       throw new Error('cleanup_unknown')
@@ -501,7 +507,13 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
     const earlyDiagnostic = process.platform === 'win32'
       ? recordOpenCodeV2ProviderFailure('execution-host-startup', failure, true, launch?.output?.().stderr, acquisitionTiming)
       : undefined
-    try { await close() } catch { throw surfaced(new Error('cleanup_unknown', { cause: failure })) }
+    try { await close() } catch {
+      // Only the attempt that retired its unbound spawn left no owner state
+      // behind, so only that failure may surface as a retryable transient.
+      const cleanup = new Error('cleanup_unknown', { cause: failure })
+      if (unboundRetired) Object.defineProperty(cleanup, 'unboundRetired', { value: true, enumerable: false })
+      throw surfaced(cleanup)
+    }
     finally {
       if (earlyDiagnostic) await earlyDiagnostic
       // Unix children publish their finite stage while closing. Windows retains
@@ -516,7 +528,8 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
  * scan: the held MAIN exits 1 with an access-denied stderr classification before
  * its module load completes. Only this closed class is ever retried — the last
  * launch stage stays before 'windows-assert', so the prepare handshake never
- * finished and no owner/nonce/plan state outlived the failed attempt. */
+ * finished; and the failed attempt proved its unbound spawn's scope empty and
+ * released its owner fence, so no owner/nonce/plan state outlived the attempt. */
 export function isTransientWindowsLaunchFailure(error: unknown): boolean {
   try {
     if (!(error instanceof Error)) return false
@@ -525,7 +538,10 @@ export function isTransientWindowsLaunchFailure(error: unknown): boolean {
     const record = startup as Record<string, unknown>
     return record.event === 'opencode-v2-startup' && record.reason === 'failed' &&
       record.nativeExitCode === 1 && record.nativeStderrKind === 'access_denied' &&
-      typeof record.stage === 'string' && record.stage !== 'windows-assert'
+      typeof record.stage === 'string' && record.stage !== 'windows-assert' &&
+      // A retry re-acquires the same profile: a retained owner fence would make
+      // it fail on owner_directory_create and mask the original failure.
+      (error as Error & { unboundRetired?: unknown }).unboundRetired === true
   } catch { return false }
 }
 /** Every retry is a complete acquisition: a fresh plan broker, native run state,

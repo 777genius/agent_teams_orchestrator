@@ -26,11 +26,16 @@ export type WindowsRealpathAnchorReceipt = Readonly<{ receiptId: string; nonce: 
 export type WindowsRealpathDllReceipt = Readonly<{ receiptId: string; nonce: string; path: string; sha256: string; volumeSerial: string; fileId: string; ownerSid: string; held: true }>
 export type WindowsExecutionMapping = Readonly<{ bun: WindowsExecutionIdentity; supervisor: WindowsExecutionIdentity; namespace: Readonly<{ name: string }>; containerSid: string; leaseOwnerId: string; realpathAnchors: WindowsRealpathAnchorReceipt; realpathDll: WindowsRealpathDllReceipt }>
 export type WindowsKernelRetirement = Readonly<{ pid: number; birth: ExecutionBirth; scopeClosed: boolean; mapping: WindowsExecutionMapping; activeProcesses: 0; heldProcessExited: true; ownAcesRemoved: true }>
+/** A spawn whose child never committed its identity carries no cleanup receipt.
+ * This is the only other claim a launch-owned retirement may mint: the native
+ * scope was proved empty and its held MAIN exited. */
+export type WindowsUnboundRetirement = Readonly<{ scopeEmpty: true; heldProcessExited: true; scopeClosed: boolean }>
 export type WindowsLaunchPlan = Readonly<{ helper: WindowsNativeArtifact; realpathDll: WindowsRealpathArtifact; executable: string; entry: string; cwd: string; writableRoots: readonly string[]; readOnlyRoots: readonly string[]; protectedRoots: readonly string[]; metadataRoots: readonly string[]; profileDirectories: readonly string[]; env: Readonly<Record<string, string>> }>
 export type WindowsSelectedAuthMetadata = Readonly<{
   read(deadline: number, signal?: AbortSignal): Promise<Readonly<{ sha256: string; bytes: number }>>
 }>
 const plans = new WeakSet<WindowsLaunchPlan>(), mappings = new WeakSet<WindowsExecutionMapping>(), retirements = new WeakSet<WindowsKernelRetirement>()
+const unboundRetirements = new WeakSet<WindowsUnboundRetirement>()
 const selectedConfigs = new WeakMap<WindowsLaunchPlan, string>(), selectingConfigs = new WeakSet<WindowsLaunchPlan>()
 // Remote controller endpoint read from the same sealed config bytes native selected.
 const controllerRelays = new WeakMap<WindowsLaunchPlan, WindowsRemoteController>()
@@ -257,6 +262,7 @@ export function observeWindowsHeldMainExit(events: EventEmitter, child: EventEmi
 }
 export function isWindowsExecutionMapping(value: unknown): value is WindowsExecutionMapping { return !!value && typeof value === 'object' && mappings.has(value as WindowsExecutionMapping) }
 export function isWindowsKernelRetirement(value: unknown): value is WindowsKernelRetirement { return !!value && typeof value === 'object' && retirements.has(value as WindowsKernelRetirement) }
+export function isWindowsUnboundRetirement(value: unknown): value is WindowsUnboundRetirement { return !!value && typeof value === 'object' && unboundRetirements.has(value as WindowsUnboundRetirement) }
 async function identity(value: unknown): Promise<WindowsExecutionIdentity> {
   const record = row(value)
   assert(Number.isSafeInteger(record.hostPID) && Number(record.hostPID) > 0 && record.nativePID === record.hostPID && typeof record.executablePath === 'string' && path.isAbsolute(record.executablePath), 'execution_identity_mismatch')
@@ -607,7 +613,7 @@ export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, l
     assert(Object.keys(live).sort().join(',') === 'anchorsReceiptId,nonce' && live.nonce === nonce &&
       live.anchorsReceiptId === current.realpathAnchors.receiptId, 'execution_identity_mismatch')
   }
-  let preparation: Promise<WindowsExecutionMapping> | undefined, retirement: Promise<WindowsKernelRetirement> | undefined
+  let preparation: Promise<WindowsExecutionMapping> | undefined, retirement: Promise<WindowsKernelRetirement | WindowsUnboundRetirement> | undefined
   let deferredRuntime = false, activated = false
   return Object.freeze({ child, fetch: http.fetch, commands: () => commandRequest.observation(),
     output: () => ({ stdout: '', stderr: launchHistory.length === 0 ? '' : JSON.stringify({
@@ -652,10 +658,17 @@ export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, l
     acknowledged: () => closed,
     readBirth() { assert(mapping && mainExit, 'execution_identity_mismatch'); return mainExit.readBirth() },
     async kill(deadline?: number) { stopped = true; try { await retireNative(deadline) } finally { controllerRelay?.disconnect() } },
-    retire(deadline?: number): Promise<WindowsKernelRetirement> {
+    retire(deadline?: number): Promise<WindowsKernelRetirement | WindowsUnboundRetirement> {
       return retirement ??= (async () => {
         stopped = true; const observed = row(await launch), receipt = row(await retireNative(deadline).finally(() => controllerRelay?.disconnect()))
-        assert(mapping && equal(receipt.mapping, observed) && receipt.empty === true && receipt.activeProcesses === 0 && receipt.heldProcessExited === true && receipt.ownedPairClosed === true && receipt.ownAcesRemoved === true, 'cleanup_unknown')
+        assert(equal(receipt.mapping, observed) && receipt.empty === true && receipt.activeProcesses === 0 && receipt.heldProcessExited === true && receipt.ownedPairClosed === true && receipt.ownAcesRemoved === true, 'cleanup_unknown')
+        if (!mapping) {
+          // No child identity was ever committed and no private close ACK can
+          // exist. The empty-scope proof above is the only claim this launch may
+          // make; without it the physical owner must be retained on uncertainty.
+          const unbound = Object.freeze({ scopeEmpty: true as const, heldProcessExited: true as const, scopeClosed: closed })
+          unboundRetirements.add(unbound); return unbound
+        }
         const value = Object.freeze({ pid: mapping.bun.hostPID, birth: mapping.bun.birth, mapping, scopeClosed: closed, activeProcesses: 0 as const, heldProcessExited: true as const, ownAcesRemoved: true as const })
         retirements.add(value); return value
       })()

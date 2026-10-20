@@ -7,7 +7,7 @@ import { isKernelRetirement, isLinuxExecutionMapping, launchLinuxExecution, linu
 import { darwinBirth, darwinSelfBirth, isDarwinExecutionMapping, isDarwinKernelRetirement, launchDarwinExecution,
   planDarwinExecution, prepareDarwinExecutionChild } from './darwin/OpenCodeV2DarwinExecution.js'
 
-import { isWindowsExecutionMapping, isWindowsKernelRetirement, launchWindowsExecution,
+import { isWindowsExecutionMapping, isWindowsKernelRetirement, isWindowsUnboundRetirement, launchWindowsExecution,
   planWindowsExecution, windowsBirth } from './windows/OpenCodeV2WindowsExecution.js'
 import { prepareWindowsExecutionChild, windowsExecutionSelfBirth } from './windows/OpenCodeV2WindowsChildControl.js'
 
@@ -60,6 +60,12 @@ export function launchExecutionPlatform(plan: ExecutionPlatformPlan, nonce: stri
 export function isExecutionPlatformMapping(value: unknown): value is ExecutionPlatformMapping {
   return process.platform === 'linux' ? isLinuxExecutionMapping(value) :
     process.platform === 'win32' ? isWindowsExecutionMapping(value) : process.platform === 'darwin' && isDarwinExecutionMapping(value)
+}
+/** Common shape of the only retirement claim a spawn without a committed child
+ * identity may make: its native scope was proved empty and the held MAIN exited. */
+export type ExecutionUnboundRetirement = Readonly<{ scopeEmpty: true; heldProcessExited: true; scopeClosed: boolean }>
+export function isExecutionUnboundRetirement(value: unknown): value is ExecutionUnboundRetirement {
+  return process.platform === 'win32' && isWindowsUnboundRetirement(value)
 }
 export function requireExecutionPlatformRetirement(value: unknown) {
   const owned = process.platform === 'linux' ? isKernelRetirement(value) :

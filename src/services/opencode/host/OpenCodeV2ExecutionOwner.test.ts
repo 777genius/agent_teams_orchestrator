@@ -162,6 +162,33 @@ describe('canonical durable execution owner', () => {
     } finally { await Promise.all(peers.map(p => p.close())); await remove() }
   }, 20_000)
 
+  // A spawn that dies before binding its child still owns both fences. Only the
+  // launch-owned empty-scope retirement may free them; without that branded
+  // claim the fence stays and blocks every later acquisition indefinitely.
+  test('unbound spawn frees its fences only through a branded empty-scope retirement', async () => {
+    const { profile, remove } = await fixture()
+    const proof = Object.freeze({ scopeEmpty: true as const, heldProcessExited: true as const, scopeClosed: false })
+    const brand = spyOn(executionPlatform, 'isExecutionUnboundRetirement').mockImplementation(
+      (value: unknown): value is executionPlatform.ExecutionUnboundRetirement => value === proof)
+    try {
+      const owner = await acquireExecutionProfileOwner(profile, identity())
+      await owner.beforeSpawn()
+      await expect(owner.abandonBeforeSpawn()).rejects.toThrow('execution_owner_unknown')
+      // Caller-supplied claims without the launch-owned brand never release.
+      await expect(owner.abandonAfterUnboundSpawn({ scopeEmpty: true, heldProcessExited: true, scopeClosed: false })).rejects.toThrow('execution_owner_unknown')
+      await owner.abandonAfterUnboundSpawn(proof)
+      await expect(owner.abandonAfterUnboundSpawn(proof)).rejects.toThrow('execution_owner_released')
+      const archive = path.join(profile.root, `.opencode-v2-execution-owner.released.${owner.record.leaseOwnerId}`, 'release.json')
+      expect(JSON.parse(await readFile(archive, 'utf8'))).toEqual({ state: 'spawn_unbound',
+        hostInstanceId: owner.record.hostInstanceId, leaseOwnerId: owner.record.leaseOwnerId,
+        retirement: { scopeEmpty: true, heldProcessExited: true, scopeClosed: false } })
+      // The freed fence admits the retry's fresh acquisition.
+      const successor = await acquireExecutionProfileOwner(profile, identity())
+      expect((await readExecutionProfileOwner(profile.root)).hostInstanceId).toBe(successor.record.hostInstanceId)
+      await successor.abandonBeforeSpawn()
+    } finally { brand.mockRestore(); await remove() }
+  })
+
   test('future and partially committed ownership bytes veto acquisition without repair', async () => {
     const { profile, remove } = await fixture()
     try {
@@ -291,6 +318,7 @@ describe('canonical durable execution owner', () => {
       const row = JSON.parse(await readFile(path.join(profile.root, '.opencode-v2-execution-owner', 'child.json'), 'utf8'))
       expect(row).toEqual({ pid: process.pid, birth: originalBirth })
       await expect(owner.abandonBeforeSpawn()).rejects.toThrow('execution_owner_unknown')
+      await expect(owner.abandonAfterUnboundSpawn({ scopeEmpty: true, heldProcessExited: true, scopeClosed: false })).rejects.toThrow('execution_owner_unknown')
     } finally { await remove() }
   })
 

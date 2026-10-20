@@ -477,7 +477,7 @@ describe('execution host ownership and cleanup', () => {
       bindWindowsExecutionSelectedConfig: async () => {}, closeWindowsExecutionPlan: async () => {},
       recordOpenCodeV2ProviderFailure: async () => {}, retainOpenCodeV2CatalogServerFailure,
       acquireExecutionProfileOwner: async () => ({ beforeSpawn: async () => {}, bindChild: async () => {},
-        abandonBeforeSpawn: async () => {}, release: async () => {} }),
+        abandonBeforeSpawn: async () => {}, abandonAfterUnboundSpawn: async () => {}, release: async () => {} }),
       boundOpenCodeRead: async <T>(work: Promise<T>) => work,
       launchExecutionPlatform: () => {
         const nativeStderrKind = attempts++ === 0 ? firstKind : laterKind
@@ -527,5 +527,72 @@ describe('execution host ownership and cleanup', () => {
     expect(exhausted.error.startup?.nativeExitCode).toBe(1)
     expect(exhausted.error.startup?.nativeStderrKind).toBe('access_denied')
     expect(kinds(exhausted.gated)).toEqual(['access_denied', 'access_denied', 'access_denied'])
+  })
+  // The owner fence is a real interprocess directory that outlives its writer.
+  // A transient attempt may only be retried when it retired its unbound spawn
+  // to a proved-empty scope and freed that fence; a retained fence makes the
+  // retry die on owner_directory_create and masks the original failure.
+  test('transient retry runs only over an attempt that released its owner fence', async () => {
+    const source = await readFile(new URL('./OpenCodeV2ExecutionHost.ts', import.meta.url), 'utf8')
+    const body = new Bun.Transpiler({ loader: 'ts' }).transformSync(
+      source.slice(source.indexOf('async function acquireOwnedNativeLease(')).replaceAll('export ', ''))
+    let attempts = 0, fence = false, spawned = false, proved = true
+    const startup = JSON.stringify({ event: 'opencode-v2-startup', reason: 'failed', stage: 'windows-prepare',
+      elapsedMs: 120, history: [{ stage: 'windows-prepare', elapsedMs: 120 }], nativeExitCode: 1, nativeStderrKind: 'access_denied' })
+    const scope = { executionAssert: (value: unknown, message?: string) => { if (!value) throw new Error(message ?? 'invalid') },
+      executionRecord: (value: unknown) => value, executionHash, randomUUID: () => 'TEST-lease',
+      randomBytes: () => ({ toString: () => 'TEST-password' }),
+      prepareOwnedNativeExecutionPlan: async (prepared: ValidatedExecutionNative, profile: SelectedExecutionProfile) =>
+        ({ native: prepared, profile, entry: '/TEST-entry', plan: { platform: 'win32', concrete: {} }, controllerStateRoots: [] }),
+      ownerFilesystemForWindowsPlan: () => ({ validateSelectedProfile: async () => {} }),
+      selectWindowsRunMemberPreflightForPlan: async () => null, consumeWindowsExecutionLaunchNonce: () => 'TEST-nonce',
+      bindWindowsExecutionSelectedConfig: async () => {}, closeWindowsExecutionPlan: async () => {},
+      recordOpenCodeV2ProviderFailure: async () => {}, retainOpenCodeV2CatalogServerFailure,
+      // The durable fence is modeled with its real contract: only the branded
+      // empty-scope retirement frees it once a spawn was attempted.
+      acquireExecutionProfileOwner: async () => {
+        if (fence) throw new Error('execution_profile_owned')
+        fence = true; spawned = false
+        return { beforeSpawn: async () => { spawned = true }, bindChild: async () => {},
+          abandonBeforeSpawn: async () => { if (spawned) throw new Error('execution_owner_unknown'); fence = false },
+          release: async () => { fence = false },
+          abandonAfterUnboundSpawn: async (evidence: unknown) => {
+            if (!evidence || (evidence as { scopeEmpty?: unknown }).scopeEmpty !== true) throw new Error('execution_owner_unknown')
+            fence = false } }
+      },
+      boundOpenCodeRead: async <T>(work: Promise<T>) => work,
+      launchExecutionPlatform: () => {
+        attempts++
+        return { child: new EventEmitter(), prepare: async () => { throw new Error('execution_cancelled') },
+          output: () => ({ stdout: '', stderr: startup }), sendClose: () => {},
+          retire: async () => proved ? { scopeEmpty: true, heldProcessExited: true, scopeClosed: false } : { scopeEmpty: false } }
+      },
+    }
+    const built = new Function('scope', `const {${Object.keys(scope).join(',')}}=scope;${body};return { acquireOwnedNativeLease, retryTransientWindowsLaunch };`)(scope) as {
+      acquireOwnedNativeLease: typeof acquireExecutionLease; retryTransientWindowsLaunch: <T>(work: () => Promise<T>) => Promise<T> }
+    const selected: SelectedExecutionProfile = { root: '/TEST-profile', epoch: 'TEST-epoch', directory: '/TEST-project',
+      databasePath: '/TEST-profile/data/opencode.db', env: {}, envSha256: 'f'.repeat(64),
+      config: { directory: '/TEST-profile/config', content: '{}', sha256: 'f'.repeat(64) },
+      selection: { agent: 'worker', model: { providerID: 'TEST', id: 'model' }, permissions: [] } }
+    const drive = async (withProof: boolean) => {
+      attempts = 0; fence = false; spawned = false; proved = withProof
+      try { await built.retryTransientWindowsLaunch(() => built.acquireOwnedNativeLease(native, selected, context)) }
+      catch (error) { return { attempts, error: error as Error & { startup?: Record<string, unknown> } } }
+      throw new Error('TEST-acquisition-must-fail')
+    }
+    // The proved-empty attempt frees its fence, so all three transient attempts
+    // reach their own complete acquisition and the original failure stands.
+    const exhausted = await drive(true)
+    expect(exhausted.attempts).toBe(3)
+    expect(exhausted.error.startup?.nativeExitCode).toBe(1)
+    expect(exhausted.error.startup?.nativeStderrKind).toBe('access_denied')
+    expect(fence).toBe(false)
+    // An unproven unbound spawn keeps its fence: the failure surfaces unchanged
+    // and is never retried into a misleading owner_directory_create refusal.
+    const retained = await drive(false)
+    expect(retained.attempts).toBe(1)
+    expect(retained.error.message).toBe('cleanup_unknown')
+    expect(retained.error.startup?.nativeStderrKind).toBe('access_denied')
+    expect(fence).toBe(true)
   })
 })
