@@ -28,6 +28,8 @@ function fixture(mode: Mode) {
   const foreignBirth = mode === 'after-root' ? rootBirth + 10 : 1792532409706
   let spawned = false, closed = false, removed = 0, tables = 0, witnessCalls = 0, foreignReads = 0, rootReads = 0
   let clock = 1_000_000
+  const startedAt = clock
+  const witnessObservations: Array<{ spawned: boolean; deadline: number; now: number }> = []
   const signals: number[] = [], taskkills: number[] = [], birthReads: number[] = [], budgets: number[] = []
   const events: string[] = []
   const controller = new AbortController()
@@ -59,7 +61,7 @@ function fixture(mode: Mode) {
   const ports = spyOn(native, 'nativePorts').mockImplementation(() => ({
     platform: 'win32', selfPid: process.pid, now: () => clock,
     existingWindows: async deadline => {
-      expect(spawned).toBe(false); expect(deadline).toBe(clock + versionAcquisitionMs('win32'))
+      witnessObservations.push({ spawned, deadline, now: clock })
       witnessCalls++; events.push('witness')
       if (mode === 'witness-hung') return await new Promise<null>(resolve => { releaseWitness = () => resolve(null) })
       if (mode === 'witness-error') throw new Error('TEST native witness unavailable')
@@ -118,13 +120,22 @@ function fixture(mode: Mode) {
   restore.push(() => date.mockRestore(), () => launcher.mockRestore(), () => spawn.mockRestore(), () => ports.mockRestore())
   const roots = { root: '/TEST/private', env: {}, remove: async () => { removed++; events.push('remove') } } as OpenCodeV2ReadRoots
   return { run: () => readOpenCodeOwnedVersion('/TEST/native', roots, controller.signal), root, relay, foreign, leaf, sibling,
-    signals, taskkills, birthReads, budgets, events, removed: () => removed, witnessCalls: () => witnessCalls,
+    signals, taskkills, birthReads, budgets, events, startedAt, witnessObservations, removed: () => removed, witnessCalls: () => witnessCalls,
     releaseWitness: () => releaseWitness?.(), spawned: () => spawned, tables: () => tables, foreignReads: () => foreignReads }
+}
+
+function expectPreSpawnWitness(f: ReturnType<typeof fixture>) {
+  expect(f.witnessObservations).toHaveLength(1)
+  const observation = f.witnessObservations[0]!
+  expect(observation.spawned).toBe(false)
+  expect(observation.now).toBe(f.startedAt)
+  expect(observation.deadline).toBe(f.startedAt + versionAcquisitionMs('win32'))
 }
 
 test('pre-spawn589 foreign generation stays alive while the original probe and owned children naturally retire', async () => {
   const f = fixture('valid')
   expect(await f.run()).toBe('1.19.0\n')
+  expectPreSpawnWitness(f)
   expect(f.events[0]).toBe('witness'); expect(f.events[1]).toBe('spawn')
   expect(f.witnessCalls()).toBe(1); expect(f.tables()).toBe(5); expect(f.foreignReads()).toBe(5)
   expect(f.birthReads).not.toContain(f.leaf) // No ownership through the excluded edge.
@@ -141,6 +152,7 @@ for (const mode of ['no-witness', 'witness-error', 'after-root', 'fresh-missing'
     const f = fixture(mode)
     let failure: unknown
     try { await f.run() } catch (error) { failure = error }
+    expectPreSpawnWitness(f)
     expect(failure).toBeInstanceOf(OpenCodeVersionProbeCleanupError)
     if (mode === 'retained-candidate-under-foreign') expect((failure as OpenCodeVersionProbeCleanupError).terminalDiagnostic)
       .toMatchObject({ guard: 'strict_candidate_census', candidatesCount: 1, birthsCount: 3 })
@@ -153,6 +165,7 @@ for (const mode of ['witness-expired', 'witness-abort', 'witness-hung'] as const
   test(`${mode} cannot start a child or retain private roots`, async () => {
     const f = fixture(mode)
     try { await expect(f.run()).rejects.toThrow() } finally { f.releaseWitness() }
+    expectPreSpawnWitness(f)
     expect(f.spawned()).toBe(false); expect(f.tables()).toBe(0)
     expect(f.signals).toEqual([]); expect(f.taskkills).toEqual([]); expect(f.removed()).toBe(1)
   })
@@ -162,6 +175,7 @@ for (const mode of ['absent-stable', 'absent-gone'] as const) {
   test(`${mode} seed grants no branch cut while its foreign orphan stays unowned`, async () => {
     const f = fixture(mode)
     expect(await f.run()).toBe('1.19.0\n')
+    expectPreSpawnWitness(f)
     expect(f.tables()).toBe(5); expect(f.foreignReads()).toBe(5)
     expect(f.birthReads).not.toContain(f.leaf)
     expect(f.signals).toEqual([]); expect(f.taskkills).toEqual([]); expect(f.removed()).toBe(1)
@@ -172,6 +186,7 @@ for (const mode of ['owned-under-foreign', 'owned-under-absent'] as const) {
  test(`${mode}: a previously captured child cannot be pruned through the foreign branch`, async () => {
   const f = fixture(mode)
   await expect(f.run()).rejects.toThrow('cleanup_unknown')
+  expectPreSpawnWitness(f)
   expect(f.signals).toEqual([f.sibling]); expect(f.signals).not.toContain(f.foreign)
   expect(f.taskkills).toEqual([]); expect(f.removed()).toBe(0)
  })
