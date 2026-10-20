@@ -21,6 +21,10 @@ export async function verifyOpenCodeV2ServerGraph(pin: OpenCodeV2Pin) {
       const ai = await filesystem.realpath(Bun.resolveSync('@opencode/ai/route/client', path.dirname(entry)))
       await verifyOpenCodePackage(ai, '@opencode/ai', pin)
       await verifyOpenCodeV2GraphEffect(ai, effectPath, pin)
+      // A hoisted shared effect binder must never decode with a foreign Effect.
+      const drizzle = await filesystem.realpath(Bun.resolveSync('drizzle-orm/effect-core', path.dirname(entry)))
+      await verifyOpenCodePackage(drizzle, 'drizzle-orm')
+      await verifyOpenCodeV2GraphEffect(drizzle, effectPath, pin)
     }
   }
   for (const [dependency, subpath] of [['@effect/platform-node', 'NodeHttpServer'], ['@effect/platform-node-shared', 'NodeStream']]) {
@@ -48,7 +52,7 @@ export async function verifyOpenCodeV2GraphEffect(entry: string, effectPath: str
   openCodeReadAssert(resolved === effectPath, 'identity_mismatch')
 }
 
-export async function verifyOpenCodePackage(entry: string, name: string, version: string): Promise<void> {
+export async function verifyOpenCodePackage(entry: string, name: string, version?: string): Promise<void> {
   let dir = path.dirname(entry)
   for (let depth = 0; depth < 5; depth++, dir = path.dirname(dir)) {
     let metadata: unknown
@@ -56,7 +60,7 @@ export async function verifyOpenCodePackage(entry: string, name: string, version
     catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue; throw error }
     const info = readRecord(metadata)
     if (info.name === undefined && info.version === undefined) continue
-    openCodeReadAssert(info.name === name && info.version === version, 'identity_mismatch')
+    openCodeReadAssert(info.name === name && (version === undefined || info.version === version), 'identity_mismatch')
     return
   }
   throw new Error('identity_mismatch')

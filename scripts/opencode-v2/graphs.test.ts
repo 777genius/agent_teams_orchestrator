@@ -39,3 +39,24 @@ test('AI cannot return programs from a second physical Effect with the correct v
     } finally { resolution.mockRestore() }
   } finally { await rm(root, { recursive: true, force: true }) }
 })
+
+test('a shared effect binder cannot decode the floor graph with a second physical Effect', async () => {
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), 'TEST-opencode-duplicate-binder-')))
+  try {
+    const drizzle = path.join(root, 'node_modules/drizzle-orm')
+    await mkdir(drizzle, { recursive: true })
+    await writeFile(path.join(drizzle, 'package.json'), JSON.stringify({ name: 'drizzle-orm', version: '1.0.0-rc.5-169397b' }))
+    const entry = path.join(drizzle, 'effect-core.js')
+    await writeFile(entry, 'export {}')
+    const effect = path.join(root, 'node_modules/effect')
+    await mkdir(effect, { recursive: true })
+    await writeFile(path.join(effect, 'package.json'), JSON.stringify({ name: 'effect', version: '4.0.0-rc.112', exports: './index.js' }))
+    await writeFile(path.join(effect, 'index.js'), 'export {}')
+    const original = Bun.resolveSync
+    const resolution = spyOn(Bun, 'resolveSync').mockImplementation((specifier, from) =>
+      specifier === 'drizzle-orm/effect-core' ? entry : original(specifier, from))
+    try {
+      await expect(verifyOpenCodeV2ServerGraph('2.0.0')).rejects.toThrow('identity_mismatch')
+    } finally { resolution.mockRestore() }
+  } finally { await rm(root, { recursive: true, force: true }) }
+})

@@ -64,19 +64,19 @@ async function packageAt(entry: string): Promise<PackageMetadata> {
   }
 }
 
-async function assertEntry(specifier: string, from: string, name: string, version: string, ownedRoot?: string): Promise<string> {
+async function assertEntry(specifier: string, from: string, name: string, version?: string, ownedRoot?: string): Promise<string> {
   const entry = await realpath(Bun.resolveSync(specifier, from))
   if (ownedRoot) {
     const relative = path.relative(ownedRoot, entry)
     if (relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw new Error('Staged graph escaped its bundle')
   }
   const info = await packageAt(entry)
-  if (info.name !== name || info.version !== version) throw new Error(`OpenCode V2 graph mismatch: ${specifier}`)
+  if (info.name !== name || (version !== undefined && info.version !== version)) throw new Error(`OpenCode V2 graph mismatch: ${specifier}`)
   return entry
 }
 
 /** Validate from each selected server/client's own physical resolution context. */
-async function verifyGraphs(from: string, ownedRoot?: string): Promise<void> {
+export async function verifyGraphs(from: string, ownedRoot?: string): Promise<void> {
   // Root model mapping and its schemas must share one physical Effect instance.
   const effect = await assertEntry('effect', from, 'effect', '4.0.1', ownedRoot)
   await assertEntry('@effect/platform-node/NodeSocket', from, '@effect/platform-node', '4.0.1', ownedRoot)
@@ -106,6 +106,9 @@ async function verifyGraphs(from: string, ownedRoot?: string): Promise<void> {
       if (dependency === 'core') {
         const ai = await assertEntry('@opencode/ai/route/client', path.dirname(entry), '@opencode/ai', pin, ownedRoot)
         await sameEffect(ai)
+        // A hoisted shared effect binder must never decode with a foreign Effect.
+        const drizzle = await assertEntry('drizzle-orm/effect-core', path.dirname(entry), 'drizzle-orm', undefined, ownedRoot)
+        await sameEffect(drizzle)
       }
     }
     for (const [dependency, subpath] of [['@effect/platform-node', 'NodeHttpServer'], ['@effect/platform-node-shared', 'NodeStream']]) {
