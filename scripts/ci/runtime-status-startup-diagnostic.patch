@@ -1,0 +1,131 @@
+--- a/src/entrypoints/cli.tsx
++++ b/src/entrypoints/cli.tsx
+@@ -1,6 +1,13 @@
++import { writeSync } from 'node:fs'
+ import { feature } from 'bun:bundle'
+ import { getClientVersion } from '../utils/clientVersion.js'
+ import type { PackagedOpenCodeDeliveryIdentity } from '../cli/packagedOpenCodeDelivery.js'
++
++// Temporary isolated diagnostic only: fixed phases, no command/env/auth values.
++function traceRuntimeStatusPhase(phase: string): void {
++  if (process.argv[2] !== 'runtime' || process.argv[3] !== 'status') return
++  writeSync(2, '@@runtime-status-phase@@' + JSON.stringify({ phase, pid: process.pid, elapsedMs: Math.round(performance.now()) }) + '\n')
++}
+ 
+ // Inlined only by the reviewed release build; absent in source and plain builds.
+ declare const PACKAGED_OPENCODE_DELIVERY: PackagedOpenCodeDeliveryIdentity | undefined
+@@ -113,22 +120,42 @@
+   if (args[0] !== 'runtime' || args[1] !== 'status') return false
+   // Status is a provider inventory command, including when Anthropic is not
+   // configured. Do not load interactive startup, OAuth or account migrations.
++  traceRuntimeStatusPhase('command-import-start')
+   const { createRuntimeStatusCommand } = await import('../cli/runtimeStatusCommand.js')
++  traceRuntimeStatusPhase('command-import-done')
+   const command = createRuntimeStatusCommand(async opts => {
++    traceRuntimeStatusPhase('handler-import-start')
+     const { runtimeStatus } = await import('../cli/handlers/runtime.js')
++    traceRuntimeStatusPhase('handler-import-done')
+     await runtimeStatus(opts)
+   })
+   command.hook('preAction', async () => {
++    traceRuntimeStatusPhase('mdm-import-start')
+     const { ensureMdmSettingsLoaded } = await import('../utils/settings/mdm/settings.js')
++    traceRuntimeStatusPhase('mdm-import-done')
++    traceRuntimeStatusPhase('mdm-read-start')
+     await ensureMdmSettingsLoaded()
++    traceRuntimeStatusPhase('mdm-read-done')
++    traceRuntimeStatusPhase('config-import-start')
+     const { enableConfigs } = await import('../utils/config.js')
++    traceRuntimeStatusPhase('config-import-done')
+     enableConfigs()
++    traceRuntimeStatusPhase('config-enabled')
++    traceRuntimeStatusPhase('managed-env-import-start')
+     const { applySafeConfigEnvironmentVariables } = await import('../utils/managedEnv.js')
++    traceRuntimeStatusPhase('managed-env-import-done')
+     applySafeConfigEnvironmentVariables()
++    traceRuntimeStatusPhase('managed-env-applied')
++    traceRuntimeStatusPhase('ca-import-start')
+     const { applyExtraCACertsFromConfig } = await import('../utils/caCertsConfig.js')
++    traceRuntimeStatusPhase('ca-import-done')
+     applyExtraCACertsFromConfig()
++    traceRuntimeStatusPhase('ca-applied')
++    traceRuntimeStatusPhase('proxy-import-start')
+     const { configureGlobalAgents } = await import('../utils/proxy.js')
++    traceRuntimeStatusPhase('proxy-import-done')
+     configureGlobalAgents()
++    traceRuntimeStatusPhase('proxy-applied')
+   })
+   await command.parseAsync(args.slice(2), { from: 'user' })
+   return true
+@@ -262,7 +289,9 @@
+   }
+ 
+   // For all other paths, load the startup profiler
++  traceRuntimeStatusPhase('profiler-import-start')
+   const { profileCheckpoint } = await import('../utils/startupProfiler.js')
++  traceRuntimeStatusPhase('profiler-import-done')
+   profileCheckpoint('cli_entry')
+ 
+   if (
+--- a/src/cli/handlers/runtime.ts
++++ b/src/cli/handlers/runtime.ts
+@@ -1,3 +1,4 @@
++import { writeSync } from 'node:fs'
+ import type { RuntimeStatusOptions } from '../runtimeStatusCommand.js'
+ /* eslint-disable custom-rules/no-process-exit -- CLI subcommand handler intentionally exits */
+ 
+@@ -47,6 +48,12 @@
+ import { readFile, writeFile } from 'node:fs/promises'
+ import { createInterface } from 'node:readline'
+ 
++// Temporary isolated diagnostic only: fixed phases, no command/env/auth values.
++function traceRuntimeStatusPhase(phase: string): void {
++  if (process.argv[2] !== 'runtime' || process.argv[3] !== 'status') return
++  writeSync(2, '@@runtime-status-phase@@' + JSON.stringify({ phase, pid: process.pid, elapsedMs: Math.round(performance.now()) }) + '\n')
++}
++
+ const STDOUT_DRAIN_FALLBACK_TIMEOUT_MS = 2_000
+ const STDOUT_EXIT_SETTLE_TIMEOUT_MS = 50
+ export const RUNTIME_PROVIDER_OAUTH_EVENT_PREFIX = '@@agent-teams-runtime-provider-oauth@@'
+@@ -337,14 +344,18 @@
+ 
+ export async function runtimeStatus(opts: RuntimeStatusOptions): Promise<void> {
+   const providerFilter = opts.provider && opts.provider !== 'all' ? opts.provider : undefined
+-  const loadPayload = () =>
+-    getUnifiedRuntimeStatusPayload(
++  const loadPayload = async () => {
++    traceRuntimeStatusPhase('payload-start')
++    const payload = await getUnifiedRuntimeStatusPayload(
+       providerFilter,
+       {},
+       {
+         detailLevel: opts.summary ? 'summary' : 'full',
+       },
+     )
++    traceRuntimeStatusPhase('payload-done')
++    return payload
++  }
+ 
+   try {
+     if (opts.text) {
+@@ -357,7 +368,9 @@
+       }
+     } else {
+       await withRuntimeJsonStdoutGuardedResponse(loadPayload, async (payload, stdoutWrite) => {
++        traceRuntimeStatusPhase('stdout-write-start')
+         await writeStdoutAndDrain(jsonStringify(payload, null, 2) + '\n', stdoutWrite, 'strict')
++        traceRuntimeStatusPhase('stdout-write-done')
+         return 0
+       })
+       return
+--- a/src/cli/runtimeStatusCommand.entry.test.ts
++++ b/src/cli/runtimeStatusCommand.entry.test.ts
+@@ -19,7 +19,7 @@
+   })
+   let stdout = '', stderr = ''
+   child.stdout.on('data', (data: Buffer) => { stdout += data.toString() })
+-  child.stderr.on('data', (data: Buffer) => { stderr += data.toString() })
++  child.stderr.on('data', (data: Buffer) => { stderr += data.toString(); process.stderr.write(data) })
+   let watchdogTriggered = false
+   const timer = setTimeout(() => { watchdogTriggered = true; child.kill('SIGKILL') }, 20_000)
+   try {
