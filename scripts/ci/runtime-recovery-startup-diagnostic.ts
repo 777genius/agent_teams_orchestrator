@@ -14,14 +14,18 @@ const hash = (data: string | Buffer) => createHash('sha256').update(data).digest
 mkdirSync(evidenceRoot, { recursive: true })
 assert.equal(process.platform, 'win32')
 assert.equal(Bun.version, '1.4.3')
-assert.equal(git('rev-parse', 'HEAD^'), source)
+assert.equal(git('rev-parse', 'HEAD^'), '52f754060a4dc2aea59c98f449f8192db49d8e68')
+assert.equal(git('rev-parse', 'HEAD^^'), source)
 assert.equal(git('status', '--porcelain', '--untracked-files=no'), '')
 assert.deepEqual(git('diff', '--name-only', source, 'HEAD').split('\n').sort(),
   ['.github/workflows/ci.yml', controllerPath, testPath].sort())
 const metadata = JSON.parse(readFileSync('package.json', 'utf8'))
 const authorityCommand = metadata.scripts['test:opencode-authority']
 assert.equal(authorityCommand, JSON.parse(git('show', `${source}:package.json`)).scripts['test:opencode-authority'])
-assert.equal(hash(readFileSync('bun.lock')), hash(execFileSync('git', ['show', `${source}:bun.lock`])))
+// Windows checkout can materialize CRLF; require the unchanged canonical Git
+// content while retaining the actual checked-out bytes in the provenance.
+const lockGitBlob = git('hash-object', '--path=bun.lock', 'bun.lock')
+assert.equal(lockGitBlob, git('rev-parse', `${source}:bun.lock`))
 const provenance = {
   source, diagnosticCommit: git('rev-parse', 'HEAD'), tree: git('rev-parse', 'HEAD^{tree}'),
   runId: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT,
@@ -30,6 +34,7 @@ const provenance = {
   args: ['run', 'test:opencode-authority', '--timeout', '30000'],
   untouchedTimeoutMs: 30000, productionSourcesUnchanged: true,
   fullPrecedingAuthorityContext: true, repetitions: 1, qualification: false,
+  lockGitBlob, lockCheckoutSha256: hash(readFileSync('bun.lock')),
   sourceTestSha256: hash(execFileSync('git', ['show', `${source}:${testPath}`])),
   tracedTestSha256: hash(readFileSync(testPath)), startedAt: new Date().toISOString(),
 }
