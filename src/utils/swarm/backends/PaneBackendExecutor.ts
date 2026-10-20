@@ -151,6 +151,7 @@ export class PaneBackendExecutor implements TeammateExecutor {
         permissionMode: appState.toolPermissionContext.mode,
         effortValue: typeof appState.effortValue === 'string' ? appState.effortValue : undefined,
         provider: config.provider,
+        memberCodex: config.codex,
       })
 
       if (config.provider && config.provider !== getCurrentProvider()) {
@@ -197,6 +198,8 @@ export class PaneBackendExecutor implements TeammateExecutor {
                 startupReadySentinel.filePath,
             }
           : undefined,
+        finalEnvPatch: config.env,
+        forcedCodexLoginMethod: config.codex?.forcedLoginMethod,
       })
 
       const spawnCommand = wrapTeammateSpawnCommand(

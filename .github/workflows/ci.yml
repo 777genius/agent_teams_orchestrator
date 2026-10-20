@@ -238,6 +238,9 @@ jobs:
           src/services/runtimeBackends/effectiveDefaultModel.test.ts
           src/services/runtimeBackends/registry.anthropicCatalog.test.ts
           src/utils/sleep.test.ts
+          src/services/teamBootstrap/teamBootstrapOwnedSpec.test.ts
+          src/utils/swarm/memberSettingsFile.test.ts
+          src/services/opencode/OpenCodeGatewayCredentialSnapshot.test.ts
 
   opencode-conformance:
     needs: scope

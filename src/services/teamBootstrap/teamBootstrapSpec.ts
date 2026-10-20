@@ -16,6 +16,11 @@ import {
 import { normalizeBootstrapModelSelection } from './teamBootstrapModelSelection.js'
 import { isWindowsReservedBasename } from '../../utils/windowsReservedNames.js'
 import { hashNativeBootstrapText } from './nativeAppManagedBootstrapContext.js'
+import { buildCodexNativeCustomProviderConfigOverrides } from '../codexNative/customProviderConfigOverrides.js'
+import {
+  assertMemberEnvPatch,
+  MEMBER_ENV_PATCH_KEYS,
+} from '../../utils/swarm/memberEnvPatch.js'
 
 const MAX_BOOTSTRAP_SPEC_BYTES = 256 * 1024
 const MAX_BOOTSTRAP_MEMBERS = 20
@@ -36,6 +41,91 @@ const bootstrapMcpSettingSourcesSchema = z
   .trim()
   .regex(/^(user|project|local)(,(user|project|local))*$/)
 
+const MAX_MEMBER_ENV_VALUE_LENGTH = 8192
+const MAX_CODEX_CONFIG_OVERRIDES = 32
+const MAX_CODEX_CONFIG_OVERRIDE_LENGTH = 2048
+const MAX_CODEX_CONFIG_OVERRIDES_TOTAL_LENGTH = 4096
+const MAX_GATEWAY_USAGE_REF_LENGTH = 256
+
+const bootstrapMemberEnvSchema = z
+  .partialRecord(
+    z.enum(MEMBER_ENV_PATCH_KEYS),
+    z
+      .string()
+      .max(MAX_MEMBER_ENV_VALUE_LENGTH)
+      .refine(value => !value.includes('\0'), {
+        message: 'env values must not contain NUL characters',
+      }),
+  )
+  .superRefine((env, ctx) => {
+    try {
+      assertMemberEnvPatch(env)
+    } catch {
+      ctx.addIssue({
+        code: 'custom',
+        message: 'invalid per-member gateway environment patch',
+      })
+    }
+  })
+
+const bootstrapMemberCodexSchema = z
+  .strictObject({
+    configOverrides: z
+      .array(z.string().min(1).max(MAX_CODEX_CONFIG_OVERRIDE_LENGTH))
+      .max(MAX_CODEX_CONFIG_OVERRIDES)
+      .optional(),
+    forcedLoginMethod: z.enum(['api']).optional(),
+  })
+  .superRefine((codex, ctx) => {
+    if (!codex.configOverrides) {
+      return
+    }
+    let totalLength = 0
+    for (const [index, override] of codex.configOverrides.entries()) {
+      if (
+        override.includes('\0') ||
+        override.includes('\n') ||
+        override.includes('\r')
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['configOverrides', index],
+          message:
+            'Codex config override must not contain NUL or newline characters',
+        })
+      }
+      totalLength += override.length
+    }
+    if (totalLength > MAX_CODEX_CONFIG_OVERRIDES_TOTAL_LENGTH) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['configOverrides'],
+        message: `Codex config overrides must total <=${MAX_CODEX_CONFIG_OVERRIDES_TOTAL_LENGTH} characters`,
+      })
+    }
+    if (codex.configOverrides.length > 0) {
+      const normalized = buildCodexNativeCustomProviderConfigOverrides({
+        settingsInline: {
+          codex: {
+            forced_login_method: codex.forcedLoginMethod,
+            agent_teams_custom_provider: { config_overrides: codex.configOverrides },
+          },
+        },
+      })
+      if (
+        codex.forcedLoginMethod !== 'api' ||
+        normalized.length !== codex.configOverrides.length ||
+        normalized.some(value => !codex.configOverrides!.includes(value))
+      ) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['configOverrides'],
+          message: 'Codex overrides must define the complete supported custom API provider',
+        })
+      }
+    }
+  })
+
 const bootstrapMemberSchema = z.strictObject({
   name: z.string().trim().min(1),
   prompt: z.string().trim().min(1).optional(),
@@ -54,6 +144,14 @@ const bootstrapMemberSchema = z.strictObject({
   mcpSettingSources: bootstrapMcpSettingSourcesSchema.optional(),
   strictMcpConfig: z.boolean().optional(),
   nativeAppManagedBootstrap: nativeAppManagedBootstrapSchema.optional(),
+  env: bootstrapMemberEnvSchema.optional(),
+  codex: bootstrapMemberCodexSchema.optional(),
+  gatewayUsageRef: z
+    .string()
+    .trim()
+    .min(1)
+    .max(MAX_GATEWAY_USAGE_REF_LENGTH)
+    .optional(),
 })
 
 const bootstrapSpecSchema = z.strictObject({
@@ -200,6 +298,22 @@ function normalizeMember(
     ...(member.nativeAppManagedBootstrap
       ? { nativeAppManagedBootstrap: member.nativeAppManagedBootstrap }
       : {}),
+    ...(member.env ? { env: { ...member.env } } : {}),
+    ...(member.codex
+      ? {
+          codex: {
+            ...(member.codex.configOverrides
+              ? { configOverrides: [...member.codex.configOverrides] }
+              : {}),
+            ...(member.codex.forcedLoginMethod
+              ? { forcedLoginMethod: member.codex.forcedLoginMethod }
+              : {}),
+          },
+        }
+      : {}),
+    ...(member.gatewayUsageRef
+      ? { gatewayUsageRef: member.gatewayUsageRef }
+      : {}),
   }
 }
 
@@ -220,9 +334,9 @@ function normalizePermissionSeedTools(tools: string[] | undefined): string[] {
   )
 }
 
-export function buildRequestHash(
+export function buildRequestHashInput(
   request: Omit<TeamBootstrapRequest, 'requestHash'>,
-): string {
+): Record<string, unknown> {
   const stableMembers = [...request.members]
     .map(member => ({
       normalizedName: member.normalizedName,
@@ -248,10 +362,26 @@ export function buildRequestHash(
             briefingHash: member.nativeAppManagedBootstrap.briefingHash,
           }
         : null,
+      // Secrets hygiene: env values may contain secret literals and must never
+      // enter the hash input. Only the sorted key names capture intent (which
+      // credentials/vars the member needs); value changes are not new intent.
+      envKeys: member.env
+        ? Object.keys(member.env).sort(compareStableStrings)
+        : null,
+      // Sorted so re-ordering config overrides does not look like new intent.
+      codex: member.codex
+        ? {
+            configOverrides: member.codex.configOverrides
+              ? [...member.codex.configOverrides].sort(compareStableStrings)
+              : null,
+            forcedLoginMethod: member.codex.forcedLoginMethod ?? null,
+          }
+        : null,
+      gatewayUsageRef: member.gatewayUsageRef ?? null,
     }))
     .sort((a, b) => compareStableStrings(a.normalizedName, b.normalizedName))
 
-  const stableIntent = {
+  return {
     version: request.version,
     mode: request.mode,
     teamName: request.teamName,
@@ -263,9 +393,13 @@ export function buildRequestHash(
     policy: request.policy,
     members: stableMembers,
   }
+}
 
+export function buildRequestHash(
+  request: Omit<TeamBootstrapRequest, 'requestHash'>,
+): string {
   return createHash('sha256')
-    .update(JSON.stringify(stableIntent))
+    .update(JSON.stringify(buildRequestHashInput(request)))
     .digest('hex')
 }
 

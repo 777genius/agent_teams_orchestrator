@@ -87,6 +87,9 @@ export class TeamBootstrapStateStore {
         logicalIdentity: member.normalizedName,
         desiredRole: member.role,
         status: 'pending',
+        ...(member.gatewayUsageRef
+          ? { gatewayUsageRef: member.gatewayUsageRef }
+          : {}),
       })),
     }
   }

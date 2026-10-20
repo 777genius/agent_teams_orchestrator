@@ -16,21 +16,9 @@ import { runTeamBootstrap } from './teamBootstrapRunner.js'
 import { readBoundRegularUtf8File } from './teamBootstrapBoundFileRead.js'
 import { readTeamBootstrapSpec } from './teamBootstrapSpec.js'
 import { TeamBootstrapStateStore } from './teamBootstrapStateStore.js'
+import { withOwnedTeamBootstrapSpec } from './teamBootstrapOwnedSpec.js'
 
 const MAX_BOOTSTRAP_USER_PROMPT_BYTES = 256 * 1024
-
-async function consumeBootstrapSpecFile(specPath: string): Promise<void> {
-  try {
-    await rm(specPath)
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') {
-      return
-    }
-    throw new Error(
-      `deterministic bootstrap could not consume the bootstrap spec file: ${error instanceof Error ? error.message : String(error)}`,
-    )
-  }
-}
 
 async function readBootstrapUserPromptFile(promptFilePath: string): Promise<string> {
   return readBoundRegularUtf8File({
@@ -65,7 +53,9 @@ export async function runStartupTeamBootstrap(params: {
   thinkingConfig?: ThinkingConfig
 }): Promise<void> {
   assertBootstrapFeatureEnabled()
-  const request = await readTeamBootstrapSpec(params.specPath)
+  const request = await withOwnedTeamBootstrapSpec(params.specPath, () =>
+    readTeamBootstrapSpec(params.specPath),
+  )
   const context = buildTeamBootstrapContext({
     commands: params.commands,
     tools: params.tools,
@@ -89,9 +79,6 @@ export async function runStartupTeamBootstrap(params: {
     request,
     context,
     emit: emitter,
-    onInitialized: async () => {
-      await consumeBootstrapSpecFile(params.specPath)
-    },
   })
   if (!result.ok && result.fatal) {
     throw new Error(result.error)

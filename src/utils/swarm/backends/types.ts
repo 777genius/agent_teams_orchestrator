@@ -232,6 +232,17 @@ export type TeammateSpawnConfig = TeammateIdentity & {
   /** Whether this teammate can show permission prompts for unlisted tools.
    * When false (default), unlisted tools are auto-denied. */
   allowPermissionPrompts?: boolean
+  /** Final narrow per-member env patch applied after all inherited-auth env
+   *  transformations. May contain secret literals; never log it. */
+  env?: Record<string, string>
+  /** Per-member Codex provider overrides (replaces the lead's codex settings
+   *  namespace for this teammate's spawn; never derived from lead settings). */
+  codex?: {
+    configOverrides?: string[]
+    forcedLoginMethod?: 'api'
+  }
+  /** Opaque per-member usage identity marker (no secrets). */
+  gatewayUsageRef?: string
 }
 
 /**

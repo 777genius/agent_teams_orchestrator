@@ -81,9 +81,13 @@ import {
   buildAppManagedAnthropicApiKeyHelperSettingsFlag,
   buildInheritedEnvObject,
   buildInheritedEnvVars,
+  buildMemberCodexSettingsFragment,
   isAppManagedAnthropicSettingsPath,
   buildProviderScopedInheritedSettingsInline,
   isAppManagedTeamRuntimeSettingsPath,
+  materializeMergedMemberSettingsFile,
+  mergeMemberSettingsFragment,
+  type MemberCodexSpawnOverrides,
   probeTmuxTeammateSpawn,
   stripInheritedCliFlag,
   stripProviderBoundaryInheritedRuntimeFlags,
@@ -977,6 +981,13 @@ export type SpawnTeammateConfig = {
   mcp_setting_sources?: string
   strict_mcp_config?: boolean
   nativeAppManagedBootstrap?: NativeAppManagedBootstrapSpec
+  /** Final narrow per-member env patch (may contain secret literals; must
+   *  never be logged). Applied after all inherited-auth env transformations. */
+  env?: Record<string, string>
+  /** Per-member Codex provider overrides (never derived from lead settings). */
+  codex?: MemberCodexSpawnOverrides
+  /** Opaque per-member usage identity marker (no secrets). */
+  gatewayUsageRef?: string
   bootstrapRunId?: string
   bootstrapTimeoutMs?: number
   /** request_id of the API call whose response contained the tool_use that
@@ -1003,6 +1014,12 @@ type SpawnInput = {
   mcp_setting_sources?: string
   strict_mcp_config?: boolean
   nativeAppManagedBootstrap?: NativeAppManagedBootstrapSpec
+  /** See SpawnTeammateConfig.env — secret-bearing, never logged. */
+  env?: Record<string, string>
+  /** See SpawnTeammateConfig.codex. */
+  codex?: MemberCodexSpawnOverrides
+  /** See SpawnTeammateConfig.gatewayUsageRef. */
+  gatewayUsageRef?: string
   bootstrapRunId?: string
   bootstrapTimeoutMs?: number
   invokingRequestId?: string
@@ -1539,6 +1556,8 @@ function finishRuntimeLogStreams(streams: Array<WriteStream | undefined>): void 
  *
  * @param options.planModeRequired - If true, don't inherit bypass permissions (plan mode takes precedence)
  * @param options.permissionMode - Permission mode to propagate
+ * @param options.memberCodex - Per-member Codex provider overrides that replace
+ *   the lead's codex settings namespace for this teammate's spawn
  */
 function buildInheritedCliFlags(options?: {
   planModeRequired?: boolean
@@ -1546,9 +1565,11 @@ function buildInheritedCliFlags(options?: {
   effortValue?: string
   strictMcpConfig?: boolean
   provider?: TeammateProvider
+  memberCodex?: MemberCodexSpawnOverrides
 }): string {
   const flags: string[] = []
-  const { planModeRequired, permissionMode, effortValue, strictMcpConfig, provider } = options || {}
+  const { planModeRequired, permissionMode, effortValue, strictMcpConfig, provider, memberCodex } =
+    options || {}
 
   // Propagate permission mode to teammates, but NOT if plan mode is required
   // Plan mode takes precedence over bypass permissions for safety
@@ -1578,26 +1599,48 @@ function buildInheritedCliFlags(options?: {
     flags.push(`--effort ${quote([effortValue])}`)
   }
 
-  // Propagate --settings if set via CLI
+  // Propagate --settings if set via CLI. Per-member Codex overrides are merged
+  // in as a final layer: the member's codex settings replace the lead's codex
+  // settings namespace for this teammate.
   const settingsPath = getFlagSettingsPath()
   const settingsInline = getFlagSettingsInline()
   const inheritedSettingsInline = buildProviderScopedInheritedSettingsInline(
     provider,
     settingsInline,
   )
+  const memberSettingsFragment = buildMemberCodexSettingsFragment(memberCodex)
   const appManagedAnthropicSettingsFlag =
-    buildAppManagedAnthropicApiKeyHelperSettingsFlag(provider, settingsPath)
+    buildAppManagedAnthropicApiKeyHelperSettingsFlag(
+      provider,
+      settingsPath,
+      memberSettingsFragment,
+    )
   const suppressAppManagedAnthropicPath =
     provider !== 'anthropic' && isAppManagedAnthropicSettingsPath(settingsPath)
   const suppressAppManagedTeamRuntimePath =
     provider !== 'anthropic' && isAppManagedTeamRuntimeSettingsPath(settingsPath)
-  if (
+  const inheritedSettingsPath =
     settingsPath &&
     !appManagedAnthropicSettingsFlag &&
     !suppressAppManagedAnthropicPath &&
     !suppressAppManagedTeamRuntimePath
-  ) {
-    flags.push(`--settings ${quote([settingsPath])}`)
+      ? settingsPath
+      : null
+  if (inheritedSettingsPath) {
+    if (memberSettingsFragment) {
+      const mergedSettingsPath = materializeMergedMemberSettingsFile(
+        inheritedSettingsPath,
+        memberSettingsFragment,
+      )
+      if (!mergedSettingsPath) {
+        throw new Error(
+          'per-member Codex settings could not be merged into the inherited settings file',
+        )
+      }
+      flags.push(`--settings ${quote([mergedSettingsPath])}`)
+    } else {
+      flags.push(`--settings ${quote([inheritedSettingsPath])}`)
+    }
   }
   if (appManagedAnthropicSettingsFlag) {
     flags.push(appManagedAnthropicSettingsFlag)
@@ -1605,7 +1648,12 @@ function buildInheritedCliFlags(options?: {
     inheritedSettingsInline &&
     (!settingsPath || suppressAppManagedAnthropicPath || suppressAppManagedTeamRuntimePath)
   ) {
-    flags.push(`--settings ${quote([JSON.stringify(inheritedSettingsInline)])}`)
+    const inlineWithMember = memberSettingsFragment
+      ? mergeMemberSettingsFragment(inheritedSettingsInline, memberSettingsFragment)
+      : inheritedSettingsInline
+    flags.push(`--settings ${quote([JSON.stringify(inlineWithMember)])}`)
+  } else if (memberSettingsFragment && !inheritedSettingsPath) {
+    flags.push(`--settings ${quote([JSON.stringify(memberSettingsFragment)])}`)
   }
 
   const disallowedTools = getFlagDisallowedTools()
@@ -1808,6 +1856,7 @@ async function handleSpawnSplitPane(
     permissionMode: appState.toolPermissionContext.mode,
     effortValue: typeof appState.effortValue === 'string' ? appState.effortValue : undefined,
     provider,
+    memberCodex: input.codex,
   })
 
   if (crossesProviderBoundary(input.provider)) {
@@ -1892,6 +1941,8 @@ async function handleSpawnSplitPane(
             }
           : {}),
       },
+      finalEnvPatch: input.env,
+      forcedCodexLoginMethod: input.codex?.forcedLoginMethod,
     })
     const spawnCommand = wrapTeammateSpawnCommand(
       `cd ${quote([workingDir])} && env ${envStr} ${binaryPath} ${teammateArgs}${flagsStr}`,
@@ -1977,6 +2028,9 @@ async function handleSpawnSplitPane(
       bootstrapProofToken,
       bootstrapRunId,
       bootstrapRuntimeEventsPath: runtimePaths.eventsPath,
+      ...(input.gatewayUsageRef
+        ? { gatewayUsageRef: input.gatewayUsageRef }
+        : {}),
       ...(input.nativeAppManagedBootstrap
         ? {
             bootstrapProofMode: 'native_app_managed_context',
@@ -2141,6 +2195,7 @@ async function handleSpawnSeparateWindow(
     permissionMode: appState.toolPermissionContext.mode,
     effortValue: typeof appState.effortValue === 'string' ? appState.effortValue : undefined,
     provider,
+    memberCodex: input.codex,
   })
 
   if (crossesProviderBoundary(input.provider)) {
@@ -2214,6 +2269,8 @@ async function handleSpawnSeparateWindow(
         [TEAMMATE_BOOTSTRAP_RUN_ID_ENV]: bootstrapRunId,
         [TEAMMATE_STARTUP_READY_SENTINEL_ENV]: startupReadySentinel.filePath,
       },
+      finalEnvPatch: input.env,
+      forcedCodexLoginMethod: input.codex?.forcedLoginMethod,
     })
     const spawnCommand = wrapTeammateSpawnCommand(
       `cd ${quote([workingDir])} && env ${envStr} ${binaryPath} ${teammateArgs}${flagsStr}`,
@@ -2304,6 +2361,9 @@ async function handleSpawnSeparateWindow(
       bootstrapProofToken,
       bootstrapRunId,
       bootstrapRuntimeEventsPath: runtimePaths.eventsPath,
+      ...(input.gatewayUsageRef
+        ? { gatewayUsageRef: input.gatewayUsageRef }
+        : {}),
       ...(input.nativeAppManagedBootstrap
         ? {
             bootstrapProofMode: 'native_app_managed_context',
@@ -2565,6 +2625,7 @@ async function handleSpawnNativeProcess(
     effortValue:
       typeof appState.effortValue === 'string' ? appState.effortValue : undefined,
     provider,
+    memberCodex: input.codex,
   })
 
   if (crossesProviderBoundary(input.provider)) {
@@ -2673,6 +2734,8 @@ async function handleSpawnNativeProcess(
             [TEAMMATE_BOOTSTRAP_PROOF_TOKEN_ENV]: bootstrapProofToken,
             [TEAMMATE_BOOTSTRAP_RUN_ID_ENV]: bootstrapRunId,
           },
+          finalEnvPatch: input.env,
+          forcedCodexLoginMethod: input.codex?.forcedLoginMethod,
         }),
       },
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -2834,6 +2897,9 @@ async function handleSpawnNativeProcess(
         bootstrapProofToken,
         bootstrapRunId,
         bootstrapRuntimeEventsPath: runtimePaths.eventsPath,
+        ...(input.gatewayUsageRef
+          ? { gatewayUsageRef: input.gatewayUsageRef }
+          : {}),
         ...(input.nativeAppManagedBootstrap
           ? {
               bootstrapProofMode: 'native_app_managed_context',
@@ -3096,10 +3162,48 @@ async function handleSpawnNativeProcess(
  * Handle spawn operation for in-process teammates.
  * In-process teammates run in the same Node.js process using AsyncLocalStorage.
  */
+/**
+ * Per-member spawn customizations that only separate-process spawn paths can
+ * apply. The in-process teammate lane shares the leader process env/settings,
+ * so it cannot inject per-member env patches, Codex overrides, or gateway
+ * usage refs. A member carrying any of these must fail loudly at spawn time
+ * instead of being silently spawned without them.
+ * @internal Exported for testing
+ */
+export function getInProcessSpawnCustomizationRejection(
+  input: Pick<SpawnInput, 'name' | 'env' | 'codex' | 'gatewayUsageRef'>,
+): string | null {
+  const unsupported: string[] = []
+  if (input.env && Object.keys(input.env).length > 0) {
+    unsupported.push('env')
+  }
+  if (input.gatewayUsageRef) {
+    unsupported.push('gatewayUsageRef')
+  }
+  if (
+    input.codex &&
+    ((input.codex.configOverrides?.length ?? 0) > 0 ||
+      input.codex.forcedLoginMethod !== undefined)
+  ) {
+    unsupported.push('codex')
+  }
+  if (unsupported.length === 0) {
+    return null
+  }
+  return (
+    `Teammate "${input.name}" carries per-member spawn customizations (${unsupported.join(', ')}) ` +
+    'that require a separate-process spawn. The in-process teammate lane cannot apply per-member env, Codex overrides, or gateway usage refs.'
+  )
+}
+
 async function handleSpawnInProcess(
   input: SpawnInput,
   context: ToolUseContext,
 ): Promise<{ data: SpawnOutput }> {
+  const customizationRejection = getInProcessSpawnCustomizationRejection(input)
+  if (customizationRejection) {
+    throw new Error(customizationRejection)
+  }
   const { setAppState, getAppState } = context
   const { name, prompt, agent_type, plan_mode_required } = input
   const separateProcessRequirement = getSeparateProcessRequirement(input.provider)
@@ -3387,6 +3491,7 @@ type SpawnMultiAgentDepsForTests = {
   detectAndGetBackend?: typeof detectAndGetBackend
   getTeammateModeFromSnapshot?: typeof getTeammateModeFromSnapshot
   isInProcessEnabled?: typeof isInProcessEnabled
+  markInProcessFallback?: typeof markInProcessFallback
 }
 
 let spawnMultiAgentDepsForTests: SpawnMultiAgentDepsForTests | null = null
@@ -3409,6 +3514,8 @@ function getSpawnMultiAgentDeps(): Required<SpawnMultiAgentDepsForTests> {
       getTeammateModeFromSnapshot,
     isInProcessEnabled:
       spawnMultiAgentDepsForTests?.isInProcessEnabled ?? isInProcessEnabled,
+    markInProcessFallback:
+      spawnMultiAgentDepsForTests?.markInProcessFallback ?? markInProcessFallback,
   }
 }
 
@@ -3501,9 +3608,13 @@ async function handleSpawn(
       logForDebugging(
         `[handleSpawn] No pane backend available, falling back to in-process: ${errorMessage(error)}`,
       )
+      // Reject before changing session-wide mode: a failed customized spawn
+      // must not force subsequent ordinary teammates into the in-process lane.
+      const customizationRejection = getInProcessSpawnCustomizationRejection(spawnInput)
+      if (customizationRejection) throw new Error(customizationRejection)
       // Record the fallback so isInProcessEnabled() reflects the actual mode
       // (fixes banner and other UI that would otherwise show tmux attach commands).
-      markInProcessFallback()
+      spawnDeps.markInProcessFallback()
       return await handleSpawnInProcess(spawnInput, context)
     }
 

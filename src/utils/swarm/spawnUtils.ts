@@ -2,6 +2,8 @@
  * Shared utilities for spawning teammates across different backends.
  */
 
+import { assertMemberEnvPatch, type MemberEnvPatch } from './memberEnvPatch.js'
+import { writeOwnedMemberSettingsFile } from './memberSettingsFile.js'
 import { mkdtemp, writeFile } from 'node:fs/promises'
 import { chmodSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -40,7 +42,10 @@ import { execFileNoThrow } from '../execFileNoThrow.js'
 import { getAPIProvider } from '../model/providers.js'
 import type { PermissionMode } from '../permissions/PermissionMode.js'
 import { sleep } from '../sleep.js'
-import { getCodexForcedLoginMethod } from '../../services/runtimeBackends/codexBackendResolver.js'
+import {
+  CODEX_FORCED_LOGIN_METHOD_ENV_VAR,
+  getCodexForcedLoginMethod,
+} from '../../services/runtimeBackends/codexBackendResolver.js'
 import { parseArguments } from '../argumentSubstitution.js'
 import type { TeammateProvider } from './backends/types.js'
 import { getTeammateModeFromSnapshot } from './backends/teammateModeSnapshot.js'
@@ -68,12 +73,79 @@ export function getTeammateCommand(): string {
 }
 
 /**
+ * Per-member Codex provider overrides carried by the bootstrap spec. These
+ * belong to the member's own runtime — the lead's codex settings are never
+ * reused as a fallback for them.
+ */
+export type MemberCodexSpawnOverrides = {
+  configOverrides?: string[]
+  forcedLoginMethod?: 'api'
+}
+
+/**
+ * Builds the settings fragment carrying per-member Codex overrides. The shape
+ * matches what the existing child-side parser
+ * (buildCodexNativeCustomProviderConfigOverrides / getCodexForcedLoginMethod)
+ * reads, so both the `-c` config-override form and the inline `--settings` JSON
+ * form round-trip through that parser unchanged.
+ */
+export function buildMemberCodexSettingsFragment(
+  memberCodex: MemberCodexSpawnOverrides | undefined,
+): Record<string, unknown> | null {
+  if (!memberCodex) {
+    return null
+  }
+  const codex: Record<string, unknown> = {}
+  if (memberCodex.forcedLoginMethod === 'api') {
+    codex.forced_login_method = 'api'
+  }
+  const configOverrides = memberCodex.configOverrides?.filter(
+    override => typeof override === 'string' && override.length > 0,
+  )
+  if (configOverrides && configOverrides.length > 0) {
+    codex.agent_teams_custom_provider = {
+      config_overrides: [...configOverrides],
+    }
+  }
+  return Object.keys(codex).length > 0 ? { codex } : null
+}
+
+/**
+ * Applies a member settings fragment on top of base settings. The fragment's
+ * top-level keys replace the base keys wholesale (not deep-merged), so a
+ * member's `codex` block never inherits the lead's codex settings.
+ */
+export function mergeMemberSettingsFragment(
+  base: Record<string, unknown> | null,
+  fragment: Record<string, unknown>,
+): Record<string, unknown> {
+  return { ...(base ?? {}), ...fragment }
+}
+
+/** Materialize a private lifecycle-owned copy without exposing inherited settings in argv. */
+export function materializeMergedMemberSettingsFile(
+  baseSettingsPath: string,
+  fragment: Record<string, unknown>,
+): string | null {
+  const baseSettings = readSettingsJsonFile(baseSettingsPath)
+  try {
+    return baseSettings
+      ? writeOwnedMemberSettingsFile(mergeMemberSettingsFragment(baseSettings, fragment))
+      : null
+  } catch {
+    return null
+  }
+}
+
+/**
  * Builds CLI flags to propagate from the current session to spawned teammates.
  * This ensures teammates inherit important settings like permission mode,
  * model selection, and plugin configuration from their parent.
  *
  * @param options.planModeRequired - If true, don't inherit bypass permissions (plan mode takes precedence)
  * @param options.permissionMode - Permission mode to propagate
+ * @param options.memberCodex - Per-member Codex provider overrides that replace
+ *   the lead's codex settings namespace for this teammate's spawn
  */
 export function buildInheritedCliFlags(options?: {
   planModeRequired?: boolean
@@ -81,9 +153,11 @@ export function buildInheritedCliFlags(options?: {
   effortValue?: string
   strictMcpConfig?: boolean
   provider?: TeammateProvider
+  memberCodex?: MemberCodexSpawnOverrides
 }): string {
   const flags: string[] = []
-  const { planModeRequired, permissionMode, effortValue, strictMcpConfig, provider } = options || {}
+  const { planModeRequired, permissionMode, effortValue, strictMcpConfig, provider, memberCodex } =
+    options || {}
 
   // Propagate permission mode to teammates, but NOT if plan mode is required
   // Plan mode takes precedence over bypass permissions for safety
@@ -108,26 +182,48 @@ export function buildInheritedCliFlags(options?: {
     flags.push(`--effort ${quote([effortValue])}`)
   }
 
-  // Propagate --settings if set via CLI
+  // Propagate --settings if set via CLI. Per-member Codex overrides are merged
+  // in as a final layer: the member's codex settings replace the lead's codex
+  // settings namespace for this teammate.
   const settingsPath = getFlagSettingsPath()
   const settingsInline = getFlagSettingsInline()
   const inheritedSettingsInline = buildProviderScopedInheritedSettingsInline(
     provider,
     settingsInline,
   )
+  const memberSettingsFragment = buildMemberCodexSettingsFragment(memberCodex)
   const appManagedAnthropicSettingsFlag =
-    buildAppManagedAnthropicApiKeyHelperSettingsFlag(provider, settingsPath)
+    buildAppManagedAnthropicApiKeyHelperSettingsFlag(
+      provider,
+      settingsPath,
+      memberSettingsFragment,
+    )
   const suppressAppManagedAnthropicPath =
     provider !== 'anthropic' && isAppManagedAnthropicSettingsPath(settingsPath)
   const suppressAppManagedTeamRuntimePath =
     provider !== 'anthropic' && isAppManagedTeamRuntimeSettingsPath(settingsPath)
-  if (
+  const inheritedSettingsPath =
     settingsPath &&
     !appManagedAnthropicSettingsFlag &&
     !suppressAppManagedAnthropicPath &&
     !suppressAppManagedTeamRuntimePath
-  ) {
-    flags.push(`--settings ${quote([settingsPath])}`)
+      ? settingsPath
+      : null
+  if (inheritedSettingsPath) {
+    if (memberSettingsFragment) {
+      const mergedSettingsPath = materializeMergedMemberSettingsFile(
+        inheritedSettingsPath,
+        memberSettingsFragment,
+      )
+      if (!mergedSettingsPath) {
+        throw new Error(
+          'per-member Codex settings could not be merged into the inherited settings file',
+        )
+      }
+      flags.push(`--settings ${quote([mergedSettingsPath])}`)
+    } else {
+      flags.push(`--settings ${quote([inheritedSettingsPath])}`)
+    }
   }
   if (appManagedAnthropicSettingsFlag) {
     flags.push(appManagedAnthropicSettingsFlag)
@@ -135,7 +231,12 @@ export function buildInheritedCliFlags(options?: {
     inheritedSettingsInline &&
     (!settingsPath || suppressAppManagedAnthropicPath || suppressAppManagedTeamRuntimePath)
   ) {
-    flags.push(`--settings ${quote([JSON.stringify(inheritedSettingsInline)])}`)
+    const inlineWithMember = memberSettingsFragment
+      ? mergeMemberSettingsFragment(inheritedSettingsInline, memberSettingsFragment)
+      : inheritedSettingsInline
+    flags.push(`--settings ${quote([JSON.stringify(inlineWithMember)])}`)
+  } else if (memberSettingsFragment && !inheritedSettingsPath) {
+    flags.push(`--settings ${quote([JSON.stringify(memberSettingsFragment)])}`)
   }
 
   const disallowedTools = getFlagDisallowedTools()
@@ -444,6 +545,7 @@ function isAppManagedAnthropicApiKeyHelperTarget(
 export function buildAppManagedAnthropicApiKeyHelperSettingsFlag(
   provider: TeammateProvider | undefined,
   inheritedSettingsPath?: string | null,
+  memberSettingsFragment?: Record<string, unknown> | null,
 ): string | null {
   if (!isAppManagedAnthropicApiKeyHelperTarget(provider)) {
     return null
@@ -456,6 +558,7 @@ export function buildAppManagedAnthropicApiKeyHelperSettingsFlag(
     inheritedSettingsPath: inheritedSettingsPath?.trim() || null,
     helperSettingsPath: settingsPath,
     provider: provider ?? getCurrentTeammateProviderForEnvForwarding(),
+    memberSettingsFragment: memberSettingsFragment ?? null,
   })
   return `--settings ${quote([mergedPath ?? settingsPath])}`
 }
@@ -532,6 +635,7 @@ function materializeAppManagedAnthropicChildSettingsFile(input: {
   inheritedSettingsPath: string | null
   helperSettingsPath: string
   provider: TeammateProvider
+  memberSettingsFragment?: Record<string, unknown> | null
 }): string | null {
   const helperSettings = readSettingsJsonFile(input.helperSettingsPath)
   if (!helperSettings) {
@@ -541,9 +645,12 @@ function materializeAppManagedAnthropicChildSettingsFile(input: {
     input.inheritedSettingsPath && input.inheritedSettingsPath !== input.helperSettingsPath
       ? readSettingsJsonFile(input.inheritedSettingsPath)
       : null
-  const merged = inheritedSettings
+  const mergedWithHelper = inheritedSettings
     ? mergeJsonSettingsObjects(inheritedSettings, helperSettings)
     : helperSettings
+  const merged = input.memberSettingsFragment
+    ? mergeMemberSettingsFragment(mergedWithHelper, input.memberSettingsFragment)
+    : mergedWithHelper
   const dir = dirname(input.helperSettingsPath)
   const outputPath = join(dir, `child-runtime-settings-${input.provider}.json`)
   try {
@@ -557,10 +664,13 @@ function materializeAppManagedAnthropicChildSettingsFile(input: {
 
 export function shouldClearCodexApiKeysForTeammateSpawn(
   provider: TeammateProvider | undefined,
+  memberForcedLoginMethod?: 'api',
 ): boolean {
+  const effectiveForcedLoginMethod =
+    memberForcedLoginMethod ?? getCodexForcedLoginMethod()
   return (
     (provider ?? getCurrentTeammateProviderForEnvForwarding()) === 'codex' &&
-    getCodexForcedLoginMethod() === 'chatgpt'
+    effectiveForcedLoginMethod === 'chatgpt'
   )
 }
 
@@ -598,6 +708,38 @@ export function shouldClearAnthropicApiKeyForTeammateSpawn(params: {
 }
 
 /**
+ * Applies the final narrow per-member env patch as the very last env layer.
+ * This runs after every inherited-auth transformation, so patch values always
+ * win (a member ANTHROPIC_AUTH_TOKEN beats the inherited parent copy).
+ *
+ * Claude-style patch semantics: when the patch supplies its own
+ * ANTHROPIC_AUTH_TOKEN and does not explicitly set ANTHROPIC_API_KEY, the
+ * competing ANTHROPIC_API_KEY is blanked as part of the patch itself so the
+ * parent's key cannot race the member token.
+ */
+export function applyFinalMemberEnvPatch(
+  envVars: Record<string, string>,
+  patch: MemberEnvPatch,
+): void {
+  assertMemberEnvPatch(patch)
+  for (const [key, value] of Object.entries(patch)) {
+    envVars[key] = value
+  }
+  if (patch.ANTHROPIC_BASE_URL !== undefined) {
+    // Reuse the explicit compatible route so child settings.env cannot later
+    // restore the lead's token/URL during the before/after-trust settings pass.
+    envVars[AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV] = 'compatible'
+  }
+  if (
+    typeof patch.ANTHROPIC_AUTH_TOKEN === 'string' &&
+    patch.ANTHROPIC_AUTH_TOKEN !== '' &&
+    patch.ANTHROPIC_API_KEY === undefined
+  ) {
+    envVars.ANTHROPIC_API_KEY = ''
+  }
+}
+
+/**
  * Builds the `env KEY=VALUE ...` string for teammate spawn commands.
  * Always includes CLAUDECODE=1 and CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1,
  * plus any provider/config env vars that are set in the current process.
@@ -605,6 +747,8 @@ export function shouldClearAnthropicApiKeyForTeammateSpawn(params: {
 export function buildInheritedEnvVars(options?: {
   provider?: TeammateProvider
   extraEnv?: Record<string, string | undefined>
+  finalEnvPatch?: Record<string, string>
+  forcedCodexLoginMethod?: 'api'
 }): string {
   return Object.entries(buildInheritedEnvObject(options))
     .map(([key, value]) => `${key}=${quote([value])}`)
@@ -614,6 +758,8 @@ export function buildInheritedEnvVars(options?: {
 export function buildInheritedEnvObject(options?: {
   provider?: TeammateProvider
   extraEnv?: Record<string, string | undefined>
+  finalEnvPatch?: Record<string, string>
+  forcedCodexLoginMethod?: 'api'
 }): Record<string, string> {
   const envVars: Record<string, string> = {
     CLAUDECODE: '1',
@@ -622,7 +768,10 @@ export function buildInheritedEnvObject(options?: {
   const provider = options?.provider
   const useAppManagedAnthropicHelper =
     isAppManagedAnthropicApiKeyHelperTarget(provider)
-  const clearCodexApiKeys = shouldClearCodexApiKeysForTeammateSpawn(provider)
+  const clearCodexApiKeys = shouldClearCodexApiKeysForTeammateSpawn(
+    provider,
+    options?.forcedCodexLoginMethod,
+  )
   const clearAnthropicApiKey = shouldClearAnthropicApiKeyForTeammateSpawn({
     anthropicApiKey: process.env.ANTHROPIC_API_KEY,
     customApiKeyStatus: process.env.ANTHROPIC_API_KEY
@@ -725,6 +874,19 @@ export function buildInheritedEnvObject(options?: {
   applyAnthropicTeammateConnectionPolicy(envVars, provider)
   if (clearAnthropicApiKey && !useAppManagedAnthropicHelper) {
     envVars.ANTHROPIC_API_KEY = ''
+  }
+
+  if (options?.forcedCodexLoginMethod === 'api') {
+    // Per-member Codex login mode pin. Scoped to this member's spawn only, so
+    // a lead-level chatgpt forced login cannot clobber a gateway member's
+    // API-key login mode.
+    envVars[CODEX_FORCED_LOGIN_METHOD_ENV_VAR] = 'api'
+  }
+
+  // Final layer: the narrow per-member env patch always wins over inherited
+  // auth env, and no auth re-normalization runs after it.
+  if (options?.finalEnvPatch) {
+    applyFinalMemberEnvPatch(envVars, options.finalEnvPatch)
   }
 
   return envVars
