@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test'
-import { readProcessStartTimeMs } from './processKill.js'
+import { readWindowsProcessStartTimeMsWithPowerShell } from './processKill.js'
 import { windowsNativeProcess } from './windowsNativeProcess.js'
 
 const windows = process.platform === 'win32'
@@ -18,7 +18,7 @@ test.skipIf(!kernel32)('kernel32 table and birth match the PowerShell StartTime 
   // which is the slowness kernel32 replaces. Retry only the oracle.
   let oracle: number | null = null
   for (let attempt = 0; attempt < 3 && oracle === null; attempt++) {
-    oracle = await readProcessStartTimeMs(process.pid, 'win32', 20_000)
+    oracle = await readWindowsProcessStartTimeMsWithPowerShell(process.pid, 20_000)
   }
   expect(birth).toBe(oracle)
 }, 90_000)

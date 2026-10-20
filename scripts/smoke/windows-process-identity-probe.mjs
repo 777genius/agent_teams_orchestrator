@@ -51,7 +51,7 @@ export function traceSpawn(spawn, emit) {
   };
 }
 
-export async function traceProductionIdentity({ processKill, pid, attempt, platform }) {
+export async function traceProductionIdentity({ processKill, pid, attempt, platform, powerShellOnly = false }) {
   const emit = item => console.error(JSON.stringify({ ...item, attempt }));
   const nativeSpawn = globalThis.Bun?.spawn;
   if (nativeSpawn) {
@@ -87,10 +87,12 @@ export async function traceProductionIdentity({ processKill, pid, attempt, platf
   try {
     emit({ phase: 'before-production-import', bunVersion: globalThis.Bun?.version,
       ...environmentSummary(process.env) });
-    const { readProcessStartTimeMs } = await import(processKill);
+    const { readProcessStartTimeMs, readWindowsProcessStartTimeMsWithPowerShell } = await import(processKill);
     emit({ phase: 'before-production-query', bunVersion: globalThis.Bun?.version });
     const started = performance.now();
-    const startedAtMs = await readProcessStartTimeMs(pid, platform);
+    const startedAtMs = await (powerShellOnly
+      ? readWindowsProcessStartTimeMsWithPowerShell(pid)
+      : readProcessStartTimeMs(pid, platform));
     emit({ phase: 'after-production-query', elapsedMs: performance.now() - started, startedAtMs });
     console.log(JSON.stringify({ startedAtMs }));
   } finally {

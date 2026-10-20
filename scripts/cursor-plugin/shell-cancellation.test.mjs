@@ -6,11 +6,12 @@ import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync, realpathSync } from 'node:fs';
+import fs, { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir, homedir } from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { syncBuiltinESMExports } from 'node:module';
 const stripTypeScriptTypes = globalThis.Bun
   ? source => new Bun.Transpiler({ loader: 'ts' }).transformSync(source)
   : (await import('node:module')).stripTypeScriptTypes;
@@ -83,10 +84,35 @@ function running(pid) {
   // explicitly recorded PID is inspected; no process-list/global PID scan.
   if (process.platform === 'linux') {
     try { return !/^\d+ \(.*\) Z /.test(readFileSync(`/proc/${pid}/stat`, 'utf8')); }
-    catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+    catch (error) { if (error.code === 'ENOENT' || error.code === 'ESRCH') return false; throw error; }
   }
   return true;
 }
+
+test('owned Linux observer admits procfs disappearance and preserves other read errors', {
+  skip: process.platform !== 'linux',
+}, t => {
+  const pid = 1234;
+  let failure;
+  const probe = t.mock.method(process, 'kill', (observedPid, signal) => {
+    assert.equal(observedPid, pid); assert.equal(signal, 0); return true;
+  });
+  const stat = t.mock.method(fs, 'readFileSync', (filename, encoding) => {
+    assert.equal(filename, `/proc/${pid}/stat`); assert.equal(encoding, 'utf8'); throw failure;
+  });
+  syncBuiltinESMExports();
+  try {
+    for (const code of ['ENOENT', 'ESRCH']) {
+      failure = Object.assign(new Error('Owned process disappeared'), { code });
+      assert.equal(running(pid), false);
+    }
+    for (const code of ['EPERM', 'EIO']) {
+      failure = Object.assign(new Error('Observation failed'), { code });
+      assert.throws(() => running(pid), error => error === failure);
+    }
+    assert.equal(probe.mock.callCount(), 4); assert.equal(stat.mock.callCount(), 4);
+  } finally { t.mock.restoreAll(); syncBuiltinESMExports(); }
+});
 const instances = new Set();
 async function start(id, { seconds = 3, timeout = 600000, alias = 'bash', resistant = false } = {}) {
   const directory = path.join(temp, id);

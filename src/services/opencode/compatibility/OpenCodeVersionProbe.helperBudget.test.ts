@@ -6,7 +6,7 @@ import * as portable from '../../../utils/portableCli.js'
 import * as native from '../OpenCodeCursorAgentTreeKill.js'
 import type { NativeHelperFailure } from '../OpenCodeCursorAgentTreeKill.js'
 import type { OpenCodeV2ReadRoots } from '../profile/OpenCodeV2ManagedConfig.js'
-import { OpenCodeVersionProbeCleanupError, readOpenCodeOwnedVersion, VERSION_CLEANUP_MS,
+import { getOpenCodeVersionProbeDiagnostics, OpenCodeVersionProbeCleanupError, readOpenCodeOwnedVersion, VERSION_CLEANUP_MS,
   versionAcquisitionMs } from './OpenCodeVersionProbe.js'
 
 const WINDOWS_ACQUISITION_MS = versionAcquisitionMs('win32')
@@ -173,7 +173,7 @@ for (const mode of ['open', 'exit-only', 'late-close', 'abort'] as const) {
 // A real catalog trace captured root -> relay -> leaf, then the leaf vanished
 // during its first birth read after the wrapper closed. A tree row alone must
 // never become signal authority, nor hide an orphan in the next full census.
-function additionFixture(mode: 'gone' | 'alive' | 'unknown' | 'orphan' | 'reused' | 'older' | 'expired' |
+function additionFixture(mode: 'gone' | 'alive' | 'unknown' | 'orphan' | 'reused' | 'older' | 'missing-parent' | 'expired' |
   'confirmation-gone' | 'confirmation-live' | 'confirmation-reused' | 'stale-gone' | 'stale-live' |
   'late-orphan' | 'open', platform: NodeJS.Platform = 'win32', reverseRows = false) {
   Object.defineProperty(process, 'platform', { value: platform })
@@ -213,16 +213,17 @@ function additionFixture(mode: 'gone' | 'alive' | 'unknown' | 'orphan' | 'reused
         }
         if (mode === 'expired') clock += WINDOWS_DEADLINE_MS
         if (mode === 'older') return 5
+        if (mode === 'missing-parent') return 30
         if (mode.startsWith('confirmation-')) return leafReads === 1 ? 30 : mode === 'confirmation-reused' ? 31 : null
         if (mode.startsWith('stale-')) return leafReads === 1 ? 30 : null
         return null
       }
-      return closed ? null : target === root ? 10 : 20
+      return closed || mode === 'missing-parent' && target === relay ? null : target === root ? 10 : 20
     },
     tree: async budget => readRows(budget),
     alive: target => {
       aliveReads.push(target)
-      return target === leaf && (mode === 'alive' || mode === 'confirmation-live' || mode === 'confirmation-reused' || mode === 'stale-live') ? 'alive'
+      return target === leaf && (mode === 'alive' || mode === 'missing-parent' || mode === 'confirmation-live' || mode === 'confirmation-reused' || mode === 'stale-live') ? 'alive'
         : target === leaf && mode === 'unknown' ? 'unknown' : 'gone'
     },
     signal: target => { signalled.push(target); throw new Error('TEST must not signal uncaptured candidate') },
@@ -427,7 +428,67 @@ test('Windows reverse census still refuses a child born before its captured pare
   expect(failure).toBeInstanceOf(OpenCodeVersionProbeCleanupError)
   expect((failure as OpenCodeVersionProbeCleanupError).terminalDiagnostic).toMatchObject({
     phase: 'addition_identity', guard: 'parent_identity', birthsCount: 2,
+    parentIdentity: {
+      reason: 'child_before_parent', pid: 900_012, ppid: 900_011, parentPid: 900_011,
+      childBirth: 5, parentBirth: 20, parentCandidate: false, anchorPid: 900_010, additionIndex: 1,
+      ancestry: [
+        { pid: 900_012, ppid: 900_011, capturedBirth: null, censusIndex: 0 },
+        { pid: 900_011, ppid: 900_010, capturedBirth: 20, censusIndex: 1 },
+        { pid: 900_010, ppid: process.pid, capturedBirth: 10, censusIndex: 2 },
+      ],
+      ancestryTruncated: false,
+    },
   })
   expect(f.removed()).toBe(0)
   expect(f.signalled).toEqual([])
+})
+
+test('Windows gone relay leaves a live child without parent birth and retains the ownership refusal', async () => {
+  const f = additionFixture('missing-parent', 'win32', true)
+  let failure: unknown
+  try { await f.run() } catch (error) { failure = error }
+  expect(failure).toBeInstanceOf(OpenCodeVersionProbeCleanupError)
+  expect((failure as OpenCodeVersionProbeCleanupError).terminalDiagnostic).toMatchObject({
+    phase: 'addition_identity', guard: 'parent_identity', birthsCount: 1, candidatesCount: 1,
+    parentIdentity: {
+      reason: 'missing_parent_birth', pid: 900_012, ppid: 900_011, parentPid: 900_011,
+      childBirth: 30, parentBirth: null, parentCandidate: true, anchorPid: 900_010, additionIndex: 1,
+      ancestry: [
+        { pid: 900_012, ppid: 900_011, capturedBirth: null, censusIndex: 0 },
+        { pid: 900_011, ppid: 900_010, capturedBirth: null, censusIndex: 1 },
+        { pid: 900_010, ppid: process.pid, capturedBirth: 10, censusIndex: 2 },
+      ],
+      ancestryTruncated: false,
+    },
+  })
+  expect(f.aliveReads).toEqual([900_011])
+  expect(f.trees()).toBe(1)
+  expect(f.leafReads()).toBe(1)
+  expect(f.removed()).toBe(0)
+  expect(f.signalled).toEqual([])
+  expect(f.budgets.every(budget => budget > 0 && budget <= 5000)).toBe(true)
+})
+
+test('parent identity diagnostic projection bounds ancestry and excludes unrecognized nested fields', () => {
+  const ancestor = { pid: 900_012, ppid: 900_011, capturedBirth: null, censusIndex: 0, stderr: 'PRIVATE' }
+  const parentIdentity = {
+    reason: 'missing_parent_birth' as const, pid: 900_012, ppid: 900_011, parentPid: 900_011,
+    childBirth: 30, parentBirth: null, parentCandidate: true, anchorPid: 900_010, additionIndex: 1,
+    ancestry: Array.from({ length: 12 }, () => ancestor), ancestryTruncated: true,
+    executable: '/PRIVATE/path',
+  }
+  const error = new OpenCodeVersionProbeCleanupError(new Error('PRIVATE'), null, {
+    phase: 'addition_identity', guard: 'parent_identity', pendingCount: 0, parentIdentity,
+  })
+  const [diagnostic] = getOpenCodeVersionProbeDiagnostics(error)
+  expect(diagnostic).toMatchObject({
+    code: 'opencode_version_probe_cleanup_unknown', phase: 'addition_identity', guard: 'parent_identity',
+    parentIdentity: {
+      reason: 'missing_parent_birth', pid: 900_012, ppid: 900_011, parentPid: 900_011,
+      childBirth: 30, parentBirth: null, parentCandidate: true, anchorPid: 900_010, additionIndex: 1,
+      ancestry: Array.from({ length: 8 }, () => ({ pid: 900_012, ppid: 900_011, capturedBirth: null, censusIndex: 0 })),
+      ancestryTruncated: true,
+    },
+  })
+  expect(JSON.stringify(diagnostic)).not.toContain('PRIVATE')
 })
