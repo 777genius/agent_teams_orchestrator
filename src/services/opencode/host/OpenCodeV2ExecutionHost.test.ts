@@ -457,4 +457,60 @@ describe('execution host ownership and cleanup', () => {
     expect(exited).toBe(true)
     expect(ack).toBe(true)
   })
+  // A cold Windows runner can hold freshly delivered bytes under a transient AV
+  // scan: the held MAIN exits 1 with an access-denied stderr class before its
+  // module load completes. Only that closed class may retry a full acquisition;
+  // a persistent startup failure must surface unchanged after one attempt.
+  test('transient cold-start failures retry the acquisition while persistent failures surface unchanged', async () => {
+    const source = await readFile(new URL('./OpenCodeV2ExecutionHost.ts', import.meta.url), 'utf8')
+    const body = new Bun.Transpiler({ loader: 'ts' }).transformSync(source.slice(source.indexOf('async function acquireOwnedNativeLease(')))
+    let attempts = 0, firstKind = 'access_denied', laterKind = 'access_denied'
+    const scope = { executionAssert: (value: unknown, message?: string) => { if (!value) throw new Error(message ?? 'invalid') },
+      executionRecord: (value: unknown) => value, executionHash, randomUUID: () => 'TEST-lease',
+      randomBytes: () => ({ toString: () => 'TEST-password' }),
+      prepareOwnedNativeExecutionPlan: async (prepared: ValidatedExecutionNative, profile: SelectedExecutionProfile) =>
+        ({ native: prepared, profile, entry: '/TEST-entry', plan: { platform: 'win32', concrete: {} }, controllerStateRoots: [] }),
+      ownerFilesystemForWindowsPlan: () => ({ validateSelectedProfile: async () => {} }),
+      selectWindowsRunMemberPreflightForPlan: async () => null, consumeWindowsExecutionLaunchNonce: () => 'TEST-nonce',
+      bindWindowsExecutionSelectedConfig: async () => {}, closeWindowsExecutionPlan: async () => {},
+      recordOpenCodeV2ProviderFailure: async () => {}, retainOpenCodeV2CatalogServerFailure,
+      acquireExecutionProfileOwner: async () => ({ beforeSpawn: async () => {}, bindChild: async () => {},
+        abandonBeforeSpawn: async () => {}, release: async () => {} }),
+      boundOpenCodeRead: async <T>(work: Promise<T>) => work,
+      launchExecutionPlatform: () => {
+        const nativeStderrKind = attempts++ === 0 ? firstKind : laterKind
+        const startup = JSON.stringify({ event: 'opencode-v2-startup', reason: 'failed', stage: 'windows-prepare',
+          elapsedMs: 120, history: [{ stage: 'windows-prepare', elapsedMs: 120 }], nativeExitCode: 1, nativeStderrKind })
+        return { child: new EventEmitter(), prepare: async () => { throw new Error('execution_cancelled') },
+          output: () => ({ stdout: '', stderr: startup }), sendClose: () => {}, retire: async () => {} }
+      },
+    }
+    const built = new Function('scope', `const {${Object.keys(scope).join(',')}}=scope;${body};return { acquireOwnedNativeLease, retryTransientWindowsLaunch };`)(scope) as {
+      acquireOwnedNativeLease: typeof acquireExecutionLease; retryTransientWindowsLaunch: <T>(work: () => Promise<T>) => Promise<T> }
+    const selected: SelectedExecutionProfile = { root: '/TEST-profile', epoch: 'TEST-epoch', directory: '/TEST-project',
+      databasePath: '/TEST-profile/data/opencode.db', env: {}, envSha256: 'f'.repeat(64),
+      config: { directory: '/TEST-profile/config', content: '{}', sha256: 'f'.repeat(64) },
+      selection: { agent: 'worker', model: { providerID: 'TEST', id: 'model' }, permissions: [] } }
+    const run = async (first: string, later: string) => {
+      attempts = 0; firstKind = first; laterKind = later
+      try { await built.retryTransientWindowsLaunch(() => built.acquireOwnedNativeLease(native, selected, context)) }
+      catch (error) { return { attempts, error: error as Error & { startup?: Record<string, unknown> } } }
+      throw new Error('TEST-acquisition-must-fail')
+    }
+    // Transient then persistent: the transient attempt is retried through a
+    // complete re-acquisition, and the persistent attempt's own failure stands.
+    const mixed = await run('access_denied', 'bun_error')
+    expect(mixed.attempts).toBe(2)
+    expect(mixed.error.message).toBe('cleanup_unknown')
+    expect(mixed.error.startup?.nativeStderrKind).toBe('bun_error')
+    // A persistent class is never retried and its error is not masked.
+    const persistent = await run('bun_error', 'bun_error')
+    expect(persistent.attempts).toBe(1)
+    expect(persistent.error.startup?.nativeStderrKind).toBe('bun_error')
+    // The transient budget is three complete attempts, then the failure stands.
+    const exhausted = await run('access_denied', 'access_denied')
+    expect(exhausted.attempts).toBe(3)
+    expect(exhausted.error.startup?.nativeExitCode).toBe(1)
+    expect(exhausted.error.startup?.nativeStderrKind).toBe('access_denied')
+  })
 })

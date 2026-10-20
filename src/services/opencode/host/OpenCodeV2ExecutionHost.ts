@@ -108,14 +108,14 @@ async function executionResolutionMounts(sourceRoot: string, graph: ExecutionGra
 export async function acquireExecutionLease(validatedNative: ValidatedExecutionNative,
   selectedProfile: SelectedExecutionProfile, context: ExecutionContext, startupGate?: ExecutionStartupGate,
   graphValidation?: ExecutionGraphValidation): Promise<ExecutionLease> {
-  return acquireOwnedNativeLease(validatedNative, selectedProfile, context, startupGate, graphValidation)
+  return retryTransientWindowsLaunch(() => acquireOwnedNativeLease(validatedNative, selectedProfile, context, startupGate, graphValidation))
 }
 
 /** Finite catalog owner has no session/model admission and creates no execution proof. */
 export async function acquireOpenCodeV2CatalogLease(native: ValidatedExecutionNative,
   profile: CatalogExecutionProfile, context: ExecutionContext): Promise<ExecutionLease> {
   executionAssert(profile.selection.purpose === 'catalog', 'catalog_profile_required')
-  return acquireOwnedNativeLease(native, profile, context)
+  return retryTransientWindowsLaunch(() => acquireOwnedNativeLease(native, profile, context))
 }
 
 /** Internal preparation performs the real guards/plan without acquiring an owner or starting a server. */
@@ -325,6 +325,19 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
     return receipt
   })()
   const abort = () => { lifetime.abort(); void close().catch(() => undefined) }
+  // The closed startup synthesis rides the surfaced failure only to classify the
+  // transient Windows cold-start class. Raw child stderr bytes stay in the
+  // collector and never leave it.
+  const surfaced = (error: unknown): unknown => {
+    try {
+      if (!(error instanceof Error) || 'startup' in error) return error
+      const raw = launch?.output?.().stderr
+      const startup = raw ? JSON.parse(raw) : undefined
+      if (startup && typeof startup === 'object' && !Array.isArray(startup))
+        Object.defineProperty(error, 'startup', { value: startup, enumerable: false })
+    } catch { /* Diagnostics never mask the original failure. */ }
+    return error
+  }
   let ready: Promise<Record<string, unknown>>, graphReady: Promise<Record<string, unknown>>
   try {
     await serial(async () => {
@@ -470,24 +483,61 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
       // proof. Preserve ownership; only pre-launch cancellation may release.
       try { if (owner) await owner.abandonBeforeSpawn() } catch (ownerFailure) {
         await closeRetainedRoots().catch(() => undefined); await closePlanOnce().catch(() => undefined)
+        // An uncertain physical owner is never a retryable surface: no startup
+        // observation is attached, so the retry gate stays closed here.
         throw new Error('execution_owner_unknown', { cause: ownerFailure })
       }
       await closeRetainedRoots().catch(() => undefined)
       await closePlanOnce().catch(() => undefined)
-      throw failure
+      throw surfaced(failure)
     }
     // Begin finite failure persistence before potentially unresolved retirement.
     // Do not delay physical cleanup on diagnostic I/O.
     const earlyDiagnostic = process.platform === 'win32'
       ? recordOpenCodeV2ProviderFailure('execution-host-startup', failure, true, launch?.output?.().stderr, acquisitionTiming)
       : undefined
-    try { await close() } catch { throw new Error('cleanup_unknown', { cause: failure }) }
+    try { await close() } catch { throw surfaced(new Error('cleanup_unknown', { cause: failure })) }
     finally {
       if (earlyDiagnostic) await earlyDiagnostic
       // Unix children publish their finite stage while closing. Windows retains
       // the native phase measured before potentially unresolved retirement.
       else await recordOpenCodeV2ProviderFailure('execution-host-startup', failure, true, launch?.output?.().stderr, acquisitionTiming)
     }
-    throw failure
+    throw surfaced(failure)
   }
+}
+
+/** A cold Windows runner may hold freshly delivered bytes under a transient AV
+ * scan: the held MAIN exits 1 with an access-denied stderr classification before
+ * its module load completes. Only this closed class is ever retried — the last
+ * launch stage stays before 'windows-assert', so the prepare handshake never
+ * finished and no owner/nonce/plan state outlived the failed attempt. */
+function isTransientWindowsLaunchFailure(error: unknown): boolean {
+  try {
+    if (!(error instanceof Error)) return false
+    const startup = (error as Error & { startup?: unknown }).startup
+    if (!startup || typeof startup !== 'object' || Array.isArray(startup)) return false
+    const record = startup as Record<string, unknown>
+    return record.event === 'opencode-v2-startup' && record.reason === 'failed' &&
+      record.nativeExitCode === 1 && record.nativeStderrKind === 'access_denied' &&
+      typeof record.stage === 'string' && record.stage !== 'windows-assert'
+  } catch { return false }
+}
+/** Every retry is a complete acquisition: a fresh plan broker, native run state,
+ * owner record and launch nonce, so the one-shot launch bindings are never
+ * replayed. A persistent failure is surfaced unchanged after its first
+ * occurrence; after three transient attempts the original failure stands. */
+async function retryTransientWindowsLaunch<T>(work: () => Promise<T>): Promise<T> {
+  let result: { value: T } | undefined, failure: unknown
+  for (let attempt = 0; attempt < 3 && result === undefined; attempt++) {
+    try { result = { value: await work() } }
+    catch (error) {
+      failure = error
+      if (attempt < 2 && isTransientWindowsLaunchFailure(error))
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100)
+      else break
+    }
+  }
+  if (result === undefined) throw failure
+  return result.value
 }
