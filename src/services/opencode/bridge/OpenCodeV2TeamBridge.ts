@@ -402,6 +402,7 @@ async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: O
     }
     if (!bridge) return refusal(envelope, started, 'Exact V2 run owner is unknown; observation/stop cannot replace it.')
     let request: RunControlRequest
+    let transcriptMessageLimit: number | undefined
     if (envelope.command === 'opencode.listRuntimePermissions' && !text(body.memberName)) {
       const status = await bridge.call({ operation: 'status' }, remaining())
       executionAssert(status.kind === 'status' && status.state === 'active', 'run_owner_unknown')
@@ -466,9 +467,15 @@ async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: O
       case 'opencode.listRuntimePermissions': case 'opencode.getRuntimeTranscript': {
         const memberId = required(body.memberName, 'memberName')
         const member = await bridge.resolveMember(memberId, text(body.laneId), text(body.runtimeSessionId ?? body.sessionId), remaining())
-        if (envelope.command === 'opencode.getRuntimeTranscript') executionAssert(
-          ['2.0.0', '2.0.32'].includes(member.pin) && originalStatus?.qualification?.version === member.pin,
-          'v2_transcript_version_unsupported')
+        if (envelope.command === 'opencode.getRuntimeTranscript') {
+          executionAssert(
+            ['2.0.0', '2.0.32'].includes(member.pin) && originalStatus?.qualification?.version === member.pin,
+            'v2_transcript_version_unsupported')
+          const window = body.messageLimit
+          executionAssert(window === undefined || (typeof window === 'number' && Number.isSafeInteger(window) && window > 0),
+            'v2_transcript_limit_invalid')
+          transcriptMessageLimit = window as number | undefined
+        }
         request = { operation: envelope.command === 'opencode.listRuntimePermissions' ? 'permissions' : 'transcript',
           memberId, originalSessionId: member.originalSessionId }
         break
@@ -518,7 +525,7 @@ async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: O
     }
     if (result.kind === 'transcript') {
       executionAssert(request.operation === 'transcript', 'transcript_authority_conflict')
-      return respond(envelope, started, normalizeV2Transcript(result, request.originalSessionId), pin)
+      return respond(envelope, started, normalizeV2Transcript(result, request.originalSessionId, transcriptMessageLimit), pin)
     }
     return respond(envelope, started, result, pin)
   } catch (error) {

@@ -138,8 +138,13 @@ function projectMessage(message: ExecutionMessage, diagnostics: string[], sessio
 }
 
 /** Public DTO normalization only: never fabricates V1 wire messages, native
- * parent IDs, effect receipts, or settled turns from completed assistant text. */
-export function normalizeV2Transcript(result: { messages: ExecutionMessagePage; log: ExecutionLog }, sessionID: string): OpenCodeV2CanonicalTranscript {
+ * parent IDs, effect receipts, or settled turns from completed assistant text.
+ * An optional message window keeps only the latest normalized entries; the
+ * native cut itself always validates complete. */
+export function normalizeV2Transcript(result: { messages: ExecutionMessagePage; log: ExecutionLog }, sessionID: string,
+  messageLimit?: number): OpenCodeV2CanonicalTranscript {
+  executionAssert(messageLimit === undefined || (Number.isSafeInteger(messageLimit) && messageLimit > 0),
+    'v2_transcript_limit_invalid')
   executionAssert(/^ses_[A-Za-z0-9]+$/.test(sessionID) && result.messages.previous === null && result.messages.next === null &&
     result.messages.data.length <= 1600 && result.log.synced === true && result.log.events.length <= 4096,
   'v2_transcript_incomplete_cut')
@@ -162,7 +167,8 @@ export function normalizeV2Transcript(result: { messages: ExecutionMessagePage; 
     }
   }
   executionAssert(result.log.watermark === (result.log.events.at(-1)?.seq ?? null), 'v2_transcript_incomplete_watermark')
-  const messages = result.messages.data.map(message => projectMessage(message, diagnostics, sessionID))
+  const messages = (messageLimit === undefined ? result.messages.data : result.messages.data.slice(-messageLimit))
+    .map(message => projectMessage(message, diagnostics, sessionID))
   const latestUser = messages.filter(message => message.role === 'user').at(-1)
   const latestAssistant = messages.filter(message => message.role === 'assistant').at(-1)
   const summary: OpenCodeSessionReconcileSummary = { sessionId: sessionID, reconcileOutcome: 'reconciled', rawStatus: null,

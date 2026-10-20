@@ -162,4 +162,18 @@ describe('V2 canonical transcript protocol DTO', () => {
     const other = cut()
     expect(() => normalizeV2Transcript({ ...other, log: { ...other.log, watermark: 3 } }, sessionID)).toThrow('v2_transcript_incomplete_watermark')
   })
+  test('the latest-entry message window trims only projected messages and never the cut validation', () => {
+    const full = normalizeV2Transcript(cut(), sessionID)
+    expect(full.messages.map(message => message.id)).toEqual(['msg_TESTuser', 'msg_TESTassistant', 'msg_TESTterminal'])
+    const windowed = normalizeV2Transcript(cut(), sessionID, 2)
+    expect(windowed.messages.map(message => message.id)).toEqual(['msg_TESTassistant', 'msg_TESTterminal'])
+    expect(windowed.logProjection.toolCallCount).toBe(full.logProjection.toolCallCount)
+    const last = normalizeV2Transcript(cut(), sessionID, 1)
+    expect(last.messages.map(message => message.id)).toEqual(['msg_TESTterminal'])
+    expect(last.logProjection.toolCallCount).toBe(0)
+    // The terminal snapshot still validates against the complete cut.
+    expect(last.durableState).toBe(full.durableState)
+    for (const invalid of [0, -1, 1.5, Number.NaN]) expect(() => normalizeV2Transcript(cut(), sessionID, invalid))
+      .toThrow('v2_transcript_limit_invalid')
+  })
 })

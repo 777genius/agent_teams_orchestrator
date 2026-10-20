@@ -138,6 +138,24 @@ describe('runtime transcript original-owner routing', () => {
     expect(p.counts.legacyProject).toBe(0)
     expect(p.counts.v2).toBe(1)
   })
+  test('the V2 read carries the latest-entry message window to the original owner', async () => {
+    const p = ports()
+    p.value.executeV2 = async input => {
+      p.counts.v2++
+      const envelope = input as { requestId: string; command: string; body: unknown }
+      expect(envelope.body).toEqual({ teamId: selection.team, runId: selection.runId, laneId: selection.lane,
+        memberName: selection.member, runtimeSessionId: selection.sessionId, messageLimit: 1 })
+      return { schemaVersion: 1, ok: true, requestId: envelope.requestId, command: envelope.command,
+        runtime: { version: '2.0.32' }, data: normalized() }
+    }
+    await resolveRuntimeTranscriptProjection({ ...selection, limit: 1 }, p.value)
+    expect(p.counts.v2).toBe(1)
+  })
+  for (const invalid of [0, -1, 1.5, Number.NaN]) test(`non-positive or fractional message window ${String(invalid)} refuses before the round trip`, async () => {
+    const p = ports()
+    await expect(resolveRuntimeTranscriptProjection({ ...selection, limit: invalid }, p.value)).rejects.toThrow('v2_transcript_limit_invalid')
+    expect(p.counts.v2).toBe(0)
+  })
 })
 
 for (const pin of ['2.0.0', '2.0.32'] as const) test(`real fixed command reads normalized ${pin} owner without source/profile/host/probe`, async () => {
@@ -173,6 +191,12 @@ for (const pin of ['2.0.0', '2.0.32'] as const) test(`real fixed command reads n
     expect(operations).toEqual(['status', 'status', 'transcript'])
     expect(p.counts.legacyProject).toBe(0)
     for (const spy of forbiddenSpies) expect(spy).not.toHaveBeenCalled()
+    const pWindow = ports()
+    const windowed = await resolveRuntimeTranscriptProjection({ ...selection, limit: 1 },
+      { ...pWindow.value, executeV2: executeExistingOpenCodeV2TranscriptEnvelope })
+    expect(windowed.summary.messages.map(message => message.id)).toEqual(['msg_TESTassistant'])
+    expect(windowed.summary.messageCount).toBe(1)
+    expect(pWindow.counts.legacyProject).toBe(0)
     await expect(executeExistingOpenCodeV2TranscriptEnvelope({ schemaVersion: 1, requestId: 'TEST', command: 'opencode.sendMessage',
       cwd: '/TEST', startedAt: new Date().toISOString(), body: {} })).rejects.toThrow('v2_transcript_command_invalid')
     if (pin === '2.0.32') {

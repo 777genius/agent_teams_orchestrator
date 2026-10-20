@@ -6,7 +6,7 @@ import { executionAssert, executionRecord } from '../services/opencode/execution
 import type { OpenCodeLogProjection, OpenCodeSessionRecord, OpenCodeSessionReconcileSummary } from '../services/opencode/types.js'
 
 export type RuntimeTranscriptSelection = Readonly<{
-  team: string; member: string; lane?: string; sessionId?: string; runId?: string
+  team: string; member: string; lane?: string; sessionId?: string; runId?: string; limit?: number
 }>
 export type RuntimeTranscriptProjection = Readonly<{
   record: Readonly<{ opencodeSessionId: string; selectedModel?: string }>
@@ -62,11 +62,13 @@ async function readV2Transcript(selection: RuntimeTranscriptSelection, projectPa
   executionAssert(/^ses_[A-Za-z0-9]+$/.test(selection.sessionId) && path.isAbsolute(projectPath) && exactText(projectPath),
     'v2_transcript_identity_invalid')
   if (expectedPin !== undefined) executionAssert(supported(expectedPin), 'v2_transcript_version_unsupported')
+  const window = selection.limit
+  executionAssert(window === undefined || (Number.isSafeInteger(window) && window > 0), 'v2_transcript_limit_invalid')
   const envelope = { schemaVersion: 1 as const, requestId: `transcript-${randomUUID()}`,
     command: 'opencode.getRuntimeTranscript' as const, cwd: projectPath,
     startedAt: new Date().toISOString(), timeoutMs: 8000,
     body: { teamId: selection.team, runId: selection.runId, laneId: selection.lane, memberName: selection.member,
-      runtimeSessionId: selection.sessionId } }
+      runtimeSessionId: selection.sessionId, ...(window === undefined ? {} : { messageLimit: window }) } }
   const reply = executionRecord(await execute(envelope))
   executionAssert(reply.schemaVersion === 1 && reply.requestId === envelope.requestId && reply.command === envelope.command,
     'v2_transcript_response_invalid')
