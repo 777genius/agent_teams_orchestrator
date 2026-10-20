@@ -6,6 +6,7 @@ import {
 } from '../../bootstrap/state.js'
 import { AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV } from '../../utils/anthropicConnectionMode.js'
 import { applySafeConfigEnvironmentVariables } from '../../utils/managedEnv.js'
+import { getMainLoopModel } from '../../utils/model/model.js'
 import { resetSettingsCache } from '../../utils/settings/settingsCache.js'
 import {
   getAnthropicDefaultLaunchModel,
@@ -27,7 +28,7 @@ const envKeys = [
 ] as const
 
 function isolated(operation: () => void) {
-  const previous = new Map(envKeys.map((key) => [key, process.env[key]]))
+  const previous = { ...process.env }
   const flags = getFlagSettingsInline()
   try {
     for (const key of envKeys) delete process.env[key]
@@ -39,15 +40,50 @@ function isolated(operation: () => void) {
   } finally {
     setFlagSettingsInline(flags)
     resetSettingsCache()
-    for (const key of envKeys) {
-      const value = previous.get(key)
-      if (value === undefined) delete process.env[key]
-      else process.env[key] = value
+    for (const key of Object.keys(process.env)) {
+      if (!Object.hasOwn(previous, key)) delete process.env[key]
     }
+    Object.assign(process.env, previous)
   }
 }
 
 describe('effective inherited Anthropic model', () => {
+  test('restores settings-applied env outside the model-key list', () => {
+    const original = process.env.ANTHROPIC_BASE_URL
+    try {
+      delete process.env.ANTHROPIC_BASE_URL
+      isolated(() => {
+        setFlagSettingsInline({
+          env: { ANTHROPIC_BASE_URL: 'http://fixture-env-restore.invalid' },
+        })
+        resetSettingsCache()
+        applySafeConfigEnvironmentVariables()
+        expect(process.env.ANTHROPIC_BASE_URL).toBe(
+          'http://fixture-env-restore.invalid',
+        )
+      })
+      expect(process.env.ANTHROPIC_BASE_URL).toBeUndefined()
+    } finally {
+      if (original === undefined) delete process.env.ANTHROPIC_BASE_URL
+      else process.env.ANTHROPIC_BASE_URL = original
+    }
+  })
+
+  test.each(['env', 'settings'] as const)(
+    'whitespace-only %s model resolves like the actual runtime launch',
+    (source) =>
+      isolated(() => {
+        if (source === 'env') process.env.ANTHROPIC_MODEL = ' \t '
+        else setFlagSettingsInline({ model: ' \t ' })
+        resetSettingsCache()
+        const catalog = { defaultLaunchModel: 'catalog-recommendation' }
+        const launchModel = getMainLoopModel()
+        expect(launchModel).not.toBe(catalog.defaultLaunchModel)
+        expect(getAnthropicDefaultLaunchModel(catalog)).toBe(launchModel)
+        expect(getAnthropicEffectiveDefaultModel(catalog)).toBe(launchModel)
+      }),
+  )
+
   test('applied env wins over saved model and catalog recommendation', () =>
     isolated(() => {
       process.env.ANTHROPIC_MODEL = 'gateway-selected'

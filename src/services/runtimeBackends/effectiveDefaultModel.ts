@@ -12,8 +12,8 @@ export function getAnthropicDefaultLaunchModel(
   const provider = getAPIProvider()
   if (provider === 'openai' || provider === 'gemini') return null
   const configured = getUserSpecifiedModelSetting()
-  return typeof configured === 'string' && configured.trim()
-    ? parseUserSpecifiedModel(configured.trim())
+  return typeof configured === 'string'
+    ? parseUserSpecifiedModel(configured)
     : catalog?.defaultLaunchModel?.trim() || null
 }
 
