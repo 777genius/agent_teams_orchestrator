@@ -233,7 +233,8 @@ describe('execution host ownership and cleanup', () => {
     // Execute the private production function body with physical ports replaced;
     // this checks its actual ticket boundaries without launching a native child.
     const source = await readFile(new URL('./OpenCodeV2ExecutionHost.ts', import.meta.url), 'utf8')
-    const body = new Bun.Transpiler({ loader: 'ts' }).transformSync(source.slice(source.indexOf('async function acquireOwnedNativeLease(')))
+    const body = new Bun.Transpiler({ loader: 'ts' }).transformSync(
+      source.slice(source.indexOf('async function acquireOwnedNativeLease(')).replaceAll('export ', ''))
     const reader = new Bun.Transpiler({ loader: 'ts' }).transformSync(source.slice(source.indexOf('export function readExecutionCleanupObservation('),
       source.indexOf('export function requireExecutionEndpoint(')).replaceAll('export ', ''))
     const cleanupObservations = new WeakMap<object, () => ExecutionCleanupObservation | undefined>()
@@ -463,7 +464,8 @@ describe('execution host ownership and cleanup', () => {
   // a persistent startup failure must surface unchanged after one attempt.
   test('transient cold-start failures retry the acquisition while persistent failures surface unchanged', async () => {
     const source = await readFile(new URL('./OpenCodeV2ExecutionHost.ts', import.meta.url), 'utf8')
-    const body = new Bun.Transpiler({ loader: 'ts' }).transformSync(source.slice(source.indexOf('async function acquireOwnedNativeLease(')))
+    const body = new Bun.Transpiler({ loader: 'ts' }).transformSync(
+      source.slice(source.indexOf('async function acquireOwnedNativeLease(')).replaceAll('export ', ''))
     let attempts = 0, firstKind = 'access_denied', laterKind = 'access_denied'
     const scope = { executionAssert: (value: unknown, message?: string) => { if (!value) throw new Error(message ?? 'invalid') },
       executionRecord: (value: unknown) => value, executionHash, randomUUID: () => 'TEST-lease',
@@ -493,24 +495,37 @@ describe('execution host ownership and cleanup', () => {
       selection: { agent: 'worker', model: { providerID: 'TEST', id: 'model' }, permissions: [] } }
     const run = async (first: string, later: string) => {
       attempts = 0; firstKind = first; laterKind = later
-      try { await built.retryTransientWindowsLaunch(() => built.acquireOwnedNativeLease(native, selected, context)) }
-      catch (error) { return { attempts, error: error as Error & { startup?: Record<string, unknown> } } }
+      const gated: unknown[] = []
+      // The run owner's gate classifies the failure exactly as it crosses. An
+      // unmarked error here is what poisoned the gate's own cancellation of the
+      // retrying acquisition before its second attempt.
+      const gate = async <T>(work: () => Promise<T>): Promise<T> => {
+        try { return await work() } catch (error) { gated.push(error); throw error }
+      }
+      try { await built.retryTransientWindowsLaunch(() => built.acquireOwnedNativeLease(native, selected, context, gate)) }
+      catch (error) { return { attempts, gated, error: error as Error & { startup?: Record<string, unknown> } } }
       throw new Error('TEST-acquisition-must-fail')
     }
+    const kinds = (gated: unknown[]) => gated.map(value =>
+      (value as { startup?: { nativeStderrKind?: unknown } }).startup?.nativeStderrKind)
     // Transient then persistent: the transient attempt is retried through a
     // complete re-acquisition, and the persistent attempt's own failure stands.
     const mixed = await run('access_denied', 'bun_error')
     expect(mixed.attempts).toBe(2)
     expect(mixed.error.message).toBe('cleanup_unknown')
     expect(mixed.error.startup?.nativeStderrKind).toBe('bun_error')
+    // The closed startup synthesis already rides every failure at the gate.
+    expect(kinds(mixed.gated)).toEqual(['access_denied', 'bun_error'])
     // A persistent class is never retried and its error is not masked.
     const persistent = await run('bun_error', 'bun_error')
     expect(persistent.attempts).toBe(1)
     expect(persistent.error.startup?.nativeStderrKind).toBe('bun_error')
+    expect(kinds(persistent.gated)).toEqual(['bun_error'])
     // The transient budget is three complete attempts, then the failure stands.
     const exhausted = await run('access_denied', 'access_denied')
     expect(exhausted.attempts).toBe(3)
     expect(exhausted.error.startup?.nativeExitCode).toBe(1)
     expect(exhausted.error.startup?.nativeStderrKind).toBe('access_denied')
+    expect(kinds(exhausted.gated)).toEqual(['access_denied', 'access_denied', 'access_denied'])
   })
 })

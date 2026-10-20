@@ -226,7 +226,12 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
   mark('prepared')
   const { native, profile, entry, plan, controllerStateRoots } = prepared
   const gatedWindows = plan.platform === 'win32' && !!startupGate
-  const serial = async <T>(work: () => Promise<T>): Promise<T> => startupGate ? startupGate(work, context.signal) : work()
+  // The gate cancels sibling acquisitions on a final failure only. Mark the
+  // closed startup synthesis on each failure as it crosses the gate, so a
+  // transient cold-start class stays retryable underneath the gate.
+  const serial = async <T>(work: () => Promise<T>): Promise<T> => startupGate
+    ? startupGate(async () => { try { return await work() } catch (error) { throw surfaced(error) } }, context.signal)
+    : work()
   let nonce: string | undefined
   const leaseOwnerId = randomUUID(), password = randomBytes(32).toString('base64url')
   let ownerIdentity: { hostInstanceId: string; leaseOwnerId: string; graphSha256: string }
@@ -512,7 +517,7 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
  * its module load completes. Only this closed class is ever retried — the last
  * launch stage stays before 'windows-assert', so the prepare handshake never
  * finished and no owner/nonce/plan state outlived the failed attempt. */
-function isTransientWindowsLaunchFailure(error: unknown): boolean {
+export function isTransientWindowsLaunchFailure(error: unknown): boolean {
   try {
     if (!(error instanceof Error)) return false
     const startup = (error as Error & { startup?: unknown }).startup
@@ -534,7 +539,8 @@ async function retryTransientWindowsLaunch<T>(work: () => Promise<T>): Promise<T
     catch (error) {
       failure = error
       if (attempt < 2 && isTransientWindowsLaunchFailure(error))
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100)
+        // The AV scan holding fresh bytes settles in seconds, not milliseconds.
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, attempt === 0 ? 500 : 1500)
       else break
     }
   }

@@ -437,6 +437,33 @@ test('Windows parent failure aborts queued native starts and drains the late ori
   } finally { physical.release(); failParent.release(); await f.close() }
 })
 
+// A transient cold-start class is retried inside one acquisition, so its first
+// failure must not cancel the run's queued physical starts at the gate: the
+// retry's second attempt would die on its own poisoned signal before its first
+// check. A final failure keeps the original cancellation of every queued start.
+test('Windows transient cold-start failure at the startup gate spares queued starts while a final failure cancels them', async () => {
+  const f = await fixture()
+  try {
+    await f.owner.ready()
+    const owner = f.owner as unknown as {
+      startupGate: <T>(start: () => Promise<T>, signal: AbortSignal | undefined, deadline: number) => Promise<T>
+      initializationAbort: AbortController; acquisitions: Set<AbortController> }
+    const queued = new AbortController()
+    owner.acquisitions.add(queued)
+    const failure = (nativeStderrKind: string) => Object.assign(new Error('execution_cancelled'), { startup: {
+      event: 'opencode-v2-startup', reason: 'failed', stage: 'windows-prepare', elapsedMs: 120, history: [],
+      nativeExitCode: 1, nativeStderrKind } })
+    const transient = failure('access_denied')
+    await expect(owner.startupGate(async () => { throw transient }, undefined, Date.now() + 60_000)).rejects.toBe(transient)
+    expect(owner.initializationAbort.signal.aborted).toBe(false)
+    expect(queued.signal.aborted).toBe(false)
+    const final = failure('bun_error')
+    await expect(owner.startupGate(async () => { throw final }, undefined, Date.now() + 60_000)).rejects.toBe(final)
+    expect(owner.initializationAbort.signal.aborted).toBe(true)
+    expect(queued.signal.aborted).toBe(true)
+  } finally { await f.close() }
+})
+
 test('Windows stop refuses queued acquisition and joins the late original lease', async () => {
   const gate = acquisitionGate(), started: string[] = [], signals: AbortSignal[] = []
   const f = await fixture({ windowsAcquisitions: true, memberCount: 3, acquisition: async (member, signal) => {

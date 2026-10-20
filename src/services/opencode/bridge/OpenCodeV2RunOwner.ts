@@ -13,7 +13,7 @@ import { isMutableExecutionReadback } from '../execution/OpenCodeV2TerminalSettl
 import { OpenCodeV2AdmissionStore } from '../execution/OpenCodeV2AdmissionStore.js'
 import { OpenCodeV2SessionService, verifyExecutionSession } from '../execution/OpenCodeV2SessionService.js'
 import { canonicalExecutionJSON, executionAssert, executionHash, executionRecord, OPEN_CODE_V2_WINDOWS_CLOSE_MS, type ExecutionContext, type SessionAuthority } from '../execution/OpenCodeV2ExecutionContracts.js'
-import { acquireExecutionLease, awaitExecutionHostReady, readExecutionCleanupObservation, readExecutionLeaseObservation, type ExecutionLease } from '../host/OpenCodeV2ExecutionHost.js'
+import { acquireExecutionLease, awaitExecutionHostReady, isTransientWindowsLaunchFailure, readExecutionCleanupObservation, readExecutionLeaseObservation, type ExecutionLease } from '../host/OpenCodeV2ExecutionHost.js'
 import { createExecutionGraphValidationCohort } from '../host/OpenCodeV2ExecutionBinding.js'
 import { isExecutionCleanupReceipt, type ExecutionCleanupReceipt } from '../host/OpenCodeV2ExecutionLifecycle.js'
 import { createOpenCodeV2ExecutionClient, type ExecutionBridgeClient, type ExecutionLog, type ExecutionMessagePage } from '../transport/OpenCodeV2ExecutionClientFactory.js'
@@ -87,9 +87,13 @@ export class OpenCodeV2RunOwner {
       executionAssert(Date.now() < deadline, 'run_stopped')
       return await start()
     } catch (error) {
-      // Abort queued physical starts before releasing this original ticket.
-      this.initializationAbort.abort(error)
-      for (const acquisition of this.acquisitions) acquisition.abort(error)
+      // A transient cold-start class is still retried inside this acquisition.
+      // Abort queued physical starts only on the final failure: cancelling the
+      // retrying acquisition here would poison its own next attempt.
+      if (!isTransientWindowsLaunchFailure(error)) {
+        this.initializationAbort.abort(error)
+        for (const acquisition of this.acquisitions) acquisition.abort(error)
+      }
       throw error
     } finally { release() }
   }
