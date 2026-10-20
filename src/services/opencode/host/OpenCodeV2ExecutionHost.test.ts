@@ -595,4 +595,64 @@ describe('execution host ownership and cleanup', () => {
     expect(retained.error.startup?.nativeStderrKind).toBe('access_denied')
     expect(fence).toBe(true)
   })
+  // The unbound proof races the launch-owned native retirement, whose own
+  // kill-and-empty wait may legally run 12s on a cold AV-torn runner. A proof
+  // bound shorter than that work abandons a claim still in flight, retains the
+  // fence, and converts the transient class into a misleading owner refusal.
+  test('the unbound retirement proof outlives the native kill-and-empty wait', async () => {
+    const source = await readFile(new URL('./OpenCodeV2ExecutionHost.ts', import.meta.url), 'utf8')
+    const body = new Bun.Transpiler({ loader: 'ts' }).transformSync(
+      source.slice(source.indexOf('async function acquireOwnedNativeLease(')).replaceAll('export ', ''))
+    let attempts = 0, fence = false, spawned = false
+    const startup = JSON.stringify({ event: 'opencode-v2-startup', reason: 'failed', stage: 'windows-prepare',
+      elapsedMs: 120, history: [{ stage: 'windows-prepare', elapsedMs: 120 }], nativeExitCode: 1, nativeStderrKind: 'access_denied' })
+    const scope = { executionAssert: (value: unknown, message?: string) => { if (!value) throw new Error(message ?? 'invalid') },
+      executionRecord: (value: unknown) => value, executionHash, randomUUID: () => 'TEST-lease',
+      randomBytes: () => ({ toString: () => 'TEST-password' }),
+      prepareOwnedNativeExecutionPlan: async (prepared: ValidatedExecutionNative, profile: SelectedExecutionProfile) =>
+        ({ native: prepared, profile, entry: '/TEST-entry', plan: { platform: 'win32', concrete: {} }, controllerStateRoots: [] }),
+      ownerFilesystemForWindowsPlan: () => ({ validateSelectedProfile: async () => {} }),
+      selectWindowsRunMemberPreflightForPlan: async () => null, consumeWindowsExecutionLaunchNonce: () => 'TEST-nonce',
+      bindWindowsExecutionSelectedConfig: async () => {}, closeWindowsExecutionPlan: async () => {},
+      recordOpenCodeV2ProviderFailure: async () => {}, retainOpenCodeV2CatalogServerFailure,
+      acquireExecutionProfileOwner: async () => {
+        if (fence) throw new Error('execution_profile_owned')
+        fence = true; spawned = false
+        return { beforeSpawn: async () => { spawned = true }, bindChild: async () => {},
+          abandonBeforeSpawn: async () => { if (spawned) throw new Error('execution_owner_unknown'); fence = false },
+          release: async () => { fence = false },
+          abandonAfterUnboundSpawn: async (evidence: unknown) => {
+            if (!evidence || (evidence as { scopeEmpty?: unknown }).scopeEmpty !== true) throw new Error('execution_owner_unknown')
+            fence = false } }
+      },
+      // The real bounded read under test: a proof is only ever claimed by work
+      // that settles inside its bound.
+      boundOpenCodeRead,
+      launchExecutionPlatform: () => {
+        const slow = attempts++ === 0
+        return { child: new EventEmitter(), prepare: async () => { throw new Error('execution_cancelled') },
+          output: () => ({ stdout: '', stderr: startup }), sendClose: () => {},
+          retire: async () => {
+            // The first native retirement holds its kill-and-empty wait past
+            // any proof bound shorter than the native retirement budget.
+            if (slow) await new Promise(resolve => setTimeout(resolve, 8000))
+            return { scopeEmpty: true, heldProcessExited: true, scopeClosed: false }
+          } }
+      },
+    }
+    const built = new Function('scope', `const {${Object.keys(scope).join(',')}}=scope;${body};return { acquireOwnedNativeLease, retryTransientWindowsLaunch };`)(scope) as {
+      acquireOwnedNativeLease: typeof acquireExecutionLease; retryTransientWindowsLaunch: <T>(work: () => Promise<T>) => Promise<T> }
+    const selected: SelectedExecutionProfile = { root: '/TEST-profile', epoch: 'TEST-epoch', directory: '/TEST-project',
+      databasePath: '/TEST-profile/data/opencode.db', env: {}, envSha256: 'f'.repeat(64),
+      config: { directory: '/TEST-profile/config', content: '{}', sha256: 'f'.repeat(64) },
+      selection: { agent: 'worker', model: { providerID: 'TEST', id: 'model' }, permissions: [] } }
+    let error: Error & { startup?: Record<string, unknown> } | undefined
+    try { await built.retryTransientWindowsLaunch(() => built.acquireOwnedNativeLease(native, selected, context)) }
+    catch (failure) { error = failure as Error & { startup?: Record<string, unknown> } }
+    // The slow first proof is still minted, so its fence is freed and the
+    // transient class reaches its full three-attempt budget.
+    expect(error?.startup?.nativeStderrKind).toBe('access_denied')
+    expect(attempts).toBe(3)
+    expect(fence).toBe(false)
+  }, 30_000)
 })
