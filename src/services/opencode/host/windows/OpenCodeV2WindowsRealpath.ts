@@ -98,7 +98,8 @@ const utf16 = (value: string): Buffer => Buffer.from(`${value}\0`, 'utf16le')
 const errorFacts = (buffer: Buffer): { operation: number; win32: number } =>
   ({ operation: buffer.readUInt32LE(0), win32: buffer.readUInt32LE(4) })
 const initializationError = (value: Diagnostics): Error =>
-  new Error(`windows_realpath_initialization_failed status=${value.status} operation=${value.operation} win32=${value.win32}`)
+  Object.assign(new Error(`windows_realpath_initialization_failed status=${value.status} operation=${value.operation} win32=${value.win32}`),
+    { status: value.status, operation: value.operation, win32: value.win32 })
 
 function isPermissionError(error: unknown): boolean {
   return typeof error === 'object' && error !== null &&

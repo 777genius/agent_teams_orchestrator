@@ -109,15 +109,22 @@ function childRealpathSelection(input: Record<string, unknown>, nativeBirth: Rec
   assert(receipt.nonce === input.nonce && receipt.receiptId === `windows-anchors:${suffix}` && Array.isArray(receipt.anchors) && receipt.anchors.length > 0 && receipt.anchors.length <= 4096)
   assert(dll.nonce === input.nonce && dll.receiptId === `windows-dll:${suffix}` && dll.held === true && typeof dll.path === 'string' && path.win32.isAbsolute(dll.path) && typeof dll.sha256 === 'string' && /^[a-f0-9]{64}$/.test(dll.sha256) && typeof dll.fileId === 'string' && /^[a-f0-9]{32}$/.test(dll.fileId))
   uint64(dll.volumeSerial)
-  const seen = new Set<string>()
-  const anchors = receipt.anchors.map(value => {
+  const seen = new Set<string>(), objects = new Set<string>()
+  const anchors: Readonly<{ dosPath: string; ntPath: string; volumeSerial: bigint; fileId: string }>[] = []
+  for (const value of receipt.anchors) {
     const anchor = record(value)
     assert((anchor.kind === 'readOnly' || anchor.kind === 'writable' || anchor.kind === 'metadata') && typeof anchor.admittedPath === 'string' && typeof anchor.dosPath === 'string' && path.win32.isAbsolute(anchor.dosPath) && path.win32.relative(anchor.admittedPath, anchor.dosPath) === '')
     assert(typeof anchor.ntPath === 'string' && anchor.ntPath.startsWith('\\Device\\') && anchor.ntPath.length <= 32767 && !anchor.ntPath.includes('\0') && anchor.ntPath.slice(1).split('\\').every(segment => segment !== '' && segment !== '.' && segment !== '..'))
     assert(typeof anchor.fileId === 'string' && /^[a-f0-9]{32}$/.test(anchor.fileId))
     const key = `${anchor.kind}:${anchor.admittedPath}`; assert(!seen.has(key)); seen.add(key)
-    return Object.freeze({ dosPath: anchor.dosPath, ntPath: anchor.ntPath, volumeSerial: uint64(anchor.volumeSerial), fileId: anchor.fileId })
-  })
+    const entry = Object.freeze({ dosPath: anchor.dosPath, ntPath: anchor.ntPath, volumeSerial: uint64(anchor.volumeSerial), fileId: anchor.fileId })
+    // The native DLL holds one anchor per physical object and refuses a second
+    // admission of the same object outright. Distinct plan roots can resolve to
+    // one object; those spellings collapse here before the native selection.
+    const object = `${entry.volumeSerial}:${entry.fileId}`
+    if (objects.has(object)) continue
+    objects.add(object); anchors.push(entry)
+  }
   realpathReceiptId = dll.receiptId as string
   return Object.freeze({ dllPath: dll.path, expectedPid: process.pid, expectedCreationFiletime: uint64(nativeBirth.value), anchors: Object.freeze(anchors) })
 }
@@ -129,6 +136,18 @@ function closeWindowsRealpath(): Promise<void> {
   })
 }
 let prepared: Readonly<{ type: 'prepared'; nonce: string; leaseOwnerId: string; pid: number; birth: ExecutionBirth; namespace: string; executableSha256: string; realpathInstalled: string }> | undefined
+const startupErrno = new Set(['EPERM', 'EACCES', 'ENOENT', 'ENOTDIR', 'EISDIR', 'EINVAL', 'UNKNOWN', 'EIO', 'ENOSYS'])
+const win32Errno: Record<number, string> = { 2: 'ENOENT', 3: 'ENOENT', 5: 'EACCES', 87: 'EINVAL' }
+/** Closed projection of a realpath refusal: the raw native message and its
+ * facts stay inside the runner, only this vocabulary reaches the startup row. */
+function closedRealpathInstallFailure(error: unknown): Error {
+  const failure = new Error('execution_realpath_install_failed') as Error & { code?: string }
+  const source = error as { code?: unknown; win32?: unknown } | null | undefined
+  const code = typeof source?.code === 'string' && startupErrno.has(source.code) ? source.code
+    : typeof source?.win32 === 'number' && Number.isSafeInteger(source.win32) ? win32Errno[source.win32] ?? 'UNKNOWN' : undefined
+  if (code) failure.code = code
+  return failure
+}
 export async function prepareWindowsExecutionChild(value: unknown) {
   assert(!preparing && !prepared && value && typeof value === 'object' && !Array.isArray(value))
   const captured = authenticatedPrepares.get(value)
@@ -143,8 +162,11 @@ export async function prepareWindowsExecutionChild(value: unknown) {
   // Capture and validate the original authenticated prepare message. The
   // private singleton cannot be installed from a replay or public caller DTO.
   const selection = childRealpathSelection(record, nativeBirth)
-  const { installWindowsRealpathFallback } = await import('./OpenCodeV2WindowsRealpath.js')
-  realpathInstallation = installWindowsRealpathFallback(selection)
+  let install: (selection: WindowsRealpathSelection) => WindowsRealpathInstallation
+  try { ({ installWindowsRealpathFallback: install } = await import('./OpenCodeV2WindowsRealpath.js')) }
+  catch { throw new Error('execution_realpath_unavailable') }
+  try { realpathInstallation = install(selection) }
+  catch (error) { throw closedRealpathInstallFailure(error) }
   assert(realpathReceiptId)
   prepared = Object.freeze({ type: 'prepared', nonce: String(record.nonce), leaseOwnerId: String(record.leaseOwnerId), pid: process.pid,
     birth: Object.freeze({ format: 'windows-filetime', value: nativeBirth.value, bootId: null }), namespace: String(record.namespace), executableSha256: record.executableSha256, realpathInstalled: realpathReceiptId })
