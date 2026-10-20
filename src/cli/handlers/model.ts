@@ -12,6 +12,7 @@ import {
   selectOpenCodeDefaultAgentModel,
 } from '../../services/opencode/OpenCodeAgentModelCompatibility.js'
 import { getAnthropicRuntimeModelCatalog } from '../../services/runtimeBackends/anthropicCatalog.js'
+import { getAnthropicDefaultLaunchModel } from '../../services/runtimeBackends/effectiveDefaultModel.js'
 import { getCodexRuntimeModelCatalog } from '../../services/runtimeBackends/codexModelCatalog.js'
 import { jsonStringify } from '../../utils/slowOperations.js'
 
@@ -102,7 +103,7 @@ export async function getProviderModels(
       {
         const catalog = await getAnthropicRuntimeModelCatalog()
         return {
-          defaultModel: catalog.defaultLaunchModel ?? 'opus[1m]',
+          defaultModel: getAnthropicDefaultLaunchModel(catalog) ?? catalog.defaultLaunchModel ?? 'opus[1m]',
           displayName: 'Anthropic',
           models: catalog.models.map((model) => ({
             id: model.launchModel,

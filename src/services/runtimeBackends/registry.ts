@@ -55,6 +55,7 @@ import {
   isAnthropicCompatibleRuntimeBaseUrl,
 } from './anthropicCatalog.js'
 import { getAnthropicSubscriptionRateLimitSnapshotForRuntimeStatus } from './anthropicSubscriptionRateLimits.js'
+import { getAnthropicEffectiveDefaultModel } from './effectiveDefaultModel.js'
 import {
   type AnthropicRuntimeBackendInfo,
   buildAnthropicRuntimeStatus,
@@ -455,6 +456,7 @@ async function buildAnthropicStatus(
         })
     : null
   return buildAnthropicRuntimeStatus({
+    effectiveDefaultModel: getAnthropicEffectiveDefaultModel(modelCatalog),
     auth: anthropicAuth,
     modelCatalog,
     visibleModels: getAnthropicVisibleRuntimeModels(modelCatalog),
@@ -506,6 +508,7 @@ async function buildAnthropicSummaryStatus(
     availableBackends: [],
     externalRuntimeDiagnostics: [],
     models: summaryModels,
+    effectiveDefaultModel: getAnthropicEffectiveDefaultModel(),
     subscriptionRateLimits: null,
     runtimeCapabilities: {
       modelCatalog: {
