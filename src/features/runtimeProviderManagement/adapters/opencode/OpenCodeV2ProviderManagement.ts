@@ -1,3 +1,5 @@
+import { recordOpenCodeV2ProviderFailure } from '../../../../services/opencode/execution/OpenCodeV2Diagnostics.js'
+export { recordOpenCodeV2ProviderFailure } from '../../../../services/opencode/execution/OpenCodeV2Diagnostics.js'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createHash, randomUUID } from 'node:crypto'
@@ -266,39 +268,4 @@ export async function retireOpenCodeV2CatalogOwner(wire: { dispose(): Promise<vo
     try { await lease.close() } catch (error) { retirementError = error }
   }
   if (transportError || retirementError) throw new AggregateError([transportError, retirementError].filter(Boolean), 'provider_physical_cleanup_unknown')
-}
-
-const privateProviderFailureCodes = new Set(['provider_missing', 'provider_key_method_unsupported', 'provider_existing_credentials_unsupported',
-  'provider_catalog_scope_changed', 'provider_catalog_location_changed', 'provider_integration_changed', 'provider_credential_identity_changed',
-  'provider_owned_connection_unknown', 'provider_active_connection_changed', 'provider_auth_publication_changed', 'provider_auth_publication_unknown',
-  'provider_selected_model_missing', 'provider_original_connect_unknown', 'provider_original_execution_pending', 'provider_execution_target_changed',
-  'provider_saved_proof_changed', 'provider_saved_proof_unqualified', 'provider_physical_cleanup_unknown', 'provider_mutation_unknown',
-  'provider_response_invalid', 'provider_authority_changed', 'provider_directory_changed', 'provider_rollback_peer_changed',
-  'provider_rollback_publication_changed', 'provider_rollback_unknown', 'provider_rollback_publication_unknown',
-  'run_control_timeout', 'run_control_disconnected', 'run_control_changed', 'run_control_foreign', 'run_control_invalid',
-  'run_control_frame_too_large', 'run_owner_stale', 'run_process_unknown', 'run_process_changed',
-  'run_deadline_expired', 'run_readiness_changed', 'run_readiness_unknown', 'run_operation_unknown',
-  'execution_selected_auth_required', 'execution_selected_auth_unbound', 'execution_selected_auth_changed',
-  'execution_selected_auth_missing', 'execution_selected_auth_unsupported', 'execution_selected_auth_location_changed',
-  'execution_selected_auth_provider_unknown', 'execution_selected_auth_existing_or_unsupported',
-  'execution_selected_auth_readback_unknown', 'execution_selected_auth_profile_changed',
-  'execution_lease_not_owned', 'execution_host_unavailable', 'execution_invalid_response', 'execution_identity_mismatch',
-  'execution_profile_changed', 'execution_graph_changed', 'execution_graph_incomplete', 'execution_graph_dependency_missing',
-  'execution_timeout', 'execution_owner_unknown', 'cleanup_unknown', 'selection_mismatch', 'authority_mismatch',
-  'graph_mismatch', 'identity_mismatch', 'unqualified_version', 'invalid_response', 'invalid_model',
-  'http_failure', 'transport_failure', 'media_type', 'deadline', 'authority_or_deadline', 'disposed'])
-/** Private static phase/category only: never an arbitrary SDK message, body, credential or key. */
-export async function recordOpenCodeV2ProviderFailure(phase: string, error: unknown, retainedOriginal: boolean): Promise<void> {
-  // Only our finite cleanup wrappers may preserve one exact known cause.
-  const cause = error instanceof Error && (error.message === 'cleanup_unknown' || error.message === 'execution_owner_unknown')
-    ? error.cause : undefined
-  const category = cause instanceof Error && privateProviderFailureCodes.has(cause.message) ? cause.message
-    : error instanceof Error && privateProviderFailureCodes.has(error.message) ? error.message : 'provider_operation_unknown'
-  try {
-    const directory = path.join(resolveClaudeMultimodelPaths().data, 'opencode/v2/provider-diagnostics')
-    await mkdir(directory, { recursive: true, mode: 0o700 })
-    const info = await lstat(directory)
-    executionAssert(info.isDirectory() && !info.isSymbolicLink() && info.uid === process.getuid?.() && (info.mode & 0o077) === 0, 'provider_diagnostics_foreign')
-    await writeFile(path.join(directory, randomUUID() + '.json'), JSON.stringify({ schemaVersion: 1, phase, category, retainedOriginal, recordedAt: new Date().toISOString() }), { flag: 'wx', mode: 0o600 })
-  } catch { /* Diagnostics cannot replace or retry the unresolved original operation. */ }
 }

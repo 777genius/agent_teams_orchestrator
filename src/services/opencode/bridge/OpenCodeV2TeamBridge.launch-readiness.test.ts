@@ -11,52 +11,47 @@ test('launch waits for original native members under one deadline before returni
     Date.now = () => clock
     const binding = { teamId: 'TEST-launch', runId: 'TEST-run', controllerInstanceId: 'TEST-controller', ownerId: 'TEST-owner' }
     const qualification = { capabilitySnapshotId: 'TEST-capability', expectedBehaviorFingerprint: 'a'.repeat(64),
-      binaryPath: '/TEST/native', binaryFingerprint: 'TEST-binary', version: '2.0.21' }
+      binaryPath: '/TEST/native', binaryFingerprint: 'TEST-binary', version: '2.0.32' }
     const owner = { binding, deadline: 10000 }
     const members = ['one', 'two'].map(memberId => ({ memberId, laneId: 'primary', originalSessionId: 'ses_' + memberId,
-      native: { version: '2.0.21' }, profile: { selection: { model: { providerID: 'TEST', id: 'model', variant: 'default' } } } }))
+      native: { version: '2.0.32' }, profile: { selection: { model: { providerID: 'TEST', id: 'model', variant: 'default' } } } }))
     const nativeMembers = members.map(member => ({ memberId: member.memberId, laneId: member.laneId,
       originalSessionId: member.originalSessionId, opencodeSessionId: member.originalSessionId, runtimeSessionId: member.originalSessionId,
-      selectedModel: 'TEST/model', selectedVariant: 'default', pin: '2.0.21', runtimePid: member.memberId === 'one' ? 123 : 124,
+      selectedModel: 'TEST/model', selectedVariant: 'default', pin: '2.0.32', runtimePid: member.memberId === 'one' ? 123 : 124,
       state: 'accepted', bootstrap: { verified: true, strategy: 'instruction-entry', missingNativeMessageID: true },
       controllerTools: { server: 'agent-teams', nativeNames: ['message_send'], schemasHash: 'b'.repeat(64) } }))
-    let waits = [], finalReads = 0, launches = 0
+    let budgets = [], launches = 0, discoveries = 0
     const factoryModule = await import(${JSON.stringify(factory)})
     mock.module(${JSON.stringify(factory)}, () => ({ ...factoryModule,
-      inspectOpenCodeRuntimeAdapterSelection: async () => ({ policy: { generation: 'v2', version: '2.0.21' } }) }))
-    const planModule = await import(${JSON.stringify(plans)})
-    mock.module(${JSON.stringify(plans)}, () => ({ ...planModule, createOpenCodeV2LaunchPlan: async () => {
+      inspectOpenCodeRuntimeAdapterSelection: async () => ({ policy: { generation: 'v2', version: '2.0.32' } }) }))
+    mock.module(${JSON.stringify(plans)}, () => ({ createOpenCodeV2LaunchPlan: async () => {
       clock += 20; return { binding, members, deadline: owner.deadline, qualification }
-    } }))
+    }, inspectOpenCodeV2SourceAvailability: async () => { throw Error('TEST source requalification forbidden') },
+      buildOpenCodeV2InternalRunPlan: async () => { throw Error('TEST probe launch forbidden') } }))
     const controlModule = await import(${JSON.stringify(control)})
     mock.module(${JSON.stringify(control)}, () => ({ ...controlModule,
-      awaitOpenCodeV2RunMemberReadiness: async (record, target, timeout) => {
-        assert.strictEqual(record, owner); waits.push(timeout)
-        const member = nativeMembers.find(member => member.memberId === target.memberId)
-        for (const key of ['memberId', 'originalSessionId', 'selectedModel', 'selectedVariant', 'pin']) assert.equal(target[key], member[key])
-        if (scenario === 'ready' && waits.length === 1) await new Promise(resolve => { release = resolve })
-        if (scenario === 'stopped') return null
-        clock += scenario === 'expired' ? timeout : 100
-        return scenario === 'noPid' ? { ...member, runtimePid: undefined } : member
-      },
+      awaitOpenCodeV2RunMemberReadiness: async () => { throw Error('TEST obsolete member-wait path forbidden') },
       requestOpenCodeV2Run: async (record, request, timeout) => {
-        assert.strictEqual(record, owner); assert.equal(request.operation, 'status'); assert.equal(timeout, finalReads === 0 ? 750 : 730); finalReads++
+        assert.strictEqual(record, owner); assert.equal(request.operation, 'status'); budgets.push(timeout)
+        if (scenario === 'ready' && budgets.length === 1) await new Promise(resolve => { release = resolve })
         if (scenario === 'foreignOwner') throw Error('run_control_foreign')
-        if (['transientTimeout', 'transientDisconnected'].includes(scenario) && finalReads === 1) {
+        if (['transientTimeout', 'transientDisconnected'].includes(scenario) && budgets.length === 1) {
           clock += 20; throw Error(scenario === 'transientTimeout' ? 'run_control_timeout' : 'run_control_disconnected')
         }
-        return { kind: 'status', state: scenario === 'stoppedAfterReady' ? 'stopped' : 'active', deadline: owner.deadline, qualification,
-          members: scenario === 'changed' ? nativeMembers.map(member => ({ ...member, originalSessionId: 'ses_replacement' })) : nativeMembers }
+        clock += scenario === 'expired' ? timeout : 100
+        const state = scenario === 'stopped' || scenario === 'startingThenStopped' && budgets.length > 1 ? 'stopped'
+          : scenario === 'startingThenStopped' ? 'starting' : 'active'
+        const observed = scenario === 'changed' ? nativeMembers.map(member => ({ ...member, originalSessionId: 'ses_replacement' }))
+          : scenario === 'noPid' ? nativeMembers.map(member => ({ ...member, runtimePid: undefined })) : nativeMembers
+        return { kind: 'status', state, deadline: owner.deadline, qualification, members: observed }
       },
     }))
     const { OpenCodeV2TeamBridge, executeSelectedOpenCodeBridgeCommandEnvelope: execute } = await import(${JSON.stringify(target)})
-    OpenCodeV2TeamBridge.prototype.discover = async () => null
+    OpenCodeV2TeamBridge.prototype.discover = async () => { discoveries++; assert.equal(discoveries, 1); return null }
     OpenCodeV2TeamBridge.prototype.launchExplicit = async () => { launches++; clock += 30; return owner }
-    // The old launch path returned this endpoint-only snapshot immediately.
-    OpenCodeV2TeamBridge.prototype.call = async () => ({ kind: 'status', state: 'starting', deadline: owner.deadline,
-      members: nativeMembers.map(member => ({ ...member, state: 'unknown', runtimePid: undefined, bootstrap: null, controllerTools: undefined })) })
-    for (scenario of ['ready', 'stopped', 'expired', 'changed', 'stoppedAfterReady', 'noPid', 'transientTimeout', 'transientDisconnected', 'foreignOwner']) {
-      clock = 1000; waits = []; finalReads = 0; launches = 0; release = undefined
+    OpenCodeV2TeamBridge.prototype.call = async () => { throw Error('TEST endpoint-only readiness forbidden') }
+    for (scenario of ['ready', 'stopped', 'expired', 'changed', 'startingThenStopped', 'noPid', 'transientTimeout', 'transientDisconnected', 'foreignOwner']) {
+      clock = 1000; budgets = []; launches = 0; discoveries = 0; release = undefined
       let settled = false
       const pending = execute({ schemaVersion: 1, requestId: 'TEST-launch', command: 'opencode.launchTeam', cwd: '/TEST',
         startedAt: new Date().toISOString(), timeoutMs: 1000, body: { teamId: binding.teamId, runId: binding.runId } },
@@ -68,8 +63,11 @@ test('launch waits for original native members under one deadline before returni
       }
       const result = await pending
       assert.equal(launches, 1)
-      if (['ready', 'transientTimeout', 'transientDisconnected'].includes(scenario)) {
-        assert.equal(result.ok, true); assert.deepEqual(waits, [950, 850]); assert.equal(finalReads, scenario === 'ready' ? 1 : 2)
+      assert.equal(discoveries, 1)
+      const retried = ['transientTimeout', 'transientDisconnected'].includes(scenario)
+      assert.deepEqual(budgets, retried ? [950, 930] : scenario === 'startingThenStopped' ? [950, 850] : [950])
+      if (scenario === 'ready' || retried) {
+        assert.equal(result.ok, true)
         for (const [name, pid] of [['one', 123], ['two', 124]]) {
           assert.equal(result.data.members[name].launchState, 'confirmed_alive')
           assert.equal(result.data.members[name].runtimePid, pid)
@@ -78,7 +76,6 @@ test('launch waits for original native members under one deadline before returni
         assert.equal(result.data.expectedBehaviorFingerprint, qualification.expectedBehaviorFingerprint)
       } else {
         assert.equal(result.ok, false); assert.equal(result.error.retryable, false)
-        assert.equal(finalReads, ['changed', 'stoppedAfterReady', 'foreignOwner'].includes(scenario) ? 1 : 0)
       }
     }
     console.log(JSON.stringify({ scenarios: 9 }))

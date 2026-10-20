@@ -147,6 +147,7 @@ type OpenCodeInventoryProbeOptions = {
   remainingMs?: () => number
   bypassCache?: boolean
   mode?: OpenCodeInventoryProbeMode
+  v1SettingsOnly?: boolean
   refreshModels?: boolean
   includeAppMcp?: boolean
   toolApprovalMode?: OpenCodeToolApprovalMode
@@ -439,13 +440,16 @@ export function execOpenCodePortableCommand(input: {
 
 export async function collectOpenCodeInventoryCommandResults(input: {
   mode: OpenCodeInventoryProbeMode
+  verifiedVersion?: string
   execOpenCode: (args: string[]) => Promise<OpenCodeCommandResult>
   modelsResult?: OpenCodeCommandResult
   refreshModels?: boolean
 }): Promise<OpenCodeInventoryCommandResults> {
   const versionResult =
     input.mode === 'profile' || input.refreshModels
-      ? EMPTY_OPEN_CODE_COMMAND_RESULT
+      ? input.mode === 'profile' && input.verifiedVersion
+        ? { ...EMPTY_OPEN_CODE_COMMAND_RESULT, stdout: input.verifiedVersion }
+        : EMPTY_OPEN_CODE_COMMAND_RESULT
       : await input.execOpenCode(['--version'])
   const providersResult =
     input.mode === 'profile'
@@ -891,10 +895,15 @@ function mergeConnectedProviders(
 export function deriveOpenCodeProfileConnectedProviders(input: {
   profileScope?: OpenCodeProfileScope
   profile: OpenCodePreparedProfile
+  settingsOnly?: boolean
   readAuthProviderSummaries?: typeof readOpenCodeAuthProviderSummaries
 }): { providers: OpenCodeConnectedProvider[]; profileScopeError: boolean } {
   const requestedScope = input.profileScope
   const preparedScope = input.profile.profileScope
+  // Unscoped settings obtains auth and connections from the managed HTTP host.
+  if (input.settingsOnly && !requestedScope && !preparedScope) {
+    return { providers: [], profileScopeError: false }
+  }
   const sourceIdentity = input.profile.selectedSourceAuthIdentity
   const managedIdentity = input.profile.selectedManagedAuthIdentity
   const valid = Boolean(
@@ -981,7 +990,7 @@ export class OpenCodeInventoryService {
     projectPath?: string | null,
     options: OpenCodeInventoryProbeOptions = {},
   ): Promise<OpenCodeInventorySnapshot> {
-    const mode = options.mode ?? 'full'
+    let mode = options.mode ?? 'full'
     if (mode === 'passive') {
       const binaryPath = process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH?.trim() || process.env.OPENCODE_BIN_PATH?.trim() || null
       return { detected: Boolean(binaryPath), binaryPath, version: null, projectPath: path.resolve(projectPath?.trim() || getCwd()),
@@ -1015,6 +1024,8 @@ export class OpenCodeInventoryService {
         diagnostics: ['capabilities_pending'], readGeneration: selection.policy.generation,
       }
     }
+    // Preserve the selected V2 full read above; only V1 settings avoids CLI sweeps.
+    if (options.v1SettingsOnly && !options.profileScope) mode = 'profile'
     const toolApprovalMode = options.toolApprovalMode ?? 'auto'
     const scopeKey = options.profileScope ? JSON.stringify(options.profileScope) : 'legacy'
     const cacheKey = `${selection.path}\0${selection.fingerprint}\0${selection.policy.version}\0${resolvedProjectPath}\0${mode}\0${options.includeAppMcp === false ? 'without-app-mcp' : 'with-app-mcp'}\0${toolApprovalMode}\0${scopeKey}`
@@ -1070,6 +1081,7 @@ export class OpenCodeInventoryService {
         cacheEnabled,
         binaryPath,
         profile,
+        verifiedVersion: options.v1SettingsOnly ? selection.policy.version ?? undefined : undefined,
       }), options.abortSignal,
     )
   }
@@ -1082,6 +1094,7 @@ export class OpenCodeInventoryService {
     cacheEnabled: boolean
     binaryPath: string
     profile: OpenCodePreparedProfile
+    verifiedVersion?: string
   }): Promise<OpenCodeInventorySnapshot> {
     const {
       mode,
@@ -1108,6 +1121,7 @@ export class OpenCodeInventoryService {
     const collectCommandResults = () =>
       collectOpenCodeInventoryCommandResults({
         mode,
+        verifiedVersion: input.verifiedVersion,
         modelsResult: options.refreshModels ? undefined : prewarmedModelsResult,
         refreshModels: options.refreshModels,
         execOpenCode: args =>
@@ -1152,7 +1166,10 @@ export class OpenCodeInventoryService {
       return scopes.length > 0 ? scopes : ['managed']
     }
     const discovered = mode === 'profile'
-      ? deriveOpenCodeProfileConnectedProviders({ profileScope: options.profileScope, profile })
+      ? deriveOpenCodeProfileConnectedProviders({
+          profileScope: options.profileScope, profile,
+          settingsOnly: options.v1SettingsOnly === true,
+        })
       : {
           providers: mergeConnectedProviders([
             ...providerParse.connectedProviders.map(provider => provider.source === 'credentials'

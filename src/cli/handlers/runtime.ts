@@ -43,6 +43,7 @@ import type {
   RuntimeProviderStatus,
 } from '../../services/runtimeBackends/types.js'
 import { jsonStringify } from '../../utils/slowOperations.js'
+import { resolveRuntimeTranscriptProjection, type RuntimeTranscriptProjection } from '../runtimeTranscriptV2.js'
 import { readFile, writeFile } from 'node:fs/promises'
 import { createInterface } from 'node:readline'
 
@@ -600,11 +601,11 @@ function printOpenCodeSessionReconcile(
 }
 
 function printOpenCodeSessionTranscript(
-  result: Awaited<ReturnType<typeof openCodeSessionBridge.reconcileSession>>,
+  result: RuntimeTranscriptProjection,
 ): void {
   process.stdout.write('OpenCode session transcript:\n')
   process.stdout.write(`  session: ${result.record.opencodeSessionId}\n`)
-  process.stdout.write(`  model: ${result.record.selectedModel}\n`)
+  if (result.record.selectedModel) process.stdout.write(`  model: ${result.record.selectedModel}\n`)
   process.stdout.write(`  durable state: ${result.summary.durableState}\n`)
   process.stdout.write(`  message count: ${result.summary.messageCount}\n`)
   process.stdout.write(`  tool calls: ${result.summary.toolCallCount}\n`)
@@ -819,9 +820,10 @@ export async function runtimeTranscript(opts: {
   lane?: string
   limit?: number
   sessionId?: string
+  runId?: string
   projectionOnly?: boolean
   output?: string
-}): Promise<void> {
+}, deps: { exit?: (code: number) => void } = {}): Promise<void> {
   const provider = opts.provider ?? 'all'
   if (provider !== 'opencode' && provider !== 'all') {
     throw new Error(
@@ -829,10 +831,12 @@ export async function runtimeTranscript(opts: {
     )
   }
 
-  const record = await resolveOpenCodeSessionRecordForCli(opts)
-
-  const result = await openCodeSessionBridge.projectLogMessages(record, {
-    limit: typeof opts.limit === 'number' ? opts.limit : undefined,
+  const result = await resolveRuntimeTranscriptProjection(opts, {
+    resolveLegacy: () => resolveOpenCodeSessionRecordForCli(opts),
+    findLegacy: (team, lane, member) => openCodeSessionStore.get(team, lane, member),
+    projectLegacy: record => openCodeSessionBridge.projectLogMessages(record, {
+      limit: typeof opts.limit === 'number' ? opts.limit : undefined,
+    }),
   })
 
   if (opts.text) {
@@ -866,11 +870,11 @@ export async function runtimeTranscript(opts: {
     if (opts.output?.trim()) {
       await writeFile(opts.output.trim(), payload, 'utf8')
     } else {
-      process.stdout.write(payload)
+      await writeStdoutAndDrain(payload)
     }
   }
 
-  process.exit(0)
+  ;(deps.exit ?? process.exit)(0)
 }
 
 export async function runtimeOpenCodeCommand(opts: {

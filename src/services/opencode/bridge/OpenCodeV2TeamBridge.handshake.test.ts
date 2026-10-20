@@ -11,15 +11,16 @@ test('fresh and original-owner handshakes bind all returned fields in the identi
   import {mock} from 'bun:test';import assert from 'node:assert/strict'
   const factory=await import(${JSON.stringify(factory)})
   mock.module(${JSON.stringify(factory)},()=>({...factory,inspectOpenCodeRuntimeAdapterSelection:async()=>({policy:{generation:'v2',version:'2.0.0'}})}))
+  let inspections=0,probes=0
   const plan=await import(${JSON.stringify(plan)})
-  mock.module(${JSON.stringify(plan)},()=>({...plan,inspectOpenCodeV2SourceAvailability:async()=>({
+  mock.module(${JSON.stringify(plan)},()=>({...plan,inspectOpenCodeV2SourceAvailability:async()=>{inspections++;return({
    native:{version:'2.0.0',executablePath:'/TEST/native'},model:{providerID:'groq',id:'c41-upstream'},
    capabilitySnapshotId:'TEST-capability',installedGraphSHA256:'a'.repeat(64),installedGraphFiles:1,
-  })}))
+  })}}))
   const proof={capabilitySnapshotId:'TEST-capability',binaryPath:'/TEST/native',binaryFingerprint:'TEST-binary',
    opencodeVersion:'2.0.0',expectedBehaviorEvidence:{expectedBehaviorFingerprint:'b'.repeat(64)}}
   const probe=await import(${JSON.stringify(probe)})
-  mock.module(${JSON.stringify(probe)},()=>({...probe,resolveOpenCodeV2ExecutionProbe:async(_envelope,_selection,_run,options)=>{assert.equal(options?.unattendedTeam,true);return{proof,reason:null}}}))
+  mock.module(${JSON.stringify(probe)},()=>({...probe,resolveOpenCodeV2ExecutionProbe:async(_envelope,_selection,_run,options)=>{probes++;assert.equal(options?.unattendedTeam,true);return{proof,reason:null}}}))
   const {createBridgeServerIdentity}=await import(${JSON.stringify(legacy)})
   const {executionHash}=await import(${JSON.stringify(contracts)})
   const {OpenCodeV2TeamBridge,executeSelectedOpenCodeBridgeCommandEnvelope:execute}=await import(${JSON.stringify(target)})
@@ -50,6 +51,17 @@ test('fresh and original-owner handshakes bind all returned fields in the identi
    assert.equal(identityHash,executionHash(unsigned))
    assert.notEqual(identityHash,executionHash({...unsigned,sourceCapabilities:{...unsigned.sourceCapabilities,teamLaunch:!unsigned.sourceCapabilities.teamLaunch}}))
   }
+  originalOwner=false
+  const before={inspections,probes}
+  const readiness=await execute({schemaVersion:1,requestId:'TEST-readiness',command:'opencode.readiness',cwd:'/TEST',
+   startedAt:new Date().toISOString(),timeoutMs:8000,body:{client,selectedModel:'groq/c41-upstream',requireExecutionProbe:true}},
+   async()=>{throw Error('V1 fallback forbidden')})
+  assert.equal(readiness.ok,true)
+  assert.equal(inspections,before.inspections+1);assert.equal(probes,before.probes+1)
+  const {identityHash:readyHash,...readyUnsigned}=readiness.data.launchHandshake
+  assert.equal(readyHash,executionHash(readyUnsigned))
+  assert.deepEqual(readiness.data.launchHandshake.client,client)
+  assert.equal(readiness.data.launchHandshake.server.runtime.binaryFingerprint,proof.binaryFingerprint)
   console.log(JSON.stringify({branches:2,productChecks}))
  `
  const child=Bun.spawn([process.execPath,'-e',script],{cwd:import.meta.dir,stdout:'pipe',stderr:'pipe'})

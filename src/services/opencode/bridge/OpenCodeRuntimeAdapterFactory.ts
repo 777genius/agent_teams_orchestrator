@@ -26,7 +26,7 @@ export type OpenCodeSessionSemanticPorts = {
 /** This selector never creates a V1 profile or client while admitting V2. */
 export function selectOpenCodeRuntimeAdapter<TV1, TV2>(
   generation: OpenCodeReadGeneration,
-  factories: { v1: () => TV1; v2: (pin: '2.0.0' | '2.0.21') => TV2 },
+  factories: { v1: () => TV1; v2: (pin: '2.0.0' | '2.0.32') => TV2 },
 ): { generation: 'v1'; adapter: TV1 } | { generation: 'v2'; adapter: TV2 } | { generation: 'unsupported'; version: string | null } {
   if (generation.generation === 'v1') return { generation: 'v1', adapter: factories.v1() }
   if (generation.generation === 'v2') return { generation: 'v2', adapter: factories.v2(generation.version) }

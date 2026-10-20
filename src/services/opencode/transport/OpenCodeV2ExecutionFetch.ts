@@ -1,4 +1,5 @@
 import { checkOpenCodeReadJson } from './OpenCodeBoundedFetch.js'
+import { types } from 'node:util'
 
 type ExecutionFetchInput = Parameters<typeof globalThis.fetch>[0]
 type ExecutionFetchInit = Parameters<typeof globalThis.fetch>[1]
@@ -7,8 +8,27 @@ function executionResponseReader(response: Response) {
   return response.body?.getReader()
 }
 
+const diagnosticWireCodes = new Set(['authority_mismatch', 'unqualified_version', 'deadline', 'disposed',
+  'capabilities_pending', 'invalid_input', 'body_limit', 'invalid_response', 'session_missing', 'http_failure',
+  'media_type', 'transport_failure', 'cleanup_unknown', 'frame_limit', 'incomplete_stream', 'authority_or_deadline', 'not_submitted'])
+type WireFailure = Readonly<{ code: string; status?: number }>
+const wireFailures = new WeakMap<object, WireFailure>()
 export class ExecutionTransportFailure extends Error {
-  constructor(readonly code: string, readonly disposition: 'not_submitted' | 'unknown') { super(code) }
+  constructor(readonly code: string, readonly disposition: 'not_submitted' | 'unknown') {
+    super(code)
+    if (diagnosticWireCodes.has(code)) wireFailures.set(this, Object.freeze({ code }))
+  }
+}
+/** Immutable finite observation minted here; SDK wrappers retain the original
+ * cause. Do not read caller properties or invoke accessors while traversing. */
+export function readOpenCodeV2ExecutionWireFailure(error: unknown): WireFailure | undefined {
+  for (let depth = 0; depth < 4 && error !== null && typeof error === 'object'; depth++) {
+    const failure = wireFailures.get(error)
+    if (failure) return failure
+    if (types.isProxy(error) || !types.isNativeError(error)) return undefined
+    const cause = Object.getOwnPropertyDescriptor(error, 'cause')
+    error = cause && 'value' in cause ? cause.value : undefined
+  }
 }
 const unsubmitted = new WeakSet<object>()
 const missingSessions = new WeakMap<object, string>()
@@ -44,12 +64,12 @@ export class OpenCodeV2ExecutionFetch {
   private readonly controllers = new Set<AbortController>()
   private readonly pending = new Set<Promise<unknown>>()
   private readonly io = new Set<Promise<unknown>>()
-  constructor(private readonly endpoint: string, private readonly pin: '2.0.0' | '2.0.21',
+  constructor(private readonly endpoint: string, private readonly pin: '2.0.0' | '2.0.32',
     private readonly directory: string, private readonly password: string,
     private readonly context: ExecutionWireContext,
     private readonly fetchImpl: (input: ExecutionFetchInput, init?: ExecutionFetchInit) => Promise<Response> = globalThis.fetch) {
     executionAssert(/^http:\/\/127\.0\.0\.1:[1-9]\d*$/.test(endpoint), 'authority_mismatch')
-    executionAssert(pin === '2.0.0' || pin === '2.0.21', 'unqualified_version')
+    executionAssert(pin === '2.0.0' || pin === '2.0.32', 'unqualified_version')
     executionAssert(Number.isFinite(context.deadline), 'deadline')
   }
   check(): void {
@@ -79,6 +99,7 @@ export class OpenCodeV2ExecutionFetch {
 
   private async request(input: ExecutionFetchInput, init?: ExecutionFetchInit): Promise<Response> {
     let invoked = false
+    let responseStatus: number | undefined
     let reader: ReturnType<typeof executionResponseReader> = undefined
     const controller = new AbortController()
     let timer: ReturnType<typeof setTimeout> | undefined
@@ -99,9 +120,13 @@ export class OpenCodeV2ExecutionFetch {
       executionAssert(request.method === 'GET' && (session || list || log || scoped || identity) ||
         request.method === 'POST' && (create || prompt || activation), 'capabilities_pending')
       const allowed = scoped || activation ? ['location[directory]'] : log ? ['after', 'follow'] :
-        url.pathname.endsWith('/message') ? ['cursor', 'limit'] : []
+        url.pathname.endsWith('/message') ? ['cursor', 'limit', 'order'] : []
       for (const key of url.searchParams.keys()) {
         executionAssert(allowed.includes(key) && url.searchParams.getAll(key).length === 1, 'authority_mismatch')
+      }
+      if (url.pathname.endsWith('/message')) {
+        const order = url.searchParams.get('order')
+        executionAssert(order === null || order === 'asc' && !url.searchParams.has('cursor'), 'authority_mismatch')
       }
       if (scoped || activation) executionAssert(url.searchParams.get('location[directory]') === this.directory, 'authority_mismatch')
       if (log) executionAssert(url.searchParams.get('follow') === 'false', 'capabilities_pending')
@@ -212,7 +237,9 @@ export class OpenCodeV2ExecutionFetch {
         throw failure
       }
       // No response body/tag from an SDK error escapes this boundary.
-      executionAssert(response.status >= 200 && response.status < 300, 'http_failure')
+      const status = response.status
+      if (!types.isProxy(response) && Object.getPrototypeOf(response) === Response.prototype) responseStatus = status
+      executionAssert(status >= 200 && status < 300, 'http_failure')
       executionAssert(media === (log ? 'text/event-stream' : 'application/json'), 'media_type')
       const text = new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks))
       if (log) checkExecutionSse(text)
@@ -223,6 +250,8 @@ export class OpenCodeV2ExecutionFetch {
       if (reader) await this.bound(this.track(reader.cancel()), new AbortController().signal, 1000).catch(() => undefined)
       const code = error instanceof ExecutionTransportFailure ? error.code : 'transport_failure'
       const failure = new ExecutionTransportFailure(code, invoked ? 'unknown' : 'not_submitted')
+      if (code === 'http_failure' && Number.isSafeInteger(responseStatus) && Number(responseStatus) >= 100 && Number(responseStatus) <= 599)
+        wireFailures.set(failure, Object.freeze({ code, status: Number(responseStatus) }))
       if (error !== null && typeof error === 'object') {
         const sessionID = missingSessions.get(error)
         if (sessionID !== undefined) missingSessions.set(failure, sessionID)

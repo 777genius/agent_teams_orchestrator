@@ -1,23 +1,27 @@
-# OpenCode 2.0.21 inline video transport
+# OpenCode 2.0.32 inline video transport
 
 These Bun `patchedDependencies` modify the actual published `@opencode/core`
-and `@opencode/ai` 2.0.21 package graph loaded by `@opencode/server/process`.
+and `@opencode/ai` 2.0.32 package graph loaded by `@opencode/server/process`.
 They do not modify an installed user CLI or its binary. The 2.0.0 floor graph
 is unchanged. `scripts/opencode-v2/stage.ts` copies the installed patched bytes
 into production bundles; the existing execution graph receipt hashes those
 actual bytes. Keep these patches in the source archive used to run Bun install.
 
-Upstream: `anomalyco/opencode`, v2.0.21,
-`8a8bd622a3d7dc29ccf30ec17f84e363ed95ed72`.
+Upstream: `anomalyco/opencode`, v2.0.32,
+official npm registry tarballs (integrities below).
 
 Registry tarball integrity:
 
-- `@opencode/core@2.0.21`: `sha512-ATpffzxXaDEHUqV+1+c356XltMGlUsuYkm20fzn3jnrvdVT7EOLo3ThfiL47ZJR2gABvdeRiIL0bJ0yF36ayCA==`
-- `@opencode/ai@2.0.21`: `sha512-eB4M0O44VoX075Kv+vIVxIpiKSrfjSXpNaeBSjtPgZdhZCjKN5CxjJXtyPbhrDxvmDf0PxLcvjGNKQBRMkZ0fw==`
+- `@opencode/core@2.0.32`: `sha512-nXlB1UXOFV05NihI8ckVYEhfaPkPNc9dy+XVjamphzFuZHu5SDE1yDpgItvXcr/vgbHJszM19pkeaMQzxJWFbQ==`
+- `@opencode/ai@2.0.32`: `sha512-NMquAbwiFupqoXuRuvY8jPwNAiCVlQcKDQlOTbULWN283gTp4LI3NQJqrpSWpLporxomDJsjU7soN8TCPv3BKQ==`
 
 The upstream core release bundles `session/prompt.ts` into
-`dist/chunks/job-ma9c1wd2.js`, and `session/runner/to-llm-message.ts` into
-`dist/chunks/job-rk1r2hx8.js`. The patches target these exact published bytes.
+`dist/chunks/instance-c01nkdt4.js`, and `session/runner/to-llm-message.ts` into
+`dist/chunks/instance-xt4njr3s.js`. The patches target these exact published bytes. Both upstream omissions remain in
+2.0.32: inline data URLs discard video MIME and runner conversion drops video
+media. The upstream AI codecs still lack the opt-in video body schema/lowering.
+The AI port preserves its new `Effect.fnUntraced` wrapper. The current graph uses
+Effect/platform 4.0.1, separately from the floor RC graph.
 The existing data URL decoder still validates canonical base64 and the existing
 attachment size limit still runs before materialization. Only explicitly
 allowlisted inline video MIME headers are retained; all existing image/text/PDF
@@ -41,7 +45,7 @@ unchanged; provider errors remain explicit where a selected endpoint rejects a
 format. No frames are extracted and no attachment becomes a text reference.
 
 Verification: run `bun test scripts/opencode-v2/native-video.test.ts` first on
-stock 2.0.21 (video retention must fail), then after patched frozen installation.
+stock 2.0.32 (video retention must fail), then after patched frozen installation.
 The test uses actual native core conversion, provider compiler, and request body
 schema. It asserts exact bytes and explicit native-OpenAI/unsupported-format
 refusals without network calls. The existing sandbox Electron/native server

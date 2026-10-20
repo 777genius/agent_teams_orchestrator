@@ -6,8 +6,8 @@ import type { OpenCodeV2NativeIdentity } from '../compatibility/OpenCodeNativeId
 export type OpenCodeV2ReadStatus = {
   schemaVersion: 1
   generation: 'v2'
-  version: '2.0.0' | '2.0.21'
-  dialect: 'v2-2.0.0' | 'v2-2.0.21'
+  version: '2.0.0' | '2.0.32'
+  dialect: 'v2-2.0.0' | 'v2-2.0.32'
   nativeSha256: string
   selectionKey: string
   locationKey: string

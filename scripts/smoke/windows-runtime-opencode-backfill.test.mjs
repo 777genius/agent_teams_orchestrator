@@ -13,7 +13,7 @@ import { PassThrough } from 'node:stream';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { assertBackfillEnvelope, assertImportedLedger, buildWindowsTeardownCommand, createBackfillFixture, finishSmokeCleanup, fixtureScriptPaths, runSmokeGroups, sandboxEnvironment, stageRuntimeDelivery, teardownOwnedProcesses, trustedSearchPath, windowsNodeScriptPattern } from './windows-runtime-opencode-backfill.mjs';
 
-import { assertReadinessHost, runProviderSmoke, runRecordedCheck } from './windows-runtime-opencode-provider-json.mjs';
+import { actualProviderResult, actualProviderTransport, catalogGuard, assertReadinessHost, runProviderSmoke, runRecordedCheck } from './windows-runtime-opencode-provider-json.mjs';
 import { environmentSummary, traceSpawn } from './windows-process-identity-probe.mjs';
 
 const repository = fileURLToPath(new URL('../../', import.meta.url));
@@ -22,6 +22,94 @@ const hash = value => createHash('sha256').update(value).digest('hex');
 const existingBun = () => (process.env.PATH || '').split(path.delimiter)
   .map(dir => path.join(dir, process.platform === 'win32' ? 'bun.exe' : 'bun'))
   .find(candidate => existsSync(candidate));
+
+test('actual provider comparison rejects static fallback and requires the selected native identity and model', () => {
+  const binary = 'C:\\TEST\\node_modules\\.bin\\opencode.cmd';
+  const view = { runtimeId: 'opencode', view: { runtime: { cliPath: binary, version: '1.18.31' },
+    providers: [{ providerId: 'deepinfra', state: 'connected' }], diagnostics: [] } };
+  const models = { runtimeId: 'opencode', models: { providerId: 'deepinfra', catalogState: 'fresh',
+    models: [{ providerId: 'deepinfra', modelId: 'deepinfra/TEST-local-catalog-model' }], diagnostics: [] } };
+  assert.equal(actualProviderResult(view, 'view', binary).passed, true);
+  assert.equal(actualProviderResult(models, 'models', binary).passed, true);
+  // An explicit custom ID must not alias the canonical ID declared by this fixture.
+  assert.equal(actualProviderResult(models, 'models_reported_id', binary).passed, false);
+  const missing = { runtimeId: 'opencode', error: { code: 'provider-missing' } };
+  assert.equal(actualProviderResult(missing, 'models_reported_id', binary, 1).passed, true);
+  assert.equal(actualProviderResult(missing, 'models_reported_id', binary).passed, false);
+  assert.equal(actualProviderResult({ ...missing, models: models.models }, 'models_reported_id', binary, 1).passed, false);
+  assert.equal(actualProviderResult({ runtimeId: 'opencode', error: { code: 'provider-missing',
+    message: 'Selected OpenCode identity is unavailable' } }, 'models_reported_id', binary, 1).passed, false);
+  const reportedMismatch = structuredClone(models);
+  reportedMismatch.models.providerId = 'deep-infra';
+  reportedMismatch.models.models[0].modelId = 'deep-infra/TEST-local-catalog-model';
+  assert.equal(actualProviderResult(reportedMismatch, 'models_reported_id', binary).passed, false);
+  assert.equal(actualProviderResult(models, 'models', binary, 1).passed, false);
+  const diagnostic = structuredClone(view);
+  diagnostic.view.runtime.version = 'opencode v1.18.31';
+  diagnostic.view.runtime.state = 'ready';
+  diagnostic.view.providers = [{ providerId: 'deepinfra', state: 'available' },
+    { providerId: 'deep-infra', state: 'connected' }, { providerId: 'TEST-secret', state: 'TEST-secret' }];
+  const projected = actualProviderResult(diagnostic, 'view', binary);
+  assert.equal(projected.passed, false);
+  assert.equal(projected.versionClass, 'branded_expected');
+  assert.equal(projected.runtimeState, 'ready');
+  assert.equal(projected.deepinfraState, 'available');
+  assert.equal(projected.deepInfraDisplayState, 'connected');
+  assert.ok(!JSON.stringify(projected).includes('TEST-secret'));
+  diagnostic.view.diagnostics = [
+    'OpenCode host did not become healthy within 10000ms Diagnostics: TEST-secret',
+    'OpenCode host did not become healthy within 10000ms',
+    'Selected OpenCode identity is unavailable TEST-secret', 'TEST-secret',
+  ];
+  const classified = actualProviderResult(diagnostic, 'view', binary);
+  assert.deepEqual(classified.diagnosticKinds, ['host_health_timeout', 'selected_identity', 'other']);
+  assert.ok(!JSON.stringify(classified).includes('TEST-secret'));
+  for (const [step, phase] of [['install managed OpenCode provider plugins', 'managed_plugins'],
+    ['prepare managed OpenCode profile: create profile directories', 'profile'],
+    ['opencode --version', 'version'], ['opencode providers list', 'providers'],
+    ['opencode models --verbose', 'models'], ['opencode agent list', 'agents'], ['TEST-secret', 'other']]) {
+    const snapshot = structuredClone(view);
+    snapshot.view.diagnostics = [`OpenCode inventory probe timed out after 60000ms during ${step}`];
+    const result = actualProviderResult(snapshot, 'view', binary);
+    assert.equal(result.inventoryTimedOut, true); assert.equal(result.inventoryPhase, phase);
+    assert.ok(!JSON.stringify(result).includes('TEST-secret'));
+  }
+  for (const mutate of [value => { value.view.runtime.cliPath = null; },
+    value => { value.view.providers.push({ providerId: 'deep-infra', state: 'connected' }); },
+    value => { value.view.runtime.version = '1.19.0'; },
+    value => { value.view.providers[0].state = 'available'; },
+    value => { value.view.diagnostics.push('capabilities_pending'); }]) {
+    const invalid = structuredClone(view); mutate(invalid);
+    assert.equal(actualProviderResult(invalid, 'view', binary).passed, false);
+  }
+  for (const mutate of [value => { value.models.catalogState = 'stale'; },
+    value => { value.models.models[0].modelId = 'other-model'; },
+    value => { value.models.providerId = 'other-provider'; }]) {
+    const invalid = structuredClone(models); mutate(invalid);
+    assert.equal(actualProviderResult(invalid, 'models', binary).passed, false);
+  }
+  const refused = actualProviderResult({ runtimeId: 'opencode', error: { code: 'runtime-unhealthy',
+    message: 'Selected OpenCode identity is unavailable TEST-secret-do-not-persist' } }, 'models', binary);
+  assert.equal(refused.identityUnavailable, true);
+  assert.equal(refused.passed, false);
+  assert.ok(!JSON.stringify(refused).includes('TEST-secret'));
+  assert.deepEqual(actualProviderTransport({ code: 'ETIMEDOUT', killed: true, message: 'TEST-secret' }),
+    { transport: 'ETIMEDOUT', killed: true });
+  assert.deepEqual(actualProviderTransport({ code: 'TEST-secret', stderr: 'TEST-secret' }),
+    { transport: 'other', killed: false });
+});
+
+test('catalog guard permits only exact read-only catalog/auth routes and rejects inference', () => {
+  const observations = [];
+  for (const [method, url, expected] of [['GET', '/v1/models', 200], ['GET', '/auth', 200],
+    ['POST', '/v1/chat/completions', 405], ['POST', '/session/prompt', 405], ['GET', '/session', 405]]) {
+    let status;
+    catalogGuard({ method, url, resume() {} }, { writeHead(value) { status = value; }, end() {} }, observations);
+    assert.equal(status, expected);
+  }
+  assert.deepEqual(observations, [{ allowed: true }, { allowed: true },
+    { allowed: false }, { allowed: false }, { allowed: false }]);
+});
 
 test('runtime relocation preserves packaged Bun and executable physical graph across every path shape', () => {
   const root = mkdtempSync(path.join(os.tmpdir(), 'runtime-relocation-'));
@@ -105,8 +193,8 @@ test('cleanup script inventory covers known fixtures without admitting dependenc
 });
 
 
-// Real SQLite reader + attribution/reconstruction, without loading the full CLI,
-// installing dependencies, compiling, starting a provider, or modifying a project.
+// Real SQLite reader + attribution/reconstruction using preinstalled dependencies,
+// without loading the full CLI, compiling, starting a provider, or modifying a project.
 test('fixture is readable and reconstructs one strictly attributed write through production readers', () => {
   const root = mkdtempSync(path.join(os.tmpdir(), 'backfill-fixture-check-'));
   try {

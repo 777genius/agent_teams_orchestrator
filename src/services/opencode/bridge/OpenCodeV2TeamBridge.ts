@@ -1,8 +1,10 @@
+import { openCodeBunVersion } from '../../../constants/openCodeBunVersion.js'
 import path from 'node:path'
 import { canonicalizeOpenCodeProjectPath } from '../OpenCodeProfileManager.js'
 import { readOpenCodeAuthority, isKnownSessionStore, requireOpenCodeAuthority, type SessionStoreShape } from '../OpenCodeAuthorityStoreRead.js'
 import { getOpenCodeVersionProbeDiagnostics } from '../compatibility/OpenCodeVersionProbe.js'
 import { classifyOpenCodeV2ExecutionDelivery } from '../host/OpenCodeV2ExecutionDelivery.js'
+import { isExecutionPlatformAvailable } from '../host/OpenCodeV2ExecutionPlatform.js'
 import { resolveOpenCodeBinaryHostIdentity } from '../OpenCodeHostIdentity.js'
 import { resolveOpenCodeV2ExecutionProbe } from './OpenCodeV2ExecutionProbe.js'
 import { parseOpenCodeBridgePreconditions, validateOpenCodeBridgeStateChangingPreconditions } from '../OpenCodeBridgePreconditions.js'
@@ -19,7 +21,7 @@ import type { OpenCodeNormalizedPermission } from '../types.js'
 import { parseOpenCodeStopRequest, type OpenCodeStopData } from '../OpenCodeStopRecovery.js'
 import { openCodeDeliveryJournalRecoveryData, commandStatusFromOutcomeStatus, isAcceptedOutcomeStatus, commandStatusMismatchReason, outcomeSendMessageDataToCommandData, type SendMessageOutcomeBase, type SendMessageCommandData } from './OpenCodeBridgeDeliveryJournal.js'
 import { OpenCodeV2DeliveryJournal } from './OpenCodeV2DeliveryJournal.js'
-import { discoverOpenCodeV2Run, requestOpenCodeV2Run, isTransientOpenCodeV2ControlRead, awaitOpenCodeV2RunMemberReadiness, OPEN_CODE_V2_RUN_INITIALIZATION_MS } from './OpenCodeV2RunControl.js'
+import { discoverOpenCodeV2Run, requestOpenCodeV2Run, isTransientOpenCodeV2ControlRead, OPEN_CODE_V2_RUN_INITIALIZATION_MS } from './OpenCodeV2RunControl.js'
 import { launchExplicitOpenCodeV2Run } from './OpenCodeV2RunOwner.js'
 import type { RunBinding, RunControlRecord, RunControlRequest, RunControlResult, RunLaunchPlan } from './OpenCodeV2RunTypes.js'
 import type { OpenCodeV2TurnProjection } from './OpenCodeV2TurnProjection.js'
@@ -62,6 +64,44 @@ export class OpenCodeV2TeamBridge {
       plan.binding.runId === this.binding.runId, 'run_binding_conflict')
     executionAssert(await this.discover() === null, 'run_already_owned')
     return this.ports.launch(plan)
+  }
+  /** Endpoint publication enables cancellation; a launch response waits for the
+   * same original members without another acquisition or model input. */
+  async awaitLaunchReady(record: RunControlRecord, plan: RunLaunchPlan, deadline: number) {
+    executionAssert(executionHash(record.binding) === executionHash(plan.binding) &&
+      record.binding.teamId === this.binding.teamId && record.binding.runId === this.binding.runId &&
+      record.deadline === plan.deadline && Number.isFinite(deadline) && deadline <= record.deadline &&
+      deadline <= Date.now() + OPEN_CODE_V2_RUN_INITIALIZATION_MS, 'run_readiness_changed')
+    while (Date.now() < deadline) {
+      const remaining = deadline - Date.now()
+      let status: RunControlResult
+      try { status = await this.ports.request(record, { operation: 'status' }, Math.min(5000, remaining)) }
+      catch (error) {
+        if (!isTransientOpenCodeV2ControlRead(error)) throw error
+        await new Promise(resolve => setTimeout(resolve, Math.min(100, Math.max(1, deadline - Date.now()))))
+        continue
+      }
+      executionAssert(status.kind === 'status' && status.deadline === record.deadline &&
+        executionHash(status.qualification ?? null) === executionHash(plan.qualification ?? null) &&
+        status.members.length === plan.members.length, 'run_readiness_changed')
+      for (const expected of plan.members) {
+        const matches = status.members.filter(member => member.memberId === expected.memberId)
+        const member = matches[0], model = expected.profile.selection.model
+        executionAssert(matches.length === 1 && member && member.laneId === expected.laneId &&
+          member.originalSessionId === expected.originalSessionId &&
+          member.opencodeSessionId === expected.originalSessionId && member.runtimeSessionId === expected.originalSessionId &&
+          member.selectedModel === `${model.providerID}/${model.id}` && member.selectedVariant === model.variant &&
+          member.pin === expected.native.version, 'run_readiness_changed')
+      }
+      if (status.state === 'active') {
+        executionAssert(Date.now() < deadline && openCodeV2SupportedSourcePredicate(status) &&
+          status.members.every(member => Number.isSafeInteger(member.runtimePid) && member.runtimePid! > 0), 'run_readiness_unknown')
+        return status
+      }
+      executionAssert(status.state === 'starting', 'run_readiness_unknown')
+      await new Promise(resolve => setTimeout(resolve, Math.min(100, Math.max(1, deadline - Date.now()))))
+    }
+    throw new Error('run_readiness_unknown')
   }
   async call(request: RunControlRequest, timeoutMs: number): Promise<RunControlResult> {
     executionAssert(Number.isFinite(timeoutMs) && timeoutMs > 0 && timeoutMs <= 30_000, 'invalid_operation_deadline')
@@ -113,20 +153,20 @@ export class OpenCodeV2TeamBridge {
       base.memberName === request.memberId && base.requestId === identity.requestId &&
       base.body.deliveryAttemptId === identity.deliveryAttemptId && base.body.messageId === identity.localMessageId,
     'delivery_identity_conflict')
-    const claim = await boundOpenCodeRead(this.journal.reserve(base, request.originalSessionId, identity, executionHash(request.intent)), remaining())
+    const claim = await boundOpenCodeRead(this.journal.reserve(base, request.originalSessionId, identity, executionHash(request.intent), deadline), remaining())
     // A retained submitting/UNKNOWN owner is read-only. Carry the immutable
     // intent for conflict checking, never invoke another admission/send.
     const generation = claim.submissionOwner ? { submissionOwner: claim.submissionOwner } : {}
     const result = await this.call(claim.action === 'submit' ? { ...request, ...generation } : { operation: 'observe', memberId: request.memberId,
       originalSessionId: request.originalSessionId, nativeInputID: identity.nativeInputID, intent: request.intent, ...generation }, remaining())
     if (result.kind === 'send_refused') return boundOpenCodeRead(
-      this.journal.refuse(base, request.originalSessionId, request.intent, result, claim.submissionOwner), remaining())
+      this.journal.refuse(base, request.originalSessionId, request.intent, result, claim.submissionOwner, deadline), remaining())
     executionAssert((result.kind === 'send' || result.kind === 'observe') && result.admission.authority.sessionID === request.originalSessionId &&
       result.admission.authority.teamId === base.teamId && result.admission.authority.runId === base.runId &&
       result.admission.authority.memberId === base.memberName && result.admission.authority.laneId === base.laneId &&
       executionHash(result.admission.identity) === executionHash(identity), 'original_input_conflict')
     return boundOpenCodeRead(this.journal.commit(base, request.originalSessionId, identity, result,
-      projectV2DeliveryObservation(result.turn, identity.nativeInputID, identity.localMessageId)), remaining())
+      projectV2DeliveryObservation(result.turn, identity.nativeInputID, identity.localMessageId), deadline), remaining())
   }
 
   commitObservation(result: Extract<RunControlResult, { kind: 'send' | 'observe' }>, body: Record<string, unknown>, timeoutMs: number) {
@@ -134,7 +174,7 @@ export class OpenCodeV2TeamBridge {
     executionAssert(result.admission.authority.teamId === this.binding.teamId &&
       result.admission.authority.runId === this.binding.runId, 'original_input_conflict')
     return boundOpenCodeRead(this.journal.commitObservation(result, body, projectV2DeliveryObservation(result.turn,
-      result.admission.identity.nativeInputID, result.admission.identity.localMessageId)), timeoutMs)
+      result.admission.identity.nativeInputID, result.admission.identity.localMessageId), Date.now() + timeoutMs), timeoutMs)
   }
 }
 
@@ -206,9 +246,9 @@ function refusal(envelope: BridgeEnvelope, started: number, message: string) {
  * Exported product defaults remain false; caller booleans cannot activate these capabilities. */
 export function openCodeV2SupportedSourcePredicate(status: Extract<RunControlResult, { kind: 'status' }>): boolean {
   try { classifyOpenCodeV2ExecutionDelivery(import.meta.url) } catch { return false }
-  return process.platform === 'linux' && process.versions.bun === '1.3.11' &&
+  return isExecutionPlatformAvailable() && process.versions.bun === openCodeBunVersion() &&
     status.qualification !== undefined && status.state === 'active' && status.deadline > Date.now() && status.members.length > 0 &&
-    status.members.every(member => ['2.0.0', '2.0.21'].includes(member.pin) && member.state === 'accepted' &&
+    status.members.every(member => ['2.0.0', '2.0.32'].includes(member.pin) && member.state === 'accepted' &&
       member.originalSessionId === member.opencodeSessionId && member.originalSessionId === member.runtimeSessionId &&
       member.bootstrap?.verified === true && member.bootstrap.strategy === 'instruction-entry' &&
       member.bootstrap.missingNativeMessageID === true && member.controllerTools?.server === 'agent-teams' &&
@@ -237,6 +277,7 @@ async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: O
   let measured: RunQualification | undefined
   let originalStatus: Extract<RunControlResult, { kind: 'status' }> | undefined
   let acceptedIdempotencyKey: string | undefined
+  let readinessStage: 'owner_discovery' | 'source_availability' | 'execution_probe' | undefined
   const respond = (env: BridgeEnvelope, at: number, data: unknown, version: string | null) => response(env, at,
     acceptedIdempotencyKey && data !== null && typeof data === 'object' && !Array.isArray(data)
       ? { ...data, idempotencyKey: acceptedIdempotencyKey } : data, version, measured)
@@ -248,41 +289,13 @@ async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: O
       const plan = await createOpenCodeV2LaunchPlan(envelope)
       measured = plan.qualification
       acceptedIdempotencyKey = parseOpenCodeBridgePreconditions(body.preconditions)?.idempotencyKey
-      const owner = await bridge.launchExplicit(plan)
-      executionAssert(executionHash(owner.binding) === executionHash(plan.binding), 'run_owner_changed')
-      // Endpoint publication precedes native initialization. Every original member
-      // shares the command/initialization budget; no wait can renew it or relaunch.
-      const deadline = Math.min(started + (envelope.timeoutMs || OPEN_CODE_V2_RUN_INITIALIZATION_MS),
-        Date.now() + OPEN_CODE_V2_RUN_INITIALIZATION_MS, owner.deadline)
-      const remaining = () => { const budget = deadline - Date.now(); executionAssert(budget > 0, 'run_readiness_timeout'); return budget }
-      const readyMembers = []
-      for (const member of plan.members) {
-        const model = member.profile.selection.model
-        const ready = await awaitOpenCodeV2RunMemberReadiness(owner, {
-          memberId: member.memberId, originalSessionId: member.originalSessionId,
-          selectedModel: `${model.providerID}/${model.id}`, selectedVariant: model.variant, pin: member.native.version,
-        }, Math.min(OPEN_CODE_V2_RUN_INITIALIZATION_MS, remaining()))
-        executionAssert(ready && typeof ready.runtimePid === 'number' && Number.isSafeInteger(ready.runtimePid) && ready.runtimePid > 0 &&
-          ready.bootstrap?.verified && ready.controllerTools, 'run_readiness_unknown')
-        readyMembers.push(ready)
-      }
-      let status: RunControlResult
-      for (;;) {
-        try {
-          status = await requestOpenCodeV2Run(owner, { operation: 'status' }, Math.min(30_000, remaining()))
-          remaining()
-          break
-        } catch (error) {
-          if (!isTransientOpenCodeV2ControlRead(error) || Date.now() >= deadline) throw error
-          await new Promise(resolve => setTimeout(resolve, Math.min(100, remaining())))
-        }
-      }
-      executionAssert(status.kind === 'status' && status.state === 'active' && status.deadline === owner.deadline &&
-        executionHash(status.members) === executionHash(readyMembers) &&
-        executionHash(status.qualification) === executionHash(plan.qualification), 'run_readiness_changed')
+      const record = await bridge.launchExplicit(plan)
+      const status = await bridge.awaitLaunchReady(record, plan, Math.min(record.deadline,
+        started + (envelope.timeoutMs || OPEN_CODE_V2_RUN_INITIALIZATION_MS), Date.now() + OPEN_CODE_V2_RUN_INITIALIZATION_MS))
       return respond(envelope, started, { ...projectV2TeamStatus(status, plan.binding.runId), expectedBehaviorFingerprint: measured?.expectedBehaviorFingerprint }, pin)
     }
     if (envelope.command === 'opencode.readiness' || envelope.command === 'opencode.handshake') {
+      readinessStage = 'owner_discovery'
       let owner: Extract<RunControlResult, { kind: 'status' }> | null = null
       if (bridge && await bridge.discover()) {
         const found = await bridge.call({ operation: 'status' }, 8000)
@@ -309,29 +322,21 @@ async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: O
         return respond(envelope, started, { ...originalHandshake, identityHash: executionHash(originalHandshake) }, measured.version)
       }
       const ownerModel = owner?.members[0]?.selectedModel
+      readinessStage = 'source_availability'
       const selection = await inspectOpenCodeV2SourceAvailability({ ...envelope,
         body: { ...body, selectedModel: body.selectedModel ?? ownerModel } })
       if (owner) executionAssert(owner.members.every(member => member.selectedModel === `${selection.model.providerID}/${selection.model.id}`), 'run_selected_model_changed')
       const qualified = owner !== null && openCodeV2SupportedSourcePredicate(owner)
       const sourceCapabilities = { teamLaunch: true, memberSession: qualified, permission: false }
+      readinessStage = 'execution_probe'
       const probe = await resolveOpenCodeV2ExecutionProbe(envelope, selection, envelope.command === 'opencode.readiness' && body.requireExecutionProbe === true, { unattendedTeam: true })
+      readinessStage = undefined
       measured = owner?.qualification ?? { capabilitySnapshotId: selection.capabilitySnapshotId,
         expectedBehaviorFingerprint: probe.proof?.expectedBehaviorEvidence.expectedBehaviorFingerprint ?? '',
         binaryPath: probe.proof?.binaryPath ?? selection.native.executablePath,
         binaryFingerprint: probe.proof?.binaryFingerprint ?? await resolveOpenCodeBinaryHostIdentity(selection.native.executablePath),
         version: probe.proof?.opencodeVersion ?? selection.native.version }
 
-      if (envelope.command === 'opencode.readiness') return respond(envelope, started, {
-        state: probe.proof ? 'ready' : 'model_unavailable', launchAllowed: probe.proof !== null, modelId: `${selection.model.providerID}/${selection.model.id}`,
-        availableModels: [], opencodeVersion: selection.native.version, binaryPath: selection.native.executablePath,
-        hostHealthy: qualified, appMcpConnected: qualified, requiredToolsPresent: qualified, permissionBridgeReady: false,
-        runtimeStoresReady: owner !== null, supportLevel: qualified ? 'source_linux' : null,
-        missing: probe.proof ? [] : [probe.reason ?? 'Selected-model native execution proof is required.'],
-        diagnostics: ['Source availability is verified. No execution proof is claimed until the normal owned native probe observes the original terminal and physical cleanup.'],
-        executionProof: probe.proof, expectedBehaviorEvidence: probe.proof?.expectedBehaviorEvidence ?? null,
-        expectedBehaviorFingerprint: probe.proof?.expectedBehaviorEvidence.expectedBehaviorFingerprint ?? null, capabilitySnapshotId: selection.capabilitySnapshotId,
-        sourceAvailability: { installedGraphSHA256: selection.installedGraphSHA256, installedGraphFiles: selection.installedGraphFiles, sourceOnly: true },
-        sourceCapabilities, ...(owner ? { team: projectV2TeamStatus(owner, required(body.runId, 'runId')) } : {}) }, selection.native.version)
       const identity = createBridgeServerIdentity(null, { runtimeStoreManifestHighWatermark: typeof body.expectedManifestHighWatermark === 'number' ? body.expectedManifestHighWatermark : null })
       identity.runtime.capabilitySnapshotId = measured.capabilitySnapshotId
       identity.runtime.binaryPath = measured.binaryPath
@@ -345,6 +350,18 @@ async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: O
       const { identityHash: omittedIdentityHash, ...unsignedHandshake } = handshake
       void omittedIdentityHash
       handshake.identityHash = executionHash(unsignedHandshake)
+      if (envelope.command === 'opencode.readiness') return respond(envelope, started, {
+        state: probe.proof ? 'ready' : 'model_unavailable', launchAllowed: probe.proof !== null, modelId: `${selection.model.providerID}/${selection.model.id}`,
+        availableModels: [], opencodeVersion: selection.native.version, binaryPath: selection.native.executablePath,
+        hostHealthy: qualified, appMcpConnected: qualified, requiredToolsPresent: qualified, permissionBridgeReady: false,
+        runtimeStoresReady: owner !== null, supportLevel: qualified ? 'production_supported' : null,
+        missing: probe.proof ? [] : [probe.reason ?? 'Selected-model native execution proof is required.'],
+        diagnostics: ['Source availability is verified. No execution proof is claimed until the normal owned native probe observes the original terminal and physical cleanup.'],
+        executionProof: probe.proof, expectedBehaviorEvidence: probe.proof?.expectedBehaviorEvidence ?? null,
+        expectedBehaviorFingerprint: probe.proof?.expectedBehaviorEvidence.expectedBehaviorFingerprint ?? null, capabilitySnapshotId: selection.capabilitySnapshotId,
+        sourceAvailability: { installedGraphSHA256: selection.installedGraphSHA256, installedGraphFiles: selection.installedGraphFiles, sourceOnly: true },
+        ...(probe.proof && body.client ? { launchHandshake: handshake } : {}),
+        sourceCapabilities, ...(owner ? { team: projectV2TeamStatus(owner, required(body.runId, 'runId')) } : {}) }, selection.native.version)
       return respond(envelope, started, handshake, selection.native.version)
     }
     const timeout = Math.min(envelope.timeoutMs || 8000, 30_000)
@@ -385,6 +402,7 @@ async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: O
     }
     if (!bridge) return refusal(envelope, started, 'Exact V2 run owner is unknown; observation/stop cannot replace it.')
     let request: RunControlRequest
+    let transcriptMessageLimit: number | undefined
     if (envelope.command === 'opencode.listRuntimePermissions' && !text(body.memberName)) {
       const status = await bridge.call({ operation: 'status' }, remaining())
       executionAssert(status.kind === 'status' && status.state === 'active', 'run_owner_unknown')
@@ -449,6 +467,15 @@ async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: O
       case 'opencode.listRuntimePermissions': case 'opencode.getRuntimeTranscript': {
         const memberId = required(body.memberName, 'memberName')
         const member = await bridge.resolveMember(memberId, text(body.laneId), text(body.runtimeSessionId ?? body.sessionId), remaining())
+        if (envelope.command === 'opencode.getRuntimeTranscript') {
+          executionAssert(
+            ['2.0.0', '2.0.32'].includes(member.pin) && originalStatus?.qualification?.version === member.pin,
+            'v2_transcript_version_unsupported')
+          const window = body.messageLimit
+          executionAssert(window === undefined || (typeof window === 'number' && Number.isSafeInteger(window) && window > 0),
+            'v2_transcript_limit_invalid')
+          transcriptMessageLimit = window as number | undefined
+        }
         request = { operation: envelope.command === 'opencode.listRuntimePermissions' ? 'permissions' : 'transcript',
           memberId, originalSessionId: member.originalSessionId }
         break
@@ -498,10 +525,24 @@ async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: O
     }
     if (result.kind === 'transcript') {
       executionAssert(request.operation === 'transcript', 'transcript_authority_conflict')
-      return respond(envelope, started, normalizeV2Transcript(result, request.originalSessionId), pin)
+      return respond(envelope, started, normalizeV2Transcript(result, request.originalSessionId, transcriptMessageLimit), pin)
     }
     return respond(envelope, started, result, pin)
-  } catch (error) { return refusal(envelope, started, error instanceof Error ? error.message : 'V2 bridge operation unknown') }
+  } catch (error) {
+    // Missing-file diagnostics must identify the closed preparation phase, never
+    // publish a filesystem path. Missing inputs remain a hard readiness refusal.
+    const missing = readinessStage && error !== null && typeof error === 'object'
+      && 'code' in error && error.code === 'ENOENT'
+    if (missing) return refusal(envelope, started, `readiness_file_missing:${readinessStage}`)
+    const message = error instanceof Error ? error.message : 'V2 bridge operation unknown'
+    // A native custody refusal inside readiness must keep its finite operation
+    // name: the shared stage string alone cannot identify the throwing request.
+    const operation = error !== null && typeof error === 'object' && 'nativeOperation' in error &&
+      typeof (error as { nativeOperation?: unknown }).nativeOperation === 'string'
+      ? (error as { nativeOperation: string }).nativeOperation : null
+    return refusal(envelope, started, operation && !message.includes('@native:')
+      ? `${message} @native:${operation}` : message)
+  }
 }
 
 // Recovery follows persisted original ownership even if the installed CLI changes.
@@ -527,6 +568,16 @@ const legacyRecoveryCommands = new Set([
   'opencode.commandStatus',
 ])
 
+/** Read an already-owned V2 transcript without selecting or qualifying a runtime.
+ * A missing original owner stays a refusal; this entry has no V1 callback. */
+export async function executeExistingOpenCodeV2TranscriptEnvelope(input: unknown): Promise<unknown> {
+  const envelope = validateEnvelope(input)
+  executionAssert(envelope.command === 'opencode.getRuntimeTranscript', 'v2_transcript_command_invalid')
+  const binding = resolveOpenCodeV2RunBinding(envelope.body)
+  executionAssert(binding, 'v2_transcript_binding_missing')
+  return executeV2(envelope, null, new OpenCodeV2TeamBridge(resolveClaudeMultimodelPaths().data, binding))
+}
+
 /** Public protocol1 routing. The existing V1 executor is passed unchanged. */
 export async function executeSelectedOpenCodeBridgeCommandEnvelope(input: unknown,
   executeV1: (input: unknown) => Promise<unknown>): Promise<unknown> {
@@ -549,12 +600,21 @@ export async function executeSelectedOpenCodeBridgeCommandEnvelope(input: unknow
     return executeV1(input)
   }
   const bridge = binding ? new OpenCodeV2TeamBridge(resolveClaudeMultimodelPaths().data, binding) : null
-  if (bridge && process.platform === 'linux' && process.getuid) {
+  if (bridge && isExecutionPlatformAvailable() && (process.platform === 'win32' || process.getuid)) {
     try { if (await bridge.discover()) return executeV2(envelope, null, bridge) }
     catch (error) {
       if (envelope.command === 'opencode.commandStatus' || envelope.command === 'opencode.recoverDeliveryJournal')
         return executeV2(envelope, null, bridge)
-      return refusal(envelope, Date.now(), error instanceof Error ? error.message : 'run_owner_unknown')
+      if ((envelope.command === 'opencode.readiness' || envelope.command === 'opencode.handshake')
+        && error !== null && typeof error === 'object' && 'code' in error && error.code === 'ENOENT')
+        return refusal(envelope, Date.now(), 'readiness_file_missing:owner_discovery')
+      // A native custody refusal must keep its finite operation name: the
+      // shared stage string cannot identify the throwing native request.
+      const message = error instanceof Error ? error.message : 'run_owner_unknown'
+      const operation = error !== null && typeof error === 'object' && 'nativeOperation' in error &&
+        typeof (error as { nativeOperation?: unknown }).nativeOperation === 'string'
+        ? (error as { nativeOperation: string }).nativeOperation : null
+      return refusal(envelope, Date.now(), operation ? `${message} @native:${operation}` : message)
     }
   }
   // This command touches only the legacy registry and never creates a host.

@@ -43,7 +43,10 @@ async function models(label: string, runtime: string, selection: string) {
   const own = path.join(root, label)
   const dirs = Object.fromEntries(['home', 'config', 'data', 'cache', 'state', 'tmp', 'appdata', 'localappdata',
     'runtime-data', 'runtime-cache', 'project'].map(name => [name, path.join(own, name)]))
-  await Promise.all(Object.values(dirs).map(dir => mkdir(dir, { recursive: true })))
+  // runtime-data (CLAUDE_MULTIMODEL_DATA_HOME) must not pre-exist: the runtime creates it
+  // exclusively with a private ACL and the x64 admission refuses plain-mkdir roots.
+  await Promise.all(Object.entries(dirs).filter(([name]) => name !== 'runtime-data')
+    .map(([, dir]) => mkdir(dir, { recursive: true })))
   const env: NodeJS.ProcessEnv = {}
   for (const key of ['SystemRoot', 'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATHEXT', 'PATH']) {
     if (process.env[key]) env[key] = process.env[key]

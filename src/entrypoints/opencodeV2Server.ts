@@ -1,3 +1,4 @@
+import { openCodeV2ServerLoopbackUrl } from '../services/opencode/host/OpenCodeV2ServerAddress.js'
 import path from 'node:path'
 import { realpath } from 'node:fs/promises'
 import { pathToFileURL } from 'node:url'
@@ -39,7 +40,7 @@ process.once('disconnect', () => { void close() })
 process.once('SIGTERM', () => { void close() })
 
 async function start(input: Record<string, unknown>): Promise<void> {
-  openCodeReadAssert(input.pin === '2.0.0' || input.pin === '2.0.21')
+  openCodeReadAssert(input.pin === '2.0.0' || input.pin === '2.0.32')
   openCodeReadAssert(typeof input.password === 'string' && input.password.length === 43)
   openCodeReadAssert(typeof input.root === 'string' && path.isAbsolute(input.root))
   const root = await realpath(input.root)
@@ -69,10 +70,11 @@ async function start(input: Record<string, unknown>): Promise<void> {
   } satisfies FloorOptions & CurrentOptions
   const server = await Effect.runPromise(runtime.start<never, never>(options).pipe(Effect.provideService(Scope.Scope, scope)), { signal: controller.signal })
   controller.signal.throwIfAborted()
-  openCodeReadAssert(!closing && server.address._tag === 'TcpAddress' && server.address.hostname === '127.0.0.1')
+  openCodeReadAssert(!closing)
+  const baseUrl = openCodeV2ServerLoopbackUrl(input.pin, server.address)
   clearTimeout(startupTimer)
   process.send?.({ type: 'ready', nonce, pid: process.pid, version: input.pin,
-    baseUrl: `http://127.0.0.1:${server.address.port}`, moduleSha256: graph.moduleSha256, executableSha256 })
+    baseUrl, moduleSha256: graph.moduleSha256, executableSha256 })
 }
 process.on('message', message => {
   try {

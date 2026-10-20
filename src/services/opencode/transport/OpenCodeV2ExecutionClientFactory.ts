@@ -1,4 +1,5 @@
 import { assertExecutionSelectedModel, type ExecutionAuthority, type ExecutionContext } from '../execution/OpenCodeV2ExecutionContracts.js'
+import { retainOpenCodeV2CatalogFailure, type ExecutionCatalogPhase } from '../execution/OpenCodeV2Diagnostics.js'
 import path from 'node:path'
 import { realpath } from 'node:fs/promises'
 import { hashOpenCodeFile } from '../compatibility/OpenCodeNativeIdentity.js'
@@ -9,6 +10,7 @@ import { executionAssert, ExecutionTransportFailure, executionSessionIsMissing, 
   rejectExecutionBeforeInvocation, OpenCodeV2ExecutionFetch } from './OpenCodeV2ExecutionFetch.js'
 
 export type ExecutionModel = { providerID: string; id: string; variant?: string }
+type ExecutionEndpoint = Pick<ReturnType<typeof requireExecutionEndpoint>, 'baseUrl' | 'password' | 'signal' | 'fetch'>
 export type ExecutionMention = { start: number; end: number; text: string }
 export type ExecutionQueueInput = {
   nativeInputID: string; text: string; resume: boolean
@@ -46,7 +48,23 @@ export type ExecutionInstruction = { key: string; value: ExecutionJson }
 export type ExecutionMcpConfig =
   | { type: 'local'; command: readonly string[]; cwd?: string; environment?: { [key: string]: string }; disabled?: boolean }
   | { type: 'remote'; url: string; headers?: { [key: string]: string }; oauth?: false; disabled?: boolean }
-export type ExecutionMcpServer = { name: string; status: 'connected' | 'pending' | 'disabled' | 'failed' | 'needs_auth' }
+/** Closed class of a native MCP failure message. The message itself never leaves this parser. */
+export type ExecutionMcpFailure = 'relay_upstream' | 'relay_transport' | 'connection_refused' | 'timeout' |
+  'http_client' | 'http_server' | 'protocol' | 'other'
+export type ExecutionMcpServer = { name: string; status: 'connected' | 'pending' | 'disabled' | 'failed' | 'needs_auth'
+  failure?: ExecutionMcpFailure }
+function mcpFailure(message: unknown): ExecutionMcpFailure {
+  if (typeof message !== 'string') return 'other'
+  if (message.includes('execution_http_request_failed')) return 'relay_upstream'
+  if (/execution_http_/.test(message)) return 'relay_transport'
+  if (/ECONNREFUSED|ConnectionRefused|connection refused|Unable to connect/i.test(message)) return 'connection_refused'
+  if (/timed? ?out|ETIMEDOUT|TimeoutError|AbortError/i.test(message)) return 'timeout'
+  const status = /\b(?:HTTP|status(?: code)?)[ :/]*([45])\d\d\b/i.exec(message)?.[1]
+  if (status === '5') return 'http_server'
+  if (status === '4') return 'http_client'
+  if (/protocol/i.test(message)) return 'protocol'
+  return 'other'
+}
 export type ExecutionPermission = { id: string; sessionID: string; action: string; resources: string[];
   source?: { type: 'tool'; messageID: string; id: string } }
 export type ExecutionBridgeClient = ExecutionClient & {
@@ -169,7 +187,7 @@ class OpenCodeV2BridgeFetch {
   private readonly pending = new Set<Promise<unknown>>()
   private readonly controllers = new Set<AbortController>()
   constructor(private readonly authority: ExecutionAuthority, private readonly context: ExecutionContext,
-    private readonly endpoint: { baseUrl: string; password: string; signal: AbortSignal }) {}
+    private readonly endpoint: ExecutionEndpoint) {}
   private check(): void {
     executionAssert(!this.closed && Date.now() < this.context.deadline && !this.endpoint.signal.aborted &&
       !this.context.signal?.aborted, 'authority_or_deadline')
@@ -242,7 +260,7 @@ class OpenCodeV2BridgeFetch {
       const headers = new Headers(request.headers)
       headers.set('authorization', 'Basic ' + Buffer.from('opencode:' + this.endpoint.password).toString('base64'))
       invoked = true
-      const response = await boundOpenCodeRead(this.track(globalThis.fetch(request, { headers, signal, redirect: 'error' })
+      const response = await boundOpenCodeRead(this.track((this.endpoint.fetch ?? globalThis.fetch)(request, { headers, signal, redirect: 'error' })
         .then(async response => { if (signal.aborted) { await response.body?.cancel(); throw new Error('deadline') }; return response })), remaining(), signal)
       executionAssert(!response.redirected && (!response.url || new URL(response.url).origin === this.endpoint.baseUrl), 'authority_mismatch')
       const body = await consume(response.body, 8 * 1024 * 1024)
@@ -272,8 +290,8 @@ class OpenCodeV2BridgeFetch {
 }
 
 async function operations(authority: ExecutionAuthority, context: ExecutionContext,
-  endpoint: { baseUrl: string; password: string; signal: AbortSignal }) {
-  executionAssert(authority.generation === 'v2' && (authority.pin === '2.0.0' || authority.pin === '2.0.21') &&
+  endpoint: ExecutionEndpoint) {
+  executionAssert(authority.generation === 'v2' && (authority.pin === '2.0.0' || authority.pin === '2.0.32') &&
     authority.dialect === `v2-${authority.pin}`, 'unqualified_version')
   const graph = requireExecutionGraph(authority)
   executionAssert(graph.sha256 === authority.graphSha256, 'authority_mismatch')
@@ -289,32 +307,54 @@ async function operations(authority: ExecutionAuthority, context: ExecutionConte
     executionAssert(dependencyProof && await hashOpenCodeFile(resolved) === dependencyProof.sha256, 'graph_mismatch')
   }
   const wire = new OpenCodeV2ExecutionFetch(endpoint.baseUrl, authority.pin, authority.directory, endpoint.password,
-    { deadline: context.deadline, signal: AbortSignal.any([endpoint.signal, ...(context.signal ? [context.signal] : [])]) })
+    { deadline: context.deadline, signal: AbortSignal.any([endpoint.signal, ...(context.signal ? [context.signal] : [])]) }, endpoint.fetch)
   const bridgeWire = new OpenCodeV2BridgeFetch(authority, context, endpoint)
   try {
     wire.check()
-    const ops = authority.pin === '2.0.0'
-      ? (await import('./OpenCodeV2ExecutionFloorClient.js')).executionFloorOperations(endpoint.baseUrl, authority.directory, wire, bridgeWire.fetch)
-      : (await import('./OpenCodeV2ExecutionCurrentClient.js')).executionCurrentOperations(endpoint.baseUrl, authority.directory, wire, bridgeWire.fetch)
-    return { ops, wire, bridgeWire }
+    let ops: ExecutionOperations, clientErrorPrototype: object
+    if (authority.pin === '2.0.0') {
+      const adapter = await import('./OpenCodeV2ExecutionFloorClient.js')
+      ops = adapter.executionFloorOperations(endpoint.baseUrl, authority.directory, wire, bridgeWire.fetch)
+      clientErrorPrototype = adapter.executionFloorClientErrorPrototype
+    } else {
+      const adapter = await import('./OpenCodeV2ExecutionCurrentClient.js')
+      ops = adapter.executionCurrentOperations(endpoint.baseUrl, authority.directory, wire, bridgeWire.fetch)
+      clientErrorPrototype = adapter.executionCurrentClientErrorPrototype
+    }
+    return { ops, wire, bridgeWire, clientErrorPrototype }
   } catch (failure) { await Promise.allSettled([wire.dispose(), bridgeWire.dispose()]); throw failure }
 }
 
-export async function awaitOpenCodeV2CatalogReadiness(endpoint: { baseUrl: string; password: string; signal: AbortSignal },
+export async function awaitOpenCodeV2CatalogReadiness(endpoint: ExecutionEndpoint,
   authority: ExecutionAuthority, context: ExecutionContext): Promise<void> {
-  const { ops, wire, bridgeWire } = await operations(authority, context, endpoint)
+  let phase: ExecutionCatalogPhase = 'client-setup'
+  let clientErrorPrototype: object | undefined
   try {
-    const identity = record(await ops.identity())
-    executionAssert(identity.pid === requireExecutionEndpoint(authority).nativePID && identity.version === authority.pin &&
-      (authority.pin !== '2.0.0' || identity.healthy === true), 'authority_mismatch')
-    executionAssert(record(await ops.location()).directory === authority.directory, 'authority_mismatch')
-    const ready = await ops.ready()
-    if (authority.pin === '2.0.21') executionAssert(record(record(ready).location).directory === authority.directory, 'authority_mismatch')
-    wire.check()
-  } finally { await Promise.all([wire.dispose(), bridgeWire.dispose()]) }
+    const prepared = await operations(authority, context, endpoint)
+    const { ops, wire, bridgeWire } = prepared
+    clientErrorPrototype = prepared.clientErrorPrototype
+    let primary: unknown
+    try {
+      phase = 'info'
+      const identity = record(await ops.identity())
+      executionAssert(identity.pid === requireExecutionEndpoint(authority).nativePID && identity.version === authority.pin &&
+        (authority.pin !== '2.0.0' || identity.healthy === true), 'authority_mismatch')
+      phase = 'location'
+      executionAssert(record(await ops.location()).directory === authority.directory, 'authority_mismatch')
+      phase = 'integration-ready'
+      const ready = await ops.ready()
+      if (authority.pin === '2.0.32') executionAssert(record(record(ready).location).directory === authority.directory, 'authority_mismatch')
+      wire.check()
+    } catch (failure) {
+      primary = failure; retainOpenCodeV2CatalogFailure(failure, phase, clientErrorPrototype); throw failure
+    } finally {
+      try { await Promise.all([wire.dispose(), bridgeWire.dispose()]) }
+      catch (failure) { retainOpenCodeV2CatalogFailure(failure, phase, clientErrorPrototype, primary); throw failure }
+    }
+  } catch (failure) { retainOpenCodeV2CatalogFailure(failure, phase, clientErrorPrototype, failure); throw failure }
 }
 
-export async function awaitOpenCodeV2ExecutionReadiness(endpoint: { baseUrl: string; password: string; signal: AbortSignal },
+export async function awaitOpenCodeV2ExecutionReadiness(endpoint: ExecutionEndpoint,
   authority: ExecutionAuthority, context: ExecutionContext,
   selection: { agent: string; model: ExecutionModel; permissions: readonly { action: string; resource: string; effect: 'allow' | 'deny' | 'ask' }[] }): Promise<void> {
   const { ops, wire, bridgeWire } = await operations(authority, context, endpoint)
@@ -324,11 +364,11 @@ export async function awaitOpenCodeV2ExecutionReadiness(endpoint: { baseUrl: str
       (authority.pin !== '2.0.0' || identity.healthy === true), 'authority_mismatch')
     executionAssert(record(await ops.location()).directory === authority.directory, 'authority_mismatch')
     const ready = await ops.ready()
-    if (authority.pin === '2.0.21') executionAssert(record(record(ready).location).directory === authority.directory, 'authority_mismatch')
+    if (authority.pin === '2.0.32') executionAssert(record(record(ready).location).directory === authority.directory, 'authority_mismatch')
     const agents = record(await ops.agent(selection.agent)), agent = record(agents.data)
     executionAssert(record(agents.location).directory === authority.directory && agent.id === selection.agent, 'selection_mismatch')
     executionAssert(JSON.stringify(model(agent.model)) === JSON.stringify(model(selection.model)), 'selection_mismatch')
-    const expected = [...selection.permissions, ...(authority.pin === '2.0.21' ? [{ action: 'browser', resource: '*', effect: 'deny' }] : [])]
+    const expected = [...selection.permissions, ...(authority.pin === '2.0.32' ? [{ action: 'browser', resource: '*', effect: 'deny' }] : [])]
     executionAssert(Array.isArray(agent.permissions) && agent.permissions.length >= expected.length && JSON.stringify((expected.length ? agent.permissions.slice(-expected.length) : []).map(value => {
       const rule = record(value); return { action: rule.action, resource: rule.resource, effect: rule.effect }
     })) === JSON.stringify(expected.map(rule => ({ action: rule.action, resource: rule.resource, effect: rule.effect }))), 'selection_mismatch')
@@ -499,9 +539,9 @@ export async function createOpenCodeV2ExecutionClient(authority: ExecutionAuthor
     mcp: () => invoke(false, async () => {
       const raw = record(await ops.mcp())
       executionAssert(record(raw.location).directory === authority.directory && Array.isArray(raw.data) && raw.data.length <= 256, 'authority_mismatch')
-      const values: ExecutionMcpServer[] = raw.data.map(value => { const entry = record(value), status = record(entry.status).status
+      const values: ExecutionMcpServer[] = raw.data.map(value => { const entry = record(value), state = record(entry.status), status = state.status
         executionAssert(status === 'connected' || status === 'pending' || status === 'disabled' || status === 'failed' || status === 'needs_auth')
-        return { name: text(entry.name), status } satisfies ExecutionMcpServer })
+        return { name: text(entry.name), status, ...(status === 'failed' || status === 'needs_auth' ? { failure: mcpFailure(state.error) } : {}) } satisfies ExecutionMcpServer })
       executionAssert(new Set(values.map(value => value.name)).size === values.length)
       return values
     }),

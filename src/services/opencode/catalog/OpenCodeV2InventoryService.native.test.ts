@@ -16,7 +16,7 @@ import { getUnifiedRuntimeStatusPayload } from '../../runtimeBackends/registry.j
 import { isProcessAlive } from '../../../utils/processKill.js'
 
 // Required explicit root invocation with BOTH exact native platform binaries. No pass-by-skip.
-for (const pin of ['2.0.0', '2.0.21'] as const) test(`native ${pin} catalog/readiness/privacy/owned close`, async () => {
+for (const pin of ['2.0.0', '2.0.32'] as const) test(`native ${pin} catalog/readiness/privacy/owned close`, async () => {
   const binary = process.env[pin === '2.0.0' ? 'TEST_OPENCODE_V2_FLOOR_BINARY' : 'TEST_OPENCODE_V2_CURRENT_BINARY']
   if (!binary || !path.isAbsolute(binary)) throw new Error(`Required verified native ${pin} binary is missing`)
   const git = Bun.which('git')

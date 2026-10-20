@@ -27,7 +27,62 @@ function cut(): { messages: ExecutionMessagePage; log: ExecutionLog } {
       { id: 'evt_TESTterminal', type: 'session.execution.succeeded', aggregateID: sessionID, seq: 2, data: { sessionID } },
     ] } }
 }
+// Recorded on both official pins: Code Mode metadata has tool/status/input,
+// without a nested call ID, per-call output/error body or timestamps.
+function codeModeCut(calls: unknown[] = [
+  { tool: 'agent-teams.task_complete', status: 'completed', input: { teamName: 'TEST-team', taskId: 'TEST-task', actor: 'alice' } },
+  { tool: 'agent-teams.message_send', status: 'completed', input: { teamName: 'TEST-team', from: 'alice', to: 'bob', text: 'ACK:TEST' } },
+  { tool: 'agent-teams.team_get', status: 'error', input: { teamName: 'TEST-team' } },
+]) {
+  const value = cut()
+  value.messages.data[1] = wrapped({ ...assistant, content: [{ type: 'tool', id: 'TEST-execute', name: 'execute',
+    time: { created: 21, ran: 22, completed: 29 }, state: { status: 'completed', input: { code: 'TEST code' },
+      content: [{ type: 'text', text: 'TEST composite program result' }], metadata: { toolCalls: calls } } }] }, 20)
+  return value
+}
 describe('V2 canonical transcript protocol DTO', () => {
+  test('projects recorded nested Code Mode calls without inventing their IDs, outputs or times and retains outer execute', () => {
+    const result = normalizeV2Transcript(codeModeCut(), sessionID), message = result.messages[1]!
+    expect(message.role).toBe('assistant')
+    expect(message.toolCalls).toHaveLength(4)
+    expect(message.toolCalls[0]).toMatchObject({ callId: 'TEST-execute', toolName: 'execute', outputText: 'TEST composite program result' })
+    expect(message.toolCalls[1]).toEqual({ callId: null, toolName: 'agent-teams.task_complete', title: null,
+      source: { kind: 'opencode-v2-code-mode-metadata', outerCallId: 'TEST-execute', index: 0 },
+      status: 'completed', input: { teamName: 'TEST-team', taskId: 'TEST-task', actor: 'alice' },
+      output: null, outputText: null, outputPreview: null, startedAt: null, completedAt: null, isError: false })
+    expect(message.toolCalls[2]).toMatchObject({ toolName: 'agent-teams.message_send', status: 'completed',
+      input: { from: 'alice', to: 'bob', text: 'ACK:TEST' }, source: { outerCallId: 'TEST-execute', index: 1 } })
+    expect(message.toolCalls[3]).toMatchObject({ toolName: 'agent-teams.team_get', status: 'errored', isError: true, output: null })
+    expect(message.contentBlocks.filter(block => block.type === 'tool_result')).toHaveLength(1)
+    expect(result.diagnostics).toContain('v2_transcript_code_mode_nested_ids_results_unavailable:msg_TESTassistant:TEST-execute')
+    expect(result.logProjection.toolCallCount).toBe(4)
+  })
+  test('running/omitted-input metadata stays incomplete and repeated actual invocations preserve separate array positions', () => {
+    const result = normalizeV2Transcript(codeModeCut([
+      { tool: 'search', status: 'running' },
+      { tool: 'agent-teams.message_send', status: 'completed', input: { text: 'ACK:TEST' } },
+      { tool: 'agent-teams.message_send', status: 'completed', input: { text: 'ACK:TEST' } },
+    ]), sessionID)
+    expect(result.messages[1]?.toolCalls[1]).toMatchObject({ status: 'running', input: null, output: null, completedAt: null })
+    expect(result.messages[1]?.toolCalls.slice(2).map(call => call.source?.index)).toEqual([1, 2])
+  })
+  test('text, unrelated tool metadata and malformed Code Mode metadata cannot manufacture completed nested tool evidence', () => {
+    const value = codeModeCut(), assistantRow = value.messages.data[1]!.data
+    value.messages.data[1] = wrapped({ ...assistantRow, content: [{ type: 'text', text: JSON.stringify({ toolCalls: [{ tool: 'agent-teams.task_complete', status: 'completed' }] }) }] }, 20)
+    expect(normalizeV2Transcript(value, sessionID).messages[1]?.toolCalls).toHaveLength(0)
+    const unrelated = codeModeCut()
+    const parts = unrelated.messages.data[1]!.data.content as Record<string, unknown>[]
+    parts[0]!.name = 'TEST-other-tool'
+    expect(normalizeV2Transcript(unrelated, sessionID).messages[1]?.toolCalls).toHaveLength(1)
+    for (const invalid of [
+      { tool: 'agent-teams.task_complete', status: 'success', input: {} },
+      { tool: 'agent-teams.task_complete', status: ['completed'], input: {} },
+      { tool: 'agent-teams.task_complete', status: 'completed', input: [] },
+      { tool: 'agent-teams.task_complete', status: 'completed', output: 'invented' },
+      { tool: 'agent-teams.task_complete', status: 'completed', id: 'invented' },
+      { tool: '', status: 'completed' }, null,
+    ]) expect(() => normalizeV2Transcript(codeModeCut([invalid]), sessionID)).toThrow('v2_transcript_invalid_code_mode_call')
+  })
   test('normalizes both pinned native message shapes without a V1 wire cast', () => {
     const result = normalizeV2Transcript(cut(), sessionID)
     expect(Object.keys(result).sort()).toEqual(['diagnostics', 'durableState', 'logProjection', 'messages', 'sessionId'])
@@ -106,5 +161,19 @@ describe('V2 canonical transcript protocol DTO', () => {
     expect(() => normalizeV2Transcript(value, sessionID)).toThrow('v2_transcript_duplicate_message')
     const other = cut()
     expect(() => normalizeV2Transcript({ ...other, log: { ...other.log, watermark: 3 } }, sessionID)).toThrow('v2_transcript_incomplete_watermark')
+  })
+  test('the latest-entry message window trims only projected messages and never the cut validation', () => {
+    const full = normalizeV2Transcript(cut(), sessionID)
+    expect(full.messages.map(message => message.id)).toEqual(['msg_TESTuser', 'msg_TESTassistant', 'msg_TESTterminal'])
+    const windowed = normalizeV2Transcript(cut(), sessionID, 2)
+    expect(windowed.messages.map(message => message.id)).toEqual(['msg_TESTassistant', 'msg_TESTterminal'])
+    expect(windowed.logProjection.toolCallCount).toBe(full.logProjection.toolCallCount)
+    const last = normalizeV2Transcript(cut(), sessionID, 1)
+    expect(last.messages.map(message => message.id)).toEqual(['msg_TESTterminal'])
+    expect(last.logProjection.toolCallCount).toBe(0)
+    // The terminal snapshot still validates against the complete cut.
+    expect(last.durableState).toBe(full.durableState)
+    for (const invalid of [0, -1, 1.5, Number.NaN]) expect(() => normalizeV2Transcript(cut(), sessionID, invalid))
+      .toThrow('v2_transcript_limit_invalid')
   })
 })

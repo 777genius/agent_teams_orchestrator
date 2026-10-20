@@ -35,12 +35,12 @@ test('response loss retains one admission, original readback and actual socket c
   try {
     const port = await boundOpenCodeRead(Promise.race([ready, exited.then(() => { throw new Error('peer exited') })]), 5000)
     const base = `http://127.0.0.1:${port}`
-    const make = (pin: '2.0.0' | '2.0.21' = '2.0.21', ms = 2000, signal?: AbortSignal) => {
+    const make = (pin: '2.0.0' | '2.0.32' = '2.0.32', ms = 2000, signal?: AbortSignal) => {
       const wire = new OpenCodeV2ExecutionFetch(base, pin, '/TEST', 'TEST-private', { deadline: Date.now() + ms, signal })
       wires.push(wire); return wire
     }
     const aborted = new AbortController(); aborted.abort()
-    const pre = make('2.0.21', 2000, aborted.signal)
+    const pre = make('2.0.32', 2000, aborted.signal)
     const absent = await pre.fetch(`${base}/api/session/ses_original/prompt`, { method: 'POST', body: '{}' }).catch(error => error)
     expect(executionWasNotSubmitted(absent)).toBe(true)
     const sdkWrapped = Object.assign(new Error('Transport', { cause: absent }), { name: 'ClientError', reason: 'Transport' })
@@ -67,7 +67,7 @@ test('response loss retains one admission, original readback and actual socket c
       expect(executionWasNotSubmitted(failure)).toBe(false)
     }
 
-    const stalled = make('2.0.21', 150)
+    const stalled = make('2.0.32', 150)
     await expect(stalled.fetch(`${base}/api/info`)).rejects.toBeInstanceOf(ExecutionTransportFailure)
     await stalled.dispose()
     await boundOpenCodeRead(bodyClosed, 2000) // Independently observed socket close, before teardown.
@@ -99,7 +99,7 @@ test('response loss retains one admission, original readback and actual socket c
 
 test('forbidden mutation and exhausted context prove non-submission without physical requests', async () => {
   let requests = 0
-  const wire = new OpenCodeV2ExecutionFetch('http://127.0.0.1:1', '2.0.21', '/TEST', 'TEST',
+  const wire = new OpenCodeV2ExecutionFetch('http://127.0.0.1:1', '2.0.32', '/TEST', 'TEST',
     { deadline: Date.now() + 1000 }, async () => { requests++; return Response.json({}) })
   try {
     const failure = await wire.fetch('http://127.0.0.1:1/api/session/ses_original/interrupt', { method: 'POST' }).catch(error => error)
@@ -117,7 +117,7 @@ test('non-byte mutation response retains uncertainty and cancels its reader', as
     start(controller) { controller.enqueue('{}') },
     cancel() { cancellations++ },
   })
-  const wire = new OpenCodeV2ExecutionFetch('http://127.0.0.1:1', '2.0.21', '/TEST', 'TEST',
+  const wire = new OpenCodeV2ExecutionFetch('http://127.0.0.1:1', '2.0.32', '/TEST', 'TEST',
     { deadline: Date.now() + 1000 }, async (_input, init) => {
       requests++; signal = init?.signal ?? undefined
       return new Response(body, { headers: { 'content-type': 'application/json' } })
@@ -138,7 +138,7 @@ test('non-byte mutation response retains uncertainty and cancels its reader', as
 
 // Neither a 404 status nor a public error-shaped object proves absence. Only a
 // completely consumed, validated native error for this exact GET can do so.
-for (const pin of ['2.0.0', '2.0.21'] as const) test(`session absence requires complete exact native 404 for ${pin}`, async () => {
+for (const pin of ['2.0.0', '2.0.32'] as const) test(`session absence requires complete exact native 404 for ${pin}`, async () => {
   const native = { _tag: 'SessionNotFoundError', sessionID: 'ses_original', message: 'private native detail' }
   const json = JSON.stringify(native)
   const cases = [
@@ -185,7 +185,7 @@ for (const pin of ['2.0.0', '2.0.21'] as const) test(`session absence requires c
   expect(executionSessionIsMissing(new ExecutionTransportFailure('session_missing', 'unknown'), 'ses_original')).toBe(false)
 })
 
-for (const pin of ['2.0.0', '2.0.21'] as const) test(`${pin} selected config readback cannot widen filesystem or mutation authority`, async () => {
+for (const pin of ['2.0.0', '2.0.32'] as const) test(`${pin} selected config readback cannot widen filesystem or mutation authority`, async () => {
   let invoked = 0
   const wire = new OpenCodeV2ExecutionFetch('http://127.0.0.1:1', pin, '/TEST/project', 'TEST',
     { deadline: Date.now() + 1000 }, async () => { invoked++; return Response.json([]) })

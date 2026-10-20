@@ -37,6 +37,7 @@ import {
   openCodeProfileManager,
 } from './OpenCodeProfileManager.js'
 import { resolveClaudeMultimodelPaths } from './OpenCodeManagedPaths.js'
+import { ensureWindowsPrivateDirectories, hasWindowsPrivateProfileDirectoryDelivery } from './profile/OpenCodePrivateDirectories.js'
 import {
   buildProcessAttributionSpawnEnv,
   mintProcessAttributionId,
@@ -926,7 +927,11 @@ export class OpenCodeHostManager {
     if (!registryPath) {
       return null
     }
-    await mkdir(path.dirname(registryPath), { recursive: true })
+    if (path.relative(defaultPersistentRegistryPath(), path.resolve(registryPath)) === '' &&
+      await hasWindowsPrivateProfileDirectoryDelivery()) {
+      await ensureWindowsPrivateDirectories([resolveClaudeMultimodelPaths().data, path.dirname(registryPath)])
+    }
+    await mkdir(path.dirname(registryPath), { recursive: true, mode: 0o700 })
     const lockPath = `${registryPath}.lock`
     await writeFile(lockPath, '', { flag: 'a' })
     return lockPath
@@ -962,7 +967,7 @@ export class OpenCodeHostManager {
     }
 
     const lockDir = path.join(path.dirname(registryPath), 'host-startup-locks')
-    await mkdir(lockDir, { recursive: true })
+    await mkdir(lockDir, { recursive: true, mode: 0o700 })
     const lockPath = path.join(lockDir, `${hashText(hostKey)}.lock`)
     await writeFile(lockPath, '', { flag: 'a' })
 
@@ -1010,7 +1015,7 @@ export class OpenCodeHostManager {
     const registryPath = this.persistentRegistryPath
     if (!registryPath) return async () => {}
     const lockDir = path.join(path.dirname(registryPath), 'host-startup-locks')
-    await mkdir(lockDir, { recursive: true })
+    await mkdir(lockDir, { recursive: true, mode: 0o700 })
     const lockPath = path.join(lockDir, `${hashText(hostKey)}.lock`)
     await writeFile(lockPath, '', { flag: 'a' })
     try {

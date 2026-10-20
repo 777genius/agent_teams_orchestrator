@@ -34,7 +34,7 @@ test('actual bundled model mapper uses staged schema and the same physical Effec
     expect(schema.startsWith(graphRoot + path.sep)).toBe(true)
     expect(model.startsWith(graphRoot + path.sep)).toBe(true)
     const metadata = JSON.parse(await readFile(path.join(graphRoot, 'node_modules/@opencode/schema/package.json'), 'utf8'))
-    expect(metadata).toMatchObject({ name: '@opencode/schema', version: '2.0.21' })
+    expect(metadata).toMatchObject({ name: '@opencode/schema', version: '2.0.32' })
     const effect = await realpath(Bun.resolveSync('effect', graphRoot))
     expect(await realpath(Bun.resolveSync('effect', path.dirname(schema)))).toBe(effect)
     expect(await realpath(Bun.resolveSync('effect', path.dirname(model)))).toBe(effect)

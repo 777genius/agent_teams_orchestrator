@@ -4,10 +4,10 @@ import { join } from 'node:path'
 import { windowsNativeProcess } from './windowsNativeProcess.js'
 
 const PROCESS_START_TIME_QUERY_TIMEOUT_MS = 2_500
-// Cold PowerShell identity queries have reached the 2.5s cutoff while a repeat
-// completes in ~0.8s. Give the first .NET query startup headroom without retrying.
+// Cold PowerShell identity queries have reached the 5s cutoff while a repeat
+// completes in ~4.6s. Match the existing startup identity cap without retrying.
 // This budget is separate from command-line queries and process termination.
-const WINDOWS_PROCESS_START_TIME_QUERY_TIMEOUT_MS = 5_000
+const WINDOWS_PROCESS_START_TIME_QUERY_TIMEOUT_MS = 6_000
 const PROCESS_START_TIME_OUTPUT_LIMIT_BYTES = 64 * 1024
 const PROCESS_COMMAND_OUTPUT_LIMIT_BYTES = 256 * 1024
 

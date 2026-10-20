@@ -22,7 +22,7 @@ describe('generation composition', () => {
       expect(captured === input).toBe(true)
     }
   })
-  test.each(['2.0.0', '2.0.21'] as const)('pin %s does not touch the V1 path', pin => {
+  test.each(['2.0.0', '2.0.32'] as const)('pin %s does not touch the V1 path', pin => {
     const selected = selectOpenCodeRuntimeAdapter({ generation: 'v2', version: pin, dialect: `v2-${pin}` }, {
       v1: () => { throw new Error('V1 invoked for V2') },
       v2: selectedPin => ({ selectedPin }),

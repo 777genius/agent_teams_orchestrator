@@ -128,7 +128,7 @@ test('fresh private V2 child closes before start with matching ACK, exit zero an
 // gate aborts after the actual Bun executable fd opens, while real delayed read
 // syscalls keep that asynchronous hash in flight. It must reject with the caller's
 // reason, retire private roots, and never exec a successor or bind a server.
-for (const pin of ['2.0.0', '2.0.21'] as const) test(`late ${pin} acquisition abort at real executable read starts no successor`, async () => {
+for (const pin of ['2.0.0', '2.0.32'] as const) test(`late ${pin} acquisition abort at real executable read starts no successor`, async () => {
   const selected = process.env.TEST_OPENCODE_STRACE_BINARY
   if (!selected || !path.isAbsolute(selected)) throw new Error('Required verified absolute TEST_OPENCODE_STRACE_BINARY is missing')
   const tracerPath = await realpath(selected)

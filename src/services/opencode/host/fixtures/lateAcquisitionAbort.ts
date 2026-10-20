@@ -6,11 +6,11 @@ import type { OpenCodeV2NativeIdentity } from '../../compatibility/OpenCodeNativ
 // A real isolated adapter caller. Control files belong to this TEST invocation;
 // there are no substituted filesystem, process, server, or adapter functions.
 const [root, project, executablePath, executableSha256, pin] = process.argv.slice(2)
-if (!root || !project || !executablePath || !executableSha256 || (pin !== '2.0.0' && pin !== '2.0.21')) {
+if (!root || !project || !executablePath || !executableSha256 || (pin !== '2.0.0' && pin !== '2.0.32')) {
   throw new Error('Invalid lifecycle fixture arguments')
 }
 const native: OpenCodeV2NativeIdentity = {
-  generation: 'v2', version: pin, dialect: pin === '2.0.0' ? 'v2-2.0.0' : 'v2-2.0.21',
+  generation: 'v2', version: pin, dialect: pin === '2.0.0' ? 'v2-2.0.0' : 'v2-2.0.32',
   executablePath, executableSha256, packageName: '@opencode/cli-test-fixture',
 }
 const controller = new AbortController()

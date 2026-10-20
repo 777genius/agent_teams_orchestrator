@@ -29,6 +29,7 @@ import { findGitRoot } from '../../utils/git.js'
 import { safeParseJSONC } from '../../utils/json.js'
 import * as lockfile from '../../utils/lockfile.js'
 import { ensureOpenCodeDirectory } from './ensureOpenCodeDirectory.js'
+import { ensureWindowsPrivateDirectories, hasWindowsPrivateProfileDirectoryDelivery } from './profile/OpenCodePrivateDirectories.js'
 import {
   applyOpenCodeAutoUpdatePolicy,
   isOpenCodeAutoUpdateAllowed,
@@ -46,6 +47,7 @@ import {
   doesOpenCodeAuthStoreIncludeSource,
   fanOutOpenCodeOAuthCredential,
   materializeOpenCodeSelectedAuthCredential,
+  type OpenCodeInitialSelectedAuthPublisher,
   mergeOpenCodeManagedAuthSources,
   readOpenCodeSavedAuthStore,
   readOpenCodeCommittedOAuthProbeRotation,
@@ -2810,7 +2812,7 @@ async function resolveOpenCodeProfileScopeInternal(
 /** V2 imports only the selected provider from a process-owned resolution snapshot.
  * The target is a fresh private V2 profile; native legacy migration owns the DB import. */
 export async function materializeOpenCodeSelectedScopeAuth(scope: OpenCodeProfileScope,
-  projectPath: string, targetAuthPath: string, selectedModelID: string | undefined, signal?: AbortSignal): Promise<Readonly<{ package?: string; baseURL?: string; models?: ExecutionProviderModels }>> {
+  projectPath: string, targetAuthPath: string, selectedModelID: string | undefined, signal?: AbortSignal, initialPublish?: OpenCodeInitialSelectedAuthPublisher): Promise<Readonly<{ package?: string; baseURL?: string; models?: ExecutionProviderModels }>> {
   signal?.throwIfAborted()
   const snapshot = openCodeEffectiveConfigSnapshots.get(scope.scopeToken)
   if (!snapshot || !['launch_runtime', 'catalog'].includes(scope.purpose) ||
@@ -2836,7 +2838,7 @@ export async function materializeOpenCodeSelectedScopeAuth(scope: OpenCodeProfil
   if (Object.keys(options).some(key => !['baseURL', 'apiKey'].includes(key))) throw new Error('OpenCode selected provider V2 options are unsupported')
   if (options.apiKey !== undefined && !credential) throw new Error('OpenCode selected provider key is not resolved')
   signal?.throwIfAborted()
-  await materializeOpenCodeSelectedAuthCredential({ authPath: targetAuthPath, providerId: scope.providerId, credential, abortSignal: signal })
+  await materializeOpenCodeSelectedAuthCredential({ authPath: targetAuthPath, providerId: scope.providerId, credential, abortSignal: signal, initialPublish })
   signal?.throwIfAborted()
   return { ...(typeof provider.npm === 'string' ? { package: mapLegacyOpenCodeV2Package(provider.npm) } : {}),
     ...(typeof options.baseURL === 'string' ? { baseURL: options.baseURL } : {}), ...(models ? { models } : {}) }
@@ -3696,6 +3698,16 @@ export class OpenCodeProfileManager {
     if (options.abortSignal?.aborted) throwOpenCodeAbortReason(options.abortSignal)
 
     enterStep('create profile directories')
+    if (await hasWindowsPrivateProfileDirectoryDelivery()) {
+      await ensureWindowsPrivateDirectories([
+        managedPaths.data, path.join(managedPaths.data, 'opencode'),
+        path.join(managedPaths.data, 'opencode', 'profiles'), profileRootPath,
+        homePath, tmpPath, xdgConfigHome, path.join(xdgConfigHome, 'opencode'),
+        xdgDataHome, path.join(xdgDataHome, 'opencode'),
+        xdgCacheHome, sharedNpmCachePath, sharedToolCachePath,
+        ...(policy?.scope.purpose === 'catalog' ? [workingDirectoryPath] : []),
+      ])
+    }
     await Promise.all([
       ensureOpenCodeDirectory(homePath),
       ensureOpenCodeDirectory(tmpPath),

@@ -80,6 +80,12 @@ test('private failure diagnostics preserve finite control causes and redact arbi
     await recordOpenCodeV2ProviderFailure('run-owner-initialization', new Error('cleanup_unknown', { cause: new Error(secret) }), true)
     await recordOpenCodeV2ProviderFailure('run-owner-initialization', new Error(secret, { cause: new Error('selection_mismatch') }), true)
     await recordOpenCodeV2ProviderFailure('run-owner-initialization', new Error('cleanup_unknown', { cause: new Error('selection_mismatch ' + secret) }), true)
+    for (const code of ['execution_selected_oauth_readback_unknown', 'execution_selected_oauth_recovery_required',
+      'execution_selected_oauth_windows_unqualified', 'execution_selected_oauth_provider_unknown',
+      'execution_selected_oauth_integration_unknown', 'execution_selected_oauth_connection_unknown', 'execution_selected_oauth_model_unknown'])
+      await recordOpenCodeV2ProviderFailure('run-owner-initialization', new Error(code), true)
+    const spoofed = Object.assign(new Error(secret), { operation: { operation: 'provider-read', stage: 'decode', status: 403, body: secret } })
+    await recordOpenCodeV2ProviderFailure('run-owner-initialization', spoofed, true)
     const directory = path.join(root, 'opencode/v2/provider-diagnostics')
     const rows = await Promise.all((await readdir(directory)).map(async name => {
       const file = path.join(directory, name), content = await readFile(file, 'utf8')
@@ -92,7 +98,10 @@ test('private failure diagnostics preserve finite control causes and redact arbi
     }))
     expect(rows.sort()).toEqual(['cleanup_unknown', 'cleanup_unknown', 'execution_selected_auth_existing_or_unsupported',
       'provider_operation_unknown', 'provider_operation_unknown', 'provider_operation_unknown', 'run_control_disconnected',
-      'run_control_timeout', 'selection_mismatch'].sort())
+      'run_control_timeout', 'selection_mismatch', 'execution_selected_oauth_readback_unknown',
+      'execution_selected_oauth_recovery_required', 'execution_selected_oauth_windows_unqualified', 'provider_operation_unknown',
+      'execution_selected_oauth_provider_unknown', 'execution_selected_oauth_integration_unknown',
+      'execution_selected_oauth_connection_unknown', 'execution_selected_oauth_model_unknown'].sort())
   } finally {
     if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_DATA_HOME
     else process.env.CLAUDE_MULTIMODEL_DATA_HOME = previous

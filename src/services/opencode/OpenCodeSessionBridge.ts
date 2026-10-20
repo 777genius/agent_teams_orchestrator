@@ -1,5 +1,6 @@
 import { readOpenCodeV1TerminalTranscript } from './OpenCodeV1TerminalTranscriptReader.js'
 import { OpenCodeAuthorityVetoError } from './OpenCodeAuthorityStoreRead.js'
+import { areSameOpenCodeWorkspace } from './OpenCodeBridgePath.js'
 import { createHash } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
 
@@ -2603,6 +2604,18 @@ export class OpenCodeSessionBridge {
     summary: OpenCodeSessionReconcileSummary
     logProjection: OpenCodeLogProjection
   }> {
+    // Historical V1 logs belong to the stored profile/session, not a newly
+    // prepared profile (whose app MCP environment may no longer be available).
+    // This is observation only: never use the snapshot as live turn authority.
+    if (record.opencodeVersion?.startsWith('1.')) {
+      const offline = await this.readOfflineSessionMessagesForLogProjection(record, {
+        staleReason: record.staleReason ?? 'read_only_history',
+        profileAuthState: null,
+        diagnostics: [],
+        requireBoundIdentity: true,
+      })
+      if (offline) return { ...offline, logProjection: this.logProjector.projectSummary(offline.summary) }
+    }
     let reconciled = await this.reconcileSession(record, options)
     if (reconciled.summary.reconcileOutcome === 'stale') {
       try {
@@ -2684,6 +2697,7 @@ export class OpenCodeSessionBridge {
       staleReason: string
       profileAuthState: OpenCodeAuthState | null
       diagnostics: string[]
+      requireBoundIdentity?: boolean
     },
   ): Promise<{
     record: OpenCodeSessionRecord
@@ -2693,6 +2707,15 @@ export class OpenCodeSessionBridge {
     if (!offline || offline.messages.length === 0) {
       return null
     }
+    if (options.requireBoundIdentity && (
+      offline.historyShape !== 'supported' || offline.historyComplete !== true
+      || offline.sessionIdentity?.sessionId !== record.opencodeSessionId
+      || !offline.sessionIdentity.directory
+      || !areSameOpenCodeWorkspace({
+        expectedWorkspaceRoot: record.projectPath,
+        recordProjectPath: offline.sessionIdentity.directory,
+      })
+    )) return null
     const summary = this.eventTranslator.reconcileSessionMessages({
       sessionId: record.opencodeSessionId,
       rawStatus: normalizeOpenCodeSessionStatus(record.lastKnownRawStatus).status,

@@ -412,6 +412,7 @@ export type OpenCodeCanonicalToolStatus = 'running' | 'completed' | 'errored' | 
 
 export type OpenCodeCanonicalToolCall = {
   callId: string | null
+  source?: { kind: 'opencode-v2-code-mode-metadata'; outerCallId: string; index: number }
   toolName: string | null
   title: string | null
   status: OpenCodeCanonicalToolStatus

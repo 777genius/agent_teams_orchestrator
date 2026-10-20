@@ -1,4 +1,5 @@
 import { access, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
 import os from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -32,6 +33,56 @@ describe('OpenCodeAuthStore', () => {
 
   afterEach(async () => {
     await rm(tempDir, { recursive: true, force: true })
+  })
+
+  for (const credential of [null, { type: 'api', key: 'TEST-only-initial-key' }]) {
+    test(`publishes initial selected ${credential ? 'credential' : 'anonymous store'} once with exact bytes`, async () => {
+      const authPath = path.join(tempDir, 'initial-auth.json')
+      const expected = JSON.stringify(credential ? { test: credential } : {}, null, 2)
+      let publications = 0
+      const input = { authPath, providerId: 'test', credential, initialPublish: async (content: string, sha256: string) => {
+        publications++
+        expect(content).toBe(expected)
+        expect(sha256).toBe(createHash('sha256').update(expected).digest('hex'))
+        await writeFile(authPath, content, { flag: 'wx', mode: 0o600 })
+      } }
+      await materializeOpenCodeSelectedAuthCredential(input)
+      await materializeOpenCodeSelectedAuthCredential(input)
+      expect(publications).toBe(1)
+      expect(await readFile(authPath, 'utf8')).toBe(expected)
+      await expect(materializeOpenCodeSelectedAuthCredential({ ...input,
+        credential: { type: 'api', key: 'TEST-changed-key' } })).rejects.toThrow('changed since scope resolution')
+      expect(publications).toBe(1)
+      expect(await readFile(authPath, 'utf8')).toBe(expected)
+    })
+  }
+
+  test('initial publisher remains inside the auth lock and a queued abort never publishes', async () => {
+    const authPath = path.join(tempDir, 'locked-initial-auth.json')
+    let entered!: () => void, release!: () => void, publications = 0
+    const ready = new Promise<void>(resolve => { entered = resolve })
+    const held = new Promise<void>(resolve => { release = resolve })
+    const input = { authPath, providerId: 'test', credential: null, initialPublish: async (content: string) => {
+      publications++
+      entered()
+      await held
+      await writeFile(authPath, content, { flag: 'wx', mode: 0o600 })
+    } }
+    const first = materializeOpenCodeSelectedAuthCredential(input)
+    await ready
+    const second = materializeOpenCodeSelectedAuthCredential(input)
+    const controller = new AbortController()
+    const aborted = materializeOpenCodeSelectedAuthCredential({ ...input, abortSignal: controller.signal })
+      .then(() => null, error => error)
+    try {
+      await new Promise(resolve => setTimeout(resolve, 30))
+      expect(publications).toBe(1)
+      controller.abort(new Error('TEST-initial-auth-aborted'))
+    } finally { release() }
+    await Promise.all([first, second])
+    expect(await aborted).toBe(controller.signal.reason)
+    expect(publications).toBe(1)
+    expect(await readFile(authPath, 'utf8')).toBe('{}')
   })
 
   for (const operationName of ['upsert', 'remove', 'materialize'] as const) {
@@ -798,6 +849,57 @@ await writeFile(process.argv[4], 'finished', 'utf8')
       await refresh
     }
   })
+
+  test('creates only the SDK global private namespace before auth locking and preserves native refusals', async () => {
+    const scriptPath = path.join(tempDir, 'private-global-auth-order.ts')
+    const authStoreUrl = pathToFileURL(path.resolve('src/services/opencode/OpenCodeAuthStore.ts')).href
+    const privateDirectoriesUrl = pathToFileURL(path.resolve('src/services/opencode/profile/OpenCodePrivateDirectories.ts')).href
+    await writeFile(scriptPath, `
+import assert from 'node:assert/strict'
+import { mock } from 'bun:test'
+import { access, mkdir, readFile } from 'node:fs/promises'
+import path from 'node:path'
+const data = path.join(process.argv[2], 'managed-data')
+process.env.CLAUDE_MULTIMODEL_DATA_HOME = data
+const globalAuth = path.join(data, 'opencode', 'auth.json')
+const coordination = globalAuth + '.agent-teams-coordination.sqlite'
+let calls = 0, refuse = false
+const original = new Error('execution_owner_not_private:private_acl_owner:0')
+mock.module(${JSON.stringify(privateDirectoriesUrl)}, () => ({
+  hasWindowsPrivateProfileDirectoryDelivery: async () => true,
+  ensureWindowsPrivateDirectories: async (directories: readonly string[]) => {
+    assert.deepEqual(directories, [data, path.dirname(globalAuth)])
+    if (refuse) throw original
+    assert.equal(await access(coordination).then(() => true, () => false), false)
+    assert.equal(await access(globalAuth).then(() => true, () => false), false)
+    calls++
+    await mkdir(path.dirname(globalAuth), { recursive: true })
+  },
+}))
+const { upsertOpenCodeApiAuthCredential } = await import(${JSON.stringify(authStoreUrl)})
+await upsertOpenCodeApiAuthCredential({ authPath: globalAuth, providerId: 'openrouter', apiKey: 'TEST-noncredential' })
+assert.equal(calls, 1)
+const saved = await readFile(globalAuth, 'utf8')
+const arbitrary = path.join(process.argv[2], 'user-chosen-store', 'auth.json')
+await upsertOpenCodeApiAuthCredential({ authPath: arbitrary, providerId: 'openrouter', apiKey: 'TEST-noncredential' })
+assert.equal(calls, 1)
+assert.equal(JSON.parse(await readFile(arbitrary, 'utf8')).openrouter.key, 'TEST-noncredential')
+refuse = true
+await assert.rejects(upsertOpenCodeApiAuthCredential({ authPath: globalAuth, providerId: 'openrouter', apiKey: 'TEST-replacement' }), error => error === original)
+assert.equal(await readFile(globalAuth, 'utf8'), saved)
+`, 'utf8')
+    // Isolate this ordering double from every other test's native validation.
+    const child = Bun.spawn([process.execPath, scriptPath, tempDir], { stdout: 'ignore', stderr: 'pipe' })
+    let ended = false
+    try {
+      const [code, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()])
+      ended = true
+      expect(stderr).toBe('')
+      expect(code).toBe(0)
+    } finally {
+      if (!ended) { child.kill(); await child.exited }
+    }
+  }, 15_000)
 
   test('reports whether managed auth includes all local source entries', () => {
     expect(

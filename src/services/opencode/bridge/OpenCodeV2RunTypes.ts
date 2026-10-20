@@ -2,18 +2,30 @@ import type { OpenCodePreparedProfile, OpenCodeExecutionProof } from '../types.j
 import type { ControllerToolProof } from './OpenCodeV2ControllerTools.js'
 import type { QueueIntent } from '../execution/OpenCodeV2AdmissionService.js'
 import type { AdmissionRecord, SessionAuthority } from '../execution/OpenCodeV2ExecutionContracts.js'
+import type { RunInitializationPhase } from '../execution/OpenCodeV2Diagnostics.js'
 import type { ExecutionLease, SelectedExecutionProfile, ValidatedExecutionNative } from '../host/OpenCodeV2ExecutionHost.js'
 import type { ExecutionCleanupReceipt } from '../host/OpenCodeV2ExecutionLifecycle.js'
 import type { ExecutionBridgeClient, ExecutionLog, ExecutionMessagePage, ExecutionPermission, ExecutionMcpServer } from '../transport/OpenCodeV2ExecutionClientFactory.js'
 import type { OpenCodeV2TurnProjection } from './OpenCodeV2TurnProjection.js'
 
 export type RunBinding = Readonly<{ teamId: string; runId: string; controllerInstanceId: string; ownerId: string }>
-export type RunProcessIdentity = Readonly<{ pid: number; startTicks: string; bootId: string; executablePath: string; executableSha256: string }>
-export type RunControlRecord = Readonly<{
-  schema: 1; protocol: 1; binding: RunBinding; process: RunProcessIdentity
-  directory: string; socketPath: string; socketDevice: number; socketInode: number
-  deadline: number; uid: number; sourceSha256: string
+export type RunFiletimeIdentity = Readonly<{ kind: 'windows-filetime'; value: string; bootId: null }>
+export type RunWindowsProcessIdentity = Readonly<{
+  pid: number; processCreationTime: RunFiletimeIdentity
+  executablePath: string; executableSha256: string; userSid: string; appContainer: false
 }>
+export type RunProcessIdentity = Readonly<{ pid: number; startTicks: string; bootId: string; executablePath: string; executableSha256: string }>
+export type RunWindowsEndpoint = Readonly<{ kind: 'windows-native-pipe'; name: string; helper: RunWindowsProcessIdentity; bun: RunWindowsProcessIdentity }>
+type RunControlRecordBase = Readonly<{ schema: 1; protocol: 1; binding: RunBinding; directory: string; deadline: number; sourceSha256: string }>
+export type RunUnixControlRecord = RunControlRecordBase & Readonly<{
+  process: RunProcessIdentity
+  socketPath: string; socketDevice: number; socketInode: number; uid: number
+}>
+export type RunWindowsControlRecord = RunControlRecordBase & Readonly<{
+  platform: 'win32'; process: RunWindowsProcessIdentity; endpoint: RunWindowsEndpoint
+}>
+export type RunControlRecord = RunUnixControlRecord | RunWindowsControlRecord
+export type RunAnyProcessIdentity = RunProcessIdentity | RunWindowsProcessIdentity
 export type InstructionReceipt = Readonly<{
   strategy: 'instruction-entry'; key: string; contextHash: string; briefingHash: string
   verified: boolean; missingNativeMessageID: true
@@ -48,11 +60,14 @@ export type RunMemberStatus = Readonly<{
   memberId: string; laneId: string; originalSessionId: string
   selectedModel: string; selectedVariant?: string
   opencodeSessionId: string; runtimeSessionId: string
-  profileEpoch: string; profileRoot: string; pin: '2.0.0' | '2.0.21'; runtimePid?: number
+  profileEpoch: string; profileRoot: string; pin: '2.0.0' | '2.0.32'; runtimePid?: number
   state: 'accepted' | 'unknown' | 'rejected'; bootstrap: InstructionReceipt | null
+  /** Observational age of the current initialization phase, never readiness evidence. */
+  initialization?: Readonly<{ phase: RunInitializationPhase; elapsedMs: number }>
   controllerTools?: ControllerToolProof
 }>
 export type RunStopMember = Readonly<{ memberId: string; cleanup: ExecutionCleanupReceipt | null; errors: readonly string[] }>
+export type RunProbeFailure = 'native_execution_failed' | 'native_execution_cancelled'
 export type RunControlResult =
   | Readonly<{ kind: 'send_refused'; disposition: 'not_reserved'; authority: SessionAuthority; intent: QueueIntent; submissionOwner?: string }>
   | Readonly<{ kind: 'send' | 'observe'; admission: AdmissionRecord; turn: OpenCodeV2TurnProjection | null }>
@@ -60,14 +75,16 @@ export type RunControlResult =
   | Readonly<{ kind: 'permissions'; requests: ExecutionPermission[] }>
   | Readonly<{ kind: 'permissionReply'; status: 'applied' | 'unknown' }>
   | Readonly<{ kind: 'mcp'; servers: ExecutionMcpServer[] }>
-  | Readonly<{ kind: 'probeEvidence'; proof: OpenCodeExecutionProof | null }>
+  | Readonly<{ kind: 'probeEvidence'; proof: OpenCodeExecutionProof | null; failure: RunProbeFailure | null }>
   | Readonly<{ kind: 'status'; qualification?: RunQualification; state: RunOwnerState; members: readonly RunMemberStatus[]; deadline: number }>
   | Readonly<{ kind: 'stop'; state: 'stopped' | 'cleanup_unknown'; members: readonly RunStopMember[]; ownerRetired?: boolean }>
 
 /** These ports preserve real process-owned objects. They are never control DTOs. */
 export type RunExecutionPorts = Readonly<{
   acquire: (native: ValidatedExecutionNative, profile: SelectedExecutionProfile,
-    context: import('../execution/OpenCodeV2ExecutionContracts.js').ExecutionContext) => Promise<ExecutionLease>
+    context: import('../execution/OpenCodeV2ExecutionContracts.js').ExecutionContext,
+    startupGate?: import('../host/OpenCodeV2ExecutionHost.js').ExecutionStartupGate,
+    graphValidation?: import('../host/OpenCodeV2ExecutionBinding.js').ExecutionGraphValidation) => Promise<ExecutionLease>
   client: (authority: ExecutionLease['authority'],
     context: import('../execution/OpenCodeV2ExecutionContracts.js').ExecutionContext) => Promise<ExecutionBridgeClient>
 }>

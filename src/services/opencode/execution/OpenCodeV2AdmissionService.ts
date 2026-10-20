@@ -98,7 +98,7 @@ export class OpenCodeV2AdmissionService {
     await this.store.reserveParkedSeries(snapshots.map(i => ({ identity: i.identity, payloadHash: validateIntent(i, i.input.resume) })))
   }
   readOriginalInput(intent: QueueIntent): Promise<AdmissionRecord> { return this.readOriginalEvidence(intent, true) }
-  private async readOriginalEvidence(intent: QueueIntent, commit: boolean): Promise<AdmissionRecord> {
+  private async readOriginalEvidence(intent: QueueIntent, commit: boolean, strict = false): Promise<AdmissionRecord> {
     intent = JSON.parse(canonicalExecutionJSON(intent)) as QueueIntent
     const hash = validateIntent(intent, intent.input.resume), snapshot = await this.store.snapshot()
     const original = snapshot.admissions.find(r => r.identity.requestId === intent.identity.requestId)
@@ -143,24 +143,38 @@ export class OpenCodeV2AdmissionService {
     } catch {
       // Keep the last committed cursor/evidence and all original IDs; an empty
       // inbox, idle or partial page cannot remove the admission fence.
-      return original
+      return strict ? { ...original, complete: false, disposition: 'unknown' } : original
     }
   }
-  /** Stop may classify a consumed original, but never settle or update after its fence. */
-  async terminalAfterStop(intent: QueueIntent): Promise<boolean> {
+  /** Independent original readback after the fence; never commits or releases its slot. */
+  async dispositionAfterStop(intent: QueueIntent): Promise<'terminal' | 'projected' | 'pending' | 'cancelled' | 'unknown'> {
     try {
       const fenced = await this.store.snapshot()
-      if (!fenced.tombstone || fenced.admissions.find(row => row.identity.requestId === intent.identity.requestId)?.state !== 'accepted') return false
-      const observed = await this.readOriginalEvidence(intent, false)
-      const proof = await readOriginalTerminal(this.client, this.authority, intent, observed)
-      if (!proof) return false
+      const original = fenced.admissions.find(row => row.identity.requestId === intent.identity.requestId)
+      if (!fenced.tombstone || original?.state !== 'accepted') return 'unknown'
+      const observed = await this.readOriginalEvidence(intent, false, true)
+      if (!observed.complete || observed.disposition === 'unknown') return 'unknown'
+      const proof = observed.projectedUserID ? await readOriginalTerminal(this.client, this.authority, intent, observed) : null
       const current = await this.store.snapshot()
-      const original = current.admissions.find(row => row.identity.requestId === proof.requestId)
-      return current.tombstone && !!original && original.state === 'accepted' && original.revision === proof.expectedRevision &&
-        executionHash(original.identity) === proof.identityHash && original.payloadHash === proof.payloadHash &&
-        original.nativePayloadHash === proof.nativePayloadHash
-    } catch { return false }
+      const retained = current.admissions.find(row => row.identity.requestId === intent.identity.requestId)
+      executionAssert(current.tombstone && retained?.state === 'accepted' && retained.revision === original.revision &&
+        observed.revision === original.revision && executionHash(retained.identity) === executionHash(intent.identity) &&
+        retained.payloadHash === original.payloadHash && observed.payloadHash === original.payloadHash &&
+        retained.nativePayloadHash === observed.nativePayloadHash && observed.returnedInboxID === intent.identity.nativeInputID,
+      'stop_original_changed')
+      if (proof) {
+        executionAssert(retained.revision === proof.expectedRevision && executionHash(retained.identity) === proof.identityHash &&
+          retained.payloadHash === proof.payloadHash && retained.nativePayloadHash === proof.nativePayloadHash, 'stop_original_changed')
+        return 'terminal'
+      }
+      if (observed.disposition === 'accepted' && observed.projectedUserID === intent.identity.nativeInputID) return 'projected'
+      if (!observed.projectedUserID && observed.disposition === 'pending') return 'pending'
+      if (!observed.projectedUserID && observed.disposition === 'cancelled') return 'cancelled'
+      return 'unknown'
+    } catch { return 'unknown' }
   }
+  /** Stop may classify a consumed original, but never settle or update after its fence. */
+  async terminalAfterStop(intent: QueueIntent): Promise<boolean> { return await this.dispositionAfterStop(intent) === 'terminal' }
   async settleOriginalInput(intent: QueueIntent): Promise<AdmissionRecord> {
     const snapshot = await this.store.snapshot()
     const original = snapshot.admissions.find(row => row.identity.requestId === intent.identity.requestId)

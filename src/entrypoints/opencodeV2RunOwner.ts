@@ -1,12 +1,15 @@
+import { openCodeBunVersion } from '../constants/openCodeBunVersion.js'
 import { recordOpenCodeV2ProviderFailure } from '../features/runtimeProviderManagement/adapters/opencode/OpenCodeV2ProviderManagement.js'
 import { resolveOpenCodeV2ExecutionDelivery } from '../services/opencode/host/OpenCodeV2ExecutionDelivery.js'
+import { assertExecutionPlatformAvailable } from '../services/opencode/host/OpenCodeV2ExecutionPlatform.js'
 import { executionAssert, executionRecord } from '../services/opencode/execution/OpenCodeV2ExecutionContracts.js'
 import { startOpenCodeV2RunSupervisor, validateRunLaunchPlan } from '../services/opencode/bridge/OpenCodeV2RunOwner.js'
 import type { RunLaunchPlan } from '../services/opencode/bridge/OpenCodeV2RunTypes.js'
 
 // Dedicated IPC entry. Native endpoint passwords and lease authority are
 // never emitted. Launch configuration is not written to a file or log.
-executionAssert(process.platform === 'linux' && process.versions.bun === '1.3.11' && process.connected, 'run_source_entry_required')
+assertExecutionPlatformAvailable()
+executionAssert(process.versions.bun === openCodeBunVersion() && process.connected, 'run_source_entry_required')
 await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'run-owner')
 let started = false
 let supervisor: Awaited<ReturnType<typeof startOpenCodeV2RunSupervisor>> | undefined

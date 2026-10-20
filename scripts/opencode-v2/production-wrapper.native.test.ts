@@ -12,7 +12,7 @@ const workspace = path.resolve(import.meta.dir, '../..')
 
 // Requires a real production build first. This regression fails if the wrapper
 // depends on src, a parent node_modules, a missing child, or mixed pin graphs.
-for (const pin of ['2.0.0', '2.0.21'] as const) test(`sourceless production wrapper reads official ${pin} and keeps summary passive`, async () => {
+for (const pin of ['2.0.0', '2.0.32'] as const) test(`sourceless production wrapper reads official ${pin} and keeps summary passive`, async () => {
   if (process.platform !== 'linux') throw new Error('This packaging gate qualifies Linux only')
   const binary = process.env[pin === '2.0.0' ? 'TEST_OPENCODE_V2_FLOOR_BINARY' : 'TEST_OPENCODE_V2_CURRENT_BINARY']
   if (!binary || !path.isAbsolute(binary)) throw new Error(`Required verified ${pin} native binary missing`)

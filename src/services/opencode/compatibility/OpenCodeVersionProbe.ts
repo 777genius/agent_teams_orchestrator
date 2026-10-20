@@ -212,14 +212,15 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
           }
         }
         const candidates = rows.filter(row => unownedCandidates.has(row.pid))
-        for (const row of candidates) {
-          const state = row.pid === process.pid || row.pid === process.ppid ? 'protected' : ports.alive(row.pid)
-          if (state !== 'gone') {
-            throw cleanupUnknown(state === 'protected' ? 'protected_candidate'
-              : state === 'alive' ? 'candidate_alive' : 'candidate_unknown')
-          }
+        let waiting = false
+        // A live candidate may outlast its stale census row. Observe every
+        // enrolled PID until independently gone; waiting grants no authority.
+        for (const target of unownedCandidates) {
+          const state = target === process.pid || target === process.ppid ? 'protected' : ports.alive(target)
+          if (state === 'alive') waiting = true
+          else if (state !== 'gone') throw cleanupUnknown(state === 'protected' ? 'protected_candidate' : 'candidate_unknown')
         }
-        return candidates.length > 0
+        return candidates.length > 0 || waiting
       }
       if (rows.some(row => !row.retired &&
         (unownedCandidates.has(row.pid) || unownedCandidates.has(row.ppid)))) throw cleanupUnknown('strict_candidate_census')
@@ -228,7 +229,16 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
     const birth = (target: number) => observe(ports.birth(target, Math.min(helperTimeout, cap())))
     const sameBirth = async (target: number, expected: number): Promise<boolean> => {
       const current = await birth(target)
-      if (current === expected) return true
+      if (current === expected) {
+        if (process.platform === 'win32') {
+          // A terminated Windows process object can retain its creation time.
+          // Matching birth alone cannot anchor new census or signal authority.
+          const state = ports.alive(target)
+          if (state === 'gone') return false
+          if (state !== 'alive') throw cleanupUnknown('candidate_unknown')
+        }
+        return true
+      }
       // Exiting between a table snapshot and the birth read is retirement,
       // whereas a live replacement or unreadable live identity is unknown.
       if (ports.alive(target) === 'gone') return false
@@ -291,12 +301,15 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
         }
         const additions = group.filter(row => !births.has(row.pid))
         if (additions.length && !anchor) {
-          const capturedRetirement = process.platform === 'win32' && closed && ended && code === 0 && !failure && !signal?.aborted &&
+          const capturedGone = process.platform === 'win32' && !failure && !signal?.aborted && (!ended || code === 0) &&
             [...births.keys()].every(target => target !== process.pid && target !== process.ppid && ports.alive(target) === 'gone')
-          if (process.platform !== 'win32' || births.size && !capturedRetirement) throw cleanupUnknown('anchor_missing')
+          if (process.platform !== 'win32' || births.size && !capturedGone) throw cleanupUnknown('anchor_missing')
           // A fast wrapper may close before birth capture, or leave a stale
           // census after its captured identities are independently gone.
-          // Waiting confers no signals; strict fresh full tables gate retirement.
+          // OS retirement may precede delivery of Node exit/close events.
+          // Waiting confers no signals; the original final close/exit checks
+          // and strict fresh full tables still gate successful retirement.
+
           unanchoredRetirement = true
           if (pid) unownedCandidates.add(pid)
           for (const target of births.keys()) unownedCandidates.add(target)
@@ -308,6 +321,7 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
           continue
         }
         const capturedAdditions: Member[] = []
+        const additionBirths = new Map<number, number>()
         phase = 'addition_identity'
         for (const row of additions) {
           if (row.pid === process.pid || row.pid === process.ppid) throw cleanupUnknown('protected_addition')
@@ -318,7 +332,15 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
             unownedCandidates.add(row.pid)
             continue
           }
-          const parentBirth = process.platform === 'win32' ? births.get(row.ppid) : births.get(anchor!.pid)
+          additionBirths.set(row.pid, identity)
+          capturedAdditions.push(row)
+        }
+        // Native census order does not guarantee parents precede children.
+        // Validate the complete capture before publishing any signal authority.
+        for (const row of capturedAdditions) {
+          const parentBirth = process.platform === 'win32'
+            ? births.get(row.ppid) ?? additionBirths.get(row.ppid) : births.get(anchor!.pid)
+          const identity = additionBirths.get(row.pid)!
           if (parentBirth === undefined || identity < parentBirth) {
             // Explain this refusal using only the already captured census and
             // births. No further OS reads confer ownership or signal authority.
@@ -339,9 +361,8 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
               additionIndex: additions.indexOf(row), ancestry, ancestryTruncated: ancestor !== undefined,
             })
           }
-          births.set(row.pid, identity)
-          capturedAdditions.push(row)
         }
+        for (const [target, identity] of additionBirths) births.set(target, identity)
         if (additions.length) {
           const confirmationRows = await table()
           phase = 'candidate_validation'
@@ -378,11 +399,13 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
           await boundOpenCodeRead(close, cap())
           await boundOpenCodeRead(Promise.allSettled([...pending]), cap())
           if (pending.size) throw cleanupUnknown('final_pending')
-          if (unownedCandidates.size) {
+          if (unownedCandidates.size || unanchoredRetirement) {
             const finalRows = await table()
             phase = 'retirement'
             assertCandidatesAbsent(finalRows, true)
-            if (members(finalRows).length || finalRows.some(row => !row.retired && births.has(row.pid))) {
+            if (members(finalRows).length
+              || finalRows.some(row => process.platform === 'win32'
+                ? births.has(row.pid) : !row.retired && births.has(row.pid))) {
               throw cleanupUnknown('final_retirement')
             }
             await boundOpenCodeRead(Promise.allSettled([...pending]), cap())

@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
 import { createOpenCodeV2ExecutionConfig, type ExecutionConfigInput } from './OpenCodeV2ExecutionConfig.js'
 
-function input(pin: '2.0.0' | '2.0.21'): ExecutionConfigInput {
+function input(pin: '2.0.0' | '2.0.32'): ExecutionConfigInput {
   return { pin, selection: { agent: 'bridge-worker', model: { providerID: 'provider', id: 'model', variant: 'selected' },
     permissions: [{ action: '*', resource: '*', effect: 'deny' },
       { action: 'mcp', resource: 'agent-teams/*', effect: 'ask' }] },
@@ -10,20 +10,20 @@ function input(pin: '2.0.0' | '2.0.21'): ExecutionConfigInput {
       environment: { CLAUDE_TEAM_CONTROL_URL: 'http://127.0.0.1:1234' } } } }
 }
 describe('selected V2 execution document', () => {
-  for (const pin of ['2.0.0', '2.0.21'] as const) {
+  for (const pin of ['2.0.0', '2.0.32'] as const) {
     test(`${pin} preserves selected ask/deny and selected model without ambient config`, () => {
       const source = input(pin), result = createOpenCodeV2ExecutionConfig(source)
       expect<unknown>(result.info.agents?.['bridge-worker']?.permissions).toEqual(source.selection.permissions)
       expect<unknown>(result.info.permissions).toEqual(source.selection.permissions)
       expect(result.info.model).toEqual({ providerID: 'provider', model: 'model', variant: 'selected' })
-      expect<unknown>(result.info.mcp?.servers?.['agent-teams']).toEqual(source.controller.config)
+      expect<unknown>(result.info.mcp?.servers?.['agent-teams']).toEqual({ ...source.controller.config, ...(process.platform === 'win32' ? { disabled: true } : {}) })
       expect(result.sha256).toBe(createHash('sha256').update(result.content).digest('hex'))
       expect(JSON.parse(result.content)).toEqual(result.info)
       expect(source.selection.permissions).toHaveLength(2)
     })
   }
   test('current config preserves selected rule order and intentional duplicates for the native safety suffix', () => {
-    const source = input('2.0.21')
+    const source = input('2.0.32')
     source.selection = { ...source.selection, permissions: [...source.selection.permissions,
       { action: 'browser', resource: '*', effect: 'deny' },
       { action: 'mcp', resource: 'agent-teams/*', effect: 'ask' }] }
@@ -45,9 +45,26 @@ describe('selected V2 execution document', () => {
   })
 })
 
+for (const pin of ['2.0.0', '2.0.32'] as const) test(`${pin} Windows managed MCP defers autostart without accepting a disabled selection`, () => {
+  const original = Object.getOwnPropertyDescriptor(process, 'platform')!
+  try {
+    Object.defineProperty(process, 'platform', { ...original, value: 'win32' })
+    const source = input(pin)
+    const result = createOpenCodeV2ExecutionConfig(source)
+    const selectedController = source.controller.config
+    const expected = selectedController.type === 'local'
+      ? { ...selectedController, command: [...selectedController.command], disabled: true }
+      : { ...selectedController, disabled: true }
+    expect(result.info.mcp?.servers?.['agent-teams']).toEqual(expected)
+    expect(source.controller.config.disabled).toBeUndefined()
+    source.controller.config.disabled = true
+    expect(() => createOpenCodeV2ExecutionConfig(source)).toThrow('v2_execution_mcp_disabled')
+  } finally { Object.defineProperty(process, 'platform', original) }
+})
+
 import { mapLegacyOpenCodeV2Package, mapSelectedOpenCodeV2Model } from './OpenCodeV2ExecutionConfig.js'
 
-for (const pin of ['2.0.0', '2.0.21'] as const) test(`${pin} real Product empty custom descriptor reaches selected native config without invented catalog metadata`, () => {
+for (const pin of ['2.0.0', '2.0.32'] as const) test(`${pin} real Product empty custom descriptor reaches selected native config without invented catalog metadata`, () => {
   const source = input(pin)
   source.selection = { ...source.selection, model: { providerID: 'groq', id: 'c41-upstream', variant: 'default' } }
   source.provider = { package: mapLegacyOpenCodeV2Package('@ai-sdk/openai-compatible'), baseURL: 'http://127.0.0.1:1234/v1',
@@ -67,6 +84,7 @@ test('selected upstream alias, limits, capabilities and variants preserve suppor
     limit: { context: 32000, output: 2048 }, capabilities: { tools: true, input: ['text'], output: ['text'] },
     variants: [{ id: 'high', settings: { reasoningEffort: 'high' } }] } })
   for (const unsupported of [{ mystery: true }, { id: 'a', modelID: 'b' }, { limit: { context: 'unbounded' } },
+    { capabilities: { tools: false } },
     { capabilities: { tools: true, input: ['text'], output: ['text'], ambient: true } },
     { variants: { high: { disabled: true } } }]) {
     expect(() => mapSelectedOpenCodeV2Model('selected', unsupported)).toThrow()

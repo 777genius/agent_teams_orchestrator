@@ -22,7 +22,7 @@ function message(id: string, type: string, data: Record<string, unknown>): Execu
   return { id, type, timeCreated: 1, data: { id, type, time: { created: 1 }, ...data } }
 }
 function cut(): OpenCodeV2TurnCut {
-  return { pin: '2.0.21', sessionID, nativeInputID, originalText: text, beforeCursor: 0,
+  return { pin: '2.0.32', sessionID, nativeInputID, originalText: text, beforeCursor: 0,
     inboundMessageId: 'TEST-inbound', advertisedTools: [toolName],
     messages: { previous: null, next: null, data: [
       message(nativeInputID, 'user', { text }),
@@ -64,7 +64,7 @@ function retryCut(pin: OpenCodeV2TurnCut['pin']): OpenCodeV2TurnCut {
   value.messages.data[value.messages.data.length - 1] = message('msg_TEST14', 'idle', { outcome: 'succeeded' })
   return { ...value, pin, log: { synced: true, watermark: 14, events } }
 }
-for (const pin of ['2.0.0', '2.0.21'] as const) {
+for (const pin of ['2.0.0', '2.0.32'] as const) {
   test(`${pin} native clean retries 5/6/7/8/9 produce one assistant and one original visible receipt`, () => {
     const projected = projectOpenCodeV2Turn(retryCut(pin))
     expect(projected.state).toBe('succeeded')
@@ -217,8 +217,8 @@ describe('V2 actual durable terminal projection', () => {
 import { capturedR264TerminalCuts } from './fixtures/OpenCodeV2R264TerminalCuts.js'
 import { readExecutionCut } from '../execution/OpenCodeV2TerminalSettlement.js'
 
-for (const captured of capturedR264TerminalCuts) test(`${captured.pin} actual R264 terminal uses its pinned projection with original lineage`, async () => {
-  const native = structuredClone(captured)
+for (const captured of capturedR264TerminalCuts) test(`${captured.pin} historical R264 lineage replays under the selected compatible dialect`, async () => {
+  const native: OpenCodeV2TurnCut = { ...structuredClone(captured), pin: captured.pin === '2.0.0' ? '2.0.0' : '2.0.32' }
   const full = await readExecutionCut({ log: async () => structuredClone(native.log),
     messages: async (_sessionID, cursor) => {
       if (cursor === undefined) return structuredClone(native.messages)

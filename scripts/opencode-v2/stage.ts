@@ -1,3 +1,4 @@
+import { openCodeV2EffectVersion } from '../../src/services/opencode/compatibility/OpenCodeGenerationPolicy.js'
 import { createHash } from 'node:crypto'
 import { cp, lstat, mkdir, readFile, realpath, symlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
@@ -5,11 +6,15 @@ import path from 'node:path'
 export const OPENCODE_V2_EXTERNALS = ['@opencode/*', 'effect', 'effect/*']
 const selections = [
   ['@opencode/server-v2-floor', '@opencode/server', '2.0.0'],
-  ['@opencode/server', '@opencode/server', '2.0.21'],
+  ['@opencode/server', '@opencode/server', '2.0.32'],
   ['@opencode/client-v2-floor', '@opencode/client', '2.0.0'],
-  ['@opencode/client', '@opencode/client', '2.0.21'],
-  ['effect', 'effect', '4.0.0-rc.112'],
-  ['@opencode/schema', '@opencode/schema', '2.0.21'],
+  ['@opencode/client', '@opencode/client', '2.0.32'],
+  ['effect', 'effect', '4.0.1'],
+  // Official core chunks import NodeSocket without declaring this package.
+  // Preserve the installed root resolution in the standalone runtime bundle.
+  ['@effect/platform-node', '@effect/platform-node', '4.0.1'],
+  ['@effect/platform-node-shared', '@effect/platform-node-shared', '4.0.1'],
+  ['@opencode/schema', '@opencode/schema', '2.0.32'],
   ['@modelcontextprotocol/sdk', '@modelcontextprotocol/sdk', '1.29.0'],
 ] as const
 type PackageMetadata = {
@@ -59,42 +64,67 @@ async function packageAt(entry: string): Promise<PackageMetadata> {
   }
 }
 
-async function assertEntry(specifier: string, from: string, name: string, version: string, ownedRoot?: string): Promise<string> {
+async function assertEntry(specifier: string, from: string, name: string, version?: string, ownedRoot?: string): Promise<string> {
   const entry = await realpath(Bun.resolveSync(specifier, from))
   if (ownedRoot) {
     const relative = path.relative(ownedRoot, entry)
     if (relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw new Error('Staged graph escaped its bundle')
   }
   const info = await packageAt(entry)
-  if (info.name !== name || info.version !== version) throw new Error(`OpenCode V2 graph mismatch: ${specifier}`)
+  if (info.name !== name || (version !== undefined && info.version !== version)) throw new Error(`OpenCode V2 graph mismatch: ${specifier}`)
   return entry
 }
 
 /** Validate from each selected server/client's own physical resolution context. */
-async function verifyGraphs(from: string, ownedRoot?: string): Promise<void> {
+export async function verifyGraphs(from: string, ownedRoot?: string): Promise<void> {
   // Root model mapping and its schemas must share one physical Effect instance.
-  const effect = await assertEntry('effect', from, 'effect', '4.0.0-rc.112', ownedRoot)
+  const effect = await assertEntry('effect', from, 'effect', '4.0.1', ownedRoot)
+  await assertEntry('@effect/platform-node/NodeSocket', from, '@effect/platform-node', '4.0.1', ownedRoot)
   for (const specifier of ['@opencode/schema/config/provider', '@opencode/schema/model']) {
-    const schema = await assertEntry(specifier, from, '@opencode/schema', '2.0.21', ownedRoot)
-    if (await assertEntry('effect', path.dirname(schema), 'effect', '4.0.0-rc.112', ownedRoot) !== effect) {
+    const schema = await assertEntry(specifier, from, '@opencode/schema', '2.0.32', ownedRoot)
+    if (await assertEntry('effect', path.dirname(schema), 'effect', '4.0.1', ownedRoot) !== effect) {
       throw new Error('OpenCode V2 schema Effect graph mismatch')
     }
   }
   await assertEntry('@modelcontextprotocol/sdk/client/index.js', from, '@modelcontextprotocol/sdk', '1.29.0', ownedRoot)
-  for (const pin of ['2.0.0', '2.0.21'] as const) {
+  const effects = new Set<string>()
+  for (const pin of ['2.0.0', '2.0.32'] as const) {
+    const version = openCodeV2EffectVersion(pin)
     const server = await assertEntry(pin === '2.0.0' ? '@opencode/server-v2-floor/process' : '@opencode/server/process',
       from, '@opencode/server', pin, ownedRoot)
+    const selectedEffect = await assertEntry('effect', path.dirname(server), 'effect', version, ownedRoot)
+    effects.add(selectedEffect)
+    const sameEffect = async (entry: string) => {
+      if (await assertEntry('effect', path.dirname(entry), 'effect', version, ownedRoot) !== selectedEffect) {
+        throw new Error('OpenCode V2 selected Effect graph mismatch')
+      }
+    }
     for (const [dependency, subpath] of [['core', 'bus'], ['protocol', 'groups/pty'],
       ['schema', 'installation-event'], ['util', 'effect/layer-node'], ['simulation', 'backend']]) {
-      await assertEntry(`@opencode/${dependency}/${subpath}`, path.dirname(server), `@opencode/${dependency}`, pin, ownedRoot)
+      const entry = await assertEntry(`@opencode/${dependency}/${subpath}`, path.dirname(server), `@opencode/${dependency}`, pin, ownedRoot)
+      await sameEffect(entry)
+      if (dependency === 'core') {
+        const ai = await assertEntry('@opencode/ai/route/client', path.dirname(entry), '@opencode/ai', pin, ownedRoot)
+        await sameEffect(ai)
+        // A hoisted shared effect binder must never decode with a foreign Effect.
+        const drizzle = await assertEntry('drizzle-orm/effect-core', path.dirname(entry), 'drizzle-orm', undefined, ownedRoot)
+        await sameEffect(drizzle)
+      }
     }
-    await assertEntry('effect', path.dirname(server), 'effect', '4.0.0-rc.112', ownedRoot)
+    for (const [dependency, subpath] of [['@effect/platform-node', 'NodeHttpServer'], ['@effect/platform-node-shared', 'NodeStream']]) {
+      const entry = await assertEntry(`${dependency}/${subpath}`, path.dirname(server), dependency!, version, ownedRoot)
+      await sameEffect(entry)
+    }
     const client = await assertEntry(pin === '2.0.0' ? '@opencode/client-v2-floor' : '@opencode/client',
       from, '@opencode/client', pin, ownedRoot)
+    // Promise adapters exchange plain JSON and do not execute the optional
+    // Effect client entrypoint. Its schema/protocol packages keep the exact pin.
     for (const [dependency, subpath] of [['protocol', 'groups/pty'], ['schema', 'installation-event']]) {
-      await assertEntry(`@opencode/${dependency}/${subpath}`, path.dirname(client), `@opencode/${dependency}`, pin, ownedRoot)
+      const entry = await assertEntry(`@opencode/${dependency}/${subpath}`, path.dirname(client), `@opencode/${dependency}`, pin, ownedRoot)
+      await assertEntry('effect', path.dirname(entry), 'effect', version, ownedRoot)
     }
   }
+  if (effects.size !== 2) throw new Error('OpenCode V2 pins must retain separate physical Effect graphs')
 }
 
 /** Build-time staging only. No installs or runtime fallbacks. All package bytes
@@ -164,7 +194,7 @@ export async function stageOpenCodeV2Graphs(sourceRoot: string, bundleDirectory:
   }
   await verifyGraphs(path.resolve(bundleDirectory), destination)
   await writeFile(path.join(bundleDirectory, 'opencode-v2-graphs.json'), JSON.stringify({
-    schema: 1, pins: ['2.0.0', '2.0.21'], effect: '4.0.0-rc.112', platform: options.platform ?? process.platform, arch: options.arch ?? process.arch,
+    schema: 1, pins: ['2.0.0', '2.0.32'], effect: '4.0.1', effects: { '2.0.0': '4.0.0-rc.112', '2.0.32': '4.0.1' }, platform: options.platform ?? process.platform, arch: options.arch ?? process.arch,
     packages: [...packages.values()].map(node => ({ name: node.metadata.name, version: node.metadata.version,
       path: path.relative(bundleDirectory, node.target),
     })),

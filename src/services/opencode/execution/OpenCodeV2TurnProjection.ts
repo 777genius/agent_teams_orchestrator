@@ -17,7 +17,7 @@ export type OpenCodeV2TurnProjection = Readonly<{
   toolEffects: readonly OpenCodeV2ToolEffect[]; visibleReplies: readonly OpenCodeV2VisibleReply[]
 }>
 export type OpenCodeV2TurnCut = Readonly<{
-  pin: '2.0.0' | '2.0.21'
+  pin: '2.0.0' | '2.0.32'
   sessionID: string; nativeInputID: string; beforeCursor: number | null; originalText: string
   messages: ExecutionMessagePage; log: ExecutionLog
   inboundMessageId?: string; advertisedTools?: readonly string[]
@@ -84,7 +84,7 @@ export function projectOpenCodeV2Turn(input: OpenCodeV2TurnCut): OpenCodeV2TurnP
   const unknown = (reason: string) => empty('unknown', reason)
   if (input.messages.previous !== null || input.messages.next !== null || input.log.synced !== true)
     return unknown('incomplete_native_cut')
-  if (input.pin !== '2.0.0' && input.pin !== '2.0.21') return unknown('unqualified_projection_pin')
+  if (input.pin !== '2.0.0' && input.pin !== '2.0.32') return unknown('unqualified_projection_pin')
   const events = input.log.events
   if (events.length > 4096 || input.messages.data.length > 1600 ||
       new Set(input.messages.data.map(message => message.id)).size !== input.messages.data.length)
@@ -234,7 +234,7 @@ export function projectOpenCodeV2Turn(input: OpenCodeV2TurnCut): OpenCodeV2TurnP
   // must agree with the actual pinned client projection of that durable event.
   // Floor projection clears retry state for execution endings without adding
   // idle. Current appends idle except native shutdown (both primary pins audited).
-  if (input.pin === '2.0.21' && !(state === 'cancelled' && ending.data.reason === 'shutdown')) {
+  if (input.pin === '2.0.32' && !(state === 'cancelled' && ending.data.reason === 'shutdown')) {
     const idle = input.messages.data.find(message => message.id === messageIDFromEvent(ending.id))
     if (!idle || idle.type !== 'idle' || idle.data.outcome !== (state === 'cancelled' ? 'interrupted' : state))
       return unknown('terminal_snapshot_mismatch')

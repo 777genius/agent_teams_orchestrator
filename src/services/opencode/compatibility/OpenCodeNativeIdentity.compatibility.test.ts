@@ -22,7 +22,7 @@ test.skipIf(process.platform === 'win32')('V1 env-node wrapper is probed through
   // Simulate a Bun installation without a sibling Node binary.
   Object.defineProperty(process,'execPath',{value:path.join(root,'without-node/bun'),configurable:true});
   const selection=await inspectOpenCodeReadSelection();expect(selection.policy).toEqual({generation:'v1',version:'1.18.34'});expect(selection.native).toBeNull();expect(selection.path).toBe(binary);
-  await writeFile(binary,'#!/usr/bin/env node\nconsole.log("opencode v2.0.21")\n');
+  await writeFile(binary,'#!/usr/bin/env node\nconsole.log("opencode v2.0.32")\n');
   await expect(inspectOpenCodeReadSelection()).rejects.toThrow();
  }finally{Object.defineProperty(process,'execPath',{value:executable,configurable:true});process.env=env;await rm(root,{recursive:true,force:true})}
 },15000)

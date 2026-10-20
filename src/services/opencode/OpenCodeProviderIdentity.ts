@@ -23,6 +23,7 @@ export function canonicalizeOpenCodeProviderId(value: string): string {
   // The auth CLI prints the built-in provider's display name, not its ID.
   // Match the spaced label so a custom raw ID "opencode-zen" stays distinct.
   if (displayLabel === 'opencode zen') return 'opencode'
+  if (displayLabel === 'deep infra') return 'deepinfra'
   const label = displayLabel.replace(/ /g, '-')
   return (
     OPEN_CODE_PROVIDER_ALIASES.get(label)

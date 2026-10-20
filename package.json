@@ -13,6 +13,7 @@
     "bun": ">=1.3.11"
   },
   "scripts": {
+    "postinstall": "bun run ./scripts/opencode-v2/ensure-graph-isolation.ts",
     "build": "bun run ./scripts/build.ts",
     "build:dev": "bun run ./scripts/build.ts --dev",
     "build:dev:full": "bun run ./scripts/build.ts --dev --feature-set=dev-full",
@@ -41,12 +42,14 @@
     "@aws-sdk/credential-providers": "^3.1020.0",
     "@azure/identity": "^4.13.1",
     "@commander-js/extra-typings": "^14.0.0",
+    "@effect/platform-node": "4.0.1",
+    "@effect/platform-node-shared": "4.0.1",
     "@google/gemini-cli-core": "0.36.0",
     "@growthbook/growthbook": "^1.6.5",
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "@opencode/client": "2.0.21",
+    "@opencode/client": "2.0.32",
     "@opencode/client-v2-floor": "npm:@opencode/client@2.0.0",
-    "@opencode/server": "2.0.21",
+    "@opencode/server": "2.0.32",
     "@opencode/server-v2-floor": "npm:@opencode/server@2.0.0",
     "@opentelemetry/api": "^1.9.1",
     "@opentelemetry/api-logs": "^0.214.0",
@@ -83,7 +86,7 @@
     "emoji-regex": "^10.6.0",
     "env-paths": "^4.0.0",
     "execa": "^9.6.1",
-    "effect": "4.0.0-rc.112",
+    "effect": "4.0.1",
     "fflate": "^0.8.2",
     "figures": "^6.1.0",
     "fuse.js": "^7.1.0",
@@ -133,7 +136,7 @@
     "@types/proper-lockfile": "4.1.4"
   },
   "patchedDependencies": {
-    "@opencode/core@2.0.21": "patches/@opencode%2Fcore@2.0.21.patch",
-    "@opencode/ai@2.0.21": "patches/@opencode%2Fai@2.0.21.patch"
+    "@opencode/core@2.0.32": "patches/@opencode%2Fcore@2.0.32.patch",
+    "@opencode/ai@2.0.32": "patches/@opencode%2Fai@2.0.32.patch"
   }
 }

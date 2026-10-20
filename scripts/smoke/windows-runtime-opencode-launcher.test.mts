@@ -1,13 +1,13 @@
 import assert from 'node:assert/strict'
 import { spawnSync, type SpawnSyncOptions, type SpawnSyncReturns } from 'node:child_process'
-import { copyFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { copyFileSync, mkdtempSync, rmSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { classifyOpenCodeReadGeneration } from '../../src/services/opencode/compatibility/OpenCodeGenerationPolicy.ts'
 import { privateOpenCodeReadEnvironment } from '../../src/services/opencode/profile/OpenCodeV2ManagedConfig.ts'
-import { spawnSyncPortableCli } from '../../src/utils/portableCli.ts'
+import { resolveDirectWindowsLauncher, spawnSyncPortableCli } from '../../src/utils/portableCli.ts'
 import { runProviderSmoke } from './windows-runtime-opencode-provider-json.mjs'
 
 test('Windows smoke fixture version admits the supported V1 profile path', () => {
@@ -23,9 +23,8 @@ test('Windows smoke fixture version admits the supported V1 profile path', () =>
   } finally { rmSync(root, { recursive: true, force: true }) }
 })
 
-test('emitted Windows smoke launcher resolves Node under the compiled runtime private PATH', {
-  skip: process.platform !== 'win32',
-}, () => {
+test('emitted provider smoke uses the recognized direct npm Node shim before private PATH', () => {
+  let recognized = false
   let version: SpawnSyncReturns<Buffer | string> | undefined
   runProviderSmoke('fixture-runtime-never-executed.exe', { cases: [] }, () => {}, {
     spawn: (_binary: string, _args?: unknown, options?: SpawnSyncOptions) => {
@@ -33,20 +32,32 @@ test('emitted Windows smoke launcher resolves Node under the compiled runtime pr
       if (!version) {
         const launcher = options.env!.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH!
         const root = path.dirname(launcher)
-        const env = privateOpenCodeReadEnvironment(root)
-        // The compiled process lives beside runtime.exe, outside Node's toolcache.
-        env.PATH = [path.join(root, 'runtime-bin'), path.join(env.SystemRoot ?? 'C:\\Windows', 'System32')].join(';')
-        assert.equal(env.PATH.split(';').includes(path.dirname(process.execPath)), false)
-        for (const directory of env.PATH.split(';')) assert.equal(existsSync(path.join(directory, 'cursor-agent.exe')), false)
-        version = spawnSyncPortableCli(launcher, ['--version'], {
-          cwd: root, env, encoding: 'utf8', timeout: 10_000, windowsHide: true,
-        })
+        const originalPlatform = process.platform
+        let direct: ReturnType<typeof resolveDirectWindowsLauncher>
+        try {
+          Object.defineProperty(process, 'platform', { value: 'win32' })
+          direct = resolveDirectWindowsLauncher(launcher)
+        } finally { Object.defineProperty(process, 'platform', { value: originalPlatform }) }
+        assert.ok(direct, 'provider JSON smoke must bypass the arbitrary CMD fallback')
+        assert.deepEqual(direct, { command: 'node', argsPrefix: [path.join(root, 'fake-opencode.cjs')] })
+        recognized = true
+        if (originalPlatform === 'win32') {
+          // Exercise the real launcher with the provider smoke's trusted SDK
+          // environment. Private-child version admission is a separate gate.
+          assert.ok(options.env.PATH?.split(path.delimiter).includes(path.dirname(process.execPath)))
+          version = spawnSyncPortableCli(launcher, ['--version'], {
+            cwd: root, env: options.env, encoding: 'utf8', timeout: 10_000, windowsHide: true,
+          })
+        }
       }
       throw new Error('This contract executes only the emitted fixture launcher')
     },
     cleanup: (_report, root) => { rmSync(root, { recursive: true, force: true }) },
   })
-  assert.ok(version, 'existing smoke hook must expose the emitted launcher')
-  assert.equal(version.status, 0, String(version.stderr))
-  assert.deepEqual(classifyOpenCodeReadGeneration(String(version.stdout)), { generation: 'v1', version: '1.18.34' })
+  assert.equal(recognized, true, 'existing smoke hook must expose the recognized emitted launcher')
+  if (process.platform === 'win32') {
+    assert.ok(version, 'Windows must execute the actual portable launcher')
+    assert.equal(version.status, 0, String(version.stderr))
+    assert.deepEqual(classifyOpenCodeReadGeneration(String(version.stdout)), { generation: 'v1', version: '1.18.34' })
+  }
 })

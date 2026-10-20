@@ -1,7 +1,7 @@
 import type { OpenCodeV2TurnCut } from '../../execution/OpenCodeV2TurnProjection.js'
 
 /** Safe exact retained R264 native4 complete readbacks, preserving native cursors. */
-export const capturedR264TerminalCuts: readonly OpenCodeV2TurnCut[] = [
+export const capturedR264TerminalCuts: readonly (Omit<OpenCodeV2TurnCut, 'pin'> & { pin: '2.0.0' | '2.0.21' })[] = [
   {
     "pin": "2.0.0",
     "sessionID": "ses_1dc4575ab2744b60b1e70f4d55da1a35",

@@ -1,11 +1,20 @@
 import { createHash } from 'node:crypto'
 
-export type ExecutionPin = '2.0.0' | '2.0.21'
+/** One absolute owner startup ceiling; callers may clip it to an earlier deadline. */
+export function openCodeV2RunInitializationMs(platform: NodeJS.Platform): number {
+  return platform === 'win32' ? 300_000 : platform === 'darwin' ? 300_000 : 90_000
+}
+// Windows physical close shares the existing 29s owner Stop envelope. The
+// owner clips this ceiling to leave 2s for the final durable run receipt.
+export const OPEN_CODE_V2_WINDOWS_CLOSE_MS = 27_000
+
+export type ExecutionPin = '2.0.0' | '2.0.32'
+export type ExecutionBirth = Readonly<{ format: 'linux-start-ticks' | 'darwin-pidversion' | 'windows-filetime' | 'utc-ms'; value: string; bootId: string | null }>
 export type ExecutionAuthority = Readonly<{
-  generation: 'v2'; pin: ExecutionPin; dialect: 'v2-2.0.0' | 'v2-2.0.21'
+  generation: 'v2'; pin: ExecutionPin; dialect: 'v2-2.0.0' | 'v2-2.0.32'
   graphSha256: string
   selectedCli: Readonly<{ path: string; sha256: string; version: ExecutionPin }>
-  child: Readonly<{ pid: number; birth: Readonly<{ format: 'linux-start-ticks' | 'utc-ms'; value: string; bootId: string | null }>; executablePath: string; sha256: string }>
+  child: Readonly<{ pid: number; birth: ExecutionBirth; executablePath: string; sha256: string }>
   hostInstanceId: string; profileEpoch: string; profileRoot: string
   directory: string; leaseOwnerId: string
 }>
@@ -55,8 +64,12 @@ export function assertExecutionAuthority(host: ExecutionAuthority): void {
   exactKeys(host, ['generation', 'pin', 'dialect', 'graphSha256', 'selectedCli', 'child', 'hostInstanceId', 'profileEpoch', 'profileRoot', 'directory', 'leaseOwnerId'])
   exactKeys(host.selectedCli, ['path', 'sha256', 'version']); exactKeys(host.child, ['pid', 'birth', 'executablePath', 'sha256'])
   exactKeys(host.child.birth, ['format', 'value', 'bootId'])
-  executionAssert(host.child.birth.format === 'linux-start-ticks' ? typeof host.child.birth.bootId === 'string' && host.child.birth.bootId.length > 0 : host.child.birth.format === 'utc-ms' && host.child.birth.bootId === null)
-  executionAssert(host.generation === 'v2' && (host.pin === '2.0.0' || host.pin === '2.0.21'))
+  executionAssert(host.child.birth.format === 'linux-start-ticks' ? typeof host.child.birth.bootId === 'string' && host.child.birth.bootId.length > 0 :
+    host.child.birth.format === 'darwin-pidversion' ? /^\d+:\d+$/.test(host.child.birth.value) && typeof host.child.birth.bootId === 'string' && /^[a-f0-9-]{36}$/i.test(host.child.birth.bootId) :
+    host.child.birth.format === 'windows-filetime' ? /^[1-9]\d{0,19}$/.test(host.child.birth.value) &&
+      BigInt(host.child.birth.value) <= 0xffffffffffffffffn && host.child.birth.bootId === null :
+    host.child.birth.format === 'utc-ms' && host.child.birth.bootId === null)
+  executionAssert(host.generation === 'v2' && (host.pin === '2.0.0' || host.pin === '2.0.32'))
   executionAssert(host.dialect === `v2-${host.pin}` && host.selectedCli.version === host.pin)
   executionAssert([host.graphSha256, host.selectedCli.sha256, host.child.sha256].every(x => /^[a-f0-9]{64}$/.test(x)))
   executionAssert(Number.isSafeInteger(host.child.pid) && host.child.pid > 0 && typeof host.child.birth.value === 'string' && host.child.birth.value.length > 0)

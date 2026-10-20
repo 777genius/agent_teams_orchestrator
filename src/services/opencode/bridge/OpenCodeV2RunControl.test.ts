@@ -1,22 +1,64 @@
 import { describe, expect, test, spyOn } from 'bun:test'
 import { spawn, execFile, type ChildProcess } from 'node:child_process'
 import { promisify } from 'node:util'
-import { mkdtemp, rm, readFile, rename, chmod, writeFile, mkdir, symlink, lstat } from 'node:fs/promises'
+import { mkdtemp, rm, readFile, rename, chmod, writeFile, mkdir, symlink, lstat, realpath } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { discoverOpenCodeV2Run, awaitOpenCodeV2RunMemberReadiness, parseRunControlRequest, requestOpenCodeV2Run, reserveRunControlDirectory, serveOpenCodeV2RunControl, writeRunControlFile } from './OpenCodeV2RunControl.js'
+import { discoverOpenCodeV2Run, awaitOpenCodeV2RunMemberReadiness, isTransientOpenCodeV2ControlRead, parseRunControlRequest, readRunProcessIdentity, requestOpenCodeV2Run, reserveRunControlDirectory, serveOpenCodeV2RunControl, writeRunControlFile } from './OpenCodeV2RunControl.js'
 import { boundOpenCodeRead } from '../transport/OpenCodeBoundedFetch.js'
+import type { RunControlRecord, RunUnixControlRecord } from './OpenCodeV2RunTypes.js'
+
+function requireUnixControl(record: RunControlRecord | null): asserts record is RunUnixControlRecord {
+  if (!record || !('socketPath' in record)) throw new Error('TEST_unix_control_required')
+}
 
 const peer = fileURLToPath(new URL('./fixtures/OpenCodeV2RunControlPeer.ts', import.meta.url))
 const binding = { teamId: 'TEST-team', runId: 'TEST-run', controllerInstanceId: 'controller', ownerId: 'owner' }
 const execute = promisify(execFile)
+test('readiness retries only proven read transport failures and preserves fatal custody errors', () => {
+  for (const message of ['run_control_timeout', 'run_control_disconnected',
+    'run_control_timeout:read:995', 'run_control_disconnected:read:109']) {
+    expect(isTransientOpenCodeV2ControlRead(new Error(message))).toBe(true)
+  }
+  for (const message of ['execution_native_timeout', 'cleanup_unknown', 'run_control_foreign',
+    'run_control_timeout:write:995', 'run_control_timeout:read:5',
+    'run_control_disconnected:read:995', 'run_control_timeout:foreign:995',
+    'run_control_timeout:read:0995', 'run_control_timeout:read:995:SECRET']) {
+    expect(isTransientOpenCodeV2ControlRead(new Error(message))).toBe(false)
+  }
+  expect(isTransientOpenCodeV2ControlRead({ message: 'run_control_timeout' })).toBe(false)
+})
+test.skipIf(process.platform === 'win32')('shared owned V1 ancestor permits private V2 runs but writable or symlink ancestors fail', async () => {
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'TEST-shared-opencode-')))
+  const ancestor = path.join(root, 'opencode')
+  try {
+    await mkdir(ancestor, { mode: 0o755 }); await chmod(ancestor, 0o755)
+    const directory = await reserveRunControlDirectory(root, binding, 'a'.repeat(64))
+    expect((await lstat(ancestor)).mode & 0o777).toBe(0o755)
+    for (const file of [path.join(ancestor, 'v2'), path.dirname(directory), directory]) {
+      expect((await lstat(file)).mode & 0o777).toBe(0o700)
+    }
+    expect((await lstat(path.join(directory, 'challenge'))).mode & 0o777).toBe(0o600)
+    await chmod(path.join(ancestor, 'v2'), 0o755)
+    await expect(reserveRunControlDirectory(root, { ...binding, runId: 'TEST-exposed-v2' }, 'a'.repeat(64))).rejects.toThrow('run_control_foreign')
+    await chmod(path.join(ancestor, 'v2'), 0o700)
+    await chmod(ancestor, 0o777)
+    await expect(reserveRunControlDirectory(root, { ...binding, runId: 'TEST-writable' }, 'a'.repeat(64))).rejects.toThrow('run_control_foreign')
+    await chmod(ancestor, 0o755); await rename(ancestor, path.join(root, 'original'))
+    await symlink(path.join(root, 'original'), ancestor)
+    await expect(reserveRunControlDirectory(root, { ...binding, runId: 'TEST-symlink' }, 'a'.repeat(64))).rejects.toThrow('run_control_foreign')
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
 function ready(child: ChildProcess): Promise<void> {
   return boundOpenCodeRead(new Promise<void>((resolve, reject) => {
-    let output = ''
+    let output = '', stderr = ''
+    child.stderr?.on('data', chunk => { stderr = (stderr + String(chunk)).slice(-4096) })
     child.stdout?.on('data', chunk => { output += String(chunk); if (output.includes('ready\n')) resolve() })
-    child.once('error', reject); child.once('exit', () => reject(new Error('TEST_peer_exited_before_ready')))
-  }), 5000)
+    child.once('error', reject); child.once('exit', () => reject(new Error('TEST_peer_exited_before_ready: ' + stderr)))
+  // The source peer imports the runtime graph before its bounded 20s initialization.
+  // Match that fixture budget; a 5s import-plus-ready race can reject healthy peers.
+  }), 20_000)
 }
 async function stopTestChild(child: ChildProcess): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) return
@@ -43,8 +85,51 @@ function socketEndpointPeer(fs: typeof import('node:fs'), net: typeof import('no
 }
 
 describe('private run control with separate synthetic CLI processes', () => {
+  test.skipIf(process.platform !== 'darwin')('Darwin retained long directory authenticates status and retires its exact socket without cwd leakage', async () => {
+    const parent = await realpath(await mkdtemp(path.join(os.tmpdir(), 'TEST-darwin-control-')))
+    const root = path.join(parent, 'durable-owner-directory-'.repeat(7))
+    await mkdir(root, { mode: 0o700 })
+    const directory = await reserveRunControlDirectory(root, binding, 'a'.repeat(64)), cwd = process.cwd(), deadline = Date.now() + 20_000
+    const control = await serveOpenCodeV2RunControl(directory, binding, deadline, 'a'.repeat(64),
+      async () => ({ kind: 'status', state: 'starting', members: [], deadline }))
+    requireUnixControl(control.record)
+    try {
+      expect(Buffer.byteLength(control.record.socketPath)).toBeGreaterThan(103)
+      expect(process.cwd()).toBe(cwd)
+      expect(control.record.process.startTicks).toMatch(/^\d+:[1-9]\d*$/)
+      expect(await requestOpenCodeV2Run(control.record, { operation: 'status' }, 5000)).toEqual({ kind: 'status', state: 'starting', members: [], deadline })
+      const module = fileURLToPath(new URL('./OpenCodeV2RunControl.ts', import.meta.url))
+      const freshCLI = await execute(process.execPath, ['-e', `import {discoverOpenCodeV2Run,requestOpenCodeV2Run} from ${JSON.stringify(module)};
+        const record=await discoverOpenCodeV2Run(${JSON.stringify(root)},'TEST-team','TEST-run');
+        if(!record) throw Error('TEST_missing_original');
+        console.log(JSON.stringify({pid:process.pid,result:await requestOpenCodeV2Run(record,{operation:'status'},5000)}));`], { cwd: parent, timeout: 10_000 })
+      const fresh = JSON.parse(freshCLI.stdout)
+      expect(fresh.result).toEqual({ kind: 'status', state: 'starting', members: [], deadline })
+      await expect(readRunProcessIdentity(fresh.pid)).rejects.toMatchObject({ code: 'ESRCH' })
+      expect(process.cwd()).toBe(cwd)
+      await expect(requestOpenCodeV2Run({ ...control.record, process: { ...control.record.process, startTicks: '0:1' } }, { operation: 'status' }, 5000)).rejects.toThrow('run_control_changed')
+      await control.close()
+      await expect(lstat(control.record.socketPath)).rejects.toMatchObject({ code: 'ENOENT' })
+      expect(process.cwd()).toBe(cwd)
+    } finally { await control.close(); await rm(parent, { recursive: true, force: true }) }
+  })
+  test.skipIf(process.platform !== 'darwin')('Darwin listener close preserves a foreign socket basename in the process cwd', async () => {
+    const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'TEST-darwin-cwd-')))
+    const module = fileURLToPath(new URL('./OpenCodeV2RunControl.ts', import.meta.url))
+    try {
+      await writeFile(path.join(root, 'control.sock'), 'TEST foreign sentinel', { mode: 0o600 })
+      const result = await execute(process.execPath, ['-e', `import {reserveRunControlDirectory,serveOpenCodeV2RunControl} from ${JSON.stringify(module)};
+        import {readFile,lstat} from 'node:fs/promises';
+        const binding=${JSON.stringify(binding)}, directory=await reserveRunControlDirectory(process.cwd(),binding,'a'.repeat(64));
+        const control=await serveOpenCodeV2RunControl(directory,binding,Date.now()+5000,'a'.repeat(64),async()=>{throw Error('TEST_no_operation')});
+        await control.close();
+        console.log(JSON.stringify({sentinel:await readFile('control.sock','utf8'),socketGone:await lstat(control.record.socketPath).then(()=>false,e=>e.code==='ENOENT')}));`],
+        { cwd: root, timeout: 10_000 })
+      expect(JSON.parse(result.stdout)).toEqual({ sentinel: 'TEST foreign sentinel', socketGone: true })
+    } finally { await rm(root, { recursive: true, force: true }) }
+  })
   test('long durable path authenticates fresh CLI and scoped stop retires the same socket without touching a foreign sentinel', async () => {
-    const parent = await mkdtemp(path.join(os.tmpdir(), 'TEST-r249-ctl-'))
+    const parent = await realpath(await mkdtemp(path.join(os.tmpdir(), 'TEST-r249-ctl-')))
     const root = path.join(parent, 'long-durable-data-root-'.repeat(7))
     await mkdir(root, { mode: 0o700 })
     const directory = await reserveRunControlDirectory(root, binding, 'a'.repeat(64))
@@ -54,6 +139,7 @@ describe('private run control with separate synthetic CLI processes', () => {
     try {
       await Promise.all([ready(owner), ready(foreign)])
       const record = await discoverOpenCodeV2Run(root, binding.teamId, binding.runId)
+      requireUnixControl(record)
       expect(record?.process.pid).toBe(owner.pid)
       expect(record?.socketPath).toBe(path.join(directory, 'control.sock'))
       const observed = await execute(process.execPath, [peer, 'call', root, JSON.stringify(binding), JSON.stringify({ operation: 'status' })], { timeout: 20_000 })
@@ -85,8 +171,31 @@ describe('private run control with separate synthetic CLI processes', () => {
       if (record) await expect(requestOpenCodeV2Run(record, { operation: 'status' }, 1000)).rejects.toThrow()
     } finally { await Promise.all([stopTestChild(owner), stopTestChild(foreign)]); await rm(parent, { recursive: true, force: true }) }
   }, 120_000)
+  test('operation failures retain only exact private codes while the public result remains unknown', async () => {
+    const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'TEST-run-private-failure-')))
+    const directory = await reserveRunControlDirectory(root, binding, 'a'.repeat(64))
+    let failure = 'mutable_readback'
+    const control = await serveOpenCodeV2RunControl(directory, binding, Date.now() + 30_000, 'a'.repeat(64),
+      async () => { throw new Error(failure) })
+    try {
+      await expect(requestOpenCodeV2Run(control.record, { operation: 'status' }, 5000)).rejects.toThrow('run_operation_unknown')
+      const first = JSON.parse(await readFile(path.join(directory, 'operation-failure.json'), 'utf8'))
+      expect(first).toEqual({ schemaVersion: 1, event: 'opencode_v2_run_operation_failure', binding,
+        operation: 'status', category: 'mutable_readback', timestamp: expect.any(String) })
+      failure = 'mutable_readback SECRET provider body /private/auth'
+      await expect(requestOpenCodeV2Run(control.record, { operation: 'status' }, 5000)).rejects.toThrow('run_operation_unknown')
+      const text = await readFile(path.join(directory, 'operation-failure.json'), 'utf8')
+      expect(JSON.parse(text).category).toBe('unclassified')
+      expect(text).not.toContain('SECRET')
+      expect(text).not.toContain('/private/auth')
+      expect((await lstat(path.join(directory, 'operation-failure.json'))).mode & 0o777).toBe(0o600)
+    } finally {
+      await control.close()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 30_000)
   for (const archiveDelayMs of [250, 10_001]) test(`stop archive reads retain the caller deadline after ${archiveDelayMs}ms`, async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), 'TEST-stop-archive-deadline-'))
+    const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'TEST-stop-archive-deadline-')))
     const directory = await reserveRunControlDirectory(root, binding, 'a'.repeat(64))
     const origin = Date.now()
     let clock = origin, calls = 0, signedDeadline: number | undefined
@@ -116,14 +225,14 @@ describe('private run control with separate synthetic CLI processes', () => {
     }
   })
   test('published control waits for the same delayed native member before its sole original admission', async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), 'TEST-r261-ready-'))
+    const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'TEST-r261-ready-')))
     const directory = await reserveRunControlDirectory(root, binding, 'a'.repeat(64))
     const owner = spawn(process.execPath, [peer, 'serve-delayed', root, JSON.stringify(binding)], { stdio: ['ignore', 'pipe', 'pipe'] })
     try {
       await ready(owner)
       const record = await discoverOpenCodeV2Run(root, binding.teamId, binding.runId)
       if (!record) throw new Error('TEST_record_missing')
-      const target = { memberId: 'worker', originalSessionId: 'ses_TESToriginal', selectedModel: 'TEST/TEST', pin: '2.0.21' as const }
+      const target = { memberId: 'worker', originalSessionId: 'ses_TESToriginal', selectedModel: 'TEST/TEST', pin: '2.0.32' as const }
       const send = { operation: 'send' as const, memberId: target.memberId, originalSessionId: target.originalSessionId,
         intent: { delivery: 'queue' as const, identity: { requestId: 'request', deliveryAttemptId: 'attempt', localMessageId: 'local', nativeInputID: 'msg_TESToriginal' },
           input: { nativeInputID: 'msg_TESToriginal', text: 'TEST delayed original', resume: true } } }
@@ -147,14 +256,14 @@ describe('private run control with separate synthetic CLI processes', () => {
     } finally { await stopTestChild(owner); await rm(root, { recursive: true, force: true }) }
   }, 120_000)
   test('permanent starting and original stop never authorize admission', async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), 'TEST-r261-ready-'))
+    const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'TEST-r261-ready-')))
     const directory = await reserveRunControlDirectory(root, binding, 'a'.repeat(64))
     const owner = spawn(process.execPath, [peer, 'serve-delayed', root, JSON.stringify(binding)], { stdio: ['ignore', 'pipe', 'pipe'] })
     try {
       await ready(owner)
       const record = await discoverOpenCodeV2Run(root, binding.teamId, binding.runId)
       if (!record) throw new Error('TEST_record_missing')
-      const target = { memberId: 'worker', originalSessionId: 'ses_TESToriginal', selectedModel: 'TEST/TEST', pin: '2.0.21' as const }
+      const target = { memberId: 'worker', originalSessionId: 'ses_TESToriginal', selectedModel: 'TEST/TEST', pin: '2.0.32' as const }
       expect(await awaitOpenCodeV2RunMemberReadiness(record, target, 1000)).toBeNull()
       await expect(lstat(path.join(directory, 'synthetic-effects.json'))).rejects.toMatchObject({ code: 'ENOENT' })
       const waiting = awaitOpenCodeV2RunMemberReadiness(record, target, 5000).catch(() => null)
@@ -169,7 +278,7 @@ describe('private run control with separate synthetic CLI processes', () => {
     } finally { await stopTestChild(owner); await rm(root, { recursive: true, force: true }) }
   }, 120_000)
   test('changed socket/owner binding or public challenge permissions cannot authorize a stop', async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), 'TEST-r249-ctl-'))
+    const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'TEST-r249-ctl-')))
     const directory = await reserveRunControlDirectory(root, binding, 'a'.repeat(64))
     const owner = spawn(process.execPath, [peer, 'serve', root, JSON.stringify(binding)], { stdio: ['ignore', 'pipe', 'pipe'] })
     try {
@@ -177,6 +286,7 @@ describe('private run control with separate synthetic CLI processes', () => {
       const record = await discoverOpenCodeV2Run(root, binding.teamId, binding.runId)
       expect(record).not.toBeNull()
       if (!record) throw new Error('TEST_record_missing')
+      requireUnixControl(record)
       await expect(requestOpenCodeV2Run({ ...record, binding: { ...binding, ownerId: 'foreign' } }, { operation: 'stop' }, 1000)).rejects.toThrow('run_control_changed')
       const challenge = path.join(directory, 'challenge')
       await chmod(challenge, 0o644)
@@ -188,12 +298,13 @@ describe('private run control with separate synthetic CLI processes', () => {
       const durable = JSON.parse(await readFile(path.join(directory, 'control.json'), 'utf8'))
       expect(durable.binding.ownerId).toBe('owner'); expect(owner.exitCode).toBeNull()
     } finally { await stopTestChild(owner); await rm(root, { recursive: true, force: true }) }
-  }, 15_000)
-  test('replaced pathname refuses cleanup but still retires the owned listener without unlinking the replacement', async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), 'TEST-r249-ctl-'))
+  }, 30_000)
+  test.skipIf(process.platform !== 'linux')('replaced pathname refuses cleanup but still retires the owned listener without unlinking the replacement', async () => {
+    const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'TEST-r249-ctl-')))
     const directory = await reserveRunControlDirectory(root, binding, 'a'.repeat(64))
     const control = await serveOpenCodeV2RunControl(directory, binding, Date.now() + 5000, 'a'.repeat(64),
       async () => { throw new Error('TEST_no_operation') })
+    requireUnixControl(control.record)
     const original = `${control.record.socketPath}.original`
     try {
       await rename(control.record.socketPath, original)
@@ -221,7 +332,7 @@ describe('private run control with separate synthetic CLI processes', () => {
     } finally { await control.close().catch(() => undefined); await rm(root, { recursive: true, force: true }) }
   })
   test('existing foreign socket path and symlink cannot be reclaimed on startup', async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), 'TEST-r249-ctl-'))
+    const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'TEST-r249-ctl-')))
     const directory = await reserveRunControlDirectory(root, binding, 'a'.repeat(64))
     const socketPath = path.join(directory, 'control.sock'), sentinel = path.join(root, 'foreign-sentinel')
     try {

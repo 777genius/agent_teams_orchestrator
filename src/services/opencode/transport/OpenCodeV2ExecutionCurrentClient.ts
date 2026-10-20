@@ -1,6 +1,9 @@
-import { OpenCode } from '@opencode/client'
+import { ClientError, OpenCode } from '@opencode/client'
 import type { ExecutionOperations } from './OpenCodeV2ExecutionClientFactory.js'
 import type { OpenCodeV2ExecutionFetch } from './OpenCodeV2ExecutionFetch.js'
+
+// Loaded only after the factory qualifies this selected pin's installed graph.
+export const executionCurrentClientErrorPrototype: object = ClientError.prototype
 
 /** Exact current Promise API stays private to this adapter. */
 export function executionCurrentOperations(baseUrl: string, directory: string, wire: OpenCodeV2ExecutionFetch, bridgeFetch: typeof globalThis.fetch): ExecutionOperations {
@@ -19,7 +22,7 @@ export function executionCurrentOperations(baseUrl: string, directory: string, w
     prompt: (sessionID, input) => sdk.session.prompt({ sessionID, id: input.nativeInputID, text: input.text,
       files: input.files, agents: input.agents, skills: input.skills, delivery: 'queue', resume: input.resume }),
     inbox: sessionID => sdk.session.inbox.list({ sessionID }),
-    messages: (sessionID, cursor) => sdk.message.list({ sessionID, cursor, limit: 200 }),
+    messages: (sessionID, cursor) => sdk.message.list({ sessionID, cursor, limit: 200, ...(cursor === undefined ? { order: 'asc' as const } : {}) }),
     log: (sessionID, after) => sdk.session.log({ sessionID, after, follow: false }),
     putInstruction: (sessionID, key, value) => bridge.session.instructions.entry.put({ sessionID, key, value }),
     instructions: sessionID => bridge.session.instructions.entry.list({ sessionID }),
