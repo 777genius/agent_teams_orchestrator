@@ -2,8 +2,8 @@
  * Shared utilities for spawning teammates across different backends.
  */
 
-import { createHash } from 'node:crypto'
 import { assertMemberEnvPatch, type MemberEnvPatch } from './memberEnvPatch.js'
+import { writeOwnedMemberSettingsFile } from './memberSettingsFile.js'
 import { mkdtemp, writeFile } from 'node:fs/promises'
 import { chmodSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -122,33 +122,16 @@ export function mergeMemberSettingsFragment(
   return { ...(base ?? {}), ...fragment }
 }
 
-/**
- * Materializes a child settings file that carries the member settings fragment
- * merged over an inherited settings file. Content-hash based path so identical
- * settings produce identical paths (prompt-cache friendly). Returns null when
- * the base settings file cannot be read or written.
- */
+/** Materialize a private lifecycle-owned copy without exposing inherited settings in argv. */
 export function materializeMergedMemberSettingsFile(
   baseSettingsPath: string,
   fragment: Record<string, unknown>,
 ): string | null {
   const baseSettings = readSettingsJsonFile(baseSettingsPath)
-  if (!baseSettings) {
-    return null
-  }
-  const merged = mergeMemberSettingsFragment(baseSettings, fragment)
-  const serialized = JSON.stringify(merged)
-  const contentHash = createHash('sha256').update(serialized).digest('hex').slice(0, 32)
-  const outputPath = join(
-    tmpdir(),
-    `claude-teammate-member-settings-${contentHash}.json`,
-  )
   try {
-    writeFileAtomicSync(outputPath, `${JSON.stringify(merged, null, 2)}\n`, {
-      mode: 0o600,
-    })
-    chmodSync(outputPath, 0o600)
-    return outputPath
+    return baseSettings
+      ? writeOwnedMemberSettingsFile(mergeMemberSettingsFragment(baseSettings, fragment))
+      : null
   } catch {
     return null
   }

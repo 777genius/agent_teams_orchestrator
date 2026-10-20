@@ -1626,7 +1626,7 @@ describe('per-member spawn customizations', () => {
     }
   })
 
-  it('materializes identical merged member settings to a stable content-hashed path', async () => {
+  it('materializes merged member settings inside separate private owner directories', async () => {
     const tempRoot = await mkdtemp(join(tmpdir(), 'member-settings-hash-'))
 
     try {
@@ -1649,7 +1649,7 @@ describe('per-member spawn customizations', () => {
       const first = materializeMergedMemberSettingsFile(basePath, fragment!)
       const second = materializeMergedMemberSettingsFile(basePath, fragment!)
       expect(first).toBeTruthy()
-      expect(second).toBe(first)
+      expect(second).not.toBe(first)
 
       const merged = JSON.parse(await readFile(first!, 'utf8')) as Record<string, unknown>
       expect(merged.model).toBe('opus')

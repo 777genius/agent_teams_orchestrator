@@ -232,6 +232,28 @@ describe('spawnTeammate partial in-process spawn cleanup', () => {
           ),
         ).rejects.toThrow('per-member spawn customizations')
 
+        let fallbackMutations = 0
+        const previousForceProcess = process.env.CLAUDE_TEAM_FORCE_PROCESS_TEAMMATES
+        process.env.CLAUDE_TEAM_FORCE_PROCESS_TEAMMATES = '0'
+        __setSpawnMultiAgentDepsForTests({
+          isInProcessEnabled: () => false,
+          getTeammateModeFromSnapshot: () => 'auto',
+          detectAndGetBackend: async () => { throw new Error('test pane backend unavailable') },
+          markInProcessFallback: () => { fallbackMutations++ },
+        })
+        try {
+          await expect(spawnTeammate({
+            name: 'gateway-fallback',
+            team_name: 'atlas-hq',
+            prompt: 'Wait for work',
+            gatewayUsageRef: 'gateway-run-123',
+          }, toolUseContext)).rejects.toThrow('per-member spawn customizations')
+          expect(fallbackMutations).toBe(0)
+        } finally {
+          if (previousForceProcess === undefined) delete process.env.CLAUDE_TEAM_FORCE_PROCESS_TEAMMATES
+          else process.env.CLAUDE_TEAM_FORCE_PROCESS_TEAMMATES = previousForceProcess
+        }
+
         // Members without per-member customizations pass the guard.
         expect(
           getInProcessSpawnCustomizationRejection({

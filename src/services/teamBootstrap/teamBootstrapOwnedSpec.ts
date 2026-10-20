@@ -12,6 +12,9 @@ function sameFile(expected: Stats, actual: Stats): boolean {
 }
 
 function isPrivate(stat: Stats): boolean {
+  // Windows exposes synthetic mode bits; privacy comes from the user temp
+  // directory ACL inherited by the writer, not POSIX chmod permissions.
+  if (process.platform === 'win32') return true
   return (
     (typeof process.getuid !== 'function' || stat.uid === process.getuid()) &&
     (stat.mode & 0o077) === 0
@@ -106,29 +109,43 @@ async function removeSameFile(filePath: string, expected: Stats): Promise<void> 
   }
 }
 
+async function consumeOwnedSpec(specPath: string, owned: OwnedSpec): Promise<void> {
+  try {
+    const currentDirectory = await fs.lstat(owned.directory)
+    if (!currentDirectory.isDirectory() || !sameFile(owned.directoryStat, currentDirectory)) {
+      throw new Error('owned team bootstrap directory changed during consumption')
+    }
+    await removeSameFile(specPath, owned.specStat)
+    await removeSameFile(owned.ownerPath, owned.ownerStat)
+    await fs.rmdir(owned.directory)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+  }
+}
+
 /** Consume only the private one-shot file created by the desktop writer. */
 export async function withOwnedTeamBootstrapSpec<T>(
   specPath: string,
   read: () => Promise<T>,
 ): Promise<T> {
   const owned = await leaseOwnedSpec(specPath)
+  let result: T
   try {
-    return await read()
-  } finally {
+    result = await read()
+  } catch (readError) {
     if (owned) {
       try {
-        const currentDirectory = await fs.lstat(owned.directory)
-        if (!currentDirectory.isDirectory() || !sameFile(owned.directoryStat, currentDirectory)) {
-          throw new Error('owned team bootstrap directory changed during consumption')
-        }
-        await removeSameFile(specPath, owned.specStat)
-        await removeSameFile(owned.ownerPath, owned.ownerStat)
-        await fs.rmdir(owned.directory)
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-          throw error
-        }
+        await consumeOwnedSpec(specPath, owned)
+      } catch (cleanupError) {
+        throw new AggregateError(
+          [readError, cleanupError],
+          'Team bootstrap spec could not be read or safely removed',
+          { cause: readError },
+        )
       }
     }
+    throw readError
   }
+  if (owned) await consumeOwnedSpec(specPath, owned)
+  return result
 }

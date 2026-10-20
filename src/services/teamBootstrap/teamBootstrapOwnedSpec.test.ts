@@ -61,6 +61,14 @@ describe('one-shot app-owned bootstrap spec consumption', () => {
     }
   })
 
+  test.skipIf(process.platform === 'win32')('preserves specs with non-private POSIX permissions', async () => {
+    const { directory, specPath, ownerPath } = await fixture()
+    await fs.chmod(specPath, 0o644)
+    await withOwnedTeamBootstrapSpec(specPath, () => readTeamBootstrapSpec(specPath))
+    expect(await fs.exists(directory)).toBe(true)
+    expect(JSON.parse(await fs.readFile(ownerPath, 'utf8')).consumerPid).toBeUndefined()
+  })
+
   test('preserves user-supplied specs on successful and failed reads', async () => {
     const { directory, specPath, ownerPath } = await fixture()
     await fs.unlink(ownerPath)
@@ -88,6 +96,25 @@ describe('one-shot app-owned bootstrap spec consumption', () => {
       expect((await fs.lstat(original)).isSymbolicLink()).toBe(true)
       expect(await fs.exists(moved)).toBe(true)
     }
+  })
+
+  test('preserves the read error and cleanup error without removing a replacement', async () => {
+    const { specPath } = await fixture()
+    const readError = new SyntaxError('malformed owned spec')
+    try {
+      await withOwnedTeamBootstrapSpec(specPath, async () => {
+        await fs.rename(specPath, `${specPath}.old`)
+        await fs.writeFile(specPath, 'replacement', { mode: 0o600 })
+        throw readError
+      })
+      throw new Error('expected bootstrap read failure')
+    } catch (error) {
+      expect(error).toBeInstanceOf(AggregateError)
+      expect((error as AggregateError).cause).toBe(readError)
+      expect((error as AggregateError).errors[0]).toBe(readError)
+      expect((error as AggregateError).errors[1].message).toMatch(/changed/)
+    }
+    expect(await fs.readFile(specPath, 'utf8')).toBe('replacement')
   })
 
   test('preserves a replacement file instead of unlinking a changed identity', async () => {

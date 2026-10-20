@@ -3491,6 +3491,7 @@ type SpawnMultiAgentDepsForTests = {
   detectAndGetBackend?: typeof detectAndGetBackend
   getTeammateModeFromSnapshot?: typeof getTeammateModeFromSnapshot
   isInProcessEnabled?: typeof isInProcessEnabled
+  markInProcessFallback?: typeof markInProcessFallback
 }
 
 let spawnMultiAgentDepsForTests: SpawnMultiAgentDepsForTests | null = null
@@ -3513,6 +3514,8 @@ function getSpawnMultiAgentDeps(): Required<SpawnMultiAgentDepsForTests> {
       getTeammateModeFromSnapshot,
     isInProcessEnabled:
       spawnMultiAgentDepsForTests?.isInProcessEnabled ?? isInProcessEnabled,
+    markInProcessFallback:
+      spawnMultiAgentDepsForTests?.markInProcessFallback ?? markInProcessFallback,
   }
 }
 
@@ -3605,9 +3608,13 @@ async function handleSpawn(
       logForDebugging(
         `[handleSpawn] No pane backend available, falling back to in-process: ${errorMessage(error)}`,
       )
+      // Reject before changing session-wide mode: a failed customized spawn
+      // must not force subsequent ordinary teammates into the in-process lane.
+      const customizationRejection = getInProcessSpawnCustomizationRejection(spawnInput)
+      if (customizationRejection) throw new Error(customizationRejection)
       // Record the fallback so isInProcessEnabled() reflects the actual mode
       // (fixes banner and other UI that would otherwise show tmux attach commands).
-      markInProcessFallback()
+      spawnDeps.markInProcessFallback()
       return await handleSpawnInProcess(spawnInput, context)
     }
 
