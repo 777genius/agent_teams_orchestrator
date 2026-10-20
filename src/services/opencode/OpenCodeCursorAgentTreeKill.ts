@@ -4,12 +4,15 @@ import { readProcessStartTimeMs } from '../../utils/processKill.js'
 import { windowsNativeProcess } from '../../utils/windowsNativeProcess.js'
 
 export type NativeRow = { pid: number; ppid: number }
+export type NativeGeneration = Readonly<NativeRow & { birth: number }>
 export type CursorAgentNativePorts = {
   platform: NodeJS.Platform
   selfPid: number
   now: () => number
   birth: (pid: number, timeout: number) => Promise<number | null>
   tree: (timeout: number) => Promise<NativeRow[]>
+  /** Read-only pre-spawn witness; unavailable backends grant no exclusions. */
+  existingWindows?: (deadline: number) => Promise<readonly NativeGeneration[] | null>
   signal: (pid: number) => void
   alive: (pid: number) => 'alive' | 'gone' | 'unknown'
   taskkill: (pid: number, timeout: number) => Promise<void>
@@ -115,6 +118,43 @@ export function nativePorts(overrides: Partial<CursorAgentNativePorts> = {},
   }
   return {
     platform: process.platform, selfPid: process.pid, now: Date.now,
+    existingWindows: async deadline => {
+      if (process.platform !== 'win32') return null
+      // Never turn this optional proof into N cold PowerShell starts. Native
+      // reads close every handle and are bounded by the original probe clock.
+      const kernel32 = await windowsNativeProcess()
+      if (!kernel32) return null
+      const cap = () => { if (Date.now() >= deadline) throw new Error('Native witness deadline exhausted') }
+      const table = () => {
+        cap()
+        const rows = kernel32.table(), seen = new Set<number>()
+        if (rows.length > 4096) throw new Error('Oversized native witness')
+        for (const row of rows) {
+          if (!Number.isSafeInteger(row.pid) || row.pid < 0 || !Number.isSafeInteger(row.ppid)
+            || row.ppid < 0 || seen.has(row.pid)) throw new Error('Unreadable native witness')
+          seen.add(row.pid)
+        }
+        cap()
+        return rows
+      }
+      const captured: NativeGeneration[] = []
+      for (const row of table()) {
+        cap()
+        if (!row.pid || row.pid === process.pid || row.pid === process.ppid) continue
+        const birth = kernel32.birth(row.pid)
+        cap()
+        if (positive(birth)) captured.push({ ...row, birth })
+      }
+      const confirmed = table(), result: NativeGeneration[] = []
+      for (const row of captured) {
+        cap()
+        if (!confirmed.some(current => current.pid === row.pid && current.ppid === row.ppid)) continue
+        const birth = kernel32.birth(row.pid)
+        cap()
+        if (birth === row.birth) result.push(row)
+      }
+      return result
+    },
     birth: async (pid, timeout) => {
       if (!Number.isSafeInteger(pid) || pid <= 0) return null
       if (process.platform === 'linux') return readProcessStartTimeMs(pid, 'linux', timeout)
