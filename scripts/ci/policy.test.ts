@@ -32,6 +32,26 @@ test('event ranges distinguish PR merge base, push before/head and new branches'
   assert.throws(() => diffArgs('pull_request', '0'.repeat(40), head))
 })
 
+test('effective model ownership and fixture changes retain both native authority lanes', () => {
+  for (const path of [
+    'src/services/runtimeBackends/effectiveDefaultModel.ts',
+    'src/services/runtimeBackends/effectiveDefaultModel.test.ts',
+    'src/cli/effectiveDefaultModel.entry.test.ts',
+    'src/cli/runtimeStatusCommand.entry.test.ts',
+    'src/cli/handlers/model.ts',
+    'src/cli/handlers/model.test.ts',
+    'src/cli/handlers/anthropicCompatibleRuntime.integration.test.ts',
+  ]) {
+    assert.equal(classify([path]).native, 'true', path)
+    assert.deepEqual(
+      JSON.parse(classify([path]).authority_os),
+      ['ubuntu-latest', 'windows-latest'],
+      path,
+    )
+  }
+  assert.equal(classify(['src/cli/handlers/unrelated.ts']).native, 'false')
+})
+
 test('NUL records preserve old/deleted paths and unusual filenames', () => {
   const paths = parsePaths('src/services/opencode/OpenCodeHostIdentity.ts\0docs/renamed file\nTEST.md\0')
   assert.equal(paths.length, 2)
