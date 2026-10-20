@@ -11,6 +11,23 @@ export type NativeAppManagedBootstrapSpec = {
   generatedAt: string
 }
 
+/**
+ * Final narrow per-member env patch applied after all inherited-auth env
+ * transformations at spawn time. Values may contain secret literals and must
+ * never be logged, persisted to diagnostics, or fed into request hashes.
+ */
+export type BootstrapMemberEnvPatch = import('../../utils/swarm/memberEnvPatch.js').MemberEnvPatch
+
+/**
+ * Per-member Codex provider overrides. These belong to the member's runtime,
+ * not the lead's settings: when present they replace (never merge with) the
+ * lead's codex settings namespace for that member's spawn.
+ */
+export type BootstrapMemberCodexSettings = {
+  configOverrides?: string[]
+  forcedLoginMethod?: 'api'
+}
+
 export type TeamBootstrapSpec = {
   version: 1
   runId: string
@@ -48,6 +65,9 @@ export type TeamBootstrapSpec = {
     mcpSettingSources?: string
     strictMcpConfig?: boolean
     nativeAppManagedBootstrap?: NativeAppManagedBootstrapSpec
+    env?: BootstrapMemberEnvPatch
+    codex?: BootstrapMemberCodexSettings
+    gatewayUsageRef?: string
   }>
   launch?: {
     bootstrapTimeoutMs?: number
@@ -104,6 +124,9 @@ export type NormalizedBootstrapMember = {
   mcpSettingSources?: string
   strictMcpConfig?: boolean
   nativeAppManagedBootstrap?: NativeAppManagedBootstrapSpec
+  env?: BootstrapMemberEnvPatch
+  codex?: BootstrapMemberCodexSettings
+  gatewayUsageRef?: string
 }
 
 export type BootstrapMemberLifecycleStatus =
@@ -126,6 +149,8 @@ export type BootstrapMemberState = {
   agentId?: string
   backendType?: string
   runtimePid?: number
+  /** Opaque usage identity marker for later usage accounting. Never a secret. */
+  gatewayUsageRef?: string
 }
 
 export type TeamBootstrapSummary = {

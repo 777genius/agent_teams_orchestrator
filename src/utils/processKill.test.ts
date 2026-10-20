@@ -3,6 +3,7 @@ import * as childProcess from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import { PassThrough } from 'node:stream'
 import { join } from 'node:path'
+import * as nativeProcess from './windowsNativeProcess.js'
 
 import {
   buildWindowsTaskkillInvocation,
@@ -15,6 +16,7 @@ import {
   parseLinuxProcessStartTicks,
   readProcessCommandLine,
   readProcessStartTimeMs,
+  readWindowsProcessStartTimeMsWithPowerShell,
 } from './processKill.js'
 
 const originalSystemRoot = process.env.SystemRoot
@@ -67,15 +69,18 @@ describe('processKill', () => {
   })
 
   it('does not spawn an identity query for an invalid pid', async () => {
+    const native = spyOn(nativeProcess, 'windowsNativeProcess').mockRejectedValue(new Error('Invalid PID must not query native identity'))
     const spawn = spyOn(childProcess, 'spawn').mockImplementation(() => {
       throw new Error('Invalid PID must not spawn')
     })
     for (const pid of [0, -1, 1.5, NaN, Infinity, -Infinity, Number.MAX_SAFE_INTEGER + 1,
       0x80000000, '123', '123; exit 0', null, undefined]) {
       await expect(readProcessStartTimeMs(pid as number, 'win32')).resolves.toBeNull()
+      await expect(readWindowsProcessStartTimeMsWithPowerShell(pid as number)).resolves.toBeNull()
     }
     await expect(readProcessCommandLine(-1, 'win32')).resolves.toBeNull()
     expect(spawn).not.toHaveBeenCalled()
+    expect(native).not.toHaveBeenCalled()
   })
 
   function mockWindowsQuery() {
@@ -115,9 +120,55 @@ describe('processKill', () => {
     }
   }
 
+  it('uses native Windows creation time without spawning or reading the process table', async () => {
+    const birth = mock(() => 1_792_513_777_348)
+    const table = mock(() => { throw new Error('Identity must not enumerate processes') })
+    const native = spyOn(nativeProcess, 'windowsNativeProcess').mockResolvedValue({ birth, table })
+    const spawn = spyOn(childProcess, 'spawn').mockImplementation(() => { throw new Error('Native identity must not spawn') })
+    await expect(readProcessStartTimeMs(2104, 'win32')).resolves.toBe(1_792_513_777_348)
+    expect(native).toHaveBeenCalledTimes(1)
+    expect(birth).toHaveBeenCalledTimes(1)
+    expect(birth).toHaveBeenCalledWith(2104)
+    expect(table).not.toHaveBeenCalled()
+    expect(spawn).not.toHaveBeenCalled()
+  })
+
+  it('does not fall back after native Windows denial, exit, or observation error', async () => {
+    const birth = mock<() => number | null>(() => null)
+    spyOn(nativeProcess, 'windowsNativeProcess').mockResolvedValue({ birth, table: () => [] })
+    const spawn = spyOn(childProcess, 'spawn').mockImplementation(() => { throw new Error('Native result must not fall back') })
+    await expect(readProcessStartTimeMs(2104, 'win32')).resolves.toBeNull()
+    birth.mockImplementation(() => { throw new Error('Native observation failed') })
+    await expect(readProcessStartTimeMs(2104, 'win32')).resolves.toBeNull()
+    expect(birth).toHaveBeenCalledTimes(2)
+    expect(spawn).not.toHaveBeenCalled()
+  })
+
+  it('fails closed if native capability resolution rejects', async () => {
+    spyOn(nativeProcess, 'windowsNativeProcess').mockRejectedValue(new Error('Unknown native capability'))
+    const spawn = spyOn(childProcess, 'spawn').mockImplementation(() => { throw new Error('Unknown capability must not fall back') })
+    await expect(readProcessStartTimeMs(2104, 'win32')).resolves.toBeNull()
+    expect(spawn).not.toHaveBeenCalled()
+  })
+
+  it('uses one unchanged bounded PowerShell query only when native capability is unavailable', async () => {
+    spyOn(nativeProcess, 'windowsNativeProcess').mockResolvedValue(null)
+    const { child, spawn } = mockWindowsQuery()
+    const clock = mockQueryClock()
+    const result = readProcessStartTimeMs(2104, 'win32')
+    await Promise.resolve()
+    expect(spawn).toHaveBeenCalledTimes(1)
+    expect(spawn.mock.calls[0]![0]).toBe('powershell.exe')
+    expect(clock.timer.mock.calls[0]![1]).toBe(6_000)
+    child.stdout.write('2026-09-09T03:26:43.6163024Z\r\n')
+    child.emit('close', 0)
+    await expect(result).resolves.toBe(Date.parse('2026-09-09T03:26:43.6163024Z'))
+    expect(clock.pendingCount()).toBe(0)
+  })
+
   it('queries the same Windows creation time through .NET without cmdlet autoimport', async () => {
     const { child, spawn } = mockWindowsQuery()
-    const result = readProcessStartTimeMs(2104, 'win32')
+    const result = readWindowsProcessStartTimeMsWithPowerShell(2104)
     expect(spawn).toHaveBeenCalledTimes(1)
     const [command, args, options] = spawn.mock.calls[0]!
     expect(command).toBe('powershell.exe')
@@ -141,7 +192,7 @@ describe('processKill', () => {
     for (const [output, code] of [['', 0], ['not a timestamp', 0],
       ['2026-09-09T03:26:43.6163024Z\n', 1], ['2026-09-09T03:26:43.6163024Z\n', null]] as const) {
       const { child, spawn } = mockWindowsQuery()
-      const result = readProcessStartTimeMs(2104, 'win32')
+      const result = readWindowsProcessStartTimeMsWithPowerShell(2104)
       child.stdout.write(output)
       child.emit('close', code)
       await expect(result).resolves.toBeNull()
@@ -152,18 +203,18 @@ describe('processKill', () => {
 
   it('fails closed on Windows query spawn errors without a fallback', async () => {
     const { child, spawn } = mockWindowsQuery()
-    const result = readProcessStartTimeMs(2104, 'win32')
+    const result = readWindowsProcessStartTimeMsWithPowerShell(2104)
     child.emit('error', new Error('ENOENT'))
     await expect(result).resolves.toBeNull()
     expect(spawn).toHaveBeenCalledTimes(1)
     spawn.mockImplementation(() => { throw new Error('EACCES') })
-    await expect(readProcessStartTimeMs(2104, 'win32')).resolves.toBeNull()
+    await expect(readWindowsProcessStartTimeMsWithPowerShell(2104)).resolves.toBeNull()
     expect(spawn).toHaveBeenCalledTimes(2)
   })
 
   it('retains the 64 KiB Windows identity output bound', async () => {
     const { child } = mockWindowsQuery()
-    const result = readProcessStartTimeMs(2104, 'win32')
+    const result = readWindowsProcessStartTimeMsWithPowerShell(2104)
     child.stdout.write(' '.repeat(64 * 1024))
     child.stdout.write('2026-09-09T03:26:43.6163024Z\n')
     child.emit('close', 0)
@@ -173,7 +224,7 @@ describe('processKill', () => {
   it('accepts the first cold Windows identity after the old budget without a retry', async () => {
     const { child, spawn } = mockWindowsQuery()
     const clock = mockQueryClock()
-    const result = readProcessStartTimeMs(2104, 'win32')
+    const result = readWindowsProcessStartTimeMsWithPowerShell(2104)
     let settled = false
     void result.then(() => { settled = true })
     clock.advanceTo(5_500)
@@ -193,7 +244,7 @@ describe('processKill', () => {
   it('kills a hung Windows query at 6 seconds and ignores partial or late success', async () => {
     const { child, spawn } = mockWindowsQuery()
     const clock = mockQueryClock()
-    const result = readProcessStartTimeMs(2104, 'win32')
+    const result = readWindowsProcessStartTimeMsWithPowerShell(2104)
     expect(clock.timer.mock.calls[0]![1]).toBe(6_000)
     child.stdout.write('2026-09-09T03:26:43.6163024Z\n')
     clock.advanceTo(5_999)
@@ -212,7 +263,7 @@ describe('processKill', () => {
   it('still rejects invalid output after a cold Windows startup', async () => {
     const { child, spawn } = mockWindowsQuery()
     const clock = mockQueryClock()
-    const result = readProcessStartTimeMs(2104, 'win32')
+    const result = readWindowsProcessStartTimeMsWithPowerShell(2104)
     clock.advanceTo(3_000)
     child.stdout.write('not a timestamp\r\n')
     child.emit('close', 0)
@@ -245,7 +296,7 @@ describe('processKill', () => {
 
   it('startup accepts four-second Windows identity and legacy reads with a six-second override', async () => {
     for (const query of [
-      () => readProcessStartTimeMs(2104, 'win32', 6_000),
+      () => readWindowsProcessStartTimeMsWithPowerShell(2104, 6_000),
       () => readProcessCommandLine(2104, 'win32', 6_000),
     ]) {
       const { child } = mockWindowsQuery()

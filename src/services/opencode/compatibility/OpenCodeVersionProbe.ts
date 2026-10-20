@@ -6,6 +6,20 @@ import { nativePorts, query, type NativeHelperFailure, type NativeRow } from '..
 import type { OpenCodeV2ReadRoots } from '../profile/OpenCodeV2ManagedConfig.js'
 import { boundOpenCodeRead } from '../transport/OpenCodeBoundedFetch.js'
 
+type ParentIdentityDiagnostic = Readonly<{
+  reason: 'missing_parent_birth' | 'child_before_parent'
+  pid: number
+  ppid: number
+  parentPid: number
+  childBirth: number
+  parentBirth: number | null
+  parentCandidate: boolean
+  anchorPid: number
+  additionIndex: number
+  ancestry: ReadonlyArray<Readonly<{ pid: number; ppid: number; capturedBirth: number | null; censusIndex: number }>>
+  ancestryTruncated: boolean
+}>
+
 export type OpenCodeProbeTerminalDiagnostic = Readonly<{
   phase: 'initial_birth' | 'census' | 'candidate_validation' | 'anchor_identity' | 'addition_identity'
     | 'identity_confirmation' | 'signal' | 'retirement' | 'wait' | 'roots_remove'
@@ -22,6 +36,7 @@ export type OpenCodeProbeTerminalDiagnostic = Readonly<{
   lastGroupCount?: number | null
   lastSurvivorCount?: number | null
   remainingMs?: number
+  parentIdentity?: ParentIdentityDiagnostic
 }>
 
 /** Last helper observation and actual terminal decision are separate evidence. */
@@ -50,6 +65,16 @@ export function getOpenCodeVersionProbeDiagnostics(error: unknown) {
     closed: terminal.closed, ended: terminal.ended, exitCode: terminal.exitCode,
     birthsCount: terminal.birthsCount, candidatesCount: terminal.candidatesCount, pendingCount: terminal.pendingCount,
     lastGroupCount: terminal.lastGroupCount, lastSurvivorCount: terminal.lastSurvivorCount, remainingMs: terminal.remainingMs,
+    ...(terminal.guard === 'parent_identity' && terminal.parentIdentity ? { parentIdentity: {
+      reason: terminal.parentIdentity.reason, pid: terminal.parentIdentity.pid, ppid: terminal.parentIdentity.ppid,
+      parentPid: terminal.parentIdentity.parentPid, childBirth: terminal.parentIdentity.childBirth,
+      parentBirth: terminal.parentIdentity.parentBirth, parentCandidate: terminal.parentIdentity.parentCandidate,
+      anchorPid: terminal.parentIdentity.anchorPid, additionIndex: terminal.parentIdentity.additionIndex,
+      ancestry: terminal.parentIdentity.ancestry.slice(0, 8).map(row => ({
+        pid: row.pid, ppid: row.ppid, capturedBirth: row.capturedBirth, censusIndex: row.censusIndex,
+      })),
+      ancestryTruncated: terminal.parentIdentity.ancestryTruncated || terminal.parentIdentity.ancestry.length > 8,
+    } } : {}),
   })
   return diagnostics
 }
@@ -171,8 +196,8 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
       remainingMs: Math.max(0, Math.min(deadlineMs, deadline - Date.now())),
     })
     snapshotCleanup = snapshot
-    const cleanupUnknown = (guard: OpenCodeProbeTerminalDiagnostic['guard']): Error => {
-      terminalDiagnostic = snapshot(phase, guard)
+    const cleanupUnknown = (guard: OpenCodeProbeTerminalDiagnostic['guard'], parentIdentity?: ParentIdentityDiagnostic): Error => {
+      terminalDiagnostic = { ...snapshot(phase, guard), ...(parentIdentity ? { parentIdentity } : {}) }
       return new Error('cleanup_unknown')
     }
     let unanchoredRetirement = false
@@ -315,7 +340,27 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
         for (const row of capturedAdditions) {
           const parentBirth = process.platform === 'win32'
             ? births.get(row.ppid) ?? additionBirths.get(row.ppid) : births.get(anchor!.pid)
-          if (parentBirth === undefined || additionBirths.get(row.pid)! < parentBirth) throw cleanupUnknown('parent_identity')
+          const identity = additionBirths.get(row.pid)!
+          if (parentBirth === undefined || identity < parentBirth) {
+            // Explain this refusal using only the already captured census and
+            // births. No further OS reads confer ownership or signal authority.
+            const ancestry: Array<ParentIdentityDiagnostic['ancestry'][number]> = []
+            const seen = new Set<number>()
+            let ancestor: Member | undefined = row
+            while (ancestor && ancestry.length < 8 && !seen.has(ancestor.pid)) {
+              seen.add(ancestor.pid)
+              ancestry.push({ pid: ancestor.pid, ppid: ancestor.ppid,
+                capturedBirth: births.get(ancestor.pid) ?? null, censusIndex: rows.indexOf(ancestor) })
+              ancestor = ancestor.pid === pid ? undefined : rows.find(current => current.pid === ancestor!.ppid)
+            }
+            const parentPid = process.platform === 'win32' ? row.ppid : anchor!.pid
+            throw cleanupUnknown('parent_identity', {
+              reason: parentBirth === undefined ? 'missing_parent_birth' : 'child_before_parent',
+              pid: row.pid, ppid: row.ppid, parentPid, childBirth: identity, parentBirth: parentBirth ?? null,
+              parentCandidate: unownedCandidates.has(parentPid), anchorPid: anchor!.pid,
+              additionIndex: additions.indexOf(row), ancestry, ancestryTruncated: ancestor !== undefined,
+            })
+          }
         }
         for (const [target, identity] of additionBirths) births.set(target, identity)
         if (additions.length) {

@@ -124,6 +124,8 @@ test('POSIX stalled cancellation kills only the child without manufacturing clea
 },10_000)
 } else {
 test('Windows abrupt caller termination closes the exact immediate sidecar process', async () => {
+  // Cold PowerShell/WMI startup on hosted Windows runners can exceed 8s.
+  // Give identity acquisition its own budget; WaitForExit still enforces 5s.
   // Windows Node kill(SIGTERM) is TerminateProcess, not a POSIX handler call.
   // Retain the sidecar's kernel handle BEFORE killing the caller: PID absence
   // alone cannot distinguish termination from PID reuse. This proves only the
@@ -184,7 +186,7 @@ let data='';process.stdin.on('data',x=>data+=x);process.stdin.on('end',async()=>
   const pid=JSON.parse(line).pid;if(!Number.isSafeInteger(pid)||pid<=0)throw Error('sidecar_pid_invalid');
   w=spawn(r.powershell,['-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',r.watcher,String(pid),String(c.pid),realpathSync.native(r.bun)],{stdio:'pipe'});
   w.stdout.on('data',x=>watchout+=x);w.stderr.on('data',x=>watcherr+=x);
-  const ready=await Promise.race([new Promise((resolve,reject)=>{const read=()=>{const ready=watchout.split('\\n').slice(0,-1).find(x=>x.startsWith('READY '));if(ready){w.stdout.off('data',read);resolve(ready)}};w.stdout.on('data',read);w.once('error',reject);w.once('close',()=>reject(Error('identity_observer_failed')))}),new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('identity_observer_timeout')),8000)})]);clearTimeout(timer);
+  const ready=await Promise.race([new Promise((resolve,reject)=>{const read=()=>{const ready=watchout.split('\\n').slice(0,-1).find(x=>x.startsWith('READY '));if(ready){w.stdout.off('data',read);resolve(ready)}};w.stdout.on('data',read);w.once('error',reject);w.once('close',()=>reject(Error('identity_observer_failed')))}),new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('identity_observer_timeout')),20000)})]);clearTimeout(timer);
   const identity=JSON.parse(ready.slice(6));if(!ready.startsWith('READY ')||identity.pid!==pid||identity.parentPid!==c.pid||!/^\\d+$/.test(identity.birth))throw Error('sidecar_identity_invalid');
   const closed=once(c,'close'),observed=once(w,'close');if(!c.kill('SIGTERM'))throw Error('caller_termination_failed');w.stdin.end('WAIT\\n');
   const [[exit,signal],[watchExit]]=await Promise.race([Promise.all([closed,observed]),new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('termination_observation_timeout')),8000)})]);clearTimeout(timer);
@@ -206,5 +208,5 @@ let data='';process.stdin.on('data',x=>data+=x);process.stdin.on('end',async()=>
   expect(result.watchExit,diagnostic).toBe(0)
   expect(result.result,diagnostic).toEqual({gone:true,cleanupRequired:false})
   expect(result.stderr,diagnostic).toBe('');expect(result.watcherr,diagnostic).toBe('')
-},30_000)
+},45_000)
 }

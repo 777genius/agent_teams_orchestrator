@@ -12,14 +12,20 @@ import {
 } from '../../bootstrap/state.js'
 import { AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV } from '../anthropicConnectionMode.js'
 import { parseArguments } from '../argumentSubstitution.js'
+import { eagerParseCliFlags, mergeJsonObjectCliFlagValues } from '../cliArgs.js'
+import { buildCodexNativeCustomProviderConfigOverrides } from '../../services/codexNative/customProviderConfigOverrides.js'
+import { CODEX_FORCED_LOGIN_METHOD_ENV_VAR } from '../../services/runtimeBackends/codexBackendResolver.js'
 
 import {
+  applyFinalMemberEnvPatch,
   buildPaneLauncherCommand,
   buildAppManagedAnthropicApiKeyHelperSettingsFlag,
   buildInheritedCliFlags,
   buildInheritedEnvObject,
   buildInheritedEnvVars,
+  buildMemberCodexSettingsFragment,
   buildProviderScopedInheritedSettingsInline,
+  materializeMergedMemberSettingsFile,
   shouldClearCodexApiKeysForTeammateSpawn,
   shouldClearAnthropicApiKeyForTeammateSpawn,
   stripInheritedCliFlag,
@@ -313,7 +319,7 @@ describe('shouldClearAnthropicApiKeyForTeammateSpawn', () => {
     }
   })
 
-  it('scrubs inherited gateway routing for explicit direct Anthropic teammates', () => {
+  it.each(['api_key', 'subscription'] as const)('scrubs inherited gateway models and routing for %s Anthropic teammates', mode => {
     const keys = [
       AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV,
       'ANTHROPIC_API_KEY',
@@ -321,6 +327,8 @@ describe('shouldClearAnthropicApiKeyForTeammateSpawn', () => {
       'ANTHROPIC_BASE_URL',
       'ANTHROPIC_CUSTOM_HEADERS',
       'ANTHROPIC_AWS_WORKSPACE_ID',
+      'ANTHROPIC_MODEL',
+      'ANTHROPIC_SMALL_FAST_MODEL',
       'ANTHROPIC_DEFAULT_SONNET_MODEL',
       'CLAUDE_CODE_OAUTH_TOKEN',
       'CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST',
@@ -328,7 +336,7 @@ describe('shouldClearAnthropicApiKeyForTeammateSpawn', () => {
     const original = new Map(keys.map(key => [key, process.env[key]]))
 
     try {
-      process.env[AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV] = 'api_key'
+      process.env[AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV] = mode
       process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1'
       process.env.ANTHROPIC_API_KEY = 'sk-ant-direct'
       process.env.ANTHROPIC_AUTH_TOKEN = 'ambient-token'
@@ -336,18 +344,22 @@ describe('shouldClearAnthropicApiKeyForTeammateSpawn', () => {
       process.env.ANTHROPIC_CUSTOM_HEADERS =
         'Authorization: Bearer ambient-token'
       process.env.ANTHROPIC_AWS_WORKSPACE_ID = 'wrkspc_should_not_win'
+      process.env.ANTHROPIC_MODEL = 'gateway-main'
+      process.env.ANTHROPIC_SMALL_FAST_MODEL = 'gateway-small'
       process.env.ANTHROPIC_DEFAULT_SONNET_MODEL = 'bedrock-model-id'
       process.env.CLAUDE_CODE_OAUTH_TOKEN = 'ambient-oauth-token'
 
       const env = buildInheritedEnvObject({ provider: 'anthropic' })
 
-      expect(env.ANTHROPIC_API_KEY).toBe('sk-ant-direct')
+      expect(env.ANTHROPIC_API_KEY).toBe(mode === 'api_key' ? 'sk-ant-direct' : '')
       expect(env.ANTHROPIC_AUTH_TOKEN).toBe('')
       expect(env.ANTHROPIC_BASE_URL).toBe('')
       expect(env.ANTHROPIC_CUSTOM_HEADERS).toBe('')
       expect(env.ANTHROPIC_AWS_WORKSPACE_ID).toBe('')
+      expect(env.ANTHROPIC_MODEL).toBe('')
+      expect(env.ANTHROPIC_SMALL_FAST_MODEL).toBe('')
       expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('')
-      expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe('')
+      expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe(mode === 'api_key' ? '' : undefined)
     } finally {
       for (const key of keys) {
         const value = original.get(key)
@@ -357,13 +369,19 @@ describe('shouldClearAnthropicApiKeyForTeammateSpawn', () => {
     }
   })
 
-  it('preserves compatible endpoint auth while clearing external model aliases', () => {
+  it('preserves compatible endpoint models and auth while clearing cloud backend routing', () => {
     const keys = [
       AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV,
       'ANTHROPIC_AUTH_TOKEN',
       'ANTHROPIC_BASE_URL',
       'ANTHROPIC_CUSTOM_HEADERS',
+      'ANTHROPIC_MODEL',
+      'ANTHROPIC_SMALL_FAST_MODEL',
       'ANTHROPIC_DEFAULT_OPUS_MODEL',
+      'ANTHROPIC_DEFAULT_OPUS_MODEL_NAME',
+      'CLAUDE_CODE_SUBAGENT_MODEL',
+      'ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION',
+      'ANTHROPIC_AWS_WORKSPACE_ID',
     ] as const
     const original = new Map(keys.map(key => [key, process.env[key]]))
 
@@ -372,14 +390,60 @@ describe('shouldClearAnthropicApiKeyForTeammateSpawn', () => {
       process.env.ANTHROPIC_AUTH_TOKEN = 'local-token'
       process.env.ANTHROPIC_BASE_URL = 'http://localhost:1234'
       process.env.ANTHROPIC_CUSTOM_HEADERS = 'X-Gateway-Tenant: team-1'
-      process.env.ANTHROPIC_DEFAULT_OPUS_MODEL = 'bedrock-opus-id'
+      process.env.ANTHROPIC_MODEL = 'gateway-main'
+      process.env.ANTHROPIC_SMALL_FAST_MODEL = 'gateway-small'
+      process.env.ANTHROPIC_DEFAULT_OPUS_MODEL = 'gateway-opus'
+      process.env.ANTHROPIC_DEFAULT_OPUS_MODEL_NAME = 'Gateway Opus'
+      process.env.CLAUDE_CODE_SUBAGENT_MODEL = 'gateway-subagent'
+      process.env.ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION = 'us-east-1'
+      process.env.ANTHROPIC_AWS_WORKSPACE_ID = 'ambient-workspace'
 
       const env = buildInheritedEnvObject({ provider: 'anthropic' })
 
       expect(env.ANTHROPIC_AUTH_TOKEN).toBe('local-token')
       expect(env.ANTHROPIC_BASE_URL).toBe('http://localhost:1234')
       expect(env.ANTHROPIC_CUSTOM_HEADERS).toBe('X-Gateway-Tenant: team-1')
-      expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('')
+      expect(env.ANTHROPIC_MODEL).toBe('gateway-main')
+      expect(env.ANTHROPIC_SMALL_FAST_MODEL).toBe('gateway-small')
+      expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('gateway-opus')
+      expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL_NAME).toBe('Gateway Opus')
+      expect(env.CLAUDE_CODE_SUBAGENT_MODEL).toBe('gateway-subagent')
+      expect(env.ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION).toBe('')
+      expect(env.ANTHROPIC_AWS_WORKSPACE_ID).toBe('')
+    } finally {
+      for (const key of keys) {
+        const value = original.get(key)
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+    }
+  })
+
+  it('keeps compatible model overrides ahead of inherited models, including explicit clears', () => {
+    const keys = [
+      AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV,
+      'ANTHROPIC_MODEL',
+      'ANTHROPIC_SMALL_FAST_MODEL',
+      'CLAUDE_CODE_SUBAGENT_MODEL',
+    ] as const
+    const original = new Map(keys.map(key => [key, process.env[key]]))
+    try {
+      process.env[AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV] = 'compatible'
+      process.env.ANTHROPIC_MODEL = 'inherited-main'
+      process.env.ANTHROPIC_SMALL_FAST_MODEL = 'inherited-small'
+      delete process.env.CLAUDE_CODE_SUBAGENT_MODEL
+
+      const env = buildInheritedEnvObject({
+        provider: 'anthropic',
+        extraEnv: {
+          ANTHROPIC_MODEL: 'overridden-main',
+          ANTHROPIC_SMALL_FAST_MODEL: '',
+        },
+      })
+
+      expect(env.ANTHROPIC_MODEL).toBe('overridden-main')
+      expect(env.ANTHROPIC_SMALL_FAST_MODEL).toBe('')
+      expect(env.CLAUDE_CODE_SUBAGENT_MODEL).toBe('')
     } finally {
       for (const key of keys) {
         const value = original.get(key)
@@ -671,8 +735,9 @@ describe('shouldClearAnthropicApiKeyForTeammateSpawn', () => {
     const originalFlagSettingsPath = getFlagSettingsPath()
     const originalFlagSettingsInline = getFlagSettingsInline()
     const helperDir = '/var/folders/team-runtime-auth/mixed/runs/run-1'
-    const inheritedAnthropicSettingsPath =
-      `/private${helperDir}/runtime-settings-anthropic.json`
+    const inheritedAnthropicSettingsPath = process.platform === 'darwin'
+      ? `/private${helperDir}/runtime-settings-anthropic.json`
+      : `${helperDir}/runtime-settings-anthropic.json`
 
     process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1'
     process.env.CLAUDE_TEAM_ANTHROPIC_AUTH_MODE = 'api_key_helper'
@@ -794,7 +859,7 @@ describe('shouldClearAnthropicApiKeyForTeammateSpawn', () => {
       '/var/folders/agent-teams-runtime-settings/mixed/run/runtime-settings-anthropic.json'
 
     process.env.CLAUDE_TEAM_RUNTIME_SETTINGS_PATH = settingsPath
-    setFlagSettingsPath(`/private${settingsPath}`)
+    setFlagSettingsPath(process.platform === 'darwin' ? `/private${settingsPath}` : settingsPath)
     setFlagSettingsInline({
       apiKeyHelper: "'/tmp/helper.sh'",
       awsCredentialExport: '/tmp/aws.sh',
@@ -1265,6 +1330,331 @@ describe('shouldClearAnthropicApiKeyForTeammateSpawn', () => {
       } else {
         process.env.CLAUDE_CODE_ENTRY_PROVIDER = originalEntryProvider
       }
+    }
+  })
+})
+
+describe('per-member spawn customizations', () => {
+  const CUSTOM_PROVIDER_OVERRIDES = [
+    'model_provider="agent_teams_custom"',
+    'model_providers.agent_teams_custom.name="Agent Teams Custom"',
+    'model_providers.agent_teams_custom.wire_api="responses"',
+    'model_providers.agent_teams_custom.env_key="CODEX_API_KEY"',
+    'model_providers.agent_teams_custom.base_url="https://member.example/v1"',
+  ]
+  const CANONICAL_CUSTOM_PROVIDER_OVERRIDES = [
+    'model_provider="agent_teams_custom"',
+    'model_providers.agent_teams_custom.name="Agent Teams Custom"',
+    'model_providers.agent_teams_custom.base_url="https://member.example/v1"',
+    'model_providers.agent_teams_custom.wire_api="responses"',
+    'model_providers.agent_teams_custom.env_key="CODEX_API_KEY"',
+  ]
+
+  function roundTripSettings(flags: string): Record<string, unknown> {
+    const argv = parseArguments(flags)
+    const merged = mergeJsonObjectCliFlagValues(
+      eagerParseCliFlags('--settings', argv),
+    )
+    expect(merged).toBeTruthy()
+    return JSON.parse(merged!) as Record<string, unknown>
+  }
+
+  it('applies the member env patch after all inherited auth transformations', () => {
+    const keys = ['ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_API_KEY'] as const
+    const original = new Map(keys.map(key => [key, process.env[key]]))
+
+    try {
+      process.env.ANTHROPIC_AUTH_TOKEN = 'parent-token'
+      process.env.ANTHROPIC_BASE_URL = 'https://parent.example'
+      process.env.ANTHROPIC_API_KEY = 'parent-key'
+
+      // Without the patch, the parent's auth token is inherited.
+      expect(buildInheritedEnvObject({ provider: 'anthropic' })).toHaveProperty(
+        'ANTHROPIC_AUTH_TOKEN',
+        'parent-token',
+      )
+
+      const env = buildInheritedEnvObject({
+        provider: 'anthropic',
+        finalEnvPatch: {
+          ANTHROPIC_AUTH_TOKEN: 'member-token',
+          ANTHROPIC_BASE_URL: 'https://member.example',
+        },
+      })
+
+      expect(env.ANTHROPIC_AUTH_TOKEN).toBe('member-token')
+      expect(env.ANTHROPIC_BASE_URL).toBe('https://member.example')
+      expect(env.ANTHROPIC_API_KEY).toBe('')
+
+      const envVars = buildInheritedEnvVars({
+        provider: 'anthropic',
+        finalEnvPatch: {
+          ANTHROPIC_AUTH_TOKEN: 'member-token',
+          ANTHROPIC_BASE_URL: 'https://member.example',
+        },
+      })
+      expect(envVars).toContain('ANTHROPIC_AUTH_TOKEN=member-token')
+      expect(envVars).toContain('ANTHROPIC_BASE_URL=https\\://member.example')
+      expect(envVars).not.toContain('ANTHROPIC_AUTH_TOKEN=parent-token')
+    } finally {
+      for (const key of keys) {
+        const value = original.get(key)
+        if (value === undefined) {
+          delete process.env[key]
+        } else {
+          process.env[key] = value
+        }
+      }
+    }
+  })
+
+  it('blanks the competing ANTHROPIC_API_KEY inside the final member env patch', () => {
+    const envVars: Record<string, string> = {
+      ANTHROPIC_API_KEY: 'parent-key',
+      ANTHROPIC_AUTH_TOKEN: 'parent-token',
+    }
+
+    applyFinalMemberEnvPatch(envVars, {
+      ANTHROPIC_AUTH_TOKEN: 'member-token',
+      ANTHROPIC_BASE_URL: 'https://member.example',
+    })
+
+    expect(envVars.ANTHROPIC_AUTH_TOKEN).toBe('member-token')
+    expect(envVars.ANTHROPIC_BASE_URL).toBe('https://member.example')
+    expect(envVars.ANTHROPIC_API_KEY).toBe('')
+
+    // The contracted explicit clear also survives the final layer.
+    const explicitKey: Record<string, string> = {}
+    applyFinalMemberEnvPatch(explicitKey, {
+      ANTHROPIC_AUTH_TOKEN: 'member-token',
+      ANTHROPIC_API_KEY: '',
+    })
+    expect(explicitKey.ANTHROPIC_API_KEY).toBe('')
+
+    // No ANTHROPIC_AUTH_TOKEN in the patch means no implicit blanking.
+    const withoutToken: Record<string, string> = {
+      ANTHROPIC_API_KEY: 'parent-key',
+    }
+    applyFinalMemberEnvPatch(withoutToken, {
+      ANTHROPIC_BASE_URL: 'https://member.example',
+    })
+    expect(withoutToken.ANTHROPIC_API_KEY).toBe('parent-key')
+  })
+
+  it('rejects unsafe member env patches before changing the spawn environment', () => {
+    const env = { ANTHROPIC_AUTH_TOKEN: 'parent-token' }
+    expect(() => applyFinalMemberEnvPatch(env, {
+      ANTHROPIC_AUTH_TOKEN: 'member-token',
+      NODE_OPTIONS: '--import=/tmp/untrusted.js',
+    } as never)).toThrow('invalid per-member gateway environment patch')
+    expect(env).toEqual({ ANTHROPIC_AUTH_TOKEN: 'parent-token' })
+    expect(() => applyFinalMemberEnvPatch(env, {
+      ANTHROPIC_API_KEY: 'competing-key',
+    })).toThrow('invalid per-member gateway environment patch')
+  })
+
+  it('pins per-member forced Codex login to api without clearing Codex keys', () => {
+    const originalApiKey = process.env.OPENAI_API_KEY
+    const originalCodexApiKey = process.env.CODEX_API_KEY
+    const originalSettingsInline = getFlagSettingsInline()
+
+    process.env.OPENAI_API_KEY = 'sk-openai-teammate'
+    process.env.CODEX_API_KEY = 'sk-codex-teammate'
+    // Lead-level forced login stays on chatgpt.
+    setFlagSettingsInline({
+      codex: {
+        forced_login_method: 'chatgpt',
+      },
+    })
+
+    try {
+      expect(shouldClearCodexApiKeysForTeammateSpawn('codex')).toBe(true)
+      expect(shouldClearCodexApiKeysForTeammateSpawn('codex', 'api')).toBe(false)
+
+      const env = buildInheritedEnvObject({
+        provider: 'codex',
+        forcedCodexLoginMethod: 'api',
+      })
+      expect(env[CODEX_FORCED_LOGIN_METHOD_ENV_VAR]).toBe('api')
+      expect(env.CODEX_API_KEY).toBe('sk-codex-teammate')
+      expect(env.OPENAI_API_KEY).toBe('sk-openai-teammate')
+
+      const envVars = buildInheritedEnvVars({
+        provider: 'codex',
+        forcedCodexLoginMethod: 'api',
+      })
+      expect(envVars).toContain('CLAUDE_CODE_CODEX_FORCED_LOGIN_METHOD=api')
+      expect(envVars).toContain('CODEX_API_KEY=sk-codex-teammate')
+      expect(envVars).toContain('OPENAI_API_KEY=sk-openai-teammate')
+
+      // Members without a per-member override still follow the lead's chatgpt
+      // forced login and get the Codex keys cleared.
+      const leadScopedEnvVars = buildInheritedEnvVars({ provider: 'codex' })
+      expect(leadScopedEnvVars).toContain("CODEX_API_KEY=''")
+      expect(leadScopedEnvVars).toContain("OPENAI_API_KEY=''")
+      expect(leadScopedEnvVars).not.toContain(
+        'CLAUDE_CODE_CODEX_FORCED_LOGIN_METHOD=api',
+      )
+    } finally {
+      if (originalApiKey === undefined) {
+        delete process.env.OPENAI_API_KEY
+      } else {
+        process.env.OPENAI_API_KEY = originalApiKey
+      }
+      if (originalCodexApiKey === undefined) {
+        delete process.env.CODEX_API_KEY
+      } else {
+        process.env.CODEX_API_KEY = originalCodexApiKey
+      }
+      setFlagSettingsInline(originalSettingsInline)
+    }
+  })
+
+  it('round-trips member Codex overrides through the child --settings parser', () => {
+    const originalSettingsInline = getFlagSettingsInline()
+    setFlagSettingsInline(null)
+
+    try {
+      const flags = buildInheritedCliFlags({
+        provider: 'codex',
+        memberCodex: {
+          configOverrides: [...CUSTOM_PROVIDER_OVERRIDES],
+          forcedLoginMethod: 'api',
+        },
+      })
+
+      const settingsInline = roundTripSettings(flags)
+      expect((settingsInline.codex as Record<string, unknown>)?.forced_login_method).toBe('api')
+
+      // Both the -c form strings and the inline --settings JSON form
+      // round-trip through the existing child-side parser unchanged.
+      expect(
+        buildCodexNativeCustomProviderConfigOverrides({ settingsInline }),
+      ).toEqual(CANONICAL_CUSTOM_PROVIDER_OVERRIDES)
+    } finally {
+      setFlagSettingsInline(originalSettingsInline)
+    }
+  })
+
+  it('replaces lead codex settings wholesale for members with Codex overrides', () => {
+    const originalSettingsInline = getFlagSettingsInline()
+    setFlagSettingsInline({
+      apiKeyHelper: "'/tmp/helper.sh'",
+      codex: {
+        forced_login_method: 'chatgpt',
+        agent_teams_workspace_trust: {
+          config_overrides: ['projects."/tmp/project".trust_level="trusted"'],
+        },
+      },
+    })
+
+    try {
+      const flags = buildInheritedCliFlags({
+        provider: 'codex',
+        memberCodex: {
+          configOverrides: [...CUSTOM_PROVIDER_OVERRIDES],
+          forcedLoginMethod: 'api',
+        },
+      })
+
+      const settingsInline = roundTripSettings(flags)
+      const codex = settingsInline.codex as Record<string, unknown>
+      expect(codex?.forced_login_method).toBe('api')
+      // The lead's codex namespace is never reused for gateway members.
+      expect(codex).not.toHaveProperty('agent_teams_workspace_trust')
+      expect(
+        (
+          codex?.agent_teams_custom_provider as {
+            config_overrides: string[]
+          }
+        )?.config_overrides,
+      ).toEqual(CUSTOM_PROVIDER_OVERRIDES)
+    } finally {
+      setFlagSettingsInline(originalSettingsInline)
+    }
+  })
+
+  it('merges member Codex overrides into an inherited settings file path', async () => {
+    const originalSettingsPath = getFlagSettingsPath()
+    const tempRoot = await mkdtemp(join(tmpdir(), 'member-settings-merge-'))
+
+    try {
+      const basePath = join(tempRoot, 'inherited-settings.json')
+      await writeFile(
+        basePath,
+        JSON.stringify({
+          model: 'opus',
+          codex: {
+            forced_login_method: 'chatgpt',
+            agent_teams_workspace_trust: {
+              config_overrides: ['projects."/tmp/project".trust_level="trusted"'],
+            },
+          },
+        }),
+        'utf8',
+      )
+      setFlagSettingsPath(basePath)
+
+      const flags = buildInheritedCliFlags({
+        provider: 'codex',
+        memberCodex: {
+          configOverrides: [...CUSTOM_PROVIDER_OVERRIDES],
+          forcedLoginMethod: 'api',
+        },
+      })
+
+      const argv = parseArguments(flags)
+      const settingsValues = eagerParseCliFlags('--settings', argv)
+      expect(settingsValues).toHaveLength(1)
+      expect(settingsValues[0]).not.toBe(basePath)
+
+      const merged = JSON.parse(await readFile(settingsValues[0]!, 'utf8')) as Record<
+        string,
+        unknown
+      >
+      expect(merged.model).toBe('opus')
+      const codex = merged.codex as Record<string, unknown>
+      expect(codex?.forced_login_method).toBe('api')
+      expect(codex).not.toHaveProperty('agent_teams_workspace_trust')
+      expect(
+        (codex?.agent_teams_custom_provider as { config_overrides: string[] })
+          ?.config_overrides,
+      ).toEqual(CUSTOM_PROVIDER_OVERRIDES)
+    } finally {
+      setFlagSettingsPath(originalSettingsPath)
+      await rm(tempRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('materializes merged member settings inside separate private owner directories', async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), 'member-settings-hash-'))
+
+    try {
+      const basePath = join(tempRoot, 'inherited-settings.json')
+      await writeFile(basePath, JSON.stringify({ model: 'opus' }), 'utf8')
+
+      const fragment = buildMemberCodexSettingsFragment({
+        configOverrides: [...CUSTOM_PROVIDER_OVERRIDES],
+        forcedLoginMethod: 'api',
+      })
+      expect(fragment).toEqual({
+        codex: {
+          forced_login_method: 'api',
+          agent_teams_custom_provider: {
+            config_overrides: CUSTOM_PROVIDER_OVERRIDES,
+          },
+        },
+      })
+
+      const first = materializeMergedMemberSettingsFile(basePath, fragment!)
+      const second = materializeMergedMemberSettingsFile(basePath, fragment!)
+      expect(first).toBeTruthy()
+      expect(second).not.toBe(first)
+
+      const merged = JSON.parse(await readFile(first!, 'utf8')) as Record<string, unknown>
+      expect(merged.model).toBe('opus')
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true })
     }
   })
 })
