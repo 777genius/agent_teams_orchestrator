@@ -104,6 +104,17 @@ test(
     const config = join(home, '.claude')
     await mkdir(config, { recursive: true })
     const env = {
+      // Inference initializes the Windows shell even with tools disabled. Keep
+      // provider discovery isolated while supplying the installed shell itself.
+      ...(process.platform === 'win32'
+        ? {
+            SystemRoot: process.env.SystemRoot ?? process.env.SYSTEMROOT,
+            ComSpec: process.env.ComSpec ?? process.env.COMSPEC,
+            CLAUDE_CODE_GIT_BASH_PATH: (
+              await import('../utils/windowsPaths.js')
+            ).findGitBashPath(),
+          }
+        : {}),
       PATH: '',
       HOME: home,
       USERPROFILE: home,
