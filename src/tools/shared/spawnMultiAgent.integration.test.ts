@@ -154,4 +154,94 @@ describe('spawnTeammate partial in-process spawn cleanup', () => {
     },
     IN_PROCESS_CLEANUP_E2E_TIMEOUT_MS,
   )
+
+  it(
+    'rejects per-member spawn customizations in the in-process lane',
+    async () => {
+      const spawnModulePath = new URL(
+        `./spawnMultiAgent.ts?inProcessCustomizationTest=${Date.now()}`,
+        import.meta.url,
+      ).href
+      const {
+        spawnTeammate,
+        getInProcessSpawnCustomizationRejection,
+        __setSpawnMultiAgentDepsForTests,
+      } = await import(spawnModulePath)
+      __setSpawnMultiAgentDepsForTests({
+        isInProcessEnabled: () => true,
+      })
+
+      let appState = {
+        abortController: new AbortController(),
+        messages: [],
+        tasks: {},
+        mainLoopModel: null,
+        toolPermissionContext: getEmptyToolPermissionContext(),
+        inbox: { messages: [] },
+        teamContext: undefined,
+      } as unknown as AppState
+
+      const toolUseContext = {
+        options: {
+          commands: [],
+          debug: false,
+          mainLoopModel: 'test-model',
+          tools: [],
+          verbose: false,
+          thinkingConfig: { type: 'disabled' as const },
+          mcpClients: [],
+          mcpResources: {},
+          isNonInteractiveSession: false,
+          agentDefinitions: { activeAgents: [], definitions: [], errors: [] },
+        },
+        abortController: new AbortController(),
+        toolUseId: 'tool-use-2',
+        readFileState: new Map(),
+        getAppState: () => appState,
+        setAppState: (updater: (prev: AppState) => AppState) => {
+          appState = updater(appState)
+        },
+      } as unknown as ToolUseContext
+
+      try {
+        await expect(
+          spawnTeammate(
+            {
+              name: 'alice',
+              prompt: 'Bootstrap and wait for work',
+              team_name: 'atlas-hq',
+              env: { ANTHROPIC_AUTH_TOKEN: 'member-token-literal' },
+              gatewayUsageRef: 'gateway-run-123',
+            },
+            toolUseContext,
+          ),
+        ).rejects.toThrow('per-member spawn customizations')
+
+        await expect(
+          spawnTeammate(
+            {
+              name: 'bob',
+              prompt: 'Bootstrap and wait for work',
+              team_name: 'atlas-hq',
+              codex: {
+                configOverrides: ['model_provider="agent_teams_custom"'],
+                forcedLoginMethod: 'api',
+              },
+            },
+            toolUseContext,
+          ),
+        ).rejects.toThrow('per-member spawn customizations')
+
+        // Members without per-member customizations pass the guard.
+        expect(
+          getInProcessSpawnCustomizationRejection({
+            name: 'carol',
+          }),
+        ).toBeNull()
+      } finally {
+        __setSpawnMultiAgentDepsForTests(null)
+      }
+    },
+    20_000,
+  )
 })

@@ -4,6 +4,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import {
   buildRequestHash,
+  buildRequestHashInput,
   buildTeamBootstrapRequestFromSpec,
   readTeamBootstrapSpec,
 } from './teamBootstrapSpec.js'
@@ -1203,5 +1204,301 @@ describe('team bootstrap spec normalization', () => {
     })
 
     expect(hashA).toBe(hashB)
+  })
+
+  test('normalizes per-member env patches, Codex overrides, and gateway usage refs', async () => {
+    const workspaceDir = join(tempRoot, 'workspace')
+    await mkdir(workspaceDir, { recursive: true })
+
+    const request = await buildTeamBootstrapRequestFromSpec({
+      version: 1,
+      runId: 'run-member-customizations',
+      mode: 'create',
+      initiator: {
+        kind: 'app',
+        source: 'claude_team_agent_teams_orchestrator',
+      },
+      team: {
+        name: 'forge-labs',
+        cwd: workspaceDir,
+      },
+      lead: {},
+      members: [
+        {
+          name: 'alice',
+          env: {
+            ANTHROPIC_AUTH_TOKEN: 'member-token-literal',
+            ANTHROPIC_BASE_URL: 'https://member.example',
+            ANTHROPIC_API_KEY: '',
+          },
+          codex: {
+            configOverrides: [
+              'model_provider="agent_teams_custom"',
+              'model_providers.agent_teams_custom.base_url="https://member.example/v1"',
+            ],
+            forcedLoginMethod: 'api',
+          },
+          gatewayUsageRef: 'gateway-run-123',
+        },
+      ],
+    } satisfies TeamBootstrapSpec)
+
+    expect(request.members[0]?.env).toEqual({
+      ANTHROPIC_AUTH_TOKEN: 'member-token-literal',
+      ANTHROPIC_BASE_URL: 'https://member.example',
+      ANTHROPIC_API_KEY: '',
+    })
+    expect(request.members[0]?.codex).toEqual({
+      configOverrides: [
+        'model_provider="agent_teams_custom"',
+        'model_providers.agent_teams_custom.base_url="https://member.example/v1"',
+      ],
+      forcedLoginMethod: 'api',
+    })
+    expect(request.members[0]?.gatewayUsageRef).toBe('gateway-run-123')
+  })
+
+  test('readTeamBootstrapSpec round-trips per-member spawn customizations', async () => {
+    const workspaceDir = join(tempRoot, 'workspace')
+    await mkdir(workspaceDir, { recursive: true })
+
+    const specPath = join(tempRoot, 'bootstrap-member-customizations.json')
+    await writeFile(
+      specPath,
+      JSON.stringify({
+        version: 1,
+        runId: 'run-member-customizations-roundtrip',
+        mode: 'launch',
+        initiator: {
+          kind: 'app',
+          source: 'claude_team_agent_teams_orchestrator',
+        },
+        team: {
+          name: 'atlas-hq',
+          cwd: workspaceDir,
+        },
+        lead: {},
+        members: [
+          {
+            name: 'alice',
+            env: {
+              CODEX_API_KEY: 'gateway-key-literal',
+              ANTHROPIC_BASE_URL: 'https://member.example',
+              ANTHROPIC_API_KEY: '',
+            },
+            codex: {
+              configOverrides: [
+                'model_provider="agent_teams_custom"',
+                'model_providers.agent_teams_custom.name="Agent Teams Custom"',
+                'model_providers.agent_teams_custom.wire_api="responses"',
+                'model_providers.agent_teams_custom.env_key="CODEX_API_KEY"',
+                'model_providers.agent_teams_custom.base_url="https://member.example/v1"',
+              ],
+              forcedLoginMethod: 'api',
+            },
+            gatewayUsageRef: 'gateway-run-456',
+          },
+        ],
+      } satisfies TeamBootstrapSpec),
+      'utf8',
+    )
+
+    const request = await readTeamBootstrapSpec(specPath)
+    expect(request.members[0]?.env).toEqual({
+      CODEX_API_KEY: 'gateway-key-literal',
+      ANTHROPIC_BASE_URL: 'https://member.example',
+      ANTHROPIC_API_KEY: '',
+    })
+    expect(request.members[0]?.codex).toEqual({
+      configOverrides: [
+        'model_provider="agent_teams_custom"',
+        'model_providers.agent_teams_custom.name="Agent Teams Custom"',
+        'model_providers.agent_teams_custom.wire_api="responses"',
+        'model_providers.agent_teams_custom.env_key="CODEX_API_KEY"',
+        'model_providers.agent_teams_custom.base_url="https://member.example/v1"',
+      ],
+      forcedLoginMethod: 'api',
+    })
+    expect(request.members[0]?.gatewayUsageRef).toBe('gateway-run-456')
+  })
+
+  test('rejects invalid per-member spawn customizations', async () => {
+    const workspaceDir = join(tempRoot, 'workspace')
+    await mkdir(workspaceDir, { recursive: true })
+
+    const invalidMembers: unknown[] = [
+      { name: 'alice', env: { 'BAD-KEY': 'value' } },
+      { name: 'alice', env: { GOOD_KEY: '' } },
+      { name: 'alice', env: { NODE_OPTIONS: '--import=/tmp/untrusted.js' } },
+      { name: 'alice', env: { ANTHROPIC_AUTH_TOKEN: '' } },
+      { name: 'alice', env: { CODEX_API_KEY: 'invalid\0key' } },
+      { name: 'alice', env: { ANTHROPIC_API_KEY: 'competing-key' } },
+      { name: 'alice', codex: { forcedLoginMethod: 'chatgpt' } },
+      { name: 'alice', codex: { unknownCodexKey: true } },
+      { name: 'alice', codex: { configOverrides: ['api_key="secret-literal"'], forcedLoginMethod: 'api' } },
+      { name: 'alice', codex: { configOverrides: ['model_provider="agent_teams_custom"'], forcedLoginMethod: 'api' } },
+      {
+        name: 'alice',
+        codex: { configOverrides: ['model_provider="x"\nnewline'] },
+      },
+      { name: 'alice', gatewayUsageRef: '   ' },
+    ]
+
+    for (const [index, member] of invalidMembers.entries()) {
+      const specPath = join(tempRoot, `bootstrap-invalid-member-${index}.json`)
+      await writeFile(
+        specPath,
+        JSON.stringify({
+          version: 1,
+          runId: `run-invalid-member-${index}`,
+          mode: 'create',
+          initiator: {
+            kind: 'app',
+            source: 'claude_team_agent_teams_orchestrator',
+          },
+          team: {
+            name: 'atlas-hq',
+            cwd: workspaceDir,
+          },
+          lead: {},
+          members: [member],
+        }),
+        'utf8',
+      )
+      await expect(readTeamBootstrapSpec(specPath)).rejects.toThrow()
+    }
+  })
+
+  test('request hash covers gateway refs and Codex intent but never env secret literals', () => {
+    const baseMember = {
+      originalName: 'alice',
+      displayName: 'alice',
+      normalizedName: 'alice',
+      prompt: 'Prompt A',
+      env: {
+        ANTHROPIC_AUTH_TOKEN: 'super-secret-token-literal',
+        ANTHROPIC_BASE_URL: 'https://member.example',
+      },
+      codex: {
+        configOverrides: [
+          'model_provider="agent_teams_custom"',
+          'model_providers.agent_teams_custom.base_url="https://member.example/v1"',
+        ],
+        forcedLoginMethod: 'api' as const,
+      },
+      gatewayUsageRef: 'gateway-run-123',
+    }
+    const baseRequest: Omit<TeamBootstrapRequest, 'requestHash'> = {
+      version: 1,
+      runId: 'run-member-customization-hash',
+      mode: 'create',
+      teamName: 'atlas-hq',
+      cwd: '/tmp/workspace',
+      members: [baseMember],
+      bootstrapTimeoutMs: 30_000,
+      continueOnPartialFailure: true,
+      permissionSeedTools: ['Edit', 'Write'],
+      emitStructuredEvents: true,
+      policy: {
+        persistentTeam: true,
+        registerForSessionCleanup: false,
+        writeConversationSummaryMessage: false,
+      },
+      initiator: {
+        kind: 'app',
+        source: 'claude_team_agent_teams_orchestrator',
+      },
+    }
+
+    // Secret env value literals never enter the hashed intent projection.
+    const hashInputDump = JSON.stringify(buildRequestHashInput(baseRequest))
+    expect(hashInputDump).not.toContain('super-secret-token-literal')
+    expect(hashInputDump).toContain('gateway-run-123')
+
+    // Rotating an env secret value is not new intent.
+    const rotatedSecretHash = buildRequestHash({
+      ...baseRequest,
+      members: [
+        {
+          ...baseMember,
+          env: {
+            ...baseMember.env,
+            ANTHROPIC_AUTH_TOKEN: 'rotated-secret-literal',
+          },
+        },
+      ],
+    })
+    expect(rotatedSecretHash).toBe(buildRequestHash(baseRequest))
+
+    // Changing the gateway usage ref is new intent.
+    const changedRefHash = buildRequestHash({
+      ...baseRequest,
+      members: [{ ...baseMember, gatewayUsageRef: 'gateway-run-456' }],
+    })
+    expect(changedRefHash).not.toBe(buildRequestHash(baseRequest))
+
+    // Changing a Codex config override is new intent.
+    const changedOverrideHash = buildRequestHash({
+      ...baseRequest,
+      members: [
+        {
+          ...baseMember,
+          codex: {
+            ...baseMember.codex,
+            configOverrides: [
+              ...baseMember.codex.configOverrides,
+              'model_providers.agent_teams_custom.wire_api="responses"',
+            ],
+          },
+        },
+      ],
+    })
+    expect(changedOverrideHash).not.toBe(buildRequestHash(baseRequest))
+
+    // Re-ordering Codex config overrides is not new intent.
+    const reorderedOverridesHash = buildRequestHash({
+      ...baseRequest,
+      members: [
+        {
+          ...baseMember,
+          codex: {
+            ...baseMember.codex,
+            configOverrides: [...baseMember.codex.configOverrides].reverse(),
+          },
+        },
+      ],
+    })
+    expect(reorderedOverridesHash).toBe(buildRequestHash(baseRequest))
+
+    // Env key names (sorted) capture intent; secret values never do.
+    const changedEnvKeyHash = buildRequestHash({
+      ...baseRequest,
+      members: [
+        {
+          ...baseMember,
+          env: {
+            CODEX_API_KEY: 'super-secret-token-literal',
+            ANTHROPIC_BASE_URL: 'https://member.example',
+          },
+        },
+      ],
+    })
+    expect(changedEnvKeyHash).not.toBe(buildRequestHash(baseRequest))
+    expect(
+      JSON.stringify(
+        buildRequestHashInput({
+          ...baseRequest,
+          members: [
+            {
+              ...baseMember,
+              env: {
+                CODEX_API_KEY: 'super-secret-token-literal',
+                ANTHROPIC_BASE_URL: 'https://member.example',
+              },
+            },
+          ],
+        }),
+      ),
+    ).not.toContain('super-secret-token-literal')
   })
 })

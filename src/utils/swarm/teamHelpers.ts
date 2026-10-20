@@ -92,6 +92,8 @@ export type TeamFile = {
     bootstrapContextHash?: string
     bootstrapBriefingHash?: string
     bootstrapRuntimeEventsPath?: string
+    /** Opaque gateway usage identity marker. Never contains secrets. */
+    gatewayUsageRef?: string
     tmuxPaneId: string
     cwd: string
     worktreePath?: string
@@ -368,6 +370,7 @@ function teamMembersEqual(a: TeamMember, b: TeamMember): boolean {
     a.bootstrapContextHash === b.bootstrapContextHash &&
     a.bootstrapBriefingHash === b.bootstrapBriefingHash &&
     a.bootstrapRuntimeEventsPath === b.bootstrapRuntimeEventsPath &&
+    a.gatewayUsageRef === b.gatewayUsageRef &&
     a.tmuxPaneId === b.tmuxPaneId &&
     a.cwd === b.cwd &&
     a.worktreePath === b.worktreePath &&

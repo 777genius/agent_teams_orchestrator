@@ -10,6 +10,7 @@ import {
   applySafeConfigEnvironmentVariables,
 } from './managedEnv.js'
 import { resetSettingsCache } from './settings/settingsCache.js'
+import { applyFinalMemberEnvPatch } from './swarm/spawnUtils.js'
 
 const ENV_KEYS = [
   AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV,
@@ -26,6 +27,8 @@ const ENV_KEYS = [
   'CLAUDE_CODE_ENTRY_PROVIDER',
   'CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST',
   'CLAUDE_CODE_USE_BEDROCK',
+  'CODEX_API_KEY',
+  'OPENAI_API_KEY',
 ] as const
 
 function withIsolatedEnv(operation: () => void): void {
@@ -50,6 +53,37 @@ function withIsolatedEnv(operation: () => void): void {
 }
 
 describe('host-managed Anthropic settings env', () => {
+  test.each([
+    ['before trust', applySafeConfigEnvironmentVariables],
+    ['after trust', applyConfigEnvironmentVariables],
+  ] as const)('preserves final gateway member credentials %s', (_phase, applyEnv) => {
+    withIsolatedEnv(() => {
+      process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1'
+      process.env.CLAUDE_CODE_ENTRY_PROVIDER = 'anthropic'
+      applyFinalMemberEnvPatch(process.env as Record<string, string>, {
+        ANTHROPIC_BASE_URL: 'https://member-gateway.example',
+        ANTHROPIC_AUTH_TOKEN: 'member-token',
+        ANTHROPIC_API_KEY: '',
+      })
+      setFlagSettingsInline({ env: {
+        ANTHROPIC_BASE_URL: 'https://leader-gateway.example',
+        ANTHROPIC_AUTH_TOKEN: 'leader-token',
+        ANTHROPIC_API_KEY: 'leader-key',
+      } })
+      applyEnv()
+      expect(process.env.ANTHROPIC_BASE_URL).toBe('https://member-gateway.example')
+      expect(process.env.ANTHROPIC_AUTH_TOKEN).toBe('member-token')
+      expect(process.env.ANTHROPIC_API_KEY).toBe('')
+
+      process.env.CLAUDE_CODE_ENTRY_PROVIDER = 'codex'
+      applyFinalMemberEnvPatch(process.env as Record<string, string>, { CODEX_API_KEY: 'member-codex-key' })
+      setFlagSettingsInline({ env: { CODEX_API_KEY: 'leader-codex-key' } })
+      resetSettingsCache()
+      applyEnv()
+      expect(process.env.CODEX_API_KEY).toBe('member-codex-key')
+    })
+  })
+
   test.each([
     ['before trust', applySafeConfigEnvironmentVariables],
     ['after trust', applyConfigEnvironmentVariables],
