@@ -46,7 +46,7 @@ describe('host-managed provider settings env allowlist', () => {
     ).toBe(false)
   })
 
-  test('blocks settings-sourced routing and model aliases for explicit Anthropic modes', () => {
+  test('blocks settings-sourced routing for explicit Anthropic modes', () => {
     for (const mode of ['subscription', 'api_key', 'compatible'] as const) {
       expect(
         isAllowedHostManagedProviderSettingsEnvVar(
@@ -58,13 +58,6 @@ describe('host-managed provider settings env allowlist', () => {
       expect(
         isAllowedHostManagedProviderSettingsEnvVar(
           'ANTHROPIC_BASE_URL',
-          'anthropic',
-          mode,
-        ),
-      ).toBe(false)
-      expect(
-        isAllowedHostManagedProviderSettingsEnvVar(
-          'ANTHROPIC_DEFAULT_SONNET_MODEL',
           'anthropic',
           mode,
         ),
@@ -92,6 +85,36 @@ describe('host-managed provider settings env allowlist', () => {
         'compatible',
       ),
     ).toBe(true)
+  })
+
+  test('allows compatible model mappings without allowing cloud backend configuration', () => {
+    const modelKeys = [
+      'ANTHROPIC_MODEL',
+      'ANTHROPIC_SMALL_FAST_MODEL',
+      'CLAUDE_CODE_SUBAGENT_MODEL',
+      ...['HAIKU', 'OPUS', 'SONNET'].flatMap(model => [
+        `ANTHROPIC_DEFAULT_${model}_MODEL`,
+        `ANTHROPIC_DEFAULT_${model}_MODEL_DESCRIPTION`,
+        `ANTHROPIC_DEFAULT_${model}_MODEL_NAME`,
+        `ANTHROPIC_DEFAULT_${model}_MODEL_SUPPORTED_CAPABILITIES`,
+      ]),
+    ]
+    for (const key of modelKeys) {
+      expect(isAllowedHostManagedProviderSettingsEnvVar(key, 'anthropic', 'compatible')).toBe(true)
+      expect(isAllowedHostManagedProviderSettingsEnvVar(key, 'anthropic', 'api_key')).toBe(false)
+      expect(isAllowedHostManagedProviderSettingsEnvVar(key, 'anthropic', 'subscription')).toBe(false)
+      expect(isAllowedHostManagedProviderSettingsEnvVar(key, 'codex', 'compatible')).toBe(false)
+      expect(isAllowedHostManagedProviderSettingsEnvVar(key, 'gemini', 'compatible')).toBe(false)
+    }
+    for (const key of [
+      'ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION',
+      'VERTEX_REGION_CLAUDE_4_5_SONNET',
+      'ANTHROPIC_BEDROCK_BASE_URL',
+      'ANTHROPIC_VERTEX_PROJECT_ID',
+      'ANTHROPIC_FOUNDRY_API_KEY',
+    ]) {
+      expect(isAllowedHostManagedProviderSettingsEnvVar(key, 'anthropic', 'compatible')).toBe(false)
+    }
   })
 
   test('pins backend-specific host entries to their own backend env', () => {

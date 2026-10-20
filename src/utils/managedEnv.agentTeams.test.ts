@@ -5,14 +5,24 @@ import {
   setFlagSettingsInline,
 } from '../bootstrap/state.js'
 import { AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV } from './anthropicConnectionMode.js'
-import { applyConfigEnvironmentVariables } from './managedEnv.js'
+import {
+  applyConfigEnvironmentVariables,
+  applySafeConfigEnvironmentVariables,
+} from './managedEnv.js'
+import { resetSettingsCache } from './settings/settingsCache.js'
 
 const ENV_KEYS = [
   AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV,
   'ANTHROPIC_API_KEY',
+  'ANTHROPIC_AUTH_TOKEN',
   'ANTHROPIC_BASE_URL',
   'ANTHROPIC_CUSTOM_HEADERS',
   'ANTHROPIC_MODEL',
+  'ANTHROPIC_SMALL_FAST_MODEL',
+  'ANTHROPIC_DEFAULT_SONNET_MODEL',
+  'ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES',
+  'CLAUDE_CODE_SUBAGENT_MODEL',
+  'ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION',
   'CLAUDE_CODE_ENTRY_PROVIDER',
   'CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST',
   'CLAUDE_CODE_USE_BEDROCK',
@@ -26,9 +36,11 @@ function withIsolatedEnv(operation: () => void): void {
 
   try {
     for (const key of ENV_KEYS) delete process.env[key]
+    resetSettingsCache()
     operation()
   } finally {
     setFlagSettingsInline(originalFlagSettings)
+    resetSettingsCache()
     for (const key of ENV_KEYS) {
       const value = originalEnv.get(key)
       if (value === undefined) delete process.env[key]
@@ -38,6 +50,44 @@ function withIsolatedEnv(operation: () => void): void {
 }
 
 describe('host-managed Anthropic settings env', () => {
+  test.each([
+    ['before trust', applySafeConfigEnvironmentVariables],
+    ['after trust', applyConfigEnvironmentVariables],
+  ] as const)('compatible mode applies model mappings %s without replacing the host route', (_phase, applyEnv) => {
+    withIsolatedEnv(() => {
+      process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1'
+      process.env.CLAUDE_CODE_ENTRY_PROVIDER = 'anthropic'
+      process.env[AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE_ENV] = 'compatible'
+      process.env.ANTHROPIC_BASE_URL = 'https://host-gateway.example/anthropic'
+      process.env.ANTHROPIC_AUTH_TOKEN = 'host-token'
+      setFlagSettingsInline({
+        env: {
+          CLAUDE_CODE_USE_BEDROCK: '1',
+          ANTHROPIC_BASE_URL: 'https://settings-gateway.example/anthropic',
+          ANTHROPIC_AUTH_TOKEN: 'settings-token',
+          ANTHROPIC_MODEL: 'gateway-main',
+          ANTHROPIC_SMALL_FAST_MODEL: 'gateway-small',
+          ANTHROPIC_DEFAULT_SONNET_MODEL: 'gateway-sonnet',
+          ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES: 'thinking',
+          CLAUDE_CODE_SUBAGENT_MODEL: 'gateway-subagent',
+          ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION: 'us-east-1',
+        },
+      })
+
+      applyEnv()
+
+      expect(process.env.ANTHROPIC_MODEL).toBe('gateway-main')
+      expect(process.env.ANTHROPIC_SMALL_FAST_MODEL).toBe('gateway-small')
+      expect(process.env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('gateway-sonnet')
+      expect(process.env.ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES).toBe('thinking')
+      expect(process.env.CLAUDE_CODE_SUBAGENT_MODEL).toBe('gateway-subagent')
+      expect(process.env.ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION).toBeUndefined()
+      expect(process.env.CLAUDE_CODE_USE_BEDROCK).toBeUndefined()
+      expect(process.env.ANTHROPIC_BASE_URL).toBe('https://host-gateway.example/anthropic')
+      expect(process.env.ANTHROPIC_AUTH_TOKEN).toBe('host-token')
+    })
+  })
+
   test('explicit API-key mode blocks settings from restoring Bedrock routing', () => {
     withIsolatedEnv(() => {
       process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1'
