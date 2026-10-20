@@ -75,6 +75,12 @@ async function assertEntry(specifier: string, from: string, name: string, versio
   return entry
 }
 
+/** Verify the exact dependency used by each selected core's Bun PTY adapter. */
+export async function verifyBunPtyGraph(coreEntry: string, pin: '2.0.0' | '2.0.32', ownedRoot?: string): Promise<string> {
+  const adapter = await assertEntry('#pty', path.dirname(coreEntry), '@opencode/core', pin, ownedRoot)
+  return assertEntry('bun-pty', path.dirname(adapter), 'bun-pty', '0.4.11', ownedRoot)
+}
+
 /** Validate from each selected server/client's own physical resolution context. */
 export async function verifyGraphs(from: string, ownedRoot?: string): Promise<void> {
   // Root model mapping and its schemas must share one physical Effect instance.
@@ -104,6 +110,7 @@ export async function verifyGraphs(from: string, ownedRoot?: string): Promise<vo
       const entry = await assertEntry(`@opencode/${dependency}/${subpath}`, path.dirname(server), `@opencode/${dependency}`, pin, ownedRoot)
       await sameEffect(entry)
       if (dependency === 'core') {
+        await verifyBunPtyGraph(entry, pin, ownedRoot)
         const ai = await assertEntry('@opencode/ai/route/client', path.dirname(entry), '@opencode/ai', pin, ownedRoot)
         await sameEffect(ai)
         // A hoisted shared effect binder must never decode with a foreign Effect.

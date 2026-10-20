@@ -11,6 +11,7 @@ const bun = process.versions.bun ? process.execPath : process.env.TEST_RUNTIME_S
 
 async function runStatus(flags: readonly string[]) {
   const home = await mkdtemp(join(tmpdir(), 'TEST-runtime-status-entry-'))
+  const started = performance.now()
   const child = spawn(bun, ['--no-install', '--no-env-file', entry, 'runtime', 'status', ...flags], {
     cwd: home,
     env: { PATH: '', HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: join(home, '.claude'), APPDATA: join(home, 'appdata'), LOCALAPPDATA: join(home, 'local-appdata'), XDG_CONFIG_HOME: join(home, '.config'), XDG_CACHE_HOME: join(home, '.cache'), NODE_ENV: 'development', CI: '1' },
@@ -19,13 +20,19 @@ async function runStatus(flags: readonly string[]) {
   let stdout = '', stderr = ''
   child.stdout.on('data', (data: Buffer) => { stdout += data.toString() })
   child.stderr.on('data', (data: Buffer) => { stderr += data.toString() })
-  const timer = setTimeout(() => child.kill('SIGKILL'), 20_000)
+  let watchdogTriggered = false
+  const timer = setTimeout(() => { watchdogTriggered = true; child.kill('SIGKILL') }, 20_000)
   try {
     const code = await new Promise<number | null>((resolve, reject) => {
       child.once('error', reject)
       child.once('close', (code, signal) => {
-        if (signal) reject(new Error(`Source CLI terminated by ${signal}`))
-        else resolve(code)
+        if (signal) {
+          let stdoutState = stdout.length ? 'non-json-or-incomplete' : 'empty'
+          if (stdout.length) {
+            try { JSON.parse(stdout); stdoutState = 'valid-json' } catch { /* Preserve incomplete output as diagnostic evidence. */ }
+          }
+          reject(new Error(`Source CLI terminated by ${signal}; elapsedMs=${Math.round(performance.now() - started)}; watchdogTriggered=${watchdogTriggered}; flags=${JSON.stringify(flags)}; stdoutState=${stdoutState}; stdoutChars=${stdout.length}; stderrChars=${stderr.length}; stdoutTail=${JSON.stringify(stdout.slice(-2048))}; stderrTail=${JSON.stringify(stderr.slice(-2048))}`))
+        } else resolve(code)
       })
     })
     return { stdout, stderr, code }

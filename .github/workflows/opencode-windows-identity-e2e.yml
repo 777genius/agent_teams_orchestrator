@@ -3,6 +3,12 @@ on:
   workflow_dispatch:
   pull_request:
     paths:
+      - package.json
+      - bun.lock
+      - scripts/opencode-v2/stage.ts
+      - scripts/opencode-v2/stage.test.ts
+      - scripts/opencode-v2/packaged-pty-smoke.ts
+      - scripts/opencode-v2/packaged-pty-smoke.test.ts
       - src/utils/windowsNativeProcess.ts
       - src/services/opencode/OpenCodeCursorAgentTreeKill.ts
       - src/services/opencode/compatibility/OpenCodeVersionProbe.ts
@@ -62,6 +68,18 @@ jobs:
             if (-not (Test-Path $file)) { throw "Missing packaged delivery file $file" }
           }
           "CANDIDATE=$((Resolve-Path dist/cli.exe).Path)" >> $env:GITHUB_ENV
+      - name: Test producer PTY observation contracts
+        run: bun test scripts/opencode-v2/packaged-pty-smoke.test.ts
+      - name: Prove both staged native PTY adapters with the shipped Bun
+        timeout-minutes: 3
+        shell: pwsh
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          $receipt = Join-Path $env:RUNNER_TEMP "TEST-packaged-pty-$env:PLATFORM.json"
+          & .\dist\bun\bun.exe --no-env-file scripts/opencode-v2/packaged-pty-smoke.ts .\dist $receipt $env:PLATFORM
+          if ($LASTEXITCODE -ne 0) { throw 'Native staged PTY proof failed' }
       - name: Prepare genuine npm OpenCode and verified public baseline
         shell: pwsh
         env:
@@ -103,6 +121,7 @@ jobs:
         with:
           name: opencode-windows-identity-${{ matrix.os }}-${{ github.sha }}
           path: |
+            ${{ runner.temp }}/TEST-packaged-pty-*.json
             ${{ runner.temp }}/TEST-opencode-identity-*/identity-e2e-summary.json
             ${{ runner.temp }}/TEST-opencode-identity-*/*/models.json
           if-no-files-found: warn

@@ -332,6 +332,8 @@ jobs:
           chmod +x "release/runtime/${{ matrix.binary_name }}"
           printf '%s\n' "$runtime_version" > release/runtime/VERSION
           printf '%s\n' "$runtime_commit" > release/runtime/COMMIT_SHA
+          [[ -f dist/opencode-delivery.json ]] || { echo "Packaged OpenCode delivery identity missing" >&2; exit 1; }
+          cp dist/opencode-delivery.json release/runtime/opencode-delivery.json
           # The managed Cursor assets are resolved beside the installed binary.
           # Leaving them out of the archive turns automatic discovery into a
           # manual staging step nobody performs on a real install.
@@ -356,6 +358,8 @@ jobs:
           cp dist/cli.exe "release/runtime/${{ matrix.binary_name }}"
           printf '%s\n' "$runtime_version" > release/runtime/VERSION
           printf '%s\n' "$runtime_commit" > release/runtime/COMMIT_SHA
+          [[ -f dist/opencode-delivery.json ]] || { echo "Packaged OpenCode delivery identity missing" >&2; exit 1; }
+          cp dist/opencode-delivery.json release/runtime/opencode-delivery.json
           # The managed Cursor assets are resolved beside the installed binary.
           # Leaving them out of the archive turns automatic discovery into a
           # manual staging step nobody performs on a real install.
@@ -387,6 +391,8 @@ jobs:
           Copy-Item $source "release/runtime/${{ matrix.binary_name }}"
           Set-Content -Path release/runtime/VERSION -Value $runtimeVersion
           Set-Content -Path release/runtime/COMMIT_SHA -Value $runtimeCommit
+          if (-not (Test-Path dist/opencode-delivery.json -PathType Leaf)) { throw "Packaged OpenCode delivery identity missing" }
+          Copy-Item dist/opencode-delivery.json release/runtime/opencode-delivery.json
           # Resolved beside the installed binary; see the bash packaging step.
           if (-not (Test-Path dist/cursor-managed)) { throw "Managed Cursor assets missing" }
           Copy-Item dist/cursor-managed release/runtime/cursor-managed -Recurse
