@@ -237,6 +237,21 @@ try {
     'teammateRuntime=' + teammateRuntime + ';env=' + teammateRuntimeEnv,
   )
 
+  const envProbeKeys = (process.env.FAKE_TEAMMATE_ENV_PROBE || '')
+    .split(',')
+    .map(key => key.trim())
+    .filter(Boolean)
+  if (envProbeKeys.length > 0) {
+    await writeEvent(
+      'env_probe',
+      JSON.stringify(
+        Object.fromEntries(
+          envProbeKeys.map(key => [key, process.env[key] ?? null]),
+        ),
+      ),
+    )
+  }
+
   if (mode === 'exit-before-ready') {
     console.error('fatal fake crash before runtime_ready')
     process.exit(42)
@@ -534,6 +549,11 @@ beforeEach(() => {
     'FAKE_TEAMMATE_SPAWN_MARKER',
     'FAKE_TEAMMATE_RUNTIME_READY_DELAY_MS',
     'FAKE_TEAMMATE_INBOX_READY_DELAY_MS',
+    'FAKE_TEAMMATE_ENV_PROBE',
+    'ANTHROPIC_AUTH_TOKEN',
+    'ANTHROPIC_BASE_URL',
+    'ANTHROPIC_API_KEY',
+    'CLAUDE_CODE_CODEX_FORCED_LOGIN_METHOD',
     'CLAUDE_TEAM_PROCESS_RUNTIME_READY_TIMEOUT_MS',
     'CLAUDE_TEAM_PROCESS_INBOX_POLLER_READY_TIMEOUT_MS',
   ])
@@ -716,6 +736,114 @@ describe('supervised process teammate backend e2e', () => {
     expect(submitted?.bootstrapMirrorId).toBe(mailboxWritten?.bootstrapMirrorId)
     expect(submitted?.bootstrapMirrorId).toBeTruthy()
     expect(confirmed?.bootstrapMirrorId).toBe(mailboxWritten?.bootstrapMirrorId)
+
+    if (alice?.runtimePid) {
+      await waitForCondition(() => !isProcessAlive(alice.runtimePid!), 5_000)
+      runtimePids = runtimePids.filter(pid => pid !== alice.runtimePid)
+    }
+  })
+
+  it('applies per-member env, Codex overrides, and gateway usage refs on process spawn', async () => {
+    const fixture = await createFixture({
+      trusted: true,
+      mode: 'member-name-confirmation',
+    })
+
+    process.env.ANTHROPIC_AUTH_TOKEN = 'parent-token'
+    process.env.ANTHROPIC_BASE_URL = 'https://parent.example'
+    process.env.ANTHROPIC_API_KEY = 'parent-key'
+    process.env.FAKE_TEAMMATE_ENV_PROBE =
+      'ANTHROPIC_AUTH_TOKEN,ANTHROPIC_BASE_URL,ANTHROPIC_API_KEY,CLAUDE_CODE_CODEX_FORCED_LOGIN_METHOD'
+
+    __setTeamBootstrapRunnerDepsForTests({
+      spawnTeammate: (input, context) =>
+        __handleSpawnNativeProcessForTests(input, context),
+    })
+
+    const bootstrapResult = await runTeamBootstrap({
+      request: {
+        version: 1,
+        runId: 'process-e2e-member-customizations',
+        requestHash: 'process-e2e-member-customizations-hash',
+        mode: 'launch',
+        teamName: fixture.teamName,
+        cwd: fixture.projectRealpath,
+        members: [
+          {
+            originalName: 'alice',
+            displayName: 'alice',
+            normalizedName: 'alice',
+            prompt: BOOTSTRAP_PROMPT,
+            cwd: fixture.projectRealpath,
+            env: {
+              ANTHROPIC_AUTH_TOKEN: 'member-token',
+              ANTHROPIC_BASE_URL: 'https://member.example',
+            },
+            codex: {
+              forcedLoginMethod: 'api',
+            },
+            gatewayUsageRef: 'gateway-run-123',
+          },
+        ],
+        bootstrapTimeoutMs: 10_000,
+        continueOnPartialFailure: false,
+        permissionSeedTools: [],
+        emitStructuredEvents: true,
+        policy: {
+          persistentTeam: true,
+          registerForSessionCleanup: false,
+          writeConversationSummaryMessage: false,
+        },
+        initiator: {
+          kind: 'tool',
+          source: 'TeamBootstrap',
+        },
+      },
+      context: fixture.context,
+      emit: {
+        started: async () => {},
+        phaseChanged: async () => {},
+        teamCreated: async () => {},
+        memberSpawnStarted: async () => {},
+        memberSpawnResult: async () => {},
+        completed: async () => {},
+        failed: async () => {},
+      },
+    })
+
+    if (!bootstrapResult.ok) {
+      throw new Error(
+        'error' in bootstrapResult ? bootstrapResult.error : 'bootstrap failed',
+      )
+    }
+    expect(bootstrapResult.summary.registeredMembers).toEqual(['alice'])
+
+    // The opaque gateway usage ref is recorded in app-owned team metadata.
+    const teamFile = await readTeamFileAsync(fixture.teamName)
+    const alice = teamFile?.members.find(member => member.name === 'alice')
+    expect(alice?.gatewayUsageRef).toBe('gateway-run-123')
+    if (alice?.runtimePid) {
+      runtimePids.push(alice.runtimePid)
+    }
+
+    const runtimePaths = getTeammateRuntimePaths({
+      teamName: fixture.teamName,
+      agentName: 'alice',
+    })
+    const events = await waitForEvents(runtimePaths.eventsPath, ['env_probe'])
+    const envProbe = events.find(
+      event => (event.type as string) === 'env_probe',
+    )
+    const probedEnv = JSON.parse(String(envProbe?.detail ?? '{}')) as Record<
+      string,
+      string | null
+    >
+    // The member env patch wins over the parent's inherited auth env.
+    expect(probedEnv.ANTHROPIC_AUTH_TOKEN).toBe('member-token')
+    expect(probedEnv.ANTHROPIC_BASE_URL).toBe('https://member.example')
+    expect(probedEnv.ANTHROPIC_API_KEY).toBe('')
+    // Per-member Codex login mode pin, scoped to this member's process.
+    expect(probedEnv.CLAUDE_CODE_CODEX_FORCED_LOGIN_METHOD).toBe('api')
 
     if (alice?.runtimePid) {
       await waitForCondition(() => !isProcessAlive(alice.runtimePid!), 5_000)

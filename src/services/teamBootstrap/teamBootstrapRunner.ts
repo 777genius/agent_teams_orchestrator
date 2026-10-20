@@ -1087,6 +1087,11 @@ export async function runTeamBootstrap(params: {
                           member.nativeAppManagedBootstrap,
                       }
                     : {}),
+                  ...(member.env ? { env: member.env } : {}),
+                  ...(member.codex ? { codex: member.codex } : {}),
+                  ...(member.gatewayUsageRef
+                    ? { gatewayUsageRef: member.gatewayUsageRef }
+                    : {}),
                   bootstrapRunId: params.request.runId,
                   // Fair-share fence: one slow or stuck teammate must not eat
                   // the whole remaining budget and starve later members.

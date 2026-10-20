@@ -1,3 +1,4 @@
+import { snapshotOpenCodeGatewayCredential } from './OpenCodeGatewayCredentialSnapshot.js'
 import { mapLegacyOpenCodeV2Package, mapSelectedOpenCodeV2Model, type ExecutionProviderModels } from './profile/OpenCodeV2ExecutionConfig.js'
 import { readProcessStartTimeMs } from '../../utils/processKill.js'
 import { publishNativeCliFile } from './OpenCodeNativeCliPublication.js'
@@ -2604,6 +2605,7 @@ async function resolveOpenCodeProfileScopeInternal(
     : await readSafeOpenCodeRuntimeConfigImport(env)
   const project = await readProjectOpenCodeRuntimeConfig(projectPath)
   const mergedRuntimeConfig = deepMergeOpenCodeConfig(imported, project)
+  await snapshotOpenCodeGatewayCredential(mergedRuntimeConfig, providerId, env)
   const importedRuntimeConfig = input.purpose === 'catalog' || input.purpose === 'launch_runtime'
     ? isolateScopedRuntimeConfig(mergedRuntimeConfig, providerId, input.purpose)
     : mergedRuntimeConfig

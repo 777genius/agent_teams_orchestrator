@@ -363,6 +363,9 @@ describe('team bootstrap readiness contract', () => {
           source: 'TeamBootstrap',
         },
       },
+      // Test the handoff and fenced budget without a 50ms disk-scheduling race.
+      // Expire only after the spawn callback has captured the original fields.
+      monotonicNow: () => capturedNativeContextHash === undefined ? 0 : 50,
       context: {
         getAppState: () => ({
           teamContext: {
