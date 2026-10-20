@@ -645,12 +645,40 @@ function nativeTeardownPhases(evidence, children, getExited) {
   ];
 }
 
-function diagnoseWindowsStartup(evidence, flush, env, root, bun) {
-  const traced = evidence.probes.find(item => item.label === 'production-identity-repeat-1');
-  const markers = traced?.stderr?.trim().split('\n').flatMap(line => {
+function identityProbeMarkers(probe) {
+  return probe?.stderr?.trim().split('\n').flatMap(line => {
     try { return [JSON.parse(line)]; } catch { return []; }
   }) ?? [];
+}
+
+// This separate traced check runs only AFTER ordinary first-call acceptance.
+// Its result can verify that no helper was spawned, never rescue the first call.
+function assertNativeIdentityRepeat(probe, firstIdentity) {
+  assert.ok(!probe.error && probe.status === 0, 'Native identity repeat must exit successfully');
+  const markers = identityProbeMarkers(probe);
+  const completion = markers.find(item => item.phase === 'after-production-query');
+  assert.ok(completion && Number.isFinite(completion.startedAtMs), 'Native identity repeat must complete');
+  assert.equal(JSON.parse(probe.stdout).startedAtMs, completion.startedAtMs);
+  assert.ok(Number.isFinite(firstIdentity), 'Only first production identity can satisfy acceptance');
+  assert.equal(completion.startedAtMs, firstIdentity);
+  assert.equal(markers.filter(item => ['query-child', 'query-native'].includes(item.phase)
+    && item.event === 'invocation').length, 0, 'Native Windows identity must not spawn a helper');
+}
+
+function diagnoseWindowsStartup(evidence, flush, env, root, bun) {
+  const traced = evidence.probes.find(item => item.label === 'production-identity-repeat-1');
+  const markers = identityProbeMarkers(traced);
+  const completion = markers.find(item => item.phase === 'after-production-query');
+  assert.ok(!traced?.error && traced?.status === 0 && completion,
+    'Diagnostic production query must finish before interpreting child traces');
   const invocations = markers.filter(item => item.phase === 'query-child' && item.event === 'invocation');
+  if (invocations.length === 0) {
+    assert.equal(markers.filter(item => item.phase === 'query-native' && item.event === 'invocation').length, 0,
+      'No-child diagnostic must not hide a native child invocation');
+    evidence.identityDiagnostics = { kind: 'no-child-query', startedAtMs: completion.startedAtMs };
+    flush();
+    return;
+  }
   assert.equal(invocations.length, 1, 'Must capture the actual traced production invocation');
   const invocation = invocations[0];
   // Change one transport variable at a time. The first two production attempts
@@ -670,6 +698,48 @@ function diagnoseWindowsStartup(evidence, flush, env, root, bun) {
       { env, cwd: root, stdio: ['ignore', 'pipe', 'pipe'], timeout: 7000 });
   }
 }
+
+test('native repeat proves completion and first identity without a child invocation', () => {
+  const identity = 1_792_513_777_348;
+  const probe = { status: 0, error: null, stdout: JSON.stringify({ startedAtMs: identity }),
+    stderr: JSON.stringify({ phase: 'after-production-query', startedAtMs: identity }) };
+  assert.doesNotThrow(() => assertNativeIdentityRepeat(probe, identity));
+  for (const rejected of [
+    { ...probe, status: 1 },
+    { ...probe, error: { code: 'ETIMEDOUT' } },
+    { ...probe, stderr: '' },
+    { ...probe, stdout: JSON.stringify({ startedAtMs: identity + 1 }) },
+    { ...probe, stderr: JSON.stringify({ phase: 'after-production-query', startedAtMs: null }) },
+    ...['query-child', 'query-native'].map(phase => ({ ...probe,
+      stderr: probe.stderr + '\n' + JSON.stringify({ phase, event: 'invocation' }) })),
+  ]) assert.throws(() => assertNativeIdentityRepeat(rejected, identity));
+  assert.throws(() => assertNativeIdentityRepeat(probe, undefined));
+  assert.throws(() => assertNativeIdentityRepeat(probe, identity + 1));
+});
+
+test('completed no-child diagnostics preserve first failure without inventing a PowerShell replay', t => {
+  const spawn = t.mock.method(childProcess, 'spawnSync', () => { throw new Error('No child to replay'); });
+  syncBuiltinESMExports();
+  try {
+    const probe = { label: 'production-identity-repeat-1', status: 0, error: null,
+      stderr: JSON.stringify({ phase: 'after-production-query', startedAtMs: null }) };
+    const evidence = { probes: [probe], error: 'original first identity failure' };
+    let flushes = 0;
+    diagnoseWindowsStartup(evidence, () => { flushes++; }, {}, '/isolated', '/existing/bun');
+    assert.deepEqual(evidence.identityDiagnostics, { kind: 'no-child-query', startedAtMs: null });
+    assert.equal(evidence.startedAtMs, undefined);
+    assert.equal(evidence.error, 'original first identity failure');
+    assert.equal(evidence.probes.length, 1);
+    assert.equal(flushes, 1);
+    assert.equal(spawn.mock.callCount(), 0);
+    for (const stderr of ['',
+      probe.stderr + '\n' + JSON.stringify({ phase: 'query-native', event: 'invocation' }),
+      probe.stderr + '\n' + [1, 2].map(() => JSON.stringify({ phase: 'query-child', event: 'invocation' })).join('\n'),
+    ]) {
+      assert.throws(() => diagnoseWindowsStartup({ probes: [{ ...probe, stderr }] }, () => {}, {}, '/isolated', '/existing/bun'));
+    }
+  } finally { t.mock.restoreAll(); syncBuiltinESMExports(); }
+});
 
 test('native probe evidence retains an empty-output timeout and its invocation', () => {
   const root = mkdtempSync(path.join(os.tmpdir(), 'backfill-probe-evidence-'));
@@ -811,7 +881,7 @@ test('Bun production tracing observes the actual helper spawn, close, and deadli
         };
         const { traceProductionIdentity } = await import(${JSON.stringify(identityProbeModule)});
         await traceProductionIdentity(${JSON.stringify({ processKill: pathToFileURL(path.join(repository, 'src/utils/processKill.ts')).href,
-          pid: 2104, attempt: 1, platform: 'win32' })});
+          pid: 2104, attempt: 1, powerShellOnly: true })});
       `;
       const probe = recordWindowsProbe({ probes: [] }, () => {}, 'synthetic-production-child', existingBun(),
         ['--eval', program], { env, cwd: root, stdio: ['ignore', 'pipe', 'pipe'], timeout: 8000 });
@@ -821,14 +891,14 @@ test('Bun production tracing observes the actual helper spawn, close, and deadli
       const events = probe.stderr.trim().split('\n').map(line => JSON.parse(line));
       const invocation = events.find(item => item.event === 'invocation');
       assert.equal(invocation.command, 'powershell.exe');
-      assert.deepEqual(invocation.options, { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true });
+      assert.deepEqual(invocation.options, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
       assert.equal(invocation.envExplicit, false);
       assert.match(invocation.args[5], /GetProcessById\(2104\)/);
       assert.equal(invocation.environmentHash, environmentSummary(env).environmentHash);
       const native = events.find(item => item.phase === 'query-native' && item.event === 'invocation');
       assert.deepEqual(native.command, [process.execPath, '--eval', childProgram]);
       // Bun's node adapter maps "ignore" to null before Bun.spawn.
-      assert.deepEqual(native.stdio, [null, 'pipe', null]);
+      assert.deepEqual(native.stdio, [null, 'pipe', 'pipe']);
       assert.equal(native.environmentHash, invocation.environmentHash);
       assert.ok(events.some(item => item.event === 'stdout-data'));
       const after = events.find(item => item.phase === 'after-production-query');
@@ -1014,7 +1084,8 @@ test('Windows isolated PATH captures identity and teardown stops only the owned 
       // Collect repeats before PowerShell controls warm the runner further. Each
       // keeps the production 5s query deadline and existing 10s Bun outer bound.
       ['diagnostic-production-repeat-1', () => {
-        productionIdentityProbe(evidence, flush, bun, env, root, children[0]?.pid, 2);
+        const probe = productionIdentityProbe(evidence, flush, bun, env, root, children[0]?.pid, 2);
+        if (process.arch === 'x64') assertNativeIdentityRepeat(probe, evidence.startedAtMs);
       }],
       ['diagnostic-startup-controls', () => {
         if (!Number.isFinite(evidence.startedAtMs) && children[0]?.pid) {

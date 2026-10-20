@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import { windowsNativeProcess } from './windowsNativeProcess.js'
 
 const PROCESS_START_TIME_QUERY_TIMEOUT_MS = 2_500
 // Cold PowerShell identity queries have reached the 2.5s cutoff while a repeat
@@ -134,6 +135,26 @@ export async function readProcessStartTimeMs(
 
   if (platform !== 'win32') return null
 
+  // Use the same creation FILETIME identity without a cold helper process.
+  // An observed native denial/exit is definitive; only an unavailable native
+  // capability (for example Node or older Windows ARM64 Bun) uses PowerShell.
+  try {
+    const native = await windowsNativeProcess()
+    return native === null
+      ? readWindowsProcessStartTimeMsWithPowerShell(normalizedPid, timeoutMs)
+      : native.birth(normalizedPid)
+  } catch {
+    return null
+  }
+}
+
+/** Bounded compatibility fallback and independent .NET oracle for native identity. */
+export async function readWindowsProcessStartTimeMsWithPowerShell(
+  pid: number,
+  timeoutMs?: number,
+): Promise<number | null> {
+  if (!Number.isSafeInteger(pid) || pid <= 0 || pid > 0x7fffffff) return null
+
   const command = 'powershell.exe'
   // Get-Process can hang during module autoimport in an isolated Windows home.
   // Read the same .NET StartTime directly and release the process handle even
@@ -147,7 +168,7 @@ export async function readProcessStartTimeMs(
     [
       '$ErrorActionPreference = "Stop"',
       '$process = $null',
-      `try { $process = [System.Diagnostics.Process]::GetProcessById(${normalizedPid}); $startedAt = $process.StartTime.ToUniversalTime().ToString("o") } catch { exit 1 } finally { if ($null -ne $process) { $process.Dispose() } }`,
+      `try { $process = [System.Diagnostics.Process]::GetProcessById(${pid}); $startedAt = $process.StartTime.ToUniversalTime().ToString("o") } catch { exit 1 } finally { if ($null -ne $process) { $process.Dispose() } }`,
       '[Console]::Out.WriteLine($startedAt)',
     ].join('; '),
   ]
