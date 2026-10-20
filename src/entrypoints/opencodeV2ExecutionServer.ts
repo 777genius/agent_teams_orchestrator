@@ -1,7 +1,7 @@
 import { openCodeV2ServerLoopbackUrl } from '../services/opencode/host/OpenCodeV2ServerAddress.js'
 import { readExecutionGraphFailure } from '../services/opencode/host/OpenCodeV2ExecutionBinding.js'
 import { openCodeBunVersion } from '../constants/openCodeBunVersion.js'
-import { windowsExecutionChildControl, windowsGraphActivation } from '../services/opencode/host/windows/OpenCodeV2WindowsChildControl.js'
+import { windowsExecutionChildControl, windowsGraphActivation, windowsRealpathInstallCauses } from '../services/opencode/host/windows/OpenCodeV2WindowsChildControl.js'
 import { prepareExecutionPlatformChild, readExecutionPlatformBirth } from '../services/opencode/host/OpenCodeV2ExecutionPlatform.js'
 import { pathToFileURL } from 'node:url'
 import { resolveOpenCodeV2ExecutionDelivery } from '../services/opencode/host/OpenCodeV2ExecutionDelivery.js'
@@ -51,7 +51,7 @@ function reportStartupFailure(reason: 'timeout' | 'failed', error?: unknown): vo
   const causes = ['execution_contract_invalid', 'execution_identity_mismatch', 'execution_entry_changed',
     'v2_compiled_runtime_unsupported', 'v2_execution_layout_unsupported', 'execution_profile_changed',
     'execution_graph_changed', 'execution_graph_incomplete', 'execution_graph_dependency_missing',
-    'execution_containment_identity_mismatch', 'execution_realpath_unavailable', 'execution_realpath_install_failed',
+    'execution_containment_identity_mismatch', 'execution_realpath_unavailable', ...windowsRealpathInstallCauses,
     'execution_timeout', 'execution_cancelled']
   const cause = error instanceof Error && causes.includes(error.message) ? error.message : undefined
   const detail = error instanceof Error ? error as Error & { code?: unknown; syscall?: unknown; profileGuard?: unknown } : undefined

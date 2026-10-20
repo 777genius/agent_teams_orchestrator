@@ -11,7 +11,7 @@ import { boundOpenCodeRead } from '../transport/OpenCodeBoundedFetch.js'
 import { acquireExecutionLease, awaitExecutionHostReady } from './OpenCodeV2ExecutionHost.js'
 import { validateExecutionProfile, type ExecutionBirth, type SelectedExecutionProfile, type ValidatedExecutionNative } from './OpenCodeV2ExecutionBinding.js'
 import { executionClosedAck, retireExecutionChild, type ExecutionRetirementPort } from './OpenCodeV2ExecutionLifecycle.js'
-import { windowsGraphActivation } from './windows/OpenCodeV2WindowsChildControl.js'
+import { windowsGraphActivation, windowsRealpathInstallCauses } from './windows/OpenCodeV2WindowsChildControl.js'
 
 const birth: ExecutionBirth = { format: 'linux-start-ticks', value: '420', bootId: 'TEST-boot-domain' }
 const context = { teamId: 'TEST-team', runId: 'TEST-run', laneId: 'TEST-lane', memberId: 'TEST-member', deadline: Number.MAX_SAFE_INTEGER }
@@ -107,7 +107,7 @@ describe('execution host ownership and cleanup', () => {
         env: {}, envSha256: 'f'.repeat(64), config: { directory: '/TEST-profile/config', content: '{}', sha256: 'f'.repeat(64) },
         selection: { agent: 'worker', model: { providerID: 'TEST', id: 'model' }, permissions: [] } }
       const platform = mode === 'standalone-posix' || mode === 'owner-deadline-posix' ? 'darwin' : 'win32'
-      const scope = { AbortController, Date, windowsGraphActivation, boundOpenCodeRead, openCodeV2RunInitializationMs,
+      const scope = { AbortController, Date, windowsGraphActivation, windowsRealpathInstallCauses, boundOpenCodeRead, openCodeV2RunInitializationMs,
         process: { platform, pid: 42, env: { PWD: profile.directory }, versions: { bun: 'TEST-bun' },
           execPath: native.bun.path, argv: ['TEST-bun', '/TEST-entry'], cwd: () => profile.directory,
           stderr: { write: (text: string) => { reports.push(JSON.parse(text)) } }, once: () => {}, exit: (code: number) => { exits.push(code) } },

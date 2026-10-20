@@ -8,6 +8,7 @@ import { ClientError as CurrentClientError } from '@opencode/client'
 import { ClientError as FloorClientError } from '@opencode/client-v2-floor'
 import { ExecutionTransportFailure } from '../transport/OpenCodeV2ExecutionFetch.js'
 import { recordOpenCodeV2ProviderFailure, retainOpenCodeV2CatalogFailure, retainOpenCodeV2CleanupPhase, retainOpenCodeV2InitializationPhase, type RunInitializationPhase } from './OpenCodeV2Diagnostics.js'
+import { windowsRealpathInstallCauses } from '../host/windows/OpenCodeV2WindowsChildControl.js'
 
 test('catalog diagnostics preserve selected official client reasons, numeric status and immutable owned wire codes only', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'TEST-v2-catalog-diagnostics-'))
@@ -587,7 +588,7 @@ test('graph original native packet survives persistence but unknown fields are r
   const history = stages.slice(0, stages.indexOf('graph-validation') + 1).map((stage, elapsedMs) => ({ stage, elapsedMs }))
   expect(history.at(-1)?.stage).toBe('graph-validation')
   let emitted = ''
-  const context = { Error, Date, runtimeReady: false, startupFailureReported: false, startupStage: 'graph-validation',
+  const context = { Error, Date, windowsRealpathInstallCauses, runtimeReady: false, startupFailureReported: false, startupStage: 'graph-validation',
     startupStartedAt: Date.now() - 41, startupHistory: history, environmentMismatchKeys: [], executionProfileGuards: [],
     graphProgress: { phase: 'hash', completed: 0, total: graphFailure.total }, readExecutionGraphFailure: () => graphFailure,
     process: { stderr: { write: (value: string) => { emitted += value } } },

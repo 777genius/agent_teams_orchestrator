@@ -14,7 +14,7 @@ export type WindowsRealpathSelection = Readonly<{
 export type WindowsRealpathInstallation = Readonly<{ uninstall(): void }>
 
 type Encoding = { kind: 'default' } | { kind: 'buffer' } | { kind: 'encoding'; encoding: BufferEncoding } | { kind: 'unsupported' }
-type Diagnostics = Readonly<{ status: number; operation: number; win32: number }>
+type Diagnostics = Readonly<{ status: number; operation: number; win32: number; anchorIndex: number }>
 type Installation = {
   readonly native: NativeLibrary
   readonly anchors: WindowsRealpathSelection['anchors']
@@ -55,7 +55,7 @@ function retainNativeRealpathFailure(error: unknown, install: Installation, rout
 const MAX_CHARS = 32767
 const OUTPUT_CAPACITY = 32768
 const ANCHOR_SIZE = 56
-const ERROR_SIZE = 8
+const ERROR_SIZE = 12
 const FILE_ID = /^[0-9a-f]{32}$/
 const UINT64_MAX = (1n << 64n) - 1n
 
@@ -95,11 +95,11 @@ function pointerAddress(pointer: unknown): bigint {
 }
 
 const utf16 = (value: string): Buffer => Buffer.from(`${value}\0`, 'utf16le')
-const errorFacts = (buffer: Buffer): { operation: number; win32: number } =>
-  ({ operation: buffer.readUInt32LE(0), win32: buffer.readUInt32LE(4) })
+const errorFacts = (buffer: Buffer): { operation: number; win32: number; anchorIndex: number } =>
+  ({ operation: buffer.readUInt32LE(0), win32: buffer.readUInt32LE(4), anchorIndex: buffer.readUInt32LE(8) })
 const initializationError = (value: Diagnostics): Error =>
   Object.assign(new Error(`windows_realpath_initialization_failed status=${value.status} operation=${value.operation} win32=${value.win32}`),
-    { status: value.status, operation: value.operation, win32: value.win32 })
+    { status: value.status, operation: value.operation, win32: value.win32, anchorIndex: value.anchorIndex })
 
 function isPermissionError(error: unknown): boolean {
   return typeof error === 'object' && error !== null &&
@@ -299,7 +299,7 @@ function openNative(selection: WindowsRealpathSelection): { library: NativeLibra
     )
     if (status !== 0) throw initializationError({ status, ...errorFacts(errorBuffer) })
     const context = contextBuffer.readBigUInt64LE(0)
-    if (context === 0n) throw initializationError({ status: 4, operation: 7, win32: 11 })
+    if (context === 0n) throw initializationError({ status: 4, operation: 7, win32: 11, anchorIndex: 0xffffffff })
     return { library, context }
   } catch (error) {
     try { library.close() } catch { /* preserve the original initialization error */ }
@@ -354,8 +354,8 @@ function closeNative(library: NativeLibrary, context: bigint): Diagnostics {
   try { status = library.symbols.RP_CloseV1(context, ffi.ptr(errorBuffer)) } catch { status = 4 }
   const facts = errorFacts(errorBuffer)
   if (status !== 0) return { status, ...facts }
-  try { library.close() } catch { return { status: 4, operation: 24, win32: 11 } }
-  return { status: 0, operation: 0, win32: 0 }
+  try { library.close() } catch { return { status: 4, operation: 24, win32: 11, anchorIndex: 0xffffffff } }
+  return { status: 0, operation: 0, win32: 0, anchorIndex: 0xffffffff }
 }
 
 export function installWindowsRealpathFallback(selection: WindowsRealpathSelection): WindowsRealpathInstallation {

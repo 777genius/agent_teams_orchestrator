@@ -1,4 +1,5 @@
 import { readWindowsNativeAliasFailure } from '../host/windows/OpenCodeV2WindowsNativeBroker.js'
+import { windowsRealpathInstallCauses } from '../host/windows/OpenCodeV2WindowsChildControl.js'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { types } from 'node:util'
@@ -70,7 +71,7 @@ function startupDiagnostic(output: string | undefined) {
       const closedFields: Record<string, readonly string[]> = {
         errno: ['EPERM', 'EACCES', 'ENOENT', 'ENOTDIR', 'EISDIR', 'EINVAL', 'UNKNOWN', 'EIO', 'ENOSYS'],
         operation: ['realpath', 'open', 'read', 'lstat', 'stat'], errorName: ['Error', 'TypeError', 'ReferenceError', 'RangeError', 'AbortError'],
-        cause: ['execution_contract_invalid', 'execution_identity_mismatch', 'execution_entry_changed', 'v2_compiled_runtime_unsupported', 'v2_execution_layout_unsupported', 'execution_profile_changed', 'execution_graph_changed', 'execution_graph_incomplete', 'execution_graph_dependency_missing', 'execution_containment_identity_mismatch', 'execution_realpath_unavailable', 'execution_realpath_install_failed', 'execution_timeout', 'execution_cancelled'],
+        cause: ['execution_contract_invalid', 'execution_identity_mismatch', 'execution_entry_changed', 'v2_compiled_runtime_unsupported', 'v2_execution_layout_unsupported', 'execution_profile_changed', 'execution_graph_changed', 'execution_graph_incomplete', 'execution_graph_dependency_missing', 'execution_containment_identity_mismatch', 'execution_realpath_unavailable', ...windowsRealpathInstallCauses, 'execution_timeout', 'execution_cancelled'],
         profileGuard: ['environment_hash', 'config_hash', 'home_mapping', 'path_containment', 'database_type', 'models_type', 'models_hash', 'process_cwd', 'process_pwd', 'process_environment'],
       }
       if (!row || Array.isArray(row)) continue

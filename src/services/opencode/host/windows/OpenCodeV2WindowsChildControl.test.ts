@@ -2,6 +2,7 @@ import { expect, test } from 'bun:test'
 import { readFile } from 'node:fs/promises'
 import path from 'node:path'
 import { runInNewContext } from 'node:vm'
+import { windowsRealpathInstallCauses } from './OpenCodeV2WindowsChildControl.js'
 
 // Execute the actual private child bodies: the native DLL refuses a second
 // held anchor for one physical object, and a prepare-time refusal must leave
@@ -46,6 +47,48 @@ test('one physical object never reaches the native DLL as two held anchors', asy
   }, { format: 'windows-filetime', value: '133000000000000000', bootId: null })
   // Both spellings of the object collapse to one anchor; the distinct object stays.
   expect(selection.anchors.map(anchor => anchor.dosPath)).toEqual(['C:\\alpha', 'C:\\beta'])
+})
+
+test('a prepare-time install refusal names its closed native step and anchor kind', async () => {
+  const body = composedBody(await controlSource())
+  const scope = {
+    path,
+    Object, String, Number, BigInt, Date, Promise, Error, structuredClone,
+    authenticatedPrepares: new WeakMap(),
+    windowsExecutionChildControl: () => ({ send: async () => {}, events: { on() {} } }),
+  }
+  const built = new Function('scope', `const {${Object.keys(scope).join(',')}}=scope;${body};return { closedRealpathInstallFailure, windowsRealpathInstallCauses };`)(scope) as {
+    closedRealpathInstallFailure: (error: unknown, selection: { anchors: readonly { kind: string }[] }) => Error & { code?: string }
+    windowsRealpathInstallCauses: readonly string[]
+  }
+  const selection = { anchors: [{ kind: 'readOnly' }, { kind: 'writable' }, { kind: 'metadata' }] }
+  const native = (operation: number, anchorIndex: number, win32 = 5) =>
+    Object.assign(new Error(`windows_realpath_initialization_failed status=2 operation=${operation} win32=${win32}`),
+      { status: 2, operation, win32, anchorIndex })
+  // The failing admission position selects the closed anchor kind; the raw
+  // native operation becomes a fixed sub-step token, never a message.
+  expect(built.closedRealpathInstallFailure(native(4, 1), selection))
+    .toMatchObject({ message: 'execution_realpath_open_anchor_identity_writable', code: 'EACCES' })
+  expect(built.closedRealpathInstallFailure(native(5, 2), selection))
+    .toMatchObject({ message: 'execution_realpath_open_anchor_component_metadata', code: 'EACCES' })
+  expect(built.closedRealpathInstallFailure(native(2, 0xffffffff), selection))
+    .toMatchObject({ message: 'execution_realpath_open_process_identity', code: 'EACCES' })
+  expect(built.closedRealpathInstallFailure(native(7, 0xffffffff, 4), selection))
+    .toMatchObject({ message: 'execution_realpath_open_table', code: 'UNKNOWN' })
+  // A loader refusal carries just an OS errno and keeps its own closed code.
+  expect(built.closedRealpathInstallFailure(Object.assign(new Error('TEST-loader-refusal'), { code: 'EACCES' }), selection))
+    .toMatchObject({ message: 'execution_realpath_dll_load_failed', code: 'EACCES' })
+  const generic = built.closedRealpathInstallFailure(new Error('TEST-unknown'), selection)
+  expect(generic.message).toBe('execution_realpath_install_failed')
+  expect(generic.code).toBeUndefined()
+  // Every emitted cause stays inside the vocabulary the startup reporter and
+  // the app harness closed-token scan accept.
+  const closed = /^(?:execution|run|cleanup|provider|controller)_[a-z_]{2,90}$/
+  for (const cause of ['execution_realpath_open_anchor_identity_writable', 'execution_realpath_open_anchor_component_metadata',
+    'execution_realpath_open_process_identity', 'execution_realpath_open_table', 'execution_realpath_dll_load_failed', generic.message]) {
+    expect(built.windowsRealpathInstallCauses).toContain(cause)
+    expect(cause).toMatch(closed)
+  }
 })
 
 test('a prepare-time realpath refusal reports a closed startup cause', async () => {
@@ -93,6 +136,7 @@ test('a prepare-time realpath refusal reports a closed startup cause', async () 
       Error, Date, runtimeReady: false, startupFailureReported: false, startupStage: 'waiting-for-prepare',
       startupStartedAt: Date.now() - 41, startupHistory: [{ stage: 'waiting-for-prepare', elapsedMs: 0 }],
       environmentMismatchKeys: [], executionProfileGuards: [], readExecutionGraphFailure: () => undefined,
+      windowsRealpathInstallCauses,
       graphProgress: undefined,
       process: { stderr: { write: (line: string) => { emitted += line } } },
       original: rejection as Error,

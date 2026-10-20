@@ -138,13 +138,41 @@ function closeWindowsRealpath(): Promise<void> {
 let prepared: Readonly<{ type: 'prepared'; nonce: string; leaseOwnerId: string; pid: number; birth: ExecutionBirth; namespace: string; executableSha256: string; realpathInstalled: string }> | undefined
 const startupErrno = new Set(['EPERM', 'EACCES', 'ENOENT', 'ENOTDIR', 'EISDIR', 'EINVAL', 'UNKNOWN', 'EIO', 'ENOSYS'])
 const win32Errno: Record<number, string> = { 2: 'ENOENT', 3: 'ENOENT', 5: 'EACCES', 87: 'EINVAL' }
+const installOperations: Readonly<Record<number, string>> = {
+  1: 'arguments', 2: 'process_identity', 3: 'anchor', 4: 'anchor_identity', 5: 'anchor_component',
+  6: 'duplicate_child', 7: 'table', 25: 'internal',
+}
+const anchorKindTokens: Readonly<Record<string, string>> = { readOnly: 'read_only', writable: 'writable', metadata: 'metadata' }
+const anchorOperations = new Set([3, 4, 5])
+/** The complete closed vocabulary of prepare-time install refusals; the startup
+ * reporter and the diagnostics projector accept exactly these causes. */
+export const windowsRealpathInstallCauses: readonly string[] = Object.freeze([
+  'execution_realpath_install_failed', 'execution_realpath_dll_load_failed', 'execution_realpath_open_failed',
+  ...Object.entries(installOperations).flatMap(([operation, token]) => anchorOperations.has(Number(operation))
+    ? [`execution_realpath_open_${token}`, ...Object.values(anchorKindTokens).map(kind => `execution_realpath_open_${token}_${kind}`)]
+    : [`execution_realpath_open_${token}`]),
+])
 /** Closed projection of a realpath refusal: the raw native message and its
  * facts stay inside the runner, only this vocabulary reaches the startup row. */
-function closedRealpathInstallFailure(error: unknown): Error {
-  const failure = new Error('execution_realpath_install_failed') as Error & { code?: string }
-  const source = error as { code?: unknown; win32?: unknown } | null | undefined
+function closedRealpathInstallFailure(error: unknown, selection: WindowsRealpathSelection): Error {
+  const source = error as { code?: unknown; win32?: unknown; status?: unknown; operation?: unknown; anchorIndex?: unknown } | null | undefined
   const code = typeof source?.code === 'string' && startupErrno.has(source.code) ? source.code
     : typeof source?.win32 === 'number' && Number.isSafeInteger(source.win32) ? win32Errno[source.win32] ?? 'UNKNOWN' : undefined
+  // Only the native initialization refusal carries the closed diagnostic triple;
+  // a loader refusal carries just an OS errno and no operation.
+  const native = typeof source?.status === 'number' && Number.isSafeInteger(source.status) &&
+    typeof source?.operation === 'number' && Number.isSafeInteger(source.operation) &&
+    typeof source?.win32 === 'number' && Number.isSafeInteger(source.win32)
+  let message = 'execution_realpath_install_failed'
+  if (native) {
+    const operation = (source as { operation: number }).operation
+    const token = installOperations[operation] ?? 'failed'
+    const anchorIndex = typeof source?.anchorIndex === 'number' && Number.isSafeInteger(source.anchorIndex) ? source.anchorIndex : undefined
+    const anchor = anchorIndex !== undefined && anchorIndex >= 0 && anchorIndex < selection.anchors.length ? selection.anchors[anchorIndex] : undefined
+    const kind = anchor ? anchorKindTokens[anchor.kind] : undefined
+    message = `execution_realpath_open_${token}${anchorOperations.has(operation) && kind ? `_${kind}` : ''}`
+  } else if (code) message = 'execution_realpath_dll_load_failed'
+  const failure = new Error(message) as Error & { code?: string }
   if (code) failure.code = code
   return failure
 }
@@ -166,7 +194,7 @@ export async function prepareWindowsExecutionChild(value: unknown) {
   try { ({ installWindowsRealpathFallback: install } = await import('./OpenCodeV2WindowsRealpath.js')) }
   catch { throw new Error('execution_realpath_unavailable') }
   try { realpathInstallation = install(selection) }
-  catch (error) { throw closedRealpathInstallFailure(error) }
+  catch (error) { throw closedRealpathInstallFailure(error, selection) }
   assert(realpathReceiptId)
   prepared = Object.freeze({ type: 'prepared', nonce: String(record.nonce), leaseOwnerId: String(record.leaseOwnerId), pid: process.pid,
     birth: Object.freeze({ format: 'windows-filetime', value: nativeBirth.value, bootId: null }), namespace: String(record.namespace), executableSha256: record.executableSha256, realpathInstalled: realpathReceiptId })
