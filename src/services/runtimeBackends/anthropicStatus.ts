@@ -32,6 +32,7 @@ export function isAnthropicSubscriptionAuthMethod(
 }
 
 export function buildAnthropicRuntimeStatus(params: {
+  effectiveDefaultModel?: string | null
   auth: AnthropicAuthenticatedState
   modelCatalog: RuntimeProviderModelCatalog
   visibleModels: string[]
@@ -76,6 +77,7 @@ export function buildAnthropicRuntimeStatus(params: {
     availableBackends: [],
     externalRuntimeDiagnostics: [],
     models: params.visibleModels,
+    effectiveDefaultModel: params.effectiveDefaultModel ?? null,
     modelCatalog: params.modelCatalog,
     subscriptionRateLimits: isAnthropicSubscriptionAuthMethod(params.auth.authMethod)
       ? (params.subscriptionRateLimits ?? null)

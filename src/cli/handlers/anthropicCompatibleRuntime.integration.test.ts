@@ -95,6 +95,7 @@ async function withAnthropicCompatibleEnv<T>(
     'ANTHROPIC_AUTH_TOKEN',
     'ANTHROPIC_BASE_URL',
     'ANTHROPIC_CUSTOM_HEADERS',
+    'ANTHROPIC_MODEL',
     'ANTHROPIC_AWS_WORKSPACE_ID',
     'ANTHROPIC_FOUNDRY_API_KEY',
     'ANTHROPIC_FOUNDRY_RESOURCE',
@@ -139,6 +140,23 @@ async function withAnthropicCompatibleEnv<T>(
 }
 
 describe('Anthropic-compatible runtime integration', () => {
+  test('env-selected model, not the first gateway model, is shared by status and launch default', async () => {
+    const server = createAnthropicCompatibleServer()
+    try {
+      await withAnthropicCompatibleEnv(server.baseUrl, async () => {
+        process.env.ANTHROPIC_MODEL = 'glm-5:cloud'
+        const modelList = await getProviderModels('anthropic')
+        const status = await getUnifiedRuntimeStatusPayload('anthropic')
+        expect(modelList.defaultModel).toBe('glm-5:cloud')
+        expect(status.providers.anthropic?.effectiveDefaultModel).toBe('glm-5:cloud')
+        expect(status.providers.anthropic?.modelCatalog?.defaultLaunchModel).toBe('qwen3.6')
+        expect(server.requests.every(request => request.path === '/v1/models')).toBe(true)
+      })
+    } finally {
+      server.stop()
+    }
+  })
+
   test('discovers Ollama-style models for model list and runtime status', async () => {
     const server = createAnthropicCompatibleServer()
 

@@ -203,6 +203,8 @@ export type RuntimeProviderStatus = {
   availableBackends: RuntimeBackendOptionStatus[]
   externalRuntimeDiagnostics: ExternalRuntimeDiagnostic[]
   models: string[]
+  /** Current inherited team model resolved from applied runtime config; null means unknown. */
+  effectiveDefaultModel?: string | null
   modelCatalog?: RuntimeProviderModelCatalog | null
   runtimeCapabilities?: RuntimeProviderCapabilities
   subscriptionRateLimits?: RuntimeProviderSubscriptionRateLimitSnapshot | null

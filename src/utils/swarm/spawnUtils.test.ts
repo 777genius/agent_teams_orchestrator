@@ -735,8 +735,9 @@ describe('shouldClearAnthropicApiKeyForTeammateSpawn', () => {
     const originalFlagSettingsPath = getFlagSettingsPath()
     const originalFlagSettingsInline = getFlagSettingsInline()
     const helperDir = '/var/folders/team-runtime-auth/mixed/runs/run-1'
-    const inheritedAnthropicSettingsPath =
-      `/private${helperDir}/runtime-settings-anthropic.json`
+    const inheritedAnthropicSettingsPath = process.platform === 'darwin'
+      ? `/private${helperDir}/runtime-settings-anthropic.json`
+      : `${helperDir}/runtime-settings-anthropic.json`
 
     process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1'
     process.env.CLAUDE_TEAM_ANTHROPIC_AUTH_MODE = 'api_key_helper'
@@ -858,7 +859,7 @@ describe('shouldClearAnthropicApiKeyForTeammateSpawn', () => {
       '/var/folders/agent-teams-runtime-settings/mixed/run/runtime-settings-anthropic.json'
 
     process.env.CLAUDE_TEAM_RUNTIME_SETTINGS_PATH = settingsPath
-    setFlagSettingsPath(`/private${settingsPath}`)
+    setFlagSettingsPath(process.platform === 'darwin' ? `/private${settingsPath}` : settingsPath)
     setFlagSettingsInline({
       apiKeyHelper: "'/tmp/helper.sh'",
       awsCredentialExport: '/tmp/aws.sh',

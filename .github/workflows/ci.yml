@@ -224,7 +224,20 @@ jobs:
         if: runner.os == 'Linux'
         run: python3 --version
       - name: Test runtime status and adjacent output boundaries
-        run: bun test src/cli/handlers/runtime.status-stdout.test.ts src/cli/handlers/runtime.providers-stdout.test.ts src/cli/handlers/runtime.verify-stdout.test.ts src/cli/runtimeStatusCommand.entry.test.ts src/utils/sleep.test.ts
+        # Model defaults use the same provider-scoped status boundary. The real
+        # CLI fixture uses portable Bun/Node APIs and a disposable local gateway.
+        run: >-
+          bun test
+          src/cli/handlers/runtime.status-stdout.test.ts
+          src/cli/handlers/runtime.providers-stdout.test.ts
+          src/cli/handlers/runtime.verify-stdout.test.ts
+          src/cli/runtimeStatusCommand.entry.test.ts
+          src/cli/effectiveDefaultModel.entry.test.ts
+          src/cli/handlers/anthropicCompatibleRuntime.integration.test.ts
+          src/cli/handlers/model.test.ts
+          src/services/runtimeBackends/effectiveDefaultModel.test.ts
+          src/services/runtimeBackends/registry.anthropicCatalog.test.ts
+          src/utils/sleep.test.ts
 
   opencode-conformance:
     needs: scope
