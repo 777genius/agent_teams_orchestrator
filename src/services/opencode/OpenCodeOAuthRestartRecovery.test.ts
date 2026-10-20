@@ -4,6 +4,7 @@ import { afterEach, expect, test } from 'bun:test'
 import { Database } from 'bun:sqlite'
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
+import { readFileSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import os from 'node:os'
@@ -22,11 +23,61 @@ const c0 = { type: 'oauth', access: 'AUDIT-C0', refresh: 'AUDIT-single-use-C0', 
 const c1 = { ...c0, access: 'AUDIT-C1', refresh: 'AUDIT-single-use-C1', expires: 500 }
 const roots: string[] = []
 const manager = new OpenCodeProfileManager()
+type RecoveryTrace = { root: string, label: string, started: number, startedAtMs: number, childSequence: number, freshSequence: number,
+  stages: { phase: string, ms: number }[] }
+const fixtureTraces = new Set<RecoveryTrace>()
+function markTrace(trace: RecoveryTrace, phase: string) {
+  trace.stages.push({ phase, ms: Math.round(performance.now() - trace.started) })
+  if (trace.stages.length > 48) trace.stages.shift()
+}
+function pidObservation(pid: number | undefined) {
+  if (pid === undefined) return { state: 'unknown' }
+  try { process.kill(pid, 0); return { state: 'present' } }
+  catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    return { state: code === 'ESRCH' ? 'already-gone' : code === 'EPERM' ? 'permission-denied' : 'unknown',
+      code: typeof code === 'string' ? code.slice(0, 32) : null }
+  }
+}
+function emitChildTrace(entry: ReturnType<typeof startOwnedChild>, event: string, pidState?: ReturnType<typeof pidObservation>) {
+  let phases: { phase: string, ms: number, atMs: number, pid: number }[] = [], sidecarError: string | null = null
+  try {
+    const text = readFileSync(entry.sidecar, 'utf8')
+    if (text.length > 4096) throw new Error('Oversized recovery trace')
+    phases = text.trim().split('\n').filter(Boolean).map(line => {
+      const value = JSON.parse(line)
+      if (!['entry', 'profile-import-begin', 'profile-import-end', 'resolve-begin', 'resolve-end', 'stdout-write-callback'].includes(value.phase)
+        || !Number.isFinite(value.ms) || value.ms < 0 || !Number.isSafeInteger(value.atMs) || value.atMs <= 0
+        || !Number.isSafeInteger(value.pid) || value.pid <= 0 || value.pid !== entry.child.pid) throw new Error('Invalid recovery trace')
+      return { phase: value.phase, ms: value.ms, atMs: value.atMs, pid: value.pid }
+    })
+    if (phases.length > 12) throw new Error('Too many recovery trace phases')
+  } catch (error) {
+    phases = []; sidecarError = String((error as NodeJS.ErrnoException).code ?? 'trace-invalid').slice(0, 32)
+    if (!entry.state.cleaning) entry.state.error ??= error as Error
+  }
+  console.error(JSON.stringify({ event: `recovery-diagnostic-${event}`, root: path.basename(entry.trace.root),
+    label: entry.trace.label, childSequence: entry.childSequence, freshSequence: entry.freshSequence,
+    pid: entry.child.pid ?? null, phase: entry.state.phase, elapsedMs: Math.round(performance.now() - entry.trace.started),
+    fixtureStartedAtMs: entry.trace.startedAtMs, wallClockAlignment: 'diagnostic-only',
+    stdoutEnded: entry.state.stdoutEnded, exited: entry.state.exited, code: entry.state.code, signal: entry.state.signal,
+    stdoutBytes: Buffer.byteLength(entry.state.stdout), stderrBytes: Buffer.byteLength(entry.state.stderr),
+    cleaning: entry.state.cleaning, pidState, parentStages: entry.trace.stages, childPhases: phases, sidecarError }))
+}
 
 // Keep OS-owned handles until close, including when Bun cancels a timed-out test.
 // Draining pipes through Node streams avoids awaiting Bun's Windows pipe readers.
-function startOwnedChild(script: string, args: string[], env: NodeJS.ProcessEnv, phase: string) {
-  const child = spawn(process.execPath, ['-e', script, ...args], {
+function startOwnedChild(script: string, args: string[], env: NodeJS.ProcessEnv, phase: string,
+  trace: RecoveryTrace, freshSequence: number | null = null) {
+  const childSequence = ++trace.childSequence
+  const sidecar = path.join(trace.root, `TEST-recovery-child-${childSequence}.jsonl`)
+  const prefix = `const diagnosticStarted = performance.now(), diagnosticFS = require('node:fs');
+    diagnosticFS.writeFileSync(${JSON.stringify(sidecar)}, '', { flag: 'wx', mode: 0o600 });
+    const diagnosticMark = phase => diagnosticFS.appendFileSync(${JSON.stringify(sidecar)},
+      JSON.stringify({ phase, ms: Math.round(performance.now() - diagnosticStarted), atMs: Date.now(), pid: process.pid }) + '\\n');
+    diagnosticMark('entry');`
+  markTrace(trace, `child-${childSequence}-spawn`)
+  const child = spawn(process.execPath, ['-e', prefix + script, ...args], {
     env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true,
   })
   const state = { phase, stdout: '', stderr: '', stdoutEnded: false,
@@ -41,9 +92,12 @@ function startOwnedChild(script: string, args: string[], env: NodeJS.ProcessEnv,
     state.exited = true; state.code = code; state.signal = signal
   })
   const closed = new Promise<void>(resolve => {
-    child.once('close', () => { ownedChildren.delete(entry); resolve() })
+    child.once('close', () => {
+      markTrace(trace, `child-${childSequence}-close`)
+      emitChildTrace(entry, 'close'); ownedChildren.delete(entry); resolve()
+    })
   })
-  const entry = { child, state, closed }
+  const entry = { child, state, closed, trace, sidecar, childSequence, freshSequence }
   ownedChildren.add(entry)
   return entry
 }
@@ -58,6 +112,10 @@ function stopInterruptedContinuation(): Promise<never> {
 
 async function reapOwnedChild(entry: ReturnType<typeof startOwnedChild>): Promise<void> {
   entry.state.cleaning = true
+  // Independent OS observation precedes our own cleanup signal; it is diagnostic only.
+  const pidState = pidObservation(entry.child.pid)
+  markTrace(entry.trace, `child-${entry.childSequence}-interruption`)
+  emitChildTrace(entry, 'interruption', pidState)
   const diagnostic = { phase: entry.state.phase, stdoutEnded: entry.state.stdoutEnded,
     exited: entry.state.exited, code: entry.state.code, signal: entry.state.signal,
     stdoutBytes: Buffer.byteLength(entry.state.stdout), stderrBytes: Buffer.byteLength(entry.state.stderr) }
@@ -78,6 +136,12 @@ afterEach(async () => {
   // dangling-child failures in subsequent tests. Preserve roots if reaping fails.
   const interrupted = [...ownedChildren]
   await Promise.all(interrupted.map(reapOwnedChild))
+  for (const trace of fixtureTraces) {
+    markTrace(trace, interrupted.length ? 'afterEach-interrupted' : 'afterEach-complete')
+    console.error(JSON.stringify({ event: 'recovery-diagnostic-fixture', root: path.basename(trace.root),
+      label: trace.label, fixtureStartedAtMs: trace.startedAtMs, wallClockAlignment: 'diagnostic-only', parentStages: trace.stages }))
+  }
+  fixtureTraces.clear()
   if (interrupted.length) {
     // Earlier setup IO may still settle after interruption. Keep its isolated
     // roots, rather than race removal against an async body Bun did not cancel.
@@ -90,13 +154,14 @@ const read = (authPath: string) => readOpenCodeAuthCredential({ authPath, provid
 const exists = (file: string) => Bun.file(file).exists()
 
 async function fixture(options: { session?: boolean, purpose?: 'launch_runtime' | 'execution_probe', remote?: boolean,
-  terminal?: string, successor?: typeof c0, controlUrl?: string, diagnostic?: 'claude-dir' | 'command' } = {}) {
-  const started = Date.now()
-  const mark = (phase: string) => {
-    if (process.platform === 'win32' && options.diagnostic)
-      console.error(`Owned recovery fixture ${options.diagnostic}: ${phase} elapsedMs=${Date.now() - started}`)
-  }
+  terminal?: string, successor?: typeof c0, controlUrl?: string, diagnostic?: string } = {}) {
+  const trace: RecoveryTrace = { root: 'allocating', label: (options.diagnostic ?? 'fixture').slice(0, 96),
+    started: performance.now(), startedAtMs: Date.now(), childSequence: 0, freshSequence: 0, stages: [] }
+  fixtureTraces.add(trace)
+  const mark = (phase: string) => markTrace(trace, phase)
+  mark('fixture-begin')
   const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'oauth-restart-audit-')))
+  trace.root = root; mark('root-ready')
   roots.push(root)
   const project = path.join(root, 'project')
   await mkdir(project)
@@ -124,7 +189,9 @@ async function fixture(options: { session?: boolean, purpose?: 'launch_runtime' 
   const global = path.join(root, 'app-data', 'opencode', 'auth.json')
   const receiptPath = `${global}.agent-teams-xai-oauth-save.json`
   const archivePath = `${receiptPath}.revoked-${createHash('sha256').update(c0.refresh).digest('hex')}`
+  mark('initial-auth-begin')
   await upsertOpenCodeAuthCredential({ authPath: global, providerId: 'xai', credential: c0 })
+  mark('initial-auth-end')
   mark('prepare-profile begin')
   const profile = await manager.prepareProfile(project, { profileScope: await resolveOpenCodeProfileScope({
     projectPath: project, selectedModel: 'xai/grok-4.3', purpose, env,
@@ -135,7 +202,7 @@ async function fixture(options: { session?: boolean, purpose?: 'launch_runtime' 
       process.exit(chunk.length === 1 && chunk[0] === 4 ? 0 : 1));
     process.stdin.on('end', () => process.exit(1));
     process.stdin.on('error', () => process.exit(1));
-    process.stdin.resume();`, [], env, 'synthetic writer stop')
+    process.stdin.resume();`, [], env, 'synthetic writer stop', trace)
   const { child } = writer
   let native: any
   try {
@@ -215,13 +282,16 @@ async function fixture(options: { session?: boolean, purpose?: 'launch_runtime' 
   const receiptText = await readFile(receiptPath, 'utf8')
   const receipt = JSON.parse(receiptText)
   expect(receipt.successor).toBeNull()
-  return { root, project, purpose, env, profile, global, receiptPath, archivePath, native, receipt, receiptText }
+  mark('fixture-ready')
+  return { root, project, purpose, env, profile, global, receiptPath, archivePath, native, receipt, receiptText, trace }
 }
 type Fixture = Awaited<ReturnType<typeof fixture>>
 
 // A new Bun process has no parent's effective-config snapshot map. Default
 // production recovery must use the exited writer's canonical SQLite history.
 async function fresh(f: Fixture, env = f.env, purpose = f.purpose, project = f.project, fault?: { path: string, after: boolean }, role: 'fault' | 'recovery' | 'idempotent' = fault ? 'fault' : 'recovery') {
+  const sequence = ++f.trace.freshSequence
+  markTrace(f.trace, `fresh-${sequence}-${role}-begin`)
   const modulePath = path.resolve(import.meta.dir, './OpenCodeProfileManager.ts')
   const inject = fault ? `const { mock } = await import('bun:test');
     const atomicPath = ${JSON.stringify(path.resolve(import.meta.dir, '../../utils/atomicWrite.ts'))};
@@ -236,20 +306,30 @@ async function fresh(f: Fixture, env = f.env, purpose = f.purpose, project = f.p
       const { deepStrictEqual } = await import('node:assert/strict');
       deepStrictEqual([process.env.HOMEDRIVE, process.env.HOMEPATH], ${JSON.stringify([env.HOMEDRIVE, env.HOMEPATH])});
     }
+    diagnosticMark('profile-import-begin');
     const { resolveOpenCodeProfileScope } = await import(${JSON.stringify(modulePath)});
+    diagnosticMark('profile-import-end'); diagnosticMark('resolve-begin');
+    let result;
     try { const scope = await resolveOpenCodeProfileScope({ projectPath: process.argv[1], selectedModel: 'xai/grok-4.3', purpose: process.argv[2] });
-      process.stdout.write(JSON.stringify({ ok: true, scope }));
-    } catch (e) { process.stdout.write(JSON.stringify({ ok: false, error: e.message })); }`
-  const entry = startOwnedChild(script, [project, purpose], env, `fresh ${role} natural exit`)
+      result = { ok: true, scope };
+    } catch (e) { result = { ok: false, error: e.message }; }
+    diagnosticMark('resolve-end');
+    process.stdout.write(JSON.stringify(result), () => diagnosticMark('stdout-write-callback'));`
+  const entry = startOwnedChild(script, [project, purpose], env, `fresh ${role} natural exit`, f.trace, sequence)
   entry.child.stdin.end()
   await entry.closed
   if (entry.state.cleaning) await stopInterruptedContinuation()
   // Fresh recovery must exit naturally, including closing its imported handles.
   expect(entry.state.error).toBeNull()
   expect(entry.state.stderr).toBe(''); expect(entry.state.code).toBe(0)
+  markTrace(f.trace, `fresh-${sequence}-${role}-end`)
   return JSON.parse(entry.state.stdout)
 }
-const current = (f: Fixture, env = f.env) => isOpenCodeOAuthPublicationScopeCurrent(f.receipt.owner, c0, env)
+const current = async (f: Fixture, env = f.env) => {
+  markTrace(f.trace, 'current-comparison-begin')
+  try { return await isOpenCodeOAuthPublicationScopeCurrent(f.receipt.owner, c0, env) }
+  finally { markTrace(f.trace, 'current-comparison-end') }
+}
 const saved = (f: Fixture, env = f.env) => readOpenCodeSavedAuthStore({ globalAuthPath: f.global, sourceAuthPaths: f.receipt.sourceAuthPaths, env })
 
 test('same-env fresh process harvests exact exited probe C1 and keeps native saved sources unchanged', async () => {
@@ -656,7 +736,7 @@ for (const state of ['pending', 'published']) for (const [label, url] of [
   ['query', 'http://127.0.0.1:43102/?secret=other'],
 ]) {
   test(`endpoint admission ${state}/${label}`, async () => {
-    const f = await fixture()
+    const f = await fixture({ diagnostic: `endpoint-${state}-${label}` })
     if (state === 'published') expect((await fresh(f)).ok).toBe(true)
     const changed = { ...f.env, CLAUDE_TEAM_CONTROL_URL: url }
     // Ineligible endpoints cannot acquire port-drift authority.
