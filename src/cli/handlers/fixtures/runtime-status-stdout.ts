@@ -22,6 +22,7 @@ for (const [file, name] of [
 }
 // This offline transport fixture substitutes both dispatch generations.
 mock.module(dependency('../../services/opencode/bridge/OpenCodeV2TeamBridge.js'), () => ({
+  executeExistingOpenCodeV2TranscriptEnvelope: unused,
   executeSelectedOpenCodeBridgeCommandEnvelope: command === 'opencode-command'
     ? async (input: unknown, executeV1: (input: unknown) => Promise<unknown>) => executeV1(input)
     : unused,
