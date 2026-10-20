@@ -7,6 +7,8 @@ import path from 'node:path'
 // Isolated diagnostic branch only. Neither result is release qualification.
 const sourceCommit = '5899164eaf0356e4b76a114b0b75313ec14a5047'
 const sourceTree = 'bb2bef2a74e38bd7d3f3daca8b65c2bdf5e5727c'
+const diagnosticParent = 'dd0d78492f4aa9705cd86e5a992bcc55766d8ae0'
+const diagnosticParentTree = '0c38ac8765d48a14d3d7e6ef1776f2c8d2e01c93'
 const fixture = 'src/cli/runtimeStatusCommand.entry.test.ts'
 const controllerPath = 'scripts/ci/runtime-status-startup-diagnostic.ts'
 const patchPath = 'scripts/ci/runtime-status-startup-diagnostic.patch'
@@ -78,12 +80,13 @@ function verifyOriginals() {
 function preserveSources(prefix: string): void {
   // Package/lock identities are retained as hashes; only the three traced files need byte copies.
   for (const file of ['src/entrypoints/cli.tsx', 'src/cli/handlers/runtime.ts', fixture]) {
-    const target = path.join(output, prefix, file)
+    // Bun treats file arguments as discovery filters; source copies must not be tests.
+    const target = path.join(output, prefix, `${file}.txt`)
     mkdirSync(path.dirname(target), { recursive: true })
     copyFileSync(file, target)
   }
 }
-type Outcome = { code: number | null; signal: string | null; spawnError: string | null; elapsedMs: number; stdoutBytes: number; stderrBytes: number; outputExceeded: boolean }
+type Outcome = { code: number | null; signal: string | null; spawnError: string | null; elapsedMs: number; stdoutBytes: number; stderrBytes: number; outputExceeded: boolean; testCount: number | null; fileCount: number | null; discoveryMatches: boolean }
 async function runOnce(name: 'baseline' | 'traced'): Promise<Outcome> {
   const stdoutFile = path.join(output, `${name}.stdout.log`)
   const stderrFile = path.join(output, `${name}.stderr.log`)
@@ -105,13 +108,18 @@ async function runOnce(name: 'baseline' | 'traced'): Promise<Outcome> {
     child.once('error', error => { spawnError = error.message })
     child.once('close', (code, signal) => resolve({ code, signal }))
   })
-  const result = { ...ending, spawnError, elapsedMs: Math.round(performance.now() - start), stdoutBytes, stderrBytes, outputExceeded }
+  const logs = readFileSync(stdoutFile, 'utf8') + '\n' + readFileSync(stderrFile, 'utf8')
+  const summaries = [...logs.matchAll(/Ran (\d+) tests across (\d+) files\./g)]
+  const testCount = summaries.length === 1 ? Number(summaries[0]![1]) : null
+  const fileCount = summaries.length === 1 ? Number(summaries[0]![2]) : null
+  const discoveryMatches = testCount === 91 && fileCount === 13
+  const result = { ...ending, spawnError, elapsedMs: Math.round(performance.now() - start), stdoutBytes, stderrBytes, outputExceeded, testCount, fileCount, discoveryMatches }
   metadata[name] = result
   save()
   return result
 }
 function successful(outcome: Outcome): boolean {
-  return outcome.code === 0 && outcome.signal === null && outcome.spawnError === null && !outcome.outputExceeded
+  return outcome.code === 0 && outcome.signal === null && outcome.spawnError === null && !outcome.outputExceeded && outcome.discoveryMatches
 }
 let failed = true
 save()
@@ -122,7 +130,9 @@ try {
   metadata.checkoutCommit = git('rev-parse', 'HEAD')
   metadata.checkoutTree = git('rev-parse', 'HEAD^{tree}')
   try { metadata.coreAutocrlf = git('config', '--get', 'core.autocrlf') } catch { metadata.coreAutocrlf = null }
-  assert.equal(git('rev-parse', 'HEAD^'), sourceCommit, 'Diagnostic commit must directly descend from reviewed source')
+  assert.equal(git('rev-parse', 'HEAD^'), diagnosticParent, 'Correction must normally descend from the retained diagnostic')
+  assert.equal(git('rev-parse', 'HEAD^^'), sourceCommit, 'Diagnostic source ancestry changed')
+  assert.equal(git('rev-parse', `${diagnosticParent}^{tree}`), diagnosticParentTree)
   assert.equal(git('rev-parse', `${sourceCommit}^{tree}`), sourceTree)
   const sourceWorkflow = execFileSync('git', ['show', `${sourceCommit}:.github/workflows/ci.yml`], { encoding: 'utf8', maxBuffer: 1024 * 1024 })
   const group = /- name: Test runtime status and adjacent output boundaries\n(?:[^\n]*\n)*?        run: >-\n((?:          [^\n]+\n)+)/.exec(sourceWorkflow)
