@@ -12,6 +12,7 @@ import type {
   OpenCodeHostHandle,
   OpenCodeInventorySnapshot,
   OpenCodeProfileScope,
+  OpenCodeProviderListEntry,
 } from '../../../../services/opencode/types.js'
 import type {
   OpenCodeHostLeaseInput,
@@ -6140,6 +6141,83 @@ describe('OpenCodeProviderManagementAdapter', () => {
       availability: 'untested',
     })
   })
+
+  function profileCatalogDeclarationAdapter(input: {
+    config: OpenCodeProviderListEntry[]
+    live: OpenCodeProviderListEntry[]
+    metadata?: OpenCodeInventorySnapshot['modelMetadata']
+  }) {
+    return new OpenCodeProviderManagementAdapter({
+      ...catalogIdentityDependencies(),
+      inventoryService: { probe: async (_projectPath, options) => {
+        expect(options?.mode).toBe('profile')
+        return inventory({ availableProviders: ['openrouter'], models: [], modelMetadata: input.metadata ?? [] })
+      } },
+      hostManager: { ensureHost: async () => host(), releaseHost: async () => {} },
+      clientFactory: { create: () => ({
+        getConfigProviders: async () => ({ providers: input.config, default: {} }),
+        getProviders: async () => ({ all: input.live, connected: [], default: {} }),
+        getProviderAuth: async () => ({}),
+      }) },
+    })
+  }
+
+  test('profile-only catalog retains exact input declarations from native HTTP model records', async () => {
+    const model = 'openai/gpt-5.4-mini'
+    const adapter = profileCatalogDeclarationAdapter({
+      config: [{ id: 'openrouter', models: { [model]: { modalities: { input: ['text', 'image'] } } } }],
+      live: [{ id: 'openrouter', models: { [model]: { capabilities: { input: { text: true, image: true, video: false } } } } }],
+    })
+    const result = await adapter.loadModels({ runtimeId: 'opencode', providerId: 'openrouter' })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.value.models.find(row => row.modelId === `openrouter/${model}`)?.declaredInputModalities)
+      .toEqual(['text', 'image'])
+  })
+
+  const httpModel = 'openai/gpt-5.4-mini'
+  const httpRecord = (raw: unknown): OpenCodeProviderListEntry[] => [{ id: 'openrouter', models: { [httpModel]: raw } }]
+  const imageDeclaration = { modalities: { input: ['image'] } }
+  const declarationCases: Array<{
+    name: string
+    config: OpenCodeProviderListEntry[]
+    live: OpenCodeProviderListEntry[]
+    metadata?: OpenCodeInventorySnapshot['modelMetadata']
+    expected: string[] | null
+  }> = [
+    { name: 'accepts config-only declaration', config: httpRecord(imageDeclaration), live: [], expected: ['image'] },
+    { name: 'accepts live-only declaration', config: [], live: httpRecord({ capabilities: { input: { image: true, text: false } } }), expected: ['image'] },
+    { name: 'accepts reordered matching native declarations', config: httpRecord({ modalities: { input: ['IMAGE', 'text'] } }), live: httpRecord({ capabilities: { input: { text: true, image: true } } }), expected: ['text', 'image'] },
+    { name: 'retains known empty declaration', config: httpRecord({ modalities: { input: [] } }), live: httpRecord({ capabilities: { input: { image: false } } }), expected: [] },
+    { name: 'ignores an undeclared output-only record', config: httpRecord({ modalities: { output: ['text'] } }), live: httpRecord(imageDeclaration), expected: ['image'] },
+    { name: 'keeps missing declarations unknown', config: httpRecord({}), live: httpRecord({}), expected: null },
+    { name: 'cannot borrow a foreign provider declaration', config: [{ id: 'foreign', models: { [httpModel]: imageDeclaration } }], live: httpRecord({}), expected: null },
+    { name: 'cannot borrow differently cased model metadata', config: [{ id: 'openrouter', models: { 'openai/GPT-5.4-mini': imageDeclaration } }], live: httpRecord({}), expected: null },
+    { name: 'refuses malformed model records', config: httpRecord(null), live: httpRecord(imageDeclaration), expected: null },
+    { name: 'refuses malformed null models container', config: [{ id: 'openrouter', models: null as unknown as Record<string, unknown> }], live: httpRecord(imageDeclaration), expected: null },
+    { name: 'refuses malformed array models container', config: httpRecord(imageDeclaration), live: [{ id: 'openrouter', models: [] as unknown as Record<string, unknown> }], expected: null },
+    { name: 'refuses malformed string models container', config: [{ id: 'openrouter', models: 'invalid' as unknown as Record<string, unknown> }], live: httpRecord(imageDeclaration), expected: null },
+    { name: 'refuses malformed declaration containers', config: httpRecord({ modalities: null }), live: httpRecord(imageDeclaration), expected: null },
+    { name: 'refuses malformed input arrays', config: httpRecord({ modalities: { input: ['image', null] } }), live: httpRecord(imageDeclaration), expected: null },
+    { name: 'refuses internally conflicting declarations', config: httpRecord({ modalities: { input: ['image'] }, capabilities: { input: { image: false } } }), live: httpRecord(imageDeclaration), expected: null },
+    { name: 'refuses conflicting native endpoint declarations', config: httpRecord({ modalities: { input: ['text'] } }), live: httpRecord(imageDeclaration), expected: null },
+    { name: 'cannot override a native empty declaration', config: httpRecord({ modalities: { input: [] } }), live: httpRecord(imageDeclaration), expected: null },
+    { name: 'refuses ambiguous provider records', config: [...httpRecord(imageDeclaration), ...httpRecord({})], live: httpRecord(imageDeclaration), expected: null },
+    { name: 'refuses malformed null config provider list', config: null as unknown as OpenCodeProviderListEntry[], live: httpRecord(imageDeclaration), expected: null },
+    { name: 'refuses malformed null live provider list', config: httpRecord(imageDeclaration), live: null as unknown as OpenCodeProviderListEntry[], expected: null },
+    { name: 'retains exact full inventory declaration precedence', config: httpRecord(imageDeclaration), live: httpRecord(imageDeclaration), metadata: [{ id: `openrouter/${httpModel}`, raw: { modalities: { input: ['text'] } }, cost: null, context: null, limits: null, free: false }], expected: ['text'] },
+    { name: 'retains authoritative inventory unknown instead of granting HTTP support', config: httpRecord(imageDeclaration), live: httpRecord(imageDeclaration), metadata: [{ id: `openrouter/${httpModel}`, raw: {}, cost: null, context: null, limits: null, free: false }], expected: null },
+    { name: 'does not borrow a foreign inventory declaration', config: httpRecord({}), live: httpRecord({}), metadata: [{ id: `foreign/${httpModel}`, raw: imageDeclaration, cost: null, context: null, limits: null, free: false }], expected: null },
+  ]
+  for (const input of declarationCases) {
+    test(`profile-only catalog ${input.name}`, async () => {
+      const result = await profileCatalogDeclarationAdapter(input).loadModels({ runtimeId: 'opencode', providerId: 'openrouter' })
+      expect(result.ok).toBe(true)
+      if (!result.ok) return
+      expect(result.value.models.find(row => row.modelId === `openrouter/${httpModel}`)?.declaredInputModalities)
+        .toEqual(input.expected)
+    })
+  }
 
   test('provider models retain exact scoped declarations and leave missing metadata unknown', async () => {
     const models = ['custom/ExactCase', 'custom/video', 'custom/none', 'custom/missing', 'custom/conflict']
