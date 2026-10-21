@@ -118,6 +118,8 @@ export async function runActualProviderComparison(baseline, candidate, binaryPat
     for (const [label, runtime] of [['baseline118', baseline], ['candidate119', candidate]]) {
       const owned = path.join(root, label); mkdirSync(owned);
       const env = sandboxEnvironment(owned, binaryPath), project = path.join(owned, 'project'); mkdirSync(project);
+      // This comparison deliberately uses the existing TEST-only ACL producer.
+      mkdirSync(env.CLAUDE_MULTIMODEL_DATA_HOME);
       await protectWindowsTestDirectory(env.CLAUDE_MULTIMODEL_DATA_HOME);
       env.DEEPINFRA_API_KEY = 'TEST-only-no-real-credential';
       Object.assign(env, { OPENCODE_DISABLE_AUTOUPDATE: '1', OPENCODE_DISABLE_LSP_DOWNLOAD: '1',

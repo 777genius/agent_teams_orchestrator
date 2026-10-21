@@ -69,7 +69,9 @@ export function sandboxEnvironment(root, fakeBinary) {
   };
   for (const [key, relative] of Object.entries(dirs)) {
     env[key] = path.join(root, relative);
-    mkdirSync(env[key], { recursive: true });
+    // The delivered runtime creates its SDK data root through the native owner
+    // boundary. An existing root is validated there, never repaired by a fixture.
+    if (key !== 'CLAUDE_MULTIMODEL_DATA_HOME') mkdirSync(env[key], { recursive: true });
   }
   const homeRoot = path.parse(env.HOME).root;
   env.HOMEDRIVE = homeRoot.replace(/[\\/]$/, '');
