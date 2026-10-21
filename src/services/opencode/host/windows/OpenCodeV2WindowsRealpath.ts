@@ -9,7 +9,7 @@ export type WindowsRealpathSelection = Readonly<{
   dllPath: string
   expectedPid: number
   expectedCreationFiletime: bigint
-  anchors: readonly Readonly<{ dosPath: string; ntPath: string; volumeSerial: bigint; fileId: string }>[]
+  anchors: readonly Readonly<{ kind?: 'readOnly' | 'writable' | 'metadata'; dosPath: string; ntPath: string; volumeSerial: bigint; fileId: string }>[]
 }>
 export type WindowsRealpathInstallation = Readonly<{ uninstall(): void }>
 

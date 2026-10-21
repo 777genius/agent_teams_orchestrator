@@ -28,8 +28,11 @@ test('one physical object never reaches the native DLL as two held anchors', asy
     authenticatedPrepares: new WeakMap(),
     windowsExecutionChildControl: () => ({ send: async () => {}, events: { on() {} } }),
   }
-  const built = new Function('scope', `const {${Object.keys(scope).join(',')}}=scope;${body};return childRealpathSelection;`)(scope) as
-    (input: Record<string, unknown>, birth: Record<string, unknown>) => { anchors: readonly { dosPath: string }[] }
+  const built = new Function('scope', `const {${Object.keys(scope).join(',')}}=scope;${body};return { childRealpathSelection, closedRealpathInstallFailure };`)(scope) as {
+    childRealpathSelection: (input: Record<string, unknown>, birth: Record<string, unknown>) =>
+      { anchors: readonly { kind?: string; dosPath: string }[] }
+    closedRealpathInstallFailure: (error: unknown, selection: { anchors: readonly { kind?: string }[] }) => Error & { code?: string }
+  }
   const sameObject = { volumeSerial: '7', fileId: 'a'.repeat(32) }
   const receipt = anchorsReceipt('TEST-nonce', [
     { kind: 'readOnly', admittedPath: 'C:\\alpha', dosPath: 'C:\\alpha', ntPath: '\\Device\\HarddiskVolume3\\alpha', ...sameObject },
@@ -37,7 +40,7 @@ test('one physical object never reaches the native DLL as two held anchors', asy
     // Distinct kind and spelling, same physical object as the first anchor.
     { kind: 'metadata', admittedPath: 'C:\\ALPHA', dosPath: 'C:\\ALPHA', ntPath: '\\Device\\HarddiskVolume3\\alpha', ...sameObject },
   ])
-  const selection = built({
+  const selection = built.childRealpathSelection({
     nonce: 'TEST-nonce',
     supervisor: { nativePID: 4242 },
     realpathAnchors: receipt,
@@ -47,6 +50,13 @@ test('one physical object never reaches the native DLL as two held anchors', asy
   }, { format: 'windows-filetime', value: '133000000000000000', bootId: null })
   // Both spellings of the object collapse to one anchor; the distinct object stays.
   expect(selection.anchors.map(anchor => anchor.dosPath)).toEqual(['C:\\alpha', 'C:\\beta'])
+  // A closed install refusal names its anchor kind from this very selection, so
+  // the collapse must retain the first admitted kind per physical object.
+  expect(selection.anchors.map(anchor => anchor.kind)).toEqual(['readOnly', 'writable'])
+  const refusal = built.closedRealpathInstallFailure(
+    Object.assign(new Error('TEST-native-refusal'), { status: 2, operation: 5, win32: 5, anchorIndex: 1 }), selection)
+  expect(refusal.message).toBe('execution_realpath_open_anchor_component_writable')
+  expect(refusal.code).toBe('EACCES')
 })
 
 test('a prepare-time install refusal names its closed native step and anchor kind', async () => {

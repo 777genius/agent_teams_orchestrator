@@ -379,8 +379,9 @@ export async function planWindowsExecution(requested: Readonly<{
     assert(relative !== '' && (relative === '..' || relative.startsWith('..\\') || path.win32.isAbsolute(relative)), 'execution_containment_dll_identity')
   }
   // Machine-derived system directory, never a caller root: the selected shell
-  // and other system tools resolve under it, and the child realpath fallback
-  // authenticates them from this metadata anchor without any ACL change.
+  // and other system tools resolve under it. The child realpath fallback walks
+  // its chain like every anchor, so the chain takes the same target-only
+  // ancestor grants, while the root itself stays out of every root grant.
   const systemRoot = ['SystemRoot', 'SYSTEMROOT', 'WINDIR'].map(name => input.env[name])
     .find(value => typeof value === 'string' && /^[A-Za-z]:\\/.test(value)) ?? 'C:\\Windows'
   const metadataRoots = Object.freeze([path.win32.join(systemRoot, 'System32')])

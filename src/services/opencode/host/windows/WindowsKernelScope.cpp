@@ -4013,6 +4013,20 @@ static void grantAncestorMetadata(Scope &scope) {
       retainMetadataAncestor(scope, Handle(duplicate));
     }
   }
+  // The child realpath fallback walks the metadata anchor chain component by
+  // component like every other anchor, and an AppContainer child refuses an
+  // ungranted component open with ERROR_ACCESS_DENIED. Its whole chain, the
+  // system directory leaf included, takes the same target-only traverse grant.
+  for (const auto &root : scope.metadataRealpathAnchors) {
+    root.assertLive();
+    for (size_t i = 0; i < root.components.size(); ++i) {
+      HANDLE duplicate = nullptr;
+      require(DuplicateHandle(GetCurrentProcess(), root.components[i].handle.value,
+                              GetCurrentProcess(), &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS),
+              "execution_containment_filesystem_denied", "ancestor_metadata_pin");
+      retainMetadataAncestor(scope, Handle(duplicate));
+    }
+  }
   assertAncestorMetadataPinsLive(scope);
   for (auto &ancestor : scope.metadataAncestors) {
     bool covered = false;
@@ -5574,8 +5588,8 @@ static std::unique_ptr<Scope> launch(const JsonObject &input, OwnerStore &owners
   // The system directory is admitted for physical path resolution only: the
   // selected shell and other system tools resolve there, and the child realpath
   // fallback authenticates them from this anchor. It is held like every other
-  // anchor but stays out of every ACL grant, deny, ancestor pin and coverage
-  // decision below.
+  // anchor and its walk chain takes the same target-only ancestor grants, but
+  // it stays out of every root grant, deny and coverage decision below.
   if (input.HasKey(L"metadataRoots")) {
     require(input.GetNamedValue(L"metadataRoots").ValueType() == JsonValueType::Array,
             "execution_invalid_response");

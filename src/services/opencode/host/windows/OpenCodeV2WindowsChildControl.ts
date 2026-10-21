@@ -110,14 +110,17 @@ function childRealpathSelection(input: Record<string, unknown>, nativeBirth: Rec
   assert(dll.nonce === input.nonce && dll.receiptId === `windows-dll:${suffix}` && dll.held === true && typeof dll.path === 'string' && path.win32.isAbsolute(dll.path) && typeof dll.sha256 === 'string' && /^[a-f0-9]{64}$/.test(dll.sha256) && typeof dll.fileId === 'string' && /^[a-f0-9]{32}$/.test(dll.fileId))
   uint64(dll.volumeSerial)
   const seen = new Set<string>(), objects = new Set<string>()
-  const anchors: Readonly<{ dosPath: string; ntPath: string; volumeSerial: bigint; fileId: string }>[] = []
+  const anchors: Readonly<{ kind: 'readOnly' | 'writable' | 'metadata'; dosPath: string; ntPath: string; volumeSerial: bigint; fileId: string }>[] = []
   for (const value of receipt.anchors) {
     const anchor = record(value)
     assert((anchor.kind === 'readOnly' || anchor.kind === 'writable' || anchor.kind === 'metadata') && typeof anchor.admittedPath === 'string' && typeof anchor.dosPath === 'string' && path.win32.isAbsolute(anchor.dosPath) && path.win32.relative(anchor.admittedPath, anchor.dosPath) === '')
     assert(typeof anchor.ntPath === 'string' && anchor.ntPath.startsWith('\\Device\\') && anchor.ntPath.length <= 32767 && !anchor.ntPath.includes('\0') && anchor.ntPath.slice(1).split('\\').every(segment => segment !== '' && segment !== '.' && segment !== '..'))
     assert(typeof anchor.fileId === 'string' && /^[a-f0-9]{32}$/.test(anchor.fileId))
     const key = `${anchor.kind}:${anchor.admittedPath}`; assert(!seen.has(key)); seen.add(key)
-    const entry = Object.freeze({ dosPath: anchor.dosPath, ntPath: anchor.ntPath, volumeSerial: uint64(anchor.volumeSerial), fileId: anchor.fileId })
+    // The kind stays on the admitted entry: a closed install refusal names its
+    // anchor kind from this selection, including after a collapse below.
+    const entry = Object.freeze({ kind: anchor.kind as 'readOnly' | 'writable' | 'metadata',
+      dosPath: anchor.dosPath, ntPath: anchor.ntPath, volumeSerial: uint64(anchor.volumeSerial), fileId: anchor.fileId })
     // The native DLL holds one anchor per physical object and refuses a second
     // admission of the same object outright. Distinct plan roots can resolve to
     // one object; those spellings collapse here before the native selection.
@@ -169,7 +172,7 @@ function closedRealpathInstallFailure(error: unknown, selection: WindowsRealpath
     const token = installOperations[operation] ?? 'failed'
     const anchorIndex = typeof source?.anchorIndex === 'number' && Number.isSafeInteger(source.anchorIndex) ? source.anchorIndex : undefined
     const anchor = anchorIndex !== undefined && anchorIndex >= 0 && anchorIndex < selection.anchors.length ? selection.anchors[anchorIndex] : undefined
-    const kind = anchor ? anchorKindTokens[anchor.kind] : undefined
+    const kind = anchor?.kind ? anchorKindTokens[anchor.kind] : undefined
     message = `execution_realpath_open_${token}${anchorOperations.has(operation) && kind ? `_${kind}` : ''}`
   } else if (code) message = 'execution_realpath_dll_load_failed'
   const failure = new Error(message) as Error & { code?: string }
