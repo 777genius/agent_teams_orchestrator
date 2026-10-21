@@ -275,3 +275,186 @@ test('native command liveness reuses one bounded complete proof only for stdio d
   expect(execution).toContain('await options.assertLive(lifecycle.has(operation), operation)')
   expect(execution).toContain("=== 'anchorsReceiptId,nonce' && live.nonce === nonce &&\n      live.anchorsReceiptId === current.realpathAnchors.receiptId, 'execution_identity_mismatch')")
 })
+
+test('run control connect keeps its deadline while the endpoint is transiently absent', async () => {
+  const { runInNewContext } = await import('node:vm')
+  const header = path.resolve(import.meta.dir, '../../src/services/opencode/host/windows/WindowsNativeRunControl.hpp')
+  const source = (await readFile(header, 'utf8')).replaceAll('\r\n', '\n')
+  const begin = source.indexOf('    Handle pipe;\n    for (;;) {')
+  expect(begin).toBeGreaterThanOrEqual(0)
+  const loopStart = source.indexOf('for (;;) {', begin)
+  const end = source.indexOf('\n    }\n', loopStart)
+  expect(end).toBeGreaterThan(loopStart)
+  const body = source.slice(loopStart, end + '\n    }'.length)
+    .replaceAll('const HANDLE raw =', 'const raw =')
+    .replaceAll('const DWORD error =', 'const error =')
+    .replaceAll('const DWORD remaining =', 'const remaining =')
+    .replaceAll('const DWORD waitError =', 'const waitError =')
+    .replaceAll('throw NativeError{', 'throw nativeError(')
+    .replaceAll('"connect"};', '"connect");')
+    .replaceAll('.c_str()', '')
+    .replaceAll('nullptr', 'null')
+    .replaceAll('L"', '"')
+  const ERROR_FILE_NOT_FOUND = 2, ERROR_ACCESS_DENIED = 5, ERROR_SEM_TIMEOUT = 121, ERROR_PIPE_BUSY = 231
+  const plan = {
+    open: [] as number[], // 0 opens the endpoint; any other value fails with that GetLastError
+    wait: [] as Array<[number, number, number]>, // WaitNamedPipeW return, GetLastError, clock advance
+  }
+  const state = { now: 1000, lastError: 0, opens: [] as number[], waits: [] as number[], slept: [] as number[] }
+  let openAt = 0, waitAt = 0
+  const context = {
+    require: (value: unknown, code: string) => { if (!value) throw new Error(code) },
+    nativeError: (code: string, win32: number) => Object.assign(new Error(code), { code, win32 }),
+    runControlRemaining: (deadline: number) => Math.max(0, deadline - state.now),
+    Handle: (raw: number) => (raw < 0 ? null : { raw }),
+    CreateFileW: () => {
+      const outcome = plan.open[Math.min(openAt++, plan.open.length - 1)] ?? 0
+      state.opens.push(outcome); state.lastError = outcome
+      return outcome === 0 ? 7 : -1
+    },
+    WaitNamedPipeW: (_endpoint: string, timeout: number) => {
+      const entry = plan.wait[Math.min(waitAt++, plan.wait.length - 1)] ?? [1, 0, 0]
+      state.waits.push(timeout); state.now += entry[2]; state.lastError = entry[1]
+      return entry[0]
+    },
+    GetLastError: () => state.lastError,
+    Sleep: (ms: number) => { state.slept.push(ms); state.now += ms },
+    GENERIC_READ: 1, GENERIC_WRITE: 2, OPEN_EXISTING: 3, FILE_FLAG_OVERLAPPED: 0x40000000,
+    INVALID_HANDLE_VALUE: -1, ERROR_SUCCESS: 0,
+    ERROR_FILE_NOT_FOUND, ERROR_ACCESS_DENIED, ERROR_SEM_TIMEOUT, ERROR_PIPE_BUSY,
+  }
+  const connect = runInNewContext(
+    `(function () {return function (endpoint, deadline) {let pipe;\n${body}\nreturn pipe;};})()`,
+    context) as (endpoint: string, deadline: number) => unknown
+  const endpoint = '\\\\.\\pipe\\agt-v2-run-control-test'
+  const reset = () => {
+    state.now = 1000; state.lastError = 0; state.opens = []; state.waits = []; state.slept = []
+    openAt = 0; waitAt = 0
+  }
+
+  // A saturated endpoint is a wait, not a refusal: the retry survives both a
+  // WaitNamedPipeW timeout report and a lost open race until the instance wins.
+  reset()
+  plan.open = [ERROR_PIPE_BUSY, ERROR_PIPE_BUSY, 0]
+  plan.wait = [[0, ERROR_SEM_TIMEOUT, 50], [1, 0, 0]]
+  expect((connect(endpoint, 3000) as { raw: number }).raw).toBe(7)
+  expect(state.opens).toEqual([ERROR_PIPE_BUSY, ERROR_PIPE_BUSY, 0])
+  expect(state.waits.length).toBe(2)
+
+  // A momentarily missing endpoint is absence, never run_control_connect_unknown.
+  reset()
+  plan.open = [ERROR_FILE_NOT_FOUND, 0]
+  plan.wait = [[0, ERROR_FILE_NOT_FOUND, 0]]
+  expect((connect(endpoint, 3000) as { raw: number }).raw).toBe(7)
+  expect(state.opens).toEqual([ERROR_FILE_NOT_FOUND, 0])
+  expect(state.slept).toEqual([10])
+
+  // An exhausted budget reports the deadline token, never connect unknown.
+  reset()
+  plan.open = [ERROR_PIPE_BUSY]
+  plan.wait = [[0, ERROR_SEM_TIMEOUT, 2000]]
+  let caught: unknown
+  try { connect(endpoint, 3000) } catch (error) { caught = error }
+  expect((caught as Error).message).toBe('run_deadline_expired')
+
+  // A true refusal still publishes the closed connect code with its native errno.
+  reset()
+  plan.open = [ERROR_ACCESS_DENIED]
+  plan.wait = [[1, 0, 0]]
+  try { connect(endpoint, 3000) } catch (error) { caught = error }
+  expect((caught as { code: string }).code).toBe('run_control_connect_unknown')
+  expect((caught as { win32: number }).win32).toBe(ERROR_ACCESS_DENIED)
+  expect(state.waits).toEqual([])
+})
+
+test('run control listener always offers a fresh instance and survives connection refusals', async () => {
+  const { runInNewContext } = await import('node:vm')
+  const header = path.resolve(import.meta.dir, '../../src/services/opencode/host/windows/WindowsNativeRunControl.hpp')
+  const source = (await readFile(header, 'utf8')).replaceAll('\r\n', '\n')
+
+  // The consumed instance is replaced before any fallible connection work.
+  const acceptBody = source.slice(source.indexOf('JsonObject accept('), source.indexOf('JsonObject read('))
+  const offer = acceptBody.indexOf('runControlOfferPending();')
+  expect(offer).toBeGreaterThan(0)
+  expect(offer).toBeLessThan(acceptBody.indexOf('runControlAuthenticate(*connection)'))
+  expect(offer).toBeLessThan(acceptBody.indexOf('registry_.emplace'))
+  // One spare instance over the live connection ceiling keeps replenish able to
+  // create while every accepted connection still owns its own instance.
+  expect(source).toContain('static_cast<DWORD>(MAX_CONNECTIONS + 2)')
+
+  // A transient create refusal is retried; a genuine refusal neither poisons
+  // the listener nor replaces its pending instance.
+  const begin = source.indexOf('void runControlOfferPending() {')
+  expect(begin).toBeGreaterThanOrEqual(0)
+  const end = source.indexOf('\n  }\n', begin)
+  expect(end).toBeGreaterThan(begin)
+  const body = source.slice(begin + 'void runControlOfferPending() {'.length, end)
+    .replaceAll('for (DWORD attempt = 0;; ++attempt)', 'for (let attempt = 0;; ++attempt)')
+    .replaceAll('catch (const NativeError &failure)', 'catch (failure)')
+    .replaceAll('listener_->', 'listener.')
+  const observed = { created: 0, slept: [] as number[] }
+  const offerPending = (listener: { name: string; pending: unknown; poisoned: boolean },
+    outcomes: Array<{ win32: number } | null>) => {
+    observed.created = 0; observed.slept = []
+    const context = {
+      ERROR_PIPE_BUSY: 231,
+      Sleep: (ms: number) => { observed.slept.push(ms) },
+      runControlCreateServer: () => {
+        const outcome = outcomes[Math.min(observed.created++, outcomes.length - 1)]
+        if (outcome) throw Object.assign(new Error('run_control_listen_unknown'),
+          { code: 'run_control_listen_unknown', win32: outcome.win32 })
+        return { fresh: true }
+      },
+    }
+    return runInNewContext(`(function () {return function (listener) {${body}\n};})()`,
+      context) as (listener: unknown) => void
+  }
+  const listener = { name: '\\\\.\\pipe\\agt-v2-run-control-test', pending: { stale: true }, poisoned: false }
+  offerPending(listener, [{ win32: 231 }, { win32: 231 }, null])(listener)
+  expect(observed.created).toBe(3)
+  expect(observed.slept).toEqual([10, 10])
+  expect(listener.pending).toEqual({ fresh: true })
+  expect(listener.poisoned).toBe(false)
+  const refused = { name: listener.name, pending: { stale: true }, poisoned: false }
+  expect(() => offerPending(refused, [{ win32: 5 }])(refused)).toThrow('run_control_listen_unknown')
+  expect(observed.created).toBe(1)
+  expect(refused.pending).toEqual({ stale: true })
+  expect(refused.poisoned).toBe(false)
+
+  // A connection-scoped refusal retires only its connection; the pump keeps
+  // offering accepts while listener-scoped refusals remain terminal.
+  const catchStart = source.lastIndexOf('} catch (const NativeError &failure) {')
+  expect(catchStart).toBeGreaterThanOrEqual(0)
+  const catchEnd = source.indexOf('\n      } catch (...) {', catchStart)
+  expect(catchEnd).toBeGreaterThan(catchStart)
+  const pumpBody = source.slice(catchStart + '} catch (const NativeError &failure) {'.length, catchEnd)
+    .replaceAll('std::strcmp(', 'strcmp(')
+    .replaceAll('failure.code.c_str()', 'failure.code')
+    .replaceAll('JsonObject poison;', '')
+    .replaceAll('num(poison, L"id", activeId);', '')
+    .replaceAll('poisonConnection(poison)', 'poisonConnection(activeId)')
+    .replaceAll('catch (...) {}', 'catch (ignored) {}')
+    .replaceAll('break;', 'return "fatal";')
+    .replaceAll('continue;', 'return "continued";')
+  const reports: string[] = [], poisons: number[] = []
+  const pumpStep = runInNewContext(
+    `(function () {return function (failure, phase, activeId, requestPumpStop_, shutdown_) {
+      try { throw failure } catch (failure) {${pumpBody}\n}
+      return 'continued'
+    };})()`,
+    {
+      strcmp: (a: string, b: string) => (a === b ? 0 : 1),
+      reportFailure: (code: string) => { reports.push(code) },
+      poisonConnection: (id: number) => { poisons.push(id) },
+    }) as (failure: { code: string; win32: number }, phase: string, activeId: number,
+      stop: boolean, down: boolean) => string
+  expect(pumpStep({ code: 'run_control_disconnected', win32: 109 }, 'read_frame', 7, false, false)).toBe('continued')
+  expect(pumpStep({ code: 'run_control_peer_identity', win32: 0 }, 'accept_authenticate', 7, false, false)).toBe('continued')
+  expect(pumpStep({ code: 'run_control_accept_timeout', win32: 121 }, 'accept_wait', 0, false, false)).toBe('continued')
+  expect(pumpStep({ code: 'run_control_accept_unknown', win32: 231 }, 'accept_wait', 0, false, false)).toBe('fatal')
+  expect(pumpStep({ code: 'run_control_listen_unknown', win32: 231 }, 'accept_replenish', 7, false, false)).toBe('fatal')
+  expect(pumpStep({ code: 'run_control_disconnected', win32: 109 }, 'read_frame', 7, true, false)).toBe('fatal')
+  expect(poisons).toEqual([7, 7, 7, 7])
+  expect(reports).toEqual(['run_control_disconnected', 'run_control_peer_identity',
+    'run_control_accept_unknown', 'run_control_listen_unknown', 'run_control_disconnected'])
+})

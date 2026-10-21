@@ -264,14 +264,25 @@ struct WindowsNativeRunControl {
       const DWORD error = raw == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
       pipe = Handle(raw);
       if (pipe) break;
-      if (error != ERROR_PIPE_BUSY)
+      // A saturated or momentarily absent endpoint is a wait inside the same
+      // deadline, never a refusal; only an unexpected errno publishes the
+      // closed connect failure.
+      if (error != ERROR_PIPE_BUSY && error != ERROR_SEM_TIMEOUT &&
+          error != ERROR_FILE_NOT_FOUND)
         throw NativeError{"run_control_connect_unknown", error, "connect"};
       const DWORD remaining = runControlRemaining(deadline);
       require(remaining > 0, "run_deadline_expired");
       // Another client can win the next open; wait only for this same endpoint
       // and consume the original budget before any request bytes are submitted.
-      if (!WaitNamedPipeW(endpoint.c_str(), remaining))
-        throw NativeError{"run_control_connect_unknown", GetLastError(), "connect"};
+      if (!WaitNamedPipeW(endpoint.c_str(), remaining)) {
+        const DWORD waitError = GetLastError();
+        if (waitError != ERROR_SEM_TIMEOUT && waitError != ERROR_FILE_NOT_FOUND)
+          throw NativeError{"run_control_connect_unknown", waitError, "connect"};
+        // A missing endpoint is momentarily absent rather than refused; poll
+        // the same deadline instead of expiring the caller on that absence.
+        if (waitError == ERROR_FILE_NOT_FOUND)
+          Sleep(10);
+      }
     }
     auto connection = runControlMakeConnection(std::move(pipe), Role::client, timeout);
     connection->endpoint = endpoint;
@@ -368,19 +379,20 @@ struct WindowsNativeRunControl {
     Handle accepted = std::move(operation->issuingHandle);
     runControlForget(operation);
 
+    // The accepted instance remains connected and owned by the registry; no
+    // DisconnectNamedPipe call destroys the accepted endpoint. Its fresh
+    // listening replacement is offered before any fallible connection work, so
+    // a refused handshake can never leave the listener without an instance.
+    if (phase) *phase = "accept_replenish";
+    runControlReapCompleted();
+    runControlOfferPending();
+
+    if (phase) *phase = "accept_authenticate";
     auto connection = runControlMakeConnection(std::move(accepted), Role::server, timeout);
     connection->endpoint = listener_->name;
-    if (phase) *phase = "accept_authenticate";
     runControlAuthenticate(*connection);
     const auto id = connection->id;
     registry_.emplace(id, std::move(connection));
-
-    // The accepted instance remains connected and owned by the registry. The
-    // listener is independently retained and immediately offers a fresh server
-    // instance; no DisconnectNamedPipe call destroys the accepted endpoint.
-    if (phase) *phase = "accept_replenish";
-    runControlReapCompleted();
-    listener_->pending = runControlCreateServer(listener_->name, false);
     JsonObject result;
     num(result, L"id", id);
     return result;
@@ -877,6 +889,21 @@ private:
             "run_control_pipe_security");
     return descriptor;
   }
+  // A replenish refusal must never deny the endpoint its next listening
+  // instance: transient instance exhaustion is retried before the failure
+  // surfaces, and a create refusal never poisons the listener.
+  void runControlOfferPending() {
+    for (DWORD attempt = 0;; ++attempt) {
+      try {
+        listener_->pending = runControlCreateServer(listener_->name, false);
+        return;
+      } catch (const NativeError &failure) {
+        if (attempt >= 2 || failure.win32 != ERROR_PIPE_BUSY)
+          throw failure;
+        Sleep(10);
+      }
+    }
+  }
   Handle runControlCreateServer(const std::wstring &name, bool first) {
     if (packagePeerProcess_) runControlValidatePackagePeer();
     LocalMemory descriptor{runControlProtectedPipeDescriptor(ownerSid_, packageSid_)};
@@ -887,7 +914,7 @@ private:
     HANDLE raw = CreateNamedPipeW(name.c_str(), mode,
                                   PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT |
                                       PIPE_REJECT_REMOTE_CLIENTS,
-                                  static_cast<DWORD>(MAX_CONNECTIONS + 1), MAX_FRAME_BYTES,
+                                  static_cast<DWORD>(MAX_CONNECTIONS + 2), MAX_FRAME_BYTES,
                                   MAX_FRAME_BYTES, 0, &attributes);
     if (raw == INVALID_HANDLE_VALUE)
       throw NativeError{"run_control_listen_unknown", GetLastError(), "listen"};
@@ -1944,7 +1971,13 @@ inline void WindowsNativeRunControl::startRequestPump() {
         }
         if (requestPumpStop_ || shutdown_)
           break;
-        if (std::strcmp(failure.code.c_str(), "run_control_accept_timeout") != 0)
+        if (std::strcmp(failure.code.c_str(), "run_control_accept_timeout") == 0)
+          continue;
+        // Only a listener-scoped refusal ends the pump. A connection-scoped
+        // failure retires just its own connection while the listener keeps
+        // offering a fresh instance to the clients that follow.
+        if (std::strcmp(phase, "accept_wait") == 0 ||
+            std::strcmp(phase, "accept_replenish") == 0)
           break;
       } catch (...) {
         reportFailure("run_control_pump_unknown", 0);
