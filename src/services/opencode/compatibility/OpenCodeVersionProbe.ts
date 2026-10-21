@@ -142,6 +142,8 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
     const started = Date.now(), deadline = started + deadlineMs
     const acquisitionDeadline = started + acquisitionMs
     const preexisting = new Map<number, NativeGeneration>()
+    const protectedPids = new Set([process.pid, process.ppid].filter(pid => pid > 0))
+    const protectedWitness = new Map<number, NativeGeneration>()
     if (process.platform === 'win32' && ports.existingWindows) {
       // This optional native-only read owns no helper process or private path.
       // A late/failed read grants no exclusion and can never launch a child.
@@ -164,6 +166,22 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
           }
           seen.add(row.pid)
           if (row.pid !== process.pid && row.pid !== process.ppid) preexisting.set(row.pid, row)
+        }
+      }
+    }
+    if (process.platform === 'win32' && ports.protectedWindows) {
+      let witness: readonly NativeGeneration[] | null = null, settled = false
+      const work = ports.protectedWindows(acquisitionDeadline).then(
+        value => { settled = true; return value }, error => { settled = true; throw error })
+      try { witness = await boundOpenCodeRead(work, Math.max(1, acquisitionDeadline - Date.now()), signal) }
+      catch { if (!settled) throw new Error('selection_unavailable') }
+      if (witness && witness.length <= protectedPids.size) {
+        for (const row of witness) {
+          if (!protectedPids.has(row.pid) || !Number.isSafeInteger(row.ppid) || row.ppid < 0
+            || !Number.isSafeInteger(row.birth) || row.birth <= 0 || protectedWitness.has(row.pid)) {
+            protectedWitness.clear(); break
+          }
+          protectedWitness.set(row.pid, row)
         }
       }
     }
@@ -289,12 +307,13 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
         return row
       })
     }
-    const members = (rows: Member[]): Member[] => {
+    let edgeCuts = new Set<number>()
+    const members = (rows: Member[], cuts = edgeCuts): Member[] => {
       if (process.platform !== 'win32') return rows.filter(row => row.group === pid && !row.retired)
       const selected = new Set<number>(pid ? [pid] : [])
       for (let changed = true; changed;) {
         changed = false
-        for (const row of rows) if (selected.has(row.ppid) && !selected.has(row.pid)) { selected.add(row.pid); changed = true }
+        for (const row of rows) if (!cuts.has(row.pid) && selected.has(row.ppid) && !selected.has(row.pid)) { selected.add(row.pid); changed = true }
       }
       // Acquire parent births first without discarding any census rows.
       const rank = new Map([...selected].map((target, index) => [target, index]))
@@ -307,12 +326,29 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
     // tracked, and all three census sites use this same generation check.
     const excluded = new Map<number, NativeGeneration>()
     const table = async (): Promise<Member[]> => {
+      edgeCuts = new Set()
       const rows = await rawTable()
       if (process.platform !== 'win32' || !preexisting.size || !pid) return rows
       const rootBirth = births.get(pid)
       if (rootBirth === undefined) return rows
-      const numeric = members(rows), blocked = new Set<number>()
-      if (numeric.some(row => row.pid === process.pid || row.pid === process.ppid)) throw cleanupUnknown('protected_addition')
+      const numeric = members(rows), cuts = new Set<number>()
+      const protectedPath = numeric.some(row => protectedPids.has(row.pid))
+      if (protectedPath) {
+        // Numeric PPIDs alone cannot prove that an apparent ancestor belongs to
+        // this probe. Only independently witnessed, still-live older protected
+        // generations permit validating a foreign incoming edge below.
+        if (!ports.protectedWindows || protectedWitness.size !== protectedPids.size) throw cleanupUnknown('protected_addition')
+        const fresh = await observe(ports.protectedWindows(deadline))
+        if (!fresh || fresh.length !== protectedPids.size) throw cleanupUnknown('protected_addition')
+        const seen = new Set<number>()
+        for (const row of fresh) {
+          const witness = protectedWitness.get(row.pid)
+          if (!witness || seen.has(row.pid) || row.birth !== witness.birth || row.ppid !== witness.ppid
+            || row.birth >= rootBirth || ports.alive(row.pid) !== 'alive'
+            || !rows.some(current => current.pid === row.pid && current.ppid === row.ppid)) throw cleanupUnknown('protected_addition')
+          seen.add(row.pid)
+        }
+      }
       for (const [target, witness] of excluded) if (!rows.some(row => row.pid === target)) {
         // An absent seed cuts no edge. Still distinguish its original foreign
         // generation/retirement from an unreadable or reused live identity.
@@ -344,20 +380,19 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
           if (!await sameBirth(pid, rootBirth)) throw cleanupUnknown('anchor_missing')
           excluded.set(row.pid, witness)
         }
-        blocked.add(row.pid)
+        cuts.add(row.pid)
       }
-      for (let changed = true; changed;) {
-        changed = false
-        for (const row of rows) if (blocked.has(row.ppid) && !blocked.has(row.pid) && !births.has(row.pid) && !unownedCandidates.has(row.pid)) {
-          if (row.pid === process.pid || row.pid === process.ppid) throw cleanupUnknown('protected_addition')
-          blocked.add(row.pid); changed = true
-        }
-      }
-      return rows.filter(row => !blocked.has(row.pid))
+      // Cut only a proven old generation's incoming membership edge. Preserve
+      // the full census, including captured owners/candidates behind that edge
+      // and cycles leading back to the captured root.
+      if (protectedPath && members(rows, cuts).some(row => protectedPids.has(row.pid))) throw cleanupUnknown('protected_addition')
+      edgeCuts = cuts
+      return rows
     }
     try {
       if (signal?.aborted) fail()
       if (pid) {
+        if (protectedPids.has(pid)) throw cleanupUnknown('protected_addition')
         const initial = await birth(pid)
         if (initial !== null) births.set(pid, initial)
       }
@@ -464,10 +499,12 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
         if (stopping) {
           phase = 'signal'
           for (const [target, identity] of births) {
+            if (protectedPids.has(target)) throw cleanupUnknown('protected_addition')
             if (unownedCandidates.has(target) || !live.some(row => row.pid === target) || signalled.has(target)) continue
             if (!await sameBirth(target, identity)) continue
             cap()
             // Signals target captured births only, never a numeric group alone.
+            if (protectedPids.has(target)) throw cleanupUnknown('protected_addition')
             try { ports.signal(target) } catch {
               if (ports.alive(target) !== 'gone') throw cleanupUnknown('signal_failed_live')
             }

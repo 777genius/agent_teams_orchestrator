@@ -13,6 +13,8 @@ export type CursorAgentNativePorts = {
   tree: (timeout: number) => Promise<NativeRow[]>
   /** Read-only pre-spawn witness; unavailable backends grant no exclusions. */
   existingWindows?: (deadline: number) => Promise<readonly NativeGeneration[] | null>
+  /** Native metadata only: independently confirm the protected generations. */
+  protectedWindows?: (deadline: number) => Promise<readonly NativeGeneration[] | null>
   signal: (pid: number) => void
   alive: (pid: number) => 'alive' | 'gone' | 'unknown'
   taskkill: (pid: number, timeout: number) => Promise<void>
@@ -118,6 +120,41 @@ export function nativePorts(overrides: Partial<CursorAgentNativePorts> = {},
   }
   return {
     platform: process.platform, selfPid: process.pid, now: Date.now,
+    protectedWindows: async deadline => {
+      if (process.platform !== 'win32') return null
+      const kernel32 = await windowsNativeProcess()
+      if (!kernel32) return null
+      const cap = () => { if (Date.now() >= deadline) throw new Error('Native witness deadline exhausted') }
+      const table = () => {
+        cap()
+        const rows = kernel32.table(), seen = new Set<number>()
+        if (rows.length > 4096) throw new Error('Oversized native witness')
+        for (const row of rows) {
+          if (!Number.isSafeInteger(row.pid) || row.pid < 0 || !Number.isSafeInteger(row.ppid)
+            || row.ppid < 0 || seen.has(row.pid)) throw new Error('Unreadable native witness')
+          seen.add(row.pid)
+        }
+        cap()
+        return rows
+      }
+      const protectedPids = new Set([process.pid, process.ppid].filter(pid => pid > 0))
+      const captured: NativeGeneration[] = []
+      for (const row of table()) if (protectedPids.has(row.pid)) {
+        cap()
+        const birth = kernel32.birth(row.pid)
+        cap()
+        if (positive(birth)) captured.push({ ...row, birth })
+      }
+      const confirmed = table(), result: NativeGeneration[] = []
+      for (const row of captured) {
+        cap()
+        if (!confirmed.some(current => current.pid === row.pid && current.ppid === row.ppid)) continue
+        const birth = kernel32.birth(row.pid)
+        cap()
+        if (birth === row.birth) result.push(row)
+      }
+      return result
+    },
     existingWindows: async deadline => {
       if (process.platform !== 'win32') return null
       // Never turn this optional proof into N cold PowerShell starts. Native
