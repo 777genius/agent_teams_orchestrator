@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -395,7 +395,8 @@ export function runBackfillSmoke(binaryInput, evidenceInput, { report: suppliedR
     cases: [], passed: false });
   const flush = suppliedFlush || (() => writeFileSync(evidencePath, JSON.stringify(report, null, 2) + '\n'));
   flush();
-  const root = mkdtempSync(path.join(os.tmpdir(), 'backfill-exe-'));
+  // The native API also expands Windows 8.3 names; the JS walk only resolves links.
+  const root = realpathSync.native(mkdtempSync(path.join(os.tmpdir(), 'backfill-exe-')));
   try {
     for (const [shape, transport] of backfillCases) {
       const item = { shape, transport, invocations: [], passed: false };

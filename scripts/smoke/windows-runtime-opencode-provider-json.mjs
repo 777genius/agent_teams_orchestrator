@@ -5,7 +5,7 @@ import { execFile, spawnSync } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createServer } from 'node:http';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { realpath } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -239,7 +239,8 @@ function assertExitZero(result, label) {
 
 export function runProviderSmoke(runtimeBinary, report, flush, { spawn = spawnSync, cleanup = finishSmokeCleanup } = {}) {
   report.mcpEvidence = { mode: 'simulated-opencode-http-attach', bundledAppMcp: false, executableTools: false };
-  const tempRoot = mkdtempSync(path.join(os.tmpdir(), 'agent-teams-runtime-opencode-smoke-'));
+  // The native API also expands Windows 8.3 names; the JS walk only resolves links.
+  const tempRoot = realpathSync.native(mkdtempSync(path.join(os.tmpdir(), 'agent-teams-runtime-opencode-smoke-')));
   try {
     const fakeOpenCodeScript = path.join(tempRoot, 'fake-opencode.cjs');
     const fakeOpenCodeCmd = path.join(tempRoot, 'opencode.cmd');

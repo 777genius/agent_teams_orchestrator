@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import childProcess, { spawn, spawnSync } from 'node:child_process';
 import { syncBuiltinESMExports } from 'node:module';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -402,6 +402,72 @@ test('ownership diagnostics are bounded to explicit fixture candidates and canno
 
 // CLI envelopes are injected here; the launch resolver runs unchanged in Bun.
 // This covers standalone fixture wiring, not native Windows or bundled app MCP.
+test('provider smoke canonicalizes owned temp roots before child cwd and controlled environment paths', t => {
+  const parent = realpathSync.native(mkdtempSync(path.join(os.tmpdir(), 'provider-canonical-temp-')));
+  const physicalTemp = path.join(parent, 'physical');
+  const aliasTemp = path.join(parent, 'alias');
+  mkdirSync(physicalTemp);
+  symlinkSync(physicalTemp, aliasTemp, process.platform === 'win32' ? 'junction' : 'dir');
+  const report = { cases: [] };
+  const launches = [];
+  let fixtureRoot, physicalRoot;
+  try {
+    t.mock.method(os, 'tmpdir', () => aliasTemp);
+    runProviderSmoke('/fixture/runtime.exe', report, () => {}, {
+      spawn: (_executable, argv, { env, cwd }) => {
+        const input = argv.includes('--input')
+          ? JSON.parse(readFileSync(argv[argv.indexOf('--input') + 1], 'utf8')) : null;
+        launches.push({ env, cwd, argv, input });
+        const payload = !input
+          ? { runtimeId: 'opencode', view: { providers: [{ providerId: 'opencode' }] } }
+          : { command: input.command, requestId: input.requestId,
+            ok: input.command === 'opencode.handshake', data: { hostHealthy: true } };
+        const stdout = JSON.stringify(payload);
+        if (argv.includes('--output')) writeFileSync(argv[argv.indexOf('--output') + 1], stdout);
+        return { status: 0, signal: null, stdout, stderr: '' };
+      },
+      cleanup: (group, root) => {
+        fixtureRoot = root;
+        physicalRoot = realpathSync.native(root);
+        finishSmokeCleanup(group, root, { teardown: () => {} });
+      },
+    });
+    assert.equal(report.error, undefined);
+    assert.equal(report.cleanupError, undefined);
+    assert.equal(report.passed, true, JSON.stringify(report));
+    assert.deepEqual(report.cases.map(item => item.label),
+      ['providers-view', 'handshake-file', 'handshake-stdout', 'readiness-stdout']);
+    assert.equal(launches.length, 4);
+    assert.equal(existsSync(fixtureRoot), false, 'Owned fixture must be removed after the checks');
+    const assertCanonical = (value, label) => {
+      const relative = path.relative(physicalRoot, value);
+      assert.ok(relative && relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative),
+        `${label} must remain inside the physical owned root`);
+      assert.equal(value, path.join(physicalRoot, relative), `${label} must use the physical canonical path`);
+    };
+    for (const [index, launch] of launches.entries()) {
+      assertCanonical(launch.cwd, `spawn ${index} cwd`);
+      for (const key of ['HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'TMP', 'TEMP', 'TMPDIR',
+        'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME', 'CLAUDE_CONFIG_DIR',
+        'CLAUDE_MULTIMODEL_DATA_HOME', 'CLAUDE_MULTIMODEL_CACHE_HOME', 'CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH',
+        'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY', 'GIT_CONFIG_GLOBAL']) {
+        assertCanonical(launch.env[key], `spawn ${index} ${key}`);
+      }
+      for (const flag of ['--project-path', '--input', '--output']) {
+        if (launch.argv.includes(flag)) assertCanonical(launch.argv[launch.argv.indexOf(flag) + 1], `spawn ${index} ${flag}`);
+      }
+      if (launch.input) assert.equal(launch.input.cwd, launch.cwd);
+      if (launch.input?.command === 'opencode.readiness') {
+        assert.equal(launch.input.body.projectPath, launch.cwd);
+        assert.equal(launch.input.body.requireExecutionProbe, false);
+      }
+    }
+  } finally {
+    t.mock.restoreAll();
+    rmSync(parent, { recursive: true, force: true });
+  }
+});
+
 test('provider fixture supplies an isolated MCP entry to the production resolver', { timeout: 15000 }, () => {
   const report = { cases: [] };
   const environments = [];
