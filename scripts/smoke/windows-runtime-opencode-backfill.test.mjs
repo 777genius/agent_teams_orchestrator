@@ -1342,6 +1342,100 @@ test('Windows isolated PATH captures identity and teardown stops only the owned 
   assert.deepEqual(evidence.cleanupErrors, [], 'Direct test-child cleanup must succeed');
 });
 
+// Run real redirected Windows PowerShell after the first cold identity query.
+// The ASCII control reproduces the old producer's literal '?' bytes; the fixed
+// body must retain exact Unicode on both streams while doing the same teardown.
+test('Windows teardown preserves exact Unicode stdout and stderr with BOM-less UTF-8', {
+  skip: process.platform !== 'win32', timeout: 90000,
+}, async t => {
+  const root = realpathSync.native(mkdtempSync(path.join(os.tmpdir(), 'TEST-teardown Юникод 世界-')));
+  const env = sandboxEnvironment(root, path.join(root, 'opencode.cmd'));
+  const script = path.join(root, 'fake-opencode.cjs');
+  const unrelatedScript = script + ' unrelated-helper.cjs';
+  const children = [];
+  const runs = [];
+  const utf8Assignment = '[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)';
+  const unicodeBytes = Buffer.from('Юникод 世界', 'utf8');
+  const bom = Buffer.from([0xef, 0xbb, 0xbf]);
+  const start = async file => {
+    writeFileSync(file, "process.stdout.write('ready\\n'); setInterval(() => {}, 1000);");
+    const child = spawn(process.execPath, [file], { env, cwd: root, stdio: ['ignore', 'pipe', 'pipe'] });
+    children.push(child);
+    await Promise.all([once(child, 'spawn'), once(child.stdout, 'data', { signal: AbortSignal.timeout(5000) })]);
+    return child;
+  };
+  try {
+    const unrelated = await start(unrelatedScript);
+    for (const variant of ['fixed-utf8', 'legacy-ascii']) {
+      const child = await start(script);
+      const exited = once(child, 'exit', { signal: AbortSignal.timeout(35000) });
+      exited.catch(() => {});
+      const emitted = buildWindowsTeardownCommand(root, [child.pid]);
+      let body = emitted;
+      if (variant === 'legacy-ascii') {
+        assert.equal(emitted.split(utf8Assignment).length, 2, 'One explicit output encoding assignment required');
+        body = emitted.replace(utf8Assignment, '');
+      }
+      const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command',
+        "[Console]::OutputEncoding = [System.Text.Encoding]::ASCII\n" + body], {
+        cwd: root, env, stdio: ['ignore', 'pipe', 'pipe'], timeout: 30000,
+        windowsHide: true, maxBuffer: 1024 * 1024,
+      });
+      assert.ifError(result.error);
+      assert.equal(result.status, 0, result.stderr?.toString('utf8'));
+      assert.equal(result.signal, null);
+      const stdout = result.stdout.toString('utf8');
+      const stderr = result.stderr.toString('utf8');
+      for (const [name, bytes, text] of [['stdout', result.stdout, stdout], ['stderr', result.stderr, stderr]]) {
+        assert.deepEqual(Buffer.from(text, 'utf8'), bytes, name + ' must be valid UTF-8 bytes');
+        assert.equal(bytes.subarray(0, bom.length).equals(bom), false, name + ' must not have a UTF-8 BOM');
+      }
+      const stopped = JSON.parse(stdout);
+      assert.equal(stopped.length, 1);
+      assert.equal(stopped[0].pid, child.pid);
+      assert.ok(Number.isFinite(Date.parse(stopped[0].startedAt)));
+      const groups = stopped[0].commandLine.match(windowsNodeScriptPattern)?.groups;
+      const emittedScript = groups?.quotedScript || groups?.bareScript;
+      const diagnostic = stderr.split(/\r?\n/).find(line => line.startsWith('teardown: fixture ownership '));
+      const ownership = JSON.parse(diagnostic?.slice('teardown: fixture ownership '.length));
+      assert.equal(ownership.pid, child.pid);
+      assert.equal(ownership.owned, true);
+      assert.match(stderr, new RegExp('teardown: after identity validation pid=' + child.pid));
+      assert.match(stderr, new RegExp('teardown: after wait for exit pid=' + child.pid));
+      assert.match(stderr, /teardown: after JSON output/);
+      const exact = variant === 'fixed-utf8';
+      assert.equal(result.stdout.includes(unicodeBytes), exact, variant + ' raw stdout Unicode');
+      assert.equal(result.stderr.includes(unicodeBytes), exact, variant + ' raw stderr Unicode');
+      assert.equal(ownership.script, emittedScript, variant + ' stdout/stderr script agreement');
+      if (exact) {
+        assert.equal(emittedScript, script, 'Fixed JSON must retain the exact whole script path');
+        assert.equal(realpathSync.native(stopped[0].executable).toLowerCase(), realpathSync.native(process.execPath).toLowerCase());
+      } else {
+        assert.notEqual(emittedScript, script, 'Legacy producer must reproduce the real Unicode identity failure');
+        const corruptedTail = path.join(path.basename(root).replace('Юникод 世界', '?????? ??'), 'fake-opencode.cjs');
+        assert.ok(emittedScript.endsWith(corruptedTail), 'Legacy producer must emit literal ASCII replacement bytes in the known owned suffix');
+      }
+      await exited;
+      assert.equal(process.kill(unrelated.pid, 0), true, 'Shared-prefix unowned fixture must survive each teardown');
+      assert.equal(process.kill(process.pid, 0), true, 'Parent must survive each teardown');
+      runs.push({ variant, status: result.status, ownedPid: child.pid, stdoutUnicodeExact: exact,
+        stderrUnicodeExact: exact, stdoutBytes: result.stdout.length, stderrBytes: result.stderr.length });
+    }
+  } finally {
+    const cleanup = await Promise.allSettled(children.map(async child => {
+      if (child.pid && child.exitCode === null && child.signalCode === null) {
+        const exited = once(child, 'exit', { signal: AbortSignal.timeout(5000) });
+        exited.catch(() => {});
+        child.kill(); // Only this test's own ChildProcess handle, including its negative fixture.
+        await exited;
+      }
+    }));
+    rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 250 });
+    t.diagnostic(JSON.stringify({ unicodeTeardownRuns: runs }));
+    assert.deepEqual(cleanup.filter(item => item.status === 'rejected'), [], 'Direct test-child cleanup must succeed');
+  }
+});
+
 // Keep this PowerShell contract after the first native production identity test;
 // it must not warm that test's cold helper query.
 test('Windows cleanup admits exact fixtures without recursively inspecting portable graphs', {
