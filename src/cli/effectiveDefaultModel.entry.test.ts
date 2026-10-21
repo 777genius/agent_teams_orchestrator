@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict'
-import { spawn } from 'node:child_process'
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
+import { spawn, spawnSync } from 'node:child_process'
+import { access, mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { isAbsolute, join } from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 
@@ -103,19 +103,27 @@ test(
     const baseUrl = `http://127.0.0.1:${address.port}`
     const config = join(home, '.claude')
     await mkdir(config, { recursive: true })
+    const systemRoot = process.env.SystemRoot ?? process.env.SYSTEMROOT
+    const comSpec = process.env.ComSpec ?? process.env.COMSPEC
     const env = {
-      // Inference initializes the Windows shell even with tools disabled. Keep
-      // provider discovery isolated while supplying the installed shell itself.
+      // Source startup can initialize Windows OS helpers; inference also needs
+      // Git Bash even with tools disabled. Keep provider launchers isolated by
+      // exposing only the system directory and the explicit shell.
       ...(process.platform === 'win32'
         ? {
-            SystemRoot: process.env.SystemRoot ?? process.env.SYSTEMROOT,
-            ComSpec: process.env.ComSpec ?? process.env.COMSPEC,
+            SystemRoot: systemRoot,
+            WINDIR: systemRoot,
+            ComSpec: comSpec,
+            PATHEXT: '.COM;.EXE;.BAT;.CMD',
             CLAUDE_CODE_GIT_BASH_PATH: (
               await import('../utils/windowsPaths.js')
             ).findGitBashPath(),
           }
         : {}),
-      PATH: '',
+      PATH:
+        process.platform === 'win32' && systemRoot
+          ? join(systemRoot, 'System32')
+          : '',
       HOME: home,
       USERPROFILE: home,
       CLAUDE_CONFIG_DIR: config,
@@ -133,11 +141,16 @@ test(
       ANTHROPIC_AUTH_TOKEN: 'fixture-only',
       ANTHROPIC_API_KEY: 'fixture-only',
     }
+    let childNumber = 0
     async function run(
       args: string[],
       extraEnv: Record<string, string>,
       cwd = home,
     ) {
+      const invocation = ++childNumber
+      const started = performance.now()
+      const firstPath = paths.length
+      const firstRootMethod = rootMethods.length
       const child = spawn(
         bun,
         ['--no-install', '--no-env-file', entry, ...args],
@@ -155,13 +168,61 @@ test(
       child.stderr.on('data', (data: Buffer) => {
         stderr += data.toString()
       })
-      const timer = setTimeout(() => child.kill('SIGKILL'), 20_000)
-      try {
-        const code = await new Promise<number | null>((resolve, reject) => {
-          child.once('error', reject)
-          child.once('close', resolve)
+      let watchdogTriggered = false
+      const timer = setTimeout(() => {
+        watchdogTriggered = true
+        child.kill('SIGKILL')
+      }, 20_000)
+      function failureDetails(
+        code: number | null,
+        signal: NodeJS.Signals | null,
+        error?: unknown,
+      ) {
+        let stdoutState = stdout.length ? 'non-json-or-incomplete' : 'empty'
+        if (stdout.length) {
+          try {
+            JSON.parse(stdout)
+            stdoutState = 'valid-json'
+          } catch {
+            // Preserve incomplete output as diagnostic evidence.
+          }
+        }
+        return JSON.stringify({
+          invocation,
+          args,
+          code,
+          signal,
+          elapsedMs: Math.round(performance.now() - started),
+          watchdogTriggered,
+          stdoutState,
+          stdoutChars: stdout.length,
+          stderrChars: stderr.length,
+          stdoutTail: stdout.slice(-2048),
+          stderrTail: stderr.slice(-2048),
+          httpPathCount: paths.length - firstPath,
+          httpPaths: paths.slice(firstPath).slice(-32),
+          rootMethods: rootMethods.slice(firstRootMethod).slice(-32),
+          ...(error ? { error: String(error) } : {}),
         })
-        assert.equal(code, 0, stderr)
+      }
+      try {
+        const { code, signal } = await new Promise<{
+          code: number | null
+          signal: NodeJS.Signals | null
+        }>((resolve, reject) => {
+          child.once('error', (error) =>
+            reject(new Error(failureDetails(null, null, error))),
+          )
+          child.once('close', (code, signal) => resolve({ code, signal }))
+        })
+        const details = failureDetails(code, signal)
+        assert.equal(code, 0, details)
+        assert.equal(signal, null, details)
+        assert.doesNotMatch(
+          stderr,
+          /'chcp' is not recognized as an internal or external command/i,
+          details,
+        )
         return { stdout, stderr }
       } finally {
         clearTimeout(timer)
@@ -187,6 +248,31 @@ test(
       return JSON.parse(result.stdout).providers.anthropic
     }
     try {
+      if (process.platform === 'win32') {
+        assert(systemRoot && isAbsolute(systemRoot), 'Expected absolute SystemRoot')
+        assert(comSpec && isAbsolute(comSpec), 'Expected absolute ComSpec')
+        await access(comSpec)
+        // Exercise the real OS command in the exact fixture environment without
+        // warming the source CLI or an unrelated provider SDK beforehand.
+        const codepage = spawnSync(comSpec, ['/d', '/s', '/c', 'chcp'], {
+          cwd: home,
+          env,
+          encoding: 'utf8',
+          timeout: 5_000,
+          windowsHide: true,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        })
+        const details = JSON.stringify({
+          command: 'chcp',
+          code: codepage.status,
+          signal: codepage.signal,
+          error: codepage.error?.message,
+          stdoutTail: codepage.stdout?.slice(-2048),
+          stderrTail: codepage.stderr?.slice(-2048),
+        })
+        assert.equal(codepage.status, 0, details)
+        assert.match(codepage.stdout, /\b\d+\b/, details)
+      }
       const auto = await status({
         AGENT_TEAMS_ANTHROPIC_CONNECTION_MODE: 'auto',
         ANTHROPIC_MODEL: 'gateway-selected',
