@@ -5432,7 +5432,7 @@ public:
       FILETIME wallTime{};
       GetSystemTimeAsFileTime(&wallTime);
       const std::uint64_t nowMs = filetime(wallTime) / 10000 - 11644473600000ULL;
-      require(static_cast<std::uint64_t>(wallDeadline) > nowMs, "run_deadline_expired");
+      require(static_cast<std::uint64_t>(wallDeadline) > nowMs, "run_state_wall_deadline_expired");
       // Queue and stdio transit already consumed the caller's original budget.
       const std::uint64_t remaining = std::min<std::uint64_t>(
           Control::runControlTimeoutMs(input, L"timeoutMs"),

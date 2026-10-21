@@ -458,3 +458,34 @@ test('run control listener always offers a fresh instance and survives connectio
   expect(reports).toEqual(['run_control_disconnected', 'run_control_peer_identity',
     'run_control_accept_unknown', 'run_control_listen_unknown', 'run_control_disconnected'])
 })
+test('run state request wall deadline expiry keeps its own closed token', async () => {
+  const { runInNewContext } = await import('node:vm')
+  const source = await readFile(path.resolve(import.meta.dir, '../../src/services/opencode/host/windows/WindowsKernelScope.cpp'), 'utf8')
+  const operation = source.indexOf('if (operation == L"runStateRequest") {')
+  expect(operation).toBeGreaterThanOrEqual(0)
+  const begin = source.indexOf('      FILETIME wallTime{};', operation)
+  expect(begin).toBeGreaterThanOrEqual(0)
+  const marker = source.indexOf('require(static_cast<std::uint64_t>(wallDeadline) > nowMs, "', begin)
+  expect(marker).toBeGreaterThan(begin)
+  const end = source.indexOf('");', marker)
+  expect(end).toBeGreaterThan(marker)
+  const body = source.slice(begin, end + '");'.length)
+    .replaceAll('FILETIME wallTime{};', 'const wallTime = {};')
+    .replaceAll('GetSystemTimeAsFileTime(&wallTime);', 'GetSystemTimeAsFileTime(wallTime);')
+    .replaceAll('const std::uint64_t nowMs =', 'const nowMs =')
+    .replaceAll('static_cast<std::uint64_t>(wallDeadline)', 'wallDeadline')
+    .replaceAll('11644473600000ULL', '11644473600000')
+  const nowMs = 1_760_000_000_000
+  const admit = (wallDeadline: number) => runInNewContext(`(function () {${body}\nreturn 'admitted';})()`, {
+    wallDeadline, GetSystemTimeAsFileTime: (value: Record<string, number>) => { value.stamp = (nowMs + 11644473600000) * 10000 },
+    filetime: (value: Record<string, number>) => value.stamp,
+    require: (value: unknown, code: string) => { if (!value) throw new Error(code) },
+  })
+  // The caller's wall deadline expiring before any connect work is its own
+  // closed branch, never the ambiguous connect/IO deadline word.
+  expect(admit(nowMs + 1)).toBe('admitted')
+  let caught: unknown
+  try { admit(nowMs) } catch (error) { caught = error }
+  expect((caught as Error).message).toBe('run_state_wall_deadline_expired')
+  expect(source).toContain('require(static_cast<std::uint64_t>(wallDeadline) > nowMs, "run_state_wall_deadline_expired");')
+})
