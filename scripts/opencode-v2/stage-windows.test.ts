@@ -298,6 +298,7 @@ test('run control connect keeps its deadline while the endpoint is transiently a
     .replaceAll('nullptr', 'null')
     .replaceAll('L"', '"')
   const ERROR_FILE_NOT_FOUND = 2, ERROR_ACCESS_DENIED = 5, ERROR_SEM_TIMEOUT = 121, ERROR_PIPE_BUSY = 231
+  const ERROR_NO_DATA = 232
   const plan = {
     open: [] as number[], // 0 opens the endpoint; any other value fails with that GetLastError
     wait: [] as Array<[number, number, number]>, // WaitNamedPipeW return, GetLastError, clock advance
@@ -323,7 +324,7 @@ test('run control connect keeps its deadline while the endpoint is transiently a
     Sleep: (ms: number) => { state.slept.push(ms); state.now += ms },
     GENERIC_READ: 1, GENERIC_WRITE: 2, OPEN_EXISTING: 3, FILE_FLAG_OVERLAPPED: 0x40000000,
     INVALID_HANDLE_VALUE: -1, ERROR_SUCCESS: 0,
-    ERROR_FILE_NOT_FOUND, ERROR_ACCESS_DENIED, ERROR_SEM_TIMEOUT, ERROR_PIPE_BUSY,
+    ERROR_FILE_NOT_FOUND, ERROR_ACCESS_DENIED, ERROR_SEM_TIMEOUT, ERROR_PIPE_BUSY, ERROR_NO_DATA,
   }
   const connect = runInNewContext(
     `(function () {return function (endpoint, deadline) {let pipe;\n${body}\nreturn pipe;};})()`,
@@ -391,6 +392,24 @@ test('run control connect keeps its deadline while the endpoint is transiently a
   expect((caught as { code: string }).code).toBe('run_control_connect_unknown')
   expect((caught as { win32: number }).win32).toBe(ERROR_ACCESS_DENIED)
   expect(state.waits).toEqual([])
+  // A closing endpoint is transient saturation: the client retries through it
+  // instead of publishing a connect unknown refusal, polling rather than
+  // spinning while the listener replaces the spent instance.
+  reset()
+  plan.open = [ERROR_NO_DATA, ERROR_NO_DATA, 0]
+  plan.wait = [[0, ERROR_NO_DATA, 0], [1, 0, 0]]
+  expect((connect(endpoint, 3000) as { raw: number }).raw).toBe(7)
+  expect(state.opens).toEqual([ERROR_NO_DATA, ERROR_NO_DATA, 0])
+  expect(state.slept).toEqual([10])
+
+  // A budget spent against the closing state reports saturation, never idle
+  // and never a connect unknown refusal.
+  reset()
+  plan.open = [ERROR_NO_DATA]
+  plan.wait = [[0, ERROR_SEM_TIMEOUT, 2000]]
+  try { connect(endpoint, 3000) } catch (error) { caught = error }
+  expect((caught as Error).message).toBe('run_control_connect_busy_timeout_expired')
+
   // The split retires the ambiguous deadline token from the native header.
   expect(source).not.toContain('"run_deadline_expired"')
 })
@@ -485,6 +504,113 @@ test('run control listener always offers a fresh instance and survives connectio
   expect(poisons).toEqual([7, 7, 7, 7])
   expect(reports).toEqual(['run_control_disconnected', 'run_control_peer_identity',
     'run_control_accept_unknown', 'run_control_listen_unknown', 'run_control_disconnected'])
+})
+
+test('run control accept replenishes a spent listening instance instead of refusing', async () => {
+  const { runInNewContext } = await import('node:vm')
+  const header = path.resolve(import.meta.dir, '../../src/services/opencode/host/windows/WindowsNativeRunControl.hpp')
+  const source = (await readFile(header, 'utf8')).replaceAll('\r\n', '\n')
+  const acceptBody = source.slice(source.indexOf('JsonObject accept('), source.indexOf('JsonObject read('))
+  const begin = acceptBody.indexOf('    const DWORD timeout = runControlTimeoutMs(input, L"timeoutMs");')
+  expect(begin).toBeGreaterThanOrEqual(0)
+  const end = acceptBody.indexOf('    // The accepted instance remains connected and owned by the registry; no')
+  expect(end).toBeGreaterThan(begin)
+  const body = acceptBody.slice(begin, end)
+    .replaceAll('const DWORD timeout =', 'const timeout =')
+    .replaceAll('const std::uint64_t acceptDeadline =', 'const acceptDeadline =')
+    .replaceAll('auto owned = std::make_shared<IoOperation>();',
+      'const owned = { overlap: {}, error: 0, complete: false, poisoned: false, unresolved: false };')
+    .replaceAll('auto operation = runControlRetain(std::move(owned));', 'const operation = runControlRetain(owned);')
+    .replaceAll('BOOL connected =', 'let connected =')
+    .replaceAll('DWORD error =', 'let error =')
+    .replaceAll('auto wait =', 'let wait =')
+    .replaceAll('const auto cancelled =', 'const cancelled =')
+    .replaceAll('Handle accepted = std::move(operation->issuingHandle);', 'const accepted = operation.issuingHandle;')
+    .replaceAll('&operation->overlap', 'operation.overlap')
+    .replaceAll('throw NativeError{', 'throw nativeError(')
+    .replaceAll('"accept"};', '"accept");')
+    .replaceAll('"};', '");')
+    .replaceAll('static_cast<bool>(', '(')
+    .replaceAll('std::move(', '(')
+    .replaceAll('*operation', 'operation')
+    .replaceAll('IoKind::accept', '"accept"')
+    .replaceAll('owned->', 'owned.')
+    .replaceAll('operation->', 'operation.')
+    .replaceAll('listener_->', 'listener.')
+    .replaceAll('listener_', 'listener')
+    .replaceAll('nullptr', 'null')
+    .replaceAll('TRUE', 'true')
+    .replaceAll('FALSE', 'false')
+    .replaceAll('L"', '"')
+  const closes = Math.max(0, (body.match(/\{/g) ?? []).length - (body.match(/\}/g) ?? []).length)
+  const ERROR_SUCCESS = 0, ERROR_NO_DATA = 232, ERROR_IO_PENDING = 997, ERROR_PIPE_CONNECTED = 535
+  const state = { now: 1000, lastError: 0, offers: 0, forgets: 0, waits: 0 }
+  const runAccept = (connects: Array<[number, number]>,
+    waits: Array<{ completed: boolean; transferred: number; error: number }>,
+    retainIdleWait: boolean, tick = 0) => {
+    state.now = 1000; state.lastError = 0; state.offers = 0; state.forgets = 0; state.waits = 0
+    let connectAt = 0
+    const waitPlan = [...waits]
+    const listener = { name: '\\\\.\\pipe\\agt-v2-run-control-test', pending: { value: 1 }, poisoned: false }
+    const context = {
+      require: (value: unknown, code: string) => { if (!value) throw new Error(code) },
+      nativeError: (code: string, win32: number) => Object.assign(new Error(code), { code, win32 }),
+      runControlTimeoutMs: () => 3000,
+      GetTickCount64: () => state.now,
+      runControlRemaining: (deadline: number) => Math.max(0, deadline - state.now),
+      runControlDuplicateHandle: (handle: number) => ({ value: handle }),
+      Handle: (raw: unknown) => raw,
+      CreateEventW: () => ({ value: 9 }),
+      runControlRetain: (operation: unknown) => operation,
+      runControlForget: () => { state.forgets += 1 },
+      runControlOfferPending: () => { state.offers += 1; listener.pending = { value: 1 + state.offers } },
+      ConnectNamedPipe: () => {
+        const entry = connects[Math.min(connectAt++, connects.length - 1)] ?? [1, 0]
+        state.lastError = entry[1]
+        if (tick) state.now += tick
+        return entry[0]
+      },
+      runControlWaitOperation: () => {
+        state.waits += 1
+        return waitPlan.shift() ?? { completed: true, transferred: 0, error: 0 }
+      },
+      runControlCancelAndDrain: () => ({ completed: true, transferred: 0, error: 0 }),
+      GetLastError: () => state.lastError,
+      lock: { unlock: () => {}, lock: () => {} },
+      requestPumpStop_: false, shutdown_: false,
+      ERROR_SUCCESS, ERROR_NO_DATA, ERROR_IO_PENDING, ERROR_PIPE_CONNECTED, ERROR_OPERATION_ABORTED: 995,
+    }
+    const accept = runInNewContext(
+      `(function () {return function (input, listener, retainIdleWait) {${body}\nreturn accepted;${'}'.repeat(closes + 1)}})()`,
+      context) as (input: unknown, listener: unknown, retainIdleWait: boolean) => unknown
+    return { result: accept({ timeoutMs: 3000 }, listener, retainIdleWait), listener }
+  }
+
+  // A spent offer is never fatal: its only client arrived and left before the
+  // listen was issued, so the instance is replaced and the retry accepts on
+  // the fresh one inside the same budget without poisoning the listener.
+  const outcome = runAccept([[0, ERROR_NO_DATA], [1, 0]], [], true)
+  expect((outcome.result as { value: number }).value).toBe(2)
+  expect(outcome.listener.poisoned).toBe(false)
+  expect(state.offers).toBe(1)
+  expect(state.forgets).toBe(2)
+
+  // A completed listen carrying the same spent-instance report takes the
+  // identical replenish-and-retry path.
+  const retried = runAccept([[0, ERROR_IO_PENDING], [1, 0]],
+    [{ completed: true, transferred: 0, error: ERROR_NO_DATA }], true)
+  expect((retried.result as { value: number }).value).toBe(2)
+  expect(retried.listener.poisoned).toBe(false)
+  expect(state.offers).toBe(1)
+
+  // An explicit accept whose budget is eaten by spent offers reports budget
+  // expiry, never a listener refusal.
+  let caught: unknown
+  try {
+    runAccept([[0, ERROR_NO_DATA]], [], false, 1000)
+  } catch (error) { caught = error }
+  expect((caught as Error).message).toBe('run_control_accept_timeout')
+  expect(state.offers).toBe(3)
 })
 test('run state request wall deadline expiry keeps its own closed token', async () => {
   const { runInNewContext } = await import('node:vm')

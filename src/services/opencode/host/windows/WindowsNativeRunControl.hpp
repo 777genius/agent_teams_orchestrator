@@ -265,7 +265,8 @@ struct WindowsNativeRunControl {
       if (runControlRemaining(deadline) == 0) {
         if (connectError == ERROR_FILE_NOT_FOUND)
           throw NativeError{"run_control_connect_no_listener_expired"};
-        if (connectError == ERROR_PIPE_BUSY || connectError == ERROR_SEM_TIMEOUT)
+        if (connectError == ERROR_PIPE_BUSY || connectError == ERROR_SEM_TIMEOUT ||
+            connectError == ERROR_NO_DATA)
           throw NativeError{"run_control_connect_busy_timeout_expired"};
         throw NativeError{"run_control_connect_idle_expired"};
       }
@@ -279,7 +280,7 @@ struct WindowsNativeRunControl {
       // deadline, never a refusal; only an unexpected errno publishes the
       // closed connect failure.
       if (error != ERROR_PIPE_BUSY && error != ERROR_SEM_TIMEOUT &&
-          error != ERROR_FILE_NOT_FOUND)
+          error != ERROR_FILE_NOT_FOUND && error != ERROR_NO_DATA)
         throw NativeError{"run_control_connect_unknown", error, "connect"};
       const DWORD remaining = runControlRemaining(deadline);
       if (remaining == 0) continue;
@@ -287,12 +288,14 @@ struct WindowsNativeRunControl {
       // and consume the original budget before any request bytes are submitted.
       if (!WaitNamedPipeW(endpoint.c_str(), remaining)) {
         const DWORD waitError = GetLastError();
-        if (waitError != ERROR_SEM_TIMEOUT && waitError != ERROR_FILE_NOT_FOUND)
+        if (waitError != ERROR_SEM_TIMEOUT && waitError != ERROR_FILE_NOT_FOUND &&
+            waitError != ERROR_NO_DATA)
           throw NativeError{"run_control_connect_unknown", waitError, "connect"};
         connectError = waitError;
-        // A missing endpoint is momentarily absent rather than refused; poll
-        // the same deadline instead of expiring the caller on that absence.
-        if (waitError == ERROR_FILE_NOT_FOUND)
+        // A missing or closing endpoint is momentarily absent rather than
+        // refused; poll the same deadline instead of expiring the caller on
+        // that absence.
+        if (waitError == ERROR_FILE_NOT_FOUND || waitError == ERROR_NO_DATA)
           Sleep(10);
       }
     }
@@ -328,86 +331,116 @@ struct WindowsNativeRunControl {
                 registry_.size() < MAX_CAPABILITIES,
             "run_control_connection_limit");
     const DWORD timeout = runControlTimeoutMs(input, L"timeoutMs");
-    require(static_cast<bool>(listener_->pending), "run_control_accept_unknown");
-    auto owned = std::make_shared<IoOperation>();
-    owned->kind = IoKind::accept;
-    owned->issuingHandle = runControlDuplicateHandle(listener_->pending.value);
-    owned->event = Handle(CreateEventW(nullptr, TRUE, FALSE, nullptr));
-    require(static_cast<bool>(owned->event), "run_control_accept_unknown");
-    owned->overlap.hEvent = owned->event.value;
-    auto operation = runControlRetain(std::move(owned));
-    listener_->acceptOperation = operation;
+    // A spent offer must never consume a second budget: an explicit accept
+    // retries inside its original timeout while the owner pump keeps
+    // observing until its stop is ordered.
+    const std::uint64_t acceptDeadline = GetTickCount64() + timeout;
+    for (;;) {
+      require(static_cast<bool>(listener_->pending), "run_control_accept_unknown");
+      auto owned = std::make_shared<IoOperation>();
+      owned->kind = IoKind::accept;
+      owned->issuingHandle = runControlDuplicateHandle(listener_->pending.value);
+      owned->event = Handle(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+      require(static_cast<bool>(owned->event), "run_control_accept_unknown");
+      owned->overlap.hEvent = owned->event.value;
+      auto operation = runControlRetain(std::move(owned));
+      listener_->acceptOperation = operation;
 
-    BOOL connected = ConnectNamedPipe(operation->issuingHandle.value, &operation->overlap);
-    DWORD error = connected ? ERROR_SUCCESS : GetLastError();
-    operation->issued = true;
-    if (!connected && error != ERROR_IO_PENDING && error != ERROR_PIPE_CONNECTED) {
-      operation->complete = true;
-      operation->error = error;
-      operation->poisoned = true;
-      runControlForget(operation);
-      throw NativeError{"run_control_accept_unknown", error, "accept"};
-    }
-    if (!connected && error == ERROR_IO_PENDING) {
-      lock.unlock();
-      auto wait = runControlWaitOperation(*operation, timeout);
-      // The owner pump has no request deadline while waiting for a client.
-      // Keep the same held HANDLE and OVERLAPPED across idle observation ticks.
-      // Shutdown still enters the existing cancel-and-drain path within a tick;
-      // explicit low-level accept requests retain their bounded timeout.
-      while (!wait.completed && retainIdleWait && !requestPumpStop_ && !shutdown_)
-        wait = runControlWaitOperation(*operation, timeout);
-      if (!wait.completed) {
-        const auto cancelled = runControlCancelAndDrain(*operation);
-        lock.lock();
-        if (!operation->complete) {
-          if (!cancelled.completed) {
-            operation->unresolved = operation->poisoned = true;
-            if (listener_)
-              listener_->poisoned = true;
-            runControlForget(operation);
-            throw NativeError{"cleanup_unknown", ERROR_OPERATION_ABORTED, "accept"};
-          }
-          operation->complete = true;
-          operation->transferred = cancelled.transferred;
-          operation->error = cancelled.error;
-        }
+      BOOL connected = ConnectNamedPipe(operation->issuingHandle.value, &operation->overlap);
+      DWORD error = connected ? ERROR_SUCCESS : GetLastError();
+      operation->issued = true;
+      if (!connected && error != ERROR_IO_PENDING && error != ERROR_PIPE_CONNECTED) {
+        operation->complete = true;
+        operation->error = error;
         operation->poisoned = true;
-        if (listener_)
-          listener_->poisoned = true;
         runControlForget(operation);
-        throw NativeError{"run_control_accept_timeout", ERROR_OPERATION_ABORTED, "accept"};
+        // ERROR_NO_DATA: the offered instance saw its only client arrive and
+        // leave before this listen was issued. The instance is spent, never
+        // the listener: offer a fresh one and retry inside the same budget.
+        if (error == ERROR_NO_DATA) {
+          runControlOfferPending();
+          require(listener_ && !shutdown_ && (!retainIdleWait || !requestPumpStop_),
+                  "run_control_accept_timeout");
+          require(retainIdleWait || runControlRemaining(acceptDeadline) > 0,
+                  "run_control_accept_timeout");
+          continue;
+        }
+        throw NativeError{"run_control_accept_unknown", error, "accept"};
       }
-      lock.lock();
-      if (shutdown_ || operation->poisoned) {
+      if (!connected && error == ERROR_IO_PENDING) {
+        lock.unlock();
+        auto wait = runControlWaitOperation(*operation, timeout);
+        // The owner pump has no request deadline while waiting for a client.
+        // Keep the same held HANDLE and OVERLAPPED across idle observation ticks.
+        // Shutdown still enters the existing cancel-and-drain path within a tick;
+        // explicit low-level accept requests retain their bounded timeout.
+        while (!wait.completed && retainIdleWait && !requestPumpStop_ && !shutdown_)
+          wait = runControlWaitOperation(*operation, timeout);
+        if (!wait.completed) {
+          const auto cancelled = runControlCancelAndDrain(*operation);
+          lock.lock();
+          if (!operation->complete) {
+            if (!cancelled.completed) {
+              operation->unresolved = operation->poisoned = true;
+              if (listener_)
+                listener_->poisoned = true;
+              runControlForget(operation);
+              throw NativeError{"cleanup_unknown", ERROR_OPERATION_ABORTED, "accept"};
+            }
+            operation->complete = true;
+            operation->transferred = cancelled.transferred;
+            operation->error = cancelled.error;
+          }
+          operation->poisoned = true;
+          if (listener_)
+            listener_->poisoned = true;
+          runControlForget(operation);
+          throw NativeError{"run_control_accept_timeout", ERROR_OPERATION_ABORTED, "accept"};
+        }
+        lock.lock();
+        if (shutdown_ || operation->poisoned) {
+          runControlForget(operation);
+          throw NativeError{"run_control_accept_timeout", ERROR_OPERATION_ABORTED, "accept"};
+        }
+        operation->transferred = wait.transferred;
+        operation->error = wait.error;
+      }
+      // A completed listen carrying the same spent-instance report takes the
+      // identical replenish-and-retry path.
+      if (operation->error == ERROR_NO_DATA) {
+        operation->complete = true;
+        operation->poisoned = true;
         runControlForget(operation);
-        throw NativeError{"run_control_accept_timeout", ERROR_OPERATION_ABORTED, "accept"};
+        runControlOfferPending();
+        require(listener_ && !shutdown_ && (!retainIdleWait || !requestPumpStop_),
+                "run_control_accept_timeout");
+        require(retainIdleWait || runControlRemaining(acceptDeadline) > 0,
+                "run_control_accept_timeout");
+        continue;
       }
-      operation->transferred = wait.transferred;
-      operation->error = wait.error;
+      require(operation->error == ERROR_SUCCESS, "run_control_accept_unknown");
+      operation->complete = true;
+      Handle accepted = std::move(operation->issuingHandle);
+      runControlForget(operation);
+
+      // The accepted instance remains connected and owned by the registry; no
+      // DisconnectNamedPipe call destroys the accepted endpoint. Its fresh
+      // listening replacement is offered before any fallible connection work, so
+      // a refused handshake can never leave the listener without an instance.
+      if (phase) *phase = "accept_replenish";
+      runControlReapCompleted();
+      runControlOfferPending();
+
+      if (phase) *phase = "accept_authenticate";
+      auto connection = runControlMakeConnection(std::move(accepted), Role::server, timeout);
+      connection->endpoint = listener_->name;
+      runControlAuthenticate(*connection);
+      const auto id = connection->id;
+      registry_.emplace(id, std::move(connection));
+      JsonObject result;
+      num(result, L"id", id);
+      return result;
     }
-    require(operation->error == ERROR_SUCCESS, "run_control_accept_unknown");
-    operation->complete = true;
-    Handle accepted = std::move(operation->issuingHandle);
-    runControlForget(operation);
-
-    // The accepted instance remains connected and owned by the registry; no
-    // DisconnectNamedPipe call destroys the accepted endpoint. Its fresh
-    // listening replacement is offered before any fallible connection work, so
-    // a refused handshake can never leave the listener without an instance.
-    if (phase) *phase = "accept_replenish";
-    runControlReapCompleted();
-    runControlOfferPending();
-
-    if (phase) *phase = "accept_authenticate";
-    auto connection = runControlMakeConnection(std::move(accepted), Role::server, timeout);
-    connection->endpoint = listener_->name;
-    runControlAuthenticate(*connection);
-    const auto id = connection->id;
-    registry_.emplace(id, std::move(connection));
-    JsonObject result;
-    num(result, L"id", id);
-    return result;
   }
 
   JsonObject read(const JsonObject &input) {
