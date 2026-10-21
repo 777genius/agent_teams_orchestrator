@@ -257,13 +257,24 @@ struct WindowsNativeRunControl {
     const DWORD timeout = runControlTimeoutMs(input, L"timeoutMs");
     if (deadline == 0) deadline = GetTickCount64() + timeout;
     Handle pipe;
-    for (;;) {
-      require(runControlRemaining(deadline) > 0, "run_deadline_expired");
+    for (DWORD connectError = ERROR_SUCCESS;;) {
+      // Budget expiry publishes the LAST observed endpoint condition, never an
+      // ambiguous generic token: a pipe object absent for the whole budget means
+      // no listener ever offered one, a saturated pool kept every instance busy,
+      // and no attempt at all is idle. No errno text or endpoint is published.
+      if (runControlRemaining(deadline) == 0) {
+        if (connectError == ERROR_FILE_NOT_FOUND)
+          throw NativeError{"run_control_connect_no_listener_expired"};
+        if (connectError == ERROR_PIPE_BUSY || connectError == ERROR_SEM_TIMEOUT)
+          throw NativeError{"run_control_connect_busy_timeout_expired"};
+        throw NativeError{"run_control_connect_idle_expired"};
+      }
       const HANDLE raw = CreateFileW(endpoint.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
                                      OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
       const DWORD error = raw == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
       pipe = Handle(raw);
       if (pipe) break;
+      connectError = error;
       // A saturated or momentarily absent endpoint is a wait inside the same
       // deadline, never a refusal; only an unexpected errno publishes the
       // closed connect failure.
@@ -271,13 +282,14 @@ struct WindowsNativeRunControl {
           error != ERROR_FILE_NOT_FOUND)
         throw NativeError{"run_control_connect_unknown", error, "connect"};
       const DWORD remaining = runControlRemaining(deadline);
-      require(remaining > 0, "run_deadline_expired");
+      if (remaining == 0) continue;
       // Another client can win the next open; wait only for this same endpoint
       // and consume the original budget before any request bytes are submitted.
       if (!WaitNamedPipeW(endpoint.c_str(), remaining)) {
         const DWORD waitError = GetLastError();
         if (waitError != ERROR_SEM_TIMEOUT && waitError != ERROR_FILE_NOT_FOUND)
           throw NativeError{"run_control_connect_unknown", waitError, "connect"};
+        connectError = waitError;
         // A missing endpoint is momentarily absent rather than refused; poll
         // the same deadline instead of expiring the caller on that absence.
         if (waitError == ERROR_FILE_NOT_FOUND)

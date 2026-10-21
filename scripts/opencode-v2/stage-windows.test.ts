@@ -280,18 +280,20 @@ test('run control connect keeps its deadline while the endpoint is transiently a
   const { runInNewContext } = await import('node:vm')
   const header = path.resolve(import.meta.dir, '../../src/services/opencode/host/windows/WindowsNativeRunControl.hpp')
   const source = (await readFile(header, 'utf8')).replaceAll('\r\n', '\n')
-  const begin = source.indexOf('    Handle pipe;\n    for (;;) {')
+  const begin = source.indexOf('    Handle pipe;\n    for (')
   expect(begin).toBeGreaterThanOrEqual(0)
-  const loopStart = source.indexOf('for (;;) {', begin)
+  const loopStart = source.indexOf('for (', begin)
   const end = source.indexOf('\n    }\n', loopStart)
   expect(end).toBeGreaterThan(loopStart)
   const body = source.slice(loopStart, end + '\n    }'.length)
+    .replaceAll('for (DWORD connectError = ERROR_SUCCESS;;)', 'for (let connectError = ERROR_SUCCESS;;)')
     .replaceAll('const HANDLE raw =', 'const raw =')
     .replaceAll('const DWORD error =', 'const error =')
     .replaceAll('const DWORD remaining =', 'const remaining =')
     .replaceAll('const DWORD waitError =', 'const waitError =')
     .replaceAll('throw NativeError{', 'throw nativeError(')
     .replaceAll('"connect"};', '"connect");')
+    .replaceAll('"};', '");')
     .replaceAll('.c_str()', '')
     .replaceAll('nullptr', 'null')
     .replaceAll('L"', '"')
@@ -349,13 +351,37 @@ test('run control connect keeps its deadline while the endpoint is transiently a
   expect(state.opens).toEqual([ERROR_FILE_NOT_FOUND, 0])
   expect(state.slept).toEqual([10])
 
-  // An exhausted budget reports the deadline token, never connect unknown.
+  // An exhausted budget reports the LAST endpoint condition seen, never the
+  // ambiguous deadline word or a connect unknown refusal.
   reset()
   plan.open = [ERROR_PIPE_BUSY]
   plan.wait = [[0, ERROR_SEM_TIMEOUT, 2000]]
   let caught: unknown
   try { connect(endpoint, 3000) } catch (error) { caught = error }
-  expect((caught as Error).message).toBe('run_deadline_expired')
+  expect((caught as Error).message).toBe('run_control_connect_busy_timeout_expired')
+
+  // A pipe object absent for the whole budget is a dead or never created
+  // listener, its own closed expiry rather than a saturation timeout.
+  reset()
+  plan.open = [ERROR_FILE_NOT_FOUND]
+  plan.wait = [[0, ERROR_FILE_NOT_FOUND, 2000]]
+  try { connect(endpoint, 3000) } catch (error) { caught = error }
+  expect((caught as Error).message).toBe('run_control_connect_no_listener_expired')
+
+  // Only the last observed endpoint condition classifies the expiry: an early
+  // absence never masks a later saturation.
+  reset()
+  plan.open = [ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY]
+  plan.wait = [[0, ERROR_FILE_NOT_FOUND, 0], [0, ERROR_SEM_TIMEOUT, 2000]]
+  try { connect(endpoint, 3000) } catch (error) { caught = error }
+  expect((caught as Error).message).toBe('run_control_connect_busy_timeout_expired')
+
+  // A deadline spent before the first attempt is idle; no endpoint condition
+  // was ever observed and no open is attempted.
+  reset()
+  try { connect(endpoint, 1000) } catch (error) { caught = error }
+  expect((caught as Error).message).toBe('run_control_connect_idle_expired')
+  expect(state.opens).toEqual([])
 
   // A true refusal still publishes the closed connect code with its native errno.
   reset()
@@ -365,6 +391,8 @@ test('run control connect keeps its deadline while the endpoint is transiently a
   expect((caught as { code: string }).code).toBe('run_control_connect_unknown')
   expect((caught as { win32: number }).win32).toBe(ERROR_ACCESS_DENIED)
   expect(state.waits).toEqual([])
+  // The split retires the ambiguous deadline token from the native header.
+  expect(source).not.toContain('"run_deadline_expired"')
 })
 
 test('run control listener always offers a fresh instance and survives connection refusals', async () => {
