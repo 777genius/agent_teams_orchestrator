@@ -212,8 +212,10 @@ export function buildWindowsTeardownCommand(root, diagnosticPids = []) {
   // PIDs select bounded diagnostics only; they never confer ownership.
   const candidates = diagnosticPids.filter(pid => Number.isSafeInteger(pid) && pid > 0 && pid <= 0x7fffffff).slice(0, 8);
   return String.raw`
-[Console]::Error.WriteLine('teardown: started')
 $ErrorActionPreference = 'Stop'
+# Node decodes both redirected streams as UTF-8; retain exact Unicode identity paths.
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+[Console]::Error.WriteLine('teardown: started')
 # Direct stderr markers need no modules and survive a later import/query timeout.
 [Console]::Error.WriteLine('teardown: before import Microsoft.PowerShell.Management')
 Import-Module Microsoft.PowerShell.Management -ErrorAction Stop
