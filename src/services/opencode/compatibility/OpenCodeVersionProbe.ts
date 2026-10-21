@@ -87,6 +87,8 @@ export function versionAcquisitionMs(platform: NodeJS.Platform = process.platfor
 }
 /** Ownership cleanup keeps at least 3 s after acquisition. */
 export const VERSION_CLEANUP_MS = 3_000
+/** A raced capture-validation may recapture at most this often. */
+export const PARENT_IDENTITY_CAPTURES = 3
 
 type Member = NativeRow & { group: number | null; retired: boolean }
 // An observation deadline is not a retirement receipt. Keep unresolved owners
@@ -320,48 +322,77 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
           await ports.sleep(Math.min(25, cap()))
           continue
         }
-        const capturedAdditions: Member[] = []
-        const additionBirths = new Map<number, number>()
-        phase = 'addition_identity'
-        for (const row of additions) {
-          if (row.pid === process.pid || row.pid === process.ppid) throw cleanupUnknown('protected_addition')
-          const identity = await birth(row.pid)
-          if (identity === null) {
-            if (ports.alive(row.pid) !== 'gone') throw cleanupUnknown('identity_missing')
-            cap()
-            unownedCandidates.add(row.pid)
-            continue
-          }
-          additionBirths.set(row.pid, identity)
-          capturedAdditions.push(row)
-        }
         // Native census order does not guarantee parents precede children.
         // Validate the complete capture before publishing any signal authority.
-        for (const row of capturedAdditions) {
-          const parentBirth = process.platform === 'win32'
-            ? births.get(row.ppid) ?? additionBirths.get(row.ppid) : births.get(anchor!.pid)
-          const identity = additionBirths.get(row.pid)!
-          if (parentBirth === undefined || identity < parentBirth) {
-            // Explain this refusal using only the already captured census and
-            // births. No further OS reads confer ownership or signal authority.
-            const ancestry: Array<ParentIdentityDiagnostic['ancestry'][number]> = []
-            const seen = new Set<number>()
-            let ancestor: Member | undefined = row
-            while (ancestor && ancestry.length < 8 && !seen.has(ancestor.pid)) {
-              seen.add(ancestor.pid)
-              ancestry.push({ pid: ancestor.pid, ppid: ancestor.ppid,
-                capturedBirth: births.get(ancestor.pid) ?? null, censusIndex: rows.indexOf(ancestor) })
-              ancestor = ancestor.pid === pid ? undefined : rows.find(current => current.pid === ancestor!.ppid)
+        // A native capture can also race the parents' identity reads, so an
+        // unconfirmed batch is recaptured with its parents inside the capture
+        // window at most PARENT_IDENTITY_CAPTURES times before the refusal.
+        let capturedAdditions: Member[] = []
+        const additionBirths = new Map<number, number>()
+        let parentIdentity: ParentIdentityDiagnostic | undefined
+        let captureRows = rows, captureAdditions = additions
+        for (let attempt = 1;; attempt++) {
+          capturedAdditions = []
+          additionBirths.clear()
+          phase = 'addition_identity'
+          for (const row of captureAdditions) {
+            if (row.pid === process.pid || row.pid === process.ppid) throw cleanupUnknown('protected_addition')
+            const identity = await birth(row.pid)
+            if (identity === null) {
+              if (ports.alive(row.pid) !== 'gone') throw cleanupUnknown('identity_missing')
+              cap()
+              unownedCandidates.add(row.pid)
+              continue
             }
-            const parentPid = process.platform === 'win32' ? row.ppid : anchor!.pid
-            throw cleanupUnknown('parent_identity', {
-              reason: parentBirth === undefined ? 'missing_parent_birth' : 'child_before_parent',
-              pid: row.pid, ppid: row.ppid, parentPid, childBirth: identity, parentBirth: parentBirth ?? null,
-              parentCandidate: unownedCandidates.has(parentPid), anchorPid: anchor!.pid,
-              additionIndex: additions.indexOf(row), ancestry, ancestryTruncated: ancestor !== undefined,
-            })
+            additionBirths.set(row.pid, identity)
+            capturedAdditions.push(row)
           }
+          parentIdentity = undefined
+          for (const row of capturedAdditions) {
+            const parentBirth = process.platform === 'win32'
+              ? births.get(row.ppid) ?? additionBirths.get(row.ppid) : births.get(anchor!.pid)
+            const identity = additionBirths.get(row.pid)!
+            if (parentBirth === undefined || identity < parentBirth) {
+              // Explain this refusal using only the already captured census and
+              // births. No further OS reads confer ownership or signal authority.
+              const ancestry: Array<ParentIdentityDiagnostic['ancestry'][number]> = []
+              const seen = new Set<number>()
+              let ancestor: Member | undefined = row
+              while (ancestor && ancestry.length < 8 && !seen.has(ancestor.pid)) {
+                seen.add(ancestor.pid)
+                ancestry.push({ pid: ancestor.pid, ppid: ancestor.ppid,
+                  capturedBirth: births.get(ancestor.pid) ?? null, censusIndex: captureRows.indexOf(ancestor) })
+                ancestor = ancestor.pid === pid ? undefined : captureRows.find(current => current.pid === ancestor!.ppid)
+              }
+              const parentPid = process.platform === 'win32' ? row.ppid : anchor!.pid
+              parentIdentity = {
+                reason: parentBirth === undefined ? 'missing_parent_birth' : 'child_before_parent',
+                pid: row.pid, ppid: row.ppid, parentPid, childBirth: identity, parentBirth: parentBirth ?? null,
+                parentCandidate: unownedCandidates.has(parentPid), anchorPid: anchor!.pid,
+                additionIndex: captureAdditions.indexOf(row), ancestry, ancestryTruncated: ancestor !== undefined,
+              }
+              break
+            }
+          }
+          if (!parentIdentity || attempt >= PARENT_IDENTITY_CAPTURES) break
+          // Unreliable birth data: recapture only while a fresh full census
+          // still shows the captured rows and their parents inside the window.
+          const retryRows = await table()
+          const windowed = capturedAdditions.every(row => {
+            const parentPid = process.platform === 'win32' ? row.ppid : anchor!.pid
+            return retryRows.some(current => current.pid === row.pid && current.ppid === row.ppid) &&
+              (births.has(parentPid) || retryRows.some(current => current.pid === parentPid))
+          })
+          if (!windowed) break
+          captureRows = retryRows
+          captureAdditions = members(retryRows).filter(row => !births.has(row.pid))
         }
+        if (parentIdentity) {
+          phase = 'addition_identity'
+          throw cleanupUnknown('parent_identity', parentIdentity)
+        }
+        // A genealogy confirmed by recapture is no longer census-only.
+        for (const row of capturedAdditions) unownedCandidates.delete(row.pid)
         for (const [target, identity] of additionBirths) births.set(target, identity)
         if (additions.length) {
           const confirmationRows = await table()
