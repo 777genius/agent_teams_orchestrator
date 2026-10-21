@@ -272,7 +272,10 @@ export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, 
         // Only known bounded stop uncertainty is reported as cleanup unknown.
         // Foreign/framing/identity faults and unexpected errors still propagate.
         if (!isTransientOpenCodeV2ControlRead(error) && !(error instanceof Error &&
-          ['probe_physical_cleanup_unknown', 'run_deadline_expired', 'run_operation_unknown'].includes(error.message))) throw error
+          ['probe_physical_cleanup_unknown', 'run_control_client_budget_exhausted',
+            'run_control_connect_busy_timeout_expired', 'run_control_connect_idle_expired',
+            'run_control_connect_no_listener_expired', 'run_deadline_expired',
+            'run_operation_unknown', 'run_state_wall_deadline_expired'].includes(error.message))) throw error
         return { state: 'failed' as const, proof: null, reason: `${original.failure}; probe_physical_cleanup_unknown` }
       }
       original.retired = true; await save(original)

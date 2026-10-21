@@ -1432,7 +1432,7 @@ try{
   ||expected==='config_identity'&&phase==='config'&&/^run_control_config_identity(?::[a-z_]+:\\d+)?$/.test(message)
  if(refused)outcome={expected,refused:true,selectedProfiles:1}
  else{
-  const codes=['execution_owner_not_private','execution_path_alias','execution_native_timeout','execution_native_unknown','cleanup_unknown','run_control_held_inputs','run_control_held_identity','run_control_config_identity','run_control_selection_changed','run_control_peer_identity','run_control_parent_join','run_control_connect_unknown','run_control_timeout']
+  const codes=['execution_owner_not_private','execution_path_alias','execution_native_timeout','execution_native_unknown','cleanup_unknown','run_control_held_inputs','run_control_held_identity','run_control_config_identity','run_control_selection_changed','run_control_peer_identity','run_control_parent_join','run_control_client_budget_exhausted','run_control_connect_busy_timeout_expired','run_control_connect_idle_expired','run_control_connect_no_listener_expired','run_control_connect_unknown','run_control_timeout','run_state_wall_deadline_expired']
   const code=/^([a-z_]+)(?::[a-z_]+:[0-9]{1,10})?$/.exec(message)?.[1]
   const operations=['selfImageCustody','runStateSelect','ownerValidateSelectedProfile','ownerSelectConfig','runStateDiscover','runStateProcessIdentity','runStateRequest']
   outcome={expected,phase,errorCode:codes.find(value=>value===code)??null,nativeOperation:operations.find(value=>value===error?.nativeOperation)??null};failed=true
