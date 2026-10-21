@@ -1254,10 +1254,11 @@ static_assert(offsetof(AnchorV1, ntPath) == 16, "AnchorV1 ntPath offset changed"
 static_assert(offsetof(AnchorV1, ntChars) == 24, "AnchorV1 ntChars offset changed");
 static_assert(offsetof(AnchorV1, volumeSerial) == 32, "AnchorV1 volumeSerial offset changed");
 static_assert(offsetof(AnchorV1, fileId) == 40, "AnchorV1 fileId offset changed");
-static_assert(sizeof(ErrorV1) == 8, "ErrorV1 ABI layout changed");
+static_assert(sizeof(ErrorV1) == 12, "ErrorV1 ABI layout changed");
 static_assert(alignof(ErrorV1) == 4, "ErrorV1 ABI alignment changed");
 static_assert(offsetof(ErrorV1, operation) == 0, "ErrorV1 operation offset changed");
 static_assert(offsetof(ErrorV1, win32) == 4, "ErrorV1 win32 offset changed");
+static_assert(offsetof(ErrorV1, anchorIndex) == 8, "ErrorV1 anchorIndex offset changed");
 #endif
 
 }  // namespace opencode_v2::windows_realpath
