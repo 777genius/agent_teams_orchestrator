@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -21,6 +21,14 @@ const backfillCases = [
   ['ascii', 'direct'], ['with spaces', 'direct'], ['Юникод 世界', 'direct'],
   ['Юникод 世界 cmd', 'app-exe-fallback'],
 ];
+
+export function assertBackfillCasePath(root, shape, binary) {
+  const suffix = path.relative(root, binary);
+  assert.ok(suffix && suffix !== '..' && !suffix.startsWith(`..${path.sep}`) && !path.isAbsolute(suffix),
+    'Case executable must remain inside the owned smoke root');
+  // Case names describe our owned suffix; canonical runner ancestors may contain spaces or Unicode.
+  if (shape === 'ascii') assert.match(suffix, /^[\x21-\x7e]+$/, 'ASCII case needs an ASCII owned suffix without spaces');
+}
 
 export function fixtureScriptPaths(root) {
   return ['', ...backfillCases.map(([shape]) => shape)]
@@ -69,7 +77,9 @@ export function sandboxEnvironment(root, fakeBinary) {
   };
   for (const [key, relative] of Object.entries(dirs)) {
     env[key] = path.join(root, relative);
-    mkdirSync(env[key], { recursive: true });
+    // The delivered runtime creates its SDK data root through the native owner
+    // boundary. An existing root is validated there, never repaired by a fixture.
+    if (key !== 'CLAUDE_MULTIMODEL_DATA_HOME') mkdirSync(env[key], { recursive: true });
   }
   const homeRoot = path.parse(env.HOME).root;
   env.HOMEDRIVE = homeRoot.replace(/[\\/]$/, '');
@@ -202,8 +212,10 @@ export function buildWindowsTeardownCommand(root, diagnosticPids = []) {
   // PIDs select bounded diagnostics only; they never confer ownership.
   const candidates = diagnosticPids.filter(pid => Number.isSafeInteger(pid) && pid > 0 && pid <= 0x7fffffff).slice(0, 8);
   return String.raw`
-[Console]::Error.WriteLine('teardown: started')
 $ErrorActionPreference = 'Stop'
+# Node decodes both redirected streams as UTF-8; retain exact Unicode identity paths.
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+[Console]::Error.WriteLine('teardown: started')
 # Direct stderr markers need no modules and survive a later import/query timeout.
 [Console]::Error.WriteLine('teardown: before import Microsoft.PowerShell.Management')
 Import-Module Microsoft.PowerShell.Management -ErrorAction Stop
@@ -395,7 +407,8 @@ export function runBackfillSmoke(binaryInput, evidenceInput, { report: suppliedR
     cases: [], passed: false });
   const flush = suppliedFlush || (() => writeFileSync(evidencePath, JSON.stringify(report, null, 2) + '\n'));
   flush();
-  const root = mkdtempSync(path.join(os.tmpdir(), 'backfill-exe-'));
+  // The native API also expands Windows 8.3 names; the JS walk only resolves links.
+  const root = realpathSync.native(mkdtempSync(path.join(os.tmpdir(), 'backfill-exe-')));
   try {
     for (const [shape, transport] of backfillCases) {
       const item = { shape, transport, invocations: [], passed: false };
@@ -407,7 +420,7 @@ export function runBackfillSmoke(binaryInput, evidenceInput, { report: suppliedR
         const projectDir = path.join(caseRoot, 'ledger-project');
         for (const dir of [binaryDir, projectPath, projectDir]) mkdirSync(dir, { recursive: true });
         const binary = path.join(binaryDir, 'runtime.exe');
-        if (shape === 'ascii') assert.match(binary, /^[\x21-\x7e]+$/, 'ASCII case needs an ASCII temp root without spaces');
+        assertBackfillCasePath(root, shape, binary);
         stageRuntimeDelivery(runtimeBinary, binaryDir);
         item.executableSha256 = sha256(readFileSync(binary));
         assert.equal(item.executableSha256, report.executableSha256);
