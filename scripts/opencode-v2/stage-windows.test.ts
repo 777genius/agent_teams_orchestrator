@@ -67,6 +67,138 @@ test('native directory alias predicate source preserves short circuit and closed
   expect(readWindowsNativeAliasFailure(decodeWindowsNativeFailure({ ...reply, alias: { ...reply.alias, path: 'SECRET' } }, 'runStateSelect'))).toBeUndefined()
 })
 
+test('machine realpath anchor chains open their final object leaf-first', async () => {
+  const { runInNewContext } = await import('node:vm')
+  const realpath = path.resolve(import.meta.dir, '../../src/services/opencode/host/windows/WindowsNativeRealpath.hpp')
+  const source = (await readFile(realpath, 'utf8')).replaceAll('\r\n', '\n')
+  const body = (from: string) => {
+    const begin = source.indexOf(from)
+    expect(begin).toBeGreaterThanOrEqual(0)
+    const end = source.indexOf('\n}\n', begin)
+    expect(end).toBeGreaterThan(begin)
+    return source.slice(begin + from.length, end)
+  }
+  const js = (text: string) => text
+    .replaceAll('wchar_t system[32768];', 'const system = [];')
+    .replaceAll('std::wstring_view(system, size)', "system.join('')")
+    .replaceAll('const std::wstring_view component =', 'const component =')
+    .replaceAll('const std::vector<std::wstring> ', 'const ')
+    .replaceAll('const std::wstring ', 'const ')
+    .replaceAll('const size_t ', 'const ')
+    .replaceAll('const DWORD ', 'const ')
+    .replaceAll('const UINT ', 'const ')
+    .replaceAll('const bool ', 'const ')
+    .replaceAll('const full(path);', 'const full = path;')
+    .replaceAll('HANDLE raw =', 'const raw =')
+    .replaceAll('std::wstring_view()', "''")
+    .replaceAll('.c_str()', '')
+    .replaceAll('nullptr', 'null')
+    .replaceAll("L'\\\\'", "'\\\\'")
+    .replaceAll('L"', '"')
+    .replaceAll('.substr(', '.substring(')
+    .replaceAll('.size()', '.length')
+  const lastNtComponent = (text: string) => text.substring(text.lastIndexOf('\\') + 1)
+  const openedPath = () => {
+    const handles = [] as unknown[] & { back?: () => unknown }
+    handles.back = () => handles[handles.length - 1]
+    return { handles, identities: [] as unknown[] }
+  }
+
+  // The admission branch itself: machine chains skip the held component walk
+  // and open their final object in one parse, while caller roots walk as before.
+  const checked = js(body(['inline bool openCheckedPath(std::wstring_view path, bool finalDirectory, DWORD finalShare,',
+    '                            Operation openStage, Operation componentStage,',
+    '                            OpenedPath& opened, Failure& failureOut) {'].join('\n')))
+  const calls = { create: [] as unknown[][], relative: 0, admits: [] as unknown[][], failure: undefined as unknown }
+  const context = {
+    validateCanonicalInput: () => true, driveRoot: (value: string) => value.substring(0, 3),
+    GetDriveTypeW: () => 3, DRIVE_FIXED: 3, machineChainPath: (full: string) =>
+      full.toLowerCase().startsWith('c:\\windows\\system32'),
+    splitDos: (value: string) => value.length <= 3 ? [] : value.substring(3).split('\\'), kMaxHeldHandles: 16384,
+    FILE_SHARE_READ: 1, FILE_SHARE_WRITE: 2, FILE_READ_ATTRIBUTES: 0x80, SYNCHRONIZE: 0x100000,
+    OPEN_EXISTING: 3, FILE_FLAG_BACKUP_SEMANTICS: 0x02000000, FILE_FLAG_OPEN_REPARSE_POINT: 0x00200000,
+    INVALID_HANDLE_VALUE: -1, GetLastError: () => 5,
+    CreateFileW: (target: string, access: number, share: number) => {
+      calls.create.push([target, access, share]); return 7 },
+    Handle: (raw: number) => ({ raw, get: () => raw }), lastNtComponent,
+    admitOpenedObject: (handle: unknown, directory: boolean, expected: string,
+      _objectStage: unknown, _componentStage: unknown, opened: { handles: unknown[]; identities: unknown[] }) => {
+      calls.admits.push([expected, directory]); opened.handles.push(handle); opened.identities.push({}); return true },
+    openHeldRelativeChain: () => { calls.relative++; return true },
+    failure: (status: string, operation: string, win32: number) =>
+      (calls.failure = { status, operation, win32 }), REJECTED: 'rejected',
+    invalid: (operation: string) => (calls.failure = { status: 'invalid', operation }),
+    denied: (operation: string) => (calls.failure = { status: 'rejected', operation, win32: 5 }),
+    machine: openedPath(), plain: openedPath(), deniedOpen: openedPath(),
+    machineOpened: true,
+  }
+  const openCheckedPath = runInNewContext(
+    `(function () {function openCheckedPath(path, finalDirectory, finalShare, openStage, componentStage, opened, failureOut) {${checked}\n};return openCheckedPath;})()`,
+    context) as (...args: unknown[]) => boolean
+
+  expect(openCheckedPath('C:\\Windows\\System32', true, 3, 'openAnchor', 'anchorComponent',
+    context.machine, undefined)).toBe(true)
+  expect(calls.create).toEqual([['\\\\?\\C:\\Windows\\System32', 0x80 | 0x100000, 3]])
+  expect(calls.relative).toBe(0) // No drive root and no intermediate component is ever opened.
+  expect(calls.admits).toEqual([['System32', true]])
+
+  calls.create.length = 0; calls.admits.length = 0
+  expect(openCheckedPath('D:\\a\\_temp\\profile', true, 3, 'openAnchor', 'anchorComponent',
+    context.plain, undefined)).toBe(true)
+  expect(calls.create).toEqual([['\\\\?\\D:\\', 0x80, 3]])
+  expect(calls.relative).toBe(1) // Caller roots keep the held component chain.
+  expect(calls.admits).toEqual([['', true]]) // The chain walk admits its drive root without a name.
+
+  // A refused machine leaf keeps the anchor-scoped closed operation of the object.
+  context.CreateFileW = () => -1
+  expect(openCheckedPath('C:\\Windows\\System32', true, 3, 'openAnchor', 'anchorComponent',
+    context.deniedOpen, undefined)).toBe(false)
+  expect(calls.failure).toEqual({ status: 'rejected', operation: 'openAnchor', win32: 5 })
+})
+
+test('machine chain predicate keys on the system directory with a closed boundary', async () => {
+  const { runInNewContext } = await import('node:vm')
+  const realpath = path.resolve(import.meta.dir, '../../src/services/opencode/host/windows/WindowsNativeRealpath.hpp')
+  const source = (await readFile(realpath, 'utf8')).replaceAll('\r\n', '\n')
+  const body = (from: string) => {
+    const begin = source.indexOf(from)
+    expect(begin).toBeGreaterThanOrEqual(0)
+    const end = source.indexOf('\n}\n', begin)
+    expect(end).toBeGreaterThan(begin)
+    return source.slice(begin + from.length, end)
+  }
+  const js = (text: string) => text
+    .replaceAll('wchar_t system[32768];', 'const system = [];')
+    .replaceAll('std::wstring_view(system, size)', "system.join('')")
+    .replaceAll('const UINT size', 'const size')
+    .replaceAll("L'\\\\'", "'\\\\'")
+    .replaceAll('L"', '"')
+    .replaceAll('.substr(', '.substring(')
+    .replaceAll('.size()', '.length')
+  let systemDirectory: string | undefined = 'C:\\Windows\\System32'
+  const context = {
+    GetSystemDirectoryW: (buffer: string[]) => {
+      if (systemDirectory === undefined) return 0
+      buffer.push(...systemDirectory); return buffer.length },
+    compareOrdinal: (left: string, right: string, ignoreCase: boolean) => {
+      const compared = ignoreCase ? left.toLowerCase().localeCompare(right.toLowerCase()) : left.localeCompare(right)
+      return compared === 0 ? 2 : compared < 0 ? 1 : 3 },
+    CSTR_EQUAL: 2,
+  }
+  const predicate = runInNewContext(
+    `(function () {function ntPrefixContains(value, prefix) {${js(body('inline bool ntPrefixContains(std::wstring_view value, std::wstring_view prefix) noexcept {'))}\n}\n` +
+    `function machineChainPath(full) {${js(body('inline bool machineChainPath(std::wstring_view full) {'))}\n};return machineChainPath;})()`,
+    context) as (full: string) => boolean
+  expect(predicate('C:\\Windows\\System32')).toBe(true)
+  expect(predicate('C:\\Windows\\System32\\cmd.exe')).toBe(true)
+  expect(predicate('c:\\windows\\system32\\CMD.EXE')).toBe(true)
+  expect(predicate('C:\\Windows\\System32x')).toBe(false) // Suffix names are never the machine chain.
+  expect(predicate('C:\\Windows')).toBe(false)
+  expect(predicate('D:\\a\\_temp\\profile')).toBe(false)
+  systemDirectory = undefined
+  expect(predicate('C:\\Windows\\System32')).toBe(false) // Unknown system directory falls back to the held chain.
+})
+
 test('native command liveness reuses one bounded complete proof only for stdio data', async () => {
   const { runInNewContext } = await import('node:vm')
   const windows = path.resolve(import.meta.dir, '../../src/services/opencode/host/windows')

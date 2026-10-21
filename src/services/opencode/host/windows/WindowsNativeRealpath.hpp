@@ -401,6 +401,18 @@ inline std::wstring_view lastNtComponent(std::wstring_view path) noexcept {
   return slash == std::wstring_view::npos ? path : path.substr(slash + 1);
 }
 
+// Machine-derived system directory: never a caller root. Its chain names are
+// opened leaf-first below, because the confined child can be denied outright on
+// the drive root or the intermediate directory while the final object still
+// passes every per-object check.
+inline bool machineChainPath(std::wstring_view full) {
+  wchar_t system[32768];
+  const UINT size = GetSystemDirectoryW(system, 32768);
+  if (size == 0 || size >= 32768)
+    return false;
+  return ntPrefixContains(full, std::wstring_view(system, size));
+}
+
 inline bool tailMatchesDos(std::wstring_view dosPath, std::wstring_view ntPath) {
   const std::vector<std::wstring> dosParts = splitDos(dosPath);
   const std::vector<std::wstring> ntParts = splitNt(ntPath);
@@ -644,6 +656,23 @@ inline bool openCheckedPath(std::wstring_view path, bool finalDirectory, DWORD f
   const std::wstring root = driveRoot(full);
   if (GetDriveTypeW(root.c_str()) != DRIVE_FIXED)
     return failureOut = denied(openStage), false;
+
+  // The machine chain admits its final object in one parse (bypass-traverse on
+  // the intermediates) with the identical per-object checks; caller roots keep
+  // the held component chain.
+  if (machineChainPath(full)) {
+    const std::wstring kernelPath = L"\\\\?\\" + full;
+    HANDLE raw = CreateFileW(kernelPath.c_str(), FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                             finalShare, nullptr, OPEN_EXISTING,
+                             FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                             nullptr);
+    if (raw == INVALID_HANDLE_VALUE) {
+      const DWORD code = GetLastError();
+      return failureOut = failure(REJECTED, openStage, code), false;
+    }
+    return admitOpenedObject(Handle(raw), finalDirectory, lastNtComponent(full),
+                             openStage, componentStage, opened, failureOut);
+  }
 
   const std::vector<std::wstring> parts = splitDos(full);
   const size_t objectCount = parts.size() + 1;
