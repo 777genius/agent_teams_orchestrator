@@ -111,6 +111,34 @@ test('catalog guard permits only exact read-only catalog/auth routes and rejects
     { allowed: false }, { allowed: false }, { allowed: false }]);
 });
 
+test('sandbox environment leaves fresh SDK data uncreated and preserves existing data ownership and contents', () => {
+  const root = realpathSync.native(mkdtempSync(path.join(os.tmpdir(), 'sdk-data-owner-')));
+  try {
+    const env = sandboxEnvironment(root, path.join(root, 'opencode.cmd'));
+    assert.equal(env.CLAUDE_MULTIMODEL_DATA_HOME, path.join(root, 'data'));
+    assert.equal(existsSync(env.CLAUDE_MULTIMODEL_DATA_HOME), false,
+      'The delivered runtime must create its SDK data root through its native ownership boundary');
+    for (const key of ['HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'TEMP',
+      'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME',
+      'CLAUDE_CONFIG_DIR', 'CLAUDE_MULTIMODEL_CACHE_HOME']) {
+      assert.equal(statSync(env[key]).isDirectory(), true, key + ' remains available to fixture children');
+    }
+    const existing = path.join(env.CLAUDE_MULTIMODEL_DATA_HOME, 'opencode');
+    mkdirSync(existing, { recursive: true });
+    const sentinel = path.join(existing, 'existing-owned-state.json');
+    const bytes = Buffer.from('{"preserve":"existing SDK state"}\n');
+    writeFileSync(sentinel, bytes);
+    const before = statSync(env.CLAUDE_MULTIMODEL_DATA_HOME);
+    const repeated = sandboxEnvironment(root, path.join(root, 'opencode.cmd'));
+    const after = statSync(repeated.CLAUDE_MULTIMODEL_DATA_HOME);
+    assert.equal(repeated.CLAUDE_MULTIMODEL_DATA_HOME, env.CLAUDE_MULTIMODEL_DATA_HOME);
+    assert.deepEqual(readFileSync(sentinel), bytes, 'Existing data must never be deleted or replaced');
+    for (const key of ['dev', 'ino', 'mode', 'uid', 'gid']) {
+      assert.equal(after[key], before[key], 'Existing data ' + key + ' must remain unchanged');
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test('runtime relocation preserves packaged Bun and executable physical graph across every path shape', () => {
   const root = mkdtempSync(path.join(os.tmpdir(), 'runtime-relocation-'));
   try {

@@ -1,12 +1,12 @@
 #!/usr/bin/env node
-// Diagnostic only: one native alias/canonical pair, then one complete corrected smoke.
+// Diagnostic only: native alias/canonical and Node/native owner pairs, then one complete corrected smoke.
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { appendFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const SOURCE = 'e1892ddd32230736c29469d5347a1b659cd49945';
 const [deliveryArg, smokeEntryArg, evidenceArg] = process.argv.slice(2);
@@ -112,6 +112,40 @@ async function run(label, executable, argv, cwd, env, input, timeoutMs, outputLi
   return item;
 }
 
+
+// Windows bridge probes deliberately retain registered V1 HTTP hosts until the
+// existing owned-fixture teardown. Its stdout lists terminated hosts, not survivors.
+function assertProviderFixtureTeardown(provider, root, pattern, startedAt) {
+  const stopped = JSON.parse(provider.teardown.stdout);
+  assert(Array.isArray(stopped) && stopped.length <= 3, 'Only the three provider host checks may require teardown');
+  const node = realpathSync.native(process.execPath), script = path.join(root, 'fake-opencode.cjs');
+  const seen = new Set(), probes = provider.probeInvocations.trim().split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line));
+  const parser = new RegExp(pattern);
+  for (const row of stopped) {
+    assert(row && typeof row === 'object' && !Array.isArray(row));
+    assert.deepEqual(Object.keys(row).sort(), ['commandLine', 'executable', 'pid', 'startedAt']);
+    assert(Number.isSafeInteger(row.pid) && row.pid > 0 && row.pid <= 0x7fffffff && !seen.has(row.pid), 'Unique positive owned fixture PID required');
+    seen.add(row.pid);
+    assert(typeof row.executable === 'string' && path.win32.isAbsolute(row.executable) && samePath(row.executable, node), 'Teardown must identify the exact known Node executable');
+    assert(typeof row.commandLine === 'string' && row.commandLine.length <= 4096);
+    const match = parser.exec(row.commandLine); assert(match?.groups, 'Pinned Windows Node/script parser must match');
+    const command = match.groups.quotedExe ?? match.groups.bareExe;
+    const selectedScript = match.groups.quotedScript ?? match.groups.bareScript;
+    assert(['node', 'node.exe'].includes(command.toLowerCase()) || path.win32.isAbsolute(command) && samePath(command, node));
+    assert(path.win32.isAbsolute(selectedScript) && path.win32.normalize(selectedScript) === selectedScript && samePath(selectedScript, script), 'Only the exact provider-owned fixture script may be reaped');
+    const args = /^serve[ \t]+--hostname[ \t]+127\.0\.0\.1[ \t]+--port[ \t]+([1-9][0-9]{0,4})$/.exec(row.commandLine.slice(match[0].length).trim());
+    assert(args && Number(args[1]) <= 65535, 'Only the fixture loopback serve arguments are allowed');
+    assert(typeof row.startedAt === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{7}Z$/.test(row.startedAt));
+    const birth = Date.parse(row.startedAt);
+    assert(Number.isFinite(birth) && birth >= startedAt && birth <= Date.now(), 'Fixture birth must fall within this smoke execution');
+    const recorded = probes.filter(probe => probe.pid === row.pid);
+    assert.equal(recorded.length, 1, 'Reaped host must have one exact fixture invocation record');
+    assert(samePath(recorded[0].execPath, node) && samePath(recorded[0].cwd, path.join(root, 'project with spaces')));
+    assert.deepEqual(recorded[0].argv, [node, script, 'serve', '--hostname', '127.0.0.1', '--port', args[1]]);
+  }
+  return stopped;
+}
+
 let fixture, fixtureIdentity, files, harnessFiles;
 try {
   assert.equal(process.platform, 'win32'); assert.equal(process.arch, 'x64');
@@ -179,6 +213,56 @@ try {
   assert.deepEqual(directoryIdentity(rawLocal), report.fixture.localAppDataIdentity);
   report.sameDirectoryAliasPredicateProven = true; flush();
 
+
+  // Same selected broker, token and canonical parent: observe ordinary Node
+  // creation without ACL repair, then use the existing exclusive native producer.
+  const expectedOwner = green.reply.value.identity?.ownerSid;
+  assert.match(expectedOwner ?? '', /^S-1-\d+(?:-\d+)+$/);
+  assert.equal(physical(selected, canonicalLocal), selected);
+  const defaultDirectory = path.join(fixture, 'owner-default-node');
+  const nativeDirectory = path.join(fixture, 'owner-native-created');
+  assert(!existsSync(defaultDirectory) && !existsSync(nativeDirectory), 'Fresh owner discriminator siblings required');
+  mkdirSync(defaultDirectory);
+  assert.equal(realpathSync.native(defaultDirectory), defaultDirectory);
+  const defaultIdentity = directoryIdentity(defaultDirectory);
+  const ownerInput = (directory, createExclusive) => JSON.stringify({ schema: 1, id: 1,
+    operation: 'ownerPreparePrivateDirectory', input: { path: directory, createExclusive } }) + '\n';
+  const brokerArgs = ['--broker', producer.sha256], brokerEnv = { ...helperEnv, LOCALAPPDATA: canonicalLocal };
+  const ownerRed = await run('native-owner-node', selected, brokerArgs, fixture, brokerEnv,
+    ownerInput(defaultDirectory, false), 15000, 64 * 1024);
+  assert.equal(ownerRed.stderr, ''); assert(!ownerRed.replyError);
+  assert.equal(ownerRed.reply.schema, 1); assert.equal(ownerRed.reply.kind, 'reply'); assert.equal(ownerRed.reply.id, 1);
+  assert.equal(ownerRed.reply.ok, false); assert.equal(ownerRed.reply.error, 'execution_owner_not_private');
+  assert.equal(ownerRed.reply.stage, 'private_acl_owner'); assert.equal(ownerRed.reply.nativeCode, 0);
+  assert.deepEqual(directoryIdentity(defaultDirectory), defaultIdentity);
+  assert.equal(realpathSync.native(defaultDirectory), defaultDirectory);
+  assert(!existsSync(nativeDirectory), 'Node open must not create the native sibling');
+  const ownerGreen = await run('native-owner-created', selected, brokerArgs, fixture, brokerEnv,
+    ownerInput(nativeDirectory, true), 15000, 64 * 1024);
+  assert.equal(ownerGreen.stderr, ''); assert(!ownerGreen.replyError);
+  assert.equal(ownerGreen.reply.schema, 1); assert.equal(ownerGreen.reply.kind, 'reply'); assert.equal(ownerGreen.reply.id, 1);
+  assert.equal(ownerGreen.reply.ok, true);
+  const created = ownerGreen.reply.value;
+  assert.equal(created.schema, 1); assert.equal(created.ok, true); assert.equal(created.path, nativeDirectory);
+  assert.equal(created.directory, true); assert.equal(created.reparse, false); assert.equal(created.privateAcl, true);
+  assert.match(created.handleId ?? '', /^[a-zA-Z0-9_-]{1,128}$/);
+  assert.deepEqual(Object.keys(created.identity).sort(), ['fileId', 'ownerSid', 'volumeSerial']);
+  assert.match(created.identity.volumeSerial, /^\d{1,20}$/);
+  assert.match(created.identity.fileId, /^[a-f0-9]{32}$/i); assert(!/^0+$/.test(created.identity.fileId));
+  assert.equal(created.identity.ownerSid, expectedOwner, 'Native-created owner must be the canonical custody token owner');
+  assert.equal(realpathSync.native(nativeDirectory), nativeDirectory);
+  const nativeIdentity = directoryIdentity(nativeDirectory);
+  assert.deepEqual(directoryIdentity(defaultDirectory), defaultIdentity);
+  assert.equal(sha(readFileSync(selected)), producer.sha256);
+  report.ownerCreationPredicateProven = { operation: 'ownerPreparePrivateDirectory',
+    selectedHelper: pin(selected), expectedOwnerSid: expectedOwner,
+    nodeCreated: { path: defaultDirectory, identity: defaultIdentity, createExclusive: false,
+      refused: true, error: ownerRed.reply.error, stage: ownerRed.reply.stage, nativeCode: ownerRed.reply.nativeCode },
+    nativeCreated: { path: nativeDirectory, identity: nativeIdentity, createExclusive: true,
+      privateAcl: true, nativeIdentity: created.identity },
+    scope: 'Same canonical parent and selected helper; no owner or ACL repair, adoption, production check change, or claim about the rejected owner SID.' };
+  flush();
+
   const rawSmokeTemp = path.join(rawFixture, 'smoke-tmp'); mkdirSync(rawSmokeTemp);
   const fullEnv = { ...plumbing(), TMP: rawSmokeTemp, TEMP: rawSmokeTemp, TMPDIR: rawSmokeTemp,
     BACKFILL_RUNTIME_SOURCE_COMMIT: SOURCE, BACKFILL_RUNTIME_HARNESS_COMMIT: report.harnessCommit,
@@ -195,9 +279,9 @@ try {
   for (const group of Object.values(smoke.groups)) {
     assert.equal(group.passed, true); assert(!group.error && !group.cleanupError && !group.remainingRoot);
     assert.equal(group.teardown.status, 0); assert.equal(group.teardown.signal, null); assert(!group.teardown.error);
-    assert.deepEqual(JSON.parse(group.teardown.stdout), []);
   }
   const backfill = smoke.groups.backfill;
+  assert.deepEqual(JSON.parse(backfill.teardown.stdout), []);
   assert.deepEqual(backfill.cases.map(row => [row.shape, row.transport]),
     [['ascii', 'direct'], ['with spaces', 'direct'], ['Юникод 世界', 'direct'], ['Юникод 世界 cmd', 'app-exe-fallback']]);
   for (const row of backfill.cases) {
@@ -220,6 +304,23 @@ try {
   for (const row of provider.cases) {
     assert(row.passed && !row.error); assert.equal(row.status, 0); assert.equal(row.signal, null);
   }
+  const smokeTemp = path.join(fixture, 'smoke-tmp');
+  const backfillRoot = path.dirname(path.dirname(backfill.cases[0].invocations[0].cwd));
+  const providerRoot = path.dirname(provider.cases[0].cwd);
+  for (const [root, prefix] of [[backfillRoot, 'backfill-exe-'], [providerRoot, 'agent-teams-runtime-opencode-smoke-']]) {
+    assert(samePath(path.dirname(root), smokeTemp) && path.basename(root).startsWith(prefix), 'Removed smoke roots must be the exact owned fixture children');
+    assert(!existsSync(root), 'Successful fixture teardown must remove the actual owned directory');
+  }
+  for (const row of backfill.cases) for (const item of row.invocations)
+    assert(samePath(item.cwd, path.join(backfillRoot, row.shape, 'project')));
+  for (const row of provider.cases) assert(samePath(row.cwd, path.join(providerRoot, 'project with spaces')));
+  const { windowsNodeScriptPattern } = await import(pathToFileURL(harnessFiles.backfill).href);
+  assert.equal(typeof windowsNodeScriptPattern, 'string');
+  const smokeStartedAt = Date.parse(report.runs.find(row => row.label === 'corrected-full-smoke').startedAt);
+  const providerStopped = assertProviderFixtureTeardown(provider, providerRoot, windowsNodeScriptPattern, smokeStartedAt);
+  report.fixtureTeardown = { backfillStopped: 0, providerStopped: providerStopped.length,
+    providerPolicy: 'Only exact owned Node fake-opencode.cjs loopback serve hosts; original teardown proves identity and WaitForExit.',
+    backfillRootRemoved: true, providerRootRemoved: true };
   report.fullSmoke = { receiptBytes: receiptBytes.length, receiptSha256: sha(receiptBytes),
     backfillCases: 4, backfillInvocations: 16, providerChecks: 4, passed: true,
     scope: 'Synthetic OpenCode HTTP/backfill regression; not actual provider, bundled app MCP, or inference qualification.' };
@@ -227,10 +328,11 @@ try {
   report.harnessAfter = Object.fromEntries(Object.entries(harnessFiles).map(([name, file]) => [name, pin(file)]));
   assert.deepEqual(report.deliveryAfter, report.deliveryBefore); assert.deepEqual(report.harnessAfter, report.harnessBefore);
   report.deliveryAnchorsUnchanged = true; report.harnessAnchorsUnchanged = true;
-  assert.deepEqual(report.runs.map(row => row.label), ['native-alias', 'native-canonical', 'corrected-full-smoke']);
+  assert.deepEqual(report.runs.map(row => row.label), ['native-alias', 'native-canonical', 'native-owner-node', 'native-owner-created', 'corrected-full-smoke']);
   assert(report.runs.every(row => row.naturalClose && row.code === 0 && row.signal === null));
   assert(samePath(realpathSync.native(fixture), fixture)); assert.deepEqual(directoryIdentity(fixture), fixtureIdentity);
   rmSync(fixture, { recursive: true, force: false, maxRetries: 5, retryDelay: 250 });
+  assert(!existsSync(fixture), 'Outer owned diagnostic fixture must be absent after removal');
   report.fixtureRemoved = true; report.passed = true;
 } catch (error) {
   report.failure = errorInfo(error);
