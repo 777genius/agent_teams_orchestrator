@@ -489,3 +489,49 @@ test('run state request wall deadline expiry keeps its own closed token', async 
   expect((caught as Error).message).toBe('run_state_wall_deadline_expired')
   expect(source).toContain('require(static_cast<std::uint64_t>(wallDeadline) > nowMs, "run_state_wall_deadline_expired");')
 })
+test('client request budget expiry is closed apart from the run wall deadline', async () => {
+  const { runInNewContext } = await import('node:vm')
+  const header = path.resolve(import.meta.dir, '../../src/services/opencode/host/windows/WindowsNativeRunControl.hpp')
+  const source = (await readFile(header, 'utf8')).replaceAll('\r\n', '\n')
+  const begin = source.indexOf('    const DWORD available = runControlRemaining(deadline);')
+  expect(begin).toBeGreaterThanOrEqual(0)
+  const end = source.indexOf('\n    };', begin)
+  expect(end).toBeGreaterThan(begin)
+  const body = source.slice(begin, end + '\n    };'.length)
+    .replaceAll('const DWORD available =', 'const available =')
+    .replaceAll('const DWORD replyAllowance =', 'const replyAllowance =')
+    .replaceAll('const DWORD cleanupAllowance =', 'const cleanupAllowance =')
+    .replaceAll('const std::uint64_t cleanupDeadline =', 'const cleanupDeadline =')
+    .replaceAll('const std::uint64_t ioDeadline =', 'const ioDeadline =')
+    .replaceAll('const DWORD value =', 'const value =')
+    .replaceAll('const auto remaining = [&] {', 'const remaining = () => {')
+    .replaceAll('std::min<DWORD>(', 'Math.min(')
+    .replaceAll('std::max<DWORD>(', 'Math.max(')
+  const attempt = (budget: readonly number[]) => {
+    const readings = [] as number[]
+    return runInNewContext(`(function () {${body}\nreturn remaining();})()`, {
+      deadline: 10_000, stop: true, CANCEL_DRAIN_MS: 5000,
+      runControlRemaining: () => {
+        const value = budget[Math.min(readings.length, budget.length - 1)] ?? 0
+        readings.push(value); return value
+      },
+      require: (value: unknown, code: string) => { if (!value) throw new Error(code) },
+    })
+  }
+  // A client whose own budget is spent before any frame IO reports that branch,
+  // never the wall deadline of the run or an IO read/write code.
+  let caught: unknown
+  try { attempt([0]) } catch (error) { caught = error }
+  expect((caught as Error).message).toBe('run_control_client_budget_exhausted')
+  caught = undefined
+  try { attempt([2, 0]) } catch (error) { caught = error }
+  expect((caught as Error).message).toBe('run_control_client_budget_exhausted')
+  expect(attempt([100, 50])).toBe(50)
+  // The stop deadline shrink shares the same exhausted-client-budget branch.
+  expect(source).toContain('require(available > 1, "run_control_client_budget_exhausted");')
+  expect(source).toContain('require(value > 0, "run_control_client_budget_exhausted");')
+  expect(source).toContain('require(activeRemaining > replyAllowance, "run_control_client_budget_exhausted");')
+  expect(source).not.toContain('require(available > 1, "run_deadline_expired");')
+  expect(source).not.toContain('require(value > 0, "run_deadline_expired");')
+  expect(source).not.toContain('require(activeRemaining > replyAllowance, "run_deadline_expired");')
+})

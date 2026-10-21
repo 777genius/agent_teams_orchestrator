@@ -590,14 +590,14 @@ struct WindowsNativeRunControl {
       originalWallDeadline = static_cast<std::uint64_t>(value);
     }
     const DWORD available = runControlRemaining(deadline);
-    require(available > 1, "run_deadline_expired");
+    require(available > 1, "run_control_client_budget_exhausted");
     const DWORD replyAllowance = std::min<DWORD>(100, std::max<DWORD>(1, available / 8));
     const DWORD cleanupAllowance = std::min<DWORD>(stop ? 1000 : CANCEL_DRAIN_MS, available / 4);
     const std::uint64_t cleanupDeadline = deadline - replyAllowance;
     const std::uint64_t ioDeadline = cleanupDeadline - cleanupAllowance;
     const auto remaining = [&] {
       const DWORD value = runControlRemaining(ioDeadline);
-      require(value > 0, "run_deadline_expired");
+      require(value > 0, "run_control_client_budget_exhausted");
       return value;
     };
     prepareExpectedEndpoint();
@@ -616,7 +616,7 @@ struct WindowsNativeRunControl {
         GetSystemTimeAsFileTime(&wallTime);
         const auto wallNow = filetime(wallTime) / 10000 - 11644473600000ULL;
         const DWORD activeRemaining = remaining();
-        require(activeRemaining > replyAllowance, "run_deadline_expired");
+        require(activeRemaining > replyAllowance, "run_control_client_budget_exhausted");
         // Only shrink the caller's original deadline, leaving the existing
         // response-flush margin inside the active read window. Sign it AFTER
         // endpoint/connect work consumed its portion of the same30s budget.
