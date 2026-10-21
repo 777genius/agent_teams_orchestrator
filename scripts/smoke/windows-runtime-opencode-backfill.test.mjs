@@ -11,7 +11,7 @@ import { once } from 'node:events';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { assertBackfillEnvelope, assertImportedLedger, buildWindowsTeardownCommand, createBackfillFixture, finishSmokeCleanup, fixtureScriptPaths, runSmokeGroups, sandboxEnvironment, stageRuntimeDelivery, teardownOwnedProcesses, trustedSearchPath, windowsNodeScriptPattern } from './windows-runtime-opencode-backfill.mjs';
+import { assertBackfillCasePath, assertBackfillEnvelope, assertImportedLedger, buildWindowsTeardownCommand, createBackfillFixture, finishSmokeCleanup, fixtureScriptPaths, runSmokeGroups, sandboxEnvironment, stageRuntimeDelivery, teardownOwnedProcesses, trustedSearchPath, windowsNodeScriptPattern } from './windows-runtime-opencode-backfill.mjs';
 
 import { actualProviderResult, actualProviderTransport, catalogGuard, assertReadinessHost, runProviderSmoke, runRecordedCheck } from './windows-runtime-opencode-provider-json.mjs';
 import { environmentSummary, traceSpawn } from './windows-process-identity-probe.mjs';
@@ -138,6 +138,31 @@ test('sandbox environment leaves fresh SDK data uncreated and preserves existing
     }
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+for (const ancestor of ['with spaces', 'Юникод 世界']) {
+  test(`backfill case path preserves an ASCII owned suffix under a canonical ${ancestor} ancestor`, () => {
+    const parent = realpathSync.native(mkdtempSync(path.join(os.tmpdir(), 'backfill-case-path-')));
+    try {
+      const root = path.join(parent, ancestor);
+      const binary = path.join(root, 'ascii', 'bin', 'runtime.exe');
+      mkdirSync(path.dirname(binary), { recursive: true });
+      writeFileSync(binary, 'fixture-only');
+      const physicalRoot = realpathSync.native(root);
+      const physicalBinary = realpathSync.native(binary);
+      assert.equal(path.relative(physicalRoot, physicalBinary), path.join('ascii', 'bin', 'runtime.exe'));
+      assert.doesNotThrow(() => assertBackfillCasePath(physicalRoot, 'ascii', physicalBinary));
+      for (const invalid of ['ascii with spaces', 'ascii-世界']) {
+        assert.throws(() => assertBackfillCasePath(physicalRoot, 'ascii', path.join(physicalRoot, invalid, 'bin', 'runtime.exe')),
+          /ASCII case/);
+      }
+      assert.throws(() => assertBackfillCasePath(physicalRoot, 'ascii', path.join(parent, 'foreign', 'runtime.exe')),
+        /owned smoke root/);
+      for (const shape of ['with spaces', 'Юникод 世界', 'Юникод 世界 cmd']) {
+        assert.doesNotThrow(() => assertBackfillCasePath(physicalRoot, shape, path.join(physicalRoot, shape, 'bin', 'runtime.exe')));
+      }
+    } finally { rmSync(parent, { recursive: true, force: true }); }
+  });
+}
 
 test('runtime relocation preserves packaged Bun and executable physical graph across every path shape', () => {
   const root = mkdtempSync(path.join(os.tmpdir(), 'runtime-relocation-'));

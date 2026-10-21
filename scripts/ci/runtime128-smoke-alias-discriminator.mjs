@@ -263,7 +263,7 @@ try {
     scope: 'Same canonical parent and selected helper; no owner or ACL repair, adoption, production check change, or claim about the rejected owner SID.' };
   flush();
 
-  const rawSmokeTemp = path.join(rawFixture, 'smoke-tmp'); mkdirSync(rawSmokeTemp);
+  const rawSmokeTemp = path.join(rawFixture, 'smoke-tmp Юникод 世界'); mkdirSync(rawSmokeTemp);
   const fullEnv = { ...plumbing(), TMP: rawSmokeTemp, TEMP: rawSmokeTemp, TMPDIR: rawSmokeTemp,
     BACKFILL_RUNTIME_SOURCE_COMMIT: SOURCE, BACKFILL_RUNTIME_HARNESS_COMMIT: report.harnessCommit,
     BACKFILL_RUNTIME_BUN_VERSION: report.buildBunVersion };
@@ -304,7 +304,7 @@ try {
   for (const row of provider.cases) {
     assert(row.passed && !row.error); assert.equal(row.status, 0); assert.equal(row.signal, null);
   }
-  const smokeTemp = path.join(fixture, 'smoke-tmp');
+  const smokeTemp = path.join(fixture, 'smoke-tmp Юникод 世界');
   const backfillRoot = path.dirname(path.dirname(backfill.cases[0].invocations[0].cwd));
   const providerRoot = path.dirname(provider.cases[0].cwd);
   for (const [root, prefix] of [[backfillRoot, 'backfill-exe-'], [providerRoot, 'agent-teams-runtime-opencode-smoke-']]) {
@@ -314,6 +314,17 @@ try {
   for (const row of backfill.cases) for (const item of row.invocations)
     assert(samePath(item.cwd, path.join(backfillRoot, row.shape, 'project')));
   for (const row of provider.cases) assert(samePath(row.cwd, path.join(providerRoot, 'project with spaces')));
+  // The ASCII case owns ASCII leaf segments beneath a real Unicode/spaces ancestor.
+  const asciiBinary = path.join(backfillRoot, 'ascii', 'bin', 'runtime.exe');
+  const asciiCwd = path.join(backfillRoot, 'ascii', 'project');
+  assert.equal(path.basename(smokeTemp), 'smoke-tmp Юникод 世界');
+  assert.match(path.relative(smokeTemp, asciiBinary), /^[\x21-\x7e]+$/);
+  assert.match(path.relative(smokeTemp, asciiCwd), /^[\x21-\x7e]+$/);
+  for (const item of backfill.cases[0].invocations) {
+    assert(samePath(item.executable, asciiBinary) && samePath(item.cwd, asciiCwd), 'Every ASCII-case invocation must traverse the actual Unicode/spaces smoke ancestor');
+  }
+  report.unicodeSmokeAncestor = { path: smokeTemp, asciiBinary, asciiCwd,
+    asciiOwnedRelativeSegments: true, asciiInvocations: 4, proven: true };
   const { windowsNodeScriptPattern } = await import(pathToFileURL(harnessFiles.backfill).href);
   assert.equal(typeof windowsNodeScriptPattern, 'string');
   const smokeStartedAt = Date.parse(report.runs.find(row => row.label === 'corrected-full-smoke').startedAt);

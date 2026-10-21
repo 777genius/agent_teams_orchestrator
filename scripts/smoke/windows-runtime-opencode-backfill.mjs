@@ -22,6 +22,14 @@ const backfillCases = [
   ['Юникод 世界 cmd', 'app-exe-fallback'],
 ];
 
+export function assertBackfillCasePath(root, shape, binary) {
+  const suffix = path.relative(root, binary);
+  assert.ok(suffix && suffix !== '..' && !suffix.startsWith(`..${path.sep}`) && !path.isAbsolute(suffix),
+    'Case executable must remain inside the owned smoke root');
+  // Case names describe our owned suffix; canonical runner ancestors may contain spaces or Unicode.
+  if (shape === 'ascii') assert.match(suffix, /^[\x21-\x7e]+$/, 'ASCII case needs an ASCII owned suffix without spaces');
+}
+
 export function fixtureScriptPaths(root) {
   return ['', ...backfillCases.map(([shape]) => shape)]
     .map(directory => path.resolve(root, directory, 'fake-opencode.cjs'));
@@ -410,7 +418,7 @@ export function runBackfillSmoke(binaryInput, evidenceInput, { report: suppliedR
         const projectDir = path.join(caseRoot, 'ledger-project');
         for (const dir of [binaryDir, projectPath, projectDir]) mkdirSync(dir, { recursive: true });
         const binary = path.join(binaryDir, 'runtime.exe');
-        if (shape === 'ascii') assert.match(binary, /^[\x21-\x7e]+$/, 'ASCII case needs an ASCII temp root without spaces');
+        assertBackfillCasePath(root, shape, binary);
         stageRuntimeDelivery(runtimeBinary, binaryDir);
         item.executableSha256 = sha256(readFileSync(binary));
         assert.equal(item.executableSha256, report.executableSha256);
