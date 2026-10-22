@@ -7,6 +7,7 @@ import { pathToFileURL } from 'node:url'
 import { PassThrough } from 'node:stream'
 
 import { describe, expect, test } from 'bun:test'
+import * as lockfile from '../../utils/lockfile.js'
 
 import {
   OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID,
@@ -3678,13 +3679,13 @@ test('historical reconciliation process inspection does not block an unrelated p
   })
   const reconciliation = manager.reconcilePersistentHosts({ reason: 'TEST', staleAgeMs: 60_000 })
   await inspectionStarted
-  let retained = false
-  const retain = manager.retainHostLease('unrelated', {
-    teamId: 'TEST-team', memberName: 'alice', runId: 'TEST-run', sessionId: 'TEST-session',
-  }).then(() => { retained = true })
   try {
-    await Promise.race([retain, new Promise(resolve => setTimeout(resolve, 300))])
-    expect(retained).toBe(true)
+    // Reject the old held gate immediately, without a machine-speed assertion.
+    const release = await lockfile.lock(`${registryPath}.lock`, { retries: 0 })
+    await release()
+    await manager.retainHostLease('unrelated', {
+      teamId: 'TEST-team', memberName: 'alice', runId: 'TEST-run', sessionId: 'TEST-session',
+    })
     resume()
     const result = await reconciliation
     const persisted = JSON.parse(await readFile(registryPath, 'utf8'))
@@ -3693,7 +3694,7 @@ test('historical reconciliation process inspection does not block an unrelated p
     expect(Object.values(persisted.hosts.unrelated.leases)).toHaveLength(1)
   } finally {
     resume()
-    await Promise.all([reconciliation, retain])
+    await reconciliation
     await rm(tempDir, { recursive: true, force: true })
   }
 })
