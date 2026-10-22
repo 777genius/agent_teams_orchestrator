@@ -450,17 +450,26 @@ test('Windows transient cold-start failure at the startup gate spares queued sta
       initializationAbort: AbortController; acquisitions: Set<AbortController> }
     const queued = new AbortController()
     owner.acquisitions.add(queued)
-    const failure = (nativeStderrKind: string) => Object.assign(new Error('execution_cancelled'), { startup: {
-      event: 'opencode-v2-startup', reason: 'failed', stage: 'windows-prepare', elapsedMs: 120, history: [],
-      nativeExitCode: 1, nativeStderrKind } })
+    const failure = (nativeStderrKind: string, unboundRetired = true) => Object.assign(new Error('execution_cancelled'), {
+      startup: { event: 'opencode-v2-startup', reason: 'failed', stage: 'windows-prepare', elapsedMs: 120, history: [],
+        nativeExitCode: 1, nativeStderrKind },
+      ...(unboundRetired ? { unboundRetired: true } : {}) })
     const transient = failure('access_denied')
     await expect(owner.startupGate(async () => { throw transient }, undefined, Date.now() + 60_000)).rejects.toBe(transient)
     expect(owner.initializationAbort.signal.aborted).toBe(false)
     expect(queued.signal.aborted).toBe(false)
+    // The access-denied class retries only when the failed attempt also proved
+    // its unbound spawn retired; an unproved owner fence keeps the failure final.
+    const unproved = failure('access_denied', false)
+    await expect(owner.startupGate(async () => { throw unproved }, undefined, Date.now() + 60_000)).rejects.toBe(unproved)
+    expect(owner.initializationAbort.signal.aborted).toBe(true)
+    expect(queued.signal.aborted).toBe(true)
+    const cancelled = new AbortController()
+    owner.acquisitions.add(cancelled)
     const final = failure('bun_error')
     await expect(owner.startupGate(async () => { throw final }, undefined, Date.now() + 60_000)).rejects.toBe(final)
     expect(owner.initializationAbort.signal.aborted).toBe(true)
-    expect(queued.signal.aborted).toBe(true)
+    expect(cancelled.signal.aborted).toBe(true)
   } finally { await f.close() }
 })
 
