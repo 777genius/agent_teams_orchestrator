@@ -802,3 +802,26 @@ test('run control frame budgets carry the full broker control packet on every ho
   expect(runControl).toContain('bytes.length > MAX_FRAME')
   expect(runControl).toContain('Buffer.byteLength(bytes) <= MAX_FRAME')
 })
+
+test('run control pipe buffers stage bytes instead of reserving the frame cap per instance', async () => {
+  const windows = path.resolve(import.meta.dir, '../../src/services/opencode/host/windows')
+  const read = async (name: string) => (await readFile(name, 'utf8')).replaceAll('\r\n', '\n')
+  const header = await read(path.join(windows, 'WindowsNativeRunControl.hpp'))
+  const budget = (source: string, name: string) => {
+    const match = source.match(new RegExp(`(?:const|constexpr[^\\n]*?)\\s+${name}\\s*=\\s*([0-9 *]+?);?\\n`))
+    expect(match).not.toBeNull()
+    return match![1].split('*').map(part => Number(part.trim())).reduce((left, right) => left * right, 1)
+  }
+  const frame = budget(header, 'RUN_CONTROL_MAX_FRAME_BYTES')
+  const buffer = budget(header, 'RUN_CONTROL_PIPE_BUFFER_BYTES')
+  // The pipe buffers only stage bytes between reads; the read loop assembles
+  // the logical 16 MiB frame across them. Reserving the frame cap for both pipe
+  // buffers pins ~32 MiB nonpaged per instance (up to MAX_CONNECTIONS + 2) and
+  // can make CreateNamedPipeW refuse the instance on modest hosts.
+  expect(buffer).toBeLessThan(frame)
+  const start = header.indexOf('Handle runControlCreateServer(')
+  expect(start).toBeGreaterThan(0)
+  const create = header.slice(start, header.indexOf('\n  }\n', start))
+  expect(create).toContain('RUN_CONTROL_PIPE_BUFFER_BYTES, RUN_CONTROL_PIPE_BUFFER_BYTES')
+  expect(create).not.toContain('MAX_FRAME_BYTES,')
+})

@@ -28,6 +28,11 @@
 // A control reply (a full transcript cut) is one frame on the pipe and one
 // packet on the broker stdio hop; one shared budget keeps both hops equal.
 static constexpr DWORD RUN_CONTROL_MAX_FRAME_BYTES = 16 * 1024 * 1024;
+// The pipe buffers only stage bytes between reads; the 16 MiB frame cap is a
+// logical budget the read loop assembles across reads. Allocating the frame cap
+// per buffer would reserve ~32 MiB nonpaged per instance and can make
+// CreateNamedPipeW refuse the instance on modest hosts.
+static constexpr DWORD RUN_CONTROL_PIPE_BUFFER_BYTES = 64 * 1024;
 static std::string runControlCanonicalJson(const IJsonValue &value) {
   switch (value.ValueType()) {
   case JsonValueType::Null:
@@ -961,8 +966,9 @@ private:
     HANDLE raw = CreateNamedPipeW(name.c_str(), mode,
                                   PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT |
                                       PIPE_REJECT_REMOTE_CLIENTS,
-                                  static_cast<DWORD>(MAX_CONNECTIONS + 2), MAX_FRAME_BYTES,
-                                  MAX_FRAME_BYTES, 0, &attributes);
+                                  static_cast<DWORD>(MAX_CONNECTIONS + 2),
+                                  RUN_CONTROL_PIPE_BUFFER_BYTES, RUN_CONTROL_PIPE_BUFFER_BYTES,
+                                  0, &attributes);
     if (raw == INVALID_HANDLE_VALUE)
       throw NativeError{"run_control_listen_unknown", GetLastError(), "listen"};
     return Handle(raw);
