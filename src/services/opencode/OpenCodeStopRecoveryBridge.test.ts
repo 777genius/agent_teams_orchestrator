@@ -261,9 +261,14 @@ test.skipIf(!process.env.AGENT_TEAMS_TEST_STOP_WIRE_PACKET)(
     record = { ...record, teamId: request.target.teamId, laneId: request.target.laneId,
       runId: request.target.runId, projectPath: request.target.projectPath,
       memberName: request.target.members[0]!.memberName,
-      opencodeSessionId: request.target.members[0]!.sessionId }
+      opencodeSessionId: request.target.members[0]!.sessionId,
+      expectedBehaviorFingerprint: request.target.expectedBehaviorFingerprint,
+      stopAuthority: { runtime: { ...runtime, capabilitySnapshotId: request.target.capabilitySnapshotId },
+        expectedBehaviorFingerprint: request.target.expectedBehaviorFingerprint } }
     store = new OpenCodeSessionStore(path.join(dir, 'app-wire-sessions.json'))
-    await store.upsert(record)
+    for (const member of request.target.members) {
+      await store.upsert({ ...record, memberName: member.memberName, opencodeSessionId: member.sessionId })
+    }
     const abort = track(spyOn(openCodeSessionBridge, 'abort').mockResolvedValue(true))
     const wrongCwd = await executeOpenCodeBridgeCommandEnvelope({ ...stop, cwd: packet.projectAlias })
     expect(wrongCwd.ok).toBe(false)
@@ -287,8 +292,10 @@ test.skipIf(!process.env.AGENT_TEAMS_TEST_STOP_WIRE_PACKET)(
       stopRecovery: { ...request, target: { ...request.target,
         members: [{ memberName: record.memberName, sessionId: 'foreign-generation' }] } } } })
     expect(foreignSession.ok).toBe(false)
-    expect(abort).toHaveBeenCalledTimes(1)
-    expect(abort.mock.calls[0]?.[0].opencodeSessionId).toBe(record.opencodeSessionId)
+    expect(abort).toHaveBeenCalledTimes(request.target.members.length)
+    expect(abort.mock.calls.map(call => call[0].opencodeSessionId).sort()).toEqual(
+      request.target.members.map(member => member.sessionId).sort(),
+    )
   }
 )
 
