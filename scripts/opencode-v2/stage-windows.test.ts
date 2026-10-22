@@ -839,3 +839,103 @@ test('poison retires a connection the read failure paths already poisoned', asyn
   expect(body).toContain('runControlRetire(')
   expect(body).not.toContain('runControlConnectionFor(')
 })
+
+test('endpoint owner witness measures retired owners while live observation refuses them', async () => {
+  const { runInNewContext } = await import('node:vm')
+  const windowsDirectory = path.resolve(import.meta.dir, '../../src/services/opencode/host/windows')
+  const source = async (name: string) => (await readFile(path.join(windowsDirectory, name), 'utf8')).replaceAll('\r\n', '\n')
+  const header = await source('WindowsNativeRunControl.hpp')
+  const scope = await source('WindowsKernelScope.cpp')
+  const slice = (text: string, from: string, to: string) => {
+    const begin = text.indexOf(from), end = text.indexOf(to, begin)
+    expect(begin).toBeGreaterThanOrEqual(0); expect(end).toBeGreaterThan(begin)
+    return text.slice(begin + from.length, end)
+  }
+  const bodyOf = (text: string, from: string) => {
+    const begin = text.indexOf(from)
+    expect(begin).toBeGreaterThanOrEqual(0)
+    const open = text.indexOf(') {', begin), end = text.indexOf('\n  }', open)
+    expect(open).toBeGreaterThan(begin); expect(end).toBeGreaterThan(open)
+    return text.slice(open + 3, end)
+  }
+  const flat = (text: string) => text.replace(/\s+/g, ' ')
+  // The endpoint witness that fills the run state's retirement handles may run
+  // against owners that already exited: ownerRetired observes their exit through
+  // exactly these handles, so the witness keeps the full identity measurement
+  // and drops only the liveness demand.
+  const retain = flat(slice(scope,
+    'static void retainOriginalEndpointOwners(State &state, const JsonObject &record) {', '\n  }\n'))
+  expect(retain).toContain('Control::runControlHeldIdentity(heldHelper.value, helperPid)')
+  expect(retain).toContain('Control::runControlHeldIdentity(heldBun.value, bunPid)')
+  expect(retain).not.toContain('runControlNativeIdentity')
+  expect(retain).toContain('runStateAssertRetirementWitnessLocked(heldHelper.value, state.helperPid_, state.helperBirth_')
+  expect(retain).toContain('runStateAssertRetirementWitnessLocked(heldBun.value, state.bunPid_, state.bunBirth_')
+  // Every remaining live measurement names its own subject, so a refused owner
+  // can never again surface as a bare process_alive.
+  const validate = flat(slice(header, 'void validateRequestPayload(std::uint64_t id, const JsonObject &payload) {', '\n  }\n'))
+  expect(validate).toContain('runControlNativeIdentity(connection.peerParent.value, connection.peerParentPin.pid, "process_alive_peer_parent")')
+  const currentBun = flat(slice(header, 'JsonObject currentBunIdentity() const {', '\n  }\n'))
+  expect(currentBun).toContain('runControlNativeIdentity(intendedBun_.value, GetProcessId(intendedBun_.value), "process_alive_held_bun")')
+  const prepare = flat(slice(header, 'void prepareExpectedEndpoint() {', '\n  }\n'))
+  expect(prepare).toContain('runControlNativeIdentity(helper.value, helperPid, "process_alive_endpoint_helper")')
+  expect(prepare).toContain('runControlNativeIdentity(bun.value, bunPid, "process_alive_endpoint_bun")')
+
+  // Behavioral pair on the extracted measurements: an exited owner is still a
+  // complete held identity (birth, sid and image survive on the open handle)
+  // and only the live observation gate refuses it, under the caller's stage.
+  const translate = (body: string) => body
+    .replaceAll('const FILETIME first =', 'const first =')
+    .replaceAll('const FILETIME second =', 'const second =')
+    .replaceAll('ProcessPin pin;', 'const pin = {};')
+    .replaceAll('const DWORD status =', 'const status =')
+    .replaceAll('const DWORD error =', 'const error =')
+    .replaceAll('throw NativeError{', 'throw nativeError(')
+    .replaceAll('aliveStage};', 'aliveStage);')
+  const waited: number[] = []
+  const birth = { observed: true }
+  const sandbox: Record<string, unknown> = {
+    require: (value: unknown, code: string) => { if (!value) throw new Error(code) },
+    nativeError: (code: string, win32: number, stage: string) => Object.assign(new Error(code), { code, win32, stage }),
+    WaitForSingleObject: (_process: unknown, timeout: number) => { waited.push(timeout); return 0 },
+    GetLastError: () => 0,
+    GetProcessId: () => 4242,
+    runControlBirth: () => birth,
+    runControlSameBirth: (first: unknown, second: unknown) => first === second,
+    runControlProcessSid: () => ({ sid: true }),
+    runControlProcessImagePin: () => ({ sha256: 'digest' }),
+    runControlIdentityJson: (_process: unknown, pid: number, pin: unknown) => ({ pid, pin }),
+    WAIT_FAILED: 0xffffffff, WAIT_TIMEOUT: 258,
+  }
+  type Failure = [string | undefined, number | undefined, string | undefined]
+  const failure = (call: () => unknown): Failure | null => {
+    try { call() } catch (error) {
+      const caught = error as { code?: string; win32?: number; stage?: string }
+      return [caught.code, caught.win32, caught.stage]
+    }
+    return null
+  }
+  const pin = runInNewContext(`(function (process) {${translate(bodyOf(header, 'static ProcessPin runControlPinProcess(HANDLE process)'))}\n})`, sandbox) as (process: unknown) => unknown
+  sandbox.runControlPinProcess = pin
+  const observe = runInNewContext(`(function (process, aliveStage = "process_alive") {${translate(bodyOf(header, 'static ProcessPin runControlObserveProcess(HANDLE process,'))}\n})`, sandbox) as (process: unknown, aliveStage?: string) => unknown
+  sandbox.runControlObserveProcess = observe
+  const native = runInNewContext(`(function (process, pid, aliveStage = "process_alive") {${translate(bodyOf(header, 'static JsonObject runControlNativeIdentity(HANDLE process, DWORD pid,'))}\n})`, sandbox) as (process: unknown, pid: number, aliveStage?: string) => unknown
+  const held = runInNewContext(`(function (process, pid) {${translate(bodyOf(header, 'static JsonObject runControlHeldIdentity(HANDLE process, DWORD pid)'))}\n})`, sandbox) as (process: unknown, pid: number) => unknown
+  const measured = { pid: 4242, birth: { observed: true }, sid: { sid: true }, image: { sha256: 'digest' } }
+  // The pin measurement of an exited owner succeeds on its open handle and
+  // never asks the liveness question.
+  waited.length = 0
+  expect(pin({})).toEqual(measured)
+  expect(waited).toEqual([])
+  // The live observation gate refuses the same exited owner under the default
+  // stage and under each caller's named stage.
+  expect(failure(() => observe({}))).toEqual(['run_control_process_identity', 0, 'process_alive'])
+  expect(failure(() => observe({}, 'process_alive_peer_parent'))).toEqual(['run_control_process_identity', 0, 'process_alive_peer_parent'])
+  expect(failure(() => native({}, 7))).toEqual(['run_control_process_identity', 0, 'process_alive'])
+  expect(failure(() => native({}, 7, 'process_alive_held_bun'))).toEqual(['run_control_process_identity', 0, 'process_alive_held_bun'])
+  expect(waited).toEqual([0, 0, 0, 0])
+  // The held identity of that same exited owner completes with the identical
+  // measurement and remains silent about liveness.
+  waited.length = 0
+  expect(held({}, 7)).toEqual({ pid: 7, pin: measured })
+  expect(waited).toEqual([])
+})

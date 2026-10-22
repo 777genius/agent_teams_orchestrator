@@ -611,8 +611,10 @@ struct WindowsNativeRunControl {
     Handle helper(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, helperPid));
     Handle bun(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, bunPid));
     require(helper && bun, "run_control_endpoint_changed");
-    const auto helperIdentity = runControlNativeIdentity(helper.value, helperPid);
-    const auto bunIdentity = runControlNativeIdentity(bun.value, bunPid);
+    const auto helperIdentity = runControlNativeIdentity(helper.value, helperPid,
+                                                         "process_alive_endpoint_helper");
+    const auto bunIdentity = runControlNativeIdentity(bun.value, bunPid,
+                                                      "process_alive_endpoint_bun");
     require(runControlCanonicalJson(helperIdentity) == runControlCanonicalJson(helperValue) &&
                 runControlCanonicalJson(bunIdentity) == runControlCanonicalJson(bunValue),
             "run_control_endpoint_changed");
@@ -706,7 +708,8 @@ struct WindowsNativeRunControl {
   }
 
   JsonObject currentBunIdentity() const {
-    return runControlNativeIdentity(intendedBun_.value, GetProcessId(intendedBun_.value));
+    return runControlNativeIdentity(intendedBun_.value, GetProcessId(intendedBun_.value),
+                                    "process_alive_held_bun");
   }
 
   void respond(const JsonObject &input) {
@@ -743,7 +746,8 @@ struct WindowsNativeRunControl {
             "run_control_peer_identity");
     const ProcessPin parentBefore = runControlObserveProcess(connection.peerParent.value, "process_alive_peer_parent");
     const auto measured = runControlNativeIdentity(connection.peerParent.value,
-                                                   connection.peerParentPin.pid);
+                                                   connection.peerParentPin.pid,
+                                                   "process_alive_peer_parent");
     const ProcessPin parentAfter = runControlObserveProcess(connection.peerParent.value, "process_alive_peer_parent");
     const ProcessPin peerAfter = runControlObserveProcess(connection.peerProcess.value, "process_alive_peer");
     require(runControlSameProcess(parentBefore, connection.peerParentPin) &&
@@ -1367,14 +1371,7 @@ private:
     require(status >= 0 && returned >= sizeof(information), "run_control_parent_join");
     return static_cast<std::uint64_t>(information.inheritedFromUniqueProcessId);
   }
-  static ProcessPin runControlObserveProcess(HANDLE process,
-                                               const char *aliveStage = "process_alive") {
-    const DWORD status = WaitForSingleObject(process, 0);
-    if (status != WAIT_TIMEOUT) {
-      const DWORD error = status == WAIT_FAILED ? GetLastError() : status;
-      throw NativeError{"run_control_process_identity", error,
-                        status == WAIT_FAILED ? "process_alive_wait" : aliveStage};
-    }
+  static ProcessPin runControlPinProcess(HANDLE process) {
     const FILETIME first = runControlBirth(process);
     const FILETIME second = runControlBirth(process);
     require(runControlSameBirth(first, second), "run_control_process_identity", "process_birth_changed");
@@ -1385,8 +1382,17 @@ private:
     pin.image = runControlProcessImagePin(process);
     return pin;
   }
-  static JsonObject runControlNativeIdentity(HANDLE process, DWORD pid) {
-    const auto pin = runControlObserveProcess(process);
+  static ProcessPin runControlObserveProcess(HANDLE process,
+                                               const char *aliveStage = "process_alive") {
+    const DWORD status = WaitForSingleObject(process, 0);
+    if (status != WAIT_TIMEOUT) {
+      const DWORD error = status == WAIT_FAILED ? GetLastError() : status;
+      throw NativeError{"run_control_process_identity", error,
+                        status == WAIT_FAILED ? "process_alive_wait" : aliveStage};
+    }
+    return runControlPinProcess(process);
+  }
+  static JsonObject runControlIdentityJson(HANDLE process, DWORD pid, const ProcessPin &pin) {
     JsonObject value;
     num(value, L"pid", pid);
     JsonObject creation;
@@ -1402,6 +1408,17 @@ private:
         runControlSidString(const_cast<BYTE *>(pin.sid.data())));
     flag(value, L"appContainer", false);
     return value;
+  }
+  static JsonObject runControlNativeIdentity(HANDLE process, DWORD pid,
+                                             const char *aliveStage = "process_alive") {
+    return runControlIdentityJson(process, pid, runControlObserveProcess(process, aliveStage));
+  }
+  // Endpoint owners may already be retired when this witness runs: the run
+  // state outlives them and ownerRetired observes their exit through exactly
+  // the handles this witness retains. Identity stays the full measurement so a
+  // recycled PID or replaced object never passes; only liveness is absent.
+  static JsonObject runControlHeldIdentity(HANDLE process, DWORD pid) {
+    return runControlIdentityJson(process, pid, runControlPinProcess(process));
   }
   static std::wstring runControlHashHex(const std::array<BYTE, 32> &hash) {
     static const wchar_t hex[] = L"0123456789abcdef";

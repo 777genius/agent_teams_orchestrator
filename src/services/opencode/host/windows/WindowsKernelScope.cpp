@@ -4907,8 +4907,8 @@ public:
     Handle heldHelper(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, helperPid));
     Handle heldBun(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, bunPid));
     require(heldHelper && heldBun &&
-                runControlCanonicalJson(Control::runControlNativeIdentity(heldHelper.value, helperPid)) == runControlCanonicalJson(helper) &&
-                runControlCanonicalJson(Control::runControlNativeIdentity(heldBun.value, bunPid)) == runControlCanonicalJson(bun),
+                runControlCanonicalJson(Control::runControlHeldIdentity(heldHelper.value, helperPid)) == runControlCanonicalJson(helper) &&
+                runControlCanonicalJson(Control::runControlHeldIdentity(heldBun.value, bunPid)) == runControlCanonicalJson(bun),
             "run_control_endpoint_changed");
     std::lock_guard<std::mutex> lock(state.mutex_);
     State::runStateAssertRetirementWitnessLocked(heldHelper.value, state.helperPid_, state.helperBirth_, "run_control_endpoint_changed");
