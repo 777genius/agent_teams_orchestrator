@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { executeOpenCodeBridgeCommandEnvelope } from './OpenCodeBridgeCommandHandler.js'
@@ -9,6 +9,8 @@ import { openCodeHostManager } from './OpenCodeHostManager.js'
 import { openCodeProvisioningProbe } from './OpenCodeProvisioningProbe.js'
 import type { OpenCodeStopRequest } from './OpenCodeStopRecovery.js'
 import type { OpenCodeSessionRecord } from './types.js'
+import { parseOpenCodeStopRequest } from './OpenCodeStopRecovery.js'
+import { validateEnvelope } from './bridge/OpenCodeBridgeProtocol.js'
 
 let dir: string
 let store: OpenCodeSessionStore
@@ -243,6 +245,59 @@ test('wire target mismatch performs no abort and writes no receipt', async () =>
   expect(abort).not.toHaveBeenCalled()
   expect((await store.lookupStop(request)).status).toBe('unknown')
 })
+
+test.skipIf(!process.env.AGENT_TEAMS_TEST_STOP_WIRE_PACKET)(
+  'admits exact app-client alias Stop/recovery bytes while rejecting raw aliases and changed sessions', async () => {
+    const packetPath = process.env.AGENT_TEAMS_TEST_STOP_WIRE_PACKET!
+    if (!path.isAbsolute(packetPath) || !packetPath.split(path.sep).some(part => part.startsWith('TEST-'))) {
+      throw new Error('App Stop wire contract requires an explicit TEST packet')
+    }
+    const packet = JSON.parse(await readFile(packetPath, 'utf8')) as { projectAlias: string; wires: unknown[] }
+    const wires = packet.wires.map(validateEnvelope)
+    expect(wires.map(wire => wire.command)).toEqual(['opencode.stopTeam', 'opencode.stopOutcome', 'opencode.reconcileStop'])
+    const stop = wires[0]!
+    request = parseOpenCodeStopRequest(stop.body.stopRecovery)
+    expect(packet.projectAlias).not.toBe(request.target.projectPath)
+    record = { ...record, teamId: request.target.teamId, laneId: request.target.laneId,
+      runId: request.target.runId, projectPath: request.target.projectPath,
+      memberName: request.target.members[0]!.memberName,
+      opencodeSessionId: request.target.members[0]!.sessionId,
+      expectedBehaviorFingerprint: request.target.expectedBehaviorFingerprint,
+      stopAuthority: { runtime: { ...runtime, capabilitySnapshotId: request.target.capabilitySnapshotId },
+        expectedBehaviorFingerprint: request.target.expectedBehaviorFingerprint } }
+    store = new OpenCodeSessionStore(path.join(dir, 'app-wire-sessions.json'))
+    for (const member of request.target.members) {
+      await store.upsert({ ...record, memberName: member.memberName, opencodeSessionId: member.sessionId })
+    }
+    const abort = track(spyOn(openCodeSessionBridge, 'abort').mockResolvedValue(true))
+    const wrongCwd = await executeOpenCodeBridgeCommandEnvelope({ ...stop, cwd: packet.projectAlias })
+    expect(wrongCwd.ok).toBe(false)
+    if (!wrongCwd.ok) expect(wrongCwd.error.message).toContain('Stop target project mismatch')
+    const wrongBody = await executeOpenCodeBridgeCommandEnvelope({ ...stop,
+      body: { ...stop.body, projectPath: packet.projectAlias } })
+    expect(wrongBody.ok).toBe(false)
+    if (!wrongBody.ok) expect(wrongBody.error.message).toContain('Stop original request/target mismatch')
+    expect(abort).not.toHaveBeenCalled()
+    expect((await store.lookupStop(request)).status).toBe('unknown')
+
+    const original = await executeOpenCodeBridgeCommandEnvelope(stop)
+    expect(original.ok).toBe(true)
+    if (!original.ok) throw new Error(original.error.message)
+    expect(original.data.stopped).toBe(true)
+    const outcome = await executeOpenCodeBridgeCommandEnvelope(wires[1]!)
+    expect(outcome.ok && outcome.data.status).toBe('completed')
+    const reconciled = await executeOpenCodeBridgeCommandEnvelope(wires[2]!)
+    expect(reconciled.ok && reconciled.data.status).toBe('reconciled_stopped')
+    const foreignSession = await executeOpenCodeBridgeCommandEnvelope({ ...stop, body: { ...stop.body,
+      stopRecovery: { ...request, target: { ...request.target,
+        members: [{ memberName: record.memberName, sessionId: 'foreign-generation' }] } } } })
+    expect(foreignSession.ok).toBe(false)
+    expect(abort).toHaveBeenCalledTimes(request.target.members.length)
+    expect(abort.mock.calls.map(call => call[0].opencodeSessionId).sort()).toEqual(
+      request.target.members.map(member => member.sessionId).sort(),
+    )
+  }
+)
 
 test('Stop only releases the original member on a host shared with another team', async () => {
   const sibling = { ...record, teamId: 'sibling', opencodeSessionId: 'sibling-session' }

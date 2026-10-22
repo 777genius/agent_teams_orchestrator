@@ -1111,7 +1111,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       ...process.env,
       DEEPINFRA_API_KEY: 'snapshot-provider-key',
       CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND: '/snapshot/mcp-node',
-      CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON: JSON.stringify(['-e', 'snapshot-command']),
+      CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON: JSON.stringify(['-e', 'process.stdout.write("snapshot-command")']),
       CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENV_JSON: JSON.stringify({ MCP_ROUTE: 'snapshot-route' }),
     }
     const localScope = await resolveOpenCodeProfileScope({
@@ -1130,7 +1130,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     expect(localProfile.appMcpLaunchSource).toBe('env-override')
     expect(localMcp.type).toBe('local')
     expect(localMcp.command).toEqual([
-      '/snapshot/mcp-node', '-e', path.resolve('snapshot-command'),
+      '/snapshot/mcp-node', '-e', 'process.stdout.write("snapshot-command")',
     ])
     expect(localMcp.environment).toMatchObject({ MCP_ROUTE: 'snapshot-route' })
 

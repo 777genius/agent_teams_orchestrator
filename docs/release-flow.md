@@ -52,11 +52,31 @@ Steps:
 5. Create and push an immutable git tag like `v0.0.3`
 6. Wait for the automatically triggered `release-runtime.yml` workflow
 
-Pushing the version tag also triggers `release-runtime.yml`, which publishes the matching runtime
-assets to `agent_teams_orchestrator_binaries` and verifies every asset is anonymously downloadable.
+Pushing the version tag triggers `release-runtime.yml`, which builds all five platform archives
+and uploads them, the versioned manifest and checksums to a **draft** in
+`agent_teams_orchestrator_binaries`. A successful tag workflow does not mean the assets are public;
+the anonymous-download job is skipped while the release remains a draft.
+
+Before publication, qualify all five platform builds and verify the exact seven draft assets.
+Check the manifest's `sourceRef` and `sourceCommit` against the immutable source tag, archive
+SHA256 values against the manifest/checksums, and payload `VERSION` and `COMMIT_SHA`. Retain the
+verified draft release ID and asset identities with the qualification evidence.
+
+After the required owner authorization, promote that exact verified draft ID without rebuilding:
+
+```sh
+gh api --method PATCH "repos/777genius/agent_teams_orchestrator_binaries/releases/RELEASE_ID" \
+  -F draft=false -F prerelease=false -f make_latest=false
+```
+
+Replace `RELEASE_ID` only with the verified draft's ID. This is the same publication operation
+used by the workflow; it preserves the qualified asset bytes and does not promote `latest`.
+Then dispatch `release-runtime.yml` for the same immutable source tag/version with
+`publish_release=false`. The workflow detects the already published release, skips build/upload,
+and runs `Verify public anonymous downloads` against the exact seven assets.
 
 Important:
-- the runtime tag publishes binaries but does **not** update the UI lock automatically
+- the runtime tag creates a binary draft but does **not** publish it or update the UI lock automatically
 - if `claude_team` is still pinned to an older runtime in `runtime.lock.json`, users will keep bootstrapping that older binary
 
 ## Republish runtime assets manually
@@ -69,8 +89,15 @@ Run the private workflow `release-runtime.yml` with:
 - `target_release_repo` = `777genius/agent_teams_orchestrator_binaries`
 - `target_release_tag` = matching public runtime release, for example `runtime-v0.0.3`
 
-This builds the runtime from the private repo and uploads the versioned archives into the dedicated
-public binary release.
+By default this builds the runtime from the private repo and uploads the versioned archives into
+a draft. `publish_release=true` also publishes after upload; `publish_prerelease=true` selects a
+prerelease instead of a stable release, and publication keeps `make_latest=false`.
+
+Do not use a `publish_release=true` redispatch to promote a draft whose bytes have already been
+qualified: when a draft exists, the workflow rebuilds, deletes that draft and creates a replacement
+before uploading. That invalidates the retained draft ID and artifact qualification. Promote the
+verified draft by exact ID as described above, then dispatch with `publish_release=false` for the
+anonymous-download gate. An already published release is not rebuilt by either dispatch path.
 
 After publishing assets, also update `claude_team/runtime.lock.json` to the new runtime version if you want `pnpm dev` and packaged app flows to start using it.
 
@@ -83,8 +110,11 @@ The preferred production flow is for the frontend release workflow to coordinate
 3. If the runtime assets for that lock are missing from the public binary release, the workflow triggers this repo's private `release-runtime.yml` with `workflow_dispatch`.
 4. The frontend workflow finds and polls the exact orchestrator run name:
    `runtime <runtime_version> -> <target_release_repo>@<target_release_tag>`.
-5. After the orchestrator run succeeds, the frontend workflow verifies all runtime assets exist in the public binary release.
-6. Platform packaging jobs download and unpack the matching runtime into `resources/runtime` before `electron-builder`.
+5. A missing runtime's default dispatch creates a draft; complete qualification and exact-ID
+   publication as described above. A successful draft build alone does not satisfy public delivery.
+6. After publication and the anonymous-download gate, the frontend workflow verifies all runtime
+   assets exist in the public binary release.
+7. Platform packaging jobs download and unpack the matching runtime into `resources/runtime` before `electron-builder`.
 
 This keeps the packaged Electron app self-contained while still keeping the runtime source private.
 

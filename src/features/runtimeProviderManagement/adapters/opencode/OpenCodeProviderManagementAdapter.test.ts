@@ -311,7 +311,11 @@ describe('OpenCodeProviderManagementAdapter', () => {
 
       const failure = expectFailure(result)
       expect(failure.code).toBe('runtime-unhealthy')
-      expect(failure.message).toBe('OpenCode inventory probe timed out after 1ms')
+      expect(failure.message).toBe(
+        'OpenCode inventory probe timed out after 1ms '
+        + 'No OpenCode inventory step was active when the timeout fired. '
+        + 'No OpenCode inventory step completed before timeout.',
+      )
       expect(ensureHostCalled).toBe(false)
       expect(setProviderAuthCalled).toBe(false)
       expect(authWriteCalled).toBe(false)
