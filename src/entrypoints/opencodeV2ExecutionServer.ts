@@ -10,6 +10,7 @@ import { executionAssert, executionHash, executionRecord, openCodeV2RunInitializ
 import { assertExecutionProfile, executionProfileGuards, validateExecutionGraph, validateExecutionNative, validateExecutionProfile,
   type ExecutionGraphProgress, type OwnedNativeProfile, type ValidatedExecutionNative } from '../services/opencode/host/OpenCodeV2ExecutionBinding.js'
 import { boundOpenCodeRead } from '../services/opencode/transport/OpenCodeBoundedFetch.js'
+import { runOpenCodeV2ExecutionCloseSequence } from '../services/opencode/execution/OpenCodeV2ExecutionClose.js'
 import { importOpenCodeV2SelectedOAuth } from '../services/opencode/host/OpenCodeV2ExecutionOAuth.js'
 import type { ServerOptions as FloorOptions } from '@opencode/server-v2-floor/options'
 import type { ServerOptions as CurrentOptions } from '@opencode/server/options'
@@ -72,18 +73,17 @@ function close(): Promise<void> {
   return closeWork ??= (async () => {
     if (!runtimeReady) reportStartupFailure('failed')
     closing = true; controller.abort(); clearTimeout(startupTimer)
-    let complete = true
-    // Acquisition may register a Scope after a suspended import. A timeout cannot earn ACK.
-    try { if (startup) await boundOpenCodeRead(startup.catch(() => undefined), 6000) } catch { complete = false }
-    try { if (finalize) await boundOpenCodeRead(finalize(), 3000) } catch { complete = false }
-    try {
-      const birth = await readExecutionPlatformBirth(process.pid)
-      executionAssert(complete && birth && nonce && childControl.connected(), 'cleanup_unknown')
-      await boundOpenCodeRead(childControl.send({ type: 'closed', nonce, leaseOwnerId: prepared?.leaseOwnerId,
-        namespace: prepared?.namespace, executableSha256: prepared?.executableSha256, pid: process.pid,
-        birth, scopeClosed: true }), 500)
-      childControl.disconnect(); process.exit(0)
-    } catch { process.exit(1) }
+    const acknowledged = await runOpenCodeV2ExecutionCloseSequence({
+      startup, finalize,
+      acknowledge: async () => {
+        const birth = await readExecutionPlatformBirth(process.pid)
+        executionAssert(birth && nonce && childControl.connected(), 'cleanup_unknown')
+        await childControl.send({ type: 'closed', nonce, leaseOwnerId: prepared?.leaseOwnerId,
+          namespace: prepared?.namespace, executableSha256: prepared?.executableSha256, pid: process.pid,
+          birth, scopeClosed: true })
+      },
+    })
+    if (acknowledged) { childControl.disconnect(); process.exit(0) } else process.exit(1)
   })()
 }
 childControl.events.on('error', (error: unknown) => { reportStartupFailure('failed', error); void close() })
