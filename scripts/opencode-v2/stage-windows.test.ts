@@ -772,7 +772,7 @@ test('process identity observation retries only transient image failures', async
   // and the kernel-scope image open; process liveness is never retried.
   expect(header.split('runControlTransientObservation(failure)').length - 1).toBe(3)
   expect(header.split('Sleep(runControlObservationRetryDelayMs);').length - 1).toBe(3)
-  expect(slice(header, 'static ProcessPin runControlObserveProcess(HANDLE process) {', '\n  }\n')).not.toContain('Sleep(')
+  expect(slice(header, 'static ProcessPin runControlObserveProcess(HANDLE process,', '\n  }\n')).not.toContain('Sleep(')
   expect(scope).toContain('!Control::runControlTransientObservation(failure)')
   expect(scope).toContain('Sleep(Control::runControlObservationRetryDelayMs);')
 })
