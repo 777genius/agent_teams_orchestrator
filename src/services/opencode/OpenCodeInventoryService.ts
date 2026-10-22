@@ -179,7 +179,7 @@ export type OpenCodeInventoryProbeProgressTracker = {
 }
 
 export function createOpenCodeInventoryProbeProgressTracker(
-  now: () => number = () => Date.now(),
+  now: () => number = () => performance.now(),
 ): OpenCodeInventoryProbeProgressTracker {
   const startedAtMs = now()
   const completedSteps: OpenCodeInventoryProbeProgressSnapshot['completedSteps'] = []
@@ -187,6 +187,12 @@ export function createOpenCodeInventoryProbeProgressTracker(
 
   return {
     enterStep(label: string): () => void {
+      if (currentStep) {
+        completedSteps.push({
+          label: currentStep.label,
+          durationMs: Math.max(0, now() - currentStep.startedAtMs),
+        })
+      }
       const step = { label, startedAtMs: now() }
       currentStep = step
       let active = true
@@ -328,6 +334,7 @@ export function execOpenCodePortableCommand(input: {
   profile: OpenCodePreparedProfile
   abortSignal?: AbortSignal
   timeoutMs?: number
+  progress?: OpenCodeInventoryProbeProgressTracker
 }): Promise<OpenCodeCommandResult> {
   return new Promise(resolve => {
     const stdout: Buffer[] = []
@@ -369,7 +376,9 @@ export function execOpenCodePortableCommand(input: {
         return
       }
 
+      const leaveCleanup = input.progress?.enterStep('clean up OpenCode inventory command')
       void killProcessTreeAndWait(pid, 'SIGKILL').finally(() => {
+        leaveCleanup?.()
         finish({
           ...snapshotOutput(),
           code: 1,
@@ -478,7 +487,9 @@ async function withManagedPluginInstallLock<T>(
   profile: OpenCodePreparedProfile,
   callback: () => Promise<T>,
   abortSignal?: AbortSignal,
+  progress?: OpenCodeInventoryProbeProgressTracker,
 ): Promise<T> {
+  const leaveLock = progress?.enterStep('wait for managed OpenCode plugin install lock')
   const lockPath = path.join(
     profile.xdgCacheHome,
     'opencode',
@@ -493,7 +504,7 @@ async function withManagedPluginInstallLock<T>(
       lockPath,
       OPEN_CODE_MANAGED_PLUGIN_INSTALL_LOCK_OPTIONS,
       abortSignal,
-    )
+    ).finally(() => leaveLock?.())
     if (abortSignal?.aborted) throwOpenCodeAbortReason(abortSignal)
     await repairEmptyOpenCodeManagedPluginCaches(profile.xdgCacheHome)
     return await callback()
@@ -508,7 +519,9 @@ async function withOpenCodeInventoryCommandLock<T>(
   profile: OpenCodePreparedProfile,
   callback: () => Promise<T>,
   abortSignal?: AbortSignal,
+  progress?: OpenCodeInventoryProbeProgressTracker,
 ): Promise<T> {
+  const leaveLock = progress?.enterStep('wait for OpenCode inventory command lock')
   const lockPath = path.join(profile.profileRootPath, 'inventory-command.lock')
   await mkdir(path.dirname(lockPath), { recursive: true })
   await writeFile(lockPath, '', { flag: 'a' })
@@ -517,7 +530,7 @@ async function withOpenCodeInventoryCommandLock<T>(
     lockPath,
     OPEN_CODE_INVENTORY_COMMAND_LOCK_OPTIONS,
     abortSignal,
-  )
+  ).finally(() => leaveLock?.())
   try {
     if (abortSignal?.aborted) throwOpenCodeAbortReason(abortSignal)
     return await callback()
@@ -555,11 +568,12 @@ export async function prewarmOpenCodeManagedSubscriptionPlugins(input: {
         profile: input.profile,
         abortSignal: input.abortSignal,
         timeoutMs: OPEN_CODE_MANAGED_PLUGIN_FIRST_LOAD_TIMEOUT_MS,
+        progress: input.progress,
       })
     } finally {
       leaveStep?.()
     }
-  }, input.abortSignal)
+  }, input.abortSignal, input.progress)
 }
 
 export function isOpenCodeInventoryTimeoutMessage(message: string | null | undefined): boolean {
@@ -615,7 +629,7 @@ export function buildOpenCodeInventoryTimeoutSnapshot(input: {
     modelMetadata: [],
     agents: [],
     authStorePath: null,
-    probeError: message,
+    probeError: diagnostics.slice(0, input.progress ? 3 : 1).join(' '),
     diagnostics,
   }
 }
@@ -980,6 +994,7 @@ export class OpenCodeInventoryService {
         profile,
         abortSignal: options.abortSignal,
         timeoutMs: options.timeoutMs ?? getOpenCodeInventoryCommandTimeoutMs(args),
+        progress: options.progress,
       })
     } finally {
       leaveStep?.()
@@ -999,6 +1014,7 @@ export class OpenCodeInventoryService {
     }
     const resolvedProjectPath = await canonicalizeOpenCodeProjectPath(projectPath)
     // Select generation before V1 profile preparation, plugin prewarming, locks or cache lookup.
+    const leaveSelection = options.progress?.enterStep('select OpenCode binary generation')
     let selection: Awaited<ReturnType<typeof inspectOpenCodeReadSelection>>
     try { selection = await inspectOpenCodeReadSelection(options.abortSignal, options.onReadAcquisitionStarted) }
     catch (failure) {
@@ -1011,7 +1027,7 @@ export class OpenCodeInventoryService {
         diagnostics: ['capabilities_pending'], readGeneration: 'unsupported',
       }
     }
-    finally { options.onReadAcquisitionSettled?.() }
+    finally { leaveSelection?.(); options.onReadAcquisitionSettled?.() }
     if (selection.native && mode === 'full') {
       options.onV2ReadStarted?.()
       return probeOpenCodeV2Inventory(selection.native, resolvedProjectPath, { signal: options.abortSignal, remainingMs: options.remainingMs })
@@ -1082,7 +1098,7 @@ export class OpenCodeInventoryService {
         binaryPath,
         profile,
         verifiedVersion: options.v1SettingsOnly ? selection.policy.version ?? undefined : undefined,
-      }), options.abortSignal,
+      }), options.abortSignal, options.progress,
     )
   }
 

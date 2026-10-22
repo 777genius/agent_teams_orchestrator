@@ -804,6 +804,25 @@ describe('OpenCodeMcpManager', () => {
     ])
   })
 
+  test('preserves module URLs and literal operands in full args JSON', async () => {
+    const args = [
+      '--import',
+      'file:///TEST%20project/100%25/tsx/loader.mjs',
+      '/TEST project/agent-teams-mcp/src/index.ts',
+      '--label',
+      'literal value 100%',
+    ]
+    const result = await resolveOpenCodeAppMcpLaunchConfig({
+      env: {
+        CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND: '/TEST/node',
+        CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON: JSON.stringify(args),
+      },
+      pathExists: async () => false,
+    })
+
+    expect(result.config.command).toEqual(['/TEST/node', ...args])
+  })
+
   test('applies MCP env JSON only to local MCP launch config', async () => {
     const result = await resolveOpenCodeAppMcpLaunchConfig({
       env: {

@@ -1110,7 +1110,7 @@ export class OpenCodeHostManager {
   ): Promise<{ baseUrl: string; pid: number }> {
     if (abortSignal?.aborted) throwOpenCodeAbortReason(abortSignal)
     if (!input.runId || !input.sessionId) throw new Error('OpenCode cleanup requires exact run and session')
-    return this.withPersistentRegistryLock(async () => {
+    const readQualifiedOwner = async () => {
       const record = (await this.readPersistentRegistryUnlocked()).hosts[hostKey]
       const lease = record && normalizePersistentHostLeases(record.leases)[buildLeaseKey(input)]
       if (!record || record.hostKey !== hostKey || record.projectPath !== input.projectPath
@@ -1128,11 +1128,31 @@ export class OpenCodeHostManager {
         || record.baseUrl !== `http://127.0.0.1:${record.port}`) {
         throw new Error('OpenCode cleanup endpoint is invalid')
       }
-      if ((await this.inspectPersistentHostProcessIdentity(record)).state !== 'confirmed') {
-        throw new Error('OpenCode cleanup host process ownership is unavailable')
+      return { record, lease }
+    }
+    const snapshot = await this.withPersistentRegistryLock(readQualifiedOwner)
+    // OS inspection can take seconds. It must not hold the shared registry gate
+    // while independent members are retaining or releasing their exact leases.
+    if ((await raceOpenCodeAbortSignal(
+      this.inspectPersistentHostProcessIdentity(snapshot.record), abortSignal,
+    )).state !== 'confirmed') {
+      throw new Error('OpenCode cleanup host process ownership is unavailable')
+    }
+    return this.withPersistentRegistryLock(async () => {
+      const current = await readQualifiedOwner()
+      const identity = (value: typeof snapshot) => JSON.stringify({
+        hostKey: value.record.hostKey, projectPath: value.record.projectPath,
+        pid: value.record.pid, processStartedAtMs: value.record.processStartedAtMs,
+        baseUrl: value.record.baseUrl, port: value.record.port,
+        lease: { leaseKey: value.lease.leaseKey, teamId: value.lease.teamId,
+          laneId: value.lease.laneId, memberName: value.lease.memberName,
+          runId: value.lease.runId, sessionId: value.lease.sessionId, createdAt: value.lease.createdAt },
+      })
+      if (identity(current) !== identity(snapshot)) {
+        throw new Error('OpenCode cleanup host ownership changed during process inspection')
       }
       if (abortSignal?.aborted) throwOpenCodeAbortReason(abortSignal)
-      return { baseUrl: record.baseUrl, pid: record.pid }
+      return { baseUrl: current.record.baseUrl, pid: current.record.pid }
     })
   }
 
