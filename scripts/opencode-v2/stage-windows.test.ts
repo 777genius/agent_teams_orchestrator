@@ -776,3 +776,28 @@ test('process identity observation retries only transient image failures', async
   expect(scope).toContain('!Control::runControlTransientObservation(failure)')
   expect(scope).toContain('Sleep(Control::runControlObservationRetryDelayMs);')
 })
+
+test('run control frame budgets carry the full broker control packet on every hop', async () => {
+  const windows = path.resolve(import.meta.dir, '../../src/services/opencode/host/windows')
+  const read = async (name: string) => readFile(name, 'utf8')
+  const header = await read(path.join(windows, 'WindowsNativeRunControl.hpp'))
+  const runControl = await read(path.resolve(import.meta.dir, '../../src/services/opencode/bridge/OpenCodeV2RunControl.ts'))
+  const broker = await read(path.join(windows, 'OpenCodeV2WindowsNativeBroker.ts'))
+  const budget = (source: string, name: string) => {
+    const match = source.match(new RegExp(`(?:const|constexpr[^\\n]*?)\\s+${name}\\s*=\\s*([0-9 *]+?);?\\n`))
+    expect(match).not.toBeNull()
+    return match![1].split('*').map(part => Number(part.trim())).reduce((left, right) => left * right, 1)
+  }
+  const packet = budget(broker, 'CONTROL_PACKET_LIMIT')
+  // A full transcript cut is one control reply: the pipe/socket frame on both
+  // peers and the broker stdio packet hops must share one budget, or a large
+  // reply is refused mid-flight and its read is silently projected as empty.
+  expect(budget(header, 'RUN_CONTROL_MAX_FRAME_BYTES')).toBe(packet)
+  expect(budget(runControl, 'MAX_FRAME')).toBe(packet)
+  // Record reads keep their own smaller bound; only frames inherit the packet budget.
+  expect(budget(runControl, 'MAX_RECORD')).toBe(512 * 1024)
+  expect(runControl).toContain('before.size <= MAX_RECORD')
+  expect(runControl).toContain('bytes.length <= MAX_RECORD')
+  expect(runControl).toContain('bytes.length > MAX_FRAME')
+  expect(runControl).toContain('Buffer.byteLength(bytes) <= MAX_FRAME')
+})

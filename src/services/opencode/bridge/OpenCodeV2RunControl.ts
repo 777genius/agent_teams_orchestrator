@@ -17,7 +17,9 @@ import { ensureWindowsPrivateDirectories } from '../profile/OpenCodePrivateDirec
 import type { WindowsLaunchPlan } from '../host/windows/OpenCodeV2WindowsExecution.js'
 export type { RunBinding, RunControlRecord, RunControlRequest, RunControlResult, RunLaunchPlan } from './OpenCodeV2RunTypes.js'
 
-const MAX_FRAME = 512 * 1024
+const MAX_RECORD = 512 * 1024
+// Frames carry full control replies and share the broker packet budget.
+const MAX_FRAME = 16 * 1024 * 1024
 // Graph preparation and native startup share one absolute budget. Individual control operations remain capped at 30s.
 export const OPEN_CODE_V2_RUN_INITIALIZATION_MS = openCodeV2RunInitializationMs(process.platform)
 const MAX_OPERATION_MS = 30_000
@@ -609,12 +611,12 @@ async function openSocketDirectory(directory: string, uid: number) {
 }
 async function readPrivate(file: string, uid: number): Promise<Buffer> {
   const before = await privatePath(file, 'file', uid)
-  executionAssert(before.size <= MAX_FRAME, 'run_control_invalid')
+  executionAssert(before.size <= MAX_RECORD, 'run_control_invalid')
   const fd = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW)
   try {
     const stat = await fd.stat()
     executionAssert(stat.dev === before.dev && stat.ino === before.ino, 'run_control_changed')
-    const bytes = await fd.readFile(); executionAssert(bytes.length <= MAX_FRAME, 'run_control_invalid'); return bytes
+    const bytes = await fd.readFile(); executionAssert(bytes.length <= MAX_RECORD, 'run_control_invalid'); return bytes
   } finally { await fd.close() }
 }
 export async function writeRunControlFile(directory: string, name: string, value: unknown): Promise<void> {

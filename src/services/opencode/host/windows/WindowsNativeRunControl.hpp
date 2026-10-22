@@ -25,7 +25,9 @@
 // The owner boundary is deliberately narrow: only the retained-selection root
 // issuer can construct this object. All observable identifiers are registry
 // generations; HANDLE and PID values never cross the JSON boundary.
-static constexpr DWORD RUN_CONTROL_MAX_FRAME_BYTES = 512 * 1024;
+// A control reply (a full transcript cut) is one frame on the pipe and one
+// packet on the broker stdio hop; one shared budget keeps both hops equal.
+static constexpr DWORD RUN_CONTROL_MAX_FRAME_BYTES = 16 * 1024 * 1024;
 static std::string runControlCanonicalJson(const IJsonValue &value) {
   switch (value.ValueType()) {
   case JsonValueType::Null:
