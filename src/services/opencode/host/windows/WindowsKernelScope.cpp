@@ -4780,10 +4780,19 @@ public:
     Handle parent(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE,
                               static_cast<DWORD>(parentPid)));
     require(static_cast<bool>(parent), "run_control_parent_join");
-    Handle executable(CreateFileW(extended(image(GetCurrentProcess())).c_str(), GENERIC_READ | READ_CONTROL,
-                                 FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                                 FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
-    require(static_cast<bool>(executable), "run_control_process_identity");
+    Handle executable;
+    for (int attempt = 0;; ++attempt) {
+      executable = Handle(CreateFileW(extended(image(GetCurrentProcess())).c_str(),
+                                     GENERIC_READ | READ_CONTROL, FILE_SHARE_READ, nullptr,
+                                     OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+      if (executable) break;
+      const DWORD error = GetLastError();
+      const NativeError failure{"run_control_process_identity", error, "process_image_open"};
+      if (attempt + 1 >= Control::runControlObservationAttempts ||
+          !Control::runControlTransientObservation(failure))
+        throw failure;
+      Sleep(Control::runControlObservationRetryDelayMs);
+    }
     Control::HeldInputs held;
     held.selectedDirectory = config.root.value;
     held.config = config.config.value;

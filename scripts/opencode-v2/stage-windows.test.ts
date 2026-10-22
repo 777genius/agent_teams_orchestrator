@@ -689,3 +689,90 @@ test('client request budget expiry is closed apart from the run wall deadline', 
   expect(source).not.toContain('require(value > 0, "run_deadline_expired");')
   expect(source).not.toContain('require(activeRemaining > replyAllowance, "run_deadline_expired");')
 })
+
+test('process identity observation retries only transient image failures', async () => {
+  const { runInNewContext } = await import('node:vm')
+  const windows = path.resolve(import.meta.dir, '../../src/services/opencode/host/windows')
+  const source = async (name: string) => (await readFile(path.join(windows, name), 'utf8')).replaceAll('\r\n', '\n')
+  const header = await source('WindowsNativeRunControl.hpp')
+  const scope = await source('WindowsKernelScope.cpp')
+  const slice = (text: string, from: string, to: string) => {
+    const begin = text.indexOf(from), end = text.indexOf(to, begin)
+    expect(begin).toBeGreaterThanOrEqual(0); expect(end).toBeGreaterThan(begin)
+    return text.slice(begin + from.length, end)
+  }
+  const translate = (body: string) => body
+    .replaceAll('FILETIME creation{}, exitTime{}, kernel{}, user{};',
+      'let creation = {}, exitTime = {}, kernel = {}, user = {};')
+    .replaceAll('NativeError failure{"run_control_process_identity", error, "process_birth"}',
+      "failure = { code: 'run_control_process_identity', win32: error, stage: 'process_birth' }")
+    .replaceAll('NativeError{"run_control_process_identity", error, "process_birth"}',
+      "{ code: 'run_control_process_identity', win32: error, stage: 'process_birth' }")
+    .replaceAll('NativeError{', '{')
+    .replaceAll('const DWORD error = ', 'const error = ')
+    .replaceAll('for (int attempt = 0;; ++attempt)', 'for (let attempt = 0;; ++attempt)')
+    .replaceAll('&creation', 'creation').replaceAll('&exitTime', 'exitTime')
+    .replaceAll('&kernel', 'kernel').replaceAll('&user', 'user')
+  // A transient observation failure is re-observed a bounded number of times;
+  // the retry never touches liveness or any pin comparison.
+  const birth = (failures: readonly number[]) => {
+    let calls = 0
+    const sleeps: number[] = []
+    const body = translate(slice(header, 'static FILETIME runControlBirth(HANDLE process) {', '\n  }\n'))
+    let value: unknown
+    try {
+      value = runInNewContext(`(function () {${body}\n})()`, {
+        process: {},
+        GetProcessTimes: (_process: unknown, creation: Record<string, unknown>) => {
+          calls += 1
+          if (calls <= failures.length) return false
+          Object.assign(creation, { observed: true })
+          return true
+        },
+        GetLastError: () => failures[Math.min(calls, failures.length) - 1] ?? 0,
+        Sleep: (ms: number) => { sleeps.push(ms) },
+        runControlObservationAttempts: 3,
+        runControlObservationRetryDelayMs: 25,
+        runControlTransientObservation: (failure: { win32: number }) => [31, 32, 33].includes(failure.win32),
+      })
+    } catch (error) { return { error: error as { code?: string; stage?: string; win32?: number }, calls, sleeps } }
+    return { value, calls, sleeps }
+  }
+  expect(birth([31])).toEqual({ value: { observed: true }, calls: 2, sleeps: [25] })
+  expect(birth([31, 32])).toEqual({ value: { observed: true }, calls: 3, sleeps: [25, 25] })
+  expect(birth([31, 31, 31])).toEqual({
+    error: { code: 'run_control_process_identity', win32: 31, stage: 'process_birth' }, calls: 3, sleeps: [25, 25] })
+  // Non-transient refusals and exhausted retries stay single-shot definitive.
+  expect(birth([5])).toEqual({
+    error: { code: 'run_control_process_identity', win32: 5, stage: 'process_birth' }, calls: 1, sleeps: [] })
+  expect(birth([0])).toEqual({
+    error: { code: 'run_control_process_identity', win32: 0, stage: 'process_birth' }, calls: 1, sleeps: [] })
+
+  const predicate = translate(slice(header,
+    'static bool runControlTransientObservation(const NativeError &failure) {', '\n  }\n'))
+    .replaceAll('const std::string stage = ', 'const stage = ')
+  const classify = (code: string, stage: string | null, win32: number) => runInNewContext(
+    `(function () {${predicate}\n})()`, {
+      failure: { code, stage, win32 },
+      ERROR_GEN_FAILURE: 31, ERROR_SHARING_VIOLATION: 32, ERROR_LOCK_VIOLATION: 33,
+    })
+  for (const stage of ['process_birth', 'process_image_path', 'process_image_open'])
+    for (const win32 of [31, 32, 33])
+      expect(classify('run_control_process_identity', stage, win32)).toBe(true)
+  const refused: readonly (readonly [string, string | null, number])[] = [
+    ['run_control_process_identity', 'process_alive', 31],
+    ['run_control_process_identity', 'process_image_path', 5],
+    ['run_control_process_identity', 'process_image_path', 0],
+    ['run_control_process_identity', null, 31],
+    ['run_control_path_alias', 'process_image_path', 31],
+  ]
+  for (const [code, stage, win32] of refused) expect(classify(code, stage, win32)).toBe(false)
+
+  // The same bounded observation retry guards the image path, the image pin
+  // and the kernel-scope image open; process liveness is never retried.
+  expect(header.split('runControlTransientObservation(failure)').length - 1).toBe(3)
+  expect(header.split('Sleep(runControlObservationRetryDelayMs);').length - 1).toBe(3)
+  expect(slice(header, 'static ProcessPin runControlObserveProcess(HANDLE process) {', '\n  }\n')).not.toContain('Sleep(')
+  expect(scope).toContain('!Control::runControlTransientObservation(failure)')
+  expect(scope).toContain('Sleep(Control::runControlObservationRetryDelayMs);')
+})

@@ -1257,38 +1257,70 @@ private:
     const bool secondFull = runControlRequireFullToken(second);
     return firstFull && secondFull;
   }
+  // AV/defender scanning the same binary can fail a live image observation
+  // transiently. Only the observation itself is retried; process liveness and
+  // every pin comparison stay single-shot and definitive.
+  static constexpr int runControlObservationAttempts = 3;
+  static constexpr DWORD runControlObservationRetryDelayMs = 25;
+  static bool runControlTransientObservation(const NativeError &failure) {
+    const std::string stage = failure.stage ? failure.stage : "";
+    return failure.code == "run_control_process_identity" &&
+           (stage == "process_birth" || stage == "process_image_path" ||
+            stage == "process_image_open") &&
+           (failure.win32 == ERROR_GEN_FAILURE ||
+            failure.win32 == ERROR_SHARING_VIOLATION ||
+            failure.win32 == ERROR_LOCK_VIOLATION);
+  }
   static FILETIME runControlBirth(HANDLE process) {
-    FILETIME creation{}, exitTime{}, kernel{}, user{};
-    if (!GetProcessTimes(process, &creation, &exitTime, &kernel, &user)) {
+    for (int attempt = 0;; ++attempt) {
+      FILETIME creation{}, exitTime{}, kernel{}, user{};
+      if (GetProcessTimes(process, &creation, &exitTime, &kernel, &user))
+        return creation;
       const DWORD error = GetLastError();
-      throw NativeError{"run_control_process_identity", error, "process_birth"};
+      const NativeError failure{"run_control_process_identity", error, "process_birth"};
+      if (attempt + 1 >= runControlObservationAttempts ||
+          !runControlTransientObservation(failure))
+        throw failure;
+      Sleep(runControlObservationRetryDelayMs);
     }
-    return creation;
   }
   static bool runControlAlive(HANDLE process) {
     return WaitForSingleObject(process, 0) == WAIT_TIMEOUT;
   }
   static std::wstring runControlImagePath(HANDLE process) {
     std::vector<wchar_t> path(32768);
-    DWORD size = static_cast<DWORD>(path.size());
-    if (!QueryFullProcessImageNameW(process, 0, path.data(), &size)) {
+    for (int attempt = 0;; ++attempt) {
+      DWORD size = static_cast<DWORD>(path.size());
+      if (QueryFullProcessImageNameW(process, 0, path.data(), &size)) {
+        require(size > 0, "run_control_process_identity", "process_image_path");
+        return std::wstring(path.data(), size);
+      }
       const DWORD error = GetLastError();
-      throw NativeError{"run_control_process_identity", error, "process_image_path"};
+      const NativeError failure{"run_control_process_identity", error, "process_image_path"};
+      if (attempt + 1 >= runControlObservationAttempts ||
+          !runControlTransientObservation(failure))
+        throw failure;
+      Sleep(runControlObservationRetryDelayMs);
     }
-    require(size > 0, "run_control_process_identity", "process_image_path");
-    return std::wstring(path.data(), size);
   }
   static FilePin runControlProcessImagePin(HANDLE process) {
     const auto path = runControlImagePath(process);
     require(path.size() >= 3 && path[1] == L':' && path[2] == L'\\',
             "run_control_path_alias");
     const auto extended = L"\\\\?\\" + path;
-    Handle image(CreateFileW(extended.c_str(), GENERIC_READ,
-                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                            OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
-    if (!image) {
+    Handle image;
+    for (int attempt = 0;; ++attempt) {
+      image = Handle(CreateFileW(extended.c_str(), GENERIC_READ,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT,
+                                nullptr));
+      if (image) break;
       const DWORD error = GetLastError();
-      throw NativeError{"run_control_process_identity", error, "process_image_open"};
+      const NativeError failure{"run_control_process_identity", error, "process_image_open"};
+      if (attempt + 1 >= runControlObservationAttempts ||
+          !runControlTransientObservation(failure))
+        throw failure;
+      Sleep(runControlObservationRetryDelayMs);
     }
     auto pin = runControlObserveFile(image.value, false);
     pin.sha256 = runControlSha256(image.value);
