@@ -333,6 +333,8 @@ const privateNativeFailureCodes = new Set([
 const privateNativeFailureStages = new Set([
   'alias_predicate',
   'assert_mapping', 'assert_stopped', 'assert_broker',
+  'process_alive', 'process_alive_wait',
+  'process_alive_held_bun', 'process_alive_package_peer', 'process_alive_peer', 'process_alive_peer_parent',
   'process_birth', 'process_image_path', 'process_image_open', 'process_birth_changed',
   'shared_acl_mutex_descriptor', 'shared_acl_mutex_create', 'shared_acl_mutex_security',
   'shared_acl_mutex_encoding', 'shared_acl_mutex_authority', 'shared_acl_mutex_wait', 'shared_acl_mutex',

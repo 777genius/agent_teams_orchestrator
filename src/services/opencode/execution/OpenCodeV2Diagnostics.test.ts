@@ -651,3 +651,32 @@ test('actual native broker alias reply decoder persists original operation and s
     await rm(root, { recursive: true, force: true })
   }
 })
+
+test('run control identity diagnostics name the observed process checkpoint stage', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'TEST-v2-identity-stage-'))
+  const previous = process.env.CLAUDE_MULTIMODEL_DATA_HOME
+  process.env.CLAUDE_MULTIMODEL_DATA_HOME = root
+  try {
+    const expected = [
+      { stage: 'process_alive', nativeCode: 0 },
+      { stage: 'process_alive_wait', nativeCode: 5 },
+      { stage: 'process_alive_held_bun', nativeCode: 0 },
+      { stage: 'process_alive_package_peer', nativeCode: 0 },
+      { stage: 'process_alive_peer', nativeCode: 0 },
+      { stage: 'process_alive_peer_parent', nativeCode: 0 },
+    ]
+    for (const { stage, nativeCode } of expected)
+      await recordOpenCodeV2ProviderFailure('run-member-retirement',
+        new Error(`run_control_process_identity:${stage}:${nativeCode}`), true, undefined, undefined, { elapsedMs: 1, dataRoot: root })
+    const rows = await Promise.all((await readdir(path.join(root, 'opencode/v2/provider-diagnostics'))).map(async name =>
+      JSON.parse(await readFile(path.join(root, 'opencode/v2/provider-diagnostics', name), 'utf8'))))
+    expect(rows).toHaveLength(expected.length)
+    expect(rows.map((row) => row.native).sort((a, b) => a.stage.localeCompare(b.stage)))
+      .toEqual(expected.slice().sort((a, b) => a.stage.localeCompare(b.stage)))
+    expect(rows.every((row) => row.category === 'run_control_process_identity')).toBe(true)
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_DATA_HOME
+    else process.env.CLAUDE_MULTIMODEL_DATA_HOME = previous
+    await rm(root, { recursive: true, force: true })
+  }
+})

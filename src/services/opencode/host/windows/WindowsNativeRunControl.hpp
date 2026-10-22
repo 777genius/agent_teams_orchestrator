@@ -734,11 +734,11 @@ struct WindowsNativeRunControl {
     require(runControlAlive(connection.peerParent.value) &&
                 runControlRequireFullToken(connection.peerParent.value),
             "run_control_peer_identity");
-    const ProcessPin parentBefore = runControlObserveProcess(connection.peerParent.value);
+    const ProcessPin parentBefore = runControlObserveProcess(connection.peerParent.value, "process_alive_peer_parent");
     const auto measured = runControlNativeIdentity(connection.peerParent.value,
                                                    connection.peerParentPin.pid);
-    const ProcessPin parentAfter = runControlObserveProcess(connection.peerParent.value);
-    const ProcessPin peerAfter = runControlObserveProcess(connection.peerProcess.value);
+    const ProcessPin parentAfter = runControlObserveProcess(connection.peerParent.value, "process_alive_peer_parent");
+    const ProcessPin peerAfter = runControlObserveProcess(connection.peerProcess.value, "process_alive_peer");
     require(runControlSameProcess(parentBefore, connection.peerParentPin) &&
                 runControlSameProcess(parentAfter, connection.peerParentPin) &&
                 runControlSameProcess(peerAfter, connection.peer) &&
@@ -1348,12 +1348,13 @@ private:
     require(status >= 0 && returned >= sizeof(information), "run_control_parent_join");
     return static_cast<std::uint64_t>(information.inheritedFromUniqueProcessId);
   }
-  static ProcessPin runControlObserveProcess(HANDLE process) {
+  static ProcessPin runControlObserveProcess(HANDLE process,
+                                               const char *aliveStage = "process_alive") {
     const DWORD status = WaitForSingleObject(process, 0);
     if (status != WAIT_TIMEOUT) {
       const DWORD error = status == WAIT_FAILED ? GetLastError() : status;
       throw NativeError{"run_control_process_identity", error,
-                        status == WAIT_FAILED ? "process_alive_wait" : "process_alive"};
+                        status == WAIT_FAILED ? "process_alive_wait" : aliveStage};
     }
     const FILETIME first = runControlBirth(process);
     const FILETIME second = runControlBirth(process);
@@ -1432,9 +1433,9 @@ private:
 
     const FILETIME parentBirthBefore = runControlBirth(intendedBun_.value);
     require(runControlAlive(intendedBun_.value), "run_control_parent_join");
-    const ProcessPin parentBefore = runControlObserveProcess(intendedBun_.value);
+    const ProcessPin parentBefore = runControlObserveProcess(intendedBun_.value, "process_alive_held_bun");
     const ProcessPin helper = runControlObserveProcess(GetCurrentProcess());
-    const ProcessPin parentAfter = runControlObserveProcess(intendedBun_.value);
+    const ProcessPin parentAfter = runControlObserveProcess(intendedBun_.value, "process_alive_held_bun");
     require(runControlParentPid(GetCurrentProcess()) == parentBefore.pid &&
                 runControlSameProcess(parentBefore, parentAfter) &&
                 runControlSameBirth(parentBirthBefore, parentAfter.birth),
@@ -1463,7 +1464,7 @@ private:
   }
   void runControlValidatePackagePeer() {
     const ProcessPin expectedPeer = held_.localRole == Role::server ? expected_.client : expected_.server;
-    const ProcessPin before = runControlObserveProcess(packagePeerProcess_.value);
+    const ProcessPin before = runControlObserveProcess(packagePeerProcess_.value, "process_alive_package_peer");
     require(runControlAlive(packagePeerProcess_.value) && runControlSameProcess(before, expectedPeer),
             "run_control_package_peer_identity");
     HANDLE raw = nullptr;
@@ -1497,7 +1498,7 @@ private:
     const auto actualString = runControlSidString(actual);
     require(actualString.rfind(L"S-1-15-2-", 0) == 0 && actualString != L"S-1-15-2-1",
             "run_control_package_peer_identity");
-    const ProcessPin after = runControlObserveProcess(packagePeerProcess_.value);
+    const ProcessPin after = runControlObserveProcess(packagePeerProcess_.value, "process_alive_package_peer");
     require(runControlSameProcess(before, after) && runControlSameProcess(after, expectedPeer),
             "run_control_package_peer_identity");
     if (!packageSid_.empty()) require(packageSid_ == actualString, "run_control_package_peer_identity");
@@ -1505,9 +1506,9 @@ private:
   }
   void runControlRevalidateHeld() {
     require(runControlAlive(intendedBun_.value), "run_control_parent_join");
-    const ProcessPin parentBefore = runControlObserveProcess(intendedBun_.value);
+    const ProcessPin parentBefore = runControlObserveProcess(intendedBun_.value, "process_alive_held_bun");
     const ProcessPin helper = runControlObserveProcess(GetCurrentProcess());
-    const ProcessPin parentAfter = runControlObserveProcess(intendedBun_.value);
+    const ProcessPin parentAfter = runControlObserveProcess(intendedBun_.value, "process_alive_held_bun");
     const ProcessPin expectedLocal =
         held_.localRole == Role::server ? expected_.server : expected_.client;
     require(runControlParentPid(GetCurrentProcess()) == parentBefore.pid &&
@@ -1538,7 +1539,7 @@ private:
       require(static_cast<bool>(peer), "run_control_peer_identity");
       connection.peerProcess = std::move(peer);
     }
-    const ProcessPin peerPin = runControlObserveProcess(connection.peerProcess.value);
+    const ProcessPin peerPin = runControlObserveProcess(connection.peerProcess.value, "process_alive_peer");
     const ProcessPin localPin = runControlObserveProcess(GetCurrentProcess());
     const auto peerParentPid = runControlParentPid(connection.peerProcess.value);
     require(peerParentPid > 0 && peerParentPid <= MAXDWORD, "run_control_parent_join");
@@ -1548,19 +1549,19 @@ private:
       require(static_cast<bool>(parent), "run_control_parent_join");
       connection.peerParent = std::move(parent);
     }
-    const ProcessPin peerParentBefore = runControlObserveProcess(connection.peerParent.value);
-    const ProcessPin peerAfter = runControlObserveProcess(connection.peerProcess.value);
+    const ProcessPin peerParentBefore = runControlObserveProcess(connection.peerParent.value, "process_alive_peer_parent");
+    const ProcessPin peerAfter = runControlObserveProcess(connection.peerProcess.value, "process_alive_peer");
     require(filetime(peerParentBefore.birth) < filetime(peerPin.birth) &&
                 runControlSameProcess(peerPin, peerAfter) &&
                 runControlSameProcess(peerParentBefore,
-                                      runControlObserveProcess(connection.peerParent.value)) &&
+                                      runControlObserveProcess(connection.peerParent.value, "process_alive_peer_parent")) &&
                 runControlSameSid(peerPin.sid, peerParentBefore.sid),
             "run_control_peer_identity");
     if (!fixedPeer_) {
       require(runControlRequireFreshFullTokens(connection.peerProcess.value,
                                                connection.peerParent.value),
               "run_control_peer_identity");
-      const ProcessPin localParent = runControlObserveProcess(intendedBun_.value);
+      const ProcessPin localParent = runControlObserveProcess(intendedBun_.value, "process_alive_held_bun");
       const ProcessPin expectedHelper =
           connection.side == Role::server ? expectedEndpoint_.helper : expectedEndpoint_.helper;
       const ProcessPin expectedBun =
