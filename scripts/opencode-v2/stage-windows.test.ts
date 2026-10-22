@@ -779,7 +779,8 @@ test('process identity observation retries only transient image failures', async
 
 test('run control frame budgets carry the full broker control packet on every hop', async () => {
   const windows = path.resolve(import.meta.dir, '../../src/services/opencode/host/windows')
-  const read = async (name: string) => readFile(name, 'utf8')
+  // Windows checkouts carry CRLF; markers and budgets match on normalized lines.
+  const read = async (name: string) => (await readFile(name, 'utf8')).replaceAll('\r\n', '\n')
   const header = await read(path.join(windows, 'WindowsNativeRunControl.hpp'))
   const runControl = await read(path.resolve(import.meta.dir, '../../src/services/opencode/bridge/OpenCodeV2RunControl.ts'))
   const broker = await read(path.join(windows, 'OpenCodeV2WindowsNativeBroker.ts'))
