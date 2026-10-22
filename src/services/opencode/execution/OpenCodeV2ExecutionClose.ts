@@ -1,11 +1,10 @@
 import { boundOpenCodeRead } from '../transport/OpenCodeBoundedFetch.js'
 
-/** The owner waits 10s for the wrapper exit after its close frame; the whole
- * close sequence, closed ACK included, must stay inside that window. */
-export const openCodeV2ExecutionCloseMs = 9500
-export const openCodeV2ExecutionCloseStartupMs = 6000
-export const openCodeV2ExecutionCloseFinalizeMs = 3000
-export const openCodeV2ExecutionCloseAckMs = 500
+/** The owner waits 10s for the wrapper exit after its close frame, then force
+ * kills. The whole close sequence shares one window inside that limit and
+ * always reserves its tail for the ACK send. */
+export const openCodeV2ExecutionCloseMs = 8500
+export const openCodeV2ExecutionCloseAckReserveMs = 2000
 
 export type ExecutionCloseSequenceInput = Readonly<{
   startup?: Promise<unknown> | undefined
@@ -20,13 +19,13 @@ export async function runOpenCodeV2ExecutionCloseSequence(sequence: ExecutionClo
   deadline: number = Date.now() + openCodeV2ExecutionCloseMs): Promise<boolean> {
   let complete = true
   const remaining = () => Math.max(1, deadline - Date.now())
+  const phase = () => Math.max(1, remaining() - openCodeV2ExecutionCloseAckReserveMs)
   try {
-    if (sequence.startup) await boundOpenCodeRead(Promise.resolve(sequence.startup).catch(() => undefined),
-      Math.min(openCodeV2ExecutionCloseStartupMs, remaining()))
+    if (sequence.startup) await boundOpenCodeRead(Promise.resolve(sequence.startup).catch(() => undefined), phase())
   } catch { complete = false }
   try {
-    if (sequence.finalize) await boundOpenCodeRead(sequence.finalize(), Math.min(openCodeV2ExecutionCloseFinalizeMs, remaining()))
+    if (sequence.finalize) await boundOpenCodeRead(sequence.finalize(), phase())
   } catch { complete = false }
   if (!complete) return false
-  try { await boundOpenCodeRead(sequence.acknowledge(), Math.min(openCodeV2ExecutionCloseAckMs, remaining())); return true } catch { return false }
+  try { await boundOpenCodeRead(sequence.acknowledge(), Math.min(remaining(), openCodeV2ExecutionCloseAckReserveMs)); return true } catch { return false }
 }
