@@ -825,3 +825,17 @@ test('run control pipe buffers stage bytes instead of reserving the frame cap pe
   expect(create).toContain('RUN_CONTROL_PIPE_BUFFER_BYTES, RUN_CONTROL_PIPE_BUFFER_BYTES')
   expect(create).not.toContain('MAX_FRAME_BYTES,')
 })
+
+test('poison retires a connection the read failure paths already poisoned', async () => {
+  const windows = path.resolve(import.meta.dir, '../../src/services/opencode/host/windows')
+  const header = (await readFile(path.join(windows, 'WindowsNativeRunControl.hpp'), 'utf8')).replaceAll('\r\n', '\n')
+  const start = header.indexOf('void poisonConnection(')
+  expect(start).toBeGreaterThan(0)
+  const body = header.slice(start, header.indexOf('\n  }\n', start))
+  // Read/write failures poison the connection before they throw, so the retire
+  // step must tolerate an already-poisoned connection. The strict lookup throws
+  // on poisoned entries and both callers swallow that throw, leaving the corpse
+  // to hold an accept slot until the listener waits forever for capacity.
+  expect(body).toContain('runControlRetire(')
+  expect(body).not.toContain('runControlConnectionFor(')
+})

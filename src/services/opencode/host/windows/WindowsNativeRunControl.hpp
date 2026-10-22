@@ -758,7 +758,18 @@ struct WindowsNativeRunControl {
     std::shared_ptr<Connection> connection;
     {
       std::lock_guard<std::recursive_mutex> lock(controlMutex_);
-      connection = runControlConnectionFor(input);
+      require(input.HasKey(L"id") && input.GetNamedValue(L"id").ValueType() == JsonValueType::Number,
+              "run_control_foreign");
+      const double number = input.GetNamedNumber(L"id");
+      require(number > 0 && number == static_cast<std::uint64_t>(number), "run_control_foreign");
+      const auto found = registry_.find(static_cast<std::uint64_t>(number));
+      require(found != registry_.end(), "run_control_foreign");
+      // A read/write failure poisons the connection before it throws, so this
+      // retire step must tolerate an already-poisoned connection. The strict
+      // lookup refuses poisoned entries and both callers swallow that refusal,
+      // which would leave the corpse holding an accept slot until the listener
+      // waits forever for capacity.
+      connection = found->second;
       connection->poisoned = true;
     }
     (void)runControlRetire(*connection);
