@@ -657,22 +657,20 @@ test('run control identity diagnostics name the observed process checkpoint stag
   const previous = process.env.CLAUDE_MULTIMODEL_DATA_HOME
   process.env.CLAUDE_MULTIMODEL_DATA_HOME = root
   try {
-    const expected = [
-      { stage: 'process_alive', nativeCode: 0 },
-      { stage: 'process_alive_wait', nativeCode: 5 },
-      { stage: 'process_alive_held_bun', nativeCode: 0 },
-      { stage: 'process_alive_package_peer', nativeCode: 0 },
-      { stage: 'process_alive_peer', nativeCode: 0 },
-      { stage: 'process_alive_peer_parent', nativeCode: 0 },
-    ]
+    // Every checkpoint literal the native run control emits, so a newly named
+    // stage cannot silently drop out of the closed diagnostics.
+    const header = await readFile(path.join(import.meta.dir, '../host/windows/WindowsNativeRunControl.hpp'), 'utf8')
+    const expected = [...new Set(header.match(/"process_alive[a-z_]*"/g) ?? [])].map(literal => literal.slice(1, -1))
+      .map(stage => ({ stage, nativeCode: stage === 'process_alive_wait' ? 5 : 0 }))
+    expect(expected.map(({ stage }) => stage)).toEqual(expect.arrayContaining(['process_alive', 'process_alive_wait',
+      'process_alive_held_bun', 'process_alive_package_peer', 'process_alive_peer', 'process_alive_peer_parent']))
     for (const { stage, nativeCode } of expected)
       await recordOpenCodeV2ProviderFailure('run-member-retirement',
         new Error(`run_control_process_identity:${stage}:${nativeCode}`), true, undefined, undefined, { elapsedMs: 1, dataRoot: root })
     const rows = await Promise.all((await readdir(path.join(root, 'opencode/v2/provider-diagnostics'))).map(async name =>
       JSON.parse(await readFile(path.join(root, 'opencode/v2/provider-diagnostics', name), 'utf8'))))
     expect(rows).toHaveLength(expected.length)
-    expect(rows.map((row) => row.native).sort((a, b) => a.stage.localeCompare(b.stage)))
-      .toEqual(expected.slice().sort((a, b) => a.stage.localeCompare(b.stage)))
+    expect(rows.map((row) => JSON.stringify(row.native ?? null)).sort()).toEqual(expected.map(value => JSON.stringify(value)).sort())
     expect(rows.every((row) => row.category === 'run_control_process_identity')).toBe(true)
   } finally {
     if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_DATA_HOME
