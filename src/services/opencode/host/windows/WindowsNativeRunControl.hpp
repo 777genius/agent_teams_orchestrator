@@ -1413,12 +1413,34 @@ private:
                                              const char *aliveStage = "process_alive") {
     return runControlIdentityJson(process, pid, runControlObserveProcess(process, aliveStage));
   }
-  // Endpoint owners may already be retired when this witness runs: the run
-  // state outlives them and ownerRetired observes their exit through exactly
-  // the handles this witness retains. Identity stays the full measurement so a
-  // recycled PID or replaced object never passes; only liveness is absent.
+  // Full identity without the liveness gate. The image measurement still
+  // needs the process to be observable, so owners that may already be retired
+  // belong to runControlHeldIdentityMatches below.
   static JsonObject runControlHeldIdentity(HANDLE process, DWORD pid) {
     return runControlIdentityJson(process, pid, runControlPinProcess(process));
+  }
+  // Endpoint owners may already be retired when this witness runs: the run
+  // state outlives them and ownerRetired observes their exit through exactly
+  // the handles this witness retains. While alive the full identity must
+  // equal the recorded measurement; once retired only the retirement witness
+  // form (pid + creation) remains observable and equally conclusive: a
+  // recycled PID or replaced object changes the birth and never passes.
+  static bool runControlHeldIdentityMatches(HANDLE process, DWORD pid,
+                                            std::uint64_t creation,
+                                            const JsonObject &record) {
+    if (WaitForSingleObject(process, 0) == WAIT_TIMEOUT) {
+      try {
+        return runControlCanonicalJson(runControlHeldIdentity(process, pid)) ==
+               runControlCanonicalJson(record);
+      } catch (const NativeError &) {
+        if (WaitForSingleObject(process, 0) == WAIT_OBJECT_0)
+          return GetProcessId(process) == pid &&
+                 filetime(runControlBirth(process)) == creation;
+        throw;
+      }
+    }
+    return GetProcessId(process) == pid &&
+           filetime(runControlBirth(process)) == creation;
   }
   static std::wstring runControlHashHex(const std::array<BYTE, 32> &hash) {
     static const wchar_t hex[] = L"0123456789abcdef";

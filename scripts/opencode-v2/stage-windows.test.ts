@@ -861,12 +861,14 @@ test('endpoint owner witness measures retired owners while live observation refu
   const flat = (text: string) => text.replace(/\s+/g, ' ')
   // The endpoint witness that fills the run state's retirement handles may run
   // against owners that already exited: ownerRetired observes their exit through
-  // exactly these handles, so the witness keeps the full identity measurement
-  // and drops only the liveness demand.
+  // exactly these handles. While alive the witness demands the full identity
+  // measurement; once retired only the retirement witness form (pid + birth)
+  // remains observable and equally conclusive.
   const retain = flat(slice(scope,
     'static void retainOriginalEndpointOwners(State &state, const JsonObject &record) {', '\n  }\n'))
-  expect(retain).toContain('Control::runControlHeldIdentity(heldHelper.value, helperPid)')
-  expect(retain).toContain('Control::runControlHeldIdentity(heldBun.value, bunPid)')
+  expect(retain).toContain('Control::runControlHeldIdentityMatches(heldHelper.value, helperPid, State::runStateProcessBirthLocked(helper, "run_control_endpoint_changed"), helper)')
+  expect(retain).toContain('Control::runControlHeldIdentityMatches(heldBun.value, bunPid, State::runStateProcessBirthLocked(bun, "run_control_endpoint_changed"), bun)')
+  expect(retain).not.toContain('Control::runControlHeldIdentity(')
   expect(retain).not.toContain('runControlNativeIdentity')
   expect(retain).toContain('runStateAssertRetirementWitnessLocked(heldHelper.value, state.helperPid_, state.helperBirth_')
   expect(retain).toContain('runStateAssertRetirementWitnessLocked(heldBun.value, state.bunPid_, state.bunBirth_')
@@ -880,9 +882,10 @@ test('endpoint owner witness measures retired owners while live observation refu
   expect(prepare).toContain('runControlNativeIdentity(helper.value, helperPid, "process_alive_endpoint_helper")')
   expect(prepare).toContain('runControlNativeIdentity(bun.value, bunPid, "process_alive_endpoint_bun")')
 
-  // Behavioral pair on the extracted measurements: an exited owner is still a
-  // complete held identity (birth, sid and image survive on the open handle)
-  // and only the live observation gate refuses it, under the caller's stage.
+  // Behavioral pair on the extracted measurements: the pin and held identity
+  // paths never ask liveness (their image step still needs an observable
+  // process - the witness test below covers retired owners) and only the live
+  // observation gate refuses an exited owner, under the caller's stage.
   const translate = (body: string) => body
     .replaceAll('const FILETIME first =', 'const first =')
     .replaceAll('const FILETIME second =', 'const second =')
@@ -938,4 +941,96 @@ test('endpoint owner witness measures retired owners while live observation refu
   waited.length = 0
   expect(held({}, 7)).toEqual({ pid: 7, pin: measured })
   expect(waited).toEqual([])
+})
+
+test('endpoint owner witness accepts retired owners by retirement witness and refuses substituted ones', async () => {
+  const { runInNewContext } = await import('node:vm')
+  const windowsDirectory = path.resolve(import.meta.dir, '../../src/services/opencode/host/windows')
+  const header = (await readFile(path.join(windowsDirectory, 'WindowsNativeRunControl.hpp'), 'utf8')).replaceAll('\r\n', '\n')
+  const bodyOf = (text: string, from: string) => {
+    const begin = text.indexOf(from)
+    expect(begin).toBeGreaterThanOrEqual(0)
+    const open = text.indexOf(') {', begin), end = text.indexOf('\n  }', open)
+    expect(open).toBeGreaterThan(begin); expect(end).toBeGreaterThan(open)
+    return text.slice(open + 3, end)
+  }
+  // A retired owner is observable only as pid + creation, exactly the
+  // retirement witness the run state itself trusts: a recycled PID or a
+  // replaced object changes the birth and never passes. A live owner must
+  // still present the full recorded identity.
+  const body = bodyOf(header, 'static bool runControlHeldIdentityMatches(HANDLE process, DWORD pid,')
+  const translate = (text: string) => text
+    .replaceAll('catch (const NativeError &)', 'catch (failure)')
+    .replaceAll('throw;', 'throw failure;')
+  const scenario = {
+    wait: [] as number[],
+    identityCalls: 0,
+    identity: undefined as unknown,
+    identityFailure: null as null | { code: string; win32: number; stage: string },
+    pid: 4242, birth: 9001, creation: 9001,
+  }
+  const reset = () => {
+    scenario.wait = []
+    scenario.identityCalls = 0
+    scenario.identity = { token: 'measured' }
+    scenario.identityFailure = null
+    scenario.pid = 4242
+    scenario.birth = 9001
+  }
+  const sandbox: Record<string, unknown> = {
+    WAIT_TIMEOUT: 258, WAIT_OBJECT_0: 0,
+    WaitForSingleObject: () => {
+      const status = scenario.wait.shift()
+      if (status === undefined) throw new Error('unexpected liveness probe')
+      return status
+    },
+    runControlHeldIdentity: () => {
+      scenario.identityCalls += 1
+      if (scenario.identityFailure)
+        throw Object.assign(new Error(scenario.identityFailure.code), scenario.identityFailure)
+      return scenario.identity
+    },
+    runControlCanonicalJson: (value: unknown) => JSON.stringify(value),
+    GetProcessId: () => scenario.pid,
+    runControlBirth: () => ({ stamp: scenario.birth }),
+    filetime: (value: { stamp: number }) => value.stamp,
+  }
+  type Failure = [string | undefined, number | undefined, string | undefined]
+  const failure = (call: () => unknown): Failure | null => {
+    try { call() } catch (error) {
+      const caught = error as { code?: string; win32?: number; stage?: string }
+      return [caught.code, caught.win32, caught.stage]
+    }
+    return null
+  }
+  const matches = runInNewContext(`(function (process, pid, creation, record) {${translate(body)}\n})`, sandbox) as (process: unknown, pid: number, creation: number, record: unknown) => boolean
+  // A live owner passes only on the full recorded identity.
+  reset(); scenario.wait = [258]
+  expect(matches({}, 4242, 9001, { token: 'measured' })).toBe(true)
+  expect(scenario.identityCalls).toBe(1)
+  reset(); scenario.wait = [258]
+  expect(matches({}, 4242, 9001, { token: 'substituted' })).toBe(false)
+  expect(scenario.identityCalls).toBe(1)
+  // A retired owner passes on the retirement witness alone and never attempts
+  // the image measurement that already failed in the wild.
+  reset(); scenario.wait = [0]
+  expect(matches({}, 4242, 9001, { token: 'measured' })).toBe(true)
+  expect(scenario.identityCalls).toBe(0)
+  // A recycled PID or a different birth never passes on that fallback.
+  reset(); scenario.wait = [0]; scenario.pid = 4243
+  expect(matches({}, 4242, 9001, { token: 'measured' })).toBe(false)
+  reset(); scenario.wait = [0]; scenario.birth = 9002
+  expect(matches({}, 4242, 9001, { token: 'measured' })).toBe(false)
+  expect(scenario.identityCalls).toBe(0)
+  // The owner may retire between the liveness probe and the image step; the
+  // same retirement witness then decides. A still-live measurement failure is
+  // never papered over.
+  reset(); scenario.wait = [258, 0]
+  scenario.identityFailure = { code: 'run_control_process_identity', win32: 31, stage: 'process_image_path' }
+  expect(matches({}, 4242, 9001, { token: 'measured' })).toBe(true)
+  expect(scenario.identityCalls).toBe(1)
+  reset(); scenario.wait = [258, 258]
+  scenario.identityFailure = { code: 'run_control_process_identity', win32: 5, stage: 'process_image_path' }
+  expect(failure(() => matches({}, 4242, 9001, { token: 'measured' }))).toEqual(['run_control_process_identity', 5, 'process_image_path'])
+  expect(scenario.identityCalls).toBe(1)
 })
