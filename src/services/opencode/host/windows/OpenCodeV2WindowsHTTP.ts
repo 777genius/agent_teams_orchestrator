@@ -430,8 +430,11 @@ export function bindWindowsControllerRelay(controller: WindowsRemoteController):
   const control = windowsExecutionChildControl()
   assert(control.connected())
   const nonce = process.env.OPENCODE_V2_WINDOWS_NONCE!, leaseOwnerId = process.env.OPENCODE_V2_WINDOWS_LEASE!
+  let closure: Promise<void> | undefined
+  // A transaction the close drain fails below ends only locally; the shared
+  // control pipe must still carry the closed ACK.
   const client = createWindowsExecutionHttpClient(
-    frame => control.send({ ...frame, nonce, leaseOwnerId }, Date.now() + 15000), () => control.disconnect(), CONTROLLER_FRAME)
+    frame => control.send({ ...frame, nonce, leaseOwnerId }, Date.now() + 15000), () => { if (!closure) control.disconnect() }, CONTROLLER_FRAME)
   client.bindOrigin(controller.origin)
   // The child control pipe already authenticated this frame's lease.
   const accept = (value: unknown) => { try { client.accept(value) } catch { control.disconnect() } }
@@ -440,7 +443,6 @@ export function bindWindowsControllerRelay(controller: WindowsRemoteController):
   const original = globalThis.fetch
   const relayed = routeWindowsControllerFetch(original, controller, request => client.fetch(request))
   globalThis.fetch = relayed
-  let closure: Promise<void> | undefined
   // Drain inside the child's existing close budget; a late owner reply then
   // fails the remaining transactions instead of withholding the closed ACK.
   const close = () => closure ??= (async () => {

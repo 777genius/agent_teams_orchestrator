@@ -1,6 +1,7 @@
 import { afterEach, expect, test } from 'bun:test'
 import { createServer, type IncomingHttpHeaders, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
+import { pathToFileURL } from 'node:url'
 // The exact MCP client the current official runtime connects with.
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
@@ -122,3 +123,58 @@ test('the owner relay forwards only Streamable HTTP request fields and refuses o
   }
   expect(seen).toHaveLength(1)
 })
+
+test('a late owner reply after the member close drain never tears down the control pipe carrying the closed ACK', async () => {
+  // Isolate the TEST child-control mock so it cannot alter another test's pipe.
+  const childControl = pathToFileURL(import.meta.dir + '/OpenCodeV2WindowsChildControl.ts').href
+  const relayModule = pathToFileURL(import.meta.dir + '/OpenCodeV2WindowsHTTP.ts').href
+  const script = `
+    const { mock } = await import('bun:test');
+    const { EventEmitter } = await import('node:events');
+    const events = new EventEmitter(), sent = [];
+    let disconnects = 0;
+    const control = { events, connected: () => true, send: async frame => { sent.push(frame) }, disconnect: () => { disconnects++ } };
+    mock.module(${JSON.stringify(childControl)}, () => ({ windowsExecutionChildControl: () => control,
+      windowsExecutionSelfBirth: () => ({ format: 'windows-filetime', value: '1', bootId: null }) }));
+    const { bindWindowsControllerRelay, readWindowsRemoteController } = await import(${JSON.stringify(relayModule)});
+    const controller = readWindowsRemoteController(JSON.stringify({ mcp: { servers: { 'agent-teams': { type: 'remote', url: 'http://127.0.0.1:9/mcp', oauth: false } } } }));
+    const original = globalThis.fetch;
+    // The member's open standalone SSE stream, whose cancel the owner never answers in time.
+    async function openStream() {
+      const response = globalThis.fetch(controller.url, { method: 'GET', headers: { accept: 'text/event-stream' } });
+      await new Promise(resolve => setTimeout(resolve, 10));
+      const request = sent.findLast(frame => frame.action === 'request');
+      return { request, response };
+    }
+    const result = {};
+    {
+      // Protocol violation on a live relay: the control pipe is still torn down.
+      disconnects = 0;
+      const relay = bindWindowsControllerRelay(controller), { request, response } = await openStream();
+      void response.catch(() => undefined);
+      events.emit('message', { type: 'windowsControllerHTTP', id: request.id, action: 'head', status: 99, statusText: '', headers: [], body: true });
+      await new Promise(resolve => setTimeout(resolve, 10));
+      result.violation = disconnects;
+      await relay.close();
+    }
+    {
+      disconnects = 0;
+      const relay = bindWindowsControllerRelay(controller), { request, response } = await openStream();
+      events.emit('message', { type: 'windowsControllerHTTP', id: request.id, action: 'head', status: 200, statusText: 'OK',
+        headers: [['content-type', 'text/event-stream']], body: true });
+      await response;
+      await relay.close();
+      await new Promise(resolve => setTimeout(resolve, 50));
+      result.lateReply = { disconnects, cancelled: sent.some(frame => frame.id === request.id && frame.action === 'cancel'),
+        fetchRestored: globalThis.fetch === original };
+    }
+    console.log(JSON.stringify(result));
+  `
+  const child = Bun.spawn([process.execPath, '-e', script], { stdout: 'pipe', stderr: 'pipe' })
+  const [stdout, stderr, exit] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited])
+  expect(exit).toBe(0); expect(stderr).toBe('')
+  const value = JSON.parse(stdout)
+  expect(value.violation).toBe(1)
+  // The drain failed the stream locally; the shared pipe stays up for the ACK.
+  expect(value.lateReply).toEqual({ disconnects: 0, cancelled: true, fetchRestored: true })
+}, 30_000)
