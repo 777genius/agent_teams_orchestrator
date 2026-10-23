@@ -4153,55 +4153,60 @@ static void removeGrants(Scope &scope, RetirementAclBudget *retirementBudget) {
       retained.insert(retained.begin(), std::move(*it));
       continue;
     }
-    progress("root_mutex_wait");
-    SharedAclMutex aclMutex(physicalIdentity, retirementBudget);
-    progress("root_precheck");
+    // Identity and liveness are AV-hot path reopens and image reads; measuring
+    // them before the cross-process ACL lock keeps every queued member's wait
+    // free of them. The post-write re-measurement widens the window these facts
+    // must survive, so a recycled object can never pass.
     it->assertLive();
     require(anchorIdentity(handle).Stringify() == identity.Stringify(), "cleanup_unknown");
-    const auto heldIdentity = grantObjectIdentity(handle, owner, it->sharedRoot);
     const auto projectSids = privateGrant ? sealedProjectSids(scope, *it) : std::vector<std::wstring>();
     const auto cohortSids = !projectSids.empty() ? projectSids :
         privateGrant ? closedControllerCohortSids(*scope.cohort) : std::vector<std::wstring>();
     const auto *cohortSidsPtr = privateGrant ? &cohortSids : nullptr;
-    AclCustody before;
-    SharedReadAclCustody sharedBefore;
-    if (it->sharedRoot) {
-      sharedBefore = sharedReadAclCustody(handle, owner, scope.sid.value, "cleanup_unknown");
-      require(sharedBefore.ownerSid == it->sharedOwnerSid && sharedBefore.daclControl == it->sharedDaclControl, "cleanup_unknown");
-    } else before = projectSids.empty() ? aclCustody(handle, owner, scope.sid.value, cohortSidsPtr, "cleanup_unknown")
-        : projectAclCustody(handle, owner, scope.sid.value, projectSids, "cleanup_unknown");
-    PACL previous = nullptr;
-    PSECURITY_DESCRIPTOR descriptor = nullptr;
-    require(GetSecurityInfo(handle, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr,
-                            nullptr, &previous, nullptr, &descriptor) == ERROR_SUCCESS,
-            "cleanup_unknown");
-    LocalMemory original{descriptor};
-    EXPLICIT_ACCESSW entry{};
-    entry.grfAccessMode = REVOKE_ACCESS;
-    BuildTrusteeWithSidW(&entry.Trustee, scope.sid.value);
-    PACL next = nullptr;
-    require(SetEntriesInAclW(1, &entry, previous, &next) == ERROR_SUCCESS, "cleanup_unknown");
-    LocalMemory nextMemory{next};
-    progress("root_dacl_write");
-    require(SetSecurityInfo(handle, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr,
-                            nullptr, next, nullptr) == ERROR_SUCCESS,
-            "cleanup_unknown");
-    progress("root_postcheck");
-    it->assertLive();
-    require(anchorIdentity(handle).Stringify() == it->identity.Stringify(), "cleanup_unknown");
-    require(grantObjectIdentity(handle, owner, it->sharedRoot).Stringify() == heldIdentity.Stringify(),
-            "cleanup_unknown");
-    if (it->sharedRoot) {
-      const auto after = sharedReadAclCustody(handle, owner, scope.sid.value, "cleanup_unknown");
-      require(after.ownerSid == sharedBefore.ownerSid &&
-                sharedReadControlAfterOwnWrite(sharedBefore.daclControl, after.daclControl) &&
-                after.foreignAces == sharedBefore.foreignAces && !after.memberAllowed,
-              "cleanup_unknown");
-    } else {
-      const auto after = projectSids.empty() ? aclCustody(handle, owner, scope.sid.value, cohortSidsPtr, "cleanup_unknown")
+    progress("root_mutex_wait");
+    {
+      SharedAclMutex aclMutex(physicalIdentity, retirementBudget);
+      progress("root_precheck");
+      AclCustody before;
+      SharedReadAclCustody sharedBefore;
+      if (it->sharedRoot) {
+        sharedBefore = sharedReadAclCustody(handle, owner, scope.sid.value, "cleanup_unknown");
+        require(sharedBefore.ownerSid == it->sharedOwnerSid && sharedBefore.daclControl == it->sharedDaclControl, "cleanup_unknown");
+      } else before = projectSids.empty() ? aclCustody(handle, owner, scope.sid.value, cohortSidsPtr, "cleanup_unknown")
           : projectAclCustody(handle, owner, scope.sid.value, projectSids, "cleanup_unknown");
-      require(after.siblings == before.siblings && !after.memberAllowed, "cleanup_unknown");
+      PACL previous = nullptr;
+      PSECURITY_DESCRIPTOR descriptor = nullptr;
+      require(GetSecurityInfo(handle, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr,
+                              nullptr, &previous, nullptr, &descriptor) == ERROR_SUCCESS,
+              "cleanup_unknown");
+      LocalMemory original{descriptor};
+      EXPLICIT_ACCESSW entry{};
+      entry.grfAccessMode = REVOKE_ACCESS;
+      BuildTrusteeWithSidW(&entry.Trustee, scope.sid.value);
+      PACL next = nullptr;
+      require(SetEntriesInAclW(1, &entry, previous, &next) == ERROR_SUCCESS, "cleanup_unknown");
+      LocalMemory nextMemory{next};
+      progress("root_dacl_write");
+      require(SetSecurityInfo(handle, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr,
+                              nullptr, next, nullptr) == ERROR_SUCCESS,
+              "cleanup_unknown");
+      progress("root_postcheck");
+      if (it->sharedRoot) {
+        const auto after = sharedReadAclCustody(handle, owner, scope.sid.value, "cleanup_unknown");
+        require(after.ownerSid == sharedBefore.ownerSid &&
+                  sharedReadControlAfterOwnWrite(sharedBefore.daclControl, after.daclControl) &&
+                  after.foreignAces == sharedBefore.foreignAces && !after.memberAllowed,
+                "cleanup_unknown");
+      } else {
+        const auto after = projectSids.empty() ? aclCustody(handle, owner, scope.sid.value, cohortSidsPtr, "cleanup_unknown")
+            : projectAclCustody(handle, owner, scope.sid.value, projectSids, "cleanup_unknown");
+        require(after.siblings == before.siblings && !after.memberAllowed, "cleanup_unknown");
+      }
     }
+    it->assertLive();
+    require(anchorIdentity(handle).Stringify() == identity.Stringify(), "cleanup_unknown");
+    require(grantObjectIdentity(handle, owner, it->sharedRoot).Stringify() == physicalIdentity.Stringify(),
+            "cleanup_unknown");
     progress("root_complete");
   }
   scope.aclRoots = std::move(retained);

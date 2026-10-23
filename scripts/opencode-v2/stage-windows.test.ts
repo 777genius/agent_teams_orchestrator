@@ -1080,3 +1080,102 @@ test('windows close frame reaches the wrapper before the transport drain retires
   await new Promise(resolve => setImmediate(resolve))
   expect(failed.events).toEqual(['error'])
 })
+
+
+test('windows closed ACK ships before any native realpath drain', async () => {
+  const { runInNewContext } = await import('node:vm')
+  const control = (await readFile(path.resolve(import.meta.dir, '../../src/services/opencode/host/windows/OpenCodeV2WindowsChildControl.ts'), 'utf8')).replaceAll('\r\n', '\n')
+  const begin = control.indexOf('async send(value')
+  expect(begin).toBeGreaterThanOrEqual(0)
+  const open = control.indexOf('{', begin)
+  let depth = 0, end = -1
+  for (let index = open; index < control.length; index++) {
+    if (control[index] === '{') depth++
+    else if (control[index] === '}') { depth--; if (depth === 0) { end = index; break } }
+  }
+  expect(end).toBeGreaterThan(open)
+  const body = new Bun.Transpiler({ loader: 'ts' }).transformSync(control.slice(open + 1, end))
+  const dispatch = (disarm: () => void) => {
+    const writes: string[] = [], events: string[] = []
+    let closes = 0
+    const context = {
+      assert: (value: unknown) => { if (!value) throw new Error('execution_containment_identity_mismatch') },
+      Buffer,
+      CONTROL_PACKET_LIMIT: 16 * 1024 * 1024,
+      connected: true,
+      ready: Promise.resolve(),
+      prepared: { nonce: 'n-1', leaseOwnerId: 'l-1', pid: 7, namespace: 'ns-1', birth: { format: 'windows-filetime', value: '9001', bootId: null } },
+      realpathReceiptId: 'windows-dll:1',
+      closeWindowsRealpath: () => { closes++; return new Promise<void>(() => undefined) },
+      disarmWindowsRealpath: () => { events.push('disarm'); disarm() },
+      socket: { destroyed: false, write: (bytes: string, callback: (error?: Error) => void) => { events.push('write'); writes.push(bytes); callback() } },
+    }
+    // The closed handler must free the wrappers and write the ACK even while a
+    // native drain would still be pending; the run's 10s exit wait starts from
+    // this delivery.
+    const send = runInNewContext(`(async function (value, deadline = Date.now() + 1000) {${body}\n})`, context) as (value: unknown, deadline?: number) => Promise<void>
+    void send({ type: 'closed', nonce: 'n-1', leaseOwnerId: 'l-1', pid: 7, namespace: 'ns-1',
+      birth: { format: 'windows-filetime', value: '9001', bootId: null }, scopeClosed: true }, Date.now() + 2000).catch(() => undefined)
+    return { writes, events, closes, context }
+  }
+  const shipped = dispatch(() => undefined)
+  await new Promise(resolve => setTimeout(resolve, 25))
+  expect(shipped.writes).toHaveLength(1)
+  expect(JSON.parse(shipped.writes[0])).toMatchObject({ type: 'closed', scopeClosed: true, realpathClosed: 'windows-dll:1' })
+  // The wrappers disarm before the ACK and the native drain never gates it.
+  expect(shipped.events).toEqual(['disarm', 'write'])
+  expect(shipped.closes).toBe(0)
+  // An uncertain disarm withholds the ACK exactly like an uncertain drain.
+  const refused = dispatch(() => { throw new Error('windows_realpath_uninstall_unknown') })
+  await new Promise(resolve => setTimeout(resolve, 25))
+  expect(refused.writes).toHaveLength(0)
+  expect(refused.events).toEqual(['disarm'])
+})
+
+
+test('native grant removal measures identity outside the ACL mutex and keeps the DACL bracket inside', async () => {
+  const source = (await readFile(path.resolve(import.meta.dir, '../../src/services/opencode/host/windows/WindowsKernelScope.cpp'), 'utf8')).replaceAll('\r\n', '\n')
+  const begin = source.indexOf('static void removeGrants(Scope &scope, RetirementAclBudget *retirementBudget) {')
+  expect(begin).toBeGreaterThanOrEqual(0)
+  const open = source.indexOf('{', begin)
+  let depth = 0, end = -1
+  for (let index = open; index < source.length; index++) {
+    if (source[index] === '{') depth++
+    else if (source[index] === '}') { depth--; if (depth === 0) { end = index; break } }
+  }
+  expect(end).toBeGreaterThan(open)
+  const body = source.slice(open + 1, end)
+  const between = (from: string, to: string) => {
+    const start = body.indexOf(from)
+    expect(start).toBeGreaterThanOrEqual(0)
+    const stop = body.indexOf(to, start + from.length)
+    expect(stop).toBeGreaterThan(start)
+    return body.slice(start + from.length, stop)
+  }
+  // Identity and liveness are AV-hot (path reopen plus image reads); every one
+  // of them runs before the cross-process ACL lock is taken so no queued member
+  // ever waits behind them.
+  const validate = between('progress("root_validate")', 'progress("root_mutex_wait")')
+  expect(validate).toContain('it->assertLive()')
+  expect(validate).toContain('anchorIdentity(handle)')
+  expect(validate).toContain('grantObjectIdentity(handle, owner, it->sharedRoot)')
+  // Under the lock only the DACL bracket runs: custody snapshot, revoke entry,
+  // the write itself and the custody comparison.
+  const hold = between('SharedAclMutex aclMutex(physicalIdentity, retirementBudget)', 'progress("root_dacl_write")')
+  expect(hold).not.toContain('assertLive')
+  expect(hold).not.toContain('anchorIdentity')
+  expect(hold).not.toContain('grantObjectIdentity')
+  expect(hold).toContain('GetSecurityInfo')
+  expect(hold).toContain('SetEntriesInAclW')
+  expect(hold).toContain('sharedReadAclCustody')
+  // The write lands under the lock; identity is re-measured only afterwards and
+  // compared against the pre-lock measurement taken across the whole window.
+  const after = between('progress("root_dacl_write")', 'progress("root_complete")')
+  expect(after.indexOf('SetSecurityInfo(')).toBeGreaterThanOrEqual(0)
+  expect(after.indexOf('SetSecurityInfo(')).toBeLessThan(after.indexOf('it->assertLive()'))
+  expect(after).toContain('anchorIdentity(handle)')
+  expect(after).toContain('grantObjectIdentity(handle, owner, it->sharedRoot).Stringify() == physicalIdentity.Stringify()')
+  expect(after).not.toContain('heldIdentity')
+  expect(after.indexOf('sharedReadAclCustody')).toBeLessThan(after.indexOf('it->assertLive()'))
+  expect(after.indexOf('aclCustody')).toBeLessThan(after.indexOf('it->assertLive()'))
+})

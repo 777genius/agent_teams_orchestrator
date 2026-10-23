@@ -64,15 +64,16 @@ export function windowsExecutionChildControl(): WindowsChildControl {
   owned = Object.freeze({ events, connected: () => connected && !socket.destroyed,
     async send(value: Readonly<Record<string, unknown>>, deadline = Date.now() + 1000) {
       assert(Date.now() < deadline)
-      // The execution server can earn closed ACK only after the installed
-      // facade has disabled wrappers, drained RP_Close and unloaded known-safe
-      // native state. UNKNOWN throws, keeps DLL custody, and emits no ACK.
+      // The closed ACK certifies the authenticated identity and that the
+      // installed facade has disarmed every wrapper. The native RP_Close and
+      // library unload are process self-cleanup the OS reclaims at exit, so no
+      // in-flight drain may delay this delivery; UNKNOWN withholds the ACK.
       let outgoing = value
       if (value.type === 'closed') {
         assert(prepared && value.nonce === prepared.nonce && value.leaseOwnerId === prepared.leaseOwnerId)
         assert(value.pid === prepared.pid && value.namespace === prepared.namespace && value.scopeClosed === true)
         assert(JSON.stringify(value.birth) === JSON.stringify(prepared.birth))
-        await closeWindowsRealpath()
+        disarmWindowsRealpath()
         outgoing = { ...value, realpathClosed: realpathReceiptId }
       }
       const bytes = JSON.stringify(outgoing) + '\n'; assert(Buffer.byteLength(bytes) <= CONTROL_PACKET_LIMIT)
@@ -130,6 +131,10 @@ function childRealpathSelection(input: Record<string, unknown>, nativeBirth: Rec
   }
   realpathReceiptId = dll.receiptId as string
   return Object.freeze({ dllPath: dll.path, expectedPid: process.pid, expectedCreationFiletime: uint64(nativeBirth.value), anchors: Object.freeze(anchors) })
+}
+function disarmWindowsRealpath(): void {
+  assert(realpathInstallation && realpathReceiptId)
+  realpathInstallation.disarm()
 }
 function closeWindowsRealpath(): Promise<void> {
   return realpathClose ??= Promise.resolve().then(() => {

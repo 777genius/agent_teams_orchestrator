@@ -10,7 +10,7 @@ import { executionAssert, executionHash, executionRecord, openCodeV2RunInitializ
 import { assertExecutionProfile, executionProfileGuards, validateExecutionGraph, validateExecutionNative, validateExecutionProfile,
   type ExecutionGraphProgress, type OwnedNativeProfile, type ValidatedExecutionNative } from '../services/opencode/host/OpenCodeV2ExecutionBinding.js'
 import { boundOpenCodeRead } from '../services/opencode/transport/OpenCodeBoundedFetch.js'
-import { runOpenCodeV2ExecutionCloseSequence } from '../services/opencode/execution/OpenCodeV2ExecutionClose.js'
+import { openCodeV2ExecutionCloseAckReserveMs, runOpenCodeV2ExecutionCloseSequence } from '../services/opencode/execution/OpenCodeV2ExecutionClose.js'
 import { importOpenCodeV2SelectedOAuth } from '../services/opencode/host/OpenCodeV2ExecutionOAuth.js'
 import type { ServerOptions as FloorOptions } from '@opencode/server-v2-floor/options'
 import type { ServerOptions as CurrentOptions } from '@opencode/server/options'
@@ -80,7 +80,7 @@ function close(): Promise<void> {
         executionAssert(birth && nonce && childControl.connected(), 'cleanup_unknown')
         await childControl.send({ type: 'closed', nonce, leaseOwnerId: prepared?.leaseOwnerId,
           namespace: prepared?.namespace, executableSha256: prepared?.executableSha256, pid: process.pid,
-          birth, scopeClosed: true })
+          birth, scopeClosed: true }, Date.now() + openCodeV2ExecutionCloseAckReserveMs)
       },
     })
     if (acknowledged) { childControl.disconnect(); process.exit(0) } else process.exit(1)

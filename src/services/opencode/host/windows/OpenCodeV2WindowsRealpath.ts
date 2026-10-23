@@ -11,7 +11,7 @@ export type WindowsRealpathSelection = Readonly<{
   expectedCreationFiletime: bigint
   anchors: readonly Readonly<{ kind?: 'readOnly' | 'writable' | 'metadata'; dosPath: string; ntPath: string; volumeSerial: bigint; fileId: string }>[]
 }>
-export type WindowsRealpathInstallation = Readonly<{ uninstall(): void }>
+export type WindowsRealpathInstallation = Readonly<{ disarm(): void; uninstall(): void }>
 
 type Encoding = { kind: 'default' } | { kind: 'buffer' } | { kind: 'encoding'; encoding: BufferEncoding } | { kind: 'unsupported' }
 type Diagnostics = Readonly<{ status: number; operation: number; win32: number; anchorIndex: number }>
@@ -22,7 +22,8 @@ type Installation = {
   readonly scratch: Readonly<{ output: Buffer; count: Buffer; error: Buffer }>
   active: boolean
   retiring: boolean
-  state: 'installed' | 'retired' | 'unknown'
+  disarmed: boolean
+  state: 'installed' | 'disarmed' | 'retired' | 'unknown'
   closeError?: Diagnostics
 }
 
@@ -378,8 +379,30 @@ export function installWindowsRealpathFallback(selection: WindowsRealpathSelecti
       throw error
     }
     active = { anchors: selection.anchors, native: native.library, context: native.context, scratch,
-      active: true, retiring: false, state: 'installed' }
+      active: true, retiring: false, disarmed: false, state: 'installed' }
     return Object.freeze({
+      // Wrappers alone disarm here: the restored surfaces are exactly what the
+      // closed ACK certifies. The native RP_Close and the library unload are
+      // process self-cleanup the OS reclaims at exit, so they can never delay
+      // the ACK; an uncertain restore withholds it instead.
+      disarm(): void {
+        const current = active
+        if (!current) {
+          if (retainedError) throw retainedError
+          return
+        }
+        if (current.disarmed || current.retiring) return
+        try {
+          restore(items)
+          current.disarmed = true
+          current.active = false
+          current.state = 'disarmed'
+        } catch (error) {
+          current.state = 'unknown'
+          retainedError = error instanceof Error ? error : new Error('windows_realpath_uninstall_unknown')
+          throw retainedError
+        }
+      },
       uninstall(): void {
         const current = active
         if (!current) {
@@ -391,7 +414,10 @@ export function installWindowsRealpathFallback(selection: WindowsRealpathSelecti
         current.active = false
         active = undefined
         try {
-          restore(items)
+          if (!current.disarmed) {
+            restore(items)
+            current.disarmed = true
+          }
           const closed = closeNative(current.native, current.context)
           if (closed.status !== 0) {
             current.state = 'unknown'
