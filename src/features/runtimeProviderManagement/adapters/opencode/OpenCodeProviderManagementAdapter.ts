@@ -4159,7 +4159,6 @@ export class OpenCodeProviderManagementAdapter
 
     const hostManager = this.deps.hostManager ?? openCodeHostManager
     const clientFactory = this.deps.clientFactory ?? openCodeClientFactory
-    const hostLifetime = input.refresh ? 'process' : 'persistent'
     let host: OpenCodeHostHandle | null = null
     let hostLease: OpenCodeHostLeaseInput | null = null
 
@@ -4170,11 +4169,11 @@ export class OpenCodeProviderManagementAdapter
         profileOptions: {
           includeAppMcp: false,
         },
-        hostLifetime,
+        hostLifetime: 'process',
         resolveConfigFingerprint: false,
         healthTimeoutMs: OPEN_CODE_PROVIDER_MANAGEMENT_HOST_HEALTH_TIMEOUT_MS,
       })
-      hostLease = await this.retainProviderManagementHost(hostManager, host)
+      hostLease = await this.retainProviderManagementHost(hostManager, host, false)
       const cacheKey = this.getDirectoryCacheKey({
         runtimeId: input.runtimeId,
         inventory,
@@ -4292,7 +4291,7 @@ export class OpenCodeProviderManagementAdapter
       if (host) {
         await this.releaseProviderManagementHost(hostManager, host, hostLease)
         await hostManager
-          .releaseHost(host.hostKey, { keepPersistentAlive: hostLifetime === 'persistent' })
+          .releaseHost(host.hostKey, { keepPersistentAlive: false })
           .catch(() => undefined)
       }
     }

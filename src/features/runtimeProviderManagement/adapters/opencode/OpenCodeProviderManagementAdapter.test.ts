@@ -335,8 +335,16 @@ describe('OpenCodeProviderManagementAdapter', () => {
     }
   })
 
-  for (const degraded of [false, true]) {
-    test(`settings disposes its snapshot host before returning without disturbing a leased persistent owner (degraded: ${degraded})`, async () => {
+  const snapshotReadCases: Array<
+    { kind: 'settings'; degraded: boolean } | { kind: 'directory'; cacheHit: boolean }
+  > = [
+    { kind: 'settings', degraded: false }, { kind: 'settings', degraded: true },
+    { kind: 'directory', cacheHit: false }, { kind: 'directory', cacheHit: true },
+  ]
+  for (const scenario of snapshotReadCases) {
+    const detail = scenario.kind === 'settings'
+      ? `degraded: ${scenario.degraded}` : `refresh: false, cache hit: ${scenario.cacheHit}`
+    test(`${scenario.kind} disposes its snapshot host before returning without disturbing a leased persistent owner (${detail})`, async () => {
       const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'settings-host-lifetime-')))
       const registryPath = path.join(root, 'host-registry.json')
       const snapshot = inventory({ projectPath: root, profile: {
@@ -354,6 +362,9 @@ describe('OpenCodeProviderManagementAdapter', () => {
       let finishDisposal!: () => void
       const disposalGate = new Promise<void>(resolve => { finishDisposal = resolve })
       const disposed: number[] = []
+      let gateDisposal = true
+      let clientReads = 0
+      let evictionSweeps = 0
       const manager = new OpenCodeHostManager({
         prepareProfile: async () => snapshot.profile!,
         allocateLoopbackPort: async () => ++nextPort,
@@ -366,7 +377,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
         fetchJson: async url => {
           const pid = Number(new URL(url).port)
           if (url.endsWith('/global/dispose')) {
-            if (pid !== persistent?.pid) {
+            if (pid !== persistent?.pid && gateDisposal) {
               disposalStarted()
               await disposalGate
             }
@@ -398,18 +409,43 @@ describe('OpenCodeProviderManagementAdapter', () => {
         const adapter = new OpenCodeProviderManagementAdapter({
           ...catalogIdentityDependencies(),
           inventoryService: { probe: async () => snapshot },
-          hostManager: manager,
-          clientFactory: { create: () => ({
+          hostManager: {
+            ensureHost: manager.ensureHost.bind(manager),
+            releaseHost: manager.releaseHost.bind(manager),
+            retainHostLease: manager.retainHostLease.bind(manager),
+            releaseHostLease: manager.releaseHostLease.bind(manager),
+            reconcilePersistentHosts: async options => {
+              evictionSweeps += 1
+              return manager.reconcilePersistentHosts(options)
+            },
+          },
+          clientFactory: { create: () => { clientReads += 1; return {
             getConfigProviders: async () => ({ providers: [], default: {} }),
             getProviders: async () => {
-              if (degraded) throw new Error('TEST metadata unavailable')
+              if (scenario.kind === 'settings' && scenario.degraded) throw new Error('TEST metadata unavailable')
               return { all: [], connected: [], default: {} }
             },
             getProviderAuth: async () => ({}),
-          }) },
+          } } },
         })
+        const directoryRequest = {
+          runtimeId: 'opencode' as const, projectPath: root, query: null,
+          filter: 'all' as const, limit: 50, cursor: null, refresh: false,
+        }
+        if (scenario.kind === 'directory' && scenario.cacheHit) {
+          gateDisposal = false
+          const primed = await adapter.loadDirectory({ ...directoryRequest, refresh: true })
+          expect(primed.ok).toBe(true)
+          expect(disposed).toEqual([43152])
+          disposed.length = 0
+          evictionSweeps = 0
+          gateDisposal = true
+        }
+        const snapshotPid = nextPort + 1
         let returned = false
-        const resultPromise = adapter.loadView('opencode').then(result => { returned = true; return result })
+        const read = scenario.kind === 'settings'
+          ? adapter.loadView('opencode') : adapter.loadDirectory(directoryRequest)
+        const resultPromise = read.then(result => { returned = true; return result })
         pending = resultPromise
         expect(await Promise.race([
           disposing.then(() => 'disposing'), resultPromise.then(() => 'returned'),
@@ -419,8 +455,12 @@ describe('OpenCodeProviderManagementAdapter', () => {
         finishDisposal()
         const result = await resultPromise
         expect(result.ok).toBe(true)
-        if (result.ok) expect(result.value.runtime.state).toBe(degraded ? 'degraded' : 'ready')
-        expect(disposed).toEqual([43152])
+        if (result.ok && 'runtime' in result.value) {
+          expect(result.value.runtime.state).toBe(scenario.kind === 'settings' && scenario.degraded ? 'degraded' : 'ready')
+        }
+        expect(clientReads).toBe(1)
+        expect(evictionSweeps).toBe(0)
+        expect(disposed).toEqual([snapshotPid])
         expect(alive).toEqual(new Set([persistent.pid]))
         expect(manager.getHost(persistent.hostKey)).toBe(persistent)
         expect(await readFile(registryPath, 'utf8')).toBe(registryBefore)
@@ -748,22 +788,14 @@ describe('OpenCodeProviderManagementAdapter', () => {
           lease.laneId === 'provider-management',
       ),
     ).toBe(true)
-    expect(reconcileCalls).toHaveLength(1)
-    expect(
-      reconcileCalls.every(
-        options =>
-          options.reason === 'provider-management-idle-eviction' &&
-          options.staleAgeMs === 10 * 60_000 &&
-          options.leaseStaleAgeMs === null &&
-          options.preflightLeaseStaleAgeMs === 2 * 60 * 60_000,
-      ),
-    ).toBe(true)
+    expect(reconcileCalls).toHaveLength(0)
   })
 
-  test('does not leave a provider-management lease behind when idle eviction fails', async () => {
+  test('releases the settings lease without running idle eviction', async () => {
     const retained: OpenCodeHostLeaseInput[] = []
     const released: OpenCodeHostLeaseInput[] = []
     const releasedHosts: string[] = []
+    let evictionSweeps = 0
     const adapter = new OpenCodeProviderManagementAdapter({
       inventoryService: {
         probe: async () => inventory(),
@@ -777,6 +809,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
           released.push(lease)
         },
         reconcilePersistentHosts: async () => {
+          evictionSweeps += 1
           throw new Error('registry temporarily unavailable')
         },
         releaseHost: async hostKey => {
@@ -795,6 +828,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
     const result = await adapter.loadView('opencode')
 
     expect(result.ok).toBe(true)
+    expect(evictionSweeps).toBe(0)
     expect(retained).toHaveLength(1)
     expect(released).toEqual(retained)
     expect(releasedHosts).toEqual(['host-key'])
