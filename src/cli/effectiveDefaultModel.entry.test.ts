@@ -115,7 +115,11 @@ test(
             ).findGitBashPath(),
           }
         : {}),
-      PATH: '',
+      // Shell initialization needs chcp.exe, but provider discovery must not
+      // inherit user-installed tools from the runner's PATH.
+      PATH: process.platform === 'win32'
+        ? join(process.env.SystemRoot ?? process.env.SYSTEMROOT ?? 'C:\\Windows', 'System32')
+        : '',
       HOME: home,
       USERPROFILE: home,
       CLAUDE_CONFIG_DIR: config,
