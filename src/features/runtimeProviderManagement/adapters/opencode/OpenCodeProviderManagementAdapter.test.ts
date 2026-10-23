@@ -103,15 +103,16 @@ function authStore() {
   }
 }
 
-function catalogIdentityDependencies() {
+function catalogIdentityDependencies(): Pick<
+  NonNullable<ConstructorParameters<typeof OpenCodeProviderManagementAdapter>[0]>,
+  'resolveBinaryPath' | 'resolveBinaryIdentity' | 'profileManager'
+> {
   return {
     resolveBinaryPath: () => testBinaryPath,
     resolveBinaryIdentity: async () => 'test-binary-identity',
     profileManager: {
       listManagedAuthPaths: async () => [],
-      readCatalogSelectedAuthIdentity: async ({ profileScope }: {
-        profileScope: { selectedAuthIdentity: string }
-      }) => ({
+      readCatalogSelectedAuthIdentity: async ({ profileScope }) => ({
         source: profileScope.selectedAuthIdentity,
         managed: profileScope.selectedAuthIdentity,
         preferences: 'known:test-preferences',

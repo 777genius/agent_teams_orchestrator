@@ -14,8 +14,10 @@ const bun = process.versions.bun
 
 test(
   'real source CLI resolves applied settings before publishing inherited model',
-  { timeout: 60_000 },
-  async () => {
+  // Allow bounded cold Windows source startup before the first loopback
+  // request. Later child deadlines stay unchanged.
+  { timeout: process.platform === 'win32' ? 90_000 : 60_000 },
+  async (context) => {
     const home = await mkdtemp(join(tmpdir(), 'TEST-effective-default-entry-'))
     const paths: string[] = []
     const inferenceModels: string[] = []
@@ -137,11 +139,17 @@ test(
       ANTHROPIC_AUTH_TOKEN: 'fixture-only',
       ANTHROPIC_API_KEY: 'fixture-only',
     }
+    let invocation = 0
     async function run(
       args: string[],
       extraEnv: Record<string, string>,
       cwd = home,
     ) {
+      const ordinal = ++invocation
+      const budgetMs = process.platform === 'win32' && ordinal === 1 ? 45_000 : 20_000
+      const startedAt = performance.now()
+      const requestsBefore = paths.length
+      let timedOut = false
       const child = spawn(
         bun,
         ['--no-install', '--no-env-file', entry, ...args],
@@ -159,16 +167,29 @@ test(
       child.stderr.on('data', (data: Buffer) => {
         stderr += data.toString()
       })
-      const timer = setTimeout(() => child.kill('SIGKILL'), 20_000)
+      const abort = () => { child.kill('SIGKILL') }
+      context.signal.addEventListener('abort', abort, { once: true })
+      const timer = setTimeout(() => {
+        timedOut = true
+        child.kill('SIGKILL')
+      }, budgetMs)
       try {
         const code = await new Promise<number | null>((resolve, reject) => {
           child.once('error', reject)
           child.once('close', resolve)
         })
-        assert.equal(code, 0, stderr)
+        const diagnostic = JSON.stringify({
+          ordinal, budgetMs, elapsedMs: Math.round(performance.now() - startedAt),
+          timedOut, aborted: context.signal.aborted, code, signal: child.signalCode,
+          stdoutBytes: Buffer.byteLength(stdout), stderrBytes: Buffer.byteLength(stderr),
+          loopbackRequests: paths.length - requestsBefore,
+        })
+        assert(!timedOut && !context.signal.aborted, `Source CLI fixture interrupted: ${diagnostic}`)
+        assert.equal(code, 0, `${diagnostic} ${stderr}`)
         return { stdout, stderr }
       } finally {
         clearTimeout(timer)
+        context.signal.removeEventListener('abort', abort)
       }
     }
     async function status(
