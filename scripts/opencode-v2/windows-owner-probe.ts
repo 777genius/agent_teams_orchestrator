@@ -1743,13 +1743,31 @@ $hash.AppendData([BitConverter]::GetBytes([int]$dacl.Length));$hash.AppendData($
   assert.ok(Number(contentionBaseline.count) > retirementFiles)
   assert.match(String(contentionBaseline.sha256), /^[a-f0-9]{64}$/)
   executionRecord(facts.concurrentRootRetirement).setupElapsedMs = Math.min(86_400_000, Date.now() - contentionSetupStarted)
+  // Mirrors rootRetirementRotation in WindowsKernelScope.cpp: the cohort-less
+  // walk rotation is the FNV-1a of the launch nonce, so sieved nonces give the
+  // three contenders three distinct deterministic rotations.
+  const retirementRotation = (nonce: string, rootCount: number) => {
+    let hash = 14695981039346656037n
+    for (let index = 0; index < nonce.length; index++) {
+      hash ^= BigInt(nonce.charCodeAt(index))
+      hash = BigInt.asUintN(64, hash * 1099511628211n)
+    }
+    return Number(hash % BigInt(rootCount))
+  }
+  const retirementRotationNonce = (rotation: number) => {
+    for (let attempt = 0; attempt < 1024; attempt++) {
+      const nonce = randomUUID()
+      if (retirementRotation(nonce, 3) === rotation) return nonce
+    }
+    throw new Error('TEST_rotation_nonce_missing')
+  }
   const contenders: Array<{ broker: ReturnType<typeof createWindowsNativeBroker>; nonce: string
     fence?: WindowsOwnerDirectory; mapping?: Record<string, unknown>; connected?: unknown
     progress: ExecutionNativeRootObservation[]; failure?: string; retired: boolean; retirement?: Promise<unknown> }> = []
   let contentionFailed = false
   try {
     for (let index = 0; index < 3; index++) {
-      const contender = { broker: createWindowsNativeBroker(helper), nonce: randomUUID(),
+      const contender = { broker: createWindowsNativeBroker(helper), nonce: retirementRotationNonce(index),
         progress: [] as ExecutionNativeRootObservation[], retired: false } as (typeof contenders)[number]
       contenders.push(contender); contender.broker.events.on('error', () => {})
       rootObservations.push(contender.progress)
@@ -1786,10 +1804,22 @@ $hash.AppendData([BitConverter]::GetBytes([int]$dacl.Length));$hash.AppendData($
       assert.deepEqual(receipt.mapping, contender.mapping); contender.retired = true
       assert.equal(contender.failure, undefined)
       assert.equal(contender.progress.length, 18)
-      for (const [index, role] of ['protected_deny', 'private_writable', 'shared_read'].entries()) {
-        const observations = contender.progress.filter(value => value.index === index + 1)
+      // Each member walks the shared roots in its own deterministic rotation,
+      // so the roles at fixed indexes follow that rotation; every index still
+      // binds exactly one root across its six phases.
+      for (const index of [1, 2, 3]) {
+        const observations = contender.progress.filter(value => value.index === index)
+        assert.equal(observations.length, 6)
+        assert.equal(observations.every(value => value.role === observations[0]!.role), true)
+      }
+      const walked = [1, 2, 3].map(index => contender.progress.find(value => value.index === index)!.role)
+      const rotationBase = ['protected_deny', 'private_writable', 'shared_read'] as const
+      const rotation = retirementRotation(contender.nonce, 3)
+      assert.deepEqual(walked, [...rotationBase.slice(rotation), ...rotationBase.slice(0, rotation)])
+      for (const role of rotationBase) {
+        const observations = contender.progress.filter(value => value.role === role)
         assert.deepEqual(observations.map(value => value.phase), executionNativeRootPhases)
-        assert.equal(observations.every(value => value.count === 3 && value.role === role), true)
+        assert.equal(observations.every(value => value.count === 3), true)
         assert.equal(observations.every((value, index) => index === 0 || value.elapsedMs >= observations[index - 1]!.elapsedMs), true)
       }
     }))
