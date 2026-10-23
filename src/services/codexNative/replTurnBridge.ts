@@ -84,12 +84,15 @@ export async function runCodexNativeTurnInRepl(
         sdkMessage.subtype === 'success' &&
         !sdkMessage.is_error &&
         !emittedAssistantError &&
-        !params.abortSignal?.aborted
+        !params.abortSignal?.aborted &&
+        emittedMessageUuids.size === 0
       ) {
         // SDK output omits empty assistants, but the live REPL mailbox needs
         // the actual successful turn receipt. Preserve its original UUID;
         // the UI still hides it through isNotEmptyMessage. Never infer one
         // from a result or forward a failed/cancelled turn as completion.
+        // Existing live activity already proves delivery; appending an earlier
+        // empty receipt now would reorder the transcript's parent chain.
         for (const message of persistedTranscriptMessages.slice(
           initialTranscriptLength,
         )) {

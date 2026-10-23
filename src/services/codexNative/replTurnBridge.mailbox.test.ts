@@ -12,6 +12,137 @@ import {
 } from '../../utils/messages.js'
 import { runCodexNativeTurnInRepl } from './replTurnBridge.js'
 import { executeCodexNativeTurn } from './turnExecutor.js'
+import {
+  cleanMessagesForLogging,
+  isChainParticipant,
+} from '../../utils/sessionStorage.js'
+
+test('mixed native turn keeps live transcript order and its final parent after an initial empty assistant', async () => {
+  const submitted = createUserMessage({
+    content: 'TEST mixed peer',
+    isMeta: true,
+  })
+  const live = [submitted] as Parameters<
+    typeof getOrdinaryProcessingAction
+  >[0]['messages']
+  let projected: typeof live = []
+  await runCodexNativeTurnInRepl(
+    {
+      prompt: 'TEST mixed peer',
+      cwd: '/tmp/TEST-mixed-peer',
+      model: 'gpt-5.4',
+      effortValue: undefined,
+      permissionMode: 'bypassPermissions',
+      additionalWritableDirectories: [],
+      initialAppState: { fastMode: false } as never,
+      transcriptMessages: live,
+      requestApproval: async () => ({ allow: false }),
+      onReplEvent: (event) =>
+        handleMessageFromStream(
+          event,
+          (message) => live.push(message),
+          () => {},
+          () => {},
+          () => {},
+        ),
+    },
+    {
+      executeTurn: (params) => {
+        projected = params.transcriptMessages
+        return executeCodexNativeTurn(
+          { ...params, persistSession: false },
+          {
+            buildUserLoopbackProviderConfigOverrides: () => [],
+            runtimeTurnSettledEmitter: { emit: async () => {} },
+            runExec: async function* () {
+              yield {
+                type: 'normalized_event',
+                event: { type: 'assistant_text', itemId: 'empty', text: '' },
+              }
+              yield {
+                type: 'normalized_event',
+                event: {
+                  type: 'tool_call_started',
+                  itemId: 'tool-1',
+                  toolSource: 'native',
+                  toolName: 'TEST tool',
+                  arguments: {},
+                  status: 'running',
+                  rawItemType: 'command_execution',
+                },
+              }
+              yield {
+                type: 'normalized_event',
+                event: {
+                  type: 'tool_call_completed',
+                  itemId: 'tool-1',
+                  toolSource: 'native',
+                  toolName: 'TEST tool',
+                  arguments: {},
+                  status: 'completed',
+                  rawItemType: 'command_execution',
+                  resultText: 'TEST result',
+                  rawResult: {},
+                  errorMessage: null,
+                  isError: false,
+                },
+              }
+              yield {
+                type: 'normalized_event',
+                event: {
+                  type: 'assistant_text',
+                  itemId: 'final',
+                  text: 'TEST final response',
+                },
+              }
+              yield {
+                type: 'normalized_event',
+                event: { type: 'turn_completed' },
+              }
+              return {
+                identity: {
+                  executablePath: '/TEST/codex',
+                  executableSource: 'system-path',
+                  version: 'codex-cli TEST',
+                },
+                threadId: null,
+                credentialSource: 'ambient-process-env',
+                completionPolicy: 'ephemeral',
+                finalHistoryCompleteness: 'live-only',
+                finalUsageAuthority: 'live-turn-completed',
+              }
+            },
+          },
+        )
+      },
+    },
+  )
+  expect(
+    projected.some(
+      (message) => message.type === 'assistant' && !isNotEmptyMessage(message),
+    ),
+  ).toBe(true)
+  expect(live.map((message) => message.type)).toEqual([
+    'user',
+    'assistant',
+    'user',
+    'assistant',
+  ])
+  expect(
+    live.some(
+      (message) => message.type === 'assistant' && !isNotEmptyMessage(message),
+    ),
+  ).toBe(false)
+  const final = live.at(-1)!
+  expect(final).toMatchObject({
+    type: 'assistant',
+    message: { content: [{ type: 'text', text: 'TEST final response' }] },
+  })
+  // Same parent selection used by useLogMessages for the following user turn.
+  expect(
+    cleanMessagesForLogging(live, live).findLast(isChainParticipant)?.uuid,
+  ).toBe(final.uuid)
+})
 
 test('completed empty native peer turn reaches the live REPL mailbox without a provider replay', async () => {
   const submitted = createUserMessage({
