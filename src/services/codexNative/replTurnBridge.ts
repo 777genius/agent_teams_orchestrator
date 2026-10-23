@@ -6,6 +6,7 @@ import { convertSDKMessage } from '../../remote/sdkMessageAdapter.js'
 import type { AppState } from '../../state/AppState.js'
 import type { Message, StreamEvent } from '../../types/message.js'
 import type { EffortValue } from '../../utils/effort.js'
+import { isNotEmptyMessage } from '../../utils/messages.js'
 import type { PermissionMode } from '../../utils/permissions/PermissionMode.js'
 import { EMPTY_USAGE } from '../api/emptyUsage.js'
 import type { CodexAppServerApprovalRequestHandler } from './appServerApproval.js'
@@ -51,7 +52,9 @@ export async function runCodexNativeTurnInRepl(
   const executeTurn = deps.executeTurn ?? executeCodexNativeTurn
   const mutableMessages = [...params.transcriptMessages]
   const persistedTranscriptMessages = [...params.transcriptMessages]
+  const initialTranscriptLength = persistedTranscriptMessages.length
   let emittedAssistantError = false
+  const emittedMessageUuids = new Set<string>()
 
   for await (const sdkMessage of executeTurn({
     prompt: params.prompt,
@@ -76,6 +79,30 @@ export async function runCodexNativeTurnInRepl(
     }
 
     if (shouldSuppressResultMessage(sdkMessage, emittedAssistantError)) {
+      if (
+        sdkMessage.type === 'result' &&
+        sdkMessage.subtype === 'success' &&
+        !sdkMessage.is_error &&
+        !emittedAssistantError &&
+        !params.abortSignal?.aborted
+      ) {
+        // SDK output omits empty assistants, but the live REPL mailbox needs
+        // the actual successful turn receipt. Preserve its original UUID;
+        // the UI still hides it through isNotEmptyMessage. Never infer one
+        // from a result or forward a failed/cancelled turn as completion.
+        for (const message of persistedTranscriptMessages.slice(
+          initialTranscriptLength,
+        )) {
+          if (
+            message.type === 'assistant' &&
+            !isNotEmptyMessage(message) &&
+            !emittedMessageUuids.has(message.uuid)
+          ) {
+            emittedMessageUuids.add(message.uuid)
+            params.onReplEvent(message)
+          }
+        }
+      }
       continue
     }
 
@@ -83,6 +110,7 @@ export async function runCodexNativeTurnInRepl(
       convertToolResults: true,
     })
     if (converted.type === 'message') {
+      emittedMessageUuids.add(converted.message.uuid)
       params.onReplEvent(converted.message)
       continue
     }

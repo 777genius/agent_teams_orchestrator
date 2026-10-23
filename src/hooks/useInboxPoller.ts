@@ -2214,6 +2214,7 @@ export function getOrdinaryProcessingAction({
     const fallback = findOrdinaryDirectReplyFallback({
       messages,
       submitUserMessageUuid: attempt.submitUserMessageUuid,
+      excludeEmptyMessages: true,
       ...(teamName ? { teamName } : {}),
     })
     if (fallback) {
