@@ -949,8 +949,10 @@ async function probeStoredLaneAuthority(
     })
     return { snapshot: retained.snapshot, records: authorityRecords, release: retained.release }
   } catch (error) {
+    // Absence is closure evidence only for the exact process every stored
+    // session is pinned to. Records without a runtime pid stay fail-closed.
     if (command !== 'opencode.stopTeam' || !isOpenCodeHostProcessGoneError(error)
-      || (expectedRuntimePid !== undefined && error.pid !== null && error.pid !== expectedRuntimePid)) {
+      || expectedRuntimePid === undefined || error.pid !== expectedRuntimePid) {
       throw error
     }
     // The registered host process is provably absent. A Stop request may close
@@ -4845,9 +4847,19 @@ async function runStop(
   // Keep the process alive on release so cleanup can honor other lanes' leases.
   await releaseAuthority()
 
+  // Stale cleanup deletes every dead registry record, while a retried gone-host
+  // Stop can re-prove absence only from that exact record. Keep it until every
+  // member of this lane is closed.
+  const deadHostEvidenceNeeded = hostGone && memberResults.some(result => !result.stopped)
   const cleanupAllowed = runtimeDeadline.remainingMs() >= OPEN_CODE_STOP_HOST_CLEANUP_RESERVE_MS
-    && !stopSignal.aborted
-  if (!cleanupAllowed) {
+    && !stopSignal.aborted && !deadHostEvidenceNeeded
+  if (deadHostEvidenceNeeded) {
+    diagnostics.push(teamDiagnostic(
+      'opencode_host_cleanup_warning',
+      'OpenCode host cleanup deferred so a Stop retry can re-prove the gone host',
+      'warning',
+    ))
+  } else if (!cleanupAllowed) {
     diagnostics.push(teamDiagnostic(
       'opencode_stop_deadline',
       `OpenCode host cleanup skipped because only ${runtimeDeadline.remainingMs()}ms remained`,

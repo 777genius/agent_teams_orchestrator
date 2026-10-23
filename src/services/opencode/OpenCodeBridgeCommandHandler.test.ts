@@ -2096,6 +2096,111 @@ describe('OpenCodeBridgeCommandHandler', () => {
     }
   })
 
+  async function withGoneHostLane(
+    recordOverrides: Partial<OpenCodeSessionRecord>,
+    run: (lane: { store: OpenCodeSessionStore; record: OpenCodeSessionRecord; body: Record<string, unknown> }) => Promise<void>,
+  ): Promise<void> {
+    const projectPath = await mkdtemp(path.join(os.tmpdir(), 'opencode-gone-host-lane-'))
+    const originalConfigDir = process.env.CLAUDE_CONFIG_DIR
+    process.env.CLAUDE_CONFIG_DIR = projectPath
+    try {
+      const store = new OpenCodeSessionStore(path.join(projectPath, 'sessions.json'))
+      const capabilitySnapshotId = `opencode:${'a'.repeat(32)}`
+      const record = buildRecord({ projectPath, runId: 'run-1',
+        selectedModel: 'openai/gpt-5.6-sol', toolApprovalMode: 'auto',
+        profileScope: { purpose: 'launch_runtime', providerId: 'openai', scopeToken: 'lane-scope',
+          configFingerprint: 'config', selectedAuthIdentity: 'absent' },
+        expectedBehaviorFingerprint: 'b'.repeat(64), ...recordOverrides })
+      await store.upsert(record)
+      await store.upsert({ ...record, memberName: 'bob', opencodeSessionId: 'session-bob' })
+      openCodeSessionStore.list = store.list.bind(store)
+      openCodeSessionStore.get = store.get.bind(store)
+      openCodeSessionStore.markStoppedIfSession = store.markStoppedIfSession.bind(store)
+      const manifestPath = path.join(projectPath, 'teams', record.teamId,
+        '.opencode-runtime', 'lanes', record.laneId ?? 'primary', 'manifest.json')
+      await mkdir(path.dirname(manifestPath), { recursive: true })
+      await writeFile(manifestPath, JSON.stringify({ data: { schemaVersion: 1,
+        teamName: record.teamId, activeRunId: record.runId,
+        activeCapabilitySnapshotId: capabilitySnapshotId } }))
+      openCodeProvisioningProbe.probe = async () => { throw new Error('broad probe forbidden') }
+      openCodeSessionBridge.abort = async () => {
+        throw new Error('must not abort a session on a gone host')
+      }
+      await run({ store, record, body: { projectPath, teamId: record.teamId, laneId: record.laneId,
+        runId: record.runId, expectedCapabilitySnapshotId: capabilitySnapshotId } })
+    } finally {
+      if (originalConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR
+      else process.env.CLAUDE_CONFIG_DIR = originalConfigDir
+      await rm(projectPath, { recursive: true, force: true })
+    }
+  }
+
+  test('stop never closes a gone host without an exact runtime pid binding', async () => {
+    // Sessions without a pinned runtime pid, or pinned to a different pid,
+    // cannot prove that the absent process is the one that owned them.
+    for (const { runtimePid, gonePid } of [{ runtimePid: undefined, gonePid: 123 },
+      { runtimePid: 123, gonePid: 456 }]) {
+      await withGoneHostLane(runtimePid === undefined ? {} : { runtimePid }, async ({ store, record, body }) => {
+        openCodeProvisioningProbe.probeRetainingHost = async () => {
+          throw new OpenCodeHostProcessGoneError(gonePid)
+        }
+        const released: string[] = []
+        openCodeSessionBridge.releaseSession = async target => { released.push(target.memberName) }
+        for (const command of ['opencode.handshake', 'opencode.stopTeam']) {
+          const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope(command, {
+            ...body, requiredCommand: 'opencode.stopTeam',
+          }))
+          expect(result.ok).toBe(false)
+        }
+        expect(released).toEqual([])
+        for (const memberName of ['alice', 'bob']) {
+          const current = await store.get(record.teamId, record.laneId ?? 'primary', memberName)
+          expect(current?.stoppedAt ?? null).toBeNull()
+        }
+      })
+    }
+  })
+
+  test('a partial gone-host stop keeps the dead host record so a retry can close the rest', async () => {
+    await withGoneHostLane({ runtimePid: 123 }, async ({ store, record, body }) => {
+      openCodeProvisioningProbe.probeRetainingHost = async () => {
+        throw new OpenCodeHostProcessGoneError(123)
+      }
+      let failBob = true
+      openCodeSessionBridge.releaseSession = async (target, options) => {
+        expect(options?.strictLeaseRelease).toBe(true)
+        if (failBob && target.memberName === 'bob') throw new Error('lease release unavailable')
+      }
+      // Stale cleanup deletes dead registry records, which is the only
+      // evidence the retry can re-prove absence from.
+      let cleanups = 0
+      openCodeHostManager.reconcilePersistentHosts = (async () => {
+        cleanups += 1
+        return { cleaned: 0, remaining: 0, hosts: [], diagnostics: [] }
+      }) as typeof openCodeHostManager.reconcilePersistentHosts
+      const first = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.stopTeam', body))
+      expect(first.ok).toBe(true)
+      if (!('data' in first) || !('stopped' in first.data)) throw new Error('missing stop result')
+      expect(first.data.stopped).toBe(false)
+      expect(first.data.members.alice?.stopped).toBe(true)
+      expect(first.data.members.bob?.stopped).toBe(false)
+      expect(cleanups).toBe(0)
+      expect((await store.get(record.teamId, record.laneId ?? 'primary', 'bob'))?.stoppedAt ?? null).toBeNull()
+
+      failBob = false
+      const retry = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.stopTeam', body))
+      expect(retry.ok).toBe(true)
+      if (!('data' in retry) || !('stopped' in retry.data)) throw new Error('missing retry result')
+      expect(retry.data.stopped).toBe(true)
+      expect(cleanups).toBe(1)
+      for (const memberName of ['alice', 'bob']) {
+        const terminal = await store.get(record.teamId, record.laneId ?? 'primary', memberName)
+        expect(terminal?.stoppedAt).toBeDefined()
+        expect(terminal?.stopAuthority).toBeUndefined()
+      }
+    })
+  })
+
   for (const failure of ['abort', 'release', 'cas'] as const) {
     test(`stop never marks terminal when ${failure} fails`, async () => {
       const record = buildRecord()

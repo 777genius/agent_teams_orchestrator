@@ -165,7 +165,7 @@ test('existing-only host retention verifies identity and never spawns or cleans 
   }
 })
 
-test('existing-only retention reports a typed gone error for a provably dead registered process', async () => {
+test('existing-only retention types a dead registered process as gone only on ESRCH proof', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-stop-gone-'))
   const registryPath = path.join(root, 'hosts.json')
   const profile = { ...baseProfile, projectPath: root, canonicalProjectPath: root, workingDirectoryPath: root }
@@ -175,23 +175,33 @@ test('existing-only retention reports a typed gone error for a provably dead reg
         managedConfigFingerprint: profile.managedConfigFingerprint,
         resolvedConfigFingerprint: profile.managedConfigFingerprint,
         processStartedAtMs: 1000, updatedAt: new Date().toISOString() } } }))
-    const manager = new OpenCodeHostManager({
-      persistentRegistryPath: registryPath,
-      spawnHostProcess: () => { throw new Error('must not spawn') },
-      killProcess: () => { throw new Error('must not kill') },
-      isProcessAlive: () => false,
-      readProcessStartTimeMs: async () => 1000,
-      fetchJson: async () => { throw new Error('must not probe a dead host') },
-    })
-    let caught: unknown = null
-    try {
-      await manager.ensureHost({ projectPath: root, preparedProfile: profile, hostKey: host.hostKey, existingOnly: true })
-    } catch (error) {
-      caught = error
+    // isProcessAlive=false is any failed signal, including EPERM on a live
+    // process. Only the kernel's ESRCH may become closure evidence.
+    for (const liveness of ['gone', 'unknown', 'alive'] as const) {
+      const manager = new OpenCodeHostManager({
+        persistentRegistryPath: registryPath,
+        spawnHostProcess: () => { throw new Error('must not spawn') },
+        killProcess: () => { throw new Error('must not kill') },
+        isProcessAlive: () => false,
+        inspectProcessLiveness: async () => liveness,
+        readProcessStartTimeMs: async () => 1000,
+        fetchJson: async () => { throw new Error('must not probe a dead host') },
+      })
+      let caught: unknown = null
+      try {
+        await manager.ensureHost({ projectPath: root, preparedProfile: profile, hostKey: host.hostKey, existingOnly: true })
+      } catch (error) {
+        caught = error
+      }
+      expect(isOpenCodeHostProcessGoneError(caught)).toBe(liveness === 'gone')
+      if (liveness === 'gone') {
+        expect((caught as Error).message).toBe('OpenCode existing host process is gone')
+        expect((caught as { code?: string }).code).toBe('host_process_gone')
+        expect((caught as OpenCodeHostProcessGoneError).pid).toBe(host.pid)
+      } else {
+        expect((caught as Error).message).toBe('OpenCode existing host process identity is unavailable or changed')
+      }
     }
-    expect(isOpenCodeHostProcessGoneError(caught)).toBe(true)
-    expect((caught as Error).message).toBe('OpenCode existing host process is gone')
-    expect((caught as { code?: string }).code).toBe('host_process_gone')
   } finally {
     await rm(root, { recursive: true, force: true })
   }

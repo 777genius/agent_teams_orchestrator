@@ -156,12 +156,13 @@ type PersistentHostProcessIdentity = {
   startedAtMs: number | null
 }
 
-/** The registered host process is provably absent, not merely unreadable.
- * Stop-path callers may treat this as physical closure evidence; every other
- * identity failure stays fail-closed. */
+/** The registered host process is provably absent (kernel ESRCH), not merely
+ * unreadable. Stop-path callers may treat this as physical closure evidence
+ * only for the exact pid they own; every other identity failure stays
+ * fail-closed. */
 export class OpenCodeHostProcessGoneError extends Error {
   readonly code = 'host_process_gone'
-  constructor(readonly pid: number | null = null) {
+  constructor(readonly pid: number) {
     super('OpenCode existing host process is gone')
     this.name = 'OpenCodeHostProcessGoneError'
   }
@@ -649,6 +650,20 @@ export class OpenCodeHostManager {
 
   private isProcessAlive(pid: number): boolean {
     return (this.deps.isProcessAlive ?? isProcessAlive)(pid)
+  }
+
+  // isProcessAlive reads any signal failure as absence. Authority decisions
+  // need the kernel's ESRCH; access or query failures stay unknown.
+  private async inspectProcessLiveness(pid: number): Promise<'alive' | 'gone' | 'unknown'> {
+    if (this.deps.inspectProcessLiveness) return this.deps.inspectProcessLiveness(pid)
+    if (!Number.isSafeInteger(pid) || pid <= 0) return 'unknown'
+    try {
+      process.kill(pid, 0)
+      return 'alive'
+    } catch (error) {
+      return error && typeof error === 'object' && 'code' in error && error.code === 'ESRCH'
+        ? 'gone' : 'unknown'
+    }
   }
 
   private killProcess(pid: number, signal: NodeJS.Signals): void {
@@ -1831,17 +1846,7 @@ export class OpenCodeHostManager {
           }
         }
         assertAbsent()
-        const inspect = async (): Promise<'alive' | 'gone' | 'unknown'> => {
-          if (this.deps.inspectProcessLiveness) return this.deps.inspectProcessLiveness(record.runtimePid!)
-          try {
-            process.kill(record.runtimePid!, 0)
-            return 'alive'
-          } catch (error) {
-            return error && typeof error === 'object' && 'code' in error && error.code === 'ESRCH'
-              ? 'gone' : 'unknown'
-          }
-        }
-        const liveness = await raceOpenCodeAbortSignal(inspect(), signal)
+        const liveness = await raceOpenCodeAbortSignal(this.inspectProcessLiveness(record.runtimePid!), signal)
         if (liveness !== 'gone') throw new Error('OpenCode old runtime process is alive or unverified')
         assertAbsent()
         if (signal?.aborted) throwOpenCodeAbortReason(signal)
@@ -1880,18 +1885,23 @@ export class OpenCodeHostManager {
         || (cached && cached.handle.state !== 'healthy')) {
         throw new Error('OpenCode existing host authority is unavailable or changed')
       }
-      const before = await raceOpenCodeAbortSignal(this.inspectPersistentHostProcessIdentity(record), abortSignal)
-      if (before.state === 'gone') {
-        throw new OpenCodeHostProcessGoneError(record.pid)
+      // Stop may close sessions on a typed gone host, so that type needs the
+      // same ESRCH proof dead-runtime recovery uses. Weaker evidence keeps the
+      // generic fail-closed identity error below.
+      const throwIfProvablyGone = async (state: PersistentHostProcessIdentity['state']) => {
+        if (state === 'gone'
+          && await raceOpenCodeAbortSignal(this.inspectProcessLiveness(record.pid), abortSignal) === 'gone') {
+          throw new OpenCodeHostProcessGoneError(record.pid)
+        }
       }
+      const before = await raceOpenCodeAbortSignal(this.inspectPersistentHostProcessIdentity(record), abortSignal)
+      await throwIfProvablyGone(before.state)
       if (before.state !== 'confirmed' || before.startedAtMs !== record.processStartedAtMs) {
         throw new Error('OpenCode existing host process identity is unavailable or changed')
       }
       const health = await raceOpenCodeAbortSignal(this.checkHealthyHostOnce(record.baseUrl), abortSignal)
       const after = await raceOpenCodeAbortSignal(this.inspectPersistentHostProcessIdentity(record), abortSignal)
-      if (after.state === 'gone') {
-        throw new OpenCodeHostProcessGoneError(record.pid)
-      }
+      await throwIfProvablyGone(after.state)
       if (!health || after.state !== 'confirmed' || after.startedAtMs !== record.processStartedAtMs) {
         throw new Error('OpenCode existing host is unhealthy or its process identity changed')
       }
