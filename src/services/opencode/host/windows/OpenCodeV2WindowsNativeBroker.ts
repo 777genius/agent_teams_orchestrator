@@ -134,10 +134,13 @@ function launchWindowsNativeBroker(artifact: WindowsNativeArtifact, custodyOnly:
         const value = JSON.parse(line) as Record<string, unknown>
         assert(value && typeof value === 'object' && !Array.isArray(value) && value.schema === 1, 'execution_invalid_response')
         if (value.kind === 'reply') {
-          const waiter = pending.get(Number(value.id)); assert(waiter, 'execution_invalid_response'); pending.delete(Number(value.id)); waiter.dispose()
-          if (value.ok === true) waiter.resolve(value.value)
-          else {
-            waiter.reject(decodeWindowsNativeFailure(value, waiter.operation))
+          const waiter = pending.get(Number(value.id))
+          if (waiter) {
+            pending.delete(Number(value.id)); waiter.dispose()
+            if (value.ok === true) waiter.resolve(value.value)
+            else {
+              waiter.reject(decodeWindowsNativeFailure(value, waiter.operation))
+            }
           }
         } else if (value.kind === 'event' && typeof value.event === 'string') events.emit(value.event, value.value)
         else throw new Error('execution_invalid_response')
@@ -152,8 +155,8 @@ function launchWindowsNativeBroker(artifact: WindowsNativeArtifact, custodyOnly:
       const id = ++sequence, bytes = JSON.stringify({ schema: 1, id, operation, input }) + '\n'
       assert(Buffer.byteLength(bytes) <= CONTROL_PACKET_LIMIT, 'execution_invalid_response')
       return new Promise<unknown>((resolve, reject) => {
-        const timer = setTimeout(() => { pending.delete(id); dispose(); reject(new Error('execution_native_timeout')); child.stdin.end() }, deadline - Date.now())
-        const abort = () => { pending.delete(id); dispose(); reject(new Error('execution_cancelled')); child.stdin.end() }
+        const timer = setTimeout(() => { pending.delete(id); dispose(); reject(new Error('execution_native_timeout')) }, deadline - Date.now())
+        const abort = () => { pending.delete(id); dispose(); reject(new Error('execution_cancelled')) }
         const dispose = () => { clearTimeout(timer); signal?.removeEventListener('abort', abort) }
         pending.set(id, { operation, resolve, reject, dispose }); signal?.addEventListener('abort', abort, { once: true })
         child.stdin.write(bytes, error => { if (error) { pending.delete(id); dispose(); reject(new Error(

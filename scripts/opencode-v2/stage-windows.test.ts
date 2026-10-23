@@ -1179,3 +1179,80 @@ test('native grant removal measures identity outside the ACL mutex and keeps the
   expect(after.indexOf('sharedReadAclCustody')).toBeLessThan(after.indexOf('it->assertLive()'))
   expect(after.indexOf('aclCustody')).toBeLessThan(after.indexOf('it->assertLive()'))
 })
+
+test('windows native broker keeps the helper alive across a single request timeout or abort', async () => {
+  const { runInNewContext } = await import('node:vm')
+  const source = (await readFile(path.resolve(import.meta.dir, '../../src/services/opencode/host/windows/OpenCodeV2WindowsNativeBroker.ts'), 'utf8')).replaceAll('\r\n', '\n')
+  const begin = source.indexOf('function launchWindowsNativeBroker(')
+  expect(begin).toBeGreaterThanOrEqual(0)
+  const open = source.indexOf('{', begin)
+  let depth = 0, end = -1
+  for (let index = open; index < source.length; index++) {
+    if (source[index] === '{') depth++
+    else if (source[index] === '}') { depth--; if (depth === 0) { end = index; break } }
+  }
+  expect(end).toBeGreaterThan(open)
+  const fnSource = new Bun.Transpiler({ loader: 'ts' }).transformSync(source.slice(begin, end + 1))
+  // A run-state broker is a long-lived, multi-request control channel. A single
+  // request's timeout or an external abort must reject only that request and
+  // leave the helper (and its sealed run-state endpoint) alive for the next
+  // request. Only a genuine protocol corruption or an explicit close may tear
+  // the helper down.
+  const dispatch = () => {
+    const child: any = { endCalls: 0, handlers: {} as Record<string, Function[]> }
+    child.stdin = {
+      write: (_bytes: string, cb?: (e?: Error) => void) => { cb && cb() },
+      end: () => { child.endCalls++; for (const fn of child.handlers.close ?? []) fn(0) },
+    }
+    child.stdout = { on: (ev: string, fn: Function) => { (child.handlers['stdout:' + ev] ??= []).push(fn) } }
+    child.stderr = { on: () => {} }
+    child.on = (ev: string, fn: Function) => { (child.handlers[ev] ??= []).push(fn) }
+    child.once = (ev: string, fn: Function) => { (child.handlers[ev] ??= []).push(fn) }
+    class EventEmitter { handlers: Record<string, Function[]> = {}; on(ev: string, fn: Function) { (this.handlers[ev] ??= []).push(fn) } emit(ev: string, ...a: unknown[]) { for (const fn of this.handlers[ev] ?? []) fn(...a) } }
+    class StringDecoder { write(s: string) { return s } }
+    const context = {
+      spawn: () => child, EventEmitter, StringDecoder,
+      decodeWindowsNativeFailure: () => new Error('execution_native_unknown'),
+      CONTROL_PACKET_LIMIT: 16 * 1024 * 1024,
+      assert: (value: unknown, code?: string) => { if (!value) throw new Error(code || 'assert') },
+      process: { env: { LOCALAPPDATA: 'X:\\AppData' } },
+      path: { win32: { isAbsolute: () => true } },
+      JSON, Buffer, setTimeout, clearTimeout, Promise, Date,
+    }
+    const launch = runInNewContext(fnSource + '\n;launchWindowsNativeBroker', context) as (artifact: unknown, custodyOnly: boolean) => any
+    const broker = launch({ path: 'C:\\helper.exe', sha256: 'a'.repeat(64) }, false)
+    return { child, broker }
+  }
+
+  // Leg 1: a request timeout rejects only that request; the helper stays up.
+  const timedOut = dispatch()
+  timedOut.broker.request('op1', {}, Date.now() + 30).catch(() => undefined)
+  await new Promise(resolve => setTimeout(resolve, 80))
+  expect(timedOut.child.endCalls).toBe(0)
+  let syncError: unknown = null
+  try { timedOut.broker.request('op2', {}, Date.now() + 1000).catch(() => undefined) } catch (error) { syncError = error }
+  expect(syncError).toBeNull()
+
+  // Leg 2: an external abort rejects only that request; the helper stays up.
+  const aborted = dispatch()
+  const listeners: Function[] = []
+  const signal: any = {
+    aborted: false,
+    throwIfAborted() { if (signal.aborted) throw new Error('execution_cancelled') },
+    addEventListener(_ev: string, fn: Function) { listeners.push(fn) },
+    removeEventListener() {},
+  }
+  aborted.broker.request('op1', {}, Date.now() + 5000, signal).catch(() => undefined)
+  signal.aborted = true
+  for (const fn of listeners) fn()
+  await new Promise(resolve => setTimeout(resolve, 10))
+  expect(aborted.child.endCalls).toBe(0)
+
+  // Leg 3 (guard against over-rotation): a genuine protocol corruption still
+  // tears the helper down so a wedged/corrupt backend cannot linger.
+  const corrupted = dispatch()
+  const stdoutData = (corrupted.child.handlers['stdout:data'] ?? [])[0] as Function
+  stdoutData('not-json\n')
+  await new Promise(resolve => setTimeout(resolve, 10))
+  expect(corrupted.child.endCalls).toBe(1)
+})
