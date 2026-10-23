@@ -364,7 +364,8 @@ async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: O
         sourceCapabilities, ...(owner ? { team: projectV2TeamStatus(owner, required(body.runId, 'runId')) } : {}) }, selection.native.version)
       return respond(envelope, started, handshake, selection.native.version)
     }
-    const timeout = Math.min(envelope.timeoutMs || 8000, 30_000)
+    // Stop carries the extended cleanup budget; every other operation stays at the 30s control cap.
+    const timeout = Math.min(envelope.timeoutMs || 8000, envelope.command === 'opencode.stopTeam' ? 45_000 : 30_000)
     const operationDeadline = Date.now() + timeout
     const remaining = () => {
       const budget = operationDeadline - Date.now(); executionAssert(budget > 0, 'operation_timeout'); return budget
