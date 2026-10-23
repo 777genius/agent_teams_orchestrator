@@ -899,11 +899,13 @@ async function exchangeOpenCodeV2Run(record: RunControlRecord, request: RunContr
       client, nonce: randomBytes(32).toString('hex'), deadline, request }
     // The fresh caller identity is measured here and independently compared by
     // native pipe peer proofs. It never borrows the published server PID.
-    // Native run control refuses a pipe window above the 30s control cap; the
-    // extended cleanup budget funds the archive reads around it, never the pipe.
+    // Native run control caps the pipe window at 30s for regular work and 45s
+    // for stop/status; the owner's 40s physical-close envelope rides the cleanup
+    // window, and the archive reads share that same deadline.
     const received = await state.broker.request('runStateRequest', {
       stateId: state.stateId, directory: native.directory, endpointHash: payload.endpoint,
-      payload, timeoutMs: Math.max(1, Math.min(MAX_OPERATION_MS, deadline - Date.now())),
+      payload, timeoutMs: Math.max(1, Math.min(request.operation === 'stop' || request.operation === 'status'
+        ? MAX_STOP_OPERATION_MS : MAX_OPERATION_MS, deadline - Date.now())),
     }, deadline) as { response: unknown }
     const response = executionRecord(received.response)
     executionAssert(response.nonce === payload.nonce && response.endpoint === payload.endpoint, 'run_control_foreign')

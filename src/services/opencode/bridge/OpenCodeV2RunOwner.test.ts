@@ -511,7 +511,7 @@ test('Windows original lease arriving after the public stop snapshot is still cl
   } finally { gate.release(); await f.close() }
 })
 
-test('Windows Stop shares its original 40s envelope with a 27s physical slice while POSIX keeps adapter defaults', async () => {
+test('Windows Stop shares its original 40s envelope with a 38s physical slice while POSIX keeps adapter defaults', async () => {
   for (const windowsAcquisitions of [true, false]) {
     const closes: (number | undefined)[] = []
     const f = await fixture({ windowsAcquisitions, leaseClose: deadline => { closes.push(deadline) } })
@@ -521,7 +521,7 @@ test('Windows Stop shares its original 40s envelope with a 27s physical slice wh
       const start = Date.now()
       clock = spyOn(Date, 'now').mockReturnValue(start)
       const stopped = await f.owner.stop()
-      expect(closes).toEqual([windowsAcquisitions ? start + 27_000 : undefined])
+      expect(closes).toEqual([windowsAcquisitions ? start + 38_000 : undefined])
       expect(stopped.state).toBe('cleanup_unknown') // Same-fields fake receipts still confer no physical proof.
       expect((await f.owner.stop())).toBe(stopped)
       expect(f.counters.closed).toBe(1)
@@ -529,12 +529,25 @@ test('Windows Stop shares its original 40s envelope with a 27s physical slice wh
   }
 })
 
+test('Windows Stop honors a signed pipe deadline inside the 40s owner envelope', async () => {
+  const closes: (number | undefined)[] = []
+  const f = await fixture({ windowsAcquisitions: true, leaseClose: deadline => { closes.push(deadline) } })
+  let clock: ReturnType<typeof spyOn> | undefined
+  try {
+    await f.owner.ready()
+    const start = Date.now()
+    clock = spyOn(Date, 'now').mockReturnValue(start)
+    await f.owner.stop(start + 30_000)
+    expect(closes).toEqual([start + 28_000]) // Signed deadline minus the shared 2s receipt reserve.
+  } finally { clock?.mockRestore(); await f.close() }
+})
+
 test('Windows Stop clips physical work and finalization to the same original 40s deadline', async () => {
   for (const mode of ['within', 'expired_close', 'persist_failed', 'persist_late', 'archive_late'] as const) {
     let now = Date.now(), start = now, observed: number | undefined
     const writes: string[] = []
     const f = await fixture({ windowsAcquisitions: true, leaseClose: deadline => { observed = deadline },
-      nativeRetirement: async () => { await Promise.resolve(); now = start + (mode === 'expired_close' ? 30_000 : 25_000) } })
+      nativeRetirement: async () => { await Promise.resolve(); now = start + (mode === 'expired_close' ? 38_000 : 25_000) } })
     let clock: ReturnType<typeof spyOn> | undefined, write: ReturnType<typeof spyOn> | undefined
     let trusted: ReturnType<typeof spyOn> | undefined, bounded: ReturnType<typeof spyOn> | undefined
     try {
@@ -560,7 +573,7 @@ test('Windows Stop clips physical work and finalization to the same original 40s
         else if (f.counters.closed) now += 500
       })
       const stopped = await f.owner.stop()
-      expect(observed).toBe(start + 30_000) // The full 27s close window opens after these three pre-close seconds.
+      expect(observed).toBe(start + 38_000) // The shared 40s envelope minus its 2s receipt reserve clips the slice.
       expect(f.counters.closed).toBe(1)
       expect(writes).toEqual(['state', 'stop']) // Shared finalization reserve, no second public persistence window.
       expect(stopped.state).toBe(mode === 'within' ? 'stopped' : 'cleanup_unknown')

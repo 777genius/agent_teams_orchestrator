@@ -923,7 +923,7 @@ private:
     require(value.HasKey(key) && value.GetNamedValue(key).ValueType() == JsonValueType::Number,
             "run_control_timeout");
     const double raw = value.GetNamedNumber(key);
-    require(raw >= 1.0 && raw <= 30000.0 && raw == std::floor(raw) &&
+    require(raw >= 1.0 && raw <= 45000.0 && raw == std::floor(raw) &&
                 raw <= static_cast<double>(std::numeric_limits<DWORD>::max()),
             "run_control_timeout");
     return static_cast<DWORD>(raw);

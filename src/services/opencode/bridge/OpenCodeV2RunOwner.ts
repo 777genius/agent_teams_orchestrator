@@ -606,7 +606,7 @@ export class OpenCodeV2RunOwner {
       let cleanup: RunStopMember['cleanup'] = null
       const cleanupStartedAt = Date.now()
       // The same 40s owner deadline funds physical close AND finalization.
-      // Windows may use up to 27s, leaving one shared 2s receipt-write reserve.
+      // Windows may use up to 38s, leaving one shared 2s receipt-write reserve.
       const closeDeadline = this.deferredWindowsControllers
         ? Math.min(Date.now() + OPEN_CODE_V2_WINDOWS_CLOSE_MS, cleanupDeadline - 2000)
         : Date.now() + remaining(22_000)
