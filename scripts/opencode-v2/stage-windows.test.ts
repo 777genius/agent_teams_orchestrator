@@ -1034,3 +1034,49 @@ test('endpoint owner witness accepts retired owners by retirement witness and re
   expect(failure(() => matches({}, 4242, 9001, { token: 'measured' }))).toEqual(['run_control_process_identity', 5, 'process_image_path'])
   expect(scenario.identityCalls).toBe(1)
 })
+
+
+test('windows close frame reaches the wrapper before the transport drain retires', async () => {
+  const { runInNewContext } = await import('node:vm')
+  const execution = (await readFile(path.resolve(import.meta.dir, '../../src/services/opencode/host/windows/OpenCodeV2WindowsExecution.ts'), 'utf8')).replaceAll('\r\n', '\n')
+  const begin = execution.indexOf('sendClose() {')
+  expect(begin).toBeGreaterThanOrEqual(0)
+  const open = execution.indexOf('{', begin)
+  let depth = 0, end = -1
+  for (let index = open; index < execution.length; index++) {
+    if (execution[index] === '{') depth++
+    else if (execution[index] === '}') { depth--; if (depth === 0) { end = index; break } }
+  }
+  expect(end).toBeGreaterThan(open)
+  const body = execution.slice(open + 1, end).replaceAll('broker!.', 'broker.')
+  const dispatch = (drain: Promise<void>) => {
+    const sends: unknown[] = [], events: string[] = []
+    let closes = 0
+    const context = {
+      mapping: {}, nonce: '01234567-89ab-cdef-0123-456789abcdef', leaseOwnerId: '89abcdef-0123-4567-89ab-cdef01234567',
+      assert: (value: unknown) => { if (!value) throw new Error('execution_containment_unqualified') },
+      broker: { request: (operation: string, input: Readonly<{ value: unknown }>) => {
+        expect(operation).toBe('send'); sends.push(input.value); return Promise.resolve(undefined)
+      } },
+      http: { close: () => { closes++; return drain } },
+      child: { emit: (event: string) => { events.push(event) } },
+      stopped: false,
+    }
+    runInNewContext(`(function () {${body}\n})()`, context)
+    return { sends, events, closes, context }
+  }
+  let release!: () => void
+  const hung = dispatch(new Promise<void>(resolve => { release = resolve }))
+  // The owner's 10s wrapper-exit wait runs from this frame, so a held turn's
+  // in-flight cancellation drain must never sit in front of its delivery.
+  expect(hung.sends).toEqual([{ type: 'close', nonce: '01234567-89ab-cdef-0123-456789abcdef', leaseOwnerId: '89abcdef-0123-4567-89ab-cdef01234567' }])
+  expect(hung.context.stopped).toBe(true)
+  expect(hung.closes).toBe(1)
+  release()
+  await new Promise(resolve => setImmediate(resolve))
+  expect(hung.events).toEqual([])
+  const failed = dispatch(Promise.reject(new Error('execution_http_cleanup_unknown')))
+  expect(failed.sends).toHaveLength(1)
+  await new Promise(resolve => setImmediate(resolve))
+  expect(failed.events).toEqual(['error'])
+})

@@ -655,7 +655,11 @@ export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, l
       await broker!.request('send', { value: { type: 'activate', nonce, leaseOwnerId, namespace: mapping.namespace.name,
         pid: mapping.bun.nativePID, birth: mapping.bun.birth } }, deadline, signal)
     },
-    sendClose() { assert(mapping); stopped = true; void http.close().then(() => broker!.request('send', { value: { type: 'close', nonce, leaseOwnerId } })).catch(() => child.emit('error', new Error('cleanup_unknown'))) },
+    // The owner's 10s exit wait runs from this frame's delivery; the transport drain must never delay it.
+    sendClose() { assert(mapping); stopped = true
+      const drain = http.close()
+      const delivered = broker!.request('send', { value: { type: 'close', nonce, leaseOwnerId } })
+      void Promise.all([delivered, drain]).catch(() => child.emit('error', new Error('cleanup_unknown'))) },
     acknowledged: () => closed,
     readBirth() { assert(mapping && mainExit, 'execution_identity_mismatch'); return mainExit.readBirth() },
     async kill(deadline?: number) { stopped = true; try { await retireNative(deadline) } finally { controllerRelay?.disconnect() } },
