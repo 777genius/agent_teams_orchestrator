@@ -1,11 +1,14 @@
 import { describe, expect, test } from 'bun:test'
-import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { realpathSync } from 'node:fs'
+import { EventEmitter } from 'node:events'
+import type { ChildProcess } from 'node:child_process'
 import os from 'node:os'
 import path from 'node:path'
 
 import { OpenCodeProviderManagementAdapter } from './OpenCodeProviderManagementAdapter.js'
 import { planOpenCodeProfilePolicy } from '../../../../services/opencode/OpenCodeProfilePolicy.js'
+import { OpenCodeHostManager } from '../../../../services/opencode/OpenCodeHostManager.js'
 
 import type {
   OpenCodeExecutionProbeResult,
@@ -100,15 +103,16 @@ function authStore() {
   }
 }
 
-function catalogIdentityDependencies() {
+function catalogIdentityDependencies(): Pick<
+  NonNullable<ConstructorParameters<typeof OpenCodeProviderManagementAdapter>[0]>,
+  'resolveBinaryPath' | 'resolveBinaryIdentity' | 'profileManager'
+> {
   return {
     resolveBinaryPath: () => testBinaryPath,
     resolveBinaryIdentity: async () => 'test-binary-identity',
     profileManager: {
       listManagedAuthPaths: async () => [],
-      readCatalogSelectedAuthIdentity: async ({ profileScope }: {
-        profileScope: { selectedAuthIdentity: string }
-      }) => ({
+      readCatalogSelectedAuthIdentity: async ({ profileScope }) => ({
         source: profileScope.selectedAuthIdentity,
         managed: profileScope.selectedAuthIdentity,
         preferences: 'known:test-preferences',
@@ -330,6 +334,107 @@ describe('OpenCodeProviderManagementAdapter', () => {
       }
     }
   })
+
+  for (const degraded of [false, true]) {
+    test(`settings disposes its snapshot host before returning without disturbing a leased persistent owner (degraded: ${degraded})`, async () => {
+      const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'settings-host-lifetime-')))
+      const registryPath = path.join(root, 'host-registry.json')
+      const snapshot = inventory({ projectPath: root, profile: {
+        ...inventory().profile!, projectPath: root, canonicalProjectPath: root,
+        workingDirectoryPath: root, profileRootPath: root, tmpPath: path.join(root, 'tmp'),
+        globalAuthPath: path.join(root, 'global-auth.json'),
+        managedAuthPath: path.join(root, 'managed-auth.json'),
+        sourceAuthPath: path.join(root, 'source-auth.json'),
+      } })
+      const alive = new Set<number>()
+      let nextPort = 43150
+      let persistent: OpenCodeHostHandle | undefined
+      let disposalStarted!: () => void
+      const disposing = new Promise<void>(resolve => { disposalStarted = resolve })
+      let finishDisposal!: () => void
+      const disposalGate = new Promise<void>(resolve => { finishDisposal = resolve })
+      const disposed: number[] = []
+      const manager = new OpenCodeHostManager({
+        prepareProfile: async () => snapshot.profile!,
+        allocateLoopbackPort: async () => ++nextPort,
+        spawnHostProcess: (_profile, pid) => {
+          alive.add(pid)
+          return Object.assign(new EventEmitter(), {
+            pid, unref() {}, kill() { alive.delete(pid); return true },
+          }) as ChildProcess
+        },
+        fetchJson: async url => {
+          const pid = Number(new URL(url).port)
+          if (url.endsWith('/global/dispose')) {
+            if (pid !== persistent?.pid) {
+              disposalStarted()
+              await disposalGate
+            }
+            disposed.push(pid)
+            alive.delete(pid)
+          }
+          return { status: 200, data: { healthy: true, version: '1.14.19' } }
+        },
+        isProcessAlive: pid => alive.has(pid),
+        readProcessStartTimeMs: async pid => pid,
+        killProcess: pid => { alive.delete(pid) },
+        sleepMs: async () => {},
+        persistentRegistryPath: registryPath,
+        processAttributionDirectory: null,
+      })
+      const ownerLease = {
+        teamId: 'TEST-other-team', laneId: 'primary', memberName: 'alice',
+        runId: 'TEST-run', sessionId: 'TEST-session',
+      }
+      let pending: Promise<ProviderManagementResult<unknown>> | undefined
+      try {
+        persistent = await manager.ensureHost({
+          preparedProfile: snapshot.profile!, hostLifetime: 'persistent',
+          resolveConfigFingerprint: false, prewarmManagedSubscriptionPlugins: false,
+        })
+        await manager.retainHostLease(persistent.hostKey, ownerLease)
+        await manager.releaseHost(persistent.hostKey, { keepPersistentAlive: true })
+        const registryBefore = await readFile(registryPath, 'utf8')
+        const adapter = new OpenCodeProviderManagementAdapter({
+          ...catalogIdentityDependencies(),
+          inventoryService: { probe: async () => snapshot },
+          hostManager: manager,
+          clientFactory: { create: () => ({
+            getConfigProviders: async () => ({ providers: [], default: {} }),
+            getProviders: async () => {
+              if (degraded) throw new Error('TEST metadata unavailable')
+              return { all: [], connected: [], default: {} }
+            },
+            getProviderAuth: async () => ({}),
+          }) },
+        })
+        let returned = false
+        const resultPromise = adapter.loadView('opencode').then(result => { returned = true; return result })
+        pending = resultPromise
+        expect(await Promise.race([
+          disposing.then(() => 'disposing'), resultPromise.then(() => 'returned'),
+        ])).toBe('disposing')
+        expect(returned).toBe(false)
+        expect(alive.size).toBe(2)
+        finishDisposal()
+        const result = await resultPromise
+        expect(result.ok).toBe(true)
+        if (result.ok) expect(result.value.runtime.state).toBe(degraded ? 'degraded' : 'ready')
+        expect(disposed).toEqual([43152])
+        expect(alive).toEqual(new Set([persistent.pid]))
+        expect(manager.getHost(persistent.hostKey)).toBe(persistent)
+        expect(await readFile(registryPath, 'utf8')).toBe(registryBefore)
+      } finally {
+        finishDisposal()
+        await pending?.catch(() => undefined)
+        if (persistent) {
+          await manager.releaseHostLease(persistent.hostKey, ownerLease)
+          await manager.disposeHost(persistent.hostKey)
+        }
+        await rm(root, { recursive: true, force: true })
+      }
+    })
+  }
 
   test('bounds settings host preparation after successful inventory and propagates cancellation', async () => {
     let hostSignal: AbortSignal | undefined
@@ -611,7 +716,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
     ).toEqual([
       {
         projectPath: '/tmp/project',
-        hostLifetime: 'persistent',
+        hostLifetime: 'process',
         healthTimeoutMs: 10_000,
         preparedProfile: true,
         includeAppMcp: false,

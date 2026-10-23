@@ -89,7 +89,7 @@ jobs:
         run: bun install --frozen-lockfile
       - name: Test native Codex approval transport
         working-directory: runtime
-        run: bun test src/services/codexNative/replApprovalTransport.test.ts src/services/codexNative/replTurnBridge.test.ts src/services/codexNative/appServerRunner.test.ts
+        run: bun test src/services/codexNative/replApprovalTransport.test.ts src/services/codexNative/replTurnBridge.test.ts src/services/codexNative/replTurnBridge.mailbox.test.ts src/services/codexNative/appServerRunner.test.ts
       # Same compile command and native Windows target as release-runtime.yml.
       - name: Compile Windows runtime
         working-directory: runtime
@@ -169,7 +169,7 @@ jobs:
         run: bun test src/utils/clientVersion.test.ts src/utils/renderOptions.test.ts src/utils/headlessInputPrompt.test.ts
 
       - name: Test native Codex approval transport
-        run: bun test src/services/codexNative/replApprovalTransport.test.ts src/services/codexNative/replTurnBridge.test.ts src/services/codexNative/appServerRunner.test.ts
+        run: bun test src/services/codexNative/replApprovalTransport.test.ts src/services/codexNative/replTurnBridge.test.ts src/services/codexNative/replTurnBridge.mailbox.test.ts src/services/codexNative/appServerRunner.test.ts
 
       - name: Test mailbox publications and lifecycle
         run: bun test src/utils/teammateMailbox.test.ts src/hooks/ordinaryMailboxMessage.test.ts src/cli/print.groupMailbox.test.ts
