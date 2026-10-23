@@ -482,6 +482,12 @@ export class OpenCodeHostManager {
     await Promise.all(this.startupLockReleases)
   }
 
+  async drainPendingLifecycleCleanups(): Promise<void> {
+    while (this.pendingLifecycleCleanups.size > 0) {
+      await Promise.all(this.pendingLifecycleCleanups)
+    }
+  }
+
   private readonly hosts = new Map<string, ManagedHostEntry>()
   private readonly pendingHosts = new Map<string, Promise<OpenCodeHostHandle>>()
   private readonly pendingRefCounts = new Map<string, number>()
@@ -2220,9 +2226,7 @@ export class OpenCodeHostManager {
     } finally {
       // Child exit can start a registry acquisition during disposal. Drain it
       // even when the initial registry read fails, before the CLI may exit.
-      while (this.pendingLifecycleCleanups.size > 0) {
-        await Promise.all(this.pendingLifecycleCleanups)
-      }
+      await this.drainPendingLifecycleCleanups()
     }
   }
 
