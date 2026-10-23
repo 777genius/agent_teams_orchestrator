@@ -11,6 +11,7 @@ import { mkdir, readdir, readFile, realpath, rm, stat, unlink, writeFile } from 
 import path from 'node:path'
 
 import * as lockfile from '../../utils/lockfile.js'
+import { withOpenCodeRegistryLockDiagnostics, type RegistryLockOperation } from './OpenCodeRegistryLockDiagnostics.js'
 import { writeJsonFileAtomic } from '../../utils/atomicWrite.js'
 import { sleep } from '../../utils/sleep.js'
 import {
@@ -475,6 +476,7 @@ export function buildOpenCodeHostProfileIdentity(
 
 export class OpenCodeHostManager {
   private readonly startupLockReleases = new Set<Promise<void>>()
+  private readonly pendingLifecycleCleanups = new Set<Promise<void>>()
 
   async drainStartupCleanupLockReleases(): Promise<void> {
     await Promise.all(this.startupLockReleases)
@@ -937,23 +939,14 @@ export class OpenCodeHostManager {
     return lockPath
   }
 
-  private async withPersistentRegistryLock<T>(callback: () => Promise<T>, onCompromised?: (error: Error) => void): Promise<T> {
+  private async withPersistentRegistryLock<T>(operation: RegistryLockOperation, callback: () => Promise<T>, onCompromised?: (error: Error) => void): Promise<T> {
     const lockPath = await this.ensurePersistentRegistryLockFile()
     if (!lockPath) {
       return callback()
     }
 
-    let release: (() => Promise<void>) | undefined
-    try {
-      release = await lockfile.lock(lockPath, onCompromised
-        ? { ...PERSISTENT_REGISTRY_LOCK_OPTIONS, onCompromised }
-        : PERSISTENT_REGISTRY_LOCK_OPTIONS)
-      return await callback()
-    } finally {
-      if (release) {
-        await release()
-      }
-    }
+    return withOpenCodeRegistryLockDiagnostics(operation, lockPath, () => lockfile.lock(lockPath,
+      onCompromised ? { ...PERSISTENT_REGISTRY_LOCK_OPTIONS, onCompromised } : PERSISTENT_REGISTRY_LOCK_OPTIONS), callback)
   }
 
   private async withPersistentHostStartupLock<T>(
@@ -1033,7 +1026,7 @@ export class OpenCodeHostManager {
     if (!registryPath || handle.pid <= 0) {
       return
     }
-    await this.withPersistentRegistryLock(async () => {
+    await this.withPersistentRegistryLock('upsert_host', async () => {
       const registry = await this.readPersistentRegistryUnlocked()
       const previous = registry.hosts[handle.hostKey]
       if (previous && await this.hasPendingOAuthHost(handle.hostKey)
@@ -1082,7 +1075,7 @@ export class OpenCodeHostManager {
     if (!registryPath) {
       return
     }
-    await this.withPersistentRegistryLock(async () => {
+    await this.withPersistentRegistryLock('remove_host', async () => {
       const registry = await this.readPersistentRegistryUnlocked()
       const record = registry.hosts[hostKey]
       if (!record
@@ -1130,7 +1123,7 @@ export class OpenCodeHostManager {
       }
       return { record, lease }
     }
-    const snapshot = await this.withPersistentRegistryLock(readQualifiedOwner)
+    const snapshot = await this.withPersistentRegistryLock('endpoint_snapshot', readQualifiedOwner)
     // OS inspection can take seconds. It must not hold the shared registry gate
     // while independent members are retaining or releasing their exact leases.
     if ((await raceOpenCodeAbortSignal(
@@ -1138,7 +1131,7 @@ export class OpenCodeHostManager {
     )).state !== 'confirmed') {
       throw new Error('OpenCode cleanup host process ownership is unavailable')
     }
-    return this.withPersistentRegistryLock(async () => {
+    return this.withPersistentRegistryLock('endpoint_confirm', async () => {
       const current = await readQualifiedOwner()
       const identity = (value: typeof snapshot) => JSON.stringify({
         hostKey: value.record.hostKey, projectPath: value.record.projectPath,
@@ -1172,7 +1165,7 @@ export class OpenCodeHostManager {
       if (Date.now() >= deadline) throw new Error('Cursor reap deadline exhausted')
     }
     try {
-      await this.withPersistentRegistryLock(async () => {
+      await this.withPersistentRegistryLock('cursor_reap', async () => {
         guard()
         const read = await readOpenCodeAuthority(registryPath, isKnownHostRegistry)
         if (read.kind === 'missing') { result.diagnostics.push('Registry missing'); return }
@@ -1215,7 +1208,7 @@ export class OpenCodeHostManager {
       && record.processStartedAtMs === identity.processStartedAtMs
       && record.baseUrl === identity.baseUrl
     let original: PersistentHostLeaseRecord | undefined
-    await this.withPersistentRegistryLock(async () => {
+    await this.withPersistentRegistryLock('operation_pin', async () => {
       const registry = await this.readPersistentRegistryUnlocked()
       const record = registry.hosts[identity.hostKey]
       if (!record || !matchesHost(record)) throw new Error('OpenCode operation host generation is unavailable')
@@ -1244,7 +1237,7 @@ export class OpenCodeHostManager {
       failed = false
       return result
     } finally {
-      await this.withPersistentRegistryLock(async () => {
+      await this.withPersistentRegistryLock('operation_unpin', async () => {
         const registry = await this.readPersistentRegistryUnlocked()
         const record = registry.hosts[identity.hostKey]
         // Missing/unreadable evidence cannot establish successful pin removal.
@@ -1271,7 +1264,7 @@ export class OpenCodeHostManager {
     const registryPath = this.persistentRegistryPath
     if (!registryPath) throw new Error('OpenCode persistent lease registry is unavailable')
 
-    await this.withPersistentRegistryLock(async () => {
+    await this.withPersistentRegistryLock('retain_lease', async () => {
       const leaseKey = buildLeaseKey(input)
       const registry = await this.readPersistentRegistryUnlocked()
       const record = registry.hosts[hostKey]
@@ -1339,7 +1332,7 @@ export class OpenCodeHostManager {
       return false
     }
 
-    return this.withPersistentRegistryLock(async () => {
+    return this.withPersistentRegistryLock('release_lease', async () => {
       const leaseKey = buildLeaseKey(input)
       const registry = await this.readPersistentRegistryUnlocked()
       const record = registry.hosts[hostKey]
@@ -1617,10 +1610,12 @@ export class OpenCodeHostManager {
 
       this.hosts.delete(hostKey)
       this.pendingHosts.delete(hostKey)
-      void this.removePersistentHost(hostKey, {
+      const cleanup = this.removePersistentHost(hostKey, {
         pid: entry.handle.pid,
         startedAtMs: entry.handle.processStartedAtMs,
       }).catch(() => undefined)
+      this.pendingLifecycleCleanups.add(cleanup)
+      void cleanup.finally(() => { this.pendingLifecycleCleanups.delete(cleanup) })
       void this.cleanupOpenTuiTempArtifactsIfUnused(
         entry.handle.profile.tmpPath,
         entry.handle.pid,
@@ -1764,7 +1759,7 @@ export class OpenCodeHostManager {
       throw new Error('OpenCode dead runtime recovery requires exact host and process authority')
     }
     return this.withPersistentHostStartupLock(record.hostKey, async () => {
-      return this.withPersistentRegistryLock(async () => {
+      return this.withPersistentRegistryLock('absent_recovery', async () => {
         const registry = requireOpenCodeAuthority(await readOpenCodeAuthority(registryPath, isKnownHostRegistry),
           'host', () => ({ schemaVersion: 1, hosts: {} }))
         const hosts = registry.hosts
@@ -1903,7 +1898,7 @@ export class OpenCodeHostManager {
     if (params.abortSignal?.aborted) {
       throwOpenCodeAbortReason(params.abortSignal)
     }
-    await this.withPersistentRegistryLock(async () => { await this.readPersistentRegistryUnlocked() })
+    await this.withPersistentRegistryLock('ensure_read', async () => { await this.readPersistentRegistryUnlocked() })
     const profile = params.preparedProfile ?? await raceOpenCodeAbortSignal(
       this.prepareProfile(params.projectPath, {
         ...params.profileOptions,
@@ -2021,7 +2016,7 @@ export class OpenCodeHostManager {
   }
 
   async refreshResolvedConfigFingerprint(hostKey: string): Promise<string | null> {
-    await this.withPersistentRegistryLock(async () => { await this.readPersistentRegistryUnlocked() })
+    await this.withPersistentRegistryLock('refresh_read', async () => { await this.readPersistentRegistryUnlocked() })
     const entry = this.hosts.get(hostKey)
     if (!entry) {
       return null
@@ -2145,14 +2140,14 @@ export class OpenCodeHostManager {
   }
 
   async disposeHost(hostKey: string): Promise<boolean> {
-    await this.withPersistentRegistryLock(async () => { await this.readPersistentRegistryUnlocked() })
+    await this.withPersistentRegistryLock('dispose_read', async () => { await this.readPersistentRegistryUnlocked() })
     const entry = this.hosts.get(hostKey)
     if (!entry) {
       return false
     }
 
     return this.withPersistentHostStartupLock(hostKey, async () => {
-      return this.withPersistentRegistryLock(async () => {
+      return this.withPersistentRegistryLock('dispose_host', async () => {
         const registry = await this.readPersistentRegistryUnlocked()
         const persisted = registry.hosts[hostKey] ?? null
         if (persisted && Object.keys(normalizePersistentHostLeases(persisted.leases)).length > 0) {
@@ -2196,31 +2191,39 @@ export class OpenCodeHostManager {
     kept: number
     diagnostics: string[]
   }> {
-    const registry = await this.readPersistentRegistry()
-    let disposed = 0
-    let kept = 0
-    const diagnostics: string[] = []
+    try {
+      const registry = await this.readPersistentRegistry()
+      let disposed = 0
+      let kept = 0
+      const diagnostics: string[] = []
 
-    for (const [hostKey, entry] of Array.from(this.hosts.entries())) {
-      if (!entry.ownedByProcess) {
-        kept += 1
-        continue
-      }
-      if (registry.hosts[hostKey]) {
-        kept += 1
-        continue
-      }
-
-      try {
-        if (await this.disposeHost(hostKey)) {
-          disposed += 1
+      for (const [hostKey, entry] of Array.from(this.hosts.entries())) {
+        if (!entry.ownedByProcess) {
+          kept += 1
+          continue
         }
-      } catch (error) {
-        diagnostics.push(error instanceof Error ? error.message : String(error))
+        if (registry.hosts[hostKey]) {
+          kept += 1
+          continue
+        }
+
+        try {
+          if (await this.disposeHost(hostKey)) {
+            disposed += 1
+          }
+        } catch (error) {
+          diagnostics.push(error instanceof Error ? error.message : String(error))
+        }
+      }
+
+      return { disposed, kept, diagnostics }
+    } finally {
+      // Child exit can start a registry acquisition during disposal. Drain it
+      // even when the initial registry read fails, before the CLI may exit.
+      while (this.pendingLifecycleCleanups.size > 0) {
+        await Promise.all(this.pendingLifecycleCleanups)
       }
     }
-
-    return { disposed, kept, diagnostics }
   }
 
   async reconcilePersistentHosts(
@@ -2250,7 +2253,7 @@ export class OpenCodeHostManager {
     }
 
     return (async () => {
-      let registry = await this.withPersistentRegistryLock(() =>
+      let registry = await this.withPersistentRegistryLock('reconcile_snapshot', () =>
         this.readPersistentRegistryUnlocked(),
       )
       const hosts: OpenCodePersistentHostReconcileResult['hosts'] = []
@@ -2318,7 +2321,7 @@ export class OpenCodeHostManager {
             legacyFailure = error
           }
         }
-        await this.withPersistentRegistryLock(async () => {
+        await this.withPersistentRegistryLock('reconcile_host', async () => {
           const currentRegistry = await this.readPersistentRegistryUnlocked()
           const record = currentRegistry.hosts[hostKey]
           if (!record || JSON.stringify(record) !== JSON.stringify(observedRecord)) {
@@ -2676,7 +2679,7 @@ export class OpenCodeHostManager {
       registry = await this.readPersistentRegistry()
 
       if (options.reason === 'startup' && !budget) {
-        await this.withPersistentRegistryLock(async () => {
+        await this.withPersistentRegistryLock('reconcile_artifacts', async () => {
           registry = await this.readPersistentRegistryUnlocked()
           const activeProfileRootKeys = new Set(
             Object.values(registry.hosts)
@@ -2762,7 +2765,7 @@ export class OpenCodeHostManager {
     hostKey: string,
     options: { keepPersistentAlive?: boolean } = {},
   ): Promise<void> {
-    await this.withPersistentRegistryLock(async () => { await this.readPersistentRegistryUnlocked() })
+    await this.withPersistentRegistryLock('release_read', async () => { await this.readPersistentRegistryUnlocked() })
     const entry = this.hosts.get(hostKey)
     if (!entry) {
       return

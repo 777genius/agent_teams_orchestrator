@@ -56,6 +56,33 @@ const baseProfile: OpenCodePreparedProfile = {
   env: {},
 }
 
+test.each(['success', 'read_failure'] as const)('drains lifecycle registry cleanup before real CLI process exit (%s)', async mode => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'TEST-opencode-lifecycle-exit-'))
+  try {
+    const project = await import('node:fs/promises').then(fs => fs.realpath(root))
+    const profilePath = path.join(root, 'profile.json')
+    await writeFile(profilePath, JSON.stringify({ ...baseProfile, projectPath: project,
+      canonicalProjectPath: project, workingDirectoryPath: project, tmpPath: path.join(root, 'tmp') }))
+    const child = Bun.spawn([process.execPath,
+      path.join(import.meta.dir, 'fixtures/host-lifecycle-exit.ts'), root, profilePath, mode], {
+      env: { ...process.env, CLAUDE_MULTIMODEL_DEBUG_OPENCODE_COMMAND: '0' }, stdout: 'pipe', stderr: 'pipe',
+    })
+    const [exitCode, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()])
+    expect(stderr).toBe('')
+    expect(exitCode).toBe(0)
+    expect(JSON.parse(await readFile(path.join(root, 'result.json'), 'utf8'))).toEqual({
+      acquisitionPaused: true, gateReleased: true, cleanupReadFailed: mode === 'read_failure',
+      lockPresentBeforeExit: false, registryPresent: mode === 'read_failure',
+    })
+    expect(await pathExists(path.join(root, 'host-registry.json.lock.lock'))).toBe(false)
+    if (mode === 'read_failure') {
+      expect(await readFile(path.join(root, 'host-registry.json'), 'utf8')).toBe('{invalid-TEST-registry')
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+}, 20000)
+
 test('deadline-bound host startup waits past the fallback retry cap', () => {
   const locked = Object.assign(new Error('contended'), { code: 'ELOCKED' })
   expect(shouldRetryPersistentHostStartupLock(locked, 120, true)).toBe(true)
@@ -1989,6 +2016,7 @@ describe('OpenCodeHostManager', () => {
       prepareProfile: async () => baseProfile,
       allocateLoopbackPort: async () => 43136,
       spawnHostProcess: () => spawned.child,
+      readProcessStartTimeMs: async () => 42,
       fetchJson: async url => {
         if (url.endsWith('/global/health')) {
           return {
