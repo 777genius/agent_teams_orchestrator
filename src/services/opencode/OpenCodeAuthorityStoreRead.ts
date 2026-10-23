@@ -51,7 +51,7 @@ export async function readOpenCodeAuthority<T>(
   // admitted: close it and restart the complete no-follow check, at most twice.
   for (let attempt = 0; attempt < 3; attempt += 1) {
     let metadata
-    try { metadata = await lstat(file) } catch (error) {
+    try { metadata = await lstat(file, { bigint: true }) } catch (error) {
       return attempt === 0 && error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT'
         ? { kind: 'missing' } : { kind: 'preserved_unknown', reason: 'unreadable' }
     }
@@ -59,7 +59,7 @@ export async function readOpenCodeAuthority<T>(
     let handle: Awaited<ReturnType<typeof open>> | undefined
     try {
       handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
-      const current = await handle.stat()
+      const current = await handle.stat({ bigint: true })
       if (!current.isFile()) return { kind: 'preserved_unknown', reason: 'nonregular' }
       if (current.ino !== metadata.ino || current.dev !== metadata.dev) {
         if (attempt < 2) continue

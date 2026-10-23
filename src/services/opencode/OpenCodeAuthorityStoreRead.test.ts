@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs'
+import { readFileSync, type BigIntStats, type PathLike, type StatOptions, type Stats } from 'node:fs'
 import * as fs from 'node:fs/promises'
 import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { spawnSync } from 'node:child_process'
@@ -19,6 +19,62 @@ const nonrootAvailable = process.platform !== 'win32' && typeof process.getuid =
   })))
 
 describe('O1a typed authority read', () => {
+  for (const replacements of [1, 3]) test(`large file IDs cannot hide ${replacements} atomic replacements through number rounding`, async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'TEST-authority-large-id-'))
+    const file = path.join(root, 'sessions.json')
+    const originalLstat = fs.lstat, originalOpen = fs.open
+    const firstId = 2n ** 63n
+    let swaps = 0, opens = 0, closes = 0, validated = 0
+    const bytes = (generation: number) => JSON.stringify({ schemaVersion: 1, records: {}, generationPin: generation })
+    await writeFile(file, bytes(0))
+    // Real rename and descriptor reads, with opaque filesystem IDs projected
+    // above the number precision limit for a deterministic Windows-like case.
+    function identifiedLstat(target: PathLike, options?: StatOptions & { bigint?: false }): Promise<Stats>
+    function identifiedLstat(target: PathLike, options: StatOptions & { bigint: true }): Promise<BigIntStats>
+    function identifiedLstat(target: PathLike, options?: StatOptions): Promise<Stats | BigIntStats>
+    async function identifiedLstat(target: PathLike, options?: StatOptions): Promise<Stats | BigIntStats> {
+      if (options?.bigint) {
+        const stat = await originalLstat(target, { ...options, bigint: true })
+        return target === file ? Object.assign(stat, { ino: firstId + BigInt(swaps) }) : stat
+      }
+      const stat = await originalLstat(target, { ...options, bigint: false })
+      return target === file ? Object.assign(stat, { ino: Number(firstId + BigInt(swaps)) }) : stat
+    }
+    const lstat = spyOn(fs, 'lstat').mockImplementation(identifiedLstat)
+    const open = spyOn(fs, 'open').mockImplementation(async (...args) => {
+      if (args[0] === file && swaps < replacements) {
+        const next = path.join(root, `next-${++swaps}.json`)
+        await writeFile(next, bytes(swaps))
+        await fs.rename(next, file)
+      }
+      const handle = await originalOpen(...args)
+      const stat = handle.stat.bind(handle), close = handle.close.bind(handle)
+      opens++
+      handle.stat = async (options?: StatOptions) => {
+        const result = await stat(options)
+        return options?.bigint
+          ? Object.assign(result, { ino: firstId + BigInt(swaps) })
+          : Object.assign(result, { ino: Number(firstId + BigInt(swaps)) })
+      }
+      handle.close = async () => { closes++; await close() }
+      return handle
+    })
+    try {
+      expect(Number(firstId)).toBe(Number(firstId + 3n))
+      const result = await readOpenCodeAuthority(file, (value): value is SessionStoreShape => {
+        validated++
+        return isKnownSessionStore(value)
+      })
+      expect(result).toEqual(replacements === 1
+        ? { kind: 'known', value: JSON.parse(bytes(1)), bytes: bytes(1) }
+        : { kind: 'preserved_unknown', reason: 'nonregular' })
+      expect(opens).toBe(replacements === 1 ? 2 : 3)
+      expect(closes).toBe(opens)
+      expect(validated).toBe(replacements === 1 ? 1 : 0)
+      expect(await readFile(file, 'utf8')).toBe(bytes(replacements))
+    } finally { open.mockRestore(); lstat.mockRestore(); await rm(root, { recursive: true, force: true }) }
+  })
+
   for (const replacements of [1, 2, 3]) test(`fresh admission after ${replacements} atomic session-store replacements is bounded`, async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'TEST-authority-read-race-'))
     const file = path.join(root, 'sessions.json')
