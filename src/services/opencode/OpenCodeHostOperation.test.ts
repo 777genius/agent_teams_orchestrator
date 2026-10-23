@@ -20,7 +20,7 @@ function fixture(marked = true) {
   // In-memory durable snapshots and a serialized gate; no filesystem or processes.
   const ports = manager as any
   let tail = Promise.resolve()
-  ports.withPersistentRegistryLock = (callback: () => Promise<unknown>) => {
+  ports.withPersistentRegistryLock = (_operation: string, callback: () => Promise<unknown>) => {
     const result = tail.then(callback)
     tail = result.then(() => undefined, () => undefined)
     return result
@@ -29,7 +29,7 @@ function fixture(marked = true) {
   ports.writePersistentRegistryUnlocked = async (value: unknown) => { registry = structuredClone(value) }
   ports.hasPendingOAuthHost = async () => false
   let kills = 0
-  const reap = () => ports.withPersistentRegistryLock(async () => {
+  const reap = () => ports.withPersistentRegistryLock('cursor_reap', async () => {
     const record = registry.hosts.host
     // The raw reaper's admission predicate, before any native port is invoked.
     if (record.cursorAgentReapContractVersion === 1 && Object.keys(record.leases).length === 0) kills++
