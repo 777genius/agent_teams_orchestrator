@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test'
+import { EventEmitter } from 'node:events'
+import { PassThrough } from 'node:stream'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -11,7 +13,7 @@ import {
 } from '../../bootstrap/state.js'
 import type { SDKMessage, SDKUserMessageReplay } from '../../entrypoints/agentSdkTypes.js'
 import { EMPTY_USAGE } from '../api/emptyUsage.js'
-import { buildCodexNativeExecArgs } from './execRunner.js'
+import { buildCodexNativeExecArgs, runCodexNativeExec } from './execRunner.js'
 import { executeCodexNativeTurn } from './turnExecutor.js'
 
 function baseParams(overrides: Partial<Parameters<typeof executeCodexNativeTurn>[0]> = {}) {
@@ -47,6 +49,73 @@ afterEach(() => {
 })
 
 describe('Codex Native strict MCP launch safe e2e', () => {
+  test('required Agent Teams handshake failure surfaces an execution error before model work', async () => {
+    setFlagMcpConfig([
+      JSON.stringify({
+        mcpServers: {
+          'agent-teams': { command: '/TEST/missing-agent-teams', args: [] },
+        },
+      }),
+    ])
+    setStrictMcpConfig(true)
+    const failure =
+      'required MCP servers failed to initialize: agent-teams: handshake timed out'
+    const messages: SDKMessage[] = []
+    let nativeCalls = 0
+    let modelWorkStarted = false
+    const iterator = executeCodexNativeTurn(baseParams(), {
+      runExec: (options) =>
+        runCodexNativeExec(options, {
+          which: () => '/TEST/codex',
+          resolveVersion: () => 'codex-cli TEST',
+          spawnProcess: (_binary, args) => {
+            nativeCalls++
+            const child = Object.assign(new EventEmitter(), {
+              stdin: new PassThrough(),
+              stdout: new PassThrough(),
+              stderr: new PassThrough(),
+              killed: false,
+              kill: () => true,
+            })
+            setTimeout(() => {
+              if (args.includes('mcp_servers.agent-teams.required=true')) {
+                child.stderr.end(failure + '\n')
+                child.stdout.end()
+                child.emit('close', 1, null)
+              } else {
+                modelWorkStarted = true
+                child.stdout.end(
+                  JSON.stringify({
+                    type: 'turn.completed',
+                    usage: {
+                      input_tokens: 0,
+                      cached_input_tokens: 0,
+                      output_tokens: 0,
+                    },
+                  }) + '\n',
+                )
+                child.stderr.end()
+                child.emit('close', 0, null)
+              }
+            }, 0)
+            return child as never
+          },
+        }),
+    })
+    for await (const message of iterator) messages.push(message)
+    expect(nativeCalls).toBe(1)
+    expect(modelWorkStarted).toBe(false)
+    expect(
+      messages.some((message) => message.type === 'result' && message.subtype === 'error_during_execution' && message.is_error),
+    ).toBe(true)
+    expect(
+      messages.some(
+        (message) => message.type === 'result' && message.subtype === 'success',
+      ),
+    ).toBe(false)
+    expect(JSON.stringify(messages)).toContain(failure)
+  })
+
   test('strict MCP launch reads app-generated Agent Teams MCP only config files', async () => {
     const previousSettings = getFlagSettingsInline()
     const tempDirectory = await mkdtemp(join(tmpdir(), 'codex-apponly-mcp-'))
