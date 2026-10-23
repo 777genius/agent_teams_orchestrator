@@ -156,6 +156,23 @@ type PersistentHostProcessIdentity = {
   startedAtMs: number | null
 }
 
+/** The registered host process is provably absent, not merely unreadable.
+ * Stop-path callers may treat this as physical closure evidence; every other
+ * identity failure stays fail-closed. */
+export class OpenCodeHostProcessGoneError extends Error {
+  readonly code = 'host_process_gone'
+  constructor(readonly pid: number | null = null) {
+    super('OpenCode existing host process is gone')
+    this.name = 'OpenCodeHostProcessGoneError'
+  }
+}
+
+export function isOpenCodeHostProcessGoneError(
+  error: unknown,
+): error is OpenCodeHostProcessGoneError {
+  return error instanceof OpenCodeHostProcessGoneError
+}
+
 export type OpenCodePersistentHostReconcileOptions = {
   startupBudget?: OpenCodeStartupCleanupBudget
   mode?: 'stale' | 'force'
@@ -732,11 +749,27 @@ export class OpenCodeHostManager {
       return { state: 'gone', startedAtMs: null }
     }
 
-    const startedAtMs = await this.readProcessStartTimeMs(record.pid, budget).catch(() => null)
-    if (!Number.isFinite(startedAtMs) || startedAtMs === null) {
+    // A single failed OS read is not proof of an unverifiable process. Retry
+    // briefly while the pid stays alive so a transient read failure cannot
+    // reject an otherwise exact existing authority.
+    let startedAtMs: number | null = null
+    for (
+      let attempt = 0;
+      attempt < OPEN_CODE_HOST_PROCESS_IDENTITY_CAPTURE_ATTEMPTS;
+      attempt += 1
+    ) {
+      startedAtMs = await this.readProcessStartTimeMs(record.pid, budget).catch(() => null)
+      if (Number.isFinite(startedAtMs) && startedAtMs !== null) {
+        break
+      }
       if (!this.isProcessAlive(record.pid)) {
         return { state: 'gone', startedAtMs: null }
       }
+      if (attempt + 1 < OPEN_CODE_HOST_PROCESS_IDENTITY_CAPTURE_ATTEMPTS) {
+        await this.sleepMs(OPEN_CODE_HOST_PROCESS_IDENTITY_CAPTURE_RETRY_MS)
+      }
+    }
+    if (!Number.isFinite(startedAtMs) || startedAtMs === null) {
       // Unit tests commonly inject synthetic process control without creating a
       // real OS process. Production cleanup remains fail-closed when identity
       // cannot be read.
@@ -1848,11 +1881,17 @@ export class OpenCodeHostManager {
         throw new Error('OpenCode existing host authority is unavailable or changed')
       }
       const before = await raceOpenCodeAbortSignal(this.inspectPersistentHostProcessIdentity(record), abortSignal)
+      if (before.state === 'gone') {
+        throw new OpenCodeHostProcessGoneError(record.pid)
+      }
       if (before.state !== 'confirmed' || before.startedAtMs !== record.processStartedAtMs) {
         throw new Error('OpenCode existing host process identity is unavailable or changed')
       }
       const health = await raceOpenCodeAbortSignal(this.checkHealthyHostOnce(record.baseUrl), abortSignal)
       const after = await raceOpenCodeAbortSignal(this.inspectPersistentHostProcessIdentity(record), abortSignal)
+      if (after.state === 'gone') {
+        throw new OpenCodeHostProcessGoneError(record.pid)
+      }
       if (!health || after.state !== 'confirmed' || after.startedAtMs !== record.processStartedAtMs) {
         throw new Error('OpenCode existing host is unhealthy or its process identity changed')
       }
