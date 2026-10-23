@@ -104,7 +104,7 @@ export class OpenCodeV2TeamBridge {
     throw new Error('run_readiness_unknown')
   }
   async call(request: RunControlRequest, timeoutMs: number): Promise<RunControlResult> {
-    executionAssert(Number.isFinite(timeoutMs) && timeoutMs > 0 && timeoutMs <= 30_000, 'invalid_operation_deadline')
+    executionAssert(Number.isFinite(timeoutMs) && timeoutMs > 0 && timeoutMs <= 45_000, 'invalid_operation_deadline')
     const deadline = Date.now() + timeoutMs
     const record = await this.discover()
     executionAssert(record && record.binding.teamId === this.binding.teamId &&

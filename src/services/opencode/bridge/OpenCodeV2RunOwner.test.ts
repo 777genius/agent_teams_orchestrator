@@ -511,7 +511,7 @@ test('Windows original lease arriving after the public stop snapshot is still cl
   } finally { gate.release(); await f.close() }
 })
 
-test('Windows Stop shares its original 29s envelope with a 27s physical slice while POSIX keeps adapter defaults', async () => {
+test('Windows Stop shares its original 40s envelope with a 27s physical slice while POSIX keeps adapter defaults', async () => {
   for (const windowsAcquisitions of [true, false]) {
     const closes: (number | undefined)[] = []
     const f = await fixture({ windowsAcquisitions, leaseClose: deadline => { closes.push(deadline) } })
@@ -529,12 +529,12 @@ test('Windows Stop shares its original 29s envelope with a 27s physical slice wh
   }
 })
 
-test('Windows Stop clips physical work and finalization to the same original 29s deadline', async () => {
+test('Windows Stop clips physical work and finalization to the same original 40s deadline', async () => {
   for (const mode of ['within', 'expired_close', 'persist_failed', 'persist_late', 'archive_late'] as const) {
     let now = Date.now(), start = now, observed: number | undefined
     const writes: string[] = []
     const f = await fixture({ windowsAcquisitions: true, leaseClose: deadline => { observed = deadline },
-      nativeRetirement: async () => { await Promise.resolve(); now = start + (mode === 'expired_close' ? 27_000 : 25_000) } })
+      nativeRetirement: async () => { await Promise.resolve(); now = start + (mode === 'expired_close' ? 30_000 : 25_000) } })
     let clock: ReturnType<typeof spyOn> | undefined, write: ReturnType<typeof spyOn> | undefined
     let trusted: ReturnType<typeof spyOn> | undefined, bounded: ReturnType<typeof spyOn> | undefined
     try {
@@ -556,11 +556,11 @@ test('Windows Stop clips physical work and finalization to the same original 29s
         }
         if (name === 'stop.json') writes.push('stop')
         await originalWrite(directory, name, value)
-        if (f.counters.closed && (mode === 'persist_late' && name === 'state.json' || mode === 'archive_late' && name === 'stop.json')) now = start + 29_000
+        if (f.counters.closed && (mode === 'persist_late' && name === 'state.json' || mode === 'archive_late' && name === 'stop.json')) now = start + 40_000
         else if (f.counters.closed) now += 500
       })
       const stopped = await f.owner.stop()
-      expect(observed).toBe(start + 27_000) // Three pre-close seconds consume this slice, never add to it.
+      expect(observed).toBe(start + 30_000) // The full 27s close window opens after these three pre-close seconds.
       expect(f.counters.closed).toBe(1)
       expect(writes).toEqual(['state', 'stop']) // Shared finalization reserve, no second public persistence window.
       expect(stopped.state).toBe(mode === 'within' ? 'stopped' : 'cleanup_unknown')
