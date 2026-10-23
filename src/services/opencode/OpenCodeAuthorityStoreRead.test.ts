@@ -1,10 +1,11 @@
 import { readFileSync } from 'node:fs'
+import * as fs from 'node:fs/promises'
 import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { spawnSync } from 'node:child_process'
 import os from 'node:os'
 import path from 'node:path'
-import { describe, expect, test } from 'bun:test'
-import { readOpenCodeAuthority, isKnownHostRegistry, isKnownSessionStore } from './OpenCodeAuthorityStoreRead.js'
+import { describe, expect, spyOn, test } from 'bun:test'
+import { readOpenCodeAuthority, isKnownHostRegistry, isKnownSessionStore, type SessionStoreShape } from './OpenCodeAuthorityStoreRead.js'
 import { OpenCodeHostManager } from './OpenCodeHostManager.js'
 import { OpenCodeSessionStore } from './OpenCodeSessionStore.js'
 import { normalizeOpenCodeSessionStatus } from './OpenCodeEventTranslator.js'
@@ -18,6 +19,95 @@ const nonrootAvailable = process.platform !== 'win32' && typeof process.getuid =
   })))
 
 describe('O1a typed authority read', () => {
+  for (const replacements of [1, 2, 3]) test(`fresh admission after ${replacements} atomic session-store replacements is bounded`, async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'TEST-authority-read-race-'))
+    const file = path.join(root, 'sessions.json')
+    const originalOpen = fs.open
+    const closed: number[] = []
+    let opens = 0, swaps = 0, validated = 0
+    const bytes = (generation: number) => JSON.stringify({ schemaVersion: 1, records: {}, generationPin: generation })
+    await writeFile(file, bytes(0))
+    // The public store uses an atomic rename. Schedule that exact filesystem
+    // transition after the reader's lstat, before its no-follow open.
+    const open = spyOn(fs, 'open').mockImplementation(async (...args) => {
+      if (args[0] === file && swaps < replacements) {
+        const replacement = path.join(root, `next-${++swaps}.json`)
+        await writeFile(replacement, bytes(swaps))
+        await fs.rename(replacement, file)
+      }
+      const handle = await originalOpen(...args)
+      const index = ++opens, close = handle.close.bind(handle)
+      handle.close = async () => { closed.push(index); await close() }
+      return handle
+    })
+    try {
+      const result = await readOpenCodeAuthority(file, (value): value is SessionStoreShape => {
+        validated++
+        return isKnownSessionStore(value)
+      })
+      expect(result).toEqual(replacements < 3
+        ? { kind: 'known', value: JSON.parse(bytes(replacements)), bytes: bytes(replacements) }
+        : { kind: 'preserved_unknown', reason: 'nonregular' })
+      expect(opens).toBe(Math.min(replacements + 1, 3))
+      expect(closed).toEqual(Array.from({ length: opens }, (_, index) => index + 1))
+      expect(validated).toBe(replacements < 3 ? 1 : 0)
+      expect(await readFile(file, 'utf8')).toBe(bytes(replacements))
+    } finally { open.mockRestore(); await rm(root, { recursive: true, force: true }) }
+  })
+
+  for (const replacementKind of ['symlink', 'directory', 'invalid'] as const) test(`atomic replacement never relaxes ${replacementKind} authority`, async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'TEST-authority-read-veto-'))
+    const file = path.join(root, 'sessions.json'), replacement = path.join(root, 'replacement')
+    const peer = path.join(root, 'peer.json'), peerBytes = '{"schemaVersion":1,"records":{}}'
+    await writeFile(file, peerBytes)
+    await writeFile(peer, peerBytes)
+    if (replacementKind === 'symlink') await fs.symlink(peer, replacement)
+    else if (replacementKind === 'directory') await fs.mkdir(replacement)
+    else await writeFile(replacement, '{"schemaVersion":42}')
+    const originalOpen = fs.open
+    let swapped = false, opens = 0
+    const open = spyOn(fs, 'open').mockImplementation(async (...args) => {
+      if (args[0] === file && !swapped) {
+        swapped = true
+        await fs.unlink(file)
+        await fs.rename(replacement, file)
+      }
+      opens++
+      return originalOpen(...args)
+    })
+    try {
+      expect(await readOpenCodeAuthority(file, isKnownSessionStore)).toEqual({
+        kind: 'preserved_unknown',
+        reason: replacementKind === 'symlink' ? 'unreadable' : replacementKind === 'directory' ? 'nonregular' : 'invalid',
+      })
+      expect(opens).toBe(replacementKind === 'invalid' ? 2 : 1)
+      expect(await readFile(peer, 'utf8')).toBe(peerBytes)
+    } finally { open.mockRestore(); await rm(root, { recursive: true, force: true }) }
+  })
+
+  test('a store disappearing after a raced regular admission never becomes empty authority', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'TEST-authority-read-missing-'))
+    const file = path.join(root, 'sessions.json')
+    const originalOpen = fs.open
+    let opens = 0
+    await writeFile(file, '{"schemaVersion":1,"records":{}}')
+    const open = spyOn(fs, 'open').mockImplementation(async (...args) => {
+      if (args[0] === file && ++opens === 1) {
+        const next = path.join(root, 'next.json')
+        await writeFile(next, '{"schemaVersion":1,"records":{}}')
+        await fs.rename(next, file)
+      }
+      const handle = await originalOpen(...args)
+      const close = handle.close.bind(handle)
+      handle.close = async () => { await close(); await fs.unlink(file) }
+      return handle
+    })
+    try {
+      expect(await readOpenCodeAuthority(file, isKnownSessionStore)).toEqual({ kind: 'preserved_unknown', reason: 'unreadable' })
+      expect(opens).toBe(1)
+    } finally { open.mockRestore(); await rm(root, { recursive: true, force: true }) }
+  })
+
   test('missing alone initializes; invalid stores remain typed unknown with safe diagnostics', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'TEST-O1a-read-'))
     try {

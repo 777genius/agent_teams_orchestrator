@@ -43,31 +43,38 @@ function envelope(v: unknown): v is Record<string, unknown> {
     && (!Object.hasOwn(v, 'generation') || v.generation === 'v1')
 }
 
-/** Only lstat ENOENT means missing. Do not follow links or open devices/FIFOs. */
+/** Only initial lstat ENOENT means missing. Do not follow links or open devices/FIFOs. */
 export async function readOpenCodeAuthority<T>(
   file: string, validate: (value: unknown) => value is T,
 ): Promise<OpenCodeAuthorityRead<T>> {
-  let metadata
-  try { metadata = await lstat(file) } catch (error) {
-    return error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT'
-      ? { kind: 'missing' } : { kind: 'preserved_unknown', reason: 'unreadable' }
-  }
-  if (!metadata.isFile() || metadata.isSymbolicLink()) return { kind: 'preserved_unknown', reason: 'nonregular' }
-  let handle: Awaited<ReturnType<typeof open>> | undefined
-  try {
-    handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
-    const current = await handle.stat()
-    if (!current.isFile() || current.ino !== metadata.ino || current.dev !== metadata.dev) {
-      return { kind: 'preserved_unknown', reason: 'nonregular' }
+  // Atomic writers replace regular files by rename. A raced inode is never
+  // admitted: close it and restart the complete no-follow check, at most twice.
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    let metadata
+    try { metadata = await lstat(file) } catch (error) {
+      return attempt === 0 && error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT'
+        ? { kind: 'missing' } : { kind: 'preserved_unknown', reason: 'unreadable' }
     }
-    const bytes = await handle.readFile('utf8')
-    let value: unknown
-    try { value = JSON.parse(bytes) } catch { return { kind: 'preserved_unknown', reason: 'invalid' } }
+    if (!metadata.isFile() || metadata.isSymbolicLink()) return { kind: 'preserved_unknown', reason: 'nonregular' }
+    let handle: Awaited<ReturnType<typeof open>> | undefined
     try {
-      return validate(value) ? { kind: 'known', value, bytes } : { kind: 'preserved_unknown', reason: 'invalid' }
-    } catch { return { kind: 'preserved_unknown', reason: 'invalid' } }
-  } catch { return { kind: 'preserved_unknown', reason: 'unreadable' } }
-  finally { await handle?.close() }
+      handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+      const current = await handle.stat()
+      if (!current.isFile()) return { kind: 'preserved_unknown', reason: 'nonregular' }
+      if (current.ino !== metadata.ino || current.dev !== metadata.dev) {
+        if (attempt < 2) continue
+        return { kind: 'preserved_unknown', reason: 'nonregular' }
+      }
+      const bytes = await handle.readFile('utf8')
+      let value: unknown
+      try { value = JSON.parse(bytes) } catch { return { kind: 'preserved_unknown', reason: 'invalid' } }
+      try {
+        return validate(value) ? { kind: 'known', value, bytes } : { kind: 'preserved_unknown', reason: 'invalid' }
+      } catch { return { kind: 'preserved_unknown', reason: 'invalid' } }
+    } catch { return { kind: 'preserved_unknown', reason: 'unreadable' } }
+    finally { await handle?.close() }
+  }
+  return { kind: 'preserved_unknown', reason: 'nonregular' }
 }
 
 export function requireOpenCodeAuthority<T>(read: OpenCodeAuthorityRead<T>, store: 'host' | 'session', empty: () => T): T {
