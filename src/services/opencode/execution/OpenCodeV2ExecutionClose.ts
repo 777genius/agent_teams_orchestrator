@@ -12,20 +12,21 @@ export type ExecutionCloseSequenceInput = Readonly<{
   acknowledge: () => Promise<void>
 }>
 
-/** A startup join that rejects or times out still closes an unused scope with
- * its ACK; only a fully completed finalize earns one. Returns whether the
- * closed acknowledgment was delivered. */
+/** The closed ACK certifies an authenticated identity and a disarmed wrapper
+ * facade (see the child-control send), so neither a startup join nor a finalize
+ * drain may delay or withhold it: the server/relay close is process self-cleanup
+ * the OS reclaims at exit, exactly like the native realpath drain. Both run
+ * best-effort within the shared bound; only an uncertain acknowledge (identity or
+ * an uncertain disarm) withholds the ACK. Returns whether it was delivered. */
 export async function runOpenCodeV2ExecutionCloseSequence(sequence: ExecutionCloseSequenceInput,
   deadline: number = Date.now() + openCodeV2ExecutionCloseMs): Promise<boolean> {
-  let complete = true
   const remaining = () => Math.max(1, deadline - Date.now())
   const phase = () => Math.max(1, remaining() - openCodeV2ExecutionCloseAckReserveMs)
   try {
     if (sequence.startup) await boundOpenCodeRead(Promise.resolve(sequence.startup).catch(() => undefined), phase())
-  } catch { complete = false }
+  } catch { /* Best-effort join; an unused scope still ships its ACK. */ }
   try {
     if (sequence.finalize) await boundOpenCodeRead(sequence.finalize(), phase())
-  } catch { complete = false }
-  if (!complete) return false
+  } catch { /* Best-effort drain; the OS reclaims the server at exit. */ }
   try { await boundOpenCodeRead(sequence.acknowledge(), Math.min(remaining(), openCodeV2ExecutionCloseAckReserveMs)); return true } catch { return false }
 }
