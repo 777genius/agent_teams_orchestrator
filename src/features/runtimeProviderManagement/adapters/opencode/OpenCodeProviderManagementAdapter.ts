@@ -4038,7 +4038,7 @@ export class OpenCodeProviderManagementAdapter
         profileOptions: {
           includeAppMcp: false,
         },
-        hostLifetime: 'persistent',
+        hostLifetime: 'process',
         resolveConfigFingerprint: false,
         healthTimeoutMs: OPEN_CODE_PROVIDER_MANAGEMENT_HOST_HEALTH_TIMEOUT_MS,
         abortSignal: deadline.signal,
@@ -4086,7 +4086,7 @@ export class OpenCodeProviderManagementAdapter
         const leaveRelease = progress.enterStep('release settings host lease')
         await this.releaseProviderManagementHost(hostManager, host, hostLease)
         await hostManager
-          .releaseHost(host.hostKey, { keepPersistentAlive: true })
+          .releaseHost(host.hostKey, { keepPersistentAlive: false })
           .catch(() => undefined)
         leaveRelease()
       }
