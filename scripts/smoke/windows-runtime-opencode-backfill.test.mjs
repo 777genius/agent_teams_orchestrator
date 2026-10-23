@@ -751,7 +751,16 @@ function productionIdentityProbe(evidence, flush, bun, env, root, pid, attempt) 
 function nativeOwnershipProbe(evidence, flush, env, root, pid) {
   assert.ok(Number.isSafeInteger(pid) && pid > 0 && pid <= 0x7fffffff, 'Fixture PID required');
   const literal = value => "'" + value.replaceAll("'", "''") + "'";
-  const prefix = buildWindowsTeardownCommand(root, [pid]).split('$stopped = @()')[0];
+  // The real teardown still records every child projection. This observation
+  // needs no diagnostic JSON and must not import Utility just to encode cases.
+  let prefix = buildWindowsTeardownCommand(root).split('$stopped = @()')[0];
+  const utilityImport = [
+    "[Console]::Error.WriteLine('teardown: before import Microsoft.PowerShell.Utility')",
+    'Import-Module Microsoft.PowerShell.Utility -ErrorAction Stop',
+    "[Console]::Error.WriteLine('teardown: after import Microsoft.PowerShell.Utility')",
+  ].join('\n');
+  assert.equal(prefix.split(utilityImport).length, 2, 'Exactly one emitted Utility import block required');
+  prefix = prefix.replace(utilityImport, '# Observation-only ownership checks need no Utility module.');
   assert.doesNotMatch(prefix, /\.Kill\(/);
   const script = path.join(root, 'fake-opencode.cjs');
   const longScript = realpathSync.native(script);
@@ -770,16 +779,22 @@ function nativeOwnershipProbe(evidence, flush, env, root, pid) {
     [false, { ...entry(`node.exe ${quoted(script)}`), ExecutablePath: null }],
     [false, { ...entry(`node.exe ${quoted(script)}`), ExecutablePath: path.join(root + '-sibling', 'node.exe') }],
   ];
+  const contractCases = cases.map(([expected, value], index) => `
+$case = [pscustomobject]@{ ExecutablePath = ${value.ExecutablePath === null ? '$null' : literal(value.ExecutablePath)}; CommandLine = ${literal(value.CommandLine)} }
+if ([bool](Is-Owned $case) -ne ${expected ? '$true' : '$false'}) { throw 'Exact argv ownership regression case ${index}' }
+$checkedCases += 1
+`).join('\n');
+  const resultPrefix = JSON.stringify({ inputScript: script, longScript }).slice(0, -1) + ',"cases":';
   const command = prefix + `
+function ConvertTo-Json { throw 'Ownership probe must not load Utility JSON commands' }
+function ConvertFrom-Json { throw 'Ownership probe must not load Utility JSON commands' }
 $expectedScript = ${literal(longScript)}
 if ((Get-OwnershipPath ${literal(script)}) -ine $expectedScript) { throw 'Short/long fixture paths disagree' }
-$cases = ConvertFrom-Json ${literal(JSON.stringify(cases))}
-foreach ($case in $cases) {
-  if ([bool](Is-Owned $case[1]) -ne $case[0]) { throw 'Exact argv ownership regression' }
-}
+$checkedCases = 0
+${contractCases}
 $rows = @(Read-ProcessEntries ' WHERE ProcessId = ${pid}')
 if ($rows.Count -ne 1 -or $rows[0].ProcessId -ne ${pid} -or -not $rows[0].CreationDate -or -not (Is-Owned $rows[0])) { throw 'Actual fixture WMI projection/ownership failed' }
-ConvertTo-Json -InputObject @{ cases = $cases.Count; startedAt = $rows[0].CreationDate.ToUniversalTime().ToString('o'); inputScript = ${literal(script)}; longScript = $expectedScript } -Compress
+[Console]::Out.WriteLine(${literal(resultPrefix)} + $checkedCases + ',"startedAt":"' + $rows[0].CreationDate.ToUniversalTime().ToString('o') + '"}')
 `;
   const probe = recordWindowsProbe(evidence, flush, 'fixture-ownership-contract', 'powershell.exe',
     ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', command],
