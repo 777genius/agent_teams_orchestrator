@@ -11,6 +11,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <sddl.h>
 #include <string>
 #include <system_error>
@@ -4127,15 +4128,41 @@ static void grantRoot(Scope &scope, Handle heldRoot, DWORD mask, ACCESS_MODE mod
     require(mode != DENY_ACCESS || after.memberAllowed == before.memberAllowed, "execution_containment_filesystem_denied");
   }
 }
+// Cohort members retire identical shared roots concurrently. One common walk
+// order queues every member on the same per-root ACL mutex, and the last member
+// can then exhaust its retirement budget waiting at the final root. A stable
+// per-member rotation keeps simultaneous walks on different roots; each root's
+// custody still runs alone under its own mutex.
+static size_t rootRetirementRotation(const Scope &scope, size_t rootCount) {
+  if (rootCount < 2) return 0;
+  const std::wstring &seed = scope.cohort ? scope.cohort->selectionId : scope.launchNonce;
+  uint64_t hash = 14695981039346656037ULL;
+  for (wchar_t unit : seed) {
+    hash ^= static_cast<uint64_t>(unit);
+    hash *= 1099511628211ULL;
+  }
+  size_t ordinal = 0;
+  if (scope.cohort) {
+    size_t index = 0;
+    for (const auto &member : scope.cohort->members) {
+      if (member.launchNonce == scope.launchNonce) { ordinal = index; break; }
+      ++index;
+    }
+  }
+  return static_cast<size_t>((hash + ordinal) % rootCount);
+}
 static void removeGrants(Scope &scope, RetirementAclBudget *retirementBudget) {
   scope.retirementProgress("retire_grants_dll");
   if (scope.realpathDll && scope.realpathDll->granted && scope.physicalCleanupProof)
     scope.realpathDll->changeAce(REVOKE_ACCESS, retirementBudget);
   scope.retirementProgress("retire_grants_roots");
-  std::vector<RetainedAnchorComponent> retained;
   const size_t rootCount = scope.aclRoots.size();
+  const size_t rotation = rootRetirementRotation(scope, rootCount);
+  std::vector<std::optional<RetainedAnchorComponent>> retained(rootCount);
   size_t rootIndex = 0;
-  for (auto it = scope.aclRoots.rbegin(); it != scope.aclRoots.rend(); ++it) {
+  for (size_t step = 0; step < rootCount; ++step) {
+    const size_t originalIndex = rootCount - 1 - (step + rotation) % rootCount;
+    auto it = scope.aclRoots.begin() + static_cast<ptrdiff_t>(originalIndex);
     ++rootIndex;
     const auto rootStarted = GetTickCount64();
     const auto progress = [&](const char *phase) {
@@ -4150,7 +4177,7 @@ static void removeGrants(Scope &scope, RetirementAclBudget *retirementBudget) {
         it->cohortPolicy && privateCohortRoot(scope, *it);
     const bool shared = it->sharedRoot || privateGrant;
     if (shared && !scope.physicalCleanupProof) {
-      retained.insert(retained.begin(), std::move(*it));
+      retained[originalIndex].emplace(std::move(*it));
       continue;
     }
     // Identity and liveness are AV-hot path reopens and image reads; measuring
@@ -4209,7 +4236,10 @@ static void removeGrants(Scope &scope, RetirementAclBudget *retirementBudget) {
             "cleanup_unknown");
     progress("root_complete");
   }
-  scope.aclRoots = std::move(retained);
+  std::vector<RetainedAnchorComponent> kept;
+  kept.reserve(rootCount);
+  for (auto &entry : retained) if (entry) kept.push_back(std::move(*entry));
+  scope.aclRoots = std::move(kept);
   if (scope.physicalCleanupProof || scope.metadataNoChildCleanupProof) {
     scope.retirementProgress("retire_grants_metadata");
     assertAncestorMetadataPinsLive(scope);
