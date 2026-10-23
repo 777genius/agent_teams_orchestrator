@@ -5,7 +5,7 @@ import { copyFile, lstat, mkdir, readdir, readFile, rename, symlink, writeFile }
 import path from 'node:path'
 import { createWindowsNativeBroker, resolveWindowsNativeArtifact } from '../../src/services/opencode/host/windows/OpenCodeV2WindowsNativeBroker.js'
 import { createWindowsOwnerFilesystem, type WindowsOwnerDirectory } from '../../src/services/opencode/host/windows/OpenCodeV2WindowsOwnerFilesystem.js'
-import { executionHash, executionRecord } from '../../src/services/opencode/execution/OpenCodeV2ExecutionContracts.js'
+import { executionHash, executionRecord, OPEN_CODE_V2_WINDOWS_CLOSE_MS } from '../../src/services/opencode/execution/OpenCodeV2ExecutionContracts.js'
 import { prepareWindowsPrivateDirectories } from '../../src/services/opencode/profile/OpenCodePrivateDirectories.js'
 import { runControlDirectory } from '../../src/services/opencode/bridge/OpenCodeV2RunControl.js'
 import { executionNativeRootPhases, readExecutionNativeRootObservation, type ExecutionNativeRootObservation } from '../../src/services/opencode/execution/OpenCodeV2Diagnostics.js'
@@ -1625,7 +1625,7 @@ $daclBytes=[byte[]]::new($raw.DiscretionaryAcl.BinaryLength);$raw.DiscretionaryA
       }
       // Invalid optional budgets must refuse before mutating the live Scope.
       const budgetPeer = peers[0]!
-      await assert.rejects(budgetPeer.broker.request('retire', { deadline: Date.now() + 27_000, timeoutMs: 27_001 }), /cleanup_unknown/)
+      await assert.rejects(budgetPeer.broker.request('retire', { deadline: Date.now() + OPEN_CODE_V2_WINDOWS_CLOSE_MS, timeoutMs: OPEN_CODE_V2_WINDOWS_CLOSE_MS + 1 }), /cleanup_unknown/)
       assert.deepEqual(await budgetPeer.broker.request('assertLive'), budgetPeer.mapping)
       facts.retirementBudgetMalformedRefused = true
       for (const peer of peers) assert.deepEqual(await peer.broker.request('assertLive'), peer.mapping)
@@ -1646,9 +1646,9 @@ $daclBytes=[byte[]]::new($raw.DiscretionaryAcl.BinaryLength);$raw.DiscretionaryA
       try {
         if (peer.mapping) {
           facts.projectCohortCleanupStage = 'member_retirement'
-          const retirementDeadline = Date.now() + 27_000
+          const retirementDeadline = Date.now() + OPEN_CODE_V2_WINDOWS_CLOSE_MS
           const receipt = executionRecord(await peer.broker.request('retire',
-            { deadline: retirementDeadline, timeoutMs: 27_000 }, retirementDeadline))
+            { deadline: retirementDeadline, timeoutMs: OPEN_CODE_V2_WINDOWS_CLOSE_MS }, retirementDeadline))
           assert.ok(Date.now() < retirementDeadline)
           assert.equal(receipt.empty, true); assert.equal(receipt.activeProcesses, 0)
           assert.equal(receipt.heldProcessExited, true); assert.equal(receipt.ownAcesRemoved, true)
@@ -1796,8 +1796,8 @@ $hash.AppendData([BitConverter]::GetBytes([int]$dacl.Length));$hash.AppendData($
       await waitProjectPeer(() => contender.connected)
     }
     const results = await Promise.allSettled(contenders.map(async contender => {
-      const deadline = Date.now() + 27_000
-      contender.retirement = contender.broker.request('retire', { deadline, timeoutMs: 27_000 }, deadline)
+      const deadline = Date.now() + OPEN_CODE_V2_WINDOWS_CLOSE_MS
+      contender.retirement = contender.broker.request('retire', { deadline, timeoutMs: OPEN_CODE_V2_WINDOWS_CLOSE_MS }, deadline)
       const receipt = executionRecord(await contender.retirement)
       assert.equal(receipt.empty, true); assert.equal(receipt.heldProcessExited, true)
       assert.equal(receipt.activeProcesses, 0); assert.equal(receipt.ownAcesRemoved, true)
