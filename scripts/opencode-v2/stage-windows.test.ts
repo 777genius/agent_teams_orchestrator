@@ -1132,6 +1132,88 @@ test('windows closed ACK ships before any native realpath drain', async () => {
   expect(refused.events).toEqual(['disarm'])
 })
 
+test('windows control read keeps the closed ACK that completes behind the MAIN exit signal', async () => {
+  const { runInNewContext } = await import('node:vm')
+  const scope = (await readFile(path.resolve(import.meta.dir, '../../src/services/opencode/host/windows/WindowsKernelScope.cpp'), 'utf8')).replaceAll('\r\n', '\n')
+  const begin = scope.indexOf('bool completeIo(OVERLAPPED &overlap, DWORD &transferred, DWORD timeout,')
+  expect(begin).toBeGreaterThanOrEqual(0)
+  const open = scope.indexOf('{', begin)
+  let depth = 0, end = -1
+  for (let index = open; index < scope.length; index++) {
+    if (scope[index] === '{') depth++
+    else if (scope[index] === '}') { depth--; if (depth === 0) { end = index; break } }
+  }
+  expect(end).toBeGreaterThan(open)
+  const body = scope.slice(open + 1, end)
+    .replaceAll('HANDLE events[] = {overlap.hEvent, cancel.value, process.value};', 'const events = [overlap.hEvent, cancel.value, process.value];')
+    .replaceAll('HANDLE grace[] = {overlap.hEvent, cancel.value};', 'const grace = [overlap.hEvent, cancel.value];')
+    .replaceAll('DWORD waited =', 'let waited =')
+    .replaceAll('DWORD completed = 0;', 'let completed = 0;')
+    .replaceAll('&overlap', 'overlap')
+    .replaceAll('&transferred', 'value => { transferred = value }')
+    .replaceAll('&completed', 'value => { completed = value }')
+  expect(body).not.toMatch(/\bHANDLE\b|\bDWORD\b|&\w/)
+  // The grace stays bounded and well inside the owner's 10s exit wait.
+  const grace = Number(/static constexpr DWORD CONTROL_EXIT_READ_GRACE_MS = (\d+);/.exec(scope)?.[1])
+  expect(grace).toBeGreaterThan(0)
+  expect(grace).toBeLessThan(10_000)
+  const INFINITE = 0xffffffff, WAIT_TIMEOUT = 258
+  const run = (input: { timeout: number; read: boolean; waits: ((io: (bytes: number) => void, signal: (name: string) => void) => void)[]; cancelRace?: number }) => {
+    const signaled = new Set<string>(), waits: [string[], number][] = []
+    let result: { ok: boolean; bytes: number } | undefined, cancels = 0
+    const io = (bytes: number) => { result ??= { ok: true, bytes }; signaled.add('io') }
+    const context = {
+      WAIT_OBJECT_0: 0, FALSE: 0, TRUE: 1, CONTROL_EXIT_READ_GRACE_MS: grace,
+      pipe: { value: 'pipe' }, cancel: { value: 'cancel' }, process: { value: 'exit' },
+      // Each wait first applies what happens while the thread is blocked, then
+      // reports the lowest signaled index exactly like WaitForMultipleObjects.
+      WaitForMultipleObjects: (count: number, handles: string[], _all: number, timeout: number) => {
+        waits.push([handles.slice(0, count), timeout])
+        input.waits[waits.length - 1]?.(io, name => signaled.add(name))
+        const index = handles.findIndex(handle => signaled.has(handle))
+        return index < 0 ? WAIT_TIMEOUT : index
+      },
+      // The cancellation race may lose to a completion that already happened.
+      CancelIoEx: () => { cancels++; if (input.cancelRace !== undefined) io(input.cancelRace); result ??= { ok: false, bytes: 0 } },
+      GetOverlappedResult: (_pipe: string, _overlap: unknown, out: (value: number) => void, wait: number) => {
+        if (!result) throw new Error(wait ? 'completion_never_requested' : 'incomplete_result_read')
+        out(result.bytes); return result.ok ? 1 : 0
+      },
+    }
+    const completeIo = runInNewContext(`(function (overlap, transferred, timeout, readMayOutliveExit = false) {
+      const ok = (() => {${body}\n})()
+      return [ok, transferred]
+    })`, context) as (overlap: unknown, transferred: number, timeout: number, read: boolean) => [boolean, number]
+    return { value: completeIo({ hEvent: 'io' }, 0, input.timeout, input.read), waits, cancels }
+  }
+  const all = ['io', 'cancel', 'exit'], held = ['io', 'cancel']
+
+  // The final frame completes while the exit signal already woke the read.
+  expect(run({ timeout: INFINITE, read: true, waits: [(_, signal) => signal('exit'), io => io(87)] }))
+    .toEqual({ value: [true, 87], waits: [[all, INFINITE], [held, grace]], cancels: 0 })
+  // A completion that beat the cancellation is delivered data, never discarded.
+  expect(run({ timeout: INFINITE, read: true, waits: [(_, signal) => signal('cancel')], cancelRace: 64 }))
+    .toEqual({ value: [true, 64], waits: [[all, INFINITE]], cancels: 1 })
+  // Simultaneous completion and exit: the lower IO index wins, no grace or cancel.
+  expect(run({ timeout: INFINITE, read: true, waits: [(io, signal) => { signal('exit'); io(12) }] }))
+    .toEqual({ value: [true, 12], waits: [[all, INFINITE]], cancels: 0 })
+  // A silent pipe after exit ends after the bounded grace; retire's cancel wakes it early.
+  expect(run({ timeout: INFINITE, read: true, waits: [(_, signal) => signal('exit')] }))
+    .toEqual({ value: [false, 0], waits: [[all, INFINITE], [held, grace]], cancels: 1 })
+  expect(run({ timeout: INFINITE, read: true, waits: [(_, signal) => signal('exit'), (_, signal) => signal('cancel')] }))
+    .toEqual({ value: [false, 0], waits: [[all, INFINITE], [held, grace]], cancels: 1 })
+  // Writes and connects take no grace, and a zero-byte race completion is not data.
+  expect(run({ timeout: 15000, read: false, waits: [(_, signal) => signal('exit')] }))
+    .toEqual({ value: [false, 0], waits: [[all, 15000]], cancels: 1 })
+  expect(run({ timeout: 15000, read: false, waits: [(_, signal) => signal('exit')], cancelRace: 0 }))
+    .toEqual({ value: [false, 0], waits: [[all, 15000]], cancels: 1 })
+  expect(scope).toContain('return completeIo(overlap, transferred, write ? 15000 : INFINITE, !write);')
+  expect(scope).toContain('require(completeIo(overlap, count, 15000), "execution_containment_pipe_denied");')
+  // A late non-closed frame is dropped without ending the loop that still holds the ACK.
+  expect(scope).toContain('if (exited() && text(packet, L"type") != L"closed")\n            continue;\n          event(L"message", packet);')
+  expect(scope).not.toContain('require(!exited() || text(packet, L"type") == L"closed"')
+})
+
 
 test('native grant removal measures identity outside the ACL mutex and keeps the DACL bracket inside', async () => {
   const source = (await readFile(path.resolve(import.meta.dir, '../../src/services/opencode/host/windows/WindowsKernelScope.cpp'), 'utf8')).replaceAll('\r\n', '\n')
