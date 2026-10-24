@@ -26,6 +26,33 @@ export function settleWindowsControlClose(socket: Pick<Socket, 'once' | 'writabl
     socket.once('finish', done); socket.once('close', done)
   })
 }
+/** The closed ACK is the one frame whose delivery must be proven end to end:
+ * a named-pipe write callback can resolve before the bytes reach the pipe and
+ * the process exits right after. The frame reships while unconfirmed and the
+ * send finishes only on the owner's authenticated closedAck reply. */
+export async function confirmWindowsClosedAck(control: Pick<WindowsChildControl, 'events' | 'send'>,
+  frame: Readonly<Record<string, unknown>>, deadline: number): Promise<void> {
+  const nonce = frame.nonce, leaseOwnerId = frame.leaseOwnerId
+  let confirmed!: () => void
+  const reply = new Promise<void>(resolve => { confirmed = resolve })
+  const onMessage = (value: unknown) => {
+    const row = value as Record<string, unknown> | null
+    if (row && typeof row === 'object' && !Array.isArray(row) && row.type === 'closedAck' && row.nonce === nonce && row.leaseOwnerId === leaseOwnerId) confirmed()
+  }
+  control.events.on('message', onMessage)
+  const attempt = Math.max(1, Math.floor((deadline - Date.now()) / 2))
+  try {
+    for (;;) {
+      await control.send(frame, deadline)
+      const landed = await Promise.race([reply.then(() => true), new Promise<boolean>(done => {
+        const timer = setTimeout(() => done(false), attempt)
+        reply.then(() => clearTimeout(timer))
+      })])
+      if (landed) return
+      if (Date.now() >= deadline) throw new Error('execution_timeout')
+    }
+  } finally { control.events.removeListener('message', onMessage) }
+}
 const CONTROL_PACKET_LIMIT = 16 * 1024 * 1024
 let owned: WindowsChildControl | undefined
 const authenticatedPrepares = new WeakMap<object, Record<string, unknown>>()

@@ -259,11 +259,13 @@ export function readExecutionNativeRootObservation(value: unknown, nonce?: strin
     return Object.freeze({ phase, role, index: Number(index), count: Number(count), elapsedMs: Number(elapsedMs) })
   } catch { return undefined }
 }
-// The MAIN exit class separates an ACK the child refused to send (exit_one)
-// from an ACK lost between the child write and the owner read (exit_zero), and
-// job_terminated covers every abnormal end. The closed-frame observation names
-// which side lost it: absent at the owner reader, or rejected by its identity
-// checks. No raw code or frame content ever leaves the runner.
+// The MAIN exit class separates an ACK the child could not confirm (exit_one:
+// withheld by an uncertain identity, or a delivery whose owner reply never
+// landed) from a confirmed one (exit_zero carries the owner's authenticated
+// reply), and job_terminated covers every abnormal end. The closed-frame
+// observation names which side lost it: absent at the owner reader, or
+// rejected by its identity checks. No raw code or frame content ever leaves
+// the runner.
 export const executionCleanupExitClasses = ['exit_zero', 'exit_one', 'job_terminated'] as const
 export type ExecutionCleanupExitClass = typeof executionCleanupExitClasses[number]
 export const executionCleanupClosedFrames = ['accepted', 'rejected', 'absent'] as const

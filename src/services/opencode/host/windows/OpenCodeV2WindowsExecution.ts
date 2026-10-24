@@ -565,7 +565,12 @@ export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, l
         return
       }
       if (record.type === 'closed') {
-        if (mapping && record.nonce === nonce && record.leaseOwnerId === leaseOwnerId && record.namespace === mapping.namespace.name && record.pid === mapping.bun.nativePID && equal(record.birth, mapping.bun.birth) && record.scopeClosed === true && record.realpathClosed === mapping.realpathDll.receiptId) closed = true
+        if (mapping && record.nonce === nonce && record.leaseOwnerId === leaseOwnerId && record.namespace === mapping.namespace.name && record.pid === mapping.bun.nativePID && equal(record.birth, mapping.bun.birth) && record.scopeClosed === true && record.realpathClosed === mapping.realpathDll.receiptId) {
+          closed = true
+          // The child reships the ACK until this authenticated reply lands;
+          // its arrival is the only proof the frame crossed every hop.
+          void broker.request('send', { value: { type: 'closedAck', nonce, leaseOwnerId } }).catch(() => undefined)
+        }
         else closedFrameRejected = true
       }
       child.emit('message', value)

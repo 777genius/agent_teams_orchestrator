@@ -1082,6 +1082,51 @@ test('windows close frame reaches the wrapper before the transport drain retires
 })
 
 
+test('the owner replies to the accepted closed ACK and never to a rejected one', async () => {
+  const { runInNewContext } = await import('node:vm')
+  const execution = (await readFile(path.resolve(import.meta.dir, '../../src/services/opencode/host/windows/OpenCodeV2WindowsExecution.ts'), 'utf8')).replaceAll('\r\n', '\n')
+  const begin = execution.indexOf("if (record.type === 'closed')")
+  expect(begin).toBeGreaterThanOrEqual(0)
+  const open = execution.indexOf('{', begin)
+  let depth = 0, end = -1
+  for (let index = open; index < execution.length; index++) {
+    if (execution[index] === '{') depth++
+    else if (execution[index] === '}') { depth--; if (depth === 0) { end = index; break } }
+  }
+  expect(end).toBeGreaterThan(open)
+  const body = execution.slice(begin, end + 1)
+  const dispatch = (record: Record<string, unknown>) => {
+    const sends: unknown[] = []
+    const context = {
+      record,
+      mapping: { namespace: { name: 'windows-job:01234567-89ab-cdef-0123-456789abcdef' },
+        bun: { nativePID: 4242, birth: { format: 'windows-filetime', value: '133000000000000000' } },
+        realpathDll: { receiptId: 'windows-dll:4242:2424:133000000000000000' } },
+      nonce: '01234567-89ab-cdef-0123-456789abcdef', leaseOwnerId: '89abcdef-0123-4567-89ab-cdef01234567',
+      equal: (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b),
+      broker: { request: (operation: string, input: Readonly<{ value: unknown }>) => {
+        expect(operation).toBe('send'); sends.push(input.value); return Promise.resolve(undefined)
+      } },
+      closed: false, closedFrameRejected: false,
+    }
+    runInNewContext(body, context)
+    return { sends, context }
+  }
+  const accepted = dispatch({ type: 'closed', nonce: '01234567-89ab-cdef-0123-456789abcdef', leaseOwnerId: '89abcdef-0123-4567-89ab-cdef01234567',
+    namespace: 'windows-job:01234567-89ab-cdef-0123-456789abcdef', pid: 4242,
+    birth: { format: 'windows-filetime', value: '133000000000000000' }, scopeClosed: true, realpathClosed: 'windows-dll:4242:2424:133000000000000000' })
+  // The reply is the child's only delivery proof and carries the identity the
+  // child's own parser requires before it may exit zero.
+  expect(accepted.context.closed).toBe(true)
+  expect(accepted.sends).toEqual([{ type: 'closedAck', nonce: '01234567-89ab-cdef-0123-456789abcdef', leaseOwnerId: '89abcdef-0123-4567-89ab-cdef01234567' }])
+  const rejected = dispatch({ type: 'closed', nonce: '01234567-89ab-cdef-0123-456789abcdef', leaseOwnerId: '89abcdef-0123-4567-89ab-cdef01234567',
+    namespace: 'windows-job:01234567-89ab-cdef-0123-456789abcdef', pid: 4242,
+    birth: { format: 'windows-filetime', value: '133000000000000000' }, scopeClosed: true, realpathClosed: 'windows-dll:ffffffff:2424:133000000000000000' })
+  expect(rejected.context.closedFrameRejected).toBe(true)
+  expect(rejected.sends).toEqual([])
+})
+
+
 test('windows closed ACK ships before any native realpath drain', async () => {
   const { runInNewContext } = await import('node:vm')
   const control = (await readFile(path.resolve(import.meta.dir, '../../src/services/opencode/host/windows/OpenCodeV2WindowsChildControl.ts'), 'utf8')).replaceAll('\r\n', '\n')

@@ -3,7 +3,7 @@ import { EventEmitter } from 'node:events'
 import { readFile } from 'node:fs/promises'
 import path from 'node:path'
 import { runInNewContext } from 'node:vm'
-import { settleWindowsControlClose, windowsRealpathInstallCauses } from './OpenCodeV2WindowsChildControl.js'
+import { confirmWindowsClosedAck, settleWindowsControlClose, windowsRealpathInstallCauses } from './OpenCodeV2WindowsChildControl.js'
 
 // Execute the actual private child bodies: the native DLL refuses a second
 // held anchor for one physical object, and a prepare-time refusal must leave
@@ -183,4 +183,46 @@ test('a closed ACK settle resolves on flush completion and never hangs past its 
   const silent = double(false), bounded = Date.now()
   await settleWindowsControlClose(silent, bounded + 120)
   expect(Date.now() - bounded).toBeLessThan(1000)
+})
+
+// The closed ACK is the one frame whose delivery must be proven end to end:
+// a write callback can resolve before the bytes reach the pipe, so the frame
+// reships until the owner's authenticated closedAck reply lands inside the
+// reserve, and a delivery the owner never confirms fails instead of lying.
+test('the closed ACK reships until the owner reply lands and always removes its listener', async () => {
+  const frame = { type: 'closed', nonce: '01234567-89ab-cdef-0123-456789abcdef', leaseOwnerId: '89abcdef-0123-4567-89ab-cdef01234567' }
+  const harness = (replies: (attempt: number, sent: Readonly<Record<string, unknown>>) => readonly Record<string, unknown>[]) => {
+    const events = new EventEmitter(), sent: Record<string, unknown>[] = []
+    const control = {
+      events,
+      send: async (value: Readonly<Record<string, unknown>>) => {
+        sent.push({ ...value })
+        const frames = replies(sent.length, value)
+        if (frames.length > 0) queueMicrotask(() => { for (const reply of frames) events.emit('message', reply) })
+      },
+    }
+    return { events, sent, control }
+  }
+  const reply = (sent: Readonly<Record<string, unknown>>) => ({ type: 'closedAck', nonce: sent.nonce, leaseOwnerId: sent.leaseOwnerId })
+  // One confirmed delivery, and duplicate replies never resolve twice or leak.
+  const landed = harness((attempt, sent) => attempt === 1 ? [reply(sent), reply(sent)] : [])
+  await confirmWindowsClosedAck(landed.control, frame, Date.now() + 1000)
+  expect(landed.sent).toHaveLength(1)
+  expect(landed.events.listenerCount('message')).toBe(0)
+  // A reply the identity check refuses does not confirm; the resend ships the
+  // identical frame and only the matching reply finishes the delivery.
+  const resent = harness((attempt, sent) => attempt === 1
+    ? [{ type: 'closedAck', nonce: sent.nonce, leaseOwnerId: 'ffffffff-0000-0000-0000-000000000000' }]
+    : attempt === 2 ? [reply(sent)] : [])
+  await confirmWindowsClosedAck(resent.control, frame, Date.now() + 2000)
+  expect(resent.sent).toHaveLength(2)
+  expect(resent.sent[0]).toEqual(resent.sent[1])
+  expect(resent.events.listenerCount('message')).toBe(0)
+  // Silence fails inside the reserve with the same two ship attempts.
+  const silent = harness(() => [])
+  const started = Date.now()
+  await expect(confirmWindowsClosedAck(silent.control, frame, started + 250)).rejects.toThrow('execution_timeout')
+  expect(silent.sent).toHaveLength(2)
+  expect(Date.now() - started).toBeLessThan(1500)
+  expect(silent.events.listenerCount('message')).toBe(0)
 })

@@ -1,7 +1,7 @@
 import { openCodeV2ServerLoopbackUrl } from '../services/opencode/host/OpenCodeV2ServerAddress.js'
 import { readExecutionGraphFailure } from '../services/opencode/host/OpenCodeV2ExecutionBinding.js'
 import { openCodeBunVersion } from '../constants/openCodeBunVersion.js'
-import { windowsExecutionChildControl, windowsGraphActivation, windowsRealpathInstallCauses } from '../services/opencode/host/windows/OpenCodeV2WindowsChildControl.js'
+import { confirmWindowsClosedAck, windowsExecutionChildControl, windowsGraphActivation, windowsRealpathInstallCauses } from '../services/opencode/host/windows/OpenCodeV2WindowsChildControl.js'
 import { prepareExecutionPlatformChild, readExecutionPlatformBirth } from '../services/opencode/host/OpenCodeV2ExecutionPlatform.js'
 import { pathToFileURL } from 'node:url'
 import { resolveOpenCodeV2ExecutionDelivery } from '../services/opencode/host/OpenCodeV2ExecutionDelivery.js'
@@ -79,9 +79,15 @@ function close(): Promise<void> {
       acknowledge: async () => {
         const birth = await readExecutionPlatformBirth(process.pid)
         executionAssert(birth && nonce && childControl.connected(), 'cleanup_unknown')
-        await childControl.send({ type: 'closed', nonce, leaseOwnerId: prepared?.leaseOwnerId,
+        const frame = { type: 'closed', nonce, leaseOwnerId: prepared?.leaseOwnerId,
           namespace: prepared?.namespace, executableSha256: prepared?.executableSha256, pid: process.pid,
-          birth, scopeClosed: true }, Date.now() + openCodeV2ExecutionCloseAckReserveMs)
+          birth, scopeClosed: true }
+        // The Windows write callback can resolve before the bytes reach the
+        // pipe and this process exits right after, so delivery is proven by
+        // the owner's reply and the frame reships until it lands. POSIX IPC
+        // send callbacks are honest and no POSIX owner replies.
+        if (process.platform === 'win32') await confirmWindowsClosedAck(childControl, frame, Date.now() + openCodeV2ExecutionCloseAckReserveMs)
+        else await childControl.send(frame, Date.now() + openCodeV2ExecutionCloseAckReserveMs)
       },
     })
     // The closed ACK must reach the pipe before this process dies: exit aborts
@@ -233,7 +239,7 @@ childControl.events.on('message', (message: unknown) => {
   try {
     const input = executionRecord(message)
     executionAssert(typeof input.nonce === 'string' && /^[a-f0-9-]{36}$/.test(input.nonce))
-    if (process.platform === 'win32' && (input.type === 'windowsHTTP' || input.type === 'windowsControllerHTTP' || input.type === 'commandResult')) return
+    if (process.platform === 'win32' && (input.type === 'windowsHTTP' || input.type === 'windowsControllerHTTP' || input.type === 'commandResult' || input.type === 'closedAck')) return
     if (input.type === 'prepare') {
       executionAssert(!preparation && !started && !closing)
       executionAssert(typeof input.leaseOwnerId === 'string')
