@@ -10,7 +10,49 @@ import type { ExecutionBirth } from '../OpenCodeV2ExecutionBinding.js'
 function assert(value: unknown): asserts value { if (!value) throw new Error('execution_containment_identity_mismatch') }
 export type WindowsChildControl = Readonly<{
   events: EventEmitter; connected(): boolean; send(value: Readonly<Record<string, unknown>>, deadline?: number): Promise<void>; disconnect(): void
+  settled(): Promise<void>
 }>
+const CONTROL_CLOSE_SETTLE_MS = 400
+/** Bun can surface a named-pipe write callback before the bytes reach the pipe,
+ * and a process exit aborts any still-pending write. The child exits only after
+ * the closed ACK write and its FIN have flushed; the bound keeps this a
+ * best-effort settle that can never hang the close sequence. */
+export function settleWindowsControlClose(socket: Pick<Socket, 'once' | 'writableFinished' | 'destroyed'>,
+  deadline: number): Promise<void> {
+  if (socket.destroyed || socket.writableFinished) return Promise.resolve()
+  return new Promise<void>(resolve => {
+    const done = () => { clearTimeout(timer); resolve() }
+    const timer = setTimeout(done, Math.max(1, deadline - Date.now()))
+    socket.once('finish', done); socket.once('close', done)
+  })
+}
+/** The closed ACK is the one frame whose delivery must be proven end to end:
+ * a named-pipe write callback can resolve before the bytes reach the pipe and
+ * the process exits right after. The frame reships while unconfirmed and the
+ * send finishes only on the owner's authenticated closedAck reply. */
+export async function confirmWindowsClosedAck(control: Pick<WindowsChildControl, 'events' | 'send'>,
+  frame: Readonly<Record<string, unknown>>, deadline: number): Promise<void> {
+  const nonce = frame.nonce, leaseOwnerId = frame.leaseOwnerId
+  let confirmed!: () => void
+  const reply = new Promise<void>(resolve => { confirmed = resolve })
+  const onMessage = (value: unknown) => {
+    const row = value as Record<string, unknown> | null
+    if (row && typeof row === 'object' && !Array.isArray(row) && row.type === 'closedAck' && row.nonce === nonce && row.leaseOwnerId === leaseOwnerId) confirmed()
+  }
+  control.events.on('message', onMessage)
+  const attempt = Math.max(1, Math.floor((deadline - Date.now()) / 2))
+  try {
+    for (;;) {
+      await control.send(frame, deadline)
+      const landed = await Promise.race([reply.then(() => true), new Promise<boolean>(done => {
+        const timer = setTimeout(() => done(false), attempt)
+        reply.then(() => clearTimeout(timer))
+      })])
+      if (landed) return
+      if (Date.now() >= deadline) throw new Error('execution_timeout')
+    }
+  } finally { control.events.removeListener('message', onMessage) }
+}
 const CONTROL_PACKET_LIMIT = 16 * 1024 * 1024
 let owned: WindowsChildControl | undefined
 const authenticatedPrepares = new WeakMap<object, Record<string, unknown>>()
@@ -64,15 +106,16 @@ export function windowsExecutionChildControl(): WindowsChildControl {
   owned = Object.freeze({ events, connected: () => connected && !socket.destroyed,
     async send(value: Readonly<Record<string, unknown>>, deadline = Date.now() + 1000) {
       assert(Date.now() < deadline)
-      // The execution server can earn closed ACK only after the installed
-      // facade has disabled wrappers, drained RP_Close and unloaded known-safe
-      // native state. UNKNOWN throws, keeps DLL custody, and emits no ACK.
+      // The closed ACK certifies the authenticated identity and that the
+      // installed facade has disarmed every wrapper. The native RP_Close and
+      // library unload are process self-cleanup the OS reclaims at exit, so no
+      // in-flight drain may delay this delivery; UNKNOWN withholds the ACK.
       let outgoing = value
       if (value.type === 'closed') {
         assert(prepared && value.nonce === prepared.nonce && value.leaseOwnerId === prepared.leaseOwnerId)
         assert(value.pid === prepared.pid && value.namespace === prepared.namespace && value.scopeClosed === true)
         assert(JSON.stringify(value.birth) === JSON.stringify(prepared.birth))
-        await closeWindowsRealpath()
+        disarmWindowsRealpath()
         outgoing = { ...value, realpathClosed: realpathReceiptId }
       }
       const bytes = JSON.stringify(outgoing) + '\n'; assert(Buffer.byteLength(bytes) <= CONTROL_PACKET_LIMIT)
@@ -88,6 +131,7 @@ export function windowsExecutionChildControl(): WindowsChildControl {
       finally { clearTimeout(timer) }
     },
     disconnect() { socket.end() },
+    settled: () => settleWindowsControlClose(socket, Date.now() + CONTROL_CLOSE_SETTLE_MS),
   })
   return owned
 }
@@ -109,17 +153,31 @@ function childRealpathSelection(input: Record<string, unknown>, nativeBirth: Rec
   assert(receipt.nonce === input.nonce && receipt.receiptId === `windows-anchors:${suffix}` && Array.isArray(receipt.anchors) && receipt.anchors.length > 0 && receipt.anchors.length <= 4096)
   assert(dll.nonce === input.nonce && dll.receiptId === `windows-dll:${suffix}` && dll.held === true && typeof dll.path === 'string' && path.win32.isAbsolute(dll.path) && typeof dll.sha256 === 'string' && /^[a-f0-9]{64}$/.test(dll.sha256) && typeof dll.fileId === 'string' && /^[a-f0-9]{32}$/.test(dll.fileId))
   uint64(dll.volumeSerial)
-  const seen = new Set<string>()
-  const anchors = receipt.anchors.map(value => {
+  const seen = new Set<string>(), objects = new Set<string>()
+  const anchors: Readonly<{ kind: 'readOnly' | 'writable' | 'metadata'; dosPath: string; ntPath: string; volumeSerial: bigint; fileId: string }>[] = []
+  for (const value of receipt.anchors) {
     const anchor = record(value)
     assert((anchor.kind === 'readOnly' || anchor.kind === 'writable' || anchor.kind === 'metadata') && typeof anchor.admittedPath === 'string' && typeof anchor.dosPath === 'string' && path.win32.isAbsolute(anchor.dosPath) && path.win32.relative(anchor.admittedPath, anchor.dosPath) === '')
     assert(typeof anchor.ntPath === 'string' && anchor.ntPath.startsWith('\\Device\\') && anchor.ntPath.length <= 32767 && !anchor.ntPath.includes('\0') && anchor.ntPath.slice(1).split('\\').every(segment => segment !== '' && segment !== '.' && segment !== '..'))
     assert(typeof anchor.fileId === 'string' && /^[a-f0-9]{32}$/.test(anchor.fileId))
     const key = `${anchor.kind}:${anchor.admittedPath}`; assert(!seen.has(key)); seen.add(key)
-    return Object.freeze({ dosPath: anchor.dosPath, ntPath: anchor.ntPath, volumeSerial: uint64(anchor.volumeSerial), fileId: anchor.fileId })
-  })
+    // The kind stays on the admitted entry: a closed install refusal names its
+    // anchor kind from this selection, including after a collapse below.
+    const entry = Object.freeze({ kind: anchor.kind as 'readOnly' | 'writable' | 'metadata',
+      dosPath: anchor.dosPath, ntPath: anchor.ntPath, volumeSerial: uint64(anchor.volumeSerial), fileId: anchor.fileId })
+    // The native DLL holds one anchor per physical object and refuses a second
+    // admission of the same object outright. Distinct plan roots can resolve to
+    // one object; those spellings collapse here before the native selection.
+    const object = `${entry.volumeSerial}:${entry.fileId}`
+    if (objects.has(object)) continue
+    objects.add(object); anchors.push(entry)
+  }
   realpathReceiptId = dll.receiptId as string
   return Object.freeze({ dllPath: dll.path, expectedPid: process.pid, expectedCreationFiletime: uint64(nativeBirth.value), anchors: Object.freeze(anchors) })
+}
+function disarmWindowsRealpath(): void {
+  assert(realpathInstallation && realpathReceiptId)
+  realpathInstallation.disarm()
 }
 function closeWindowsRealpath(): Promise<void> {
   return realpathClose ??= Promise.resolve().then(() => {
@@ -129,6 +187,46 @@ function closeWindowsRealpath(): Promise<void> {
   })
 }
 let prepared: Readonly<{ type: 'prepared'; nonce: string; leaseOwnerId: string; pid: number; birth: ExecutionBirth; namespace: string; executableSha256: string; realpathInstalled: string }> | undefined
+const startupErrno = new Set(['EPERM', 'EACCES', 'ENOENT', 'ENOTDIR', 'EISDIR', 'EINVAL', 'UNKNOWN', 'EIO', 'ENOSYS'])
+const win32Errno: Record<number, string> = { 2: 'ENOENT', 3: 'ENOENT', 5: 'EACCES', 87: 'EINVAL' }
+const installOperations: Readonly<Record<number, string>> = {
+  1: 'arguments', 2: 'process_identity', 3: 'anchor', 4: 'anchor_identity', 5: 'anchor_component',
+  6: 'duplicate_child', 7: 'table', 25: 'internal',
+}
+const anchorKindTokens: Readonly<Record<string, string>> = { readOnly: 'read_only', writable: 'writable', metadata: 'metadata' }
+const anchorOperations = new Set([3, 4, 5])
+/** The complete closed vocabulary of prepare-time install refusals; the startup
+ * reporter and the diagnostics projector accept exactly these causes. */
+export const windowsRealpathInstallCauses: readonly string[] = Object.freeze([
+  'execution_realpath_install_failed', 'execution_realpath_dll_load_failed', 'execution_realpath_open_failed',
+  ...Object.entries(installOperations).flatMap(([operation, token]) => anchorOperations.has(Number(operation))
+    ? [`execution_realpath_open_${token}`, ...Object.values(anchorKindTokens).map(kind => `execution_realpath_open_${token}_${kind}`)]
+    : [`execution_realpath_open_${token}`]),
+])
+/** Closed projection of a realpath refusal: the raw native message and its
+ * facts stay inside the runner, only this vocabulary reaches the startup row. */
+function closedRealpathInstallFailure(error: unknown, selection: WindowsRealpathSelection): Error {
+  const source = error as { code?: unknown; win32?: unknown; status?: unknown; operation?: unknown; anchorIndex?: unknown } | null | undefined
+  const code = typeof source?.code === 'string' && startupErrno.has(source.code) ? source.code
+    : typeof source?.win32 === 'number' && Number.isSafeInteger(source.win32) ? win32Errno[source.win32] ?? 'UNKNOWN' : undefined
+  // Only the native initialization refusal carries the closed diagnostic triple;
+  // a loader refusal carries just an OS errno and no operation.
+  const native = typeof source?.status === 'number' && Number.isSafeInteger(source.status) &&
+    typeof source?.operation === 'number' && Number.isSafeInteger(source.operation) &&
+    typeof source?.win32 === 'number' && Number.isSafeInteger(source.win32)
+  let message = 'execution_realpath_install_failed'
+  if (native) {
+    const operation = (source as { operation: number }).operation
+    const token = installOperations[operation] ?? 'failed'
+    const anchorIndex = typeof source?.anchorIndex === 'number' && Number.isSafeInteger(source.anchorIndex) ? source.anchorIndex : undefined
+    const anchor = anchorIndex !== undefined && anchorIndex >= 0 && anchorIndex < selection.anchors.length ? selection.anchors[anchorIndex] : undefined
+    const kind = anchor?.kind ? anchorKindTokens[anchor.kind] : undefined
+    message = `execution_realpath_open_${token}${anchorOperations.has(operation) && kind ? `_${kind}` : ''}`
+  } else if (code) message = 'execution_realpath_dll_load_failed'
+  const failure = new Error(message) as Error & { code?: string }
+  if (code) failure.code = code
+  return failure
+}
 export async function prepareWindowsExecutionChild(value: unknown) {
   assert(!preparing && !prepared && value && typeof value === 'object' && !Array.isArray(value))
   const captured = authenticatedPrepares.get(value)
@@ -143,8 +241,11 @@ export async function prepareWindowsExecutionChild(value: unknown) {
   // Capture and validate the original authenticated prepare message. The
   // private singleton cannot be installed from a replay or public caller DTO.
   const selection = childRealpathSelection(record, nativeBirth)
-  const { installWindowsRealpathFallback } = await import('./OpenCodeV2WindowsRealpath.js')
-  realpathInstallation = installWindowsRealpathFallback(selection)
+  let install: (selection: WindowsRealpathSelection) => WindowsRealpathInstallation
+  try { ({ installWindowsRealpathFallback: install } = await import('./OpenCodeV2WindowsRealpath.js')) }
+  catch { throw new Error('execution_realpath_unavailable') }
+  try { realpathInstallation = install(selection) }
+  catch (error) { throw closedRealpathInstallFailure(error, selection) }
   assert(realpathReceiptId)
   prepared = Object.freeze({ type: 'prepared', nonce: String(record.nonce), leaseOwnerId: String(record.leaseOwnerId), pid: process.pid,
     birth: Object.freeze({ format: 'windows-filetime', value: nativeBirth.value, bootId: null }), namespace: String(record.namespace), executableSha256: record.executableSha256, realpathInstalled: realpathReceiptId })

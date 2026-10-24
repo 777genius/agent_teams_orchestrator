@@ -5,7 +5,7 @@ import { copyFile, lstat, mkdir, readdir, readFile, rename, symlink, writeFile }
 import path from 'node:path'
 import { createWindowsNativeBroker, resolveWindowsNativeArtifact } from '../../src/services/opencode/host/windows/OpenCodeV2WindowsNativeBroker.js'
 import { createWindowsOwnerFilesystem, type WindowsOwnerDirectory } from '../../src/services/opencode/host/windows/OpenCodeV2WindowsOwnerFilesystem.js'
-import { executionHash, executionRecord } from '../../src/services/opencode/execution/OpenCodeV2ExecutionContracts.js'
+import { executionHash, executionRecord, OPEN_CODE_V2_WINDOWS_CLOSE_MS } from '../../src/services/opencode/execution/OpenCodeV2ExecutionContracts.js'
 import { prepareWindowsPrivateDirectories } from '../../src/services/opencode/profile/OpenCodePrivateDirectories.js'
 import { runControlDirectory } from '../../src/services/opencode/bridge/OpenCodeV2RunControl.js'
 import { executionNativeRootPhases, readExecutionNativeRootObservation, type ExecutionNativeRootObservation } from '../../src/services/opencode/execution/OpenCodeV2Diagnostics.js'
@@ -1432,7 +1432,7 @@ try{
   ||expected==='config_identity'&&phase==='config'&&/^run_control_config_identity(?::[a-z_]+:\\d+)?$/.test(message)
  if(refused)outcome={expected,refused:true,selectedProfiles:1}
  else{
-  const codes=['execution_owner_not_private','execution_path_alias','execution_native_timeout','execution_native_unknown','cleanup_unknown','run_control_held_inputs','run_control_held_identity','run_control_config_identity','run_control_selection_changed','run_control_peer_identity','run_control_parent_join','run_control_connect_unknown','run_control_timeout']
+  const codes=['execution_owner_not_private','execution_path_alias','execution_native_timeout','execution_native_unknown','cleanup_unknown','run_control_held_inputs','run_control_held_identity','run_control_config_identity','run_control_selection_changed','run_control_peer_identity','run_control_parent_join','run_control_client_budget_exhausted','run_control_connect_busy_timeout_expired','run_control_connect_idle_expired','run_control_connect_no_listener_expired','run_control_connect_unknown','run_control_timeout','run_state_wall_deadline_expired']
   const code=/^([a-z_]+)(?::[a-z_]+:[0-9]{1,10})?$/.exec(message)?.[1]
   const operations=['selfImageCustody','runStateSelect','ownerValidateSelectedProfile','ownerSelectConfig','runStateDiscover','runStateProcessIdentity','runStateRequest']
   outcome={expected,phase,errorCode:codes.find(value=>value===code)??null,nativeOperation:operations.find(value=>value===error?.nativeOperation)??null};failed=true
@@ -1625,7 +1625,7 @@ $daclBytes=[byte[]]::new($raw.DiscretionaryAcl.BinaryLength);$raw.DiscretionaryA
       }
       // Invalid optional budgets must refuse before mutating the live Scope.
       const budgetPeer = peers[0]!
-      await assert.rejects(budgetPeer.broker.request('retire', { deadline: Date.now() + 27_000, timeoutMs: 27_001 }), /cleanup_unknown/)
+      await assert.rejects(budgetPeer.broker.request('retire', { deadline: Date.now() + OPEN_CODE_V2_WINDOWS_CLOSE_MS, timeoutMs: OPEN_CODE_V2_WINDOWS_CLOSE_MS + 1 }), /cleanup_unknown/)
       assert.deepEqual(await budgetPeer.broker.request('assertLive'), budgetPeer.mapping)
       facts.retirementBudgetMalformedRefused = true
       for (const peer of peers) assert.deepEqual(await peer.broker.request('assertLive'), peer.mapping)
@@ -1646,9 +1646,9 @@ $daclBytes=[byte[]]::new($raw.DiscretionaryAcl.BinaryLength);$raw.DiscretionaryA
       try {
         if (peer.mapping) {
           facts.projectCohortCleanupStage = 'member_retirement'
-          const retirementDeadline = Date.now() + 27_000
+          const retirementDeadline = Date.now() + OPEN_CODE_V2_WINDOWS_CLOSE_MS
           const receipt = executionRecord(await peer.broker.request('retire',
-            { deadline: retirementDeadline, timeoutMs: 27_000 }, retirementDeadline))
+            { deadline: retirementDeadline, timeoutMs: OPEN_CODE_V2_WINDOWS_CLOSE_MS }, retirementDeadline))
           assert.ok(Date.now() < retirementDeadline)
           assert.equal(receipt.empty, true); assert.equal(receipt.activeProcesses, 0)
           assert.equal(receipt.heldProcessExited, true); assert.equal(receipt.ownAcesRemoved, true)
@@ -1743,13 +1743,31 @@ $hash.AppendData([BitConverter]::GetBytes([int]$dacl.Length));$hash.AppendData($
   assert.ok(Number(contentionBaseline.count) > retirementFiles)
   assert.match(String(contentionBaseline.sha256), /^[a-f0-9]{64}$/)
   executionRecord(facts.concurrentRootRetirement).setupElapsedMs = Math.min(86_400_000, Date.now() - contentionSetupStarted)
+  // Mirrors rootRetirementRotation in WindowsKernelScope.cpp: the cohort-less
+  // walk rotation is the FNV-1a of the launch nonce, so sieved nonces give the
+  // three contenders three distinct deterministic rotations.
+  const retirementRotation = (nonce: string, rootCount: number) => {
+    let hash = 14695981039346656037n
+    for (let index = 0; index < nonce.length; index++) {
+      hash ^= BigInt(nonce.charCodeAt(index))
+      hash = BigInt.asUintN(64, hash * 1099511628211n)
+    }
+    return Number(hash % BigInt(rootCount))
+  }
+  const retirementRotationNonce = (rotation: number) => {
+    for (let attempt = 0; attempt < 1024; attempt++) {
+      const nonce = randomUUID()
+      if (retirementRotation(nonce, 3) === rotation) return nonce
+    }
+    throw new Error('TEST_rotation_nonce_missing')
+  }
   const contenders: Array<{ broker: ReturnType<typeof createWindowsNativeBroker>; nonce: string
     fence?: WindowsOwnerDirectory; mapping?: Record<string, unknown>; connected?: unknown
     progress: ExecutionNativeRootObservation[]; failure?: string; retired: boolean; retirement?: Promise<unknown> }> = []
   let contentionFailed = false
   try {
     for (let index = 0; index < 3; index++) {
-      const contender = { broker: createWindowsNativeBroker(helper), nonce: randomUUID(),
+      const contender = { broker: createWindowsNativeBroker(helper), nonce: retirementRotationNonce(index),
         progress: [] as ExecutionNativeRootObservation[], retired: false } as (typeof contenders)[number]
       contenders.push(contender); contender.broker.events.on('error', () => {})
       rootObservations.push(contender.progress)
@@ -1778,18 +1796,30 @@ $hash.AppendData([BitConverter]::GetBytes([int]$dacl.Length));$hash.AppendData($
       await waitProjectPeer(() => contender.connected)
     }
     const results = await Promise.allSettled(contenders.map(async contender => {
-      const deadline = Date.now() + 27_000
-      contender.retirement = contender.broker.request('retire', { deadline, timeoutMs: 27_000 }, deadline)
+      const deadline = Date.now() + OPEN_CODE_V2_WINDOWS_CLOSE_MS
+      contender.retirement = contender.broker.request('retire', { deadline, timeoutMs: OPEN_CODE_V2_WINDOWS_CLOSE_MS }, deadline)
       const receipt = executionRecord(await contender.retirement)
       assert.equal(receipt.empty, true); assert.equal(receipt.heldProcessExited, true)
       assert.equal(receipt.activeProcesses, 0); assert.equal(receipt.ownAcesRemoved, true)
       assert.deepEqual(receipt.mapping, contender.mapping); contender.retired = true
       assert.equal(contender.failure, undefined)
       assert.equal(contender.progress.length, 18)
-      for (const [index, role] of ['protected_deny', 'private_writable', 'shared_read'].entries()) {
-        const observations = contender.progress.filter(value => value.index === index + 1)
+      // Each member walks the shared roots in its own deterministic rotation,
+      // so the roles at fixed indexes follow that rotation; every index still
+      // binds exactly one root across its six phases.
+      for (const index of [1, 2, 3]) {
+        const observations = contender.progress.filter(value => value.index === index)
+        assert.equal(observations.length, 6)
+        assert.equal(observations.every(value => value.role === observations[0]!.role), true)
+      }
+      const walked = [1, 2, 3].map(index => contender.progress.find(value => value.index === index)!.role)
+      const rotationBase = ['protected_deny', 'private_writable', 'shared_read'] as const
+      const rotation = retirementRotation(contender.nonce, 3)
+      assert.deepEqual(walked, [...rotationBase.slice(rotation), ...rotationBase.slice(0, rotation)])
+      for (const role of rotationBase) {
+        const observations = contender.progress.filter(value => value.role === role)
         assert.deepEqual(observations.map(value => value.phase), executionNativeRootPhases)
-        assert.equal(observations.every(value => value.count === 3 && value.role === role), true)
+        assert.equal(observations.every(value => value.count === 3), true)
         assert.equal(observations.every((value, index) => index === 0 || value.elapsedMs >= observations[index - 1]!.elapsedMs), true)
       }
     }))

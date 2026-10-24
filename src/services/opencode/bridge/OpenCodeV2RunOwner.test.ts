@@ -450,17 +450,26 @@ test('Windows transient cold-start failure at the startup gate spares queued sta
       initializationAbort: AbortController; acquisitions: Set<AbortController> }
     const queued = new AbortController()
     owner.acquisitions.add(queued)
-    const failure = (nativeStderrKind: string) => Object.assign(new Error('execution_cancelled'), { startup: {
-      event: 'opencode-v2-startup', reason: 'failed', stage: 'windows-prepare', elapsedMs: 120, history: [],
-      nativeExitCode: 1, nativeStderrKind } })
+    const failure = (nativeStderrKind: string, unboundRetired = true) => Object.assign(new Error('execution_cancelled'), {
+      startup: { event: 'opencode-v2-startup', reason: 'failed', stage: 'windows-prepare', elapsedMs: 120, history: [],
+        nativeExitCode: 1, nativeStderrKind },
+      ...(unboundRetired ? { unboundRetired: true } : {}) })
     const transient = failure('access_denied')
     await expect(owner.startupGate(async () => { throw transient }, undefined, Date.now() + 60_000)).rejects.toBe(transient)
     expect(owner.initializationAbort.signal.aborted).toBe(false)
     expect(queued.signal.aborted).toBe(false)
+    // The access-denied class retries only when the failed attempt also proved
+    // its unbound spawn retired; an unproved owner fence keeps the failure final.
+    const unproved = failure('access_denied', false)
+    await expect(owner.startupGate(async () => { throw unproved }, undefined, Date.now() + 60_000)).rejects.toBe(unproved)
+    expect(owner.initializationAbort.signal.aborted).toBe(true)
+    expect(queued.signal.aborted).toBe(true)
+    const cancelled = new AbortController()
+    owner.acquisitions.add(cancelled)
     const final = failure('bun_error')
     await expect(owner.startupGate(async () => { throw final }, undefined, Date.now() + 60_000)).rejects.toBe(final)
     expect(owner.initializationAbort.signal.aborted).toBe(true)
-    expect(queued.signal.aborted).toBe(true)
+    expect(cancelled.signal.aborted).toBe(true)
   } finally { await f.close() }
 })
 
@@ -502,7 +511,7 @@ test('Windows original lease arriving after the public stop snapshot is still cl
   } finally { gate.release(); await f.close() }
 })
 
-test('Windows Stop shares its original 29s envelope with a 27s physical slice while POSIX keeps adapter defaults', async () => {
+test('Windows Stop shares its original 40s envelope with a 38s physical slice while POSIX keeps adapter defaults', async () => {
   for (const windowsAcquisitions of [true, false]) {
     const closes: (number | undefined)[] = []
     const f = await fixture({ windowsAcquisitions, leaseClose: deadline => { closes.push(deadline) } })
@@ -512,7 +521,7 @@ test('Windows Stop shares its original 29s envelope with a 27s physical slice wh
       const start = Date.now()
       clock = spyOn(Date, 'now').mockReturnValue(start)
       const stopped = await f.owner.stop()
-      expect(closes).toEqual([windowsAcquisitions ? start + 27_000 : undefined])
+      expect(closes).toEqual([windowsAcquisitions ? start + 38_000 : undefined])
       expect(stopped.state).toBe('cleanup_unknown') // Same-fields fake receipts still confer no physical proof.
       expect((await f.owner.stop())).toBe(stopped)
       expect(f.counters.closed).toBe(1)
@@ -520,12 +529,25 @@ test('Windows Stop shares its original 29s envelope with a 27s physical slice wh
   }
 })
 
-test('Windows Stop clips physical work and finalization to the same original 29s deadline', async () => {
+test('Windows Stop honors a signed pipe deadline inside the 40s owner envelope', async () => {
+  const closes: (number | undefined)[] = []
+  const f = await fixture({ windowsAcquisitions: true, leaseClose: deadline => { closes.push(deadline) } })
+  let clock: ReturnType<typeof spyOn> | undefined
+  try {
+    await f.owner.ready()
+    const start = Date.now()
+    clock = spyOn(Date, 'now').mockReturnValue(start)
+    await f.owner.stop(start + 30_000)
+    expect(closes).toEqual([start + 28_000]) // Signed deadline minus the shared 2s receipt reserve.
+  } finally { clock?.mockRestore(); await f.close() }
+})
+
+test('Windows Stop clips physical work and finalization to the same original 40s deadline', async () => {
   for (const mode of ['within', 'expired_close', 'persist_failed', 'persist_late', 'archive_late'] as const) {
     let now = Date.now(), start = now, observed: number | undefined
     const writes: string[] = []
     const f = await fixture({ windowsAcquisitions: true, leaseClose: deadline => { observed = deadline },
-      nativeRetirement: async () => { await Promise.resolve(); now = start + (mode === 'expired_close' ? 27_000 : 25_000) } })
+      nativeRetirement: async () => { await Promise.resolve(); now = start + (mode === 'expired_close' ? 38_000 : 25_000) } })
     let clock: ReturnType<typeof spyOn> | undefined, write: ReturnType<typeof spyOn> | undefined
     let trusted: ReturnType<typeof spyOn> | undefined, bounded: ReturnType<typeof spyOn> | undefined
     try {
@@ -547,11 +569,11 @@ test('Windows Stop clips physical work and finalization to the same original 29s
         }
         if (name === 'stop.json') writes.push('stop')
         await originalWrite(directory, name, value)
-        if (f.counters.closed && (mode === 'persist_late' && name === 'state.json' || mode === 'archive_late' && name === 'stop.json')) now = start + 29_000
+        if (f.counters.closed && (mode === 'persist_late' && name === 'state.json' || mode === 'archive_late' && name === 'stop.json')) now = start + 40_000
         else if (f.counters.closed) now += 500
       })
       const stopped = await f.owner.stop()
-      expect(observed).toBe(start + 27_000) // Three pre-close seconds consume this slice, never add to it.
+      expect(observed).toBe(start + 38_000) // The shared 40s envelope minus its 2s receipt reserve clips the slice.
       expect(f.counters.closed).toBe(1)
       expect(writes).toEqual(['state', 'stop']) // Shared finalization reserve, no second public persistence window.
       expect(stopped.state).toBe(mode === 'within' ? 'stopped' : 'cleanup_unknown')

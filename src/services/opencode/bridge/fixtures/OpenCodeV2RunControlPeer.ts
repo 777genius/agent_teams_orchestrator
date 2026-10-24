@@ -1,4 +1,4 @@
-import { lstat } from 'node:fs/promises'
+import { lstat, readFile, rm } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { discoverOpenCodeV2Run, parseRunBinding, parseRunControlRequest, requestOpenCodeV2Run,
@@ -111,19 +111,40 @@ if (mode === 'sentinel') {
     const result = await requestOpenCodeV2Run(record, request, 5000)
     process.stdout.write(JSON.stringify(result) + '\n')
   } else {
-    executionAssert(mode === 'serve' || mode === 'serve-delayed', 'TEST_mode_invalid')
+    executionAssert(mode === 'serve' || mode === 'serve-delayed' || mode.startsWith('serve-drop-'), 'TEST_mode_invalid')
+    const drop = mode.startsWith('serve-drop-') ? mode.slice('serve-drop-'.length) : null
     let control: Awaited<ReturnType<typeof serveOpenCodeV2RunControl>> | undefined
     const directory = runControlDirectory(dataRoot, binding.teamId, binding.runId)
     const deadline = Date.now() + 20_000
     const owner = syntheticOwner(dataRoot, binding, directory, deadline, mode === 'serve-delayed')
     control = await serveOpenCodeV2RunControl(directory, binding, deadline, 'a'.repeat(64),
-      (request, operationDeadline) => owner.execute(request, operationDeadline))
+      async (request, operationDeadline) => {
+        // A lost stop reply: retire without answering. The durable receipt (or
+        // its absence) decides later confirmation from the same-run archive.
+        if (drop && request.operation === 'stop') {
+          if (drop === 'archive' || drop === 'unknown') {
+            await writeRunControlFile(directory, 'tombstone.json', { binding })
+            await writeRunControlFile(directory, 'stop.json', { binding, receipt: { kind: 'stop',
+              state: drop === 'archive' ? 'stopped' : 'cleanup_unknown',
+              members: drop === 'archive' ? [{ memberId: 'worker', cleanup: { scopeClosed: true, processRetired: true,
+                descendantsRetired: true, pid: 4242, birth: { format: 'darwin-pidversion', value: '4242:1', bootId: null } },
+              errors: [] }] : [] } })
+          }
+          if (drop === 'corrupt') {
+            const current = JSON.parse((await readFile(path.join(directory, 'control.json'))).toString('utf8'))
+            await writeRunControlFile(directory, 'control.json', { ...current, sourceSha256: 'b'.repeat(64) })
+          }
+          await rm(path.join(directory, 'control.sock'), { force: true })
+          process.exit(0)
+        }
+        return owner.execute(request, operationDeadline)
+      })
     let retiring: Promise<void> | undefined
     const retire = () => retiring ??= (async () => { await owner.stop(); await owner.awaitCleanupTerminal(); await control?.close() })()
     process.once('SIGTERM', () => { void retire().finally(() => process.exit(0)) })
     void owner.stopped.then(() => { setTimeout(() => { void retire().finally(() => process.exit(0)) }, 100) })
     if (mode === 'serve-delayed') process.stdout.write('ready\n')
     await owner.ready()
-    if (mode === 'serve') process.stdout.write('ready\n')
+    if (mode !== 'serve-delayed') process.stdout.write('ready\n')
   }
 }

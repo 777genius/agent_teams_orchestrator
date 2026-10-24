@@ -1,6 +1,6 @@
 import type { EventEmitter } from 'node:events'
 import { executionAssert } from '../execution/OpenCodeV2ExecutionContracts.js'
-import type { ExecutionCommandObservation } from '../execution/OpenCodeV2Diagnostics.js'
+import type { ExecutionCleanupClosedFrame, ExecutionCommandObservation } from '../execution/OpenCodeV2Diagnostics.js'
 import type { ExecutionBirth } from './OpenCodeV2ExecutionBinding.js'
 import { isKernelRetirement, isLinuxExecutionMapping, launchLinuxExecution, linuxBirth,
   planLinuxExecution, prepareLinuxExecutionChild } from './OpenCodeV2ExecutionLauncher.js'
@@ -27,6 +27,8 @@ export type ExecutionPlatformLaunch = Readonly<{
   start(payload: Readonly<Record<string, unknown>>, deadline: number, signal?: AbortSignal): Promise<void>
   activate?(deadline: number, signal?: AbortSignal): Promise<void>
   assertLive(): Promise<void>; sendClose(): void; acknowledged(): boolean
+  /** Diagnostic only: how the owner reader observed the closed ACK frame. */
+  closedObservation?(): ExecutionCleanupClosedFrame
   readBirth?(): Promise<ExecutionBirth | null>
   kill(deadline?: number): void | Promise<void>; retire(deadline?: number): Promise<unknown>
 }>

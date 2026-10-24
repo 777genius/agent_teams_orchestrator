@@ -8,10 +8,11 @@ import { executionHash, openCodeV2RunInitializationMs } from '../execution/OpenC
 import { executionNativeRetirementPhases, readExecutionNativeRootObservation, retainOpenCodeV2CatalogServerFailure,
   type ExecutionCleanupObservation, type ExecutionCleanupPhase } from '../execution/OpenCodeV2Diagnostics.js'
 import { boundOpenCodeRead } from '../transport/OpenCodeBoundedFetch.js'
+import { openCodeV2ExecutionCloseAckReserveMs, runOpenCodeV2ExecutionCloseSequence } from '../execution/OpenCodeV2ExecutionClose.js'
 import { acquireExecutionLease, awaitExecutionHostReady } from './OpenCodeV2ExecutionHost.js'
 import { validateExecutionProfile, type ExecutionBirth, type SelectedExecutionProfile, type ValidatedExecutionNative } from './OpenCodeV2ExecutionBinding.js'
 import { executionClosedAck, retireExecutionChild, type ExecutionRetirementPort } from './OpenCodeV2ExecutionLifecycle.js'
-import { windowsGraphActivation } from './windows/OpenCodeV2WindowsChildControl.js'
+import { confirmWindowsClosedAck, windowsGraphActivation, windowsRealpathInstallCauses } from './windows/OpenCodeV2WindowsChildControl.js'
 
 const birth: ExecutionBirth = { format: 'linux-start-ticks', value: '420', bootId: 'TEST-boot-domain' }
 const context = { teamId: 'TEST-team', runId: 'TEST-run', laneId: 'TEST-lane', memberId: 'TEST-member', deadline: Number.MAX_SAFE_INTEGER }
@@ -107,11 +108,16 @@ describe('execution host ownership and cleanup', () => {
         env: {}, envSha256: 'f'.repeat(64), config: { directory: '/TEST-profile/config', content: '{}', sha256: 'f'.repeat(64) },
         selection: { agent: 'worker', model: { providerID: 'TEST', id: 'model' }, permissions: [] } }
       const platform = mode === 'standalone-posix' || mode === 'owner-deadline-posix' ? 'darwin' : 'win32'
-      const scope = { AbortController, Date, windowsGraphActivation, boundOpenCodeRead, openCodeV2RunInitializationMs,
+      const scope = { AbortController, Date, windowsGraphActivation, windowsRealpathInstallCauses, confirmWindowsClosedAck, boundOpenCodeRead, runOpenCodeV2ExecutionCloseSequence, openCodeV2ExecutionCloseAckReserveMs, openCodeV2RunInitializationMs,
         process: { platform, pid: 42, env: { PWD: profile.directory }, versions: { bun: 'TEST-bun' },
           execPath: native.bun.path, argv: ['TEST-bun', '/TEST-entry'], cwd: () => profile.directory,
           stderr: { write: (text: string) => { reports.push(JSON.parse(text)) } }, once: () => {}, exit: (code: number) => { exits.push(code) } },
-        childControl: { events, connected: () => true, send: async (value: Readonly<Record<string, unknown>>) => { sent.push(value) }, disconnect: () => {} },
+        // The Windows owner confirms the closed ACK with its authenticated
+        // reply; no POSIX owner replies.
+        childControl: { events, connected: () => true, send: async (value: Readonly<Record<string, unknown>>) => {
+          sent.push(value)
+          if (platform === 'win32' && value.type === 'closed') events.emit('message', { type: 'closedAck', nonce: value.nonce, leaseOwnerId: value.leaseOwnerId })
+        }, disconnect: () => {}, settled: async () => {} },
         setTimeout: (run: () => void, ms: number) => { const id = ++sequence; armed.push(now + ms); timers.set(id, { at: now + ms, run }); return id },
         clearTimeout: (id: number) => { timers.delete(id) },
         executionAssert: (value: unknown, message = 'execution_contract_invalid') => { if (!value) throw new Error(message) },
@@ -286,7 +292,7 @@ describe('execution host ownership and cleanup', () => {
             if (platform !== 'win32') { atReady = true; child.emit('message', { type: 'ready', ...tuple(), baseUrl: 'http://127.0.0.1:1' }) }
           },
           activate: async () => { await assertLive(); observation.activate++; atReady = true; child.emit('message', { type: 'ready', ...tuple(), baseUrl: 'http://127.0.0.1:1' }) },
-          sendClose: () => { observation.closed++; child.emit('close') }, acknowledged: () => true, retire: async () => {}, kill: async () => {} }
+          sendClose: () => { observation.closed++; child.emit('close', 0) }, acknowledged: () => true, retire: async () => {}, kill: async () => {} }
       },
       readExecutionBirth: async () => { birthReads++; expect(critical).toBe(1); return birth }, awaitExecutionHostReady,
       boundOpenCodeRead: async <T>(work: Promise<T>) => work,
@@ -328,15 +334,15 @@ describe('execution host ownership and cleanup', () => {
     launches[0]!.emitRoot(nativeRoot)
     const snapshot = readObservation(leases[0]!)
     await expect(boundOpenCodeRead(closing, 1)).rejects.toThrow('timeout') // Owner's outer timer wins while original cleanup is pending.
-    expect(snapshot).toEqual({ phase: 'kernel-retirement', nativePhase: 'retire_grants_roots', nativeRoot })
+    expect(snapshot).toEqual({ phase: 'kernel-retirement', exit: 'exit_zero', closedFrame: 'accepted', nativePhase: 'retire_grants_roots', nativeRoot })
     expect(Object.isFrozen(snapshot)).toBe(true)
     expect(readObservation({ ...leases[0]! })).toBeUndefined() // Same-fields objects cannot borrow the original observation.
     launches[0]!.emitNative('TEST-private-path-secret')
-    expect(readObservation(leases[0]!)).toEqual({ phase: 'kernel-retirement' })
+    expect(readObservation(leases[0]!)).toEqual({ phase: 'kernel-retirement', exit: 'exit_zero', closedFrame: 'accepted' })
     launches[0]!.emitNative(undefined); releaseNative(); heldRetirement = undefined
     await wait(() => readObservation(leases[0]!)?.phase === 'owner-release')
-    expect(readObservation(leases[0]!)).toEqual({ phase: 'owner-release' })
-    expect(snapshot).toEqual({ phase: 'kernel-retirement', nativePhase: 'retire_grants_roots', nativeRoot })
+    expect(readObservation(leases[0]!)).toEqual({ phase: 'owner-release', exit: 'exit_zero', closedFrame: 'accepted' })
+    expect(snapshot).toEqual({ phase: 'kernel-retirement', exit: 'exit_zero', closedFrame: 'accepted', nativePhase: 'retire_grants_roots', nativeRoot })
     releaseOwner(); heldRelease = undefined; await closing
     await Promise.all(leases.map(lease => lease.close()))
     expect(launches.map(value => [value.closed, value.release])).toEqual([[1, 1], [1, 1]])

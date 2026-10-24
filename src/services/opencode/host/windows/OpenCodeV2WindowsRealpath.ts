@@ -9,12 +9,12 @@ export type WindowsRealpathSelection = Readonly<{
   dllPath: string
   expectedPid: number
   expectedCreationFiletime: bigint
-  anchors: readonly Readonly<{ dosPath: string; ntPath: string; volumeSerial: bigint; fileId: string }>[]
+  anchors: readonly Readonly<{ kind?: 'readOnly' | 'writable' | 'metadata'; dosPath: string; ntPath: string; volumeSerial: bigint; fileId: string }>[]
 }>
-export type WindowsRealpathInstallation = Readonly<{ uninstall(): void }>
+export type WindowsRealpathInstallation = Readonly<{ disarm(): void; uninstall(): void }>
 
 type Encoding = { kind: 'default' } | { kind: 'buffer' } | { kind: 'encoding'; encoding: BufferEncoding } | { kind: 'unsupported' }
-type Diagnostics = Readonly<{ status: number; operation: number; win32: number }>
+type Diagnostics = Readonly<{ status: number; operation: number; win32: number; anchorIndex: number }>
 type Installation = {
   readonly native: NativeLibrary
   readonly anchors: WindowsRealpathSelection['anchors']
@@ -22,7 +22,8 @@ type Installation = {
   readonly scratch: Readonly<{ output: Buffer; count: Buffer; error: Buffer }>
   active: boolean
   retiring: boolean
-  state: 'installed' | 'retired' | 'unknown'
+  disarmed: boolean
+  state: 'installed' | 'disarmed' | 'retired' | 'unknown'
   closeError?: Diagnostics
 }
 
@@ -55,7 +56,7 @@ function retainNativeRealpathFailure(error: unknown, install: Installation, rout
 const MAX_CHARS = 32767
 const OUTPUT_CAPACITY = 32768
 const ANCHOR_SIZE = 56
-const ERROR_SIZE = 8
+const ERROR_SIZE = 12
 const FILE_ID = /^[0-9a-f]{32}$/
 const UINT64_MAX = (1n << 64n) - 1n
 
@@ -95,10 +96,11 @@ function pointerAddress(pointer: unknown): bigint {
 }
 
 const utf16 = (value: string): Buffer => Buffer.from(`${value}\0`, 'utf16le')
-const errorFacts = (buffer: Buffer): { operation: number; win32: number } =>
-  ({ operation: buffer.readUInt32LE(0), win32: buffer.readUInt32LE(4) })
+const errorFacts = (buffer: Buffer): { operation: number; win32: number; anchorIndex: number } =>
+  ({ operation: buffer.readUInt32LE(0), win32: buffer.readUInt32LE(4), anchorIndex: buffer.readUInt32LE(8) })
 const initializationError = (value: Diagnostics): Error =>
-  new Error(`windows_realpath_initialization_failed status=${value.status} operation=${value.operation} win32=${value.win32}`)
+  Object.assign(new Error(`windows_realpath_initialization_failed status=${value.status} operation=${value.operation} win32=${value.win32}`),
+    { status: value.status, operation: value.operation, win32: value.win32, anchorIndex: value.anchorIndex })
 
 function isPermissionError(error: unknown): boolean {
   return typeof error === 'object' && error !== null &&
@@ -298,7 +300,7 @@ function openNative(selection: WindowsRealpathSelection): { library: NativeLibra
     )
     if (status !== 0) throw initializationError({ status, ...errorFacts(errorBuffer) })
     const context = contextBuffer.readBigUInt64LE(0)
-    if (context === 0n) throw initializationError({ status: 4, operation: 7, win32: 11 })
+    if (context === 0n) throw initializationError({ status: 4, operation: 7, win32: 11, anchorIndex: 0xffffffff })
     return { library, context }
   } catch (error) {
     try { library.close() } catch { /* preserve the original initialization error */ }
@@ -353,8 +355,8 @@ function closeNative(library: NativeLibrary, context: bigint): Diagnostics {
   try { status = library.symbols.RP_CloseV1(context, ffi.ptr(errorBuffer)) } catch { status = 4 }
   const facts = errorFacts(errorBuffer)
   if (status !== 0) return { status, ...facts }
-  try { library.close() } catch { return { status: 4, operation: 24, win32: 11 } }
-  return { status: 0, operation: 0, win32: 0 }
+  try { library.close() } catch { return { status: 4, operation: 24, win32: 11, anchorIndex: 0xffffffff } }
+  return { status: 0, operation: 0, win32: 0, anchorIndex: 0xffffffff }
 }
 
 export function installWindowsRealpathFallback(selection: WindowsRealpathSelection): WindowsRealpathInstallation {
@@ -377,8 +379,30 @@ export function installWindowsRealpathFallback(selection: WindowsRealpathSelecti
       throw error
     }
     active = { anchors: selection.anchors, native: native.library, context: native.context, scratch,
-      active: true, retiring: false, state: 'installed' }
+      active: true, retiring: false, disarmed: false, state: 'installed' }
     return Object.freeze({
+      // Wrappers alone disarm here: the restored surfaces are exactly what the
+      // closed ACK certifies. The native RP_Close and the library unload are
+      // process self-cleanup the OS reclaims at exit, so they can never delay
+      // the ACK; an uncertain restore withholds it instead.
+      disarm(): void {
+        const current = active
+        if (!current) {
+          if (retainedError) throw retainedError
+          return
+        }
+        if (current.disarmed || current.retiring) return
+        try {
+          restore(items)
+          current.disarmed = true
+          current.active = false
+          current.state = 'disarmed'
+        } catch (error) {
+          current.state = 'unknown'
+          retainedError = error instanceof Error ? error : new Error('windows_realpath_uninstall_unknown')
+          throw retainedError
+        }
+      },
       uninstall(): void {
         const current = active
         if (!current) {
@@ -390,7 +414,10 @@ export function installWindowsRealpathFallback(selection: WindowsRealpathSelecti
         current.active = false
         active = undefined
         try {
-          restore(items)
+          if (!current.disarmed) {
+            restore(items)
+            current.disarmed = true
+          }
           const closed = closeNative(current.native, current.context)
           if (closed.status !== 0) {
             current.state = 'unknown'

@@ -25,7 +25,14 @@
 // The owner boundary is deliberately narrow: only the retained-selection root
 // issuer can construct this object. All observable identifiers are registry
 // generations; HANDLE and PID values never cross the JSON boundary.
-static constexpr DWORD RUN_CONTROL_MAX_FRAME_BYTES = 512 * 1024;
+// A control reply (a full transcript cut) is one frame on the pipe and one
+// packet on the broker stdio hop; one shared budget keeps both hops equal.
+static constexpr DWORD RUN_CONTROL_MAX_FRAME_BYTES = 16 * 1024 * 1024;
+// The pipe buffers only stage bytes between reads; the 16 MiB frame cap is a
+// logical budget the read loop assembles across reads. Allocating the frame cap
+// per buffer would reserve ~32 MiB nonpaged per instance and can make
+// CreateNamedPipeW refuse the instance on modest hosts.
+static constexpr DWORD RUN_CONTROL_PIPE_BUFFER_BYTES = 64 * 1024;
 static std::string runControlCanonicalJson(const IJsonValue &value) {
   switch (value.ValueType()) {
   case JsonValueType::Null:
@@ -257,21 +264,47 @@ struct WindowsNativeRunControl {
     const DWORD timeout = runControlTimeoutMs(input, L"timeoutMs");
     if (deadline == 0) deadline = GetTickCount64() + timeout;
     Handle pipe;
-    for (;;) {
-      require(runControlRemaining(deadline) > 0, "run_deadline_expired");
+    for (DWORD connectError = ERROR_SUCCESS;;) {
+      // Budget expiry publishes the LAST observed endpoint condition, never an
+      // ambiguous generic token: a pipe object absent for the whole budget means
+      // no listener ever offered one, a saturated pool kept every instance busy,
+      // and no attempt at all is idle. No errno text or endpoint is published.
+      if (runControlRemaining(deadline) == 0) {
+        if (connectError == ERROR_FILE_NOT_FOUND)
+          throw NativeError{"run_control_connect_no_listener_expired"};
+        if (connectError == ERROR_PIPE_BUSY || connectError == ERROR_SEM_TIMEOUT ||
+            connectError == ERROR_NO_DATA)
+          throw NativeError{"run_control_connect_busy_timeout_expired"};
+        throw NativeError{"run_control_connect_idle_expired"};
+      }
       const HANDLE raw = CreateFileW(endpoint.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
                                      OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
       const DWORD error = raw == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
       pipe = Handle(raw);
       if (pipe) break;
-      if (error != ERROR_PIPE_BUSY)
+      connectError = error;
+      // A saturated or momentarily absent endpoint is a wait inside the same
+      // deadline, never a refusal; only an unexpected errno publishes the
+      // closed connect failure.
+      if (error != ERROR_PIPE_BUSY && error != ERROR_SEM_TIMEOUT &&
+          error != ERROR_FILE_NOT_FOUND && error != ERROR_NO_DATA)
         throw NativeError{"run_control_connect_unknown", error, "connect"};
       const DWORD remaining = runControlRemaining(deadline);
-      require(remaining > 0, "run_deadline_expired");
+      if (remaining == 0) continue;
       // Another client can win the next open; wait only for this same endpoint
       // and consume the original budget before any request bytes are submitted.
-      if (!WaitNamedPipeW(endpoint.c_str(), remaining))
-        throw NativeError{"run_control_connect_unknown", GetLastError(), "connect"};
+      if (!WaitNamedPipeW(endpoint.c_str(), remaining)) {
+        const DWORD waitError = GetLastError();
+        if (waitError != ERROR_SEM_TIMEOUT && waitError != ERROR_FILE_NOT_FOUND &&
+            waitError != ERROR_NO_DATA)
+          throw NativeError{"run_control_connect_unknown", waitError, "connect"};
+        connectError = waitError;
+        // A missing or closing endpoint is momentarily absent rather than
+        // refused; poll the same deadline instead of expiring the caller on
+        // that absence.
+        if (waitError == ERROR_FILE_NOT_FOUND || waitError == ERROR_NO_DATA)
+          Sleep(10);
+      }
     }
     auto connection = runControlMakeConnection(std::move(pipe), Role::client, timeout);
     connection->endpoint = endpoint;
@@ -305,85 +338,116 @@ struct WindowsNativeRunControl {
                 registry_.size() < MAX_CAPABILITIES,
             "run_control_connection_limit");
     const DWORD timeout = runControlTimeoutMs(input, L"timeoutMs");
-    require(static_cast<bool>(listener_->pending), "run_control_accept_unknown");
-    auto owned = std::make_shared<IoOperation>();
-    owned->kind = IoKind::accept;
-    owned->issuingHandle = runControlDuplicateHandle(listener_->pending.value);
-    owned->event = Handle(CreateEventW(nullptr, TRUE, FALSE, nullptr));
-    require(static_cast<bool>(owned->event), "run_control_accept_unknown");
-    owned->overlap.hEvent = owned->event.value;
-    auto operation = runControlRetain(std::move(owned));
-    listener_->acceptOperation = operation;
+    // A spent offer must never consume a second budget: an explicit accept
+    // retries inside its original timeout while the owner pump keeps
+    // observing until its stop is ordered.
+    const std::uint64_t acceptDeadline = GetTickCount64() + timeout;
+    for (;;) {
+      require(static_cast<bool>(listener_->pending), "run_control_accept_unknown");
+      auto owned = std::make_shared<IoOperation>();
+      owned->kind = IoKind::accept;
+      owned->issuingHandle = runControlDuplicateHandle(listener_->pending.value);
+      owned->event = Handle(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+      require(static_cast<bool>(owned->event), "run_control_accept_unknown");
+      owned->overlap.hEvent = owned->event.value;
+      auto operation = runControlRetain(std::move(owned));
+      listener_->acceptOperation = operation;
 
-    BOOL connected = ConnectNamedPipe(operation->issuingHandle.value, &operation->overlap);
-    DWORD error = connected ? ERROR_SUCCESS : GetLastError();
-    operation->issued = true;
-    if (!connected && error != ERROR_IO_PENDING && error != ERROR_PIPE_CONNECTED) {
-      operation->complete = true;
-      operation->error = error;
-      operation->poisoned = true;
-      runControlForget(operation);
-      throw NativeError{"run_control_accept_unknown", error, "accept"};
-    }
-    if (!connected && error == ERROR_IO_PENDING) {
-      lock.unlock();
-      auto wait = runControlWaitOperation(*operation, timeout);
-      // The owner pump has no request deadline while waiting for a client.
-      // Keep the same held HANDLE and OVERLAPPED across idle observation ticks.
-      // Shutdown still enters the existing cancel-and-drain path within a tick;
-      // explicit low-level accept requests retain their bounded timeout.
-      while (!wait.completed && retainIdleWait && !requestPumpStop_ && !shutdown_)
-        wait = runControlWaitOperation(*operation, timeout);
-      if (!wait.completed) {
-        const auto cancelled = runControlCancelAndDrain(*operation);
-        lock.lock();
-        if (!operation->complete) {
-          if (!cancelled.completed) {
-            operation->unresolved = operation->poisoned = true;
-            if (listener_)
-              listener_->poisoned = true;
-            runControlForget(operation);
-            throw NativeError{"cleanup_unknown", ERROR_OPERATION_ABORTED, "accept"};
-          }
-          operation->complete = true;
-          operation->transferred = cancelled.transferred;
-          operation->error = cancelled.error;
-        }
+      BOOL connected = ConnectNamedPipe(operation->issuingHandle.value, &operation->overlap);
+      DWORD error = connected ? ERROR_SUCCESS : GetLastError();
+      operation->issued = true;
+      if (!connected && error != ERROR_IO_PENDING && error != ERROR_PIPE_CONNECTED) {
+        operation->complete = true;
+        operation->error = error;
         operation->poisoned = true;
-        if (listener_)
-          listener_->poisoned = true;
         runControlForget(operation);
-        throw NativeError{"run_control_accept_timeout", ERROR_OPERATION_ABORTED, "accept"};
+        // ERROR_NO_DATA: the offered instance saw its only client arrive and
+        // leave before this listen was issued. The instance is spent, never
+        // the listener: offer a fresh one and retry inside the same budget.
+        if (error == ERROR_NO_DATA) {
+          runControlOfferPending();
+          require(listener_ && !shutdown_ && (!retainIdleWait || !requestPumpStop_),
+                  "run_control_accept_timeout");
+          require(retainIdleWait || runControlRemaining(acceptDeadline) > 0,
+                  "run_control_accept_timeout");
+          continue;
+        }
+        throw NativeError{"run_control_accept_unknown", error, "accept"};
       }
-      lock.lock();
-      if (shutdown_ || operation->poisoned) {
+      if (!connected && error == ERROR_IO_PENDING) {
+        lock.unlock();
+        auto wait = runControlWaitOperation(*operation, timeout);
+        // The owner pump has no request deadline while waiting for a client.
+        // Keep the same held HANDLE and OVERLAPPED across idle observation ticks.
+        // Shutdown still enters the existing cancel-and-drain path within a tick;
+        // explicit low-level accept requests retain their bounded timeout.
+        while (!wait.completed && retainIdleWait && !requestPumpStop_ && !shutdown_)
+          wait = runControlWaitOperation(*operation, timeout);
+        if (!wait.completed) {
+          const auto cancelled = runControlCancelAndDrain(*operation);
+          lock.lock();
+          if (!operation->complete) {
+            if (!cancelled.completed) {
+              operation->unresolved = operation->poisoned = true;
+              if (listener_)
+                listener_->poisoned = true;
+              runControlForget(operation);
+              throw NativeError{"cleanup_unknown", ERROR_OPERATION_ABORTED, "accept"};
+            }
+            operation->complete = true;
+            operation->transferred = cancelled.transferred;
+            operation->error = cancelled.error;
+          }
+          operation->poisoned = true;
+          if (listener_)
+            listener_->poisoned = true;
+          runControlForget(operation);
+          throw NativeError{"run_control_accept_timeout", ERROR_OPERATION_ABORTED, "accept"};
+        }
+        lock.lock();
+        if (shutdown_ || operation->poisoned) {
+          runControlForget(operation);
+          throw NativeError{"run_control_accept_timeout", ERROR_OPERATION_ABORTED, "accept"};
+        }
+        operation->transferred = wait.transferred;
+        operation->error = wait.error;
+      }
+      // A completed listen carrying the same spent-instance report takes the
+      // identical replenish-and-retry path.
+      if (operation->error == ERROR_NO_DATA) {
+        operation->complete = true;
+        operation->poisoned = true;
         runControlForget(operation);
-        throw NativeError{"run_control_accept_timeout", ERROR_OPERATION_ABORTED, "accept"};
+        runControlOfferPending();
+        require(listener_ && !shutdown_ && (!retainIdleWait || !requestPumpStop_),
+                "run_control_accept_timeout");
+        require(retainIdleWait || runControlRemaining(acceptDeadline) > 0,
+                "run_control_accept_timeout");
+        continue;
       }
-      operation->transferred = wait.transferred;
-      operation->error = wait.error;
+      require(operation->error == ERROR_SUCCESS, "run_control_accept_unknown");
+      operation->complete = true;
+      Handle accepted = std::move(operation->issuingHandle);
+      runControlForget(operation);
+
+      // The accepted instance remains connected and owned by the registry; no
+      // DisconnectNamedPipe call destroys the accepted endpoint. Its fresh
+      // listening replacement is offered before any fallible connection work, so
+      // a refused handshake can never leave the listener without an instance.
+      if (phase) *phase = "accept_replenish";
+      runControlReapCompleted();
+      runControlOfferPending();
+
+      if (phase) *phase = "accept_authenticate";
+      auto connection = runControlMakeConnection(std::move(accepted), Role::server, timeout);
+      connection->endpoint = listener_->name;
+      runControlAuthenticate(*connection);
+      const auto id = connection->id;
+      registry_.emplace(id, std::move(connection));
+      JsonObject result;
+      num(result, L"id", id);
+      return result;
     }
-    require(operation->error == ERROR_SUCCESS, "run_control_accept_unknown");
-    operation->complete = true;
-    Handle accepted = std::move(operation->issuingHandle);
-    runControlForget(operation);
-
-    auto connection = runControlMakeConnection(std::move(accepted), Role::server, timeout);
-    connection->endpoint = listener_->name;
-    if (phase) *phase = "accept_authenticate";
-    runControlAuthenticate(*connection);
-    const auto id = connection->id;
-    registry_.emplace(id, std::move(connection));
-
-    // The accepted instance remains connected and owned by the registry. The
-    // listener is independently retained and immediately offers a fresh server
-    // instance; no DisconnectNamedPipe call destroys the accepted endpoint.
-    if (phase) *phase = "accept_replenish";
-    runControlReapCompleted();
-    listener_->pending = runControlCreateServer(listener_->name, false);
-    JsonObject result;
-    num(result, L"id", id);
-    return result;
   }
 
   JsonObject read(const JsonObject &input) {
@@ -547,8 +611,10 @@ struct WindowsNativeRunControl {
     Handle helper(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, helperPid));
     Handle bun(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, bunPid));
     require(helper && bun, "run_control_endpoint_changed");
-    const auto helperIdentity = runControlNativeIdentity(helper.value, helperPid);
-    const auto bunIdentity = runControlNativeIdentity(bun.value, bunPid);
+    const auto helperIdentity = runControlNativeIdentity(helper.value, helperPid,
+                                                         "process_alive_endpoint_helper");
+    const auto bunIdentity = runControlNativeIdentity(bun.value, bunPid,
+                                                      "process_alive_endpoint_bun");
     require(runControlCanonicalJson(helperIdentity) == runControlCanonicalJson(helperValue) &&
                 runControlCanonicalJson(bunIdentity) == runControlCanonicalJson(bunValue),
             "run_control_endpoint_changed");
@@ -578,14 +644,14 @@ struct WindowsNativeRunControl {
       originalWallDeadline = static_cast<std::uint64_t>(value);
     }
     const DWORD available = runControlRemaining(deadline);
-    require(available > 1, "run_deadline_expired");
+    require(available > 1, "run_control_client_budget_exhausted");
     const DWORD replyAllowance = std::min<DWORD>(100, std::max<DWORD>(1, available / 8));
     const DWORD cleanupAllowance = std::min<DWORD>(stop ? 1000 : CANCEL_DRAIN_MS, available / 4);
     const std::uint64_t cleanupDeadline = deadline - replyAllowance;
     const std::uint64_t ioDeadline = cleanupDeadline - cleanupAllowance;
     const auto remaining = [&] {
       const DWORD value = runControlRemaining(ioDeadline);
-      require(value > 0, "run_deadline_expired");
+      require(value > 0, "run_control_client_budget_exhausted");
       return value;
     };
     prepareExpectedEndpoint();
@@ -604,7 +670,7 @@ struct WindowsNativeRunControl {
         GetSystemTimeAsFileTime(&wallTime);
         const auto wallNow = filetime(wallTime) / 10000 - 11644473600000ULL;
         const DWORD activeRemaining = remaining();
-        require(activeRemaining > replyAllowance, "run_deadline_expired");
+        require(activeRemaining > replyAllowance, "run_control_client_budget_exhausted");
         // Only shrink the caller's original deadline, leaving the existing
         // response-flush margin inside the active read window. Sign it AFTER
         // endpoint/connect work consumed its portion of the same30s budget.
@@ -642,7 +708,8 @@ struct WindowsNativeRunControl {
   }
 
   JsonObject currentBunIdentity() const {
-    return runControlNativeIdentity(intendedBun_.value, GetProcessId(intendedBun_.value));
+    return runControlNativeIdentity(intendedBun_.value, GetProcessId(intendedBun_.value),
+                                    "process_alive_held_bun");
   }
 
   void respond(const JsonObject &input) {
@@ -677,11 +744,12 @@ struct WindowsNativeRunControl {
     require(runControlAlive(connection.peerParent.value) &&
                 runControlRequireFullToken(connection.peerParent.value),
             "run_control_peer_identity");
-    const ProcessPin parentBefore = runControlObserveProcess(connection.peerParent.value);
+    const ProcessPin parentBefore = runControlObserveProcess(connection.peerParent.value, "process_alive_peer_parent");
     const auto measured = runControlNativeIdentity(connection.peerParent.value,
-                                                   connection.peerParentPin.pid);
-    const ProcessPin parentAfter = runControlObserveProcess(connection.peerParent.value);
-    const ProcessPin peerAfter = runControlObserveProcess(connection.peerProcess.value);
+                                                   connection.peerParentPin.pid,
+                                                   "process_alive_peer_parent");
+    const ProcessPin parentAfter = runControlObserveProcess(connection.peerParent.value, "process_alive_peer_parent");
+    const ProcessPin peerAfter = runControlObserveProcess(connection.peerProcess.value, "process_alive_peer");
     require(runControlSameProcess(parentBefore, connection.peerParentPin) &&
                 runControlSameProcess(parentAfter, connection.peerParentPin) &&
                 runControlSameProcess(peerAfter, connection.peer) &&
@@ -694,7 +762,18 @@ struct WindowsNativeRunControl {
     std::shared_ptr<Connection> connection;
     {
       std::lock_guard<std::recursive_mutex> lock(controlMutex_);
-      connection = runControlConnectionFor(input);
+      require(input.HasKey(L"id") && input.GetNamedValue(L"id").ValueType() == JsonValueType::Number,
+              "run_control_foreign");
+      const double number = input.GetNamedNumber(L"id");
+      require(number > 0 && number == static_cast<std::uint64_t>(number), "run_control_foreign");
+      const auto found = registry_.find(static_cast<std::uint64_t>(number));
+      require(found != registry_.end(), "run_control_foreign");
+      // A read/write failure poisons the connection before it throws, so this
+      // retire step must tolerate an already-poisoned connection. The strict
+      // lookup refuses poisoned entries and both callers swallow that refusal,
+      // which would leave the corpse holding an accept slot until the listener
+      // waits forever for capacity.
+      connection = found->second;
       connection->poisoned = true;
     }
     (void)runControlRetire(*connection);
@@ -844,7 +923,7 @@ private:
     require(value.HasKey(key) && value.GetNamedValue(key).ValueType() == JsonValueType::Number,
             "run_control_timeout");
     const double raw = value.GetNamedNumber(key);
-    require(raw >= 1.0 && raw <= 30000.0 && raw == std::floor(raw) &&
+    require(raw >= 1.0 && raw <= 45000.0 && raw == std::floor(raw) &&
                 raw <= static_cast<double>(std::numeric_limits<DWORD>::max()),
             "run_control_timeout");
     return static_cast<DWORD>(raw);
@@ -877,6 +956,21 @@ private:
             "run_control_pipe_security");
     return descriptor;
   }
+  // A replenish refusal must never deny the endpoint its next listening
+  // instance: transient instance exhaustion is retried before the failure
+  // surfaces, and a create refusal never poisons the listener.
+  void runControlOfferPending() {
+    for (DWORD attempt = 0;; ++attempt) {
+      try {
+        listener_->pending = runControlCreateServer(listener_->name, false);
+        return;
+      } catch (const NativeError &failure) {
+        if (attempt >= 2 || failure.win32 != ERROR_PIPE_BUSY)
+          throw failure;
+        Sleep(10);
+      }
+    }
+  }
   Handle runControlCreateServer(const std::wstring &name, bool first) {
     if (packagePeerProcess_) runControlValidatePackagePeer();
     LocalMemory descriptor{runControlProtectedPipeDescriptor(ownerSid_, packageSid_)};
@@ -887,8 +981,9 @@ private:
     HANDLE raw = CreateNamedPipeW(name.c_str(), mode,
                                   PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT |
                                       PIPE_REJECT_REMOTE_CLIENTS,
-                                  static_cast<DWORD>(MAX_CONNECTIONS + 1), MAX_FRAME_BYTES,
-                                  MAX_FRAME_BYTES, 0, &attributes);
+                                  static_cast<DWORD>(MAX_CONNECTIONS + 2),
+                                  RUN_CONTROL_PIPE_BUFFER_BYTES, RUN_CONTROL_PIPE_BUFFER_BYTES,
+                                  0, &attributes);
     if (raw == INVALID_HANDLE_VALUE)
       throw NativeError{"run_control_listen_unknown", GetLastError(), "listen"};
     return Handle(raw);
@@ -1185,38 +1280,70 @@ private:
     const bool secondFull = runControlRequireFullToken(second);
     return firstFull && secondFull;
   }
+  // AV/defender scanning the same binary can fail a live image observation
+  // transiently. Only the observation itself is retried; process liveness and
+  // every pin comparison stay single-shot and definitive.
+  static constexpr int runControlObservationAttempts = 3;
+  static constexpr DWORD runControlObservationRetryDelayMs = 25;
+  static bool runControlTransientObservation(const NativeError &failure) {
+    const std::string stage = failure.stage ? failure.stage : "";
+    return failure.code == "run_control_process_identity" &&
+           (stage == "process_birth" || stage == "process_image_path" ||
+            stage == "process_image_open") &&
+           (failure.win32 == ERROR_GEN_FAILURE ||
+            failure.win32 == ERROR_SHARING_VIOLATION ||
+            failure.win32 == ERROR_LOCK_VIOLATION);
+  }
   static FILETIME runControlBirth(HANDLE process) {
-    FILETIME creation{}, exitTime{}, kernel{}, user{};
-    if (!GetProcessTimes(process, &creation, &exitTime, &kernel, &user)) {
+    for (int attempt = 0;; ++attempt) {
+      FILETIME creation{}, exitTime{}, kernel{}, user{};
+      if (GetProcessTimes(process, &creation, &exitTime, &kernel, &user))
+        return creation;
       const DWORD error = GetLastError();
-      throw NativeError{"run_control_process_identity", error, "process_birth"};
+      const NativeError failure{"run_control_process_identity", error, "process_birth"};
+      if (attempt + 1 >= runControlObservationAttempts ||
+          !runControlTransientObservation(failure))
+        throw failure;
+      Sleep(runControlObservationRetryDelayMs);
     }
-    return creation;
   }
   static bool runControlAlive(HANDLE process) {
     return WaitForSingleObject(process, 0) == WAIT_TIMEOUT;
   }
   static std::wstring runControlImagePath(HANDLE process) {
     std::vector<wchar_t> path(32768);
-    DWORD size = static_cast<DWORD>(path.size());
-    if (!QueryFullProcessImageNameW(process, 0, path.data(), &size)) {
+    for (int attempt = 0;; ++attempt) {
+      DWORD size = static_cast<DWORD>(path.size());
+      if (QueryFullProcessImageNameW(process, 0, path.data(), &size)) {
+        require(size > 0, "run_control_process_identity", "process_image_path");
+        return std::wstring(path.data(), size);
+      }
       const DWORD error = GetLastError();
-      throw NativeError{"run_control_process_identity", error, "process_image_path"};
+      const NativeError failure{"run_control_process_identity", error, "process_image_path"};
+      if (attempt + 1 >= runControlObservationAttempts ||
+          !runControlTransientObservation(failure))
+        throw failure;
+      Sleep(runControlObservationRetryDelayMs);
     }
-    require(size > 0, "run_control_process_identity", "process_image_path");
-    return std::wstring(path.data(), size);
   }
   static FilePin runControlProcessImagePin(HANDLE process) {
     const auto path = runControlImagePath(process);
     require(path.size() >= 3 && path[1] == L':' && path[2] == L'\\',
             "run_control_path_alias");
     const auto extended = L"\\\\?\\" + path;
-    Handle image(CreateFileW(extended.c_str(), GENERIC_READ,
-                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                            OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
-    if (!image) {
+    Handle image;
+    for (int attempt = 0;; ++attempt) {
+      image = Handle(CreateFileW(extended.c_str(), GENERIC_READ,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT,
+                                nullptr));
+      if (image) break;
       const DWORD error = GetLastError();
-      throw NativeError{"run_control_process_identity", error, "process_image_open"};
+      const NativeError failure{"run_control_process_identity", error, "process_image_open"};
+      if (attempt + 1 >= runControlObservationAttempts ||
+          !runControlTransientObservation(failure))
+        throw failure;
+      Sleep(runControlObservationRetryDelayMs);
     }
     auto pin = runControlObserveFile(image.value, false);
     pin.sha256 = runControlSha256(image.value);
@@ -1244,13 +1371,7 @@ private:
     require(status >= 0 && returned >= sizeof(information), "run_control_parent_join");
     return static_cast<std::uint64_t>(information.inheritedFromUniqueProcessId);
   }
-  static ProcessPin runControlObserveProcess(HANDLE process) {
-    const DWORD status = WaitForSingleObject(process, 0);
-    if (status != WAIT_TIMEOUT) {
-      const DWORD error = status == WAIT_FAILED ? GetLastError() : status;
-      throw NativeError{"run_control_process_identity", error,
-                        status == WAIT_FAILED ? "process_alive_wait" : "process_alive"};
-    }
+  static ProcessPin runControlPinProcess(HANDLE process) {
     const FILETIME first = runControlBirth(process);
     const FILETIME second = runControlBirth(process);
     require(runControlSameBirth(first, second), "run_control_process_identity", "process_birth_changed");
@@ -1261,8 +1382,17 @@ private:
     pin.image = runControlProcessImagePin(process);
     return pin;
   }
-  static JsonObject runControlNativeIdentity(HANDLE process, DWORD pid) {
-    const auto pin = runControlObserveProcess(process);
+  static ProcessPin runControlObserveProcess(HANDLE process,
+                                               const char *aliveStage = "process_alive") {
+    const DWORD status = WaitForSingleObject(process, 0);
+    if (status != WAIT_TIMEOUT) {
+      const DWORD error = status == WAIT_FAILED ? GetLastError() : status;
+      throw NativeError{"run_control_process_identity", error,
+                        status == WAIT_FAILED ? "process_alive_wait" : aliveStage};
+    }
+    return runControlPinProcess(process);
+  }
+  static JsonObject runControlIdentityJson(HANDLE process, DWORD pid, const ProcessPin &pin) {
     JsonObject value;
     num(value, L"pid", pid);
     JsonObject creation;
@@ -1278,6 +1408,39 @@ private:
         runControlSidString(const_cast<BYTE *>(pin.sid.data())));
     flag(value, L"appContainer", false);
     return value;
+  }
+  static JsonObject runControlNativeIdentity(HANDLE process, DWORD pid,
+                                             const char *aliveStage = "process_alive") {
+    return runControlIdentityJson(process, pid, runControlObserveProcess(process, aliveStage));
+  }
+  // Full identity without the liveness gate. The image measurement still
+  // needs the process to be observable, so owners that may already be retired
+  // belong to runControlHeldIdentityMatches below.
+  static JsonObject runControlHeldIdentity(HANDLE process, DWORD pid) {
+    return runControlIdentityJson(process, pid, runControlPinProcess(process));
+  }
+  // Endpoint owners may already be retired when this witness runs: the run
+  // state outlives them and ownerRetired observes their exit through exactly
+  // the handles this witness retains. While alive the full identity must
+  // equal the recorded measurement; once retired only the retirement witness
+  // form (pid + creation) remains observable and equally conclusive: a
+  // recycled PID or replaced object changes the birth and never passes.
+  static bool runControlHeldIdentityMatches(HANDLE process, DWORD pid,
+                                            std::uint64_t creation,
+                                            const JsonObject &record) {
+    if (WaitForSingleObject(process, 0) == WAIT_TIMEOUT) {
+      try {
+        return runControlCanonicalJson(runControlHeldIdentity(process, pid)) ==
+               runControlCanonicalJson(record);
+      } catch (const NativeError &) {
+        if (WaitForSingleObject(process, 0) == WAIT_OBJECT_0)
+          return GetProcessId(process) == pid &&
+                 filetime(runControlBirth(process)) == creation;
+        throw;
+      }
+    }
+    return GetProcessId(process) == pid &&
+           filetime(runControlBirth(process)) == creation;
   }
   static std::wstring runControlHashHex(const std::array<BYTE, 32> &hash) {
     static const wchar_t hex[] = L"0123456789abcdef";
@@ -1328,9 +1491,9 @@ private:
 
     const FILETIME parentBirthBefore = runControlBirth(intendedBun_.value);
     require(runControlAlive(intendedBun_.value), "run_control_parent_join");
-    const ProcessPin parentBefore = runControlObserveProcess(intendedBun_.value);
+    const ProcessPin parentBefore = runControlObserveProcess(intendedBun_.value, "process_alive_held_bun");
     const ProcessPin helper = runControlObserveProcess(GetCurrentProcess());
-    const ProcessPin parentAfter = runControlObserveProcess(intendedBun_.value);
+    const ProcessPin parentAfter = runControlObserveProcess(intendedBun_.value, "process_alive_held_bun");
     require(runControlParentPid(GetCurrentProcess()) == parentBefore.pid &&
                 runControlSameProcess(parentBefore, parentAfter) &&
                 runControlSameBirth(parentBirthBefore, parentAfter.birth),
@@ -1359,7 +1522,7 @@ private:
   }
   void runControlValidatePackagePeer() {
     const ProcessPin expectedPeer = held_.localRole == Role::server ? expected_.client : expected_.server;
-    const ProcessPin before = runControlObserveProcess(packagePeerProcess_.value);
+    const ProcessPin before = runControlObserveProcess(packagePeerProcess_.value, "process_alive_package_peer");
     require(runControlAlive(packagePeerProcess_.value) && runControlSameProcess(before, expectedPeer),
             "run_control_package_peer_identity");
     HANDLE raw = nullptr;
@@ -1393,7 +1556,7 @@ private:
     const auto actualString = runControlSidString(actual);
     require(actualString.rfind(L"S-1-15-2-", 0) == 0 && actualString != L"S-1-15-2-1",
             "run_control_package_peer_identity");
-    const ProcessPin after = runControlObserveProcess(packagePeerProcess_.value);
+    const ProcessPin after = runControlObserveProcess(packagePeerProcess_.value, "process_alive_package_peer");
     require(runControlSameProcess(before, after) && runControlSameProcess(after, expectedPeer),
             "run_control_package_peer_identity");
     if (!packageSid_.empty()) require(packageSid_ == actualString, "run_control_package_peer_identity");
@@ -1401,9 +1564,9 @@ private:
   }
   void runControlRevalidateHeld() {
     require(runControlAlive(intendedBun_.value), "run_control_parent_join");
-    const ProcessPin parentBefore = runControlObserveProcess(intendedBun_.value);
+    const ProcessPin parentBefore = runControlObserveProcess(intendedBun_.value, "process_alive_held_bun");
     const ProcessPin helper = runControlObserveProcess(GetCurrentProcess());
-    const ProcessPin parentAfter = runControlObserveProcess(intendedBun_.value);
+    const ProcessPin parentAfter = runControlObserveProcess(intendedBun_.value, "process_alive_held_bun");
     const ProcessPin expectedLocal =
         held_.localRole == Role::server ? expected_.server : expected_.client;
     require(runControlParentPid(GetCurrentProcess()) == parentBefore.pid &&
@@ -1434,7 +1597,7 @@ private:
       require(static_cast<bool>(peer), "run_control_peer_identity");
       connection.peerProcess = std::move(peer);
     }
-    const ProcessPin peerPin = runControlObserveProcess(connection.peerProcess.value);
+    const ProcessPin peerPin = runControlObserveProcess(connection.peerProcess.value, "process_alive_peer");
     const ProcessPin localPin = runControlObserveProcess(GetCurrentProcess());
     const auto peerParentPid = runControlParentPid(connection.peerProcess.value);
     require(peerParentPid > 0 && peerParentPid <= MAXDWORD, "run_control_parent_join");
@@ -1444,19 +1607,19 @@ private:
       require(static_cast<bool>(parent), "run_control_parent_join");
       connection.peerParent = std::move(parent);
     }
-    const ProcessPin peerParentBefore = runControlObserveProcess(connection.peerParent.value);
-    const ProcessPin peerAfter = runControlObserveProcess(connection.peerProcess.value);
+    const ProcessPin peerParentBefore = runControlObserveProcess(connection.peerParent.value, "process_alive_peer_parent");
+    const ProcessPin peerAfter = runControlObserveProcess(connection.peerProcess.value, "process_alive_peer");
     require(filetime(peerParentBefore.birth) < filetime(peerPin.birth) &&
                 runControlSameProcess(peerPin, peerAfter) &&
                 runControlSameProcess(peerParentBefore,
-                                      runControlObserveProcess(connection.peerParent.value)) &&
+                                      runControlObserveProcess(connection.peerParent.value, "process_alive_peer_parent")) &&
                 runControlSameSid(peerPin.sid, peerParentBefore.sid),
             "run_control_peer_identity");
     if (!fixedPeer_) {
       require(runControlRequireFreshFullTokens(connection.peerProcess.value,
                                                connection.peerParent.value),
               "run_control_peer_identity");
-      const ProcessPin localParent = runControlObserveProcess(intendedBun_.value);
+      const ProcessPin localParent = runControlObserveProcess(intendedBun_.value, "process_alive_held_bun");
       const ProcessPin expectedHelper =
           connection.side == Role::server ? expectedEndpoint_.helper : expectedEndpoint_.helper;
       const ProcessPin expectedBun =
@@ -1944,7 +2107,13 @@ inline void WindowsNativeRunControl::startRequestPump() {
         }
         if (requestPumpStop_ || shutdown_)
           break;
-        if (std::strcmp(failure.code.c_str(), "run_control_accept_timeout") != 0)
+        if (std::strcmp(failure.code.c_str(), "run_control_accept_timeout") == 0)
+          continue;
+        // Only a listener-scoped refusal ends the pump. A connection-scoped
+        // failure retires just its own connection while the listener keeps
+        // offering a fresh instance to the clients that follow.
+        if (std::strcmp(phase, "accept_wait") == 0 ||
+            std::strcmp(phase, "accept_replenish") == 0)
           break;
       } catch (...) {
         reportFailure("run_control_pump_unknown", 0);

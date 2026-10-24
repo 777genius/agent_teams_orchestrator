@@ -604,7 +604,8 @@ test('Windows gone relay leaves a live child without parent birth and retains th
   // The hardened sameBirth anchor check reads the root state before the relay's
   // missing identity is observed gone.
   expect(f.aliveReads).toEqual([900_010, 900_011])
-  expect(f.trees()).toBe(1)
+  // The bounded recapture window adds one fresh census before the refusal.
+  expect(f.trees()).toBe(2)
   expect(f.leafReads()).toBe(1)
   expect(f.removed()).toBe(0)
   expect(f.signalled).toEqual([])
@@ -633,4 +634,103 @@ test('parent identity diagnostic projection bounds ancestry and excludes unrecog
     },
   })
   expect(JSON.stringify(diagnostic)).not.toContain('PRIVATE')
+})
+
+// CI census captures can race the parents' identity reads: a parent birth comes
+// back null behind a transient gone probe, or a child birth read is stale and
+// precedes its parent. The parent_identity guard may then recapture a bounded
+// number of times with the parents inside the capture window before granting
+// any signal authority, and must still refuse an unconfirmed genealogy.
+function parentIdentityRaceFixture(mode: 'parent-resolves' | 'child-resolves' | 'parent-persists') {
+  Object.defineProperty(process, 'platform', { value: 'win32' })
+  const root = 900_030, relay = 900_031, leaf = 900_032
+  let clock = 1_000_000, removed = 0, trees = 0, closed = false
+  const reads = new Map<number, number>(), signalled: number[] = [], budgets: number[] = []
+  const child = new EventEmitter() as ChildProcess
+  Object.assign(child, { pid: root, stdout: new PassThrough() })
+  const rows = [{ pid: root, ppid: process.pid }, { pid: relay, ppid: root }, { pid: leaf, ppid: relay }]
+  const readOf = (target: number) => {
+    reads.set(target, (reads.get(target) ?? 0) + 1)
+    return reads.get(target)!
+  }
+  const date = spyOn(Date, 'now').mockImplementation(() => clock)
+  const launcher = spyOn(portable, 'resolveDirectWindowsLauncher').mockReturnValue({ command: '/TEST/native', argsPrefix: [] })
+  const spawn = spyOn(portable, 'spawnPortableCli').mockImplementation(() => {
+    queueMicrotask(() => child.stdout!.emit('data', Buffer.from('1.19.0\n')))
+    return child
+  })
+  const ports = spyOn(native, 'nativePorts').mockImplementation(() => ({
+    platform: 'win32', selfPid: process.pid, now: () => clock,
+    birth: async (target: number, budget: number) => {
+      budgets.push(budget); clock += 10
+      const attempt = readOf(target)
+      if (target === root) return 10
+      if (target === relay) {
+        // The parent identity read races the capture window: null behind a
+        // transient gone probe, or persistently unreadable in the bad mode.
+        if (mode === 'parent-persists') return null
+        if (mode === 'parent-resolves' && attempt === 1) return null
+        return 20
+      }
+      if (target === leaf) {
+        if (attempt === 1) {
+          child.emit('exit', 0); child.emit('close', 0); closed = true
+          // A stale first read can precede its captured parent's birth.
+          return mode === 'child-resolves' ? 5 : 30
+        }
+        return 30
+      }
+      return null
+    },
+    tree: async (budget: number) => { budgets.push(budget); trees++; return trees <= 3 ? rows : [] },
+    alive: (target: number) => (!closed && (target === root || (target === relay && mode === 'child-resolves'))
+      ? 'alive' : 'gone') as 'alive' | 'gone' | 'unknown',
+    signal: (target: number) => { signalled.push(target); throw new Error('TEST must not signal uncaptured candidate') },
+    taskkill: async () => { throw new Error('TEST must not kill uncaptured candidate') },
+    sleep: async (ms: number) => { clock += ms },
+  }))
+  restore.push(() => date.mockRestore(), () => launcher.mockRestore(), () => spawn.mockRestore(), () => ports.mockRestore())
+  const roots = { root: '/TEST/private', env: {}, remove: async () => { removed++ } } as OpenCodeV2ReadRoots
+  return { run: () => readOpenCodeOwnedVersion('/TEST/native', roots), removed: () => removed,
+    trees: () => trees, reads, signalled, budgets, root, relay, leaf }
+}
+
+test('Windows parent_identity capture race recovers through bounded recapture with parents in the window', async () => {
+  const f = parentIdentityRaceFixture('parent-resolves')
+  expect(await f.run()).toBe('1.19.0\n')
+  // One raced capture, one bounded recapture, one confirmation recheck.
+  expect(f.reads.get(f.relay)).toBe(3)
+  expect(f.reads.get(f.leaf)).toBe(3)
+  expect(f.trees()).toBeGreaterThanOrEqual(4)
+  expect(f.removed()).toBe(1)
+  expect(f.signalled).toEqual([])
+  expect(f.budgets.every(budget => budget > 0 && budget <= 5000)).toBe(true)
+})
+
+test('Windows child_before_parent capture race recovers through bounded recapture', async () => {
+  const f = parentIdentityRaceFixture('child-resolves')
+  expect(await f.run()).toBe('1.19.0\n')
+  expect(f.reads.get(f.leaf)).toBe(3)
+  expect(f.removed()).toBe(1)
+  expect(f.signalled).toEqual([])
+})
+
+test('Windows parent_identity race that never confirms stays unknown after bounded recapture', async () => {
+  const f = parentIdentityRaceFixture('parent-persists')
+  let failure: unknown
+  try { await f.run() } catch (error) { failure = error }
+  expect(failure).toBeInstanceOf(OpenCodeVersionProbeCleanupError)
+  expect((failure as OpenCodeVersionProbeCleanupError).terminalDiagnostic).toMatchObject({
+    phase: 'addition_identity', guard: 'parent_identity', birthsCount: 1,
+    parentIdentity: {
+      reason: 'missing_parent_birth', pid: 900_032, ppid: 900_031, parentPid: 900_031,
+      childBirth: 30, parentBirth: null, parentCandidate: true, anchorPid: 900_030, additionIndex: 1,
+    },
+  })
+  // The refusal is bounded: at most three captures with parents in the window.
+  expect(f.reads.get(f.relay)).toBe(3)
+  expect(f.trees()).toBe(3)
+  expect(f.removed()).toBe(0)
+  expect(f.signalled).toEqual([])
+  expect(f.budgets.every(budget => budget > 0 && budget <= 5000)).toBe(true)
 })

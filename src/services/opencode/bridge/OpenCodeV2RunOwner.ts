@@ -516,8 +516,8 @@ export class OpenCodeV2RunOwner {
   }
   private async performStop(deadline?: number): Promise<Extract<RunControlResult, { kind: 'stop' }>> {
     // The authenticated Windows cutoff already spent time in client/native
-    // preflight. First Stop owns it; neither delivery nor retries restart29s.
-    const cleanupDeadline = Math.min(Date.now() + 29_000,
+    // preflight. First Stop owns it; neither delivery nor retries restart 40s.
+    const cleanupDeadline = Math.min(Date.now() + 40_000,
       this.deferredWindowsControllers ? deadline ?? Infinity : Infinity)
     const remaining = (maximum: number) => Math.max(1, Math.min(maximum, cleanupDeadline - Date.now()))
     let durable = true
@@ -605,8 +605,8 @@ export class OpenCodeV2RunOwner {
       catch { errors.push('readers_unknown') }
       let cleanup: RunStopMember['cleanup'] = null
       const cleanupStartedAt = Date.now()
-      // The same 29s owner deadline funds physical close AND finalization.
-      // Windows may use up to27s, leaving one shared2s receipt-write reserve.
+      // The same 40s owner deadline funds physical close AND finalization.
+      // Windows may use up to 38s, leaving one shared 2s receipt-write reserve.
       const closeDeadline = this.deferredWindowsControllers
         ? Math.min(Date.now() + OPEN_CODE_V2_WINDOWS_CLOSE_MS, cleanupDeadline - 2000)
         : Date.now() + remaining(22_000)
@@ -630,7 +630,7 @@ export class OpenCodeV2RunOwner {
       results.length === this.plan.members.length && results.every(result => result.cleanup !== null && result.errors.length === 0) ? 'stopped' : 'cleanup_unknown'
     if (this.deferredWindowsControllers) {
       // Persist the final state before publishing a positive stop archive.
-      // Both writes consume the SAME remaining29s, never a new2s allowance.
+      // Both writes consume the SAME remaining 40s, never a new 2s allowance.
       try {
         await boundOpenCodeRead(this.persistState(), remaining(2000))
         executionAssert(Date.now() < cleanupDeadline, 'cleanup_unknown')

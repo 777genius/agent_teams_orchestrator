@@ -379,8 +379,9 @@ export async function planWindowsExecution(requested: Readonly<{
     assert(relative !== '' && (relative === '..' || relative.startsWith('..\\') || path.win32.isAbsolute(relative)), 'execution_containment_dll_identity')
   }
   // Machine-derived system directory, never a caller root: the selected shell
-  // and other system tools resolve under it, and the child realpath fallback
-  // authenticates them from this metadata anchor without any ACL change.
+  // and other system tools resolve under it. The child realpath fallback walks
+  // its chain like every anchor, so the chain takes the same target-only
+  // ancestor grants, while the root itself stays out of every root grant.
   const systemRoot = ['SystemRoot', 'SYSTEMROOT', 'WINDIR'].map(name => input.env[name])
     .find(value => typeof value === 'string' && /^[A-Za-z]:\\/.test(value)) ?? 'C:\\Windows'
   const metadataRoots = Object.freeze([path.win32.join(systemRoot, 'System32')])
@@ -526,6 +527,7 @@ export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, l
   // Command request IDs are replayed only while their operation is pending or
   // retained in a small settled window.
   let mapping: WindowsExecutionMapping | undefined, nativeMapping: unknown, stopped = false, started = false, closed = false
+  let closedFrameRejected = false
   // A refused relay frame means this contained member broke the protocol.
   const remoteController = controllerRelays.get(plan)
   const controllerRelay = remoteController && createWindowsControllerRelayServer(remoteController,
@@ -562,7 +564,15 @@ export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, l
         void commandRequest(record)
         return
       }
-      if (mapping && record.type === 'closed' && record.nonce === nonce && record.leaseOwnerId === leaseOwnerId && record.namespace === mapping.namespace.name && record.pid === mapping.bun.nativePID && equal(record.birth, mapping.bun.birth) && record.scopeClosed === true && record.realpathClosed === mapping.realpathDll.receiptId) closed = true
+      if (record.type === 'closed') {
+        if (mapping && record.nonce === nonce && record.leaseOwnerId === leaseOwnerId && record.namespace === mapping.namespace.name && record.pid === mapping.bun.nativePID && equal(record.birth, mapping.bun.birth) && record.scopeClosed === true && record.realpathClosed === mapping.realpathDll.receiptId) {
+          closed = true
+          // The child reships the ACK until this authenticated reply lands;
+          // its arrival is the only proof the frame crossed every hop.
+          void broker.request('send', { value: { type: 'closedAck', nonce, leaseOwnerId } }).catch(() => undefined)
+        }
+        else closedFrameRejected = true
+      }
       child.emit('message', value)
     } catch { child.emit('error', new Error('execution_invalid_response')) }
   })
@@ -654,8 +664,13 @@ export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, l
       await broker!.request('send', { value: { type: 'activate', nonce, leaseOwnerId, namespace: mapping.namespace.name,
         pid: mapping.bun.nativePID, birth: mapping.bun.birth } }, deadline, signal)
     },
-    sendClose() { assert(mapping); stopped = true; void http.close().then(() => broker!.request('send', { value: { type: 'close', nonce, leaseOwnerId } })).catch(() => child.emit('error', new Error('cleanup_unknown'))) },
+    // The owner's 10s exit wait runs from this frame's delivery; the transport drain must never delay it.
+    sendClose() { assert(mapping); stopped = true
+      const drain = http.close()
+      const delivered = broker!.request('send', { value: { type: 'close', nonce, leaseOwnerId } })
+      void Promise.all([delivered, drain]).catch(() => child.emit('error', new Error('cleanup_unknown'))) },
     acknowledged: () => closed,
+    closedObservation: () => closed ? 'accepted' as const : closedFrameRejected ? 'rejected' as const : 'absent' as const,
     readBirth() { assert(mapping && mainExit, 'execution_identity_mismatch'); return mainExit.readBirth() },
     async kill(deadline?: number) { stopped = true; try { await retireNative(deadline) } finally { controllerRelay?.disconnect() } },
     retire(deadline?: number): Promise<WindowsKernelRetirement | WindowsUnboundRetirement> {

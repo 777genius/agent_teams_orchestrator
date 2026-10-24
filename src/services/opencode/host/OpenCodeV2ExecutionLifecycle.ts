@@ -31,7 +31,7 @@ export function executionClosedAck(value: unknown, nonce: string, pid: number, b
 export async function retireExecutionChild(port: ExecutionRetirementPort, deadline?: number,
   observe?: (phase: ExecutionCleanupPhase) => void): Promise<ExecutionCleanupReceipt> {
   const mark = (phase: ExecutionCleanupPhase) => { try { observe?.(phase) } catch { /* Observation cannot alter cleanup. */ } }
-  // Windows Stop supplies a physical-close slice of its original 29s. Pass that SAME
+  // Windows Stop supplies a physical-close slice of its original 40s envelope. Pass that SAME
   // absolute deadline through every wait and the native RPC; never restart it.
   // Standalone and POSIX retirement retain their original adapter budgets.
   const closeDeadline = process.platform === 'win32' && Number.isSafeInteger(deadline)

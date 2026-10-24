@@ -1,4 +1,5 @@
 import { readWindowsNativeAliasFailure } from '../host/windows/OpenCodeV2WindowsNativeBroker.js'
+import { windowsRealpathInstallCauses } from '../host/windows/OpenCodeV2WindowsChildControl.js'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { types } from 'node:util'
@@ -70,7 +71,7 @@ function startupDiagnostic(output: string | undefined) {
       const closedFields: Record<string, readonly string[]> = {
         errno: ['EPERM', 'EACCES', 'ENOENT', 'ENOTDIR', 'EISDIR', 'EINVAL', 'UNKNOWN', 'EIO', 'ENOSYS'],
         operation: ['realpath', 'open', 'read', 'lstat', 'stat'], errorName: ['Error', 'TypeError', 'ReferenceError', 'RangeError', 'AbortError'],
-        cause: ['execution_contract_invalid', 'execution_identity_mismatch', 'execution_entry_changed', 'v2_compiled_runtime_unsupported', 'v2_execution_layout_unsupported', 'execution_profile_changed', 'execution_graph_changed', 'execution_graph_incomplete', 'execution_graph_dependency_missing', 'execution_containment_identity_mismatch', 'execution_timeout', 'execution_cancelled'],
+        cause: ['execution_contract_invalid', 'execution_identity_mismatch', 'execution_entry_changed', 'v2_compiled_runtime_unsupported', 'v2_execution_layout_unsupported', 'execution_profile_changed', 'execution_graph_changed', 'execution_graph_incomplete', 'execution_graph_dependency_missing', 'execution_containment_identity_mismatch', 'execution_realpath_unavailable', ...windowsRealpathInstallCauses, 'execution_timeout', 'execution_cancelled'],
         profileGuard: ['environment_hash', 'config_hash', 'home_mapping', 'path_containment', 'database_type', 'models_type', 'models_hash', 'process_cwd', 'process_pwd', 'process_environment'],
       }
       if (!row || Array.isArray(row)) continue
@@ -258,7 +259,19 @@ export function readExecutionNativeRootObservation(value: unknown, nonce?: strin
     return Object.freeze({ phase, role, index: Number(index), count: Number(count), elapsedMs: Number(elapsedMs) })
   } catch { return undefined }
 }
-export type ExecutionCleanupObservation = Readonly<{ phase: ExecutionCleanupPhase; nativePhase?: ExecutionNativeRetirementPhase
+// The MAIN exit class separates an ACK the child could not confirm (exit_one:
+// withheld by an uncertain identity, or a delivery whose owner reply never
+// landed) from a confirmed one (exit_zero carries the owner's authenticated
+// reply), and job_terminated covers every abnormal end. The closed-frame
+// observation names which side lost it: absent at the owner reader, or
+// rejected by its identity checks. No raw code or frame content ever leaves
+// the runner.
+export const executionCleanupExitClasses = ['exit_zero', 'exit_one', 'job_terminated'] as const
+export type ExecutionCleanupExitClass = typeof executionCleanupExitClasses[number]
+export const executionCleanupClosedFrames = ['accepted', 'rejected', 'absent'] as const
+export type ExecutionCleanupClosedFrame = typeof executionCleanupClosedFrames[number]
+export type ExecutionCleanupObservation = Readonly<{ phase: ExecutionCleanupPhase; exit?: ExecutionCleanupExitClass
+  closedFrame?: ExecutionCleanupClosedFrame; nativePhase?: ExecutionNativeRetirementPhase
   nativeRoot?: ExecutionNativeRootObservation }>
 const cleanupFailures = new WeakMap<Error, ExecutionCleanupPhase>()
 export function retainOpenCodeV2CleanupPhase(error: Error, phase: ExecutionCleanupPhase): void {
@@ -297,7 +310,10 @@ const privateProviderFailureCodes = new Set(['provider_missing', 'provider_key_m
   'provider_rollback_publication_changed', 'provider_rollback_unknown', 'provider_rollback_publication_unknown',
   'run_control_timeout', 'run_control_disconnected', 'run_control_changed', 'run_control_foreign', 'run_control_invalid',
   'run_control_frame_too_large', 'run_owner_stale', 'run_process_unknown', 'run_process_changed',
+  'run_control_client_budget_exhausted', 'run_control_connect_busy_timeout_expired',
+  'run_control_connect_idle_expired', 'run_control_connect_no_listener_expired',
   'run_deadline_expired', 'run_readiness_changed', 'run_readiness_unknown', 'run_operation_unknown',
+  'run_state_wall_deadline_expired',
   'run_acquisition_timeout', 'run_initialization_timeout', 'run_stopped', 'cancelled', 'run_controller_mcp_unknown', 'execution_http_transport_unknown',
   'execution_selected_auth_required', 'execution_selected_auth_unbound', 'execution_selected_auth_changed',
   'execution_selected_auth_missing', 'execution_selected_auth_unsupported', 'execution_selected_auth_location_changed',
@@ -329,6 +345,9 @@ const privateNativeFailureCodes = new Set([
 const privateNativeFailureStages = new Set([
   'alias_predicate',
   'assert_mapping', 'assert_stopped', 'assert_broker',
+  'process_alive', 'process_alive_wait',
+  'process_alive_held_bun', 'process_alive_package_peer', 'process_alive_peer', 'process_alive_peer_parent',
+  'process_alive_endpoint_helper', 'process_alive_endpoint_bun',
   'process_birth', 'process_image_path', 'process_image_open', 'process_birth_changed',
   'shared_acl_mutex_descriptor', 'shared_acl_mutex_create', 'shared_acl_mutex_security',
   'shared_acl_mutex_encoding', 'shared_acl_mutex_authority', 'shared_acl_mutex_wait', 'shared_acl_mutex',
@@ -391,9 +410,12 @@ export async function recordOpenCodeV2ProviderFailure(phase: string, error: unkn
   const nativePhase = cleanupPhase === observedPhase && (cleanupPhase === 'kernel-retirement' || cleanupPhase === 'force-kill')
     ? executionNativeRetirementPhases.find(value => value === observed?.nativePhase) : undefined
   const nativeRoot = nativePhase === 'retire_grants_roots' ? readExecutionNativeRootObservation(observed?.nativeRoot) : undefined
+  const exit = executionCleanupExitClasses.find(value => value === observed?.exit)
+  const closedFrame = executionCleanupClosedFrames.find(value => value === observed?.closedFrame)
   const cleanup = phase === 'run-member-retirement' && Number.isSafeInteger(cleanupTiming?.elapsedMs) &&
     Number(cleanupTiming?.elapsedMs) >= 0 && Number(cleanupTiming?.elapsedMs) <= 86_400_000
     ? { elapsedMs: Number(cleanupTiming?.elapsedMs), ...(cleanupPhase ? { phase: cleanupPhase } : {}),
+      ...(exit ? { exit } : {}), ...(closedFrame ? { closedFrame } : {}),
       ...(nativePhase ? { nativePhase } : {}), ...(nativeRoot ? { nativeRoot } : {}) } : undefined
   if (cleanupTiming?.dataRoot !== undefined && (!cleanup || typeof cleanupTiming.dataRoot !== 'string' || !path.isAbsolute(cleanupTiming.dataRoot))) return
   try {

@@ -11,6 +11,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <sddl.h>
 #include <string>
 #include <system_error>
@@ -25,6 +26,7 @@
 #include <winternl.h>
 using namespace winrt::Windows::Data::Json;
 static constexpr size_t CONTROL_PACKET_LIMIT = 16 * 1024 * 1024;
+static constexpr DWORD CONTROL_EXIT_READ_GRACE_MS = 2000;
 struct NativeError {
   std::string code;
   DWORD win32 = 0;
@@ -3346,18 +3348,31 @@ struct Scope {
     return info.ActiveProcesses;
   }
   bool exited() { return WaitForSingleObject(process.value, 0) == WAIT_OBJECT_0; }
-  bool completeIo(OVERLAPPED &overlap, DWORD &transferred, DWORD timeout) {
+  bool completeIo(OVERLAPPED &overlap, DWORD &transferred, DWORD timeout,
+                  bool readMayOutliveExit = false) {
     HANDLE events[] = {overlap.hEvent, cancel.value, process.value};
     DWORD waited = WaitForMultipleObjects(3, events, FALSE, timeout);
+    if (waited == WAIT_OBJECT_0 + 2 && readMayOutliveExit) {
+      // The closed ACK is the child's final frame and races this exit signal:
+      // the read must still deliver the bytes already queued behind it instead
+      // of cancelling away the tail of the stream.
+      HANDLE grace[] = {overlap.hEvent, cancel.value};
+      if (WaitForMultipleObjects(2, grace, FALSE, CONTROL_EXIT_READ_GRACE_MS) == WAIT_OBJECT_0)
+        waited = WAIT_OBJECT_0;
+    }
     if (waited == WAIT_OBJECT_0)
       return GetOverlappedResult(pipe.value, &overlap, &transferred, FALSE) != 0;
 
     // CancelIoEx requests cancellation; it does not establish completion. Keep
     // the OVERLAPPED, event and caller buffer alive until the kernel completes
-    // this exact operation, including the already-completed race.
+    // this exact operation, including the already-completed race, whose
+    // read result is delivered data and never waste to discard.
     CancelIoEx(pipe.value, &overlap);
-    DWORD ignored = 0;
-    GetOverlappedResult(pipe.value, &overlap, &ignored, TRUE);
+    DWORD completed = 0;
+    if (GetOverlappedResult(pipe.value, &overlap, &completed, TRUE) != 0 && completed > 0) {
+      transferred = completed;
+      return true;
+    }
     return false;
   }
   bool io(bool write, void *bytes, DWORD count, DWORD &transferred) {
@@ -3373,7 +3388,7 @@ struct Scope {
       return false;
     // Quiet sessions remain live. Writes are bounded; reads end on peer data,
     // explicit cancellation or the privately held main-process signal.
-    return completeIo(overlap, transferred, write ? 15000 : INFINITE);
+    return completeIo(overlap, transferred, write ? 15000 : INFINITE, !write);
   }
   void send(JsonObject value) {
     std::string bytes = narrow(std::wstring(value.Stringify())) + '\n';
@@ -3419,7 +3434,11 @@ struct Scope {
         for (size_t newline; (newline = buffer.find('\n')) != std::string::npos;) {
           auto packet = JsonObject::Parse(wide(buffer.substr(0, newline)));
           buffer.erase(0, newline + 1);
-          require(!exited() || text(packet, L"type") == L"closed", "execution_identity_mismatch");
+          // After MAIN exit only the closed ACK may still be relayed. A late
+          // non-closed frame is dropped without aborting the read loop, so a
+          // closed ACK queued behind it in the buffer still reaches the owner.
+          if (exited() && text(packet, L"type") != L"closed")
+            continue;
           event(L"message", packet);
         }
       }
@@ -4127,15 +4146,41 @@ static void grantRoot(Scope &scope, Handle heldRoot, DWORD mask, ACCESS_MODE mod
     require(mode != DENY_ACCESS || after.memberAllowed == before.memberAllowed, "execution_containment_filesystem_denied");
   }
 }
+// Cohort members retire identical shared roots concurrently. One common walk
+// order queues every member on the same per-root ACL mutex, and the last member
+// can then exhaust its retirement budget waiting at the final root. A stable
+// per-member rotation keeps simultaneous walks on different roots; each root's
+// custody still runs alone under its own mutex.
+static size_t rootRetirementRotation(const Scope &scope, size_t rootCount) {
+  if (rootCount < 2) return 0;
+  const std::wstring &seed = scope.cohort ? scope.cohort->selectionId : scope.launchNonce;
+  uint64_t hash = 14695981039346656037ULL;
+  for (wchar_t unit : seed) {
+    hash ^= static_cast<uint64_t>(unit);
+    hash *= 1099511628211ULL;
+  }
+  size_t ordinal = 0;
+  if (scope.cohort) {
+    size_t index = 0;
+    for (const auto &member : scope.cohort->members) {
+      if (member.launchNonce == scope.launchNonce) { ordinal = index; break; }
+      ++index;
+    }
+  }
+  return static_cast<size_t>((hash + ordinal) % rootCount);
+}
 static void removeGrants(Scope &scope, RetirementAclBudget *retirementBudget) {
   scope.retirementProgress("retire_grants_dll");
   if (scope.realpathDll && scope.realpathDll->granted && scope.physicalCleanupProof)
     scope.realpathDll->changeAce(REVOKE_ACCESS, retirementBudget);
   scope.retirementProgress("retire_grants_roots");
-  std::vector<RetainedAnchorComponent> retained;
   const size_t rootCount = scope.aclRoots.size();
+  const size_t rotation = rootRetirementRotation(scope, rootCount);
+  std::vector<std::optional<RetainedAnchorComponent>> retained(rootCount);
   size_t rootIndex = 0;
-  for (auto it = scope.aclRoots.rbegin(); it != scope.aclRoots.rend(); ++it) {
+  for (size_t step = 0; step < rootCount; ++step) {
+    const size_t originalIndex = rootCount - 1 - (step + rotation) % rootCount;
+    auto it = scope.aclRoots.begin() + static_cast<ptrdiff_t>(originalIndex);
     ++rootIndex;
     const auto rootStarted = GetTickCount64();
     const auto progress = [&](const char *phase) {
@@ -4150,61 +4195,69 @@ static void removeGrants(Scope &scope, RetirementAclBudget *retirementBudget) {
         it->cohortPolicy && privateCohortRoot(scope, *it);
     const bool shared = it->sharedRoot || privateGrant;
     if (shared && !scope.physicalCleanupProof) {
-      retained.insert(retained.begin(), std::move(*it));
+      retained[originalIndex].emplace(std::move(*it));
       continue;
     }
-    progress("root_mutex_wait");
-    SharedAclMutex aclMutex(physicalIdentity, retirementBudget);
-    progress("root_precheck");
+    // Identity and liveness are AV-hot path reopens and image reads; measuring
+    // them before the cross-process ACL lock keeps every queued member's wait
+    // free of them. The post-write re-measurement widens the window these facts
+    // must survive, so a recycled object can never pass.
     it->assertLive();
     require(anchorIdentity(handle).Stringify() == identity.Stringify(), "cleanup_unknown");
-    const auto heldIdentity = grantObjectIdentity(handle, owner, it->sharedRoot);
     const auto projectSids = privateGrant ? sealedProjectSids(scope, *it) : std::vector<std::wstring>();
     const auto cohortSids = !projectSids.empty() ? projectSids :
         privateGrant ? closedControllerCohortSids(*scope.cohort) : std::vector<std::wstring>();
     const auto *cohortSidsPtr = privateGrant ? &cohortSids : nullptr;
-    AclCustody before;
-    SharedReadAclCustody sharedBefore;
-    if (it->sharedRoot) {
-      sharedBefore = sharedReadAclCustody(handle, owner, scope.sid.value, "cleanup_unknown");
-      require(sharedBefore.ownerSid == it->sharedOwnerSid && sharedBefore.daclControl == it->sharedDaclControl, "cleanup_unknown");
-    } else before = projectSids.empty() ? aclCustody(handle, owner, scope.sid.value, cohortSidsPtr, "cleanup_unknown")
-        : projectAclCustody(handle, owner, scope.sid.value, projectSids, "cleanup_unknown");
-    PACL previous = nullptr;
-    PSECURITY_DESCRIPTOR descriptor = nullptr;
-    require(GetSecurityInfo(handle, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr,
-                            nullptr, &previous, nullptr, &descriptor) == ERROR_SUCCESS,
-            "cleanup_unknown");
-    LocalMemory original{descriptor};
-    EXPLICIT_ACCESSW entry{};
-    entry.grfAccessMode = REVOKE_ACCESS;
-    BuildTrusteeWithSidW(&entry.Trustee, scope.sid.value);
-    PACL next = nullptr;
-    require(SetEntriesInAclW(1, &entry, previous, &next) == ERROR_SUCCESS, "cleanup_unknown");
-    LocalMemory nextMemory{next};
-    progress("root_dacl_write");
-    require(SetSecurityInfo(handle, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr,
-                            nullptr, next, nullptr) == ERROR_SUCCESS,
-            "cleanup_unknown");
-    progress("root_postcheck");
-    it->assertLive();
-    require(anchorIdentity(handle).Stringify() == it->identity.Stringify(), "cleanup_unknown");
-    require(grantObjectIdentity(handle, owner, it->sharedRoot).Stringify() == heldIdentity.Stringify(),
-            "cleanup_unknown");
-    if (it->sharedRoot) {
-      const auto after = sharedReadAclCustody(handle, owner, scope.sid.value, "cleanup_unknown");
-      require(after.ownerSid == sharedBefore.ownerSid &&
-                sharedReadControlAfterOwnWrite(sharedBefore.daclControl, after.daclControl) &&
-                after.foreignAces == sharedBefore.foreignAces && !after.memberAllowed,
-              "cleanup_unknown");
-    } else {
-      const auto after = projectSids.empty() ? aclCustody(handle, owner, scope.sid.value, cohortSidsPtr, "cleanup_unknown")
+    progress("root_mutex_wait");
+    {
+      SharedAclMutex aclMutex(physicalIdentity, retirementBudget);
+      progress("root_precheck");
+      AclCustody before;
+      SharedReadAclCustody sharedBefore;
+      if (it->sharedRoot) {
+        sharedBefore = sharedReadAclCustody(handle, owner, scope.sid.value, "cleanup_unknown");
+        require(sharedBefore.ownerSid == it->sharedOwnerSid && sharedBefore.daclControl == it->sharedDaclControl, "cleanup_unknown");
+      } else before = projectSids.empty() ? aclCustody(handle, owner, scope.sid.value, cohortSidsPtr, "cleanup_unknown")
           : projectAclCustody(handle, owner, scope.sid.value, projectSids, "cleanup_unknown");
-      require(after.siblings == before.siblings && !after.memberAllowed, "cleanup_unknown");
+      PACL previous = nullptr;
+      PSECURITY_DESCRIPTOR descriptor = nullptr;
+      require(GetSecurityInfo(handle, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr,
+                              nullptr, &previous, nullptr, &descriptor) == ERROR_SUCCESS,
+              "cleanup_unknown");
+      LocalMemory original{descriptor};
+      EXPLICIT_ACCESSW entry{};
+      entry.grfAccessMode = REVOKE_ACCESS;
+      BuildTrusteeWithSidW(&entry.Trustee, scope.sid.value);
+      PACL next = nullptr;
+      require(SetEntriesInAclW(1, &entry, previous, &next) == ERROR_SUCCESS, "cleanup_unknown");
+      LocalMemory nextMemory{next};
+      progress("root_dacl_write");
+      require(SetSecurityInfo(handle, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr,
+                              nullptr, next, nullptr) == ERROR_SUCCESS,
+              "cleanup_unknown");
+      progress("root_postcheck");
+      if (it->sharedRoot) {
+        const auto after = sharedReadAclCustody(handle, owner, scope.sid.value, "cleanup_unknown");
+        require(after.ownerSid == sharedBefore.ownerSid &&
+                  sharedReadControlAfterOwnWrite(sharedBefore.daclControl, after.daclControl) &&
+                  after.foreignAces == sharedBefore.foreignAces && !after.memberAllowed,
+                "cleanup_unknown");
+      } else {
+        const auto after = projectSids.empty() ? aclCustody(handle, owner, scope.sid.value, cohortSidsPtr, "cleanup_unknown")
+            : projectAclCustody(handle, owner, scope.sid.value, projectSids, "cleanup_unknown");
+        require(after.siblings == before.siblings && !after.memberAllowed, "cleanup_unknown");
+      }
     }
+    it->assertLive();
+    require(anchorIdentity(handle).Stringify() == identity.Stringify(), "cleanup_unknown");
+    require(grantObjectIdentity(handle, owner, it->sharedRoot).Stringify() == physicalIdentity.Stringify(),
+            "cleanup_unknown");
     progress("root_complete");
   }
-  scope.aclRoots = std::move(retained);
+  std::vector<RetainedAnchorComponent> kept;
+  kept.reserve(rootCount);
+  for (auto &entry : retained) if (entry) kept.push_back(std::move(*entry));
+  scope.aclRoots = std::move(kept);
   if (scope.physicalCleanupProof || scope.metadataNoChildCleanupProof) {
     scope.retirementProgress("retire_grants_metadata");
     assertAncestorMetadataPinsLive(scope);
@@ -4780,10 +4833,19 @@ public:
     Handle parent(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE,
                               static_cast<DWORD>(parentPid)));
     require(static_cast<bool>(parent), "run_control_parent_join");
-    Handle executable(CreateFileW(extended(image(GetCurrentProcess())).c_str(), GENERIC_READ | READ_CONTROL,
-                                 FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                                 FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
-    require(static_cast<bool>(executable), "run_control_process_identity");
+    Handle executable;
+    for (int attempt = 0;; ++attempt) {
+      executable = Handle(CreateFileW(extended(image(GetCurrentProcess())).c_str(),
+                                     GENERIC_READ | READ_CONTROL, FILE_SHARE_READ, nullptr,
+                                     OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+      if (executable) break;
+      const DWORD error = GetLastError();
+      const NativeError failure{"run_control_process_identity", error, "process_image_open"};
+      if (attempt + 1 >= Control::runControlObservationAttempts ||
+          !Control::runControlTransientObservation(failure))
+        throw failure;
+      Sleep(Control::runControlObservationRetryDelayMs);
+    }
     Control::HeldInputs held;
     held.selectedDirectory = config.root.value;
     held.config = config.config.value;
@@ -4898,8 +4960,10 @@ public:
     Handle heldHelper(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, helperPid));
     Handle heldBun(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, bunPid));
     require(heldHelper && heldBun &&
-                runControlCanonicalJson(Control::runControlNativeIdentity(heldHelper.value, helperPid)) == runControlCanonicalJson(helper) &&
-                runControlCanonicalJson(Control::runControlNativeIdentity(heldBun.value, bunPid)) == runControlCanonicalJson(bun),
+                Control::runControlHeldIdentityMatches(heldHelper.value, helperPid,
+                    State::runStateProcessBirthLocked(helper, "run_control_endpoint_changed"), helper) &&
+                Control::runControlHeldIdentityMatches(heldBun.value, bunPid,
+                    State::runStateProcessBirthLocked(bun, "run_control_endpoint_changed"), bun),
             "run_control_endpoint_changed");
     std::lock_guard<std::mutex> lock(state.mutex_);
     State::runStateAssertRetirementWitnessLocked(heldHelper.value, state.helperPid_, state.helperBirth_, "run_control_endpoint_changed");
@@ -5432,7 +5496,7 @@ public:
       FILETIME wallTime{};
       GetSystemTimeAsFileTime(&wallTime);
       const std::uint64_t nowMs = filetime(wallTime) / 10000 - 11644473600000ULL;
-      require(static_cast<std::uint64_t>(wallDeadline) > nowMs, "run_deadline_expired");
+      require(static_cast<std::uint64_t>(wallDeadline) > nowMs, "run_state_wall_deadline_expired");
       // Queue and stdio transit already consumed the caller's original budget.
       const std::uint64_t remaining = std::min<std::uint64_t>(
           Control::runControlTimeoutMs(input, L"timeoutMs"),
@@ -5863,7 +5927,7 @@ int wmain(int argc, wchar_t **argv) {
             const double timeoutMs = input.GetNamedNumber(L"timeoutMs");
             require(wallDeadline > 0 && wallDeadline <= 9007199254740991.0 &&
                         wallDeadline == static_cast<double>(static_cast<std::uint64_t>(wallDeadline)) &&
-                        timeoutMs >= 0 && timeoutMs <= 27000 &&
+                        timeoutMs >= 0 && timeoutMs <= 38000 &&
                         timeoutMs == static_cast<double>(static_cast<std::uint64_t>(timeoutMs)), "cleanup_unknown");
             FILETIME wallTime{};
             GetSystemTimeAsFileTime(&wallTime);

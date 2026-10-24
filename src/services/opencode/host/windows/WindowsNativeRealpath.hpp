@@ -43,6 +43,9 @@ struct AnchorV1 {
 struct ErrorV1 {
   uint32_t operation;
   uint32_t win32;
+  // Failing admission position, or 0xffffffff when the refusal is not tied to
+  // one anchor. The child projects only its closed kind through startup.
+  uint32_t anchorIndex;
 };
 
 enum Status : int32_t {
@@ -91,10 +94,13 @@ constexpr uint32_t kMaxHeldHandles = 16384;
 constexpr uint32_t kMaxContexts = 4096;
 constexpr DWORD kFixedQueryCapacity = 32768;
 
+constexpr uint32_t kNoAnchorIndex = 0xffffffffu;
+
 struct Failure {
   Status status = NATIVE_FAILURE;
   Operation operation = OperationNone;
   DWORD win32 = ERROR_SUCCESS;
+  uint32_t anchorIndex = kNoAnchorIndex;
 };
 
 struct Identity {
@@ -177,6 +183,7 @@ inline void clearError(ErrorV1* error) noexcept {
   if (error != nullptr) {
     error->operation = OperationNone;
     error->win32 = ERROR_SUCCESS;
+    error->anchorIndex = kNoAnchorIndex;
   }
 }
 
@@ -184,6 +191,7 @@ inline void setError(ErrorV1* error, const Failure& failure) noexcept {
   if (error != nullptr) {
     error->operation = failure.operation;
     error->win32 = failure.win32;
+    error->anchorIndex = failure.anchorIndex;
   }
 }
 
@@ -391,6 +399,18 @@ inline bool ntPrefixContains(std::wstring_view value, std::wstring_view prefix) 
 inline std::wstring_view lastNtComponent(std::wstring_view path) noexcept {
   const size_t slash = path.find_last_of(L'\\');
   return slash == std::wstring_view::npos ? path : path.substr(slash + 1);
+}
+
+// Machine-derived system directory: never a caller root. Its chain names are
+// opened leaf-first below, because the confined child can be denied outright on
+// the drive root or the intermediate directory while the final object still
+// passes every per-object check.
+inline bool machineChainPath(std::wstring_view full) {
+  wchar_t system[32768];
+  const UINT size = GetSystemDirectoryW(system, 32768);
+  if (size == 0 || size >= 32768)
+    return false;
+  return ntPrefixContains(full, std::wstring_view(system, size));
 }
 
 inline bool tailMatchesDos(std::wstring_view dosPath, std::wstring_view ntPath) {
@@ -637,6 +657,23 @@ inline bool openCheckedPath(std::wstring_view path, bool finalDirectory, DWORD f
   if (GetDriveTypeW(root.c_str()) != DRIVE_FIXED)
     return failureOut = denied(openStage), false;
 
+  // The machine chain admits its final object in one parse (bypass-traverse on
+  // the intermediates) with the identical per-object checks; caller roots keep
+  // the held component chain.
+  if (machineChainPath(full)) {
+    const std::wstring kernelPath = L"\\\\?\\" + full;
+    HANDLE raw = CreateFileW(kernelPath.c_str(), FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                             finalShare, nullptr, OPEN_EXISTING,
+                             FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                             nullptr);
+    if (raw == INVALID_HANDLE_VALUE) {
+      const DWORD code = GetLastError();
+      return failureOut = failure(REJECTED, openStage, code), false;
+    }
+    return admitOpenedObject(Handle(raw), finalDirectory, lastNtComponent(full),
+                             openStage, componentStage, opened, failureOut);
+  }
+
   const std::vector<std::wstring> parts = splitDos(full);
   const size_t objectCount = parts.size() + 1;
   if (objectCount > kMaxHeldHandles ||
@@ -794,16 +831,22 @@ inline int32_t openImpl(uint32_t expectedPid, uint64_t expectedCreationFiletime,
   size_t projectedHandles = 0;
 
   for (uint32_t index = 0; index < anchorCount; ++index) {
+    // Every anchor-scoped refusal keeps its admission position so the child can
+    // name the closed anchor kind without ever leaving a raw path.
+    const auto anchored = [&](Failure value) noexcept {
+      value.anchorIndex = index;
+      return finishFailure(value, outError);
+    };
     const AnchorV1& source = anchors[index];
     if (source.dosPath == nullptr || source.ntPath == nullptr ||
         source.dosChars == 0 || source.dosChars > kMaxStringChars ||
         source.ntChars == 0 || source.ntChars > kMaxStringChars)
-      return finishFailure(invalid(OperationOpenArguments), outError);
+      return anchored(invalid(OperationOpenArguments));
     if (std::wstring_view(source.dosPath, source.dosChars).find(L'\0') !=
             std::wstring_view::npos ||
         std::wstring_view(source.ntPath, source.ntChars).find(L'\0') !=
             std::wstring_view::npos)
-      return finishFailure(invalid(OperationOpenArguments), outError);
+      return anchored(invalid(OperationOpenArguments));
 
     HeldAnchor anchor;
     anchor.dosPath.assign(source.dosPath, source.dosChars);
@@ -813,32 +856,31 @@ inline int32_t openImpl(uint32_t expectedPid, uint64_t expectedCreationFiletime,
     if (!validateDosComponents(anchor.dosPath, true) ||
         !validateNtPath(anchor.ntPath) ||
         !tailMatchesDos(anchor.dosPath, anchor.ntPath))
-      return finishFailure(invalid(OperationOpenArguments), outError);
+      return anchored(invalid(OperationOpenArguments));
     if (GetDriveTypeW(driveRoot(anchor.dosPath).c_str()) != DRIVE_FIXED)
-      return finishFailure(denied(OperationOpenArguments), outError);
+      return anchored(denied(OperationOpenArguments));
 
     OpenedPath opened;
     if (!openCheckedPath(anchor.dosPath, true, FILE_SHARE_READ | FILE_SHARE_WRITE,
                          OperationOpenAnchor, OperationOpenAnchorComponent,
                          opened, failureOut))
-      return finishFailure(failureOut, outError);
+      return anchored(failureOut);
     projectedHandles += opened.handles.size();
     if (projectedHandles > kMaxHeldHandles)
-      return finishFailure(invalid(OperationOpenArguments), outError);
+      return anchored(invalid(OperationOpenArguments));
     const Identity& observed = opened.object();
     if (observed.volumeSerial != anchor.volumeSerial ||
         !sameFileId(observed.fileId, anchor.fileId) ||
         !equalOrdinal(observed.ntPath, anchor.ntPath, false))
-      return finishFailure(failure(REJECTED, OperationOpenAnchorIdentity, ERROR_ACCESS_DENIED),
-                           outError);
+      return anchored(failure(REJECTED, OperationOpenAnchorIdentity, ERROR_ACCESS_DENIED));
     if (!optionalCanonicalDosMatches(opened.handles.back().get(), anchor.dosPath,
                                      failureOut, OperationOpenAnchorIdentity))
-      return finishFailure(failureOut, outError);
+      return anchored(failureOut);
 
     for (const HeldAnchor& existing : context->anchors)
       if (existing.volumeSerial == anchor.volumeSerial &&
           sameFileId(existing.fileId, anchor.fileId))
-        return finishFailure(denied(OperationOpenAnchorIdentity), outError);
+        return anchored(denied(OperationOpenAnchorIdentity));
     anchor.identities = std::move(opened.identities);
     anchor.handles = std::move(opened.handles);
     context->anchors.emplace_back(std::move(anchor));
@@ -1241,10 +1283,11 @@ static_assert(offsetof(AnchorV1, ntPath) == 16, "AnchorV1 ntPath offset changed"
 static_assert(offsetof(AnchorV1, ntChars) == 24, "AnchorV1 ntChars offset changed");
 static_assert(offsetof(AnchorV1, volumeSerial) == 32, "AnchorV1 volumeSerial offset changed");
 static_assert(offsetof(AnchorV1, fileId) == 40, "AnchorV1 fileId offset changed");
-static_assert(sizeof(ErrorV1) == 8, "ErrorV1 ABI layout changed");
+static_assert(sizeof(ErrorV1) == 12, "ErrorV1 ABI layout changed");
 static_assert(alignof(ErrorV1) == 4, "ErrorV1 ABI alignment changed");
 static_assert(offsetof(ErrorV1, operation) == 0, "ErrorV1 operation offset changed");
 static_assert(offsetof(ErrorV1, win32) == 4, "ErrorV1 win32 offset changed");
+static_assert(offsetof(ErrorV1, anchorIndex) == 8, "ErrorV1 anchorIndex offset changed");
 #endif
 
 }  // namespace opencode_v2::windows_realpath

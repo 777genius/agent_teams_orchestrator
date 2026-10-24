@@ -1,7 +1,7 @@
 import { openCodeV2ServerLoopbackUrl } from '../services/opencode/host/OpenCodeV2ServerAddress.js'
 import { readExecutionGraphFailure } from '../services/opencode/host/OpenCodeV2ExecutionBinding.js'
 import { openCodeBunVersion } from '../constants/openCodeBunVersion.js'
-import { windowsExecutionChildControl, windowsGraphActivation } from '../services/opencode/host/windows/OpenCodeV2WindowsChildControl.js'
+import { confirmWindowsClosedAck, windowsExecutionChildControl, windowsGraphActivation, windowsRealpathInstallCauses } from '../services/opencode/host/windows/OpenCodeV2WindowsChildControl.js'
 import { prepareExecutionPlatformChild, readExecutionPlatformBirth } from '../services/opencode/host/OpenCodeV2ExecutionPlatform.js'
 import { pathToFileURL } from 'node:url'
 import { resolveOpenCodeV2ExecutionDelivery } from '../services/opencode/host/OpenCodeV2ExecutionDelivery.js'
@@ -10,6 +10,7 @@ import { executionAssert, executionHash, executionRecord, openCodeV2RunInitializ
 import { assertExecutionProfile, executionProfileGuards, validateExecutionGraph, validateExecutionNative, validateExecutionProfile,
   type ExecutionGraphProgress, type OwnedNativeProfile, type ValidatedExecutionNative } from '../services/opencode/host/OpenCodeV2ExecutionBinding.js'
 import { boundOpenCodeRead } from '../services/opencode/transport/OpenCodeBoundedFetch.js'
+import { openCodeV2ExecutionCloseAckReserveMs, runOpenCodeV2ExecutionCloseSequence } from '../services/opencode/execution/OpenCodeV2ExecutionClose.js'
 import { importOpenCodeV2SelectedOAuth } from '../services/opencode/host/OpenCodeV2ExecutionOAuth.js'
 import type { ServerOptions as FloorOptions } from '@opencode/server-v2-floor/options'
 import type { ServerOptions as CurrentOptions } from '@opencode/server/options'
@@ -26,6 +27,7 @@ const childControl = process.platform === 'win32' ? windowsExecutionChildControl
     process.send!(value, error => error ? reject(error) : resolve())
   }),
   disconnect: () => process.disconnect?.(),
+  settled: async () => { /* IPC delivery is settled by its own send callback. */ },
 }
 const controller = new AbortController()
 let prepared: Awaited<ReturnType<typeof prepareExecutionPlatformChild>> | undefined
@@ -51,7 +53,8 @@ function reportStartupFailure(reason: 'timeout' | 'failed', error?: unknown): vo
   const causes = ['execution_contract_invalid', 'execution_identity_mismatch', 'execution_entry_changed',
     'v2_compiled_runtime_unsupported', 'v2_execution_layout_unsupported', 'execution_profile_changed',
     'execution_graph_changed', 'execution_graph_incomplete', 'execution_graph_dependency_missing',
-    'execution_containment_identity_mismatch', 'execution_timeout', 'execution_cancelled']
+    'execution_containment_identity_mismatch', 'execution_realpath_unavailable', ...windowsRealpathInstallCauses,
+    'execution_timeout', 'execution_cancelled']
   const cause = error instanceof Error && causes.includes(error.message) ? error.message : undefined
   const detail = error instanceof Error ? error as Error & { code?: unknown; syscall?: unknown; profileGuard?: unknown } : undefined
   const errno = ['EPERM', 'EACCES', 'ENOENT', 'ENOTDIR', 'EISDIR', 'EINVAL', 'UNKNOWN', 'EIO', 'ENOSYS'].find(value => value === detail?.code)
@@ -71,18 +74,25 @@ function close(): Promise<void> {
   return closeWork ??= (async () => {
     if (!runtimeReady) reportStartupFailure('failed')
     closing = true; controller.abort(); clearTimeout(startupTimer)
-    let complete = true
-    // Acquisition may register a Scope after a suspended import. A timeout cannot earn ACK.
-    try { if (startup) await boundOpenCodeRead(startup.catch(() => undefined), 6000) } catch { complete = false }
-    try { if (finalize) await boundOpenCodeRead(finalize(), 3000) } catch { complete = false }
-    try {
-      const birth = await readExecutionPlatformBirth(process.pid)
-      executionAssert(complete && birth && nonce && childControl.connected(), 'cleanup_unknown')
-      await boundOpenCodeRead(childControl.send({ type: 'closed', nonce, leaseOwnerId: prepared?.leaseOwnerId,
-        namespace: prepared?.namespace, executableSha256: prepared?.executableSha256, pid: process.pid,
-        birth, scopeClosed: true }), 500)
-      childControl.disconnect(); process.exit(0)
-    } catch { process.exit(1) }
+    const acknowledged = await runOpenCodeV2ExecutionCloseSequence({
+      startup, finalize,
+      acknowledge: async () => {
+        const birth = await readExecutionPlatformBirth(process.pid)
+        executionAssert(birth && nonce && childControl.connected(), 'cleanup_unknown')
+        const frame = { type: 'closed', nonce, leaseOwnerId: prepared?.leaseOwnerId,
+          namespace: prepared?.namespace, executableSha256: prepared?.executableSha256, pid: process.pid,
+          birth, scopeClosed: true }
+        // The Windows write callback can resolve before the bytes reach the
+        // pipe and this process exits right after, so delivery is proven by
+        // the owner's reply and the frame reships until it lands. POSIX IPC
+        // send callbacks are honest and no POSIX owner replies.
+        if (process.platform === 'win32') await confirmWindowsClosedAck(childControl, frame, Date.now() + openCodeV2ExecutionCloseAckReserveMs)
+        else await childControl.send(frame, Date.now() + openCodeV2ExecutionCloseAckReserveMs)
+      },
+    })
+    // The closed ACK must reach the pipe before this process dies: exit aborts
+    // any write the transport has not yet flushed.
+    if (acknowledged) { childControl.disconnect(); await childControl.settled(); process.exit(0) } else process.exit(1)
   })()
 }
 childControl.events.on('error', (error: unknown) => { reportStartupFailure('failed', error); void close() })
@@ -229,7 +239,7 @@ childControl.events.on('message', (message: unknown) => {
   try {
     const input = executionRecord(message)
     executionAssert(typeof input.nonce === 'string' && /^[a-f0-9-]{36}$/.test(input.nonce))
-    if (process.platform === 'win32' && (input.type === 'windowsHTTP' || input.type === 'windowsControllerHTTP' || input.type === 'commandResult')) return
+    if (process.platform === 'win32' && (input.type === 'windowsHTTP' || input.type === 'windowsControllerHTTP' || input.type === 'commandResult' || input.type === 'closedAck')) return
     if (input.type === 'prepare') {
       executionAssert(!preparation && !started && !closing)
       executionAssert(typeof input.leaseOwnerId === 'string')

@@ -8,7 +8,7 @@ import { canonicalExecutionJSON, executionAssert, executionHash, executionRecord
 import type { QueueIntent } from '../execution/OpenCodeV2AdmissionService.js'
 import type { ExecutionMention } from '../transport/OpenCodeV2ExecutionClientFactory.js'
 import type { RunAnyProcessIdentity, RunBinding, RunControlRecord, RunControlRequest, RunControlResult, RunMemberStatus, RunProcessIdentity, RunStopMember, RunUnixControlRecord, RunWindowsControlRecord } from './OpenCodeV2RunTypes.js'
-import type { SelectedExecutionProfile } from '../host/OpenCodeV2ExecutionBinding.js'
+import type { ExecutionBirth, SelectedExecutionProfile } from '../host/OpenCodeV2ExecutionBinding.js'
 import { OpenCodeV2RunNonces } from './OpenCodeV2RunNonces.js'
 import { CONTROLLER_INBOX_MAX_BYTES, retainedControllerPath, selectedControllerInboxRoot,
   type ControllerInboxBinding, type ControllerToolProof } from './OpenCodeV2ControllerTools.js'
@@ -17,10 +17,16 @@ import { ensureWindowsPrivateDirectories } from '../profile/OpenCodePrivateDirec
 import type { WindowsLaunchPlan } from '../host/windows/OpenCodeV2WindowsExecution.js'
 export type { RunBinding, RunControlRecord, RunControlRequest, RunControlResult, RunLaunchPlan } from './OpenCodeV2RunTypes.js'
 
-const MAX_FRAME = 512 * 1024
-// Graph preparation and native startup share one absolute budget. Individual control operations remain capped at 30s.
+const MAX_RECORD = 512 * 1024
+// Frames carry full control replies and share the broker packet budget.
+const MAX_FRAME = 16 * 1024 * 1024
+// Graph preparation and native startup share one absolute budget. Individual
+// control operations remain capped at 30s; cleanup stop/status extend to 45s.
 export const OPEN_CODE_V2_RUN_INITIALIZATION_MS = openCodeV2RunInitializationMs(process.platform)
 const MAX_OPERATION_MS = 30_000
+const MAX_STOP_OPERATION_MS = 45_000
+// A lost stop reply is confirmed once from the durable archive within this window.
+const STOP_RECONCILE_MS = 10_000
 const digest = (bytes: string | Buffer) => createHash('sha256').update(bytes).digest('hex')
 type WindowsServingAdmission = Readonly<{ record: RunWindowsControlRecord; profiles: readonly WindowsProfileAdmission[] }>
 type WindowsRunComposition = { readonly broker: WindowsNativeBroker; readonly stateId: string; serving?: WindowsServingAdmission }
@@ -469,11 +475,12 @@ function parseWindowsEndpointProof(value: unknown, record: RunWindowsControlReco
     executionHash(parseWindowsIdentity(row.helper)) === executionHash(record.endpoint.helper) &&
     executionHash(parseWindowsIdentity(row.bun)) === executionHash(record.endpoint.bun), 'run_control_endpoint_changed')
 }
-function sameStopReceipt(left: Extract<RunControlResult, { kind: 'stop' }>,
+// Either side may carry the late public downgrade; a proven archive keeps the proof.
+export function sameStopReceipt(left: Extract<RunControlResult, { kind: 'stop' }>,
   right: Extract<RunControlResult, { kind: 'stop' }>): boolean {
   return executionHash(left.members) === executionHash(right.members) &&
     (left.state === right.state || left.state === 'stopped' && right.state === 'cleanup_unknown' &&
-      right.ownerRetired === false)
+      right.ownerRetired === false || left.state === 'cleanup_unknown' && right.state === 'stopped')
 }
 function parseWindowsStopReceipt(value: unknown): Extract<RunControlResult, { kind: 'stop' }> {
   const receipt = executionRecord(value)
@@ -495,6 +502,34 @@ function parseWindowsStopReceipt(value: unknown): Extract<RunControlResult, { ki
         /^[1-9]\d{0,19}$/.test(string(birth.value)), 'run_control_invalid')
       cleanup = { scopeClosed: true, processRetired: true, descendantsRetired: true, pid: integer(row.pid),
         birth: { format: 'windows-filetime', value: string(birth.value), bootId: null } }
+    }
+    return { memberId: string(member.memberId), cleanup, errors: errors.map(string) }
+  })
+  executionAssert(receipt.state !== 'stopped' || members.length > 0 &&
+    members.every(member => member.cleanup !== null && member.errors.length === 0), 'run_control_invalid')
+  return { kind: 'stop', state: receipt.state, members }
+}
+function parseUnixStopReceipt(value: unknown): Extract<RunControlResult, { kind: 'stop' }> {
+  const receipt = executionRecord(value)
+  keys(receipt, ['kind', 'state', 'members'])
+  executionAssert(receipt.kind === 'stop' && (receipt.state === 'stopped' || receipt.state === 'cleanup_unknown'), 'run_control_invalid')
+  const memberValues = array(receipt.members)
+  executionAssert(memberValues.length <= 32, 'run_control_invalid')
+  const members = memberValues.map(value => {
+    const member = executionRecord(value); keys(member, ['memberId', 'cleanup', 'errors'])
+    const errors = array(member.errors)
+    executionAssert(errors.every(error => typeof error === 'string' && error.length > 0 && error.length <= 256), 'run_control_invalid')
+    let cleanup: RunStopMember['cleanup'] = null
+    if (member.cleanup !== null) {
+      const row = executionRecord(member.cleanup)
+      keys(row, ['scopeClosed', 'processRetired', 'descendantsRetired', 'pid', 'birth'])
+      const birth = executionRecord(row.birth); keys(birth, ['format', 'value', 'bootId'])
+      executionAssert(row.scopeClosed === true && row.processRetired === true && row.descendantsRetired === true &&
+        integer(row.pid) > 0 && ['linux-start-ticks', 'darwin-pidversion', 'windows-filetime', 'utc-ms'].includes(String(birth.format)) &&
+        (birth.bootId === null || typeof birth.bootId === 'string'), 'run_control_invalid')
+      cleanup = { scopeClosed: true, processRetired: true, descendantsRetired: true, pid: integer(row.pid),
+        birth: { format: String(birth.format) as ExecutionBirth['format'], value: string(birth.value),
+          bootId: birth.bootId === null ? null : string(birth.bootId) } }
     }
     return { memberId: string(member.memberId), cleanup, errors: errors.map(string) }
   })
@@ -609,12 +644,12 @@ async function openSocketDirectory(directory: string, uid: number) {
 }
 async function readPrivate(file: string, uid: number): Promise<Buffer> {
   const before = await privatePath(file, 'file', uid)
-  executionAssert(before.size <= MAX_FRAME, 'run_control_invalid')
+  executionAssert(before.size <= MAX_RECORD, 'run_control_invalid')
   const fd = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW)
   try {
     const stat = await fd.stat()
     executionAssert(stat.dev === before.dev && stat.ino === before.ino, 'run_control_changed')
-    const bytes = await fd.readFile(); executionAssert(bytes.length <= MAX_FRAME, 'run_control_invalid'); return bytes
+    const bytes = await fd.readFile(); executionAssert(bytes.length <= MAX_RECORD, 'run_control_invalid'); return bytes
   } finally { await fd.close() }
 }
 export async function writeRunControlFile(directory: string, name: string, value: unknown): Promise<void> {
@@ -786,11 +821,9 @@ export async function readOpenCodeV2RunStop(record: RunControlRecord,
   keys(archive, ['binding', 'receipt'])
   const tombstone = executionRecord(JSON.parse((await readPrivate(path.join(unix.directory, 'tombstone.json'), unix.uid)).toString('utf8')))
   executionAssert(executionHash(archive.binding) === executionHash(unix.binding) && executionHash(tombstone.binding) === executionHash(unix.binding), 'run_control_foreign')
-  const receipt = executionRecord(archive.receipt)
-  executionAssert(receipt.kind === 'stop' && (receipt.state === 'stopped' || receipt.state === 'cleanup_unknown') && Array.isArray(receipt.members) && receipt.members.length <= 32, 'run_control_invalid')
-  const result = receipt as Extract<RunControlResult, { kind: 'stop' }>
+  const receipt = parseUnixStopReceipt(archive.receipt)
   const retired = await runOwnerRetired(record, deadline)
-  return { ...result, state: result.state === 'stopped' && retired ? 'stopped' : 'cleanup_unknown', ownerRetired: retired }
+  return { ...receipt, state: receipt.state === 'stopped' && retired ? 'stopped' : 'cleanup_unknown', ownerRetired: retired }
 }
 /** Endpoint publication precedes native initialization. Observe only this authenticated
  * original owner until its original member is ready; this never submits or replaces input. */
@@ -835,9 +868,21 @@ export async function awaitOpenCodeV2RunMemberReadiness(record: RunControlRecord
 
 export async function requestOpenCodeV2Run(record: RunControlRecord, request: RunControlRequest, timeoutMs = MAX_OPERATION_MS): Promise<RunControlResult> {
   request = parseRunControlRequest(request)
-  executionAssert(Number.isSafeInteger(timeoutMs) && timeoutMs > 0 && timeoutMs <= MAX_OPERATION_MS, 'run_control_invalid')
   const cleanup = request.operation === 'stop' || request.operation === 'status'
-  const deadline = Math.min(Date.now() + timeoutMs, record.deadline + (cleanup ? MAX_OPERATION_MS : 0))
+  executionAssert(Number.isSafeInteger(timeoutMs) && timeoutMs > 0 && timeoutMs <= (cleanup ? MAX_STOP_OPERATION_MS : MAX_OPERATION_MS), 'run_control_invalid')
+  const deadline = Math.min(Date.now() + timeoutMs, record.deadline + (cleanup ? MAX_STOP_OPERATION_MS : 0))
+  try {
+    return await exchangeOpenCodeV2Run(record, request, deadline)
+  } catch (failure) {
+    // A stop whose reply was lost is confirmed once from the durable archive of
+    // the same run; only a proven stopped archive replaces the failure and every
+    // custody/validity refusal keeps its exact closed code.
+    if (request.operation === 'stop' && isTransientOpenCodeV2ControlRead(failure))
+      return confirmOpenCodeV2RunStop(record, failure, Date.now() + STOP_RECONCILE_MS)
+    throw failure
+  }
+}
+async function exchangeOpenCodeV2Run(record: RunControlRecord, request: RunControlRequest, deadline: number): Promise<RunControlResult> {
   if (process.platform === 'win32') {
     const native = windowsRecord(record)
     if (request.operation === 'stop') {
@@ -854,9 +899,13 @@ export async function requestOpenCodeV2Run(record: RunControlRecord, request: Ru
       client, nonce: randomBytes(32).toString('hex'), deadline, request }
     // The fresh caller identity is measured here and independently compared by
     // native pipe peer proofs. It never borrows the published server PID.
+    // Native run control caps the pipe window at 30s for regular work and 45s
+    // for stop/status; the owner's 40s physical-close envelope rides the cleanup
+    // window, and the archive reads share that same deadline.
     const received = await state.broker.request('runStateRequest', {
       stateId: state.stateId, directory: native.directory, endpointHash: payload.endpoint,
-      payload, timeoutMs: Math.max(1, deadline - Date.now()),
+      payload, timeoutMs: Math.max(1, Math.min(request.operation === 'stop' || request.operation === 'status'
+        ? MAX_STOP_OPERATION_MS : MAX_OPERATION_MS, deadline - Date.now())),
     }, deadline) as { response: unknown }
     const response = executionRecord(received.response)
     executionAssert(response.nonce === payload.nonce && response.endpoint === payload.endpoint, 'run_control_foreign')
@@ -866,7 +915,9 @@ export async function requestOpenCodeV2Run(record: RunControlRecord, request: Ru
       (request.operation === 'send' || request.operation === 'observe' && request.intent !== undefined)), 'run_control_invalid')
     if (value.kind === 'stop') {
       const stop = value as Extract<RunControlResult, { kind: 'stop' }>
-      const archived = await readOpenCodeV2RunStop(record, deadline)
+      // The durable receipt and independent owner-exit proof can land after the
+      // request deadline; keep a bounded reconcile window, never new authority.
+      const archived = await readOpenCodeV2RunStop(record, Math.max(deadline, Date.now() + STOP_RECONCILE_MS))
       executionAssert(archived !== null && sameStopReceipt(stop, archived), 'run_control_invalid')
       return archived
     }
@@ -923,6 +974,29 @@ export async function requestOpenCodeV2Run(record: RunControlRecord, request: Ru
       }
     } finally { await socketDirectory.fd.close() }
   }
+}
+// Custody and validity refusals met while confirming keep their exact closed code;
+// native run-state refusals may carry a closed ':stage:code' suffix.
+const STOP_CONFIRM_REFUSALS = new Set(['run_control_foreign', 'run_control_changed', 'run_control_invalid',
+  'run_control_endpoint_changed', 'run_control_selection_missing'])
+async function confirmOpenCodeV2RunStop(record: RunControlRecord, failure: unknown,
+  deadline: number): Promise<Extract<RunControlResult, { kind: 'stop' }>> {
+  // The attempt bound keeps the window finite even when the wall clock stalls.
+  for (let attempt = 0; attempt <= STOP_RECONCILE_MS / 100; attempt += 1) {
+    let archived: Extract<RunControlResult, { kind: 'stop' }> | null
+    try { archived = await readOpenCodeV2RunStop(record, deadline) }
+    catch (error) {
+      const code = error instanceof Error ? error.message.split(':')[0]! : ''
+      if (STOP_CONFIRM_REFUSALS.has(code) || code.startsWith('run_state_')) throw error
+      break
+    }
+    if (archived?.state === 'stopped') return archived
+    // A retired owner with a non-stopped receipt is terminal; an absent archive
+    // or an unretired owner can still confirm within the window.
+    if (archived?.ownerRetired === true || Date.now() >= deadline) break
+    await new Promise<void>(resolve => setTimeout(resolve, Math.min(100, Math.max(1, deadline - Date.now()))))
+  }
+  throw failure
 }
 async function serveWindowsRunControl(directory: string, binding: RunBinding, deadline: number, sourceSha256: string,
   execute: (request: RunControlRequest, deadline: number) => Promise<RunControlResult>,
@@ -987,7 +1061,7 @@ async function serveWindowsRunControl(directory: string, binding: RunBinding, de
       // completed before this event. Replay/deadline policy remains authoritative.
       executionAssert(payload.protocol === 1 && executionHash(payload.binding) === executionHash(binding) &&
         payload.endpoint === executionHash(native) && parseWindowsIdentity(payload.client).appContainer === false &&
-        requestDeadline > Date.now() && requestDeadline <= deadline + (request.operation === 'stop' || request.operation === 'status' ? MAX_OPERATION_MS : 0), 'run_deadline_expired')
+        requestDeadline > Date.now() && requestDeadline <= deadline + (request.operation === 'stop' || request.operation === 'status' ? MAX_STOP_OPERATION_MS : 0), 'run_deadline_expired')
       usedNonces.claim(string(payload.nonce), requestDeadline, request.operation, Date.now())
       let result: RunControlResult | undefined, error: string | undefined
       try { result = await execute(request, requestDeadline) }
@@ -1061,7 +1135,9 @@ export async function serveOpenCodeV2RunControl(directory: string, binding: RunB
   const server = createServer(socket => {
     sockets.add(socket); socket.once('close', () => sockets.delete(socket))
     void (async () => {
-      const frame = executionRecord(await readFrame(socket, Math.min(MAX_OPERATION_MS, Math.max(1, deadline + MAX_OPERATION_MS - Date.now()))))
+      // Frames stay readable through the extended cleanup window; the signed
+      // deadline check below still refuses every other post-deadline operation.
+      const frame = executionRecord(await readFrame(socket, Math.min(MAX_OPERATION_MS, Math.max(1, deadline + MAX_STOP_OPERATION_MS - Date.now()))))
       keys(frame, ['payload', 'mac']); executionAssert(authentic(secret, frame.payload, frame.mac), 'run_control_foreign')
       const payload = executionRecord(frame.payload)
       keys(payload, ['protocol', 'binding', 'endpoint', 'client', 'nonce', 'deadline', 'request'])
@@ -1069,7 +1145,7 @@ export async function serveOpenCodeV2RunControl(directory: string, binding: RunB
       const nonce = string(payload.nonce), requestDeadline = integer(payload.deadline)
       const request = parseRunControlRequest(payload.request)
       const cleanup = request.operation === 'stop' || request.operation === 'status'
-      executionAssert(requestDeadline > Date.now() && requestDeadline <= deadline + (cleanup ? MAX_OPERATION_MS : 0) && requestDeadline - Date.now() <= MAX_OPERATION_MS, 'run_control_timeout')
+      executionAssert(requestDeadline > Date.now() && requestDeadline <= deadline + (cleanup ? MAX_STOP_OPERATION_MS : 0) && requestDeadline - Date.now() <= (cleanup ? MAX_STOP_OPERATION_MS : MAX_OPERATION_MS), 'run_control_timeout')
       const client = parseIdentity(payload.client)
       executionAssert(client.executablePath === record.process.executablePath && client.executableSha256 === record.process.executableSha256 &&
         executionHash(await readUnixProcessIdentity(client.pid)) === executionHash(client), 'run_control_foreign')

@@ -8,6 +8,7 @@ import { ClientError as CurrentClientError } from '@opencode/client'
 import { ClientError as FloorClientError } from '@opencode/client-v2-floor'
 import { ExecutionTransportFailure } from '../transport/OpenCodeV2ExecutionFetch.js'
 import { recordOpenCodeV2ProviderFailure, retainOpenCodeV2CatalogFailure, retainOpenCodeV2CleanupPhase, retainOpenCodeV2InitializationPhase, type RunInitializationPhase } from './OpenCodeV2Diagnostics.js'
+import { windowsRealpathInstallCauses } from '../host/windows/OpenCodeV2WindowsChildControl.js'
 
 test('catalog diagnostics preserve selected official client reasons, numeric status and immutable owned wire codes only', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'TEST-v2-catalog-diagnostics-'))
@@ -587,7 +588,7 @@ test('graph original native packet survives persistence but unknown fields are r
   const history = stages.slice(0, stages.indexOf('graph-validation') + 1).map((stage, elapsedMs) => ({ stage, elapsedMs }))
   expect(history.at(-1)?.stage).toBe('graph-validation')
   let emitted = ''
-  const context = { Error, Date, runtimeReady: false, startupFailureReported: false, startupStage: 'graph-validation',
+  const context = { Error, Date, windowsRealpathInstallCauses, runtimeReady: false, startupFailureReported: false, startupStage: 'graph-validation',
     startupStartedAt: Date.now() - 41, startupHistory: history, environmentMismatchKeys: [], executionProfileGuards: [],
     graphProgress: { phase: 'hash', completed: 0, total: graphFailure.total }, readExecutionGraphFailure: () => graphFailure,
     process: { stderr: { write: (value: string) => { emitted += value } } },
@@ -647,6 +648,61 @@ test('actual native broker alias reply decoder persists original operation and s
   } finally {
     if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_DATA_HOME
     else process.env.CLAUDE_MULTIMODEL_DATA_HOME = previous
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('run control identity diagnostics name the observed process checkpoint stage', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'TEST-v2-identity-stage-'))
+  const previous = process.env.CLAUDE_MULTIMODEL_DATA_HOME
+  process.env.CLAUDE_MULTIMODEL_DATA_HOME = root
+  try {
+    // Every checkpoint literal the native run control emits, so a newly named
+    // stage cannot silently drop out of the closed diagnostics.
+    const header = await readFile(path.join(import.meta.dir, '../host/windows/WindowsNativeRunControl.hpp'), 'utf8')
+    const expected = [...new Set(header.match(/"process_alive[a-z_]*"/g) ?? [])].map(literal => literal.slice(1, -1))
+      .map(stage => ({ stage, nativeCode: stage === 'process_alive_wait' ? 5 : 0 }))
+    expect(expected.map(({ stage }) => stage)).toEqual(expect.arrayContaining(['process_alive', 'process_alive_wait',
+      'process_alive_held_bun', 'process_alive_package_peer', 'process_alive_peer', 'process_alive_peer_parent']))
+    for (const { stage, nativeCode } of expected)
+      await recordOpenCodeV2ProviderFailure('run-member-retirement',
+        new Error(`run_control_process_identity:${stage}:${nativeCode}`), true, undefined, undefined, { elapsedMs: 1, dataRoot: root })
+    const rows = await Promise.all((await readdir(path.join(root, 'opencode/v2/provider-diagnostics'))).map(async name =>
+      JSON.parse(await readFile(path.join(root, 'opencode/v2/provider-diagnostics', name), 'utf8'))))
+    expect(rows).toHaveLength(expected.length)
+    expect(rows.map((row) => JSON.stringify(row.native ?? null)).sort()).toEqual(expected.map(value => JSON.stringify(value)).sort())
+    expect(rows.every((row) => row.category === 'run_control_process_identity')).toBe(true)
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_DATA_HOME
+    else process.env.CLAUDE_MULTIMODEL_DATA_HOME = previous
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+// The cleanup row names which side lost the closed ACK: the MAIN exit class
+// separates a withheld ACK (exit_one) from one lost in transit (exit_zero), and
+// the closed-frame observation separates an owner identity rejection from a
+// frame that never arrived. Values outside the closed vocabularies are omitted.
+test('member retirement cleanup records the MAIN exit class and closed frame observation', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'TEST-v2-cleanup-exit-class-'))
+  try {
+    const write = (observation: Record<string, unknown>) => recordOpenCodeV2ProviderFailure('run-member-retirement',
+      new Error('cleanup_unknown'), true, undefined, undefined,
+      { elapsedMs: 42, dataRoot: root, observation: { phase: 'closed-ack', ...observation } as never })
+    await write({ exit: 'exit_zero', closedFrame: 'absent' })
+    await write({ exit: 'exit_one', closedFrame: 'rejected' })
+    await write({ exit: 'job_terminated', closedFrame: 'accepted' })
+    await write({ exit: 'exit_42', closedFrame: 'TEST-RAW-FRAME' })
+    const directory = path.join(root, 'opencode/v2/provider-diagnostics')
+    const rows = await Promise.all((await readdir(directory)).map(async name =>
+      JSON.parse(await readFile(path.join(directory, name), 'utf8')) as { cleanup: Record<string, unknown> }))
+    expect(rows.map(row => JSON.stringify(row.cleanup)).sort()).toEqual([
+      JSON.stringify({ elapsedMs: 42, phase: 'closed-ack' }),
+      JSON.stringify({ elapsedMs: 42, phase: 'closed-ack', exit: 'exit_one', closedFrame: 'rejected' }),
+      JSON.stringify({ elapsedMs: 42, phase: 'closed-ack', exit: 'exit_zero', closedFrame: 'absent' }),
+      JSON.stringify({ elapsedMs: 42, phase: 'closed-ack', exit: 'job_terminated', closedFrame: 'accepted' }),
+    ].sort())
+  } finally {
     await rm(root, { recursive: true, force: true })
   }
 })
