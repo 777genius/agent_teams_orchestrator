@@ -1,9 +1,12 @@
 import { openCodeBunVersion } from '../constants/openCodeBunVersion.js'
-import { spawn, type ChildProcess } from 'node:child_process'
+import { execFile, spawn, type ChildProcess } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { lstat, readFile, realpath } from 'node:fs/promises'
 import { constants } from 'node:os'
 import path from 'node:path'
+import { promisify } from 'node:util'
+
+const execFileAsync = promisify(execFile)
 
 export type PackagedOpenCodeDeliveryIdentity = Readonly<{
   schema: 1; platform: string; arch: string; bunVersion: '1.3.11' | '1.4.3'
@@ -34,6 +37,49 @@ async function verifiedSidecar(file: string, sha256: string, signal: AbortSignal
   signal.throwIfAborted()
 }
 
+// Absolute path: the delivery check must not depend on PATH.
+const CODESIGN = '/usr/bin/codesign'
+const DEVELOPER_ID_APP = 'anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] and certificate leaf[field.1.2.840.113635.100.6.1.13]'
+
+/** Team ID of this runtime, read from its own signature. It is only used to build a requirement, and the
+ * runtime must then satisfy that requirement, so a forged value can only make the check fail. */
+async function runtimeTeamId(runtimeExe: string, signal: AbortSignal): Promise<string | null> {
+  const { stderr } = await execFileAsync(CODESIGN, ['-dv', '--verbose=2', runtimeExe], { signal })
+  const team = /^TeamIdentifier=(.+)$/m.exec(stderr)?.[1]?.trim()
+  return team && /^[A-Z0-9]{10}$/.test(team) ? team : null
+}
+
+/** macOS release bundles sign bun with the app identity after this runtime was compiled, so the unsigned
+ * digest in the identity no longer matches. Accept a bun only when Apple's Developer ID requirement holds for
+ * the runtime and for bun (identifier "bun") under the same team. Team IDs printed for bun itself are never
+ * trusted: an ad-hoc identifier can embed a forged TeamIdentifier line. */
+async function signedBySameTeam(file: string, runtimeExe: string, signal: AbortSignal): Promise<boolean> {
+  if (process.platform !== 'darwin') return false
+  try {
+    const team = await runtimeTeamId(runtimeExe, signal)
+    if (team === null) return false
+    const teamRequirement = `${DEVELOPER_ID_APP} and certificate leaf[subject.OU] = "${team}"`
+    await execFileAsync(CODESIGN, ['--verify', '--strict', `-R=${teamRequirement}`, runtimeExe], { signal })
+    await execFileAsync(CODESIGN, ['--verify', '--strict', `-R=identifier "bun" and ${teamRequirement}`, file], { signal })
+    return true
+  } catch {
+    signal.throwIfAborted()
+    return false
+  }
+}
+
+/** bun may match the exact unsigned bytes from the release identity, or be a bun signed by the same team. */
+async function verifiedBunSidecar(file: string, sha256: string, runtimeExe: string, signal: AbortSignal): Promise<void> {
+  signal.throwIfAborted()
+  const info = await lstat(file)
+  if (!info.isFile() || info.isSymbolicLink() || await realpath(file) !== file) {
+    throw new Error('packaged_opencode_delivery_changed')
+  }
+  if (createHash('sha256').update(await readFile(file)).digest('hex') === sha256) return
+  if (await signedBySameTeam(file, runtimeExe, signal)) return
+  throw new Error('packaged_opencode_delivery_changed')
+}
+
 /** Only the release build supplies this identity. No environment/PATH/source fallback.
  * Existing child commands own their hosts, leases, deadlines and UNKNOWN outcomes. */
 export async function runPackagedOpenCodeDelivery(args: string[], embedded: PackagedOpenCodeDeliveryIdentity): Promise<number> {
@@ -58,10 +104,11 @@ export async function runPackagedOpenCodeDelivery(args: string[], embedded: Pack
     if (identity.platform !== process.platform || identity.arch !== process.arch || !isPackagedOpenCodeCommand(args)) {
       throw new Error('packaged_opencode_delivery_identity_invalid')
     }
-    const root = path.dirname(await realpath(process.execPath))
+    const runtimeExe = await realpath(process.execPath)
+    const root = path.dirname(runtimeExe)
     const bun = path.join(root, 'bun', process.platform === 'win32' ? 'bun.exe' : 'bun')
     const entry = path.join(root, 'local-cli', 'cli.js')
-    await verifiedSidecar(bun, identity.bunSha256, controller.signal)
+    await verifiedBunSidecar(bun, identity.bunSha256, runtimeExe, controller.signal)
     await verifiedSidecar(entry, identity.entrySha256, controller.signal)
     controller.signal.throwIfAborted()
     child = spawn(bun, [entry, ...args], { cwd: process.cwd(), env: { ...process.env }, stdio: [0, 1, 2], shell: false, windowsHide: true })
