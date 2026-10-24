@@ -41,11 +41,12 @@ for (const pin of ['2.0.0', '2.0.32'] as const) test(`sourceless production wrap
     expect(await lstat(path.join(installation, 'src')).then(() => true, () => false)).toBe(false)
     const graphRoot = path.join(installation, 'dist/local-cli')
     // Every graph the build staged, as recorded by its own staging manifest.
-    const staged = (JSON.parse(await readFile(path.join(graphRoot, 'opencode-v2-graphs.json'), 'utf8')) as { pins: OpenCodeV2Pin[] }).pins
-    expect(staged).toContain(pin)
-    for (const specifier of staged.flatMap(version => {
-      const aliases = openCodeV2GraphPackages(version)
-      return [`${aliases.server}/process`, aliases.client]
+    const staged = (JSON.parse(await readFile(path.join(graphRoot, 'opencode-v2-graphs.json'), 'utf8')) as {
+      graphs: { version: OpenCodeV2Pin; server: string; client: string }[] }).graphs
+    expect(staged.map(graph => graph.version)).toContain(pin)
+    for (const specifier of staged.flatMap(graph => {
+      expect(graph).toMatchObject(openCodeV2GraphPackages(graph.version))
+      return [`${graph.server}/process`, graph.client]
     })) {
       const resolved = await realpath(Bun.resolveSync(specifier, graphRoot))
       expect(resolved.startsWith(graphRoot + path.sep)).toBe(true)

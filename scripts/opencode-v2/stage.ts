@@ -1,4 +1,4 @@
-import { openCodeV2GraphPackages, openCodeV2StagedVersions, type OpenCodeV2Pin } from '../../src/services/opencode/compatibility/OpenCodeV2Registry.js'
+import { openCodeV2GraphPackages, openCodeV2StagedVersions, openCodeV2Wire, type OpenCodeV2Pin } from '../../src/services/opencode/compatibility/OpenCodeV2Registry.js'
 import { OPENCODE_V2_CLIENT_GRAPH_ENTRIES, OPENCODE_V2_EFFECT_PLATFORM_ENTRIES,
   OPENCODE_V2_SERVER_GRAPH_ENTRIES } from '../../src/services/opencode/host/OpenCodeV2ServerGraph.js'
 import { createHash } from 'node:crypto'
@@ -237,12 +237,16 @@ export async function stageOpenCodeV2Graphs(sourceRoot: string, bundleDirectory:
     await link(destination, alias, node.target)
   }
   await verifyGraphs(path.resolve(bundleDirectory), destination, plan)
-  const effects: Record<string, string> = {}
-  for (const pin of plan.versions) {
-    effects[pin] = await serverEffectVersion(await realpath(Bun.resolveSync(`${openCodeV2GraphPackages(pin).server}/process`, bundleDirectory)), pin)
+  // Consumers (packaging, smokes) read the staged graphs from here instead of
+  // repeating versions or alias names.
+  const graphs = []
+  for (const version of plan.versions) {
+    const aliases = openCodeV2GraphPackages(version)
+    const effect = await serverEffectVersion(await realpath(Bun.resolveSync(`${aliases.server}/process`, bundleDirectory)), version)
+    graphs.push({ version, server: aliases.server, client: aliases.client, effect, wire: openCodeV2Wire(version) })
   }
   await writeFile(path.join(bundleDirectory, 'opencode-v2-graphs.json'), JSON.stringify({
-    schema: 1, pins: plan.versions, effect: plan.root.effect, effects, pty: plan.ptyVersion, platform: options.platform ?? process.platform, arch: options.arch ?? process.arch,
+    schema: 2, graphs, effect: plan.root.effect, pty: plan.ptyVersion, platform: options.platform ?? process.platform, arch: options.arch ?? process.arch,
     packages: [...packages.values()].map(node => ({ name: node.metadata.name, version: node.metadata.version,
       path: path.relative(bundleDirectory, node.target),
     })),

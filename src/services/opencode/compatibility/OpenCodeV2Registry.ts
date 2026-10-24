@@ -125,7 +125,13 @@ export function openCodeV2Qualification(version: OpenCodeV2Pin): OpenCodeV2Quali
   return qualifications.get(version) ?? null
 }
 export function openCodeV2QualifiedVersions(): readonly OpenCodeV2Pin[] {
-  return [...qualifications.keys()]
+  return [...qualifications.keys()].sort((left, right) => compare(release(left)!, release(right)!))
+}
+/** Published with each runtime release; the desktop pins this exact contract in its runtime lock. */
+export function openCodeV2ReleaseContract(): Readonly<{
+  range: typeof OPENCODE_V2_SUPPORTED_RANGE; qualified: readonly OpenCodeV2Pin[]
+}> {
+  return { range: { ...OPENCODE_V2_SUPPORTED_RANGE }, qualified: openCodeV2QualifiedVersions() }
 }
 
 export type OpenCodeV2LaunchRefusal = 'opencode_v2_version_out_of_range' | 'opencode_v2_version_unqualified'

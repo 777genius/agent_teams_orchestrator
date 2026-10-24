@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
+import { openCodeV2ReleaseContract } from '../src/services/opencode/compatibility/OpenCodeV2Registry.js';
 
 type AssetDescriptor = {
   platform: string;
@@ -64,6 +65,8 @@ const manifest = {
   sourceRepository: process.env.GITHUB_REPOSITORY,
   sourceRef: process.env.RUNTIME_SOURCE_REF ?? process.env.GITHUB_REF_NAME,
   sourceCommit: process.env.RUNTIME_SOURCE_COMMIT ?? process.env.GITHUB_SHA,
+  // Consumers copy this into their runtime lock; it is derived from the runtime registry.
+  opencodeV2: openCodeV2ReleaseContract(),
   assets: {} as Record<string, { file: string; archiveKind: string; binaryName: string; sha256: string }>,
 };
 

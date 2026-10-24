@@ -131,11 +131,12 @@ export async function main(deliveryArgument: string, receipt: string, expectedPl
       HOME: home, USERPROFILE: home, APPDATA: path.join(home, 'appdata'),
       LOCALAPPDATA: path.join(home, 'localappdata'), TEMP: temp, TMP: temp }
     // Exercise every graph the bundle staged, as recorded by its own staging manifest.
-    const staged = JSON.parse(await readFile(path.join(bundle, 'opencode-v2-graphs.json'), 'utf8')) as { pins: string[]; pty: string }
-    assert(Array.isArray(staged.pins) && staged.pins.length > 0 && typeof staged.pty === 'string', 'Staged graph manifest invalid')
-    for (const pin of staged.pins) {
-      assert(isOpenCodeV2Pin(pin), 'Staged graph manifest invalid')
-      const server = await physical(Bun.resolveSync(`${openCodeV2GraphPackages(pin).server}/process`, bundle), bundle)
+    const staged = JSON.parse(await readFile(path.join(bundle, 'opencode-v2-graphs.json'), 'utf8')) as {
+      schema: number; graphs: { version: string; server: string }[]; pty: string }
+    assert(staged.schema === 2 && Array.isArray(staged.graphs) && staged.graphs.length > 0 && typeof staged.pty === 'string', 'Staged graph manifest invalid')
+    for (const { version: pin, server: alias } of staged.graphs) {
+      assert(isOpenCodeV2Pin(pin) && alias === openCodeV2GraphPackages(pin).server, 'Staged graph manifest invalid')
+      const server = await physical(Bun.resolveSync(`${alias}/process`, bundle), bundle)
       await packageInfo(server, '@opencode/server', pin, bundle)
       const core = await physical(Bun.resolveSync('@opencode/core/bus', path.dirname(server)), bundle)
       const coreRoot = await packageInfo(core, '@opencode/core', pin, bundle)
