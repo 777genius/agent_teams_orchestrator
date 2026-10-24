@@ -1,5 +1,6 @@
 import { checkOpenCodeReadJson } from './OpenCodeBoundedFetch.js'
 import { types } from 'node:util'
+import { openCodeV2LaunchRefusal, openCodeV2Wire, type OpenCodeV2Pin } from '../compatibility/OpenCodeV2Registry.js'
 
 type ExecutionFetchInput = Parameters<typeof globalThis.fetch>[0]
 type ExecutionFetchInit = Parameters<typeof globalThis.fetch>[1]
@@ -64,12 +65,12 @@ export class OpenCodeV2ExecutionFetch {
   private readonly controllers = new Set<AbortController>()
   private readonly pending = new Set<Promise<unknown>>()
   private readonly io = new Set<Promise<unknown>>()
-  constructor(private readonly endpoint: string, private readonly pin: '2.0.0' | '2.0.32',
+  constructor(private readonly endpoint: string, private readonly pin: OpenCodeV2Pin,
     private readonly directory: string, private readonly password: string,
     private readonly context: ExecutionWireContext,
     private readonly fetchImpl: (input: ExecutionFetchInput, init?: ExecutionFetchInit) => Promise<Response> = globalThis.fetch) {
     executionAssert(/^http:\/\/127\.0\.0\.1:[1-9]\d*$/.test(endpoint), 'authority_mismatch')
-    executionAssert(pin === '2.0.0' || pin === '2.0.32', 'unqualified_version')
+    executionAssert(openCodeV2LaunchRefusal(pin) === null, 'unqualified_version')
     executionAssert(Number.isFinite(context.deadline), 'deadline')
   }
   check(): void {
@@ -114,8 +115,9 @@ export class OpenCodeV2ExecutionFetch {
       const list = /^\/api\/session\/[^/]+\/(?:inbox|message)$/.test(url.pathname)
       const log = /^\/api\/experimental\/session\/[^/]+\/log$/.test(url.pathname)
       const scoped = /^\/api\/(?:location|agent\/[^/]+|model|integration|config)$/.test(url.pathname)
-      const activation = this.pin === '2.0.0' && url.pathname === '/api/plugin/await-activation'
-      const identity = (this.pin === '2.0.0' ? ['/api/health', '/api/server'] : ['/api/info']).includes(url.pathname)
+      const floor = openCodeV2Wire(this.pin) === 'floor'
+      const activation = floor && url.pathname === '/api/plugin/await-activation'
+      const identity = (floor ? ['/api/health', '/api/server'] : ['/api/info']).includes(url.pathname)
       const create = url.pathname === '/api/session'
       executionAssert(request.method === 'GET' && (session || list || log || scoped || identity) ||
         request.method === 'POST' && (create || prompt || activation), 'capabilities_pending')

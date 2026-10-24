@@ -318,7 +318,7 @@ describe('OpenCodeV2 Windows probe owner adapter', () => {
       model: { providerID: 'provider', id: 'model' },
       native: { version: '2.0.32', executablePath: '/TEST/opencode' },
       controller: { type: 'local', environment: {} },
-    } as Parameters<typeof resolveOpenCodeV2ExecutionProbe>[1]
+    } as unknown as Parameters<typeof resolveOpenCodeV2ExecutionProbe>[1]
     const binding = { teamId: 'TEST-probe', runId: 'TEST-run', controllerInstanceId: 'TEST-controller', ownerId: 'TEST-owner' }
     const proof = {
       projectPath: selection.project, modelId: 'provider/model', capabilitySnapshotId: 'TEST-capability',
@@ -372,7 +372,7 @@ describe('OpenCodeV2 Windows probe owner adapter', () => {
       expect(events.indexOf('record-submitted')).toBeLessThan(events.indexOf('send'))
 
       failExclusive = true
-      const changed = { ...selection, behaviorFingerprint: 'd'.repeat(64) } as Parameters<typeof resolveOpenCodeV2ExecutionProbe>[1]
+      const changed = { ...selection, behaviorFingerprint: 'd'.repeat(64) } as unknown as Parameters<typeof resolveOpenCodeV2ExecutionProbe>[1]
       await expect(resolveOpenCodeV2ExecutionProbe(envelope, changed, true)).rejects.toThrow('execution_native_owned')
       expect(launchCalls).toBe(1)
       expect(sendCalls).toBe(1)
@@ -437,7 +437,7 @@ describe('OpenCodeV2 Windows probe owner adapter', () => {
     const selection = { project: path.join(temp, 'project'), scope: { scopeToken: 'TEST-live', selectedAuthIdentity: 'absent' },
       behaviorFingerprint: 'b'.repeat(64), installedGraphSHA256: 'c'.repeat(64), capabilitySnapshotId: 'TEST-capability',
       model: { providerID: 'provider', id: 'model' }, native: { version: '2.0.32', executablePath: '/TEST/opencode' },
-      controller: { type: 'remote' } } as Parameters<typeof resolveOpenCodeV2ExecutionProbe>[1]
+      controller: { type: 'remote' } } as unknown as Parameters<typeof resolveOpenCodeV2ExecutionProbe>[1]
     const binding = { teamId: 'TEST-probe', runId: 'TEST-run', controllerInstanceId: 'TEST-controller', ownerId: 'TEST-owner' }
     const restores: Array<{ mockRestore(): void }> = []
     try {
@@ -639,7 +639,7 @@ describe('OpenCodeV2 Windows probe owner adapter', () => {
       model: { providerID: 'provider', id: 'model' },
       native: { version: '2.0.32', executablePath: '/TEST/opencode' },
       controller: { type: 'local', environment: {} },
-    } as Parameters<typeof resolveOpenCodeV2ExecutionProbe>[1]
+    } as unknown as Parameters<typeof resolveOpenCodeV2ExecutionProbe>[1]
     const binding = { teamId: 'TEST-ambient-probe', runId: 'TEST-ambient-run',
       controllerInstanceId: 'TEST-ambient-controller', ownerId: 'TEST-ambient-owner' }
     const proof = {

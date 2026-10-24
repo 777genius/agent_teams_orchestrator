@@ -4,6 +4,7 @@ import { hashOpenCodeFile, type OpenCodeV2NativeIdentity } from '../compatibilit
 import { acquireOpenCodeV2ReadHost } from '../host/OpenCodeHostNativeAdapter.js'
 import { createOpenCodeV2ReadClient } from '../transport/OpenCodeV2ClientFactory.js'
 import { openCodeReadAssert } from '../transport/OpenCodeBoundedFetch.js'
+import { openCodeV2Wire } from '../compatibility/OpenCodeV2Registry.js'
 import { emptyOpenCodeV2ReadStatus, readAgent, readArray, readConfiguration, readLocation, readModel,
   readProvider, readRecord, readWrapped, type OpenCodeV2ReadStatus } from './OpenCodeV2ReadStatus.js'
 
@@ -31,7 +32,7 @@ export async function probeOpenCodeV2Inventory(native: OpenCodeV2NativeIdentity,
     const sdk = reader.client, wrap = (value: unknown) => readWrapped(value, directory, projectId)
     const identity = readRecord(await sdk.identity())
     openCodeReadAssert(identity.pid === host.authority.pid && identity.version === native.version &&
-      (native.version !== '2.0.0' || identity.healthy === true), 'identity_mismatch')
+      (openCodeV2Wire(native.version) !== 'floor' || identity.healthy === true), 'identity_mismatch')
     const urls = readArray(await sdk.urls())
     openCodeReadAssert(urls.includes(host.authority.baseUrl), 'identity_mismatch')
     const projectId = readLocation(await sdk.location(directory), directory)

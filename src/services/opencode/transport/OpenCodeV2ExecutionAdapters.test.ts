@@ -1,5 +1,7 @@
 import { expect, test } from 'bun:test'
 import { executionCurrentOperations } from './OpenCodeV2ExecutionCurrentClient.js'
+import * as FloorClient from '@opencode/client-v2.0.0'
+import * as CurrentClient from '@opencode/client-v2.0.32'
 import { executionFloorOperations } from './OpenCodeV2ExecutionFloorClient.js'
 import { OpenCodeV2ExecutionFetch } from './OpenCodeV2ExecutionFetch.js'
 
@@ -17,7 +19,7 @@ for (const pin of ['2.0.0', '2.0.32'] as const) {
         { status, headers: { 'content-type': streaming ? 'text/event-stream' : 'application/json' } })
     }, { preconnect(): never { throw new Error('TEST preconnect unsupported') } })
     const wire = new OpenCodeV2ExecutionFetch(base, pin, directory, 'TEST-password', { deadline: Date.now() + 10_000 }, fetch)
-    const operations = (pin === '2.0.0' ? executionFloorOperations : executionCurrentOperations)(base, directory, wire, fetch)
+    const operations = pin === '2.0.0' ? executionFloorOperations(FloorClient, base, directory, wire, fetch) : executionCurrentOperations(CurrentClient, base, directory, wire, fetch)
     const session = { id, directory, agent: 'TEST-agent', model: { providerID: 'TEST-provider', id: 'TEST-model', variant: 'default' }, time: { created: 1 } }
     const inbox = { id: 'msg_TESToriginal', sessionID: id, type: 'user', time: { created: 2 }, delivery: 'queue', payload: { text: 'TEST' } }
     const instruction = { key: 'test', value: { text: 'TEST' } }

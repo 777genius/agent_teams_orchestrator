@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { OpenCode } from '@opencode/client-v2-floor'
+import { OpenCode } from '@opencode/client-v2.0.0'
 import { privateOpenCodeReadEnvironment } from '../profile/OpenCodeV2ManagedConfig.js'
 import { OpenCodeBoundedFetch, boundOpenCodeRead } from './OpenCodeBoundedFetch.js'
 

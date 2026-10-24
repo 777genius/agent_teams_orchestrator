@@ -5,8 +5,7 @@ import { fileURLToPath } from 'node:url'
 import { createHash, randomUUID } from 'node:crypto'
 import { mkdir, mkdtemp, realpath, writeFile, readFile, lstat } from 'node:fs/promises'
 import { isDeepStrictEqual } from 'node:util'
-import { OpenCode as Current } from '@opencode/client'
-import { OpenCode as Floor } from '@opencode/client-v2-floor'
+import { importOpenCodeV2ClientModule, resolveOpenCodeV2ClientEntry } from '../../../../services/opencode/transport/OpenCodeV2ClientModule.js'
 import { getOpenCodeV2DeclaredInputModalities } from '../../../../services/opencode/OpenCodeDeclaredInputModalities.js'
 import { inspectOpenCodeReadSelection } from '../../../../services/opencode/compatibility/OpenCodeNativeIdentity.js'
 import { canonicalizeOpenCodeProjectPath, resolveOpenCodeV2CatalogProfileScope, materializeOpenCodeV2CatalogScope } from '../../../../services/opencode/OpenCodeProfileManager.js'
@@ -61,13 +60,15 @@ async function catalog<T>(input: { providerId: string; projectPath?: string | nu
   const unregister = registerExecutionDisposer(lease.authority, () => wire.dispose())
   try {
     const location = { directory: project }
-    const sdk = lease.authority.pin === '2.0.0' ? Floor.make({ baseUrl: endpoint.baseUrl, fetch: wire.fetch }) : Current.make({ baseUrl: endpoint.baseUrl, fetch: wire.fetch })
+    const selected = await importOpenCodeV2ClientModule(lease.authority.pin, await resolveOpenCodeV2ClientEntry(lease.authority.pin))
+    const sdk = selected.wire === 'floor' ? selected.module.OpenCode.make({ baseUrl: endpoint.baseUrl, fetch: wire.fetch })
+      : selected.module.OpenCode.make({ baseUrl: endpoint.baseUrl, fetch: wire.fetch })
     return await use({ authority: lease.authority, profile, authPath: imported.authPath, preferredModel: imported.preferredModel, scopeToken: scope.scopeToken,
       providers: () => sdk.provider.list({ location }), models: () => sdk.model.list({ location }), integration: integrationID => sdk.integration.get({ location, integrationID }),
       connect: (integrationID, key) => sdk.integration.connect.key({ location, integrationID, key }),
-      remove: credentialID => lease.authority.pin === '2.0.0'
-        ? Floor.make({ baseUrl: endpoint.baseUrl, fetch: wire.fetch }).credential.remove({ location, credentialID })
-        : Current.make({ baseUrl: endpoint.baseUrl, fetch: wire.fetch }).credential.remove({ credentialID }) })
+      remove: credentialID => selected.wire === 'floor'
+        ? selected.module.OpenCode.make({ baseUrl: endpoint.baseUrl, fetch: wire.fetch }).credential.remove({ location, credentialID })
+        : selected.module.OpenCode.make({ baseUrl: endpoint.baseUrl, fetch: wire.fetch }).credential.remove({ credentialID }) })
   } finally { await retireOpenCodeV2CatalogOwner(wire, lease, unregister) }
 }
 

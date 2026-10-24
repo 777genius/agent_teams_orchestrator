@@ -3,8 +3,8 @@ import { Info as NativeProviderInfo } from '@opencode/schema/config/provider'
 import { Capabilities as NativeCapabilities } from '@opencode/schema/model'
 import { createHash } from 'node:crypto'
 import path from 'node:path'
-import type { ConfigEntry as FloorEntry } from '@opencode/client-v2-floor'
-import type { ConfigEntry as CurrentEntry } from '@opencode/client'
+import { isOpenCodeV2Pin, type OpenCodeV2Pin } from '../compatibility/OpenCodeV2Registry.js'
+import type { CurrentConfigEntry as CurrentEntry, FloorConfigEntry as FloorEntry } from '../compatibility/OpenCodeV2WireTypes.js'
 import type { ExecutionSelection } from '../host/OpenCodeV2ExecutionBinding.js'
 import type { ExecutionMcpConfig } from '../transport/OpenCodeV2ExecutionClientFactory.js'
 
@@ -12,7 +12,7 @@ export type ExecutionConfigInfo = Extract<FloorEntry, { type: 'document' }>['inf
   Extract<CurrentEntry, { type: 'document' }>['info']
 export type ExecutionProviderModels = NonNullable<NonNullable<ExecutionConfigInfo['providers']>[string]['models']>
 export type ExecutionConfigInput = {
-  pin: '2.0.0' | '2.0.32'
+  pin: OpenCodeV2Pin
   selection: ExecutionSelection
   /** Autonomous team profiles cannot wait for an interactive form response. */
   unattendedTeam?: boolean
@@ -26,7 +26,7 @@ export function createOpenCodeV2ExecutionConfig(input: ExecutionConfigInput): {
   info: ExecutionConfigInfo; content: string; sha256: string
 } {
   const { pin, selection, controller } = input
-  if ((pin !== '2.0.0' && pin !== '2.0.32') || !/^[A-Za-z0-9_-]{1,256}$/.test(selection.agent) ||
+  if (!isOpenCodeV2Pin(pin) || !/^[A-Za-z0-9_-]{1,256}$/.test(selection.agent) ||
     controller.server !== 'agent-teams' || !selection.model.providerID || !selection.model.id ||
     selection.permissions.length === 0) throw new Error('v2_execution_selection_invalid')
   if (selection.model.variant !== undefined && !selection.model.variant) throw new Error('v2_execution_selection_invalid')

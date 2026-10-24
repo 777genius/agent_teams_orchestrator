@@ -1,13 +1,14 @@
 import { createHash } from 'node:crypto'
 import { openCodeReadAssert } from '../transport/OpenCodeBoundedFetch.js'
 import type { OpenCodeV2NativeIdentity } from '../compatibility/OpenCodeNativeIdentity.js'
+import type { OpenCodeV2Dialect, OpenCodeV2Pin } from '../compatibility/OpenCodeV2Registry.js'
 
 /** Serialized SDK contract for the later product reader. No generated native types. */
 export type OpenCodeV2ReadStatus = {
   schemaVersion: 1
   generation: 'v2'
-  version: '2.0.0' | '2.0.32'
-  dialect: 'v2-2.0.0' | 'v2-2.0.32'
+  version: OpenCodeV2Pin
+  dialect: OpenCodeV2Dialect
   nativeSha256: string
   selectionKey: string
   locationKey: string

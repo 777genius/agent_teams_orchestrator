@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import { projectOpenCodeV2Turn, type OpenCodeV2TurnCut } from './OpenCodeV2TurnProjection.js'
 import type { ExecutionLogEvent, ExecutionMessage } from '../transport/OpenCodeV2ExecutionClientFactory.js'
 import type { SessionStepStarted as CurrentStepStarted, SessionStepEnded as CurrentStepEnded, SessionRetryScheduled as CurrentRetryScheduled } from '@opencode/client'
-import type { SessionStepStarted as FloorStepStarted, SessionRetryScheduled as FloorRetryScheduled } from '@opencode/client-v2-floor'
+import type { SessionStepStarted as FloorStepStarted, SessionRetryScheduled as FloorRetryScheduled } from '@opencode/client-v2.0.0'
 
 const sessionID = 'ses_TESToriginal', nativeInputID = 'msg_TESTinput', assistantID = 'msg_TESTassistant'
 const text = 'TEST inbound app relay'

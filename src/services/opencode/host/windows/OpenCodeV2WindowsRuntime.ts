@@ -5,10 +5,9 @@ import filesystem, { stat } from 'node:fs/promises'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { types } from 'node:util'
-import { openCodeV2EffectVersion, type OpenCodeV2Pin } from '../../compatibility/OpenCodeGenerationPolicy.js'
+import { isOpenCodeV2Pin, openCodeV2Wire, type OpenCodeV2Pin } from '../../compatibility/OpenCodeV2Registry.js'
 import { verifyOpenCodePackage, verifyOpenCodeV2GraphEffect, verifyOpenCodeV2ServerGraph } from '../OpenCodeV2ServerGraph.js'
-import type { ServerOptions as FloorOptions } from '@opencode/server-v2-floor/options'
-import type { ServerOptions as CurrentOptions } from '@opencode/server/options'
+import type { CurrentServerOptions as CurrentOptions, FloorServerOptions as FloorOptions } from '../../compatibility/OpenCodeV2WireTypes.js'
 import { isWindowsCommandPort, type WindowsCommandPort } from './OpenCodeV2WindowsCommand.js'
 import type { OwnedNativeProfile } from '../OpenCodeV2ExecutionBinding.js'
 import { createOpenCodeV2ColdLocationObservation } from '../../execution/OpenCodeV2ServerFailure.js'
@@ -47,7 +46,7 @@ const CONTROL_ENV = /^OPENCODE_V2_/i
 export async function loadOpenCodeV2WindowsRuntime(pin: OpenCodeV2Pin, expectedModuleSha256: string,
   commands: WindowsCommandPort, profile: OwnedNativeProfile) {
   requireValue(process.platform === 'win32' && process.versions.bun === openCodeBunVersion())
-  requireValue(pin === '2.0.0' || pin === '2.0.32')
+  requireValue(isOpenCodeV2Pin(pin))
   requireValue(isWindowsCommandPort(commands))
   const trustedEnvironment = Object.freeze({ ...profile.env })
   const databasePath = profile.databasePath, configDirectory = profile.config.directory
@@ -66,14 +65,16 @@ export async function loadOpenCodeV2WindowsRuntime(pin: OpenCodeV2Pin, expectedM
   async function load<T>(specifier: string, packageName: string, version: string): Promise<T> {
     const entry = await filesystem.realpath(Bun.resolveSync(specifier, directory))
     await verifyOpenCodePackage(entry, packageName, version)
-    await verifyOpenCodeV2GraphEffect(entry, graph.effectPath, pin)
+    await verifyOpenCodeV2GraphEffect(entry, graph.effectPath, graph.effectVersion)
     return import(pathToFileURL(entry).href) as Promise<T>
   }
   // No Effect values from a different physical graph enter this layer.
   const effect: typeof import('effect') = await import(pathToFileURL(graph.effectPath).href)
+  // The floor graph's Effect release candidate still exposes these modules as unstable.
+  const floor = openCodeV2Wire(pin) === 'floor'
   const spawn = await load<typeof import('effect/process/ChildProcessSpawner')>(
-    pin === '2.0.0' ? 'effect/unstable/process/ChildProcessSpawner' : 'effect/process/ChildProcessSpawner', 'effect', openCodeV2EffectVersion(pin))
-  const httpTypes = await load<typeof import('effect/http')>(pin === '2.0.0' ? 'effect/unstable/http' : 'effect/http', 'effect', openCodeV2EffectVersion(pin))
+    floor ? 'effect/unstable/process/ChildProcessSpawner' : 'effect/process/ChildProcessSpawner', 'effect', graph.effectVersion)
+  const httpTypes = await load<typeof import('effect/http')>(floor ? 'effect/unstable/http' : 'effect/http', 'effect', graph.effectVersion)
   const routes = await load<typeof import('@opencode/server/routes')>('@opencode/server/routes', '@opencode/server', pin)
   const cross = await load<typeof import('@opencode/util/cross-spawn-spawner')>(
     '@opencode/util/cross-spawn-spawner', '@opencode/util', pin)
@@ -81,7 +82,7 @@ export async function loadOpenCodeV2WindowsRuntime(pin: OpenCodeV2Pin, expectedM
   const platform = await load<typeof import('@opencode/util/effect/app-node-platform')>(
     '@opencode/util/effect/app-node-platform', '@opencode/util', pin)
   const http = await load<typeof import('@effect/platform-node/NodeHttpServer')>(
-    '@effect/platform-node/NodeHttpServer', '@effect/platform-node', openCodeV2EffectVersion(pin))
+    '@effect/platform-node/NodeHttpServer', '@effect/platform-node', graph.effectVersion)
   const { Effect, Layer, PlatformError, Stream, Sink, Scope, Exit, Context, FileSystem } = effect
   // Bun keeps captured builtin namespace callbacks when syncBuiltinESMExports
   // runs. Preserve the selected official normalizer, then route only its

@@ -1,4 +1,5 @@
-import { openCodeV2EffectVersion } from '../compatibility/OpenCodeGenerationPolicy.js'
+import { openCodeV2Dialect } from '../compatibility/OpenCodeV2Registry.js'
+import { resolveOpenCodeV2GraphEntry } from '../host/OpenCodeV2ServerGraph.js'
 import { openCodeBunVersion } from '../../../constants/openCodeBunVersion.js'
 import path from 'node:path'
 import { resolveOpenCodeV2ExecutionDelivery } from '../host/OpenCodeV2ExecutionDelivery.js'
@@ -71,9 +72,13 @@ executionAssert(cliSha256 === identity.executableSha256, 'native_selection_chang
 const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'execution')
 // Legacy callers supply a source root; delivery is derived from this module, never that hint.
 const resolutionRoot = delivery.runtimeMode === 'source' ? path.join(delivery.root, 'src/services/opencode/host') : delivery.root
-const server = await realpath(Bun.resolveSync(pin === '2.0.0' ? '@opencode/server-v2-floor/process' : '@opencode/server/process', resolutionRoot))
-const client = await realpath(Bun.resolveSync(pin === '2.0.0' ? '@opencode/client-v2-floor' : '@opencode/client', resolutionRoot))
+const server = await resolveOpenCodeV2GraphEntry(pin, 'server', 'process', resolutionRoot)
+const client = await resolveOpenCodeV2GraphEntry(pin, 'client', undefined, resolutionRoot)
 const effect = await realpath(Bun.resolveSync('effect', path.dirname(server)))
+// One Effect release per graph: the server's resolved Effect. Graph validation
+// additionally binds it to the server's declared exact dependency.
+const effectVersion = executionRecord(JSON.parse(await readFile(path.join(await resolveOpenCodeV2ReceiptPackageRoot(effect), 'package.json'), 'utf8'))).version
+executionAssert(typeof effectVersion === 'string' && effectVersion.length > 0, 'effect_pin_mismatch')
 async function locate(name: string, from: string): Promise<string | undefined> {
   executionAssert(/^(?:@[a-z0-9._-]+\/)?[a-z0-9._-]+$/.test(name))
   for (let directory = from; ; directory = path.dirname(directory)) {
@@ -89,7 +94,7 @@ async function visit(root: string, expectedName?: string): Promise<void> {
   executionAssert(typeof metadata.name === 'string' && typeof metadata.version === 'string')
   if (expectedName) executionAssert(metadata.name === expectedName, 'package_name_mismatch')
   if (/^@opencode\//.test(metadata.name)) executionAssert(metadata.version === pin, 'package_pin_mismatch')
-  if (metadata.name === 'effect' || metadata.name === '@effect/platform-node' || metadata.name === '@effect/platform-node-shared') executionAssert(metadata.version === openCodeV2EffectVersion(pin), 'effect_pin_mismatch')
+  if (metadata.name === 'effect' || metadata.name === '@effect/platform-node' || metadata.name === '@effect/platform-node-shared') executionAssert(metadata.version === effectVersion, 'effect_pin_mismatch')
   async function walk(directory: string): Promise<void> {
     const pending: string[] = []
     for (const item of await readdir(directory, { withFileTypes: true })) {
@@ -215,7 +220,7 @@ files.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0)
 executionAssert(new Set(files.map(row => row.path)).size === files.length)
 const cliMetadata = executionRecord(JSON.parse(await readFile(path.join(path.dirname(path.dirname(cli)), 'package.json'), 'utf8')))
 executionAssert(typeof cliMetadata.name === 'string' && cliMetadata.version === pin)
-const native = { generation: 'v2', version: pin, dialect: `v2-${pin}`, runtimeMode: delivery.runtimeMode, executablePath: cli,
+const native = { generation: 'v2', version: pin, dialect: openCodeV2Dialect(pin), runtimeMode: delivery.runtimeMode, executablePath: cli,
   executableSha256: cliSha256, packageName: cliMetadata.name, entrySha256: delivery.entrySha256,
   bun: { path: bun, sha256: await sha(bun) }, graph: { sha256: executionHash(files), files },
   ...(taskNode ? { taskNode } : {}) } satisfies ValidatedExecutionNative

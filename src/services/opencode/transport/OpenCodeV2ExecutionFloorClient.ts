@@ -1,14 +1,14 @@
-import { ClientError, OpenCode } from '@opencode/client-v2-floor'
+import type { FloorClient } from '../compatibility/OpenCodeV2WireTypes.js'
 import type { ExecutionOperations } from './OpenCodeV2ExecutionClientFactory.js'
 import type { OpenCodeV2ExecutionFetch } from './OpenCodeV2ExecutionFetch.js'
 
-// Loaded only after the factory qualifies this selected pin's installed graph.
-export const executionFloorClientErrorPrototype: object = ClientError.prototype
+// The factory passes the selected pin's own client module after qualifying its graph.
+export const executionFloorClientErrorPrototype = (client: typeof FloorClient): object => client.ClientError.prototype
 
 /** Exact floor Promise API stays private to this adapter. */
-export function executionFloorOperations(baseUrl: string, directory: string, wire: OpenCodeV2ExecutionFetch, bridgeFetch: typeof globalThis.fetch): ExecutionOperations {
-  const sdk = OpenCode.make({ baseUrl, fetch: wire.fetch })
-  const bridge = OpenCode.make({ baseUrl, fetch: bridgeFetch })
+export function executionFloorOperations(client: typeof FloorClient, baseUrl: string, directory: string, wire: OpenCodeV2ExecutionFetch, bridgeFetch: typeof globalThis.fetch): ExecutionOperations {
+  const sdk = client.OpenCode.make({ baseUrl, fetch: wire.fetch })
+  const bridge = client.OpenCode.make({ baseUrl, fetch: bridgeFetch })
   return {
     identity: () => sdk.health.get(),
     location: () => sdk.location.get({ location: { directory } }),

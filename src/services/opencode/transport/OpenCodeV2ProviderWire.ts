@@ -1,5 +1,6 @@
 import { requireExecutionEndpoint } from '../host/OpenCodeV2ExecutionHost.js'
 import { executionAssert, type ExecutionAuthority } from '../execution/OpenCodeV2ExecutionContracts.js'
+import { openCodeV2Wire } from '../compatibility/OpenCodeV2Registry.js'
 import { boundOpenCodeRead, checkOpenCodeReadJson } from './OpenCodeBoundedFetch.js'
 
 type ProviderOperation = 'provider-read' | 'model-read' | 'integration-read' | 'activation-await' | 'key-connect' | 'credential-delete' | 'credential-activate'
@@ -33,11 +34,12 @@ export class OpenCodeV2ProviderWire {
     const scoped = /^\/api\/(?:provider(?:\/[^/]+)?|model|integration(?:\/[^/]+)?|integration\/[^/]+\/connect\/key)$/.test(url.pathname)
     const credential = /^\/api\/credential\/cred_[A-Za-z0-9]+(?:\/activate)?$/.test(url.pathname)
     const key = /^\/api\/integration\/[^/]+\/connect\/key$/.test(url.pathname)
-    const activation = this.authority.pin === '2.0.0' && request.method === 'POST' && url.pathname === '/api/plugin/await-activation'
+    const floor = openCodeV2Wire(this.authority.pin) === 'floor'
+    const activation = floor && request.method === 'POST' && url.pathname === '/api/plugin/await-activation'
     executionAssert((request.method === 'GET' && scoped && !key) || (request.method === 'POST' && key) ||
       (credential && (request.method === 'DELETE' || request.method === 'POST' && url.pathname.endsWith('/activate'))) || activation, 'provider_transport_unsupported')
     executionAssert(!activation || request.body === null, 'provider_transport_unsupported')
-    const location = scoped || activation || credential && this.authority.pin === '2.0.0'
+    const location = scoped || activation || credential && floor
     executionAssert([...url.searchParams.keys()].every(name => name === 'location[directory]' && url.searchParams.getAll(name).length === 1) &&
       (location ? url.searchParams.get('location[directory]') === this.authority.directory : url.search === ''), 'provider_directory_changed')
     const operation: ProviderOperation = activation ? 'activation-await' : key ? 'key-connect' : credential

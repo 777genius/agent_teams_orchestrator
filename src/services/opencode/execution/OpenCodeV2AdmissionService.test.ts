@@ -12,6 +12,8 @@ import { assertExecutionSelectedModel, executionHash, type SessionAuthority } fr
 import { OpenCodeV2ExecutionFetch, rejectExecutionBeforeInvocation } from '../transport/OpenCodeV2ExecutionFetch.js'
 import { executionFloorOperations } from '../transport/OpenCodeV2ExecutionFloorClient.js'
 import { executionCurrentOperations } from '../transport/OpenCodeV2ExecutionCurrentClient.js'
+import * as FloorClient from '@opencode/client-v2.0.0'
+import * as CurrentClient from '@opencode/client-v2.0.32'
 
 const authority: SessionAuthority = {
   host: { generation: 'v2', pin: '2.0.32', dialect: 'v2-2.0.32', graphSha256: '1'.repeat(64),
@@ -176,7 +178,7 @@ describe('durable V2 admission ownership', () => {
           return new Response(JSON.stringify({ data: { id: authority.sessionID, location: { directory: authority.host.directory },
             agent: authority.agent, model, time: { created: 1 } } }), { headers: { 'content-type': 'application/json' } })
         })
-      const operations = (pin === '2.0.0' ? executionFloorOperations : executionCurrentOperations)(endpoint, authority.host.directory, wire, wire.fetch)
+      const operations = pin === '2.0.0' ? executionFloorOperations(FloorClient, endpoint, authority.host.directory, wire, wire.fetch) : executionCurrentOperations(CurrentClient, endpoint, authority.host.directory, wire, wire.fetch)
       try {
         expect(await operations.create({ sessionID: authority.sessionID, agent: authority.agent, model })).toMatchObject({ model })
         expect(await operations.get(authority.sessionID)).toMatchObject({ model })

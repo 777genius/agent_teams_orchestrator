@@ -2,7 +2,8 @@ import path from 'node:path'
 import { realpath } from 'node:fs/promises'
 import type { OpenCodeClientRequestContext } from '../OpenCodeClientRequestContext.js'
 import { assertOpenCodeV2EndpointAuthority, type OpenCodeV2EndpointAuthority } from '../host/OpenCodeHostNativeAdapter.js'
-import { verifyOpenCodePackage } from '../host/OpenCodeV2ServerGraph.js'
+import { OPENCODE_V2_CLIENT_GRAPH_ENTRIES, verifyOpenCodePackage } from '../host/OpenCodeV2ServerGraph.js'
+import { importOpenCodeV2ClientModule, resolveOpenCodeV2ClientEntry } from './OpenCodeV2ClientModule.js'
 import { OpenCodeBoundedFetch } from './OpenCodeBoundedFetch.js'
 
 /** Only finite catalog operations are exposed; no generated types or mutation client escapes. */
@@ -17,19 +18,18 @@ export type OpenCodeV2ReadClient = {
 export async function createOpenCodeV2ReadClient(authority: OpenCodeV2EndpointAuthority,
   context: OpenCodeClientRequestContext = {}) {
   assertOpenCodeV2EndpointAuthority(authority)
-  const name = authority.native.version === '2.0.0' ? '@opencode/client-v2-floor' : '@opencode/client'
-  const entry = await realpath(Bun.resolveSync(name, import.meta.dir))
-  await verifyOpenCodePackage(entry, '@opencode/client', authority.native.version)
-  for (const [dependency, subpath] of [['schema', 'installation-event'], ['protocol', 'groups/pty']]) {
+  const entry = await resolveOpenCodeV2ClientEntry(authority.native.version)
+  for (const [dependency, subpath] of OPENCODE_V2_CLIENT_GRAPH_ENTRIES) {
     await verifyOpenCodePackage(await realpath(Bun.resolveSync(`@opencode/${dependency}/${subpath}`, path.dirname(entry))),
       `@opencode/${dependency}`, authority.native.version)
   }
   const wire = new OpenCodeBoundedFetch(authority.baseUrl, authority.native.version,
     authority.directory, authority.authorization, context)
   try {
-    const client = authority.native.version === '2.0.0'
-      ? (await import('./OpenCodeV2FloorClient.js')).createOpenCodeV2FloorClient(authority.baseUrl, wire)
-      : (await import('./OpenCodeV2CurrentClient.js')).createOpenCodeV2CurrentClient(authority.baseUrl, wire)
+    const selected = await importOpenCodeV2ClientModule(authority.native.version, entry)
+    const client = selected.wire === 'floor'
+      ? (await import('./OpenCodeV2FloorClient.js')).createOpenCodeV2FloorClient(selected.module, authority.baseUrl, wire)
+      : (await import('./OpenCodeV2CurrentClient.js')).createOpenCodeV2CurrentClient(selected.module, authority.baseUrl, wire)
     return { client, check: () => wire.check(), dispose: () => wire.dispose() }
   } catch (error) { await wire.dispose(); throw error }
 }

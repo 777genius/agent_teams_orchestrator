@@ -1,58 +1,91 @@
 import filesystem from 'node:fs/promises'
 import path from 'node:path'
 import { hashOpenCodeFile, readOpenCodePackageManifest } from '../compatibility/OpenCodeNativeIdentity.js'
-import { openCodeV2EffectVersion, type OpenCodeV2Pin } from '../compatibility/OpenCodeGenerationPolicy.js'
+import { isOpenCodeV2Pin, openCodeV2GraphPackages, type OpenCodeV2Pin } from '../compatibility/OpenCodeV2Registry.js'
 import { readRecord } from '../catalog/OpenCodeV2ReadStatus.js'
 import { openCodeReadAssert } from '../transport/OpenCodeBoundedFetch.js'
 
-export async function verifyOpenCodeV2ServerGraph(pin: OpenCodeV2Pin) {
-  const name = pin === '2.0.0' ? '@opencode/server-v2-floor' : '@opencode/server'
-  const modulePath = await filesystem.realpath(Bun.resolveSync(`${name}/process`, import.meta.dir))
+/** Official server packages pinned to the graph version, with an entry each subpath exports. */
+export const OPENCODE_V2_SERVER_GRAPH_ENTRIES = [['core', 'bus'], ['protocol', 'groups/pty'],
+  ['schema', 'installation-event'], ['util', 'effect/layer-node'], ['simulation', 'backend']] as const
+export const OPENCODE_V2_CLIENT_GRAPH_ENTRIES = [['schema', 'installation-event'], ['protocol', 'groups/pty']] as const
+export const OPENCODE_V2_EFFECT_PLATFORM_ENTRIES = [['@effect/platform-node', 'NodeHttpServer'],
+  ['@effect/platform-node-shared', 'NodeStream']] as const
+const EXACT_RELEASE = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?$/
+
+export type OpenCodeV2ServerGraph = Readonly<{
+  pin: OpenCodeV2Pin; modulePath: string; moduleSha256: string
+  effectPath: string; effectVersion: string; clientPath: string
+}>
+
+/** Resolve one version-derived graph alias; an unstaged version is a coded refusal. */
+export async function resolveOpenCodeV2GraphEntry(pin: OpenCodeV2Pin, kind: 'server' | 'client',
+  subpath?: string, from: string = import.meta.dir): Promise<string> {
+  openCodeReadAssert(isOpenCodeV2Pin(pin), 'opencode_v2_version_out_of_range')
+  const name = openCodeV2GraphPackages(pin)[kind]
+  let entry: string
+  try { entry = Bun.resolveSync(subpath ? `${name}/${subpath}` : name, from) }
+  catch { throw new Error('opencode_v2_graph_unavailable') }
+  return filesystem.realpath(entry)
+}
+
+/** The selected server declares the exact Effect release its whole graph must share. */
+export async function readOpenCodeV2ServerEffectVersion(modulePath: string): Promise<string> {
+  const info = await readOpenCodePackageAt(modulePath)
+  openCodeReadAssert(info.name === '@opencode/server', 'identity_mismatch')
+  const dependencies = readRecord(info.dependencies)
+  const version = dependencies.effect
+  openCodeReadAssert(typeof version === 'string' && EXACT_RELEASE.test(version), 'identity_mismatch')
+  return version
+}
+
+export async function verifyOpenCodeV2ServerGraph(pin: OpenCodeV2Pin): Promise<OpenCodeV2ServerGraph> {
+  const modulePath = await resolveOpenCodeV2GraphEntry(pin, 'server', 'process')
   await verifyOpenCodePackage(modulePath, '@opencode/server', pin)
+  const effectVersion = await readOpenCodeV2ServerEffectVersion(modulePath)
   const effectPath = await filesystem.realpath(Bun.resolveSync('effect', path.dirname(modulePath)))
-  await verifyOpenCodePackage(effectPath, 'effect', openCodeV2EffectVersion(pin))
-  for (const [dependency, subpath] of [['core', 'bus'], ['protocol', 'groups/pty'],
-    ['schema', 'installation-event'], ['util', 'effect/layer-node'], ['simulation', 'backend']]) {
+  await verifyOpenCodePackage(effectPath, 'effect', effectVersion)
+  for (const [dependency, subpath] of OPENCODE_V2_SERVER_GRAPH_ENTRIES) {
     const entry = await filesystem.realpath(Bun.resolveSync(`@opencode/${dependency}/${subpath}`, path.dirname(modulePath)))
     await verifyOpenCodePackage(entry, `@opencode/${dependency}`, pin)
-    await verifyOpenCodeV2GraphEffect(entry, effectPath, pin)
+    await verifyOpenCodeV2GraphEffect(entry, effectPath, effectVersion)
     if (dependency === 'core') {
       // compileRequest returns Effect programs that core evaluates directly.
       const ai = await filesystem.realpath(Bun.resolveSync('@opencode/ai/route/client', path.dirname(entry)))
       await verifyOpenCodePackage(ai, '@opencode/ai', pin)
-      await verifyOpenCodeV2GraphEffect(ai, effectPath, pin)
+      await verifyOpenCodeV2GraphEffect(ai, effectPath, effectVersion)
       // A hoisted shared effect binder must never decode with a foreign Effect.
       const drizzle = await filesystem.realpath(Bun.resolveSync('drizzle-orm/effect-core', path.dirname(entry)))
       await verifyOpenCodePackage(drizzle, 'drizzle-orm')
-      await verifyOpenCodeV2GraphEffect(drizzle, effectPath, pin)
+      await verifyOpenCodeV2GraphEffect(drizzle, effectPath, effectVersion)
     }
   }
-  for (const [dependency, subpath] of [['@effect/platform-node', 'NodeHttpServer'], ['@effect/platform-node-shared', 'NodeStream']]) {
+  for (const [dependency, subpath] of OPENCODE_V2_EFFECT_PLATFORM_ENTRIES) {
     const entry = await filesystem.realpath(Bun.resolveSync(`${dependency}/${subpath}`, path.dirname(modulePath)))
-    await verifyOpenCodePackage(entry, dependency!, openCodeV2EffectVersion(pin))
-    await verifyOpenCodeV2GraphEffect(entry, effectPath, pin)
+    await verifyOpenCodePackage(entry, dependency, effectVersion)
+    await verifyOpenCodeV2GraphEffect(entry, effectPath, effectVersion)
   }
-  const client = await filesystem.realpath(Bun.resolveSync(pin === '2.0.0' ? '@opencode/client-v2-floor' : '@opencode/client', import.meta.dir))
-  await verifyOpenCodePackage(client, '@opencode/client', pin)
+  const clientPath = await resolveOpenCodeV2GraphEntry(pin, 'client')
+  await verifyOpenCodePackage(clientPath, '@opencode/client', pin)
   // The selected Promise client exchanges JSON only; its optional Effect peer
   // is not executed. Schema/protocol imports must still retain their own pin.
-  for (const [dependency, subpath] of [['schema', 'installation-event'], ['protocol', 'groups/pty']]) {
-    const entry = await filesystem.realpath(Bun.resolveSync(`@opencode/${dependency}/${subpath}`, path.dirname(client)))
+  for (const [dependency, subpath] of OPENCODE_V2_CLIENT_GRAPH_ENTRIES) {
+    const entry = await filesystem.realpath(Bun.resolveSync(`@opencode/${dependency}/${subpath}`, path.dirname(clientPath)))
     await verifyOpenCodePackage(entry, `@opencode/${dependency}`, pin)
     const clientEffect = await filesystem.realpath(Bun.resolveSync('effect', path.dirname(entry)))
-    await verifyOpenCodePackage(clientEffect, 'effect', openCodeV2EffectVersion(pin))
+    await verifyOpenCodePackage(clientEffect, 'effect', effectVersion)
   }
-  return { modulePath, effectPath, moduleSha256: await hashOpenCodeFile(modulePath) }
+  return { pin, modulePath, effectPath, effectVersion, clientPath, moduleSha256: await hashOpenCodeFile(modulePath) }
 }
 
 /** Versions alone cannot qualify two separately installed copies of Effect. */
-export async function verifyOpenCodeV2GraphEffect(entry: string, effectPath: string, pin: OpenCodeV2Pin): Promise<void> {
+export async function verifyOpenCodeV2GraphEffect(entry: string, effectPath: string, effectVersion: string): Promise<void> {
   const resolved = await filesystem.realpath(Bun.resolveSync('effect', path.dirname(entry)))
-  await verifyOpenCodePackage(resolved, 'effect', openCodeV2EffectVersion(pin))
+  await verifyOpenCodePackage(resolved, 'effect', effectVersion)
   openCodeReadAssert(resolved === effectPath, 'identity_mismatch')
 }
 
-export async function verifyOpenCodePackage(entry: string, name: string, version?: string): Promise<void> {
+async function readOpenCodePackageAt(entry: string): Promise<Record<string, unknown>> {
   let dir = path.dirname(entry)
   for (let depth = 0; depth < 5; depth++, dir = path.dirname(dir)) {
     let metadata: unknown
@@ -60,8 +93,12 @@ export async function verifyOpenCodePackage(entry: string, name: string, version
     catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue; throw error }
     const info = readRecord(metadata)
     if (info.name === undefined && info.version === undefined) continue
-    openCodeReadAssert(info.name === name && (version === undefined || info.version === version), 'identity_mismatch')
-    return
+    return info
   }
   throw new Error('identity_mismatch')
+}
+
+export async function verifyOpenCodePackage(entry: string, name: string, version?: string): Promise<void> {
+  const info = await readOpenCodePackageAt(entry)
+  openCodeReadAssert(info.name === name && (version === undefined || info.version === version), 'identity_mismatch')
 }

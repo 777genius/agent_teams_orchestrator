@@ -2,12 +2,13 @@ import { createHash } from 'node:crypto'
 import filesystem, { lstat, open, stat } from 'node:fs/promises'
 import path from 'node:path'
 import { resolveOpenCodeBinaryPath } from '../OpenCodeBinaryResolver.js'
-import { classifyOpenCodeReadGeneration, type OpenCodeReadGeneration, type OpenCodeV2Pin } from './OpenCodeGenerationPolicy.js'
+import { classifyOpenCodeReadGeneration, type OpenCodeReadGeneration } from './OpenCodeGenerationPolicy.js'
+import type { OpenCodeV2Dialect, OpenCodeV2Pin } from './OpenCodeV2Registry.js'
 import { createOpenCodeVersionReadRoots } from '../profile/OpenCodeV2ManagedConfig.js'
 import { readOpenCodeOwnedVersion } from './OpenCodeVersionProbe.js'
 
 export type OpenCodeV2NativeIdentity = {
-  generation: 'v2'; version: OpenCodeV2Pin; dialect: 'v2-2.0.0' | 'v2-2.0.32'
+  generation: 'v2'; version: OpenCodeV2Pin; dialect: OpenCodeV2Dialect
   executablePath: string; executableSha256: string; packageName: string
 }
 

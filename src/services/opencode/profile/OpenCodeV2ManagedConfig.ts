@@ -2,8 +2,7 @@ import { mkdtemp, mkdir, realpath, rm } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import type { ConfigEntry as FloorEntry } from '@opencode/client-v2-floor'
-import type { ConfigEntry as CurrentEntry } from '@opencode/client'
+import type { CurrentConfigEntry as CurrentEntry, FloorConfigEntry as FloorEntry } from '../compatibility/OpenCodeV2WireTypes.js'
 
 /** Native vocabulary; these overrides authorize no session, model, or plugin work. */
 export const openCodeV2ReadOverrides = {

@@ -8,7 +8,7 @@ import { readWindowsRealpathFailure, retainWindowsRealpathFailure } from './Open
 
 for (const pin of ['2.0.0', '2.0.32'] as const)
 test(`selected ${pin} filesystem replacement reaches direct and transitive consumers without changing refusal semantics`, async () => {
-  const directory = path.dirname(Bun.resolveSync(pin === '2.0.0' ? '@opencode/server-v2-floor/options' : '@opencode/server/options', import.meta.dir))
+  const directory = path.dirname(Bun.resolveSync(`@opencode/server-v${pin}/options`, import.meta.dir))
   const load = <T>(specifier: string): Promise<T> => import(pathToFileURL(Bun.resolveSync(specifier, directory)).href)
   const effect = await load<typeof import('effect')>('effect')
   const { Effect, Layer, FileSystem, Exit, PlatformError } = effect

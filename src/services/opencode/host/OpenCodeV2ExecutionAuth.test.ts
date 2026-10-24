@@ -31,8 +31,8 @@ test('execution auth module loads without importing either official client befor
   try {
     const source = new URL('./OpenCodeV2ExecutionAuth.ts', import.meta.url).href
     const script = `Bun.plugin({name:'TEST-client-selection',setup(build){
-      build.onResolve({filter:/^@opencode\\/client(?:-v2-floor)?$/},()=>{throw Error('TEST_client_import_before_selection')})
-      build.onLoad({filter:/[/\\\\]@opencode[/\\\\]client(?:-v2-floor)?[/\\\\]/},()=>{throw Error('TEST_client_import_before_selection')})
+      build.onResolve({filter:/^@opencode\\/client(?:-v[0-9.]+)?$/},()=>{throw Error('TEST_client_import_before_selection')})
+      build.onLoad({filter:/[/\\\\]@opencode[/\\\\]client(?:-v[0-9.]+)?[/\\\\]/},()=>{throw Error('TEST_client_import_before_selection')})
     }});try{const value=await import(${JSON.stringify(source)});
     if(typeof value.initializeOpenCodeV2ExecutionAuth!=='function'||typeof value.attachOpenCodeV2SelectedKey!=='function')throw Error('TEST_auth_exports_missing');
     await Bun.stdout.write('TEST-auth-module-selected-lazy');
@@ -52,7 +52,7 @@ test('fresh official database skips legacy key import; native key attachment mak
   const f = await fixture()
   let db: SQLite | undefined
   try {
-    const server = Bun.resolveSync('@opencode/server-v2-floor/process', import.meta.dir)
+    const server = Bun.resolveSync('@opencode/server-v2.0.0/process', import.meta.dir)
     const core = Bun.resolveSync('@opencode/core/database/database', server)
     const { Database }: typeof import('@opencode/core/database/database') = await import(pathToFileURL(core).href)
     const { Global }: typeof import('@opencode/util/global') = await import(pathToFileURL(Bun.resolveSync('@opencode/util/global', core)).href)

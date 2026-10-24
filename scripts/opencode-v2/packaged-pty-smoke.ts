@@ -4,6 +4,7 @@ import { lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:f
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
+import { isOpenCodeV2Pin, openCodeV2GraphPackages } from '../../src/services/opencode/compatibility/OpenCodeV2Registry.js'
 
 type Exit = { exitCode: number; signal?: string | number }
 type Terminal = {
@@ -129,15 +130,19 @@ export async function main(deliveryArgument: string, receipt: string, expectedPl
     const environment = { SystemRoot: systemRoot, ComSpec: command, PATH: path.dirname(command),
       HOME: home, USERPROFILE: home, APPDATA: path.join(home, 'appdata'),
       LOCALAPPDATA: path.join(home, 'localappdata'), TEMP: temp, TMP: temp }
-    for (const pin of ['2.0.0', '2.0.32'] as const) {
-      const server = await physical(Bun.resolveSync(pin === '2.0.0' ? '@opencode/server-v2-floor/process' : '@opencode/server/process', bundle), bundle)
+    // Exercise every graph the bundle staged, as recorded by its own staging manifest.
+    const staged = JSON.parse(await readFile(path.join(bundle, 'opencode-v2-graphs.json'), 'utf8')) as { pins: string[]; pty: string }
+    assert(Array.isArray(staged.pins) && staged.pins.length > 0 && typeof staged.pty === 'string', 'Staged graph manifest invalid')
+    for (const pin of staged.pins) {
+      assert(isOpenCodeV2Pin(pin), 'Staged graph manifest invalid')
+      const server = await physical(Bun.resolveSync(`${openCodeV2GraphPackages(pin).server}/process`, bundle), bundle)
       await packageInfo(server, '@opencode/server', pin, bundle)
       const core = await physical(Bun.resolveSync('@opencode/core/bus', path.dirname(server)), bundle)
       const coreRoot = await packageInfo(core, '@opencode/core', pin, bundle)
       const adapter = await physical(Bun.resolveSync('#pty', path.dirname(core)), bundle)
       assert.equal(await packageInfo(adapter, '@opencode/core', pin, bundle), coreRoot)
       const pty = await physical(Bun.resolveSync('bun-pty', path.dirname(adapter)), bundle)
-      const ptyRoot = await packageInfo(pty, 'bun-pty', '0.4.11', bundle)
+      const ptyRoot = await packageInfo(pty, 'bun-pty', staged.pty, bundle)
       const dll = await physical(path.join(ptyRoot, 'rust-pty/target/release', process.arch === 'arm64' ? 'rust_pty_arm64.dll' : 'rust_pty.dll'), bundle)
       const bytes = await readFile(dll), pe = bytes.readUInt32LE(0x3c)
       assert.equal(bytes.readUInt16LE(0), 0x5a4d); assert(pe <= bytes.length - 6)

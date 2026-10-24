@@ -3,7 +3,9 @@ import { retainOpenCodeV2CatalogFailure, type ExecutionCatalogPhase } from '../e
 import path from 'node:path'
 import { realpath } from 'node:fs/promises'
 import { hashOpenCodeFile } from '../compatibility/OpenCodeNativeIdentity.js'
-import { verifyOpenCodePackage } from '../host/OpenCodeV2ServerGraph.js'
+import { OPENCODE_V2_CLIENT_GRAPH_ENTRIES, verifyOpenCodePackage } from '../host/OpenCodeV2ServerGraph.js'
+import { isOpenCodeV2Identity, openCodeV2LaunchRefusal, openCodeV2Wire } from '../compatibility/OpenCodeV2Registry.js'
+import { importOpenCodeV2ClientModule, resolveOpenCodeV2ClientEntry } from './OpenCodeV2ClientModule.js'
 import { checkOpenCodeReadJson, boundOpenCodeRead } from './OpenCodeBoundedFetch.js'
 import { requireExecutionEndpoint, requireExecutionGraph, registerExecutionDisposer, executionAuthorityIsCatalogOnly } from '../host/OpenCodeV2ExecutionHost.js'
 import { executionAssert, ExecutionTransportFailure, executionSessionIsMissing, executionWasNotSubmitted,
@@ -132,7 +134,7 @@ function inbox(value: unknown, authority: ExecutionAuthority, sessionID: string)
   const raw = record(value)
   executionAssert(raw.sessionID === sessionID && (raw.delivery === 'queue' || raw.delivery === 'steer'), 'authority_mismatch')
   return { id: text(raw.id), sessionID, type: text(raw.type), delivery: raw.delivery,
-    timeCreated: position(authority.pin === '2.0.0' ? raw.timeCreated : record(raw.time).created),
+    timeCreated: position(openCodeV2Wire(authority.pin) === 'floor' ? raw.timeCreated : record(raw.time).created),
     payload: record(raw.payload) }
 }
 
@@ -209,14 +211,15 @@ class OpenCodeV2BridgeFetch {
       let request = new Request(input, init)
       const url = new URL(request.url), segment = '[A-Za-z0-9_-]{1,256}'
       executionAssert(url.origin === this.endpoint.baseUrl && !url.username && !url.password && !url.hash, 'authority_mismatch')
-      const instructionsPrefix = this.authority.pin === '2.0.0' ? '/api/session/' : '/api/experimental/session/'
+      const floor = openCodeV2Wire(this.authority.pin) === 'floor'
+      const instructionsPrefix = floor ? '/api/session/' : '/api/experimental/session/'
       const instructionsList = new RegExp('^' + instructionsPrefix + segment + '/instructions/entries$').test(url.pathname)
       const instructionsPut = new RegExp('^' + instructionsPrefix + segment + '/instructions/entries/[a-z0-9][a-z0-9._-]{0,255}$').test(url.pathname)
       const interrupt = new RegExp('^/api/session/' + segment + '/interrupt$').test(url.pathname)
       const inboxCancel = new RegExp('^/api/session/' + segment + '/inbox/' + segment + '$').test(url.pathname)
       const permissions = new RegExp('^/api/session/' + segment + '/permission(?:/' + segment + ')?$').test(url.pathname)
       const reply = new RegExp('^/api/session/' + segment + '/permission/' + segment + '/reply$').test(url.pathname)
-      const mcpPrefix = this.authority.pin === '2.0.0' ? '/api/mcp/' : '/api/experimental/mcp/'
+      const mcpPrefix = floor ? '/api/mcp/' : '/api/experimental/mcp/'
       const mcpList = url.pathname === '/api/mcp'
       const mcpPut = new RegExp('^' + mcpPrefix + segment + '$').test(url.pathname)
       const mcpAction = new RegExp('^' + mcpPrefix + segment + '/(?:connect|disconnect)$').test(url.pathname)
@@ -225,7 +228,7 @@ class OpenCodeV2BridgeFetch {
         request.method === 'PUT' && (instructionsPut || mcpPut) ||
         request.method === 'POST' && (interrupt || reply || mcpAction) ||
         request.method === 'DELETE' && inboxCancel, 'unsupported_input')
-      const mcp = mcpList || mcpPut || mcpAction, resumeField = this.authority.pin === '2.0.0' ? 'continue' : 'resume'
+      const mcp = mcpList || mcpPut || mcpAction, resumeField = floor ? 'continue' : 'resume'
       const allowedQuery = mcp ? ['location[directory]'] : interrupt ? [resumeField] : []
       for (const key of url.searchParams.keys()) executionAssert(allowedQuery.includes(key) &&
         url.searchParams.getAll(key).length === 1, 'authority_mismatch')
@@ -250,7 +253,7 @@ class OpenCodeV2BridgeFetch {
       if (instructionsPut || mcpPut || reply) {
         const body = await consume(request.body, 1024 * 1024); checkOpenCodeReadJson(body)
         const fields = record(JSON.parse(body))
-        const expected = instructionsPut ? 'value' : mcpPut ? 'config' : this.authority.pin === '2.0.0' ? 'reply' : 'decision'
+        const expected = instructionsPut ? 'value' : mcpPut ? 'config' : floor ? 'reply' : 'decision'
         executionAssert(Object.keys(fields).length === 1 && expected in fields, 'unsupported_input')
         if (instructionsPut) validateJson(fields.value)
         if (reply) executionAssert(fields[expected] === 'once' || fields[expected] === 'always' || fields[expected] === 'reject', 'invalid_input')
@@ -291,16 +294,14 @@ class OpenCodeV2BridgeFetch {
 
 async function operations(authority: ExecutionAuthority, context: ExecutionContext,
   endpoint: ExecutionEndpoint) {
-  executionAssert(authority.generation === 'v2' && (authority.pin === '2.0.0' || authority.pin === '2.0.32') &&
-    authority.dialect === `v2-${authority.pin}`, 'unqualified_version')
+  executionAssert(authority.generation === 'v2' && isOpenCodeV2Identity(authority.pin, authority.dialect) &&
+    openCodeV2LaunchRefusal(authority.pin) === null, 'unqualified_version')
   const graph = requireExecutionGraph(authority)
   executionAssert(graph.sha256 === authority.graphSha256, 'authority_mismatch')
-  const name = authority.pin === '2.0.0' ? '@opencode/client-v2-floor' : '@opencode/client'
-  const entry = await realpath(Bun.resolveSync(name, import.meta.dir))
+  const entry = await resolveOpenCodeV2ClientEntry(authority.pin)
   const proof = graph.files.find(file => file.path === entry)
   executionAssert(proof && await hashOpenCodeFile(entry) === proof.sha256, 'graph_mismatch')
-  await verifyOpenCodePackage(entry, '@opencode/client', authority.pin)
-  for (const [dependency, subpath] of [['schema', 'installation-event'], ['protocol', 'groups/pty']]) {
+  for (const [dependency, subpath] of OPENCODE_V2_CLIENT_GRAPH_ENTRIES) {
     const resolved = await realpath(Bun.resolveSync(`@opencode/${dependency}/${subpath}`, path.dirname(entry)))
     await verifyOpenCodePackage(resolved, `@opencode/${dependency}`, authority.pin)
     const dependencyProof = graph.files.find(file => file.path === resolved)
@@ -312,14 +313,15 @@ async function operations(authority: ExecutionAuthority, context: ExecutionConte
   try {
     wire.check()
     let ops: ExecutionOperations, clientErrorPrototype: object
-    if (authority.pin === '2.0.0') {
+    const selected = await importOpenCodeV2ClientModule(authority.pin, entry)
+    if (selected.wire === 'floor') {
       const adapter = await import('./OpenCodeV2ExecutionFloorClient.js')
-      ops = adapter.executionFloorOperations(endpoint.baseUrl, authority.directory, wire, bridgeWire.fetch)
-      clientErrorPrototype = adapter.executionFloorClientErrorPrototype
+      ops = adapter.executionFloorOperations(selected.module, endpoint.baseUrl, authority.directory, wire, bridgeWire.fetch)
+      clientErrorPrototype = adapter.executionFloorClientErrorPrototype(selected.module)
     } else {
       const adapter = await import('./OpenCodeV2ExecutionCurrentClient.js')
-      ops = adapter.executionCurrentOperations(endpoint.baseUrl, authority.directory, wire, bridgeWire.fetch)
-      clientErrorPrototype = adapter.executionCurrentClientErrorPrototype
+      ops = adapter.executionCurrentOperations(selected.module, endpoint.baseUrl, authority.directory, wire, bridgeWire.fetch)
+      clientErrorPrototype = adapter.executionCurrentClientErrorPrototype(selected.module)
     }
     return { ops, wire, bridgeWire, clientErrorPrototype }
   } catch (failure) { await Promise.allSettled([wire.dispose(), bridgeWire.dispose()]); throw failure }
@@ -338,12 +340,12 @@ export async function awaitOpenCodeV2CatalogReadiness(endpoint: ExecutionEndpoin
       phase = 'info'
       const identity = record(await ops.identity())
       executionAssert(identity.pid === requireExecutionEndpoint(authority).nativePID && identity.version === authority.pin &&
-        (authority.pin !== '2.0.0' || identity.healthy === true), 'authority_mismatch')
+        (openCodeV2Wire(authority.pin) !== 'floor' || identity.healthy === true), 'authority_mismatch')
       phase = 'location'
       executionAssert(record(await ops.location()).directory === authority.directory, 'authority_mismatch')
       phase = 'integration-ready'
       const ready = await ops.ready()
-      if (authority.pin === '2.0.32') executionAssert(record(record(ready).location).directory === authority.directory, 'authority_mismatch')
+      if (openCodeV2Wire(authority.pin) === 'current') executionAssert(record(record(ready).location).directory === authority.directory, 'authority_mismatch')
       wire.check()
     } catch (failure) {
       primary = failure; retainOpenCodeV2CatalogFailure(failure, phase, clientErrorPrototype); throw failure
@@ -361,14 +363,14 @@ export async function awaitOpenCodeV2ExecutionReadiness(endpoint: ExecutionEndpo
   try {
     const identity = record(await ops.identity())
     executionAssert(identity.pid === requireExecutionEndpoint(authority).nativePID && identity.version === authority.pin &&
-      (authority.pin !== '2.0.0' || identity.healthy === true), 'authority_mismatch')
+      (openCodeV2Wire(authority.pin) !== 'floor' || identity.healthy === true), 'authority_mismatch')
     executionAssert(record(await ops.location()).directory === authority.directory, 'authority_mismatch')
     const ready = await ops.ready()
-    if (authority.pin === '2.0.32') executionAssert(record(record(ready).location).directory === authority.directory, 'authority_mismatch')
+    if (openCodeV2Wire(authority.pin) === 'current') executionAssert(record(record(ready).location).directory === authority.directory, 'authority_mismatch')
     const agents = record(await ops.agent(selection.agent)), agent = record(agents.data)
     executionAssert(record(agents.location).directory === authority.directory && agent.id === selection.agent, 'selection_mismatch')
     executionAssert(JSON.stringify(model(agent.model)) === JSON.stringify(model(selection.model)), 'selection_mismatch')
-    const expected = [...selection.permissions, ...(authority.pin === '2.0.32' ? [{ action: 'browser', resource: '*', effect: 'deny' }] : [])]
+    const expected = [...selection.permissions, ...(openCodeV2Wire(authority.pin) === 'current' ? [{ action: 'browser', resource: '*', effect: 'deny' }] : [])]
     executionAssert(Array.isArray(agent.permissions) && agent.permissions.length >= expected.length && JSON.stringify((expected.length ? agent.permissions.slice(-expected.length) : []).map(value => {
       const rule = record(value); return { action: rule.action, resource: rule.resource, effect: rule.effect }
     })) === JSON.stringify(expected.map(rule => ({ action: rule.action, resource: rule.resource, effect: rule.effect }))), 'selection_mismatch')

@@ -6,6 +6,7 @@ import { types } from 'node:util'
 import { lstat, realpath } from 'node:fs/promises'
 import { resolveOpenCodeV2ExecutionDelivery } from './OpenCodeV2ExecutionDelivery.js'
 import { hashOpenCodeFile } from '../compatibility/OpenCodeNativeIdentity.js'
+import { assertOpenCodeV2Launchable, isOpenCodeV2Identity } from '../compatibility/OpenCodeV2Registry.js'
 import { executionAssert, executionHash, executionRecord, type ExecutionAuthority, type ExecutionContext } from '../execution/OpenCodeV2ExecutionContracts.js'
 import { boundOpenCodeRead } from '../transport/OpenCodeBoundedFetch.js'
 import { awaitOpenCodeV2ExecutionReadiness, awaitOpenCodeV2CatalogReadiness } from '../transport/OpenCodeV2ExecutionClientFactory.js'
@@ -133,8 +134,10 @@ export async function prepareOwnedNativeExecutionPlan(validatedNative: Validated
   }
   check()
   assertExecutionPlatformAvailable()
-  executionAssert(native.generation === 'v2' && (native.version === '2.0.0' || native.version === '2.0.32') &&
-    native.dialect === `v2-${native.version}` && process.versions.bun === openCodeBunVersion(), 'execution_identity_mismatch')
+  // Launch admission: the selected version must be in range and qualified (coded refusal).
+  assertOpenCodeV2Launchable(native.version)
+  executionAssert(native.generation === 'v2' && isOpenCodeV2Identity(native.version, native.dialect) &&
+    process.versions.bun === openCodeBunVersion(), 'execution_identity_mismatch')
   executionAssert([context.teamId, context.runId, context.laneId, context.memberId].every(value => value.length > 0))
   await validateExecutionProfile(profile); check()
   await canonicalExecutionDirectory(profile.directory); check(); progress?.('profile-validated')

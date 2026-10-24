@@ -5,7 +5,7 @@ import path from 'node:path'
 import { verifyBunPtyGraph, verifyGraphs } from './stage.js'
 
 async function ptyFixture(root: string, pin: '2.0.0' | '2.0.32') {
-  const core = path.join(root, 'node_modules', pin === '2.0.0' ? '@opencode/server-v2-floor/node_modules/@opencode/core' : '@opencode/core')
+  const core = path.join(root, 'node_modules', pin === '2.0.0' ? '@opencode/server-v2.0.0/node_modules/@opencode/core' : '@opencode/core')
   await mkdir(path.join(core, 'dist/pty'), { recursive: true })
   await writeFile(path.join(core, 'package.json'), JSON.stringify({
     name: '@opencode/core', version: pin, imports: { '#pty': './dist/pty/pty.bun.js' },

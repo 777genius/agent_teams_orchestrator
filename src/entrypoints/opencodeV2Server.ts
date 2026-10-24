@@ -2,13 +2,13 @@ import { openCodeV2ServerLoopbackUrl } from '../services/opencode/host/OpenCodeV
 import path from 'node:path'
 import { realpath } from 'node:fs/promises'
 import { pathToFileURL } from 'node:url'
-import type { ServerOptions as FloorOptions } from '@opencode/server-v2-floor/options'
-import type { ServerOptions as CurrentOptions } from '@opencode/server/options'
+import type { CurrentServerOptions as CurrentOptions, FloorServerOptions as FloorOptions } from '../services/opencode/compatibility/OpenCodeV2WireTypes.js'
 import { hashOpenCodeFile } from '../services/opencode/compatibility/OpenCodeNativeIdentity.js'
 import { verifyOpenCodeV2ServerGraph } from '../services/opencode/host/OpenCodeV2ServerGraph.js'
 import { openCodeV2ReadOverrides } from '../services/opencode/profile/OpenCodeV2ManagedConfig.js'
 import { boundOpenCodeRead, openCodeReadAssert } from '../services/opencode/transport/OpenCodeBoundedFetch.js'
 import { readRecord } from '../services/opencode/catalog/OpenCodeV2ReadStatus.js'
+import { isOpenCodeV2Pin } from '../services/opencode/compatibility/OpenCodeV2Registry.js'
 
 // Separate process only. Credentials and the acquisition nonce arrive over private IPC.
 let started = false, closing = false, nonce: string | undefined
@@ -40,7 +40,7 @@ process.once('disconnect', () => { void close() })
 process.once('SIGTERM', () => { void close() })
 
 async function start(input: Record<string, unknown>): Promise<void> {
-  openCodeReadAssert(input.pin === '2.0.0' || input.pin === '2.0.32')
+  openCodeReadAssert(isOpenCodeV2Pin(input.pin), 'opencode_v2_version_out_of_range')
   openCodeReadAssert(typeof input.password === 'string' && input.password.length === 43)
   openCodeReadAssert(typeof input.root === 'string' && path.isAbsolute(input.root))
   const root = await realpath(input.root)

@@ -33,7 +33,7 @@ async function fixture() {
 }
 
 async function official(pin: '2.0.0' | '2.0.32') {
-  const modulePath = await realpath(Bun.resolveSync(pin === '2.0.0' ? '@opencode/server-v2-floor/process' : '@opencode/server/process', import.meta.dir))
+  const modulePath = await realpath(Bun.resolveSync(`@opencode/server-v${pin}/process`, import.meta.dir))
   const locate = async (name: string) => realpath(Bun.resolveSync(name, modulePath))
   const effect: typeof import('effect') = await import(pathToFileURL(await locate('effect')).href)
   const { Database }: typeof import('@opencode/core/database/database') = await import(pathToFileURL(await locate('@opencode/core/database/database')).href)

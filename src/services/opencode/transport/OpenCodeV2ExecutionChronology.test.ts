@@ -1,5 +1,7 @@
 import { expect, test } from 'bun:test'
 import { executionCurrentOperations } from './OpenCodeV2ExecutionCurrentClient.js'
+import * as FloorClient from '@opencode/client-v2.0.0'
+import * as CurrentClient from '@opencode/client-v2.0.32'
 import { executionFloorOperations } from './OpenCodeV2ExecutionFloorClient.js'
 import { OpenCodeV2ExecutionFetch } from './OpenCodeV2ExecutionFetch.js'
 
@@ -28,7 +30,7 @@ for (const pin of ['2.0.0', '2.0.32'] as const) {
         return Response.json({ data: [], cursor: requests.length === 1 ? { next: cursor } : {} })
       })
     try {
-      const operations = (pin === '2.0.0' ? executionFloorOperations : executionCurrentOperations)(endpoint, '/TEST/project', wire, wire.fetch)
+      const operations = pin === '2.0.0' ? executionFloorOperations(FloorClient, endpoint, '/TEST/project', wire, wire.fetch) : executionCurrentOperations(CurrentClient, endpoint, '/TEST/project', wire, wire.fetch)
       await operations.messages(sessionID)
       await operations.messages(sessionID, cursor)
       expect(requests).toHaveLength(2)

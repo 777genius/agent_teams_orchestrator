@@ -1,11 +1,11 @@
-import { OpenCode } from '@opencode/client'
+import type { CurrentClient } from '../compatibility/OpenCodeV2WireTypes.js'
 import type { OpenCodeV2ReadClient } from './OpenCodeV2ClientFactory.js'
 import type { OpenCodeBoundedFetch } from './OpenCodeBoundedFetch.js'
 import { readRecord } from '../catalog/OpenCodeV2ReadStatus.js'
 import { openCodeReadAssert } from './OpenCodeBoundedFetch.js'
 
-export function createOpenCodeV2CurrentClient(baseUrl: string, wire: OpenCodeBoundedFetch): OpenCodeV2ReadClient {
-  const sdk = OpenCode.make({ baseUrl, fetch: wire.fetch })
+export function createOpenCodeV2CurrentClient(client: typeof CurrentClient, baseUrl: string, wire: OpenCodeBoundedFetch): OpenCodeV2ReadClient {
+  const sdk = client.OpenCode.make({ baseUrl, fetch: wire.fetch })
   return {
     identity: () => sdk.server.info(),
     urls: async () => (await sdk.server.info()).urls,

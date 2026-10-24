@@ -326,6 +326,7 @@ const privateProviderFailureCodes = new Set(['provider_missing', 'provider_key_m
   'execution_profile_changed', 'execution_graph_changed', 'execution_graph_incomplete', 'execution_graph_dependency_missing',
   'execution_timeout', 'execution_owner_unknown', 'execution_owner_record_invalid', 'cleanup_unknown', 'selection_mismatch', 'authority_mismatch',
   'graph_mismatch', 'identity_mismatch', 'unqualified_version', 'invalid_response', 'invalid_model',
+  'opencode_v2_version_out_of_range', 'opencode_v2_version_unqualified', 'opencode_v2_graph_unavailable',
   'http_failure', 'transport_failure', 'media_type', 'deadline', 'authority_or_deadline', 'disposed', 'timeout'])
 // Exact native producer literals only; neither an arbitrary message nor a
 // syntactically plausible unknown stage is persisted as diagnostic data.
