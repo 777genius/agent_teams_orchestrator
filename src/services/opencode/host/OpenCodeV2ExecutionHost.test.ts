@@ -12,7 +12,7 @@ import { openCodeV2ExecutionCloseAckReserveMs, runOpenCodeV2ExecutionCloseSequen
 import { acquireExecutionLease, awaitExecutionHostReady } from './OpenCodeV2ExecutionHost.js'
 import { validateExecutionProfile, type ExecutionBirth, type SelectedExecutionProfile, type ValidatedExecutionNative } from './OpenCodeV2ExecutionBinding.js'
 import { executionClosedAck, retireExecutionChild, type ExecutionRetirementPort } from './OpenCodeV2ExecutionLifecycle.js'
-import { windowsGraphActivation, windowsRealpathInstallCauses } from './windows/OpenCodeV2WindowsChildControl.js'
+import { confirmWindowsClosedAck, windowsGraphActivation, windowsRealpathInstallCauses } from './windows/OpenCodeV2WindowsChildControl.js'
 
 const birth: ExecutionBirth = { format: 'linux-start-ticks', value: '420', bootId: 'TEST-boot-domain' }
 const context = { teamId: 'TEST-team', runId: 'TEST-run', laneId: 'TEST-lane', memberId: 'TEST-member', deadline: Number.MAX_SAFE_INTEGER }
@@ -108,11 +108,16 @@ describe('execution host ownership and cleanup', () => {
         env: {}, envSha256: 'f'.repeat(64), config: { directory: '/TEST-profile/config', content: '{}', sha256: 'f'.repeat(64) },
         selection: { agent: 'worker', model: { providerID: 'TEST', id: 'model' }, permissions: [] } }
       const platform = mode === 'standalone-posix' || mode === 'owner-deadline-posix' ? 'darwin' : 'win32'
-      const scope = { AbortController, Date, windowsGraphActivation, windowsRealpathInstallCauses, boundOpenCodeRead, runOpenCodeV2ExecutionCloseSequence, openCodeV2ExecutionCloseAckReserveMs, openCodeV2RunInitializationMs,
+      const scope = { AbortController, Date, windowsGraphActivation, windowsRealpathInstallCauses, confirmWindowsClosedAck, boundOpenCodeRead, runOpenCodeV2ExecutionCloseSequence, openCodeV2ExecutionCloseAckReserveMs, openCodeV2RunInitializationMs,
         process: { platform, pid: 42, env: { PWD: profile.directory }, versions: { bun: 'TEST-bun' },
           execPath: native.bun.path, argv: ['TEST-bun', '/TEST-entry'], cwd: () => profile.directory,
           stderr: { write: (text: string) => { reports.push(JSON.parse(text)) } }, once: () => {}, exit: (code: number) => { exits.push(code) } },
-        childControl: { events, connected: () => true, send: async (value: Readonly<Record<string, unknown>>) => { sent.push(value) }, disconnect: () => {}, settled: async () => {} },
+        // The Windows owner confirms the closed ACK with its authenticated
+        // reply; no POSIX owner replies.
+        childControl: { events, connected: () => true, send: async (value: Readonly<Record<string, unknown>>) => {
+          sent.push(value)
+          if (platform === 'win32' && value.type === 'closed') events.emit('message', { type: 'closedAck', nonce: value.nonce, leaseOwnerId: value.leaseOwnerId })
+        }, disconnect: () => {}, settled: async () => {} },
         setTimeout: (run: () => void, ms: number) => { const id = ++sequence; armed.push(now + ms); timers.set(id, { at: now + ms, run }); return id },
         clearTimeout: (id: number) => { timers.delete(id) },
         executionAssert: (value: unknown, message = 'execution_contract_invalid') => { if (!value) throw new Error(message) },
