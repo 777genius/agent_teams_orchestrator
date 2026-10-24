@@ -112,7 +112,7 @@ describe('execution host ownership and cleanup', () => {
         process: { platform, pid: 42, env: { PWD: profile.directory }, versions: { bun: 'TEST-bun' },
           execPath: native.bun.path, argv: ['TEST-bun', '/TEST-entry'], cwd: () => profile.directory,
           stderr: { write: (text: string) => { reports.push(JSON.parse(text)) } }, once: () => {}, exit: (code: number) => { exits.push(code) } },
-        childControl: { events, connected: () => true, send: async (value: Readonly<Record<string, unknown>>) => { sent.push(value) }, disconnect: () => {} },
+        childControl: { events, connected: () => true, send: async (value: Readonly<Record<string, unknown>>) => { sent.push(value) }, disconnect: () => {}, settled: async () => {} },
         setTimeout: (run: () => void, ms: number) => { const id = ++sequence; armed.push(now + ms); timers.set(id, { at: now + ms, run }); return id },
         clearTimeout: (id: number) => { timers.delete(id) },
         executionAssert: (value: unknown, message = 'execution_contract_invalid') => { if (!value) throw new Error(message) },
@@ -287,7 +287,7 @@ describe('execution host ownership and cleanup', () => {
             if (platform !== 'win32') { atReady = true; child.emit('message', { type: 'ready', ...tuple(), baseUrl: 'http://127.0.0.1:1' }) }
           },
           activate: async () => { await assertLive(); observation.activate++; atReady = true; child.emit('message', { type: 'ready', ...tuple(), baseUrl: 'http://127.0.0.1:1' }) },
-          sendClose: () => { observation.closed++; child.emit('close') }, acknowledged: () => true, retire: async () => {}, kill: async () => {} }
+          sendClose: () => { observation.closed++; child.emit('close', 0) }, acknowledged: () => true, retire: async () => {}, kill: async () => {} }
       },
       readExecutionBirth: async () => { birthReads++; expect(critical).toBe(1); return birth }, awaitExecutionHostReady,
       boundOpenCodeRead: async <T>(work: Promise<T>) => work,
@@ -329,15 +329,15 @@ describe('execution host ownership and cleanup', () => {
     launches[0]!.emitRoot(nativeRoot)
     const snapshot = readObservation(leases[0]!)
     await expect(boundOpenCodeRead(closing, 1)).rejects.toThrow('timeout') // Owner's outer timer wins while original cleanup is pending.
-    expect(snapshot).toEqual({ phase: 'kernel-retirement', nativePhase: 'retire_grants_roots', nativeRoot })
+    expect(snapshot).toEqual({ phase: 'kernel-retirement', exit: 'exit_zero', closedFrame: 'accepted', nativePhase: 'retire_grants_roots', nativeRoot })
     expect(Object.isFrozen(snapshot)).toBe(true)
     expect(readObservation({ ...leases[0]! })).toBeUndefined() // Same-fields objects cannot borrow the original observation.
     launches[0]!.emitNative('TEST-private-path-secret')
-    expect(readObservation(leases[0]!)).toEqual({ phase: 'kernel-retirement' })
+    expect(readObservation(leases[0]!)).toEqual({ phase: 'kernel-retirement', exit: 'exit_zero', closedFrame: 'accepted' })
     launches[0]!.emitNative(undefined); releaseNative(); heldRetirement = undefined
     await wait(() => readObservation(leases[0]!)?.phase === 'owner-release')
-    expect(readObservation(leases[0]!)).toEqual({ phase: 'owner-release' })
-    expect(snapshot).toEqual({ phase: 'kernel-retirement', nativePhase: 'retire_grants_roots', nativeRoot })
+    expect(readObservation(leases[0]!)).toEqual({ phase: 'owner-release', exit: 'exit_zero', closedFrame: 'accepted' })
+    expect(snapshot).toEqual({ phase: 'kernel-retirement', exit: 'exit_zero', closedFrame: 'accepted', nativePhase: 'retire_grants_roots', nativeRoot })
     releaseOwner(); heldRelease = undefined; await closing
     await Promise.all(leases.map(lease => lease.close()))
     expect(launches.map(value => [value.closed, value.release])).toEqual([[1, 1], [1, 1]])

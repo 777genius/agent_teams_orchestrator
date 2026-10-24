@@ -23,7 +23,7 @@ import { selectWindowsRunMemberPreflightForPlan } from '../bridge/OpenCodeV2RunC
 import { resolveOpenCodeV2DarwinControllerRuntimeClosure } from '../profile/OpenCodeV2ExecutionReceipt.js'
 import { recordOpenCodeV2ProviderFailure, retainOpenCodeV2CatalogServerFailure, executionNativeRetirementPhases, type ExecutionAcquisitionPhase, type ExecutionAcquisitionTiming,
   readExecutionNativeRootObservation, type ExecutionNativeRootObservation,
-  type ExecutionCleanupPhase, type ExecutionCleanupObservation, type ExecutionCommandObservation, type ExecutionNativeRetirementPhase } from '../execution/OpenCodeV2Diagnostics.js'
+  type ExecutionCleanupExitClass, type ExecutionCleanupPhase, type ExecutionCleanupObservation, type ExecutionCommandObservation, type ExecutionNativeRetirementPhase } from '../execution/OpenCodeV2Diagnostics.js'
 import { readOpenCodeV2ServerFailure, type OpenCodeV2ServerFailure } from '../execution/OpenCodeV2ServerFailure.js'
 
 export type { SelectedExecutionProfile, ValidatedExecutionNative } from './OpenCodeV2ExecutionBinding.js'
@@ -291,6 +291,7 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
   let exited = false, unboundRetired = false, closeWork: Promise<ExecutionCleanupReceipt> | undefined
   let cleanupPhase: ExecutionCleanupPhase | undefined, nativeCleanupPhase: ExecutionNativeRetirementPhase | undefined
   let nativeCleanupRoot: ExecutionNativeRootObservation | undefined
+  let cleanupExitClass: ExecutionCleanupExitClass | undefined
   let exitResolve: () => void = () => undefined
   const exit = new Promise<void>(resolve => { exitResolve = resolve })
   const close = (deadline?: number): Promise<ExecutionCleanupReceipt> => closeWork ??= (async () => {
@@ -395,7 +396,14 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
         nativeCleanupRoot = undefined
       })
       child.on('retireRootProgress', (root: unknown) => { nativeCleanupRoot = readExecutionNativeRootObservation(root) })
-      child.once('close', () => { exited = true; lifetime.abort(); exitResolve(); void close().catch(() => undefined) })
+      child.once('close', (...closeArgs: unknown[]) => {
+        // Diagnostic class of the MAIN exit only: zero means the closed ACK
+        // left the child, one that the child withheld it, anything else an
+        // abnormal end. No raw code is ever retained.
+        const code = closeArgs[0]
+        cleanupExitClass = code === 0 ? 'exit_zero' : code === 1 ? 'exit_one' : 'job_terminated'
+        exited = true; lifetime.abort(); exitResolve(); void close().catch(() => undefined)
+      })
       let graphResolve!: (value: Record<string, unknown>) => void, graphReject!: (error: unknown) => void
       graphReady = new Promise((resolve, reject) => { graphResolve = resolve; graphReject = reject })
       void graphReady.catch(() => undefined)
@@ -477,6 +485,8 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
       executionAssert(!closeWork && !exited, 'execution_host_unavailable')
       const lease = Object.freeze({ authority, signal: lifetime.signal, close })
       cleanupObservations.set(lease, () => cleanupPhase ? Object.freeze({ phase: cleanupPhase,
+        ...(cleanupExitClass ? { exit: cleanupExitClass } : {}),
+        closedFrame: launch?.closedObservation ? launch.closedObservation() : launch?.acknowledged() ? 'accepted' as const : 'absent' as const,
         ...((cleanupPhase === 'kernel-retirement' || cleanupPhase === 'force-kill') && nativeCleanupPhase
           ? { nativePhase: nativeCleanupPhase,
             ...(nativeCleanupPhase === 'retire_grants_roots' && nativeCleanupRoot ? { nativeRoot: nativeCleanupRoot } : {}) } : {}) }) : undefined)

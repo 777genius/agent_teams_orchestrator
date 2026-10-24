@@ -3420,7 +3420,11 @@ struct Scope {
         for (size_t newline; (newline = buffer.find('\n')) != std::string::npos;) {
           auto packet = JsonObject::Parse(wide(buffer.substr(0, newline)));
           buffer.erase(0, newline + 1);
-          require(!exited() || text(packet, L"type") == L"closed", "execution_identity_mismatch");
+          // After MAIN exit only the closed ACK may still be relayed. A late
+          // non-closed frame is dropped without aborting the read loop, so a
+          // closed ACK queued behind it in the buffer still reaches the owner.
+          if (exited() && text(packet, L"type") != L"closed")
+            continue;
           event(L"message", packet);
         }
       }

@@ -10,7 +10,22 @@ import type { ExecutionBirth } from '../OpenCodeV2ExecutionBinding.js'
 function assert(value: unknown): asserts value { if (!value) throw new Error('execution_containment_identity_mismatch') }
 export type WindowsChildControl = Readonly<{
   events: EventEmitter; connected(): boolean; send(value: Readonly<Record<string, unknown>>, deadline?: number): Promise<void>; disconnect(): void
+  settled(): Promise<void>
 }>
+const CONTROL_CLOSE_SETTLE_MS = 400
+/** Bun can surface a named-pipe write callback before the bytes reach the pipe,
+ * and a process exit aborts any still-pending write. The child exits only after
+ * the closed ACK write and its FIN have flushed; the bound keeps this a
+ * best-effort settle that can never hang the close sequence. */
+export function settleWindowsControlClose(socket: Pick<Socket, 'once' | 'writableFinished' | 'destroyed'>,
+  deadline: number): Promise<void> {
+  if (socket.destroyed || socket.writableFinished) return Promise.resolve()
+  return new Promise<void>(resolve => {
+    const done = () => { clearTimeout(timer); resolve() }
+    const timer = setTimeout(done, Math.max(1, deadline - Date.now()))
+    socket.once('finish', done); socket.once('close', done)
+  })
+}
 const CONTROL_PACKET_LIMIT = 16 * 1024 * 1024
 let owned: WindowsChildControl | undefined
 const authenticatedPrepares = new WeakMap<object, Record<string, unknown>>()
@@ -89,6 +104,7 @@ export function windowsExecutionChildControl(): WindowsChildControl {
       finally { clearTimeout(timer) }
     },
     disconnect() { socket.end() },
+    settled: () => settleWindowsControlClose(socket, Date.now() + CONTROL_CLOSE_SETTLE_MS),
   })
   return owned
 }

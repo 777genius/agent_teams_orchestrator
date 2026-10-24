@@ -527,6 +527,7 @@ export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, l
   // Command request IDs are replayed only while their operation is pending or
   // retained in a small settled window.
   let mapping: WindowsExecutionMapping | undefined, nativeMapping: unknown, stopped = false, started = false, closed = false
+  let closedFrameRejected = false
   // A refused relay frame means this contained member broke the protocol.
   const remoteController = controllerRelays.get(plan)
   const controllerRelay = remoteController && createWindowsControllerRelayServer(remoteController,
@@ -563,7 +564,10 @@ export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, l
         void commandRequest(record)
         return
       }
-      if (mapping && record.type === 'closed' && record.nonce === nonce && record.leaseOwnerId === leaseOwnerId && record.namespace === mapping.namespace.name && record.pid === mapping.bun.nativePID && equal(record.birth, mapping.bun.birth) && record.scopeClosed === true && record.realpathClosed === mapping.realpathDll.receiptId) closed = true
+      if (record.type === 'closed') {
+        if (mapping && record.nonce === nonce && record.leaseOwnerId === leaseOwnerId && record.namespace === mapping.namespace.name && record.pid === mapping.bun.nativePID && equal(record.birth, mapping.bun.birth) && record.scopeClosed === true && record.realpathClosed === mapping.realpathDll.receiptId) closed = true
+        else closedFrameRejected = true
+      }
       child.emit('message', value)
     } catch { child.emit('error', new Error('execution_invalid_response')) }
   })
@@ -661,6 +665,7 @@ export function launchWindowsExecution(plan: WindowsLaunchPlan, nonce: string, l
       const delivered = broker!.request('send', { value: { type: 'close', nonce, leaseOwnerId } })
       void Promise.all([delivered, drain]).catch(() => child.emit('error', new Error('cleanup_unknown'))) },
     acknowledged: () => closed,
+    closedObservation: () => closed ? 'accepted' as const : closedFrameRejected ? 'rejected' as const : 'absent' as const,
     readBirth() { assert(mapping && mainExit, 'execution_identity_mismatch'); return mainExit.readBirth() },
     async kill(deadline?: number) { stopped = true; try { await retireNative(deadline) } finally { controllerRelay?.disconnect() } },
     retire(deadline?: number): Promise<WindowsKernelRetirement | WindowsUnboundRetirement> {

@@ -259,7 +259,17 @@ export function readExecutionNativeRootObservation(value: unknown, nonce?: strin
     return Object.freeze({ phase, role, index: Number(index), count: Number(count), elapsedMs: Number(elapsedMs) })
   } catch { return undefined }
 }
-export type ExecutionCleanupObservation = Readonly<{ phase: ExecutionCleanupPhase; nativePhase?: ExecutionNativeRetirementPhase
+// The MAIN exit class separates an ACK the child refused to send (exit_one)
+// from an ACK lost between the child write and the owner read (exit_zero), and
+// job_terminated covers every abnormal end. The closed-frame observation names
+// which side lost it: absent at the owner reader, or rejected by its identity
+// checks. No raw code or frame content ever leaves the runner.
+export const executionCleanupExitClasses = ['exit_zero', 'exit_one', 'job_terminated'] as const
+export type ExecutionCleanupExitClass = typeof executionCleanupExitClasses[number]
+export const executionCleanupClosedFrames = ['accepted', 'rejected', 'absent'] as const
+export type ExecutionCleanupClosedFrame = typeof executionCleanupClosedFrames[number]
+export type ExecutionCleanupObservation = Readonly<{ phase: ExecutionCleanupPhase; exit?: ExecutionCleanupExitClass
+  closedFrame?: ExecutionCleanupClosedFrame; nativePhase?: ExecutionNativeRetirementPhase
   nativeRoot?: ExecutionNativeRootObservation }>
 const cleanupFailures = new WeakMap<Error, ExecutionCleanupPhase>()
 export function retainOpenCodeV2CleanupPhase(error: Error, phase: ExecutionCleanupPhase): void {
@@ -398,9 +408,12 @@ export async function recordOpenCodeV2ProviderFailure(phase: string, error: unkn
   const nativePhase = cleanupPhase === observedPhase && (cleanupPhase === 'kernel-retirement' || cleanupPhase === 'force-kill')
     ? executionNativeRetirementPhases.find(value => value === observed?.nativePhase) : undefined
   const nativeRoot = nativePhase === 'retire_grants_roots' ? readExecutionNativeRootObservation(observed?.nativeRoot) : undefined
+  const exit = executionCleanupExitClasses.find(value => value === observed?.exit)
+  const closedFrame = executionCleanupClosedFrames.find(value => value === observed?.closedFrame)
   const cleanup = phase === 'run-member-retirement' && Number.isSafeInteger(cleanupTiming?.elapsedMs) &&
     Number(cleanupTiming?.elapsedMs) >= 0 && Number(cleanupTiming?.elapsedMs) <= 86_400_000
     ? { elapsedMs: Number(cleanupTiming?.elapsedMs), ...(cleanupPhase ? { phase: cleanupPhase } : {}),
+      ...(exit ? { exit } : {}), ...(closedFrame ? { closedFrame } : {}),
       ...(nativePhase ? { nativePhase } : {}), ...(nativeRoot ? { nativeRoot } : {}) } : undefined
   if (cleanupTiming?.dataRoot !== undefined && (!cleanup || typeof cleanupTiming.dataRoot !== 'string' || !path.isAbsolute(cleanupTiming.dataRoot))) return
   try {

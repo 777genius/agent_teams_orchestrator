@@ -27,6 +27,7 @@ const childControl = process.platform === 'win32' ? windowsExecutionChildControl
     process.send!(value, error => error ? reject(error) : resolve())
   }),
   disconnect: () => process.disconnect?.(),
+  settled: async () => { /* IPC delivery is settled by its own send callback. */ },
 }
 const controller = new AbortController()
 let prepared: Awaited<ReturnType<typeof prepareExecutionPlatformChild>> | undefined
@@ -83,7 +84,9 @@ function close(): Promise<void> {
           birth, scopeClosed: true }, Date.now() + openCodeV2ExecutionCloseAckReserveMs)
       },
     })
-    if (acknowledged) { childControl.disconnect(); process.exit(0) } else process.exit(1)
+    // The closed ACK must reach the pipe before this process dies: exit aborts
+    // any write the transport has not yet flushed.
+    if (acknowledged) { childControl.disconnect(); await childControl.settled(); process.exit(0) } else process.exit(1)
   })()
 }
 childControl.events.on('error', (error: unknown) => { reportStartupFailure('failed', error); void close() })

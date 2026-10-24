@@ -1,8 +1,9 @@
 import { expect, test } from 'bun:test'
+import { EventEmitter } from 'node:events'
 import { readFile } from 'node:fs/promises'
 import path from 'node:path'
 import { runInNewContext } from 'node:vm'
-import { windowsRealpathInstallCauses } from './OpenCodeV2WindowsChildControl.js'
+import { settleWindowsControlClose, windowsRealpathInstallCauses } from './OpenCodeV2WindowsChildControl.js'
 
 // Execute the actual private child bodies: the native DLL refuses a second
 // held anchor for one physical object, and a prepare-time refusal must leave
@@ -162,4 +163,24 @@ test('a prepare-time realpath refusal reports a closed startup cause', async () 
     restore('OPENCODE_V2_WINDOWS_NONCE', previous[0])
     restore('OPENCODE_V2_WINDOWS_LEASE', previous[1])
   }
+})
+
+// A process exit aborts an unfinished pipe write, so the closed ACK send may
+// settle only after the flush; when the transport never reports it the bound
+// still ends the wait instead of hanging the close sequence.
+test('a closed ACK settle resolves on flush completion and never hangs past its bound', async () => {
+  const double = (writableFinished: boolean) => Object.assign(new EventEmitter(),
+    { writableFinished, destroyed: false }) as unknown as Parameters<typeof settleWindowsControlClose>[0]
+  const flushedAt = Date.now()
+  await settleWindowsControlClose(double(true), flushedAt + 1000)
+  expect(Date.now() - flushedAt).toBeLessThan(50)
+  const pending = double(false)
+  const started = Date.now()
+  const settle = settleWindowsControlClose(pending, started + 5000)
+  setTimeout(() => (pending as unknown as EventEmitter).emit('finish'), 30)
+  await settle
+  expect(Date.now() - started).toBeGreaterThanOrEqual(25)
+  const silent = double(false), bounded = Date.now()
+  await settleWindowsControlClose(silent, bounded + 120)
+  expect(Date.now() - bounded).toBeLessThan(1000)
 })

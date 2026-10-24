@@ -678,3 +678,31 @@ test('run control identity diagnostics name the observed process checkpoint stag
     await rm(root, { recursive: true, force: true })
   }
 })
+
+// The cleanup row names which side lost the closed ACK: the MAIN exit class
+// separates a withheld ACK (exit_one) from one lost in transit (exit_zero), and
+// the closed-frame observation separates an owner identity rejection from a
+// frame that never arrived. Values outside the closed vocabularies are omitted.
+test('member retirement cleanup records the MAIN exit class and closed frame observation', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'TEST-v2-cleanup-exit-class-'))
+  try {
+    const write = (observation: Record<string, unknown>) => recordOpenCodeV2ProviderFailure('run-member-retirement',
+      new Error('cleanup_unknown'), true, undefined, undefined,
+      { elapsedMs: 42, dataRoot: root, observation: { phase: 'closed-ack', ...observation } as never })
+    await write({ exit: 'exit_zero', closedFrame: 'absent' })
+    await write({ exit: 'exit_one', closedFrame: 'rejected' })
+    await write({ exit: 'job_terminated', closedFrame: 'accepted' })
+    await write({ exit: 'exit_42', closedFrame: 'TEST-RAW-FRAME' })
+    const directory = path.join(root, 'opencode/v2/provider-diagnostics')
+    const rows = await Promise.all((await readdir(directory)).map(async name =>
+      JSON.parse(await readFile(path.join(directory, name), 'utf8')) as { cleanup: Record<string, unknown> }))
+    expect(rows.map(row => JSON.stringify(row.cleanup)).sort()).toEqual([
+      JSON.stringify({ elapsedMs: 42, phase: 'closed-ack' }),
+      JSON.stringify({ elapsedMs: 42, phase: 'closed-ack', exit: 'exit_one', closedFrame: 'rejected' }),
+      JSON.stringify({ elapsedMs: 42, phase: 'closed-ack', exit: 'exit_zero', closedFrame: 'absent' }),
+      JSON.stringify({ elapsedMs: 42, phase: 'closed-ack', exit: 'job_terminated', closedFrame: 'accepted' }),
+    ].sort())
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
