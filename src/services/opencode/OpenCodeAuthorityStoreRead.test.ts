@@ -134,7 +134,9 @@ describe('O1a typed authority read', () => {
     try {
       expect(await readOpenCodeAuthority(file, isKnownSessionStore)).toEqual({
         kind: 'preserved_unknown',
-        reason: replacementKind === 'symlink' ? 'unreadable' : replacementKind === 'directory' ? 'nonregular' : 'invalid',
+        reason: replacementKind === 'symlink'
+          ? process.platform === 'win32' ? 'nonregular' : 'unreadable'
+          : replacementKind === 'directory' ? 'nonregular' : 'invalid',
       })
       expect(opens).toBe(replacementKind === 'invalid' ? 2 : 1)
       expect(await readFile(peer, 'utf8')).toBe(peerBytes)
