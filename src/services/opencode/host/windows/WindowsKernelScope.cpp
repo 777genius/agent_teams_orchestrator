@@ -26,6 +26,7 @@
 #include <winternl.h>
 using namespace winrt::Windows::Data::Json;
 static constexpr size_t CONTROL_PACKET_LIMIT = 16 * 1024 * 1024;
+static constexpr DWORD CONTROL_EXIT_READ_GRACE_MS = 2000;
 struct NativeError {
   std::string code;
   DWORD win32 = 0;
@@ -3347,18 +3348,31 @@ struct Scope {
     return info.ActiveProcesses;
   }
   bool exited() { return WaitForSingleObject(process.value, 0) == WAIT_OBJECT_0; }
-  bool completeIo(OVERLAPPED &overlap, DWORD &transferred, DWORD timeout) {
+  bool completeIo(OVERLAPPED &overlap, DWORD &transferred, DWORD timeout,
+                  bool readMayOutliveExit = false) {
     HANDLE events[] = {overlap.hEvent, cancel.value, process.value};
     DWORD waited = WaitForMultipleObjects(3, events, FALSE, timeout);
+    if (waited == WAIT_OBJECT_0 + 2 && readMayOutliveExit) {
+      // The closed ACK is the child's final frame and races this exit signal:
+      // the read must still deliver the bytes already queued behind it instead
+      // of cancelling away the tail of the stream.
+      HANDLE grace[] = {overlap.hEvent, cancel.value};
+      if (WaitForMultipleObjects(2, grace, FALSE, CONTROL_EXIT_READ_GRACE_MS) == WAIT_OBJECT_0)
+        waited = WAIT_OBJECT_0;
+    }
     if (waited == WAIT_OBJECT_0)
       return GetOverlappedResult(pipe.value, &overlap, &transferred, FALSE) != 0;
 
     // CancelIoEx requests cancellation; it does not establish completion. Keep
     // the OVERLAPPED, event and caller buffer alive until the kernel completes
-    // this exact operation, including the already-completed race.
+    // this exact operation, including the already-completed race, whose
+    // read result is delivered data and never waste to discard.
     CancelIoEx(pipe.value, &overlap);
-    DWORD ignored = 0;
-    GetOverlappedResult(pipe.value, &overlap, &ignored, TRUE);
+    DWORD completed = 0;
+    if (GetOverlappedResult(pipe.value, &overlap, &completed, TRUE) != 0 && completed > 0) {
+      transferred = completed;
+      return true;
+    }
     return false;
   }
   bool io(bool write, void *bytes, DWORD count, DWORD &transferred) {
@@ -3374,7 +3388,7 @@ struct Scope {
       return false;
     // Quiet sessions remain live. Writes are bounded; reads end on peer data,
     // explicit cancellation or the privately held main-process signal.
-    return completeIo(overlap, transferred, write ? 15000 : INFINITE);
+    return completeIo(overlap, transferred, write ? 15000 : INFINITE, !write);
   }
   void send(JsonObject value) {
     std::string bytes = narrow(std::wstring(value.Stringify())) + '\n';
