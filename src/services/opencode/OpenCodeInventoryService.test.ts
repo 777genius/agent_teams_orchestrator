@@ -242,6 +242,25 @@ describe('OpenCodeInventoryService parsers', () => {
     expect(isOpenCodeInventoryTimeoutSnapshot(result)).toBe(false)
   })
 
+  test('retains command timing when deadline cleanup replaces the active step', () => {
+    let now = 0
+    const progress = createOpenCodeInventoryProbeProgressTracker(() => now)
+    const leaveCommand = progress.enterStep('opencode providers list')
+    now = 10_000
+    const leaveCleanup = progress.enterStep('clean up OpenCode inventory command')
+    leaveCommand()
+    now = 10_500
+    expect(progress.snapshot()).toEqual({
+      elapsedMs: 10_500,
+      currentStep: 'clean up OpenCode inventory command',
+      currentStepElapsedMs: 500,
+      completedSteps: [{ label: 'opencode providers list', durationMs: 10_000 }],
+    })
+    leaveCleanup()
+    leaveCleanup()
+    expect(progress.snapshot().completedSteps).toHaveLength(2)
+  })
+
   test('reports the active OpenCode inventory step and aborts on probe timeout', async () => {
     let now = 100
     const progress = createOpenCodeInventoryProbeProgressTracker(() => now)
@@ -263,7 +282,7 @@ describe('OpenCodeInventoryService parsers', () => {
 
     expect(aborted).toBe(true)
     expect(result.probeError).toBe(
-      'OpenCode inventory probe timed out after 1ms during opencode providers list',
+      'OpenCode inventory probe timed out after 1ms during opencode providers list Current OpenCode inventory step: opencode providers list has been running for 41ms. Completed OpenCode inventory steps before timeout: prepare managed OpenCode profile (3ms).',
     )
     expect(result.diagnostics).toContain(
       'Current OpenCode inventory step: opencode providers list has been running for 41ms.',

@@ -7,6 +7,7 @@ import { pathToFileURL } from 'node:url'
 import { PassThrough } from 'node:stream'
 
 import { describe, expect, test } from 'bun:test'
+import * as lockfile from '../../utils/lockfile.js'
 
 import {
   OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID,
@@ -54,6 +55,33 @@ const baseProfile: OpenCodePreparedProfile = {
   authState: 'ok',
   env: {},
 }
+
+test.each(['success', 'read_failure'] as const)('drains lifecycle registry cleanup before real CLI process exit (%s)', async mode => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'TEST-opencode-lifecycle-exit-'))
+  try {
+    const project = await import('node:fs/promises').then(fs => fs.realpath(root))
+    const profilePath = path.join(root, 'profile.json')
+    await writeFile(profilePath, JSON.stringify({ ...baseProfile, projectPath: project,
+      canonicalProjectPath: project, workingDirectoryPath: project, tmpPath: path.join(root, 'tmp') }))
+    const child = Bun.spawn([process.execPath,
+      path.join(import.meta.dir, 'fixtures/host-lifecycle-exit.ts'), root, profilePath, mode], {
+      env: { ...process.env, CLAUDE_MULTIMODEL_DEBUG_OPENCODE_COMMAND: '0' }, stdout: 'pipe', stderr: 'pipe',
+    })
+    const [exitCode, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()])
+    expect(stderr).toBe('')
+    expect(exitCode).toBe(0)
+    expect(JSON.parse(await readFile(path.join(root, 'result.json'), 'utf8'))).toEqual({
+      acquisitionPaused: true, gateReleased: true, cleanupReadFailed: mode === 'read_failure',
+      lockPresentBeforeExit: false, registryPresent: mode === 'read_failure',
+    })
+    expect(await pathExists(path.join(root, 'host-registry.json.lock.lock'))).toBe(false)
+    if (mode === 'read_failure') {
+      expect(await readFile(path.join(root, 'host-registry.json'), 'utf8')).toBe('{invalid-TEST-registry')
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+}, 20000)
 
 test('deadline-bound host startup waits past the fallback retry cap', () => {
   const locked = Object.assign(new Error('contended'), { code: 'ELOCKED' })
@@ -1988,6 +2016,7 @@ describe('OpenCodeHostManager', () => {
       prepareProfile: async () => baseProfile,
       allocateLoopbackPort: async () => 43136,
       spawnHostProcess: () => spawned.child,
+      readProcessStartTimeMs: async () => 42,
       fetchJson: async url => {
         if (url.endsWith('/global/health')) {
           return {
@@ -3600,6 +3629,7 @@ import { mock } from 'bun:test'
 import { access, mkdir } from 'node:fs/promises'
 import path from 'node:path'
 let data = path.join(process.argv[2], 'managed-data'), calls = 0, refuse = false
+const prepared = new Set<string>()
 process.env.CLAUDE_MULTIMODEL_DATA_HOME = data
 const original = new Error('execution_owner_not_private:private_acl_owner:0')
 mock.module(${JSON.stringify(privateDirectoriesUrl)}, () => ({
@@ -3607,7 +3637,8 @@ mock.module(${JSON.stringify(privateDirectoriesUrl)}, () => ({
   ensureWindowsPrivateDirectories: async (directories: readonly string[]) => {
     assert.deepEqual(directories, [data, path.join(data, 'opencode')])
     if (refuse) throw original
-    assert.equal(await access(path.join(data, 'opencode', 'host-registry.json.lock')).then(() => true, () => false), false)
+    if (!prepared.has(data)) assert.equal(await access(path.join(data, 'opencode', 'host-registry.json.lock')).then(() => true, () => false), false)
+    prepared.add(data)
     calls++
     await mkdir(path.join(data, 'opencode'), { recursive: true })
   },
@@ -3616,16 +3647,17 @@ const { OpenCodeHostManager } = await import(${JSON.stringify(hostManagerUrl)})
 const manager = new OpenCodeHostManager({ processAttributionDirectory: null })
 const result = await manager.reconcilePersistentHosts({ reason: 'startup' })
 assert.equal(result.remaining, 0)
-assert.equal(calls, 1)
+assert.ok(calls >= 1)
+const initialCalls = calls
 const custom = path.join(process.argv[2], 'custom', 'registry.json')
 await new OpenCodeHostManager({ persistentRegistryPath: custom, processAttributionDirectory: null }).reconcilePersistentHosts()
-assert.equal(calls, 1)
+assert.equal(calls, initialCalls)
 await access(custom + '.lock')
 data = path.join(process.argv[2], 'fresh-ensure-data')
 process.env.CLAUDE_MULTIMODEL_DATA_HOME = data
 const profileStopped = new Error('TEST-before-host-spawn')
 await assert.rejects(new OpenCodeHostManager({ processAttributionDirectory: null, prepareProfile: async () => {
-  assert.equal(calls, 2)
+  assert.equal(calls, initialCalls + 1)
   await access(path.join(data, 'opencode', 'host-registry.json.lock'))
   throw profileStopped
 } }).ensureHost(), error => error === profileStopped)
@@ -3648,3 +3680,100 @@ assert.equal(await access(path.join(data, 'opencode', 'host-registry.json.lock')
     }
   } finally { await rm(root, { recursive: true, force: true }) }
 }, 15_000)
+
+test('historical reconciliation process inspection does not block an unrelated persistent lease', async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'TEST-opencode-reconcile-gate-'))
+  const registryPath = path.join(tempDir, 'host-registry.json')
+  let entered!: () => void
+  const inspectionStarted = new Promise<void>(resolve => { entered = resolve })
+  let resume!: () => void
+  const inspectionGate = new Promise<void>(resolve => { resume = resolve })
+  const record = (hostKey: string, pid: number) => ({
+    hostKey, pid, processStartedAtMs: 1000, profileRootKey: 'TEST-profile',
+    projectPath: tempDir, projectBehaviorFingerprint: 'TEST', managedConfigFingerprint: 'TEST',
+    baseUrl: `http://127.0.0.1:${pid}`, port: pid, version: '1.19.4',
+    resolvedConfigFingerprint: null, updatedAt: new Date().toISOString(), leases: {},
+  })
+  await writeFile(registryPath, JSON.stringify({ schemaVersion: 1, hosts: {
+    historical: record('historical', 43211), unrelated: record('unrelated', 43212),
+  } }))
+  const manager = new OpenCodeHostManager({
+    persistentRegistryPath: registryPath, processAttributionDirectory: null,
+    isProcessAlive: () => true,
+    readProcessStartTimeMs: async pid => {
+      if (pid === 43211) { entered(); await inspectionGate }
+      return 1000
+    },
+  })
+  const reconciliation = manager.reconcilePersistentHosts({ reason: 'TEST', staleAgeMs: 60_000 })
+  await inspectionStarted
+  try {
+    // Reject the old held gate immediately, without a machine-speed assertion.
+    const release = await lockfile.lock(`${registryPath}.lock`, { retries: 0 })
+    await release()
+    await manager.retainHostLease('unrelated', {
+      teamId: 'TEST-team', memberName: 'alice', runId: 'TEST-run', sessionId: 'TEST-session',
+    })
+    resume()
+    const result = await reconciliation
+    const persisted = JSON.parse(await readFile(registryPath, 'utf8'))
+    expect(result.remaining).toBe(2)
+    expect(Object.keys(persisted.hosts)).toEqual(['historical', 'unrelated'])
+    expect(Object.values(persisted.hosts.unrelated.leases)).toHaveLength(1)
+  } finally {
+    resume()
+    await reconciliation
+    await rm(tempDir, { recursive: true, force: true })
+  }
+})
+
+test.each(['lease', 'generation'] as const)('reconciliation discards slow qualification after a host %s change', async change => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'TEST-opencode-reconcile-cas-'))
+  const registryPath = path.join(tempDir, 'host-registry.json')
+  let entered!: () => void
+  const inspectionStarted = new Promise<void>(resolve => { entered = resolve })
+  let resume!: () => void
+  const inspectionGate = new Promise<void>(resolve => { resume = resolve })
+  const killed: number[] = []
+  const record = {
+    hostKey: 'historical', pid: 43213, processStartedAtMs: 1000, profileRootKey: 'TEST-profile',
+    projectPath: tempDir, projectBehaviorFingerprint: 'TEST', managedConfigFingerprint: 'TEST',
+    baseUrl: 'http://127.0.0.1:43213', port: 43213, version: '1.19.4',
+    resolvedConfigFingerprint: null, updatedAt: new Date().toISOString(), leases: {},
+  }
+  await writeFile(registryPath, JSON.stringify({ schemaVersion: 1, hosts: { historical: record } }))
+  const manager = new OpenCodeHostManager({
+    persistentRegistryPath: registryPath, processAttributionDirectory: null,
+    isProcessAlive: () => true,
+    killProcess: pid => { killed.push(pid) },
+    readProcessStartTimeMs: async () => { entered(); await inspectionGate; return 1000 },
+  })
+  const reconciliation = manager.reconcilePersistentHosts({ reason: 'TEST', mode: 'force' })
+  await inspectionStarted
+  try {
+    if (change === 'lease') {
+      await manager.retainHostLease('historical', {
+        teamId: 'TEST-team', memberName: 'bob', runId: 'TEST-new-run', sessionId: 'TEST-new-session',
+      })
+    } else {
+      await writeFile(registryPath, JSON.stringify({ schemaVersion: 1, hosts: {
+        historical: { ...record, pid: 43214, processStartedAtMs: 2000 },
+      } }))
+    }
+    resume()
+    const result = await reconciliation
+    expect(killed).toEqual([])
+    expect(result.hosts[0]).toMatchObject({
+      action: 'kept_active', reason: 'host ownership changed during reconciliation qualification',
+    })
+    const persisted = JSON.parse(await readFile(registryPath, 'utf8'))
+    expect(Object.values(persisted.hosts.historical.leases)).toHaveLength(change === 'lease' ? 1 : 0)
+    expect(persisted.hosts.historical.pid).toBe(change === 'lease' ? 43213 : 43214)
+    expect(result.remaining).toBe(1)
+    expect(result.cleaned).toBe(0)
+  } finally {
+    resume()
+    await reconciliation
+    await rm(tempDir, { recursive: true, force: true })
+  }
+})

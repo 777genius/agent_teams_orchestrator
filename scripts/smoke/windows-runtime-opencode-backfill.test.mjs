@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import childProcess, { spawn, spawnSync } from 'node:child_process';
 import { syncBuiltinESMExports } from 'node:module';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -11,7 +11,7 @@ import { once } from 'node:events';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { assertBackfillEnvelope, assertImportedLedger, buildWindowsTeardownCommand, createBackfillFixture, finishSmokeCleanup, fixtureScriptPaths, runSmokeGroups, sandboxEnvironment, stageRuntimeDelivery, teardownOwnedProcesses, trustedSearchPath, windowsNodeScriptPattern } from './windows-runtime-opencode-backfill.mjs';
+import { assertBackfillCasePath, assertBackfillEnvelope, assertImportedLedger, buildWindowsTeardownCommand, createBackfillFixture, finishSmokeCleanup, fixtureScriptPaths, runSmokeGroups, sandboxEnvironment, stageRuntimeDelivery, teardownOwnedProcesses, trustedSearchPath, windowsNodeScriptPattern } from './windows-runtime-opencode-backfill.mjs';
 
 import { actualProviderResult, actualProviderTransport, catalogGuard, assertReadinessHost, runProviderSmoke, runRecordedCheck } from './windows-runtime-opencode-provider-json.mjs';
 import { environmentSummary, traceSpawn } from './windows-process-identity-probe.mjs';
@@ -110,6 +110,59 @@ test('catalog guard permits only exact read-only catalog/auth routes and rejects
   assert.deepEqual(observations, [{ allowed: true }, { allowed: true },
     { allowed: false }, { allowed: false }, { allowed: false }]);
 });
+
+test('sandbox environment leaves fresh SDK data uncreated and preserves existing data ownership and contents', () => {
+  const root = realpathSync.native(mkdtempSync(path.join(os.tmpdir(), 'sdk-data-owner-')));
+  try {
+    const env = sandboxEnvironment(root, path.join(root, 'opencode.cmd'));
+    assert.equal(env.CLAUDE_MULTIMODEL_DATA_HOME, path.join(root, 'data'));
+    assert.equal(existsSync(env.CLAUDE_MULTIMODEL_DATA_HOME), false,
+      'The delivered runtime must create its SDK data root through its native ownership boundary');
+    for (const key of ['HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'TEMP',
+      'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME',
+      'CLAUDE_CONFIG_DIR', 'CLAUDE_MULTIMODEL_CACHE_HOME']) {
+      assert.equal(statSync(env[key]).isDirectory(), true, key + ' remains available to fixture children');
+    }
+    const existing = path.join(env.CLAUDE_MULTIMODEL_DATA_HOME, 'opencode');
+    mkdirSync(existing, { recursive: true });
+    const sentinel = path.join(existing, 'existing-owned-state.json');
+    const bytes = Buffer.from('{"preserve":"existing SDK state"}\n');
+    writeFileSync(sentinel, bytes);
+    const before = statSync(env.CLAUDE_MULTIMODEL_DATA_HOME);
+    const repeated = sandboxEnvironment(root, path.join(root, 'opencode.cmd'));
+    const after = statSync(repeated.CLAUDE_MULTIMODEL_DATA_HOME);
+    assert.equal(repeated.CLAUDE_MULTIMODEL_DATA_HOME, env.CLAUDE_MULTIMODEL_DATA_HOME);
+    assert.deepEqual(readFileSync(sentinel), bytes, 'Existing data must never be deleted or replaced');
+    for (const key of ['dev', 'ino', 'mode', 'uid', 'gid']) {
+      assert.equal(after[key], before[key], 'Existing data ' + key + ' must remain unchanged');
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+for (const ancestor of ['with spaces', 'Юникод 世界']) {
+  test(`backfill case path preserves an ASCII owned suffix under a canonical ${ancestor} ancestor`, () => {
+    const parent = realpathSync.native(mkdtempSync(path.join(os.tmpdir(), 'backfill-case-path-')));
+    try {
+      const root = path.join(parent, ancestor);
+      const binary = path.join(root, 'ascii', 'bin', 'runtime.exe');
+      mkdirSync(path.dirname(binary), { recursive: true });
+      writeFileSync(binary, 'fixture-only');
+      const physicalRoot = realpathSync.native(root);
+      const physicalBinary = realpathSync.native(binary);
+      assert.equal(path.relative(physicalRoot, physicalBinary), path.join('ascii', 'bin', 'runtime.exe'));
+      assert.doesNotThrow(() => assertBackfillCasePath(physicalRoot, 'ascii', physicalBinary));
+      for (const invalid of ['ascii with spaces', 'ascii-世界']) {
+        assert.throws(() => assertBackfillCasePath(physicalRoot, 'ascii', path.join(physicalRoot, invalid, 'bin', 'runtime.exe')),
+          /ASCII case/);
+      }
+      assert.throws(() => assertBackfillCasePath(physicalRoot, 'ascii', path.join(parent, 'foreign', 'runtime.exe')),
+        /owned smoke root/);
+      for (const shape of ['with spaces', 'Юникод 世界', 'Юникод 世界 cmd']) {
+        assert.doesNotThrow(() => assertBackfillCasePath(physicalRoot, shape, path.join(physicalRoot, shape, 'bin', 'runtime.exe')));
+      }
+    } finally { rmSync(parent, { recursive: true, force: true }); }
+  });
+}
 
 test('runtime relocation preserves packaged Bun and executable physical graph across every path shape', () => {
   const root = mkdtempSync(path.join(os.tmpdir(), 'runtime-relocation-'));
@@ -402,6 +455,72 @@ test('ownership diagnostics are bounded to explicit fixture candidates and canno
 
 // CLI envelopes are injected here; the launch resolver runs unchanged in Bun.
 // This covers standalone fixture wiring, not native Windows or bundled app MCP.
+test('provider smoke canonicalizes owned temp roots before child cwd and controlled environment paths', t => {
+  const parent = realpathSync.native(mkdtempSync(path.join(os.tmpdir(), 'provider-canonical-temp-')));
+  const physicalTemp = path.join(parent, 'physical');
+  const aliasTemp = path.join(parent, 'alias');
+  mkdirSync(physicalTemp);
+  symlinkSync(physicalTemp, aliasTemp, process.platform === 'win32' ? 'junction' : 'dir');
+  const report = { cases: [] };
+  const launches = [];
+  let fixtureRoot, physicalRoot;
+  try {
+    t.mock.method(os, 'tmpdir', () => aliasTemp);
+    runProviderSmoke('/fixture/runtime.exe', report, () => {}, {
+      spawn: (_executable, argv, { env, cwd }) => {
+        const input = argv.includes('--input')
+          ? JSON.parse(readFileSync(argv[argv.indexOf('--input') + 1], 'utf8')) : null;
+        launches.push({ env, cwd, argv, input });
+        const payload = !input
+          ? { runtimeId: 'opencode', view: { providers: [{ providerId: 'opencode' }] } }
+          : { command: input.command, requestId: input.requestId,
+            ok: input.command === 'opencode.handshake', data: { hostHealthy: true } };
+        const stdout = JSON.stringify(payload);
+        if (argv.includes('--output')) writeFileSync(argv[argv.indexOf('--output') + 1], stdout);
+        return { status: 0, signal: null, stdout, stderr: '' };
+      },
+      cleanup: (group, root) => {
+        fixtureRoot = root;
+        physicalRoot = realpathSync.native(root);
+        finishSmokeCleanup(group, root, { teardown: () => {} });
+      },
+    });
+    assert.equal(report.error, undefined);
+    assert.equal(report.cleanupError, undefined);
+    assert.equal(report.passed, true, JSON.stringify(report));
+    assert.deepEqual(report.cases.map(item => item.label),
+      ['providers-view', 'handshake-file', 'handshake-stdout', 'readiness-stdout']);
+    assert.equal(launches.length, 4);
+    assert.equal(existsSync(fixtureRoot), false, 'Owned fixture must be removed after the checks');
+    const assertCanonical = (value, label) => {
+      const relative = path.relative(physicalRoot, value);
+      assert.ok(relative && relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative),
+        `${label} must remain inside the physical owned root`);
+      assert.equal(value, path.join(physicalRoot, relative), `${label} must use the physical canonical path`);
+    };
+    for (const [index, launch] of launches.entries()) {
+      assertCanonical(launch.cwd, `spawn ${index} cwd`);
+      for (const key of ['HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'TMP', 'TEMP', 'TMPDIR',
+        'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME', 'CLAUDE_CONFIG_DIR',
+        'CLAUDE_MULTIMODEL_DATA_HOME', 'CLAUDE_MULTIMODEL_CACHE_HOME', 'CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH',
+        'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY', 'GIT_CONFIG_GLOBAL']) {
+        assertCanonical(launch.env[key], `spawn ${index} ${key}`);
+      }
+      for (const flag of ['--project-path', '--input', '--output']) {
+        if (launch.argv.includes(flag)) assertCanonical(launch.argv[launch.argv.indexOf(flag) + 1], `spawn ${index} ${flag}`);
+      }
+      if (launch.input) assert.equal(launch.input.cwd, launch.cwd);
+      if (launch.input?.command === 'opencode.readiness') {
+        assert.equal(launch.input.body.projectPath, launch.cwd);
+        assert.equal(launch.input.body.requireExecutionProbe, false);
+      }
+    }
+  } finally {
+    t.mock.restoreAll();
+    rmSync(parent, { recursive: true, force: true });
+  }
+});
+
 test('provider fixture supplies an isolated MCP entry to the production resolver', { timeout: 15000 }, () => {
   const report = { cases: [] };
   const environments = [];
@@ -1221,6 +1340,100 @@ test('Windows isolated PATH captures identity and teardown stops only the owned 
   }
   if (originalError) throw originalError;
   assert.deepEqual(evidence.cleanupErrors, [], 'Direct test-child cleanup must succeed');
+});
+
+// Run real redirected Windows PowerShell after the first cold identity query.
+// The ASCII control reproduces the old producer's literal '?' bytes; the fixed
+// body must retain exact Unicode on both streams while doing the same teardown.
+test('Windows teardown preserves exact Unicode stdout and stderr with BOM-less UTF-8', {
+  skip: process.platform !== 'win32', timeout: 90000,
+}, async t => {
+  const root = realpathSync.native(mkdtempSync(path.join(os.tmpdir(), 'TEST-teardown Юникод 世界-')));
+  const env = sandboxEnvironment(root, path.join(root, 'opencode.cmd'));
+  const script = path.join(root, 'fake-opencode.cjs');
+  const unrelatedScript = script + ' unrelated-helper.cjs';
+  const children = [];
+  const runs = [];
+  const utf8Assignment = '[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)';
+  const unicodeBytes = Buffer.from('Юникод 世界', 'utf8');
+  const bom = Buffer.from([0xef, 0xbb, 0xbf]);
+  const start = async file => {
+    writeFileSync(file, "process.stdout.write('ready\\n'); setInterval(() => {}, 1000);");
+    const child = spawn(process.execPath, [file], { env, cwd: root, stdio: ['ignore', 'pipe', 'pipe'] });
+    children.push(child);
+    await Promise.all([once(child, 'spawn'), once(child.stdout, 'data', { signal: AbortSignal.timeout(5000) })]);
+    return child;
+  };
+  try {
+    const unrelated = await start(unrelatedScript);
+    for (const variant of ['fixed-utf8', 'legacy-ascii']) {
+      const child = await start(script);
+      const exited = once(child, 'exit', { signal: AbortSignal.timeout(35000) });
+      exited.catch(() => {});
+      const emitted = buildWindowsTeardownCommand(root, [child.pid]);
+      let body = emitted;
+      if (variant === 'legacy-ascii') {
+        assert.equal(emitted.split(utf8Assignment).length, 2, 'One explicit output encoding assignment required');
+        body = emitted.replace(utf8Assignment, '');
+      }
+      const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command',
+        "[Console]::OutputEncoding = [System.Text.Encoding]::ASCII\n" + body], {
+        cwd: root, env, stdio: ['ignore', 'pipe', 'pipe'], timeout: 30000,
+        windowsHide: true, maxBuffer: 1024 * 1024,
+      });
+      assert.ifError(result.error);
+      assert.equal(result.status, 0, result.stderr?.toString('utf8'));
+      assert.equal(result.signal, null);
+      const stdout = result.stdout.toString('utf8');
+      const stderr = result.stderr.toString('utf8');
+      for (const [name, bytes, text] of [['stdout', result.stdout, stdout], ['stderr', result.stderr, stderr]]) {
+        assert.deepEqual(Buffer.from(text, 'utf8'), bytes, name + ' must be valid UTF-8 bytes');
+        assert.equal(bytes.subarray(0, bom.length).equals(bom), false, name + ' must not have a UTF-8 BOM');
+      }
+      const stopped = JSON.parse(stdout);
+      assert.equal(stopped.length, 1);
+      assert.equal(stopped[0].pid, child.pid);
+      assert.ok(Number.isFinite(Date.parse(stopped[0].startedAt)));
+      const groups = stopped[0].commandLine.match(windowsNodeScriptPattern)?.groups;
+      const emittedScript = groups?.quotedScript || groups?.bareScript;
+      const diagnostic = stderr.split(/\r?\n/).find(line => line.startsWith('teardown: fixture ownership '));
+      const ownership = JSON.parse(diagnostic?.slice('teardown: fixture ownership '.length));
+      assert.equal(ownership.pid, child.pid);
+      assert.equal(ownership.owned, true);
+      assert.match(stderr, new RegExp('teardown: after identity validation pid=' + child.pid));
+      assert.match(stderr, new RegExp('teardown: after wait for exit pid=' + child.pid));
+      assert.match(stderr, /teardown: after JSON output/);
+      const exact = variant === 'fixed-utf8';
+      assert.equal(result.stdout.includes(unicodeBytes), exact, variant + ' raw stdout Unicode');
+      assert.equal(result.stderr.includes(unicodeBytes), exact, variant + ' raw stderr Unicode');
+      assert.equal(ownership.script, emittedScript, variant + ' stdout/stderr script agreement');
+      if (exact) {
+        assert.equal(emittedScript, script, 'Fixed JSON must retain the exact whole script path');
+        assert.equal(realpathSync.native(stopped[0].executable).toLowerCase(), realpathSync.native(process.execPath).toLowerCase());
+      } else {
+        assert.notEqual(emittedScript, script, 'Legacy producer must reproduce the real Unicode identity failure');
+        const corruptedTail = path.join(path.basename(root).replace('Юникод 世界', '?????? ??'), 'fake-opencode.cjs');
+        assert.ok(emittedScript.endsWith(corruptedTail), 'Legacy producer must emit literal ASCII replacement bytes in the known owned suffix');
+      }
+      await exited;
+      assert.equal(process.kill(unrelated.pid, 0), true, 'Shared-prefix unowned fixture must survive each teardown');
+      assert.equal(process.kill(process.pid, 0), true, 'Parent must survive each teardown');
+      runs.push({ variant, status: result.status, ownedPid: child.pid, stdoutUnicodeExact: exact,
+        stderrUnicodeExact: exact, stdoutBytes: result.stdout.length, stderrBytes: result.stderr.length });
+    }
+  } finally {
+    const cleanup = await Promise.allSettled(children.map(async child => {
+      if (child.pid && child.exitCode === null && child.signalCode === null) {
+        const exited = once(child, 'exit', { signal: AbortSignal.timeout(5000) });
+        exited.catch(() => {});
+        child.kill(); // Only this test's own ChildProcess handle, including its negative fixture.
+        await exited;
+      }
+    }));
+    rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 250 });
+    t.diagnostic(JSON.stringify({ unicodeTeardownRuns: runs }));
+    assert.deepEqual(cleanup.filter(item => item.status === 'rejected'), [], 'Direct test-child cleanup must succeed');
+  }
 });
 
 // Keep this PowerShell contract after the first native production identity test;

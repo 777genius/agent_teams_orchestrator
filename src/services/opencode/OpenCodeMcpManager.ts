@@ -406,7 +406,7 @@ export async function resolveOpenCodeAppMcpLaunchConfig(deps: {
         type: 'local',
         command: [
           commandOverride ?? resolveNodeCommand(),
-          ...argsOverride.map(arg => arg.startsWith('-') || path.isAbsolute(arg) ? arg : path.resolve(arg)),
+          ...argsOverride,
         ],
         environment: localEnvironment,
         enabled: true,

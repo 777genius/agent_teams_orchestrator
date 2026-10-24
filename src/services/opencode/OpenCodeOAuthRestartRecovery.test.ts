@@ -3,7 +3,7 @@
 import { afterEach, expect, test } from 'bun:test'
 import { Database } from 'bun:sqlite'
 import { spawn } from 'node:child_process'
-import { createHash } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import os from 'node:os'
@@ -25,17 +25,19 @@ const manager = new OpenCodeProfileManager()
 
 // Keep OS-owned handles until close, including when Bun cancels a timed-out test.
 // Draining pipes through Node streams avoids awaiting Bun's Windows pipe readers.
-function startOwnedChild(script: string, args: string[], env: NodeJS.ProcessEnv, phase: string) {
+function startOwnedChild(script: string, args: string[], env: NodeJS.ProcessEnv, phase: string, ipc = false) {
   const child = spawn(process.execPath, ['-e', script, ...args], {
-    env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true,
+    env, stdio: ipc ? ['pipe', 'pipe', 'pipe', 'ipc'] : ['pipe', 'pipe', 'pipe'], windowsHide: true,
   })
   const state = { phase, stdout: '', stderr: '', stdoutEnded: false,
+    checkpointPath: null as string | null,
     exited: false, code: null as number | null, signal: null as NodeJS.Signals | null,
-    error: null as Error | null, cleaning: false }
-  child.stdout.on('data', chunk => { state.stdout += chunk.toString() })
-  child.stdout.once('end', () => { state.stdoutEnded = true })
-  child.stderr.on('data', chunk => { state.stderr += chunk.toString() })
-  child.stdin.on('error', error => { if (!state.cleaning) state.error = error })
+    error: null as Error | null, cleaning: false,
+    control: null as null | { ready: boolean; stopSent: boolean; stopAcknowledged: boolean; stopAckSent: boolean } }
+  child.stdout!.on('data', chunk => { state.stdout += chunk.toString() })
+  child.stdout!.once('end', () => { state.stdoutEnded = true })
+  child.stderr!.on('data', chunk => { state.stderr += chunk.toString() })
+  child.stdin!.on('error', error => { if (!state.cleaning) state.error = error })
   child.once('error', error => { state.error = error })
   child.once('exit', (code, signal) => {
     state.exited = true; state.code = code; state.signal = signal
@@ -49,6 +51,114 @@ function startOwnedChild(script: string, args: string[], env: NodeJS.ProcessEnv,
 }
 const ownedChildren = new Set<ReturnType<typeof startOwnedChild>>()
 
+function writerControl(writer: ReturnType<typeof startOwnedChild>, token: string) {
+  const control = { ready: false, stopSent: false, stopAcknowledged: false, stopAckSent: false }
+  let stopAckSend: Promise<void> | null = null
+  writer.state.control = control
+  const ready = new Promise<void>((resolve, reject) => {
+    const message = (value: unknown) => {
+      if (!value || typeof value !== 'object' || !('token' in value) || value.token !== token
+        || !('pid' in value) || value.pid !== writer.child.pid || !('type' in value)) {
+        writer.state.error ??= new Error('Invalid synthetic writer acknowledgment')
+        reject(writer.state.error)
+      } else if (value.type === 'ready' && !control.ready) {
+        control.ready = true; resolve()
+      } else if (value.type === 'stopped' && control.ready && control.stopSent && !control.stopAcknowledged) {
+        control.stopAcknowledged = true
+        // Only receipt by this parent authorizes the writer's natural exit.
+        // Its close can precede this send callback, so join both independently.
+        stopAckSend = new Promise<void>(resolve => {
+          try {
+            writer.child.send({ type: 'stop-ack', token, pid: writer.child.pid }, error => {
+              if (error) writer.state.error ??= error
+              else control.stopAckSent = true
+              resolve()
+            })
+          } catch (error) {
+            writer.state.error ??= error instanceof Error ? error : new Error(String(error))
+            resolve()
+          }
+        })
+      } else {
+        writer.state.error ??= new Error('Unexpected synthetic writer acknowledgment')
+        reject(writer.state.error)
+      }
+    }
+    writer.child.on('message', message)
+    void writer.closed.then(() => {
+      writer.child.off('message', message)
+      if (!control.ready) reject(new Error('Synthetic writer closed before readiness'))
+    })
+  })
+  const stop = async () => {
+    await ready
+    if (control.stopSent) throw new Error('Synthetic writer stop already requested')
+    writer.state.phase = 'writer-ipc-stop'
+    control.stopSent = true
+    await new Promise<void>((resolve, reject) => {
+      writer.child.send({ type: 'stop', token, pid: writer.child.pid }, error => error ? reject(error) : resolve())
+    })
+    writer.state.phase = 'writer-close-wait'
+    await writer.closed
+    if (writer.state.cleaning) await stopInterruptedContinuation()
+    expect(control.stopAcknowledged).toBe(true)
+    expect(stopAckSend).not.toBeNull()
+    expect(writer.state.exited).toBe(true)
+    if (stopAckSend) {
+      // Physical close already removed this entry. Retain the pending parent
+      // continuation so afterEach can mark it interrupted without signalling.
+      ownedChildren.add(writer)
+      try { await stopAckSend } finally { ownedChildren.delete(writer) }
+      if (writer.state.cleaning) await stopInterruptedContinuation()
+    }
+    expect(control.stopAckSent).toBe(true)
+    expect(writer.state.error).toBeNull()
+    expect(writer.state.exited).toBe(true)
+    expect(writer.state.code).toBe(0)
+    expect(writer.state.signal).toBeNull()
+  }
+  return { ready, stop }
+}
+
+function syntheticWriterScript(token: string) {
+  return `const token = ${JSON.stringify(token)};
+    let phase = 'ready';
+    process.on('message', value => {
+      if (value?.token !== token || value.pid !== process.pid) process.exit(1);
+      if (value.type === 'stop' && phase === 'ready') {
+        phase = 'stopped';
+        process.send({ type: 'stopped', token, pid: process.pid }, error => { if (error) process.exit(1) });
+      } else if (value.type === 'stop-ack' && phase === 'stopped') {
+        phase = 'done';
+        process.exit(0);
+      } else process.exit(1);
+    });
+    process.on('disconnect', () => process.exit(1));
+    process.send({ type: 'ready', token, pid: process.pid }, error => { if (error) process.exit(1) });`
+}
+
+function startSyntheticWriter(env: NodeJS.ProcessEnv) {
+  const token = randomBytes(16).toString('hex')
+  // This process supplies only an actual OS lifetime. Its explicit control
+  // channel must acknowledge initialization and shutdown; stdin EOF/data is
+  // deliberately not part of the native OAuth retirement predicate.
+  const writer = startOwnedChild(syntheticWriterScript(token), [], env, 'writer-ready-wait', true)
+  return { writer, ...writerControl(writer, token) }
+}
+
+async function startUnacknowledgedWriter() {
+  const token = randomBytes(16).toString('hex')
+  const writer = startOwnedChild(syntheticWriterScript(token), [], process.env, 'TEST-held-stop-ack', true)
+  const ready = await new Promise(resolve => writer.child.once('message', resolve))
+  expect(ready).toEqual({ type: 'ready', token, pid: writer.child.pid })
+  const stop = async () => {
+    const stopped = new Promise(resolve => writer.child.once('message', resolve))
+    writer.child.send({ type: 'stop', token, pid: writer.child.pid })
+    expect(await stopped).toEqual({ type: 'stopped', token, pid: writer.child.pid })
+  }
+  return { writer, token, stop }
+}
+
 // Bun records timeout failure without cancelling the async test body. Once
 // afterEach has reaped its resources, park that interrupted continuation on an
 // inert promise so it cannot resume assertions or touch deleted sandbox roots.
@@ -60,7 +170,8 @@ async function reapOwnedChild(entry: ReturnType<typeof startOwnedChild>): Promis
   entry.state.cleaning = true
   const diagnostic = { phase: entry.state.phase, stdoutEnded: entry.state.stdoutEnded,
     exited: entry.state.exited, code: entry.state.code, signal: entry.state.signal,
-    stdoutBytes: Buffer.byteLength(entry.state.stdout), stderrBytes: Buffer.byteLength(entry.state.stderr) }
+    stdoutBytes: Buffer.byteLength(entry.state.stdout), stderrBytes: Buffer.byteLength(entry.state.stderr),
+    ...(entry.state.control ? { control: entry.state.control } : {}) }
   // Only the tracked child handle is signalled, never a persisted registry PID.
   if (!entry.state.exited) entry.child.kill('SIGKILL')
   let timer: ReturnType<typeof setTimeout> | undefined
@@ -69,8 +180,16 @@ async function reapOwnedChild(entry: ReturnType<typeof startOwnedChild>): Promis
       timer = setTimeout(() => reject(new Error(`Owned fixture cleanup did not close: ${JSON.stringify(diagnostic)}`)), 2_500)
     })])
   } finally { clearTimeout(timer) }
+  // A closed entry may have been retained for its pending parent ACK callback.
+  ownedChildren.delete(entry)
+  const checkpoint = entry.state.checkpointPath
+    ? await readFile(entry.state.checkpointPath, 'utf8').catch(() => 'unavailable')
+    : null
+  const lastCheckpoint = checkpoint === null ? null
+    : ['import-started', 'resolve-started', 'receipt-produced', 'unavailable'].includes(checkpoint)
+      ? checkpoint : 'invalid-checkpoint'
   console.error(`Owned recovery fixture reaped after test interruption: ${JSON.stringify({ ...diagnostic,
-    closeCode: entry.state.code, closeSignal: entry.state.signal })}`)
+    lastCheckpoint, closeCode: entry.state.code, closeSignal: entry.state.signal })}`)
 }
 
 afterEach(async () => {
@@ -88,6 +207,166 @@ afterEach(async () => {
 })
 const read = (authPath: string) => readOpenCodeAuthCredential({ authPath, providerId: 'xai' })
 const exists = (file: string) => Bun.file(file).exists()
+
+test('synthetic OAuth writer acknowledges readiness and stop before natural physical close', async () => {
+  const { writer, ready, stop } = startSyntheticWriter(process.env)
+  await ready
+  expect(writer.state.exited).toBe(false)
+  expect(await readProcessStartTimeMs(writer.child.pid!)).toBeGreaterThan(0)
+  await stop()
+  expect(writer.state.stdoutEnded).toBe(true)
+  expect(ownedChildren.has(writer)).toBe(false)
+})
+
+test('synthetic OAuth writer stays physically alive until its parent acknowledges the stopped receipt', async () => {
+  const { writer, token, stop } = await startUnacknowledgedWriter()
+  const birth = await readProcessStartTimeMs(writer.child.pid!)
+  expect(birth).toBeGreaterThan(0)
+  await stop()
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    // Explicitly withhold receipt authorization while observing physical close;
+    // this observation window does not extend any fixture or cleanup deadline.
+    expect(await Promise.race([writer.closed.then(() => true), new Promise<boolean>(resolve => {
+      timer = setTimeout(() => resolve(false), 50)
+    })])).toBe(false)
+  } finally { clearTimeout(timer) }
+  expect(writer.state.exited).toBe(false)
+  expect(await readProcessStartTimeMs(writer.child.pid!)).toBe(birth)
+  await new Promise<void>((resolve, reject) => writer.child.send({ type: 'stop-ack', token, pid: writer.child.pid },
+    error => error ? reject(error) : resolve()))
+  await writer.closed
+  expect(writer.state.error).toBeNull()
+  expect(writer.state.exited).toBe(true)
+  expect(writer.state.code).toBe(0)
+  expect(writer.state.signal).toBeNull()
+  expect(writer.state.stdoutEnded).toBe(true)
+  expect(ownedChildren.has(writer)).toBe(false)
+})
+
+for (const kind of ['wrong-token', 'wrong-pid', 'before-stop', 'duplicate-stop'] as const) {
+  test(`synthetic OAuth writer rejects ${kind} receipt authorization`, async () => {
+    const { writer, token, stop } = await startUnacknowledgedWriter()
+    if (kind !== 'before-stop') await stop()
+    writer.child.send({ type: kind === 'duplicate-stop' ? 'stop' : 'stop-ack',
+      token: kind === 'wrong-token' ? 'TEST-unrelated' : token,
+      pid: kind === 'wrong-pid' ? writer.child.pid! + 1 : writer.child.pid })
+    await writer.closed
+    expect(writer.state.code).toBe(1)
+    expect(writer.state.signal).toBeNull()
+    expect(ownedChildren.has(writer)).toBe(false)
+  })
+}
+
+test('synthetic OAuth writer cannot qualify a zero exit without its stopped receipt', async () => {
+  const token = randomBytes(16).toString('hex')
+  const writer = startOwnedChild(`process.on('message', () => process.exit(0));
+    process.send({ type: 'ready', token: ${JSON.stringify(token)}, pid: process.pid });`,
+  [], process.env, 'TEST-no-stopped-receipt', true)
+  const control = writerControl(writer, token)
+  await expect(control.stop()).rejects.toThrow()
+  expect(writer.state.exited).toBe(true)
+  expect(writer.state.code).toBe(0)
+  expect(writer.state.control?.stopAcknowledged).toBe(false)
+  expect(writer.state.control?.stopAckSent).toBe(false)
+})
+
+test('synthetic OAuth writer cannot qualify duplicate stopped receipts before physical close', async () => {
+  const token = randomBytes(16).toString('hex')
+  const writer = startOwnedChild(`const token = ${JSON.stringify(token)};
+    process.on('message', value => {
+      if (value.type === 'stop') {
+        process.send({ type: 'stopped', token, pid: process.pid });
+        process.send({ type: 'stopped', token, pid: process.pid });
+      } else if (value.type === 'finish') process.exit(0);
+    });
+    process.send({ type: 'ready', token, pid: process.pid });`,
+  [], process.env, 'TEST-duplicate-stopped-receipt', true)
+  const control = writerControl(writer, token)
+  let receipts = 0
+  const duplicated = new Promise<void>(resolve => writer.child.on('message', value => {
+    if (value && typeof value === 'object' && 'type' in value && value.type === 'stopped' && ++receipts === 2) resolve()
+  }))
+  const stopping = control.stop()
+  await duplicated
+  expect(writer.state.error?.message).toBe('Unexpected synthetic writer acknowledgment')
+  writer.child.send({ type: 'finish' })
+  await expect(stopping).rejects.toThrow()
+  expect(writer.state.code).toBe(0)
+})
+
+for (const outcome of ['joined', 'send-error', 'interrupted'] as const) {
+  const label = outcome === 'interrupted' ? 'parks its interrupted' : outcome === 'send-error' ? 'rejects a failed' : 'joins its'
+  test(`synthetic OAuth writer ${label} stop-ack send callback even after physical close`, async () => {
+    const { writer, ready, stop } = startSyntheticWriter(process.env)
+    await ready
+    const send = writer.child.send.bind(writer.child)
+    const kill = writer.child.kill
+    let signals = 0
+    let releaseAck: (() => void) | undefined
+    let callbackObserved!: () => void
+    const observed = new Promise<void>(resolve => { callbackObserved = resolve })
+    writer.child.send = ((message: { type: string }, callback: (error: Error | null) => void) => {
+      if (message.type !== 'stop-ack') return send(message, callback)
+      return send(message, error => {
+        releaseAck = () => callback(outcome === 'send-error' ? new Error('TEST-stop-ack-send-failed') : error)
+        callbackObserved()
+      })
+    }) as typeof writer.child.send
+    let completed = false
+    const stopping = stop().then(() => { completed = true; return null }, error => { completed = true; return error })
+    try {
+      await Promise.all([writer.closed, observed])
+      if (writer.state.cleaning) await stopInterruptedContinuation()
+      expect(writer.state.code).toBe(0)
+      expect(writer.state.exited).toBe(true)
+      expect(writer.state.control?.stopAcknowledged).toBe(true)
+      expect(writer.state.control?.stopAckSent).toBe(false)
+      expect(ownedChildren.has(writer)).toBe(true)
+      expect(completed).toBe(false)
+      if (outcome === 'interrupted') {
+        writer.child.kill = (() => { signals++; return false }) as typeof writer.child.kill
+        await reapOwnedChild(writer)
+        expect(writer.state.cleaning).toBe(true)
+        expect(ownedChildren.has(writer)).toBe(false)
+        expect(signals).toBe(0)
+      }
+    } finally { releaseAck?.(); writer.child.send = send; writer.child.kill = kill }
+    if (outcome === 'interrupted') {
+      // Release all queued ACK microtasks without adding another timing budget.
+      await new Promise<void>(resolve => setImmediate(resolve))
+      expect(completed).toBe(false)
+      expect(ownedChildren.has(writer)).toBe(false)
+      return
+    }
+    const error = await stopping
+    expect(ownedChildren.has(writer)).toBe(false)
+    if (outcome === 'send-error') {
+      expect(error).not.toBeNull()
+      expect(writer.state.error?.message).toBe('TEST-stop-ack-send-failed')
+      expect(writer.state.control?.stopAckSent).toBe(false)
+    } else {
+      expect(error).toBeNull()
+      expect(writer.state.control?.stopAckSent).toBe(true)
+    }
+  })
+}
+
+test('synthetic OAuth writer rejects an unrelated stop token', async () => {
+  const { writer, ready } = startSyntheticWriter(process.env)
+  await ready
+  writer.child.send({ type: 'stop', token: 'TEST-unrelated', pid: writer.child.pid })
+  await writer.closed
+  expect(writer.state.code).toBe(1)
+  expect(writer.state.control?.stopAcknowledged).toBe(false)
+})
+
+test('synthetic OAuth writer cannot qualify a zero exit before readiness', async () => {
+  const writer = startOwnedChild('process.exit(0)', [], process.env, 'TEST-before-ready', true)
+  await expect(writerControl(writer, 'TEST-never-ready').ready).rejects.toThrow('closed before readiness')
+  expect(writer.state.code).toBe(0)
+  expect(writer.state.control?.ready).toBe(false)
+})
 
 async function fixture(options: { session?: boolean, purpose?: 'launch_runtime' | 'execution_probe', remote?: boolean,
   terminal?: string, successor?: typeof c0, controlUrl?: string, diagnostic?: 'claude-dir' | 'command' } = {}) {
@@ -131,14 +410,11 @@ async function fixture(options: { session?: boolean, purpose?: 'launch_runtime' 
   }) })
   mark('prepare-profile end')
   // Real OS birth and ESRCH; this child is only a synthetic writer lifetime.
-  const writer = startOwnedChild(`process.stdin.once('data', chunk =>
-      process.exit(chunk.length === 1 && chunk[0] === 4 ? 0 : 1));
-    process.stdin.on('end', () => process.exit(1));
-    process.stdin.on('error', () => process.exit(1));
-    process.stdin.resume();`, [], env, 'synthetic writer stop')
+  const { writer, ready, stop } = startSyntheticWriter(env)
   const { child } = writer
   let native: any
   try {
+    await ready
     const pid = child.pid
     if (pid === undefined) throw new Error('Synthetic writer failed to spawn')
     writer.state.phase = 'measure-writer'
@@ -203,14 +479,9 @@ async function fixture(options: { session?: boolean, purpose?: 'launch_runtime' 
     } finally { db.close() }
     mark('write-native-history end')
   } finally {
-    writer.state.phase = 'writer-eof-wait'
-    mark('writer-eof-wait begin')
-    child.stdin.end(Buffer.from([4]))
-    await writer.closed
-    if (writer.state.cleaning) await stopInterruptedContinuation()
-    mark('writer-eof-wait end')
-    expect(writer.state.error).toBeNull()
-    expect(writer.state.code).toBe(0)
+    mark('writer-close-wait begin')
+    await stop()
+    mark('writer-close-wait end')
   }
   const receiptText = await readFile(receiptPath, 'utf8')
   const receipt = JSON.parse(receiptText)
@@ -223,6 +494,9 @@ type Fixture = Awaited<ReturnType<typeof fixture>>
 // production recovery must use the exited writer's canonical SQLite history.
 async function fresh(f: Fixture, env = f.env, purpose = f.purpose, project = f.project, fault?: { path: string, after: boolean }, role: 'fault' | 'recovery' | 'idempotent' = fault ? 'fault' : 'recovery') {
   const modulePath = path.resolve(import.meta.dir, './OpenCodeProfileManager.ts')
+  // A finite sidecar checkpoint distinguishes cold import from resolution and
+  // post-result handle drain without adding IPC handles or exposing payloads.
+  const checkpointPath = path.join(f.root, `fresh-phase-${randomBytes(8).toString('hex')}`)
   const inject = fault ? `const { mock } = await import('bun:test');
     const atomicPath = ${JSON.stringify(path.resolve(import.meta.dir, '../../utils/atomicWrite.ts'))};
     const atomic = await import(atomicPath); const originalWrite = atomic.writeJsonFileAtomic;
@@ -232,21 +506,28 @@ async function fresh(f: Fixture, env = f.env, purpose = f.purpose, project = f.p
       if (p === ${JSON.stringify(fault.path)}) throw new Error('AUDIT crash boundary');
     } }));` : ''
   const script = `${inject}globalThis.fetch = async () => { throw new Error('AUDIT forbids network') };
+    const { writeFile } = await import('node:fs/promises');
+    const checkpoint = phase => writeFile(${JSON.stringify(checkpointPath)}, phase);
     if (process.platform === 'win32') {
       const { deepStrictEqual } = await import('node:assert/strict');
       deepStrictEqual([process.env.HOMEDRIVE, process.env.HOMEPATH], ${JSON.stringify([env.HOMEDRIVE, env.HOMEPATH])});
     }
+    await checkpoint('import-started');
     const { resolveOpenCodeProfileScope } = await import(${JSON.stringify(modulePath)});
+    await checkpoint('resolve-started');
     try { const scope = await resolveOpenCodeProfileScope({ projectPath: process.argv[1], selectedModel: 'xai/grok-4.3', purpose: process.argv[2] });
       process.stdout.write(JSON.stringify({ ok: true, scope }));
-    } catch (e) { process.stdout.write(JSON.stringify({ ok: false, error: e.message })); }`
+    } catch (e) { process.stdout.write(JSON.stringify({ ok: false, error: e.message })); }
+    await checkpoint('receipt-produced');`
   const entry = startOwnedChild(script, [project, purpose], env, `fresh ${role} natural exit`)
-  entry.child.stdin.end()
+  entry.state.checkpointPath = checkpointPath
+  entry.child.stdin!.end()
   await entry.closed
   if (entry.state.cleaning) await stopInterruptedContinuation()
   // Fresh recovery must exit naturally, including closing its imported handles.
   expect(entry.state.error).toBeNull()
   expect(entry.state.stderr).toBe(''); expect(entry.state.code).toBe(0)
+  expect(await readFile(checkpointPath, 'utf8')).toBe('receipt-produced')
   return JSON.parse(entry.state.stdout)
 }
 const current = (f: Fixture, env = f.env) => isOpenCodeOAuthPublicationScopeCurrent(f.receipt.owner, c0, env)

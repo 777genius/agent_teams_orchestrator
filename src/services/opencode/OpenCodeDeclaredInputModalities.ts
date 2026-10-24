@@ -32,7 +32,7 @@ function parseInputCapabilityRecord(value: unknown): string[] | null {
 }
 
 export function getOpenCodeModelDeclaredInputModalities(
-  metadata: OpenCodeModelMetadata | null | undefined,
+  metadata: Pick<OpenCodeModelMetadata, 'raw'> | null | undefined,
 ): string[] | null {
   const rawModalities = metadata?.raw.modalities
   const rawCapabilities = metadata?.raw.capabilities

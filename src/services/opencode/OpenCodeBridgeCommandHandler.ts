@@ -67,7 +67,7 @@ import { buildManagedConfigFingerprint, canonicalizeOpenCodeProjectPath, openCod
 import { normalizeOpenCodePermissions } from './OpenCodePermissionNormalizer.js'
 import { openCodeProvisioningProbe, type OpenCodeAuthorityRejection } from './OpenCodeProvisioningProbe.js'
 import { normalizeOpenCodeProjectIdentity } from './OpenCodeProjectIdentity.js'
-import { openCodeHostManager } from './OpenCodeHostManager.js'
+import { isOpenCodeHostProcessGoneError, openCodeHostManager } from './OpenCodeHostManager.js'
 import {
   PROCESS_ATTRIBUTION_SCHEMA_VERSION,
   resolveProcessAttributionDirectory,
@@ -734,11 +734,66 @@ function expectedCapabilitySnapshotId(body: Record<string, unknown>): string | n
     ?? asString(body.expectedCapabilitySnapshotId)
 }
 
+type StoredLaneAuthority = {
+  snapshot: OpenCodeProvisioningSnapshot | null
+  records: OpenCodeSessionRecord[]
+  release: (keepAlive?: boolean) => Promise<void> | void
+  confirmedStopRuntime?: ConfirmedStopRuntime
+  deliveryRuntime?: ReturnType<typeof createRuntimeSnapshot>
+  hostGone?: boolean
+  signal?: AbortSignal
+  assertOwner?: () => Promise<void>
+}
+
+// Receipts attest a confirmed Stop. When none exist, cleanup binds the exact
+// desktop-persisted launch capability instead, never a capability derived from
+// current provider state.
+async function resolveStoredStopRuntime(
+  authorityRecords: OpenCodeSessionRecord[],
+  legacyInput: { teamsPath: string; teamId: string; laneId: string; runId: string },
+  options: { legacyCursor: boolean },
+): Promise<ConfirmedStopRuntime> {
+  const receiptRuntime = options.legacyCursor
+    ? undefined
+    : authorityRecords.find(record => record.stopAuthority)?.stopAuthority?.runtime
+  if (receiptRuntime) return receiptRuntime
+  const legacyVersion = authorityRecords[0]?.opencodeVersion ?? null
+  return {
+    providerId: 'opencode',
+    binaryPath: 'opencode',
+    binaryFingerprint: legacyVersion ? `version:${legacyVersion}` : null,
+    version: legacyVersion,
+    capabilitySnapshotId: await readOpenCodeLegacyStopCapability(legacyInput),
+  }
+}
+
+function assertStoredStopRuntimeMatchesLane(input: {
+  authorityRecords: OpenCodeSessionRecord[]
+  runtime: ConfirmedStopRuntime
+  body: Record<string, unknown>
+  preconditions: ReturnType<typeof parseOpenCodeBridgePreconditions>
+  allowReceiptlessRecords: boolean
+}): void {
+  const { authorityRecords, runtime, body, preconditions, allowReceiptlessRecords } = input
+  if (runtime.providerId !== 'opencode'
+    || !/^opencode:[a-f0-9]{32}$/.test(runtime.capabilitySnapshotId)
+    || authorityRecords.some(record => !/^[a-f0-9]{64}$/.test(record.expectedBehaviorFingerprint ?? '')
+      || (record.stopAuthority
+        ? record.stopAuthority.expectedBehaviorFingerprint !== record.expectedBehaviorFingerprint
+          || hashStable(record.stopAuthority.runtime) !== hashStable(runtime)
+        : !allowReceiptlessRecords))
+    || expectedCapabilitySnapshotId(body) !== runtime.capabilitySnapshotId
+    || (preconditions?.expectedBehaviorFingerprint
+      && authorityRecords.some(record => record.expectedBehaviorFingerprint !== preconditions.expectedBehaviorFingerprint))) {
+    throw new Error('OpenCode confirmed stop authority mismatch')
+  }
+}
+
 async function probeStoredLaneAuthority(
   envelope: BridgeEnvelope,
   command: string,
   phaseContext?: OpenCodePhaseContext,
-) {
+): Promise<StoredLaneAuthority> {
   const body = envelope.body
   const teamId = asString(body.teamId) ?? asString(body.teamName)
   const laneId = asString(body.laneId)
@@ -813,32 +868,22 @@ async function probeStoredLaneAuthority(
   if (command === 'opencode.stopTeam' && (selectedModel.providerId === 'cursor-acp'
     || authorityRecords.every(record => record.stopAuthority || isOpenCodeSessionStopped(record)))) {
     const allHaveReceipt = authorityRecords.every(record => record.stopAuthority)
-    if (!allHaveReceipt && selectedModel.providerId !== 'cursor-acp') {
+    // Every session already terminal completes idempotently even when
+    // process-absence retirement minted no receipt: no live session remains
+    // whose Stop this request must attest.
+    const allTerminal = authorityRecords.every(record => isOpenCodeSessionStopped(record))
+    if (!allHaveReceipt && selectedModel.providerId !== 'cursor-acp' && !allTerminal) {
       throw new Error('OpenCode confirmed stop authority mismatch')
     }
     // Pre-fix Cursor records lack the receipt, but the desktop persists the
     // original launch capability. Preserve that exact capability for cleanup.
     const legacyCursor = selectedModel.providerId === 'cursor-acp' && !allHaveReceipt
-    const legacyVersion = firstAuthority.opencodeVersion ?? null
-    const runtime: ConfirmedStopRuntime = legacyCursor ? {
-      providerId: 'opencode', binaryPath: 'opencode', version: legacyVersion,
-      binaryFingerprint: legacyVersion ? `version:${legacyVersion}` : null,
-      capabilitySnapshotId: await readOpenCodeLegacyStopCapability({
-        teamsPath: getTeamsDir(), teamId, laneId, runId,
-      }),
-    } : firstAuthority.stopAuthority!.runtime
-    if (runtime.providerId !== 'opencode'
-      || !/^opencode:[a-f0-9]{32}$/.test(runtime.capabilitySnapshotId)
-      || authorityRecords.some(record => !/^[a-f0-9]{64}$/.test(record.expectedBehaviorFingerprint ?? '')
-        || (record.stopAuthority
-          ? record.stopAuthority.expectedBehaviorFingerprint !== record.expectedBehaviorFingerprint
-            || hashStable(record.stopAuthority.runtime) !== hashStable(runtime)
-          : !legacyCursor))
-      || expectedCapabilitySnapshotId(body) !== runtime.capabilitySnapshotId
-      || (preconditions?.expectedBehaviorFingerprint
-        && authorityRecords.some(record => record.expectedBehaviorFingerprint !== preconditions.expectedBehaviorFingerprint))) {
-      throw new Error('OpenCode confirmed stop authority mismatch')
-    }
+    const runtime = await resolveStoredStopRuntime(authorityRecords,
+      { teamsPath: getTeamsDir(), teamId, laneId, runId }, { legacyCursor })
+    assertStoredStopRuntimeMatchesLane({
+      authorityRecords, runtime, body, preconditions,
+      allowReceiptlessRecords: legacyCursor || allTerminal,
+    })
     for (const record of authorityRecords.filter(record => !isOpenCodeSessionStopped(record))) {
       await openCodeHostManager.resolveOwnedSessionEndpoint(record.hostKey, {
         teamId: record.teamId, laneId: record.laneId, memberName: record.memberName,
@@ -895,13 +940,38 @@ async function probeStoredLaneAuthority(
       assertOwner: async () => { for (const check of ownerChecks) await check() },
       release: async (_keepAlive?: boolean) => {} }
   }
-  const retained = await openCodeProvisioningProbe.probeRetainingHost(projectPath, {
-    selectedModel: selectedModel.raw, toolApprovalMode: mode, phaseContext,
-    existingHostKey,
-    ...(expectedRuntimePid !== undefined ? { expectedRuntimePid } : {}),
-    ...(command === 'opencode.stopTeam' ? { attachAppMcp: false } : {}),
-  })
-  return { snapshot: retained.snapshot, records: authorityRecords, release: retained.release }
+  try {
+    const retained = await openCodeProvisioningProbe.probeRetainingHost(projectPath, {
+      selectedModel: selectedModel.raw, toolApprovalMode: mode, phaseContext,
+      existingHostKey,
+      ...(expectedRuntimePid !== undefined ? { expectedRuntimePid } : {}),
+      ...(command === 'opencode.stopTeam' ? { attachAppMcp: false } : {}),
+    })
+    return { snapshot: retained.snapshot, records: authorityRecords, release: retained.release }
+  } catch (error) {
+    // Absence is closure evidence only for the exact process every stored
+    // session is pinned to. Records without a runtime pid stay fail-closed.
+    if (command !== 'opencode.stopTeam' || !isOpenCodeHostProcessGoneError(error)
+      || expectedRuntimePid === undefined || error.pid !== expectedRuntimePid) {
+      throw error
+    }
+    // The registered host process is provably absent. A Stop request may close
+    // the lane from stored authority plus desktop-owned launch capability; no
+    // confirmed Stop receipt is minted from process absence.
+    const runtime = await resolveStoredStopRuntime(authorityRecords,
+      { teamsPath: getTeamsDir(), teamId, laneId, runId }, { legacyCursor: false })
+    assertStoredStopRuntimeMatchesLane({
+      authorityRecords, runtime, body, preconditions,
+      allowReceiptlessRecords: true,
+    })
+    return {
+      snapshot: null,
+      records: authorityRecords,
+      confirmedStopRuntime: runtime,
+      hostGone: true,
+      release: async () => {},
+    }
+  }
 }
 
 // Bind delivery to the member captured before provisioning, including across
@@ -4423,6 +4493,7 @@ async function runStop(
       }
     })
     : null
+  const hostGone = retained?.hostGone === true
   let authorityReleased = false
   const releaseAuthority = async () => {
     if (authorityReleased) return
@@ -4499,6 +4570,56 @@ async function runStop(
             'warning',
           ))
         }
+      } else if (hostGone) {
+        // The registered host process is provably gone, so there is no live
+        // session to abort or observe. Close the exact stored owner instead:
+        // strict lease release plus terminal CAS. Process absence retires the
+        // session; it is not a confirmed Stop receipt, so none is minted.
+        runtimeDeadline.throwIfExpired('stop_cleanup')
+        const beforeClose = await raceOpenCodeAbortSignal(
+          openCodeSessionStore.get(teamId, laneId, record.memberName),
+          stopSignal,
+        )
+        if (!isExactStopSession(beforeClose, record)) {
+          diagnostics.push(teamDiagnostic(
+            'opencode_stop_identity_changed',
+            `${record.memberName}: session identity changed before dead-host closure`,
+            'error',
+          ))
+          memberDiagnostics.push('identity changed before dead-host closure')
+          return { record, stopped: false, diagnostics: memberDiagnostics }
+        }
+        if (runtimeDeadline.remainingMs() < OPEN_CODE_STOP_ATOMIC_CLEANUP_RESERVE_MS) {
+          memberDiagnostics.push('deadline expired')
+          diagnostics.push(teamDiagnostic(
+            'opencode_stop_deadline',
+            `${record.memberName}: insufficient budget for strict lease release; remaining=${runtimeDeadline.remainingMs()}ms`,
+            'error',
+          ))
+          return { record, stopped: false, diagnostics: memberDiagnostics }
+        }
+        await openCodeSessionBridge.releaseSession(record, { strictLeaseRelease: true })
+        const terminal = await openCodeSessionStore.markStoppedIfSession(record)
+        if (!terminal) {
+          const current = await openCodeSessionStore.get(teamId, laneId, record.memberName)
+          if (isExactStopSession(current, record) && current.staleReason === 'runtime_process_gone') {
+            memberDiagnostics.push('runtime disappeared without confirmed Stop')
+            diagnostics.push(teamDiagnostic(
+              'opencode_stop_status_unconfirmed',
+              `${record.memberName}: runtime retirement is not confirmed Stop evidence`,
+              'warning',
+            ))
+            return { record, stopped: false, diagnostics: memberDiagnostics }
+          }
+          diagnostics.push(teamDiagnostic(
+            'opencode_stop_identity_changed',
+            `${record.memberName}: session identity changed before confirmation`,
+            'error',
+          ))
+          memberDiagnostics.push('identity changed before confirmation')
+          return { record, stopped: false, diagnostics: memberDiagnostics }
+        }
+        stopped = true
       } else {
         runtimeDeadline.throwIfExpired('stop_abort')
         const beforeAbort = await raceOpenCodeAbortSignal(
@@ -4726,9 +4847,19 @@ async function runStop(
   // Keep the process alive on release so cleanup can honor other lanes' leases.
   await releaseAuthority()
 
+  // Stale cleanup deletes every dead registry record, while a retried gone-host
+  // Stop can re-prove absence only from that exact record. Keep it until every
+  // member of this lane is closed.
+  const deadHostEvidenceNeeded = hostGone && memberResults.some(result => !result.stopped)
   const cleanupAllowed = runtimeDeadline.remainingMs() >= OPEN_CODE_STOP_HOST_CLEANUP_RESERVE_MS
-    && !stopSignal.aborted
-  if (!cleanupAllowed) {
+    && !stopSignal.aborted && !deadHostEvidenceNeeded
+  if (deadHostEvidenceNeeded) {
+    diagnostics.push(teamDiagnostic(
+      'opencode_host_cleanup_warning',
+      'OpenCode host cleanup deferred so a Stop retry can re-prove the gone host',
+      'warning',
+    ))
+  } else if (!cleanupAllowed) {
     diagnostics.push(teamDiagnostic(
       'opencode_stop_deadline',
       `OpenCode host cleanup skipped because only ${runtimeDeadline.remainingMs()}ms remained`,

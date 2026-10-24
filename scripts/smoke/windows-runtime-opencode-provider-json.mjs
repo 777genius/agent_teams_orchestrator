@@ -5,7 +5,7 @@ import { execFile, spawnSync } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createServer } from 'node:http';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { realpath } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -118,6 +118,8 @@ export async function runActualProviderComparison(baseline, candidate, binaryPat
     for (const [label, runtime] of [['baseline118', baseline], ['candidate119', candidate]]) {
       const owned = path.join(root, label); mkdirSync(owned);
       const env = sandboxEnvironment(owned, binaryPath), project = path.join(owned, 'project'); mkdirSync(project);
+      // This comparison deliberately uses the existing TEST-only ACL producer.
+      mkdirSync(env.CLAUDE_MULTIMODEL_DATA_HOME);
       await protectWindowsTestDirectory(env.CLAUDE_MULTIMODEL_DATA_HOME);
       env.DEEPINFRA_API_KEY = 'TEST-only-no-real-credential';
       Object.assign(env, { OPENCODE_DISABLE_AUTOUPDATE: '1', OPENCODE_DISABLE_LSP_DOWNLOAD: '1',
@@ -239,7 +241,8 @@ function assertExitZero(result, label) {
 
 export function runProviderSmoke(runtimeBinary, report, flush, { spawn = spawnSync, cleanup = finishSmokeCleanup } = {}) {
   report.mcpEvidence = { mode: 'simulated-opencode-http-attach', bundledAppMcp: false, executableTools: false };
-  const tempRoot = mkdtempSync(path.join(os.tmpdir(), 'agent-teams-runtime-opencode-smoke-'));
+  // The native API also expands Windows 8.3 names; the JS walk only resolves links.
+  const tempRoot = realpathSync.native(mkdtempSync(path.join(os.tmpdir(), 'agent-teams-runtime-opencode-smoke-')));
   try {
     const fakeOpenCodeScript = path.join(tempRoot, 'fake-opencode.cjs');
     const fakeOpenCodeCmd = path.join(tempRoot, 'opencode.cmd');

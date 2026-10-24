@@ -62,7 +62,37 @@ describe('runtimeOpenCodeCommand cancellation cleanup', () => {
     expect(settled).toBe(true)
   })
 
-  test('bounds cleanup before the force-exit watchdog reserve', async () => {
+  test('drains host work queued while the parallel session drain is still pending', async () => {
+    let finishHosts!: () => void, finishSession!: () => void, finishLateHost!: () => void
+    const hosts = new Promise<void>(resolve => { finishHosts = resolve })
+    const session = new Promise<void>(resolve => { finishSession = resolve })
+    const lateHost = new Promise<void>(resolve => { finishLateHost = resolve })
+    let hostsStarted = false, sessionStarted = false, lateHostQueued = false, settled = false
+    const deps = {
+      disposeUnregisteredOwnedHosts: async () => { hostsStarted = true; await hosts },
+      drainPendingLateLockReleases: async () => {
+        sessionStarted = true
+        await session
+        // A registered host exits while the sibling cleanup is awaiting I/O.
+        lateHostQueued = true
+      },
+      drainPendingHostLifecycleCleanups: async () => { if (lateHostQueued) await lateHost },
+      timeoutMs: 10_000,
+    }
+    const cleanup = drainRuntimeOpenCodeCommandCleanup(deps).then(() => { settled = true })
+    expect(hostsStarted && sessionStarted).toBe(true)
+    finishHosts()
+    await new Promise<void>(resolve => setImmediate(resolve))
+    finishSession()
+    await new Promise<void>(resolve => setImmediate(resolve))
+    expect(lateHostQueued).toBe(true)
+    expect(settled).toBe(false)
+    finishLateHost()
+    await cleanup
+    expect(settled).toBe(true)
+  })
+
+  test.each(['session', 'final_host'] as const)('bounds %s cleanup before the force-exit watchdog reserve', async pending => {
     let expireTimeout!: () => void
     const timer = { unref: mock(() => undefined) } as unknown as ReturnType<typeof setTimeout>
     const clearTimeoutMock = mock((actual: ReturnType<typeof setTimeout>) => {
@@ -74,17 +104,21 @@ describe('runtimeOpenCodeCommand cancellation cleanup', () => {
       return timer
     })
     const never = new Promise<void>(() => undefined)
+    let enteredFinalHost!: () => void
+    const finalHostEntered = new Promise<void>(resolve => { enteredFinalHost = resolve })
     const onTimeout = mock((timeoutMs: number) => {
       expect(timeoutMs).toBe(OPENCODE_COMMAND_CLEANUP_TIMEOUT_MS)
     })
 
     const cleanup = drainRuntimeOpenCodeCommandCleanup({
       disposeUnregisteredOwnedHosts: () => Promise.resolve(),
-      drainPendingLateLockReleases: () => never,
+      drainPendingLateLockReleases: () => pending === 'session' ? never : Promise.resolve(),
+      drainPendingHostLifecycleCleanups: () => { enteredFinalHost(); return never },
       setTimeout: setTimeoutMock,
       clearTimeout: clearTimeoutMock,
       onTimeout,
     })
+    if (pending === 'final_host') await finalHostEntered
     expireTimeout()
     await cleanup
 

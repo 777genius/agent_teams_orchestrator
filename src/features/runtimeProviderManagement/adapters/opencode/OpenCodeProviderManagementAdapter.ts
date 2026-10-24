@@ -2898,6 +2898,49 @@ function providerModelMatchesQuery(model: RuntimeProviderModel, query: string): 
   ].some(value => value.toLowerCase().includes(query))
 }
 
+function getProviderModelDeclaredInputModalities(input: {
+  providerId: string
+  modelId: string
+  inventory: OpenCodeInventorySnapshot
+  configProviders: OpenCodeConfigProvidersResponse | null
+  providers: OpenCodeProviderResponse | null
+}): string[] | null {
+  const inventoryMetadata = input.inventory.modelMetadata?.find(metadata => metadata.id === input.modelId)
+  // Preserve the existing authority of an exact full-inventory record, including
+  // its refusal when metadata is absent, malformed, or internally contradictory.
+  if (inventoryMetadata) return getOpenCodeModelDeclaredInputModalities(inventoryMetadata)
+
+  // Profile-only catalog reads omit verbose inventory metadata. Their native
+  // HTTP records are already fenced to the same project/profile/catalog identity.
+  const nestedModelId = input.modelId.slice(`${input.providerId}/`.length)
+  let declaration: string[] | null = null
+  for (const entries of [input.configProviders?.providers, input.providers?.all]) {
+    if (entries !== undefined && !Array.isArray(entries)) return null
+    const matching = entries?.filter(provider => normalizeProviderId(provider.id) === input.providerId) ?? []
+    if (matching.length > 1) return null
+    const rawModels = matching[0]?.models
+    if (rawModels === undefined) continue
+    const models = asRecord(rawModels)
+    if (!models) return null
+    if (!Object.prototype.hasOwnProperty.call(models, nestedModelId)) continue
+    const raw = asRecord(models[nestedModelId])
+    if (!raw) return null
+    const modalities = asRecord(raw.modalities)
+    const capabilities = asRecord(raw.capabilities)
+    if ((raw.modalities !== undefined && !modalities) || (raw.capabilities !== undefined && !capabilities)) return null
+    // A record without an input declaration grants no authority and does not
+    // override a declaration explicitly supplied by the other native endpoint.
+    if (modalities?.input === undefined && capabilities?.input === undefined) continue
+    const candidate = getOpenCodeModelDeclaredInputModalities({ raw })
+    if (candidate === null) return null
+    if (declaration !== null && (
+      declaration.length !== candidate.length || declaration.some(modality => !candidate.includes(modality))
+    )) return null
+    declaration = candidate
+  }
+  return declaration
+}
+
 function buildRuntimeProviderModel(input: {
   providerId: string
   modelId: string
@@ -2923,9 +2966,7 @@ function buildRuntimeProviderModel(input: {
     modelId: input.modelId,
     providerId: input.providerId,
     displayName: nestedModelId || input.modelId,
-    declaredInputModalities: getOpenCodeModelDeclaredInputModalities(
-      input.inventory.modelMetadata?.find(metadata => metadata.id === input.modelId),
-    ),
+    declaredInputModalities: getProviderModelDeclaredInputModalities(input),
     sourceLabel,
     free: isOpenCodeModelFree(input.modelId, input.inventory.modelMetadata),
     default: input.defaultModelId === input.modelId,
@@ -3997,7 +4038,7 @@ export class OpenCodeProviderManagementAdapter
         profileOptions: {
           includeAppMcp: false,
         },
-        hostLifetime: 'persistent',
+        hostLifetime: 'process',
         resolveConfigFingerprint: false,
         healthTimeoutMs: OPEN_CODE_PROVIDER_MANAGEMENT_HOST_HEALTH_TIMEOUT_MS,
         abortSignal: deadline.signal,
@@ -4045,7 +4086,7 @@ export class OpenCodeProviderManagementAdapter
         const leaveRelease = progress.enterStep('release settings host lease')
         await this.releaseProviderManagementHost(hostManager, host, hostLease)
         await hostManager
-          .releaseHost(host.hostKey, { keepPersistentAlive: true })
+          .releaseHost(host.hostKey, { keepPersistentAlive: false })
           .catch(() => undefined)
         leaveRelease()
       }
@@ -4118,7 +4159,6 @@ export class OpenCodeProviderManagementAdapter
 
     const hostManager = this.deps.hostManager ?? openCodeHostManager
     const clientFactory = this.deps.clientFactory ?? openCodeClientFactory
-    const hostLifetime = input.refresh ? 'process' : 'persistent'
     let host: OpenCodeHostHandle | null = null
     let hostLease: OpenCodeHostLeaseInput | null = null
 
@@ -4129,11 +4169,11 @@ export class OpenCodeProviderManagementAdapter
         profileOptions: {
           includeAppMcp: false,
         },
-        hostLifetime,
+        hostLifetime: 'process',
         resolveConfigFingerprint: false,
         healthTimeoutMs: OPEN_CODE_PROVIDER_MANAGEMENT_HOST_HEALTH_TIMEOUT_MS,
       })
-      hostLease = await this.retainProviderManagementHost(hostManager, host)
+      hostLease = await this.retainProviderManagementHost(hostManager, host, false)
       const cacheKey = this.getDirectoryCacheKey({
         runtimeId: input.runtimeId,
         inventory,
@@ -4251,7 +4291,7 @@ export class OpenCodeProviderManagementAdapter
       if (host) {
         await this.releaseProviderManagementHost(hostManager, host, hostLease)
         await hostManager
-          .releaseHost(host.hostKey, { keepPersistentAlive: hostLifetime === 'persistent' })
+          .releaseHost(host.hostKey, { keepPersistentAlive: false })
           .catch(() => undefined)
       }
     }

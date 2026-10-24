@@ -119,6 +119,9 @@
     "@opencode/core@2.0.32": "patches/@opencode%2Fcore@2.0.32.patch",
     "@opencode/ai@2.0.32": "patches/@opencode%2Fai@2.0.32.patch",
   },
+  "overrides": {
+    "bun-pty": "0.4.11",
+  },
   "packages": {
     "@a2a-js/sdk": ["@a2a-js/sdk@0.3.11", "", { "dependencies": { "uuid": "^11.1.0" }, "peerDependencies": { "@bufbuild/protobuf": "^2.10.2", "@grpc/grpc-js": "^1.11.0", "express": "^4.21.2 || ^5.1.0" }, "optionalPeers": ["@bufbuild/protobuf", "@grpc/grpc-js", "express"] }, "sha512-pXjjlL0ZYHgAxObov1J+W3ylfQV0rOrDBB8Eo4a9eCunqs7iNW5OIfMcV8YnZQdzeVSRomj8jHeudVz0zc4RNw=="],
 
@@ -3051,8 +3054,6 @@
     "@opencode/server-v2-floor/@opencode/core/@opencode/plugin": ["@opencode/plugin@2.0.0", "", { "dependencies": { "@ai-sdk/provider": "3.0.8", "@opencode/ai": "2.0.0", "@opencode/client": "2.0.0", "@opencode/protocol": "2.0.0", "@opencode/schema": "2.0.0", "@opencode/util": "2.0.0", "@standard-schema/spec": "1.1.0", "effect": "4.0.0-rc.112", "zod": "4.1.8" }, "peerDependencies": { "@opencode/theme": "2.0.0", "@opentui/core": ">=0.5.10", "@opentui/solid": ">=0.5.10", "solid-js": ">=1.9.0" }, "optionalPeers": ["@opencode/theme", "@opentui/core", "@opentui/solid", "solid-js"] }, "sha512-AngGt9i8fUozDn3VS3byVPCU+ORKRFfkP0gW1nL2eFTl5qkmt5zBFaSDTH/HjGZGyShKsItD+tceUy1AA4Bv8w=="],
 
     "@opencode/server-v2-floor/@opencode/core/@opencode/plugin-browser": ["@opencode/plugin-browser@2.0.0", "", { "dependencies": { "@opencode/plugin": "2.0.0", "@opencode/schema": "2.0.0", "effect": "4.0.0-rc.112" } }, "sha512-O9BbPMrZv1oCsz7XkCCkdCP/dqlwG5poHjMvL6FrmHRLLv/1pwwDm+v/SJxql+1EDwVrXpH/l7DkE1kpygwy9g=="],
-
-    "@opencode/server-v2-floor/@opencode/core/bun-pty": ["bun-pty@0.4.8", "", {}, "sha512-rO70Mrbr13+jxHHHu2YBkk2pNqrJE5cJn29WE++PUr+GFA0hq/VgtQPZANJ8dJo6d7XImvBk37Innt8GM7O28w=="],
 
     "@opencode/server-v2-floor/@opencode/core/gitlab-ai-provider": ["gitlab-ai-provider@6.12.1", "", { "dependencies": { "@anthropic-ai/sdk": "^0.71.0", "@anycable/core": "^0.9.2", "graphql-request": "^6.1.0", "isomorphic-ws": "^5.0.0", "openai": "^6.16.0", "socket.io-client": "^4.8.1", "vscode-jsonrpc": "^8.2.1", "zod": "^3.25.76" }, "peerDependencies": { "@ai-sdk/provider": ">=3.0.0", "@ai-sdk/provider-utils": ">=4.0.0" } }, "sha512-Qn5iHqvjG8yktI5MWaUgdRR94l7O4WtYW0CAbhsCh1Tj0Fei/DeprOYPVyf4Nht1Ix6U2PXSYM32QOHI6Z2TDw=="],
 

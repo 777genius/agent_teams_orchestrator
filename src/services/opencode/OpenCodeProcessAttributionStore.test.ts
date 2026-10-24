@@ -476,9 +476,10 @@ describe('OpenCodeProcessAttributionStore', () => {
     expect(await exists(corruptPath)).toBe(false)
   })
 
-  test('keeps a dead host and the live agent under it until the last agent is gone', async () => {
+  test.each(['matching', 'unreadable'] as const)('keeps a dead host and the live agent under it until the last agent is gone (%s birth)', async identity => {
     const directory = await createStoreDirectory()
     const hostId = mintProcessAttributionId()
+    const startedAtMs = 1_757_500_000_123
     await writeHostAttributionRecord({
       directory,
       attributionId: hostId,
@@ -488,13 +489,15 @@ describe('OpenCodeProcessAttributionStore', () => {
       owners: [],
     })
     const agentPath = await writeAgentRecordFile(directory, hostId, '666-1.json',
-      buildAgentRecord({ attributionId: hostId, pid: 666, writtenAtMs: Date.now() }))
+      buildAgentRecord({ attributionId: hostId, pid: 666, startedAtMs, writtenAtMs: Date.now() }))
 
     // A host that died leaving live agent trees behind is exactly the orphan the
     // desktop sweep exists to find, so its evidence - the agent record and the
     // host record that names the team - has to survive the sweep.
     const result = await pruneStaleAttributionRecords(directory, {
       isProcessAlive: pid => pid === 666,
+      // The process is synthetic; its birth must not come from a real PID 666.
+      readProcessStartTimeMs: async () => identity === 'matching' ? startedAtMs : null,
     })
 
     expect(result).toMatchObject({ prunedHosts: 0, prunedAgents: 0 })
@@ -534,6 +537,7 @@ describe('OpenCodeProcessAttributionStore', () => {
     const result = await pruneStaleAttributionRecords(directory, {
       now: () => nowMs,
       isProcessAlive: pid => pid !== 444,
+      readProcessStartTimeMs: async () => null,
     })
 
     // The horizon is a backstop for records nobody can judge, never a reason to

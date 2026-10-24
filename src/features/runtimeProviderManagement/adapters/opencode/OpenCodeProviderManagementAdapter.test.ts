@@ -1,17 +1,21 @@
 import { describe, expect, test } from 'bun:test'
-import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { realpathSync } from 'node:fs'
+import { EventEmitter } from 'node:events'
+import type { ChildProcess } from 'node:child_process'
 import os from 'node:os'
 import path from 'node:path'
 
 import { OpenCodeProviderManagementAdapter } from './OpenCodeProviderManagementAdapter.js'
 import { planOpenCodeProfilePolicy } from '../../../../services/opencode/OpenCodeProfilePolicy.js'
+import { OpenCodeHostManager } from '../../../../services/opencode/OpenCodeHostManager.js'
 
 import type {
   OpenCodeExecutionProbeResult,
   OpenCodeHostHandle,
   OpenCodeInventorySnapshot,
   OpenCodeProfileScope,
+  OpenCodeProviderListEntry,
 } from '../../../../services/opencode/types.js'
 import type {
   OpenCodeHostLeaseInput,
@@ -99,15 +103,16 @@ function authStore() {
   }
 }
 
-function catalogIdentityDependencies() {
+function catalogIdentityDependencies(): Pick<
+  NonNullable<ConstructorParameters<typeof OpenCodeProviderManagementAdapter>[0]>,
+  'resolveBinaryPath' | 'resolveBinaryIdentity' | 'profileManager'
+> {
   return {
     resolveBinaryPath: () => testBinaryPath,
     resolveBinaryIdentity: async () => 'test-binary-identity',
     profileManager: {
       listManagedAuthPaths: async () => [],
-      readCatalogSelectedAuthIdentity: async ({ profileScope }: {
-        profileScope: { selectedAuthIdentity: string }
-      }) => ({
+      readCatalogSelectedAuthIdentity: async ({ profileScope }) => ({
         source: profileScope.selectedAuthIdentity,
         managed: profileScope.selectedAuthIdentity,
         preferences: 'known:test-preferences',
@@ -310,7 +315,11 @@ describe('OpenCodeProviderManagementAdapter', () => {
 
       const failure = expectFailure(result)
       expect(failure.code).toBe('runtime-unhealthy')
-      expect(failure.message).toBe('OpenCode inventory probe timed out after 1ms')
+      expect(failure.message).toBe(
+        'OpenCode inventory probe timed out after 1ms '
+        + 'No OpenCode inventory step was active when the timeout fired. '
+        + 'No OpenCode inventory step completed before timeout.',
+      )
       expect(ensureHostCalled).toBe(false)
       expect(setProviderAuthCalled).toBe(false)
       expect(authWriteCalled).toBe(false)
@@ -325,6 +334,147 @@ describe('OpenCodeProviderManagementAdapter', () => {
       }
     }
   })
+
+  const snapshotReadCases: Array<
+    { kind: 'settings'; degraded: boolean } | { kind: 'directory'; cacheHit: boolean }
+  > = [
+    { kind: 'settings', degraded: false }, { kind: 'settings', degraded: true },
+    { kind: 'directory', cacheHit: false }, { kind: 'directory', cacheHit: true },
+  ]
+  for (const scenario of snapshotReadCases) {
+    const detail = scenario.kind === 'settings'
+      ? `degraded: ${scenario.degraded}` : `refresh: false, cache hit: ${scenario.cacheHit}`
+    test(`${scenario.kind} disposes its snapshot host before returning without disturbing a leased persistent owner (${detail})`, async () => {
+      const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'settings-host-lifetime-')))
+      const registryPath = path.join(root, 'host-registry.json')
+      const snapshot = inventory({ projectPath: root, profile: {
+        ...inventory().profile!, projectPath: root, canonicalProjectPath: root,
+        workingDirectoryPath: root, profileRootPath: root, tmpPath: path.join(root, 'tmp'),
+        globalAuthPath: path.join(root, 'global-auth.json'),
+        managedAuthPath: path.join(root, 'managed-auth.json'),
+        sourceAuthPath: path.join(root, 'source-auth.json'),
+      } })
+      const alive = new Set<number>()
+      let nextPort = 43150
+      let persistent: OpenCodeHostHandle | undefined
+      let disposalStarted!: () => void
+      const disposing = new Promise<void>(resolve => { disposalStarted = resolve })
+      let finishDisposal!: () => void
+      const disposalGate = new Promise<void>(resolve => { finishDisposal = resolve })
+      const disposed: number[] = []
+      let gateDisposal = true
+      let clientReads = 0
+      let evictionSweeps = 0
+      const manager = new OpenCodeHostManager({
+        prepareProfile: async () => snapshot.profile!,
+        allocateLoopbackPort: async () => ++nextPort,
+        spawnHostProcess: (_profile, pid) => {
+          alive.add(pid)
+          return Object.assign(new EventEmitter(), {
+            pid, unref() {}, kill() { alive.delete(pid); return true },
+          }) as ChildProcess
+        },
+        fetchJson: async url => {
+          const pid = Number(new URL(url).port)
+          if (url.endsWith('/global/dispose')) {
+            if (pid !== persistent?.pid && gateDisposal) {
+              disposalStarted()
+              await disposalGate
+            }
+            disposed.push(pid)
+            alive.delete(pid)
+          }
+          return { status: 200, data: { healthy: true, version: '1.14.19' } }
+        },
+        isProcessAlive: pid => alive.has(pid),
+        readProcessStartTimeMs: async pid => pid,
+        killProcess: pid => { alive.delete(pid) },
+        sleepMs: async () => {},
+        persistentRegistryPath: registryPath,
+        processAttributionDirectory: null,
+      })
+      const ownerLease = {
+        teamId: 'TEST-other-team', laneId: 'primary', memberName: 'alice',
+        runId: 'TEST-run', sessionId: 'TEST-session',
+      }
+      let pending: Promise<ProviderManagementResult<unknown>> | undefined
+      try {
+        persistent = await manager.ensureHost({
+          preparedProfile: snapshot.profile!, hostLifetime: 'persistent',
+          resolveConfigFingerprint: false, prewarmManagedSubscriptionPlugins: false,
+        })
+        await manager.retainHostLease(persistent.hostKey, ownerLease)
+        await manager.releaseHost(persistent.hostKey, { keepPersistentAlive: true })
+        const registryBefore = await readFile(registryPath, 'utf8')
+        const adapter = new OpenCodeProviderManagementAdapter({
+          ...catalogIdentityDependencies(),
+          inventoryService: { probe: async () => snapshot },
+          hostManager: {
+            ensureHost: manager.ensureHost.bind(manager),
+            releaseHost: manager.releaseHost.bind(manager),
+            retainHostLease: manager.retainHostLease.bind(manager),
+            releaseHostLease: manager.releaseHostLease.bind(manager),
+            reconcilePersistentHosts: async options => {
+              evictionSweeps += 1
+              return manager.reconcilePersistentHosts(options)
+            },
+          },
+          clientFactory: { create: () => { clientReads += 1; return {
+            getConfigProviders: async () => ({ providers: [], default: {} }),
+            getProviders: async () => {
+              if (scenario.kind === 'settings' && scenario.degraded) throw new Error('TEST metadata unavailable')
+              return { all: [], connected: [], default: {} }
+            },
+            getProviderAuth: async () => ({}),
+          } } },
+        })
+        const directoryRequest = {
+          runtimeId: 'opencode' as const, projectPath: root, query: null,
+          filter: 'all' as const, limit: 50, cursor: null, refresh: false,
+        }
+        if (scenario.kind === 'directory' && scenario.cacheHit) {
+          gateDisposal = false
+          const primed = await adapter.loadDirectory({ ...directoryRequest, refresh: true })
+          expect(primed.ok).toBe(true)
+          expect(disposed).toEqual([43152])
+          disposed.length = 0
+          evictionSweeps = 0
+          gateDisposal = true
+        }
+        const snapshotPid = nextPort + 1
+        let returned = false
+        const read = scenario.kind === 'settings'
+          ? adapter.loadView('opencode') : adapter.loadDirectory(directoryRequest)
+        const resultPromise = read.then(result => { returned = true; return result })
+        pending = resultPromise
+        expect(await Promise.race([
+          disposing.then(() => 'disposing'), resultPromise.then(() => 'returned'),
+        ])).toBe('disposing')
+        expect(returned).toBe(false)
+        expect(alive.size).toBe(2)
+        finishDisposal()
+        const result = await resultPromise
+        expect(result.ok).toBe(true)
+        if (result.ok && 'runtime' in result.value) {
+          expect(result.value.runtime.state).toBe(scenario.kind === 'settings' && scenario.degraded ? 'degraded' : 'ready')
+        }
+        expect(clientReads).toBe(1)
+        expect(evictionSweeps).toBe(0)
+        expect(disposed).toEqual([snapshotPid])
+        expect(alive).toEqual(new Set([persistent.pid]))
+        expect(manager.getHost(persistent.hostKey)).toBe(persistent)
+        expect(await readFile(registryPath, 'utf8')).toBe(registryBefore)
+      } finally {
+        finishDisposal()
+        await pending?.catch(() => undefined)
+        if (persistent) {
+          await manager.releaseHostLease(persistent.hostKey, ownerLease)
+          await manager.disposeHost(persistent.hostKey)
+        }
+        await rm(root, { recursive: true, force: true })
+      }
+    })
+  }
 
   test('bounds settings host preparation after successful inventory and propagates cancellation', async () => {
     let hostSignal: AbortSignal | undefined
@@ -606,7 +756,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
     ).toEqual([
       {
         projectPath: '/tmp/project',
-        hostLifetime: 'persistent',
+        hostLifetime: 'process',
         healthTimeoutMs: 10_000,
         preparedProfile: true,
         includeAppMcp: false,
@@ -638,22 +788,14 @@ describe('OpenCodeProviderManagementAdapter', () => {
           lease.laneId === 'provider-management',
       ),
     ).toBe(true)
-    expect(reconcileCalls).toHaveLength(1)
-    expect(
-      reconcileCalls.every(
-        options =>
-          options.reason === 'provider-management-idle-eviction' &&
-          options.staleAgeMs === 10 * 60_000 &&
-          options.leaseStaleAgeMs === null &&
-          options.preflightLeaseStaleAgeMs === 2 * 60 * 60_000,
-      ),
-    ).toBe(true)
+    expect(reconcileCalls).toHaveLength(0)
   })
 
-  test('does not leave a provider-management lease behind when idle eviction fails', async () => {
+  test('releases the settings lease without running idle eviction', async () => {
     const retained: OpenCodeHostLeaseInput[] = []
     const released: OpenCodeHostLeaseInput[] = []
     const releasedHosts: string[] = []
+    let evictionSweeps = 0
     const adapter = new OpenCodeProviderManagementAdapter({
       inventoryService: {
         probe: async () => inventory(),
@@ -667,6 +809,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
           released.push(lease)
         },
         reconcilePersistentHosts: async () => {
+          evictionSweeps += 1
           throw new Error('registry temporarily unavailable')
         },
         releaseHost: async hostKey => {
@@ -685,6 +828,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
     const result = await adapter.loadView('opencode')
 
     expect(result.ok).toBe(true)
+    expect(evictionSweeps).toBe(0)
     expect(retained).toHaveLength(1)
     expect(released).toEqual(retained)
     expect(releasedHosts).toEqual(['host-key'])
@@ -6140,6 +6284,83 @@ describe('OpenCodeProviderManagementAdapter', () => {
       availability: 'untested',
     })
   })
+
+  function profileCatalogDeclarationAdapter(input: {
+    config: OpenCodeProviderListEntry[]
+    live: OpenCodeProviderListEntry[]
+    metadata?: OpenCodeInventorySnapshot['modelMetadata']
+  }) {
+    return new OpenCodeProviderManagementAdapter({
+      ...catalogIdentityDependencies(),
+      inventoryService: { probe: async (_projectPath, options) => {
+        expect(options?.mode).toBe('profile')
+        return inventory({ availableProviders: ['openrouter'], models: [], modelMetadata: input.metadata ?? [] })
+      } },
+      hostManager: { ensureHost: async () => host(), releaseHost: async () => {} },
+      clientFactory: { create: () => ({
+        getConfigProviders: async () => ({ providers: input.config, default: {} }),
+        getProviders: async () => ({ all: input.live, connected: [], default: {} }),
+        getProviderAuth: async () => ({}),
+      }) },
+    })
+  }
+
+  test('profile-only catalog retains exact input declarations from native HTTP model records', async () => {
+    const model = 'openai/gpt-5.4-mini'
+    const adapter = profileCatalogDeclarationAdapter({
+      config: [{ id: 'openrouter', models: { [model]: { modalities: { input: ['text', 'image'] } } } }],
+      live: [{ id: 'openrouter', models: { [model]: { capabilities: { input: { text: true, image: true, video: false } } } } }],
+    })
+    const result = await adapter.loadModels({ runtimeId: 'opencode', providerId: 'openrouter' })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.value.models.find(row => row.modelId === `openrouter/${model}`)?.declaredInputModalities)
+      .toEqual(['text', 'image'])
+  })
+
+  const httpModel = 'openai/gpt-5.4-mini'
+  const httpRecord = (raw: unknown): OpenCodeProviderListEntry[] => [{ id: 'openrouter', models: { [httpModel]: raw } }]
+  const imageDeclaration = { modalities: { input: ['image'] } }
+  const declarationCases: Array<{
+    name: string
+    config: OpenCodeProviderListEntry[]
+    live: OpenCodeProviderListEntry[]
+    metadata?: OpenCodeInventorySnapshot['modelMetadata']
+    expected: string[] | null
+  }> = [
+    { name: 'accepts config-only declaration', config: httpRecord(imageDeclaration), live: [], expected: ['image'] },
+    { name: 'accepts live-only declaration', config: [], live: httpRecord({ capabilities: { input: { image: true, text: false } } }), expected: ['image'] },
+    { name: 'accepts reordered matching native declarations', config: httpRecord({ modalities: { input: ['IMAGE', 'text'] } }), live: httpRecord({ capabilities: { input: { text: true, image: true } } }), expected: ['text', 'image'] },
+    { name: 'retains known empty declaration', config: httpRecord({ modalities: { input: [] } }), live: httpRecord({ capabilities: { input: { image: false } } }), expected: [] },
+    { name: 'ignores an undeclared output-only record', config: httpRecord({ modalities: { output: ['text'] } }), live: httpRecord(imageDeclaration), expected: ['image'] },
+    { name: 'keeps missing declarations unknown', config: httpRecord({}), live: httpRecord({}), expected: null },
+    { name: 'cannot borrow a foreign provider declaration', config: [{ id: 'foreign', models: { [httpModel]: imageDeclaration } }], live: httpRecord({}), expected: null },
+    { name: 'cannot borrow differently cased model metadata', config: [{ id: 'openrouter', models: { 'openai/GPT-5.4-mini': imageDeclaration } }], live: httpRecord({}), expected: null },
+    { name: 'refuses malformed model records', config: httpRecord(null), live: httpRecord(imageDeclaration), expected: null },
+    { name: 'refuses malformed null models container', config: [{ id: 'openrouter', models: null as unknown as Record<string, unknown> }], live: httpRecord(imageDeclaration), expected: null },
+    { name: 'refuses malformed array models container', config: httpRecord(imageDeclaration), live: [{ id: 'openrouter', models: [] as unknown as Record<string, unknown> }], expected: null },
+    { name: 'refuses malformed string models container', config: [{ id: 'openrouter', models: 'invalid' as unknown as Record<string, unknown> }], live: httpRecord(imageDeclaration), expected: null },
+    { name: 'refuses malformed declaration containers', config: httpRecord({ modalities: null }), live: httpRecord(imageDeclaration), expected: null },
+    { name: 'refuses malformed input arrays', config: httpRecord({ modalities: { input: ['image', null] } }), live: httpRecord(imageDeclaration), expected: null },
+    { name: 'refuses internally conflicting declarations', config: httpRecord({ modalities: { input: ['image'] }, capabilities: { input: { image: false } } }), live: httpRecord(imageDeclaration), expected: null },
+    { name: 'refuses conflicting native endpoint declarations', config: httpRecord({ modalities: { input: ['text'] } }), live: httpRecord(imageDeclaration), expected: null },
+    { name: 'cannot override a native empty declaration', config: httpRecord({ modalities: { input: [] } }), live: httpRecord(imageDeclaration), expected: null },
+    { name: 'refuses ambiguous provider records', config: [...httpRecord(imageDeclaration), ...httpRecord({})], live: httpRecord(imageDeclaration), expected: null },
+    { name: 'refuses malformed null config provider list', config: null as unknown as OpenCodeProviderListEntry[], live: httpRecord(imageDeclaration), expected: null },
+    { name: 'refuses malformed null live provider list', config: httpRecord(imageDeclaration), live: null as unknown as OpenCodeProviderListEntry[], expected: null },
+    { name: 'retains exact full inventory declaration precedence', config: httpRecord(imageDeclaration), live: httpRecord(imageDeclaration), metadata: [{ id: `openrouter/${httpModel}`, raw: { modalities: { input: ['text'] } }, cost: null, context: null, limits: null, free: false }], expected: ['text'] },
+    { name: 'retains authoritative inventory unknown instead of granting HTTP support', config: httpRecord(imageDeclaration), live: httpRecord(imageDeclaration), metadata: [{ id: `openrouter/${httpModel}`, raw: {}, cost: null, context: null, limits: null, free: false }], expected: null },
+    { name: 'does not borrow a foreign inventory declaration', config: httpRecord({}), live: httpRecord({}), metadata: [{ id: `foreign/${httpModel}`, raw: imageDeclaration, cost: null, context: null, limits: null, free: false }], expected: null },
+  ]
+  for (const input of declarationCases) {
+    test(`profile-only catalog ${input.name}`, async () => {
+      const result = await profileCatalogDeclarationAdapter(input).loadModels({ runtimeId: 'opencode', providerId: 'openrouter' })
+      expect(result.ok).toBe(true)
+      if (!result.ok) return
+      expect(result.value.models.find(row => row.modelId === `openrouter/${httpModel}`)?.declaredInputModalities)
+        .toEqual(input.expected)
+    })
+  }
 
   test('provider models retain exact scoped declarations and leave missing metadata unknown', async () => {
     const models = ['custom/ExactCase', 'custom/video', 'custom/none', 'custom/missing', 'custom/conflict']
