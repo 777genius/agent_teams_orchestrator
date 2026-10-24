@@ -37,22 +37,31 @@ async function verifiedSidecar(file: string, sha256: string, signal: AbortSignal
   signal.throwIfAborted()
 }
 
-/** Team ID from codesign, or null when the file is unsigned, ad-hoc, or the output is unexpected. */
-async function codesignTeamId(target: string, signal: AbortSignal): Promise<string | null> {
-  const { stderr } = await execFileAsync('codesign', ['-dv', '--verbose=2', target], { signal })
+// Absolute path: the delivery check must not depend on PATH.
+const CODESIGN = '/usr/bin/codesign'
+const DEVELOPER_ID_APP = 'anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] and certificate leaf[field.1.2.840.113635.100.6.1.13]'
+
+/** Team ID of this runtime, read from its own signature. It is only used to build a requirement, and the
+ * runtime must then satisfy that requirement, so a forged value can only make the check fail. */
+async function runtimeTeamId(runtimeExe: string, signal: AbortSignal): Promise<string | null> {
+  const { stderr } = await execFileAsync(CODESIGN, ['-dv', '--verbose=2', runtimeExe], { signal })
   const team = /^TeamIdentifier=(.+)$/m.exec(stderr)?.[1]?.trim()
-  return team && team !== 'not set' ? team : null
+  return team && /^[A-Z0-9]{10}$/.test(team) ? team : null
 }
 
-/** macOS release bundles sign bun with the app identity after this runtime was compiled, so the
- * unsigned digest in the identity no longer matches. Accept a bun only when codesign verifies it
- * strictly and it carries the same Team ID as this runtime executable. */
+/** macOS release bundles sign bun with the app identity after this runtime was compiled, so the unsigned
+ * digest in the identity no longer matches. Accept a bun only when Apple's Developer ID requirement holds for
+ * the runtime and for bun (identifier "bun") under the same team. Team IDs printed for bun itself are never
+ * trusted: an ad-hoc identifier can embed a forged TeamIdentifier line. */
 async function signedBySameTeam(file: string, runtimeExe: string, signal: AbortSignal): Promise<boolean> {
   if (process.platform !== 'darwin') return false
   try {
-    await execFileAsync('codesign', ['--verify', '--strict', file], { signal })
-    const [fileTeam, runtimeTeam] = [await codesignTeamId(file, signal), await codesignTeamId(runtimeExe, signal)]
-    return fileTeam !== null && fileTeam === runtimeTeam
+    const team = await runtimeTeamId(runtimeExe, signal)
+    if (team === null) return false
+    const teamRequirement = `${DEVELOPER_ID_APP} and certificate leaf[subject.OU] = "${team}"`
+    await execFileAsync(CODESIGN, ['--verify', '--strict', `-R=${teamRequirement}`, runtimeExe], { signal })
+    await execFileAsync(CODESIGN, ['--verify', '--strict', `-R=identifier "bun" and ${teamRequirement}`, file], { signal })
+    return true
   } catch {
     signal.throwIfAborted()
     return false
