@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import * as fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { executeOpenCodeBridgeCommandEnvelope } from './OpenCodeBridgeCommandHandler.js'
@@ -73,6 +74,43 @@ beforeEach(async () => {
 afterEach(async () => {
   for (const restore of restores.splice(0).reverse()) restore()
   await rm(dir, { recursive: true, force: true })
+})
+
+test('sibling lane atomic publication during Stop re-admits the exact original session without losing peer authority', async () => {
+  const peer = { ...record, laneId: 'secondary:opencode:bob', runId: 'TEST-peer-run', memberName: 'bob',
+    opencodeSessionId: 'TEST-peer-session', runtimePid: 42 }
+  await store.upsert(peer)
+  const originalOpen = fs.open
+  let armed = false, replaced = false
+  track(spyOn(openCodeSessionStore, 'get').mockImplementation(async (team, lane, member) => {
+    armed = true
+    try { return await store.get(team, lane, member) } finally { armed = false }
+  }))
+  track(spyOn(fs, 'open').mockImplementation(async (...args) => {
+    if (armed && !replaced && args[0] === path.join(dir, 'sessions.json')) {
+      replaced = true
+      armed = false
+      // Actual store writer, under its actual lock and atomic rename. Both
+      // lanes retain the same host; this update changes no Stop authority.
+      await store.upsert({ ...peer, updatedAt: '2026-10-24T00:00:00.000Z' })
+    }
+    return originalOpen(...args)
+  }))
+  const abort = track(spyOn(openCodeSessionBridge, 'abort').mockResolvedValue(true))
+  const result = await executeOpenCodeBridgeCommandEnvelope(envelope('opencode.stopTeam', stopBody()))
+  expect(replaced).toBe(true)
+  expect(result.ok).toBe(true)
+  if (!('data' in result) || !result.data || typeof result.data !== 'object' || !('stopped' in result.data))
+    throw new Error('TEST Stop domain result missing')
+  expect(result.data.stopped).toBe(true)
+  expect(abort).toHaveBeenCalledTimes(1)
+  expect(abort.mock.calls[0][0].opencodeSessionId).toBe(record.opencodeSessionId)
+  expect((await store.lookupStop(request)).status).toBe('completed')
+  expect(await store.get(peer.teamId, peer.laneId, peer.memberName)).toMatchObject({
+    opencodeSessionId: 'TEST-peer-session', hostKey: peer.hostKey, runtimePid: 42,
+    runId: 'TEST-peer-run', updatedAt: '2026-10-24T00:00:00.000Z',
+  })
+  expect((await store.get(peer.teamId, peer.laneId, peer.memberName))?.stoppedAt).toBeUndefined()
 })
 
 for (const stopped of [true, false]) test(`wire Stop retains original ${stopped} and replay bypasses host/message status`, async () => {
