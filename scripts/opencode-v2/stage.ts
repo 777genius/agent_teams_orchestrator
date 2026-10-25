@@ -2,8 +2,9 @@ import { openCodeV2GraphPackages, openCodeV2StagedVersions, openCodeV2Wire, type
 import { OPENCODE_V2_CLIENT_GRAPH_ENTRIES, OPENCODE_V2_EFFECT_PLATFORM_ENTRIES,
   OPENCODE_V2_SERVER_GRAPH_ENTRIES } from '../../src/services/opencode/host/OpenCodeV2ServerGraph.js'
 import { createHash } from 'node:crypto'
-import { cp, lstat, mkdir, readFile, realpath, symlink, writeFile } from 'node:fs/promises'
+import { cp, lstat, mkdir, readdir, readFile, realpath, rmdir, stat, symlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
+import { stagedPackageFilter, type StagedPackageManifest } from './staged-files.js'
 
 export const OPENCODE_V2_EXTERNALS = ['@opencode/*', 'effect', 'effect/*']
 // Root packages the bundled CLI imports directly. Official core chunks import
@@ -12,7 +13,7 @@ const ROOT_PACKAGES = ['effect', '@effect/platform-node', '@effect/platform-node
   '@modelcontextprotocol/sdk'] as const
 const EXACT_RELEASE = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?$/
 const RUNTIME_ROOT = path.join(import.meta.dir, '..', '..')
-type PackageMetadata = {
+type PackageMetadata = StagedPackageManifest & {
   name: string; version: string
   dependencies?: Record<string, string>; optionalDependencies?: Record<string, string>
   peerDependencies?: Record<string, string>
@@ -163,8 +164,35 @@ export async function verifyGraphs(from: string, ownedRoot?: string, plan?: Open
   }
 }
 
-/** Build-time staging only. No installs or runtime fallbacks. All package bytes
- * and installed native assets are copied, preserving separate physical graphs. */
+async function treeSize(directory: string): Promise<{ files: number; bytes: number }> {
+  const size = { files: 0, bytes: 0 }
+  for (const relative of await readdir(directory, { recursive: true })) {
+    const entry = await stat(path.join(directory, relative))
+    if (!entry.isFile()) continue
+    size.files += 1
+    size.bytes += entry.size
+  }
+  return size
+}
+
+/** Remove directories that excluded files left empty, never the package root itself. */
+async function removeEmptied(directory: string, root: string): Promise<void> {
+  for (let current = directory; current.startsWith(root + path.sep); current = path.dirname(current)) {
+    let entries: string[]
+    try { entries = await readdir(current) }
+    catch (error) {
+      // A deeper pass already removed it; its parent may be empty now too.
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue
+      throw error
+    }
+    if (entries.length > 0) return
+    await rmdir(current)
+  }
+}
+
+/** Build-time staging only. No installs or runtime fallbacks. Every loadable package
+ * byte and installed native asset is copied, preserving separate physical graphs;
+ * files Bun never loads are left out (see staged-files.ts). */
 export async function stageOpenCodeV2Graphs(sourceRoot: string, bundleDirectory: string,
   options: { portable?: boolean; platform?: string; arch?: string } = {}): Promise<void> {
   sourceRoot = await realpath(sourceRoot)
@@ -172,6 +200,8 @@ export async function stageOpenCodeV2Graphs(sourceRoot: string, bundleDirectory:
   const plan = await planOpenCodeV2Stage(sourceRoot)
   await verifyGraphs(sourceRoot, undefined, plan)
   await mkdir(destination, { recursive: true })
+  const stagedTarget = { platform: options.platform ?? process.platform, arch: options.arch ?? process.arch }
+  const excluded = { files: 0, bytes: 0 }
   const packages = new Map<string, PackageNode>()
   const link = async (directory: string, name: string, target: string) => {
     // Portable packages retain the source hoisted/nested positions. The normal
@@ -194,6 +224,8 @@ export async function stageOpenCodeV2Graphs(sourceRoot: string, bundleDirectory:
     const target = options.portable ? path.join(destination, physicalRelative) : path.join(destination, '.opencode-v2', id)
     const node = { source, target, metadata: info }
     packages.set(source, node)
+    const keep = stagedPackageFilter(info, stagedTarget)
+    const emptied = new Set<string>()
     await cp(source, target, { recursive: true, dereference: true, filter: async file => {
       const relative = path.relative(source, file)
       if (relative.split(path.sep).includes('node_modules')) return false
@@ -203,8 +235,19 @@ export async function stageOpenCodeV2Graphs(sourceRoot: string, bundleDirectory:
           throw new Error('Package asset escapes its package')
         }
       }
-      return true
+      if (!relative) return true
+      const entry = await stat(file)
+      if (keep(relative.split(path.sep).join('/'), entry.isDirectory())) return true
+      const size = entry.isDirectory() ? await treeSize(file) : { files: 1, bytes: entry.size }
+      excluded.files += size.files
+      excluded.bytes += size.bytes
+      emptied.add(path.dirname(path.join(target, relative)))
+      return false
     } })
+    // Excluded files can leave directories that no longer hold anything.
+    for (const directory of [...emptied].sort((left, right) => right.length - left.length)) {
+      await removeEmptied(directory, target)
+    }
     const optional = info.optionalDependencies ?? {}
     const required = info.dependencies ?? {}
     const peers = info.peerDependencies ?? {}
@@ -246,9 +289,11 @@ export async function stageOpenCodeV2Graphs(sourceRoot: string, bundleDirectory:
     graphs.push({ version, server: aliases.server, client: aliases.client, effect, wire: openCodeV2Wire(version) })
   }
   await writeFile(path.join(bundleDirectory, 'opencode-v2-graphs.json'), JSON.stringify({
-    schema: 2, graphs, effect: plan.root.effect, pty: plan.ptyVersion, platform: options.platform ?? process.platform, arch: options.arch ?? process.arch,
+    schema: 2, graphs, effect: plan.root.effect, pty: plan.ptyVersion, platform: stagedTarget.platform, arch: stagedTarget.arch,
     packages: [...packages.values()].map(node => ({ name: node.metadata.name, version: node.metadata.version,
       path: path.relative(bundleDirectory, node.target),
     })),
   }, null, 2) + '\n')
+  console.log(`Staged ${packages.size} OpenCode V2 graph packages for ${stagedTarget.platform}-${stagedTarget.arch}; ` +
+    `left out ${excluded.files} files (${(excluded.bytes / 1e6).toFixed(1)} MB) that Bun never loads`)
 }
