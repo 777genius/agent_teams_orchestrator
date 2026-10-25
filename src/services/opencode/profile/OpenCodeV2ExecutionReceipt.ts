@@ -1,3 +1,4 @@
+import { openCodeV2EngineVersion } from '../compatibility/OpenCodeV2Registry.js'
 import { openCodeV2Dialect } from '../compatibility/OpenCodeV2Registry.js'
 import { resolveOpenCodeV2GraphEntry } from '../host/OpenCodeV2ServerGraph.js'
 import { openCodeBunVersion } from '../../../constants/openCodeBunVersion.js'
@@ -63,7 +64,7 @@ async function inspectOpenCodeV2WindowsPeExecutable(file: string, expectedName: 
 export async function createOpenCodeV2ExecutionReceipt(_sourceRoot: string, identity: import('../compatibility/OpenCodeNativeIdentity.js').OpenCodeV2NativeIdentity, controller?: ExecutionMcpConfig): Promise<ValidatedExecutionNative> {
 assertExecutionPlatformAvailable()
 executionAssert(process.versions.bun === openCodeBunVersion() && identity.generation === 'v2', 'source_bun_required')
-const cli = await realpath(identity.executablePath), bun = await realpath(process.execPath), pin = identity.version
+const cli = await realpath(identity.executablePath), bun = await realpath(process.execPath), pin = openCodeV2EngineVersion(identity)
 const sha = async (file: string) => createHash('sha256').update(await readFile(file)).digest('hex')
 const cliSha256 = process.platform === 'win32'
   ? (await inspectOpenCodeV2WindowsPeExecutable(cli, 'opencode.exe', 'native_selection_changed')).sha256
@@ -218,10 +219,8 @@ if (process.platform === 'darwin') {
 }
 files.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0)
 executionAssert(new Set(files.map(row => row.path)).size === files.length)
-const cliMetadata = executionRecord(JSON.parse(await readFile(path.join(path.dirname(path.dirname(cli)), 'package.json'), 'utf8')))
-executionAssert(typeof cliMetadata.name === 'string' && cliMetadata.version === pin)
-const native = { generation: 'v2', version: pin, dialect: openCodeV2Dialect(pin), runtimeMode: delivery.runtimeMode, executablePath: cli,
-  executableSha256: cliSha256, packageName: cliMetadata.name, entrySha256: delivery.entrySha256,
+const native = { generation: 'v2', version: identity.version, engineVersion: pin, dialect: openCodeV2Dialect(pin), runtimeMode: delivery.runtimeMode, executablePath: cli,
+  executableSha256: cliSha256, packageName: identity.packageName, ...(identity.origin ? { origin: identity.origin } : {}), entrySha256: delivery.entrySha256,
   bun: { path: bun, sha256: await sha(bun) }, graph: { sha256: executionHash(files), files },
   ...(taskNode ? { taskNode } : {}) } satisfies ValidatedExecutionNative
 executionAssert(native.executableSha256 === identity.executableSha256 && native.packageName === identity.packageName, 'native_selection_changed')

@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { isOpenCodeV2Identity, type OpenCodeV2Dialect, type OpenCodeV2Pin } from '../compatibility/OpenCodeV2Registry.js'
+import { isOpenCodeV2Identity, isOpenCodeV2Pin, type OpenCodeV2Dialect, type OpenCodeV2Pin } from '../compatibility/OpenCodeV2Registry.js'
 
 /** One absolute owner startup ceiling; callers may clip it to an earlier deadline. */
 export function openCodeV2RunInitializationMs(platform: NodeJS.Platform): number {
@@ -19,6 +19,7 @@ export const OPEN_CODE_V2_WINDOWS_CLOSE_MS = 38_000
 export type ExecutionPin = OpenCodeV2Pin
 export type ExecutionBirth = Readonly<{ format: 'linux-start-ticks' | 'darwin-pidversion' | 'windows-filetime' | 'utc-ms'; value: string; bootId: string | null }>
 export type ExecutionAuthority = Readonly<{
+  /** pin/dialect identify the exact owned engine; selectedCli.version identifies the installed CLI. */
   generation: 'v2'; pin: ExecutionPin; dialect: OpenCodeV2Dialect
   graphSha256: string
   selectedCli: Readonly<{ path: string; sha256: string; version: ExecutionPin }>
@@ -77,7 +78,7 @@ export function assertExecutionAuthority(host: ExecutionAuthority): void {
     host.child.birth.format === 'windows-filetime' ? /^[1-9]\d{0,19}$/.test(host.child.birth.value) &&
       BigInt(host.child.birth.value) <= 0xffffffffffffffffn && host.child.birth.bootId === null :
     host.child.birth.format === 'utc-ms' && host.child.birth.bootId === null)
-  executionAssert(host.generation === 'v2' && isOpenCodeV2Identity(host.pin, host.dialect) && host.selectedCli.version === host.pin)
+  executionAssert(host.generation === 'v2' && isOpenCodeV2Identity(host.pin, host.dialect) && isOpenCodeV2Pin(host.selectedCli.version))
   executionAssert([host.graphSha256, host.selectedCli.sha256, host.child.sha256].every(x => /^[a-f0-9]{64}$/.test(x)))
   executionAssert(Number.isSafeInteger(host.child.pid) && host.child.pid > 0 && typeof host.child.birth.value === 'string' && host.child.birth.value.length > 0)
   executionAssert([host.profileEpoch, host.hostInstanceId, host.leaseOwnerId].every(x => typeof x === 'string' && x.length > 0))
@@ -98,8 +99,12 @@ export function assertExecutionSelectedModel(model: ExecutionSelectedModel): voi
   if (Object.hasOwn(model, 'variant')) executionAssert(typeof model.variant === 'string' &&
     model.variant.length > 0 && Buffer.byteLength(model.variant) <= 4096 && !model.variant.includes('\0'), 'invalid_model')
 }
+/** App message IDs can be long: a still-stuck work-sync nudge carries two SHA-256 agendas and a
+ * timestamp (224 chars). The native input ID is a hash, so this bound only limits record size. */
+export const INTENT_IDENTITY_MAX_LENGTH = 512
 export function assertIntentIdentity(identity: IntentIdentity): void {
   executionAssert(Object.keys(identity).sort().join(',') === 'deliveryAttemptId,localMessageId,nativeInputID,requestId')
-  executionAssert([identity.requestId, identity.deliveryAttemptId, identity.localMessageId].every(x => typeof x === 'string' && x.length > 0 && x.length <= 200))
+  executionAssert([identity.requestId, identity.deliveryAttemptId, identity.localMessageId].every(x => typeof x === 'string' && x.length > 0 &&
+    x.length <= INTENT_IDENTITY_MAX_LENGTH), 'intent_identity_invalid')
   executionAssert(/^msg_[a-zA-Z0-9]+$/.test(identity.nativeInputID))
 }

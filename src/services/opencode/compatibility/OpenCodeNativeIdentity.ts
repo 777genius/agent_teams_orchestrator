@@ -3,13 +3,17 @@ import filesystem, { lstat, open, stat } from 'node:fs/promises'
 import path from 'node:path'
 import { resolveOpenCodeBinaryPath } from '../OpenCodeBinaryResolver.js'
 import { classifyOpenCodeReadGeneration, type OpenCodeReadGeneration } from './OpenCodeGenerationPolicy.js'
-import type { OpenCodeV2Dialect, OpenCodeV2Pin } from './OpenCodeV2Registry.js'
+import { resolveOpenCodeV2EngineVersion, openCodeV2Dialect, type OpenCodeV2Dialect, type OpenCodeV2Pin } from './OpenCodeV2Registry.js'
 import { createOpenCodeVersionReadRoots } from '../profile/OpenCodeV2ManagedConfig.js'
 import { readOpenCodeOwnedVersion } from './OpenCodeVersionProbe.js'
 
 export type OpenCodeV2NativeIdentity = {
-  generation: 'v2'; version: OpenCodeV2Pin; dialect: OpenCodeV2Dialect
-  executablePath: string; executableSha256: string; packageName: string
+  generation: 'v2'; version: OpenCodeV2Pin
+  /** Exact owned engine; absent only in legacy records. dialect always belongs to this engine. */
+  engineVersion?: OpenCodeV2Pin; dialect: OpenCodeV2Dialect
+  executablePath: string; executableSha256: string; packageName: string | null
+  /** Missing only in legacy npm-bound records. */
+  origin?: 'npm' | 'standalone'
 }
 
 export async function readOpenCodePackageManifest(file: string): Promise<unknown> {
@@ -24,6 +28,27 @@ export async function readOpenCodePackageManifest(file: string): Promise<unknown
     if (result.bytesRead > 64 * 1024) throw new Error('identity_mismatch')
     return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(0, result.bytesRead)))
   } finally { await handle.close() }
+}
+
+/** Our legacy console shim delegates through environment state; it is not a CLI identity. */
+export function assertOpenCodeStandaloneNativePath(executablePath: string): void {
+  if (/(?:^|\/)runtime\/opencode-console\/opencode\.exe$/i.test(executablePath.replaceAll('\\', '/'))) {
+    throw new Error('identity_mismatch')
+  }
+}
+
+/** Only lstat's absence admits standalone; broken links and read errors remain failures. */
+export async function readOpenCodeNativePackageMetadata(executablePath: string): Promise<unknown | undefined> {
+  const file = path.join(path.dirname(path.dirname(executablePath)), 'package.json')
+  try { await lstat(file) }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      assertOpenCodeStandaloneNativePath(executablePath)
+      return undefined
+    }
+    throw error
+  }
+  return readOpenCodePackageManifest(file)
 }
 
 export async function hashOpenCodeFile(file: string, signal?: AbortSignal): Promise<string> {
@@ -87,16 +112,16 @@ export async function inspectOpenCodeReadSelection(signal?: AbortSignal, onAcqui
   signal?.throwIfAborted()
   const policy = classifyOpenCodeReadGeneration(output)
   if (policy.generation !== 'v2') return { path: executablePath, policy, native: null, fingerprint: executableSha256 }
-  const metadataPath = path.join(path.dirname(path.dirname(executablePath)), 'package.json')
-  const metadata = await readOpenCodePackageManifest(metadataPath)
+  const metadata = await readOpenCodeNativePackageMetadata(executablePath)
   signal?.throwIfAborted()
-  if (!metadata || typeof metadata !== 'object' || !('name' in metadata) || !('version' in metadata) ||
+  if (metadata !== undefined && (metadata === null || typeof metadata !== 'object' || !('name' in metadata) || !('version' in metadata) ||
     typeof metadata.name !== 'string' || !/^@opencode\/cli-[a-z0-9-]+$/.test(metadata.name) ||
-    metadata.version !== policy.version || !/^opencode(?:\.exe)?$/.test(path.basename(executablePath)) ||
+    metadata.version !== policy.version)) throw new Error('identity_mismatch')
+  if (!/^opencode(?:\.exe)?$/.test(path.basename(executablePath)) ||
     await hashOpenCodeFile(executablePath) !== executableSha256) throw new Error('identity_mismatch')
   signal?.throwIfAborted()
   const expectedPlatform = process.platform === 'win32' ? 'windows' : process.platform
-  if (!metadata.name.startsWith(`@opencode/cli-${expectedPlatform}-${process.arch}`)) throw new Error('identity_mismatch')
+  if (metadata !== undefined && !(metadata as { name: string }).name.startsWith(`@opencode/cli-${expectedPlatform}-${process.arch}`)) throw new Error('identity_mismatch')
   const binary = await open(executablePath, 'r')
   try {
     signal?.throwIfAborted()
@@ -107,6 +132,8 @@ export async function inspectOpenCodeReadSelection(signal?: AbortSignal, onAcqui
       !['cffaedfe', 'cefaedfe', 'feedfacf', 'feedface', 'cafebabe', 'bebafeca'].includes(magic)) throw new Error('identity_mismatch')
   } finally { await binary.close() }
   signal?.throwIfAborted()
+  const engineVersion = resolveOpenCodeV2EngineVersion(policy.version) ?? policy.version
   return { path: executablePath, policy, fingerprint: executableSha256,
-    native: { ...policy, executablePath, executableSha256, packageName: metadata.name } }
+    native: { ...policy, engineVersion, dialect: openCodeV2Dialect(engineVersion), executablePath, executableSha256,
+      origin: metadata === undefined ? 'standalone' : 'npm', packageName: metadata === undefined ? null : (metadata as { name: string }).name } }
 }

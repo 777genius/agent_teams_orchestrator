@@ -30,8 +30,8 @@ test('unsupported Windows architecture selects V1 without querying unavailable V
   } finally {await rm(root,{recursive:true,force:true})}`)
 }, 15000)
 
-// This source contract checks ordering/vetoes only. Actual native absence and
-// original PID/birth recovery are exercised by windows-owner-probe.ts on x64.
+// This source contract checks ordering/vetoes only. Real Windows launches run in the
+// native Windows end-to-end workflow.
 test('Windows x64 discovers before V1 selection and UNKNOWN vetoes a bound handshake', async () => {
   await isolated(`${prefix}
   try {

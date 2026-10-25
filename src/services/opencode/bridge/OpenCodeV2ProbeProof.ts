@@ -72,7 +72,7 @@ export async function buildOwnedV2ProbeProof(input: { client: ExecutionBridgeCli
   const host = { hostKey: authority.host.hostInstanceId, profileRootKey: captured.profile.profileRootKey,
     projectPath: authority.host.directory, projectBehaviorFingerprint: captured.profile.projectBehaviorFingerprint,
     baseUrl: endpoint.baseUrl, port: Number(new URL(endpoint.baseUrl).port), pid: endpoint.nativePID,
-    version: authority.host.pin, state: 'healthy' as const, profile: captured.profile,
+    version: authority.host.selectedCli.version, state: 'healthy' as const, profile: captured.profile,
     resolvedConfigFingerprint: captured.configFingerprint, diagnostics: [] }
   const snapshot: OpenCodeProvisioningSnapshot = { detected: true, hostHealthy: true,
     projectPath: authority.host.directory, profile: captured.profile, host,

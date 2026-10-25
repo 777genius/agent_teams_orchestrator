@@ -86,7 +86,9 @@ export const OPEN_CODE_PROBE_TIMEOUT_MS = 10_000
 // Summary still prepares the profile and runs sequential version/auth probes.
 // Allow profile I/O plus both per-command budgets without starting a model host.
 export const OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS = OPEN_CODE_PROBE_TIMEOUT_MS * 3
-export const OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS = OPEN_CODE_PROBE_TIMEOUT_MS * 6
+// Cold full inventory includes profile/auth preparation and the first managed-plugin
+// load before sequential probes. Keep their shared budget below the desktop connect ceiling.
+export const OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS = 180_000
 export const OPEN_CODE_MODEL_LIST_TIMEOUT_MS = 30_000
 // Seeding runs before a catalog host starts, inside the catalog read's own deadline.
 export const OPEN_CODE_MODELS_CACHE_SEED_TIMEOUT_MS = 15_000

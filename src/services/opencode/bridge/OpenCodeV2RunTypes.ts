@@ -10,23 +10,15 @@ import type { ExecutionBridgeClient, ExecutionLog, ExecutionMessagePage, Executi
 import type { OpenCodeV2TurnProjection } from './OpenCodeV2TurnProjection.js'
 
 export type RunBinding = Readonly<{ teamId: string; runId: string; controllerInstanceId: string; ownerId: string }>
-export type RunFiletimeIdentity = Readonly<{ kind: 'windows-filetime'; value: string; bootId: null }>
-export type RunWindowsProcessIdentity = Readonly<{
-  pid: number; processCreationTime: RunFiletimeIdentity
-  executablePath: string; executableSha256: string; userSid: string; appContainer: false
-}>
 export type RunProcessIdentity = Readonly<{ pid: number; startTicks: string; bootId: string; executablePath: string; executableSha256: string }>
-export type RunWindowsEndpoint = Readonly<{ kind: 'windows-native-pipe'; name: string; helper: RunWindowsProcessIdentity; bun: RunWindowsProcessIdentity }>
 type RunControlRecordBase = Readonly<{ schema: 1; protocol: 1; binding: RunBinding; directory: string; deadline: number; sourceSha256: string }>
+/** POSIX publishes a private pathname socket; Windows publishes `tcp://127.0.0.1:<port>` with zero device and inode. */
 export type RunUnixControlRecord = RunControlRecordBase & Readonly<{
   process: RunProcessIdentity
   socketPath: string; socketDevice: number; socketInode: number; uid: number
 }>
-export type RunWindowsControlRecord = RunControlRecordBase & Readonly<{
-  platform: 'win32'; process: RunWindowsProcessIdentity; endpoint: RunWindowsEndpoint
-}>
-export type RunControlRecord = RunUnixControlRecord | RunWindowsControlRecord
-export type RunAnyProcessIdentity = RunProcessIdentity | RunWindowsProcessIdentity
+export type RunControlRecord = RunUnixControlRecord
+export type RunAnyProcessIdentity = RunProcessIdentity
 export type InstructionReceipt = Readonly<{
   strategy: 'instruction-entry'; key: string; contextHash: string; briefingHash: string
   verified: boolean; missingNativeMessageID: true
@@ -37,7 +29,7 @@ export type RunMemberPlan = Readonly<{
   bootstrap: Readonly<{ key: string; value: string; contextHash: string; briefingHash: string }>
   controllerMcpName: string; advertisedTools: readonly string[]
 }>
-export type RunQualification = Readonly<{ capabilitySnapshotId: string | null; expectedBehaviorFingerprint: string; binaryPath: string; binaryFingerprint: string; version: string | null }>
+export type RunQualification = Readonly<{ capabilitySnapshotId: string | null; expectedBehaviorFingerprint: string; binaryPath: string; binaryFingerprint: string; version: string | null; engineVersion?: OpenCodeV2Pin }>
 export type RunLaunchPlan = Readonly<{
   qualification?: RunQualification
   dataRoot: string; binding: RunBinding; deadline: number; members: readonly RunMemberPlan[]

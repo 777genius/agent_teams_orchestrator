@@ -2,7 +2,7 @@ import { expect, test } from 'bun:test'
 
 // The endpoint stub is confined to a child, so it cannot replace the registered
 // lease boundary in other tests. No native server, model or real auth is used.
-for (const pin of ['2.0.0', '2.0.32'] as const) {
+for (const [pin,cliVersion] of [['2.0.0','2.0.0'],['2.0.32','2.0.32'],['2.0.32','2.99.0']] as const) {
   test(`${pin} original native terminal cuts preserve probe failures and success`, async () => {
     const script = `
       import { mock } from 'bun:test'
@@ -11,7 +11,7 @@ for (const pin of ['2.0.0', '2.0.32'] as const) {
       import path from 'node:path'
       import os from 'node:os'
       import { createHash } from 'node:crypto'
-      const pin = ${JSON.stringify(pin)}
+      const pin = ${JSON.stringify(pin)}, cliVersion = ${JSON.stringify(cliVersion)}
       const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'TEST-v2-probe-cut-')))
       Object.assign(process.env, { HOME: root, XDG_CONFIG_HOME: root, XDG_DATA_HOME: root, XDG_CACHE_HOME: root })
       const project = path.join(root, 'project'), data = path.join(root, 'data/opencode')
@@ -19,7 +19,7 @@ for (const pin of ['2.0.0', '2.0.32'] as const) {
       const authPath = path.join(data, 'auth.json')
       await writeFile(authPath, '{}', { mode: 0o600 })
       const host = { generation: 'v2', pin, dialect: 'v2-' + pin,
-        graphSha256: 'a'.repeat(64), selectedCli: { path: path.join(root, 'TEST-binary'), sha256: 'a'.repeat(64), version: pin },
+        graphSha256: 'a'.repeat(64), selectedCli: { path: path.join(root, 'TEST-binary'), sha256: 'a'.repeat(64), version: cliVersion },
         child: { pid: 42, birth: { format: 'utc-ms', value: '42', bootId: null }, executablePath: '/TEST-bun', sha256: 'a'.repeat(64) },
         hostInstanceId: 'TEST-host', profileEpoch: 'TEST-epoch', profileRoot: root,
         directory: project, leaseOwnerId: 'TEST-owner' }
@@ -96,7 +96,7 @@ for (const pin of ['2.0.0', '2.0.32'] as const) {
         }
         const success = await build(fixture('succeeded'))
         assert.equal(success.failure, null); assert.equal(success.proof.modelId, 'test-provider/test-model')
-        assert.equal(success.proof.projectPath, project); assert.equal(success.proof.opencodeVersion, pin)
+        assert.equal(success.proof.projectPath, project); assert.equal(success.proof.opencodeVersion, cliVersion)
         assert.equal(success.proof.capabilitySnapshotId, 'TEST-capability')
         assert.deepEqual(parseOpenCodeExecutionProof(success.proof), success.proof); cases++
         const unrelated = fixture('failed')

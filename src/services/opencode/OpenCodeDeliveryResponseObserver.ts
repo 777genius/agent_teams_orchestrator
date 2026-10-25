@@ -661,10 +661,10 @@ function classifyChildren(input: {
   }
 
   const lastChild = input.children[input.children.length - 1]
-  // A silent group peer may complete without sending a reply. A missing status
-  // is not completion proof: the exact child must positively finish on its own.
-  const completedSilentGroupTurn = Boolean(
-    input.groupChatId && (input.rawStatus === 'idle' || input.rawStatus === null) && lastChild?.id
+  // Completion is a fact about this exact child, independent of reply policy.
+  // Consumers decide whether the delivery permits silence; idle alone proves nothing.
+  const completedSilentTurn = Boolean(
+    (input.rawStatus === 'idle' || input.rawStatus === null) && lastChild?.id
     && Number.isFinite(lastChild.completedAt) && (lastChild.completedAt ?? 0) > 0
     && lastChild.finishReason === 'stop' && observedToolNames.size === 0,
   )
@@ -674,7 +674,7 @@ function classifyChildren(input: {
     assistantMessageId: lastChild?.id ?? null,
     toolCallNames: [...observedToolNames],
     latestAssistantPreview: messagePreview(lastChild ?? null),
-    reason: completedSilentGroupTurn
+    reason: completedSilentTurn
       ? 'assistant_child_completed_without_visible_or_meaningful_response'
       : 'assistant_child_has_no_visible_or_meaningful_response',
   })

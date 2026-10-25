@@ -58,11 +58,6 @@ jobs:
         run: |
           bun install --frozen-lockfile --linker hoisted
           if ($LASTEXITCODE -ne 0) { throw 'Dependency install failed' }
-          # Packaging stages the sealed MSVC producer assets from native/win32-x64.
-          if ($env:PLATFORM -eq 'win32-x64') {
-            bun scripts/opencode-v2/compile-windows.ts
-            if ($LASTEXITCODE -ne 0) { throw 'Native producer compilation failed' }
-          }
           bun scripts/package-runtime.ts --platform $env:PLATFORM
           if ($LASTEXITCODE -ne 0) { throw 'Candidate packaging failed' }
           foreach ($file in @('dist/cli.exe', 'dist/opencode-delivery.json', 'dist/bun/bun.exe', 'dist/local-cli/cli.js')) {

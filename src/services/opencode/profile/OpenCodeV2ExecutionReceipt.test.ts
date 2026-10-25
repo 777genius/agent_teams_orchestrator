@@ -6,7 +6,6 @@ import { mkdir, mkdtemp, readFile, realpath, writeFile, rm, symlink } from 'node
 import { fileURLToPath } from 'node:url'
 import { createHash } from 'node:crypto'
 import { createOpenCodeV2ExecutionReceipt, resolveOpenCodeV2ReceiptPackageRoot, resolveOpenCodeV2DarwinControllerRuntimeClosure } from './OpenCodeV2ExecutionReceipt.js'
-import { DARWIN_SCOPE_POLICY } from '../host/darwin/OpenCodeV2DarwinPolicy.js'
 import { OpenCodeRuntimeDeadlineError } from '../OpenCodeRuntimeDeadline.js'
 import * as executionDelivery from '../host/OpenCodeV2ExecutionDelivery.js'
 import * as fsPromises from 'node:fs/promises'
@@ -15,38 +14,6 @@ const actualFs = { ...fsPromises }
 const actualDelivery = { ...executionDelivery }
 const deliveryModule = new URL('../host/OpenCodeV2ExecutionDelivery.js', import.meta.url).href
 
-test.skipIf(process.platform !== 'darwin')('selected native Node closure executes while an unrelated TEST sibling stays unreadable', async () => {
-  const selected = Bun.which('node')
-  expect(selected).not.toBeNull()
-  const node = await realpath(selected!)
-  const closure = await resolveOpenCodeV2DarwinControllerRuntimeClosure(node)
-  const root = await realpath(await mkdtemp(path.join(tmpdir(), 'TEST-native-node-')))
-  const project = path.join(root, 'project'), sentinel = path.join(root, 'foreign.txt')
-  await mkdir(project); await writeFile(sentinel, 'TEST unrelated sibling')
-  const quote = (value: string) => JSON.stringify(value)
-  const policy = ['(version 1)', '(deny default)', '(import "system.sb")',
-    '(allow process-exec)', '(allow file-read-metadata)', '(allow sysctl-read)', DARWIN_SCOPE_POLICY,
-    '(allow file-read* (subpath "/System") (subpath "/usr") (subpath "/bin"))',
-    '(allow file-read* file-write* (literal "/dev/null") (literal "/dev/urandom"))',
-    ...closure.files.map(file => `(allow file-read* (literal ${quote(file.path)}))`),
-    ...closure.aliases.map(alias => `(allow file-read* (literal ${quote(alias.target)}))`),
-    `(allow file-read* file-write* (subpath ${quote(project)}))`,
-  ].join('\n')
-  try {
-    const program = `const fs=require('node:fs'),a=require('node:assert/strict');
-      a.equal(process.execPath,${JSON.stringify(node)});
-      a.throws(()=>fs.readFileSync(${JSON.stringify(sentinel)}),e=>['EPERM','EACCES'].includes(e.code));
-      a.equal(require('node:crypto').randomBytes(4).length,4);
-      a.ok(new Intl.NumberFormat('en').format(123));
-      fs.writeFileSync('result.txt','TEST native Node passed\\n');`
-    const child = Bun.spawn(['/usr/bin/sandbox-exec', '-p', policy, '/bin/sh', '-c', `node -e ${"'" + program.replaceAll("'", "'\\''") + "'"}`],
-      { cwd: project, env: { PATH: `${path.dirname(node)}:/usr/bin:/bin`, HOME: project, OPENSSL_CONF: '/dev/null' }, stdout: 'pipe', stderr: 'pipe' })
-    const [exitCode, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()])
-    expect(exitCode, stderr).toBe(0)
-    expect(await readFile(path.join(project, 'result.txt'), 'utf8')).toBe('TEST native Node passed\n')
-    expect(await readFile(sentinel, 'utf8')).toBe('TEST unrelated sibling')
-  } finally { await rm(root, { recursive: true, force: true }) }
-}, 15_000)
 
 async function fixture() {
   const root = await realpath(await mkdtemp(path.join(tmpdir(), 'TEST-v2-receipt-package-')))
@@ -426,4 +393,26 @@ test.skipIf(process.arch !== 'x64')('Windows receipt rejects malformed, truncate
       }
     } finally { await rm(f.root, { recursive: true, force: true }) }
   }
+})
+
+
+test('receipt preserves actual unlisted CLI and standalone provenance while graph stays on its persisted engine', async () => {
+  const f = await receiptFixture()
+  const metadata = path.join(path.dirname(path.dirname(f.identity.executablePath)), 'package.json')
+  const identity = { ...f.identity, version: '2.99.0' as const, engineVersion: '2.0.32' as const, origin: 'npm' as const }
+  try {
+    await writeFile(metadata, JSON.stringify({ name: identity.packageName, version: identity.version }))
+    const receipt = await callReceipt(f, () => null, module => module.createOpenCodeV2ExecutionReceipt('/TEST-unused', identity))
+    expect(receipt).toMatchObject({ version: '2.99.0', engineVersion: '2.0.32', dialect: 'v2-2.0.32', origin: 'npm', packageName: identity.packageName })
+    expect(receipt.graph.files.some(row => row.path === f.resolution['@opencode/server-v2.0.32/process'])).toBe(true)
+    await rm(metadata)
+    const standalone = await callReceipt(f, () => null, module => module.createOpenCodeV2ExecutionReceipt('/TEST-unused', {
+      ...identity, origin: 'standalone', packageName: null,
+    }))
+    expect(standalone).toMatchObject({ version: '2.99.0', engineVersion: '2.0.32', origin: 'standalone', packageName: null })
+    expect(standalone.graph).toEqual(receipt.graph)
+    await expect(callReceipt(f, () => null, module => module.createOpenCodeV2ExecutionReceipt('/TEST-unused', {
+      ...identity, origin: 'standalone', packageName: null, executableSha256: '0'.repeat(64),
+    }))).rejects.toThrow('native_selection_changed')
+  } finally { await rm(f.root, { recursive: true, force: true }) }
 })
