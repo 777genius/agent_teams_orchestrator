@@ -50,7 +50,8 @@
       "qualifiedAt": "2026-10-25",
       "scope": "team-launch",
       "platforms": [
-        "darwin-arm64"
+        "darwin-arm64",
+        "linux-x64"
       ],
       "evidence": [
         {
