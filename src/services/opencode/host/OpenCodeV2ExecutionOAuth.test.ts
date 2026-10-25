@@ -1,4 +1,5 @@
 import { expect, mock, test } from 'bun:test'
+import type { OpenCodeV2Pin } from '../compatibility/OpenCodeV2Registry.js'
 import { stagedOpenCodeV2Pins } from '../compatibility/fixtures/stagedOpenCodeV2Pins.js'
 import { createHash } from 'node:crypto'
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
@@ -33,7 +34,7 @@ async function fixture() {
   return { profile, auth, content, remove: () => rm(root, { recursive: true, force: true }) }
 }
 
-async function official(pin: '2.0.0' | '2.0.32') {
+async function official(pin: OpenCodeV2Pin) {
   const modulePath = await realpath(Bun.resolveSync(`@opencode/server-v${pin}/process`, import.meta.dir))
   const locate = async (name: string) => realpath(Bun.resolveSync(name, modulePath))
   const effect: typeof import('effect') = await import(pathToFileURL(await locate('effect')).href)

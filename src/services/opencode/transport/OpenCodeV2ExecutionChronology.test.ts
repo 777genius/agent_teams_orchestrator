@@ -1,13 +1,13 @@
 import { expect, test } from 'bun:test'
 import { executionCurrentOperations } from './OpenCodeV2ExecutionCurrentClient.js'
-import { stagedOpenCodeV2Client, stagedOpenCodeV2Pins } from '../compatibility/fixtures/stagedOpenCodeV2Pins.js'
+import { launchableStagedOpenCodeV2Pins, stagedOpenCodeV2Client } from '../compatibility/fixtures/stagedOpenCodeV2Pins.js'
 import { executionFloorOperations } from './OpenCodeV2ExecutionFloorClient.js'
 import { OpenCodeV2ExecutionFetch } from './OpenCodeV2ExecutionFetch.js'
 
 const endpoint = 'http://127.0.0.1:32123'
 const sessionID = 'ses_TESTchronology'
 const cursor = Buffer.from(JSON.stringify({ id: 'msg_TESTcomment', order: 'asc', direction: 'next' })).toString('base64url')
-for (const pin of stagedOpenCodeV2Pins) {
+for (const pin of launchableStagedOpenCodeV2Pins) {
   test(`${pin} official generated client requests ascending first page and follows cursor without order`, async () => {
     const requests: URL[] = []
     const wire = new OpenCodeV2ExecutionFetch(endpoint, pin, '/TEST/project', 'TEST-only-password',

@@ -1,12 +1,12 @@
 import { expect, test } from 'bun:test'
 import { executionCurrentOperations } from './OpenCodeV2ExecutionCurrentClient.js'
-import { stagedOpenCodeV2Client, stagedOpenCodeV2Pins } from '../compatibility/fixtures/stagedOpenCodeV2Pins.js'
+import { launchableStagedOpenCodeV2Pins, stagedOpenCodeV2Client } from '../compatibility/fixtures/stagedOpenCodeV2Pins.js'
 import { executionFloorOperations } from './OpenCodeV2ExecutionFloorClient.js'
 import { OpenCodeV2ExecutionFetch } from './OpenCodeV2ExecutionFetch.js'
 
 // Exercise the installed generated SDK, including its HTTP-envelope decoding.
 // This controlled HTTP port mints no lease/endpoint or native admission authority.
-for (const pin of stagedOpenCodeV2Pins) {
+for (const pin of launchableStagedOpenCodeV2Pins) {
   test(`${pin} exact execution adapter preserves each published finite response contract`, async () => {
     const base = 'http://127.0.0.1:31999', directory = '/TEST/project', id = 'ses_TESToriginal'
     const location = { directory }

@@ -12,7 +12,7 @@ import { assertExecutionSelectedModel, executionHash, type SessionAuthority } fr
 import { OpenCodeV2ExecutionFetch, rejectExecutionBeforeInvocation } from '../transport/OpenCodeV2ExecutionFetch.js'
 import { executionFloorOperations } from '../transport/OpenCodeV2ExecutionFloorClient.js'
 import { executionCurrentOperations } from '../transport/OpenCodeV2ExecutionCurrentClient.js'
-import { stagedOpenCodeV2Client, stagedOpenCodeV2Pins } from '../compatibility/fixtures/stagedOpenCodeV2Pins.js'
+import { launchableStagedOpenCodeV2Pins, stagedOpenCodeV2Client } from '../compatibility/fixtures/stagedOpenCodeV2Pins.js'
 
 const authority: SessionAuthority = {
   host: { generation: 'v2', pin: '2.0.32', dialect: 'v2-2.0.32', graphSha256: '1'.repeat(64),
@@ -164,7 +164,7 @@ describe('durable V2 admission ownership', () => {
   })
   // Red if selection construction drops variant, if create loses it, or if
   // variant-only native drift reaches prompt mutation through readback.
-  for (const pin of stagedOpenCodeV2Pins) {
+  for (const pin of launchableStagedOpenCodeV2Pins) {
     // Real generated adapters must preserve variant in both wire directions;
     // a service-only fake cannot detect dialect mapping silently dropping it.
     test(`${pin} generated create/get roundtrip preserves variant on the wire`, async () => {
