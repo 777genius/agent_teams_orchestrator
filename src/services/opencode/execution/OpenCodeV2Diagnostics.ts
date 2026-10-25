@@ -373,6 +373,10 @@ const privateNativeFailureStages = new Set([
   'private_acl_owner_op_selected_profile', 'private_acl_owner_op_profile_config', 'private_acl_owner_op_metadata',
   'private_acl_owner_op_run_state_select', 'private_acl_owner_op_run_state_acquire', 'private_acl_owner_op_run_state_reserve',
   'private_acl_owner_op_run_state_other', 'private_acl_owner_op_owner_other',
+  // Execution-probe store directory whose DACL owner is foreign.
+  'private_acl_owner_probe_store_data_parent', 'private_acl_owner_probe_store_data_root',
+  'private_acl_owner_probe_store_opencode', 'private_acl_owner_probe_store_v2',
+  'private_acl_owner_probe_store_execution_probes', 'private_acl_owner_probe_store_source',
   'private_image_protected_dacl', 'private_dll_owner', 'private_owner_acquire', 'private_owner_cohort',
   'private_owner_controller_tasks', 'private_owner_controller_teams', 'private_owner_discover_selection',
   'private_owner_reserve_selection', 'private_owner_selected_selection',

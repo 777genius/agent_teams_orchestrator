@@ -39,6 +39,20 @@ async function privateDirectory(root: string) {
     stat.uid === process.getuid?.() && (stat.mode & 0o077) === 0, 'probe_store_foreign')
 }
 
+type ProbeStoreRole = 'data_parent' | 'data_root' | 'opencode' | 'v2' | 'execution_probes' | 'source'
+function probeStoreRole(candidate: string, dataRoot: string, directory: string): ProbeStoreRole {
+  return candidate === path.dirname(dataRoot) ? 'data_parent' : candidate === dataRoot ? 'data_root'
+    : candidate === path.join(dataRoot, 'opencode') ? 'opencode'
+    : candidate === path.join(dataRoot, 'opencode/v2') ? 'v2' : candidate === directory ? 'source' : 'execution_probes'
+}
+/** Names which store directory has a foreign DACL owner with one closed role.
+ * The error object is kept; only its exact owner-mismatch message changes. */
+function labelProbeStoreOwnerFailure(error: unknown, role: ProbeStoreRole): unknown {
+  const match = error instanceof Error && /^execution_owner_not_private:private_acl_owner(?:_op_prepare_directory|_op_assert_directory)?:(0|[1-9][0-9]{0,9})$/.exec(error.message)
+  if (match) (error as Error).message = `execution_owner_not_private:private_acl_owner_probe_store_${role}:${match[1]}`
+  return error
+}
+
 async function openWindowsProbeStore(dataRoot: string, sourceKey: string, deadline: number): Promise<WindowsProbeStore> {
   executionAssert(Date.now() < deadline, 'execution_timeout')
   const broker = createWindowsNativeBroker(await resolveWindowsNativeArtifact())
@@ -68,8 +82,10 @@ async function openWindowsProbeStore(dataRoot: string, sourceKey: string, deadli
       // Store directories never archive. Retain the preparatory capability so
       // sibling launch-plan brokers can verify these same pinned ancestors.
       // Missing paths still create exclusively; uncertain results never adopt.
-      held.push(await filesystem.prepareDirectory(candidate, !stat, deadline))
-      await held.at(-1)!.assertOwned(deadline)
+      try {
+        held.push(await filesystem.prepareDirectory(candidate, !stat, deadline))
+        await held.at(-1)!.assertOwned(deadline)
+      } catch (error) { throw labelProbeStoreOwnerFailure(error, probeStoreRole(candidate, dataRoot, directory)) }
       if (candidate === path.dirname(directory) || candidate === directory) storeRoots.push(held.at(-1)!)
     }
     const guard = path.join(directory, 'owner.lock'), file = path.join(directory, 'probe.json')

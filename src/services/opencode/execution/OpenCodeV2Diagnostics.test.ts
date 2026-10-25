@@ -462,8 +462,10 @@ test('native diagnostics retain only closed producer codes and stages with uint3
   // Profile: root, parent, database, 8 named, 16 positions, other. Operations: 11 families.
   expect(profileOwnerRoles).toHaveLength(39)
   const cases: { error: Error; category: string; native?: { stage: string; nativeCode: number } }[] = [
-    ...profileOwnerRoles.map(stage => ({ error: new Error(`execution_owner_not_private:${stage}:0`),
-      category: 'execution_owner_not_private', native: { stage, nativeCode: 0 } })),
+    ...[...profileOwnerRoles, ...['data_parent', 'data_root', 'opencode', 'v2', 'execution_probes', 'source']
+      .map(role => `private_acl_owner_probe_store_${role}`)]
+      .map(stage => ({ error: new Error(`execution_owner_not_private:${stage}:0`),
+        category: 'execution_owner_not_private', native: { stage, nativeCode: 0 } })),
     { error: new Error('execution_owner_not_private:private_acl_owner_run_v2:5'), category: 'execution_owner_not_private',
       native: { stage: 'private_acl_owner_run_v2', nativeCode: 5 } },
     ...['retire_broker_state', 'retire_broker_write', 'retire_job', 'retire_wait', 'retire_io_join',
