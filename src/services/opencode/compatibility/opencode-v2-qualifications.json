@@ -6,8 +6,14 @@
       "qualifiedAt": "2026-10-10",
       "scope": "team-launch",
       "evidence": [
-        { "kind": "pull-request", "ref": "777genius/agent_teams_orchestrator#111" },
-        { "kind": "commit", "ref": "9f9d3ba18edc580da705fc8a17a24cd162160b8b" }
+        {
+          "kind": "pull-request",
+          "ref": "777genius/agent_teams_orchestrator#111"
+        },
+        {
+          "kind": "commit",
+          "ref": "9f9d3ba18edc580da705fc8a17a24cd162160b8b"
+        }
       ]
     },
     {
@@ -15,8 +21,25 @@
       "qualifiedAt": "2026-10-18",
       "scope": "team-launch",
       "evidence": [
-        { "kind": "pull-request", "ref": "777genius/agent_teams_orchestrator#137" },
-        { "kind": "commit", "ref": "3c26cb5ea71ad70513f4fe29b5eabf5161aa181f" }
+        {
+          "kind": "pull-request",
+          "ref": "777genius/agent_teams_orchestrator#137"
+        },
+        {
+          "kind": "commit",
+          "ref": "3c26cb5ea71ad70513f4fe29b5eabf5161aa181f"
+        }
+      ]
+    },
+    {
+      "version": "2.1.4",
+      "qualifiedAt": "2026-10-25",
+      "scope": "team-launch",
+      "evidence": [
+        {
+          "kind": "e2e-report",
+          "ref": "docs/opencode-v2-qualification/2.1.4.md"
+        }
       ]
     }
   ]
