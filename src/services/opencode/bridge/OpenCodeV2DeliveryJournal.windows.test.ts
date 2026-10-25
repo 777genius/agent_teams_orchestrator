@@ -314,11 +314,12 @@ test.skipIf(process.platform !== 'win32')('Windows delivery guard holds exact pr
     try {
       const linkIdentity = await lstat(symlinkPath), linkTarget = await readlink(symlinkPath)
       expect(linkIdentity.isSymbolicLink()).toBe(true)
-      // Native custody checks the link's owner before its reparse attribute.
+      // Native custody checks the link's owner before its reparse attribute;
+      // the DeliveryGuard metadata write names its operation family.
       await expect(openWindowsDeliveryJournalGuard(root, cutoff()).then(opened => {
         unexpectedGuard = opened; return opened
       })).rejects.toThrow(
-        /^(?:execution_owner_not_private:private_acl_owner:0|execution_owner_alias:owner_identity_reparse:0)$/)
+        /^(?:execution_owner_not_private:private_acl_owner_op_metadata:0|execution_owner_alias:owner_identity_reparse:0)$/)
       const retainedLink = await lstat(symlinkPath), retainedSentinel = await lstat(sentinel)
       expect(retainedLink.isSymbolicLink()).toBe(true)
       expect([retainedLink.dev, retainedLink.ino]).toEqual([linkIdentity.dev, linkIdentity.ino])

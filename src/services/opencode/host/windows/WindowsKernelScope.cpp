@@ -70,6 +70,22 @@ static decltype(auto) inAclOwnerRole(const char *role, Action action) {
     throw labeled;
   }
 }
+// Closed operation-family labels for an otherwise unlabeled owner mismatch.
+static const char *unlabeledOwnerOperationRole(const std::wstring &operation) {
+  if (operation == L"ownerOpenDirectory") return "private_acl_owner_op_open_directory";
+  if (operation == L"ownerPreparePrivateDirectory") return "private_acl_owner_op_prepare_directory";
+  if (operation == L"ownerAssertDirectory") return "private_acl_owner_op_assert_directory";
+  if (operation == L"ownerValidateSelectedProfile") return "private_acl_owner_op_selected_profile";
+  if (operation == L"ownerInspectProfileConfig" || operation == L"ownerSelectConfig")
+    return "private_acl_owner_op_profile_config";
+  if (operation == L"ownerReadMetadata" || operation == L"ownerWriteMetadata")
+    return "private_acl_owner_op_metadata";
+  if (operation == L"runStateSelect") return "private_acl_owner_op_run_state_select";
+  if (operation == L"runStateAcquire") return "private_acl_owner_op_run_state_acquire";
+  if (operation == L"runStateReserve") return "private_acl_owner_op_run_state_reserve";
+  if (operation.rfind(L"runState", 0) == 0) return "private_acl_owner_op_run_state_other";
+  return "private_acl_owner_op_owner_other";
+}
 // Retirement must retain the failed native substep without serializing exception
 // text. Existing NativeError codes/status survive; WinRT contributes only HRESULT.
 template <typename Action>
@@ -5899,7 +5915,10 @@ int wmain(int argc, wchar_t **argv) {
         if (custodyOnly) {
           value = custody->receipt();
         } else if (operation.rfind(L"owner", 0) == 0 || operation.rfind(L"runState", 0) == 0)
-          value = owners.request(operation, input);
+          // An owner mismatch no finer role named still names its operation family.
+          value = inAclOwnerRole(unlabeledOwnerOperationRole(operation), [&] {
+            return owners.request(operation, input);
+          });
         else if (operation == L"identity") {
           double raw = input.GetNamedNumber(L"pid");
           require(raw > 0 && raw <= MAXDWORD && raw == static_cast<DWORD>(raw),

@@ -368,6 +368,11 @@ const privateNativeFailureStages = new Set([
   'private_acl_owner_profile_cache', 'private_acl_owner_profile_state', 'private_acl_owner_profile_tmp',
   'private_acl_owner_profile_appdata', 'private_acl_owner_profile_localappdata', 'private_acl_owner_profile_input_other',
   ...Array.from({ length: 16 }, (_, index) => `private_acl_owner_profile_input_${index}`),
+  // Operation family of an owner mismatch no finer role named.
+  'private_acl_owner_op_open_directory', 'private_acl_owner_op_prepare_directory', 'private_acl_owner_op_assert_directory',
+  'private_acl_owner_op_selected_profile', 'private_acl_owner_op_profile_config', 'private_acl_owner_op_metadata',
+  'private_acl_owner_op_run_state_select', 'private_acl_owner_op_run_state_acquire', 'private_acl_owner_op_run_state_reserve',
+  'private_acl_owner_op_run_state_other', 'private_acl_owner_op_owner_other',
   'private_image_protected_dacl', 'private_dll_owner', 'private_owner_acquire', 'private_owner_cohort',
   'private_owner_controller_tasks', 'private_owner_controller_teams', 'private_owner_discover_selection',
   'private_owner_reserve_selection', 'private_owner_selected_selection',
