@@ -50,6 +50,7 @@ const files = [
   'src/services/opencode/host/OpenCodeV2LinuxLauncherQualification.test.ts',
   'src/services/opencode/execution/OpenCodeV2RefusalReason.test.ts',
   'src/services/opencode/execution/OpenCodeV2ActivationDeadline.test.ts',
+  'src/services/opencode/host/OpenCodeV2ExecutionReadiness.test.ts',
 ]
 
 const isRecovery = (file: string) => file.endsWith('/OpenCodeOAuthRestartRecovery.test.ts')
