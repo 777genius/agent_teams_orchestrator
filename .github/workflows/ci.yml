@@ -428,6 +428,8 @@ jobs:
         run: |
           set -euo pipefail
           bun test scripts/opencode-v2/release-delivery.test.ts
+          # Start from an empty dist: the bundled build above left a deep local-cli tree.
+          if [[ "$RUNNER_OS" == Windows ]]; then pwsh -NoProfile -Command "Remove-Item -LiteralPath dist -Recurse -Force"; else rm -rf dist; fi
           bun scripts/package-runtime.ts --platform ${{ matrix.platform }}
           bun scripts/ci/verify-runtime-without-v2.ts
 

@@ -51,10 +51,12 @@ function build(executable: string, buildArgs: string[]): void {
 // A release without OpenCode V2 ships only the compiled front door: no V2 graphs, no physical JS
 // delivery and no pinned Bun, and every command runs in the compiled runtime.
 if (openCodeV2ReleaseDelivery() === 'off') {
+  // Bun's recursive rm can return without removing a deep tree on Windows, so any error
+  // surfaces and a remaining entry fails the build: remove ./dist first in that case.
   for (const leftover of ['./dist/local-cli', './dist/bun', './dist/build-bun', './dist/opencode-delivery.json']) {
     const info = await lstat(leftover).catch(() => null)
-    if (info) await rm(leftover, { recursive: info.isDirectory(), force: true })
-    if (existsSync(leftover)) throw new Error(`Could not remove the V2 delivery from an earlier build: ${leftover}`)
+    if (info) await rm(leftover, { recursive: info.isDirectory() })
+    if (existsSync(leftover)) throw new Error(`Could not remove the V2 delivery from an earlier build: ${leftover}; remove ./dist first`)
   }
   build(process.execPath, ['--compile', '--without-opencode-v2'])
   console.log(`Prepared compiled runtime without OpenCode V2 for ${platform}`)
