@@ -18,7 +18,7 @@ describe('selected V2 execution document', () => {
       expect<unknown>(result.info.agents?.['bridge-worker']?.permissions).toEqual(source.selection.permissions)
       expect<unknown>(result.info.permissions).toEqual(source.selection.permissions)
       expect(result.info.model).toEqual({ providerID: 'provider', model: 'model', variant: 'selected' })
-      expect<unknown>(result.info.mcp?.servers?.['agent-teams']).toEqual({ ...source.controller.config, ...(process.platform === 'win32' ? { disabled: true } : {}) })
+      expect<unknown>(result.info.mcp?.servers?.['agent-teams']).toEqual({ ...source.controller.config, codemode: false })
       expect(result.sha256).toBe(createHash('sha256').update(result.content).digest('hex'))
       expect(JSON.parse(result.content)).toEqual(result.info)
       expect(source.selection.permissions).toHaveLength(2)
@@ -55,7 +55,7 @@ for (const pin of ['2.0.0', '2.0.32'] as const) test(`${pin} managed MCP starts 
     const result = createOpenCodeV2ExecutionConfig(source)
     const selectedController = source.controller.config
     const expected = selectedController.type === 'local'
-      ? { ...selectedController, command: [...selectedController.command] } : { ...selectedController }
+      ? { ...selectedController, command: [...selectedController.command], codemode: false } : { ...selectedController, codemode: false }
     expect(result.info.mcp?.servers?.['agent-teams']).toEqual(expected)
     source.controller.config.disabled = true
     expect(() => createOpenCodeV2ExecutionConfig(source)).toThrow('v2_execution_mcp_disabled')
@@ -111,10 +111,7 @@ test('V2 teammates never get more than V1 teammates in auto approval mode', asyn
   // V2 names the same tools differently; V1-only tools have no V2 counterpart.
   const v2Action: Record<string, string> = { bash: 'shell', write: 'edit', task: 'subagent' }
   const v1Allowed = new Set(Object.entries(v1).filter(([, effect]) => effect === 'allow').map(([tool]) => v2Action[tool] ?? tool))
-  // V2 reaches MCP tools only through code mode; each inner call asserts its own action
-  // (agent-teams_* here), so `execute` stands for the V1 MCP allow and adds no tool.
   expect(Object.keys(v1).some(tool => /^agent[-_]teams_/.test(tool) && v1[tool] === 'allow')).toBe(true)
-  v1Allowed.add('execute')
   const rules = OPENCODE_V2_TEAMMATE_PERMISSIONS
   // Last match wins: a leading catch-all deny makes every unlisted tool (webfetch, websearch, skill, ...) denied.
   expect(rules[0]).toEqual({ action: '*', resource: '*', effect: 'deny' })
@@ -132,18 +129,16 @@ test('V2 teammates never get more than V1 teammates in auto approval mode', asyn
   }
 })
 
-test('V2 code mode reaches only tools the V1-parity rules allow, under every staged official evaluator', async () => {
+test('V2 code mode stays off and team MCP tools are direct tools, under every staged official evaluator', async () => {
   const { OPENCODE_V2_TEAMMATE_PERMISSIONS: rules } = await import('./OpenCodeV2ExecutionConfig.js')
   for (const version of ['2.0.0', '2.0.32', '2.1.4']) {
     const server = path.dirname(Bun.resolveSync(`@opencode/server-v${version}/package.json`, import.meta.dir))
     const { Permission } = await import(Bun.resolveSync('@opencode/core/permission', server))
     const effect = (action: string, resource = '*') => [version, action, Permission.evaluate(action, resource, rules).effect]
-    // Code mode is on: `execute` is not wholly denied.
-    expect(effect('execute')).toEqual([version, 'execute', 'allow'])
-    // A tool enters the code-mode inventory only when the rules do not wholly deny it,
-    // so a project's own MCP servers stay out.
+    // Code mode is wholly denied: its fetch and worktree tools skip permission checks.
+    expect(effect('execute')).toEqual([version, 'execute', 'deny'])
+    // A project's own MCP servers stay wholly denied.
     for (const foreign of ['github_create_issue', 'filesystem_read_file', 'TEST-server_run']) expect(effect(foreign)).toEqual([version, foreign, 'deny'])
-    // Every call made from code mode asserts its own action: what V1 auto denies stays denied.
     for (const [action, resource] of [['webfetch', 'https://example.invalid'], ['websearch', 'TEST'], ['skill', 'TEST'],
       ['subagent', 'general'], ['external_directory', '/etc/*'], ['question', '*'], ['doom_loop', '*']]) {
       expect(effect(action, resource)).toEqual([version, action, 'deny'])
@@ -153,17 +148,24 @@ test('V2 code mode reaches only tools the V1-parity rules allow, under every sta
       expect(effect(action, resource)).toEqual([version, action, 'allow'])
     }
   }
+  const { createOpenCodeV2ExecutionConfig } = await import('./OpenCodeV2ExecutionConfig.js')
+  const document = createOpenCodeV2ExecutionConfig({ pin: '2.1.4', selection: { agent: 'worker',
+    model: { providerID: 'provider', id: 'model' }, permissions: rules.map(rule => ({ ...rule })) },
+    controller: { server: 'agent-teams', config: { type: 'local', command: ['/TEST/bun', '/TEST/mcp.ts'] } } })
+  expect(document.info.mcp?.servers?.['agent-teams']).toMatchObject({ codemode: false })
 })
 
-// Pins the routing the rule above relies on, for the qualified 2.1.4 core: code mode lists only
-// tools the rules do not wholly deny, and an MCP tool asserts `${server}_${tool}` when called.
-test('qualified 2.1.4 core routes code mode through each tool permission', async () => {
+// Pins the routing the rule above relies on, for the qualified 2.1.4 core: a server's
+// `codemode: false` reaches its tools, such tools are direct, and code mode needs `execute`.
+test('qualified 2.1.4 core keeps codemode-false MCP tools direct and gates code mode on execute', async () => {
   const server = path.dirname(Bun.resolveSync('@opencode/server-v2.1.4/package.json', import.meta.dir))
   const chunks = path.join(path.dirname(Bun.resolveSync('@opencode/core/permission', server)), 'chunks')
   const source = (await Promise.all((await readdir(chunks)).filter(name => name.endsWith('.js'))
     .map(name => readFile(path.join(chunks, name), 'utf8')))).join('\n')
+  expect(source).toMatch(/\.\.\.entry\.config\.codemode === undefined \? \{\} : \{ codemode: entry\.config\.codemode \}/)
+  expect(source).toMatch(/codemode: tool\.codemode !== false/)
+  expect(source).toMatch(/const direct = new Map\(Array\.from\(active\)\.filter\(\(\[, tool\]\) => tool\.options\?\.codemode === false\)\);/)
   expect(source).toMatch(/if \(whollyDisabled\(tool\.options\?\.permission \?\? name, rules\)\)\s*continue;/)
   expect(source).toMatch(/const codeModeEnabled = !whollyDisabled\("execute", rules\);/)
-  expect(source).toMatch(/codeModeTools = new Map\(Array\.from\(active\)\.filter/)
   expect(source).toMatch(/permission\.assert\(\{\s*action: \w+\(tool\.server, tool\.name\),/)
 })

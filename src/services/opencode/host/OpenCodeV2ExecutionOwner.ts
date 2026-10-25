@@ -196,7 +196,9 @@ export async function acquireExecutionProfileOwner(requestedProfile: OwnedNative
         retirement: { pid: proof.pid, processExited: true, scopeClosed: proof.scopeClosed } })
     }) },
     release(receipt: ExecutionCleanupReceipt): Promise<void> { return serialize(async () => {
-      executionAssert(isExecutionCleanupReceipt(receipt) && child && receipt.scopeClosed === true && receipt.processRetired === true && receipt.descendantsRetired === true &&
+      executionAssert(isExecutionCleanupReceipt(receipt) && child && receipt.scopeClosed === true && receipt.processRetired === true &&
+        // Windows descendants are retired best-effort, the accepted limitation of plain execution.
+        (receipt.descendantsRetired === true || process.platform === 'win32') &&
         receipt.pid === child.pid && executionHash(receipt.birth) === executionHash(child.birth), 'execution_owner_unknown')
       await retire({ state: 'retired', receipt })
     }) },

@@ -5,6 +5,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createHash, randomUUID } from 'node:crypto'
 import { mkdir, mkdtemp, realpath, writeFile, readFile, lstat } from 'node:fs/promises'
+import type { Stats } from 'node:fs'
 import { isDeepStrictEqual } from 'node:util'
 import { importOpenCodeV2ClientModule, resolveOpenCodeV2ClientEntry } from '../../../../services/opencode/transport/OpenCodeV2ClientModule.js'
 import { getOpenCodeV2DeclaredInputModalities } from '../../../../services/opencode/OpenCodeDeclaredInputModalities.js'
@@ -30,6 +31,14 @@ import type { OpenCodeV2Pin } from '../../../../services/opencode/compatibility/
 const sourceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../../..')
 const text = (value: unknown): string => { executionAssert(typeof value === 'string' && value.length > 0, 'provider_response_invalid'); return value }
 const resultError = (code: 'auth-failed' | 'runtime-unhealthy' | 'unsupported-auth-method', message: string) => ({ ok: false as const, error: { code, message, recoverable: true } })
+/** A provider intent marker is a small regular file of this user. POSIX proves that by owner and
+ * mode bits; Windows reports neither (no uid, mode 0o666) and its files inherit the user's ACL. */
+export function isOwnedProviderIntentMarker(stat: Pick<Stats, 'isFile' | 'isSymbolicLink' | 'uid' | 'mode' | 'size'>,
+  platform: NodeJS.Platform = process.platform): boolean {
+  return stat.isFile() && !stat.isSymbolicLink() && stat.size < 64 * 1024 &&
+    (platform === 'win32' || stat.uid === process.getuid?.() && (stat.mode & 0o077) === 0)
+}
+
 export async function selectedProviderUsesOpenCodeV2(): Promise<boolean> {
   return (await selectedOpenCodeV2Version()) !== null
 }
@@ -132,7 +141,7 @@ export async function connectOpenCodeV2Provider(input: ConnectProviderInput): Pr
       const directory = openCodeV2ProviderConnectionsDirectory(); await mkdir(directory, { recursive: true, mode: 0o700 })
       marker = path.join(directory, executionHash({ project: owner.authority.directory, provider: input.providerId, key: apiKey }) + '.json')
       try {
-        const stat = await lstat(marker); executionAssert(stat.isFile() && !stat.isSymbolicLink() && stat.uid === process.getuid?.() && (stat.mode & 0o077) === 0 && stat.size < 64 * 1024, 'provider_intent_foreign')
+        executionAssert(isOwnedProviderIntentMarker(await lstat(marker)), 'provider_intent_foreign')
         const saved = executionRecord(JSON.parse(await readFile(marker, 'utf8')))
         if (saved.state === 'complete' && isDeepStrictEqual(previous, published)) {
           const connection = parseSavedConnection(saved.connection), originalProof = parseOpenCodeExecutionProof(saved.proof)

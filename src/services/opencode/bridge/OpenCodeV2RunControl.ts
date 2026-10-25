@@ -185,10 +185,10 @@ function parseUnixStopReceipt(value: unknown): Extract<RunControlResult, { kind:
       const row = executionRecord(member.cleanup)
       keys(row, ['scopeClosed', 'processRetired', 'descendantsRetired', 'pid', 'birth'])
       const birth = executionRecord(row.birth); keys(birth, ['format', 'value', 'bootId'])
-      executionAssert(row.scopeClosed === true && row.processRetired === true && row.descendantsRetired === true &&
+      executionAssert(row.scopeClosed === true && row.processRetired === true && typeof row.descendantsRetired === 'boolean' &&
         integer(row.pid) > 0 && ['linux-start-ticks', 'darwin-pidversion', 'windows-filetime', 'utc-ms'].includes(String(birth.format)) &&
         (birth.bootId === null || typeof birth.bootId === 'string'), 'run_control_invalid')
-      cleanup = { scopeClosed: true, processRetired: true, descendantsRetired: true, pid: integer(row.pid),
+      cleanup = { scopeClosed: true, processRetired: true, descendantsRetired: row.descendantsRetired, pid: integer(row.pid),
         birth: { format: String(birth.format) as ExecutionBirth['format'], value: string(birth.value),
           bootId: birth.bootId === null ? null : string(birth.bootId) } }
     }

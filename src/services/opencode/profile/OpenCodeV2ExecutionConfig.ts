@@ -25,11 +25,12 @@ export type ExecutionConfigInput = {
  * searching files, editing them, running shell commands, the todo list and the team
  * controller tools. Subagents and paths outside the project stay denied. The last
  * matching rule wins, so the catch-all deny comes first.
- * V2 offers MCP tools only through its code-mode `execute` tool, and every tool called
- * from it still asserts its own action, so `execute` reaches nothing the rules deny. */
+ * Code mode (`execute`) stays denied: it also offers tools that skip permission checks
+ * (fetch, worktree removal). The team MCP server is therefore registered with
+ * `codemode: false`, so its tools are direct tools the rules above admit by name. */
 export const OPENCODE_V2_TEAMMATE_PERMISSIONS: ExecutionSelection['permissions'] = Object.freeze([
   { action: '*', resource: '*', effect: 'deny' as const },
-  ...['read', 'glob', 'grep', 'todowrite', 'edit', 'shell', 'execute'].map(action => ({ action, resource: '*', effect: 'allow' as const })),
+  ...['read', 'glob', 'grep', 'todowrite', 'edit', 'shell'].map(action => ({ action, resource: '*', effect: 'allow' as const })),
   { action: 'subagent', resource: '*', effect: 'deny' as const },
   { action: 'external_directory', resource: '*', effect: 'deny' as const },
   ...['agent-teams_*', 'agent_teams_*', 'mcp__agent-teams__*', 'mcp__agent_teams__*']
@@ -64,7 +65,8 @@ export function createOpenCodeV2ExecutionConfig(input: ExecutionConfigInput): {
   }
   const selectedModel = { providerID: selection.model.providerID, model: selection.model.id,
     ...(selection.model.variant === undefined ? {} : { variant: selection.model.variant }) }
-  const nativeMcp = mcp.type === 'local' ? { ...mcp, command: [...mcp.command] } : { ...mcp }
+  // Direct tools, never code mode: see OPENCODE_V2_TEAMMATE_PERMISSIONS.
+  const nativeMcp = mcp.type === 'local' ? { ...mcp, command: [...mcp.command], codemode: false } : { ...mcp, codemode: false }
   const info = {
     update: 'disable', share: 'disabled', snapshots: false, warming: false,
     plugins: input.unattendedTeam === true ? ['-opencode.tool.question'] : [],
