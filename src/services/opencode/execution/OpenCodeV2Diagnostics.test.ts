@@ -456,7 +456,13 @@ test('native diagnostics retain only closed producer codes and stages with uint3
   const root = await mkdtemp(path.join(tmpdir(), 'TEST-v2-native-diagnostics-'))
   const previous = process.env.CLAUDE_MULTIMODEL_DATA_HOME
   const secret = 'TEST_PRIVATE_NATIVE_PAYLOAD'
+  // Every selected-profile owner role the native producer can emit is a retained stage.
+  const profileOwnerRoles = [...new Set((await readFile(path.resolve(import.meta.dir,
+    '../host/windows/WindowsKernelScope.cpp'), 'utf8')).match(/private_acl_owner_profile_[a-z0-9_]+/g) ?? [])]
+  expect(profileOwnerRoles).toHaveLength(28) // root, parent, database, 8 named, 16 positions, other
   const cases: { error: Error; category: string; native?: { stage: string; nativeCode: number } }[] = [
+    ...profileOwnerRoles.map(stage => ({ error: new Error(`execution_owner_not_private:${stage}:0`),
+      category: 'execution_owner_not_private', native: { stage, nativeCode: 0 } })),
     { error: new Error('execution_owner_not_private:private_acl_owner_run_v2:5'), category: 'execution_owner_not_private',
       native: { stage: 'private_acl_owner_run_v2', nativeCode: 5 } },
     ...['retire_broker_state', 'retire_broker_write', 'retire_job', 'retire_wait', 'retire_io_join',

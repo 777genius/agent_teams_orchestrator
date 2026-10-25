@@ -362,6 +362,12 @@ const privateNativeFailureStages = new Set([
   'owner_verification_open', 'private_acl_foreign_allow', 'private_acl_owner',
   'private_acl_owner_run_data_root', 'private_acl_owner_run_leaf', 'private_acl_owner_run_opencode',
   'private_acl_owner_run_runs', 'private_acl_owner_run_v2', 'private_image_open',
+  // Selected-profile component whose DACL owner differs; closed labels, never a path.
+  'private_acl_owner_profile_root', 'private_acl_owner_profile_parent', 'private_acl_owner_profile_database',
+  'private_acl_owner_profile_home', 'private_acl_owner_profile_config', 'private_acl_owner_profile_data',
+  'private_acl_owner_profile_cache', 'private_acl_owner_profile_state', 'private_acl_owner_profile_tmp',
+  'private_acl_owner_profile_appdata', 'private_acl_owner_profile_localappdata', 'private_acl_owner_profile_input_other',
+  ...Array.from({ length: 16 }, (_, index) => `private_acl_owner_profile_input_${index}`),
   'private_image_protected_dacl', 'private_dll_owner', 'private_owner_acquire', 'private_owner_cohort',
   'private_owner_controller_tasks', 'private_owner_controller_teams', 'private_owner_discover_selection',
   'private_owner_reserve_selection', 'private_owner_selected_selection',

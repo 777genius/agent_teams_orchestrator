@@ -55,6 +55,21 @@ static decltype(auto) inRole(const char *role, Action action) {
     throw;
   }
 }
+// Names which selected-profile component failed the DACL owner check with one
+// closed label. Only that exact unlabeled stage changes; every other code,
+// stage (including an existing finer role) and status passes through as is.
+template <typename Action>
+static decltype(auto) inAclOwnerRole(const char *role, Action action) {
+  try { return action(); }
+  catch (const NativeError &error) {
+    if (error.code != "execution_owner_not_private" || !error.stage ||
+        std::strcmp(error.stage, "private_acl_owner") != 0)
+      throw;
+    NativeError labeled = error;
+    labeled.stage = role;
+    throw labeled;
+  }
+}
 // Retirement must retain the failed native substep without serializing exception
 // text. Existing NativeError codes/status survive; WinRT contributes only HRESULT.
 template <typename Action>
@@ -1876,6 +1891,33 @@ public:
     }
     throw NativeError{"execution_native_stdio_owner_unknown"};
   }
+  // Closed component labels only: a fixed profile directory by name, otherwise
+  // the position of the caller's requested directory. Never a path.
+  static const char *selectedProfileDirectoryRole(const std::wstring &root, const std::wstring &path,
+                                                  const std::vector<std::wstring> &requested) {
+    static const wchar_t *const names[] = {L"home", L"config", L"data", L"cache",
+                                           L"state", L"tmp", L"appdata", L"localappdata"};
+    static const char *const named[] = {
+        "private_acl_owner_profile_home", "private_acl_owner_profile_config",
+        "private_acl_owner_profile_data", "private_acl_owner_profile_cache",
+        "private_acl_owner_profile_state", "private_acl_owner_profile_tmp",
+        "private_acl_owner_profile_appdata", "private_acl_owner_profile_localappdata"};
+    static const char *const positions[] = {
+        "private_acl_owner_profile_input_0", "private_acl_owner_profile_input_1",
+        "private_acl_owner_profile_input_2", "private_acl_owner_profile_input_3",
+        "private_acl_owner_profile_input_4", "private_acl_owner_profile_input_5",
+        "private_acl_owner_profile_input_6", "private_acl_owner_profile_input_7",
+        "private_acl_owner_profile_input_8", "private_acl_owner_profile_input_9",
+        "private_acl_owner_profile_input_10", "private_acl_owner_profile_input_11",
+        "private_acl_owner_profile_input_12", "private_acl_owner_profile_input_13",
+        "private_acl_owner_profile_input_14", "private_acl_owner_profile_input_15"};
+    if (equalPath(path, root)) return "private_acl_owner_profile_root";
+    for (size_t index = 0; index < std::size(names); index++)
+      if (equalPath(path, root + L"\\" + names[index])) return named[index];
+    for (size_t index = 0; index < requested.size() && index < std::size(positions); index++)
+      if (equalPath(path, requested[index])) return positions[index];
+    return "private_acl_owner_profile_input_other";
+  }
   JsonObject validateSelectedProfile(const JsonObject &input) {
     auto root = text(input, L"root"), database = text(input, L"databasePath");
     const auto cohortSids = sealedCohort ? sealedCohortSids() : std::vector<std::wstring>();
@@ -1890,9 +1932,11 @@ public:
       admitted.push_back(root + L"\\" + name);
     require(input.HasKey(L"directories") && input.GetNamedArray(L"directories").Size() <= 64,
             "execution_profile_changed");
+    std::vector<std::wstring> requested;
     for (auto item : input.GetNamedArray(L"directories")) {
       require(item.ValueType() == JsonValueType::String, "execution_profile_changed");
       std::wstring path(item.GetString());
+      requested.push_back(path);
       require(path == root ||
                   (path.size() > root.size() + 1 && equalPath(path.substr(0, root.size()), root) &&
                    path[root.size()] == L'\\'),
@@ -1912,18 +1956,21 @@ public:
       value.ancestors = holdSelectedAncestors(database);
       value.root = holdSelectedDirectory(root);
       value.parent = holdSelectedDirectory(parent);
-      value.rootIdentity =
-          fileIdentity(value.root.value, value.owner, true, selectedPackage, cohortSidsPtr);
-      value.parentIdentity =
-          fileIdentity(value.parent.value, value.owner, true, selectedPackage, cohortSidsPtr);
+      value.rootIdentity = inAclOwnerRole("private_acl_owner_profile_root", [&] {
+        return fileIdentity(value.root.value, value.owner, true, selectedPackage, cohortSidsPtr);
+      });
+      value.parentIdentity = inAclOwnerRole("private_acl_owner_profile_parent", [&] {
+        return fileIdentity(value.parent.value, value.owner, true, selectedPackage, cohortSidsPtr);
+      });
       value.admittedDirectories = admitted;
       for (const auto &path : admitted) {
         SelectedProfileDirectory directory;
         directory.path = path;
         directory.ancestors = holdSelectedAncestors(path);
         directory.file = holdSelectedDirectory(path);
-        directory.identity =
-            fileIdentity(directory.file.value, value.owner, true, selectedPackage, cohortSidsPtr);
+        directory.identity = inAclOwnerRole(selectedProfileDirectoryRole(root, path, requested), [&] {
+          return fileIdentity(directory.file.value, value.owner, true, selectedPackage, cohortSidsPtr);
+        });
         value.directories.push_back(std::move(directory));
       }
       wchar_t filesystem[64]{};
@@ -1964,8 +2011,9 @@ public:
         require(GetLastError() == ERROR_FILE_NOT_FOUND, "execution_database_alias");
       else {
         require(equalPath(finalPath(file.value), extended(database)), "execution_database_alias");
-        selected.databaseIdentity =
-            fileIdentity(file.value, selected.owner, false, selectedPackage, cohortSidsPtr);
+        selected.databaseIdentity = inAclOwnerRole("private_acl_owner_profile_database", [&] {
+          return fileIdentity(file.value, selected.owner, false, selectedPackage, cohortSidsPtr);
+        });
         selected.database = std::move(file);
       }
     } else
