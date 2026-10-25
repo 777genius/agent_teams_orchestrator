@@ -13,3 +13,14 @@ test('known refusals name the cause; anything else stays generic', () => {
     expect(openCodeV2RefusalReason(error)).toBeNull()
   }
 })
+
+test('a failed full V2 read shows the named cause in the provider status detail', async () => {
+  const { buildOpenCodeV2RuntimeStatus } = await import('../catalog/OpenCodeV2RuntimeStatus.js')
+  const cause = openCodeV2RefusalReason(new Error('execution_containment_launcher_unsupported'))!
+  const snapshot = { detected: true, binaryPath: '/TEST/opencode', models: [], probeError: cause, readGeneration: 'v2' as const }
+  const failed = buildOpenCodeV2RuntimeStatus({ ...snapshot, readStatus: { catalog: 'unavailable', defaultModel: null, models: [] } } as never)
+  expect(failed.detailMessage).toBe(cause)
+  expect(failed.statusCheckOutcome).toBe('transient_error')
+  // Without a full read (passive selection) the detail stays the qualification note.
+  expect(buildOpenCodeV2RuntimeStatus(snapshot as never).detailMessage).toContain('remain unqualified')
+})

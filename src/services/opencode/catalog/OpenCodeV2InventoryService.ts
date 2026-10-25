@@ -6,6 +6,7 @@ import { acquireOpenCodeV2ReadHost } from '../host/OpenCodeHostNativeAdapter.js'
 import { createOpenCodeV2ReadClient } from '../transport/OpenCodeV2ClientFactory.js'
 import { openCodeReadAssert } from '../transport/OpenCodeBoundedFetch.js'
 import { openCodeV2Wire } from '../compatibility/OpenCodeV2Registry.js'
+import { openCodeV2RefusalReason } from '../execution/OpenCodeV2RefusalReason.js'
 import { emptyOpenCodeV2ReadStatus, readAgent, readArray, readConfiguration, readLocation, readModel,
   readProvider, readRecord, readWrapped, type OpenCodeV2ReadStatus } from './OpenCodeV2ReadStatus.js'
 
@@ -75,7 +76,7 @@ export async function probeOpenCodeV2Inventory(native: OpenCodeV2NativeIdentity,
       ? 'V2 catalog reads require the packaged JS wrapper; compiled binary mode is unsupported.'
       : error instanceof Error && error.message === 'cleanup_unknown'
         ? 'V2 owned server cleanup unknown.'
-        : 'V2 read status unavailable; authentication and execution remain unqualified.'
+        : openCodeV2RefusalReason(error) ?? 'V2 read status unavailable; authentication and execution remain unqualified.'
   } finally {
     try { if (reader) await reader.dispose() } catch { failure = 'V2 HTTP cleanup unknown.' }
     try { if (host) await host.close() } catch { failure = 'V2 owned server cleanup unknown.' }

@@ -15,7 +15,9 @@ export function buildOpenCodeV2RuntimeStatus(snapshot: OpenCodeInventorySnapshot
     capabilities: { teamLaunch: false, oneShot: false,
       extensions: { plugins: unavailable, mcp: unavailable, skills: unavailable, apiKeys: unavailable } },
     statusMessage: ready ? 'OpenCode V2 catalog available; capabilities_pending' : 'OpenCode read capabilities_pending',
-    detailMessage: 'Authentication, team launch and one-shot execution remain unqualified. Only an existing verified V2 native selection is supported for reads.',
+    // A failed full read names its cause (fixed text from the V2 inventory probe, never a native error).
+    detailMessage: read && !ready && snapshot.probeError ? snapshot.probeError
+      : 'Authentication, team launch and one-shot execution remain unqualified. Only an existing verified V2 native selection is supported for reads.',
     selectedBackendId: null, resolvedBackendId: null, availableBackends: [],
     externalRuntimeDiagnostics: [{ id: 'cli-bin', label: 'OpenCode CLI', detected: snapshot.detected,
       statusMessage: 'Read-scoped native selection', detailMessage: snapshot.binaryPath }],
