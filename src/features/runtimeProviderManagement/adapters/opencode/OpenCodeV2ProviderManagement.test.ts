@@ -90,7 +90,8 @@ test('private failure diagnostics preserve finite control causes and redact arbi
     const rows = await Promise.all((await readdir(directory)).map(async name => {
       const file = path.join(directory, name), content = await readFile(file, 'utf8')
       expect(content.includes(secret)).toBe(false)
-      expect((await stat(file)).mode & 0o077).toBe(0)
+      // Windows stat mode bits do not describe inherited ACLs; this is a POSIX-only check.
+      if (process.platform !== 'win32') expect((await stat(file)).mode & 0o077).toBe(0)
       const row = JSON.parse(content)
       expect(Object.keys(row).sort()).toEqual(['category', 'phase', 'recordedAt', 'retainedOriginal', 'schemaVersion'])
       expect(row.retainedOriginal).toBe(true)
