@@ -31,37 +31,46 @@ describe('Linux launcher probe classification', () => {
   })
 })
 
-// Shell stand-ins for bwrap. They only emulate the setup effects the probe observes:
-// a fixed launcher creates the control directory and refuses the symlinked target; a
-// vulnerable one follows the /oldroot symlink and creates the target on the host.
+// Shell stand-ins for bwrap. They process setup operations in order, as bwrap does, and
+// only emulate the effects the probe observes: a fixed launcher creates the control
+// directory and dies at the symlinked operation; a vulnerable one follows the /oldroot
+// symlink and creates the target on the host. `<kind>-only` is vulnerable for one kind.
 const fake = (mode: string) => `#!/bin/sh
 PATH=/usr/bin:/bin
+mode=${mode}
 if [ "$1" = "--version" ]; then
-  if [ "${mode}" = old ]; then echo "bubblewrap 0.9.0"; else echo "bubblewrap 0.13.1"; fi
+  if [ "$mode" = old ]; then echo "bubblewrap 0.9.0"; else echo "bubblewrap 0.13.1"; fi
   exit 0
 fi
-[ "${mode}" = denied ] && exit 1
-root=""; op=""; dest=""
+[ "$mode" = denied ] && exit 1
+root=""
+probe() { # <op> <dest>: returns 0 when the stand-in follows the symlink
+  case "$1:$2" in
+    --dir:/link/*) kind=dir ;; --bind:/link/*) kind=bind ;; --ro-bind:/link/*) kind=file ;; --ro-bind:*) kind=leaf ;; *) kind=other ;;
+  esac
+  [ "$mode" = vulnerable ] || [ "$mode" = "$kind-only" ] || return 1
+  case "$2" in
+    /link/*) target="$(readlink "$root/link")/\${2#/link/}" ;;
+    *) target=$(readlink "$root$2") ;;
+  esac
+  target=\${target#/oldroot}
+  if [ "$1" = --ro-bind ]; then : > "$target"; else mkdir "$target"; fi
+}
 while [ $# -gt 0 ]; do
   case "$1" in
     --bind|--ro-bind)
-      if [ -z "$root" ] && [ "$3" = "/" ]; then root=$2; else op=$1; dest=$3; fi
+      if [ -z "$root" ] && [ "$3" = "/" ]; then root=$2; else probe "$1" "$3" || exit 1; fi
       shift 3 ;;
     --dir)
-      case "$2" in /setup-*) mkdir "$root$2" ;; *) op=--dir; dest=$2 ;; esac
+      case "$2" in
+        /setup-*) mkdir "$root$2"; [ "$mode" = slow ] && exec sleep 10 ;;
+        *) probe --dir "$2" || exit 1 ;;
+      esac
       shift 2 ;;
     --) break ;;
     *) shift ;;
   esac
 done
-escape() {
-  target=$(readlink "$root/link"); leaf=\${dest#/link/}
-  if [ "$op" = --ro-bind ]; then : > "\${target#/oldroot}/$leaf"; else mkdir "\${target#/oldroot}/$leaf"; fi
-}
-case "${mode}" in
-  vulnerable) escape ;;
-  file-bind-only) [ "$op" = --ro-bind ] && escape ;;
-esac
 exit 1
 `
 
@@ -93,12 +102,19 @@ describe.skipIf(process.platform === 'win32')('Linux launcher qualification with
     await expect(qualify('vulnerable')).rejects.toThrow('execution_containment_launcher_unsafe')
     expect(await probeLeftovers()).toEqual([])
   })
-  test('the file bind mount point is probed on its own', async () => {
-    await expect(qualify('file-bind-only')).rejects.toThrow('execution_containment_launcher_unsafe')
-  })
+  // Each mount point kind is probed on its own: dropping any case lets its stand-in qualify.
+  for (const kind of ['dir', 'bind', 'file', 'leaf']) {
+    test(`a launcher vulnerable only for the ${kind} mount point is refused`, async () => {
+      await expect(qualify(`${kind}-only`)).rejects.toThrow('execution_containment_launcher_unsafe')
+    })
+  }
   test('a launcher that cannot build the sandbox is refused', async () => {
     await expect(qualify('denied')).rejects.toThrow('execution_containment_launcher_denied')
   })
+  test('a probe killed at its deadline fails closed', async () => {
+    await expect(qualify('slow')).rejects.toThrow('execution_containment_launcher_denied')
+    expect(await probeLeftovers()).toEqual([])
+  }, 20_000)
   test('a launcher below the version floor is refused before it is probed', async () => {
     await expect(qualify('old')).rejects.toThrow('execution_containment_launcher_unsupported')
   })

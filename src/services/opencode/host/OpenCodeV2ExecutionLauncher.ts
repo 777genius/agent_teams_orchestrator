@@ -153,8 +153,9 @@ async function present(file: string): Promise<boolean> {
   }
 }
 /** The upstream advisory reproduction, once for each setup operation that creates a
- * mount point (a directory, a directory bind and a file bind), against the exact launcher
- * bytes inside a private temporary directory. Host-side effects decide; exit codes do not. */
+ * mount point (a directory, a directory bind and a file bind under a symlinked parent, and
+ * a file bind onto a symlink), against the exact launcher bytes inside a private temporary
+ * directory. Host-side effects decide; exit codes do not; a timeout fails closed. */
 async function probeLinuxLauncher(launcher: string): Promise<void> {
   const base = await realpath(await mkdtemp(path.join(tmpdir(), 'opencode-v2-launcher-')))
   try {
@@ -163,18 +164,23 @@ async function probeLinuxLauncher(launcher: string): Promise<void> {
     for (const directory of [root, host, sourceDirectory]) await mkdir(directory, { mode: 0o700 })
     await writeFile(sourceFile, '', { mode: 0o600 })
     await symlink(`/oldroot${host}`, path.join(root, 'link'))
+    // The mount point itself may be the symlink too (a dangling one the file bind would create).
+    await symlink(`/oldroot${host}/escape-leaf`, path.join(root, 'leaf'))
     const cases = [['--dir', '/link/escape-directory'], ['--bind', sourceDirectory, '/link/escape-bind'],
-      ['--ro-bind', sourceFile, '/link/escape-file']]
+      ['--ro-bind', sourceFile, '/link/escape-file'], ['--ro-bind', sourceFile, '/leaf']]
     const effects: LinuxLauncherProbeEffects[] = []
     for (const [index, operation] of cases.entries()) {
       const child = spawn(launcher, [...LINUX_ISOLATION_ARGS, '--bind', root, '/', '--dir', `/setup-${index}`, ...operation,
         '--', '/opencode-v2-launcher-probe'], { env: {}, stdio: 'ignore' })
+      let timedOut = false
       await new Promise<void>((resolve, reject) => {
-        const timer = setTimeout(() => child.kill('SIGKILL'), 3000)
+        const timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL') }, 3000)
         child.once('error', error => { clearTimeout(timer); reject(error) })
         child.once('close', () => { clearTimeout(timer); resolve() })
       })
-      effects.push({ setupReached: await present(path.join(root, `setup-${index}`)), escapedToHost: (await readdir(host)).length > 0 })
+      // A killed probe proves nothing about the step it did not finish: it fails closed.
+      effects.push({ setupReached: !timedOut && await present(path.join(root, `setup-${index}`)),
+        escapedToHost: (await readdir(host)).length > 0 })
     }
     const verdict = classifyLinuxLauncherProbe(effects)
     assert(verdict === 'qualified', verdict)
@@ -182,7 +188,7 @@ async function probeLinuxLauncher(launcher: string): Promise<void> {
 }
 async function qualifyLinuxLauncherOnce(launcher: string): Promise<void> {
   let version: string
-  try { version = await linuxLauncherVersion(launcher) } catch { throw new Error('execution_containment_launcher_unsupported') }
+  try { version = await linuxLauncherVersion(launcher) } catch { throw new Error('execution_containment_launcher_version_unknown') }
   assert(linuxLauncherMeetsFloor(version), 'execution_containment_launcher_unsupported')
   await probeLinuxLauncher(launcher)
 }
@@ -221,7 +227,7 @@ export async function planLinuxExecution(requested: Readonly<{
     throw error
   }
   const stat = await lstat(launcher)
-  assert(stat.isFile() && (stat.mode & 0o6022) === 0, 'execution_containment_launcher_authority')
+  assert(stat.isFile() && stat.uid === 0 && (stat.mode & 0o6022) === 0, 'execution_containment_launcher_authority')
   assert(await realpath(input.bun.path) === input.bun.path && await linuxFileHash(input.bun.path) === input.bun.sha256,
     'execution_identity_mismatch')
   const launcherSha256 = await linuxFileHash(launcher)
@@ -329,8 +335,9 @@ export function launchLinuxExecution(plan: LinuxLaunchPlan, nonce: string, lease
   const prepared = new Promise<Record<string, unknown>>((resolve, reject) => { preparedResolve = resolve; preparedReject = reject })
   void prepared.catch(() => undefined)
   child.once('error', () => preparedReject(new Error('execution_containment_spawn_failed')))
+  // The sandbox was built (init was found) but the child ended before it answered prepare.
   // The launcher's own stderr stays in output(); the error carries only the fixed code.
-  child.once('close', () => preparedReject(new Error('execution_containment_launcher_denied')))
+  child.once('close', () => preparedReject(new Error('execution_containment_launcher_exited')))
   child.on('message', value => {
     try {
       const message = row(value)

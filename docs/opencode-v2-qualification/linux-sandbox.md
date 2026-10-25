@@ -12,22 +12,27 @@ connect, model tests and the provider status.
    process could plant one in a writable root and make the next sandbox setup create
    host paths. The version is read from `bwrap --version`.
 2. **Setup that stays inside the new root.** The runtime runs the upstream advisory
-   reproduction once each for a directory, a directory bind and a file bind, in a
-   private temporary directory. Any host-side effect refuses the launcher, whatever
-   version it reports.
+   reproduction once each for a directory, a directory bind and a file bind under a
+   symlinked parent, and for a file bind onto a dangling symlink, in a private temporary
+   directory. Any host-side effect refuses the launcher, whatever version it reports; a
+   probe that does not finish within 3 seconds counts as not reached.
 3. **Unprivileged user namespaces for `/usr/bin/bwrap`.** The sandbox runs as the
    ordinary user. The runtime checks that the live child has no capabilities and
    `NoNewPrivs` set; bwrap itself asserts that nested user namespaces are disabled.
-4. `/usr/bin/bwrap` is a regular file, not setuid or setgid, and not writable by group
-   or others.
+4. `/usr/bin/bwrap` is a root-owned regular file, not setuid or setgid, and not writable
+   by group or others.
 
-| Refusal | Cause |
-|---|---|
-| `execution_containment_launcher_missing` | No `/usr/bin/bwrap`. |
-| `execution_containment_launcher_unsupported` | Older than 0.12.0, or no `bubblewrap X.Y.Z` version. |
-| `execution_containment_launcher_unsafe` | The setup probe created a host path. |
-| `execution_containment_launcher_denied` | The sandbox could not be built (usually the user-namespace restriction). |
-| `execution_containment_launcher_authority` | Unsafe file mode. |
+| Refusal | Cause | Provider status |
+|---|---|---|
+| `execution_containment_launcher_missing` | No `/usr/bin/bwrap`. | unsupported, with the cause |
+| `execution_containment_launcher_unsupported` | Older than 0.12.0, or not a `bubblewrap X.Y.Z` report. | unsupported, with the cause |
+| `execution_containment_launcher_unsafe` | The setup probe created a host path. | unsupported, with the cause |
+| `execution_containment_launcher_authority` | Not root-owned, or an unsafe file mode. | unsupported, with the cause |
+| `execution_containment_launcher_denied` | The sandbox could not be built (usually the user-namespace restriction). | retryable, with the cause |
+| `execution_containment_launcher_version_unknown` | `bwrap --version` failed or timed out. | retryable, with the cause |
+| `execution_containment_launcher_exited` | The sandbox started but the child ended before it answered. | retryable, generic |
+
+These texts are used on Linux only; the darwin and Windows adapters keep their own codes.
 
 ## Ubuntu 24.04
 
@@ -45,7 +50,7 @@ With bubblewrap 0.12.0, 0.13.0 or 0.13.1 built from the upstream release at
 `/usr/bin/bwrap` (root-owned, mode 0755) and this profile, the restriction stays on and
 the runtime's kernel containment fixture passes for every case:
 
-```
+```text
 abi <abi/4.0>,
 include <tunables/global>
 

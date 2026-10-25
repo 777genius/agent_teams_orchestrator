@@ -11,7 +11,22 @@ test('routine source and documentation keep Linux coverage without native jobs',
     assert.equal(decision.native, 'false', path)
     assert.deepEqual(JSON.parse(decision.authority_os), ['ubuntu-latest'])
     assert.match(decision.reason, /native jobs skipped/)
+    assert.equal(decision.v2_linux, 'false', path)
   }
+})
+
+test('V2 execution, catalog and provider code selects the real Linux V2 lane', () => {
+  // host/ is not a native boundary: the Linux deadline regression changed host code only.
+  for (const path of ['src/services/opencode/host/OpenCodeV2ExecutionHost.ts', 'src/services/opencode/host/OpenCodeV2ExecutionLauncher.ts',
+    'src/services/opencode/execution/OpenCodeV2ExecutionContracts.ts', 'src/services/opencode/catalog/OpenCodeV2RuntimeStatus.ts',
+    'src/services/opencode/compatibility/opencode-v2-qualifications.json', 'src/services/opencode/bridge/OpenCodeV2TeamBridge.ts',
+    'src/services/opencode/transport/OpenCodeV2ProviderWire.ts', 'src/services/opencode/profile/OpenCodeV2ExecutionReceipt.ts',
+    'src/features/runtimeProviderManagement/adapters/opencode/OpenCodeV2ProviderManagement.ts', 'src/entrypoints/opencodeV2ExecutionServer.ts',
+    'scripts/opencode-v2/stage.ts', 'scripts/ci/opencode-v2-linux-execution.sh', 'patches/@opencode%2Fcore@2.0.32.patch', 'package.json']) {
+    assert.equal(classify([path]).v2_linux, 'true', path)
+  }
+  assert.equal(classify(['src/services/opencode/host/OpenCodeV2ExecutionHost.ts']).native, 'false')
+  assert.equal(classify([], true).v2_linux, 'true')
 })
 
 test('custody, process identity, startup cleanup, lifecycle, ABI and policy retain native gates', () => {
@@ -83,15 +98,16 @@ test('real no-index Git diff retains renamed-away and deleted authority paths', 
   } finally { rmSync(root, { recursive: true, force: true }) }
 })
 
-function needs(native = 'false') {
+function needs(native = 'false', v2Linux = native === 'true' ? 'true' : 'false') {
   return {
-    scope: { result: 'success', outputs: { native, reason: 'TEST decision' } },
+    scope: { result: 'success', outputs: { native, reason: 'TEST decision', v2_linux: v2Linux } },
     'cursor-managed-plugin': { result: 'success' },
     'task-change-ledger': { result: 'success' },
     'opencode-authority': { result: 'success' },
     'packaged-delivery': { result: native === 'true' ? 'success' : 'skipped' },
     'windows-packaged-backfill': { result: native === 'true' ? 'success' : 'skipped' },
     'opencode-conformance': { result: native === 'true' ? 'success' : 'skipped' },
+    'opencode-v2-linux': { result: v2Linux === 'true' ? 'success' : 'skipped' },
   }
 }
 
@@ -102,12 +118,21 @@ test('aggregate independently rejects required failures/cancellation/skips and c
       for (const result of ['failure', 'cancelled', 'skipped', 'unknown']) {
         const sample = needs(native)
         sample[job as keyof typeof sample].result = result
-        if (native === 'false' && result === 'skipped' && ['windows-packaged-backfill', 'opencode-conformance', 'packaged-delivery'].includes(job)) {
+        if (native === 'false' && result === 'skipped' && ['windows-packaged-backfill', 'opencode-conformance', 'packaged-delivery', 'opencode-v2-linux'].includes(job)) {
           assert.equal(aggregate(sample), 'TEST decision')
         } else assert.throws(() => aggregate(sample), `${job}/${native}/${result}`)
       }
     }
   }
+  // The V2 Linux lane may be skipped only when it was not selected; native always selects it.
+  const selected = needs('false', 'true')
+  assert.equal(aggregate(selected), 'TEST decision')
+  for (const result of ['failure', 'cancelled', 'skipped']) {
+    const sample = needs('false', 'true'); sample['opencode-v2-linux'].result = result
+    assert.throws(() => aggregate(sample), result)
+  }
+  assert.throws(() => aggregate(needs('true', 'false')))
+  for (const v2Linux of ['', 'invalid']) assert.throws(() => aggregate(needs('false', v2Linux)))
   for (const native of ['', 'invalid']) assert.throws(() => aggregate(needs(native)))
   const missingReason = needs(); missingReason.scope.outputs.reason = ''
   assert.throws(() => aggregate(missingReason))
@@ -123,7 +148,7 @@ test('actual Node CLI emits outputs and fails closed without Git access or valid
     const output = join(root, 'outputs')
     const full = invoke('classify', { CI_EVENT: 'workflow_dispatch', CI_FULL: 'true', GITHUB_OUTPUT: output })
     assert.equal(full.status, 0, full.stderr)
-    assert.match(readFileSync(output, 'utf8'), /native=true\nauthority_os=\["ubuntu-latest","windows-latest"\]\nreason=Explicit full validation request\n/)
+    assert.match(readFileSync(output, 'utf8'), /native=true\nauthority_os=\["ubuntu-latest","windows-latest"\]\nreason=Explicit full validation request\nv2_linux=true\n/)
     assert.notEqual(invoke('classify', { CI_EVENT: 'workflow_dispatch', CI_FULL: 'false', GITHUB_OUTPUT: output }).status, 0)
     assert.notEqual(invoke('classify', { CI_EVENT: 'push', CI_BASE: 'a'.repeat(40), CI_HEAD: 'b'.repeat(40), GITHUB_OUTPUT: output }).status, 0)
     assert.equal(invoke('aggregate', { CI_NEEDS: JSON.stringify(needs()) }).status, 0)

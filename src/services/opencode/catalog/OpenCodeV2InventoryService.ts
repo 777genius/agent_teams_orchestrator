@@ -6,7 +6,7 @@ import { acquireOpenCodeV2ReadHost } from '../host/OpenCodeHostNativeAdapter.js'
 import { createOpenCodeV2ReadClient } from '../transport/OpenCodeV2ClientFactory.js'
 import { openCodeReadAssert } from '../transport/OpenCodeBoundedFetch.js'
 import { openCodeV2Wire } from '../compatibility/OpenCodeV2Registry.js'
-import { openCodeV2RefusalReason } from '../execution/OpenCodeV2RefusalReason.js'
+import { openCodeV2Refusal, type OpenCodeV2Refusal } from '../execution/OpenCodeV2RefusalReason.js'
 import { emptyOpenCodeV2ReadStatus, readAgent, readArray, readConfiguration, readLocation, readModel,
   readProvider, readRecord, readWrapped, type OpenCodeV2ReadStatus } from './OpenCodeV2ReadStatus.js'
 
@@ -32,7 +32,7 @@ export async function probeOpenCodeV2Inventory(native: OpenCodeV2NativeIdentity,
   let status = emptyOpenCodeV2ReadStatus(native, directory)
   let host: Awaited<ReturnType<typeof acquireOpenCodeV2ReadHost>> | undefined
   let reader: Awaited<ReturnType<typeof createOpenCodeV2ReadClient>> | undefined
-  let failure: string | null = null, refusal: string | null = null
+  let failure: string | null = null, refusal: OpenCodeV2Refusal | null = null
   try {
     host = await acquireOpenCodeV2ReadHost(native, directory, boundedContext)
     reader = await createOpenCodeV2ReadClient(host.authority, boundedContext)
@@ -73,12 +73,12 @@ export async function probeOpenCodeV2Inventory(native: OpenCodeV2NativeIdentity,
       defaultModel: defaultRow ? { providerId: defaultRow.providerId, catalogId: defaultRow.catalogId } : null }
   } catch (error) {
     // Only fixed texts are public; never serialize native errors.
-    refusal = openCodeV2RefusalReason(error)
+    refusal = openCodeV2Refusal(error)
     failure = error instanceof Error && error.message === 'v2_compiled_runtime_unsupported'
       ? 'V2 catalog reads require the packaged JS wrapper; compiled binary mode is unsupported.'
       : error instanceof Error && error.message === 'cleanup_unknown'
         ? 'V2 owned server cleanup unknown.'
-        : refusal ?? 'V2 read status unavailable; authentication and execution remain unqualified.'
+        : refusal?.message ?? 'V2 read status unavailable; authentication and execution remain unqualified.'
   } finally {
     // An unknown cleanup outranks a refusal: it is reported instead and stays retryable.
     try { if (reader) await reader.dispose() } catch { failure = 'V2 HTTP cleanup unknown.'; refusal = null }
@@ -87,5 +87,7 @@ export async function probeOpenCodeV2Inventory(native: OpenCodeV2NativeIdentity,
   if (failure) status = emptyOpenCodeV2ReadStatus(native, directory)
   let connected: OpenCodeConnectedProvider[] = []
   try { connected = await readOpenCodeV2ConnectedProviders(directory, native.version) } catch { /* Unknown receipts never display as connected. */ }
-  return openCodeV2InventorySnapshot(native, directory, status, failure, connected, refusal !== null && failure === refusal)
+  // Only a settled refusal leaves the retryable transient status; its text is shown either way.
+  return openCodeV2InventorySnapshot(native, directory, status, failure, connected,
+    refusal !== null && refusal.settled && failure === refusal.message)
 }

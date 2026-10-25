@@ -1,5 +1,5 @@
 import { recordOpenCodeV2ProviderFailure } from '../../../../services/opencode/execution/OpenCodeV2Diagnostics.js'
-import { openCodeV2RefusalReason } from '../../../../services/opencode/execution/OpenCodeV2RefusalReason.js'
+import { openCodeV2Refusal } from '../../../../services/opencode/execution/OpenCodeV2RefusalReason.js'
 export { recordOpenCodeV2ProviderFailure } from '../../../../services/opencode/execution/OpenCodeV2Diagnostics.js'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -201,8 +201,8 @@ export async function connectOpenCodeV2Provider(input: ConnectProviderInput): Pr
     await recordOpenCodeV2ProviderFailure(phase, error, retainUnknown)
     // A refusal the user can act on (platform qualification, the Linux sandbox) is not an
     // authentication failure; name it instead of the generic text.
-    const reason = retainUnknown ? null : openCodeV2RefusalReason(error)
-    if (reason) return resultError('runtime-unhealthy', reason)
+    const refusal = retainUnknown ? null : openCodeV2Refusal(error)
+    if (refusal) return resultError('runtime-unhealthy', refusal.message)
     return resultError(retainUnknown ? 'runtime-unhealthy' : 'auth-failed', retainUnknown
       ? 'The original V2 provider connection or execution remains unresolved. No automatic reconnect or prompt retry is authorized.'
       : 'V2 provider connection could not be qualified. Existing credentials were preserved.')
@@ -232,7 +232,7 @@ export async function testOpenCodeV2ProviderModel(input: TestProviderModelInput)
     const ok = proof.state === 'available' && proof.proof?.modelId === input.modelId && proof.proof.projectPath === project
     return { ok: true, value: { providerId: input.providerId, modelId: input.modelId, ok,
       availability: ok ? 'available' : 'unknown', message: ok ? 'Selected V2 model execution and physical retirement verified.' : 'Original selected-model execution is pending; no alternate input was submitted.', diagnostics: [] } }
-  } catch (error) { return resultError('runtime-unhealthy', openCodeV2RefusalReason(error) ?? 'V2 selected-model execution could not be qualified. No alternate model was tried.') }
+  } catch (error) { return resultError('runtime-unhealthy', openCodeV2Refusal(error)?.message ?? 'V2 selected-model execution could not be qualified. No alternate model was tried.') }
 }
 
 export async function loadOpenCodeV2ProviderModels(input: LoadProviderModelsInput): Promise<ProviderManagementResult<RuntimeProviderModelsView>> {
@@ -248,7 +248,7 @@ export async function loadOpenCodeV2ProviderModels(input: LoadProviderModelsInpu
         models: rows.map(row => buildOpenCodeV2RuntimeProviderModel(row, input.providerId, owner.preferredModel)) }
     })
     return { ok: true, value }
-  } catch (error) { return resultError('runtime-unhealthy', openCodeV2RefusalReason(error) ?? 'V2 native provider catalog is unavailable; no legacy CLI catalog command was invoked.') }
+  } catch (error) { return resultError('runtime-unhealthy', openCodeV2Refusal(error)?.message ?? 'V2 native provider catalog is unavailable; no legacy CLI catalog command was invoked.') }
 }
 
 export function buildOpenCodeV2RuntimeProviderModel(row: Record<string, unknown>, providerId: string, preferredModel: string | null): RuntimeProviderModel {

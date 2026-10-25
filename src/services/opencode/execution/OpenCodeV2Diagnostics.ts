@@ -336,7 +336,7 @@ const privateNativeFailureCodes = new Set([
   'execution_containment_helper_closed', 'execution_containment_helper_failed', 'execution_containment_helper_identity',
   'execution_containment_launcher_denied', 'execution_containment_pipe_denied', 'execution_containment_profile_denied',
   'execution_containment_launcher_missing', 'execution_containment_launcher_unsupported', 'execution_containment_launcher_unsafe',
-  'execution_containment_launcher_authority',
+  'execution_containment_launcher_authority', 'execution_containment_launcher_version_unknown', 'execution_containment_launcher_exited',
   'execution_containment_init_unavailable', 'execution_containment_pidfd_unavailable', 'execution_containment_pidfd_runtime_pending',
   'execution_containment_unavailable', 'execution_native_command_unknown', 'execution_native_stdio_owner_unknown',
   'execution_native_timeout', 'execution_native_unknown', 'execution_owner_alias', 'run_control_process_identity',
