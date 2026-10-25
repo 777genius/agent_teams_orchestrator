@@ -66,7 +66,7 @@ versions=$(node -e '
 
 failed=0
 for version in $versions; do
-  echo "::group::V2 $version catalog read inside the sandbox"
+  echo "::group::V2 $version catalog read inside the sandbox and provider status"
   w="$OUT/TEST-v2-$version"
   mkdir -p "$w/home" "$w/project"
   npm install --prefix "$w/oc" --ignore-scripts --no-audit --no-fund "@opencode/cli-linux-x64@$version" >/dev/null
@@ -92,6 +92,26 @@ for version in $versions; do
     echo "V2 $version: catalog server started in the sandbox"
   else
     echo "::error::V2 $version catalog read failed (exit $code)"; tail -20 "$w/models.stderr" || true
+    failed=1
+  fi
+  # The provider status reads the catalog outside the sandbox but must check the launcher first.
+  set +e
+  (cd "$w/project" && env -i PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 HOME="$w/home" TMPDIR="$w/home" \
+    XDG_CONFIG_HOME="$w/home/.config" XDG_DATA_HOME="$w/home/.local/share" \
+    XDG_CACHE_HOME="$w/home/.cache" XDG_STATE_HOME="$w/home/.local/state" \
+    CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH="$oc" \
+    "$runtime/claude-multimodel" runtime status --provider opencode --json >"$w/status.json" 2>"$w/status.stderr")
+  set -e
+  if node -e '
+    const payload = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")), providers = payload.providers
+    const status = Array.isArray(providers) ? providers.find(row => row.providerId === "opencode") : providers?.opencode
+    console.log(JSON.stringify({ supported: status?.supported ?? null, statusCheckOutcome: status?.statusCheckOutcome ?? null,
+      statusMessage: status?.statusMessage ?? null, detailMessage: status?.detailMessage ?? null }))
+    process.exit(status?.supported === true && status.statusCheckOutcome === "model_only" ? 0 : 1)
+  ' "$w/status.json"; then
+    echo "V2 $version: provider status reports the catalog"
+  else
+    echo "::error::V2 $version provider status is not ready"; tail -20 "$w/status.stderr" || true
     failed=1
   fi
   find "$w/home" -path '*provider-diagnostics*' -name '*.json' -exec cat {} \; 2>/dev/null || true

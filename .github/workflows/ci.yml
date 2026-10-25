@@ -455,6 +455,7 @@ jobs:
           path: |
             ${{ runner.temp }}/TEST-opencode-v2-linux/TEST-kernel/receipt.json
             ${{ runner.temp }}/TEST-opencode-v2-linux/TEST-v2-*/models.json
+            ${{ runner.temp }}/TEST-opencode-v2-linux/TEST-v2-*/status.json
 
   required:
     name: CI required
