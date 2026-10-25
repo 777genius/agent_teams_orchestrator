@@ -367,7 +367,7 @@ jobs:
         if: matrix.platform == 'win32-x64'
         run: bun scripts/opencode-v2/compile-windows.ts
       - name: Test native compiled delegation and cancellation
-        run: bun test src/cli/packagedOpenCodeDelivery.test.ts scripts/opencode-v2/native-video.test.ts scripts/opencode-v2/stage.test.ts scripts/opencode-v2/staged-files.test.ts src/services/opencode/host/OpenCodeV2ExecutionAuth.test.ts
+        run: bun test src/cli/packagedOpenCodeDelivery.test.ts scripts/opencode-v2/native-video.test.ts scripts/opencode-v2/stage.test.ts scripts/opencode-v2/stage-copy.test.ts scripts/opencode-v2/staged-files.test.ts src/services/opencode/host/OpenCodeV2ExecutionAuth.test.ts
       - name: Select qualified Windows runtime Bun
         if: matrix.platform == 'win32-x64'
         uses: oven-sh/setup-bun@v2
@@ -409,15 +409,21 @@ jobs:
           cp -R dist/local-cli dist/bun dist/cursor-managed candidate/runtime/
           printf '%s\n' "$CANDIDATE_SOURCE_SHA" > candidate/runtime/COMMIT_SHA
           tar -czf "candidate-$CANDIDATE_PLATFORM.tar.gz" -C candidate runtime
-      - name: Serve every staged V2 graph from the candidate delivery
+      - name: Serve every staged V2 graph from the extracted candidate archive
+        timeout-minutes: 10
         shell: bash
         env:
           CANDIDATE_PLATFORM: ${{ matrix.platform }}
         run: |
           set -euo pipefail
-          shipped_bun=dist/bun/bun
-          if [[ "$CANDIDATE_PLATFORM" == win32-* ]]; then shipped_bun=dist/bun/bun.exe; fi
-          "$shipped_bun" --no-env-file scripts/opencode-v2/packaged-server-smoke.ts dist "packaged-server-smoke-$CANDIDATE_PLATFORM.json"
+          # Outside the checkout, so module resolution cannot fall back to the source install.
+          extracted="$RUNNER_TEMP/TEST-packaged-server-smoke"
+          rm -rf "$extracted"
+          mkdir -p "$extracted"
+          tar -xzf "candidate-$CANDIDATE_PLATFORM.tar.gz" -C "$extracted"
+          shipped_bun="$extracted/runtime/bun/bun"
+          if [[ "$CANDIDATE_PLATFORM" == win32-* ]]; then shipped_bun="$extracted/runtime/bun/bun.exe"; fi
+          "$shipped_bun" --no-env-file scripts/opencode-v2/packaged-server-smoke.ts "$extracted/runtime" "packaged-server-smoke-$CANDIDATE_PLATFORM.json"
       - name: Preserve staged V2 server evidence
         if: always()
         uses: actions/upload-artifact@v4

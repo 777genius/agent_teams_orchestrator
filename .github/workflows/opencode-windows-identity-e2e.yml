@@ -7,6 +7,7 @@ on:
       - bun.lock
       - scripts/opencode-v2/stage.ts
       - scripts/opencode-v2/stage.test.ts
+      - scripts/opencode-v2/staged-files.ts
       - scripts/opencode-v2/packaged-pty-smoke.ts
       - scripts/opencode-v2/packaged-pty-smoke.test.ts
       - src/utils/windowsNativeProcess.ts

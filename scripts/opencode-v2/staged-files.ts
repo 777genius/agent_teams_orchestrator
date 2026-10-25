@@ -3,13 +3,14 @@
  *
  * Bun never loads type declarations, source maps, C/C++ sources of prebuilt
  * addons, markdown documentation or another platform's prebuilt addon. Staging
- * leaves them out; every loadable byte (JavaScript, JSON, WebAssembly, native
- * libraries, grammar queries and other package assets) is copied unchanged, so
- * module digests and the graph identity checks see the same files as before.
+ * leaves them out; package code, data, WebAssembly, the staged platform's native
+ * libraries, grammar queries and other assets are copied unchanged, so module
+ * digests and the graph identity checks see the same files as before.
  *
- * TypeScript sources stay when the manifest can route an import to one, and the
- * `typescript` package stays whole because the compiler reads its own lib
- * declarations at run time.
+ * TypeScript sources stay whenever Bun could resolve an import to one. The
+ * `typescript` package stays whole: @opencode/codemode loads the compiler at run
+ * time, and keeping all of it avoids reasoning about which of its files it reads.
+ * License texts stay, including a root README when the package has no other one.
  */
 
 /** Manifest fields that select a run-time file. Condition values are walked recursively. */
@@ -26,6 +27,7 @@ const NATIVE_SOURCE = /\.(?:c|cc|cpp|cxx|h|hh|hpp|hxx)$/i
 const MARKDOWN = /\.(?:md|mdx|markdown)$/i
 // License and attribution texts are kept whatever their extension.
 const LEGAL = /^(?:licen[cs]e|notice|copying|copyright|authors|third[-_]?party)/i
+const README = /^readme(?:\.|$)/i
 // prebuildify/node-gyp-build layout: prebuilds/<platform>-<arch>[+<arch>...]/
 const PREBUILD = /^(aix|android|darwin|freebsd|linux|netbsd|openbsd|sunos|win32)-([a-z0-9]+(?:\+[a-z0-9]+)*)$/
 const TYPE_CONDITIONS = new Set(['types', 'typings'])
@@ -39,15 +41,28 @@ function* runtimeTargets(value: unknown, condition?: string): Generator<string> 
   }
 }
 
-/** A manifest that routes, or may route through an extensionless pattern, to a TypeScript file. */
+const routesToSource = (target: string) => TYPESCRIPT_SOURCE.test(target) && !DECLARATION.test(target)
+const leafOf = (target: string) => target.slice(target.lastIndexOf('/') + 1)
+
+/** Whether Bun could resolve an import of this package to a TypeScript file. */
 export function exposesTypeScript(manifest: StagedPackageManifest): boolean {
-  for (const field of [manifest.main, manifest.module, manifest.browser, manifest.bin, manifest.exports, manifest.imports]) {
+  // Without an entry field Bun falls back to index.* lookup, which includes index.ts.
+  if (manifest.exports === undefined && manifest.main === undefined && manifest.module === undefined) return true
+  // Legacy fields resolve extensionless targets by probing extensions and index files.
+  for (const field of [manifest.main, manifest.module, manifest.browser]) {
+    for (const target of runtimeTargets(field)) if (routesToSource(target) || !leafOf(target).includes('.')) return true
+  }
+  // Export and import maps resolve exactly; an extensionless pattern may still map to a source file.
+  for (const field of [manifest.exports, manifest.imports]) {
     for (const target of runtimeTargets(field)) {
-      const leaf = target.slice(target.lastIndexOf('/') + 1)
-      if ((TYPESCRIPT_SOURCE.test(target) && !DECLARATION.test(target)) || (leaf.includes('*') && !leaf.includes('.'))) return true
+      const leaf = leafOf(target)
+      if (routesToSource(target) || (leaf.includes('*') && !leaf.includes('.'))) return true
     }
   }
-  return false
+  // bin names are not conditions, and an extensionless bin is a script, not a module.
+  const bins = typeof manifest.bin === 'string' ? [manifest.bin]
+    : manifest.bin && typeof manifest.bin === 'object' ? Object.values(manifest.bin) : []
+  return bins.some(target => typeof target === 'string' && routesToSource(target))
 }
 
 function foreignPrebuild(directory: string, target: StagedTarget): boolean {
@@ -58,12 +73,15 @@ function foreignPrebuild(directory: string, target: StagedTarget): boolean {
 
 /**
  * Returns the copy predicate for one package. `relative` is the POSIX path inside
- * the package root; nested `node_modules` are staged separately and never reach it.
+ * the package root and `rootEntries` the names directly in it; nested
+ * `node_modules` are staged separately and never reach the predicate.
  */
-export function stagedPackageFilter(manifest: StagedPackageManifest, target: StagedTarget):
-  (relative: string, directory: boolean) => boolean {
+export function stagedPackageFilter(manifest: StagedPackageManifest, target: StagedTarget,
+  rootEntries: readonly string[]): (relative: string, directory: boolean) => boolean {
   if (manifest.name === 'typescript') return () => true
   const keepTypeScript = exposesTypeScript(manifest)
+  // Some packages carry their only license text in the README.
+  const readmeIsLicense = !rootEntries.some(name => LEGAL.test(name))
   return (relative, directory) => {
     const segments = relative.split('/')
     if (segments[0] === 'prebuilds' && segments.length >= 2 && foreignPrebuild(segments[1]!, target)) return false
@@ -71,6 +89,7 @@ export function stagedPackageFilter(manifest: StagedPackageManifest, target: Sta
     const name = segments[segments.length - 1]!
     if (DECLARATION.test(name) || SOURCE_MAP.test(name) || NATIVE_SOURCE.test(name)) return false
     if (TYPESCRIPT_SOURCE.test(name)) return keepTypeScript
-    return !MARKDOWN.test(name) || LEGAL.test(name)
+    if (!MARKDOWN.test(name) || LEGAL.test(name)) return true
+    return readmeIsLicense && segments.length === 1 && README.test(name)
   }
 }
