@@ -11,7 +11,7 @@ const reasons: Readonly<Record<string, (platform: string) => string>> = Object.f
   execution_containment_launcher_unsafe: () =>
     `The installed bubblewrap (/usr/bin/bwrap) is affected by CVE-2026-87766: sandbox setup can create files outside the sandbox. ${BWRAP_REQUIREMENT}.`,
   execution_containment_launcher_denied: () =>
-    `bubblewrap (/usr/bin/bwrap) could not create the OpenCode V2 sandbox. ${BWRAP_REQUIREMENT} and unprivileged user namespaces, which this system may disable or restrict (for example with AppArmor).`,
+    `bubblewrap (/usr/bin/bwrap) could not create the OpenCode V2 sandbox. ${BWRAP_REQUIREMENT} and unprivileged user namespaces. Ubuntu 23.10 and later restrict them with AppArmor unless /usr/bin/bwrap has a profile that allows userns.`,
   execution_containment_launcher_authority: () =>
     `/usr/bin/bwrap must be a regular file that is not setuid, setgid or writable by group or others. ${BWRAP_REQUIREMENT}.`,
 })
