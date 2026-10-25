@@ -5,6 +5,13 @@
       "version": "2.0.0",
       "qualifiedAt": "2026-10-10",
       "scope": "team-launch",
+      "platforms": [
+        "darwin-arm64",
+        "darwin-x64",
+        "linux-arm64",
+        "linux-x64",
+        "win32-x64"
+      ],
       "evidence": [
         {
           "kind": "pull-request",
@@ -20,6 +27,13 @@
       "version": "2.0.32",
       "qualifiedAt": "2026-10-18",
       "scope": "team-launch",
+      "platforms": [
+        "darwin-arm64",
+        "darwin-x64",
+        "linux-arm64",
+        "linux-x64",
+        "win32-x64"
+      ],
       "evidence": [
         {
           "kind": "pull-request",
@@ -35,6 +49,9 @@
       "version": "2.1.4",
       "qualifiedAt": "2026-10-25",
       "scope": "team-launch",
+      "platforms": [
+        "darwin-arm64"
+      ],
       "evidence": [
         {
           "kind": "e2e-report",

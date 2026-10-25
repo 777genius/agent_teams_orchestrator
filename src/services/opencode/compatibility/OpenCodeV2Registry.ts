@@ -7,16 +7,26 @@ import qualificationData from './opencode-v2-qualifications.json' with { type: '
  * - Recognition is a range rule: any exact stable release >=2.0.0 <3.0.0.
  * - A graph is the official `@opencode/server` and `@opencode/client` release
  *   of that exact version, installed under version-derived aliases.
- * - Launch additionally requires a qualification record with evidence
- *   (`opencode-v2-qualifications.json`). Recognition alone never admits a run.
+ * - Launch additionally requires a team-launch qualification record with
+ *   evidence for the running platform (`opencode-v2-qualifications.json`).
+ *   Recognition alone never admits a run.
  */
 export const OPENCODE_V2_SUPPORTED_RANGE = Object.freeze({ minimum: '2.0.0', below: '3.0.0' } as const)
 
 /** An exact recognized V2 release. Runtime values must pass `isOpenCodeV2Pin`. */
 export type OpenCodeV2Pin = `2.${number}.${number}`
 export type OpenCodeV2Dialect = `v2-${OpenCodeV2Pin}`
-/** Wire family: the range minimum keeps the original 2.0.0 HTTP surface. */
+/** Wire family: only the first V2 release keeps the original HTTP surface. */
 export type OpenCodeV2Wire = 'floor' | 'current'
+/** The one release with the original 2.0.0 HTTP surface (health/server identity,
+ * `continue`/`reply` fields, non-experimental instruction and MCP routes). Every
+ * later release uses the current surface. Independent of the supported range. */
+export const OPENCODE_V2_FLOOR_WIRE_VERSION = '2.0.0'
+/** Platforms a qualification record can name, keyed like the release assets (`<platform>-<arch>`). */
+export const OPENCODE_V2_RELEASE_PLATFORMS = ['darwin-arm64', 'darwin-x64', 'linux-arm64', 'linux-x64', 'win32-arm64', 'win32-x64'] as const
+export type OpenCodeV2ReleasePlatform = typeof OPENCODE_V2_RELEASE_PLATFORMS[number]
+/** The only scope that admits a team launch. */
+export const OPENCODE_V2_TEAM_LAUNCH_SCOPE = 'team-launch'
 export type OpenCodeV2VersionStatus = 'recognized' | 'too_old' | 'too_new' | 'unsupported'
 export type OpenCodeV2VersionClass =
   | Readonly<{ status: 'recognized'; version: OpenCodeV2Pin; dialect: OpenCodeV2Dialect }>
@@ -58,7 +68,7 @@ export function isOpenCodeV2Identity(version: unknown, dialect: unknown): versio
   return isOpenCodeV2Pin(version) && dialect === openCodeV2Dialect(version)
 }
 export function openCodeV2Wire(version: OpenCodeV2Pin): OpenCodeV2Wire {
-  return version === OPENCODE_V2_SUPPORTED_RANGE.minimum ? 'floor' : 'current'
+  return version === OPENCODE_V2_FLOOR_WIRE_VERSION ? 'floor' : 'current'
 }
 
 const GRAPH_ALIAS = /^@opencode\/(server|client)-v(.+)$/
@@ -92,7 +102,8 @@ export function openCodeV2StagedVersions(dependencies: Readonly<Record<string, u
 
 export type OpenCodeV2QualificationEvidence = Readonly<{ kind: string; ref: string }>
 export type OpenCodeV2Qualification = Readonly<{
-  version: OpenCodeV2Pin; qualifiedAt: string; scope: string; evidence: readonly OpenCodeV2QualificationEvidence[]
+  version: OpenCodeV2Pin; qualifiedAt: string; scope: string
+  platforms: readonly OpenCodeV2ReleasePlatform[]; evidence: readonly OpenCodeV2QualificationEvidence[]
 }>
 
 function loadQualifications(value: unknown): ReadonlyMap<OpenCodeV2Pin, OpenCodeV2Qualification> {
@@ -114,31 +125,46 @@ function loadQualifications(value: unknown): ReadonlyMap<OpenCodeV2Pin, OpenCode
       const proof = row(item)
       return Object.freeze({ kind: text(proof.kind), ref: text(proof.ref) })
     })
+    // A record names every platform its evidence covers; nothing is implied for the others.
+    const platforms = record.platforms
+    if (!Array.isArray(platforms) || platforms.length === 0 || new Set(platforms).size !== platforms.length ||
+      !platforms.every(platform => (OPENCODE_V2_RELEASE_PLATFORMS as readonly unknown[]).includes(platform))) invalid()
     records.set(version as OpenCodeV2Pin, Object.freeze({ version: version as OpenCodeV2Pin, qualifiedAt,
-      scope: text(record.scope), evidence: Object.freeze(evidence) }))
+      scope: text(record.scope), platforms: Object.freeze([...platforms as OpenCodeV2ReleasePlatform[]]),
+      evidence: Object.freeze(evidence) }))
   }
   return records
 }
 const qualifications = loadQualifications(qualificationData)
+const byVersion = (left: OpenCodeV2Pin, right: OpenCodeV2Pin) => compare(release(left)!, release(right)!)
 
 export function openCodeV2Qualification(version: OpenCodeV2Pin): OpenCodeV2Qualification | null {
   return qualifications.get(version) ?? null
 }
 export function openCodeV2QualifiedVersions(): readonly OpenCodeV2Pin[] {
-  return [...qualifications.keys()].sort((left, right) => compare(release(left)!, release(right)!))
+  return [...qualifications.keys()].sort(byVersion)
 }
-/** Published with each runtime release; the desktop pins this exact contract in its runtime lock. */
+export function openCodeV2CurrentPlatform(): string {
+  return `${process.platform}-${process.arch}`
+}
+/** Published with each runtime release; the desktop pins this exact contract in its runtime lock.
+ * `qualified` lists, per release platform, the versions admitted for team launch there. */
 export function openCodeV2ReleaseContract(): Readonly<{
-  range: typeof OPENCODE_V2_SUPPORTED_RANGE; qualified: readonly OpenCodeV2Pin[]
+  range: typeof OPENCODE_V2_SUPPORTED_RANGE; qualified: Readonly<Record<OpenCodeV2ReleasePlatform, readonly OpenCodeV2Pin[]>>
 }> {
-  return { range: { ...OPENCODE_V2_SUPPORTED_RANGE }, qualified: openCodeV2QualifiedVersions() }
+  const qualified = Object.fromEntries(OPENCODE_V2_RELEASE_PLATFORMS.map(platform => [platform,
+    [...qualifications.values()].filter(record => record.scope === OPENCODE_V2_TEAM_LAUNCH_SCOPE &&
+      record.platforms.includes(platform)).map(record => record.version).sort(byVersion)]))
+  return { range: { ...OPENCODE_V2_SUPPORTED_RANGE }, qualified: qualified as Record<OpenCodeV2ReleasePlatform, OpenCodeV2Pin[]> }
 }
 
 export type OpenCodeV2LaunchRefusal = 'opencode_v2_version_out_of_range' | 'opencode_v2_version_unqualified'
-/** Launch admission: in range and qualified. Returns the coded refusal, or null when admitted. */
-export function openCodeV2LaunchRefusal(version: unknown): OpenCodeV2LaunchRefusal | null {
+/** Launch admission: in range and qualified for team launch on this platform. Returns the coded refusal, or null. */
+export function openCodeV2LaunchRefusal(version: unknown, platform = openCodeV2CurrentPlatform()): OpenCodeV2LaunchRefusal | null {
   if (!isOpenCodeV2Pin(version)) return 'opencode_v2_version_out_of_range'
-  return qualifications.has(version) ? null : 'opencode_v2_version_unqualified'
+  const record = qualifications.get(version)
+  return record && record.scope === OPENCODE_V2_TEAM_LAUNCH_SCOPE &&
+    (record.platforms as readonly string[]).includes(platform) ? null : 'opencode_v2_version_unqualified'
 }
 export function assertOpenCodeV2Launchable(version: unknown): asserts version is OpenCodeV2Pin {
   const refusal = openCodeV2LaunchRefusal(version)

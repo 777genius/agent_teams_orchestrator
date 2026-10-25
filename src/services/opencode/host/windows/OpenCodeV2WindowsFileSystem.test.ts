@@ -1,4 +1,5 @@
 import { expect, spyOn, test } from 'bun:test'
+import { stagedOpenCodeV2Pins } from '../../compatibility/fixtures/stagedOpenCodeV2Pins.js'
 import filesystem, { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -6,7 +7,7 @@ import { pathToFileURL } from 'node:url'
 import { types } from 'node:util'
 import { readWindowsRealpathFailure, retainWindowsRealpathFailure } from './OpenCodeV2WindowsRealpath.js'
 
-for (const pin of ['2.0.0', '2.0.32'] as const)
+for (const pin of stagedOpenCodeV2Pins)
 test(`selected ${pin} filesystem replacement reaches direct and transitive consumers without changing refusal semantics`, async () => {
   const directory = path.dirname(Bun.resolveSync(`@opencode/server-v${pin}/options`, import.meta.dir))
   const load = <T>(specifier: string): Promise<T> => import(pathToFileURL(Bun.resolveSync(specifier, directory)).href)

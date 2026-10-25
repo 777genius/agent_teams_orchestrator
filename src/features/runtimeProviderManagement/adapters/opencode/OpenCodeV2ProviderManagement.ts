@@ -24,12 +24,17 @@ import type { OpenCodeExecutionProof } from '../../../../services/opencode/types
 import type { BridgeEnvelope } from '../../../../services/opencode/bridge/OpenCodeBridgeProtocol.js'
 import type { ConnectProviderInput, LoadProviderModelsInput, TestProviderModelInput, ProviderConnection, RuntimeProviderModel, RuntimeProviderModelsView, ProviderModelTestResult, ProviderManagementResult, ProviderSetupForm } from '../../domain/types.js'
 import { OPENCODE_V2_NATIVE_KEY_OPTION_ID, openCodeV2KeyIntegration, openCodeV2ProviderConnectionsDirectory } from '../../../../services/opencode/catalog/OpenCodeV2KeyIntegrations.js'
+import type { OpenCodeV2Pin } from '../../../../services/opencode/compatibility/OpenCodeV2Registry.js'
 
 const sourceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../../..')
 const text = (value: unknown): string => { executionAssert(typeof value === 'string' && value.length > 0, 'provider_response_invalid'); return value }
 const resultError = (code: 'auth-failed' | 'runtime-unhealthy' | 'unsupported-auth-method', message: string) => ({ ok: false as const, error: { code, message, recoverable: true } })
 export async function selectedProviderUsesOpenCodeV2(): Promise<boolean> {
-  return (await inspectOpenCodeReadSelection()).policy.generation === 'v2'
+  return (await selectedOpenCodeV2Version()) !== null
+}
+export async function selectedOpenCodeV2Version(): Promise<OpenCodeV2Pin | null> {
+  const { policy } = await inspectOpenCodeReadSelection()
+  return policy.generation === 'v2' ? policy.version : null
 }
 
 
@@ -110,7 +115,7 @@ export async function connectOpenCodeV2Provider(input: ConnectProviderInput): Pr
   const apiKey = input.apiKey?.trim()
   if (!apiKey) return resultError('auth-failed', 'API key is required.')
   if (input.metadata && Object.keys(input.metadata).length || input.authMethodIndex !== undefined && input.authMethodIndex !== null ||
-    input.authOptionId && input.authOptionId !== OPENCODE_V2_NATIVE_KEY_OPTION_ID)
+    input.authOptionId && !(input.authOptionId === OPENCODE_V2_NATIVE_KEY_OPTION_ID && openCodeV2KeyIntegration(input.providerId)))
     return resultError('unsupported-auth-method', 'This V2 source path requires the native key method without an additional setup form.')
   let retainUnknown = false, marker: string | undefined, acceptedProof: OpenCodeExecutionProof | undefined
   let phase = 'catalog-acquisition'
@@ -200,8 +205,8 @@ export async function connectOpenCodeV2Provider(input: ConnectProviderInput): Pr
 }
 
 /** The native key method form for a registered V2 key integration; null for every other provider. */
-export function buildOpenCodeV2KeySetupForm(providerId: string): ProviderSetupForm | null {
-  const integration = openCodeV2KeyIntegration(providerId)
+export function buildOpenCodeV2KeySetupForm(providerId: string, version: OpenCodeV2Pin): ProviderSetupForm | null {
+  const integration = openCodeV2KeyIntegration(providerId, version)
   if (!integration) return null
   const secret = { key: 'key' as const, label: 'API key', placeholder: null, required: true }
   return { runtimeId: 'opencode', providerId, displayName: integration.displayName, method: 'api', supported: true,

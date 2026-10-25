@@ -18,7 +18,8 @@ for (const pin of staged) test(`${pin} actual listener address retains exact loo
     return (yield* http.make(() => createServer(), { host: '127.0.0.1', port: 0 })).address
   })))
   expect(openCodeV2ServerLoopbackUrl(pin, address)).toMatch(/^http:\/\/127\.0\.0\.1:[1-9]\d*$/)
-  const other = staged.find(version => openCodeV2Wire(version) !== openCodeV2Wire(pin))!
+  const other = staged.find(version => openCodeV2Wire(version) !== openCodeV2Wire(pin))
+  if (!other) throw new Error('TEST requires a staged graph of each wire family')
   expect(() => openCodeV2ServerLoopbackUrl(other, address)).toThrow('execution_server_address_invalid')
   for (const port of [0, -1, 65536, 1.5, '1234'])
     expect(() => openCodeV2ServerLoopbackUrl(pin, { ...address, port })).toThrow('execution_server_address_invalid')

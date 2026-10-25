@@ -4,7 +4,7 @@ import path from 'node:path'
 import {
   assertOpenCodeV2Launchable, classifyOpenCodeV2Version, isOpenCodeV2Identity, openCodeV2Dialect,
   openCodeV2GraphPackages, openCodeV2LaunchRefusal, openCodeV2Qualification, openCodeV2QualifiedVersions,
-  openCodeV2StagedVersions, openCodeV2Wire, parseOpenCodeV2GraphAlias, type OpenCodeV2Pin,
+  openCodeV2ReleaseContract, openCodeV2StagedVersions, openCodeV2Wire, parseOpenCodeV2GraphAlias, type OpenCodeV2Pin,
 } from './OpenCodeV2Registry.js'
 import { validateRunLaunchPlan } from '../bridge/OpenCodeV2RunOwner.js'
 import type { RunLaunchPlan } from '../bridge/OpenCodeV2RunTypes.js'
@@ -46,8 +46,26 @@ test('existing 2.0.0 floor and 2.0.32 current identities are unchanged', () => {
   expect(openCodeV2Dialect('2.0.32')).toBe('v2-2.0.32')
   expect(openCodeV2Wire('2.0.0')).toBe('floor')
   expect(openCodeV2Wire('2.0.32')).toBe('current')
-  expect(openCodeV2LaunchRefusal('2.0.0')).toBeNull()
-  expect(openCodeV2LaunchRefusal('2.0.32')).toBeNull()
+  // Both keep every platform where V2 execution already ran.
+  for (const platform of ['darwin-arm64', 'darwin-x64', 'linux-x64', 'win32-x64']) {
+    expect(openCodeV2LaunchRefusal('2.0.0', platform)).toBeNull()
+    expect(openCodeV2LaunchRefusal('2.0.32', platform)).toBeNull()
+  }
+})
+
+test('qualification is per platform: a version is admitted only where its evidence ran', () => {
+  const record = openCodeV2Qualification('2.1.4')
+  expect(record?.platforms.length).toBeGreaterThan(0)
+  for (const platform of ['darwin-arm64', 'darwin-x64', 'linux-arm64', 'linux-x64', 'win32-arm64', 'win32-x64']) {
+    expect(openCodeV2LaunchRefusal('2.1.4', platform)).toBe(record?.platforms.includes(platform as never) ? null : 'opencode_v2_version_unqualified')
+  }
+  // The published contract lists, per platform, exactly the versions admitted there.
+  const contract = openCodeV2ReleaseContract()
+  for (const [platform, versions] of Object.entries(contract.qualified)) {
+    for (const version of openCodeV2QualifiedVersions()) {
+      expect(versions.includes(version)).toBe(openCodeV2LaunchRefusal(version, platform) === null)
+    }
+  }
 })
 
 test('staged graph aliases must name the official package at the same exact version, in pairs', () => {

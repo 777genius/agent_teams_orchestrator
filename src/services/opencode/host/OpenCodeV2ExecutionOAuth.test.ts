@@ -1,4 +1,5 @@
 import { expect, mock, test } from 'bun:test'
+import { stagedOpenCodeV2Pins } from '../compatibility/fixtures/stagedOpenCodeV2Pins.js'
 import { createHash } from 'node:crypto'
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
@@ -66,7 +67,7 @@ async function official(pin: '2.0.0' | '2.0.32') {
   return { graph, modulePath, effect, records }
 }
 
-for (const pin of ['2.0.0', '2.0.32'] as const) {
+for (const pin of stagedOpenCodeV2Pins) {
   test(`${pin}: official OAuth importer binds a fresh DB, preserves exact reuse and refuses recovery mismatches`, async () => {
     const f = await fixture(), native = await official(pin)
     try {

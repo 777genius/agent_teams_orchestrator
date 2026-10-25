@@ -1035,12 +1035,12 @@ export class OpenCodeInventoryService {
     }
     if (selection.path && selection.policy.generation !== 'v1') {
       // Passive V2 reads still list the native key integrations and their completed connections.
-      const v2 = selection.policy.generation === 'v2'
+      const v2 = selection.policy.generation === 'v2' ? selection.policy.version : null
       let connectedProviders: OpenCodeInventorySnapshot['connectedProviders'] = []
-      if (v2) { try { connectedProviders = await readOpenCodeV2ConnectedProviders(resolvedProjectPath) } catch { /* unknown is not connected */ } }
+      if (v2) { try { connectedProviders = await readOpenCodeV2ConnectedProviders(resolvedProjectPath, v2) } catch { /* unknown is not connected */ } }
       return {
         detected: true, binaryPath: selection.path, version: selection.policy.version, projectPath: resolvedProjectPath,
-        profile: null, connectedProviders, availableProviders: v2 ? openCodeV2KeyIntegrations().map(entry => entry.providerId) : [],
+        profile: null, connectedProviders, availableProviders: v2 ? openCodeV2KeyIntegrations(v2).map(entry => entry.providerId) : [],
         models: [], agents: [], authStorePath: null,
         probeError: 'This selected generation requires an explicit qualified V2 full catalog read.',
         diagnostics: ['capabilities_pending'], readGeneration: selection.policy.generation,

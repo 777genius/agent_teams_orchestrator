@@ -1,4 +1,5 @@
 import { expect, test } from 'bun:test'
+import { stagedOpenCodeV2Pins } from '../compatibility/fixtures/stagedOpenCodeV2Pins.js'
 import type { ExecutionAuthority, ExecutionContext } from '../execution/OpenCodeV2ExecutionContracts.js'
 import { createOpenCodeV2ExecutionClient } from './OpenCodeV2ExecutionClientFactory.js'
 
@@ -14,7 +15,7 @@ function persistedAuthority(pin: '2.0.0' | '2.0.32'): ExecutionAuthority {
 }
 const context: ExecutionContext = { teamId: 'TEST-team', runId: 'TEST-run', laneId: 'TEST-lane',
   memberId: 'TEST-member', deadline: Date.now() + 10_000 }
-for (const pin of ['2.0.0', '2.0.32'] as const) {
+for (const pin of stagedOpenCodeV2Pins) {
   test(`${pin} persisted authority cannot mint native endpoint/client/disposer authority`, async () => {
     const persisted = persistedAuthority(pin)
     await expect(createOpenCodeV2ExecutionClient(persisted, context)).rejects.toThrow('execution_lease_not_owned')

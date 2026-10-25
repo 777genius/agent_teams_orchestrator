@@ -1,14 +1,13 @@
 import { expect, test } from 'bun:test'
 import { executionCurrentOperations } from './OpenCodeV2ExecutionCurrentClient.js'
-import * as FloorClient from '@opencode/client-v2.0.0'
-import * as CurrentClient from '@opencode/client-v2.0.32'
+import { stagedOpenCodeV2Client, stagedOpenCodeV2Pins } from '../compatibility/fixtures/stagedOpenCodeV2Pins.js'
 import { executionFloorOperations } from './OpenCodeV2ExecutionFloorClient.js'
 import { OpenCodeV2ExecutionFetch } from './OpenCodeV2ExecutionFetch.js'
 
 const endpoint = 'http://127.0.0.1:32123'
 const sessionID = 'ses_TESTchronology'
 const cursor = Buffer.from(JSON.stringify({ id: 'msg_TESTcomment', order: 'asc', direction: 'next' })).toString('base64url')
-for (const pin of ['2.0.0', '2.0.32'] as const) {
+for (const pin of stagedOpenCodeV2Pins) {
   test(`${pin} official generated client requests ascending first page and follows cursor without order`, async () => {
     const requests: URL[] = []
     const wire = new OpenCodeV2ExecutionFetch(endpoint, pin, '/TEST/project', 'TEST-only-password',
@@ -30,7 +29,7 @@ for (const pin of ['2.0.0', '2.0.32'] as const) {
         return Response.json({ data: [], cursor: requests.length === 1 ? { next: cursor } : {} })
       })
     try {
-      const operations = pin === '2.0.0' ? executionFloorOperations(FloorClient, endpoint, '/TEST/project', wire, wire.fetch) : executionCurrentOperations(CurrentClient, endpoint, '/TEST/project', wire, wire.fetch)
+      const operations = pin === '2.0.0' ? executionFloorOperations(await stagedOpenCodeV2Client(pin), endpoint, '/TEST/project', wire, wire.fetch) : executionCurrentOperations(await stagedOpenCodeV2Client(pin), endpoint, '/TEST/project', wire, wire.fetch)
       await operations.messages(sessionID)
       await operations.messages(sessionID, cursor)
       expect(requests).toHaveLength(2)

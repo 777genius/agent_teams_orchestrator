@@ -1,13 +1,12 @@
 import { expect, test } from 'bun:test'
 import { executionCurrentOperations } from './OpenCodeV2ExecutionCurrentClient.js'
-import * as FloorClient from '@opencode/client-v2.0.0'
-import * as CurrentClient from '@opencode/client-v2.0.32'
+import { stagedOpenCodeV2Client, stagedOpenCodeV2Pins } from '../compatibility/fixtures/stagedOpenCodeV2Pins.js'
 import { executionFloorOperations } from './OpenCodeV2ExecutionFloorClient.js'
 import { OpenCodeV2ExecutionFetch } from './OpenCodeV2ExecutionFetch.js'
 
 // Exercise the installed generated SDK, including its HTTP-envelope decoding.
 // This controlled HTTP port mints no lease/endpoint or native admission authority.
-for (const pin of ['2.0.0', '2.0.32'] as const) {
+for (const pin of stagedOpenCodeV2Pins) {
   test(`${pin} exact execution adapter preserves each published finite response contract`, async () => {
     const base = 'http://127.0.0.1:31999', directory = '/TEST/project', id = 'ses_TESToriginal'
     const location = { directory }
@@ -19,7 +18,7 @@ for (const pin of ['2.0.0', '2.0.32'] as const) {
         { status, headers: { 'content-type': streaming ? 'text/event-stream' : 'application/json' } })
     }, { preconnect(): never { throw new Error('TEST preconnect unsupported') } })
     const wire = new OpenCodeV2ExecutionFetch(base, pin, directory, 'TEST-password', { deadline: Date.now() + 10_000 }, fetch)
-    const operations = pin === '2.0.0' ? executionFloorOperations(FloorClient, base, directory, wire, fetch) : executionCurrentOperations(CurrentClient, base, directory, wire, fetch)
+    const operations = pin === '2.0.0' ? executionFloorOperations(await stagedOpenCodeV2Client(pin), base, directory, wire, fetch) : executionCurrentOperations(await stagedOpenCodeV2Client(pin), base, directory, wire, fetch)
     const session = { id, directory, agent: 'TEST-agent', model: { providerID: 'TEST-provider', id: 'TEST-model', variant: 'default' }, time: { created: 1 } }
     const inbox = { id: 'msg_TESToriginal', sessionID: id, type: 'user', time: { created: 2 }, delivery: 'queue', payload: { text: 'TEST' } }
     const instruction = { key: 'test', value: { text: 'TEST' } }

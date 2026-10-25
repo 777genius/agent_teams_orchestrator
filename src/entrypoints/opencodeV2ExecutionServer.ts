@@ -54,7 +54,8 @@ function reportStartupFailure(reason: 'timeout' | 'failed', error?: unknown): vo
     'v2_compiled_runtime_unsupported', 'v2_execution_layout_unsupported', 'execution_profile_changed',
     'execution_graph_changed', 'execution_graph_incomplete', 'execution_graph_dependency_missing',
     'execution_containment_identity_mismatch', 'execution_realpath_unavailable', ...windowsRealpathInstallCauses,
-    'execution_timeout', 'execution_cancelled']
+    'execution_timeout', 'execution_cancelled', 'opencode_v2_version_out_of_range', 'opencode_v2_version_unqualified',
+    'opencode_v2_graph_unavailable']
   const cause = error instanceof Error && causes.includes(error.message) ? error.message : undefined
   const detail = error instanceof Error ? error as Error & { code?: unknown; syscall?: unknown; profileGuard?: unknown } : undefined
   const errno = ['EPERM', 'EACCES', 'ENOENT', 'ENOTDIR', 'EISDIR', 'EINVAL', 'UNKNOWN', 'EIO', 'ENOSYS'].find(value => value === detail?.code)

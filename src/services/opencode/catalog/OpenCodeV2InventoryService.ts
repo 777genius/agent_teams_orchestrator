@@ -14,7 +14,7 @@ export function openCodeV2InventorySnapshot(native: OpenCodeV2NativeIdentity, di
   connectedProviders: readonly OpenCodeConnectedProvider[] = []): OpenCodeInventorySnapshot {
   // The directory offers the native key integrations; completed V2 connections mark them connected.
   const availableProviders = [...new Set([...readStatus.providers.map(row => row.id),
-    ...openCodeV2KeyIntegrations().map(entry => entry.providerId)])]
+    ...openCodeV2KeyIntegrations(native.version).map(entry => entry.providerId)])]
   return { detected: true, binaryPath: native.executablePath, version: native.version, projectPath: directory,
     profile: null, authStorePath: null, connectedProviders: [...connectedProviders], availableProviders,
     models: readStatus.models.map(row => `${row.providerId}/${row.catalogId}`), modelMetadata: [],
@@ -82,6 +82,6 @@ export async function probeOpenCodeV2Inventory(native: OpenCodeV2NativeIdentity,
   }
   if (failure) status = emptyOpenCodeV2ReadStatus(native, directory)
   let connected: OpenCodeConnectedProvider[] = []
-  try { connected = await readOpenCodeV2ConnectedProviders(directory) } catch { /* Unknown receipts never display as connected. */ }
+  try { connected = await readOpenCodeV2ConnectedProviders(directory, native.version) } catch { /* Unknown receipts never display as connected. */ }
   return openCodeV2InventorySnapshot(native, directory, status, failure, connected)
 }

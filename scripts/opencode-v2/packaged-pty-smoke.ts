@@ -4,7 +4,8 @@ import { lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:f
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { isOpenCodeV2Pin, openCodeV2GraphPackages } from '../../src/services/opencode/compatibility/OpenCodeV2Registry.js'
+import { isOpenCodeV2Pin, openCodeV2GraphPackages, openCodeV2StagedVersions } from '../../src/services/opencode/compatibility/OpenCodeV2Registry.js'
+import runtimeManifest from '../../package.json' with { type: 'json' }
 
 type Exit = { exitCode: number; signal?: string | number }
 type Terminal = {
@@ -133,7 +134,10 @@ export async function main(deliveryArgument: string, receipt: string, expectedPl
     // Exercise every graph the bundle staged, as recorded by its own staging manifest.
     const staged = JSON.parse(await readFile(path.join(bundle, 'opencode-v2-graphs.json'), 'utf8')) as {
       schema: number; graphs: { version: string; server: string }[]; pty: string }
-    assert(staged.schema === 2 && Array.isArray(staged.graphs) && staged.graphs.length > 0 && typeof staged.pty === 'string', 'Staged graph manifest invalid')
+    assert(staged.schema === 2 && Array.isArray(staged.graphs) && typeof staged.pty === 'string', 'Staged graph manifest invalid')
+    // The artifact must ship exactly the graphs and PTY pin this source manifest stages.
+    assert.deepEqual(staged.graphs.map(graph => graph.version), [...openCodeV2StagedVersions(runtimeManifest.dependencies)], 'Staged graph set changed')
+    assert.equal(staged.pty, runtimeManifest.overrides['bun-pty'], 'Staged PTY pin changed')
     for (const { version: pin, server: alias } of staged.graphs) {
       assert(isOpenCodeV2Pin(pin) && alias === openCodeV2GraphPackages(pin).server, 'Staged graph manifest invalid')
       const server = await physical(Bun.resolveSync(`${alias}/process`, bundle), bundle)

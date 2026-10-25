@@ -1,4 +1,5 @@
 import { openCodeBunVersion } from '../../../constants/openCodeBunVersion.js'
+import { assertOpenCodeV2Launchable } from '../compatibility/OpenCodeV2Registry.js'
 import { resolveOpenCodeV2ExecutionProbe } from './OpenCodeV2ExecutionProbe.js'
 import { parseOpenCodeExecutionProof } from '../OpenCodeExecutionProof.js'
 import type { OpenCodePreparedProfile } from '../types.js'
@@ -135,6 +136,8 @@ export async function inspectOpenCodeV2SourceAvailability(envelope: BridgeEnvelo
 
 /** Reuse only this command's selection; installed bytes are still verified afresh. */
 async function prepareSelectedOpenCodeV2SourceAvailability(selection: Awaited<ReturnType<typeof inspectOpenCodeV2LaunchSelection>>) {
+  // Version admission precedes graph resolution, so an unqualified release is refused as such.
+  assertOpenCodeV2Launchable(selection.native.version)
   const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'execution')
   const receipt = await createOpenCodeV2ExecutionReceipt(delivery.root, selection.native, selection.controller)
   const config = selection.controller
