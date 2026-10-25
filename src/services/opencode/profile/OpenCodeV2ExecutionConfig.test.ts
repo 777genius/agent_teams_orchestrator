@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
+import { readdir, readFile } from 'node:fs/promises'
+import path from 'node:path'
 import { createOpenCodeV2ExecutionConfig, type ExecutionConfigInput } from './OpenCodeV2ExecutionConfig.js'
 
 function input(pin: '2.0.0' | '2.0.32'): ExecutionConfigInput {
@@ -128,4 +130,40 @@ test('V2 teammates never get more than V1 teammates in auto approval mode', asyn
     const last = rules.findLast(rule => rule.action === action || rule.action === '*')
     expect([action, last?.effect]).toEqual([action, 'deny'])
   }
+})
+
+test('V2 code mode reaches only tools the V1-parity rules allow, under every staged official evaluator', async () => {
+  const { OPENCODE_V2_TEAMMATE_PERMISSIONS: rules } = await import('./OpenCodeV2ExecutionConfig.js')
+  for (const version of ['2.0.0', '2.0.32', '2.1.4']) {
+    const server = path.dirname(Bun.resolveSync(`@opencode/server-v${version}/package.json`, import.meta.dir))
+    const { Permission } = await import(Bun.resolveSync('@opencode/core/permission', server))
+    const effect = (action: string, resource = '*') => [version, action, Permission.evaluate(action, resource, rules).effect]
+    // Code mode is on: `execute` is not wholly denied.
+    expect(effect('execute')).toEqual([version, 'execute', 'allow'])
+    // A tool enters the code-mode inventory only when the rules do not wholly deny it,
+    // so a project's own MCP servers stay out.
+    for (const foreign of ['github_create_issue', 'filesystem_read_file', 'TEST-server_run']) expect(effect(foreign)).toEqual([version, foreign, 'deny'])
+    // Every call made from code mode asserts its own action: what V1 auto denies stays denied.
+    for (const [action, resource] of [['webfetch', 'https://example.invalid'], ['websearch', 'TEST'], ['skill', 'TEST'],
+      ['subagent', 'general'], ['external_directory', '/etc/*'], ['question', '*'], ['doom_loop', '*']]) {
+      expect(effect(action, resource)).toEqual([version, action, 'deny'])
+    }
+    for (const [action, resource] of [['agent-teams_message_send', '*'], ['agent_teams_task_complete', '*'],
+      ['shell', 'git status'], ['edit', '/TEST/project/file.txt'], ['read', '/TEST/project/file.txt']]) {
+      expect(effect(action, resource)).toEqual([version, action, 'allow'])
+    }
+  }
+})
+
+// Pins the routing the rule above relies on, for the qualified 2.1.4 core: code mode lists only
+// tools the rules do not wholly deny, and an MCP tool asserts `${server}_${tool}` when called.
+test('qualified 2.1.4 core routes code mode through each tool permission', async () => {
+  const server = path.dirname(Bun.resolveSync('@opencode/server-v2.1.4/package.json', import.meta.dir))
+  const chunks = path.join(path.dirname(Bun.resolveSync('@opencode/core/permission', server)), 'chunks')
+  const source = (await Promise.all((await readdir(chunks)).filter(name => name.endsWith('.js'))
+    .map(name => readFile(path.join(chunks, name), 'utf8')))).join('\n')
+  expect(source).toMatch(/if \(whollyDisabled\(tool\.options\?\.permission \?\? name, rules\)\)\s*continue;/)
+  expect(source).toMatch(/const codeModeEnabled = !whollyDisabled\("execute", rules\);/)
+  expect(source).toMatch(/codeModeTools = new Map\(Array\.from\(active\)\.filter/)
+  expect(source).toMatch(/permission\.assert\(\{\s*action: \w+\(tool\.server, tool\.name\),/)
 })
