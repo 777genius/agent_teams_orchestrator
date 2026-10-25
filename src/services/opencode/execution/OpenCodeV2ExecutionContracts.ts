@@ -98,8 +98,12 @@ export function assertExecutionSelectedModel(model: ExecutionSelectedModel): voi
   if (Object.hasOwn(model, 'variant')) executionAssert(typeof model.variant === 'string' &&
     model.variant.length > 0 && Buffer.byteLength(model.variant) <= 4096 && !model.variant.includes('\0'), 'invalid_model')
 }
+/** App message IDs can be long: a still-stuck work-sync nudge carries two SHA-256 agendas and a
+ * timestamp (224 chars). The native input ID is a hash, so this bound only limits record size. */
+export const INTENT_IDENTITY_MAX_LENGTH = 512
 export function assertIntentIdentity(identity: IntentIdentity): void {
   executionAssert(Object.keys(identity).sort().join(',') === 'deliveryAttemptId,localMessageId,nativeInputID,requestId')
-  executionAssert([identity.requestId, identity.deliveryAttemptId, identity.localMessageId].every(x => typeof x === 'string' && x.length > 0 && x.length <= 200))
+  executionAssert([identity.requestId, identity.deliveryAttemptId, identity.localMessageId].every(x => typeof x === 'string' && x.length > 0 &&
+    x.length <= INTENT_IDENTITY_MAX_LENGTH), 'intent_identity_invalid')
   executionAssert(/^msg_[a-zA-Z0-9]+$/.test(identity.nativeInputID))
 }

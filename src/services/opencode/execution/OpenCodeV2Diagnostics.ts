@@ -307,7 +307,7 @@ const privateProviderFailureCodes = new Set(['provider_missing', 'provider_key_m
   'provider_rollback_publication_changed', 'provider_rollback_unknown', 'provider_rollback_publication_unknown',
   'execution_spawn_failed', 'execution_child_exited', 'execution_prepare_timeout', 'execution_prepare_aborted',
   'execution_retired_before_start', 'execution_platform_unsupported', 'execution_environment_injection', 'execution_ipc_unavailable',
-  'execution_profile_not_private',
+  'execution_profile_not_private', 'intent_identity_invalid',
   'run_control_timeout', 'run_control_disconnected', 'run_control_changed', 'run_control_foreign', 'run_control_invalid',
   'run_control_frame_too_large', 'run_owner_stale', 'run_process_unknown', 'run_process_changed',
   'run_control_client_budget_exhausted', 'run_control_connect_busy_timeout_expired',

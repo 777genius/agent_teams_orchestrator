@@ -25,3 +25,17 @@ test('existing birth domains remain distinct from Windows FILETIME', () => {
   ] satisfies ExecutionBirth[]) expect(() => assertExecutionAuthority(authority(birth))).not.toThrow()
   expect(() => assertExecutionAuthority(authority({ format: 'win32-filetime' as ExecutionBirth['format'], value: '42', bootId: null }))).toThrow('execution_contract_invalid')
 })
+
+test('delivery identity accepts the app’s long work-sync nudge IDs and still bounds record size', async () => {
+  const { assertIntentIdentity, INTENT_IDENTITY_MAX_LENGTH } = await import('./OpenCodeV2ExecutionContracts.js')
+  // A still-stuck work-sync nudge: two SHA-256 agendas and a timestamp, over the former 200 bound.
+  const nudge = `member-work-sync:TEST-team:alice:agenda-sync-still-stuck:agenda:v1:${'e'.repeat(64)}:${'9'.repeat(64)}:2026-10-25T15:30:00.000Z`
+  expect(nudge.length).toBeGreaterThan(200)
+  const identity = { requestId: nudge, deliveryAttemptId: nudge, localMessageId: nudge, nativeInputID: 'msg_TEST0123' }
+  expect(() => assertIntentIdentity(identity)).not.toThrow()
+  const tooLong = 'x'.repeat(INTENT_IDENTITY_MAX_LENGTH + 1)
+  for (const key of ['requestId', 'deliveryAttemptId', 'localMessageId'] as const) {
+    expect(() => assertIntentIdentity({ ...identity, [key]: tooLong })).toThrow('intent_identity_invalid')
+    expect(() => assertIntentIdentity({ ...identity, [key]: '' })).toThrow('intent_identity_invalid')
+  }
+})
