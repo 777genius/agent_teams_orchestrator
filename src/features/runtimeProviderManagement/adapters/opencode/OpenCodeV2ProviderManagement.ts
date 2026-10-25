@@ -11,6 +11,7 @@ import { getOpenCodeV2DeclaredInputModalities } from '../../../../services/openc
 import { inspectOpenCodeReadSelection } from '../../../../services/opencode/compatibility/OpenCodeNativeIdentity.js'
 import { canonicalizeOpenCodeProjectPath, resolveOpenCodeV2CatalogProfileScope, materializeOpenCodeV2CatalogScope } from '../../../../services/opencode/OpenCodeProfileManager.js'
 import { resolveClaudeMultimodelPaths } from '../../../../services/opencode/OpenCodeManagedPaths.js'
+import { ensureWindowsPrivateDirectories } from '../../../../services/opencode/profile/OpenCodePrivateDirectories.js'
 import { createOpenCodeV2ExecutionReceipt } from '../../../../services/opencode/profile/OpenCodeV2ExecutionReceipt.js'
 import { acquireOpenCodeV2CatalogLease, requireExecutionEndpoint, registerExecutionDisposer } from '../../../../services/opencode/host/OpenCodeV2ExecutionHost.js'
 import type { CatalogExecutionProfile } from '../../../../services/opencode/host/OpenCodeV2ExecutionBinding.js'
@@ -47,10 +48,25 @@ async function catalog<T>(input: { providerId: string; projectPath?: string | nu
   const selected = await inspectOpenCodeReadSelection(); executionAssert(selected.native && selected.policy.generation === 'v2', 'provider_v2_required')
   const project = await canonicalizeOpenCodeProjectPath(input.projectPath)
   const scope = await resolveOpenCodeV2CatalogProfileScope({ projectPath: project, providerId: input.providerId })
-  const parent = path.join(resolveClaudeMultimodelPaths().data, 'opencode/v2/provider-profiles'); await mkdir(parent, { recursive: true, mode: 0o700 })
-  const root = await realpath(await mkdtemp(path.join(parent, 'catalog-')))
-  for (const name of ['home', 'config', 'data', 'cache', 'state', 'tmp', 'appdata', 'localappdata']) await mkdir(path.join(root, name), { mode: 0o700 })
-  const directory = path.join(root, 'config/opencode'), data = path.join(root, 'data/opencode'); await mkdir(directory, { mode: 0o700 }); await mkdir(data, { mode: 0o700 })
+  const managed = resolveClaudeMultimodelPaths().data, parent = path.join(managed, 'opencode/v2/provider-profiles')
+  const names = ['home', 'config', 'data', 'cache', 'state', 'tmp', 'appdata', 'localappdata']
+  let root: string
+  if (process.platform === 'win32') {
+    // A default mkdir leaves the creator token's default owner (Administrators
+    // for an elevated or UAC-less admin) on the shared V2 namespace, and every
+    // later private V2 store refuses it. Create the namespace and this profile
+    // with the private owner and DACL the execution host requires.
+    await ensureWindowsPrivateDirectories([managed, path.join(managed, 'opencode'), path.join(managed, 'opencode', 'v2'), parent])
+    root = path.join(await realpath(parent), `catalog-${randomUUID()}`)
+    await ensureWindowsPrivateDirectories([root, ...names.map(name => path.join(root, name)),
+      path.join(root, 'config', 'opencode'), path.join(root, 'data', 'opencode')], [root])
+  } else {
+    await mkdir(parent, { recursive: true, mode: 0o700 })
+    root = await realpath(await mkdtemp(path.join(parent, 'catalog-')))
+    for (const name of names) await mkdir(path.join(root, name), { mode: 0o700 })
+  }
+  const directory = path.join(root, 'config/opencode'), data = path.join(root, 'data/opencode')
+  if (process.platform !== 'win32') { await mkdir(directory, { mode: 0o700 }); await mkdir(data, { mode: 0o700 }) }
   const imported = await materializeOpenCodeV2CatalogScope(scope, project, path.join(data, 'auth.json'))
   const provider = { ...(imported.provider.package ? { package: imported.provider.package } : {}),
     ...(imported.provider.baseURL ? { settings: { baseURL: imported.provider.baseURL } } : {}), ...(imported.provider.models ? { models: imported.provider.models } : {}) }
@@ -129,7 +145,10 @@ export async function connectOpenCodeV2Provider(input: ConnectProviderInput): Pr
       executionAssert(Array.isArray(before.methods) && before.methods.some(value => executionRecord(value).type === 'key' && executionRecord(value).form === undefined), 'provider_key_method_unsupported')
       const previous = await readOpenCodeAuthCredential({ authPath: owner.authPath, providerId: input.providerId })
       const published = { type: 'api' as const, key: apiKey }
-      const directory = openCodeV2ProviderConnectionsDirectory(); await mkdir(directory, { recursive: true, mode: 0o700 })
+      const directory = openCodeV2ProviderConnectionsDirectory()
+      // Missing V2 ancestors are created privately on Windows, never with a default owner.
+      if (process.platform === 'win32') await ensureWindowsPrivateDirectories([directory])
+      else await mkdir(directory, { recursive: true, mode: 0o700 })
       marker = path.join(directory, executionHash({ project: owner.authority.directory, provider: input.providerId, key: apiKey }) + '.json')
       try {
         const stat = await lstat(marker); executionAssert(stat.isFile() && !stat.isSymbolicLink() && stat.uid === process.getuid?.() && (stat.mode & 0o077) === 0 && stat.size < 64 * 1024, 'provider_intent_foreign')
