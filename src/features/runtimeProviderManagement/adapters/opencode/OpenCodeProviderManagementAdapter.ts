@@ -148,6 +148,7 @@ type OpenCodeInventoryServiceLike = {
     options?: Parameters<typeof openCodeInventoryService.probe>[1],
   ): ReturnType<typeof openCodeInventoryService.probe>
   clearCache?(): void
+  seedModelsCache?: typeof openCodeInventoryService.seedModelsCache
 }
 
 type OpenCodeHostManagerLike = Pick<typeof openCodeHostManager, 'ensureHost' | 'releaseHost'> &
@@ -3850,6 +3851,8 @@ export class OpenCodeProviderManagementAdapter
       catalogFailureSanitization?: boolean
       catalogProviderId?: string
       progress?: OpenCodeInventoryProbeProgressTracker
+      /** Seed OpenCode's shared Models.dev cache before the host serves a model catalog. */
+      seedModelsCache?: boolean
     } = {},
   ): Promise<ProviderManagementResult<T>> {
     if (runtimeId !== 'opencode') {
@@ -3888,6 +3891,14 @@ export class OpenCodeProviderManagementAdapter
       }
       if (inventory.readGeneration !== undefined && inventory.readGeneration !== 'v1') {
         return providerManagementError('runtime-unhealthy', 'Selected OpenCode generation is not supported for this action')
+      }
+      if (options.seedModelsCache && inventoryService.seedModelsCache) {
+        const leaveSeedStep = options.progress?.enterStep('seed OpenCode Models.dev cache')
+        await inventoryService.seedModelsCache(inventory, {
+          abortSignal: options.abortSignal,
+          progress: options.progress,
+        })
+        leaveSeedStep?.()
       }
       const leaveHostStep = options.progress?.enterStep('ensure managed catalog host')
       host = await hostManager.ensureHost({
@@ -4664,6 +4675,7 @@ export class OpenCodeProviderManagementAdapter
         catalogFailureSanitization: true,
         catalogProviderId: providerId,
         progress,
+        seedModelsCache: true,
       },
     )
     let timeout: ReturnType<typeof setTimeout> | undefined
