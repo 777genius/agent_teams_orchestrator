@@ -3,10 +3,12 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { chmod, cp, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
-import type { ConfigEntry as FloorEntry } from '@opencode/client-v2-floor'
+import type { ConfigEntry as FloorEntry } from '@opencode/client-v2.0.0'
 import type { ConfigEntry as CurrentEntry } from '@opencode/client'
 import { privateOpenCodeReadEnvironment } from '../../src/services/opencode/profile/OpenCodeV2ManagedConfig.js'
 import { readRecord } from '../../src/services/opencode/catalog/OpenCodeV2ReadStatus.js'
+import { openCodeV2GraphPackages, openCodeV2StagedVersions, type OpenCodeV2Pin } from '../../src/services/opencode/compatibility/OpenCodeV2Registry.js'
+import runtimeManifest from '../../package.json' with { type: 'json' }
 
 const workspace = path.resolve(import.meta.dir, '../..')
 
@@ -39,7 +41,15 @@ for (const pin of ['2.0.0', '2.0.32'] as const) test(`sourceless production wrap
     })
     expect(await lstat(path.join(installation, 'src')).then(() => true, () => false)).toBe(false)
     const graphRoot = path.join(installation, 'dist/local-cli')
-    for (const specifier of ['@opencode/server/process', '@opencode/server-v2-floor/process', '@opencode/client', '@opencode/client-v2-floor']) {
+    // Every graph the build staged, as recorded by its own staging manifest.
+    const staged = (JSON.parse(await readFile(path.join(graphRoot, 'opencode-v2-graphs.json'), 'utf8')) as {
+      graphs: { version: OpenCodeV2Pin; server: string; client: string }[] }).graphs
+    expect(staged.map(graph => graph.version)).toEqual([...openCodeV2StagedVersions(runtimeManifest.dependencies)])
+    expect(staged.map(graph => graph.version)).toContain(pin)
+    for (const specifier of staged.flatMap(graph => {
+      expect(graph).toMatchObject(openCodeV2GraphPackages(graph.version))
+      return [`${graph.server}/process`, graph.client]
+    })) {
       const resolved = await realpath(Bun.resolveSync(specifier, graphRoot))
       expect(resolved.startsWith(graphRoot + path.sep)).toBe(true)
     }

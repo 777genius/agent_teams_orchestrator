@@ -1,5 +1,6 @@
 import { cp, lstat, mkdir, readFile, realpath } from 'node:fs/promises'
 import path from 'node:path'
+import { openCodeV2GraphPackages, openCodeV2StagedVersions } from '../../src/services/opencode/compatibility/OpenCodeV2Registry.js'
 
 type PackageMetadata = {
   name: string
@@ -9,8 +10,6 @@ type PackageMetadata = {
   peerDependencies?: Record<string, string>
 }
 
-export const pins = ['@opencode/server-v2-floor', '@opencode/server'] as const
-
 async function metadata(root: string): Promise<PackageMetadata> {
   const value: unknown = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8'))
   if (!value || typeof value !== 'object' || !('name' in value) || typeof value.name !== 'string'
@@ -18,8 +17,14 @@ async function metadata(root: string): Promise<PackageMetadata> {
   return value as PackageMetadata
 }
 
+/** Server graph aliases staged by this install manifest; derived, never listed. */
+export async function stagedServerAliases(sourceRoot: string): Promise<string[]> {
+  const manifest = await metadata(sourceRoot)
+  return openCodeV2StagedVersions(manifest.dependencies ?? {}).map(version => openCodeV2GraphPackages(version).server)
+}
+
 // Match Node/Bun's package lookup before reading exports. Package roots are not
-// necessarily exported, and the floor alias's manifest has its official name.
+// necessarily exported, and an alias's manifest has its official name.
 export async function packageRoot(name: string, from: string): Promise<string | null> {
   if (!/^(?:@[a-z0-9._-]+\/)?[a-z0-9._-]+$/i.test(name)) throw new Error('Invalid dependency name')
   let directory = from
@@ -79,7 +84,7 @@ async function nestBinder(source: string, target: string): Promise<void> {
 
 if (import.meta.main) {
   const sourceRoot = await realpath(path.join(import.meta.dir, '..', '..'))
-  for (const server of pins) {
+  for (const server of await stagedServerAliases(sourceRoot)) {
     const root = await packageRoot(server, sourceRoot)
     if (!root) throw new Error(`Missing selected package ${server}`)
     const graphEffect = await packageRoot('effect', root)

@@ -12,6 +12,7 @@ import { assertExecutionSelectedModel, executionHash, type SessionAuthority } fr
 import { OpenCodeV2ExecutionFetch, rejectExecutionBeforeInvocation } from '../transport/OpenCodeV2ExecutionFetch.js'
 import { executionFloorOperations } from '../transport/OpenCodeV2ExecutionFloorClient.js'
 import { executionCurrentOperations } from '../transport/OpenCodeV2ExecutionCurrentClient.js'
+import { launchableStagedOpenCodeV2Pins, stagedOpenCodeV2Client } from '../compatibility/fixtures/stagedOpenCodeV2Pins.js'
 
 const authority: SessionAuthority = {
   host: { generation: 'v2', pin: '2.0.32', dialect: 'v2-2.0.32', graphSha256: '1'.repeat(64),
@@ -163,7 +164,7 @@ describe('durable V2 admission ownership', () => {
   })
   // Red if selection construction drops variant, if create loses it, or if
   // variant-only native drift reaches prompt mutation through readback.
-  for (const pin of ['2.0.0', '2.0.32'] as const) {
+  for (const pin of launchableStagedOpenCodeV2Pins) {
     // Real generated adapters must preserve variant in both wire directions;
     // a service-only fake cannot detect dialect mapping silently dropping it.
     test(`${pin} generated create/get roundtrip preserves variant on the wire`, async () => {
@@ -176,7 +177,7 @@ describe('durable V2 admission ownership', () => {
           return new Response(JSON.stringify({ data: { id: authority.sessionID, location: { directory: authority.host.directory },
             agent: authority.agent, model, time: { created: 1 } } }), { headers: { 'content-type': 'application/json' } })
         })
-      const operations = (pin === '2.0.0' ? executionFloorOperations : executionCurrentOperations)(endpoint, authority.host.directory, wire, wire.fetch)
+      const operations = pin === '2.0.0' ? executionFloorOperations(await stagedOpenCodeV2Client(pin), endpoint, authority.host.directory, wire, wire.fetch) : executionCurrentOperations(await stagedOpenCodeV2Client(pin), endpoint, authority.host.directory, wire, wire.fetch)
       try {
         expect(await operations.create({ sessionID: authority.sessionID, agent: authority.agent, model })).toMatchObject({ model })
         expect(await operations.get(authority.sessionID)).toMatchObject({ model })

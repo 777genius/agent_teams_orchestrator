@@ -4,8 +4,12 @@ import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { verifyOpenCodeV2ServerGraph } from '../../src/services/opencode/host/OpenCodeV2ServerGraph.js'
 import { openCodeV2ServerLoopbackUrl } from '../../src/services/opencode/host/OpenCodeV2ServerAddress.js'
+import { openCodeV2StagedVersions, openCodeV2Wire } from '../../src/services/opencode/compatibility/OpenCodeV2Registry.js'
+import manifest from '../../package.json' with { type: 'json' }
 
-for (const pin of ['2.0.0', '2.0.32'] as const) test(`${pin} actual listener address retains exact loopback authority`, async () => {
+const staged = openCodeV2StagedVersions(manifest.dependencies)
+
+for (const pin of staged) test(`${pin} actual listener address retains exact loopback authority`, async () => {
   const graph = await verifyOpenCodeV2ServerGraph(pin)
   const { Effect }: typeof import('effect') = await import(pathToFileURL(graph.effectPath).href)
   const entry = Bun.resolveSync('@effect/platform-node/NodeHttpServer', path.dirname(graph.modulePath))
@@ -14,7 +18,8 @@ for (const pin of ['2.0.0', '2.0.32'] as const) test(`${pin} actual listener add
     return (yield* http.make(() => createServer(), { host: '127.0.0.1', port: 0 })).address
   })))
   expect(openCodeV2ServerLoopbackUrl(pin, address)).toMatch(/^http:\/\/127\.0\.0\.1:[1-9]\d*$/)
-  const other = pin === '2.0.0' ? '2.0.32' : '2.0.0'
+  const other = staged.find(version => openCodeV2Wire(version) !== openCodeV2Wire(pin))
+  if (!other) throw new Error('TEST requires a staged graph of each wire family')
   expect(() => openCodeV2ServerLoopbackUrl(other, address)).toThrow('execution_server_address_invalid')
   for (const port of [0, -1, 65536, 1.5, '1234'])
     expect(() => openCodeV2ServerLoopbackUrl(pin, { ...address, port })).toThrow('execution_server_address_invalid')

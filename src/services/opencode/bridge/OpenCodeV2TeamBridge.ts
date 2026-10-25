@@ -13,6 +13,7 @@ import { createOpenCodeV2LaunchPlan, inspectOpenCodeV2SourceAvailability } from 
 import { createBridgeServerIdentity } from '../OpenCodeBridgeCommandHandler.js'
 import { SUPPORTED_COMMANDS } from './OpenCodeBridgeProtocol.js'
 import { createHash } from 'node:crypto'
+import { openCodeV2LaunchRefusal } from '../compatibility/OpenCodeV2Registry.js'
 import type { QueueIntent } from '../execution/OpenCodeV2AdmissionService.js'
 import { assertIntentIdentity, executionAssert, executionHash } from '../execution/OpenCodeV2ExecutionContracts.js'
 import { resolveClaudeMultimodelPaths } from '../OpenCodeManagedPaths.js'
@@ -248,7 +249,7 @@ export function openCodeV2SupportedSourcePredicate(status: Extract<RunControlRes
   try { classifyOpenCodeV2ExecutionDelivery(import.meta.url) } catch { return false }
   return isExecutionPlatformAvailable() && process.versions.bun === openCodeBunVersion() &&
     status.qualification !== undefined && status.state === 'active' && status.deadline > Date.now() && status.members.length > 0 &&
-    status.members.every(member => ['2.0.0', '2.0.32'].includes(member.pin) && member.state === 'accepted' &&
+    status.members.every(member => openCodeV2LaunchRefusal(member.pin) === null && member.state === 'accepted' &&
       member.originalSessionId === member.opencodeSessionId && member.originalSessionId === member.runtimeSessionId &&
       member.bootstrap?.verified === true && member.bootstrap.strategy === 'instruction-entry' &&
       member.bootstrap.missingNativeMessageID === true && member.controllerTools?.server === 'agent-teams' &&
@@ -470,7 +471,7 @@ async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: O
         const member = await bridge.resolveMember(memberId, text(body.laneId), text(body.runtimeSessionId ?? body.sessionId), remaining())
         if (envelope.command === 'opencode.getRuntimeTranscript') {
           executionAssert(
-            ['2.0.0', '2.0.32'].includes(member.pin) && originalStatus?.qualification?.version === member.pin,
+            openCodeV2LaunchRefusal(member.pin) === null && originalStatus?.qualification?.version === member.pin,
             'v2_transcript_version_unsupported')
           const window = body.messageLimit
           executionAssert(window === undefined || (typeof window === 'number' && Number.isSafeInteger(window) && window > 0),

@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import type { SessionMessageAssistant as CurrentAssistant, SessionMessageUser as CurrentUser } from '@opencode/client'
-import type { SessionMessageAssistant as FloorAssistant, SessionMessageUser as FloorUser } from '@opencode/client-v2-floor'
+import type { SessionMessageAssistant as FloorAssistant, SessionMessageUser as FloorUser } from '@opencode/client-v2.0.0'
 import { normalizeV2Transcript } from './OpenCodeV2TranscriptProjection.js'
 import type { ExecutionLog, ExecutionMessage, ExecutionMessagePage } from '../transport/OpenCodeV2ExecutionClientFactory.js'
 

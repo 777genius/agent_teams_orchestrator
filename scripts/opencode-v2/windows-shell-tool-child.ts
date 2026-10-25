@@ -91,8 +91,8 @@ async function execute(input: Record<string, unknown>): Promise<void> {
     assert.equal(graph.moduleSha256, input.moduleSha256)
     async function selected<T>(specifier: string, packageName: string): Promise<T> {
       const entry = await filesystem.realpath(Bun.resolveSync(specifier, path.dirname(graph.modulePath)))
-      await verifyOpenCodePackage(entry, packageName, packageName.startsWith('@effect/') ? '4.0.1' : '2.0.32')
-      await verifyOpenCodeV2GraphEffect(entry, graph.effectPath, '2.0.32')
+      await verifyOpenCodePackage(entry, packageName, packageName.startsWith('@effect/') ? graph.effectVersion : '2.0.32')
+      await verifyOpenCodeV2GraphEffect(entry, graph.effectPath, graph.effectVersion)
       return import(pathToFileURL(entry).href) as Promise<T>
     }
     const effect: typeof import('effect') = await import(pathToFileURL(graph.effectPath).href)

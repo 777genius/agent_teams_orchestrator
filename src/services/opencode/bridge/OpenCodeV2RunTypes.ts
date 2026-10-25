@@ -3,6 +3,7 @@ import type { ControllerToolProof } from './OpenCodeV2ControllerTools.js'
 import type { QueueIntent } from '../execution/OpenCodeV2AdmissionService.js'
 import type { AdmissionRecord, SessionAuthority } from '../execution/OpenCodeV2ExecutionContracts.js'
 import type { RunInitializationPhase } from '../execution/OpenCodeV2Diagnostics.js'
+import type { OpenCodeV2Pin } from '../compatibility/OpenCodeV2Registry.js'
 import type { ExecutionLease, SelectedExecutionProfile, ValidatedExecutionNative } from '../host/OpenCodeV2ExecutionHost.js'
 import type { ExecutionCleanupReceipt } from '../host/OpenCodeV2ExecutionLifecycle.js'
 import type { ExecutionBridgeClient, ExecutionLog, ExecutionMessagePage, ExecutionPermission, ExecutionMcpServer } from '../transport/OpenCodeV2ExecutionClientFactory.js'
@@ -60,7 +61,7 @@ export type RunMemberStatus = Readonly<{
   memberId: string; laneId: string; originalSessionId: string
   selectedModel: string; selectedVariant?: string
   opencodeSessionId: string; runtimeSessionId: string
-  profileEpoch: string; profileRoot: string; pin: '2.0.0' | '2.0.32'; runtimePid?: number
+  profileEpoch: string; profileRoot: string; pin: OpenCodeV2Pin; runtimePid?: number
   state: 'accepted' | 'unknown' | 'rejected'; bootstrap: InstructionReceipt | null
   /** Observational age of the current initialization phase, never readiness evidence. */
   initialization?: Readonly<{ phase: RunInitializationPhase; elapsedMs: number }>

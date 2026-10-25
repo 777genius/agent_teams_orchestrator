@@ -2,8 +2,9 @@
 
 These Bun `patchedDependencies` modify the actual published `@opencode/core`
 and `@opencode/ai` 2.0.32 package graph loaded by `@opencode/server/process`.
-They do not modify an installed user CLI or its binary. The 2.0.0 floor graph
-is unchanged. `scripts/opencode-v2/stage.ts` copies the installed patched bytes
+They do not modify an installed user CLI or its binary. Every other staged
+graph (the 2.0.0 floor and later versions such as 2.1.4) is unchanged, so inline
+video transport is available only on 2.0.32 until a version's patch is added. `scripts/opencode-v2/stage.ts` copies the installed patched bytes
 into production bundles; the existing execution graph receipt hashes those
 actual bytes. Keep these patches in the source archive used to run Bun install.
 

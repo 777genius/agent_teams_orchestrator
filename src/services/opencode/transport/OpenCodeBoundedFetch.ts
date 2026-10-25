@@ -1,5 +1,5 @@
 import type { OpenCodeClientRequestContext } from '../OpenCodeClientRequestContext.js'
-import type { OpenCodeV2Pin } from '../compatibility/OpenCodeGenerationPolicy.js'
+import { openCodeV2Wire, type OpenCodeV2Pin } from '../compatibility/OpenCodeV2Registry.js'
 
 type OpenCodeFetchInput = Parameters<typeof globalThis.fetch>[0]
 type OpenCodeFetchInit = Parameters<typeof globalThis.fetch>[1]
@@ -89,8 +89,9 @@ export class OpenCodeBoundedFetch {
     const request = new Request(input, init), url = new URL(request.url)
     openCodeReadAssert(url.origin === this.baseUrl && !url.username && !url.password && !url.hash, 'identity_mismatch')
     const scoped = /^\/api\/(?:location|model(?:\/default)?|provider(?:\/[^/]+)?|agent(?:\/[^/]+)?|config|integration)$/.test(url.pathname)
-    const identity = this.pin === '2.0.0' ? ['/api/health', '/api/server'] : ['/api/info']
-    const activation = this.pin === '2.0.0' && request.method === 'POST' && url.pathname === '/api/plugin/await-activation'
+    const floor = openCodeV2Wire(this.pin) === 'floor'
+    const identity = floor ? ['/api/health', '/api/server'] : ['/api/info']
+    const activation = floor && request.method === 'POST' && url.pathname === '/api/plugin/await-activation'
     openCodeReadAssert(activation || request.method === 'GET' && (scoped || identity.includes(url.pathname)), 'capabilities_pending')
     for (const key of url.searchParams.keys()) openCodeReadAssert(key === 'location[directory]', 'identity_mismatch')
     if (scoped || activation) openCodeReadAssert(url.searchParams.get('location[directory]') === this.directory, 'identity_mismatch')

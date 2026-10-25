@@ -6,14 +6,14 @@ import { prepareExecutionPlatformChild, readExecutionPlatformBirth } from '../se
 import { pathToFileURL } from 'node:url'
 import { resolveOpenCodeV2ExecutionDelivery } from '../services/opencode/host/OpenCodeV2ExecutionDelivery.js'
 import { hashOpenCodeFile } from '../services/opencode/compatibility/OpenCodeNativeIdentity.js'
+import { assertOpenCodeV2Launchable, isOpenCodeV2Identity } from '../services/opencode/compatibility/OpenCodeV2Registry.js'
 import { executionAssert, executionHash, executionRecord, openCodeV2RunInitializationMs } from '../services/opencode/execution/OpenCodeV2ExecutionContracts.js'
 import { assertExecutionProfile, executionProfileGuards, validateExecutionGraph, validateExecutionNative, validateExecutionProfile,
   type ExecutionGraphProgress, type OwnedNativeProfile, type ValidatedExecutionNative } from '../services/opencode/host/OpenCodeV2ExecutionBinding.js'
 import { boundOpenCodeRead } from '../services/opencode/transport/OpenCodeBoundedFetch.js'
 import { openCodeV2ExecutionCloseAckReserveMs, runOpenCodeV2ExecutionCloseSequence } from '../services/opencode/execution/OpenCodeV2ExecutionClose.js'
 import { importOpenCodeV2SelectedOAuth } from '../services/opencode/host/OpenCodeV2ExecutionOAuth.js'
-import type { ServerOptions as FloorOptions } from '@opencode/server-v2-floor/options'
-import type { ServerOptions as CurrentOptions } from '@opencode/server/options'
+import type { CurrentServerOptions as CurrentOptions, FloorServerOptions as FloorOptions } from '../services/opencode/compatibility/OpenCodeV2WireTypes.js'
 
 // Dedicated IPC child. The execution DB/profile are retained, including failed acquisition.
 // Native Windows uses an authenticated named pipe; POSIX keeps its inherited
@@ -54,7 +54,8 @@ function reportStartupFailure(reason: 'timeout' | 'failed', error?: unknown): vo
     'v2_compiled_runtime_unsupported', 'v2_execution_layout_unsupported', 'execution_profile_changed',
     'execution_graph_changed', 'execution_graph_incomplete', 'execution_graph_dependency_missing',
     'execution_containment_identity_mismatch', 'execution_realpath_unavailable', ...windowsRealpathInstallCauses,
-    'execution_timeout', 'execution_cancelled']
+    'execution_timeout', 'execution_cancelled', 'opencode_v2_version_out_of_range', 'opencode_v2_version_unqualified',
+    'opencode_v2_graph_unavailable']
   const cause = error instanceof Error && causes.includes(error.message) ? error.message : undefined
   const detail = error instanceof Error ? error as Error & { code?: unknown; syscall?: unknown; profileGuard?: unknown } : undefined
   const errno = ['EPERM', 'EACCES', 'ENOENT', 'ENOTDIR', 'EISDIR', 'EINVAL', 'UNKNOWN', 'EIO', 'ENOSYS'].find(value => value === detail?.code)
@@ -126,9 +127,9 @@ async function start(input: Record<string, unknown>): Promise<void> {
   } else executionAssert(input.deferRuntime === undefined, 'execution_identity_mismatch')
   enterStartupStage('delivery-resolution')
   const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'execution')
+  assertOpenCodeV2Launchable(native.version)
   executionAssert(native.runtimeMode === delivery.runtimeMode && native.entrySha256 === delivery.entrySha256 &&
-    native.generation === 'v2' &&
-    (native.version === '2.0.0' || native.version === '2.0.32') && native.dialect === `v2-${native.version}` &&
+    native.generation === 'v2' && isOpenCodeV2Identity(native.version, native.dialect) &&
     process.versions.bun === openCodeBunVersion(), 'execution_identity_mismatch')
   enterStartupStage('profile-validation')
   await validateExecutionProfile(profile); controller.signal.throwIfAborted()

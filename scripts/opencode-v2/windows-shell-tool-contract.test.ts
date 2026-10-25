@@ -10,7 +10,7 @@ test('the exact no-model document decodes with the verified selected config sche
   const graph = await verifyOpenCodeV2ServerGraph('2.0.32')
   const entry = await realpath(Bun.resolveSync('@opencode/schema/config', path.dirname(graph.modulePath)))
   await verifyOpenCodePackage(entry, '@opencode/schema', '2.0.32')
-  await verifyOpenCodeV2GraphEffect(entry, graph.effectPath, '2.0.32')
+  await verifyOpenCodeV2GraphEffect(entry, graph.effectPath, graph.effectVersion)
   const { Schema }: typeof import('effect') = await import(pathToFileURL(graph.effectPath).href)
   const { Config }: typeof import('@opencode/schema/config') = await import(pathToFileURL(entry).href)
   const controllerRoot = 'C:\\TEST\\TEST-claude', bun = 'C:\\TEST\\bun.exe'
@@ -135,7 +135,7 @@ test('registered TEST agent and shell snapshot follow actual plugin activation w
     const path=require('node:path'),{pathToFileURL}=require('node:url');
     const {verifyOpenCodeV2ServerGraph,verifyOpenCodePackage,verifyOpenCodeV2GraphEffect}=await import('./src/services/opencode/host/OpenCodeV2ServerGraph.ts');
     const graph=await verifyOpenCodeV2ServerGraph('2.0.32'),base=path.dirname(graph.modulePath);
-    const selected=async(specifier,name)=>{const entry=await require('node:fs').promises.realpath(Bun.resolveSync(specifier,base));await verifyOpenCodePackage(entry,name,name==='effect'||name.startsWith('@effect/')?'4.0.1':'2.0.32');await verifyOpenCodeV2GraphEffect(entry,graph.effectPath,'2.0.32');return import(pathToFileURL(entry).href)};
+    const selected=async(specifier,name)=>{const entry=await require('node:fs').promises.realpath(Bun.resolveSync(specifier,base));await verifyOpenCodePackage(entry,name,name==='effect'||name.startsWith('@effect/')?graph.effectVersion:'2.0.32');await verifyOpenCodeV2GraphEffect(entry,graph.effectPath,graph.effectVersion);return import(pathToFileURL(entry).href)};
     const {Effect,Layer,Scope,Exit,Context,Schema}=await import(pathToFileURL(graph.effectPath).href);
     const [routes,global,cross,spawn,http,sessions,instances,agents,plugins,tools,permissions,schema]=await Promise.all([
       ['@opencode/server/routes','@opencode/server'],['@opencode/util/global','@opencode/util'],['@opencode/util/cross-spawn-spawner','@opencode/util'],

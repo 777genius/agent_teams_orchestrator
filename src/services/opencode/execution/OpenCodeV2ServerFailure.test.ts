@@ -1,4 +1,5 @@
 import { expect, test } from 'bun:test'
+import { stagedOpenCodeV2Pins } from '../compatibility/fixtures/stagedOpenCodeV2Pins.js'
 import { readFile } from 'node:fs/promises'
 import { types } from 'node:util'
 import path from 'node:path'
@@ -9,9 +10,9 @@ const secret = 'TEST-PRIVATE-SERVER-PAYLOAD'
 const fail = (error: unknown) => ({ reasons: [{ _tag: 'Fail', error }] })
 const finite = { operation: 'location', kind: 'Fail', tag: 'PlatformError', module: 'FileSystem', method: 'realPath', reason: 'PermissionDenied', errno: 'EACCES' } as const
 
-for (const pin of ['2.0.0', '2.0.32'] as const)
+for (const pin of stagedOpenCodeV2Pins)
 test(`selected ${pin} Effect cause projects one finite error chain without exposing private fields`, async () => {
-  const directory = path.dirname(Bun.resolveSync(pin === '2.0.0' ? '@opencode/server-v2-floor/options' : '@opencode/server/options', import.meta.dir))
+  const directory = path.dirname(Bun.resolveSync(`@opencode/server-v${pin}/options`, import.meta.dir))
   const { Effect, Exit, PlatformError }: typeof import('effect') = await import(pathToFileURL(Bun.resolveSync('effect', directory)).href)
   const original = PlatformError.systemError({ _tag: 'PermissionDenied', module: 'FileSystem', method: 'realPath',
     pathOrDescriptor: secret, cause: Object.assign(new Error(secret), { code: 'EACCES', path: secret }) })

@@ -1,16 +1,22 @@
 import type { OpenCodeClientRequestContext } from '../OpenCodeClientRequestContext.js'
-import type { OpenCodeInventorySnapshot } from '../types.js'
+import type { OpenCodeConnectedProvider, OpenCodeInventorySnapshot } from '../types.js'
+import { openCodeV2KeyIntegrations, readOpenCodeV2ConnectedProviders } from './OpenCodeV2KeyIntegrations.js'
 import { hashOpenCodeFile, type OpenCodeV2NativeIdentity } from '../compatibility/OpenCodeNativeIdentity.js'
 import { acquireOpenCodeV2ReadHost } from '../host/OpenCodeHostNativeAdapter.js'
 import { createOpenCodeV2ReadClient } from '../transport/OpenCodeV2ClientFactory.js'
 import { openCodeReadAssert } from '../transport/OpenCodeBoundedFetch.js'
+import { openCodeV2Wire } from '../compatibility/OpenCodeV2Registry.js'
 import { emptyOpenCodeV2ReadStatus, readAgent, readArray, readConfiguration, readLocation, readModel,
   readProvider, readRecord, readWrapped, type OpenCodeV2ReadStatus } from './OpenCodeV2ReadStatus.js'
 
 export function openCodeV2InventorySnapshot(native: OpenCodeV2NativeIdentity, directory: string,
-  readStatus = emptyOpenCodeV2ReadStatus(native, directory), probeError: string | null = null): OpenCodeInventorySnapshot {
+  readStatus = emptyOpenCodeV2ReadStatus(native, directory), probeError: string | null = null,
+  connectedProviders: readonly OpenCodeConnectedProvider[] = []): OpenCodeInventorySnapshot {
+  // The directory offers the native key integrations; completed V2 connections mark them connected.
+  const availableProviders = [...new Set([...readStatus.providers.map(row => row.id),
+    ...openCodeV2KeyIntegrations(native.version).map(entry => entry.providerId)])]
   return { detected: true, binaryPath: native.executablePath, version: native.version, projectPath: directory,
-    profile: null, authStorePath: null, connectedProviders: [], availableProviders: readStatus.providers.map(row => row.id),
+    profile: null, authStorePath: null, connectedProviders: [...connectedProviders], availableProviders,
     models: readStatus.models.map(row => `${row.providerId}/${row.catalogId}`), modelMetadata: [],
     agents: readStatus.agents.map(row => ({ id: row.id, mode: row.mode === 'all' ? 'unknown' : row.mode })),
     probeError, diagnostics: ['capabilities_pending: V2 catalog reads do not qualify authentication, team launch or one-shot execution.'],
@@ -31,7 +37,7 @@ export async function probeOpenCodeV2Inventory(native: OpenCodeV2NativeIdentity,
     const sdk = reader.client, wrap = (value: unknown) => readWrapped(value, directory, projectId)
     const identity = readRecord(await sdk.identity())
     openCodeReadAssert(identity.pid === host.authority.pid && identity.version === native.version &&
-      (native.version !== '2.0.0' || identity.healthy === true), 'identity_mismatch')
+      (openCodeV2Wire(native.version) !== 'floor' || identity.healthy === true), 'identity_mismatch')
     const urls = readArray(await sdk.urls())
     openCodeReadAssert(urls.includes(host.authority.baseUrl), 'identity_mismatch')
     const projectId = readLocation(await sdk.location(directory), directory)
@@ -75,5 +81,7 @@ export async function probeOpenCodeV2Inventory(native: OpenCodeV2NativeIdentity,
     try { if (host) await host.close() } catch { failure = 'V2 owned server cleanup unknown.' }
   }
   if (failure) status = emptyOpenCodeV2ReadStatus(native, directory)
-  return openCodeV2InventorySnapshot(native, directory, status, failure)
+  let connected: OpenCodeConnectedProvider[] = []
+  try { connected = await readOpenCodeV2ConnectedProviders(directory, native.version) } catch { /* Unknown receipts never display as connected. */ }
+  return openCodeV2InventorySnapshot(native, directory, status, failure, connected)
 }

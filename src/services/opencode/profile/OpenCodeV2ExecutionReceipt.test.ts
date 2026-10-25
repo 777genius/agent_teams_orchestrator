@@ -224,8 +224,8 @@ async function receiptFixture(platform: NodeJS.Platform = 'darwin') {
     packageName: `@opencode/cli-${platform === 'win32' ? 'windows' : platform}-${process.arch}`,
   }
   const resolution = {
-    '@opencode/server/process': server,
-    '@opencode/client': client,
+    '@opencode/server-v2.0.32/process': server,
+    '@opencode/client-v2.0.32': client,
     'effect': effect,
     '@modelcontextprotocol/sdk/client/index.js': mcpSdk,
   }

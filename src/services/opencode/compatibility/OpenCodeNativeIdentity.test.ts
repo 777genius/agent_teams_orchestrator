@@ -8,8 +8,9 @@ import { hashOpenCodeFile, selectedOpenCodeReadPath } from './OpenCodeNativeIden
 
 test('strict family/dialect classification preserves V1 floor and refuses ambiguous output', () => {
   for (const version of ['1.16.0', '1.18.34']) expect(classifyOpenCodeReadGeneration(version).generation).toBe('v1')
-  for (const version of ['2.0.0', '2.0.32']) expect(classifyOpenCodeReadGeneration(version).generation).toBe('v2')
-  for (const version of ['2.0.1', '2.0.21', '2.0.31', '2.0.33', '3.0.0', '2.0.32-rc.1', 'opencode 2.0.32', '1.18.34\n2.0.32', '02.0.32']) {
+  // Recognition is the V2 range rule; launch qualification is a separate gate.
+  for (const version of ['2.0.0', '2.0.1', '2.0.21', '2.0.32', '2.0.33', '2.1.4', '2.99.0']) expect(classifyOpenCodeReadGeneration(version).generation).toBe('v2')
+  for (const version of ['3.0.0', '1.15.9', '0.9.0', '2.0.32-rc.1', 'opencode 2.0.32', '1.18.34\n2.0.32', '02.0.32']) {
     expect(classifyOpenCodeReadGeneration(version).generation).toBe('unsupported')
   }
 })
@@ -23,14 +24,14 @@ for (const pin of ['2.0.0', '2.0.32'] as const) {
   })
 }
 
-test('decorated, multiline and unqualified branded versions remain unsupported', () => {
+test('decorated, multiline and out-of-range branded versions remain unsupported', () => {
   for (const output of [
     'warning: opencode v2.0.32\n', 'opencode v2.0.32 extra\n',
     'banner\nopencode v2.0.32\n', 'opencode v2.0.32\nbanner\n',
     'opencode v2.0.0\nopencode v2.0.32\n', 'opencode v2.0.32\n\n',
     '\nopencode v2.0.32\n', ' opencode v2.0.32\n', 'opencode 2.0.32\n',
     'opencode v02.0.32\n', 'opencode v2.0.32-rc.1\n',
-    'opencode v2.0.1\n', 'opencode v2.0.26\n', 'opencode v2.1.0\n', 'opencode v3.0.0\n',
+    'opencode v3.0.0\n', 'opencode v2.1.4+build\n',
   ]) expect(classifyOpenCodeReadGeneration(output).generation).toBe('unsupported')
 })
 

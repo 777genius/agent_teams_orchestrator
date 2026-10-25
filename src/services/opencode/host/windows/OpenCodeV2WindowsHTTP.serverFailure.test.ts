@@ -1,4 +1,5 @@
 import { expect, spyOn, test } from 'bun:test'
+import { launchableStagedOpenCodeV2Pins } from '../../compatibility/fixtures/stagedOpenCodeV2Pins.js'
 import { EventEmitter } from 'node:events'
 import { createServer } from 'node:http'
 import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
@@ -12,13 +13,13 @@ import { openCodeV2ServerLoopbackUrl } from '../OpenCodeV2ServerAddress.js'
 import { recordOpenCodeV2ProviderFailure, retainOpenCodeV2CatalogFailure, retainOpenCodeV2CatalogServerFailure } from '../../execution/OpenCodeV2Diagnostics.js'
 import { OpenCodeV2ExecutionFetch } from '../../transport/OpenCodeV2ExecutionFetch.js'
 
-for (const pin of ['2.0.0', '2.0.32'] as const)
+for (const pin of launchableStagedOpenCodeV2Pins)
 test(`selected ${pin} NodeHttpServer default500 carries its sole cause on the existing authenticated head`, async () => {
-  const directory = path.dirname(Bun.resolveSync(pin === '2.0.0' ? '@opencode/server-v2-floor/options' : '@opencode/server/options', import.meta.dir))
+  const directory = path.dirname(Bun.resolveSync(`@opencode/server-v${pin}/options`, import.meta.dir))
   const { Effect, Context, Scope, Exit }: typeof import('effect') = await import(pathToFileURL(Bun.resolveSync('effect', directory)).href)
   const httpTypes: typeof import('effect/http') = await import(pathToFileURL(Bun.resolveSync(pin === '2.0.0' ? 'effect/unstable/http' : 'effect/http', directory)).href)
   const http: typeof import('@effect/platform-node/NodeHttpServer') = await import(pathToFileURL(Bun.resolveSync('@effect/platform-node/NodeHttpServer', directory)).href)
-  const client: typeof import('@opencode/client') = await import(pin === '2.0.0' ? '@opencode/client-v2-floor' : '@opencode/client')
+  const client: typeof import('@opencode/client') = await import(`@opencode/client-v${pin}`)
   const latch = createOpenCodeV2ColdLocationObservation(), events = new EventEmitter()
   const nonce = 'TEST-nonce', leaseOwnerId = 'TEST-lease'
   const frames: Record<string, unknown>[] = [], observed: unknown[] = []

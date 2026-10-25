@@ -23,7 +23,7 @@ test(`catalog refusal retains ${phase} with original thrown identity and bounded
     hostInstanceId: 'TEST-host', profileEpoch: 'TEST-profile', profileRoot: '/TEST/profile', directory, leaseOwnerId: 'TEST-owner' }
   const context: ExecutionContext = { teamId: 'TEST-team', runId: 'TEST-run', laneId: 'primary', memberId: 'alice', deadline: Date.now() + 10_000 }
   const original = new Error(phase === 'cleanup' ? 'cleanup_unknown' : 'TEST-PRIVATE-CATALOG-PAYLOAD')
-  const entry = await realpath(Bun.resolveSync('@opencode/client', import.meta.dir))
+  const entry = await realpath(Bun.resolveSync('@opencode/client-v2.0.32', import.meta.dir))
   const files = await Promise.all([entry, ...['schema/installation-event', 'protocol/groups/pty'].map(name => Bun.resolveSync('@opencode/' + name, path.dirname(entry)))].map(async file => {
     const canonical = await realpath(file)
     return { path: canonical, sha256: createHash('sha256').update(await readFile(canonical)).digest('hex') }

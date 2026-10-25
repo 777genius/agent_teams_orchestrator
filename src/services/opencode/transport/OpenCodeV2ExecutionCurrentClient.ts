@@ -1,14 +1,14 @@
-import { ClientError, OpenCode } from '@opencode/client'
+import type { CurrentClient } from '../compatibility/OpenCodeV2WireTypes.js'
 import type { ExecutionOperations } from './OpenCodeV2ExecutionClientFactory.js'
 import type { OpenCodeV2ExecutionFetch } from './OpenCodeV2ExecutionFetch.js'
 
-// Loaded only after the factory qualifies this selected pin's installed graph.
-export const executionCurrentClientErrorPrototype: object = ClientError.prototype
+// The factory passes the selected pin's own client module after qualifying its graph.
+export const executionCurrentClientErrorPrototype = (client: typeof CurrentClient): object => client.ClientError.prototype
 
 /** Exact current Promise API stays private to this adapter. */
-export function executionCurrentOperations(baseUrl: string, directory: string, wire: OpenCodeV2ExecutionFetch, bridgeFetch: typeof globalThis.fetch): ExecutionOperations {
-  const sdk = OpenCode.make({ baseUrl, fetch: wire.fetch })
-  const bridge = OpenCode.make({ baseUrl, fetch: bridgeFetch })
+export function executionCurrentOperations(client: typeof CurrentClient, baseUrl: string, directory: string, wire: OpenCodeV2ExecutionFetch, bridgeFetch: typeof globalThis.fetch): ExecutionOperations {
+  const sdk = client.OpenCode.make({ baseUrl, fetch: wire.fetch })
+  const bridge = client.OpenCode.make({ baseUrl, fetch: bridgeFetch })
   return {
     identity: () => sdk.server.info(),
     location: () => sdk.location.get({ location: { directory } }),

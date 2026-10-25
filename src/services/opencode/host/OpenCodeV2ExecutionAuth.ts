@@ -1,5 +1,6 @@
 import { executionAssert, executionRecord, type ExecutionAuthority, type ExecutionContext } from '../execution/OpenCodeV2ExecutionContracts.js'
 import { OpenCodeV2ProviderWire } from '../transport/OpenCodeV2ProviderWire.js'
+import { importOpenCodeV2ClientModule, resolveOpenCodeV2ClientEntry } from '../transport/OpenCodeV2ClientModule.js'
 import { requireExecutionEndpoint, registerExecutionDisposer } from './OpenCodeV2ExecutionHost.js'
 import type { OwnedNativeProfile } from './OpenCodeV2ExecutionBinding.js'
 import { readOpenCodeV2SelectedAuth, type SelectedAuthMetadata } from './OpenCodeV2ExecutionOAuth.js'
@@ -122,16 +123,15 @@ export async function initializeOpenCodeV2ExecutionAuth(authority: ExecutionAuth
   try {
     const location = { directory: profile.directory }
     // Listener readiness precedes plugin transforms; await each pin's official activation barrier.
-    const sdk = authority.pin === '2.0.0'
+    const selected = await importOpenCodeV2ClientModule(authority.pin, await resolveOpenCodeV2ClientEntry(authority.pin))
+    const sdk = selected.wire === 'floor'
       ? await (async () => {
-        const { OpenCode: Floor } = await import('@opencode/client-v2-floor')
-        const sdk = Floor.make({ baseUrl: endpoint.baseUrl, fetch: wire.fetch })
+        const sdk = selected.module.OpenCode.make({ baseUrl: endpoint.baseUrl, fetch: wire.fetch })
         await sdk.plugin.awaitActivation({ location })
         return sdk
       })()
       : await (async () => {
-        const { OpenCode: Current } = await import('@opencode/client')
-        const sdk = Current.make({ baseUrl: endpoint.baseUrl, fetch: wire.fetch })
+        const sdk = selected.module.OpenCode.make({ baseUrl: endpoint.baseUrl, fetch: wire.fetch })
         await sdk.integration.list({ location })
         return sdk
       })()
