@@ -146,7 +146,7 @@ describe('OpenCodeDeliveryResponseObserver', () => {
     expect(observed.deliveredUserMessageId).toBe('user-1')
   })
 
-  test('distinguishes an explicitly completed silent group child from unanswered work', () => {
+  test.each([undefined, 'group-1'])('distinguishes an explicitly completed silent child from unanswered work (group %s)', groupChatId => {
     const user = message({ id: 'accepted-peer-prompt', role: 'user', text: 'Peer FYI' })
     const child = message({
       id: 'silent-peer-child', parentId: user.id, role: 'assistant',
@@ -155,7 +155,7 @@ describe('OpenCodeDeliveryResponseObserver', () => {
     const observe = (children = [child], rawStatus: OpenCodeSessionReconcileSummary['rawStatus'] = 'idle') =>
       observeOpenCodeDeliveryResponse({
         inboundMessageId: 'physical-peer', runtimePromptMessageId: user.id,
-        groupChatId: 'group-1', memberName: 'alice', teamName: 'team',
+        groupChatId, memberName: 'alice', teamName: 'team',
         summary: summary([user, ...children], rawStatus),
       })
     const proof = observe()
@@ -178,8 +178,13 @@ describe('OpenCodeDeliveryResponseObserver', () => {
       expect(observe([{ ...child, ...incomplete }], null).reason).not.toBe(proof.reason)
     }
     expect(observe([]).reason).toBe('no_assistant_child_for_delivered_prompt')
+    expect(observe([{ ...child, parentId: 'another-session-prompt' }]).reason).not.toBe(proof.reason)
+    const stale = summary([user, child])
+    stale.reconcileOutcome = 'stale'
+    stale.staleReason = 'runtime_session_changed'
+    expect(observeOpenCodeDeliveryResponse({ runtimePromptMessageId: user.id, summary: stale }).state).toBe('session_stale')
     expect(observeOpenCodeDeliveryResponse({
-      runtimePromptMessageId: 'different-prompt', groupChatId: 'group-1',
+      runtimePromptMessageId: 'different-session-prompt', groupChatId,
       summary: summary([user, child]),
     }).reason).not.toBe(proof.reason)
   })

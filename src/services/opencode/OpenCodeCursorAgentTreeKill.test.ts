@@ -97,7 +97,13 @@ test('native birth failures retain finite helper evidence before returning null'
     ${withoutKernel32}
     const original=await import('node:child_process')
     let mode='exit'
-    mock.module('node:child_process',()=>({...original,spawn:()=>{
+    mock.module('node:child_process',()=>({...original,spawn:(_command,args)=>{
+      assert.deepEqual(args.slice(0,3),['-NoProfile','-NonInteractive','-EncodedCommand'])
+      assert(/^[A-Za-z0-9+/]+={0,2}$/.test(args[3]))
+      const decoded=Buffer.from(args[3],'base64').toString('utf16le')
+      assert(decoded.includes('[System.Diagnostics.Process]::GetProcessById(123)'))
+      assert(decoded.includes('ToString("o")')&&decoded.includes('native-helper-cause:'))
+      assert(decoded.includes('$p.Dispose()'))
       const child=Object.assign(new EventEmitter(),{pid:123,stdout:new EventEmitter(),
         kill:()=>{queueMicrotask(()=>child.emit('close',null));return true}})
       if(mode==='exit')queueMicrotask(()=>child.emit('close',7))
@@ -136,8 +142,9 @@ test('Windows census without bun:ffi uses direct WMI rows and retains strict pro
     mock.module('node:child_process',()=>({...original,spawn:(command,args,options)=>{
       calls++
       assert(command.split(String.fromCharCode(92)).join('/').endsWith('System32/WindowsPowerShell/v1.0/powershell.exe'))
-      assert.deepEqual(args.slice(0,3),['-NoProfile','-NonInteractive','-Command'])
-      const census=args[3]
+      assert.deepEqual(args.slice(0,3),['-NoProfile','-NonInteractive','-EncodedCommand'])
+      assert(/^[A-Za-z0-9+/]+={0,2}$/.test(args[3]))
+      const census=Buffer.from(args[3],'base64').toString('utf16le')
       assert(census.includes('System.Management.ManagementObjectSearcher'))
       assert(census.includes('SELECT ProcessId, ParentProcessId FROM Win32_Process'))
       assert(census.includes("GetPropertyValue('ProcessId')")&&census.includes("GetPropertyValue('ParentProcessId')"))
@@ -189,3 +196,26 @@ test('Windows ports read kernel32 without spawning helpers when bun:ffi is avail
   expect({exit,stderr}).toEqual({exit:0,stderr:''})
   expect(stdout.trim()).toBe('TEST Windows native ports qualified')
 },15000)
+
+
+test.skipIf(process.platform !== 'win32')('real Windows PowerShell fallback observes the current process without weakening ownership', async () => {
+  const module = import.meta.resolve('./OpenCodeCursorAgentTreeKill.ts')
+  const script = `
+    import {mock} from 'bun:test'
+    import assert from 'node:assert/strict'
+    ${withoutKernel32}
+    const {nativePorts}=await import(${JSON.stringify(module)})
+    const failures=[]
+    const ports=nativePorts({},failure=>failures.push(failure))
+    const birth=await ports.birth(process.pid,5000)
+    assert(Number.isSafeInteger(birth)&&birth>0)
+    const rows=await ports.tree(5000)
+    assert.deepEqual(rows.find(row=>row.pid===process.pid),{pid:process.pid,ppid:process.ppid})
+    assert.deepEqual(failures,[])
+    console.log('TEST real Windows fallback identity qualified')
+  `
+  const child=Bun.spawn([process.execPath,'-e',script],{cwd:import.meta.dir,stdout:'pipe',stderr:'pipe'})
+  const [exit,stdout,stderr]=await Promise.all([child.exited,new Response(child.stdout).text(),new Response(child.stderr).text()])
+  expect({exit,stderr}).toEqual({exit:0,stderr:''})
+  expect(stdout.trim()).toBe('TEST real Windows fallback identity qualified')
+},30000)

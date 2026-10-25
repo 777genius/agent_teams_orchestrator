@@ -195,8 +195,8 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
     const pid = child.pid
     // Match processKill.ts's 5s Windows process-birth query budget: cold
     // PowerShell/WMI startup can exceed 2s. Every helper still uses the
-    // probe remainder; POSIX queries keep their 2s cap.
-    const helperTimeout = process.platform === 'win32' ? 5000 : 2000
+    // probe remainder; Darwin census also needs cold-start headroom. Linux keeps 2s.
+    const helperTimeout = process.platform === 'win32' || process.platform === 'darwin' ? 5000 : 2000
     let ended = false, closed = false, code: number | null = null
     let phase: OpenCodeProbeTerminalDiagnostic['phase'] = 'initial_birth'
     let terminalDiagnostic: OpenCodeProbeTerminalDiagnostic | undefined
@@ -298,7 +298,7 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
         .map(row => ({ ...row, group: null, retired: false }))
       // The detached POSIX spawn creates an isolated group. Unlike a PPID walk,
       // PGID membership still includes orphans after the leader has exited.
-      const text = await observe(query('ps', ['-e', '-o', 'pid=', '-o', 'ppid=', '-o', 'pgid=', '-o', 'stat='], Math.min(2000, cap())))
+      const text = await observe(query('ps', ['-e', '-o', 'pid=', '-o', 'ppid=', '-o', 'pgid=', '-o', 'stat='], Math.min(helperTimeout, cap())))
       const seen = new Set<number>()
       return text.trim().split('\n').filter(Boolean).map(line => {
         const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s*$/.exec(line)

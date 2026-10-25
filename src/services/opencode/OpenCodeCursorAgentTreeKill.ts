@@ -102,6 +102,12 @@ export type NativeHelperFailure = Readonly<{
   helperCause?: NativeHelperCause
 }>
 
+// PowerShell's command-line parser does not consume libuv's backslash-escaped
+// embedded quotes. Encoding transports the exact script without a second parse.
+function windowsPowerShellArguments(script: string): string[] {
+  return ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')]
+}
+
 export function nativePorts(overrides: Partial<CursorAgentNativePorts> = {},
   onHelperFailure?: (failure: NativeHelperFailure) => void): CursorAgentNativePorts {
   const observedQuery = async (operation: NativeHelperFailure['operation'], command: string, args: string[], timeout: number) => {
@@ -203,7 +209,7 @@ export function nativePorts(overrides: Partial<CursorAgentNativePorts> = {},
           ? await observedQuery('birth', 'ps', ['-p', String(pid), '-o', 'lstart='], timeout)
           : await observedQuery('birth', path.win32.join(process.env.SystemRoot || 'C:\\Windows',
             'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
-            ['-NoProfile', '-NonInteractive', '-Command',
+            windowsPowerShellArguments(
               `$ErrorActionPreference = "Stop"; $p = $null; $stage = 'process_lookup';
 try {
   $p = [System.Diagnostics.Process]::GetProcessById(${pid});
@@ -221,7 +227,7 @@ try {
   if ($cause -is [System.ComponentModel.Win32Exception]) { $nativeCode = $cause.NativeErrorCode.ToString([System.Globalization.CultureInfo]::InvariantCulture) };
   [Console]::Error.WriteLine('native-helper-cause:{"stage":"' + $stage + '","category":"' + $category + '","hresult":' + $cause.HResult.ToString([System.Globalization.CultureInfo]::InvariantCulture) + ',"nativeErrorCode":' + $nativeCode + '}');
   exit 1
-} finally { if ($null -ne $p) { $p.Dispose() } }`], timeout)
+} finally { if ($null -ne $p) { $p.Dispose() } }`), timeout)
         const value = Date.parse(output.trim())
         return Number.isFinite(value) ? value : null
       } catch { return null }
@@ -237,7 +243,7 @@ try {
       const output = process.platform === 'win32'
         ? await observedQuery('tree', path.win32.join(process.env.SystemRoot || 'C:\\Windows',
           'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
-          ['-NoProfile', '-NonInteractive', '-Command',
+          windowsPowerShellArguments(
             // Avoid loading CimCmdlets in the private Windows environment.
             // Keep the same PID/parent projection and dispose every WMI resource.
             `$ErrorActionPreference = 'Stop';
@@ -250,7 +256,7 @@ try {
     try { [Console]::Out.WriteLine('{0} {1}', $row.GetPropertyValue('ProcessId'), $row.GetPropertyValue('ParentProcessId')) }
     finally { $row.Dispose() }
   }
-} finally { if ($null -ne $results) { $results.Dispose() }; $searcher.Dispose() }`], timeout)
+} finally { if ($null -ne $results) { $results.Dispose() }; $searcher.Dispose() }`), timeout)
         : await observedQuery('tree', 'ps', ['-e', '-o', 'pid=', '-o', 'ppid='], timeout)
       const rows = output.trim().split('\n').filter(Boolean).map(line => {
         const match = /^\s*(\d+)\s+(\d+)\s*$/.exec(line)
