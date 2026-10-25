@@ -1,3 +1,4 @@
+import { openCodeV2EngineVersion } from '../compatibility/OpenCodeV2Registry.js'
 import { openCodeBunVersion } from '../../../constants/openCodeBunVersion.js'
 import { assertOpenCodeV2Launchable } from '../compatibility/OpenCodeV2Registry.js'
 import { resolveOpenCodeV2ExecutionProbe } from './OpenCodeV2ExecutionProbe.js'
@@ -118,6 +119,8 @@ export async function inspectOpenCodeV2LaunchSelection(envelope: BridgeEnvelope)
     controller = { ...controller, command, environment }
   }
   const behaviorFingerprint = executionHash({ source: 'linux-v2-protocol1', pin: selected.native.version,
+    ...(selected.native.origin === 'standalone' ? { nativeOrigin: 'standalone' } : {}),
+    ...(openCodeV2EngineVersion(selected.native) === selected.native.version ? {} : { engineVersion: openCodeV2EngineVersion(selected.native) }),
     binary: selected.native.executableSha256, model, scope: { purpose: scope.purpose, providerId: scope.providerId,
       configFingerprint: scope.configFingerprint, selectedAuthIdentity: scope.selectedAuthIdentity }, controller })
   return { native: selected.native, model, project, scope, controller, behaviorFingerprint,
@@ -134,7 +137,7 @@ export async function inspectOpenCodeV2SourceAvailability(envelope: BridgeEnvelo
 /** Reuse only this command's selection; installed bytes are still verified afresh. */
 async function prepareSelectedOpenCodeV2SourceAvailability(selection: Awaited<ReturnType<typeof inspectOpenCodeV2LaunchSelection>>) {
   // Version admission precedes graph resolution, so an unqualified release is refused as such.
-  assertOpenCodeV2Launchable(selection.native.version)
+  assertOpenCodeV2Launchable(openCodeV2EngineVersion(selection.native))
   const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'execution')
   const receipt = await createOpenCodeV2ExecutionReceipt(delivery.root, selection.native, selection.controller)
   const config = selection.controller
@@ -172,7 +175,7 @@ export async function createOpenCodeV2LaunchPlan(envelope: BridgeEnvelope): Prom
   executionAssert((await collectProjectBehaviorMetadata(selection.project)).projectBehaviorFingerprint === verified.proof.projectBehaviorFingerprint && Date.parse(verified.proof.expiresAt) > Date.now(), 'run_launch_project_behavior_or_proof_changed')
   return { ...plan, qualification: { capabilitySnapshotId: verified.proof.capabilitySnapshotId,
     expectedBehaviorFingerprint: verified.proof.expectedBehaviorEvidence.expectedBehaviorFingerprint,
-    binaryPath: verified.proof.binaryPath, binaryFingerprint: verified.proof.binaryFingerprint, version: verified.proof.opencodeVersion } }
+    binaryPath: verified.proof.binaryPath, binaryFingerprint: verified.proof.binaryFingerprint, version: verified.proof.opencodeVersion, engineVersion: openCodeV2EngineVersion(native) } }
 }
 
 /** Production constructor only: no caller body receipt, endpoint or mount hook. */
@@ -278,7 +281,7 @@ export async function createOpenCodeV2PreparedMember(selection: Awaited<ReturnTy
       // qualify this exact free model before admitting any native session.
       if (anonymous) executionAssert(Object.keys(executionRecord(JSON.parse(await readFile(managedAuthPath, 'utf8')))).length === 0,
         'run_selected_auth_changed')
-      config = createOpenCodeV2ExecutionConfig({ pin: native.version, selection: selected,
+      config = createOpenCodeV2ExecutionConfig({ pin: openCodeV2EngineVersion(native), selection: selected,
         controller: { server: 'agent-teams', config: selection.controller }, provider, unattendedTeam: input.unattendedTeam })
       await writeFile(path.join(configDirectory, 'opencode.json'), config.content, { flag: 'wx', mode: 0o600 })
     }

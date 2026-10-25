@@ -394,3 +394,25 @@ test.skipIf(process.arch !== 'x64')('Windows receipt rejects malformed, truncate
     } finally { await rm(f.root, { recursive: true, force: true }) }
   }
 })
+
+
+test('receipt preserves actual unlisted CLI and standalone provenance while graph stays on its persisted engine', async () => {
+  const f = await receiptFixture()
+  const metadata = path.join(path.dirname(path.dirname(f.identity.executablePath)), 'package.json')
+  const identity = { ...f.identity, version: '2.99.0' as const, engineVersion: '2.0.32' as const, origin: 'npm' as const }
+  try {
+    await writeFile(metadata, JSON.stringify({ name: identity.packageName, version: identity.version }))
+    const receipt = await callReceipt(f, () => null, module => module.createOpenCodeV2ExecutionReceipt('/TEST-unused', identity))
+    expect(receipt).toMatchObject({ version: '2.99.0', engineVersion: '2.0.32', dialect: 'v2-2.0.32', origin: 'npm', packageName: identity.packageName })
+    expect(receipt.graph.files.some(row => row.path === f.resolution['@opencode/server-v2.0.32/process'])).toBe(true)
+    await rm(metadata)
+    const standalone = await callReceipt(f, () => null, module => module.createOpenCodeV2ExecutionReceipt('/TEST-unused', {
+      ...identity, origin: 'standalone', packageName: null,
+    }))
+    expect(standalone).toMatchObject({ version: '2.99.0', engineVersion: '2.0.32', origin: 'standalone', packageName: null })
+    expect(standalone.graph).toEqual(receipt.graph)
+    await expect(callReceipt(f, () => null, module => module.createOpenCodeV2ExecutionReceipt('/TEST-unused', {
+      ...identity, origin: 'standalone', packageName: null, executableSha256: '0'.repeat(64),
+    }))).rejects.toThrow('native_selection_changed')
+  } finally { await rm(f.root, { recursive: true, force: true }) }
+})

@@ -39,3 +39,15 @@ test('delivery identity accepts the app’s long work-sync nudge IDs and still b
     expect(() => assertIntentIdentity({ ...identity, [key]: '' })).toThrow('intent_identity_invalid')
   }
 })
+
+
+test('authority binds recognized CLI identity independently of the exact persisted engine', () => {
+  const original = authority({ format: 'utc-ms', value: '42', bootId: null })
+  const independent = { ...original, selectedCli: { ...original.selectedCli, version: '2.99.0' as const } }
+  expect(() => assertExecutionAuthority(independent)).not.toThrow()
+  expect(() => assertExecutionAuthority(original)).not.toThrow()
+  expect(() => assertExecutionAuthority({ ...independent, dialect: 'v2-2.99.0' })).toThrow()
+  expect(() => assertExecutionAuthority({ ...independent, selectedCli: { ...independent.selectedCli, version: '3.0.0' as never } })).toThrow()
+  expect(() => assertExecutionAuthority({ ...independent, selectedCli: { ...independent.selectedCli, sha256: 'tampered' } })).toThrow()
+  expect(() => assertExecutionAuthority({ ...independent, graphSha256: 'tampered' })).toThrow()
+})

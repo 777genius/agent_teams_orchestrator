@@ -1,3 +1,4 @@
+import { openCodeV2EngineVersion } from '../services/opencode/compatibility/OpenCodeV2Registry.js'
 import { openCodeV2ServerLoopbackUrl } from '../services/opencode/host/OpenCodeV2ServerAddress.js'
 import { readExecutionGraphFailure } from '../services/opencode/host/OpenCodeV2ExecutionBinding.js'
 import { openCodeBunVersion } from '../constants/openCodeBunVersion.js'
@@ -108,9 +109,9 @@ async function start(input: Record<string, unknown>): Promise<void> {
   }
   enterStartupStage('delivery-resolution')
   const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'execution')
-  assertOpenCodeV2Launchable(native.version)
+  assertOpenCodeV2Launchable(openCodeV2EngineVersion(native))
   executionAssert(native.runtimeMode === delivery.runtimeMode && native.entrySha256 === delivery.entrySha256 &&
-    native.generation === 'v2' && isOpenCodeV2Identity(native.version, native.dialect) &&
+    native.generation === 'v2' && isOpenCodeV2Identity(openCodeV2EngineVersion(native), native.dialect) &&
     process.versions.bun === openCodeBunVersion(), 'execution_identity_mismatch')
   enterStartupStage('profile-validation')
   await validateExecutionProfile(profile); controller.signal.throwIfAborted()
@@ -128,11 +129,11 @@ async function start(input: Record<string, unknown>): Promise<void> {
   await validateExecutionNative(native)
   controller.signal.throwIfAborted()
   enterStartupStage('graph-validation')
-  const graph = await validateExecutionGraph(native.version, native.graph, value => { graphProgress = value }, controller.signal)
+  const graph = await validateExecutionGraph(openCodeV2EngineVersion(native), native.graph, value => { graphProgress = value }, controller.signal)
   controller.signal.throwIfAborted()
   const options = {
     hostname: '127.0.0.1', port: 0, password: input.password,
-    app: { name: 'agent-teams-execution', version: native.version },
+    app: { name: 'agent-teams-execution', version: openCodeV2EngineVersion(native) },
     database: { path: profile.databasePath }, events: { persist: true },
     config: { directory: profile.config.directory, project: !('purpose' in profile.selection), content: profile.config.content },
     models: { fetch: false, snapshot: !profile.models, ...(profile.models ? { file: profile.models.path } : {}) },
@@ -157,7 +158,7 @@ async function start(input: Record<string, unknown>): Promise<void> {
     controller.signal.throwIfAborted()
     enterStartupStage('server-start')
     const server = await Effect.runPromise(runtime.start<never, never>(options).pipe(Effect.provideService(Scope.Scope, scope)), { signal: controller.signal })
-    baseUrl = openCodeV2ServerLoopbackUrl(native.version, server.address)
+    baseUrl = openCodeV2ServerLoopbackUrl(openCodeV2EngineVersion(native), server.address)
   }
   controller.signal.throwIfAborted()
   enterStartupStage('ready-identity')
@@ -167,7 +168,7 @@ async function start(input: Record<string, unknown>): Promise<void> {
   clearTimeout(startupTimer)
   executionAssert(childControl.connected())
   await boundOpenCodeRead(childControl.send({ type: 'ready', nonce, leaseOwnerId: prepared?.leaseOwnerId,
-    namespace: prepared?.namespace, pid: process.pid, birth, pin: native.version,
+    namespace: prepared?.namespace, pid: process.pid, birth, pin: openCodeV2EngineVersion(native),
     baseUrl, graphSha256: native.graph.sha256,
     executableSha256: native.bun.sha256, profileEpoch: profile.epoch,
     selectionSha256: executionHash(profile.selection) }), 1000, controller.signal)

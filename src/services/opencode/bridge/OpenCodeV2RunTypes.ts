@@ -29,7 +29,7 @@ export type RunMemberPlan = Readonly<{
   bootstrap: Readonly<{ key: string; value: string; contextHash: string; briefingHash: string }>
   controllerMcpName: string; advertisedTools: readonly string[]
 }>
-export type RunQualification = Readonly<{ capabilitySnapshotId: string | null; expectedBehaviorFingerprint: string; binaryPath: string; binaryFingerprint: string; version: string | null }>
+export type RunQualification = Readonly<{ capabilitySnapshotId: string | null; expectedBehaviorFingerprint: string; binaryPath: string; binaryFingerprint: string; version: string | null; engineVersion?: OpenCodeV2Pin }>
 export type RunLaunchPlan = Readonly<{
   qualification?: RunQualification
   dataRoot: string; binding: RunBinding; deadline: number; members: readonly RunMemberPlan[]

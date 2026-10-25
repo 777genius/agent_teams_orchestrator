@@ -1,3 +1,4 @@
+import { openCodeV2EngineVersion } from '../compatibility/OpenCodeV2Registry.js'
 import path from 'node:path'
 import { realpath } from 'node:fs/promises'
 import type { OpenCodeClientRequestContext } from '../OpenCodeClientRequestContext.js'
@@ -18,15 +19,15 @@ export type OpenCodeV2ReadClient = {
 export async function createOpenCodeV2ReadClient(authority: OpenCodeV2EndpointAuthority,
   context: OpenCodeClientRequestContext = {}) {
   assertOpenCodeV2EndpointAuthority(authority)
-  const entry = await resolveOpenCodeV2ClientEntry(authority.native.version)
+  const entry = await resolveOpenCodeV2ClientEntry(openCodeV2EngineVersion(authority.native))
   for (const [dependency, subpath] of OPENCODE_V2_CLIENT_GRAPH_ENTRIES) {
     await verifyOpenCodePackage(await realpath(Bun.resolveSync(`@opencode/${dependency}/${subpath}`, path.dirname(entry))),
-      `@opencode/${dependency}`, authority.native.version)
+      `@opencode/${dependency}`, openCodeV2EngineVersion(authority.native))
   }
-  const wire = new OpenCodeBoundedFetch(authority.baseUrl, authority.native.version,
+  const wire = new OpenCodeBoundedFetch(authority.baseUrl, openCodeV2EngineVersion(authority.native),
     authority.directory, authority.authorization, context)
   try {
-    const selected = await importOpenCodeV2ClientModule(authority.native.version, entry)
+    const selected = await importOpenCodeV2ClientModule(openCodeV2EngineVersion(authority.native), entry)
     const client = selected.wire === 'floor'
       ? (await import('./OpenCodeV2FloorClient.js')).createOpenCodeV2FloorClient(selected.module, authority.baseUrl, wire)
       : (await import('./OpenCodeV2CurrentClient.js')).createOpenCodeV2CurrentClient(selected.module, authority.baseUrl, wire)

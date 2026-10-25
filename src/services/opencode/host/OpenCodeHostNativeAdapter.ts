@@ -1,3 +1,4 @@
+import { openCodeV2EngineVersion } from '../compatibility/OpenCodeV2Registry.js'
 import { spawn } from 'node:child_process'
 import { randomBytes, randomUUID } from 'node:crypto'
 import { realpath } from 'node:fs/promises'
@@ -38,7 +39,7 @@ export async function acquireOpenCodeV2ReadHost(native: OpenCodeV2NativeIdentity
   const nativeSha256 = await hashOpenCodeFile(native.executablePath)
   check()
   openCodeReadAssert(nativeSha256 === native.executableSha256, 'identity_mismatch')
-  const graph = await verifyOpenCodeV2ServerGraph(native.version)
+  const graph = await verifyOpenCodeV2ServerGraph(openCodeV2EngineVersion(native))
   check()
   const roots = await createOpenCodeV2ReadRoots()
   const nonce = randomUUID(), password = randomBytes(32).toString('base64url')
@@ -98,13 +99,13 @@ export async function acquireOpenCodeV2ReadHost(native: OpenCodeV2NativeIdentity
     birth = await boundOpenCodeRead(birthWork, deadline - Date.now(), context.signal)
     check()
     openCodeReadAssert(!closeWork && !exited && birth !== null, 'identity_mismatch')
-    child.send({ type: 'start', nonce, pin: native.version, root: roots.root, password,
+    child.send({ type: 'start', nonce, pin: openCodeV2EngineVersion(native), root: roots.root, password,
       executableSha256, moduleSha256: graph.moduleSha256 })
     const row = await boundOpenCodeRead(ready, deadline - Date.now(), context.signal)
     check()
     const currentBirth = await readProcessStartTimeMs(child.pid)
     check()
-    openCodeReadAssert(!closeWork && !exited && row.pid === child.pid && row.version === native.version &&
+    openCodeReadAssert(!closeWork && !exited && row.pid === child.pid && row.version === openCodeV2EngineVersion(native) &&
       row.moduleSha256 === graph.moduleSha256 && row.executableSha256 === executableSha256 &&
       currentBirth === birth, 'identity_mismatch')
     openCodeReadAssert(typeof row.baseUrl === 'string' && /^http:\/\/127\.0\.0\.1:[1-9]\d*$/.test(row.baseUrl), 'identity_mismatch')

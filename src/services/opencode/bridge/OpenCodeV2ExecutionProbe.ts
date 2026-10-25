@@ -1,3 +1,4 @@
+import { openCodeV2EngineVersion } from '../compatibility/OpenCodeV2Registry.js'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, realpath, lstat, writeFile, rename } from 'node:fs/promises'
@@ -174,7 +175,7 @@ export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, 
     if (record.failure) return await finishFailure(record)
     if (!record.submitted) {
       const ready = await awaitOpenCodeV2RunMemberReadiness(owner, { memberId: 'probe', originalSessionId: record.sessionID,
-        selectedModel: `${selection.model.providerID}/${selection.model.id}`, selectedVariant: variant, pin: selection.native.version },
+        selectedModel: `${selection.model.providerID}/${selection.model.id}`, selectedVariant: variant, pin: openCodeV2EngineVersion(selection.native) },
         Math.max(1, Math.min(OPEN_CODE_V2_RUN_INITIALIZATION_MS, deadline - Date.now())))
       if (!ready) return { state: 'pending' as const, proof: null, reason: 'Original native member is not ready; no input was submitted.' }
       assertDeadline()

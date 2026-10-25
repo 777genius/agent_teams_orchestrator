@@ -1,3 +1,4 @@
+import { openCodeV2EngineVersion } from '../compatibility/OpenCodeV2Registry.js'
 import { openCodeBunVersion } from '../../../constants/openCodeBunVersion.js'
 import { assertSelectedOpenCodeV2ControllerState, deriveSelectedOpenCodeV2ControllerState } from './OpenCodeV2Profile.js'
 import path from 'node:path'
@@ -104,9 +105,9 @@ export async function prepareOwnedNativeExecutionPlan(validatedNative: Validated
   }
   check()
   assertExecutionPlatformAvailable()
-  // Launch admission: the selected version must be in range and qualified (coded refusal).
-  assertOpenCodeV2Launchable(native.version)
-  executionAssert(native.generation === 'v2' && isOpenCodeV2Identity(native.version, native.dialect) &&
+  // Engine admission remains exact and platform-qualified; CLI recognition is independent.
+  assertOpenCodeV2Launchable(openCodeV2EngineVersion(native))
+  executionAssert(native.generation === 'v2' && isOpenCodeV2Identity(openCodeV2EngineVersion(native), native.dialect) &&
     process.versions.bun === openCodeBunVersion(), 'execution_identity_mismatch')
   executionAssert([context.teamId, context.runId, context.laneId, context.memberId].every(value => value.length > 0))
   await validateExecutionProfile(profile); check()
@@ -117,8 +118,8 @@ export async function prepareOwnedNativeExecutionPlan(validatedNative: Validated
   const graphSignal = context.signal && lifetimeSignal ? AbortSignal.any([context.signal, lifetimeSignal]) : context.signal ?? lifetimeSignal
   // A run cohort validates one exact receipt once for its concurrently
   // preparing members; every child still validates its own graph.
-  if (graphValidation) await graphValidation(native.version, native.graph, graphSignal)
-  else await validateExecutionGraph(native.version, native.graph, undefined, graphSignal)
+  if (graphValidation) await graphValidation(openCodeV2EngineVersion(native), native.graph, graphSignal)
+  else await validateExecutionGraph(openCodeV2EngineVersion(native), native.graph, undefined, graphSignal)
   check(); progress?.('graph-validated')
   const entry = delivery.entryPath; check()
   executionAssert(delivery.entrySha256 === native.entrySha256, 'execution_entry_changed'); check()
@@ -270,7 +271,7 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
     })
     const assertReadyIdentity = (row: Record<string, unknown>) => {
       executionAssert(mapping && !closeWork && !exited, 'execution_identity_mismatch')
-      executionAssert(row.pid === mapping.bun.nativePID && row.leaseOwnerId === leaseOwnerId && row.namespace === mapping.namespace.name && row.pin === native.version && row.graphSha256 === native.graph.sha256 &&
+      executionAssert(row.pid === mapping.bun.nativePID && row.leaseOwnerId === leaseOwnerId && row.namespace === mapping.namespace.name && row.pin === openCodeV2EngineVersion(native) && row.graphSha256 === native.graph.sha256 &&
         row.executableSha256 === native.bun.sha256 && row.profileEpoch === profile.epoch &&
         row.selectionSha256 === executionHash(profile.selection) && executionHash(row.birth) === executionHash(birth), 'execution_identity_mismatch')
     }
@@ -281,7 +282,7 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
       executionAssert(executionHash(await readExecutionBirth(mapping!.bun.hostPID)) === executionHash(birth), 'execution_identity_mismatch')
       check()
       executionAssert(typeof row.baseUrl === 'string' && /^http:\/\/127\.0\.0\.1:[1-9]\d*$/.test(row.baseUrl), 'execution_identity_mismatch')
-      authority = Object.freeze({ generation: 'v2', pin: native.version, dialect: native.dialect, graphSha256: native.graph.sha256,
+      authority = Object.freeze({ generation: 'v2', pin: openCodeV2EngineVersion(native), dialect: native.dialect, graphSha256: native.graph.sha256,
         selectedCli: Object.freeze({ path: native.executablePath, sha256: native.executableSha256, version: native.version }),
         // Published child PID and birth use the controller namespace; /info PID stays private.
         child: Object.freeze({ pid: mapping.bun.hostPID, birth: Object.freeze(birth), executablePath: native.bun.path, sha256: native.bun.sha256 }),

@@ -1,3 +1,4 @@
+import { openCodeV2EngineVersion } from '../compatibility/OpenCodeV2Registry.js'
 import { openCodeBunVersion } from '../../../constants/openCodeBunVersion.js'
 import { assertOpenCodeV2Launchable } from '../compatibility/OpenCodeV2Registry.js'
 import { recordOpenCodeV2ProviderFailure, retainOpenCodeV2InitializationPhase, type RunInitializationFacts, type RunInitializationPhase } from '../execution/OpenCodeV2Diagnostics.js'
@@ -44,8 +45,8 @@ export function validateRunLaunchPlan(plan: RunLaunchPlan): void {
   executionAssert(plan.source.files.length > 0 && plan.source.files.length <= 20_000 &&
     new Set(plan.source.files.map(file => file.path)).size === plan.source.files.length, 'run_source_invalid')
   for (const member of plan.members) {
-    // Every member's exact version must be in range and qualified before any effect.
-    assertOpenCodeV2Launchable(member.native.version)
+    // Every member's persisted engine must remain exactly qualified before any effect.
+    assertOpenCodeV2Launchable(openCodeV2EngineVersion(member.native))
     executionAssert(member.memberId.length > 0 && member.laneId.length > 0 && /^ses_[a-zA-Z0-9]+$/.test(member.originalSessionId), 'run_member_invalid')
     executionAssert(['source', 'packaged'].includes(member.native.runtimeMode) &&
       member.native.runtimeMode === plan.members[0]!.native.runtimeMode && member.native.generation === 'v2', 'run_pin_unsupported')
@@ -121,7 +122,7 @@ export class OpenCodeV2RunOwner {
       const age = initialization ? Date.now() - initialization.startedAt : 0
       return { memberId: plan.memberId, laneId: plan.laneId, originalSessionId: plan.originalSessionId,
         opencodeSessionId: plan.originalSessionId, runtimeSessionId: plan.originalSessionId,
-        profileEpoch: plan.profile.epoch, profileRoot: plan.profile.root, pin: plan.native.version,
+        profileEpoch: plan.profile.epoch, profileRoot: plan.profile.root, pin: openCodeV2EngineVersion(plan.native),
         ...(member ? { runtimePid: member.lease.authority.child.pid } : {}),
         selectedModel: `${plan.profile.selection.model.providerID}/${plan.profile.selection.model.id}`,
         ...(plan.profile.selection.model.variant === undefined ? {} : { selectedVariant: plan.profile.selection.model.variant }),

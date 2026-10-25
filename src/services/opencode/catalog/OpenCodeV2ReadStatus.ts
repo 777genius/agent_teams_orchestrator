@@ -1,13 +1,14 @@
 import { createHash } from 'node:crypto'
 import { openCodeReadAssert } from '../transport/OpenCodeBoundedFetch.js'
 import type { OpenCodeV2NativeIdentity } from '../compatibility/OpenCodeNativeIdentity.js'
-import type { OpenCodeV2Dialect, OpenCodeV2Pin } from '../compatibility/OpenCodeV2Registry.js'
+import { openCodeV2EngineVersion, type OpenCodeV2Dialect, type OpenCodeV2Pin } from '../compatibility/OpenCodeV2Registry.js'
 
 /** Serialized SDK contract for the later product reader. No generated native types. */
 export type OpenCodeV2ReadStatus = {
   schemaVersion: 1
   generation: 'v2'
   version: OpenCodeV2Pin
+  engineVersion?: OpenCodeV2Pin
   dialect: OpenCodeV2Dialect
   nativeSha256: string
   selectionKey: string
@@ -30,9 +31,9 @@ export type OpenCodeV2ReadStatus = {
 export function readStatusKey(value: string): string { return createHash('sha256').update(value).digest('hex') }
 export function emptyOpenCodeV2ReadStatus(native: OpenCodeV2NativeIdentity, directory: string): OpenCodeV2ReadStatus {
   return {
-    schemaVersion: 1, generation: 'v2', version: native.version, dialect: native.dialect,
+    schemaVersion: 1, generation: 'v2', version: native.version, engineVersion: openCodeV2EngineVersion(native), dialect: native.dialect,
     nativeSha256: native.executableSha256,
-    selectionKey: readStatusKey(`${native.executablePath}\0${native.executableSha256}\0${native.dialect}`),
+    selectionKey: readStatusKey(`${native.executablePath}\0${native.executableSha256}\0${native.dialect}${openCodeV2EngineVersion(native) === native.version ? '' : `\0${native.version}`}${native.origin === 'standalone' ? '\0standalone' : ''}`),
     locationKey: readStatusKey(directory), projectId: null, catalog: 'unavailable', configuration: null,
     authentication: 'unknown', supportState: 'capabilities_pending', teamLaunch: false, oneShot: false,
     providers: [], models: [], agents: [], defaultModel: null,

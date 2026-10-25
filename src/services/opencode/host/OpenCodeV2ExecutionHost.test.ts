@@ -8,7 +8,7 @@ import { executionHash, openCodeV2RunInitializationMs } from '../execution/OpenC
 import { executionNativeRetirementPhases, readExecutionNativeRootObservation, retainOpenCodeV2CatalogServerFailure,
   type ExecutionCleanupObservation, type ExecutionCleanupPhase } from '../execution/OpenCodeV2Diagnostics.js'
 import { boundOpenCodeRead } from '../transport/OpenCodeBoundedFetch.js'
-import { assertOpenCodeV2Launchable, isOpenCodeV2Identity } from '../compatibility/OpenCodeV2Registry.js'
+import { assertOpenCodeV2Launchable, isOpenCodeV2Identity, openCodeV2EngineVersion } from '../compatibility/OpenCodeV2Registry.js'
 import { openCodeV2ExecutionCloseAckReserveMs, runOpenCodeV2ExecutionCloseSequence } from '../execution/OpenCodeV2ExecutionClose.js'
 import { acquireExecutionLease, awaitExecutionHostReady } from './OpenCodeV2ExecutionHost.js'
 import { validateExecutionProfile, type ExecutionBirth, type SelectedExecutionProfile, type ValidatedExecutionNative } from './OpenCodeV2ExecutionBinding.js'
@@ -72,7 +72,7 @@ describe('execution host ownership and cleanup', () => {
         clearTimeout: (id: number) => { timers.delete(id) },
         executionAssert: (value: unknown, message = 'execution_contract_invalid') => { if (!value) throw new Error(message) },
         executionRecord: (value: unknown) => value, executionHash, executionProfileGuards: [], readExecutionGraphFailure: () => undefined,
-        assertOpenCodeV2Launchable, isOpenCodeV2Identity,
+        assertOpenCodeV2Launchable, isOpenCodeV2Identity, openCodeV2EngineVersion,
         prepareExecutionPlatformChild: async () => prepared, readExecutionPlatformBirth: async () => childBirth,
         resolveOpenCodeV2ExecutionDelivery: async () => ({ runtimeMode: native.runtimeMode, entrySha256: native.entrySha256 }),
         validateExecutionProfile: async () => {}, assertExecutionProfile: () => {}, openCodeBunVersion: () => 'TEST-bun',

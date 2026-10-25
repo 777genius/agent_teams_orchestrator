@@ -1,3 +1,4 @@
+import { openCodeV2EngineVersion } from '../compatibility/OpenCodeV2Registry.js'
 import { openCodeBunVersion } from '../../../constants/openCodeBunVersion.js'
 import path from 'node:path'
 import { canonicalizeOpenCodeProjectPath } from '../OpenCodeProfileManager.js'
@@ -92,7 +93,7 @@ export class OpenCodeV2TeamBridge {
           member.originalSessionId === expected.originalSessionId &&
           member.opencodeSessionId === expected.originalSessionId && member.runtimeSessionId === expected.originalSessionId &&
           member.selectedModel === `${model.providerID}/${model.id}` && member.selectedVariant === model.variant &&
-          member.pin === expected.native.version, 'run_readiness_changed')
+          member.pin === openCodeV2EngineVersion(expected.native), 'run_readiness_changed')
       }
       if (status.state === 'active') {
         executionAssert(Date.now() < deadline && openCodeV2SupportedSourcePredicate(status) &&
@@ -336,7 +337,7 @@ async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: O
         expectedBehaviorFingerprint: probe.proof?.expectedBehaviorEvidence.expectedBehaviorFingerprint ?? '',
         binaryPath: probe.proof?.binaryPath ?? selection.native.executablePath,
         binaryFingerprint: probe.proof?.binaryFingerprint ?? await resolveOpenCodeBinaryHostIdentity(selection.native.executablePath),
-        version: probe.proof?.opencodeVersion ?? selection.native.version }
+        version: probe.proof?.opencodeVersion ?? selection.native.version, engineVersion: openCodeV2EngineVersion(selection.native) }
 
       const identity = createBridgeServerIdentity(null, { runtimeStoreManifestHighWatermark: typeof body.expectedManifestHighWatermark === 'number' ? body.expectedManifestHighWatermark : null })
       identity.runtime.capabilitySnapshotId = measured.capabilitySnapshotId
@@ -470,8 +471,9 @@ async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: O
         const memberId = required(body.memberName, 'memberName')
         const member = await bridge.resolveMember(memberId, text(body.laneId), text(body.runtimeSessionId ?? body.sessionId), remaining())
         if (envelope.command === 'opencode.getRuntimeTranscript') {
+          const qualification = originalStatus?.qualification
           executionAssert(
-            openCodeV2LaunchRefusal(member.pin) === null && originalStatus?.qualification?.version === member.pin,
+            openCodeV2LaunchRefusal(member.pin) === null && (qualification?.engineVersion === undefined ? qualification?.version : qualification.engineVersion) === member.pin,
             'v2_transcript_version_unsupported')
           const window = body.messageLimit
           executionAssert(window === undefined || (typeof window === 'number' && Number.isSafeInteger(window) && window > 0),

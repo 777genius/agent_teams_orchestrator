@@ -1,3 +1,4 @@
+import { openCodeV2EngineVersion } from '../../../../services/opencode/compatibility/OpenCodeV2Registry.js'
 import { recordOpenCodeV2ProviderFailure } from '../../../../services/opencode/execution/OpenCodeV2Diagnostics.js'
 import { openCodeV2Refusal } from '../../../../services/opencode/execution/OpenCodeV2RefusalReason.js'
 export { recordOpenCodeV2ProviderFailure } from '../../../../services/opencode/execution/OpenCodeV2Diagnostics.js'
@@ -43,8 +44,8 @@ export async function selectedProviderUsesOpenCodeV2(): Promise<boolean> {
   return (await selectedOpenCodeV2Version()) !== null
 }
 export async function selectedOpenCodeV2Version(): Promise<OpenCodeV2Pin | null> {
-  const { policy } = await inspectOpenCodeReadSelection()
-  return policy.generation === 'v2' ? policy.version : null
+  const { policy, native } = await inspectOpenCodeReadSelection()
+  return policy.generation === 'v2' && native ? openCodeV2EngineVersion(native) : null
 }
 
 
@@ -149,7 +150,7 @@ export async function connectOpenCodeV2Provider(input: ConnectProviderInput): Pr
           phase = 'original-proof-readback'
           const current = await executionProof(owner.authority.directory, text(connection.verifiedModelId), undefined, false)
           executionAssert(current.state === 'available' && current.proof && executionHash(current.proof) === executionHash(originalProof) &&
-            current.proof.opencodeVersion === owner.authority.pin && current.proof.binaryPath === owner.authority.selectedCli.path && Date.parse(current.proof.expiresAt) > Date.now(), 'provider_saved_proof_unqualified')
+            current.proof.opencodeVersion === owner.authority.selectedCli.version && current.proof.binaryPath === owner.authority.selectedCli.path && Date.parse(current.proof.expiresAt) > Date.now(), 'provider_saved_proof_unqualified')
           acceptedProof = current.proof
           phase = 'catalog-retirement'
           return connection

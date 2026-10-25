@@ -1,15 +1,15 @@
 import qualificationData from './opencode-v2-qualifications.json' with { type: 'json' }
 
 /**
- * The single OpenCode V2 version policy. Recognition, the API dialect, the
- * staged package graph and launch admission all derive from this module.
+ * Installed CLI recognition and qualified owned-engine selection. The CLI is an
+ * identity/configuration source; only the owned engine determines API dialect.
  *
  * - Recognition is a range rule: any exact stable release >=2.0.0 <3.0.0.
- * - A graph is the official `@opencode/server` and `@opencode/client` release
- *   of that exact version, installed under version-derived aliases.
+ * - An engine graph is the official `@opencode/server` and `@opencode/client`
+ *   release at one exact qualified engine version, independent of the CLI.
  * - Launch additionally requires a team-launch qualification record with
  *   evidence for the running platform (`opencode-v2-qualifications.json`).
- *   Recognition alone never admits a run.
+ *   Recognition alone never qualifies an engine or weakens its byte checks.
  */
 export const OPENCODE_V2_SUPPORTED_RANGE = Object.freeze({ minimum: '2.0.0', below: '3.0.0' } as const)
 
@@ -141,6 +141,21 @@ const byVersion = (left: OpenCodeV2Pin, right: OpenCodeV2Pin) => compare(release
 export function openCodeV2Qualification(version: OpenCodeV2Pin): OpenCodeV2Qualification | null {
   return qualifications.get(version) ?? null
 }
+/** Select only the owned engine. Installed stable V2 CLI releases are not an engine allowlist. */
+export function resolveOpenCodeV2EngineVersion(cliVersion: unknown, platform = openCodeV2CurrentPlatform()): OpenCodeV2Pin | null {
+  if (!isOpenCodeV2Pin(cliVersion)) return null
+  const qualified = openCodeV2QualifiedVersions().filter(version => openCodeV2LaunchRefusal(version, platform) === null)
+  return qualified.includes(cliVersion) ? cliVersion : qualified.at(-1) ?? null
+}
+
+/** Legacy persisted identities keep their original engine, never today's selection default. */
+export function openCodeV2EngineVersion(identity: { version: OpenCodeV2Pin; engineVersion?: OpenCodeV2Pin; dialect: OpenCodeV2Dialect }): OpenCodeV2Pin {
+  const version = identity.engineVersion === undefined ? identity.version : identity.engineVersion
+  if (!isOpenCodeV2Pin(identity.version)) throw new Error('opencode_v2_version_out_of_range')
+  if (!isOpenCodeV2Identity(version, identity.dialect)) throw new Error('execution_identity_mismatch')
+  return version
+}
+
 export function openCodeV2QualifiedVersions(): readonly OpenCodeV2Pin[] {
   return [...qualifications.keys()].sort(byVersion)
 }
@@ -148,14 +163,14 @@ export function openCodeV2CurrentPlatform(): string {
   return `${process.platform}-${process.arch}`
 }
 /** Published with each runtime release; the desktop pins this exact contract in its runtime lock.
- * `qualified` lists, per release platform, the versions admitted for team launch there. */
+ * `qualified` lists, per release platform, the exact owned engines admitted for team launch there. */
 export function openCodeV2ReleaseContract(): Readonly<{
-  range: typeof OPENCODE_V2_SUPPORTED_RANGE; qualified: Readonly<Record<OpenCodeV2ReleasePlatform, readonly OpenCodeV2Pin[]>>
+  cliVersionPolicy: 'stable-v2-qualified-engine'; range: typeof OPENCODE_V2_SUPPORTED_RANGE; qualified: Readonly<Record<OpenCodeV2ReleasePlatform, readonly OpenCodeV2Pin[]>>
 }> {
   const qualified = Object.fromEntries(OPENCODE_V2_RELEASE_PLATFORMS.map(platform => [platform,
     [...qualifications.values()].filter(record => record.scope === OPENCODE_V2_TEAM_LAUNCH_SCOPE &&
       record.platforms.includes(platform)).map(record => record.version).sort(byVersion)]))
-  return { range: { ...OPENCODE_V2_SUPPORTED_RANGE }, qualified: qualified as Record<OpenCodeV2ReleasePlatform, OpenCodeV2Pin[]> }
+  return { cliVersionPolicy: 'stable-v2-qualified-engine', range: { ...OPENCODE_V2_SUPPORTED_RANGE }, qualified: qualified as Record<OpenCodeV2ReleasePlatform, OpenCodeV2Pin[]> }
 }
 
 export type OpenCodeV2LaunchRefusal = 'opencode_v2_version_out_of_range' | 'opencode_v2_version_unqualified'

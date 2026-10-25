@@ -1,9 +1,10 @@
+import { openCodeV2EngineVersion } from '../compatibility/OpenCodeV2Registry.js'
 import type { OpenCodeV2Pin } from '../compatibility/OpenCodeV2Registry.js'
 import path from 'node:path'
 import { readExecutionPlatformBirth } from './OpenCodeV2ExecutionPlatform.js'
 import filesystem, { lstat, open, readFile, readdir } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
-import { hashOpenCodeFile, readOpenCodePackageManifest, type OpenCodeV2NativeIdentity } from '../compatibility/OpenCodeNativeIdentity.js'
+import { hashOpenCodeFile, readOpenCodePackageManifest, readOpenCodeNativePackageMetadata, type OpenCodeV2NativeIdentity } from '../compatibility/OpenCodeNativeIdentity.js'
 import { assertExecutionSelectedModel, executionAssert, executionHash, executionRecord,
   type ExecutionSelectedModel, type ExecutionBirth } from '../execution/OpenCodeV2ExecutionContracts.js'
 import { verifyOpenCodeV2ServerGraph } from './OpenCodeV2ServerGraph.js'
@@ -278,11 +279,18 @@ function dependencyPackageName(name: string, specification: unknown): string {
 }
 
 export async function validateExecutionNative(native: ValidatedExecutionNative): Promise<void> {
+  openCodeV2EngineVersion(native)
   executionAssert(await filesystem.realpath(native.executablePath) === native.executablePath && /^opencode(?:\.exe)?$/.test(path.basename(native.executablePath)), 'execution_identity_mismatch')
-  const metadata = executionRecord(await readOpenCodePackageManifest(path.join(path.dirname(path.dirname(native.executablePath)), 'package.json')))
-  const platform = process.platform === 'win32' ? 'windows' : process.platform
-  executionAssert(metadata.name === native.packageName && metadata.version === native.version &&
-    native.packageName.startsWith(`@opencode/cli-${platform}-${process.arch}`), 'execution_identity_mismatch')
+  const raw = await readOpenCodeNativePackageMetadata(native.executablePath)
+  if (native.origin === 'standalone') {
+    executionAssert(native.packageName === null && raw === undefined, 'execution_identity_mismatch')
+  } else {
+    executionAssert(native.origin === undefined || native.origin === 'npm', 'execution_identity_mismatch')
+    const metadata = executionRecord(raw)
+    const platform = process.platform === 'win32' ? 'windows' : process.platform
+    executionAssert(typeof native.packageName === 'string' && metadata.name === native.packageName && metadata.version === native.version &&
+      native.packageName.startsWith(`@opencode/cli-${platform}-${process.arch}`), 'execution_identity_mismatch')
+  }
   executionAssert(await hashOpenCodeFile(native.executablePath) === native.executableSha256, 'execution_identity_mismatch')
   const handle = await open(native.executablePath, 'r')
   try {

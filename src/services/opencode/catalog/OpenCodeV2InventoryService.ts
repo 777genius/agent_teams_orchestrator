@@ -1,3 +1,4 @@
+import { openCodeV2EngineVersion } from '../compatibility/OpenCodeV2Registry.js'
 import type { OpenCodeClientRequestContext } from '../OpenCodeClientRequestContext.js'
 import type { OpenCodeConnectedProvider, OpenCodeInventorySnapshot } from '../types.js'
 import { openCodeV2KeyIntegrations, readOpenCodeV2ConnectedProviders } from './OpenCodeV2KeyIntegrations.js'
@@ -16,7 +17,7 @@ export function openCodeV2InventorySnapshot(native: OpenCodeV2NativeIdentity, di
   connectedProviders: readonly OpenCodeConnectedProvider[] = [], probeRefusal = false): OpenCodeInventorySnapshot {
   // The directory offers the native key integrations; completed V2 connections mark them connected.
   const availableProviders = [...new Set([...readStatus.providers.map(row => row.id),
-    ...openCodeV2KeyIntegrations(native.version).map(entry => entry.providerId)])]
+    ...openCodeV2KeyIntegrations(openCodeV2EngineVersion(native)).map(entry => entry.providerId)])]
   return { detected: true, binaryPath: native.executablePath, version: native.version, projectPath: directory,
     profile: null, authStorePath: null, connectedProviders: [...connectedProviders], availableProviders,
     models: readStatus.models.map(row => `${row.providerId}/${row.catalogId}`), modelMetadata: [],
@@ -37,13 +38,13 @@ export async function probeOpenCodeV2Inventory(native: OpenCodeV2NativeIdentity,
   try {
     // The read host runs outside the sandbox; connect and launch do not. Refuse the catalog with
     // the cause when this version or this Linux launcher would refuse every execution.
-    await assertOpenCodeV2ExecutionReady(native.version)
+    await assertOpenCodeV2ExecutionReady(openCodeV2EngineVersion(native))
     host = await acquireOpenCodeV2ReadHost(native, directory, boundedContext)
     reader = await createOpenCodeV2ReadClient(host.authority, boundedContext)
     const sdk = reader.client, wrap = (value: unknown) => readWrapped(value, directory, projectId)
     const identity = readRecord(await sdk.identity())
-    openCodeReadAssert(identity.pid === host.authority.pid && identity.version === native.version &&
-      (openCodeV2Wire(native.version) !== 'floor' || identity.healthy === true), 'identity_mismatch')
+    openCodeReadAssert(identity.pid === host.authority.pid && identity.version === openCodeV2EngineVersion(native) &&
+      (openCodeV2Wire(openCodeV2EngineVersion(native)) !== 'floor' || identity.healthy === true), 'identity_mismatch')
     const urls = readArray(await sdk.urls())
     openCodeReadAssert(urls.includes(host.authority.baseUrl), 'identity_mismatch')
     const projectId = readLocation(await sdk.location(directory), directory)
