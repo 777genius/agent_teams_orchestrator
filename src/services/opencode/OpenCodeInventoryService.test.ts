@@ -835,9 +835,10 @@ describe('OpenCode Models.dev cache seeding', () => {
       clock += OPEN_CODE_MODELS_CACHE_SEED_RETRY_MS - 60_000
       expect(await seedOpenCodeModelsCache(input)).toBe('unavailable')
       expect(calls).toBe(1)
-      clock += 120_000
       const stale = Date.now() - 2 * OPEN_CODE_MODELS_CACHE_SEED_RETRY_MS
       await markAt(stale)
+      // Just past the window, so a longer window would fail here.
+      clock = stale + OPEN_CODE_MODELS_CACHE_SEED_RETRY_MS + 60_000
       expect(await seedOpenCodeModelsCache({ ...input, exec: async () => { calls += 1; throw new Error('spawn failed') } }))
         .toBe('unavailable')
       expect(calls).toBe(2)

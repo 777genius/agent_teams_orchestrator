@@ -380,7 +380,7 @@ export function seedOpenCodeModelsCache(input: {
     if (input.abortSignal?.aborted) return 'unavailable'
     await mkdir(cacheDirectory, { recursive: true })
       // Non-empty, changing content: every failure must move the marker's mtime,
-      // also where truncating an already empty file would not (Windows).
+      // which rewriting an already empty file does not guarantee on every platform.
       .then(() => writeFile(failureMarker, `${new Date().toISOString()}\n`))
       .catch(() => undefined)
     return 'unavailable'
