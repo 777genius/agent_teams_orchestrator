@@ -635,7 +635,12 @@ export async function executeSelectedOpenCodeBridgeCommandEnvelope(input: unknow
   catch (error) {
     const result = refusal(envelope, Date.now(), error instanceof Error ? error.message : 'selection_unavailable')
     const diagnostics = getOpenCodeVersionProbeDiagnostics(error)
-    return diagnostics.length ? { ...result, diagnostics } : result
+    return diagnostics.length ? { ...result, diagnostics: diagnostics.map(data => ({
+      providerId: 'opencode' as const, type: data.code, severity: 'error' as const,
+      message: data.code === 'opencode_version_probe_helper_failed'
+        ? 'OpenCode version probe helper failed.' : 'OpenCode version probe cleanup could not be confirmed.',
+      createdAt: result.completedAt, data,
+    })) } : result
   }
   const selected = selectOpenCodeRuntimeAdapter(selection.policy, {
     v1: () => () => executeV1(input),

@@ -95,6 +95,29 @@ test('a hung Windows helper exhausts the original remainder without a retirement
   expect(f.removed()).toBe(0)
 })
 
+test('Darwin census can exceed two seconds while retaining physical cleanup proof', async () => {
+  const f = fixture('darwin', [2200])
+  expect(await f.run()).toBe('1.18.34\n')
+  expect(f.budgets).toEqual([5000])
+  expect(f.removed()).toBe(1)
+})
+
+test('Darwin census budget is clipped to the original probe deadline', async () => {
+  const f = fixture('darwin', [1500], 1, 4000)
+  expect(await f.run()).toBe('1.18.34\n')
+  expect(f.budgets).toEqual([4000])
+  expect(f.elapsed()).toBe(5500)
+  expect(f.removed()).toBe(1)
+})
+
+test('a hung Darwin census retains ownership without extending the probe deadline', async () => {
+  const f = fixture('darwin', [6000])
+  await expect(f.run()).rejects.toBeInstanceOf(OpenCodeVersionProbeCleanupError)
+  expect(f.budgets).toEqual([5000])
+  expect(f.elapsed()).toBe(5000)
+  expect(f.removed()).toBe(0)
+})
+
 test('POSIX process-table helpers keep their two-second cap', async () => {
   const f = fixture('linux', [1000])
   expect(await f.run()).toBe('1.18.34\n')
@@ -324,7 +347,7 @@ test('darwin gone group member with reparented PPID requires absence and final c
   expect(f.trees()).toBeGreaterThanOrEqual(4)
   expect(f.removed()).toBe(1)
   expect(f.signalled).toEqual([])
-  expect(f.budgets.every(budget => budget > 0 && budget <= 2000)).toBe(true)
+  expect(f.budgets.every(budget => budget > 0 && budget <= 5000)).toBe(true)
   expect(f.events.slice(-2)).toEqual(['census:empty', 'remove'])
 })
 
