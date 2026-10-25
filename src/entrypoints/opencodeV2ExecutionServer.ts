@@ -48,7 +48,7 @@ function reportStartupFailure(reason: 'timeout' | 'failed', error?: unknown): vo
   const causes = ['execution_contract_invalid', 'execution_identity_mismatch', 'execution_entry_changed',
     'v2_compiled_runtime_unsupported', 'v2_execution_layout_unsupported', 'execution_profile_changed',
     'execution_graph_changed', 'execution_graph_incomplete', 'execution_graph_dependency_missing',
-    'execution_identity_mismatch', 'execution_realpath_unavailable',
+    'execution_ipc_unavailable', 'execution_realpath_unavailable',
     'execution_timeout', 'execution_cancelled', 'opencode_v2_version_out_of_range', 'opencode_v2_version_unqualified',
     'opencode_v2_graph_unavailable']
   const cause = error instanceof Error && causes.includes(error.message) ? error.message : undefined

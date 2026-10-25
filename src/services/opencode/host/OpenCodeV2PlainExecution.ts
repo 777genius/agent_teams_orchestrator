@@ -1,14 +1,16 @@
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { readFile, realpath } from 'node:fs/promises'
-import { killProcessTree, readProcessStartTimeMs } from '../../../utils/processKill.js'
+import { readdir, readFile, realpath } from 'node:fs/promises'
+import { killProcessTreeAndWait, readProcessStartTimeMs } from '../../../utils/processKill.js'
+import { windowsNativeProcess } from '../../../utils/windowsNativeProcess.js'
 import { executionAssert, executionHash, executionRecord, type ExecutionBirth } from '../execution/OpenCodeV2ExecutionContracts.js'
 
 // V2 execution runs the shipped Bun as an ordinary child process, like the V1 host:
 // no OS sandbox. The owner keeps the exact child identity (PID and start time), the
-// private IPC handshake and the closed acknowledgement. Retirement claims only what it
-// checked: on POSIX the child's whole process group is gone; on Windows the child itself
-// exited after a process-tree kill, and its descendants are retired best-effort.
+// private IPC handshake and the closed acknowledgement, and checks the launched image
+// itself where the OS exposes it (Linux /proc, darwin proc_pidpath). Retirement claims
+// only what it checked: on POSIX the child's whole process group is gone; on Windows the
+// child exited and every descendant seen before close was killed, which stays best-effort.
 
 export type PlainExecutionMapping = Readonly<{
   bun: Readonly<{ hostPID: number; nativePID: number; birth: ExecutionBirth; executablePath: string; executableSha256: string }>
@@ -66,18 +68,61 @@ export async function planPlainExecution(requested: Readonly<{
   return plan
 }
 
-/** Kill the child and everything it started: its own process group on POSIX, taskkill /T on Windows. */
-function killTree(pid: number): void {
-  if (process.platform === 'win32') { killProcessTree(pid, 'SIGKILL'); return }
-  try { process.kill(-pid, 'SIGKILL') } catch { try { process.kill(pid, 'SIGKILL') } catch { /* Already gone. */ } }
+/** POSIX: the child leads its own process group, so the group signal reaches every
+ * command it started and never a reused single PID. */
+function killGroup(pgid: number): void {
+  try { process.kill(-pgid, 'SIGKILL') } catch { /* Group already gone. */ }
 }
-/** POSIX only: true once no process is left in the group. Killed members stay visible until reaped. */
+/** Linux: a killed member stays visible until its parent reaps it. A container whose
+ * PID 1 never reaps would keep the group occupied forever, so zombies count as gone. */
+async function linuxGroupHasLiveMember(pgid: number): Promise<boolean> {
+  for (const entry of await readdir('/proc')) {
+    if (!/^\d+$/.test(entry)) continue
+    const stat = await readFile(`/proc/${entry}/stat`, 'utf8').catch(() => null)
+    if (stat === null) continue
+    const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ')
+    if (Number(fields[2]) === pgid && fields[0] !== 'Z' && fields[0] !== 'X') return true
+  }
+  return false
+}
+/** POSIX only: true once no live process is left in the group. */
 export async function processGroupEmpty(pgid: number, deadline: number): Promise<boolean> {
   for (;;) {
     try { process.kill(-pgid, 0) } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ESRCH') return true }
+    if (process.platform === 'linux' && !await linuxGroupHasLiveMember(pgid)) return true
     if (Date.now() >= deadline) return false
     await new Promise(resolve => setTimeout(resolve, 25))
   }
+}
+type WindowsDescendant = Readonly<{ pid: number; birth: number }>
+/** Windows: descendants of the child with their creation time, read while the child is alive.
+ * taskkill /T walks parent links, which a descendant of an exited child no longer has. */
+async function windowsDescendants(root: number): Promise<WindowsDescendant[]> {
+  const native = await windowsNativeProcess()
+  if (!native) return []
+  const rows = native.table(), found: WindowsDescendant[] = [], parents = new Set([root])
+  for (let grew = true; grew;) {
+    grew = false
+    for (const row of rows) {
+      if (!parents.has(row.ppid) || parents.has(row.pid) || row.pid === row.ppid) continue
+      parents.add(row.pid); grew = true
+      const birth = native.birth(row.pid)
+      if (birth !== null) found.push({ pid: row.pid, birth })
+    }
+  }
+  return found
+}
+/** The launched image as the host reads it, not as the child reports it. */
+async function launchedImageSha256(pid: number): Promise<string | null> {
+  if (process.platform === 'linux') return sha(`/proc/${pid}/exe`)
+  if (process.platform !== 'darwin') return null
+  const { dlopen, FFIType, ptr } = await import('bun:ffi')
+  const native = dlopen('/usr/lib/libSystem.B.dylib', { proc_pidpath: { args: [FFIType.i32, FFIType.ptr, FFIType.u32], returns: FFIType.i32 } })
+  try {
+    const buffer = Buffer.alloc(4096)
+    const length = native.symbols.proc_pidpath(pid, ptr(buffer), buffer.length)
+    return length > 0 ? sha(buffer.toString('utf8', 0, length)) : null
+  } finally { native.close() }
 }
 
 export function launchPlainExecution(plan: PlainExecutionPlan, nonce: string, leaseOwnerId: string,
@@ -88,6 +133,15 @@ export function launchPlainExecution(plan: PlainExecutionPlan, nonce: string, le
   const child = spawn(plan.bun.path, [plan.entry], { cwd: plan.cwd, env: { ...plan.env },
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'], serialization: 'json', detached: process.platform !== 'win32', windowsHide: true })
   let ended = false, closed = false, stopping = false, startSent = false
+  let snapshot: Promise<WindowsDescendant[]> = Promise.resolve([])
+  // Take the Windows tree while the child still parents it; the child exits right after its close ACK.
+  const recordDescendants = () => {
+    if (process.platform !== 'win32' || !child.pid || ended) return
+    const previous = snapshot, pid = child.pid
+    snapshot = Promise.all([previous, windowsDescendants(pid).catch(() => [])]).then(([left, right]) =>
+      [...new Map([...left, ...right].map(row => [`${row.pid}:${row.birth}`, row])).values()])
+  }
+  if (process.platform === 'win32') void windowsNativeProcess()
   let mapping: PlainExecutionMapping | undefined
   let prepareWork: Promise<PlainExecutionMapping> | undefined, retireWork: Promise<PlainExecutionRetirement> | undefined
   let stdout = '', stderr = ''
@@ -126,6 +180,8 @@ export function launchPlainExecution(plan: PlainExecutionPlan, nonce: string, le
       const birth = await readPlainExecutionBirth(child.pid)
       executionAssert(birth && message.pid === child.pid && same(message.birth, birth) && message.namespace === PLAIN_NAMESPACE &&
         message.executableSha256 === plan.bun.sha256, 'execution_identity_mismatch')
+      const image = await launchedImageSha256(child.pid)
+      executionAssert(image === null && process.platform === 'win32' || image === plan.bun.sha256, 'execution_identity_mismatch')
       mapping = Object.freeze({ bun: Object.freeze({ hostPID: child.pid, nativePID: child.pid, birth,
         executablePath: plan.bun.path, executableSha256: plan.bun.sha256 }),
       namespace: Object.freeze({ name: PLAIN_NAMESPACE }), leaseOwnerId })
@@ -137,19 +193,25 @@ export function launchPlainExecution(plan: PlainExecutionPlan, nonce: string, le
     return retireWork ??= (async () => {
       stopping = true; preparedReject(new Error('execution_retired_before_start'))
       try { if (prepareWork) await prepareWork } catch { /* The spawned process is still retired below. */ }
-      if (child.pid && !ended) killTree(child.pid)
+      executionAssert(child.pid, 'cleanup_unknown')
+      const pid = child.pid
+      if (process.platform === 'win32') {
+        recordDescendants()
+        if (!ended) await killProcessTreeAndWait(pid, 'SIGKILL', { timeoutMs: 3000 })
+      } else if (!ended) killGroup(pid)
       let timer: ReturnType<typeof setTimeout> | undefined
       try { await Promise.race([exit, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('cleanup_unknown')), 5000) })]) }
       finally { clearTimeout(timer) }
-      executionAssert(child.pid, 'cleanup_unknown')
       let scopeClosed: boolean, descendants: PlainExecutionDescendants
       if (process.platform === 'win32') {
-        // The child exited; the tree kill above cannot prove a detached descendant is gone.
+        // Kill every recorded descendant that still has its recorded creation time. One started
+        // after the last snapshot, or outside the tree, is not seen: best-effort, not proof.
+        for (const row of await snapshot) await killProcessTreeAndWait(row.pid, 'SIGKILL', { timeoutMs: 1000, expectedStartedAtMs: row.birth })
         scopeClosed = true; descendants = 'best-effort'
       } else {
         // The leader is gone; its process group may still hold commands it started.
-        killTree(child.pid)
-        scopeClosed = await processGroupEmpty(child.pid, Date.now() + 2000)
+        killGroup(pid)
+        scopeClosed = await processGroupEmpty(pid, Date.now() + 2000)
         descendants = scopeClosed ? 'process-group' : 'unknown'
       }
       const birth = mapping?.bun.birth ?? Object.freeze({ format: 'utc-ms' as const, value: '0', bootId: null })
@@ -160,7 +222,10 @@ export function launchPlainExecution(plan: PlainExecutionPlan, nonce: string, le
   }
   return Object.freeze({ child, exit, prepare, retire,
     exited: () => ended, acknowledged: () => closed, output: () => ({ stdout, stderr }),
-    sendClose: () => { stopping = true; executionAssert(child.connected, 'cleanup_unknown'); child.send({ type: 'close', nonce, leaseOwnerId }) },
+    sendClose: () => {
+      stopping = true; executionAssert(child.connected, 'cleanup_unknown')
+      recordDescendants(); child.send({ type: 'close', nonce, leaseOwnerId })
+    },
     async start(payload: Readonly<Record<string, unknown>>, deadline: number, signal?: AbortSignal): Promise<void> {
       executionAssert(mapping && !ended && !stopping && !startSent, 'execution_identity_mismatch')
       executionAssert(same(await readPlainExecutionBirth(mapping.bun.hostPID), mapping.bun.birth), 'execution_identity_mismatch')
@@ -180,7 +245,11 @@ export function launchPlainExecution(plan: PlainExecutionPlan, nonce: string, le
       } finally { clearTimeout(timer); if (abort) signal?.removeEventListener('abort', abort) }
     },
     readBirth: () => readPlainExecutionBirth(child.pid!),
-    kill(): void { executionAssert(child.pid, 'cleanup_unknown'); killTree(child.pid) },
+    kill(): void {
+      executionAssert(child.pid, 'cleanup_unknown')
+      if (process.platform !== 'win32') { killGroup(child.pid); return }
+      recordDescendants(); void killProcessTreeAndWait(child.pid, 'SIGKILL', { timeoutMs: 3000 })
+    },
     async assertLive(): Promise<void> {
       executionAssert(mapping && !ended, 'execution_identity_mismatch')
       executionAssert(same(await readPlainExecutionBirth(mapping.bun.hostPID), mapping.bun.birth), 'execution_identity_mismatch')

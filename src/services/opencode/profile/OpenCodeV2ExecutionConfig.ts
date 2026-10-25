@@ -24,10 +24,12 @@ export type ExecutionConfigInput = {
  * (buildOpenCodeTeammatePermission('auto')): everything is denied except reading and
  * searching files, editing them, running shell commands, the todo list and the team
  * controller tools. Subagents and paths outside the project stay denied. The last
- * matching rule wins, so the catch-all deny comes first. */
+ * matching rule wins, so the catch-all deny comes first.
+ * V2 offers MCP tools only through its code-mode `execute` tool, and every tool called
+ * from it still asserts its own action, so `execute` reaches nothing the rules deny. */
 export const OPENCODE_V2_TEAMMATE_PERMISSIONS: ExecutionSelection['permissions'] = Object.freeze([
   { action: '*', resource: '*', effect: 'deny' as const },
-  ...['read', 'glob', 'grep', 'todowrite', 'edit', 'shell'].map(action => ({ action, resource: '*', effect: 'allow' as const })),
+  ...['read', 'glob', 'grep', 'todowrite', 'edit', 'shell', 'execute'].map(action => ({ action, resource: '*', effect: 'allow' as const })),
   { action: 'subagent', resource: '*', effect: 'deny' as const },
   { action: 'external_directory', resource: '*', effect: 'deny' as const },
   ...['agent-teams_*', 'agent_teams_*', 'mcp__agent-teams__*', 'mcp__agent_teams__*']

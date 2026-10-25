@@ -188,10 +188,9 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
         // Without a committed child identity no cleanup receipt can exist. The
         // launch-owned empty-scope retirement is the only proof that may free
         // this owner; anything else retains the physical fence on uncertainty.
-        // The read bound must outlive the native retirement's own kill-and-empty
-        // wait (12s on a cold AV-torn runner): abandoning an in-flight proof
-        // converts a transient launch failure into a retained fence whose 183
-        // refusal then masks that original failure.
+        // The read bound must outlive the retirement's own kill-and-empty wait:
+        // abandoning an in-flight proof converts a launch failure into a retained
+        // fence whose refusal then masks that original failure.
         const proof = await boundOpenCodeRead(launch.retire(), 30000)
         if (owner) { await owner.abandonAfterUnboundSpawn(proof); unboundRetired = true }
       } catch { /* Retain physical owner on uncertainty. */ }

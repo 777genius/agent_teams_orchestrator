@@ -24,10 +24,12 @@ function parseProbeFailure(value: unknown): RunProbeFailure | null {
   return value
 }
 const WINDOWS = process.platform === 'win32'
-async function privateDirectory(root: string) {
+/** `lexicalRoot`: on Windows the configured data root may differ from its real path in letter
+ * case or 8.3 names; it is canonicalized once and everything below must match exactly. */
+async function privateDirectory(root: string, lexicalRoot = false) {
   await mkdir(root, { recursive: true, mode: 0o700 })
   const stat = await lstat(root)
-  executionAssert(await realpath(root) === root && stat.isDirectory() && !stat.isSymbolicLink() &&
+  executionAssert((lexicalRoot && WINDOWS || await realpath(root) === root) && stat.isDirectory() && !stat.isSymbolicLink() &&
     (WINDOWS || stat.uid === process.getuid?.() && (stat.mode & 0o077) === 0), 'probe_store_foreign')
 }
 
@@ -63,7 +65,7 @@ export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, 
   assertDeadline()
   let dataRoot: string, directory: string, file: string, guard: string
   {
-    await privateDirectory(requestedDataRoot)
+    await privateDirectory(requestedDataRoot, true)
     dataRoot = await realpath(requestedDataRoot)
     directory = path.join(dataRoot, 'opencode/v2/execution-probes', sourceKey)
     await privateDirectory(directory)

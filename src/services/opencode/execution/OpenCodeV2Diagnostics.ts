@@ -305,6 +305,9 @@ const privateProviderFailureCodes = new Set(['provider_missing', 'provider_key_m
   'provider_saved_proof_changed', 'provider_saved_proof_unqualified', 'provider_physical_cleanup_unknown', 'provider_mutation_unknown',
   'provider_response_invalid', 'provider_authority_changed', 'provider_directory_changed', 'provider_rollback_peer_changed',
   'provider_rollback_publication_changed', 'provider_rollback_unknown', 'provider_rollback_publication_unknown',
+  'execution_spawn_failed', 'execution_child_exited', 'execution_prepare_timeout', 'execution_prepare_aborted',
+  'execution_retired_before_start', 'execution_platform_unsupported', 'execution_environment_injection', 'execution_ipc_unavailable',
+  'execution_profile_not_private',
   'run_control_timeout', 'run_control_disconnected', 'run_control_changed', 'run_control_foreign', 'run_control_invalid',
   'run_control_frame_too_large', 'run_owner_stale', 'run_process_unknown', 'run_process_changed',
   'run_control_client_budget_exhausted', 'run_control_connect_busy_timeout_expired',
@@ -398,7 +401,6 @@ export async function recordOpenCodeV2ProviderFailure(phase: string, error: unkn
   const syscall = ['realpath', 'open', 'read', 'lstat', 'stat'].find(value => value === detail?.syscall)
   const failure = phase === 'execution-host-startup' && (name || errno || syscall)
     ? { ...(name ? { name } : {}), ...(errno ? { errno } : {}), ...(syscall ? { operation: syscall } : {}) } : undefined
-  const alias = undefined
   const operation = readOpenCodeV2ProviderWireFailure(error)
   const catalog = error !== null && typeof error === 'object' ? catalogFailures.get(error) : undefined
   const startup = startupDiagnostic(startupOutput)
@@ -429,6 +431,6 @@ export async function recordOpenCodeV2ProviderFailure(phase: string, error: unkn
     // Nonsecret observational data only: this file is not native ownership or
     // cleanup authority, even when an elevated Windows writer owns the file.
     await writeFile(path.join(directory, randomUUID() + '.json'), JSON.stringify({ schemaVersion: 1, phase, category, retainedOriginal,
-      ...(native?.native ? { native: native.native } : {}), ...(alias ? { alias } : {}), ...(failure ? { failure } : {}), ...(operation ? { operation } : {}), ...(catalog ? { catalog } : {}), ...(startup ? { startup } : {}), ...(acquisition ? { acquisition } : {}), ...(cleanup ? { cleanup } : {}), ...(initialization ? { initialization } : {}), recordedAt: new Date().toISOString() }), { flag: 'wx', mode: 0o600 })
+      ...(native?.native ? { native: native.native } : {}), ...(failure ? { failure } : {}), ...(operation ? { operation } : {}), ...(catalog ? { catalog } : {}), ...(startup ? { startup } : {}), ...(acquisition ? { acquisition } : {}), ...(cleanup ? { cleanup } : {}), ...(initialization ? { initialization } : {}), recordedAt: new Date().toISOString() }), { flag: 'wx', mode: 0o600 })
   } catch { /* Diagnostics cannot replace or retry the unresolved original operation. */ }
 }

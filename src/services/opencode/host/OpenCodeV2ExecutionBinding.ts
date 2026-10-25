@@ -294,7 +294,7 @@ export async function validateExecutionNative(native: ValidatedExecutionNative):
 }
 
 export type { ExecutionBirth } from '../execution/OpenCodeV2ExecutionContracts.js'
-/** Native Linux ticks and Darwin process versions are never compared with a wall clock. */
+/** Linux start ticks with the boot ID; elsewhere the OS process creation time in UTC milliseconds. */
 export async function readExecutionBirth(pid: number): Promise<ExecutionBirth | null> {
   return readExecutionPlatformBirth(pid)
 }

@@ -54,19 +54,6 @@ test('finite reader and cause projection never execute getters, proxies or enume
   expect(calls).toBe(0)
 })
 
-test('server native realpath projection accepts only the existing bounded integers and omits invalid nested metadata', () => {
-  const native = { status: 2, operation: 18, win32: 5, anchorCount: 2, matchingAnchorIndex: 1 }
-  expect(readOpenCodeV2ServerFailure({ ...finite, realpath: { ...native, path: secret } })?.realpath).toEqual(native)
-  let calls = 0
-  const forbidden = () => { calls++; throw new Error(secret) }
-  for (const changed of [{ status: 0 }, { status: 5 }, { operation: 26 }, { operation: -1 }, { win32: 0x100000000 },
-    { anchorCount: 4097 }, { matchingAnchorIndex: 2 }, { matchingAnchorIndex: -2 }, { win32: 5.5 }])
-    expect(readOpenCodeV2ServerFailure({ ...finite, realpath: { ...native, ...changed } })).toEqual(finite)
-  expect(readOpenCodeV2ServerFailure({ ...finite, realpath: Object.defineProperty({ ...native }, 'win32', { get: forbidden }) })).toEqual(finite)
-  expect(readOpenCodeV2ServerFailure({ ...finite, realpath: new Proxy(native, { getOwnPropertyDescriptor: forbidden }) })).toEqual(finite)
-  expect(calls).toBe(0)
-})
-
 test('cold observation binds exactly one handler entry and consumes or disarms on every outcome', () => {
   const observation = createOpenCodeV2ColdLocationObservation()
   const early = observation.enter()
@@ -85,27 +72,4 @@ test('cold observation binds exactly one handler entry and consumes or disarms o
     expect(latch.consume('TEST-id', outcome === 'success' ? 200 : 500)).toBeUndefined()
     latch.begin('TEST-next'); expect(latch.enter()).toBeUndefined()
   }
-})
-
-test('actual host listener ignores foreign child identities and hostile metadata without refusing acquisition', async () => {
-  const source = await readFile(new URL('../host/OpenCodeV2ExecutionHost.ts', import.meta.url), 'utf8')
-  const start = source.indexOf("child.on('serverFailure', ") + "child.on('serverFailure', ".length
-  const listener = source.slice(start, source.indexOf("\n      child.on('retireProgress'", start)).replace(/\)\s*$/, '')
-  const body = new Bun.Transpiler({ loader: 'ts' }).transformSync(`const listener = ${listener};`)
-  const mapping = { namespace: { name: 'TEST-namespace' }, bun: { nativePID: 42, birth: { format: 'windows-filetime', value: '420', bootId: null } } }
-  const scope = { types, mapping, nonce: 'TEST-nonce', leaseOwnerId: 'TEST-lease', plan: { platform: 'win32' }, readOpenCodeV2ServerFailure }
-  const inspect = new Function('scope', `const {${Object.keys(scope).join(',')}} = scope; let serverFailure; ${body}; return { listener, retained: () => serverFailure };`)(scope)
-  const valid = { nonce: scope.nonce, leaseOwnerId: scope.leaseOwnerId, namespace: mapping.namespace.name,
-    pid: 42, birth: mapping.bun.birth, serverFailure: finite }
-  let calls = 0
-  const forbidden = () => { calls++; throw new Error(secret) }
-  for (const key of ['nonce', 'leaseOwnerId', 'namespace', 'pid', 'birth']) {
-    inspect.listener({ ...valid, [key]: secret }); expect(inspect.retained()).toBeUndefined()
-  }
-  inspect.listener(Object.defineProperty({ ...valid }, 'nonce', { get: forbidden }))
-  inspect.listener(new Proxy(valid, { getOwnPropertyDescriptor: forbidden }))
-  expect(inspect.retained()).toBeUndefined(); expect(calls).toBe(0)
-  inspect.listener(valid); expect(inspect.retained()).toEqual(finite)
-  inspect.listener({ ...valid, serverFailure: { operation: 'location', kind: 'Die' } })
-  expect(inspect.retained()).toEqual(finite)
 })

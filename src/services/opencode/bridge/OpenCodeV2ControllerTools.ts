@@ -154,12 +154,14 @@ export async function readOwnedControllerInbox(profile: SelectedExecutionProfile
   if (root === null) return null
   const check = () => { signal?.throwIfAborted(); executionAssert(Date.now() < deadline, 'run_controller_timeout') }
   if (process.platform === 'win32') {
-    // No descriptor-relative opens on Windows: read the canonical inbox path in the user's own profile.
-    const file = path.join(root, 'teams', binding.teamId, 'inboxes', 'user.json')
+    // No descriptor-relative opens on Windows: read the inbox in the user's own profile. The
+    // root may arrive in another letter case or with 8.3 names, so compare inside its real path:
+    // a link or junction anywhere below the root changes the relative path and is refused.
+    const relative = path.join('teams', binding.teamId, 'inboxes', 'user.json'), file = path.join(root, relative)
     try {
       const stat = await lstat(file)
       executionAssert(stat.isFile() && !stat.isSymbolicLink() && stat.size <= CONTROLLER_INBOX_MAX_BYTES &&
-        await realpath(file) === file, 'run_controller_inbox_unknown')
+        path.relative(await realpath(root), await realpath(file)).toLowerCase() === relative.toLowerCase(), 'run_controller_inbox_unknown')
       const bytes = await readFile(file)
       executionAssert(bytes.length <= CONTROLLER_INBOX_MAX_BYTES, 'run_controller_inbox_unknown')
       check()

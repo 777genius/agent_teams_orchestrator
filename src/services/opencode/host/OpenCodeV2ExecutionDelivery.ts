@@ -11,7 +11,7 @@ export function classifyOpenCodeV2ExecutionDelivery(location: string) {
   // Match the same closed layouts after Windows URL conversion, while retaining
   // the native path for canonical filesystem identity and child resolution.
   const layout = process.platform === 'win32' ? file.replaceAll('\\', '/') : file
-  const source = /\/src\/(?:services\/opencode\/(?:host|profile|bridge)\/[^/]+|services\/opencode\/host\/darwin\/OpenCodeV2DarwinExecution|entrypoints\/opencodeV2(?:ExecutionServer|RunOwner))\.ts$/.test(layout)
+  const source = /\/src\/(?:services\/opencode\/(?:host|profile|bridge)\/[^/]+|entrypoints\/opencodeV2(?:ExecutionServer|RunOwner))\.ts$/.test(layout)
   const packaged = /\/(?:cli|cli-dev|opencodeV2ExecutionServer|opencodeV2RunOwner)\.js$/.test(layout)
   executionAssert(source || packaged, 'v2_execution_layout_unsupported')
   return { file, source }

@@ -109,6 +109,10 @@ test('V2 teammates never get more than V1 teammates in auto approval mode', asyn
   // V2 names the same tools differently; V1-only tools have no V2 counterpart.
   const v2Action: Record<string, string> = { bash: 'shell', write: 'edit', task: 'subagent' }
   const v1Allowed = new Set(Object.entries(v1).filter(([, effect]) => effect === 'allow').map(([tool]) => v2Action[tool] ?? tool))
+  // V2 reaches MCP tools only through code mode; each inner call asserts its own action
+  // (agent-teams_* here), so `execute` stands for the V1 MCP allow and adds no tool.
+  expect(Object.keys(v1).some(tool => /^agent[-_]teams_/.test(tool) && v1[tool] === 'allow')).toBe(true)
+  v1Allowed.add('execute')
   const rules = OPENCODE_V2_TEAMMATE_PERMISSIONS
   // Last match wins: a leading catch-all deny makes every unlisted tool (webfetch, websearch, skill, ...) denied.
   expect(rules[0]).toEqual({ action: '*', resource: '*', effect: 'deny' })
