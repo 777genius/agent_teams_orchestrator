@@ -23,6 +23,7 @@ import {
   parseOpenCodeModelsOutput,
   parseOpenCodeModelsVerboseOutput,
   parseOpenCodeProvidersOutput,
+  OPEN_CODE_MODELS_CACHE_SEED_RETRY_MS,
   seedOpenCodeModelsCache,
   supportsOpenCodeSuperGrokOAuth,
   withOpenCodeInventoryProbeTimeout,
@@ -770,14 +771,19 @@ describe('OpenCode Models.dev cache seeding', () => {
       await rm(cacheHome, { recursive: true, force: true })
     }
   }
-  const profile = (xdgCacheHome: string) =>
-    ({ xdgCacheHome, env: { XDG_CACHE_HOME: xdgCacheHome } }) as unknown as OpenCodePreparedProfile
+  const profile = (xdgCacheHome: string, env: Record<string, string> = {}) =>
+    ({
+      xdgCacheHome,
+      projectPath: '/TEST/user-project',
+      workingDirectoryPath: '/TEST/profile/catalog-workspace',
+      env: { XDG_CACHE_HOME: xdgCacheHome, ...env },
+    }) as unknown as OpenCodePreparedProfile
 
-  test('a cold profile is refreshed once, through the plugin-free catalog profile, before it is used', () =>
+  test('a cold profile is refreshed once, plugin-free and outside the user project, before it is used', () =>
     withCacheHome(async (cacheHome, cacheFile) => {
-      const calls: { args: string[]; config: unknown }[] = []
+      const calls: { args: string[]; cwd: string; config: unknown }[] = []
       const exec = async (_binary: string, args: string[], used: OpenCodePreparedProfile) => {
-        calls.push({ args, config: JSON.parse(used.env.OPENCODE_CONFIG_CONTENT ?? 'null') })
+        calls.push({ args, cwd: used.projectPath, config: JSON.parse(used.env.OPENCODE_CONFIG_CONTENT ?? 'null') })
         await new Promise(resolve => setTimeout(resolve, 20))
         await mkdir(path.dirname(cacheFile), { recursive: true })
         await writeFile(cacheFile, '{"opencode":{}}')
@@ -787,21 +793,39 @@ describe('OpenCode Models.dev cache seeding', () => {
       // Concurrent catalog reads share one refresh.
       expect(await Promise.all([seedOpenCodeModelsCache(input), seedOpenCodeModelsCache(input)]))
         .toEqual(['seeded', 'seeded'])
-      expect(calls).toEqual([{ args: getOpenCodeRefreshModelsArgs(), config: { autoupdate: false, plugin: [], mcp: {} } }])
-      // A seeded cache is left to OpenCode's own refresh.
+      expect(calls).toEqual([{
+        args: getOpenCodeRefreshModelsArgs(),
+        cwd: '/TEST/profile/catalog-workspace',
+        config: { autoupdate: false, plugin: [], mcp: {} },
+      }])
+      // An existing cache is left to OpenCode's own refresh.
       expect(await seedOpenCodeModelsCache(input)).toBe('present')
       expect(calls).toHaveLength(1)
     }))
 
-  test('a failed refresh keeps the previous behavior without throwing', () =>
+  test('a Models.dev source chosen through OpenCode environment is never seeded', () =>
+    withCacheHome(async cacheHome => {
+      for (const name of ['OPENCODE_DISABLE_MODELS_FETCH', 'OPENCODE_MODELS_URL', 'OPENCODE_MODELS_PATH'])
+        expect(await seedOpenCodeModelsCache({
+          binaryPath: '/TEST/opencode',
+          profile: profile(cacheHome, { [name]: name === 'OPENCODE_MODELS_URL' ? 'https://models.example' : '1' }),
+          exec: async () => { throw new Error('must not run') },
+        })).toBe('not-applicable')
+    }))
+
+  test('a failed refresh keeps the previous behavior and is not retried by every read', () =>
     withCacheHome(async cacheHome => {
       let calls = 0
-      const failing = { binaryPath: '/TEST/opencode', profile: profile(cacheHome), exec: async () => {
+      let clock = Date.now()
+      const input = { binaryPath: '/TEST/opencode', profile: profile(cacheHome), now: () => clock, exec: async () => {
         calls += 1
         return { stdout: '', stderr: 'getaddrinfo ENOTFOUND models.dev', code: 1 }
       } }
-      expect(await seedOpenCodeModelsCache(failing)).toBe('unavailable')
-      expect(await seedOpenCodeModelsCache({ ...failing, exec: async () => { calls += 1; throw new Error('spawn failed') } }))
+      expect(await seedOpenCodeModelsCache(input)).toBe('unavailable')
+      expect(await seedOpenCodeModelsCache(input)).toBe('unavailable')
+      expect(calls).toBe(1)
+      clock += OPEN_CODE_MODELS_CACHE_SEED_RETRY_MS + 60_000
+      expect(await seedOpenCodeModelsCache({ ...input, exec: async () => { calls += 1; throw new Error('spawn failed') } }))
         .toBe('unavailable')
       expect(calls).toBe(2)
       for (const missing of [{ binaryPath: null, profile: profile(cacheHome) }, { binaryPath: '/TEST/opencode', profile: null }])

@@ -321,7 +321,14 @@ function getOpenCodeCatalogRefreshProfile(
   }
 }
 
-export type OpenCodeModelsCacheSeed = 'present' | 'seeded' | 'unavailable'
+export type OpenCodeModelsCacheSeed = 'present' | 'seeded' | 'not-applicable' | 'unavailable'
+
+// OpenCode controls its own Models.dev source with these; then the cache file
+// named below is not the one it reads, or a fetch was disabled on purpose.
+const OPEN_CODE_MODELS_SOURCE_ENV = ['OPENCODE_DISABLE_MODELS_FETCH', 'OPENCODE_MODELS_URL', 'OPENCODE_MODELS_PATH'] as const
+// A failed seed (offline, blocked network) is not retried by every catalog read.
+export const OPEN_CODE_MODELS_CACHE_SEED_RETRY_MS = 15 * 60_000
+const OPEN_CODE_MODELS_CACHE_SEED_FAILURE_MARKER = '.models-cache-seed-failed'
 
 const modelsCacheSeeds = new Map<string, Promise<OpenCodeModelsCacheSeed>>()
 
@@ -332,25 +339,41 @@ function isNonEmptyFile(filePath: string): Promise<boolean> {
 /**
  * Until OpenCode's shared Models.dev cache exists, OpenCode answers from the
  * model snapshot built into its release, which can still list models that
- * Models.dev has deprecated since. Seed the cache once, before a catalog host
- * starts, so a catalog reported as fresh is current. Best effort: if the refresh
- * fails (for example offline), OpenCode keeps its snapshot, as before.
+ * Models.dev has deprecated since. Seed a missing cache once, before a catalog
+ * host starts; an existing cache is refreshed by OpenCode itself. Best effort:
+ * if the refresh fails (for example offline), OpenCode keeps its snapshot as
+ * before, and the next attempt waits OPEN_CODE_MODELS_CACHE_SEED_RETRY_MS.
  */
 export function seedOpenCodeModelsCache(input: {
   binaryPath: string | null
   profile: OpenCodePreparedProfile | null
   exec: (binaryPath: string, args: string[], profile: OpenCodePreparedProfile) => Promise<OpenCodeCommandResult>
+  now?: () => number
 }): Promise<OpenCodeModelsCacheSeed> {
   const { binaryPath, profile } = input
   if (!binaryPath || !profile?.xdgCacheHome) return Promise.resolve('unavailable')
-  const cacheFile = path.join(profile.xdgCacheHome, 'opencode', 'models.json')
+  if (OPEN_CODE_MODELS_SOURCE_ENV.some(name => profile.env?.[name])) return Promise.resolve('not-applicable')
+  const cacheDirectory = path.join(profile.xdgCacheHome, 'opencode')
+  const cacheFile = path.join(cacheDirectory, 'models.json')
+  const failureMarker = path.join(cacheDirectory, OPEN_CODE_MODELS_CACHE_SEED_FAILURE_MARKER)
+  const now = input.now ?? Date.now
   const pending = modelsCacheSeeds.get(cacheFile)
   if (pending) return pending
   const seed = (async (): Promise<OpenCodeModelsCacheSeed> => {
     if (await isNonEmptyFile(cacheFile)) return 'present'
-    await input.exec(binaryPath, getOpenCodeRefreshModelsArgs(), getOpenCodeCatalogRefreshProfile(profile))
+    const failedAt = await stat(failureMarker).then(info => info.mtimeMs, () => null)
+    if (failedAt !== null && now() - failedAt < OPEN_CODE_MODELS_CACHE_SEED_RETRY_MS) return 'unavailable'
+    // The plugin-free catalog profile, run outside the user's project so its
+    // project-level plugins are not loaded; the cache lives in XDG_CACHE_HOME.
+    await input.exec(binaryPath, getOpenCodeRefreshModelsArgs(), {
+      ...getOpenCodeCatalogRefreshProfile(profile),
+      projectPath: profile.workingDirectoryPath,
+    }).catch(() => undefined)
+    if (await isNonEmptyFile(cacheFile)) return 'seeded'
+    await mkdir(cacheDirectory, { recursive: true })
+      .then(() => writeFile(failureMarker, new Date(now()).toISOString()))
       .catch(() => undefined)
-    return await isNonEmptyFile(cacheFile) ? 'seeded' : 'unavailable'
+    return 'unavailable'
   })().finally(() => modelsCacheSeeds.delete(cacheFile))
   modelsCacheSeeds.set(cacheFile, seed)
   return seed
