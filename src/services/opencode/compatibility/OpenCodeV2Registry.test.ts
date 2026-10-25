@@ -41,18 +41,17 @@ test('dialect, wire family and graph aliases derive from any in-range version wi
   })).toEqual([version])
 })
 
-test('existing 2.0.0 floor and 2.0.32 current identities are unchanged', () => {
+test('2.0.0 floor and 2.0.32 current keep their identities but no longer admit a team launch', () => {
   expect(openCodeV2Dialect('2.0.0')).toBe('v2-2.0.0')
   expect(openCodeV2Dialect('2.0.32')).toBe('v2-2.0.32')
   expect(openCodeV2Wire('2.0.0')).toBe('floor')
   expect(openCodeV2Wire('2.0.32')).toBe('current')
-  // Both keep the POSIX platforms where V2 execution already ran. Their Windows evidence
-  // ran under the removed AppContainer host, so plain Windows execution is not claimed.
-  for (const platform of ['darwin-arm64', 'darwin-x64', 'linux-x64']) {
-    expect(openCodeV2LaunchRefusal('2.0.0', platform)).toBeNull()
-    expect(openCodeV2LaunchRefusal('2.0.32', platform)).toBeNull()
+  // Only the latest qualified release launches; its evidence ran without the removed sandbox.
+  expect(openCodeV2QualifiedVersions()).toEqual(['2.1.4'])
+  for (const platform of ['darwin-arm64', 'darwin-x64', 'linux-arm64', 'linux-x64', 'win32-arm64', 'win32-x64']) {
+    expect(openCodeV2LaunchRefusal('2.0.0', platform)).toBe('opencode_v2_version_unqualified')
+    expect(openCodeV2LaunchRefusal('2.0.32', platform)).toBe('opencode_v2_version_unqualified')
   }
-  for (const version of ['2.0.0', '2.0.32']) expect(openCodeV2LaunchRefusal(version, 'win32-x64')).toBe('opencode_v2_version_unqualified')
 })
 
 test('qualification is per platform: a version is admitted only where its evidence ran', () => {
