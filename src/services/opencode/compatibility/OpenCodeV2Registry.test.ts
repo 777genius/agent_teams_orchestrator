@@ -14,8 +14,8 @@ const manifest = JSON.parse(readFileSync(path.join(import.meta.dir, '../../../..
 }
 
 test('range classification boundaries: >=2.0.0 <3.0.0, exact stable releases only', () => {
-  for (const version of ['2.0.0', '2.0.32', '2.1.4', '2.999.999']) {
-    expect(classifyOpenCodeV2Version(version)).toEqual({ status: 'recognized', version, dialect: `v2-${version}` })
+  for (const version of ['2.0.0', '2.0.32', '2.1.4', '2.999.999'] as const) {
+    expect(classifyOpenCodeV2Version(version)).toEqual({ status: 'recognized', version, dialect: `v2-${version}` as const })
   }
   for (const version of ['1.18.34', '1.99.99', '0.0.1']) expect(classifyOpenCodeV2Version(version).status).toBe('too_old')
   for (const version of ['3.0.0', '3.1.0', '10.0.0']) expect(classifyOpenCodeV2Version(version).status).toBe('too_new')

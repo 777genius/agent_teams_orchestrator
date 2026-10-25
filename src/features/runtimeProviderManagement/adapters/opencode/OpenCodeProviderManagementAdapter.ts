@@ -1,4 +1,5 @@
-import { selectedProviderUsesOpenCodeV2, connectOpenCodeV2Provider, loadOpenCodeV2ProviderModels, testOpenCodeV2ProviderModel } from './OpenCodeV2ProviderManagement.js'
+import { selectedProviderUsesOpenCodeV2, connectOpenCodeV2Provider, loadOpenCodeV2ProviderModels, testOpenCodeV2ProviderModel, buildOpenCodeV2KeySetupForm } from './OpenCodeV2ProviderManagement.js'
+import { openCodeV2KeyIntegration } from '../../../../services/opencode/catalog/OpenCodeV2KeyIntegrations.js'
 import path from 'node:path'
 import { realpath } from 'node:fs/promises'
 import { getOpenCodeModelDeclaredInputModalities } from '../../../../services/opencode/OpenCodeDeclaredInputModalities.js'
@@ -766,7 +767,7 @@ function getProviderDisplayName(providerId: string, entry?: OpenCodeProviderList
     return KNOWN_PROVIDER_LABELS.opencode ?? 'OpenCode Zen'
   }
   const name = asString(entry?.name)
-  return name ?? KNOWN_PROVIDER_LABELS[providerId] ?? providerId
+  return name ?? KNOWN_PROVIDER_LABELS[providerId] ?? openCodeV2KeyIntegration(providerId)?.displayName ?? providerId
 }
 
 function catalogFailureDisplayName(providerId: string | undefined): string {
@@ -4310,6 +4311,13 @@ export class OpenCodeProviderManagementAdapter
         `Provider management is not available for ${input.runtimeId}`,
         false,
       )
+    }
+    // Registered native V2 key integrations are served only while the selected binary is V2.
+    if (openCodeV2KeyIntegration(providerId)) {
+      let selectedV2 = false
+      try { selectedV2 = await selectedProviderUsesOpenCodeV2() } catch { selectedV2 = false }
+      const form = selectedV2 ? buildOpenCodeV2KeySetupForm(providerId) : null
+      if (form) return { ok: true, value: form }
     }
     if (FAST_CURATED_SETUP_PROVIDER_IDS.has(providerId)) {
       return {
