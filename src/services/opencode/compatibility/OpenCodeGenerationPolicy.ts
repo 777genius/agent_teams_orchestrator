@@ -1,6 +1,6 @@
-import { classifyOpenCodeV2Version, type OpenCodeV2Dialect, type OpenCodeV2Pin } from './OpenCodeV2Registry.js'
+import { classifyOpenCodeV2Version, type OpenCodeV2Dialect, type OpenCodeV2Pin } from './OpenCodeV2Registry.ts'
 
-export type { OpenCodeV2Pin } from './OpenCodeV2Registry.js'
+export type { OpenCodeV2Pin } from './OpenCodeV2Registry.ts'
 export type OpenCodeReadGeneration =
   | { generation: 'v1'; version: string }
   | { generation: 'v2'; version: OpenCodeV2Pin; dialect: OpenCodeV2Dialect }
