@@ -34,6 +34,14 @@ export async function canonicalExecutionDirectory(directory: string): Promise<vo
   const info = await lstat(directory)
   executionAssert(info.isDirectory() && !info.isSymbolicLink(), 'execution_identity_mismatch')
 }
+/** POSIX keeps a profile private by owner and mode bits. Windows has no cheap owner check (its
+ * profiles inherit the user's ACL), so a canonical profile directory must at least stay off
+ * network shares and device namespaces; reparse points already fail canonicalExecutionDirectory. */
+export async function assertExecutionProfilePrivate(directory: string): Promise<void> {
+  const info = await lstat(directory)
+  executionAssert(process.platform === 'win32' ? !/^[\\/]{2}/.test(directory)
+    : info.uid === process.getuid?.() && (info.mode & 0o077) === 0, 'execution_profile_not_private')
+}
 const inside = (root: string, file: string) => file.startsWith(root + path.sep)
 export const executionProfileGuards = ['environment_hash', 'config_hash', 'home_mapping', 'path_containment',
   'database_type', 'models_type', 'models_hash', 'process_cwd', 'process_pwd', 'process_environment'] as const
@@ -46,7 +54,7 @@ export async function validateExecutionProfile(profile: OwnedNativeProfile): Pro
   else { executionAssert(profile.selection.agent.length > 0); assertExecutionSelectedModel(profile.selection.model) }
   await canonicalExecutionDirectory(profile.root)
   await canonicalExecutionDirectory(profile.directory)
-  executionAssert(await lstat(profile.root).then(info => process.platform === 'win32' || (info.mode & 0o077) === 0), 'execution_profile_not_private')
+  await assertExecutionProfilePrivate(profile.root)
   assertExecutionProfile(executionHash(profile.env) === profile.envSha256, 'environment_hash')
   executionAssert(Object.entries(profile.env).every(([key, value]) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(key) && typeof value === 'string' && !value.includes('\0')))
   executionAssert(!Object.keys(profile.env).some(key => /^(?:NODE_OPTIONS|NODE_PATH|BUN_.*|LD_.*|DYLD_.*|BASH_ENV|ENV|ZDOTDIR|SHELLOPTS)$/i.test(key)), 'execution_environment_injection')
@@ -57,13 +65,13 @@ export async function validateExecutionProfile(profile: OwnedNativeProfile): Pro
     APPDATA: 'appdata', LOCALAPPDATA: 'localappdata' })) {
     assertExecutionProfile(profile.env[key] === path.join(profile.root, relative), 'home_mapping')
     await canonicalExecutionDirectory(profile.env[key]!)
-    executionAssert(await lstat(profile.env[key]!).then(info => process.platform === 'win32' || (info.mode & 0o077) === 0), 'execution_profile_not_private')
+    await assertExecutionProfilePrivate(profile.env[key]!)
   }
   assertExecutionProfile(inside(profile.root, profile.config.directory) && inside(profile.root, profile.databasePath), 'path_containment')
   await canonicalExecutionDirectory(profile.config.directory)
   await canonicalExecutionDirectory(path.dirname(profile.databasePath))
   for (const directory of [profile.config.directory, path.dirname(profile.databasePath)]) {
-    executionAssert(await lstat(directory).then(info => process.platform === 'win32' || (info.mode & 0o077) === 0), 'execution_profile_not_private')
+    await assertExecutionProfilePrivate(directory)
   }
   const db = await lstat(profile.databasePath).catch(error => {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error

@@ -3,7 +3,7 @@ import { isExecutionPlatformMapping, isExecutionUnboundRetirement, type Executio
 import { constants } from 'node:fs'
 import { lstat, mkdir, open, realpath, rename } from 'node:fs/promises'
 import { executionAssert, executionHash, executionRecord } from '../execution/OpenCodeV2ExecutionContracts.js'
-import { canonicalExecutionDirectory, readExecutionBirth, type ExecutionBirth, type OwnedNativeProfile } from './OpenCodeV2ExecutionBinding.js'
+import { assertExecutionProfilePrivate, canonicalExecutionDirectory, readExecutionBirth, type ExecutionBirth, type OwnedNativeProfile } from './OpenCodeV2ExecutionBinding.js'
 import { isExecutionCleanupReceipt, type ExecutionCleanupReceipt } from './OpenCodeV2ExecutionLifecycle.js'
 
 type OwnerIdentity = Readonly<{ hostInstanceId: string; leaseOwnerId: string; graphSha256: string }>
@@ -86,8 +86,7 @@ export async function acquireExecutionProfileOwner(requestedProfile: OwnedNative
     leaseOwnerId: requestedIdentity.leaseOwnerId, graphSha256: requestedIdentity.graphSha256 })
   {
     await canonicalExecutionDirectory(profile.root)
-    // POSIX keeps the profile private by mode bits; Windows profiles inherit the user's ACL.
-    executionAssert(process.platform === 'win32' || ((await lstat(profile.root)).mode & 0o077) === 0, 'execution_profile_not_private')
+    await assertExecutionProfilePrivate(profile.root)
     await canonicalExecutionDirectory(path.dirname(profile.databasePath))
     executionAssert(profile.databasePath.startsWith(profile.root + path.sep), 'execution_profile_changed')
     const db = await lstat(profile.databasePath).catch(error => {

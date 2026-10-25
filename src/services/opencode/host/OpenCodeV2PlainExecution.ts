@@ -6,14 +6,20 @@ import { executionAssert, executionHash, executionRecord, type ExecutionBirth } 
 
 // V2 execution runs the shipped Bun as an ordinary child process, like the V1 host:
 // no OS sandbox. The owner keeps the exact child identity (PID and start time), the
-// private IPC handshake and the closed acknowledgement; agent commands and their
-// descendants are retired with a process-tree kill when the child does not exit.
+// private IPC handshake and the closed acknowledgement. Retirement claims only what it
+// checked: on POSIX the child's whole process group is gone; on Windows the child itself
+// exited after a process-tree kill, and its descendants are retired best-effort.
 
 export type PlainExecutionMapping = Readonly<{
   bun: Readonly<{ hostPID: number; nativePID: number; birth: ExecutionBirth; executablePath: string; executableSha256: string }>
   namespace: Readonly<{ name: string }>; leaseOwnerId: string
 }>
-export type PlainExecutionRetirement = Readonly<{ pid: number; birth: ExecutionBirth; scopeClosed: boolean }>
+/** `process-group`: the group was checked empty. `best-effort`: a tree kill ran, but a descendant that
+ * left the tree is not tracked. `unknown`: members of the group were still present at the deadline. */
+export type PlainExecutionDescendants = 'process-group' | 'best-effort' | 'unknown'
+export type PlainExecutionRetirement = Readonly<{
+  pid: number; birth: ExecutionBirth; scopeClosed: boolean; descendants: PlainExecutionDescendants; acknowledged: boolean
+}>
 export type PlainExecutionPlan = Readonly<{
   bun: Readonly<{ path: string; sha256: string }>; entry: string; cwd: string; env: Readonly<Record<string, string>>
 }>
@@ -64,6 +70,14 @@ export async function planPlainExecution(requested: Readonly<{
 function killTree(pid: number): void {
   if (process.platform === 'win32') { killProcessTree(pid, 'SIGKILL'); return }
   try { process.kill(-pid, 'SIGKILL') } catch { try { process.kill(pid, 'SIGKILL') } catch { /* Already gone. */ } }
+}
+/** POSIX only: true once no process is left in the group. Killed members stay visible until reaped. */
+export async function processGroupEmpty(pgid: number, deadline: number): Promise<boolean> {
+  for (;;) {
+    try { process.kill(-pgid, 0) } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ESRCH') return true }
+    if (Date.now() >= deadline) return false
+    await new Promise(resolve => setTimeout(resolve, 25))
+  }
 }
 
 export function launchPlainExecution(plan: PlainExecutionPlan, nonce: string, leaseOwnerId: string,
@@ -127,11 +141,19 @@ export function launchPlainExecution(plan: PlainExecutionPlan, nonce: string, le
       let timer: ReturnType<typeof setTimeout> | undefined
       try { await Promise.race([exit, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('cleanup_unknown')), 5000) })]) }
       finally { clearTimeout(timer) }
-      // The leader is gone; its process group may still hold commands it started.
-      if (child.pid && process.platform !== 'win32') killTree(child.pid)
       executionAssert(child.pid, 'cleanup_unknown')
+      let scopeClosed: boolean, descendants: PlainExecutionDescendants
+      if (process.platform === 'win32') {
+        // The child exited; the tree kill above cannot prove a detached descendant is gone.
+        scopeClosed = true; descendants = 'best-effort'
+      } else {
+        // The leader is gone; its process group may still hold commands it started.
+        killTree(child.pid)
+        scopeClosed = await processGroupEmpty(child.pid, Date.now() + 2000)
+        descendants = scopeClosed ? 'process-group' : 'unknown'
+      }
       const birth = mapping?.bun.birth ?? Object.freeze({ format: 'utc-ms' as const, value: '0', bootId: null })
-      const result = Object.freeze({ pid: child.pid, birth, scopeClosed: closed })
+      const result = Object.freeze({ pid: child.pid, birth, scopeClosed, descendants, acknowledged: closed })
       retirements.add(result)
       return result
     })()
