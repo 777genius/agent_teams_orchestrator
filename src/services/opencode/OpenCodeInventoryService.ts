@@ -323,9 +323,12 @@ function getOpenCodeCatalogRefreshProfile(
 
 export type OpenCodeModelsCacheSeed = 'present' | 'seeded' | 'not-applicable' | 'unavailable'
 
-// OpenCode controls its own Models.dev source with these; then the cache file
-// named below is not the one it reads, or a fetch was disabled on purpose.
-const OPEN_CODE_MODELS_SOURCE_ENV = ['OPENCODE_DISABLE_MODELS_FETCH', 'OPENCODE_MODELS_URL', 'OPENCODE_MODELS_PATH'] as const
+// OpenCode controls its own Models.dev source with these: a fetch disabled on
+// purpose, or another file than the cache named below.
+function openCodeChoosesModelsSource(env: NodeJS.ProcessEnv | undefined): boolean {
+  const disabled = env?.OPENCODE_DISABLE_MODELS_FETCH?.toLowerCase()
+  return disabled === 'true' || disabled === '1' || Boolean(env?.OPENCODE_MODELS_URL) || Boolean(env?.OPENCODE_MODELS_PATH)
+}
 // A failed seed (offline, blocked network) is not retried by every catalog read.
 export const OPEN_CODE_MODELS_CACHE_SEED_RETRY_MS = 15 * 60_000
 const OPEN_CODE_MODELS_CACHE_SEED_FAILURE_MARKER = '.models-cache-seed-failed'
@@ -348,11 +351,13 @@ export function seedOpenCodeModelsCache(input: {
   binaryPath: string | null
   profile: OpenCodePreparedProfile | null
   exec: (binaryPath: string, args: string[], profile: OpenCodePreparedProfile) => Promise<OpenCodeCommandResult>
+  /** The caller's deadline; a cancelled seed is not a failed one. Joined callers share the first one's. */
+  abortSignal?: AbortSignal
   now?: () => number
 }): Promise<OpenCodeModelsCacheSeed> {
   const { binaryPath, profile } = input
   if (!binaryPath || !profile?.xdgCacheHome) return Promise.resolve('unavailable')
-  if (OPEN_CODE_MODELS_SOURCE_ENV.some(name => profile.env?.[name])) return Promise.resolve('not-applicable')
+  if (openCodeChoosesModelsSource(profile.env)) return Promise.resolve('not-applicable')
   const cacheDirectory = path.join(profile.xdgCacheHome, 'opencode')
   const cacheFile = path.join(cacheDirectory, 'models.json')
   const failureMarker = path.join(cacheDirectory, OPEN_CODE_MODELS_CACHE_SEED_FAILURE_MARKER)
@@ -362,16 +367,19 @@ export function seedOpenCodeModelsCache(input: {
   const seed = (async (): Promise<OpenCodeModelsCacheSeed> => {
     if (await isNonEmptyFile(cacheFile)) return 'present'
     const failedAt = await stat(failureMarker).then(info => info.mtimeMs, () => null)
-    if (failedAt !== null && now() - failedAt < OPEN_CODE_MODELS_CACHE_SEED_RETRY_MS) return 'unavailable'
-    // The plugin-free catalog profile, run outside the user's project so its
-    // project-level plugins are not loaded; the cache lives in XDG_CACHE_HOME.
+    // A marker dated in the future (clock moved back) does not block seeding.
+    if (failedAt !== null && failedAt <= now() && now() - failedAt < OPEN_CODE_MODELS_CACHE_SEED_RETRY_MS)
+      return 'unavailable'
+    // The catalog refresh profile (no managed plugins or MCP), run in the catalog
+    // workspace rather than the user's project; the cache lives in XDG_CACHE_HOME.
     await input.exec(binaryPath, getOpenCodeRefreshModelsArgs(), {
       ...getOpenCodeCatalogRefreshProfile(profile),
       projectPath: profile.workingDirectoryPath,
     }).catch(() => undefined)
     if (await isNonEmptyFile(cacheFile)) return 'seeded'
+    if (input.abortSignal?.aborted) return 'unavailable'
     await mkdir(cacheDirectory, { recursive: true })
-      .then(() => writeFile(failureMarker, new Date(now()).toISOString()))
+      .then(() => writeFile(failureMarker, ''))
       .catch(() => undefined)
     return 'unavailable'
   })().finally(() => modelsCacheSeeds.delete(cacheFile))
@@ -1034,6 +1042,7 @@ export class OpenCodeInventoryService {
     return seedOpenCodeModelsCache({
       binaryPath: inventory.binaryPath,
       profile: inventory.profile,
+      abortSignal: options.abortSignal,
       exec: (binaryPath, args, profile) => this.execOpenCode(binaryPath, args, profile, {
         ...options,
         timeoutMs: OPEN_CODE_MODELS_CACHE_SEED_TIMEOUT_MS,

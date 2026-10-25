@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { access, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
+import { access, mkdir, mkdtemp, readFile, realpath, rm, stat, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
@@ -805,31 +805,57 @@ describe('OpenCode Models.dev cache seeding', () => {
 
   test('a Models.dev source chosen through OpenCode environment is never seeded', () =>
     withCacheHome(async cacheHome => {
-      for (const name of ['OPENCODE_DISABLE_MODELS_FETCH', 'OPENCODE_MODELS_URL', 'OPENCODE_MODELS_PATH'])
-        expect(await seedOpenCodeModelsCache({
-          binaryPath: '/TEST/opencode',
-          profile: profile(cacheHome, { [name]: name === 'OPENCODE_MODELS_URL' ? 'https://models.example' : '1' }),
-          exec: async () => { throw new Error('must not run') },
-        })).toBe('not-applicable')
+      let calls = 0
+      const seed = (env: Record<string, string>) => seedOpenCodeModelsCache({
+        binaryPath: '/TEST/opencode', profile: profile(cacheHome, env),
+        exec: async () => { calls += 1; return { stdout: '', stderr: '', code: 1 } },
+      })
+      for (const env of [{ OPENCODE_DISABLE_MODELS_FETCH: '1' }, { OPENCODE_DISABLE_MODELS_FETCH: 'TRUE' },
+        { OPENCODE_MODELS_URL: 'https://models.example' }, { OPENCODE_MODELS_PATH: '/TEST/models.json' }])
+        expect(await seed(env)).toBe('not-applicable')
+      expect(calls).toBe(0)
+      // OpenCode itself treats only "1" and "true" as disabling the fetch.
+      expect(await seed({ OPENCODE_DISABLE_MODELS_FETCH: 'false' })).toBe('unavailable')
+      expect(calls).toBe(1)
     }))
 
-  test('a failed refresh keeps the previous behavior and is not retried by every read', () =>
+  test('a failed refresh keeps the previous behavior and is not retried inside the backoff window', () =>
     withCacheHome(async cacheHome => {
+      const marker = path.join(cacheHome, 'opencode', '.models-cache-seed-failed')
       let calls = 0
       let clock = Date.now()
       const input = { binaryPath: '/TEST/opencode', profile: profile(cacheHome), now: () => clock, exec: async () => {
         calls += 1
         return { stdout: '', stderr: 'getaddrinfo ENOTFOUND models.dev', code: 1 }
       } }
+      const markAt = async (time: number) => utimes(marker, time / 1000, time / 1000)
       expect(await seedOpenCodeModelsCache(input)).toBe('unavailable')
+      expect((await stat(marker)).isFile()).toBe(true)
+      await markAt(clock)
+      clock += OPEN_CODE_MODELS_CACHE_SEED_RETRY_MS - 60_000
       expect(await seedOpenCodeModelsCache(input)).toBe('unavailable')
       expect(calls).toBe(1)
-      clock += OPEN_CODE_MODELS_CACHE_SEED_RETRY_MS + 60_000
+      clock += 120_000
       expect(await seedOpenCodeModelsCache({ ...input, exec: async () => { calls += 1; throw new Error('spawn failed') } }))
         .toBe('unavailable')
       expect(calls).toBe(2)
+      // A marker dated in the future (clock moved back) does not block seeding.
+      await markAt(clock + 2 * 60 * 60_000)
+      expect(await seedOpenCodeModelsCache(input)).toBe('unavailable')
+      expect(calls).toBe(3)
       for (const missing of [{ binaryPath: null, profile: profile(cacheHome) }, { binaryPath: '/TEST/opencode', profile: null }])
         expect(await seedOpenCodeModelsCache({ ...missing, exec: async () => { throw new Error('must not run') } }))
           .toBe('unavailable')
+    }))
+
+  test('a seed cancelled by its caller does not start the backoff', () =>
+    withCacheHome(async cacheHome => {
+      const marker = path.join(cacheHome, 'opencode', '.models-cache-seed-failed')
+      const controller = new AbortController()
+      expect(await seedOpenCodeModelsCache({
+        binaryPath: '/TEST/opencode', profile: profile(cacheHome), abortSignal: controller.signal,
+        exec: async () => { controller.abort(); return { stdout: '', stderr: '', code: 1, error: 'OpenCode command aborted' } },
+      })).toBe('unavailable')
+      expect(await stat(marker).then(() => true, () => false)).toBe(false)
     }))
 })
