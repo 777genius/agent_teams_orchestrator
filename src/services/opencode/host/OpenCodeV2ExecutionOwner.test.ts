@@ -80,21 +80,24 @@ describe('canonical durable execution owner', () => {
   // claim the fence stays and blocks every later acquisition indefinitely.
   test('unbound spawn frees its fences only through a branded retirement of its process', async () => {
     const { profile, remove } = await fixture()
-    const proof = Object.freeze({ pid: 4242, scopeClosed: false })
+    const proof = Object.freeze({ pid: 4242, scopeClosed: true })
+    const open = Object.freeze({ pid: 4242, scopeClosed: false })
     const brand = spyOn(executionPlatform, 'isExecutionUnboundRetirement').mockImplementation(
-      (value: unknown): value is executionPlatform.ExecutionUnboundRetirement => value === proof)
+      (value: unknown): value is executionPlatform.ExecutionUnboundRetirement => value === proof || value === open)
     try {
       const owner = await acquireExecutionProfileOwner(profile, identity())
       await owner.beforeSpawn()
       await expect(owner.abandonBeforeSpawn()).rejects.toThrow('execution_owner_unknown')
       // Caller-supplied claims without the launch-owned brand never release.
-      await expect(owner.abandonAfterUnboundSpawn({ pid: 4242, scopeClosed: false })).rejects.toThrow('execution_owner_unknown')
+      await expect(owner.abandonAfterUnboundSpawn({ pid: 4242, scopeClosed: true })).rejects.toThrow('execution_owner_unknown')
+      // A branded retirement that could not close the scope keeps the fence.
+      await expect(owner.abandonAfterUnboundSpawn(open)).rejects.toThrow('execution_owner_unknown')
       await owner.abandonAfterUnboundSpawn(proof)
       await expect(owner.abandonAfterUnboundSpawn(proof)).rejects.toThrow('execution_owner_released')
       const archive = path.join(profile.root, `.opencode-v2-execution-owner.released.${owner.record.leaseOwnerId}`, 'release.json')
       expect(JSON.parse(await readFile(archive, 'utf8'))).toEqual({ state: 'spawn_unbound',
         hostInstanceId: owner.record.hostInstanceId, leaseOwnerId: owner.record.leaseOwnerId,
-        retirement: { pid: 4242, processExited: true, scopeClosed: false } })
+        retirement: { pid: 4242, processExited: true, scopeClosed: true } })
       // The freed fence admits the retry's fresh acquisition.
       const successor = await acquireExecutionProfileOwner(profile, identity())
       expect((await readExecutionProfileOwner(profile.root)).hostInstanceId).toBe(successor.record.hostInstanceId)
