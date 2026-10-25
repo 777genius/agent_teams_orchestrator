@@ -437,7 +437,7 @@ jobs:
           Compress-Archive -Path release/runtime -DestinationPath "release/${{ matrix.archive_name }}" -Force
 
       - name: Serve every staged V2 graph from the release archive
-        if: runner.os != 'Windows' && matrix.platform != 'win32-arm64'
+        if: runner.os != 'Windows' && matrix.platform != 'win32-arm64' && steps.opencode-v2.outputs.delivery == 'bundled'
         timeout-minutes: 10
         shell: bash
         env:
@@ -452,7 +452,7 @@ jobs:
           "$extracted/runtime/bun/bun" --no-env-file scripts/opencode-v2/packaged-server-smoke.ts "$extracted/runtime" "$RUNNER_TEMP/packaged-server-smoke.json"
 
       - name: Serve every staged V2 graph from the release archive (Windows)
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && steps.opencode-v2.outputs.delivery == 'bundled'
         timeout-minutes: 10
         shell: pwsh
         env:
