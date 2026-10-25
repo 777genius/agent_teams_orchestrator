@@ -14,13 +14,19 @@ test('known refusals name the cause; anything else stays generic', () => {
   }
 })
 
-test('a failed full V2 read shows the named cause in the provider status detail', async () => {
+test('a named V2 read refusal is a settled unsupported status with its cause; other failures stay transient', async () => {
   const { buildOpenCodeV2RuntimeStatus } = await import('../catalog/OpenCodeV2RuntimeStatus.js')
   const cause = openCodeV2RefusalReason(new Error('execution_containment_launcher_unsupported'))!
-  const snapshot = { detected: true, binaryPath: '/TEST/opencode', models: [], probeError: cause, readGeneration: 'v2' as const }
-  const failed = buildOpenCodeV2RuntimeStatus({ ...snapshot, readStatus: { catalog: 'unavailable', defaultModel: null, models: [] } } as never)
-  expect(failed.detailMessage).toBe(cause)
-  expect(failed.statusCheckOutcome).toBe('transient_error')
+  const failedRead = { catalog: 'unavailable', defaultModel: null, models: [] }
+  const snapshot = { detected: true, binaryPath: '/TEST/opencode', models: [], readGeneration: 'v2' as const, readStatus: failedRead }
+  const refused = buildOpenCodeV2RuntimeStatus({ ...snapshot, probeError: cause, probeRefusal: true } as never)
+  expect(refused).toMatchObject({ supported: false, statusCheckOutcome: 'authoritative', statusCheckErrorCode: null, detailMessage: cause })
+  // An unnamed failure (or cleanup unknown) keeps the retryable transient outcome.
+  const transient = buildOpenCodeV2RuntimeStatus({ ...snapshot, probeError: 'V2 owned server cleanup unknown.' } as never)
+  expect(transient).toMatchObject({ supported: true, statusCheckOutcome: 'transient_error', statusCheckErrorCode: 'unavailable',
+    detailMessage: 'V2 owned server cleanup unknown.' })
   // Without a full read (passive selection) the detail stays the qualification note.
-  expect(buildOpenCodeV2RuntimeStatus(snapshot as never).detailMessage).toContain('remain unqualified')
+  const passive = buildOpenCodeV2RuntimeStatus({ detected: true, binaryPath: '/TEST/opencode', models: [], probeError: cause, probeRefusal: true } as never)
+  expect(passive.detailMessage).toContain('remain unqualified')
+  expect(passive.supported).toBe(false)
 })

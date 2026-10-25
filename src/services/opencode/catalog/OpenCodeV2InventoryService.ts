@@ -12,7 +12,7 @@ import { emptyOpenCodeV2ReadStatus, readAgent, readArray, readConfiguration, rea
 
 export function openCodeV2InventorySnapshot(native: OpenCodeV2NativeIdentity, directory: string,
   readStatus = emptyOpenCodeV2ReadStatus(native, directory), probeError: string | null = null,
-  connectedProviders: readonly OpenCodeConnectedProvider[] = []): OpenCodeInventorySnapshot {
+  connectedProviders: readonly OpenCodeConnectedProvider[] = [], probeRefusal = false): OpenCodeInventorySnapshot {
   // The directory offers the native key integrations; completed V2 connections mark them connected.
   const availableProviders = [...new Set([...readStatus.providers.map(row => row.id),
     ...openCodeV2KeyIntegrations(native.version).map(entry => entry.providerId)])]
@@ -20,7 +20,8 @@ export function openCodeV2InventorySnapshot(native: OpenCodeV2NativeIdentity, di
     profile: null, authStorePath: null, connectedProviders: [...connectedProviders], availableProviders,
     models: readStatus.models.map(row => `${row.providerId}/${row.catalogId}`), modelMetadata: [],
     agents: readStatus.agents.map(row => ({ id: row.id, mode: row.mode === 'all' ? 'unknown' : row.mode })),
-    probeError, diagnostics: ['capabilities_pending: V2 catalog reads do not qualify authentication, team launch or one-shot execution.'],
+    probeError, ...(probeRefusal ? { probeRefusal: true } : {}),
+    diagnostics: ['capabilities_pending: V2 catalog reads do not qualify authentication, team launch or one-shot execution.'],
     readStatus, readGeneration: 'v2' }
 }
 
@@ -31,7 +32,7 @@ export async function probeOpenCodeV2Inventory(native: OpenCodeV2NativeIdentity,
   let status = emptyOpenCodeV2ReadStatus(native, directory)
   let host: Awaited<ReturnType<typeof acquireOpenCodeV2ReadHost>> | undefined
   let reader: Awaited<ReturnType<typeof createOpenCodeV2ReadClient>> | undefined
-  let failure: string | null = null
+  let failure: string | null = null, refusal: string | null = null
   try {
     host = await acquireOpenCodeV2ReadHost(native, directory, boundedContext)
     reader = await createOpenCodeV2ReadClient(host.authority, boundedContext)
@@ -71,18 +72,20 @@ export async function probeOpenCodeV2Inventory(native: OpenCodeV2NativeIdentity,
     status = { ...status, projectId, catalog: 'ready', configuration, providers, models, agents,
       defaultModel: defaultRow ? { providerId: defaultRow.providerId, catalogId: defaultRow.catalogId } : null }
   } catch (error) {
-    // Only this fixed delivery fence is public; never serialize native errors.
+    // Only fixed texts are public; never serialize native errors.
+    refusal = openCodeV2RefusalReason(error)
     failure = error instanceof Error && error.message === 'v2_compiled_runtime_unsupported'
       ? 'V2 catalog reads require the packaged JS wrapper; compiled binary mode is unsupported.'
       : error instanceof Error && error.message === 'cleanup_unknown'
         ? 'V2 owned server cleanup unknown.'
-        : openCodeV2RefusalReason(error) ?? 'V2 read status unavailable; authentication and execution remain unqualified.'
+        : refusal ?? 'V2 read status unavailable; authentication and execution remain unqualified.'
   } finally {
-    try { if (reader) await reader.dispose() } catch { failure = 'V2 HTTP cleanup unknown.' }
-    try { if (host) await host.close() } catch { failure = 'V2 owned server cleanup unknown.' }
+    // An unknown cleanup outranks a refusal: it is reported instead and stays retryable.
+    try { if (reader) await reader.dispose() } catch { failure = 'V2 HTTP cleanup unknown.'; refusal = null }
+    try { if (host) await host.close() } catch { failure = 'V2 owned server cleanup unknown.'; refusal = null }
   }
   if (failure) status = emptyOpenCodeV2ReadStatus(native, directory)
   let connected: OpenCodeConnectedProvider[] = []
   try { connected = await readOpenCodeV2ConnectedProviders(directory, native.version) } catch { /* Unknown receipts never display as connected. */ }
-  return openCodeV2InventorySnapshot(native, directory, status, failure, connected)
+  return openCodeV2InventorySnapshot(native, directory, status, failure, connected, refusal !== null && failure === refusal)
 }
