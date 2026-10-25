@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, spyOn, test } from 'bun:test'
 import { access, mkdir, mkdtemp, readFile, realpath, rm, stat, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -125,16 +125,17 @@ describe('OpenCodeInventoryService parsers', () => {
     })
   })
 
-  test('keeps the full inventory timeout aligned with sequential OpenCode probes', () => {
+  test('budgets cold full inventory independently of summary and per-command probes', () => {
     expect(OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS).toBeGreaterThanOrEqual(
       OPEN_CODE_PROBE_TIMEOUT_MS * 3,
     )
     expect(OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS).toBeGreaterThan(
       OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS,
     )
-    expect(OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS).toBeGreaterThanOrEqual(
-      OPEN_CODE_PROBE_TIMEOUT_MS * 5,
-    )
+    expect(OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS).toBe(180_000)
+    expect(OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS).toBe(30_000)
+    expect(OPEN_CODE_PROBE_TIMEOUT_MS).toBe(10_000)
+    expect(OPEN_CODE_MODEL_LIST_TIMEOUT_MS).toBe(30_000)
   })
 
   test('queries the full OpenCode model inventory, not only the opencode provider', () => {
@@ -242,6 +243,53 @@ describe('OpenCodeInventoryService parsers', () => {
     expect(result).toBe(completed)
     expect(timedOut).toBe(false)
     expect(isOpenCodeInventoryTimeoutSnapshot(result)).toBe(false)
+  })
+
+  test('cold full preparation can exceed sixty seconds while the whole probe remains bounded', async () => {
+    let now = 0, nextId = 0, aborted = false
+    const timers = new Map<number, { at: number; callback: () => void }>()
+    const schedule = spyOn(globalThis, 'setTimeout').mockImplementation(((callback: () => void, ms = 0) => {
+      const id = ++nextId
+      timers.set(id, { at: now + ms, callback })
+      return id
+    }) as unknown as typeof setTimeout)
+    const clear = spyOn(globalThis, 'clearTimeout').mockImplementation((id) => { timers.delete(Number(id)) })
+    const advance = async (target: number) => {
+      for (;;) {
+        const next = [...timers].filter(([, timer]) => timer.at <= target).sort((a, b) => a[1].at - b[1].at)[0]
+        if (!next) break
+        now = next[1].at; timers.delete(next[0]); next[1].callback()
+        await Promise.resolve(); await Promise.resolve()
+      }
+      now = target
+    }
+    try {
+      const completed = inventorySnapshot({ models: ['TEST/cold-model'] })
+      const coldPreparation = new Promise<OpenCodeInventorySnapshot>(resolve => {
+        setTimeout(() => resolve(completed), 65_000)
+      })
+      const coldResult = withOpenCodeInventoryProbeTimeout(coldPreparation, {
+        timeoutMs: OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS, onTimeout: () => { aborted = true },
+      })
+      await advance(65_000)
+      expect(await coldResult).toBe(completed)
+      expect(aborted).toBe(false)
+      expect(timers.size).toBe(0)
+
+      let resolveLate!: (value: OpenCodeInventorySnapshot) => void
+      const hung = withOpenCodeInventoryProbeTimeout(new Promise(resolve => { resolveLate = resolve }), {
+        timeoutMs: OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS, onTimeout: () => { aborted = true },
+      })
+      await advance(65_000 + 179_999)
+      expect(aborted).toBe(false)
+      await advance(65_000 + 180_000)
+      const timedOut = await hung
+      expect(aborted).toBe(true)
+      expect(isOpenCodeInventoryTimeoutSnapshot(timedOut)).toBe(true)
+      resolveLate(completed)
+      expect(await hung).toBe(timedOut)
+      expect(timers.size).toBe(0)
+    } finally { clear.mockRestore(); schedule.mockRestore() }
   })
 
   test('retains command timing when deadline cleanup replaces the active step', () => {
