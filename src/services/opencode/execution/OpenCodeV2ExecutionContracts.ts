@@ -5,6 +5,13 @@ import { isOpenCodeV2Identity, type OpenCodeV2Dialect, type OpenCodeV2Pin } from
 export function openCodeV2RunInitializationMs(platform: NodeJS.Platform): number {
   return platform === 'win32' ? 300_000 : platform === 'darwin' ? 300_000 : 90_000
 }
+/** The activation deadline a child accepts: the caller's deadline, clipped to the
+ * platform ceiling counted from before the child was spawned. The entry refuses any
+ * deadline past its own start plus that ceiling, so a longer caller deadline (the
+ * 240s catalog lease) must not reach it unclipped. */
+export function openCodeV2ActivationDeadline(callerDeadline: number, acquisitionStartedAt: number, platform: NodeJS.Platform): number {
+  return Math.min(callerDeadline, acquisitionStartedAt + openCodeV2RunInitializationMs(platform))
+}
 // Windows physical close shares the 40s owner Stop envelope. The
 // owner clips this ceiling to leave 2s for the final durable run receipt.
 export const OPEN_CODE_V2_WINDOWS_CLOSE_MS = 38_000

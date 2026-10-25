@@ -7,7 +7,7 @@ import { lstat, realpath } from 'node:fs/promises'
 import { resolveOpenCodeV2ExecutionDelivery } from './OpenCodeV2ExecutionDelivery.js'
 import { hashOpenCodeFile } from '../compatibility/OpenCodeNativeIdentity.js'
 import { assertOpenCodeV2Launchable, isOpenCodeV2Identity } from '../compatibility/OpenCodeV2Registry.js'
-import { executionAssert, executionHash, executionRecord, type ExecutionAuthority, type ExecutionContext } from '../execution/OpenCodeV2ExecutionContracts.js'
+import { executionAssert, executionHash, executionRecord, openCodeV2ActivationDeadline, type ExecutionAuthority, type ExecutionContext } from '../execution/OpenCodeV2ExecutionContracts.js'
 import { boundOpenCodeRead } from '../transport/OpenCodeBoundedFetch.js'
 import { awaitOpenCodeV2ExecutionReadiness, awaitOpenCodeV2CatalogReadiness } from '../transport/OpenCodeV2ExecutionClientFactory.js'
 import { canonicalExecutionDirectory, readExecutionBirth, validateExecutionGraph, validateExecutionNative, validateExecutionProfile,
@@ -431,7 +431,8 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
       executionAssert(!closeWork && !exited, 'execution_identity_mismatch')
       await owner!.bindChild(mapping.bun.hostPID, birth, mapping); check(); mark('child-bound')
       await launch.assertLive(); check()
-      await launch.start({ password, native, profile, activationDeadline: context.deadline, ...(gatedWindows ? { deferRuntime: true } : {}) }, context.deadline, lifetime.signal); check(); mark('start-sent')
+      const activationDeadline = openCodeV2ActivationDeadline(context.deadline, acquisitionStartedAt, process.platform)
+      await launch.start({ password, native, profile, activationDeadline, ...(gatedWindows ? { deferRuntime: true } : {}) }, context.deadline, lifetime.signal); check(); mark('start-sent')
     })
     const assertReadyIdentity = (row: Record<string, unknown>) => {
       executionAssert(mapping && !closeWork && !exited, 'execution_identity_mismatch')
