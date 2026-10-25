@@ -9,13 +9,9 @@ import type { ExecutionGraph, OwnedNativeProfile } from './OpenCodeV2ExecutionBi
 type SelectedCredential = Readonly<{ type: 'api'; key: string }> | Readonly<{
   type: 'oauth'; access: string; refresh: string; expires: number; accountId?: string; enterpriseUrl?: string
 }>
-export type SelectedAuthMetadata = Readonly<{
-  read(deadline: number, signal?: AbortSignal): Promise<Readonly<{ sha256: string; bytes: number }>>
-}>
-
-/** Both the parent admission guard and sealed child consume the same bound file. */
+/** Both the parent admission guard and the child consume the same bound file. */
 export async function readOpenCodeV2SelectedAuth(profile: OwnedNativeProfile,
-  metadata?: SelectedAuthMetadata, deadline = Date.now() + 15_000, signal?: AbortSignal) {
+  deadline = Date.now() + 15_000, signal?: AbortSignal) {
   executionAssert(!('purpose' in profile.selection), 'execution_selected_auth_required')
   const providerId = profile.selection.model.providerID
   const file = path.join(profile.root, 'data/opencode/auth.json'), fingerprint = profile.authSha256
@@ -28,12 +24,7 @@ export async function readOpenCodeV2SelectedAuth(profile: OwnedNativeProfile,
       (process.platform === 'win32' || stat.uid === process.getuid?.()) &&
       (process.platform === 'win32' || (stat.mode & 0o077) === 0) && stat.size <= 128 * 1024 &&
       await filesystem.realpath(file) === file && await hashOpenCodeFile(file) === fingerprint, 'execution_selected_auth_changed')
-    if (metadata) {
-      const observed = await metadata.read(deadline, signal)
-      executionAssert(observed.sha256 === fingerprint && observed.bytes === stat.size, 'execution_selected_auth_changed')
-    }
   }
-  if (process.platform === 'win32') executionAssert(metadata, 'execution_selected_auth_metadata_required')
   await check()
   const bytes = await readFile(file)
   executionAssert(createHash('sha256').update(bytes).digest('hex') === fingerprint, 'execution_selected_auth_changed')

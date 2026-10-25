@@ -229,7 +229,7 @@ test('initial auth waits for the pin-specific native activation barrier before r
 
 
 
-test('selected auth SHA metadata gates consumption and never leaks credential fragments', async () => {
+test('a changed selected auth file gates consumption and never leaks credential fragments', async () => {
   const f = await fixture()
   let providerCalls = 0, connectCalls = 0
   const port = {
@@ -239,28 +239,19 @@ test('selected auth SHA metadata gates consumption and never leaks credential fr
     connect: async () => { connectCalls++ },
   }
   try {
+    await writeFile(f.auth, `${f.content}TEST-LOCAL-CHANGE`)
     let message = ''
-    try {
-      await attachOpenCodeV2SelectedKey(f.profile, port, {
-        metadata: { read: async () => ({ sha256: digest(f.content), bytes: f.content.length + 1 }) }, deadline: Date.now() + 1000,
-      })
-    } catch (error) { message = error instanceof Error ? error.message : String(error) }
+    try { await attachOpenCodeV2SelectedKey(f.profile, port, { deadline: Date.now() + 1000 }) }
+    catch (error) { message = error instanceof Error ? error.message : String(error) }
     expect(message).toBe('execution_selected_auth_changed')
     expect(message).not.toContain('TEST-DUMMY-ACCESS')
-    expect(providerCalls).toBe(0)
-    expect(connectCalls).toBe(0)
-
-    await writeFile(f.auth, `${f.content}TEST-LOCAL-CHANGE`)
-    await expect(attachOpenCodeV2SelectedKey(f.profile, port, {
-      metadata: { read: async () => ({ sha256: digest(f.content), bytes: f.content.length }) }, deadline: Date.now() + 1000,
-    })).rejects.toThrow('execution_selected_auth_changed')
     expect(providerCalls).toBe(0)
     expect(connectCalls).toBe(0)
 
     const apiContent = JSON.stringify({ openai: { type: 'api', key: 'TEST-DUMMY-KEY' } })
     await writeFile(f.auth, apiContent)
     const profile = { ...f.profile, authSha256: digest(apiContent) }
-    let connected: Record<string, unknown> | null = null, integrationCalls = 0, metadataCalls = 0
+    let connected: Record<string, unknown> | null = null, integrationCalls = 0
     await attachOpenCodeV2SelectedKey(profile, {
       providers: async () => ({ location: { directory: profile.directory }, data: [{ id: 'openai', integrationID: 'openai', activation: 'enabled' }] }),
       integration: async () => {
@@ -275,28 +266,8 @@ test('selected auth SHA metadata gates consumption and never leaks credential fr
         connected = { type: 'credential', id: 'cred_TESTselected' }
         connectCalls++
       },
-    }, { metadata: { read: async () => {
-      metadataCalls++
-      return { sha256: digest(apiContent), bytes: apiContent.length }
-    } }, deadline: Date.now() + 1000 })
+    }, { deadline: Date.now() + 1000 })
     expect(connectCalls).toBe(1)
     expect(integrationCalls).toBe(2)
-    expect(metadataCalls).toBeGreaterThanOrEqual(4)
-
-    connected = null
-    let freshnessMetadataCalls = 0
-    await expect(attachOpenCodeV2SelectedKey(profile, {
-      providers: async () => ({ location: { directory: profile.directory }, data: [{ id: 'openai', integrationID: 'openai', activation: 'enabled' }] }),
-      integration: async () => ({ location: { directory: profile.directory }, data: {
-        id: 'openai', methods: [{ type: 'key' }], connections: connected ? [connected] : [],
-      } }),
-      connect: async () => { connected = { type: 'credential', id: 'cred_TESTunexpected' }; connectCalls++ },
-    }, { metadata: { read: async () => {
-      freshnessMetadataCalls++
-      return freshnessMetadataCalls < 3
-        ? { sha256: digest(apiContent), bytes: apiContent.length }
-        : { sha256: digest(apiContent), bytes: apiContent.length + 1 }
-    } }, deadline: Date.now() + 1000 })).rejects.toThrow('execution_selected_auth_changed')
-    expect(connectCalls).toBe(1)
   } finally { await f.remove() }
 })

@@ -19,13 +19,6 @@ async function fixture(credential: unknown = { type: 'api', key: 'TEST-DUMMY-KEY
     selection: { agent: 'build', model: { providerID: 'groq', id: 'TEST-model' }, permissions: [] } }
   return { profile, auth, content, remove: () => rm(root, { recursive: true, force: true }) }
 }
-// Windows admission requires the native SHA-only auth metadata. This TEST
-// reader observes the same bound file, so every file and API check still runs.
-const selectedAuth = (file: string) => process.platform !== 'win32' ? undefined : {
-  deadline: Date.now() + 15_000,
-  metadata: { read: async () => { const bytes = await readFile(file); return { sha256: createHash('sha256').update(bytes).digest('hex'), bytes: bytes.length } } },
-}
-
 test('execution auth module loads without importing either official client before selection', async () => {
   const f = await fixture()
   try {
@@ -102,7 +95,7 @@ test('fresh official database skips legacy key import; native key attachment mak
         ({ location, data: { id: 'groq', methods: [{ type: 'oauth' }], connections: [] } }) },
         'execution_selected_auth_existing_or_unsupported'],
     ] as const) {
-      await expect(attachOpenCodeV2SelectedKey(f.profile, changed, selectedAuth(f.auth))).rejects.toThrow(code)
+      await expect(attachOpenCodeV2SelectedKey(f.profile, changed)).rejects.toThrow(code)
     }
     expect(posts).toBe(0); expect(connections()).toEqual([]); expect(providerGets).toBe(1)
     await attachOpenCodeV2SelectedKey(f.profile, {
@@ -113,7 +106,7 @@ test('fresh official database skips legacy key import; native key attachment mak
         db!.query('insert into credential(id,integration_id,label,value,time_created,time_updated) values(?,?,?,?,?,?)')
           .run('cred_TESToriginal', id, 'API key', JSON.stringify({ type: 'key', key }), 1, 1)
       },
-    }, selectedAuth(f.auth))
+    })
     expect(posts).toBe(1); expect(connections()).toEqual([{ type: 'credential', id: 'cred_TESToriginal' }])
     expect(providerGets).toBe(2)
     expect(await readFile(f.auth, 'utf8')).toBe(f.content)
@@ -122,7 +115,7 @@ test('fresh official database skips legacy key import; native key attachment mak
       ...exact,
       integration: async id => ({ location: { directory: f.profile.directory }, data: { id, methods: [{ type: 'key' }], connections: connections() } }),
       connect: async () => { posts++; },
-    }, selectedAuth(f.auth))).rejects.toThrow('execution_selected_auth_existing_or_unsupported')
+    })).rejects.toThrow('execution_selected_auth_existing_or_unsupported')
     expect(posts).toBe(1)
   } finally { db?.close(); await f.remove() }
 }, 20_000)
@@ -134,9 +127,7 @@ test('changed, absent and unsupported selected auth never reach native mutation'
     try {
       if (mode === 'changed') await writeFile(f.auth, '{}')
       const port = { providers: async () => { calls++; return {} }, integration: async () => { calls++; return {} }, connect: async () => { calls++; } }
-      if (process.platform === 'win32') await expect(attachOpenCodeV2SelectedKey(f.profile, port))
-        .rejects.toThrow('execution_selected_auth_metadata_required')
-      await expect(attachOpenCodeV2SelectedKey(f.profile, port, selectedAuth(f.auth))).rejects.toThrow('execution_selected_auth_' +
+      await expect(attachOpenCodeV2SelectedKey(f.profile, port)).rejects.toThrow('execution_selected_auth_' +
         (mode === 'changed' ? 'changed' : mode === 'absent' ? 'missing' : 'unsupported'))
       expect(calls).toBe(0)
     } finally { await f.remove() }
