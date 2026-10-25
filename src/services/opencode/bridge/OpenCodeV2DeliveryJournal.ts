@@ -8,7 +8,6 @@ import { assertIntentIdentity, executionAssert, executionHash, executionRecord }
 import type { OpenCodeDeliveryResponseObservation } from '../OpenCodeDeliveryResponseObserver.js'
 import { commandStatusMismatchReason, markSendMessageOutcome, type SendMessageCommandData, type SendMessageOutcomeBase } from './OpenCodeBridgeDeliveryJournal.js'
 import type { RunControlResult } from './OpenCodeV2RunTypes.js'
-import { openWindowsDeliveryJournalGuard } from './OpenCodeV2WindowsDeliveryGuard.js'
 
 type DeliveryResult = Extract<RunControlResult, { kind: 'send' | 'observe' }>
 
@@ -26,27 +25,6 @@ export class OpenCodeV2DeliveryJournal {
   query(input: Parameters<OpenCodeCommandOutcomeStore['query']>[0]) { return this.store.query(input) }
 
   private async withLock<T>(operation: () => Promise<T>, deadline?: number): Promise<T> {
-    if (process.platform === 'win32') {
-      const guard = await openWindowsDeliveryJournalGuard(this.dataRoot, deadline ?? Date.now() + 30_000)
-      let release: (() => Promise<void>) | undefined
-      let primary: unknown, failed = false
-      try {
-        await guard.assertOwned()
-        release = await lockfile.lock(guard.path, { retries: { retries: 30, minTimeout: 5, maxTimeout: 100 } })
-        await guard.assertOwned()
-        const result = await operation()
-        await guard.assertOwned()
-        return result
-      } catch (error) { primary = error; failed = true; throw error }
-      finally {
-        const errors: unknown[] = []
-        try { if (release) await release() } catch (error) { errors.push(error) }
-        try { await guard.assertOwned() } catch (error) { errors.push(error) }
-        try { await guard.close() } catch (error) { errors.push(error) }
-        if (errors.length) throw new AggregateError([...(failed ? [primary] : []), ...errors],
-          'cleanup_unknown', { cause: failed ? primary : errors[0] })
-      }
-    }
     // Serialize V2 observation merge decisions across fresh CLI processes,
     // then use the unchanged shared store's own atomic identity/write lock.
     // There is still one app outcome file, including for V1 consumers.
@@ -59,7 +37,7 @@ export class OpenCodeV2DeliveryJournal {
     })
     const stat = await lstat(this.lockPath)
     executionAssert(stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1 &&
-      stat.uid === process.getuid?.() && (stat.mode & 0o077) === 0, 'delivery_lock_foreign')
+      (process.platform === 'win32' || stat.uid === process.getuid?.() && (stat.mode & 0o077) === 0), 'delivery_lock_foreign')
     const release = await lockfile.lock(this.lockPath, { retries: { retries: 30, minTimeout: 5, maxTimeout: 100 } })
     try { return await operation() } finally { await release() }
   }

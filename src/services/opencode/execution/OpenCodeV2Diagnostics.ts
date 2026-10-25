@@ -1,5 +1,3 @@
-import { readWindowsNativeAliasFailure } from '../host/windows/OpenCodeV2WindowsNativeBroker.js'
-import { windowsRealpathInstallCauses } from '../host/windows/OpenCodeV2WindowsChildControl.js'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { types } from 'node:util'
@@ -9,7 +7,6 @@ import { executionAssert } from './OpenCodeV2ExecutionContracts.js'
 import { readOpenCodeV2ProviderWireFailure } from '../transport/OpenCodeV2ProviderWire.js'
 import { readOpenCodeV2ExecutionWireFailure } from '../transport/OpenCodeV2ExecutionFetch.js'
 import type { ExecutionMcpFailure } from '../transport/OpenCodeV2ExecutionClientFactory.js'
-import { ensureWindowsPrivateDirectories } from '../profile/OpenCodePrivateDirectories.js'
 import { readOpenCodeV2ServerFailure, type OpenCodeV2ServerFailure } from './OpenCodeV2ServerFailure.js'
 
 export type ExecutionCatalogPhase = 'client-setup' | 'info' | 'location' | 'integration-ready'
@@ -71,7 +68,7 @@ function startupDiagnostic(output: string | undefined) {
       const closedFields: Record<string, readonly string[]> = {
         errno: ['EPERM', 'EACCES', 'ENOENT', 'ENOTDIR', 'EISDIR', 'EINVAL', 'UNKNOWN', 'EIO', 'ENOSYS'],
         operation: ['realpath', 'open', 'read', 'lstat', 'stat'], errorName: ['Error', 'TypeError', 'ReferenceError', 'RangeError', 'AbortError'],
-        cause: ['execution_contract_invalid', 'execution_identity_mismatch', 'execution_entry_changed', 'v2_compiled_runtime_unsupported', 'v2_execution_layout_unsupported', 'execution_profile_changed', 'execution_graph_changed', 'execution_graph_incomplete', 'execution_graph_dependency_missing', 'execution_containment_identity_mismatch', 'execution_realpath_unavailable', ...windowsRealpathInstallCauses, 'execution_timeout', 'execution_cancelled'],
+        cause: ['execution_contract_invalid', 'execution_identity_mismatch', 'execution_entry_changed', 'v2_compiled_runtime_unsupported', 'v2_execution_layout_unsupported', 'execution_profile_changed', 'execution_graph_changed', 'execution_graph_incomplete', 'execution_graph_dependency_missing', 'execution_containment_identity_mismatch', 'execution_realpath_unavailable', 'execution_timeout', 'execution_cancelled'],
         profileGuard: ['environment_hash', 'config_hash', 'home_mapping', 'path_containment', 'database_type', 'models_type', 'models_hash', 'process_cwd', 'process_pwd', 'process_environment'],
       }
       if (!row || Array.isArray(row)) continue
@@ -401,7 +398,7 @@ export async function recordOpenCodeV2ProviderFailure(phase: string, error: unkn
   const syscall = ['realpath', 'open', 'read', 'lstat', 'stat'].find(value => value === detail?.syscall)
   const failure = phase === 'execution-host-startup' && (name || errno || syscall)
     ? { ...(name ? { name } : {}), ...(errno ? { errno } : {}), ...(syscall ? { operation: syscall } : {}) } : undefined
-  const alias = readWindowsNativeAliasFailure(cause) ?? readWindowsNativeAliasFailure(error)
+  const alias = undefined
   const operation = readOpenCodeV2ProviderWireFailure(error)
   const catalog = error !== null && typeof error === 'object' ? catalogFailures.get(error) : undefined
   const startup = startupDiagnostic(startupOutput)
@@ -424,12 +421,10 @@ export async function recordOpenCodeV2ProviderFailure(phase: string, error: unkn
   if (cleanupTiming?.dataRoot !== undefined && (!cleanup || typeof cleanupTiming.dataRoot !== 'string' || !path.isAbsolute(cleanupTiming.dataRoot))) return
   try {
     const directory = path.join(cleanupTiming?.dataRoot ?? resolveClaudeMultimodelPaths().data, 'opencode/v2/provider-diagnostics')
-    if (process.platform === 'win32') {
-      await ensureWindowsPrivateDirectories([directory])
-    } else {
+    {
       await mkdir(directory, { recursive: true, mode: 0o700 })
       const info = await lstat(directory)
-      executionAssert(info.isDirectory() && !info.isSymbolicLink() && info.uid === process.getuid?.() && (info.mode & 0o077) === 0, 'provider_diagnostics_foreign')
+      executionAssert(info.isDirectory() && !info.isSymbolicLink() && (process.platform === 'win32' || info.uid === process.getuid?.() && (info.mode & 0o077) === 0), 'provider_diagnostics_foreign')
     }
     // Nonsecret observational data only: this file is not native ownership or
     // cleanup authority, even when an elevated Windows writer owns the file.

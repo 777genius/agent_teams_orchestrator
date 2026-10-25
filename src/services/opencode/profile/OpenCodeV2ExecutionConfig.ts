@@ -20,6 +20,20 @@ export type ExecutionConfigInput = {
   provider?: Readonly<{ package?: string; baseURL?: string; models?: ExecutionProviderModels }>
 }
 
+/** V2 teammates get the same tools as V1 teammates in auto approval mode
+ * (buildOpenCodeTeammatePermission('auto')): everything is denied except reading and
+ * searching files, editing them, running shell commands, the todo list and the team
+ * controller tools. Subagents and paths outside the project stay denied. The last
+ * matching rule wins, so the catch-all deny comes first. */
+export const OPENCODE_V2_TEAMMATE_PERMISSIONS: ExecutionSelection['permissions'] = Object.freeze([
+  { action: '*', resource: '*', effect: 'deny' as const },
+  ...['read', 'glob', 'grep', 'todowrite', 'edit', 'shell'].map(action => ({ action, resource: '*', effect: 'allow' as const })),
+  { action: 'subagent', resource: '*', effect: 'deny' as const },
+  { action: 'external_directory', resource: '*', effect: 'deny' as const },
+  ...['agent-teams_*', 'agent_teams_*', 'mcp__agent-teams__*', 'mcp__agent_teams__*']
+    .map(action => ({ action, resource: '*', effect: 'allow' as const })),
+].map(rule => Object.freeze(rule)))
+
 /** Selected profile overrides, never ambient HOME/config/auth discovery. The profile owner
  * persists this document before acquiring its lease. Readiness verifies the selected rules. */
 export function createOpenCodeV2ExecutionConfig(input: ExecutionConfigInput): {
@@ -48,9 +62,7 @@ export function createOpenCodeV2ExecutionConfig(input: ExecutionConfigInput): {
   }
   const selectedModel = { providerID: selection.model.providerID, model: selection.model.id,
     ...(selection.model.variant === undefined ? {} : { variant: selection.model.variant }) }
-  const nativeMcp = mcp.type === 'local'
-    ? { ...mcp, command: [...mcp.command], ...(process.platform === 'win32' ? { disabled: true } : {}) }
-    : { ...mcp, ...(process.platform === 'win32' ? { disabled: true } : {}) }
+  const nativeMcp = mcp.type === 'local' ? { ...mcp, command: [...mcp.command] } : { ...mcp }
   const info = {
     update: 'disable', share: 'disabled', snapshots: false, warming: false,
     plugins: input.unattendedTeam === true ? ['-opencode.tool.question'] : [],

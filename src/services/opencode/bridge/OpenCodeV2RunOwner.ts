@@ -2,7 +2,7 @@ import { openCodeBunVersion } from '../../../constants/openCodeBunVersion.js'
 import { assertOpenCodeV2Launchable } from '../compatibility/OpenCodeV2Registry.js'
 import { recordOpenCodeV2ProviderFailure, retainOpenCodeV2InitializationPhase, type RunInitializationFacts, type RunInitializationPhase } from '../execution/OpenCodeV2Diagnostics.js'
 import { captureOwnedV2ProbeAuthority, buildOwnedV2ProbeProof, type ProbeAuthority } from './OpenCodeV2ProbeProof.js'
-import { parseControllerInboxBytes, readOwnedControllerInbox, readOwnedControllerTools, type ControllerToolProof } from './OpenCodeV2ControllerTools.js'
+import { readOwnedControllerInbox, readOwnedControllerTools, type ControllerToolProof } from './OpenCodeV2ControllerTools.js'
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { readFile, realpath } from 'node:fs/promises'
@@ -13,15 +13,15 @@ import { OpenCodeV2AdmissionService, type QueueIntent } from '../execution/OpenC
 import { isMutableExecutionReadback } from '../execution/OpenCodeV2TerminalSettlement.js'
 import { OpenCodeV2AdmissionStore } from '../execution/OpenCodeV2AdmissionStore.js'
 import { OpenCodeV2SessionService, verifyExecutionSession } from '../execution/OpenCodeV2SessionService.js'
-import { canonicalExecutionJSON, executionAssert, executionHash, executionRecord, OPEN_CODE_V2_WINDOWS_CLOSE_MS, type ExecutionContext, type SessionAuthority } from '../execution/OpenCodeV2ExecutionContracts.js'
-import { acquireExecutionLease, awaitExecutionHostReady, isTransientWindowsLaunchFailure, readExecutionCleanupObservation, readExecutionLeaseObservation, type ExecutionLease } from '../host/OpenCodeV2ExecutionHost.js'
+import { canonicalExecutionJSON, executionAssert, executionHash, executionRecord, type ExecutionContext, type SessionAuthority } from '../execution/OpenCodeV2ExecutionContracts.js'
+import { acquireExecutionLease, awaitExecutionHostReady, readExecutionCleanupObservation, readExecutionLeaseObservation, type ExecutionLease } from '../host/OpenCodeV2ExecutionHost.js'
 import { createExecutionGraphValidationCohort } from '../host/OpenCodeV2ExecutionBinding.js'
 import { isExecutionCleanupReceipt, type ExecutionCleanupReceipt } from '../host/OpenCodeV2ExecutionLifecycle.js'
 import { createOpenCodeV2ExecutionClient, type ExecutionBridgeClient, type ExecutionLog, type ExecutionMessagePage } from '../transport/OpenCodeV2ExecutionClientFactory.js'
 import { boundOpenCodeRead } from '../transport/OpenCodeBoundedFetch.js'
 import { projectOpenCodeV2Turn } from './OpenCodeV2TurnProjection.js'
 import { verifyOpenCodeV2SilentBootstrap } from './OpenCodeV2BootstrapProjection.js'
-import { OPEN_CODE_V2_RUN_INITIALIZATION_MS, discoverOpenCodeV2Run, readWindowsRunControllerInbox, parseRunControlRequest, readRunProcessIdentity, reserveRunControlDirectory, runControlDirectory, serveOpenCodeV2RunControl, writeRunControlFile } from './OpenCodeV2RunControl.js'
+import { OPEN_CODE_V2_RUN_INITIALIZATION_MS, discoverOpenCodeV2Run, parseRunControlRequest, reserveRunControlDirectory, runControlDirectory, serveOpenCodeV2RunControl, writeRunControlFile } from './OpenCodeV2RunControl.js'
 import type { InstructionReceipt, RunControlRecord, RunControlRequest, RunControlResult, RunExecutionPorts, RunLaunchPlan, RunMemberPlan, RunMemberStatus, RunOwnerState, RunStopMember } from './OpenCodeV2RunTypes.js'
 
 const productionPorts: RunExecutionPorts = { acquire: acquireExecutionLease, client: createOpenCodeV2ExecutionClient }
@@ -71,7 +71,8 @@ export class OpenCodeV2RunOwner {
   private readonly operations = new Set<AbortController>()
   private readonly initializationAbort = new AbortController()
   private readonly acquisitions = new Set<AbortController>()
-  private readonly deferredWindowsControllers = process.platform === 'win32'
+  // Members start their native children concurrently on every platform.
+  private readonly deferredWindowsControllers = false
   private readonly pendingLeases = new Map<string, ExecutionLease>()
   // Members share one official graph receipt; their concurrent owner checks
   // join one in-flight validation. Children keep independent validation.
@@ -89,13 +90,8 @@ export class OpenCodeV2RunOwner {
       executionAssert(Date.now() < deadline, 'run_stopped')
       return await start()
     } catch (error) {
-      // A transient cold-start class is still retried inside this acquisition.
-      // Abort queued physical starts only on the final failure: cancelling the
-      // retrying acquisition here would poison its own next attempt.
-      if (!isTransientWindowsLaunchFailure(error)) {
-        this.initializationAbort.abort(error)
-        for (const acquisition of this.acquisitions) acquisition.abort(error)
-      }
+      this.initializationAbort.abort(error)
+      for (const acquisition of this.acquisitions) acquisition.abort(error)
       throw error
     } finally { release() }
   }
@@ -497,10 +493,7 @@ export class OpenCodeV2RunOwner {
       member.controllerTools = await readOwnedControllerTools(client, member.plan.profile, member.plan.controllerMcpName, deadline, signal)
       const controllerBinding = { teamId: this.plan.binding.teamId, runId: this.plan.binding.runId,
         memberId: member.plan.memberId, sessionID: id }
-      const controllerInbox = process.platform === 'win32'
-        ? parseControllerInboxBytes(await readWindowsRunControllerInbox(this.directory, member.plan.profile,
-          member.controllerTools, controllerBinding, deadline, signal), controllerBinding)
-        : await readOwnedControllerInbox(member.plan.profile, member.controllerTools, controllerBinding, deadline, signal)
+      const controllerInbox = await readOwnedControllerInbox(member.plan.profile, member.controllerTools, controllerBinding, deadline, signal)
       const turn = projectOpenCodeV2Turn({ pin: client.authority.pin, sessionID: id, nativeInputID: intent.identity.nativeInputID,
         beforeCursor: admission.beforeCursor, originalText: intent.input.text, ...cut,
         inboundMessageId: intent.identity.localMessageId, advertisedTools: member.controllerTools.nativeNames,
@@ -608,10 +601,7 @@ export class OpenCodeV2RunOwner {
       let cleanup: RunStopMember['cleanup'] = null
       const cleanupStartedAt = Date.now()
       // The same 40s owner deadline funds physical close AND finalization.
-      // Windows may use up to 38s, leaving one shared 2s receipt-write reserve.
-      const closeDeadline = this.deferredWindowsControllers
-        ? Math.min(Date.now() + OPEN_CODE_V2_WINDOWS_CLOSE_MS, cleanupDeadline - 2000)
-        : Date.now() + remaining(22_000)
+      const closeDeadline = Date.now() + remaining(22_000)
       try { cleanup = await boundOpenCodeRead(this.closeLease(member.lease, closeDeadline), Math.max(1, closeDeadline - Date.now())) }
       catch (failure) {
         errors.push('physical_cleanup_unknown')
@@ -704,18 +694,7 @@ export async function launchExplicitOpenCodeV2Run(plan: RunLaunchPlan): Promise<
     await boundOpenCodeRead(ready, Math.min(process.platform === 'darwin' ? OPEN_CODE_V2_RUN_INITIALIZATION_MS : 30_000, plan.deadline - Date.now()))
     const record = await discoverOpenCodeV2Run(plan.dataRoot, plan.binding.teamId, plan.binding.runId)
     executionAssert(record && executionHash(record.binding) === executionHash(plan.binding) && record.sourceSha256 === sourceSha256, 'run_owner_unknown')
-    if (process.platform === 'win32') {
-      executionAssert('endpoint' in record, 'run_owner_unknown')
-      // Native control publishes the helper in record.process and the separately
-      // measured Bun supervisor in endpoint.bun. Match the spawned supervisor
-      // only to that measured owner identity; a supplied PID is not proof.
-      const supervisor = await readRunProcessIdentity(child.pid)
-      executionAssert(child.pid === record.endpoint.bun.pid &&
-        executionHash(supervisor) === executionHash(record.endpoint.bun) &&
-        record.process.pid !== record.endpoint.bun.pid, 'run_owner_unknown')
-    } else {
-      executionAssert(!('endpoint' in record) && child.pid === record.process.pid, 'run_owner_unknown')
-    }
+    executionAssert(child.pid === record.process.pid, 'run_owner_unknown')
     child.disconnect(); child.unref(); return record
   } catch (error) {
     await recordOpenCodeV2ProviderFailure('execution-host-startup', entryFailure ?? error, true,

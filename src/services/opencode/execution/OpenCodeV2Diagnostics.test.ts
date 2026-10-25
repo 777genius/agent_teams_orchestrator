@@ -3,12 +3,10 @@ import { test, expect, spyOn } from 'bun:test'
 import { mkdir, mkdtemp, readdir, readFile, rm, lstat } from 'node:fs/promises'
 import path from 'node:path'
 import { tmpdir } from 'node:os'
-import * as privateDirectories from '../profile/OpenCodePrivateDirectories.js'
 import { ClientError as CurrentClientError } from '@opencode/client'
 import { ClientError as FloorClientError } from '@opencode/client-v2.0.0'
 import { ExecutionTransportFailure } from '../transport/OpenCodeV2ExecutionFetch.js'
 import { recordOpenCodeV2ProviderFailure, retainOpenCodeV2CatalogFailure, retainOpenCodeV2CleanupPhase, retainOpenCodeV2InitializationPhase, type RunInitializationPhase } from './OpenCodeV2Diagnostics.js'
-import { windowsRealpathInstallCauses } from '../host/windows/OpenCodeV2WindowsChildControl.js'
 
 test('catalog diagnostics preserve selected official client reasons, numeric status and immutable owned wire codes only', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'TEST-v2-catalog-diagnostics-'))
@@ -291,166 +289,8 @@ test('MCP readback retains the exact category and only the closed controller sta
   }
 })
 
-test('owner MCP initialization retains closed command channel facts from the actual Windows handler', async () => {
-  const { createWindowsCommandRequestHandler } = await import('../host/windows/OpenCodeV2WindowsExecution.js')
-  const root = await mkdtemp(path.join(tmpdir(), 'TEST-v2-owner-commands-'))
-  const previous = process.env.CLAUDE_MULTIMODEL_DATA_HOME
-  process.env.CLAUDE_MULTIMODEL_DATA_HOME = root
-  const secret = 'TEST-PRIVATE-COMMAND-PAYLOAD', nonce = 'TEST-nonce', leaseOwnerId = 'TEST-lease'
-  let now = 1_000_000, counter = 0, commandId = '', hang = false, failReply = false
-  const replies: Record<string, unknown>[] = []
-  const clock = spyOn(Date, 'now').mockImplementation(() => now)
-  try {
-    const handler = createWindowsCommandRequestHandler({ nonce, leaseOwnerId, ready: () => true, closing: () => false,
-      assertLive: async () => undefined, failed: () => undefined,
-      request: async (operation, input = {}) => {
-        const value = input as Record<string, unknown>
-        if (operation === 'send') {
-          if (failReply) { failReply = false; throw new Error(secret) }
-          replies.push(value.value as Record<string, unknown>); return undefined
-        }
-        now += 7
-        if (operation === 'commandStart' && hang) return new Promise(() => undefined)
-        if (operation === 'commandEndStdin') return { closed: true, nextOffset: 120 }
-        if (operation === 'commandStart') { commandId = String(value.commandId); return { commandId, pid: 4, birthFiletime: '1' } }
-        if (operation === 'commandWriteStdin') return { writtenBytes: 120, nextOffset: 120 }
-        if (operation === 'commandRead' && value.stream === 'stderr') return { bytesBase64: secret, nextOffset: 42, eof: false }
-        if (operation === 'commandRead' && value.offset === 1) throw new Error(secret)
-        if (operation === 'commandRead') return { bytesBase64: '', nextOffset: 0, eof: false }
-        if (operation === 'commandStatus') return { running: true, exitCode: null }
-        throw new Error(secret)
-      } })
-    const send = (operation: string, input: Record<string, unknown>) => handler({ type: 'commandRequest', nonce, leaseOwnerId,
-      id: `00000000-0000-4000-8000-${String(++counter).padStart(12, '0')}`, operation, input })
-    const mcpStartedAt = now
-    now += 5
-    await send('commandStart', { executable: `C:\\${secret}\\node.exe`, args: [secret], cwd: 'C:\\', env: { TOKEN: secret }, stdin: 'pipe' })
-    await send('commandWriteStdin', { commandId, offset: 0, bytesBase64: secret })
-    await send('commandRead', { commandId, stream: 'stdout', offset: 0, maxBytes: 8192 })
-    await send('commandRead', { commandId, stream: 'stderr', offset: 0, maxBytes: 8192 })
-    await send('commandStatus', { commandId })
-    await send('commandRead', { commandId, stream: 'stdout', offset: 1, maxBytes: 8192 })
-    // A native result whose reply cannot be delivered is a reply failure, not a native failure.
-    failReply = true
-    await send('commandEndStdin', { commandId, offset: 120 })
-    expect(replies.map(reply => reply.ok)).toEqual([true, true, true, true, true, false, false])
-    // An in-flight native start is visible with its stage and age, not as an absent spawn.
-    hang = true
-    const hungAt = now
-    void send('commandStart', { executable: 'C:\\TEST\\git.exe', args: [], cwd: 'C:\\', env: {}, stdin: 'ignore' })
-    await new Promise(resolve => setImmediate(resolve))
-    now += 100
-    const observation = handler.observation()
-    clock.mockRestore()
-    const error = new Error('invalid_response'), history = [{ phase: 'bootstrap-before-log' as const, elapsedMs: 9 }, { phase: 'MCP-connect' as const, elapsedMs: 40 }]
-    const acquisition = { elapsedMs: 120, history: [{ phase: 'preparing' as const, elapsedMs: 0 }, { phase: 'selection-ready' as const, elapsedMs: 110 }] }
-    retainOpenCodeV2InitializationPhase(error, 'MCP-connect', 30_041, { ownerElapsedMs: 150, history, acquisition,
-      commands: { observation, originAt: mcpStartedAt } })
-    await recordOpenCodeV2ProviderFailure('run-owner-initialization', error, true)
-    // Each invalid optional fact is omitted; the original phase is still retained.
-    const invalid = new Error('invalid_response')
-    retainOpenCodeV2InitializationPhase(invalid, 'MCP-readback', 5, { ownerElapsedMs: -1,
-      history: [{ phase: secret as RunInitializationPhase, elapsedMs: 1 }],
-      acquisition: { elapsedMs: 1, history: [{ phase: 'mapping', elapsedMs: 0 }] },
-      commands: { observation: { operations: null } as never, originAt: 0 } })
-    await recordOpenCodeV2ProviderFailure('run-owner-initialization', invalid, true)
-    const rows = await Promise.all((await readdir(path.join(root, 'opencode/v2/provider-diagnostics'))).map(async name => {
-      const bytes = await readFile(path.join(root, 'opencode/v2/provider-diagnostics', name), 'utf8')
-      expect(bytes).not.toContain(secret)
-      expect(bytes).not.toContain(commandId)
-      return JSON.parse(bytes)
-    }))
-    const observed = rows.find(row => row.initialization.phase === 'MCP-connect')
-    expect(observed.acquisition).toEqual(acquisition)
-    expect(observed.initialization).toEqual({ phase: 'MCP-connect', elapsedMs: 30_041, ownerElapsedMs: 150, history, commands: {
-      starts: 1, firstFailedOperation: 'commandRead',
-      operations: [{ operation: 'commandStart', requests: 2, failures: 0, replyFailures: 0, maxLatencyMs: 7, pending: 1,
-          oldestPendingAgeMs: now - hungAt, oldestPendingStage: 'native' },
-        ...[['commandRead', 3, 1, 0], ['commandStatus', 1, 0, 0], ['commandWriteStdin', 1, 0, 0], ['commandEndStdin', 1, 0, 1]].map(
-          ([operation, requests, failures, replyFailures]) => ({ operation, requests, failures, replyFailures, maxLatencyMs: 7,
-            pending: 0, oldestPendingAgeMs: null, oldestPendingStage: null }))],
-      commands: [{ startOffsetMs: 5, startLatencyMs: 7, stdin: 'pipe', stdinBytes: 120, stdoutBytes: 0, stderrBytes: 42,
-        stdoutEof: false, stderrEof: false, running: true, exitCode: null, failedOperation: 'commandRead' }] } })
-    const omitted = rows.find(row => row.initialization.phase === 'MCP-readback')
-    expect(omitted.initialization).toEqual({ phase: 'MCP-readback', elapsedMs: 5 })
-    expect(Object.hasOwn(omitted, 'acquisition')).toBe(false)
-  } finally {
-    clock.mockRestore()
-    if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_DATA_HOME
-    else process.env.CLAUDE_MULTIMODEL_DATA_HOME = previous
-    await rm(root, { recursive: true, force: true })
-  }
-})
-
 // These check branch ordering and refusal only. The real native directory
 // custody and Windows file publication are qualified by the Windows source gate.
-test('Windows diagnostics await native directory admission before exclusive publication', async () => {
-  const root = await mkdtemp(path.join(tmpdir(), 'TEST-v2-windows-diagnostics-'))
-  const previous = process.env.CLAUDE_MULTIMODEL_DATA_HOME
-  const platform = Object.getOwnPropertyDescriptor(process, 'platform')!
-  const getuid = Object.getOwnPropertyDescriptor(process, 'getuid')
-  const directory = path.join(root, 'opencode/v2/provider-diagnostics')
-  let release!: () => void, entered!: () => void
-  const admission = new Promise<void>(resolve => { release = resolve })
-  const requested = new Promise<void>(resolve => { entered = resolve })
-  const prepare = spyOn(privateDirectories, 'ensureWindowsPrivateDirectories').mockImplementation(async directories => {
-    expect(directories).toEqual([directory])
-    entered()
-    await admission
-    await mkdir(directory, { recursive: true, mode: 0o700 })
-  })
-  let pending: Promise<void> | undefined
-  try {
-    process.env.CLAUDE_MULTIMODEL_DATA_HOME = root
-    Object.defineProperty(process, 'platform', { ...platform, value: 'win32' })
-    Object.defineProperty(process, 'getuid', { configurable: true, value: undefined })
-    pending = recordOpenCodeV2ProviderFailure('run-owner-initialization', new Error('execution_host_unavailable'), true)
-    await requested
-    expect(await lstat(directory).catch((error: NodeJS.ErrnoException) => error.code)).toBe('ENOENT')
-    release()
-    await pending
-    expect(prepare).toHaveBeenCalledTimes(1)
-    const names = await readdir(directory)
-    expect(names).toHaveLength(1)
-    const row = JSON.parse(await readFile(path.join(directory, names[0]!), 'utf8'))
-    expect(row.category).toBe('execution_host_unavailable')
-    expect(row.retainedOriginal).toBe(true)
-    expect(Object.keys(row).sort()).toEqual(['category', 'phase', 'recordedAt', 'retainedOriginal', 'schemaVersion'])
-  } finally {
-    release()
-    await pending
-    prepare.mockRestore()
-    Object.defineProperty(process, 'platform', platform)
-    if (getuid) Object.defineProperty(process, 'getuid', getuid)
-    else delete (process as { getuid?: unknown }).getuid
-    if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_DATA_HOME
-    else process.env.CLAUDE_MULTIMODEL_DATA_HOME = previous
-    await rm(root, { recursive: true, force: true })
-  }
-})
-
-test('Windows directory admission refusal emits nothing and cannot replace the original failure', async () => {
-  const root = await mkdtemp(path.join(tmpdir(), 'TEST-v2-windows-diagnostics-refused-'))
-  const previous = process.env.CLAUDE_MULTIMODEL_DATA_HOME
-  const platform = Object.getOwnPropertyDescriptor(process, 'platform')!
-  const original = new Error('execution_host_unavailable')
-  const before = Object.getOwnPropertyDescriptors(original)
-  const prepare = spyOn(privateDirectories, 'ensureWindowsPrivateDirectories').mockRejectedValue(new Error('execution_owner_not_private'))
-  try {
-    process.env.CLAUDE_MULTIMODEL_DATA_HOME = root
-    Object.defineProperty(process, 'platform', { ...platform, value: 'win32' })
-    await expect(recordOpenCodeV2ProviderFailure('run-owner-initialization', original, true)).resolves.toBeUndefined()
-    expect(prepare).toHaveBeenCalledTimes(1)
-    expect(await readdir(root)).toEqual([])
-    expect(Object.getOwnPropertyDescriptors(original)).toEqual(before)
-  } finally {
-    prepare.mockRestore()
-    Object.defineProperty(process, 'platform', platform)
-    if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_DATA_HOME
-    else process.env.CLAUDE_MULTIMODEL_DATA_HOME = previous
-    await rm(root, { recursive: true, force: true })
-  }
-})
 
 test('native diagnostics retain only closed producer codes and stages with uint32 status', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'TEST-v2-native-diagnostics-'))
@@ -574,12 +414,11 @@ test('retirement diagnostics retain bounded timing and native failure without pr
   }
 })
 
-test('graph original native packet survives persistence but unknown fields are rejected', async () => {
+test('graph original failure packet survives persistence but unknown fields are rejected', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'TEST-v2-graph-native-facts-'))
   const previous = process.env.CLAUDE_MULTIMODEL_DATA_HOME
   process.env.CLAUDE_MULTIMODEL_DATA_HOME = root
-  const graphFailure = { index: 3, total: 53237, readPhase: 'realpath', pathSha256: 'a'.repeat(64), contentSha256: 'b'.repeat(64),
-    realpath: { status: 1, operation: 15, win32: 0, anchorCount: 4, matchingAnchorIndex: 2 } }
+  const graphFailure = { index: 3, total: 53237, readPhase: 'realpath', pathSha256: 'a'.repeat(64), contentSha256: 'b'.repeat(64) }
   // Execute the actual producer, not a hand-maintained approximation of its schema.
   const source = await readFile(path.resolve(import.meta.dir, '../../../entrypoints/opencodeV2ExecutionServer.ts'), 'utf8')
   const start = source.indexOf('function reportStartupFailure('), end = source.indexOf('\n// A source graph', start)
@@ -588,7 +427,7 @@ test('graph original native packet survives persistence but unknown fields are r
   const history = stages.slice(0, stages.indexOf('graph-validation') + 1).map((stage, elapsedMs) => ({ stage, elapsedMs }))
   expect(history.at(-1)?.stage).toBe('graph-validation')
   let emitted = ''
-  const context = { Error, Date, windowsRealpathInstallCauses, runtimeReady: false, startupFailureReported: false, startupStage: 'graph-validation',
+  const context = { Error, Date, runtimeReady: false, startupFailureReported: false, startupStage: 'graph-validation',
     startupStartedAt: Date.now() - 41, startupHistory: history, environmentMismatchKeys: [], executionProfileGuards: [],
     graphProgress: { phase: 'hash', completed: 0, total: graphFailure.total }, readExecutionGraphFailure: () => graphFailure,
     process: { stderr: { write: (value: string) => { emitted += value } } },
@@ -600,78 +439,16 @@ test('graph original native packet survives persistence but unknown fields are r
   expect(emitted).not.toContain('DO-NOT-EMIT')
   try {
     await recordOpenCodeV2ProviderFailure('execution-host-startup', new Error('execution_host_unavailable'), true, JSON.stringify(startup))
-    emitted = ''
-    context.startupFailureReported = false
-    runInNewContext(new Bun.Transpiler({ loader: 'ts' }).transformSync(source.slice(start, end)) + "\nreadExecutionGraphFailure = () => ({index:3,total:53237,readPhase:'realpath',pathSha256:'a'.repeat(64),contentSha256:'b'.repeat(64)}); reportStartupFailure('failed', original)", context)
-    await recordOpenCodeV2ProviderFailure('execution-host-startup', new Error('execution_host_unavailable'), true, emitted)
     await recordOpenCodeV2ProviderFailure('execution-host-startup', new Error('execution_host_unavailable'), true,
       JSON.stringify({ ...startup, graphFailure: { ...graphFailure, secret: 'DO-NOT-EMIT' } }))
     await recordOpenCodeV2ProviderFailure('execution-host-startup', new Error('execution_host_unavailable'), true, JSON.stringify({ ...startup, constructor: 'DO-NOT-EMIT' }))
     const rows = await Promise.all((await readdir(path.join(root, 'opencode/v2/provider-diagnostics'))).map(async name => JSON.parse(await readFile(path.join(root, 'opencode/v2/provider-diagnostics', name), 'utf8'))))
-    expect(rows.find(row => row.startup?.graphFailure?.realpath)?.startup.graphFailure).toEqual(graphFailure)
+    expect(rows.find(row => row.startup?.graphFailure)?.startup.graphFailure).toEqual(graphFailure)
     expect(rows.find(row => row.startup)?.startup).toMatchObject({ errno: 'EPERM', operation: 'lstat', errorName: 'Error' })
     expect(startup.graphFailure.readPhase).toBe('realpath')
-    expect(rows.filter(row => row.startup)).toHaveLength(2)
-    expect(rows.find(row => row.startup && !row.startup.graphFailure.realpath)?.startup.graphFailure).toMatchObject({ index: 3, total: 53237, readPhase: 'realpath' })
+    expect(rows.filter(row => row.startup)).toHaveLength(1)
     expect(rows.filter(row => !row.startup)).toHaveLength(2)
     expect(JSON.stringify(rows)).not.toContain('DO-NOT-EMIT')
-  } finally {
-    if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_DATA_HOME
-    else process.env.CLAUDE_MULTIMODEL_DATA_HOME = previous
-    await rm(root, { recursive: true, force: true })
-  }
-})
-
-test('actual native broker alias reply decoder persists original operation and source predicate', async () => {
-  const { decodeWindowsNativeFailure } = await import('../host/windows/OpenCodeV2WindowsNativeBroker.js')
-  const root = await mkdtemp(path.join(tmpdir(), 'TEST-native-alias-packet-'))
-  const previous = process.env.CLAUDE_MULTIMODEL_DATA_HOME
-  process.env.CLAUDE_MULTIMODEL_DATA_HOME = root
-  try {
-    const original = decodeWindowsNativeFailure({ error: 'execution_path_alias', stage: 'alias_predicate', nativeCode: 0, nativeStatus: 0xc0000022,
-      alias: { operation: 'runStateSelect', sourceLine: 392, predicates: 2 } }, 'runStateSelect')
-    const before = Object.getOwnPropertyDescriptors(original)
-    expect(Reflect.get(original, 'nativeOperation')).toBe('runStateSelect')
-    expect(Reflect.get(original, 'nativeStatus')).toBe(0xc0000022)
-    expect(Reflect.get(decodeWindowsNativeFailure({ error: 'execution_native_unknown', nativeStatus: 0x100000000 }, 'TEST_arbitrary'), 'nativeStatus')).toBeUndefined()
-    expect(Reflect.get(decodeWindowsNativeFailure({ error: 'execution_native_unknown' }, 'TEST_arbitrary'), 'nativeOperation')).toBe('unknown')
-    expect(decodeWindowsNativeFailure({ error: 'execution_owner_not_private', stage: 'private_acl_owner_run_v2', nativeCode: 5 }, 'ownerPreparePrivateDirectory').message)
-      .toBe('execution_owner_not_private:private_acl_owner_run_v2:5')
-    await recordOpenCodeV2ProviderFailure('execution-host-startup', original, true)
-    const directory = path.join(root, 'opencode/v2/provider-diagnostics'), names = await readdir(directory)
-    expect(names).toHaveLength(1)
-    const value = JSON.parse(await readFile(path.join(directory, names[0]!), 'utf8'))
-    expect(value.category).toBe('execution_path_alias')
-    expect(value.alias).toEqual({ operation: 'runStateSelect', sourceLine: 392, predicate: 2, passed: false })
-    expect(value.native).toEqual({ stage: 'alias_predicate', nativeCode: 0 })
-    expect(Object.getOwnPropertyDescriptors(original)).toEqual(before)
-  } finally {
-    if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_DATA_HOME
-    else process.env.CLAUDE_MULTIMODEL_DATA_HOME = previous
-    await rm(root, { recursive: true, force: true })
-  }
-})
-
-test('run control identity diagnostics name the observed process checkpoint stage', async () => {
-  const root = await mkdtemp(path.join(tmpdir(), 'TEST-v2-identity-stage-'))
-  const previous = process.env.CLAUDE_MULTIMODEL_DATA_HOME
-  process.env.CLAUDE_MULTIMODEL_DATA_HOME = root
-  try {
-    // Every checkpoint literal the native run control emits, so a newly named
-    // stage cannot silently drop out of the closed diagnostics.
-    const header = await readFile(path.join(import.meta.dir, '../host/windows/WindowsNativeRunControl.hpp'), 'utf8')
-    const expected = [...new Set(header.match(/"process_alive[a-z_]*"/g) ?? [])].map(literal => literal.slice(1, -1))
-      .map(stage => ({ stage, nativeCode: stage === 'process_alive_wait' ? 5 : 0 }))
-    expect(expected.map(({ stage }) => stage)).toEqual(expect.arrayContaining(['process_alive', 'process_alive_wait',
-      'process_alive_held_bun', 'process_alive_package_peer', 'process_alive_peer', 'process_alive_peer_parent']))
-    for (const { stage, nativeCode } of expected)
-      await recordOpenCodeV2ProviderFailure('run-member-retirement',
-        new Error(`run_control_process_identity:${stage}:${nativeCode}`), true, undefined, undefined, { elapsedMs: 1, dataRoot: root })
-    const rows = await Promise.all((await readdir(path.join(root, 'opencode/v2/provider-diagnostics'))).map(async name =>
-      JSON.parse(await readFile(path.join(root, 'opencode/v2/provider-diagnostics', name), 'utf8'))))
-    expect(rows).toHaveLength(expected.length)
-    expect(rows.map((row) => JSON.stringify(row.native ?? null)).sort()).toEqual(expected.map(value => JSON.stringify(value)).sort())
-    expect(rows.every((row) => row.category === 'run_control_process_identity')).toBe(true)
   } finally {
     if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_DATA_HOME
     else process.env.CLAUDE_MULTIMODEL_DATA_HOME = previous

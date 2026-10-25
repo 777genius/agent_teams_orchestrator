@@ -1,6 +1,5 @@
-import { createHash } from 'node:crypto'
 import { constants } from 'node:fs'
-import { open, realpath, type FileHandle } from 'node:fs/promises'
+import { lstat, open, readFile, realpath, type FileHandle } from 'node:fs/promises'
 import path from 'node:path'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
@@ -63,25 +62,13 @@ export type ControllerToolProof = Readonly<{
 export async function readOwnedControllerTools(client: ExecutionBridgeClient, profile: SelectedExecutionProfile,
   server: string, deadline: number, signal?: AbortSignal): Promise<ControllerToolProof> {
   const config = executionRecord(executionRecord(executionRecord(JSON.parse(profile.config.content)).mcp).servers)[server] as ExecutionMcpConfig
-  const managedDeferred = process.platform === 'win32' && config?.disabled === true &&
-    createHash('sha256').update(profile.config.content).digest('hex') === profile.config.sha256 &&
-    client.authority.profileRoot === profile.root && client.authority.profileEpoch === profile.epoch &&
-    client.authority.directory === profile.directory
-  executionAssert(config && (config.disabled !== true || managedDeferred) && server === 'agent-teams', 'run_controller_config_unknown')
+  executionAssert(config && config.disabled !== true && server === 'agent-teams', 'run_controller_config_unknown')
   const check = () => { signal?.throwIfAborted(); executionAssert(Date.now() < deadline, 'run_controller_timeout') }
   const connected = async () => {
     check(); const servers = await client.mcp(); check()
     executionAssert(servers.filter(row => row.name === server && row.status === 'connected').length === 1, 'run_controller_mcp_unknown')
   }
   await connected()
-  if (managedDeferred) {
-    const entries = await boundOpenCodeRead(client.config(), Math.max(1, deadline - Date.now()), signal)
-    const selectedHash = executionHash(JSON.parse(profile.config.content))
-    executionAssert(entries.some(value => {
-      const entry = executionRecord(value)
-      return entry.type === 'document' && executionHash(entry.info) === selectedHash
-    }), 'run_controller_config_unknown')
-  }
   const sdk = new Client({ name: 'agent-teams-v2-source-schema-proof', version: '1.0.0' })
   const transport = config.type === 'local'
     ? new StdioClientTransport({ command: config.command[0] ?? '', args: [...config.command.slice(1)],
@@ -166,6 +153,22 @@ export async function readOwnedControllerInbox(profile: SelectedExecutionProfile
   const root = selectedControllerInboxRoot(profile, proof, binding)
   if (root === null) return null
   const check = () => { signal?.throwIfAborted(); executionAssert(Date.now() < deadline, 'run_controller_timeout') }
+  if (process.platform === 'win32') {
+    // No descriptor-relative opens on Windows: read the canonical inbox path in the user's own profile.
+    const file = path.join(root, 'teams', binding.teamId, 'inboxes', 'user.json')
+    try {
+      const stat = await lstat(file)
+      executionAssert(stat.isFile() && !stat.isSymbolicLink() && stat.size <= CONTROLLER_INBOX_MAX_BYTES &&
+        await realpath(file) === file, 'run_controller_inbox_unknown')
+      const bytes = await readFile(file)
+      executionAssert(bytes.length <= CONTROLLER_INBOX_MAX_BYTES, 'run_controller_inbox_unknown')
+      check()
+      return parseControllerInboxBytes(bytes, binding)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return Object.freeze({ binding: Object.freeze({ ...binding }), messages: [] })
+      throw error
+    }
+  }
   const handles: FileHandle[] = []
   const limit = CONTROLLER_INBOX_MAX_BYTES
   try {

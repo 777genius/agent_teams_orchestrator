@@ -1,5 +1,4 @@
 import { types } from 'node:util'
-import { readWindowsRealpathFailure, type WindowsRealpathFailure } from '../host/windows/OpenCodeV2WindowsRealpath.js'
 
 const kinds = ['Fail', 'Die', 'Interrupt', 'unknown'] as const
 const openCodeV2ServerFailureFields = {
@@ -18,7 +17,7 @@ const openCodeV2ServerFailureFields = {
   sqlCode: ['SQLITE_AUTH', 'SQLITE_PERM', 'SQLITE_CONSTRAINT', 'SQLITE_BUSY', 'SQLITE_LOCKED', 'SQLITE_CANTOPEN', 'SQLITE_CONSTRAINT_UNIQUE'],
 } as const
 type Fields = typeof openCodeV2ServerFailureFields
-export type OpenCodeV2ServerFailure = Readonly<{ operation: 'location'; kind: typeof kinds[number]; realpath?: WindowsRealpathFailure } &
+export type OpenCodeV2ServerFailure = Readonly<{ operation: 'location'; kind: typeof kinds[number] } &
   { [K in keyof Fields]?: Fields[K][number] }>
 const object = (value: unknown): value is object => value !== null && typeof value === 'object' && !types.isProxy(value)
 function data(value: unknown, key: string): unknown {
@@ -26,17 +25,6 @@ function data(value: unknown, key: string): unknown {
   const descriptor = Object.getOwnPropertyDescriptor(value, key)
   return descriptor && 'value' in descriptor ? descriptor.value : undefined
 }
-function realpath(value: unknown): WindowsRealpathFailure | undefined {
-  const status = data(value, 'status'), operation = data(value, 'operation'), win32 = data(value, 'win32')
-  const anchorCount = data(value, 'anchorCount'), matchingAnchorIndex = data(value, 'matchingAnchorIndex')
-  if (![status, operation, win32, anchorCount, matchingAnchorIndex].every(Number.isSafeInteger) ||
-      Number(status) < 1 || Number(status) > 4 || Number(operation) < 0 || Number(operation) > 25 ||
-      Number(win32) < 0 || Number(win32) > 0xffffffff || Number(anchorCount) < 0 || Number(anchorCount) > 4096 ||
-      Number(matchingAnchorIndex) < -1 || Number(matchingAnchorIndex) >= Number(anchorCount)) return undefined
-  return Object.freeze({ status: Number(status), operation: Number(operation), win32: Number(win32),
-    anchorCount: Number(anchorCount), matchingAnchorIndex: Number(matchingAnchorIndex) })
-}
-
 /** Fixed finite projection only; this observation never qualifies a lease or request. */
 export function readOpenCodeV2ServerFailure(value: unknown): OpenCodeV2ServerFailure | undefined {
   try {
@@ -52,8 +40,6 @@ export function readOpenCodeV2ServerFailure(value: unknown): OpenCodeV2ServerFai
       if (typeof scalar !== 'string' || !allowed.includes(scalar)) return undefined
       result[key] = scalar
     }
-    const native = realpath(data(value, 'realpath'))
-    if (native) result.realpath = native
     return Object.freeze(result) as OpenCodeV2ServerFailure
   } catch { return undefined }
 }
@@ -86,7 +72,6 @@ export function projectOpenCodeV2LocationCause(cause: unknown): OpenCodeV2Server
     for (let depth = 0; depth <= 4; depth++) {
       if (!object(value) || seen.has(value)) break
       seen.add(value)
-      if (result.realpath === undefined) result.realpath = readWindowsRealpathFailure(value)
       put('tag', data(value, '_tag')); put('reason', data(value, '_tag'))
       put('module', data(value, 'module')); put('method', data(value, 'method'))
       put('errno', data(value, 'code')); put('sqlCode', data(value, 'code')); put('name', data(value, 'name'))

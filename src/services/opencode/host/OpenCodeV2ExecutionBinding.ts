@@ -1,5 +1,4 @@
 import type { OpenCodeV2Pin } from '../compatibility/OpenCodeV2Registry.js'
-import { readWindowsRealpathFailure, type WindowsRealpathFailure } from './windows/OpenCodeV2WindowsRealpath.js'
 import path from 'node:path'
 import { readExecutionPlatformBirth } from './OpenCodeV2ExecutionPlatform.js'
 import filesystem, { lstat, open, readFile, readdir } from 'node:fs/promises'
@@ -79,7 +78,7 @@ export async function validateExecutionProfile(profile: OwnedNativeProfile): Pro
 }
 
 /** Receipt covers the owner's reviewed graph, including generated client and server dependencies. */
-export type ExecutionGraphFailure = Readonly<{ index: number; total: number; readPhase: 'realpath' | 'hash'; pathSha256: string; contentSha256: string; realpath?: WindowsRealpathFailure }>
+export type ExecutionGraphFailure = Readonly<{ index: number; total: number; readPhase: 'realpath' | 'hash'; pathSha256: string; contentSha256: string }>
 const originalGraphFailures = new WeakMap<Error, ExecutionGraphFailure>()
 export function readExecutionGraphFailure(error: unknown): ExecutionGraphFailure | undefined {
   return error instanceof Error ? originalGraphFailures.get(error) : undefined
@@ -177,8 +176,7 @@ export async function validateExecutionGraph(pin: OpenCodeV2Pin, receipt: Execut
         signal?.throwIfAborted()
         } catch (error) {
           if (error instanceof Error && typeof row.path === 'string' && !originalGraphFailures.has(error)) originalGraphFailures.set(error, Object.freeze({ index, total: rows.length, readPhase,
-            pathSha256: createHash('sha256').update(row.path).digest('hex'), contentSha256: /^[a-f0-9]{64}$/.test(row.sha256) ? row.sha256 : '0'.repeat(64),
-            ...(readWindowsRealpathFailure(error) ? { realpath: readWindowsRealpathFailure(error) } : {}) }))
+            pathSha256: createHash('sha256').update(row.path).digest('hex'), contentSha256: /^[a-f0-9]{64}$/.test(row.sha256) ? row.sha256 : '0'.repeat(64) }))
           throw error
         }
         completed++
@@ -290,13 +288,5 @@ export async function validateExecutionNative(native: ValidatedExecutionNative):
 export type { ExecutionBirth } from '../execution/OpenCodeV2ExecutionContracts.js'
 /** Native Linux ticks and Darwin process versions are never compared with a wall clock. */
 export async function readExecutionBirth(pid: number): Promise<ExecutionBirth | null> {
-  if (process.platform === 'linux' || process.platform === 'darwin') return readExecutionPlatformBirth(pid)
-  // Windows birth is a native FILETIME identity. Do not substitute a POSIX
-  // process-start clock or treat a missing PID as proof that a process exited.
-  if (pid === process.pid && process.env.OPENCODE_V2_WINDOWS_PIPE) {
-    const { windowsExecutionSelfBirth } = await import('./windows/OpenCodeV2WindowsChildControl.js')
-    return windowsExecutionSelfBirth()
-  }
-  const { windowsBirth } = await import('./windows/OpenCodeV2WindowsExecution.js')
-  return windowsBirth(pid)
+  return readExecutionPlatformBirth(pid)
 }

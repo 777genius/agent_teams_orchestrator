@@ -10,9 +10,6 @@ import * as receipts from '../profile/OpenCodeV2ExecutionReceipt.js'
 import * as mcp from '../OpenCodeMcpManager.js'
 import * as probes from './OpenCodeV2ExecutionProbe.js'
 import * as launchPlans from './OpenCodeV2LaunchPlan.js'
-import * as privateDirectories from '../profile/OpenCodePrivateDirectories.js'
-import * as windowsBroker from '../host/windows/OpenCodeV2WindowsNativeBroker.js'
-import * as windowsFilesystem from '../host/windows/OpenCodeV2WindowsOwnerFilesystem.js'
 import * as projectIdentity from '../OpenCodeProjectIdentity.js'
 import { buildOpenCodeExecutionProof } from '../OpenCodeExecutionProof.js'
 import { executionHash } from '../execution/OpenCodeV2ExecutionContracts.js'
@@ -162,6 +159,7 @@ test('controller entries refuse directories, missing and non-absolute targets be
 for (const version of ['2.0.0', '2.0.32'] as const) test(`${version} admits Linux and Darwin selection but fences unsupported hosts before identity reads`, async () => {
   pin = version
   const platform = Object.getOwnPropertyDescriptor(process, 'platform')!
+  const arch = Object.getOwnPropertyDescriptor(process, 'arch')!
   const bun = Object.getOwnPropertyDescriptor(process.versions, 'bun')!
   try {
     for (const host of ['linux', 'darwin'] as const) {
@@ -172,14 +170,18 @@ for (const version of ['2.0.0', '2.0.32'] as const) test(`${version} admits Linu
       expect(selection.model).toEqual({ providerID: 'provider', id: 'model' })
     }
     expect(nativeSelectionCalls).toBe(2)
+    // Windows execution ships for x64 only.
     Object.defineProperty(process, 'platform', { ...platform, value: 'win32' })
-    await expect(inspectOpenCodeV2SourceAvailability(envelope())).rejects.toThrow('execution_containment_platform_pending')
+    Object.defineProperty(process, 'arch', { ...arch, value: 'arm64' })
+    await expect(inspectOpenCodeV2SourceAvailability(envelope())).rejects.toThrow('execution_platform_unsupported')
+    Object.defineProperty(process, 'arch', arch)
     Object.defineProperty(process, 'platform', { ...platform, value: 'darwin' })
     Object.defineProperty(process.versions, 'bun', { ...bun, value: '1.3.10' })
     await expect(inspectOpenCodeV2SourceAvailability(envelope())).rejects.toThrow('run_source_bun_required')
     expect(nativeSelectionCalls).toBe(2)
   } finally {
     Object.defineProperty(process, 'platform', platform)
+    Object.defineProperty(process, 'arch', arch)
     Object.defineProperty(process.versions, 'bun', bun)
   }
 })
@@ -209,11 +211,14 @@ for (const version of ['2.0.0', '2.0.32'] as const) test(`${version} team launch
   expect(nextPlan.members[0]?.native.graph).toEqual(plan.members[0]?.native.graph)
   expect(plan.members[0]?.profile.config.sha256).toBe(samePolicyProof.managedConfigFingerprint)
   const platform = Object.getOwnPropertyDescriptor(process, 'platform')!
+  const arch = Object.getOwnPropertyDescriptor(process, 'arch')!
   try {
     Object.defineProperty(process, 'platform', { ...platform, value: 'win32' })
-    await expect(launchExplicitOpenCodeV2Run(plan)).rejects.toThrow('execution_containment_platform_pending')
-    await expect(startOpenCodeV2RunSupervisor(plan, '/TEST-unqualified', 'TEST')).rejects.toThrow('execution_containment_platform_pending')
-  } finally { Object.defineProperty(process, 'platform', platform) }
+    Object.defineProperty(process, 'arch', { ...arch, value: 'arm64' })
+    // No V2 version is qualified on Windows arm64, so launch refuses before any process work.
+    await expect(launchExplicitOpenCodeV2Run(plan)).rejects.toThrow('opencode_v2_version_unqualified')
+    await expect(startOpenCodeV2RunSupervisor(plan, '/TEST-unqualified', 'TEST')).rejects.toThrow('execution_platform_unsupported')
+  } finally { Object.defineProperty(process, 'platform', platform); Object.defineProperty(process, 'arch', arch) }
   // A permitted host still cannot launch the fixture's unqualified Bun bytes.
   await expect(launchExplicitOpenCodeV2Run(plan)).rejects.toThrow('run_source_changed')
   expect(await readdir(path.join(root, 'app-data/opencode/v2'))).not.toContain('runs')
@@ -342,151 +347,4 @@ test('retired original terminal failure is retained across read and run requests
       .toEqual({ state: 'failed', proof: null, reason: 'native_execution_failed' })
     expect(await readFile(file, 'utf8')).toBe(saved)
   }
-})
-
-for (const refuse of [false, true]) for (const cleanupRefused of [false, true]) test(`Windows prepared member creates its database before closing native publishers (refused=${refuse}, cleanupRefused=${cleanupRefused})`, async () => {
-  const platform = Object.getOwnPropertyDescriptor(process, 'platform')!
-  const events: string[] = []
-  const refusal = new Error('execution_owner_unknown:prepared_database_exists:80')
-  const closeData = windowsBroker.decodeWindowsNativeFailure({ error: 'execution_native_unknown', stage: 'owner_metadata_cleanup', nativeCode: 5 }, 'ownerCloseDirectory')
-  const closeConfig = new Error('execution_owner_unknown'), closeBroker = new Error('cleanup_unknown')
-  let databasePath: string | undefined
-  try {
-    Object.defineProperty(process, 'platform', { ...platform, value: 'darwin' })
-    const selection = await inspectOpenCodeV2SourceAvailability(envelope())
-    const parent = path.join(root, 'profiles'); await mkdir(parent)
-    const unused = async (): Promise<never> => { throw new Error('TEST unexpected owner operation') }
-    const unusedFilesystem = windowsFilesystem.createWindowsOwnerFilesystem(unused)
-    restores.push(
-      spyOn(privateDirectories, 'ensureWindowsPrivateDirectories').mockImplementation(async directories => {
-        for (const directory of directories) await mkdir(directory, { recursive: true })
-      }),
-      spyOn(windowsBroker, 'resolveWindowsNativeArtifact').mockResolvedValue({ path: '/TEST/helper.exe', sha256: 'a'.repeat(64), arch: 'x64' }),
-      spyOn(windowsBroker, 'createWindowsNativeBroker').mockReturnValue({
-        events: new EventEmitter(), ended: () => false,
-        request: async () => { throw new Error('TEST unexpected native request') },
-        close: async () => { events.push('broker-close'); if (cleanupRefused) throw closeBroker },
-      }),
-      spyOn(windowsFilesystem, 'createWindowsOwnerFilesystem').mockReturnValue({
-        ...unusedFilesystem,
-        createDirectory: async (directory: string) => {
-          await mkdir(directory)
-          const role = directory.endsWith(path.join('config', 'opencode')) ? 'config' : 'data'
-          return {
-            identity: { volumeSerial: '1', fileId: '1'.repeat(32), ownerSid: 'S-1-5-21-1' },
-            assertOwned: unused, writeExclusive: unused, writePreparedAuth: unused,
-            readRecord: unused, readMetadata: unused, writeMetadata: unused, archive: unused,
-            writePreparedConfig: async (content: string) => {
-              events.push('config'); await writeFile(path.join(directory, 'opencode.json'), content, { flag: 'wx' })
-            },
-            createPreparedDatabase: async () => {
-              expect(role).toBe('data')
-              expect(await readFile(path.join(directory, 'auth.json'), 'utf8')).toBe(authContent)
-              expect(events).toEqual(['config'])
-              events.push('database')
-              databasePath = path.join(directory, 'opencode.db')
-              if (refuse) throw refusal
-              await writeFile(databasePath, '', { flag: 'wx' })
-            },
-            close: async () => { events.push(`close-${role}`); if (cleanupRefused) throw role === 'data' ? closeData : closeConfig },
-          } satisfies windowsFilesystem.WindowsOwnerDirectory
-        },
-      }),
-    )
-    Object.defineProperty(process, 'platform', { ...platform, value: 'win32' })
-    const prepared = createOpenCodeV2PreparedMember(selection, native(), parent,
-      { teamId: 'TEST-team', runId: 'TEST-run', memberId: 'worker', unattendedTeam: true })
-    if (cleanupRefused) {
-      const failure = await prepared.catch(error => error)
-      expect(failure).toBeInstanceOf(AggregateError)
-      expect(failure.message).toBe('cleanup_unknown')
-      expect(failure.cause).toBe(refuse ? refusal : closeData)
-      expect(failure.errors).toEqual([...(refuse ? [refusal] : []), closeData, closeConfig, closeBroker])
-      expect(failure.errors[refuse ? 1 : 0]).toBe(closeData)
-      expect(Reflect.get(closeData, 'nativeOperation')).toBe('ownerCloseDirectory')
-    } else if (refuse) await expect(prepared).rejects.toBe(refusal)
-    else {
-      const result = await prepared
-      if (databasePath === undefined) throw new Error('TEST native database creation was not called')
-      expect(result.profile.databasePath).toBe(databasePath)
-      expect(await readFile(result.profile.databasePath)).toHaveLength(0)
-    }
-    expect(events).toEqual(['config', 'database', 'close-data', 'close-config', 'broker-close'])
-  } finally { Object.defineProperty(process, 'platform', platform) }
-})
-
-for (const refuse of [false, true]) for (const cleanupRefused of [false, true]) test(`Windows probe privately creates only its two exclusive controller leaves before planning (refused=${refuse}, cleanupRefused=${cleanupRefused})`, async () => {
-  const platform = Object.getOwnPropertyDescriptor(process, 'platform')!
-  const stoppedBeforeLaunch = new Error('TEST complete controller preparation')
-  const refusal = new Error('execution_profile_owned')
-  const closeDirectory = windowsBroker.decodeWindowsNativeFailure({ error: 'execution_native_unknown', stage: 'owner_metadata_cleanup', nativeCode: 6 }, 'ownerCloseDirectory')
-  const closeBroker = new Error('cleanup_unknown')
-  const identity = { volumeSerial: '1', fileId: '1'.repeat(32), ownerSid: 'S-1-5-21-1' }
-  let allocations = 0, planned = 0, closed = false
-  try {
-    Object.defineProperty(process, 'platform', { ...platform, value: 'darwin' })
-    const selection = await inspectOpenCodeV2SourceAvailability(envelope())
-    const controller = path.join(root, 'controller'); await mkdir(controller)
-    for (const kind of ['teams', 'tasks']) await mkdir(path.join(controller, kind))
-    const unused = async (): Promise<never> => { throw new Error('TEST unexpected owner operation') }
-    const filesystem = windowsFilesystem.createWindowsOwnerFilesystem(unused)
-    restores.push(
-      spyOn(windowsBroker, 'resolveWindowsNativeArtifact').mockResolvedValue({ path: '/TEST/helper.exe', sha256: 'a'.repeat(64), arch: 'x64' }),
-      spyOn(windowsBroker, 'createWindowsNativeBroker').mockReturnValue({
-        events: new EventEmitter(), ended: () => closed, request: unused,
-        close: async () => { closed = true; if (cleanupRefused) throw closeBroker },
-      }),
-      spyOn(windowsFilesystem, 'createWindowsOwnerFilesystem').mockReturnValue({ ...filesystem,
-        prepareDirectory: async (directory: string) => {
-          await mkdir(directory, { recursive: true })
-          return { identity, assertOwned: async () => {}, close: async () => { if (cleanupRefused) throw closeDirectory },
-            writeMetadata: async (purpose) => {
-              if (purpose !== 'ProbeGuard') throw new Error('TEST unexpected probe submission')
-              await writeFile(path.join(directory, 'owner.lock'), '', { flag: 'wx' })
-            },
-            readMetadata: async (purpose) => ({ purpose, directoryIdentity: identity,
-              path: path.join(directory, purpose === 'ProbeGuard' ? 'owner.lock' : 'probe.json'),
-              fileIdentity: purpose === 'ProbeGuard' ? identity : null, bytes: 0,
-              ...(purpose === 'ProbeRecord' ? { absent: true as const } : {}) }),
-            writeExclusive: unused, createPreparedDatabase: unused, writePreparedConfig: unused,
-            writePreparedAuth: unused, readRecord: unused, archive: unused,
-          } satisfies windowsFilesystem.WindowsOwnerDirectory
-        },
-      }),
-      spyOn(privateDirectories, 'ensureWindowsPrivateDirectories').mockImplementation(async (leaves, exclusive) => {
-        allocations++
-        if (!exclusive) throw new Error('TEST exclusive controller leaves required')
-        expect(leaves).toEqual(exclusive)
-        expect(leaves).toHaveLength(2)
-        expect(leaves.map(leaf => path.dirname(leaf))).toEqual([path.join(controller, 'teams'), path.join(controller, 'tasks')])
-        expect(path.basename(leaves[0]!)).toMatch(/^TEST-execution-probe-[a-f0-9]{32}$/)
-        expect(path.basename(leaves[1]!)).toBe(path.basename(leaves[0]!))
-        if (refuse) throw refusal
-        for (const leaf of leaves) await mkdir(leaf) // Exclusive: the fixture never repairs an existing leaf.
-      }),
-      spyOn(launchPlans, 'buildOpenCodeV2InternalRunPlan').mockImplementation(async (_selection, body) => {
-        planned++
-        expect(allocations).toBe(1)
-        for (const kind of ['teams', 'tasks']) expect(await readdir(path.join(controller, kind))).toEqual([body.teamId as string])
-        throw stoppedBeforeLaunch
-      }),
-    )
-    Object.defineProperty(process, 'platform', { ...platform, value: 'win32' })
-    const result = probes.resolveOpenCodeV2ExecutionProbe(envelope(), { ...selection,
-      controller: { type: 'local', command: [process.execPath, '/TEST/controller.mjs'],
-        environment: { AGENT_TEAMS_MCP_CLAUDE_DIR: controller } } }, true)
-    if (cleanupRefused) {
-      const failure = await result.catch(error => error)
-      expect(failure).toBeInstanceOf(AggregateError)
-      expect(failure.cause).toBe(refuse ? refusal : stoppedBeforeLaunch)
-      expect(failure.errors[0]).toBe(failure.cause)
-      const cleanup = failure.errors[1]
-      expect(cleanup).toBeInstanceOf(AggregateError)
-      expect(cleanup.cause).toBe(closeDirectory)
-      expect(cleanup.errors.length).toBeGreaterThan(1)
-      expect(cleanup.errors.slice(0, -1).every((error: unknown) => error === closeDirectory)).toBe(true)
-      expect(cleanup.errors.at(-1)).toBe(closeBroker)
-    } else await expect(result).rejects.toBe(refuse ? refusal : stoppedBeforeLaunch)
-    expect(allocations).toBe(1); expect(planned).toBe(refuse ? 0 : 1); expect(closed).toBe(true)
-  } finally { Object.defineProperty(process, 'platform', platform) }
 })

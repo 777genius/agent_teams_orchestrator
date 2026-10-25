@@ -204,10 +204,6 @@ jobs:
         if: matrix.platform == 'win32-arm64'
         run: bun install --frozen-lockfile --linker hoisted --os=win32 --cpu=arm64
 
-      - name: Compile Windows x64 native assets
-        if: matrix.platform == 'win32-x64'
-        run: bun scripts/opencode-v2/compile-windows.ts
-
       - name: Build packaged runtime deliveries
         env:
           BUN_COMPILE_TARGET: ${{ matrix.compile_target }}

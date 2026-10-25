@@ -17,7 +17,7 @@ test('routine source and documentation keep Linux coverage without native jobs',
 
 test('V2 execution, catalog and provider code selects the real Linux V2 lane', () => {
   // host/ is not a native boundary: the Linux deadline regression changed host code only.
-  for (const path of ['src/services/opencode/host/OpenCodeV2ExecutionHost.ts', 'src/services/opencode/host/OpenCodeV2ExecutionLauncher.ts',
+  for (const path of ['src/services/opencode/host/OpenCodeV2ExecutionHost.ts', 'src/services/opencode/host/OpenCodeV2PlainExecution.ts',
     'src/services/opencode/execution/OpenCodeV2ExecutionContracts.ts', 'src/services/opencode/catalog/OpenCodeV2RuntimeStatus.ts',
     'src/services/opencode/compatibility/opencode-v2-qualifications.json', 'src/services/opencode/bridge/OpenCodeV2TeamBridge.ts',
     'src/services/opencode/transport/OpenCodeV2ProviderWire.ts', 'src/services/opencode/profile/OpenCodeV2ExecutionReceipt.ts',

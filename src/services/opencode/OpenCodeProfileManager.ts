@@ -29,7 +29,6 @@ import { findGitRoot } from '../../utils/git.js'
 import { safeParseJSONC } from '../../utils/json.js'
 import * as lockfile from '../../utils/lockfile.js'
 import { ensureOpenCodeDirectory } from './ensureOpenCodeDirectory.js'
-import { ensureWindowsPrivateDirectories, hasWindowsPrivateProfileDirectoryDelivery } from './profile/OpenCodePrivateDirectories.js'
 import {
   applyOpenCodeAutoUpdatePolicy,
   isOpenCodeAutoUpdateAllowed,
@@ -303,7 +302,7 @@ function findCanonicalProviderConfig(
   return null
 }
 
-function buildOpenCodeTeammatePermission(
+export function buildOpenCodeTeammatePermission(
   toolApprovalMode: OpenCodeToolApprovalMode = 'auto',
 ): Record<string, unknown> {
   if (toolApprovalMode === 'manual') {
@@ -3698,16 +3697,6 @@ export class OpenCodeProfileManager {
     if (options.abortSignal?.aborted) throwOpenCodeAbortReason(options.abortSignal)
 
     enterStep('create profile directories')
-    if (await hasWindowsPrivateProfileDirectoryDelivery()) {
-      await ensureWindowsPrivateDirectories([
-        managedPaths.data, path.join(managedPaths.data, 'opencode'),
-        path.join(managedPaths.data, 'opencode', 'profiles'), profileRootPath,
-        homePath, tmpPath, xdgConfigHome, path.join(xdgConfigHome, 'opencode'),
-        xdgDataHome, path.join(xdgDataHome, 'opencode'),
-        xdgCacheHome, sharedNpmCachePath, sharedToolCachePath,
-        ...(policy?.scope.purpose === 'catalog' ? [workingDirectoryPath] : []),
-      ])
-    }
     await Promise.all([
       ensureOpenCodeDirectory(homePath),
       ensureOpenCodeDirectory(tmpPath),

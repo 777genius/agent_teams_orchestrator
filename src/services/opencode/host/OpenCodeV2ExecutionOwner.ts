@@ -1,6 +1,4 @@
 import path from 'node:path'
-import { ownerFilesystemForWindowsPlan, windowsBirth, type WindowsLaunchPlan } from './windows/OpenCodeV2WindowsExecution.js'
-import type { WindowsOwnerDirectory } from './windows/OpenCodeV2WindowsOwnerFilesystem.js'
 import { isExecutionPlatformMapping, isExecutionUnboundRetirement, type ExecutionPlatformMapping, type ExecutionUnboundRetirement } from './OpenCodeV2ExecutionPlatform.js'
 import { constants } from 'node:fs'
 import { lstat, mkdir, open, realpath, rename } from 'node:fs/promises'
@@ -19,13 +17,14 @@ const MAX_BYTES = 16 * 1024
 
 function isDurableBirth(birth: Record<string, unknown>): boolean {
   return Object.keys(birth).sort().join(',') === 'bootId,format,value' &&
-    typeof birth.value === 'string' &&
-    (birth.format === 'windows-filetime' ? /^[1-9]\d{0,19}$/.test(birth.value) && BigInt(birth.value) <= 0xffffffffffffffffn && birth.bootId === null :
-      typeof birth.bootId === 'string' && (birth.format === 'linux-start-ticks' ? /^\d+$/.test(birth.value) && /^[a-f0-9-]{36}$/.test(birth.bootId) :
-      birth.format === 'darwin-pidversion' && /^\d+:\d+$/.test(birth.value) && /^[a-f0-9-]{36}$/i.test(birth.bootId)))
+    typeof birth.value === 'string' && /^\d{1,20}$/.test(birth.value) &&
+    (birth.format === 'linux-start-ticks' ? typeof birth.bootId === 'string' && /^[a-f0-9-]{36}$/.test(birth.bootId)
+      : birth.format === 'utc-ms' && birth.bootId === null)
 }
 
 async function syncDirectory(directory: string): Promise<void> {
+  // Windows cannot open a directory handle for fsync; NTFS metadata is journaled.
+  if (process.platform === 'win32') return
   const handle = await open(directory, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW)
   try { await handle.sync() } finally { await handle.close() }
 }
@@ -55,7 +54,7 @@ function validateOwnerRecord(value: unknown): ExecutionOwnerRecord {
     row.schema === 1 && row.generation === 'v2', 'execution_owner_unknown')
   const controller = executionRecord(row.controller), birth = executionRecord(controller.birth)
   executionAssert(Object.keys(controller).sort().join(',') === 'birth,pid' && Number.isSafeInteger(controller.pid) && Number(controller.pid) > 0 &&
-    isDurableBirth(birth) && (process.platform === 'win32' ? birth.format === 'windows-filetime' : birth.format !== 'windows-filetime'), 'execution_owner_unknown')
+    isDurableBirth(birth), 'execution_owner_unknown')
   executionAssert(names.slice(2, 8).every(name => typeof row[name] === 'string' && String(row[name]).length > 0) &&
     typeof row.graphSha256 === 'string' && /^[a-f0-9]{64}$/.test(row.graphSha256) &&
     (process.platform === 'win32' ? path.win32 : path).isAbsolute(String(row.profileRoot)) &&
@@ -65,24 +64,7 @@ function validateOwnerRecord(value: unknown): ExecutionOwnerRecord {
 
 /** Read retained original identities, without adoption, takeover or native mutation.
  * A missing/incomplete/future record remains UNKNOWN; no file is rewritten. */
-export async function readExecutionProfileOwner(profileRoot: string, windowsPlan?: WindowsLaunchPlan): Promise<ExecutionOwnerRecord> {
-  if (process.platform === 'win32') {
-    executionAssert(windowsPlan && windowsPlan.writableRoots.includes(profileRoot), 'execution_owner_platform_pending')
-    const filesystem = ownerFilesystemForWindowsPlan(windowsPlan)
-    const root = await filesystem.openDirectory(profileRoot)
-    try {
-      await root.assertOwned()
-      const directory = await filesystem.openDirectory(path.win32.join(profileRoot, OWNER_DIRECTORY))
-      try {
-        const record = validateOwnerRecord(await directory.readRecord('owner.json'))
-        executionAssert(record.profileRoot === profileRoot && record.controller.birth.format === 'windows-filetime', 'execution_owner_unknown')
-        await filesystem.validateSelectedProfile(record.profileRoot, record.databasePath)
-        await root.assertOwned()
-        return record
-      } finally { await directory.close() }
-    } finally { await root.close() }
-  }
-  executionAssert(!windowsPlan, 'execution_owner_platform_pending')
+export async function readExecutionProfileOwner(profileRoot: string): Promise<ExecutionOwnerRecord> {
   await canonicalExecutionDirectory(profileRoot)
   const directory = path.join(profileRoot, OWNER_DIRECTORY)
   await canonicalExecutionDirectory(directory)
@@ -94,24 +76,18 @@ export async function readExecutionProfileOwner(profileRoot: string, windowsPlan
  * writer, even before owner.json is committed, blocks acquisition indefinitely.
  * Only the exact holder can retire its own directory; there is no stale timeout. */
 export async function acquireExecutionProfileOwner(requestedProfile: OwnedNativeProfile, requestedIdentity: OwnerIdentity,
-  filesystem: Readonly<{ rename: typeof rename }> | Readonly<{ windowsPlan: WindowsLaunchPlan }> = { rename }) {
+  filesystem: Readonly<{ rename: typeof rename }> = { rename }) {
   // Narrow archive operation port for deterministic publication-order regression.
-  const windows = 'windowsPlan' in filesystem ? ownerFilesystemForWindowsPlan(filesystem.windowsPlan) : undefined
-  const archive = 'rename' in filesystem ? filesystem.rename : rename
-  executionAssert(process.platform === 'win32' ? windows : !windows, 'execution_owner_platform_pending')
+  const archive = filesystem.rename
   // Capture authority before the first await. A caller retaining mutable inputs
   // cannot redirect validation, durable records or retirement to another owner.
   const profile = Object.freeze({ root: requestedProfile.root, databasePath: requestedProfile.databasePath, epoch: requestedProfile.epoch })
   const identity = Object.freeze({ hostInstanceId: requestedIdentity.hostInstanceId,
     leaseOwnerId: requestedIdentity.leaseOwnerId, graphSha256: requestedIdentity.graphSha256 })
-  executionAssert(process.platform === 'linux' || process.platform === 'darwin' || (process.platform === 'win32' && windows), 'execution_owner_platform_pending')
-  if (windows) {
-    executionAssert('windowsPlan' in filesystem && filesystem.windowsPlan.writableRoots.includes(profile.root), 'execution_profile_changed')
-    await windows.validateSelectedProfile(profile.root, profile.databasePath)
-  }
-  else {
+  {
     await canonicalExecutionDirectory(profile.root)
-    executionAssert(((await lstat(profile.root)).mode & 0o077) === 0, 'execution_profile_not_private')
+    // POSIX keeps the profile private by mode bits; Windows profiles inherit the user's ACL.
+    executionAssert(process.platform === 'win32' || ((await lstat(profile.root)).mode & 0o077) === 0, 'execution_profile_not_private')
     await canonicalExecutionDirectory(path.dirname(profile.databasePath))
     executionAssert(profile.databasePath.startsWith(profile.root + path.sep), 'execution_profile_changed')
     const db = await lstat(profile.databasePath).catch(error => {
@@ -123,24 +99,13 @@ export async function acquireExecutionProfileOwner(requestedProfile: OwnedNative
   }
   executionAssert(/^[a-f0-9-]{36}$/.test(identity.hostInstanceId) && /^[a-f0-9-]{36}$/.test(identity.leaseOwnerId) &&
     /^[a-f0-9]{64}$/.test(identity.graphSha256) && profile.epoch.length > 0, 'execution_owner_unknown')
-  const readBirth = windows ? windowsBirth : readExecutionBirth
+  const readBirth = readExecutionBirth
   const birth = await readBirth(process.pid)
-  executionAssert(birth && isDurableBirth(birth) && birth.format ===
-    (process.platform === 'win32' ? 'windows-filetime' : process.platform === 'darwin' ? 'darwin-pidversion' : 'linux-start-ticks'), 'execution_owner_unknown')
+  executionAssert(birth && isDurableBirth(birth), 'execution_owner_unknown')
   const directory = path.join(profile.root, OWNER_DIRECTORY)
   const databaseDirectory = path.join(path.dirname(profile.databasePath), `.${path.basename(profile.databasePath)}.opencode-v2-execution-owner`)
-  let profileHandle: WindowsOwnerDirectory | undefined, databaseHandle: WindowsOwnerDirectory | undefined
   let assertDirectories: () => Promise<void>
-  if (windows) {
-    profileHandle = await windows.createDirectory(directory)
-    try { databaseHandle = await windows.createDirectory(databaseDirectory) }
-    catch (error) { await profileHandle.close().catch(() => undefined); throw error }
-    const heldProfile = profileHandle, heldDatabase = databaseHandle
-    assertDirectories = async () => {
-      await windows.validateSelectedProfile(profile.root, profile.databasePath)
-      await heldProfile.assertOwned(); await heldDatabase.assertOwned()
-    }
-  } else {
+  {
     await mkdir(directory, { mode: 0o700 }).catch(error => {
       if ((error as NodeJS.ErrnoException).code === 'EEXIST') throw new Error('execution_profile_owned')
       throw error
@@ -162,22 +127,14 @@ export async function acquireExecutionProfileOwner(requestedProfile: OwnedNative
     }
   }
   const writeOwned = async (name: string, value: unknown) => {
-    if (profileHandle && databaseHandle) { await profileHandle.writeExclusive(name, value); await databaseHandle.writeExclusive(name, value) }
-    else { await writeExclusive(directory, name, value); await writeExclusive(databaseDirectory, name, value) }
+    await writeExclusive(directory, name, value); await writeExclusive(databaseDirectory, name, value)
   }
-  const readOwned = async () => {
-    if (profileHandle && databaseHandle) return [validateOwnerRecord(await profileHandle.readRecord('owner.json')), validateOwnerRecord(await databaseHandle.readRecord('owner.json'))]
-    return [await readRecord(directory), await readRecord(databaseDirectory)]
-  }
+  const readOwned = async () => [await readRecord(directory), await readRecord(databaseDirectory)]
   const record: ExecutionOwnerRecord = Object.freeze({ schema: 1, generation: 'v2', profileRoot: profile.root,
     databasePath: profile.databasePath, profileEpoch: profile.epoch, ...identity,
     controller: Object.freeze({ pid: process.pid, birth }) })
-  try { await writeOwned('owner.json', record) }
-  catch (error) {
-    // Close handles without erasing either permanent partial-acquisition fence.
-    await Promise.allSettled([profileHandle?.close(), databaseHandle?.close()])
-    throw error
-  }
+  // A failure keeps both permanent partial-acquisition fences.
+  await writeOwned('owner.json', record)
   let launchAttempted = false, child: { pid: number; birth: ExecutionBirth } | undefined, retired = false
   let transition: Promise<void> = Promise.resolve()
   const serialize = (action: () => Promise<void>): Promise<void> => {
@@ -199,20 +156,12 @@ export async function acquireExecutionProfileOwner(requestedProfile: OwnedNative
     // bytes/IDs. A late release never unlinks a subsequent owner's fence.
     // Database becomes durable/free first. Profile remains the admission fence
     // through this rename and fsync; failures retain the unproven profile fence.
-    if (profileHandle && databaseHandle) {
-      await databaseHandle.archive(`${databaseDirectory}.released.${identity.leaseOwnerId}`)
-      await profileHandle.archive(`${directory}.released.${identity.leaseOwnerId}`)
-      retired = true
-      const closed = await Promise.allSettled([databaseHandle.close(), profileHandle.close()])
-      executionAssert(closed.every(value => value.status === 'fulfilled'), 'execution_owner_unknown')
-    } else {
-      await archive(databaseDirectory, `${databaseDirectory}.released.${identity.leaseOwnerId}`)
-      await syncDirectory(path.dirname(databaseDirectory))
-      await archive(directory, `${directory}.released.${identity.leaseOwnerId}`)
-      retired = true
-      await syncDirectory(profile.root)
-      await syncDirectory(path.dirname(databaseDirectory))
-    }
+    await archive(databaseDirectory, `${databaseDirectory}.released.${identity.leaseOwnerId}`)
+    await syncDirectory(path.dirname(databaseDirectory))
+    await archive(directory, `${directory}.released.${identity.leaseOwnerId}`)
+    retired = true
+    await syncDirectory(profile.root)
+    await syncDirectory(path.dirname(databaseDirectory))
   }
   return Object.freeze({ record,
     beforeSpawn(): Promise<void> { return serialize(async () => { await assertOwned(); executionAssert(!launchAttempted, 'execution_owner_unknown'); launchAttempted = true }) },
@@ -227,11 +176,7 @@ export async function acquireExecutionProfileOwner(requestedProfile: OwnedNative
           // This audit file is never read as launch/release authority. Keep the
           // complete branded mapping in its native adapter; commit every field
           // without expanding the 16KiB owner-record ceiling for anchor arrays.
-          await writeOwned('containment.json', windows ? {
-            schema: 1, platform: 'win32', mappingSha256: executionHash(mapping),
-            child: { pid, birth: childBirth }, namespace: mapping.namespace.name,
-            leaseOwnerId: mapping.leaseOwnerId,
-          } : mapping)
+          await writeOwned('containment.json', mapping)
         }
         child = { pid, birth: childBirth }
         await writeOwned('child.json', child)
@@ -242,16 +187,14 @@ export async function acquireExecutionProfileOwner(requestedProfile: OwnedNative
       await retire({ state: 'not_submitted', hostInstanceId: record.hostInstanceId, leaseOwnerId: record.leaseOwnerId })
     }) },
     /** A spawn was attempted but no child identity was ever committed, and the
-     * launch-owned retirement proved its native scope empty with the held MAIN
-     * exited. Only that branded claim may free this fence; an unbound spawn
-     * without it stays UNKNOWN and blocks acquisition indefinitely. */
+     * launch-owned retirement killed its process tree and saw it exit. Only that
+     * branded claim may free this fence; anything else stays UNKNOWN. */
     abandonAfterUnboundSpawn(evidence: unknown): Promise<void> { return serialize(async () => {
       executionAssert(launchAttempted && !child, 'execution_owner_unknown')
       executionAssert(isExecutionUnboundRetirement(evidence), 'execution_owner_unknown')
       const proof = evidence as ExecutionUnboundRetirement
-      executionAssert(proof.scopeEmpty === true && proof.heldProcessExited === true && typeof proof.scopeClosed === 'boolean', 'execution_owner_unknown')
       await retire({ state: 'spawn_unbound', hostInstanceId: record.hostInstanceId, leaseOwnerId: record.leaseOwnerId,
-        retirement: { scopeEmpty: true, heldProcessExited: true, scopeClosed: proof.scopeClosed } })
+        retirement: { pid: proof.pid, processExited: true, scopeClosed: proof.scopeClosed } })
     }) },
     release(receipt: ExecutionCleanupReceipt): Promise<void> { return serialize(async () => {
       executionAssert(isExecutionCleanupReceipt(receipt) && child && receipt.scopeClosed === true && receipt.processRetired === true && receipt.descendantsRetired === true &&

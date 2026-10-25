@@ -45,7 +45,7 @@ describe('selected V2 execution document', () => {
   })
 })
 
-for (const pin of ['2.0.0', '2.0.32'] as const) test(`${pin} Windows managed MCP defers autostart without accepting a disabled selection`, () => {
+for (const pin of ['2.0.0', '2.0.32'] as const) test(`${pin} managed MCP starts enabled on every platform and refuses a disabled selection`, () => {
   const original = Object.getOwnPropertyDescriptor(process, 'platform')!
   try {
     Object.defineProperty(process, 'platform', { ...original, value: 'win32' })
@@ -53,10 +53,8 @@ for (const pin of ['2.0.0', '2.0.32'] as const) test(`${pin} Windows managed MCP
     const result = createOpenCodeV2ExecutionConfig(source)
     const selectedController = source.controller.config
     const expected = selectedController.type === 'local'
-      ? { ...selectedController, command: [...selectedController.command], disabled: true }
-      : { ...selectedController, disabled: true }
+      ? { ...selectedController, command: [...selectedController.command] } : { ...selectedController }
     expect(result.info.mcp?.servers?.['agent-teams']).toEqual(expected)
-    expect(source.controller.config.disabled).toBeUndefined()
     source.controller.config.disabled = true
     expect(() => createOpenCodeV2ExecutionConfig(source)).toThrow('v2_execution_mcp_disabled')
   } finally { Object.defineProperty(process, 'platform', original) }
@@ -102,4 +100,28 @@ test('legacy npm selects AISDK while explicit native packages retain their API',
   expect(() => mapSelectedOpenCodeV2Model('selected', { npm: 42 })).toThrow('v2_selected_model_package_invalid')
   expect(() => mapSelectedOpenCodeV2Model('selected', { npm: '@ai-sdk/openai-compatible', package: '@opencode/ai/providers/openai-compatible' }))
     .toThrow('v2_selected_model_alias_conflict')
+})
+
+test('V2 teammates never get more than V1 teammates in auto approval mode', async () => {
+  const { buildOpenCodeTeammatePermission } = await import('../OpenCodeProfileManager.js')
+  const { OPENCODE_V2_TEAMMATE_PERMISSIONS } = await import('./OpenCodeV2ExecutionConfig.js')
+  const v1 = buildOpenCodeTeammatePermission('auto')
+  // V2 names the same tools differently; V1-only tools have no V2 counterpart.
+  const v2Action: Record<string, string> = { bash: 'shell', write: 'edit', task: 'subagent' }
+  const v1Allowed = new Set(Object.entries(v1).filter(([, effect]) => effect === 'allow').map(([tool]) => v2Action[tool] ?? tool))
+  const rules = OPENCODE_V2_TEAMMATE_PERMISSIONS
+  // Last match wins: a leading catch-all deny makes every unlisted tool (webfetch, websearch, skill, ...) denied.
+  expect(rules[0]).toEqual({ action: '*', resource: '*', effect: 'deny' })
+  expect(v1['*']).toBe('deny')
+  for (const rule of rules.slice(1)) {
+    expect(rule.resource).toBe('*')
+    if (rule.effect === 'allow') expect([rule.action, v1Allowed.has(rule.action)]).toEqual([rule.action, true])
+  }
+  // V1 denies subagents and paths outside the project; V2 keeps both denied after every allow.
+  expect(v1.external_directory).toBe('deny')
+  expect((v1.task as Record<string, unknown>)['*']).toBe('deny')
+  for (const action of ['subagent', 'external_directory']) {
+    const last = rules.findLast(rule => rule.action === action || rule.action === '*')
+    expect([action, last?.effect]).toEqual([action, 'deny'])
+  }
 })

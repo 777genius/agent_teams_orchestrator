@@ -1,7 +1,6 @@
 import { openCodeV2ServerLoopbackUrl } from '../services/opencode/host/OpenCodeV2ServerAddress.js'
 import { readExecutionGraphFailure } from '../services/opencode/host/OpenCodeV2ExecutionBinding.js'
 import { openCodeBunVersion } from '../constants/openCodeBunVersion.js'
-import { confirmWindowsClosedAck, windowsExecutionChildControl, windowsGraphActivation, windowsRealpathInstallCauses } from '../services/opencode/host/windows/OpenCodeV2WindowsChildControl.js'
 import { prepareExecutionPlatformChild, readExecutionPlatformBirth } from '../services/opencode/host/OpenCodeV2ExecutionPlatform.js'
 import { pathToFileURL } from 'node:url'
 import { resolveOpenCodeV2ExecutionDelivery } from '../services/opencode/host/OpenCodeV2ExecutionDelivery.js'
@@ -15,19 +14,16 @@ import { openCodeV2ExecutionCloseAckReserveMs, runOpenCodeV2ExecutionCloseSequen
 import { importOpenCodeV2SelectedOAuth } from '../services/opencode/host/OpenCodeV2ExecutionOAuth.js'
 import type { CurrentServerOptions as CurrentOptions, FloorServerOptions as FloorOptions } from '../services/opencode/compatibility/OpenCodeV2WireTypes.js'
 
-// Dedicated IPC child. The execution DB/profile are retained, including failed acquisition.
-// Native Windows uses an authenticated named pipe; POSIX keeps its inherited
-// process IPC. The official runtime sees no process-global IPC overrides; its
-// only Windows fetch relay is the sealed remote controller origin below.
-const childControl = process.platform === 'win32' ? windowsExecutionChildControl() : {
+// Dedicated IPC child of the owner on every platform. The execution DB/profile are
+// retained, including failed acquisition.
+const childControl = {
   events: process,
   connected: () => !!process.send && process.connected === true,
-  send: (value: Readonly<Record<string, unknown>>) => new Promise<void>((resolve, reject) => {
-    executionAssert(process.send && process.connected, 'execution_containment_identity_mismatch')
+  send: (value: Readonly<Record<string, unknown>>, _deadline?: number) => new Promise<void>((resolve, reject) => {
+    executionAssert(process.send && process.connected, 'execution_identity_mismatch')
     process.send!(value, error => error ? reject(error) : resolve())
   }),
   disconnect: () => process.disconnect?.(),
-  settled: async () => { /* IPC delivery is settled by its own send callback. */ },
 }
 const controller = new AbortController()
 let prepared: Awaited<ReturnType<typeof prepareExecutionPlatformChild>> | undefined
@@ -35,7 +31,6 @@ let preparation: ReturnType<typeof prepareExecutionPlatformChild> | undefined
 let leaseOwnerId: string | undefined
 let nonce: string | undefined, started = false, closing = false
 let startup: Promise<void> | undefined, finalize: (() => Promise<void>) | undefined
-let graphActivation: ReturnType<typeof windowsGraphActivation> | undefined
 let closeWork: Promise<void> | undefined
 const startupStartedAt = Date.now()
 let startupStage = 'waiting-for-prepare'
@@ -53,7 +48,7 @@ function reportStartupFailure(reason: 'timeout' | 'failed', error?: unknown): vo
   const causes = ['execution_contract_invalid', 'execution_identity_mismatch', 'execution_entry_changed',
     'v2_compiled_runtime_unsupported', 'v2_execution_layout_unsupported', 'execution_profile_changed',
     'execution_graph_changed', 'execution_graph_incomplete', 'execution_graph_dependency_missing',
-    'execution_containment_identity_mismatch', 'execution_realpath_unavailable', ...windowsRealpathInstallCauses,
+    'execution_identity_mismatch', 'execution_realpath_unavailable',
     'execution_timeout', 'execution_cancelled', 'opencode_v2_version_out_of_range', 'opencode_v2_version_unqualified',
     'opencode_v2_graph_unavailable']
   const cause = error instanceof Error && causes.includes(error.message) ? error.message : undefined
@@ -67,9 +62,8 @@ function reportStartupFailure(reason: 'timeout' | 'failed', error?: unknown): vo
     elapsedMs: Math.max(startupHistory.at(-1)!.elapsedMs, Date.now() - startupStartedAt), history: startupHistory, ...(graphProgress ? { graph: graphProgress } : {}), ...(readExecutionGraphFailure(error) ? { graphFailure: readExecutionGraphFailure(error) } : {}) }) + '\n')
 }
 // A source graph can legitimately take more than 30 seconds under concurrent
-// startup. The owner still enforces its original shared initialization deadline.
-// Standalone children retain their local watchdog. Authenticated deferred
-// Windows startup instead uses the owner's original absolute deadline below.
+// startup. The owner still enforces its original shared initialization deadline;
+// the start request replaces this local watchdog with that absolute deadline.
 let startupTimer = setTimeout(() => { reportStartupFailure('timeout'); void close() }, process.platform === 'win32' ? 120_000 : 60_000)
 function close(): Promise<void> {
   return closeWork ??= (async () => {
@@ -83,17 +77,11 @@ function close(): Promise<void> {
         const frame = { type: 'closed', nonce, leaseOwnerId: prepared?.leaseOwnerId,
           namespace: prepared?.namespace, executableSha256: prepared?.executableSha256, pid: process.pid,
           birth, scopeClosed: true }
-        // The Windows write callback can resolve before the bytes reach the
-        // pipe and this process exits right after, so delivery is proven by
-        // the owner's reply and the frame reships until it lands. POSIX IPC
-        // send callbacks are honest and no POSIX owner replies.
-        if (process.platform === 'win32') await confirmWindowsClosedAck(childControl, frame, Date.now() + openCodeV2ExecutionCloseAckReserveMs)
-        else await childControl.send(frame, Date.now() + openCodeV2ExecutionCloseAckReserveMs)
+        await childControl.send(frame, Date.now() + openCodeV2ExecutionCloseAckReserveMs)
       },
     })
-    // The closed ACK must reach the pipe before this process dies: exit aborts
-    // any write the transport has not yet flushed.
-    if (acknowledged) { childControl.disconnect(); await childControl.settled(); process.exit(0) } else process.exit(1)
+    // The IPC send callback has confirmed the closed ACK before this process exits.
+    if (acknowledged) { childControl.disconnect(); process.exit(0) } else process.exit(1)
   })()
 }
 childControl.events.on('error', (error: unknown) => { reportStartupFailure('failed', error); void close() })
@@ -103,7 +91,7 @@ process.once('SIGTERM', () => { void close() })
 async function start(input: Record<string, unknown>): Promise<void> {
   if (preparation) prepared = await preparation
   executionAssert(prepared && input.nonce === prepared.nonce && input.leaseOwnerId === prepared.leaseOwnerId &&
-    input.namespace === prepared.namespace, 'execution_containment_identity_mismatch')
+    input.namespace === prepared.namespace, 'execution_identity_mismatch')
   controller.signal.throwIfAborted()
   executionAssert(typeof input.password === 'string' && /^[A-Za-z0-9_-]{43}$/.test(input.password))
   executionRecord(input.native); executionRecord(input.profile)
@@ -111,20 +99,13 @@ async function start(input: Record<string, unknown>): Promise<void> {
   const profile = input.profile as OwnedNativeProfile
   let activationDeadline: number | undefined
   if (input.activationDeadline !== undefined) {
-    // The owner's absolute initialization deadline replaces the local startup
-    // watchdog on every platform; deferred Windows additionally gates runtime
-    // import behind the authenticated activation barrier.
+    // The owner's absolute initialization deadline replaces the local startup watchdog.
     executionAssert(Number.isSafeInteger(input.activationDeadline) &&
       Number(input.activationDeadline) > Date.now() && Number(input.activationDeadline) <= startupStartedAt + openCodeV2RunInitializationMs(process.platform), 'execution_identity_mismatch')
     activationDeadline = Number(input.activationDeadline)
-    if (input.deferRuntime !== undefined) {
-      executionAssert(process.platform === 'win32' && input.deferRuntime === true, 'execution_identity_mismatch')
-      graphActivation = windowsGraphActivation({ nonce: prepared.nonce, leaseOwnerId: prepared.leaseOwnerId,
-        namespace: prepared.namespace, pid: process.pid, birth: prepared.birth }, activationDeadline)
-    }
     clearTimeout(startupTimer)
     startupTimer = setTimeout(() => { reportStartupFailure('timeout'); void close() }, activationDeadline - Date.now())
-  } else executionAssert(input.deferRuntime === undefined, 'execution_identity_mismatch')
+  }
   enterStartupStage('delivery-resolution')
   const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'execution')
   assertOpenCodeV2Launchable(native.version)
@@ -133,14 +114,6 @@ async function start(input: Record<string, unknown>): Promise<void> {
     process.versions.bun === openCodeBunVersion(), 'execution_identity_mismatch')
   enterStartupStage('profile-validation')
   await validateExecutionProfile(profile); controller.signal.throwIfAborted()
-  // AppContainer reroutes its temporary/local-data environment at creation.
-  // Rebind only these observed OS overrides to the authenticated private profile
-  // before importing the official runtime; every environment check still runs.
-  if (process.platform === 'win32') for (const key of ['TMP', 'TEMP', 'LOCALAPPDATA', 'PATH'] as const) {
-    const value = profile.env[key]
-    assertExecutionProfile(typeof value === 'string', 'process_environment')
-    process.env[key] = value
-  }
   assertExecutionProfile(profile.directory === process.cwd(), 'process_cwd')
   assertExecutionProfile(process.env.PWD === profile.directory, 'process_pwd')
   const knownKeys = ['HOME', 'USERPROFILE', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME',
@@ -157,19 +130,6 @@ async function start(input: Record<string, unknown>): Promise<void> {
   enterStartupStage('graph-validation')
   const graph = await validateExecutionGraph(native.version, native.graph, value => { graphProgress = value }, controller.signal)
   controller.signal.throwIfAborted()
-  if (graphActivation && activationDeadline !== undefined) {
-    enterStartupStage('waiting-for-activation')
-    const birth = await readExecutionPlatformBirth(process.pid)
-    executionAssert(birth && executionHash(birth) === executionHash(prepared.birth), 'execution_identity_mismatch')
-    graphActivation.ready()
-    await boundOpenCodeRead(childControl.send({ type: 'graph-ready', nonce, leaseOwnerId: prepared.leaseOwnerId,
-      namespace: prepared.namespace, pid: process.pid, birth, pin: native.version, graphSha256: native.graph.sha256,
-      executableSha256: native.bun.sha256, profileEpoch: profile.epoch, selectionSha256: executionHash(profile.selection) }),
-      Math.min(1000, activationDeadline - Date.now()), controller.signal)
-    await boundOpenCodeRead(graphActivation.wait(), activationDeadline - Date.now(), controller.signal)
-    controller.signal.throwIfAborted()
-    executionAssert(Date.now() < activationDeadline, 'execution_timeout')
-  }
   const options = {
     hostname: '127.0.0.1', port: 0, password: input.password,
     app: { name: 'agent-teams-execution', version: native.version },
@@ -179,30 +139,7 @@ async function start(input: Record<string, unknown>): Promise<void> {
     fs: { filewatcher: false, fff: false },
   } satisfies FloorOptions & CurrentOptions
   let baseUrl: string
-  if (process.platform === 'win32') {
-    enterStartupStage('runtime-import')
-    const { loadOpenCodeV2WindowsRuntime } = await import('../services/opencode/host/windows/OpenCodeV2WindowsRuntime.js')
-    const { windowsExecutionCommandPort } = await import('../services/opencode/host/windows/OpenCodeV2WindowsCommand.js')
-    const { bindWindowsControllerRelay, bindWindowsExecutionHttp, readWindowsRemoteController } =
-      await import('../services/opencode/host/windows/OpenCodeV2WindowsHTTP.js')
-    // Before any official module can capture fetch: a loopback remote
-    // controller is reachable from this AppContainer only through the owner.
-    const remoteController = readWindowsRemoteController(profile.config.content)
-    const relay = remoteController && bindWindowsControllerRelay(remoteController)
-    const closeRelay = async () => { await relay?.close() }
-    finalize = closeRelay
-    const runtime = await loadOpenCodeV2WindowsRuntime(native.version, graph.moduleSha256,
-      windowsExecutionCommandPort(), profile)
-    controller.signal.throwIfAborted()
-    enterStartupStage('server-start')
-    const server = await runtime.start(options, controller.signal)
-    // Register ownership before binding so a failed bridge bind still closes
-    // the acquired official server, without acknowledging partial cleanup.
-    finalize = async () => { try { await server.close() } finally { await closeRelay() } }
-    const bridge = bindWindowsExecutionHttp(server.baseUrl, controller.signal, server.locationObservation)
-    finalize = async () => { try { await bridge.close() } finally { try { await server.close() } finally { await closeRelay() } } }
-    baseUrl = server.baseUrl
-  } else {
+  {
     // Effect and runtime resolve from the same verified official package graph.
     enterStartupStage('effect-import')
     const effect: typeof import('effect') = await import(pathToFileURL(graph.effectPath).href)
@@ -240,7 +177,6 @@ childControl.events.on('message', (message: unknown) => {
   try {
     const input = executionRecord(message)
     executionAssert(typeof input.nonce === 'string' && /^[a-f0-9-]{36}$/.test(input.nonce))
-    if (process.platform === 'win32' && (input.type === 'windowsHTTP' || input.type === 'windowsControllerHTTP' || input.type === 'commandResult' || input.type === 'closedAck')) return
     if (input.type === 'prepare') {
       executionAssert(!preparation && !started && !closing)
       executionAssert(typeof input.leaseOwnerId === 'string')
@@ -252,10 +188,6 @@ childControl.events.on('message', (message: unknown) => {
     if (input.type === 'close') {
       if (!started && !closing && nonce === undefined) nonce = input.nonce
       executionAssert(input.nonce === nonce && (leaseOwnerId === undefined || input.leaseOwnerId === leaseOwnerId), 'execution_identity_mismatch'); void close(); return
-    }
-    if (input.type === 'activate') {
-      executionAssert(started && !closing && childControl.connected() && graphActivation, 'execution_identity_mismatch')
-      graphActivation.activate(input, controller.signal); return
     }
     executionAssert(preparation && !started && !closing && input.type === 'start' && childControl.connected())
     started = true; nonce = input.nonce

@@ -141,6 +141,6 @@ export async function initializeOpenCodeV2ExecutionAuth(authority: ExecutionAuth
       models: () => sdk.model.list({ location }),
       integration: integrationID => sdk.integration.get({ location, integrationID }),
       connect: (integrationID, key) => sdk.integration.connect.key({ location, integrationID, key }),
-    }, { metadata: endpoint.selectedAuth, deadline: context.deadline, signal: context.signal })
+    }, { deadline: context.deadline, signal: context.signal })
   } finally { await wire.dispose(); unregister() }
 }

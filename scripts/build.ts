@@ -12,8 +12,6 @@ import {
 import { dirname, join, relative, resolve } from 'path'
 import { stageCursorManagedAssets } from './cursor-plugin/stage.js'
 import { OPENCODE_V2_EXTERNALS, stageOpenCodeV2Graphs } from './opencode-v2/stage.js'
-import { stageOpenCodeV2DarwinHelper } from './opencode-v2/stage-darwin.js'
-import { stageWindowsHelper } from './opencode-v2/stage-windows.js'
 import { validatePackagedOpenCodeIdentity } from '../src/cli/packagedOpenCodeDelivery.js'
 
 const pkg = await Bun.file(new URL('../package.json', import.meta.url)).json() as {
@@ -449,17 +447,6 @@ if (compile) {
   runBuild(cmd)
   await stageOpenCodeV2Graphs(process.cwd(), stagingOutdir, { portable: args.includes('--portable-graph'),
     platform: portablePlatform?.split('-')[0], arch: portablePlatform?.split('-')[1] })
-  await stageOpenCodeV2DarwinHelper(process.cwd(), stagingOutdir, {
-    platform: portablePlatform?.split('-')[0], arch: portablePlatform?.split('-')[1] })
-  // Native Windows producers are required only for explicit portable/native
-  // release delivery. Ordinary build:dev bundles remain independent of that
-  // optional native staging input.
-  if ((args.includes('--portable-graph') || portablePlatform !== undefined) && (portablePlatform?.split('-')[0] ?? process.platform) === 'win32') {
-    const arch = portablePlatform?.split('-')[1] ?? process.arch
-    if (arch !== 'x64' && arch !== 'arm64') throw new Error('execution_containment_native_build_required')
-    // Native V2 is qualified for x64 only; ARM64 retains the existing V1 delivery.
-    if (arch === 'x64') await stageWindowsHelper(resolve('native'), stagingOutdir, arch)
-  }
   publishBundleOutdir(stagingOutdir, bundleOutdir)
   writeLauncher(outfile, bundleEntrypoint)
 

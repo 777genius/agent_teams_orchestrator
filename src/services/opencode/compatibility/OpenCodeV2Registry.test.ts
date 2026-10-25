@@ -46,11 +46,13 @@ test('existing 2.0.0 floor and 2.0.32 current identities are unchanged', () => {
   expect(openCodeV2Dialect('2.0.32')).toBe('v2-2.0.32')
   expect(openCodeV2Wire('2.0.0')).toBe('floor')
   expect(openCodeV2Wire('2.0.32')).toBe('current')
-  // Both keep every platform where V2 execution already ran.
-  for (const platform of ['darwin-arm64', 'darwin-x64', 'linux-x64', 'win32-x64']) {
+  // Both keep the POSIX platforms where V2 execution already ran. Their Windows evidence
+  // ran under the removed AppContainer host, so plain Windows execution is not claimed.
+  for (const platform of ['darwin-arm64', 'darwin-x64', 'linux-x64']) {
     expect(openCodeV2LaunchRefusal('2.0.0', platform)).toBeNull()
     expect(openCodeV2LaunchRefusal('2.0.32', platform)).toBeNull()
   }
+  for (const version of ['2.0.0', '2.0.32']) expect(openCodeV2LaunchRefusal(version, 'win32-x64')).toBe('opencode_v2_version_unqualified')
 })
 
 test('qualification is per platform: a version is admitted only where its evidence ran', () => {
