@@ -417,7 +417,10 @@ jobs:
         run: |
           set -euo pipefail
           # Outside the checkout, so module resolution cannot fall back to the source install.
-          extracted="$RUNNER_TEMP/TEST-packaged-server-smoke"
+          # Git Bash tar reads a drive-letter path (D:\a\_temp) as a remote host, so use the POSIX form.
+          temp="$RUNNER_TEMP"
+          if [[ "$CANDIDATE_PLATFORM" == win32-* ]]; then temp="$(cygpath -u "$RUNNER_TEMP")"; fi
+          extracted="$temp/TEST-packaged-server-smoke"
           rm -rf "$extracted"
           mkdir -p "$extracted"
           tar -xzf "candidate-$CANDIDATE_PLATFORM.tar.gz" -C "$extracted"
