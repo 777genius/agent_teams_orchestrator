@@ -30,19 +30,23 @@ test('launcher refusals are Linux only; the AppArmor denial and an unread versio
   }
 })
 
-test('a settled V2 read refusal is an unsupported status with its cause; other failures stay transient', async () => {
+test('a named V2 read refusal is marked in the status; unnamed failures stay plainly transient', async () => {
   const { buildOpenCodeV2RuntimeStatus } = await import('../catalog/OpenCodeV2RuntimeStatus.js')
-  const cause = openCodeV2Refusal(new Error('execution_containment_launcher_unsupported'), 'linux-x64')!.message
+  const settledCause = openCodeV2Refusal(new Error('execution_containment_launcher_unsupported'), 'linux-x64')!.message
+  const retryableCause = openCodeV2Refusal(new Error('execution_containment_launcher_denied'), 'linux-x64')!.message
   const failedRead = { catalog: 'unavailable', defaultModel: null, models: [] }
   const snapshot = { detected: true, binaryPath: '/TEST/opencode', models: [], readGeneration: 'v2' as const, readStatus: failedRead }
-  const refused = buildOpenCodeV2RuntimeStatus({ ...snapshot, probeError: cause, probeRefusal: true } as never)
-  expect(refused).toMatchObject({ supported: false, statusCheckOutcome: 'authoritative', statusCheckErrorCode: null, detailMessage: cause })
-  // A retryable refusal or an unnamed failure keeps the transient outcome and still shows its text.
+  const refused = buildOpenCodeV2RuntimeStatus({ ...snapshot, probeError: settledCause, probeRefusal: 'settled' } as never)
+  expect(refused).toMatchObject({ supported: false, statusCheckOutcome: 'authoritative', statusCheckErrorCode: null, detailMessage: settledCause })
+  // The desktop shows detailMessage as the cause only with this code; an admin can lift the denial, so it stays retryable.
+  const denied = buildOpenCodeV2RuntimeStatus({ ...snapshot, probeError: retryableCause, probeRefusal: 'retryable' } as never)
+  expect(denied).toMatchObject({ supported: true, statusCheckOutcome: 'transient_error', statusCheckErrorCode: 'execution_refused',
+    detailMessage: retryableCause })
   const transient = buildOpenCodeV2RuntimeStatus({ ...snapshot, probeError: 'V2 owned server cleanup unknown.' } as never)
   expect(transient).toMatchObject({ supported: true, statusCheckOutcome: 'transient_error', statusCheckErrorCode: 'unavailable',
     detailMessage: 'V2 owned server cleanup unknown.' })
-  // Without a full read (passive selection) the detail stays the qualification note.
-  const passive = buildOpenCodeV2RuntimeStatus({ detected: true, binaryPath: '/TEST/opencode', models: [], probeError: cause, probeRefusal: true } as never)
+  // Without a full read (passive selection) nothing is marked and the detail stays the qualification note.
+  const passive = buildOpenCodeV2RuntimeStatus({ detected: true, binaryPath: '/TEST/opencode', models: [], probeError: settledCause, probeRefusal: 'settled' } as never)
+  expect(passive).toMatchObject({ supported: false, statusCheckOutcome: 'transient_error', statusCheckErrorCode: 'unavailable' })
   expect(passive.detailMessage).toContain('remain unqualified')
-  expect(passive.supported).toBe(false)
 })

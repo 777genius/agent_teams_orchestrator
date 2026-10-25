@@ -181,6 +181,8 @@ export type RuntimeStatusCheckErrorCode =
   | 'unavailable'
   | 'runtime_missing'
   | 'partial_response'
+  /** A retryable refusal the runtime names in detailMessage (for example the Linux sandbox). */
+  | 'execution_refused'
 
 export type RuntimeProviderStatus = {
   openCodeReadStatus?: OpenCodeV2ReadStatus

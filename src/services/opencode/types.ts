@@ -131,8 +131,9 @@ export type OpenCodeInventorySnapshot = {
   agents: OpenCodeAgentSummary[]
   authStorePath: string | null
   probeError: string | null
-  /** The V2 read was refused for a cause the user must fix (see OpenCodeV2RefusalReason); not transient. */
-  probeRefusal?: boolean
+  /** The V2 read was refused for a cause named in probeError (see OpenCodeV2RefusalReason):
+   * `settled` until the system or selection changes, `retryable` when an admin can fix it. */
+  probeRefusal?: 'settled' | 'retryable'
   diagnostics: string[]
 }
 

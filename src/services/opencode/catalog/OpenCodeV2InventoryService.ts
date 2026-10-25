@@ -13,7 +13,7 @@ import { emptyOpenCodeV2ReadStatus, readAgent, readArray, readConfiguration, rea
 
 export function openCodeV2InventorySnapshot(native: OpenCodeV2NativeIdentity, directory: string,
   readStatus = emptyOpenCodeV2ReadStatus(native, directory), probeError: string | null = null,
-  connectedProviders: readonly OpenCodeConnectedProvider[] = [], probeRefusal = false): OpenCodeInventorySnapshot {
+  connectedProviders: readonly OpenCodeConnectedProvider[] = [], probeRefusal?: 'settled' | 'retryable'): OpenCodeInventorySnapshot {
   // The directory offers the native key integrations; completed V2 connections mark them connected.
   const availableProviders = [...new Set([...readStatus.providers.map(row => row.id),
     ...openCodeV2KeyIntegrations(native.version).map(entry => entry.providerId)])]
@@ -21,7 +21,7 @@ export function openCodeV2InventorySnapshot(native: OpenCodeV2NativeIdentity, di
     profile: null, authStorePath: null, connectedProviders: [...connectedProviders], availableProviders,
     models: readStatus.models.map(row => `${row.providerId}/${row.catalogId}`), modelMetadata: [],
     agents: readStatus.agents.map(row => ({ id: row.id, mode: row.mode === 'all' ? 'unknown' : row.mode })),
-    probeError, ...(probeRefusal ? { probeRefusal: true } : {}),
+    probeError, ...(probeRefusal ? { probeRefusal } : {}),
     diagnostics: ['capabilities_pending: V2 catalog reads do not qualify authentication, team launch or one-shot execution.'],
     readStatus, readGeneration: 'v2' }
 }
@@ -91,7 +91,7 @@ export async function probeOpenCodeV2Inventory(native: OpenCodeV2NativeIdentity,
   if (failure) status = emptyOpenCodeV2ReadStatus(native, directory)
   let connected: OpenCodeConnectedProvider[] = []
   try { connected = await readOpenCodeV2ConnectedProviders(directory, native.version) } catch { /* Unknown receipts never display as connected. */ }
-  // Only a settled refusal leaves the retryable transient status; its text is shown either way.
+  // A named refusal keeps its kind so the status can mark it; unnamed failures carry none.
   return openCodeV2InventorySnapshot(native, directory, status, failure, connected,
-    refusal !== null && refusal.settled && failure === refusal.message)
+    refusal !== null && failure === refusal.message ? (refusal.settled ? 'settled' : 'retryable') : undefined)
 }

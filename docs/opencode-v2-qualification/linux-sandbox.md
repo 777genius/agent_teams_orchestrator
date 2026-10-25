@@ -29,8 +29,8 @@ in provider connect and in model tests and lists.
 | `execution_containment_launcher_unsupported` | Older than 0.12.0, or not a `bubblewrap X.Y.Z` report. | unsupported, with the cause |
 | `execution_containment_launcher_unsafe` | The setup probe created a host path. | unsupported, with the cause |
 | `execution_containment_launcher_authority` | Not root-owned, or an unsafe file mode. | unsupported, with the cause |
-| `execution_containment_launcher_denied` | The sandbox could not be built (usually the user-namespace restriction). | retryable, with the cause |
-| `execution_containment_launcher_version_unknown` | `bwrap --version` failed or timed out. | retryable, with the cause |
+| `execution_containment_launcher_denied` | The sandbox could not be built (usually the user-namespace restriction). | retryable, `execution_refused` with the cause |
+| `execution_containment_launcher_version_unknown` | `bwrap --version` failed or timed out. | retryable, `execution_refused` with the cause |
 | `execution_containment_launcher_exited` | The sandbox started but the child ended before it answered (launch only). | not in the status |
 
 These texts are used on Linux only; the darwin and Windows adapters keep their own codes.
@@ -55,7 +55,7 @@ the runtime's kernel containment fixture passes for every case:
 abi <abi/4.0>,
 include <tunables/global>
 
-profile bwrap /usr/bin/bwrap flags=(unconfined) {
+profile opencode-v2-bwrap /usr/bin/bwrap flags=(unconfined) {
   userns,
 }
 ```
@@ -63,8 +63,10 @@ profile bwrap /usr/bin/bwrap flags=(unconfined) {
 The profile, like Ubuntu's own profiles for applications that need user namespaces,
 lets any local process obtain one through `/usr/bin/bwrap`. That is the trade-off the
 restriction exists to limit, so it is an administrator's decision; the runtime does not
-install it. A bubblewrap outside `/usr/bin` is not covered by such a profile and is
-denied as well.
+install it. Add it only when no other profile covers `/usr/bin/bwrap`; a stricter one
+(such as AppArmor's `bwrap-userns-restrict`, which confines the sandboxed children) was
+not tested with V2. A bubblewrap outside `/usr/bin` is not covered by such a profile and
+is denied as well.
 
 [advisory]: https://github.com/containers/bubblewrap/security/advisories/GHSA-pxhw-h44j-8pfx
 [usn]: https://ubuntu.com/security/notices/USN-8779-2

@@ -4,9 +4,11 @@ import type { RuntimeExtensionCapability, RuntimeProviderStatus } from '../../ru
 /** Catalog availability never participates in authentication or protocol1 launch readiness. */
 export function buildOpenCodeV2RuntimeStatus(snapshot: OpenCodeInventorySnapshot): RuntimeProviderStatus {
   const read = snapshot.readStatus, ready = read?.catalog === 'ready'
-  // A named refusal (version not qualified here, Linux sandbox unavailable) is a settled
-  // answer, not a transient read failure: report it as unsupported with its cause.
-  const refused = Boolean(read) && !ready && snapshot.probeRefusal === true && Boolean(snapshot.probeError)
+  // A settled named refusal (version not qualified here, bwrap older than 0.12.0) is reported
+  // as unsupported with its cause. A retryable one (the AppArmor userns denial) stays transient
+  // with the execution_refused code, which tells the desktop the detail is that cause.
+  const named = read && !ready && snapshot.probeError ? snapshot.probeRefusal : undefined
+  const refused = named === 'settled'
   const unavailable: RuntimeExtensionCapability = {
     status: 'unsupported', ownership: 'provider-scoped', reason: 'capabilities_pending',
   }
@@ -28,7 +30,7 @@ export function buildOpenCodeV2RuntimeStatus(snapshot: OpenCodeInventorySnapshot
     models: ready ? snapshot.models : [],
     backend: snapshot.detected ? { kind: 'opencode-cli', label: 'OpenCode CLI', authMethodDetail: null } : null,
     statusCheckOutcome: ready ? 'model_only' : refused ? 'authoritative' : 'transient_error',
-    statusCheckErrorCode: ready || refused ? null : 'unavailable',
+    statusCheckErrorCode: ready || refused ? null : named === 'retryable' ? 'execution_refused' : 'unavailable',
     runtimeCapabilities: { modelCatalog: { dynamic: true, source: 'app-server' } },
     ...(read ? { openCodeReadStatus: read } : {}),
     modelCatalog: {
