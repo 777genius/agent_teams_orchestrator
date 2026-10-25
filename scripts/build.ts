@@ -212,6 +212,8 @@ const externals = [
 
 const defines = {
   PACKAGED_OPENCODE_DELIVERY: packagedDelivery ? JSON.stringify(packagedDelivery) : 'undefined',
+  // A runtime released without OpenCode V2 (scripts/opencode-v2/release-delivery.ts) admits no V2 launch.
+  OPENCODE_V2_DELIVERED: args.includes('--without-opencode-v2') ? 'false' : 'true',
   'process.env.USER_TYPE': JSON.stringify('external'),
   'process.env.CLAUDE_CODE_FORCE_FULL_LOGO': JSON.stringify('true'),
   ...(dev

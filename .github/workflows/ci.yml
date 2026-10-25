@@ -416,6 +416,18 @@ jobs:
           path: candidate-${{ matrix.platform }}.tar.gz
           if-no-files-found: error
           retention-days: 7
+      # A release can ship without OpenCode V2 (scripts/opencode-v2/release-delivery.ts): the
+      # compiled runtime alone must serve runtime commands and qualify no V2 version.
+      - name: Produce and verify the runtime without OpenCode V2
+        shell: bash
+        env:
+          RUNTIME_OPENCODE_V2: 'off'
+          CANDIDATE_BINARY: ${{ matrix.binary }}
+        run: |
+          set -euo pipefail
+          bun test scripts/opencode-v2/release-delivery.test.ts
+          bun scripts/package-runtime.ts --platform ${{ matrix.platform }}
+          bun scripts/ci/verify-runtime-without-v2.ts
 
   opencode-v2-linux:
     needs: scope

@@ -208,6 +208,13 @@ jobs:
         if: matrix.platform == 'win32-x64'
         run: bun scripts/opencode-v2/compile-windows.ts
 
+      # The committed release setting (scripts/opencode-v2/release-delivery.ts) decides whether
+      # this release ships OpenCode V2; the manifest's opencodeV2 contract follows it.
+      - name: Resolve OpenCode V2 delivery
+        id: opencode-v2
+        shell: bash
+        run: echo "delivery=$(bun ./scripts/opencode-v2/release-delivery.ts)" >> "$GITHUB_OUTPUT"
+
       - name: Build packaged runtime deliveries
         env:
           BUN_COMPILE_TARGET: ${{ matrix.compile_target }}
@@ -312,6 +319,7 @@ jobs:
         if: runner.os != 'Windows' && matrix.platform != 'win32-arm64'
         env:
           RAW_RUNTIME_VERSION: ${{ needs.prepare-release.outputs.runtime_version }}
+          OPENCODE_V2_DELIVERY: ${{ steps.opencode-v2.outputs.delivery }}
         shell: bash
         run: |
           set -euo pipefail
@@ -332,21 +340,29 @@ jobs:
           chmod +x "release/runtime/${{ matrix.binary_name }}"
           printf '%s\n' "$runtime_version" > release/runtime/VERSION
           printf '%s\n' "$runtime_commit" > release/runtime/COMMIT_SHA
-          [[ -f dist/opencode-delivery.json ]] || { echo "Packaged OpenCode delivery identity missing" >&2; exit 1; }
-          cp dist/opencode-delivery.json release/runtime/opencode-delivery.json
+          if [[ "$OPENCODE_V2_DELIVERY" == bundled ]]; then
+            [[ -f dist/opencode-delivery.json ]] || { echo "Packaged OpenCode delivery identity missing" >&2; exit 1; }
+            cp dist/opencode-delivery.json release/runtime/opencode-delivery.json
+            cp -R dist/local-cli release/runtime/local-cli
+            cp -R dist/bun release/runtime/bun
+          else
+            # Without OpenCode V2 the compiled runtime runs every command itself.
+            for leftover in dist/opencode-delivery.json dist/local-cli dist/bun; do
+              [[ ! -e "$leftover" ]] || { echo "OpenCode V2 delivery found in a release without V2: $leftover" >&2; exit 1; }
+            done
+          fi
           # The managed Cursor assets are resolved beside the installed binary.
           # Leaving them out of the archive turns automatic discovery into a
           # manual staging step nobody performs on a real install.
           [[ -d dist/cursor-managed ]] || { echo "Managed Cursor assets missing"; exit 1; }
           cp -R dist/cursor-managed release/runtime/cursor-managed
-          cp -R dist/local-cli release/runtime/local-cli
-          cp -R dist/bun release/runtime/bun
           tar -czf "release/${{ matrix.archive_name }}" -C release runtime
 
       - name: Package cross-compiled Windows ARM64 runtime archive
         if: matrix.platform == 'win32-arm64'
         env:
           RAW_RUNTIME_VERSION: ${{ needs.prepare-release.outputs.runtime_version }}
+          OPENCODE_V2_DELIVERY: ${{ steps.opencode-v2.outputs.delivery }}
         shell: bash
         run: |
           set -euo pipefail
@@ -358,21 +374,29 @@ jobs:
           cp dist/cli.exe "release/runtime/${{ matrix.binary_name }}"
           printf '%s\n' "$runtime_version" > release/runtime/VERSION
           printf '%s\n' "$runtime_commit" > release/runtime/COMMIT_SHA
-          [[ -f dist/opencode-delivery.json ]] || { echo "Packaged OpenCode delivery identity missing" >&2; exit 1; }
-          cp dist/opencode-delivery.json release/runtime/opencode-delivery.json
+          if [[ "$OPENCODE_V2_DELIVERY" == bundled ]]; then
+            [[ -f dist/opencode-delivery.json ]] || { echo "Packaged OpenCode delivery identity missing" >&2; exit 1; }
+            cp dist/opencode-delivery.json release/runtime/opencode-delivery.json
+            cp -R dist/local-cli release/runtime/local-cli
+            cp -R dist/bun release/runtime/bun
+          else
+            # Without OpenCode V2 the compiled runtime runs every command itself.
+            for leftover in dist/opencode-delivery.json dist/local-cli dist/bun; do
+              [[ ! -e "$leftover" ]] || { echo "OpenCode V2 delivery found in a release without V2: $leftover" >&2; exit 1; }
+            done
+          fi
           # The managed Cursor assets are resolved beside the installed binary.
           # Leaving them out of the archive turns automatic discovery into a
           # manual staging step nobody performs on a real install.
           [[ -d dist/cursor-managed ]] || { echo "Managed Cursor assets missing"; exit 1; }
           cp -R dist/cursor-managed release/runtime/cursor-managed
-          cp -R dist/local-cli release/runtime/local-cli
-          cp -R dist/bun release/runtime/bun
           (cd release && zip -qr "${{ matrix.archive_name }}" runtime)
 
       - name: Package runtime archive (Windows)
         if: runner.os == 'Windows'
         env:
           RAW_RUNTIME_VERSION: ${{ needs.prepare-release.outputs.runtime_version }}
+          OPENCODE_V2_DELIVERY: ${{ steps.opencode-v2.outputs.delivery }}
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -391,13 +415,20 @@ jobs:
           Copy-Item $source "release/runtime/${{ matrix.binary_name }}"
           Set-Content -Path release/runtime/VERSION -Value $runtimeVersion
           Set-Content -Path release/runtime/COMMIT_SHA -Value $runtimeCommit
-          if (-not (Test-Path dist/opencode-delivery.json -PathType Leaf)) { throw "Packaged OpenCode delivery identity missing" }
-          Copy-Item dist/opencode-delivery.json release/runtime/opencode-delivery.json
+          if ($env:OPENCODE_V2_DELIVERY -eq 'bundled') {
+            if (-not (Test-Path dist/opencode-delivery.json -PathType Leaf)) { throw "Packaged OpenCode delivery identity missing" }
+            Copy-Item dist/opencode-delivery.json release/runtime/opencode-delivery.json
+            Copy-Item dist/local-cli release/runtime/local-cli -Recurse
+            Copy-Item dist/bun release/runtime/bun -Recurse
+          } else {
+            # Without OpenCode V2 the compiled runtime runs every command itself.
+            foreach ($leftover in @('dist/opencode-delivery.json', 'dist/local-cli', 'dist/bun')) {
+              if (Test-Path $leftover) { throw "OpenCode V2 delivery found in a release without V2: $leftover" }
+            }
+          }
           # Resolved beside the installed binary; see the bash packaging step.
           if (-not (Test-Path dist/cursor-managed)) { throw "Managed Cursor assets missing" }
           Copy-Item dist/cursor-managed release/runtime/cursor-managed -Recurse
-          Copy-Item dist/local-cli release/runtime/local-cli -Recurse
-          Copy-Item dist/bun release/runtime/bun -Recurse
           Compress-Archive -Path release/runtime -DestinationPath "release/${{ matrix.archive_name }}" -Force
 
       - name: Rename archive to versioned asset name

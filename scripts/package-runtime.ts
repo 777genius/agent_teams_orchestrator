@@ -1,9 +1,10 @@
 import { openCodeBunVersion } from '../src/constants/openCodeBunVersion.js'
 import { createHash } from 'node:crypto'
-import { chmod, mkdir, readFile, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { unzipSync } from 'fflate'
 import { validatePackagedOpenCodeIdentity } from '../src/cli/packagedOpenCodeDelivery.js'
+import { openCodeV2ReleaseDelivery } from './opencode-v2/release-delivery.js'
 
 const args = process.argv.slice(2)
 const option = (name: string) => args[args.indexOf(name) + 1]
@@ -42,6 +43,19 @@ async function stageBinary(directory: string, target: string, binary: Uint8Array
   if (!target.startsWith('win32-')) await chmod(file, 0o755)
   return file
 }
+function build(executable: string, buildArgs: string[]): void {
+  const result = Bun.spawnSync({ cmd: [executable, './scripts/build.ts', ...buildArgs], stdout: 'inherit', stderr: 'inherit' })
+  if (result.exitCode !== 0) throw new Error('Runtime delivery build failed')
+}
+// A release without OpenCode V2 ships only the compiled front door: no V2 graphs, no physical JS
+// delivery and no pinned Bun, and every command runs in the compiled runtime.
+if (openCodeV2ReleaseDelivery() === 'off') {
+  for (const leftover of ['./dist/local-cli', './dist/bun', './dist/build-bun', './dist/opencode-delivery.json'])
+    await rm(leftover, { recursive: true, force: true })
+  build(process.execPath, ['--compile', '--without-opencode-v2'])
+  console.log(`Prepared compiled runtime without OpenCode V2 for ${platform}`)
+  process.exit(0)
+}
 const binary = await pinnedBinary(pins.assets[platform]!, args.includes('--bun-archive') ? option('--bun-archive') : undefined)
 const shipped = await stageBinary('./dist/bun', platform, binary)
 // The physical delivery is parsed by its platform pin. A newer compiler's minifier may
@@ -51,10 +65,6 @@ const host = `${process.platform}-${process.arch}`
 if (!Object.hasOwn(pins.assets, host)) throw new Error('Unsupported runtime release build host')
 const jsBuilder = host === platform ? shipped :
   await stageBinary('./dist/build-bun', host, await pinnedBinary(pins.assets[host]!))
-function build(executable: string, buildArgs: string[]): void {
-  const result = Bun.spawnSync({ cmd: [executable, './scripts/build.ts', ...buildArgs], stdout: 'inherit', stderr: 'inherit' })
-  if (result.exitCode !== 0) throw new Error('Runtime delivery build failed')
-}
 build(jsBuilder, ['--portable-graph', `--release-platform=${platform}`])
 const [targetPlatform, arch] = platform.split('-')
 const identity = validatePackagedOpenCodeIdentity({ schema: 1, platform: targetPlatform, arch,
