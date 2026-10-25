@@ -379,7 +379,9 @@ export function seedOpenCodeModelsCache(input: {
     if (await isNonEmptyFile(cacheFile)) return 'seeded'
     if (input.abortSignal?.aborted) return 'unavailable'
     await mkdir(cacheDirectory, { recursive: true })
-      .then(() => writeFile(failureMarker, ''))
+      // Non-empty, changing content: every failure must move the marker's mtime,
+      // which rewriting an already empty file does not guarantee on every platform.
+      .then(() => writeFile(failureMarker, `${new Date().toISOString()}\n`))
       .catch(() => undefined)
     return 'unavailable'
   })().finally(() => modelsCacheSeeds.delete(cacheFile))
