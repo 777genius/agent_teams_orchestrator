@@ -391,6 +391,8 @@ jobs:
         with:
           bun-version: '1.4.2'
       - name: Produce physical JS and native front door
+        env:
+          RUNTIME_OPENCODE_V2: bundled
         run: bun scripts/package-runtime.ts --platform ${{ matrix.platform }}
       - name: Verify and archive complete candidate delivery
         shell: bash
@@ -442,6 +444,20 @@ jobs:
           path: candidate-${{ matrix.platform }}.tar.gz
           if-no-files-found: error
           retention-days: 7
+      # A release can ship without OpenCode V2 (scripts/opencode-v2/release-delivery.ts): the
+      # compiled runtime alone must serve runtime commands and qualify no V2 version.
+      - name: Produce and verify the runtime without OpenCode V2
+        shell: bash
+        env:
+          RUNTIME_OPENCODE_V2: 'off'
+          CANDIDATE_BINARY: ${{ matrix.binary }}
+        run: |
+          set -euo pipefail
+          bun test scripts/opencode-v2/release-delivery.test.ts
+          # Start from an empty dist: the bundled build above left a deep local-cli tree.
+          if [[ "$RUNNER_OS" == Windows ]]; then pwsh -NoProfile -Command "Remove-Item -LiteralPath dist -Recurse -Force"; else rm -rf dist; fi
+          bun scripts/package-runtime.ts --platform ${{ matrix.platform }}
+          bun scripts/ci/verify-runtime-without-v2.ts
 
   opencode-v2-linux:
     needs: scope
@@ -468,6 +484,8 @@ jobs:
       - name: Test launcher qualification, refusal text and activation deadline
         run: bun test src/services/opencode/host/OpenCodeV2LinuxLauncherQualification.test.ts src/services/opencode/host/OpenCodeV2ExecutionReadiness.test.ts src/services/opencode/execution/OpenCodeV2RefusalReason.test.ts src/services/opencode/execution/OpenCodeV2ActivationDeadline.test.ts
       - name: Produce the packaged linux-x64 delivery
+        env:
+          RUNTIME_OPENCODE_V2: bundled
         run: bun scripts/package-runtime.ts --platform linux-x64
       - name: Start every qualified V2 version inside the real sandbox
         run: bash scripts/ci/opencode-v2-linux-execution.sh dist

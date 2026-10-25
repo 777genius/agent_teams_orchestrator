@@ -25,7 +25,7 @@ import type { OpenCodeExecutionProof } from '../../../../services/opencode/types
 import type { BridgeEnvelope } from '../../../../services/opencode/bridge/OpenCodeBridgeProtocol.js'
 import type { ConnectProviderInput, LoadProviderModelsInput, TestProviderModelInput, ProviderConnection, RuntimeProviderModel, RuntimeProviderModelsView, ProviderModelTestResult, ProviderManagementResult, ProviderSetupForm } from '../../domain/types.js'
 import { OPENCODE_V2_NATIVE_KEY_OPTION_ID, openCodeV2KeyIntegration, openCodeV2ProviderConnectionsDirectory } from '../../../../services/opencode/catalog/OpenCodeV2KeyIntegrations.js'
-import type { OpenCodeV2Pin } from '../../../../services/opencode/compatibility/OpenCodeV2Registry.js'
+import { openCodeV2Delivered, type OpenCodeV2Pin } from '../../../../services/opencode/compatibility/OpenCodeV2Registry.js'
 
 const sourceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../../..')
 const text = (value: unknown): string => { executionAssert(typeof value === 'string' && value.length > 0, 'provider_response_invalid'); return value }
@@ -44,6 +44,8 @@ async function catalog<T>(input: { providerId: string; projectPath?: string | nu
   providers(): Promise<unknown>; models(): Promise<unknown>; integration(id: string): Promise<unknown>;
   connect(id: string, key: string): Promise<void>; remove(id: string): Promise<void>
 }) => Promise<T>): Promise<T> {
+  // A runtime released without V2 refuses before any profile, credential or child work.
+  executionAssert(openCodeV2Delivered(), 'opencode_v2_version_unqualified')
   const selected = await inspectOpenCodeReadSelection(); executionAssert(selected.native && selected.policy.generation === 'v2', 'provider_v2_required')
   const project = await canonicalizeOpenCodeProjectPath(input.projectPath)
   const scope = await resolveOpenCodeV2CatalogProfileScope({ projectPath: project, providerId: input.providerId })

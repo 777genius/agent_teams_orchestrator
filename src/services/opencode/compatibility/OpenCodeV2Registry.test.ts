@@ -2,11 +2,12 @@ import { expect, test } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import {
-  assertOpenCodeV2Launchable, classifyOpenCodeV2Version, isOpenCodeV2Identity, openCodeV2Dialect,
+  assertOpenCodeV2Launchable, classifyOpenCodeV2Version, isOpenCodeV2Identity, openCodeV2Delivered, openCodeV2Dialect,
   openCodeV2GraphPackages, openCodeV2LaunchRefusal, openCodeV2Qualification, openCodeV2QualifiedVersions,
   openCodeV2ReleaseContract, openCodeV2StagedVersions, openCodeV2Wire, parseOpenCodeV2GraphAlias, type OpenCodeV2Pin,
 } from './OpenCodeV2Registry.js'
 import { validateRunLaunchPlan } from '../bridge/OpenCodeV2RunOwner.js'
+import { openCodeV2KeyIntegration, openCodeV2KeyIntegrations } from '../catalog/OpenCodeV2KeyIntegrations.js'
 import type { RunLaunchPlan } from '../bridge/OpenCodeV2RunTypes.js'
 
 const manifest = JSON.parse(readFileSync(path.join(import.meta.dir, '../../../../package.json'), 'utf8')) as {
@@ -103,4 +104,23 @@ test('launch is refused with a coded error for in-range unqualified and for out-
   }) as unknown as RunLaunchPlan
   expect(() => validateRunLaunchPlan(plan('2.0.40'))).toThrow('opencode_v2_version_unqualified')
   expect(() => validateRunLaunchPlan(plan('3.0.0'))).toThrow('opencode_v2_version_out_of_range')
+})
+
+test('a runtime built without V2 admits no V2 launch and offers no V2 key integration', () => {
+  const qualified = openCodeV2QualifiedVersions().find(version => openCodeV2LaunchRefusal(version, 'darwin-arm64') === null)
+  expect(qualified).toBeDefined()
+  expect(openCodeV2Delivered()).toBe(true)
+  expect(openCodeV2KeyIntegrations('2.1.4').length).toBeGreaterThan(0)
+  // The build defines this global; source runs and tests leave it undefined.
+  Reflect.set(globalThis, 'OPENCODE_V2_DELIVERED', false)
+  try {
+    expect(openCodeV2Delivered()).toBe(false)
+    expect(openCodeV2LaunchRefusal(qualified, 'darwin-arm64')).toBe('opencode_v2_version_unqualified')
+    expect(openCodeV2LaunchRefusal('3.0.0', 'darwin-arm64')).toBe('opencode_v2_version_out_of_range')
+    expect(openCodeV2KeyIntegrations('2.1.4')).toEqual([])
+    expect(openCodeV2KeyIntegration('kimi-code-plan-cn')).toBeNull()
+  } finally {
+    Reflect.deleteProperty(globalThis, 'OPENCODE_V2_DELIVERED')
+  }
+  expect(openCodeV2Delivered()).toBe(true)
 })

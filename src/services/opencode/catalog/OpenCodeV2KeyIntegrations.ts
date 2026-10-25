@@ -2,7 +2,7 @@ import { lstat, readdir, readFile } from 'node:fs/promises'
 import path from 'node:path'
 import { resolveClaudeMultimodelPaths } from '../OpenCodeManagedPaths.js'
 import type { OpenCodeConnectedProvider } from '../types.js'
-import { openCodeV2Wire, type OpenCodeV2Pin } from '../compatibility/OpenCodeV2Registry.js'
+import { openCodeV2Delivered, openCodeV2Wire, type OpenCodeV2Pin } from '../compatibility/OpenCodeV2Registry.js'
 
 /**
  * Native OpenCode V2 integrations the provider-management surface offers with the
@@ -19,11 +19,11 @@ export const OPENCODE_V2_NATIVE_KEY_OPTION_ID = 'api:native'
 
 /** The native integration catalog of the floor release predates these integrations. */
 export function openCodeV2KeyIntegrations(version: OpenCodeV2Pin): readonly Readonly<{ providerId: string; displayName: string }>[] {
-  return openCodeV2Wire(version) === 'current' ? KEY_INTEGRATIONS : []
+  return openCodeV2Delivered() && openCodeV2Wire(version) === 'current' ? KEY_INTEGRATIONS : []
 }
 export function openCodeV2KeyIntegration(providerId: string, version?: OpenCodeV2Pin): Readonly<{ providerId: string; displayName: string }> | null {
   const entry = KEY_INTEGRATIONS.find(candidate => candidate.providerId === providerId) ?? null
-  return entry && (version === undefined || openCodeV2Wire(version) === 'current') ? entry : null
+  return entry && openCodeV2Delivered() && (version === undefined || openCodeV2Wire(version) === 'current') ? entry : null
 }
 
 /** Owner-private V2 connection transaction receipts (one per project, provider and key). */
