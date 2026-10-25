@@ -181,6 +181,7 @@ async function probeLinuxLauncher(launcher: string): Promise<void> {
       // A killed probe proves nothing about the step it did not finish: it fails closed.
       effects.push({ setupReached: !timedOut && await present(path.join(root, `setup-${index}`)),
         escapedToHost: (await readdir(host)).length > 0 })
+      if (!effects.at(-1)!.setupReached) break // Already refused; do not wait on the others.
     }
     const verdict = classifyLinuxLauncherProbe(effects)
     assert(verdict === 'qualified', verdict)
@@ -206,6 +207,20 @@ export function qualifyLinuxLauncher(launcher: string, launcherSha256: string): 
   }
   return work
 }
+/** The one launcher every Linux V2 sandbox uses: root-owned, not setuid/setgid or writable by
+ * group or others, and qualified. Provider status calls this before reporting a usable catalog. */
+export async function qualifyLinuxSystemLauncher(): Promise<Readonly<{ launcher: string; launcherSha256: string }>> {
+  let launcher: string
+  try { launcher = await realpath('/usr/bin/bwrap') } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw new Error('execution_containment_launcher_missing')
+    throw error
+  }
+  const stat = await lstat(launcher)
+  assert(stat.isFile() && stat.uid === 0 && (stat.mode & 0o6022) === 0, 'execution_containment_launcher_authority')
+  const launcherSha256 = await linuxFileHash(launcher)
+  await qualifyLinuxLauncher(launcher, launcherSha256)
+  return Object.freeze({ launcher, launcherSha256 })
+}
 export type LinuxLaunchPlan = Readonly<{ launcher: string; launcherSha256: string; args: readonly string[]; cwd: string; serialization: 'json' }>
 const plans = new WeakSet<LinuxLaunchPlan>()
 const planBinaries = new WeakMap<LinuxLaunchPlan, Readonly<{ path: string; sha256: string }>>()
@@ -221,17 +236,9 @@ export async function planLinuxExecution(requested: Readonly<{
   const input = structuredClone(requested)
   assert(process.platform === 'linux', 'execution_containment_platform_pending')
   await linuxPidfds()
-  let launcher: string
-  try { launcher = await realpath('/usr/bin/bwrap') } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw new Error('execution_containment_launcher_missing')
-    throw error
-  }
-  const stat = await lstat(launcher)
-  assert(stat.isFile() && stat.uid === 0 && (stat.mode & 0o6022) === 0, 'execution_containment_launcher_authority')
+  const { launcher, launcherSha256 } = await qualifyLinuxSystemLauncher()
   assert(await realpath(input.bun.path) === input.bun.path && await linuxFileHash(input.bun.path) === input.bun.sha256,
     'execution_identity_mismatch')
-  const launcherSha256 = await linuxFileHash(launcher)
-  await qualifyLinuxLauncher(launcher, launcherSha256)
   const mountinfo = await readFile('/proc/self/mountinfo', 'utf8')
   const authorityMounts = mountinfo.trim().split('\n').flatMap(line => {
     const fields = line.split(' '), split = fields.indexOf('-')

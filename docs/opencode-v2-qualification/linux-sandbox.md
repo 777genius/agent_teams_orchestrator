@@ -1,9 +1,10 @@
 # OpenCode V2 on Linux: the bubblewrap sandbox
 
-Every OpenCode V2 execution on Linux (catalog reads, provider connect, model tests
-and team members) runs inside `/usr/bin/bwrap`. The runtime qualifies that launcher
-before its first sandbox in each process; a refusal names its cause in provider
-connect, model tests and the provider status.
+Every OpenCode V2 execution on Linux (provider connect, model tests and lists, and team
+members) runs inside `/usr/bin/bwrap`. The runtime qualifies that launcher before its first
+sandbox in each process. The provider status reads the catalog outside the sandbox, so it
+checks the version qualification and the launcher first; a refusal names its cause there,
+in provider connect and in model tests and lists.
 
 ## What the launcher must provide
 
@@ -30,7 +31,7 @@ connect, model tests and the provider status.
 | `execution_containment_launcher_authority` | Not root-owned, or an unsafe file mode. | unsupported, with the cause |
 | `execution_containment_launcher_denied` | The sandbox could not be built (usually the user-namespace restriction). | retryable, with the cause |
 | `execution_containment_launcher_version_unknown` | `bwrap --version` failed or timed out. | retryable, with the cause |
-| `execution_containment_launcher_exited` | The sandbox started but the child ended before it answered. | retryable, generic |
+| `execution_containment_launcher_exited` | The sandbox started but the child ended before it answered (launch only). | not in the status |
 
 These texts are used on Linux only; the darwin and Windows adapters keep their own codes.
 

@@ -3,6 +3,7 @@ import type { OpenCodeConnectedProvider, OpenCodeInventorySnapshot } from '../ty
 import { openCodeV2KeyIntegrations, readOpenCodeV2ConnectedProviders } from './OpenCodeV2KeyIntegrations.js'
 import { hashOpenCodeFile, type OpenCodeV2NativeIdentity } from '../compatibility/OpenCodeNativeIdentity.js'
 import { acquireOpenCodeV2ReadHost } from '../host/OpenCodeHostNativeAdapter.js'
+import { assertOpenCodeV2ExecutionReady } from '../host/OpenCodeV2ExecutionReadiness.js'
 import { createOpenCodeV2ReadClient } from '../transport/OpenCodeV2ClientFactory.js'
 import { openCodeReadAssert } from '../transport/OpenCodeBoundedFetch.js'
 import { openCodeV2Wire } from '../compatibility/OpenCodeV2Registry.js'
@@ -34,6 +35,9 @@ export async function probeOpenCodeV2Inventory(native: OpenCodeV2NativeIdentity,
   let reader: Awaited<ReturnType<typeof createOpenCodeV2ReadClient>> | undefined
   let failure: string | null = null, refusal: OpenCodeV2Refusal | null = null
   try {
+    // The read host runs outside the sandbox; connect and launch do not. Refuse the catalog with
+    // the cause when this version or this Linux launcher would refuse every execution.
+    await assertOpenCodeV2ExecutionReady(native.version)
     host = await acquireOpenCodeV2ReadHost(native, directory, boundedContext)
     reader = await createOpenCodeV2ReadClient(host.authority, boundedContext)
     const sdk = reader.client, wrap = (value: unknown) => readWrapped(value, directory, projectId)

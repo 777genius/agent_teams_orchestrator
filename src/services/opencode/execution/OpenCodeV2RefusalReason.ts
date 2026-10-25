@@ -17,7 +17,7 @@ const reasons: Readonly<Record<string, Reason>> = Object.freeze({
   execution_containment_launcher_missing: { settled: true, linuxOnly: true, text: () =>
     `bubblewrap was not found. ${BWRAP_REQUIREMENT}.` },
   execution_containment_launcher_unsupported: { settled: true, linuxOnly: true, text: () =>
-    `The installed bubblewrap (/usr/bin/bwrap) is older than 0.12.0, the first release that fixes CVE-2026-87766. ${BWRAP_REQUIREMENT}.` },
+    `The installed bubblewrap (/usr/bin/bwrap) is older than 0.12.0, the first release that fixes CVE-2026-87766, or reports an unexpected version. ${BWRAP_REQUIREMENT}.` },
   execution_containment_launcher_unsafe: { settled: true, linuxOnly: true, text: () =>
     `The installed bubblewrap (/usr/bin/bwrap) is affected by CVE-2026-87766: sandbox setup can create files outside the sandbox. ${BWRAP_REQUIREMENT}.` },
   execution_containment_launcher_authority: { settled: true, linuxOnly: true, text: () =>
