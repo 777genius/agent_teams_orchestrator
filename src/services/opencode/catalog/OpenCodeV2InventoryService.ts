@@ -3,15 +3,17 @@ import type { OpenCodeConnectedProvider, OpenCodeInventorySnapshot } from '../ty
 import { openCodeV2KeyIntegrations, readOpenCodeV2ConnectedProviders } from './OpenCodeV2KeyIntegrations.js'
 import { hashOpenCodeFile, type OpenCodeV2NativeIdentity } from '../compatibility/OpenCodeNativeIdentity.js'
 import { acquireOpenCodeV2ReadHost } from '../host/OpenCodeHostNativeAdapter.js'
+import { assertOpenCodeV2ExecutionReady } from '../host/OpenCodeV2ExecutionReadiness.js'
 import { createOpenCodeV2ReadClient } from '../transport/OpenCodeV2ClientFactory.js'
 import { openCodeReadAssert } from '../transport/OpenCodeBoundedFetch.js'
 import { openCodeV2Wire } from '../compatibility/OpenCodeV2Registry.js'
+import { openCodeV2Refusal, type OpenCodeV2Refusal } from '../execution/OpenCodeV2RefusalReason.js'
 import { emptyOpenCodeV2ReadStatus, readAgent, readArray, readConfiguration, readLocation, readModel,
   readProvider, readRecord, readWrapped, type OpenCodeV2ReadStatus } from './OpenCodeV2ReadStatus.js'
 
 export function openCodeV2InventorySnapshot(native: OpenCodeV2NativeIdentity, directory: string,
   readStatus = emptyOpenCodeV2ReadStatus(native, directory), probeError: string | null = null,
-  connectedProviders: readonly OpenCodeConnectedProvider[] = []): OpenCodeInventorySnapshot {
+  connectedProviders: readonly OpenCodeConnectedProvider[] = [], probeRefusal = false): OpenCodeInventorySnapshot {
   // The directory offers the native key integrations; completed V2 connections mark them connected.
   const availableProviders = [...new Set([...readStatus.providers.map(row => row.id),
     ...openCodeV2KeyIntegrations(native.version).map(entry => entry.providerId)])]
@@ -19,7 +21,8 @@ export function openCodeV2InventorySnapshot(native: OpenCodeV2NativeIdentity, di
     profile: null, authStorePath: null, connectedProviders: [...connectedProviders], availableProviders,
     models: readStatus.models.map(row => `${row.providerId}/${row.catalogId}`), modelMetadata: [],
     agents: readStatus.agents.map(row => ({ id: row.id, mode: row.mode === 'all' ? 'unknown' : row.mode })),
-    probeError, diagnostics: ['capabilities_pending: V2 catalog reads do not qualify authentication, team launch or one-shot execution.'],
+    probeError, ...(probeRefusal ? { probeRefusal: true } : {}),
+    diagnostics: ['capabilities_pending: V2 catalog reads do not qualify authentication, team launch or one-shot execution.'],
     readStatus, readGeneration: 'v2' }
 }
 
@@ -30,8 +33,11 @@ export async function probeOpenCodeV2Inventory(native: OpenCodeV2NativeIdentity,
   let status = emptyOpenCodeV2ReadStatus(native, directory)
   let host: Awaited<ReturnType<typeof acquireOpenCodeV2ReadHost>> | undefined
   let reader: Awaited<ReturnType<typeof createOpenCodeV2ReadClient>> | undefined
-  let failure: string | null = null
+  let failure: string | null = null, refusal: OpenCodeV2Refusal | null = null
   try {
+    // The read host runs outside the sandbox; connect and launch do not. Refuse the catalog with
+    // the cause when this version or this Linux launcher would refuse every execution.
+    await assertOpenCodeV2ExecutionReady(native.version)
     host = await acquireOpenCodeV2ReadHost(native, directory, boundedContext)
     reader = await createOpenCodeV2ReadClient(host.authority, boundedContext)
     const sdk = reader.client, wrap = (value: unknown) => readWrapped(value, directory, projectId)
@@ -70,18 +76,22 @@ export async function probeOpenCodeV2Inventory(native: OpenCodeV2NativeIdentity,
     status = { ...status, projectId, catalog: 'ready', configuration, providers, models, agents,
       defaultModel: defaultRow ? { providerId: defaultRow.providerId, catalogId: defaultRow.catalogId } : null }
   } catch (error) {
-    // Only this fixed delivery fence is public; never serialize native errors.
+    // Only fixed texts are public; never serialize native errors.
+    refusal = openCodeV2Refusal(error)
     failure = error instanceof Error && error.message === 'v2_compiled_runtime_unsupported'
       ? 'V2 catalog reads require the packaged JS wrapper; compiled binary mode is unsupported.'
       : error instanceof Error && error.message === 'cleanup_unknown'
         ? 'V2 owned server cleanup unknown.'
-        : 'V2 read status unavailable; authentication and execution remain unqualified.'
+        : refusal?.message ?? 'V2 read status unavailable; authentication and execution remain unqualified.'
   } finally {
-    try { if (reader) await reader.dispose() } catch { failure = 'V2 HTTP cleanup unknown.' }
-    try { if (host) await host.close() } catch { failure = 'V2 owned server cleanup unknown.' }
+    // An unknown cleanup outranks a refusal: it is reported instead and stays retryable.
+    try { if (reader) await reader.dispose() } catch { failure = 'V2 HTTP cleanup unknown.'; refusal = null }
+    try { if (host) await host.close() } catch { failure = 'V2 owned server cleanup unknown.'; refusal = null }
   }
   if (failure) status = emptyOpenCodeV2ReadStatus(native, directory)
   let connected: OpenCodeConnectedProvider[] = []
   try { connected = await readOpenCodeV2ConnectedProviders(directory, native.version) } catch { /* Unknown receipts never display as connected. */ }
-  return openCodeV2InventorySnapshot(native, directory, status, failure, connected)
+  // Only a settled refusal leaves the retryable transient status; its text is shown either way.
+  return openCodeV2InventorySnapshot(native, directory, status, failure, connected,
+    refusal !== null && refusal.settled && failure === refusal.message)
 }

@@ -60,8 +60,8 @@ try {
   })
   closeObservedInitFD = fd => assert(pidfds.symbols.close(fd) === 0, 'fixture_pidfd_close_failed')
   const launcherVersion = await bound(linuxLauncherVersion('/usr/bin/bwrap'), 1500)
+  // The launcher is qualified by behaviour in planLinuxExecution; the version is recorded only.
   observations.push({ launcherVersion, launcherSha256: await linuxFileHash('/usr/bin/bwrap'), bun })
-  assert(launcherVersion === 'bubblewrap 0.13.0', 'fixture_requires_pinned_bwrap_0.13.0')
   const entry = await realpath(fileURLToPath(new URL('./linuxKernelChild.ts', import.meta.url)))
   const sourceRoot = path.resolve(path.dirname(entry), '../../../../..')
   sentinel = spawn(bun.path, [entry], { env: { TMPDIR: root, R247_FIXTURE_MODE: 'sentinel' },

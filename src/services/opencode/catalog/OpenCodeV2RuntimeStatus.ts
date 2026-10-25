@@ -4,24 +4,31 @@ import type { RuntimeExtensionCapability, RuntimeProviderStatus } from '../../ru
 /** Catalog availability never participates in authentication or protocol1 launch readiness. */
 export function buildOpenCodeV2RuntimeStatus(snapshot: OpenCodeInventorySnapshot): RuntimeProviderStatus {
   const read = snapshot.readStatus, ready = read?.catalog === 'ready'
+  // A named refusal (version not qualified here, Linux sandbox unavailable) is a settled
+  // answer, not a transient read failure: report it as unsupported with its cause.
+  const refused = Boolean(read) && !ready && snapshot.probeRefusal === true && Boolean(snapshot.probeError)
   const unavailable: RuntimeExtensionCapability = {
     status: 'unsupported', ownership: 'provider-scoped', reason: 'capabilities_pending',
   }
   const now = new Date().toISOString()
   const defaultId = read?.defaultModel ? `${read.defaultModel.providerId}/${read.defaultModel.catalogId}` : null
   return {
-    providerId: 'opencode', displayName: 'OpenCode (75+ LLM providers)', supported: Boolean(read),
+    providerId: 'opencode', displayName: 'OpenCode (75+ LLM providers)', supported: Boolean(read) && !refused,
     authenticated: false, authMethod: null, verificationState: 'unknown', canLoginFromUi: false,
     capabilities: { teamLaunch: false, oneShot: false,
       extensions: { plugins: unavailable, mcp: unavailable, skills: unavailable, apiKeys: unavailable } },
-    statusMessage: ready ? 'OpenCode V2 catalog available; capabilities_pending' : 'OpenCode read capabilities_pending',
-    detailMessage: 'Authentication, team launch and one-shot execution remain unqualified. Only an existing verified V2 native selection is supported for reads.',
+    statusMessage: ready ? 'OpenCode V2 catalog available; capabilities_pending' : refused ? 'OpenCode V2 is not available on this system'
+      : 'OpenCode read capabilities_pending',
+    // A failed full read names its cause (fixed text from the V2 inventory probe, never a native error).
+    detailMessage: read && !ready && snapshot.probeError ? snapshot.probeError
+      : 'Authentication, team launch and one-shot execution remain unqualified. Only an existing verified V2 native selection is supported for reads.',
     selectedBackendId: null, resolvedBackendId: null, availableBackends: [],
     externalRuntimeDiagnostics: [{ id: 'cli-bin', label: 'OpenCode CLI', detected: snapshot.detected,
       statusMessage: 'Read-scoped native selection', detailMessage: snapshot.binaryPath }],
     models: ready ? snapshot.models : [],
     backend: snapshot.detected ? { kind: 'opencode-cli', label: 'OpenCode CLI', authMethodDetail: null } : null,
-    statusCheckOutcome: ready ? 'model_only' : 'transient_error', statusCheckErrorCode: ready ? null : 'unavailable',
+    statusCheckOutcome: ready ? 'model_only' : refused ? 'authoritative' : 'transient_error',
+    statusCheckErrorCode: ready || refused ? null : 'unavailable',
     runtimeCapabilities: { modelCatalog: { dynamic: true, source: 'app-server' } },
     ...(read ? { openCodeReadStatus: read } : {}),
     modelCatalog: {

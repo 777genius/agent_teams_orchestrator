@@ -1,7 +1,8 @@
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { constants, fstatSync, readlinkSync } from 'node:fs'
-import { lstat, open, readFile, readlink, readdir, realpath, type FileHandle } from 'node:fs/promises'
+import { lstat, mkdir, mkdtemp, open, readFile, readlink, readdir, realpath, rm, symlink, writeFile, type FileHandle } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import path from 'node:path'
 import type { ExecutionBirth } from './OpenCodeV2ExecutionBinding.js'
 
@@ -118,6 +119,108 @@ export async function linuxLauncherVersion(launcher: string): Promise<string> {
     child.once('close', code => { clearTimeout(timer); code === 0 ? resolve(text.trim()) : reject(new Error(`execution_containment_launcher_version: ${errorText}`)) })
   })
 }
+// The namespace and privilege flags every V2 sandbox starts with. bwrap 0.8.0 added
+// the userns pair; an older launcher refuses them and fails the probe below.
+const LINUX_ISOLATION_ARGS = ['--unshare-user', '--disable-userns', '--assert-userns-disabled', '--unshare-pid', '--as-pid-1',
+  '--unshare-ipc', '--unshare-uts', '--die-with-parent', '--new-session', '--cap-drop', 'ALL', '--clearenv'] as const
+/** 0.12.0 is the first release that resolves setup paths inside the new root. Earlier
+ * releases follow an absolute symlink into /oldroot while creating a mount point
+ * (CVE-2026-87766, GHSA-pxhw-h44j-8pfx): a sandboxed process can plant one in a writable
+ * root and make the next sandbox setup create host paths. Ubuntu reverted its 0.9.0
+ * backport (USN-8779-2), so a distro version number alone proves nothing either way. */
+const LINUX_LAUNCHER_FLOOR = [0, 12, 0] as const
+/** Pure: true only for an exact `bubblewrap X.Y.Z` report at or above the floor. */
+export function linuxLauncherMeetsFloor(versionText: string): boolean {
+  const match = /^bubblewrap (\d{1,4})\.(\d{1,4})\.(\d{1,4})$/.exec(versionText.trim())
+  if (!match) return false
+  const version = match.slice(1).map(Number)
+  for (let index = 0; index < LINUX_LAUNCHER_FLOOR.length; index++) {
+    if (version[index]! !== LINUX_LAUNCHER_FLOOR[index]) return version[index]! > LINUX_LAUNCHER_FLOOR[index]!
+  }
+  return true
+}
+export type LinuxLauncherProbeEffects = Readonly<{ setupReached: boolean; escapedToHost: boolean }>
+/** Pure: any host-side effect fails closed; every case must also have reached setup. */
+export function classifyLinuxLauncherProbe(effects: readonly LinuxLauncherProbeEffects[]):
+  'qualified' | 'execution_containment_launcher_denied' | 'execution_containment_launcher_unsafe' {
+  if (effects.some(effect => effect.escapedToHost)) return 'execution_containment_launcher_unsafe'
+  return effects.length > 0 && effects.every(effect => effect.setupReached) ? 'qualified' : 'execution_containment_launcher_denied'
+}
+async function present(file: string): Promise<boolean> {
+  try { await lstat(file); return true } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+    throw error
+  }
+}
+/** The upstream advisory reproduction, once for each setup operation that creates a
+ * mount point (a directory, a directory bind and a file bind under a symlinked parent, and
+ * a file bind onto a symlink), against the exact launcher bytes inside a private temporary
+ * directory. Host-side effects decide; exit codes do not; a timeout fails closed. */
+async function probeLinuxLauncher(launcher: string): Promise<void> {
+  const base = await realpath(await mkdtemp(path.join(tmpdir(), 'opencode-v2-launcher-')))
+  try {
+    const root = path.join(base, 'root'), host = path.join(base, 'host')
+    const sourceDirectory = path.join(base, 'source-directory'), sourceFile = path.join(base, 'source-file')
+    for (const directory of [root, host, sourceDirectory]) await mkdir(directory, { mode: 0o700 })
+    await writeFile(sourceFile, '', { mode: 0o600 })
+    await symlink(`/oldroot${host}`, path.join(root, 'link'))
+    // The mount point itself may be the symlink too (a dangling one the file bind would create).
+    await symlink(`/oldroot${host}/escape-leaf`, path.join(root, 'leaf'))
+    const cases = [['--dir', '/link/escape-directory'], ['--bind', sourceDirectory, '/link/escape-bind'],
+      ['--ro-bind', sourceFile, '/link/escape-file'], ['--ro-bind', sourceFile, '/leaf']]
+    const effects: LinuxLauncherProbeEffects[] = []
+    for (const [index, operation] of cases.entries()) {
+      const child = spawn(launcher, [...LINUX_ISOLATION_ARGS, '--bind', root, '/', '--dir', `/setup-${index}`, ...operation,
+        '--', '/opencode-v2-launcher-probe'], { env: {}, stdio: 'ignore' })
+      let timedOut = false
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL') }, 3000)
+        child.once('error', error => { clearTimeout(timer); reject(error) })
+        child.once('close', () => { clearTimeout(timer); resolve() })
+      })
+      // A killed probe proves nothing about the step it did not finish: it fails closed.
+      effects.push({ setupReached: !timedOut && await present(path.join(root, `setup-${index}`)),
+        escapedToHost: (await readdir(host)).length > 0 })
+      if (!effects.at(-1)!.setupReached) break // Already refused; do not wait on the others.
+    }
+    const verdict = classifyLinuxLauncherProbe(effects)
+    assert(verdict === 'qualified', verdict)
+  } finally { await rm(base, { recursive: true, force: true }) }
+}
+async function qualifyLinuxLauncherOnce(launcher: string): Promise<void> {
+  let version: string
+  try { version = await linuxLauncherVersion(launcher) } catch { throw new Error('execution_containment_launcher_version_unknown') }
+  assert(linuxLauncherMeetsFloor(version), 'execution_containment_launcher_unsupported')
+  await probeLinuxLauncher(launcher)
+}
+const launcherQualifications = new Map<string, Promise<void>>()
+/** The version floor and the behaviour probe must both pass. Probed once per launcher
+ * identity and process; a refusal is probed again next time. */
+export function qualifyLinuxLauncher(launcher: string, launcherSha256: string): Promise<void> {
+  const key = `${launcherSha256}:${launcher}`
+  let work = launcherQualifications.get(key)
+  if (!work) {
+    const started = qualifyLinuxLauncherOnce(launcher)
+    launcherQualifications.set(key, started)
+    started.catch(() => { if (launcherQualifications.get(key) === started) launcherQualifications.delete(key) })
+    work = started
+  }
+  return work
+}
+/** The one launcher every Linux V2 sandbox uses: root-owned, not setuid/setgid or writable by
+ * group or others, and qualified. Provider status calls this before reporting a usable catalog. */
+export async function qualifyLinuxSystemLauncher(): Promise<Readonly<{ launcher: string; launcherSha256: string }>> {
+  let launcher: string
+  try { launcher = await realpath('/usr/bin/bwrap') } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw new Error('execution_containment_launcher_missing')
+    throw error
+  }
+  const stat = await lstat(launcher)
+  assert(stat.isFile() && stat.uid === 0 && (stat.mode & 0o6022) === 0, 'execution_containment_launcher_authority')
+  const launcherSha256 = await linuxFileHash(launcher)
+  await qualifyLinuxLauncher(launcher, launcherSha256)
+  return Object.freeze({ launcher, launcherSha256 })
+}
 export type LinuxLaunchPlan = Readonly<{ launcher: string; launcherSha256: string; args: readonly string[]; cwd: string; serialization: 'json' }>
 const plans = new WeakSet<LinuxLaunchPlan>()
 const planBinaries = new WeakMap<LinuxLaunchPlan, Readonly<{ path: string; sha256: string }>>()
@@ -133,12 +236,9 @@ export async function planLinuxExecution(requested: Readonly<{
   const input = structuredClone(requested)
   assert(process.platform === 'linux', 'execution_containment_platform_pending')
   await linuxPidfds()
-  const launcher = await realpath('/usr/bin/bwrap')
-  const stat = await lstat(launcher)
-  assert(stat.isFile() && (stat.mode & 0o6022) === 0, 'execution_containment_launcher_authority')
+  const { launcher, launcherSha256 } = await qualifyLinuxSystemLauncher()
   assert(await realpath(input.bun.path) === input.bun.path && await linuxFileHash(input.bun.path) === input.bun.sha256,
     'execution_identity_mismatch')
-  assert(await linuxLauncherVersion(launcher) === 'bubblewrap 0.13.0', 'execution_containment_launcher_version_pending')
   const mountinfo = await readFile('/proc/self/mountinfo', 'utf8')
   const authorityMounts = mountinfo.trim().split('\n').flatMap(line => {
     const fields = line.split(' '), split = fields.indexOf('-')
@@ -158,8 +258,7 @@ export async function planLinuxExecution(requested: Readonly<{
       assert(!(mount === root || mount.startsWith(root + '/')), 'execution_containment_authority_mount')
     }
   }
-  const args = ['--unshare-user', '--disable-userns', '--assert-userns-disabled', '--unshare-pid', '--as-pid-1',
-    '--unshare-ipc', '--unshare-uts', '--die-with-parent', '--new-session', '--cap-drop', 'ALL', '--clearenv']
+  const args: string[] = [...LINUX_ISOLATION_ARGS]
   // Start with an empty root, not a recursive bind of the controller's proc/sys.
   for (const directory of ['/usr', '/bin', '/lib', '/lib64', '/etc/ssl/certs']) {
     args.push('--ro-bind-try', directory, directory)
@@ -192,7 +291,9 @@ export async function planLinuxExecution(requested: Readonly<{
   // Matches the explicit parent spawn serialization; never guess a wrapper default.
   args.push('--setenv', 'NODE_CHANNEL_FD', '3', '--setenv', 'NODE_CHANNEL_SERIALIZATION_MODE', 'json',
     '--', input.bun.path, input.entry)
-  const plan = Object.freeze({ launcher, launcherSha256: await linuxFileHash(launcher), args: Object.freeze(args), cwd: input.cwd, serialization: 'json' as const })
+  // The probe and the launch must run the same bytes; the supervisor is checked against this digest.
+  assert(await linuxFileHash(launcher) === launcherSha256, 'execution_identity_mismatch')
+  const plan = Object.freeze({ launcher, launcherSha256, args: Object.freeze(args), cwd: input.cwd, serialization: 'json' as const })
   plans.add(plan); planBinaries.set(plan, Object.freeze({ ...input.bun })); return plan
 }
 
@@ -241,7 +342,9 @@ export function launchLinuxExecution(plan: LinuxLaunchPlan, nonce: string, lease
   const prepared = new Promise<Record<string, unknown>>((resolve, reject) => { preparedResolve = resolve; preparedReject = reject })
   void prepared.catch(() => undefined)
   child.once('error', () => preparedReject(new Error('execution_containment_spawn_failed')))
-  child.once('close', () => preparedReject(new Error(`execution_containment_launcher_denied: ${stderr}`)))
+  // The sandbox was built (init was found) but the child ended before it answered prepare.
+  // The launcher's own stderr stays in output(); the error carries only the fixed code.
+  child.once('close', () => preparedReject(new Error('execution_containment_launcher_exited')))
   child.on('message', value => {
     try {
       const message = row(value)

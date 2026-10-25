@@ -6,6 +6,9 @@ import { fileURLToPath } from 'node:url'
 const policyPath = /^(?:\.github\/workflows\/|scripts\/ci\/)/
 const platformPath = /^(?:package\.json$|bun\.lock$|tsconfig[^/]*\.json$|cli(?:-source)?$|install\.sh$|scripts\/(?:package-runtime\.ts$|runtime-bun-pins\.json$|opencode-v2\/|(?:build|compile)[^/]*)|features\/|src\/(?:native-ts\/|entrypoints\/|cli\/packagedOpenCodeDelivery[^/]*)|src\/utils\/(?:platform|nativeInstaller|subprocessEnv))/
 const lifecyclePath = /^(?:src\/services\/(?:runtimeBackends|teamBootstrap)\/|src\/features\/runtimeProviderManagement\/(?:application|adapters|domain|ports)\/|src\/utils\/(?:process(?:\.ts$|Kill\.)|genericProcessUtils|swarm\/|windowsNativeProcess)|src\/tools\/shared\/spawnMultiAgent|src\/cli\/(?:handlers\/(?:runtime|model(?:\.test)?\.ts$|anthropicCompatibleRuntime\.integration\.test\.ts$)|(?:runtimeStatusCommand|effectiveDefaultModel)\.entry\.test\.ts$)|scripts\/(?:opencode-.*conformance|smoke\/windows-runtime-opencode)|test\/fixtures\/opencode-generation-native\/)/
+// Real V2 execution runs only on Linux with a qualified bwrap, so its lane follows the V2
+// execution, catalog and provider code, not only native boundaries (host/ is not one).
+const v2LinuxPath = /^(?:src\/services\/opencode\/(?:host|execution|bridge|catalog|compatibility|transport|profile)\/|src\/entrypoints\/opencodeV2|src\/features\/runtimeProviderManagement\/adapters\/opencode\/|scripts\/opencode-v2\/|scripts\/ci\/opencode-v2-linux-execution\.sh$|patches\/)/
 const authorityPath = /^src\/services\/opencode\/(?:types\.ts$|recovery-contract\/|compatibility\/OpenCodeVersionProbe(?:\.ts$|\.helperBudget\.test\.ts$)|OpenCode[^/]*(?:Authority|Recovery|Identity|Attribution|Host|BinaryResolver|ProvisioningProbe|ExecutionProof|Launch|Startup|Stop|Cursor|Profile|Session|Native|OAuth|ExecutionProbe|ManagedPaths|AuthCoordination|AuthStore|RuntimeDeadline|EffectiveAgentPolicyContract|BridgePreconditions|BridgeCommandHandler|McpManager))/
 
 export function classify(paths: string[], full = false) {
@@ -14,6 +17,7 @@ export function classify(paths: string[], full = false) {
     native: String(native),
     authority_os: JSON.stringify(native ? ['ubuntu-latest', 'windows-latest'] : ['ubuntu-latest']),
     reason: full ? 'Explicit full validation request' : native ? 'CI policy, platform or process/provider lifecycle boundary changed' : 'Routine change: Linux authority, client/headless, ledger and Cursor checks; native jobs skipped',
+    v2_linux: String(native || paths.some(path => v2LinuxPath.test(path))),
   }
 }
 
@@ -37,7 +41,9 @@ export function aggregate(needs: Record<string, Need>): string {
   if (scope?.result !== 'success') throw new Error('Classifier failed, cancelled or skipped')
   const native = scope.outputs?.native
   const reason = scope.outputs?.reason
+  const v2Linux = scope.outputs?.v2_linux
   if (!['true', 'false'].includes(native ?? '') || !reason?.trim()) throw new Error('Missing classifier decision/reason')
+  if (!['true', 'false'].includes(v2Linux ?? '') || (native === 'true' && v2Linux !== 'true')) throw new Error('Missing V2 Linux decision')
   const required = ['cursor-managed-plugin', 'task-change-ledger', 'opencode-authority']
   const optional = ['windows-packaged-backfill', 'opencode-conformance', 'packaged-delivery']
   for (const job of [...required, ...optional]) {
@@ -45,6 +51,8 @@ export function aggregate(needs: Record<string, Need>): string {
     const allowedSkip = native === 'false' && optional.includes(job)
     if (result !== 'success' && !(allowedSkip && result === 'skipped')) throw new Error(`${job}: ${result ?? 'missing'}`)
   }
+  const v2Result = needs['opencode-v2-linux']?.result
+  if (v2Result !== 'success' && !(v2Linux === 'false' && v2Result === 'skipped')) throw new Error(`opencode-v2-linux: ${v2Result ?? 'missing'}`)
   return reason
 }
 
