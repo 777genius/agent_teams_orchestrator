@@ -391,6 +391,8 @@ jobs:
         with:
           bun-version: '1.4.2'
       - name: Produce physical JS and native front door
+        env:
+          RUNTIME_OPENCODE_V2: bundled
         run: bun scripts/package-runtime.ts --platform ${{ matrix.platform }}
       - name: Verify and archive complete candidate delivery
         shell: bash
@@ -454,6 +456,8 @@ jobs:
       - name: Test launcher qualification, refusal text and activation deadline
         run: bun test src/services/opencode/host/OpenCodeV2LinuxLauncherQualification.test.ts src/services/opencode/host/OpenCodeV2ExecutionReadiness.test.ts src/services/opencode/execution/OpenCodeV2RefusalReason.test.ts src/services/opencode/execution/OpenCodeV2ActivationDeadline.test.ts
       - name: Produce the packaged linux-x64 delivery
+        env:
+          RUNTIME_OPENCODE_V2: bundled
         run: bun scripts/package-runtime.ts --platform linux-x64
       - name: Start every qualified V2 version inside the real sandbox
         run: bash scripts/ci/opencode-v2-linux-execution.sh dist

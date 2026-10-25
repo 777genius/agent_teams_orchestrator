@@ -54,6 +54,8 @@ jobs:
         shell: pwsh
         env:
           PLATFORM: ${{ matrix.platform }}
+          # This identity check needs the V2 delivery, whatever the release setting is.
+          RUNTIME_OPENCODE_V2: bundled
         run: |
           bun install --frozen-lockfile --linker hoisted
           if ($LASTEXITCODE -ne 0) { throw 'Dependency install failed' }

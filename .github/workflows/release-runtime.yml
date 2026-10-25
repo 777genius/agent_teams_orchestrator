@@ -213,7 +213,12 @@ jobs:
       - name: Resolve OpenCode V2 delivery
         id: opencode-v2
         shell: bash
-        run: echo "delivery=$(bun ./scripts/opencode-v2/release-delivery.ts)" >> "$GITHUB_OUTPUT"
+        run: |
+          set -euo pipefail
+          delivery="$(bun ./scripts/opencode-v2/release-delivery.ts | tr -d '\r')"
+          case "$delivery" in bundled|off) ;; *) echo "Unexpected OpenCode V2 delivery: $delivery" >&2; exit 1 ;; esac
+          echo "delivery=$delivery" >> "$GITHUB_OUTPUT"
+          echo "OpenCode V2 delivery: \`$delivery\`" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Build packaged runtime deliveries
         env:

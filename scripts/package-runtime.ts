@@ -1,6 +1,7 @@
 import { openCodeBunVersion } from '../src/constants/openCodeBunVersion.js'
 import { createHash } from 'node:crypto'
-import { chmod, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, lstat, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
 import path from 'node:path'
 import { unzipSync } from 'fflate'
 import { validatePackagedOpenCodeIdentity } from '../src/cli/packagedOpenCodeDelivery.js'
@@ -50,8 +51,11 @@ function build(executable: string, buildArgs: string[]): void {
 // A release without OpenCode V2 ships only the compiled front door: no V2 graphs, no physical JS
 // delivery and no pinned Bun, and every command runs in the compiled runtime.
 if (openCodeV2ReleaseDelivery() === 'off') {
-  for (const leftover of ['./dist/local-cli', './dist/bun', './dist/build-bun', './dist/opencode-delivery.json'])
-    await rm(leftover, { recursive: true, force: true })
+  for (const leftover of ['./dist/local-cli', './dist/bun', './dist/build-bun', './dist/opencode-delivery.json']) {
+    const info = await lstat(leftover).catch(() => null)
+    if (info) await rm(leftover, { recursive: info.isDirectory(), force: true })
+    if (existsSync(leftover)) throw new Error(`Could not remove the V2 delivery from an earlier build: ${leftover}`)
+  }
   build(process.execPath, ['--compile', '--without-opencode-v2'])
   console.log(`Prepared compiled runtime without OpenCode V2 for ${platform}`)
   process.exit(0)
