@@ -836,9 +836,13 @@ describe('OpenCode Models.dev cache seeding', () => {
       expect(await seedOpenCodeModelsCache(input)).toBe('unavailable')
       expect(calls).toBe(1)
       clock += 120_000
+      const stale = Date.now() - 2 * OPEN_CODE_MODELS_CACHE_SEED_RETRY_MS
+      await markAt(stale)
       expect(await seedOpenCodeModelsCache({ ...input, exec: async () => { calls += 1; throw new Error('spawn failed') } }))
         .toBe('unavailable')
       expect(calls).toBe(2)
+      // The new failure moves the marker, restarting the window.
+      expect((await stat(marker)).mtimeMs).toBeGreaterThan(stale + OPEN_CODE_MODELS_CACHE_SEED_RETRY_MS)
       // A marker dated in the future (clock moved back) does not block seeding.
       await markAt(clock + 2 * 60 * 60_000)
       expect(await seedOpenCodeModelsCache(input)).toBe('unavailable')
