@@ -6305,6 +6305,35 @@ describe('OpenCodeProviderManagementAdapter', () => {
     })
   }
 
+  test('a model catalog read seeds the Models.dev cache before its host starts', async () => {
+    const events: string[] = []
+    const adapter = new OpenCodeProviderManagementAdapter({
+      ...catalogIdentityDependencies(),
+      inventoryService: {
+        probe: async () => inventory({ availableProviders: ['openrouter'], models: [] }),
+        seedModelsCache: async seeded => {
+          events.push(`seed:${seeded.binaryPath}`)
+          return 'seeded'
+        },
+      },
+      hostManager: {
+        ensureHost: async () => {
+          events.push('host')
+          return host()
+        },
+        releaseHost: async () => {},
+      },
+      clientFactory: { create: () => ({
+        getConfigProviders: async () => ({ providers: [{ id: 'openrouter', models: { 'moonshotai/kimi-k2': {} } }], default: {} }),
+        getProviders: async () => ({ all: [{ id: 'openrouter', name: 'OpenRouter' }], connected: ['openrouter'], default: {} }),
+        getProviderAuth: async () => ({}),
+      }) },
+    })
+    const result = await adapter.loadModels({ runtimeId: 'opencode', providerId: 'openrouter' })
+    expect(result.ok).toBe(true)
+    expect(events).toEqual([`seed:${inventory().binaryPath}`, 'host'])
+  })
+
   test('profile-only catalog retains exact input declarations from native HTTP model records', async () => {
     const model = 'openai/gpt-5.4-mini'
     const adapter = profileCatalogDeclarationAdapter({

@@ -1,4 +1,4 @@
-import { mkdir, writeFile } from 'node:fs/promises'
+import { mkdir, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import stripAnsi from 'strip-ansi'
 
@@ -88,6 +88,8 @@ export const OPEN_CODE_PROBE_TIMEOUT_MS = 10_000
 export const OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS = OPEN_CODE_PROBE_TIMEOUT_MS * 3
 export const OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS = OPEN_CODE_PROBE_TIMEOUT_MS * 6
 export const OPEN_CODE_MODEL_LIST_TIMEOUT_MS = 30_000
+// Seeding runs before a catalog host starts, inside the catalog read's own deadline.
+export const OPEN_CODE_MODELS_CACHE_SEED_TIMEOUT_MS = 15_000
 const OPEN_CODE_MODEL_REFRESH_OUTPUT_PROVIDER = 'opencode'
 const OPEN_CODE_CACHE_TTL_MS = 10_000
 const OPEN_CODE_INVENTORY_TIMEOUT_MESSAGE_PREFIX = 'OpenCode inventory probe timed out'
@@ -317,6 +319,41 @@ function getOpenCodeCatalogRefreshProfile(
       }),
     },
   }
+}
+
+export type OpenCodeModelsCacheSeed = 'present' | 'seeded' | 'unavailable'
+
+const modelsCacheSeeds = new Map<string, Promise<OpenCodeModelsCacheSeed>>()
+
+function isNonEmptyFile(filePath: string): Promise<boolean> {
+  return stat(filePath).then(info => info.isFile() && info.size > 0, () => false)
+}
+
+/**
+ * Until OpenCode's shared Models.dev cache exists, OpenCode answers from the
+ * model snapshot built into its release, which can still list models that
+ * Models.dev has deprecated since. Seed the cache once, before a catalog host
+ * starts, so a catalog reported as fresh is current. Best effort: if the refresh
+ * fails (for example offline), OpenCode keeps its snapshot, as before.
+ */
+export function seedOpenCodeModelsCache(input: {
+  binaryPath: string | null
+  profile: OpenCodePreparedProfile | null
+  exec: (binaryPath: string, args: string[], profile: OpenCodePreparedProfile) => Promise<OpenCodeCommandResult>
+}): Promise<OpenCodeModelsCacheSeed> {
+  const { binaryPath, profile } = input
+  if (!binaryPath || !profile?.xdgCacheHome) return Promise.resolve('unavailable')
+  const cacheFile = path.join(profile.xdgCacheHome, 'opencode', 'models.json')
+  const pending = modelsCacheSeeds.get(cacheFile)
+  if (pending) return pending
+  const seed = (async (): Promise<OpenCodeModelsCacheSeed> => {
+    if (await isNonEmptyFile(cacheFile)) return 'present'
+    await input.exec(binaryPath, getOpenCodeRefreshModelsArgs(), getOpenCodeCatalogRefreshProfile(profile))
+      .catch(() => undefined)
+    return await isNonEmptyFile(cacheFile) ? 'seeded' : 'unavailable'
+  })().finally(() => modelsCacheSeeds.delete(cacheFile))
+  modelsCacheSeeds.set(cacheFile, seed)
+  return seed
 }
 
 const EMPTY_OPEN_CODE_COMMAND_RESULT: OpenCodeCommandResult = {
@@ -964,6 +1001,21 @@ export class OpenCodeInventoryService {
 
   clearCache(): void {
     this.cache.clear()
+  }
+
+  /** See seedOpenCodeModelsCache; call it before a catalog host starts. */
+  seedModelsCache(
+    inventory: Pick<OpenCodeInventorySnapshot, 'binaryPath' | 'profile'>,
+    options: { abortSignal?: AbortSignal; progress?: OpenCodeInventoryProbeProgressTracker } = {},
+  ): Promise<OpenCodeModelsCacheSeed> {
+    return seedOpenCodeModelsCache({
+      binaryPath: inventory.binaryPath,
+      profile: inventory.profile,
+      exec: (binaryPath, args, profile) => this.execOpenCode(binaryPath, args, profile, {
+        ...options,
+        timeoutMs: OPEN_CODE_MODELS_CACHE_SEED_TIMEOUT_MS,
+      }),
+    })
   }
 
   private getCommandFailureMessage(

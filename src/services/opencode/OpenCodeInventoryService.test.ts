@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { access, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
+import { access, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
@@ -23,6 +23,7 @@ import {
   parseOpenCodeModelsOutput,
   parseOpenCodeModelsVerboseOutput,
   parseOpenCodeProvidersOutput,
+  seedOpenCodeModelsCache,
   supportsOpenCodeSuperGrokOAuth,
   withOpenCodeInventoryProbeTimeout,
 } from './OpenCodeInventoryService.js'
@@ -758,4 +759,53 @@ llama.cpp/qwen3-coder:a3b local
     ).toBe(32768)
     expect(isOpenCodeModelFree('opencode/qwen3.6-plus-free', [])).toBe(false)
   })
+})
+
+describe('OpenCode Models.dev cache seeding', () => {
+  async function withCacheHome<T>(run: (cacheHome: string, cacheFile: string) => Promise<T>): Promise<T> {
+    const cacheHome = await mkdtemp(path.join(tmpdir(), 'TEST-opencode-models-cache-'))
+    try {
+      return await run(cacheHome, path.join(cacheHome, 'opencode', 'models.json'))
+    } finally {
+      await rm(cacheHome, { recursive: true, force: true })
+    }
+  }
+  const profile = (xdgCacheHome: string) =>
+    ({ xdgCacheHome, env: { XDG_CACHE_HOME: xdgCacheHome } }) as unknown as OpenCodePreparedProfile
+
+  test('a cold profile is refreshed once, through the plugin-free catalog profile, before it is used', () =>
+    withCacheHome(async (cacheHome, cacheFile) => {
+      const calls: { args: string[]; config: unknown }[] = []
+      const exec = async (_binary: string, args: string[], used: OpenCodePreparedProfile) => {
+        calls.push({ args, config: JSON.parse(used.env.OPENCODE_CONFIG_CONTENT ?? 'null') })
+        await new Promise(resolve => setTimeout(resolve, 20))
+        await mkdir(path.dirname(cacheFile), { recursive: true })
+        await writeFile(cacheFile, '{"opencode":{}}')
+        return { stdout: 'Models cache refreshed\n', stderr: '', code: 0 }
+      }
+      const input = { binaryPath: '/TEST/opencode', profile: profile(cacheHome), exec }
+      // Concurrent catalog reads share one refresh.
+      expect(await Promise.all([seedOpenCodeModelsCache(input), seedOpenCodeModelsCache(input)]))
+        .toEqual(['seeded', 'seeded'])
+      expect(calls).toEqual([{ args: getOpenCodeRefreshModelsArgs(), config: { autoupdate: false, plugin: [], mcp: {} } }])
+      // A seeded cache is left to OpenCode's own refresh.
+      expect(await seedOpenCodeModelsCache(input)).toBe('present')
+      expect(calls).toHaveLength(1)
+    }))
+
+  test('a failed refresh keeps the previous behavior without throwing', () =>
+    withCacheHome(async cacheHome => {
+      let calls = 0
+      const failing = { binaryPath: '/TEST/opencode', profile: profile(cacheHome), exec: async () => {
+        calls += 1
+        return { stdout: '', stderr: 'getaddrinfo ENOTFOUND models.dev', code: 1 }
+      } }
+      expect(await seedOpenCodeModelsCache(failing)).toBe('unavailable')
+      expect(await seedOpenCodeModelsCache({ ...failing, exec: async () => { calls += 1; throw new Error('spawn failed') } }))
+        .toBe('unavailable')
+      expect(calls).toBe(2)
+      for (const missing of [{ binaryPath: null, profile: profile(cacheHome) }, { binaryPath: '/TEST/opencode', profile: null }])
+        expect(await seedOpenCodeModelsCache({ ...missing, exec: async () => { throw new Error('must not run') } }))
+          .toBe('unavailable')
+    }))
 })
