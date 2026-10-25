@@ -436,6 +436,36 @@ jobs:
           Copy-Item dist/cursor-managed release/runtime/cursor-managed -Recurse
           Compress-Archive -Path release/runtime -DestinationPath "release/${{ matrix.archive_name }}" -Force
 
+      - name: Serve every staged V2 graph from the release archive
+        if: runner.os != 'Windows' && matrix.platform != 'win32-arm64'
+        timeout-minutes: 10
+        shell: bash
+        env:
+          ARCHIVE_NAME: ${{ matrix.archive_name }}
+        run: |
+          set -euo pipefail
+          # Outside the checkout, so module resolution cannot fall back to the source install.
+          extracted="$RUNNER_TEMP/TEST-release-server-smoke"
+          rm -rf "$extracted"
+          mkdir -p "$extracted"
+          tar -xzf "release/$ARCHIVE_NAME" -C "$extracted"
+          "$extracted/runtime/bun/bun" --no-env-file scripts/opencode-v2/packaged-server-smoke.ts "$extracted/runtime" "$RUNNER_TEMP/packaged-server-smoke.json"
+
+      - name: Serve every staged V2 graph from the release archive (Windows)
+        if: runner.os == 'Windows'
+        timeout-minutes: 10
+        shell: pwsh
+        env:
+          ARCHIVE_NAME: ${{ matrix.archive_name }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          # Outside the checkout, so module resolution cannot fall back to the source install.
+          $extracted = Join-Path $env:RUNNER_TEMP 'TEST-release-server-smoke'
+          Remove-Item $extracted -Recurse -Force -ErrorAction SilentlyContinue
+          Expand-Archive -Path "release/$env:ARCHIVE_NAME" -DestinationPath $extracted
+          & (Join-Path $extracted 'runtime/bun/bun.exe') --no-env-file scripts/opencode-v2/packaged-server-smoke.ts (Join-Path $extracted 'runtime') (Join-Path $env:RUNNER_TEMP 'packaged-server-smoke.json')
+          if ($LASTEXITCODE -ne 0) { throw 'Staged V2 server smoke failed' }
+
       - name: Rename archive to versioned asset name
         id: versioned-archive
         env:
