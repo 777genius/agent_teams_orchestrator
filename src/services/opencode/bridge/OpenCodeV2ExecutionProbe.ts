@@ -10,6 +10,7 @@ import { collectProjectBehaviorMetadata } from '../OpenCodeProfileManager.js'
 import { executionAssert, executionHash, executionRecord } from '../execution/OpenCodeV2ExecutionContracts.js'
 import { buildOpenCodeV2InternalRunPlan, type inspectOpenCodeV2SourceAvailability } from './OpenCodeV2LaunchPlan.js'
 import { launchExplicitOpenCodeV2Run } from './OpenCodeV2RunOwner.js'
+import { ensureOpenCodeV2ProbeStore } from './OpenCodeV2ProbeStore.js'
 import { OPEN_CODE_V2_RUN_INITIALIZATION_MS, discoverOpenCodeV2Run, awaitOpenCodeV2RunMemberReadiness, requestOpenCodeV2Run, parseRunControlRequest, isTransientOpenCodeV2ControlRead } from './OpenCodeV2RunControl.js'
 import type { OpenCodeExecutionProof } from '../types.js'
 import type { BridgeEnvelope } from './OpenCodeBridgeProtocol.js'
@@ -17,6 +18,7 @@ import type { RunBinding, RunProbeFailure } from './OpenCodeV2RunTypes.js'
 import type { QueueIntent } from '../execution/OpenCodeV2AdmissionService.js'
 
 type Selection = Awaited<ReturnType<typeof inspectOpenCodeV2SourceAvailability>>
+export type OpenCodeV2ProbeIntent = { sourceKey: string; binding: RunBinding; sessionID: string; intentHash: string }
 type ProbeRecord = { sourceKey: string; binding: RunBinding; sessionID: string; intent: QueueIntent;
   submitted: boolean; proof: OpenCodeExecutionProof | null; retired: boolean; failure: RunProbeFailure | null }
 function parseProbeFailure(value: unknown): RunProbeFailure | null {
@@ -54,7 +56,8 @@ function parseRecord(value: unknown): ProbeRecord {
 /** Normal readiness protocol. The cached proof is a result of this owned producer,
  * never a public caller proof DTO. UNKNOWN retains the original IDs and only observes. */
 export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, selection: Selection, run: boolean,
-  options: { unattendedTeam?: boolean } = {}) {
+  options: { unattendedTeam?: boolean; onPrepared?: (sourceKey: string) => Promise<void>;
+    onIntentPersisted?: (value: OpenCodeV2ProbeIntent) => Promise<void>; requireExisting?: OpenCodeV2ProbeIntent } = {}) {
   const unattendedTeam = options.unattendedTeam === true
   const deadline = Date.now() + Math.max(1, Math.min(envelope.timeoutMs || 120_000, 300_000) - 25_000)
   const assertDeadline = () => executionAssert(Date.now() < deadline, 'execution_timeout')
@@ -63,12 +66,13 @@ export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, 
   const sourceKey = executionHash({ project: selection.project, scopeToken: selection.scope.scopeToken, selectedAuthIdentity: selection.scope.selectedAuthIdentity, source: selection.behaviorFingerprint, graph: selection.installedGraphSHA256,
     projectBehavior: behavior.projectBehaviorFingerprint, variant, ...(unattendedTeam ? { unattendedTeam: true } : {}) })
   const requestedDataRoot = path.resolve(resolveClaudeMultimodelPaths().data)
+  await options.onPrepared?.(sourceKey)
   assertDeadline()
   let dataRoot: string, directory: string, file: string, guard: string
   {
-    await privateDirectory(requestedDataRoot, true)
-    dataRoot = await realpath(requestedDataRoot)
-    directory = path.join(dataRoot, 'opencode/v2/execution-probes', sourceKey)
+    const store = await ensureOpenCodeV2ProbeStore(requestedDataRoot)
+    dataRoot = store.dataRoot
+    directory = path.join(store.probeRoot, sourceKey)
     await privateDirectory(directory)
     file = path.join(directory, 'probe.json'); guard = path.join(directory, 'owner.lock')
     await writeFile(guard, '', { flag: 'ax', mode: 0o600 }).catch((error: unknown) => {
@@ -100,11 +104,19 @@ export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, 
       assertDeadline()
       if (record) executionAssert(record.sourceKey === sourceKey, 'probe_source_changed')
     } catch (error) { if (executionRecord(error).code !== 'ENOENT') throw error }
+    if (options.requireExisting) {
+      executionAssert(record && executionHash({ sourceKey, binding: record.binding, sessionID: record.sessionID,
+        intentHash: executionHash(record.intent) }) === executionHash(options.requireExisting), 'probe_original_intent_changed')
+      if (record.proof && record.retired && Date.parse(record.proof.expiresAt) <= Date.now())
+        return { state: 'pending' as const, proof: null, reason: 'The original qualified proof expired; no replacement input was submitted.' }
+    }
     if (record?.proof) executionAssert(record.proof.projectPath === normalizeOpenCodeProjectIdentity(selection.project) && record.proof.modelId === `${selection.model.providerID}/${selection.model.id}` &&
       record.proof.capabilitySnapshotId === selection.capabilitySnapshotId && record.proof.opencodeVersion === selection.native.version &&
       record.proof.binaryPath === selection.native.executablePath && record.proof.projectBehaviorFingerprint === behavior.projectBehaviorFingerprint, 'probe_cached_target_changed')
-    if (record?.proof && record.retired && Date.parse(record.proof.expiresAt) > Date.now())
+    if (record?.proof && record.retired && Date.parse(record.proof.expiresAt) > Date.now()) {
+      await options.onIntentPersisted?.({ sourceKey, binding: record.binding, sessionID: record.sessionID, intentHash: executionHash(record.intent) })
       return { state: 'available' as const, proof: record.proof, reason: null }
+    }
     if (record?.failure && (record.retired || !run)) return { state: 'failed' as const, proof: null,
       reason: record.retired ? record.failure : `${record.failure}; probe_physical_cleanup_unknown` }
     // A retained unresolved attempt never allocates another session or input.
@@ -141,8 +153,10 @@ export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, 
       const member = plan.members[0]; executionAssert(member, 'probe_plan_invalid')
       record = { sourceKey, binding: plan.binding, sessionID: member.originalSessionId, intent, submitted: false, proof: null, retired: false, failure: null }
       await save(record) // Original identities precede launch and every prompt effect.
+      await options.onIntentPersisted?.({ sourceKey, binding: record.binding, sessionID: record.sessionID, intentHash: executionHash(record.intent) })
+      assertDeadline()
       await launchExplicitOpenCodeV2Run(plan)
-    }
+    } else await options.onIntentPersisted?.({ sourceKey, binding: record.binding, sessionID: record.sessionID, intentHash: executionHash(record.intent) })
     const owner = await discoverOpenCodeV2Run(dataRoot, record.binding.teamId, record.binding.runId)
     assertDeadline()
     if (!owner) return { state: record.failure ? 'failed' as const : 'pending' as const, proof: null,
