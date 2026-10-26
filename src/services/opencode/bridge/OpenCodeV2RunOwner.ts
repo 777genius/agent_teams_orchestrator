@@ -1,3 +1,4 @@
+import { assertOpenCodeV2GroupBinding, buildOpenCodeV2GroupProof } from './OpenCodeV2GroupChat.js'
 import { openCodeV2EngineVersion } from '../compatibility/OpenCodeV2Registry.js'
 import { openCodeBunVersion } from '../../../constants/openCodeBunVersion.js'
 import { assertOpenCodeV2Launchable } from '../compatibility/OpenCodeV2Registry.js'
@@ -424,6 +425,16 @@ export class OpenCodeV2RunOwner {
       executionAssert(client.authority === member.lease.authority && this.state === 'active', 'run_stopped')
       verifyExecutionSession(member.authority, await client.getSession(member.authority.sessionID))
       const id = member.authority.sessionID
+      if (request.operation === 'groupProof' || request.operation === 'send' && request.intent.group) {
+        executionAssert(this.plan.qualification && member.bootstrap?.verified && member.mcpConnected, 'GROUP_RECIPIENT_INCOMPATIBLE')
+        member.controllerTools = await readOwnedControllerTools(client, member.plan.profile, member.plan.controllerMcpName, deadline, signal)
+        executionAssert(this.state === 'active' && !signal.aborted && !member.lease.signal.aborted, 'run_stopped')
+        const status = this.statuses().find(row => row.memberId === member.plan.memberId)!
+        const proof = buildOpenCodeV2GroupProof(this.plan.binding, status, member.controllerTools)
+        if (request.operation === 'groupProof') return { kind: 'groupProof', proof }
+        executionAssert(proof, 'GROUP_RECIPIENT_INCOMPATIBLE')
+        assertOpenCodeV2GroupBinding(request.intent.group!, this.plan.binding, proof, status)
+      }
       if (request.operation === 'probeEvidence') {
         const probe = this.plan.executionProbe
         executionAssert(probe && probe.memberId === member.plan.memberId && member.probeAuthority, 'probe_not_owned')
@@ -497,7 +508,7 @@ export class OpenCodeV2RunOwner {
       const controllerInbox = await readOwnedControllerInbox(member.plan.profile, member.controllerTools, controllerBinding, deadline, signal)
       const turn = projectOpenCodeV2Turn({ pin: client.authority.pin, sessionID: id, nativeInputID: intent.identity.nativeInputID,
         beforeCursor: admission.beforeCursor, originalText: intent.input.text, ...cut,
-        inboundMessageId: intent.identity.localMessageId, advertisedTools: member.controllerTools.nativeNames,
+        inboundMessageId: intent.identity.localMessageId, group: intent.group, advertisedTools: member.controllerTools.nativeNames,
         controllerBinding, controllerInbox })
       return { kind: 'observe', admission, turn }
     } finally { await client.dispose() }

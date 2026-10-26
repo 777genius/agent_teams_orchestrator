@@ -1,3 +1,4 @@
+import type { OpenCodeGroupChatRunProof } from '../OpenCodeGroupChatCapability.js'
 import type { OpenCodePreparedProfile, OpenCodeExecutionProof } from '../types.js'
 import type { ControllerToolProof } from './OpenCodeV2ControllerTools.js'
 import type { QueueIntent } from '../execution/OpenCodeV2AdmissionService.js'
@@ -44,6 +45,7 @@ export type RunControlRequest =
   | (MemberRequest & Readonly<{ operation: 'transcript' }>)
   | (MemberRequest & Readonly<{ operation: 'permissions' }>)
   | (MemberRequest & Readonly<{ operation: 'mcp' }>)
+  | (MemberRequest & Readonly<{ operation: 'groupProof' }>)
   | (MemberRequest & Readonly<{ operation: 'probeEvidence' }>)
   | (MemberRequest & Readonly<{ operation: 'permissionReply'; requestId: string; decision: 'allow' | 'deny' }>)
   | Readonly<{ operation: 'stop' }>
@@ -68,6 +70,7 @@ export type RunControlResult =
   | Readonly<{ kind: 'permissions'; requests: ExecutionPermission[] }>
   | Readonly<{ kind: 'permissionReply'; status: 'applied' | 'unknown' }>
   | Readonly<{ kind: 'mcp'; servers: ExecutionMcpServer[] }>
+  | Readonly<{ kind: 'groupProof'; proof: OpenCodeGroupChatRunProof | null }>
   | Readonly<{ kind: 'probeEvidence'; proof: OpenCodeExecutionProof | null; failure: RunProbeFailure | null }>
   | Readonly<{ kind: 'status'; qualification?: RunQualification; state: RunOwnerState; members: readonly RunMemberStatus[]; deadline: number }>
   | Readonly<{ kind: 'stop'; state: 'stopped' | 'cleanup_unknown'; members: readonly RunStopMember[]; ownerRetired?: boolean }>

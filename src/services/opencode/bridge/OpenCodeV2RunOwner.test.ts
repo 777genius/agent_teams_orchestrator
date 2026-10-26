@@ -37,7 +37,7 @@ const intent: QueueIntent = { delivery: 'queue', identity: {
   requestId: 'request', deliveryAttemptId: 'attempt', localMessageId: 'local', nativeInputID: 'msg_TESTinput',
 }, input: { nativeInputID: 'msg_TESTinput', text: 'hello worker', resume: true } }
 
-async function fixture(options: { unknown?: boolean; foreignClient?: boolean; createUnknown?: boolean;
+async function fixture(options: { groupTools?: boolean; unknown?: boolean; foreignClient?: boolean; createUnknown?: boolean;
   probe?: boolean; promptBarrier?: Promise<void>; closeBarrier?: Promise<void>; permissionResources?: string[];
   lifetimeMs?: number; twoMembers?: boolean; memberCount?: number; preparation?: () => void; startup?: () => void;
   graphValidations?: unknown[];
@@ -69,11 +69,14 @@ async function fixture(options: { unknown?: boolean; foreignClient?: boolean; cr
         executableSha256: 'b'.repeat(64), packageName: '@opencode/cli-linux-x64', runtimeMode: 'source', entrySha256: 'e'.repeat(64),
         bun: { path: '/TEST-bun', sha256: 'c'.repeat(64) }, graph: { sha256: 'a'.repeat(64), files: [] } },
       profile: { epoch: 'TEST-epoch', root: '/TEST-profile', directory: '/TEST-project', databasePath: '/TEST-profile/data/db',
-        env: {}, envSha256: 'f'.repeat(64), config: { directory: '/TEST-profile/config', content: JSON.stringify({ mcp: { servers: { 'agent-teams': { type: 'local', command: [process.execPath, fileURLToPath(new URL('./fixtures/OpenCodeV2ControllerToolsPeer.ts', import.meta.url))] } } } }), sha256: 'f'.repeat(64) },
+        env: {}, envSha256: 'f'.repeat(64), config: { directory: '/TEST-profile/config', content: JSON.stringify({ mcp: { servers: { 'agent-teams': { type: 'local', command: [process.execPath, fileURLToPath(new URL('./fixtures/OpenCodeV2ControllerToolsPeer.ts', import.meta.url)), ...(options.groupTools ? ['--group-tools'] : [])] } } } }), sha256: 'f'.repeat(64) },
         selection: { agent: 'worker', model: { providerID: 'TEST-provider', id: 'TEST-model' }, permissions: options.permissions ?? [{ action: '*', resource: '*', effect: 'ask' }] } },
       bootstrap: { key: 'test.context', value, contextHash: createHash('sha256').update(value).digest('hex'), briefingHash: 'f'.repeat(64) },
       controllerMcpName: 'agent-teams', advertisedTools: ['message_send'] }],
   }
+  if (options.groupTools !== undefined) plan = { ...plan, qualification: {
+    capabilitySnapshotId: 'TEST-group-capability', expectedBehaviorFingerprint: 'a'.repeat(64),
+    binaryPath: '/TEST-opencode', binaryFingerprint: 'TEST-native', version: '2.0.32' } }
   if (options.probe) {
     const member = plan.members[0]!, config = JSON.parse(member.profile.config.content)
     plan = { ...plan, members: [{ ...member, profile: { ...member.profile, root, directory: authority.directory } }], executionProbe: { memberId: member.memberId, intent, expectedText: 'done', capabilitySnapshotId: 'TEST-capability',
@@ -1074,4 +1077,32 @@ test('owner entry diagnostics preserve exit without changing ignored stderr owne
   expect(JSON.parse(projectRunOwnerEntryFailure(5, null))).not.toHaveProperty('nativeExitCode')
   expect(JSON.parse(projectRunOwnerEntryFailure(5, -1))).not.toHaveProperty('nativeExitCode')
   expect(JSON.parse(projectRunOwnerEntryFailure(5, 0)).nativeExitCode).toBe(0)
+})
+
+
+test('group proof reads the original native session and fresh MCP tools without native input', async () => {
+  const f = await fixture({ groupTools: true })
+  try {
+    await f.owner.ready()
+    const clients = f.counters.clients
+    const result = await f.owner.execute({ operation: 'groupProof', ...f.selected }, Date.now() + 5000)
+    expect(result).toEqual({ kind: 'groupProof', proof: {
+      teamName: 'TEST-team', memberName: 'worker', runId: 'TEST-run', runKey: 'TEST-run',
+      laneId: 'primary', runtimePid: 42, runtimeSessionId: 'ses_TESToriginal', processorReady: true, groupReactionProtocolVersion: 1 } })
+    expect(f.counters.clients).toBeGreaterThan(clients)
+    expect(f.counters.prompted).toBe(0)
+    await expect(f.owner.execute({ operation: 'groupProof', ...f.selected, originalSessionId: 'ses_wrong' }, Date.now() + 5000)).rejects.toThrow()
+    f.native.mcp = async () => [{ name: 'agent-teams', status: 'disconnected' }]
+    await expect(f.owner.execute({ operation: 'groupProof', ...f.selected }, Date.now() + 5000)).rejects.toThrow('run_controller_mcp_unknown')
+    expect(f.counters.prompted).toBe(0)
+  } finally { await f.close() }
+})
+
+test('ordinary live native session without group MCP tools never receives a group capability', async () => {
+  const f = await fixture({ groupTools: false })
+  try {
+    await f.owner.ready()
+    expect(await f.owner.execute({ operation: 'groupProof', ...f.selected }, Date.now() + 5000)).toEqual({ kind: 'groupProof', proof: null })
+    expect(f.counters.prompted).toBe(0)
+  } finally { await f.close() }
 })

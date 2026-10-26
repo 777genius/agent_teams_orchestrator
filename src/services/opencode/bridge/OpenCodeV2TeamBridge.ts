@@ -1,3 +1,5 @@
+import { assertOpenCodeV2GroupBinding, assertOpenCodeV2GroupProof, openCodeV2GroupPrompt, parseOpenCodeV2GroupDelivery } from './OpenCodeV2GroupChat.js'
+import type { OpenCodeGroupChatRunProof } from '../OpenCodeGroupChatCapability.js'
 import { COMPLETED_NON_RESPONSE_REASON, isOpenCodeNonResponseText } from '../OpenCodeCompletedNonResponse.js'
 import { openCodeV2EngineVersion } from '../compatibility/OpenCodeV2Registry.js'
 import { openCodeBunVersion } from '../../../constants/openCodeBunVersion.js'
@@ -207,9 +209,14 @@ export function projectV2DeliveryObservation(turn: OpenCodeV2TurnProjection | nu
 }
 
 /** Immutable per-delivery native identity; recovery never allocates a successor. */
-export function createV2ProtocolQueueIntent(envelope: BridgeEnvelope): QueueIntent {
+export function createV2ProtocolQueueIntent(envelope: BridgeEnvelope, groupProof?: OpenCodeGroupChatRunProof): QueueIntent {
   const body = envelope.body
   executionAssert(body.noReply !== true && body.system === undefined, 'unsupported_v1_input')
+  const group = parseOpenCodeV2GroupDelivery(body, required(body.messageId, 'messageId'))
+  if (group) executionAssert(groupProof && groupProof.runKey === group.groupRunKey &&
+    groupProof.teamName === (body.teamId ?? body.teamName) && groupProof.memberName === body.memberName &&
+    groupProof.laneId === body.laneId &&
+    ((body.runtimeSessionId ?? body.sessionId) === undefined || groupProof.runtimeSessionId === (body.runtimeSessionId ?? body.sessionId)), 'GROUP_RECIPIENT_INCOMPATIBLE')
   const parts = parseOpenCodePromptFileParts(body.fileParts ?? body.parts)
   const files = parts.map(part => {
     executionAssert(part.type === 'file', 'invalid_file_part')
@@ -226,7 +233,8 @@ export function createV2ProtocolQueueIntent(envelope: BridgeEnvelope): QueueInte
     requestId: identity.requestId, deliveryAttemptId: identity.deliveryAttemptId, localMessageId: identity.localMessageId,
   })).digest('hex')}`
   assertIntentIdentity(identity)
-  return { identity, input: { nativeInputID: identity.nativeInputID, text: required(body.text, 'text'), resume: true,
+  return { identity, ...(group ? { group } : {}), input: { nativeInputID: identity.nativeInputID,
+    text: group ? openCodeV2GroupPrompt(group, identity.localMessageId, required(body.teamId ?? body.teamName, 'teamId'), required(body.memberName, 'memberName')) : required(body.text, 'text'), resume: true,
     ...(files.length > 0 ? { files } : {}) }, delivery: 'queue' }
 }
 
@@ -319,6 +327,16 @@ async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: O
         originalIdentity.runtime.binaryFingerprint = measured.binaryFingerprint
         originalIdentity.runtime.version = measured.version
         originalIdentity.featureFlags.opencodeStateChangingCommands = true
+        if (text(body.memberName) && openCodeV2SupportedSourcePredicate(owner)) {
+          const member = await bridge.resolveMember(required(body.memberName, 'memberName'), text(body.laneId), text(body.runtimeSessionId ?? body.sessionId), 8000)
+          const group = await bridge.call({ operation: 'groupProof', memberId: member.memberId, originalSessionId: member.originalSessionId }, 8000)
+          executionAssert(group.kind === 'groupProof', 'GROUP_RECIPIENT_INCOMPATIBLE')
+          if (group.proof) {
+            assertOpenCodeV2GroupProof({ teamId: required(body.teamId ?? body.teamName, 'teamId'), runId: required(body.runId, 'runId') }, group.proof, member)
+            originalIdentity.bridgeProtocol.groupChatProtocolVersion = 1
+            originalIdentity.runtime.groupChatRunProof = group.proof
+          }
+        }
         const originalHandshake = { schemaVersion: 1, requestId: envelope.requestId, client: body.client ?? originalIdentity,
           server: originalIdentity, agreedProtocolVersion: 1,
           acceptedCommands: SUPPORTED_COMMANDS.filter(command => command !== 'opencode.stopOutcome' && command !== 'opencode.reconcileStop'),
@@ -446,8 +464,16 @@ async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: O
         const memberId = required(body.memberName, 'memberName')
         const member = await bridge.resolveMember(memberId, text(body.laneId), text(body.runtimeSessionId ?? body.sessionId), remaining())
         const originalSessionId = member.originalSessionId
+        const group = parseOpenCodeV2GroupDelivery(body, required(body.messageId, 'messageId'))
+        let groupProof: OpenCodeGroupChatRunProof | undefined
+        if (group) {
+          const observed = await bridge.call({ operation: 'groupProof', memberId, originalSessionId }, remaining())
+          executionAssert(observed.kind === 'groupProof' && observed.proof, 'GROUP_RECIPIENT_INCOMPATIBLE')
+          assertOpenCodeV2GroupBinding(group, { teamId: required(body.teamId ?? body.teamName, 'teamId'), runId: required(body.runId, 'runId') }, observed.proof, member)
+          groupProof = observed.proof
+        }
         const data = await bridge.send({ operation: 'send', memberId, originalSessionId,
-          intent: createV2ProtocolQueueIntent(envelope) }, {
+          intent: createV2ProtocolQueueIntent(envelope, groupProof) }, {
           requestId: envelope.requestId, body, teamId: required(body.teamId ?? body.teamName, 'teamId'),
           teamName: text(body.teamName) ?? required(body.teamId, 'teamId'), laneId: required(body.laneId, 'laneId'),
           memberName: memberId, projectPath: text(body.projectPath) ?? envelope.cwd, runId: required(body.runId, 'runId'),

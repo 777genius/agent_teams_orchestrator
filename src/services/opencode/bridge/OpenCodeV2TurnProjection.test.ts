@@ -294,3 +294,41 @@ test('counts native tools even when absent from advertised controller effects', 
   expect(projected.toolEffects).toEqual([])
   expect(projected.observedToolCallCount).toBe(1)
 })
+
+const groupDelivery = { groupChatId: '11111111-1111-4111-8111-111111111111',
+  groupMessageId: '22222222-2222-4222-8222-222222222222', groupRunKey: 'TEST-run', groupChatProtocolVersion: 1 as const,
+  from: 'user', text: 'TEST group input', timestamp: '2026-10-26T00:00:00Z' }
+const groupReplyId = '33333333-3333-4333-8333-333333333333'
+function groupCut(codeMode: boolean): OpenCodeV2TurnCut {
+  const value = codeMode ? codeModeCut() : cut()
+  const groupInput = { teamName: 'TEST-team', from: 'worker', groupChatId: groupDelivery.groupChatId,
+    messageId: groupReplyId, relayOfMessageId: 'TEST-inbound', text: 'TEST group reply' }
+  const groupResult = { saved: true, groupChatId: groupDelivery.groupChatId, messageId: groupReplyId,
+    groupMessageId: groupReplyId, relayOfMessageId: 'TEST-inbound' }
+  const groupContent = [{ type: 'text', text: JSON.stringify(groupResult) }]
+  const metadata = { truncated: false, toolCalls: [{ tool: 'agent-teams.group_chat_send', status: 'completed', input: groupInput }] }
+  const nativeName = codeMode ? 'execute' : 'agent-teams_group_chat_send'
+  const actualInput = codeMode ? { code: 'TEST actual native execution' } : groupInput
+  assistant(value).data = { ...assistant(value).data, content: [{ type: 'tool', id: 'TEST-tool', name: nativeName, executed: false,
+    state: { status: 'completed', input: actualInput, content: groupContent, ...(codeMode ? { metadata } : {}) } }] }
+  const events = value.log.events.map(row => row.type === 'session.tool.input.started'
+    ? { ...row, data: { ...row.data, name: nativeName } } : row.type === 'session.tool.called'
+      ? { ...row, data: { ...row.data, input: actualInput } } : row.type === 'session.tool.success'
+        ? { ...row, data: { ...row.data, content: groupContent, ...(codeMode ? { metadata } : {}) } } : row)
+  return { ...value, log: { ...value.log, events }, group: groupDelivery, controllerBinding,
+    advertisedTools: ['agent-teams_group_chat_send'], controllerInbox: { binding: controllerBinding,
+      messages: [{ ...inboxRow, messageId: groupReplyId, groupMessageId: groupReplyId, groupChatId: groupDelivery.groupChatId,
+        groupChatProtocolVersion: 1, text: groupInput.text }] } }
+}
+for (const mode of [false, true]) test(`${mode ? 'CodeMode' : 'direct'} group reply requires real exact group/physical relay rather than private-message success`, () => {
+  const value = groupCut(mode)
+  expect(projectOpenCodeV2Turn(value).visibleReplies).toMatchObject([{ inboundMessageId: 'TEST-inbound', visibleReplyMessageId: groupReplyId }])
+  for (const change of [{ group: undefined }, { group: { ...groupDelivery, groupChatId: '44444444-4444-4444-8444-444444444444' } },
+    { group: { ...groupDelivery, groupRunKey: 'wrong-run' } }, { inboundMessageId: 'wrong-physical' },
+    { controllerBinding: { ...controllerBinding, memberId: 'other' } }, { advertisedTools: [] }])
+    expect(projectOpenCodeV2Turn({ ...value, ...change }).visibleReplies).toEqual([])
+  if (mode) for (const change of [{ groupChatId: 'wrong-group' }, { groupMessageId: 'wrong-canonical' }, { relayOfMessageId: 'wrong-physical' }]) {
+    const inbox = value.controllerInbox!
+    expect(projectOpenCodeV2Turn({ ...value, controllerInbox: { ...inbox, messages: [{ ...inbox.messages[0]!, ...change }] } }).visibleReplies).toEqual([])
+  }
+})
