@@ -492,6 +492,7 @@ export function buildOpenCodeHostProfileIdentity(
 }
 
 export class OpenCodeHostManager {
+  private ownedHostAdmissionClosed = false
   private readonly startupLockReleases = new Set<Promise<void>>()
   private readonly pendingLifecycleCleanups = new Set<Promise<void>>()
 
@@ -1705,11 +1706,13 @@ export class OpenCodeHostManager {
     abortSignal?: AbortSignal,
   ): Promise<OpenCodeHostHandle> {
     const port = await this.allocateLoopbackPort()
+    if (this.ownedHostAdmissionClosed) throw new Error('OpenCode host manager is closing')
     const baseUrl = `http://127.0.0.1:${port}`
     await this.cleanupOpenTuiTempArtifactsIfUnused(profile.tmpPath).catch(() => undefined)
     // Minted before the spawn so every process below this host inherits it,
     // including the cursor-agent trees the runtime never sees.
     const attributionId = mintProcessAttributionId()
+    if (this.ownedHostAdmissionClosed) throw new Error('OpenCode host manager is closing')
     const child = this.spawnHost(profile, port, lifetime, attributionId)
 
     const diagnostics: string[] = []
@@ -1945,6 +1948,7 @@ export class OpenCodeHostManager {
       abortSignal?: AbortSignal
     } = {},
   ): Promise<OpenCodeHostHandle> {
+    if (this.ownedHostAdmissionClosed) throw new Error('OpenCode host manager is closing')
     if (params.abortSignal?.aborted) {
       throwOpenCodeAbortReason(params.abortSignal)
     }
@@ -2241,6 +2245,9 @@ export class OpenCodeHostManager {
     kept: number
     diagnostics: string[]
   }> {
+    // Final command cleanup must also fence startups waiting on profile/port preparation.
+    // Registered/shared hosts remain governed by the existing ownership checks below.
+    this.ownedHostAdmissionClosed = true
     try {
       const registry = await this.readPersistentRegistry()
       let disposed = 0
