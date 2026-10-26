@@ -102,11 +102,20 @@ test('Darwin census can exceed two seconds while retaining physical cleanup proo
   expect(f.removed()).toBe(1)
 })
 
+test('Darwin cold native version can take thirty-two seconds and still requires physical retirement', async () => {
+  const f = fixture('darwin', [1000], 1, 32_000)
+  expect(await f.run()).toBe('1.18.34\n')
+  expect(f.elapsed()).toBe(33_000)
+  expect(f.budgets).toEqual([5000])
+  expect(f.removed()).toBe(1)
+})
+
 test('Darwin census budget is clipped to the original probe deadline', async () => {
-  const f = fixture('darwin', [1500], 1, 4000)
+  const initialBirthMs = versionAcquisitionMs('darwin') + VERSION_CLEANUP_MS - 4000
+  const f = fixture('darwin', [1500], 1, initialBirthMs)
   expect(await f.run()).toBe('1.18.34\n')
   expect(f.budgets).toEqual([4000])
-  expect(f.elapsed()).toBe(5500)
+  expect(f.elapsed()).toBe(initialBirthMs + 1500)
   expect(f.removed()).toBe(1)
 })
 
