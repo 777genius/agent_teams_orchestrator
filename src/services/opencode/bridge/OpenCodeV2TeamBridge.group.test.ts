@@ -27,7 +27,7 @@ test('public V2 owner handshake and group send bind the exact member before jour
     OpenCodeV2TeamBridge.prototype.send=async(request)=>{sends++;assert.equal(request.intent.group.groupRunKey,'TEST-run');assert.match(request.intent.input.text,/queued GROUP CHAT message/);return{delivered:true}}
     const client=createBridgeServerIdentity(null);client.peer='claude_team'
     const body={...binding,teamName:'TEST-team',laneId:'secondary:kimi',memberName:'kimi',runtimeSessionId:'ses_TEST',client,
-      requiredCommand:'opencode.sendMessage',expectedRunId:'TEST-run',expectedCapabilitySnapshotId:'TEST-cap',
+      requiredCommand:'opencode.sendMessage',expectedRunId:'TEST-run',expectedCapabilitySnapshotId:'TEST-cap',expectedManifestHighWatermark:1,
       messageId:'22222222-2222-4222-8222-222222222222:g:12345678',deliveryAttemptId:'TEST-attempt',text:'TEST group text',
       groupChatId:'11111111-1111-4111-8111-111111111111',groupMessageId:'22222222-2222-4222-8222-222222222222',
       groupRunKey:'TEST-run',groupChatProtocolVersion:1,from:'user',timestamp:new Date().toISOString()}
@@ -36,6 +36,13 @@ test('public V2 owner handshake and group send bind the exact member before jour
     const handshake=await run('opencode.handshake');assert.equal(handshake.ok,true)
     assert.equal(handshake.data.server.bridgeProtocol.groupChatProtocolVersion,1)
     assert.deepEqual(handshake.data.server.runtime.groupChatRunProof,proof)
+    assert.equal(handshake.data.server.runtime.runtimeStoreManifestHighWatermark,null)
+    assert.equal(handshake.data.server.runtime.activeRunId,'TEST-run')
+    if(process.env.TEST_PRODUCT_HANDSHAKE_CONTRACT){
+      const {validateOpenCodeBridgeHandshake:validate}=await import(process.env.TEST_PRODUCT_HANDSHAKE_CONTRACT)
+      assert.deepEqual(validate({handshake:handshake.data,expectedClient:client,requiredCommand:'opencode.sendMessage',
+        expectedCapabilitySnapshotId:'TEST-cap',expectedManifestHighWatermark:1,expectedRunId:'TEST-run'}),{ok:true})
+    }
     const {identityHash,...unsigned}=handshake.data;assert.equal(identityHash,executionHash(unsigned))
     for(const changes of [{from:undefined},{groupRunKey:'wrong'},{laneId:'wrong'},{runtimeSessionId:'ses_wrong'},{memberName:'other'}]){
       const result=await run('opencode.sendMessage',changes);assert.equal(result.ok,false);assert.equal(sends,0)

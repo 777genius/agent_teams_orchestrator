@@ -322,6 +322,10 @@ async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: O
         if (body.selectedModel !== undefined) executionAssert(owner.members.every(member => member.selectedModel === body.selectedModel), 'run_selected_model_changed')
         measured = owner.qualification
         const originalIdentity = createBridgeServerIdentity(null, { runtimeStoreManifestHighWatermark: null })
+        // Native owners do not own the app's V1 manifest sequence. The shared
+        // V1 factory maps null to zero, so explicitly retain honest unknown here.
+        originalIdentity.runtime.runtimeStoreManifestHighWatermark = null
+        originalIdentity.runtime.activeRunId = required(body.runId, 'runId')
         originalIdentity.runtime.capabilitySnapshotId = measured.capabilitySnapshotId
         originalIdentity.runtime.binaryPath = measured.binaryPath
         originalIdentity.runtime.binaryFingerprint = measured.binaryFingerprint
@@ -353,7 +357,11 @@ async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: O
       const qualified = owner !== null && openCodeV2SupportedSourcePredicate(owner)
       const sourceCapabilities = { teamLaunch: true, memberSession: qualified, permission: false }
       readinessStage = 'execution_probe'
-      const probe = await resolveOpenCodeV2ExecutionProbe(envelope, selection, envelope.command === 'opencode.readiness' && body.requireExecutionProbe === true, { unattendedTeam: true })
+      const freshRequestId = body.freshExecutionProofRequestId
+      executionAssert(freshRequestId === undefined || envelope.command === 'opencode.readiness' && body.requireExecutionProbe === true &&
+        typeof freshRequestId === 'string' && /^[a-zA-Z0-9._:-]{1,200}$/.test(freshRequestId), 'probe_fresh_request_invalid')
+      const probe = await resolveOpenCodeV2ExecutionProbe(envelope, selection, envelope.command === 'opencode.readiness' && body.requireExecutionProbe === true,
+        { unattendedTeam: true, ...(freshRequestId === undefined ? {} : { freshExecutionProofRequestId: freshRequestId as string }) })
       readinessStage = undefined
       measured = owner?.qualification ?? { capabilitySnapshotId: selection.capabilitySnapshotId,
         expectedBehaviorFingerprint: probe.proof?.expectedBehaviorEvidence.expectedBehaviorFingerprint ?? '',

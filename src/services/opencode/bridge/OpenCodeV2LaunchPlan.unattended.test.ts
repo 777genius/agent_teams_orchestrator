@@ -1,3 +1,4 @@
+import { claimOpenCodeV2FreshProofRequest } from './OpenCodeV2FreshProofRequest.js'
 import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test'
 import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
@@ -79,10 +80,10 @@ afterEach(async () => {
   for (const [key, value] of Object.entries(saved)) if (value === undefined) delete process.env[key]; else process.env[key] = value
   await rm(root, { recursive: true, force: true })
 })
-async function proof(prepared: OpenCodePreparedProfile, capabilitySnapshotId: string, platform?: NodeJS.Platform) {
+async function proof(prepared: OpenCodePreparedProfile, capabilitySnapshotId: string, platform?: NodeJS.Platform, verifiedAt?: string) {
   const snapshot = { projectPath: project, profile: prepared, hostHealthy: true, host: { profile: prepared, version: pin,
     resolvedConfigFingerprint: prepared.managedConfigFingerprint } } as OpenCodeProvisioningSnapshot
-  return buildOpenCodeExecutionProof({ selectedModel: 'provider/model', snapshot, capabilitySnapshotId }, {
+  return buildOpenCodeExecutionProof({ selectedModel: 'provider/model', snapshot, capabilitySnapshotId, verifiedAt }, {
     resolveBinaryPath: () => native().executablePath, resolveBinaryIdentity: async () => 'TEST-native-identity', readCredential: async () => null, platform })
 }
 for (const version of ['2.0.0', '2.0.32'] as const) test(`${version} absent selected auth routes prepared profiles through native free-model readback while sealing paid keys`, async () => {
@@ -421,4 +422,97 @@ test('same-command receipt refuses mutated selection identity before preparing a
   await expect(launchPlans.buildOpenCodeV2InternalRunPlan(selection, request.body, 'TEST-controller'))
     .rejects.toThrow('run_prepared_selection_changed')
   expect(nativeReceiptCalls).toBe(1)
+})
+
+async function freshProbeFixture(verifiedAt = new Date().toISOString()) {
+  const request = envelope(), selection = await inspectOpenCodeV2SourceAvailability(request)
+  const parent = path.join(root, 'fresh-profiles'); await mkdir(parent)
+  const team = await createOpenCodeV2PreparedMember(selection, native(), parent,
+    { teamId: 'TEST-team', runId: 'TEST-run', memberId: 'worker', unattendedTeam: true })
+  const issued = await proof(team.prepared, selection.capabilitySnapshotId, undefined, verifiedAt)
+  const sourceKey = executionHash({ project, scopeToken: selection.scope.scopeToken, selectedAuthIdentity: selection.scope.selectedAuthIdentity,
+    source: selection.behaviorFingerprint, graph: selection.installedGraphSHA256, projectBehavior: behavior, variant: 'default', unattendedTeam: true })
+  const directory = path.join(root, 'app-data/opencode/v2/execution-probes', sourceKey)
+  await mkdir(directory, { recursive: true, mode: 0o700 })
+  const nonce = 'TEST-original-fresh-probe'
+  const record = { sourceKey, binding: { teamId: 'TEST-original', runId: nonce, controllerInstanceId: nonce, ownerId: nonce },
+    sessionID: 'ses_TESToriginal', intent: { identity: { requestId: nonce, deliveryAttemptId: nonce, localMessageId: nonce, nativeInputID: 'msg_TESToriginal' },
+      delivery: 'queue', input: { nativeInputID: 'msg_TESToriginal', resume: true, text: 'Original TEST proof input' } },
+    submitted: true, retired: true, proof: issued, failure: null }
+  const file = path.join(directory, 'probe.json')
+  return { request, selection, record, file }
+}
+test('explicit fresh request replaces only a retired genuine near-expiry generation once and durably pins its request ID', async () => {
+  const f = await freshProbeFixture(new Date(Date.now() - 118_000).toISOString())
+  await writeFile(f.file, JSON.stringify(f.record), { mode: 0o600 })
+  let launches = 0
+  restores.push(spyOn(runOwners, 'launchExplicitOpenCodeV2Run').mockImplementation(async () => {
+    launches++; throw new Error('TEST-before-any-native-input')
+  }))
+  const options = { unattendedTeam: true, freshExecutionProofRequestId: 'TEST-new-admission' }
+  await expect(probes.resolveOpenCodeV2ExecutionProbe(f.request, f.selection, true, options)).rejects.toThrow('TEST-before-any-native-input')
+  const saved = JSON.parse(await readFile(f.file, 'utf8'))
+  expect(saved.freshExecutionProofRequestId).toBe(options.freshExecutionProofRequestId)
+  expect(saved.sourceKey).toBe(f.record.sourceKey)
+  expect(saved.binding).not.toEqual(f.record.binding)
+  expect(saved.submitted).toBe(false)
+  const before = await readFile(f.file, 'utf8')
+  expect((await probes.resolveOpenCodeV2ExecutionProbe(f.request, f.selection, true, options)).state).toBe('pending')
+  expect(await readFile(f.file, 'utf8')).toBe(before)
+  expect(launches).toBe(1)
+})
+for (const expired of [false, true]) test(`the same fresh request ${expired ? 'expires fail-closed' : 'reuses its own proof'} without another native input`, async () => {
+  const f = await freshProbeFixture(new Date(Date.now() - (expired ? 121_000 : 0)).toISOString())
+  const saved = JSON.stringify({ ...f.record, freshExecutionProofRequestId: 'TEST-same-admission' })
+  await writeFile(f.file, saved, { mode: 0o600 })
+  await claimOpenCodeV2FreshProofRequest(path.dirname(f.file), f.record.sourceKey, 'TEST-same-admission')
+  restores.push(spyOn(runOwners, 'launchExplicitOpenCodeV2Run').mockImplementation(async () => { throw Error('TEST-replay-forbidden') }))
+  const result = await probes.resolveOpenCodeV2ExecutionProbe(f.request, f.selection, true,
+    { unattendedTeam: true, freshExecutionProofRequestId: 'TEST-same-admission' })
+  expect(result.state).toBe(expired ? 'pending' : 'available')
+  expect(result.proof).toEqual(expired ? null : f.record.proof)
+  expect(await readFile(f.file, 'utf8')).toBe(saved)
+})
+test('explicit fresh request never replaces an UNKNOWN, unsubmitted, or unretired original', async () => {
+  const f = await freshProbeFixture()
+  let launches = 0
+  restores.push(spyOn(runOwners, 'launchExplicitOpenCodeV2Run').mockImplementation(async () => { launches++; throw Error('TEST-replay-forbidden') }))
+  for (const submitted of [false, true]) for (const originalProof of [null, f.record.proof]) {
+    const saved = JSON.stringify({ ...f.record, submitted, proof: originalProof, retired: false })
+    await writeFile(f.file, saved, { mode: 0o600 })
+    const result = await probes.resolveOpenCodeV2ExecutionProbe(f.request, f.selection, true,
+      { unattendedTeam: true, freshExecutionProofRequestId: 'TEST-new-admission' })
+    expect(result).toMatchObject({ state: 'pending', proof: null })
+    expect(await readFile(f.file, 'utf8')).toBe(saved)
+  }
+  expect(launches).toBe(0)
+})
+
+
+test('fresh request A then B cannot replay the old paid generation on late retry A', async () => {
+  const f = await freshProbeFixture()
+  await writeFile(f.file, JSON.stringify(f.record), { mode: 0o600 })
+  let launches = 0
+  restores.push(spyOn(runOwners, 'launchExplicitOpenCodeV2Run').mockImplementation(async () => { launches++; throw Error('TEST-native-boundary') }))
+  for (const id of ['TEST-admission-A', 'TEST-admission-B']) {
+    await expect(probes.resolveOpenCodeV2ExecutionProbe(f.request, f.selection, true,
+      { unattendedTeam: true, freshExecutionProofRequestId: id })).rejects.toThrow('TEST-native-boundary')
+    const generation = JSON.parse(await readFile(f.file, 'utf8'))
+    expect(generation.freshExecutionProofRequestId).toBe(id)
+    await writeFile(f.file, JSON.stringify({ ...generation, submitted: true, retired: true, proof: f.record.proof }), { mode: 0o600 })
+  }
+  const before = await readFile(f.file, 'utf8')
+  expect(await probes.resolveOpenCodeV2ExecutionProbe(f.request, f.selection, true,
+    { unattendedTeam: true, freshExecutionProofRequestId: 'TEST-admission-A' })).toMatchObject({ state: 'pending', proof: null })
+  expect(launches).toBe(2)
+  expect(await readFile(f.file, 'utf8')).toBe(before)
+})
+test('fresh claim crash before the new probe record remains fail-closed without replacing the original', async () => {
+  const f = await freshProbeFixture()
+  const before = JSON.stringify(f.record); await writeFile(f.file, before, { mode: 0o600 })
+  await claimOpenCodeV2FreshProofRequest(path.dirname(f.file), f.record.sourceKey, 'TEST-before-record-crash')
+  restores.push(spyOn(runOwners, 'launchExplicitOpenCodeV2Run').mockImplementation(async () => { throw Error('TEST-replay-forbidden') }))
+  expect(await probes.resolveOpenCodeV2ExecutionProbe(f.request, f.selection, true,
+    { unattendedTeam: true, freshExecutionProofRequestId: 'TEST-before-record-crash' })).toMatchObject({ state: 'pending', proof: null })
+  expect(await readFile(f.file, 'utf8')).toBe(before)
 })
