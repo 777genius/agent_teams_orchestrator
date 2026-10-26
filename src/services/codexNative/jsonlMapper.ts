@@ -13,6 +13,7 @@ type CodexMcpToolCallItem = {
   id?: string
   type?: string
   text?: string
+  phase?: unknown
   server?: string
   tool?: string
   arguments?: unknown
@@ -38,6 +39,7 @@ type CodexItemCompletedEvent = {
         id?: string
         type?: string
         text?: string
+        phase?: unknown
       }
     | CodexMcpToolCallItem
 }
@@ -379,6 +381,8 @@ function mapJsonEvent(event: CodexExecJsonEvent): CodexNativeNormalizedEvent[] {
         type: 'assistant_text',
         itemId: event.item.id,
         text: event.item.text,
+        ...(['commentary', 'partial_answer', 'final_answer'].includes(String(event.item.phase))
+          ? { phase: event.item.phase as 'commentary' | 'partial_answer' | 'final_answer' } : {}),
       },
     ]
   }

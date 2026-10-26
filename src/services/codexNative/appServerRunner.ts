@@ -557,7 +557,10 @@ export function createCodexAppServerNotificationMapper(): {
       const text = typeof item.text === 'string' ? item.text : textByItem.get(key)?.text
       textByItem.delete(key)
       completedItems.add(key)
-      if (text !== undefined) events.push({ type: 'assistant_text', itemId, text })
+      if (text !== undefined) events.push({ type: 'assistant_text', itemId, text,
+        ...(['commentary', 'partial_answer', 'final_answer'].includes(String(item.phase))
+          ? { phase: item.phase as 'commentary' | 'partial_answer' | 'final_answer' } : {}),
+      })
     } else if (method === 'turn/completed') {
       // Retain a delta-only completion fallback when no item snapshot arrives.
       events.push(...flushPending(scope))

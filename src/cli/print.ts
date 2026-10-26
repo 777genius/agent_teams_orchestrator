@@ -2468,7 +2468,7 @@ function runHeadlessStreaming(
                 current?.ready && current.teamName === groupTurn.teamName &&
                 current.memberName === groupTurn.memberName &&
                 isCurrentGroupMailboxMessage(groupTurn.message)) {
-              const fallback = findOrdinaryDirectReplyFallback({ ...scope, excludeEmptyMessages: true })
+              const fallback = findOrdinaryDirectReplyFallback({ ...scope, excludeEmptyMessages: true, excludeNativeCommentary: true })
               if (fallback) {
                 try {
                   await relayGroupAssistantText({

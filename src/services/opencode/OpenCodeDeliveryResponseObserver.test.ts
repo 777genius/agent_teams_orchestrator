@@ -18,7 +18,7 @@ test('named group reply proof requires exact group, sender, team and physical re
   const user = message({ id: 'delivered-group', role: 'user', text: physical })
   const observe = (toolName: string, args = input, output: unknown = receipt, status: OpenCodeCanonicalToolStatus = 'completed') => observeOpenCodeDeliveryResponse({
     inboundMessageId: physical, runtimePromptMessageId: user.id, groupChatId, memberName: 'alice', teamName: 'synthetic-groups',
-    summary: summary([user, message({ id: 'group-answer', parentId: user.id, role: 'assistant', text: 'No private echo', toolCalls: [{
+    summary: summary([user, message({ id: 'group-answer', parentId: user.id, role: 'assistant', text: '[[AGENT_TEAMS_NO_REPLY]]', toolCalls: [{
       callId: 'group-send', toolName, input: args, output, outputText: null, status, title: null, isError: status === 'errored', outputPreview: null, startedAt: null, completedAt: null,
     }] })]),
   })
@@ -1294,4 +1294,54 @@ describe('OpenCodeDeliveryResponseObserver', () => {
     expect(observed.toolCallNames).toContain('task_add_comment')
     expect(observed.reason).toBe('meaningful_tool_call_failed')
   })
+})
+
+ test('certifies only a completed exact child with full non-response output, never a preview or meaningful answer', () => {
+  const user = message({ id: 'accepted', role: 'user', text: 'peer FYI' })
+  const child = message({ id: 'child', parentId: user.id, role: 'assistant',
+    text: '[[AGENT_TEAMS_NO_REPLY]]', completedAt: 1000, finishReason: 'stop' })
+  const observe = (overrides: Partial<OpenCodeCanonicalMessage> = {}, rawStatus: OpenCodeSessionReconcileSummary['rawStatus'] = 'idle', extra: OpenCodeCanonicalMessage[] = []) => observeOpenCodeDeliveryResponse({
+    runtimePromptMessageId: user.id, inboundMessageId: 'physical', groupChatId: 'group',
+    summary: summary([user, ...extra, { ...child, ...overrides }], rawStatus),
+  })
+  expect(observe().reason).toBe('assistant_child_completed_with_non_response_text')
+  expect(observe({ text: 'Reading instructions first. [[AGENT_TEAMS_NO_REPLY]]' }).reason).toBe('assistant_child_completed_with_non_response_text')
+  expect(observe({ text: 'No reply needed; peer status message, not a request.' }).reason).toBe('assistant_child_completed_with_non_response_text')
+  for (const overrides of [
+    { text: 'No reply needed; result is 42.' },
+    { text: '[[AGENT_TEAMS_NO_REPLY]] real answer' },
+    { text: 'No reply needed' + ' '.repeat(500) + ' result is 42.', previewText: 'No reply needed' },
+    { text: '', previewText: '[[AGENT_TEAMS_NO_REPLY]]' },
+    { completedAt: null }, { finishReason: null }, { parentId: 'foreign-prompt' },
+    { hasError: true },
+  ]) expect(observe(overrides).reason).not.toBe('assistant_child_completed_with_non_response_text')
+  expect(observe({}, 'busy').reason).not.toBe('assistant_child_completed_with_non_response_text')
+  expect(observe({}, 'idle', [message({ id: 'meaningful', role: 'assistant', parentId: user.id, text: 'The answer is 42' })]).reason).not.toBe('assistant_child_completed_with_non_response_text')
+})
+
+test('does not certify an earlier completed no-response before a later unfinished child', () => {
+  const user = message({ id: 'prompt', role: 'user' })
+  const observed = observeOpenCodeDeliveryResponse({ runtimePromptMessageId: user.id,
+    summary: summary([user,
+      message({ id: 'done', role: 'assistant', parentId: user.id, text: '[[AGENT_TEAMS_NO_REPLY]]', completedAt: 1000, finishReason: 'stop' }),
+      message({ id: 'unfinished', role: 'assistant', parentId: user.id }),
+    ], null),
+  })
+  expect(observed.reason).not.toBe('assistant_child_completed_with_non_response_text')
+})
+
+test('completed no-response allows only a successful read-only catalog, not failed or other tools', () => {
+  const user = message({ id: 'prompt', role: 'user' })
+  const tool: import('./types.js').OpenCodeCanonicalToolCall = {
+    callId: 'catalog', toolName: 'agent-teams_group_chat_list', input: {}, output: [], outputText: null,
+    status: 'completed', title: null, isError: false, outputPreview: null, startedAt: 1, completedAt: 2,
+  }
+  const observe = (changes = {}) => observeOpenCodeDeliveryResponse({ runtimePromptMessageId: user.id,
+    summary: summary([user, message({ id: 'catalog-child', role: 'assistant', parentId: user.id, toolCalls: [{ ...tool, ...changes }] }),
+      message({ id: 'final-child', role: 'assistant', parentId: user.id, text: '[[AGENT_TEAMS_NO_REPLY]]', completedAt: 4, finishReason: 'stop' })]),
+  })
+  expect(observe().reason).toBe('assistant_child_completed_with_non_response_text')
+  for (const changes of [{ status: 'running' }, { isError: true }, { output: { isError: true, content: [] } },
+    { toolName: 'read' }, { status: 'errored' }, { output: null }])
+    expect(observe(changes).reason).not.toBe('assistant_child_completed_with_non_response_text')
 })

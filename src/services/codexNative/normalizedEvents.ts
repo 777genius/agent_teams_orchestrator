@@ -11,6 +11,7 @@ export type CodexNativeNormalizedEvent =
     }
   | {
       type: 'assistant_text'
+      phase?: 'commentary' | 'partial_answer' | 'final_answer'
       itemId: string
       text: string
     }

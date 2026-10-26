@@ -297,6 +297,11 @@ export async function readMailbox(
   }
 }
 
+/** Read-only bounded snapshot for prompt context. It grants no mutation or delivery authority. */
+export async function readGroupMailboxContext(agentName: string, teamName: string): Promise<TeammateMessage[]> {
+  return (await readMailboxMutationSource(agentName, teamName)).messages
+}
+
 /**
  * Read only unread messages from a teammate's inbox
  * @param agentName - The agent name (not UUID) to read inbox for

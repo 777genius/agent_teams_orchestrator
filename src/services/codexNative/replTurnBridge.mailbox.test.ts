@@ -1,6 +1,7 @@
 import { expect, test } from 'bun:test'
 
 import {
+  findOrdinaryDirectReplyFallback,
   getOrdinaryPendingMessage,
   getOrdinaryProcessingAction,
   getProcessingOrdinaryMessage,
@@ -59,6 +60,7 @@ test('mixed native turn keeps live transcript order and its final parent after a
                 type: 'normalized_event',
                 event: { type: 'assistant_text', itemId: 'empty', text: '' },
               }
+              yield { type: 'normalized_event', event: { type: 'assistant_text', itemId: 'commentary', phase: 'commentary', text: 'I will read the instructions first.' } }
               yield {
                 type: 'normalized_event',
                 event: {
@@ -92,6 +94,7 @@ test('mixed native turn keeps live transcript order and its final parent after a
                 event: {
                   type: 'assistant_text',
                   itemId: 'final',
+                  phase: 'final_answer',
                   text: 'TEST final response',
                 },
               }
@@ -125,6 +128,7 @@ test('mixed native turn keeps live transcript order and its final parent after a
   expect(live.map((message) => message.type)).toEqual([
     'user',
     'assistant',
+    'assistant',
     'user',
     'assistant',
   ])
@@ -138,6 +142,8 @@ test('mixed native turn keeps live transcript order and its final parent after a
     type: 'assistant',
     message: { content: [{ type: 'text', text: 'TEST final response' }] },
   })
+  expect(findOrdinaryDirectReplyFallback({ messages: live, submitUserMessageUuid: submitted.uuid, excludeNativeCommentary: true })).toEqual({ text: 'TEST final response' })
+  expect(findOrdinaryDirectReplyFallback({ messages: live, submitUserMessageUuid: submitted.uuid })?.text).toContain('I will read the instructions first.')
   // Same parent selection used by useLogMessages for the following user turn.
   expect(
     cleanMessagesForLogging(live, live).findLast(isChainParticipant)?.uuid,

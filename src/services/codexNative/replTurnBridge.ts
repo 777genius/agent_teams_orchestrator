@@ -1,3 +1,4 @@
+import { writeChildOwnedTeammateRuntimeEvent } from '../../utils/swarm/teammateRuntimeEvents.js'
 import type { ContentBlockParam } from '@anthropic-ai/sdk/resources/messages.mjs'
 
 import { isSessionPersistenceDisabled } from '../../bootstrap/state.js'
@@ -50,6 +51,17 @@ export async function runCodexNativeTurnInRepl(
   deps: RunCodexNativeTurnInReplDeps = {},
 ): Promise<void> {
   const executeTurn = deps.executeTurn ?? executeCodexNativeTurn
+  const promptText = typeof params.prompt === 'string' ? params.prompt : params.prompt
+    .flatMap(block => block.type === 'text' ? [block.text] : []).join('\n')
+  if (promptText.includes('Process this queued GROUP CHAT message.')) {
+    // Diagnostic facts only: never persist model/user text or private bootstrap context.
+    void writeChildOwnedTeammateRuntimeEvent({
+      type: 'group_context_prepared', source: 'codexNative.replTurnBridge',
+      detail: JSON.stringify({ promptChars: promptText.length,
+        hasGroupHistory: promptText.includes('<group_mailbox_history>'),
+        physicalMessageId: promptText.match(/Physical inbound ID: "([0-9a-f-]{36}:g:[0-9a-f]{24})"/)?.[1] ?? null }),
+    })
+  }
   const mutableMessages = [...params.transcriptMessages]
   const persistedTranscriptMessages = [...params.transcriptMessages]
   const initialTranscriptLength = persistedTranscriptMessages.length
