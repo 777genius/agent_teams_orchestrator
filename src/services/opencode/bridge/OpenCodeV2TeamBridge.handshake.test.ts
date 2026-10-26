@@ -14,7 +14,7 @@ test('fresh and original-owner handshakes bind all returned fields in the identi
   let inspections=0,probes=0
   const plan=await import(${JSON.stringify(plan)})
   mock.module(${JSON.stringify(plan)},()=>({...plan,inspectOpenCodeV2SourceAvailability:async()=>{inspections++;return({
-   native:{version:'2.0.0',executablePath:'/TEST/native'},model:{providerID:'groq',id:'c41-upstream'},
+   native:{version:'2.0.0',dialect:'v2-2.0.0',executablePath:'/TEST/native'},model:{providerID:'groq',id:'c41-upstream'},
    capabilitySnapshotId:'TEST-capability',installedGraphSHA256:'a'.repeat(64),installedGraphFiles:1,
   })}}))
   const proof={capabilitySnapshotId:'TEST-capability',binaryPath:'/TEST/native',binaryFingerprint:'TEST-binary',
@@ -39,7 +39,7 @@ test('fresh and original-owner handshakes bind all returned fields in the identi
    const response=await execute({schemaVersion:1,requestId:'TEST-handshake',command:'opencode.handshake',cwd:'/TEST',
     startedAt:new Date().toISOString(),timeoutMs:8000,body:{client,selectedModel:'groq/c41-upstream',...(owned?{teamId:'TEST',runId:'TEST-run'}:{})}},
     async()=>{throw Error('V1 fallback forbidden')})
-   assert.equal(response.ok,true);const handshake=response.data
+   assert.equal(response.ok,true,JSON.stringify(response));const handshake=response.data
    if(process.env.TEST_PRODUCT_HANDSHAKE_CONTRACT){
     const {validateOpenCodeBridgeHandshake:validate}=await import(process.env.TEST_PRODUCT_HANDSHAKE_CONTRACT)
     const input={handshake,expectedClient:client,requiredCommand:'opencode.launchTeam',expectedCapabilitySnapshotId:'TEST-capability',expectedManifestHighWatermark:null,expectedRunId:owned?'TEST-run':null}

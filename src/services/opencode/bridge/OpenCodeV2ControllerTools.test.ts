@@ -127,3 +127,15 @@ test('managed Windows deferred controller requires exact owned config and live c
   expect(proof.nativeNames).toEqual(['agent-teams_message_send'])
   expect(createHash('sha256').update(config.content).digest('hex')).toBe(profile.config.sha256)
 })
+
+test('canonical group reply inbox parsing retains validated group identity and physical relay', () => {
+  const binding = { teamId: 'TEST-team', runId: 'TEST-run', memberId: 'kimi', sessionID: 'ses_TEST' }
+  const id = '11111111-1111-4111-8111-111111111111', group = '22222222-2222-4222-8222-222222222222'
+  const row = { messageId: id, groupMessageId: id, groupChatId: group, groupChatProtocolVersion: 1,
+    from: 'kimi', to: 'user', text: 'TEST group reply', timestamp: '2026-10-26T00:00:00Z', read: false,
+    source: 'runtime_delivery', relayOfMessageId: '33333333-3333-4333-8333-333333333333:g:abcdef' }
+  const read = (value: unknown) => parseControllerInboxBytes(Buffer.from(JSON.stringify([value])), binding)
+  expect(read(row)).toEqual({ binding, messages: [row] })
+  for (const change of [{ groupChatId: 'invalid' }, { groupMessageId: undefined }, { groupChatProtocolVersion: 2 }])
+    expect(() => read({ ...row, ...change })).toThrow()
+})

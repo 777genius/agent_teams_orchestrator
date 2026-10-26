@@ -1,3 +1,4 @@
+import { parseOpenCodeV2GroupDelivery } from './OpenCodeV2GroupChat.js'
 import { openCodeBunVersion } from '../../../constants/openCodeBunVersion.js'
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { constants } from 'node:fs'
@@ -199,7 +200,7 @@ function parseUnixStopReceipt(value: unknown): Extract<RunControlResult, { kind:
   return { kind: 'stop', state: receipt.state, members }
 }
 function parseIntent(value: unknown): QueueIntent {
-  const row = executionRecord(value); keys(row, ['identity', 'input', 'delivery'])
+  const row = executionRecord(value); optionalKeys(row, ['identity', 'input', 'delivery'], ['group'])
   const identity = executionRecord(row.identity)
   const typedIdentity = { requestId: string(identity.requestId), deliveryAttemptId: string(identity.deliveryAttemptId), localMessageId: string(identity.localMessageId), nativeInputID: string(identity.nativeInputID) }
   keys(identity, ['requestId', 'deliveryAttemptId', 'localMessageId', 'nativeInputID']); assertIntentIdentity(typedIdentity)
@@ -227,6 +228,10 @@ function parseIntent(value: unknown): QueueIntent {
   const result: QueueIntent = { identity: typedIdentity, input: { nativeInputID: typedIdentity.nativeInputID, text, resume: input.resume,
     ...(files ? { files } : {}), ...(agents ? { agents } : {}), ...(skills ? { skills } : {}) }, delivery: 'queue' }
   executionAssert(Buffer.byteLength(canonicalExecutionJSON(result.input)) <= 256 * 1024, 'run_control_invalid')
+  if (row.group !== undefined) {
+    const group = parseOpenCodeV2GroupDelivery(executionRecord(row.group), typedIdentity.localMessageId)
+    executionAssert(group && executionHash(group) === executionHash(row.group), 'GROUP_INVALID_ENVELOPE'); result.group = group
+  }
   return result
 }
 export function parseRunControlRequest(value: unknown): RunControlRequest {
@@ -250,7 +255,7 @@ export function parseRunControlRequest(value: unknown): RunControlRequest {
     executionAssert(submissionOwner === undefined || intent && /^[a-zA-Z0-9._-]{1,200}$/.test(submissionOwner), 'run_control_invalid')
     return { operation, memberId, originalSessionId, nativeInputID, ...(intent ? { intent } : {}), ...(submissionOwner ? { submissionOwner } : {}) }
   }
-  if (operation === 'transcript' || operation === 'permissions' || operation === 'mcp' || operation === 'probeEvidence') {
+  if (operation === 'transcript' || operation === 'permissions' || operation === 'mcp' || operation === 'probeEvidence' || operation === 'groupProof') {
     keys(row, ['operation', 'memberId', 'originalSessionId']); return { operation, memberId, originalSessionId }
   }
   executionAssert(operation === 'permissionReply' && (row.decision === 'allow' || row.decision === 'deny'), 'run_control_invalid')
