@@ -111,3 +111,43 @@ test('a finalized host-owned turn retains its successful proactive DONE beside t
   const sibling = { ...current, relayOfMessageId: 'human-for-peer' }
   expect(selectGroupMailboxHistory(sibling, 'worker', [human, sibling], input.sentHistory, proofs)).toEqual([])
 })
+
+
+test('a later fanout answer retains finalized sibling completion as one indivisible causal context', () => {
+  const human = row('fanout-human', { text: 'Ask both peers; report DONE once after an answer.' })
+  const first = row('first-answer', { from: 'alice', text: 'FIRST:15', relayOfMessageId: 'question-for-alice' })
+  const current = row('second-answer', { from: 'bob', text: 'SECOND:15', read: false, relayOfMessageId: 'question-for-bob' })
+  const ownPost = (id: string, inbound: string, text: string): GroupMailboxHistoryMessage => row(id, {
+    from: 'worker', to: 'user', source: 'runtime_delivery', groupMessageId: id, relayOfMessageId: inbound, text,
+  })
+  const question = { ...ownPost('fanout-question', human.messageId!, 'QUESTION:5+10?'), groupDeliverySummary: {
+    recipients: [{ memberName: 'alice', physicalMessageId: 'question-for-alice', status: 'queued' },
+      { memberName: 'bob', physicalMessageId: 'question-for-bob', status: 'accepted' }],
+  } }
+  const done = ownPost('first-done', first.messageId!, 'DONE:15')
+  const unrelated = row('unrelated-human', { text: 'UNRELATED COMMAND' })
+  const unrelatedReply = ownPost('unrelated-post', unrelated.messageId!, 'UNRELATED RESPONSE')
+  const history = [unrelated, human, first, current]
+  const select = (incoming = history, outgoing = [unrelatedReply, question, done]) =>
+    selectGroupMailboxHistory(current, 'worker', incoming, outgoing)
+  expect(select().map(entry => entry.text)).toEqual([human.text, question.text, first.text, done.text])
+  expect(select(history, [question, { ...question, messageId: 'ambiguous-question', groupMessageId: 'ambiguous-question' }, done])).toEqual([])
+  // Following receipt edges must reach completed descendants, not only one sibling level.
+  const followup = { ...ownPost('followup-question', first.messageId!, 'Follow-up?'), groupDeliverySummary: {
+    recipients: [{ memberName: 'alice', physicalMessageId: 'followup-for-alice', status: 'queued' }],
+  } }
+  const descendant = row('descendant-answer', { from: 'alice', text: 'DETAILS', relayOfMessageId: 'followup-for-alice' })
+  const finalDone = ownPost('descendant-done', descendant.messageId!, 'FINAL DONE')
+  expect(select([unrelated, human, first, descendant, current], [question, followup, finalDone])
+    .map(entry => entry.text)).toContain(finalDone.text)
+  // Omit the whole connected context if a completion exceeds bytes or the chain exceeds eight rows.
+  expect(select(history, [question, { ...done, text: 'x'.repeat(20000) }])).toEqual([])
+  const extraOwnPosts = Array.from({ length: 5 }, (_, index) => ownPost('extra-' + index, first.messageId!, 'More completion context'))
+  expect(select(history, [question, done, ...extraOwnPosts])).toEqual([])
+  // Wrong recipient/status, stale or unread branches cannot enter the connected component.
+  for (const change of [{ from: 'someone' }, { read: false }, { groupRunKey: 'old' }, { to: 'other' }])
+    expect(select([human, { ...first, ...change }, current], [question, done]).map(entry => entry.text))
+      .toEqual([human.text, question.text])
+  const parallel = { ...current, relayOfMessageId: 'human-copy-for-bob' }
+  expect(selectGroupMailboxHistory(parallel, 'worker', [human, first, parallel], [question, done])).toEqual([])
+})

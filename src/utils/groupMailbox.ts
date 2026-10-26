@@ -233,22 +233,45 @@ export function selectGroupMailboxHistory(current: GroupMailboxHistoryMessage, m
   // Replay peer context only along a proven reply chain to our own posts.
   // Parallel answers to a human must not reintroduce that human's old command.
   if (current.from !== 'user') {
-    const parentReply = (incoming: GroupMailboxHistoryMessage) => {
-      const matches = ownReplies.filter(reply => reply.groupDeliverySummary?.recipients.some(recipient =>
-        recipient.memberName === incoming.from && recipient.physicalMessageId === incoming.relayOfMessageId &&
-        (recipient.status === 'queued' || recipient.status === 'accepted')))
-      return matches.length === 1 ? matches[0] : undefined
+    const repliesByReceipt = new Map<string, GroupMailboxHistoryMessage | null>()
+    for (const reply of ownReplies) {
+      const receiptKeys = new Set((reply.groupDeliverySummary?.recipients ?? [])
+        .filter(recipient => recipient.status === 'queued' || recipient.status === 'accepted')
+        .map(recipient => JSON.stringify([recipient.memberName, recipient.physicalMessageId])))
+      for (const key of receiptKeys)
+        repliesByReceipt.set(key, repliesByReceipt.has(key) ? null : reply)
     }
+    const parentReply = (incoming: GroupMailboxHistoryMessage) => incoming.relayOfMessageId
+      ? repliesByReceipt.get(JSON.stringify([incoming.from, incoming.relayOfMessageId])) ?? undefined
+      : undefined
+    const earlierById = new Map(earlier.map(row => [row.messageId!, row]))
     const ancestors = new Set<string>()
     let incoming: GroupMailboxHistoryMessage | undefined = current
     while (incoming && ancestors.size < 8) {
       const parent = parentReply(incoming)
-      const previous = parent && earlier.find(row => row.messageId === parentId(parent))
+      const previous = parent && earlierById.get(parentId(parent)!)
       if (!previous?.messageId || ancestors.has(previous.messageId)) break
       ancestors.add(previous.messageId)
       incoming = previous.from === 'user' ? undefined : previous
     }
     if (ancestors.size === 0) return []
+    // Include finalized sibling branches and their saved completions. A later
+    // peer answer must not replay an ancestor while hiding work already done.
+    const childrenByParent = new Map<string, string[]>()
+    for (const row of earlier) {
+      const parent = parentReply(row)
+      const previousId = parent && parentId(parent)
+      if (!previousId) continue
+      const children = childrenByParent.get(previousId) ?? []
+      children.push(row.messageId!); childrenByParent.set(previousId, children)
+    }
+    const connected = [...ancestors]
+    for (let index = 0; index < connected.length; index++) {
+      for (const childId of childrenByParent.get(connected[index]!) ?? []) {
+        if (ancestors.has(childId)) continue
+        ancestors.add(childId); connected.push(childId)
+      }
+    }
     earlier = earlier.filter(row => ancestors.has(row.messageId!))
     ownReplies = ownReplies.filter(reply => ancestors.has(parentId(reply)!))
   }
@@ -257,10 +280,16 @@ export function selectGroupMailboxHistory(current: GroupMailboxHistoryMessage, m
     const replies = repliesByInbound.get(parentId(reply)!) ?? []
     replies.push(reply); repliesByInbound.set(parentId(reply)!, replies)
   }
-  const units = earlier.map(inbound => {
+  let units = earlier.map(inbound => {
     const rows = [inbound, ...(repliesByInbound.get(inbound.messageId!) ?? [])]
     return { rows, latest: rows.reduce((latest, row) => Math.max(latest, Date.parse(row.timestamp)), 0) }
   }).sort((left, right) => left.latest - right.latest)
+  if (current.from !== 'user') {
+    // The entire connected peer context is indivisible: omitting a completed
+    // branch while retaining its human ancestor would imply unfinished work.
+    const rows = units.flatMap(unit => unit.rows)
+    units = [{ rows, latest: units.reduce((latest, unit) => Math.max(latest, unit.latest), 0) }]
+  }
   const selected: Pick<GroupMailboxHistoryMessage, 'from' | 'text' | 'messageId' | 'timestamp'>[][] = []
   let bytes = 2, count = 0
   for (const unit of units.reverse()) {
