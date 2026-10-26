@@ -277,7 +277,8 @@ test(
           false,
           project,
         )
-        assert.equal(scoped.effectiveDefaultModel, model)
+        // Saved project settings remain runtime-owned, not environment evidence.
+        assert.equal(scoped.effectiveDefaultModel, null)
       }
       assert(
         paths.length >= 5 &&
