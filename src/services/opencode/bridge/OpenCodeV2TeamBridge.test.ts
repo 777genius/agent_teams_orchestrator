@@ -166,3 +166,17 @@ describe('bounded original-owner status recovery', () => {
     const [exit,stderr]=await Promise.all([child.exited,new Response(child.stderr).text()]);expect({exit,stderr}).toEqual({exit:0,stderr:''});
   },15000);
 });
+
+test('V2 certifies only a successful full non-response without tools or mixed assistant output', () => {
+  const turn = { ...terminal, observedToolCallCount: 0, successfulCatalogToolCallCount: 0, text: '[[AGENT_TEAMS_NO_REPLY]]' }
+  const observe = (value: OpenCodeV2TurnProjection) => projectV2DeliveryObservation(value, 'native', 'physical')
+  expect(observe(turn).reason).toBe('assistant_child_completed_with_non_response_text')
+  for (const value of [
+    { ...turn, state: 'pending' as const }, { ...turn, state: 'failed' as const },
+    { ...turn, text: 'No reply needed; result is 42.' },
+    { ...turn, text: 'No reply needed' + ' '.repeat(500) + ' result is 42.' },
+    { ...turn, assistantMessageIds: [] },
+    { ...turn, observedToolCallCount: 1 }, { ...turn, observedToolCallCount: undefined },
+    { ...turn, toolEffects: [{ assistantMessageId: 'assistant', toolCallId: 'tool', toolName: 'read', kind: 'other' as const, input: {}, content: [], result: null }] },
+  ]) expect(observe(value).reason).not.toBe('assistant_child_completed_with_non_response_text')
+})

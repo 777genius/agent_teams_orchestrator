@@ -1,3 +1,4 @@
+import { COMPLETED_NON_RESPONSE_REASON, isOpenCodeNonResponseText, isSuccessfulGroupCatalogResult } from './OpenCodeCompletedNonResponse.js'
 import type {
   OpenCodeCanonicalMessage,
   OpenCodeCanonicalToolCall,
@@ -643,8 +644,19 @@ function classifyChildren(input: {
   }
 
   if (best) {
+    const child = input.children.find(item => item.id === best.assistantMessageId)
+    const onlyTextChild = input.children.filter(item => compactText(item.text) || compactText(item.previewText)).length === 1
+    const completedNonResponse = best.state === 'responded_plain_text' && onlyTextChild &&
+      (input.rawStatus === 'idle' || input.rawStatus === null) && child &&
+      child.id === input.children.at(-1)?.id && child.parentId === deliveredUserMessageId && Number.isFinite(child.completedAt) &&
+      (child.completedAt ?? 0) > 0 && child.finishReason === 'stop' &&
+      !child.hasError && !hasErroredMeaningfulTool && input.children.every(item => !item.hasError && item.toolCalls.every(tool =>
+        normalizeToolName(tool.toolName) === 'group_chat_list' && tool.status === 'completed' && !isErroredTool(tool) &&
+        (isSuccessfulGroupCatalogResult(tool.output) || (tool.output == null && isSuccessfulGroupCatalogResult(tool.outputText))))) &&
+      isOpenCodeNonResponseText(child.text)
     return {
       ...best,
+      ...(completedNonResponse ? { reason: COMPLETED_NON_RESPONSE_REASON } : {}),
       toolCallNames: [...observedToolNames],
     }
   }

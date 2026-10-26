@@ -1,4 +1,4 @@
-import { buildGroupMailboxPrompt, findGroupMailboxReplyOutcome, hasConflictingGroupReplyScope, hasGroupMailboxMarker, isCurrentGroupMailboxMessage, type GroupMailboxEnvelope } from '../utils/groupMailbox.js'
+import { buildGroupMailboxPrompt, findGroupMailboxReplyOutcome, hasConflictingGroupReplyScope, hasGroupMailboxMarker, isCurrentGroupMailboxMessage, type GroupMailboxEnvelope, type GroupMailboxHistoryMessage, type GroupMailboxHostTurn, type GroupMailboxOwnPostProof, findGroupMailboxOwnPostProofs } from '../utils/groupMailbox.js'
 import type { ContentBlockParam } from '@anthropic-ai/sdk/resources/messages.mjs'
 import { readFreshGroupChatCatalog, relayGroupAssistantText } from '../utils/groupChatControlClient.js'
 import { createHash, randomUUID } from 'crypto'
@@ -107,6 +107,7 @@ import {
   isTeamPermissionUpdate,
   markMessagesAsReadByIds,
   readAndClaimInteractiveMailboxSnapshot,
+  readGroupMailboxContext,
   type TeammateMessage,
   writeToMailbox,
   writeToMailboxVerified,
@@ -591,6 +592,7 @@ export function shouldSkipBootstrapReadinessWait(params: {
 
 export function getOrdinaryInlineHandoffPrompt({
   from,
+  to,
   source,
   memberName,
   messageId,
@@ -599,20 +601,27 @@ export function getOrdinaryInlineHandoffPrompt({
   teamName,
   timestamp,
   groupCatalog,
+  groupHistory,
+  groupSentHistory,
+  groupOwnPosts,
   ...groupEnvelope
 }: GroupMailboxEnvelope & {
   from: string
+  to?: string
   source?: string
   memberName?: string
   messageId?: string
   replyProtocol?: OrdinaryUserDirectReplyProtocol
   groupCatalog?: unknown
+  groupHistory?: readonly GroupMailboxHistoryMessage[]
+  groupSentHistory?: readonly GroupMailboxHistoryMessage[]
+  groupOwnPosts?: readonly GroupMailboxOwnPostProof[]
   text: string
   teamName?: string
   timestamp: string
 }): string {
   if (hasGroupMailboxMarker(groupEnvelope)) {
-    return buildGroupMailboxPrompt({ ...groupEnvelope, from, messageId, text, timestamp }, teamName, memberName, groupCatalog)
+    return buildGroupMailboxPrompt({ ...groupEnvelope, from, to, messageId, text, timestamp }, teamName, memberName, groupCatalog, groupHistory, groupSentHistory, groupOwnPosts)
   }
   const isUserMessage = isHumanDirectMailboxMessage({ from, source })
   const normalizedTeamName = teamName?.trim()
@@ -1791,11 +1800,13 @@ export function findOrdinaryDirectReplyFallback({
   submitUserMessageUuid,
   teamName,
   excludeEmptyMessages = false,
+  excludeNativeCommentary = false,
 }: {
   messages: AppState['messages']
   submitUserMessageUuid: string
   teamName?: string
   excludeEmptyMessages?: boolean
+  excludeNativeCommentary?: boolean
 }): OrdinaryDirectReplyFallback | null {
   const startIndex = messages.findIndex(
     message => message.type === 'user' && message.uuid === submitUserMessageUuid,
@@ -1824,7 +1835,8 @@ export function findOrdinaryDirectReplyFallback({
       continue
     }
 
-    const text = extractAssistantText(message, excludeEmptyMessages)
+    const phase = (message.message as { codexNativeMessagePhase?: string }).codexNativeMessagePhase
+    const text = excludeNativeCommentary && phase === 'commentary' ? '' : extractAssistantText(message, excludeEmptyMessages)
     if (text) {
       assistantTextParts.push(text)
     }
@@ -2063,7 +2075,7 @@ export function getOrdinaryProcessingAction({
       logForDebugging('[InboxPoller] Ambiguous group turn: no inferred reply destination or private fallback')
       return { type: 'finalize' }
     }
-    const fallback = findOrdinaryDirectReplyFallback({ messages, submitUserMessageUuid: attempt.submitUserMessageUuid, teamName, excludeEmptyMessages: true })
+    const fallback = findOrdinaryDirectReplyFallback({ messages, submitUserMessageUuid: attempt.submitUserMessageUuid, teamName, excludeEmptyMessages: true, excludeNativeCommentary: true })
     if (fallback) return { type: 'deliver_assistant_text', text: fallback.text }
     if (hasAttemptObservedPostSubmitActivity({ messages, submitUserMessageUuid: attempt.submitUserMessageUuid })) return { type: 'finalize' }
     return { type: 'noop' }
@@ -2282,6 +2294,7 @@ export function useInboxPoller({
     new Map(),
   )
   const observedBootstrapTransportRef = useRef<Set<string>>(new Set())
+  const groupHostTurnsRef = useRef<GroupMailboxHostTurn[]>([])
   const ordinaryAttemptsRef = useRef<Map<string, OrdinaryAttemptState>>(
     new Map(),
   )
@@ -4194,7 +4207,29 @@ export function useInboxPoller({
           ? ordinaryRecoveryRef.current.get(ordinaryPendingMessage.messageId)
           : undefined
       let groupCatalog: unknown
+      let groupHistory: readonly GroupMailboxHistoryMessage[] | undefined
+      let groupSentHistory: readonly GroupMailboxHistoryMessage[] | undefined
+      let groupOwnPosts: readonly GroupMailboxOwnPostProof[] | undefined
       if (ordinaryPendingMessage && hasGroupMailboxMarker(ordinaryPendingMessage) && teamName && agentName) {
+        // Native Codex starts a fresh thread each turn. Read only its own prior
+        // finalized physical deliveries; group/run/receiver fences are applied by the prompt builder.
+        if (shouldUseCodexProviderRoutingForCurrentProcess()) {
+          try {
+            groupHistory = await readGroupMailboxContext(agentName, teamName)
+            // Canonical rows are filtered here and then fenced by their physical
+            // relay into this receiver/run. Other user inbox content never enters the prompt.
+            groupSentHistory = (await readGroupMailboxContext('user', teamName)).filter(row =>
+              row.from === agentName && row.groupChatId === ordinaryPendingMessage.groupChatId && row.source === 'runtime_delivery')
+            groupOwnPosts = findGroupMailboxOwnPostProofs({
+              messages: getMessages(), turns: groupHostTurnsRef.current, teamName, memberName: agentName,
+              current: { ...ordinaryPendingMessage, to: agentName }, history: groupHistory, sentHistory: groupSentHistory,
+            })
+          }
+          catch {
+            groupHistory = undefined; groupSentHistory = undefined; groupOwnPosts = undefined
+            logForDebugging('[InboxPoller] Prior group context unavailable')
+          }
+        }
         try { groupCatalog = await readFreshGroupChatCatalog(teamName, agentName) }
         catch (error) { logForDebugging(`[InboxPoller] Fresh group catalog unavailable: ${String(error)}`) }
       }
@@ -4211,6 +4246,10 @@ export function useInboxPoller({
             : getOrdinaryInlineHandoffPrompt({
                 ...ordinaryPendingMessage,
                 groupCatalog,
+                groupHistory,
+                groupSentHistory,
+                groupOwnPosts,
+                to: agentName,
                 from: ordinaryPendingMessage.from,
                 source: ordinaryPendingMessage.source,
                 memberName: agentName,
@@ -4401,6 +4440,17 @@ export function useInboxPoller({
           `[InboxPoller] Submission rejected, keeping messages queued: ${formatPromptSubmitRejectionDetail(submitted)}`,
         )
         return
+      }
+
+      if (ordinaryPendingMessage?.messageId && ordinaryPendingMessage.groupChatId &&
+          ordinaryPendingMessage.groupRunKey && submitted.userMessageUuid && teamName &&
+          shouldUseCodexProviderRoutingForCurrentProcess()) {
+        groupHostTurnsRef.current.push({
+          submitUserMessageUuid: submitted.userMessageUuid, teamName, memberName: agentName,
+          groupChatId: ordinaryPendingMessage.groupChatId, groupRunKey: ordinaryPendingMessage.groupRunKey,
+          physicalMessageId: ordinaryPendingMessage.messageId,
+        })
+        if (groupHostTurnsRef.current.length > 64) groupHostTurnsRef.current.shift()
       }
 
       if (nativeBootstrapInjection) {

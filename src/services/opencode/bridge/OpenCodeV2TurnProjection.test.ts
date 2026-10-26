@@ -286,3 +286,11 @@ test('CodeMode forged output, absent metadata or durable record, wrong binding a
   expect(projectOpenCodeV2Turn({ ...mismatch, log: { ...mismatch.log, events } }).visibleReplies).toHaveLength(0)
   expect(projectOpenCodeV2Turn({ ...codeModeCut(), sessionID: 'ses_TESTwrong' }).visibleReplies).toHaveLength(0)
 })
+
+test('counts native tools even when absent from advertised controller effects', () => {
+  const value = cut()
+  const projected = projectOpenCodeV2Turn({ ...value, advertisedTools: [] })
+  expect(projected.state).toBe('succeeded')
+  expect(projected.toolEffects).toEqual([])
+  expect(projected.observedToolCallCount).toBe(1)
+})

@@ -1,3 +1,4 @@
+import { COMPLETED_NON_RESPONSE_REASON, isOpenCodeNonResponseText } from '../OpenCodeCompletedNonResponse.js'
 import { openCodeV2EngineVersion } from '../compatibility/OpenCodeV2Registry.js'
 import { openCodeBunVersion } from '../../../constants/openCodeBunVersion.js'
 import path from 'node:path'
@@ -198,7 +199,10 @@ export function projectV2DeliveryObservation(turn: OpenCodeV2TurnProjection | nu
     visibleReplyMessageId: terminal ? reply?.visibleReplyMessageId ?? null : null,
     visibleReplyCorrelation: terminal && reply ? 'relayOfMessageId' : null,
     latestAssistantPreview: terminal ? turn?.text.slice(0, 500) || null : null,
-    reason: turn?.reason ?? 'native_terminal_not_observed',
+    reason: turn?.state === 'succeeded' && !reply && turn.observedToolCallCount !== undefined && turn.observedToolCallCount === turn.successfulCatalogToolCallCount &&
+      turn.assistantMessageIds.length > 0 && turn.toolEffects.every(effect =>
+        ['group_chat_list', 'agent-teams_group_chat_list', 'agent_teams_group_chat_list', 'mcp__agent-teams__group_chat_list', 'mcp__agent_teams__group_chat_list'].includes(effect.toolName)) && isOpenCodeNonResponseText(turn.text)
+      ? COMPLETED_NON_RESPONSE_REASON : turn?.reason ?? 'native_terminal_not_observed',
   }
 }
 

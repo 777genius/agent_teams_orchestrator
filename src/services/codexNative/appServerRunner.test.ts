@@ -480,3 +480,12 @@ describe('runCodexNativeAppServer', () => {
     )
   })
 })
+
+test('preserves known native assistant phases and keeps unknown phases compatible', () => {
+  const map = createCodexAppServerNotificationMapper()
+  for (const phase of ['commentary', 'partial_answer', 'final_answer', null, 'future']) {
+    const events = map('item/completed', { threadId: 'TEST', turnId: 'turn', item: { type: 'agentMessage', id: String(phase), text: 'text', phase } })
+    expect(events[0]).toEqual({ type: 'assistant_text', itemId: String(phase), text: 'text',
+      ...(['commentary', 'partial_answer', 'final_answer'].includes(String(phase)) ? { phase } : {}) })
+  }
+})
