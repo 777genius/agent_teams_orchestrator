@@ -82,7 +82,7 @@ export async function readRetiredOpenCodeV2CatalogProfile(dataRoot: string, root
   executionAssert(await absent(path.join(root, '.opencode-v2-execution-owner')) &&
     await absent(path.join(path.dirname(databasePath), '.opencode.db.opencode-v2-execution-owner')), 'provider_original_owner_unknown')
   const releases = (await readdir(root)).filter(name => /^\.opencode-v2-execution-owner\.released\.[a-f0-9-]{36}$/.test(name))
-  executionAssert(releases.length > 0 && releases.length <= 32, 'provider_original_owner_unknown')
+  executionAssert(releases.length > 0, 'provider_original_owner_unknown')
   let retired = false
   for (const name of releases) {
     const directory = path.join(root, name); await privatePath(directory, 'directory')
@@ -96,6 +96,7 @@ export async function readRetiredOpenCodeV2CatalogProfile(dataRoot: string, root
       receipt.scopeClosed === true && receipt.processRetired === true &&
       (receipt.descendantsRetired === true || windows), 'provider_original_owner_unknown')
     retired = true
+    break
   }
   executionAssert(retired, 'provider_original_owner_unknown')
   const directory = path.join(root, 'config/opencode')

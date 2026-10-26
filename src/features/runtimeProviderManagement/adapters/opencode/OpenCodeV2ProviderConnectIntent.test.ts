@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test'
-import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, realpath, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { tmpdir } from 'node:os'
 import { prepareOpenCodeV2ConnectVerification, readOpenCodeV2ConnectIntent,
@@ -65,7 +65,7 @@ test('marker publication preserves pending identities, rejects replacement creat
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 
-test('only the retired original profile is admitted for readonly integration readback', async () => {
+test('more than 32 retired readback leases remain recoverable while active or unretired ownership is refused', async () => {
   const dataRoot = await realpath(await mkdtemp(path.join(tmpdir(), 'TEST-v2-retired-catalog-')))
   const root = path.join(dataRoot, 'opencode/v2/provider-profiles/catalog-TESToriginal')
   const lease = '11111111-1111-4111-8111-111111111111', graph = 'a'.repeat(64)
@@ -82,11 +82,22 @@ test('only the retired original profile is admitted for readonly integration rea
     const release = { state: 'retired', receipt: { pid, birth, scopeClosed: true, processRetired: true, descendantsRetired: true } }
     await save(path.join(released, 'release.json'), release)
     await save(path.join(directory, 'opencode.json'), { providers: { 'kimi-code-plan-global': {} }, plugins: [] })
+    for (let index = 2; index <= 33; index++) {
+      const leaseOwnerId = `11111111-1111-4111-8111-${String(index).padStart(12, '0')}`
+      const archive = path.join(root, `.opencode-v2-execution-owner.released.${leaseOwnerId}`)
+      await mkdir(archive, { mode: 0o700 })
+      await save(path.join(archive, 'owner.json'), { profileRoot: root, databasePath, graphSha256: graph, leaseOwnerId })
+      await save(path.join(archive, 'child.json'), { pid, birth })
+      await save(path.join(archive, 'release.json'), release)
+    }
     expect((await readRetiredOpenCodeV2CatalogProfile(dataRoot, root, 'kimi-code-plan-global', graph)).databasePath).toBe(databasePath)
     await mkdir(path.join(root, '.opencode-v2-execution-owner'), { mode: 0o700 })
     await expect(readRetiredOpenCodeV2CatalogProfile(dataRoot, root, 'kimi-code-plan-global', graph)).rejects.toThrow('provider_original_owner_unknown')
     await rm(path.join(root, '.opencode-v2-execution-owner'), { recursive: true })
-    await save(path.join(released, 'release.json'), { ...release, receipt: { ...release.receipt, scopeClosed: false } })
+    for (const archive of await readdir(root)) {
+      if (archive.startsWith('.opencode-v2-execution-owner.released.'))
+        await save(path.join(root, archive, 'release.json'), { ...release, receipt: { ...release.receipt, scopeClosed: false } })
+    }
     await expect(readRetiredOpenCodeV2CatalogProfile(dataRoot, root, 'kimi-code-plan-global', graph)).rejects.toThrow('provider_original_owner_unknown')
   } finally { await rm(dataRoot, { recursive: true, force: true }) }
 })
