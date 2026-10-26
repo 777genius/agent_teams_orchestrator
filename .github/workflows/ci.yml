@@ -463,7 +463,7 @@ jobs:
 
   required:
     name: CI required
-    if: always()
+    if: always() && !cancelled()
     needs: [scope, cursor-managed-plugin, task-change-ledger, opencode-authority, windows-packaged-backfill, opencode-conformance, packaged-delivery, opencode-v2-linux]
     runs-on: ubuntu-latest
     timeout-minutes: 5
