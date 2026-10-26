@@ -1,3 +1,4 @@
+import { claimOpenCodeV2FreshProofRequest, hasOpenCodeV2FreshProofClaim } from './OpenCodeV2FreshProofRequest.js'
 import { openCodeV2EngineVersion } from '../compatibility/OpenCodeV2Registry.js'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
@@ -20,7 +21,7 @@ import type { QueueIntent } from '../execution/OpenCodeV2AdmissionService.js'
 type Selection = Awaited<ReturnType<typeof inspectOpenCodeV2SourceAvailability>>
 export type OpenCodeV2ProbeIntent = { sourceKey: string; binding: RunBinding; sessionID: string; intentHash: string }
 type ProbeRecord = { sourceKey: string; binding: RunBinding; sessionID: string; intent: QueueIntent;
-  submitted: boolean; proof: OpenCodeExecutionProof | null; retired: boolean; failure: RunProbeFailure | null }
+  submitted: boolean; proof: OpenCodeExecutionProof | null; retired: boolean; failure: RunProbeFailure | null; freshExecutionProofRequestId?: string }
 function parseProbeFailure(value: unknown): RunProbeFailure | null {
   if (value === null || value === undefined) return null // Existing records predate this field.
   executionAssert(value === 'native_execution_failed' || value === 'native_execution_cancelled', 'probe_failure_invalid')
@@ -47,17 +48,27 @@ function parseRecord(value: unknown): ProbeRecord {
   executionAssert(request.operation === 'send', 'probe_store_invalid')
   const proof = row.proof === null ? null : parseOpenCodeExecutionProof(row.proof)
   executionAssert(row.proof === null || proof, 'probe_store_invalid')
+  executionAssert(row.freshExecutionProofRequestId === undefined || typeof row.freshExecutionProofRequestId === 'string' &&
+    /^[a-zA-Z0-9._:-]{1,200}$/.test(row.freshExecutionProofRequestId), 'probe_store_invalid')
   const failure = parseProbeFailure(row.failure)
   executionAssert(!failure || row.submitted === true && !proof, 'probe_store_invalid')
   return { sourceKey: row.sourceKey, binding: typedBinding, sessionID: row.sessionID,
-    submitted: row.submitted, retired: row.retired, intent: request.intent, proof, failure }
+    submitted: row.submitted, retired: row.retired, intent: request.intent, proof, failure,
+    ...(row.freshExecutionProofRequestId === undefined ? {} : { freshExecutionProofRequestId: row.freshExecutionProofRequestId as string }) }
 }
 
 /** Normal readiness protocol. The cached proof is a result of this owned producer,
  * never a public caller proof DTO. UNKNOWN retains the original IDs and only observes. */
 export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, selection: Selection, run: boolean,
   options: { unattendedTeam?: boolean; onPrepared?: (sourceKey: string) => Promise<void>;
-    onIntentPersisted?: (value: OpenCodeV2ProbeIntent) => Promise<void>; requireExisting?: OpenCodeV2ProbeIntent } = {}) {
+    onIntentPersisted?: (value: OpenCodeV2ProbeIntent) => Promise<void>; requireExisting?: OpenCodeV2ProbeIntent;
+    freshExecutionProofRequestId?: string } = {}) {
+  const freshRequestId = options.freshExecutionProofRequestId
+  executionAssert(freshRequestId === undefined || run && !options.requireExisting && typeof freshRequestId === 'string' &&
+    /^[a-zA-Z0-9._:-]{1,200}$/.test(freshRequestId), 'probe_fresh_request_invalid')
+  const available = (record: ProbeRecord) => freshRequestId !== undefined && record.freshExecutionProofRequestId !== freshRequestId
+    ? { state: 'pending' as const, proof: null, reason: 'The original probe settled; the requested fresh proof still requires its own retired-generation admission.' }
+    : { state: 'available' as const, proof: record.proof, reason: null }
   const unattendedTeam = options.unattendedTeam === true
   const deadline = Date.now() + Math.max(1, Math.min(envelope.timeoutMs || 120_000, 300_000) - 25_000)
   const assertDeadline = () => executionAssert(Date.now() < deadline, 'execution_timeout')
@@ -113,9 +124,19 @@ export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, 
     if (record?.proof) executionAssert(record.proof.projectPath === normalizeOpenCodeProjectIdentity(selection.project) && record.proof.modelId === `${selection.model.providerID}/${selection.model.id}` &&
       record.proof.capabilitySnapshotId === selection.capabilitySnapshotId && record.proof.opencodeVersion === selection.native.version &&
       record.proof.binaryPath === selection.native.executablePath && record.proof.projectBehaviorFingerprint === behavior.projectBehaviorFingerprint, 'probe_cached_target_changed')
+    const freshClaimed = freshRequestId === undefined ? false : await hasOpenCodeV2FreshProofClaim(directory, sourceKey, freshRequestId)
+    if (freshClaimed && record?.freshExecutionProofRequestId !== freshRequestId)
+      return { state: 'pending' as const, proof: null, reason: 'This fresh request already owns a retained claim; no replacement input was submitted.' }
+    if (freshRequestId !== undefined && record?.freshExecutionProofRequestId === freshRequestId && !freshClaimed)
+      return { state: 'pending' as const, proof: null, reason: 'The original fresh request claim is unavailable; no replacement input was submitted.' }
+    if (freshRequestId !== undefined && record?.proof && record.retired) {
+      if (record.freshExecutionProofRequestId !== freshRequestId) record = null
+      else if (Date.parse(record.proof.expiresAt) <= Date.now())
+        return { state: 'pending' as const, proof: null, reason: 'This fresh request already completed and expired; no replacement input was submitted.' }
+    }
     if (record?.proof && record.retired && Date.parse(record.proof.expiresAt) > Date.now()) {
       await options.onIntentPersisted?.({ sourceKey, binding: record.binding, sessionID: record.sessionID, intentHash: executionHash(record.intent) })
-      return { state: 'available' as const, proof: record.proof, reason: null }
+      return available(record)
     }
     if (record?.failure && (record.retired || !run)) return { state: 'failed' as const, proof: null,
       reason: record.retired ? record.failure : `${record.failure}; probe_physical_cleanup_unknown` }
@@ -125,6 +146,11 @@ export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, 
     if (record?.proof && record.retired) record = null // Completed generations may start a fresh normal probe after TTL.
     if (!record) {
       assertDeadline()
+      if (freshRequestId !== undefined) {
+        executionAssert(!freshClaimed, 'probe_fresh_claim_conflict')
+        await claimOpenCodeV2FreshProofRequest(directory, sourceKey, freshRequestId)
+        assertDeadline()
+      }
       const nonce = randomUUID().replaceAll('-', ''), teamId = `TEST-execution-probe-${nonce}`
       const localClaude = selection.controller.type === 'local' ? selection.controller.environment?.AGENT_TEAMS_MCP_CLAUDE_DIR : undefined
       if (localClaude) {
@@ -151,7 +177,8 @@ export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, 
         randomUUID(), { intent, expectedText, unattendedTeam }), deadline }
       assertDeadline()
       const member = plan.members[0]; executionAssert(member, 'probe_plan_invalid')
-      record = { sourceKey, binding: plan.binding, sessionID: member.originalSessionId, intent, submitted: false, proof: null, retired: false, failure: null }
+      record = { sourceKey, binding: plan.binding, sessionID: member.originalSessionId, intent, submitted: false, proof: null, retired: false, failure: null,
+        ...(freshRequestId === undefined ? {} : { freshExecutionProofRequestId: freshRequestId }) }
       await save(record) // Original identities precede launch and every prompt effect.
       await options.onIntentPersisted?.({ sourceKey, binding: record.binding, sessionID: record.sessionID, intentHash: executionHash(record.intent) })
       assertDeadline()
@@ -212,7 +239,7 @@ export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, 
       if (observed.proof) {
         await retire()
         record.proof = observed.proof; record.retired = true; await save(record)
-        return { state: 'available' as const, proof: record.proof, reason: null }
+        return available(record)
       }
       await new Promise(resolve => setTimeout(resolve, Math.min(300, Math.max(1, deadline - Date.now()))))
     }
