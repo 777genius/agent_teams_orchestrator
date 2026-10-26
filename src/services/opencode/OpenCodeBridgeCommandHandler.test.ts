@@ -1689,6 +1689,29 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(releases).toBe(1)
   })
 
+  test('selected send acquisition timeout carries explicit non-submission proof', async () => {
+    const { state, envelope } = await setupSelectedDeliveryRegression('opencode.sendMessage')
+    openCodeProvisioningProbe.probeRetainingHost = async () => {
+      throw new OpenCodeRuntimeDeadlineError('host_start', 25, 26)
+    }
+    const result = await executeOpenCodeBridgeCommandEnvelope(envelope)
+    expect(result.ok).toBe(false)
+    if (!('error' in result)) throw new Error('Expected acquisition timeout')
+    expect(result.error.details).toMatchObject({ promptSubmission: 'not_started' })
+    expect(state.prompts).toBe(0)
+  })
+
+  test('a timeout thrown by the prompt operation never carries non-submission proof', async () => {
+    const { envelope } = await setupSelectedDeliveryRegression('opencode.sendMessage')
+    openCodeSessionBridge.promptAsync = async () => {
+      throw new OpenCodeRuntimeDeadlineError('host_start', 25, 26)
+    }
+    const result = await executeOpenCodeBridgeCommandEnvelope(envelope)
+    expect(result.ok).toBe(false)
+    if (!('error' in result)) throw new Error('Expected prompt timeout')
+    expect(result.error.details).not.toHaveProperty('promptSubmission')
+  })
+
   test('stored lane handshake, reconcile and stop share selected authority without a provider catalog', async () => {
     const record = buildRecord({ runId: 'run-1', selectedModel: 'openai/gpt-5.6-sol', toolApprovalMode: 'manual',
       profileScope: { purpose: 'launch_runtime', providerId: 'openai', scopeToken: 'lane-scope',

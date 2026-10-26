@@ -32,6 +32,11 @@ type OpenCodeRuntimeDeadlineDeps = {
 
 export class OpenCodeRuntimeDeadlineError extends Error {
   readonly kind = 'timeout' as const
+  private promptNotSubmitted = false
+
+  confirmPromptNotSubmitted(): void {
+    this.promptNotSubmitted = true
+  }
 
   constructor(
     readonly phase: OpenCodeReadinessPhase,
@@ -52,7 +57,18 @@ export class OpenCodeRuntimeDeadlineError extends Error {
       commandBudgetMs: this.commandBudgetMs,
       elapsedMs: this.elapsedMs,
       remainingMs: this.remainingMs,
+      ...(this.promptNotSubmitted ? { promptSubmission: 'not_started' } : {}),
     }
+  }
+}
+
+/** Wrap only acquisition which cannot submit a prompt, never the send operation. */
+export async function beforeOpenCodePromptSubmission<T>(operation: () => Promise<T>): Promise<T> {
+  try {
+    return await operation()
+  } catch (error) {
+    if (isOpenCodeRuntimeDeadlineError(error)) error.confirmPromptNotSubmitted()
+    throw error
   }
 }
 

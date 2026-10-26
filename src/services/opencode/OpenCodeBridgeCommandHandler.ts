@@ -73,6 +73,7 @@ import {
   resolveProcessAttributionDirectory,
 } from './OpenCodeProcessAttributionStore.js'
 import {
+  beforeOpenCodePromptSubmission,
   isOpenCodeRuntimeDeadlineError,
   OpenCodeRuntimeDeadline,
   raceOpenCodeAbortSignal,
@@ -1022,7 +1023,7 @@ async function withStoredLaneAuthority<T>(
   operation: (authority: Awaited<ReturnType<typeof probeStoredLaneAuthority>>) => Promise<T>,
 ): Promise<T> {
   const signal = externalSignal ? AbortSignal.any([deadline.signal, externalSignal]) : deadline.signal
-  const retained = await deadline.runPhase('host_start', async context => {
+  const acquire = () => deadline.runPhase('host_start', async context => {
     const phaseContext = { ...context, signal, throwIfExpired: () => {
       signal.throwIfAborted()
       context.throwIfExpired()
@@ -1039,6 +1040,9 @@ async function withStoredLaneAuthority<T>(
     }
     return retained
   })
+  const retained = command === 'opencode.sendMessage'
+    ? await beforeOpenCodePromptSubmission(acquire)
+    : await acquire()
   try {
     signal.throwIfAborted()
     const value = await operation(retained)

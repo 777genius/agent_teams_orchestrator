@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 
 import {
+  beforeOpenCodePromptSubmission,
   OPEN_CODE_READINESS_PHASES,
   OpenCodeRuntimeDeadline,
   OpenCodeRuntimeDeadlineError,
@@ -9,6 +10,20 @@ import {
 } from './OpenCodeRuntimeDeadline.js'
 
 type ManualTimer = { callback: () => void; timeoutMs: number; cancelled: boolean }
+
+test('only an explicitly pre-submission timeout proves that a prompt was not sent', async () => {
+  const timeout = new OpenCodeRuntimeDeadlineError('host_start', 50, 60)
+  expect(timeout.toDetails()).not.toHaveProperty('promptSubmission')
+  await expect(beforeOpenCodePromptSubmission(async () => { throw timeout })).rejects.toBe(timeout)
+  expect(timeout.toDetails()).toMatchObject({ promptSubmission: 'not_started' })
+  const duringSend = new OpenCodeRuntimeDeadlineError('host_start', 50, 60)
+  await beforeOpenCodePromptSubmission(async () => 'acquired')
+  // A phase name alone is not submission evidence: legacy sends retain host_start.
+  expect(duringSend.toDetails()).not.toHaveProperty('promptSubmission')
+  const other = new Error('transport failed')
+  await expect(beforeOpenCodePromptSubmission(async () => { throw other })).rejects.toBe(other)
+  expect(other).not.toHaveProperty('promptSubmission')
+})
 
 async function withManualTimers(run: (timers: ManualTimer[]) => Promise<void>): Promise<void> {
   const realSetTimeout = globalThis.setTimeout
