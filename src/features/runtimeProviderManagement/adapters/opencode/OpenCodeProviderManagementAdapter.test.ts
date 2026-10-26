@@ -153,6 +153,64 @@ function executionProbeResult(
 }
 
 describe('OpenCodeProviderManagementAdapter', () => {
+  test('recovers setup discovery after one cold catalog read without retrying successful endpoints', async () => {
+    const initialization: boolean[] = []
+    let providerReads = 0
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: { probe: async () => inventory({ availableProviders: [], connectedProviders: [], models: [] }) },
+      hostManager: { ensureHost: async () => host(), releaseHost: async () => {} },
+      clientFactory: { create: () => ({
+        getConfigProviders: async options => {
+          initialization.push(options?.initializeInstance === true)
+          if (initialization.length === 1) throw new Error('cold instance timed out')
+          return { providers: [{ id: 'github-copilot', name: 'GitHub Copilot' }], default: {} }
+        },
+        getProviders: async () => { providerReads += 1; return { all: [], connected: [], default: {} } },
+        getProviderAuth: async () => ({ 'github-copilot': [{ type: 'oauth', label: 'GitHub sign-in' }] }),
+      }) },
+    })
+    const result = await adapter.loadSetupForm({ runtimeId: 'opencode', providerId: 'github-copilot' })
+    expect(result.ok).toBe(true)
+    expect(initialization).toEqual([true, false])
+    expect(providerReads).toBe(1)
+  })
+
+  test('reports failed catalog reads instead of falsely declaring Copilot missing', async () => {
+    let reads = 0
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: { probe: async () => inventory({ availableProviders: [], connectedProviders: [], models: [] }) },
+      hostManager: { ensureHost: async () => host(), releaseHost: async () => {} },
+      clientFactory: { create: () => ({
+        getConfigProviders: async () => { reads += 1; throw new Error('HTTP 503 token=private-catalog-token') },
+        getProviders: async () => { throw new Error('ECONNRESET') },
+        getProviderAuth: async () => ({}),
+      }) },
+    })
+    const failure = expectFailure(await adapter.loadSetupForm({ runtimeId: 'opencode', providerId: 'github-copilot' }))
+    expect(reads).toBe(2)
+    expect(failure.code).toBe('runtime-unhealthy')
+    expect(failure.message).toContain('/config/providers')
+    expect(failure.message).toContain('503')
+    expect(failure.message).toContain('/provider:')
+    expect(failure.message).toContain('ECONNRESET')
+    expect(failure.message).not.toContain('private-catalog-token')
+  })
+
+  test('keeps an honestly missing provider missing without repeating empty reads', async () => {
+    let reads = 0
+    const adapter = new OpenCodeProviderManagementAdapter({
+      inventoryService: { probe: async () => inventory({ availableProviders: [], connectedProviders: [], models: [] }) },
+      hostManager: { ensureHost: async () => host(), releaseHost: async () => {} },
+      clientFactory: { create: () => ({
+        getConfigProviders: async () => { reads += 1; return { providers: [], default: {} } },
+        getProviders: async () => ({ all: [], connected: [], default: {} }),
+        getProviderAuth: async () => ({}),
+      }) },
+    })
+    expect(expectFailure(await adapter.loadSetupForm({ runtimeId: 'opencode', providerId: 'github-copilot' })).code).toBe('provider-missing')
+    expect(reads).toBe(1)
+  })
+
   test('returns a needs-setup view when OpenCode is missing', async () => {
     let ensureHostCalled = false
     const adapter = new OpenCodeProviderManagementAdapter({

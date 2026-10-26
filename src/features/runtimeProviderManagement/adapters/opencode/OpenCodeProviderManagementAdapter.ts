@@ -5,6 +5,8 @@ import { realpath } from 'node:fs/promises'
 import { getOpenCodeModelDeclaredInputModalities } from '../../../../services/opencode/OpenCodeDeclaredInputModalities.js'
 import { getOpenCodeVersionProbeDiagnostics, OpenCodeVersionProbeCleanupError } from '../../../../services/opencode/compatibility/OpenCodeVersionProbe.js'
 
+import { readProviderCatalogWithRetry, providerCatalogReadFailures } from './providerCatalogRead.js'
+
 import {
   openCodeClientFactory,
   OPEN_CODE_INSTANCE_INITIALIZATION_TIMEOUT_MS,
@@ -4362,16 +4364,22 @@ export class OpenCodeProviderManagementAdapter
       async ({ inventory, client }) => {
         const [configProvidersResult, providersResult, providerAuthResult, serverDocResult] =
           await Promise.all([
-            safeRead(() => client.getConfigProviders()),
-            safeRead(() => client.getProviders()),
-            safeRead(() => client.getProviderAuth()),
+            readProviderCatalogWithRetry(attempt => client.getConfigProviders({ initializeInstance: attempt === 0 })),
+            readProviderCatalogWithRetry(() => client.getProviders()),
+            readProviderCatalogWithRetry(() => client.getProviderAuth()),
             client.getServerDoc
-              ? safeRead(() => client.getServerDoc!())
+              ? readProviderCatalogWithRetry(() => client.getServerDoc!())
               : Promise.resolve({
                   ok: true,
                   value: null,
                 } as SafeValue<OpenCodeServerDocResponse | null>),
           ])
+        const catalogFailure = providerCatalogReadFailures({
+          '/config/providers': configProvidersResult,
+          '/provider': providersResult,
+          '/provider/auth': providerAuthResult,
+          '/doc': serverDocResult,
+        })
         const configProviders = configProvidersResult.ok ? configProvidersResult.value : null
         const providers = providersResult.ok ? providersResult.value : null
         const providerAuth = providerAuthResult.ok ? providerAuthResult.value : null
@@ -4381,6 +4389,9 @@ export class OpenCodeProviderManagementAdapter
           providers,
         })
         if (!liveProviderIds.has(providerId)) {
+          if (catalogFailure) {
+            return providerManagementError('runtime-unhealthy', redactDiagnostic(catalogFailure))
+          }
           return providerManagementError(
             'provider-missing',
             `OpenCode provider ${providerId} was not found in the live catalog`,
@@ -4831,21 +4842,30 @@ export class OpenCodeProviderManagementAdapter
 
         const [configProvidersResult, providersResult, providerAuthResult, serverDocResult] =
           await Promise.all([
-            safeRead(() => client.getConfigProviders()),
-            safeRead(() => client.getProviders()),
-            safeRead(() => client.getProviderAuth()),
+            readProviderCatalogWithRetry(attempt => client.getConfigProviders({ initializeInstance: attempt === 0 })),
+            readProviderCatalogWithRetry(() => client.getProviders()),
+            readProviderCatalogWithRetry(() => client.getProviderAuth()),
             client.getServerDoc
-              ? safeRead(() => client.getServerDoc!())
+              ? readProviderCatalogWithRetry(() => client.getServerDoc!())
               : Promise.resolve({
                   ok: true,
                   value: null,
                 } as SafeValue<OpenCodeServerDocResponse | null>),
           ])
+        const catalogFailure = providerCatalogReadFailures({
+          '/config/providers': configProvidersResult,
+          '/provider': providersResult,
+          '/provider/auth': providerAuthResult,
+          '/doc': serverDocResult,
+        })
         const configProviders = configProvidersResult.ok ? configProvidersResult.value : null
         const providers = providersResult.ok ? providersResult.value : null
         const providerAuth = providerAuthResult.ok ? providerAuthResult.value : null
         const capabilities = getCapabilities(serverDocResult.ok ? serverDocResult.value : null)
         if (!capabilities.authorizeOAuth || !capabilities.completeOAuth) {
+          if (!serverDocResult.ok && catalogFailure) {
+            return providerManagementError('runtime-unhealthy', redactDiagnostic(catalogFailure))
+          }
           return providerManagementError(
             'unsupported-auth-method',
             'Update OpenCode to a version that supports provider OAuth authorize and callback endpoints.',
@@ -4858,6 +4878,9 @@ export class OpenCodeProviderManagementAdapter
           providers,
         })
         if (!liveProviderIds.has(providerId)) {
+          if (catalogFailure) {
+            return providerManagementError('runtime-unhealthy', redactDiagnostic(catalogFailure))
+          }
           return providerManagementError(
             'provider-missing',
             `OpenCode provider ${providerId} was not found in the live catalog`,
