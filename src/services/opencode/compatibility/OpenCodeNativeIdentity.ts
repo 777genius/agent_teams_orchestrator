@@ -105,7 +105,7 @@ export async function inspectOpenCodeReadSelection(signal?: AbortSignal, onAcqui
   signal?.throwIfAborted()
   const executablePath = await filesystem.realpath(selected)
   signal?.throwIfAborted()
-  const executableSha256 = await hashOpenCodeFile(executablePath)
+  const executableSha256 = await hashOpenCodeFile(executablePath, signal)
   signal?.throwIfAborted()
   const roots = await createOpenCodeVersionReadRoots()
   const output = await readOpenCodeOwnedVersion(executablePath, roots, signal)
@@ -118,7 +118,7 @@ export async function inspectOpenCodeReadSelection(signal?: AbortSignal, onAcqui
     typeof metadata.name !== 'string' || !/^@opencode\/cli-[a-z0-9-]+$/.test(metadata.name) ||
     metadata.version !== policy.version)) throw new Error('identity_mismatch')
   if (!/^opencode(?:\.exe)?$/.test(path.basename(executablePath)) ||
-    await hashOpenCodeFile(executablePath) !== executableSha256) throw new Error('identity_mismatch')
+    await hashOpenCodeFile(executablePath, signal) !== executableSha256) throw new Error('identity_mismatch')
   signal?.throwIfAborted()
   const expectedPlatform = process.platform === 'win32' ? 'windows' : process.platform
   if (metadata !== undefined && !(metadata as { name: string }).name.startsWith(`@opencode/cli-${expectedPlatform}-${process.arch}`)) throw new Error('identity_mismatch')

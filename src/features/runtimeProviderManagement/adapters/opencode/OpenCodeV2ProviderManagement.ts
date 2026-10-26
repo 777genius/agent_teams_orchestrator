@@ -11,6 +11,7 @@ import { isDeepStrictEqual } from 'node:util'
 import { importOpenCodeV2ClientModule, resolveOpenCodeV2ClientEntry } from '../../../../services/opencode/transport/OpenCodeV2ClientModule.js'
 import { getOpenCodeV2DeclaredInputModalities } from '../../../../services/opencode/OpenCodeDeclaredInputModalities.js'
 import { inspectOpenCodeReadSelection } from '../../../../services/opencode/compatibility/OpenCodeNativeIdentity.js'
+export { inspectOpenCodeReadSelection } from '../../../../services/opencode/compatibility/OpenCodeNativeIdentity.js'
 import { canonicalizeOpenCodeProjectPath, resolveOpenCodeV2CatalogProfileScope, materializeOpenCodeV2CatalogScope } from '../../../../services/opencode/OpenCodeProfileManager.js'
 import { resolveClaudeMultimodelPaths } from '../../../../services/opencode/OpenCodeManagedPaths.js'
 import { createOpenCodeV2ExecutionReceipt } from '../../../../services/opencode/profile/OpenCodeV2ExecutionReceipt.js'
@@ -53,8 +54,9 @@ async function catalog<T>(input: { providerId: string; projectPath?: string | nu
   authority: ExecutionAuthority; profile: CatalogExecutionProfile; authPath: string; preferredModel: string | null; scopeToken: string;
   providers(): Promise<unknown>; models(): Promise<unknown>; integration(id: string): Promise<unknown>;
   connect(id: string, key: string): Promise<void>; remove(id: string): Promise<void>
-}) => Promise<T>): Promise<T> {
-  const selected = await inspectOpenCodeReadSelection(); executionAssert(selected.native && selected.policy.generation === 'v2', 'provider_v2_required')
+}) => Promise<T>, selectedRead?: Awaited<ReturnType<typeof inspectOpenCodeReadSelection>>): Promise<T> {
+  // Reuse this request's generation decision; receipt/owner/child checks still revalidate the bytes.
+  const selected = selectedRead ?? await inspectOpenCodeReadSelection(); executionAssert(selected.native && selected.policy.generation === 'v2', 'provider_v2_required')
   const project = await canonicalizeOpenCodeProjectPath(input.projectPath)
   const scope = await resolveOpenCodeV2CatalogProfileScope({ projectPath: project, providerId: input.providerId })
   const parent = path.join(resolveClaudeMultimodelPaths().data, 'opencode/v2/provider-profiles'); await mkdir(parent, { recursive: true, mode: 0o700 })
@@ -245,7 +247,8 @@ export async function testOpenCodeV2ProviderModel(input: TestProviderModelInput)
   } catch (error) { return resultError('runtime-unhealthy', openCodeV2Refusal(error)?.message ?? 'V2 selected-model execution could not be qualified. No alternate model was tried.') }
 }
 
-export async function loadOpenCodeV2ProviderModels(input: LoadProviderModelsInput): Promise<ProviderManagementResult<RuntimeProviderModelsView>> {
+export async function loadOpenCodeV2ProviderModels(input: LoadProviderModelsInput,
+  selectedRead?: Awaited<ReturnType<typeof inspectOpenCodeReadSelection>>): Promise<ProviderManagementResult<RuntimeProviderModelsView>> {
   try {
     if (input.cursor) return resultError('runtime-unhealthy', 'V2 catalog cursors require a fresh bounded catalog query.')
     const value = await catalog(input, async owner => {
@@ -256,7 +259,7 @@ export async function loadOpenCodeV2ProviderModels(input: LoadProviderModelsInpu
       return { runtimeId: 'opencode' as const, providerId: input.providerId, totalCount, returnedCount: rows.length, limit, cursor: null, nextCursor: null,
         defaultModelId: owner.preferredModel, diagnostics: [], catalogState: 'fresh' as const,
         models: rows.map(row => buildOpenCodeV2RuntimeProviderModel(row, input.providerId, owner.preferredModel)) }
-    })
+    }, selectedRead)
     return { ok: true, value }
   } catch (error) { return resultError('runtime-unhealthy', openCodeV2Refusal(error)?.message ?? 'V2 native provider catalog is unavailable; no legacy CLI catalog command was invoked.') }
 }

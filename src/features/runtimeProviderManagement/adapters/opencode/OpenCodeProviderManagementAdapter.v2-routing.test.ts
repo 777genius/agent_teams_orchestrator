@@ -5,12 +5,25 @@ import type { ConnectProviderInput, LoadProviderModelsInput, TestProviderModelIn
 // Run this module alone: replacement is a private transport boundary, never a production capability/proof hook.
 let selectedV2 = true
 let selectedIdentityError: unknown
+let selectionReads = 0
+let lastReadSelection: unknown
+const modelSelections: unknown[] = []
 const connectCalls: ConnectProviderInput[] = [], modelCalls: LoadProviderModelsInput[] = [], testCalls: TestProviderModelInput[] = []
 const boundaryFailure = { ok: false as const, error: { code: 'runtime-unhealthy' as const, message: 'TEST owned V2 boundary reached', recoverable: true } }
 mock.module('./OpenCodeV2ProviderManagement.js', () => ({
+  selectedOpenCodeV2Version: async () => selectedV2 ? '2.1.4' : null,
+  buildOpenCodeV2KeySetupForm: () => null,
+  inspectOpenCodeReadSelection: async () => {
+    selectionReads++
+    if (selectedIdentityError !== undefined) throw selectedIdentityError
+    lastReadSelection = selectedV2
+      ? { policy: { generation: 'v2', version: '2.1.4' }, native: { generation: 'v2', version: '2.1.4' } }
+      : { policy: { generation: 'v1', version: '1.19.4' }, native: null }
+    return lastReadSelection
+  },
   selectedProviderUsesOpenCodeV2: async () => { if (selectedIdentityError !== undefined) throw selectedIdentityError; return selectedV2 },
   connectOpenCodeV2Provider: async (input: ConnectProviderInput) => { connectCalls.push(input); return boundaryFailure },
-  loadOpenCodeV2ProviderModels: async (input: LoadProviderModelsInput) => { modelCalls.push(input); return boundaryFailure },
+  loadOpenCodeV2ProviderModels: async (input: LoadProviderModelsInput, selection?: unknown) => { modelCalls.push(input); modelSelections.push(selection); return boundaryFailure },
   testOpenCodeV2ProviderModel: async (input: TestProviderModelInput) => { testCalls.push(input); return boundaryFailure },
 }))
 const { OpenCodeProviderManagementAdapter } = await import('./OpenCodeProviderManagementAdapter.js')
@@ -41,10 +54,23 @@ test('public V2 OAuth routes to typed refusal boundary before legacy OAuth inven
 
 test('actual public models and model-test routes preserve normalized identity before V2 transport', async () => {
   selectedV2 = true
+  const readsBefore = selectionReads
   expect(await adapter.loadModels({ runtimeId: 'opencode', providerId: ' GROQ ', projectPath: '/TEST/project' })).toEqual(boundaryFailure)
+  expect(selectionReads).toBe(readsBefore + 1)
+  expect(modelSelections.at(-1)).toBe(lastReadSelection)
   expect(await adapter.testModel({ runtimeId: 'opencode', providerId: ' GROQ ', modelId: ' c41-upstream ', projectPath: '/TEST/project' })).toEqual(boundaryFailure)
   expect(modelCalls.at(-1)?.providerId).toBe('groq')
   expect(testCalls.at(-1)?.providerId).toBe('groq'); expect(testCalls.at(-1)?.modelId).toBe('groq/c41-upstream'); expect(legacyReads).toBe(0)
+})
+
+test('V1 model selection keeps the existing provider validation and does not enter the V2 catalog', async () => {
+  selectedV2 = false
+  const beforeModels = modelCalls.length, beforeReads = selectionReads
+  const result = await adapter.loadModels({ runtimeId: 'opencode', providerId: '', projectPath: '/TEST/project' })
+  expect(result.ok).toBe(false)
+  if (!result.ok) expect(result.error.code).toBe('provider-missing')
+  expect(modelCalls.length).toBe(beforeModels)
+  expect(selectionReads).toBe(beforeReads + 1)
 })
 
 test('V1 selection still enters existing managed inventory rather than V2 key transport', async () => {
