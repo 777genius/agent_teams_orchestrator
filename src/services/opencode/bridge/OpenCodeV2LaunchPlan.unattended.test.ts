@@ -403,3 +403,22 @@ test('a failed Connect intent callback after saved probe cannot create another p
   expect(await readFile(file, 'utf8')).toBe(saved)
   expect(launches).toBe(0)
 })
+
+test('same-command readiness probe plan consumes its validated receipt without rehashing the graph', async () => {
+  const request = envelope(), selection = await inspectOpenCodeV2SourceAvailability(request)
+  expect(nativeReceiptCalls).toBe(1)
+  const plan = await launchPlans.buildOpenCodeV2InternalRunPlan(selection, request.body, 'TEST-controller')
+  expect(nativeReceiptCalls).toBe(1)
+  expect(plan.members[0]?.native.graph.sha256).toBe(selection.installedGraphSHA256)
+  // Serialization cannot carry this private preparation to another command.
+  await launchPlans.buildOpenCodeV2InternalRunPlan(JSON.parse(JSON.stringify(selection)), request.body, 'TEST-next-controller')
+  expect(nativeReceiptCalls).toBe(2)
+})
+
+test('same-command receipt refuses mutated selection identity before preparing any member', async () => {
+  const request = envelope(), selection = await inspectOpenCodeV2SourceAvailability(request)
+  selection.native.executableSha256 = 'f'.repeat(64)
+  await expect(launchPlans.buildOpenCodeV2InternalRunPlan(selection, request.body, 'TEST-controller'))
+    .rejects.toThrow('run_prepared_selection_changed')
+  expect(nativeReceiptCalls).toBe(1)
+})
