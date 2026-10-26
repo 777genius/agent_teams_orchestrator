@@ -28,6 +28,13 @@ import type { SelectedExecutionProfile } from '../host/OpenCodeV2ExecutionHost.j
 import type { BridgeEnvelope } from './OpenCodeBridgeProtocol.js'
 import type { RunLaunchPlan, RunMemberPlan } from './OpenCodeV2RunTypes.js'
 
+// One command owns this non-serializable, one-use preparation. No process-wide
+// receipt cache exists; DTO copies and subsequent commands verify bytes anew.
+const preparedPlanReceipt = Symbol('preparedOpenCodeV2PlanReceipt')
+type PreparedPlanSelection = Awaited<ReturnType<typeof inspectOpenCodeV2LaunchSelection>> & {
+  [preparedPlanReceipt]?: () => ValidatedExecutionNative
+}
+
 const text = (value: unknown): string => { executionAssert(typeof value === 'string' && value.trim().length > 0, 'run_launch_input_invalid'); return value }
 const SUPERVISOR_ENVIRONMENT_NAMES = new Map([
   ['PATH', 'PATH'], ['HOME', 'HOME'], ['USER', 'USER'], ['LOGNAME', 'LOGNAME'],
@@ -149,7 +156,13 @@ async function prepareSelectedOpenCodeV2SourceAvailability(selection: Awaited<Re
   }
   executionAssert(receipt.graph.files.length > 0 && receipt.graph.sha256.length === 64 &&
     receipt.executableSha256 === selection.native.executableSha256, 'run_source_graph_unknown')
-  return { native: receipt, availability: { ...selection, installedGraphSHA256: receipt.graph.sha256, installedGraphFiles: receipt.graph.files.length } }
+  const availability = { ...selection, installedGraphSHA256: receipt.graph.sha256, installedGraphFiles: receipt.graph.files.length }
+  const selectionHash = executionHash(availability)
+  Object.defineProperty(availability, preparedPlanReceipt, { configurable: true, value: () => {
+    executionAssert(executionHash(availability) === selectionHash, 'run_prepared_selection_changed')
+    return receipt
+  } })
+  return { native: receipt, availability }
 }
 
 /** Stable protocol1 fields feed an SDK-owned production provisioner. No caller receipt or endpoint authority. */
@@ -181,8 +194,12 @@ export async function createOpenCodeV2LaunchPlan(envelope: BridgeEnvelope): Prom
 /** Production constructor only: no caller body receipt, endpoint or mount hook. */
 export async function buildOpenCodeV2InternalRunPlan(selection: Awaited<ReturnType<typeof inspectOpenCodeV2LaunchSelection>>,
   body: Record<string, unknown>, controllerInstanceId: string, probe?: { intent: import('../execution/OpenCodeV2AdmissionService.js').QueueIntent; expectedText: string; unattendedTeam?: boolean }): Promise<RunLaunchPlan> {
-  const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'run-owner')
-  const native = await createOpenCodeV2ExecutionReceipt(delivery.root, selection.native, selection.controller)
+  const prepared = selection as PreparedPlanSelection
+  const consume = prepared[preparedPlanReceipt]
+  // Remove before any asynchronous preparation so this authority is consumed once.
+  if (consume) delete prepared[preparedPlanReceipt]
+  const native = consume ? consume() : await createOpenCodeV2ExecutionReceipt(
+    (await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'run-owner')).root, selection.native, selection.controller)
   return buildOpenCodeV2InternalRunPlanWithNative(selection, body, controllerInstanceId, native, probe)
 }
 

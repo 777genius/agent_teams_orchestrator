@@ -10,6 +10,7 @@ import * as receipts from '../profile/OpenCodeV2ExecutionReceipt.js'
 import * as mcp from '../OpenCodeMcpManager.js'
 import * as probes from './OpenCodeV2ExecutionProbe.js'
 import * as launchPlans from './OpenCodeV2LaunchPlan.js'
+import * as runOwners from './OpenCodeV2RunOwner.js'
 import * as projectIdentity from '../OpenCodeProjectIdentity.js'
 import { buildOpenCodeExecutionProof } from '../OpenCodeExecutionProof.js'
 import { executionHash } from '../execution/OpenCodeV2ExecutionContracts.js'
@@ -347,4 +348,77 @@ test('retired original terminal failure is retained across read and run requests
       .toEqual({ state: 'failed', proof: null, reason: 'native_execution_failed' })
     expect(await readFile(file, 'utf8')).toBe(saved)
   }
+})
+
+test('Connect reconciliation observes its exact submitted probe and never replaces a missing original', async () => {
+  const request = envelope(), selection = await inspectOpenCodeV2SourceAvailability(request)
+  const sourceKey = executionHash({ project, scopeToken: selection.scope.scopeToken,
+    selectedAuthIdentity: selection.scope.selectedAuthIdentity, source: selection.behaviorFingerprint,
+    graph: selection.installedGraphSHA256, projectBehavior: behavior, variant: 'default' })
+  const directory = path.join(root, 'app-data/opencode/v2/execution-probes', sourceKey)
+  await mkdir(directory, { recursive: true, mode: 0o700 })
+  const nonce = 'TEST-original-connect-probe'
+  const intent = { identity: { requestId: nonce, deliveryAttemptId: nonce, localMessageId: nonce,
+    nativeInputID: 'msg_TESTconnect' }, delivery: 'queue',
+    input: { nativeInputID: 'msg_TESTconnect', resume: true, text: 'Original TEST input' } }
+  const binding = { teamId: 'TEST-original', runId: nonce, controllerInstanceId: nonce, ownerId: nonce }
+  const saved = JSON.stringify({ sourceKey, binding, sessionID: 'ses_TESTconnect', intent,
+    submitted: true, proof: null, retired: false })
+  const file = path.join(directory, 'probe.json'); await writeFile(file, saved, { mode: 0o600 })
+  const original = { sourceKey, binding, sessionID: 'ses_TESTconnect', intentHash: executionHash(intent) }
+  let launches = 0
+  restores.push(spyOn(runOwners, 'launchExplicitOpenCodeV2Run').mockImplementation(async () => {
+    launches++; throw new Error('TEST-replay-forbidden')
+  }))
+  expect((await probes.resolveOpenCodeV2ExecutionProbe(request, selection, true, { requireExisting: original })).state).toBe('pending')
+  expect(await readFile(file, 'utf8')).toBe(saved)
+  await rm(file)
+  await expect(probes.resolveOpenCodeV2ExecutionProbe(request, selection, true, { requireExisting: original })).rejects.toThrow('probe_original_intent_changed')
+  expect(launches).toBe(0)
+})
+
+test('a failed Connect intent callback after saved probe cannot create another probe on resume', async () => {
+  const request = envelope(), selection = await inspectOpenCodeV2SourceAvailability(request)
+  const sourceKey = executionHash({ project, scopeToken: selection.scope.scopeToken,
+    selectedAuthIdentity: selection.scope.selectedAuthIdentity, source: selection.behaviorFingerprint,
+    graph: selection.installedGraphSHA256, projectBehavior: behavior, variant: 'default' })
+  const directory = path.join(root, 'app-data/opencode/v2/execution-probes', sourceKey)
+  await mkdir(directory, { recursive: true, mode: 0o700 })
+  const nonce = 'TEST-connect-checkpoint-failure'
+  const intent = { identity: { requestId: nonce, deliveryAttemptId: nonce, localMessageId: nonce,
+    nativeInputID: 'msg_TESTcheckpoint' }, delivery: 'queue',
+    input: { nativeInputID: 'msg_TESTcheckpoint', resume: true, text: 'Original TEST input' } }
+  const saved = JSON.stringify({ sourceKey, binding: { teamId: 'TEST-original', runId: nonce,
+    controllerInstanceId: nonce, ownerId: nonce }, sessionID: 'ses_TESTcheckpoint', intent,
+    submitted: false, proof: null, retired: false })
+  const file = path.join(directory, 'probe.json'); await writeFile(file, saved, { mode: 0o600 })
+  let launches = 0
+  restores.push(spyOn(runOwners, 'launchExplicitOpenCodeV2Run').mockImplementation(async () => {
+    launches++; throw new Error('TEST-replay-forbidden')
+  }))
+  await expect(probes.resolveOpenCodeV2ExecutionProbe(request, selection, true, {
+    onIntentPersisted: async () => { throw Error('TEST-Connect-checkpoint-failed') },
+  })).rejects.toThrow('TEST-Connect-checkpoint-failed')
+  expect((await probes.resolveOpenCodeV2ExecutionProbe(request, selection, true)).state).toBe('pending')
+  expect(await readFile(file, 'utf8')).toBe(saved)
+  expect(launches).toBe(0)
+})
+
+test('same-command readiness probe plan consumes its validated receipt without rehashing the graph', async () => {
+  const request = envelope(), selection = await inspectOpenCodeV2SourceAvailability(request)
+  expect(nativeReceiptCalls).toBe(1)
+  const plan = await launchPlans.buildOpenCodeV2InternalRunPlan(selection, request.body, 'TEST-controller')
+  expect(nativeReceiptCalls).toBe(1)
+  expect(plan.members[0]?.native.graph.sha256).toBe(selection.installedGraphSHA256)
+  // Serialization cannot carry this private preparation to another command.
+  await launchPlans.buildOpenCodeV2InternalRunPlan(JSON.parse(JSON.stringify(selection)), request.body, 'TEST-next-controller')
+  expect(nativeReceiptCalls).toBe(2)
+})
+
+test('same-command receipt refuses mutated selection identity before preparing any member', async () => {
+  const request = envelope(), selection = await inspectOpenCodeV2SourceAvailability(request)
+  selection.native.executableSha256 = 'f'.repeat(64)
+  await expect(launchPlans.buildOpenCodeV2InternalRunPlan(selection, request.body, 'TEST-controller'))
+    .rejects.toThrow('run_prepared_selection_changed')
+  expect(nativeReceiptCalls).toBe(1)
 })
