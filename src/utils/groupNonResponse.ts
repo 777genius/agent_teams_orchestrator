@@ -4,7 +4,8 @@ export function isGroupNonResponseText(text: string): boolean {
   // Reserved, unescaped final control token cancels the ENTIRE peer fallback,
   // including preceding commentary or answer text. Quoted/embedded forms are
   // ordinary content; human-origin and explicit tool sends bypass this policy.
-  if (/(?:^|\s)\[\[AGENT_TEAMS_NO_REPLY\]\]$/.test(normalized)) return true
+  const lastLine = normalized.slice(normalized.lastIndexOf('\n') + 1)
+  if (!/^[ \t]*>/.test(lastLine) && /(?:^|\s)\[\[AGENT_TEAMS_NO_REPLY\]\]$/.test(normalized)) return true
   // Narrow legacy forms produced by existing models. Arbitrary explanations or
   // suffixes may contain real answers and must remain visible.
   return /^No reply needed[.!]?$/i.test(normalized) ||

@@ -6,6 +6,6 @@ test('reserved trailing control token cancels the entire peer fallback without i
     'Сначала проверю каталог. [[AGENT_TEAMS_NO_REPLY]]', 'result is 42 [[AGENT_TEAMS_NO_REPLY]]   '])
     expect(isGroupNonResponseText(text)).toBe(true)
   for (const text of ['No reply needed; result is 42.', '"[[AGENT_TEAMS_NO_REPLY]]"', '`[[AGENT_TEAMS_NO_REPLY]]`',
-    '\\[[AGENT_TEAMS_NO_REPLY]]', '[[AGENT_TEAMS_NO_REPLY]] result is 42.', 'x[[AGENT_TEAMS_NO_REPLY]]', '[[AGENT_TEAMS_NO_RE'])
+    '\\[[AGENT_TEAMS_NO_REPLY]]', '> [[AGENT_TEAMS_NO_REPLY]]', '  >> [[AGENT_TEAMS_NO_REPLY]]', 'Answer: 42\n> [[AGENT_TEAMS_NO_REPLY]]', '[[AGENT_TEAMS_NO_REPLY]] result is 42.', 'x[[AGENT_TEAMS_NO_REPLY]]', '[[AGENT_TEAMS_NO_RE'])
     expect(isGroupNonResponseText(text)).toBe(false)
 })
