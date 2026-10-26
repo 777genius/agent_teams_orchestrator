@@ -17,7 +17,7 @@ import { resolveClaudeMultimodelPaths } from '../../../../services/opencode/Open
 import { createOpenCodeV2ExecutionReceipt } from '../../../../services/opencode/profile/OpenCodeV2ExecutionReceipt.js'
 import { acquireOpenCodeV2CatalogLease, requireExecutionEndpoint, registerExecutionDisposer } from '../../../../services/opencode/host/OpenCodeV2ExecutionHost.js'
 import type { CatalogExecutionProfile, ValidatedExecutionNative } from '../../../../services/opencode/host/OpenCodeV2ExecutionBinding.js'
-import { executionAssert, executionHash, executionRecord, type ExecutionAuthority } from '../../../../services/opencode/execution/OpenCodeV2ExecutionContracts.js'
+import { executionAssert, executionHash, executionRecord, openCodeV2RunInitializationMs, type ExecutionAuthority } from '../../../../services/opencode/execution/OpenCodeV2ExecutionContracts.js'
 import { OpenCodeV2ProviderWire as ProviderWire } from '../../../../services/opencode/transport/OpenCodeV2ProviderWire.js'
 import { type OpenCodeAuthCredential, readOpenCodeAuthCredential, upsertOpenCodeApiAuthCredential } from '../../../../services/opencode/OpenCodeAuthStore.js'
 import { withOpenCodeAuthCoordinationLock } from '../../../../services/opencode/OpenCodeAuthCoordinationLock.js'
@@ -150,7 +150,7 @@ async function executionProof(project: string, selectedModel: string, run = true
   prepared(sourceKey: string): Promise<void>; persisted(probe: OpenCodeV2ProbeIntent): Promise<void>;
 }) {
   const envelope: BridgeEnvelope = { schemaVersion: 1, requestId: randomUUID(), command: 'opencode.readiness', cwd: project,
-    startedAt: new Date().toISOString(), timeoutMs: 150_000, body: { projectPath: project, selectedModel, effort: 'default', requireExecutionProbe: true } }
+    startedAt: new Date().toISOString(), timeoutMs: Math.max(150_000, openCodeV2RunInitializationMs(process.platform)), body: { projectPath: project, selectedModel, effort: 'default', requireExecutionProbe: true } }
   const selection = await inspectOpenCodeV2SourceAvailability(envelope)
   if (verification) executionAssert(executionHash(verification.native) === executionHash({
     path: selection.native.executablePath, sha256: selection.native.executableSha256, version: selection.native.version }), 'provider_execution_target_changed')
