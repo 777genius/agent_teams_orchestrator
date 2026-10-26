@@ -81,9 +81,10 @@ export function getOpenCodeVersionProbeDiagnostics(error: unknown) {
 
 /** `--version` must print and close within this window. On a busy Windows
  * runner the native exe alone took 3-4 s and more than 5 s through the
- * runtime; the app's own version check allows 30 s. POSIX keeps 5 s. */
+ * runtime. Darwin cold starts on loaded hosts can exceed 30 s; give native
+ * acquisition bounded headroom without changing helper or cleanup budgets. */
 export function versionAcquisitionMs(platform: NodeJS.Platform = process.platform): number {
-  return platform === 'win32' ? 15_000 : 5_000
+  return platform === 'darwin' ? 60_000 : platform === 'win32' ? 15_000 : 5_000
 }
 /** Ownership cleanup keeps at least 3 s after acquisition. */
 export const VERSION_CLEANUP_MS = 3_000
