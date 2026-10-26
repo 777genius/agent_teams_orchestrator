@@ -1,4 +1,4 @@
-import { selectedProviderUsesOpenCodeV2, selectedOpenCodeV2Version, connectOpenCodeV2Provider, loadOpenCodeV2ProviderModels, testOpenCodeV2ProviderModel, buildOpenCodeV2KeySetupForm } from './OpenCodeV2ProviderManagement.js'
+import { inspectOpenCodeReadSelection, selectedProviderUsesOpenCodeV2, selectedOpenCodeV2Version, connectOpenCodeV2Provider, loadOpenCodeV2ProviderModels, testOpenCodeV2ProviderModel, buildOpenCodeV2KeySetupForm } from './OpenCodeV2ProviderManagement.js'
 import { openCodeV2KeyIntegration } from '../../../../services/opencode/catalog/OpenCodeV2KeyIntegrations.js'
 import path from 'node:path'
 import { realpath } from 'node:fs/promises'
@@ -4421,13 +4421,13 @@ export class OpenCodeProviderManagementAdapter
   async loadModels(
     input: LoadProviderModelsInput,
   ): Promise<ProviderManagementResult<RuntimeProviderModelsView>> {
-    let selectedV2 = false
-    try { selectedV2 = input.runtimeId === 'opencode' && await selectedProviderUsesOpenCodeV2() }
+    let selectedRead: Awaited<ReturnType<typeof inspectOpenCodeReadSelection>> | undefined
+    try { if (input.runtimeId === 'opencode') selectedRead = await inspectOpenCodeReadSelection() }
     catch (error) { return providerManagementError('runtime-unhealthy', selectedIdentityFailureMessage(error)) }
-    if (selectedV2) {
+    if (selectedRead?.policy.generation === 'v2' && selectedRead.native) {
       const providerId = normalizeProviderId(canonicalizeOpenCodeProviderId(input.providerId))
       if (!providerId) return providerManagementError('provider-missing', 'Provider id is invalid')
-      return loadOpenCodeV2ProviderModels({ ...input, providerId })
+      return loadOpenCodeV2ProviderModels({ ...input, providerId }, selectedRead)
     }
     const deadline = new OpenCodeRuntimeDeadline(
       this.deps.catalogOverallTimeoutMs ?? OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS,
