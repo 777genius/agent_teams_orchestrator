@@ -119,6 +119,7 @@ import {
   processSandboxPermissionResponse,
 } from './useSwarmPermissionPoller.js'
 import type { GetNativeAppManagedBootstrapContextInjection } from './useNativeAppManagedBootstrapContextInjection.js'
+import type { CodexNativeConversationScope } from '../services/codexNative/conversationScope.js'
 import {
   buildNativeAppManagedBootstrapPrivatePrompt,
   isNativeAppManagedBootstrapInstructionText,
@@ -201,6 +202,7 @@ export type InboxPromptSubmitOptions = {
   isMeta?: boolean
   prefixMessages?: AppState['messages']
   submissionKind?: IncomingPromptSubmissionKind
+  conversationScope?: CodexNativeConversationScope
 }
 
 export type NativeInboxAttachmentsReadiness = {
@@ -4211,7 +4213,7 @@ export function useInboxPoller({
       let groupSentHistory: readonly GroupMailboxHistoryMessage[] | undefined
       let groupOwnPosts: readonly GroupMailboxOwnPostProof[] | undefined
       if (ordinaryPendingMessage && hasGroupMailboxMarker(ordinaryPendingMessage) && teamName && agentName) {
-        // Native Codex starts a fresh thread each turn. Read only its own prior
+        // Native Codex group turns stay ephemeral. Read only its own prior
         // finalized physical deliveries; group/run/receiver fences are applied by the prompt builder.
         if (shouldUseCodexProviderRoutingForCurrentProcess()) {
           try {
@@ -4414,6 +4416,13 @@ export function useInboxPoller({
 
       const submitted = onSubmitTeammateMessage(promptContent, {
         isMeta: true,
+        // The selected delivery envelope owns scope. Prompt text, including
+        // quoted protocol markers in an ordinary DM, cannot select a thread.
+        conversationScope: bootstrapPendingMessage
+          ? 'bootstrap'
+          : ordinaryPendingMessage && hasGroupMailboxMarker(ordinaryPendingMessage)
+            ? 'group'
+            : 'direct',
         submissionKind: resolveIncomingMailboxSubmissionKind({
           bootstrapPendingMessage,
           ordinaryPendingMessage,

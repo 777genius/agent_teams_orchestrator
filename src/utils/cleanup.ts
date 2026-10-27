@@ -2,6 +2,7 @@ import * as fs from 'fs/promises'
 import { homedir } from 'os'
 import { join } from 'path'
 import { logEvent } from '../services/analytics/index.js'
+import { unlinkExpiredCodexAwareTranscript } from '../services/codexNative/conversationRetention.js'
 import { CACHE_PATHS } from './cachePaths.js'
 import { logForDebugging } from './debug.js'
 import { getClaudeConfigHomeDir } from './envUtils.js'
@@ -185,7 +186,9 @@ export async function cleanupOldSessionFiles(): Promise<CleanupResult> {
         }
         try {
           if (
-            await unlinkIfOld(join(projectDir, entry.name), cutoffDate, fsImpl)
+            await (entry.name.endsWith('.jsonl')
+              ? unlinkExpiredCodexAwareTranscript(join(projectDir, entry.name), cutoffDate, fsImpl)
+              : unlinkIfOld(join(projectDir, entry.name), cutoffDate, fsImpl))
           ) {
             result.messages++
           }
@@ -193,6 +196,9 @@ export async function cleanupOldSessionFiles(): Promise<CleanupResult> {
           result.errors++
         }
       } else if (entry.isDirectory()) {
+        // proper-lockfile owns these directories, including stale-lock recovery.
+        // Removing an empty one here would invalidate an active Codex owner.
+        if (entry.name.endsWith('.codex-native.lock')) continue
         // Session directory — clean up tool-results/<toolDir>/* beneath it
         const sessionDir = join(projectDir, entry.name)
         const toolResultsDir = join(sessionDir, TOOL_RESULTS_SUBDIR)

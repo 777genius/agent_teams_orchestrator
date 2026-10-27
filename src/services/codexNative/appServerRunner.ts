@@ -1,18 +1,6 @@
 import { type ChildProcess } from 'node:child_process'
-import {
-  cp,
-  lstat,
-  mkdtemp,
-  readdir,
-  rm,
-  symlink,
-  writeFile,
-} from 'node:fs/promises'
-import { homedir, tmpdir } from 'node:os'
-import path from 'node:path'
 import readline from 'node:readline'
 
-import { killProcessTree } from '../../utils/processKill.js'
 import { spawnPortableCli } from '../../utils/portableCli.js'
 import {
   resolveCodexCliBinary,
@@ -38,6 +26,13 @@ import {
   type CodexNativeExecSummary,
 } from './execRunner.js'
 import type { CodexNativeNormalizedEvent } from './normalizedEvents.js'
+import { createCodexNativeHomeOverlay } from './nativeHomeOverlay.js'
+import {
+  assertCodexNativeContinuationOptions,
+  CodexNativeRunnerError,
+  observeCodexNativeChild,
+  type CodexNativeRunnerLifecycle,
+} from './runnerLifecycle.js'
 
 type JsonRpcErrorPayload = {
   code: number
@@ -81,6 +76,8 @@ export type CodexNativeAppServerRunnerOptions = {
     | 'ultra'
     | null
   ephemeral?: boolean
+  resumeThreadId?: string
+  sessionsDirectory?: string
   apiKey?: string | null
   forcedLoginMethod?: CodexForcedLoginMethod | null
   configOverrides?: string[]
@@ -124,18 +121,6 @@ type QueuedObservation =
   | { type: 'runner_done' }
 
 const DEFAULT_APP_SERVER_REQUEST_TIMEOUT_MS = 120_000
-const CODEX_CONFIG_FILE_NAME = 'config.toml'
-const CODEX_APP_SERVER_HOME_PREFIX = 'codex-app-server-home-'
-const REQUIRED_CODEX_HOME_OVERLAY_ENTRIES = new Set(['accounts', 'auth.json'])
-const SKIP_CODEX_HOME_OVERLAY_ENTRIES = new Set([
-  CODEX_CONFIG_FILE_NAME,
-  'sessions',
-  'session_index.json',
-  'history.jsonl',
-  'logs',
-  'tmp',
-  '.tmp',
-])
 
 function defaultResolveVersion(executablePath: string): string | null {
   try {
@@ -180,85 +165,6 @@ function buildAppServerArgs(options: CodexNativeAppServerRunnerOptions): string[
     args.push('--disable', feature)
   }
   return args
-}
-
-function resolveCodexHome(env: NodeJS.ProcessEnv): string {
-  return env.CODEX_HOME?.trim() || path.join(homedir(), '.codex')
-}
-
-function isMissingPathError(error: unknown): boolean {
-  return Boolean(
-    error &&
-      typeof error === 'object' &&
-      'code' in error &&
-      (error as NodeJS.ErrnoException).code === 'ENOENT',
-  )
-}
-
-async function linkCodexHomeEntry(
-  entryName: string,
-  sourcePath: string,
-  targetPath: string,
-): Promise<void> {
-  const stats = await lstat(sourcePath)
-  try {
-    await symlink(sourcePath, targetPath, stats.isDirectory() ? 'dir' : 'file')
-    return
-  } catch (symlinkError) {
-    try {
-      await cp(sourcePath, targetPath, {
-        recursive: true,
-        force: false,
-        errorOnExist: true,
-        verbatimSymlinks: true,
-      })
-    } catch {
-      if (REQUIRED_CODEX_HOME_OVERLAY_ENTRIES.has(entryName)) {
-        throw symlinkError
-      }
-    }
-  }
-}
-
-async function createCodexAppServerHomeOverlay(
-  env: NodeJS.ProcessEnv,
-): Promise<{ env: NodeJS.ProcessEnv; cleanup: () => Promise<void> }> {
-  const sourceHome = resolveCodexHome(env)
-  const overlayHome = await mkdtemp(path.join(tmpdir(), CODEX_APP_SERVER_HOME_PREFIX))
-
-  try {
-    let entries: Awaited<ReturnType<typeof readdir>>
-    try {
-      entries = await readdir(sourceHome, { withFileTypes: true })
-    } catch (error) {
-      if (!isMissingPathError(error)) {
-        throw error
-      }
-      entries = []
-    }
-
-    for (const entry of entries) {
-      if (SKIP_CODEX_HOME_OVERLAY_ENTRIES.has(entry.name)) {
-        continue
-      }
-      await linkCodexHomeEntry(
-        entry.name,
-        path.join(sourceHome, entry.name),
-        path.join(overlayHome, entry.name),
-      )
-    }
-  } catch (error) {
-    await rm(overlayHome, { recursive: true, force: true }).catch(() => undefined)
-    throw error
-  }
-
-  return {
-    env: {
-      ...env,
-      CODEX_HOME: overlayHome,
-    },
-    cleanup: () => rm(overlayHome, { recursive: true, force: true }),
-  }
 }
 
 function createObservationQueue() {
@@ -587,6 +493,23 @@ export async function* runCodexNativeAppServer(
   options: CodexNativeAppServerRunnerOptions,
   deps: CodexNativeAppServerRunnerDeps = {},
 ): AsyncGenerator<CodexNativeExecObservation, CodexNativeExecSummary, unknown> {
+  const lifecycle: CodexNativeRunnerLifecycle = {
+    submissionMayHaveStarted: false, turnTerminal: false, childStopped: true,
+  }
+  try {
+    return yield* runCodexNativeAppServerImpl(options, deps, lifecycle)
+  } catch (error) {
+    throw new CodexNativeRunnerError(error, lifecycle)
+  }
+}
+
+async function* runCodexNativeAppServerImpl(
+  options: CodexNativeAppServerRunnerOptions,
+  deps: CodexNativeAppServerRunnerDeps,
+  lifecycle: CodexNativeRunnerLifecycle,
+): AsyncGenerator<CodexNativeExecObservation, CodexNativeExecSummary, unknown> {
+  assertCodexNativeContinuationOptions(options)
+  if (options.abortSignal?.aborted) throw options.abortSignal.reason ?? new Error('Codex turn aborted.')
   const binaryResolution = resolveCodexCliBinary({ which: deps.which })
   if (!binaryResolution) {
     throw new Error('Codex app-server runtime requires the codex CLI binary.')
@@ -613,18 +536,18 @@ export async function* runCodexNativeAppServer(
     env.CODEX_API_KEY = options.apiKey
   }
 
-  const codexHomeOverlay = await createCodexAppServerHomeOverlay(env)
-  if (options.loopbackOverlayToml && codexHomeOverlay.env.CODEX_HOME) {
-    await writeFile(
-      path.join(codexHomeOverlay.env.CODEX_HOME, CODEX_CONFIG_FILE_NAME),
-      options.loopbackOverlayToml,
-      { mode: 0o600 },
-    )
-  }
+  const codexHomeOverlay = await createCodexNativeHomeOverlay({
+    env, sessionsDirectory: options.sessionsDirectory,
+    loopbackOverlayToml: options.loopbackOverlayToml,
+  })
+  const launchArgs = buildAppServerArgs({ ...options,
+    configOverrides: [...(options.configOverrides ?? []), ...codexHomeOverlay.configOverrides],
+  })
   let child: SpawnedCodexAppServerProcess
   try {
+    if (options.abortSignal?.aborted) throw options.abortSignal.reason ?? new Error('Codex turn aborted.')
     child =
-      deps.spawnProcess?.(executablePath, buildAppServerArgs(options), {
+      deps.spawnProcess?.(executablePath, launchArgs, {
         cwd: options.cwd,
         env: codexHomeOverlay.env,
         signal: options.abortSignal,
@@ -633,7 +556,7 @@ export async function* runCodexNativeAppServer(
         stdout: 'pipe',
         stderr: 'pipe',
       }) ??
-      spawnPortableCli(executablePath, buildAppServerArgs(options), {
+      spawnPortableCli(executablePath, launchArgs, {
         cwd: options.cwd,
         env: codexHomeOverlay.env,
         signal: options.abortSignal,
@@ -645,8 +568,10 @@ export async function* runCodexNativeAppServer(
     throw error
   }
 
+  lifecycle.childStopped = false
+  const nativeChild = observeCodexNativeChild(child)
+  try {
   if (!child.stdin || !child.stdout) {
-    await codexHomeOverlay.cleanup().catch(() => undefined)
     throw new Error('Codex app-server stdio is unavailable.')
   }
 
@@ -669,10 +594,13 @@ export async function* runCodexNativeAppServer(
 
   const enqueueEvent = (event: CodexNativeNormalizedEvent): void => {
     if (event.type === 'thread_started') {
-      threadId = event.threadId
+      // The RPC response below is the authoritative identity admission point.
+      // Do not emit a notification early or overwrite an expected resume UUID.
+      return
     }
     if (event.type === 'turn_completed') {
       completed = true
+      lifecycle.turnTerminal = true
       cancelApprovals()
     }
     observations.push({ type: 'normalized_event', event })
@@ -700,19 +628,6 @@ export async function* runCodexNativeAppServer(
     if (child.stdin && !child.stdin.destroyed) {
       child.stdin.end()
     }
-    setTimeout(() => {
-      if (child.exitCode === null && child.signalCode === null && !child.killed) {
-        if (child.pid && process.platform !== 'win32') {
-          try {
-            process.kill(-child.pid, 'SIGTERM')
-          } catch {
-            killProcessTree(child.pid, 'SIGTERM')
-          }
-        } else {
-          child.kill('SIGTERM')
-        }
-      }
-    }, 250).unref()
   }
 
   const request = <T>(
@@ -862,22 +777,34 @@ export async function* runCodexNativeAppServer(
     yield { type: 'binary_identity', identity }
     await request('initialize', buildCodexAppServerInitializeRequest(1).params)
     writeJson(buildCodexAppServerInitializedNotification())
-    const threadStartResult = await request<Record<string, unknown>>(
-      'thread/start',
-      buildCodexManualThreadStartParams({
+    const threadMethod = options.resumeThreadId ? 'thread/resume' : 'thread/start'
+    const startParams = buildCodexManualThreadStartParams({
         model: options.model,
         cwd: options.cwd,
         ephemeral: options.ephemeral,
-      }),
+    })
+    const threadResult = await request<Record<string, unknown>>(
+      threadMethod,
+      options.resumeThreadId ? {
+        threadId: options.resumeThreadId, model: startParams.model, cwd: startParams.cwd,
+        approvalPolicy: startParams.approvalPolicy,
+        approvalsReviewer: startParams.approvalsReviewer, sandbox: startParams.sandbox,
+      } : startParams,
     )
-    threadId = extractThreadId(threadStartResult) ?? threadId
-    if (threadId) {
-      enqueueEvent({ type: 'thread_started', threadId })
-    }
+    threadId = extractThreadId(threadResult)
     if (!threadId) {
-      throw new Error('Codex app-server thread/start returned no thread id.')
+      throw new Error(`Codex app-server ${threadMethod} returned no thread id.`)
     }
+    if (options.sessionsDirectory) assertCodexNativeContinuationOptions({ ...options, resumeThreadId: threadId })
+    if (options.resumeThreadId && threadId !== options.resumeThreadId) {
+      throw new Error('Codex app-server resume returned a different thread UUID.')
+    }
+    // Resuming this yield admits the turn. The owner durably records the UUID
+    // before requesting the next observation from the generator.
+    yield { type: 'normalized_event', event: { type: 'thread_started', threadId } }
+    if (options.abortSignal?.aborted) throw options.abortSignal.reason ?? new Error('Codex turn aborted.')
 
+    lifecycle.submissionMayHaveStarted = true
     await request('turn/start', buildCodexManualTurnStartParams({
       threadId,
       prompt: options.prompt,
@@ -961,7 +888,6 @@ export async function* runCodexNativeAppServer(
     throw error
   } finally {
     cleanup()
-    await codexHomeOverlay.cleanup().catch(() => undefined)
   }
 
   return {
@@ -971,5 +897,13 @@ export async function* runCodexNativeAppServer(
     completionPolicy: options.ephemeral === false ? 'persistent' : 'ephemeral',
     finalHistoryCompleteness: 'explicit-hydration-required',
     finalUsageAuthority: 'live-turn-completed',
+  }
+  } finally {
+    lifecycle.childStopped = await nativeChild.shutdown()
+    if (lifecycle.childStopped) await codexHomeOverlay.cleanup().catch(() => undefined)
+    else {
+      void nativeChild.closed.then(() => codexHomeOverlay.cleanup()).catch(() => undefined)
+      throw new Error('Codex app-server child shutdown could not be confirmed.')
+    }
   }
 }

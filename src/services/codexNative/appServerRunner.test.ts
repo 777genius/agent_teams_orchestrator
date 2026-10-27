@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events'
 import { existsSync } from 'node:fs'
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { PassThrough } from 'node:stream'
@@ -9,6 +9,160 @@ import { describe, expect, test } from 'bun:test'
 import { createCodexAppServerNotificationMapper, runCodexNativeAppServer } from './appServerRunner.js'
 import { CodexNativeTranscriptProjector } from './transcriptProjector.js'
 import type { CodexNativeExecObservation } from './execRunner.js'
+import { CodexNativeRunnerError } from './runnerLifecycle.js'
+
+const CONTINUITY_THREAD = '7be87d9e-6118-4575-93fb-56735114b4bb'
+
+function serveContinuityThread(fake: ReturnType<typeof createFakeCodexAppServer>, options: {
+  responseThreadId?: string
+  resumeError?: boolean
+  status?: 'completed' | 'failed' | 'interrupted'
+} = {}) {
+  const requests: Array<Record<string, any>> = []
+  fake.stdin.on('data', chunk => {
+    for (const line of String(chunk).split('\n').filter(Boolean)) {
+      const message = JSON.parse(line)
+      requests.push(message)
+      if (!message.id) continue
+      if (message.method === 'thread/resume' && options.resumeError) {
+        writeJson(fake.stdout, { id: message.id, error: { code: -32600, message: 'Thread not found' } })
+        continue
+      }
+      const threadId = options.responseThreadId ?? CONTINUITY_THREAD
+      const result = message.method === 'thread/start' || message.method === 'thread/resume'
+        ? { thread: { id: threadId } }
+        : message.method === 'turn/start' ? { turn: { id: 'turn' } } : {}
+      writeJson(fake.stdout, { id: message.id, result })
+      if (message.method === 'turn/start') {
+        writeJson(fake.stdout, { method: 'turn/completed', params: {
+          threadId, turn: { id: 'turn', status: options.status ?? 'completed',
+            ...(options.status === 'failed' ? { error: { message: 'TEST provider failure' } } : {}) },
+        } })
+      }
+    }
+  })
+  return requests
+}
+
+describe('app-server owned conversation continuity', () => {
+  test('yields durable identity before admission, then resumes exact UUID with current policy and model', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'TEST-codex-server-continuity-'))
+    const sessions = path.join(root, 'sessions')
+    const source = path.join(root, 'profile')
+    await mkdir(sessions)
+    await mkdir(source)
+    const homes: string[] = []
+    try {
+      for (let turn = 0; turn < 2; turn++) {
+        const fake = createFakeCodexAppServer()
+        const requests = serveContinuityThread(fake)
+        const iterator = runCodexNativeAppServer({
+          prompt: `current turn ${turn}`, cwd: root, model: `TEST-model-${turn}`,
+          reasoningEffort: 'high', ephemeral: false, sessionsDirectory: sessions,
+          ...(turn ? { resumeThreadId: CONTINUITY_THREAD } : {}),
+          extraEnv: { CODEX_HOME: source }, requestApproval: async () => ({ allow: false }),
+        }, {
+          which: () => '/TEST/codex', resolveVersion: () => 'TEST',
+          spawnProcess: (_binary, args, options) => {
+            homes.push(options.env.CODEX_HOME!)
+            expect(options.env.CODEX_SQLITE_HOME).toBe(options.env.CODEX_HOME)
+            expect(args).toContain(`sqlite_home=${JSON.stringify(options.env.CODEX_HOME)}`)
+            return fake.child as never
+          },
+        })
+        expect((await iterator.next()).value).toMatchObject({ type: 'binary_identity' })
+        expect((await iterator.next()).value).toEqual({ type: 'normalized_event', event: {
+          type: 'thread_started', threadId: CONTINUITY_THREAD,
+        } })
+        expect(requests.some(request => request.method === 'turn/start')).toBe(false)
+        await writeFile(path.join(homes[turn]!, 'sessions', 'sentinel'), 'owned')
+        const result = await collect(iterator)
+        expect(result.summary).toMatchObject({ threadId: CONTINUITY_THREAD, completionPolicy: 'persistent' })
+        const threadRequest = requests.find(request => request.method === (turn ? 'thread/resume' : 'thread/start'))!
+        expect(threadRequest.params).toMatchObject({
+          model: `TEST-model-${turn}`, cwd: root,
+          approvalPolicy: 'on-request', approvalsReviewer: 'user', sandbox: 'read-only',
+          ...(turn ? { threadId: CONTINUITY_THREAD } : { ephemeral: false }),
+        })
+        expect(requests.filter(request => request.method === 'thread/start')).toHaveLength(turn ? 0 : 1)
+        expect(requests.find(request => request.method === 'turn/start')!.params).toMatchObject({
+          threadId: CONTINUITY_THREAD, model: `TEST-model-${turn}`, effort: 'high',
+          input: [{ type: 'text', text: `current turn ${turn}`, text_elements: [] }],
+        })
+        expect(existsSync(homes[turn]!)).toBe(false)
+        expect(await readFile(path.join(sessions, 'sentinel'), 'utf8')).toBe('owned')
+      }
+      expect(homes[0]).not.toBe(homes[1])
+    } finally { await rm(root, { recursive: true, force: true }) }
+  })
+
+  for (const kind of ['missing', 'mismatched'] as const) {
+    test(`refuses ${kind} resumed identity before turn submission`, async () => {
+      const sessions = await mkdtemp(path.join(tmpdir(), 'TEST-codex-server-refusal-'))
+      const fake = createFakeCodexAppServer()
+      const requests = serveContinuityThread(fake, kind === 'missing'
+        ? { resumeError: true } : { responseThreadId: 'ba3ffad7-71ad-48eb-99d9-796a3d2597e5' })
+      try {
+        const error = await collect(runCodexNativeAppServer({
+          prompt: 'must not submit', cwd: sessions, ephemeral: false,
+          sessionsDirectory: sessions, resumeThreadId: CONTINUITY_THREAD,
+          extraEnv: { CODEX_HOME: sessions }, requestApproval: async () => ({ allow: false }),
+        }, { which: () => '/TEST/codex', resolveVersion: () => 'TEST', spawnProcess: () => fake.child as never }))
+          .then(() => null, error => error)
+        expect(error).toBeInstanceOf(CodexNativeRunnerError)
+        expect(error.lifecycle).toEqual({ submissionMayHaveStarted: false, turnTerminal: false, childStopped: true })
+        expect(requests.some(request => request.method === 'thread/start' || request.method === 'turn/start')).toBe(false)
+      } finally { await rm(sessions, { recursive: true, force: true }) }
+    })
+  }
+
+  for (const status of ['failed', 'interrupted'] as const) {
+    test(`classifies terminal ${status} plus confirmed shutdown as safe for a new request`, async () => {
+      const fake = createFakeCodexAppServer()
+      serveContinuityThread(fake, { status })
+      const error = await collect(runCodexNativeAppServer({
+        prompt: 'TEST terminal failure', cwd: tmpdir(), requestApproval: async () => ({ allow: false }),
+      }, { which: () => '/TEST/codex', resolveVersion: () => 'TEST', spawnProcess: () => fake.child as never }))
+        .then(() => null, error => error)
+      expect(error).toBeInstanceOf(CodexNativeRunnerError)
+      expect(error.lifecycle).toEqual({ submissionMayHaveStarted: true, turnTerminal: true, childStopped: true })
+    })
+  }
+
+  for (const finish of ['success', 'generator-return'] as const) {
+    test(`${finish} waits for physical close before removing its overlay`, async () => {
+      const fake = createFakeCodexAppServer(false)
+      serveContinuityThread(fake)
+      let home = ''
+      const iterator = runCodexNativeAppServer({
+        prompt: 'TEST shutdown', cwd: tmpdir(), requestApproval: async () => ({ allow: false }),
+      }, { which: () => '/TEST/codex', resolveVersion: () => 'TEST',
+        spawnProcess: (_binary, _args, options) => { home = options.env.CODEX_HOME!; return fake.child as never } })
+      await iterator.next()
+      await iterator.next()
+      let settled = false
+      const remaining = (finish === 'success' ? collect(iterator) : iterator.return(undefined as never))
+        .finally(() => { settled = true })
+      await new Promise(resolve => setTimeout(resolve, 15))
+      expect(settled).toBe(false)
+      expect(existsSync(home)).toBe(true)
+      fake.child.emit('exit', 0, null)
+      await remaining
+      expect(existsSync(home)).toBe(false)
+    })
+  }
+
+  test('rejects resume titles and --last before spawning', async () => {
+    let spawned = false
+    const error = await collect(runCodexNativeAppServer({
+      prompt: 'TEST invalid identity', cwd: tmpdir(), ephemeral: false,
+      sessionsDirectory: tmpdir(), resumeThreadId: '--last', requestApproval: async () => ({ allow: false }),
+    }, { spawnProcess: () => { spawned = true; throw new Error('unexpected spawn') } }))
+      .then(() => null, error => error)
+    expect(spawned).toBe(false)
+    expect(error.lifecycle).toEqual({ submissionMayHaveStarted: false, turnTerminal: false, childStopped: true })
+  })
+})
 
 describe('Codex app-server assistant snapshots', () => {
   for (const failure of ['exit', 'abort', 'idle timeout', 'absolute timeout'] as const) {
@@ -132,7 +286,7 @@ describe('Codex app-server assistant snapshots', () => {
   })
 })
 
-function createFakeCodexAppServer() {
+function createFakeCodexAppServer(autoClose = true) {
   const stdin = new PassThrough()
   const stdout = new PassThrough()
   const stderr = new PassThrough()
@@ -150,6 +304,19 @@ function createFakeCodexAppServer() {
       this.emit('exit', 0, null)
       return true
     },
+  })
+  let closed = false
+  child.on('exit', (code, signal) => {
+    if (closed) return
+    closed = true
+    child.exitCode = code
+    child.signalCode = signal
+    stdout.end()
+    stderr.end()
+    child.emit('close', code, signal)
+  })
+  if (autoClose) stdin.on('finish', () => {
+    queueMicrotask(() => { if (!closed) child.emit('exit', 0, null) })
   })
   return { child, stdin, stdout, stderr }
 }
