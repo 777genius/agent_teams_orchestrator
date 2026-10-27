@@ -169,7 +169,7 @@ class ManagedChild {
     })
   }
 
-  async result(expected: string): Promise<void> {
+  private async nextResult(): Promise<Record<string, unknown>> {
     const deadline = Date.now() + TURN_TIMEOUT_MS
     while (!this.results.length) {
       if (this.failure || this.closed) throw this.error('Child ended before a turn result')
@@ -180,9 +180,21 @@ class ManagedChild {
       })
     }
     if (this.failure) throw this.error('Invalid source child output')
-    const result = this.results.shift()!
+    return this.results.shift()!
+  }
+
+  async result(expected: string): Promise<void> {
+    const result = await this.nextResult()
     requireThat(result.subtype === 'success' && result.is_error !== true && result.result === expected,
       this.error(`Unexpected turn result: ${JSON.stringify(result)}`).message)
+  }
+
+  async refusal(expected: string): Promise<Record<string, unknown>> {
+    const result = await this.nextResult()
+    requireThat(result.subtype === 'error_during_execution' && result.is_error === true &&
+      Array.isArray(result.errors) && result.errors.some(error => typeof error === 'string' && error.includes(expected)),
+    this.error(`Expected a structured history refusal: ${JSON.stringify(result)}`).message)
+    return result
   }
 
   async send(prompt: string, sessionId: string, expected: string): Promise<void> {
@@ -196,7 +208,7 @@ class ManagedChild {
     return new Error(`${message}${this.failure ? `; ${this.failure.message}` : ''}\n${this.stderr}`)
   }
 
-  async finish(): Promise<void> {
+  async finish(expectedExitCode = 0): Promise<void> {
     this.child.stdin.end()
     let timer: ReturnType<typeof setTimeout> | undefined
     try {
@@ -206,7 +218,7 @@ class ManagedChild {
     } finally {
       clearTimeout(timer)
     }
-    requireThat(this.exitCode === 0 && !this.failure, this.error(`Child exited ${this.exitCode}`).message)
+    requireThat(this.exitCode === expectedExitCode && !this.failure, this.error(`Child exited ${this.exitCode}`).message)
     requireThat(this.results.length === 0, 'Unexpected extra turn result')
     children.delete(this)
   }
@@ -367,6 +379,21 @@ async function runLead(test: FixtureCase, fixture: ReturnType<typeof responsesFi
   const resumed = new ManagedChild(cliArgs(test, true, true), test.project, test.env, test.nativeLaunches)
   await resumed.send(prompts[2]!, test.sessionId, answers[2]!)
   await resumed.finish()
+  // The current provider alone cannot guard a previously bound conversation.
+  // Exercise --continue's own load-error path after switching away from Codex.
+  const transcriptPath = await findTranscript(path.join(test.env.CLAUDE_CONFIG_DIR!, 'projects'), test.sessionId)
+  const beforeRefusal = await readFile(transcriptPath, 'utf8')
+  const switchedProvider = new ManagedChild([
+    path.join(REPO, 'src/entrypoints/cli.tsx'), '--bare', '--print', '--continue', '--fork-session',
+    '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
+    '--model', 'claude-sonnet-4-5', '--setting-sources', '', '--strict-mcp-config', '--tools', '',
+  ], test.project, { ...test.env, CLAUDE_CODE_ENTRY_PROVIDER: 'anthropic',
+    ANTHROPIC_API_KEY: 'TEST-local-refusal-only', ANTHROPIC_BASE_URL: fixture.baseUrl }, test.nativeLaunches)
+  const continueForkRefusal = await switchedProvider.refusal('Failed to continue session: Native Codex does not support forking')
+  await switchedProvider.finish(1)
+  requireThat(await readFile(transcriptPath, 'utf8') === beforeRefusal, 'Refused continue/fork changed the original transcript')
+  // Any extra request (including an Anthropic endpoint) makes this strict
+  // fixture fail, even if the child eventually returns an error result.
   const requests = fixture.finish(3)
   for (let turn = 0; turn < requests.length; turn++) {
     const label = `lead request ${turn + 1}`
@@ -375,7 +402,8 @@ async function runLead(test: FixtureCase, fixture: ReturnType<typeof responsesFi
     for (let previous = 0; previous <= turn; previous++) assertCount(requests[turn]!, prompts[previous]!, 1, label)
     for (let previous = 0; previous < turn; previous++) assertCount(requests[turn]!, answers[previous]!, 1, label)
   }
-  return { requests, native: await assertNativeEvidence(test, ['exec', 'exec', 'app-server'], ['persistent', 'persistent', 'persistent']) }
+  return { requests, continueForkRefusal,
+    native: await assertNativeEvidence(test, ['exec', 'exec', 'app-server'], ['persistent', 'persistent', 'persistent']) }
 }
 
 async function runBootstrappedLead(test: FixtureCase, fixture: ReturnType<typeof responsesFixture>) {
@@ -516,8 +544,8 @@ try {
   const teammate = await runTeammate(await createCase(root, 'teammate', binary, fixture.baseUrl), fixture)
   if (args[3]) await writeFile(path.resolve(args[3]), JSON.stringify({ version: EXPECTED_VERSION, lead, bootstrappedLead, teammate }, null, 2) + '\n')
   console.log(JSON.stringify({ ok: true, nativeVersion: EXPECTED_VERSION,
-    coverage: 'source headless QueryEngine + full resume; deterministic lead bootstrap + stripped-spec resume; inbox composition + REPL bridge; real native runners; local Responses input',
-    lead: { requestCount: lead.requests.length, ...lead.native },
+    coverage: 'source headless QueryEngine + full resume + switched-provider continue/fork refusal; deterministic lead bootstrap + stripped-spec resume; inbox composition + REPL bridge; real native runners; local Responses input',
+    lead: { requestCount: lead.requests.length, continueForkRefusal: lead.continueForkRefusal.errors, ...lead.native },
     bootstrappedLead: { requestCount: bootstrappedLead.requests.length, ...bootstrappedLead.native },
     teammate: { requestCount: teammate.requests.length, ...teammate.native } }, null, 2))
 } catch (error) {

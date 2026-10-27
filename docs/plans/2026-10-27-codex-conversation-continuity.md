@@ -249,3 +249,34 @@ an unchanged UI, but exercise actual lead/inbox composition and packaged runtime
 - Implementation review additionally corrected first-admission locking across different profiles, retry after proven pre-submission write failure, and history guards when native credentials are unavailable.
 - Effective host persistence policy (including skip-history and zero-day retention) also controls native persistence.
 - Remaining gates: complete source-runtime E2E, unmocked regression/platform CI, final independent review, and the existing immutable release publication path.
+
+## Pre-merge automated review follow-up
+
+The initial implementation (`c475c25`) passed the native continuity source E2E,
+the Linux and Windows native suites, packaged delivery, and both Windows
+OpenCode identity jobs. After the draft became ready for review, CodeRabbit
+reported four additional cases. Merge was paused to verify them independently.
+
+- Confirmed: the ordinary session-directory sweep could remove an empty active
+  `.codex-native.lock` directory. Skip that reserved suffix in the sweep;
+  `proper-lockfile` retains responsibility for stale recovery. Actual-source
+  cleanup with real filesystem, retention and locks reproduced the deletion
+  before the fix and preserved the active lock after it. Add unmocked Linux and
+  Windows regressions for active ownership, stale recovery and ordinary expiry.
+- Confirmed: `--continue` hid a source-transcript history refusal after a provider
+  switch. Report the failure through the existing output-format-aware loader
+  error path. Extend the source E2E with a switched-provider continue/fork refusal,
+  requiring an error result, exit 1, unchanged source transcript and no inference.
+- Confirmed: both selector validation refusals left the restore selection set,
+  disabling normal dismissal. Clear that selection before displaying the error;
+  leave the existing restore and files-only paths intact.
+- Partially confirmed: real Bun 1.3.11 failed spawns emitted `error` followed by
+  `close`; missing `close` was not reproduced on Linux. The actual exec runner did
+  incorrectly classify a prompt as possibly submitted even though no PID existed.
+  Record failed spawn only for an error with `pid === undefined`, and clear the
+  exec admission flag only on that evidence. Errors from a real PID still require
+  physical close. Real-process tests cover both cases and temporary-home cleanup.
+
+The follow-up uses the existing runners, cleanup and UI error paths. Independent
+reviewers cross-check one another's fixes; current-head unmocked platform CI and
+the extended source E2E remain required before merge.

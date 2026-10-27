@@ -39,14 +39,23 @@ export function assertCodexNativeContinuationOptions(options: {
 type NativeChild = Pick<ChildProcess, 'once' | 'stdin' | 'pid' | 'kill'>
 type NativeExit = { code: number | null; signal: NodeJS.Signals | null }
 
-/** Observe close immediately after spawn, before any input can be admitted. */
+/** Observe termination immediately after spawn, before any input can be admitted. */
 export function observeCodexNativeChild(child: NativeChild) {
   let stopped = false
+  let failedToSpawn = false
   let shutdownPromise: Promise<boolean> | null = null
   const closed = new Promise<NativeExit>(resolve => {
     child.once('close', (code, signal) => {
       stopped = true
       resolve({ code, signal })
+    })
+    child.once('error', () => {
+      // Failed spawn has no process to stop or admit input. Do not depend on a
+      // later close event, or confuse an existing process's error with exit.
+      if (child.pid !== undefined) return
+      failedToSpawn = true
+      stopped = true
+      resolve({ code: null, signal: null })
     })
   })
   const signal = (value: NodeJS.Signals): void => {
@@ -63,7 +72,7 @@ export function observeCodexNativeChild(child: NativeChild) {
       } else {
         child.kill(value)
       }
-    } catch { /* Only an observed close confirms successful shutdown. */ }
+    } catch { /* A signal result alone does not confirm shutdown. */ }
   }
   const wait = async (ms: number): Promise<boolean> => {
     if (stopped) return true
@@ -93,5 +102,5 @@ export function observeCodexNativeChild(child: NativeChild) {
     })()
     return shutdownPromise
   }
-  return { closed, isStopped: () => stopped, signal, shutdown }
+  return { closed, isStopped: () => stopped, didFailToSpawn: () => failedToSpawn, signal, shutdown }
 }

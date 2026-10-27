@@ -150,6 +150,7 @@ export function MessageSelector({
   async function restoreConversationDirectly(message: UserMessage) {
     const restoreError = await getConversationRestoreError('conversation', validateConversationRestore);
     if (restoreError) {
+      setMessageToRestore(undefined);
       setError(restoreError);
       return;
     }
@@ -223,6 +224,7 @@ export function MessageSelector({
     }
     const restoreError = await getConversationRestoreError(option, validateConversationRestore);
     if (restoreError) {
+      setMessageToRestore(undefined);
       setError(restoreError);
       return;
     }

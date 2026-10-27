@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test'
 import { EventEmitter } from 'node:events'
+import { spawn } from 'node:child_process'
 import { PassThrough } from 'node:stream'
 import { existsSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
@@ -22,6 +23,45 @@ async function drainExec(iterator: ReturnType<typeof runCodexNativeExec>) {
 }
 
 describe('exec owned conversation continuity', () => {
+  test('actual ENOENT spawn reports safe pre-submission failure and releases its temporary home', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'TEST-codex-exec-spawn-failure-'))
+    const source = path.join(root, 'profile')
+    const sessions = path.join(root, 'sessions')
+    const missing = path.join(root, 'missing-codex-executable')
+    await mkdir(source)
+    await mkdir(sessions)
+    await writeFile(path.join(sessions, 'sentinel'), 'owned history')
+    let overlayHome = ''
+    let launched: ReturnType<typeof spawn> | undefined
+    try {
+      const error = await drainExec(runCodexNativeExec({
+        prompt: 'TEST input that no process can receive', cwd: root,
+        ephemeral: false, sessionsDirectory: sessions, extraEnv: { CODEX_HOME: source },
+      }, {
+        which: () => missing, resolveVersion: () => 'TEST-no-child',
+        spawnProcess: (_binary, args, options) => {
+          overlayHome = options.env.CODEX_HOME!
+          launched = spawn(missing, args, {
+            cwd: options.cwd, env: options.env, signal: options.signal,
+            detached: options.detached, stdio: ['pipe', 'pipe', 'pipe'],
+          })
+          return launched
+        },
+      })).then(() => null, error => error)
+      expect(launched).toBeDefined()
+      expect(launched!.pid).toBeUndefined()
+      expect(error).toBeInstanceOf(CodexNativeRunnerError)
+      expect(error.cause?.code).toBe('ENOENT')
+      expect(error.lifecycle).toEqual({ submissionMayHaveStarted: false, turnTerminal: false, childStopped: true })
+      expect(overlayHome).not.toBe('')
+      expect(existsSync(overlayHome)).toBe(false)
+      expect(await readFile(path.join(sessions, 'sentinel'), 'utf8')).toBe('owned history')
+    } finally {
+      if (launched?.pid) launched.kill('SIGKILL')
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   test('keeps shared flags before exact resume UUID and new images after resume', () => {
     const args = buildCodexNativeExecArgs({
       prompt: 'new input', cwd: tmpdir(), ephemeral: false, resumeThreadId: CONTINUITY_THREAD,

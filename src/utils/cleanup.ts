@@ -196,6 +196,9 @@ export async function cleanupOldSessionFiles(): Promise<CleanupResult> {
           result.errors++
         }
       } else if (entry.isDirectory()) {
+        // proper-lockfile owns these directories, including stale-lock recovery.
+        // Removing an empty one here would invalidate an active Codex owner.
+        if (entry.name.endsWith('.codex-native.lock')) continue
         // Session directory — clean up tool-results/<toolDir>/* beneath it
         const sessionDir = join(projectDir, entry.name)
         const toolResultsDir = join(sessionDir, TOOL_RESULTS_SUBDIR)

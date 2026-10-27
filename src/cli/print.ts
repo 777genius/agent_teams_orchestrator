@@ -5365,6 +5365,12 @@ async function loadInitialMessages(
       }
     } catch (error) {
       logError(error)
+      emitLoadError(
+        error instanceof Error
+          ? `Failed to continue session: ${error.message}`
+          : 'Failed to continue session with --print mode',
+        options.outputFormat,
+      )
       gracefulShutdownSync(1)
       return { messages: [] }
     }

@@ -702,6 +702,9 @@ async function* runCodexNativeExecImpl(
   }
   } finally {
     lifecycle.childStopped = await nativeChild.shutdown()
+    // Writing to a failed spawn's pipe cannot admit a native prompt. Only the
+    // error-without-PID evidence can undo the conservative stdin admission.
+    if (nativeChild.didFailToSpawn()) lifecycle.submissionMayHaveStarted = false
     if (lifecycle.childStopped) await overlay?.cleanup().catch(() => undefined)
     else {
       // Keep the live child's profile until close; never remove an active mount.
