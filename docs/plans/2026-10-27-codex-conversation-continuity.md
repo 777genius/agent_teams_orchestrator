@@ -1,6 +1,6 @@
 # Codex conversation continuity: bounded correction
 
-Status: revision 2 after independent design criticism; native storage spike pending.
+Status: revision 3, approved in two design-review rounds; native storage spike pending.
 Date: 2026-10-27.
 Scope: fix repeated loss of an agent's direct conversation in native Codex,
 qualify both transports, and deliver the runtime through the desktop app pin.
@@ -58,11 +58,11 @@ not evidence that a recent OpenUI change caused the loss of ordinary history.
 5. A missing/corrupt/mismatched saved thread or uncertain creation must surface
    an actionable error. Never select `--last`, another agent's thread, or silently
    retry as a fresh conversation. Never automatically replay an uncertain prompt.
-6. Preserve explicit non-persistent/single-turn callers. `--no-session-persistence`
+6. Preserve explicit non-persistent callers. `--no-session-persistence`
    is print-only; normal desktop lead/teammate turns persist their host session.
-   An explicit non-persistent call stays ephemeral and creates no durable binding
-   or native rollout. Do not infer desktop semantics from non-persistent unit
-   fixtures.
+   This flag can also accompany multiple stream-json inputs; its existing
+   ephemeral semantics stay outside this persistence fix. It creates no durable
+   binding or native rollout. Do not infer desktop semantics from such unit fixtures.
 7. Old ephemeral conversations have no native history to resume. Do not claim
    to restore lost native tool history or blindly concatenate the UI transcript.
    A genuine legacy resume gets a one-time visible context-reset notice before
@@ -84,6 +84,8 @@ replay of every UI message, new settings, and unrelated provider/auth refactors.
 - Place native storage next to the owning orchestrator session's existing
   transcript directory. Identity includes host session, agent/team, project and
   source Codex profile. Use safe generated directory names, not user text paths.
+  Exclude PID, runtime instance, work-sync generation and per-launch run ID: a
+  full resume may start a new process/run while retaining the same host session.
 - Store the exact native thread UUID, owner/schema metadata, startup-context hash,
   and a minimal creating/active/ready state atomically.
   Keep native rollout files in this owned directory; they remain Codex's model
@@ -99,6 +101,9 @@ replay of every UI message, new settings, and unrelated provider/auth refactors.
 - Correlate the saved conversation with its latest host turn boundary. Reject a
   truncated/rewound host transcript before native input; never infer that a UUID
   alone means the full original conversation is still the requested context.
+  Use authoritative lineage/explicit operation guards, not absence of an old UUID
+  from a filtered/compacted UI projection. Persist and flush the versioned owner
+  reference before first native submission to close the legacy-reset crash gap.
 - Capture identity at turn entry. `/clear`/session switches during a turn must
   not attach the old result to the new conversation. Forks cannot reuse a parent
   native ID; no hidden parent mutation.
@@ -217,5 +222,8 @@ an unchanged UI, but exercise actual lead/inbox composition and packaged runtime
   thread/start but the host's managed /etc/codex configuration contains a hook
   unsupported by that binary. System hooks were not modified. Run the native
   loopback spike in a clean GitHub Actions job before accepting storage behavior.
-- Pending gates: second plan review, real sessions-only/cross-transport spike,
-  and access to the existing immutable release publication path.
+- Review round 2: no remaining blocking architecture issue. Clarified stable
+  resume identity, owner-reference flush before admission, authoritative lineage,
+  and the fact that no-persistence stream-json can still contain multiple turns.
+- Pending gates: real sessions-only/cross-transport spike and access to the
+  existing immutable release publication path. Production code remains unchanged.
