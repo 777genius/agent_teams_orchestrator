@@ -162,6 +162,7 @@ import {
   getCodexNativeHistoryOperationError,
   getCodexNativeHistoryOperationErrorForTranscript,
 } from 'src/services/codexNative/conversationHistoryGuard.js'
+import { restoreCodexLeadConversationForFullResume } from 'src/services/codexNative/leadConversationResume.js'
 import { runSideQuestion } from 'src/utils/sideQuestion.js'
 import {
   processSessionStartHooks,
@@ -879,6 +880,19 @@ export async function runHeadless(
     process.stderr.write(
       'Error: When using --print, --output-format=stream-json requires --verbose\n',
     )
+    gracefulShutdownSync(1)
+    return
+  }
+
+  try {
+    await restoreCodexLeadConversationForFullResume({
+      isFullResume: Boolean(options.resume || options.continue) &&
+        !options.forkSession && !options.resumeSessionAt && !options.teleport,
+      getAppState,
+      setAppState,
+    })
+  } catch (error) {
+    emitLoadError(error instanceof Error ? error.message : 'Failed to restore the Codex lead identity', options.outputFormat)
     gracefulShutdownSync(1)
     return
   }

@@ -6,8 +6,9 @@
  * bun scripts/codex-native-continuity-e2e.ts --codex /path/to/codex
  *   [--evidence-file /path/to/fixture-evidence.json]
  *
- * Exercises print -> QueryEngine -> native runner, actual host --resume, and
- * ordinary inbox prompt composition -> REPL native bridge. It does not launch
+ * Exercises print -> QueryEngine -> native runner, actual host --resume,
+ * deterministic lead bootstrap followed by a stripped-bootstrap full resume,
+ * and ordinary inbox prompt composition -> REPL native bridge. It does not launch
  * Electron, mount the React inbox poller, or claim live-model recall. All model
  * requests go to this loopback fixture; assertions inspect their actual input.
  * Run on a clean Linux CI worker. Managed system configuration is not bypassed.
@@ -340,8 +341,18 @@ async function assertNativeEvidence(test: FixtureCase, transports: string[], pol
   const directId = [...directIds][0]
   const ephemeralIds = summaries.filter(row => row.codexNativeCompletionPolicy === 'ephemeral').map(row => row.codexNativeThreadId)
   requireThat(ephemeralIds.every(id => typeof id === 'string' && id !== directId) && new Set(ephemeralIds).size === ephemeralIds.length, 'Bootstrap/group used the direct thread or reused each other')
-  requireThat(rows.filter(row => row.type === 'codex-conversation-owner').length === 1, 'Host transcript should have exactly one native owner reference')
-  return { transports: actualTransports, policies, directThreadId: directId, ephemeralThreadIds: ephemeralIds }
+  const references = rows.filter(row => row.type === 'codex-conversation-owner')
+  requireThat(references.length === 1, 'Host transcript should have exactly one native owner reference')
+  // This scan is confined to the disposable test transcript directory. The
+  // production reader uses an exact stable address, never a directory scan.
+  const nativeRoot = path.join(path.dirname(transcriptPath), 'codex-native')
+  const stored = (await readdir(nativeRoot, { withFileTypes: true })).filter(entry => entry.isDirectory())
+  requireThat(stored.length === 1, 'Expected one native conversation binding in the fixture')
+  const binding = JSON.parse(await readFile(path.join(nativeRoot, stored[0]!.name, 'binding.json'), 'utf8'))
+  requireThat(binding.state === 'ready' && binding.threadId === directId && binding.ownerKey === references[0]!.ownerKey,
+    'The persisted native binding does not match its host reference or completed thread')
+  return { transports: actualTransports, policies, directThreadId: directId, ephemeralThreadIds: ephemeralIds,
+    ownerKey: binding.ownerKey, owner: binding.owner }
 }
 
 async function runLead(test: FixtureCase, fixture: ReturnType<typeof responsesFixture>) {
@@ -365,6 +376,81 @@ async function runLead(test: FixtureCase, fixture: ReturnType<typeof responsesFi
     for (let previous = 0; previous < turn; previous++) assertCount(requests[turn]!, answers[previous]!, 1, label)
   }
   return { requests, native: await assertNativeEvidence(test, ['exec', 'exec', 'app-server'], ['persistent', 'persistent', 'persistent']) }
+}
+
+async function runBootstrappedLead(test: FixtureCase, fixture: ReturnType<typeof responsesFixture>) {
+  // The desktop lead has no teammate identity flags or member startup-context
+  // env. Its team identity originates in deterministic bootstrap AppState.
+  delete test.env.CLAUDE_CODE_NATIVE_APP_MANAGED_BOOTSTRAP_CONTEXT_PATH
+  test.env.CLAUDE_ENABLE_DETERMINISTIC_TEAM_BOOTSTRAP = '1'
+  test.env.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS = '1'
+  test.env.TMPDIR = test.directory
+  const teamName = `test-native-lead-${test.id}`
+  const url = `https://example.invalid/${test.id}/bootstrapped-lead-reference`
+  const prompts = [`BOOTSTRAPPED_LEAD_USER_A_${test.id}: remember ${url}`,
+    `BOOTSTRAPPED_LEAD_USER_B_${test.id}: recall the earlier reference`,
+    `BOOTSTRAPPED_LEAD_USER_C_${test.id}: continue after the app restarts the lead`]
+  const answers = ['A', 'B', 'C'].map(letter => `BOOTSTRAPPED_LEAD_ASSISTANT_${letter}_${test.id}`)
+  const bootstrapDirectory = path.join(test.directory, `agent-teams-bootstrap-${test.id}`)
+  await mkdir(bootstrapDirectory, { mode: 0o700 })
+  const specPath = path.join(bootstrapDirectory, 'bootstrap.json')
+  await writeFile(specPath, JSON.stringify({ version: 1, runId: test.id, mode: 'create',
+    initiator: { kind: 'app', source: 'claude_team_agent_teams_orchestrator' },
+    team: { name: teamName, cwd: test.project }, lead: {}, members: [],
+    ui: { emitStructuredEvents: true } }), { mode: 0o600 })
+  await writeFile(path.join(bootstrapDirectory, '.agent-teams-bootstrap-owner.json'), JSON.stringify({
+    version: 1, kind: 'agent-teams-bootstrap', specFile: 'bootstrap.json', ownerPid: process.pid,
+  }), { mode: 0o600 })
+  const promptPath = path.join(test.directory, 'first-real-user-task.txt')
+  await writeFile(promptPath, prompts[0]!, { mode: 0o600 })
+  fixture.prepare(answers)
+  const first = new ManagedChild([...cliArgs(test, false, false), '--team-bootstrap-spec', specPath,
+    '--team-bootstrap-user-prompt-file', promptPath], test.project, test.env, test.nativeLaunches)
+  await first.result(answers[0]!)
+  await first.send(prompts[1]!, test.sessionId, answers[1]!)
+  await first.finish()
+  for (const consumed of [specPath, promptPath]) {
+    const exists = await lstat(consumed).then(() => true, error => {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+      throw error
+    })
+    requireThat(!exists, 'Deterministic lead bootstrap did not consume its one-shot input')
+  }
+  const teamPath = path.join(test.env.CLAUDE_CONFIG_DIR!, 'teams', teamName, 'config.json')
+  const team = JSON.parse(await readFile(teamPath, 'utf8'))
+  requireThat(team.name === teamName && team.leadSessionId === test.sessionId && team.members.length === 1,
+    'Deterministic bootstrap did not create the expected lead ownership')
+  requireThat(team.members[0].agentId === team.leadAgentId && team.members[0].sessionId === undefined,
+    'Fixture must exercise the normal TeamCreate contract without member.sessionId')
+  const before = await assertNativeEvidence(test, ['exec', 'exec'], ['persistent', 'persistent'])
+  requireThat(before.owner.agentId === team.leadAgentId && before.owner.teamName === teamName,
+    'First real lead task was not bound to its bootstrapped team identity')
+
+  // Match the desktop restart contract: keep the exact host session and env,
+  // drop consumed bootstrap flags, and use --resume. No identity flag is added.
+  const resumedArgs = cliArgs(test, true, true)
+  requireThat(!resumedArgs.some(arg => ['--team-bootstrap-spec', '--team-bootstrap-user-prompt-file',
+    '--agent-id', '--agent-name', '--team-name'].includes(arg)), 'Resume must restore persisted lead identity')
+  const resumed = new ManagedChild(resumedArgs, test.project, test.env, test.nativeLaunches)
+  await resumed.send(prompts[2]!, test.sessionId, answers[2]!)
+  await resumed.finish()
+  const requests = fixture.finish(3)
+  for (let turn = 0; turn < requests.length; turn++) {
+    const label = `bootstrapped lead request ${turn + 1}`
+    assertCount(requests[turn]!, url, 1, label)
+    for (let previous = 0; previous <= turn; previous++) assertCount(requests[turn]!, prompts[previous]!, 1, label)
+    for (let previous = 0; previous < turn; previous++) assertCount(requests[turn]!, answers[previous]!, 1, label)
+    for (const unused of [test.context, test.privateProof, '<agent_teams_native_bootstrap_control>']) {
+      assertCount(requests[turn]!, unused, 0, label)
+    }
+  }
+  const native = await assertNativeEvidence(test, ['exec', 'exec', 'app-server'], ['persistent', 'persistent', 'persistent'])
+  requireThat(native.ownerKey === before.ownerKey && native.directThreadId === before.directThreadId &&
+    JSON.stringify(native.owner) === JSON.stringify(before.owner), 'Lead full resume changed the native conversation owner')
+  const resumedTeam = JSON.parse(await readFile(teamPath, 'utf8'))
+  requireThat(resumedTeam.leadSessionId === team.leadSessionId && resumedTeam.leadAgentId === team.leadAgentId,
+    'Full resume reassigned the persisted team lead')
+  return { requests, native, teamName, leadAgentId: team.leadAgentId }
 }
 
 async function runTeammate(test: FixtureCase, fixture: ReturnType<typeof responsesFixture>) {
@@ -426,11 +512,14 @@ try {
   requireThat(version.exitCode === 0 && version.stdout.toString().trim() === `codex-cli ${EXPECTED_VERSION}`, `This gate requires codex-cli ${EXPECTED_VERSION}`)
   fixture = responsesFixture()
   const lead = await runLead(await createCase(root, 'lead', binary, fixture.baseUrl), fixture)
+  const bootstrappedLead = await runBootstrappedLead(await createCase(root, 'bootstrapped-lead', binary, fixture.baseUrl), fixture)
   const teammate = await runTeammate(await createCase(root, 'teammate', binary, fixture.baseUrl), fixture)
-  if (args[3]) await writeFile(path.resolve(args[3]), JSON.stringify({ version: EXPECTED_VERSION, lead, teammate }, null, 2) + '\n')
+  if (args[3]) await writeFile(path.resolve(args[3]), JSON.stringify({ version: EXPECTED_VERSION, lead, bootstrappedLead, teammate }, null, 2) + '\n')
   console.log(JSON.stringify({ ok: true, nativeVersion: EXPECTED_VERSION,
-    coverage: 'source headless QueryEngine + full resume; inbox composition + REPL bridge; real native runners; local Responses input',
-    lead: { requestCount: lead.requests.length, ...lead.native }, teammate: { requestCount: teammate.requests.length, ...teammate.native } }, null, 2))
+    coverage: 'source headless QueryEngine + full resume; deterministic lead bootstrap + stripped-spec resume; inbox composition + REPL bridge; real native runners; local Responses input',
+    lead: { requestCount: lead.requests.length, ...lead.native },
+    bootstrappedLead: { requestCount: bootstrappedLead.requests.length, ...bootstrappedLead.native },
+    teammate: { requestCount: teammate.requests.length, ...teammate.native } }, null, 2))
 } catch (error) {
   console.error(error instanceof Error ? error.stack : String(error))
   process.exitCode = 1

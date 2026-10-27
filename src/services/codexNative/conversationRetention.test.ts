@@ -6,7 +6,7 @@ import path from 'node:path'
 import { afterEach, expect, test } from 'bun:test'
 
 import { lock } from '../../utils/lockfile.js'
-import { codexConversationOwnerKey, resolveCodexConversationOwner } from './conversationBinding.js'
+import { codexConversationDirectory, codexConversationOwnerKey, resolveCodexConversationOwner } from './conversationBinding.js'
 import { writeCodexConversationOwnerReference } from './conversationOwnerReference.js'
 import { unlinkExpiredCodexAwareTranscript } from './conversationRetention.js'
 
@@ -28,7 +28,7 @@ async function fixture(existingRoot?: string) {
   const ownerKey = codexConversationOwnerKey(owner)
   const reference = { schemaVersion: 1 as const, ownerKey, sessionId }
   await writeCodexConversationOwnerReference(transcript, reference, { flush: async () => {} })
-  const directory = path.join(path.dirname(owner.transcriptPath), 'codex-native', ownerKey)
+  const directory = codexConversationDirectory(owner.transcriptPath)
   const sessions = path.join(directory, 'sessions')
   await mkdir(sessions, { recursive: true })
   const history = path.join(sessions, 'TEST-rollout.jsonl')
@@ -65,6 +65,16 @@ test('legacy transcripts retain the same age policy without touching unrelated n
   expect(await unlinkExpiredCodexAwareTranscript(legacy, cutoff, transcriptFs)).toBe(true)
   expect(existsSync(legacy)).toBe(false)
   expect(existsSync(owned.history)).toBe(true)
+})
+
+test('a lost transcript reference does not orphan an existing native binding during retention', async () => {
+  const f = await fixture()
+  await writeFile(f.transcript, '{"type":"user","message":"owner reference lost"}\n')
+  await utimes(f.transcript, expired, expired)
+  await expect(unlinkExpiredCodexAwareTranscript(f.transcript, cutoff, transcriptFs))
+    .rejects.toThrow('without its transcript owner reference')
+  expect(existsSync(f.transcript)).toBe(true)
+  expect(existsSync(f.history)).toBe(true)
 })
 
 test('a recent transcript survives normal retention and expires under the existing zero-day cutoff', async () => {

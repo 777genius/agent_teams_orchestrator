@@ -86,6 +86,20 @@ replay of every UI message, new settings, and unrelated provider/auth refactors.
   source Codex profile. Use safe generated directory names, not user text paths.
   Exclude PID, runtime instance, work-sync generation and per-launch run ID: a
   full resume may start a new process/run while retaining the same host session.
+- Derive the storage address from the canonical transcript path, while retaining
+  the complete owner identity hash in binding/reference validation. A resumed
+  lead can then locate an existing binding before its team identity is restored;
+  a lost reference cannot silently turn that binding into a legacy fresh thread.
+- On an explicit full lead resume, recover missing AppState identity only from
+  the validated persisted native owner and the exact existing team file's lead
+  agent/session/project. Preserve all explicit current identities and mismatch
+  refusals. This covers the app's restart path, which strips the initial
+  bootstrap spec. It adds no new app/runtime protocol or native history replay.
+  Desktop clear launches a fresh bootstrap and updates lead ownership. The raw
+  interactive CLI's in-process `/clear` does not update `teamFile.leadSessionId`;
+  a later lead restart with that stale team ownership is explicitly refused.
+  Do not claim universal team resume after that separate CLI lifecycle or relax
+  the exact lead-session check to conceal it.
 - Store the exact native thread UUID, owner/schema metadata, startup-context hash,
   and a minimal creating/active/ready state atomically.
   Keep native rollout files in this owned directory; they remain Codex's model

@@ -68,7 +68,11 @@ async function canonicalPath(value: string): Promise<string> {
     return await realpath(resolved)
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
-    return resolved
+    // A first transcript/profile may not exist yet. Resolve its existing
+    // ancestors so creating it cannot change identity through a parent symlink
+    // or a Windows short-path alias on the next turn.
+    const parent = path.dirname(resolved)
+    return parent === resolved ? resolved : path.join(await canonicalPath(parent), path.basename(resolved))
   }
 }
 
@@ -91,6 +95,12 @@ export function codexConversationOwnerKey(owner: CodexConversationOwner): string
   ])).digest('hex')
 }
 
+/** Stable address even before a resumed lead's agent/team identity is restored. */
+export function codexConversationDirectory(canonicalTranscriptPath: string): string {
+  const storageKey = createHash('sha256').update(canonicalTranscriptPath).digest('hex')
+  return path.join(path.dirname(canonicalTranscriptPath), 'codex-native', storageKey)
+}
+
 function parseBinding(value: unknown, ownerKey: string): Binding {
   const b = value as Partial<Binding> | null
   if (!b || b.schemaVersion !== 1 || b.ownerKey !== ownerKey || !b.owner ||
@@ -106,6 +116,50 @@ function parseBinding(value: unknown, ownerKey: string): Binding {
   return b as Binding
 }
 
+/**
+ * A full host resume may need the saved lead identity before AppState exists.
+ * Read it only through the physical transcript reference, and still require
+ * the current host session, project and source profile to match exactly.
+ * The caller must verify the existing team's lead membership before restoring
+ * that identity. acquire() repeats ownership validation under its writer lock.
+ */
+export async function readCodexConversationOwnerForFullResume(
+  current: Omit<CodexConversationOwner, 'agentId' | 'teamName'>,
+): Promise<CodexConversationOwner | null> {
+  const canonical = await resolveCodexConversationOwner({
+    ...current, agentId: null, teamName: null,
+  })
+  const reference = await readCodexConversationOwnerReference(canonical.transcriptPath)
+  const bindingPath = path.join(codexConversationDirectory(canonical.transcriptPath), 'binding.json')
+  let serializedBinding: string
+  try {
+    serializedBinding = await readFile(bindingPath, 'utf8')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT' && !reference) return null
+    throw refusal('the saved native binding is missing or unreadable')
+  }
+  if (!reference) throw refusal('the host conversation owner reference is missing')
+  if (reference.sessionId !== canonical.sessionId || !/^[0-9a-f]{64}$/.test(reference.ownerKey)) {
+    throw refusal('the resumed host conversation has a different or invalid owner')
+  }
+  let binding: Binding
+  try {
+    binding = parseBinding(JSON.parse(serializedBinding), reference.ownerKey)
+  } catch (error) {
+    throw refusal(error instanceof Error ? error.message : 'cannot read the saved binding')
+  }
+  if (codexConversationOwnerKey({
+    ...canonical, agentId: binding.owner.agentId, teamName: binding.owner.teamName,
+  }) !== reference.ownerKey) {
+    throw refusal('the resumed host session, project, or Codex profile changed')
+  }
+  if (binding.state !== 'ready') {
+    throw refusal('the previous native request has an unconfirmed outcome')
+  }
+  await readCodexConversationOwnerReference(canonical.transcriptPath, binding.lastHostTurnId)
+  return binding.owner
+}
+
 /** Own one direct conversation until its native child has actually stopped. */
 export async function acquireCodexNativeConversation(
   params: { owner: CodexConversationOwner; flush: () => Promise<void> },
@@ -113,7 +167,7 @@ export async function acquireCodexNativeConversation(
 ): Promise<CodexNativeConversation> {
   const owner = await resolveCodexConversationOwner(params.owner)
   const ownerKey = codexConversationOwnerKey(owner)
-  const directory = path.join(path.dirname(owner.transcriptPath), 'codex-native', ownerKey)
+  const directory = codexConversationDirectory(owner.transcriptPath)
   const bindingPath = path.join(directory, 'binding.json')
   const sessionsDirectory = path.join(directory, 'sessions')
   await mkdir(directory, { recursive: true, mode: 0o700 })

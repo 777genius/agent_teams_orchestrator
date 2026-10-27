@@ -670,7 +670,7 @@ export async function* executeCodexNativeTurn(
     null
   let conversation: CodexNativeConversation | undefined
   let nativeIterator: ReturnType<typeof runCodexNativeExec> | undefined
-  let runnerTransport: 'exec' | 'app-server' | undefined
+  let runnerTransport: 'exec-json' | 'app-server' | undefined
   let runnerFinished = false
   let contextAdmitted = false
   let turnTerminal = false

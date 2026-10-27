@@ -3,7 +3,7 @@ import { lstat, readFile, realpath, rm } from 'node:fs/promises'
 import path from 'node:path'
 
 import { lock } from '../../utils/lockfile.js'
-import { codexConversationOwnerKey, type CodexConversationOwner } from './conversationBinding.js'
+import { codexConversationDirectory, codexConversationOwnerKey, type CodexConversationOwner } from './conversationBinding.js'
 import { readCodexConversationOwnerReference } from './conversationOwnerReference.js'
 
 type TranscriptFs = {
@@ -95,7 +95,7 @@ export async function unlinkExpiredCodexAwareTranscript(
       const rootStats = await statIfPresent(nativeRoot)
       if (rootStats) {
         assertDirectory(rootStats, 'native storage root')
-        const directory = path.join(nativeRoot, reference.ownerKey)
+        const directory = codexConversationDirectory(transcript)
         const directoryStats = await statIfPresent(directory)
         if (directoryStats) {
           assertDirectory(directoryStats, 'native owner directory')
@@ -120,6 +120,8 @@ export async function unlinkExpiredCodexAwareTranscript(
           ownedDirectory = directory
         }
       }
+    } else if (await statIfPresent(path.join(codexConversationDirectory(transcript), 'binding.json'))) {
+      throw new Error('Codex retention refuses a native binding without its transcript owner reference.')
     }
 
     // Metadata reads can take time. Re-check the actual file immediately before

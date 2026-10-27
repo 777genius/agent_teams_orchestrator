@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { createHash, randomUUID } from 'node:crypto'
-import { appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
@@ -8,6 +8,7 @@ import { writeJsonFileAtomic } from '../../utils/atomicWrite.js'
 import {
   acquireCodexNativeConversation,
   codexConversationOwnerKey,
+  readCodexConversationOwnerForFullResume,
   resolveCodexConversationOwner,
   type CodexConversationOwner,
   type CodexNativeConversation,
@@ -91,11 +92,114 @@ async function ready(f: Awaited<ReturnType<typeof fixture>>) {
   return conversation
 }
 
+function fullResumeInput(owner: CodexConversationOwner) {
+  const { sessionId, transcriptPath, cwd, sourceProfile } = owner
+  return { sessionId, transcriptPath, cwd, sourceProfile }
+}
+
 afterEach(async () => {
   await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true })))
 })
 
 describe('Codex native conversation binding', () => {
+  test('full host resume reads the exact saved owner without reserving or changing native state', async () => {
+    const f = await fixture()
+    const previous = await ready(f)
+    const before = await readFile(bindingPath(previous), 'utf8')
+    const transcriptBefore = await readFile(f.owner.transcriptPath, 'utf8')
+
+    expect(await readCodexConversationOwnerForFullResume(fullResumeInput(f.owner)))
+      .toEqual(await resolveCodexConversationOwner(f.owner))
+    expect(await readFile(bindingPath(previous), 'utf8')).toBe(before)
+    expect(await readFile(f.owner.transcriptPath, 'utf8')).toBe(transcriptBefore)
+    expect(f.locks.held.size).toBe(0)
+  })
+
+  test('full host resume leaves legacy and standalone conversations without team identity', async () => {
+    const f = await fixture()
+    expect(await readCodexConversationOwnerForFullResume(fullResumeInput(f.owner))).toBeNull()
+    f.owner.agentId = null
+    f.owner.teamName = null
+    await ready(f)
+
+    expect(await readCodexConversationOwnerForFullResume(fullResumeInput(f.owner)))
+      .toEqual(await resolveCodexConversationOwner(f.owner))
+  })
+
+  test('creating a missing transcript through a parent alias keeps safe retry on the same owner and storage', async () => {
+    const f = await fixture()
+    const alias = path.join(f.root, 'transcript-alias')
+    await symlink(path.dirname(f.owner.transcriptPath), alias, 'junction')
+    await rm(f.owner.transcriptPath)
+    f.owner.transcriptPath = path.join(alias, 'host.jsonl')
+
+    const first = await f.acquire()
+    await expect(first.verifyHostTurn(f.hostTurnId)).rejects.toThrow('recorded host turn')
+    await first.settle(notSubmitted)
+    await first.release()
+    const reference = await readCodexConversationOwnerReference(f.owner.transcriptPath)
+    await appendFile(f.owner.transcriptPath, userRow(f.owner, f.hostTurnId))
+
+    const retry = await f.acquire()
+    expect(retry.isNew).toBe(false)
+    expect(retry.resumeThreadId).toBeUndefined()
+    expect(retry.sessionsDirectory).toBe(first.sessionsDirectory)
+    expect(await readCodexConversationOwnerReference(f.owner.transcriptPath)).toEqual(reference)
+    await retry.verifyHostTurn(f.hostTurnId)
+    await retry.settle(notSubmitted)
+    await retry.release()
+  })
+
+  test('loss of the owner reference and in-memory team identity cannot start fresh on full resume', async () => {
+    const f = await fixture()
+    const previous = await ready(f)
+    const before = await readFile(bindingPath(previous), 'utf8')
+    // Preserve the real accepted user turn; only the physical owner metadata is lost.
+    await writeFile(f.owner.transcriptPath, userRow(f.owner, f.hostTurnId))
+
+    await expect(readCodexConversationOwnerForFullResume(fullResumeInput(f.owner)))
+      .rejects.toThrow('Codex conversation cannot be continued')
+    await expect(acquireCodexNativeConversation({
+      ...f.params, owner: { ...f.owner, agentId: null, teamName: null },
+    }, { lock: f.locks.lock })).rejects.toThrow('Codex conversation cannot be continued')
+    expect(await readFile(bindingPath(previous), 'utf8')).toBe(before)
+    expect(f.locks.held.size).toBe(0)
+  })
+
+  test.each(['sessionId', 'cwd', 'sourceProfile', 'transcriptPath'] as const)(
+    'full host resume refuses a changed %s instead of adopting saved team identity', async field => {
+      const f = await fixture()
+      const previous = await ready(f)
+      const current = fullResumeInput(f.owner)
+      const before = await readFile(bindingPath(previous), 'utf8')
+      current[field] = `${current[field]}-OTHER`
+      if (field === 'transcriptPath') {
+        await writeFile(current.transcriptPath, await readFile(f.owner.transcriptPath))
+      }
+
+      await expect(readCodexConversationOwnerForFullResume(current))
+        .rejects.toThrow('Codex conversation cannot be continued')
+      expect(await readFile(bindingPath(previous), 'utf8')).toBe(before)
+    },
+  )
+
+  test.each(['malformed', 'path-like-owner-key'])(
+    'full host resume refuses a %s owner reference', async scenario => {
+      const f = await fixture()
+      const previous = await ready(f)
+      const before = await readFile(bindingPath(previous), 'utf8')
+      await writeFile(f.owner.transcriptPath, userRow(f.owner, f.hostTurnId) + (
+        scenario === 'malformed' ? '{"type":"codex-conversation-owner"' : JSON.stringify({
+          type: 'codex-conversation-owner', schemaVersion: 1,
+          sessionId: f.owner.sessionId, ownerKey: '../OTHER-owner',
+        }) + '\n'
+      ))
+
+      await expect(readCodexConversationOwnerForFullResume(fullResumeInput(f.owner))).rejects.toThrow()
+      expect(await readFile(bindingPath(previous), 'utf8')).toBe(before)
+    },
+  )
+
   test('persists host ownership before admission and resumes the exact native history after release', async () => {
     const f = await fixture()
     const first = await f.acquire()
@@ -181,7 +285,7 @@ describe('Codex native conversation binding', () => {
       const before = await readFile(bindingPath(previous), 'utf8')
       const changed = { ...f.owner, [field]: `${f.owner[field]}-OTHER` }
       await expect(acquireCodexNativeConversation({ ...f.params, owner: changed }, { lock: f.locks.lock }))
-        .rejects.toThrow('different agent, project, or Codex profile')
+        .rejects.toThrow('Codex conversation cannot be continued')
       expect(await readFile(bindingPath(previous), 'utf8')).toBe(before)
       expect(f.locks.held.size).toBe(0)
     },
@@ -211,6 +315,8 @@ describe('Codex native conversation binding', () => {
         ...(scenario === 'wrong-owner' ? { ownerKey: 'another-owner' } : { threadId: 'not-a-thread-uuid' }),
       }))
       await expect(f.acquire()).rejects.toThrow('Codex conversation cannot be continued')
+      await expect(readCodexConversationOwnerForFullResume(fullResumeInput(f.owner)))
+        .rejects.toThrow('Codex conversation cannot be continued')
       expect(f.locks.held.size).toBe(0)
     },
   )
@@ -229,6 +335,8 @@ describe('Codex native conversation binding', () => {
     await writeFile(bindingPath(previous), damaged)
 
     await expect(f.acquire()).rejects.toThrow('Codex conversation cannot be continued')
+    await expect(readCodexConversationOwnerForFullResume(fullResumeInput(f.owner)))
+      .rejects.toThrow('Codex conversation cannot be continued')
     expect(await readFile(bindingPath(previous), 'utf8')).toBe(damaged)
     expect(f.locks.held.size).toBe(0)
   })
@@ -240,6 +348,8 @@ describe('Codex native conversation binding', () => {
     await previous.settle({ submissionMayHaveStarted: true, turnTerminal: false, childStopped: true })
     await previous.release()
     await expect(f.acquire()).rejects.toThrow('unconfirmed outcome')
+    await expect(readCodexConversationOwnerForFullResume(fullResumeInput(f.owner)))
+      .rejects.toThrow('unconfirmed outcome')
     expect((await binding(previous)).state).toBe(threadObserved ? 'active' : 'creating')
   })
 
@@ -271,6 +381,8 @@ describe('Codex native conversation binding', () => {
         state: 'ready', threadId: null, startupContextHash: null, lastHostTurnId: null,
       })
     }
+    expect(await readCodexConversationOwnerForFullResume(fullResumeInput(f.owner)))
+      .toEqual(await resolveCodexConversationOwner(f.owner))
     const next = await f.acquire()
     expect(next.resumeThreadId).toBe(established ? threadId : undefined)
     expect(next.startupContextHash).toBe(established ? contextHash : null)
@@ -335,6 +447,8 @@ describe('Codex native conversation binding', () => {
     const rows = (await readFile(f.owner.transcriptPath, 'utf8')).split('\n')
     await writeFile(f.owner.transcriptPath, rows.filter(row => !row.includes(f.hostTurnId)).join('\n'))
     await expect(f.acquire()).rejects.toThrow('recorded host turn')
+    await expect(readCodexConversationOwnerForFullResume(fullResumeInput(f.owner)))
+      .rejects.toThrow('recorded host turn')
     expect((await binding(previous)).state).toBe('ready')
   })
 
