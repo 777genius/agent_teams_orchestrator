@@ -158,8 +158,9 @@ import { buildSideQuestionFallbackParams } from 'src/utils/queryContext.js'
 import { runStartupTeamBootstrap } from 'src/services/teamBootstrap/teamBootstrapEntry.js'
 import { validateTeamBootstrapStartupOptions } from 'src/services/teamBootstrap/teamBootstrapStartupGuards.js'
 import {
+  assertCodexNativeHistoryOperationSupportedForTranscript,
   getCodexNativeHistoryOperationError,
-  usesCodexNativeConversation,
+  getCodexNativeHistoryOperationErrorForTranscript,
 } from 'src/services/codexNative/conversationHistoryGuard.js'
 import { runSideQuestion } from 'src/utils/sideQuestion.js'
 import {
@@ -224,6 +225,7 @@ import {
   saveMode,
   saveAiGeneratedTitle,
   restoreSessionMetadata,
+  getTranscriptPathForSession,
 } from 'src/utils/sessionStorage.js'
 import { incrementPromptCount } from 'src/utils/commitAttribution.js'
 import {
@@ -1006,6 +1008,10 @@ export async function runHeadless(
       : null
 
   headlessProfilerCheckpoint('before_runHeadlessStreaming')
+  const allowInterruptedTurnReplay = !(
+    turnInterruptionState && turnInterruptionState.kind !== 'none' &&
+    process.env.CLAUDE_CODE_RESUME_INTERRUPTED_TURN
+  ) || !(await getCodexNativeHistoryOperationErrorForTranscript('rewind'))
   for await (const message of runHeadlessStreaming(
     structuredIO,
     appState.mcp.clients,
@@ -1019,6 +1025,7 @@ export async function runHeadless(
     agents,
     options,
     turnInterruptionState,
+    allowInterruptedTurnReplay,
   )) {
     if (transformToStreamlined) {
       // Streamlined mode: transform messages and stream immediately
@@ -1152,6 +1159,7 @@ function runHeadlessStreaming(
     workload?: string | undefined
   },
   turnInterruptionState?: TurnInterruptionState,
+  allowInterruptedTurnReplay = true,
 ): AsyncIterable<StdoutMessage> {
   let running = false
   let leadMailboxPollGeneration = 0
@@ -1321,7 +1329,7 @@ function runHeadlessStreaming(
     turnInterruptionState &&
     turnInterruptionState.kind !== 'none' &&
     resumeInterruptedTurnEnv &&
-    !usesCodexNativeConversation()
+    allowInterruptedTurnReplay
   ) {
     logForDebugging(
       `[print.ts] Auto-resuming interrupted turn (kind: ${turnInterruptionState.kind})`,
@@ -5260,6 +5268,12 @@ async function loadInitialMessages(
   },
 ): Promise<LoadInitialMessagesResult> {
   const persistSession = !isSessionPersistenceDisabled()
+  const assertTargetHistoryOperation = async (result: { fullPath?: string; sessionId?: string }): Promise<void> => {
+    const operation = options.resumeSessionAt ? 'partial-resume' : options.forkSession ? 'fork' : undefined
+    if (!operation) return
+    await assertCodexNativeHistoryOperationSupportedForTranscript(operation,
+      result.fullPath ?? getTranscriptPathForSession(result.sessionId ?? getSessionId()))
+  }
   // Handle continue in print mode
   if (options.continue) {
     try {
@@ -5270,6 +5284,7 @@ async function loadInitialMessages(
         undefined /* file path */,
       )
       if (result) {
+        await assertTargetHistoryOperation(result)
         // Match coordinator mode to the resumed session's mode
         if (feature('COORDINATOR_MODE') && coordinatorModeModule) {
           const warning = coordinatorModeModule.matchSessionMode(result.mode)
@@ -5457,6 +5472,10 @@ async function loadInitialMessages(
           return { messages: [] }
         }
       }
+
+      // A different current provider does not authorize cutting/forking the
+      // saved native owner's history. Check the source before any state edit.
+      await assertTargetHistoryOperation(result)
 
       // Handle resumeSessionAt feature
       if (options.resumeSessionAt) {

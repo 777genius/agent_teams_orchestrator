@@ -8,6 +8,7 @@ import { getSessionId, getSessionProjectDir, switchSession } from '../../bootstr
 import type { SDKMessage } from '../../entrypoints/agentSdkTypes.js'
 import { asSessionId } from '../../types/ids.js'
 import type { Message } from '../../types/message.js'
+import { writeJsonFileAtomic } from '../../utils/atomicWrite.js'
 import { createUserMessage } from '../../utils/messages.js'
 import { EMPTY_USAGE } from '../api/emptyUsage.js'
 import {
@@ -15,7 +16,6 @@ import {
   NATIVE_APP_MANAGED_BOOTSTRAP_CONTEXT_ENV,
 } from '../teamBootstrap/nativeAppManagedBootstrapContext.js'
 import { acquireCodexNativeConversation } from './conversationBinding.js'
-import type { CodexNativeConversationScope } from './conversationScope.js'
 import { readCodexConversationOwnerReference } from './conversationOwnerReference.js'
 import type { CodexNativeExecObservation, CodexNativeExecSummary, CodexNativeExecRunnerOptions } from './execRunner.js'
 import { CodexNativeRunnerError } from './runnerLifecycle.js'
@@ -85,6 +85,7 @@ async function fixture() {
   let acquired = 0
   let enabled = true
   let sessionsDirectory: string | undefined
+  let bindingOverrides: BindingDeps = {}
   const lock: NonNullable<BindingDeps['lock']> = async file => {
     if (heldLocks.has(file)) throw new Error('TEST conversation already owned')
     heldLocks.add(file)
@@ -124,7 +125,7 @@ async function fixture() {
       acquired++
       expect(params.owner.sessionId).toBe(sessionId)
       expect(params.owner.transcriptPath).toBe(transcriptPath)
-      const conversation = await acquireCodexNativeConversation(params, { lock })
+      const conversation = await acquireCodexNativeConversation(params, { lock, ...bindingOverrides })
       sessionsDirectory = conversation.sessionsDirectory
       return conversation
     },
@@ -152,6 +153,7 @@ async function fixture() {
     messages, calls, heldLocks, deps, successful, start,
     turn: (prompt: string, options: Partial<Params> = {}) => collect(start(prompt, options)),
     setRunner: (next: Runner) => { behavior = next },
+    setBindingDeps: (next: BindingDeps) => { bindingOverrides = next },
     setPersistenceEnabled: (next: boolean) => { enabled = next },
     acquisitions: () => acquired,
     bindingPath: () => path.join(path.dirname(sessionsDirectory!), 'binding.json'),
@@ -264,6 +266,25 @@ describe('native Codex executor conversation continuity', () => {
     expect(JSON.stringify(await bootstrap.turn('First user turn'))).not.toContain('[Codex session notice]')
   })
 
+  test('legacy synthetic direct-mailbox history gets a notice without treating its text as replay authority', async () => {
+    const f = await fixture()
+    f.messages.push(createUserMessage({
+      content: 'Process this queued mailbox message now.\n<queued_mailbox_message>Earlier TEST direct request</queued_mailbox_message>',
+      isMeta: true,
+      isSynthetic: true,
+    }))
+    expect(JSON.stringify(await f.turn('First newly continuous direct turn'))).toContain('[Codex session notice]')
+    expect(JSON.stringify(await f.turn('Another direct turn'))).not.toContain('[Codex session notice]')
+    expect(f.calls.every(call => !call.prompt.includes('Earlier TEST direct request'))).toBe(true)
+    expect(f.calls[1]!.resumeThreadId).toBe(f.threadId)
+  })
+
+  test('group-only legacy history is not reported as a lost private conversation', async () => {
+    const f = await fixture()
+    await f.turn('Process this queued GROUP CHAT message.\n<queued_group_chat_message>Earlier group request</queued_group_chat_message>', { conversationScope: 'group' })
+    expect(JSON.stringify(await f.turn('First private user request'))).not.toContain('[Codex session notice]')
+  })
+
   test.each(['missing', 'corrupt'] as const)('a %s binding produces an error without launching another native request', async state => {
     const f = await fixture()
     await f.turn('Established history')
@@ -273,6 +294,21 @@ describe('native Codex executor conversation continuity', () => {
     expect(JSON.stringify(output)).toContain('Codex conversation cannot be continued')
     expect(f.calls).toHaveLength(1)
     expect(f.heldLocks.size).toBe(0)
+  })
+
+  test('a silently lost host user row stops admission and remains safely retryable', async () => {
+    const f = await fixture()
+    const actualRecordTranscript = f.deps.recordTranscript!
+    f.deps.recordTranscript = async () => null
+    const rejected = await f.turn('This host row was never committed')
+    expect(JSON.stringify(rejected)).toContain('recorded host turn')
+    expect(f.calls).toHaveLength(0)
+    expect(f.heldLocks.size).toBe(0)
+    f.deps.recordTranscript = actualRecordTranscript
+    await f.turn('A new request with healthy host storage')
+    expect(f.calls).toHaveLength(1)
+    expect(f.calls[0]!.prompt).toBe('A new request with healthy host storage')
+    expect(f.calls[0]!.resumeThreadId).toBeUndefined()
   })
 
   test.each(['pre-submit', 'terminal', 'unconfirmed-shutdown'] as const)('uses typed %s evidence to decide whether a NEW request may resume', async failure => {
@@ -300,6 +336,58 @@ describe('native Codex executor conversation continuity', () => {
       expect(f.calls[1]!.prompt).toBe('A different new request')
     }
     expect(f.heldLocks.size).toBe(0)
+  })
+
+  test('a transient identity write failure before app-server admission permits exact-thread recovery', async () => {
+    const f = await fixture()
+    await startupContext(f.root, 'TEST_CONTEXT_NOT_YET_ADMITTED')
+    let failIdentityWrite = true
+    f.setBindingDeps({
+      writeBinding: async (file, value, options) => {
+        if (failIdentityWrite && (value as { state?: string }).state === 'active') {
+          failIdentityWrite = false
+          throw new Error('TEST identity write failed')
+        }
+        await writeJsonFileAtomic(file, value, options)
+      },
+    })
+    let submitted = 0
+    let stopped = 0
+    f.setRunner(async function* (options) {
+      try {
+        yield { type: 'normalized_event', event: { type: 'thread_started', threadId: f.threadId } }
+        submitted++
+        yield { type: 'normalized_event', event: { type: 'turn_started' } }
+        yield { type: 'normalized_event', event: { type: 'assistant_text', itemId: randomUUID(), text: 'TEST recovered' } }
+        yield { type: 'normalized_event', event: { type: 'turn_completed' } }
+        return summary(options, f.threadId)
+      } finally { stopped++ }
+    })
+    expect(JSON.stringify(await f.turn('Never admitted', { permissionMode: 'default' }))).toContain('TEST identity write failed')
+    expect(submitted).toBe(0)
+    expect(stopped).toBe(1)
+    expect(f.heldLocks.size).toBe(0)
+    expect(JSON.parse(await readFile(f.bindingPath(), 'utf8')).startupContextHash).toBeNull()
+    await f.turn('A new request after storage recovery', { permissionMode: 'default' })
+    expect(submitted).toBe(1)
+    expect(stopped).toBe(2)
+    expect(f.calls[1]!.resumeThreadId).toBe(f.threadId)
+    expect(f.calls[1]!.prompt).toBe('TEST_CONTEXT_NOT_YET_ADMITTED\n\nA new request after storage recovery')
+  })
+
+  test.each(['identity', 'terminal'] as const)('a normal runner return without %s confirmation cannot enable a fresh fallback', async missing => {
+    const f = await fixture()
+    f.setRunner(async function* (options) {
+      if (missing !== 'identity') yield { type: 'normalized_event', event: { type: 'thread_started', threadId: f.threadId } }
+      yield { type: 'normalized_event', event: { type: 'turn_started' } }
+      yield { type: 'normalized_event', event: { type: 'assistant_text', itemId: randomUUID(), text: 'TEST incomplete native evidence' } }
+      if (missing !== 'terminal') yield { type: 'normalized_event', event: { type: 'turn_completed' } }
+      return summary(options, f.threadId)
+    })
+    expect(JSON.stringify(await f.turn('Unconfirmed request'))).toContain('without confirming the owned thread')
+    f.setRunner(f.successful)
+    expect(JSON.stringify(await f.turn('A new request must be refused'))).toContain('unconfirmed outcome')
+    expect(f.calls).toHaveLength(1)
   })
 
   test('consumer early return waits for native cleanup before releasing ownership', async () => {

@@ -215,6 +215,24 @@ describe('Codex native conversation binding', () => {
     },
   )
 
+  test('loss of only the saved thread UUID cannot turn admitted history into a fresh conversation', async () => {
+    const f = await fixture()
+    const previous = await ready(f)
+    const saved = await binding(previous)
+    expect(saved).toMatchObject({
+      state: 'ready',
+      threadId,
+      startupContextHash: contextHash,
+      lastHostTurnId: f.hostTurnId,
+    })
+    const damaged = JSON.stringify({ ...saved, threadId: null })
+    await writeFile(bindingPath(previous), damaged)
+
+    await expect(f.acquire()).rejects.toThrow('Codex conversation cannot be continued')
+    expect(await readFile(bindingPath(previous), 'utf8')).toBe(damaged)
+    expect(f.locks.held.size).toBe(0)
+  })
+
   test.each([false, true])('uncertain native outcome keeps the reservation (thread observed: %s)', async threadObserved => {
     const f = await fixture()
     const previous = await f.acquire()
@@ -248,6 +266,11 @@ describe('Codex native conversation binding', () => {
     const failed = await f.acquire()
     await failed.settle(notSubmitted)
     await failed.release()
+    if (!established) {
+      expect(await binding(failed)).toMatchObject({
+        state: 'ready', threadId: null, startupContextHash: null, lastHostTurnId: null,
+      })
+    }
     const next = await f.acquire()
     expect(next.resumeThreadId).toBe(established ? threadId : undefined)
     expect(next.startupContextHash).toBe(established ? contextHash : null)

@@ -31,7 +31,7 @@ try {
   state.setAllowedSettingSources([])
   state.setFlagSettingsInline({ codex: { forced_login_method: 'api' } })
   state.setStrictMcpConfig(true)
-  state.setFlagMcpConfig(['{"mcpServers":{}}'])
+  state.setFlagMcpConfig([])
   const { setDynamicTeamContext } = await import('../../src/utils/teammate.js')
   setDynamicTeamContext({ agentId: `${spec.memberName}@${spec.teamName}`, agentName: spec.memberName,
     teamName: spec.teamName, planModeRequired: false })

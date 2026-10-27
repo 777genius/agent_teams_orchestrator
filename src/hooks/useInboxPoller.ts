@@ -4213,7 +4213,7 @@ export function useInboxPoller({
       let groupSentHistory: readonly GroupMailboxHistoryMessage[] | undefined
       let groupOwnPosts: readonly GroupMailboxOwnPostProof[] | undefined
       if (ordinaryPendingMessage && hasGroupMailboxMarker(ordinaryPendingMessage) && teamName && agentName) {
-        // Native Codex starts a fresh thread each turn. Read only its own prior
+        // Native Codex group turns stay ephemeral. Read only its own prior
         // finalized physical deliveries; group/run/receiver fences are applied by the prompt builder.
         if (shouldUseCodexProviderRoutingForCurrentProcess()) {
           try {

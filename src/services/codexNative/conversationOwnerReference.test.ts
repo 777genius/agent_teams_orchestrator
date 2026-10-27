@@ -61,6 +61,29 @@ describe('Codex host conversation owner reference', () => {
     expect(await readCodexConversationOwnerReference(path)).toBeNull()
   })
 
+  test('refuses the owner append when the lock is compromised during an await', async () => {
+    const path = await transcriptPath()
+    const original = userRow('turn-1')
+    await writeFile(path, original)
+    let owned = true
+    let releaseFlush!: () => void
+    let flushStarted!: () => void
+    const barrier = new Promise<void>(resolve => { releaseFlush = resolve })
+    const started = new Promise<void>(resolve => { flushStarted = resolve })
+    const pending = writeCodexConversationOwnerReference(path, reference, {
+      flush: async () => { flushStarted(); await barrier },
+      assertCommitEligible: () => {
+        if (!owned) throw new Error('TEST conversation lock compromised')
+      },
+    })
+    await started
+    owned = false
+    releaseFlush()
+    await expect(pending).rejects.toThrow('TEST conversation lock compromised')
+    expect(await readFile(path, 'utf8')).toBe(original)
+    expect(await readCodexConversationOwnerReference(path)).toBeNull()
+  })
+
   test('keeps identical writes idempotent and refuses owner replacement', async () => {
     const path = await transcriptPath()
     await writeCodexConversationOwnerReference(path, reference, flushed)

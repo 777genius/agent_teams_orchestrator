@@ -36,6 +36,7 @@ export type CodexNativeConversation = {
   isNew: boolean
   signal: AbortSignal
   assertOwned: () => void
+  verifyHostTurn: (hostTurnId: string) => Promise<void>
   recordThread: (threadId: string) => Promise<void>
   settle: (result: CodexNativeRunnerLifecycle & {
     contextAdmitted?: boolean
@@ -98,6 +99,7 @@ function parseBinding(value: unknown, ownerKey: string): Binding {
       !(b.threadId === null || (typeof b.threadId === 'string' && UUID_PATTERN.test(b.threadId))) ||
       !(b.startupContextHash === null || (typeof b.startupContextHash === 'string' && /^[0-9a-f]{64}$/.test(b.startupContextHash))) ||
       !(b.lastHostTurnId === null || typeof b.lastHostTurnId === 'string') ||
+      (b.threadId === null && (b.startupContextHash !== null || b.lastHostTurnId !== null)) ||
       (b.state === 'active' && !b.threadId)) {
     throw refusal('saved native binding is invalid or belongs to another owner')
   }
@@ -191,7 +193,7 @@ export async function acquireCodexNativeConversation(
       await (deps.writeOwnerReference ?? writeCodexConversationOwnerReference)(
         owner.transcriptPath,
         { schemaVersion: 1, sessionId: owner.sessionId, ownerKey },
-        { flush: params.flush },
+        { flush: params.flush, assertCommitEligible: assertOwned },
       )
     }
     await mkdir(sessionsDirectory, { recursive: true, mode: 0o700 })
@@ -200,6 +202,16 @@ export async function acquireCodexNativeConversation(
     return {
       sessionsDirectory, resumeThreadId, startupContextHash, isNew,
       signal: abort.signal, assertOwned, release,
+      verifyHostTurn: async hostTurnId => {
+        assertOwned()
+        const reference = await (deps.readOwnerReference ?? readCodexConversationOwnerReference)(
+          owner.transcriptPath, hostTurnId,
+        )
+        assertOwned()
+        if (reference?.ownerKey !== ownerKey || reference.sessionId !== owner.sessionId) {
+          throw refusal('the submitted host turn has no durable conversation owner')
+        }
+      },
       recordThread: async threadId => {
         assertOwned()
         if (!UUID_PATTERN.test(threadId) || (binding.threadId && binding.threadId !== threadId)) {
@@ -230,6 +242,7 @@ export async function acquireCodexNativeConversation(
       try {
         assertOwned()
         const reference = await (deps.readOwnerReference ?? readCodexConversationOwnerReference)(owner.transcriptPath)
+        assertOwned()
         if (!reference && createdBinding) {
           await rm(bindingPath, { force: true })
         } else if (reference?.ownerKey === ownerKey && reference.sessionId === owner.sessionId) {

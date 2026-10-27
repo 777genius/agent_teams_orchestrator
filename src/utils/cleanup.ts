@@ -2,6 +2,7 @@ import * as fs from 'fs/promises'
 import { homedir } from 'os'
 import { join } from 'path'
 import { logEvent } from '../services/analytics/index.js'
+import { unlinkExpiredCodexAwareTranscript } from '../services/codexNative/conversationRetention.js'
 import { CACHE_PATHS } from './cachePaths.js'
 import { logForDebugging } from './debug.js'
 import { getClaudeConfigHomeDir } from './envUtils.js'
@@ -185,7 +186,9 @@ export async function cleanupOldSessionFiles(): Promise<CleanupResult> {
         }
         try {
           if (
-            await unlinkIfOld(join(projectDir, entry.name), cutoffDate, fsImpl)
+            await (entry.name.endsWith('.jsonl')
+              ? unlinkExpiredCodexAwareTranscript(join(projectDir, entry.name), cutoffDate, fsImpl)
+              : unlinkIfOld(join(projectDir, entry.name), cutoffDate, fsImpl))
           ) {
             result.messages++
           }

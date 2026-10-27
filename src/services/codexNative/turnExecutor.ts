@@ -701,9 +701,21 @@ export async function* executeCodexNativeTurn(
           },
           flush: flushSessionStorageImpl,
         })
-        if (conversation.isNew && params.transcriptMessages.some(message =>
-          message.type === 'user' && message.uuid !== currentHostTurnId && isHumanAuthoredTurn(message),
-        )) {
+        if (!currentHostTurnId) {
+          throw new Error('Codex direct conversation requires a persisted host user turn before native admission.')
+        }
+        await conversation.verifyHostTurn(currentHostTurnId)
+        if (conversation.isNew && params.transcriptMessages.some(message => {
+          if (message.type !== 'user' || message.uuid === currentHostTurnId) return false
+          if (isHumanAuthoredTurn(message)) return true
+          // Old teammate DMs were persisted as synthetic/meta mailbox prompts,
+          // without a structured delivery scope. This legacy text check selects
+          // an informational migration notice ONLY; it never selects a thread,
+          // grants scope, or replays any content into native model input.
+          const text = typeof message.message.content === 'string'
+            ? message.message.content : extractTextContent(message.message.content)
+          return (message.isMeta || message.isSynthetic) && isOrdinaryQueuedMailboxPrompt(text)
+        })) {
           const notice = createAssistantMessage({
             content: '[Codex session notice] Earlier messages remain in the transcript. Native conversation continuity starts with this message; the previous ephemeral Codex history cannot be restored.',
           })

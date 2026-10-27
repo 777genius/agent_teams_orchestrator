@@ -33,13 +33,14 @@ type RestoreOption = 'both' | 'conversation' | 'code' | 'summarize' | 'summarize
 function isSummarizeOption(option: RestoreOption | null): option is 'summarize' | 'summarize_up_to' {
   return option === 'summarize' || option === 'summarize_up_to';
 }
-export function getConversationRestoreError(option: RestoreOption, validate?: () => string | undefined): string | undefined {
+type ConversationRestoreValidator = () => string | undefined | Promise<string | undefined>;
+export function getConversationRestoreError(option: RestoreOption, validate?: ConversationRestoreValidator): string | undefined | Promise<string | undefined> {
   return option === 'conversation' || option === 'both' ? validate?.() : undefined;
 }
 type Props = {
   messages: Message[];
   /** Refuse unsupported conversation changes before cancelling or restoring code. */
-  validateConversationRestore?: () => string | undefined;
+  validateConversationRestore?: ConversationRestoreValidator;
   onPreRestore: () => void;
   onRestoreMessage: (message: UserMessage) => Promise<void>;
   onRestoreCode: (message: UserMessage) => Promise<void>;
@@ -147,7 +148,7 @@ export function MessageSelector({
 
   // Helper to restore conversation without confirmation
   async function restoreConversationDirectly(message: UserMessage) {
-    const restoreError = getConversationRestoreError('conversation', validateConversationRestore);
+    const restoreError = await getConversationRestoreError('conversation', validateConversationRestore);
     if (restoreError) {
       setError(restoreError);
       return;
@@ -220,7 +221,7 @@ export function MessageSelector({
       }
       return;
     }
-    const restoreError = getConversationRestoreError(option, validateConversationRestore);
+    const restoreError = await getConversationRestoreError(option, validateConversationRestore);
     if (restoreError) {
       setError(restoreError);
       return;

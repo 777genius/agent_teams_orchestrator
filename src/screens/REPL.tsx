@@ -163,7 +163,7 @@ import type { Message as MessageType, UserMessage, ProgressMessage, HookResultMe
 import { query } from '../query.js';
 import { runCodexNativeTurnInRepl } from '../services/codexNative/replTurnBridge.js';
 import type { CodexNativeConversationScope } from '../services/codexNative/conversationScope.js';
-import { assertCodexNativeHistoryOperationSupported, getCodexNativeHistoryOperationError, usesCodexNativeConversation } from '../services/codexNative/conversationHistoryGuard.js';
+import { assertCodexNativeHistoryOperationSupported, assertCodexNativeHistoryOperationSupportedForTranscript, getCodexNativeHistoryOperationErrorForTranscript } from '../services/codexNative/conversationHistoryGuard.js';
 import { createCodexAppServerApprovalPromptHandler } from '../services/codexNative/approvalPromptBridge.js';
 import { resolveCodexRuntimeSelection } from '../services/runtimeBackends/codexBackendResolver.js';
 import { mergeClients, useMergedClients } from '../hooks/useMergedClients.js';
@@ -194,7 +194,7 @@ import type { ContentBlockParam, ImageBlockParam } from '@anthropic-ai/sdk/resou
 import type { ProcessUserInputContext } from '../utils/processUserInput/processUserInput.js';
 import type { PastedContent } from '../utils/config.js';
 import { copyPlanForFork, copyPlanForResume, getPlanSlug, setPlanSlug } from '../utils/plans.js';
-import { clearSessionMetadata, resetSessionFilePointer, adoptResumedSessionFile, removeTranscriptMessage, restoreSessionMetadata, getCurrentSessionTitle, isEphemeralToolProgress, isLoggableMessage, saveWorktreeState, getAgentTranscript } from '../utils/sessionStorage.js';
+import { clearSessionMetadata, resetSessionFilePointer, adoptResumedSessionFile, removeTranscriptMessage, restoreSessionMetadata, getCurrentSessionTitle, isEphemeralToolProgress, isLoggableMessage, saveWorktreeState, getAgentTranscript, getTranscriptPathForSession } from '../utils/sessionStorage.js';
 import { deserializeMessages } from '../utils/conversationRecovery.js';
 import { extractReadFilesFromMessages, extractBashToolsFromMessages } from '../utils/queryHelpers.js';
 import { resetMicrocompactState } from '../services/compact/microCompact.js';
@@ -1853,7 +1853,10 @@ export function REPL({
   const resume = useCallback(async (sessionId: UUID, log: LogOption, entrypoint: ResumeEntrypoint) => {
     const resumeStart = performance.now();
     try {
-      if (entrypoint === 'fork') assertCodexNativeHistoryOperationSupported('fork');
+      if (entrypoint === 'fork') {
+        assertCodexNativeHistoryOperationSupported('fork');
+        await assertCodexNativeHistoryOperationSupportedForTranscript('fork', log.fullPath ?? getTranscriptPathForSession(sessionId));
+      }
       // Deserialize messages to properly clean up the conversation
       // This filters unresolved tool uses and adds a synthetic assistant message if needed
       const messages = deserializeMessages(log.messages);
@@ -3183,7 +3186,11 @@ export function REPL({
       // avoids removeLastFromHistory removing B's entry instead of A's),
       // not viewing a teammate (messagesRef is the main conversation — the
       // old Up-arrow quick-restore had this guard, preserve it).
-      if (abortController.signal.reason === 'user-cancel' && !queryGuard.isActive && inputValueRef.current === '' && getCommandQueueLength() === 0 && !store.getState().viewingAgentTaskId && !usesCodexNativeConversation()) {
+      const autoRestoreSessionId = getSessionId();
+      const nativeHistoryError = abortController.signal.reason === 'user-cancel'
+        ? await getCodexNativeHistoryOperationErrorForTranscript('rewind')
+        : undefined;
+      if (abortController.signal.reason === 'user-cancel' && !nativeHistoryError && getSessionId() === autoRestoreSessionId && !queryGuard.isActive && inputValueRef.current === '' && getCommandQueueLength() === 0 && !store.getState().viewingAgentTaskId) {
         const msgs = messagesRef.current;
         const lastUserMsg = msgs.findLast(selectableUserMessagesFilter);
         if (lastUserMsg) {
@@ -3929,12 +3936,14 @@ export function REPL({
   // renders to static output before rewind — otherwise it remains vestigial
   // at the top of the screen.
   const handleRestoreMessage = useCallback(async (message: UserMessage) => {
-    assertCodexNativeHistoryOperationSupported('rewind');
+    const restoreSessionId = getSessionId();
+    await assertCodexNativeHistoryOperationSupportedForTranscript('rewind');
     // Keep the deferred mutation inside the returned promise so the selector
     // can display a refusal instead of reporting success before the callback.
     await new Promise<void>((resolve, reject) => {
       setImmediate(() => {
         try {
+          if (getSessionId() !== restoreSessionId) throw new Error('Conversation changed before history could be restored.');
           restoreMessageSync(message);
           resolve();
         } catch (error) {
@@ -3965,7 +3974,7 @@ export function REPL({
       });
     }),
     edit: async msg => {
-      const nativeHistoryError = getCodexNativeHistoryOperationError('rewind');
+      const nativeHistoryError = await getCodexNativeHistoryOperationErrorForTranscript('rewind');
       if (nativeHistoryError) {
         addNotification({ key: 'native-codex-history-operation', text: nativeHistoryError, color: 'warning', priority: 'immediate', timeoutMs: 8000 });
         return;
@@ -3980,7 +3989,9 @@ export function REPL({
         // rewindConversationTo's setMessages races stream appends — cancel first (idempotent).
         onCancel();
         // handleRestoreMessage also restores pasted images.
-        void handleRestoreMessage(raw);
+        await handleRestoreMessage(raw).catch(error => {
+          addNotification({ key: 'native-codex-history-operation', text: String(error instanceof Error ? error.message : error), color: 'warning', priority: 'immediate', timeoutMs: 8000 });
+        });
       } else {
         // Dialog path: onPreRestore (= onCancel) fires when user CONFIRMS, not on nevermind.
         setMessageSelectorPreselect(raw);
@@ -5177,7 +5188,7 @@ export function REPL({
                 {cursor &&
           // inputValue is REPL state; typed text survives the round-trip.
           <MessageActionsBar cursor={cursor} />}
-                {focusedInputDialog === 'message-selector' && <MessageSelector messages={messages} preselectedMessage={messageSelectorPreselect} validateConversationRestore={() => getCodexNativeHistoryOperationError('rewind')} onPreRestore={onCancel} onRestoreCode={async (message: UserMessage) => {
+                {focusedInputDialog === 'message-selector' && <MessageSelector messages={messages} preselectedMessage={messageSelectorPreselect} validateConversationRestore={() => getCodexNativeHistoryOperationErrorForTranscript('rewind')} onPreRestore={onCancel} onRestoreCode={async (message: UserMessage) => {
             await fileHistoryRewind((updater: (prev: FileHistoryState) => FileHistoryState) => {
               setAppState(prev => ({
                 ...prev,

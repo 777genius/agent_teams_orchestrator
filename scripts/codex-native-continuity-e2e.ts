@@ -284,7 +284,9 @@ function cliArgs(test: FixtureCase, resume: boolean, manual: boolean): string[] 
   return [path.join(REPO, 'src/entrypoints/cli.tsx'), '--bare', '--print',
     '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
     '--model', 'gpt-5.4', '--settings', JSON.stringify(SETTINGS), '--setting-sources', '',
-    '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}', '--tools', '',
+    // No dynamic MCP entries: an explicitly supplied empty config correctly
+    // trips the runtime's required agent-teams bridge guard.
+    '--strict-mcp-config', '--tools', '',
     ...(manual ? ['--permission-mode', 'default', '--permission-prompt-tool', 'stdio']
       : ['--dangerously-skip-permissions', '--permission-mode', 'bypassPermissions']),
     ...(resume ? ['--resume', test.sessionId] : ['--session-id', test.sessionId]),

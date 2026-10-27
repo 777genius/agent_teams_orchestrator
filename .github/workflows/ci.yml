@@ -193,7 +193,7 @@ jobs:
         run: bun run test:task-change-ledger
 
       - name: Verify native Codex lead and teammate conversation continuity
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && !cancelled()
         timeout-minutes: 8
         run: >-
           bun scripts/codex-native-continuity-e2e.ts

@@ -90,6 +90,12 @@ replay of every UI message, new settings, and unrelated provider/auth refactors.
   and a minimal creating/active/ready state atomically.
   Keep native rollout files in this owned directory; they remain Codex's model
   context, while the host transcript remains the UI/observability projection.
+- Expire owned native history with the owning transcript's existing retention
+  cutoff. Cleanup takes the same transcript lock, rechecks age, validates the
+  owner marker/binding and removes only that generated native directory before
+  unlinking the transcript. Active locks and uncertain creating/active bindings
+  are intentionally skipped; retention must not delete storage that an
+  unconfirmed native child may still use. No generic orphan sweep is added.
 - Reserve creation before spawning/submitting. Record the created thread as soon
   as native identity is observed, not only after successful completion. Reuse
   existing locking/atomic-write helpers; refuse concurrent ownership instead of

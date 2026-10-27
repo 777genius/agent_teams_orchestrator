@@ -115,7 +115,10 @@ export async function readCodexConversationOwnerReference(
 export async function writeCodexConversationOwnerReference(
   transcriptPath: string,
   reference: CodexConversationOwnerReference,
-  options: { flush?: () => Promise<void> } = {},
+  options: {
+    flush?: () => Promise<void>
+    assertCommitEligible?: () => void
+  } = {},
 ): Promise<void> {
   const validated = parseReference(reference)
   const flush = options.flush ?? (await import('../../utils/sessionStorage.js')).flushSessionStorage
@@ -139,6 +142,9 @@ export async function writeCodexConversationOwnerReference(
       await file.read(lastByte, 0, 1, size - 1)
       if (lastByte[0] !== 0x0a) separator = '\n'
     }
+    // The lock may have been lost while awaiting flush or filesystem IO.
+    // As with atomic binding writes, check ownership at commit admission.
+    options.assertCommitEligible?.()
     await file.writeFile(
       separator + JSON.stringify({ type: OWNER_REFERENCE_TYPE, ...validated }) + '\n',
       'utf8',

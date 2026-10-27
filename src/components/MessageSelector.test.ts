@@ -25,6 +25,18 @@ describe('conversation restore admission', () => {
     expect(getConversationRestoreError('both')).toBeUndefined()
     expect(getConversationRestoreError('conversation', () => undefined)).toBeUndefined()
   })
+
+  test('awaits a bound-history preflight and never invokes it for files-only restore', async () => {
+    let checks = 0
+    const validate = async () => {
+      checks += 1
+      return 'The source transcript has a native conversation owner'
+    }
+    expect(await getConversationRestoreError('both', validate)).toContain('native conversation owner')
+    expect(await getConversationRestoreError('conversation', validate)).toContain('native conversation owner')
+    expect(await getConversationRestoreError('code', validate)).toBeUndefined()
+    expect(checks).toBe(2)
+  })
 })
 
 function userMessage(overrides: Partial<Message> = {}): Message {
