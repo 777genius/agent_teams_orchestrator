@@ -12,9 +12,11 @@ import type { PermissionMode } from '../../utils/permissions/PermissionMode.js'
 import { EMPTY_USAGE } from '../api/emptyUsage.js'
 import type { CodexAppServerApprovalRequestHandler } from './appServerApproval.js'
 import { executeCodexNativeTurn } from './turnExecutor.js'
+import type { CodexNativeConversationScope } from './conversationScope.js'
 
 type RunCodexNativeTurnInReplParams = {
   prompt: string | ContentBlockParam[]
+  conversationScope?: CodexNativeConversationScope
   cwd: string
   model: string
   effortValue: EffortValue | undefined
@@ -53,7 +55,7 @@ export async function runCodexNativeTurnInRepl(
   const executeTurn = deps.executeTurn ?? executeCodexNativeTurn
   const promptText = typeof params.prompt === 'string' ? params.prompt : params.prompt
     .flatMap(block => block.type === 'text' ? [block.text] : []).join('\n')
-  if (promptText.includes('Process this queued GROUP CHAT message.')) {
+  if (params.conversationScope === 'group') {
     // Diagnostic facts only: never persist model/user text or private bootstrap context.
     void writeChildOwnedTeammateRuntimeEvent({
       type: 'group_context_prepared', source: 'codexNative.replTurnBridge',
@@ -70,6 +72,7 @@ export async function runCodexNativeTurnInRepl(
 
   for await (const sdkMessage of executeTurn({
     prompt: params.prompt,
+    conversationScope: params.conversationScope ?? 'direct',
     cwd: params.cwd,
     model: params.model,
     effortValue: params.effortValue,

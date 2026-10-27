@@ -157,6 +157,10 @@ import { generateSessionTitle } from 'src/utils/sessionTitle.js'
 import { buildSideQuestionFallbackParams } from 'src/utils/queryContext.js'
 import { runStartupTeamBootstrap } from 'src/services/teamBootstrap/teamBootstrapEntry.js'
 import { validateTeamBootstrapStartupOptions } from 'src/services/teamBootstrap/teamBootstrapStartupGuards.js'
+import {
+  getCodexNativeHistoryOperationError,
+  usesCodexNativeConversation,
+} from 'src/services/codexNative/conversationHistoryGuard.js'
 import { runSideQuestion } from 'src/utils/sideQuestion.js'
 import {
   processSessionStartHooks,
@@ -608,6 +612,17 @@ export async function runHeadless(
 
   if (options.resumeSessionAt && !options.resume) {
     process.stderr.write(`Error: --resume-session-at requires --resume\n`)
+    gracefulShutdownSync(1)
+    return
+  }
+
+  const nativeHistoryError = options.resumeSessionAt
+    ? getCodexNativeHistoryOperationError('partial-resume')
+    : options.forkSession
+      ? getCodexNativeHistoryOperationError('fork')
+      : undefined
+  if (nativeHistoryError) {
+    emitLoadError(nativeHistoryError, options.outputFormat)
     gracefulShutdownSync(1)
     return
   }
@@ -1305,7 +1320,8 @@ function runHeadlessStreaming(
   if (
     turnInterruptionState &&
     turnInterruptionState.kind !== 'none' &&
-    resumeInterruptedTurnEnv
+    resumeInterruptedTurnEnv &&
+    !usesCodexNativeConversation()
   ) {
     logForDebugging(
       `[print.ts] Auto-resuming interrupted turn (kind: ${turnInterruptionState.kind})`,
@@ -2338,6 +2354,9 @@ function runHeadlessStreaming(
                   'name',
                 ),
                 prompt: input,
+                // Only the validated, process-owned envelope can select group
+                // scope. First real lead tasks and ordinary stdin stay direct.
+                conversationScope: queuedGroupTurn ? 'group' : 'direct',
                 promptUuid: cmd.uuid,
                 isMeta: cmd.isMeta,
                 cwd: cwd(),

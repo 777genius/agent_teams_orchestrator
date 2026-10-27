@@ -119,6 +119,7 @@ import {
   processSandboxPermissionResponse,
 } from './useSwarmPermissionPoller.js'
 import type { GetNativeAppManagedBootstrapContextInjection } from './useNativeAppManagedBootstrapContextInjection.js'
+import type { CodexNativeConversationScope } from '../services/codexNative/conversationScope.js'
 import {
   buildNativeAppManagedBootstrapPrivatePrompt,
   isNativeAppManagedBootstrapInstructionText,
@@ -201,6 +202,7 @@ export type InboxPromptSubmitOptions = {
   isMeta?: boolean
   prefixMessages?: AppState['messages']
   submissionKind?: IncomingPromptSubmissionKind
+  conversationScope?: CodexNativeConversationScope
 }
 
 export type NativeInboxAttachmentsReadiness = {
@@ -4414,6 +4416,13 @@ export function useInboxPoller({
 
       const submitted = onSubmitTeammateMessage(promptContent, {
         isMeta: true,
+        // The selected delivery envelope owns scope. Prompt text, including
+        // quoted protocol markers in an ordinary DM, cannot select a thread.
+        conversationScope: bootstrapPendingMessage
+          ? 'bootstrap'
+          : ordinaryPendingMessage && hasGroupMailboxMarker(ordinaryPendingMessage)
+            ? 'group'
+            : 'direct',
         submissionKind: resolveIncomingMailboxSubmissionKind({
           bootstrapPendingMessage,
           ordinaryPendingMessage,

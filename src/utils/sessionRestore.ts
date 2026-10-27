@@ -10,6 +10,7 @@ import {
   switchSession,
 } from '../bootstrap/state.js'
 import { clearSystemPromptSections } from '../constants/systemPromptSections.js'
+import { assertCodexNativeHistoryOperationSupported } from '../services/codexNative/conversationHistoryGuard.js'
 import { restoreCostStateForSession } from '../cost-tracker.js'
 import type { AppState } from '../state/AppState.js'
 import type { AgentColorName } from '../tools/AgentTool/agentColorManager.js'
@@ -423,6 +424,7 @@ export async function processResumedConversation(
     initialState: AppState
   },
 ): Promise<ProcessedResume> {
+  if (opts.forkSession) assertCodexNativeHistoryOperationSupported('fork')
   // Match coordinator/normal mode to the resumed session
   let modeWarning: string | undefined
   if (feature('COORDINATOR_MODE')) {

@@ -1,5 +1,7 @@
 import type { ContentBlockParam } from '@anthropic-ai/sdk/resources/messages.mjs'
 import { randomUUID } from 'crypto'
+import { homedir } from 'node:os'
+import path from 'node:path'
 
 import { getSessionId, getStrictMcpConfig } from '../../bootstrap/state.js'
 import type {
@@ -17,10 +19,13 @@ import {
 } from '../../utils/effort.js'
 import {
   createAssistantAPIErrorMessage,
+  createAssistantMessage,
   extractTextContent,
 } from '../../utils/messages.js'
 import type { Message } from '../../types/message.js'
-import { flushSessionStorage, recordTranscript } from '../../utils/sessionStorage.js'
+import { flushSessionStorage, getTranscriptPath, isSessionStoragePersistenceEnabled, recordTranscript } from '../../utils/sessionStorage.js'
+import { getAgentId, getTeamName } from '../../utils/teammate.js'
+import { isHumanAuthoredTurn } from '../../utils/replayProvenance.js'
 import { normalizeMessage } from '../../utils/queryHelpers.js'
 import type { AppState } from '../../state/AppState.js'
 import type { PermissionMode } from '../../utils/permissions/PermissionMode.js'
@@ -66,6 +71,9 @@ import {
   createCodexNativeThreadStatusMessage,
 } from './statusAuthority.js'
 import { CodexNativeTranscriptProjector } from './transcriptProjector.js'
+import { acquireCodexNativeConversation, type CodexNativeConversation } from './conversationBinding.js'
+import type { CodexNativeConversationScope } from './conversationScope.js'
+import { CodexNativeRunnerError, type CodexNativeRunnerLifecycle } from './runnerLifecycle.js'
 
 type CodexNativeExecutionSummary = {
   totalUsage: NonNullableUsage
@@ -90,6 +98,7 @@ type ExecuteCodexNativeTurnParams = {
   permissionMode: PermissionMode
   additionalWritableDirectories: string[]
   persistSession: boolean
+  conversationScope?: CodexNativeConversationScope
   replayedUserMessages: SDKUserMessageReplay[]
   transcriptMessages: Message[]
   mutableMessages: Message[]
@@ -107,6 +116,8 @@ type ExecuteCodexNativeTurnDeps = {
   runAppServer?: typeof runCodexNativeAppServer
   recordTranscript?: typeof recordTranscript
   flushSessionStorage?: typeof flushSessionStorage
+  acquireConversation?: typeof acquireCodexNativeConversation
+  isPersistenceEnabled?: typeof isSessionStoragePersistenceEnabled
   runtimeTurnSettledEmitter?: CodexNativeTurnSettledEmitterPort
   buildUserLoopbackProviderConfigOverrides?: typeof buildCodexNativeUserLoopbackProviderConfigOverrides
   resolveUserLoopbackLaunchConfig?: typeof resolveCodexNativeUserLoopbackLaunchConfig
@@ -384,12 +395,6 @@ function mapEffortToCodexNativeReasoningEffort(
   return resolved
 }
 
-function shouldUseEphemeralCodexNativeThread(
-  env: NodeJS.ProcessEnv = process.env,
-): boolean {
-  return env.CLAUDE_CODE_CODEX_NATIVE_PERSIST_THREADS !== '1'
-}
-
 function shouldIgnoreCodexNativeUserConfig(
   env: NodeJS.ProcessEnv = process.env,
 ): boolean {
@@ -548,9 +553,29 @@ export async function* executeCodexNativeTurn(
   params: ExecuteCodexNativeTurnParams,
   deps: ExecuteCodexNativeTurnDeps = {},
 ): AsyncGenerator<SDKMessage, CodexNativeExecutionSummary, unknown> {
+  const capturedSessionId = getSessionId()
+  const capturedTranscriptPath = getTranscriptPath()
+  const capturedSourceProfile = path.resolve(process.env.CODEX_HOME?.trim() || path.join(homedir(), '.codex'))
+  const capturedAgentId = getAgentId() ?? resolveTurnSettledIdentityFromAppState(params.initialAppState)?.agentId ?? null
+  const capturedTeamName = getTeamName(params.initialAppState.teamContext) ?? null
+  const currentHostTurnId = params.transcriptMessages.findLast(message => message.type === 'user')?.uuid ?? null
+  const assertSessionUnchanged = (): void => {
+    if (getSessionId() !== capturedSessionId) {
+      throw new Error('Codex turn stopped because the host conversation changed.')
+    }
+  }
+  function* normalizeTurnMessage(message: Message): Generator<SDKMessage> {
+    for (const normalized of normalizeMessage(message)) {
+      assertSessionUnchanged()
+      yield normalized
+    }
+  }
   const runExec = deps.runExec ?? runCodexNativeExec
   const runAppServer = deps.runAppServer ?? runCodexNativeAppServer
-  const recordTranscriptImpl = deps.recordTranscript ?? recordTranscript
+  const recordTranscriptImpl: typeof recordTranscript = async (...args) => {
+    assertSessionUnchanged()
+    return (deps.recordTranscript ?? recordTranscript)(...args)
+  }
   const flushSessionStorageImpl =
     deps.flushSessionStorage ?? flushSessionStorage
   const capturedQueryIdentity = readWorkSyncActiveQueryIdentity()
@@ -607,7 +632,7 @@ export async function* executeCodexNativeTurn(
       params.persistSession,
       recordTranscriptImpl,
     )
-    yield* normalizeMessage(assistantMessage)
+    yield* normalizeTurnMessage(assistantMessage)
     await maybeFlush(params.persistSession, flushSessionStorageImpl)
     params.setSDKStatus?.('idle')
     await emitRuntimeTurnSettled({
@@ -643,126 +668,246 @@ export async function* executeCodexNativeTurn(
     null
   let finalUsageAuthority: CodexNativeExecutionSummary['finalUsageAuthority'] =
     null
+  let conversation: CodexNativeConversation | undefined
+  let nativeIterator: ReturnType<typeof runCodexNativeExec> | undefined
+  let runnerTransport: 'exec' | 'app-server' | undefined
+  let runnerFinished = false
+  let contextAdmitted = false
+  let turnTerminal = false
+  let startupContextHash: string | null = null
+  let lifecycle: CodexNativeRunnerLifecycle = {
+    submissionMayHaveStarted: false, turnTerminal: false, childStopped: true,
+  }
 
   try {
-    const contextualPrompt = await buildCodexNativeStartupContextPrompt(
-      resolvedPrompt.text,
-      resolvedPrompt.input,
-    )
-    const timeoutPolicy = resolveCodexNativeExecTimeoutPolicy(
-      resolvedPrompt.text,
-    )
-    const forcedLoginMethod = getCodexForcedLoginMethod() ?? undefined
-    const apiKey =
-      forcedLoginMethod === 'chatgpt' ? undefined : (getCodexNativeApiKey() ?? undefined)
-    const launchPolicy = resolveCodexNativeApprovalLaunchPolicy(
-      params.permissionMode,
-    )
-    const customProviderConfigOverrides = buildCodexNativeCustomProviderConfigOverrides()
-    const loopbackLaunch =
-      customProviderConfigOverrides.length === 0
-        ? resolveLoopbackLaunchConfig(deps)
-        : EMPTY_LOOPBACK_LAUNCH_CONFIG
-    const commonOptions = {
-      prompt: contextualPrompt.prompt,
-      imagePaths: resolvedPrompt.imagePaths,
-      cwd: params.cwd,
-      model: params.model,
-      reasoningEffort: mapEffortToCodexNativeReasoningEffort(
-        params.model,
-        params.effortValue,
-      ),
-      ephemeral: shouldUseEphemeralCodexNativeThread(),
-      apiKey,
-      forcedLoginMethod,
-      extraEnv: loopbackLaunch.secretEnv,
-      configOverrides: [
-        ...customProviderConfigOverrides,
-        ...loopbackLaunch.configOverrides,
-        ...buildCodexNativeMcpConfigOverrides({
-          strictMcpConfig: getStrictMcpConfig(),
-        }),
-        ...buildCodexNativeWorkspaceTrustConfigOverrides(),
-        ...buildCodexNativeLaunchConfigOverrides(),
-      ],
-      disabledFeatures: resolveCodexNativeDisabledFeatures({
-        apiKey,
-        forcedLoginMethod,
-      }),
-      abortSignal: params.abortSignal,
-      idleTimeoutMs: timeoutPolicy?.idleTimeoutMs ?? null,
-      absoluteTimeoutMs: timeoutPolicy?.absoluteTimeoutMs ?? null,
-    }
-    const iterator =
-      launchPolicy.transport === 'app-server'
-        ? runAppServer({
-            ...commonOptions,
-            input: contextualPrompt.input,
-            loopbackOverlayToml: loopbackLaunch.overlayToml,
-            requestApproval:
-              params.requestApproval ??
-              (async () => {
-                throw new Error('update Codex CLI or enable auto-approve')
-              }),
-          })
-        : runExec({
-            ...commonOptions,
-            approvalPolicy: launchPolicy.approvalPolicy,
-            sandboxMode: launchPolicy.sandboxMode,
-            additionalWritableDirectories: params.additionalWritableDirectories,
-            ignoreUserConfig: shouldIgnoreCodexNativeUserConfig(),
-          })
-
-    while (true) {
-      const next = await iterator.next()
-      if (next.done) {
-        binaryIdentity = next.value.identity
-        threadId = next.value.threadId
-        credentialSource = next.value.credentialSource
-        completionPolicy = next.value.completionPolicy
-        finalHistoryCompleteness = next.value.finalHistoryCompleteness
-        finalUsageAuthority = next.value.finalUsageAuthority
-        break
-      }
-
-      if (next.value.type === 'binary_identity') {
-        binaryIdentity = next.value.identity
-        continue
-      }
-
-      const projection = projector.apply(next.value.event)
-      if (
-        (next.value.event.type === 'turn_started' ||
-          next.value.event.type === 'turn_completed') &&
-        next.value.event.turnId &&
-        !capturedTurnId
-      ) {
-        capturedTurnId = next.value.event.turnId
-      }
-
-      for (const message of projection.appendedMessages) {
-        await appendProjectedMessage({
-          message,
-          mutableMessages: params.mutableMessages,
-          transcriptMessages: params.transcriptMessages,
-          persistSession: params.persistSession,
-          recordTranscriptImpl,
+    try {
+      if (params.persistSession &&
+          (deps.isPersistenceEnabled ?? isSessionStoragePersistenceEnabled)() &&
+          (params.conversationScope ?? 'direct') === 'direct') {
+        // The host reference and current user row must be durable before Codex
+        // can admit a prompt. Capture their path/identity before any async work.
+        assertSessionUnchanged()
+        await persistMessages(params.transcriptMessages, true, recordTranscriptImpl)
+        await flushSessionStorageImpl()
+        assertSessionUnchanged()
+        conversation = await (deps.acquireConversation ?? acquireCodexNativeConversation)({
+          owner: {
+            sessionId: capturedSessionId,
+            transcriptPath: capturedTranscriptPath,
+            cwd: params.cwd,
+            agentId: capturedAgentId,
+            teamName: capturedTeamName,
+            sourceProfile: capturedSourceProfile,
+          },
+          flush: flushSessionStorageImpl,
         })
-
-        if (message.type === 'assistant' || message.type === 'user') {
-          yield* normalizeMessage(message)
+        if (conversation.isNew && params.transcriptMessages.some(message =>
+          message.type === 'user' && message.uuid !== currentHostTurnId && isHumanAuthoredTurn(message),
+        )) {
+          const notice = createAssistantMessage({
+            content: '[Codex session notice] Earlier messages remain in the transcript. Native conversation continuity starts with this message; the previous ephemeral Codex history cannot be restored.',
+          })
+          await appendProjectedMessage({
+            message: notice, mutableMessages: params.mutableMessages,
+            transcriptMessages: params.transcriptMessages, persistSession: true,
+            recordTranscriptImpl,
+          })
+          yield* normalizeTurnMessage(notice)
         }
       }
+      const contextualPrompt = await buildCodexNativeStartupContextPrompt(
+        resolvedPrompt.text,
+        resolvedPrompt.input,
+        process.env,
+        conversation?.startupContextHash,
+      )
+      startupContextHash = contextualPrompt.contextHash
+      const timeoutPolicy = resolveCodexNativeExecTimeoutPolicy(
+        resolvedPrompt.text,
+      )
+      const forcedLoginMethod = getCodexForcedLoginMethod() ?? undefined
+      const apiKey =
+        forcedLoginMethod === 'chatgpt' ? undefined : (getCodexNativeApiKey() ?? undefined)
+      const launchPolicy = resolveCodexNativeApprovalLaunchPolicy(
+        params.permissionMode,
+      )
+      runnerTransport = launchPolicy.transport
+      const customProviderConfigOverrides = buildCodexNativeCustomProviderConfigOverrides()
+      const loopbackLaunch =
+        customProviderConfigOverrides.length === 0
+          ? resolveLoopbackLaunchConfig(deps)
+          : EMPTY_LOOPBACK_LAUNCH_CONFIG
+      const commonOptions = {
+        prompt: contextualPrompt.prompt,
+        imagePaths: resolvedPrompt.imagePaths,
+        cwd: params.cwd,
+        model: params.model,
+        reasoningEffort: mapEffortToCodexNativeReasoningEffort(
+          params.model,
+          params.effortValue,
+        ),
+        // Only an owned direct conversation is persistent. Group/bootstrap and
+        // explicit no-persistence callers must never import its native history.
+        ephemeral: !conversation,
+        resumeThreadId: conversation?.resumeThreadId,
+        sessionsDirectory: conversation?.sessionsDirectory,
+        apiKey,
+        forcedLoginMethod,
+        extraEnv: conversation
+          ? { ...loopbackLaunch.secretEnv, CODEX_HOME: capturedSourceProfile }
+          : loopbackLaunch.secretEnv,
+        loopbackOverlayToml: loopbackLaunch.overlayToml,
+        configOverrides: [
+          ...customProviderConfigOverrides,
+          ...loopbackLaunch.configOverrides,
+          ...buildCodexNativeMcpConfigOverrides({
+            strictMcpConfig: getStrictMcpConfig(),
+          }),
+          ...buildCodexNativeWorkspaceTrustConfigOverrides(),
+          ...buildCodexNativeLaunchConfigOverrides(),
+        ],
+        disabledFeatures: resolveCodexNativeDisabledFeatures({
+          apiKey,
+          forcedLoginMethod,
+        }),
+        abortSignal: conversation
+          ? AbortSignal.any([conversation.signal, ...(params.abortSignal ? [params.abortSignal] : [])])
+          : params.abortSignal,
+        idleTimeoutMs: timeoutPolicy?.idleTimeoutMs ?? null,
+        absoluteTimeoutMs: timeoutPolicy?.absoluteTimeoutMs ?? null,
+      }
+      nativeIterator =
+        launchPolicy.transport === 'app-server'
+          ? runAppServer({
+              ...commonOptions,
+              input: contextualPrompt.input,
+              loopbackOverlayToml: loopbackLaunch.overlayToml,
+              requestApproval:
+                params.requestApproval ??
+                (async () => {
+                  throw new Error('update Codex CLI or enable auto-approve')
+                }),
+            })
+          : runExec({
+              ...commonOptions,
+              approvalPolicy: launchPolicy.approvalPolicy,
+              sandboxMode: launchPolicy.sandboxMode,
+              additionalWritableDirectories: params.additionalWritableDirectories,
+              ignoreUserConfig: shouldIgnoreCodexNativeUserConfig(),
+            })
 
-      if (projection.turnCompleted) {
-        await persistMessages(
-          params.transcriptMessages,
-          params.persistSession,
-          recordTranscriptImpl,
-        )
+      while (true) {
+        assertSessionUnchanged()
+        conversation?.assertOwned()
+        lifecycle = { submissionMayHaveStarted: true, turnTerminal, childStopped: false }
+        let next: Awaited<ReturnType<typeof nativeIterator.next>>
+        try {
+          next = await nativeIterator.next()
+        } catch (error) {
+          // A throwing generator has already finalized. Calling return() on it
+          // would be a no-op, not evidence that an unconfirmed child has stopped.
+          runnerFinished = true
+          throw error
+        }
+        assertSessionUnchanged()
+        if (next.done) {
+          runnerFinished = true
+          lifecycle.childStopped = true
+          binaryIdentity = next.value.identity
+          if (conversation && (!threadId || next.value.threadId !== threadId || !turnTerminal)) {
+            throw new Error('Codex native ended without confirming the owned thread and a terminal turn.')
+          }
+          threadId = next.value.threadId
+          credentialSource = next.value.credentialSource
+          completionPolicy = next.value.completionPolicy
+          finalHistoryCompleteness = next.value.finalHistoryCompleteness
+          finalUsageAuthority = next.value.finalUsageAuthority
+          lifecycle = { submissionMayHaveStarted: true, turnTerminal, childStopped: true }
+          break
+        }
+
+        if (next.value.type === 'binary_identity') {
+          if (runnerTransport === 'app-server') lifecycle.submissionMayHaveStarted = false
+          binaryIdentity = next.value.identity
+          continue
+        }
+
+        if (next.value.event.type === 'thread_started') {
+          if (runnerTransport === 'app-server') lifecycle.submissionMayHaveStarted = false
+          threadId = next.value.event.threadId
+          // App-server yields this identity before turn/start; do not advance
+          // the iterator until the exact UUID has been committed.
+          await conversation?.recordThread(threadId)
+        }
+        if (['turn_started', 'assistant_text', 'tool_call_started', 'tool_call_completed'].includes(next.value.event.type)) {
+          contextAdmitted = true
+        }
+        if (next.value.event.type === 'turn_completed') turnTerminal = true
+
+        const projection = projector.apply(next.value.event)
+        if (
+          (next.value.event.type === 'turn_started' ||
+            next.value.event.type === 'turn_completed') &&
+          next.value.event.turnId &&
+          !capturedTurnId
+        ) {
+          capturedTurnId = next.value.event.turnId
+        }
+
+        for (const message of projection.appendedMessages) {
+          await appendProjectedMessage({
+            message,
+            mutableMessages: params.mutableMessages,
+            transcriptMessages: params.transcriptMessages,
+            persistSession: params.persistSession,
+            recordTranscriptImpl,
+          })
+
+          if (message.type === 'assistant' || message.type === 'user') {
+            yield* normalizeTurnMessage(message)
+          }
+        }
+
+        if (projection.turnCompleted) {
+          await persistMessages(
+            params.transcriptMessages,
+            params.persistSession,
+            recordTranscriptImpl,
+          )
+        }
+      }
+    } catch (error) {
+      if (error instanceof CodexNativeRunnerError) lifecycle = { ...error.lifecycle }
+      throw error
+    } finally {
+      try {
+        if (nativeIterator && !runnerFinished) {
+          try {
+            await nativeIterator.return(undefined as never)
+            // Both runners await owned-child shutdown in their finalizers.
+            lifecycle.childStopped = true
+            lifecycle.turnTerminal ||= turnTerminal
+          } catch (error) {
+            if (error instanceof CodexNativeRunnerError) lifecycle = { ...error.lifecycle }
+            throw error
+          }
+        }
+      } finally {
+        if (conversation) {
+          try {
+            await conversation.settle({
+              ...lifecycle, contextAdmitted, startupContextHash,
+              hostTurnId: currentHostTurnId,
+            })
+          } finally {
+            await conversation.release()
+          }
+        }
       }
     }
   } catch (error) {
+    // /clear or a session switch must not append the old turn to its successor.
+    if (getSessionId() !== capturedSessionId) throw error
     const message = error instanceof Error ? error.message : String(error)
     if (threadId) {
       await appendProjectedMessage({
@@ -788,7 +933,7 @@ export async function* executeCodexNativeTurn(
       params.persistSession,
       recordTranscriptImpl,
     )
-    yield* normalizeMessage(assistantMessage)
+    yield* normalizeTurnMessage(assistantMessage)
     await maybeFlush(params.persistSession, flushSessionStorageImpl)
     params.setSDKStatus?.('idle')
     await emitRuntimeTurnSettled({
@@ -817,6 +962,7 @@ export async function* executeCodexNativeTurn(
   }
 
   await maybeFlush(params.persistSession, flushSessionStorageImpl)
+  assertSessionUnchanged()
 
   const finalAssistant = projector.getLastAssistantMessage()
   if (!finalAssistant) {
@@ -846,7 +992,7 @@ export async function* executeCodexNativeTurn(
       params.persistSession,
       recordTranscriptImpl,
     )
-    yield* normalizeMessage(assistantMessage)
+    yield* normalizeTurnMessage(assistantMessage)
     await maybeFlush(params.persistSession, flushSessionStorageImpl)
     params.setSDKStatus?.('idle')
     await emitRuntimeTurnSettled({
@@ -913,6 +1059,7 @@ export async function* executeCodexNativeTurn(
     outcome: 'success',
     threadId,
   })
+  assertSessionUnchanged()
   yield buildResultSuccessMessage({
     result: finalText,
     startTime: params.startTime,

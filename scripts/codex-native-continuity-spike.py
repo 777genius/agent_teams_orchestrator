@@ -135,7 +135,7 @@ def child_env(home):
     return env
 
 
-def provider_args(server):
+def provider_args(server, home):
     overrides = [
         'model="test-continuity-model"', 'model_provider="continuity_fixture"',
         'model_providers.continuity_fixture.name="Continuity Fixture"',
@@ -145,6 +145,9 @@ def provider_args(server):
         'model_providers.continuity_fixture.supports_websockets=false',
         'features.shell_tool=false', 'features.remote_models=false',
         'analytics.enabled=false',
+        # A configured sqlite_home takes precedence over CODEX_SQLITE_HOME in
+        # Codex 0.135.0. Keep the catalog private even with inherited config.
+        'sqlite_home=' + json.dumps(str(home)),
     ]
     return [part for override in overrides for part in ("-c", override)]
 
@@ -184,7 +187,7 @@ def run_exec(binary, home, project, server, prompt, resume_id, timeout):
     # Resume-specific arguments follow `resume`; shared options belong to exec.
     args = [str(binary), "exec", "--json", "--skip-git-repo-check", "-C", str(project),
             "--sandbox", "read-only", "--ignore-user-config",
-            "-c", 'approval_policy="never"', *provider_args(server)]
+            "-c", 'approval_policy="never"', *provider_args(server, home)]
     if resume_id:
         args.extend(["resume", resume_id])
     args.append("-")
@@ -207,7 +210,7 @@ class AppServer:
         self.next_id = 0
         self.methods = []
         self.proc = subprocess.Popen(
-            [str(binary), "app-server", "--listen", "stdio://", *provider_args(server)],
+            [str(binary), "app-server", "--listen", "stdio://", *provider_args(server, home)],
             cwd=project, env=child_env(home), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, bufsize=1)
         self.reader = threading.Thread(target=self._read, daemon=True)

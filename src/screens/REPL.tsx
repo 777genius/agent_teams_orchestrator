@@ -162,6 +162,8 @@ import { queryCheckpoint, logQueryProfileReport } from '../utils/queryProfiler.j
 import type { Message as MessageType, UserMessage, ProgressMessage, HookResultMessage, PartialCompactDirection } from '../types/message.js';
 import { query } from '../query.js';
 import { runCodexNativeTurnInRepl } from '../services/codexNative/replTurnBridge.js';
+import type { CodexNativeConversationScope } from '../services/codexNative/conversationScope.js';
+import { assertCodexNativeHistoryOperationSupported, getCodexNativeHistoryOperationError, usesCodexNativeConversation } from '../services/codexNative/conversationHistoryGuard.js';
 import { createCodexAppServerApprovalPromptHandler } from '../services/codexNative/approvalPromptBridge.js';
 import { resolveCodexRuntimeSelection } from '../services/runtimeBackends/codexBackendResolver.js';
 import { mergeClients, useMergedClients } from '../hooks/useMergedClients.js';
@@ -1851,6 +1853,7 @@ export function REPL({
   const resume = useCallback(async (sessionId: UUID, log: LogOption, entrypoint: ResumeEntrypoint) => {
     const resumeStart = performance.now();
     try {
+      if (entrypoint === 'fork') assertCodexNativeHistoryOperationSupported('fork');
       // Deserialize messages to properly clean up the conversation
       // This filters unresolved tool uses and adds a synthetic assistant message if needed
       const messages = deserializeMessages(log.messages);
@@ -2775,7 +2778,7 @@ export function REPL({
       });
     }, onStreamingText);
   }, [setMessages, setResponseLength, setStreamMode, setStreamingToolUses, setStreamingThinking, onStreamingText]);
-  const onQueryImpl = useCallback(async (messagesIncludingNewMessages: MessageType[], newMessages: MessageType[], abortController: AbortController, shouldQuery: boolean, additionalAllowedTools: string[], mainLoopModelParam: string, effort?: EffortValue) => {
+  const onQueryImpl = useCallback(async (messagesIncludingNewMessages: MessageType[], newMessages: MessageType[], abortController: AbortController, shouldQuery: boolean, additionalAllowedTools: string[], mainLoopModelParam: string, effort?: EffortValue, conversationScope: CodexNativeConversationScope = 'direct') => {
     // Prepare IDE integration for new prompt. Read mcpClients fresh from
     // store — useManageMCPConnections may have populated it since the
     // render that captured this closure (same pattern as computeTools).
@@ -2915,6 +2918,7 @@ export function REPL({
       }
       await runCodexNativeTurnInRepl({
         prompt: promptMessage.message.content,
+        conversationScope,
         cwd: getOriginalCwd(),
         model: mainLoopModelParam,
         effortValue: effort ?? store.getState().effortValue,
@@ -2993,7 +2997,7 @@ export function REPL({
     // Signal that a query turn has completed successfully
     await onTurnComplete?.(messagesRef.current);
   }, [initialMcpClients, resetLoadingState, getToolUseContext, toolPermissionContext, setAppState, customSystemPrompt, onTurnComplete, appendSystemPrompt, canUseTool, mainThreadAgentDefinition, onQueryEvent, sessionTitle, titleDisabled]);
-  const onQuery = useCallback(async (newMessages: MessageType[], abortController: AbortController, shouldQuery: boolean, additionalAllowedTools: string[], mainLoopModelParam: string, onBeforeQueryCallback?: (input: string, newMessages: MessageType[]) => Promise<boolean>, input?: string, effort?: EffortValue): Promise<void> => {
+  const onQuery = useCallback(async (newMessages: MessageType[], abortController: AbortController, shouldQuery: boolean, additionalAllowedTools: string[], mainLoopModelParam: string, onBeforeQueryCallback?: (input: string, newMessages: MessageType[]) => Promise<boolean>, input?: string, effort?: EffortValue, conversationScope: CodexNativeConversationScope = 'direct'): Promise<void> => {
     // If this is a teammate, mark them as active when starting a turn
     if (isAgentSwarmsEnabled()) {
       const teamName = getTeamName();
@@ -3078,7 +3082,7 @@ export function REPL({
           return;
         }
       }
-      await onQueryImpl(latestMessages, newMessages, abortController, shouldQuery, additionalAllowedTools, mainLoopModelParam, effort);
+      await onQueryImpl(latestMessages, newMessages, abortController, shouldQuery, additionalAllowedTools, mainLoopModelParam, effort, conversationScope);
     } finally {
       // queryGuard.end() atomically checks generation and transitions
       // running→idle. Returns false if a newer query owns the guard
@@ -3179,7 +3183,7 @@ export function REPL({
       // avoids removeLastFromHistory removing B's entry instead of A's),
       // not viewing a teammate (messagesRef is the main conversation — the
       // old Up-arrow quick-restore had this guard, preserve it).
-      if (abortController.signal.reason === 'user-cancel' && !queryGuard.isActive && inputValueRef.current === '' && getCommandQueueLength() === 0 && !store.getState().viewingAgentTaskId) {
+      if (abortController.signal.reason === 'user-cancel' && !queryGuard.isActive && inputValueRef.current === '' && getCommandQueueLength() === 0 && !store.getState().viewingAgentTaskId && !usesCodexNativeConversation()) {
         const msgs = messagesRef.current;
         const lastUserMsg = msgs.findLast(selectableUserMessagesFilter);
         if (lastUserMsg) {
@@ -3840,6 +3844,7 @@ export function REPL({
   // fresh via the setMessages wrapper) so callers don't need to worry about
   // stale closures.
   const rewindConversationTo = useCallback((message: UserMessage) => {
+    assertCodexNativeHistoryOperationSupported('rewind');
     const prev = messagesRef.current;
     const messageIndex = prev.lastIndexOf(message);
     if (messageIndex === -1) return;
@@ -3924,7 +3929,19 @@ export function REPL({
   // renders to static output before rewind — otherwise it remains vestigial
   // at the top of the screen.
   const handleRestoreMessage = useCallback(async (message: UserMessage) => {
-    setImmediate((restore, message) => restore(message), restoreMessageSync, message);
+    assertCodexNativeHistoryOperationSupported('rewind');
+    // Keep the deferred mutation inside the returned promise so the selector
+    // can display a refusal instead of reporting success before the callback.
+    await new Promise<void>((resolve, reject) => {
+      setImmediate(() => {
+        try {
+          restoreMessageSync(message);
+          resolve();
+        } catch (error) {
+          reject(error);
+        }
+      });
+    });
   }, [restoreMessageSync]);
 
   // Not memoized — hook stores caps via ref, reads latest closure at dispatch.
@@ -3948,6 +3965,11 @@ export function REPL({
       });
     }),
     edit: async msg => {
+      const nativeHistoryError = getCodexNativeHistoryOperationError('rewind');
+      if (nativeHistoryError) {
+        addNotification({ key: 'native-codex-history-operation', text: nativeHistoryError, color: 'warning', priority: 'immediate', timeoutMs: 8000 });
+        return;
+      }
       // Same skip-confirm check as /rewind: lossless → direct, else confirm dialog.
       const rawIdx = findRawIndex(msg.uuid);
       const raw = rawIdx >= 0 ? messages[rawIdx] : undefined;
@@ -4212,7 +4234,7 @@ export function REPL({
       isSynthetic: isSyntheticIncomingPrompt ? true : undefined,
       protocolKind,
     });
-    void onQuery([...(options?.prefixMessages ?? []), userMessage], newAbortController, true, [], mainLoopModel);
+    void onQuery([...(options?.prefixMessages ?? []), userMessage], newAbortController, true, [], mainLoopModel, undefined, undefined, undefined, options?.conversationScope);
     return {
       accepted: true,
       userMessageUuid: userMessage.uuid
@@ -5155,7 +5177,7 @@ export function REPL({
                 {cursor &&
           // inputValue is REPL state; typed text survives the round-trip.
           <MessageActionsBar cursor={cursor} />}
-                {focusedInputDialog === 'message-selector' && <MessageSelector messages={messages} preselectedMessage={messageSelectorPreselect} onPreRestore={onCancel} onRestoreCode={async (message: UserMessage) => {
+                {focusedInputDialog === 'message-selector' && <MessageSelector messages={messages} preselectedMessage={messageSelectorPreselect} validateConversationRestore={() => getCodexNativeHistoryOperationError('rewind')} onPreRestore={onCancel} onRestoreCode={async (message: UserMessage) => {
             await fileHistoryRewind((updater: (prev: FileHistoryState) => FileHistoryState) => {
               setAppState(prev => ({
                 ...prev,

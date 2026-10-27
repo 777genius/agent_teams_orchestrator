@@ -1,6 +1,6 @@
 # Codex conversation continuity: bounded correction
 
-Status: revision 3, approved in two design-review rounds; native storage spike pending.
+Status: revision 3, approved in two design-review rounds; native storage spike passed; implementation under review.
 Date: 2026-10-27.
 Scope: fix repeated loss of an agent's direct conversation in native Codex,
 qualify both transports, and deliver the runtime through the desktop app pin.
@@ -225,5 +225,7 @@ an unchanged UI, but exercise actual lead/inbox composition and packaged runtime
 - Review round 2: no remaining blocking architecture issue. Clarified stable
   resume identity, owner-reference flush before admission, authoritative lineage,
   and the fact that no-persistence stream-json can still contain multiple turns.
-- Pending gates: real sessions-only/cross-transport spike and access to the
-  existing immutable release publication path. Production code remains unchanged.
+- Native storage gate passed in [CI run 40517067692](https://github.com/777genius/agent_teams_orchestrator/actions/runs/40517067692/job/122233464442): Codex 0.135.0, all four transport pairs retain the exact thread UUID and each prior user/URL/assistant marker once in actual model input; both absent UUID cases refuse with zero model submissions. Six cases passed.
+- Implementation review additionally corrected first-admission locking across different profiles, retry after proven pre-submission write failure, and history guards when native credentials are unavailable.
+- Effective host persistence policy (including skip-history and zero-day retention) also controls native persistence.
+- Remaining gates: complete source-runtime E2E, unmocked regression/platform CI, final independent review, and the existing immutable release publication path.

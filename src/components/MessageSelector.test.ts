@@ -2,9 +2,30 @@ import { describe, expect, test } from 'bun:test'
 
 import type { Message } from '../types/message.js'
 import {
+  getConversationRestoreError,
   messagesAfterAreOnlySynthetic,
   selectableUserMessagesFilter,
 } from './MessageSelector.js'
+
+describe('conversation restore admission', () => {
+  test('rejects conversation-only and combined restores while preserving files-only restore', () => {
+    let checks = 0
+    const validate = () => {
+      checks += 1
+      return 'Native conversation rewind is unavailable'
+    }
+    expect(getConversationRestoreError('conversation', validate)).toBe('Native conversation rewind is unavailable')
+    expect(getConversationRestoreError('both', validate)).toBe('Native conversation rewind is unavailable')
+    expect(getConversationRestoreError('code', validate)).toBeUndefined()
+    expect(getConversationRestoreError('nevermind', validate)).toBeUndefined()
+    expect(checks).toBe(2)
+  })
+
+  test('preserves restore behavior when the current provider has no refusal', () => {
+    expect(getConversationRestoreError('both')).toBeUndefined()
+    expect(getConversationRestoreError('conversation', () => undefined)).toBeUndefined()
+  })
+})
 
 function userMessage(overrides: Partial<Message> = {}): Message {
   return {

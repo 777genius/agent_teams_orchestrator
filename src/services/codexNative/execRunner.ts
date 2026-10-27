@@ -9,11 +9,17 @@ import {
   type CodexCliBinarySource,
   type CodexForcedLoginMethod,
 } from '../runtimeBackends/codexBackendResolver.js'
-import { killProcessTree } from '../../utils/processKill.js'
 import { spawnPortableCli, spawnSyncPortableCli } from '../../utils/portableCli.js'
 import { CodexNativeTraceWriter } from './CodexNativeTraceWriter.js'
 import { mapCodexNativeExecLine } from './jsonlMapper.js'
 import type { CodexNativeNormalizedEvent } from './normalizedEvents.js'
+import { createCodexNativeHomeOverlay } from './nativeHomeOverlay.js'
+import {
+  assertCodexNativeContinuationOptions,
+  CodexNativeRunnerError,
+  observeCodexNativeChild,
+  type CodexNativeRunnerLifecycle,
+} from './runnerLifecycle.js'
 
 export type CodexNativeExecRunnerOptions = {
   prompt: string
@@ -32,6 +38,8 @@ export type CodexNativeExecRunnerOptions = {
   sandboxMode?: 'read-only' | 'workspace-write' | 'danger-full-access' | null
   additionalWritableDirectories?: string[]
   ephemeral?: boolean
+  resumeThreadId?: string
+  sessionsDirectory?: string
   apiKey?: string | null
   forcedLoginMethod?: CodexForcedLoginMethod | null
   configOverrides?: string[]
@@ -39,6 +47,7 @@ export type CodexNativeExecRunnerOptions = {
   disabledFeatures?: string[]
   imagePaths?: string[]
   ignoreUserConfig?: boolean
+  loopbackOverlayToml?: string | null
   abortSignal?: AbortSignal
   timeoutMs?: number | null
   idleTimeoutMs?: number | null
@@ -136,6 +145,7 @@ function normalizeTimeoutMs(timeoutMs: number | null | undefined): number | null
 export function buildCodexNativeExecArgs(
   options: CodexNativeExecRunnerOptions,
 ): string[] {
+  assertCodexNativeContinuationOptions(options)
   const args = ['exec', '--json', '--skip-git-repo-check', '-C', options.cwd]
 
   if (options.ignoreUserConfig) {
@@ -176,6 +186,10 @@ export function buildCodexNativeExecArgs(
 
   for (const directory of options.additionalWritableDirectories ?? []) {
     args.push('--add-dir', directory)
+  }
+
+  if (options.resumeThreadId) {
+    args.push('resume', options.resumeThreadId)
   }
 
   for (const imagePath of options.imagePaths ?? []) {
@@ -290,32 +304,10 @@ function defaultResolveVersion(executablePath: string): string | null {
   return version.length > 0 ? version : null
 }
 
-function terminateCodexNativeProcessGroup(
-  pid: number | undefined,
-  signal: NodeJS.Signals,
-): boolean {
-  if (!pid || !Number.isFinite(pid) || pid <= 1) {
-    return false
-  }
-
-  if (process.platform !== 'win32') {
-    try {
-      process.kill(-pid, signal)
-      return true
-    } catch {
-      // Fall back to the direct process if the group is already gone or was not
-      // spawned as a POSIX process-group leader.
-    }
-  }
-
-  killProcessTree(pid, signal)
-  return true
-}
-
 function createQueuedLineStream(
   process: SpawnedCodexProcess,
   onStdoutActivity?: () => void,
-): AsyncGenerator<QueuedLine, void, unknown> {
+): AsyncGenerator<QueuedLine, void, unknown> & { cancel: () => void } {
   const queue: QueuedLine[] = []
   let streamClosures = 0
   let notify: (() => void) | null = null
@@ -361,7 +353,7 @@ function createQueuedLineStream(
     wake()
   })
 
-  return (async function* queuedLines() {
+  const iterator = (async function* queuedLines() {
     try {
       while (streamClosures < 2 || queue.length > 0) {
         if (queue.length === 0) {
@@ -383,19 +375,38 @@ function createQueuedLineStream(
       stderrInterface.close()
     }
   })()
+  return Object.assign(iterator, { cancel: () => { streamClosures = 2; wake() } })
 }
 
 export async function* runCodexNativeExec(
   options: CodexNativeExecRunnerOptions,
   deps: CodexNativeExecRunnerDeps = {},
 ): AsyncGenerator<CodexNativeExecObservation, CodexNativeExecSummary, unknown> {
+  const lifecycle: CodexNativeRunnerLifecycle = {
+    submissionMayHaveStarted: false, turnTerminal: false, childStopped: true,
+  }
+  try {
+    return yield* runCodexNativeExecImpl(options, deps, lifecycle)
+  } catch (error) {
+    throw new CodexNativeRunnerError(error, lifecycle)
+  }
+}
+
+async function* runCodexNativeExecImpl(
+  options: CodexNativeExecRunnerOptions,
+  deps: CodexNativeExecRunnerDeps,
+  lifecycle: CodexNativeRunnerLifecycle,
+): AsyncGenerator<CodexNativeExecObservation, CodexNativeExecSummary, unknown> {
+  assertCodexNativeContinuationOptions(options)
+  if (options.abortSignal?.aborted) throw options.abortSignal.reason ?? new Error('Codex turn aborted.')
   const binaryResolution = resolveCodexCliBinary({ which: deps.which })
   if (!binaryResolution) {
     throw new Error('Codex native runtime requires the codex CLI binary.')
   }
   const executablePath = binaryResolution.executablePath
   assertReadableCodexNativeImagePaths(options.imagePaths)
-  const execArgs = buildCodexNativeExecArgs(options)
+  // Validate every caller argument before allocating the temporary home.
+  const initialExecArgs = buildCodexNativeExecArgs(options)
 
   const identity: CodexNativeBinaryIdentity = {
     executablePath,
@@ -419,10 +430,22 @@ export async function* runCodexNativeExec(
     env.CODEX_API_KEY = options.apiKey
   }
 
-  const child =
-    deps.spawnProcess?.(executablePath, execArgs, {
+  const overlay = options.sessionsDirectory || options.loopbackOverlayToml
+    ? await createCodexNativeHomeOverlay({
+        env, sessionsDirectory: options.sessionsDirectory,
+        includeUserConfig: !options.ignoreUserConfig,
+        loopbackOverlayToml: options.loopbackOverlayToml,
+      })
+    : null
+  const execArgs = overlay ? buildCodexNativeExecArgs({ ...options,
+    configOverrides: [...(options.configOverrides ?? []), ...(overlay?.configOverrides ?? [])],
+  }) : initialExecArgs
+  let child: SpawnedCodexProcess
+  try {
+    if (options.abortSignal?.aborted) throw options.abortSignal.reason ?? new Error('Codex turn aborted.')
+    child = deps.spawnProcess?.(executablePath, execArgs, {
       cwd: options.cwd,
-      env,
+      env: overlay?.env ?? env,
       signal: options.abortSignal,
       detached: process.platform !== 'win32',
       stdin: 'pipe',
@@ -431,11 +454,20 @@ export async function* runCodexNativeExec(
     }) ??
     spawnPortableCli(executablePath, execArgs, {
       cwd: options.cwd,
-      env,
+      env: overlay?.env ?? env,
       signal: options.abortSignal,
       detached: process.platform !== 'win32',
       stdio: ['pipe', 'pipe', 'pipe'],
     })
+  } catch (error) {
+    await overlay?.cleanup().catch(() => undefined)
+    throw error
+  }
+  lifecycle.childStopped = false
+  const nativeChild = observeCodexNativeChild(child)
+  try {
+  if (!child.stdin || !child.stdout) throw new Error('Codex native exec stdio is unavailable.')
+  if (options.abortSignal?.aborted) throw options.abortSignal.reason ?? new Error('Codex turn aborted.')
 
   let recordProcessActivity: (() => void) | null = null
   let stdinError: Error | null = null
@@ -443,6 +475,7 @@ export async function* runCodexNativeExec(
     child.stdin.once('error', error => {
       stdinError = error instanceof Error ? error : new Error(String(error))
     })
+    lifecycle.submissionMayHaveStarted = true
     child.stdin.end(options.prompt)
   } else {
     stdinError = new Error('Codex native exec stdin is unavailable.')
@@ -457,10 +490,8 @@ export async function* runCodexNativeExec(
       ? normalizeTimeoutMs(options.timeoutMs)
       : normalizeTimeoutMs(options.absoluteTimeoutMs)
   let timeoutReason: CodexNativeExecTimeoutReason | null = null
-  let childClosed = false
   let idleTimeoutHandle: ReturnType<typeof setTimeout> | null = null
   let absoluteTimeoutHandle: ReturnType<typeof setTimeout> | null = null
-  let forceKillHandle: ReturnType<typeof setTimeout> | null = null
   const clearTimeouts = () => {
     if (idleTimeoutHandle) {
       clearTimeout(idleTimeoutHandle)
@@ -470,36 +501,14 @@ export async function* runCodexNativeExec(
       clearTimeout(absoluteTimeoutHandle)
       absoluteTimeoutHandle = null
     }
-    if (forceKillHandle) {
-      clearTimeout(forceKillHandle)
-      forceKillHandle = null
-    }
   }
 
   const terminateChildProcessGroup = (signal: NodeJS.Signals): void => {
-    if (childClosed) {
-      return
-    }
-    try {
-      if (
-        !child.killed &&
-        !terminateCodexNativeProcessGroup(child.pid, signal)
-      ) {
-        child.kill(signal)
-      }
-    } catch {
-      // Best-effort process cleanup.
-    }
+    nativeChild.signal(signal)
   }
 
   const scheduleForceKill = (): void => {
-    if (forceKillHandle || childClosed) {
-      return
-    }
-    forceKillHandle = setTimeout(() => {
-      terminateChildProcessGroup('SIGKILL')
-    }, 5_000)
-    forceKillHandle.unref?.()
+    void nativeChild.shutdown(0).finally(() => queuedLines.cancel())
   }
 
   const terminateForTimeout = (
@@ -551,6 +560,7 @@ export async function* runCodexNativeExec(
   }
 
   let threadId: string | null = null
+  let terminalFailure: string | null = null
   const codexDiagnosticLines: string[] = []
   const stderrFilterState: CodexNativeStderrFilterState = {
     suppressAnalyticsHtmlContinuation: false,
@@ -568,14 +578,6 @@ export async function* runCodexNativeExec(
   child.once('error', error => {
     spawnError = error instanceof Error ? error : new Error(String(error))
   })
-  const exitPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
-    resolve => {
-      child.once('close', (code, signal) => {
-        childClosed = true
-        resolve({ code, signal })
-      })
-    },
-  )
 
   try {
     yield {
@@ -606,8 +608,19 @@ export async function* runCodexNativeExec(
       }
 
       await traceWriter.recordStdoutLine(entry.line).catch(() => undefined)
+      // turn.failed is diagnostic-only in the public mapper, but is terminal
+      // evidence for the owner once the child has physically stopped.
+      try {
+        const raw = JSON.parse(entry.line)
+        if (raw.type === 'turn.failed' || raw.type === 'turn.completed') lifecycle.turnTerminal = true
+        if (raw.type === 'turn.failed') terminalFailure = raw.error?.message || 'Codex native turn failed.'
+      } catch { /* The mapper retains its existing malformed-line behavior. */ }
       for (const event of mapCodexNativeExecLine(entry.line)) {
         if (event.type === 'thread_started') {
+          if (options.sessionsDirectory) assertCodexNativeContinuationOptions({ ...options, resumeThreadId: event.threadId })
+          if (options.resumeThreadId && event.threadId !== options.resumeThreadId) {
+            throw new Error('Codex native resume returned a different thread UUID.')
+          }
           threadId = event.threadId
         }
         if (event.type === 'warning' && event.source === 'codex') {
@@ -620,7 +633,9 @@ export async function* runCodexNativeExec(
       }
     }
 
-    const exit = await exitPromise
+    lifecycle.childStopped = await nativeChild.shutdown()
+    if (!lifecycle.childStopped) throw new Error('Codex native child shutdown could not be confirmed.')
+    const exit = await nativeChild.closed
     traceExitCode = exit.code
     traceSignal = exit.signal
 
@@ -657,6 +672,11 @@ export async function* runCodexNativeExec(
       throw new Error(`Codex native exec exited with ${detail}${stderrText}`)
     }
 
+    if (!lifecycle.turnTerminal) {
+      throw new Error('Codex native exec stopped without a terminal turn event.')
+    }
+    if (terminalFailure) throw new Error(terminalFailure)
+
     traceOutcome = 'success'
     return {
       identity,
@@ -679,9 +699,14 @@ export async function* runCodexNativeExec(
       .catch(() => undefined)
     clearTimeouts()
     options.abortSignal?.removeEventListener('abort', onAbort)
-    if (!childClosed) {
-      terminateChildProcessGroup('SIGTERM')
-      scheduleForceKill()
+  }
+  } finally {
+    lifecycle.childStopped = await nativeChild.shutdown()
+    if (lifecycle.childStopped) await overlay?.cleanup().catch(() => undefined)
+    else {
+      // Keep the live child's profile until close; never remove an active mount.
+      void nativeChild.closed.then(() => overlay?.cleanup()).catch(() => undefined)
+      throw new Error('Codex native child shutdown could not be confirmed.')
     }
   }
 }

@@ -33,8 +33,13 @@ type RestoreOption = 'both' | 'conversation' | 'code' | 'summarize' | 'summarize
 function isSummarizeOption(option: RestoreOption | null): option is 'summarize' | 'summarize_up_to' {
   return option === 'summarize' || option === 'summarize_up_to';
 }
+export function getConversationRestoreError(option: RestoreOption, validate?: () => string | undefined): string | undefined {
+  return option === 'conversation' || option === 'both' ? validate?.() : undefined;
+}
 type Props = {
   messages: Message[];
+  /** Refuse unsupported conversation changes before cancelling or restoring code. */
+  validateConversationRestore?: () => string | undefined;
   onPreRestore: () => void;
   onRestoreMessage: (message: UserMessage) => Promise<void>;
   onRestoreCode: (message: UserMessage) => Promise<void>;
@@ -46,6 +51,7 @@ type Props = {
 const MAX_VISIBLE_MESSAGES = 7;
 export function MessageSelector({
   messages,
+  validateConversationRestore,
   onPreRestore,
   onRestoreMessage,
   onRestoreCode,
@@ -141,6 +147,11 @@ export function MessageSelector({
 
   // Helper to restore conversation without confirmation
   async function restoreConversationDirectly(message: UserMessage) {
+    const restoreError = getConversationRestoreError('conversation', validateConversationRestore);
+    if (restoreError) {
+      setError(restoreError);
+      return;
+    }
     onPreRestore();
     setIsRestoring(true);
     try {
@@ -207,6 +218,11 @@ export function MessageSelector({
         setMessageToRestore(undefined);
         setError(`Failed to summarize:\n${error_1}`);
       }
+      return;
+    }
+    const restoreError = getConversationRestoreError(option, validateConversationRestore);
+    if (restoreError) {
+      setError(restoreError);
       return;
     }
     onPreRestore();
