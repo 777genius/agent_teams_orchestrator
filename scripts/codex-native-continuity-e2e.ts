@@ -72,11 +72,25 @@ function responsesFixture() {
   let requests: CapturedRequest[] = []
   let replies: string[] = []
   let errors: string[] = []
+  let startupPreconnectBudget = 0
+  let startupPreconnectReceipts: Array<{ method: 'HEAD'; path: '/v1'; bodyBytes: 0 }> = []
   const server = Bun.serve({
     hostname: '127.0.0.1', port: 0, maxRequestBodySize: 4 * 1024 * 1024,
     async fetch(request) {
       try {
-        requireThat(request.method === 'POST' && new URL(request.url).pathname === '/v1/responses', 'Unexpected fixture endpoint')
+        const url = new URL(request.url)
+        const endpoint = `${request.method} ${url.pathname}`
+        if (request.method === 'HEAD' && url.pathname === '/v1' && url.search === '') {
+          // init.ts -> apiPreconnect.ts warms the configured Anthropic base
+          // URL. Permit at most this empty HEAD during the provider-switch
+          // refusal only; no catalog, token-count, or inference call is allowed.
+          requireThat(startupPreconnectBudget === 1, `Unplanned startup preconnect: ${endpoint}`)
+          startupPreconnectBudget = 0
+          requireThat((await request.arrayBuffer()).byteLength === 0, 'Startup preconnect must have an empty body')
+          startupPreconnectReceipts.push({ method: 'HEAD', path: '/v1', bodyBytes: 0 })
+          return new Response(null, { status: 200 })
+        }
+        requireThat(request.method === 'POST' && url.pathname === '/v1/responses', `Unexpected fixture endpoint: ${endpoint}`)
         let bytes = new Uint8Array(await request.arrayBuffer())
         if (request.headers.get('content-encoding') === 'gzip') bytes = Bun.gunzipSync(bytes)
         requireThat(bytes.length > 0 && bytes.length <= 4 * 1024 * 1024, 'Unexpected model request size')
@@ -115,7 +129,21 @@ function responsesFixture() {
   })
   return {
     baseUrl: `http://127.0.0.1:${server.port}/v1`,
-    prepare(nextReplies: string[]) { requests = []; errors = []; replies = [...nextReplies] },
+    prepare(nextReplies: string[]) {
+      requests = []; errors = []; replies = [...nextReplies]
+      startupPreconnectBudget = 0; startupPreconnectReceipts = []
+    },
+    allowAnthropicStartupPreconnect() {
+      requireThat(startupPreconnectBudget === 0 && startupPreconnectReceipts.length === 0, 'Startup preconnect already enabled')
+      startupPreconnectBudget = 1
+    },
+    finishAnthropicStartupPreconnect() {
+      // Fire-and-forget startup can exit before its HEAD arrives; zero calls
+      // is also valid. A second call or any other endpoint is still an error.
+      startupPreconnectBudget = 0
+      requireThat(startupPreconnectReceipts.length <= 1, 'Startup preconnect budget exceeded')
+      return [...startupPreconnectReceipts]
+    },
     finish(expected: number) {
       requireThat(errors.length === 0, `Fixture protocol errors: ${errors.join('; ')}`)
       requireThat(requests.length === expected && replies.length === 0, `Expected ${expected} model submissions, received ${requests.length}`)
@@ -383,6 +411,7 @@ async function runLead(test: FixtureCase, fixture: ReturnType<typeof responsesFi
   // Exercise --continue's own load-error path after switching away from Codex.
   const transcriptPath = await findTranscript(path.join(test.env.CLAUDE_CONFIG_DIR!, 'projects'), test.sessionId)
   const beforeRefusal = await readFile(transcriptPath, 'utf8')
+  fixture.allowAnthropicStartupPreconnect()
   const switchedProvider = new ManagedChild([
     path.join(REPO, 'src/entrypoints/cli.tsx'), '--bare', '--print', '--continue', '--fork-session',
     '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
@@ -392,9 +421,10 @@ async function runLead(test: FixtureCase, fixture: ReturnType<typeof responsesFi
   const continueForkRefusal = await switchedProvider.refusal('Failed to continue session: Native Codex does not support forking')
   await switchedProvider.finish(1)
   requireThat(await readFile(transcriptPath, 'utf8') === beforeRefusal, 'Refused continue/fork changed the original transcript')
-  // Any extra request (including an Anthropic endpoint) makes this strict
-  // fixture fail, even if the child eventually returns an error result.
+  // Any extra inference request or endpoint beyond the single allowed startup
+  // HEAD fails, even if the child eventually returns an error result.
   const requests = fixture.finish(3)
+  const startupPreconnects = fixture.finishAnthropicStartupPreconnect()
   for (let turn = 0; turn < requests.length; turn++) {
     const label = `lead request ${turn + 1}`
     assertPublicContext(requests[turn]!, test, label)
@@ -402,7 +432,7 @@ async function runLead(test: FixtureCase, fixture: ReturnType<typeof responsesFi
     for (let previous = 0; previous <= turn; previous++) assertCount(requests[turn]!, prompts[previous]!, 1, label)
     for (let previous = 0; previous < turn; previous++) assertCount(requests[turn]!, answers[previous]!, 1, label)
   }
-  return { requests, continueForkRefusal,
+  return { requests, continueForkRefusal, startupPreconnects,
     native: await assertNativeEvidence(test, ['exec', 'exec', 'app-server'], ['persistent', 'persistent', 'persistent']) }
 }
 
@@ -545,7 +575,8 @@ try {
   if (args[3]) await writeFile(path.resolve(args[3]), JSON.stringify({ version: EXPECTED_VERSION, lead, bootstrappedLead, teammate }, null, 2) + '\n')
   console.log(JSON.stringify({ ok: true, nativeVersion: EXPECTED_VERSION,
     coverage: 'source headless QueryEngine + full resume + switched-provider continue/fork refusal; deterministic lead bootstrap + stripped-spec resume; inbox composition + REPL bridge; real native runners; local Responses input',
-    lead: { requestCount: lead.requests.length, continueForkRefusal: lead.continueForkRefusal.errors, ...lead.native },
+    lead: { requestCount: lead.requests.length, continueForkRefusal: lead.continueForkRefusal.errors,
+      startupPreconnects: lead.startupPreconnects, ...lead.native },
     bootstrappedLead: { requestCount: bootstrappedLead.requests.length, ...bootstrappedLead.native },
     teammate: { requestCount: teammate.requests.length, ...teammate.native } }, null, 2))
 } catch (error) {
