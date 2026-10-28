@@ -32,6 +32,9 @@ import { spawnPortableCli } from '../../utils/portableCli.js'
 import { OPEN_CODE_MANAGED_HOST_CONFIG_GENERATION, buildOpenCodeHostTransportIdentity, resolveOpenCodeBinaryHostIdentity } from './OpenCodeHostIdentity.js'
 export { resolveOpenCodeBinaryHostIdentity } from './OpenCodeHostIdentity.js'
 import { resolveOpenCodeBinaryPath } from './OpenCodeBinaryResolver.js'
+import { launchNativeCustody, recoverNativeCustody, nativeCustodyForChild, resolveNativeCustodyHelper, type NativeCustody } from './native/OpenCodeNativeCustody.js'
+import { nativeAuthorityPath, readNativeAuthority, nativeExitConfirmed, withNativeAuthorityGate, writeNativeAuthority } from './native/OpenCodeNativeAuthority.js'
+import { productionOpenCodeFetch } from './native/OpenCodeNativeRequestLease.js'
 import { prewarmOpenCodeManagedSubscriptionPlugins } from './OpenCodeInventoryService.js'
 import {
   assertOpenCodePreparedProfileScope,
@@ -293,7 +296,7 @@ async function allocateLoopbackPort(): Promise<number> {
 }
 
 async function fetchJson(url: string, init?: RequestInit): Promise<FetchJsonResult> {
-  const response = await fetch(url, init)
+  const response = await productionOpenCodeFetch(url, init)
   const text = await response.text()
 
   let data: unknown = null
@@ -416,6 +419,7 @@ function unrefChildProcessHandle(child: ChildProcess): void {
   unrefHandle(child.stdout as UnrefableHandle)
   unrefHandle(child.stderr as UnrefableHandle)
   unrefHandle(child.stdin as UnrefableHandle)
+  for (const stream of child.stdio?.slice(3) ?? []) unrefHandle(stream as UnrefableHandle)
 }
 
 export function shouldUnrefOpenCodeHostProcess(
@@ -512,6 +516,31 @@ export class OpenCodeHostManager {
   private readonly pendingHostHealthTimeoutMs = new Map<string, number>()
 
   constructor(private readonly deps: OpenCodeHostManagerDeps = {}) {}
+
+  private get usesNativeCustody(): boolean {
+    // Explicit injected transports belong to unit fixtures/embedders. Ordinary
+    // production construction always takes the native path on this qualified lane.
+    return process.platform === 'linux' && !this.deps.spawnHostProcess && !this.deps.fetchJson
+  }
+
+  private async recoverRecordCustody(record: PersistentHostRegistryRecord, profile?: OpenCodePreparedProfile): Promise<NativeCustody> {
+    if (!/^(?:scope-)?[a-f0-9]{16,64}$/.test(record.profileRootKey)) throw new Error('native_custody_scope_mismatch')
+    const root = profile?.profileRootPath ?? path.dirname(this.getPersistentProfileTmpPath(record.profileRootKey))
+    const authority = await readNativeAuthority(nativeAuthorityPath(root, record.hostKey))
+    const scope = authority.scope
+    if (!scope || typeof scope !== 'object' || !('prepared' in scope) || !scope.prepared || typeof scope.prepared !== 'object')
+      throw new Error('native_custody_scope_mismatch')
+    const prepared = scope.prepared as Record<string, unknown>
+    for (const [key, value] of Object.entries({ profileRootPath: root, profileRootKey: record.profileRootKey,
+      projectPath: record.projectPath, projectBehaviorFingerprint: record.projectBehaviorFingerprint,
+      managedConfigFingerprint: record.managedConfigFingerprint })) {
+      if (prepared[key] !== value) throw new Error('native_custody_scope_mismatch')
+    }
+    if (await nativeExitConfirmed(authority)) throw new OpenCodeHostProcessGoneError(record.pid)
+    const custody = await recoverNativeCustody(root, record.hostKey, record.baseUrl)
+    if (custody.reference.nativePid !== record.pid) throw new Error('native_custody_scope_mismatch')
+    return custody
+  }
 
   private async prepareProfile(
     projectPath?: string | null,
@@ -1174,6 +1203,7 @@ export class OpenCodeHostManager {
       return { record, lease }
     }
     const snapshot = await this.withPersistentRegistryLock('endpoint_snapshot', readQualifiedOwner)
+    if (this.usesNativeCustody) await this.recoverRecordCustody(snapshot.record)
     // OS inspection can take seconds. It must not hold the shared registry gate
     // while independent members are retaining or releasing their exact leases.
     if ((await raceOpenCodeAbortSignal(
@@ -1448,6 +1478,17 @@ export class OpenCodeHostManager {
     if (!record) {
       return null
     }
+    if (this.usesNativeCustody) {
+      if (record.projectPath !== profile.projectPath || record.profileRootKey !== profile.profileRootKey ||
+        record.projectBehaviorFingerprint !== profile.projectBehaviorFingerprint || record.managedConfigFingerprint !== profile.managedConfigFingerprint)
+        throw new Error('native_custody_scope_mismatch')
+      try { await this.recoverRecordCustody(record, profile) }
+      catch (error) {
+        if (!isOpenCodeHostProcessGoneError(error)) throw error
+        await this.removePersistentHost(hostKey, { pid: record.pid, startedAtMs: record.processStartedAtMs })
+        return null
+      }
+    }
     if (
       record.projectPath !== profile.projectPath ||
       record.profileRootKey !== profile.profileRootKey ||
@@ -1610,24 +1651,46 @@ export class OpenCodeHostManager {
     }
   }
 
-  private spawnHost(
+  private async spawnHost(
     profile: OpenCodePreparedProfile,
     port: number,
     lifetime: OpenCodeHostLifetime,
     attributionId: string | null,
-  ): ChildProcess {
+    hostKey: string,
+    abortSignal?: AbortSignal,
+  ): Promise<ChildProcess> {
     if (this.deps.spawnHostProcess) {
       return this.deps.spawnHostProcess(profile, port)
     }
 
+    const selectedBinary = await resolveOpenCodeBinaryPath(abortSignal)
+    if (this.ownedHostAdmissionClosed) throw new Error('OpenCode host manager is closing')
+    abortSignal?.throwIfAborted()
+    const spawnOptions = buildOpenCodeHostSpawnOptions(profile, process.platform, {
+      lifetime, attributionId, attributionDirectory: this.processAttributionDirectory,
+    })
+    const args = ['serve', '--hostname', '127.0.0.1', '--port', String(port)]
+    if (this.usesNativeCustody) {
+      if (!selectedBinary) throw new Error('native_custody_binary_unavailable')
+      const helper = await resolveNativeCustodyHelper()
+      if (this.ownedHostAdmissionClosed) throw new Error('OpenCode host manager is closing')
+      abortSignal?.throwIfAborted()
+      const custody = await launchNativeCustody({ helper, selectedBinary, hostKey,
+        profileRoot: profile.profileRootPath, scope: profile,
+        cwd: profile.workingDirectoryPath ?? profile.projectPath, baseUrl: `http://127.0.0.1:${port}`,
+        args, env: spawnOptions.env ?? {}, persistent: lifetime === 'persistent', signal: abortSignal,
+        minimumVersion: profile.profileScope?.providerId === 'opencode' ||
+          (typeof profile.managedConfig.model === 'string' && profile.managedConfig.model.startsWith('opencode/'))
+          ? '1.18.0' : '1.16.0' })
+      if (this.ownedHostAdmissionClosed || abortSignal?.aborted) {
+        await custody.stopExact(); throw new Error('OpenCode host manager is closing')
+      }
+      return custody.child!
+    }
     return spawnPortableCli(
-      resolveOpenCodeBinaryPath() ?? 'opencode',
+      selectedBinary ?? 'opencode',
       ['serve', '--hostname', '127.0.0.1', '--port', String(port)],
-      buildOpenCodeHostSpawnOptions(profile, process.platform, {
-        lifetime,
-        attributionId,
-        attributionDirectory: this.processAttributionDirectory,
-      }),
+      spawnOptions,
     )
   }
 
@@ -1648,6 +1711,27 @@ export class OpenCodeHostManager {
 
     entry.child.once('exit', (code, signal) => {
       if (this.hosts.get(hostKey) !== entry) {
+        return
+      }
+
+      const custody = nativeCustodyForChild(entry.child!)
+      if (custody) {
+        entry.handle.state = 'degraded'
+        const file = nativeAuthorityPath(entry.handle.profile.profileRootPath, hostKey)
+        const cleanup = withNativeAuthorityGate(file, async () => {
+          const authority = await readNativeAuthority(file)
+          if (authority.images.epoch !== custody.reference.epoch) return
+          if (await nativeExitConfirmed(authority)) {
+            await writeNativeAuthority(file, { ...authority, phase: 'dead' })
+            this.hosts.delete(hostKey); this.pendingHosts.delete(hostKey)
+            await this.removePersistentHost(hostKey, { pid: entry.handle.pid, startedAtMs: entry.handle.processStartedAtMs })
+          } else {
+            await writeNativeAuthority(file, { ...authority, phase: 'unknown' })
+            pushDiagnostic('native custody ended without a confirmed owned-tree exit; authority preserved')
+          }
+        }).catch(() => undefined)
+        this.pendingLifecycleCleanups.add(cleanup)
+        void cleanup.finally(() => this.pendingLifecycleCleanups.delete(cleanup))
         return
       }
 
@@ -1674,6 +1758,8 @@ export class OpenCodeHostManager {
   }
 
   private async forceKillSpawnedHostProcess(child: ChildProcess): Promise<void> {
+    const custody = nativeCustodyForChild(child)
+    if (custody) { await custody.stopExact(); return }
     const pid = child.pid
     try {
       if (pid) {
@@ -1713,7 +1799,8 @@ export class OpenCodeHostManager {
     // including the cursor-agent trees the runtime never sees.
     const attributionId = mintProcessAttributionId()
     if (this.ownedHostAdmissionClosed) throw new Error('OpenCode host manager is closing')
-    const child = this.spawnHost(profile, port, lifetime, attributionId)
+    const child = await this.spawnHost(profile, port, lifetime, attributionId, hostKey, abortSignal)
+    const custody = nativeCustodyForChild(child)
 
     const diagnostics: string[] = []
     const captureOutput = (source: 'stdout' | 'stderr') => (chunk: Buffer | string) => {
@@ -1727,8 +1814,8 @@ export class OpenCodeHostManager {
       }
     }
 
-    child.stdout?.on('data', captureOutput('stdout'))
-    child.stderr?.on('data', captureOutput('stderr'))
+    ;(custody ? custody.stdout : child.stdout)?.on('data', captureOutput('stdout'))
+    ;(custody ? custody.stderr : child.stderr)?.on('data', captureOutput('stderr'))
 
     const handle: OpenCodeHostHandle = {
       hostKey,
@@ -1737,7 +1824,7 @@ export class OpenCodeHostManager {
       projectBehaviorFingerprint: profile.projectBehaviorFingerprint,
       baseUrl,
       port,
-      pid: child.pid ?? -1,
+      pid: custody?.reference.nativePid ?? child.pid ?? -1,
       attributionId,
       version: null,
       state: 'starting',
@@ -1765,6 +1852,7 @@ export class OpenCodeHostManager {
         () => this.pendingHostHealthTimeoutMs.get(hostKey) ?? OPEN_CODE_HOST_HEALTH_TIMEOUT_MS,
         abortSignal,
       )
+      if (custody && health.version !== custody.reference.measuredVersion) throw new Error('native_custody_version_mismatch')
       handle.version = health.version
       handle.resolvedConfigFingerprint = resolveConfigFingerprint
         ? await this.getResolvedConfigFingerprint(baseUrl)
@@ -1883,6 +1971,7 @@ export class OpenCodeHostManager {
         || (cached && cached.handle.state !== 'healthy')) {
         throw new Error('OpenCode existing host authority is unavailable or changed')
       }
+      if (this.usesNativeCustody) await this.recoverRecordCustody(record, profile)
       // Stop may close sessions on a typed gone host, so that type needs the
       // same ESRCH proof dead-runtime recovery uses. Weaker evidence keeps the
       // generic fail-closed identity error below.
@@ -1968,7 +2057,7 @@ export class OpenCodeHostManager {
       }
       return this.retainExistingHost(hostKey, profile, params.abortSignal)
     }
-    const binaryPath = resolveOpenCodeBinaryPath()
+    const binaryPath = await resolveOpenCodeBinaryPath(params.abortSignal)
     const preparedBinaryIdentity = profile.env.AGENT_TEAMS_CURSOR_HOST_BINARY_IDENTITY
     const needsBinaryIdentity = Boolean(preparedBinaryIdentity) || !params.hostKey?.trim()
     const binaryHostIdentity = binaryPath && needsBinaryIdentity
@@ -2089,6 +2178,24 @@ export class OpenCodeHostManager {
     const baseUrl = entry?.handle.baseUrl ?? record.baseUrl
     const pid = entry?.handle.pid ?? record.pid
     let terminated = false
+
+    if (this.usesNativeCustody) {
+      options.startupBudget?.assertAvailable()
+      try {
+        const custody = await this.recoverRecordCustody(record, entry?.handle.profile)
+        try {
+          const response = await productionOpenCodeFetch(`${record.baseUrl}/global/dispose`, { method: 'POST', signal: AbortSignal.timeout(2000) })
+          await response.body?.cancel()
+        } catch { /* The captured native process may already have committed disposal. Never replay. */ }
+        await custody.stopExact()
+      } catch (error) { if (!isOpenCodeHostProcessGoneError(error)) throw error }
+      if (entry) {
+        entry.handle.state = 'disposed'
+        for (const stream of entry.child?.stdio ?? []) stream?.destroy()
+      }
+      this.hosts.delete(record.hostKey); this.pendingHosts.delete(record.hostKey)
+      return // A failed custody action never reaches a numeric-PID fallback.
+    }
 
     const processIdentity = await this.inspectPersistentHostProcessIdentity({
       ...record,

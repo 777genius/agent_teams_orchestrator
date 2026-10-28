@@ -30,11 +30,28 @@ test('V2 execution, catalog and provider code selects the real Linux V2 lane', (
 })
 
 test('custody, process identity, startup cleanup, lifecycle, ABI and policy retain native gates', () => {
+  for (const path of ['native/opencode-custody/linux.c', 'src/services/opencode/native/OpenCodeNativeCustody.ts',
+    'scripts/stage-opencode-custody.mts', 'scripts/lib/opencode-custody-artifact.ts']) {
+    assert.equal(classify([path]).native, 'true', path)
+  }
   for (const path of ['src/services/opencode/OpenCodeBinaryResolver.ts', 'src/services/opencode/compatibility/OpenCodeVersionProbe.ts', 'src/services/opencode/compatibility/OpenCodeVersionProbe.helperBudget.test.ts', 'src/services/opencode/OpenCodeProvisioningProbe.ts', 'src/services/opencode/OpenCodeExecutionProof.ts', 'src/services/opencode/OpenCodeSelectedSessionAuthority.ts', 'src/services/opencode/OpenCodeCursorAgentAtomicReap.test.ts', 'src/services/opencode/OpenCodeStartupCleanup.ts', 'src/services/opencode/OpenCodeProcessAttributionStore.ts', 'src/services/opencode/recovery-contract/independent-boundaries.test.ts', 'src/utils/processKill.ts', 'src/utils/windowsNativeProcess.ts', 'src/services/opencode/host/OpenCodeV2PlainExecution.ts', 'src/utils/swarm/processBackend.ts', 'src/services/runtimeBackends/registry.ts', 'src/services/teamBootstrap/teamBootstrapRunner.ts', 'src/features/runtimeProviderManagement/application/connectProvider.ts', 'src/native-ts/yoga-layout/index.ts', 'src/entrypoints/cli.tsx', 'scripts/build.ts', 'scripts/package-runtime.ts', 'scripts/runtime-bun-pins.json', 'scripts/opencode-v2/stage.ts', 'src/cli/packagedOpenCodeDelivery.ts', 'src/cli/packagedOpenCodeDelivery.test.ts', 'package.json', 'bun.lock', 'tsconfig.json', '.github/workflows/ci.yml', 'scripts/ci/policy.test.ts', 'scripts/smoke/windows-runtime-opencode-provider-json.mjs']) {
     assert.equal(classify([path]).native, 'true', path)
     assert.deepEqual(JSON.parse(classify([path]).authority_os), ['ubuntu-latest', 'windows-latest'])
   }
   assert.equal(classify([], true).native, 'true')
+})
+
+test('a factory-only request admission change requires native custody qualification', () => {
+  for (const path of ['src/services/opencode/OpenCodeClientFactory.ts', 'src/services/opencode/OpenCodeClientFactory.test.ts',
+    'src/services/opencode/OpenCodeHostManager.ts', 'src/services/opencode/native/OpenCodeNativeRequestLease.ts']) {
+    const decision = classify([path])
+    assert.equal(decision.native, 'true', path)
+    assert.equal(decision.v2_linux, 'true', path)
+    assert.deepEqual(JSON.parse(decision.authority_os), ['ubuntu-latest', 'windows-latest'])
+    const missingQualification = needs(decision.native, decision.v2_linux)
+    missingQualification['opencode-native-custody'].result = 'skipped'
+    assert.throws(() => aggregate(missingQualification), /opencode-native-custody: skipped/)
+  }
 })
 
 test('event ranges distinguish PR merge base, push before/head and new branches', () => {
@@ -117,6 +134,7 @@ function needs(native = 'false', v2Linux = native === 'true' ? 'true' : 'false')
     'task-change-ledger': { result: 'success' },
     'opencode-authority': { result: 'success' },
     'packaged-delivery': { result: native === 'true' ? 'success' : 'skipped' },
+    'opencode-native-custody': { result: native === 'true' ? 'success' : 'skipped' },
     'windows-packaged-backfill': { result: native === 'true' ? 'success' : 'skipped' },
     'opencode-conformance': { result: native === 'true' ? 'success' : 'skipped' },
     'opencode-v2-linux': { result: v2Linux === 'true' ? 'success' : 'skipped' },
@@ -130,7 +148,7 @@ test('aggregate independently rejects required failures/cancellation/skips and c
       for (const result of ['failure', 'cancelled', 'skipped', 'unknown']) {
         const sample = needs(native)
         sample[job as keyof typeof sample].result = result
-        if (native === 'false' && result === 'skipped' && ['windows-packaged-backfill', 'opencode-conformance', 'packaged-delivery', 'opencode-v2-linux'].includes(job)) {
+        if (native === 'false' && result === 'skipped' && ['windows-packaged-backfill', 'opencode-conformance', 'packaged-delivery', 'opencode-native-custody', 'opencode-v2-linux'].includes(job)) {
           assert.equal(aggregate(sample), 'TEST decision')
         } else assert.throws(() => aggregate(sample), `${job}/${native}/${result}`)
       }

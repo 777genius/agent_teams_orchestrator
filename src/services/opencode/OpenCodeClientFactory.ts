@@ -1,4 +1,5 @@
 import { readOpenCodeBoundedHttpResponse } from './OpenCodeBoundedHttpResponse.js'
+import { productionOpenCodeFetch } from './native/OpenCodeNativeRequestLease.js'
 import type { OpenCodeClientRequestContext } from './OpenCodeClientRequestContext.js'
 export type { OpenCodeClientRequestContext } from './OpenCodeClientRequestContext.js'
 import type {
@@ -162,7 +163,7 @@ export class OpenCodeClientFactory {
   constructor(private readonly deps: OpenCodeClientFactoryDeps = {}) {}
 
   create(baseUrl: string, context: OpenCodeClientRequestContext = {}): OpenCodeClient {
-    const fetchImpl = this.deps.fetchImpl ?? fetch
+    const fetchImpl = this.deps.fetchImpl ?? productionOpenCodeFetch
 
     const request = async <T>(
       path: string,
