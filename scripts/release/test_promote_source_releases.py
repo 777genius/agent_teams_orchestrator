@@ -78,6 +78,18 @@ class PromotionTest(unittest.TestCase):
                     self.run_promotion()
                 self.assertFalse(any('PATCH' in c for c in self.calls))
 
+    def test_suffixed_tag_does_not_block_stable_candidates(self):
+        tags = ['v1.2.4-rc.1', 'v1.2.3']
+        def inventory(repo):
+            return [dict(id=i, tag_name=('runtime-' if repo == promotion.BINARIES else '') + tag,
+                         draft=repo == promotion.SOURCE, prerelease=False)
+                    for i, tag in enumerate(tags)]
+        with patch.object(promotion, 'releases', side_effect=inventory), \
+             patch.object(promotion, 'promote', return_value={}) as promote, \
+             patch('sys.argv', ['promote-source-releases.py']), patch('builtins.print'):
+            promotion.main()
+        promote.assert_called_once_with('v1.2.3', False, 1)
+
     def test_existing_public_source_is_unchanged(self):
         original = self.gh
         self.gh = lambda path: original(path) if '/commits/' in path or promotion.BINARIES in path else dict(tag_name=self.tag, draft=False)

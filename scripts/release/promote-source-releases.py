@@ -119,7 +119,9 @@ def main():
         stable = {r['tag_name'] for r in releases(BINARIES)
                   if not r['draft'] and not r['prerelease']}
         source_ids = {r['tag_name']: r['id'] for r in releases(SOURCE)
-                      if r['draft'] and not r['prerelease'] and f'runtime-{r["tag_name"]}' in stable}
+                      if r['draft'] and not r['prerelease']
+                      and re.fullmatch(r'v\d+\.\d+\.\d+', r['tag_name'])
+                      and f'runtime-{r["tag_name"]}' in stable}
         tags = list(source_ids)
         tags.sort(key=lambda t: tuple(map(int, t[1:].split('.'))))
     failed = False
