@@ -5,11 +5,13 @@ on:
     branches: [main, dev]
     paths:
       - 'src/services/opencode/ensureOpenCodeDirectory*'
+      - 'src/services/opencode/OpenCodePrivateMcp*'
       - 'src/services/opencode/OpenCodeProfileManager.ts'
       - '.github/workflows/opencode-directories.yml'
   pull_request:
     paths:
       - 'src/services/opencode/ensureOpenCodeDirectory*'
+      - 'src/services/opencode/OpenCodePrivateMcp*'
       - 'src/services/opencode/OpenCodeProfileManager.ts'
       - '.github/workflows/opencode-directories.yml'
 
@@ -24,7 +26,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest, macos-15-intel, windows-latest]
     steps:
       - uses: actions/checkout@v6
       - uses: oven-sh/setup-bun@v2
@@ -32,4 +34,7 @@ jobs:
           bun-version: 1.3.11
       # Builtin-only tests intentionally cover the Bun version embedded in 2.14.2.
       - name: Test directory compatibility
-        run: bun test src/services/opencode/ensureOpenCodeDirectory.test.ts
+        run: bun test --timeout 30000 src/services/opencode/ensureOpenCodeDirectory.test.ts src/services/opencode/OpenCodePrivateMcpConfig.test.ts
+      - name: Test foreign ownership refusal in isolated root-owned temporary fixture
+        if: runner.os == 'Linux'
+        run: sudo env TMPDIR=/tmp "$(command -v bun)" test src/services/opencode/OpenCodePrivateMcpConfig.test.ts --test-name-pattern 'rejects a foreign-owned existing file'

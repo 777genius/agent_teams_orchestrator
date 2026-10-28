@@ -2,6 +2,7 @@ import { snapshotOpenCodeGatewayCredential } from './OpenCodeGatewayCredentialSn
 import { mapLegacyOpenCodeV2Package, mapSelectedOpenCodeV2Model, type ExecutionProviderModels } from './profile/OpenCodeV2ExecutionConfig.js'
 import { readProcessStartTimeMs } from '../../utils/processKill.js'
 import { publishNativeCliFile } from './OpenCodeNativeCliPublication.js'
+import { publishPrivateCursorMcpConfig } from './OpenCodePrivateMcpConfig.js'
 import { resolveOpenCodeBinaryPath } from './OpenCodeBinaryResolver.js'
 import { OPEN_CODE_MANAGED_HOST_CONFIG_GENERATION, buildOpenCodeHostTransportIdentity, resolveOpenCodeBinaryHostIdentity } from './OpenCodeHostIdentity.js'
 import { execFile } from 'node:child_process'
@@ -3708,16 +3709,14 @@ export class OpenCodeProfileManager {
       ensureOpenCodeDirectory(workingDirectoryPath),
     ])
     let nativeCliCredentialBridge: OpenCodeNativeCliCredentialBridge | null = null
+    let cursorMcpConfigPath: string | null = null
     if (managedSubscriptionPlugins.length > 0 && policy?.reconcileAuth !== false) {
       enterStep('repair plugin caches and native bridge')
       await repairEmptyOpenCodeManagedPluginCaches(xdgCacheHome)
       // The plugin's MCP bridge reads servers from a config file, not from
       // OPENCODE_CONFIG_CONTENT. Without this file it discovers nothing and the
       // agent has no Agent Teams tools at all.
-      const managedConfigPath = cursorManagedAssets
-        ? path.join(xdgConfigHome, 'opencode', 'opencode.json')
-        : null
-      if (managedConfigPath) {
+      if (cursorManagedAssets) {
         // Only the sections the bridge actually reads. OpenCode merges this file
         // with OPENCODE_CONFIG_CONTENT, and `plugin` is an array, so writing the
         // whole config appended the plugin a second time and the launch readiness
@@ -3728,11 +3727,9 @@ export class OpenCodeProfileManager {
             .filter(section => managedConfig[section] && !Array.isArray(managedConfig[section]))
             .map(section => [section, managedConfig[section]]),
         )
-        await mkdir(path.dirname(managedConfigPath), { recursive: true })
-        await writeFile(
-          managedConfigPath,
-          `${JSON.stringify(bridgeConfig, null, 2)}\n`,
-          { encoding: 'utf8', mode: 0o600 },
+        cursorMcpConfigPath = await publishPrivateCursorMcpConfig(
+          cursorManagedStatePath ?? profileRootPath,
+          bridgeConfig,
         )
       }
       nativeCliCredentialBridge = await ensureOpenCodeNativeCliCredentialBridge(
@@ -3740,7 +3737,7 @@ export class OpenCodeProfileManager {
         { ...runtimeEnv, ...(cursorNative ? { CURSOR_AGENT_EXECUTABLE: cursorNative.executablePath } : {}) },
         process.platform,
         cursorManagedAssets,
-        managedConfigPath,
+        cursorMcpConfigPath,
       )
     }
     enterStep('coordinate shared node_modules')
@@ -3925,6 +3922,7 @@ export class OpenCodeProfileManager {
       }
     }
     delete env.OPENCODE_CONFIG
+    if (cursorMcpConfigPath) env.OPENCODE_CONFIG = cursorMcpConfigPath
     if (options.abortSignal?.aborted) throwOpenCodeAbortReason(options.abortSignal)
 
     return {
