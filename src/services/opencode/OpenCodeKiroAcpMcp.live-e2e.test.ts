@@ -249,7 +249,7 @@ describe('OpenCode Kiro ACP MCP live e2e', () => {
       }
       const profileManager = new OpenCodeProfileManager()
       const preparedProfile = await profileManager.prepareProfile(projectPath, profileOptions)
-      const binaryPath = resolveOpenCodeBinaryPath()
+      const binaryPath = await resolveOpenCodeBinaryPath()
       if (!binaryPath) {
         throw new Error('OpenCode binary is unavailable for the Kiro ACP live E2E')
       }

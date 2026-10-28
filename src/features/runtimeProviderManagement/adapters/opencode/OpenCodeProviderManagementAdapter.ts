@@ -245,7 +245,7 @@ type OpenCodeProviderManagementAdapterDeps = {
   inventoryTimeoutMs?: number
   /** Settings preparation and HTTP budget; cancellation must drain before CLI exit. */
   viewTimeoutMs?: number
-  resolveBinaryPath?: () => string | null
+  resolveBinaryPath?: () => string | null | Promise<string | null>
   resolveBinaryIdentity?: (binaryPath: string) => Promise<string>
   /** Query, model normalization, and identity-publication budget after host readiness. */
   catalogTimeoutMs?: number
@@ -3275,7 +3275,7 @@ export class OpenCodeProviderManagementAdapter
 
     let binary: CatalogIdentityComponent
     try {
-      const selectedBinaryPath = (this.deps.resolveBinaryPath ?? resolveOpenCodeBinaryPath)()
+      const selectedBinaryPath = await (this.deps.resolveBinaryPath ?? resolveOpenCodeBinaryPath)()
       const binaryPath = selectedBinaryPath ? await realpath(selectedBinaryPath) : null
       if (input.expectedBinaryPath !== undefined && binaryPath !== input.expectedBinaryPath) {
         binary = { state: 'error' }

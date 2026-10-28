@@ -81,7 +81,7 @@ describe('Cursor App MCP live e2e', () => {
       expect(Object.keys(JSON.parse(await readFile(configFile, 'utf8')).mcp ?? {}))
         .toContain('agent-teams')
 
-      const binaryPath = resolveOpenCodeBinaryPath()
+      const binaryPath = await resolveOpenCodeBinaryPath()
       if (!binaryPath) throw new Error('OpenCode binary is unavailable for the App MCP live E2E')
       const cold = await execOpenCodePortableCommand({
         binaryPath, args: getOpenCodeVerboseModelsArgs(), profile, timeoutMs: 300_000,

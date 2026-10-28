@@ -2831,7 +2831,7 @@ async function runReadiness(
   const parsedSelectedModel = parseOpenCodeProviderScopedModelRef(selectedModel)
   const openCodeBinaryPath = shouldProbeSelectedModel
     && parsedSelectedModel?.providerId === 'cursor-acp'
-    ? resolveOpenCodeBinaryPath()
+    ? await resolveOpenCodeBinaryPath()
     : null
   if (
     shouldProbeSelectedModel

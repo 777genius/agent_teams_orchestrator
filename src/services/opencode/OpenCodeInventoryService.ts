@@ -13,7 +13,7 @@ import {
 } from './OpenCodeModelRef.js'
 import { canonicalizeOpenCodeProviderId } from './OpenCodeProviderIdentity.js'
 import { readOpenCodeAuthProviderSummaries } from './OpenCodeAuthStore.js'
-import { resolveOpenCodeBinaryPath } from './OpenCodeBinaryResolver.js'
+import { readCapturedOpenCodeBinaryPath } from './OpenCodeBinaryResolver.js'
 import { inspectOpenCodeReadSelection } from './compatibility/OpenCodeNativeIdentity.js'
 import { probeOpenCodeV2Inventory } from './catalog/OpenCodeV2InventoryService.js'
 import { openCodeV2KeyIntegrations, readOpenCodeV2ConnectedProviders } from './catalog/OpenCodeV2KeyIntegrations.js'
@@ -663,7 +663,7 @@ export function buildOpenCodeInventoryTimeoutSnapshot(input: {
   progress?: OpenCodeInventoryProbeProgressSnapshot | null
 }): OpenCodeInventorySnapshot {
   const resolvedProjectPath = path.resolve(input.projectPath?.trim() || getCwd())
-  const binaryPath = resolveOpenCodeBinaryPath()
+  const binaryPath = readCapturedOpenCodeBinaryPath()
   const currentStep = input.progress?.currentStep?.trim() || null
   const message = currentStep
     ? `${OPEN_CODE_INVENTORY_TIMEOUT_MESSAGE_PREFIX} after ${input.timeoutMs}ms during ${currentStep}`
