@@ -12,7 +12,7 @@ export async function stageSupportFixture(base: string, support: string, cacheAr
   const cache = await realpath(cacheArgument), instance = randomUUID()
   const parent = path.join(cache, descriptor.runtimeVersion, `${descriptor.platform}-${descriptor.arch}`, descriptor.archive.sha256)
   await mkdir(parent, { recursive: true })
-  await cp(selected.support, path.join(parent, instance), { recursive: true, errorOnExist: true, force: false, dereference: false })
+  await cp(selected.support, path.join(parent, instance), { recursive: true, errorOnExist: true, force: false, dereference: false, verbatimSymlinks: true })
   await writeFile(path.join(parent, 'installed.json'), JSON.stringify({ schemaVersion: 1, runtimeVersion: descriptor.runtimeVersion,
     sourceCommit: descriptor.sourceCommit, bridgeProtocol: 1, platform: descriptor.platform, arch: descriptor.arch,
     archiveSha256: descriptor.archive.sha256, manifestSha256: descriptor.manifest.sha256, instance }))
