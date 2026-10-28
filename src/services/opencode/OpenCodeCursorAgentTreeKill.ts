@@ -102,6 +102,17 @@ export type NativeHelperFailure = Readonly<{
   helperCause?: NativeHelperCause
 }>
 
+export function classifyNativeHelperFailure(operation: NativeHelperFailure['operation'], error: unknown,
+  elapsedMs: number): NativeHelperFailure {
+  const message = error instanceof Error ? error.message : ''
+  const exit = /^Native helper exited (-?\d+)$/.exec(message)
+  const reason: NativeHelperFailure['reason'] = message === 'Native helper timed out' ? 'helper_timeout'
+    : exit ? 'helper_nonzero' : message === 'Native helper output exceeded limit' ? 'helper_output_limit'
+      : error instanceof Error && 'code' in error ? 'helper_spawn_error' : 'helper_error'
+  return { operation, reason, exitCode: exit ? Number(exit[1]) : null, elapsedMs: Math.max(0, elapsedMs),
+    ...(error instanceof NativeHelperQueryError && error.helperCause ? { helperCause: error.helperCause } : {}) }
+}
+
 // PowerShell's command-line parser does not consume libuv's backslash-escaped
 // embedded quotes. Encoding transports the exact script without a second parse.
 function windowsPowerShellArguments(script: string): string[] {
@@ -114,13 +125,7 @@ export function nativePorts(overrides: Partial<CursorAgentNativePorts> = {},
     const started = Date.now()
     try { return await query(command, args, timeout, spawn, operation === 'birth' && process.platform === 'win32') }
     catch (error) {
-      const message = error instanceof Error ? error.message : ''
-      const exit = /^Native helper exited (-?\d+)$/.exec(message)
-      const reason: NativeHelperFailure['reason'] = message === 'Native helper timed out' ? 'helper_timeout'
-        : exit ? 'helper_nonzero' : message === 'Native helper output exceeded limit' ? 'helper_output_limit'
-          : error instanceof Error && 'code' in error ? 'helper_spawn_error' : 'helper_error'
-      onHelperFailure?.({ operation, reason, exitCode: exit ? Number(exit[1]) : null, elapsedMs: Math.max(0, Date.now() - started),
-        ...(error instanceof NativeHelperQueryError && error.helperCause ? { helperCause: error.helperCause } : {}) })
+      onHelperFailure?.(classifyNativeHelperFailure(operation, error, Date.now() - started))
       throw error
     }
   }
