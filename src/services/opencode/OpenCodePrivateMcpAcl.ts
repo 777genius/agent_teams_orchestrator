@@ -83,27 +83,34 @@ export function validateWindowsAcl(snapshot: WindowsAclSnapshot): void {
 }
 
 export type WindowsAclRunner = (script: string) => string;
-const runAcl: WindowsAclRunner = (script) => {
-  const executable = path.win32.join(
-    process.env.SystemRoot ?? 'C:\\Windows',
+/** Trusted WinPS5 toolchain only, including when the parent was PowerShell 7 through Bun. */
+export const runWindowsMcpAclScript: WindowsAclRunner = (script) => {
+  const windowsRoot = process.env.SystemRoot ?? 'C:\\Windows';
+  const powerShellHome = path.win32.join(
+    windowsRoot,
     'System32',
     'WindowsPowerShell',
-    'v1.0',
-    'powershell.exe'
+    'v1.0'
   );
+  const executable = path.win32.join(powerShellHome, 'powershell.exe');
+  // Implicit module discovery can select PS7 modules in an indirect WinPS5 child.
+  // Load only the OS-shipped JSON cmdlet module; ACL reads use .NET Framework directly.
+  const bootstrap = "$ErrorActionPreference='Stop'; $PSModuleAutoLoadingPreference='None'; $env:PSModulePath=[System.IO.Path]::Combine($PSHOME,'Modules'); Import-Module -Name ([System.IO.Path]::Combine($PSHOME,'Modules\\Microsoft.PowerShell.Utility\\Microsoft.PowerShell.Utility.psd1')) -ErrorAction Stop; ";
   return execFileSync(
     executable,
     [
       '-NoProfile',
       '-NonInteractive',
       '-EncodedCommand',
-      Buffer.from(script, 'utf16le').toString('base64'),
+      Buffer.from(bootstrap + script, 'utf16le').toString('base64'),
     ],
     {
       encoding: 'utf8',
       env: {
-        SystemRoot: process.env.SystemRoot ?? 'C:\\Windows',
-        WINDIR: process.env.SystemRoot ?? 'C:\\Windows',
+        SystemRoot: windowsRoot,
+        WINDIR: windowsRoot,
+        PATH: path.win32.join(windowsRoot, 'System32'),
+        PSModulePath: path.win32.join(powerShellHome, 'Modules'),
         ...(process.env.TEMP ? { TEMP: process.env.TEMP } : {}),
         ...(process.env.TMP ? { TMP: process.env.TMP } : {}),
       },
@@ -115,9 +122,9 @@ const runAcl: WindowsAclRunner = (script) => {
 };
 
 /** Read effective filesystem ACLs; failure/malformed output fails closed. No credential is passed to a process. */
-export function assertPrivateWindowsAcl(file: string, runner: WindowsAclRunner = runAcl): void {
+export function assertPrivateWindowsAcl(file: string, runner: WindowsAclRunner = runWindowsMcpAclScript): void {
   const literal = file.replace(/'/g, "''");
-  const script = `$ErrorActionPreference='Stop'; $u=[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; $a=Get-Acl -LiteralPath '${literal}'; @{userSid=$u;ownerSid=$a.GetOwner([System.Security.Principal.SecurityIdentifier]).Value;rules=@($a.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier]) | ForEach-Object { @{sid=$_.IdentityReference.Value;type=$_.AccessControlType.ToString()} })} | ConvertTo-Json -Compress -Depth 4`;
+  const script = `$u=[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; $p='${literal}'; $a=if ([System.IO.Directory]::Exists($p)) { [System.IO.Directory]::GetAccessControl($p) } else { [System.IO.File]::GetAccessControl($p) }; @{userSid=$u;ownerSid=$a.GetOwner([System.Security.Principal.SecurityIdentifier]).Value;rules=@($a.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier]) | ForEach-Object { @{sid=$_.IdentityReference.Value;type=$_.AccessControlType.ToString()} })} | ConvertTo-Json -Compress -Depth 4`;
   try {
     validateWindowsAcl(JSON.parse(runner(script)) as WindowsAclSnapshot);
   } catch {
@@ -126,9 +133,9 @@ export function assertPrivateWindowsAcl(file: string, runner: WindowsAclRunner =
 }
 
 /** One metadata-only command checks the private root and every existing ancestor. */
-export function assertWindowsMcpAncestry(paths: string[], runner: WindowsAclRunner = runAcl): void {
+export function assertWindowsMcpAncestry(paths: string[], runner: WindowsAclRunner = runWindowsMcpAclScript): void {
   const literals = paths.map(file => `'${file.replace(/'/g, "''")}'`).join(',');
-  const script = `$ErrorActionPreference='Stop'; $u=[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; @(${literals}) | ForEach-Object { $p=$_; $a=Get-Acl -LiteralPath $p; @{path=$p;userSid=$u;ownerSid=$a.GetOwner([System.Security.Principal.SecurityIdentifier]).Value;rules=@($a.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier]) | ForEach-Object { @{sid=$_.IdentityReference.Value;type=$_.AccessControlType.ToString();rights=[long]$_.FileSystemRights;inheritOnly=[bool]($_.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::InheritOnly)} })} } | ConvertTo-Json -Compress -Depth 5`;
+  const script = `$u=[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; @(${literals}) | ForEach-Object { $p=$_; $a=[System.IO.Directory]::GetAccessControl($p); @{path=$p;userSid=$u;ownerSid=$a.GetOwner([System.Security.Principal.SecurityIdentifier]).Value;rules=@($a.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier]) | ForEach-Object { @{sid=$_.IdentityReference.Value;type=$_.AccessControlType.ToString();rights=[long]$_.FileSystemRights;inheritOnly=[bool]($_.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::InheritOnly)} })} } | ConvertTo-Json -Compress -Depth 5`;
   try {
     const parsed: unknown = JSON.parse(runner(script));
     const records = Array.isArray(parsed) ? parsed : [parsed];

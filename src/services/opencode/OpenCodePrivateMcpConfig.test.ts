@@ -4,7 +4,7 @@ import { chmod, chown, link, lstat, mkdir, mkdtemp, readFile, readdir, realpath,
 import os from 'node:os'
 import path from 'node:path'
 
-import { assertPrivateWindowsAcl, validateWindowsAcl, validateWindowsAncestorAcl } from './OpenCodePrivateMcpAcl.js'
+import { assertPrivateWindowsAcl, validateWindowsAcl, validateWindowsAncestorAcl, runWindowsMcpAclScript } from './OpenCodePrivateMcpAcl.js'
 import { publishPrivateCursorMcpConfig } from './OpenCodePrivateMcpConfig.js'
 
 let root: string
@@ -123,10 +123,8 @@ test.skipIf(process.platform !== 'darwin')('rejects actual macOS allow ACLs desp
 
 test.skipIf(process.platform !== 'win32')('rejects an actual broad Windows file ACL before replacing its bytes', async () => {
   const file = await publishPrivateCursorMcpConfig(root, { sentinel: true })
-  const script = `$ErrorActionPreference='Stop'; $p='${file.replace(/'/g, "''")}'; $a=Get-Acl -LiteralPath $p; $r=[System.Security.AccessControl.FileSystemAccessRule]::new([System.Security.Principal.SecurityIdentifier]::new('S-1-1-0'),[System.Security.AccessControl.FileSystemRights]::Read,[System.Security.AccessControl.AccessControlType]::Allow); $a.AddAccessRule($r); Set-Acl -LiteralPath $p -AclObject $a`
-  const executable = path.win32.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
-  execFileSync(executable, ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
-    { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], timeout: 10_000 })
+  const script = `$p='${file.replace(/'/g, "''")}'; $a=[System.IO.File]::GetAccessControl($p); $r=[System.Security.AccessControl.FileSystemAccessRule]::new([System.Security.Principal.SecurityIdentifier]::new('S-1-1-0'),[System.Security.AccessControl.FileSystemRights]::Read,[System.Security.AccessControl.AccessControlType]::Allow); $a.AddAccessRule($r); [System.IO.File]::SetAccessControl($p,$a)`
+  runWindowsMcpAclScript(script)
   await expect(publishPrivateCursorMcpConfig(root, secretConfig)).rejects.toThrow('not private')
   expect(JSON.parse(await readFile(file, 'utf8'))).toEqual({ sentinel: true })
 })
@@ -134,11 +132,29 @@ test.skipIf(process.platform !== 'win32')('rejects an actual broad Windows file 
 test.skipIf(process.platform !== 'win32')('rejects an actual writable Windows ancestor before creating credential files', async () => {
   const state = path.join(root, 'generation-state')
   await mkdir(state)
-  const script = `$ErrorActionPreference='Stop'; $p='${root.replace(/'/g, "''")}'; $a=Get-Acl -LiteralPath $p; $r=[System.Security.AccessControl.FileSystemAccessRule]::new([System.Security.Principal.SecurityIdentifier]::new('S-1-1-0'),[System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles,[System.Security.AccessControl.AccessControlType]::Allow); $a.AddAccessRule($r); Set-Acl -LiteralPath $p -AclObject $a`
-  const executable = path.win32.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
-  execFileSync(executable, ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
-    { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], timeout: 10_000 })
+  const script = `$p='${root.replace(/'/g, "''")}'; $a=[System.IO.Directory]::GetAccessControl($p); $r=[System.Security.AccessControl.FileSystemAccessRule]::new([System.Security.Principal.SecurityIdentifier]::new('S-1-1-0'),[System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles,[System.Security.AccessControl.AccessControlType]::Allow); $a.AddAccessRule($r); [System.IO.Directory]::SetAccessControl($p,$a)`
+  runWindowsMcpAclScript(script)
   await expect(publishPrivateCursorMcpConfig(state, secretConfig)).rejects.toThrow('not private')
   expect(await readdir(state)).toEqual([])
   expect(() => assertPrivateWindowsAcl(root)).toThrow()
+})
+
+test.skipIf(process.platform !== 'win32')('uses the trusted WinPS5 module context without inheriting a credential environment', () => {
+  const oldModulePath = process.env.PSModulePath
+  const secretKey = 'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_HEADERS_JSON'
+  const oldCredential = process.env[secretKey]
+  try {
+    process.env.PSModulePath = 'C:\\TEST-incompatible-PowerShell7-modules'
+    process.env[secretKey] = 'TEST-synthetic-credential-must-not-enter-ACL-child'
+    const actual = JSON.parse(runWindowsMcpAclScript(`@{major=$PSVersionTable.PSVersion.Major;modulePath=$env:PSModulePath;inheritedCredential=[bool][System.Environment]::GetEnvironmentVariable('${secretKey}')} | ConvertTo-Json -Compress`))
+    expect(actual.major).toBe(5)
+    expect(actual.modulePath.toLowerCase()).toBe(path.win32.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'Modules').toLowerCase())
+    expect(actual.inheritedCredential).toBe(false)
+    assertPrivateWindowsAcl(root)
+  } finally {
+    if (oldModulePath === undefined) delete process.env.PSModulePath
+    else process.env.PSModulePath = oldModulePath
+    if (oldCredential === undefined) delete process.env[secretKey]
+    else process.env[secretKey] = oldCredential
+  }
 })
