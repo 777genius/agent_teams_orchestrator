@@ -2,8 +2,9 @@
 
 Tag pushes create a draft source release and build binary deliveries independently.
 A successful build alone does not authorize or prove public delivery: binary
-qualification drafts stay private until the normal `publish_release=true` path
-publishes and verifies them.
+qualification drafts stay private until the exact verified draft is published
+and the anonymous-download gate succeeds, as described in
+[`docs/release-flow.md`](../../docs/release-flow.md).
 
 `Promote Verified Source Releases` runs on the default branch after either
 `Release Runtime` or `Runtime Source Release` succeeds. It reconciles source
