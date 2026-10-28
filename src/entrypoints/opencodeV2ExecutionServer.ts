@@ -108,7 +108,8 @@ async function start(input: Record<string, unknown>): Promise<void> {
     startupTimer = setTimeout(() => { reportStartupFailure('timeout'); void close() }, activationDeadline - Date.now())
   }
   enterStartupStage('delivery-resolution')
-  const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'execution')
+  const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'execution', native.graph.delivery)
+  executionAssert(native.runtimeMode !== 'packaged' || native.graph.delivery, 'execution_identity_mismatch')
   assertOpenCodeV2Launchable(openCodeV2EngineVersion(native))
   executionAssert(native.runtimeMode === delivery.runtimeMode && native.entrySha256 === delivery.entrySha256 &&
     native.generation === 'v2' && isOpenCodeV2Identity(openCodeV2EngineVersion(native), native.dialect) &&

@@ -298,7 +298,7 @@ async function operations(authority: ExecutionAuthority, context: ExecutionConte
     openCodeV2LaunchRefusal(authority.pin) === null, 'unqualified_version')
   const graph = requireExecutionGraph(authority)
   executionAssert(graph.sha256 === authority.graphSha256, 'authority_mismatch')
-  const entry = await resolveOpenCodeV2ClientEntry(authority.pin)
+  const entry = await resolveOpenCodeV2ClientEntry(authority.pin, undefined, graph.delivery)
   const proof = graph.files.find(file => file.path === entry)
   executionAssert(proof && await hashOpenCodeFile(entry) === proof.sha256, 'graph_mismatch')
   for (const [dependency, subpath] of OPENCODE_V2_CLIENT_GRAPH_ENTRIES) {

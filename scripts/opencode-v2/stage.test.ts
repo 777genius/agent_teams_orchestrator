@@ -2,7 +2,15 @@ import { expect, test, spyOn } from 'bun:test'
 import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { verifyBunPtyGraph, verifyGraphs } from './stage.js'
+import { selectOpenCodeV2StageVersions, verifyBunPtyGraph, verifyGraphs } from './stage.js'
+
+test('release staging preserves every exact platform engine without adding a new qualification', () => {
+  const staged = ['2.0.0', '2.0.32', '2.1.4'] as const
+  expect(selectOpenCodeV2StageVersions(staged, 'darwin-x64')).toEqual(['2.0.0', '2.0.32'])
+  expect(selectOpenCodeV2StageVersions(staged, 'win32-x64')).toEqual(['2.1.4'])
+  expect(selectOpenCodeV2StageVersions(staged, 'win32-arm64')).toEqual([])
+  expect(() => selectOpenCodeV2StageVersions(['2.0.32'], 'linux-x64')).toThrow('not installed')
+})
 
 async function ptyFixture(root: string, pin: '2.0.0' | '2.0.32') {
   const core = path.join(root, 'node_modules', pin === '2.0.0' ? '@opencode/server-v2.0.0/node_modules/@opencode/core' : '@opencode/core')

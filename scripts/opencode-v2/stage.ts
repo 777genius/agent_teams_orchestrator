@@ -1,4 +1,4 @@
-import { openCodeV2GraphPackages, openCodeV2StagedVersions, openCodeV2Wire, type OpenCodeV2Pin } from '../../src/services/opencode/compatibility/OpenCodeV2Registry.js'
+import { openCodeV2GraphPackages, openCodeV2ReleaseContract, openCodeV2StagedVersions, openCodeV2Wire, type OpenCodeV2Pin } from '../../src/services/opencode/compatibility/OpenCodeV2Registry.js'
 import { OPENCODE_V2_CLIENT_GRAPH_ENTRIES, OPENCODE_V2_EFFECT_PLATFORM_ENTRIES,
   OPENCODE_V2_SERVER_GRAPH_ENTRIES } from '../../src/services/opencode/host/OpenCodeV2ServerGraph.js'
 import { createHash } from 'node:crypto'
@@ -27,6 +27,16 @@ export type OpenCodeV2StagePlan = Readonly<{
   root: Readonly<Record<typeof ROOT_PACKAGES[number], string>>
   ptyVersion: string
 }>
+
+/** A release carries every engine its platform may select, and no foreign qualification. */
+export function selectOpenCodeV2StageVersions(staged: readonly OpenCodeV2Pin[], platform: string): readonly OpenCodeV2Pin[] {
+  const qualified = openCodeV2ReleaseContract().qualified[platform as keyof ReturnType<typeof openCodeV2ReleaseContract>['qualified']]
+  if (!qualified) throw new Error(`Unknown OpenCode V2 release platform: ${platform}`)
+  for (const version of qualified) {
+    if (!staged.includes(version)) throw new Error(`Qualified OpenCode V2 graph is not installed: ${version}`)
+  }
+  return [...qualified]
+}
 
 async function metadata(root: string): Promise<PackageMetadata> {
   const value: unknown = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8'))
@@ -235,10 +245,14 @@ export async function copyStagedPackage(source: string, target: string, manifest
  * the staged platform's native assets are copied byte for byte, preserving separate
  * physical graphs; files Bun never loads are left out (see staged-files.ts). */
 export async function stageOpenCodeV2Graphs(sourceRoot: string, bundleDirectory: string,
-  options: { portable?: boolean; platform?: string; arch?: string } = {}): Promise<void> {
+  options: { portable?: boolean; platform?: string; arch?: string; qualifiedPlatform?: string } = {}): Promise<void> {
   sourceRoot = await realpath(sourceRoot)
   const destination = path.resolve(bundleDirectory, 'node_modules')
-  const plan = await planOpenCodeV2Stage(sourceRoot)
+  const installed = await planOpenCodeV2Stage(sourceRoot)
+  const plan = options.qualifiedPlatform
+    ? { ...installed, versions: selectOpenCodeV2StageVersions(installed.versions, options.qualifiedPlatform) }
+    : installed
+  if (plan.versions.length === 0) throw new Error('No OpenCode V2 engine is qualified for this release platform')
   await verifyGraphs(sourceRoot, undefined, plan)
   await mkdir(destination, { recursive: true })
   const stagedTarget = { platform: options.platform ?? process.platform, arch: options.arch ?? process.arch }

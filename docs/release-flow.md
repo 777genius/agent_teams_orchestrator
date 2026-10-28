@@ -57,7 +57,19 @@ and uploads them, the versioned manifest and checksums to a **draft** in
 `agent_teams_orchestrator_binaries`. A successful tag workflow does not mean the assets are public;
 the anonymous-download job is skipped while the release remains a draft.
 
-Before publication, qualify all five platform builds and verify the exact seven draft assets.
+Before publication, qualify all five base platform builds and every qualified optional
+OpenCode V2 support archive. The generated release manifest determines the complete
+asset roster (currently five base archives, four support ZIPs, manifest and checksums).
+Each optional descriptor must match the same runtime source commit, platform, Bun pin
+and qualified engines as its base; platform metadata sidecars are build inputs only.
+
+Published runtime releases and their versioned support assets are retained. Installed
+apps download their pinned support lazily and may still need an older release after
+a new app/runtime version ships. Never delete published assets as draft cleanup, replace
+their bytes in place, or point an old descriptor at a newer engine. The workflow may
+recreate only the matching **still-draft** release, rechecking its state immediately
+before deletion. Cleaning unrelated releases or implementing a retention service is
+outside this delivery flow.
 Check the manifest's `sourceRef` and `sourceCommit` against the immutable source tag, archive
 SHA256 values against the manifest/checksums, and payload `VERSION` and `COMMIT_SHA`. Retain the
 verified draft release ID and asset identities with the qualification evidence.

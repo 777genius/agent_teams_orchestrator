@@ -1,9 +1,11 @@
 import { openCodeBunVersion } from '../src/constants/openCodeBunVersion.js'
 import { createHash } from 'node:crypto'
-import { chmod, mkdir, readFile, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { unzipSync } from 'fflate'
 import { validatePackagedOpenCodeIdentity } from '../src/cli/packagedOpenCodeDelivery.js'
+import { openCodeV2ReleaseContract } from '../src/services/opencode/compatibility/OpenCodeV2Registry.js'
+import { packageOpenCodeV2Delivery } from './opencode-v2/delivery.js'
 
 const args = process.argv.slice(2)
 const option = (name: string) => args[args.indexOf(name) + 1]
@@ -52,13 +54,28 @@ if (!Object.hasOwn(pins.assets, host)) throw new Error('Unsupported runtime rele
 const jsBuilder = host === platform ? shipped :
   await stageBinary('./dist/build-bun', host, await pinnedBinary(pins.assets[host]!))
 function build(executable: string, buildArgs: string[]): void {
-  const result = Bun.spawnSync({ cmd: [executable, './scripts/build.ts', ...buildArgs], stdout: 'inherit', stderr: 'inherit' })
+  const result = Bun.spawnSync({ cmd: [executable, '--no-install', './scripts/build.ts', ...buildArgs], stdout: 'inherit', stderr: 'inherit' })
   if (result.exitCode !== 0) throw new Error('Runtime delivery build failed')
 }
-build(jsBuilder, ['--portable-graph', `--release-platform=${platform}`])
+const source = Bun.spawnSync(['git', 'rev-parse', 'HEAD'], { stdout: 'pipe', stderr: 'pipe' })
+const sourceCommit = new TextDecoder().decode(source.stdout).trim()
+if (source.exitCode !== 0 || !/^[a-f0-9]{40}$/.test(sourceCommit)) throw new Error('Runtime source commit is required')
+process.env.RUNTIME_SOURCE_COMMIT = sourceCommit
+const metadata = JSON.parse(await readFile('./package.json', 'utf8')) as { version: string }
+await writeFile('./dist/VERSION', metadata.version + '\n')
+await writeFile('./dist/COMMIT_SHA', sourceCommit + '\n')
+await rm('./dist/opencode-v2-delivery.json', { force: true })
+await rm('./dist/opencode-v2-support', { recursive: true, force: true })
+const qualified = openCodeV2ReleaseContract().qualified[platform as keyof ReturnType<typeof openCodeV2ReleaseContract>['qualified']]
+if (qualified?.length) {
+  build(jsBuilder, ['--opencode-v2-support', '--portable-graph', `--release-platform=${platform}`])
+  await packageOpenCodeV2Delivery({ root: './dist/opencode-v2-support', outputDirectory: './dist',
+    runtimeVersion: metadata.version, sourceCommit, platformKey: platform })
+}
+build(jsBuilder, ['--base-delivery', `--release-platform=${platform}`])
 const [targetPlatform, arch] = platform.split('-')
 const identity = validatePackagedOpenCodeIdentity({ schema: 1, platform: targetPlatform, arch,
   bunVersion: openCodeBunVersion(targetPlatform), bunSha256: sha(binary), entrySha256: sha(await readFile('./dist/local-cli/cli.js')) })
 await writeFile('./dist/opencode-delivery.json', JSON.stringify(identity, null, 2) + '\n')
-build(process.execPath, ['--compile', '--packaged-delivery'])
-console.log(`Prepared compiled front door, physical graph and pinned Bun for ${platform}`)
+build(process.execPath, ['--compile', '--packaged-delivery', '--base-delivery', `--release-platform=${platform}`])
+console.log(`Prepared graph-free base${qualified?.length ? ' and separate qualified V2 support' : ''} for ${platform}`)
