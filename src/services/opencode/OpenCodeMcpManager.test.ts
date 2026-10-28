@@ -635,6 +635,185 @@ describe('OpenCodeMcpManager', () => {
     })
   })
 
+  test('passes explicit remote authorization without putting it in the URL', async () => {
+    const authorization = `Bearer ${'a'.repeat(48)}`
+    const result = await resolveOpenCodeAppMcpLaunchConfig({ env: {
+      CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL: 'http://127.0.0.1:41001/mcp#agent-teams-app',
+      CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_HEADERS_JSON: JSON.stringify({ Authorization: authorization }),
+    } })
+    expect(result.config.headers).toEqual({ Authorization: authorization })
+    expect(result.config.url).toBe('http://127.0.0.1:41001/mcp#agent-teams-app')
+    expect(result.config.oauth).toBe(false)
+  })
+
+  test('fails closed on malformed headers and credentialed URLs without exposing credentials', async () => {
+    const secret = 'TEST-secret-value-must-not-appear-in-errors'
+    const authorization = `Bearer ${secret}`
+    for (const [url, headers] of [
+      ['http://127.0.0.1:41001/mcp', `{ "Authorization": "${secret}`],
+      ['http://127.0.0.1:41001/mcp', JSON.stringify({ Authorization: authorization, Cookie: secret })],
+      ['http://127.0.0.1:41001/mcp', JSON.stringify({ Authorization: 'Bearer short' })],
+      ['http://127.0.0.1:41001/mcp', JSON.stringify({ Authorization: `${authorization}\r\nInjected: value` })],
+      ['http://127.0.0.1:41001/mcp?token=legacy', JSON.stringify({ Authorization: authorization })],
+      ['http://user:password@127.0.0.1:41001/mcp', JSON.stringify({ Authorization: authorization })],
+      ['', JSON.stringify({ Authorization: authorization })],
+    ]) {
+      let thrown: unknown
+      try {
+        await resolveOpenCodeAppMcpLaunchConfig({ env: {
+          CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL: url,
+          CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_HEADERS_JSON: headers,
+          CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY: '/TEST/never-use-unauthenticated-fallback.js',
+        }, pathExists: async () => false })
+      } catch (error) { thrown = error }
+      expect(thrown).toBeInstanceOf(Error)
+      expect(String(thrown)).toContain('exactly one Authorization Bearer header')
+      expect(String(thrown)).not.toContain(secret)
+    }
+  })
+
+  test('reattaches on authorization rotation and keeps diagnostics free of authorization values', async () => {
+    const oldAuthorization = `Bearer ${'o'.repeat(48)}`
+    const authorization = `Bearer ${'n'.repeat(48)}`
+    const url = 'http://127.0.0.1:41001/mcp'
+    let current: Record<string, Record<string, unknown>> = {
+      'agent-teams': { connected: true, type: 'remote', url, headers: { Authorization: oldAuthorization } },
+    }
+    const calls: string[] = []
+    const manager = new OpenCodeMcpManager({ env: {
+      CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL: url,
+      CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_HEADERS_JSON: JSON.stringify({ Authorization: authorization }),
+    }, clientFactory: { create: () => ({
+      getMcp: async () => current,
+      getConfig: async () => ({ mcp: current }),
+      addMcp: async (_name, config) => {
+        calls.push(config.headers!.Authorization!)
+        current = { 'agent-teams': { ...config, connected: true } }
+        return current
+      },
+    }) } })
+    const first = await manager.ensureAppMcp({ baseUrl: 'http://127.0.0.1:4096', attachIfMissing: true })
+    const second = await manager.ensureAppMcp({ baseUrl: 'http://127.0.0.1:4096', attachIfMissing: true })
+    expect(calls).toEqual([authorization])
+    expect(first.summary.status).toBe('attached')
+    expect(second.summary.status).toBe('present')
+    expect(JSON.stringify(first.summary)).not.toContain(authorization)
+    expect(JSON.stringify(first.summary)).not.toContain(oldAuthorization)
+  })
+
+  test('serializes concurrent credential rotation without deduping the new generation', async () => {
+    const oldAuthorization = `Bearer ${'a'.repeat(48)}`
+    const newAuthorization = `Bearer ${'b'.repeat(48)}`
+    const env = {
+      CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL: 'http://127.0.0.1:41001/mcp',
+      CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_HEADERS_JSON: JSON.stringify({ Authorization: oldAuthorization }),
+    }
+    let current: Record<string, Record<string, unknown>> = {}
+    const attached: string[] = []
+    const manager = new OpenCodeMcpManager({ env, clientFactory: { create: () => ({
+      getMcp: async () => current,
+      addMcp: async (_name, config) => {
+        attached.push(config.headers!.Authorization!)
+        current = { 'agent-teams': { ...config, connected: true } }
+        return current
+      },
+    }) } })
+    const first = manager.ensureAppMcp({ baseUrl: 'http://127.0.0.1:4096', attachIfMissing: true })
+    env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_HEADERS_JSON = JSON.stringify({ Authorization: newAuthorization })
+    const second = manager.ensureAppMcp({ baseUrl: 'http://127.0.0.1:4096', attachIfMissing: true })
+    await Promise.all([first, second])
+    expect(attached).toEqual([oldAuthorization, newAuthorization])
+    expect(current['agent-teams']?.headers).toEqual({ Authorization: newAuthorization })
+  })
+
+  test('returns queued abort/deadline promptly while keeping later callers behind physical work', async () => {
+    const oldAuthorization = `Bearer ${'a'.repeat(48)}`
+    const newAuthorization = `Bearer ${'b'.repeat(48)}`
+    const env = {
+      CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL: 'http://127.0.0.1:41001/mcp',
+      CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_HEADERS_JSON: JSON.stringify({ Authorization: oldAuthorization }),
+    }
+    const entered = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<void>()
+    let current: Record<string, Record<string, unknown>> = {}
+    const attached: string[] = []
+    let creates = 0
+    const manager = new OpenCodeMcpManager({ env, clientFactory: { create: () => {
+      creates += 1
+      return {
+        getMcp: async () => current,
+        addMcp: async (_name, config) => {
+          if (config.headers?.Authorization === oldAuthorization) {
+            entered.resolve()
+            await release.promise
+          }
+          attached.push(config.headers!.Authorization!)
+          current = { 'agent-teams': { ...config, connected: true } }
+          return current
+        },
+      }
+    } } })
+    const first = manager.ensureAppMcp({ baseUrl: 'http://127.0.0.1:4096', attachIfMissing: true,
+      requestContext: { signal: new AbortController().signal } })
+    await entered.promise
+    env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_HEADERS_JSON = JSON.stringify({ Authorization: newAuthorization })
+    const second = manager.ensureAppMcp({ baseUrl: 'http://127.0.0.1:4096', attachIfMissing: true,
+      requestContext: { signal: new AbortController().signal } })
+    const aborted = new AbortController()
+    const third = manager.ensureAppMcp({ baseUrl: 'http://127.0.0.1:4096', attachIfMissing: true,
+      requestContext: { signal: aborted.signal } })
+    const fourth = manager.ensureAppMcp({ baseUrl: 'http://127.0.0.1:4096', attachIfMissing: true,
+      requestContext: { remainingMs: () => 1 } })
+    aborted.abort()
+    let fifthCompleted = false
+    let fifth: Promise<unknown> | undefined
+    try {
+      // These must reject before the delayed old attach is released.
+      const cancelled = await Promise.allSettled([third, fourth])
+      expect(cancelled.map(result => result.status)).toEqual(['rejected', 'rejected'])
+      expect(creates).toBe(1)
+      fifth = manager.ensureAppMcp({ baseUrl: 'http://127.0.0.1:4096', attachIfMissing: true })
+        .then(result => { fifthCompleted = true; return result })
+      await Promise.resolve()
+      expect(fifthCompleted).toBe(false)
+      expect(creates).toBe(1)
+    } finally {
+      release.resolve()
+    }
+    await Promise.all([first, second, fifth])
+    expect(creates).toBe(3)
+    expect(attached).toEqual([oldAuthorization, newAuthorization])
+    expect(current['agent-teams']?.headers).toEqual({ Authorization: newAuthorization })
+  })
+
+  test('rejects malformed explicit remote credentials before client construction', async () => {
+    let creates = 0
+    const manager = new OpenCodeMcpManager({ env: {
+      CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL: 'http://127.0.0.1:41001/mcp',
+      CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_HEADERS_JSON: '{invalid',
+    }, clientFactory: { create: () => {
+      creates += 1
+      return { getMcp: async () => ({}) }
+    } } })
+    await expect(manager.ensureAppMcp({ baseUrl: 'http://127.0.0.1:4096', attachIfMissing: true }))
+      .rejects.toThrow('exactly one Authorization Bearer header')
+    expect(creates).toBe(0)
+  })
+
+  test('does not expose an authenticated attach error that echoes the request', async () => {
+    const authorization = `Bearer ${'s'.repeat(48)}`
+    const manager = new OpenCodeMcpManager({ env: {
+      CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL: 'http://127.0.0.1:41001/mcp',
+      CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_HEADERS_JSON: JSON.stringify({ Authorization: authorization }),
+    }, clientFactory: { create: () => ({
+      getMcp: async () => ({}),
+      addMcp: async () => { throw new Error(`request rejected: ${authorization}`) },
+    }) } })
+    const result = await manager.ensureAppMcp({ baseUrl: 'http://127.0.0.1:4096', attachIfMissing: true })
+    expect(result.summary.status).toBe('attach_failed')
+    expect(result.summary.diagnostics).toEqual(['authenticated MCP request failed'])
+  })
+
   test('rejects invalid env override remote MCP URLs', async () => {
     await expect(
       resolveOpenCodeAppMcpLaunchConfig({
