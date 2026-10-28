@@ -35,7 +35,7 @@ def verify_delivery(tag):
         raise ValueError(f'Unsupported stable tag: {tag}')
     version = tag[1:]
     binary_tag = f'runtime-{tag}'
-    release = public_json(f'https://api.github.com/repos/{BINARIES}/releases/tags/{binary_tag}')
+    release = gh_json(f'repos/{BINARIES}/releases/tags/{binary_tag}')
     if release['draft'] or release['prerelease'] or release['tag_name'] != binary_tag:
         raise ValueError('Binary release is not the matching published stable release')
     base = f'https://github.com/{BINARIES}/releases/download/{binary_tag}/'
@@ -98,7 +98,10 @@ def promote(tag, apply=False, source_id=None):
         command('gh', 'api', '--method', 'PATCH',
                 f'repos/{SOURCE}/releases/{source["id"]}',
                 '-F', 'draft=false', '-f', 'make_latest=false')
-        published = public_json(f'https://api.github.com/repos/{SOURCE}/releases/tags/{tag}')
+        command('curl', '--fail', '--silent', '--show-error', '--location',
+                '--head', '--output', '/dev/null', '--retry', '3',
+                f'https://github.com/{SOURCE}/releases/tag/{tag}')
+        published = gh_json(f'repos/{SOURCE}/releases/{source_id}')
         if published['draft'] or published['prerelease']:
             raise ValueError('Source publication did not become public and stable')
     return {'tag': tag, 'status': 'published' if apply else 'ready', 'commit': commit}

@@ -24,6 +24,7 @@ class PromotionTest(unittest.TestCase):
                                 {'name': f'agent-teams-runtime-manifest-{self.tag}.json', 'size': 100},
                                 {'name': f'agent-teams-runtime-SHA256SUMS-{self.tag}', 'size': 100}])
         self.calls = []
+        self.published = False
 
     def public(self, url):
         if url.endswith('/releases/tags/' + self.tag):
@@ -31,10 +32,14 @@ class PromotionTest(unittest.TestCase):
         return self.manifest if url.endswith('.json') else self.release
 
     def gh(self, path):
-        return {'sha': self.sha} if '/commits/' in path else dict(id=42, tag_name=self.tag, draft=True, prerelease=False)
+        if promotion.BINARIES in path:
+            return self.release
+        return {'sha': self.sha} if '/commits/' in path else dict(id=42, tag_name=self.tag, draft=not self.published, prerelease=False)
 
     def command(self, *args):
         self.calls.append(args)
+        if 'PATCH' in args:
+            self.published = True
         if args[0] == 'curl' and '--head' not in args:
             return '\n'.join(f'{self.digest}  {a["file"]}' for a in self.assets.values())
         return ''
@@ -75,7 +80,7 @@ class PromotionTest(unittest.TestCase):
 
     def test_existing_public_source_is_unchanged(self):
         original = self.gh
-        self.gh = lambda path: original(path) if '/commits/' in path else dict(tag_name=self.tag, draft=False)
+        self.gh = lambda path: original(path) if '/commits/' in path or promotion.BINARIES in path else dict(tag_name=self.tag, draft=False)
         self.assertEqual(self.run_promotion()['status'], 'already-public')
         self.assertFalse(any('PATCH' in c for c in self.calls))
 
