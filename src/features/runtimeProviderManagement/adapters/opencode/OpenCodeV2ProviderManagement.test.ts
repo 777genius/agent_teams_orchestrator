@@ -2,7 +2,7 @@ import { mkdtemp, readdir, readFile, rm, stat } from 'node:fs/promises'
 import path from 'node:path'
 import { tmpdir } from 'node:os'
 import { test, expect } from 'bun:test'
-import { buildOpenCodeV2RuntimeProviderModel, openCodeV2ConnectionIDs, requireOpenCodeV2OwnedConnection, rollbackOpenCodeV2OwnedConnection, retireOpenCodeV2CatalogOwner, recordOpenCodeV2ProviderFailure } from './OpenCodeV2ProviderManagement.js'
+import { openCodeV2ModelTestMessage, buildOpenCodeV2RuntimeProviderModel, openCodeV2ConnectionIDs, requireOpenCodeV2OwnedConnection, rollbackOpenCodeV2OwnedConnection, retireOpenCodeV2CatalogOwner, recordOpenCodeV2ProviderFailure } from './OpenCodeV2ProviderManagement.js'
 import type { OpenCodeAuthCredential } from '../../../../services/opencode/OpenCodeAuthStore.js'
 const empty = { id: 'groq', methods: [{ type: 'key' }], connections: [] }
 const connection = { ...empty, connections: [{ type: 'credential', id: 'cred_original', label: 'Groq' }] }
@@ -128,4 +128,12 @@ test('a provider intent marker of this user is accepted on Windows, where files 
     expect(isOwnedProviderIntentMarker(marker({ mode: 0o100644 }), 'linux')).toBe(false)
     expect(isOwnedProviderIntentMarker(marker({ uid: process.getuid() + 1 }), 'darwin')).toBe(false)
   }
+})
+
+test('model test distinguishes terminal failure from pending without exposing raw provider errors', () => {
+  expect(openCodeV2ModelTestMessage(false, 'failed')).toContain('execution failed')
+  expect(openCodeV2ModelTestMessage(false, 'failed')).not.toContain('is pending')
+  expect(openCodeV2ModelTestMessage(false, 'pending')).toContain('pending or unverified')
+  expect(openCodeV2ModelTestMessage(false, 'available')).not.toContain('verified.')
+  expect(openCodeV2ModelTestMessage(true, 'available')).toContain('physical retirement verified')
 })
