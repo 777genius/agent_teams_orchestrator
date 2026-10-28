@@ -38,6 +38,8 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/TEST-ci-policy"
           TMPDIR="$RUNNER_TEMP/TEST-ci-policy" node --test scripts/ci/policy.test.ts
+      - name: Test source release publication contracts
+        run: python3 -m unittest discover -s scripts/release -p 'test_*.py'
       - name: Classify event changes
         id: scope
         env:
