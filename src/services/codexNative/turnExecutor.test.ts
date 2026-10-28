@@ -1183,6 +1183,7 @@ requires_openai_auth = true
   test('records an assistant API error when native execution completes without assistant output', async () => {
     const params = baseParams({
       persistSession: true,
+      conversationScope: 'group', // This case tests host projection, not direct continuity.
     })
     const persistenceCalls: string[] = []
     const messages = await collectMessages(
@@ -1317,6 +1318,7 @@ requires_openai_auth = true
         },
       ],
       persistSession: true,
+      conversationScope: 'group', // This case tests host projection, not direct continuity.
     })
 
     const transcriptSnapshots: number[] = []
@@ -1477,6 +1479,7 @@ requires_openai_auth = true
   test('records explicit hydration-required history truth for persistent native runs', async () => {
     const params = baseParams({
       persistSession: true,
+      conversationScope: 'group', // This case tests host projection, not direct continuity.
     })
 
     const iterator = executeTurn(params, {

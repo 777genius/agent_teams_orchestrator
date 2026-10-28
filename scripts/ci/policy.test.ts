@@ -47,6 +47,18 @@ test('event ranges distinguish PR merge base, push before/head and new branches'
   assert.throws(() => diffArgs('pull_request', '0'.repeat(40), head))
 })
 
+test('native Codex conversation and transport changes retain Windows process/storage checks', () => {
+  for (const path of [
+    'src/services/codexNative/execRunner.ts',
+    'src/services/codexNative/appServerRunner.ts',
+    'src/services/codexNative/conversationBinding.ts',
+    'src/services/codexNative/nativeHomeOverlay.test.ts',
+  ]) {
+    assert.equal(classify([path]).native, 'true', path)
+    assert.deepEqual(JSON.parse(classify([path]).authority_os), ['ubuntu-latest', 'windows-latest'])
+  }
+})
+
 test('effective model ownership and fixture changes retain both native authority lanes', () => {
   for (const path of [
     'src/services/runtimeBackends/effectiveDefaultModel.ts',

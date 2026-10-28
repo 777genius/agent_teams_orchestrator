@@ -36,6 +36,7 @@ import { query } from './query.js'
 import { categorizeRetryableAPIError } from './services/api/errors.js'
 import type { MCPServerConnection } from './services/mcp/types.js'
 import { createCodexAppServerApprovalPromptHandler } from './services/codexNative/approvalPromptBridge.js'
+import type { CodexNativeConversationScope } from './services/codexNative/conversationScope.js'
 import { executeCodexNativeTurn } from './services/codexNative/turnExecutor.js'
 import { resolveCodexRuntimeSelection } from './services/runtimeBackends/codexBackendResolver.js'
 import type { AppState } from './state/AppState.js'
@@ -220,7 +221,7 @@ export class QueryEngine {
 
   async *submitMessage(
     prompt: string | ContentBlockParam[],
-    options?: { uuid?: string; isMeta?: boolean },
+    options?: { uuid?: string; isMeta?: boolean; conversationScope?: CodexNativeConversationScope },
   ): AsyncGenerator<SDKMessage, void, unknown> {
     const {
       cwd,
@@ -695,6 +696,7 @@ export class QueryEngine {
 
       const nativeSummary = yield* executeCodexNativeTurn({
         prompt,
+        conversationScope: options?.conversationScope ?? 'direct',
         jsonSchema,
         cwd,
         model: mainLoopModel,
@@ -1287,6 +1289,7 @@ export async function* ask({
   prompt,
   promptUuid,
   isMeta,
+  conversationScope,
   cwd,
   tools,
   mcpClients,
@@ -1318,6 +1321,7 @@ export async function* ask({
   prompt: string | Array<ContentBlockParam>
   promptUuid?: string
   isMeta?: boolean
+  conversationScope?: CodexNativeConversationScope
   cwd: string
   tools: Tools
   verbose?: boolean
@@ -1387,6 +1391,7 @@ export async function* ask({
     yield* engine.submitMessage(prompt, {
       uuid: promptUuid,
       isMeta,
+      conversationScope,
     })
   } finally {
     setReadFileCache(engine.getReadFileState())
