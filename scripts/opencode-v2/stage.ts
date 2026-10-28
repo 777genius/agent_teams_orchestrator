@@ -253,6 +253,9 @@ export async function stageOpenCodeV2Graphs(sourceRoot: string, bundleDirectory:
     ? { ...installed, versions: selectOpenCodeV2StageVersions(installed.versions, options.qualifiedPlatform) }
     : installed
   if (plan.versions.length === 0) throw new Error('No OpenCode V2 engine is qualified for this release platform')
+  // A portable hoisted install may be shared through node_modules itself. Freeze
+  // its physical root once; individual packages still cannot leave that root.
+  const installRoot = options.portable ? await realpath(path.join(sourceRoot, 'node_modules')) : path.join(sourceRoot, 'node_modules')
   await verifyGraphs(sourceRoot, undefined, plan)
   await mkdir(destination, { recursive: true })
   const stagedTarget = { platform: options.platform ?? process.platform, arch: options.arch ?? process.arch }
@@ -272,7 +275,7 @@ export async function stageOpenCodeV2Graphs(sourceRoot: string, bundleDirectory:
     if (existing) return existing
     const info = await metadata(source)
     const id = createHash('sha256').update(path.relative(sourceRoot, source)).digest('hex').slice(0, 24)
-    const physicalRelative = path.relative(path.join(sourceRoot, 'node_modules'), source)
+    const physicalRelative = path.relative(installRoot, source)
     if (options.portable && (physicalRelative.startsWith('..') || path.isAbsolute(physicalRelative))) {
       throw new Error('Portable graph escaped the hoisted install')
     }
