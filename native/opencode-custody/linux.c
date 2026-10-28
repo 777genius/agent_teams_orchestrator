@@ -30,7 +30,7 @@ static char *fields[MAX_FIELDS];
 static pid_t native_pid = -1;
 static int process_fd = -1, image_fd = -1, dead = 0;
 static int native_status = 0;
-static int root_exited = 0;
+static int root_exited = 0, startup_failed = 0;
 static struct stat image_stat;
 static char native_birth[32], epoch[65];
 static char *image_path;
@@ -47,6 +47,10 @@ static int full_write(int fd, const void *data, size_t n) {
   while (n) { ssize_t k = write(fd, p, n); if (k <= 0) return 0; p += k; n -= (size_t)k; }
   return 1;
 }
+static void free_fields(unsigned count) {
+  for (unsigned i = 0; i < count; i++) { free(fields[i]); fields[i] = NULL; }
+}
+static unsigned invalid_fields(unsigned count) { free_fields(count); return 0; }
 static unsigned read_fields(int fd, unsigned ceiling) {
   uint32_t length;
   if (!full_read(fd, &length, 4)) return 0;
@@ -54,10 +58,10 @@ static unsigned read_fields(int fd, unsigned ceiling) {
   if (!n || n > ceiling || !full_read(fd, packet, n)) return 0;
   unsigned count = 0, offset = 0;
   while (offset < n) {
-    if (count == MAX_FIELDS || offset + 4 > n) return 0;
+    if (count == MAX_FIELDS || offset + 4 > n) return invalid_fields(count);
     uint32_t encoded; memcpy(&encoded, packet + offset, 4); offset += 4;
     unsigned size = ntohl(encoded);
-    if (size > n - offset || memchr(packet + offset, 0, size)) return 0;
+    if (size > n - offset || memchr(packet + offset, 0, size)) return invalid_fields(count);
     /* Move fields into independent buffers: a terminator must not overwrite the next length. */
     fields[count] = malloc((size_t)size + 1);
     if (!fields[count]) fail();
@@ -66,10 +70,31 @@ static unsigned read_fields(int fd, unsigned ceiling) {
   }
   return count;
 }
-static void free_fields(unsigned count) { for (unsigned i = 0; i < count; i++) free(fields[i]); }
 static int reply(int fd, const char *data) {
   uint32_t n = htonl((uint32_t)strlen(data));
   return full_write(fd, &n, 4) && full_write(fd, data, strlen(data));
+}
+/* Own and close the pre-exec pipe on every result. EOF means CLOEXEC completed;
+ * an error byte, invalid event, or absolute monotonic deadline refuses launch. */
+static int await_exec_result(int fd, unsigned milliseconds) {
+  struct timespec start, now;
+  int accepted = 0;
+  if (clock_gettime(CLOCK_MONOTONIC, &start)) { close(fd); return 0; }
+  for (;;) {
+    if (clock_gettime(CLOCK_MONOTONIC, &now)) break;
+    long long elapsed = (now.tv_sec - start.tv_sec) * 1000LL + (now.tv_nsec - start.tv_nsec) / 1000000LL;
+    if (elapsed >= (long long)milliseconds) break;
+    struct pollfd ready = { .fd = fd, .events = POLLIN | POLLHUP };
+    int result = poll(&ready, 1, (int)((long long)milliseconds - elapsed));
+    if (result < 0 && errno == EINTR) continue;
+    if (result <= 0 || (ready.revents & (POLLERR | POLLNVAL))) break;
+    if (!(ready.revents & (POLLIN | POLLHUP))) break;
+    unsigned char failure;
+    ssize_t bytes = read(fd, &failure, 1);
+    if (bytes < 0 && errno == EINTR) continue;
+    accepted = bytes == 0; break;
+  }
+  close(fd); return accepted;
 }
 static unsigned long long number(const char *s) {
   if (!*s || strlen(s) > 20) fail();
@@ -162,6 +187,34 @@ static int stop_exact(void) {
   if (wait_exit(750)) return 1;
   if (syscall(SYS_pidfd_send_signal, process_fd, SIGKILL, NULL, 0) < 0 && errno != ESRCH) return 0;
   return wait_exit(2500);
+}
+/* Before publication, the original fork plus its held pidfd own this creation
+ * even if exec never completed. Do not require the post-exec image to roll it back. */
+static int stop_created(void) {
+  if (observe_exit()) return 1;
+  if (process_fd < 0) return 0;
+  if (syscall(SYS_pidfd_send_signal, process_fd, SIGKILL, NULL, 0) < 0 && errno != ESRCH) return 0;
+  return wait_exit(2500);
+}
+static void close_launch_resources(int listener) {
+  close(listener);
+  if (process_fd >= 0) { close(process_fd); process_fd = -1; }
+  if (image_fd >= 0) { close(image_fd); image_fd = -1; }
+  close(5);
+  free(image_path); image_path = NULL;
+}
+static void failed_creation(int listener, unsigned count, int signalled_without_pidfd) {
+  startup_failed = 1;
+  int closed = signalled_without_pidfd ? wait_exit(2500) : stop_created();
+  char result[96]; snprintf(result, sizeof(result), "{\"protocol\":1,\"closed\":%s,\"status\":%d}", closed ? "true" : "false", native_status);
+  (void)reply(STDOUT_FILENO, result);
+  free_fields(count);
+  // A deadline does not release an uncertain child or its original custody.
+  while (!closed) {
+    struct timespec pause = { .tv_nsec = 100000000 }; nanosleep(&pause, NULL);
+    closed = observe_exit();
+  }
+  close_launch_resources(listener);
 }
 static unsigned socket_inodes(unsigned long long *out, int *descriptors) {
   char directory[64]; snprintf(directory, sizeof(directory), "/proc/%d/fd", native_pid);
@@ -309,24 +362,31 @@ static void launch(unsigned count, int measurement) {
   close(exec_error[1]);
   close(3); close(4);
   process_fd = (int)syscall(SYS_pidfd_open, native_pid, 0);
-  if (process_fd < 0) { /* The unreaped original child still owns this number. */ kill(native_pid, SIGKILL); waitpid(native_pid, NULL, 0); fail(); }
-  if (!birth(native_pid, native_birth)) { (void)syscall(SYS_pidfd_send_signal, process_fd, SIGKILL, NULL, 0); waitpid(native_pid, NULL, 0); fail(); }
-  int failure; ssize_t error_size = read(exec_error[0], &failure, sizeof(failure)); close(exec_error[0]);
-  if (error_size != 0) { stop_exact(); fail(); }
+  if (process_fd < 0) {
+    /* Creation-owned rollback only: this single-threaded parent has never reaped
+     * its original fork, so that child's number cannot have been reassigned.
+     * No public/recovered action can use this narrow pre-publication branch. */
+    (void)kill(native_pid, SIGKILL); close(exec_error[0]);
+    failed_creation(listener, count, 1); return;
+  }
+  if (!birth(native_pid, native_birth)) {
+    close(exec_error[0]); failed_creation(listener, count, 0); return;
+  }
+  if (!await_exec_result(exec_error[0], 5000)) { failed_creation(listener, count, 0); return; }
   if (measurement) {
     int closed = wait_exit(5000);
     if (!closed) { (void)syscall(SYS_pidfd_send_signal, process_fd, SIGKILL, NULL, 0); closed = wait_exit(2500); }
     char measured[96]; snprintf(measured, sizeof(measured), "{\"protocol\":1,\"closed\":%s,\"status\":%d}", closed ? "true" : "false", native_status);
     if (closed) {
-      close(listener); close(process_fd); close(image_fd); free_fields(count);
+      close_launch_resources(listener); free_fields(count);
       if (!reply(STDOUT_FILENO, measured)) fail();
       return;
     }
     (void)reply(STDOUT_FILENO, measured); /* Uncertain probe stays captured below. */
-  } else if (!verify_child()) { stop_exact(); fail(); }
+  } else if (!verify_child()) { failed_creation(listener, count, 0); return; }
   char started[32], output[256]; if (!birth(getpid(), started)) fail();
   snprintf(output, sizeof(output), "{\"protocol\":1,\"pid\":%d,\"birth\":\"%s\",\"custodianPid\":%d,\"custodianBirth\":\"%s\"}", native_pid, native_birth, getpid(), started);
-  if (!measurement && !reply(STDOUT_FILENO, output)) { stop_exact(); fail(); }
+  if (!measurement && !reply(STDOUT_FILENO, output)) { failed_creation(listener, count, 0); return; }
   int persistent = !measurement && !strcmp(fields[4], "persistent"); free_fields(count);
   struct pollfd ready[2] = {{ .fd = listener, .events = POLLIN }, { .fd = STDIN_FILENO, .events = POLLIN | POLLHUP }};
   while (!observe_exit()) {
@@ -351,7 +411,9 @@ static void launch(unsigned count, int measurement) {
     }
     close(client); free_fields(command);
   }
-  close(listener); close(process_fd); close(image_fd);
+  // Failed ephemeral/poll cleanup cannot drop an original live custody object.
+  while (!observe_exit()) { struct timespec pause = { .tv_nsec = 100000000 }; nanosleep(&pause, NULL); }
+  close_launch_resources(listener);
 }
 static void control(unsigned count) {
   /* control, custodian PID/birth, helper dev/ino, epoch, nonce, action, ... */
@@ -386,5 +448,6 @@ int main(void) {
   else if (!strcmp(fields[0], "measure")) launch(count, 1);
   else if (!strcmp(fields[0], "control")) control(count);
   else fail();
+  if (startup_failed) return 112;
   return native_pid > 0 && WIFEXITED(native_status) ? WEXITSTATUS(native_status) : 0;
 }

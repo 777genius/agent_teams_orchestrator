@@ -29,6 +29,11 @@ describe.skipIf(process.platform !== 'linux')('physical Linux native custody', (
     helper = path.join(root, 'source-custodian'); original = path.join(root, 'installer-A'); replacement = path.join(root, 'installer-B')
     const source = path.resolve(import.meta.dir, '../../../..', 'native/opencode-custody')
     const options = { timeout: 60000 }
+    const failurePaths = path.join(root, 'TEST-failurepaths')
+    await execute('/usr/bin/cc', ['-std=c11', '-Wall', '-Wextra', '-Werror', '-O2',
+      path.join(source, 'failurepaths.test.c'), '-o', failurePaths], options)
+    const checked = await execute(failurePaths, [], { timeout: 5000, cwd: root, env: {} })
+    expect(checked.stdout.trim()).toBe('TEST native helper finite failure paths passed')
     const staged = process.env.OPENCODE_NATIVE_CUSTODY_TEST_HELPER
     if (staged) {
       expect(path.isAbsolute(staged) && await realpath(staged) === staged).toBe(true)
