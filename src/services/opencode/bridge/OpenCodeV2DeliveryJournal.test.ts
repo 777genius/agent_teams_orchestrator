@@ -162,8 +162,8 @@ describe('V2 composition with the existing durable app outcome authority', () =>
       } })
     try {
       const request = { operation: 'send' as const, memberId: 'worker', originalSessionId: sessionId, intent }
-      expect((await bridge().send(request, base, 5000)).accepted).toBe(false)
-      expect((await bridge().send(request, base, 5000)).accepted).toBe(false)
+      expect(await bridge().send(request, base, 5000)).toMatchObject({ accepted: false })
+      expect((await bridge().send(request, base, 5000)).promptNotSubmitted).toBeUndefined()
       expect(operations).toEqual(['send', 'observe'])
     } finally { await f.close() }
   })
@@ -177,7 +177,12 @@ test('stale unreserved refusal cannot release a newer immutable-input submission
       authority: admission('prepared').authority, intent }
     const first = await f.journal.reserve(base, sessionId, identity, executionHash(intent))
     expect(first.action).toBe('submit')
-    await f.journal.refuse(base, sessionId, intent, { ...refused, submissionOwner: first.submissionOwner }, first.submissionOwner)
+    const refusal = await f.journal.refuse(base, sessionId, intent, { ...refused, submissionOwner: first.submissionOwner }, first.submissionOwner)
+    // The desktop must retry this proven never-reserved input, not observe a
+    // native input that the owner has positively proved does not exist.
+    expect(refusal).toMatchObject({ accepted: false, promptNotSubmitted: true })
+    expect((await f.journal.query({ requestId: identity.requestId })).record).toMatchObject({
+      status: 'failed_before_accept', safeToRetry: true })
     let current = first
     // Retry metadata remains usable past the shared diagnostics retention cap.
     for (let i = 0; i < 45; i++) {

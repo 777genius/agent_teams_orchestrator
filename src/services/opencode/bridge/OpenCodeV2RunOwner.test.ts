@@ -793,7 +793,7 @@ describe('durable owner refusal crosses authenticated control and app journal', 
         await expect(send(next)).rejects.toThrow('run_control_disconnected')
         expect((await bridge().queryOutcome({ requestId: next.identity.requestId })).record?.safeToRetry).toBe(false)
       }
-      expect((await send(next)).accepted).toBe(false)
+      expect(await send(next)).toMatchObject({ accepted: false, promptNotSubmitted: true })
       expect((await bridge().queryOutcome({ requestId: next.identity.requestId })).record).toMatchObject({
         status: 'failed_before_accept', safeToRetry: true, runtimePromptMessageId: next.identity.nativeInputID })
       expect((await (await f.store()).snapshot()).admissions).toHaveLength(1)
@@ -864,7 +864,9 @@ test('lost send response after native invocation stays fenced and a fresh bridge
     await expect(send()).rejects.toThrow('run_control_disconnected')
     expect((await bridge().queryOutcome({ requestId: intent.identity.requestId })).record).toMatchObject({
       status: 'prompt_submitting', safeToRetry: false })
-    expect((await send()).accepted).toBe(false)
+    const recovered = await send()
+    expect(recovered.accepted).toBe(false)
+    expect(recovered.promptNotSubmitted).toBeUndefined()
     expect(operations).toEqual(['send', 'observe'])
     expect(f.counters.prompted).toBe(1)
     expect((await (await f.store()).snapshot()).admissions[0]?.state).toBe('unknown')

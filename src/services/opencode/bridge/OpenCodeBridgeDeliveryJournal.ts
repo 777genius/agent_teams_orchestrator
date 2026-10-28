@@ -15,6 +15,8 @@ export type TeamDiagnostic = {
 
 export type SendMessageCommandData = {
   accepted: boolean
+  /** Trusted owner proved this exact input was never reserved or submitted. */
+  promptNotSubmitted?: true
   runId?: string
   sessionId?: string
   memberName: string

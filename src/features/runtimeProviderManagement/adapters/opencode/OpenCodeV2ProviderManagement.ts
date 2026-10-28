@@ -294,6 +294,13 @@ export function buildOpenCodeV2KeySetupForm(providerId: string, version: OpenCod
     verification: { kind: 'model-request', freeModelPreferred: false, mayUseQuotaOrBalance: true } }
 }
 
+/** Terminal failures must not be presented as an execution still in progress. */
+export function openCodeV2ModelTestMessage(ok: boolean, state: string): string {
+  if (ok) return 'Selected V2 model execution and physical retirement verified.'
+  if (state === 'failed') return 'The original selected-model execution failed. No alternate input was submitted. Check provider limits and connection diagnostics.'
+  return 'Original selected-model execution is pending or unverified; no alternate input was submitted.'
+}
+
 export async function testOpenCodeV2ProviderModel(input: TestProviderModelInput): Promise<ProviderManagementResult<ProviderModelTestResult>> {
   try {
     const project = await canonicalizeOpenCodeProjectPath(input.projectPath)
@@ -301,7 +308,7 @@ export async function testOpenCodeV2ProviderModel(input: TestProviderModelInput)
     const proof = await executionProof(project, input.modelId)
     const ok = proof.state === 'available' && proof.proof?.modelId === input.modelId && proof.proof.projectPath === project
     return { ok: true, value: { providerId: input.providerId, modelId: input.modelId, ok,
-      availability: ok ? 'available' : 'unknown', message: ok ? 'Selected V2 model execution and physical retirement verified.' : 'Original selected-model execution is pending; no alternate input was submitted.', diagnostics: [] } }
+      availability: ok ? 'available' : 'unknown', message: openCodeV2ModelTestMessage(ok, proof.state), diagnostics: [] } }
   } catch (error) { return resultError('runtime-unhealthy', openCodeV2Refusal(error)?.message ?? 'V2 selected-model execution could not be qualified. No alternate model was tried.') }
 }
 
