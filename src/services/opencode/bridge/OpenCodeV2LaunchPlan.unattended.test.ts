@@ -172,9 +172,9 @@ for (const version of ['2.0.0', '2.0.32'] as const) test(`${version} admits Linu
       expect(selection.model).toEqual({ providerID: 'provider', id: 'model' })
     }
     expect(nativeSelectionCalls).toBe(2)
-    // Windows execution ships for x64 only.
+    // Windows execution still refuses unsupported 32-bit hosts.
     Object.defineProperty(process, 'platform', { ...platform, value: 'win32' })
-    Object.defineProperty(process, 'arch', { ...arch, value: 'arm64' })
+    Object.defineProperty(process, 'arch', { ...arch, value: 'ia32' })
     await expect(inspectOpenCodeV2SourceAvailability(envelope())).rejects.toThrow('execution_platform_unsupported')
     Object.defineProperty(process, 'arch', arch)
     Object.defineProperty(process, 'platform', { ...platform, value: 'darwin' })
@@ -217,9 +217,9 @@ for (const version of ['2.0.0', '2.0.32'] as const) test(`${version} team launch
   try {
     Object.defineProperty(process, 'platform', { ...platform, value: 'win32' })
     Object.defineProperty(process, 'arch', { ...arch, value: 'arm64' })
-    // No V2 version is qualified on Windows arm64, so launch refuses before any process work.
+    // These older engines remain unqualified on Windows ARM64; refuse before process work.
     await expect(launchExplicitOpenCodeV2Run(plan)).rejects.toThrow('opencode_v2_version_unqualified')
-    await expect(startOpenCodeV2RunSupervisor(plan, '/TEST-unqualified', 'TEST')).rejects.toThrow('execution_platform_unsupported')
+    await expect(startOpenCodeV2RunSupervisor(plan, '/TEST-unqualified', 'TEST')).rejects.toThrow('opencode_v2_version_unqualified')
   } finally { Object.defineProperty(process, 'platform', platform); Object.defineProperty(process, 'arch', arch) }
   // A permitted host still cannot launch the fixture's unqualified Bun bytes.
   await expect(launchExplicitOpenCodeV2Run(plan)).rejects.toThrow('run_source_changed')

@@ -5,6 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { unzipSync } from 'fflate'
 import { inventoryOpenCodeV2Delivery, packageOpenCodeV2Delivery } from './delivery.js'
+import { validateOpenCodeV2DeliveryDescriptor } from '../../src/services/opencode/host/OpenCodeV2DeliveryContract.js'
 
 const sha = (bytes: Uint8Array | string) => createHash('sha256').update(bytes).digest('hex')
 async function fixture() {
@@ -55,7 +56,23 @@ test('a payload with an unqualified or incomplete engine roster never publishes 
   try {
     await writeFile(path.join(f.local, 'opencode-v2-graphs.json'), JSON.stringify({ platform: 'linux', arch: 'x64', graphs: [{ version: '2.1.4' }] }))
     await expect(packageOpenCodeV2Delivery(f.options)).rejects.toThrow('graph roster mismatch')
-    await expect(packageOpenCodeV2Delivery({ ...f.options, platformKey: 'win32-arm64' })).rejects.toThrow('not qualified')
+    await expect(packageOpenCodeV2Delivery({ ...f.options, platformKey: 'win32-ia32' })).rejects.toThrow('not qualified')
+  } finally { await rm(f.root, { recursive: true, force: true }) }
+})
+
+test('Windows ARM64 support binds its own architecture, Bun and exact engine roster', async () => {
+  const f = await fixture()
+  try {
+    await writeFile(path.join(f.local, 'opencode-v2-graphs.json'), JSON.stringify({
+      schema: 2, platform: 'win32', arch: 'arm64', graphs: [{ version: '2.1.4' }],
+    }))
+    const descriptor = await packageOpenCodeV2Delivery({ ...f.options, platformKey: 'win32-arm64' })
+    expect(descriptor).toMatchObject({ platform: 'win32', arch: 'arm64', requiredBunVersion: '1.4.3',
+      engineVersions: ['2.1.4'], archive: { file: 'agent-teams-opencode-v2-support-win32-arm64-v0.0.999.zip' } })
+    expect(validateOpenCodeV2DeliveryDescriptor(descriptor)).toEqual(descriptor)
+    expect(() => validateOpenCodeV2DeliveryDescriptor({ ...descriptor, arch: 'x64' })).toThrow()
+    expect(() => validateOpenCodeV2DeliveryDescriptor({ ...descriptor, requiredBunVersion: '1.3.11' })).toThrow()
+    await expect(packageOpenCodeV2Delivery({ ...f.options, platformKey: 'win32-x64' })).rejects.toThrow('graph roster mismatch')
   } finally { await rm(f.root, { recursive: true, force: true }) }
 })
 

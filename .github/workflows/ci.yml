@@ -380,6 +380,10 @@ jobs:
             platform: win32-x64
             executable: claude-multimodel.exe
             binary: dist/cli.exe
+          - os: windows-11-arm
+            platform: win32-arm64
+            executable: claude-multimodel.exe
+            binary: dist/cli.exe
     steps:
       - uses: actions/checkout@v6
         with:
@@ -391,12 +395,56 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: '24'
+      - name: Require the native target architecture
+        shell: bash
+        env:
+          CANDIDATE_PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          node -e 'if (`${process.platform}-${process.arch}` !== process.env.CANDIDATE_PLATFORM) throw new Error("Node is not native to the candidate platform")'
+          bun --no-install -e 'if (`${process.platform}-${process.arch}` !== process.env.CANDIDATE_PLATFORM) throw new Error("Bun is not native to the candidate platform")'
+      - name: Enable Windows long paths
+        if: runner.os == 'Windows'
+        run: git config --global core.longpaths true
       - name: Install frozen portable dependencies
         run: bun install --frozen-lockfile --linker hoisted
       - name: Test native compiled delegation and cancellation
-        run: bun test src/cli/packagedOpenCodeDelivery.test.ts scripts/opencode-v2/native-video.test.ts scripts/opencode-v2/stage.test.ts scripts/opencode-v2/stage-copy.test.ts scripts/opencode-v2/staged-files.test.ts src/services/opencode/host/OpenCodeV2ExecutionAuth.test.ts src/services/opencode/host/OpenCodeV2PlainExecution.test.ts src/services/opencode/profile/OpenCodeV2ExecutionConfig.test.ts src/services/opencode/host/OpenCodeV2ExecutionLifecycle.test.ts src/features/runtimeProviderManagement/adapters/opencode/OpenCodeV2ProviderManagement.test.ts
+        run: bun test src/cli/packagedOpenCodeDelivery.test.ts scripts/opencode-v2/native-video.test.ts scripts/opencode-v2/stage.test.ts scripts/opencode-v2/stage-copy.test.ts scripts/opencode-v2/staged-files.test.ts src/services/opencode/host/OpenCodeV2ExecutionAuth.test.ts src/services/opencode/host/OpenCodeV2ExecutionPlatform.test.ts src/services/opencode/host/OpenCodeV2PlainExecution.test.ts src/services/opencode/profile/OpenCodeV2ExecutionConfig.test.ts src/services/opencode/host/OpenCodeV2ExecutionLifecycle.test.ts src/features/runtimeProviderManagement/adapters/opencode/OpenCodeV2ProviderManagement.test.ts
+      - name: Test Windows receipt architecture admission
+        if: runner.os == 'Windows'
+        run: bun test src/services/opencode/profile/OpenCodeV2ExecutionReceipt.test.ts --test-name-pattern Windows
       - name: Produce physical JS and native front door
         run: bun --no-install scripts/package-runtime.ts --platform ${{ matrix.platform }}
+      - name: Verify the qualified native Windows OpenCode CLI
+        if: runner.os == 'Windows'
+        timeout-minutes: 5
+        shell: pwsh
+        env:
+          CANDIDATE_PLATFORM: ${{ matrix.platform }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $descriptor = Get-Content dist/opencode-v2-delivery.json -Raw | ConvertFrom-Json
+          $arch = $env:CANDIDATE_PLATFORM.Split('-')[1]
+          if ($descriptor.platform -cne 'win32' -or $descriptor.arch -cne $arch) { throw 'V2 candidate platform mismatch' }
+          $version = $descriptor.engineVersions[-1]
+          $packageName = "@opencode/cli-windows-$arch"
+          $root = Join-Path $env:RUNNER_TEMP "TEST-opencode-v2-cli-$arch"
+          npm install --prefix $root --ignore-scripts --no-audit --no-fund "${packageName}@${version}"
+          if ($LASTEXITCODE -ne 0) { throw 'Qualified native CLI install failed' }
+          $packageRoot = Join-Path $root "node_modules/$packageName"
+          $metadata = Get-Content (Join-Path $packageRoot 'package.json') -Raw | ConvertFrom-Json
+          if ($metadata.name -cne $packageName -or $metadata.version -cne $version) { throw 'Native CLI package identity mismatch' }
+          $binary = Join-Path $packageRoot 'bin/opencode.exe'
+          $bytes = [IO.File]::ReadAllBytes($binary)
+          if ($bytes.Length -lt 64 -or $bytes[0] -ne 0x4d -or $bytes[1] -ne 0x5a) { throw 'Native CLI DOS header mismatch' }
+          $pe = [BitConverter]::ToInt32($bytes, 0x3c)
+          if ($pe -lt 64 -or $pe + 6 -gt $bytes.Length -or [BitConverter]::ToUInt32($bytes, $pe) -ne 0x00004550) { throw 'Native CLI PE header mismatch' }
+          $machine = [BitConverter]::ToUInt16($bytes, $pe + 4)
+          $expectedMachine = if ($arch -ceq 'arm64') { 0xaa64 } else { 0x8664 }
+          if ($machine -ne $expectedMachine) { throw 'Native CLI PE architecture mismatch' }
+          $reported = (& $binary --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $reported -cnotin @($version, "opencode v$version")) { throw 'Native CLI version mismatch' }
+          @{ platform = $env:CANDIDATE_PLATFORM; package = $packageName; version = $reported; machine = ('0x{0:x4}' -f $machine); sha256 = (Get-FileHash $binary -Algorithm SHA256).Hash.ToLowerInvariant() } | ConvertTo-Json | Set-Content "native-v2-cli-$env:CANDIDATE_PLATFORM.json"
       - name: Verify and archive complete candidate delivery
         shell: bash
         env:
@@ -439,12 +487,18 @@ jobs:
           mkdir -p "$extracted/support"
           unzip -q "$extracted/$support_archive" -d "$extracted/support"
           "$shipped_bun" --no-install --no-env-file scripts/opencode-v2/packaged-server-smoke.ts "$extracted/runtime" "$extracted/support" "packaged-server-smoke-$CANDIDATE_PLATFORM.json"
-      - name: Preserve staged V2 server evidence
+          if [[ "$CANDIDATE_PLATFORM" == win32-* ]]; then
+            "$shipped_bun" --no-install --no-env-file scripts/opencode-v2/packaged-pty-smoke.ts "$extracted/runtime" "$extracted/support" "packaged-pty-smoke-$CANDIDATE_PLATFORM.json" "$CANDIDATE_PLATFORM"
+          fi
+      - name: Preserve staged V2 and native CLI evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: packaged-server-smoke-${{ matrix.platform }}-${{ github.event.pull_request.head.sha || github.sha }}
-          path: packaged-server-smoke-${{ matrix.platform }}.json
+          path: |
+            packaged-server-smoke-${{ matrix.platform }}.json
+            packaged-pty-smoke-${{ matrix.platform }}.json
+            native-v2-cli-${{ matrix.platform }}.json
           if-no-files-found: warn
           retention-days: 7
       - name: Preserve exact-head candidate archive

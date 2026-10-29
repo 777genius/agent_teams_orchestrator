@@ -86,10 +86,10 @@ function macho(dependencies: readonly string[], rpaths: readonly string[] = [], 
   return Buffer.concat([header, ...commands])
 }
 
-function peExecutable(payload = 'TEST canonical PE payload'): Buffer {
+function peExecutable(payload = 'TEST canonical PE payload', machine = 0x8664): Buffer {
   const image = Buffer.alloc(0x400), pe = 0x40, optional = pe + 24
   image.write('MZ', 0, 'ascii'); image.writeUInt32LE(pe, 0x3c)
-  image.write('PE\0\0', pe, 'ascii'); image.writeUInt16LE(0x8664, pe + 4); image.writeUInt16LE(1, pe + 6)
+  image.write('PE\0\0', pe, 'ascii'); image.writeUInt16LE(machine, pe + 4); image.writeUInt16LE(1, pe + 6)
   image.writeUInt16LE(240, pe + 20); image.writeUInt16LE(0x0022, pe + 22)
   image.writeUInt16LE(0x20b, optional); image.writeUInt32LE(0x200, optional + 36)
   image.writeUInt32LE(0x1000, optional + 32); image.writeUInt32LE(0x1000, optional + 16)
@@ -164,7 +164,7 @@ test.skipIf(process.platform !== 'darwin' || !process.env.OPENCODE_E2E_TEST_NODE
   } finally { await rm(f.root, { recursive: true, force: true }) }
 }, 120_000)
 
-async function receiptFixture(platform: NodeJS.Platform = 'darwin') {
+async function receiptFixture(platform: NodeJS.Platform = 'darwin', arch: string = process.arch) {
   const root = await realpath(await mkdtemp(path.join(tmpdir(), 'TEST-v2-receipt-admission-')))
   const writePackage = async (directory: string, name: string, entry: string, version = '1.0.0') => {
     await mkdir(path.join(directory, path.dirname(entry)), { recursive: true })
@@ -182,13 +182,14 @@ async function receiptFixture(platform: NodeJS.Platform = 'darwin') {
   const executablePath = path.join(nativeRoot, 'bin', executableName)
   await mkdir(path.dirname(executablePath), { recursive: true })
   await writeFile(path.join(nativeRoot, 'package.json'), JSON.stringify({
-    name: `@opencode/cli-${platform === 'win32' ? 'windows' : platform}-${process.arch}`, version: '2.0.32',
+    name: `@opencode/cli-${platform === 'win32' ? 'windows' : platform}-${arch}`, version: '2.0.32',
   }))
-  await writeFile(executablePath, platform === 'win32' ? peExecutable('TEST selected opencode.exe') : macho([]))
+  await writeFile(executablePath, platform === 'win32'
+    ? peExecutable('TEST selected opencode.exe', arch === 'arm64' ? 0xaa64 : 0x8664) : macho([]))
   const identity = {
     generation: 'v2' as const, version: '2.0.32' as const, dialect: 'v2-2.0.32' as const,
     executablePath, executableSha256: createHash('sha256').update(await readFile(executablePath)).digest('hex'),
-    packageName: `@opencode/cli-${platform === 'win32' ? 'windows' : platform}-${process.arch}`,
+    packageName: `@opencode/cli-${platform === 'win32' ? 'windows' : platform}-${arch}`,
   }
   const resolution = {
     '@opencode/server-v2.0.32/process': server,
@@ -225,12 +226,15 @@ async function callReceipt<T>(
   operation: (receipt: typeof import('./OpenCodeV2ExecutionReceipt.js')) => Promise<T>,
   readFile?: typeof fsPromises.readFile,
   platform: NodeJS.Platform = 'darwin',
+  arch: string = process.arch,
 ): Promise<T> {
   const platformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform')!
+  const archDescriptor = Object.getOwnPropertyDescriptor(process, 'arch')!
   const versions = process.versions as Record<string, unknown>
   const bunVersion = Object.getOwnPropertyDescriptor(process.versions, 'bun')
   const originalWhich = Bun.which, originalResolve = Bun.resolveSync
   Object.defineProperty(process, 'platform', { ...platformDescriptor, value: platform })
+  Object.defineProperty(process, 'arch', { ...archDescriptor, value: arch })
   Object.defineProperty(process.versions, 'bun', { configurable: true, value: openCodeBunVersion() })
   Bun.which = which as typeof Bun.which
   Bun.resolveSync = ((name: string) => {
@@ -249,6 +253,7 @@ async function callReceipt<T>(
       Bun.which = originalWhich
       Bun.resolveSync = originalResolve
       Object.defineProperty(process, 'platform', platformDescriptor)
+      Object.defineProperty(process, 'arch', archDescriptor)
       if (bunVersion) Object.defineProperty(process.versions, 'bun', bunVersion)
       else Reflect.deleteProperty(versions, 'bun')
     }
@@ -341,15 +346,15 @@ test('mandatory controller qualification and optional graph hash conflicts remai
   } finally { await rm(f.root, { recursive: true, force: true }) }
 })
 
-test.skipIf(process.arch !== 'x64')('Windows receipt admits a canonical x64 node.exe and hashes its complete inspected image', async () => {
-  const f = await receiptFixture('win32'), runtime = path.join(f.root, 'node.exe')
-  const image = peExecutable('TEST complete node.exe image including trailing evidence')
+test.each([['x64', 0x8664], ['arm64', 0xaa64]] as const)('Windows %s receipt admits native CLI and controller PE images and hashes their complete bytes', async (arch, machine) => {
+  const f = await receiptFixture('win32', arch), runtime = path.join(f.root, 'node.exe')
+  const image = peExecutable('TEST complete node.exe image including trailing evidence', machine)
   try {
     await writeFile(runtime, image)
     const receipt = await callReceipt(f, () => null,
       module => module.createOpenCodeV2ExecutionReceipt('/TEST-unused', f.identity, {
         type: 'local', command: [runtime, f.controllerEntry],
-      }), undefined, 'win32')
+      }), undefined, 'win32', arch)
     expect(receipt.executableSha256).toBe(f.identity.executableSha256)
     expect(receipt.graph.files).toContainEqual({
       path: runtime,
@@ -362,19 +367,21 @@ test.skipIf(process.arch !== 'x64')('Windows receipt admits a canonical x64 node
   } finally { await rm(f.root, { recursive: true, force: true }) }
 })
 
-test.skipIf(process.arch !== 'x64')('Windows receipt rejects malformed, truncated, wrong-architecture and DLL PE sources', async () => {
-  const malformed = peExecutable(), truncated = peExecutable().subarray(0, 0x50)
+test.each([['x64', 0x8664], ['arm64', 0xaa64]] as const)('Windows %s receipt rejects malformed, truncated, foreign-architecture and DLL PE sources', async (arch, machine) => {
+  const malformed = peExecutable(undefined, machine), truncated = peExecutable(undefined, machine).subarray(0, 0x50)
   malformed.writeUInt32LE(0x1000, 0x3c)
-  const wrongArchitecture = peExecutable(); wrongArchitecture.writeUInt16LE(0x014c, 0x44)
-  const dll = peExecutable(); dll.writeUInt16LE(0x2022, 0x56)
+  const wrongArchitecture = peExecutable(undefined, arch === 'arm64' ? 0x8664 : 0xaa64)
+  const unsupportedArchitecture = peExecutable(undefined, 0x014c)
+  const dll = peExecutable(undefined, machine); dll.writeUInt16LE(0x2022, 0x56)
   const cases = [
     { name: 'malformed', image: malformed, expected: 'native_selection_changed' },
     { name: 'truncated', image: truncated, expected: 'native_selection_changed' },
     { name: 'wrongarch', image: wrongArchitecture, expected: 'native_selection_changed' },
+    { name: 'unsupportedarch', image: unsupportedArchitecture, expected: 'native_selection_changed' },
     { name: 'dll', image: dll, expected: 'native_selection_changed' },
   ]
   for (const target of ['selected', 'controller'] as const) {
-    const f = await receiptFixture('win32')
+    const f = await receiptFixture('win32', arch)
     try {
       for (const testCase of cases) {
         const runtime = target === 'controller' ? path.join(f.root, 'node.exe') : f.identity.executablePath
@@ -383,13 +390,13 @@ test.skipIf(process.arch !== 'x64')('Windows receipt rejects malformed, truncate
           ? { ...f.identity, executablePath: runtime,
             executableSha256: createHash('sha256').update(testCase.image).digest('hex') }
           : f.identity
-        const expected = target === 'controller' && testCase.name === 'wrongarch'
+        const expected = target === 'controller' && ['wrongarch', 'unsupportedarch'].includes(testCase.name)
           ? 'controller_runtime_architecture_invalid'
           : target === 'controller' ? 'controller_runtime_pe_invalid' : testCase.expected
         await expect(callReceipt(f, () => null,
           module => module.createOpenCodeV2ExecutionReceipt('/TEST-unused', identity, target === 'controller'
             ? { type: 'local', command: [runtime, f.controllerEntry] } : undefined),
-          undefined, 'win32')).rejects.toThrow(expected)
+          undefined, 'win32', arch)).rejects.toThrow(expected)
       }
     } finally { await rm(f.root, { recursive: true, force: true }) }
   }

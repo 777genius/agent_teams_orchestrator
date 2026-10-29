@@ -25,7 +25,7 @@ type ExecutionPlatformPlan = Readonly<{ platform: NodeJS.Platform; concrete: Pla
 // V2 execution runs as an ordinary child process on every platform it ships for.
 export function isExecutionPlatformAvailable(): boolean {
   return process.platform === 'linux' || process.platform === 'darwin' ||
-    process.platform === 'win32' && process.arch === 'x64'
+    process.platform === 'win32' && (process.arch === 'x64' || process.arch === 'arm64')
 }
 export function assertExecutionPlatformAvailable(): void {
   executionAssert(isExecutionPlatformAvailable(), 'execution_platform_unsupported')

@@ -13,6 +13,7 @@ on:
       - src/utils/windowsNativeProcess.ts
       - src/services/opencode/OpenCodeCursorAgentTreeKill.ts
       - src/services/opencode/compatibility/OpenCodeVersionProbe.ts
+      - src/services/opencode/compatibility/opencode-v2-qualifications.json
       - scripts/opencode-windows-identity-e2e.ts
       - scripts/package-runtime.ts
       - scripts/runtime-bun-pins.json
@@ -67,7 +68,6 @@ jobs:
       - name: Test producer PTY observation contracts
         run: bun test scripts/opencode-v2/packaged-pty-smoke.test.ts
       - name: Prove qualified staged native PTY adapters with the shipped Bun
-        if: matrix.platform == 'win32-x64'
         timeout-minutes: 3
         shell: pwsh
         env:

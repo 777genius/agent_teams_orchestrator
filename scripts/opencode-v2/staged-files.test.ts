@@ -87,6 +87,7 @@ test('bun-pty support keeps its exact target binding before the payload is signe
     { platform: 'darwin', arch: 'x64', expected: ['librust_pty.dylib'] },
     { platform: 'linux', arch: 'x64', expected: ['librust_pty.so', 'librust_pty_musl.so'] },
     { platform: 'win32', arch: 'x64', expected: ['rust_pty.dll'] },
+    { platform: 'win32', arch: 'arm64', expected: ['rust_pty_arm64.dll'] },
   ]
   for (const target of targets) {
     const keep = stagedPackageFilter({ name: 'bun-pty', main: './src/index.ts' }, target, licensed)
