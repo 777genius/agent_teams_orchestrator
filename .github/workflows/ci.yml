@@ -263,6 +263,12 @@ jobs:
         run: bun test src/features/runtimeProviderManagement/adapters/opencode/OpenCodeProviderSelectionFailure.test.ts --timeout 30000
       - name: Test V2 catalog cache in isolation
         run: bun test src/services/opencode/OpenCodeInventoryService.v2-cache.test.ts --timeout 30000
+      - name: Test V2 probe session titles and launch plans in isolation
+        if: runner.os != 'Windows'
+        run: bun test src/services/opencode/bridge/OpenCodeV2LaunchPlan.unattended.test.ts --timeout 30000
+      - name: Test qualified Windows V2 probe session titles
+        if: runner.os == 'Windows'
+        run: bun test src/services/opencode/bridge/OpenCodeV2LaunchPlan.unattended.test.ts --test-name-pattern 'probe-owned session title' --timeout 30000
       - name: Test Windows startup cleanup completion contracts
         run: bun test src/utils/processKill.test.ts src/services/opencode/OpenCodeStartupCleanupBudget.test.ts src/services/opencode/OpenCodeStartupCleanup.test.ts --timeout 30000
       - name: Test native Windows startup termination

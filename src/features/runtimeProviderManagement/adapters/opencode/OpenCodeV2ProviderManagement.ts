@@ -165,6 +165,21 @@ async function executionProof(project: string, selectedModel: string, run = true
   } : {})
 }
 
+/** Only the probe's exact settled terminal reasons distinguish failure from cleanup uncertainty. */
+export function openCodeV2ConnectProofFailureCode(state: string, reason: string | null): string {
+  return state === 'failed' && (reason === 'native_execution_failed' || reason === 'native_execution_cancelled')
+    ? 'provider_original_execution_failed' : 'provider_original_execution_pending'
+}
+
+export function openCodeV2ConnectFailureMessage(error: unknown, retainedOriginal: boolean): string {
+  if (retainedOriginal && error instanceof Error && error.message === 'provider_original_execution_failed') {
+    return 'The selected-model verification failed. Check provider access, limits and connection diagnostics. The original attempt was retained; no automatic reconnect or prompt retry was performed.'
+  }
+  return retainedOriginal
+    ? 'The original V2 provider connection or execution remains unresolved. No automatic reconnect or prompt retry is authorized.'
+    : 'V2 provider connection could not be qualified. Existing credentials were preserved.'
+}
+
 export async function connectOpenCodeV2Provider(input: ConnectProviderInput): Promise<ProviderManagementResult<ProviderConnection>> {
   if (input.method !== 'api') return resultError('unsupported-auth-method', 'This V2 source path supports API-key provider connection only.')
   const apiKey = input.apiKey?.trim()
@@ -215,7 +230,7 @@ export async function connectOpenCodeV2Provider(input: ConnectProviderInput): Pr
             pendingIntent = { ...pendingIntent!, phase: 'probe-owned', verification: { ...pendingIntent!.verification!, probe } }
             await writeOpenCodeV2ConnectIntent(marker!, pendingIntent)
           } })
-        executionAssert(proof.state === 'available' && proof.proof, 'provider_original_execution_pending')
+        executionAssert(proof.state === 'available' && proof.proof, openCodeV2ConnectProofFailureCode(proof.state, proof.reason))
         executionAssert(proof.proof.modelId === target.modelId && proof.proof.projectPath === normalizeOpenCodeProjectIdentity(owner.authority.directory), 'provider_execution_target_changed')
         executionAssert(isDeepStrictEqual(await readOpenCodeAuthCredential({ authPath: owner.authPath, providerId: input.providerId }), published), 'provider_auth_publication_changed')
         acceptedProof = proof.proof; phase = 'catalog-retirement'
@@ -275,9 +290,7 @@ export async function connectOpenCodeV2Provider(input: ConnectProviderInput): Pr
     // authentication failure; name it instead of the generic text.
     const refusal = retainUnknown ? null : openCodeV2Refusal(error)
     if (refusal) return resultError('runtime-unhealthy', refusal.message)
-    return resultError(retainUnknown ? 'runtime-unhealthy' : 'auth-failed', retainUnknown
-      ? 'The original V2 provider connection or execution remains unresolved. No automatic reconnect or prompt retry is authorized.'
-      : 'V2 provider connection could not be qualified. Existing credentials were preserved.')
+    return resultError(retainUnknown ? 'runtime-unhealthy' : 'auth-failed', openCodeV2ConnectFailureMessage(error, retainUnknown))
   }
 }
 

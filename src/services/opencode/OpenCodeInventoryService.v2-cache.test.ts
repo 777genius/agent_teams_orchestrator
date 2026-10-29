@@ -20,6 +20,8 @@ let native = { ...original }, catalogReads = 0, failure = false
 let receiptRows: OpenCodeConnectedProvider[] = []
 let finishRead: (() => void) | undefined
 let finishReceiptRead: (() => void) | undefined
+let pauseRead: (() => Promise<void>) | undefined
+let catalogName = 'OpenCode Go'
 mock.module('./compatibility/OpenCodeNativeIdentity.js', () => ({ ...identityModule,
   inspectOpenCodeReadSelection: async () => ({ path: native.executablePath, native: { ...native },
     policy: { generation: 'v2', version: native.version }, fingerprint: native.executableSha256 }),
@@ -31,14 +33,27 @@ mock.module('./catalog/OpenCodeV2InventoryService.js', () => ({ ...inventoryModu
   probeOpenCodeV2Inventory: async (selected: OpenCodeV2NativeIdentity, directory: string) => {
     catalogReads++
     const read = { ...emptyOpenCodeV2ReadStatus(selected, directory), catalog: failure ? 'unavailable' as const : 'ready' as const,
-      integrations: [{ id: 'opencode-go', name: 'OpenCode Go', plainKey: true }] }
+      integrations: [{ id: 'opencode-go', name: catalogName, plainKey: true }] }
+    const snapshot = inventoryModule.openCodeV2InventorySnapshot(selected, directory, read, failure ? 'TEST read failed' : null, receiptRows)
+    const pause = pauseRead
+    pauseRead = undefined
     finishRead?.()
-    return inventoryModule.openCodeV2InventorySnapshot(selected, directory, read, failure ? 'TEST read failed' : null, receiptRows)
+    await pause?.()
+    return snapshot
   },
 }))
 const { OpenCodeInventoryService } = await import('./OpenCodeInventoryService.js')
-beforeEach(() => { native = { ...original }; catalogReads = 0; failure = false; receiptRows = []; finishRead = undefined; finishReceiptRead = undefined })
+beforeEach(() => { native = { ...original }; catalogReads = 0; failure = false; receiptRows = []; finishRead = undefined; finishReceiptRead = undefined;
+  pauseRead = undefined; catalogName = 'OpenCode Go' })
 afterAll(() => rm(root, { recursive: true, force: true }))
+
+function holdNextRead() {
+  let begin!: () => void, resume!: () => void
+  const started = new Promise<void>(resolve => { begin = resolve })
+  const held = new Promise<void>(resolve => { resume = resolve })
+  pauseRead = () => { begin(); return held }
+  return { started, resume }
+}
 
 test('successful V2 full reads reuse the catalog but reread completed connection receipts', async () => {
   const service = new OpenCodeInventoryService()
@@ -99,4 +114,63 @@ test('cancellation during a fresh receipt read cannot publish a cached catalog f
   finishReceiptRead = () => controller.abort()
   await expect(service.probe(root, { abortSignal: controller.signal })).rejects.toMatchObject({ name: 'AbortError' })
   expect(catalogReads).toBe(1)
+})
+
+test('an older catalog cannot replace a completed explicit refresh', async () => {
+  const service = new OpenCodeInventoryService(), held = holdNextRead()
+  const older = service.probe(root)
+  await held.started
+  catalogName = 'TEST refreshed catalog'
+  await service.probe(root, { bypassCache: true })
+  held.resume(); await older
+  expect((await service.probe(root)).readStatus?.integrations[0]?.name).toBe('TEST refreshed catalog')
+  expect(catalogReads).toBe(2)
+})
+
+for (const outcome of ['failed', 'aborted'] as const) test(`an older ${outcome} catalog cannot evict a completed refresh`, async () => {
+  const service = new OpenCodeInventoryService(), held = holdNextRead(), controller = new AbortController()
+  failure = outcome === 'failed'
+  const older = service.probe(root, { abortSignal: controller.signal })
+  await held.started
+  failure = false; catalogName = 'TEST refreshed catalog'
+  await service.probe(root, { bypassCache: true })
+  if (outcome === 'aborted') controller.abort()
+  held.resume(); await older
+  expect((await service.probe(root)).readStatus?.integrations[0]?.name).toBe('TEST refreshed catalog')
+  expect(catalogReads).toBe(2)
+})
+
+test('a failed refresh cannot be undone by a late older success', async () => {
+  const service = new OpenCodeInventoryService(), held = holdNextRead()
+  const older = service.probe(root)
+  await held.started
+  failure = true
+  await service.probe(root, { bypassCache: true })
+  held.resume(); await older
+  failure = false; catalogName = 'TEST fresh after failure'
+  expect((await service.probe(root)).readStatus?.integrations[0]?.name).toBe('TEST fresh after failure')
+  expect(catalogReads).toBe(3)
+})
+
+test('clearCache prevents a running old read from repopulating the catalog', async () => {
+  const service = new OpenCodeInventoryService(), held = holdNextRead()
+  const older = service.probe(root)
+  await held.started
+  service.clearCache()
+  held.resume(); await older
+  catalogName = 'TEST fresh after clear'
+  expect((await service.probe(root)).readStatus?.integrations[0]?.name).toBe('TEST fresh after clear')
+  expect(catalogReads).toBe(2)
+})
+
+test('overlapping reads for different projects keep their independent cache entries', async () => {
+  const service = new OpenCodeInventoryService(), held = holdNextRead()
+  const first = service.probe(root)
+  await held.started
+  catalogName = 'TEST other project'
+  await service.probe(other)
+  held.resume(); await first
+  expect((await service.probe(root)).readStatus?.integrations[0]?.name).toBe('OpenCode Go')
+  expect((await service.probe(other)).readStatus?.integrations[0]?.name).toBe('TEST other project')
+  expect(catalogReads).toBe(2)
 })

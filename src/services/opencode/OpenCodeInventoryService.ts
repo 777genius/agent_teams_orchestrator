@@ -1034,9 +1034,11 @@ export function parseOpenCodeAgentListOutput(output: string): OpenCodeAgentSumma
 
 export class OpenCodeInventoryService {
   private readonly cache = new Map<string, CacheEntry>()
+  private readonly v2CatalogReads = new Map<string, symbol>()
 
   clearCache(): void {
     this.cache.clear()
+    this.v2CatalogReads.clear()
   }
 
   /** See seedOpenCodeModelsCache; call it before a catalog host starts. */
@@ -1130,11 +1132,23 @@ export class OpenCodeInventoryService {
         options.abortSignal?.throwIfAborted()
         return { ...cached.snapshot, connectedProviders }
       }
-      const snapshot = await probeOpenCodeV2Inventory(selection.native, resolvedProjectPath, { signal: options.abortSignal, remainingMs: options.remainingMs })
-      if (!options.abortSignal?.aborted && !snapshot.probeError && snapshot.readStatus?.catalog === 'ready') {
-        this.cache.set(cacheKey, { snapshot, expiresAt: Date.now() + OPEN_CODE_CACHE_TTL_MS })
-      } else this.cache.delete(cacheKey)
-      return snapshot
+      const readToken = Symbol()
+      this.v2CatalogReads.set(cacheKey, readToken)
+      try {
+        const snapshot = await probeOpenCodeV2Inventory(selection.native, resolvedProjectPath, { signal: options.abortSignal, remainingMs: options.remainingMs })
+        // A late read must not undo a newer refresh or explicit invalidation.
+        if (this.v2CatalogReads.get(cacheKey) === readToken) {
+          if (!options.abortSignal?.aborted && !snapshot.probeError && snapshot.readStatus?.catalog === 'ready') {
+            this.cache.set(cacheKey, { snapshot, expiresAt: Date.now() + OPEN_CODE_CACHE_TTL_MS })
+          } else this.cache.delete(cacheKey)
+        }
+        return snapshot
+      } catch (error) {
+        if (this.v2CatalogReads.get(cacheKey) === readToken) this.cache.delete(cacheKey)
+        throw error
+      } finally {
+        if (this.v2CatalogReads.get(cacheKey) === readToken) this.v2CatalogReads.delete(cacheKey)
+      }
     }
     if (selection.path && selection.policy.generation !== 'v1') {
       // Passive V2 reads still list the native key integrations and their completed connections.
