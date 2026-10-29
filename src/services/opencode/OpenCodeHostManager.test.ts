@@ -6,8 +6,9 @@ import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { PassThrough } from 'node:stream'
 
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, spyOn, test } from 'bun:test'
 import * as lockfile from '../../utils/lockfile.js'
+import * as binaryResolver from './OpenCodeBinaryResolver.js'
 
 import {
   OPEN_CODE_PREFLIGHT_HOST_LEASE_TEAM_ID,
@@ -1602,6 +1603,11 @@ describe('OpenCodeHostManager', () => {
     const spawned = createMockChildProcess(43134)
     const healthProbeStarted = createDeferred()
     const allowHealthProbe = createDeferred()
+    // This is a startup-lock fixture, not a platform CPU/binary selection probe.
+    const resolver = spyOn(binaryResolver, 'resolveOpenCodeBinaryPath').mockResolvedValue(null)
+    let firstPromise: ReturnType<OpenCodeHostManager['ensureHost']> | undefined
+    let waitingPromise: ReturnType<OpenCodeHostManager['ensureHost']> | undefined
+    let cancellationTimer: ReturnType<typeof setTimeout> | undefined
 
     const fetchJson = (waitForHealth: boolean) => async (url: string) => {
       if (url.endsWith('/global/health')) {
@@ -1650,10 +1656,10 @@ describe('OpenCodeHostManager', () => {
     })
 
     try {
-      const firstPromise = firstManager.ensureHost({ hostKey: 'host-key' })
+      firstPromise = firstManager.ensureHost({ hostKey: 'host-key' })
       await healthProbeStarted.promise
       const controller = new AbortController()
-      const waitingPromise = waitingManager.ensureHost({
+      waitingPromise = waitingManager.ensureHost({
         hostKey: 'host-key',
         abortSignal: controller.signal,
       })
@@ -1663,7 +1669,7 @@ describe('OpenCodeHostManager', () => {
       await expect(Promise.race([
         waitingPromise,
         new Promise<never>((_, reject) => {
-          setTimeout(() => reject(new Error('startup lock wait did not cancel')), 500)
+          cancellationTimer = setTimeout(() => reject(new Error('startup lock wait did not cancel')), 500)
         }),
       ])).rejects.toThrow('host startup deadline expired')
 
@@ -1686,7 +1692,10 @@ describe('OpenCodeHostManager', () => {
       const adopted = await adoptingManager.ensureHost({ hostKey: 'host-key' })
       expect(adopted.pid).toBe(first.pid)
     } finally {
+      clearTimeout(cancellationTimer)
       allowHealthProbe.resolve()
+      await Promise.allSettled([firstPromise, waitingPromise])
+      resolver.mockRestore()
       await rm(tempDir, { recursive: true, force: true })
     }
   })

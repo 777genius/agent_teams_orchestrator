@@ -82,7 +82,9 @@ describe('independent production Stop contract (setup adapted from existing pend
     readStatusMap = async () => ({ 'native-session': status })
     abortAcknowledged = true; abortCalls = 0; onAbort = undefined
     bridge = new OpenCodeSessionBridge({
-      hostManager: new OpenCodeHostManager({ persistentRegistryPath: registryPath }), sessionStore,
+      hostManager: new OpenCodeHostManager({ persistentRegistryPath: registryPath,
+        fetchJson: async () => { throw new Error('Synthetic Stop fixture must not contact HTTP') },
+      }), sessionStore,
       clientFactory: { create: () => ({ getSessionStatus: () => readStatusMap(),
         getSessionMessages: async () => { await onRead?.(); return messages }, abortSession: async () => { abortCalls += 1; await onAbort?.(); return abortAcknowledged } }) as never },
     })

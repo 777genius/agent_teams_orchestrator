@@ -17,6 +17,7 @@ import {
 import { OpenCodeRuntimeDeadlineError, type OpenCodeProvisioningStage } from './OpenCodeRuntimeDeadline.js'
 import { resolveClaudeMultimodelPaths } from './OpenCodeManagedPaths.js'
 import { openCodeCommandOutcomeStore } from './OpenCodeCommandOutcomeStore.js'
+import { OpenCodeClientFactory, openCodeClientFactory } from './OpenCodeClientFactory.js'
 import { openCodeExecutionProbe } from './OpenCodeExecutionProbe.js'
 import { OpenCodeHostProcessGoneError, openCodeHostManager } from './OpenCodeHostManager.js'
 import {
@@ -1055,6 +1056,13 @@ describe('OpenCodeBridgeCommandHandler', () => {
         return new Response('Unknown synthetic endpoint', { status: 404 })
       },
     })
+    const previousCreate = openCodeClientFactory.create
+    const fixtureFactory = new OpenCodeClientFactory({ fetchImpl: (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : String(input))
+      if (url.origin !== host.url.origin || url.username || url.password) throw new Error('Foreign group fixture origin')
+      return fetch(input, { ...init, redirect: 'error' })
+    } })
+    openCodeClientFactory.create = fixtureFactory.create.bind(fixtureFactory)
     try {
       live.host!.baseUrl = host.url.origin
       live.host!.port = host.port!
@@ -1185,7 +1193,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
       expect((await handshake()).runtime.groupChatRunProof).toBeUndefined()
       record = { ...record, runtimePid: process.pid, appManagedBootstrap: undefined }
       expect((await handshake()).runtime.groupChatRunProof).toBeUndefined()
-    } finally { host.stop(true) }
+    } finally { openCodeClientFactory.create = previousCreate; host.stop(true) }
   })
   test('exposes the OpenCode task ledger evidence contract version in handshake', async () => {
     openCodeProvisioningProbe.probe = async () => snapshot
