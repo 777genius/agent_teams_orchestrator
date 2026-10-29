@@ -202,7 +202,7 @@ async function receiptFixture(platform: NodeJS.Platform = 'darwin') {
   }
 }
 
-async function importReceiptHarness(readFile?: typeof fsPromises.readFile) {
+async function importReceiptHarness(readFile?: typeof fsPromises.readFile, openFile?: typeof fsPromises.open) {
   const receiptModule = new URL('./OpenCodeV2ExecutionReceipt.ts', import.meta.url).href
   mock.module(deliveryModule, () => ({
     ...actualDelivery,
@@ -215,6 +215,7 @@ async function importReceiptHarness(readFile?: typeof fsPromises.readFile) {
   mock.module('node:fs/promises', () => ({
     ...actualFs,
     ...(readFile ? { readFile } : {}),
+    ...(openFile ? { open: openFile } : {}),
   }))
   return await import(`${receiptModule}?optional-node-admission=${Math.random().toString(36).slice(2)}`)
 }
@@ -225,6 +226,7 @@ async function callReceipt<T>(
   operation: (receipt: typeof import('./OpenCodeV2ExecutionReceipt.js')) => Promise<T>,
   readFile?: typeof fsPromises.readFile,
   platform: NodeJS.Platform = 'darwin',
+  openFile?: typeof fsPromises.open,
 ): Promise<T> {
   const platformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform')!
   const versions = process.versions as Record<string, unknown>
@@ -239,7 +241,7 @@ async function callReceipt<T>(
     return resolved
   }) as typeof Bun.resolveSync
   try {
-    const receipt = await importReceiptHarness(readFile)
+    const receipt = await importReceiptHarness(readFile, openFile)
     return await operation(receipt)
   } finally {
     try {
@@ -325,16 +327,21 @@ test('mandatory controller qualification and optional graph hash conflicts remai
 
     const replacement = Buffer.concat([macho([]), Buffer.alloc(8)])
     const trigger = path.join(f.root, 'controller/package.json')
-    const readFile = (async (...args: unknown[]) => {
-      const value = await (actualFs.readFile as unknown as (...values: unknown[]) => Promise<unknown>)(...args)
-      if (String(args[0]) === trigger) await actualFs.writeFile(node, replacement)
-      return value
-    }) as typeof fsPromises.readFile
+    let mutated = false
+    // Package manifests now use bounded FileHandle reads, so inject at their
+    // actual open boundary instead of a readFile hook that never runs.
+    const openFile = (async (...args: unknown[]) => {
+      const handle = await (actualFs.open as unknown as (...values: unknown[]) => Promise<unknown>)(...args)
+      if (String(args[0]) === trigger) { await actualFs.writeFile(node, replacement); mutated = true }
+      return handle
+    }) as typeof fsPromises.open
     await writeFile(node, macho([]))
     await expect(callReceipt(f, () => node,
       module => module.createOpenCodeV2ExecutionReceipt('/TEST-unused', f.identity, {
         type: 'local', command: [node, f.controllerEntry],
-      }), readFile)).rejects.toThrow('controller_runtime_changed')
+      }), undefined, 'darwin', openFile)).rejects.toThrow('controller_runtime_changed')
+    expect(mutated).toBe(true)
+    expect(fsPromises.open).toBe(actualFs.open)
     expect(fsPromises.readFile).toBe(actualFs.readFile)
     expect(fsPromises.writeFile).toBe(actualFs.writeFile)
     expect(executionDelivery.resolveOpenCodeV2ExecutionDelivery).toBe(actualDelivery.resolveOpenCodeV2ExecutionDelivery)

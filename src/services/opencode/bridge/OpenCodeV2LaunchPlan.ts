@@ -73,11 +73,13 @@ export function createOpenCodeV2SupervisorEnvironment(source: NodeJS.ProcessEnv 
   return result
 }
 
-export async function inspectOpenCodeV2LaunchSelection(envelope: BridgeEnvelope) {
+export type OpenCodeV2SourceReadBudget = { signal?: AbortSignal; deadlineMs?: number }
+export async function inspectOpenCodeV2LaunchSelection(envelope: BridgeEnvelope, budget: OpenCodeV2SourceReadBudget = {}) {
+  budget.signal?.throwIfAborted()
   assertExecutionPlatformAvailable()
   executionAssert(process.versions.bun === openCodeBunVersion(), 'run_source_bun_required')
   const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'run-owner')
-  const selected = await inspectOpenCodeReadSelection()
+  const selected = await inspectOpenCodeReadSelection(budget.signal, undefined, budget.deadlineMs)
   executionAssert(selected.native && selected.policy.generation === 'v2', 'run_selected_native_unknown')
   const selectedModel = text(envelope.body.selectedModel)
   const slash = selectedModel.indexOf('/')
@@ -87,7 +89,9 @@ export async function inspectOpenCodeV2LaunchSelection(envelope: BridgeEnvelope)
   executionAssert(envelope.body.skipPermissions !== false &&
     (envelope.body.toolApprovalMode === undefined || envelope.body.toolApprovalMode === 'auto'), 'run_manual_permission_unsupported')
   const project = await canonicalizeOpenCodeProjectPath(typeof envelope.body.projectPath === 'string' ? envelope.body.projectPath : envelope.cwd)
+  budget.signal?.throwIfAborted()
   const scope = await resolveOpenCodeProfileScope({ projectPath: project, purpose: 'launch_runtime', selectedModel })
+  budget.signal?.throwIfAborted()
   executionAssert(scope.selectedAuthIdentity !== 'error', 'run_selected_auth_unknown')
   const resolved = await resolveOpenCodeAppMcpLaunchConfig()
   executionAssert(resolved.config.enabled !== false, 'run_controller_disabled')
@@ -126,6 +130,7 @@ export async function inspectOpenCodeV2LaunchSelection(envelope: BridgeEnvelope)
     }
     controller = { ...controller, command, environment }
   }
+  budget.signal?.throwIfAborted()
   const behaviorFingerprint = executionHash({ source: 'linux-v2-protocol1', pin: selected.native.version,
     ...(selected.native.origin === 'standalone' ? { nativeOrigin: 'standalone' } : {}),
     ...(openCodeV2EngineVersion(selected.native) === selected.native.version ? {} : { engineVersion: openCodeV2EngineVersion(selected.native) }),
@@ -139,17 +144,19 @@ export async function inspectOpenCodeV2LaunchSelection(envelope: BridgeEnvelope)
 
 /** Availability precedes any owner/session. This path reads identity and the installed
  * graph only; it never acquires a host or runs a model preflight. */
-export async function inspectOpenCodeV2SourceAvailability(envelope: BridgeEnvelope) {
-  const selection = await inspectOpenCodeV2LaunchSelection(envelope)
-  return (await prepareSelectedOpenCodeV2SourceAvailability(selection)).availability
+export async function inspectOpenCodeV2SourceAvailability(envelope: BridgeEnvelope, budget: OpenCodeV2SourceReadBudget = {}) {
+  const selection = await inspectOpenCodeV2LaunchSelection(envelope, budget)
+  return (await prepareSelectedOpenCodeV2SourceAvailability(selection, budget)).availability
 }
 
 /** Reuse only this command's selection; installed bytes are still verified afresh. */
-async function prepareSelectedOpenCodeV2SourceAvailability(selection: Awaited<ReturnType<typeof inspectOpenCodeV2LaunchSelection>>) {
+async function prepareSelectedOpenCodeV2SourceAvailability(selection: Awaited<ReturnType<typeof inspectOpenCodeV2LaunchSelection>>, budget: OpenCodeV2SourceReadBudget = {}) {
+  budget.signal?.throwIfAborted()
   // Version admission precedes graph resolution, so an unqualified release is refused as such.
   assertOpenCodeV2Launchable(openCodeV2EngineVersion(selection.native))
   const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'execution', selectedDeliveries.get(selection)?.binding)
-  const receipt = await createOpenCodeV2ExecutionReceipt(delivery.root, selection.native, selection.controller, delivery.binding)
+  const receipt = await createOpenCodeV2ExecutionReceipt(delivery.root, selection.native, selection.controller, delivery.binding, budget.signal)
+  budget.signal?.throwIfAborted()
   const config = selection.controller
   if (config.type === 'local') executionAssert(config.command.length > 0 &&
     config.command.every(value => typeof value === 'string' && value.length > 0 && !value.includes('\0')), 'run_controller_transport_unsupported')
@@ -232,7 +239,7 @@ async function buildOpenCodeV2InternalRunPlanWithNative(selection: Awaited<Retur
   for (const member of rawMembers) {
     const memberId = text(member.name), sessionID = `ses_${randomUUID().replaceAll('-', '')}`
     const variant = typeof member.effort === 'string' ? member.effort : typeof body.effort === 'string' ? body.effort : undefined
-    const { profile, prepared } = await createOpenCodeV2PreparedMember(selection, native, profileParent, { teamId, runId, memberId, variant, unattendedTeam: probe ? probe.unattendedTeam === true : true })
+    const { profile, prepared } = await createOpenCodeV2PreparedMember(selection, native, profileParent, { teamId, runId, memberId, variant, unattendedTeam: probe ? probe.unattendedTeam === true : true, modelVerification: Boolean(probe && !probe.unattendedTeam) })
     if (probe) probePrepared = prepared
     const prompt = typeof member.prompt === 'string' ? member.prompt : `Join OpenCode team ${teamId} as ${memberId}. Wait for app MCP task delivery.`
     const value = buildOpenCodeAppManagedBootstrapContextText({ teamName: typeof body.teamName === 'string' ? body.teamName : teamId,
@@ -289,7 +296,7 @@ async function buildOpenCodeV2InternalRunPlanWithNative(selection: Awaited<Retur
 async function hashText(value: string): Promise<string> { const { createHash } = await import('node:crypto'); return createHash('sha256').update(value).digest('hex') }
 
 export async function createOpenCodeV2PreparedMember(selection: Awaited<ReturnType<typeof inspectOpenCodeV2LaunchSelection>>,
-  native: ValidatedExecutionNative, profileParent: string, input: { teamId: string; runId: string; memberId: string; variant?: string; unattendedTeam?: boolean }) {
+  native: ValidatedExecutionNative, profileParent: string, input: { teamId: string; runId: string; memberId: string; variant?: string; unattendedTeam?: boolean; modelVerification?: boolean }) {
   const { teamId, runId, memberId, variant } = input
     const prefix = `${executionHash({ teamId, runId, memberId }).slice(0, 16)}-`
     const root = await realpath(await mkdtemp(path.join(profileParent, prefix)))
@@ -300,7 +307,12 @@ export async function createOpenCodeV2PreparedMember(selection: Awaited<ReturnTy
     const managedAuthPath = path.join(nativeData, 'auth.json')
     const anonymous = selection.scope.selectedAuthIdentity === 'absent'
     const model = { ...selection.model, variant: variant ?? 'default' }
-    const selected = { agent: 'build', model, permissions: OPENCODE_V2_TEAMMATE_PERMISSIONS.map(rule => ({ ...rule })) }
+    // Test/Connect advertise the native tools required by the free route, but an
+    // unexpected tool request must wait for permission and is cancelled by the
+    // probe owner. Unattended launch proofs retain the exact team configuration.
+    const selected = { agent: 'build', model, permissions: OPENCODE_V2_TEAMMATE_PERMISSIONS.map(rule => ({
+      ...rule, effect: input.modelVerification && rule.effect === 'allow' ? 'ask' as const : rule.effect,
+    })) }
     let config: ReturnType<typeof createOpenCodeV2ExecutionConfig>
     let managedAuthFingerprint: string
     {

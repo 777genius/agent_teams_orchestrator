@@ -11,6 +11,7 @@ import { isDeepStrictEqual } from 'node:util'
 import { importOpenCodeV2ClientModule, resolveOpenCodeV2ClientEntry } from '../../../../services/opencode/transport/OpenCodeV2ClientModule.js'
 import { getOpenCodeV2DeclaredInputModalities } from '../../../../services/opencode/OpenCodeDeclaredInputModalities.js'
 import { readIntegration } from '../../../../services/opencode/catalog/OpenCodeV2ReadStatus.js'
+import { isOpenCodeV2AnonymousProvider, isOpenCodeV2ModelFree } from '../../../../services/opencode/catalog/OpenCodeV2ModelPricing.js'
 import { inspectOpenCodeReadSelection } from '../../../../services/opencode/compatibility/OpenCodeNativeIdentity.js'
 export { inspectOpenCodeReadSelection } from '../../../../services/opencode/compatibility/OpenCodeNativeIdentity.js'
 import { canonicalizeOpenCodeProjectPath, resolveOpenCodeV2CatalogProfileScope, materializeOpenCodeV2CatalogScope } from '../../../../services/opencode/OpenCodeProfileManager.js'
@@ -29,6 +30,7 @@ import { prepareOpenCodeV2ConnectVerification, readRetiredOpenCodeV2CatalogProfi
   readOpenCodeV2ConnectIntent, writeOpenCodeV2ConnectIntent, type OpenCodeV2ConnectIntent } from './OpenCodeV2ProviderConnectIntent.js'
 import { parseOpenCodeExecutionProof } from '../../../../services/opencode/OpenCodeExecutionProof.js'
 import { normalizeOpenCodeProjectIdentity } from '../../../../services/opencode/OpenCodeProjectIdentity.js'
+import { pageOpenCodeV2ProviderModels } from './OpenCodeV2ModelPagination.js'
 import type { OpenCodeExecutionProof } from '../../../../services/opencode/types.js'
 import type { BridgeEnvelope } from '../../../../services/opencode/bridge/OpenCodeBridgeProtocol.js'
 import type { ConnectProviderInput, LoadProviderModelsInput, LoadProviderSetupFormInput, TestProviderModelInput, ProviderConnection, RuntimeProviderModel, RuntimeProviderModelsView, ProviderModelTestResult, ProviderManagementResult, ProviderSetupForm } from '../../domain/types.js'
@@ -62,7 +64,7 @@ type CatalogOwner = {
   connect(id: string, key: string): Promise<void>; remove(id: string): Promise<void>
 }
 async function catalog<T>(input: { providerId: string; projectPath?: string | null }, use: (value: CatalogOwner) => Promise<T>,
-  selectedRead?: Awaited<ReturnType<typeof inspectOpenCodeReadSelection>>): Promise<T> {
+  selectedRead?: Awaited<ReturnType<typeof inspectOpenCodeReadSelection>>, options?: { includeSelectedApiKey?: boolean }): Promise<T> {
   // Reuse this request's generation decision; receipt/owner/child checks still revalidate the bytes.
   const selected = selectedRead ?? await inspectOpenCodeReadSelection(); executionAssert(selected.native && selected.policy.generation === 'v2', 'provider_v2_required')
   const project = await canonicalizeOpenCodeProjectPath(input.projectPath)
@@ -71,9 +73,12 @@ async function catalog<T>(input: { providerId: string; projectPath?: string | nu
   const root = await realpath(await mkdtemp(path.join(parent, 'catalog-')))
   for (const name of ['home', 'config', 'data', 'cache', 'state', 'tmp', 'appdata', 'localappdata']) await mkdir(path.join(root, name), { mode: 0o700 })
   const directory = path.join(root, 'config/opencode'), data = path.join(root, 'data/opencode'); await mkdir(directory, { mode: 0o700 }); await mkdir(data, { mode: 0o700 })
-  const imported = await materializeOpenCodeV2CatalogScope(scope, project, path.join(data, 'auth.json'))
+  const imported = await materializeOpenCodeV2CatalogScope(scope, project, path.join(data, 'auth.json'), options)
   const provider = { ...(imported.provider.package ? { package: imported.provider.package } : {}),
-    ...(imported.provider.baseURL ? { settings: { baseURL: imported.provider.baseURL } } : {}), ...(imported.provider.models ? { models: imported.provider.models } : {}) }
+    ...(imported.provider.baseURL || imported.provider.apiKey ? { settings: {
+      ...(imported.provider.baseURL ? { baseURL: imported.provider.baseURL } : {}),
+      ...(imported.provider.apiKey ? { apiKey: imported.provider.apiKey } : {}),
+    } } : {}), ...(imported.provider.models ? { models: imported.provider.models } : {}) }
   const content = JSON.stringify({ update: 'disable', share: 'disabled', snapshots: false, warming: false, plugins: [], providers: { [input.providerId]: provider } })
   await writeFile(path.join(directory, 'opencode.json'), content, { flag: 'wx', mode: 0o600 })
   const env = createOpenCodeV2OwnedProfileEnvironment(root)
@@ -355,26 +360,39 @@ export async function testOpenCodeV2ProviderModel(input: TestProviderModelInput)
 export async function loadOpenCodeV2ProviderModels(input: LoadProviderModelsInput,
   selectedRead?: Awaited<ReturnType<typeof inspectOpenCodeReadSelection>>): Promise<ProviderManagementResult<RuntimeProviderModelsView>> {
   try {
-    if (input.cursor) return resultError('runtime-unhealthy', 'V2 catalog cursors require a fresh bounded catalog query.')
     const value = await catalog(input, async owner => {
-      let rows = scopedRows(await owner.models(), owner.authority.directory).filter(row => row.providerID === input.providerId)
-      if (input.query) rows = rows.filter(row => `${row.id} ${row.name}`.toLowerCase().includes(input.query!.toLowerCase()))
-      const totalCount = rows.length, limit = input.limit == null ? null : Math.max(1, Math.min(200, input.limit))
-      if (limit) rows = rows.slice(0, limit)
-      return { runtimeId: 'opencode' as const, providerId: input.providerId, totalCount, returnedCount: rows.length, limit, cursor: null, nextCursor: null,
-        defaultModelId: owner.preferredModel, diagnostics: [], catalogState: 'fresh' as const,
-        models: rows.map(row => buildOpenCodeV2RuntimeProviderModel(row, input.providerId, owner.preferredModel)) }
-    }, selectedRead)
+      const rows = scopedRows(await owner.models(), owner.authority.directory).filter(row => row.providerID === input.providerId)
+      let anonymousProvider = false
+      if (input.providerId === 'opencode') {
+        const providers = scopedRows(await owner.providers(), owner.authority.directory).filter(row => row.id === input.providerId)
+        if (providers.length === 1 && isOpenCodeV2AnonymousProvider(providers[0]!)) {
+          const integration = scopedIntegration(await owner.integration('opencode'), owner.authority.directory, 'opencode')
+          anonymousProvider = Array.isArray(integration.connections) && integration.connections.length === 0
+        }
+      }
+      const models = rows.map(row => buildOpenCodeV2RuntimeProviderModel(row, input.providerId, owner.preferredModel, anonymousProvider))
+      return { runtimeId: 'opencode' as const, providerId: input.providerId,
+        ...pageOpenCodeV2ProviderModels(models, { ...input, projectPath: owner.authority.directory }),
+        defaultModelId: owner.preferredModel, diagnostics: [], catalogState: 'fresh' as const }
+    }, selectedRead, { includeSelectedApiKey: true })
     return { ok: true, value }
-  } catch (error) { return resultError('runtime-unhealthy', openCodeV2Refusal(error)?.message ?? 'V2 native provider catalog is unavailable; no legacy CLI catalog command was invoked.') }
+  } catch (error) { return resultError('runtime-unhealthy', error instanceof Error && error.message === 'provider_catalog_page_changed'
+    ? 'The OpenCode model catalog changed while loading more models. Refresh models and try again.'
+    : openCodeV2Refusal(error)?.message ?? 'V2 native provider catalog is unavailable; no legacy CLI catalog command was invoked.') }
 }
 
-export function buildOpenCodeV2RuntimeProviderModel(row: Record<string, unknown>, providerId: string, preferredModel: string | null): RuntimeProviderModel {
+export function buildOpenCodeV2RuntimeProviderModel(row: Record<string, unknown>, providerId: string, preferredModel: string | null,
+  anonymousProvider = false): RuntimeProviderModel {
+  const free = isOpenCodeV2ModelFree(providerId, row.cost)
+  const builtinFree = anonymousProvider && providerId === 'opencode' && free && row.enabled === true && row.status === 'active'
   return { modelId: `${providerId}/${text(row.id)}`, providerId, displayName: text(row.name), sourceLabel: 'OpenCode V2 native catalog',
     declaredInputModalities: getOpenCodeV2DeclaredInputModalities(row.capabilities),
-    free: false, default: `${providerId}/${row.id}` === preferredModel, catalogStatus: 'active',
-    availability: row.enabled === false ? 'unavailable' : 'untested', accessKind: 'credentialed', routeKind: 'catalog_provider',
-    proofState: 'needs_probe', requiresExecutionProof: true, accessReason: 'Selected-model execution proof is required.',
+    free, default: `${providerId}/${row.id}` === preferredModel,
+    catalogStatus: row.status === 'alpha' || row.status === 'beta' || row.status === 'deprecated' ? row.status : 'active',
+    availability: row.enabled === false ? 'unavailable' : 'untested',
+    accessKind: builtinFree ? 'builtin_free' : 'credentialed', routeKind: builtinFree ? 'builtin_free' : 'catalog_provider',
+    proofState: 'needs_probe', requiresExecutionProof: true,
+    accessReason: builtinFree ? 'Listed as free by OpenCode; access is subject to OpenCode limits and selected-model verification.' : 'Selected-model execution proof is required.',
     catalogContextTokens: finiteNumber(executionRecord(row.limit).context),
     catalogOutputTokens: finiteNumber(executionRecord(row.limit).output),
     managedContextTokens: null, managedOutputTokens: null, managedUpdatedAt: null }

@@ -13,6 +13,8 @@ import * as mcp from '../OpenCodeMcpManager.js'
 import * as probes from './OpenCodeV2ExecutionProbe.js'
 import * as launchPlans from './OpenCodeV2LaunchPlan.js'
 import * as runOwners from './OpenCodeV2RunOwner.js'
+import * as controls from './OpenCodeV2RunControl.js'
+import type { RunControlResult } from './OpenCodeV2RunTypes.js'
 import * as projectIdentity from '../OpenCodeProjectIdentity.js'
 import { buildOpenCodeExecutionProof } from '../OpenCodeExecutionProof.js'
 import { executionHash } from '../execution/OpenCodeV2ExecutionContracts.js'
@@ -107,6 +109,12 @@ for (const version of titleVersions) test(`${version} probe-owned session title 
   const member = probe.members[0]!
   expect(member.title).toBe('Agent Teams model verification')
   expect(probe.executionProbe?.intent).toEqual(intent)
+  expect(member.profile.selection.permissions.some(rule => rule.effect === 'allow')).toBe(false)
+  expect(member.profile.selection.permissions.filter(rule => rule.effect === 'ask').map(rule => rule.action))
+    .toEqual(team.members[0]!.profile.selection.permissions.filter(rule => rule.effect === 'allow').map(rule => rule.action))
+  const launchProbe = await launchPlans.buildOpenCodeV2InternalRunPlan(selection, request.body, 'TEST-launch-controller',
+    { intent, expectedText: 'TEST-verification-result', unattendedTeam: true })
+  expect(launchProbe.members[0]!.profile.config.sha256).toBe(team.members[0]!.profile.config.sha256)
   // A name or caller-supplied title cannot turn an ordinary team member into a probe.
   expect(team.members[0]).not.toHaveProperty('title')
   expect(team.executionProbe).toBeUndefined()
@@ -561,4 +569,35 @@ test('fresh claim crash before the new probe record remains fail-closed without 
   expect(await probes.resolveOpenCodeV2ExecutionProbe(f.request, f.selection, true,
     { unattendedTeam: true, freshExecutionProofRequestId: 'TEST-before-record-crash' })).toMatchObject({ state: 'pending', proof: null })
   expect(await readFile(f.file, 'utf8')).toBe(before)
+})
+
+
+test('a model-test tool request cancels and retires the original without approval, replay or proof', async () => {
+  const request = envelope(), selection = await inspectOpenCodeV2SourceAvailability(request)
+  const sourceKey = executionHash({ project, scopeToken: selection.scope.scopeToken,
+    selectedAuthIdentity: selection.scope.selectedAuthIdentity, source: selection.behaviorFingerprint,
+    graph: selection.installedGraphSHA256, projectBehavior: behavior, variant: 'default' })
+  const directory = path.join(root, 'app-data/opencode/v2/execution-probes', sourceKey)
+  await mkdir(directory, { recursive: true, mode: 0o700 })
+  const nonce = 'TEST-permission-probe', sessionID = 'ses_TESTpermission'
+  const binding = { teamId: nonce, runId: nonce, controllerInstanceId: nonce, ownerId: nonce }
+  const intent = { identity: { requestId: nonce, deliveryAttemptId: nonce, localMessageId: nonce, nativeInputID: 'msg_TESTpermission' },
+    delivery: 'queue', input: { nativeInputID: 'msg_TESTpermission', resume: true, text: 'TEST verification only' } }
+  const file = path.join(directory, 'probe.json')
+  await writeFile(file, JSON.stringify({ sourceKey, binding, sessionID, intent, submitted: true, proof: null, retired: false, failure: null }), { mode: 0o600 })
+  const operations: string[] = []
+  restores.push(spyOn(controls, 'discoverOpenCodeV2Run').mockImplementation(async () => ({ binding }) as NonNullable<Awaited<ReturnType<typeof controls.discoverOpenCodeV2Run>>>))
+  restores.push(spyOn(controls, 'requestOpenCodeV2Run').mockImplementation(async (_owner, operation): Promise<RunControlResult> => {
+    operations.push(operation.operation)
+    if (operation.operation === 'permissions') return { kind: 'permissions', requests: [{ id: 'perm_TEST', sessionID, action: 'shell', resources: ['TEST forbidden tool'] }] } as RunControlResult
+    expect(operation.operation).toBe('stop')
+    expect(JSON.parse(await readFile(file, 'utf8'))).toMatchObject({ failure: 'native_execution_cancelled', retired: false, proof: null })
+    // Unit orchestration fixture only; the native E2E independently verifies real retirement.
+    return { kind: 'stop', state: 'stopped', ownerRetired: true, members: [{ memberId: 'probe', cleanup: {}, errors: [] }] } as RunControlResult
+  }))
+  const expected = { state: 'failed', proof: null, reason: 'native_execution_cancelled' }
+  expect(await probes.resolveOpenCodeV2ExecutionProbe(request, selection, true)).toEqual(expected)
+  expect(JSON.parse(await readFile(file, 'utf8'))).toMatchObject({ failure: 'native_execution_cancelled', retired: true, proof: null })
+  for (const run of [false, true]) expect(await probes.resolveOpenCodeV2ExecutionProbe(request, selection, run)).toEqual(expected)
+  expect(operations).toEqual(['permissions', 'stop'])
 })

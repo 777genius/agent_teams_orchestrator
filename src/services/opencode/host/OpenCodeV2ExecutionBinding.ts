@@ -286,7 +286,8 @@ function dependencyPackageName(name: string, specification: unknown): string {
   return alias[1]!
 }
 
-export async function validateExecutionNative(native: ValidatedExecutionNative): Promise<void> {
+export async function validateExecutionNative(native: ValidatedExecutionNative, signal?: AbortSignal): Promise<void> {
+  signal?.throwIfAborted()
   openCodeV2EngineVersion(native)
   executionAssert(await filesystem.realpath(native.executablePath) === native.executablePath && /^opencode(?:\.exe)?$/.test(path.basename(native.executablePath)), 'execution_identity_mismatch')
   const raw = await readOpenCodeNativePackageMetadata(native.executablePath)
@@ -299,7 +300,8 @@ export async function validateExecutionNative(native: ValidatedExecutionNative):
     executionAssert(typeof native.packageName === 'string' && metadata.name === native.packageName && metadata.version === native.version &&
       native.packageName.startsWith(`@opencode/cli-${platform}-${process.arch}`), 'execution_identity_mismatch')
   }
-  executionAssert(await hashOpenCodeFile(native.executablePath) === native.executableSha256, 'execution_identity_mismatch')
+  executionAssert(await hashOpenCodeFile(native.executablePath, signal) === native.executableSha256, 'execution_identity_mismatch')
+  signal?.throwIfAborted()
   const handle = await open(native.executablePath, 'r')
   try {
     const header = Buffer.alloc(4); await handle.read(header, 0, 4, 0)

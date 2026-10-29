@@ -1,5 +1,6 @@
 import { inspectOpenCodeReadSelection, selectedProviderUsesOpenCodeV2, connectOpenCodeV2Provider, loadOpenCodeV2ProviderModels, testOpenCodeV2ProviderModel, loadOpenCodeV2ProviderSetupForm } from './OpenCodeV2ProviderManagement.js'
 import { buildOpenCodeV2ProviderDirectoryEntries } from './OpenCodeV2ProviderDirectory.js'
+import { applyOpenCodeV2DefaultSelection, clearOpenCodeV2ProjectDefaultModel, setOpenCodeV2DefaultModel } from './OpenCodeV2DefaultModels.js'
 import { openCodeV2KeyIntegration } from '../../../../services/opencode/catalog/OpenCodeV2KeyIntegrations.js'
 import path from 'node:path'
 import { realpath } from 'node:fs/promises'
@@ -4012,16 +4013,15 @@ export class OpenCodeProviderManagementAdapter
 
     if (!inventory.detected
       || (inventory.readGeneration !== undefined && inventory.readGeneration !== 'v1')) {
+      const view = buildView({
+        inventory, host: null, configProviders: null, providers: null,
+        providerAuth: null, diagnostics: inventory.diagnostics,
+      })
+      const nativeDefault = inventory.readStatus?.defaultModel
       return {
         ok: true,
-        value: buildView({
-          inventory,
-          host: null,
-          configProviders: null,
-          providers: null,
-          providerAuth: null,
-          diagnostics: inventory.diagnostics,
-        }),
+        value: inventory.readGeneration === 'v2' ? await applyOpenCodeV2DefaultSelection(view,
+          nativeDefault ? `${nativeDefault.providerId}/${nativeDefault.catalogId}` : null) : view,
       }
     }
     if (isOpenCodeInventoryTimeoutSnapshot(inventory)) {
@@ -5663,6 +5663,14 @@ export class OpenCodeProviderManagementAdapter
     }
     const scope = input.scope === 'all_projects' ? 'all_projects' : 'project'
 
+    let selectedRead: Awaited<ReturnType<typeof inspectOpenCodeReadSelection>> | undefined
+    try { if (input.runtimeId === 'opencode') selectedRead = await inspectOpenCodeReadSelection() }
+    catch (error) { return providerManagementError('runtime-unhealthy', selectedIdentityFailureMessage(error)) }
+    if (selectedRead?.policy.generation === 'v2' && selectedRead.native) {
+      return setOpenCodeV2DefaultModel({ ...input, providerId, modelId, scope },
+        () => this.loadView({ runtimeId: input.runtimeId, projectPath: input.projectPath }), selectedRead)
+    }
+
     return this.withManagedOpenCodeClient(
       input.runtimeId,
       input.projectPath,
@@ -5795,6 +5803,12 @@ export class OpenCodeProviderManagementAdapter
         'A project path is required to clear its OpenCode default model',
       )
     }
+    try {
+      if (input.runtimeId === 'opencode' && await selectedProviderUsesOpenCodeV2()) {
+        return clearOpenCodeV2ProjectDefaultModel({ ...input, projectPath },
+          () => this.loadView({ runtimeId: input.runtimeId, projectPath }))
+      }
+    } catch (error) { return providerManagementError('runtime-unhealthy', selectedIdentityFailureMessage(error)) }
     return this.withManagedOpenCodeClient(
       input.runtimeId,
       projectPath,
