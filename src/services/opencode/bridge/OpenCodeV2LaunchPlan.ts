@@ -43,6 +43,7 @@ const SUPERVISOR_ENVIRONMENT_NAMES = new Map([
 ])
 const WINDOWS_SUPERVISOR_ENVIRONMENT_NAMES = new Set(['LOCALAPPDATA', 'SYSTEMROOT', 'WINDIR'])
 const SUPERVISOR_ENVIRONMENT_INJECTION = /^(?:NODE_OPTIONS|NODE_PATH|BUN_.*|LD_.*|DYLD_.*|BASH_ENV|ENV|ZDOTDIR|SHELLOPTS)$/i
+const selectedDeliveries = new WeakMap<object, Awaited<ReturnType<typeof resolveOpenCodeV2ExecutionDelivery>>>()
 
 /** Reject loader-option injection in any plan-like supervisor replacement. */
 export function assertOpenCodeV2SupervisorEnvironment(environment: Readonly<Record<string, string>>): void {
@@ -130,8 +131,10 @@ export async function inspectOpenCodeV2LaunchSelection(envelope: BridgeEnvelope)
     ...(openCodeV2EngineVersion(selected.native) === selected.native.version ? {} : { engineVersion: openCodeV2EngineVersion(selected.native) }),
     binary: selected.native.executableSha256, model, scope: { purpose: scope.purpose, providerId: scope.providerId,
       configFingerprint: scope.configFingerprint, selectedAuthIdentity: scope.selectedAuthIdentity }, controller })
-  return { native: selected.native, model, project, scope, controller, behaviorFingerprint,
+  const selection = { native: selected.native, model, project, scope, controller, behaviorFingerprint,
     capabilitySnapshotId: `opencode:${executionHash({ behaviorFingerprint, sourceRoot: delivery.root }).slice(0, 32)}` }
+  selectedDeliveries.set(selection, delivery)
+  return selection
 }
 
 /** Availability precedes any owner/session. This path reads identity and the installed
@@ -145,8 +148,8 @@ export async function inspectOpenCodeV2SourceAvailability(envelope: BridgeEnvelo
 async function prepareSelectedOpenCodeV2SourceAvailability(selection: Awaited<ReturnType<typeof inspectOpenCodeV2LaunchSelection>>) {
   // Version admission precedes graph resolution, so an unqualified release is refused as such.
   assertOpenCodeV2Launchable(openCodeV2EngineVersion(selection.native))
-  const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'execution')
-  const receipt = await createOpenCodeV2ExecutionReceipt(delivery.root, selection.native, selection.controller)
+  const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'execution', selectedDeliveries.get(selection)?.binding)
+  const receipt = await createOpenCodeV2ExecutionReceipt(delivery.root, selection.native, selection.controller, delivery.binding)
   const config = selection.controller
   if (config.type === 'local') executionAssert(config.command.length > 0 &&
     config.command.every(value => typeof value === 'string' && value.length > 0 && !value.includes('\0')), 'run_controller_transport_unsupported')
@@ -157,6 +160,7 @@ async function prepareSelectedOpenCodeV2SourceAvailability(selection: Awaited<Re
   executionAssert(receipt.graph.files.length > 0 && receipt.graph.sha256.length === 64 &&
     receipt.executableSha256 === selection.native.executableSha256, 'run_source_graph_unknown')
   const availability = { ...selection, installedGraphSHA256: receipt.graph.sha256, installedGraphFiles: receipt.graph.files.length }
+  selectedDeliveries.set(availability, delivery)
   const selectionHash = executionHash(availability)
   Object.defineProperty(availability, preparedPlanReceipt, { configurable: true, value: () => {
     executionAssert(executionHash(availability) === selectionHash, 'run_prepared_selection_changed')
@@ -198,8 +202,13 @@ export async function buildOpenCodeV2InternalRunPlan(selection: Awaited<ReturnTy
   const consume = prepared[preparedPlanReceipt]
   // Remove before any asynchronous preparation so this authority is consumed once.
   if (consume) delete prepared[preparedPlanReceipt]
-  const native = consume ? consume() : await createOpenCodeV2ExecutionReceipt(
-    (await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'run-owner')).root, selection.native, selection.controller)
+  let native: ValidatedExecutionNative
+  if (consume) native = consume()
+  else {
+    const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'run-owner', selectedDeliveries.get(selection)?.binding)
+    selectedDeliveries.set(selection, delivery)
+    native = await createOpenCodeV2ExecutionReceipt(delivery.root, selection.native, selection.controller, delivery.binding)
+  }
   return buildOpenCodeV2InternalRunPlanWithNative(selection, body, controllerInstanceId, native, probe)
 }
 
@@ -217,7 +226,7 @@ async function buildOpenCodeV2InternalRunPlanWithNative(selection: Awaited<Retur
   const dataRoot = await realpath(paths.data)
   const profileParent = path.join(dataRoot, 'opencode', 'v2', 'profiles')
   await mkdir(profileParent, { recursive: true, mode: 0o700 })
-  const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'run-owner')
+  const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'run-owner', native.graph.delivery)
   const members: RunMemberPlan[] = []
   let probePrepared: OpenCodePreparedProfile | undefined
   for (const member of rawMembers) {
@@ -253,7 +262,10 @@ async function buildOpenCodeV2InternalRunPlanWithNative(selection: Awaited<Retur
   }
   else {
     // Bun emits self-contained JS entries. Official packages are independently graph-bound.
-    for (const name of ['cli.js', 'opencodeV2RunOwner.js', 'opencodeV2ExecutionServer.js']) {
+    const baseEntry = selectedDeliveries.get(selection)?.baseEntryPath
+    executionAssert(baseEntry && await realpath(baseEntry) === baseEntry, 'run_source_incomplete')
+    files.push({ path: baseEntry, sha256: await hashOpenCodeFile(baseEntry) })
+    for (const name of ['opencodeV2RunOwner.js', 'opencodeV2ExecutionServer.js']) {
       const file = await realpath(path.join(delivery.root, name))
       executionAssert(path.dirname(file) === delivery.root, 'run_source_symlink')
       files.push({ path: file, sha256: await hashOpenCodeFile(file) })
@@ -270,7 +282,7 @@ async function buildOpenCodeV2InternalRunPlanWithNative(selection: Awaited<Retur
     ...(probe && probePrepared ? { executionProbe: { memberId: 'probe', intent: probe.intent, expectedText: probe.expectedText,
       prepared: probePrepared, capabilitySnapshotId: selection.capabilitySnapshotId } } : {}),
     source: { entryPath, entrySha256: await hashOpenCodeFile(entryPath), bunPath: native.bun.path,
-      bunSha256: native.bun.sha256, files, env } }
+      bunSha256: native.bun.sha256, files, env, ...(native.graph.delivery ? { delivery: native.graph.delivery } : {}) } }
 }
 async function hashText(value: string): Promise<string> { const { createHash } = await import('node:crypto'); return createHash('sha256').update(value).digest('hex') }
 

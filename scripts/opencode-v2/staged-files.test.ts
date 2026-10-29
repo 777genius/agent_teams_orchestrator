@@ -78,3 +78,21 @@ test('prebuilt addons stay for the staged platform only', () => {
   expect(windows('prebuilds/win32-x64/node.napi.node', false)).toBe(true)
   expect(windows('prebuilds/win32-arm64/node.napi.node', false)).toBe(false)
 })
+
+test('bun-pty support keeps its exact target binding before the payload is signed and hashed', () => {
+  const bindings = ['librust_pty.so', 'librust_pty_musl.so', 'librust_pty_arm64.so', 'librust_pty_arm64_musl.so',
+    'librust_pty.dylib', 'librust_pty_arm64.dylib', 'rust_pty.dll', 'rust_pty_arm64.dll']
+  const targets = [
+    { platform: 'darwin', arch: 'arm64', expected: ['librust_pty_arm64.dylib'] },
+    { platform: 'darwin', arch: 'x64', expected: ['librust_pty.dylib'] },
+    { platform: 'linux', arch: 'x64', expected: ['librust_pty.so', 'librust_pty_musl.so'] },
+    { platform: 'win32', arch: 'x64', expected: ['rust_pty.dll'] },
+  ]
+  for (const target of targets) {
+    const keep = stagedPackageFilter({ name: 'bun-pty', main: './src/index.ts' }, target, licensed)
+    expect(bindings.filter(name => keep(`rust-pty/target/release/${name}`, false))).toEqual(target.expected)
+    expect(keep('rust-pty/target/release/unknown-native-library.dll', false)).toBe(true)
+    expect(keep('src/index.ts', false)).toBe(true)
+  }
+  expect(stagedPackageFilter(distOnly, darwinArm64, licensed)('rust-pty/target/release/rust_pty.dll', false)).toBe(true)
+})

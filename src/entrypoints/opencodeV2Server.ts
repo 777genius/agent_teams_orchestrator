@@ -9,6 +9,8 @@ import { openCodeV2ReadOverrides } from '../services/opencode/profile/OpenCodeV2
 import { boundOpenCodeRead, openCodeReadAssert } from '../services/opencode/transport/OpenCodeBoundedFetch.js'
 import { readRecord } from '../services/opencode/catalog/OpenCodeV2ReadStatus.js'
 import { isOpenCodeV2Pin } from '../services/opencode/compatibility/OpenCodeV2Registry.js'
+import { resolveOpenCodeV2Delivery, type OpenCodeV2DeliveryBinding } from '../services/opencode/host/OpenCodeV2DeliveryManifest.js'
+import { collectOpenCodeV2GraphFiles } from '../services/opencode/host/OpenCodeV2GraphFiles.js'
 
 // Separate process only. Credentials and the acquisition nonce arrive over private IPC.
 let started = false, closing = false, nonce: string | undefined
@@ -46,7 +48,12 @@ async function start(input: Record<string, unknown>): Promise<void> {
   const root = await realpath(input.root)
   controller.signal.throwIfAborted()
   openCodeReadAssert(root === process.cwd() && root === input.root && process.env.HOME === path.join(root, 'home'))
-  const graph = await verifyOpenCodeV2ServerGraph(input.pin)
+  const packaged = !import.meta.url.endsWith('/opencodeV2Server.ts')
+  openCodeReadAssert(!packaged || input.delivery !== undefined, 'opencode_v2_support_required')
+  const binding = input.delivery as OpenCodeV2DeliveryBinding | undefined
+  const delivery = binding ? await resolveOpenCodeV2Delivery(binding) : undefined
+  const graph = await verifyOpenCodeV2ServerGraph(input.pin, delivery?.binding)
+  if (delivery) await collectOpenCodeV2GraphFiles(input.pin, delivery.root, delivery.binding, controller.signal)
   controller.signal.throwIfAborted()
   const executableSha256 = await hashOpenCodeFile(process.execPath)
   controller.signal.throwIfAborted()

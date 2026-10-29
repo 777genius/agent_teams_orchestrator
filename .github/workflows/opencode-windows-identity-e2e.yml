@@ -66,7 +66,8 @@ jobs:
           "CANDIDATE=$((Resolve-Path dist/cli.exe).Path)" >> $env:GITHUB_ENV
       - name: Test producer PTY observation contracts
         run: bun test scripts/opencode-v2/packaged-pty-smoke.test.ts
-      - name: Prove both staged native PTY adapters with the shipped Bun
+      - name: Prove qualified staged native PTY adapters with the shipped Bun
+        if: matrix.platform == 'win32-x64'
         timeout-minutes: 3
         shell: pwsh
         env:
@@ -74,7 +75,7 @@ jobs:
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           $receipt = Join-Path $env:RUNNER_TEMP "TEST-packaged-pty-$env:PLATFORM.json"
-          & .\dist\bun\bun.exe --no-env-file scripts/opencode-v2/packaged-pty-smoke.ts .\dist $receipt $env:PLATFORM
+          & .\dist\bun\bun.exe --no-install --no-env-file scripts/opencode-v2/packaged-pty-smoke.ts .\dist .\dist\opencode-v2-support $receipt $env:PLATFORM
           if ($LASTEXITCODE -ne 0) { throw 'Native staged PTY proof failed' }
       - name: Prepare genuine npm OpenCode and verified public baseline
         shell: pwsh

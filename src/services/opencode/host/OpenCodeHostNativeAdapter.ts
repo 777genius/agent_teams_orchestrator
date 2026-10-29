@@ -9,11 +9,14 @@ import { createOpenCodeV2ReadRoots } from '../profile/OpenCodeV2ManagedConfig.js
 import { boundOpenCodeRead, openCodeReadAssert } from '../transport/OpenCodeBoundedFetch.js'
 import { readRecord } from '../catalog/OpenCodeV2ReadStatus.js'
 import { verifyOpenCodeV2ServerGraph } from './OpenCodeV2ServerGraph.js'
-import { resolveOpenCodeV2ChildEntry } from './OpenCodeV2ChildEntry.js'
+import { resolveOpenCodeV2ChildDelivery } from './OpenCodeV2ChildEntry.js'
+import { collectOpenCodeV2GraphFiles } from './OpenCodeV2GraphFiles.js'
+import type { OpenCodeV2DeliveryBinding } from './OpenCodeV2DeliveryManifest.js'
 
 export type OpenCodeV2EndpointAuthority = {
   native: OpenCodeV2NativeIdentity; baseUrl: string; pid: number; processBirth: number
   directory: string; instanceId: string; authorization: string
+  delivery?: OpenCodeV2DeliveryBinding
 }
 const owned = new WeakSet<OpenCodeV2EndpointAuthority>()
 export function assertOpenCodeV2EndpointAuthority(authority: OpenCodeV2EndpointAuthority): void {
@@ -31,7 +34,8 @@ export async function acquireOpenCodeV2ReadHost(native: OpenCodeV2NativeIdentity
   check()
   // Resolve delivery mode before package inspection. A compiled CLI is fenced,
   // rather than spawning its own executable as if it were a Bun interpreter.
-  const entry = await resolveOpenCodeV2ChildEntry()
+  const delivery = await resolveOpenCodeV2ChildDelivery()
+  const entry = delivery.entryPath
   check()
   const canonicalDirectory = await realpath(directory)
   check()
@@ -39,7 +43,8 @@ export async function acquireOpenCodeV2ReadHost(native: OpenCodeV2NativeIdentity
   const nativeSha256 = await hashOpenCodeFile(native.executablePath)
   check()
   openCodeReadAssert(nativeSha256 === native.executableSha256, 'identity_mismatch')
-  const graph = await verifyOpenCodeV2ServerGraph(openCodeV2EngineVersion(native))
+  const graph = await verifyOpenCodeV2ServerGraph(openCodeV2EngineVersion(native), delivery.binding)
+  if (delivery.binding) await collectOpenCodeV2GraphFiles(openCodeV2EngineVersion(native), delivery.root, delivery.binding, context.signal)
   check()
   const roots = await createOpenCodeV2ReadRoots()
   const nonce = randomUUID(), password = randomBytes(32).toString('base64url')
@@ -73,7 +78,7 @@ export async function acquireOpenCodeV2ReadHost(native: OpenCodeV2NativeIdentity
     check()
     const executableSha256 = await hashOpenCodeFile(executable)
     check()
-    child = spawn(executable, [entry], { cwd: roots.root, env: roots.env,
+    child = spawn(executable, ['--no-install', entry], { cwd: roots.root, env: roots.env,
       stdio: ['ignore', 'ignore', 'ignore', 'ipc'], windowsHide: true })
     child.once('close', () => { exited = true; resolveExit() })
     child.on('message', message => {
@@ -100,7 +105,7 @@ export async function acquireOpenCodeV2ReadHost(native: OpenCodeV2NativeIdentity
     check()
     openCodeReadAssert(!closeWork && !exited && birth !== null, 'identity_mismatch')
     child.send({ type: 'start', nonce, pin: openCodeV2EngineVersion(native), root: roots.root, password,
-      executableSha256, moduleSha256: graph.moduleSha256 })
+      executableSha256, moduleSha256: graph.moduleSha256, ...(delivery.binding ? { delivery: delivery.binding } : {}) })
     const row = await boundOpenCodeRead(ready, deadline - Date.now(), context.signal)
     check()
     const currentBirth = await readProcessStartTimeMs(child.pid)
@@ -110,7 +115,8 @@ export async function acquireOpenCodeV2ReadHost(native: OpenCodeV2NativeIdentity
       currentBirth === birth, 'identity_mismatch')
     openCodeReadAssert(typeof row.baseUrl === 'string' && /^http:\/\/127\.0\.0\.1:[1-9]\d*$/.test(row.baseUrl), 'identity_mismatch')
     authority = Object.freeze({ native: Object.freeze({ ...native }), baseUrl: row.baseUrl, pid: child.pid, processBirth: birth,
-      directory, instanceId: nonce, authorization: 'Basic ' + Buffer.from(`opencode:${password}`).toString('base64') })
+      directory, instanceId: nonce, authorization: 'Basic ' + Buffer.from(`opencode:${password}`).toString('base64'),
+      ...(delivery.binding ? { delivery: delivery.binding } : {}) })
     owned.add(authority)
     return { authority, close: async () => {
       context.signal?.removeEventListener('abort', abort)

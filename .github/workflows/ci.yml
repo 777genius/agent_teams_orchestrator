@@ -396,7 +396,7 @@ jobs:
       - name: Test native compiled delegation and cancellation
         run: bun test scripts/ci/verify-packaged-delivery.test.ts src/cli/packagedOpenCodeDelivery.test.ts scripts/opencode-v2/native-video.test.ts scripts/opencode-v2/stage.test.ts scripts/opencode-v2/stage-copy.test.ts scripts/opencode-v2/staged-files.test.ts src/services/opencode/host/OpenCodeV2ExecutionAuth.test.ts src/services/opencode/host/OpenCodeV2PlainExecution.test.ts src/services/opencode/profile/OpenCodeV2ExecutionConfig.test.ts src/services/opencode/host/OpenCodeV2ExecutionLifecycle.test.ts src/features/runtimeProviderManagement/adapters/opencode/OpenCodeV2ProviderManagement.test.ts
       - name: Produce physical JS and native front door
-        run: bun scripts/package-runtime.ts --platform ${{ matrix.platform }}
+        run: bun --no-install scripts/package-runtime.ts --platform ${{ matrix.platform }}
       - name: Verify and archive complete candidate delivery
         shell: bash
         env:
@@ -410,13 +410,14 @@ jobs:
           mkdir -p candidate/runtime
           cp "$CANDIDATE_BINARY" "candidate/runtime/$CANDIDATE_EXECUTABLE"
           cp dist/opencode-delivery.json candidate/runtime/opencode-delivery.json
+          cp dist/opencode-v2-delivery.json candidate/runtime/opencode-v2-delivery.json
           cp -R dist/local-cli dist/bun dist/cursor-managed candidate/runtime/
           if [[ "$CANDIDATE_PLATFORM" == linux-* ]]; then
             custody="candidate/runtime/native/opencode-custody/$CANDIDATE_PLATFORM"
             mkdir -p "$custody"
             cp "dist/native/opencode-custody/$CANDIDATE_PLATFORM/custodian" "dist/native/opencode-custody/$CANDIDATE_PLATFORM/custodian.json" "$custody/"
           fi
-          bun scripts/ci/verify-packaged-delivery.ts
+          bun --no-install scripts/ci/verify-packaged-delivery.ts
           if [[ "$CANDIDATE_PLATFORM" == linux-* ]]; then
             {
               printf '%s\n' 'Checkpoint ABI evidence only: Linux portability remains unqualified.'
@@ -430,8 +431,11 @@ jobs:
               done
             } > candidate/runtime/linux-elf-abi.txt
           fi
+          cp dist/opencode-v2-delivery.json candidate/opencode-v2-delivery.json
+          support_archive="$(bun --no-install -e 'console.log(JSON.parse(await Bun.file("dist/opencode-v2-delivery.json").text()).archive.file)')"
+          cp "dist/$support_archive" candidate/
           printf '%s\n' "$CANDIDATE_SOURCE_SHA" > candidate/runtime/COMMIT_SHA
-          tar -czf "candidate-$CANDIDATE_PLATFORM.tar.gz" -C candidate runtime
+          tar -czf "candidate-$CANDIDATE_PLATFORM.tar.gz" -C candidate .
       - name: Serve every staged V2 graph from the extracted candidate archive
         timeout-minutes: 10
         shell: bash
@@ -449,7 +453,10 @@ jobs:
           tar -xzf "candidate-$CANDIDATE_PLATFORM.tar.gz" -C "$extracted"
           shipped_bun="$extracted/runtime/bun/bun"
           if [[ "$CANDIDATE_PLATFORM" == win32-* ]]; then shipped_bun="$extracted/runtime/bun/bun.exe"; fi
-          "$shipped_bun" --no-env-file scripts/opencode-v2/packaged-server-smoke.ts "$extracted/runtime" "packaged-server-smoke-$CANDIDATE_PLATFORM.json"
+          support_archive="$(bun --no-install -e 'console.log(JSON.parse(await Bun.file(process.argv[1]).text()).archive.file)' "$extracted/opencode-v2-delivery.json")"
+          mkdir -p "$extracted/support"
+          unzip -q "$extracted/$support_archive" -d "$extracted/support"
+          "$shipped_bun" --no-install --no-env-file scripts/opencode-v2/packaged-server-smoke.ts "$extracted/runtime" "$extracted/support" "packaged-server-smoke-$CANDIDATE_PLATFORM.json"
       - name: Preserve staged V2 server evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -541,8 +548,8 @@ jobs:
           mkdir -p "$fixture/delivery" "$fixture/home" "$fixture/config" "$fixture/data" "$fixture/cache" "$fixture/tmp" "$fixture/vendors"
           chmod 700 "$fixture/vendors"
           tar -xzf .task-inputs/native-custody-candidate/candidate-linux-x64.tar.gz -C "$fixture/delivery" \
-            runtime/native/opencode-custody/linux-x64/custodian runtime/native/opencode-custody/linux-x64/custodian.json \
-            runtime/COMMIT_SHA runtime/security-capabilities.json runtime/linux-elf-abi.txt
+            ./runtime/native/opencode-custody/linux-x64/custodian ./runtime/native/opencode-custody/linux-x64/custodian.json \
+            ./runtime/COMMIT_SHA ./runtime/security-capabilities.json ./runtime/linux-elf-abi.txt
           custody_bun="$(command -v bun)"
           # Keep synthetic lifecycle tests in their own process; module mocks must not reach physical qualification.
           env -i PATH=/usr/bin:/bin HOME="$fixture/home" USERPROFILE="$fixture/home" TMPDIR="$fixture/tmp" \

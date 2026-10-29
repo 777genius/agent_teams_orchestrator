@@ -85,7 +85,7 @@ async function catalog<T>(input: { providerId: string; projectPath?: string | nu
   const unregister = registerExecutionDisposer(lease.authority, () => wire.dispose())
   try {
     const location = { directory: project }
-    const selected = await importOpenCodeV2ClientModule(lease.authority.pin, await resolveOpenCodeV2ClientEntry(lease.authority.pin))
+    const selected = await importOpenCodeV2ClientModule(lease.authority.pin, await resolveOpenCodeV2ClientEntry(lease.authority.pin, undefined, native.graph.delivery))
     const sdk = selected.wire === 'floor' ? selected.module.OpenCode.make({ baseUrl: endpoint.baseUrl, fetch: wire.fetch })
       : selected.module.OpenCode.make({ baseUrl: endpoint.baseUrl, fetch: wire.fetch })
     return await use({ native, authority: lease.authority, profile, authPath: imported.authPath, preferredModel: imported.preferredModel, scopeToken: scope.scopeToken,
@@ -111,7 +111,7 @@ async function readOriginalConnection(owner: CatalogOwner, saved: Record<string,
   const wire = new ProviderWire(lease.authority, deadline), endpoint = requireExecutionEndpoint(lease.authority)
   const unregister = registerExecutionDisposer(lease.authority, () => wire.dispose())
   try {
-    const selected = await importOpenCodeV2ClientModule(lease.authority.pin, await resolveOpenCodeV2ClientEntry(lease.authority.pin))
+    const selected = await importOpenCodeV2ClientModule(lease.authority.pin, await resolveOpenCodeV2ClientEntry(lease.authority.pin, undefined, owner.native.graph.delivery))
     const sdk = selected.module.OpenCode.make({ baseUrl: endpoint.baseUrl, fetch: wire.fetch })
     const info = scopedIntegration(await sdk.integration.get({ location: { directory: owner.authority.directory },
       integrationID: text(saved.integrationID) }), owner.authority.directory, text(saved.integrationID))

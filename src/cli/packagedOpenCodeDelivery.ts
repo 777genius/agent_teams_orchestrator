@@ -111,7 +111,7 @@ export async function runPackagedOpenCodeDelivery(args: string[], embedded: Pack
     await verifiedBunSidecar(bun, identity.bunSha256, runtimeExe, controller.signal)
     await verifiedSidecar(entry, identity.entrySha256, controller.signal)
     controller.signal.throwIfAborted()
-    child = spawn(bun, [entry, ...args], { cwd: process.cwd(), env: { ...process.env }, stdio: [0, 1, 2], shell: false, windowsHide: true })
+    child = spawn(bun, ['--no-install', entry, ...args], { cwd: process.cwd(), env: { ...process.env }, stdio: [0, 1, 2], shell: false, windowsHide: true })
     const result = await new Promise<{code: number | null; signal: NodeJS.Signals | null}>((resolve, reject) => {
       child!.once('error', reject)
       child!.once('close', (code, signal) => resolve({ code, signal }))
