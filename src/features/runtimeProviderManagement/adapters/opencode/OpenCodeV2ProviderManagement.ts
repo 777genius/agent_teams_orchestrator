@@ -10,6 +10,7 @@ import type { Stats } from 'node:fs'
 import { isDeepStrictEqual } from 'node:util'
 import { importOpenCodeV2ClientModule, resolveOpenCodeV2ClientEntry } from '../../../../services/opencode/transport/OpenCodeV2ClientModule.js'
 import { getOpenCodeV2DeclaredInputModalities } from '../../../../services/opencode/OpenCodeDeclaredInputModalities.js'
+import { readIntegration } from '../../../../services/opencode/catalog/OpenCodeV2ReadStatus.js'
 import { inspectOpenCodeReadSelection } from '../../../../services/opencode/compatibility/OpenCodeNativeIdentity.js'
 export { inspectOpenCodeReadSelection } from '../../../../services/opencode/compatibility/OpenCodeNativeIdentity.js'
 import { canonicalizeOpenCodeProjectPath, resolveOpenCodeV2CatalogProfileScope, materializeOpenCodeV2CatalogScope } from '../../../../services/opencode/OpenCodeProfileManager.js'
@@ -27,9 +28,10 @@ import { assertLegacyOpenCodeV2ProbePreEffect, ensureOpenCodeV2ProbeStore } from
 import { prepareOpenCodeV2ConnectVerification, readRetiredOpenCodeV2CatalogProfile,
   readOpenCodeV2ConnectIntent, writeOpenCodeV2ConnectIntent, type OpenCodeV2ConnectIntent } from './OpenCodeV2ProviderConnectIntent.js'
 import { parseOpenCodeExecutionProof } from '../../../../services/opencode/OpenCodeExecutionProof.js'
+import { normalizeOpenCodeProjectIdentity } from '../../../../services/opencode/OpenCodeProjectIdentity.js'
 import type { OpenCodeExecutionProof } from '../../../../services/opencode/types.js'
 import type { BridgeEnvelope } from '../../../../services/opencode/bridge/OpenCodeBridgeProtocol.js'
-import type { ConnectProviderInput, LoadProviderModelsInput, TestProviderModelInput, ProviderConnection, RuntimeProviderModel, RuntimeProviderModelsView, ProviderModelTestResult, ProviderManagementResult, ProviderSetupForm } from '../../domain/types.js'
+import type { ConnectProviderInput, LoadProviderModelsInput, LoadProviderSetupFormInput, TestProviderModelInput, ProviderConnection, RuntimeProviderModel, RuntimeProviderModelsView, ProviderModelTestResult, ProviderManagementResult, ProviderSetupForm } from '../../domain/types.js'
 import { OPENCODE_V2_NATIVE_KEY_OPTION_ID, openCodeV2KeyIntegration, openCodeV2ProviderConnectionsDirectory } from '../../../../services/opencode/catalog/OpenCodeV2KeyIntegrations.js'
 import type { OpenCodeV2Pin } from '../../../../services/opencode/compatibility/OpenCodeV2Registry.js'
 
@@ -168,7 +170,7 @@ export async function connectOpenCodeV2Provider(input: ConnectProviderInput): Pr
   const apiKey = input.apiKey?.trim()
   if (!apiKey) return resultError('auth-failed', 'API key is required.')
   if (input.metadata && Object.keys(input.metadata).length || input.authMethodIndex !== undefined && input.authMethodIndex !== null ||
-    input.authOptionId && !(input.authOptionId === OPENCODE_V2_NATIVE_KEY_OPTION_ID && openCodeV2KeyIntegration(input.providerId)))
+    input.authOptionId && input.authOptionId !== OPENCODE_V2_NATIVE_KEY_OPTION_ID)
     return resultError('unsupported-auth-method', 'This V2 source path requires the native key method without an additional setup form.')
   let retainUnknown = false, marker: string | undefined, acceptedProof: OpenCodeExecutionProof | undefined
   let pendingIntent: OpenCodeV2ConnectIntent | undefined, originalIntent: Record<string, unknown> | undefined
@@ -214,7 +216,7 @@ export async function connectOpenCodeV2Provider(input: ConnectProviderInput): Pr
             await writeOpenCodeV2ConnectIntent(marker!, pendingIntent)
           } })
         executionAssert(proof.state === 'available' && proof.proof, 'provider_original_execution_pending')
-        executionAssert(proof.proof.modelId === target.modelId && proof.proof.projectPath === owner.authority.directory, 'provider_execution_target_changed')
+        executionAssert(proof.proof.modelId === target.modelId && proof.proof.projectPath === normalizeOpenCodeProjectIdentity(owner.authority.directory), 'provider_execution_target_changed')
         executionAssert(isDeepStrictEqual(await readOpenCodeAuthCredential({ authPath: owner.authPath, providerId: input.providerId }), published), 'provider_auth_publication_changed')
         acceptedProof = proof.proof; phase = 'catalog-retirement'
         return { providerId: input.providerId, displayName: text(provider.name), state: 'connected', ownership: ['managed'],
@@ -283,15 +285,40 @@ export async function connectOpenCodeV2Provider(input: ConnectProviderInput): Pr
 export function buildOpenCodeV2KeySetupForm(providerId: string, version: OpenCodeV2Pin): ProviderSetupForm | null {
   const integration = openCodeV2KeyIntegration(providerId, version)
   if (!integration) return null
+  return nativeKeySetupForm(providerId, integration.displayName)
+}
+
+function nativeKeySetupForm(providerId: string, displayName: string): ProviderSetupForm {
   const secret = { key: 'key' as const, label: 'API key', placeholder: null, required: true }
-  return { runtimeId: 'opencode', providerId, displayName: integration.displayName, method: 'api', supported: true,
-    title: `Connect ${integration.displayName}`,
+  return { runtimeId: 'opencode', providerId, displayName, method: 'api', supported: true,
+    title: `Connect ${displayName}`,
     description: 'The key is connected through the selected OpenCode V2 native integration and verified with one model request.',
     submitLabel: 'Connect', disabledReason: null, source: 'opencode-auth', secret, prompts: [],
     authOptions: [{ id: OPENCODE_V2_NATIVE_KEY_OPTION_ID, method: 'api', methodIndex: null, label: 'API key', supported: true,
       disabledReason: null, secret, prompts: [] }],
     defaultAuthOptionId: OPENCODE_V2_NATIVE_KEY_OPTION_ID,
     verification: { kind: 'model-request', freeModelPreferred: false, mayUseQuotaOrBalance: true } }
+}
+
+/** Read the selected native provider's actual integration; opening a form never submits a key or a model request. */
+export async function loadOpenCodeV2ProviderSetupForm(input: LoadProviderSetupFormInput,
+  selectedRead?: Awaited<ReturnType<typeof inspectOpenCodeReadSelection>>): Promise<ProviderManagementResult<ProviderSetupForm>> {
+  try {
+    return await catalog(input, async owner => {
+      const provider = scopedRows(await owner.providers(), owner.authority.directory).find(row => row.id === input.providerId)
+      if (!provider || typeof provider.integrationID !== 'string') {
+        return resultError('unsupported-auth-method', 'This provider does not expose a supported API-key setup method. Configure it in OpenCode.')
+      }
+      const integrationID = text(provider.integrationID)
+      const integration = readIntegration(scopedIntegration(await owner.integration(integrationID), owner.authority.directory, integrationID))
+      if (!integration.plainKey) {
+        return resultError('unsupported-auth-method', 'This provider requires sign-in or additional setup in OpenCode. API-key setup without an additional form is not available.')
+      }
+      return { ok: true as const, value: nativeKeySetupForm(input.providerId, integration.name) }
+    }, selectedRead)
+  } catch (error) {
+    return resultError('runtime-unhealthy', openCodeV2Refusal(error)?.message ?? 'The OpenCode provider setup could not be loaded. Refresh providers and try again.')
+  }
 }
 
 /** Terminal failures must not be presented as an execution still in progress. */
@@ -306,7 +333,7 @@ export async function testOpenCodeV2ProviderModel(input: TestProviderModelInput)
     const project = await canonicalizeOpenCodeProjectPath(input.projectPath)
     executionAssert(input.modelId.startsWith(input.providerId + '/'), 'provider_model_changed')
     const proof = await executionProof(project, input.modelId)
-    const ok = proof.state === 'available' && proof.proof?.modelId === input.modelId && proof.proof.projectPath === project
+    const ok = proof.state === 'available' && proof.proof?.modelId === input.modelId && proof.proof.projectPath === normalizeOpenCodeProjectIdentity(project)
     return { ok: true, value: { providerId: input.providerId, modelId: input.modelId, ok,
       availability: ok ? 'available' : 'unknown', message: openCodeV2ModelTestMessage(ok, proof.state), diagnostics: [] } }
   } catch (error) { return resultError('runtime-unhealthy', openCodeV2Refusal(error)?.message ?? 'V2 selected-model execution could not be qualified. No alternate model was tried.') }

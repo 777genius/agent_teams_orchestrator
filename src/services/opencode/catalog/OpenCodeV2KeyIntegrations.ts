@@ -1,6 +1,7 @@
 import { lstat, readdir, readFile } from 'node:fs/promises'
 import path from 'node:path'
 import { resolveClaudeMultimodelPaths } from '../OpenCodeManagedPaths.js'
+import { normalizeOpenCodeProjectIdentity } from '../OpenCodeProjectIdentity.js'
 import type { OpenCodeConnectedProvider } from '../types.js'
 import { openCodeV2Wire, type OpenCodeV2Pin } from '../compatibility/OpenCodeV2Registry.js'
 
@@ -56,7 +57,7 @@ export async function readOpenCodeV2ConnectedProviders(project: string, version:
       const connection = receipt.connection !== null && typeof receipt.connection === 'object' ? receipt.connection as Record<string, unknown> : {}
       const proof = receipt.proof !== null && typeof receipt.proof === 'object' ? receipt.proof as Record<string, unknown> : {}
       if (receipt.state !== 'complete' || connection.state !== 'connected' || typeof connection.providerId !== 'string' ||
-        proof.projectPath !== project || proof.opencodeVersion !== version) continue
+        proof.projectPath !== normalizeOpenCodeProjectIdentity(project) || proof.opencodeVersion !== version) continue
       connected.set(connection.providerId, { id: connection.providerId, authHint: 'api', source: 'credentials', credentialScopes: ['managed'] })
     } catch { /* An unreadable receipt is not evidence of a connection. */ }
   }

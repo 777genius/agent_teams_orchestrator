@@ -11,6 +11,7 @@ import { OpenCodeBoundedFetch } from './OpenCodeBoundedFetch.js'
 export type OpenCodeV2ReadClient = {
   identity(): Promise<unknown>; urls(): Promise<unknown>
   location(directory: string): Promise<unknown>; ready(directory: string): Promise<void>
+  integrations(directory: string): Promise<unknown>
   models(directory: string): Promise<unknown>; defaultModel(directory: string): Promise<unknown>
   providers(directory: string): Promise<unknown>; provider(directory: string, id: string): Promise<unknown>
   agents(directory: string): Promise<unknown>; agent(directory: string, id: string): Promise<unknown>

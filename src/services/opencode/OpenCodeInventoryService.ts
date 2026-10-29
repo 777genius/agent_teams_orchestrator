@@ -16,6 +16,7 @@ import { readOpenCodeAuthProviderSummaries } from './OpenCodeAuthStore.js'
 import { resolveOpenCodeBinaryPath } from './OpenCodeBinaryResolver.js'
 import { inspectOpenCodeReadSelection } from './compatibility/OpenCodeNativeIdentity.js'
 import { probeOpenCodeV2Inventory } from './catalog/OpenCodeV2InventoryService.js'
+import { emptyOpenCodeV2ReadStatus } from './catalog/OpenCodeV2ReadStatus.js'
 import { openCodeV2KeyIntegrations, readOpenCodeV2ConnectedProviders } from './catalog/OpenCodeV2KeyIntegrations.js'
 import {
   getOpenCodeManagedSubscriptionPluginPackages,
@@ -1119,7 +1120,21 @@ export class OpenCodeInventoryService {
     finally { leaveSelection?.(); options.onReadAcquisitionSettled?.() }
     if (selection.native && mode === 'full') {
       options.onV2ReadStarted?.()
-      return probeOpenCodeV2Inventory(selection.native, resolvedProjectPath, { signal: options.abortSignal, remainingMs: options.remainingMs })
+      const identity = emptyOpenCodeV2ReadStatus(selection.native, resolvedProjectPath)
+      const cacheKey = `v2-catalog\0${identity.selectionKey}\0${identity.locationKey}`
+      const cached = this.cache.get(cacheKey)
+      if (!options.bypassCache && !options.refreshModels && cached && cached.expiresAt > Date.now()) {
+        // Connection receipts can change independently of the public catalog.
+        let connectedProviders: OpenCodeConnectedProvider[] = []
+        try { connectedProviders = await readOpenCodeV2ConnectedProviders(resolvedProjectPath, selection.native.version) } catch { /* unknown is not connected */ }
+        options.abortSignal?.throwIfAborted()
+        return { ...cached.snapshot, connectedProviders }
+      }
+      const snapshot = await probeOpenCodeV2Inventory(selection.native, resolvedProjectPath, { signal: options.abortSignal, remainingMs: options.remainingMs })
+      if (!options.abortSignal?.aborted && !snapshot.probeError && snapshot.readStatus?.catalog === 'ready') {
+        this.cache.set(cacheKey, { snapshot, expiresAt: Date.now() + OPEN_CODE_CACHE_TTL_MS })
+      } else this.cache.delete(cacheKey)
+      return snapshot
     }
     if (selection.path && selection.policy.generation !== 'v1') {
       // Passive V2 reads still list the native key integrations and their completed connections.

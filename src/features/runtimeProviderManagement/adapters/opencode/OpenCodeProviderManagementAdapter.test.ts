@@ -1664,12 +1664,12 @@ describe('OpenCodeProviderManagementAdapter', () => {
     )
   })
 
-  test('uses profile-only inventory for provider directory discovery instead of spawning duplicate CLI probes', async () => {
-    const inventoryModes: Array<string | undefined> = []
+  test('keeps V1 profile-only discovery while allowing the native V2 full directory read', async () => {
+    const inventoryModes: Array<{ mode?: string; v1SettingsOnly?: boolean }> = []
     const adapter = new OpenCodeProviderManagementAdapter({
       inventoryService: {
         probe: async (_projectPath, options) => {
-          inventoryModes.push(options?.mode)
+          inventoryModes.push({ mode: options?.mode, v1SettingsOnly: options?.v1SettingsOnly })
           return inventory({ availableProviders: ['xai'] })
         },
       },
@@ -1695,7 +1695,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
 
     await adapter.loadDirectory({ runtimeId: 'opencode' })
 
-    expect(inventoryModes).toEqual(['profile'])
+    expect(inventoryModes).toEqual([{ mode: 'full', v1SettingsOnly: true }])
   })
 
   test('forces a full catalog refresh and reads it through a fresh process host', async () => {

@@ -249,6 +249,20 @@ jobs:
         run: bun run test:opencode-authority --timeout ${{ runner.os == 'Windows' && '30000' || '5000' }}
       - name: Test provider settings and HTTP body deadlines
         run: bun test src/features/runtimeProviderManagement/adapters/opencode/OpenCodeProviderManagementAdapter.test.ts src/services/opencode/OpenCodeProviderIdentity.test.ts src/services/opencode/OpenCodeInventoryService.test.ts src/services/opencode/OpenCodeProviderLabelRegression.test.ts src/services/opencode/OpenCodeClientFactory.test.ts --timeout 30000
+      - name: Test V2 provider discovery and project identity
+        run: >-
+          bun test
+          src/features/runtimeProviderManagement/adapters/opencode/OpenCodeV2ProviderDirectory.test.ts
+          src/features/runtimeProviderManagement/adapters/opencode/OpenCodeV2ProviderManagement.project-identity.test.ts
+          src/services/opencode/catalog/OpenCodeV2ReadStatus.test.ts
+          src/services/opencode/catalog/OpenCodeV2KeyIntegrations.test.ts
+          --timeout 30000
+      - name: Test V2 provider routing in isolation
+        run: bun test src/features/runtimeProviderManagement/adapters/opencode/OpenCodeProviderManagementAdapter.v2-routing.test.ts --timeout 30000
+      - name: Test provider selection failures in isolation
+        run: bun test src/features/runtimeProviderManagement/adapters/opencode/OpenCodeProviderSelectionFailure.test.ts --timeout 30000
+      - name: Test V2 catalog cache in isolation
+        run: bun test src/services/opencode/OpenCodeInventoryService.v2-cache.test.ts --timeout 30000
       - name: Test Windows startup cleanup completion contracts
         run: bun test src/utils/processKill.test.ts src/services/opencode/OpenCodeStartupCleanupBudget.test.ts src/services/opencode/OpenCodeStartupCleanup.test.ts --timeout 30000
       - name: Test native Windows startup termination
