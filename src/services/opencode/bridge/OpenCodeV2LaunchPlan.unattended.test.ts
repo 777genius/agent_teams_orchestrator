@@ -5,6 +5,7 @@ import { EventEmitter } from 'node:events'
 import { mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import { openCodeBunVersion } from '../../../constants/openCodeBunVersion.js'
 import * as profiles from '../OpenCodeProfileManager.js'
 import * as nativeIdentity from '../compatibility/OpenCodeNativeIdentity.js'
 import * as receipts from '../profile/OpenCodeV2ExecutionReceipt.js'
@@ -16,13 +17,18 @@ import * as projectIdentity from '../OpenCodeProjectIdentity.js'
 import { buildOpenCodeExecutionProof } from '../OpenCodeExecutionProof.js'
 import { executionHash } from '../execution/OpenCodeV2ExecutionContracts.js'
 import { attachOpenCodeV2SelectedKey } from '../host/OpenCodeV2ExecutionAuth.js'
+import { stagedOpenCodeV2Client } from '../compatibility/fixtures/stagedOpenCodeV2Pins.js'
+import { executionCurrentOperations } from '../transport/OpenCodeV2ExecutionCurrentClient.js'
+import { executionFloorOperations } from '../transport/OpenCodeV2ExecutionFloorClient.js'
+import { OpenCodeV2ExecutionFetch } from '../transport/OpenCodeV2ExecutionFetch.js'
 import { createOpenCodeV2PreparedMember, createOpenCodeV2LaunchPlan, inspectOpenCodeV2SourceAvailability } from './OpenCodeV2LaunchPlan.js'
 import { launchExplicitOpenCodeV2Run, startOpenCodeV2RunSupervisor } from './OpenCodeV2RunOwner.js'
 import type { BridgeEnvelope } from './OpenCodeBridgeProtocol.js'
 import type { OpenCodePreparedProfile, OpenCodeProfileScope, OpenCodeProvisioningSnapshot } from '../types.js'
 import type { ValidatedExecutionNative } from '../host/OpenCodeV2ExecutionHost.js'
+import type { QueueIntent } from '../execution/OpenCodeV2AdmissionService.js'
 
-let root: string, project: string, pin: '2.0.0' | '2.0.32' = '2.0.32'
+let root: string, project: string, pin: '2.0.0' | '2.0.32' | '2.1.4' = '2.0.32'
 let saved: NodeJS.ProcessEnv
 let nativeSelectionCalls = 0, nativeReceiptCalls = 0
 let receiptControllers: unknown[] = []
@@ -34,7 +40,7 @@ const restores: { mockRestore(): void }[] = []
 const behavior = 'b'.repeat(64)
 const digest = (value: string) => createHash('sha256').update(value).digest('hex')
 function native(): ValidatedExecutionNative {
-  return { generation: 'v2', version: pin, dialect: pin === '2.0.0' ? 'v2-2.0.0' : 'v2-2.0.32',
+  return { generation: 'v2', version: pin, dialect: `v2-${pin}`,
     executablePath: '/TEST/qualified/opencode', executableSha256: 'a'.repeat(64), packageName: '@opencode/cli-linux-x64',
     runtimeMode: 'source', entrySha256: 'a'.repeat(64), bun: { path: process.execPath, sha256: 'a'.repeat(64) },
     graph: { sha256: 'a'.repeat(64), files: [{ path: import.meta.path, sha256: 'a'.repeat(64) }] } }
@@ -86,6 +92,45 @@ async function proof(prepared: OpenCodePreparedProfile, capabilitySnapshotId: st
   return buildOpenCodeExecutionProof({ selectedModel: 'provider/model', snapshot, capabilitySnapshotId, verifiedAt }, {
     resolveBinaryPath: () => native().executablePath, resolveBinaryIdentity: async () => 'TEST-native-identity', readCredential: async () => null, platform })
 }
+const titleVersions = process.platform === 'win32' ? ['2.1.4'] as const : ['2.0.0', '2.0.32', '2.1.4'] as const
+for (const version of titleVersions) test(`${version} probe-owned session title prevents automatic title requests without changing team sessions`, async () => {
+  pin = version
+  const request = envelope()
+  request.body.members = [{ name: 'probe', prompt: 'TEST-private briefing', title: 'TEST-caller-title' }]
+  const selection = await inspectOpenCodeV2SourceAvailability(request)
+  const intent: QueueIntent = { identity: { requestId: 'TEST-probe', deliveryAttemptId: 'TEST-probe',
+    localMessageId: 'TEST-probe', nativeInputID: 'msg_TESTprobe' }, delivery: 'queue',
+    input: { nativeInputID: 'msg_TESTprobe', resume: true, text: 'TEST-verification-input' } }
+  const probe = await launchPlans.buildOpenCodeV2InternalRunPlan(selection, request.body, 'TEST-probe-controller',
+    { intent, expectedText: 'TEST-verification-result' })
+  const team = await launchPlans.buildOpenCodeV2InternalRunPlan(selection, request.body, 'TEST-team-controller')
+  const member = probe.members[0]!
+  expect(member.title).toBe('Agent Teams model verification')
+  expect(probe.executionProbe?.intent).toEqual(intent)
+  // A name or caller-supplied title cannot turn an ordinary team member into a probe.
+  expect(team.members[0]).not.toHaveProperty('title')
+  expect(team.executionProbe).toBeUndefined()
+
+  // Check the generated floor/current SDK request too: a plan-only title would
+  // still leave the native engine free to issue its second, automatic request.
+  const base = 'http://127.0.0.1:31999', calls: Request[] = []
+  const session = { id: member.originalSessionId, directory: project, ...member.profile.selection, time: { created: 1 } }
+  const fetch = Object.assign(async (input: Parameters<typeof globalThis.fetch>[0], init?: Parameters<typeof globalThis.fetch>[1]) => {
+    calls.push(new Request(input, init))
+    return new Response(JSON.stringify({ data: session }), { headers: { 'content-type': 'application/json' } })
+  }, { preconnect(): never { throw new Error('TEST preconnect unsupported') } })
+  const wire = new OpenCodeV2ExecutionFetch(base, version, project, 'TEST-password', { deadline: Date.now() + 10_000 }, fetch)
+  try {
+    const client = await stagedOpenCodeV2Client(version)
+    const operations = version === '2.0.0'
+      ? executionFloorOperations(client, base, project, wire, fetch)
+      : executionCurrentOperations(client, base, project, wire, fetch)
+    await operations.create({ sessionID: member.originalSessionId, agent: member.profile.selection.agent,
+      model: member.profile.selection.model, title: member.title })
+    expect(calls).toHaveLength(1)
+    expect(await calls[0]!.json()).toMatchObject({ id: member.originalSessionId, title: 'Agent Teams model verification' })
+  } finally { await wire.dispose() }
+})
 for (const version of ['2.0.0', '2.0.32'] as const) test(`${version} absent selected auth routes prepared profiles through native free-model readback while sealing paid keys`, async () => {
   pin = version
   const selection = await inspectOpenCodeV2SourceAvailability(envelope())
@@ -166,6 +211,7 @@ for (const version of ['2.0.0', '2.0.32'] as const) test(`${version} admits Linu
   try {
     for (const host of ['linux', 'darwin'] as const) {
       Object.defineProperty(process, 'platform', { ...platform, value: host })
+      Object.defineProperty(process.versions, 'bun', { ...bun, value: openCodeBunVersion(host) })
       const selection = await inspectOpenCodeV2SourceAvailability(envelope())
       expect(selection.native.version).toBe(version)
       expect(selection.installedGraphFiles).toBeGreaterThan(0)

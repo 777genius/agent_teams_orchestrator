@@ -7,6 +7,10 @@ on:
       - .github/workflows/opencode-v1-provider-regression.yml
 permissions:
   contents: read
+concurrency:
+  group: opencode-v1-provider-regression-${{ github.event_name }}-${{ (github.event_name == 'pull_request' || github.event_name == 'push') && (github.event.pull_request.number || github.ref) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
+
 jobs:
   windows-provider:
     runs-on: windows-latest

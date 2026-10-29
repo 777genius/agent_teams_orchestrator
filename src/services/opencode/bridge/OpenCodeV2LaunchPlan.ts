@@ -239,6 +239,8 @@ async function buildOpenCodeV2InternalRunPlanWithNative(selection: Awaited<Retur
       memberName: memberId, runId, laneId, runtimeSessionId: sessionID, prompt })
     const briefingHash = executionHash({ purpose: 'opencode-app-managed-bootstrap-briefing-v1', teamName: teamId, memberName: memberId, runId, laneId, prompt })
     members.push({ memberId, laneId, originalSessionId: sessionID, native, profile,
+      // An untitled native root session generates its title with another model request.
+      ...(probe ? { title: 'Agent Teams model verification' } : {}),
       bootstrap: { key: 'agent-teams.context', value, contextHash: await hashText(value), briefingHash },
       controllerMcpName: 'agent-teams', advertisedTools: [] })
   }

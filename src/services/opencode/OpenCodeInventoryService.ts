@@ -16,6 +16,7 @@ import { readOpenCodeAuthProviderSummaries } from './OpenCodeAuthStore.js'
 import { resolveOpenCodeBinaryPath } from './OpenCodeBinaryResolver.js'
 import { inspectOpenCodeReadSelection } from './compatibility/OpenCodeNativeIdentity.js'
 import { probeOpenCodeV2Inventory } from './catalog/OpenCodeV2InventoryService.js'
+import { emptyOpenCodeV2ReadStatus } from './catalog/OpenCodeV2ReadStatus.js'
 import { openCodeV2KeyIntegrations, readOpenCodeV2ConnectedProviders } from './catalog/OpenCodeV2KeyIntegrations.js'
 import {
   getOpenCodeManagedSubscriptionPluginPackages,
@@ -1033,9 +1034,11 @@ export function parseOpenCodeAgentListOutput(output: string): OpenCodeAgentSumma
 
 export class OpenCodeInventoryService {
   private readonly cache = new Map<string, CacheEntry>()
+  private readonly v2CatalogReads = new Map<string, symbol>()
 
   clearCache(): void {
     this.cache.clear()
+    this.v2CatalogReads.clear()
   }
 
   /** See seedOpenCodeModelsCache; call it before a catalog host starts. */
@@ -1119,7 +1122,33 @@ export class OpenCodeInventoryService {
     finally { leaveSelection?.(); options.onReadAcquisitionSettled?.() }
     if (selection.native && mode === 'full') {
       options.onV2ReadStarted?.()
-      return probeOpenCodeV2Inventory(selection.native, resolvedProjectPath, { signal: options.abortSignal, remainingMs: options.remainingMs })
+      const identity = emptyOpenCodeV2ReadStatus(selection.native, resolvedProjectPath)
+      const cacheKey = `v2-catalog\0${identity.selectionKey}\0${identity.locationKey}`
+      const cached = this.cache.get(cacheKey)
+      if (!options.bypassCache && !options.refreshModels && cached && cached.expiresAt > Date.now()) {
+        // Connection receipts can change independently of the public catalog.
+        let connectedProviders: OpenCodeConnectedProvider[] = []
+        try { connectedProviders = await readOpenCodeV2ConnectedProviders(resolvedProjectPath, selection.native.version) } catch { /* unknown is not connected */ }
+        options.abortSignal?.throwIfAborted()
+        return { ...cached.snapshot, connectedProviders }
+      }
+      const readToken = Symbol()
+      this.v2CatalogReads.set(cacheKey, readToken)
+      try {
+        const snapshot = await probeOpenCodeV2Inventory(selection.native, resolvedProjectPath, { signal: options.abortSignal, remainingMs: options.remainingMs })
+        // A late read must not undo a newer refresh or explicit invalidation.
+        if (this.v2CatalogReads.get(cacheKey) === readToken) {
+          if (!options.abortSignal?.aborted && !snapshot.probeError && snapshot.readStatus?.catalog === 'ready') {
+            this.cache.set(cacheKey, { snapshot, expiresAt: Date.now() + OPEN_CODE_CACHE_TTL_MS })
+          } else this.cache.delete(cacheKey)
+        }
+        return snapshot
+      } catch (error) {
+        if (this.v2CatalogReads.get(cacheKey) === readToken) this.cache.delete(cacheKey)
+        throw error
+      } finally {
+        if (this.v2CatalogReads.get(cacheKey) === readToken) this.v2CatalogReads.delete(cacheKey)
+      }
     }
     if (selection.path && selection.policy.generation !== 'v1') {
       // Passive V2 reads still list the native key integrations and their completed connections.
