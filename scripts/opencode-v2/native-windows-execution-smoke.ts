@@ -3,7 +3,7 @@
 // input: the MCP peer is the existing synthetic SDK schema fixture, not the app.
 import assert from 'node:assert/strict'
 import { createHash, randomUUID } from 'node:crypto'
-import { copyFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
+import { copyFile, lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -27,6 +27,11 @@ export async function main(cliArgument: string, nodeArgument: string, receiptArg
   // Invalid invocation must never turn an executable (or any external file) into a receipt.
   assert(path.extname(receipt) === '.json' && path.dirname(receipt) === originalDirectory,
     'Receipt must be a JSON file in the current directory')
+  const existingReceipt = await lstat(receipt).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === 'ENOENT') return null
+    throw error
+  })
+  assert.equal(existingReceipt, null, 'Receipt destination must not already exist')
   const evidence: Record<string, unknown> = { schemaVersion: 1, ok: false, mode: 'source-owner',
     sourceHead: process.env.PR_HEAD_SHA ?? null,
     platform: process.platform, arch: process.arch, bunVersion: Bun.version, model: MODEL,
@@ -161,7 +166,7 @@ export async function main(cliArgument: string, nodeArgument: string, receiptArg
     } else if (fixture) { evidence.fixtureRetained = fixture; evidence.cleanupUnknown = true }
     for (const key of Object.keys(process.env)) delete process.env[key]
     Object.assign(process.env, originalEnvironment)
-    await writeFile(receipt, JSON.stringify(evidence, null, 2) + '\n')
+    await writeFile(receipt, JSON.stringify(evidence, null, 2) + '\n', { flag: 'wx' })
     console.log(JSON.stringify({ ok: evidence.ok, receipt }))
     if (evidence.ok !== true) process.exitCode = 1
   }
