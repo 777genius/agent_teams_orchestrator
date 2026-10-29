@@ -66,7 +66,11 @@ export function runOpenCodeAuthorityTests(
   spawn: typeof spawnSync = spawnSync,
 ): number {
   for (const group of groups) {
-    const result = spawn(process.execPath, ['test', ...group, ...args], { stdio: 'inherit' })
+    // Bun test defaults to UTC internally. Its ps/direct children must inherit
+    // the same zone; an explicit caller timezone keeps its existing meaning.
+    const result = spawn(process.execPath, ['test', ...group, ...args], {
+      stdio: 'inherit', env: { ...process.env, TZ: process.env.TZ || 'Etc/UTC' },
+    })
     if (result.error) throw result.error
     if (result.signal || result.status === null) return 1
     if (result.status !== 0) return result.status
