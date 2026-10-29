@@ -1,3 +1,4 @@
+import { OpenCodeNativeRequestOwners } from './OpenCodeNativeRequestOwners.js'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { constants } from 'node:fs'
 import { lstat, open, readFile, realpath } from 'node:fs/promises'
@@ -399,8 +400,27 @@ export async function recoverNativeCustody(profileRoot: string, hostKey: string,
   return bind(Object.freeze(reference), null)
 }
 
-export async function recheckNativeRequestAuthority(baseUrl: string): Promise<void> {
-  await verifyAuthority(nativeCustodyForEndpoint(baseUrl).reference)
+// Only HostManager/native admission can bind a physical epoch to a local owner.
+const requestOwners = new OpenCodeNativeRequestOwners<NativeCustody>(
+  custody => fact(admitted.has(custody)),
+  (first, second) => JSON.stringify(first.reference) === JSON.stringify(second.reference),
+)
+export function bindNativeRequestOwner<T extends object>(owner: T, custody: NativeCustody): T {
+  return requestOwners.bind(owner, custody)
+}
+export function inheritNativeRequestOwner<T extends object>(owner: T, source: object): T {
+  return requestOwners.inherit(owner, source)
+}
+export function hasNativeRequestOwner(owner: object): boolean { return requestOwners.has(owner) }
+export function nativeCustodyForRequest(owner: object | undefined, baseUrl: string): NativeCustody {
+  const custody = requestOwners.capture(owner)
+  fact(custody.reference.baseUrl === baseUrl)
+  return custody
+}
+export async function recheckNativeRequestAuthority(custody: NativeCustody): Promise<void> {
+  fact(admitted.has(custody))
+  // Recheck the captured reference, never whichever epoch now occupies its URL.
+  await verifyAuthority(custody.reference)
 }
 
 export async function resolveNativeCustodyHelper(): Promise<Readonly<{ path: string; sha256: string }>> {

@@ -32,7 +32,7 @@ import { spawnPortableCli } from '../../utils/portableCli.js'
 import { OPEN_CODE_MANAGED_HOST_CONFIG_GENERATION, buildOpenCodeHostTransportIdentity, resolveOpenCodeBinaryHostIdentity } from './OpenCodeHostIdentity.js'
 export { resolveOpenCodeBinaryHostIdentity } from './OpenCodeHostIdentity.js'
 import { resolveOpenCodeBinaryPath } from './OpenCodeBinaryResolver.js'
-import { launchNativeCustody, recoverNativeCustody, nativeCustodyForChild, resolveNativeCustodyHelper, type NativeCustody } from './native/OpenCodeNativeCustody.js'
+import { launchNativeCustody, recoverNativeCustody, nativeCustodyForChild, resolveNativeCustodyHelper, bindNativeRequestOwner, inheritNativeRequestOwner, type NativeCustody } from './native/OpenCodeNativeCustody.js'
 import { nativeAuthorityPath, readNativeAuthority, nativeExitConfirmed, withNativeAuthorityGate, writeNativeAuthority } from './native/OpenCodeNativeAuthority.js'
 import { productionOpenCodeFetch } from './native/OpenCodeNativeRequestLease.js'
 import { prewarmOpenCodeManagedSubscriptionPlugins } from './OpenCodeInventoryService.js'
@@ -295,8 +295,8 @@ async function allocateLoopbackPort(): Promise<number> {
   })
 }
 
-async function fetchJson(url: string, init?: RequestInit): Promise<FetchJsonResult> {
-  const response = await productionOpenCodeFetch(url, init)
+async function fetchJson(url: string, init?: RequestInit, owner?: object): Promise<FetchJsonResult> {
+  const response = await productionOpenCodeFetch(url, init, owner)
   const text = await response.text()
 
   let data: unknown = null
@@ -539,6 +539,7 @@ export class OpenCodeHostManager {
     if (await nativeExitConfirmed(authority)) throw new OpenCodeHostProcessGoneError(record.pid)
     const custody = await recoverNativeCustody(root, record.hostKey, record.baseUrl)
     if (custody.reference.nativePid !== record.pid) throw new Error('native_custody_scope_mismatch')
+    bindNativeRequestOwner(record, custody)
     return custody
   }
 
@@ -551,14 +552,15 @@ export class OpenCodeHostManager {
     return prepareProfile(projectPath, options)
   }
 
-  private async fetchJson(url: string, init?: RequestInit): Promise<FetchJsonResult> {
-    return (this.deps.fetchJson ?? fetchJson)(url, init)
+  private async fetchJson(url: string, init?: RequestInit, owner?: object): Promise<FetchJsonResult> {
+    return this.deps.fetchJson ? this.deps.fetchJson(url, init) : fetchJson(url, init, owner)
   }
 
   private async fetchJsonWithTimeout(
     url: string,
     timeoutMs: number,
     init?: RequestInit,
+    owner?: object,
   ): Promise<FetchJsonResult> {
     const controller = new AbortController()
     const timeout = setTimeout(() => {
@@ -569,7 +571,7 @@ export class OpenCodeHostManager {
       return await this.fetchJson(url, {
         ...init,
         signal: controller.signal,
-      })
+      }, owner)
     } catch (error) {
       if (controller.signal.aborted) {
         throw new Error(`OpenCode host request timed out after ${timeoutMs}ms for ${url}`)
@@ -772,7 +774,7 @@ export class OpenCodeHostManager {
         `OpenCode host pid ${record.pid} has no resolved config fingerprint for safe migration`,
       )
     }
-    const currentFingerprint = await this.getResolvedConfigFingerprint(record.baseUrl, budget)
+    const currentFingerprint = await this.getResolvedConfigFingerprint(record.baseUrl, budget, record)
     if (!currentFingerprint || currentFingerprint !== record.resolvedConfigFingerprint) {
       throw new Error(
         `OpenCode host pid ${record.pid} resolved config fingerprint changed during migration`,
@@ -1225,7 +1227,48 @@ export class OpenCodeHostManager {
         throw new Error('OpenCode cleanup host ownership changed during process inspection')
       }
       if (abortSignal?.aborted) throwOpenCodeAbortReason(abortSignal)
-      return { baseUrl: current.record.baseUrl, pid: current.record.pid }
+      return inheritNativeRequestOwner({ baseUrl: current.record.baseUrl, pid: current.record.pid }, snapshot.record)
+    })
+  }
+
+  /** Cold OAuth probe continuation re-admits an exact existing registry authority.
+   * The saved URL is a comparison field, never an endpoint grant. */
+  async resolveOwnedProbeEndpoint(input: {
+    hostKey: string; baseUrl: string; pid: number; processStartedAtMs: number
+    projectPath: string; profileRootKey: string; scopeToken: string
+  }): Promise<{ baseUrl: string; pid: number }> {
+    const readExact = async () => {
+      const record = (await this.readPersistentRegistryUnlocked()).hosts[input.hostKey]
+      if (!record || record.hostKey !== input.hostKey || record.pid !== input.pid
+        || record.processStartedAtMs !== input.processStartedAtMs
+        || record.projectPath !== input.projectPath || record.profileRootKey !== input.profileRootKey
+        || !Number.isFinite(input.processStartedAtMs) || input.processStartedAtMs <= 0
+        || record.baseUrl !== input.baseUrl || record.baseUrl !== `http://127.0.0.1:${record.port}`) {
+        throw new Error('OpenCode OAuth probe host ownership changed')
+      }
+      return record
+    }
+    const record = await this.withPersistentRegistryLock('endpoint_snapshot', readExact)
+    const identityKey = (value: typeof record) => JSON.stringify([value.hostKey, value.baseUrl, value.port,
+      value.pid, value.processStartedAtMs, value.projectPath, value.profileRootKey,
+      value.projectBehaviorFingerprint, value.managedConfigFingerprint, value.resolvedConfigFingerprint])
+    if (this.usesNativeCustody) {
+      const custody = await this.recoverRecordCustody(record)
+      const authority = await readNativeAuthority(nativeAuthorityPath(custody.reference.profileRoot, record.hostKey))
+      const scope = authority.scope as { prepared?: { scopeToken?: unknown } }
+      if (!input.scopeToken || scope?.prepared?.scopeToken !== input.scopeToken) {
+        throw new Error('OpenCode OAuth probe scope ownership changed')
+      }
+    }
+    const identity = await this.inspectPersistentHostProcessIdentity(record)
+    if (identity.state !== 'confirmed' || identity.startedAtMs !== input.processStartedAtMs) {
+      throw new Error('OpenCode OAuth probe process ownership changed')
+    }
+    return this.withPersistentRegistryLock('endpoint_confirm', async () => {
+      if (identityKey(await readExact()) !== identityKey(record)) {
+        throw new Error('OpenCode OAuth probe registry changed during admission')
+      }
+      return inheritNativeRequestOwner({ baseUrl: record.baseUrl, pid: record.pid }, record)
     })
   }
 
@@ -1451,11 +1494,12 @@ export class OpenCodeHostManager {
     })
   }
 
-  private async checkHealthyHostOnce(baseUrl: string, budget?: OpenCodeStartupCleanupBudget): Promise<{ version: string | null } | null> {
+  private async checkHealthyHostOnce(baseUrl: string, budget?: OpenCodeStartupCleanupBudget, owner?: object): Promise<{ version: string | null } | null> {
     try {
       const result = await this.fetchJsonWithTimeout(
         `${baseUrl}/global/health`,
         budget?.cap(OPEN_CODE_HOST_HEALTH_REQUEST_TIMEOUT_MS) ?? OPEN_CODE_HOST_HEALTH_REQUEST_TIMEOUT_MS,
+        undefined, owner,
       )
       const data = result.data as { healthy?: boolean; version?: string }
       if (result.status === 200 && data?.healthy === true) {
@@ -1504,7 +1548,7 @@ export class OpenCodeHostManager {
       await this.removePersistentHost(hostKey).catch(() => undefined)
       return null
     }
-    const health = await this.checkHealthyHostOnce(record.baseUrl)
+    const health = await this.checkHealthyHostOnce(record.baseUrl, undefined, record)
     if (!health) {
       if (processIdentity.state === 'unverified') {
         throw new Error(
@@ -1552,9 +1596,10 @@ export class OpenCodeHostManager {
       resolvedConfigFingerprint: record.resolvedConfigFingerprint,
       diagnostics: [`adopted persistent OpenCode host pid=${record.pid}`],
     }
+    inheritNativeRequestOwner(handle, record)
     if (resolveConfigFingerprint) {
       handle.resolvedConfigFingerprint =
-        (await this.getResolvedConfigFingerprint(handle.baseUrl)) ??
+        (await this.getResolvedConfigFingerprint(handle.baseUrl, undefined, handle)) ??
         record.resolvedConfigFingerprint
     }
     this.hosts.set(hostKey, {
@@ -1572,6 +1617,7 @@ export class OpenCodeHostManager {
     baseUrl: string,
     getHealthTimeoutMs: () => number = () => OPEN_CODE_HOST_HEALTH_TIMEOUT_MS,
     abortSignal?: AbortSignal,
+    owner?: object,
   ): Promise<{ version: string | null }> {
     const startedAt = this.nowMs()
     let healthTimeoutMs = normalizeOpenCodeHostHealthTimeoutMs(getHealthTimeoutMs())
@@ -1586,6 +1632,7 @@ export class OpenCodeHostManager {
         const result = await this.fetchJsonWithTimeout(
           `${baseUrl}/global/health`,
           OPEN_CODE_HOST_HEALTH_REQUEST_TIMEOUT_MS,
+          undefined, owner,
         )
         const data = result.data as { healthy?: boolean; version?: string }
         if (result.status === 200 && data?.healthy === true) {
@@ -1604,24 +1651,28 @@ export class OpenCodeHostManager {
     throw new Error(`OpenCode host did not become healthy within ${healthTimeoutMs}ms`)
   }
 
-  private async getResolvedConfigFingerprint(baseUrl: string, budget?: OpenCodeStartupCleanupBudget): Promise<string | null> {
+  private async getResolvedConfigFingerprint(baseUrl: string, budget?: OpenCodeStartupCleanupBudget, owner?: object): Promise<string | null> {
     try {
       const [config, configProviders, agents, mcp] = await Promise.all([
         this.fetchJsonWithTimeout(
           `${baseUrl}/config`,
           budget?.cap(OPEN_CODE_RESOLVED_CONFIG_FINGERPRINT_REQUEST_TIMEOUT_MS) ?? OPEN_CODE_RESOLVED_CONFIG_FINGERPRINT_REQUEST_TIMEOUT_MS,
+          undefined, owner,
         ),
         this.fetchJsonWithTimeout(
           `${baseUrl}/config/providers`,
           budget?.cap(OPEN_CODE_RESOLVED_CONFIG_FINGERPRINT_REQUEST_TIMEOUT_MS) ?? OPEN_CODE_RESOLVED_CONFIG_FINGERPRINT_REQUEST_TIMEOUT_MS,
+          undefined, owner,
         ),
         this.fetchJsonWithTimeout(
           `${baseUrl}/agent`,
           budget?.cap(OPEN_CODE_RESOLVED_CONFIG_FINGERPRINT_REQUEST_TIMEOUT_MS) ?? OPEN_CODE_RESOLVED_CONFIG_FINGERPRINT_REQUEST_TIMEOUT_MS,
+          undefined, owner,
         ),
         this.fetchJsonWithTimeout(
           `${baseUrl}/mcp`,
           budget?.cap(OPEN_CODE_RESOLVED_CONFIG_FINGERPRINT_REQUEST_TIMEOUT_MS) ?? OPEN_CODE_RESOLVED_CONFIG_FINGERPRINT_REQUEST_TIMEOUT_MS,
+          undefined, owner,
         ),
       ])
 
@@ -1833,6 +1884,7 @@ export class OpenCodeHostManager {
       diagnostics,
     }
 
+    if (custody) bindNativeRequestOwner(handle, custody)
     const entry: ManagedHostEntry = {
       handle,
       child,
@@ -1851,11 +1903,12 @@ export class OpenCodeHostManager {
         baseUrl,
         () => this.pendingHostHealthTimeoutMs.get(hostKey) ?? OPEN_CODE_HOST_HEALTH_TIMEOUT_MS,
         abortSignal,
+        handle,
       )
       if (custody && health.version !== custody.reference.measuredVersion) throw new Error('native_custody_version_mismatch')
       handle.version = health.version
       handle.resolvedConfigFingerprint = resolveConfigFingerprint
-        ? await this.getResolvedConfigFingerprint(baseUrl)
+        ? await this.getResolvedConfigFingerprint(baseUrl, undefined, handle)
         : profile.managedConfigFingerprint
       handle.state = 'healthy'
       handle.processStartedAtMs = await this.captureProcessStartTimeMs(handle.pid, abortSignal)
@@ -1986,7 +2039,7 @@ export class OpenCodeHostManager {
       if (before.state !== 'confirmed' || before.startedAtMs !== record.processStartedAtMs) {
         throw new Error('OpenCode existing host process identity is unavailable or changed')
       }
-      const health = await raceOpenCodeAbortSignal(this.checkHealthyHostOnce(record.baseUrl), abortSignal)
+      const health = await raceOpenCodeAbortSignal(this.checkHealthyHostOnce(record.baseUrl, undefined, record), abortSignal)
       const after = await raceOpenCodeAbortSignal(this.inspectPersistentHostProcessIdentity(record), abortSignal)
       await throwIfProvablyGone(after.state)
       if (!health || after.state !== 'confirmed' || after.startedAtMs !== record.processStartedAtMs) {
@@ -2016,6 +2069,7 @@ export class OpenCodeHostManager {
         resolvedConfigFingerprint: record.resolvedConfigFingerprint,
         diagnostics: [`retained existing OpenCode host pid=${record.pid}`],
       }
+      inheritNativeRequestOwner(handle, record)
       this.hosts.set(hostKey, {
         handle, child: null, refCount: 1, ownedByProcess: false, lifetime: 'persistent',
       })
@@ -2165,7 +2219,7 @@ export class OpenCodeHostManager {
       return null
     }
 
-    const fingerprint = await this.getResolvedConfigFingerprint(entry.handle.baseUrl)
+    const fingerprint = await this.getResolvedConfigFingerprint(entry.handle.baseUrl, undefined, entry.handle)
     entry.handle.resolvedConfigFingerprint = fingerprint
     return fingerprint
   }
@@ -2184,7 +2238,7 @@ export class OpenCodeHostManager {
       try {
         const custody = await this.recoverRecordCustody(record, entry?.handle.profile)
         try {
-          const response = await productionOpenCodeFetch(`${record.baseUrl}/global/dispose`, { method: 'POST', signal: AbortSignal.timeout(2000) })
+          const response = await productionOpenCodeFetch(`${record.baseUrl}/global/dispose`, { method: 'POST', signal: AbortSignal.timeout(2000) }, record)
           await response.body?.cancel()
         } catch { /* The captured native process may already have committed disposal. Never replay. */ }
         await custody.stopExact()
@@ -2468,7 +2522,7 @@ export class OpenCodeHostManager {
             : await this.inspectPersistentHostProcessIdentity(observedRecord, budget)
         const observedHealth =
           observedIdentity?.state === 'unverified'
-            ? await this.checkHealthyHostOnce(observedRecord.baseUrl, budget)
+            ? await this.checkHealthyHostOnce(observedRecord.baseUrl, budget, observedRecord)
             : null
         let legacyBirth: number | undefined
         let legacyFailure: unknown

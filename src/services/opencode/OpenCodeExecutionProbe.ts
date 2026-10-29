@@ -1,3 +1,4 @@
+import { inheritNativeRequestOwner, hasNativeRequestOwner } from './native/OpenCodeNativeCustody.js'
 import { mkdir, mkdtemp, rm } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -77,7 +78,7 @@ const OPEN_CODE_CURSOR_NATIVE_RECOVERY_CHECK_TIMEOUT_MS = 250
 
 type OpenCodeExecutionProbeDeps = {
   hostManager?: Pick<typeof openCodeHostManager, 'ensureHost' | 'releaseHost'>
-    & Partial<Pick<typeof openCodeHostManager, 'withHostOperation' | 'retainHostLease' | 'releaseHostLease'>>
+    & Partial<Pick<typeof openCodeHostManager, 'withHostOperation' | 'retainHostLease' | 'releaseHostLease' | 'resolveOwnedProbeEndpoint'>>
   clientFactory?: Pick<typeof openCodeClientFactory, 'create'>
   eventTranslator?: Pick<typeof openCodeEventTranslator, 'reconcileSessionMessages'>
   prepareProfile?: (
@@ -727,8 +728,7 @@ export class OpenCodeExecutionProbe {
             signal: context.signal,
             remainingMs: context.remainingMs,
           }
-        : undefined,
-    )
+        : undefined, host)
   }
 
   private async verifyPromptStarted(input: {
@@ -805,7 +805,7 @@ export class OpenCodeExecutionProbe {
     const client = this.clientFactory.create(host.baseUrl, {
       signal: controller.signal,
       remainingMs,
-    })
+    }, host)
 
     try {
       await withTimeout(
@@ -1094,10 +1094,10 @@ export class OpenCodeExecutionProbe {
             try {
               result = await this.runProbeModelWithHostUnlocked({ ...input,
                 armOAuthNativeProbe: async (sessionId, messageId) => {
-                  nativeOwner = { ...expectedHost, processStartedAtMs: expectedHost.processStartedAtMs!,
+                  nativeOwner = inheritNativeRequestOwner({ ...expectedHost, processStartedAtMs: expectedHost.processStartedAtMs!,
                     projectPath: input.host.profile.projectPath, scopeToken: input.host.profile.scopeToken!,
                     profileRootKey: input.host.profile.profileRootKey, sessionId, messageId,
-                    selectedModel: input.params.selectedModel }
+                    selectedModel: input.params.selectedModel }, input.host)
                   await armProbe(nativeOwner)
                 },
               })
@@ -1114,7 +1114,7 @@ export class OpenCodeExecutionProbe {
         if (settled && nativeOwner && completion.result.outcome === 'available'
           && completion.result.observedProviderId === selected.providerID
           && completion.result.observedModelId === selected.modelID) {
-          input.params.onOwnedOAuthProbeSuccess?.({ ...nativeOwner })
+          input.params.onOwnedOAuthProbeSuccess?.(inheritNativeRequestOwner({ ...nativeOwner }, nativeOwner))
         }
         return completion.result
       },
@@ -1163,7 +1163,13 @@ export class OpenCodeExecutionProbe {
         && absent()
     }
     if (unsubmitted) return false // Idle does not exclude an in-flight submission.
-    const client = this.clientFactory.create(owner.baseUrl)
+    // A pending OAuth receipt is serialized. Recover through its exact existing
+    // registry/profile/process identity before restoring the local capability.
+    if (process.platform === 'linux' && !hasNativeRequestOwner(owner) && this.hostManager.resolveOwnedProbeEndpoint) {
+      const endpoint = await this.hostManager.resolveOwnedProbeEndpoint(owner)
+      inheritNativeRequestOwner(owner, endpoint)
+    }
+    const client = this.clientFactory.create(owner.baseUrl, undefined, owner)
     const idle = async () => {
       const statuses = await client.getSessionStatus()
       if (!statuses || typeof statuses !== 'object' || Array.isArray(statuses)) return false
@@ -1527,7 +1533,7 @@ export class OpenCodeExecutionProbe {
                   - (nowMs() - recoveryStartedAtMs),
               ),
             ),
-          })
+          }, host)
 
           let timeout: ReturnType<typeof setTimeout> | null = null
           try {
@@ -1629,7 +1635,7 @@ export class OpenCodeExecutionProbe {
           const pollClient = this.clientFactory.create(host.baseUrl, {
             signal: pollRequestsController.signal,
             ...(context ? { remainingMs: context.remainingMs } : {}),
-          })
+          }, host)
           let messagesRequest: Promise<
             | { kind: 'messages'; messages: OpenCodeMessage[] }
             | { kind: 'error'; error: unknown }

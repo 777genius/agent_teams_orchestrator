@@ -1,3 +1,4 @@
+import { inheritNativeRequestOwner } from './native/OpenCodeNativeCustody.js'
 import { parseOpenCodePromptFileParts, SUPPORTED_COMMANDS, validateEnvelope, type BridgeEnvelope } from './bridge/OpenCodeBridgeProtocol.js'
 import { openCodeDeliveryJournalRecoveryData, teamDiagnosticToOutcomeString, commandStatusFromOutcomeStatus, isAcceptedOutcomeStatus, outcomeSendMessageDataToCommandData, commandStatusMismatchReason, type CommandStatusCommandData, markSendMessageOutcome, type SendMessageCommandData, type SendMessageOutcomeBase, type TeamDiagnostic } from './bridge/OpenCodeBridgeDeliveryJournal.js'
 import { drainStartupTaskkills, pendingStartupTaskkillPids } from '../../utils/processKill.js'
@@ -284,7 +285,7 @@ async function findPromptAcceptedEvidenceReadOnly(input: {
   }
 
   try {
-    const client = openCodeClientFactory.create(activeHost.baseUrl)
+    const client = openCodeClientFactory.create(activeHost.baseUrl, undefined, activeHost)
     const message = client.getSessionMessage
       ? await client.getSessionMessage(sessionRecord.opencodeSessionId, input.runtimePromptMessageId)
       : null
@@ -923,12 +924,13 @@ async function probeStoredLaneAuthority(
         || record.projectBehaviorFingerprint !== firstAuthority.projectBehaviorFingerprint) {
         throw new Error('OpenCode observation launch authority is unavailable')
       }
-      await openCodeSessionBridge.withOwnedOAuthSessionObservation(record, async ({ baseUrl }, assertOwner) => {
+      await openCodeSessionBridge.withOwnedOAuthSessionObservation(record, async (endpoint, assertOwner) => {
+        const { baseUrl } = endpoint
         ownerChecks.push(assertOwner)
         if (record === authorityRecords[0]) {
           const client = openCodeClientFactory.create(baseUrl, phaseContext ? {
             signal: phaseContext.signal, remainingMs: phaseContext.remainingMs,
-          } : undefined)
+          } : undefined, endpoint)
           const [mcp, config] = await Promise.all([client.getMcp(), client.getConfig()])
           snapshot = { ...snapshot, mcp, config,
             diagnostics: ['OpenCode delivery observation used the exact persisted launch and owned endpoint.'] }
@@ -1774,7 +1776,7 @@ async function readLiveGroupChatRunProofs(
     const observed = await listAppMcpToolsFromResolvedLaunchConfig(launchConfig, phaseContext, snapshot.host.profile.env)
     const client = openCodeClientFactory.create(snapshot.host.baseUrl, phaseContext ? {
       signal: phaseContext.signal, remainingMs: phaseContext.remainingMs,
-    } : {})
+    } : {}, snapshot.host)
     const mcp = await client.getMcp()
     if (mcp['agent-teams']?.status !== 'connected') return []
     const proofs: OpenCodeGroupChatRunProof[] = []
@@ -2785,7 +2787,7 @@ async function runReadiness(
       const snapshot = {
         ...retained.snapshot,
         profile: refreshedAfter,
-        host: retained.snapshot.host ? { ...retained.snapshot.host, profile: refreshedAfter } : null,
+        host: retained.snapshot.host ? inheritNativeRequestOwner({ ...retained.snapshot.host, profile: refreshedAfter }, retained.snapshot.host) : null,
       }
       const observedModelMatches =
         executionOutcome.observedProviderId === qualifiedSelectedModel.providerId

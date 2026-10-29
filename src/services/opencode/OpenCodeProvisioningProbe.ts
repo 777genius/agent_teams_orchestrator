@@ -1,3 +1,4 @@
+import { inheritNativeRequestOwner } from './native/OpenCodeNativeCustody.js'
 import { refreshSelectedProfileAuthority } from './OpenCodeSelectedProfileAuthority.js'
 export type { OpenCodeAuthorityRejection } from './OpenCodeSelectedProfileAuthority.js'
 import { formatOpenCodeLockFailure, safeOpenCodeLockFailure } from './OpenCodeLockFailure.js'
@@ -62,7 +63,7 @@ export type RetainedOpenCodeProvisioningProbe = {
 }
 
 function cloneHost(handle: NonNullable<OpenCodeProvisioningSnapshot['host']>): NonNullable<OpenCodeProvisioningSnapshot['host']> {
-  return {
+  return inheritNativeRequestOwner({
     ...handle,
     profile: {
       ...handle.profile,
@@ -71,7 +72,7 @@ function cloneHost(handle: NonNullable<OpenCodeProvisioningSnapshot['host']>): N
       env: { ...handle.profile.env },
     },
     diagnostics: [...handle.diagnostics],
-  }
+  }, handle)
 }
 
 function uniqueSorted(values: Iterable<string>): string[] {
@@ -394,6 +395,7 @@ export class OpenCodeProvisioningProbe {
           options.phaseContext?.reportProvisioningStage?.('app_mcp')
           const appMcp = await mcpManager.ensureAppMcp({
             baseUrl: host.baseUrl,
+            requestOwner: host,
             attachIfMissing: options.attachAppMcp !== false,
             requestContext,
           })
@@ -428,7 +430,7 @@ export class OpenCodeProvisioningProbe {
         }
       }
 
-      const client = clientFactory.create(host.baseUrl, requestContext)
+      const client = clientFactory.create(host.baseUrl, requestContext, host)
 
       try {
         const [config, configProviders, providers, providerAuth, agents] = await Promise.all([
@@ -442,6 +444,7 @@ export class OpenCodeProvisioningProbe {
           ? null
           : await mcpManager.ensureAppMcp({
             baseUrl: host.baseUrl,
+            requestOwner: host,
             attachIfMissing: true,
             requestContext,
           })

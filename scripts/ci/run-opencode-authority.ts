@@ -14,6 +14,7 @@ const files = [
   'src/services/opencode/OpenCodeStrictLaunchCoordinator.test.ts',
   'src/services/opencode/OpenCodeHostManager.test.ts',
   'src/services/opencode/OpenCodeOwnedEndpointConcurrency.test.ts',
+  'src/services/opencode/OpenCodeOwnedProbeEndpoint.test.ts',
   'src/services/opencode/OpenCodeMcpManager.test.ts',
   'src/services/opencode/OpenCodeProcessAttributionStore.test.ts',
   'src/services/opencode/OpenCodeCursorAgentAtomicReap.test.ts',
@@ -53,7 +54,12 @@ const files = [
 ]
 
 const isRecovery = (file: string) => file.endsWith('/OpenCodeOAuthRestartRecovery.test.ts')
-const groups = [files.filter(file => !isRecovery(file)), files.filter(isRecovery)]
+// Socket transport controls run in a fresh Bun process: other suites install
+// process/native fixture mocks that must not become transport evidence.
+const groups = [files.filter(file => !isRecovery(file)), files.filter(isRecovery),
+  ['src/services/opencode/native/OpenCodeNativeRequestLease.test.ts',
+    'src/services/opencode/native/OpenCodeNativeRequestOwners.test.ts',
+    'src/services/opencode/native/OpenCodeNativeOwnerConsumers.test.ts']]
 
 export function runOpenCodeAuthorityTests(
   args: string[],

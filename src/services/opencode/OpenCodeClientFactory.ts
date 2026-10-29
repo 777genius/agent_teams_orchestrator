@@ -126,12 +126,14 @@ function buildQueryPath(path: string, query: Record<string, string | null | unde
   return encoded.length > 0 ? `${path}?${encoded}` : path
 }
 
+export class OpenCodeHttpError extends Error {
+  constructor(readonly status: number) { super(`OpenCode request failed (${status})`); this.name = 'OpenCodeHttpError' }
+}
+
 async function parseResponse<T>(response: Response): Promise<T> {
   const text = await response.text()
   if (!response.ok) {
-    throw new Error(
-      `OpenCode request failed (${response.status} ${response.statusText}): ${text || 'no response body'}`,
-    )
+    throw new OpenCodeHttpError(response.status)
   }
 
   if (response.status === 204 || text.trim().length === 0) {
@@ -162,8 +164,8 @@ function resolveAbortReason(signal: AbortSignal, fallback: Error): unknown {
 export class OpenCodeClientFactory {
   constructor(private readonly deps: OpenCodeClientFactoryDeps = {}) {}
 
-  create(baseUrl: string, context: OpenCodeClientRequestContext = {}): OpenCodeClient {
-    const fetchImpl = this.deps.fetchImpl ?? productionOpenCodeFetch
+  create(baseUrl: string, context: OpenCodeClientRequestContext = {}, owner?: object): OpenCodeClient {
+    const fetchImpl = this.deps.fetchImpl ?? ((input: RequestInfo | URL, init?: RequestInit) => productionOpenCodeFetch(input, init, owner))
 
     const request = async <T>(
       path: string,
@@ -206,6 +208,10 @@ export class OpenCodeClientFactory {
           controller.signal.throwIfAborted()
           if (context.remainingMs && context.remainingMs() <= 0) throw timeoutError
         } catch (error) { void response.body?.cancel().catch(() => undefined); throw error }
+        if (!response.ok) {
+          void response.body?.cancel().catch(() => undefined)
+          throw new OpenCodeHttpError(response.status)
+        }
         const result = context.boundedReconciliation || maxItems !== undefined
           ? await readOpenCodeBoundedHttpResponse(response, controller.signal, maxItems ?? 256, context.remainingMs, responseKind) as T
           : await parseResponse<T>(response)
@@ -311,7 +317,7 @@ export class OpenCodeClientFactory {
             undefined, DEFAULT_REQUEST_TIMEOUT_MS, undefined, 'transcript',
           )
         } catch (error) {
-          if (error instanceof Error && error.message.includes('(404 ')) {
+          if (error instanceof OpenCodeHttpError && error.status === 404) {
             if (context.boundedReconciliation) {
               let before: string | undefined
               for (let page = 0; page < 4; page++) {
@@ -390,6 +396,7 @@ export class OpenCodeClientFactory {
               PERMISSION_REQUEST_TIMEOUT_MS,
             )
           } catch (error) {
+            if (!(error instanceof OpenCodeHttpError) || (error.status !== 404 && error.status !== 405)) throw error
             lastError = error
           }
         }

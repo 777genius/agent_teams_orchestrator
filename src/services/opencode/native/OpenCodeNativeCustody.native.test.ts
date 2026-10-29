@@ -7,7 +7,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { promisify } from 'node:util'
 import { OpenCodeClientFactory } from '../OpenCodeClientFactory.js'
-import { launchNativeCustody, recoverNativeCustody, nativeCustodyForEndpoint, type NativeCustody } from './OpenCodeNativeCustody.js'
+import { launchNativeCustody, recoverNativeCustody, nativeCustodyForEndpoint, bindNativeRequestOwner, type NativeCustody } from './OpenCodeNativeCustody.js'
 import { OpenCodeHostManager } from '../OpenCodeHostManager.js'
 import type { OpenCodePreparedProfile } from '../types.js'
 import { fetchNativeOpenCode } from './OpenCodeNativeRequestLease.js'
@@ -110,7 +110,7 @@ describe.skipIf(process.platform !== 'linux')('physical Linux native custody', (
         baseUrl: `http://127.0.0.1:${port}`, args: ['serve', '--hostname', '127.0.0.1', '--port', String(port), ...(deferred ? ['--deferred-accept'] : []), ...extraArgs],
         env: { PATH: '/usr/bin:/bin' }, persistent: true, minimumVersion: '1.16.0' })
       active.add(custody); epochs.add(custody)
-      const client = new OpenCodeClientFactory().create(custody.reference.baseUrl)
+      const client = new OpenCodeClientFactory().create(custody.reference.baseUrl, undefined, bindNativeRequestOwner({}, custody))
       for (let attempt = 0; ; attempt++) {
         try { await client.getConfig(); return custody }
         catch (error) { if (attempt === 49) throw error; await Bun.sleep(20) }
@@ -175,14 +175,14 @@ describe.skipIf(process.platform !== 'linux')('physical Linux native custody', (
       catch (error) { failure = String(error) + JSON.stringify(error) + (error instanceof Error ? error.stack : '') }
       expect(failure.length > 0 && !containsPrivateCredential(failure)).toBe(true)
       let bodyFailure = ''
-      try { await new OpenCodeClientFactory().create(host.baseUrl).getSession('broken-body') }
+      try { await new OpenCodeClientFactory().create(host.baseUrl, undefined, host).getSession('broken-body') }
       catch (error) { bodyFailure = String(error) + JSON.stringify(error) + (error instanceof Error ? error.stack : '') }
       expect(bodyFailure.length > 0 && !containsPrivateCredential(bodyFailure)).toBe(true)
       expect(host.pid).toBe(custody.reference.nativePid)
       expect(host.pid).not.toBe(custody.reference.custodianPid)
       const retained = await recovered.ensureHost({ hostKey: host.hostKey, preparedProfile: prepared, existingOnly: true })
       expect(retained.pid).toBe(host.pid)
-      expect(await new OpenCodeClientFactory().create(retained.baseUrl).getConfig()).toMatchObject({ marker: 'A' })
+      expect(await new OpenCodeClientFactory().create(retained.baseUrl, undefined, retained).getConfig()).toMatchObject({ marker: 'A' })
       expect(await manager.disposeHost(host.hostKey)).toBe(true)
       active.delete(custody)
       expect((await readNativeAuthority(nativeAuthorityPath(profileRoot, host.hostKey))).phase).toBe('dead')
@@ -244,7 +244,7 @@ describe.skipIf(process.platform !== 'linux')('physical Linux native custody', (
           expect(response.status).toBe(401)
           expect((await response.text()).includes(sentinel)).toBe(false)
         }
-        const admitted = await new OpenCodeClientFactory().create(host.baseUrl).getConfig()
+        const admitted = await new OpenCodeClientFactory().create(host.baseUrl, undefined, host).getConfig()
         expect(admitted).toMatchObject({ mcp: { fixture: { headers: { Authorization: sentinel } } } })
         expect(containsPrivateCredential(JSON.stringify(admitted))).toBe(false)
         expect(await manager.disposeHost(host.hostKey)).toBe(true)
@@ -259,16 +259,16 @@ describe.skipIf(process.platform !== 'linux')('physical Linux native custody', (
     const source = path.join(root, 'same-path-opencode')
     await copyFile(original, source)
     const custody = await start('same-path', source), sentinel = await start('unrelated-sentinel')
-    const client = new OpenCodeClientFactory().create(custody.reference.baseUrl)
+    const client = new OpenCodeClientFactory().create(custody.reference.baseUrl, undefined, bindNativeRequestOwner({}, custody))
     expect(await client.getConfig()).toMatchObject({ marker: 'A' })
     const staging = `${source}.replacement`; await copyFile(replacement, staging); await rename(staging, source); await unlink(source)
     const recovered = await recoverNativeCustody(profile, 'same-path', custody.reference.baseUrl)
     expect(recovered.reference.nativePid).toBe(custody.reference.nativePid)
     expect(recovered.reference.nativeBirth).toBe(custody.reference.nativeBirth)
-    expect(await new OpenCodeClientFactory().create(recovered.reference.baseUrl).getConfig()).toMatchObject({ marker: 'A' })
+    expect(await new OpenCodeClientFactory().create(recovered.reference.baseUrl, undefined, bindNativeRequestOwner({}, recovered)).getConfig()).toMatchObject({ marker: 'A' })
     await recovered.stopExact(); active.delete(custody)
     expect((await readNativeAuthority(nativeAuthorityPath(profile, 'same-path'))).phase).toBe('dead')
-    expect(await new OpenCodeClientFactory().create(sentinel.reference.baseUrl).getConfig()).toMatchObject({ marker: 'A' })
+    expect(await new OpenCodeClientFactory().create(sentinel.reference.baseUrl, undefined, bindNativeRequestOwner({}, sentinel)).getConfig()).toMatchObject({ marker: 'A' })
   }, 20000)
   test('native config ingress denies unauthenticated access while the production request path remains authorized', async () => {
     const custody = await start('native-ingress-privacy')
@@ -278,17 +278,17 @@ describe.skipIf(process.platform !== 'linux')('physical Linux native custody', (
     const wrong = await globalThis.fetch(`${custody.reference.baseUrl}/config`, { redirect: 'error', headers: { authorization: 'Basic TEST-wrong-key' } })
     expect(wrong.status).toBe(401)
     expect(await wrong.text()).toBe('')
-    expect(await new OpenCodeClientFactory().create(custody.reference.baseUrl).getConfig()).toMatchObject({
+    expect(await new OpenCodeClientFactory().create(custody.reference.baseUrl, undefined, bindNativeRequestOwner({}, custody)).getConfig()).toMatchObject({
       marker: 'A', mcp: { fixture: { headers: { Authorization: 'Bearer TEST-private-MCP-sentinel' } } },
     })
   }, 20000)
   test('admits genuine deferred accept only after proving the exact native listener socket option', async () => {
     const custody = await start('native-deferred-accept', original, true)
-    expect(await new OpenCodeClientFactory().create(custody.reference.baseUrl).getConfig()).toMatchObject({ marker: 'A' })
+    expect(await new OpenCodeClientFactory().create(custody.reference.baseUrl, undefined, bindNativeRequestOwner({}, custody)).getConfig()).toMatchObject({ marker: 'A' })
   }, 20000)
   test('a replacement listener receives zero HTTP bytes despite the same URL and a live old child', async () => {
     const custody = await start('foreign-port-takeover')
-    await (await fetchNativeOpenCode(`${custody.reference.baseUrl}/close-listener`, { method: 'POST' })).text()
+    await (await fetchNativeOpenCode(`${custody.reference.baseUrl}/close-listener`, { method: 'POST' }, bindNativeRequestOwner({}, custody))).text()
     await Bun.sleep(30)
     let bytes = 0
     const sockets = new Set<Socket>()
@@ -299,7 +299,7 @@ describe.skipIf(process.platform !== 'linux')('physical Linux native custody', (
     await new Promise<void>(resolve => foreign.listen(Number(new URL(custody.reference.baseUrl).port), '127.0.0.1', resolve))
     try {
       let failure = ''
-      try { await new OpenCodeClientFactory().create(custody.reference.baseUrl).getConfig() }
+      try { await new OpenCodeClientFactory().create(custody.reference.baseUrl, undefined, bindNativeRequestOwner({}, custody)).getConfig() }
       catch (error) { failure = String(error) + JSON.stringify(error) + (error instanceof Error ? error.stack : '') }
       const encoded = custody.reference.authorization.slice('Basic '.length)
       const password = Buffer.from(encoded, 'base64').toString('utf8').slice('opencode:'.length)
@@ -313,11 +313,11 @@ describe.skipIf(process.platform !== 'linux')('physical Linux native custody', (
   test('an exit after custody acquisition retires by captured exit receipt without a fresh PID action', async () => {
     const custody = await start('exit-before-action'), sentinel = await start('action-sentinel')
     await custody.verify()
-    await (await fetchNativeOpenCode(`${custody.reference.baseUrl}/global/dispose`, { method: 'POST' })).text()
+    await (await fetchNativeOpenCode(`${custody.reference.baseUrl}/global/dispose`, { method: 'POST' }, bindNativeRequestOwner({}, custody))).text()
     await Bun.sleep(30)
     await custody.stopExact(); active.delete(custody)
     expect((await readNativeAuthority(nativeAuthorityPath(profile, 'exit-before-action'))).phase).toBe('dead')
-    expect(await new OpenCodeClientFactory().create(sentinel.reference.baseUrl).getConfig()).toMatchObject({ marker: 'A' })
+    expect(await new OpenCodeClientFactory().create(sentinel.reference.baseUrl, undefined, bindNativeRequestOwner({}, sentinel)).getConfig()).toMatchObject({ marker: 'A' })
   }, 20000)
   test('held pidfd Stop drains a real descendant that escaped the process group and preserves an unrelated sentinel', async () => {
     const descendantPort = await unusedPort()
@@ -333,6 +333,6 @@ describe.skipIf(process.platform !== 'linux')('physical Linux native custody', (
     expect(observed).toBe(true)
     await custody.stopExact(); active.delete(custody)
     expect(await listening()).toBe(false)
-    expect(await new OpenCodeClientFactory().create(sentinel.reference.baseUrl).getConfig()).toMatchObject({ marker: 'A' })
+    expect(await new OpenCodeClientFactory().create(sentinel.reference.baseUrl, undefined, bindNativeRequestOwner({}, sentinel)).getConfig()).toMatchObject({ marker: 'A' })
   }, 20000)
 })

@@ -1,94 +1,87 @@
-import { Agent, request as httpRequest } from 'node:http'
-import { connect } from 'node:net'
+// Bun maps bare "undici" to its fetch shim. The explicit installed entrypoint
+// preserves the connector contract on the production Bun runtime.
+import { Client, type Dispatcher } from 'undici/index.js'
+import { connect, type Socket } from 'node:net'
 import { Readable } from 'node:stream'
-import { nativeCustodyForEndpoint, recheckNativeRequestAuthority } from './OpenCodeNativeCustody.js'
+import { nativeCustodyForRequest, recheckNativeRequestAuthority } from './OpenCodeNativeCustody.js'
 
-/** A new socket for every request. HTTP receives it only after native peer admission. */
-export async function fetchNativeOpenCode(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+/** One admitted socket and one dispatch; neither redirects nor reconnects replay a request. */
+export async function fetchNativeOpenCode(input: RequestInfo | URL, init?: RequestInit, owner?: object): Promise<Response> {
   const request = new Request(input, init), url = new URL(request.url)
   if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || !url.port || url.username || url.password || url.hash)
     throw new Error('native_custody_unavailable')
-  const custody = nativeCustodyForEndpoint(url.origin) // Locator only; native proof follows for the actual socket.
-  const agent = new Agent({ keepAlive: false, maxSockets: 1 })
-  agent.createConnection = ((_options, callback) => {
-    if (!callback) throw new Error('native_custody_protocol')
-    const socket = connect({ host: '127.0.0.1', port: Number(url.port) })
-    let completed = false
-    const finish = (error: Error | null): void => {
-      if (completed) return
-      completed = true
-      request.signal.removeEventListener('abort', abort)
-      if (error) socket.destroy()
-      callback(error, socket)
-    }
-    const abort = () => finish(new Error('native_custody_cancelled'))
-    request.signal.addEventListener('abort', abort, { once: true })
-    socket.once('error', error => finish(error))
-    socket.once('connect', () => { void (async () => {
-      try {
-        request.signal.throwIfAborted()
-        if (!socket.localPort || socket.destroyed) throw new Error('native_custody_unavailable')
-        await custody.verifyPeer(socket.localPort)
-        await recheckNativeRequestAuthority(url.origin)
-        request.signal.throwIfAborted()
-        if (socket.destroyed) throw new Error('native_custody_unavailable')
-        finish(null)
-      } catch { finish(new Error('native_custody_unavailable')) }
-    })() })
-    // Agent's documented asynchronous callback supplies the *same* socket after
-    // proof. Returning a socket here would flush buffered HTTP before admission.
-    return undefined
-  }) as typeof agent.createConnection
+  const custody = nativeCustodyForRequest(owner, url.origin)
+  let attempted = false, socket: Socket | undefined
+  const client = new Client(url.origin, {
+    pipelining: 0,
+    connect(_options, callback) {
+      if (attempted) { callback(new Error('native_custody_reconnect_refused'), null); return }
+      attempted = true
+      let completed = false
+      const finish = (error: Error | null) => {
+        if (completed) return
+        completed = true
+        if (error) { socket?.destroy(); callback(error, null) }
+        else callback(null, socket!)
+      }
+      const abort = () => { socket?.destroy(); finish(new Error('native_custody_cancelled')) }
+      request.signal.addEventListener('abort', abort, { once: true })
+      if (request.signal.aborted) { abort(); return }
+      socket = connect({ host: '127.0.0.1', port: Number(url.port) })
+      socket.once('close', () => request.signal.removeEventListener('abort', abort))
+      socket.once('error', () => finish(new Error('native_custody_unavailable')))
+      socket.once('connect', () => { void (async () => {
+        try {
+          request.signal.throwIfAborted()
+          if (!socket?.localPort || socket.destroyed) throw new Error('native_custody_unavailable')
+          await custody.verifyPeer(socket.localPort)
+          request.signal.throwIfAborted()
+          await recheckNativeRequestAuthority(custody)
+          request.signal.throwIfAborted()
+          if (socket.destroyed) throw new Error('native_custody_unavailable')
+          // Only now may Undici see the exact socket and flush its private headers.
+          finish(null)
+        } catch { finish(new Error('native_custody_unavailable')) }
+      })() })
+    },
+  })
+  const dispose = () => { void client.destroy().catch(() => undefined) }
   try {
     const body = request.body ? Buffer.from(await request.arrayBuffer()) : undefined
     request.signal.throwIfAborted()
-    return await new Promise<Response>((resolve, reject) => {
-      const authenticated = new Headers(request.headers)
-      authenticated.set('authorization', custody.reference.authorization)
-      const operation = httpRequest(url, {
-        agent, method: request.method, headers: Object.fromEntries(authenticated), signal: request.signal,
-      }, incoming => {
-        const status = incoming.statusCode ?? 502
-        const headers = new Headers()
-        for (const [name, value] of Object.entries(incoming.headers)) {
-          if (Array.isArray(value)) for (const item of value) headers.append(name, item)
-          else if (value !== undefined) headers.set(name, value)
-        }
-        const empty = request.method === 'HEAD' || [204, 205, 304].includes(status)
-        if (empty) incoming.resume()
-        let bodyStream: ReadableStream<Uint8Array> | null = null
-        if (!empty) {
-          const reader = Readable.toWeb(incoming).getReader()
-          bodyStream = new ReadableStream<Uint8Array>({
-            async pull(controller) {
-              try {
-                const part = await reader.read()
-                if (part.done) { reader.releaseLock(); controller.close() }
-                else if (part.value instanceof Uint8Array) controller.enqueue(part.value)
-                else throw new Error('native_custody_response_failed')
-              } catch {
-                controller.error(new Error('native_custody_response_failed'))
-                agent.destroy()
-              }
-            },
-            async cancel() { try { await reader.cancel() } finally { agent.destroy() } },
-          })
-        }
-        // Node HTTP never follows redirects; a redirect cannot acquire a second socket.
-        resolve(new Response(bodyStream, {
-          status, statusText: incoming.statusMessage, headers,
-        }))
+    const headers = new Headers(request.headers)
+    headers.set('authorization', custody.reference.authorization)
+    const incoming = await client.request({ path: url.pathname + url.search, method: request.method as Dispatcher.HttpMethod,
+      headers: Object.fromEntries(headers), body, signal: request.signal, idempotent: false, headersTimeout: 0, bodyTimeout: 0 })
+    const responseHeaders = new Headers()
+    for (const [name, value] of Object.entries(incoming.headers)) {
+      if (Array.isArray(value)) for (const item of value) responseHeaders.append(name, item)
+      else if (value !== undefined) responseHeaders.set(name, value)
+    }
+    const empty = request.method === 'HEAD' || [204, 205, 304].includes(incoming.statusCode)
+    let stream: ReadableStream<Uint8Array> | null = null
+    if (empty) { await incoming.body.dump(); dispose() }
+    else {
+      const reader = Readable.toWeb(incoming.body).getReader()
+      stream = new ReadableStream<Uint8Array>({
+        async pull(controller) {
+          try {
+            const part = await reader.read()
+            if (part.done) { reader.releaseLock(); dispose(); controller.close() }
+            else if (part.value instanceof Uint8Array) controller.enqueue(part.value)
+            else throw new Error('native_custody_response_failed')
+          } catch { dispose(); controller.error(new Error('native_custody_response_failed')) }
+        },
+        async cancel() { try { await reader.cancel() } finally { dispose() } },
       })
-      operation.once('error', reject)
-      operation.end(body)
-    })
+    }
+    return new Response(stream, { status: incoming.statusCode, headers: responseHeaders })
   } catch {
-    agent.destroy()
-    // ClientRequest/transport error objects may retain private request headers.
-    // Public failure paths carry only an allowlisted phase code, never a cause.
+    dispose()
+    // Transport errors may retain request headers; never expose their cause.
     throw new Error(request.signal.aborted ? 'native_custody_cancelled' : 'native_custody_unavailable')
   }
 }
 
-export const productionOpenCodeFetch = (input: RequestInfo | URL, init?: RequestInit): Promise<Response> =>
-  process.platform === 'linux' ? fetchNativeOpenCode(input, init) : globalThis.fetch(input, init)
+export const productionOpenCodeFetch = (input: RequestInfo | URL, init?: RequestInit, owner?: object): Promise<Response> =>
+  process.platform === 'linux' ? fetchNativeOpenCode(input, init, owner) : globalThis.fetch(input, init)

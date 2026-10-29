@@ -92,6 +92,7 @@ export class OpenCodeTurnSettledObserver {
   observe(params: {
     authority?: OpenCodeV1TerminalAuthority
     signal?: AbortSignal
+    requestOwner?: object
     baseUrl: string
     sessionId: string
     projectPath?: string | null
@@ -259,7 +260,7 @@ export class OpenCodeTurnSettledObserver {
       void (async () => {
         try {
           const evidence = await readOpenCodeV1TerminalTranscript({
-            authority, baseUrl: params.baseUrl, sessionId: params.sessionId, runtimePromptMessageId,
+            authority, baseUrl: params.baseUrl, requestOwner: params.requestOwner, sessionId: params.sessionId, runtimePromptMessageId,
             remainingMs: () => Math.max(0, deadlineAt - performance.now()),
             signal: controller.signal, fetchImpl: this.deps.fetchImpl,
           })
@@ -409,7 +410,7 @@ export class OpenCodeTurnSettledObserver {
           state.endpoint = endpoint
           const matchedBefore = state.matchedEventCount
           const result = await readOpenCodeSseEndpoint({
-            baseUrl: params.baseUrl,
+            baseUrl: params.baseUrl, requestOwner: params.requestOwner,
             endpoint,
             fetchImpl: this.deps.fetchImpl,
             signal: controller.signal,
