@@ -5,7 +5,7 @@ export { recordOpenCodeV2ProviderFailure } from '../../../../services/opencode/e
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createHash, randomUUID } from 'node:crypto'
-import { mkdir, mkdtemp, realpath, writeFile, lstat } from 'node:fs/promises'
+import { mkdir, mkdtemp, realpath, rm, writeFile, lstat } from 'node:fs/promises'
 import type { Stats } from 'node:fs'
 import { isDeepStrictEqual } from 'node:util'
 import { importOpenCodeV2ClientModule, resolveOpenCodeV2ClientEntry } from '../../../../services/opencode/transport/OpenCodeV2ClientModule.js'
@@ -71,21 +71,34 @@ async function catalog<T>(input: { providerId: string; projectPath?: string | nu
   const scope = await resolveOpenCodeV2CatalogProfileScope({ projectPath: project, providerId: input.providerId })
   const parent = path.join(resolveClaudeMultimodelPaths().data, 'opencode/v2/provider-profiles'); await mkdir(parent, { recursive: true, mode: 0o700 })
   const root = await realpath(await mkdtemp(path.join(parent, 'catalog-')))
-  for (const name of ['home', 'config', 'data', 'cache', 'state', 'tmp', 'appdata', 'localappdata']) await mkdir(path.join(root, name), { mode: 0o700 })
-  const directory = path.join(root, 'config/opencode'), data = path.join(root, 'data/opencode'); await mkdir(directory, { mode: 0o700 }); await mkdir(data, { mode: 0o700 })
-  const imported = await materializeOpenCodeV2CatalogScope(scope, project, path.join(data, 'auth.json'), options)
-  const provider = { ...(imported.provider.package ? { package: imported.provider.package } : {}),
-    ...(imported.provider.baseURL || imported.provider.apiKey ? { settings: {
-      ...(imported.provider.baseURL ? { baseURL: imported.provider.baseURL } : {}),
-      ...(imported.provider.apiKey ? { apiKey: imported.provider.apiKey } : {}),
-    } } : {}), ...(imported.provider.models ? { models: imported.provider.models } : {}) }
-  const content = JSON.stringify({ update: 'disable', share: 'disabled', snapshots: false, warming: false, plugins: [], providers: { [input.providerId]: provider } })
-  await writeFile(path.join(directory, 'opencode.json'), content, { flag: 'wx', mode: 0o600 })
-  const env = createOpenCodeV2OwnedProfileEnvironment(root)
-  env.OPENCODE_CONFIG_DIR = directory
-  const profile: CatalogExecutionProfile = { epoch: randomUUID(), root, directory: project, databasePath: path.join(data, 'opencode.db'), env,
-    envSha256: executionHash(env), config: { directory, content, sha256: createHash('sha256').update(content).digest('hex') }, selection: { purpose: 'catalog' } }
-  const native = await createOpenCodeV2ExecutionReceipt(sourceRoot, selected.native)
+  let imported: Awaited<ReturnType<typeof materializeOpenCodeV2CatalogScope>>
+  let profile: CatalogExecutionProfile
+  let native: ValidatedExecutionNative
+  try {
+    for (const name of ['home', 'config', 'data', 'cache', 'state', 'tmp', 'appdata', 'localappdata']) await mkdir(path.join(root, name), { mode: 0o700 })
+    const directory = path.join(root, 'config/opencode'), data = path.join(root, 'data/opencode'); await mkdir(directory, { mode: 0o700 }); await mkdir(data, { mode: 0o700 })
+    imported = await materializeOpenCodeV2CatalogScope(scope, project, path.join(data, 'auth.json'), options)
+    const provider = { ...(imported.provider.package ? { package: imported.provider.package } : {}),
+      ...(imported.provider.baseURL || imported.provider.apiKey ? { settings: {
+        ...(imported.provider.baseURL ? { baseURL: imported.provider.baseURL } : {}),
+        ...(imported.provider.apiKey ? { apiKey: imported.provider.apiKey } : {}),
+      } } : {}), ...(imported.provider.models ? { models: imported.provider.models } : {}) }
+    const content = JSON.stringify({ update: 'disable', share: 'disabled', snapshots: false, warming: false, plugins: [], providers: { [input.providerId]: provider } })
+    await writeFile(path.join(directory, 'opencode.json'), content, { flag: 'wx', mode: 0o600 })
+    const env = createOpenCodeV2OwnedProfileEnvironment(root)
+    env.OPENCODE_CONFIG_DIR = directory
+    profile = { epoch: randomUUID(), root, directory: project, databasePath: path.join(data, 'opencode.db'), env,
+      envSha256: executionHash(env), config: { directory, content, sha256: createHash('sha256').update(content).digest('hex') }, selection: { purpose: 'catalog' } }
+    native = await createOpenCodeV2ExecutionReceipt(sourceRoot, selected.native)
+  } catch (error) {
+    // No lease acquisition has begun, so no native owner can use these sealed
+    // key/config files. Once acquisition starts, its failure path retains custody.
+    try { await rm(root, { recursive: true, force: true }) }
+    catch (cleanupError) {
+      throw new AggregateError([error, cleanupError], 'provider_catalog_prelease_cleanup_unknown', { cause: error })
+    }
+    throw error
+  }
   const nonce = randomUUID(), deadline = Date.now() + 240_000
   const lease = await acquireOpenCodeV2CatalogLease(native, profile, { teamId: `catalog-${nonce}`, runId: nonce, laneId: 'provider-catalog', memberId: input.providerId, deadline })
   const wire = new ProviderWire(lease.authority, deadline), endpoint = requireExecutionEndpoint(lease.authority)
@@ -364,10 +377,16 @@ export async function loadOpenCodeV2ProviderModels(input: LoadProviderModelsInpu
       const rows = scopedRows(await owner.models(), owner.authority.directory).filter(row => row.providerID === input.providerId)
       let anonymousProvider = false
       if (input.providerId === 'opencode') {
-        const providers = scopedRows(await owner.providers(), owner.authority.directory).filter(row => row.id === input.providerId)
-        if (providers.length === 1 && isOpenCodeV2AnonymousProvider(providers[0]!)) {
-          const integration = scopedIntegration(await owner.integration('opencode'), owner.authority.directory, 'opencode')
-          anonymousProvider = Array.isArray(integration.connections) && integration.connections.length === 0
+        try {
+          const providers = scopedRows(await owner.providers(), owner.authority.directory).filter(row => row.id === input.providerId)
+          if (providers.length === 1 && isOpenCodeV2AnonymousProvider(providers[0]!)) {
+            const integration = scopedIntegration(await owner.integration('opencode'), owner.authority.directory, 'opencode')
+            anonymousProvider = Array.isArray(integration.connections) && integration.connections.length === 0
+          }
+        } catch {
+          // These optional reads classify access, not the already validated model
+          // catalog. Missing native evidence cannot grant anonymous availability.
+          anonymousProvider = false
         }
       }
       const models = rows.map(row => buildOpenCodeV2RuntimeProviderModel(row, input.providerId, owner.preferredModel, anonymousProvider))

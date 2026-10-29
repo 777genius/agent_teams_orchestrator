@@ -2,7 +2,7 @@ import { canonicalizeOpenCodeProjectPath } from '../../../../services/opencode/O
 import { readOpenCodeManagedDefaultSelection } from '../../../../services/opencode/OpenCodeManagedDefaultSelection.js'
 import { clearOpenCodeManagedDefaultModel, setOpenCodeManagedDefaultModel, setOpenCodeManagedGlobalDefaultModel } from '../../../../services/opencode/OpenCodeManagedPreferences.js'
 import { loadOpenCodeV2ProviderModels, testOpenCodeV2ProviderModel } from './OpenCodeV2ProviderManagement.js'
-import type { ClearProjectDefaultModelInput, ProviderManagementResult, ProviderManagementView, SetDefaultModelInput } from '../../domain/types.js'
+import type { ClearProjectDefaultModelInput, ProviderDirectoryEntry, ProviderManagementResult, ProviderManagementView, SetDefaultModelInput } from '../../domain/types.js'
 import type { inspectOpenCodeReadSelection } from '../../../../services/opencode/compatibility/OpenCodeNativeIdentity.js'
 
 /** A saved model is a preference only. It does not mint authentication or launch proof. */
@@ -18,6 +18,14 @@ export async function applyOpenCodeV2DefaultSelection(view: ProviderManagementVi
     // the user explicitly configured this model in their external OpenCode.
     defaultModelSource: defaults.defaultModelSource ?? (fallbackModel ? 'fallback' : null),
     configuredModels: view.configuredModels.map(model => ({ ...model, default: model.modelId === (defaultModel ?? fallbackModel) })) }
+}
+
+export async function applyOpenCodeV2DirectoryDefaultSelection(entries: ProviderDirectoryEntry[], projectPath: string): Promise<ProviderDirectoryEntry[]> {
+  const project = await canonicalizeOpenCodeProjectPath(projectPath)
+  const { defaultModel } = await readOpenCodeManagedDefaultSelection(project)
+  if (!defaultModel) return entries
+  return entries.map(entry => ({ ...entry,
+    defaultModelId: defaultModel.startsWith(`${entry.providerId}/`) ? defaultModel : null }))
 }
 
 const error = (code: 'model-missing' | 'model-test-failed' | 'runtime-unhealthy', message: string): ProviderManagementResult<ProviderManagementView> =>
@@ -39,14 +47,18 @@ export async function setOpenCodeV2DefaultModel(input: SetDefaultModelInput, rea
       if (!tested.ok) return tested
       if (!tested.value.ok) return error('model-test-failed', tested.value.message)
     }
-    // Capture a display view before committing; a subsequent catalog outage must
-    // not turn a successfully saved preference into an apparent failed mutation.
+    // Capture a display view before committing, and distinguish any subsequent
+    // refresh failure from failure to persist the preference itself.
     const view = await readView()
     if (!view.ok) return view
     const defaults = await readOpenCodeManagedDefaultSelection(projectPath)
     if (input.scope === 'all_projects') await setOpenCodeManagedGlobalDefaultModel(defaults.dataRoot, input.modelId)
     else await setOpenCodeManagedDefaultModel(defaults.profileRoot, input.modelId)
-    return { ok: true, value: await applyOpenCodeV2DefaultSelection(view.value, view.value.fallbackModel) }
+    try {
+      return { ok: true, value: await applyOpenCodeV2DefaultSelection(view.value, view.value.fallbackModel) }
+    } catch {
+      return error('runtime-unhealthy', 'The OpenCode default model was saved, but the provider view could not be refreshed. Refresh providers to see the current default.')
+    }
   } catch {
     return error('runtime-unhealthy', 'The OpenCode default model could not be saved. Refresh providers and try again.')
   }
@@ -60,7 +72,11 @@ export async function clearOpenCodeV2ProjectDefaultModel(input: ClearProjectDefa
     if (!view.ok) return view
     const defaults = await readOpenCodeManagedDefaultSelection(projectPath)
     await clearOpenCodeManagedDefaultModel(defaults.profileRoot)
-    return { ok: true, value: await applyOpenCodeV2DefaultSelection(view.value, view.value.fallbackModel) }
+    try {
+      return { ok: true, value: await applyOpenCodeV2DefaultSelection(view.value, view.value.fallbackModel) }
+    } catch {
+      return error('runtime-unhealthy', 'The project OpenCode default was cleared, but the provider view could not be refreshed. Refresh providers to see the current default.')
+    }
   } catch {
     return error('runtime-unhealthy', 'The project OpenCode default could not be cleared. Refresh providers and try again.')
   }

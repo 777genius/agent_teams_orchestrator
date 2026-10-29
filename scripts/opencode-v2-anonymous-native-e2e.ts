@@ -174,6 +174,7 @@ if (process.argv[2] !== 'child') {
     assert(free); assert(paid)
     assert.equal(free.free, true); assert.equal(free.accessKind, 'builtin_free'); assert.equal(free.proofState, 'needs_probe'); assert.equal(free.availability, 'untested')
     assert.equal(paid.free, false); assert.equal(paid.accessKind, 'credentialed'); assert.equal(paid.requiresExecutionProof, true)
+    assert.notEqual(paid.availability, 'available', 'A no-key paid model cannot claim availability without execution proof')
     const actualNative = models.value.models.filter((row: any) => row.modelId !== freeId && row.modelId !== paidId && !row.modelId.includes('/TEST-') && row.free)
     assert(actualNative.length > 0); console.log(JSON.stringify({ event: 'TEST-free-catalog', actualNativeFree: actualNative.length, free, paid }))
   }

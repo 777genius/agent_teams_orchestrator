@@ -653,7 +653,8 @@ async function buildOpenCodeStatus(
     const managedDefault = snapshot.readGeneration === 'v2' && snapshot.readStatus?.catalog === 'ready'
       ? (await readOpenCodeManagedDefaultSelection(snapshot.projectPath)).defaultModel : null
     // The desktop full-status IPC has a 90s wall budget. A proof overlay is
-    // optional, capped at 15s and 75s total, leaving owned cleanup headroom.
+    // optional, with at most a 15s read budget and 75s total target. Owned
+    // version/auth cleanup remains joined after cancellation, not a hard I/O cap.
     const proofTimeoutMs = Math.max(0, Math.min(15_000, deadline - Date.now(), 75_000 - (Date.now() - startedAt)))
     return buildOpenCodeV2RuntimeStatusWithProof(snapshot, managedDefault, proofTimeoutMs)
   }

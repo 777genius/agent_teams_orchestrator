@@ -12,7 +12,10 @@ export function buildOpenCodeV2RuntimeStatus(snapshot: OpenCodeInventorySnapshot
     status: 'unsupported', ownership: 'provider-scoped', reason: 'capabilities_pending',
   }
   const now = new Date().toISOString()
-  const defaultId = managedDefault ?? (read?.defaultModel ? `${read.defaultModel.providerId}/${read.defaultModel.catalogId}` : null)
+  const managedDefaultIsListed = managedDefault !== null && read?.models.some(model =>
+    `${model.providerId}/${model.catalogId}` === managedDefault) === true
+  const defaultId = (managedDefaultIsListed ? managedDefault : null)
+    ?? (read?.defaultModel ? `${read.defaultModel.providerId}/${read.defaultModel.catalogId}` : null)
   return {
     providerId: 'opencode', displayName: 'OpenCode (75+ LLM providers)', supported: Boolean(read) && !refused,
     authenticated: false, authMethod: null, verificationState: 'unknown', canLoginFromUi: false,

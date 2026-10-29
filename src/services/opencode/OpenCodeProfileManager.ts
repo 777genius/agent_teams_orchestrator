@@ -2375,6 +2375,7 @@ type OpenCodeScopeResolutionInput = {
   purpose: OpenCodeProfilePurpose
   selectedModel: string
   env?: NodeJS.ProcessEnv
+  abortSignal?: AbortSignal
   // Authority refresh reads scope without publishing a preparation snapshot.
   cacheSnapshot?: boolean
   isOAuthNativeSessionSettled?: (owner: OpenCodeOAuthNativeSessionOwner) => Promise<boolean>
@@ -2396,7 +2397,9 @@ function scopeSourceEnvironment(inputEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv 
 }
 
 export async function resolveOpenCodeProfileScope(input: OpenCodeScopeResolutionInput): Promise<OpenCodeProfileScope> {
+  if (input.abortSignal?.aborted) throwOpenCodeAbortReason(input.abortSignal)
   await recoverOpenCodeScopedOAuth(input)
+  if (input.abortSignal?.aborted) throwOpenCodeAbortReason(input.abortSignal)
   return resolveOpenCodeProfileScopeInternal(input)
 }
 
@@ -2465,7 +2468,7 @@ async function recoverOpenCodeScopedOAuth(input: OpenCodeScopeResolutionInput): 
     }
     try {
     await recoverOpenCodeOwnedOAuthSave({
-      globalAuthPath, env,
+      globalAuthPath, env, abortSignal: input.abortSignal,
       assertRetirementAuthority: async owner => {
         if (await canonicalizeOpenCodeProjectPath(input.projectPath) !== owner.projectPath) {
           throw new Error('OpenCode OAuth retirement belongs to another project; original admission retained')
@@ -2570,11 +2573,13 @@ async function resolveOpenCodeProfileScopeInternal(
   captureSnapshot?: (snapshot: OpenCodeEffectiveConfigSnapshot) => void,
   catalogProviderId?: string,
 ): Promise<OpenCodeProfileScope> {
+  if (input.abortSignal?.aborted) throwOpenCodeAbortReason(input.abortSignal)
   const envSnapshot = scopeSourceEnvironment(input.env ?? process.env)
   const attachmentRoot = await resolveOpenCodeAttachmentRoot(envSnapshot)
   if (attachmentRoot) envSnapshot.CLAUDE_AGENT_TEAMS_ATTACHMENT_ROOT = attachmentRoot
   else delete envSnapshot.CLAUDE_AGENT_TEAMS_ATTACHMENT_ROOT
   const projectPath = await canonicalizeOpenCodeProjectPath(input.projectPath)
+  if (input.abortSignal?.aborted) throwOpenCodeAbortReason(input.abortSignal)
   if (isStrictAuthorityPurpose(input.purpose)
     && canonicalizeOpenCodeProviderId(input.selectedModel.split('/')[0] ?? '') === 'cursor-acp') {
     Object.assign(envSnapshot, managedCursorNativeEnvironment(
@@ -2797,6 +2802,7 @@ async function resolveOpenCodeProfileScopeInternal(
     selectedAuthIdentity,
     scopeToken,
   }
+  if (input.abortSignal?.aborted) throwOpenCodeAbortReason(input.abortSignal)
   if (captureSnapshot || !recoveryPredecessor && input.cacheSnapshot !== false && !openCodeEffectiveConfigSnapshots.has(scopeToken)) {
     const snapshot = freezeConfigSnapshot({
       projectPath,

@@ -24,7 +24,7 @@ test('V2 defaults persist across provider catalogs and CLI reads, isolate projec
     const { OpenCodeProviderManagementAdapter } = await import(${JSON.stringify(import.meta.resolve('./OpenCodeProviderManagementAdapter.ts'))})
     const { getProviderModels } = await import(${JSON.stringify(import.meta.resolve('../../../../cli/handlers/model.ts'))})
     const { getUnifiedRuntimeStatusPayload } = await import(${JSON.stringify(import.meta.resolve('../../../../services/runtimeBackends/registry.ts'))})
-    const { emptyOpenCodeV2ReadStatus } = await import(${JSON.stringify(import.meta.resolve('../../../../services/opencode/catalog/OpenCodeV2ReadStatus.ts'))})
+    const { emptyOpenCodeV2ReadStatus, readModel, readProvider } = await import(${JSON.stringify(import.meta.resolve('../../../../services/opencode/catalog/OpenCodeV2ReadStatus.ts'))})
     const { openCodeV2InventorySnapshot } = await import(${JSON.stringify(import.meta.resolve('../../../../services/opencode/catalog/OpenCodeV2InventoryService.ts'))})
     const native = { generation: 'v2', version: '2.1.4', engineVersion: '2.1.4', dialect: 'v2-2.1.4',
       executablePath: path.join(root, 'TEST-opencode'), executableSha256: 'a'.repeat(64), packageName: null }
@@ -46,6 +46,10 @@ test('V2 defaults persist across provider catalogs and CLI reads, isolate projec
       const value = openCodeV2InventorySnapshot(native, directory, {
         ...emptyOpenCodeV2ReadStatus(native, directory), catalog: 'ready',
         defaultModel: hasNativeDefault ? { providerId: 'opencode', catalogId: 'builtin-free' } : null,
+        providers: ['opencode', 'deepseek'].map(id => readProvider({ id, activation: 'enabled' })),
+        models: [['opencode', hasNativeDefault ? 'builtin-free' : 'fallback'], ['deepseek', 'chat'], ['deepseek', 'reasoner']].map(([providerID, id]) =>
+          readModel({ id, modelID: id, providerID, enabled: true, status: 'active', variants: [],
+            capabilities: { tools: true, input: ['text'], output: ['text'] }, limit: { context: 8192, output: 512 } })),
       })
       if (!hasNativeDefault) value.models = ['opencode/fallback']
       return value
@@ -55,11 +59,20 @@ test('V2 defaults persist across provider catalogs and CLI reads, isolate projec
       hostManager: { ensureHost: async () => assert.fail('V1 host must not run'), releaseHost: async () => {} },
     })
     const input = { runtimeId: 'opencode', providerId: 'deepseek', modelId: model.modelId, projectPath: project, probe: false }
+    const directoryDefaults = async directory => {
+      const result = await adapter.loadDirectory({ runtimeId: 'opencode', projectPath: directory, limit: null })
+      assert.equal(result.ok, true, JSON.stringify(result))
+      return Object.fromEntries(result.value.entries.map(entry => [entry.providerId, entry.defaultModelId]))
+    }
     try {
+      assert.equal((await directoryDefaults(project)).opencode, 'opencode/builtin-free')
       const global = await adapter.setDefaultModel({ ...input, scope: 'all_projects' })
       assert.equal(global.ok, true, JSON.stringify(global))
       assert.equal(global.value.allProjectsDefaultModel, model.modelId)
       assert.equal(global.value.defaultModelSource, 'all_projects')
+      assert.equal((await directoryDefaults(project)).deepseek, 'deepseek/chat')
+      assert.equal((await directoryDefaults(other)).deepseek, 'deepseek/chat')
+      assert.equal((await directoryDefaults(project)).opencode, null, 'Managed selection replaces the native default in other provider rows')
       assert.equal(tests, 0, 'Saving the UI preference must not run a model when probe is false')
       assert.equal((await adapter.loadView({ runtimeId: 'opencode', projectPath: other })).value.defaultModel, model.modelId)
       const scoped = await profiles.resolveOpenCodeV2CatalogProfileScope({ providerId: 'deepseek', projectPath: project })
@@ -77,6 +90,8 @@ test('V2 defaults persist across provider catalogs and CLI reads, isolate projec
       assert.equal(local.ok, true, JSON.stringify(local))
       assert.equal(local.value.projectDefaultModel, model.modelId)
       assert.equal(local.value.defaultModelSource, 'project')
+      assert.equal((await directoryDefaults(project)).deepseek, 'deepseek/reasoner')
+      assert.equal((await directoryDefaults(other)).deepseek, 'deepseek/chat')
       assert.equal((await preferences.readOpenCodeManagedDefaultSelection(other)).defaultModel, 'deepseek/chat')
       assert.equal((await getProviderModels('opencode', { getOpenCodeInventorySnapshot: async () => snapshot(project) })).defaultModel, model.modelId)
       const cleared = await adapter.clearProjectDefaultModel({ runtimeId: 'opencode', projectPath: project })
@@ -84,6 +99,7 @@ test('V2 defaults persist across provider catalogs and CLI reads, isolate projec
       assert.equal(cleared.value.projectDefaultModel, null)
       assert.equal(cleared.value.defaultModel, 'deepseek/chat')
       assert.equal(cleared.value.defaultModelSource, 'all_projects')
+      assert.equal((await directoryDefaults(project)).deepseek, 'deepseek/chat')
       const failedProbe = await adapter.setDefaultModel({ ...input, modelId: model.modelId, probe: true })
       assert.equal(failedProbe.ok, false)
       assert.equal(failedProbe.error.code, 'model-test-failed')
@@ -101,6 +117,9 @@ test('V2 defaults persist across provider catalogs and CLI reads, isolate projec
       assert.equal(tests, 2)
       const fallback = await adapter.clearProjectDefaultModel({ runtimeId: 'opencode', projectPath: project })
       const reloaded = await adapter.loadView({ runtimeId: 'opencode', projectPath: project })
+      const fallbackDirectory = await directoryDefaults(project)
+      assert.equal(fallbackDirectory.deepseek, null)
+      assert.equal(fallbackDirectory.opencode, null, 'No native or managed directory default is invented')
       for (const value of [fallback, reloaded]) {
         assert.equal(value.ok, true, JSON.stringify(value))
         assert.equal(value.value.defaultModel, 'opencode/fallback')

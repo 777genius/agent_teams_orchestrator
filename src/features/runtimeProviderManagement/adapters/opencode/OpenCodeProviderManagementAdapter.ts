@@ -1,6 +1,6 @@
 import { inspectOpenCodeReadSelection, selectedProviderUsesOpenCodeV2, connectOpenCodeV2Provider, loadOpenCodeV2ProviderModels, testOpenCodeV2ProviderModel, loadOpenCodeV2ProviderSetupForm } from './OpenCodeV2ProviderManagement.js'
 import { buildOpenCodeV2ProviderDirectoryEntries } from './OpenCodeV2ProviderDirectory.js'
-import { applyOpenCodeV2DefaultSelection, clearOpenCodeV2ProjectDefaultModel, setOpenCodeV2DefaultModel } from './OpenCodeV2DefaultModels.js'
+import { applyOpenCodeV2DefaultSelection, applyOpenCodeV2DirectoryDefaultSelection, clearOpenCodeV2ProjectDefaultModel, setOpenCodeV2DefaultModel } from './OpenCodeV2DefaultModels.js'
 import { openCodeV2KeyIntegration } from '../../../../services/opencode/catalog/OpenCodeV2KeyIntegrations.js'
 import path from 'node:path'
 import { realpath } from 'node:fs/promises'
@@ -4128,7 +4128,8 @@ export class OpenCodeProviderManagementAdapter
     })
 
     if (!input.summary && inventory.readGeneration === 'v2') {
-      const { entries, modelIdsByProviderId } = buildOpenCodeV2ProviderDirectoryEntries(inventory)
+      const { entries: nativeEntries, modelIdsByProviderId } = buildOpenCodeV2ProviderDirectoryEntries(inventory)
+      const entries = await applyOpenCodeV2DirectoryDefaultSelection(nativeEntries, inventory.projectPath)
       return { ok: true, value: filterAndPageProviderDirectory({
         directory: { runtimeId: 'opencode', entries: sortProviderDirectoryEntries(entries),
           totalCount: entries.length, returnedCount: entries.length, query: null, filter: 'all',

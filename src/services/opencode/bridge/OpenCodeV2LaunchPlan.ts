@@ -17,6 +17,7 @@ import { hashOpenCodeFile, inspectOpenCodeReadSelection } from '../compatibility
 import { resolveClaudeMultimodelPaths } from '../OpenCodeManagedPaths.js'
 import { collectProjectBehaviorMetadata, canonicalizeOpenCodeProjectPath, materializeOpenCodeSelectedScopeAuth, resolveOpenCodeProfileScope, readOpenCodeSelectedScopeMetadata } from '../OpenCodeProfileManager.js'
 import { normalizeOpenCodeProjectIdentity } from '../OpenCodeProjectIdentity.js'
+import { raceOpenCodeAbortSignal } from '../OpenCodeRuntimeDeadline.js'
 import { resolveOpenCodeAppMcpLaunchConfig } from '../OpenCodeMcpManager.js'
 import { createOpenCodeV2ExecutionConfig, OPENCODE_V2_TEAMMATE_PERMISSIONS } from '../profile/OpenCodeV2ExecutionConfig.js'
 import { createOpenCodeV2ExecutionReceipt } from '../profile/OpenCodeV2ExecutionReceipt.js'
@@ -78,7 +79,7 @@ export async function inspectOpenCodeV2LaunchSelection(envelope: BridgeEnvelope,
   budget.signal?.throwIfAborted()
   assertExecutionPlatformAvailable()
   executionAssert(process.versions.bun === openCodeBunVersion(), 'run_source_bun_required')
-  const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'run-owner')
+  const delivery = await raceOpenCodeAbortSignal(resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'run-owner'), budget.signal)
   const selected = await inspectOpenCodeReadSelection(budget.signal, undefined, budget.deadlineMs)
   executionAssert(selected.native && selected.policy.generation === 'v2', 'run_selected_native_unknown')
   const selectedModel = text(envelope.body.selectedModel)
@@ -90,7 +91,8 @@ export async function inspectOpenCodeV2LaunchSelection(envelope: BridgeEnvelope,
     (envelope.body.toolApprovalMode === undefined || envelope.body.toolApprovalMode === 'auto'), 'run_manual_permission_unsupported')
   const project = await canonicalizeOpenCodeProjectPath(typeof envelope.body.projectPath === 'string' ? envelope.body.projectPath : envelope.cwd)
   budget.signal?.throwIfAborted()
-  const scope = await resolveOpenCodeProfileScope({ projectPath: project, purpose: 'launch_runtime', selectedModel })
+  const scope = await resolveOpenCodeProfileScope({ projectPath: project, purpose: 'launch_runtime', selectedModel,
+    abortSignal: budget.signal })
   budget.signal?.throwIfAborted()
   executionAssert(scope.selectedAuthIdentity !== 'error', 'run_selected_auth_unknown')
   const resolved = await resolveOpenCodeAppMcpLaunchConfig()
@@ -154,8 +156,10 @@ async function prepareSelectedOpenCodeV2SourceAvailability(selection: Awaited<Re
   budget.signal?.throwIfAborted()
   // Version admission precedes graph resolution, so an unqualified release is refused as such.
   assertOpenCodeV2Launchable(openCodeV2EngineVersion(selection.native))
-  const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'execution', selectedDeliveries.get(selection)?.binding)
-  const receipt = await createOpenCodeV2ExecutionReceipt(delivery.root, selection.native, selection.controller, delivery.binding, budget.signal)
+  // Layout/receipt validation only reads bytes and retains file-handle cleanup.
+  // Version-child and auth recovery ownership remain joined in selection above.
+  const delivery = await raceOpenCodeAbortSignal(resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'execution', selectedDeliveries.get(selection)?.binding), budget.signal)
+  const receipt = await raceOpenCodeAbortSignal(createOpenCodeV2ExecutionReceipt(delivery.root, selection.native, selection.controller, delivery.binding, budget.signal), budget.signal)
   budget.signal?.throwIfAborted()
   const config = selection.controller
   if (config.type === 'local') executionAssert(config.command.length > 0 &&

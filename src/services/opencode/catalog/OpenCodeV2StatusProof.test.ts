@@ -2,7 +2,7 @@ import { expect, test } from 'bun:test'
 
 test('full V2 status revalidates only owned current-model proof and never executes on refresh', async () => {
   const script = `
-    import { mock } from 'bun:test'
+    import { mock, spyOn } from 'bun:test'
     import assert from 'node:assert/strict'
     import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
     import path from 'node:path'
@@ -19,6 +19,8 @@ test('full V2 status revalidates only owned current-model proof and never execut
     const selected = { native, model: { providerID: 'opencode', id: 'TEST-free' }, project,
       scope: { scopeToken: 'TEST-current-scope', selectedAuthIdentity: 'absent' }, behaviorFingerprint: 'b'.repeat(64),
       installedGraphSHA256: 'c'.repeat(64), capabilitySnapshotId: 'TEST-current-capability' }
+    const unattendedSelected = { ...selected, model: { providerID: 'opencode', id: 'TEST-other' },
+      behaviorFingerprint: '3'.repeat(64), capabilitySnapshotId: 'TEST-team-capability' }
     let current = selected, inspectionError = false, inspections = 0, resolutions = 0
     let delayInspection = false, cancelled = false, cleanupFinished = false
     const launchModule = ${JSON.stringify(import.meta.resolve('../bridge/OpenCodeV2LaunchPlan.ts'))}
@@ -34,7 +36,9 @@ test('full V2 status revalidates only owned current-model proof and never execut
         }) }
         finally { await new Promise(resolve => setTimeout(resolve, 25)); cleanupFinished = true }
       }
-      assert.equal(envelope.body.selectedModel, 'opencode/TEST-free'); assert.equal(envelope.cwd, project)
+      assert.equal(envelope.cwd, project)
+      if (envelope.body.selectedModel === 'opencode/TEST-other') return unattendedSelected
+      assert.equal(envelope.body.selectedModel, 'opencode/TEST-free')
       if (inspectionError) throw new Error('TEST changed source')
       return current
     } }))
@@ -66,6 +70,11 @@ test('full V2 status revalidates only owned current-model proof and never execut
         host: { version: native.version, resolvedConfigFingerprint: 'f'.repeat(64) } } }, {
       readCredential: async () => null, resolveBinaryPath: () => native.executablePath, resolveBinaryIdentity: async () => 'a'.repeat(64),
     })
+    const unattendedProof = await buildOpenCodeExecutionProof({ selectedModel: 'opencode/TEST-other',
+      capabilitySnapshotId: unattendedSelected.capabilitySnapshotId, snapshot: { profile, projectPath: project, hostHealthy: true,
+        host: { version: native.version, resolvedConfigFingerprint: 'f'.repeat(64) } } }, {
+      readCredential: async () => null, resolveBinaryPath: () => native.executablePath, resolveBinaryIdentity: async () => 'a'.repeat(64),
+    })
     const sourceKey = executionHash({ project, scopeToken: selected.scope.scopeToken, selectedAuthIdentity: selected.scope.selectedAuthIdentity,
       source: selected.behaviorFingerprint, graph: selected.installedGraphSHA256, projectBehavior: behavior.projectBehaviorFingerprint, variant: 'default' })
     let cases = 0
@@ -84,6 +93,18 @@ test('full V2 status revalidates only owned current-model proof and never execut
         submitted: true, retired: true, proof, failure: null }
       const save = value => writeFile(file, JSON.stringify(value), { mode: 0o600 })
       await save(record)
+      const unattendedKey = executionHash({ project, scopeToken: unattendedSelected.scope.scopeToken, selectedAuthIdentity: unattendedSelected.scope.selectedAuthIdentity,
+        source: unattendedSelected.behaviorFingerprint, graph: unattendedSelected.installedGraphSHA256, projectBehavior: behavior.projectBehaviorFingerprint,
+        variant: 'default', unattendedTeam: true })
+      const unattendedDirectory = path.join(store.probeRoot, unattendedKey)
+      await mkdir(unattendedDirectory, { mode: 0o700 })
+      await writeFile(path.join(unattendedDirectory, 'probe.json'), JSON.stringify({ ...record, sourceKey: unattendedKey, proof: unattendedProof }), { mode: 0o600 })
+      const unattendedEnvelope = { schemaVersion: 1, requestId: 'TEST-team-hint', command: 'opencode.readiness', cwd: project,
+        startedAt: new Date().toISOString(), timeoutMs: 60000, body: { effort: 'default' } }
+      // Team preflight uses different source/config authority. It cannot select
+      // a display candidate which ordinary passive Test lookup cannot resolve.
+      assert.equal((await resolveOriginal(unattendedEnvelope, unattendedSelected, true, { unattendedTeam: true })).state, 'available')
+      assert.equal(await readOpenCodeV2StatusProof(inventory), null); assert.equal(inspections, 0); cases++
       // The real producer's cached-success branch publishes the discovery hint.
       await resolveOriginal({ schemaVersion: 1, requestId: 'TEST-publish-hint', command: 'opencode.readiness', cwd: project,
         startedAt: new Date().toISOString(), timeoutMs: 60000, body: { effort: 'default' } }, selected, true)
@@ -95,6 +116,10 @@ test('full V2 status revalidates only owned current-model proof and never execut
       assert.equal(status.authenticated, false); assert.equal(status.capabilities.teamLaunch, false)
       assert.equal(status.capabilities.oneShot, false); assert.equal(status.modelCatalog.defaultLaunchModel, null)
       assert.equal(resolutions, 1); cases++
+      await resolveOriginal(unattendedEnvelope, unattendedSelected, true, { unattendedTeam: true })
+      assert.equal((await readOpenCodeV2StatusProof(inventory)).proofHash, proof.proofHash,
+        'A later team preflight must preserve the ordinary Test discovery hint')
+      cases++
       for (const change of [
         { proof: { ...proof, expiresAt: new Date(Date.now() - 1).toISOString() } },
         { proof: { ...proof, projectPath: path.join(root, 'TEST-other-project') } },
@@ -151,12 +176,53 @@ test('full V2 status revalidates only owned current-model proof and never execut
       assert.equal(apiStatus.modelCatalog.models[0].metadata.opencode.proofState, 'verified')
       assert.equal(apiStatus.modelCatalog.models[0].metadata.opencode.routeKind, 'catalog_provider', 'Key-backed proof cannot claim verified anonymous access')
       cases++
+      // A stalled pure file read cannot keep passive status waiting after its
+      // budget. Its file owner must still close after the late read settles.
+      const filesystem = await import('node:fs/promises'), originalOpen = filesystem.open
+      let releaseRead, markRead, markClosed, readStarted = false, fileClosed = false
+      const heldRead = new Promise(resolve => { releaseRead = resolve })
+      const enteredRead = new Promise(resolve => { markRead = resolve })
+      const closedRead = new Promise(resolve => { markClosed = resolve })
+      const delayedOpen = spyOn(filesystem, 'open').mockImplementation(async (...args) => {
+        const handle = await originalOpen(...args)
+        if (String(args[0]) !== path.join(apiDirectory, 'probe.json')) return handle
+        const originalRead = handle.readFile.bind(handle), originalClose = handle.close.bind(handle)
+        handle.readFile = async (...readArgs) => {
+          readStarted = true; markRead(); await heldRead
+          return originalRead(...readArgs)
+        }
+        handle.close = async () => {
+          try { return await originalClose() }
+          finally { fileClosed = true; markClosed() }
+        }
+        return handle
+      })
+      let readTimer
+      const beforeReadInspections = inspections, beforeReadResolutions = resolutions
+      const waitingRead = readOpenCodeV2StatusProof(inventory, 1000)
+      try {
+        assert.equal(await Promise.race([enteredRead.then(() => true), waitingRead.then(() => false)]), true)
+        const result = await Promise.race([waitingRead, new Promise(resolve => {
+          readTimer = setTimeout(() => resolve('TEST-read-still-pending'), 2500)
+        })])
+        assert.equal(result, null)
+        assert.equal(fileClosed, false, 'The test still owns the deferred read at timeout')
+        assert.equal(inspections, beforeReadInspections); assert.equal(resolutions, beforeReadResolutions)
+        cases++
+      } finally {
+        clearTimeout(readTimer); releaseRead(); await waitingRead
+        if (readStarted) await closedRead
+        delayedOpen.mockRestore()
+      }
+      assert.equal(fileClosed, true)
+      assert.equal(inspections, beforeReadInspections, 'Late file completion cannot begin source or auth inspection')
+      assert.equal(resolutions, beforeReadResolutions, 'Late file completion cannot publish proof')
       // Changed source keys may have locks, but refresh cannot write another probe or start a run.
       let records = 0
       for (const name of await readdir(store.probeRoot)) {
         try { await readFile(path.join(store.probeRoot, name, 'probe.json')); records++ } catch { }
       }
-      assert.equal(records, 2)
+      assert.equal(records, 3)
       assert.deepEqual(JSON.parse(await readFile(file, 'utf8')), record)
       assert.equal(await readdir(path.join(process.env.CLAUDE_MULTIMODEL_DATA_HOME, 'opencode/v2')).then(rows => rows.includes('runs')), false)
     } finally { await rm(root, { recursive: true, force: true }) }
@@ -167,5 +233,5 @@ test('full V2 status revalidates only owned current-model proof and never execut
       NODE_ENV: 'test', OPENCODE_DISABLE_MODELS_FETCH: '1', OPENCODE_DISABLE_AUTOUPDATE: '1' } })
   const [exit, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()])
   expect({ exit, stderr }).toEqual({ exit: 0, stderr: '' })
-  expect(JSON.parse(stdout)).toEqual({ cases: 19, inspections: 9, resolutions: 7, fixtureRemoved: true })
+  expect(JSON.parse(stdout)).toEqual({ cases: 22, inspections: 10, resolutions: 8, fixtureRemoved: true })
 }, 30_000)

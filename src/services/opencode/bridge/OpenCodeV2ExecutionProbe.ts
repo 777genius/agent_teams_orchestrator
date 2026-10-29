@@ -67,16 +67,17 @@ export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, 
   const freshRequestId = options.freshExecutionProofRequestId
   executionAssert(freshRequestId === undefined || run && !options.requireExisting && typeof freshRequestId === 'string' &&
     /^[a-zA-Z0-9._:-]{1,200}$/.test(freshRequestId), 'probe_fresh_request_invalid')
+  const unattendedTeam = options.unattendedTeam === true
   const available = async (record: ProbeRecord) => {
     if (freshRequestId !== undefined && record.freshExecutionProofRequestId !== freshRequestId)
       return { state: 'pending' as const, proof: null, reason: 'The original probe settled; the requested fresh proof still requires its own retired-generation admission.' }
     // Only an explicit producer success updates the display hint. Passive reads
-    // never select a different model or publish a hint from a cached DTO.
-    if (run && record.proof && record.retired)
+    // never select a different model or publish a hint from a cached DTO. Team
+    // preflight has a separate source key which ordinary status cannot resolve.
+    if (run && !unattendedTeam && record.proof && record.retired)
       await writeOpenCodeV2StatusProofHint(path.dirname(directory), selection.project, sourceKey)
     return { state: 'available' as const, proof: record.proof, reason: null }
   }
-  const unattendedTeam = options.unattendedTeam === true
   const deadline = Date.now() + Math.max(1, Math.min(envelope.timeoutMs || 120_000, 300_000) - 25_000)
   const assertDeadline = () => { options.signal?.throwIfAborted(); executionAssert(Date.now() < deadline, 'execution_timeout') }
   assertDeadline()

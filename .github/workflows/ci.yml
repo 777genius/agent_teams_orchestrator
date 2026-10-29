@@ -260,11 +260,14 @@ jobs:
           src/features/runtimeProviderManagement/adapters/opencode/OpenCodeV2ProviderSetupForm.test.ts
           src/features/runtimeProviderManagement/adapters/opencode/OpenCodeV2CatalogCredentials.test.ts
           src/features/runtimeProviderManagement/adapters/opencode/OpenCodeV2DefaultModels.test.ts
+          src/features/runtimeProviderManagement/adapters/opencode/OpenCodeV2DefaultModelsRefresh.test.ts
           src/features/runtimeProviderManagement/adapters/opencode/OpenCodeV2FreeModels.test.ts
           src/features/runtimeProviderManagement/adapters/opencode/OpenCodeV2ModelPagination.test.ts
           src/features/runtimeProviderManagement/adapters/opencode/OpenCodeV2ProviderManagement.project-identity.test.ts
           src/services/opencode/catalog/OpenCodeV2ReadStatus.test.ts
+          src/services/opencode/catalog/OpenCodeV2RuntimeStatus.test.ts
           src/services/opencode/catalog/OpenCodeV2StatusProof.test.ts
+          src/services/opencode/bridge/OpenCodeV2ScopeCancellation.test.ts
           src/services/opencode/catalog/OpenCodeV2KeyIntegrations.test.ts
           --timeout 30000
       - name: Test V2 provider routing in isolation

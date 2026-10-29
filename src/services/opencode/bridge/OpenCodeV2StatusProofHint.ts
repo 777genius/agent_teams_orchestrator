@@ -10,14 +10,18 @@ function hintFile(root: string, project: string): string {
   return path.join(root, `latest-${executionHash(normalizeOpenCodeProjectIdentity(project))}.json`)
 }
 /** Discovery only. A hint is never proof, even when written by the producer. */
-export async function readOpenCodeV2StatusProofHint(root: string, project: string): Promise<string | null> {
+export async function readOpenCodeV2StatusProofHint(root: string, project: string, signal?: AbortSignal): Promise<string | null> {
   try {
+    signal?.throwIfAborted()
     const handle = await open(hintFile(root, project), constants.O_RDONLY | (windows ? 0 : constants.O_NOFOLLOW))
     try {
+      signal?.throwIfAborted()
       const stat = await handle.stat()
+      signal?.throwIfAborted()
       if (!stat.isFile() || stat.nlink !== 1 || stat.size < 1 || stat.size > 1024 ||
         !windows && (stat.uid !== process.getuid?.() || (stat.mode & 0o077) !== 0)) return null
-      const row = JSON.parse(await handle.readFile('utf8'))
+      const row = JSON.parse(await handle.readFile({ encoding: 'utf8', signal }))
+      signal?.throwIfAborted()
       return row?.schemaVersion === 1 && typeof row.sourceKey === 'string' && /^[a-f0-9]{64}$/.test(row.sourceKey)
         ? row.sourceKey : null
     } finally { await handle.close() }
