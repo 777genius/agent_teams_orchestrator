@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'bun:test'
 import { OpenCodeVersionProbeCleanupError } from '../../../../services/opencode/compatibility/OpenCodeVersionProbe.js'
-import type { ConnectProviderInput, LoadProviderModelsInput, TestProviderModelInput } from '../../domain/types.js'
+import type { ConnectProviderInput, LoadProviderModelsInput, LoadProviderSetupFormInput, TestProviderModelInput } from '../../domain/types.js'
 
 // Run this module alone: replacement is a private transport boundary, never a production capability/proof hook.
 let selectedV2 = true
@@ -8,6 +8,7 @@ let selectedIdentityError: unknown
 let selectionReads = 0
 let lastReadSelection: unknown
 const modelSelections: unknown[] = []
+const setupCalls: LoadProviderSetupFormInput[] = [], setupSelections: unknown[] = []
 const connectCalls: ConnectProviderInput[] = [], modelCalls: LoadProviderModelsInput[] = [], testCalls: TestProviderModelInput[] = []
 const boundaryFailure = { ok: false as const, error: { code: 'runtime-unhealthy' as const, message: 'TEST owned V2 boundary reached', recoverable: true } }
 mock.module('./OpenCodeV2ProviderManagement.js', () => ({
@@ -24,11 +25,29 @@ mock.module('./OpenCodeV2ProviderManagement.js', () => ({
   selectedProviderUsesOpenCodeV2: async () => { if (selectedIdentityError !== undefined) throw selectedIdentityError; return selectedV2 },
   connectOpenCodeV2Provider: async (input: ConnectProviderInput) => { connectCalls.push(input); return boundaryFailure },
   loadOpenCodeV2ProviderModels: async (input: LoadProviderModelsInput, selection?: unknown) => { modelCalls.push(input); modelSelections.push(selection); return boundaryFailure },
+  loadOpenCodeV2ProviderSetupForm: async (input: LoadProviderSetupFormInput, selection?: unknown) => { setupCalls.push(input); setupSelections.push(selection); return boundaryFailure },
   testOpenCodeV2ProviderModel: async (input: TestProviderModelInput) => { testCalls.push(input); return boundaryFailure },
 }))
 const { OpenCodeProviderManagementAdapter } = await import('./OpenCodeProviderManagementAdapter.js')
 let legacyReads = 0
 const adapter = new OpenCodeProviderManagementAdapter({ inventoryService: { probe: async () => { legacyReads++; throw new Error('TEST legacy inventory must not execute for V2') } } })
+
+test('first-time and curated V2 setup use the native reader before every V1 setup fallback', async () => {
+  selectedV2 = true
+  const before = setupCalls.length, readsBefore = legacyReads
+  for (const providerId of ['opencode-go', 'openai', 'deepseek', 'kimi-code-plan-global', 'minimax-coding-plan']) {
+    expect(await adapter.loadSetupForm({ runtimeId: 'opencode', providerId, projectPath: '/TEST/project' })).toEqual(boundaryFailure)
+    expect(setupSelections.at(-1)).toBe(lastReadSelection)
+  }
+  expect(setupCalls.length).toBe(before + 5)
+  expect(legacyReads).toBe(readsBefore)
+  selectedIdentityError = new Error('TEST selection failed')
+  try {
+    const failure = await adapter.loadSetupForm({ runtimeId: 'opencode', providerId: 'minimax-coding-plan' })
+    expect(failure).toMatchObject({ ok: false, error: { code: 'runtime-unhealthy' } })
+    expect(setupCalls.length).toBe(before + 5)
+  } finally { selectedIdentityError = undefined }
+})
 
 test('public API-key convenience method and direct connect route reach V2 after existing validation', async () => {
   selectedV2 = true; const before = connectCalls.length

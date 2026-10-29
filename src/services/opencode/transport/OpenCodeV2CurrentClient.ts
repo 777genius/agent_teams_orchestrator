@@ -16,6 +16,7 @@ export function createOpenCodeV2CurrentClient(client: typeof CurrentClient, base
       wire.check()
     },
     models: directory => sdk.model.list({ location: { directory } }),
+    integrations: directory => sdk.integration.list({ location: { directory } }),
     defaultModel: directory => sdk.model.default({ location: { directory } }),
     providers: directory => sdk.provider.list({ location: { directory } }),
     provider: (directory, providerID) => sdk.provider.get({ location: { directory }, providerID }),

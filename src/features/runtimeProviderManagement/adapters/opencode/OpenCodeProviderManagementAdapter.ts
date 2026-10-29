@@ -1,4 +1,5 @@
-import { inspectOpenCodeReadSelection, selectedProviderUsesOpenCodeV2, selectedOpenCodeV2Version, connectOpenCodeV2Provider, loadOpenCodeV2ProviderModels, testOpenCodeV2ProviderModel, buildOpenCodeV2KeySetupForm } from './OpenCodeV2ProviderManagement.js'
+import { inspectOpenCodeReadSelection, selectedProviderUsesOpenCodeV2, connectOpenCodeV2Provider, loadOpenCodeV2ProviderModels, testOpenCodeV2ProviderModel, loadOpenCodeV2ProviderSetupForm } from './OpenCodeV2ProviderManagement.js'
+import { buildOpenCodeV2ProviderDirectoryEntries } from './OpenCodeV2ProviderDirectory.js'
 import { openCodeV2KeyIntegration } from '../../../../services/opencode/catalog/OpenCodeV2KeyIntegrations.js'
 import path from 'node:path'
 import { realpath } from 'node:fs/promises'
@@ -4120,10 +4121,22 @@ export class OpenCodeProviderManagementAdapter
 
     const inventoryService = this.deps.inventoryService ?? openCodeInventoryService
     const inventory = await this.probeInventory(inventoryService, input.projectPath, {
-      mode: input.summary ? 'summary' : input.refresh ? 'full' : 'profile',
+      mode: input.summary ? 'summary' : 'full',
+      v1SettingsOnly: !input.summary && input.refresh !== true,
       bypassCache: input.refresh === true,
       refreshModels: input.refresh === true && input.summary !== true,
     })
+
+    if (!input.summary && inventory.readGeneration === 'v2') {
+      const { entries, modelIdsByProviderId } = buildOpenCodeV2ProviderDirectoryEntries(inventory)
+      return { ok: true, value: filterAndPageProviderDirectory({
+        directory: { runtimeId: 'opencode', entries: sortProviderDirectoryEntries(entries),
+          totalCount: entries.length, returnedCount: entries.length, query: null, filter: 'all',
+          limit: entries.length, cursor: null, nextCursor: null, fetchedAt: new Date().toISOString(),
+          diagnostics: redactDiagnostics([...inventory.diagnostics, ...(inventory.probeError ? [inventory.probeError] : [])]) },
+        modelIdsByProviderId, query: input.query, filter: input.filter, limit: input.limit, cursor: input.cursor,
+      }) }
+    }
 
     if (!inventory.detected
       || (!input.summary && inventory.readGeneration !== undefined && inventory.readGeneration !== 'v1')) {
@@ -4325,12 +4338,11 @@ export class OpenCodeProviderManagementAdapter
         false,
       )
     }
-    // Registered native V2 key integrations are served only while the selected binary is V2.
-    if (openCodeV2KeyIntegration(providerId)) {
-      let selectedVersion: Awaited<ReturnType<typeof selectedOpenCodeV2Version>> = null
-      try { selectedVersion = await selectedOpenCodeV2Version() } catch { selectedVersion = null }
-      const form = selectedVersion ? buildOpenCodeV2KeySetupForm(providerId, selectedVersion) : null
-      if (form) return { ok: true, value: form }
+    let selected: Awaited<ReturnType<typeof inspectOpenCodeReadSelection>>
+    try { selected = await inspectOpenCodeReadSelection() }
+    catch { return providerManagementError('runtime-unhealthy', 'Selected OpenCode identity is unavailable') }
+    if (selected.policy.generation === 'v2') {
+      return loadOpenCodeV2ProviderSetupForm({ ...input, providerId }, selected)
     }
     if (FAST_CURATED_SETUP_PROVIDER_IDS.has(providerId)) {
       return {
@@ -5282,7 +5294,15 @@ export class OpenCodeProviderManagementAdapter
       return providerManagementError('auth-required', curatedSubscriptionKeyError)
     }
 
-    if (selectedV2) return connectOpenCodeV2Provider({ ...input, providerId, apiKey })
+    if (selectedV2) {
+      const result = await connectOpenCodeV2Provider({ ...input, providerId, apiKey })
+      if (result.ok) {
+        this.invalidateDirectoryCache()
+        const inventoryService = this.deps.inventoryService ?? openCodeInventoryService
+        inventoryService.clearCache?.()
+      }
+      return result
+    }
 
     return this.withManagedOpenCodeClient(
       input.runtimeId,
