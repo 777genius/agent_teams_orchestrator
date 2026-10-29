@@ -15,6 +15,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.event_name }}-${{ (github.event_name == 'pull_request' || github.event_name == 'push') && (github.event.pull_request.number || github.ref) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
+
 jobs:
   scope:
     name: CI scope
@@ -517,7 +521,7 @@ jobs:
 
   required:
     name: CI required
-    if: always()
+    if: always() && !cancelled()
     needs: [scope, cursor-managed-plugin, task-change-ledger, opencode-authority, windows-packaged-backfill, opencode-conformance, packaged-delivery, opencode-v2-linux]
     runs-on: ubuntu-latest
     timeout-minutes: 5

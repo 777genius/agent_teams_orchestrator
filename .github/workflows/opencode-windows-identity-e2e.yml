@@ -20,8 +20,8 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: opencode-windows-identity-e2e-${{ github.ref }}
-  cancel-in-progress: true
+  group: opencode-windows-identity-e2e-${{ github.event_name }}-${{ (github.event_name == 'pull_request' || github.event_name == 'push') && (github.event.pull_request.number || github.ref) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
 env:
   OPENCODE_NPM_VERSION: '1.19.2'
   BASELINE_RUNTIME: '0.0.122'
