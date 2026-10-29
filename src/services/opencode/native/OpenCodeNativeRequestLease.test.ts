@@ -1,5 +1,6 @@
 import { afterEach, expect, spyOn, test } from 'bun:test'
 import { createServer, type Server, type Socket } from 'node:net'
+import { Client } from 'undici/index.js'
 import * as custody from './OpenCodeNativeCustody.js'
 import { fetchNativeOpenCode } from './OpenCodeNativeRequestLease.js'
 import { OpenCodeClientFactory, OpenCodeHttpError } from '../OpenCodeClientFactory.js'
@@ -151,4 +152,129 @@ test('bounded reconciliation transport reset cannot become an unsupported-route 
     .create('http://TEST-loopback', { boundedReconciliation: true })
   await expect(client.answerPermission({ requestId: 'TEST-reset', decision: 'allow' })).rejects.toThrow('TEST-reset')
   expect(requests).toBe(1)
+})
+
+test('cancelling an unread admitted response tolerates already-buffered and late data', async () => {
+  const e = await endpoint(socket => {
+    socket.on('error', () => undefined)
+    socket.write('HTTP/1.1 200 OK\r\nContent-Length: 131072\r\nConnection: close\r\n\r\n')
+    socket.write(Buffer.alloc(65536, 120))
+    setTimeout(() => { if (!socket.destroyed) socket.end(Buffer.alloc(65536, 121)) }, 10)
+  })
+  await withAuthority(e.baseUrl, async () => {}, async owner => {
+    const response = await fetchNativeOpenCode(e.baseUrl + '/TEST-cancel', { signal: AbortSignal.timeout(2000) }, owner)
+    await response.body!.cancel()
+    // Let Bun's queued readable resume/data callbacks run after cancellation.
+    await Bun.sleep(30)
+    expect(response.body!.locked).toBe(false)
+  })
+})
+
+test('cancelling a pending body read closes it without waiting for late data and disposes once', async () => {
+  const late = deferred<void>(), closed = deferred<void>()
+  const e = await endpoint(socket => {
+    socket.on('error', () => undefined)
+    socket.once('close', () => closed.resolve())
+    socket.write('HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n')
+    setTimeout(() => { if (!socket.destroyed) socket.end('xy'); late.resolve() }, 20)
+  })
+  const destroy = spyOn(Client.prototype, 'destroy')
+  try {
+    await withAuthority(e.baseUrl, async () => {}, async owner => {
+      const response = await fetchNativeOpenCode(e.baseUrl + '/TEST-pending-cancel', { signal: AbortSignal.timeout(2000) }, owner)
+      const reader = response.body!.getReader()
+      const pending = reader.read()
+      await reader.cancel()
+      expect(await pending).toEqual({ done: true, value: undefined })
+      await reader.cancel()
+      await Promise.all([closed.promise, late.promise])
+      // Undici's promise overload re-enters its callback overload internally.
+      expect(destroy.mock.calls.filter(args => args.length === 0)).toHaveLength(1)
+      reader.releaseLock()
+    })
+  } finally { destroy.mockRestore() }
+})
+
+test('abort during a pending body read rejects with a sanitized error and disposes once', async () => {
+  const e = await endpoint(socket => {
+    socket.on('error', () => undefined)
+    socket.write('HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n')
+  })
+  const destroy = spyOn(Client.prototype, 'destroy')
+  try {
+    await withAuthority(e.baseUrl, async () => {}, async owner => {
+      const controller = new AbortController()
+      const response = await fetchNativeOpenCode(e.baseUrl + '/TEST-abort', { signal: controller.signal }, owner)
+      const pending = response.text()
+      controller.abort()
+      await expect(pending).rejects.toThrow('native_custody_response_failed')
+      await Bun.sleep(0)
+      // Undici's promise overload re-enters its callback overload internally.
+      expect(destroy.mock.calls.filter(args => args.length === 0)).toHaveLength(1)
+    })
+  } finally { destroy.mockRestore() }
+})
+
+test('body EOF closes once and subsequent cancel does not dispose twice', async () => {
+  const e = await endpoint(ok)
+  const destroy = spyOn(Client.prototype, 'destroy')
+  try {
+    await withAuthority(e.baseUrl, async () => {}, async owner => {
+      const response = await fetchNativeOpenCode(e.baseUrl + '/TEST-eof', undefined, owner)
+      const reader = response.body!.getReader()
+      let text = ''
+      while (true) {
+        const value = await reader.read()
+        if (value.done) break
+        text += new TextDecoder().decode(value.value)
+      }
+      expect(text).toBe('{}')
+      expect(await reader.read()).toEqual({ done: true, value: undefined })
+      await reader.cancel()
+      await Bun.sleep(0)
+      // Undici's promise overload re-enters its callback overload internally.
+      expect(destroy.mock.calls.filter(args => args.length === 0)).toHaveLength(1)
+      reader.releaseLock()
+    })
+  } finally { destroy.mockRestore() }
+})
+
+test('truncated body errors stay sanitized after partial data and dispose once', async () => {
+  const e = await endpoint(socket => socket.end('HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nTEST-partial'))
+  const destroy = spyOn(Client.prototype, 'destroy')
+  try {
+    await withAuthority(e.baseUrl, async () => {}, async owner => {
+      const response = await fetchNativeOpenCode(e.baseUrl + '/TEST-truncated', undefined, owner)
+      const error = await response.text().then(() => null, error => error)
+      expect(error).toBeInstanceOf(Error)
+      expect(error.message).toBe('native_custody_response_failed')
+      expect(error.cause).toBeUndefined()
+      await Bun.sleep(0)
+      // Undici's promise overload re-enters its callback overload internally.
+      expect(destroy.mock.calls.filter(args => args.length === 0)).toHaveLength(1)
+    })
+  } finally { destroy.mockRestore() }
+})
+
+test('manual body streaming delivers the first chunk before the server releases the remainder', async () => {
+  let release!: () => void
+  const e = await endpoint(socket => {
+    socket.write('HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n')
+    release = () => socket.end('5\r\nworld\r\n0\r\n\r\n')
+  })
+  await withAuthority(e.baseUrl, async () => {}, async owner => {
+    const response = await fetchNativeOpenCode(e.baseUrl + '/TEST-stream', { signal: AbortSignal.timeout(2000) }, owner)
+    const reader = response.body!.getReader()
+    const first = await reader.read()
+    expect(new TextDecoder().decode(first.value)).toBe('hello')
+    release()
+    let text = 'hello'
+    while (true) {
+      const value = await reader.read()
+      if (value.done) break
+      text += new TextDecoder().decode(value.value)
+    }
+    expect(text).toBe('helloworld')
+    reader.releaseLock()
+  })
 })
