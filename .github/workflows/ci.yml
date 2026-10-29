@@ -253,6 +253,7 @@ jobs:
         run: >-
           bun test
           src/features/runtimeProviderManagement/adapters/opencode/OpenCodeV2ProviderDirectory.test.ts
+          src/features/runtimeProviderManagement/adapters/opencode/OpenCodeV2ProviderSetupForm.test.ts
           src/features/runtimeProviderManagement/adapters/opencode/OpenCodeV2ProviderManagement.project-identity.test.ts
           src/services/opencode/catalog/OpenCodeV2ReadStatus.test.ts
           src/services/opencode/catalog/OpenCodeV2KeyIntegrations.test.ts

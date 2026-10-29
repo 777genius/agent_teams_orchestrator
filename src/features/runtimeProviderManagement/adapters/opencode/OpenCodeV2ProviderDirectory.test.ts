@@ -29,7 +29,8 @@ test('first-time discovery includes native key providers absent from the active 
   expect(entries.some(row => ['exa', 'tavily'].includes(row.providerId))).toBe(false)
   const copilot = entries.find(row => row.providerId === 'github-copilot')!
   expect(copilot.setupKind).toBe('configure-manually')
-  expect(copilot.actions.every(action => !action.enabled)).toBe(true)
+  expect(copilot.actions).toHaveLength(1)
+  expect(copilot.actions).toMatchObject([{ id: 'configure', enabled: false }])
   expect(copilot.authMethods).toEqual([])
 })
 
