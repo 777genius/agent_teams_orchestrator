@@ -1,8 +1,82 @@
 import { expect, test, spyOn } from 'bun:test'
-import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { verifyBunPtyGraph, verifyGraphs } from './stage.js'
+import { selectOpenCodeV2StageVersions, stageOpenCodeV2Graphs, verifyBunPtyGraph, verifyGraphs } from './stage.js'
+
+test('release staging preserves every exact platform engine without adding a new qualification', () => {
+  const staged = ['2.0.0', '2.0.32', '2.1.4'] as const
+  expect(selectOpenCodeV2StageVersions(staged, 'darwin-x64')).toEqual(['2.0.0', '2.0.32'])
+  expect(selectOpenCodeV2StageVersions(staged, 'win32-x64')).toEqual(['2.1.4'])
+  expect(selectOpenCodeV2StageVersions(staged, 'win32-arm64')).toEqual([])
+  expect(() => selectOpenCodeV2StageVersions(['2.0.32'], 'linux-x64')).toThrow('not installed')
+})
+
+/** Tiny real package/export closure: exercises staging without copying the installed vendor graph. */
+async function linkedInstallFixture(root: string, outsideDependency = false) {
+  const source = path.join(root, 'source'), install = path.join(root, 'shared/node_modules'), pin = '2.0.32'
+  await mkdir(source, { recursive: true }); await mkdir(install, { recursive: true })
+  await symlink(install, path.join(source, 'node_modules'), process.platform === 'win32' ? 'junction' : 'dir')
+  const writePackage = async (alias: string, name: string, version: string, exports: Record<string, string>,
+    dependencies: Record<string, string> = {}, imports?: Record<string, string>, modules = install) => {
+    const directory = path.join(modules, alias)
+    await mkdir(directory, { recursive: true })
+    await writeFile(path.join(directory, 'package.json'), JSON.stringify({ name, version, exports, dependencies, ...(imports ? { imports } : {}) }))
+    for (const file of new Set([...Object.values(exports), ...Object.values(imports ?? {})])) {
+      await mkdir(path.dirname(path.join(directory, file)), { recursive: true })
+      await writeFile(path.join(directory, file), `export const marker = ${JSON.stringify(name)}\n`)
+    }
+  }
+  const effect = { effect: '4.0.1' }
+  await writePackage('effect', 'effect', '4.0.1', { '.': './index.js' })
+  await writePackage('@effect/platform-node', '@effect/platform-node', '4.0.1',
+    { './NodeSocket': './socket.js', './NodeHttpServer': './server.js' }, effect)
+  await writePackage('@effect/platform-node-shared', '@effect/platform-node-shared', '4.0.1', { './NodeStream': './stream.js' }, effect)
+  await writePackage('@modelcontextprotocol/sdk', '@modelcontextprotocol/sdk', '1.29.0', { './client/index.js': './client.js' })
+  await writePackage('bun-pty', 'bun-pty', '0.4.11', { '.': './index.js' })
+  await writePackage('drizzle-orm', 'drizzle-orm', '1.0.0', { './effect-core': './effect-core.js' }, effect)
+  await writePackage('@opencode/ai', '@opencode/ai', pin, { './route/client': './client.js' }, effect)
+  await writePackage('@opencode/core', '@opencode/core', pin, { './bus': './bus.js' },
+    { ...effect, '@opencode/ai': pin, 'drizzle-orm': '1.0.0', 'bun-pty': '0.4.11' }, { '#pty': './pty.bun.js' })
+  await writePackage('@opencode/schema', '@opencode/schema', pin,
+    { './config/provider': './provider.js', './model': './model.js', './installation-event': './event.js' }, effect)
+  await writePackage('@opencode/protocol', '@opencode/protocol', pin, { './groups/pty': './pty.js' }, effect)
+  await writePackage('@opencode/util', '@opencode/util', pin, { './effect/layer-node': './layer.js' }, effect)
+  await writePackage('@opencode/simulation', '@opencode/simulation', pin, { './backend': './backend.js' }, effect)
+  await writePackage('@opencode/client-v2.0.32', '@opencode/client', pin, { '.': './index.js' },
+    { '@opencode/schema': pin, '@opencode/protocol': pin })
+  await writePackage('@opencode/server-v2.0.32', '@opencode/server', pin, { './process': './process.js' },
+    { ...effect, ...Object.fromEntries(['core', 'schema', 'protocol', 'util', 'simulation'].map(name => [`@opencode/${name}`, pin])),
+      ...(outsideDependency ? { outside: '1.0.0' } : {}) })
+  if (outsideDependency) await writePackage('outside', 'outside', '1.0.0', { '.': './index.js' }, {}, undefined, path.join(root, 'node_modules'))
+  await writeFile(path.join(source, 'package.json'), JSON.stringify({ name: 'TEST-linked-install', version: '1.0.0',
+    dependencies: { '@opencode/server-v2.0.32': `npm:@opencode/server@${pin}`, '@opencode/client-v2.0.32': `npm:@opencode/client@${pin}` },
+    overrides: { 'bun-pty': '0.4.11' } }))
+  return { source, install, bundle: path.join(root, 'bundle') }
+}
+
+test('portable staging accepts a linked hoisted install and produces a self-contained physical graph', async () => {
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'TEST-opencode-linked-install-')))
+  try {
+    const fixture = await linkedInstallFixture(root)
+    await stageOpenCodeV2Graphs(fixture.source, fixture.bundle, { portable: true })
+    const server = path.join(fixture.bundle, 'node_modules/@opencode/server-v2.0.32/process.js')
+    expect(await readFile(server, 'utf8')).toContain('@opencode/server')
+    expect((await lstat(path.dirname(server))).isSymbolicLink()).toBe(false)
+    expect(await realpath(Bun.resolveSync('@opencode/server-v2.0.32/process', fixture.bundle))).toBe(server)
+    const manifest = JSON.parse(await readFile(path.join(fixture.bundle, 'opencode-v2-graphs.json'), 'utf8'))
+    expect(manifest.graphs.map((row: { version: string }) => row.version)).toEqual(['2.0.32'])
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('portable staging rejects an ancestor dependency outside the frozen canonical install root', async () => {
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'TEST-opencode-linked-escape-')))
+  try {
+    const fixture = await linkedInstallFixture(root, true)
+    await expect(stageOpenCodeV2Graphs(fixture.source, fixture.bundle, { portable: true })).rejects.toThrow('Portable graph escaped the hoisted install')
+    expect(await lstat(path.join(fixture.bundle, 'node_modules/outside')).then(() => true, () => false)).toBe(false)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
 
 async function ptyFixture(root: string, pin: '2.0.0' | '2.0.32') {
   const core = path.join(root, 'node_modules', pin === '2.0.0' ? '@opencode/server-v2.0.0/node_modules/@opencode/core' : '@opencode/core')

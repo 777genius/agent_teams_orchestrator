@@ -19,7 +19,7 @@ export type OpenCodeV2ReadClient = {
 export async function createOpenCodeV2ReadClient(authority: OpenCodeV2EndpointAuthority,
   context: OpenCodeClientRequestContext = {}) {
   assertOpenCodeV2EndpointAuthority(authority)
-  const entry = await resolveOpenCodeV2ClientEntry(openCodeV2EngineVersion(authority.native))
+  const entry = await resolveOpenCodeV2ClientEntry(openCodeV2EngineVersion(authority.native), undefined, authority.delivery)
   for (const [dependency, subpath] of OPENCODE_V2_CLIENT_GRAPH_ENTRIES) {
     await verifyOpenCodePackage(await realpath(Bun.resolveSync(`@opencode/${dependency}/${subpath}`, path.dirname(entry))),
       `@opencode/${dependency}`, openCodeV2EngineVersion(authority.native))

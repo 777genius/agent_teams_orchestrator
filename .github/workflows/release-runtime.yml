@@ -207,7 +207,7 @@ jobs:
       - name: Build packaged runtime deliveries
         env:
           BUN_COMPILE_TARGET: ${{ matrix.compile_target }}
-        run: bun run ./scripts/package-runtime.ts --platform ${{ matrix.platform }}
+        run: bun --no-install ./scripts/package-runtime.ts --platform ${{ matrix.platform }}
 
       - name: Verify compiled runtime
         if: runner.os != 'Windows' && matrix.platform != 'win32-arm64'
@@ -330,6 +330,7 @@ jobs:
           printf '%s\n' "$runtime_commit" > release/runtime/COMMIT_SHA
           [[ -f dist/opencode-delivery.json ]] || { echo "Packaged OpenCode delivery identity missing" >&2; exit 1; }
           cp dist/opencode-delivery.json release/runtime/opencode-delivery.json
+          if [[ -f dist/opencode-v2-delivery.json ]]; then cp dist/opencode-v2-delivery.json release/runtime/opencode-v2-delivery.json; fi
           # The managed Cursor assets are resolved beside the installed binary.
           # Leaving them out of the archive turns automatic discovery into a
           # manual staging step nobody performs on a real install.
@@ -356,6 +357,7 @@ jobs:
           printf '%s\n' "$runtime_commit" > release/runtime/COMMIT_SHA
           [[ -f dist/opencode-delivery.json ]] || { echo "Packaged OpenCode delivery identity missing" >&2; exit 1; }
           cp dist/opencode-delivery.json release/runtime/opencode-delivery.json
+          if [[ -f dist/opencode-v2-delivery.json ]]; then cp dist/opencode-v2-delivery.json release/runtime/opencode-v2-delivery.json; fi
           # The managed Cursor assets are resolved beside the installed binary.
           # Leaving them out of the archive turns automatic discovery into a
           # manual staging step nobody performs on a real install.
@@ -389,12 +391,17 @@ jobs:
           Set-Content -Path release/runtime/COMMIT_SHA -Value $runtimeCommit
           if (-not (Test-Path dist/opencode-delivery.json -PathType Leaf)) { throw "Packaged OpenCode delivery identity missing" }
           Copy-Item dist/opencode-delivery.json release/runtime/opencode-delivery.json
+          if (Test-Path dist/opencode-v2-delivery.json) { Copy-Item dist/opencode-v2-delivery.json release/runtime/opencode-v2-delivery.json }
           # Resolved beside the installed binary; see the bash packaging step.
           if (-not (Test-Path dist/cursor-managed)) { throw "Managed Cursor assets missing" }
           Copy-Item dist/cursor-managed release/runtime/cursor-managed -Recurse
           Copy-Item dist/local-cli release/runtime/local-cli -Recurse
           Copy-Item dist/bun release/runtime/bun -Recurse
           Compress-Archive -Path release/runtime -DestinationPath "release/${{ matrix.archive_name }}" -Force
+
+      - name: Stage qualified support and source sidecars
+        shell: bash
+        run: bun --no-install ./scripts/opencode-v2/delivery.ts stage-release '${{ matrix.platform }}'
 
       - name: Serve every staged V2 graph from the release archive
         if: runner.os != 'Windows' && matrix.platform != 'win32-arm64'
@@ -409,7 +416,10 @@ jobs:
           rm -rf "$extracted"
           mkdir -p "$extracted"
           tar -xzf "release/$ARCHIVE_NAME" -C "$extracted"
-          "$extracted/runtime/bun/bun" --no-env-file scripts/opencode-v2/packaged-server-smoke.ts "$extracted/runtime" "$RUNNER_TEMP/packaged-server-smoke.json"
+          support_archive="$(bun --no-install -e 'console.log(JSON.parse(await Bun.file("dist/opencode-v2-delivery.json").text()).archive.file)')"
+          mkdir -p "$extracted/support"
+          unzip -q "release/$support_archive" -d "$extracted/support"
+          "$extracted/runtime/bun/bun" --no-install --no-env-file scripts/opencode-v2/packaged-server-smoke.ts "$extracted/runtime" "$extracted/support" "$RUNNER_TEMP/packaged-server-smoke.json"
 
       - name: Serve every staged V2 graph from the release archive (Windows)
         if: runner.os == 'Windows'
@@ -423,7 +433,9 @@ jobs:
           $extracted = Join-Path $env:RUNNER_TEMP 'TEST-release-server-smoke'
           Remove-Item $extracted -Recurse -Force -ErrorAction SilentlyContinue
           Expand-Archive -Path "release/$env:ARCHIVE_NAME" -DestinationPath $extracted
-          & (Join-Path $extracted 'runtime/bun/bun.exe') --no-env-file scripts/opencode-v2/packaged-server-smoke.ts (Join-Path $extracted 'runtime') (Join-Path $env:RUNNER_TEMP 'packaged-server-smoke.json')
+          $supportArchive = (Get-Content dist/opencode-v2-delivery.json -Raw | ConvertFrom-Json).archive.file
+          Expand-Archive -Path "release/$supportArchive" -DestinationPath (Join-Path $extracted 'support')
+          & (Join-Path $extracted 'runtime/bun/bun.exe') --no-install --no-env-file scripts/opencode-v2/packaged-server-smoke.ts (Join-Path $extracted 'runtime') (Join-Path $extracted 'support') (Join-Path $env:RUNNER_TEMP 'packaged-server-smoke.json')
           if ($LASTEXITCODE -ne 0) { throw 'Staged V2 server smoke failed' }
 
       - name: Rename archive to versioned asset name
@@ -454,7 +466,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: runtime-${{ matrix.platform }}
-          path: release/${{ steps.versioned-archive.outputs.archive_name }}
+          path: |
+            release/${{ steps.versioned-archive.outputs.archive_name }}
+            release/agent-teams-opencode-v2-support-*.zip
+            release/metadata/${{ matrix.platform }}
           if-no-files-found: error
           retention-days: 1
 
@@ -507,16 +522,21 @@ jobs:
         run: |
           set -euo pipefail
 
-          find release-flat -maxdepth 1 -type f -name 'agent-teams-runtime-*' -printf '%f\n' \
-            | sort > expected-assets.txt
-          if [[ "$(wc -l < expected-assets.txt)" -ne 7 ]]; then
-            echo "Expected exactly seven runtime release assets" >&2
-            cat expected-assets.txt >&2
-            exit 1
-          fi
+          # The generator validated every base/qualified support source and digest.
+          # Metadata sidecars remain private; only this complete derived roster is public.
+          cp release-flat/expected-assets.txt expected-assets.txt
+          [[ -s expected-assets.txt ]] || { echo "Runtime release roster is empty" >&2; exit 1; }
 
           release_id="$EXISTING_DRAFT_RELEASE_ID"
           if [[ -n "$release_id" ]]; then
+            # Preparation can precede this step by a full build. Re-read before
+            # deleting: published support assets are retained for installed apps.
+            current_release="$(gh api "repos/${TARGET_RELEASE_REPO}/releases/${release_id}")"
+            if ! jq -e --arg tag "$TARGET_RELEASE_TAG" '.draft == true and .tag_name == $tag' \
+              >/dev/null <<<"$current_release"; then
+              echo "Refusing to delete a published release or another runtime tag" >&2
+              exit 1
+            fi
             # Recreate the draft instead of deleting large assets one-by-one.
             # GitHub often returns 500 when deleting those zips in place.
             status="$(curl --silent --show-error \
@@ -619,6 +639,7 @@ jobs:
           TARGET_RELEASE_REPO: ${{ needs.prepare-release.outputs.target_repo }}
           TARGET_RELEASE_TAG: ${{ needs.prepare-release.outputs.target_tag }}
           RUNTIME_VERSION: ${{ needs.prepare-release.outputs.runtime_version }}
+          RUNTIME_SOURCE_COMMIT: ${{ needs.prepare-release.outputs.source_commit }}
         shell: bash
         run: |
           set -euo pipefail
@@ -639,17 +660,27 @@ jobs:
             exit 1
           fi
 
-          cat > expected-assets.txt <<EOF
-          agent-teams-runtime-SHA256SUMS-v${RUNTIME_VERSION}
-          agent-teams-runtime-darwin-arm64-v${RUNTIME_VERSION}.tar.gz
-          agent-teams-runtime-darwin-x64-v${RUNTIME_VERSION}.tar.gz
-          agent-teams-runtime-linux-x64-v${RUNTIME_VERSION}.tar.gz
-          agent-teams-runtime-manifest-v${RUNTIME_VERSION}.json
-          agent-teams-runtime-win32-arm64-v${RUNTIME_VERSION}.zip
-          agent-teams-runtime-win32-x64-v${RUNTIME_VERSION}.zip
-          EOF
+          manifest_name="agent-teams-runtime-manifest-v${RUNTIME_VERSION}.json"
+          curl --fail --silent --show-error --location \
+            "https://github.com/${TARGET_RELEASE_REPO}/releases/download/${TARGET_RELEASE_TAG}/${manifest_name}" \
+            --output public-runtime-manifest.json
+          jq --exit-status --arg version "$RUNTIME_VERSION" --arg commit "$RUNTIME_SOURCE_COMMIT" '
+            . as $manifest |
+            .version == $version and .sourceCommit == $commit and
+            (if has("opencodeV2Delivery") then
+              .bridgeProtocol == 1 and
+              ((.opencodeV2Delivery | keys) == [.assets | keys[] | select(($manifest.opencodeV2.qualified[.] | length) > 0)]) and
+              all(.opencodeV2Delivery | to_entries[];
+                . as $delivery | .value.runtimeVersion == $version and .value.sourceCommit == $commit and
+                .value.bridgeProtocol == 1 and (.value.platform + "-" + .value.arch) == .key and
+                .value.engineVersions == $manifest.opencodeV2.qualified[$delivery.key])
+            else (.version | split(".") | map(tonumber)) <= [0, 0, 145] end)
+          ' public-runtime-manifest.json >/dev/null
+          {
+            printf '%s\n' "agent-teams-runtime-SHA256SUMS-v${RUNTIME_VERSION}" "$manifest_name"
+            jq -r '.assets[].file, ((.opencodeV2Delivery // {}) | .[].archive.file)' public-runtime-manifest.json
+          } | sort > expected-assets.txt
           jq -r '.assets[].name' <<<"$release_json" | sort > actual-assets.txt
-          sort -o expected-assets.txt expected-assets.txt
           diff -u expected-assets.txt actual-assets.txt
 
           while IFS= read -r asset; do

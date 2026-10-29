@@ -1,9 +1,12 @@
 import { expect, test } from 'bun:test'
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { mkdtemp, readFile, realpath, rm, writeFile, mkdir } from 'node:fs/promises'
 import path from 'node:path'
 import { tmpdir } from 'node:os'
 import { resolveOpenCodeV2ExecutionDelivery } from './OpenCodeV2ExecutionDelivery.js'
+import { canonicalOpenCodeV2DeliveryManifest, OPENCODE_V2_SUPPORT_ROOT_ENV } from './OpenCodeV2DeliveryContract.js'
+import { openCodeBunVersion } from '../../../constants/openCodeBunVersion.js'
+import { openCodeV2QualifiedVersions, openCodeV2LaunchRefusal } from '../compatibility/OpenCodeV2Registry.js'
 
 const sha = (value: string | Buffer) => createHash('sha256').update(value).digest('hex')
 const workspace = path.resolve(import.meta.dir, '../../../..')
@@ -12,7 +15,7 @@ test('Windows source delivery canonicalizes only its admitted src subtree and re
   const source = await readFile(new URL('./OpenCodeV2ExecutionDelivery.ts', import.meta.url), 'utf8')
   const body = new Bun.Transpiler({ loader: 'ts' }).transformSync(source.slice(source.indexOf('/** Resolve only'))
     .replaceAll('export ', ''))
-  for (const platform of ['win32', 'darwin'] as const) for (const mode of ['source', 'packaged'] as const) {
+  for (const platform of ['win32', 'darwin'] as const) for (const mode of ['source'] as const) {
     const paths = platform === 'win32' ? path.win32 : path.posix
     const root = platform === 'win32' ? 'C:\\TEST-sdk' : '/TEST-sdk'
     const src = paths.join(root, 'src'), location = mode === 'source'
@@ -46,31 +49,51 @@ test('Windows source delivery canonicalizes only its admitted src subtree and re
   }
 })
 
-// A hardcoded TS child path or source-only fence makes the actual JS bundle fail.
-test('actual Bun JS bundle resolves and hashes both adjacent children without a source tree', async () => {
+const qualifiedHere = openCodeV2QualifiedVersions().filter(pin => openCodeV2LaunchRefusal(pin) === null)
+// Actual JS resolution must use the pinned external instance, even with adjacent/source lookalikes.
+test.skipIf(process.versions.bun !== openCodeBunVersion() || qualifiedHere.length === 0)('actual JS bundle binds external children and refuses a missing hook without source fallback', async () => {
   const root = await realpath(await mkdtemp(path.join(tmpdir(), 'TEST-v2-js-delivery-')))
   try {
     const entry = path.join(root, 'harness.ts'), bundle = path.join(root, 'cli.js')
+    const cache = path.join(root, 'support'), instance = randomUUID(), archiveSha256 = 'b'.repeat(64)
+    const parent = path.join(cache, '0.0.999', `${process.platform}-${process.arch}`, archiveSha256), actual = path.join(parent, instance)
+    await mkdir(path.join(actual, 'local-cli'), { recursive: true })
+    const names = ['opencode-v2-graphs.json', 'opencodeV2ExecutionServer.js', 'opencodeV2RunOwner.js', 'opencodeV2Server.js']
+    for (const name of names) await writeFile(path.join(actual, 'local-cli', name), 'TEST', { mode: 0o644 })
+    const identity = { schemaVersion: 1 as const, runtimeVersion: '0.0.999', sourceCommit: 'a'.repeat(40), bridgeProtocol: 1 as const,
+      platform: process.platform, arch: process.arch, requiredBunVersion: openCodeBunVersion(), engineVersions: qualifiedHere }
+    const manifest = canonicalOpenCodeV2DeliveryManifest({ ...identity,
+      files: names.map(name => ({ path: `local-cli/${name}`, bytes: 4, sha256: sha('TEST'), executable: false })) })
+    const descriptor = { ...identity, archive: { file: `agent-teams-opencode-v2-support-${process.platform}-${process.arch}-v0.0.999.zip`,
+      kind: 'zip', sha256: archiveSha256, bytes: 100, entries: names.length + 1, expandedBytes: Buffer.byteLength(manifest) + names.length * 4 },
+      manifest: { file: 'opencode-v2-engine-manifest.json', sha256: sha(manifest), bytes: Buffer.byteLength(manifest), files: names.length } }
+    await writeFile(path.join(actual, descriptor.manifest.file), manifest)
+    await writeFile(path.join(parent, 'installed.json'), JSON.stringify({ schemaVersion: 1, runtimeVersion: identity.runtimeVersion,
+      sourceCommit: identity.sourceCommit, bridgeProtocol: 1, platform: process.platform, arch: process.arch,
+      archiveSha256, manifestSha256: descriptor.manifest.sha256, instance }))
     await writeFile(entry, `import { resolveOpenCodeV2ExecutionDelivery as resolve } from ${JSON.stringify(path.join(import.meta.dir, 'OpenCodeV2ExecutionDelivery.ts'))};\nconsole.log(JSON.stringify(await Promise.all(['execution', 'run-owner'].map(child => resolve(import.meta.url, child)))));\n`)
-    const result = await Bun.build({ entrypoints: [entry], target: 'bun', format: 'esm', minify: true })
+    const result = await Bun.build({ entrypoints: [entry], target: 'bun', format: 'esm', minify: true,
+      define: { OPENCODE_V2_DELIVERY_DESCRIPTOR: JSON.stringify(descriptor), OPENCODE_RUNTIME_SOURCE_COMMIT: JSON.stringify(identity.sourceCommit),
+        OPENCODE_RUNTIME_VERSION: JSON.stringify(identity.runtimeVersion) } })
     expect(result.success).toBe(true)
     await writeFile(bundle, await result.outputs[0]!.text())
     await rm(entry)
     for (const name of ['opencodeV2ExecutionServer', 'opencodeV2RunOwner']) await writeFile(path.join(root, `${name}.js`), `export const name = '${name}'`)
-    const child = Bun.spawn([process.execPath, bundle], { stdout: 'pipe', stderr: 'pipe' })
+    const env = { ...process.env, [OPENCODE_V2_SUPPORT_ROOT_ENV]: cache }
+    const child = Bun.spawn([process.execPath, '--no-install', bundle], { env, stdout: 'pipe', stderr: 'pipe' })
     const [output, error, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited])
     expect(error).toBe(''); expect(code).toBe(0)
     const rows = JSON.parse(output) as Awaited<ReturnType<typeof resolveOpenCodeV2ExecutionDelivery>>[]
     expect(rows.map(row => row.runtimeMode)).toEqual(['packaged', 'packaged'])
-    expect(rows.map(row => row.root)).toEqual([root, root])
+    expect(rows.map(row => row.root)).toEqual([path.join(actual, 'local-cli'), path.join(actual, 'local-cli')])
     for (const [index, name] of ['opencodeV2ExecutionServer', 'opencodeV2RunOwner'].entries()) {
-      expect(rows[index]!.entryPath).toBe(path.join(root, `${name}.js`))
+      expect(rows[index]!.entryPath).toBe(path.join(actual, 'local-cli', `${name}.js`))
       expect(rows[index]!.entrySha256).toBe(sha(await readFile(rows[index]!.entryPath)))
     }
-    await rm(path.join(root, 'opencodeV2ExecutionServer.js'))
+    await rm(path.join(actual, 'local-cli/opencodeV2ExecutionServer.js'))
     await mkdir(path.join(root, 'src/entrypoints'), { recursive: true })
     await writeFile(path.join(root, 'src/entrypoints/opencodeV2ExecutionServer.ts'), 'export {}')
-    const missing = Bun.spawn([process.execPath, bundle], { stdout: 'pipe', stderr: 'pipe' })
+    const missing = Bun.spawn([process.execPath, '--no-install', bundle], { env, stdout: 'pipe', stderr: 'pipe' })
     expect(await missing.exited).not.toBe(0)
     expect(await new Response(missing.stderr).text()).toContain('ENOENT')
   } finally { await rm(root, { recursive: true, force: true }) }

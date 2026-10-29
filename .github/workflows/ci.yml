@@ -396,7 +396,7 @@ jobs:
       - name: Test native compiled delegation and cancellation
         run: bun test src/cli/packagedOpenCodeDelivery.test.ts scripts/opencode-v2/native-video.test.ts scripts/opencode-v2/stage.test.ts scripts/opencode-v2/stage-copy.test.ts scripts/opencode-v2/staged-files.test.ts src/services/opencode/host/OpenCodeV2ExecutionAuth.test.ts src/services/opencode/host/OpenCodeV2PlainExecution.test.ts src/services/opencode/profile/OpenCodeV2ExecutionConfig.test.ts src/services/opencode/host/OpenCodeV2ExecutionLifecycle.test.ts src/features/runtimeProviderManagement/adapters/opencode/OpenCodeV2ProviderManagement.test.ts
       - name: Produce physical JS and native front door
-        run: bun scripts/package-runtime.ts --platform ${{ matrix.platform }}
+        run: bun --no-install scripts/package-runtime.ts --platform ${{ matrix.platform }}
       - name: Verify and archive complete candidate delivery
         shell: bash
         env:
@@ -408,12 +408,16 @@ jobs:
           set -euo pipefail
           "$CANDIDATE_BINARY" --version | grep -Fx '2.777.777 (Claude Code)'
           mkdir -p candidate/runtime
-          bun scripts/ci/verify-packaged-delivery.ts
+          bun --no-install scripts/ci/verify-packaged-delivery.ts
           cp "$CANDIDATE_BINARY" "candidate/runtime/$CANDIDATE_EXECUTABLE"
           cp dist/opencode-delivery.json candidate/runtime/opencode-delivery.json
+          cp dist/opencode-v2-delivery.json candidate/runtime/opencode-v2-delivery.json
           cp -R dist/local-cli dist/bun dist/cursor-managed candidate/runtime/
+          cp dist/opencode-v2-delivery.json candidate/opencode-v2-delivery.json
+          support_archive="$(bun --no-install -e 'console.log(JSON.parse(await Bun.file("dist/opencode-v2-delivery.json").text()).archive.file)')"
+          cp "dist/$support_archive" candidate/
           printf '%s\n' "$CANDIDATE_SOURCE_SHA" > candidate/runtime/COMMIT_SHA
-          tar -czf "candidate-$CANDIDATE_PLATFORM.tar.gz" -C candidate runtime
+          tar -czf "candidate-$CANDIDATE_PLATFORM.tar.gz" -C candidate .
       - name: Serve every staged V2 graph from the extracted candidate archive
         timeout-minutes: 10
         shell: bash
@@ -431,7 +435,10 @@ jobs:
           tar -xzf "candidate-$CANDIDATE_PLATFORM.tar.gz" -C "$extracted"
           shipped_bun="$extracted/runtime/bun/bun"
           if [[ "$CANDIDATE_PLATFORM" == win32-* ]]; then shipped_bun="$extracted/runtime/bun/bun.exe"; fi
-          "$shipped_bun" --no-env-file scripts/opencode-v2/packaged-server-smoke.ts "$extracted/runtime" "packaged-server-smoke-$CANDIDATE_PLATFORM.json"
+          support_archive="$(bun --no-install -e 'console.log(JSON.parse(await Bun.file(process.argv[1]).text()).archive.file)' "$extracted/opencode-v2-delivery.json")"
+          mkdir -p "$extracted/support"
+          unzip -q "$extracted/$support_archive" -d "$extracted/support"
+          "$shipped_bun" --no-install --no-env-file scripts/opencode-v2/packaged-server-smoke.ts "$extracted/runtime" "$extracted/support" "packaged-server-smoke-$CANDIDATE_PLATFORM.json"
       - name: Preserve staged V2 server evidence
         if: always()
         uses: actions/upload-artifact@v4

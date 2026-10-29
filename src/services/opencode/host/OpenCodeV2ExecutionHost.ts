@@ -95,8 +95,9 @@ export async function prepareOwnedNativeExecutionPlan(validatedNative: Validated
   selectedProfile: OwnedNativeProfile, context: ExecutionContext, lifetimeSignal?: AbortSignal, progress?: (phase: ExecutionAcquisitionPhase) => void,
   graphValidation?: ExecutionGraphValidation) {
   // Delivery mode is explicit. No packaged/source fallback and no acquisition effect before this fence.
-  const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'execution')
+  const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'execution', validatedNative.graph.delivery)
   executionAssert(validatedNative.runtimeMode === delivery.runtimeMode, 'v2_execution_delivery_mismatch')
+  executionAssert(validatedNative.runtimeMode !== 'packaged' || validatedNative.graph.delivery, 'v2_execution_delivery_mismatch')
   const native = structuredClone(validatedNative), profile = structuredClone(selectedProfile)
   progress?.('delivery-resolved')
   const check = () => {
@@ -291,7 +292,8 @@ async function acquireOwnedNativeLease(validatedNative: ValidatedExecutionNative
       const endpoint: PrivateEndpointFields = { baseUrl: row.baseUrl, password, signal: lifetime.signal, nativePID: mapping.bun.nativePID }
       endpoints.set(authority, endpoint)
       disposers.set(authority, new Set())
-      graphs.set(authority, Object.freeze({ sha256: native.graph.sha256, files: Object.freeze(native.graph.files.map(row => Object.freeze(row))) }))
+      graphs.set(authority, Object.freeze({ sha256: native.graph.sha256, files: Object.freeze(native.graph.files.map(row => Object.freeze(row))),
+        ...(native.graph.delivery ? { delivery: native.graph.delivery } : {}) }))
       mark('ready')
       await awaitOpenCodeV2CatalogReadiness(endpoint, authority, context); mark('catalog-ready')
       Object.freeze(endpoint)

@@ -1,14 +1,15 @@
 import { expect, test } from 'bun:test'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
+import { randomUUID } from 'node:crypto'
 import { chmod, cp, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import type { ConfigEntry as FloorEntry } from '@opencode/client-v2.0.0'
 import type { ConfigEntry as CurrentEntry } from '@opencode/client'
 import { privateOpenCodeReadEnvironment } from '../../src/services/opencode/profile/OpenCodeV2ManagedConfig.js'
 import { readRecord } from '../../src/services/opencode/catalog/OpenCodeV2ReadStatus.js'
-import { openCodeV2GraphPackages, openCodeV2StagedVersions, type OpenCodeV2Pin } from '../../src/services/opencode/compatibility/OpenCodeV2Registry.js'
-import runtimeManifest from '../../package.json' with { type: 'json' }
+import { openCodeV2GraphPackages, type OpenCodeV2Pin } from '../../src/services/opencode/compatibility/OpenCodeV2Registry.js'
+import { validateOpenCodeV2DeliveryDescriptor, OPENCODE_V2_SUPPORT_ROOT_ENV } from '../../src/services/opencode/host/OpenCodeV2DeliveryContract.js'
 
 const workspace = path.resolve(import.meta.dir, '../..')
 
@@ -40,11 +41,20 @@ for (const pin of ['2.0.0', '2.0.32'] as const) test(`sourceless production wrap
       recursive: true, dereference: false, verbatimSymlinks: true,
     })
     expect(await lstat(path.join(installation, 'src')).then(() => true, () => false)).toBe(false)
-    const graphRoot = path.join(installation, 'dist/local-cli')
+    const descriptor = validateOpenCodeV2DeliveryDescriptor(JSON.parse(await readFile(path.join(workspace, 'dist/opencode-v2-delivery.json'), 'utf8')))
+    const supportCache = path.join(root, 'support'), instance = randomUUID()
+    const parent = path.join(supportCache, descriptor.runtimeVersion, `${descriptor.platform}-${descriptor.arch}`, descriptor.archive.sha256)
+    const supportRoot = path.join(parent, instance)
+    await mkdir(parent, { recursive: true })
+    await cp(path.join(workspace, 'dist/opencode-v2-support'), supportRoot, { recursive: true, dereference: false, verbatimSymlinks: true })
+    await writeFile(path.join(parent, 'installed.json'), JSON.stringify({ schemaVersion: 1, runtimeVersion: descriptor.runtimeVersion,
+      sourceCommit: descriptor.sourceCommit, bridgeProtocol: 1, platform: descriptor.platform, arch: descriptor.arch,
+      archiveSha256: descriptor.archive.sha256, manifestSha256: descriptor.manifest.sha256, instance }))
+    const graphRoot = path.join(supportRoot, 'local-cli')
     // Every graph the build staged, as recorded by its own staging manifest.
     const staged = (JSON.parse(await readFile(path.join(graphRoot, 'opencode-v2-graphs.json'), 'utf8')) as {
       graphs: { version: OpenCodeV2Pin; server: string; client: string }[] }).graphs
-    expect(staged.map(graph => graph.version)).toEqual([...openCodeV2StagedVersions(runtimeManifest.dependencies)])
+    expect(staged.map(graph => graph.version)).toEqual(descriptor.engineVersions as OpenCodeV2Pin[])
     expect(staged.map(graph => graph.version)).toContain(pin)
     for (const specifier of staged.flatMap(graph => {
       expect(graph).toMatchObject(openCodeV2GraphPackages(graph.version))
@@ -53,7 +63,7 @@ for (const pin of ['2.0.0', '2.0.32'] as const) test(`sourceless production wrap
       const resolved = await realpath(Bun.resolveSync(specifier, graphRoot))
       expect(resolved.startsWith(graphRoot + path.sep)).toBe(true)
     }
-    const env = { ...privateOpenCodeReadEnvironment(root), CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH: binary }
+    const env = { ...privateOpenCodeReadEnvironment(root), CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH: binary, [OPENCODE_V2_SUPPORT_ROOT_ENV]: supportCache }
     await promisify(execFile)(git, ['init', '--quiet', project], { cwd: root, env })
     const secret = 'test-fixture-literal'
     const config = {
@@ -108,7 +118,7 @@ for (const pin of ['2.0.0', '2.0.32'] as const) test(`sourceless production wrap
     const trap = path.join(root, 'summary-native-trap'), marker = path.join(root, 'summary-native-started')
     await writeFile(trap, `#!${process.execPath}\nawait Bun.write(${JSON.stringify(marker)}, 'started'); console.log(${JSON.stringify(pin)});\n`)
     await chmod(trap, 0o755)
-    await rm(path.join(installation, 'dist/local-cli/opencodeV2Server.js'))
+    await rm(path.join(graphRoot, 'opencodeV2Server.js'))
     await run(true, trap)
     expect(await lstat(marker).then(() => true, () => false)).toBe(false)
     expect(requests).toBe(0)

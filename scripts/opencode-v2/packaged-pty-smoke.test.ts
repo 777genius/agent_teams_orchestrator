@@ -68,4 +68,5 @@ test('PTY proof refuses case-insensitive loader overrides and startup hooks', ()
   }
   expect(() => assertNoPtyHooks({}, ['--preload', 'foreign.ts'])).toThrow('startup arguments')
   expect(() => assertNoPtyHooks({}, ['--no-env-file'])).not.toThrow()
+  expect(() => assertNoPtyHooks({}, ['--no-install', '--no-env-file'])).not.toThrow()
 })

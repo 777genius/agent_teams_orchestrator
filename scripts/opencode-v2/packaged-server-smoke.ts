@@ -15,6 +15,9 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { isOpenCodeV2Pin, openCodeV2GraphPackages, openCodeV2Wire } from '../../src/services/opencode/compatibility/OpenCodeV2Registry.js'
 import { createOpenCodeV2ReadRoots } from '../../src/services/opencode/profile/OpenCodeV2ManagedConfig.js'
+import { collectOpenCodeV2GraphFiles } from '../../src/services/opencode/host/OpenCodeV2GraphFiles.js'
+import type { OpenCodeV2DeliveryBinding } from '../../src/services/opencode/host/OpenCodeV2DeliveryManifest.js'
+import { loadPackagedOpenCodeV2Support } from './packaged-support.js'
 
 const READY_MS = 60_000, REQUEST_MS = 15_000, CLOSE_MS = 15_000
 
@@ -68,8 +71,9 @@ function loadBashGrammar(core: string): string[] {
   return Object.keys(grammar).sort()
 }
 
-async function serveGraph(bundle: string, bun: string, executableSha256: string, version: string) {
+async function serveGraph(bundle: string, bun: string, executableSha256: string, version: string, delivery: OpenCodeV2DeliveryBinding) {
   assert(isOpenCodeV2Pin(version), 'Staged graph manifest invalid')
+  await collectOpenCodeV2GraphFiles(version, bundle, delivery)
   const { server } = openCodeV2GraphPackages(version)
   const serverEntry = await realpath(Bun.resolveSync(`${server}/process`, bundle))
   const moduleSha256 = await sha(serverEntry)
@@ -80,7 +84,7 @@ async function serveGraph(bundle: string, bun: string, executableSha256: string,
   const project = await realpath(await mkdtemp(path.join(tmpdir(), 'TEST-v2-server-smoke-project-')))
   const nonce = randomUUID(), password = randomBytes(32).toString('base64url')
   const started = performance.now()
-  const child = spawn(bun, [path.join(bundle, 'opencodeV2Server.js')], { cwd: roots.root, env: roots.env,
+  const child = spawn(bun, ['--no-install', path.join(bundle, 'opencodeV2Server.js')], { cwd: roots.root, env: roots.env,
     stdio: ['ignore', 'ignore', 'pipe', 'ipc'], windowsHide: true })
   let stderr = ''
   child.stderr!.on('data', chunk => { stderr = (stderr + String(chunk)).slice(-2000) })
@@ -91,7 +95,7 @@ async function serveGraph(bundle: string, bun: string, executableSha256: string,
   })
   const next = messages(child, exited)
   try {
-    child.send({ type: 'start', nonce, pin: version, root: roots.root, password, executableSha256, moduleSha256 })
+    child.send({ type: 'start', nonce, pin: version, root: roots.root, password, executableSha256, moduleSha256, delivery })
     const ready = await next(row => row.nonce === nonce && (row.type === 'ready' || row.type === 'failed'), READY_MS, 'ready')
     assert.equal(ready.type, 'ready', 'Server child reported a failed start')
     assert(ready.pid === child.pid && ready.version === version && ready.moduleSha256 === moduleSha256 &&
@@ -127,23 +131,22 @@ async function serveGraph(bundle: string, bun: string, executableSha256: string,
   return evidence
 }
 
-export async function main(deliveryArgument: string, receipt: string): Promise<void> {
+export async function main(baseArgument: string, supportArgument: string, receipt: string): Promise<void> {
   const evidence: Row = { schemaVersion: 1, ok: false, platform: process.platform, arch: process.arch,
     bunVersion: Bun.version, graphs: [] }
   try {
-    const delivery = await realpath(deliveryArgument)
-    const bundle = await realpath(path.join(delivery, 'local-cli'))
-    const bun = await realpath(path.join(delivery, 'bun', process.platform === 'win32' ? 'bun.exe' : 'bun'))
-    assert.equal(await realpath(process.execPath), bun, 'Smoke must execute the shipped physical Bun')
+    const { delivery, descriptor, bun } = await loadPackagedOpenCodeV2Support(baseArgument, supportArgument)
+    const bundle = delivery.root
     const staged = await inventory(path.join(bundle, 'node_modules'))
     evidence.stagedFiles = staged.files
     evidence.stagedMegabytes = Math.round(staged.bytes / 1e5) / 10
     const manifest = JSON.parse(await readFile(path.join(bundle, 'opencode-v2-graphs.json'), 'utf8')) as {
       schema: number; graphs: { version: string }[] }
     assert(manifest.schema === 2 && Array.isArray(manifest.graphs) && manifest.graphs.length > 0, 'Staged graph manifest invalid')
+    assert.deepEqual(manifest.graphs.map(row => row.version), descriptor.engineVersions, 'Support graph set differs from its platform descriptor')
     const executableSha256 = await sha(bun)
     for (const { version } of manifest.graphs) {
-      ;(evidence.graphs as Row[]).push(await serveGraph(bundle, bun, executableSha256, version))
+      ;(evidence.graphs as Row[]).push(await serveGraph(bundle, bun, executableSha256, version, delivery.binding))
     }
     evidence.ok = (evidence.graphs as Row[]).every(graph => graph.ok === true)
   } catch (error) {
@@ -155,7 +158,7 @@ export async function main(deliveryArgument: string, receipt: string): Promise<v
 }
 
 if (import.meta.main) {
-  const [delivery, receipt] = process.argv.slice(2)
-  assert(delivery && receipt, 'Expected delivery and receipt arguments')
-  await main(delivery, receipt)
+  const [base, support, receipt] = process.argv.slice(2)
+  assert(base && support && receipt, 'Expected base, support and receipt arguments')
+  await main(base, support, receipt)
 }
