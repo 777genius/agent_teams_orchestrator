@@ -5,6 +5,7 @@ import type { QueueIntent } from '../execution/OpenCodeV2AdmissionService.js'
 import type { AdmissionRecord, SessionAuthority } from '../execution/OpenCodeV2ExecutionContracts.js'
 import type { RunInitializationPhase } from '../execution/OpenCodeV2Diagnostics.js'
 import type { OpenCodeV2Pin } from '../compatibility/OpenCodeV2Registry.js'
+import type { OpenCodeV2DeliveryBinding } from '../host/OpenCodeV2DeliveryManifest.js'
 import type { ExecutionLease, SelectedExecutionProfile, ValidatedExecutionNative } from '../host/OpenCodeV2ExecutionHost.js'
 import type { ExecutionCleanupReceipt } from '../host/OpenCodeV2ExecutionLifecycle.js'
 import type { ExecutionBridgeClient, ExecutionLog, ExecutionMessagePage, ExecutionPermission, ExecutionMcpServer } from '../transport/OpenCodeV2ExecutionClientFactory.js'
@@ -36,7 +37,7 @@ export type RunLaunchPlan = Readonly<{
   dataRoot: string; binding: RunBinding; deadline: number; members: readonly RunMemberPlan[]
   executionProbe?: Readonly<{ memberId: string; intent: QueueIntent; expectedText: string; prepared: OpenCodePreparedProfile; capabilitySnapshotId: string }>
   source: Readonly<{ entryPath: string; entrySha256: string; bunPath: string; bunSha256: string
-    files: readonly Readonly<{ path: string; sha256: string }>[]; env: Readonly<Record<string, string>> }>
+    files: readonly Readonly<{ path: string; sha256: string }>[]; env: Readonly<Record<string, string>>; delivery?: OpenCodeV2DeliveryBinding }>
 }>
 type MemberRequest = Readonly<{ memberId: string; originalSessionId: string }>
 export type RunControlRequest =

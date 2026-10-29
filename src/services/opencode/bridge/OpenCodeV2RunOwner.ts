@@ -52,6 +52,8 @@ export function validateRunLaunchPlan(plan: RunLaunchPlan): void {
     executionAssert(['source', 'packaged'].includes(member.native.runtimeMode) &&
       member.native.runtimeMode === plan.members[0]!.native.runtimeMode && member.native.generation === 'v2', 'run_pin_unsupported')
     executionAssert(member.native.bun.path === plan.source.bunPath && member.native.bun.sha256 === plan.source.bunSha256, 'run_source_changed')
+    executionAssert(executionHash(member.native.graph.delivery ?? null) === executionHash(plan.source.delivery ?? null) &&
+      (member.native.runtimeMode !== 'packaged' || plan.source.delivery), 'run_source_changed')
     executionAssert(/^[a-z0-9][a-z0-9._-]{0,199}$/.test(member.bootstrap.key) &&
       Buffer.byteLength(member.bootstrap.value) <= 256 * 1024 && sha(member.bootstrap.value) === member.bootstrap.contextHash &&
       /^[a-f0-9]{64}$/.test(member.bootstrap.briefingHash), 'run_bootstrap_conflict')
@@ -678,7 +680,7 @@ export async function launchExplicitOpenCodeV2Run(plan: RunLaunchPlan): Promise<
   assertExecutionPlatformAvailable()
   executionAssert(process.versions.bun === openCodeBunVersion(), 'run_source_bun_required')
   executionAssert(await realpath(plan.source.bunPath) === plan.source.bunPath && sha(await readFile(plan.source.bunPath)) === plan.source.bunSha256, 'run_source_changed')
-  const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'run-owner')
+  const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'run-owner', plan.source.delivery)
   const entry = delivery.entryPath
   executionAssert(plan.members.every(member => member.native.runtimeMode === delivery.runtimeMode) &&
     plan.source.entryPath === entry && delivery.entrySha256 === plan.source.entrySha256, 'run_source_changed')
@@ -689,7 +691,7 @@ export async function launchExplicitOpenCodeV2Run(plan: RunLaunchPlan): Promise<
   const directory = await reserveRunControlDirectory(plan.dataRoot, plan.binding, sourceSha256,
     plan.members.map(member => member.profile))
   const entryStarted = Date.now()
-  const child = spawn(plan.source.bunPath, [entry], { detached: true, cwd: plan.dataRoot, env: { ...plan.source.env }, stdio: ['ignore', 'ignore', 'ignore', 'ipc'] })
+  const child = spawn(plan.source.bunPath, ['--no-install', entry], { detached: true, cwd: plan.dataRoot, env: { ...plan.source.env }, stdio: ['ignore', 'ignore', 'ignore', 'ipc'] })
   let entryExit: number | null = null, entryFailure: unknown
   child.once('error', error => { entryFailure = error })
   child.once('close', code => { entryExit = code })
@@ -724,7 +726,7 @@ export async function startOpenCodeV2RunSupervisor(plan: RunLaunchPlan, director
   executionAssert(directory === runControlDirectory(plan.dataRoot, plan.binding.teamId, plan.binding.runId) &&
     executionHash(plan.source.files) === sourceSha256 && process.versions.bun === openCodeBunVersion() &&
     await realpath(process.execPath) === plan.source.bunPath && sha(await readFile(process.execPath)) === plan.source.bunSha256, 'run_source_changed')
-  const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'run-owner')
+  const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'run-owner', plan.source.delivery)
   executionAssert(plan.members.every(member => member.native.runtimeMode === delivery.runtimeMode) &&
     plan.source.entryPath === delivery.entryPath && plan.source.entrySha256 === delivery.entrySha256 &&
     await realpath(process.argv[1]!) === delivery.entryPath, 'run_source_changed')

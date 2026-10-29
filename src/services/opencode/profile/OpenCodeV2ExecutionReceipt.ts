@@ -1,13 +1,15 @@
 import { openCodeV2EngineVersion } from '../compatibility/OpenCodeV2Registry.js'
 import { openCodeV2Dialect } from '../compatibility/OpenCodeV2Registry.js'
-import { resolveOpenCodeV2GraphEntry } from '../host/OpenCodeV2ServerGraph.js'
+import { collectOpenCodeV2GraphFiles, resolveOpenCodeV2ReceiptPackageRoot } from '../host/OpenCodeV2GraphFiles.js'
+export { resolveOpenCodeV2ReceiptPackageRoot } from '../host/OpenCodeV2GraphFiles.js'
+import type { OpenCodeV2DeliveryBinding } from '../host/OpenCodeV2DeliveryManifest.js'
 import { openCodeBunVersion } from '../../../constants/openCodeBunVersion.js'
 import path from 'node:path'
 import { resolveOpenCodeV2ExecutionDelivery } from '../host/OpenCodeV2ExecutionDelivery.js'
 import { assertExecutionPlatformAvailable } from '../host/OpenCodeV2ExecutionPlatform.js'
 import { validateExecutionNative } from '../host/OpenCodeV2ExecutionBinding.js'
 import { createHash } from 'node:crypto'
-import { open, readFile, realpath, readdir, lstat } from 'node:fs/promises'
+import { open, readFile, realpath, lstat } from 'node:fs/promises'
 import { executionHash, executionAssert, executionRecord } from '../execution/OpenCodeV2ExecutionContracts.js'
 import type { ExecutionMcpConfig } from '../transport/OpenCodeV2ExecutionClientFactory.js'
 import type { ValidatedExecutionNative } from '../host/OpenCodeV2ExecutionBinding.js'
@@ -61,7 +63,7 @@ async function inspectOpenCodeV2WindowsPeExecutable(file: string, expectedName: 
 }
 
 /** Read-only installed graph receipt; no server import, CLI execution, or output file. */
-export async function createOpenCodeV2ExecutionReceipt(_sourceRoot: string, identity: import('../compatibility/OpenCodeNativeIdentity.js').OpenCodeV2NativeIdentity, controller?: ExecutionMcpConfig): Promise<ValidatedExecutionNative> {
+export async function createOpenCodeV2ExecutionReceipt(_sourceRoot: string, identity: import('../compatibility/OpenCodeNativeIdentity.js').OpenCodeV2NativeIdentity, controller?: ExecutionMcpConfig, binding?: OpenCodeV2DeliveryBinding): Promise<ValidatedExecutionNative> {
 assertExecutionPlatformAvailable()
 executionAssert(process.versions.bun === openCodeBunVersion() && identity.generation === 'v2', 'source_bun_required')
 const cli = await realpath(identity.executablePath), bun = await realpath(process.execPath), pin = openCodeV2EngineVersion(identity)
@@ -70,71 +72,10 @@ const cliSha256 = process.platform === 'win32'
   ? (await inspectOpenCodeV2WindowsPeExecutable(cli, 'opencode.exe', 'native_selection_changed')).sha256
   : await sha(cli)
 executionAssert(cliSha256 === identity.executableSha256, 'native_selection_changed')
-const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'execution')
+const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'execution', binding)
 // Legacy callers supply a source root; delivery is derived from this module, never that hint.
 const resolutionRoot = delivery.runtimeMode === 'source' ? path.join(delivery.root, 'src/services/opencode/host') : delivery.root
-const server = await resolveOpenCodeV2GraphEntry(pin, 'server', 'process', resolutionRoot)
-const client = await resolveOpenCodeV2GraphEntry(pin, 'client', undefined, resolutionRoot)
-const effect = await realpath(Bun.resolveSync('effect', path.dirname(server)))
-// One Effect release per graph: the server's resolved Effect. Graph validation
-// additionally binds it to the server's declared exact dependency.
-const effectVersion = executionRecord(JSON.parse(await readFile(path.join(await resolveOpenCodeV2ReceiptPackageRoot(effect), 'package.json'), 'utf8'))).version
-executionAssert(typeof effectVersion === 'string' && effectVersion.length > 0, 'effect_pin_mismatch')
-async function locate(name: string, from: string): Promise<string | undefined> {
-  executionAssert(/^(?:@[a-z0-9._-]+\/)?[a-z0-9._-]+$/.test(name))
-  for (let directory = from; ; directory = path.dirname(directory)) {
-    try { return await realpath(path.join(directory, 'node_modules', name)) } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
-    if (path.dirname(directory) === directory) return undefined
-  }
-}
-const visited = new Set<string>(), files: { path: string; sha256: string }[] = []
-async function visit(root: string, expectedName?: string): Promise<void> {
-  if (visited.has(root)) return
-  executionAssert(visited.size < 1000, 'graph_package_budget'); visited.add(root)
-  const metadata = executionRecord(JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8')))
-  executionAssert(typeof metadata.name === 'string' && typeof metadata.version === 'string')
-  if (expectedName) executionAssert(metadata.name === expectedName, 'package_name_mismatch')
-  if (/^@opencode\//.test(metadata.name)) executionAssert(metadata.version === pin, 'package_pin_mismatch')
-  if (metadata.name === 'effect' || metadata.name === '@effect/platform-node' || metadata.name === '@effect/platform-node-shared') executionAssert(metadata.version === effectVersion, 'effect_pin_mismatch')
-  async function walk(directory: string): Promise<void> {
-    const pending: string[] = []
-    for (const item of await readdir(directory, { withFileTypes: true })) {
-      if (item.name === 'node_modules') continue
-      const file = path.join(directory, item.name)
-      executionAssert(!item.isSymbolicLink(), 'graph_symlink_not_supported')
-      if (item.isDirectory()) await walk(file)
-      else { executionAssert(item.isFile(), 'graph_file_budget'); pending.push(file) }
-    }
-    executionAssert(files.length + pending.length <= 65_536, 'graph_file_budget')
-    // Preserve complete byte verification while bounding independent filesystem reads.
-    for (let offset = 0; offset < pending.length; offset += 16)
-      files.push(...await Promise.all(pending.slice(offset, offset + 16).map(async file => ({ path: file, sha256: await sha(file) }))))
-  }
-  await walk(root)
-  for (const optional of [false, true]) {
-    const deps = metadata[optional ? 'optionalDependencies' : 'dependencies']
-    if (deps === undefined) continue
-    const dependencies = executionRecord(deps)
-    for (const name of Object.keys(dependencies)) {
-      const dependency = await locate(name, root)
-      if (!dependency && optional) continue
-      executionAssert(dependency, 'graph_dependency_missing:' + name)
-      const specification = dependencies[name]
-      executionAssert(typeof specification === 'string', 'graph_dependency_invalid')
-      const alias = specification.startsWith('npm:')
-        ? /^npm:((?:@[a-z0-9._-]+\/)?[a-z0-9._-]+)(?:@[^\s]+)?$/.exec(specification) : null
-      executionAssert(!specification.startsWith('npm:') || alias, 'graph_dependency_invalid')
-      await visit(dependency, alias ? alias[1]! : name)
-    }
-  }
-}
-await visit(await resolveOpenCodeV2ReceiptPackageRoot(server), '@opencode/server')
-await visit(await resolveOpenCodeV2ReceiptPackageRoot(client), '@opencode/client')
-await visit(await resolveOpenCodeV2ReceiptPackageRoot(effect), 'effect')
-// The bridge's SDK tools/list client and the exact selected native local MCP
-// command need their own genuine closure inside the read-only execution graph.
-const mcpSdk = await realpath(Bun.resolveSync('@modelcontextprotocol/sdk/client/index.js', resolutionRoot))
-await visit(await resolveOpenCodeV2ReceiptPackageRoot(mcpSdk), '@modelcontextprotocol/sdk')
+const { files, visit } = await collectOpenCodeV2GraphFiles(pin, resolutionRoot, delivery.binding)
 if (controller?.type === 'local') {
   executionAssert(controller.command.length >= 2 && path.isAbsolute(controller.command[0]!), 'controller_runtime_missing')
   const runtime = await realpath(controller.command[0]!)
@@ -221,7 +162,7 @@ files.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0)
 executionAssert(new Set(files.map(row => row.path)).size === files.length)
 const native = { generation: 'v2', version: identity.version, engineVersion: pin, dialect: openCodeV2Dialect(pin), runtimeMode: delivery.runtimeMode, executablePath: cli,
   executableSha256: cliSha256, packageName: identity.packageName, ...(identity.origin ? { origin: identity.origin } : {}), entrySha256: delivery.entrySha256,
-  bun: { path: bun, sha256: await sha(bun) }, graph: { sha256: executionHash(files), files },
+  bun: { path: bun, sha256: await sha(bun) }, graph: { sha256: executionHash(files), files, ...(delivery.binding ? { delivery: delivery.binding } : {}) },
   ...(taskNode ? { taskNode } : {}) } satisfies ValidatedExecutionNative
 executionAssert(native.executableSha256 === identity.executableSha256 && native.packageName === identity.packageName, 'native_selection_changed')
 await validateExecutionNative(native)
@@ -359,18 +300,4 @@ export async function resolveOpenCodeV2DarwinControllerRuntimeClosure(runtime: s
   const byPath = (a: { path: string }, b: { path: string }) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0
   return Object.freeze({ files: Object.freeze([...files.values()].sort(byPath)),
     aliases: Object.freeze([...aliases.values()].sort((a, b) => byPath({ path: a.target }, { path: b.target }))) })
-}
-
-/** A nested module-scope manifest is not the named/versioned installed package root. */
-export async function resolveOpenCodeV2ReceiptPackageRoot(file: string): Promise<string> {
-  for (let directory = path.dirname(file); ; directory = path.dirname(directory)) {
-    let metadata: Record<string, unknown> | undefined
-    try { metadata = executionRecord(JSON.parse(await readFile(path.join(directory, 'package.json'), 'utf8'))) }
-    catch (error) { if (!error || typeof error !== 'object' || !('code' in error) || error.code !== 'ENOENT') throw error }
-    if (metadata) {
-      if (typeof metadata.name === 'string' && typeof metadata.version === 'string') return directory
-      executionAssert(metadata.name === undefined && metadata.version === undefined, 'receipt_package_metadata_invalid')
-    }
-    executionAssert(path.dirname(directory) !== directory, 'package_root_missing')
-  }
 }

@@ -2,7 +2,7 @@ import type { ChildProcess } from 'node:child_process'
 import { open } from 'node:fs/promises'
 import path from 'node:path'
 import { resolveDirectWindowsLauncher, spawnPortableCli } from '../../../utils/portableCli.js'
-import { nativePorts, query, type NativeGeneration, type NativeHelperFailure, type NativeRow } from '../OpenCodeCursorAgentTreeKill.js'
+import { classifyNativeHelperFailure, nativePorts, query, type NativeGeneration, type NativeHelperFailure, type NativeRow } from '../OpenCodeCursorAgentTreeKill.js'
 import type { OpenCodeV2ReadRoots } from '../profile/OpenCodeV2ManagedConfig.js'
 import { boundOpenCodeRead } from '../transport/OpenCodeBoundedFetch.js'
 
@@ -26,7 +26,7 @@ export type OpenCodeProbeTerminalDiagnostic = Readonly<{
   guard: 'deadline' | 'protected_candidate' | 'candidate_alive' | 'candidate_unknown' | 'strict_candidate_census'
     | 'identity_missing' | 'identity_changed_live' | 'anchor_missing' | 'protected_addition' | 'parent_identity'
     | 'ancestry_changed' | 'signal_failed_live' | 'final_pending' | 'final_retirement' | 'census_unreadable'
-    | 'roots_remove' | 'unexpected'
+    | 'census_helper_failed' | 'roots_remove' | 'unexpected'
   closed?: boolean
   ended?: boolean
   exitCode?: number | null
@@ -299,7 +299,21 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
         .map(row => ({ ...row, group: null, retired: false }))
       // The detached POSIX spawn creates an isolated group. Unlike a PPID walk,
       // PGID membership still includes orphans after the leader has exited.
-      const text = await observe(query('ps', ['-e', '-o', 'pid=', '-o', 'ppid=', '-o', 'pgid=', '-o', 'stat='], Math.min(helperTimeout, cap())))
+      const started = Date.now()
+      let queryFailed = false
+      const census = query('ps', ['-e', '-o', 'pid=', '-o', 'ppid=', '-o', 'pgid=', '-o', 'stat='], Math.min(helperTimeout, cap()))
+        .catch(error => {
+          helperFailure = classifyNativeHelperFailure('tree', error, Math.min(deadlineMs, Date.now() - started))
+          queryFailed = true
+          throw error
+        })
+      let text: string
+      try { text = await observe(census) }
+      catch (error) {
+        // An observation deadline does not prove the helper has settled.
+        if (queryFailed) terminalDiagnostic = snapshot('census', 'census_helper_failed')
+        throw error
+      }
       const seen = new Set<number>()
       return text.trim().split('\n').filter(Boolean).map(line => {
         const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s*$/.exec(line)

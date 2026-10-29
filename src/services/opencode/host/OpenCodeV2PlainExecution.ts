@@ -130,7 +130,7 @@ export function launchPlainExecution(plan: PlainExecutionPlan, nonce: string, le
   executionAssert(plans.has(plan) && same(plan.bun, bun), 'execution_identity_mismatch')
   // Its own process group lets cleanup reach the commands it starts. Losing the
   // parent closes the IPC channel, and the child closes itself on disconnect.
-  const child = spawn(plan.bun.path, [plan.entry], { cwd: plan.cwd, env: { ...plan.env },
+  const child = spawn(plan.bun.path, ['--no-install', plan.entry], { cwd: plan.cwd, env: { ...plan.env },
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'], serialization: 'json', detached: process.platform !== 'win32', windowsHide: true })
   let ended = false, closed = false, stopping = false, startSent = false
   let snapshot: Promise<WindowsDescendant[]> = Promise.resolve([])
