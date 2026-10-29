@@ -600,6 +600,16 @@ jobs:
           TEST_OPENCODE_V2_NATIVE_BINARY="$native_root/node_modules/@opencode/cli-linux-x64/bin/opencode" \
             TEST_EVIDENCE_DIR="$RUNNER_TEMP/TEST-opencode-v2-anonymous-evidence" \
             dist/bun/bun --no-install --no-env-file scripts/opencode-v2-anonymous-native-e2e.ts
+      - name: Verify real protocol1 team launch, native replies and physical stop
+        timeout-minutes: 8
+        shell: bash
+        run: |
+          set -euo pipefail
+          native_root="$RUNNER_TEMP/TEST-opencode-v2-anonymous-cli"
+          TEST_OPENCODE_V2_NATIVE_BINARY="$native_root/node_modules/@opencode/cli-linux-x64/bin/opencode" \
+            TEST_EVIDENCE_DIR="$RUNNER_TEMP/TEST-opencode-v2-team-evidence" \
+            PR_HEAD_SHA="${{ github.event.pull_request.head.sha || github.sha }}" \
+            dist/bun/bun --no-install --no-env-file scripts/opencode-v2-team-native-e2e.ts
       - name: Preserve sanitized V2 Linux receipts
         if: always()
         uses: actions/upload-artifact@v4
@@ -611,6 +621,7 @@ jobs:
             ${{ runner.temp }}/TEST-opencode-v2-linux/TEST-v2-*/models.json
             ${{ runner.temp }}/TEST-opencode-v2-linux/TEST-v2-*/status.json
             ${{ runner.temp }}/TEST-opencode-v2-anonymous-evidence/anonymous-native-proof.json
+            ${{ runner.temp }}/TEST-opencode-v2-team-evidence/team-native-proof.json
 
   opencode-v2-desktop-lifecycle:
     needs: scope
