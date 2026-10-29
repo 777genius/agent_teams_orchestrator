@@ -24,6 +24,9 @@ async function gone(pid: number): Promise<boolean> {
 
 export async function main(cliArgument: string, nodeArgument: string, receiptArgument: string, platform: string): Promise<void> {
   const receipt = path.resolve(receiptArgument), originalEnvironment = { ...process.env }, originalDirectory = process.cwd()
+  // Invalid invocation must never turn an executable (or any external file) into a receipt.
+  assert(path.extname(receipt) === '.json' && path.dirname(receipt) === originalDirectory,
+    'Receipt must be a JSON file in the current directory')
   const evidence: Record<string, unknown> = { schemaVersion: 1, ok: false, mode: 'source-owner',
     sourceHead: process.env.PR_HEAD_SHA ?? null,
     platform: process.platform, arch: process.arch, bunVersion: Bun.version, model: MODEL,
@@ -165,7 +168,10 @@ export async function main(cliArgument: string, nodeArgument: string, receiptArg
 }
 
 if (import.meta.main) {
-  const [cli, node, receipt, platform] = process.argv.slice(2)
+  const arguments_ = process.argv.slice(2)
+  console.log(JSON.stringify({ smoke: 'native-windows-execution', arguments: arguments_.map(argument => path.basename(argument)) }))
+  assert.equal(arguments_.length, 4, 'Expected exactly four native Windows execution smoke arguments')
+  const [cli, node, receipt, platform] = arguments_
   assert(cli && node && receipt && platform, 'Usage: native-windows-execution-smoke.ts <opencode.exe> <node.exe> <evidence.json> <win32-arch>')
   await main(cli, node, receipt, platform)
 }

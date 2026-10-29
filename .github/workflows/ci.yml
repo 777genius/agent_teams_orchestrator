@@ -410,7 +410,7 @@ jobs:
       - name: Install frozen portable dependencies
         run: bun install --frozen-lockfile --linker hoisted
       - name: Test native compiled delegation and cancellation
-        run: bun test src/cli/packagedOpenCodeDelivery.test.ts scripts/opencode-v2/native-video.test.ts scripts/opencode-v2/stage.test.ts scripts/opencode-v2/stage-copy.test.ts scripts/opencode-v2/staged-files.test.ts src/services/opencode/host/OpenCodeV2ExecutionAuth.test.ts src/services/opencode/host/OpenCodeV2ExecutionPlatform.test.ts src/services/opencode/host/OpenCodeV2PlainExecution.test.ts src/services/opencode/profile/OpenCodeV2ExecutionConfig.test.ts src/services/opencode/host/OpenCodeV2ExecutionLifecycle.test.ts src/features/runtimeProviderManagement/adapters/opencode/OpenCodeV2ProviderManagement.test.ts
+        run: bun test src/cli/packagedOpenCodeDelivery.test.ts scripts/opencode-v2/native-video.test.ts scripts/opencode-v2/native-windows-execution-smoke.test.ts scripts/opencode-v2/stage.test.ts scripts/opencode-v2/stage-copy.test.ts scripts/opencode-v2/staged-files.test.ts src/services/opencode/host/OpenCodeV2ExecutionAuth.test.ts src/services/opencode/host/OpenCodeV2ExecutionPlatform.test.ts src/services/opencode/host/OpenCodeV2PlainExecution.test.ts src/services/opencode/profile/OpenCodeV2ExecutionConfig.test.ts src/services/opencode/host/OpenCodeV2ExecutionLifecycle.test.ts src/features/runtimeProviderManagement/adapters/opencode/OpenCodeV2ProviderManagement.test.ts
       - name: Test Windows receipt architecture admission
         if: runner.os == 'Windows'
         run: bun test src/services/opencode/profile/OpenCodeV2ExecutionReceipt.test.ts --test-name-pattern Windows
@@ -448,6 +448,7 @@ jobs:
           @{ platform = $env:CANDIDATE_PLATFORM; package = $packageName; version = $reported; machine = ('0x{0:x4}' -f $machine); sha256 = (Get-FileHash $binary -Algorithm SHA256).Hash.ToLowerInvariant() } | ConvertTo-Json | Set-Content "native-v2-cli-$env:CANDIDATE_PLATFORM.json"
           "V2_NATIVE_CLI=$binary" >> $env:GITHUB_ENV
       - name: Verify and archive complete candidate delivery
+        id: candidate-delivery
         shell: bash
         env:
           CANDIDATE_PLATFORM: ${{ matrix.platform }}
@@ -502,7 +503,11 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $shippedBun = Join-Path $env:RUNNER_TEMP 'TEST-packaged-server-smoke/runtime/bun/bun.exe'
-          $node = (Get-Command node -CommandType Application -ErrorAction Stop).Source
+          # -CommandType enumerates PATH matches; an array would shift the receipt argument.
+          $nodeCommands = @(Get-Command node -CommandType Application -ErrorAction Stop)
+          $node = ($nodeCommands | Select-Object -First 1).Source
+          if ($node -isnot [string] -or -not (Test-Path $node -PathType Leaf)) { throw 'One physical Node executable is required' }
+          Write-Output "Controller Node matches: $($nodeCommands.Count); selected: $node"
           & $shippedBun --no-install --no-env-file scripts/opencode-v2/native-windows-execution-smoke.ts $env:V2_NATIVE_CLI $node "native-v2-execution-$env:CANDIDATE_PLATFORM.json" $env:CANDIDATE_PLATFORM
           if ($LASTEXITCODE -ne 0) { throw 'Native V2 source execution proof failed' }
       - name: Preserve staged V2 and native CLI evidence
@@ -518,6 +523,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
       - name: Preserve exact-head candidate archive
+        if: always() && steps.candidate-delivery.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: packaged-delivery-${{ matrix.platform }}-${{ github.event.pull_request.head.sha || github.sha }}
