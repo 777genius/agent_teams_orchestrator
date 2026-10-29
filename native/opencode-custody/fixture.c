@@ -13,6 +13,19 @@
 #ifndef FIXTURE_MARKER
 #define FIXTURE_MARKER "A"
 #endif
+static int write_response(int client, const char *response, size_t size) {
+  while (size) {
+    ssize_t written = write(client, response, size);
+    if (written < 0) {
+      if (errno == EINTR) continue;
+      return -1;
+    }
+    if (!written) { errno = EIO; return -1; }
+    response += (size_t)written;
+    size -= (size_t)written;
+  }
+  return 0;
+}
 static int authorized(const char *request) {
   const char *password = getenv("OPENCODE_SERVER_PASSWORD");
   if (!password || !*password) return 0;
@@ -73,17 +86,18 @@ int main(int argc, char **argv) {
     request[used] = 0;
     if (!authorized(request)) {
       const char denied[] = "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-      if (used) (void)write(client, denied, sizeof(denied) - 1);
+      if (used && write_response(client, denied, sizeof(denied) - 1)) { close(client); return 112; }
       close(client); continue;
     }
     if (strstr(request, " /session/broken-body ")) {
       const char broken[] = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 999\r\nConnection: close\r\n\r\n{}";
-      (void)write(client, broken, sizeof(broken) - 1); close(client); continue;
+      if (write_response(client, broken, sizeof(broken) - 1)) { close(client); return 112; }
+      close(client); continue;
     }
     const char *body = strstr(request, " /global/health ") ? "{\"healthy\":true,\"version\":\"1.18.34\"}" :
       "{\"marker\":\"" FIXTURE_MARKER "\",\"mcp\":{\"fixture\":{\"headers\":{\"Authorization\":\"Bearer TEST-private-MCP-sentinel\"}}}}";
     char response[512]; int size = snprintf(response, sizeof(response), "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n%s", strlen(body), body);
-    if (used && size > 0 && size < (int)sizeof(response)) (void)write(client, response, (size_t)size);
+    if (used && size > 0 && size < (int)sizeof(response) && write_response(client, response, (size_t)size)) { close(client); return 112; }
     close(client);
     if (strstr(request, " /global/dispose ")) { close(listener); return 0; }
     if (strstr(request, " /close-listener ")) { close(listener); listener = -1; }
