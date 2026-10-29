@@ -120,4 +120,5 @@ jobs:
             ${{ runner.temp }}/TEST-packaged-pty-*.json
             ${{ runner.temp }}/TEST-opencode-identity-*/identity-e2e-summary.json
             ${{ runner.temp }}/TEST-opencode-identity-*/*/models.json
+            ${{ runner.temp }}/TEST-opencode-identity-*/*/command-diagnostics.json
           if-no-files-found: warn

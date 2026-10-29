@@ -6,6 +6,7 @@
  */
 import assert from 'node:assert/strict'
 import { spawn, type ChildProcess } from 'node:child_process'
+import { writeFileSync } from 'node:fs'
 import { mkdir, readFile, realpath, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -21,14 +22,58 @@ const selections = { shim: await realpath(shimArg), native: await realpath(nativ
 assert(selections.shim.endsWith('.cmd') && (await readFile(selections.shim, 'utf8')).includes('opencode-ai'), 'Expected genuine npm shim')
 const runtimes = { candidate: await realpath(candidateArg), baseline: await realpath(baselineArg) }
 
-async function run(binary: string, args: string[], cwd: string, env: NodeJS.ProcessEnv) {
+type CommandPhase = 'waiting' | 'spawned' | 'error' | 'exit' | 'close' | 'watchdog'
+function outputClass(stdout: string): string {
+  if (!stdout) return 'empty'
+  let value: Json
+  try { value = JSON.parse(stdout) } catch { return 'non-json-or-incomplete' }
+  const message = typeof value?.error?.message === 'string' ? value.error.message : ''
+  if (message.includes('Selected OpenCode identity is unavailable') || message.includes('not detected on PATH')) return 'identity-refusal'
+  if (message.startsWith('OpenCode catalog overall deadline exceeded')) return 'catalog-overall-deadline'
+  if (Array.isArray(value?.models?.models) && value.models.models.some((item: Json) => item?.providerId === 'opencode')) return 'models-json'
+  return 'other-json'
+}
+
+async function run(binary: string, args: string[], cwd: string, env: NodeJS.ProcessEnv,
+  label: string, diagnosticFile: string) {
   const started = performance.now()
   const child = spawn(binary, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
-  let stdout = '', stderr = ''
-  child.stdout!.on('data', chunk => { stdout += chunk })
-  child.stderr!.on('data', chunk => { stderr += chunk })
+  let stdout = '', stderr = '', stdoutBytes = 0, stderrBytes = 0
+  let spawnMs: number | null = null, exitMs: number | null = null, closeMs: number | null = null
+  let exitCode: number | null = null, closeCode: number | null = null
+  let exitSignal: string | null = null, closeSignal: string | null = null, spawnErrorCode: string | null = null
+  let diagnosticWriteFailed = false
+  const elapsed = () => Math.round(performance.now() - started)
+  const signalClass = (signal: string | null) => signal === null ? null :
+    ['SIGTERM', 'SIGKILL', 'SIGINT', 'SIGABRT', 'SIGSEGV'].includes(signal) ? signal : 'other'
+  const persist = (phase: CommandPhase) => {
+    const snapshot = {
+      schemaVersion: 1, phase,
+      label: /^(idle|contention)-(candidate|baseline)-(shim|native)$/.test(label) ? label : 'other',
+      elapsedMs: elapsed(), watchdogBudgetMs: 240_000, spawnMs, exitMs, closeMs,
+      exitCode, closeCode, exitSignal, closeSignal, spawnErrorCode,
+      stdoutBytes, stderrBytes, outputClass: outputClass(stdout), diagnosticWriteFailed,
+    }
+    try { writeFileSync(diagnosticFile, JSON.stringify(snapshot, null, 2), { mode: 0o600 }) }
+    catch { diagnosticWriteFailed = true; snapshot.diagnosticWriteFailed = true }
+    console.error(JSON.stringify({ type: 'identity-e2e-command', ...snapshot }))
+  }
+  child.stdout!.on('data', chunk => { stdout += chunk; stdoutBytes += Buffer.byteLength(chunk) })
+  child.stderr!.on('data', chunk => { stderr += chunk; stderrBytes += Buffer.byteLength(chunk) })
   // A timeout fails the job. The disposable runner owns final process teardown.
-  const timer = setTimeout(() => { console.error('TEST command deadline expired'); process.exit(1) }, 240_000)
+  const timer = setTimeout(() => { persist('watchdog'); console.error('TEST command deadline expired'); process.exit(1) }, 240_000)
+  child.once('spawn', () => { spawnMs = elapsed(); persist('spawned') })
+  child.once('error', (error: NodeJS.ErrnoException) => {
+    spawnErrorCode = ['ENOENT', 'EACCES', 'EPERM', 'EINVAL'].includes(error.code ?? '') ? error.code! : 'other'
+    persist('error')
+  })
+  child.once('exit', (code, signal) => {
+    exitMs = elapsed(); exitCode = code; exitSignal = signalClass(signal); persist('exit')
+  })
+  child.once('close', (code, signal) => {
+    closeMs = elapsed(); closeCode = code; closeSignal = signalClass(signal); persist('close')
+  })
+  persist('waiting')
   try {
     const code = await new Promise<number | null>((resolve, reject) => {
       child.once('error', reject); child.once('close', resolve)
@@ -61,7 +106,7 @@ async function models(label: string, runtime: string, selection: string) {
   })
   // The user's failing command: the public OpenCode Zen catalog, without inference.
   const result = await run(runtime, ['runtime', 'providers', 'models', '--runtime', 'opencode', '--provider', 'opencode', '--json'],
-    dirs.project!, env)
+    dirs.project!, env, label, path.join(own, 'command-diagnostics.json'))
   await writeFile(path.join(own, 'models.json'), JSON.stringify(result, null, 2))
   const message = String(result.value?.error?.message ?? '')
   return {
