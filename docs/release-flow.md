@@ -85,7 +85,8 @@ Replace `RELEASE_ID` only with the verified draft's ID. This is the same publica
 used by the workflow; it preserves the qualified asset bytes and does not promote `latest`.
 Then dispatch `release-runtime.yml` for the same immutable source tag/version with
 `publish_release=false`. The workflow detects the already published release, skips build/upload,
-and runs `Verify public anonymous downloads` against the exact seven assets.
+and runs `Verify public anonymous downloads` against the complete asset roster
+derived from that release's manifest, including its optional V2 support archives.
 
 Important:
 - the runtime tag creates a binary draft but does **not** publish it or update the UI lock automatically
