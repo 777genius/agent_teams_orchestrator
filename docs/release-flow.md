@@ -59,7 +59,7 @@ the anonymous-download job is skipped while the release remains a draft.
 
 Before publication, qualify all five base platform builds and every qualified optional
 OpenCode V2 support archive. The generated release manifest determines the complete
-asset roster (currently five base archives, four support ZIPs, manifest and checksums).
+asset roster (five base archives, each qualified platform's support ZIP, manifest and checksums).
 Each optional descriptor must match the same runtime source commit, platform, Bun pin
 and qualified engines as its base; platform metadata sidecars are build inputs only.
 

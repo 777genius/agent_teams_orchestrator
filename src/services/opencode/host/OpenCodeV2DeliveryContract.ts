@@ -38,7 +38,7 @@ function identity(row: Record<string, unknown>): DeliveryIdentity {
   assert(row.schemaVersion === 1 && row.bridgeProtocol === 1 && typeof row.runtimeVersion === 'string' && VERSION.test(row.runtimeVersion) &&
     typeof row.sourceCommit === 'string' && COMMIT.test(row.sourceCommit) && typeof row.platform === 'string' && typeof row.arch === 'string')
   const platform = `${row.platform}-${row.arch}`
-  assert(['darwin-arm64', 'darwin-x64', 'linux-x64', 'win32-x64'].includes(platform) && row.requiredBunVersion === openCodeBunVersion(row.platform))
+  assert(['darwin-arm64', 'darwin-x64', 'linux-x64', 'win32-x64', 'win32-arm64'].includes(platform) && row.requiredBunVersion === openCodeBunVersion(row.platform))
   const expected = openCodeV2QualifiedVersions().filter(pin => openCodeV2LaunchRefusal(pin, platform) === null)
   assert(Array.isArray(row.engineVersions) && row.engineVersions.length > 0 && row.engineVersions.every(isOpenCodeV2Pin) &&
     JSON.stringify(row.engineVersions) === JSON.stringify(expected))
