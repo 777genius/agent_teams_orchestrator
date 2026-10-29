@@ -16,12 +16,14 @@ import type { ValidatedExecutionNative } from '../host/OpenCodeV2ExecutionBindin
 
 type PeExecutableFailure = 'native_selection_changed' | 'controller_runtime_invalid'
 
-/** Qualify one canonical x64 PE executable from a bounded, stable byte snapshot. */
+/** Qualify a native PE executable from a bounded, stable byte snapshot; no emulation fallback. */
 async function inspectOpenCodeV2WindowsPeExecutable(file: string, expectedName: string,
   failure: PeExecutableFailure, signal?: AbortSignal): Promise<Readonly<{ path: string; sha256: string }>> {
   signal?.throwIfAborted()
   const invalid = failure === 'controller_runtime_invalid' ? 'controller_runtime_pe_invalid' : failure
   const architecture = failure === 'controller_runtime_invalid' ? 'controller_runtime_architecture_invalid' : failure
+  const expectedMachine = process.arch === 'x64' ? 0x8664 : process.arch === 'arm64' ? 0xaa64 : null
+  executionAssert(expectedMachine !== null, architecture)
   executionAssert(path.isAbsolute(file) && path.basename(file) === expectedName && await realpath(file) === file, invalid)
   const leaf = await lstat(file)
   executionAssert(leaf.isFile() && !leaf.isSymbolicLink(), invalid)
@@ -57,7 +59,7 @@ async function inspectOpenCodeV2WindowsPeExecutable(file: string, expectedName: 
     executionAssert(sectionTableEnd <= captured.length && sectionTableEnd <= before.size, invalid)
     executionAssert(captured.readUInt16LE(optional) === 0x20b, invalid)
     executionAssert((characteristics & 0x0002) !== 0 && (characteristics & 0x2000) === 0, invalid)
-    executionAssert(machine === 0x8664, architecture)
+    executionAssert(machine === expectedMachine, architecture)
     return Object.freeze({ path: file, sha256: hash.digest('hex') })
   } finally {
     await handle.close()

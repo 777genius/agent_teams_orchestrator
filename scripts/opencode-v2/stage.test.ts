@@ -8,7 +8,8 @@ test('release staging preserves every exact platform engine without adding a new
   const staged = ['2.0.0', '2.0.32', '2.1.4'] as const
   expect(selectOpenCodeV2StageVersions(staged, 'darwin-x64')).toEqual(['2.0.0', '2.0.32'])
   expect(selectOpenCodeV2StageVersions(staged, 'win32-x64')).toEqual(['2.1.4'])
-  expect(selectOpenCodeV2StageVersions(staged, 'win32-arm64')).toEqual([])
+  expect(selectOpenCodeV2StageVersions(staged, 'win32-arm64')).toEqual(['2.1.4'])
+  expect(() => selectOpenCodeV2StageVersions(['2.0.0', '2.0.32'], 'win32-arm64')).toThrow('not installed')
   expect(() => selectOpenCodeV2StageVersions(['2.0.32'], 'linux-x64')).toThrow('not installed')
 })
 

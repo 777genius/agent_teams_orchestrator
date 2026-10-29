@@ -37,9 +37,9 @@ test('release aggregation preserves all platform sidecars and derives the comple
   try {
     const { manifest, publicAssets } = generateRuntimeReleaseManifest(f)
     expect(Object.keys(manifest.assets)).toHaveLength(5)
-    expect(Object.keys(manifest.opencodeV2Delivery)).toEqual(['darwin-arm64', 'darwin-x64', 'linux-x64', 'win32-x64'])
-    expect(publicAssets).toHaveLength(11)
-    expect(publicAssets.filter(name => name.startsWith('agent-teams-opencode-v2-support-'))).toHaveLength(4)
+    expect(Object.keys(manifest.opencodeV2Delivery)).toEqual(platforms)
+    expect(publicAssets).toHaveLength(12)
+    expect(publicAssets.filter(name => name.startsWith('agent-teams-opencode-v2-support-'))).toHaveLength(5)
     const sums = await readFile(path.join(f.releaseDirectory, 'agent-teams-runtime-SHA256SUMS-v0.0.999'), 'utf8')
     for (const descriptor of Object.values(manifest.opencodeV2Delivery)) expect(sums).toContain(`${descriptor!.archive.sha256}  ${descriptor!.archive.file}\n`)
     expect((await readFile(path.join(f.releaseDirectory, 'expected-assets.txt'), 'utf8')).trim().split('\n')).toEqual(publicAssets)
