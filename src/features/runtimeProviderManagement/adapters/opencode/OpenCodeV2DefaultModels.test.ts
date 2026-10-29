@@ -31,7 +31,10 @@ test('V2 defaults persist across provider catalogs and CLI reads, isolate projec
     const selected = { native, policy: { generation: 'v2', version: native.version }, fingerprint: null }
     let tests = 0, valid = true, proof = false, hasNativeDefault = true
     const model = { modelId: 'deepseek/chat', providerId: 'deepseek', displayName: 'Chat', sourceLabel: 'native',
-      catalogStatus: 'active', availability: 'untested', free: false, default: false }
+      catalogStatus: 'active', availability: 'untested', free: false, default: false,
+      declaredInputModalities: ['text'], accessKind: 'credentialed', routeKind: 'catalog_provider',
+      proofState: 'needs_probe', requiresExecutionProof: true, accessReason: 'Selected-model execution proof is required.',
+      catalogContextTokens: 8192, catalogOutputTokens: 512, managedContextTokens: null, managedOutputTokens: null, managedUpdatedAt: null }
     const spies = [
       spyOn(identity, 'inspectOpenCodeReadSelection').mockResolvedValue(selected),
       spyOn(management, 'loadOpenCodeV2ProviderModels').mockImplementation(async input => {
@@ -66,10 +69,21 @@ test('V2 defaults persist across provider catalogs and CLI reads, isolate projec
     }
     try {
       assert.equal((await directoryDefaults(project)).opencode, 'opencode/builtin-free')
+      const before = await adapter.loadView({ runtimeId: 'opencode', projectPath: project })
+      assert.equal(before.ok, true, JSON.stringify(before))
+      assert.equal(before.value.configuredModels.some(row => row.modelId === model.modelId), false,
+        'A paid catalog model is not already a configured model before saving it')
       const global = await adapter.setDefaultModel({ ...input, scope: 'all_projects' })
       assert.equal(global.ok, true, JSON.stringify(global))
       assert.equal(global.value.allProjectsDefaultModel, model.modelId)
       assert.equal(global.value.defaultModelSource, 'all_projects')
+      assert.deepEqual(global.value.configuredModels.find(row => row.modelId === model.modelId),
+        { ...model, default: true }, 'The successful save must include its validated selected model row')
+      assert.deepEqual(global.value.configuredModels.filter(row => row.default).map(row => row.modelId), [model.modelId])
+      for (const previous of before.value.configuredModels) {
+        assert.deepEqual(global.value.configuredModels.find(row => row.modelId === previous.modelId),
+          { ...previous, default: false }, 'Preserve existing model metadata while replacing the default flag')
+      }
       assert.equal((await directoryDefaults(project)).deepseek, 'deepseek/chat')
       assert.equal((await directoryDefaults(other)).deepseek, 'deepseek/chat')
       assert.equal((await directoryDefaults(project)).opencode, null, 'Managed selection replaces the native default in other provider rows')
@@ -90,6 +104,8 @@ test('V2 defaults persist across provider catalogs and CLI reads, isolate projec
       assert.equal(local.ok, true, JSON.stringify(local))
       assert.equal(local.value.projectDefaultModel, model.modelId)
       assert.equal(local.value.defaultModelSource, 'project')
+      assert.deepEqual(local.value.configuredModels.find(row => row.modelId === model.modelId),
+        { ...model, default: true })
       assert.equal((await directoryDefaults(project)).deepseek, 'deepseek/reasoner')
       assert.equal((await directoryDefaults(other)).deepseek, 'deepseek/chat')
       assert.equal((await preferences.readOpenCodeManagedDefaultSelection(other)).defaultModel, 'deepseek/chat')

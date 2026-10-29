@@ -1,13 +1,18 @@
 import { createHash } from 'node:crypto'
 import type { LoadProviderModelsInput, RuntimeProviderModel } from '../../domain/types.js'
 
+/** The same normalized display query selects raw rows and their final DTOs. */
+export function matchesOpenCodeV2ModelQuery(modelId: string, displayName: string, query: string): boolean {
+  return !query || `${modelId} ${displayName}`.toLowerCase().includes(query)
+}
+
 /** Settings pages are display-only, but must still represent the same native catalog. */
 export function pageOpenCodeV2ProviderModels(
   models: readonly RuntimeProviderModel[],
   input: Pick<LoadProviderModelsInput, 'providerId' | 'projectPath' | 'query' | 'limit' | 'cursor'>,
 ) {
   const query = input.query?.trim().toLowerCase() ?? ''
-  const matching = models.filter(model => !query || `${model.modelId} ${model.displayName}`.toLowerCase().includes(query))
+  const matching = models.filter(model => matchesOpenCodeV2ModelQuery(model.modelId, model.displayName, query))
     .sort((left, right) => left.modelId < right.modelId ? -1 : left.modelId > right.modelId ? 1 : 0)
   if (input.limit != null && (!Number.isSafeInteger(input.limit) || input.limit < 1)) {
     throw new Error('provider_catalog_page_invalid')

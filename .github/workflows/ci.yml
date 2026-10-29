@@ -572,7 +572,9 @@ jobs:
     # Real V2 children on ubuntu-24.04. Public catalog reads and anonymous execution
     # against loopback fixtures; no credential or external model request.
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    # Anonymous stages allow 4 x 5m; each team run allows 5m + 5m + 2m cleanup.
+    # Leave room for both native versions, packaging, catalogs and receipt upload.
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v6
         with:
@@ -594,7 +596,7 @@ jobs:
       - name: Start every qualified V2 version
         run: bash scripts/ci/opencode-v2-linux-execution.sh dist
       - name: Verify anonymous native execution, live status and selected-key catalogs
-        timeout-minutes: 8
+        timeout-minutes: 22
         shell: bash
         run: |
           set -euo pipefail
@@ -604,15 +606,23 @@ jobs:
             TEST_EVIDENCE_DIR="$RUNNER_TEMP/TEST-opencode-v2-anonymous-evidence" \
             dist/bun/bun --no-install --no-env-file scripts/opencode-v2-anonymous-native-e2e.ts
       - name: Verify real protocol1 team launch, native replies and physical stop
-        timeout-minutes: 8
+        timeout-minutes: 28
         shell: bash
         run: |
           set -euo pipefail
-          native_root="$RUNNER_TEMP/TEST-opencode-v2-anonymous-cli"
-          TEST_OPENCODE_V2_NATIVE_BINARY="$native_root/node_modules/@opencode/cli-linux-x64/bin/opencode" \
-            TEST_EVIDENCE_DIR="$RUNNER_TEMP/TEST-opencode-v2-team-evidence" \
-            PR_HEAD_SHA="${{ github.event.pull_request.head.sha || github.sha }}" \
-            dist/bun/bun --no-install --no-env-file scripts/opencode-v2-team-native-e2e.ts
+          # The desktop-managed baseline and the separately installed version
+          # from the reported issue. Both binaries were downloaded above.
+          for version in 2.1.4 2.2.0; do
+            if [[ "$version" == 2.2.0 ]]; then
+              native_root="$RUNNER_TEMP/TEST-opencode-v2-anonymous-cli"
+            else
+              native_root="$RUNNER_TEMP/TEST-opencode-v2-linux/TEST-v2-$version/oc"
+            fi
+            TEST_OPENCODE_V2_NATIVE_BINARY="$native_root/node_modules/@opencode/cli-linux-x64/bin/opencode" \
+              TEST_EVIDENCE_DIR="$RUNNER_TEMP/TEST-opencode-v2-team-evidence/TEST-v2-$version" \
+              PR_HEAD_SHA="${{ github.event.pull_request.head.sha || github.sha }}" \
+              dist/bun/bun --no-install --no-env-file scripts/opencode-v2-team-native-e2e.ts
+          done
       - name: Preserve sanitized V2 Linux receipts
         if: always()
         uses: actions/upload-artifact@v4
@@ -624,7 +634,7 @@ jobs:
             ${{ runner.temp }}/TEST-opencode-v2-linux/TEST-v2-*/models.json
             ${{ runner.temp }}/TEST-opencode-v2-linux/TEST-v2-*/status.json
             ${{ runner.temp }}/TEST-opencode-v2-anonymous-evidence/anonymous-native-proof.json
-            ${{ runner.temp }}/TEST-opencode-v2-team-evidence/team-native-proof.json
+            ${{ runner.temp }}/TEST-opencode-v2-team-evidence/TEST-v2-*/team-native-proof.json
 
   opencode-v2-desktop-lifecycle:
     needs: scope

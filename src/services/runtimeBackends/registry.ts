@@ -650,8 +650,13 @@ async function buildOpenCodeStatus(
       probeError: 'OpenCode owned read cleanup unknown.' } }
   }
   if (snapshot.readStatus || snapshot.readGeneration === 'v2' || snapshot.readGeneration === 'unsupported') {
-    const managedDefault = snapshot.readGeneration === 'v2' && snapshot.readStatus?.catalog === 'ready'
-      ? (await readOpenCodeManagedDefaultSelection(snapshot.projectPath)).defaultModel : null
+    // Preferences are optional read-only metadata. Discard a late result rather
+    // than let filesystem latency consume the command's owned-cleanup window.
+    const preferenceTimeoutMs = Math.min(deadline, startedAt + 75_000) - Date.now()
+    const managedDefault = snapshot.readGeneration === 'v2' && snapshot.readStatus?.catalog === 'ready' && preferenceTimeoutMs > 0
+      ? await boundOpenCodeRead(readOpenCodeManagedDefaultSelection(snapshot.projectPath), preferenceTimeoutMs)
+        .then(selection => selection.defaultModel, () => null)
+      : null
     // The desktop full-status IPC has a 90s wall budget. A proof overlay is
     // optional, with at most a 15s read budget and 75s total target. Owned
     // version/auth cleanup remains joined after cancellation, not a hard I/O cap.

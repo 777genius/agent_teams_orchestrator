@@ -35,7 +35,7 @@ test('saved API keys affect only the selected private model catalog without conn
         cost: [{ input: 1, output: 2, cache: { read: 0, write: 0 } }] },
     ]
     const catalogs = [], requests = []
-    let profile, authority, endpoint, closed = 0, unregistered = 0, integrationFailure = null, providerFailure = null, modelFailure = null
+    let profile, authority, endpoint, closed = 0, unregistered = 0, integrationFailure = null, providerFailure = null, modelFailure = null, modelRows = null
     const spies = [
       spyOn(receipts, 'createOpenCodeV2ExecutionReceipt').mockResolvedValue({ graph: {} }),
       spyOn(host, 'acquireOpenCodeV2CatalogLease').mockImplementation(async (_native, selectedProfile) => {
@@ -68,7 +68,7 @@ test('saved API keys affect only the selected private model catalog without conn
                 data: url.pathname === '/api/provider' ? [] : { id: providerId, name: 'OpenCode', methods: [{ type: 'key' }], connections: [] } })
             }
             const key = JSON.parse(profile.config.content).providers.opencode?.settings?.apiKey
-            const data = url.pathname === '/api/model' ? (key === secret ? models : models.slice(0, 1))
+            const data = url.pathname === '/api/model' ? (modelRows ?? (key === secret ? models : models.slice(0, 1)))
               : url.pathname === '/api/provider' ? [{ id: providerId, integrationID: providerId,
                 name: 'OpenCode', activation: 'enabled', settings: { apiKey: key ?? 'public' } }]
               : url.pathname === '/api/integration/opencode'
@@ -106,6 +106,44 @@ test('saved API keys affect only the selected private model catalog without conn
         assert.equal(requiredRead.ok, false, 'An unavailable or incorrectly scoped required catalog must remain a failure')
       }
       modelFailure = null
+      // Query projection must precede strict DTO mapping, after the complete
+      // response/location check. The same matching snapshot still binds pages.
+      const matching = [1, 2].map(index => ({ ...models[0], id: 'selected-' + index,
+        modelID: 'selected-' + index, name: 'TEST Choice ' + index }))
+      const unrelatedMalformed = { ...models[0], id: { toString: null }, name: { toString: null }, limit: null }
+      modelRows = [...matching, unrelatedMalformed]
+      const queryInput = { ...input, query: '  TeSt CHOICE  ', limit: 1 }
+      const first = await loadOpenCodeV2ProviderModels(queryInput, selectedRead)
+      assert.equal(first.ok, true, 'Unrelated malformed rows must not reject a valid query: ' + JSON.stringify(first))
+      assert.equal(first.value.totalCount, 2); assert.equal(first.value.returnedCount, 1)
+      assert.deepEqual(first.value.models.map(row => row.modelId), ['opencode/selected-1'])
+      assert(first.value.nextCursor)
+      modelRows = [{ ...unrelatedMalformed, id: 'unrelated', name: null }, ...matching.toReversed()]
+      const second = await loadOpenCodeV2ProviderModels({ ...queryInput, cursor: first.value.nextCursor }, selectedRead)
+      assert.equal(second.ok, true, JSON.stringify(second))
+      assert.deepEqual(second.value.models.map(row => row.modelId), ['opencode/selected-2'])
+      assert.equal(second.value.nextCursor, null)
+      const qualified = await loadOpenCodeV2ProviderModels({ ...input, query: '  OPENCODE/SELECTED-1 ' }, selectedRead)
+      assert.equal(qualified.ok, true, JSON.stringify(qualified))
+      assert.deepEqual(qualified.value.models.map(row => row.modelId), ['opencode/selected-1'])
+      modelRows = [{ ...matching[0], limit: { context: 16384, output: 512 } }, matching[1], unrelatedMalformed]
+      const changed = await loadOpenCodeV2ProviderModels({ ...queryInput, cursor: first.value.nextCursor }, selectedRead)
+      assert.equal(changed.ok, false, 'A changed matching snapshot must invalidate its cursor')
+      assert.match(changed.error.message, /changed while loading/)
+      for (const malformed of [{ ...matching[1], name: null }, { ...matching[1], id: null }, { ...matching[1], limit: null }]) {
+        modelRows = [matching[0], malformed]
+        const matchingInvalid = await loadOpenCodeV2ProviderModels({ ...input, query: 'OPENCODE/', limit: 1 }, selectedRead)
+        assert.equal(matchingInvalid.ok, false, 'Matching malformed rows must fail even beyond the first page')
+      }
+      modelRows = [...matching, unrelatedMalformed]
+      for (const query of [null, '  ']) {
+        const full = await loadOpenCodeV2ProviderModels({ ...input, query }, selectedRead)
+        assert.equal(full.ok, false, 'An unfiltered catalog must still validate every selected-provider row')
+      }
+      modelFailure = 'scope'
+      const foreign = await loadOpenCodeV2ProviderModels(queryInput, selectedRead)
+      assert.equal(foreign.ok, false, 'A query must never hide an invalid response project')
+      modelRows = null; modelFailure = null
       await auth.upsertOpenCodeApiAuthCredential({ authPath: sourceAuth, providerId, apiKey: secret })
       await auth.upsertOpenCodeApiAuthCredential({ authPath: sourceAuth, providerId: 'deepseek', apiKey: unrelated })
       const sourceBefore = await readFile(sourceAuth, 'utf8')

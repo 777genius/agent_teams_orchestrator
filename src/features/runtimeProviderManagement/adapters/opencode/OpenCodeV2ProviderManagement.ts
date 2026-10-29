@@ -30,7 +30,7 @@ import { prepareOpenCodeV2ConnectVerification, readRetiredOpenCodeV2CatalogProfi
   readOpenCodeV2ConnectIntent, writeOpenCodeV2ConnectIntent, type OpenCodeV2ConnectIntent } from './OpenCodeV2ProviderConnectIntent.js'
 import { parseOpenCodeExecutionProof } from '../../../../services/opencode/OpenCodeExecutionProof.js'
 import { normalizeOpenCodeProjectIdentity } from '../../../../services/opencode/OpenCodeProjectIdentity.js'
-import { pageOpenCodeV2ProviderModels } from './OpenCodeV2ModelPagination.js'
+import { matchesOpenCodeV2ModelQuery, pageOpenCodeV2ProviderModels } from './OpenCodeV2ModelPagination.js'
 import type { OpenCodeExecutionProof } from '../../../../services/opencode/types.js'
 import type { BridgeEnvelope } from '../../../../services/opencode/bridge/OpenCodeBridgeProtocol.js'
 import type { ConnectProviderInput, LoadProviderModelsInput, LoadProviderSetupFormInput, TestProviderModelInput, ProviderConnection, RuntimeProviderModel, RuntimeProviderModelsView, ProviderModelTestResult, ProviderManagementResult, ProviderSetupForm } from '../../domain/types.js'
@@ -374,7 +374,14 @@ export async function loadOpenCodeV2ProviderModels(input: LoadProviderModelsInpu
   selectedRead?: Awaited<ReturnType<typeof inspectOpenCodeReadSelection>>): Promise<ProviderManagementResult<RuntimeProviderModelsView>> {
   try {
     const value = await catalog(input, async owner => {
-      const rows = scopedRows(await owner.models(), owner.authority.directory).filter(row => row.providerID === input.providerId)
+      const query = input.query?.trim().toLowerCase() ?? ''
+      const rows = scopedRows(await owner.models(), owner.authority.directory)
+        .filter(row => row.providerID === input.providerId)
+        // Search known display strings without coercing malformed native values.
+        // Every matching row still passes the strict mapper, including full reads.
+        .filter(row => matchesOpenCodeV2ModelQuery(
+          `${input.providerId}/${typeof row.id === 'string' ? row.id : ''}`,
+          typeof row.name === 'string' ? row.name : '', query))
       let anonymousProvider = false
       if (input.providerId === 'opencode') {
         try {

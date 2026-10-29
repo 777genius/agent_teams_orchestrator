@@ -45,11 +45,18 @@ test.each(['project', 'all_projects', 'clear'] as const)('V2 %s default reports 
     const readView = async () => ({ ok: true, value: { runtimeId: 'opencode', projectPath: project,
       configuredModels: [], defaultModel: 'provider/old-view', fallbackModel: 'provider/native',
       projectDefaultModel: operation === 'all_projects' ? null : 'provider/project-old', allProjectsDefaultModel: 'provider/global-old' } })
+    const run = read => operation === 'clear'
+      ? defaults.clearOpenCodeV2ProjectDefaultModel({ runtimeId: 'opencode', projectPath: project }, read)
+      : defaults.setOpenCodeV2DefaultModel({ runtimeId: 'opencode', projectPath: project,
+          providerId: 'provider', modelId: 'provider/new', scope: operation, probe: false }, read)
     try {
-      const result = operation === 'clear'
-        ? await defaults.clearOpenCodeV2ProjectDefaultModel({ runtimeId: 'opencode', projectPath: project }, readView)
-        : await defaults.setOpenCodeV2DefaultModel({ runtimeId: 'opencode', projectPath: project,
-            providerId: 'provider', modelId: 'provider/new', scope: operation, probe: false }, readView)
+      const unavailableView = { ok: false, error: { code: 'runtime-unhealthy', message: 'TEST pre-write view unavailable', recoverable: true } }
+      assert.deepEqual(await run(async () => unavailableView), unavailableView)
+      assert.equal(committed, false, 'A failed pre-write view cannot mutate preferences')
+      const unchanged = await originalRead(project)
+      assert.equal(unchanged.allProjectsDefaultModel, 'provider/global-old')
+      assert.equal(unchanged.projectDefaultModel, operation === 'all_projects' ? null : 'provider/project-old')
+      const result = await run(readView)
       assert.equal(committed, true)
       const persisted = await originalRead(project)
       assert.equal(persisted.allProjectsDefaultModel, operation === 'all_projects' ? 'provider/new' : 'provider/global-old')

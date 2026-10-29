@@ -55,7 +55,11 @@ export async function setOpenCodeV2DefaultModel(input: SetDefaultModelInput, rea
     if (input.scope === 'all_projects') await setOpenCodeManagedGlobalDefaultModel(defaults.dataRoot, input.modelId)
     else await setOpenCodeManagedDefaultModel(defaults.profileRoot, input.modelId)
     try {
-      return { ok: true, value: await applyOpenCodeV2DefaultSelection(view.value, view.value.fallbackModel) }
+      // The pre-write view excludes paid catalog models that were not configured
+      // yet. Reuse this request's validated row without another native read.
+      const configuredModels = view.value.configuredModels.some(row => row.modelId === model.modelId)
+        ? view.value.configuredModels : [...view.value.configuredModels, model]
+      return { ok: true, value: await applyOpenCodeV2DefaultSelection({ ...view.value, configuredModels }, view.value.fallbackModel) }
     } catch {
       return error('runtime-unhealthy', 'The OpenCode default model was saved, but the provider view could not be refreshed. Refresh providers to see the current default.')
     }

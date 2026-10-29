@@ -20,6 +20,25 @@ const modelId = 'opencode/big-pickle', upstreamModel = 'TEST-team-native-upstrea
 const evidenceDirectory = process.env.TEST_EVIDENCE_DIR
 const save = (file: string, value: unknown) => writeFile(file, JSON.stringify(value, null, 2), { mode: 0o600 })
 const read = (file: string) => readFile(file, 'utf8').then(JSON.parse)
+// Independent Linux observation: do not use the runtime's own retirement receipt
+// or PID alone as the oracle. An unreadable live process is unknown, never gone.
+async function readKernelProcess(pid: number) {
+  assert(Number.isSafeInteger(pid) && pid > 0)
+  let stat: string
+  try { stat = await readFile(`/proc/${pid}/stat`, 'utf8') }
+  catch (error) {
+    assert.equal((error as NodeJS.ErrnoException).code, 'ENOENT')
+    try { process.kill(pid, 0) }
+    catch (missing) { assert.equal((missing as NodeJS.ErrnoException).code, 'ESRCH'); return null }
+    throw new Error(`Cannot read the kernel identity of existing process ${pid}`)
+  }
+  const fields = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/)
+  assert.match(fields[19] ?? '', /^\d+$/)
+  assert.equal(fields[0]?.length, 1)
+  const bootId = (await readFile('/proc/sys/kernel/random/boot_id', 'utf8')).trim()
+  assert.match(bootId, /^[a-f0-9-]{36}$/)
+  return { pid, startTicks: fields[19]!, bootId, state: fields[0]! }
+}
 
 if (process.argv[2] !== 'child') {
   if (evidenceDirectory) await mkdir(evidenceDirectory, { recursive: true, mode: 0o700 })
@@ -209,6 +228,7 @@ if (process.argv[2] !== 'child') {
     assert.equal(launch.data.expectedBehaviorFingerprint, handshake.expectedBehaviorFingerprint)
     assert.deepEqual(Object.keys(launch.data.members).sort(), fixture.members.map((row: any) => row.name).sort())
     const members: any[] = Object.values(launch.data.members)
+    const kernelMembers: Record<string, NonNullable<Awaited<ReturnType<typeof readKernelProcess>>>> = {}
     assert.equal(new Set(members.map(row => row.sessionId)).size, 2)
     assert.equal(new Set(members.map(row => row.runtimePid)).size, 2)
     for (const member of members) {
@@ -222,10 +242,14 @@ if (process.argv[2] !== 'child') {
     assert.equal(control.binding.controllerInstanceId, conditions.commandLeaseId)
     const owned = await requestOpenCodeV2Run(control, { operation: 'status' }, 8000)
     assert.equal(owned.state, 'active'); assert.equal(owned.members.length, 2)
+    assert.deepEqual(owned.members.map((member: any) => member.memberId).sort(), fixture.members.map((member: any) => member.name).sort())
     for (const member of owned.members) {
       assert.equal(member.originalSessionId, launch.data.members[member.memberId].sessionId)
       assert.equal(member.runtimePid, launch.data.members[member.memberId].runtimePid)
       assert(member.controllerTools.nativeNames.some((name: string) => name.endsWith('message_send')))
+      const kernel = await readKernelProcess(member.runtimePid)
+      assert(kernel && kernel.state !== 'Z' && kernel.state !== 'X', 'The original native member must be live')
+      kernelMembers[member.memberId] = kernel
     }
     // Proof must itself have a real submitted and physically retired producer.
     const probes = []
@@ -235,7 +259,7 @@ if (process.argv[2] !== 'child') {
     }
     const producer = probes.filter(row => row.proof?.proofHash === proof.proofHash)
     assert.equal(producer.length, 1); assert.equal(producer[0].submitted, true); assert.equal(producer[0].retired, true); assert.equal(producer[0].failure, null)
-    await save(resultFile, { readiness, launch, control, owned, producer: producer[0] })
+    await save(resultFile, { readiness, launch, control, owned, kernelMembers, producer: producer[0] })
     console.log(JSON.stringify({ event: 'TEST-native-team-launched', nativeVersion: launch.runtime.version,
       engineVersion: owned.qualification.engineVersion, members: members.map(row => ({ sessionId: row.sessionId, pid: row.runtimePid })),
       proofHash: proof.proofHash, proofProducerRetired: true }))
@@ -303,10 +327,24 @@ if (process.argv[2] !== 'child') {
     assert(physical); assert.equal(physical.state, 'stopped'); assert.equal(physical.ownerRetired, true)
     assert.equal(physical.members.length, 2)
     const launch = await read(path.join(root, 'TEST-launch-result.json'))
+    assert.deepEqual(physical.members.map((member: any) => member.memberId).sort(), Object.keys(launch.kernelMembers).sort())
+    const kernelRetirements = []
+    result = { stopped, physical, kernelRetirements }
     for (const member of physical.members) {
       assert.deepEqual(member.errors, []); assert(member.cleanup)
       assert.equal(member.cleanup.scopeClosed, true); assert.equal(member.cleanup.processRetired, true); assert.equal(member.cleanup.descendantsRetired, true)
       assert.equal(member.cleanup.pid, launch.launch.data.members[member.memberId].runtimePid)
+      const original = launch.kernelMembers[member.memberId]
+      assert(original); assert.equal(original.pid, member.cleanup.pid)
+      const retirement = { member: member.memberId, original,
+        current: null as Awaited<ReturnType<typeof readKernelProcess>>, observation: 'unknown' }
+      kernelRetirements.push(retirement)
+      const current = await readKernelProcess(original.pid)
+      const observation = current === null ? 'absent'
+        : current.startTicks !== original.startTicks || current.bootId !== original.bootId ? 'pid-reused'
+        : current.state === 'Z' || current.state === 'X' ? 'exited' : 'still-live'
+      Object.assign(retirement, { current, observation })
+      assert.notEqual(observation, 'still-live', `Original native member ${member.memberId} survived Stop`)
     }
     const lateSend = await execute(envelope('opencode.sendMessage', { memberName: fixture.members[0].name,
       runtimeSessionId: launch.launch.data.members[fixture.members[0].name].sessionId,
@@ -316,9 +354,9 @@ if (process.argv[2] !== 'child') {
     assert.deepEqual(retained, control, 'The original tombstone must retain ownership')
     const mirror = await read(path.join(dataRoot, 'opencode/auth.json')).catch((error: NodeJS.ErrnoException) => { assert.equal(error.code, 'ENOENT'); return {} })
     assert.deepEqual(mirror, {})
-    result = { stopped, physical, lateSend, ownerRetired: true, mirrorEmpty: true }
+    result = { stopped, physical, kernelRetirements, lateSend, ownerRetired: true, mirrorEmpty: true }
     console.log(JSON.stringify({ event: 'TEST-native-team-retired', ownerRetired: physical.ownerRetired,
-      members: physical.members.map((row: any) => ({ member: row.memberId, ...row.cleanup })), afterStopRefused: true }))
+      members: physical.members.map((row: any) => ({ member: row.memberId, ...row.cleanup })), kernelRetirements, afterStopRefused: true }))
     } catch (error) { teamFailure = error }
     finally {
       // Readiness owns a different real run. If it failed before launch or the
