@@ -499,6 +499,7 @@ jobs:
         shell: bash
         env:
           CANDIDATE_PLATFORM: ${{ matrix.platform }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
           # Outside the checkout, so module resolution cannot fall back to the source install.
