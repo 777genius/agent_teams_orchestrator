@@ -140,6 +140,12 @@ async function fresh(f: Fixture, env = f.env, purpose = f.purpose, project = f.p
       if (p === ${JSON.stringify(fault.path)}) throw new Error('AUDIT crash boundary');
     } }));` : ''
   const script = `${inject}globalThis.fetch = async () => { throw new Error('AUDIT forbids network') };
+    const { spyOn } = await import('bun:test');
+    const { OpenCodeHostManager } = await import(${JSON.stringify(path.resolve(import.meta.dir, '../OpenCodeHostManager.ts'))});
+    const endpoints = new OpenCodeHostManager({ persistentRegistryPath: ${JSON.stringify(path.join(f.root, 'app-data', 'opencode', 'host-registry.json'))},
+      fetchJson: async () => { throw new Error('AUDIT synthetic registry forbids HTTP'); } });
+    const sessionEndpoint = OpenCodeHostManager.prototype.resolveOwnedSessionEndpoint;
+    spyOn(OpenCodeHostManager.prototype, 'resolveOwnedSessionEndpoint').mockImplementation((...args) => sessionEndpoint.apply(endpoints, args));
     const { resolveOpenCodeProfileScope } = await import(${JSON.stringify(modulePath)});
     try { const scope = await resolveOpenCodeProfileScope({ projectPath: process.argv[1], selectedModel: 'xai/grok-4.3', purpose: process.argv[2] });
       process.stdout.write(JSON.stringify({ ok: true, scope }));

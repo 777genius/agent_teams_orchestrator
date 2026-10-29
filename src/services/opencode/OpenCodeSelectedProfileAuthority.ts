@@ -166,12 +166,13 @@ export async function refreshSelectedProfileAuthority(input: {
       const client = (deps.clientFactory ?? openCodeClientFactory).create(
         baseUrl,
         requestContext,
+        input.host,
       )
       const [liveConfig, liveAgents, appMcp, behavior, scope] = await Promise.all([
         read('live_config', () => client.getConfig()),
         read('effective_agents', () => client.listAgents()),
         read('app_mcp', () => (deps.mcpManager ?? openCodeMcpManager).ensureAppMcp({
-          baseUrl, attachIfMissing: false,
+          baseUrl, requestOwner: input.host, attachIfMissing: false,
           requestContext,
         })),
         read('project_behavior', () => (deps.collectBehavior ?? collectProjectBehaviorMetadata)(profile.canonicalProjectPath, profile.env)),

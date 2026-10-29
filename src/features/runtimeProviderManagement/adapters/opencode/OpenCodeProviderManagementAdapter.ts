@@ -179,7 +179,7 @@ type OpenCodeProviderManagementClient = {
 }
 
 type OpenCodeClientFactoryLike = {
-  create(baseUrl: string, options?: { signal?: AbortSignal; remainingMs?: () => number }): OpenCodeProviderManagementClient
+  create(baseUrl: string, options?: { signal?: AbortSignal; remainingMs?: () => number }, owner?: object): OpenCodeProviderManagementClient
 }
 
 type OpenCodeProviderManagementAdapterDeps = {
@@ -245,7 +245,7 @@ type OpenCodeProviderManagementAdapterDeps = {
   inventoryTimeoutMs?: number
   /** Settings preparation and HTTP budget; cancellation must drain before CLI exit. */
   viewTimeoutMs?: number
-  resolveBinaryPath?: () => string | null
+  resolveBinaryPath?: () => string | null | Promise<string | null>
   resolveBinaryIdentity?: (binaryPath: string) => Promise<string>
   /** Query, model normalization, and identity-publication budget after host readiness. */
   catalogTimeoutMs?: number
@@ -3275,7 +3275,7 @@ export class OpenCodeProviderManagementAdapter
 
     let binary: CatalogIdentityComponent
     try {
-      const selectedBinaryPath = (this.deps.resolveBinaryPath ?? resolveOpenCodeBinaryPath)()
+      const selectedBinaryPath = await (this.deps.resolveBinaryPath ?? resolveOpenCodeBinaryPath)()
       const binaryPath = selectedBinaryPath ? await realpath(selectedBinaryPath) : null
       if (input.expectedBinaryPath !== undefined && binaryPath !== input.expectedBinaryPath) {
         binary = { state: 'error' }
@@ -3801,7 +3801,7 @@ export class OpenCodeProviderManagementAdapter
         // Inventory (or the initial host on timeout) already prewarmed this profile.
         prewarmManagedSubscriptionPlugins: false,
       })
-      const client = clientFactory.create(host.baseUrl)
+      const client = clientFactory.create(host.baseUrl, undefined, host)
       const [configProvidersResult, providersResult] = await Promise.all([
         safeRead(() => client.getConfigProviders()),
         safeRead(() => client.getProviders()),
@@ -3918,7 +3918,7 @@ export class OpenCodeProviderManagementAdapter
         hostLease = await this.retainProviderManagementHost(hostManager, host)
       }
       leaveLeaseStep?.()
-      const client = clientFactory.create(host.baseUrl, { signal: options.abortSignal })
+      const client = clientFactory.create(host.baseUrl, { signal: options.abortSignal }, host)
       return await raceOpenCodeAbortSignal(
         run({ inventory, inventoryService, host, client }),
         options.abortSignal,
@@ -4067,7 +4067,7 @@ export class OpenCodeProviderManagementAdapter
       const client = clientFactory.create(host.baseUrl, {
         signal: deadline.signal,
         remainingMs: () => deadline.remainingMs(),
-      })
+      }, host)
       const leaveHttp = progress.enterStep('read settings HTTP endpoints')
 
       liveView = await readLiveView({
@@ -4210,7 +4210,7 @@ export class OpenCodeProviderManagementAdapter
         }
       }
 
-      const client = clientFactory.create(host.baseUrl)
+      const client = clientFactory.create(host.baseUrl, undefined, host)
       const serverDocRead = client.getServerDoc
         ? safeRead(() => client.getServerDoc!())
         : Promise.resolve({

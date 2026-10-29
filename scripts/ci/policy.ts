@@ -10,9 +10,10 @@ const lifecyclePath = /^(?:src\/services\/(?:runtimeBackends|teamBootstrap|codex
 // and provider code, not only native boundaries (host/ is not one).
 const v2LinuxPath = /^(?:src\/services\/opencode\/(?:host|execution|bridge|catalog|compatibility|transport|profile)\/|src\/entrypoints\/opencodeV2|src\/features\/runtimeProviderManagement\/adapters\/opencode\/|scripts\/opencode-v2\/|scripts\/ci\/opencode-v2-linux-execution\.sh$|patches\/)/
 const authorityPath = /^src\/services\/opencode\/(?:types\.ts$|recovery-contract\/|compatibility\/OpenCodeVersionProbe(?:\.ts$|\.helperBudget\.test\.ts$)|OpenCode[^/]*(?:Authority|Recovery|Identity|Attribution|Host|BinaryResolver|ProvisioningProbe|ExecutionProof|Launch|Startup|Stop|Cursor|Profile|Session|Native|OAuth|ExecutionProbe|ManagedPaths|AuthCoordination|AuthStore|RuntimeDeadline|EffectiveAgentPolicyContract|BridgePreconditions|BridgeCommandHandler|McpManager))/
+const custodyPath = /^(?:native\/opencode-custody\/|src\/services\/opencode\/(?:native\/|OpenCodeClientFactory(?:\.test)?\.ts$)|scripts\/stage-opencode-custody\.mts$|scripts\/lib\/opencode-custody-artifact(?:\.test)?\.ts$)/
 
 export function classify(paths: string[], full = false) {
-  const native = full || paths.some(path => policyPath.test(path) || platformPath.test(path) || lifecyclePath.test(path) || authorityPath.test(path))
+  const native = full || paths.some(path => policyPath.test(path) || platformPath.test(path) || lifecyclePath.test(path) || authorityPath.test(path) || custodyPath.test(path))
   return {
     native: String(native),
     authority_os: JSON.stringify(native ? ['ubuntu-latest', 'windows-latest'] : ['ubuntu-latest']),
@@ -45,7 +46,7 @@ export function aggregate(needs: Record<string, Need>): string {
   if (!['true', 'false'].includes(native ?? '') || !reason?.trim()) throw new Error('Missing classifier decision/reason')
   if (!['true', 'false'].includes(v2Linux ?? '') || (native === 'true' && v2Linux !== 'true')) throw new Error('Missing V2 Linux decision')
   const required = ['cursor-managed-plugin', 'task-change-ledger', 'opencode-authority']
-  const optional = ['windows-packaged-backfill', 'opencode-conformance', 'packaged-delivery']
+  const optional = ['windows-packaged-backfill', 'opencode-conformance', 'packaged-delivery', 'opencode-native-custody']
   for (const job of [...required, ...optional]) {
     const result = needs[job]?.result
     const allowedSkip = native === 'false' && optional.includes(job)

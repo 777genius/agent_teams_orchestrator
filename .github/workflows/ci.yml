@@ -372,7 +372,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             platform: linux-x64
             executable: claude-multimodel
             binary: dist/cli
@@ -408,11 +408,29 @@ jobs:
           set -euo pipefail
           "$CANDIDATE_BINARY" --version | grep -Fx '2.777.777 (Claude Code)'
           mkdir -p candidate/runtime
-          bun --no-install scripts/ci/verify-packaged-delivery.ts
           cp "$CANDIDATE_BINARY" "candidate/runtime/$CANDIDATE_EXECUTABLE"
           cp dist/opencode-delivery.json candidate/runtime/opencode-delivery.json
           cp dist/opencode-v2-delivery.json candidate/runtime/opencode-v2-delivery.json
           cp -R dist/local-cli dist/bun dist/cursor-managed candidate/runtime/
+          if [[ "$CANDIDATE_PLATFORM" == linux-* ]]; then
+            custody="candidate/runtime/native/opencode-custody/$CANDIDATE_PLATFORM"
+            mkdir -p "$custody"
+            cp "dist/native/opencode-custody/$CANDIDATE_PLATFORM/custodian" "dist/native/opencode-custody/$CANDIDATE_PLATFORM/custodian.json" "$custody/"
+          fi
+          bun --no-install scripts/ci/verify-packaged-delivery.ts
+          if [[ "$CANDIDATE_PLATFORM" == linux-* ]]; then
+            {
+              printf '%s\n' 'Checkpoint ABI evidence only: Linux portability remains unqualified.'
+              /usr/bin/timeout 10 /usr/bin/cc --version
+              /usr/bin/timeout 10 /usr/bin/readelf --version
+              for elf in "candidate/runtime/native/opencode-custody/$CANDIDATE_PLATFORM/custodian" \
+                "candidate/runtime/$CANDIDATE_EXECUTABLE" candidate/runtime/bun/bun; do
+                printf '\nELF %s\n' "$elf"
+                /usr/bin/sha256sum "$elf"
+                /usr/bin/timeout 10 /usr/bin/readelf --program-headers --dynamic --version-info --wide "$elf"
+              done
+            } > candidate/runtime/linux-elf-abi.txt
+          fi
           cp dist/opencode-v2-delivery.json candidate/opencode-v2-delivery.json
           support_archive="$(bun --no-install -e 'console.log(JSON.parse(await Bun.file("dist/opencode-v2-delivery.json").text()).archive.file)')"
           cp "dist/$support_archive" candidate/
@@ -494,10 +512,73 @@ jobs:
             ${{ runner.temp }}/TEST-opencode-v2-linux/TEST-v2-*/models.json
             ${{ runner.temp }}/TEST-opencode-v2-linux/TEST-v2-*/status.json
 
+  opencode-native-custody:
+    name: OpenCode native custody (Linux x64)
+    needs: [scope, packaged-delivery]
+    if: ${{ !cancelled() && needs.scope.outputs.native == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.3.11'
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - name: Install exact pinned dependencies
+        run: bun install --frozen-lockfile --linker hoisted
+      - name: Test source and binary artifact binding
+        run: node --test scripts/lib/opencode-custody-artifact.test.ts
+      - uses: actions/download-artifact@v4
+        with:
+          name: packaged-delivery-linux-x64-${{ github.event.pull_request.head.sha || github.sha }}
+          path: .task-inputs/native-custody-candidate
+      - name: Qualify extracted candidate custody and pinned V1 ingress
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$(/usr/bin/uname -s)" == Linux && "$(/usr/bin/uname -m)" == x86_64 ]]
+          fixture="$RUNNER_TEMP/TEST-opencode-native-custody"
+          [[ ! -e "$fixture" && ! -L "$fixture" ]]
+          mkdir -m 700 "$fixture"
+          mkdir -p "$fixture/delivery" "$fixture/home" "$fixture/config" "$fixture/data" "$fixture/cache" "$fixture/tmp" "$fixture/vendors"
+          chmod 700 "$fixture/vendors"
+          tar -xzf .task-inputs/native-custody-candidate/candidate-linux-x64.tar.gz -C "$fixture/delivery" \
+            ./runtime/native/opencode-custody/linux-x64/custodian ./runtime/native/opencode-custody/linux-x64/custodian.json \
+            ./runtime/COMMIT_SHA ./runtime/security-capabilities.json ./runtime/linux-elf-abi.txt
+          custody_bun="$(command -v bun)"
+          # Keep synthetic lifecycle tests in their own process; module mocks must not reach physical qualification.
+          env -i PATH=/usr/bin:/bin HOME="$fixture/home" USERPROFILE="$fixture/home" TMPDIR="$fixture/tmp" \
+            XDG_CONFIG_HOME="$fixture/config" XDG_DATA_HOME="$fixture/data" XDG_CACHE_HOME="$fixture/cache" \
+            "$custody_bun" --no-env-file test src/services/opencode/native/OpenCodeNativeHelperLifecycle.test.ts --timeout 30000 2>&1 | tee native-custody-test.log
+          env -i PATH=/usr/bin:/bin HOME="$fixture/home" USERPROFILE="$fixture/home" TMPDIR="$fixture/tmp" \
+            OPENCODE_NATIVE_CUSTODY_SOURCE_SHA="${{ github.event.pull_request.head.sha || github.sha }}" \
+            "$custody_bun" --no-env-file scripts/ci/stage-native-custody-vendors.mts "$fixture/vendors" "$fixture/delivery/runtime"
+          env -i PATH=/usr/bin:/bin HOME="$fixture/home" USERPROFILE="$fixture/home" TMPDIR="$fixture/tmp" \
+            XDG_CONFIG_HOME="$fixture/config" XDG_DATA_HOME="$fixture/data" XDG_CACHE_HOME="$fixture/cache" \
+            OPENCODE_NATIVE_CUSTODY_TEST_HELPER="$fixture/delivery/runtime/native/opencode-custody/linux-x64/custodian" \
+            OPENCODE_NATIVE_CUSTODY_TEST_VENDORS="$fixture/vendors/vendors.json" \
+            "$custody_bun" --no-env-file test src/services/opencode/native/OpenCodeNativeCustody.native.test.ts --timeout 30000 2>&1 | tee -a native-custody-test.log
+      - name: Preserve nonsecret native qualification log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencode-native-custody-linux-x64-${{ github.event.pull_request.head.sha || github.sha }}
+          path: |
+            native-custody-test.log
+            ${{ runner.temp }}/TEST-opencode-native-custody/vendors/acquisition.json
+            ${{ runner.temp }}/TEST-opencode-native-custody/delivery/runtime/linux-elf-abi.txt
+          if-no-files-found: warn
+          retention-days: 7
+
   required:
     name: CI required
     if: always()
-    needs: [scope, cursor-managed-plugin, task-change-ledger, opencode-authority, windows-packaged-backfill, opencode-conformance, packaged-delivery, opencode-v2-linux]
+    needs: [scope, cursor-managed-plugin, task-change-ledger, opencode-authority, windows-packaged-backfill, opencode-conformance, packaged-delivery, opencode-v2-linux, opencode-native-custody]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

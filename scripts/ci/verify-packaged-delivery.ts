@@ -5,6 +5,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import os from 'node:os'
 import path from 'node:path'
 import { validatePackagedOpenCodeIdentity } from '../../src/cli/packagedOpenCodeDelivery.js'
+import { verifyLinuxCustodyArtifact } from '../lib/opencode-custody-artifact.js'
 import { validateOpenCodeV2DeliveryDescriptor, validateOpenCodeV2DeliveryManifest } from '../../src/services/opencode/host/OpenCodeV2DeliveryContract.js'
 
 /** A release must refuse old/help output, false capability claims and unrelated data. */
@@ -42,6 +43,9 @@ function verifyPackagedDelivery(): void {
     if (existsSync(file)) throw new Error('Optional V2 bytes leaked into the graph-free base')
   }
   if (platform !== process.platform || arch !== process.arch) throw new Error('Candidate cannot execute on this host')
+  if (platform === 'linux') {
+    verifyLinuxCustodyArtifact('candidate/runtime/native', candidate, 'native/opencode-custody/linux.c')
+  }
   const sourceSha = process.env.CANDIDATE_SOURCE_SHA
   if (!sourceSha || !/^[a-f0-9]{40}$/.test(sourceSha)) throw new Error('Missing candidate source identity')
   const binary = path.resolve(platform === 'win32' ? 'dist/cli.exe' : 'dist/cli')

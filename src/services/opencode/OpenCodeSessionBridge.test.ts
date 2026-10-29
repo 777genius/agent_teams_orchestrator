@@ -1963,7 +1963,9 @@ describe('OpenCodeSessionBridge', () => {
       connected: true,
       diagnostics: [],
     })
-    expect(ensureCalls).toEqual([{ baseUrl: 'http://127.0.0.1:4096', attachIfMissing: true }])
+    expect(ensureCalls).toEqual([{ baseUrl: 'http://127.0.0.1:4096', attachIfMissing: true,
+      requestOwner: expect.objectContaining({ baseUrl: 'http://127.0.0.1:4096', runtimePid: 123 }),
+    }])
     expect(retainedLeases).toEqual([{
       teamId: 'team-a',
       laneId: 'primary',

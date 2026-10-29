@@ -8,6 +8,9 @@ import { OpenCodeProvisioningProbe } from './OpenCodeProvisioningProbe.js'
 import { OpenCodeProfileManager, resolveOpenCodeProfileScope, buildManagedConfigFingerprint } from './OpenCodeProfileManager.js'
 import { OpenCodeHostManager } from './OpenCodeHostManager.js'
 import { OpenCodeSessionBridge } from './OpenCodeSessionBridge.js'
+import { OpenCodeClientFactory } from './OpenCodeClientFactory.js'
+import { OpenCodeMcpManager } from './OpenCodeMcpManager.js'
+import { OpenCodePreviewObserver } from './OpenCodePreviewObserver.js'
 import type { OpenCodeSessionRecord } from './types.js'
 
 async function stopFixtureChild(child: ChildProcess): Promise<void> {
@@ -83,10 +86,25 @@ test('fresh selected sessions retain the managed fingerprint domain', async () =
         return new Response('Unexpected endpoint', { status: 404 });
       } });
     `)
+    // This fake binary has no native custody. Keep all HTTP on its exact TEST origins.
+    const fixtureOrigins = new Set<string>()
+    const fixtureFetch = (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      const url = new URL(input instanceof Request ? input.url : String(input))
+      if (!fixtureOrigins.has(url.origin)) throw new Error('Foreign fixture HTTP origin')
+      return fetch(input, { ...init, redirect: 'error' })
+    }
+    const clientFactory = new OpenCodeClientFactory({ fetchImpl: fixtureFetch })
+    const mcpManager = new OpenCodeMcpManager({ clientFactory })
+    const previewObserver = new OpenCodePreviewObserver({ fetchImpl: fixtureFetch })
+    const fetchJson = async (url: string, init?: RequestInit) => {
+      const response = await fixtureFetch(url, init)
+      return { status: response.status, data: await response.json() }
+    }
     const registryPath = path.join(root, 'registry.json')
     const managers = () => new OpenCodeHostManager({ prepareProfile: async () => profile,
-      persistentRegistryPath: registryPath, readProcessStartTimeMs,
+      persistentRegistryPath: registryPath, fetchJson, readProcessStartTimeMs,
       spawnHostProcess: (_profile, port) => {
+        fixtureOrigins.add(`http://127.0.0.1:${port}`)
         const child = spawn(process.execPath, [serverFile, String(port)], {
           cwd: project, env: { HOME: process.env.HOME, XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME,
             XDG_DATA_HOME: process.env.XDG_DATA_HOME, TMPDIR: root }, stdio: ['ignore', 'pipe', 'pipe'],
@@ -97,7 +115,7 @@ test('fresh selected sessions retain the managed fingerprint domain', async () =
     })
     const firstManager = managers()
     let saved: OpenCodeSessionRecord | null = null
-    const bridge = new OpenCodeSessionBridge({ prepareProfile: async () => profile, hostManager: firstManager,
+    const bridge = new OpenCodeSessionBridge({ prepareProfile: async () => profile, hostManager: firstManager, clientFactory, mcpManager, previewObserver,
       sessionStore: { get: async () => saved, upsert: async record => { saved = record; return 'created' },
         markStale: async () => { throw new Error('unexpected stale write') } },
     })
@@ -105,7 +123,7 @@ test('fresh selected sessions retain the managed fingerprint domain', async () =
       selectedModel, projectPath: project, preparedProfile: profile, runId: 'run-1' })
     // Before the fix this assertion exposes the broad HTTP inventory hash sealed by ensureSession.
     expect(record.resolvedBehaviorFingerprint).toBe(profile.managedConfigFingerprint)
-    const probeFor = (hostManager: OpenCodeHostManager) => new OpenCodeProvisioningProbe({ hostManager,
+    const probeFor = (hostManager: OpenCodeHostManager) => new OpenCodeProvisioningProbe({ hostManager, clientFactory, mcpManager,
       inventoryService: { probe: async () => ({ detected: true, projectPath: profile.projectPath, profile,
         binaryPath: serverFile, version: '1.18.4', connectedProviders: [], availableProviders: ['deepinfra'],
         agents: [], authStorePath: null, models: [selectedModel], probeError: null, diagnostics: [] }) },
