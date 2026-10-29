@@ -3085,9 +3085,20 @@ test('cleanup resolves exact persistent ownership across restart without profile
 test.skipIf(process.platform === 'win32')('isolated umask0002 missing host directory is created private without relaxing unsafe existing directories', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-host-directory-mode-'))
   const lease = { teamId: 'team', laneId: 'primary', memberName: 'alice', runId: 'run', sessionId: 'session' }
-  const resolveInSubprocess = async (registryPath: string, projectPath: string) => {
+  const resolveInSubprocess = async (registryPath: string, projectPath: string, modeTracePath?: string) => {
     const module = new URL('./OpenCodeHostManager.ts', import.meta.url).href
     const source = `process.umask(0o0002);
+      const fs = await import('node:fs/promises');
+      const modeTracePath = ${JSON.stringify(modeTracePath) ?? 'undefined'};
+      const target = ${JSON.stringify(path.dirname(registryPath))};
+      const mode = async directory => {
+        try { return (await fs.stat(directory)).mode & 0o777; }
+        catch (error) { if (error?.code === 'ENOENT') return null; throw error; }
+      };
+      const facts = {};
+      if (modeTracePath) {
+        facts.targetBeforeImport = await mode(target);
+      }
       const { OpenCodeHostManager } = await import(${JSON.stringify(module)});
       const manager = new OpenCodeHostManager({
         persistentRegistryPath: ${JSON.stringify(registryPath)},
@@ -3095,11 +3106,24 @@ test.skipIf(process.platform === 'win32')('isolated umask0002 missing host direc
         fetchJson: async () => { throw new Error('TEST network must not run') },
         spawnHostProcess: () => { throw new Error('TEST host must not start') },
       });
+      if (modeTracePath) facts.targetBeforeResolve = await mode(target);
       try {
         await manager.resolveOwnedSessionEndpoint('owned', ${JSON.stringify({ ...lease, projectPath })});
         console.log(JSON.stringify({ kind: 'resolved' }));
       } catch (error) {
         console.log(JSON.stringify({ kind: 'rejected', name: error?.name, message: error?.message }));
+      } finally {
+        if (modeTracePath) {
+          facts.targetAfterResolve = await mode(target);
+          // Run the independent primitive only after observing the original target path.
+          const primitive = ${JSON.stringify(path.join(root, 'TEST-independent-mkdir-primitive'))};
+          await fs.mkdir(primitive, { mode: 0o777 });
+          await fs.chmod(primitive, 0o777);
+          facts.primitiveBefore = await mode(primitive);
+          await fs.mkdir(primitive, { recursive: true, mode: 0o700 });
+          facts.primitiveAfter = await mode(primitive);
+          await fs.writeFile(modeTracePath, JSON.stringify(facts), { flag: 'wx', mode: 0o600 });
+        }
       }`
     const child = Bun.spawn([process.execPath, '-e', source], { stdout: 'pipe', stderr: 'pipe' })
     const [exitCode, stdout, stderr] = await Promise.all([
@@ -3125,10 +3149,18 @@ test.skipIf(process.platform === 'win32')('isolated umask0002 missing host direc
     const unsafeHost = path.join(root, 'TEST-existing-unsafe-host', 'private', 'session')
     await mkdir(unsafeHost, { recursive: true, mode: 0o777 })
     await chmod(unsafeHost, 0o777)
-    expect(await resolveInSubprocess(path.join(unsafeHost, 'hosts.json'), root)).toEqual({
+    const modeTracePath = path.join(root, 'TEST-unsafe-directory-mode-trace.json')
+    expect(await resolveInSubprocess(path.join(unsafeHost, 'hosts.json'), root, modeTracePath)).toEqual({
       kind: 'rejected', name: 'Error', message: 'OpenCode cleanup host ownership is unavailable',
     })
-    expect((await stat(unsafeHost)).mode & 0o777).toBe(0o777)
+    // Child and both pipes have closed before reading its mode-only evidence.
+    const trace = JSON.parse(await readFile(modeTracePath, 'utf8')) as Record<string, unknown>
+    const modeFacts = Object.fromEntries([
+      'targetBeforeImport', 'targetBeforeResolve', 'targetAfterResolve', 'primitiveBefore', 'primitiveAfter',
+    ].map(key => [key, typeof trace[key] === 'number' && Number.isInteger(trace[key])
+      && trace[key] >= 0 && trace[key] <= 0o777 ? trace[key] : null]))
+    expect(Object.values(modeFacts).every(value => value !== null)).toBe(true)
+    expect((await stat(unsafeHost)).mode & 0o777, JSON.stringify(modeFacts)).toBe(0o777)
 
     const unsafeAuthority = path.join(root, 'TEST-existing-authority-directory', 'hosts.json')
     await mkdir(unsafeAuthority, { recursive: true, mode: 0o777 })
