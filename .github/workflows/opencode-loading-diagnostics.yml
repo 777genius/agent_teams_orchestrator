@@ -8,7 +8,7 @@ permissions:
 jobs:
   validate:
     if: github.repository == '777genius/agent_teams_orchestrator' && github.ref == 'refs/heads/fix/opencode-three-minute-loading'
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-4
     timeout-minutes: 10
     permissions:
       contents: write
