@@ -1,3 +1,4 @@
+import { OPEN_CODE_LOADING_TIMEOUT_MS } from '../services/opencode/OpenCodeLoadingBudget.js'
 import { openCodeV2ServerLoopbackUrl } from '../services/opencode/host/OpenCodeV2ServerAddress.js'
 import path from 'node:path'
 import { realpath } from 'node:fs/promises'
@@ -18,7 +19,7 @@ const controller = new AbortController()
 let startup: Promise<void> | undefined
 let finalize: (() => Promise<void>) | undefined
 let closeWork: Promise<void> | undefined
-const startupTimer = setTimeout(() => { void close() }, 30_000)
+const startupTimer = setTimeout(() => { void close() }, OPEN_CODE_LOADING_TIMEOUT_MS)
 function close(): Promise<void> {
   return closeWork ??= (async () => {
     closing = true

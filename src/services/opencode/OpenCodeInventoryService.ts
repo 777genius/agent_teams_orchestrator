@@ -1,3 +1,4 @@
+import { OPEN_CODE_LOADING_TIMEOUT_MS } from './OpenCodeLoadingBudget.js'
 import { mkdir, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import stripAnsi from 'strip-ansi'
@@ -89,14 +90,14 @@ export const OPEN_CODE_PROBE_TIMEOUT_MS = 10_000
 export const OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS = OPEN_CODE_PROBE_TIMEOUT_MS * 3
 // Cold full inventory includes profile/auth preparation and the first managed-plugin
 // load before sequential probes. Keep their shared budget below the desktop connect ceiling.
-export const OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS = 180_000
-export const OPEN_CODE_MODEL_LIST_TIMEOUT_MS = 30_000
+export const OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS = OPEN_CODE_LOADING_TIMEOUT_MS
+export const OPEN_CODE_MODEL_LIST_TIMEOUT_MS = OPEN_CODE_LOADING_TIMEOUT_MS
 // Seeding runs before a catalog host starts, inside the catalog read's own deadline.
 export const OPEN_CODE_MODELS_CACHE_SEED_TIMEOUT_MS = 15_000
 const OPEN_CODE_MODEL_REFRESH_OUTPUT_PROVIDER = 'opencode'
 const OPEN_CODE_CACHE_TTL_MS = 10_000
 const OPEN_CODE_INVENTORY_TIMEOUT_MESSAGE_PREFIX = 'OpenCode inventory probe timed out'
-const OPEN_CODE_MANAGED_PLUGIN_FIRST_LOAD_TIMEOUT_MS = 45_000
+const OPEN_CODE_MANAGED_PLUGIN_FIRST_LOAD_TIMEOUT_MS = OPEN_CODE_LOADING_TIMEOUT_MS
 const OPEN_CODE_MANAGED_PLUGIN_INSTALL_LOCK_OPTIONS = {
   stale: 30_000,
   update: 5_000,

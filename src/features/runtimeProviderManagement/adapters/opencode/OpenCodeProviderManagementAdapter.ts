@@ -418,7 +418,7 @@ function isCopilotExplicitModelUnsupported(reason: string): boolean {
 const DEFAULT_DIRECTORY_LIMIT = 50
 const MAX_DIRECTORY_LIMIT = 100
 const DIRECTORY_CACHE_TTL_MS = 30_000
-const OPEN_CODE_PROVIDER_MANAGEMENT_HOST_HEALTH_TIMEOUT_MS = 10_000
+const OPEN_CODE_PROVIDER_MANAGEMENT_HOST_HEALTH_TIMEOUT_MS = OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS
 const OPEN_CODE_PROVIDER_MANAGEMENT_IDLE_HOST_TTL_MS = 10 * 60_000
 const OPEN_CODE_PROVIDER_MANAGEMENT_LEASE_STALE_AGE_MS = 2 * 60 * 60_000
 const AUTO_OAUTH_CREDENTIAL_POLL_INTERVAL_MS = 250
@@ -3969,7 +3969,7 @@ export class OpenCodeProviderManagementAdapter
       }
     }
 
-    const deadline = new OpenCodeRuntimeDeadline(this.deps.viewTimeoutMs ?? 75_000)
+    const deadline = new OpenCodeRuntimeDeadline(this.deps.viewTimeoutMs ?? OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS)
     const progress = createOpenCodeInventoryProbeProgressTracker()
     let timeoutMessage: string | undefined
     const captureTimeout = () => {

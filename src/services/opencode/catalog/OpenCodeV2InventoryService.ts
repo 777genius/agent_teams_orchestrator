@@ -1,3 +1,4 @@
+import { OPEN_CODE_LOADING_TIMEOUT_MS } from '../OpenCodeLoadingBudget.js'
 import { openCodeV2EngineVersion } from '../compatibility/OpenCodeV2Registry.js'
 import type { OpenCodeClientRequestContext } from '../OpenCodeClientRequestContext.js'
 import type { OpenCodeConnectedProvider, OpenCodeInventorySnapshot } from '../types.js'
@@ -30,7 +31,7 @@ export function openCodeV2InventorySnapshot(native: OpenCodeV2NativeIdentity, di
 
 export async function probeOpenCodeV2Inventory(native: OpenCodeV2NativeIdentity, directory: string,
   context: OpenCodeClientRequestContext = {}): Promise<OpenCodeInventorySnapshot> {
-  const deadline = Date.now() + Math.min(60_000, context.remainingMs?.() ?? 60_000)
+  const deadline = Date.now() + Math.min(OPEN_CODE_LOADING_TIMEOUT_MS, context.remainingMs?.() ?? OPEN_CODE_LOADING_TIMEOUT_MS)
   const boundedContext = { ...context, remainingMs: () => Math.min(deadline - Date.now(), context.remainingMs?.() ?? Infinity) }
   let status = emptyOpenCodeV2ReadStatus(native, directory)
   let host: Awaited<ReturnType<typeof acquireOpenCodeV2ReadHost>> | undefined
