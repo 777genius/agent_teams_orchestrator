@@ -53,7 +53,7 @@ test('a shorter caller deadline still rejects a late response', async () => {
   } finally { await wire.dispose(); clock.mockRestore() }
 })
 
-test('caller cancellation is immediate and a late body is cancelled rather than accepted', async () => {
+test('caller cancellation rejects a late body and joins its cancellation', async () => {
   const controller = new AbortController()
   let release!: (value: Response) => void, cancelled = false
   const response = new Promise<Response>(resolve => { release = resolve })
@@ -61,10 +61,10 @@ test('caller cancellation is immediate and a late body is cancelled rather than 
     { signal: controller.signal }, async () => response)
   try {
     const work = wire.fetch(`${base}/api/info`)
-    const rejected = expect(work).rejects.toThrow('timeout')
+    void work.catch(() => undefined)
     controller.abort()
-    await rejected
     release(new Response(new ReadableStream({ cancel() { cancelled = true } })))
+    await expect(work).rejects.toThrow('timeout')
     await wire.dispose()
     expect(cancelled).toBe(true)
   } finally { await wire.dispose() }
