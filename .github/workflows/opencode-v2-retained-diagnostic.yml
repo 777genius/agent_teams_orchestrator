@@ -15,22 +15,29 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Read the original isolated desktop failure
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - uses: actions/checkout@v6
+        with:
+          ref: '54f4e96059edf9b6ceb8471022a7138c8b4766a1'
+          path: runtime
+          persist-credentials: false
+      - uses: actions/checkout@v6
+        with:
+          repository: 777genius/agent-teams-ai
+          ref: 'da1ef5825aa9287581d91f1acea3a03ab49485d2'
+          path: desktop
+          persist-credentials: false
+      - name: Retain exact source snapshots without credentials or generated state
         shell: bash
         run: |
           set -euo pipefail
-          evidence="$RUNNER_TEMP/TEST-v2-retained-desktop"
-          mkdir -p "$evidence"
-          gh run download 40936870333 --repo 777genius/agent_teams_orchestrator \
-            --name opencode-v2-desktop-lifecycle-de8ba2ab8fcf646ee5d4c3d12438f6b5b30b1454 \
-            --dir "$evidence"
-          python3 - "$evidence" <<'PY'
-          import json, pathlib, sys
-          root = pathlib.Path(sys.argv[1])
-          for name in ('result.json', 'failure.json'):
-              value = json.loads((root / name).read_text())
-              keys = ('ok', 'error', 'phases', 'modelRequests', 'fixtureFailures') if name == 'result.json' else ('loading', 'error', 'viewport', 'text')
-              print(name, json.dumps({key: value.get(key) for key in keys}, ensure_ascii=False))
-          PY
+          mkdir TEST-v2-source-snapshots
+          git -C runtime archive --format=tar.gz HEAD > TEST-v2-source-snapshots/runtime.tar.gz
+          git -C desktop archive --format=tar.gz HEAD > TEST-v2-source-snapshots/desktop.tar.gz
+          git -C runtime rev-parse HEAD > TEST-v2-source-snapshots/runtime.sha
+          git -C desktop rev-parse HEAD > TEST-v2-source-snapshots/desktop.sha
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TEST-v2-source-snapshots
+          path: TEST-v2-source-snapshots/
+          retention-days: 1
+          if-no-files-found: error
