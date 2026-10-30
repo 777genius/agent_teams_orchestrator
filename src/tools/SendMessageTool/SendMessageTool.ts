@@ -37,6 +37,7 @@ import {
   createShutdownRejectedMessage,
   createShutdownRequestMessage,
   writeToMailbox,
+  writeToMailboxVerified,
 } from '../../utils/teammateMailbox.js'
 import { resumeAgentBackground } from '../AgentTool/resumeAgent.js'
 import { SEND_MESSAGE_TOOL_NAME } from './constants.js'
@@ -154,11 +155,14 @@ async function handleMessage(
 ): Promise<{ data: MessageOutput }> {
   const appState = context.getAppState()
   const teamName = getTeamName(appState.teamContext)
+  if (!teamName) {
+    throw new Error(`Not in a team context: cannot deliver to "${recipientName}".`)
+  }
   const senderName =
     getAgentName() || (isTeammate() ? 'teammate' : TEAM_LEAD_NAME)
   const senderColor = getTeammateColor()
 
-  await writeToMailbox(
+  await writeToMailboxVerified(
     recipientName,
     {
       from: senderName,

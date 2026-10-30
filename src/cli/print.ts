@@ -163,6 +163,7 @@ import {
   getCodexNativeHistoryOperationErrorForTranscript,
 } from 'src/services/codexNative/conversationHistoryGuard.js'
 import { restoreCodexLeadConversationForFullResume } from 'src/services/codexNative/leadConversationResume.js'
+import { restoreResumedLeadTeam } from 'src/services/teamBootstrap/resumedLeadTeam.js'
 import { runSideQuestion } from 'src/utils/sideQuestion.js'
 import {
   processSessionStartHooks,
@@ -885,12 +886,14 @@ export async function runHeadless(
   }
 
   try {
-    await restoreCodexLeadConversationForFullResume({
+    const resumeParams = {
       isFullResume: Boolean(options.resume || options.continue) &&
         !options.forkSession && !options.resumeSessionAt && !options.teleport,
       getAppState,
       setAppState,
-    })
+    }
+    await restoreCodexLeadConversationForFullResume(resumeParams)
+    await restoreResumedLeadTeam(resumeParams)
   } catch (error) {
     emitLoadError(error instanceof Error ? error.message : 'Failed to restore the Codex lead identity', options.outputFormat)
     gracefulShutdownSync(1)
