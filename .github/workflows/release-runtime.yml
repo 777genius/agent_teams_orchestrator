@@ -175,7 +175,7 @@ jobs:
             platform: win32-arm64
             archive_name: agent-teams-runtime-win32-arm64.zip
             binary_name: claude-multimodel.exe
-          - runner: macos-14
+          - runner: macos-15
             platform: darwin-arm64
             archive_name: agent-teams-runtime-darwin-arm64.tar.gz
             binary_name: claude-multimodel
