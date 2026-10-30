@@ -1,4 +1,4 @@
-name: OpenCode loading diagnostic sources
+name: OpenCode loading final validation
 on:
   push:
     branches: [fix/opencode-three-minute-loading]
@@ -6,31 +6,64 @@ on:
 permissions:
   contents: read
 jobs:
-  sources:
+  validate:
+    if: github.repository == '777genius/agent_teams_orchestrator' && github.ref == 'refs/heads/fix/opencode-three-minute-loading'
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v6
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Collect only timeout test and startup sources
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p TEST-loading-sources
-          git grep -l -e 'reports the connect timeout when host health consumes' -e 'OpenCode startup timed out' -e 'native-flat native provider directory full mode' -- src scripts > TEST-loading-sources/paths.txt
-          cat TEST-loading-sources/paths.txt
-          while IFS= read -r file; do
-            mkdir -p "TEST-loading-sources/$(dirname "$file")"
-            cp "$file" "TEST-loading-sources/$file"
-          done < TEST-loading-sources/paths.txt
-          for file in src/services/opencode/OpenCodeHostManager.ts src/features/runtimeProviderManagement/adapters/opencode/OpenCodeProviderManagementAdapter.ts scripts/smoke/windows-runtime-opencode-provider-json.mjs; do
-            mkdir -p "TEST-loading-sources/$(dirname "$file")"
-            cp "$file" "TEST-loading-sources/$file"
-          done
-      - uses: actions/upload-artifact@v4
+      - name: Retain tracked source for diagnosis
+        run: git archive --format=tar.gz HEAD > runtime-source.tar.gz
+      - uses: oven-sh/setup-bun@v2
         with:
-          name: opencode-loading-source-diagnosis
-          path: TEST-loading-sources
+          bun-version: '1.3.11'
+      - run: bun install --frozen-lockfile
+      - name: Update exact obsolete view-budget assertions
+        id: edit
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          file = Path('src/features/runtimeProviderManagement/adapters/opencode/OpenCodeProviderManagementAdapter.test.ts')
+          source = file.read_text()
+          before = '        healthTimeoutMs: 10_000,'
+          assert source.count(before) == 2
+          file.write_text(source.replace(before, '        healthTimeoutMs: 180_000,'))
+          PY
+          git diff --check
+          git diff > candidate.patch
+      - name: Provider settings and body deadline regression suite
+        run: bun test src/features/runtimeProviderManagement/adapters/opencode/OpenCodeProviderManagementAdapter.test.ts src/services/opencode/OpenCodeProviderIdentity.test.ts src/services/opencode/OpenCodeInventoryService.test.ts src/services/opencode/OpenCodeProviderLabelRegression.test.ts src/services/opencode/OpenCodeClientFactory.test.ts --timeout 30000
+      - name: Export the exact tested blob without changing refs
+        if: always() && steps.edit.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bun --eval '
+          import assert from "node:assert/strict";
+          import { execFileSync } from "node:child_process";
+          const path = "src/features/runtimeProviderManagement/adapters/opencode/OpenCodeProviderManagementAdapter.test.ts";
+          const git = (...args) => execFileSync("git", args, { encoding: "utf8" }).trim();
+          assert.equal(git("diff", "--name-only"), path);
+          const response = await fetch("https://api.github.com/repos/777genius/agent_teams_orchestrator/git/blobs", {
+            method: "POST", headers: { Authorization: `Bearer ${process.env.GH_TOKEN}`, "Content-Type": "application/json" },
+            body: JSON.stringify({ content: await Bun.file(path).text(), encoding: "utf-8" }), signal: AbortSignal.timeout(60000),
+          });
+          assert(response.ok, `Blob upload: ${response.status}`);
+          const { sha } = await response.json(); assert.match(sha, /^[a-f0-9]{40}$/);
+          const receipt = { parent: git("rev-parse", "HEAD"), baseTree: git("rev-parse", "HEAD^{tree}"), entries: [{ path, mode: "100644", type: "blob", sha }] };
+          await Bun.write("candidate-tree.json", JSON.stringify(receipt, null, 2));
+          console.log(JSON.stringify(receipt));'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: opencode-loading-final-validation
+          path: |
+            runtime-source.tar.gz
+            candidate.patch
+            candidate-tree.json
           retention-days: 3
