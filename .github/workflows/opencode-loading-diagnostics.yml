@@ -1,0 +1,36 @@
+name: OpenCode loading diagnostic sources
+on:
+  push:
+    branches: [fix/opencode-three-minute-loading]
+    paths: [.github/workflows/opencode-loading-diagnostics.yml]
+permissions:
+  contents: read
+jobs:
+  sources:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Collect only timeout test and startup sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p TEST-loading-sources
+          git grep -l -e 'reports the connect timeout when host health consumes' -e 'OpenCode startup timed out' -e 'native-flat native provider directory full mode' -- src scripts > TEST-loading-sources/paths.txt
+          cat TEST-loading-sources/paths.txt
+          while IFS= read -r file; do
+            mkdir -p "TEST-loading-sources/$(dirname "$file")"
+            cp "$file" "TEST-loading-sources/$file"
+          done < TEST-loading-sources/paths.txt
+          for file in src/services/opencode/OpenCodeHostManager.ts src/features/runtimeProviderManagement/adapters/opencode/OpenCodeProviderManagementAdapter.ts scripts/smoke/windows-runtime-opencode-provider-json.mjs; do
+            mkdir -p "TEST-loading-sources/$(dirname "$file")"
+            cp "$file" "TEST-loading-sources/$file"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: opencode-loading-source-diagnosis
+          path: TEST-loading-sources
+          retention-days: 3
