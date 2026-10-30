@@ -1,0 +1,179 @@
+name: TEST V2 summary default candidate
+
+on:
+  push:
+    branches: [TEST/opencode-v2-summary-20261030]
+    paths: [.github/workflows/TEST-opencode-v2-summary.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  qualify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: e63fa3728a5a2946014e499ec604727c00fcb18a
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.3.11'
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - name: Require the exact reviewed base and source blobs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = e63fa3728a5a2946014e499ec604727c00fcb18a
+          test "$(git rev-parse HEAD:src/features/runtimeProviderManagement/adapters/opencode/OpenCodeProviderManagementAdapter.ts)" = 33af5b6add5f42879534620397e5cb434a85d820
+          test "$(git rev-parse HEAD:src/features/runtimeProviderManagement/adapters/opencode/OpenCodeV2DefaultModels.test.ts)" = 1e4b4dab9876711b22e569cf7f37a4693fa790cc
+          mkdir -p "$RUNNER_TEMP/TEST-v2-summary-evidence"
+      - name: Install the frozen dependency graph
+        run: bun install --frozen-lockfile
+      - name: Add the regression to the existing isolated test
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          p = Path('src/features/runtimeProviderManagement/adapters/opencode/OpenCodeV2DefaultModels.test.ts')
+          text = p.read_text()
+          def replace_once(old, new):
+              global text
+              assert text.count(old) == 1, f'Expected exactly one anchor: {old[:90]}'
+              text = text.replace(old, new, 1)
+          anchor = "      return Object.fromEntries(result.value.entries.map(entry => [entry.providerId, entry.defaultModelId]))\n    }\n    try {"
+          helper = """      return Object.fromEntries(result.value.entries.map(entry => [entry.providerId, entry.defaultModelId]))
+              }
+              const assertSummaryDefault = async (directory, expected) => {
+                const previous = anonymousInventoryOnly, probes = tests
+                anonymousInventoryOnly = true
+                try {
+                  const before = await preferences.readOpenCodeManagedDefaultSelection(directory)
+                  const result = await adapter.loadDirectory({
+                    runtimeId: 'opencode', projectPath: directory, summary: true,
+                    query: 'deepseek', filter: 'connected', limit: 1,
+                  })
+                  assert.equal(result.ok, true, JSON.stringify(result))
+                  assert.equal(result.value.entries.length, 1)
+                  assert.equal(result.value.entries[0].providerId, 'deepseek')
+                  assert.equal(result.value.entries[0].defaultModelId, expected,
+                    'V2 summary must preserve the stored default')
+                  assert.equal(result.value.returnedCount, 1)
+                  assert.equal(result.value.totalCount, 1)
+                  assert.equal(result.value.limit, 1)
+                  assert.equal(result.value.nextCursor, null)
+                  assert.deepEqual(await preferences.readOpenCodeManagedDefaultSelection(directory), before)
+                  assert.equal(tests, probes, 'A summary is a passive read')
+                } finally { anonymousInventoryOnly = previous }
+              }
+              try {"""
+          # The embedded child script uses four-space indentation.
+          lines = helper.splitlines()
+          helper = lines[0] + '\n' + '\n'.join(line[10:] if line.startswith('          ') else line for line in lines[1:])
+          replace_once(anchor, helper)
+          anchor = "      assert.equal((await directoryDefaults(project)).opencode, null, 'Managed selection replaces the native default in other provider rows')"
+          replace_once(anchor, anchor + "\n      await assertSummaryDefault(project, 'deepseek/chat')\n      await assertSummaryDefault(other, 'deepseek/chat')")
+          anchor = "      assert.equal((await directoryDefaults(project)).deepseek, 'deepseek/reasoner')\n      assert.equal((await directoryDefaults(other)).deepseek, 'deepseek/chat')"
+          replace_once(anchor, anchor + "\n      await assertSummaryDefault(project, 'deepseek/reasoner')\n      await assertSummaryDefault(other, 'deepseek/chat')")
+          anchor = "      assert.equal(cleared.value.defaultModelSource, 'all_projects')\n      assert.equal((await directoryDefaults(project)).deepseek, 'deepseek/chat')"
+          replace_once(anchor, anchor + "\n      await assertSummaryDefault(project, 'deepseek/chat')\n      await assertSummaryDefault(other, 'deepseek/chat')")
+          anchor = "      assert.equal(fallbackDirectory.opencode, null, 'No native or managed directory default is invented')"
+          replace_once(anchor, anchor + "\n      await assertSummaryDefault(project, null)\n      await assertSummaryDefault(other, null)")
+          p.write_text(text)
+          PY
+      - name: Prove the original implementation fails the exact new assertion
+        shell: bash
+        run: |
+          set -uo pipefail
+          log="$RUNNER_TEMP/TEST-v2-summary-evidence/before.log"
+          bun test src/features/runtimeProviderManagement/adapters/opencode/OpenCodeV2DefaultModels.test.ts --timeout 30000 > "$log" 2>&1
+          result=$?
+          cat "$log"
+          test "$result" -ne 0 || exit 1
+          grep -F 'V2 summary must preserve the stored default' "$log" || exit 1
+      - name: Apply only the successful V2 summary overlay
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          p = Path('src/features/runtimeProviderManagement/adapters/opencode/OpenCodeProviderManagementAdapter.ts')
+          text = p.read_text()
+          old = """    if (input.summary) {
+                return {
+                  ok: true,
+                  value: buildSummaryProviderDirectory({
+                    inventory,
+                    query: input.query,
+                    filter: input.filter,
+                    limit: input.limit,
+                    cursor: input.cursor,
+                  }),
+                }
+              }"""
+          new = """    if (input.summary) {
+                const directory = buildSummaryProviderDirectory({
+                  inventory,
+                  query: input.query,
+                  filter: input.filter,
+                  limit: input.limit,
+                  cursor: input.cursor,
+                })
+                return {
+                  ok: true,
+                  value: inventory.readGeneration === 'v2'
+                    ? {
+                        ...directory,
+                        entries: await applyOpenCodeV2DirectoryDefaultSelection(
+                          directory.entries,
+                          inventory.projectPath,
+                        ),
+                      }
+                    : directory,
+                }
+              }"""
+          def dedent_after_first(value):
+              lines = value.splitlines()
+              return lines[0] + '\n' + '\n'.join(line[10:] for line in lines[1:])
+          old, new = dedent_after_first(old), dedent_after_first(new)
+          assert text.count(old) == 1, 'Summary branch must match exactly once'
+          p.write_text(text.replace(old, new, 1))
+          PY
+          git diff --check
+          git diff -- src/features/runtimeProviderManagement/adapters/opencode/OpenCodeProviderManagementAdapter.ts src/features/runtimeProviderManagement/adapters/opencode/OpenCodeV2DefaultModels.test.ts > "$RUNNER_TEMP/TEST-v2-summary-evidence/candidate.patch"
+      - name: Verify fixed defaults and unchanged V1 provider behavior
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun test src/features/runtimeProviderManagement/adapters/opencode/OpenCodeV2DefaultModels.test.ts src/features/runtimeProviderManagement/adapters/opencode/OpenCodeV2DefaultModelsRefresh.test.ts src/features/runtimeProviderManagement/adapters/opencode/OpenCodeV2ProviderDirectory.test.ts --timeout 30000 2>&1 | tee "$RUNNER_TEMP/TEST-v2-summary-evidence/after-defaults.log"
+          bun test src/features/runtimeProviderManagement/adapters/opencode/OpenCodeProviderManagementAdapter.test.ts --timeout 30000 2>&1 | tee "$RUNNER_TEMP/TEST-v2-summary-evidence/v1-adapter.log"
+          bun test src/features/runtimeProviderManagement/adapters/opencode/OpenCodeProviderManagementAdapter.v2-routing.test.ts --timeout 30000 2>&1 | tee "$RUNNER_TEMP/TEST-v2-summary-evidence/v2-routing.log"
+      - name: Publish only a clean candidate branch, never main or the PR branch
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = e63fa3728a5a2946014e499ec604727c00fcb18a
+          git config user.name 777genius
+          git config user.email 13103045+777genius@users.noreply.github.com
+          git add -- src/features/runtimeProviderManagement/adapters/opencode/OpenCodeProviderManagementAdapter.ts src/features/runtimeProviderManagement/adapters/opencode/OpenCodeV2DefaultModels.test.ts
+          test "$(git diff --cached --name-only | wc -l | tr -d ' ')" = 2
+          git diff --cached --check
+          git -c core.hooksPath=/dev/null commit -m 'fix(opencode): preserve managed defaults in V2 summary catalogs'
+          test "$(git rev-parse HEAD^)" = e63fa3728a5a2946014e499ec604727c00fcb18a
+          git rev-parse HEAD | tee "$RUNNER_TEMP/TEST-v2-summary-evidence/candidate-sha.txt"
+          gh auth setup-git
+          git push origin HEAD:refs/heads/TEST/opencode-v2-summary-candidate-20261030
+      - name: Preserve baseline, fixed regression and candidate diff
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: TEST-v2-summary-candidate-${{ github.run_id }}
+          path: ${{ runner.temp }}/TEST-v2-summary-evidence/
+          if-no-files-found: error
+          retention-days: 7
