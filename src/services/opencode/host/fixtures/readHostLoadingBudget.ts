@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, realpath, rm } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { mock, spyOn } from 'bun:test'
+import { openCodeV2Dialect } from '../../compatibility/OpenCodeV2Registry.js'
 
 const scenario = process.argv[2]
 assert(scenario && ['slow', 'near-limit', 'caller-limit', 'expired', 'abort', 'tampered'].includes(scenario))
@@ -43,7 +44,7 @@ mock.module('../OpenCodeV2GraphFiles.js', () => ({ collectOpenCodeV2GraphFiles: 
 try {
   const { acquireOpenCodeV2ReadHost, assertOpenCodeV2EndpointAuthority } = await import('../OpenCodeHostNativeAdapter.js')
   const native = { executablePath: path.join(root, 'TEST-opencode'), executableSha256: digest, version: '2.1.4',
-    engineVersion: '2.1.4', dialect: 'current', generation: 'v2' } as Parameters<typeof acquireOpenCodeV2ReadHost>[0]
+    engineVersion: '2.1.4', dialect: openCodeV2Dialect('2.1.4'), generation: 'v2' } as Parameters<typeof acquireOpenCodeV2ReadHost>[0]
   let host: Awaited<ReturnType<typeof acquireOpenCodeV2ReadHost>> | undefined, failure: unknown
   try {
     host = await acquireOpenCodeV2ReadHost(native, project, {
@@ -68,8 +69,6 @@ try {
   console.log(JSON.stringify({ scenario, elapsedMs: now - startedAt, removed, ok: true }))
 } finally {
   clock.mockRestore()
-  // Refuse to discard diagnostics under an unexpectedly live child. The peer also
-  // has its own finite watchdog and exits on IPC disconnect.
   let gone = !pid
   if (pid) try { process.kill(pid, 0) } catch (error) { gone = (error as NodeJS.ErrnoException).code === 'ESRCH' }
   if (gone) await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })

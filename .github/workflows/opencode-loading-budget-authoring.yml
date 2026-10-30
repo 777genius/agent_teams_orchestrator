@@ -2,7 +2,6 @@ name: OpenCode loading budget candidate
 on:
   push:
     branches: [fix/opencode-three-minute-loading]
-    paths: [.github/apply-opencode-loading-budget.ts, .github/workflows/opencode-loading-budget-authoring.yml]
 permissions:
   contents: read
 jobs:
