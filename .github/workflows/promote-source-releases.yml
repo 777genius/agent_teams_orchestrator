@@ -1,0 +1,32 @@
+name: Promote Verified Source Releases
+
+on:
+  workflow_run:
+    workflows: [Release Runtime, Runtime Source Release]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: promote-verified-source-releases
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # Always use trusted default-branch policy, never code from the triggering tag.
+      - uses: actions/checkout@v6
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Test publication safety contracts
+        run: python3 -m unittest discover -s scripts/release -p 'test_*.py'
+      - name: Reconcile source drafts with public stable binary releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/release/promote-source-releases.py --apply
