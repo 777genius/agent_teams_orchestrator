@@ -135,7 +135,7 @@ describe('OpenCodeInventoryService parsers', () => {
     expect(OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS).toBe(180_000)
     expect(OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS).toBe(30_000)
     expect(OPEN_CODE_PROBE_TIMEOUT_MS).toBe(10_000)
-    expect(OPEN_CODE_MODEL_LIST_TIMEOUT_MS).toBe(30_000)
+    expect(OPEN_CODE_MODEL_LIST_TIMEOUT_MS).toBe(180_000)
   })
 
   test('queries the full OpenCode model inventory, not only the opencode provider', () => {

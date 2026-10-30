@@ -42,13 +42,15 @@ describe('execution host ownership and cleanup', () => {
   test('owner initialization budget is platform-specific without changing other platforms', () => {
     expect(openCodeV2RunInitializationMs('win32')).toBe(300_000)
     expect(openCodeV2RunInitializationMs('darwin')).toBe(300_000)
-    expect(openCodeV2RunInitializationMs('linux')).toBe(90_000)
+    expect(openCodeV2RunInitializationMs('linux')).toBe(180_000)
   })
   for (const mode of ['standalone-windows', 'standalone-posix', 'owner-deadline-posix', 'transport-error'] as const)
     test(`actual child watchdog retains its original owner deadline (${mode})`, async () => {
       const source = await readFile(path.resolve(import.meta.dir, '../../../entrypoints/opencodeV2ExecutionServer.ts'), 'utf8')
       const body = new Bun.Transpiler({ loader: 'ts' }).transformSync(source.slice(source.indexOf('const controller = new AbortController()'))
         .replaceAll('import.meta.url', JSON.stringify('/TEST-entry')))
+      // This watchdog fixture exercises source startup; packaged delivery refusal is tested separately below.
+      const sourceNative: ValidatedExecutionNative = { ...native, runtimeMode: 'source' }
       const base = 1_000_000, originalDeadline = base + 150_000
       let now = base, sequence = 0, completeGraph!: () => void
       const clock = spyOn(Date, 'now').mockImplementation(() => now)
@@ -74,7 +76,7 @@ describe('execution host ownership and cleanup', () => {
         executionRecord: (value: unknown) => value, executionHash, executionProfileGuards: [], readExecutionGraphFailure: () => undefined,
         assertOpenCodeV2Launchable, isOpenCodeV2Identity, openCodeV2EngineVersion,
         prepareExecutionPlatformChild: async () => prepared, readExecutionPlatformBirth: async () => childBirth,
-        resolveOpenCodeV2ExecutionDelivery: async () => ({ runtimeMode: native.runtimeMode, entrySha256: native.entrySha256 }),
+        resolveOpenCodeV2ExecutionDelivery: async () => ({ runtimeMode: sourceNative.runtimeMode, entrySha256: sourceNative.entrySha256 }),
         validateExecutionProfile: async () => {}, assertExecutionProfile: () => {}, openCodeBunVersion: () => 'TEST-bun',
         hashOpenCodeFile: async (file: string) => file === native.bun.path ? native.bun.sha256 : native.entrySha256,
         validateExecutionNative: async () => {},
@@ -92,7 +94,7 @@ describe('execution host ownership and cleanup', () => {
           for (const [id, timer] of [...timers]) if (timer.at <= now) { timers.delete(id); timer.run() }
           await settle()
         }
-        expect([...timers.values()].map(timer => timer.at)).toEqual([base + (platform === 'win32' ? 120_000 : 60_000)])
+        expect([...timers.values()].map(timer => timer.at)).toEqual([base + (openCodeV2RunInitializationMs(platform))])
         if (mode === 'transport-error') {
           // An unhandled transport 'error' must not become an uncaught emitter
           // throw: the entry reports its controlled failure and closes once.
@@ -109,26 +111,26 @@ describe('execution host ownership and cleanup', () => {
         }
         events.emit('message', { type: 'prepare', nonce, leaseOwnerId }); await settle()
         now = base + 20_000
-        events.emit('message', { type: 'start', nonce, leaseOwnerId, namespace: prepared.namespace, password: 'A'.repeat(43), native, profile,
+        events.emit('message', { type: 'start', nonce, leaseOwnerId, namespace: prepared.namespace, password: 'A'.repeat(43), native: sourceNative, profile,
           ...(mode === 'owner-deadline-posix' ? { activationDeadline: originalDeadline } : {}) })
         await settle()
         expect(inspect().startupStage).toBe('graph-validation')
         if (mode === 'owner-deadline-posix') {
-          // The local 60s watchdog is replaced by the owner's absolute
+          // The local platform watchdog is replaced by the owner's absolute
           // initialization deadline, not merely pushed behind it.
           expect([...timers.values()].map(timer => timer.at)).toEqual([originalDeadline])
           await advance(base + 60_001)
           expect(inspect().closing).toBe(false)
           expect(reports).toEqual([])
           await advance(originalDeadline)
-        } else await advance(base + (platform === 'win32' ? 120_000 : 60_000))
+        } else await advance(base + (openCodeV2RunInitializationMs(platform)))
         await settle()
         expect(inspect()).toMatchObject({ closing: true, runtimeReady: false })
         expect(sent.some(value => value.type === 'ready')).toBe(false)
         expect(exits).toEqual([0])
         expect(reports).toHaveLength(1)
         if (mode === 'owner-deadline-posix') expect(reports[0]).toMatchObject({ reason: 'timeout', stage: 'graph-validation', elapsedMs: originalDeadline - base })
-        if (mode !== 'owner-deadline-posix') expect(reports[0]).toMatchObject({ reason: 'timeout', stage: 'graph-validation', elapsedMs: platform === 'win32' ? 120_000 : 60_000 })
+        if (mode !== 'owner-deadline-posix') expect(reports[0]).toMatchObject({ reason: 'timeout', stage: 'graph-validation', elapsedMs: openCodeV2RunInitializationMs(platform) })
       } finally { clock.mockRestore() }
     })
   test('startup readiness preserves the exact acquisition cancellation and original rejection before cleanup', async () => {
