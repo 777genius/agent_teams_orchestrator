@@ -147,6 +147,20 @@ function findTeammateColor(
   return undefined
 }
 
+// Inbox files are named after the member, and file names are case-sensitive on Linux while
+// recipients are matched without regard to case elsewhere: write to the member's own spelling.
+async function canonicalRecipientName(
+  teamName: string,
+  recipientName: string,
+): Promise<string> {
+  const team = await readTeamFileAsync(teamName).catch(() => null)
+  const lower = recipientName.toLowerCase()
+  return (
+    team?.members?.find(member => member.name.toLowerCase() === lower)?.name ??
+    recipientName
+  )
+}
+
 async function handleMessage(
   recipientName: string,
   content: string,
@@ -162,8 +176,10 @@ async function handleMessage(
     getAgentName() || (isTeammate() ? 'teammate' : TEAM_LEAD_NAME)
   const senderColor = getTeammateColor()
 
+  const inboxName = await canonicalRecipientName(teamName, recipientName)
+
   await writeToMailboxVerified(
-    recipientName,
+    inboxName,
     {
       from: senderName,
       text: content,

@@ -2,6 +2,7 @@ import { readdir } from 'node:fs/promises'
 
 import { getSessionId } from '../../bootstrap/state.js'
 import type { AppState } from '../../state/AppState.js'
+import { isAgentSwarmsEnabled } from '../../utils/agentSwarmsEnabled.js'
 import { getCwd } from '../../utils/cwd.js'
 import { logForDebugging } from '../../utils/debug.js'
 import { getTeamsDir } from '../../utils/envUtils.js'
@@ -37,7 +38,7 @@ export async function restoreResumedLeadTeam(
   },
   deps: { readTeams?: () => Promise<TeamEntry[]>; setLeaderTeam?: typeof setLeaderTeamName } = {},
 ): Promise<void> {
-  if (!params.isFullResume || usesCodexNativeConversation()) return
+  if (!params.isFullResume || !isAgentSwarmsEnabled() || usesCodexNativeConversation()) return
   const state = params.getAppState()
   if (getAgentId() || getTeamName(state.teamContext) || state.teamContext) return
   const sessionId = getSessionId()

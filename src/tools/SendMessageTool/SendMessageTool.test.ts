@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
-import { mkdtemp, mkdir, rm, writeFile } from 'fs/promises'
+import { mkdtemp, mkdir, readdir, rm, writeFile } from 'fs/promises'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { resetStateForTests } from '../../bootstrap/state.js'
@@ -31,6 +31,14 @@ describe('SendMessageTool direct message', () => {
     const rows = await readMailbox('alice', 'my-team')
     expect(rows).toHaveLength(1)
     expect(rows[0]).toMatchObject({ from: 'team-lead', text: 'hi', read: false })
+  })
+
+  it("writes to the member's own spelling of the name", async () => {
+    const configPath = join(getInboxPath('Alice', 'my-team'), '..', '..', 'config.json')
+    await mkdir(join(configPath, '..'), { recursive: true })
+    await writeFile(configPath, JSON.stringify({ name: 'my-team', leadAgentId: 'team-lead@my-team', members: [{ agentId: 'Alice@my-team', name: 'Alice' }] }))
+    await SendMessageTool.call({ to: 'alice', summary: 's', message: 'hi' } as any, context, (async () => ({})) as any, undefined as any)
+    expect(await readdir(join(configPath, '..', 'inboxes'))).toEqual(['Alice.json'])
   })
 
   it('fails loudly when the write cannot be verified', async () => {

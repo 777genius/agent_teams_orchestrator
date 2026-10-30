@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { realpath } from 'node:fs/promises'
+import { join } from 'node:path'
 import { getSessionId } from '../../bootstrap/state.js'
 import type { AppState } from '../../state/AppState.js'
 import { getCwd } from '../../utils/cwd.js'
@@ -30,7 +31,7 @@ describe('resumed app lead team context', () => {
     let leader = ''
     await restoreResumedLeadTeam(h.params, { readTeams: async () => [await team('My Display Name', getSessionId(), 'my-team')], setLeaderTeam: name => { leader = name } })
     expect(h.state().teamContext?.teamName).toBe('my-team')
-    expect(h.state().teamContext?.teamFilePath.endsWith('my-team/config.json')).toBe(true)
+    expect(h.state().teamContext?.teamFilePath.endsWith(join('my-team', 'config.json'))).toBe(true)
     expect(leader).toBe('my-team')
   })
   test('leaves state untouched when no or several teams match', async () => {
