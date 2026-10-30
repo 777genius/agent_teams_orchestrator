@@ -1,13 +1,10 @@
-// Temporary, exact-source authoring helper. Removed from the candidate tree;
-// it never commits, updates refs, merges PRs or changes published assets.
+// Temporary exact-source authoring helper; never commits, updates refs or merges.
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { readFileSync, writeFileSync } from 'node:fs'
-
 const repository = '777genius/agent_teams_orchestrator'
-const branch = 'refs/heads/fix/opencode-three-minute-loading'
 assert.equal(process.env.GITHUB_REPOSITORY, repository)
-assert.equal(process.env.GITHUB_REF, branch)
+assert.equal(process.env.GITHUB_REF, 'refs/heads/fix/opencode-three-minute-loading')
 const git = (...args: string[]) => execFileSync('git', args, { encoding: 'utf8' }).trim()
 const ephemeral = ['.github/apply-opencode-loading-budget.ts', '.github/workflows/opencode-loading-budget-authoring.yml']
 const changed: string[] = []
@@ -18,11 +15,10 @@ function edit(file: string, replacements: readonly (readonly [string, string])[]
     content = content.replace(before, after)
   }
   if (imported) { assert(!content.includes(imported)); content = imported + '\n' + content }
-  writeFileSync(file, content)
-  changed.push(file)
+  writeFileSync(file, content); changed.push(file)
 }
 if (!process.argv.includes('--publish-tree')) {
-  assert.equal(git('rev-parse', 'HEAD^'), 'e36564e0ca48faa6b6a1a810208dba4c55f8ee33')
+  execFileSync('git', ['merge-base', '--is-ancestor', 'e36564e0ca48faa6b6a1a810208dba4c55f8ee33', 'HEAD'])
   edit('src/services/opencode/host/OpenCodeHostNativeAdapter.ts', [
     ['Math.min(30_000, context.remainingMs?.() ?? 30_000)', 'Math.min(OPEN_CODE_LOADING_TIMEOUT_MS, context.remainingMs?.() ?? OPEN_CODE_LOADING_TIMEOUT_MS)'],
   ], "import { OPEN_CODE_LOADING_TIMEOUT_MS } from '../OpenCodeLoadingBudget.js'")
@@ -35,7 +31,7 @@ if (!process.argv.includes('--publish-tree')) {
   edit('src/services/opencode/transport/OpenCodeBoundedFetch.ts', [
     ['context.remainingMs?.() ?? 60_000', 'context.remainingMs?.() ?? OPEN_CODE_LOADING_TIMEOUT_MS'],
     ['Math.min(60_000, remaining)', 'Math.min(OPEN_CODE_LOADING_TIMEOUT_MS, remaining)'],
-    ["    const initialization = activation || url.pathname === '/api/location' || url.pathname === '/api/integration'\n    const timer = setTimeout(() => controller.abort(), Math.min(initialization ? 30_000 : 15_000, this.deadline - Date.now()))", "    // All permitted routes are catalog reads (or the no-payload activation barrier).\n    // Keep one shared deadline instead of a shorter per-request loading ceiling.\n    const timer = setTimeout(() => controller.abort(), Math.min(this.deadline - Date.now(), this.context.remainingMs?.() ?? Infinity))"],
+    ["    const initialization = activation || url.pathname === '/api/location' || url.pathname === '/api/integration'\n    const timer = setTimeout(() => controller.abort(), Math.min(initialization ? 30_000 : 15_000, this.deadline - Date.now()))", "    // Catalog reads share the original remaining budget, including body consumption.\n    const timer = setTimeout(() => controller.abort(), Math.min(this.deadline - Date.now(), this.context.remainingMs?.() ?? Infinity))"],
   ], "import { OPEN_CODE_LOADING_TIMEOUT_MS } from '../OpenCodeLoadingBudget.js'")
   edit('src/services/opencode/OpenCodeInventoryService.ts', [
     ['export const OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS = 180_000', 'export const OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS = OPEN_CODE_LOADING_TIMEOUT_MS'],
@@ -62,9 +58,7 @@ if (!process.argv.includes('--publish-tree')) {
   edit('src/entrypoints/opencodeV2ExecutionServer.ts', [
     ["process.platform === 'win32' ? 120_000 : 60_000", 'openCodeV2RunInitializationMs(process.platform)'],
   ])
-  edit('src/services/opencode/execution/OpenCodeV2ActivationDeadline.test.ts', [
-    ['Linux allows 90s:', 'Linux allows 180s:'],
-  ])
+  edit('src/services/opencode/execution/OpenCodeV2ActivationDeadline.test.ts', [['Linux allows 90s:', 'Linux allows 180s:']])
   edit('.github/workflows/ci.yml', [
     ['run: bun test src/cli/packagedOpenCodeDelivery.test.ts', 'run: bun test src/services/opencode/OpenCodeLoadingBudget.test.ts src/services/opencode/host/OpenCodeHostNativeAdapter.loading.test.ts src/services/opencode/transport/OpenCodeBoundedFetch.loading.test.ts src/cli/packagedOpenCodeDelivery.test.ts'],
   ])
@@ -74,17 +68,14 @@ if (!process.argv.includes('--publish-tree')) {
 } else {
   const paths: string[] = JSON.parse(readFileSync('loading-budget-files.json', 'utf8'))
   assert.equal(paths.length, 13)
-  const actual = git('diff', '--name-only').split('\n').filter(Boolean).sort()
-  assert.deepEqual(actual, [...paths].sort(), 'Unexpected changes outside the reviewed patch')
+  assert.deepEqual(git('diff', '--name-only').split('\n').filter(Boolean).sort(), [...paths].sort())
   async function post(route: string, body: unknown): Promise<{ sha: string }> {
     const response = await fetch(`https://api.github.com/repos/${repository}/git/${route}`, {
       method: 'POST', headers: { Authorization: `Bearer ${process.env.GH_TOKEN}`, Accept: 'application/vnd.github+json', 'Content-Type': 'application/json' },
       body: JSON.stringify(body), signal: AbortSignal.timeout(60_000),
     })
     assert(response.ok, `Git object upload failed: ${response.status}`)
-    const value = await response.json() as { sha: string }
-    assert.match(value.sha, /^[a-f0-9]{40}$/)
-    return value
+    const value = await response.json() as { sha: string }; assert.match(value.sha, /^[a-f0-9]{40}$/); return value
   }
   const entries: { path: string; mode: string; type: string; sha: string | null }[] = []
   for (const file of paths) {
