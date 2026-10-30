@@ -29,6 +29,7 @@ import { jsonParse, jsonStringify } from './slowOperations.js'
 import type { BackendType } from './swarm/backends/types.js'
 import { TEAM_LEAD_NAME } from './swarm/constants.js'
 import { sanitizePathComponent } from './tasks.js'
+import { safeWindowsPathSegment } from './windowsReservedNames.js'
 import { getAgentName, getTeammateColor, getTeamName } from './teammate.js'
 import {
   isNativeAttachmentMailboxMessage,
@@ -179,7 +180,8 @@ async function sleepMs(ms: number): Promise<void> {
 export function getInboxPath(agentName: string, teamName?: string): string {
   const team = teamName || getTeamName() || 'default'
   const safeTeam = sanitizePathComponent(team)
-  const safeAgentName = sanitizePathComponent(agentName)
+  // Same file name the app uses for inboxes/<member>.json: member names allow [a-zA-Z0-9._-].
+  const safeAgentName = safeWindowsPathSegment(agentName.replace(/[^a-zA-Z0-9._-]/g, '-'))
   const inboxDir = join(getTeamsDir(), safeTeam, 'inboxes')
   const fullPath = join(inboxDir, `${safeAgentName}.json`)
   logForDebugging(

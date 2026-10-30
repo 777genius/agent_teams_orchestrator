@@ -191,7 +191,7 @@ jobs:
         run: bun test src/services/codexNative src/components/MessageSelector.test.ts src/utils/sessionStorage.persistence.test.ts src/utils/cleanup.codexLocks.test.ts
 
       - name: Test mailbox publications and lifecycle
-        run: bun test src/utils/teammateMailbox.test.ts src/hooks/ordinaryMailboxMessage.test.ts src/cli/print.groupMailbox.test.ts
+        run: bun test src/utils/teammateMailbox.test.ts src/hooks/ordinaryMailboxMessage.test.ts src/cli/print.groupMailbox.test.ts src/tools/AgentTool/AgentTool.teamScope.test.ts src/tools/SendMessageTool/SendMessageTool.test.ts src/services/teamBootstrap/resumedLeadTeam.test.ts
 
       - name: Test task change ledger
         run: bun run test:task-change-ledger

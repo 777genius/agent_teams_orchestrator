@@ -37,6 +37,7 @@ import {
   createShutdownRejectedMessage,
   createShutdownRequestMessage,
   writeToMailbox,
+  writeToMailboxVerified,
 } from '../../utils/teammateMailbox.js'
 import { resumeAgentBackground } from '../AgentTool/resumeAgent.js'
 import { SEND_MESSAGE_TOOL_NAME } from './constants.js'
@@ -146,6 +147,20 @@ function findTeammateColor(
   return undefined
 }
 
+// Inbox files are named after the member, and file names are case-sensitive on Linux while
+// recipients are matched without regard to case elsewhere: write to the member's own spelling.
+async function canonicalRecipientName(
+  teamName: string,
+  recipientName: string,
+): Promise<string> {
+  const team = await readTeamFileAsync(teamName).catch(() => null)
+  const lower = recipientName.toLowerCase()
+  return (
+    team?.members?.find(member => member.name.toLowerCase() === lower)?.name ??
+    recipientName
+  )
+}
+
 async function handleMessage(
   recipientName: string,
   content: string,
@@ -154,12 +169,17 @@ async function handleMessage(
 ): Promise<{ data: MessageOutput }> {
   const appState = context.getAppState()
   const teamName = getTeamName(appState.teamContext)
+  if (!teamName) {
+    throw new Error(`Not in a team context: cannot deliver to "${recipientName}".`)
+  }
   const senderName =
     getAgentName() || (isTeammate() ? 'teammate' : TEAM_LEAD_NAME)
   const senderColor = getTeammateColor()
 
-  await writeToMailbox(
-    recipientName,
+  const inboxName = await canonicalRecipientName(teamName, recipientName)
+
+  await writeToMailboxVerified(
+    inboxName,
     {
       from: senderName,
       text: content,
