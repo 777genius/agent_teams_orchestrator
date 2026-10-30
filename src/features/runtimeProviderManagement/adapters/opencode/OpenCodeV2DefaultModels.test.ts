@@ -29,7 +29,7 @@ test('V2 defaults persist across provider catalogs and CLI reads, isolate projec
     const native = { generation: 'v2', version: '2.1.4', engineVersion: '2.1.4', dialect: 'v2-2.1.4',
       executablePath: path.join(root, 'TEST-opencode'), executableSha256: 'a'.repeat(64), packageName: null }
     const selected = { native, policy: { generation: 'v2', version: native.version }, fingerprint: null }
-    let tests = 0, valid = true, proof = false, hasNativeDefault = true
+    let tests = 0, valid = true, proof = false, hasNativeDefault = true, anonymousInventoryOnly = false
     const model = { modelId: 'deepseek/chat', providerId: 'deepseek', displayName: 'Chat', sourceLabel: 'native',
       catalogStatus: 'active', availability: 'untested', free: false, default: false,
       declaredInputModalities: ['text'], accessKind: 'credentialed', routeKind: 'catalog_provider',
@@ -54,6 +54,12 @@ test('V2 defaults persist across provider catalogs and CLI reads, isolate projec
           readModel({ id, modelID: id, providerID, enabled: true, status: 'active', variants: [],
             capabilities: { tools: true, input: ['text'], output: ['text'] }, limit: { context: 8192, output: 512 } })),
       })
+      if (anonymousInventoryOnly) {
+        value.readStatus.models = value.readStatus.models.filter(row => row.providerId === 'opencode')
+        value.readStatus.providers = value.readStatus.providers.filter(row => row.id === 'opencode')
+        value.models = value.models.filter(id => id.startsWith('opencode/'))
+        value.connectedProviders = [{ id: 'deepseek', authHint: 'api', source: 'credentials', credentialScopes: ['managed'] }]
+      }
       if (!hasNativeDefault) value.models = ['opencode/fallback']
       return value
     }
@@ -99,6 +105,32 @@ test('V2 defaults persist across provider catalogs and CLI reads, isolate projec
       assert.equal(status.authenticated, false)
       assert.equal(status.capabilities.teamLaunch, false)
       assert.equal(status.modelCatalog.defaultLaunchModel, null)
+      // The real passive host has no saved credential. Its anonymous rows are
+      // not evidence that a validated selected-account preference was retired.
+      anonymousInventoryOnly = true
+      const storedBeforeRead = await preferences.readOpenCodeManagedDefaultSelection(project)
+      const partialView = await adapter.loadView({ runtimeId: 'opencode', projectPath: project })
+      assert.equal(partialView.ok, true, JSON.stringify(partialView))
+      assert.equal(partialView.value.defaultModel, 'deepseek/chat')
+      assert.equal(partialView.value.defaultModelSource, 'all_projects')
+      const partialDirectory = await adapter.loadDirectory({ runtimeId: 'opencode', projectPath: project, limit: null })
+      assert.equal(partialDirectory.ok, true, JSON.stringify(partialDirectory))
+      const account = partialDirectory.value.entries.find(row => row.providerId === 'deepseek')
+      assert.equal(account.defaultModelId, 'deepseek/chat')
+      assert.equal(account.modelCount, null, 'The account catalog is unknown, not empty')
+      const partialCli = await getProviderModels('opencode', { getOpenCodeInventorySnapshot: async () => snapshot(project) })
+      assert.equal(partialCli.defaultModel, 'deepseek/chat')
+      assert.equal(partialCli.models.some(row => row.id === 'deepseek/chat'), false)
+      const partialStatus = (await getUnifiedRuntimeStatusPayload('opencode', {
+        getOpenCodeInventorySnapshot: async () => snapshot(project),
+      })).providers.opencode
+      assert.equal(partialStatus.modelCatalog.defaultModelId, 'opencode/builtin-free', 'Only a listed row is marked in the passive catalog')
+      assert.equal(partialStatus.modelCatalog.defaultLaunchModel, null, 'The display fallback is never launch authority')
+      assert.equal(partialStatus.authenticated, false)
+      assert.equal(partialStatus.capabilities.teamLaunch, false)
+      assert.deepEqual(await preferences.readOpenCodeManagedDefaultSelection(project), storedBeforeRead)
+      assert.equal(tests, 0, 'Passive reads cannot probe, substitute or rewrite the saved selection')
+      anonymousInventoryOnly = false
       model.modelId = 'deepseek/reasoner'
       const local = await adapter.setDefaultModel({ ...input, modelId: model.modelId, scope: 'project' })
       assert.equal(local.ok, true, JSON.stringify(local))

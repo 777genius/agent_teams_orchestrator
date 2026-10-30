@@ -5,7 +5,9 @@ import { loadOpenCodeV2ProviderModels, testOpenCodeV2ProviderModel } from './Ope
 import type { ClearProjectDefaultModelInput, ProviderDirectoryEntry, ProviderManagementResult, ProviderManagementView, SetDefaultModelInput } from '../../domain/types.js'
 import type { inspectOpenCodeReadSelection } from '../../../../services/opencode/compatibility/OpenCodeNativeIdentity.js'
 
-/** A saved model is a preference only. It does not mint authentication or launch proof. */
+/** A saved model is a preference only. It does not mint authentication or launch proof.
+ * The passive inventory is credential-free, not a complete selected-account catalog.
+ * Absence there must not replace a paid preference with a different model. */
 export async function applyOpenCodeV2DefaultSelection(view: ProviderManagementView, nativeDefault: string | null = null): Promise<ProviderManagementView> {
   const project = await canonicalizeOpenCodeProjectPath(view.projectPath)
   const defaults = await readOpenCodeManagedDefaultSelection(project)
@@ -20,6 +22,8 @@ export async function applyOpenCodeV2DefaultSelection(view: ProviderManagementVi
     configuredModels: view.configuredModels.map(model => ({ ...model, default: model.modelId === (defaultModel ?? fallbackModel) })) }
 }
 
+/** Provider rows carry the saved preference, even when their scoped model count is
+ * unknown. Runtime modelCatalog.defaultModelId instead marks a listed display row. */
 export async function applyOpenCodeV2DirectoryDefaultSelection(entries: ProviderDirectoryEntry[], projectPath: string): Promise<ProviderDirectoryEntry[]> {
   const project = await canonicalizeOpenCodeProjectPath(projectPath)
   const { defaultModel } = await readOpenCodeManagedDefaultSelection(project)
