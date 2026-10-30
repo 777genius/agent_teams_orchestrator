@@ -92,6 +92,34 @@ describe('SendMessageTool direct message', () => {
     await expect(send({ to: 'atlsa', message: { type: 'shutdown_request' } })).rejects.toThrow(/UNKNOWN_RECIPIENT/)
     expect(existsSync(getInboxPath('atlsa', 'my-team'))).toBe(false)
   })
+
+  it('refuses a plan approval to a recipient outside the team', async () => {
+    await writeTeamConfig(['team-lead', 'atlas'])
+    const lead = { getAppState: () => ({ teamContext: { teamName: 'my-team', leadAgentId: 'team-lead@my-team', teammates: {} }, toolPermissionContext: { mode: 'default' }, agentNameRegistry: new Map(), tasks: {} }) } as any
+    await expect(send({ to: 'atlsa', message: { type: 'plan_approval_response', request_id: 'r1', approve: true } }, lead)).rejects.toThrow(/UNKNOWN_RECIPIENT/)
+    expect(await inboxFiles()).toEqual([])
+  })
+
+  it('keeps the config.json spelling when members.meta.json spells the name differently', async () => {
+    await writeTeamConfig(['team-lead', 'atlas'])
+    await writeMembersMeta([{ name: 'Atlas' }])
+    await send({ to: 'ATLAS', summary: 's', message: 'hi' })
+    expect(await inboxFiles()).toEqual(['atlas.json'])
+  })
+
+  it('refuses when neither config.json nor members.meta.json exists', async () => {
+    await expect(send({ to: 'atlas', summary: 's', message: 'hi' })).rejects.toThrow(/TEAM_CONFIG_UNAVAILABLE/)
+    expect(await inboxFiles()).toEqual([])
+  })
+
+  it('does not call a name unknown while config.json is unreadable', async () => {
+    await mkdir(getTeamDir('my-team'), { recursive: true })
+    await writeFile(getTeamFilePath('my-team'), '{"members": [')
+    await writeMembersMeta([{ name: 'nova' }])
+    await expect(send({ to: 'atlas', summary: 's', message: 'hi' })).rejects.toThrow(/^TEAM_CONFIG_UNAVAILABLE/)
+    await send({ to: 'nova', summary: 's', message: 'hi' })
+    expect(await inboxFiles()).toEqual(['nova.json'])
+  })
 })
 
 describe('SendMessageTool without team context', () => {

@@ -177,9 +177,10 @@ async function readMembersMetaRecords(teamName: string): Promise<unknown[]> {
   }
 }
 
-// Same rules as the desktop app's roster (collectExplicitTeamMembers): config.json members
+// Membership follows the desktop app's roster (collectExplicitTeamMembers): config.json members
 // first, then members.meta.json, where an entry with a numeric removedAt drops the member and
-// any other entry adds it under its own spelling. Keyed by the lower-cased name.
+// any other entry adds a member that is not there yet. The config.json spelling wins, since the
+// runtime names inbox files after it. Keyed by the lower-cased name.
 async function readTeamRoster(
   teamName: string,
 ): Promise<{ configReadable: boolean; members: Map<string, string> }> {
@@ -196,10 +197,11 @@ async function readTeamRoster(
   for (const record of metaRecords) {
     const name = memberRecordName(record)
     if (!name) continue
+    const key = name.toLowerCase()
     if (typeof (record as { removedAt?: unknown }).removedAt === 'number') {
-      members.delete(name.toLowerCase())
-    } else {
-      members.set(name.toLowerCase(), name)
+      members.delete(key)
+    } else if (!members.has(key)) {
+      members.set(key, name)
     }
   }
   return { configReadable: config !== null, members }
@@ -231,9 +233,10 @@ async function resolveTeamRecipient(
   if (member) {
     return { teamName, recipient: member }
   }
-  if (!configReadable && members.size === 0) {
+  // Without config.json the roster is incomplete, so a name missing from it is not proof of a typo.
+  if (!configReadable) {
     throw new Error(
-      `TEAM_CONFIG_UNAVAILABLE: cannot read the member list of team "${teamName}", nothing was sent to "${requested}".`,
+      `TEAM_CONFIG_UNAVAILABLE: cannot read the member list of team "${teamName}" right now, nothing was sent to "${requested}". Retry shortly.`,
     )
   }
 
