@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { realpath } from 'node:fs/promises'
 import { join } from 'node:path'
 import { getSessionId } from '../../bootstrap/state.js'
@@ -20,6 +20,13 @@ function harness() {
 }
 
 describe('resumed app lead team context', () => {
+  // The app starts leads with agent teams enabled; do not depend on the developer's shell.
+  const original = process.env.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS
+  beforeEach(() => { process.env.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS = '1' })
+  afterEach(() => {
+    if (original === undefined) delete process.env.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS
+    else process.env.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS = original
+  })
   test('re-attaches the single team that names this session as lead', async () => {
     const h = harness()
     await restoreResumedLeadTeam(h.params, { readTeams: async () => [await team('my-team', getSessionId()), await team('other', 'other-session')], setLeaderTeam: () => {} })
