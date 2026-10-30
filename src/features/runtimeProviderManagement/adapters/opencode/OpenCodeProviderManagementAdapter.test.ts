@@ -815,14 +815,14 @@ describe('OpenCodeProviderManagementAdapter', () => {
       {
         projectPath: '/tmp/project',
         hostLifetime: 'process',
-        healthTimeoutMs: 10_000,
+        healthTimeoutMs: 180_000,
         preparedProfile: true,
         includeAppMcp: false,
       },
       {
         projectPath: '/tmp/project',
         hostLifetime: 'process',
-        healthTimeoutMs: 10_000,
+        healthTimeoutMs: 180_000,
         preparedProfile: true,
         includeAppMcp: false,
       },
