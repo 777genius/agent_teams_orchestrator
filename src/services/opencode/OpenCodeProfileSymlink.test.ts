@@ -76,6 +76,24 @@ test('retries transient Windows lock contention without broadening POSIX lock er
   }
 })
 
+test('permanent Windows access denial exits after a short bounded retry window', {
+  skip: process.platform !== 'win32',
+}, async () => {
+  const accessDenied = Object.assign(new Error('TEST permanent access denial'), { code: 'EPERM' })
+  let attempts = 0
+  const lock = spyOn(lockfile, 'lock').mockImplementation(async () => {
+    attempts++
+    throw accessDenied
+  })
+  try {
+    await expect(ensureDirectorySymlink(source, target)).rejects.toBe(accessDenied)
+    expect(attempts).toBe(7)
+    expect((await fs.lstat(source)).isDirectory()).toBe(true)
+  } finally {
+    lock.mockRestore()
+  }
+})
+
 for (const kind of ['symlink', 'migration'] as const) {
   test(`abort while waiting for ${kind} lock does not acquire later or remove source`, async () => {
     const lockPath = kind === 'symlink' ? `${source}.prepare-lock` : `${target}.migration-lock`
