@@ -1094,3 +1094,10 @@ describe('teammateMailbox', () => {
     ).toHaveLength(1)
   })
 })
+
+describe('inbox path for dotted member names', () => {
+  it('keeps the dot so the desktop app reads the same inbox file', () => {
+    expect(getInboxPath('ops.bot', 'my-team').endsWith(join('my-team', 'inboxes', 'ops.bot.json'))).toBe(true)
+    expect(getInboxPath('a/../b', 'my-team').endsWith(join('inboxes', 'a-..-b.json'))).toBe(true)
+  })
+})

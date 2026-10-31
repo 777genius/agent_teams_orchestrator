@@ -1,4 +1,6 @@
 import { feature } from 'bun:bundle'
+import { readFile } from 'fs/promises'
+import { join } from 'path'
 import { z } from 'zod/v4'
 import { isReplBridgeActive } from '../../bootstrap/state.js'
 import { getReplBridgeHandle } from '../../bridge/replBridgeHandle.js'
@@ -20,10 +22,16 @@ import { gracefulShutdown } from '../../utils/gracefulShutdown.js'
 import { lazySchema } from '../../utils/lazySchema.js'
 import { parseAddress } from '../../utils/peerAddress.js'
 import { semanticBoolean } from '../../utils/semanticBoolean.js'
-import { jsonStringify } from '../../utils/slowOperations.js'
+import { jsonParse, jsonStringify } from '../../utils/slowOperations.js'
 import type { BackendType } from '../../utils/swarm/backends/types.js'
-import { TEAM_LEAD_NAME } from '../../utils/swarm/constants.js'
-import { readTeamFileAsync } from '../../utils/swarm/teamHelpers.js'
+import {
+  TEAM_LEAD_NAME,
+  USER_RECIPIENT_NAME,
+} from '../../utils/swarm/constants.js'
+import {
+  getTeamDir,
+  readTeamFileAsync,
+} from '../../utils/swarm/teamHelpers.js'
 import {
   getAgentId,
   getAgentName,
@@ -37,6 +45,7 @@ import {
   createShutdownRejectedMessage,
   createShutdownRequestMessage,
   writeToMailbox,
+  writeToMailboxVerified,
 } from '../../utils/teammateMailbox.js'
 import { resumeAgentBackground } from '../AgentTool/resumeAgent.js'
 import { SEND_MESSAGE_TOOL_NAME } from './constants.js'
@@ -146,6 +155,102 @@ function findTeammateColor(
   return undefined
 }
 
+function memberRecordName(record: unknown): string | undefined {
+  if (!record || typeof record !== 'object') return undefined
+  const name = (record as { name?: unknown }).name
+  return typeof name === 'string' && name.trim() ? name.trim() : undefined
+}
+
+// members.meta.json is written by the desktop app next to config.json. A missing or
+// malformed file adds nobody; it never fails the send on its own.
+async function readMembersMetaRecords(teamName: string): Promise<unknown[]> {
+  try {
+    const content = await readFile(
+      join(getTeamDir(teamName), 'members.meta.json'),
+      'utf-8',
+    )
+    const members = (jsonParse(content) as { members?: unknown } | null)
+      ?.members
+    return Array.isArray(members) ? members : []
+  } catch {
+    return []
+  }
+}
+
+// Membership follows the desktop app's roster (collectExplicitTeamMembers): config.json members
+// first, then members.meta.json, where an entry with a numeric removedAt drops the member and
+// any other entry adds a member that is not there yet. The config.json spelling wins, since the
+// runtime names inbox files after it. Keyed by the lower-cased name.
+async function readTeamRoster(
+  teamName: string,
+): Promise<{ configReadable: boolean; members: Map<string, string> }> {
+  const [config, metaRecords] = await Promise.all([
+    readTeamFileAsync(teamName),
+    readMembersMetaRecords(teamName),
+  ])
+  const members = new Map<string, string>()
+  const configMembers: unknown = config?.members
+  for (const record of Array.isArray(configMembers) ? configMembers : []) {
+    const name = memberRecordName(record)
+    if (name) members.set(name.toLowerCase(), name)
+  }
+  for (const record of metaRecords) {
+    const name = memberRecordName(record)
+    if (!name) continue
+    const key = name.toLowerCase()
+    if (typeof (record as { removedAt?: unknown }).removedAt === 'number') {
+      members.delete(key)
+    } else if (!members.has(key)) {
+      members.set(key, name)
+    }
+  }
+  return { configReadable: config !== null, members }
+}
+
+// Resolves a recipient against the team roster. Writing to an unknown name would create a
+// new inbox file that nobody reads, so the send is refused with the list of valid names.
+// Inbox files are named after the member, and file names are case-sensitive on Linux while
+// recipients are matched without regard to case: the member's own spelling is returned.
+async function resolveTeamRecipient(
+  teamName: string | undefined,
+  raw: string,
+  { allowUser }: { allowUser: boolean },
+): Promise<{ teamName: string; recipient: string }> {
+  if (!teamName) {
+    throw new Error(`Not in a team context: cannot deliver to "${raw}".`)
+  }
+  const requested = raw.trim()
+  const key = requested.toLowerCase()
+  if (key === TEAM_LEAD_NAME) {
+    return { teamName, recipient: TEAM_LEAD_NAME }
+  }
+  if (allowUser && key === USER_RECIPIENT_NAME) {
+    return { teamName, recipient: USER_RECIPIENT_NAME }
+  }
+
+  const { configReadable, members } = await readTeamRoster(teamName)
+  const member = members.get(key)
+  if (member) {
+    return { teamName, recipient: member }
+  }
+  // Without config.json the roster is incomplete, so a name missing from it is not proof of a typo.
+  if (!configReadable) {
+    throw new Error(
+      `TEAM_CONFIG_UNAVAILABLE: cannot read the member list of team "${teamName}" right now, nothing was sent to "${requested}". Retry shortly.`,
+    )
+  }
+
+  const valid = new Map(members)
+  valid.set(TEAM_LEAD_NAME, TEAM_LEAD_NAME)
+  if (allowUser) valid.set(USER_RECIPIENT_NAME, USER_RECIPIENT_NAME)
+  const validNames = [...valid.values()].sort((a, b) => a.localeCompare(b))
+  // Only plain messages may go to the user or be broadcast; structured ones may not.
+  const broadcastHint = allowUser ? ' (or "*" to broadcast)' : ''
+  throw new Error(
+    `UNKNOWN_RECIPIENT: "${requested}" is not a member of team "${teamName}"; nothing was sent. Valid recipients: ${validNames.join(', ')}${broadcastHint}. Teammates that are not spawned yet or have left the team cannot receive messages. Retry with one of these names.`,
+  )
+}
+
 async function handleMessage(
   recipientName: string,
   content: string,
@@ -153,13 +258,17 @@ async function handleMessage(
   context: ToolUseContext,
 ): Promise<{ data: MessageOutput }> {
   const appState = context.getAppState()
-  const teamName = getTeamName(appState.teamContext)
+  const { teamName, recipient } = await resolveTeamRecipient(
+    getTeamName(appState.teamContext),
+    recipientName,
+    { allowUser: true },
+  )
   const senderName =
     getAgentName() || (isTeammate() ? 'teammate' : TEAM_LEAD_NAME)
   const senderColor = getTeammateColor()
 
-  await writeToMailbox(
-    recipientName,
+  await writeToMailboxVerified(
+    recipient,
     {
       from: senderName,
       text: content,
@@ -170,16 +279,16 @@ async function handleMessage(
     teamName,
   )
 
-  const recipientColor = findTeammateColor(appState, recipientName)
+  const recipientColor = findTeammateColor(appState, recipient)
 
   return {
     data: {
       success: true,
-      message: `Message sent to ${recipientName}'s inbox`,
+      message: `Message sent to ${recipient}'s inbox`,
       routing: {
         sender: senderName,
         senderColor,
-        target: `@${recipientName}`,
+        target: `@${recipient}`,
         targetColor: recipientColor,
         summary,
         content,
@@ -271,9 +380,13 @@ async function handleShutdownRequest(
   context: ToolUseContext,
 ): Promise<{ data: RequestOutput }> {
   const appState = context.getAppState()
-  const teamName = getTeamName(appState.teamContext)
+  const { teamName, recipient } = await resolveTeamRecipient(
+    getTeamName(appState.teamContext),
+    targetName,
+    { allowUser: false },
+  )
   const senderName = getAgentName() || TEAM_LEAD_NAME
-  const requestId = generateRequestId('shutdown', targetName)
+  const requestId = generateRequestId('shutdown', recipient)
 
   const shutdownMessage = createShutdownRequestMessage({
     requestId,
@@ -282,7 +395,7 @@ async function handleShutdownRequest(
   })
 
   await writeToMailbox(
-    targetName,
+    recipient,
     {
       from: senderName,
       text: jsonStringify(shutdownMessage),
@@ -295,9 +408,9 @@ async function handleShutdownRequest(
   return {
     data: {
       success: true,
-      message: `Shutdown request sent to ${targetName}. Request ID: ${requestId}`,
+      message: `Shutdown request sent to ${recipient}. Request ID: ${requestId}`,
       request_id: requestId,
-      target: targetName,
+      target: recipient,
     },
   }
 }
@@ -437,13 +550,18 @@ async function handlePlanApproval(
   context: ToolUseContext,
 ): Promise<{ data: ResponseOutput }> {
   const appState = context.getAppState()
-  const teamName = appState.teamContext?.teamName
 
   if (!isTeamLead(appState.teamContext)) {
     throw new Error(
       'Only the team lead can approve plans. Teammates cannot approve their own or other plans.',
     )
   }
+
+  const { teamName, recipient } = await resolveTeamRecipient(
+    appState.teamContext?.teamName,
+    recipientName,
+    { allowUser: false },
+  )
 
   const leaderMode = appState.toolPermissionContext.mode
   const modeToInherit = leaderMode === 'plan' ? 'default' : leaderMode
@@ -457,7 +575,7 @@ async function handlePlanApproval(
   }
 
   await writeToMailbox(
-    recipientName,
+    recipient,
     {
       from: TEAM_LEAD_NAME,
       text: jsonStringify(approvalResponse),
@@ -469,7 +587,7 @@ async function handlePlanApproval(
   return {
     data: {
       success: true,
-      message: `Plan approved for ${recipientName}. They will receive the approval and can proceed with implementation.`,
+      message: `Plan approved for ${recipient}. They will receive the approval and can proceed with implementation.`,
       request_id: requestId,
     },
   }
@@ -482,13 +600,18 @@ async function handlePlanRejection(
   context: ToolUseContext,
 ): Promise<{ data: ResponseOutput }> {
   const appState = context.getAppState()
-  const teamName = appState.teamContext?.teamName
 
   if (!isTeamLead(appState.teamContext)) {
     throw new Error(
       'Only the team lead can reject plans. Teammates cannot reject their own or other plans.',
     )
   }
+
+  const { teamName, recipient } = await resolveTeamRecipient(
+    appState.teamContext?.teamName,
+    recipientName,
+    { allowUser: false },
+  )
 
   const rejectionResponse = {
     type: 'plan_approval_response',
@@ -499,7 +622,7 @@ async function handlePlanRejection(
   }
 
   await writeToMailbox(
-    recipientName,
+    recipient,
     {
       from: TEAM_LEAD_NAME,
       text: jsonStringify(rejectionResponse),
@@ -511,7 +634,7 @@ async function handlePlanRejection(
   return {
     data: {
       success: true,
-      message: `Plan rejected for ${recipientName} with feedback: "${feedback}"`,
+      message: `Plan rejected for ${recipient} with feedback: "${feedback}"`,
       request_id: requestId,
     },
   }
