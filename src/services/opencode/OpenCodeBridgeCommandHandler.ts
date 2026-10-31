@@ -1778,6 +1778,22 @@ async function listAppMcpToolsFromResolvedLaunchConfig(
   }
 }
 
+/** Resolve the group-control owner from the same MCP launch configuration
+ * selected by the live host, not from an unrelated child or stale bridge hint. */
+async function readOpenCodeGroupControlBinding(
+  snapshot: OpenCodeProvisioningSnapshot,
+  launchConfig: ResolvedAppMcpLaunchConfig,
+  signal?: AbortSignal,
+): Promise<{ controlUrl: string; context: string } | null> {
+  if (!snapshot.host) {
+    return readOwnedOAuthGroupControlBinding(launchConfig.config, process.env, signal)
+  }
+  const env = { ...snapshot.host.profile.env, ...launchConfig.config.environment }
+  return isBoundGroupChatControl(env.AGENT_TEAMS_BOUND_CONTROL_URL, env.AGENT_TEAMS_BOUND_CONTEXT_JSON)
+    ? { controlUrl: env.AGENT_TEAMS_BOUND_CONTROL_URL!, context: env.AGENT_TEAMS_BOUND_CONTEXT_JSON! }
+    : null
+}
+
 async function readLiveGroupChatRunProofs(
   snapshot: OpenCodeProvisioningSnapshot | null,
   records: OpenCodeSessionRecord[],
@@ -1797,13 +1813,8 @@ async function readLiveGroupChatRunProofs(
       const liveMcp = asRecord(asRecord(snapshot.config)?.mcp)?.[OPEN_CODE_APP_MCP_SERVER_NAME]
       if (!asRecord(liveMcp) || hashStable(liveMcp) !== hashStable(launchConfig.config)) return []
     }
-    const binding = snapshot.host
-      ? (() => {
-          const env = { ...baseEnv, ...launchConfig.config.environment }
-          return { controlUrl: env.AGENT_TEAMS_BOUND_CONTROL_URL, context: env.AGENT_TEAMS_BOUND_CONTEXT_JSON }
-        })()
-      : await readOwnedOAuthGroupControlBinding(launchConfig.config, process.env, phaseContext?.signal)
-    if (!binding || !isBoundGroupChatControl(binding.controlUrl, binding.context)) return []
+    const binding = await readOpenCodeGroupControlBinding(snapshot, launchConfig, phaseContext?.signal)
+    if (!binding) return []
     // Deliberately bypass the persisted/version-scoped tools cache for this run.
     const observed = await listAppMcpToolsFromResolvedLaunchConfig(launchConfig, phaseContext, baseEnv)
     const client = openCodeClientFactory.create(snapshot.host?.baseUrl ?? ownedOAuthHost!.baseUrl, phaseContext ? {
@@ -5290,15 +5301,8 @@ async function runSendMessage(
       const launchConfig = snapshot.host
         ? getRetainedAppMcpLaunchConfig(snapshot.host)
         : await resolveOpenCodeAppMcpLaunchConfig()
-      const binding = snapshot.host
-        ? (() => {
-            const env = { ...snapshot.host!.profile.env, ...launchConfig.config.environment }
-            return { controlUrl: env.AGENT_TEAMS_BOUND_CONTROL_URL, context: env.AGENT_TEAMS_BOUND_CONTEXT_JSON }
-          })()
-        : await readOwnedOAuthGroupControlBinding(launchConfig.config, process.env)
-      if (binding) groupCatalog = await readFreshGroupChatCatalog(teamId, memberName, {
-        controlUrl: binding.controlUrl, context: binding.context,
-      })
+      const binding = await readOpenCodeGroupControlBinding(snapshot, launchConfig)
+      if (binding) groupCatalog = await readFreshGroupChatCatalog(teamId, memberName, binding)
     } catch { /* Unavailable is explicit in the handoff prompt. */ }
     await assertStoredDeliveryAuthority(deliveryRecord, authority)
   }
