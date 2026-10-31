@@ -153,6 +153,73 @@ function executionProbeResult(
 }
 
 describe('OpenCodeProviderManagementAdapter', () => {
+
+  test('directory passes the same remaining deadline through inventory, host and HTTP', async () => {
+    let capturedHostBudget = 0
+    let capturedSignal: AbortSignal | undefined
+    let capturedReadRemaining: (() => number) | undefined
+    const adapter = new OpenCodeProviderManagementAdapter({
+      viewTimeoutMs: 1_000,
+      inventoryService: { probe: async () => {
+        await Bun.sleep(40)
+        return inventory()
+      } },
+      hostManager: {
+        ensureHost: async options => {
+          capturedHostBudget = options.healthTimeoutMs ?? 0
+          capturedSignal = options.abortSignal
+          return host()
+        },
+        releaseHost: async () => {},
+      },
+      clientFactory: { create: (_url, context) => {
+        capturedReadRemaining = context?.remainingMs
+        expect(context?.signal).toBe(capturedSignal)
+        return {
+          getConfigProviders: async () => ({ providers: [], default: {} }),
+          getProviders: async () => ({ all: [], connected: [], default: {} }),
+          getProviderAuth: async () => ({}),
+        }
+      } },
+    })
+    const result = await adapter.loadDirectory({ runtimeId: 'opencode', projectPath: '/tmp/project' })
+    expect(result.ok).toBe(true)
+    expect(capturedSignal).toBeDefined()
+    expect(capturedHostBudget).toBeGreaterThan(0)
+    expect(capturedHostBudget).toBeLessThan(1_000)
+    expect(capturedReadRemaining).toBeDefined()
+    expect(capturedReadRemaining!()).toBeLessThan(1_000)
+  })
+
+  test('directory rejects host readiness after its inventory consumed the shared deadline', async () => {
+    let observedHostAbort = false
+    const adapter = new OpenCodeProviderManagementAdapter({
+      viewTimeoutMs: 500,
+      inventoryService: { probe: async () => {
+        await Bun.sleep(20)
+        return inventory()
+      } },
+      hostManager: {
+        ensureHost: async options => {
+          const signal = options.abortSignal
+          expect(signal).toBeDefined()
+          await new Promise<void>((_, reject) => {
+            const abort = () => { observedHostAbort = true; reject(signal!.reason) }
+            if (signal!.aborted) abort()
+            else signal!.addEventListener('abort', abort, { once: true })
+          })
+          return host()
+        },
+        releaseHost: async () => {},
+      },
+    })
+    const result = await adapter.loadDirectory({ runtimeId: 'opencode', projectPath: '/tmp/project' })
+    expect(result.ok).toBe(false)
+    expect(observedHostAbort).toBe(true)
+    if (!result.ok) expect(result.error.message).toContain('timed out')
+  })
+
+
   test('recovers setup discovery after one cold catalog read without retrying successful endpoints', async () => {
     const initialization: boolean[] = []
     let providerReads = 0
