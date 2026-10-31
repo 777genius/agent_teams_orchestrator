@@ -31,6 +31,7 @@ import {
 } from './OpenCodeProfileManager.js'
 import {
   raceOpenCodeAbortSignal,
+  OpenCodeRuntimeDeadline,
   throwOpenCodeAbortReason,
   waitForOpenCodeAbortableDelay,
 } from './OpenCodeRuntimeDeadline.js'
@@ -305,6 +306,18 @@ export function getOpenCodeInventoryCommandTimeoutMs(args: readonly string[]): n
   return args[0] === 'models'
     ? OPEN_CODE_MODEL_LIST_TIMEOUT_MS
     : OPEN_CODE_PROBE_TIMEOUT_MS
+}
+
+/** Each sequential CLI stage consumes the original full-inventory budget. */
+export function getOpenCodeRemainingInventoryCommandTimeoutMs(
+  args: readonly string[],
+  remainingMs: (() => number) | undefined,
+): number {
+  const remaining = remainingMs?.() ?? OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS
+  if (!Number.isFinite(remaining) || remaining <= 0) {
+    throw new Error('OpenCode inventory probe timed out')
+  }
+  return Math.max(1, Math.min(getOpenCodeInventoryCommandTimeoutMs(args), Math.floor(remaining)))
 }
 
 function getOpenCodeCatalogRefreshProfile(
@@ -1098,6 +1111,36 @@ export class OpenCodeInventoryService {
     projectPath?: string | null,
     options: OpenCodeInventoryProbeOptions = {},
   ): Promise<OpenCodeInventorySnapshot> {
+    if ((options.mode ?? 'full') !== 'full') {
+      return this.probeWithinDeadline(projectPath, options)
+    }
+    const remaining = Math.min(
+      OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS,
+      options.remainingMs?.() ?? OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS,
+    )
+    if (!Number.isFinite(remaining) || remaining <= 0) {
+      throw new Error('OpenCode inventory probe timed out')
+    }
+    const deadline = new OpenCodeRuntimeDeadline(remaining)
+    const signal = options.abortSignal
+      ? AbortSignal.any([options.abortSignal, deadline.signal])
+      : deadline.signal
+    try {
+      signal.throwIfAborted()
+      return await this.probeWithinDeadline(projectPath, {
+        ...options,
+        abortSignal: signal,
+        remainingMs: () => Math.min(deadline.remainingMs(), options.remainingMs?.() ?? Infinity),
+      })
+    } finally {
+      deadline.dispose()
+    }
+  }
+
+  private async probeWithinDeadline(
+    projectPath?: string | null,
+    options: OpenCodeInventoryProbeOptions = {},
+  ): Promise<OpenCodeInventorySnapshot> {
     let mode = options.mode ?? 'full'
     if (mode === 'passive') {
       const binaryPath = process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH?.trim() || process.env.OPENCODE_BIN_PATH?.trim() || null
@@ -1274,9 +1317,7 @@ export class OpenCodeInventoryService {
             {
               abortSignal: options.abortSignal,
               progress: options.progress,
-              ...(options.refreshModels && args[0] === 'models'
-                ? { timeoutMs: OPEN_CODE_MODEL_LIST_TIMEOUT_MS }
-                : {}),
+              timeoutMs: getOpenCodeRemainingInventoryCommandTimeoutMs(args, options.remainingMs),
             },
           ),
       })
@@ -1344,12 +1385,15 @@ export class OpenCodeInventoryService {
     let modelMetadata = verboseModels.modelMetadata
     let finalModelsResult = modelsResult
     if (mode === 'full' && models.length === 0) {
-      const fallbackModelsResult = await this.execOpenCode(binaryPath, [
+      options.abortSignal?.throwIfAborted()
+      const fallbackModelsArgs = [
         'models',
         ...(options.refreshModels ? ['--refresh'] : []),
-      ], profile, {
+      ]
+      const fallbackModelsResult = await this.execOpenCode(binaryPath, fallbackModelsArgs, profile, {
         abortSignal: options.abortSignal,
         progress: options.progress,
+        timeoutMs: getOpenCodeRemainingInventoryCommandTimeoutMs(fallbackModelsArgs, options.remainingMs),
       })
       finalModelsResult = fallbackModelsResult
       models =
