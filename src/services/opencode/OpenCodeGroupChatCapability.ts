@@ -1,5 +1,6 @@
 import { isBoundGroupChatControl } from '../../utils/groupChatControlClient.js'
 import { hasGroupChatTools } from '../../utils/groupMailbox.js'
+import { createHash } from 'node:crypto'
 import type { OpenCodeProvisioningSnapshot, OpenCodeSessionRecord } from './types.js'
 
 export type OpenCodeGroupChatRunProof = {
@@ -12,6 +13,72 @@ export type OpenCodeGroupChatRunProof = {
   runtimeSessionId: string
   processorReady: true
   groupReactionProtocolVersion?: 1
+}
+
+export type OpenCodeGroupControlBinding = {
+  controlUrl: string
+  context: string
+}
+
+/** The selected xAI endpoint is host-less in observations. For local MCP, read
+ * the bound config that OpenCode actually loaded. For desktop HTTP MCP, verify
+ * the current app-scoped URL AND the live HTTP server's root/transport identity;
+ * a bridge environment alone does not attest another MCP process. */
+export async function readOwnedOAuthGroupControlBinding(
+  config: { type: 'local' | 'remote'; environment?: Record<string, string>; url?: string },
+  environment: NodeJS.ProcessEnv,
+  signal?: AbortSignal,
+): Promise<OpenCodeGroupControlBinding | null> {
+  const appControlUrl = environment.AGENT_TEAMS_BOUND_CONTROL_URL
+  const appContext = environment.AGENT_TEAMS_BOUND_CONTEXT_JSON
+  if (!isBoundGroupChatControl(appControlUrl, appContext)) return null
+
+  if (config.type === 'local') {
+    const controlUrl = config.environment?.AGENT_TEAMS_BOUND_CONTROL_URL
+    const context = config.environment?.AGENT_TEAMS_BOUND_CONTEXT_JSON
+    return controlUrl === appControlUrl && context === appContext
+      ? { controlUrl: controlUrl!, context: context! }
+      : null
+  }
+  if (config.type !== 'remote' || !config.url) return null
+
+  try {
+    const url = new URL(config.url)
+    const appInstance = environment.CLAUDE_TEAM_APP_INSTANCE_ID
+    const appProfile = environment.CLAUDE_TEAM_APP_PROFILE_SCOPE
+    const root = environment.AGENT_TEAMS_MCP_CLAUDE_DIR
+    const context = JSON.parse(appContext!) as Record<string, unknown>
+    const markers = new URLSearchParams(url.hash.slice(1))
+    // This is the app-owned HTTP transport, not an arbitrary remote MCP.
+    if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' ||
+        !url.port || url.pathname !== '/mcp' || url.search || url.username || url.password ||
+        !appInstance || !/^[a-f0-9]{64}$/.test(appProfile ?? '') || !root ||
+        context.appInstanceId !== appInstance ||
+        markers.get('agent-teams-app-instance') !== appInstance ||
+        markers.get('agent-teams-app-profile') !== appProfile ||
+        environment.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL_HASH !==
+          createHash('sha256').update(url.origin + url.pathname).digest('hex')) return null
+
+    const response = await fetch(url.origin + '/health', {
+      redirect: 'error',
+      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(1_500)]) : AbortSignal.timeout(1_500),
+    })
+    if (!response.ok || Number(response.headers.get('content-length') ?? 0) > 8192) return null
+    const raw = await response.text()
+    if (raw.length > 8192) return null
+    const health = JSON.parse(raw) as Record<string, unknown>
+    if (health.schemaVersion !== 1 || health.service !== 'agent-teams-mcp-http' ||
+        health.transport !== 'httpStream' || health.host !== '127.0.0.1' ||
+        health.port !== Number(url.port) || health.endpoint !== '/mcp' ||
+        health.claudeDirHash !== createHash('sha256').update(root).digest('hex') ||
+        typeof health.ownerInstanceId !== 'string' || !health.ownerInstanceId.trim() ||
+        typeof health.launchSpecHash !== 'string' || !/^[a-f0-9]{64}$/.test(health.launchSpecHash)) return null
+
+    return { controlUrl: appControlUrl!, context: appContext! }
+  } catch {
+    if (signal?.aborted) throw signal.reason
+    return null
+  }
 }
 
 // A retained host or exact owned OAuth endpoint, a matching run/session, and
