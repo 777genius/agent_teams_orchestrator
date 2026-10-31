@@ -64,9 +64,26 @@ export async function readOwnedOAuthGroupControlBinding(
       signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(1_500)]) : AbortSignal.timeout(1_500),
     })
     if (!response.ok || Number(response.headers.get('content-length') ?? 0) > 8192) return null
-    const raw = await response.text()
-    if (raw.length > 8192) return null
-    const health = JSON.parse(raw) as Record<string, unknown>
+    const reader = response.body?.getReader()
+    if (!reader) return null
+    const chunks: Uint8Array[] = []
+    let bytes = 0
+    try {
+      while (true) {
+        const next = await reader.read()
+        if (next.done) break
+        bytes += next.value.byteLength
+        if (bytes > 8192) {
+          void reader.cancel().catch(() => undefined)
+          return null
+        }
+        chunks.push(next.value)
+      }
+    } finally {
+      reader.releaseLock()
+    }
+    const health = JSON.parse(new TextDecoder('utf-8', { fatal: true })
+      .decode(Buffer.concat(chunks))) as Record<string, unknown>
     if (health.schemaVersion !== 1 || health.service !== 'agent-teams-mcp-http' ||
         health.transport !== 'httpStream' || health.host !== '127.0.0.1' ||
         health.port !== Number(url.port) || health.endpoint !== '/mcp' ||
