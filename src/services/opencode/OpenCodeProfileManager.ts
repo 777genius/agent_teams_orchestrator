@@ -527,7 +527,10 @@ async function acquireProfileSymlinkLock(
       return release
     } catch (error) {
       if (signal?.aborted) throwOpenCodeAbortReason(signal)
-      if (getErrnoCode(error) !== 'ELOCKED' || attempt >= 120) throw error
+      const code = getErrnoCode(error)
+      const retryableWindowsContention = process.platform === 'win32'
+        && (code === 'EPERM' || code === 'EACCES' || code === 'EBUSY')
+      if ((code !== 'ELOCKED' && !retryableWindowsContention) || attempt >= 120) throw error
       await waitForOpenCodeAbortableDelay(Math.min(25 * 2 ** attempt, 250), signal)
     }
   }
