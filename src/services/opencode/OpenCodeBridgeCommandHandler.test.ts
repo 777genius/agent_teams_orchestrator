@@ -1196,6 +1196,8 @@ describe('OpenCodeBridgeCommandHandler', () => {
     } finally { host.stop(true) }
   })
   test('owned xAI OAuth proves and delivers a named-group message without re-preparing credentials', async () => {
+    const previousBoundControlUrl = process.env.AGENT_TEAMS_BOUND_CONTROL_URL
+    const previousBoundControlContext = process.env.AGENT_TEAMS_BOUND_CONTEXT_JSON
     const groupContext = JSON.stringify({
       appInstanceId: 'owned-xai-test', dataRootFingerprint: 'owned-xai-root', connectionGeneration: 1,
     })
@@ -1232,6 +1234,8 @@ describe('OpenCodeBridgeCommandHandler', () => {
         SYNTHETIC_GROUP_TOOLS: '1',
       }
       process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENV_JSON = JSON.stringify(env)
+      process.env.AGENT_TEAMS_BOUND_CONTROL_URL = env.AGENT_TEAMS_BOUND_CONTROL_URL
+      process.env.AGENT_TEAMS_BOUND_CONTEXT_JSON = env.AGENT_TEAMS_BOUND_CONTEXT_JSON
       liveConfig = (await resolveOpenCodeAppMcpLaunchConfig()).config
       const record = buildRecord({
         selectedModel: 'xai/grok-4.5', toolApprovalMode: 'auto', runtimePid: process.pid,
@@ -1330,6 +1334,10 @@ describe('OpenCodeBridgeCommandHandler', () => {
       expect(prompts).toHaveLength(1)
     } finally {
       host.stop(true)
+      if (previousBoundControlUrl === undefined) delete process.env.AGENT_TEAMS_BOUND_CONTROL_URL
+      else process.env.AGENT_TEAMS_BOUND_CONTROL_URL = previousBoundControlUrl
+      if (previousBoundControlContext === undefined) delete process.env.AGENT_TEAMS_BOUND_CONTEXT_JSON
+      else process.env.AGENT_TEAMS_BOUND_CONTEXT_JSON = previousBoundControlContext
     }
   })
 
