@@ -1256,15 +1256,26 @@ describe('OpenCodeBridgeCommandHandler', () => {
       Client.prototype.listTools = originalClientListTools
       Client.prototype.close = originalClientClose
 
+      // The selected-lane handshake checks the *real* persisted launch
+      // capability, not an arbitrary marker. Keep the synthetic fixture's
+      // stable identity aligned with the host-less OAuth observation snapshot.
+      const expectedCapabilitySnapshotId = `opencode:${hash(JSON.stringify({
+        managedConfigFingerprint: record.managedConfigFingerprint,
+        mcpServers: ['agent-teams'],
+        projectBehaviorFingerprint: record.projectBehaviorFingerprint,
+        projectPath: normalizeOpenCodeProjectIdentity(record.projectPath),
+        providers: [],
+        version: record.opencodeVersion,
+      })).slice(0, 32)}`
       const request = {
         teamName: record.teamId, teamId: record.teamId, laneId: record.laneId, runId: record.runId,
         memberName: record.memberName, requiredCommand: 'opencode.sendMessage',
-        expectedCapabilitySnapshotId: 'existing-run',
+        expectedCapabilitySnapshotId,
       }
       const handshake = async () => {
         const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.handshake', request))
-        expect(result.ok).toBe(true)
-        if (!result.ok || !('server' in result.data)) throw new Error('Expected xAI handshake server')
+        if (!result.ok) throw new Error(`xAI group handshake failed: ${result.error.message}`)
+        if (!('server' in result.data)) throw new Error('Expected xAI handshake server')
         return result.data.server
       }
       const admitted = await handshake()
