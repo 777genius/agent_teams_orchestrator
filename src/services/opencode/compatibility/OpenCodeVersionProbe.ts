@@ -122,7 +122,7 @@ async function versionLauncher(executable: string): Promise<{ command: string; a
 
 /** Private --version admission, including children which inherit its stdout. */
 export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCodeV2ReadRoots,
-  signal?: AbortSignal): Promise<string> {
+  signal?: AbortSignal, acquisitionDeadlineMs?: number): Promise<string> {
   let child: ChildProcess | undefined
   let retired = false
   let helperFailure: NativeHelperFailure | null = null
@@ -141,7 +141,12 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
     const launcher = await versionLauncher(executable)
     signal?.throwIfAborted()
     const ports = nativePorts({}, failure => { helperFailure = failure })
-    const acquisitionMs = versionAcquisitionMs(), deadlineMs = acquisitionMs + VERSION_CLEANUP_MS
+    // A passive display read may reduce acquisition, while owned retirement
+    // retains its normal cleanup allowance. Ordinary callers keep their budget.
+    if (acquisitionDeadlineMs !== undefined && (!Number.isFinite(acquisitionDeadlineMs) || acquisitionDeadlineMs <= Date.now()))
+      throw new Error('selection_unavailable')
+    const acquisitionMs = Math.min(versionAcquisitionMs(), acquisitionDeadlineMs === undefined ? Infinity : Math.max(1, acquisitionDeadlineMs - Date.now()))
+    const deadlineMs = acquisitionMs + VERSION_CLEANUP_MS
     const started = Date.now(), deadline = started + deadlineMs
     const acquisitionDeadline = started + acquisitionMs
     const preexisting = new Map<number, NativeGeneration>()

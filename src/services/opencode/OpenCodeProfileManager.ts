@@ -71,6 +71,7 @@ import {
   readOpenCodeGlobalManagedRuntimePreferences,
   readOpenCodeManagedRuntimePreferences,
 } from './OpenCodeManagedPreferences.js'
+import { readOpenCodeManagedDefaultSelection } from './OpenCodeManagedDefaultSelection.js'
 import {
   CLAUDE_MULTIMODEL_CACHE_HOME_ENV,
   CLAUDE_MULTIMODEL_DATA_HOME_ENV,
@@ -746,7 +747,9 @@ export const PROJECT_BEHAVIOR_DIRS = [
 async function collectBehaviorDirectoryEntries(
   rootPath: string,
   relativeDir: string,
+  signal?: AbortSignal,
 ): Promise<string[]> {
+  signal?.throwIfAborted()
   const absoluteDir = path.join(rootPath, relativeDir)
   if (!(await fileExists(absoluteDir))) {
     return []
@@ -754,10 +757,12 @@ async function collectBehaviorDirectoryEntries(
 
   const entries: string[] = []
   const walk = async (currentDir: string): Promise<void> => {
+    signal?.throwIfAborted()
     const dirents = await readdir(currentDir, { withFileTypes: true })
     dirents.sort((left, right) => left.name.localeCompare(right.name))
 
     for (const dirent of dirents) {
+      signal?.throwIfAborted()
       if (dirent.name === '.DS_Store' || dirent.name === '.git' || dirent.name === 'node_modules') {
         continue
       }
@@ -772,7 +777,7 @@ async function collectBehaviorDirectoryEntries(
       }
 
       const relativePath = path.relative(rootPath, nextPath)
-      const content = await readFile(nextPath)
+      const content = await readFile(nextPath, { signal })
       entries.push(`${relativePath}:${hashBuffer(content)}`)
     }
   }
@@ -784,6 +789,7 @@ async function collectBehaviorDirectoryEntries(
 export async function collectProjectBehaviorMetadata(
   projectPath: string,
   env: NodeJS.ProcessEnv = process.env,
+  signal?: AbortSignal,
 ): Promise<{
   projectBehaviorFingerprint: string
   behaviorSources: string[]
@@ -793,12 +799,13 @@ export async function collectProjectBehaviorMetadata(
   const behaviorSources = new Set<string>()
 
   for (const relativePath of PROJECT_BEHAVIOR_FILES) {
+    signal?.throwIfAborted()
     const absolutePath = path.join(projectPath, relativePath)
     if (!(await fileExists(absolutePath))) {
       continue
     }
 
-    const content = await readFile(absolutePath)
+    const content = await readFile(absolutePath, { signal })
     const fingerprint = relativePath === 'opencode.json' || relativePath === 'opencode.jsonc'
       ? hashString(JSON.stringify(redactConfigIdentity(
           safeParseJSONC(content.toString('utf8')),
@@ -810,7 +817,7 @@ export async function collectProjectBehaviorMetadata(
   }
 
   for (const relativeDir of PROJECT_BEHAVIOR_DIRS) {
-    const dirEntries = await collectBehaviorDirectoryEntries(projectPath, relativeDir)
+    const dirEntries = await collectBehaviorDirectoryEntries(projectPath, relativeDir, signal)
     for (const entry of dirEntries) {
       const separatorIndex = entry.indexOf(':')
       behaviorSources.add(separatorIndex >= 0 ? entry.slice(0, separatorIndex) : entry)
@@ -2368,6 +2375,7 @@ type OpenCodeScopeResolutionInput = {
   purpose: OpenCodeProfilePurpose
   selectedModel: string
   env?: NodeJS.ProcessEnv
+  abortSignal?: AbortSignal
   // Authority refresh reads scope without publishing a preparation snapshot.
   cacheSnapshot?: boolean
   isOAuthNativeSessionSettled?: (owner: OpenCodeOAuthNativeSessionOwner) => Promise<boolean>
@@ -2389,7 +2397,9 @@ function scopeSourceEnvironment(inputEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv 
 }
 
 export async function resolveOpenCodeProfileScope(input: OpenCodeScopeResolutionInput): Promise<OpenCodeProfileScope> {
+  if (input.abortSignal?.aborted) throwOpenCodeAbortReason(input.abortSignal)
   await recoverOpenCodeScopedOAuth(input)
+  if (input.abortSignal?.aborted) throwOpenCodeAbortReason(input.abortSignal)
   return resolveOpenCodeProfileScopeInternal(input)
 }
 
@@ -2458,7 +2468,7 @@ async function recoverOpenCodeScopedOAuth(input: OpenCodeScopeResolutionInput): 
     }
     try {
     await recoverOpenCodeOwnedOAuthSave({
-      globalAuthPath, env,
+      globalAuthPath, env, abortSignal: input.abortSignal,
       assertRetirementAuthority: async owner => {
         if (await canonicalizeOpenCodeProjectPath(input.projectPath) !== owner.projectPath) {
           throw new Error('OpenCode OAuth retirement belongs to another project; original admission retained')
@@ -2563,11 +2573,13 @@ async function resolveOpenCodeProfileScopeInternal(
   captureSnapshot?: (snapshot: OpenCodeEffectiveConfigSnapshot) => void,
   catalogProviderId?: string,
 ): Promise<OpenCodeProfileScope> {
+  if (input.abortSignal?.aborted) throwOpenCodeAbortReason(input.abortSignal)
   const envSnapshot = scopeSourceEnvironment(input.env ?? process.env)
   const attachmentRoot = await resolveOpenCodeAttachmentRoot(envSnapshot)
   if (attachmentRoot) envSnapshot.CLAUDE_AGENT_TEAMS_ATTACHMENT_ROOT = attachmentRoot
   else delete envSnapshot.CLAUDE_AGENT_TEAMS_ATTACHMENT_ROOT
   const projectPath = await canonicalizeOpenCodeProjectPath(input.projectPath)
+  if (input.abortSignal?.aborted) throwOpenCodeAbortReason(input.abortSignal)
   if (isStrictAuthorityPurpose(input.purpose)
     && canonicalizeOpenCodeProviderId(input.selectedModel.split('/')[0] ?? '') === 'cursor-acp') {
     Object.assign(envSnapshot, managedCursorNativeEnvironment(
@@ -2790,6 +2802,7 @@ async function resolveOpenCodeProfileScopeInternal(
     selectedAuthIdentity,
     scopeToken,
   }
+  if (input.abortSignal?.aborted) throwOpenCodeAbortReason(input.abortSignal)
   if (captureSnapshot || !recoveryPredecessor && input.cacheSnapshot !== false && !openCodeEffectiveConfigSnapshots.has(scopeToken)) {
     const snapshot = freezeConfigSnapshot({
       projectPath,
@@ -3982,7 +3995,8 @@ export async function readOpenCodeSelectedScopeMetadata(scope: OpenCodeProfileSc
 }
 
 /** Exact catalog snapshot only; no execution model, MCP transport or ambient credential selection. */
-export async function materializeOpenCodeV2CatalogScope(scope: OpenCodeProfileScope, projectPath: string, targetAuthPath: string) {
+export async function materializeOpenCodeV2CatalogScope(scope: OpenCodeProfileScope, projectPath: string, targetAuthPath: string,
+  options: { includeSelectedApiKey?: boolean } = {}) {
   const snapshot = openCodeEffectiveConfigSnapshots.get(scope.scopeToken)
   if (!snapshot || scope.purpose !== 'catalog' || await canonicalizeOpenCodeProjectPath(projectPath) !== snapshot.projectPath ||
     !isDeepStrictEqual(snapshot.scopeIdentity, buildScopeIdentity(planOpenCodeProfilePolicy(scope).scope))) throw new Error('OpenCode catalog scope changed')
@@ -3991,8 +4005,16 @@ export async function materializeOpenCodeV2CatalogScope(scope: OpenCodeProfileSc
   if (Object.keys(declared).length > 2048) throw new Error('OpenCode selected catalog model budget exceeded')
   for (const [id, definition] of Object.entries(declared)) Object.assign(models, mapSelectedOpenCodeV2Model(id, definition))
   const imported = await materializeOpenCodeSelectedScopeAuth(scope, projectPath, targetAuthPath, undefined)
-  const selected = snapshot.importedRuntimeConfig.model
-  return { provider: { ...imported, ...(Object.keys(models).length ? { models } : {}) },
+  // Fresh V2 databases do not import legacy auth.json. Model discovery can use
+  // this exact already-materialized key in its private, hash-bound config without
+  // creating a native connection or invoking authentication/model requests.
+  // Setup/Connect opt out, and OAuth/additional credential metadata stay untouched.
+  const credential = snapshot.selectedAuthCredential
+  const apiKey = options.includeSelectedApiKey && credential?.type === 'api' && typeof credential.key === 'string' &&
+    Object.keys(credential).every(key => key === 'type' || key === 'key') ? credential.key : undefined
+  const defaults = await readOpenCodeManagedDefaultSelection(snapshot.projectPath)
+  const selected = defaults.defaultModel ?? snapshot.importedRuntimeConfig.model
+  return { provider: { ...imported, ...(apiKey ? { apiKey } : {}), ...(Object.keys(models).length ? { models } : {}) },
     preferredModel: typeof selected === 'string' && selected.startsWith(scope.providerId + '/') ? selected : null,
     authPath: path.join(snapshot.managedPaths.data, 'opencode', 'auth.json') }
 }

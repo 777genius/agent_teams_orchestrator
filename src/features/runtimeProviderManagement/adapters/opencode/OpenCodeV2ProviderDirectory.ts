@@ -32,10 +32,12 @@ export function buildOpenCodeV2ProviderDirectoryEntries(inventory: OpenCodeInven
     const integration = integrations.get(provider ? provider.integrationId ?? '' : providerId)
     const plainKey = read?.catalog === 'ready' && integration?.plainKey === true
     const isConnected = connected.has(providerId)
-    // The isolated reader has no saved credentials. An inactive provider's models
-    // are unknown, including when a completed connection receipt exists elsewhere.
-    const modelCount = read?.catalog === 'ready' && provider ? (modelIdsByProviderId[providerId]?.length ?? 0) : null
+    // The passive reader has no saved credentials. A connected account's count
+    // remains unknown until scoped discovery, even if this reader lists free models.
+    const modelCount = read?.catalog === 'ready' && provider && !isConnected ? (modelIdsByProviderId[providerId]?.length ?? 0) : null
     const hasModels = modelCount !== null && modelCount > 0
+    const hasAnonymousModels = provider?.anonymous === true && (read?.models ?? []).some(model =>
+      model.providerId === providerId && model.enabled && model.status === 'active' && model.free === true)
     const actions: ProviderActionDescriptor[] = []
     if (plainKey && !isConnected) actions.push({ id: 'connect', label: 'Connect', enabled: true,
       disabledReason: null, requiresSecret: true, ownershipScope: 'managed' })
@@ -52,13 +54,14 @@ export function buildOpenCodeV2ProviderDirectoryEntries(inventory: OpenCodeInven
       displayName: integration?.name ?? openCodeV2KeyIntegration(providerId)?.displayName ?? providerId,
       state: isConnected ? 'connected' : hasModels ? 'available' : 'not-connected',
       connectedAuthHint: isConnected ? 'api' : null,
-      setupKind: isConnected ? 'connected' : plainKey ? 'connect-api-key' : 'configure-manually',
+      setupKind: isConnected ? 'connected' : hasAnonymousModels ? 'available-readonly' : plainKey ? 'connect-api-key' : 'configure-manually',
       ownership: isConnected ? ['managed'] : [], recommended: isRecommendedProvider(providerId), modelCount,
       authMethods: plainKey || isConnected ? ['api'] : [],
       defaultModelId: preferred?.providerId === providerId ? `${providerId}/${preferred.catalogId}` : null,
       sources: nativeCatalog ? ['opencode-provider'] : ['inventory'],
       sourceLabel: nativeCatalog ? 'OpenCode catalog' : 'inventory', providerSource: null,
       detail: isConnected ? 'Connected with a verified API key'
+        : hasAnonymousModels ? 'OpenCode lists free models without an API key. Select a model to verify access and current limits.'
         : plainKey ? 'Connect with an API key; verification uses one model request'
           : 'Configure this provider in OpenCode. Model access still requires verification.',
       actions,
