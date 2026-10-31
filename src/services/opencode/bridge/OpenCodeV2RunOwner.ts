@@ -2,7 +2,7 @@ import { assertOpenCodeV2GroupBinding, buildOpenCodeV2GroupProof } from './OpenC
 import { openCodeV2EngineVersion } from '../compatibility/OpenCodeV2Registry.js'
 import { openCodeBunVersion } from '../../../constants/openCodeBunVersion.js'
 import { assertOpenCodeV2Launchable } from '../compatibility/OpenCodeV2Registry.js'
-import { recordOpenCodeV2ProviderFailure, retainOpenCodeV2InitializationPhase, type RunInitializationFacts, type RunInitializationPhase } from '../execution/OpenCodeV2Diagnostics.js'
+import { classifyOpenCodeV2RunOwnerFailure, recordOpenCodeV2ProviderFailure, retainOpenCodeV2InitializationPhase, type RunInitializationFacts, type RunInitializationPhase } from '../execution/OpenCodeV2Diagnostics.js'
 import { captureOwnedV2ProbeAuthority, buildOwnedV2ProbeProof, type ProbeAuthority } from './OpenCodeV2ProbeProof.js'
 import { readOwnedControllerInbox, readOwnedControllerTools, type ControllerToolProof } from './OpenCodeV2ControllerTools.js'
 import { spawn } from 'node:child_process'
@@ -103,6 +103,8 @@ export class OpenCodeV2RunOwner {
   private cleanupGraceDeadline = 0
   private state: RunOwnerState = 'starting'
   private stopping: Promise<Extract<RunControlResult, { kind: 'stop' }>> | undefined
+  // Set only when initialization failed on its own, never when a stop aborted it.
+  private initializationFailure: { error: unknown } | undefined
   private readonly initialization: Promise<void>
   private readonly timer: ReturnType<typeof setTimeout>
   private resolveStopped: (receipt: Extract<RunControlResult, { kind: 'stop' }>) => void = () => undefined
@@ -111,7 +113,10 @@ export class OpenCodeV2RunOwner {
     validateRunLaunchPlan(plan)
     this.plan = structuredClone(plan)
     this.initialization = this.initialize()
-    void this.initialization.catch(() => { void this.stop().catch(() => undefined) })
+    void this.initialization.catch(error => {
+      if (!this.stopping) this.initializationFailure = { error }
+      void this.stop().catch(() => undefined)
+    })
     this.timer = setTimeout(() => { void this.stop().catch(() => undefined) }, plan.deadline - Date.now())
   }
   private context(member: RunMemberPlan, deadline = this.plan.deadline, signal?: AbortSignal): ExecutionContext {
@@ -535,6 +540,12 @@ export class OpenCodeV2RunOwner {
       await boundOpenCodeRead(this.persistState(), remaining(2000))
     }
     catch { durable = false }
+    if (this.initializationFailure) {
+      // Readers see this closed cause next to the tombstone, before stop.json and
+      // before this process exits. Observational only: it never changes the receipt.
+      await boundOpenCodeRead(writeRunControlFile(this.directory, 'owner-failure.json', { binding: this.plan.binding,
+        failure: classifyOpenCodeV2RunOwnerFailure(this.initializationFailure.error) }), remaining(2000)).catch(() => undefined)
+    }
     this.initializationAbort.abort(new Error('run_stopped'))
     for (const controller of this.acquisitions) controller.abort(new Error('run_stopped'))
     for (const controller of this.operations) controller.abort(new Error('run_stopped'))
