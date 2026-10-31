@@ -4111,6 +4111,21 @@ export class OpenCodeProviderManagementAdapter
   async loadDirectory(
     input: LoadProviderDirectoryInput,
   ): Promise<ProviderManagementResult<ProviderDirectoryView>> {
+    const deadline = new OpenCodeRuntimeDeadline(this.deps.viewTimeoutMs ?? OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS)
+    try {
+      return await this.loadDirectoryWithinDeadline(input, deadline)
+    } catch (error) {
+      if (!deadline.signal.aborted) throw error
+      return providerManagementError('runtime-unhealthy', 'OpenCode provider directory loading timed out')
+    } finally {
+      deadline.dispose()
+    }
+  }
+
+  private async loadDirectoryWithinDeadline(
+    input: LoadProviderDirectoryInput,
+    deadline: OpenCodeRuntimeDeadline,
+  ): Promise<ProviderManagementResult<ProviderDirectoryView>> {
     if (input.runtimeId !== 'opencode') {
       return providerManagementError(
         'unsupported-runtime',
@@ -4125,7 +4140,10 @@ export class OpenCodeProviderManagementAdapter
       v1SettingsOnly: !input.summary && input.refresh !== true,
       bypassCache: input.refresh === true,
       refreshModels: input.refresh === true && input.summary !== true,
+      abortSignal: deadline.signal,
+      remainingMs: () => deadline.remainingMs(),
     })
+    deadline.throwIfExpired()
 
     if (!input.summary && inventory.readGeneration === 'v2') {
       const { entries: nativeEntries, modelIdsByProviderId } = buildOpenCodeV2ProviderDirectoryEntries(inventory)
@@ -4203,8 +4221,10 @@ export class OpenCodeProviderManagementAdapter
         },
         hostLifetime: 'process',
         resolveConfigFingerprint: false,
-        healthTimeoutMs: OPEN_CODE_PROVIDER_MANAGEMENT_HOST_HEALTH_TIMEOUT_MS,
+        healthTimeoutMs: Math.min(OPEN_CODE_PROVIDER_MANAGEMENT_HOST_HEALTH_TIMEOUT_MS, deadline.remainingMs()),
+        abortSignal: deadline.signal,
       })
+      deadline.throwIfExpired()
       hostLease = await this.retainProviderManagementHost(hostManager, host, false)
       const cacheKey = this.getDirectoryCacheKey({
         runtimeId: input.runtimeId,
@@ -4214,6 +4234,7 @@ export class OpenCodeProviderManagementAdapter
       if (!input.refresh) {
         const cached = this.readDirectoryCache(cacheKey)
         if (cached) {
+          deadline.throwIfExpired()
           return {
             ok: true,
             value: filterAndPageProviderDirectory({
@@ -4228,7 +4249,11 @@ export class OpenCodeProviderManagementAdapter
         }
       }
 
-      const client = clientFactory.create(host.baseUrl)
+      deadline.throwIfExpired()
+      const client = clientFactory.create(host.baseUrl, {
+        signal: deadline.signal,
+        remainingMs: () => deadline.remainingMs(),
+      })
       const serverDocRead = client.getServerDoc
         ? safeRead(() => client.getServerDoc!())
         : Promise.resolve({
@@ -4287,12 +4312,14 @@ export class OpenCodeProviderManagementAdapter
         limit: Number.MAX_SAFE_INTEGER,
         cursor: null,
       })
+      deadline.throwIfExpired()
       this.writeDirectoryCache(
         cacheKey,
         uncachedDirectory,
         buildProviderDirectoryModelSearchIndex(directorySource),
       )
 
+      deadline.throwIfExpired()
       return {
         ok: true,
         value: buildProviderDirectory({
