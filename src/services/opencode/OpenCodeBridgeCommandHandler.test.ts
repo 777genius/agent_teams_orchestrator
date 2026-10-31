@@ -19,6 +19,7 @@ import { resolveClaudeMultimodelPaths } from './OpenCodeManagedPaths.js'
 import { openCodeCommandOutcomeStore } from './OpenCodeCommandOutcomeStore.js'
 import { openCodeExecutionProbe } from './OpenCodeExecutionProbe.js'
 import { OpenCodeHostProcessGoneError, openCodeHostManager } from './OpenCodeHostManager.js'
+import { resolveOpenCodeAppMcpLaunchConfig } from './OpenCodeMcpManager.js'
 import {
   computeOpenCodeExpectedBehaviorFingerprint,
   OPEN_CODE_KNOWN_ABSENT_AUTH_FINGERPRINT,
@@ -487,6 +488,7 @@ const originalReconcilePersistentHosts = openCodeHostManager.reconcilePersistent
 const originalRefreshResolvedConfigFingerprint = openCodeHostManager.refreshResolvedConfigFingerprint
 const originalEnsureSession = openCodeSessionBridge.ensureSession
 const originalMaterializeSessionOnHost = openCodeSessionBridge.materializeSessionOnHost
+const originalOwnedOAuthObservation = openCodeSessionBridge.withOwnedOAuthSessionObservation
 const originalEnsureSessionAppMcpReady = openCodeSessionBridge.ensureSessionAppMcpReady
 const originalInjectAppManagedBootstrapContext = openCodeSessionBridge.injectAppManagedBootstrapContext
 const originalRefreshSessionEnvironment = openCodeSessionBridge.refreshSessionEnvironment
@@ -842,6 +844,7 @@ afterEach(async () => {
   openCodeHostManager.refreshResolvedConfigFingerprint = originalRefreshResolvedConfigFingerprint
   openCodeSessionBridge.ensureSession = originalEnsureSession
   openCodeSessionBridge.materializeSessionOnHost = originalMaterializeSessionOnHost
+  openCodeSessionBridge.withOwnedOAuthSessionObservation = originalOwnedOAuthObservation
   openCodeSessionBridge.ensureSessionAppMcpReady = originalEnsureSessionAppMcpReady
   openCodeSessionBridge.injectAppManagedBootstrapContext = originalInjectAppManagedBootstrapContext
   openCodeSessionBridge.refreshSessionEnvironment = originalRefreshSessionEnvironment
@@ -1187,6 +1190,133 @@ describe('OpenCodeBridgeCommandHandler', () => {
       expect((await handshake()).runtime.groupChatRunProof).toBeUndefined()
     } finally { host.stop(true) }
   })
+  test('owned xAI OAuth proves and delivers a named-group message without re-preparing credentials', async () => {
+    const groupContext = JSON.stringify({
+      appInstanceId: 'owned-xai-test', dataRootFingerprint: 'owned-xai-root', connectionGeneration: 1,
+    })
+    const requests: string[] = []
+    let connected = true
+    let sessionAvailable = true
+    let liveConfig: Record<string, unknown> = {}
+    let prompts: string[] = []
+    const host = Bun.serve({
+      hostname: '127.0.0.1', port: 0,
+      async fetch(request) {
+        const pathname = new URL(request.url).pathname
+        requests.push(pathname)
+        if (pathname === '/config') return Response.json({ mcp: { 'agent-teams': liveConfig } })
+        if (pathname === '/mcp') return Response.json({ 'agent-teams': { status: connected ? 'connected' : 'disconnected' } })
+        if (pathname === '/session/session-1') {
+          return sessionAvailable ? Response.json({ id: 'session-1' }) : new Response('Session gone', { status: 404 })
+        }
+        if (pathname === '/api/teams/team-a/group-chats/list') {
+          if (request.headers.get('x-agent-teams-app-context') !== groupContext) return new Response('Wrong owner', { status: 409 })
+          return Response.json([{ id: '3695a573-5ad2-469a-91f2-427f90792e11', name: 'Design', archivedAt: null }])
+        }
+        return new Response('Not found', { status: 404 })
+      },
+    })
+    try {
+      process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND = process.execPath
+      process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY =
+        fileURLToPath(new URL('./fixtures/group-chat-mcp.ts', import.meta.url))
+      const env = {
+        AGENT_TEAMS_BOUND_CONTROL_URL: host.url.origin,
+        AGENT_TEAMS_BOUND_CONTEXT_JSON: groupContext,
+        SYNTHETIC_MCP_TOOL_NAMES: JSON.stringify(REQUIRED_MOCK_MCP_TOOL_NAMES),
+        SYNTHETIC_GROUP_TOOLS: '1',
+      }
+      process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENV_JSON = JSON.stringify(env)
+      liveConfig = (await resolveOpenCodeAppMcpLaunchConfig()).config
+      const record = buildRecord({
+        selectedModel: 'xai/grok-4.5', toolApprovalMode: 'auto', runtimePid: process.pid,
+        profileScope: { purpose: 'launch_runtime', providerId: 'xai', scopeToken: 'xai-group',
+          configFingerprint: 'config', selectedAuthIdentity: 'absent' },
+        resolvedBehaviorFingerprint: 'owned-xai-config',
+        managedConfigFingerprint: 'owned-xai-config',
+        expectedBehaviorFingerprint: expectedFingerprintForModel('xai/grok-4.5'),
+        opencodeVersion: '1.4.0',
+        appManagedBootstrap: {
+          schemaVersion: 1, messageID: 'msg_owned_xai', contextHash: 'a'.repeat(64),
+          briefingHash: 'b'.repeat(64), injectionVerifiedAt: '2026-10-31T00:00:00Z',
+        },
+      })
+      openCodeSessionStore.list = async () => [record]
+      openCodeSessionStore.get = async () => record
+      openCodeProvisioningProbe.probe = async () => { throw new Error('broad discovery forbidden') }
+      openCodeProvisioningProbe.probeRetainingHost = async () => { throw new Error('auth scope preparation forbidden') }
+      let ownerChecks = 0
+      openCodeSessionBridge.withOwnedOAuthSessionObservation = (async (target, operation) => {
+        expect(target.runId).toBe(record.runId)
+        expect(target.opencodeSessionId).toBe(record.opencodeSessionId)
+        return operation({ baseUrl: host.url.origin, runtimePid: process.pid }, async () => { ownerChecks++ })
+      }) as typeof openCodeSessionBridge.withOwnedOAuthSessionObservation
+      openCodeSessionBridge.promptAsync = (async (_target, input) => { prompts.push(input.text) }) as typeof openCodeSessionBridge.promptAsync
+      Client.prototype.connect = originalClientConnect
+      Client.prototype.listTools = originalClientListTools
+      Client.prototype.close = originalClientClose
+
+      const request = {
+        teamName: record.teamId, teamId: record.teamId, laneId: record.laneId, runId: record.runId,
+        memberName: record.memberName, requiredCommand: 'opencode.sendMessage',
+        expectedCapabilitySnapshotId: 'existing-run',
+      }
+      const handshake = async () => {
+        const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.handshake', request))
+        expect(result.ok).toBe(true)
+        if (!result.ok || !('server' in result.data)) throw new Error('Expected xAI handshake server')
+        return result.data.server
+      }
+      const admitted = await handshake()
+      expect(admitted.bridgeProtocol.groupChatProtocolVersion).toBe(1)
+      expect(admitted.runtime.groupChatRunProof).toEqual({
+        teamName: record.teamId, memberName: record.memberName, runId: record.runId, runKey: record.runId,
+        laneId: record.laneId, runtimePid: process.pid, runtimeSessionId: record.opencodeSessionId,
+        processorReady: true, groupReactionProtocolVersion: 1,
+      })
+      expect(requests).toContain('/config')
+      expect(requests).toContain('/mcp')
+      expect(requests).toContain('/session/session-1')
+      expect(ownerChecks).toBeGreaterThan(0)
+
+      const message = {
+        teamId: record.teamId, teamName: record.teamId, laneId: record.laneId, runId: record.runId,
+        memberName: record.memberName, text: 'Please review this design',
+        expectedCapabilitySnapshotId: admitted.runtime.capabilitySnapshotId,
+        expectedBehaviorFingerprint: record.expectedBehaviorFingerprint,
+        groupChatProtocolVersion: 1, groupRunKey: record.runId,
+        groupChatId: '3695a573-5ad2-469a-91f2-427f90792e11', groupChatName: 'Design',
+        groupMessageId: 'b8192a4c-97c8-4f67-bccd-7b29d8131286',
+        messageId: '0bdf10f0-3fd3-4494-a974-b394de06c181',
+        from: 'user', timestamp: '2026-10-31T00:00:00Z', settlementMode: 'acceptance',
+      }
+      const delivered = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.sendMessage', message))
+      expect(delivered.ok).toBe(true)
+      if (!delivered.ok || !('accepted' in delivered.data)) throw new Error('Expected owned xAI group acceptance')
+      expect(delivered.data.accepted).toBe(true)
+      expect(prompts).toHaveLength(1)
+      expect(prompts[0]).toContain('Group name: "Design"')
+      expect(prompts[0]).toContain('Fresh group catalog:')
+
+      connected = false
+      expect((await handshake()).runtime.groupChatRunProof).toBeUndefined()
+      connected = true
+      sessionAvailable = false
+      expect((await handshake()).runtime.groupChatRunProof).toBeUndefined()
+      sessionAvailable = true
+      liveConfig = { type: 'local', command: ['foreign-agent'], environment: env }
+      expect((await handshake()).runtime.groupChatRunProof).toBeUndefined()
+      liveConfig = (await resolveOpenCodeAppMcpLaunchConfig()).config
+      process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENV_JSON =
+        JSON.stringify({ ...env, SYNTHETIC_GROUP_TOOLS: '0' })
+      liveConfig = (await resolveOpenCodeAppMcpLaunchConfig()).config
+      expect((await handshake()).runtime.groupChatRunProof).toBeUndefined()
+      expect(prompts).toHaveLength(1)
+    } finally {
+      host.stop(true)
+    }
+  })
+
   test('exposes the OpenCode task ledger evidence contract version in handshake', async () => {
     openCodeProvisioningProbe.probe = async () => snapshot
 
