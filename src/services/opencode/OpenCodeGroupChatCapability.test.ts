@@ -81,6 +81,8 @@ describe('owned xAI OAuth named-group proof', () => {
       groupReactionProtocolVersion: 1,
     })
     expect(buildOpenCodeGroupChatRunProof(makeSnapshot(), makeRecord(), groupTools)).toBeUndefined()
+    expect(buildOpenCodeGroupChatRunProof(makeSnapshot(),
+      { ...makeRecord(), runtimePid: undefined }, groupTools)).toBeUndefined()
   })
 
   test('fails closed for mismatched host and process identity', () => {
