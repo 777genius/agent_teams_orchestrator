@@ -290,6 +290,15 @@ jobs:
       - name: Test V2 run owner retirement
         if: runner.os != 'Windows'
         run: bun test src/services/opencode/bridge/OpenCodeV2RunOwnerRetirement.test.ts --timeout 30000
+      # The Linux socket fixture runs under the job's Node. The mutable-cut test starts a
+      # second bun test process under a fixed 15s budget and stays out of this step.
+      - name: Test V2 run control and run owner
+        if: runner.os != 'Windows'
+        run: |
+          TEST_OPENCODE_NODE_BINARY="$(command -v node)" bun test \
+            src/services/opencode/bridge/OpenCodeV2RunControl.test.ts \
+            src/services/opencode/bridge/OpenCodeV2RunOwner.test.ts \
+            --test-name-pattern '^(?!.*probe readiness retains one original)' --timeout 30000
       - name: Test Windows startup cleanup completion contracts
         run: bun test src/utils/processKill.test.ts src/services/opencode/OpenCodeStartupCleanupBudget.test.ts src/services/opencode/OpenCodeStartupCleanup.test.ts --timeout 30000
       - name: Test native Windows startup termination

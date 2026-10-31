@@ -299,7 +299,7 @@ export function retainOpenCodeV2InitializationPhase(error: unknown, phase: RunIn
   }))
 }
 
-const privateProviderFailureCodes = new Set(['provider_missing', 'provider_key_method_unsupported', 'provider_existing_credentials_unsupported',
+const providerFailureCodes = ['provider_missing', 'provider_key_method_unsupported', 'provider_existing_credentials_unsupported',
   'provider_catalog_scope_changed', 'provider_catalog_location_changed', 'provider_integration_changed', 'provider_credential_identity_changed',
   'provider_owned_connection_unknown', 'provider_active_connection_changed', 'provider_auth_publication_changed', 'provider_auth_publication_unknown',
   'provider_selected_model_missing', 'provider_original_connect_unknown', 'provider_original_execution_pending', 'provider_original_execution_failed', 'provider_execution_target_changed',
@@ -329,10 +329,11 @@ const privateProviderFailureCodes = new Set(['provider_missing', 'provider_key_m
   'execution_timeout', 'execution_owner_unknown', 'execution_owner_record_invalid', 'cleanup_unknown', 'selection_mismatch', 'authority_mismatch',
   'graph_mismatch', 'identity_mismatch', 'unqualified_version', 'invalid_response', 'invalid_model',
   'opencode_v2_version_out_of_range', 'opencode_v2_version_unqualified', 'opencode_v2_graph_unavailable',
-  'http_failure', 'transport_failure', 'media_type', 'deadline', 'authority_or_deadline', 'disposed', 'timeout'])
+  'http_failure', 'transport_failure', 'media_type', 'deadline', 'authority_or_deadline', 'disposed', 'timeout'] as const
+const privateProviderFailureCodes = new Set<string>(providerFailureCodes)
 // Exact native producer literals only; neither an arbitrary message nor a
 // syntactically plausible unknown stage is persisted as diagnostic data.
-const privateNativeFailureCodes = new Set([
+const nativeFailureCodes = [
   'cleanup_unknown', 'execution_identity_unknown', 'execution_path_alias',
   'execution_cancelled', 'execution_containment_unqualified', 'execution_containment_dll_identity', 'execution_containment_filesystem_denied',
   'execution_containment_helper_closed', 'execution_containment_helper_failed', 'execution_containment_helper_identity',
@@ -347,7 +348,15 @@ const privateNativeFailureCodes = new Set([
   'execution_owner_metadata_changed', 'execution_owner_metadata_invalid', 'execution_owner_metadata_missing',
   'execution_owner_metadata_purpose_invalid', 'execution_owner_not_private', 'execution_owner_ntfs_required',
   'execution_owner_path_invalid', 'execution_owner_prepared_invalid', 'execution_owner_prepared_purpose_invalid',
-  'execution_owner_read_only', 'execution_owner_unknown', 'execution_owner_write_through_pending'])
+  'execution_owner_read_only', 'execution_owner_unknown', 'execution_owner_write_through_pending'] as const
+const privateNativeFailureCodes = new Set<string>(nativeFailureCodes)
+/** Every category a provider or owner failure record can carry. */
+export type OpenCodeV2ProviderFailureCategory = typeof providerFailureCodes[number] | typeof nativeFailureCodes[number] | 'provider_operation_unknown'
+/** Readers accept only these closed categories; anything else reads as unknown. */
+export function openCodeV2ProviderFailureCategory(value: unknown): OpenCodeV2ProviderFailureCategory {
+  return typeof value === 'string' && (privateProviderFailureCodes.has(value) || privateNativeFailureCodes.has(value))
+    ? value as OpenCodeV2ProviderFailureCategory : 'provider_operation_unknown'
+}
 const privateNativeFailureStages = new Set([
   'alias_predicate',
   'assert_mapping', 'assert_stopped', 'assert_broker',
@@ -398,7 +407,7 @@ function providerFailureCategory(error: unknown) {
 /** The same closed category and provider wire stage as the diagnostics record, for the
  * owner's run directory. Never a message, body, path or credential. */
 export function classifyOpenCodeV2RunOwnerFailure(error: unknown): RunOwnerFailure {
-  const { category } = providerFailureCategory(error), operation = readOpenCodeV2ProviderWireFailure(error)
+  const category = openCodeV2ProviderFailureCategory(providerFailureCategory(error).category), operation = readOpenCodeV2ProviderWireFailure(error)
   return { category, ...(operation ? { operation: { operation: operation.operation, stage: operation.stage, status: operation.status } } : {}) }
 }
 /** Private static phase/category only: never an arbitrary SDK message, body, credential or key. */

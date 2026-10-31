@@ -26,7 +26,10 @@ export type OpenCodeV2ProbeIntent = { sourceKey: string; binding: RunBinding; se
 type ProbeFailure = RunProbeFailure | 'native_owner_retired'
 type ProbeRecord = { sourceKey: string; binding: RunBinding; sessionID: string; intent: QueueIntent;
   submitted: boolean; proof: OpenCodeExecutionProof | null; retired: boolean; failure: ProbeFailure | null; freshExecutionProofRequestId?: string
-  ownerFailure?: RunOwnerFailure }
+  ownerFailure?: RunOwnerFailure
+  /** This source key already spent its one replacement without a fresh request. Every
+   * successor record keeps it, so later replacements need a new fresh request id. */
+  automaticReplacementUsed?: true }
 function parseProbeFailure(value: unknown): RunProbeFailure | null {
   if (value === null || value === undefined) return null // Existing records predate this field.
   executionAssert(value === 'native_execution_failed' || value === 'native_execution_cancelled', 'probe_failure_invalid')
@@ -63,6 +66,7 @@ function parseRecord(value: unknown): ProbeRecord {
   executionAssert(row.proof === null || proof, 'probe_store_invalid')
   executionAssert(row.freshExecutionProofRequestId === undefined || typeof row.freshExecutionProofRequestId === 'string' &&
     /^[a-zA-Z0-9._:-]{1,200}$/.test(row.freshExecutionProofRequestId), 'probe_store_invalid')
+  executionAssert(row.automaticReplacementUsed === undefined || row.automaticReplacementUsed === true, 'probe_store_invalid')
   const failure = parseStoredProbeFailure(row.failure)
   // Owner retirement settles only an original that never received input; every other
   // failure belongs to a submitted original without proof.
@@ -76,7 +80,7 @@ function parseRecord(value: unknown): ProbeRecord {
   return { sourceKey: row.sourceKey, binding: typedBinding, sessionID: row.sessionID,
     submitted: row.submitted, retired: row.retired, intent: request.intent, proof, failure,
     ...(row.freshExecutionProofRequestId === undefined ? {} : { freshExecutionProofRequestId: row.freshExecutionProofRequestId as string }),
-    ...(ownerFailure ? { ownerFailure } : {}) }
+    ...(ownerFailure ? { ownerFailure } : {}), ...(row.automaticReplacementUsed === true ? { automaticReplacementUsed: true as const } : {}) }
 }
 
 /** Normal readiness protocol. The cached proof is a result of this owned producer,
@@ -154,6 +158,8 @@ export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, 
     if (record?.proof) executionAssert(record.proof.projectPath === normalizeOpenCodeProjectIdentity(selection.project) && record.proof.modelId === `${selection.model.providerID}/${selection.model.id}` &&
       record.proof.capabilitySnapshotId === selection.capabilitySnapshotId && record.proof.opencodeVersion === selection.native.version &&
       record.proof.binaryPath === selection.native.executablePath && record.proof.projectBehaviorFingerprint === behavior.projectBehaviorFingerprint, 'probe_cached_target_changed')
+    // Inherited by every successor of this source key, whichever path replaces the record.
+    let automaticReplacementUsed = record?.automaticReplacementUsed === true
     const freshClaimed = freshRequestId === undefined ? false : await hasOpenCodeV2FreshProofClaim(directory, sourceKey, freshRequestId)
     if (freshClaimed && record?.freshExecutionProofRequestId !== freshRequestId)
       return { state: 'pending' as const, proof: null, reason: 'This fresh request already owns a retained claim; no replacement input was submitted.' }
@@ -168,10 +174,14 @@ export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, 
       await options.onIntentPersisted?.({ sourceKey, binding: record.binding, sessionID: record.sessionID, intentHash: executionHash(record.intent) })
       return available(record)
     }
-    // An original whose owner retired before any input never ran: a requested probe may
-    // start one new original. The same fresh request keeps its settled failure.
-    if (run && !options.requireExisting && record?.failure === 'native_owner_retired' && record.retired && !record.submitted &&
-      (freshRequestId === undefined || record.freshExecutionProofRequestId !== freshRequestId)) record = null
+    // An original whose owner retired before any input never ran, so a requested probe
+    // may start one new original. Without a fresh request that happens at most once per
+    // source key: a persistent owner failure cannot turn every model check into a new
+    // owner. A new fresh request id may always replace it; the same one keeps its failure.
+    if (run && !options.requireExisting && record?.failure === 'native_owner_retired' && record.retired && !record.submitted) {
+      if (freshRequestId !== undefined) { if (record.freshExecutionProofRequestId !== freshRequestId) record = null }
+      else if (!automaticReplacementUsed) { automaticReplacementUsed = true; record = null }
+    }
     if (record?.failure && (record.retired || !run)) return { state: 'failed' as const, proof: null,
       reason: record.retired ? probeFailureReason(record) : `${record.failure}; probe_physical_cleanup_unknown` }
     // A retained unresolved attempt never allocates another session or input.
@@ -212,7 +222,8 @@ export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, 
       assertDeadline()
       const member = plan.members[0]; executionAssert(member, 'probe_plan_invalid')
       record = { sourceKey, binding: plan.binding, sessionID: member.originalSessionId, intent, submitted: false, proof: null, retired: false, failure: null,
-        ...(freshRequestId === undefined ? {} : { freshExecutionProofRequestId: freshRequestId }) }
+        ...(freshRequestId === undefined ? {} : { freshExecutionProofRequestId: freshRequestId }),
+        ...(automaticReplacementUsed ? { automaticReplacementUsed: true as const } : {}) }
       await save(record) // Original identities precede launch and every prompt effect.
       await options.onIntentPersisted?.({ sourceKey, binding: record.binding, sessionID: record.sessionID, intentHash: executionHash(record.intent) })
       assertDeadline()

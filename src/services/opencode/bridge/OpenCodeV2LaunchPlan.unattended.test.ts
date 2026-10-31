@@ -606,11 +606,13 @@ test('a model-test tool request cancels and retires the original without approva
   expect(operations).toEqual(['permissions', 'stop'])
 })
 
-// A real owner process retires itself after its own initialization failure. Only
-// the replacement launch is a fixture boundary; no native input or model call exists.
+// A real owner process retires itself after a real provider wire failure during its own
+// initialization. Only the provider endpoint and the replacement launch are fixture
+// boundaries; no native input or model call exists.
 const ownerPeer = fileURLToPath(new URL('./fixtures/OpenCodeV2RunControlPeer.ts', import.meta.url))
+const providerEndpoint = fileURLToPath(new URL('./fixtures/OpenCodeV2ProviderEndpointPreload.ts', import.meta.url))
 const posix = process.platform !== 'win32'
-const ownerCause = { category: 'provider_response_invalid', operation: { operation: 'provider-read', stage: 'decode' as const, status: 404 } }
+const ownerCause = { category: 'provider_response_invalid', operation: { operation: 'provider-read', stage: 'decode', status: 404 } } as const
 const ownerReason = 'native_owner_retired:provider_response_invalid:provider-read:decode:404'
 // A 60s envelope leaves the probe a 35s budget, so loaded runners do not expire it.
 async function originalProbe(submitted: boolean, extra: Record<string, unknown> = {}, timeoutMs = 60_000) {
@@ -638,17 +640,17 @@ function peerReady(child: ChildProcess): Promise<void> {
 /** The original owner publishes its endpoint, fails its own initialization and exits. */
 async function retiredOwner(dataRoot: string, binding: RunBinding): Promise<string> {
   const directory = await controls.reserveRunControlDirectory(dataRoot, binding, 'a'.repeat(64))
-  const owner = spawn(process.execPath, [ownerPeer, 'serve-fail', dataRoot, JSON.stringify(binding), 'provider_response_invalid'],
-    { stdio: ['ignore', 'pipe', 'ignore'] })
+  const owner = spawn(process.execPath, ['--preload', providerEndpoint, ownerPeer, 'serve-fail', dataRoot, JSON.stringify(binding),
+    'TEST-provider-read-404'], { stdio: ['ignore', 'pipe', 'ignore'] })
   const exit = new Promise<void>(resolve => owner.once('exit', () => resolve()))
   try {
     await peerReady(owner)
     await writeFile(path.join(directory, 'TEST-release-initialization'), '', { flag: 'wx', mode: 0o600 })
     await boundOpenCodeRead(exit, 45_000)
   } finally { if (owner.exitCode === null && owner.signalCode === null) owner.kill('SIGKILL') }
-  for (const name of ['tombstone.json', 'stop.json', 'owner-failure.json']) await lstat(path.join(directory, name))
-  // The recorded wire stage of a real provider read, in the owner's own closed record.
-  await controls.writeRunControlFile(directory, 'owner-failure.json', { binding, failure: ownerCause })
+  for (const name of ['tombstone.json', 'stop.json']) await lstat(path.join(directory, name))
+  // The owner's own record carries the real wire stage of its failed provider read.
+  expect(JSON.parse(await readFile(path.join(directory, 'owner-failure.json'), 'utf8'))).toEqual({ binding, failure: ownerCause })
   return directory
 }
 function countLaunches() {
@@ -659,7 +661,7 @@ function countLaunches() {
   return counter
 }
 
-test.skipIf(!posix)('an unsubmitted probe whose owner retired settles with the owner cause and the next request starts one new original', async () => {
+test.skipIf(!posix)('an owner-retired unsubmitted probe settles with the owner cause; without a fresh request only one replacement starts', async () => {
   const f = await originalProbe(false)
   const runDirectory = await retiredOwner(f.dataRoot, f.binding)
   const counter = countLaunches()
@@ -673,12 +675,27 @@ test.skipIf(!posix)('an unsubmitted probe whose owner retired settles with the o
   await expect(probes.resolveOpenCodeV2ExecutionProbe(f.request, f.selection, true)).rejects.toThrow('TEST-new-original-boundary')
   expect(counter.launches).toBe(1)
   const next = JSON.parse(await readFile(f.file, 'utf8'))
-  expect(next).toMatchObject({ sourceKey: f.sourceKey, submitted: false, retired: false, failure: null, proof: null })
+  expect(next).toMatchObject({ sourceKey: f.sourceKey, submitted: false, retired: false, failure: null, proof: null,
+    automaticReplacementUsed: true })
   expect(next.binding).not.toEqual(f.binding)
   expect(next).not.toHaveProperty('ownerFailure')
   // Nothing of the retired original is removed.
   for (const name of ['control.json', 'tombstone.json', 'stop.json', 'owner-failure.json']) await lstat(path.join(runDirectory, name))
-}, 120_000)
+  // The replacement's owner fails the same way: it settles, and repeated requests
+  // without a fresh request id start no further owner.
+  await retiredOwner(f.dataRoot, next.binding)
+  for (let attempt = 0; attempt < 3; attempt++)
+    expect(await probes.resolveOpenCodeV2ExecutionProbe(f.request, f.selection, true)).toEqual(failed)
+  expect(counter.launches).toBe(1)
+  expect(JSON.parse(await readFile(f.file, 'utf8'))).toMatchObject({ binding: next.binding, failure: 'native_owner_retired',
+    retired: true, automaticReplacementUsed: true })
+  // A new fresh request still may start one new original; the spent budget stays recorded.
+  await expect(probes.resolveOpenCodeV2ExecutionProbe(f.request, f.selection, true, { freshExecutionProofRequestId: 'TEST-fresh-retry' }))
+    .rejects.toThrow('TEST-new-original-boundary')
+  expect(counter.launches).toBe(2)
+  expect(JSON.parse(await readFile(f.file, 'utf8'))).toMatchObject({ freshExecutionProofRequestId: 'TEST-fresh-retry',
+    submitted: false, failure: null, automaticReplacementUsed: true })
+}, 180_000)
 
 test.skipIf(!posix)('a submitted probe whose owner retired is never settled as unsubmitted or replaced', async () => {
   const f = await originalProbe(true)
@@ -703,7 +720,9 @@ test.skipIf(!posix)('a submitted probe whose owner retired is never settled as u
 }, 120_000)
 
 test.skipIf(!posix)('an unsubmitted probe with a live starting owner stays pending without settling or replacing it', async () => {
-  const f = await originalProbe(false, {}, 30_000)
+  // A 40s envelope gives a 15s probe budget: enough for loaded runners, and the probe
+  // waits the whole budget for the starting owner.
+  const f = await originalProbe(false, {}, 40_000)
   const directory = await controls.reserveRunControlDirectory(f.dataRoot, f.binding, 'a'.repeat(64))
   const deadline = Date.now() + 60_000
   const status = { kind: 'status', state: 'starting', deadline, members: [{ memberId: 'probe', laneId: 'execution-probe',
@@ -718,7 +737,7 @@ test.skipIf(!posix)('an unsubmitted probe with a live starting owner stays pendi
     expect(await readFile(f.file, 'utf8')).toBe(f.saved)
     expect(counter.launches).toBe(0)
   } finally { await control.close() }
-}, 30_000)
+}, 90_000)
 
 test.skipIf(!posix)('a fresh request keeps its own settled owner failure while another request or Connect readback never replays it', async () => {
   const f = await originalProbe(false, { freshExecutionProofRequestId: 'TEST-fresh-A' })

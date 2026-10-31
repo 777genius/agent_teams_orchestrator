@@ -3,7 +3,8 @@ import type { OpenCodePreparedProfile, OpenCodeExecutionProof } from '../types.j
 import type { ControllerToolProof } from './OpenCodeV2ControllerTools.js'
 import type { QueueIntent } from '../execution/OpenCodeV2AdmissionService.js'
 import type { AdmissionRecord, SessionAuthority } from '../execution/OpenCodeV2ExecutionContracts.js'
-import type { RunInitializationPhase } from '../execution/OpenCodeV2Diagnostics.js'
+import type { OpenCodeV2ProviderFailureCategory, RunInitializationPhase } from '../execution/OpenCodeV2Diagnostics.js'
+import type { OpenCodeV2ProviderWireFailure } from '../transport/OpenCodeV2ProviderWire.js'
 import type { OpenCodeV2Pin } from '../compatibility/OpenCodeV2Registry.js'
 import type { OpenCodeV2DeliveryBinding } from '../host/OpenCodeV2DeliveryManifest.js'
 import type { ExecutionLease, SelectedExecutionProfile, ValidatedExecutionNative } from '../host/OpenCodeV2ExecutionHost.js'
@@ -66,8 +67,7 @@ export type RunStopMember = Readonly<{ memberId: string; cleanup: ExecutionClean
 export type RunProbeFailure = 'native_execution_failed' | 'native_execution_cancelled'
 /** Closed facts of an owner's own initialization failure: a fixed category and the
  * provider wire stage. Never a message, body, path or credential. */
-export type RunOwnerFailure = Readonly<{ category: string
-  operation?: Readonly<{ operation: string; stage: 'request' | 'response' | 'body' | 'decode'; status: number | null }> }>
+export type RunOwnerFailure = Readonly<{ category: OpenCodeV2ProviderFailureCategory; operation?: OpenCodeV2ProviderWireFailure }>
 /** The original owner process is proven gone; `failure` is its own record, if any. */
 export type RunOwnerRetirement = Readonly<{ failure: RunOwnerFailure | null }>
 export type RunControlResult =

@@ -11,6 +11,7 @@ import { boundOpenCodeRead } from '../transport/OpenCodeBoundedFetch.js'
 // Real owner processes and kernel process reads. Only the status transport is
 // replaced where a mid-measurement failure must be reproduced deterministically.
 const peer = fileURLToPath(new URL('./fixtures/OpenCodeV2RunControlPeer.ts', import.meta.url))
+const providerEndpoint = fileURLToPath(new URL('./fixtures/OpenCodeV2ProviderEndpointPreload.ts', import.meta.url))
 const binding = { teamId: 'TEST-team', runId: 'TEST-run', controllerInstanceId: 'controller', ownerId: 'owner' }
 const target = { memberId: 'worker', originalSessionId: 'ses_TESToriginal', selectedModel: 'TEST/TEST', pin: '2.0.32' as const }
 const posix = process.platform !== 'win32'
@@ -54,13 +55,19 @@ async function exitedIdentity(): Promise<RunProcessIdentity> {
     return await controls.readRunProcessIdentity(child.pid)
   } finally { await stopTestChild(child) }
 }
-const ownerFailure = { category: 'provider_response_invalid', operation: { operation: 'provider-read', stage: 'decode' as const, status: 404 } }
+const ownerFailure = { category: 'provider_response_invalid', operation: { operation: 'provider-read', stage: 'decode', status: 404 } } as const
 
-for (const failure of ['provider_response_invalid', 'provider_response_invalid SECRET /private/auth'])
-  test.skipIf(!posix)(`an owner whose initialization fails with ${failure.includes('SECRET') ? 'an unclassified' : 'a closed'} cause records it and readiness reports the retirement`, async () => {
+const ownerFailures = {
+  // A real provider read through the wire, refused at its decode stage with 404.
+  wire: { argument: 'TEST-provider-read-404', failure: ownerFailure },
+  unclassified: { argument: 'provider_response_invalid SECRET /private/auth', failure: { category: 'provider_operation_unknown' } },
+} as const
+for (const [kind, { argument, failure: expected }] of Object.entries(ownerFailures))
+  test.skipIf(!posix)(`an owner whose initialization fails with ${kind === 'wire' ? 'a provider wire' : 'an unclassified'} cause records it and readiness reports the retirement`, async () => {
     const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'TEST-owner-retired-')))
     const directory = await controls.reserveRunControlDirectory(root, binding, 'a'.repeat(64))
-    const owner = spawn(process.execPath, [peer, 'serve-fail', root, JSON.stringify(binding), failure], { stdio: ['ignore', 'pipe', 'pipe'] })
+    const owner = spawn(process.execPath, ['--preload', providerEndpoint, peer, 'serve-fail', root, JSON.stringify(binding), argument],
+      { stdio: ['ignore', 'pipe', 'pipe'] })
     try {
       await ready(owner)
       const record = await controls.discoverOpenCodeV2Run(root, binding.teamId, binding.runId)
@@ -68,16 +75,15 @@ for (const failure of ['provider_response_invalid', 'provider_response_invalid S
       const waiting = caught(controls.awaitOpenCodeV2RunMemberReadiness(record, target, 15_000))
       await writeFile(path.join(directory, 'TEST-release-initialization'), '', { flag: 'wx', mode: 0o600 })
       const error = await waiting
-      const category = failure.includes('SECRET') ? 'provider_operation_unknown' : 'provider_response_invalid'
       expect(error).toMatchObject({ message: 'run_owner_retired' })
-      expect(controls.readOpenCodeV2RunOwnerRetiredError(error)).toEqual({ failure: { category } })
+      expect(controls.readOpenCodeV2RunOwnerRetiredError(error)).toEqual({ failure: expected })
       const text = await readFile(path.join(directory, 'owner-failure.json'), 'utf8')
-      expect(JSON.parse(text)).toEqual({ binding, failure: { category } })
+      expect(JSON.parse(text)).toEqual({ binding, failure: expected })
       expect(text).not.toContain('SECRET')
       expect((await lstat(path.join(directory, 'owner-failure.json'))).mode & 0o777).toBe(0o600)
       expect(JSON.parse(await readFile(path.join(directory, 'stop.json'), 'utf8')).receipt).toEqual({ kind: 'stop', state: 'cleanup_unknown', members: [] })
       await boundOpenCodeRead(exited(owner), 5000)
-      expect(await controls.readOpenCodeV2RunOwnerRetirement(record)).toEqual({ failure: { category } })
+      expect(await controls.readOpenCodeV2RunOwnerRetirement(record)).toEqual({ failure: expected })
       // An error that was not minted from a proven retirement carries no cause.
       expect(controls.readOpenCodeV2RunOwnerRetiredError(new Error('run_owner_retired'))).toBeUndefined()
     } finally { await stopTestChild(owner); await rm(root, { recursive: true, force: true }) }
@@ -114,8 +120,16 @@ test.skipIf(!posix)('an identity measurement that fails because the owner exited
       expect(error).toMatchObject({ message: 'run_owner_retired' })
       expect(controls.readOpenCodeV2RunOwnerRetiredError(error)).toEqual({ failure: ownerFailure })
       expect(request).toHaveBeenCalledTimes(1)
-      // The cause is observational: an unreadable record never blocks the proven retirement.
-      for (const failure of [{ category: 'TEST message with spaces' }, { category: 'provider_response_invalid', extra: true }]) {
+      // Only closed categories are read back; anything else is unknown.
+      for (const category of ['TEST message with spaces', 'run_owner_retired_TEST', 'native_execution_failed']) {
+        await controls.writeRunControlFile(record.directory, 'owner-failure.json', { binding, failure: { category } })
+        expect(await controls.readOpenCodeV2RunOwnerRetirement(record)).toEqual({ failure: { category: 'provider_operation_unknown' } })
+      }
+      // The cause is observational: a malformed record never blocks the proven retirement.
+      for (const failure of [{ category: 'provider_response_invalid', extra: true }, { category: 7 },
+        { ...ownerFailure, operation: { ...ownerFailure.operation, operation: 'TEST-operation' } },
+        { ...ownerFailure, operation: { ...ownerFailure.operation, stage: 'TEST-stage' } },
+        { ...ownerFailure, operation: { ...ownerFailure.operation, status: 42 } }]) {
         await controls.writeRunControlFile(record.directory, 'owner-failure.json', { binding, failure })
         expect(await controls.readOpenCodeV2RunOwnerRetirement(record)).toEqual({ failure: null })
       }
@@ -157,13 +171,28 @@ test.skipIf(!posix)('a live owner keeps the original error: at once without a to
     const missing = Object.assign(new Error('TEST endpoint missing'), { code: 'ENOENT' })
     const request = spyOn(controls, 'requestOpenCodeV2Run').mockImplementation(async () => { throw missing })
     try {
-      const started = Date.now()
-      expect(await caught(controls.awaitOpenCodeV2RunMemberReadiness(record, target, 5000))).toBe(missing)
-      expect(Date.now() - started).toBeLessThan(2500)
+      // Without a tombstone the error returns at once, well inside the 10s stop window
+      // that a stopping owner would be followed for.
+      let started = Date.now()
+      expect(await caught(controls.awaitOpenCodeV2RunMemberReadiness(record, target, 20_000))).toBe(missing)
+      expect(Date.now() - started).toBeLessThan(9000)
       expect(await controls.readOpenCodeV2RunOwnerRetirement(record)).toBeNull()
+      // With a tombstone the same live owner is followed until the readiness deadline.
       await controls.writeRunControlFile(record.directory, 'tombstone.json', { binding })
+      started = Date.now()
       expect(await caught(controls.awaitOpenCodeV2RunMemberReadiness(record, target, 1500))).toBe(missing)
+      expect(Date.now() - started).toBeGreaterThanOrEqual(1000)
       expect(await controls.readOpenCodeV2RunOwnerRetirement(record)).toBeNull()
     } finally { request.mockRestore() }
   } finally { await rm(root, { recursive: true, force: true }) }
 }, 30_000)
+
+test('Windows presence never proves absence: an unreadable start time stays unknown', async () => {
+  const identity = { pid: 4242, startTicks: '1700000000000', bootId: 'windows', executablePath: 'windows-process', executableSha256: '0'.repeat(64) }
+  // Gone, exited and access denied all read as null on Windows.
+  const unknown = await caught(controls.readWindowsRunProcessPresence(identity, async () => null))
+  expect(unknown).toMatchObject({ message: 'run_process_unknown' })
+  expect((unknown as { code?: unknown }).code).toBeUndefined()
+  expect(await controls.readWindowsRunProcessPresence(identity, async () => 1700000000000)).toBe('same')
+  expect(await controls.readWindowsRunProcessPresence(identity, async () => 1700000000001)).toBe('replaced')
+})

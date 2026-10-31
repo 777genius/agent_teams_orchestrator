@@ -11,6 +11,8 @@ import type { ExecutionMention } from '../transport/OpenCodeV2ExecutionClientFac
 import type { RunAnyProcessIdentity, RunBinding, RunControlRecord, RunControlRequest, RunControlResult, RunMemberStatus, RunOwnerFailure, RunOwnerRetirement, RunProcessIdentity, RunStopMember, RunUnixControlRecord } from './OpenCodeV2RunTypes.js'
 import type { ExecutionBirth, SelectedExecutionProfile } from '../host/OpenCodeV2ExecutionBinding.js'
 import { readProcessStartTimeMs } from '../../../utils/processKill.js'
+import { openCodeV2ProviderFailureCategory } from '../execution/OpenCodeV2Diagnostics.js'
+import { OPEN_CODE_V2_PROVIDER_OPERATIONS, OPEN_CODE_V2_PROVIDER_STAGES } from '../transport/OpenCodeV2ProviderWire.js'
 import { OpenCodeV2RunNonces } from './OpenCodeV2RunNonces.js'
 import { retainedControllerPath } from './OpenCodeV2ControllerTools.js'
 export type { RunBinding, RunControlRecord, RunControlRequest, RunControlResult, RunLaunchPlan } from './OpenCodeV2RunTypes.js'
@@ -451,17 +453,23 @@ export async function readOpenCodeV2RunStop(record: RunControlRecord,
   const retired = await runOwnerRetired(record, deadline)
   return { ...receipt, state: receipt.state === 'stopped' && retired ? 'stopped' : 'cleanup_unknown', ownerRetired: retired }
 }
+/** Windows reads only the start time of another process, and its `null` covers a gone,
+ * exited and inaccessible process alike. It never proves absence: `null` stays UNKNOWN,
+ * so retirement and probe replacement fail closed on Windows. */
+export async function readWindowsRunProcessPresence(identity: RunProcessIdentity,
+  readStartTime: (pid: number) => Promise<number | null> = pid => readProcessStartTimeMs(pid)): Promise<'same' | 'replaced'> {
+  const started = await readStartTime(identity.pid)
+  executionAssert(started !== null, 'run_process_unknown')
+  return String(started) === identity.startTicks ? 'same' : 'replaced'
+}
 /** Kernel presence of the exact published process instance, without hashing its image.
- * 'absent' only when the kernel has no process for the PID; 'replaced' when another
- * instance or boot holds it. Access and query failures throw and stay UNKNOWN. */
+ * POSIX: 'absent' only on the kernel's ESRCH (Darwin) or a missing /proc entry while
+ * procfs answers (Linux). 'replaced' when another instance or boot holds the PID.
+ * Windows never reports 'absent' (see above). Query failures throw and stay UNKNOWN. */
 async function readRunProcessPresence(identity: RunProcessIdentity): Promise<'same' | 'replaced' | 'absent'> {
   const pid = identity.pid
   executionAssert(Number.isSafeInteger(pid) && pid > 0, 'run_process_unknown')
-  // Same rule as the identity read: Windows only reads the start time of another process.
-  if (WINDOWS) {
-    const started = await readProcessStartTimeMs(pid)
-    return started === null ? 'absent' : String(started) === identity.startTicks ? 'same' : 'replaced'
-  }
+  if (WINDOWS) return readWindowsRunProcessPresence(identity)
   if (process.platform === 'darwin') {
     const { dlopen, FFIType, ptr, toArrayBuffer } = await import('bun:ffi')
     const native = dlopen('/usr/lib/libSystem.B.dylib', {
@@ -472,7 +480,10 @@ async function readRunProcessPresence(identity: RunProcessIdentity): Promise<'sa
     try {
       const info = Buffer.alloc(56), boot = Buffer.alloc(128), length = Buffer.alloc(8)
       length.writeBigUInt64LE(128n)
-      if (native.symbols.proc_pidinfo(pid, 17, 0, ptr(info), info.length) !== info.length) {
+      const written = native.symbols.proc_pidinfo(pid, 17, 0, ptr(info), info.length)
+      if (written !== info.length) {
+        // errno is defined only for the failure return; a short read stays UNKNOWN.
+        executionAssert(written <= 0, 'run_process_unknown')
         const pointer = native.symbols.__error()
         executionAssert(pointer !== null, 'run_process_unknown')
         if (new DataView(toArrayBuffer(pointer, 0, 4)).getInt32(0, true) === 3) return 'absent'
@@ -498,17 +509,18 @@ async function readRunProcessPresence(identity: RunProcessIdentity): Promise<'sa
   executionAssert(startTicks && /^[0-9]+$/.test(startTicks), 'run_process_unknown')
   return bootId === identity.bootId && startTicks === identity.startTicks ? 'same' : 'replaced'
 }
-const providerStages = ['request', 'response', 'body', 'decode'] as const
+/** Only closed categories and provider wire facts: an unknown category reads as
+ * `provider_operation_unknown`; a malformed record is refused. */
 export function parseOpenCodeV2RunOwnerFailure(value: unknown): RunOwnerFailure {
   const row = executionRecord(value); optionalKeys(row, ['category'], ['operation'])
-  const category = row.category
-  executionAssert(typeof category === 'string' && /^[a-z][a-z0-9_]{0,95}$/.test(category), 'run_control_invalid')
+  executionAssert(typeof row.category === 'string', 'run_control_invalid')
+  const category = openCodeV2ProviderFailureCategory(row.category)
   if (row.operation === undefined) return { category }
   const operation = executionRecord(row.operation); keys(operation, ['operation', 'stage', 'status'])
-  const name = operation.operation, stage = providerStages.find(value => value === operation.stage)
+  const name = OPEN_CODE_V2_PROVIDER_OPERATIONS.find(value => value === operation.operation)
+  const stage = OPEN_CODE_V2_PROVIDER_STAGES.find(value => value === operation.stage)
   const status = operation.status === null ? null : typeof operation.status === 'number' ? operation.status : Number.NaN
-  executionAssert(typeof name === 'string' && /^[a-z][a-z-]{0,31}$/.test(name) && stage &&
-    (status === null || Number.isSafeInteger(status) && status >= 100 && status <= 599), 'run_control_invalid')
+  executionAssert(name && stage && (status === null || Number.isSafeInteger(status) && status >= 100 && status <= 599), 'run_control_invalid')
   return { category, operation: { operation: name, stage, status } }
 }
 /** The owner's own closed initialization cause, written before its stop archive. */

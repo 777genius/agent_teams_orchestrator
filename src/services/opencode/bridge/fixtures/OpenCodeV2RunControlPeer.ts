@@ -6,6 +6,7 @@ import { discoverOpenCodeV2Run, parseRunBinding, parseRunControlRequest, request
 import { writeRunControlFile } from '../OpenCodeV2RunControl.js'
 import { executionAssert, type ExecutionAuthority } from '../../execution/OpenCodeV2ExecutionContracts.js'
 import { OpenCodeV2ExecutionFetch } from '../../transport/OpenCodeV2ExecutionFetch.js'
+import { OpenCodeV2ProviderWire } from '../../transport/OpenCodeV2ProviderWire.js'
 import type { ExecutionBridgeClient, ExecutionInbox } from '../../transport/OpenCodeV2ExecutionClientFactory.js'
 import { OpenCodeV2RunOwner } from '../OpenCodeV2RunOwner.js'
 import { OpenCodeV2TeamBridge } from '../OpenCodeV2TeamBridge.js'
@@ -75,7 +76,15 @@ function syntheticOwner(dataRoot: string, binding: RunBinding, directory: string
         catch (error) { if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error }
         await new Promise(resolve => setTimeout(resolve, 20))
       }
-      // The owner's own initialization failure, as an exact closed code.
+      // A real provider read through the wire (needs OpenCodeV2ProviderEndpointPreload.ts),
+      // which fails at its decode stage with 404 like the selected-auth provider lookup.
+      if (acquisitionFailure === 'TEST-provider-read-404') {
+        const wire = new OpenCodeV2ProviderWire(authority, Date.now() + 5000)
+        try { await wire.fetch(`http://127.0.0.1:1/api/provider/TEST?location%5Bdirectory%5D=${encodeURIComponent(authority.directory)}`) }
+        finally { await wire.dispose() }
+        throw new Error('TEST_provider_read_not_refused')
+      }
+      // Otherwise the owner's own initialization failure, as an exact code.
       if (acquisitionFailure !== undefined) throw new Error(acquisitionFailure)
       return { authority, signal: new AbortController().signal, close: async () => {
       effects.closed++; await writeRunControlFile(directory, 'synthetic-effects.json', effects)
