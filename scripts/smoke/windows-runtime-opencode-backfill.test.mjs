@@ -377,6 +377,7 @@ test('teardown retains the last phase on timeout or failure and keeps stdout sep
     assert.deepEqual(argv.slice(0, -1), ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command']);
     assert.equal(options.env, env);
     assert.equal(options.timeout, WINDOWS_BACKFILL_TEARDOWN_TIMEOUT_MS);
+    assert.equal(WINDOWS_BACKFILL_TEARDOWN_TIMEOUT_MS, 3 * 60_000);
     assert.deepEqual(options.stdio, ['ignore', 'pipe', 'pipe']);
     // Check emitted diagnostic boundaries; native execution remains Windows-only.
     const command = argv.at(-1);
