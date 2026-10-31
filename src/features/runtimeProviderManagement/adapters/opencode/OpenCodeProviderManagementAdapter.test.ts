@@ -8607,6 +8607,62 @@ describe('OpenCodeProviderManagementAdapter', () => {
     })
   }
 
+  test('reserves stale catalog recovery time before the overall instance deadline', async () => {
+    let stallInstance = false
+    let requestSignal: AbortSignal | undefined
+    let releases = 0
+    const adapter = new OpenCodeProviderManagementAdapter({
+      catalogOverallTimeoutMs: 2_500,
+      catalogInstanceTimeoutMs: 2_500,
+      catalogTimeoutMs: 100,
+      resolveBinaryPath: () => testBinaryPath,
+      resolveBinaryIdentity: async () => 'test-binary',
+      profileManager: {
+        listManagedAuthPaths: async () => [],
+        readCatalogSelectedAuthIdentity: async () => ({
+          source: 'absent', managed: 'absent', preferences: 'known:preferences',
+        }),
+      },
+      inventoryService: { probe: async () => inventory({ models: [], availableProviders: [] }) },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => { releases += 1 },
+      },
+      clientFactory: { create: (_baseUrl, options) => {
+        requestSignal = options?.signal
+        return {
+          getConfigProviders: async () => stallInstance
+            ? new Promise<never>(() => {})
+            : { providers: [], default: {} },
+          getProviders: async () => ({
+            all: [{ id: 'local', name: 'Local', models: { cached: {} } }],
+            connected: [], default: {},
+          }),
+          getProviderAuth: async () => ({}),
+        }
+      } },
+    })
+    const timingAdapter = adapter as unknown as {
+      readCatalogIdentity(): Promise<{
+        key: string; reusable: boolean; managedAuthConsistent: boolean; managedAuthAbsent: boolean
+      }>
+    }
+    timingAdapter.readCatalogIdentity = async () => ({
+      key: 'instance-reserve-fixture', reusable: true,
+      managedAuthConsistent: true, managedAuthAbsent: true,
+    })
+    const input = { runtimeId: 'opencode' as const, providerId: 'local', projectPath: '/tmp/project' }
+    expect((await adapter.loadModels(input)).ok).toBe(true)
+    stallInstance = true
+    const result = await adapter.loadModels(input)
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.value.catalogState).toBe('stale')
+    expect(result.value.models.map(model => model.modelId)).toEqual(['local/cached'])
+    expect(requestSignal?.aborted).toBe(true)
+    expect(releases).toBe(2)
+  })
+
   test('keeps a late catalog write on symlink target A out of retargeted project B', async () => {
     if (process.platform === 'win32') return
     const tempDir = await mkdtemp(path.join(os.tmpdir(), 'opencode-catalog-symlink-'))
