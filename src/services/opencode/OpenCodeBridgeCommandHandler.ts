@@ -63,7 +63,8 @@ import { resolveOpenCodeProviderScopedModel } from './OpenCodeModelResolver.js'
 import { parseOpenCodeProviderScopedModelRef } from './OpenCodeModelRef.js'
 import { canonicalizeOpenCodeProviderId } from './OpenCodeProviderIdentity.js'
 import { resolveOpenCodeCursorManagedAssets } from './OpenCodeCursorManagedAssets.js'
-import { buildManagedConfigFingerprint, canonicalizeOpenCodeProjectPath, openCodeProfileManager } from './OpenCodeProfileManager.js'
+import { applyOpenCodeManagedPathsToAppMcpLaunchConfig, buildManagedConfigFingerprint, canonicalizeOpenCodeProjectPath, openCodeProfileManager } from './OpenCodeProfileManager.js'
+import { resolveClaudeMultimodelPaths } from './OpenCodeManagedPaths.js'
 import { normalizeOpenCodePermissions } from './OpenCodePermissionNormalizer.js'
 import { openCodeProvisioningProbe, type OpenCodeAuthorityRejection } from './OpenCodeProvisioningProbe.js'
 import { normalizeOpenCodeProjectIdentity } from './OpenCodeProjectIdentity.js'
@@ -1778,6 +1779,19 @@ async function listAppMcpToolsFromResolvedLaunchConfig(
   }
 }
 
+/** xAI observations have no retained profile, but the host was prepared
+ * with managed data/cache paths. Compare and tools/list against that same
+ * effective local MCP config, never the unprepared bridge env projection. */
+async function resolveOpenCodeGroupAppMcpLaunchConfig(
+  snapshot: OpenCodeProvisioningSnapshot,
+): Promise<ResolvedAppMcpLaunchConfig> {
+  if (snapshot.host) return getRetainedAppMcpLaunchConfig(snapshot.host)
+  return applyOpenCodeManagedPathsToAppMcpLaunchConfig(
+    await resolveOpenCodeAppMcpLaunchConfig(),
+    resolveClaudeMultimodelPaths(),
+  )
+}
+
 /** Resolve the group-control owner from the same MCP launch configuration
  * selected by the live host, not from an unrelated child or stale bridge hint. */
 async function readOpenCodeGroupControlBinding(
@@ -1803,9 +1817,7 @@ async function readLiveGroupChatRunProofs(
   if (!snapshot || (!snapshot.host && !ownedOAuthHost)
     || (snapshot.host && !isAppMcpConnected(snapshot))) return []
   try {
-    const launchConfig = snapshot.host
-      ? getRetainedAppMcpLaunchConfig(snapshot.host)
-      : await resolveOpenCodeAppMcpLaunchConfig()
+    const launchConfig = await resolveOpenCodeGroupAppMcpLaunchConfig(snapshot)
     const baseEnv = snapshot.host?.profile.env ?? process.env
     if (ownedOAuthHost) {
       // SessionBridge attests this exact endpoint. Verify its loaded MCP config
@@ -5298,9 +5310,7 @@ async function runSendMessage(
   let groupCatalog: unknown
   if (groupChatId && (snapshot.host || authority?.ownedOAuthHost)) {
     try {
-      const launchConfig = snapshot.host
-        ? getRetainedAppMcpLaunchConfig(snapshot.host)
-        : await resolveOpenCodeAppMcpLaunchConfig()
+      const launchConfig = await resolveOpenCodeGroupAppMcpLaunchConfig(snapshot)
       const binding = await readOpenCodeGroupControlBinding(snapshot, launchConfig)
       if (binding) groupCatalog = await readFreshGroupChatCatalog(teamId, memberName, binding)
     } catch { /* Unavailable is explicit in the handoff prompt. */ }
