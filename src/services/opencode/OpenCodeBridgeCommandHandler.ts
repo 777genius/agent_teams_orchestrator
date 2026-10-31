@@ -5281,13 +5281,15 @@ async function runSendMessage(
 
   let groupCatalog: unknown
   if (groupChatId && (snapshot.host || authority?.ownedOAuthHost)) {
-    const launchConfig = snapshot.host
-      ? getRetainedAppMcpLaunchConfig(snapshot.host)
-      : await resolveOpenCodeAppMcpLaunchConfig()
-    const env = { ...(snapshot.host?.profile.env ?? process.env), ...launchConfig.config.environment }
-    try { groupCatalog = await readFreshGroupChatCatalog(teamId, memberName, {
-      controlUrl: env.AGENT_TEAMS_BOUND_CONTROL_URL, context: env.AGENT_TEAMS_BOUND_CONTEXT_JSON,
-    }) } catch { /* Unavailable is explicit in the handoff prompt. */ }
+    try {
+      const launchConfig = snapshot.host
+        ? getRetainedAppMcpLaunchConfig(snapshot.host)
+        : await resolveOpenCodeAppMcpLaunchConfig()
+      const env = { ...(snapshot.host?.profile.env ?? process.env), ...launchConfig.config.environment }
+      groupCatalog = await readFreshGroupChatCatalog(teamId, memberName, {
+        controlUrl: env.AGENT_TEAMS_BOUND_CONTROL_URL, context: env.AGENT_TEAMS_BOUND_CONTEXT_JSON,
+      })
+    } catch { /* Unavailable is explicit in the handoff prompt. */ }
     await assertStoredDeliveryAuthority(deliveryRecord, authority)
   }
   const groupPrompt = groupChatId ? buildGroupMailboxPrompt({
