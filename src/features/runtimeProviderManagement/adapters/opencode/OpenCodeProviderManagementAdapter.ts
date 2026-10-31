@@ -4173,16 +4173,20 @@ export class OpenCodeProviderManagementAdapter
       }
     }
     if (input.summary) {
-      return {
-        ok: true,
-        value: buildSummaryProviderDirectory({
-          inventory,
-          query: input.query,
-          filter: input.filter,
-          limit: input.limit,
-          cursor: input.cursor,
-        }),
+      const directory = buildSummaryProviderDirectory({
+        inventory,
+        query: input.query,
+        filter: input.filter,
+        limit: input.limit,
+        cursor: input.cursor,
+      })
+      if (inventory.readGeneration === 'v2') {
+        directory.entries = await applyOpenCodeV2DirectoryDefaultSelection(
+          directory.entries,
+          inventory.projectPath,
+        )
       }
+      return { ok: true, value: directory }
     }
 
     const hostManager = this.deps.hostManager ?? openCodeHostManager

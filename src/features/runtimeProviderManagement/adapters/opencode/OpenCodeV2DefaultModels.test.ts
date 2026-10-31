@@ -68,8 +68,8 @@ test('V2 defaults persist across provider catalogs and CLI reads, isolate projec
       hostManager: { ensureHost: async () => assert.fail('V1 host must not run'), releaseHost: async () => {} },
     })
     const input = { runtimeId: 'opencode', providerId: 'deepseek', modelId: model.modelId, projectPath: project, probe: false }
-    const directoryDefaults = async directory => {
-      const result = await adapter.loadDirectory({ runtimeId: 'opencode', projectPath: directory, limit: null })
+    const directoryDefaults = async (directory, summary = false) => {
+      const result = await adapter.loadDirectory({ runtimeId: 'opencode', projectPath: directory, summary, limit: null })
       assert.equal(result.ok, true, JSON.stringify(result))
       return Object.fromEntries(result.value.entries.map(entry => [entry.providerId, entry.defaultModelId]))
     }
@@ -90,9 +90,12 @@ test('V2 defaults persist across provider catalogs and CLI reads, isolate projec
         assert.deepEqual(global.value.configuredModels.find(row => row.modelId === previous.modelId),
           { ...previous, default: false }, 'Preserve existing model metadata while replacing the default flag')
       }
-      assert.equal((await directoryDefaults(project)).deepseek, 'deepseek/chat')
-      assert.equal((await directoryDefaults(other)).deepseek, 'deepseek/chat')
-      assert.equal((await directoryDefaults(project)).opencode, null, 'Managed selection replaces the native default in other provider rows')
+      for (const summary of [false, true]) {
+        const defaults = await directoryDefaults(project, summary)
+        assert.equal(defaults.deepseek, 'deepseek/chat')
+        assert.equal((await directoryDefaults(other, summary)).deepseek, 'deepseek/chat')
+        assert.equal(defaults.opencode, null, 'Managed selection replaces the native default in other provider rows')
+      }
       assert.equal(tests, 0, 'Saving the UI preference must not run a model when probe is false')
       assert.equal((await adapter.loadView({ runtimeId: 'opencode', projectPath: other })).value.defaultModel, model.modelId)
       const scoped = await profiles.resolveOpenCodeV2CatalogProfileScope({ providerId: 'deepseek', projectPath: project })
@@ -113,11 +116,13 @@ test('V2 defaults persist across provider catalogs and CLI reads, isolate projec
       assert.equal(partialView.ok, true, JSON.stringify(partialView))
       assert.equal(partialView.value.defaultModel, 'deepseek/chat')
       assert.equal(partialView.value.defaultModelSource, 'all_projects')
-      const partialDirectory = await adapter.loadDirectory({ runtimeId: 'opencode', projectPath: project, limit: null })
-      assert.equal(partialDirectory.ok, true, JSON.stringify(partialDirectory))
-      const account = partialDirectory.value.entries.find(row => row.providerId === 'deepseek')
-      assert.equal(account.defaultModelId, 'deepseek/chat')
-      assert.equal(account.modelCount, null, 'The account catalog is unknown, not empty')
+      for (const summary of [false, true]) {
+        const partialDirectory = await adapter.loadDirectory({ runtimeId: 'opencode', projectPath: project, summary, limit: null })
+        assert.equal(partialDirectory.ok, true, JSON.stringify(partialDirectory))
+        const account = partialDirectory.value.entries.find(row => row.providerId === 'deepseek')
+        assert.equal(account.defaultModelId, 'deepseek/chat')
+        assert.equal(account.modelCount, null, 'The account catalog is unknown, not empty')
+      }
       const partialCli = await getProviderModels('opencode', { getOpenCodeInventorySnapshot: async () => snapshot(project) })
       assert.equal(partialCli.defaultModel, 'deepseek/chat')
       assert.equal(partialCli.models.some(row => row.id === 'deepseek/chat'), false)
@@ -138,8 +143,10 @@ test('V2 defaults persist across provider catalogs and CLI reads, isolate projec
       assert.equal(local.value.defaultModelSource, 'project')
       assert.deepEqual(local.value.configuredModels.find(row => row.modelId === model.modelId),
         { ...model, default: true })
-      assert.equal((await directoryDefaults(project)).deepseek, 'deepseek/reasoner')
-      assert.equal((await directoryDefaults(other)).deepseek, 'deepseek/chat')
+      for (const summary of [false, true]) {
+        assert.equal((await directoryDefaults(project, summary)).deepseek, 'deepseek/reasoner')
+        assert.equal((await directoryDefaults(other, summary)).deepseek, 'deepseek/chat')
+      }
       assert.equal((await preferences.readOpenCodeManagedDefaultSelection(other)).defaultModel, 'deepseek/chat')
       assert.equal((await getProviderModels('opencode', { getOpenCodeInventorySnapshot: async () => snapshot(project) })).defaultModel, model.modelId)
       const cleared = await adapter.clearProjectDefaultModel({ runtimeId: 'opencode', projectPath: project })
@@ -147,7 +154,9 @@ test('V2 defaults persist across provider catalogs and CLI reads, isolate projec
       assert.equal(cleared.value.projectDefaultModel, null)
       assert.equal(cleared.value.defaultModel, 'deepseek/chat')
       assert.equal(cleared.value.defaultModelSource, 'all_projects')
-      assert.equal((await directoryDefaults(project)).deepseek, 'deepseek/chat')
+      for (const summary of [false, true]) {
+        assert.equal((await directoryDefaults(project, summary)).deepseek, 'deepseek/chat')
+      }
       const failedProbe = await adapter.setDefaultModel({ ...input, modelId: model.modelId, probe: true })
       assert.equal(failedProbe.ok, false)
       assert.equal(failedProbe.error.code, 'model-test-failed')
@@ -165,9 +174,11 @@ test('V2 defaults persist across provider catalogs and CLI reads, isolate projec
       assert.equal(tests, 2)
       const fallback = await adapter.clearProjectDefaultModel({ runtimeId: 'opencode', projectPath: project })
       const reloaded = await adapter.loadView({ runtimeId: 'opencode', projectPath: project })
-      const fallbackDirectory = await directoryDefaults(project)
-      assert.equal(fallbackDirectory.deepseek, null)
-      assert.equal(fallbackDirectory.opencode, null, 'No native or managed directory default is invented')
+      for (const summary of [false, true]) {
+        const fallbackDirectory = await directoryDefaults(project, summary)
+        assert.equal(fallbackDirectory.deepseek, null)
+        assert.equal(fallbackDirectory.opencode, null, 'No native or managed directory default is invented')
+      }
       for (const value of [fallback, reloaded]) {
         assert.equal(value.ok, true, JSON.stringify(value))
         assert.equal(value.value.defaultModel, 'opencode/fallback')
