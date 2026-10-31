@@ -528,7 +528,14 @@ async function acquireProfileSymlinkLock(
       return release
     } catch (error) {
       if (signal?.aborted) throwOpenCodeAbortReason(signal)
-      if (getErrnoCode(error) !== 'ELOCKED' || attempt >= 120) throw error
+      const code = getErrnoCode(error)
+      const retryableWindowsBusy = process.platform === 'win32' && code === 'EBUSY'
+      const transientWindowsAccess = process.platform === 'win32'
+        && (code === 'EPERM' || code === 'EACCES')
+      // Access-denied errors can be transient on Windows, but may also be permanent.
+      // Give them a short chance to settle without hiding a true permission failure.
+      if ((code !== 'ELOCKED' && !retryableWindowsBusy && !transientWindowsAccess)
+        || attempt >= (transientWindowsAccess ? 6 : 120)) throw error
       await waitForOpenCodeAbortableDelay(Math.min(25 * 2 ** attempt, 250), signal)
     }
   }

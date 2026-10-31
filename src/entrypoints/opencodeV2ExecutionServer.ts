@@ -65,7 +65,7 @@ function reportStartupFailure(reason: 'timeout' | 'failed', error?: unknown): vo
 // A source graph can legitimately take more than 30 seconds under concurrent
 // startup. The owner still enforces its original shared initialization deadline;
 // the start request replaces this local watchdog with that absolute deadline.
-let startupTimer = setTimeout(() => { reportStartupFailure('timeout'); void close() }, process.platform === 'win32' ? 120_000 : 60_000)
+let startupTimer = setTimeout(() => { reportStartupFailure('timeout'); void close() }, openCodeV2RunInitializationMs(process.platform))
 function close(): Promise<void> {
   return closeWork ??= (async () => {
     if (!runtimeReady) reportStartupFailure('failed')

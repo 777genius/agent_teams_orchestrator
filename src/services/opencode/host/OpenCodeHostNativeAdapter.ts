@@ -1,3 +1,4 @@
+import { OPEN_CODE_LOADING_TIMEOUT_MS } from '../OpenCodeLoadingBudget.js'
 import { openCodeV2EngineVersion } from '../compatibility/OpenCodeV2Registry.js'
 import { spawn } from 'node:child_process'
 import { randomBytes, randomUUID } from 'node:crypto'
@@ -26,7 +27,7 @@ export function assertOpenCodeV2EndpointAuthority(authority: OpenCodeV2EndpointA
 /** One ephemeral catalog lease. No shared listener adoption, persistent registry or V1 host changes. */
 export async function acquireOpenCodeV2ReadHost(native: OpenCodeV2NativeIdentity, directory: string,
   context: OpenCodeClientRequestContext = {}) {
-  const deadline = Date.now() + Math.min(30_000, context.remainingMs?.() ?? 30_000)
+  const deadline = Date.now() + Math.min(OPEN_CODE_LOADING_TIMEOUT_MS, context.remainingMs?.() ?? OPEN_CODE_LOADING_TIMEOUT_MS)
   const check = () => {
     context.signal?.throwIfAborted()
     openCodeReadAssert(Date.now() < deadline && (context.remainingMs?.() ?? 1) > 0, 'timeout')

@@ -353,14 +353,16 @@ ConvertTo-Json -InputObject $stopped -Depth 4 -Compress
 `;
 }
 
+export const WINDOWS_BACKFILL_TEARDOWN_TIMEOUT_MS = 3 * 60_000;
+
 export function teardownOwnedProcesses(root, report, env = sandboxEnvironment(root, path.join(root, 'opencode.cmd'))) {
   const command = buildWindowsTeardownCommand(root, (report.children || []).map(child => child.pid));
   const argv = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', command];
   const started = performance.now();
   const result = spawnSync('powershell.exe', argv, { env, cwd: root, encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'pipe'], timeout: 30000, maxBuffer: 1024 * 1024, windowsHide: true });
+    stdio: ['ignore', 'pipe', 'pipe'], timeout: WINDOWS_BACKFILL_TEARDOWN_TIMEOUT_MS, maxBuffer: 1024 * 1024, windowsHide: true });
   report.teardown = { executable: 'powershell.exe', argv, pid: result.pid, status: result.status,
-    elapsedMs: Math.round(performance.now() - started), timeoutMs: 30000, signal: result.signal,
+    elapsedMs: Math.round(performance.now() - started), timeoutMs: WINDOWS_BACKFILL_TEARDOWN_TIMEOUT_MS, signal: result.signal,
     stdout: result.stdout, stderr: result.stderr, error: result.error?.message, errorCode: result.error?.code };
   if (result.error) throw result.error;
   assert.equal(result.status, 0, `Owned-process teardown failed: ${result.stderr}`);

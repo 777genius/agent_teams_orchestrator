@@ -153,6 +153,73 @@ function executionProbeResult(
 }
 
 describe('OpenCodeProviderManagementAdapter', () => {
+
+  test('directory passes the same remaining deadline through inventory, host and HTTP', async () => {
+    let capturedHostBudget = 0
+    let capturedSignal: AbortSignal | undefined
+    let capturedReadRemaining: (() => number) | undefined
+    const adapter = new OpenCodeProviderManagementAdapter({
+      viewTimeoutMs: 1_000,
+      inventoryService: { probe: async () => {
+        await Bun.sleep(40)
+        return inventory()
+      } },
+      hostManager: {
+        ensureHost: async options => {
+          capturedHostBudget = options.healthTimeoutMs ?? 0
+          capturedSignal = options.abortSignal
+          return host()
+        },
+        releaseHost: async () => {},
+      },
+      clientFactory: { create: (_url, context) => {
+        capturedReadRemaining = context?.remainingMs
+        expect(context?.signal).toBe(capturedSignal)
+        return {
+          getConfigProviders: async () => ({ providers: [], default: {} }),
+          getProviders: async () => ({ all: [], connected: [], default: {} }),
+          getProviderAuth: async () => ({}),
+        }
+      } },
+    })
+    const result = await adapter.loadDirectory({ runtimeId: 'opencode', projectPath: '/tmp/project' })
+    expect(result.ok).toBe(true)
+    expect(capturedSignal).toBeDefined()
+    expect(capturedHostBudget).toBeGreaterThan(0)
+    expect(capturedHostBudget).toBeLessThan(1_000)
+    expect(capturedReadRemaining).toBeDefined()
+    expect(capturedReadRemaining!()).toBeLessThan(1_000)
+  })
+
+  test('directory rejects host readiness after its inventory consumed the shared deadline', async () => {
+    let observedHostAbort = false
+    const adapter = new OpenCodeProviderManagementAdapter({
+      viewTimeoutMs: 500,
+      inventoryService: { probe: async () => {
+        await Bun.sleep(20)
+        return inventory()
+      } },
+      hostManager: {
+        ensureHost: async options => {
+          const signal = options.abortSignal
+          expect(signal).toBeDefined()
+          await new Promise<void>((_, reject) => {
+            const abort = () => { observedHostAbort = true; reject(signal!.reason) }
+            if (signal!.aborted) abort()
+            else signal!.addEventListener('abort', abort, { once: true })
+          })
+          return host()
+        },
+        releaseHost: async () => {},
+      },
+    })
+    const result = await adapter.loadDirectory({ runtimeId: 'opencode', projectPath: '/tmp/project' })
+    expect(result.ok).toBe(false)
+    expect(observedHostAbort).toBe(true)
+    if (!result.ok) expect(result.error.message).toContain('timed out')
+  })
+
+
   test('recovers setup discovery after one cold catalog read without retrying successful endpoints', async () => {
     const initialization: boolean[] = []
     let providerReads = 0
@@ -815,14 +882,14 @@ describe('OpenCodeProviderManagementAdapter', () => {
       {
         projectPath: '/tmp/project',
         hostLifetime: 'process',
-        healthTimeoutMs: 10_000,
+        healthTimeoutMs: 180_000,
         preparedProfile: true,
         includeAppMcp: false,
       },
       {
         projectPath: '/tmp/project',
         hostLifetime: 'process',
-        healthTimeoutMs: 10_000,
+        healthTimeoutMs: expect.any(Number),
         preparedProfile: true,
         includeAppMcp: false,
       },
@@ -834,6 +901,8 @@ describe('OpenCodeProviderManagementAdapter', () => {
         includeAppMcp: undefined,
       },
     ])
+    expect(ensureHostCalls[1]?.healthTimeoutMs).toBeGreaterThan(0)
+    expect(ensureHostCalls[1]?.healthTimeoutMs).toBeLessThanOrEqual(180_000)
     expect(releasedHosts).toEqual(['host-key', 'host-key', 'host-key'])
     expect(retainedHostLeases).toHaveLength(2)
     expect(releasedHostLeases).toEqual(retainedHostLeases)
@@ -8537,6 +8606,62 @@ describe('OpenCodeProviderManagementAdapter', () => {
       expect(releaseCount).toBe(phaseCase === 'host is bounded' ? 0 : 1)
     })
   }
+
+  test('reserves stale catalog recovery time before the overall instance deadline', async () => {
+    let stallInstance = false
+    let requestSignal: AbortSignal | undefined
+    let releases = 0
+    const adapter = new OpenCodeProviderManagementAdapter({
+      catalogOverallTimeoutMs: 2_500,
+      catalogInstanceTimeoutMs: 2_500,
+      catalogTimeoutMs: 100,
+      resolveBinaryPath: () => testBinaryPath,
+      resolveBinaryIdentity: async () => 'test-binary',
+      profileManager: {
+        listManagedAuthPaths: async () => [],
+        readCatalogSelectedAuthIdentity: async () => ({
+          source: 'absent', managed: 'absent', preferences: 'known:preferences',
+        }),
+      },
+      inventoryService: { probe: async () => inventory({ models: [], availableProviders: [] }) },
+      hostManager: {
+        ensureHost: async () => host(),
+        releaseHost: async () => { releases += 1 },
+      },
+      clientFactory: { create: (_baseUrl, options) => {
+        requestSignal = options?.signal
+        return {
+          getConfigProviders: async () => stallInstance
+            ? new Promise<never>(() => {})
+            : { providers: [], default: {} },
+          getProviders: async () => ({
+            all: [{ id: 'local', name: 'Local', models: { cached: {} } }],
+            connected: [], default: {},
+          }),
+          getProviderAuth: async () => ({}),
+        }
+      } },
+    })
+    const timingAdapter = adapter as unknown as {
+      readCatalogIdentity(): Promise<{
+        key: string; reusable: boolean; managedAuthConsistent: boolean; managedAuthAbsent: boolean
+      }>
+    }
+    timingAdapter.readCatalogIdentity = async () => ({
+      key: 'instance-reserve-fixture', reusable: true,
+      managedAuthConsistent: true, managedAuthAbsent: true,
+    })
+    const input = { runtimeId: 'opencode' as const, providerId: 'local', projectPath: '/tmp/project' }
+    expect((await adapter.loadModels(input)).ok).toBe(true)
+    stallInstance = true
+    const result = await adapter.loadModels(input)
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.value.catalogState).toBe('stale')
+    expect(result.value.models.map(model => model.modelId)).toEqual(['local/cached'])
+    expect(requestSignal?.aborted).toBe(true)
+    expect(releases).toBe(2)
+  })
 
   test('keeps a late catalog write on symlink target A out of retargeted project B', async () => {
     if (process.platform === 'win32') return
