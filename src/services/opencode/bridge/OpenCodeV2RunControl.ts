@@ -8,7 +8,7 @@ import path from 'node:path'
 import { canonicalExecutionJSON, executionAssert, executionHash, executionRecord, assertIntentIdentity, openCodeV2RunInitializationMs, type ExecutionContext } from '../execution/OpenCodeV2ExecutionContracts.js'
 import type { QueueIntent } from '../execution/OpenCodeV2AdmissionService.js'
 import type { ExecutionMention } from '../transport/OpenCodeV2ExecutionClientFactory.js'
-import type { RunAnyProcessIdentity, RunBinding, RunControlRecord, RunControlRequest, RunControlResult, RunMemberStatus, RunProcessIdentity, RunStopMember, RunUnixControlRecord } from './OpenCodeV2RunTypes.js'
+import type { RunAnyProcessIdentity, RunBinding, RunControlRecord, RunControlRequest, RunControlResult, RunMemberStatus, RunOwnerFailure, RunOwnerRetirement, RunProcessIdentity, RunStopMember, RunUnixControlRecord } from './OpenCodeV2RunTypes.js'
 import type { ExecutionBirth, SelectedExecutionProfile } from '../host/OpenCodeV2ExecutionBinding.js'
 import { readProcessStartTimeMs } from '../../../utils/processKill.js'
 import { OpenCodeV2RunNonces } from './OpenCodeV2RunNonces.js'
@@ -451,6 +451,135 @@ export async function readOpenCodeV2RunStop(record: RunControlRecord,
   const retired = await runOwnerRetired(record, deadline)
   return { ...receipt, state: receipt.state === 'stopped' && retired ? 'stopped' : 'cleanup_unknown', ownerRetired: retired }
 }
+/** Kernel presence of the exact published process instance, without hashing its image.
+ * 'absent' only when the kernel has no process for the PID; 'replaced' when another
+ * instance or boot holds it. Access and query failures throw and stay UNKNOWN. */
+async function readRunProcessPresence(identity: RunProcessIdentity): Promise<'same' | 'replaced' | 'absent'> {
+  const pid = identity.pid
+  executionAssert(Number.isSafeInteger(pid) && pid > 0, 'run_process_unknown')
+  // Same rule as the identity read: Windows only reads the start time of another process.
+  if (WINDOWS) {
+    const started = await readProcessStartTimeMs(pid)
+    return started === null ? 'absent' : String(started) === identity.startTicks ? 'same' : 'replaced'
+  }
+  if (process.platform === 'darwin') {
+    const { dlopen, FFIType, ptr, toArrayBuffer } = await import('bun:ffi')
+    const native = dlopen('/usr/lib/libSystem.B.dylib', {
+      proc_pidinfo: { args: [FFIType.i32, FFIType.i32, FFIType.u64, FFIType.ptr, FFIType.i32], returns: FFIType.i32 },
+      sysctlbyname: { args: [FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.u64], returns: FFIType.i32 },
+      __error: { args: [], returns: FFIType.ptr },
+    })
+    try {
+      const info = Buffer.alloc(56), boot = Buffer.alloc(128), length = Buffer.alloc(8)
+      length.writeBigUInt64LE(128n)
+      if (native.symbols.proc_pidinfo(pid, 17, 0, ptr(info), info.length) !== info.length) {
+        const pointer = native.symbols.__error()
+        executionAssert(pointer !== null, 'run_process_unknown')
+        if (new DataView(toArrayBuffer(pointer, 0, 4)).getInt32(0, true) === 3) return 'absent'
+        throw Object.assign(new Error('run_process_unknown'), { code: 'EACCES' })
+      }
+      executionAssert(native.symbols.sysctlbyname(ptr(Buffer.from('kern.bootsessionuuid\0')), ptr(boot), ptr(length), null, 0) === 0, 'run_process_unknown')
+      const bootId = boot.toString('utf8').split('\0')[0]!.toLowerCase()
+      // The same unique process ID:PID version fields the identity read publishes.
+      return bootId === identity.bootId && `${info.readBigUInt64LE(16)}:${info.readInt32LE(32)}` === identity.startTicks ? 'same' : 'replaced'
+    } finally { native.close() }
+  }
+  executionAssert(process.platform === 'linux', 'run_source_linux_required')
+  let stat: string
+  try { stat = await readFile(`/proc/${pid}/stat`, 'utf8') }
+  catch (error) {
+    const code = executionRecord(error).code
+    if (code !== 'ENOENT' && code !== 'ESRCH') throw error
+    // A missing entry proves absence only while procfs itself answers.
+    await readFile('/proc/self/stat', 'utf8'); return 'absent'
+  }
+  const bootId = (await readFile('/proc/sys/kernel/random/boot_id', 'utf8')).trim()
+  const startTicks = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/)[19]
+  executionAssert(startTicks && /^[0-9]+$/.test(startTicks), 'run_process_unknown')
+  return bootId === identity.bootId && startTicks === identity.startTicks ? 'same' : 'replaced'
+}
+const providerStages = ['request', 'response', 'body', 'decode'] as const
+export function parseOpenCodeV2RunOwnerFailure(value: unknown): RunOwnerFailure {
+  const row = executionRecord(value); optionalKeys(row, ['category'], ['operation'])
+  const category = row.category
+  executionAssert(typeof category === 'string' && /^[a-z][a-z0-9_]{0,95}$/.test(category), 'run_control_invalid')
+  if (row.operation === undefined) return { category }
+  const operation = executionRecord(row.operation); keys(operation, ['operation', 'stage', 'status'])
+  const name = operation.operation, stage = providerStages.find(value => value === operation.stage)
+  const status = operation.status === null ? null : typeof operation.status === 'number' ? operation.status : Number.NaN
+  executionAssert(typeof name === 'string' && /^[a-z][a-z-]{0,31}$/.test(name) && stage &&
+    (status === null || Number.isSafeInteger(status) && status >= 100 && status <= 599), 'run_control_invalid')
+  return { category, operation: { operation: name, stage, status } }
+}
+/** The owner's own closed initialization cause, written before its stop archive. */
+async function readRunOwnerFailure(unix: RunUnixControlRecord): Promise<RunOwnerFailure | null> {
+  let bytes: Buffer
+  try { bytes = await readPrivate(path.join(unix.directory, 'owner-failure.json'), unix.uid) }
+  catch (error) { if (executionRecord(error).code === 'ENOENT') return null; throw error }
+  let value: unknown
+  try { value = JSON.parse(bytes.toString('utf8')) } catch { throw new Error('run_control_invalid') }
+  const row = executionRecord(value); keys(row, ['binding', 'failure'])
+  executionAssert(executionHash(row.binding) === executionHash(unix.binding), 'run_control_foreign')
+  return parseOpenCodeV2RunOwnerFailure(row.failure)
+}
+/** 'stopping': the same process is alive after publishing its tombstone. 'unproven': a
+ * live owner without a tombstone, or a PID held by another process without the owner's
+ * own retirement archive. */
+async function inspectRunOwnerExit(record: RunControlRecord): Promise<RunOwnerRetirement | 'stopping' | 'unproven'> {
+  const unix = unixRecord(record)
+  await privatePath(unix.directory, 'directory', unix.uid)
+  const current = parseRecord(JSON.parse((await readPrivate(path.join(unix.directory, 'control.json'), unix.uid)).toString('utf8')))
+  executionAssert(executionHash(current) === executionHash(unix), 'run_control_changed')
+  const presence = await readRunProcessPresence(unix.process)
+  if (presence === 'same') {
+    return await privatePath(path.join(unix.directory, 'tombstone.json'), 'file', unix.uid).then(() => 'stopping' as const,
+      (error: unknown) => { if (executionRecord(error).code === 'ENOENT') return 'unproven' as const; throw error })
+  }
+  if (presence === 'replaced' && (await readOpenCodeV2RunStop(record))?.ownerRetired !== true) return 'unproven'
+  // The cause is observational: an unreadable record never blocks a proven retirement.
+  return { failure: await readRunOwnerFailure(unix).catch(() => null) }
+}
+/** Read-only proof that the exact original owner process is gone: the kernel has no
+ * process for its PID, or its own stop archive proves retirement after the PID changed
+ * hands. A live owner or a tombstone alone stays unretired; this never authenticates,
+ * signals or replaces any process. */
+export async function readOpenCodeV2RunOwnerRetirement(record: RunControlRecord): Promise<RunOwnerRetirement | null> {
+  const inspected = await inspectRunOwnerExit(record)
+  return typeof inspected === 'string' ? null : inspected
+}
+const ownerRetirements = new WeakMap<Error, RunOwnerRetirement>()
+function ownerRetiredError(retirement: RunOwnerRetirement): Error {
+  const error = new Error('run_owner_retired'); ownerRetirements.set(error, retirement); return error
+}
+/** Only an error minted here from a proven retirement carries the owner's closed cause. */
+export function readOpenCodeV2RunOwnerRetiredError(error: unknown): RunOwnerRetirement | undefined {
+  return error instanceof Error ? ownerRetirements.get(error) : undefined
+}
+/** Follow an owner that is leaving until its exit is proven, within the stop reconcile
+ * window. `stopping` is the owner's own authenticated state. An unproven owner or an
+ * unreadable proof returns null at once, so callers keep their previous result. */
+async function awaitRunOwnerExit(record: RunControlRecord, deadline: number, stopping: boolean): Promise<RunOwnerRetirement | null> {
+  const until = Math.min(deadline, Date.now() + STOP_RECONCILE_MS)
+  while (Date.now() < until) {
+    let inspected: Awaited<ReturnType<typeof inspectRunOwnerExit>>
+    try { inspected = await inspectRunOwnerExit(record) } catch { return null }
+    if (typeof inspected !== 'string') return inspected
+    if (inspected === 'unproven' && !stopping) return null
+    await new Promise(resolve => setTimeout(resolve, Math.min(100, Math.max(1, until - Date.now()))))
+  }
+  return null
+}
+// Failures an exiting owner produces: a removed endpoint or file, an absent process,
+// or an identity read that changed or failed between its two kernel reads.
+const ownerExitMessages = new Set(['run_process_changed', 'run_process_unknown', 'run_owner_stale'])
+async function classifyRunOwnerExit(record: RunControlRecord, failure: unknown, deadline: number): Promise<unknown> {
+  const code = failure !== null && typeof failure === 'object' ? (failure as { code?: unknown }).code : undefined
+  if (!(code === 'ENOENT' || code === 'ESRCH' || failure instanceof Error && ownerExitMessages.has(failure.message))) return failure
+  // Only a proven exit replaces the original error; a PID held by another process
+  // without the owner's own retirement archive stays a process change.
+  const retirement = await awaitRunOwnerExit(record, deadline, false)
+  return retirement ? ownerRetiredError(retirement) : failure
+}
 /** Endpoint publication precedes native initialization. Observe only this authenticated
  * original owner until its original member is ready; this never submits or replaces input. */
 export function isTransientOpenCodeV2ControlRead(error: unknown): boolean {
@@ -470,7 +599,7 @@ export async function awaitOpenCodeV2RunMemberReadiness(record: RunControlRecord
       // Authentication and framing share this budget. Expiry can close the
       // final read before a reply; expiry never authorizes input submission.
       if (Date.now() >= deadline) return null
-      if (!isTransientOpenCodeV2ControlRead(error)) throw error
+      if (!isTransientOpenCodeV2ControlRead(error)) throw await classifyRunOwnerExit(record, error, deadline)
       await new Promise(resolve => setTimeout(resolve, Math.min(100, Math.max(1, deadline - Date.now()))))
       continue
     }
@@ -486,7 +615,12 @@ export async function awaitOpenCodeV2RunMemberReadiness(record: RunControlRecord
         member.bootstrap.missingNativeMessageID === true && member.runtimePid !== undefined, 'run_readiness_unknown')
       return Date.now() < deadline ? member : null
     }
-    if (status.state !== 'starting') return null
+    if (status.state !== 'starting') {
+      // A stopping or stopped original never becomes ready; report its proven exit.
+      const retirement = await awaitRunOwnerExit(record, deadline, true)
+      if (retirement) throw ownerRetiredError(retirement)
+      return null
+    }
     await new Promise(resolve => setTimeout(resolve, Math.min(100, Math.max(1, deadline - Date.now()))))
   }
   return null

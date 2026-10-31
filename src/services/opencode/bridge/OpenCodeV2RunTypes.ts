@@ -64,6 +64,12 @@ export type RunMemberStatus = Readonly<{
 }>
 export type RunStopMember = Readonly<{ memberId: string; cleanup: ExecutionCleanupReceipt | null; errors: readonly string[] }>
 export type RunProbeFailure = 'native_execution_failed' | 'native_execution_cancelled'
+/** Closed facts of an owner's own initialization failure: a fixed category and the
+ * provider wire stage. Never a message, body, path or credential. */
+export type RunOwnerFailure = Readonly<{ category: string
+  operation?: Readonly<{ operation: string; stage: 'request' | 'response' | 'body' | 'decode'; status: number | null }> }>
+/** The original owner process is proven gone; `failure` is its own record, if any. */
+export type RunOwnerRetirement = Readonly<{ failure: RunOwnerFailure | null }>
 export type RunControlResult =
   | Readonly<{ kind: 'send_refused'; disposition: 'not_reserved'; authority: SessionAuthority; intent: QueueIntent; submissionOwner?: string }>
   | Readonly<{ kind: 'send' | 'observe'; admission: AdmissionRecord; turn: OpenCodeV2TurnProjection | null }>

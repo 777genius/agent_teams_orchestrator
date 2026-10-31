@@ -15,7 +15,8 @@ import { createHash } from 'node:crypto'
 // The real owner/session/admission composition runs in this separate process.
 // Only its native and lease ports are synthetic. No accepted AdmissionRecord
 // is fabricated by the control fixture and no kernel cleanup proof is minted.
-function syntheticOwner(dataRoot: string, binding: RunBinding, directory: string, deadline: number, delayed = false): OpenCodeV2RunOwner {
+function syntheticOwner(dataRoot: string, binding: RunBinding, directory: string, deadline: number, delayed = false,
+  acquisitionFailure?: string): OpenCodeV2RunOwner {
   const authority: ExecutionAuthority = { generation: 'v2', pin: '2.0.32', dialect: 'v2-2.0.32', graphSha256: 'a'.repeat(64),
     selectedCli: { path: '/TEST-native', sha256: 'b'.repeat(64), version: '2.0.32' },
     child: { pid: process.pid, birth: { format: 'linux-start-ticks', value: '1', bootId: 'TEST' },
@@ -74,6 +75,8 @@ function syntheticOwner(dataRoot: string, binding: RunBinding, directory: string
         catch (error) { if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error }
         await new Promise(resolve => setTimeout(resolve, 20))
       }
+      // The owner's own initialization failure, as an exact closed code.
+      if (acquisitionFailure !== undefined) throw new Error(acquisitionFailure)
       return { authority, signal: new AbortController().signal, close: async () => {
       effects.closed++; await writeRunControlFile(directory, 'synthetic-effects.json', effects)
       throw new Error('TEST_no_kernel_cleanup_receipt')
@@ -111,12 +114,15 @@ if (mode === 'sentinel') {
     const result = await requestOpenCodeV2Run(record, request, 5000)
     process.stdout.write(JSON.stringify(result) + '\n')
   } else {
-    executionAssert(mode === 'serve' || mode === 'serve-delayed' || mode.startsWith('serve-drop-'), 'TEST_mode_invalid')
+    executionAssert(mode === 'serve' || mode === 'serve-delayed' || mode === 'serve-fail' || mode.startsWith('serve-drop-'), 'TEST_mode_invalid')
     const drop = mode.startsWith('serve-drop-') ? mode.slice('serve-drop-'.length) : null
+    // serve-fail: the released acquisition throws rawRequest; the owner then retires itself.
+    const failing = mode === 'serve-fail'
     let control: Awaited<ReturnType<typeof serveOpenCodeV2RunControl>> | undefined
     const directory = runControlDirectory(dataRoot, binding.teamId, binding.runId)
     const deadline = Date.now() + 20_000
-    const owner = syntheticOwner(dataRoot, binding, directory, deadline, mode === 'serve-delayed')
+    const owner = syntheticOwner(dataRoot, binding, directory, deadline, mode === 'serve-delayed' || failing,
+      failing ? rawRequest ?? 'TEST_owner_failure' : undefined)
     control = await serveOpenCodeV2RunControl(directory, binding, deadline, 'a'.repeat(64),
       async (request, operationDeadline) => {
         // A lost stop reply: retire without answering. The durable receipt (or
@@ -143,8 +149,10 @@ if (mode === 'sentinel') {
     const retire = () => retiring ??= (async () => { await owner.stop(); await owner.awaitCleanupTerminal(); await control?.close() })()
     process.once('SIGTERM', () => { void retire().finally(() => process.exit(0)) })
     void owner.stopped.then(() => { setTimeout(() => { void retire().finally(() => process.exit(0)) }, 100) })
-    if (mode === 'serve-delayed') process.stdout.write('ready\n')
-    await owner.ready()
-    if (mode !== 'serve-delayed') process.stdout.write('ready\n')
+    if (mode === 'serve-delayed' || failing) process.stdout.write('ready\n')
+    // Like the production entry, a failed initialization exits through owner.stopped.
+    if (failing) await owner.ready().catch(() => undefined)
+    else await owner.ready()
+    if (mode !== 'serve-delayed' && !failing) process.stdout.write('ready\n')
   }
 }

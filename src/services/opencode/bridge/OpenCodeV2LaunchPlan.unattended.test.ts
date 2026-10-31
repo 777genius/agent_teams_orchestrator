@@ -1,10 +1,14 @@
 import { claimOpenCodeV2FreshProofRequest } from './OpenCodeV2FreshProofRequest.js'
 import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test'
+import { spawn, type ChildProcess } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
-import { mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { openCodeV2EngineVersion } from '../compatibility/OpenCodeV2Registry.js'
+import { boundOpenCodeRead } from '../transport/OpenCodeBoundedFetch.js'
 import { openCodeBunVersion } from '../../../constants/openCodeBunVersion.js'
 import * as profiles from '../OpenCodeProfileManager.js'
 import * as nativeIdentity from '../compatibility/OpenCodeNativeIdentity.js'
@@ -14,7 +18,7 @@ import * as probes from './OpenCodeV2ExecutionProbe.js'
 import * as launchPlans from './OpenCodeV2LaunchPlan.js'
 import * as runOwners from './OpenCodeV2RunOwner.js'
 import * as controls from './OpenCodeV2RunControl.js'
-import type { RunControlResult } from './OpenCodeV2RunTypes.js'
+import type { RunBinding, RunControlResult } from './OpenCodeV2RunTypes.js'
 import * as projectIdentity from '../OpenCodeProjectIdentity.js'
 import { buildOpenCodeExecutionProof } from '../OpenCodeExecutionProof.js'
 import { executionHash } from '../execution/OpenCodeV2ExecutionContracts.js'
@@ -601,3 +605,137 @@ test('a model-test tool request cancels and retires the original without approva
   for (const run of [false, true]) expect(await probes.resolveOpenCodeV2ExecutionProbe(request, selection, run)).toEqual(expected)
   expect(operations).toEqual(['permissions', 'stop'])
 })
+
+// A real owner process retires itself after its own initialization failure. Only
+// the replacement launch is a fixture boundary; no native input or model call exists.
+const ownerPeer = fileURLToPath(new URL('./fixtures/OpenCodeV2RunControlPeer.ts', import.meta.url))
+const posix = process.platform !== 'win32'
+const ownerCause = { category: 'provider_response_invalid', operation: { operation: 'provider-read', stage: 'decode' as const, status: 404 } }
+const ownerReason = 'native_owner_retired:provider_response_invalid:provider-read:decode:404'
+// A 60s envelope leaves the probe a 35s budget, so loaded runners do not expire it.
+async function originalProbe(submitted: boolean, extra: Record<string, unknown> = {}, timeoutMs = 60_000) {
+  const request = { ...envelope(), timeoutMs }, selection = await inspectOpenCodeV2SourceAvailability(request)
+  const sourceKey = executionHash({ project, scopeToken: selection.scope.scopeToken,
+    selectedAuthIdentity: selection.scope.selectedAuthIdentity, source: selection.behaviorFingerprint,
+    graph: selection.installedGraphSHA256, projectBehavior: behavior, variant: 'default' })
+  const directory = path.join(root, 'app-data/opencode/v2/execution-probes', sourceKey)
+  await mkdir(directory, { recursive: true, mode: 0o700 })
+  const nonce = 'TESToriginalowner'
+  const binding = { teamId: `TEST-execution-probe-${nonce}`, runId: nonce, controllerInstanceId: nonce, ownerId: nonce }
+  const intent = { identity: { requestId: nonce, deliveryAttemptId: nonce, localMessageId: nonce, nativeInputID: 'msg_TESTowner' },
+    delivery: 'queue', input: { nativeInputID: 'msg_TESTowner', resume: true, text: 'Original TEST input' } }
+  const saved = JSON.stringify({ sourceKey, binding, sessionID: 'ses_TESTowner', intent, submitted, proof: null, retired: false, failure: null, ...extra })
+  const file = path.join(directory, 'probe.json'); await writeFile(file, saved, { mode: 0o600 })
+  return { request, selection, sourceKey, binding, intent, file, saved, dataRoot: await realpath(path.join(root, 'app-data')) }
+}
+function peerReady(child: ChildProcess): Promise<void> {
+  return boundOpenCodeRead(new Promise<void>((resolve, reject) => {
+    let output = ''
+    child.stdout?.on('data', chunk => { output += String(chunk); if (output.includes('ready\n')) resolve() })
+    child.once('error', reject); child.once('exit', () => reject(new Error('TEST_peer_exited_before_ready')))
+  }), 45_000)
+}
+/** The original owner publishes its endpoint, fails its own initialization and exits. */
+async function retiredOwner(dataRoot: string, binding: RunBinding): Promise<string> {
+  const directory = await controls.reserveRunControlDirectory(dataRoot, binding, 'a'.repeat(64))
+  const owner = spawn(process.execPath, [ownerPeer, 'serve-fail', dataRoot, JSON.stringify(binding), 'provider_response_invalid'],
+    { stdio: ['ignore', 'pipe', 'ignore'] })
+  const exit = new Promise<void>(resolve => owner.once('exit', () => resolve()))
+  try {
+    await peerReady(owner)
+    await writeFile(path.join(directory, 'TEST-release-initialization'), '', { flag: 'wx', mode: 0o600 })
+    await boundOpenCodeRead(exit, 45_000)
+  } finally { if (owner.exitCode === null && owner.signalCode === null) owner.kill('SIGKILL') }
+  for (const name of ['tombstone.json', 'stop.json', 'owner-failure.json']) await lstat(path.join(directory, name))
+  // The recorded wire stage of a real provider read, in the owner's own closed record.
+  await controls.writeRunControlFile(directory, 'owner-failure.json', { binding, failure: ownerCause })
+  return directory
+}
+function countLaunches() {
+  const counter = { launches: 0 }
+  restores.push(spyOn(runOwners, 'launchExplicitOpenCodeV2Run').mockImplementation(async () => {
+    counter.launches++; throw new Error('TEST-new-original-boundary')
+  }))
+  return counter
+}
+
+test.skipIf(!posix)('an unsubmitted probe whose owner retired settles with the owner cause and the next request starts one new original', async () => {
+  const f = await originalProbe(false)
+  const runDirectory = await retiredOwner(f.dataRoot, f.binding)
+  const counter = countLaunches()
+  const failed = { state: 'failed' as const, proof: null, reason: ownerReason }
+  expect(await probes.resolveOpenCodeV2ExecutionProbe(f.request, f.selection, true)).toEqual(failed)
+  expect(JSON.parse(await readFile(f.file, 'utf8'))).toEqual({ ...JSON.parse(f.saved), retired: true,
+    failure: 'native_owner_retired', ownerFailure: ownerCause })
+  // Passive reads only report the settled cause.
+  expect(await probes.resolveOpenCodeV2ExecutionProbe(f.request, f.selection, false)).toEqual(failed)
+  expect(counter.launches).toBe(0)
+  await expect(probes.resolveOpenCodeV2ExecutionProbe(f.request, f.selection, true)).rejects.toThrow('TEST-new-original-boundary')
+  expect(counter.launches).toBe(1)
+  const next = JSON.parse(await readFile(f.file, 'utf8'))
+  expect(next).toMatchObject({ sourceKey: f.sourceKey, submitted: false, retired: false, failure: null, proof: null })
+  expect(next.binding).not.toEqual(f.binding)
+  expect(next).not.toHaveProperty('ownerFailure')
+  // Nothing of the retired original is removed.
+  for (const name of ['control.json', 'tombstone.json', 'stop.json', 'owner-failure.json']) await lstat(path.join(runDirectory, name))
+}, 120_000)
+
+test.skipIf(!posix)('a submitted probe whose owner retired is never settled as unsubmitted or replaced', async () => {
+  const f = await originalProbe(true)
+  await retiredOwner(f.dataRoot, f.binding)
+  const counter = countLaunches()
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await expect(probes.resolveOpenCodeV2ExecutionProbe(f.request, f.selection, true)).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(await readFile(f.file, 'utf8')).toBe(f.saved)
+  }
+  const settled = JSON.stringify({ ...JSON.parse(f.saved), retired: true, failure: 'native_execution_failed' })
+  await writeFile(f.file, settled, { mode: 0o600 })
+  expect(await probes.resolveOpenCodeV2ExecutionProbe(f.request, f.selection, true))
+    .toEqual({ state: 'failed', proof: null, reason: 'native_execution_failed' })
+  // Owner retirement can never describe an original that received input.
+  for (const forged of [{ retired: true, failure: 'native_owner_retired' },
+    { retired: true, failure: 'native_owner_retired', ownerFailure: ownerCause },
+    { retired: true, failure: 'native_execution_failed', ownerFailure: ownerCause }]) {
+    await writeFile(f.file, JSON.stringify({ ...JSON.parse(f.saved), ...forged }), { mode: 0o600 })
+    await expect(probes.resolveOpenCodeV2ExecutionProbe(f.request, f.selection, true)).rejects.toThrow('probe_store_invalid')
+  }
+  expect(counter.launches).toBe(0)
+}, 120_000)
+
+test.skipIf(!posix)('an unsubmitted probe with a live starting owner stays pending without settling or replacing it', async () => {
+  const f = await originalProbe(false, {}, 30_000)
+  const directory = await controls.reserveRunControlDirectory(f.dataRoot, f.binding, 'a'.repeat(64))
+  const deadline = Date.now() + 60_000
+  const status = { kind: 'status', state: 'starting', deadline, members: [{ memberId: 'probe', laneId: 'execution-probe',
+    originalSessionId: 'ses_TESTowner', opencodeSessionId: 'ses_TESTowner', runtimeSessionId: 'ses_TESTowner',
+    profileEpoch: 'TEST', profileRoot: '/TEST', pin: openCodeV2EngineVersion(f.selection.native), selectedModel: 'provider/model',
+    selectedVariant: 'default', state: 'unknown', bootstrap: null }] } as RunControlResult
+  const control = await controls.serveOpenCodeV2RunControl(directory, f.binding, deadline, 'a'.repeat(64), async () => status)
+  const counter = countLaunches()
+  try {
+    expect(await probes.resolveOpenCodeV2ExecutionProbe(f.request, f.selection, true))
+      .toEqual({ state: 'pending', proof: null, reason: 'Original native member is not ready; no input was submitted.' })
+    expect(await readFile(f.file, 'utf8')).toBe(f.saved)
+    expect(counter.launches).toBe(0)
+  } finally { await control.close() }
+}, 30_000)
+
+test.skipIf(!posix)('a fresh request keeps its own settled owner failure while another request or Connect readback never replays it', async () => {
+  const f = await originalProbe(false, { freshExecutionProofRequestId: 'TEST-fresh-A' })
+  await claimOpenCodeV2FreshProofRequest(path.dirname(f.file), f.sourceKey, 'TEST-fresh-A')
+  await retiredOwner(f.dataRoot, f.binding)
+  const counter = countLaunches()
+  const failed = { state: 'failed' as const, proof: null, reason: ownerReason }
+  const original = { sourceKey: f.sourceKey, binding: f.binding, sessionID: 'ses_TESTowner', intentHash: executionHash(f.intent) }
+  // Connect observes only its exact original: it settles, but never starts a successor.
+  expect(await probes.resolveOpenCodeV2ExecutionProbe(f.request, f.selection, true, { requireExisting: original })).toEqual(failed)
+  const settled = await readFile(f.file, 'utf8')
+  expect(await probes.resolveOpenCodeV2ExecutionProbe(f.request, f.selection, true, { requireExisting: original })).toEqual(failed)
+  expect(await probes.resolveOpenCodeV2ExecutionProbe(f.request, f.selection, true, { freshExecutionProofRequestId: 'TEST-fresh-A' })).toEqual(failed)
+  expect(await readFile(f.file, 'utf8')).toBe(settled)
+  expect(counter.launches).toBe(0)
+  await expect(probes.resolveOpenCodeV2ExecutionProbe(f.request, f.selection, true, { freshExecutionProofRequestId: 'TEST-fresh-B' }))
+    .rejects.toThrow('TEST-new-original-boundary')
+  expect(counter.launches).toBe(1)
+  expect(JSON.parse(await readFile(f.file, 'utf8'))).toMatchObject({ freshExecutionProofRequestId: 'TEST-fresh-B', submitted: false, failure: null })
+}, 120_000)

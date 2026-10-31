@@ -8,6 +8,7 @@ import { readOpenCodeV2ProviderWireFailure } from '../transport/OpenCodeV2Provid
 import { readOpenCodeV2ExecutionWireFailure } from '../transport/OpenCodeV2ExecutionFetch.js'
 import type { ExecutionMcpFailure } from '../transport/OpenCodeV2ExecutionClientFactory.js'
 import { readOpenCodeV2ServerFailure, type OpenCodeV2ServerFailure } from './OpenCodeV2ServerFailure.js'
+import type { RunOwnerFailure } from '../bridge/OpenCodeV2RunTypes.js'
 
 export type ExecutionCatalogPhase = 'client-setup' | 'info' | 'location' | 'integration-ready'
 const catalogPhases = new Set<ExecutionCatalogPhase>(['client-setup', 'info', 'location', 'integration-ready'])
@@ -309,7 +310,7 @@ const privateProviderFailureCodes = new Set(['provider_missing', 'provider_key_m
   'execution_retired_before_start', 'execution_platform_unsupported', 'execution_environment_injection', 'execution_ipc_unavailable',
   'execution_profile_not_private', 'intent_identity_invalid',
   'run_control_timeout', 'run_control_disconnected', 'run_control_changed', 'run_control_foreign', 'run_control_invalid',
-  'run_control_frame_too_large', 'run_owner_stale', 'run_process_unknown', 'run_process_changed',
+  'run_control_frame_too_large', 'run_owner_stale', 'run_owner_retired', 'run_process_unknown', 'run_process_changed',
   'run_control_client_budget_exhausted', 'run_control_connect_busy_timeout_expired',
   'run_control_connect_idle_expired', 'run_control_connect_no_listener_expired',
   'run_deadline_expired', 'run_readiness_changed', 'run_readiness_unknown', 'run_operation_unknown',
@@ -385,14 +386,24 @@ function nativeFailure(error: unknown): { category: string; native?: { stage: st
   return { category: match[1]!, ...(privateNativeFailureStages.has(match[2]!)
     ? { native: { stage: match[2]!, nativeCode } } : {}) }
 }
-/** Private static phase/category only: never an arbitrary SDK message, body, credential or key. */
-export async function recordOpenCodeV2ProviderFailure(phase: string, error: unknown, retainedOriginal: boolean, startupOutput?: string, acquisitionTiming?: unknown, cleanupTiming?: Readonly<{ elapsedMs: number; dataRoot?: string; observation?: ExecutionCleanupObservation }>): Promise<void> {
+function providerFailureCategory(error: unknown) {
   // Only our finite cleanup wrappers may preserve one exact known cause.
   const cause = error instanceof Error && (error.message === 'cleanup_unknown' || error.message === 'execution_owner_unknown')
     ? error.cause : undefined
   const native = nativeFailure(cause) ?? nativeFailure(error)
   const category = cause instanceof Error && privateProviderFailureCodes.has(cause.message) ? cause.message
     : native?.category ?? (error instanceof Error && privateProviderFailureCodes.has(error.message) ? error.message : 'provider_operation_unknown')
+  return { cause, native, category }
+}
+/** The same closed category and provider wire stage as the diagnostics record, for the
+ * owner's run directory. Never a message, body, path or credential. */
+export function classifyOpenCodeV2RunOwnerFailure(error: unknown): RunOwnerFailure {
+  const { category } = providerFailureCategory(error), operation = readOpenCodeV2ProviderWireFailure(error)
+  return { category, ...(operation ? { operation: { operation: operation.operation, stage: operation.stage, status: operation.status } } : {}) }
+}
+/** Private static phase/category only: never an arbitrary SDK message, body, credential or key. */
+export async function recordOpenCodeV2ProviderFailure(phase: string, error: unknown, retainedOriginal: boolean, startupOutput?: string, acquisitionTiming?: unknown, cleanupTiming?: Readonly<{ elapsedMs: number; dataRoot?: string; observation?: ExecutionCleanupObservation }>): Promise<void> {
+  const { cause, native, category } = providerFailureCategory(error)
   // Preserve only fixed original exception facts when a startup guard is not a
   // known category. Never persist its message, path, stack or arbitrary fields.
   const detail = (cause instanceof Error ? cause : error instanceof Error ? error : undefined) as
