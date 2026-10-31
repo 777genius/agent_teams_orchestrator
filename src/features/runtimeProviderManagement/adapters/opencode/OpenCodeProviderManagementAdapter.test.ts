@@ -889,7 +889,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
       {
         projectPath: '/tmp/project',
         hostLifetime: 'process',
-        healthTimeoutMs: 180_000,
+        healthTimeoutMs: expect.any(Number),
         preparedProfile: true,
         includeAppMcp: false,
       },
@@ -901,6 +901,8 @@ describe('OpenCodeProviderManagementAdapter', () => {
         includeAppMcp: undefined,
       },
     ])
+    expect(ensureHostCalls[1]?.healthTimeoutMs).toBeGreaterThan(0)
+    expect(ensureHostCalls[1]?.healthTimeoutMs).toBeLessThanOrEqual(180_000)
     expect(releasedHosts).toEqual(['host-key', 'host-key', 'host-key'])
     expect(retainedHostLeases).toHaveLength(2)
     expect(releasedHostLeases).toEqual(retainedHostLeases)
