@@ -69,9 +69,18 @@ test('V2 defaults persist across provider catalogs and CLI reads, isolate projec
     })
     const input = { runtimeId: 'opencode', providerId: 'deepseek', modelId: model.modelId, projectPath: project, probe: false }
     const directoryDefaults = async (directory, summary = false) => {
-      const result = await adapter.loadDirectory({ runtimeId: 'opencode', projectPath: directory, summary, limit: null })
-      assert.equal(result.ok, true, JSON.stringify(result))
-      return Object.fromEntries(result.value.entries.map(entry => [entry.providerId, entry.defaultModelId]))
+      // Summary is intentionally compact: expose DeepSeek through the selected
+      // credential receipt while its paid models remain absent from the passive
+      // anonymous catalog. Do not require unrelated unconnected provider rows.
+      const wasAnonymousOnly = anonymousInventoryOnly
+      if (summary) anonymousInventoryOnly = true
+      try {
+        const result = await adapter.loadDirectory({ runtimeId: 'opencode', projectPath: directory, summary, limit: null })
+        assert.equal(result.ok, true, JSON.stringify(result))
+        return Object.fromEntries(result.value.entries.map(entry => [entry.providerId, entry.defaultModelId]))
+      } finally {
+        anonymousInventoryOnly = wasAnonymousOnly
+      }
     }
     try {
       assert.equal((await directoryDefaults(project)).opencode, 'opencode/builtin-free')
