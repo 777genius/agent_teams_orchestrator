@@ -67,7 +67,11 @@ import { buildManagedConfigFingerprint, canonicalizeOpenCodeProjectPath, openCod
 import { normalizeOpenCodePermissions } from './OpenCodePermissionNormalizer.js'
 import { openCodeProvisioningProbe, type OpenCodeAuthorityRejection } from './OpenCodeProvisioningProbe.js'
 import { normalizeOpenCodeProjectIdentity } from './OpenCodeProjectIdentity.js'
-import { isOpenCodeHostProcessGoneError, openCodeHostManager } from './OpenCodeHostManager.js'
+import {
+  isOpenCodeHostProcessGoneError,
+  isOpenCodeUnregisteredHostProcessGoneError,
+  openCodeHostManager,
+} from './OpenCodeHostManager.js'
 import {
   PROCESS_ATTRIBUTION_SCHEMA_VERSION,
   resolveProcessAttributionDirectory,
@@ -742,6 +746,9 @@ type StoredLaneAuthority = {
   confirmedStopRuntime?: ConfirmedStopRuntime
   deliveryRuntime?: ReturnType<typeof createRuntimeSnapshot>
   hostGone?: boolean
+  /** Set with hostGone when the host has no registry record left; the pid
+   * every stored session of the run is pinned to. */
+  unregisteredHostPid?: number
   signal?: AbortSignal
   assertOwner?: () => Promise<void>
   ownedOAuthHost?: { hostKey: string; pid: number; baseUrl: string }
@@ -955,11 +962,18 @@ async function probeStoredLaneAuthority(
   } catch (error) {
     // Absence is closure evidence only for the exact process every stored
     // session is pinned to. Records without a runtime pid stay fail-closed.
-    if (command !== 'opencode.stopTeam' || !isOpenCodeHostProcessGoneError(error)
-      || expectedRuntimePid === undefined || error.pid !== expectedRuntimePid) {
-      throw error
-    }
-    // The registered host process is provably absent. A Stop request may close
+    if (command !== 'opencode.stopTeam' || expectedRuntimePid === undefined) throw error
+    const registeredHostGone = isOpenCodeHostProcessGoneError(error) && error.pid === expectedRuntimePid
+    // Startup cleanup deletes a dead host's registry record, after which the
+    // check above can never succeed again. Without a record, every session of
+    // the run must name the same pid and that pid must be ESRCH-gone. OAuth
+    // lanes keep their strict release path, so they stay fail-closed here.
+    const unregisteredHostGone = !registeredHostGone
+      && isOpenCodeUnregisteredHostProcessGoneError(error) && error.pid === expectedRuntimePid
+      && selectedModel.providerId !== 'xai'
+      && authorityRecords.every(record => record.runtimePid === expectedRuntimePid)
+    if (!registeredHostGone && !unregisteredHostGone) throw error
+    // The host process is provably absent. A Stop request may close
     // the lane from stored authority plus desktop-owned launch capability; no
     // confirmed Stop receipt is minted from process absence.
     const runtime = await resolveStoredStopRuntime(authorityRecords,
@@ -973,6 +987,7 @@ async function probeStoredLaneAuthority(
       records: authorityRecords,
       confirmedStopRuntime: runtime,
       hostGone: true,
+      ...(unregisteredHostGone ? { unregisteredHostPid: expectedRuntimePid } : {}),
       release: async () => {},
     }
   }
@@ -4519,6 +4534,7 @@ async function runStop(
     })
     : null
   const hostGone = retained?.hostGone === true
+  const unregisteredHostPid = hostGone ? retained?.unregisteredHostPid : undefined
   let authorityReleased = false
   const releaseAuthority = async () => {
     if (authorityReleased) return
@@ -4596,16 +4612,18 @@ async function runStop(
           ))
         }
       } else if (hostGone) {
-        // The registered host process is provably gone, so there is no live
-        // session to abort or observe. Close the exact stored owner instead:
-        // strict lease release plus terminal CAS. Process absence retires the
-        // session; it is not a confirmed Stop receipt, so none is minted.
+        // The host process is provably gone, so there is no live session to
+        // abort or observe. Close the exact stored owner instead: strict lease
+        // release (or fenced proof that no record is left) plus terminal CAS.
+        // Process absence retires the session; it is not a confirmed Stop
+        // receipt, so none is minted. Nothing is killed on this path.
         runtimeDeadline.throwIfExpired('stop_cleanup')
         const beforeClose = await raceOpenCodeAbortSignal(
           openCodeSessionStore.get(teamId, laneId, record.memberName),
           stopSignal,
         )
-        if (!isExactStopSession(beforeClose, record)) {
+        if (!isExactStopSession(beforeClose, record) || (unregisteredHostPid !== undefined
+          && (record.runtimePid !== unregisteredHostPid || beforeClose.runtimePid !== unregisteredHostPid))) {
           diagnostics.push(teamDiagnostic(
             'opencode_stop_identity_changed',
             `${record.memberName}: session identity changed before dead-host closure`,
@@ -4615,16 +4633,29 @@ async function runStop(
           return { record, stopped: false, diagnostics: memberDiagnostics }
         }
         if (runtimeDeadline.remainingMs() < OPEN_CODE_STOP_ATOMIC_CLEANUP_RESERVE_MS) {
+          const closeStep = unregisteredHostPid === undefined ? 'strict lease release' : 'dead-host closure'
           memberDiagnostics.push('deadline expired')
           diagnostics.push(teamDiagnostic(
             'opencode_stop_deadline',
-            `${record.memberName}: insufficient budget for strict lease release; remaining=${runtimeDeadline.remainingMs()}ms`,
+            `${record.memberName}: insufficient budget for ${closeStep}; remaining=${runtimeDeadline.remainingMs()}ms`,
             'error',
           ))
           return { record, stopped: false, diagnostics: memberDiagnostics }
         }
-        await openCodeSessionBridge.releaseSession(record, { strictLeaseRelease: true })
-        const terminal = await openCodeSessionStore.markStoppedIfSession(record)
+        let terminal: OpenCodeSessionRecord | null
+        if (unregisteredHostPid !== undefined) {
+          // No registry record means no lease is left to release. Re-prove
+          // under the host startup and registry fences that the record is still
+          // absent and the pinned pid is ESRCH-gone, then apply the same CAS.
+          terminal = await openCodeHostManager.withConfirmedAbsentHostAuthority(
+            { hostKey: record.hostKey, runtimePid: unregisteredHostPid, requireUnregistered: true },
+            () => openCodeSessionStore.markStoppedIfSession(record),
+            stopSignal,
+          )
+        } else {
+          await openCodeSessionBridge.releaseSession(record, { strictLeaseRelease: true })
+          terminal = await openCodeSessionStore.markStoppedIfSession(record)
+        }
         if (!terminal) {
           const current = await openCodeSessionStore.get(teamId, laneId, record.memberName)
           if (isExactStopSession(current, record) && current.staleReason === 'runtime_process_gone') {
