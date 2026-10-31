@@ -3,7 +3,7 @@ import { openCodeV2ActivationDeadline, openCodeV2RunInitializationMs } from './O
 
 test('a caller deadline past the platform ceiling is clipped before it reaches the child', () => {
   const started = 1_000_000, catalogLease = started + 240_000
-  // Linux allows 90s: the 240s catalog lease used to reach the child unclipped and was refused.
+  // Linux allows 180s: the 240s catalog lease used to reach the child unclipped and was refused.
   expect(openCodeV2ActivationDeadline(catalogLease, started, 'linux')).toBe(started + openCodeV2RunInitializationMs('linux'))
   // Darwin and Windows allow 300s, so the same caller deadline stays as it was.
   expect(openCodeV2ActivationDeadline(catalogLease, started, 'darwin')).toBe(catalogLease)

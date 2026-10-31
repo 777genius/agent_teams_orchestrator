@@ -1,3 +1,4 @@
+import { OPEN_CODE_LOADING_TIMEOUT_MS } from './OpenCodeLoadingBudget.js'
 import {
   readOpenCodeAuthority, requireOpenCodeAuthority, isKnownHostRegistry,
   normalizeKnownHostRegistry, normalizePersistentHostLeases, type PersistentHostRegistryShape,
@@ -59,8 +60,8 @@ import type {
   OpenCodePreparedProfile,
 } from './types.js'
 
-const OPEN_CODE_HOST_HEALTH_TIMEOUT_MS = 30_000
-const OPEN_CODE_HOST_HEALTH_TIMEOUT_MAX_MS = 60_000
+const OPEN_CODE_HOST_HEALTH_TIMEOUT_MS = OPEN_CODE_LOADING_TIMEOUT_MS
+const OPEN_CODE_HOST_HEALTH_TIMEOUT_MAX_MS = OPEN_CODE_LOADING_TIMEOUT_MS
 const OPEN_CODE_HOST_HEALTH_POLL_MS = 250
 const OPEN_CODE_HOST_HEALTH_REQUEST_TIMEOUT_MS = 1_000
 const OPEN_CODE_RESOLVED_CONFIG_FINGERPRINT_REQUEST_TIMEOUT_MS = 2_500

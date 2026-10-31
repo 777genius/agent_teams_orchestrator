@@ -419,7 +419,7 @@ function isCopilotExplicitModelUnsupported(reason: string): boolean {
 const DEFAULT_DIRECTORY_LIMIT = 50
 const MAX_DIRECTORY_LIMIT = 100
 const DIRECTORY_CACHE_TTL_MS = 30_000
-const OPEN_CODE_PROVIDER_MANAGEMENT_HOST_HEALTH_TIMEOUT_MS = 10_000
+const OPEN_CODE_PROVIDER_MANAGEMENT_HOST_HEALTH_TIMEOUT_MS = OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS
 const OPEN_CODE_PROVIDER_MANAGEMENT_IDLE_HOST_TTL_MS = 10 * 60_000
 const OPEN_CODE_PROVIDER_MANAGEMENT_LEASE_STALE_AGE_MS = 2 * 60 * 60_000
 const AUTO_OAUTH_CREDENTIAL_POLL_INTERVAL_MS = 250
@@ -3970,7 +3970,7 @@ export class OpenCodeProviderManagementAdapter
       }
     }
 
-    const deadline = new OpenCodeRuntimeDeadline(this.deps.viewTimeoutMs ?? 75_000)
+    const deadline = new OpenCodeRuntimeDeadline(this.deps.viewTimeoutMs ?? OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS)
     const progress = createOpenCodeInventoryProbeProgressTracker()
     let timeoutMessage: string | undefined
     const captureTimeout = () => {
@@ -4111,6 +4111,21 @@ export class OpenCodeProviderManagementAdapter
   async loadDirectory(
     input: LoadProviderDirectoryInput,
   ): Promise<ProviderManagementResult<ProviderDirectoryView>> {
+    const deadline = new OpenCodeRuntimeDeadline(this.deps.viewTimeoutMs ?? OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS)
+    try {
+      return await this.loadDirectoryWithinDeadline(input, deadline)
+    } catch (error) {
+      if (!deadline.signal.aborted) throw error
+      return providerManagementError('runtime-unhealthy', 'OpenCode provider directory loading timed out')
+    } finally {
+      deadline.dispose()
+    }
+  }
+
+  private async loadDirectoryWithinDeadline(
+    input: LoadProviderDirectoryInput,
+    deadline: OpenCodeRuntimeDeadline,
+  ): Promise<ProviderManagementResult<ProviderDirectoryView>> {
     if (input.runtimeId !== 'opencode') {
       return providerManagementError(
         'unsupported-runtime',
@@ -4125,11 +4140,15 @@ export class OpenCodeProviderManagementAdapter
       v1SettingsOnly: !input.summary && input.refresh !== true,
       bypassCache: input.refresh === true,
       refreshModels: input.refresh === true && input.summary !== true,
+      abortSignal: deadline.signal,
+      remainingMs: () => deadline.remainingMs(),
     })
+    deadline.throwIfExpired()
 
     if (!input.summary && inventory.readGeneration === 'v2') {
       const { entries: nativeEntries, modelIdsByProviderId } = buildOpenCodeV2ProviderDirectoryEntries(inventory)
       const entries = await applyOpenCodeV2DirectoryDefaultSelection(nativeEntries, inventory.projectPath)
+      deadline.throwIfExpired()
       return { ok: true, value: filterAndPageProviderDirectory({
         directory: { runtimeId: 'opencode', entries: sortProviderDirectoryEntries(entries),
           totalCount: entries.length, returnedCount: entries.length, query: null, filter: 'all',
@@ -4185,6 +4204,7 @@ export class OpenCodeProviderManagementAdapter
           directory.entries,
           inventory.projectPath,
         )
+        deadline.throwIfExpired()
       }
       return { ok: true, value: directory }
     }
@@ -4203,8 +4223,10 @@ export class OpenCodeProviderManagementAdapter
         },
         hostLifetime: 'process',
         resolveConfigFingerprint: false,
-        healthTimeoutMs: OPEN_CODE_PROVIDER_MANAGEMENT_HOST_HEALTH_TIMEOUT_MS,
+        healthTimeoutMs: Math.min(OPEN_CODE_PROVIDER_MANAGEMENT_HOST_HEALTH_TIMEOUT_MS, deadline.remainingMs()),
+        abortSignal: deadline.signal,
       })
+      deadline.throwIfExpired()
       hostLease = await this.retainProviderManagementHost(hostManager, host, false)
       const cacheKey = this.getDirectoryCacheKey({
         runtimeId: input.runtimeId,
@@ -4214,6 +4236,7 @@ export class OpenCodeProviderManagementAdapter
       if (!input.refresh) {
         const cached = this.readDirectoryCache(cacheKey)
         if (cached) {
+          deadline.throwIfExpired()
           return {
             ok: true,
             value: filterAndPageProviderDirectory({
@@ -4228,7 +4251,11 @@ export class OpenCodeProviderManagementAdapter
         }
       }
 
-      const client = clientFactory.create(host.baseUrl)
+      deadline.throwIfExpired()
+      const client = clientFactory.create(host.baseUrl, {
+        signal: deadline.signal,
+        remainingMs: () => deadline.remainingMs(),
+      })
       const serverDocRead = client.getServerDoc
         ? safeRead(() => client.getServerDoc!())
         : Promise.resolve({
@@ -4287,12 +4314,14 @@ export class OpenCodeProviderManagementAdapter
         limit: Number.MAX_SAFE_INTEGER,
         cursor: null,
       })
+      deadline.throwIfExpired()
       this.writeDirectoryCache(
         cacheKey,
         uncachedDirectory,
         buildProviderDirectoryModelSearchIndex(directorySource),
       )
 
+      deadline.throwIfExpired()
       return {
         ok: true,
         value: buildProviderDirectory({
@@ -4304,6 +4333,7 @@ export class OpenCodeProviderManagementAdapter
         }),
       }
     } catch (error) {
+      if (deadline.signal.aborted) throw error
       const message = error instanceof Error ? error.message : String(error)
       return {
         ok: true,
@@ -4728,8 +4758,14 @@ export class OpenCodeProviderManagementAdapter
         startPhaseTimeout = phase => {
         if (abortController.signal.aborted) return
         if (timeout) clearTimeout(timeout)
+        // Leave room for stale identity recheck and bounded cleanup before the
+        // overall deadline wins the race. Short caller budgets reserve at most half.
+        const remainingMs = deadline.remainingMs()
         const phaseTimeoutMs = phase === 'instance'
-          ? this.deps.catalogInstanceTimeoutMs ?? OPEN_CODE_INSTANCE_INITIALIZATION_TIMEOUT_MS
+          ? Math.max(1, Math.min(
+              this.deps.catalogInstanceTimeoutMs ?? OPEN_CODE_INSTANCE_INITIALIZATION_TIMEOUT_MS,
+              remainingMs - Math.min(1_500, Math.floor(remainingMs / 2)),
+            ))
           : timeoutMs
         timeoutMessage = phase === 'instance'
           ? `OpenCode catalog instance initialization timed out after ${phaseTimeoutMs}ms`
