@@ -24,6 +24,8 @@ function makeRecord(): OpenCodeSessionRecord {
     projectPath: '/synthetic/workspace',
     profileRootKey: 'owned-xai-profile',
     hostKey: ownedHost.hostKey,
+    profileScope: { purpose: 'launch_runtime', providerId: 'xai',
+      scopeToken: 'owned-xai-test', configFingerprint: 'owned-xai-config', selectedAuthIdentity: 'absent' },
     laneId: 'xai-lane',
     runId: 'current-run',
     runtimePid: process.pid,
@@ -94,6 +96,18 @@ describe('owned xAI OAuth named-group proof', () => {
     }
     expect(buildOpenCodeGroupChatRunProof(makeSnapshot(), { ...makeRecord(), runtimePid: 0 }, groupTools, ownedHost)).toBeUndefined()
     expect(buildOpenCodeGroupChatRunProof(makeSnapshot(), { ...makeRecord(), hostKey: 'foreign-host' }, groupTools, ownedHost)).toBeUndefined()
+  })
+
+  test('never treats a host-less observation from another OpenCode provider as an xAI owned session', () => {
+    for (const providerId of ['openrouter', 'openai', 'github-copilot', 'zai', 'cursor-acp', 'kiro']) {
+      const record = makeRecord()
+      record.selectedModel = `${providerId}/synthetic-model`
+      record.profileScope = { ...record.profileScope!, providerId }
+      expect(buildOpenCodeGroupChatRunProof(makeSnapshot(), record, groupTools, ownedHost)).toBeUndefined()
+    }
+    const record = makeRecord()
+    record.profileScope = { ...record.profileScope!, purpose: 'catalog' }
+    expect(buildOpenCodeGroupChatRunProof(makeSnapshot(), record, groupTools, ownedHost)).toBeUndefined()
   })
 
   test('fails closed for stale, stopped or unbootstrapped sessions', () => {
