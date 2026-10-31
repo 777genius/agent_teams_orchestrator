@@ -4758,8 +4758,14 @@ export class OpenCodeProviderManagementAdapter
         startPhaseTimeout = phase => {
         if (abortController.signal.aborted) return
         if (timeout) clearTimeout(timeout)
+        // Leave room for stale identity recheck and bounded cleanup before the
+        // overall deadline wins the race. Short caller budgets reserve at most half.
+        const remainingMs = deadline.remainingMs()
         const phaseTimeoutMs = phase === 'instance'
-          ? this.deps.catalogInstanceTimeoutMs ?? OPEN_CODE_INSTANCE_INITIALIZATION_TIMEOUT_MS
+          ? Math.max(1, Math.min(
+              this.deps.catalogInstanceTimeoutMs ?? OPEN_CODE_INSTANCE_INITIALIZATION_TIMEOUT_MS,
+              remainingMs - Math.min(1_500, Math.floor(remainingMs / 2)),
+            ))
           : timeoutMs
         timeoutMessage = phase === 'instance'
           ? `OpenCode catalog instance initialization timed out after ${phaseTimeoutMs}ms`
