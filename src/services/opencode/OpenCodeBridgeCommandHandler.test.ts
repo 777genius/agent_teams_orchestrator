@@ -1,5 +1,5 @@
 import { effectiveAgentsFixture } from './OpenCodeEffectiveAgents.test-support.js'
-import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test'
 import { createHash } from 'node:crypto'
 import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
@@ -18,7 +18,7 @@ import { OpenCodeRuntimeDeadlineError, type OpenCodeProvisioningStage } from './
 import { resolveClaudeMultimodelPaths } from './OpenCodeManagedPaths.js'
 import { openCodeCommandOutcomeStore } from './OpenCodeCommandOutcomeStore.js'
 import { openCodeExecutionProbe } from './OpenCodeExecutionProbe.js'
-import { OpenCodeHostProcessGoneError, openCodeHostManager } from './OpenCodeHostManager.js'
+import { OpenCodeHostManager, OpenCodeHostProcessGoneError, openCodeHostManager } from './OpenCodeHostManager.js'
 import {
   computeOpenCodeExpectedBehaviorFingerprint,
   OPEN_CODE_KNOWN_ABSENT_AUTH_FINGERPRINT,
@@ -30,7 +30,7 @@ import { resolveProcessAttributionDirectory } from './OpenCodeProcessAttribution
 import { buildManagedConfig, buildManagedConfigFingerprint } from './OpenCodeProfileManager.js'
 import { refreshSelectedProfileAuthority } from './OpenCodeSelectedProfileAuthority.js'
 import { normalizeOpenCodeProjectIdentity } from './OpenCodeProjectIdentity.js'
-import { openCodeProvisioningProbe } from './OpenCodeProvisioningProbe.js'
+import { OpenCodeProvisioningProbe, openCodeProvisioningProbe } from './OpenCodeProvisioningProbe.js'
 import { RUNTIME_TURN_SETTLED_SPOOL_ROOT_ENV } from './OpenCodeRuntimeTurnSettledEmitter.js'
 import { openCodeSessionBridge } from './OpenCodeSessionBridge.js'
 import { OpenCodeSessionStore, openCodeSessionStore } from './OpenCodeSessionStore.js'
@@ -2222,6 +2222,201 @@ describe('OpenCodeBridgeCommandHandler', () => {
         expect(terminal?.stopAuthority).toBeUndefined()
       }
     })
+  })
+
+  // After a crash, startup cleanup deletes the dead host's registry record.
+  // These cases run the real probe forwarding, host manager decision and fenced
+  // close; only the kernel answer to kill(pid, 0) is simulated per pid.
+  type UnregisteredHostStopCase = {
+    alicePid?: number
+    bobPid?: number
+    registry?: 'absent' | 'foreign-record' | 'exact-record'
+    signalZero: Record<number, 'alive' | 'ESRCH' | 'EPERM'>
+    xai?: boolean
+    // Simulates a host registered for the same key between probe and close.
+    registerBeforeClose?: { pid: number }
+  }
+  type UnregisteredHostStopOutcome = {
+    handshakeOk: boolean
+    stop: Awaited<ReturnType<typeof executeOpenCodeBridgeCommandEnvelope>>
+    stopped: Record<string, boolean>
+    stopAuthorities: unknown[]
+    registryChanged: boolean
+    fatalSignals: string[]
+    strictReleases: string[]
+    cleanups: number
+  }
+
+  async function stopAfterHostRecordCleanup(
+    input: UnregisteredHostStopCase,
+  ): Promise<UnregisteredHostStopOutcome> {
+    let outcome: UnregisteredHostStopOutcome | undefined
+    const xaiScope = { purpose: 'launch_runtime' as const, providerId: 'xai', scopeToken: 'lane-scope',
+      configFingerprint: 'config', selectedAuthIdentity: 'absent' as const }
+    await withGoneHostLane({
+      ...(input.alicePid === undefined ? {} : { runtimePid: input.alicePid }),
+      ...(input.xai ? { selectedModel: 'xai/grok-4', profileScope: xaiScope } : {}),
+    }, async ({ store, record, body }) => {
+      const { runtimePid: _alicePid, ...bob } = { ...record, memberName: 'bob', opencodeSessionId: 'session-bob' }
+      await store.upsert(input.bobPid === undefined ? bob : { ...bob, runtimePid: input.bobPid })
+      const projectPath = String(body.projectPath)
+      const registryPath = path.join(projectPath, 'TEST-host-registry.json')
+      const profile = { ...snapshot.profile!, projectPath, canonicalProjectPath: projectPath,
+        workingDirectoryPath: projectPath }
+      const hostRecord = (pid: number) => ({ hostKey: record.hostKey, profileRootKey: profile.profileRootKey,
+        projectPath, projectBehaviorFingerprint: profile.projectBehaviorFingerprint,
+        baseUrl: 'http://127.0.0.1:4096', port: 4096, pid, processStartedAtMs: 1000, version: '1.4.0',
+        managedConfigFingerprint: profile.managedConfigFingerprint,
+        resolvedConfigFingerprint: profile.managedConfigFingerprint, updatedAt: '2026-04-22T12:00:00.000Z' })
+      const writeRegistry = (hosts: Record<string, unknown>) => writeFile(registryPath, JSON.stringify({
+        schemaVersion: 1, processIdentityFormat: 'platform-native-v2', hosts }))
+      await writeRegistry(input.registry === 'exact-record'
+        ? { [record.hostKey]: hostRecord(input.alicePid ?? 123) }
+        : input.registry === 'foreign-record'
+          ? { [record.hostKey]: { ...hostRecord(input.alicePid ?? 123), managedConfigFingerprint: 'foreign' } }
+          : {})
+      let registryBefore = await readFile(registryPath, 'utf8')
+      const fatalSignals: string[] = []
+      const manager = new OpenCodeHostManager({
+        persistentRegistryPath: registryPath,
+        spawnHostProcess: () => { throw new Error('must not spawn') },
+        killProcess: (pid, signal) => { fatalSignals.push(`${pid}:${signal}`) },
+        readProcessStartTimeMs: async () => 1000,
+        fetchJson: async () => { throw new Error('must not probe a gone host') },
+      })
+      const realKill = process.kill.bind(process)
+      const kill = spyOn(process, 'kill').mockImplementation(((pid: number, signal?: string | number) => {
+        const answer = input.signalZero[pid]
+        if (answer === undefined) return realKill(pid, signal)
+        if (signal !== 0) {
+          fatalSignals.push(`${pid}:${String(signal)}`)
+          return true
+        }
+        if (answer === 'alive') return true
+        throw Object.assign(new Error(answer), { code: answer })
+      }) as typeof process.kill)
+      const originalAbsentAuthority = openCodeHostManager.withConfirmedAbsentHostAuthority
+      openCodeHostManager.withConfirmedAbsentHostAuthority = async (...args) => {
+        if (input.registerBeforeClose) {
+          await writeRegistry({ [record.hostKey]: hostRecord(input.registerBeforeClose.pid) })
+          registryBefore = await readFile(registryPath, 'utf8')
+        }
+        return manager.withConfirmedAbsentHostAuthority(...args)
+      }
+      let cleanups = 0
+      openCodeHostManager.reconcilePersistentHosts = (async () => {
+        cleanups += 1
+        return { cleaned: 0, remaining: 0, hosts: [], diagnostics: [] }
+      }) as typeof openCodeHostManager.reconcilePersistentHosts
+      const strictReleases: string[] = []
+      openCodeSessionBridge.releaseSession = async (target, options) => {
+        if (options?.strictLeaseRelease) strictReleases.push(target.memberName)
+      }
+      openCodeProvisioningProbe.probeRetainingHost = (async (probePath, options) => new OpenCodeProvisioningProbe({
+        inventoryService: { probe: async () => ({ detected: true, projectPath: probePath, profile,
+          models: [], diagnostics: [] }) as never },
+        hostManager: manager,
+      }).probeRetainingHost(probePath, { ...options, selectedModel: undefined })) as typeof openCodeProvisioningProbe.probeRetainingHost
+      try {
+        const handshake = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.handshake', {
+          ...body, requiredCommand: 'opencode.stopTeam',
+        }))
+        const stop = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.stopTeam', body))
+        const members = await Promise.all(['alice', 'bob'].map(memberName =>
+          store.get(record.teamId, record.laneId ?? 'primary', memberName)))
+        outcome = {
+          handshakeOk: handshake.ok,
+          stop,
+          stopped: Object.fromEntries(members.map(member => [member!.memberName, Boolean(member!.stoppedAt)])),
+          stopAuthorities: members.map(member => member!.stopAuthority),
+          registryChanged: await readFile(registryPath, 'utf8') !== registryBefore,
+          fatalSignals,
+          strictReleases,
+          cleanups,
+        }
+      } finally {
+        kill.mockRestore()
+        openCodeHostManager.withConfirmedAbsentHostAuthority = originalAbsentAuthority
+      }
+    })
+    return outcome!
+  }
+
+  function expectLaneUntouched(outcome: UnregisteredHostStopOutcome): void {
+    expect(outcome.handshakeOk).toBe(false)
+    expect(outcome.stop.ok).toBe(false)
+    expect(outcome.stopped).toEqual({ alice: false, bob: false })
+    expect(outcome.registryChanged).toBe(false)
+    expect(outcome.fatalSignals).toEqual([])
+    expect(outcome.strictReleases).toEqual([])
+  }
+
+  test('stop closes a lane whose host record is gone and whose single pinned pid is ESRCH-gone', async () => {
+    const outcome = await stopAfterHostRecordCleanup({ alicePid: 123, bobPid: 123, signalZero: { 123: 'ESRCH' } })
+    expect(outcome.handshakeOk).toBe(true)
+    expect(outcome.stop.ok).toBe(true)
+    if (!('data' in outcome.stop) || !('stopped' in outcome.stop.data)) throw new Error('missing stop result')
+    expect(outcome.stop.data.stopped).toBe(true)
+    expect(outcome.stopped).toEqual({ alice: true, bob: true })
+    // Process absence closes the sessions; it never mints a Stop receipt.
+    expect(outcome.stopAuthorities).toEqual([undefined, undefined])
+    // Nothing is killed, no lease is released and the registry is not written.
+    expect(outcome.fatalSignals).toEqual([])
+    expect(outcome.strictReleases).toEqual([])
+    expect(outcome.registryChanged).toBe(false)
+    expect(outcome.cleanups).toBe(1)
+  })
+
+  test('stop keeps a lane open when its unregistered host pid is alive', async () => {
+    expectLaneUntouched(await stopAfterHostRecordCleanup({ alicePid: 123, bobPid: 123, signalZero: { 123: 'alive' } }))
+  })
+
+  test('stop keeps a lane open when its sessions name different pids', async () => {
+    expectLaneUntouched(await stopAfterHostRecordCleanup({ alicePid: 123, bobPid: 456,
+      signalZero: { 123: 'ESRCH', 456: 'alive' } }))
+  })
+
+  test('stop keeps a lane open when a session has no recorded pid', async () => {
+    expectLaneUntouched(await stopAfterHostRecordCleanup({ alicePid: 123, signalZero: { 123: 'ESRCH' } }))
+    expectLaneUntouched(await stopAfterHostRecordCleanup({ signalZero: { 123: 'ESRCH' } }))
+  })
+
+  test('stop keeps a lane open when kill(pid, 0) answers EPERM', async () => {
+    expectLaneUntouched(await stopAfterHostRecordCleanup({ alicePid: 123, bobPid: 123, signalZero: { 123: 'EPERM' } }))
+  })
+
+  test('stop keeps OAuth lanes on the strict path when their host record is gone', async () => {
+    expectLaneUntouched(await stopAfterHostRecordCleanup({ alicePid: 123, bobPid: 123, xai: true,
+      signalZero: { 123: 'ESRCH' } }))
+  })
+
+  test('stop keeps the previous rules while a host record exists', async () => {
+    // A record that no longer matches the lane stays fail-closed even if the
+    // pid is gone.
+    expectLaneUntouched(await stopAfterHostRecordCleanup({ alicePid: 123, bobPid: 123,
+      registry: 'foreign-record', signalZero: { 123: 'ESRCH' } }))
+    // An exact dead record still uses the registered path: strict lease release
+    // through the session bridge, never the unregistered close.
+    const registered = await stopAfterHostRecordCleanup({ alicePid: 123, bobPid: 123,
+      registry: 'exact-record', signalZero: { 123: 'ESRCH' } })
+    expect(registered.stop.ok).toBe(true)
+    expect(registered.stopped).toEqual({ alice: true, bob: true })
+    expect([...registered.strictReleases].sort()).toEqual(['alice', 'bob'])
+    expect(registered.fatalSignals).toEqual([])
+  })
+
+  test('stop does not close when a host record for the key appears before closure', async () => {
+    // Same key and even the same (reused) pid: the fenced close must refuse
+    // instead of treating the new record as the dead one and deleting it.
+    const outcome = await stopAfterHostRecordCleanup({ alicePid: 123, bobPid: 123,
+      signalZero: { 123: 'ESRCH' }, registerBeforeClose: { pid: 123 } })
+    expect(outcome.stop.ok).toBe(true)
+    if (!('data' in outcome.stop) || !('stopped' in outcome.stop.data)) throw new Error('missing stop result')
+    expect(outcome.stop.data.stopped).toBe(false)
+    expect(outcome.stopped).toEqual({ alice: false, bob: false })
+    expect(outcome.registryChanged).toBe(false)
+    expect(outcome.fatalSignals).toEqual([])
+    expect(outcome.strictReleases).toEqual([])
   })
 
   for (const failure of ['abort', 'release', 'cas'] as const) {
