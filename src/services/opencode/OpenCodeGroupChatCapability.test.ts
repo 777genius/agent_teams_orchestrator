@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
-import { buildOpenCodeGroupChatRunProof } from './OpenCodeGroupChatCapability.js'
+import { createHash } from 'node:crypto'
+import { buildOpenCodeGroupChatRunProof, readOwnedOAuthGroupControlBinding } from './OpenCodeGroupChatCapability.js'
 import type { OpenCodeProvisioningSnapshot, OpenCodeSessionRecord } from './types.js'
 
 const controlContext = JSON.stringify({
@@ -129,5 +130,82 @@ describe('owned xAI OAuth named-group proof', () => {
     expect(buildOpenCodeGroupChatRunProof(makeSnapshot(), makeRecord(), groupTools,
       { ...ownedHost, controlUrl: 'http://remote.example:41571' })).toBeUndefined()
     expect(buildOpenCodeGroupChatRunProof({ ...makeSnapshot(), mcp: null }, makeRecord(), groupTools, ownedHost)).toBeUndefined()
+  })
+})
+
+describe('owned xAI MCP app-control provenance', () => {
+  test('local MCP requires matching bound environment from loaded configuration', async () => {
+    const appEnv = {
+      AGENT_TEAMS_BOUND_CONTROL_URL: ownedHost.controlUrl,
+      AGENT_TEAMS_BOUND_CONTEXT_JSON: ownedHost.controlContext,
+    }
+    const configuration = { type: 'local' as const, environment: appEnv }
+    expect(await readOwnedOAuthGroupControlBinding(configuration, appEnv)).toEqual({
+      controlUrl: ownedHost.controlUrl, context: ownedHost.controlContext,
+    })
+    expect(await readOwnedOAuthGroupControlBinding(configuration, { ...appEnv,
+      AGENT_TEAMS_BOUND_CONTEXT_JSON: JSON.stringify({ appInstanceId: 'foreign', dataRootFingerprint: 'foreign-root', connectionGeneration: 1 }),
+    })).toBeNull()
+    expect(await readOwnedOAuthGroupControlBinding({ type: 'local', environment: {} }, appEnv)).toBeNull()
+  })
+
+  test('desktop HTTP MCP must attest its own live transport, root and app-scoped URL', async () => {
+    const root = '/synthetic/agent-teams-claude-root'
+    const appInstanceId = 'owned-app-1'
+    const profileScope = 'e'.repeat(64)
+    let healthyOwner = 'http-server-owner'
+    const server = Bun.serve({
+      hostname: '127.0.0.1', port: 0,
+      fetch(request) {
+        if (new URL(request.url).pathname !== '/health') return new Response('Not found', { status: 404 })
+        return Response.json({
+          schemaVersion: 1, service: 'agent-teams-mcp-http', transport: 'httpStream',
+          host: '127.0.0.1', port: server.port, endpoint: '/mcp',
+          claudeDirHash: createHash('sha256').update(root).digest('hex'),
+          launchSpecHash: 'c'.repeat(64), ownerInstanceId: healthyOwner,
+        })
+      },
+    })
+    try {
+      const scoped = new URL(server.url.origin + '/mcp')
+      scoped.hash = new URLSearchParams({
+        'agent-teams-app-instance': appInstanceId,
+        'agent-teams-app-profile': profileScope,
+      }).toString()
+      const bound = {
+        ...{
+          AGENT_TEAMS_BOUND_CONTROL_URL: ownedHost.controlUrl,
+          AGENT_TEAMS_BOUND_CONTEXT_JSON: JSON.stringify({
+            appInstanceId, dataRootFingerprint: 'root-fingerprint', connectionGeneration: 1,
+          }),
+        },
+        CLAUDE_TEAM_APP_INSTANCE_ID: appInstanceId,
+        CLAUDE_TEAM_APP_PROFILE_SCOPE: profileScope,
+        AGENT_TEAMS_MCP_CLAUDE_DIR: root,
+        CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL_HASH:
+          createHash('sha256').update(server.url.origin + '/mcp').digest('hex'),
+      }
+      const remote = { type: 'remote' as const, url: scoped.toString() }
+      expect(await readOwnedOAuthGroupControlBinding(remote, bound)).toEqual({
+        controlUrl: bound.AGENT_TEAMS_BOUND_CONTROL_URL,
+        context: bound.AGENT_TEAMS_BOUND_CONTEXT_JSON,
+      })
+      const wrongScope = new URL(scoped)
+      wrongScope.hash = new URLSearchParams({
+        'agent-teams-app-instance': appInstanceId, 'agent-teams-app-profile': 'f'.repeat(64),
+      }).toString()
+      expect(await readOwnedOAuthGroupControlBinding({ ...remote, url: wrongScope.toString() }, bound)).toBeNull()
+      expect(await readOwnedOAuthGroupControlBinding(remote, {
+        ...bound, CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL_HASH: 'a'.repeat(64),
+      })).toBeNull()
+      expect(await readOwnedOAuthGroupControlBinding(remote, {
+        ...bound, CLAUDE_TEAM_APP_INSTANCE_ID: 'foreign-app',
+      })).toBeNull()
+      healthyOwner = ''
+      expect(await readOwnedOAuthGroupControlBinding(remote, bound)).toBeNull()
+      expect(await readOwnedOAuthGroupControlBinding({ type: 'remote', url: 'https://other.example/mcp' }, bound)).toBeNull()
+    } finally {
+      server.stop(true)
+    }
   })
 })
