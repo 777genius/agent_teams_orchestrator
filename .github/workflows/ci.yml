@@ -4,6 +4,7 @@ on:
   push:
     branches: [main, dev]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
     inputs:
       full:
@@ -22,6 +23,7 @@ concurrency:
 jobs:
   scope:
     name: CI scope
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -128,6 +130,7 @@ jobs:
 
   cursor-managed-plugin:
     name: Cursor managed plugin
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -147,6 +150,7 @@ jobs:
 
   task-change-ledger:
     name: Task change ledger (${{ matrix.os }})
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -732,7 +736,7 @@ jobs:
 
   required:
     name: CI required
-    if: always() && !cancelled()
+    if: always() && !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
     needs: [scope, cursor-managed-plugin, task-change-ledger, opencode-authority, windows-packaged-backfill, opencode-conformance, packaged-delivery, opencode-v2-linux, opencode-v2-desktop-lifecycle]
     runs-on: ubuntu-latest
     timeout-minutes: 5
