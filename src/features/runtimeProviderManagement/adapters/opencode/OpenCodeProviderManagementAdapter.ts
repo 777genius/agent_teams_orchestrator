@@ -4331,6 +4331,7 @@ export class OpenCodeProviderManagementAdapter
         }),
       }
     } catch (error) {
+      if (deadline.signal.aborted) throw error
       const message = error instanceof Error ? error.message : String(error)
       return {
         ok: true,
