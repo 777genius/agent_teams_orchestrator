@@ -1,7 +1,7 @@
 import { parseOpenCodePromptFileParts, SUPPORTED_COMMANDS, validateEnvelope, type BridgeEnvelope } from './bridge/OpenCodeBridgeProtocol.js'
 import { openCodeDeliveryJournalRecoveryData, teamDiagnosticToOutcomeString, commandStatusFromOutcomeStatus, isAcceptedOutcomeStatus, outcomeSendMessageDataToCommandData, commandStatusMismatchReason, type CommandStatusCommandData, markSendMessageOutcome, type SendMessageCommandData, type SendMessageOutcomeBase, type TeamDiagnostic } from './bridge/OpenCodeBridgeDeliveryJournal.js'
 import { drainStartupTaskkills, pendingStartupTaskkillPids } from '../../utils/processKill.js'
-import { buildOpenCodeGroupChatRunProof, type OpenCodeGroupChatRunProof } from './OpenCodeGroupChatCapability.js'
+import { buildOpenCodeGroupChatRunProof, readOwnedOAuthGroupControlBinding, type OpenCodeGroupChatRunProof } from './OpenCodeGroupChatCapability.js'
 import { isBoundGroupChatControl, readFreshGroupChatCatalog } from '../../utils/groupChatControlClient.js'
 import { assertValidGroupMailboxRows, buildGroupMailboxPrompt, hasGroupMailboxMarker } from '../../utils/groupMailbox.js'
 import { OpenCodeStartupCleanupBudget } from './OpenCodeStartupCleanupBudget.js'
@@ -1791,14 +1791,19 @@ async function readLiveGroupChatRunProofs(
       ? getRetainedAppMcpLaunchConfig(snapshot.host)
       : await resolveOpenCodeAppMcpLaunchConfig()
     const baseEnv = snapshot.host?.profile.env ?? process.env
-    const binding = { ...baseEnv, ...launchConfig.config.environment }
-    if (!isBoundGroupChatControl(binding.AGENT_TEAMS_BOUND_CONTROL_URL, binding.AGENT_TEAMS_BOUND_CONTEXT_JSON)) return []
     if (ownedOAuthHost) {
       // SessionBridge attests this exact endpoint. Verify its loaded MCP config
       // against the app-controlled launch source before invoking tools/list.
       const liveMcp = asRecord(asRecord(snapshot.config)?.mcp)?.[OPEN_CODE_APP_MCP_SERVER_NAME]
       if (!asRecord(liveMcp) || hashStable(liveMcp) !== hashStable(launchConfig.config)) return []
     }
+    const binding = snapshot.host
+      ? (() => {
+          const env = { ...baseEnv, ...launchConfig.config.environment }
+          return { controlUrl: env.AGENT_TEAMS_BOUND_CONTROL_URL, context: env.AGENT_TEAMS_BOUND_CONTEXT_JSON }
+        })()
+      : await readOwnedOAuthGroupControlBinding(launchConfig.config, process.env, phaseContext?.signal)
+    if (!binding || !isBoundGroupChatControl(binding.controlUrl, binding.context)) return []
     // Deliberately bypass the persisted/version-scoped tools cache for this run.
     const observed = await listAppMcpToolsFromResolvedLaunchConfig(launchConfig, phaseContext, baseEnv)
     const client = openCodeClientFactory.create(snapshot.host?.baseUrl ?? ownedOAuthHost!.baseUrl, phaseContext ? {
@@ -1819,8 +1824,8 @@ async function readLiveGroupChatRunProofs(
         { ...snapshot, mcp }, current, observed.map(canonicalizeAppMcpToolId),
         ownedOAuthHost && !snapshot.host ? {
           hostKey: ownedOAuthHost.hostKey, pid: ownedOAuthHost.pid,
-          controlUrl: binding.AGENT_TEAMS_BOUND_CONTROL_URL!,
-          controlContext: binding.AGENT_TEAMS_BOUND_CONTEXT_JSON!,
+          controlUrl: binding.controlUrl,
+          controlContext: binding.context,
         } : undefined,
       )
       if (proof) proofs.push(proof)
@@ -5285,9 +5290,14 @@ async function runSendMessage(
       const launchConfig = snapshot.host
         ? getRetainedAppMcpLaunchConfig(snapshot.host)
         : await resolveOpenCodeAppMcpLaunchConfig()
-      const env = { ...(snapshot.host?.profile.env ?? process.env), ...launchConfig.config.environment }
-      groupCatalog = await readFreshGroupChatCatalog(teamId, memberName, {
-        controlUrl: env.AGENT_TEAMS_BOUND_CONTROL_URL, context: env.AGENT_TEAMS_BOUND_CONTEXT_JSON,
+      const binding = snapshot.host
+        ? (() => {
+            const env = { ...snapshot.host!.profile.env, ...launchConfig.config.environment }
+            return { controlUrl: env.AGENT_TEAMS_BOUND_CONTROL_URL, context: env.AGENT_TEAMS_BOUND_CONTEXT_JSON }
+          })()
+        : await readOwnedOAuthGroupControlBinding(launchConfig.config, process.env)
+      if (binding) groupCatalog = await readFreshGroupChatCatalog(teamId, memberName, {
+        controlUrl: binding.controlUrl, context: binding.context,
       })
     } catch { /* Unavailable is explicit in the handoff prompt. */ }
     await assertStoredDeliveryAuthority(deliveryRecord, authority)
