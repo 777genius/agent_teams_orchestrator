@@ -33,7 +33,7 @@ import { openCodeInventoryService } from './OpenCodeInventoryService.js'
 import { openCodeLedgerBridgeService } from './OpenCodeLedgerBridgeService.js'
 import { parseOpenCodeProviderScopedModelRef } from './OpenCodeModelRef.js'
 import { resolveProcessAttributionDirectory } from './OpenCodeProcessAttributionStore.js'
-import { buildManagedConfig, buildManagedConfigFingerprint } from './OpenCodeProfileManager.js'
+import { applyOpenCodeManagedPathsToAppMcpLaunchConfig, buildManagedConfig, buildManagedConfigFingerprint } from './OpenCodeProfileManager.js'
 import { refreshSelectedProfileAuthority } from './OpenCodeSelectedProfileAuthority.js'
 import { normalizeOpenCodeProjectIdentity } from './OpenCodeProjectIdentity.js'
 import { OpenCodeProvisioningProbe, openCodeProvisioningProbe } from './OpenCodeProvisioningProbe.js'
@@ -1198,6 +1198,12 @@ describe('OpenCodeBridgeCommandHandler', () => {
   test('owned xAI OAuth proves and delivers a named-group message without re-preparing credentials', async () => {
     const previousBoundControlUrl = process.env.AGENT_TEAMS_BOUND_CONTROL_URL
     const previousBoundControlContext = process.env.AGENT_TEAMS_BOUND_CONTEXT_JSON
+    const previousManagedDataHome = process.env.CLAUDE_MULTIMODEL_DATA_HOME
+    const previousManagedCacheHome = process.env.CLAUDE_MULTIMODEL_CACHE_HOME
+    // Reproduce the normal bridge: only profile preparation supplies these
+    // root values, not the caller's original launch environment.
+    delete process.env.CLAUDE_MULTIMODEL_DATA_HOME
+    delete process.env.CLAUDE_MULTIMODEL_CACHE_HOME
     const groupContext = JSON.stringify({
       appInstanceId: 'owned-xai-test', dataRootFingerprint: 'owned-xai-root', connectionGeneration: 1,
     })
@@ -1236,7 +1242,14 @@ describe('OpenCodeBridgeCommandHandler', () => {
       process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENV_JSON = JSON.stringify(env)
       process.env.AGENT_TEAMS_BOUND_CONTROL_URL = env.AGENT_TEAMS_BOUND_CONTROL_URL
       process.env.AGENT_TEAMS_BOUND_CONTEXT_JSON = env.AGENT_TEAMS_BOUND_CONTEXT_JSON
-      liveConfig = (await resolveOpenCodeAppMcpLaunchConfig()).config
+      const managedMcp = async () => applyOpenCodeManagedPathsToAppMcpLaunchConfig(
+        await resolveOpenCodeAppMcpLaunchConfig(), resolveClaudeMultimodelPaths(),
+      ).config
+      liveConfig = await managedMcp()
+      expect((liveConfig.environment as Record<string, string>).CLAUDE_MULTIMODEL_DATA_HOME)
+        .toBe(resolveClaudeMultimodelPaths().data)
+      expect((liveConfig.environment as Record<string, string>).CLAUDE_MULTIMODEL_CACHE_HOME)
+        .toBe(resolveClaudeMultimodelPaths().cache)
       const record = buildRecord({
         selectedModel: 'xai/grok-4.5', toolApprovalMode: 'auto', runtimePid: process.pid,
         profileScope: { purpose: 'launch_runtime', providerId: 'xai', scopeToken: 'xai-group',
@@ -1326,10 +1339,17 @@ describe('OpenCodeBridgeCommandHandler', () => {
       sessionAvailable = true
       liveConfig = { type: 'local', command: ['foreign-agent'], environment: env }
       expect((await handshake()).runtime.groupChatRunProof).toBeUndefined()
-      liveConfig = (await resolveOpenCodeAppMcpLaunchConfig()).config
+      liveConfig = await managedMcp()
+      // Never normalize away a forged managed root or any other MCP identity.
+      const correct = await managedMcp()
+      liveConfig = { ...correct, environment: {
+        ...correct.environment, CLAUDE_MULTIMODEL_DATA_HOME: '/foreign-data-root',
+      } }
+      expect((await handshake()).runtime.groupChatRunProof).toBeUndefined()
+      liveConfig = correct
       process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENV_JSON =
         JSON.stringify({ ...env, SYNTHETIC_GROUP_TOOLS: '0' })
-      liveConfig = (await resolveOpenCodeAppMcpLaunchConfig()).config
+      liveConfig = await managedMcp()
       expect((await handshake()).runtime.groupChatRunProof).toBeUndefined()
       expect(prompts).toHaveLength(1)
     } finally {
@@ -1338,6 +1358,10 @@ describe('OpenCodeBridgeCommandHandler', () => {
       else process.env.AGENT_TEAMS_BOUND_CONTROL_URL = previousBoundControlUrl
       if (previousBoundControlContext === undefined) delete process.env.AGENT_TEAMS_BOUND_CONTEXT_JSON
       else process.env.AGENT_TEAMS_BOUND_CONTEXT_JSON = previousBoundControlContext
+      if (previousManagedDataHome === undefined) delete process.env.CLAUDE_MULTIMODEL_DATA_HOME
+      else process.env.CLAUDE_MULTIMODEL_DATA_HOME = previousManagedDataHome
+      if (previousManagedCacheHome === undefined) delete process.env.CLAUDE_MULTIMODEL_CACHE_HOME
+      else process.env.CLAUDE_MULTIMODEL_CACHE_HOME = previousManagedCacheHome
     }
   })
 
