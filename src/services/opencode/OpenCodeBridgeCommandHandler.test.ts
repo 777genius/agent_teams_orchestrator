@@ -33,7 +33,7 @@ import { openCodeInventoryService } from './OpenCodeInventoryService.js'
 import { openCodeLedgerBridgeService } from './OpenCodeLedgerBridgeService.js'
 import { parseOpenCodeProviderScopedModelRef } from './OpenCodeModelRef.js'
 import { resolveProcessAttributionDirectory } from './OpenCodeProcessAttributionStore.js'
-import { applyOpenCodeManagedPathsToAppMcpLaunchConfig, buildManagedConfig, buildManagedConfigFingerprint } from './OpenCodeProfileManager.js'
+import { buildManagedConfig, buildManagedConfigFingerprint } from './OpenCodeProfileManager.js'
 import { refreshSelectedProfileAuthority } from './OpenCodeSelectedProfileAuthority.js'
 import { normalizeOpenCodeProjectIdentity } from './OpenCodeProjectIdentity.js'
 import { OpenCodeProvisioningProbe, openCodeProvisioningProbe } from './OpenCodeProvisioningProbe.js'
@@ -1242,9 +1242,21 @@ describe('OpenCodeBridgeCommandHandler', () => {
       process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENV_JSON = JSON.stringify(env)
       process.env.AGENT_TEAMS_BOUND_CONTROL_URL = env.AGENT_TEAMS_BOUND_CONTROL_URL
       process.env.AGENT_TEAMS_BOUND_CONTEXT_JSON = env.AGENT_TEAMS_BOUND_CONTEXT_JSON
-      const managedMcp = async () => applyOpenCodeManagedPathsToAppMcpLaunchConfig(
-        await resolveOpenCodeAppMcpLaunchConfig(), resolveClaudeMultimodelPaths(),
-      ).config
+      // Model the actual host's profile-preparation mutation independently of
+      // the production comparison helper. If the reader compares raw launch
+      // environment, this fixture rejects an otherwise valid live xAI group.
+      const managedMcp = async () => {
+        const { config } = await resolveOpenCodeAppMcpLaunchConfig()
+        const managedPaths = resolveClaudeMultimodelPaths()
+        return config.type === 'remote' ? config : {
+          ...config,
+          environment: {
+            ...config.environment,
+            CLAUDE_MULTIMODEL_DATA_HOME: managedPaths.data,
+            CLAUDE_MULTIMODEL_CACHE_HOME: managedPaths.cache,
+          },
+        }
+      }
       liveConfig = await managedMcp()
       expect((liveConfig.environment as Record<string, string>).CLAUDE_MULTIMODEL_DATA_HOME)
         .toBe(resolveClaudeMultimodelPaths().data)
