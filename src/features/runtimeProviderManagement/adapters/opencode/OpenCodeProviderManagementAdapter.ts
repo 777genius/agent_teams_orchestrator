@@ -4148,6 +4148,7 @@ export class OpenCodeProviderManagementAdapter
     if (!input.summary && inventory.readGeneration === 'v2') {
       const { entries: nativeEntries, modelIdsByProviderId } = buildOpenCodeV2ProviderDirectoryEntries(inventory)
       const entries = await applyOpenCodeV2DirectoryDefaultSelection(nativeEntries, inventory.projectPath)
+      deadline.throwIfExpired()
       return { ok: true, value: filterAndPageProviderDirectory({
         directory: { runtimeId: 'opencode', entries: sortProviderDirectoryEntries(entries),
           totalCount: entries.length, returnedCount: entries.length, query: null, filter: 'all',
@@ -4203,6 +4204,7 @@ export class OpenCodeProviderManagementAdapter
           directory.entries,
           inventory.projectPath,
         )
+        deadline.throwIfExpired()
       }
       return { ok: true, value: directory }
     }
