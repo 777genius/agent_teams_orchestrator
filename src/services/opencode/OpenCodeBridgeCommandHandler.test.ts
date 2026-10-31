@@ -18,7 +18,12 @@ import { OpenCodeRuntimeDeadlineError, type OpenCodeProvisioningStage } from './
 import { resolveClaudeMultimodelPaths } from './OpenCodeManagedPaths.js'
 import { openCodeCommandOutcomeStore } from './OpenCodeCommandOutcomeStore.js'
 import { openCodeExecutionProbe } from './OpenCodeExecutionProbe.js'
-import { OpenCodeHostManager, OpenCodeHostProcessGoneError, openCodeHostManager } from './OpenCodeHostManager.js'
+import {
+  isOpenCodeUnregisteredHostProcessGoneError,
+  OpenCodeHostManager,
+  OpenCodeHostProcessGoneError,
+  openCodeHostManager,
+} from './OpenCodeHostManager.js'
 import {
   computeOpenCodeExpectedBehaviorFingerprint,
   OPEN_CODE_KNOWN_ABSENT_AUTH_FINGERPRINT,
@@ -2235,6 +2240,10 @@ describe('OpenCodeBridgeCommandHandler', () => {
     xai?: boolean
     // Simulates a host registered for the same key between probe and close.
     registerBeforeClose?: { pid: number }
+    // Simulates bob's session being pinned to another pid after the Stop probe.
+    repinBobAfterStopProbe?: { pid: number }
+    // Simulates a host start for the same key that is still in flight.
+    pendingStart?: boolean
   }
   type UnregisteredHostStopOutcome = {
     handshakeOk: boolean
@@ -2245,6 +2254,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
     fatalSignals: string[]
     strictReleases: string[]
     cleanups: number
+    probeErrors: unknown[]
   }
 
   async function stopAfterHostRecordCleanup(
@@ -2284,6 +2294,11 @@ describe('OpenCodeBridgeCommandHandler', () => {
         readProcessStartTimeMs: async () => 1000,
         fetchJson: async () => { throw new Error('must not probe a gone host') },
       })
+      if (input.pendingStart) {
+        // Same fixture shape as dead-run recovery: no runtime is launched.
+        (manager as unknown as { pendingHosts: Map<string, unknown> })
+          .pendingHosts.set(record.hostKey, new Promise(() => {}))
+      }
       const realKill = process.kill.bind(process)
       const kill = spyOn(process, 'kill').mockImplementation(((pid: number, signal?: string | number) => {
         const answer = input.signalZero[pid]
@@ -2312,11 +2327,25 @@ describe('OpenCodeBridgeCommandHandler', () => {
       openCodeSessionBridge.releaseSession = async (target, options) => {
         if (options?.strictLeaseRelease) strictReleases.push(target.memberName)
       }
-      openCodeProvisioningProbe.probeRetainingHost = (async (probePath, options) => new OpenCodeProvisioningProbe({
-        inventoryService: { probe: async () => ({ detected: true, projectPath: probePath, profile,
-          models: [], diagnostics: [] }) as never },
-        hostManager: manager,
-      }).probeRetainingHost(probePath, { ...options, selectedModel: undefined })) as typeof openCodeProvisioningProbe.probeRetainingHost
+      const probeErrors: unknown[] = []
+      let probes = 0
+      openCodeProvisioningProbe.probeRetainingHost = (async (probePath, options) => {
+        probes += 1
+        try {
+          return await new OpenCodeProvisioningProbe({
+            inventoryService: { probe: async () => ({ detected: true, projectPath: probePath, profile,
+              models: [], diagnostics: [] }) as never },
+            hostManager: manager,
+          }).probeRetainingHost(probePath, { ...options, selectedModel: undefined })
+        } catch (error) {
+          probeErrors.push(error)
+          // The second probe belongs to Stop; the lane snapshot is already taken.
+          if (probes === 2 && input.repinBobAfterStopProbe) {
+            await store.upsert({ ...bob, runtimePid: input.repinBobAfterStopProbe.pid })
+          }
+          throw error
+        }
+      }) as typeof openCodeProvisioningProbe.probeRetainingHost
       try {
         const handshake = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.handshake', {
           ...body, requiredCommand: 'opencode.stopTeam',
@@ -2333,6 +2362,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
           fatalSignals,
           strictReleases,
           cleanups,
+          probeErrors,
         }
       } finally {
         kill.mockRestore()
@@ -2413,10 +2443,37 @@ describe('OpenCodeBridgeCommandHandler', () => {
     expect(outcome.stop.ok).toBe(true)
     if (!('data' in outcome.stop) || !('stopped' in outcome.stop.data)) throw new Error('missing stop result')
     expect(outcome.stop.data.stopped).toBe(false)
+    expect(outcome.stop.data.members.alice?.diagnostics)
+      .toContain('OpenCode host closure requires no registry record, but one exists')
     expect(outcome.stopped).toEqual({ alice: false, bob: false })
     expect(outcome.registryChanged).toBe(false)
     expect(outcome.fatalSignals).toEqual([])
     expect(outcome.strictReleases).toEqual([])
+  })
+
+  test('stop keeps a member open when its session is pinned to another pid before closure', async () => {
+    const outcome = await stopAfterHostRecordCleanup({ alicePid: 123, bobPid: 123,
+      signalZero: { 123: 'ESRCH', 456: 'alive' }, repinBobAfterStopProbe: { pid: 456 } })
+    expect(outcome.stop.ok).toBe(true)
+    if (!('data' in outcome.stop) || !('stopped' in outcome.stop.data)) throw new Error('missing stop result')
+    expect(outcome.stop.data.stopped).toBe(false)
+    expect(outcome.stop.data.members.bob?.diagnostics).toContain('identity changed before dead-host closure')
+    expect(outcome.stopped).toEqual({ alice: true, bob: false })
+    expect(outcome.registryChanged).toBe(false)
+    expect(outcome.fatalSignals).toEqual([])
+    expect(outcome.strictReleases).toEqual([])
+  })
+
+  test('stop keeps a lane open while a host start for its key is in flight', async () => {
+    const outcome = await stopAfterHostRecordCleanup({ alicePid: 123, bobPid: 123,
+      signalZero: { 123: 'ESRCH' }, pendingStart: true })
+    expectLaneUntouched(outcome)
+    // The handshake and Stop probes both see the generic error, never the new type.
+    expect(outcome.probeErrors).toHaveLength(2)
+    for (const error of outcome.probeErrors) {
+      expect(isOpenCodeUnregisteredHostProcessGoneError(error)).toBe(false)
+      expect((error as Error).message).toBe('OpenCode existing host authority is unavailable or changed')
+    }
   })
 
   for (const failure of ['abort', 'release', 'cas'] as const) {

@@ -4612,10 +4612,11 @@ async function runStop(
           return { record, stopped: false, diagnostics: memberDiagnostics }
         }
         if (runtimeDeadline.remainingMs() < OPEN_CODE_STOP_ATOMIC_CLEANUP_RESERVE_MS) {
+          const closeStep = unregisteredHostPid === undefined ? 'strict lease release' : 'dead-host closure'
           memberDiagnostics.push('deadline expired')
           diagnostics.push(teamDiagnostic(
             'opencode_stop_deadline',
-            `${record.memberName}: insufficient budget for strict lease release; remaining=${runtimeDeadline.remainingMs()}ms`,
+            `${record.memberName}: insufficient budget for ${closeStep}; remaining=${runtimeDeadline.remainingMs()}ms`,
             'error',
           ))
           return { record, stopped: false, diagnostics: memberDiagnostics }

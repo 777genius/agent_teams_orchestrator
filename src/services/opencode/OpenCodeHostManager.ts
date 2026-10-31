@@ -1837,7 +1837,7 @@ export class OpenCodeHostManager {
           'host', () => ({ schemaVersion: 1, hosts: {} }))
         const hosts = registry.hosts
         if (record.requireUnregistered && Object.hasOwn(hosts, record.hostKey)) {
-          throw new Error('OpenCode dead runtime recovery found a registered host record')
+          throw new Error('OpenCode host closure requires no registry record, but one exists')
         }
         const registered = hosts[record.hostKey]
         if (record.expectedProcessStartedAtMs !== undefined && (!registered || typeof registered !== 'object'
