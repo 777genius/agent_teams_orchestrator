@@ -42,7 +42,8 @@ import {
   selectOpenCodeDefaultAgentModel,
 } from '../opencode/OpenCodeAgentModelCompatibility.js'
 import type { OpenCodeInventorySnapshot } from '../opencode/types.js'
-import { buildOpenCodeV2RuntimeStatus } from '../opencode/catalog/OpenCodeV2RuntimeStatus.js'
+import { buildOpenCodeV2RuntimeStatusWithProof } from '../opencode/catalog/OpenCodeV2RuntimeStatus.js'
+import { readOpenCodeManagedDefaultSelection } from '../opencode/OpenCodeManagedDefaultSelection.js'
 import { boundOpenCodeRead } from '../opencode/transport/OpenCodeBoundedFetch.js'
 import type { GeminiBackendStatus } from '../gemini/types.js'
 import {
@@ -617,7 +618,7 @@ async function buildOpenCodeStatus(
   const progress = createOpenCodeInventoryProbeProgressTracker()
   let v2ReadStarted = false
   let readAcquisitionPending = false
-  const deadline = Date.now() + timeoutMs
+  const startedAt = Date.now(), deadline = startedAt + timeoutMs
   const probe = deps.getOpenCodeInventorySnapshot
       ? deps.getOpenCodeInventorySnapshot()
       : openCodeInventoryService.probe(
@@ -649,7 +650,18 @@ async function buildOpenCodeStatus(
       probeError: 'OpenCode owned read cleanup unknown.' } }
   }
   if (snapshot.readStatus || snapshot.readGeneration === 'v2' || snapshot.readGeneration === 'unsupported') {
-    return buildOpenCodeV2RuntimeStatus(snapshot)
+    // Preferences are optional read-only metadata. Discard a late result rather
+    // than let filesystem latency consume the command's owned-cleanup window.
+    const preferenceTimeoutMs = Math.min(deadline, startedAt + 75_000) - Date.now()
+    const managedDefault = snapshot.readGeneration === 'v2' && snapshot.readStatus?.catalog === 'ready' && preferenceTimeoutMs > 0
+      ? await boundOpenCodeRead(readOpenCodeManagedDefaultSelection(snapshot.projectPath), preferenceTimeoutMs)
+        .then(selection => selection.defaultModel, () => null)
+      : null
+    // The desktop full-status IPC has a 90s wall budget. A proof overlay is
+    // optional, with at most a 15s read budget and 75s total target. Owned
+    // version/auth cleanup remains joined after cancellation, not a hard I/O cap.
+    const proofTimeoutMs = Math.max(0, Math.min(15_000, deadline - Date.now(), 75_000 - (Date.now() - startedAt)))
+    return buildOpenCodeV2RuntimeStatusWithProof(snapshot, managedDefault, proofTimeoutMs)
   }
   const runtimeModels = snapshot.models
   const agentModels = filterOpenCodeAgentModels(runtimeModels, snapshot.modelMetadata)

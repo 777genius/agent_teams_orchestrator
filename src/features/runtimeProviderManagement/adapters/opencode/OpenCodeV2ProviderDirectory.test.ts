@@ -82,3 +82,18 @@ test('catalog models grant no connected or authless status; only completed recei
   expect(modelIdsByProviderId.deepseek).toEqual(['deepseek/reasoner'])
   expect(entries.flatMap(row => row.actions).some(action => ['set-default', 'disconnect', 'forget'].includes(action.id))).toBe(false)
 })
+
+for (const anonymousModelCount of [0, 1]) {
+  test(`connected provider remains browseable when passive catalog contains ${anonymousModelCount} anonymous models`, () => {
+    const status = read()
+    status.integrations = [{ id: 'opencode', name: 'OpenCode', plainKey: true }]
+    status.providers = [{ id: 'opencode', integrationId: 'opencode', activation: 'enabled', anonymous: true }]
+    status.models = anonymousModelCount === 0 ? [] : [{ providerId: 'opencode', catalogId: 'free', upstreamModelId: 'free', variants: [],
+      enabled: true, status: 'active', tools: true, input: ['text'], output: ['text'], context: 8192, outputTokens: 512, free: true }]
+    const snapshot = openCodeV2InventorySnapshot(native, '/TEST/project', status, null,
+      [{ id: 'opencode', authHint: 'api', source: 'credentials', credentialScopes: ['managed'] }])
+    const row = buildOpenCodeV2ProviderDirectoryEntries(snapshot).entries.find(entry => entry.providerId === 'opencode')!
+    expect(row).toMatchObject({ state: 'connected', setupKind: 'connected', modelCount: null,
+      metadata: { hasKnownModels: false }, actions: [{ id: 'use', enabled: true }] })
+  })
+}

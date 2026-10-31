@@ -12,6 +12,7 @@ import { executionAssert, executionHash, executionRecord } from '../execution/Op
 import { buildOpenCodeV2InternalRunPlan, type inspectOpenCodeV2SourceAvailability } from './OpenCodeV2LaunchPlan.js'
 import { launchExplicitOpenCodeV2Run } from './OpenCodeV2RunOwner.js'
 import { ensureOpenCodeV2ProbeStore } from './OpenCodeV2ProbeStore.js'
+import { writeOpenCodeV2StatusProofHint } from './OpenCodeV2StatusProofHint.js'
 import { OPEN_CODE_V2_RUN_INITIALIZATION_MS, discoverOpenCodeV2Run, awaitOpenCodeV2RunMemberReadiness, requestOpenCodeV2Run, parseRunControlRequest, isTransientOpenCodeV2ControlRead } from './OpenCodeV2RunControl.js'
 import type { OpenCodeExecutionProof } from '../types.js'
 import type { BridgeEnvelope } from './OpenCodeBridgeProtocol.js'
@@ -60,19 +61,27 @@ function parseRecord(value: unknown): ProbeRecord {
 /** Normal readiness protocol. The cached proof is a result of this owned producer,
  * never a public caller proof DTO. UNKNOWN retains the original IDs and only observes. */
 export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, selection: Selection, run: boolean,
-  options: { unattendedTeam?: boolean; onPrepared?: (sourceKey: string) => Promise<void>;
+  options: { unattendedTeam?: boolean; signal?: AbortSignal; onPrepared?: (sourceKey: string) => Promise<void>;
     onIntentPersisted?: (value: OpenCodeV2ProbeIntent) => Promise<void>; requireExisting?: OpenCodeV2ProbeIntent;
     freshExecutionProofRequestId?: string } = {}) {
   const freshRequestId = options.freshExecutionProofRequestId
   executionAssert(freshRequestId === undefined || run && !options.requireExisting && typeof freshRequestId === 'string' &&
     /^[a-zA-Z0-9._:-]{1,200}$/.test(freshRequestId), 'probe_fresh_request_invalid')
-  const available = (record: ProbeRecord) => freshRequestId !== undefined && record.freshExecutionProofRequestId !== freshRequestId
-    ? { state: 'pending' as const, proof: null, reason: 'The original probe settled; the requested fresh proof still requires its own retired-generation admission.' }
-    : { state: 'available' as const, proof: record.proof, reason: null }
   const unattendedTeam = options.unattendedTeam === true
+  const available = async (record: ProbeRecord) => {
+    if (freshRequestId !== undefined && record.freshExecutionProofRequestId !== freshRequestId)
+      return { state: 'pending' as const, proof: null, reason: 'The original probe settled; the requested fresh proof still requires its own retired-generation admission.' }
+    // Only an explicit producer success updates the display hint. Passive reads
+    // never select a different model or publish a hint from a cached DTO. Team
+    // preflight has a separate source key which ordinary status cannot resolve.
+    if (run && !unattendedTeam && record.proof && record.retired)
+      await writeOpenCodeV2StatusProofHint(path.dirname(directory), selection.project, sourceKey)
+    return { state: 'available' as const, proof: record.proof, reason: null }
+  }
   const deadline = Date.now() + Math.max(1, Math.min(envelope.timeoutMs || 120_000, 300_000) - 25_000)
-  const assertDeadline = () => executionAssert(Date.now() < deadline, 'execution_timeout')
-  const behavior = await collectProjectBehaviorMetadata(selection.project)
+  const assertDeadline = () => { options.signal?.throwIfAborted(); executionAssert(Date.now() < deadline, 'execution_timeout') }
+  assertDeadline()
+  const behavior = await collectProjectBehaviorMetadata(selection.project, process.env, options.signal)
   const variant = typeof envelope.body.effort === 'string' ? envelope.body.effort : 'default'
   const sourceKey = executionHash({ project: selection.project, scopeToken: selection.scope.scopeToken, selectedAuthIdentity: selection.scope.selectedAuthIdentity, source: selection.behaviorFingerprint, graph: selection.installedGraphSHA256,
     projectBehavior: behavior.projectBehaviorFingerprint, variant, ...(unattendedTeam ? { unattendedTeam: true } : {}) })
@@ -226,6 +235,15 @@ export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, 
       assertDeadline()
     }
     while (Date.now() < deadline) {
+      const permissions = await requestOpenCodeV2Run(owner, { operation: 'permissions', memberId: 'probe', originalSessionId: record.sessionID }, Math.min(10_000, deadline - Date.now()))
+      assertDeadline()
+      executionAssert(permissions.kind === 'permissions', 'probe_observation_unknown')
+      if (permissions.requests.length > 0) {
+        // A model check never approves a native tool. Persist cancellation before
+        // stopping the original run, so retries can only finish its retirement.
+        record.failure = 'native_execution_cancelled'; await save(record)
+        return await finishFailure(record)
+      }
       const observed = await requestOpenCodeV2Run(owner, { operation: 'probeEvidence', memberId: 'probe', originalSessionId: record.sessionID }, Math.min(10_000, deadline - Date.now()))
       assertDeadline()
       executionAssert(observed.kind === 'probeEvidence', 'probe_observation_unknown')

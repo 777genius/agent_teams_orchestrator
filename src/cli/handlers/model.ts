@@ -7,6 +7,7 @@ import {
 } from '../../utils/model/gemini.js'
 import { getAPIProvider } from '../../utils/model/providers.js'
 import { openCodeInventoryService } from '../../services/opencode/OpenCodeInventoryService.js'
+import { readOpenCodeManagedDefaultSelection } from '../../services/opencode/OpenCodeManagedDefaultSelection.js'
 import {
   filterOpenCodeAgentModels,
   selectOpenCodeDefaultAgentModel,
@@ -88,8 +89,12 @@ export async function getProviderModels(
         deps.getOpenCodeInventorySnapshot ?? (() => openCodeInventoryService.probe())
       )()
       const models = filterOpenCodeAgentModels(snapshot.models, snapshot.modelMetadata)
+      const managedDefault = snapshot.readGeneration === 'v2' && snapshot.readStatus?.catalog === 'ready'
+        ? (await readOpenCodeManagedDefaultSelection(snapshot.projectPath)).defaultModel : null
+      const nativeDefault = snapshot.readStatus?.defaultModel
       return {
-        defaultModel: selectOpenCodeDefaultAgentModel(models) ?? '',
+        defaultModel: managedDefault ?? (nativeDefault ? `${nativeDefault.providerId}/${nativeDefault.catalogId}` : null)
+          ?? selectOpenCodeDefaultAgentModel(models) ?? '',
         displayName: 'OpenCode',
         models: models.map(model => ({
           id: model,
