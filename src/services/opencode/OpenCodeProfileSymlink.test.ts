@@ -53,6 +53,29 @@ test('merges missing files and preserves file, directory and symlink conflicts',
   expect(await fs.readlink(path.join(target, 'new-link'))).toBe('nested')
 })
 
+test('retries transient Windows lock contention without broadening POSIX lock errors', async () => {
+  const lockPath = `${source}.prepare-lock`
+  const realLock = lockfile.lock
+  let calls = 0
+  const lock = spyOn(lockfile, 'lock').mockImplementation(async (...args) => {
+    calls += 1
+    if (calls === 1) {
+      const error = Object.assign(new Error('transient TEST contention'), {
+        code: process.platform === 'win32' ? 'EPERM' : 'ELOCKED',
+      })
+      throw error
+    }
+    return realLock(...args)
+  })
+  try {
+    await ensureDirectorySymlink(source, target)
+    expect(calls).toBe(2)
+    expect(await fs.readlink(source)).toBe(target)
+  } finally {
+    lock.mockRestore()
+  }
+})
+
 for (const kind of ['symlink', 'migration'] as const) {
   test(`abort while waiting for ${kind} lock does not acquire later or remove source`, async () => {
     const lockPath = kind === 'symlink' ? `${source}.prepare-lock` : `${target}.migration-lock`
