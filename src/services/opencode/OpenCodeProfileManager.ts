@@ -2728,19 +2728,8 @@ async function resolveOpenCodeProfileScopeInternal(
     env[OPEN_CODE_SCOPE_APP_MCP_LAUNCH_CONFIG_ENV],
   ) as ResolvedAppMcpLaunchConfig | null
   const appMcpLaunchConfig = input.purpose === 'launch_runtime'
-    ? retainedAppMcpLaunchConfig ?? await resolveOpenCodeAppMcpLaunchConfig({ env }).then(resolved => {
-        const managedConfig = buildManagedConfig(resolved.config)
-        applyManagedPathEnvironmentToMcpConfig(managedConfig, {
-          [CLAUDE_MULTIMODEL_DATA_HOME_ENV]: snapshotManagedPaths.data,
-          [CLAUDE_MULTIMODEL_CACHE_HOME_ENV]: snapshotManagedPaths.cache,
-        })
-        return {
-          source: resolved.source,
-          config: (
-            asRecord(managedConfig.mcp)[OPEN_CODE_APP_MCP_SERVER_NAME]
-          ) as OpenCodeMcpServerConfig,
-        }
-      })
+    ? retainedAppMcpLaunchConfig ?? await resolveOpenCodeAppMcpLaunchConfig({ env })
+        .then(resolved => applyOpenCodeManagedPathsToAppMcpLaunchConfig(resolved, snapshotManagedPaths))
     : null
   const appMcpLaunchIdentity = redactConfigIdentity(appMcpLaunchConfig, env)
   const configFingerprint = hashString(JSON.stringify({
@@ -2906,6 +2895,29 @@ function applyManagedPathEnvironmentToMcpConfig(
   managedConfig.mcp = {
     ...mcpConfig,
     [OPEN_CODE_APP_MCP_SERVER_NAME]: appMcpConfig,
+  }
+}
+
+/**
+ * Match the exact local MCP environment added during profile preparation.
+ * A stored xAI OAuth host can be observed without preparing another profile;
+ * its live /config must still be checked against this effective launch config.
+ * Do not normalize away arbitrary environment, command, URL, or auth fields.
+ */
+export function applyOpenCodeManagedPathsToAppMcpLaunchConfig(
+  launch: ResolvedAppMcpLaunchConfig,
+  paths: Pick<ReturnType<typeof resolveClaudeMultimodelPaths>, 'data' | 'cache'>,
+): ResolvedAppMcpLaunchConfig {
+  const managedConfig: Record<string, unknown> = {
+    mcp: { [OPEN_CODE_APP_MCP_SERVER_NAME]: launch.config },
+  }
+  applyManagedPathEnvironmentToMcpConfig(managedConfig, {
+    [CLAUDE_MULTIMODEL_DATA_HOME_ENV]: paths.data,
+    [CLAUDE_MULTIMODEL_CACHE_HOME_ENV]: paths.cache,
+  })
+  return {
+    ...launch,
+    config: asRecord(managedConfig.mcp)[OPEN_CODE_APP_MCP_SERVER_NAME] as OpenCodeMcpServerConfig,
   }
 }
 
