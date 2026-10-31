@@ -30,7 +30,9 @@ export function buildOpenCodeGroupChatRunProof(
   const pid = record.runtimePid
   const hostMatches = host
     ? host.state === 'healthy' && snapshot?.hostHealthy && host.pid === pid && host.hostKey === record.hostKey
-    : !!ownedHost && ownedHost.pid === pid && ownedHost.hostKey === record.hostKey
+    : !!ownedHost && record.profileScope?.purpose === 'launch_runtime'
+      && record.profileScope.providerId === 'xai'
+      && ownedHost.pid === pid && ownedHost.hostKey === record.hostKey
   if (!hostMatches || !Number.isSafeInteger(pid) || pid <= 0 ||
       !record.runId || record.stoppedAt || record.staleReason || !record.appManagedBootstrap ||
       record.appManagedBootstrap.schemaVersion !== 1 || !record.appManagedBootstrap.injectionVerifiedAt ||
