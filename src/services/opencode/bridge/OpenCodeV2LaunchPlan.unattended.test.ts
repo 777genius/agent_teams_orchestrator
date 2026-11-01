@@ -656,7 +656,7 @@ test('a model-test tool request cancels and retires the original without approva
     // Unit orchestration fixture only; the native E2E independently verifies real retirement.
     return { kind: 'stop', state: 'stopped', ownerRetired: true, members: [{ memberId: 'probe', cleanup: {}, errors: [] }] } as RunControlResult
   }))
-  const expected = { state: 'failed', proof: null, reason: 'native_execution_cancelled' }
+  const expected = { state: 'failed' as const, proof: null, reason: 'native_execution_cancelled' }
   expect(await probes.resolveOpenCodeV2ExecutionProbe(request, selection, true)).toEqual(expected)
   expect(JSON.parse(await readFile(file, 'utf8'))).toMatchObject({ failure: 'native_execution_cancelled', retired: true, proof: null })
   for (const run of [false, true]) expect(await probes.resolveOpenCodeV2ExecutionProbe(request, selection, run)).toEqual(expected)
