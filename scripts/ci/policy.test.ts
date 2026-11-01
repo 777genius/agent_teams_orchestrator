@@ -22,7 +22,7 @@ test('V2 execution, catalog and provider code selects the real Linux V2 lane', (
     'src/services/opencode/compatibility/opencode-v2-qualifications.json', 'src/services/opencode/bridge/OpenCodeV2TeamBridge.ts',
     'src/services/opencode/transport/OpenCodeV2ProviderWire.ts', 'src/services/opencode/profile/OpenCodeV2ExecutionReceipt.ts',
     'src/features/runtimeProviderManagement/adapters/opencode/OpenCodeV2ProviderManagement.ts', 'src/entrypoints/opencodeV2ExecutionServer.ts',
-    'scripts/opencode-v2/stage.ts', 'scripts/ci/opencode-v2-linux-execution.sh', 'patches/@opencode%2Fcore@2.0.32.patch', 'package.json']) {
+    'scripts/opencode-v2/stage.ts', 'scripts/opencode-v2-anonymous-native-e2e.ts', 'scripts/opencode-v2-team-native-e2e.ts', 'scripts/ci/opencode-v2-linux-execution.sh', 'patches/@opencode%2Fcore@2.0.32.patch', 'package.json']) {
     assert.equal(classify([path]).v2_linux, 'true', path)
   }
   assert.equal(classify(['src/services/opencode/host/OpenCodeV2ExecutionHost.ts']).native, 'false')
@@ -138,6 +138,7 @@ function needs(native = 'false', v2Linux = native === 'true' ? 'true' : 'false')
     'windows-packaged-backfill': { result: native === 'true' ? 'success' : 'skipped' },
     'opencode-conformance': { result: native === 'true' ? 'success' : 'skipped' },
     'opencode-v2-linux': { result: v2Linux === 'true' ? 'success' : 'skipped' },
+    'opencode-v2-desktop-lifecycle': { result: v2Linux === 'true' ? 'success' : 'skipped' },
   }
 }
 
@@ -148,7 +149,7 @@ test('aggregate independently rejects required failures/cancellation/skips and c
       for (const result of ['failure', 'cancelled', 'skipped', 'unknown']) {
         const sample = needs(native)
         sample[job as keyof typeof sample].result = result
-        if (native === 'false' && result === 'skipped' && ['windows-packaged-backfill', 'opencode-conformance', 'packaged-delivery', 'opencode-native-custody', 'opencode-v2-linux'].includes(job)) {
+        if (native === 'false' && result === 'skipped' && ['windows-packaged-backfill', 'opencode-conformance', 'packaged-delivery', 'opencode-native-custody', 'opencode-v2-linux', 'opencode-v2-desktop-lifecycle'].includes(job)) {
           assert.equal(aggregate(sample), 'TEST decision')
         } else assert.throws(() => aggregate(sample), `${job}/${native}/${result}`)
       }
@@ -157,9 +158,13 @@ test('aggregate independently rejects required failures/cancellation/skips and c
   // The V2 Linux lane may be skipped only when it was not selected; native always selects it.
   const selected = needs('false', 'true')
   assert.equal(aggregate(selected), 'TEST decision')
-  for (const result of ['failure', 'cancelled', 'skipped']) {
-    const sample = needs('false', 'true'); sample['opencode-v2-linux'].result = result
-    assert.throws(() => aggregate(sample), result)
+  for (const job of ['opencode-v2-linux', 'opencode-v2-desktop-lifecycle'] as const) {
+    for (const result of ['failure', 'cancelled', 'skipped']) {
+      const sample = needs('false', 'true'); sample[job].result = result
+      assert.throws(() => aggregate(sample), `${job}/${result}`)
+    }
+    const { [job]: omitted, ...missing } = needs('false', 'true')
+    assert.throws(() => aggregate(missing), `${job}/missing`)
   }
   assert.throws(() => aggregate(needs('true', 'false')))
   for (const v2Linux of ['', 'invalid']) assert.throws(() => aggregate(needs('false', v2Linux)))

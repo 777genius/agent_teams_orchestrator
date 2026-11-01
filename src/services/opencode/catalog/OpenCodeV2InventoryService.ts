@@ -1,3 +1,4 @@
+import { OPEN_CODE_LOADING_TIMEOUT_MS } from '../OpenCodeLoadingBudget.js'
 import { openCodeV2EngineVersion } from '../compatibility/OpenCodeV2Registry.js'
 import type { OpenCodeClientRequestContext } from '../OpenCodeClientRequestContext.js'
 import type { OpenCodeConnectedProvider, OpenCodeInventorySnapshot } from '../types.js'
@@ -9,13 +10,14 @@ import { createOpenCodeV2ReadClient } from '../transport/OpenCodeV2ClientFactory
 import { openCodeReadAssert } from '../transport/OpenCodeBoundedFetch.js'
 import { openCodeV2Wire } from '../compatibility/OpenCodeV2Registry.js'
 import { openCodeV2Refusal, type OpenCodeV2Refusal } from '../execution/OpenCodeV2RefusalReason.js'
-import { emptyOpenCodeV2ReadStatus, readAgent, readArray, readConfiguration, readLocation, readModel,
+import { emptyOpenCodeV2ReadStatus, readAgent, readArray, readConfiguration, readIntegration, readLocation, readModel,
   readProvider, readRecord, readWrapped, type OpenCodeV2ReadStatus } from './OpenCodeV2ReadStatus.js'
 
 export function openCodeV2InventorySnapshot(native: OpenCodeV2NativeIdentity, directory: string,
   readStatus = emptyOpenCodeV2ReadStatus(native, directory), probeError: string | null = null,
   connectedProviders: readonly OpenCodeConnectedProvider[] = [], probeRefusal = false): OpenCodeInventorySnapshot {
-  // The directory offers the native key integrations; completed V2 connections mark them connected.
+  // Preserve the compact inventory's active-provider semantics. Full first-time
+  // discovery belongs to readStatus.integrations and the native V2 directory.
   const availableProviders = [...new Set([...readStatus.providers.map(row => row.id),
     ...openCodeV2KeyIntegrations(openCodeV2EngineVersion(native)).map(entry => entry.providerId)])]
   return { detected: true, binaryPath: native.executablePath, version: native.version, projectPath: directory,
@@ -29,7 +31,7 @@ export function openCodeV2InventorySnapshot(native: OpenCodeV2NativeIdentity, di
 
 export async function probeOpenCodeV2Inventory(native: OpenCodeV2NativeIdentity, directory: string,
   context: OpenCodeClientRequestContext = {}): Promise<OpenCodeInventorySnapshot> {
-  const deadline = Date.now() + Math.min(60_000, context.remainingMs?.() ?? 60_000)
+  const deadline = Date.now() + Math.min(OPEN_CODE_LOADING_TIMEOUT_MS, context.remainingMs?.() ?? OPEN_CODE_LOADING_TIMEOUT_MS)
   const boundedContext = { ...context, remainingMs: () => Math.min(deadline - Date.now(), context.remainingMs?.() ?? Infinity) }
   let status = emptyOpenCodeV2ReadStatus(native, directory)
   let host: Awaited<ReturnType<typeof acquireOpenCodeV2ReadHost>> | undefined
@@ -51,12 +53,13 @@ export async function probeOpenCodeV2Inventory(native: OpenCodeV2NativeIdentity,
     // Native location construction does not imply plugin activation completion.
     await sdk.ready(directory)
     reader.check()
+    const integrations = readArray(wrap(await sdk.integrations(directory))).map(readIntegration)
     const providers = readArray(wrap(await sdk.providers(directory))).map(readProvider)
     const models = readArray(wrap(await sdk.models(directory))).map(readModel)
     const agents = readArray(wrap(await sdk.agents(directory))).map(readAgent)
-    openCodeReadAssert(providers.length <= 256 && agents.length <= 256)
+    openCodeReadAssert(integrations.length <= 1_000 && providers.length <= 256 && agents.length <= 256)
     const unique = (values: string[]) => new Set(values).size === values.length
-    openCodeReadAssert(unique(providers.map(row => row.id)) && unique(agents.map(row => row.id)) &&
+    openCodeReadAssert(unique(integrations.map(row => row.id)) && unique(providers.map(row => row.id)) && unique(agents.map(row => row.id)) &&
       unique(models.map(row => `${row.providerId}\0${row.catalogId}`)))
     for (const provider of providers) {
       const detail = readProvider(wrap(await sdk.provider(directory, provider.id)))
@@ -67,14 +70,14 @@ export async function probeOpenCodeV2Inventory(native: OpenCodeV2NativeIdentity,
       openCodeReadAssert(JSON.stringify(detail) === JSON.stringify(agent), 'identity_mismatch')
     }
     openCodeReadAssert(models.every(model => providers.some(provider => provider.id === model.providerId)))
-    const configuration = readConfiguration(await sdk.config(directory))
+    const configuration = readConfiguration(await sdk.config(directory), openCodeV2EngineVersion(native))
     const defaultValue = wrap(await sdk.defaultModel(directory))
     const defaultRow = defaultValue === null ? null : readModel(defaultValue)
     if (defaultRow) openCodeReadAssert(models.some(row => row.providerId === defaultRow.providerId && row.catalogId === defaultRow.catalogId))
     openCodeReadAssert(readLocation(await sdk.location(directory), directory) === projectId, 'identity_mismatch')
     openCodeReadAssert(await hashOpenCodeFile(native.executablePath) === native.executableSha256, 'identity_mismatch')
     reader.check()
-    status = { ...status, projectId, catalog: 'ready', configuration, providers, models, agents,
+    status = { ...status, projectId, catalog: 'ready', configuration, integrations, providers, models, agents,
       defaultModel: defaultRow ? { providerId: defaultRow.providerId, catalogId: defaultRow.catalogId } : null }
   } catch (error) {
     // Only fixed texts are public; never serialize native errors.

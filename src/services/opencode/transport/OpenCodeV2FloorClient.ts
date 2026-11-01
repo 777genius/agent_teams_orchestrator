@@ -10,6 +10,7 @@ export function createOpenCodeV2FloorClient(client: typeof FloorClient, baseUrl:
     location: directory => sdk.location.get({ location: { directory } }),
     ready: async directory => { await sdk.plugin.awaitActivation({ location: { directory } }); wire.check() },
     models: directory => sdk.model.list({ location: { directory } }),
+    integrations: directory => sdk.integration.list({ location: { directory } }),
     defaultModel: directory => sdk.model.default({ location: { directory } }),
     providers: directory => sdk.provider.list({ location: { directory } }),
     provider: (directory, providerID) => sdk.provider.get({ location: { directory }, providerID }),

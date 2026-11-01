@@ -1,4 +1,6 @@
-import { inspectOpenCodeReadSelection, selectedProviderUsesOpenCodeV2, selectedOpenCodeV2Version, connectOpenCodeV2Provider, loadOpenCodeV2ProviderModels, testOpenCodeV2ProviderModel, buildOpenCodeV2KeySetupForm } from './OpenCodeV2ProviderManagement.js'
+import { inspectOpenCodeReadSelection, selectedProviderUsesOpenCodeV2, connectOpenCodeV2Provider, loadOpenCodeV2ProviderModels, testOpenCodeV2ProviderModel, loadOpenCodeV2ProviderSetupForm } from './OpenCodeV2ProviderManagement.js'
+import { buildOpenCodeV2ProviderDirectoryEntries } from './OpenCodeV2ProviderDirectory.js'
+import { applyOpenCodeV2DefaultSelection, applyOpenCodeV2DirectoryDefaultSelection, clearOpenCodeV2ProjectDefaultModel, setOpenCodeV2DefaultModel } from './OpenCodeV2DefaultModels.js'
 import { openCodeV2KeyIntegration } from '../../../../services/opencode/catalog/OpenCodeV2KeyIntegrations.js'
 import path from 'node:path'
 import { realpath } from 'node:fs/promises'
@@ -417,7 +419,7 @@ function isCopilotExplicitModelUnsupported(reason: string): boolean {
 const DEFAULT_DIRECTORY_LIMIT = 50
 const MAX_DIRECTORY_LIMIT = 100
 const DIRECTORY_CACHE_TTL_MS = 30_000
-const OPEN_CODE_PROVIDER_MANAGEMENT_HOST_HEALTH_TIMEOUT_MS = 10_000
+const OPEN_CODE_PROVIDER_MANAGEMENT_HOST_HEALTH_TIMEOUT_MS = OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS
 const OPEN_CODE_PROVIDER_MANAGEMENT_IDLE_HOST_TTL_MS = 10 * 60_000
 const OPEN_CODE_PROVIDER_MANAGEMENT_LEASE_STALE_AGE_MS = 2 * 60 * 60_000
 const AUTO_OAUTH_CREDENTIAL_POLL_INTERVAL_MS = 250
@@ -3968,7 +3970,7 @@ export class OpenCodeProviderManagementAdapter
       }
     }
 
-    const deadline = new OpenCodeRuntimeDeadline(this.deps.viewTimeoutMs ?? 75_000)
+    const deadline = new OpenCodeRuntimeDeadline(this.deps.viewTimeoutMs ?? OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS)
     const progress = createOpenCodeInventoryProbeProgressTracker()
     let timeoutMessage: string | undefined
     const captureTimeout = () => {
@@ -4011,16 +4013,15 @@ export class OpenCodeProviderManagementAdapter
 
     if (!inventory.detected
       || (inventory.readGeneration !== undefined && inventory.readGeneration !== 'v1')) {
+      const view = buildView({
+        inventory, host: null, configProviders: null, providers: null,
+        providerAuth: null, diagnostics: inventory.diagnostics,
+      })
+      const nativeDefault = inventory.readStatus?.defaultModel
       return {
         ok: true,
-        value: buildView({
-          inventory,
-          host: null,
-          configProviders: null,
-          providers: null,
-          providerAuth: null,
-          diagnostics: inventory.diagnostics,
-        }),
+        value: inventory.readGeneration === 'v2' ? await applyOpenCodeV2DefaultSelection(view,
+          nativeDefault ? `${nativeDefault.providerId}/${nativeDefault.catalogId}` : null) : view,
       }
     }
     if (isOpenCodeInventoryTimeoutSnapshot(inventory)) {
@@ -4110,6 +4111,21 @@ export class OpenCodeProviderManagementAdapter
   async loadDirectory(
     input: LoadProviderDirectoryInput,
   ): Promise<ProviderManagementResult<ProviderDirectoryView>> {
+    const deadline = new OpenCodeRuntimeDeadline(this.deps.viewTimeoutMs ?? OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS)
+    try {
+      return await this.loadDirectoryWithinDeadline(input, deadline)
+    } catch (error) {
+      if (!deadline.signal.aborted) throw error
+      return providerManagementError('runtime-unhealthy', 'OpenCode provider directory loading timed out')
+    } finally {
+      deadline.dispose()
+    }
+  }
+
+  private async loadDirectoryWithinDeadline(
+    input: LoadProviderDirectoryInput,
+    deadline: OpenCodeRuntimeDeadline,
+  ): Promise<ProviderManagementResult<ProviderDirectoryView>> {
     if (input.runtimeId !== 'opencode') {
       return providerManagementError(
         'unsupported-runtime',
@@ -4120,10 +4136,27 @@ export class OpenCodeProviderManagementAdapter
 
     const inventoryService = this.deps.inventoryService ?? openCodeInventoryService
     const inventory = await this.probeInventory(inventoryService, input.projectPath, {
-      mode: input.summary ? 'summary' : input.refresh ? 'full' : 'profile',
+      mode: input.summary ? 'summary' : 'full',
+      v1SettingsOnly: !input.summary && input.refresh !== true,
       bypassCache: input.refresh === true,
       refreshModels: input.refresh === true && input.summary !== true,
+      abortSignal: deadline.signal,
+      remainingMs: () => deadline.remainingMs(),
     })
+    deadline.throwIfExpired()
+
+    if (!input.summary && inventory.readGeneration === 'v2') {
+      const { entries: nativeEntries, modelIdsByProviderId } = buildOpenCodeV2ProviderDirectoryEntries(inventory)
+      const entries = await applyOpenCodeV2DirectoryDefaultSelection(nativeEntries, inventory.projectPath)
+      deadline.throwIfExpired()
+      return { ok: true, value: filterAndPageProviderDirectory({
+        directory: { runtimeId: 'opencode', entries: sortProviderDirectoryEntries(entries),
+          totalCount: entries.length, returnedCount: entries.length, query: null, filter: 'all',
+          limit: entries.length, cursor: null, nextCursor: null, fetchedAt: new Date().toISOString(),
+          diagnostics: redactDiagnostics([...inventory.diagnostics, ...(inventory.probeError ? [inventory.probeError] : [])]) },
+        modelIdsByProviderId, query: input.query, filter: input.filter, limit: input.limit, cursor: input.cursor,
+      }) }
+    }
 
     if (!inventory.detected
       || (!input.summary && inventory.readGeneration !== undefined && inventory.readGeneration !== 'v1')) {
@@ -4159,16 +4192,21 @@ export class OpenCodeProviderManagementAdapter
       }
     }
     if (input.summary) {
-      return {
-        ok: true,
-        value: buildSummaryProviderDirectory({
-          inventory,
-          query: input.query,
-          filter: input.filter,
-          limit: input.limit,
-          cursor: input.cursor,
-        }),
+      const directory = buildSummaryProviderDirectory({
+        inventory,
+        query: input.query,
+        filter: input.filter,
+        limit: input.limit,
+        cursor: input.cursor,
+      })
+      if (inventory.readGeneration === 'v2') {
+        directory.entries = await applyOpenCodeV2DirectoryDefaultSelection(
+          directory.entries,
+          inventory.projectPath,
+        )
+        deadline.throwIfExpired()
       }
+      return { ok: true, value: directory }
     }
 
     const hostManager = this.deps.hostManager ?? openCodeHostManager
@@ -4185,8 +4223,10 @@ export class OpenCodeProviderManagementAdapter
         },
         hostLifetime: 'process',
         resolveConfigFingerprint: false,
-        healthTimeoutMs: OPEN_CODE_PROVIDER_MANAGEMENT_HOST_HEALTH_TIMEOUT_MS,
+        healthTimeoutMs: Math.min(OPEN_CODE_PROVIDER_MANAGEMENT_HOST_HEALTH_TIMEOUT_MS, deadline.remainingMs()),
+        abortSignal: deadline.signal,
       })
+      deadline.throwIfExpired()
       hostLease = await this.retainProviderManagementHost(hostManager, host, false)
       const cacheKey = this.getDirectoryCacheKey({
         runtimeId: input.runtimeId,
@@ -4196,6 +4236,7 @@ export class OpenCodeProviderManagementAdapter
       if (!input.refresh) {
         const cached = this.readDirectoryCache(cacheKey)
         if (cached) {
+          deadline.throwIfExpired()
           return {
             ok: true,
             value: filterAndPageProviderDirectory({
@@ -4210,7 +4251,11 @@ export class OpenCodeProviderManagementAdapter
         }
       }
 
-      const client = clientFactory.create(host.baseUrl, undefined, host)
+      deadline.throwIfExpired()
+      const client = clientFactory.create(host.baseUrl, {
+        signal: deadline.signal,
+        remainingMs: () => deadline.remainingMs(),
+      }, host)
       const serverDocRead = client.getServerDoc
         ? safeRead(() => client.getServerDoc!())
         : Promise.resolve({
@@ -4269,12 +4314,14 @@ export class OpenCodeProviderManagementAdapter
         limit: Number.MAX_SAFE_INTEGER,
         cursor: null,
       })
+      deadline.throwIfExpired()
       this.writeDirectoryCache(
         cacheKey,
         uncachedDirectory,
         buildProviderDirectoryModelSearchIndex(directorySource),
       )
 
+      deadline.throwIfExpired()
       return {
         ok: true,
         value: buildProviderDirectory({
@@ -4286,6 +4333,7 @@ export class OpenCodeProviderManagementAdapter
         }),
       }
     } catch (error) {
+      if (deadline.signal.aborted) throw error
       const message = error instanceof Error ? error.message : String(error)
       return {
         ok: true,
@@ -4325,12 +4373,11 @@ export class OpenCodeProviderManagementAdapter
         false,
       )
     }
-    // Registered native V2 key integrations are served only while the selected binary is V2.
-    if (openCodeV2KeyIntegration(providerId)) {
-      let selectedVersion: Awaited<ReturnType<typeof selectedOpenCodeV2Version>> = null
-      try { selectedVersion = await selectedOpenCodeV2Version() } catch { selectedVersion = null }
-      const form = selectedVersion ? buildOpenCodeV2KeySetupForm(providerId, selectedVersion) : null
-      if (form) return { ok: true, value: form }
+    let selected: Awaited<ReturnType<typeof inspectOpenCodeReadSelection>>
+    try { selected = await inspectOpenCodeReadSelection() }
+    catch { return providerManagementError('runtime-unhealthy', 'Selected OpenCode identity is unavailable') }
+    if (selected.policy.generation === 'v2') {
+      return loadOpenCodeV2ProviderSetupForm({ ...input, providerId }, selected)
     }
     if (FAST_CURATED_SETUP_PROVIDER_IDS.has(providerId)) {
       return {
@@ -4711,8 +4758,14 @@ export class OpenCodeProviderManagementAdapter
         startPhaseTimeout = phase => {
         if (abortController.signal.aborted) return
         if (timeout) clearTimeout(timeout)
+        // Leave room for stale identity recheck and bounded cleanup before the
+        // overall deadline wins the race. Short caller budgets reserve at most half.
+        const remainingMs = deadline.remainingMs()
         const phaseTimeoutMs = phase === 'instance'
-          ? this.deps.catalogInstanceTimeoutMs ?? OPEN_CODE_INSTANCE_INITIALIZATION_TIMEOUT_MS
+          ? Math.max(1, Math.min(
+              this.deps.catalogInstanceTimeoutMs ?? OPEN_CODE_INSTANCE_INITIALIZATION_TIMEOUT_MS,
+              remainingMs - Math.min(1_500, Math.floor(remainingMs / 2)),
+            ))
           : timeoutMs
         timeoutMessage = phase === 'instance'
           ? `OpenCode catalog instance initialization timed out after ${phaseTimeoutMs}ms`
@@ -5282,7 +5335,15 @@ export class OpenCodeProviderManagementAdapter
       return providerManagementError('auth-required', curatedSubscriptionKeyError)
     }
 
-    if (selectedV2) return connectOpenCodeV2Provider({ ...input, providerId, apiKey })
+    if (selectedV2) {
+      const result = await connectOpenCodeV2Provider({ ...input, providerId, apiKey })
+      if (result.ok) {
+        this.invalidateDirectoryCache()
+        const inventoryService = this.deps.inventoryService ?? openCodeInventoryService
+        inventoryService.clearCache?.()
+      }
+      return result
+    }
 
     return this.withManagedOpenCodeClient(
       input.runtimeId,
@@ -5643,6 +5704,14 @@ export class OpenCodeProviderManagementAdapter
     }
     const scope = input.scope === 'all_projects' ? 'all_projects' : 'project'
 
+    let selectedRead: Awaited<ReturnType<typeof inspectOpenCodeReadSelection>> | undefined
+    try { if (input.runtimeId === 'opencode') selectedRead = await inspectOpenCodeReadSelection() }
+    catch (error) { return providerManagementError('runtime-unhealthy', selectedIdentityFailureMessage(error)) }
+    if (selectedRead?.policy.generation === 'v2' && selectedRead.native) {
+      return setOpenCodeV2DefaultModel({ ...input, providerId, modelId, scope },
+        () => this.loadView({ runtimeId: input.runtimeId, projectPath: input.projectPath }), selectedRead)
+    }
+
     return this.withManagedOpenCodeClient(
       input.runtimeId,
       input.projectPath,
@@ -5775,6 +5844,12 @@ export class OpenCodeProviderManagementAdapter
         'A project path is required to clear its OpenCode default model',
       )
     }
+    try {
+      if (input.runtimeId === 'opencode' && await selectedProviderUsesOpenCodeV2()) {
+        return clearOpenCodeV2ProjectDefaultModel({ ...input, projectPath },
+          () => this.loadView({ runtimeId: input.runtimeId, projectPath }))
+      }
+    } catch (error) { return providerManagementError('runtime-unhealthy', selectedIdentityFailureMessage(error)) }
     return this.withManagedOpenCodeClient(
       input.runtimeId,
       projectPath,

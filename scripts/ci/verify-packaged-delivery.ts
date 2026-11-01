@@ -25,7 +25,8 @@ export function parsePackagedSecurityCapabilities(stdout: string): {
 
 function verifyPackagedDelivery(): void {
   const candidate = process.env.CANDIDATE_PLATFORM
-  if (candidate !== 'linux-x64' && candidate !== 'win32-x64') throw new Error('Unsupported candidate platform')
+  if (candidate !== 'linux-x64' && candidate !== 'win32-x64' && candidate !== 'win32-arm64') throw new Error('Unsupported candidate platform')
+  if (candidate !== `${process.platform}-${process.arch}`) throw new Error('Candidate verification requires the native target architecture')
   const [platform, arch] = candidate.split('-')
   const identity = validatePackagedOpenCodeIdentity(JSON.parse(readFileSync('dist/opencode-delivery.json', 'utf8')))
   if (identity.platform !== platform || identity.arch !== arch || identity.bunVersion !== openCodeBunVersion(platform)) {

@@ -2,6 +2,7 @@ import { expect, test } from 'bun:test'
 import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+import { normalizeOpenCodeProjectIdentity } from '../OpenCodeProjectIdentity.js'
 import { OPENCODE_V2_NATIVE_KEY_OPTION_ID, openCodeV2KeyIntegrations, openCodeV2ProviderConnectionsDirectory,
   readOpenCodeV2ConnectedProviders } from './OpenCodeV2KeyIntegrations.js'
 import { openCodeV2InventorySnapshot } from './OpenCodeV2InventoryService.js'
@@ -26,7 +27,7 @@ async function withDataHome<T>(run: (directory: string) => Promise<T>): Promise<
   }
 }
 const receipt = (state: string, providerId: string, projectPath: string, opencodeVersion = '2.1.4') => JSON.stringify({ state,
-  connection: { providerId, state: 'connected' }, proof: { projectPath, opencodeVersion } })
+  connection: { providerId, state: 'connected' }, proof: { projectPath: normalizeOpenCodeProjectIdentity(projectPath), opencodeVersion } })
 
 test('only completed owner-private receipts for the exact project and version mark a provider connected', () => withDataHome(async directory => {
   const write = async (name: string, content: string, mode = 0o600) => {
@@ -36,7 +37,8 @@ test('only completed owner-private receipts for the exact project and version ma
   await write('a', receipt('complete', 'kimi-code-plan-cn', '/TEST/project'))
   await write('b', receipt('pending', 'kimi-code-plan-global', '/TEST/project'))
   await write('c', receipt('complete', 'moonshotai', '/TEST/other-project'))
-  await write('d', receipt('complete', 'openrouter', '/TEST/project'), 0o644)
+  // Windows receipts rely on the private data directory, not POSIX permission bits.
+  if (process.platform !== 'win32') await write('d', receipt('complete', 'openrouter', '/TEST/project'), 0o644)
   await write('e', '{not json')
   await write('f', receipt('complete', 'kimi-code-plan-global', '/TEST/project', '2.0.32'))
   await writeFile(path.join(directory, 'not-a-receipt.json'), receipt('complete', 'xai', '/TEST/project'), { mode: 0o600 })
@@ -67,6 +69,6 @@ test('a registered key integration gets the native key form; connect admits only
     apiKey: 'TEST-key', authOptionId: 'api:curated', projectPath: '/TEST/project' })).toMatchObject({
     ok: false, error: { code: 'unsupported-auth-method' } })
   expect(await connectOpenCodeV2Provider({ runtimeId: 'opencode', providerId: 'openrouter', method: 'api',
-    apiKey: 'TEST-key', authOptionId: OPENCODE_V2_NATIVE_KEY_OPTION_ID, projectPath: '/TEST/project' })).toMatchObject({
+    apiKey: 'TEST-key', authOptionId: 'api:curated', projectPath: '/TEST/project' })).toMatchObject({
     ok: false, error: { code: 'unsupported-auth-method' } })
 })

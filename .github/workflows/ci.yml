@@ -4,6 +4,7 @@ on:
   push:
     branches: [main, dev]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
     inputs:
       full:
@@ -15,9 +16,14 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.event_name }}-${{ (github.event_name == 'pull_request' || github.event_name == 'push') && (github.event.pull_request.number || github.ref) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
+
 jobs:
   scope:
     name: CI scope
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -124,6 +130,7 @@ jobs:
 
   cursor-managed-plugin:
     name: Cursor managed plugin
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -143,6 +150,7 @@ jobs:
 
   task-change-ledger:
     name: Task change ledger (${{ matrix.os }})
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -187,7 +195,7 @@ jobs:
         run: bun test src/services/codexNative src/components/MessageSelector.test.ts src/utils/sessionStorage.persistence.test.ts src/utils/cleanup.codexLocks.test.ts
 
       - name: Test mailbox publications and lifecycle
-        run: bun test src/utils/teammateMailbox.test.ts src/hooks/ordinaryMailboxMessage.test.ts src/cli/print.groupMailbox.test.ts
+        run: bun test src/utils/teammateMailbox.test.ts src/hooks/ordinaryMailboxMessage.test.ts src/cli/print.groupMailbox.test.ts src/tools/AgentTool/AgentTool.teamScope.test.ts src/tools/SendMessageTool/SendMessageTool.test.ts src/services/teamBootstrap/resumedLeadTeam.test.ts
 
       - name: Test task change ledger
         run: bun run test:task-change-ledger
@@ -249,6 +257,48 @@ jobs:
         run: bun run test:opencode-authority --timeout ${{ runner.os == 'Windows' && '30000' || '5000' }}
       - name: Test provider settings and HTTP body deadlines
         run: bun test src/features/runtimeProviderManagement/adapters/opencode/OpenCodeProviderManagementAdapter.test.ts src/services/opencode/OpenCodeProviderIdentity.test.ts src/services/opencode/OpenCodeInventoryService.test.ts src/services/opencode/OpenCodeProviderLabelRegression.test.ts src/services/opencode/OpenCodeClientFactory.test.ts --timeout 30000
+      - name: Test V2 provider catalogs, defaults and project identity
+        run: >-
+          bun test
+          src/features/runtimeProviderManagement/adapters/opencode/OpenCodeV2ProviderDirectory.test.ts
+          src/features/runtimeProviderManagement/adapters/opencode/OpenCodeV2ProviderSetupForm.test.ts
+          src/features/runtimeProviderManagement/adapters/opencode/OpenCodeV2CatalogCredentials.test.ts
+          src/features/runtimeProviderManagement/adapters/opencode/OpenCodeV2DefaultModels.test.ts
+          src/features/runtimeProviderManagement/adapters/opencode/OpenCodeV2DefaultModelsRefresh.test.ts
+          src/features/runtimeProviderManagement/adapters/opencode/OpenCodeV2FreeModels.test.ts
+          src/features/runtimeProviderManagement/adapters/opencode/OpenCodeV2ModelPagination.test.ts
+          src/features/runtimeProviderManagement/adapters/opencode/OpenCodeV2ProviderManagement.project-identity.test.ts
+          src/services/opencode/catalog/OpenCodeV2ReadStatus.test.ts
+          src/services/opencode/catalog/OpenCodeV2RuntimeStatus.test.ts
+          src/services/opencode/catalog/OpenCodeV2StatusProof.test.ts
+          src/services/opencode/bridge/OpenCodeV2ScopeCancellation.test.ts
+          src/services/opencode/catalog/OpenCodeV2KeyIntegrations.test.ts
+          --timeout 30000
+      - name: Test V2 provider routing in isolation
+        run: bun test src/features/runtimeProviderManagement/adapters/opencode/OpenCodeProviderManagementAdapter.v2-routing.test.ts --timeout 30000
+      - name: Test provider selection failures in isolation
+        run: bun test src/features/runtimeProviderManagement/adapters/opencode/OpenCodeProviderSelectionFailure.test.ts --timeout 30000
+      - name: Test V2 catalog cache in isolation
+        run: bun test src/services/opencode/OpenCodeInventoryService.v2-cache.test.ts --timeout 30000
+      - name: Test V2 probe session titles and launch plans in isolation
+        if: runner.os != 'Windows'
+        run: bun test src/services/opencode/bridge/OpenCodeV2LaunchPlan.unattended.test.ts --timeout 30000
+      - name: Test qualified Windows V2 probe session titles
+        if: runner.os == 'Windows'
+        run: bun test src/services/opencode/bridge/OpenCodeV2LaunchPlan.unattended.test.ts --test-name-pattern 'probe-owned session title' --timeout 30000
+      # Real owner processes over POSIX run control; probe recovery itself runs in the step above.
+      - name: Test V2 run owner retirement
+        if: runner.os != 'Windows'
+        run: bun test src/services/opencode/bridge/OpenCodeV2RunOwnerRetirement.test.ts --timeout 30000
+      # The Linux socket fixture runs under the job's Node. The mutable-cut test starts a
+      # second bun test process under a fixed 15s budget and stays out of this step.
+      - name: Test V2 run control and run owner
+        if: runner.os != 'Windows'
+        run: |
+          TEST_OPENCODE_NODE_BINARY="$(command -v node)" bun test \
+            src/services/opencode/bridge/OpenCodeV2RunControl.test.ts \
+            src/services/opencode/bridge/OpenCodeV2RunOwner.test.ts \
+            --test-name-pattern '^(?!.*probe readiness retains one original)' --timeout 30000
       - name: Test Windows startup cleanup completion contracts
         run: bun test src/utils/processKill.test.ts src/services/opencode/OpenCodeStartupCleanupBudget.test.ts src/services/opencode/OpenCodeStartupCleanup.test.ts --timeout 30000
       - name: Test native Windows startup termination
@@ -367,7 +417,8 @@ jobs:
     needs: scope
     if: needs.scope.outputs.native == 'true'
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 25
+    # Windows also proves a real source owner with its production readiness and stop budgets.
+    timeout-minutes: ${{ matrix.platform != 'linux-x64' && 35 || 25 }}
     strategy:
       fail-fast: false
       matrix:
@@ -378,6 +429,10 @@ jobs:
             binary: dist/cli
           - os: windows-latest
             platform: win32-x64
+            executable: claude-multimodel.exe
+            binary: dist/cli.exe
+          - os: windows-11-arm
+            platform: win32-arm64
             executable: claude-multimodel.exe
             binary: dist/cli.exe
     steps:
@@ -391,13 +446,59 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: '24'
+      - name: Require the native target architecture
+        shell: bash
+        env:
+          CANDIDATE_PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          node -e 'if (`${process.platform}-${process.arch}` !== process.env.CANDIDATE_PLATFORM) throw new Error("Node is not native to the candidate platform")'
+          bun --no-install -e 'if (`${process.platform}-${process.arch}` !== process.env.CANDIDATE_PLATFORM) throw new Error("Bun is not native to the candidate platform")'
+      - name: Enable Windows long paths
+        if: runner.os == 'Windows'
+        run: git config --global core.longpaths true
       - name: Install frozen portable dependencies
         run: bun install --frozen-lockfile --linker hoisted
       - name: Test native compiled delegation and cancellation
-        run: bun test scripts/ci/verify-packaged-delivery.test.ts src/cli/packagedOpenCodeDelivery.test.ts scripts/opencode-v2/native-video.test.ts scripts/opencode-v2/stage.test.ts scripts/opencode-v2/stage-copy.test.ts scripts/opencode-v2/staged-files.test.ts src/services/opencode/host/OpenCodeV2ExecutionAuth.test.ts src/services/opencode/host/OpenCodeV2PlainExecution.test.ts src/services/opencode/profile/OpenCodeV2ExecutionConfig.test.ts src/services/opencode/host/OpenCodeV2ExecutionLifecycle.test.ts src/features/runtimeProviderManagement/adapters/opencode/OpenCodeV2ProviderManagement.test.ts
+        run: bun test scripts/ci/verify-packaged-delivery.test.ts src/services/opencode/OpenCodeLoadingBudget.test.ts src/services/opencode/host/OpenCodeHostNativeAdapter.loading.test.ts src/services/opencode/transport/OpenCodeBoundedFetch.loading.test.ts src/cli/packagedOpenCodeDelivery.test.ts scripts/opencode-v2/native-video.test.ts scripts/opencode-v2/native-windows-execution-smoke.test.ts scripts/opencode-v2/stage.test.ts scripts/opencode-v2/stage-copy.test.ts scripts/opencode-v2/staged-files.test.ts src/services/opencode/host/OpenCodeV2ExecutionAuth.test.ts src/services/opencode/host/OpenCodeV2ExecutionPlatform.test.ts src/services/opencode/host/OpenCodeV2PlainExecution.test.ts src/services/opencode/profile/OpenCodeV2ExecutionConfig.test.ts src/services/opencode/host/OpenCodeV2ExecutionLifecycle.test.ts src/features/runtimeProviderManagement/adapters/opencode/OpenCodeV2ProviderManagement.test.ts
+      - name: Test Windows receipt architecture admission
+        if: runner.os == 'Windows'
+        run: bun test src/services/opencode/profile/OpenCodeV2ExecutionReceipt.test.ts --test-name-pattern Windows
       - name: Produce physical JS and native front door
         run: bun --no-install scripts/package-runtime.ts --platform ${{ matrix.platform }}
+      - name: Verify the qualified native Windows OpenCode CLI
+        if: runner.os == 'Windows'
+        timeout-minutes: 5
+        shell: pwsh
+        env:
+          CANDIDATE_PLATFORM: ${{ matrix.platform }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $descriptor = Get-Content dist/opencode-v2-delivery.json -Raw | ConvertFrom-Json
+          $arch = $env:CANDIDATE_PLATFORM.Split('-')[1]
+          if ($descriptor.platform -cne 'win32' -or $descriptor.arch -cne $arch) { throw 'V2 candidate platform mismatch' }
+          $version = $descriptor.engineVersions[-1]
+          $packageName = "@opencode/cli-windows-$arch"
+          $root = Join-Path $env:RUNNER_TEMP "TEST-opencode-v2-cli-$arch"
+          npm install --prefix $root --ignore-scripts --no-audit --no-fund "${packageName}@${version}"
+          if ($LASTEXITCODE -ne 0) { throw 'Qualified native CLI install failed' }
+          $packageRoot = Join-Path $root "node_modules/$packageName"
+          $metadata = Get-Content (Join-Path $packageRoot 'package.json') -Raw | ConvertFrom-Json
+          if ($metadata.name -cne $packageName -or $metadata.version -cne $version) { throw 'Native CLI package identity mismatch' }
+          $binary = Join-Path $packageRoot 'bin/opencode.exe'
+          $bytes = [IO.File]::ReadAllBytes($binary)
+          if ($bytes.Length -lt 64 -or $bytes[0] -ne 0x4d -or $bytes[1] -ne 0x5a) { throw 'Native CLI DOS header mismatch' }
+          $pe = [BitConverter]::ToInt32($bytes, 0x3c)
+          if ($pe -lt 64 -or $pe + 6 -gt $bytes.Length -or [BitConverter]::ToUInt32($bytes, $pe) -ne 0x00004550) { throw 'Native CLI PE header mismatch' }
+          $machine = [BitConverter]::ToUInt16($bytes, $pe + 4)
+          $expectedMachine = if ($arch -ceq 'arm64') { 0xaa64 } else { 0x8664 }
+          if ($machine -ne $expectedMachine) { throw 'Native CLI PE architecture mismatch' }
+          $reported = (& $binary --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $reported -cnotin @($version, "opencode v$version")) { throw 'Native CLI version mismatch' }
+          @{ platform = $env:CANDIDATE_PLATFORM; package = $packageName; version = $reported; machine = ('0x{0:x4}' -f $machine); sha256 = (Get-FileHash $binary -Algorithm SHA256).Hash.ToLowerInvariant() } | ConvertTo-Json | Set-Content "native-v2-cli-$env:CANDIDATE_PLATFORM.json"
+          "V2_NATIVE_CLI=$binary" >> $env:GITHUB_ENV
       - name: Verify and archive complete candidate delivery
+        id: candidate-delivery
         shell: bash
         env:
           CANDIDATE_PLATFORM: ${{ matrix.platform }}
@@ -441,6 +542,7 @@ jobs:
         shell: bash
         env:
           CANDIDATE_PLATFORM: ${{ matrix.platform }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
           # Outside the checkout, so module resolution cannot fall back to the source install.
@@ -457,15 +559,40 @@ jobs:
           mkdir -p "$extracted/support"
           unzip -q "$extracted/$support_archive" -d "$extracted/support"
           "$shipped_bun" --no-install --no-env-file scripts/opencode-v2/packaged-server-smoke.ts "$extracted/runtime" "$extracted/support" "packaged-server-smoke-$CANDIDATE_PLATFORM.json"
-      - name: Preserve staged V2 server evidence
+          if [[ "$CANDIDATE_PLATFORM" == win32-* ]]; then
+            "$shipped_bun" --no-install --no-env-file scripts/opencode-v2/packaged-pty-smoke.ts "$extracted/runtime" "$extracted/support" "packaged-pty-smoke-$CANDIDATE_PLATFORM.json" "$CANDIDATE_PLATFORM"
+          fi
+      - name: Prove native Windows V2 source launch, MCP readiness and physical stop
+        if: runner.os == 'Windows'
+        timeout-minutes: 8
+        shell: pwsh
+        env:
+          CANDIDATE_PLATFORM: ${{ matrix.platform }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $shippedBun = Join-Path $env:RUNNER_TEMP 'TEST-packaged-server-smoke/runtime/bun/bun.exe'
+          # -CommandType enumerates PATH matches; an array would shift the receipt argument.
+          $nodeCommands = @(Get-Command node -CommandType Application -ErrorAction Stop)
+          $node = ($nodeCommands | Select-Object -First 1).Source
+          if ($node -isnot [string] -or -not (Test-Path $node -PathType Leaf)) { throw 'One physical Node executable is required' }
+          Write-Output "Controller Node matches: $($nodeCommands.Count); selected: $node"
+          & $shippedBun --no-install --no-env-file scripts/opencode-v2/native-windows-execution-smoke.ts $env:V2_NATIVE_CLI $node "native-v2-execution-$env:CANDIDATE_PLATFORM.json" $env:CANDIDATE_PLATFORM
+          if ($LASTEXITCODE -ne 0) { throw 'Native V2 source execution proof failed' }
+      - name: Preserve staged V2 and native CLI evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: packaged-server-smoke-${{ matrix.platform }}-${{ github.event.pull_request.head.sha || github.sha }}
-          path: packaged-server-smoke-${{ matrix.platform }}.json
+          path: |
+            packaged-server-smoke-${{ matrix.platform }}.json
+            packaged-pty-smoke-${{ matrix.platform }}.json
+            native-v2-cli-${{ matrix.platform }}.json
+            native-v2-execution-${{ matrix.platform }}.json
           if-no-files-found: warn
           retention-days: 7
       - name: Preserve exact-head candidate archive
+        if: always() && steps.candidate-delivery.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: packaged-delivery-${{ matrix.platform }}-${{ github.event.pull_request.head.sha || github.sha }}
@@ -477,10 +604,12 @@ jobs:
     needs: scope
     if: needs.scope.outputs.v2_linux == 'true'
     name: OpenCode V2 Linux execution
-    # A real V2 child on ubuntu-24.04. No model request, no credential. See the script header
-    # for the regression that no Linux job could catch before this lane.
+    # Real V2 children on ubuntu-24.04. Public catalog reads and anonymous execution
+    # against loopback fixtures; no credential or external model request.
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    # Anonymous stages allow 4 x 5m; each team run allows 5m + 5m + 2m cleanup.
+    # Leave room for both native versions, packaging, catalogs and receipt upload.
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v6
         with:
@@ -501,6 +630,34 @@ jobs:
         run: bun scripts/package-runtime.ts --platform linux-x64
       - name: Start every qualified V2 version
         run: bash scripts/ci/opencode-v2-linux-execution.sh dist
+      - name: Verify anonymous native execution, live status and selected-key catalogs
+        timeout-minutes: 22
+        shell: bash
+        run: |
+          set -euo pipefail
+          native_root="$RUNNER_TEMP/TEST-opencode-v2-anonymous-cli"
+          npm install --prefix "$native_root" --ignore-scripts --no-audit --no-fund @opencode/cli-linux-x64@2.2.0
+          TEST_OPENCODE_V2_NATIVE_BINARY="$native_root/node_modules/@opencode/cli-linux-x64/bin/opencode" \
+            TEST_EVIDENCE_DIR="$RUNNER_TEMP/TEST-opencode-v2-anonymous-evidence" \
+            dist/bun/bun --no-install --no-env-file scripts/opencode-v2-anonymous-native-e2e.ts
+      - name: Verify real protocol1 team launch, native replies and physical stop
+        timeout-minutes: 28
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The desktop-managed baseline and the separately installed version
+          # from the reported issue. Both binaries were downloaded above.
+          for version in 2.1.4 2.2.0; do
+            if [[ "$version" == 2.2.0 ]]; then
+              native_root="$RUNNER_TEMP/TEST-opencode-v2-anonymous-cli"
+            else
+              native_root="$RUNNER_TEMP/TEST-opencode-v2-linux/TEST-v2-$version/oc"
+            fi
+            TEST_OPENCODE_V2_NATIVE_BINARY="$native_root/node_modules/@opencode/cli-linux-x64/bin/opencode" \
+              TEST_EVIDENCE_DIR="$RUNNER_TEMP/TEST-opencode-v2-team-evidence/TEST-v2-$version" \
+              PR_HEAD_SHA="${{ github.event.pull_request.head.sha || github.sha }}" \
+              dist/bun/bun --no-install --no-env-file scripts/opencode-v2-team-native-e2e.ts
+          done
       - name: Preserve sanitized V2 Linux receipts
         if: always()
         uses: actions/upload-artifact@v4
@@ -511,6 +668,102 @@ jobs:
           path: |
             ${{ runner.temp }}/TEST-opencode-v2-linux/TEST-v2-*/models.json
             ${{ runner.temp }}/TEST-opencode-v2-linux/TEST-v2-*/status.json
+            ${{ runner.temp }}/TEST-opencode-v2-anonymous-evidence/anonymous-native-proof.json
+            ${{ runner.temp }}/TEST-opencode-v2-team-evidence/TEST-v2-*/team-native-proof.json
+
+  opencode-v2-desktop-lifecycle:
+    needs: scope
+    if: needs.scope.outputs.v2_linux == 'true'
+    name: OpenCode V2 desktop lifecycle (Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout the exact runtime candidate with its ancestry
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: runtime
+          fetch-depth: 0
+          # The existing dev launcher fetches origin/main and verifies ancestry.
+          # This is the ordinary read-only job token, never a write-capable PAT.
+          persist-credentials: true
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - name: Read the reviewed desktop compatibility pin
+        id: desktop-pin
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const pin = JSON.parse(fs.readFileSync('runtime/scripts/ci/opencode-v2-desktop-compatibility.json', 'utf8'));
+          if (pin.repository !== '777genius/agent-teams-ai' || !/^[a-f0-9]{40}$/.test(pin.commit)) {
+            throw new Error('Expected an exact reviewed desktop repository and commit');
+          }
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `commit=${pin.commit}\n`);
+          NODE
+      - name: Checkout the reviewed desktop candidate
+        uses: actions/checkout@v6
+        with:
+          repository: 777genius/agent-teams-ai
+          ref: ${{ steps.desktop-pin.outputs.commit }}
+          path: desktop
+          persist-credentials: false
+      - name: Resolve the desktop's pinned package manager
+        id: desktop-tools
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const { packageManager } = JSON.parse(fs.readFileSync('desktop/package.json', 'utf8'));
+          const match = /^pnpm@(\d+\.\d+\.\d+)(?:\+sha512\.[a-f0-9]+)?$/.exec(packageManager);
+          if (!match) throw new Error('Expected the desktop pnpm version and integrity pin');
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `pnpm=${match[1]}\n`);
+          NODE
+      - uses: pnpm/action-setup@v6
+        with:
+          version: ${{ steps.desktop-tools.outputs.pnpm }}
+          run_install: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: desktop/.node-version
+          cache: pnpm
+          cache-dependency-path: desktop/pnpm-lock.yaml
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.3.11'
+      - name: Install standard Electron Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libnss3 libatk-bridge2.0-0t64 libgtk-3-0t64 libasound2t64 libgbm1 fonts-dejavu-core
+      - name: Install the frozen runtime dependency graph
+        working-directory: runtime
+        run: bun install --frozen-lockfile
+      - name: Install the frozen desktop dependency graph
+        working-directory: desktop
+        run: node scripts/ci/install-dependencies-with-retry.mjs
+      - name: Canonical desktop typecheck
+        working-directory: desktop
+        timeout-minutes: 10
+        run: pnpm typecheck
+      - name: Real download, hot activation, anonymous Test and scoped status refresh
+        working-directory: desktop
+        timeout-minutes: 25
+        env:
+          CLAUDE_AGENT_TEAMS_ORCHESTRATOR_CLI_PATH: ${{ github.workspace }}/runtime/cli-source
+          OPENCODE_V2_E2E_EVIDENCE: ${{ runner.temp }}/TEST-v2-desktop-evidence
+          TMPDIR: ${{ runner.temp }}/TEST-v2-desktop-scratch
+        run: |
+          mkdir -p "$TMPDIR" "$OPENCODE_V2_E2E_EVIDENCE"
+          node scripts/e2e/opencode-v2-activation-desktop.mjs
+      - name: Preserve desktop source identities and observed evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencode-v2-desktop-lifecycle-${{ github.event.pull_request.head.sha || github.sha }}
+          path: ${{ runner.temp }}/TEST-v2-desktop-evidence/
+          if-no-files-found: warn
+          retention-days: 7
 
   opencode-native-custody:
     name: OpenCode native custody (Linux x64)
@@ -577,8 +830,8 @@ jobs:
 
   required:
     name: CI required
-    if: always()
-    needs: [scope, cursor-managed-plugin, task-change-ledger, opencode-authority, windows-packaged-backfill, opencode-conformance, packaged-delivery, opencode-v2-linux, opencode-native-custody]
+    if: always() && !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
+    needs: [scope, cursor-managed-plugin, task-change-ledger, opencode-authority, windows-packaged-backfill, opencode-conformance, packaged-delivery, opencode-v2-linux, opencode-v2-desktop-lifecycle, opencode-native-custody]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

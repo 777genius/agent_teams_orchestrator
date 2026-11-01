@@ -8,7 +8,7 @@ const platformPath = /^(?:package\.json$|bun\.lock$|tsconfig[^/]*\.json$|cli(?:-
 const lifecyclePath = /^(?:src\/services\/(?:runtimeBackends|teamBootstrap|codexNative)\/|src\/features\/runtimeProviderManagement\/(?:application|adapters|domain|ports)\/|src\/utils\/(?:process(?:\.ts$|Kill\.)|genericProcessUtils|swarm\/|windowsNativeProcess)|src\/services\/opencode\/host\/OpenCodeV2PlainExecution|src\/tools\/shared\/spawnMultiAgent|src\/cli\/(?:handlers\/(?:runtime|model(?:\.test)?\.ts$|anthropicCompatibleRuntime\.integration\.test\.ts$)|(?:runtimeStatusCommand|effectiveDefaultModel)\.entry\.test\.ts$)|scripts\/(?:opencode-.*conformance|smoke\/windows-runtime-opencode)|test\/fixtures\/opencode-generation-native\/)/
 // The real V2 execution lane runs on Linux, so it follows the V2 execution, catalog
 // and provider code, not only native boundaries (host/ is not one).
-const v2LinuxPath = /^(?:src\/services\/opencode\/(?:host|execution|bridge|catalog|compatibility|transport|profile)\/|src\/entrypoints\/opencodeV2|src\/features\/runtimeProviderManagement\/adapters\/opencode\/|scripts\/opencode-v2\/|scripts\/ci\/opencode-v2-linux-execution\.sh$|patches\/)/
+const v2LinuxPath = /^(?:src\/services\/opencode\/(?:host|execution|bridge|catalog|compatibility|transport|profile)\/|src\/entrypoints\/opencodeV2|src\/features\/runtimeProviderManagement\/adapters\/opencode\/|scripts\/opencode-v2\/|scripts\/opencode-v2-(?:anonymous|team)-native-e2e\.ts$|scripts\/ci\/opencode-v2-linux-execution\.sh$|patches\/)/
 const authorityPath = /^src\/services\/opencode\/(?:types\.ts$|recovery-contract\/|compatibility\/OpenCodeVersionProbe(?:\.ts$|\.helperBudget\.test\.ts$)|OpenCode[^/]*(?:Authority|Recovery|Identity|Attribution|Host|BinaryResolver|ProvisioningProbe|ExecutionProof|Launch|Startup|Stop|Cursor|Profile|Session|Native|OAuth|ExecutionProbe|ManagedPaths|AuthCoordination|AuthStore|RuntimeDeadline|EffectiveAgentPolicyContract|BridgePreconditions|BridgeCommandHandler|McpManager))/
 const custodyPath = /^(?:native\/opencode-custody\/|src\/services\/opencode\/(?:native\/|OpenCodeClientFactory(?:\.test)?\.ts$)|scripts\/stage-opencode-custody\.mts$|scripts\/lib\/opencode-custody-artifact(?:\.test)?\.ts$)/
 
@@ -52,8 +52,10 @@ export function aggregate(needs: Record<string, Need>): string {
     const allowedSkip = native === 'false' && optional.includes(job)
     if (result !== 'success' && !(allowedSkip && result === 'skipped')) throw new Error(`${job}: ${result ?? 'missing'}`)
   }
-  const v2Result = needs['opencode-v2-linux']?.result
-  if (v2Result !== 'success' && !(v2Linux === 'false' && v2Result === 'skipped')) throw new Error(`opencode-v2-linux: ${v2Result ?? 'missing'}`)
+  for (const job of ['opencode-v2-linux', 'opencode-v2-desktop-lifecycle']) {
+    const result = needs[job]?.result
+    if (result !== 'success' && !(v2Linux === 'false' && result === 'skipped')) throw new Error(`${job}: ${result ?? 'missing'}`)
+  }
   return reason
 }
 

@@ -284,6 +284,8 @@ export class OpenCodeProvisioningProbe {
       const ensurePromise = hostManager.ensureHost({
         projectPath: inventory.projectPath,
         ...(options.existingHostKey ? { hostKey: options.existingHostKey, existingOnly: true } : {}),
+        ...(options.existingHostKey && options.expectedRuntimePid !== undefined
+          ? { expectedRuntimePid: options.expectedRuntimePid } : {}),
         preparedProfile: inventory.profile ?? undefined,
         ...(options.phaseContext
           ? { healthTimeoutMs: options.phaseContext.remainingMs() }

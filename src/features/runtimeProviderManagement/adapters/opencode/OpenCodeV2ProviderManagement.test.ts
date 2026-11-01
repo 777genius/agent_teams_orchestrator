@@ -2,7 +2,7 @@ import { mkdtemp, readdir, readFile, rm, stat } from 'node:fs/promises'
 import path from 'node:path'
 import { tmpdir } from 'node:os'
 import { test, expect } from 'bun:test'
-import { openCodeV2ModelTestMessage, buildOpenCodeV2RuntimeProviderModel, openCodeV2ConnectionIDs, requireOpenCodeV2OwnedConnection, rollbackOpenCodeV2OwnedConnection, retireOpenCodeV2CatalogOwner, recordOpenCodeV2ProviderFailure } from './OpenCodeV2ProviderManagement.js'
+import { openCodeV2ModelTestMessage, openCodeV2ConnectProofFailureCode, openCodeV2ConnectFailureMessage, buildOpenCodeV2RuntimeProviderModel, openCodeV2ConnectionIDs, requireOpenCodeV2OwnedConnection, rollbackOpenCodeV2OwnedConnection, retireOpenCodeV2CatalogOwner, recordOpenCodeV2ProviderFailure } from './OpenCodeV2ProviderManagement.js'
 import type { OpenCodeAuthCredential } from '../../../../services/opencode/OpenCodeAuthStore.js'
 const empty = { id: 'groq', methods: [{ type: 'key' }], connections: [] }
 const connection = { ...empty, connections: [{ type: 'credential', id: 'cred_original', label: 'Groq' }] }
@@ -74,6 +74,8 @@ test('private failure diagnostics preserve finite control causes and redact arbi
     await recordOpenCodeV2ProviderFailure('selected-model-execution-proof', new Error('run_control_disconnected'), true)
     await recordOpenCodeV2ProviderFailure('selected-model-execution-proof', new Error('run_control_timeout'), true)
     await recordOpenCodeV2ProviderFailure('selected-model-execution-proof', new Error('run_control_timeout ' + secret), true)
+    await recordOpenCodeV2ProviderFailure('selected-model-execution-proof', new Error('provider_original_execution_failed'), true)
+    await recordOpenCodeV2ProviderFailure('selected-model-execution-proof', new Error('provider_original_execution_failed ' + secret), true)
     await recordOpenCodeV2ProviderFailure('selected-model-execution-proof', new Error(secret), true)
     await recordOpenCodeV2ProviderFailure('run-owner-initialization', new Error('execution_selected_auth_existing_or_unsupported'), true)
     await recordOpenCodeV2ProviderFailure('run-owner-initialization', new Error('cleanup_unknown', { cause: new Error('selection_mismatch') }), true)
@@ -98,6 +100,7 @@ test('private failure diagnostics preserve finite control causes and redact arbi
       return row.category
     }))
     expect(rows.sort()).toEqual(['cleanup_unknown', 'cleanup_unknown', 'execution_selected_auth_existing_or_unsupported',
+      'provider_original_execution_failed', 'provider_operation_unknown',
       'provider_operation_unknown', 'provider_operation_unknown', 'provider_operation_unknown', 'run_control_disconnected',
       'run_control_timeout', 'selection_mismatch', 'execution_selected_oauth_readback_unknown',
       'execution_selected_oauth_recovery_required', 'execution_selected_oauth_windows_unqualified', 'provider_operation_unknown',
@@ -136,4 +139,36 @@ test('model test distinguishes terminal failure from pending without exposing ra
   expect(openCodeV2ModelTestMessage(false, 'pending')).toContain('pending or unverified')
   expect(openCodeV2ModelTestMessage(false, 'available')).not.toContain('verified.')
   expect(openCodeV2ModelTestMessage(true, 'available')).toContain('physical retirement verified')
+})
+
+test('connect reports a settled model-verification failure without treating it as pending or bad authentication', () => {
+  for (const reason of ['native_execution_failed', 'native_execution_cancelled']) {
+    const code = openCodeV2ConnectProofFailureCode('failed', reason)
+    expect(code).toBe('provider_original_execution_failed')
+    const message = openCodeV2ConnectFailureMessage(new Error(code), true)
+    expect(message).toContain('verification failed')
+    expect(message).toContain('original attempt was retained')
+    expect(message).toContain('no automatic reconnect or prompt retry was performed')
+    expect(message).not.toContain('unresolved')
+    expect(message).not.toContain('authentication')
+  }
+})
+
+test('connect preserves unresolved wording for cleanup uncertainty, pending probes and unknown reasons', () => {
+  for (const [state, reason] of [
+    ['failed', 'native_execution_failed; probe_physical_cleanup_unknown'],
+    ['failed', 'native_execution_cancelled; probe_physical_cleanup_unknown'],
+    ['pending', 'native_execution_failed'],
+    ['failed', 'TEST-PRIVATE arbitrary provider response'],
+    ['failed', null],
+  ] as const) {
+    const code = openCodeV2ConnectProofFailureCode(state, reason)
+    expect(code).toBe('provider_original_execution_pending')
+    const message = openCodeV2ConnectFailureMessage(new Error(code), true)
+    expect(message).toContain('remains unresolved')
+    expect(message).not.toContain('TEST-PRIVATE')
+  }
+  expect(openCodeV2ConnectFailureMessage(new Error('provider_physical_cleanup_unknown'), true)).toContain('remains unresolved')
+  expect(openCodeV2ConnectFailureMessage(new Error('provider_original_execution_failed TEST-PRIVATE'), true)).toContain('remains unresolved')
+  expect(openCodeV2ConnectFailureMessage(new Error('provider_original_execution_failed'), false)).toContain('Existing credentials were preserved')
 })

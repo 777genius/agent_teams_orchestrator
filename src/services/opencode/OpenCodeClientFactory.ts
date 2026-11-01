@@ -1,3 +1,4 @@
+import { OPEN_CODE_LOADING_TIMEOUT_MS } from './OpenCodeLoadingBudget.js'
 import { readOpenCodeBoundedHttpResponse } from './OpenCodeBoundedHttpResponse.js'
 import { productionOpenCodeFetch } from './native/OpenCodeNativeRequestLease.js'
 import type { OpenCodeClientRequestContext } from './OpenCodeClientRequestContext.js'
@@ -105,7 +106,7 @@ type OpenCodeClientFactoryDeps = {
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000
 // /global/health does not initialize the directory-scoped native instance.
 // Give the first scoped request the same budget as native host startup.
-export const OPEN_CODE_INSTANCE_INITIALIZATION_TIMEOUT_MS = 30_000
+export const OPEN_CODE_INSTANCE_INITIALIZATION_TIMEOUT_MS = OPEN_CODE_LOADING_TIMEOUT_MS
 const MCP_REQUEST_TIMEOUT_MS = 35_000
 const PERMISSION_REQUEST_TIMEOUT_MS = 2_500
 const MESSAGE_REQUEST_TIMEOUT_MS = 120_000

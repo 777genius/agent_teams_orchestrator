@@ -9,6 +9,7 @@ on:
       - 'src/services/opencode/OpenCodeProfileManager.ts'
       - '.github/workflows/opencode-directories.yml'
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - 'src/services/opencode/ensureOpenCodeDirectory*'
       - 'src/services/opencode/OpenCodePrivateMcp*'
@@ -18,8 +19,13 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: opencode-directories-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   directory-compatibility:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     name: Directory compatibility (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 5
