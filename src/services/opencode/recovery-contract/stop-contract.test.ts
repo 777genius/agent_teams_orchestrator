@@ -27,6 +27,10 @@ describe('independent production Stop contract (setup adapted from existing pend
   let readStatusMap: () => Promise<any>
   let abortAcknowledged: boolean, abortCalls: number, onAbort: (() => Promise<void>) | undefined
   let sessionStore: OpenCodeSessionStore, bridge: OpenCodeSessionBridge
+  const endpointSpies: Array<{ mockRestore(): void }> = []
+  const fixtureHostManager = () => new OpenCodeHostManager({ persistentRegistryPath: registryPath,
+    fetchJson: async () => { throw new Error('Synthetic Stop fixture must not contact HTTP') },
+  })
   const manager = new OpenCodeProfileManager()
   const readSaved = () => manager.readSavedOAuthCredential(profile)
   const saveRegistry = () => writeFile(registryPath, JSON.stringify(registry))
@@ -76,20 +80,27 @@ describe('independent production Stop contract (setup adapted from existing pend
         runId: record.runId, sessionId: record.opencodeSessionId, createdAt: now, updatedAt: now } },
     } } }
     await saveRegistry()
+    // ARM creates its own manager; retain real lease/run/birth validation against
+    // this synthetic registry without claiming Linux native custody authority.
+    const endpoints = fixtureHostManager()
+    const sessionEndpoint = OpenCodeHostManager.prototype.resolveOwnedSessionEndpoint
+    endpointSpies.push(spyOn(OpenCodeHostManager.prototype, 'resolveOwnedSessionEndpoint')
+      .mockImplementation((...args) => sessionEndpoint.apply(endpoints, args)))
     sessionStore = new OpenCodeSessionStore(sessionPath)
     await sessionStore.upsert(record)
     status = 'idle'; messages = []; onRead = undefined
     readStatusMap = async () => ({ 'native-session': status })
     abortAcknowledged = true; abortCalls = 0; onAbort = undefined
     bridge = new OpenCodeSessionBridge({
-      hostManager: new OpenCodeHostManager({ persistentRegistryPath: registryPath,
-        fetchJson: async () => { throw new Error('Synthetic Stop fixture must not contact HTTP') },
-      }), sessionStore,
+      hostManager: fixtureHostManager(), sessionStore,
       clientFactory: { create: () => ({ getSessionStatus: () => readStatusMap(),
         getSessionMessages: async () => { await onRead?.(); return messages }, abortSession: async () => { abortCalls += 1; await onAbort?.(); return abortAcknowledged } }) as never },
     })
   })
-  afterEach(async () => { await rm(root, { recursive: true, force: true }) })
+  afterEach(async () => {
+    try { for (const spy of endpointSpies.splice(0).reverse()) spy.mockRestore() }
+    finally { await rm(root, { recursive: true, force: true }) }
+  })
 
 
   test('F2 strict Stop must retain lease when abort rejects and source changes during abort', async () => {

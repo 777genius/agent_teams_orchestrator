@@ -1237,7 +1237,16 @@ describe('OpenCodeBridgeCommandHandler', () => {
         return new Response('Not found', { status: 404 })
       },
     })
+    const previousCreate = openCodeClientFactory.create
+    const fixtureFactory = new OpenCodeClientFactory({ fetchImpl: (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : String(input))
+      if (url.origin !== host.url.origin || url.username || url.password) {
+        throw new Error('Foreign xAI group fixture origin')
+      }
+      return fetch(input, { ...init, redirect: 'error' })
+    } })
     try {
+      openCodeClientFactory.create = fixtureFactory.create.bind(fixtureFactory)
       process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND = process.execPath
       process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY =
         fileURLToPath(new URL('./fixtures/group-chat-mcp.ts', import.meta.url))
@@ -1373,6 +1382,7 @@ describe('OpenCodeBridgeCommandHandler', () => {
       expect((await handshake()).runtime.groupChatRunProof).toBeUndefined()
       expect(prompts).toHaveLength(1)
     } finally {
+      openCodeClientFactory.create = previousCreate
       host.stop(true)
       if (previousBoundControlUrl === undefined) delete process.env.AGENT_TEAMS_BOUND_CONTROL_URL
       else process.env.AGENT_TEAMS_BOUND_CONTROL_URL = previousBoundControlUrl
