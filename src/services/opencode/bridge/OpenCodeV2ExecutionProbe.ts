@@ -10,7 +10,7 @@ import { resolveClaudeMultimodelPaths } from '../OpenCodeManagedPaths.js'
 import { collectProjectBehaviorMetadata } from '../OpenCodeProfileManager.js'
 import { executionAssert, executionHash, executionRecord } from '../execution/OpenCodeV2ExecutionContracts.js'
 import { buildOpenCodeV2InternalRunPlan, type inspectOpenCodeV2SourceAvailability } from './OpenCodeV2LaunchPlan.js'
-import { launchExplicitOpenCodeV2Run } from './OpenCodeV2RunOwner.js'
+import { launchExplicitOpenCodeV2Run, readOpenCodeV2RunNotStartedFailure } from './OpenCodeV2RunOwner.js'
 import { ensureOpenCodeV2ProbeStore } from './OpenCodeV2ProbeStore.js'
 import { writeOpenCodeV2StatusProofHint } from './OpenCodeV2StatusProofHint.js'
 import { OPEN_CODE_V2_RUN_INITIALIZATION_MS, discoverOpenCodeV2Run, awaitOpenCodeV2RunMemberReadiness, requestOpenCodeV2Run, parseRunControlRequest, isTransientOpenCodeV2ControlRead,
@@ -23,7 +23,7 @@ import type { QueueIntent } from '../execution/OpenCodeV2AdmissionService.js'
 type Selection = Awaited<ReturnType<typeof inspectOpenCodeV2SourceAvailability>>
 export type OpenCodeV2ProbeIntent = { sourceKey: string; binding: RunBinding; sessionID: string; intentHash: string }
 /** `native_owner_retired`: the original owner is proven gone before any input was submitted. */
-type ProbeFailure = RunProbeFailure | 'native_owner_retired'
+type ProbeFailure = RunProbeFailure | 'native_owner_retired' | 'native_owner_not_started'
 type ProbeRecord = { sourceKey: string; binding: RunBinding; sessionID: string; intent: QueueIntent;
   submitted: boolean; proof: OpenCodeExecutionProof | null; retired: boolean; failure: ProbeFailure | null; freshExecutionProofRequestId?: string
   ownerFailure?: RunOwnerFailure
@@ -36,7 +36,7 @@ function parseProbeFailure(value: unknown): RunProbeFailure | null {
   return value
 }
 function parseStoredProbeFailure(value: unknown): ProbeFailure | null {
-  return value === 'native_owner_retired' ? value : parseProbeFailure(value)
+  return value === 'native_owner_retired' || value === 'native_owner_not_started' ? value : parseProbeFailure(value)
 }
 function probeFailureReason(record: ProbeRecord, providerID: string): string {
   const owner = record.ownerFailure, operation = owner?.operation
@@ -84,9 +84,9 @@ function parseRecord(value: unknown): ProbeRecord {
     /^[a-zA-Z0-9._:-]{1,200}$/.test(row.freshExecutionProofRequestId), 'probe_store_invalid')
   executionAssert(row.automaticReplacementUsed === undefined || row.automaticReplacementUsed === true, 'probe_store_invalid')
   const failure = parseStoredProbeFailure(row.failure)
-  // Owner retirement settles only an original that never received input; every other
-  // failure belongs to a submitted original without proof.
-  executionAssert(failure === 'native_owner_retired' ? row.submitted === false && row.retired === true && !proof
+  // A retired or never-started owner settles only an original that never received
+  // input; every native execution failure belongs to a submitted original.
+  executionAssert(failure === 'native_owner_retired' || failure === 'native_owner_not_started' ? row.submitted === false && row.retired === true && !proof
     : !failure || row.submitted === true && !proof, 'probe_store_invalid')
   let ownerFailure: RunOwnerFailure | undefined
   if (row.ownerFailure !== undefined) {
@@ -126,10 +126,17 @@ export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, 
     return { state: 'available' as const, proof: record.proof, reason: null }
   }
   const deadline = Math.min(openCodeV2ReadinessDeadline(envelope), options.deadline ?? Infinity)
-  const assertDeadline = () => {
+  const deadlineErrors = new WeakSet<Error>()
+  const assertNotCancelled = () => {
     if (options.signal?.aborted && !(options.signal.reason instanceof Error && options.signal.reason.message === 'execution_timeout'))
       options.signal.throwIfAborted()
-    executionAssert(!options.signal?.aborted && Date.now() < deadline, `execution_timeout:${currentPhase}`)
+  }
+  const assertDeadline = () => {
+    assertNotCancelled()
+    if (options.signal?.aborted || Date.now() >= deadline) {
+      const error = new Error(`execution_timeout:${currentPhase}`)
+      deadlineErrors.add(error); throw error
+    }
   }
   assertDeadline()
   const behavior = await collectProjectBehaviorMetadata(selection.project, process.env, options.signal)
@@ -155,13 +162,17 @@ export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, 
   }
   assertDeadline()
   let release: (() => Promise<void>) | undefined
-  const save = async (record: ProbeRecord) => {
-    assertDeadline()
+  const save = async (record: ProbeRecord, noOwnerSettlement = false) => {
+    if (noOwnerSettlement) {
+      // A terminal no-owner fact may outlive observation, never custody or cancellation.
+      assertNotCancelled()
+      executionAssert(record.failure === 'native_owner_not_started' && record.retired && !record.submitted && !record.proof, 'probe_store_invalid')
+    } else assertDeadline()
     const recordBytes = Buffer.from(JSON.stringify(record), 'utf8')
     executionAssert(recordBytes.length > 0 && recordBytes.length < 131072, 'probe_store_invalid')
     const temporary = path.join(directory, `.${randomUUID()}.tmp`)
     await writeFile(temporary, recordBytes, { flag: 'wx', mode: 0o600 }); await rename(temporary, file)
-    assertDeadline()
+    if (noOwnerSettlement) assertNotCancelled(); else assertDeadline()
   }
   try {
     release = await lockfile.lock(guard, { retries: { retries: 10, minTimeout: 20, maxTimeout: 200 } })
@@ -208,6 +219,10 @@ export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, 
       if (freshRequestId !== undefined) { if (record.freshExecutionProofRequestId !== freshRequestId) record = null }
       else if (!automaticReplacementUsed) { automaticReplacementUsed = true; record = null }
     }
+    // A proven no-spawn attempt spent no native execution. Only a later explicit
+    // request can replace it; Connect's original intent and the same fresh ID stay pinned.
+    if (run && !options.requireExisting && record?.failure === 'native_owner_not_started' &&
+      record.retired && !record.submitted && (freshRequestId === undefined || record.freshExecutionProofRequestId !== freshRequestId)) record = null
     if (record?.failure && (record.retired || !run)) return { state: 'failed' as const, proof: null,
       reason: record.retired ? probeFailureReason(record, selection.model.providerID) : `${record.failure}; probe_physical_cleanup_unknown` }
     // A retained unresolved attempt never allocates another session or input.
@@ -251,11 +266,25 @@ export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, 
       record = { sourceKey, binding: plan.binding, sessionID: member.originalSessionId, intent, submitted: false, proof: null, retired: false, failure: null,
         ...(freshRequestId === undefined ? {} : { freshExecutionProofRequestId: freshRequestId }),
         ...(automaticReplacementUsed ? { automaticReplacementUsed: true as const } : {}) }
-      await save(record) // Original identities precede launch and every prompt effect.
-      await options.onIntentPersisted?.({ sourceKey, binding: record.binding, sessionID: record.sessionID, intentHash: executionHash(record.intent) })
-      phase('owner_start')
-      assertDeadline()
-      await launchExplicitOpenCodeV2Run(plan)
+      let launchEntered = false
+      try {
+        await save(record) // Original identities precede launch and every prompt effect.
+        await options.onIntentPersisted?.({ sourceKey, binding: record.binding, sessionID: record.sessionID, intentHash: executionHash(record.intent) })
+        phase('owner_start')
+        assertDeadline()
+        launchEntered = true
+        await launchExplicitOpenCodeV2Run(plan)
+      } catch (error) {
+        const notStarted = readOpenCodeV2RunNotStartedFailure(error)
+        // Neither caller-shaped timeouts nor unknown/maybe-spawn failures prove no child.
+        if (!launchEntered && error instanceof Error && deadlineErrors.has(error) ||
+          notStarted?.bindingHash === executionHash(record.binding)) {
+          executionAssert(!record.submitted && !record.proof && !record.failure && !record.retired, 'probe_store_invalid')
+          record.failure = 'native_owner_not_started'; record.retired = true
+          await save(record, true)
+        }
+        throw error
+      }
     } else {
       await options.onIntentPersisted?.({ sourceKey, binding: record.binding, sessionID: record.sessionID, intentHash: executionHash(record.intent) })
       phase('owner_readiness')

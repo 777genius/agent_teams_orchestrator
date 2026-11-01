@@ -1,6 +1,7 @@
 import { claimOpenCodeV2FreshProofRequest } from './OpenCodeV2FreshProofRequest.js'
 import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test'
 import { spawn, type ChildProcess } from 'node:child_process'
+import * as childProcesses from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises'
@@ -852,6 +853,65 @@ test('owner startup refuses a deadline spent in source validation before reservi
       const result = await resolve(...args); clock = plan.deadline + 1; return result
     }),
     spyOn(controls, 'reserveRunControlDirectory').mockImplementation(async () => { reservations++; throw Error('TEST-late-effect-forbidden') }))
-  await expect(runOwners.launchExplicitOpenCodeV2Run(plan)).rejects.toThrow('execution_timeout:owner_start')
+  const error = await runOwners.launchExplicitOpenCodeV2Run(plan).catch(error => error)
+  expect(error.message).toBe('execution_timeout:owner_start')
+  expect(runOwners.readOpenCodeV2RunNotStartedFailure(error)).toEqual({ bindingHash: executionHash(plan.binding) })
   expect(reservations).toBe(0)
+}, 30000)
+
+
+test.skipIf(!posix)('a proven no-spawn probe deadline settles after reservation and only an explicit retry can recover', async () => {
+  const request = { ...envelope(), timeoutMs: 60000 }, selection = await inspectOpenCodeV2SourceAvailability(request)
+  const bunPath = await realpath(process.execPath), bunSha256 = await nativeIdentity.hashOpenCodeFile(bunPath)
+  const build = launchPlans.buildOpenCodeV2InternalRunPlan, launch = runOwners.launchExplicitOpenCodeV2Run
+  const reserve = controls.reserveRunControlDirectory
+  let clock = Date.now(), launches = 0, reservations = 0, spawns = 0, file = '', originalDirectory = ''
+  let template: Awaited<ReturnType<typeof build>> | undefined
+  restores.push(spyOn(Date, 'now').mockImplementation(() => clock),
+    spyOn(launchPlans, 'buildOpenCodeV2InternalRunPlan').mockImplementation(async (...args) => {
+      const plan = template ? { ...template, binding: { ...template.binding, teamId: String(args[1].teamId),
+        runId: String(args[1].runId), controllerInstanceId: args[2] } } : await build(...args)
+      template = { ...plan, source: { ...plan.source, bunPath, bunSha256,
+        files: plan.source.files.filter(file => file.path === plan.source.entryPath) },
+        members: plan.members.map(member => ({ ...member, native: { ...member.native, bun: { path: bunPath, sha256: bunSha256 } } })) }
+      return template
+    }),
+    spyOn(controls, 'reserveRunControlDirectory').mockImplementation(async (...args) => {
+      reservations++; originalDirectory = await reserve(...args)
+      clock += 60000 // Spend the command budget only after its real private launch fence exists.
+      return originalDirectory
+    }),
+    spyOn(childProcesses, 'spawn').mockImplementation(() => { spawns++; throw Error('TEST-native-spawn-forbidden') }),
+    spyOn(runOwners, 'launchExplicitOpenCodeV2Run').mockImplementation(async plan => {
+      launches++
+      if (launches === 1) return launch(plan)
+      // A caller-shaped timeout after launch entry has no positive no-spawn receipt.
+      throw Object.assign(Error('execution_timeout:owner_start'), { bindingHash: executionHash(plan.binding) })
+    }))
+  const options = { unattendedTeam: true, onPrepared: async (sourceKey: string) => {
+    file = path.join(root, 'app-data/opencode/v2/execution-probes', sourceKey, 'probe.json')
+  } }
+  await expect(probes.resolveOpenCodeV2ExecutionProbe(request, selection, true, options)).rejects.toThrow('execution_timeout:owner_start')
+  const settledBytes = await readFile(file, 'utf8'), settled = JSON.parse(settledBytes)
+  expect(settled).toMatchObject({ submitted: false, retired: true, proof: null, failure: 'native_owner_not_started' })
+  expect({ launches, reservations, spawns }).toEqual({ launches: 1, reservations: 1, spawns: 0 })
+  const original = { sourceKey: settled.sourceKey, binding: settled.binding, sessionID: settled.sessionID, intentHash: executionHash(settled.intent) }
+  for (const followup of [{ ...options, run: false }, { ...options, run: true, requireExisting: original }]) {
+    expect(await probes.resolveOpenCodeV2ExecutionProbe(request, selection, followup.run, followup))
+      .toEqual({ state: 'failed', proof: null, reason: 'native_owner_not_started' })
+  }
+  expect(await readFile(file, 'utf8')).toBe(settledBytes)
+  expect(launches).toBe(1)
+  await lstat(path.join(originalDirectory, 'start.json')) // The old custody fence is preserved.
+  await expect(probes.resolveOpenCodeV2ExecutionProbe(request, selection, true, options)).rejects.toThrow('execution_timeout:owner_start')
+  const unknownBytes = await readFile(file, 'utf8'), unknown = JSON.parse(unknownBytes)
+  expect(unknown.binding).not.toEqual(settled.binding)
+  expect(unknown).toMatchObject({ submitted: false, retired: false, failure: null })
+  for (const run of [false, true]) {
+    expect(await probes.resolveOpenCodeV2ExecutionProbe(request, selection, run, options)).toMatchObject({ state: 'pending', proof: null })
+    expect(await readFile(file, 'utf8')).toBe(unknownBytes)
+  }
+  await writeFile(file, JSON.stringify({ ...unknown, submitted: true }), { mode: 0o600 })
+  expect(await probes.resolveOpenCodeV2ExecutionProbe(request, selection, true, options)).toMatchObject({ state: 'pending', proof: null })
+  expect({ launches, reservations, spawns }).toEqual({ launches: 2, reservations: 1, spawns: 0 })
 }, 30000)
