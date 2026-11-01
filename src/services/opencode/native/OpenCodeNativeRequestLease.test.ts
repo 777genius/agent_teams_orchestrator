@@ -59,15 +59,48 @@ test('Bun sends zero HTTP/Basic bytes until the exact connected socket passes pe
 })
 
 test('stale A-to-new B handoff after peer proof cannot adopt B by its reused URL', async () => {
-  const gate = deferred<void>()
+  const gate = deferred<void>(), peerReached = deferred<void>()
+  const events: string[] = []
   const e = await endpoint(ok)
-  await withAuthority(e.baseUrl, () => gate.promise, async (owner, change, checks) => {
-    const pending = fetchNativeOpenCode(e.baseUrl + '/session', { method: 'POST', body: '{}', signal: AbortSignal.timeout(2000) }, owner)
+  await withAuthority(e.baseUrl, async () => {
+    events.push('peer-enter'); peerReached.resolve()
+    await gate.promise
+    events.push('peer-complete')
+  }, async (owner, change, checks) => {
+    const signal = AbortSignal.timeout(2000)
+    const pending = fetchNativeOpenCode(e.baseUrl + '/session', { method: 'POST', body: '{}', signal }, owner)
+    // Observe rejection immediately, including failures before verifyPeer entry.
+    const settled = pending.then(() => null, error => error)
+    const phase = await Promise.race([
+      peerReached.promise.then(() => 'peer-entered' as const),
+      settled.then(() => 'settled-before-peer' as const),
+    ])
+    if (phase === 'settled-before-peer') {
+      const error = await settled
+      const refusal = error instanceof Error && error.message === 'native_custody_unavailable' ? 'unavailable'
+        : error instanceof Error && error.message === 'native_custody_cancelled' ? 'cancelled' : 'other'
+      console.info('TEST stale handoff witness', JSON.stringify({ phase, events, rechecks: checks.length,
+        aborted: signal.aborted, refusal }))
+      expect(phase).toBe('peer-entered')
+      return
+    }
     await e.connections.promise
+    const started = performance.now()
     change(); gate.resolve()
-    await expect(pending).rejects.toThrow('native_custody_unavailable')
+    const error = await settled
+    const elapsedMs = performance.now() - started
+    // On a platform regression, retain the admission witnesses before the exact
+    // refusal assertion; no private headers or custody objects are reported.
+    console.info('TEST stale handoff witness', JSON.stringify({ events, rechecks: checks.length,
+      aborted: signal.aborted, elapsedMs, refusal: error instanceof Error && error.message === 'native_custody_unavailable' ? 'unavailable'
+        : error instanceof Error && error.message === 'native_custody_cancelled' ? 'cancelled' : 'other' }))
+    expect(events).toEqual(['peer-enter', 'peer-complete'])
     expect(checks).toHaveLength(1)
     expect(Buffer.concat(e.received).length).toBe(0)
+    expect(signal.aborted).toBe(false)
+    expect(elapsedMs).toBeLessThan(1000)
+    expect(error).toBeInstanceOf(Error)
+    expect(error.message).toBe('native_custody_unavailable')
   })
 })
 
