@@ -1,7 +1,7 @@
 import { parseOpenCodePromptFileParts, SUPPORTED_COMMANDS, validateEnvelope, type BridgeEnvelope } from './bridge/OpenCodeBridgeProtocol.js'
 import { openCodeDeliveryJournalRecoveryData, teamDiagnosticToOutcomeString, commandStatusFromOutcomeStatus, isAcceptedOutcomeStatus, outcomeSendMessageDataToCommandData, commandStatusMismatchReason, type CommandStatusCommandData, markSendMessageOutcome, type SendMessageCommandData, type SendMessageOutcomeBase, type TeamDiagnostic } from './bridge/OpenCodeBridgeDeliveryJournal.js'
 import { drainStartupTaskkills, pendingStartupTaskkillPids } from '../../utils/processKill.js'
-import { buildOpenCodeGroupChatRunProof, type OpenCodeGroupChatRunProof } from './OpenCodeGroupChatCapability.js'
+import { buildOpenCodeGroupChatRunProof, readOwnedOAuthGroupControlBinding, type OpenCodeGroupChatRunProof } from './OpenCodeGroupChatCapability.js'
 import { isBoundGroupChatControl, readFreshGroupChatCatalog } from '../../utils/groupChatControlClient.js'
 import { assertValidGroupMailboxRows, buildGroupMailboxPrompt, hasGroupMailboxMarker } from '../../utils/groupMailbox.js'
 import { OpenCodeStartupCleanupBudget } from './OpenCodeStartupCleanupBudget.js'
@@ -63,7 +63,8 @@ import { resolveOpenCodeProviderScopedModel } from './OpenCodeModelResolver.js'
 import { parseOpenCodeProviderScopedModelRef } from './OpenCodeModelRef.js'
 import { canonicalizeOpenCodeProviderId } from './OpenCodeProviderIdentity.js'
 import { resolveOpenCodeCursorManagedAssets } from './OpenCodeCursorManagedAssets.js'
-import { buildManagedConfigFingerprint, canonicalizeOpenCodeProjectPath, openCodeProfileManager } from './OpenCodeProfileManager.js'
+import { applyOpenCodeManagedPathsToAppMcpLaunchConfig, buildManagedConfigFingerprint, canonicalizeOpenCodeProjectPath, openCodeProfileManager } from './OpenCodeProfileManager.js'
+import { resolveClaudeMultimodelPaths } from './OpenCodeManagedPaths.js'
 import { normalizeOpenCodePermissions } from './OpenCodePermissionNormalizer.js'
 import { openCodeProvisioningProbe, type OpenCodeAuthorityRejection } from './OpenCodeProvisioningProbe.js'
 import { normalizeOpenCodeProjectIdentity } from './OpenCodeProjectIdentity.js'
@@ -751,6 +752,7 @@ type StoredLaneAuthority = {
   unregisteredHostPid?: number
   signal?: AbortSignal
   assertOwner?: () => Promise<void>
+  ownedOAuthHost?: { hostKey: string; pid: number; baseUrl: string }
 }
 
 // Receipts attest a confirmed Stop. When none exist, cleanup binds the exact
@@ -921,6 +923,7 @@ async function probeStoredLaneAuthority(
     // before arming the next prompt under the OAuth publication lock.
     const ownerChecks: Array<() => Promise<void>> = []
     let snapshot = buildSendMessageStoredSessionSnapshot(projectPath, firstAuthority)
+    let ownedOAuthHost: StoredLaneAuthority['ownedOAuthHost']
     for (const record of authorityRecords) {
       if (!record.opencodeVersion || !record.managedConfigFingerprint
         || record.resolvedBehaviorFingerprint !== record.managedConfigFingerprint
@@ -930,9 +933,10 @@ async function probeStoredLaneAuthority(
         || record.projectBehaviorFingerprint !== firstAuthority.projectBehaviorFingerprint) {
         throw new Error('OpenCode observation launch authority is unavailable')
       }
-      await openCodeSessionBridge.withOwnedOAuthSessionObservation(record, async ({ baseUrl }, assertOwner) => {
+      await openCodeSessionBridge.withOwnedOAuthSessionObservation(record, async ({ baseUrl, runtimePid }, assertOwner) => {
         ownerChecks.push(assertOwner)
         if (record === authorityRecords[0]) {
+          ownedOAuthHost = { hostKey: record.hostKey, pid: runtimePid, baseUrl }
           const client = openCodeClientFactory.create(baseUrl, phaseContext ? {
             signal: phaseContext.signal, remainingMs: phaseContext.remainingMs,
           } : undefined)
@@ -945,7 +949,7 @@ async function probeStoredLaneAuthority(
     const deliveryRuntime = createRuntimeSnapshot(snapshot, authorityRecords[0])
     validateOpenCodeBridgeStateChangingPreconditions({ body, runtime: createRuntimePreconditionSnapshot(snapshot, { deliveryRuntime }) })
     return { snapshot, records: authorityRecords, deliveryRuntime, signal: phaseContext?.signal,
-      assertOwner: async () => { for (const check of ownerChecks) await check() },
+      ownedOAuthHost, assertOwner: async () => { for (const check of ownerChecks) await check() },
       release: async (_keepAlive?: boolean) => {} }
   }
   try {
@@ -1775,19 +1779,57 @@ async function listAppMcpToolsFromResolvedLaunchConfig(
   }
 }
 
+/** xAI observations have no retained profile, but the host was prepared
+ * with managed data/cache paths. Compare and tools/list against that same
+ * effective local MCP config, never the unprepared bridge env projection. */
+async function resolveOpenCodeGroupAppMcpLaunchConfig(
+  snapshot: OpenCodeProvisioningSnapshot,
+): Promise<ResolvedAppMcpLaunchConfig> {
+  if (snapshot.host) return getRetainedAppMcpLaunchConfig(snapshot.host)
+  return applyOpenCodeManagedPathsToAppMcpLaunchConfig(
+    await resolveOpenCodeAppMcpLaunchConfig(),
+    resolveClaudeMultimodelPaths(),
+  )
+}
+
+/** Resolve the group-control owner from the same MCP launch configuration
+ * selected by the live host, not from an unrelated child or stale bridge hint. */
+async function readOpenCodeGroupControlBinding(
+  snapshot: OpenCodeProvisioningSnapshot,
+  launchConfig: ResolvedAppMcpLaunchConfig,
+  signal?: AbortSignal,
+): Promise<{ controlUrl: string; context: string } | null> {
+  if (!snapshot.host) {
+    return readOwnedOAuthGroupControlBinding(launchConfig.config, process.env, signal)
+  }
+  const env = { ...snapshot.host.profile.env, ...launchConfig.config.environment }
+  return isBoundGroupChatControl(env.AGENT_TEAMS_BOUND_CONTROL_URL, env.AGENT_TEAMS_BOUND_CONTEXT_JSON)
+    ? { controlUrl: env.AGENT_TEAMS_BOUND_CONTROL_URL!, context: env.AGENT_TEAMS_BOUND_CONTEXT_JSON! }
+    : null
+}
+
 async function readLiveGroupChatRunProofs(
   snapshot: OpenCodeProvisioningSnapshot | null,
   records: OpenCodeSessionRecord[],
   phaseContext?: OpenCodePhaseContext,
+  ownedOAuthHost?: StoredLaneAuthority['ownedOAuthHost'],
 ): Promise<OpenCodeGroupChatRunProof[]> {
-  if (!snapshot?.host || !isAppMcpConnected(snapshot)) return []
+  if (!snapshot || (!snapshot.host && !ownedOAuthHost)
+    || (snapshot.host && !isAppMcpConnected(snapshot))) return []
   try {
-    const launchConfig = getRetainedAppMcpLaunchConfig(snapshot.host)
-    const binding = { ...snapshot.host.profile.env, ...launchConfig.config.environment }
-    if (!isBoundGroupChatControl(binding.AGENT_TEAMS_BOUND_CONTROL_URL, binding.AGENT_TEAMS_BOUND_CONTEXT_JSON)) return []
+    const launchConfig = await resolveOpenCodeGroupAppMcpLaunchConfig(snapshot)
+    const baseEnv = snapshot.host?.profile.env ?? process.env
+    if (ownedOAuthHost) {
+      // SessionBridge attests this exact endpoint. Verify its loaded MCP config
+      // against the app-controlled launch source before invoking tools/list.
+      const liveMcp = asRecord(asRecord(snapshot.config)?.mcp)?.[OPEN_CODE_APP_MCP_SERVER_NAME]
+      if (!asRecord(liveMcp) || hashStable(liveMcp) !== hashStable(launchConfig.config)) return []
+    }
+    const binding = await readOpenCodeGroupControlBinding(snapshot, launchConfig, phaseContext?.signal)
+    if (!binding) return []
     // Deliberately bypass the persisted/version-scoped tools cache for this run.
-    const observed = await listAppMcpToolsFromResolvedLaunchConfig(launchConfig, phaseContext, snapshot.host.profile.env)
-    const client = openCodeClientFactory.create(snapshot.host.baseUrl, phaseContext ? {
+    const observed = await listAppMcpToolsFromResolvedLaunchConfig(launchConfig, phaseContext, baseEnv)
+    const client = openCodeClientFactory.create(snapshot.host?.baseUrl ?? ownedOAuthHost!.baseUrl, phaseContext ? {
       signal: phaseContext.signal, remainingMs: phaseContext.remainingMs,
     } : {})
     const mcp = await client.getMcp()
@@ -1799,8 +1841,15 @@ async function readLiveGroupChatRunProofs(
       const current = await openCodeSessionStore.get(record.teamId, record.laneId ?? 'primary', record.memberName)
       if (!current || current.runId !== record.runId || current.hostKey !== record.hostKey ||
           current.runtimePid !== record.runtimePid || current.opencodeSessionId !== record.opencodeSessionId) continue
+      if (ownedOAuthHost && (current.profileScope?.providerId !== 'xai'
+        || current.hostKey !== ownedOAuthHost.hostKey || current.runtimePid !== ownedOAuthHost.pid)) continue
       const proof = buildOpenCodeGroupChatRunProof(
         { ...snapshot, mcp }, current, observed.map(canonicalizeAppMcpToolId),
+        ownedOAuthHost && !snapshot.host ? {
+          hostKey: ownedOAuthHost.hostKey, pid: ownedOAuthHost.pid,
+          controlUrl: binding.controlUrl,
+          controlContext: binding.context,
+        } : undefined,
       )
       if (proof) proofs.push(proof)
     }
@@ -5238,7 +5287,7 @@ async function runSendMessage(
 
   const groupChatId = asString(body.groupChatId)
   if (groupChatId) {
-    const [capability] = await readLiveGroupChatRunProofs(snapshot, [deliveryRecord])
+    const [capability] = await readLiveGroupChatRunProofs(snapshot, [deliveryRecord], undefined, authority?.ownedOAuthHost)
     if (!authority || !capability || capability.runId !== runId ||
         capability.runKey !== asString(body.groupRunKey) ||
         body.groupChatProtocolVersion !== 1 || !asString(body.groupMessageId) ||
@@ -5259,12 +5308,12 @@ async function runSendMessage(
     : null
 
   let groupCatalog: unknown
-  if (groupChatId && snapshot.host) {
-    const launchConfig = getRetainedAppMcpLaunchConfig(snapshot.host)
-    const env = { ...snapshot.host.profile.env, ...launchConfig.config.environment }
-    try { groupCatalog = await readFreshGroupChatCatalog(teamId, memberName, {
-      controlUrl: env.AGENT_TEAMS_BOUND_CONTROL_URL, context: env.AGENT_TEAMS_BOUND_CONTEXT_JSON,
-    }) } catch { /* Unavailable is explicit in the handoff prompt. */ }
+  if (groupChatId && (snapshot.host || authority?.ownedOAuthHost)) {
+    try {
+      const launchConfig = await resolveOpenCodeGroupAppMcpLaunchConfig(snapshot)
+      const binding = await readOpenCodeGroupControlBinding(snapshot, launchConfig)
+      if (binding) groupCatalog = await readFreshGroupChatCatalog(teamId, memberName, binding)
+    } catch { /* Unavailable is explicit in the handoff prompt. */ }
     await assertStoredDeliveryAuthority(deliveryRecord, authority)
   }
   const groupPrompt = groupChatId ? buildGroupMailboxPrompt({
@@ -6240,7 +6289,7 @@ async function handleEnvelope(
                 remainingMs: () => runtimeDeadline.remainingMs(),
                 throwIfExpired: () => runtimeDeadline.throwIfExpired('mcp_preflight'),
                 phase: 'mcp_preflight',
-              })
+              }, retained.ownedOAuthHost)
               for (const capability of groupChatRunProofs) {
                 const record = retained.records.find(row => row.memberName === capability.memberName)!
                 await assertStoredDeliveryAuthority(record, retained)
