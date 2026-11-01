@@ -1,3 +1,4 @@
+import { productionOpenCodeFetch } from './native/OpenCodeNativeRequestLease.js'
 import {
   extractOpenCodeSseData,
   getOpenCodeSseMessageId,
@@ -21,6 +22,7 @@ type OpenCodePreviewObserverDeps = {
 
 type ObserveSessionParams = {
   baseUrl: string
+  requestOwner?: object
   sessionId: string
   timeoutMs?: number
   idleTimeoutMs?: number
@@ -91,10 +93,6 @@ function getOpenCodeSsePartId(properties: Record<string, unknown>): string | nul
 
 export class OpenCodePreviewObserver {
   constructor(private readonly deps: OpenCodePreviewObserverDeps = {}) {}
-
-  private get fetchImpl(): OpenCodePreviewFetch {
-    return this.deps.fetchImpl ?? fetch
-  }
 
   async observeSession(params: ObserveSessionParams): Promise<OpenCodeSessionPreviewSummary> {
     const timeoutMs = params.timeoutMs ?? DEFAULT_PREVIEW_TIMEOUT_MS
@@ -361,7 +359,7 @@ export class OpenCodePreviewObserver {
         const previewBeforeEndpoint = state.latestAssistantPreview
         let response: Response
         try {
-          response = await this.fetchImpl(params.baseUrl + endpoint, {
+          response = await (this.deps.fetchImpl ?? ((input, init) => productionOpenCodeFetch(input, init, params.requestOwner)))(params.baseUrl + endpoint, {
             method: 'GET',
             signal: controller.signal,
             headers: {
@@ -382,6 +380,7 @@ export class OpenCodePreviewObserver {
         }
 
         if (!response.ok) {
+          void response.body?.cancel().catch(() => undefined)
           state.diagnostics.push(
             `OpenCode preview endpoint ${endpoint} returned ${response.status} ${response.statusText}`,
           )
@@ -389,6 +388,7 @@ export class OpenCodePreviewObserver {
         }
 
         if (!response.headers.get('content-type')?.includes('text/event-stream')) {
+          void response.body?.cancel().catch(() => undefined)
           state.diagnostics.push(
             `OpenCode preview endpoint ${endpoint} did not return text/event-stream`,
           )
@@ -499,6 +499,7 @@ export class OpenCodePreviewObserver {
           )
         } finally {
           clearTimers()
+          await reader.cancel().catch(() => undefined)
           reader.releaseLock()
         }
       }

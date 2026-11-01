@@ -3678,7 +3678,7 @@ export class OpenCodeProfileManager {
     })
     // A retained endpoint belongs to the stable host generation, excluding port.
     // Old live hosts keep their own state when account/config/assets change.
-    const cursorHostBinaryPath = cursorManagedAssets ? resolveOpenCodeBinaryPath() : null
+    const cursorHostBinaryPath = cursorManagedAssets ? await resolveOpenCodeBinaryPath(options.abortSignal) : null
     const cursorHostBinaryIdentity = cursorManagedAssets
       ? cursorHostBinaryPath ? await resolveOpenCodeBinaryHostIdentity(cursorHostBinaryPath) : 'missing-binary'
       : null

@@ -179,7 +179,7 @@ describe('OpenCode managed Cursor Stop fake e2e', () => {
         expect(await readFile(path.join(path.dirname(profile.env.CURSOR_AGENT_EXECUTABLE!), 'mcptool'), 'utf8'))
           .toContain('assets/plugin/dist/cli/mcptool.js')
 
-        const binaryPath = resolveOpenCodeBinaryPath()
+        const binaryPath = await resolveOpenCodeBinaryPath()
         if (!binaryPath) throw new Error('OpenCode binary is unavailable for the managed Cursor fake E2E')
         const cold = await execOpenCodePortableCommand({
           binaryPath, args: getOpenCodeVerboseModelsArgs(), profile, timeoutMs: 300_000,

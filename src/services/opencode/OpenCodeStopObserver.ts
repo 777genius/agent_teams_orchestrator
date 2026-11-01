@@ -17,6 +17,7 @@ export type OpenCodeStopObserver = {
 }
 
 export async function startOpenCodeStopObserver(params: {
+  requestOwner?: object
   baseUrl: string
   sessionId: string
   signal?: AbortSignal
@@ -45,7 +46,7 @@ export async function startOpenCodeStopObserver(params: {
   }
 
   const stream = readOpenCodeSseEndpoint({
-    baseUrl: params.baseUrl,
+    baseUrl: params.baseUrl, requestOwner: params.requestOwner,
     endpoint: '/event',
     fetchImpl: params.fetchImpl,
     signal,

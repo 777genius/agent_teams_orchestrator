@@ -1,3 +1,4 @@
+import { inheritNativeRequestOwner } from './native/OpenCodeNativeCustody.js'
 import { readOpenCodeV1TerminalTranscript } from './OpenCodeV1TerminalTranscriptReader.js'
 import { OpenCodeAuthorityVetoError } from './OpenCodeAuthorityStoreRead.js'
 import { areSameOpenCodeWorkspace } from './OpenCodeBridgePath.js'
@@ -618,7 +619,7 @@ export class OpenCodeSessionBridge {
     })
 
     try {
-      const client = this.clientFactory.create(host.baseUrl)
+      const client = this.clientFactory.create(host.baseUrl, undefined, host)
       const sessionTitle = params.title?.trim() || `${params.identity.teamId} - ${params.identity.memberName}`
       let session: OpenCodeSessionSummary | null = null
       let lastCreateError: unknown = null
@@ -880,7 +881,7 @@ export class OpenCodeSessionBridge {
               expectedProcessStartedAtMs: owner.processStartedAtMs,
             })
             if (endpoint.baseUrl !== owner.baseUrl || endpoint.pid !== owner.pid) return false
-            const acknowledged = await this.clientFactory.create(endpoint.baseUrl, { remainingMs: () => 1000 })
+            const acknowledged = await this.clientFactory.create(endpoint.baseUrl, { remainingMs: () => 1000 }, endpoint)
               .abortSession(owner.record.opencodeSessionId)
             if (acknowledged !== true) return false
             cancelledOwner = structuredClone(owner)
@@ -934,11 +935,12 @@ export class OpenCodeSessionBridge {
       remainingMs?: () => number
     } = {},
   ): Promise<OpenCodeSessionAppMcpReadyResult> {
-    const check = async (baseUrl: string, runtimePid: number | null) => {
+    const check = async (endpoint: { baseUrl: string }, runtimePid: number | null): Promise<OpenCodeSessionAppMcpReadyResult> => {
+      const { baseUrl } = endpoint
       let result: Awaited<ReturnType<typeof openCodeMcpManager.ensureAppMcp>>
       try {
         result = await this.mcpManager.ensureAppMcp({
-          baseUrl,
+          baseUrl, requestOwner: endpoint,
           attachIfMissing: options.attachIfMissing === true,
           ...(options.signal ? {
             requestContext: {
@@ -972,9 +974,9 @@ export class OpenCodeSessionBridge {
       if (record.hostKey !== options.host.hostKey) {
         throw new Error('OpenCode strict member MCP host identity mismatch')
       }
-      return check(options.host.baseUrl, options.host.pid > 0 ? options.host.pid : null)
+      return check(options.host, options.host.pid > 0 ? options.host.pid : null)
     }
-    return this.withSessionHost(record, ({ baseUrl, runtimePid }) => check(baseUrl, runtimePid))
+    return this.withSessionHost(record, endpoint => check(endpoint, endpoint.runtimePid))
   }
 
   private withSessionOperation<T>(
@@ -1014,13 +1016,13 @@ export class OpenCodeSessionBridge {
     let authorityUnknown = false
     try {
       await this.retainSessionHostLease(record, record.runId)
-      return await this.withSessionOperation(host, record, () => callback({
+      return await this.withSessionOperation(host, record, () => callback(inheritNativeRequestOwner({
         baseUrl: host.baseUrl,
         profile: sessionProfile.profile,
         resolvedConfigFingerprint: host.resolvedConfigFingerprint,
         runtimePid: host.pid > 0 ? host.pid : null,
         processStartedAtMs: host.processStartedAtMs ?? null,
-      }))
+      }, host)))
     } catch (error) {
       authorityUnknown = error instanceof OpenCodeAuthorityVetoError
       throw error
@@ -1090,15 +1092,15 @@ export class OpenCodeSessionBridge {
           let failed = false
           let error: unknown
           try {
-            value = await callback({ ...context, armOAuthNativeSession: async (messageId, noReply = false) => {
+            value = await callback(inheritNativeRequestOwner({ ...context, armOAuthNativeSession: async (messageId, noReply = false) => {
               if (!context.runtimePid) throw new Error('OpenCode OAuth session has no owned process')
-              const candidate = { record: capturedRecord, baseUrl: context.baseUrl,
-                pid: context.runtimePid, processStartedAtMs: context.processStartedAtMs!, messageId, noReply }
+              const candidate = inheritNativeRequestOwner({ record: capturedRecord, baseUrl: context.baseUrl,
+                pid: context.runtimePid, processStartedAtMs: context.processStartedAtMs!, messageId, noReply }, context)
               await arm(candidate)
               // An attempted arm is not an admitted native operation. In
               // particular, a publication CAS rejection cannot have sent HTTP.
               nativeOwner = candidate
-            } })
+            } }, context))
           } catch (caught) { failed = true; error = caught }
           if (!nativeOwner && failed) throw error
           // A lost HTTP response does not undo native token consumption. Only the
@@ -1151,6 +1153,7 @@ export class OpenCodeSessionBridge {
       if (endpoint.baseUrl !== owner.baseUrl || endpoint.pid !== owner.pid) {
         throw new Error('OpenCode OAuth pending session host process changed')
       }
+      inheritNativeRequestOwner(owner, endpoint)
     }
     const completedPrompt = (messages: OpenCodeMessage[]) => {
       const model = parseProviderScopedModel(record.selectedModel)
@@ -1188,7 +1191,7 @@ export class OpenCodeSessionBridge {
       return settled
     }
     if (unsubmitted) return false // A live host may still admit an in-flight request.
-    const client = this.clientFactory.create(owner.baseUrl)
+    const client = this.clientFactory.create(owner.baseUrl, undefined, owner)
     const idle = async () => {
       const statuses = await client.getSessionStatus()
       if (!asRecord(statuses)) return false
@@ -1600,7 +1603,7 @@ export class OpenCodeSessionBridge {
     const client = this.clientFactory.create(params.host.baseUrl, {
       signal: params.signal,
       remainingMs: params.remainingMs,
-    })
+    }, params.host)
     let session: { id: string }
     try {
       session = await client.createSession({
@@ -1755,8 +1758,9 @@ export class OpenCodeSessionBridge {
     record: OpenCodeSessionRecord,
     limit?: number,
   ): Promise<OpenCodeMessage[]> {
-    return this.withSessionHost(record, async ({ baseUrl }) => {
-      const client = this.clientFactory.create(baseUrl)
+    return this.withSessionHost(record, async endpoint => {
+      const { baseUrl } = endpoint
+      const client = this.clientFactory.create(baseUrl, undefined, endpoint)
       return client.getSessionMessages(record.opencodeSessionId, limit)
     })
   }
@@ -1833,8 +1837,9 @@ export class OpenCodeSessionBridge {
       system?: string
     },
   ): Promise<OpenCodeMessage> {
-    return this.withSessionPromptHost(record, async ({ baseUrl, profile, armOAuthNativeSession }) => {
-      const client = this.clientFactory.create(baseUrl)
+    return this.withSessionPromptHost(record, async endpoint => {
+      const { baseUrl, profile, armOAuthNativeSession } = endpoint
+      const client = this.clientFactory.create(baseUrl, undefined, endpoint)
       const messageID = armOAuthNativeSession
         ? (await this.allocateRuntimePromptMessageId(client, record.opencodeSessionId)).runtimePromptMessageId : undefined
       try {
@@ -1877,10 +1882,11 @@ export class OpenCodeSessionBridge {
     injectionVerifiedAt: string
     alreadyPresent: boolean
   }> {
-    const inject = async (baseUrl: string) => {
+    const inject = async (endpoint: { baseUrl: string }) => {
+      const { baseUrl } = endpoint
       const client = this.clientFactory.create(baseUrl, params.signal
         ? { signal: params.signal, remainingMs: params.remainingMs }
-        : undefined)
+        : undefined, endpoint)
       const assertMessageMatches = (message: OpenCodeMessage | null, phase: string) => {
         if (!message) {
           throw new Error(`OpenCode app-managed bootstrap context was not found after ${phase}`)
@@ -1976,11 +1982,12 @@ export class OpenCodeSessionBridge {
       }
       await this.retainSessionHostLease(record, record.runId)
       const host = params.host
-      return this.withSessionOperation(host, record, () => inject(host.baseUrl))
+      return this.withSessionOperation(host, record, () => inject(host))
     }
-    return this.withSessionPromptHost(record, async ({ baseUrl, armOAuthNativeSession }) => {
+    return this.withSessionPromptHost(record, async endpoint => {
+      const { baseUrl, armOAuthNativeSession } = endpoint
       await armOAuthNativeSession?.(params.messageID, true)
-      return inject(baseUrl)
+      return inject(endpoint)
     }, () => true)
   }
 
@@ -2013,8 +2020,9 @@ export class OpenCodeSessionBridge {
       system?: string
     } & Pick<OpenCodePromptAsyncWithTurnSettledHooks, 'onPromptSubmitting' | 'onPromptDefinitelyUnsubmitted'>,
   ): Promise<void> {
-    await this.withSessionPromptHost(record, async ({ baseUrl, profile, armOAuthNativeSession }) => {
-      const client = this.clientFactory.create(baseUrl)
+    await this.withSessionPromptHost(record, async endpoint => {
+      const { baseUrl, profile, armOAuthNativeSession } = endpoint
+      const client = this.clientFactory.create(baseUrl, undefined, endpoint)
       const messageID = armOAuthNativeSession || params.onPromptSubmitting
         ? (await this.allocateRuntimePromptMessageId(client, record.opencodeSessionId)).runtimePromptMessageId : undefined
       try {
@@ -2059,11 +2067,13 @@ export class OpenCodeSessionBridge {
     if (params.noReply) {
       throw new Error('OpenCode turn-settled observation does not support noReply prompts')
     }
-    return this.withSessionPromptHost(record, async ({ baseUrl, profile, armOAuthNativeSession }) => {
-      const client = this.clientFactory.create(baseUrl, params.signal ? { signal: params.signal } : undefined)
+    return this.withSessionPromptHost(record, async endpoint => {
+      const { baseUrl, profile, armOAuthNativeSession } = endpoint
+      const client = this.clientFactory.create(baseUrl, params.signal ? { signal: params.signal } : undefined, endpoint)
       const allocation = await this.allocateRuntimePromptMessageId(client, record.opencodeSessionId)
       const observation = this.turnSettledObserver.observe({
         authority: record,
+        requestOwner: endpoint,
         signal: params.signal,
         baseUrl,
         sessionId: record.opencodeSessionId,
@@ -2162,7 +2172,7 @@ export class OpenCodeSessionBridge {
   ): Promise<boolean> {
     const endpoint = await this.ownedStopEndpoint(record, options)
     if (!endpoint) return true
-    return this.clientFactory.create(endpoint.baseUrl, options).abortSession(record.opencodeSessionId)
+    return this.clientFactory.create(endpoint.baseUrl, options, endpoint).abortSession(record.opencodeSessionId)
   }
 
   async observeStopIdle(
@@ -2176,7 +2186,7 @@ export class OpenCodeSessionBridge {
     // The existing exact persistent session lease keeps the host alive until the
     // stop transaction releases it. Observing cleanup must never reacquire it.
     return (this.deps.stopObserverFactory ?? startOpenCodeStopObserver)({
-      baseUrl: endpoint.baseUrl, sessionId: record.opencodeSessionId, signal: options.signal,
+      baseUrl: endpoint.baseUrl, requestOwner: endpoint, sessionId: record.opencodeSessionId, signal: options.signal,
     })
   }
 
@@ -2187,11 +2197,12 @@ export class OpenCodeSessionBridge {
       decision: 'allow' | 'always' | 'reject'
     },
   ): Promise<unknown> {
-    return this.withSessionHost(record, async ({ baseUrl }) => {
+    return this.withSessionHost(record, async endpoint => {
+      const { baseUrl } = endpoint
       // Recheck the selected record after host/lease acquisition and inside the
       // session operation guard, immediately before dispatch.
       await this.assertExactSessionAuthority(record)
-      const client = this.clientFactory.create(baseUrl)
+      const client = this.clientFactory.create(baseUrl, undefined, endpoint)
       return client.answerPermission({
         requestId: params.requestId,
         sessionId: record.opencodeSessionId,
@@ -2201,8 +2212,9 @@ export class OpenCodeSessionBridge {
   }
 
   async getSession(record: OpenCodeSessionRecord): Promise<OpenCodeSessionSummary> {
-    return this.withSessionHost(record, async ({ baseUrl }) => {
-      const client = this.clientFactory.create(baseUrl)
+    return this.withSessionHost(record, async endpoint => {
+      const { baseUrl } = endpoint
+      const client = this.clientFactory.create(baseUrl, undefined, endpoint)
       return client.getSession(record.opencodeSessionId)
     })
   }
@@ -2213,7 +2225,7 @@ export class OpenCodeSessionBridge {
   ): Promise<OpenCodeSessionStatusInput | null> {
     const endpoint = await this.ownedStopEndpoint(record, options)
     if (!endpoint) return { type: 'idle' }
-    const statusMap = await this.clientFactory.create(endpoint.baseUrl, options).getSessionStatus()
+    const statusMap = await this.clientFactory.create(endpoint.baseUrl, options, endpoint).getSessionStatus()
     return statusMap[record.opencodeSessionId] ?? null
   }
 
@@ -2233,8 +2245,9 @@ export class OpenCodeSessionBridge {
     if (params.noReply) {
       throw new Error('OpenCode prompt acceptance observation does not support noReply prompts')
     }
-    return this.withSessionPromptHost(record, async ({ baseUrl, profile, armOAuthNativeSession }) => {
-      const client = this.clientFactory.create(baseUrl)
+    return this.withSessionPromptHost(record, async endpoint => {
+      const { baseUrl, profile, armOAuthNativeSession } = endpoint
+      const client = this.clientFactory.create(baseUrl, undefined, endpoint)
       try {
         const allocation = await this.allocateRuntimePromptMessageId(client, record.opencodeSessionId)
         const runtimePromptMessageId = allocation.runtimePromptMessageId
@@ -2295,11 +2308,11 @@ export class OpenCodeSessionBridge {
       // Observation must remain available while an admitted native turn owns
       // the publication fence. Preparing a profile here both gates the read on
       // settlement and may reconcile auth.json while that writer is still busy.
-      return this.withOwnedOAuthSessionObservation(record, async ({ baseUrl, runtimePid }, assertOwner) =>
-        this.reconcileSessionAtEndpoint(record, record, options, {
-          baseUrl, runtimePid, resolvedConfigFingerprint: record.resolvedBehaviorFingerprint,
+      return this.withOwnedOAuthSessionObservation(record, async (endpoint, assertOwner) =>
+        this.reconcileSessionAtEndpoint(record, record, options, inheritNativeRequestOwner({
+          baseUrl: endpoint.baseUrl, runtimePid: endpoint.runtimePid, resolvedConfigFingerprint: record.resolvedBehaviorFingerprint,
           profileAuthState: null, preflightDiagnostics: [], assertOwner,
-        }), options.signal)
+        }, endpoint)), options.signal)
     }
     const sessionProfile = await this.prepareProfileForSessionRecord(record)
     const profile = sessionProfile.profile
@@ -2320,7 +2333,8 @@ export class OpenCodeSessionBridge {
       })
     }
 
-    return this.withSessionHost(activeRecord, async ({ baseUrl, resolvedConfigFingerprint, runtimePid }) => {
+    return this.withSessionHost(activeRecord, async endpoint => {
+      const { baseUrl, resolvedConfigFingerprint, runtimePid } = endpoint
       if (
         activeRecord.resolvedBehaviorFingerprint
         && resolvedConfigFingerprint
@@ -2334,9 +2348,9 @@ export class OpenCodeSessionBridge {
         })
       }
 
-      return this.reconcileSessionAtEndpoint(record, activeRecord, options, {
+      return this.reconcileSessionAtEndpoint(record, activeRecord, options, inheritNativeRequestOwner({
         baseUrl, resolvedConfigFingerprint, runtimePid, profileAuthState: profile.authState, preflightDiagnostics,
-      })
+      }, endpoint))
     }, profile)
   }
 
@@ -2368,7 +2382,7 @@ export class OpenCodeSessionBridge {
       }
     }
     await assertOwner()
-    const value = await operation({ baseUrl: endpoint.baseUrl, runtimePid: endpoint.pid }, assertOwner)
+    const value = await operation(inheritNativeRequestOwner({ baseUrl: endpoint.baseUrl, runtimePid: endpoint.pid }, endpoint), assertOwner)
     await assertOwner()
     return value
   }
@@ -2400,7 +2414,7 @@ export class OpenCodeSessionBridge {
       const boundedReconciliation = Boolean(options.runtimePromptMessageId || options.remainingMs)
       const client = this.clientFactory.create(baseUrl, {
         signal: options.signal, remainingMs: options.remainingMs, boundedReconciliation,
-      })
+      }, context)
       let permissionDiagnostic: string | null = null
       const [statusMap, pendingPermissions] = await Promise.all([
         client.getSessionStatus(),
@@ -2456,7 +2470,7 @@ export class OpenCodeSessionBridge {
         const terminalDeadline = setTimeout(() => terminalController.abort(), 2_000)
         try {
           terminalEvidence = await readOpenCodeV1TerminalTranscript({
-            authority: activeRecord, baseUrl, sessionId: targetSessionId, signal: terminalController.signal,
+            authority: activeRecord, baseUrl, requestOwner: context, sessionId: targetSessionId, signal: terminalController.signal,
             runtimePromptMessageId: options.runtimePromptMessageId, remainingMs: options.remainingMs,
           })
         } finally {
@@ -2561,7 +2575,8 @@ export class OpenCodeSessionBridge {
       })
     }
 
-    return this.withSessionHost(activeRecord, async ({ baseUrl, resolvedConfigFingerprint }) => {
+    return this.withSessionHost(activeRecord, async endpoint => {
+      const { baseUrl, resolvedConfigFingerprint } = endpoint
       if (
         activeRecord.resolvedBehaviorFingerprint
         && resolvedConfigFingerprint
@@ -2576,7 +2591,7 @@ export class OpenCodeSessionBridge {
       }
 
       const summary = await this.previewObserver.observeSession({
-        baseUrl,
+        baseUrl, requestOwner: endpoint,
         sessionId: activeRecord.opencodeSessionId,
         timeoutMs: options.timeoutMs,
         idleTimeoutMs: options.idleTimeoutMs,
@@ -2658,8 +2673,9 @@ export class OpenCodeSessionBridge {
     record: OpenCodeSessionRecord
     summary: OpenCodeSessionReconcileSummary
   }> {
-    return this.withSessionHost(record, async ({ baseUrl, runtimePid }) => {
-      const client = this.clientFactory.create(baseUrl)
+    return this.withSessionHost(record, async endpoint => {
+      const { baseUrl, runtimePid } = endpoint
+      const client = this.clientFactory.create(baseUrl, undefined, endpoint)
       const diagnostics = [...options.diagnostics]
       let rawStatus: OpenCodeSessionStatusInput | null = null
       try {

@@ -4,6 +4,7 @@ import { chmod, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { unzipSync } from 'fflate'
 import { validatePackagedOpenCodeIdentity } from '../src/cli/packagedOpenCodeDelivery.js'
+import { verifyLinuxCustodyArtifact } from './lib/opencode-custody-artifact.js'
 import { openCodeV2ReleaseContract } from '../src/services/opencode/compatibility/OpenCodeV2Registry.js'
 import { packageOpenCodeV2Delivery } from './opencode-v2/delivery.js'
 
@@ -21,6 +22,14 @@ for (const [target, asset] of Object.entries(pins.assets)) {
   if ((asset.version ?? pins.version) !== openCodeBunVersion(target.split('-')[0])) {
     throw new Error('Runtime Bun platform pin mismatch')
   }
+}
+if (platform.startsWith('linux-')) {
+  if (process.platform !== 'linux' || platform !== `linux-${process.arch}`) {
+    throw new Error('Native custody delivery requires the matching physical Linux build lane')
+  }
+  const staged = Bun.spawnSync({ cmd: [process.execPath, './scripts/stage-opencode-custody.mts'], stdout: 'inherit', stderr: 'inherit' })
+  if (staged.exitCode !== 0) throw new Error('Native custody artifact staging failed')
+  verifyLinuxCustodyArtifact('./dist/native', platform, './native/opencode-custody/linux.c')
 }
 const sha = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex')
 async function pinnedBinary(selected: Asset, localArchive?: string): Promise<Uint8Array> {

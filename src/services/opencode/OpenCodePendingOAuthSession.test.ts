@@ -31,9 +31,14 @@ describe('pending native OAuth session authority', () => {
   const manager = new OpenCodeProfileManager()
   const readSaved = () => manager.readSavedOAuthCredential(profile)
   const saveRegistry = () => writeFile(registryPath, JSON.stringify(registry))
+  // Synthetic hosts exercise exact registry/birth/lease checks, without native custody.
+  const endpointSpies: Array<{ mockRestore(): void }> = []
+  const fixtureHostManager = () => new OpenCodeHostManager({ persistentRegistryPath: registryPath,
+    fetchJson: async () => { throw new Error('Synthetic registry fixture must not contact HTTP') },
+  })
   const resolve = () => resolveOpenCodeProfileScope({ projectPath: project, selectedModel: 'xai/grok-4.3',
     purpose: 'launch_runtime', env, isOAuthNativeSessionSettled: value => bridge.isOwnedOAuthNativeSessionSettled(value),
-    isOAuthNativeProbeSettled: value => new OpenCodeExecutionProbe({ clientFactory: { create: () => ({
+    isOAuthNativeProbeSettled: value => new OpenCodeExecutionProbe({ hostManager: fixtureHostManager(), clientFactory: { create: () => ({
       getSessionStatus: () => readStatusMap(), getSessionMessages: async () => { await onRead?.(); return messages },
     }) as never } }).isOwnedOAuthNativeProbeSettled(value) })
   const arm = (throwAfter = false) => manager.withOwnedOAuthRefresh({ profile, assertHostOwnership: async () => {},
@@ -77,18 +82,29 @@ describe('pending native OAuth session authority', () => {
         runId: record.runId, sessionId: record.opencodeSessionId, createdAt: now, updatedAt: now } },
     } } }
     await saveRegistry()
+    // Default recovery callbacks also use this suite-owned registry.
+    const endpoints = fixtureHostManager()
+    const sessionEndpoint = OpenCodeHostManager.prototype.resolveOwnedSessionEndpoint
+    const probeEndpoint = OpenCodeHostManager.prototype.resolveOwnedProbeEndpoint
+    endpointSpies.push(spyOn(OpenCodeHostManager.prototype, 'resolveOwnedSessionEndpoint')
+      .mockImplementation((...args) => sessionEndpoint.apply(endpoints, args)))
+    endpointSpies.push(spyOn(OpenCodeHostManager.prototype, 'resolveOwnedProbeEndpoint')
+      .mockImplementation((...args) => probeEndpoint.apply(endpoints, args)))
     sessionStore = new OpenCodeSessionStore(sessionPath)
     await sessionStore.upsert(record)
     status = 'idle'; messages = []; onRead = undefined
     readStatusMap = async () => ({ 'native-session': status })
     abortAcknowledged = true; abortCalls = 0; onAbort = undefined
     bridge = new OpenCodeSessionBridge({
-      hostManager: new OpenCodeHostManager({ persistentRegistryPath: registryPath }), sessionStore,
+      hostManager: fixtureHostManager(), sessionStore,
       clientFactory: { create: () => ({ getSessionStatus: () => readStatusMap(),
         getSessionMessages: async () => { await onRead?.(); return messages }, abortSession: async () => { abortCalls += 1; await onAbort?.(); return abortAcknowledged } }) as never },
     })
   })
-  afterEach(async () => { await rm(root, { recursive: true, force: true }) })
+  afterEach(async () => {
+    for (const spy of endpointSpies.splice(0).reverse()) spy.mockRestore()
+    await rm(root, { recursive: true, force: true })
+  })
 
   test('relay recovery observes both owned sessions while the shared OAuth writer is pending', async () => {
     // The selected members share the native host and one saved-publication slot.
@@ -107,7 +123,7 @@ describe('pending native OAuth session authority', () => {
     await writeFile(profile.managedAuthPath, JSON.stringify({ xai: c1 }))
     const nativeAuth = await readFile(profile.managedAuthPath, 'utf8')
     const observationBridge = new OpenCodeSessionBridge({
-      hostManager: new OpenCodeHostManager({ persistentRegistryPath: registryPath }), sessionStore,
+      hostManager: fixtureHostManager(), sessionStore,
       clientFactory: { create: () => ({ getSessionStatus: () => readStatusMap(),
         getPermissions: async () => [], getSessionMessages: async (id: string) => id === other.opencodeSessionId ? [] : messages,
       }) as never },
@@ -202,7 +218,7 @@ describe('pending native OAuth session authority', () => {
       leases['TEST::primary::other'] = { ...leases['TEST::primary::owner'], leaseKey: 'TEST::primary::other',
         memberName: 'other', sessionId: other.opencodeSessionId }
       await saveRegistry()
-      const hosts = new OpenCodeHostManager({ persistentRegistryPath: registryPath })
+      const hosts = fixtureHostManager()
       const hostFor = (prepared: OpenCodePreparedProfile): OpenCodeHostHandle => ({
         hostKey: owner.record.hostKey, profileRootKey: prepared.profileRootKey, projectPath: project,
         projectBehaviorFingerprint: prepared.projectBehaviorFingerprint, baseUrl: owner.baseUrl, port: 43210,
@@ -446,12 +462,18 @@ describe('pending native OAuth session authority', () => {
         const script = `import { spyOn } from 'bun:test';
           import { OpenCodeProfileManager, resolveOpenCodeProfileScope } from ${modulePath('OpenCodeProfileManager.ts')};
           import { openCodeSessionStore } from ${modulePath('OpenCodeSessionStore.ts')};
-          import { openCodeHostManager } from ${modulePath('OpenCodeHostManager.ts')};
+          import { OpenCodeHostManager, openCodeHostManager } from ${modulePath('OpenCodeHostManager.ts')};
           import { openCodeClientFactory } from ${modulePath('OpenCodeClientFactory.ts')};
           import { openCodeMcpManager } from ${modulePath('OpenCodeMcpManager.ts')};
           import { OpenCodeCommandOutcomeStore, openCodeCommandOutcomeStore } from ${modulePath('OpenCodeCommandOutcomeStore.ts')};
           import { effectiveAgentsFixture } from ${modulePath('OpenCodeEffectiveAgents.test-support.ts')};
           import { executeOpenCodeBridgeCommandEnvelope as execute } from ${modulePath('OpenCodeBridgeCommandHandler.ts')};
+          const endpoints = new OpenCodeHostManager({ persistentRegistryPath: ${JSON.stringify(registryPath)},
+            fetchJson: async () => { throw new Error('TEST restarted registry must not contact HTTP'); } });
+          const sessionEndpoint = OpenCodeHostManager.prototype.resolveOwnedSessionEndpoint;
+          spyOn(OpenCodeHostManager.prototype, 'resolveOwnedSessionEndpoint').mockImplementation((...args) => sessionEndpoint.apply(endpoints, args));
+          const probeEndpoint = OpenCodeHostManager.prototype.resolveOwnedProbeEndpoint;
+          spyOn(OpenCodeHostManager.prototype, 'resolveOwnedProbeEndpoint').mockImplementation((...args) => probeEndpoint.apply(endpoints, args));
           const record = await openCodeSessionStore.get('TEST', 'primary', 'owner');
           await resolveOpenCodeProfileScope({ projectPath: record.projectPath, selectedModel: record.selectedModel, purpose: 'launch_runtime' });
           const manager = new OpenCodeProfileManager();
@@ -570,10 +592,17 @@ describe('pending native OAuth session authority', () => {
     // Only the synthetic canonical native transport is mocked in the fresh child.
     // Default ProfileManager recovery constructs real HostManager and SessionStore
     // from the captured data root and reads the live parent process birth.
-    const script = `import { mock } from 'bun:test';
+    const script = `import { mock, spyOn } from 'bun:test';
       mock.module(${JSON.stringify(path.join(import.meta.dir, 'OpenCodeClientFactory.ts'))}, () => ({
         openCodeClientFactory: { create: () => ({ getSessionStatus: async () => ({ 'native-session': 'idle' }),
           getSessionMessages: async () => ${JSON.stringify(terminalMessages(owner.messageId))} }) } }));
+      const { OpenCodeHostManager, openCodeHostManager } = await import(${JSON.stringify(path.join(import.meta.dir, 'OpenCodeHostManager.ts'))});
+      const endpoints = new OpenCodeHostManager({ persistentRegistryPath: ${JSON.stringify(registryPath)},
+        fetchJson: async () => { throw new Error('TEST fresh registry must not contact HTTP'); } });
+      const sessionEndpoint = OpenCodeHostManager.prototype.resolveOwnedSessionEndpoint;
+          spyOn(OpenCodeHostManager.prototype, 'resolveOwnedSessionEndpoint').mockImplementation((...args) => sessionEndpoint.apply(endpoints, args));
+      const probeEndpoint = OpenCodeHostManager.prototype.resolveOwnedProbeEndpoint;
+          spyOn(OpenCodeHostManager.prototype, 'resolveOwnedProbeEndpoint').mockImplementation((...args) => probeEndpoint.apply(endpoints, args));
       const { resolveOpenCodeProfileScope, OpenCodeProfileManager } = await import(${JSON.stringify(path.join(import.meta.dir, 'OpenCodeProfileManager.ts'))});
       const scope = await resolveOpenCodeProfileScope({ projectPath: process.argv[1], selectedModel: 'xai/grok-4.3', purpose: 'launch_runtime' });
       const manager = new OpenCodeProfileManager();
@@ -856,7 +885,7 @@ describe('pending native OAuth session authority', () => {
         const { openCodeSessionStore } = await import('./OpenCodeSessionStore.js')
         const { openCodeHostManager } = await import('./OpenCodeHostManager.js')
         const { openCodeProvisioningProbe } = await import('./OpenCodeProvisioningProbe.js')
-        const hosts = new OpenCodeHostManager({ persistentRegistryPath: registryPath })
+        const hosts = fixtureHostManager()
         const restores: Array<{ mockRestore(): void }> = []
         let provisioned = false
         try {
@@ -970,10 +999,17 @@ describe('pending native OAuth session authority', () => {
   test('fresh-process Stop saves owned C1 before revoking its lease and new resolution reuses C1', async () => {
     await arm()
     await writeFile(profile.managedAuthPath, JSON.stringify({ xai: c1 }))
-    const script = `import { mock } from 'bun:test';
+    const script = `import { mock, spyOn } from 'bun:test';
       mock.module(${JSON.stringify(path.join(import.meta.dir, 'OpenCodeClientFactory.ts'))}, () => ({
         openCodeClientFactory: { create: () => ({ getSessionStatus: async () => ({ 'native-session': 'idle' }),
           getSessionMessages: async () => ${JSON.stringify(terminalMessages(owner.messageId).slice(0, 1))}, abortSession: async () => true }) } }));
+      const { OpenCodeHostManager, openCodeHostManager } = await import(${JSON.stringify(path.join(import.meta.dir, 'OpenCodeHostManager.ts'))});
+      const endpoints = new OpenCodeHostManager({ persistentRegistryPath: ${JSON.stringify(registryPath)},
+        fetchJson: async () => { throw new Error('TEST fresh registry must not contact HTTP'); } });
+      const sessionEndpoint = OpenCodeHostManager.prototype.resolveOwnedSessionEndpoint;
+          spyOn(OpenCodeHostManager.prototype, 'resolveOwnedSessionEndpoint').mockImplementation((...args) => sessionEndpoint.apply(endpoints, args));
+      const probeEndpoint = OpenCodeHostManager.prototype.resolveOwnedProbeEndpoint;
+          spyOn(OpenCodeHostManager.prototype, 'resolveOwnedProbeEndpoint').mockImplementation((...args) => probeEndpoint.apply(endpoints, args));
       const { OpenCodeSessionBridge } = await import(${JSON.stringify(path.join(import.meta.dir, 'OpenCodeSessionBridge.ts'))});
       const { openCodeSessionStore } = await import(${JSON.stringify(path.join(import.meta.dir, 'OpenCodeSessionStore.ts'))});
       const { resolveOpenCodeProfileScope, OpenCodeProfileManager } = await import(${JSON.stringify(path.join(import.meta.dir, 'OpenCodeProfileManager.ts'))});

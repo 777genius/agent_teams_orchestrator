@@ -74,7 +74,7 @@ type OpenCodeMcpClient = {
 
 type OpenCodeMcpManagerDeps = {
   clientFactory?: {
-    create(baseUrl: string, context?: OpenCodeClientRequestContext): OpenCodeMcpClient
+    create(baseUrl: string, context?: OpenCodeClientRequestContext, owner?: object): OpenCodeMcpClient
   }
   resolveLaunchConfig?: () => Promise<ResolvedAppMcpLaunchConfig>
   pathExists?: (targetPath: string) => Promise<boolean>
@@ -786,6 +786,7 @@ export class OpenCodeMcpManager {
 
   async ensureAppMcp(params: {
     baseUrl: string
+    requestOwner?: object
     attachIfMissing?: boolean
     requestContext?: OpenCodeClientRequestContext
   }): Promise<EnsureAppMcpResult> {
@@ -802,7 +803,7 @@ export class OpenCodeMcpManager {
     checkContext()
     const remoteIdentity = createHash('sha256').update(JSON.stringify([env[OPEN_CODE_MCP_URL_ENV], env[OPEN_CODE_MCP_HEADERS_JSON_ENV]])).digest('hex')
     const cacheKey = `${params.baseUrl}::${params.attachIfMissing === true ? 'attach' : 'read'}::${remoteIdentity}`
-    const inFlight = params.requestContext ? undefined : this.ensureAppMcpInFlight.get(cacheKey)
+    const inFlight = params.requestContext || params.requestOwner ? undefined : this.ensureAppMcpInFlight.get(cacheKey)
     if (inFlight) {
       return inFlight
     }
@@ -831,7 +832,7 @@ export class OpenCodeMcpManager {
         if (this.ensureAppMcpByHost.get(params.baseUrl) === work) this.ensureAppMcpByHost.delete(params.baseUrl)
       })
     // Context owners retain independent cancellation/deadline semantics.
-    if (!params.requestContext) this.ensureAppMcpInFlight.set(cacheKey, work)
+    if (!params.requestContext && !params.requestOwner) this.ensureAppMcpInFlight.set(cacheKey, work)
     this.ensureAppMcpByHost.set(params.baseUrl, work)
     // Caller cancellation returns promptly; physical host work remains the queue tail.
     try {
@@ -843,10 +844,11 @@ export class OpenCodeMcpManager {
 
   private async ensureAppMcpOnce(params: {
     baseUrl: string
+    requestOwner?: object
     attachIfMissing?: boolean
     requestContext?: OpenCodeClientRequestContext
   }, currentEnv: NodeJS.ProcessEnv): Promise<EnsureAppMcpResult> {
-    const client = this.clientFactory.create(params.baseUrl, params.requestContext)
+    const client = this.clientFactory.create(params.baseUrl, params.requestContext, params.requestOwner)
     const existingMcp = await client.getMcp()
     const existingMatch = getMatchedAppMcpEntry(existingMcp)
 

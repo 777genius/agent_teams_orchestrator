@@ -25,7 +25,7 @@ describe('OpenCodeClientFactory permissions API', () => {
       : undefined
     try {
       const result = await Promise.race([
-        new OpenCodeClientFactory().create(`http://127.0.0.1:${address.port}`, {
+        new OpenCodeClientFactory({ fetchImpl: globalThis.fetch }).create(`http://127.0.0.1:${address.port}`, {
           remainingMs: () => cancellation === 'request' ? 30 : 5_000,
           signal: caller.signal,
         }).getProviders().then(() => 'unexpected success', error => String(error)),

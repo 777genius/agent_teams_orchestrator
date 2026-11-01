@@ -22,7 +22,7 @@ type OpenCodeExecutionProofDeps = {
   nowMs?: () => number
   platform?: NodeJS.Platform
   readCredential?: typeof readOpenCodeAuthCredential
-  resolveBinaryPath?: () => string | null
+  resolveBinaryPath?: () => string | null | Promise<string | null>
   resolveBinaryIdentity?: (binaryPath: string) => Promise<string>
 }
 
@@ -114,7 +114,7 @@ async function resolveRuntimeIdentity(deps: OpenCodeExecutionProofDeps): Promise
   binaryPath: string
   binaryFingerprint: string
 }> {
-  const binaryPath = (deps.resolveBinaryPath ?? resolveOpenCodeBinaryPath)()
+  const binaryPath = await (deps.resolveBinaryPath ?? resolveOpenCodeBinaryPath)()
   if (!binaryPath) {
     throw new Error('OpenCode binary identity is unavailable')
   }
