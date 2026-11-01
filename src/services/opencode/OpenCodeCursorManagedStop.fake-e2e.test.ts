@@ -171,7 +171,7 @@ describe('OpenCode managed Cursor Stop fake e2e', () => {
         // so a `plugin` key here loads the plugin twice and the launch readiness
         // authority rejects the host on selected_config_match:plugin.
         const bridgeConfig = JSON.parse(await readFile(
-          path.join(profile.xdgConfigHome, 'opencode', 'opencode.json'), 'utf8'))
+          profile.env.OPENCODE_CONFIG!, 'utf8'))
         expect(Object.keys(bridgeConfig.mcp ?? {})).toContain('agent-teams')
         expect(bridgeConfig).not.toHaveProperty('plugin')
         // The agent must be able to reach this profile's MCP servers.

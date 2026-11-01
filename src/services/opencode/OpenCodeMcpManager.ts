@@ -1,8 +1,10 @@
 import path from 'node:path'
+import { createHash } from 'node:crypto'
 import { existsSync, readFileSync } from 'node:fs'
 import os from 'node:os'
 
 import { openCodeClientFactory } from './OpenCodeClientFactory.js'
+import { raceOpenCodeAbortSignal } from './OpenCodeRuntimeDeadline.js'
 import {
   CLAUDE_MULTIMODEL_CACHE_HOME_ENV,
   CLAUDE_MULTIMODEL_DATA_HOME_ENV,
@@ -32,6 +34,7 @@ const OPEN_CODE_MCP_COMMAND_ENV = 'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND'
 const OPEN_CODE_MCP_ARGS_JSON_ENV = 'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON'
 const OPEN_CODE_MCP_ENV_JSON_ENV = 'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENV_JSON'
 const OPEN_CODE_MCP_URL_ENV = 'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL'
+const OPEN_CODE_MCP_HEADERS_JSON_ENV = 'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_HEADERS_JSON'
 const AGENT_TEAMS_MCP_CLAUDE_DIR_ENV = 'AGENT_TEAMS_MCP_CLAUDE_DIR'
 const CLAUDE_TEAM_CONTROL_URL_ENV = 'CLAUDE_TEAM_CONTROL_URL'
 const OPEN_CODE_MCP_ENVIRONMENT_ALLOWLIST = [
@@ -128,6 +131,30 @@ function parseMcpRemoteUrl(value: string | null): string | null {
   } catch {
     return null
   }
+}
+
+function parseMcpRemoteHeaders(env: NodeJS.ProcessEnv, url: string | null): Record<string, string> | undefined {
+  const raw = env[OPEN_CODE_MCP_HEADERS_JSON_ENV]
+  if (raw === undefined) return undefined // Compatibility with older desktop launchers.
+  const invalid = () => new Error(`${OPEN_CODE_MCP_HEADERS_JSON_ENV} requires a clean remote URL and exactly one Authorization Bearer header`)
+  if (!url) throw invalid()
+  const endpoint = new URL(url)
+  if (endpoint.username || endpoint.password || endpoint.search) throw invalid()
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    // JSON parser messages may contain part of a credential.
+    throw invalid()
+  }
+  const record = asRecord(parsed)
+  if (!record || Object.keys(record).length !== 1 || typeof record.Authorization !== 'string'
+    || !/^Bearer [\x21-\x7e]{32,512}$/.test(record.Authorization)) throw invalid()
+  return { Authorization: record.Authorization }
+}
+
+function remoteMcpIdentity(config: Pick<OpenCodeMcpServerConfig, 'url' | 'headers'>): string {
+  return createHash('sha256').update(JSON.stringify([config.url, config.headers?.Authorization ?? null])).digest('hex')
 }
 
 function parseMcpEnvironmentJson(value: string | null): Record<string, string> {
@@ -377,6 +404,7 @@ export async function resolveOpenCodeAppMcpLaunchConfig(deps: {
   const pathExists = deps.pathExists ?? defaultPathExists
   const remoteUrlOverrideRaw = asString(env[OPEN_CODE_MCP_URL_ENV])
   const remoteUrlOverride = parseMcpRemoteUrl(remoteUrlOverrideRaw)
+  const headers = parseMcpRemoteHeaders(env, remoteUrlOverride)
   const commandOverride = asString(env[OPEN_CODE_MCP_COMMAND_ENV])
   const entryOverride = asString(env[OPEN_CODE_MCP_ENTRY_ENV])
   const argsOverride = parseArgsJson(asString(env[OPEN_CODE_MCP_ARGS_JSON_ENV]))
@@ -391,6 +419,7 @@ export async function resolveOpenCodeAppMcpLaunchConfig(deps: {
       config: {
         type: 'remote',
         url: remoteUrlOverride,
+        ...(headers ? { headers } : {}),
         enabled: true,
         timeout: OPEN_CODE_APP_MCP_TIMEOUT_MS,
         oauth: false,
@@ -587,6 +616,7 @@ function shouldVerifyExistingAppMcpConfig(
 
   if (
     asString(env[OPEN_CODE_MCP_URL_ENV]) !== null
+    || env[OPEN_CODE_MCP_HEADERS_JSON_ENV] !== undefined
     || hasOpenCodeLocalMcpLaunchOverride(env)
     || OPEN_CODE_MCP_ENVIRONMENT_IDENTITY_KEYS.some(key => {
       const value = env[key]
@@ -661,6 +691,14 @@ function appMcpConfigMatchesRequiredRuntime(
     }
   }
 
+  if (desiredConfig.headers?.Authorization) {
+    const candidates = [entry, asRecord(entry?.config), asRecord(entry?.server), asRecord(entry?.options)]
+    const headers = candidates.map(candidate => asStringRecord(candidate?.headers)).find(Boolean)
+    if (!headers || Object.keys(headers).length !== 1 || remoteMcpIdentity({ url: getEntryUrl(entry) ?? undefined, headers }) !== remoteMcpIdentity(desiredConfig)) {
+      return { ok: false, reason: 'existing app MCP authorization does not match current launch identity' }
+    }
+  }
+
   return { ok: true, reason: null }
 }
 
@@ -706,11 +744,17 @@ function inferMcpConnected(entry: OpenCodeMcpStatusEntry | null): boolean | null
 
 export class OpenCodeMcpManager {
   private readonly ensureAppMcpInFlight = new Map<string, Promise<EnsureAppMcpResult>>()
+  private readonly ensureAppMcpByHost = new Map<string, Promise<EnsureAppMcpResult>>()
 
   constructor(private readonly deps: OpenCodeMcpManagerDeps = {}) {}
 
   private get clientFactory() {
     return this.deps.clientFactory ?? openCodeClientFactory
+  }
+
+  private describeError(error: unknown, env: NodeJS.ProcessEnv): string {
+    if (env[OPEN_CODE_MCP_HEADERS_JSON_ENV] !== undefined) return 'authenticated MCP request failed'
+    return error instanceof Error ? error.message : String(error)
   }
 
   private async sleepMs(ms: number): Promise<void> {
@@ -729,13 +773,13 @@ export class OpenCodeMcpManager {
     return this.deps.verifyPollMs ?? OPEN_CODE_APP_MCP_VERIFY_POLL_MS
   }
 
-  private async resolveLaunchConfig(): Promise<ResolvedAppMcpLaunchConfig> {
+  private async resolveLaunchConfig(env: NodeJS.ProcessEnv): Promise<ResolvedAppMcpLaunchConfig> {
     if (this.deps.resolveLaunchConfig) {
       return this.deps.resolveLaunchConfig()
     }
 
     return resolveOpenCodeAppMcpLaunchConfig({
-      env: this.deps.env,
+      env,
       pathExists: this.deps.pathExists,
     })
   }
@@ -745,29 +789,63 @@ export class OpenCodeMcpManager {
     attachIfMissing?: boolean
     requestContext?: OpenCodeClientRequestContext
   }): Promise<EnsureAppMcpResult> {
-    if (params.requestContext) {
-      return this.ensureAppMcpOnce(params)
+    const env = { ...(this.deps.env ?? process.env) }
+    // Validate the explicit credential pair before constructing any client.
+    parseMcpRemoteHeaders(env, parseMcpRemoteUrl(asString(env[OPEN_CODE_MCP_URL_ENV])))
+    let waitSignal = params.requestContext?.signal
+    const checkContext = () => {
+      waitSignal?.throwIfAborted()
+      if (params.requestContext?.remainingMs && params.requestContext.remainingMs() <= 0) {
+        throw new Error('OpenCode app MCP request deadline expired')
+      }
     }
-    const cacheKey = `${params.baseUrl}::${params.attachIfMissing === true ? 'attach' : 'read'}`
-    const inFlight = this.ensureAppMcpInFlight.get(cacheKey)
+    checkContext()
+    const remoteIdentity = createHash('sha256').update(JSON.stringify([env[OPEN_CODE_MCP_URL_ENV], env[OPEN_CODE_MCP_HEADERS_JSON_ENV]])).digest('hex')
+    const cacheKey = `${params.baseUrl}::${params.attachIfMissing === true ? 'attach' : 'read'}::${remoteIdentity}`
+    const inFlight = params.requestContext ? undefined : this.ensureAppMcpInFlight.get(cacheKey)
     if (inFlight) {
       return inFlight
     }
 
-    const work = this.ensureAppMcpOnce(params).finally(() => {
-      if (this.ensureAppMcpInFlight.get(cacheKey) === work) {
-        this.ensureAppMcpInFlight.delete(cacheKey)
-      }
-    })
-    this.ensureAppMcpInFlight.set(cacheKey, work)
-    return work
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const remainingMs = params.requestContext?.remainingMs?.()
+    if (remainingMs !== undefined && Number.isFinite(remainingMs)) {
+      const deadline = new AbortController()
+      waitSignal = waitSignal ? AbortSignal.any([waitSignal, deadline.signal]) : deadline.signal
+      timer = setTimeout(() => deadline.abort(new Error('OpenCode app MCP request deadline expired')), Math.max(0, remainingMs))
+    }
+    const executionParams = params.requestContext && waitSignal
+      ? { ...params, requestContext: { ...params.requestContext, signal: waitSignal } }
+      : params
+
+    // A rotated credential must follow an older attach, never race it and be overwritten.
+    const previous = this.ensureAppMcpByHost.get(params.baseUrl)
+    const work = (previous ? previous.catch(() => undefined) : Promise.resolve())
+      .then(() => {
+        checkContext()
+        return this.ensureAppMcpOnce(executionParams, env)
+      }).finally(() => {
+        if (this.ensureAppMcpInFlight.get(cacheKey) === work) {
+          this.ensureAppMcpInFlight.delete(cacheKey)
+        }
+        if (this.ensureAppMcpByHost.get(params.baseUrl) === work) this.ensureAppMcpByHost.delete(params.baseUrl)
+      })
+    // Context owners retain independent cancellation/deadline semantics.
+    if (!params.requestContext) this.ensureAppMcpInFlight.set(cacheKey, work)
+    this.ensureAppMcpByHost.set(params.baseUrl, work)
+    // Caller cancellation returns promptly; physical host work remains the queue tail.
+    try {
+      return await raceOpenCodeAbortSignal(work, waitSignal)
+    } finally {
+      if (timer !== undefined) clearTimeout(timer)
+    }
   }
 
   private async ensureAppMcpOnce(params: {
     baseUrl: string
     attachIfMissing?: boolean
     requestContext?: OpenCodeClientRequestContext
-  }): Promise<EnsureAppMcpResult> {
+  }, currentEnv: NodeJS.ProcessEnv): Promise<EnsureAppMcpResult> {
     const client = this.clientFactory.create(params.baseUrl, params.requestContext)
     const existingMcp = await client.getMcp()
     const existingMatch = getMatchedAppMcpEntry(existingMcp)
@@ -775,7 +853,6 @@ export class OpenCodeMcpManager {
     if (existingMatch.matchedServerName) {
       const connected = inferMcpConnected(existingMatch.entry)
       let launchConfig: ResolvedAppMcpLaunchConfig | null = null
-      const currentEnv = this.deps.env ?? process.env
       const shouldVerifyExistingConfig = shouldVerifyExistingAppMcpConfig(
         existingMatch.entry,
         client,
@@ -783,7 +860,7 @@ export class OpenCodeMcpManager {
         params.attachIfMissing,
       )
       if (shouldVerifyExistingConfig) {
-        launchConfig = await this.resolveLaunchConfig()
+        launchConfig = await this.resolveLaunchConfig(currentEnv)
         const requiredEnvironmentKeys =
           launchConfig.source === 'env-override' && launchConfig.config.type === 'local'
             ? getMcpEnvironmentJsonKeys(currentEnv)
@@ -865,7 +942,7 @@ export class OpenCodeMcpManager {
                 availableServerNames: getMcpServerNames(existingMcp),
                 diagnostics: [
                   `OpenCode app MCP server ${existingMatch.matchedServerName} is stale: ${compatibility.reason}`,
-                  `OpenCode app MCP reattach failed: ${error instanceof Error ? error.message : String(error)}`,
+                  `OpenCode app MCP reattach failed: ${this.describeError(error, currentEnv)}`,
                 ],
               },
             }
@@ -895,7 +972,7 @@ export class OpenCodeMcpManager {
         } catch (error) {
           if (typeof client.addMcp === 'function') {
             try {
-              launchConfig ??= await this.resolveLaunchConfig()
+              launchConfig ??= await this.resolveLaunchConfig(currentEnv)
               await client.addMcp(OPEN_CODE_APP_MCP_SERVER_NAME, launchConfig.config)
               const refreshedMcp = await this.waitForMcpConnected(
                 client,
@@ -914,10 +991,10 @@ export class OpenCodeMcpManager {
                   availableServerNames: getMcpServerNames(refreshedMcp),
                   diagnostics: refreshedConnected === true
                     ? [
-                        `Reattached OpenCode app MCP server after connect failed: ${error instanceof Error ? error.message : String(error)}`,
+                        `Reattached OpenCode app MCP server after connect failed: ${this.describeError(error, currentEnv)}`,
                       ]
                     : [
-                        `Reattached OpenCode app MCP server after connect failed: ${error instanceof Error ? error.message : String(error)}`,
+                        `Reattached OpenCode app MCP server after connect failed: ${this.describeError(error, currentEnv)}`,
                         `OpenCode app MCP server ${OPEN_CODE_APP_MCP_SERVER_NAME} did not report connected after reattach`,
                       ],
                 },
@@ -933,8 +1010,8 @@ export class OpenCodeMcpManager {
                   launchSource: launchConfig?.source ?? null,
                   availableServerNames: getMcpServerNames(existingMcp),
                   diagnostics: [
-                    `OpenCode app MCP connect failed: ${error instanceof Error ? error.message : String(error)}`,
-                    `OpenCode app MCP reattach after connect failure failed: ${reattachError instanceof Error ? reattachError.message : String(reattachError)}`,
+                    `OpenCode app MCP connect failed: ${this.describeError(error, currentEnv)}`,
+                    `OpenCode app MCP reattach after connect failure failed: ${this.describeError(reattachError, currentEnv)}`,
                   ],
                 },
               }
@@ -949,7 +1026,7 @@ export class OpenCodeMcpManager {
               connected,
               launchSource: launchConfig?.source ?? null,
               availableServerNames: getMcpServerNames(existingMcp),
-              diagnostics: [`OpenCode app MCP connect failed: ${error instanceof Error ? error.message : String(error)}`],
+              diagnostics: [`OpenCode app MCP connect failed: ${this.describeError(error, currentEnv)}`],
             },
           }
         }
@@ -984,7 +1061,7 @@ export class OpenCodeMcpManager {
       }
     }
 
-    const launchConfig = await this.resolveLaunchConfig()
+    const launchConfig = await this.resolveLaunchConfig(currentEnv)
     if (typeof client.addMcp !== 'function') {
       return {
         mcp: existingMcp,
@@ -1055,7 +1132,7 @@ export class OpenCodeMcpManager {
           launchSource: launchConfig.source,
           availableServerNames: getMcpServerNames(existingMcp),
           diagnostics: [
-            error instanceof Error ? error.message : String(error),
+            this.describeError(error, currentEnv),
           ],
         },
       }
