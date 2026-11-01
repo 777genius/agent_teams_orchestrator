@@ -28,7 +28,7 @@ type ProbeRecord = { sourceKey: string; binding: RunBinding; sessionID: string; 
   submitted: boolean; proof: OpenCodeExecutionProof | null; retired: boolean; failure: ProbeFailure | null; freshExecutionProofRequestId?: string
   ownerFailure?: RunOwnerFailure
   /** This source key already spent its one replacement without a fresh request. Every
-   * successor record keeps it, so later replacements need a new fresh request id. */
+   * successor keeps it until a successful, physically retired probe re-arms recovery. */
   automaticReplacementUsed?: true }
 function parseProbeFailure(value: unknown): RunProbeFailure | null {
   if (value === null || value === undefined) return null // Existing records predate this field.
@@ -38,11 +38,27 @@ function parseProbeFailure(value: unknown): RunProbeFailure | null {
 function parseStoredProbeFailure(value: unknown): ProbeFailure | null {
   return value === 'native_owner_retired' ? value : parseProbeFailure(value)
 }
-function probeFailureReason(record: ProbeRecord): string {
+function probeFailureReason(record: ProbeRecord, providerID: string): string {
   const owner = record.ownerFailure, operation = owner?.operation
-  return record.failure === 'native_owner_retired' && owner ? `native_owner_retired:${owner.category}` +
-    (operation ? `:${operation.operation}:${operation.stage}:${operation.status ?? 'none'}` : '') : String(record.failure)
+  if (record.failure !== 'native_owner_retired' || !owner) return String(record.failure)
+  const reason = `native_owner_retired:${owner.category}` +
+    (operation ? `:${operation.operation}:${operation.stage}:${operation.status ?? 'none'}` : '')
+  // The source key binds the selected model, so this record's provider is the selection's.
+  return owner.category === 'selected_provider_not_in_v2_catalog'
+    ? `${reason}; provider ${providerID} is not part of this OpenCode V2 catalog` : reason
 }
+/** Closed probe stages a readiness deadline can expire in. `owner_readiness` covers the
+ * owner's native server start, catalog and selected-auth initialization. */
+export type OpenCodeV2ProbePhase = 'probe_preparation' | 'launch_plan' | 'owner_start' | 'owner_readiness' |
+  'model_send' | 'model_observe' | 'probe_retirement'
+/** One readiness budget capped at 300s, with up to 25s reserved for the response.
+ * Keep at least 5s (or the whole shorter budget) for short handshakes/readiness reads.
+ * A command passes its own start so earlier stages draw from the same budget. */
+export function openCodeV2ReadinessDeadline(envelope: Pick<BridgeEnvelope, 'timeoutMs'>, startedAt = Date.now()): number {
+  const budget = Math.min(envelope.timeoutMs || 120_000, 300_000)
+  return startedAt + Math.max(1, Math.min(budget, Math.max(5000, budget - 25_000)))
+}
+const timedOut = (phase: OpenCodeV2ProbePhase, text: string) => `execution_timeout:${phase}; ${text}`
 const WINDOWS = process.platform === 'win32'
 /** `lexicalRoot`: on Windows the configured data root may differ from its real path in letter
  * case or 8.3 names; it is canonicalized once and everything below must match exactly. */
@@ -88,10 +104,16 @@ function parseRecord(value: unknown): ProbeRecord {
 export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, selection: Selection, run: boolean,
   options: { unattendedTeam?: boolean; signal?: AbortSignal; onPrepared?: (sourceKey: string) => Promise<void>;
     onIntentPersisted?: (value: OpenCodeV2ProbeIntent) => Promise<void>; requireExisting?: OpenCodeV2ProbeIntent;
-    freshExecutionProofRequestId?: string } = {}) {
+    freshExecutionProofRequestId?: string;
+    /** An earlier absolute deadline of the calling command; the probe never extends it. */
+    deadline?: number; onPhase?: (phase: OpenCodeV2ProbePhase) => void } = {}) {
   const freshRequestId = options.freshExecutionProofRequestId
   executionAssert(freshRequestId === undefined || run && !options.requireExisting && typeof freshRequestId === 'string' &&
     /^[a-zA-Z0-9._:-]{1,200}$/.test(freshRequestId), 'probe_fresh_request_invalid')
+  executionAssert(options.deadline === undefined || Number.isFinite(options.deadline), 'probe_deadline_invalid')
+  let currentPhase: OpenCodeV2ProbePhase = 'probe_preparation'
+  const phase = (value: OpenCodeV2ProbePhase) => { currentPhase = value; options.onPhase?.(value) }
+  phase('probe_preparation')
   const unattendedTeam = options.unattendedTeam === true
   const available = async (record: ProbeRecord) => {
     if (freshRequestId !== undefined && record.freshExecutionProofRequestId !== freshRequestId)
@@ -103,8 +125,12 @@ export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, 
       await writeOpenCodeV2StatusProofHint(path.dirname(directory), selection.project, sourceKey)
     return { state: 'available' as const, proof: record.proof, reason: null }
   }
-  const deadline = Date.now() + Math.max(1, Math.min(envelope.timeoutMs || 120_000, 300_000) - 25_000)
-  const assertDeadline = () => { options.signal?.throwIfAborted(); executionAssert(Date.now() < deadline, 'execution_timeout') }
+  const deadline = Math.min(openCodeV2ReadinessDeadline(envelope), options.deadline ?? Infinity)
+  const assertDeadline = () => {
+    if (options.signal?.aborted && !(options.signal.reason instanceof Error && options.signal.reason.message === 'execution_timeout'))
+      options.signal.throwIfAborted()
+    executionAssert(!options.signal?.aborted && Date.now() < deadline, `execution_timeout:${currentPhase}`)
+  }
   assertDeadline()
   const behavior = await collectProjectBehaviorMetadata(selection.project, process.env, options.signal)
   const variant = typeof envelope.body.effort === 'string' ? envelope.body.effort : 'default'
@@ -183,7 +209,7 @@ export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, 
       else if (!automaticReplacementUsed) { automaticReplacementUsed = true; record = null }
     }
     if (record?.failure && (record.retired || !run)) return { state: 'failed' as const, proof: null,
-      reason: record.retired ? probeFailureReason(record) : `${record.failure}; probe_physical_cleanup_unknown` }
+      reason: record.retired ? probeFailureReason(record, selection.model.providerID) : `${record.failure}; probe_physical_cleanup_unknown` }
     // A retained unresolved attempt never allocates another session or input.
     if (!run) return { state: 'pending' as const, proof: null, reason: record ? 'Original native execution proof is pending or expired.' : 'Selected-model execution proof was not requested.' }
     if (record?.retired && !record.proof) return { state: 'pending' as const, proof: null, reason: 'Original native probe was retired without qualifying terminal evidence.' }
@@ -215,10 +241,11 @@ export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, 
       const intent: QueueIntent = { identity: { requestId: `probe-${nonce}`, deliveryAttemptId: `probe-${nonce}`,
         localMessageId: `probe-${nonce}`, nativeInputID: `msg_${nonce}` }, delivery: 'queue',
         input: { nativeInputID: `msg_${nonce}`, resume: true, text: `Output only this exact token: ${expectedText}` } }
+      phase('launch_plan')
       const plan = { ...await buildOpenCodeV2InternalRunPlan(selection, { teamId, teamName: teamId, runId: nonce, laneId: 'execution-probe',
         selectedModel: `${selection.model.providerID}/${selection.model.id}`, effort: variant,
         members: [{ name: 'probe', prompt: 'Execute the single selected-model readiness prompt. Do not call controller tools.' }] },
-        randomUUID(), { intent, expectedText, unattendedTeam }), deadline }
+        randomUUID(), { intent, expectedText, unattendedTeam }, { signal: options.signal, deadlineMs: deadline }), deadline }
       assertDeadline()
       const member = plan.members[0]; executionAssert(member, 'probe_plan_invalid')
       record = { sourceKey, binding: plan.binding, sessionID: member.originalSessionId, intent, submitted: false, proof: null, retired: false, failure: null,
@@ -226,20 +253,25 @@ export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, 
         ...(automaticReplacementUsed ? { automaticReplacementUsed: true as const } : {}) }
       await save(record) // Original identities precede launch and every prompt effect.
       await options.onIntentPersisted?.({ sourceKey, binding: record.binding, sessionID: record.sessionID, intentHash: executionHash(record.intent) })
+      phase('owner_start')
       assertDeadline()
       await launchExplicitOpenCodeV2Run(plan)
-    } else await options.onIntentPersisted?.({ sourceKey, binding: record.binding, sessionID: record.sessionID, intentHash: executionHash(record.intent) })
+    } else {
+      await options.onIntentPersisted?.({ sourceKey, binding: record.binding, sessionID: record.sessionID, intentHash: executionHash(record.intent) })
+      phase('owner_readiness')
+    }
     const owner = await discoverOpenCodeV2Run(dataRoot, record.binding.teamId, record.binding.runId)
     assertDeadline()
     if (!owner) return { state: record.failure ? 'failed' as const : 'pending' as const, proof: null,
       reason: record.failure ? `${record.failure}; probe_physical_cleanup_unknown` : 'Original native owner is unavailable; no replay is authorized.' }
     executionAssert(executionHash(owner.binding) === executionHash(record.binding), 'probe_original_owner_changed')
     const retire = async () => {
+      phase('probe_retirement')
       const stopped = await requestOpenCodeV2Run(owner, { operation: 'stop' }, Math.max(1, Math.min(30_000, deadline - Date.now())))
-      assertDeadline()
       executionAssert(stopped.kind === 'stop' && stopped.state === 'stopped' && stopped.ownerRetired === true &&
         stopped.members.length === 1 && stopped.members[0]?.memberId === 'probe' &&
         stopped.members[0].cleanup !== null && stopped.members[0].errors.length === 0, 'probe_physical_cleanup_unknown')
+      assertDeadline()
     }
     const finishFailure = async (original: ProbeRecord) => {
       executionAssert(original.failure && original.submitted && !original.proof, 'probe_store_invalid')
@@ -264,16 +296,19 @@ export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, 
       original.failure = 'native_owner_retired'; original.retired = true
       if (retirement.failure) original.ownerFailure = retirement.failure
       await save(original)
-      return { state: 'failed' as const, proof: null, reason: probeFailureReason(original) }
+      return { state: 'failed' as const, proof: null, reason: probeFailureReason(original, selection.model.providerID) }
     }
     // Retry only the original stop/readback after a persisted failure, never send.
     if (record.failure) return await finishFailure(record)
     if (!record.submitted) {
+      phase('owner_readiness')
       let ready: RunMemberStatus | null
+      const readiness = Math.max(1, Math.min(OPEN_CODE_V2_RUN_INITIALIZATION_MS, deadline - Date.now()))
+      const readinessDeadline = Date.now() + readiness
       try {
         ready = await awaitOpenCodeV2RunMemberReadiness(owner, { memberId: 'probe', originalSessionId: record.sessionID,
           selectedModel: `${selection.model.providerID}/${selection.model.id}`, selectedVariant: variant, pin: openCodeV2EngineVersion(selection.native) },
-          Math.max(1, Math.min(OPEN_CODE_V2_RUN_INITIALIZATION_MS, deadline - Date.now())))
+          readiness)
       } catch (error) {
         const retirement = readOpenCodeV2RunOwnerRetiredError(error)
         if (!retirement) throw error
@@ -284,14 +319,18 @@ export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, 
         // An unreadable proof keeps the previous pending result.
         const retirement = await readOpenCodeV2RunOwnerRetirement(owner).catch(() => null)
         if (retirement) return await retireUnsubmitted(record, retirement)
-        return { state: 'pending' as const, proof: null, reason: 'Original native member is not ready; no input was submitted.' }
+        const text = 'Original native member is not ready; no input was submitted.'
+        // Only an exhausted wait names the timeout; a stopping owner whose exit is unproven does not.
+        return { state: 'pending' as const, proof: null, reason: Date.now() >= readinessDeadline ? timedOut('owner_readiness', text) : text }
       }
+      phase('model_send')
       assertDeadline()
       record.submitted = true; await save(record)
       await requestOpenCodeV2Run(owner, { operation: 'send', memberId: 'probe', originalSessionId: record.sessionID, intent: record.intent },
         Math.max(1, Math.min(30_000, deadline - Date.now())))
       assertDeadline()
     }
+    phase('model_observe')
     while (Date.now() < deadline) {
       const permissions = await requestOpenCodeV2Run(owner, { operation: 'permissions', memberId: 'probe', originalSessionId: record.sessionID }, Math.min(10_000, deadline - Date.now()))
       assertDeadline()
@@ -314,11 +353,25 @@ export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, 
       }
       if (observed.proof) {
         await retire()
-        record.proof = observed.proof; record.retired = true; await save(record)
+        // A real success re-arms the one automatic replacement: every later replacement
+        // still needs another success between owner failures, so failures cannot storm.
+        record.proof = observed.proof; record.retired = true; delete record.automaticReplacementUsed; await save(record)
         return available(record)
       }
       await new Promise(resolve => setTimeout(resolve, Math.min(300, Math.max(1, deadline - Date.now()))))
     }
-    return { state: 'pending' as const, proof: null, reason: 'Original native input has no qualifying terminal; only readback is authorized.' }
+    return { state: 'pending' as const, proof: null,
+      reason: timedOut('model_observe', 'Original native input has no qualifying terminal; only readback is authorized.') }
+  } catch (error) {
+    // A bounded control read can expire before its final deadline check. Preserve
+    // custody/framing errors, and never present uncertain retirement as a timeout.
+    const expiredRead = Date.now() >= deadline && error instanceof Error &&
+      (isTransientOpenCodeV2ControlRead(error) || currentPhase === 'owner_start' && error.message === 'timeout' ||
+        ['run_deadline_expired', 'run_operation_timeout', 'run_control_client_budget_exhausted',
+        'run_control_connect_busy_timeout_expired', 'run_control_connect_idle_expired',
+        'run_control_connect_no_listener_expired', 'run_state_wall_deadline_expired'].includes(error.message))
+    if (expiredRead || error instanceof Error && ['execution_timeout', 'execution_timeout:probe_retirement'].includes(error.message))
+      throw new Error(currentPhase === 'probe_retirement' ? 'probe_physical_cleanup_unknown' : `execution_timeout:${currentPhase}`, { cause: error })
+    throw error
   } finally { await release?.() }
 }

@@ -10,7 +10,7 @@ import { getOpenCodeVersionProbeDiagnostics } from '../compatibility/OpenCodeVer
 import { classifyOpenCodeV2ExecutionDelivery } from '../host/OpenCodeV2ExecutionDelivery.js'
 import { isExecutionPlatformAvailable } from '../host/OpenCodeV2ExecutionPlatform.js'
 import { resolveOpenCodeBinaryHostIdentity } from '../OpenCodeHostIdentity.js'
-import { resolveOpenCodeV2ExecutionProbe } from './OpenCodeV2ExecutionProbe.js'
+import { openCodeV2ReadinessDeadline, resolveOpenCodeV2ExecutionProbe, type OpenCodeV2ProbePhase } from './OpenCodeV2ExecutionProbe.js'
 import { parseOpenCodeBridgePreconditions, validateOpenCodeBridgeStateChangingPreconditions } from '../OpenCodeBridgePreconditions.js'
 import type { RunQualification } from './OpenCodeV2RunTypes.js'
 import { createOpenCodeV2LaunchPlan, inspectOpenCodeV2SourceAvailability } from './OpenCodeV2LaunchPlan.js'
@@ -284,14 +284,16 @@ function projectV2TeamStatus(status: Extract<RunControlResult, { kind: 'status' 
     durableCheckpoints: [] }
 }
 
-async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: OpenCodeV2TeamBridge | null) {
-  const started = Date.now()
+/** `started`: when this command entered the runtime, so stages before V2 selection share its budget. */
+async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: OpenCodeV2TeamBridge | null, started = Date.now()) {
   const body: Record<string, unknown> = { ...envelope.body, runId: envelope.body.runId ?? envelope.body.expectedRunId }
   envelope = { ...envelope, body }
   let measured: RunQualification | undefined
   let originalStatus: Extract<RunControlResult, { kind: 'status' }> | undefined
   let acceptedIdempotencyKey: string | undefined
   let readinessStage: 'owner_discovery' | 'source_availability' | 'execution_probe' | undefined
+  let probePhase: OpenCodeV2ProbePhase | undefined
+  let readinessDeadline: number | undefined, readinessExpiry: ReturnType<typeof setTimeout> | undefined
   const respond = (env: BridgeEnvelope, at: number, data: unknown, version: string | null) => response(env, at,
     acceptedIdempotencyKey && data !== null && typeof data === 'object' && !Array.isArray(data)
       ? { ...data, idempotencyKey: acceptedIdempotencyKey } : data, version, measured)
@@ -309,10 +311,21 @@ async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: O
       return respond(envelope, started, { ...projectV2TeamStatus(status, plan.binding.runId), expectedBehaviorFingerprint: measured?.expectedBehaviorFingerprint }, pin)
     }
     if (envelope.command === 'opencode.readiness' || envelope.command === 'opencode.handshake') {
+      // One probe budget counted from the command's start: source availability and the probe
+      // expire together, early enough to answer inside the caller's own watchdog.
+      const deadline = readinessDeadline = openCodeV2ReadinessDeadline(envelope, started)
+      const expiry = new AbortController()
+      readinessExpiry = setTimeout(() => expiry.abort(new Error('execution_timeout')), Math.max(0, deadline - Date.now()))
+      const remaining = () => {
+        expiry.signal.throwIfAborted()
+        executionAssert(Date.now() < deadline, 'execution_timeout')
+        return Math.max(1, Math.min(8000, deadline - Date.now()))
+      }
       readinessStage = 'owner_discovery'
       let owner: Extract<RunControlResult, { kind: 'status' }> | null = null
-      if (bridge && await bridge.discover()) {
-        const found = await bridge.call({ operation: 'status' }, 8000)
+      if (bridge && await boundOpenCodeRead(bridge.discover(), remaining(), expiry.signal)) {
+        const found = await bridge.call({ operation: 'status' }, remaining())
+        remaining()
         executionAssert(found.kind === 'status', 'run_status_unknown'); owner = found
       }
       if (owner && envelope.command === 'opencode.handshake') {
@@ -332,8 +345,9 @@ async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: O
         originalIdentity.runtime.version = measured.version
         originalIdentity.featureFlags.opencodeStateChangingCommands = true
         if (text(body.memberName) && openCodeV2SupportedSourcePredicate(owner)) {
-          const member = await bridge.resolveMember(required(body.memberName, 'memberName'), text(body.laneId), text(body.runtimeSessionId ?? body.sessionId), 8000)
-          const group = await bridge.call({ operation: 'groupProof', memberId: member.memberId, originalSessionId: member.originalSessionId }, 8000)
+          const member = await bridge.resolveMember(required(body.memberName, 'memberName'), text(body.laneId), text(body.runtimeSessionId ?? body.sessionId), remaining())
+          const group = await bridge.call({ operation: 'groupProof', memberId: member.memberId, originalSessionId: member.originalSessionId }, remaining())
+          remaining()
           executionAssert(group.kind === 'groupProof', 'GROUP_RECIPIENT_INCOMPATIBLE')
           if (group.proof) {
             assertOpenCodeV2GroupProof({ teamId: required(body.teamId ?? body.teamName, 'teamId'), runId: required(body.runId, 'runId') }, group.proof, member)
@@ -352,7 +366,7 @@ async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: O
       const ownerModel = owner?.members[0]?.selectedModel
       readinessStage = 'source_availability'
       const selection = await inspectOpenCodeV2SourceAvailability({ ...envelope,
-        body: { ...body, selectedModel: body.selectedModel ?? ownerModel } })
+        body: { ...body, selectedModel: body.selectedModel ?? ownerModel } }, { signal: expiry.signal, deadlineMs: deadline })
       if (owner) executionAssert(owner.members.every(member => member.selectedModel === `${selection.model.providerID}/${selection.model.id}`), 'run_selected_model_changed')
       const qualified = owner !== null && openCodeV2SupportedSourcePredicate(owner)
       const sourceCapabilities = { teamLaunch: true, memberSession: qualified, permission: false }
@@ -361,8 +375,9 @@ async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: O
       executionAssert(freshRequestId === undefined || envelope.command === 'opencode.readiness' && body.requireExecutionProbe === true &&
         typeof freshRequestId === 'string' && /^[a-zA-Z0-9._:-]{1,200}$/.test(freshRequestId), 'probe_fresh_request_invalid')
       const probe = await resolveOpenCodeV2ExecutionProbe(envelope, selection, envelope.command === 'opencode.readiness' && body.requireExecutionProbe === true,
-        { unattendedTeam: true, ...(freshRequestId === undefined ? {} : { freshExecutionProofRequestId: freshRequestId as string }) })
-      readinessStage = undefined
+        { unattendedTeam: true, deadline, signal: expiry.signal, onPhase: phase => { probePhase = phase },
+          ...(freshRequestId === undefined ? {} : { freshExecutionProofRequestId: freshRequestId as string }) })
+      readinessStage = undefined; probePhase = undefined
       measured = owner?.qualification ?? { capabilitySnapshotId: selection.capabilitySnapshotId,
         expectedBehaviorFingerprint: probe.proof?.expectedBehaviorEvidence.expectedBehaviorFingerprint ?? '',
         binaryPath: probe.proof?.binaryPath ?? selection.native.executablePath,
@@ -576,6 +591,14 @@ async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: O
     const missing = readinessStage && error !== null && typeof error === 'object'
       && 'code' in error && error.code === 'ENOENT'
     if (missing) return refusal(envelope, started, `readiness_file_missing:${readinessStage}`)
+    // An exhausted readiness budget names its closed stage instead of running into the caller's
+    // watchdog. The version read refuses an acquisition deadline it cannot meet as
+    // selection_unavailable; every other code, cleanup uncertainty included, stays as it is.
+    const expired = readinessDeadline !== undefined && Date.now() >= readinessDeadline
+    if (readinessStage && error instanceof Error && (error.message === 'execution_timeout' ||
+      expired && (readinessStage === 'source_availability' && error.message === 'selection_unavailable' ||
+        readinessStage === 'owner_discovery' && ['cancelled', 'timeout', 'run_control_timeout', 'operation_timeout'].includes(error.message))))
+      return refusal(envelope, started, `execution_timeout:${probePhase ?? readinessStage}`)
     const message = error instanceof Error ? error.message : 'V2 bridge operation unknown'
     // A native custody refusal inside readiness must keep its finite operation
     // name: the shared stage string alone cannot identify the throwing request.
@@ -584,7 +607,7 @@ async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: O
       ? (error as { nativeOperation: string }).nativeOperation : null
     return refusal(envelope, started, operation && !message.includes('@native:')
       ? `${message} @native:${operation}` : message)
-  }
+  } finally { clearTimeout(readinessExpiry) }
 }
 
 // Recovery follows persisted original ownership even if the installed CLI changes.
@@ -623,6 +646,8 @@ export async function executeExistingOpenCodeV2TranscriptEnvelope(input: unknown
 /** Public protocol1 routing. The existing V1 executor is passed unchanged. */
 export async function executeSelectedOpenCodeBridgeCommandEnvelope(input: unknown,
   executeV1: (input: unknown) => Promise<unknown>): Promise<unknown> {
+  // Owner discovery and runtime selection below spend the same command budget as V2 readiness.
+  const started = Date.now()
   let envelope: BridgeEnvelope
   try { envelope = validateEnvelope(input) } catch { return executeV1(input) }
   let binding: ReturnType<typeof resolveOpenCodeV2RunBinding>
@@ -643,16 +668,27 @@ export async function executeSelectedOpenCodeBridgeCommandEnvelope(input: unknow
   }
   const bridge = binding ? new OpenCodeV2TeamBridge(resolveClaudeMultimodelPaths().data, binding) : null
   if (bridge && isExecutionPlatformAvailable() && (process.platform === 'win32' || process.getuid)) {
-    try { if (await bridge.discover()) return executeV2(envelope, null, bridge) }
+    try {
+      const readiness = envelope.command === 'opencode.readiness' || envelope.command === 'opencode.handshake'
+      const owner = readiness
+        ? await boundOpenCodeRead(bridge.discover(), Math.max(1, openCodeV2ReadinessDeadline(envelope, started) - Date.now()))
+        : await bridge.discover()
+      if (readiness && Date.now() >= openCodeV2ReadinessDeadline(envelope, started))
+        return refusal(envelope, started, 'execution_timeout:owner_discovery')
+      if (owner) return executeV2(envelope, null, bridge, started)
+    }
     catch (error) {
       if (envelope.command === 'opencode.commandStatus' || envelope.command === 'opencode.recoverDeliveryJournal')
-        return executeV2(envelope, null, bridge)
+        return executeV2(envelope, null, bridge, started)
       if ((envelope.command === 'opencode.readiness' || envelope.command === 'opencode.handshake')
         && error !== null && typeof error === 'object' && 'code' in error && error.code === 'ENOENT')
         return refusal(envelope, Date.now(), 'readiness_file_missing:owner_discovery')
       // A native custody refusal must keep its finite operation name: the
       // shared stage string cannot identify the throwing native request.
       const message = error instanceof Error ? error.message : 'run_owner_unknown'
+      if ((envelope.command === 'opencode.readiness' || envelope.command === 'opencode.handshake') &&
+        message === 'timeout' && Date.now() >= openCodeV2ReadinessDeadline(envelope, started))
+        return refusal(envelope, started, 'execution_timeout:owner_discovery')
       const operation = error !== null && typeof error === 'object' && 'nativeOperation' in error &&
         typeof (error as { nativeOperation?: unknown }).nativeOperation === 'string'
         ? (error as { nativeOperation: string }).nativeOperation : null
@@ -671,10 +707,22 @@ export async function executeSelectedOpenCodeBridgeCommandEnvelope(input: unknow
     catch (error) { return refusal(envelope, Date.now(), error instanceof Error ? error.message : 'legacy_owner_unknown') }
   }
   let selection: Awaited<ReturnType<typeof inspectOpenCodeRuntimeAdapterSelection>>
-  try { selection = await inspectOpenCodeRuntimeAdapterSelection() }
+  const selectionReadiness = envelope.command === 'opencode.readiness' || envelope.command === 'opencode.handshake'
+  const selectionDeadline = selectionReadiness ? openCodeV2ReadinessDeadline(envelope, started) : undefined
+  const selectionExpiry = new AbortController()
+  const selectionTimer = selectionDeadline === undefined ? undefined : setTimeout(() =>
+    selectionExpiry.abort(new Error('execution_timeout')), Math.max(0, selectionDeadline - Date.now()))
+  try {
+    // The version reader owns abort and physical cleanup. Do not race away from it.
+    selection = await inspectOpenCodeRuntimeAdapterSelection(selectionReadiness ? selectionExpiry.signal : undefined, undefined, selectionDeadline)
+    if (selectionReadiness && selection.policy.generation === 'v2' && Date.now() >= selectionDeadline!)
+      return refusal(envelope, started, 'execution_timeout:runtime_selection')
+  }
   catch (error) {
-    const result = refusal(envelope, Date.now(), error instanceof Error ? error.message : 'selection_unavailable')
     const diagnostics = getOpenCodeVersionProbeDiagnostics(error)
+    const timeout = selectionDeadline !== undefined && Date.now() >= selectionDeadline && diagnostics.length === 0 &&
+      error instanceof Error && ['execution_timeout', 'selection_unavailable'].includes(error.message)
+    const result = refusal(envelope, started, timeout ? 'execution_timeout:runtime_selection' : error instanceof Error ? error.message : 'selection_unavailable')
     return diagnostics.length ? { ...result, diagnostics: diagnostics.map(data => ({
       providerId: 'opencode' as const, type: data.code, severity: 'error' as const,
       message: data.code === 'opencode_version_probe_helper_failed'
@@ -682,9 +730,10 @@ export async function executeSelectedOpenCodeBridgeCommandEnvelope(input: unknow
       createdAt: result.completedAt, data,
     })) } : result
   }
+  finally { clearTimeout(selectionTimer) }
   const selected = selectOpenCodeRuntimeAdapter(selection.policy, {
     v1: () => () => executeV1(input),
-    v2: pin => () => executeV2(envelope, pin, bridge),
+    v2: pin => () => executeV2(envelope, pin, bridge, started),
   })
   if (selected.generation === 'unsupported')
     return refusal(envelope, Date.now(), 'Selected OpenCode generation is unsupported; capabilities remain false.')

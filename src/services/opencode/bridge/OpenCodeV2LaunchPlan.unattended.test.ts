@@ -17,6 +17,7 @@ import * as mcp from '../OpenCodeMcpManager.js'
 import * as probes from './OpenCodeV2ExecutionProbe.js'
 import * as launchPlans from './OpenCodeV2LaunchPlan.js'
 import * as runOwners from './OpenCodeV2RunOwner.js'
+import * as delivery from '../host/OpenCodeV2ExecutionDelivery.js'
 import * as controls from './OpenCodeV2RunControl.js'
 import type { RunBinding, RunControlResult } from './OpenCodeV2RunTypes.js'
 import * as projectIdentity from '../OpenCodeProjectIdentity.js'
@@ -733,7 +734,7 @@ test.skipIf(!posix)('an unsubmitted probe with a live starting owner stays pendi
   const counter = countLaunches()
   try {
     expect(await probes.resolveOpenCodeV2ExecutionProbe(f.request, f.selection, true))
-      .toEqual({ state: 'pending', proof: null, reason: 'Original native member is not ready; no input was submitted.' })
+      .toEqual({ state: 'pending', proof: null, reason: 'execution_timeout:owner_readiness; Original native member is not ready; no input was submitted.' })
     expect(await readFile(f.file, 'utf8')).toBe(f.saved)
     expect(counter.launches).toBe(0)
   } finally { await control.close() }
@@ -758,3 +759,99 @@ test.skipIf(!posix)('a fresh request keeps its own settled owner failure while a
   expect(counter.launches).toBe(1)
   expect(JSON.parse(await readFile(f.file, 'utf8'))).toMatchObject({ freshExecutionProofRequestId: 'TEST-fresh-B', submitted: false, failure: null })
 }, 120_000)
+
+
+test('a successful original probe re-arms automatic recovery only after physical retirement', async () => {
+  const f = await freshProbeFixture()
+  await writeFile(f.file, JSON.stringify({ ...f.record, proof: null, retired: false, automaticReplacementUsed: true }), { mode: 0o600 })
+  const operations: string[] = []
+  restores.push(spyOn(controls, 'discoverOpenCodeV2Run').mockImplementation(async () => ({ binding: f.record.binding }) as never),
+    spyOn(controls, 'requestOpenCodeV2Run').mockImplementation(async (_owner, request): Promise<RunControlResult> => {
+      operations.push(request.operation)
+      if (request.operation === 'permissions') return { kind: 'permissions', requests: [] }
+      if (request.operation === 'probeEvidence') return { kind: 'probeEvidence', proof: f.record.proof, failure: null }
+      expect(request.operation).toBe('stop')
+      // A terminal proof alone cannot re-arm owner replacement.
+      expect(JSON.parse(await readFile(f.file, 'utf8')).automaticReplacementUsed).toBe(true)
+      return { kind: 'stop', state: 'stopped', ownerRetired: true, members: [{ memberId: 'probe', cleanup: {}, errors: [] }] } as RunControlResult
+    }))
+  expect(await probes.resolveOpenCodeV2ExecutionProbe(f.request, f.selection, true, { unattendedTeam: true }))
+    .toEqual({ state: 'available', proof: f.record.proof, reason: null })
+  const completed = JSON.parse(await readFile(f.file, 'utf8'))
+  expect(completed).toMatchObject({ retired: true, submitted: true, proof: f.record.proof })
+  expect(completed).not.toHaveProperty('automaticReplacementUsed')
+  expect(operations).toEqual(['permissions', 'probeEvidence', 'stop'])
+  // Passive repeated reads do not allocate another owner or submit input.
+  expect((await probes.resolveOpenCodeV2ExecutionProbe(f.request, f.selection, false, { unattendedTeam: true })).state).toBe('available')
+  expect(operations).toEqual(['permissions', 'probeEvidence', 'stop'])
+})
+
+for (const cleanup of [false, true]) test(`deadline during ${cleanup ? 'retirement preserves cleanup uncertainty' : 'observation names its phase without another input'}`, async () => {
+  const f = await originalProbe(true, { automaticReplacementUsed: true })
+  const operations: string[] = []
+  let clock = Date.now()
+  const deadline = clock + 10000
+  restores.push(spyOn(Date, 'now').mockImplementation(() => clock))
+  restores.push(spyOn(controls, 'discoverOpenCodeV2Run').mockImplementation(async () => ({ binding: f.binding }) as never),
+    spyOn(controls, 'requestOpenCodeV2Run').mockImplementation(async (_owner, request): Promise<RunControlResult> => {
+      operations.push(request.operation)
+      if (cleanup && request.operation === 'permissions') return { kind: 'permissions', requests: [{}] } as RunControlResult
+      clock = deadline + 1
+      if (cleanup) return { kind: 'stop', state: 'cleanup_unknown', ownerRetired: false, members: [] } as RunControlResult
+      throw Error('run_control_timeout')
+    }))
+  const options = { deadline }
+  if (cleanup) {
+    expect(await probes.resolveOpenCodeV2ExecutionProbe(f.request, f.selection, true, options))
+      .toEqual({ state: 'failed', proof: null, reason: 'native_execution_cancelled; probe_physical_cleanup_unknown' })
+    expect(JSON.parse(await readFile(f.file, 'utf8'))).toMatchObject({ retired: false, automaticReplacementUsed: true })
+  } else {
+    await expect(probes.resolveOpenCodeV2ExecutionProbe(f.request, f.selection, true, options))
+      .rejects.toThrow('execution_timeout:model_observe')
+    expect(await readFile(f.file, 'utf8')).toBe(f.saved)
+  }
+  expect(operations).toEqual(cleanup ? ['permissions', 'stop'] : ['permissions'])
+})
+
+test('cached missing-provider failure names the selected provider and passive reads cannot replace it', async () => {
+  const failure = { category: 'selected_provider_not_in_v2_catalog', operation: { operation: 'provider-read', stage: 'decode', status: 404 } }
+  const f = await originalProbe(false, { failure: 'native_owner_retired', retired: true, ownerFailure: failure, automaticReplacementUsed: true })
+  const counter = countLaunches()
+  for (const run of [false, true]) expect(await probes.resolveOpenCodeV2ExecutionProbe(f.request, f.selection, run))
+    .toEqual({ state: 'failed', proof: null, reason: 'native_owner_retired:selected_provider_not_in_v2_catalog:provider-read:decode:404; provider provider is not part of this OpenCode V2 catalog' })
+  expect(counter.launches).toBe(0)
+  expect(await readFile(f.file, 'utf8')).toBe(f.saved)
+})
+
+
+test('probe planning aborts during real source hashing without launching an owner', async () => {
+  const request = envelope(), selection = await inspectOpenCodeV2SourceAvailability(request)
+  const abort = new AbortController(), hash = nativeIdentity.hashOpenCodeFile
+  let sourceReads = 0
+  restores.push(spyOn(nativeIdentity, 'hashOpenCodeFile').mockImplementation(async (file, signal) => {
+    const result = await hash(file, signal)
+    if (file.includes(path.sep + 'src' + path.sep)) { sourceReads++; abort.abort(Error('TEST-plan-expired')) }
+    return result
+  }))
+  await expect(launchPlans.buildOpenCodeV2InternalRunPlan(selection, request.body, 'TEST-controller', undefined,
+    { signal: abort.signal, deadlineMs: Date.now() + 10000 })).rejects.toThrow('TEST-plan-expired')
+  expect(sourceReads).toBeGreaterThan(0)
+  expect(await readdir(path.join(root, 'app-data/opencode/v2'))).not.toContain('runs')
+})
+
+test('owner startup refuses a deadline spent in source validation before reserving or spawning', async () => {
+  const request = envelope(), selection = await inspectOpenCodeV2SourceAvailability(request)
+  const preparedPlan = await launchPlans.buildOpenCodeV2InternalRunPlan(selection, request.body, 'TEST-controller')
+  const bunPath = await realpath(process.execPath), bunSha256 = await nativeIdentity.hashOpenCodeFile(bunPath)
+  let clock = Date.now(), reservations = 0
+  const plan = { ...preparedPlan, deadline: clock + 10000, source: { ...preparedPlan.source, bunPath, bunSha256 },
+    members: preparedPlan.members.map(member => ({ ...member, native: { ...member.native, bun: { path: bunPath, sha256: bunSha256 } } })) }
+  const resolve = delivery.resolveOpenCodeV2ExecutionDelivery
+  restores.push(spyOn(Date, 'now').mockImplementation(() => clock),
+    spyOn(delivery, 'resolveOpenCodeV2ExecutionDelivery').mockImplementation(async (...args) => {
+      const result = await resolve(...args); clock = plan.deadline + 1; return result
+    }),
+    spyOn(controls, 'reserveRunControlDirectory').mockImplementation(async () => { reservations++; throw Error('TEST-late-effect-forbidden') }))
+  await expect(runOwners.launchExplicitOpenCodeV2Run(plan)).rejects.toThrow('execution_timeout:owner_start')
+  expect(reservations).toBe(0)
+}, 30000)

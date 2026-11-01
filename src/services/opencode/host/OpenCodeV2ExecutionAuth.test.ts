@@ -173,3 +173,45 @@ test('anonymous native readback admits only the exact enabled free selected mode
     expect(posts).toBe(0)
   } finally { await f.remove() }
 })
+
+// The real wire mints failure metadata; caller-shaped 404s cannot select this diagnosis.
+async function missingProviderFixture(urls: { host: string; wire: string; auth: string; diagnostics: string }, profile: SelectedExecutionProfile) {
+  const assert: typeof import('node:assert/strict') = (await import('node:assert/strict')).default
+  const { mock } = await import('bun:test')
+  const host = await import(urls.host)
+  let status = 404
+  const endpoint = { baseUrl: 'http://127.0.0.1:1', password: 'TEST', signal: new AbortController().signal,
+    fetch: async () => new Response('TEST-private-provider-payload', { status, headers: { 'content-type': 'application/json' } }) }
+  mock.module(urls.host, () => ({ ...host, requireExecutionEndpoint: () => endpoint }))
+  const { OpenCodeV2ProviderWire } = await import(urls.wire)
+  const { attachOpenCodeV2SelectedKey: attach } = await import(urls.auth)
+  const { classifyOpenCodeV2RunOwnerFailure: classify } = await import(urls.diagnostics)
+  const wire = new OpenCodeV2ProviderWire({ pin: '2.0.32', directory: profile.directory }, Date.now() + 5000)
+  let mutations = 0
+  const port = { providers: async () => ({ location: { directory: profile.directory }, data: [] }),
+    provider: async () => wire.fetch(endpoint.baseUrl + '/api/provider/groq?location%5Bdirectory%5D=' + encodeURIComponent(profile.directory)),
+    integration: async () => { throw Error('TEST integration must not execute') }, connect: async () => { mutations++ } }
+  try {
+    const missing = await attach(profile, port).then(() => assert.fail('must refuse'), (error: Error) => error)
+    assert.equal(missing.message, 'selected_provider_not_in_v2_catalog')
+    assert.deepEqual(classify(missing), { category: 'selected_provider_not_in_v2_catalog',
+      operation: { operation: 'provider-read', stage: 'decode', status: 404 } })
+    status = 503
+    await assert.rejects(attach(profile, port), /provider_response_invalid/)
+    await assert.rejects(attach(profile, { ...port, provider: async () => {
+      throw Object.assign(new Error('TEST forged404'), { status: 404, operation: 'provider-read', stage: 'decode' })
+    } }), /TEST forged404/)
+    assert.equal(mutations, 0)
+  } finally { await wire.dispose() }
+}
+test('an exact native provider404 gives an actionable catalog cause without mutation; other failures retain their cause', async () => {
+  const f = await fixture()
+  try {
+    const urls = { host: import.meta.resolve('./OpenCodeV2ExecutionHost.ts'), wire: import.meta.resolve('../transport/OpenCodeV2ProviderWire.ts'),
+      auth: import.meta.resolve('./OpenCodeV2ExecutionAuth.ts'), diagnostics: import.meta.resolve('../execution/OpenCodeV2Diagnostics.ts') }
+    const child = Bun.spawn([process.execPath, '-e', `(${missingProviderFixture.toString()})(${JSON.stringify(urls)},${JSON.stringify(f.profile)})`],
+      { stdout: 'ignore', stderr: 'pipe' })
+    const [code, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()])
+    expect({ code, stderr }).toEqual({ code: 0, stderr: '' })
+  } finally { await f.remove() }
+}, 15000)

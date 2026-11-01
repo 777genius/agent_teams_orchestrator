@@ -13,6 +13,7 @@ import { mkdir, mkdtemp, readFile, readdir, realpath, writeFile, access, lstat }
 import { constants } from 'node:fs'
 
 import { executionAssert, executionHash, executionRecord } from '../execution/OpenCodeV2ExecutionContracts.js'
+import { OPENCODE_V2_UNSUPPORTED_EXTENSION_PROVIDER_IDS } from '../catalog/OpenCodeV2KeyIntegrations.js'
 import { hashOpenCodeFile, inspectOpenCodeReadSelection } from '../compatibility/OpenCodeNativeIdentity.js'
 import { resolveClaudeMultimodelPaths } from '../OpenCodeManagedPaths.js'
 import { collectProjectBehaviorMetadata, canonicalizeOpenCodeProjectPath, materializeOpenCodeSelectedScopeAuth, resolveOpenCodeProfileScope, readOpenCodeSelectedScopeMetadata } from '../OpenCodeProfileManager.js'
@@ -75,6 +76,10 @@ export function createOpenCodeV2SupervisorEnvironment(source: NodeJS.ProcessEnv 
 }
 
 export type OpenCodeV2SourceReadBudget = { signal?: AbortSignal; deadlineMs?: number }
+function assertReadBudget(budget: OpenCodeV2SourceReadBudget) {
+  budget.signal?.throwIfAborted()
+  executionAssert(budget.deadlineMs === undefined || Date.now() < budget.deadlineMs, 'execution_timeout')
+}
 export async function inspectOpenCodeV2LaunchSelection(envelope: BridgeEnvelope, budget: OpenCodeV2SourceReadBudget = {}) {
   budget.signal?.throwIfAborted()
   assertExecutionPlatformAvailable()
@@ -86,7 +91,7 @@ export async function inspectOpenCodeV2LaunchSelection(envelope: BridgeEnvelope,
   const slash = selectedModel.indexOf('/')
   executionAssert(slash > 0 && slash < selectedModel.length - 1, 'run_selected_model_invalid')
   const model = { providerID: selectedModel.slice(0, slash), id: selectedModel.slice(slash + 1) }
-  executionAssert(!['kiro', 'cursor-acp'].includes(model.providerID), 'run_extension_provider_unsupported')
+  executionAssert(!OPENCODE_V2_UNSUPPORTED_EXTENSION_PROVIDER_IDS.includes(model.providerID), 'run_extension_provider_unsupported')
   executionAssert(envelope.body.skipPermissions !== false &&
     (envelope.body.toolApprovalMode === undefined || envelope.body.toolApprovalMode === 'auto'), 'run_manual_permission_unsupported')
   const project = await canonicalizeOpenCodeProjectPath(typeof envelope.body.projectPath === 'string' ? envelope.body.projectPath : envelope.cwd)
@@ -208,7 +213,8 @@ export async function createOpenCodeV2LaunchPlan(envelope: BridgeEnvelope): Prom
 
 /** Production constructor only: no caller body receipt, endpoint or mount hook. */
 export async function buildOpenCodeV2InternalRunPlan(selection: Awaited<ReturnType<typeof inspectOpenCodeV2LaunchSelection>>,
-  body: Record<string, unknown>, controllerInstanceId: string, probe?: { intent: import('../execution/OpenCodeV2AdmissionService.js').QueueIntent; expectedText: string; unattendedTeam?: boolean }): Promise<RunLaunchPlan> {
+  body: Record<string, unknown>, controllerInstanceId: string, probe?: { intent: import('../execution/OpenCodeV2AdmissionService.js').QueueIntent; expectedText: string; unattendedTeam?: boolean }, budget: OpenCodeV2SourceReadBudget = {}): Promise<RunLaunchPlan> {
+  assertReadBudget(budget)
   const prepared = selection as PreparedPlanSelection
   const consume = prepared[preparedPlanReceipt]
   // Remove before any asynchronous preparation so this authority is consumed once.
@@ -218,16 +224,18 @@ export async function buildOpenCodeV2InternalRunPlan(selection: Awaited<ReturnTy
   else {
     const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'run-owner', selectedDeliveries.get(selection)?.binding)
     selectedDeliveries.set(selection, delivery)
-    native = await createOpenCodeV2ExecutionReceipt(delivery.root, selection.native, selection.controller, delivery.binding)
+    native = await createOpenCodeV2ExecutionReceipt(delivery.root, selection.native, selection.controller, delivery.binding, budget.signal)
   }
-  return buildOpenCodeV2InternalRunPlanWithNative(selection, body, controllerInstanceId, native, probe)
+  assertReadBudget(budget)
+  return buildOpenCodeV2InternalRunPlanWithNative(selection, body, controllerInstanceId, native, probe, budget)
 }
 
 /** Reuse only the receipt constructed in this command's private preparation.
  * Caller DTOs and subsequent commands cannot supply or retain this receipt. */
 async function buildOpenCodeV2InternalRunPlanWithNative(selection: Awaited<ReturnType<typeof inspectOpenCodeV2LaunchSelection>>,
   body: Record<string, unknown>, controllerInstanceId: string, native: ValidatedExecutionNative,
-  probe?: { intent: import('../execution/OpenCodeV2AdmissionService.js').QueueIntent; expectedText: string; unattendedTeam?: boolean }): Promise<RunLaunchPlan> {
+  probe?: { intent: import('../execution/OpenCodeV2AdmissionService.js').QueueIntent; expectedText: string; unattendedTeam?: boolean }, budget: OpenCodeV2SourceReadBudget = {}): Promise<RunLaunchPlan> {
+  assertReadBudget(budget)
   const teamId = text(body.teamId ?? body.teamName), runId = text(body.runId), laneId = text(body.laneId)
   executionAssert(Array.isArray(body.members) && body.members.length > 0 && body.members.length <= 32, 'run_members_invalid')
   const rawMembers = body.members.map(executionRecord)
@@ -241,9 +249,11 @@ async function buildOpenCodeV2InternalRunPlanWithNative(selection: Awaited<Retur
   const members: RunMemberPlan[] = []
   let probePrepared: OpenCodePreparedProfile | undefined
   for (const member of rawMembers) {
+    assertReadBudget(budget)
     const memberId = text(member.name), sessionID = `ses_${randomUUID().replaceAll('-', '')}`
     const variant = typeof member.effort === 'string' ? member.effort : typeof body.effort === 'string' ? body.effort : undefined
-    const { profile, prepared } = await createOpenCodeV2PreparedMember(selection, native, profileParent, { teamId, runId, memberId, variant, unattendedTeam: probe ? probe.unattendedTeam === true : true, modelVerification: Boolean(probe && !probe.unattendedTeam) })
+    const { profile, prepared } = await createOpenCodeV2PreparedMember(selection, native, profileParent, { teamId, runId, memberId, variant, unattendedTeam: probe ? probe.unattendedTeam === true : true, modelVerification: Boolean(probe && !probe.unattendedTeam), signal: budget.signal })
+    assertReadBudget(budget)
     if (probe) probePrepared = prepared
     const prompt = typeof member.prompt === 'string' ? member.prompt : `Join OpenCode team ${teamId} as ${memberId}. Wait for app MCP task delivery.`
     const value = buildOpenCodeAppManagedBootstrapContextText({ teamName: typeof body.teamName === 'string' ? body.teamName : teamId,
@@ -258,6 +268,7 @@ async function buildOpenCodeV2InternalRunPlanWithNative(selection: Awaited<Retur
   const files: { path: string; sha256: string }[] = []
   const sourceFiles: string[] = []
   async function walk(directory: string): Promise<void> {
+    assertReadBudget(budget)
     for (const row of await readdir(directory, { withFileTypes: true })) {
       executionAssert(!row.isSymbolicLink(), 'run_source_symlink')
       const file = path.join(directory, row.name)
@@ -269,21 +280,25 @@ async function buildOpenCodeV2InternalRunPlanWithNative(selection: Awaited<Retur
     await walk(path.join(delivery.root, 'src'))
     // Match the installed-graph reader's bounded concurrency. Each source file
     // still receives the same stable-handle byte and identity verification.
-    for (let offset = 0; offset < sourceFiles.length; offset += 16)
+    for (let offset = 0; offset < sourceFiles.length; offset += 16) {
+      assertReadBudget(budget)
       files.push(...await Promise.all(sourceFiles.slice(offset, offset + 16)
-        .map(async file => ({ path: file, sha256: await hashOpenCodeFile(file) }))))
+        .map(async file => ({ path: file, sha256: await hashOpenCodeFile(file, budget.signal) }))))
+    }
   }
   else {
     // Bun emits self-contained JS entries. Official packages are independently graph-bound.
     const baseEntry = selectedDeliveries.get(selection)?.baseEntryPath
     executionAssert(baseEntry && await realpath(baseEntry) === baseEntry, 'run_source_incomplete')
-    files.push({ path: baseEntry, sha256: await hashOpenCodeFile(baseEntry) })
+    files.push({ path: baseEntry, sha256: await hashOpenCodeFile(baseEntry, budget.signal) })
     for (const name of ['opencodeV2RunOwner.js', 'opencodeV2ExecutionServer.js']) {
       const file = await realpath(path.join(delivery.root, name))
       executionAssert(path.dirname(file) === delivery.root, 'run_source_symlink')
-      files.push({ path: file, sha256: await hashOpenCodeFile(file) })
+      assertReadBudget(budget)
+      files.push({ path: file, sha256: await hashOpenCodeFile(file, budget.signal) })
     }
   }
+  assertReadBudget(budget)
   files.sort((a, b) => a.path.localeCompare(b.path))
   const entryPath = delivery.entryPath
   const env = createOpenCodeV2SupervisorEnvironment()
@@ -294,13 +309,14 @@ async function buildOpenCodeV2InternalRunPlanWithNative(selection: Awaited<Retur
     deadline: Date.now() + (probe ? 300_000 : 24 * 60 * 60 * 1000 - 1000), members,
     ...(probe && probePrepared ? { executionProbe: { memberId: 'probe', intent: probe.intent, expectedText: probe.expectedText,
       prepared: probePrepared, capabilitySnapshotId: selection.capabilitySnapshotId } } : {}),
-    source: { entryPath, entrySha256: await hashOpenCodeFile(entryPath), bunPath: native.bun.path,
+    source: { entryPath, entrySha256: await hashOpenCodeFile(entryPath, budget.signal), bunPath: native.bun.path,
       bunSha256: native.bun.sha256, files, env, ...(native.graph.delivery ? { delivery: native.graph.delivery } : {}) } }
 }
 async function hashText(value: string): Promise<string> { const { createHash } = await import('node:crypto'); return createHash('sha256').update(value).digest('hex') }
 
 export async function createOpenCodeV2PreparedMember(selection: Awaited<ReturnType<typeof inspectOpenCodeV2LaunchSelection>>,
-  native: ValidatedExecutionNative, profileParent: string, input: { teamId: string; runId: string; memberId: string; variant?: string; unattendedTeam?: boolean; modelVerification?: boolean }) {
+  native: ValidatedExecutionNative, profileParent: string, input: { teamId: string; runId: string; memberId: string; variant?: string; unattendedTeam?: boolean; modelVerification?: boolean; signal?: AbortSignal }) {
+  input.signal?.throwIfAborted()
   const { teamId, runId, memberId, variant } = input
     const prefix = `${executionHash({ teamId, runId, memberId }).slice(0, 16)}-`
     const root = await realpath(await mkdtemp(path.join(profileParent, prefix)))
@@ -321,8 +337,8 @@ export async function createOpenCodeV2PreparedMember(selection: Awaited<ReturnTy
     let managedAuthFingerprint: string
     {
       const provider = await materializeOpenCodeSelectedScopeAuth(selection.scope, selection.project, managedAuthPath,
-        selection.model.id, undefined, undefined)
-      managedAuthFingerprint = await hashOpenCodeFile(managedAuthPath)
+        selection.model.id, input.signal, undefined)
+      managedAuthFingerprint = await hashOpenCodeFile(managedAuthPath, input.signal)
       // An empty sealed store binds the normal proof without pretending the native
       // public marker is a credential. The host's read-only catalog guard must still
       // qualify this exact free model before admitting any native session.
@@ -341,9 +357,10 @@ export async function createOpenCodeV2PreparedMember(selection: Awaited<ReturnTy
     const profile: SelectedExecutionProfile = { epoch: randomUUID(), root, directory: selection.project,
       databasePath: path.join(nativeData, 'opencode.db'), ...(anonymous ? {} : { authSha256: managedAuthFingerprint }), env, envSha256: executionHash(env),
       config: { directory: configDirectory, content: config.content, sha256: config.sha256 }, selection: selected }
+  input.signal?.throwIfAborted()
   const metadata = await readOpenCodeSelectedScopeMetadata(selection.scope, selection.project)
   executionAssert(metadata.selectedAuthIdentity === selection.scope.selectedAuthIdentity &&
-    await hashOpenCodeFile(managedAuthPath) === managedAuthFingerprint, 'run_selected_auth_changed')
+    await hashOpenCodeFile(managedAuthPath, input.signal) === managedAuthFingerprint, 'run_selected_auth_changed')
   const prepared: OpenCodePreparedProfile = {
     projectPath: selection.project, canonicalProjectPath: selection.project, workingDirectoryPath: selection.project,
     scopeToken: selection.scope.scopeToken, profileRootKey: executionHash({ project: selection.project,
