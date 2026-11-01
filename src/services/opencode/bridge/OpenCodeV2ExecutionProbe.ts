@@ -9,7 +9,7 @@ import { normalizeOpenCodeProjectIdentity } from '../OpenCodeProjectIdentity.js'
 import { resolveClaudeMultimodelPaths } from '../OpenCodeManagedPaths.js'
 import { collectProjectBehaviorMetadata } from '../OpenCodeProfileManager.js'
 import { executionAssert, executionHash, executionRecord } from '../execution/OpenCodeV2ExecutionContracts.js'
-import { buildOpenCodeV2InternalRunPlan, type inspectOpenCodeV2SourceAvailability } from './OpenCodeV2LaunchPlan.js'
+import { buildOpenCodeV2InternalRunPlan, removeOpenCodeV2UnstartedPlanProfiles, type inspectOpenCodeV2SourceAvailability } from './OpenCodeV2LaunchPlan.js'
 import { launchExplicitOpenCodeV2Run, readOpenCodeV2RunNotStartedFailure } from './OpenCodeV2RunOwner.js'
 import { ensureOpenCodeV2ProbeStore } from './OpenCodeV2ProbeStore.js'
 import { writeOpenCodeV2StatusProofHint } from './OpenCodeV2StatusProofHint.js'
@@ -164,9 +164,10 @@ export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, 
   let release: (() => Promise<void>) | undefined
   const save = async (record: ProbeRecord, noOwnerSettlement = false) => {
     if (noOwnerSettlement) {
-      // A terminal no-owner fact may outlive observation, never custody or cancellation.
+      // The actual completed plan's no-input checkpoint and terminal fact may outlive observation.
       assertNotCancelled()
-      executionAssert(record.failure === 'native_owner_not_started' && record.retired && !record.submitted && !record.proof, 'probe_store_invalid')
+      executionAssert(!record.submitted && !record.proof && (record.failure === null && !record.retired ||
+        record.failure === 'native_owner_not_started' && record.retired), 'probe_store_invalid')
     } else assertDeadline()
     const recordBytes = Buffer.from(JSON.stringify(record), 'utf8')
     executionAssert(recordBytes.length > 0 && recordBytes.length < 131072, 'probe_store_invalid')
@@ -261,14 +262,15 @@ export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, 
         selectedModel: `${selection.model.providerID}/${selection.model.id}`, effort: variant,
         members: [{ name: 'probe', prompt: 'Execute the single selected-model readiness prompt. Do not call controller tools.' }] },
         randomUUID(), { intent, expectedText, unattendedTeam }, { signal: options.signal, deadlineMs: deadline }), deadline }
-      assertDeadline()
-      const member = plan.members[0]; executionAssert(member, 'probe_plan_invalid')
-      record = { sourceKey, binding: plan.binding, sessionID: member.originalSessionId, intent, submitted: false, proof: null, retired: false, failure: null,
-        ...(freshRequestId === undefined ? {} : { freshExecutionProofRequestId: freshRequestId }),
-        ...(automaticReplacementUsed ? { automaticReplacementUsed: true as const } : {}) }
       let launchEntered = false
       try {
-        await save(record) // Original identities precede launch and every prompt effect.
+        const member = plan.members[0]; executionAssert(member, 'probe_plan_invalid')
+        record = { sourceKey, binding: plan.binding, sessionID: member.originalSessionId, intent, submitted: false, proof: null, retired: false, failure: null,
+          ...(freshRequestId === undefined ? {} : { freshExecutionProofRequestId: freshRequestId }),
+          ...(automaticReplacementUsed ? { automaticReplacementUsed: true as const } : {}) }
+        // Pin the completed private plan before its post-build deadline check or any handoff.
+        await save(record, true)
+        assertDeadline()
         await options.onIntentPersisted?.({ sourceKey, binding: record.binding, sessionID: record.sessionID, intentHash: executionHash(record.intent) })
         phase('owner_start')
         assertDeadline()
@@ -276,9 +278,14 @@ export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, 
         await launchExplicitOpenCodeV2Run(plan)
       } catch (error) {
         const notStarted = readOpenCodeV2RunNotStartedFailure(error)
-        // Neither caller-shaped timeouts nor unknown/maybe-spawn failures prove no child.
-        if (!launchEntered && error instanceof Error && deadlineErrors.has(error) ||
-          notStarted?.bindingHash === executionHash(record.binding)) {
+        const brandedNoSpawn = notStarted?.bindingHash === executionHash(plan.binding)
+        if (!launchEntered || brandedNoSpawn) {
+          try { await removeOpenCodeV2UnstartedPlanProfiles(plan) }
+          catch (cleanup) { throw new AggregateError([error, cleanup], 'probe_physical_cleanup_unknown') }
+        }
+        // Root cleanup has broader pre-handoff authority than retry: only our own
+        // deadline or the matching launcher's positive no-spawn receipt permits retirement.
+        if (record && (!launchEntered && error instanceof Error && deadlineErrors.has(error) || brandedNoSpawn)) {
           executionAssert(!record.submitted && !record.proof && !record.failure && !record.retired, 'probe_store_invalid')
           record.failure = 'native_owner_not_started'; record.retired = true
           await save(record, true)

@@ -13,7 +13,7 @@ import { resolveOpenCodeBinaryHostIdentity } from '../OpenCodeHostIdentity.js'
 import { openCodeV2ReadinessDeadline, resolveOpenCodeV2ExecutionProbe, type OpenCodeV2ProbePhase } from './OpenCodeV2ExecutionProbe.js'
 import { parseOpenCodeBridgePreconditions, validateOpenCodeBridgeStateChangingPreconditions } from '../OpenCodeBridgePreconditions.js'
 import type { RunQualification } from './OpenCodeV2RunTypes.js'
-import { createOpenCodeV2LaunchPlan, inspectOpenCodeV2SourceAvailability } from './OpenCodeV2LaunchPlan.js'
+import { createOpenCodeV2LaunchPlan, inspectOpenCodeV2SourceAvailability, removeOpenCodeV2UnstartedPlanProfiles } from './OpenCodeV2LaunchPlan.js'
 import { createBridgeServerIdentity } from '../OpenCodeBridgeCommandHandler.js'
 import { SUPPORTED_COMMANDS } from './OpenCodeBridgeProtocol.js'
 import { createHash } from 'node:crypto'
@@ -27,7 +27,7 @@ import { parseOpenCodeStopRequest, type OpenCodeStopData } from '../OpenCodeStop
 import { openCodeDeliveryJournalRecoveryData, commandStatusFromOutcomeStatus, isAcceptedOutcomeStatus, commandStatusMismatchReason, outcomeSendMessageDataToCommandData, type SendMessageOutcomeBase, type SendMessageCommandData } from './OpenCodeBridgeDeliveryJournal.js'
 import { OpenCodeV2DeliveryJournal } from './OpenCodeV2DeliveryJournal.js'
 import { discoverOpenCodeV2Run, requestOpenCodeV2Run, isTransientOpenCodeV2ControlRead, OPEN_CODE_V2_RUN_INITIALIZATION_MS } from './OpenCodeV2RunControl.js'
-import { launchExplicitOpenCodeV2Run } from './OpenCodeV2RunOwner.js'
+import { launchExplicitOpenCodeV2Run, readOpenCodeV2RunNotStartedFailure } from './OpenCodeV2RunOwner.js'
 import type { RunBinding, RunControlRecord, RunControlRequest, RunControlResult, RunLaunchPlan } from './OpenCodeV2RunTypes.js'
 import type { OpenCodeV2TurnProjection } from './OpenCodeV2TurnProjection.js'
 import { normalizeV2Transcript } from './OpenCodeV2TranscriptProjection.js'
@@ -64,11 +64,19 @@ export class OpenCodeV2TeamBridge {
   async discover(): Promise<RunControlRecord | null> {
     return this.ports.discover(this.dataRoot, this.binding.teamId, this.binding.runId)
   }
-  async launchExplicit(plan: RunLaunchPlan): Promise<RunControlRecord> {
-    executionAssert(plan.dataRoot === this.dataRoot && plan.binding.teamId === this.binding.teamId &&
-      plan.binding.runId === this.binding.runId, 'run_binding_conflict')
-    executionAssert(await this.discover() === null, 'run_already_owned')
-    return this.ports.launch(plan)
+  async launchExplicit(plan: RunLaunchPlan, cleanupUnstarted?: () => Promise<void>): Promise<RunControlRecord> {
+    let launchEntered = false
+    try {
+      executionAssert(plan.dataRoot === this.dataRoot && plan.binding.teamId === this.binding.teamId &&
+        plan.binding.runId === this.binding.runId, 'run_binding_conflict')
+      executionAssert(await this.discover() === null, 'run_already_owned')
+      launchEntered = true
+      return await this.ports.launch(plan)
+    } catch (error) {
+      if (cleanupUnstarted && (!launchEntered || readOpenCodeV2RunNotStartedFailure(error)?.bindingHash === executionHash(plan.binding)))
+        await cleanupUnstarted()
+      throw error
+    }
   }
   /** Endpoint publication enables cancellation; a launch response waits for the
    * same original members without another acquisition or model input. */
@@ -305,7 +313,7 @@ async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: O
       const plan = await createOpenCodeV2LaunchPlan(envelope)
       measured = plan.qualification
       acceptedIdempotencyKey = parseOpenCodeBridgePreconditions(body.preconditions)?.idempotencyKey
-      const record = await bridge.launchExplicit(plan)
+      const record = await bridge.launchExplicit(plan, () => removeOpenCodeV2UnstartedPlanProfiles(plan))
       const status = await bridge.awaitLaunchReady(record, plan, Math.min(record.deadline,
         started + (envelope.timeoutMs || OPEN_CODE_V2_RUN_INITIALIZATION_MS), Date.now() + OPEN_CODE_V2_RUN_INITIALIZATION_MS))
       return respond(envelope, started, { ...projectV2TeamStatus(status, plan.binding.runId), expectedBehaviorFingerprint: measured?.expectedBehaviorFingerprint }, pin)

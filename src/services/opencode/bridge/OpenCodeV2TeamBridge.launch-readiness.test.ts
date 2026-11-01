@@ -27,7 +27,8 @@ test('launch waits for original native members under one deadline before returni
     mock.module(${JSON.stringify(plans)}, () => ({ createOpenCodeV2LaunchPlan: async () => {
       clock += 20; return { binding, members, deadline: owner.deadline, qualification }
     }, inspectOpenCodeV2SourceAvailability: async () => { throw Error('TEST source requalification forbidden') },
-      buildOpenCodeV2InternalRunPlan: async () => { throw Error('TEST probe launch forbidden') } }))
+      buildOpenCodeV2InternalRunPlan: async () => { throw Error('TEST probe launch forbidden') },
+      removeOpenCodeV2UnstartedPlanProfiles: async () => { throw Error('TEST cleanup after launch forbidden') } }))
     const controlModule = await import(${JSON.stringify(control)})
     mock.module(${JSON.stringify(control)}, () => ({ ...controlModule,
       awaitOpenCodeV2RunMemberReadiness: async () => { throw Error('TEST obsolete member-wait path forbidden') },

@@ -326,11 +326,18 @@ async function buildOpenCodeV2InternalRunPlanWithNative(selection: Awaited<Retur
 async function hashText(value: string): Promise<string> { const { createHash } = await import('node:crypto'); return createHash('sha256').update(value).digest('hex') }
 
 /** These roots were created by this preparation and have not been handed to an owner. */
-async function cleanupPreparedProfileRoots(roots: readonly string[], original: unknown): Promise<never> {
+async function removePreparedProfileRoots(roots: readonly string[], original?: unknown): Promise<void> {
   const removed = await Promise.allSettled(roots.map(root => rm(root, { recursive: true, force: true })))
   const failed = removed.filter((item): item is PromiseRejectedResult => item.status === 'rejected')
   if (failed.length) throw new AggregateError([original, ...failed.map(item => item.reason)], 'run_profile_cleanup_unknown')
+}
+async function cleanupPreparedProfileRoots(roots: readonly string[], original: unknown): Promise<never> {
+  await removePreparedProfileRoots(roots, original)
   throw original
+}
+/** Internal producers call this only after proving their factory-built plan was never started. */
+export function removeOpenCodeV2UnstartedPlanProfiles(plan: RunLaunchPlan): Promise<void> {
+  return removePreparedProfileRoots(plan.members.map(member => member.profile.root))
 }
 
 export async function createOpenCodeV2PreparedMember(selection: Awaited<ReturnType<typeof inspectOpenCodeV2LaunchSelection>>,

@@ -1,4 +1,5 @@
 import { expect, spyOn, test } from 'bun:test'
+import { launchExplicitOpenCodeV2Run } from './OpenCodeV2RunOwner.js'
 import { OpenCodeV2TeamBridge, type OpenCodeV2RunControlPorts } from './OpenCodeV2TeamBridge.js'
 import type { RunControlRecord, RunControlResult, RunLaunchPlan, RunMemberStatus } from './OpenCodeV2RunTypes.js'
 
@@ -280,3 +281,28 @@ test('public readiness shares one deadline across discovery, selection, preparat
   const [code, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()])
   expect({ code, stderr }).toEqual({ code: 0, stderr: '' })
 }, 15000)
+
+
+test('team launch invokes producer cleanup only before handoff or with a matching no-spawn receipt', async () => {
+  const f = fixture()
+  let cleanups = 0
+  const cleanup = async () => { cleanups++ }
+  await f.bridge.launchExplicit(f.plan, cleanup)
+  expect(cleanups).toBe(0) // A successful launch hands ownership to its original owner.
+  const unusedPlan = { ...f.plan, members: f.plan.members.map(member => ({ ...member,
+    profile: { ...member.profile, root: member.profile.root + '-unused' } })) }
+  await expect(f.bridge.launchExplicit(unusedPlan, cleanup)).rejects.toThrow('run_already_owned')
+  expect(cleanups).toBe(1)
+  for (const branded of [false, true]) {
+    cleanups = 0
+    const bridge = new OpenCodeV2TeamBridge(f.plan.dataRoot, f.plan.binding, {
+      discover: async () => null, request: async () => f.active,
+      launch: async plan => {
+        if (branded) return launchExplicitOpenCodeV2Run({ ...plan, deadline: Date.now() - 1 })
+        throw Error('execution_timeout:owner_start')
+      },
+    })
+    await expect(bridge.launchExplicit(f.plan, cleanup)).rejects.toThrow('execution_timeout:owner_start')
+    expect(cleanups).toBe(branded ? 1 : 0)
+  }
+})
