@@ -11,6 +11,7 @@ import { launchNativeCustody, recoverNativeCustody, nativeCustodyForEndpoint, bi
 import { OpenCodeHostManager } from '../OpenCodeHostManager.js'
 import type { OpenCodePreparedProfile } from '../types.js'
 import { fetchNativeOpenCode } from './OpenCodeNativeRequestLease.js'
+import { qualifyNativeColdRecovery } from './OpenCodeNativeColdRecovery.js'
 import { nativeAuthorityPath, readNativeAuthority } from './OpenCodeNativeAuthority.js'
 
 // Required in the physical Linux qualification lane. Mac/Windows cannot count
@@ -18,6 +19,8 @@ import { nativeAuthorityPath, readNativeAuthority } from './OpenCodeNativeAuthor
 describe.skipIf(process.platform !== 'linux')('physical Linux native custody', () => {
   let root: string, profile: string, helper: string, original: string, replacement: string, helperSha: string
   let preserve = false
+  const coldPending = new Set<object>()
+  const coldRetiredImages: string[] = []
   const vendors = new Map<string, string>()
   const active = new Set<NativeCustody>()
   const epochs = new Set<NativeCustody>()
@@ -78,6 +81,8 @@ describe.skipIf(process.platform !== 'linux')('physical Linux native custody', (
       size: (await readFile(helper)).length, sha256: helperSha }), { mode: 0o600 })
   }, 60000)
   afterAll(async () => {
+    // Independent of child receipts/epochs: outer timeouts cannot bypass this.
+    if (coldPending.size) preserve = true
     for (const custody of active) {
       try { await custody.stopExact(); active.delete(custody) }
       catch { preserve = true }
@@ -91,7 +96,10 @@ describe.skipIf(process.platform !== 'linux')('physical Linux native custody', (
         }
         await chmod(custody.reference.images.root, 0o700)
       }
-      if (!preserve) await rm(root, { recursive: true, force: true })
+      if (!preserve) {
+        for (const imageRoot of coldRetiredImages) await chmod(imageRoot, 0o700)
+        await rm(root, { recursive: true, force: true })
+      }
     }
     if (preserve) throw new Error(`Native fixture closure is uncertain; owned TEST files preserved at ${root}`)
   }, 30000)
@@ -335,4 +343,31 @@ describe.skipIf(process.platform !== 'linux')('physical Linux native custody', (
     expect(await listening()).toBe(false)
     expect(await new OpenCodeClientFactory().create(sentinel.reference.baseUrl, undefined, bindNativeRequestOwner({}, sentinel)).getConfig()).toMatchObject({ marker: 'A' })
   }, 20000)
+  for (const version of ['1.16.0', '1.18.34'] as const) {
+    test.skipIf(!process.env.OPENCODE_NATIVE_CUSTODY_TEST_VENDORS)(`real pinned V1 ${version} survives JS controller exit and cold OS controller recovery`, async () => {
+      if (coldPending.size) throw new Error('Prior cold attempt remains unknown; no subsequent cold attempt is allowed')
+      const binary = vendors.get(version)
+      const evidenceRoot = process.env.OPENCODE_NATIVE_CUSTODY_EVIDENCE_DIR
+      const sourceSha = process.env.OPENCODE_NATIVE_CUSTODY_SOURCE_SHA
+      if (!binary || !evidenceRoot || !sourceSha) throw new Error('Cold native qualification requires verified vendor and durable evidence root/source binding')
+      const attempt = {} // A late completion cannot clear another attempt.
+      coldPending.add(attempt)
+      const parentObservation = new AbortController()
+      let timeout: ReturnType<typeof setTimeout> | undefined
+      try {
+        const closed = await Promise.race([
+          qualifyNativeColdRecovery({ root, evidenceRoot, binary, helper, version, sourceSha, parentSignal: parentObservation.signal }),
+          new Promise<never>((_, reject) => { timeout = setTimeout(() => {
+            const error = new Error('Cold parent observation expired; preserve pending attempt')
+            parentObservation.abort(error)
+            reject(error)
+          }, 130000) }),
+        ])
+        // If the deadline won, a late underlying completion cannot reach here.
+        coldRetiredImages.push(closed.retiredImageRoot)
+        coldPending.delete(attempt)
+      } catch (error) { parentObservation.abort(error); preserve = true; throw error }
+      finally { clearTimeout(timeout) }
+    }, 150000)
+  }
 })

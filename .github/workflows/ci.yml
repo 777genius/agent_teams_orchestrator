@@ -798,7 +798,7 @@ jobs:
           fixture="$RUNNER_TEMP/TEST-opencode-native-custody"
           [[ ! -e "$fixture" && ! -L "$fixture" ]]
           mkdir -m 700 "$fixture"
-          mkdir -p "$fixture/delivery" "$fixture/home" "$fixture/config" "$fixture/data" "$fixture/cache" "$fixture/tmp" "$fixture/vendors"
+          mkdir -p "$fixture/delivery" "$fixture/home" "$fixture/config" "$fixture/data" "$fixture/cache" "$fixture/tmp" "$fixture/vendors" "$fixture/evidence"
           chmod 700 "$fixture/vendors"
           tar -xzf .task-inputs/native-custody-candidate/candidate-linux-x64.tar.gz -C "$fixture/delivery" \
             ./runtime/native/opencode-custody/linux-x64/custodian ./runtime/native/opencode-custody/linux-x64/custodian.json \
@@ -815,6 +815,8 @@ jobs:
             XDG_CONFIG_HOME="$fixture/config" XDG_DATA_HOME="$fixture/data" XDG_CACHE_HOME="$fixture/cache" \
             OPENCODE_NATIVE_CUSTODY_TEST_HELPER="$fixture/delivery/runtime/native/opencode-custody/linux-x64/custodian" \
             OPENCODE_NATIVE_CUSTODY_TEST_VENDORS="$fixture/vendors/vendors.json" \
+            OPENCODE_NATIVE_CUSTODY_EVIDENCE_DIR="$fixture/evidence" \
+            OPENCODE_NATIVE_CUSTODY_SOURCE_SHA="${{ github.event.pull_request.head.sha || github.sha }}" \
             "$custody_bun" --no-env-file test src/services/opencode/native/OpenCodeNativeCustody.native.test.ts --timeout 30000 2>&1 | tee -a native-custody-test.log
       - name: Preserve nonsecret native qualification log
         if: always()
@@ -823,6 +825,7 @@ jobs:
           name: opencode-native-custody-linux-x64-${{ github.event.pull_request.head.sha || github.sha }}
           path: |
             native-custody-test.log
+            ${{ runner.temp }}/TEST-opencode-native-custody/evidence/**/*.json*
             ${{ runner.temp }}/TEST-opencode-native-custody/vendors/acquisition.json
             ${{ runner.temp }}/TEST-opencode-native-custody/delivery/runtime/linux-elf-abi.txt
           if-no-files-found: warn
