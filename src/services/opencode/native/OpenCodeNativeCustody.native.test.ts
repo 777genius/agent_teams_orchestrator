@@ -11,6 +11,7 @@ import { launchNativeCustody, recoverNativeCustody, nativeCustodyForEndpoint, bi
 import { OpenCodeHostManager } from '../OpenCodeHostManager.js'
 import type { OpenCodePreparedProfile } from '../types.js'
 import { fetchNativeOpenCode } from './OpenCodeNativeRequestLease.js'
+import { failureDiagnostic } from './fixtures/OpenCodeNativeColdController.js'
 import { qualifyNativeColdRecovery } from './OpenCodeNativeColdRecovery.js'
 import { nativeAuthorityPath, readNativeAuthority } from './OpenCodeNativeAuthority.js'
 
@@ -264,19 +265,39 @@ describe.skipIf(process.platform !== 'linux')('physical Linux native custody', (
     }, 60000)
   }
   test('retains the actual image across same-path replacement/unlink, recovers and stops only that child', async () => {
-    const source = path.join(root, 'same-path-opencode')
-    await copyFile(original, source)
-    const custody = await start('same-path', source), sentinel = await start('unrelated-sentinel')
-    const client = new OpenCodeClientFactory().create(custody.reference.baseUrl, undefined, bindNativeRequestOwner({}, custody))
-    expect(await client.getConfig()).toMatchObject({ marker: 'A' })
-    const staging = `${source}.replacement`; await copyFile(replacement, staging); await rename(staging, source); await unlink(source)
-    const recovered = await recoverNativeCustody(profile, 'same-path', custody.reference.baseUrl)
-    expect(recovered.reference.nativePid).toBe(custody.reference.nativePid)
-    expect(recovered.reference.nativeBirth).toBe(custody.reference.nativeBirth)
-    expect(await new OpenCodeClientFactory().create(recovered.reference.baseUrl, undefined, bindNativeRequestOwner({}, recovered)).getConfig()).toMatchObject({ marker: 'A' })
-    await recovered.stopExact(); active.delete(custody)
-    expect((await readNativeAuthority(nativeAuthorityPath(profile, 'same-path'))).phase).toBe('dead')
-    expect(await new OpenCodeClientFactory().create(sentinel.reference.baseUrl, undefined, bindNativeRequestOwner({}, sentinel)).getConfig()).toMatchObject({ marker: 'A' })
+    let subphase: 'copy-installer' | 'primary-launch' | 'sentinel-launch' | 'initial-read' | 'replace-installer' |
+      'unlink-installer' | 'recover' | 'recovered-read' | 'stop' | 'dead-receipt' | 'sentinel-read' = 'copy-installer'
+    try {
+      const source = path.join(root, 'same-path-opencode')
+      await copyFile(original, source)
+      subphase = 'primary-launch'
+      const custody = await start('same-path', source)
+      subphase = 'sentinel-launch'
+      const sentinel = await start('unrelated-sentinel')
+      const client = new OpenCodeClientFactory().create(custody.reference.baseUrl, undefined, bindNativeRequestOwner({}, custody))
+      subphase = 'initial-read'
+      expect(await client.getConfig()).toMatchObject({ marker: 'A' })
+      subphase = 'replace-installer'
+      const staging = `${source}.replacement`; await copyFile(replacement, staging); await rename(staging, source)
+      subphase = 'unlink-installer'
+      await unlink(source)
+      subphase = 'recover'
+      const recovered = await recoverNativeCustody(profile, 'same-path', custody.reference.baseUrl)
+      expect(recovered.reference.nativePid).toBe(custody.reference.nativePid)
+      expect(recovered.reference.nativeBirth).toBe(custody.reference.nativeBirth)
+      subphase = 'recovered-read'
+      expect(await new OpenCodeClientFactory().create(recovered.reference.baseUrl, undefined, bindNativeRequestOwner({}, recovered)).getConfig()).toMatchObject({ marker: 'A' })
+      subphase = 'stop'
+      await recovered.stopExact(); active.delete(custody)
+      subphase = 'dead-receipt'
+      expect((await readNativeAuthority(nativeAuthorityPath(profile, 'same-path'))).phase).toBe('dead')
+      subphase = 'sentinel-read'
+      expect(await new OpenCodeClientFactory().create(sentinel.reference.baseUrl, undefined, bindNativeRequestOwner({}, sentinel)).getConfig()).toMatchObject({ marker: 'A' })
+    } catch (error) {
+      console.error('TEST_NATIVE_SAME_PATH_FAILURE', JSON.stringify({ protocol: 1, subphase,
+        failure: failureDiagnostic('native-same-path', error) }))
+      throw error
+    }
   }, 20000)
   test('native config ingress denies unauthenticated access while the production request path remains authorized', async () => {
     const custody = await start('native-ingress-privacy')

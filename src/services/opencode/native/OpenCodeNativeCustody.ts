@@ -91,38 +91,71 @@ function frame(fields: string[]): Buffer {
   const body = Buffer.concat(chunks); fact(body.length > 0 && body.length <= 256000)
   const length = Buffer.alloc(4); length.writeUInt32BE(body.length); return Buffer.concat([length, body])
 }
-function frames(child: ChildProcess): { next(): Promise<Record<string, unknown>>; assertOpen(): void } {
+type HelperWaitPhase = 'unspecified' | 'hello' | 'measure-terminal' | 'launch-started' | 'control-inspect' | 'control-peer' | 'control-stop'
+type HelperTrigger = 'none' | 'invalid-frame' | 'child-error' | 'child-close' | 'stdout-end' | 'stdout-error' | 'stdin-error' | 'timeout'
+/** Diagnostic facts from the original handle only. Never used as admission or death authority. */
+type HelperDiagnostic = {
+  waitPhase: HelperWaitPhase; trigger: HelperTrigger; exitObserved: boolean; closeObserved: boolean
+  exitCode: number | null; signal: string | null; bufferedBytes: number; queuedFrames: number; waitingReplies: number; bufferedAtTrigger: number; waitingAtTrigger: number
+}
+const helperDiagnostics = new WeakMap<object, () => HelperDiagnostic>()
+export function nativeHelperFailureDiagnostic(error: unknown): HelperDiagnostic | undefined {
+  // WeakMap identity avoids invoking error getters/toJSON or accepting caller data.
+  return error !== null && typeof error === 'object' ? helperDiagnostics.get(error)?.() : undefined
+}
+function frames(child: ChildProcess): { next(phase?: HelperWaitPhase): Promise<Record<string, unknown>>; assertOpen(): void } {
   let data = Buffer.alloc(0), failure: Error | undefined, ended = false
+  let waitPhase: HelperWaitPhase = 'unspecified', trigger: HelperTrigger = 'none', bufferedAtTrigger = 0, waitingAtTrigger = 0
+  let exitObserved = false, closeObserved = false, exitCode: number | null = null, signal: string | null = null
   const queue: Array<Record<string, unknown>> = [], waiting: Array<{ resolve(value: Record<string, unknown>): void; reject(reason: unknown): void }> = []
-  const refuse = () => { failure = new Error('native_custody_protocol'); for (const waiter of waiting.splice(0)) waiter.reject(failure) }
-  const finish = () => {
-    ended = true
-    if (data.length) { refuse(); return }
-    for (const waiter of waiting.splice(0)) waiter.reject(new Error('native_custody_protocol'))
+  const diagnostic = (): HelperDiagnostic => ({ waitPhase, trigger, exitObserved, closeObserved, exitCode, signal,
+    bufferedBytes: Math.min(data.length, 32769), queuedFrames: Math.min(queue.length, 32769), waitingReplies: Math.min(waiting.length, 32769), bufferedAtTrigger, waitingAtTrigger })
+  const problem = (code: 'native_custody_protocol' | 'native_custody_timeout' | 'native_custody_unavailable') => {
+    const error = new Error(code); helperDiagnostics.set(error, diagnostic); return error
   }
+  const mark = (cause: HelperTrigger) => { if (trigger === 'none') {
+    trigger = cause; bufferedAtTrigger = Math.min(data.length, 32769); waitingAtTrigger = Math.min(waiting.length, 32769)
+  } }
+  const refuse = (cause: HelperTrigger) => {
+    mark(cause); failure = problem('native_custody_protocol'); for (const waiter of waiting.splice(0)) waiter.reject(failure)
+  }
+  const finish = (cause: 'child-close' | 'stdout-end') => {
+    mark(cause); ended = true
+    if (data.length) { refuse(cause); return }
+    for (const waiter of waiting.splice(0)) waiter.reject(problem('native_custody_protocol'))
+  }
+  child.once('exit', (code, observedSignal) => {
+    exitObserved = true; exitCode = Number.isSafeInteger(code) ? code : null
+    // Node supplies a signal enum; retain only a fixed finite set, never arbitrary text.
+    signal = observedSignal === null ? null : ['SIGABRT', 'SIGALRM', 'SIGBUS', 'SIGFPE', 'SIGHUP', 'SIGILL', 'SIGINT',
+      'SIGKILL', 'SIGPIPE', 'SIGQUIT', 'SIGSEGV', 'SIGTERM', 'SIGTRAP', 'SIGUSR1', 'SIGUSR2', 'SIGXCPU', 'SIGXFSZ']
+      .includes(observedSignal) ? observedSignal : 'other'
+  })
   child.stdout!.on('data', (chunk: Buffer) => {
     if (failure || ended) return
-    data = Buffer.concat([data, chunk]); if (data.length > 32768) { refuse(); return }
+    data = Buffer.concat([data, chunk]); if (data.length > 32768) { refuse('invalid-frame'); return }
     while (data.length >= 4) {
-      const size = data.readUInt32BE(); if (!size || size > 16384) { refuse(); return }
+      const size = data.readUInt32BE(); if (!size || size > 16384) { refuse('invalid-frame'); return }
       if (data.length < 4 + size) break
       try {
         const value = record(JSON.parse(data.subarray(4, size + 4).toString('utf8')))
         fact(value.protocol === 1); data = data.subarray(size + 4)
         const waiter = waiting.shift(); if (waiter) waiter.resolve(value); else queue.push(value)
-      } catch { refuse(); return }
+      } catch { refuse('invalid-frame'); return }
     }
   })
-  child.once('error', refuse); child.once('close', finish)
-  child.stdout!.once('end', finish); child.stdout!.once('error', refuse)
-  child.stdin!.on('error', refuse)
-  return { assertOpen: () => { if (failure) throw failure; fact(!ended) }, next: async () => {
+  child.once('error', () => refuse('child-error'))
+  child.once('close', () => { closeObserved = true; finish('child-close') })
+  child.stdout!.once('end', () => finish('stdout-end')); child.stdout!.once('error', () => refuse('stdout-error'))
+  child.stdin!.on('error', () => refuse('stdin-error'))
+  return { assertOpen: () => { if (failure) throw failure; if (ended) throw problem('native_custody_unavailable') }, next: async (phase = 'unspecified') => {
+    waitPhase = phase
     if (failure) throw failure
     if (queue.length) return queue.shift()!
-    if (ended) throw new Error('native_custody_protocol')
+    if (ended) throw problem('native_custody_protocol')
     return new Promise((resolve, reject) => {
       const pending = { resolve, reject }; waiting.push(pending)
-      const timer = setTimeout(() => { const index = waiting.indexOf(pending); if (index >= 0) waiting.splice(index, 1); reject(new Error('native_custody_timeout')) }, 10000)
+      const timer = setTimeout(() => { const index = waiting.indexOf(pending); if (index >= 0) waiting.splice(index, 1); mark('timeout'); reject(problem('native_custody_timeout')) }, 10000)
       pending.resolve = value => { clearTimeout(timer); resolve(value) }
       pending.reject = error => { clearTimeout(timer); reject(error) }
     })
@@ -190,7 +223,7 @@ async function openHelper(images: NativeEpochImages, launch = false, measure = f
   const { stream, closeUnadmitted, assertLive } = observation
   try {
     fact(!receiptCloseFailed)
-    const hello = await stream.next()
+    const hello = await stream.next('hello')
     fact(child.pid && hello.pid === child.pid && decimal(hello.birth) && hello.dev === images.helperIdentity.dev &&
       hello.ino === images.helperIdentity.ino && typeof hello.bootId === 'string')
     const loaded = await lstat(`/proc/${child.pid}/exe`).then(async () => {
@@ -226,7 +259,7 @@ async function measurePrivateImage(images: NativeEpochImages, minimum: '1.16.0' 
     const packet = frame(['measure', images.epoch, images.image, images.probeRoot, 'ephemeral',
       images.imageIdentity.dev, images.imageIdentity.ino, '2', images.image, '--version', String(env.length), ...env])
     signal?.throwIfAborted(); probe.assertLive(); lifetime.created(); packetSent = true; probe.child.stdin!.end(packet)
-    const terminal = await probe.stream.next()
+    const terminal = await probe.stream.next('measure-terminal')
     fact(terminal.closed === true); lifetime.closed()
     fact(terminal.status === 0)
     await ended
@@ -264,7 +297,7 @@ async function control(reference: NativeCustodyReference, action: 'inspect' | 'p
     }
     const packet = frame(fields)
     operation.assertLive(); packetSent = true; operation.child.stdin!.end(packet)
-    const response = await operation.stream.next()
+    const response = await operation.stream.next(`control-${action}`)
     fact(response.epoch === reference.epoch && response.nonce === nonce && response.pid === reference.nativePid &&
       response.birth === reference.nativeBirth && response.ok === true)
   } catch (error) {
@@ -361,7 +394,7 @@ export async function launchNativeCustody(input: {
       String(args.length), ...args, String(env.length), ...env])
     input.signal?.throwIfAborted(); operation.assertLive(); creationSent = true
     operation.child.stdin!.write(packet)
-    const started = await operation.stream.next()
+    const started = await operation.stream.next('launch-started')
     fact(Number.isSafeInteger(started.pid) && Number(started.pid) > 0 && decimal(started.birth) &&
       started.custodianPid === operation.child.pid && started.custodianBirth === operation.hello.birth)
     const reference: NativeCustodyReference = Object.freeze({ schemaVersion: 1, platform: 'linux', epoch: images.epoch,

@@ -1,5 +1,6 @@
 /* eslint-disable custom-rules/no-process-exit -- Finite TEST controller exits only after durable evidence; never signals the native host. */
-import { constants } from 'node:fs'
+import { constants, writeSync } from 'node:fs'
+import { coldFailureCodes, coldErrnoCodes, coldProgressPrefix, type ColdProgress, type ColdProgressPhase } from '../OpenCodeNativeColdDiagnostics.js'
 import { link, lstat, open, unlink } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
 import { createServer } from 'node:http'
@@ -7,7 +8,7 @@ import path from 'node:path'
 import { OpenCodeHostManager } from '../../OpenCodeHostManager.js'
 import { OpenCodeClientFactory } from '../../OpenCodeClientFactory.js'
 import type { OpenCodePreparedProfile } from '../../types.js'
-import { nativeCustodyForRequest, type NativeCustodyReference } from '../OpenCodeNativeCustody.js'
+import { nativeCustodyForRequest, nativeHelperFailureDiagnostic, type NativeCustodyReference } from '../OpenCodeNativeCustody.js'
 import { nativeAuthorityPath, nativeExitConfirmed, readNativeAuthority } from '../OpenCodeNativeAuthority.js'
 
 export type ColdInput = {
@@ -22,9 +23,16 @@ export type ReadyReceipt = { schemaVersion: 1; caseId: string; controllerPid: nu
 type ColdFailurePhase = 'source-binding' | 'sentinel-start' | 'sentinel-before' | 'A-exit' | 'A-validate' |
   'B-exit' | 'B-validate' | 'closure' | 'controller-input' | 'controller-public-receipt' |
   'controller-admission' | 'controller-config' | 'controller-session-create' | 'controller-ready-receipt' |
-  'controller-session-read' | 'controller-stop' | 'controller-receipt' | 'sentinel-close'
+  'controller-session-read' | 'controller-stop' | 'controller-receipt' | 'sentinel-close' | 'native-same-path'
+function progress(input: ColdInput, role: ColdProgress['role'], phase: ColdProgressPhase, error?: unknown): void {
+  // One small synchronous write distinguishes evidence fsync tail from JS exit.
+  // Failure to write telemetry cannot alter the custody/test outcome.
+  const diagnostic = error === undefined ? { errorClass: 'none', code: 'none' } : failureDiagnostic(controllerPhase, error)
+  try { writeSync(2, `${coldProgressPrefix}${JSON.stringify({ protocol: 1, caseId: input.caseId, role, phase,
+    errorClass: diagnostic.errorClass, code: diagnostic.code })}\n`) } catch { /* Diagnostic only. */ }
+}
 let controllerPhase: ColdFailurePhase = 'controller-input'
-function failureDiagnostic(phase: ColdFailurePhase, error: unknown): { phase: ColdFailurePhase; errorClass: string; code: string } {
+export function failureDiagnostic(phase: ColdFailurePhase, error: unknown): { phase: ColdFailurePhase; errorClass: string; code: string; nativeHelper?: ReturnType<typeof nativeHelperFailureDiagnostic> } {
   let errorClass = 'other', code = 'other'
   // Inspect descriptors only: neither code/message getters nor custom error
   // serialization may expose a path, configuration, provider output or token.
@@ -39,23 +47,18 @@ function failureDiagnostic(phase: ColdFailurePhase, error: unknown): { phase: Co
         const descriptor = Object.getOwnPropertyDescriptor(error, key)
         return descriptor && 'value' in descriptor ? descriptor.value : undefined
       }
-      const fixedCodes = new Set(['TEST_cold_contract', 'TEST_cold_publication_incomplete',
-        'TEST_cold_observation_timeout', 'TEST_cold_receipt_timeout', 'native_custody_unavailable',
-        'native_custody_cancelled', 'native_custody_reconnect_refused', 'native_custody_response_failed',
-        'native_custody_protocol', 'native_custody_timeout', 'native_custody_receipt_close_failed',
-        'native_custody_asset_unavailable', 'native_custody_authority_unknown', 'native_custody_image_mismatch'])
       const ownCode = ownData('code')
       if (typeof ownCode === 'string' && ownCode.length <= 64 &&
-        (/^E[A-Z_]+$/.test(ownCode) || fixedCodes.has(ownCode))) code = ownCode
+        (coldErrnoCodes.has(ownCode) || coldFailureCodes.has(ownCode))) code = ownCode
       else {
         const ownMessage = ownData('message')
         // Native/test errors carry fixed phase codes as their message. Only an
         // exact reviewed constant may be emitted, never a raw message or stack.
-        if (typeof ownMessage === 'string' && fixedCodes.has(ownMessage)) code = ownMessage
+        if (typeof ownMessage === 'string' && coldFailureCodes.has(ownMessage)) code = ownMessage
       }
     }
   } catch { /* Exotic/proxy errors remain bounded unknown diagnostics. */ }
-  return { phase, errorClass, code }
+  return { phase, errorClass, code, nativeHelper: nativeHelperFailureDiagnostic(error) }
 }
 export function fact(value: unknown, code = 'TEST_cold_contract'): asserts value { if (!value) throw new Error(code) }
 export function publicEpoch(reference: NativeCustodyReference): PublicEpoch {
@@ -142,9 +145,11 @@ async function run(input: ColdInput, role: 'A' | 'B'): Promise<void> {
     fact(typeof session.id === 'string' && session.id.length > 0 && session.id.length <= 256)
     await custody.verify()
     controllerPhase = 'controller-ready-receipt'
+    progress(input, role, 'ready-write-start')
     await evidence(input, 'A-ready.json', { schemaVersion: 1, caseId: input.caseId, controllerPid: process.pid,
       epoch: captured, sessionId: session.id, configWitnessSha256: witness,
       termination: 'deliberate-js-exit-after-flush-without-host-dispose' })
+    progress(input, role, 'ready-write-complete')
     return // The entrypoint exits this JS controller, never manager.disposeHost().
   }
   fact(prior)
@@ -203,10 +208,13 @@ if (import.meta.main) {
     fact(input.schemaVersion === 1 && /^TEST-cold-[a-f0-9]{16}$/.test(input.caseId) && path.isAbsolute(input.evidence))
     if (role === 'sentinel') await sentinel(input)
     else await run(input, role as 'A' | 'B')
+    progress(input, role as ColdProgress['role'], 'role-run-returned')
     // This proves OS controller exit, not native/helper/tree death. All evidence
     // and native HTTP bodies above have completed before the deliberate exit.
+    progress(input, role as ColdProgress['role'], 'exit-requested')
     process.exit(0)
   } catch (error) {
+    if (input && ['A', 'B', 'sentinel'].includes(role)) progress(input, role as ColdProgress['role'], 'caught-error', error)
     if (input) await evidence(input, `${role}-failed.json`, { schemaVersion: 1, caseId: input.caseId,
       phase: role === 'A' ? 'A-effect-unknown' : role === 'B' ? 'B-effect-unknown' : 'sentinel-incomplete', preserve: true },
       { phase: controllerPhase, error }).catch(() => undefined)

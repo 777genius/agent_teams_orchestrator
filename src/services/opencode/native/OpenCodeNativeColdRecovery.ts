@@ -1,3 +1,4 @@
+import { captureColdProgress, drainColdOutput, type ColdProgress } from './OpenCodeNativeColdDiagnostics.js'
 import { createHash, randomBytes } from 'node:crypto'
 import { mkdir, open, readFile } from 'node:fs/promises'
 import { constants } from 'node:fs'
@@ -12,17 +13,7 @@ async function deadline<T>(operation: Promise<T>, milliseconds: number): Promise
     timer = setTimeout(() => reject(new Error('TEST_cold_observation_timeout')), milliseconds)
   })]) } finally { clearTimeout(timer) }
 }
-function drain(stream: ReadableStream<Uint8Array>) {
-  const reader = stream.getReader(); let bytes = 0
-  const result = (async () => {
-    try { while (true) { const part = await reader.read(); if (part.done) break; bytes += part.value.byteLength } }
-    finally { reader.releaseLock() }
-    return { bytes: Math.min(bytes, 65537), overflow: bytes > 65536 }
-  })()
-  // Contents are deliberately neither returned nor persisted: vendor/module
-  // output may contain private configuration. Keep only bounded numeric facts.
-  return { result, cancel: async () => { try { await reader.cancel() } catch { /* Captured reader may have settled. */ } } }
-}
+
 async function waitReceipt<T>(input: ColdInput, name: string): Promise<T> {
   const until = Date.now() + 10000
   while (Date.now() < until) {
@@ -81,14 +72,25 @@ export async function qualifyNativeColdRecovery(options: {
       cwd: project, env: { PATH: '/usr/bin:/bin', HOME: profile.homePath, USERPROFILE: profile.homePath,
         TMPDIR: profile.tmpPath, TZ: 'Etc/UTC' }, stdin: 'pipe', stdout: 'pipe', stderr: 'pipe',
     })
-    let exited = false
-    const stdoutDrain = drain(child.stdout), stderrDrain = drain(child.stderr)
-    const observation = Promise.all([child.exited.then(code => { exited = true; return code }), stdoutDrain.result, stderrDrain.result])
+    let exited = false, exitCode: number | null = null, exitSignal: string | null = null
+    const progress: ColdProgress[] = []
+    const stdoutDrain = drainColdOutput(child.stdout), stderrDrain = drainColdOutput(child.stderr, line => {
+      captureColdProgress(line, caseId, role, progress)
+    })
+    const observation = Promise.all([child.exited.then(code => {
+      exited = true; exitCode = Number.isSafeInteger(code) ? code : null
+      const signal = child.signalCode
+      exitSignal = signal == null ? null : ['SIGABRT', 'SIGALRM', 'SIGBUS', 'SIGFPE', 'SIGHUP', 'SIGILL', 'SIGINT',
+        'SIGKILL', 'SIGPIPE', 'SIGQUIT', 'SIGSEGV', 'SIGTERM', 'SIGTRAP', 'SIGUSR1', 'SIGUSR2', 'SIGXCPU', 'SIGXFSZ'].includes(signal) ? signal : 'other'
+      return code
+    }), stdoutDrain.result, stderrDrain.result])
       .then(([code, stdout, stderr]) => ({ code, signal: child.signalCode ?? null, stdout, stderr }))
     // Keep one observation and one exact original handle. Never rediscover or
     // signal a numeric PID, and never relaunch a controller after uncertainty.
     void observation.catch(() => undefined)
-    return { role, child, observation, stdoutDrain, stderrDrain, exited: () => exited }
+    const diagnostics = () => ({ exitObserved: exited, exitCode, signal: exitSignal,
+      stdout: stdoutDrain.snapshot(), stderr: stderrDrain.snapshot(), progress: [...progress] })
+    return { role, child, observation, stdoutDrain, stderrDrain, diagnostics, exited: () => exited }
   }
   const controllers: Array<ReturnType<typeof launch>> = []
   let sentinel: ReturnType<typeof launch> | undefined, completed = false
@@ -98,7 +100,7 @@ export async function qualifyNativeColdRecovery(options: {
     const result = await deadline(controller.observation, 60000)
     await evidence(input, `${role}-controller-exit.json`, { schemaVersion: 1, caseId, controllerPid: controller.child.pid,
       exitCode: result.code, signal: result.signal, stdout: result.stdout, stderr: result.stderr,
-      exitMeaning: 'JS-controller-exit-only; never-native-death' })
+      observations: controller.diagnostics(), exitMeaning: 'JS-controller-exit-only; never-native-death' })
     fact(result.code === 0 && result.signal === null && !result.stdout.overflow && !result.stderr.overflow)
   }
   try {
@@ -160,7 +162,8 @@ export async function qualifyNativeColdRecovery(options: {
     return { retiredImageRoot: finalAuthority.images.root }
   } catch (error) {
     await evidence(input, 'result.json', { schemaVersion: 1, caseId, outcome: 'unknown-or-failed', preserve: true,
-      replayAllowed: false, numericPidFallbackAllowed: false, privateStatePreserved: true }, { phase, error }).catch(() => undefined)
+      replayAllowed: false, numericPidFallbackAllowed: false, privateStatePreserved: true,
+      controllers: controllers.map(value => ({ role: value.role, observations: value.diagnostics() })) }, { phase, error }).catch(() => undefined)
     throw new Error(`TEST cold recovery incomplete; preserve ${caseId} receipts and private state`)
   } finally {
     // Only original controller stdin handles receive EOF. Do not stop a native
@@ -181,7 +184,7 @@ export async function qualifyNativeColdRecovery(options: {
     }
     if (!completed) await evidence(input, 'controller-handoff.json', { schemaVersion: 1, caseId, preserve: true,
       nativeOutcome: 'unknown; no Stop replay or PID fallback', controllers: controllers.map(value => ({
-        role: value.role, controllerPid: value.child.pid, exitObserved: value.exited(),
+        role: value.role, controllerPid: value.child.pid, exitObserved: value.exited(), observations: value.diagnostics(),
       })) }).catch(() => undefined)
   }
 }
