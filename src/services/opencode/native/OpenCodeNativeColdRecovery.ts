@@ -68,9 +68,10 @@ export async function qualifyNativeColdRecovery(options: {
     // A timed-out parent can never start a later controller/effect, even if an
     // earlier asynchronous operation eventually finishes.
     options.parentSignal.throwIfAborted()
+    // Only the sentinel consumes control input; A/B exit from their finite role.
     const child = Bun.spawn([process.execPath, '--no-env-file', controllerFile, role, configFile], {
       cwd: project, env: { PATH: '/usr/bin:/bin', HOME: profile.homePath, USERPROFILE: profile.homePath,
-        TMPDIR: profile.tmpPath, TZ: 'Etc/UTC' }, stdin: 'pipe', stdout: 'pipe', stderr: 'pipe',
+        TMPDIR: profile.tmpPath, TZ: 'Etc/UTC' }, stdin: role === 'sentinel' ? 'pipe' : 'ignore', stdout: 'pipe', stderr: 'pipe',
     })
     let exited = false, exitCode: number | null = null, exitSignal: string | null = null
     const progress: ColdProgress[] = []
@@ -96,7 +97,6 @@ export async function qualifyNativeColdRecovery(options: {
   let sentinel: ReturnType<typeof launch> | undefined, completed = false
   let phase: NonNullable<Parameters<typeof evidence>[3]>['phase'] = 'source-binding'
   const finish = async (role: 'A' | 'B', controller: ReturnType<typeof launch>) => {
-    controller.child.stdin.end()
     const result = await deadline(controller.observation, 60000)
     await evidence(input, `${role}-controller-exit.json`, { schemaVersion: 1, caseId, controllerPid: controller.child.pid,
       exitCode: result.code, signal: result.signal, stdout: result.stdout, stderr: result.stderr,
@@ -142,7 +142,7 @@ export async function qualifyNativeColdRecovery(options: {
     fact(stopped.nativeExitConfirmed && stopped.authorityPhase === 'dead')
     phase = 'closure'
     await evidence(input, 'sentinel-after-stop.json', await probe())
-    sentinel.child.stdin.write(`close:${caseId}\n`); sentinel.child.stdin.end()
+    sentinel.child.stdin!.write(`close:${caseId}\n`); sentinel.child.stdin!.end()
     const sentinelExit = await deadline(sentinel.observation, 5000)
     fact(sentinelExit.code === 0 && sentinelExit.signal === null &&
       !sentinelExit.stdout.overflow && !sentinelExit.stderr.overflow)
@@ -166,13 +166,15 @@ export async function qualifyNativeColdRecovery(options: {
       controllers: controllers.map(value => ({ role: value.role, observations: value.diagnostics() })) }, { phase, error }).catch(() => undefined)
     throw new Error(`TEST cold recovery incomplete; preserve ${caseId} receipts and private state`)
   } finally {
-    // Only original controller stdin handles receive EOF. Do not stop a native
+    // Only the original sentinel stdin handle receives EOF. Do not stop a native
     // custodian or retry B after a timeout/unknown outcome. Retain all files.
     if (!completed && sentinel && !sentinel.exited()) {
-      try { sentinel.child.stdin.write(`close:${caseId}\n`); sentinel.child.stdin.end() } catch { /* Original handle only. */ }
+      try { sentinel.child.stdin!.write(`close:${caseId}\n`); sentinel.child.stdin!.end() } catch { /* Original handle only. */ }
     }
     if (!completed) for (const controller of controllers) {
-      try { controller.child.stdin.end() } catch { /* Original pipe may already be closed. */ }
+      if (controller.role === 'sentinel') {
+        try { controller.child.stdin!.end() } catch { /* Original pipe may already be closed. */ }
+      }
       // Bun's signal API may ultimately address a PID after a reaping race.
       // Never signal, even through the original JS child object.
       await deadline(controller.observation, 1000).catch(() => undefined)
