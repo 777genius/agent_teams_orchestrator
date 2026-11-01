@@ -193,6 +193,7 @@ export async function createOpenCodeV2LaunchPlan(envelope: BridgeEnvelope): Prom
   const preconditions = parseOpenCodeBridgePreconditions(body.preconditions)
   const { native, availability } = await prepareSelectedOpenCodeV2SourceAvailability(selection)
   const verified = await resolveOpenCodeV2ExecutionProbe(envelope, availability, false, { unattendedTeam: true })
+  executionAssert(!('reasonCode' in verified && verified.reasonCode === 'execution_proof_expired'), 'run_launch_execution_proof_expired')
   const supplied = parseOpenCodeExecutionProof(body.executionProof)
   executionAssert(verified.proof && verified.proof.projectPath === normalizeOpenCodeProjectIdentity(selection.project) &&
     verified.proof.modelId === `${selection.model.providerID}/${selection.model.id}` &&
@@ -206,7 +207,8 @@ export async function createOpenCodeV2LaunchPlan(envelope: BridgeEnvelope): Prom
   try {
     executionAssert(plan.members.every(member => member.profile.config.sha256 === verified.proof!.managedConfigFingerprint), 'run_launch_config_variant_changed')
     for (const member of plan.members) executionAssert(await hashOpenCodeFile(path.join(member.profile.root, 'data/opencode/auth.json')) === verified.proof.managedAuthFingerprint, 'run_launch_selected_auth_changed')
-    executionAssert((await collectProjectBehaviorMetadata(selection.project)).projectBehaviorFingerprint === verified.proof.projectBehaviorFingerprint && Date.parse(verified.proof.expiresAt) > Date.now(), 'run_launch_project_behavior_or_proof_changed')
+    executionAssert((await collectProjectBehaviorMetadata(selection.project)).projectBehaviorFingerprint === verified.proof.projectBehaviorFingerprint, 'run_launch_project_behavior_or_proof_changed')
+    executionAssert(Date.parse(verified.proof.expiresAt) > Date.now(), 'run_launch_execution_proof_expired')
     return { ...plan, qualification: { capabilitySnapshotId: verified.proof.capabilitySnapshotId,
       expectedBehaviorFingerprint: verified.proof.expectedBehaviorEvidence.expectedBehaviorFingerprint,
       binaryPath: verified.proof.binaryPath, binaryFingerprint: verified.proof.binaryFingerprint, version: verified.proof.opencodeVersion, engineVersion: openCodeV2EngineVersion(native) } }
@@ -318,7 +320,7 @@ async function buildOpenCodeV2InternalRunPlanWithNative(selection: Awaited<Retur
     return { dataRoot, binding: { teamId, runId, controllerInstanceId: controllerInstanceId, ownerId: randomUUID() },
       deadline: Date.now() + (probe ? 300_000 : 24 * 60 * 60 * 1000 - 1000), members,
       ...(probe && probePrepared ? { executionProbe: { memberId: 'probe', intent: probe.intent, expectedText: probe.expectedText,
-        prepared: probePrepared, capabilitySnapshotId: selection.capabilitySnapshotId } } : {}),
+        prepared: probePrepared, capabilitySnapshotId: selection.capabilitySnapshotId, unattendedTeam: probe.unattendedTeam === true } } : {}),
       source: { entryPath, entrySha256: await hashOpenCodeFile(entryPath, budget.signal), bunPath: native.bun.path,
         bunSha256: native.bun.sha256, files, env, ...(native.graph.delivery ? { delivery: native.graph.delivery } : {}) } }
   } catch (error) { return cleanupPreparedProfileRoots(preparedRoots, error) }

@@ -191,7 +191,8 @@ export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, 
       executionAssert(record && executionHash({ sourceKey, binding: record.binding, sessionID: record.sessionID,
         intentHash: executionHash(record.intent) }) === executionHash(options.requireExisting), 'probe_original_intent_changed')
       if (record.proof && record.retired && Date.parse(record.proof.expiresAt) <= Date.now())
-        return { state: 'pending' as const, proof: null, reason: 'The original qualified proof expired; no replacement input was submitted.' }
+        return { state: 'pending' as const, proof: null, reasonCode: 'execution_proof_expired' as const,
+          reason: 'The original qualified proof expired; no replacement input was submitted.' }
     }
     if (record?.proof) executionAssert(record.proof.projectPath === normalizeOpenCodeProjectIdentity(selection.project) && record.proof.modelId === `${selection.model.providerID}/${selection.model.id}` &&
       record.proof.capabilitySnapshotId === selection.capabilitySnapshotId && record.proof.opencodeVersion === selection.native.version &&
@@ -206,7 +207,8 @@ export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, 
     if (freshRequestId !== undefined && record?.proof && record.retired) {
       if (record.freshExecutionProofRequestId !== freshRequestId) record = null
       else if (Date.parse(record.proof.expiresAt) <= Date.now())
-        return { state: 'pending' as const, proof: null, reason: 'This fresh request already completed and expired; no replacement input was submitted.' }
+        return { state: 'pending' as const, proof: null, reasonCode: 'execution_proof_expired' as const,
+          reason: 'This fresh request already completed and expired; no replacement input was submitted.' }
     }
     if (record?.proof && record.retired && Date.parse(record.proof.expiresAt) > Date.now()) {
       await options.onIntentPersisted?.({ sourceKey, binding: record.binding, sessionID: record.sessionID, intentHash: executionHash(record.intent) })
@@ -226,6 +228,9 @@ export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, 
       record.retired && !record.submitted && (freshRequestId === undefined || record.freshExecutionProofRequestId !== freshRequestId)) record = null
     if (record?.failure && (record.retired || !run)) return { state: 'failed' as const, proof: null,
       reason: record.retired ? probeFailureReason(record, selection.model.providerID) : `${record.failure}; probe_physical_cleanup_unknown` }
+    if (!run && record?.proof && record.retired && Date.parse(record.proof.expiresAt) <= Date.now())
+      return { state: 'pending' as const, proof: null, reasonCode: 'execution_proof_expired' as const,
+        reason: 'The original qualified proof expired; no replacement input was submitted.' }
     // A retained unresolved attempt never allocates another session or input.
     if (!run) return { state: 'pending' as const, proof: null, reason: record ? 'Original native execution proof is pending or expired.' : 'Selected-model execution proof was not requested.' }
     if (record?.retired && !record.proof) return { state: 'pending' as const, proof: null, reason: 'Original native probe was retired without qualifying terminal evidence.' }

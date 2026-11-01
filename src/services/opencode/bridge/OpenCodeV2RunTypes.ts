@@ -36,7 +36,7 @@ export type RunQualification = Readonly<{ capabilitySnapshotId: string | null; e
 export type RunLaunchPlan = Readonly<{
   qualification?: RunQualification
   dataRoot: string; binding: RunBinding; deadline: number; members: readonly RunMemberPlan[]
-  executionProbe?: Readonly<{ memberId: string; intent: QueueIntent; expectedText: string; prepared: OpenCodePreparedProfile; capabilitySnapshotId: string }>
+  executionProbe?: Readonly<{ memberId: string; intent: QueueIntent; expectedText: string; prepared: OpenCodePreparedProfile; capabilitySnapshotId: string; unattendedTeam?: boolean }>
   source: Readonly<{ entryPath: string; entrySha256: string; bunPath: string; bunSha256: string
     files: readonly Readonly<{ path: string; sha256: string }>[]; env: Readonly<Record<string, string>>; delivery?: OpenCodeV2DeliveryBinding }>
 }>
