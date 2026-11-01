@@ -293,6 +293,11 @@ test('team launch invokes producer cleanup only before handoff or with a matchin
     profile: { ...member.profile, root: member.profile.root + '-unused' } })) }
   await expect(f.bridge.launchExplicit(unusedPlan, cleanup)).rejects.toThrow('run_already_owned')
   expect(cleanups).toBe(1)
+  const cleanupFailure = Error('TEST-profile-cleanup-failed')
+  await expect(f.bridge.launchExplicit(unusedPlan, async () => { throw cleanupFailure })).rejects.toMatchObject({
+    message: 'run_profile_cleanup_unknown',
+    errors: [expect.objectContaining({ message: 'run_already_owned' }), cleanupFailure],
+  })
   for (const branded of [false, true]) {
     cleanups = 0
     const bridge = new OpenCodeV2TeamBridge(f.plan.dataRoot, f.plan.binding, {

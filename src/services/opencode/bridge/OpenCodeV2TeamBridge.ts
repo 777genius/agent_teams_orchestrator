@@ -73,8 +73,10 @@ export class OpenCodeV2TeamBridge {
       launchEntered = true
       return await this.ports.launch(plan)
     } catch (error) {
-      if (cleanupUnstarted && (!launchEntered || readOpenCodeV2RunNotStartedFailure(error)?.bindingHash === executionHash(plan.binding)))
-        await cleanupUnstarted()
+      if (cleanupUnstarted && (!launchEntered || readOpenCodeV2RunNotStartedFailure(error)?.bindingHash === executionHash(plan.binding))) {
+        try { await cleanupUnstarted() }
+        catch (cleanup) { throw new AggregateError([error, cleanup], 'run_profile_cleanup_unknown') }
+      }
       throw error
     }
   }
