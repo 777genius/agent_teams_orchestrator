@@ -1,4 +1,5 @@
 import { claimOpenCodeV2FreshProofRequest } from './OpenCodeV2FreshProofRequest.js'
+import { ensureOpenCodeV2ProbeStore } from './OpenCodeV2ProbeStore.js'
 import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test'
 import { spawn, type ChildProcess } from 'node:child_process'
 import * as childProcesses from 'node:child_process'
@@ -95,10 +96,10 @@ afterEach(async () => {
   for (const [key, value] of Object.entries(saved)) if (value === undefined) delete process.env[key]; else process.env[key] = value
   await rm(root, { recursive: true, force: true })
 })
-async function proof(prepared: OpenCodePreparedProfile, capabilitySnapshotId: string, platform?: NodeJS.Platform, verifiedAt?: string) {
+async function proof(prepared: OpenCodePreparedProfile, capabilitySnapshotId: string, platform?: NodeJS.Platform, verifiedAt?: string, unattendedTeam = false) {
   const snapshot = { projectPath: project, profile: prepared, hostHealthy: true, host: { profile: prepared, version: pin,
     resolvedConfigFingerprint: prepared.managedConfigFingerprint } } as OpenCodeProvisioningSnapshot
-  return buildOpenCodeExecutionProof({ selectedModel: 'provider/model', snapshot, capabilitySnapshotId, verifiedAt }, {
+  return buildOpenCodeExecutionProof({ selectedModel: 'provider/model', snapshot, capabilitySnapshotId, verifiedAt, unattendedTeam }, {
     resolveBinaryPath: () => native().executablePath, resolveBinaryIdentity: async () => 'TEST-native-identity', readCredential: async () => null, platform })
 }
 const titleVersions = process.platform === 'win32' ? ['2.1.4'] as const : ['2.0.0', '2.0.32', '2.1.4'] as const
@@ -116,12 +117,14 @@ for (const version of titleVersions) test(`${version} probe-owned session title 
   const member = probe.members[0]!
   expect(member.title).toBe('Agent Teams model verification')
   expect(probe.executionProbe?.intent).toEqual(intent)
+  expect(JSON.parse(JSON.stringify(probe)).executionProbe.unattendedTeam).toBe(false)
   expect(member.profile.selection.permissions.some(rule => rule.effect === 'allow')).toBe(false)
   expect(member.profile.selection.permissions.filter(rule => rule.effect === 'ask').map(rule => rule.action))
     .toEqual(team.members[0]!.profile.selection.permissions.filter(rule => rule.effect === 'allow').map(rule => rule.action))
   const launchProbe = await launchPlans.buildOpenCodeV2InternalRunPlan(selection, request.body, 'TEST-launch-controller',
     { intent, expectedText: 'TEST-verification-result', unattendedTeam: true })
   expect(launchProbe.members[0]!.profile.config.sha256).toBe(team.members[0]!.profile.config.sha256)
+  expect(JSON.parse(JSON.stringify(launchProbe)).executionProbe.unattendedTeam).toBe(true)
   // A name or caller-supplied title cannot turn an ordinary team member into a probe.
   expect(team.members[0]).not.toHaveProperty('title')
   expect(team.executionProbe).toBeUndefined()
@@ -248,6 +251,49 @@ for (const version of ['2.0.0', '2.0.32'] as const) test(`${version} admits Linu
     Object.defineProperty(process.versions, 'bun', bun)
   }
 })
+test('team proof survives 126s source preparation without refreshing a probe and expires at 330s', async () => {
+  pin = '2.1.4'
+  const request = envelope(), selection = await inspectOpenCodeV2SourceAvailability(request)
+  const parent = path.join(root, 'profiles'); await mkdir(parent)
+  const team = await createOpenCodeV2PreparedMember(selection, native(), parent,
+    { teamId: 'TEST-team', runId: 'TEST-run', memberId: 'worker', unattendedTeam: true })
+  const issued = Date.now(), verifiedAt = new Date(issued).toISOString()
+  const ordinary = await proof(team.prepared, selection.capabilitySnapshotId, undefined, verifiedAt)
+  const qualified = await proof(team.prepared, selection.capabilitySnapshotId, undefined, verifiedAt, true)
+  const sourceKey = executionHash({ project, scopeToken: selection.scope.scopeToken, selectedAuthIdentity: selection.scope.selectedAuthIdentity,
+    source: selection.behaviorFingerprint, graph: selection.installedGraphSHA256, projectBehavior: behavior, variant: 'default', unattendedTeam: true })
+  const store = await ensureOpenCodeV2ProbeStore(process.env.CLAUDE_MULTIMODEL_DATA_HOME!)
+  const directory = path.join(store.probeRoot, sourceKey); await mkdir(directory, { mode: 0o700 })
+  const file = path.join(directory, 'probe.json')
+  const record = { sourceKey, binding: { teamId: 'TEST-proof', runId: 'TEST-proof', controllerInstanceId: 'TEST-controller', ownerId: 'TEST-owner' },
+    sessionID: 'ses_TESTproof', intent: { identity: { requestId: 'TEST-proof', deliveryAttemptId: 'TEST-proof', localMessageId: 'TEST-proof', nativeInputID: 'msg_TESTproof' },
+      delivery: 'queue', input: { nativeInputID: 'msg_TESTproof', text: 'TEST readiness', resume: true } }, submitted: true, retired: true, failure: null }
+  const launch = (evidence: typeof qualified) => ({ ...request, body: { ...request.body, executionProof: evidence, preconditions: {
+    handshakeIdentityHash: 'TEST-handshake', laneId: 'primary', expectedRunId: 'TEST-run', expectedCapabilitySnapshotId: selection.capabilitySnapshotId,
+    expectedBehaviorFingerprint: evidence.expectedBehaviorEvidence.expectedBehaviorFingerprint, expectedManifestHighWatermark: null,
+    commandLeaseId: 'TEST-lease', idempotencyKey: 'TEST-launch' } } })
+  let now = issued, preparationMs = 126_000
+  restores.push(spyOn(Date, 'now').mockImplementation(() => now),
+    spyOn(receipts, 'createOpenCodeV2ExecutionReceipt').mockImplementation(async () => { now = issued + preparationMs; return native() }))
+  await writeFile(file, JSON.stringify({ ...record, proof: ordinary }), { mode: 0o600 })
+  const oldBytes = await readFile(file, 'utf8')
+  await expect(createOpenCodeV2LaunchPlan(launch(ordinary))).rejects.toThrow('run_launch_execution_proof_expired')
+  expect(await readFile(file, 'utf8')).toBe(oldBytes)
+  await writeFile(file, JSON.stringify({ ...record, proof: qualified }), { mode: 0o600 })
+  const qualifiedBytes = await readFile(file, 'utf8')
+  const plan = await createOpenCodeV2LaunchPlan(launch(qualified))
+  expect(plan.members[0]!.profile.config.sha256).toBe(qualified.managedConfigFingerprint)
+  preparationMs = 329_999
+  await expect(createOpenCodeV2LaunchPlan(launch(qualified))).resolves.toHaveProperty('binding.runId', 'TEST-run')
+  const profileRoots = (await readdir(path.join(root, 'app-data/opencode/v2/profiles'))).sort()
+  preparationMs = 330_000
+  await expect(createOpenCodeV2LaunchPlan(launch(qualified))).rejects.toThrow('run_launch_execution_proof_expired')
+  expect((await readdir(path.join(root, 'app-data/opencode/v2/profiles'))).sort()).toEqual(profileRoots)
+  expect(await readFile(file, 'utf8')).toBe(qualifiedBytes)
+  expect((await readdir(store.probeRoot))).toEqual([sourceKey])
+  expect(await readdir(path.join(root, 'app-data/opencode/v2'))).not.toContain('runs')
+})
+
 for (const version of ['2.0.0', '2.0.32'] as const) test(`${version} team launch requires the same unattended profile as its strict proof`, async () => {
   pin = version
   const request = envelope(), selection = await inspectOpenCodeV2SourceAvailability(request)
@@ -313,7 +359,7 @@ for (const version of ['2.0.0', '2.0.32'] as const) test(`${version} team launch
   expect(maximum).toBeGreaterThan(1)
   expect(maximum).toBeLessThanOrEqual(16)
   expireDuringSourceRead = true
-  await expect(createOpenCodeV2LaunchPlan(launch)).rejects.toThrow('run_launch_project_behavior_or_proof_changed')
+  await expect(createOpenCodeV2LaunchPlan(launch)).rejects.toThrow('run_launch_execution_proof_expired')
   expect((await readdir(profilesParent)).sort()).toEqual(retainedProfiles)
   now = beforeExpiry; expireDuringSourceRead = false
   const behaviorRead = spyOn(profiles, 'collectProjectBehaviorMetadata')

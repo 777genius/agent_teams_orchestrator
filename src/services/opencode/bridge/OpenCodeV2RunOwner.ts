@@ -449,7 +449,8 @@ export class OpenCodeV2RunOwner {
         try {
           const admission = await service.settleOriginalInput(probe.intent)
           const evidence = await buildOwnedV2ProbeProof({ client, authority: member.authority, captured: member.probeAuthority,
-            intent: probe.intent, admission, expectedText: probe.expectedText, capabilitySnapshotId: probe.capabilitySnapshotId })
+            intent: probe.intent, admission, expectedText: probe.expectedText, capabilitySnapshotId: probe.capabilitySnapshotId,
+            unattendedTeam: probe.unattendedTeam === true })
           return { kind: 'probeEvidence', ...evidence }
         } catch (failure) {
           // The same original may still be streaming. No resubmission, release

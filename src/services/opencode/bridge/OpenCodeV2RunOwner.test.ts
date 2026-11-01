@@ -38,7 +38,7 @@ const intent: QueueIntent = { delivery: 'queue', identity: {
 }, input: { nativeInputID: 'msg_TESTinput', text: 'hello worker', resume: true } }
 
 async function fixture(options: { groupTools?: boolean; unknown?: boolean; foreignClient?: boolean; createUnknown?: boolean;
-  probe?: boolean; promptBarrier?: Promise<void>; closeBarrier?: Promise<void>; permissionResources?: string[];
+  probe?: boolean; unattendedTeam?: boolean; promptBarrier?: Promise<void>; closeBarrier?: Promise<void>; permissionResources?: string[];
   lifetimeMs?: number; twoMembers?: boolean; memberCount?: number; preparation?: () => void; startup?: () => void;
   graphValidations?: unknown[];
   leaseClose?: (deadline: number | undefined) => void;
@@ -79,7 +79,7 @@ async function fixture(options: { groupTools?: boolean; unknown?: boolean; forei
     binaryPath: '/TEST-opencode', binaryFingerprint: 'TEST-native', version: '2.0.32' } }
   if (options.probe) {
     const member = plan.members[0]!, config = JSON.parse(member.profile.config.content)
-    plan = { ...plan, members: [{ ...member, profile: { ...member.profile, root, directory: authority.directory } }], executionProbe: { memberId: member.memberId, intent, expectedText: 'done', capabilitySnapshotId: 'TEST-capability',
+    plan = { ...plan, members: [{ ...member, profile: { ...member.profile, root, directory: authority.directory } }], executionProbe: { memberId: member.memberId, intent, expectedText: 'done', capabilitySnapshotId: 'TEST-capability', unattendedTeam: options.unattendedTeam === true,
       prepared: { projectPath: authority.directory, canonicalProjectPath: authority.directory, workingDirectoryPath: authority.directory,
         scopeToken: null, profileRootKey: 'TEST-profile', profileRootPath: root, projectBehaviorFingerprint: 'b'.repeat(64), behaviorSources: [],
         managedConfig: config, managedConfigFingerprint: createHash('sha256').update(JSON.stringify(config)).digest('hex'),
@@ -1029,7 +1029,8 @@ requireExecutionEndpoint: authority => {
     } finally { await rm(root, { recursive: true, force: true }) }
     return
   }
-  const f = await fixture({ probe: true })
+  for (const unattendedTeam of [false, true]) {
+  const f = await fixture({ probe: true, unattendedTeam })
   try {
     await f.owner.ready()
     await f.owner.execute({ operation: 'send', ...f.selected, intent }, Date.now() + 2000)
@@ -1059,6 +1060,7 @@ requireExecutionEndpoint: authority => {
     if (settled.kind !== 'probeEvidence') throw Error('TEST probe missing')
     expect(settled.failure).toBeNull()
     expect(settled.proof).toMatchObject({ modelId: 'TEST-provider/TEST-model', opencodeVersion: '2.0.32', capabilitySnapshotId: 'TEST-capability' })
+    expect(Date.parse(settled.proof!.expiresAt) - Date.parse(settled.proof!.verifiedAt)).toBe(unattendedTeam ? 330_000 : 120_000)
     expect((await (await f.store()).snapshot()).slot).toBeNull()
     expect(f.counters).toMatchObject({ prompted: 1, acquired: 1, sessions: 1 })
     for (const fault of [new Error('mutable_readback'), new ExecutionTransportFailure('invalid_response', 'not_submitted')]) {
@@ -1071,6 +1073,7 @@ requireExecutionEndpoint: authority => {
     await expect(f.owner.execute({ operation: 'probeEvidence', ...f.selected }, Date.now() + 2000)).rejects.toThrow('incomplete_log')
     expect(f.counters.prompted).toBe(1)
   } finally { f.native.log = async () => ({ events: [], synced: true, watermark: null }); await f.close() }
+  }
 }, 15_000)
 
 
