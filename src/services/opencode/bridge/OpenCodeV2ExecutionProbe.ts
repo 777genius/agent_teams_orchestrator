@@ -111,8 +111,8 @@ export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, 
   executionAssert(freshRequestId === undefined || run && !options.requireExisting && typeof freshRequestId === 'string' &&
     /^[a-zA-Z0-9._:-]{1,200}$/.test(freshRequestId), 'probe_fresh_request_invalid')
   executionAssert(options.deadline === undefined || Number.isFinite(options.deadline), 'probe_deadline_invalid')
-  let currentPhase: OpenCodeV2ProbePhase = 'probe_preparation'
-  const phase = (value: OpenCodeV2ProbePhase) => { currentPhase = value; options.onPhase?.(value) }
+  const progress: { phase: OpenCodeV2ProbePhase } = { phase: 'probe_preparation' }
+  const phase = (value: OpenCodeV2ProbePhase) => { progress.phase = value; options.onPhase?.(value) }
   phase('probe_preparation')
   const unattendedTeam = options.unattendedTeam === true
   const available = async (record: ProbeRecord) => {
@@ -134,7 +134,7 @@ export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, 
   const assertDeadline = () => {
     assertNotCancelled()
     if (options.signal?.aborted || Date.now() >= deadline) {
-      const error = new Error(`execution_timeout:${currentPhase}`)
+      const error = new Error(`execution_timeout:${progress.phase}`)
       deadlineErrors.add(error); throw error
     }
   }
@@ -395,12 +395,12 @@ export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, 
     // A bounded control read can expire before its final deadline check. Preserve
     // custody/framing errors, and never present uncertain retirement as a timeout.
     const expiredRead = Date.now() >= deadline && error instanceof Error &&
-      (isTransientOpenCodeV2ControlRead(error) || currentPhase === 'owner_start' && error.message === 'timeout' ||
+      (isTransientOpenCodeV2ControlRead(error) || progress.phase === 'owner_start' && error.message === 'timeout' ||
         ['run_deadline_expired', 'run_operation_timeout', 'run_control_client_budget_exhausted',
         'run_control_connect_busy_timeout_expired', 'run_control_connect_idle_expired',
         'run_control_connect_no_listener_expired', 'run_state_wall_deadline_expired'].includes(error.message))
     if (expiredRead || error instanceof Error && ['execution_timeout', 'execution_timeout:probe_retirement'].includes(error.message))
-      throw new Error(currentPhase === 'probe_retirement' ? 'probe_physical_cleanup_unknown' : `execution_timeout:${currentPhase}`, { cause: error })
+      throw new Error(progress.phase === 'probe_retirement' ? 'probe_physical_cleanup_unknown' : `execution_timeout:${progress.phase}`, { cause: error })
     throw error
   } finally { await release?.() }
 }

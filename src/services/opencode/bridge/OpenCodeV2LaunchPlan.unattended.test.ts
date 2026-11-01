@@ -774,7 +774,9 @@ test('a successful original probe re-arms automatic recovery only after physical
       expect(request.operation).toBe('stop')
       // A terminal proof alone cannot re-arm owner replacement.
       expect(JSON.parse(await readFile(f.file, 'utf8')).automaticReplacementUsed).toBe(true)
-      return { kind: 'stop', state: 'stopped', ownerRetired: true, members: [{ memberId: 'probe', cleanup: {}, errors: [] }] } as RunControlResult
+      return { kind: 'stop', state: 'stopped', ownerRetired: true, members: [{ memberId: 'probe', errors: [],
+        cleanup: { scopeClosed: true, processRetired: true, descendantsRetired: true, pid: 101,
+          birth: { format: 'linux-start-ticks', value: 'TEST-birth', bootId: 'TEST-boot' } } }] }
     }))
   expect(await probes.resolveOpenCodeV2ExecutionProbe(f.request, f.selection, true, { unattendedTeam: true }))
     .toEqual({ state: 'available', proof: f.record.proof, reason: null })
