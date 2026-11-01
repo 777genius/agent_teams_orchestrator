@@ -683,10 +683,24 @@ export function projectRunOwnerEntryFailure(elapsedMs: number, exitCode: number 
       ? { nativeExitCode: exitCode } : {}) })
 }
 
+const notStartedFailures = new WeakMap<Error, Readonly<{ bindingHash: string }>>()
+/** Only this launcher's deadline fences mint positive no-spawn evidence. */
+export function readOpenCodeV2RunNotStartedFailure(error: unknown): Readonly<{ bindingHash: string }> | undefined {
+  return error instanceof Error ? notStartedFailures.get(error) : undefined
+}
+function assertUnspawnedRunDeadline(plan: RunLaunchPlan): void {
+  if (Date.now() < plan.deadline) return
+  const error = new Error('execution_timeout:owner_start')
+  notStartedFailures.set(error, Object.freeze({ bindingHash: executionHash(plan.binding) }))
+  throw error
+}
+
 /** Explicit launch alone may spawn. Config/native objects travel over inherited
  * private IPC, never via protocol stdout or a durable authority descriptor. */
 export async function launchExplicitOpenCodeV2Run(plan: RunLaunchPlan): Promise<RunControlRecord> {
   plan = structuredClone(plan)
+  // An entry-time expiry is also definitely before spawn, rather than an invalid lifetime.
+  if (Number.isSafeInteger(plan.deadline) && plan.deadline <= Date.now()) assertUnspawnedRunDeadline(plan)
   validateRunLaunchPlan(plan)
   assertExecutionPlatformAvailable()
   executionAssert(process.versions.bun === openCodeBunVersion(), 'run_source_bun_required')
@@ -695,12 +709,17 @@ export async function launchExplicitOpenCodeV2Run(plan: RunLaunchPlan): Promise<
   const entry = delivery.entryPath
   executionAssert(plan.members.every(member => member.native.runtimeMode === delivery.runtimeMode) &&
     plan.source.entryPath === entry && delivery.entrySha256 === plan.source.entrySha256, 'run_source_changed')
-  for (const file of plan.source.files) executionAssert(await realpath(file.path) === file.path && sha(await readFile(file.path)) === file.sha256, 'run_source_changed')
+  for (const file of plan.source.files) {
+    assertUnspawnedRunDeadline(plan)
+    executionAssert(await realpath(file.path) === file.path && sha(await readFile(file.path)) === file.sha256, 'run_source_changed')
+  }
   executionAssert(plan.source.files.some(file => file.path === entry && file.sha256 === plan.source.entrySha256), 'run_source_incomplete')
   executionAssert(!Object.keys(plan.source.env).some(key => /^(?:NODE_OPTIONS|NODE_PATH|BUN_.*|LD_.*|DYLD_.*|BASH_ENV|ENV|ZDOTDIR|SHELLOPTS)$/i.test(key)), 'run_environment_injection')
   const sourceSha256 = executionHash(plan.source.files)
+  assertUnspawnedRunDeadline(plan)
   const directory = await reserveRunControlDirectory(plan.dataRoot, plan.binding, sourceSha256,
     plan.members.map(member => member.profile))
+  assertUnspawnedRunDeadline(plan)
   const entryStarted = Date.now()
   const child = spawn(plan.source.bunPath, ['--no-install', entry], { detached: true, cwd: plan.dataRoot, env: { ...plan.source.env }, stdio: ['ignore', 'ignore', 'ignore', 'ipc'] })
   let entryExit: number | null = null, entryFailure: unknown
@@ -741,7 +760,10 @@ export async function startOpenCodeV2RunSupervisor(plan: RunLaunchPlan, director
   executionAssert(plan.members.every(member => member.native.runtimeMode === delivery.runtimeMode) &&
     plan.source.entryPath === delivery.entryPath && plan.source.entrySha256 === delivery.entrySha256 &&
     await realpath(process.argv[1]!) === delivery.entryPath, 'run_source_changed')
-  for (const file of plan.source.files) executionAssert(await realpath(file.path) === file.path && sha(await readFile(file.path)) === file.sha256, 'run_source_changed')
+  for (const file of plan.source.files) {
+    executionAssert(Date.now() < plan.deadline, 'execution_timeout:owner_start')
+    executionAssert(await realpath(file.path) === file.path && sha(await readFile(file.path)) === file.sha256, 'run_source_changed')
+  }
   let owner: OpenCodeV2RunOwner | undefined
   const control = await serveOpenCodeV2RunControl(directory, plan.binding, plan.deadline, sourceSha256,
     (request, deadline) => {

@@ -1,7 +1,7 @@
 import { inspectOpenCodeReadSelection, selectedProviderUsesOpenCodeV2, connectOpenCodeV2Provider, loadOpenCodeV2ProviderModels, testOpenCodeV2ProviderModel, loadOpenCodeV2ProviderSetupForm } from './OpenCodeV2ProviderManagement.js'
 import { buildOpenCodeV2ProviderDirectoryEntries } from './OpenCodeV2ProviderDirectory.js'
 import { applyOpenCodeV2DefaultSelection, applyOpenCodeV2DirectoryDefaultSelection, clearOpenCodeV2ProjectDefaultModel, setOpenCodeV2DefaultModel } from './OpenCodeV2DefaultModels.js'
-import { openCodeV2KeyIntegration } from '../../../../services/opencode/catalog/OpenCodeV2KeyIntegrations.js'
+import { isOpenCodeV1OnlyProviderId, openCodeV2KeyIntegration } from '../../../../services/opencode/catalog/OpenCodeV2KeyIntegrations.js'
 import path from 'node:path'
 import { realpath } from 'node:fs/promises'
 import { getOpenCodeModelDeclaredInputModalities } from '../../../../services/opencode/OpenCodeDeclaredInputModalities.js'
@@ -2335,11 +2335,16 @@ function buildSummaryProviderDirectory(input: {
   cursor?: string | null
 }): ProviderDirectoryView {
   const configProviders = buildSummaryConfigProviders(input.inventory)
+  // A V2 summary lists the native key integrations the inventory reports and never
+  // offers a V1-only provider id, which the V2 catalog does not contain.
+  const v2 = input.inventory.readGeneration === 'v2'
+  const nativeV2Providers = v2
+    ? input.inventory.availableProviders.filter(providerId => openCodeV2KeyIntegration(providerId) !== null) : []
   const providerIds = new Set([
-    ...SUMMARY_PROVIDER_IDS, 'opencode',
+    ...SUMMARY_PROVIDER_IDS, 'opencode', ...nativeV2Providers,
     ...input.inventory.connectedProviders.map(provider => provider.id),
     ...(configProviders?.providers ?? []).map(provider => provider.id),
-  ])
+  ].filter(providerId => !v2 || !isOpenCodeV1OnlyProviderId(providerId)))
   const inventory: OpenCodeInventorySnapshot = {
     ...input.inventory,
     availableProviders: [...providerIds],
@@ -2348,7 +2353,9 @@ function buildSummaryProviderDirectory(input: {
     inventory,
     configProviders,
     providers: null,
-    providerAuth: SUMMARY_PROVIDER_AUTH_METHODS,
+    // The native key integrations connect with the V2 native key method only.
+    providerAuth: { ...SUMMARY_PROVIDER_AUTH_METHODS,
+      ...Object.fromEntries(nativeV2Providers.map(providerId => [providerId, [{ type: 'api' as const }]])) },
     capabilities: SUMMARY_CAPABILITIES,
     diagnostics: inventory.diagnostics,
   }

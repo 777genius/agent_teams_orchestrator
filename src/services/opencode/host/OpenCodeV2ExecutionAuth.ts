@@ -1,5 +1,5 @@
 import { executionAssert, executionRecord, type ExecutionAuthority, type ExecutionContext } from '../execution/OpenCodeV2ExecutionContracts.js'
-import { OpenCodeV2ProviderWire } from '../transport/OpenCodeV2ProviderWire.js'
+import { OpenCodeV2ProviderWire, readOpenCodeV2ProviderWireFailure } from '../transport/OpenCodeV2ProviderWire.js'
 import { importOpenCodeV2ClientModule, resolveOpenCodeV2ClientEntry } from '../transport/OpenCodeV2ClientModule.js'
 import { requireExecutionEndpoint, requireExecutionGraph, registerExecutionDisposer } from './OpenCodeV2ExecutionHost.js'
 import type { OwnedNativeProfile } from './OpenCodeV2ExecutionBinding.js'
@@ -61,7 +61,13 @@ export async function attachOpenCodeV2SelectedKey(profile: OwnedNativeProfile, p
   executionAssert(matches.length <= 1, 'execution_selected_auth_provider_unknown')
   let provider = matches[0]
   if (matches.length === 0 && credential.type === 'api' && typeof port.provider === 'function') {
-    const detail = scoped(await port.provider(providerId))
+    const detail = scoped(await port.provider(providerId).catch((error: unknown): never => {
+      // Every pinned native server answers this read with 404 only for ProviderNotFoundError.
+      // Name the absent provider instead of a generic transport fault; nothing was connected.
+      const failure = readOpenCodeV2ProviderWireFailure(error)
+      throw failure?.operation === 'provider-read' && failure.stage === 'decode' && failure.status === 404
+        ? new Error('selected_provider_not_in_v2_catalog', { cause: error }) : error
+    }))
     executionAssert(detail !== null && typeof detail === 'object' && !Array.isArray(detail),
       'execution_selected_auth_provider_unknown')
     provider = executionRecord(detail)

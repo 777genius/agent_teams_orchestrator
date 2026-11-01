@@ -9,10 +9,11 @@ import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { resolveOpenCodeV2ExecutionDelivery } from '../host/OpenCodeV2ExecutionDelivery.js'
 import { assertExecutionPlatformAvailable } from '../host/OpenCodeV2ExecutionPlatform.js'
-import { mkdir, mkdtemp, readFile, readdir, realpath, writeFile, access, lstat } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, realpath, writeFile, access, lstat, rm } from 'node:fs/promises'
 import { constants } from 'node:fs'
 
 import { executionAssert, executionHash, executionRecord } from '../execution/OpenCodeV2ExecutionContracts.js'
+import { OPENCODE_V2_UNSUPPORTED_EXTENSION_PROVIDER_IDS } from '../catalog/OpenCodeV2KeyIntegrations.js'
 import { hashOpenCodeFile, inspectOpenCodeReadSelection } from '../compatibility/OpenCodeNativeIdentity.js'
 import { resolveClaudeMultimodelPaths } from '../OpenCodeManagedPaths.js'
 import { collectProjectBehaviorMetadata, canonicalizeOpenCodeProjectPath, materializeOpenCodeSelectedScopeAuth, resolveOpenCodeProfileScope, readOpenCodeSelectedScopeMetadata } from '../OpenCodeProfileManager.js'
@@ -75,6 +76,10 @@ export function createOpenCodeV2SupervisorEnvironment(source: NodeJS.ProcessEnv 
 }
 
 export type OpenCodeV2SourceReadBudget = { signal?: AbortSignal; deadlineMs?: number }
+function assertReadBudget(budget: OpenCodeV2SourceReadBudget) {
+  budget.signal?.throwIfAborted()
+  executionAssert(budget.deadlineMs === undefined || Date.now() < budget.deadlineMs, 'execution_timeout')
+}
 export async function inspectOpenCodeV2LaunchSelection(envelope: BridgeEnvelope, budget: OpenCodeV2SourceReadBudget = {}) {
   budget.signal?.throwIfAborted()
   assertExecutionPlatformAvailable()
@@ -86,7 +91,7 @@ export async function inspectOpenCodeV2LaunchSelection(envelope: BridgeEnvelope,
   const slash = selectedModel.indexOf('/')
   executionAssert(slash > 0 && slash < selectedModel.length - 1, 'run_selected_model_invalid')
   const model = { providerID: selectedModel.slice(0, slash), id: selectedModel.slice(slash + 1) }
-  executionAssert(!['kiro', 'cursor-acp'].includes(model.providerID), 'run_extension_provider_unsupported')
+  executionAssert(!OPENCODE_V2_UNSUPPORTED_EXTENSION_PROVIDER_IDS.includes(model.providerID), 'run_extension_provider_unsupported')
   executionAssert(envelope.body.skipPermissions !== false &&
     (envelope.body.toolApprovalMode === undefined || envelope.body.toolApprovalMode === 'auto'), 'run_manual_permission_unsupported')
   const project = await canonicalizeOpenCodeProjectPath(typeof envelope.body.projectPath === 'string' ? envelope.body.projectPath : envelope.cwd)
@@ -198,17 +203,20 @@ export async function createOpenCodeV2LaunchPlan(envelope: BridgeEnvelope): Prom
   validateOpenCodeBridgeStateChangingPreconditions({ body, runtime: { capabilitySnapshotId: selection.capabilitySnapshotId,
     runtimeStoreManifestHighWatermark: null } })
   const plan = await buildOpenCodeV2InternalRunPlanWithNative(selection, body, preconditions.commandLeaseId, native)
-  executionAssert(plan.members.every(member => member.profile.config.sha256 === verified.proof!.managedConfigFingerprint), 'run_launch_config_variant_changed')
-  for (const member of plan.members) executionAssert(await hashOpenCodeFile(path.join(member.profile.root, 'data/opencode/auth.json')) === verified.proof.managedAuthFingerprint, 'run_launch_selected_auth_changed')
-  executionAssert((await collectProjectBehaviorMetadata(selection.project)).projectBehaviorFingerprint === verified.proof.projectBehaviorFingerprint && Date.parse(verified.proof.expiresAt) > Date.now(), 'run_launch_project_behavior_or_proof_changed')
-  return { ...plan, qualification: { capabilitySnapshotId: verified.proof.capabilitySnapshotId,
-    expectedBehaviorFingerprint: verified.proof.expectedBehaviorEvidence.expectedBehaviorFingerprint,
-    binaryPath: verified.proof.binaryPath, binaryFingerprint: verified.proof.binaryFingerprint, version: verified.proof.opencodeVersion, engineVersion: openCodeV2EngineVersion(native) } }
+  try {
+    executionAssert(plan.members.every(member => member.profile.config.sha256 === verified.proof!.managedConfigFingerprint), 'run_launch_config_variant_changed')
+    for (const member of plan.members) executionAssert(await hashOpenCodeFile(path.join(member.profile.root, 'data/opencode/auth.json')) === verified.proof.managedAuthFingerprint, 'run_launch_selected_auth_changed')
+    executionAssert((await collectProjectBehaviorMetadata(selection.project)).projectBehaviorFingerprint === verified.proof.projectBehaviorFingerprint && Date.parse(verified.proof.expiresAt) > Date.now(), 'run_launch_project_behavior_or_proof_changed')
+    return { ...plan, qualification: { capabilitySnapshotId: verified.proof.capabilitySnapshotId,
+      expectedBehaviorFingerprint: verified.proof.expectedBehaviorEvidence.expectedBehaviorFingerprint,
+      binaryPath: verified.proof.binaryPath, binaryFingerprint: verified.proof.binaryFingerprint, version: verified.proof.opencodeVersion, engineVersion: openCodeV2EngineVersion(native) } }
+  } catch (error) { return cleanupPreparedProfileRoots(plan.members.map(member => member.profile.root), error) }
 }
 
 /** Production constructor only: no caller body receipt, endpoint or mount hook. */
 export async function buildOpenCodeV2InternalRunPlan(selection: Awaited<ReturnType<typeof inspectOpenCodeV2LaunchSelection>>,
-  body: Record<string, unknown>, controllerInstanceId: string, probe?: { intent: import('../execution/OpenCodeV2AdmissionService.js').QueueIntent; expectedText: string; unattendedTeam?: boolean }): Promise<RunLaunchPlan> {
+  body: Record<string, unknown>, controllerInstanceId: string, probe?: { intent: import('../execution/OpenCodeV2AdmissionService.js').QueueIntent; expectedText: string; unattendedTeam?: boolean }, budget: OpenCodeV2SourceReadBudget = {}): Promise<RunLaunchPlan> {
+  assertReadBudget(budget)
   const prepared = selection as PreparedPlanSelection
   const consume = prepared[preparedPlanReceipt]
   // Remove before any asynchronous preparation so this authority is consumed once.
@@ -218,16 +226,18 @@ export async function buildOpenCodeV2InternalRunPlan(selection: Awaited<ReturnTy
   else {
     const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'run-owner', selectedDeliveries.get(selection)?.binding)
     selectedDeliveries.set(selection, delivery)
-    native = await createOpenCodeV2ExecutionReceipt(delivery.root, selection.native, selection.controller, delivery.binding)
+    native = await createOpenCodeV2ExecutionReceipt(delivery.root, selection.native, selection.controller, delivery.binding, budget.signal)
   }
-  return buildOpenCodeV2InternalRunPlanWithNative(selection, body, controllerInstanceId, native, probe)
+  assertReadBudget(budget)
+  return buildOpenCodeV2InternalRunPlanWithNative(selection, body, controllerInstanceId, native, probe, budget)
 }
 
 /** Reuse only the receipt constructed in this command's private preparation.
  * Caller DTOs and subsequent commands cannot supply or retain this receipt. */
 async function buildOpenCodeV2InternalRunPlanWithNative(selection: Awaited<ReturnType<typeof inspectOpenCodeV2LaunchSelection>>,
   body: Record<string, unknown>, controllerInstanceId: string, native: ValidatedExecutionNative,
-  probe?: { intent: import('../execution/OpenCodeV2AdmissionService.js').QueueIntent; expectedText: string; unattendedTeam?: boolean }): Promise<RunLaunchPlan> {
+  probe?: { intent: import('../execution/OpenCodeV2AdmissionService.js').QueueIntent; expectedText: string; unattendedTeam?: boolean }, budget: OpenCodeV2SourceReadBudget = {}): Promise<RunLaunchPlan> {
+  assertReadBudget(budget)
   const teamId = text(body.teamId ?? body.teamName), runId = text(body.runId), laneId = text(body.laneId)
   executionAssert(Array.isArray(body.members) && body.members.length > 0 && body.members.length <= 32, 'run_members_invalid')
   const rawMembers = body.members.map(executionRecord)
@@ -239,71 +249,105 @@ async function buildOpenCodeV2InternalRunPlanWithNative(selection: Awaited<Retur
   await mkdir(profileParent, { recursive: true, mode: 0o700 })
   const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'run-owner', native.graph.delivery)
   const members: RunMemberPlan[] = []
-  let probePrepared: OpenCodePreparedProfile | undefined
-  for (const member of rawMembers) {
-    const memberId = text(member.name), sessionID = `ses_${randomUUID().replaceAll('-', '')}`
-    const variant = typeof member.effort === 'string' ? member.effort : typeof body.effort === 'string' ? body.effort : undefined
-    const { profile, prepared } = await createOpenCodeV2PreparedMember(selection, native, profileParent, { teamId, runId, memberId, variant, unattendedTeam: probe ? probe.unattendedTeam === true : true, modelVerification: Boolean(probe && !probe.unattendedTeam) })
-    if (probe) probePrepared = prepared
-    const prompt = typeof member.prompt === 'string' ? member.prompt : `Join OpenCode team ${teamId} as ${memberId}. Wait for app MCP task delivery.`
-    const value = buildOpenCodeAppManagedBootstrapContextText({ teamName: typeof body.teamName === 'string' ? body.teamName : teamId,
-      memberName: memberId, runId, laneId, runtimeSessionId: sessionID, prompt })
-    const briefingHash = executionHash({ purpose: 'opencode-app-managed-bootstrap-briefing-v1', teamName: teamId, memberName: memberId, runId, laneId, prompt })
-    members.push({ memberId, laneId, originalSessionId: sessionID, native, profile,
-      // An untitled native root session generates its title with another model request.
-      ...(probe ? { title: 'Agent Teams model verification' } : {}),
-      bootstrap: { key: 'agent-teams.context', value, contextHash: await hashText(value), briefingHash },
-      controllerMcpName: 'agent-teams', advertisedTools: [] })
-  }
-  const files: { path: string; sha256: string }[] = []
-  const sourceFiles: string[] = []
-  async function walk(directory: string): Promise<void> {
-    for (const row of await readdir(directory, { withFileTypes: true })) {
-      executionAssert(!row.isSymbolicLink(), 'run_source_symlink')
-      const file = path.join(directory, row.name)
-      if (row.isDirectory()) await walk(file)
-      else { executionAssert(row.isFile() && sourceFiles.length < 20_000, 'run_source_budget'); sourceFiles.push(file) }
+  const preparedRoots: string[] = []
+  try {
+    let probePrepared: OpenCodePreparedProfile | undefined
+    for (const member of rawMembers) {
+      assertReadBudget(budget)
+      const memberId = text(member.name), sessionID = `ses_${randomUUID().replaceAll('-', '')}`
+      const variant = typeof member.effort === 'string' ? member.effort : typeof body.effort === 'string' ? body.effort : undefined
+      const { profile, prepared } = await createOpenCodeV2PreparedMember(selection, native, profileParent, { teamId, runId, memberId, variant, unattendedTeam: probe ? probe.unattendedTeam === true : true, modelVerification: Boolean(probe && !probe.unattendedTeam), signal: budget.signal })
+      preparedRoots.push(profile.root)
+      assertReadBudget(budget)
+      if (probe) probePrepared = prepared
+      const prompt = typeof member.prompt === 'string' ? member.prompt : `Join OpenCode team ${teamId} as ${memberId}. Wait for app MCP task delivery.`
+      const value = buildOpenCodeAppManagedBootstrapContextText({ teamName: typeof body.teamName === 'string' ? body.teamName : teamId,
+        memberName: memberId, runId, laneId, runtimeSessionId: sessionID, prompt })
+      const briefingHash = executionHash({ purpose: 'opencode-app-managed-bootstrap-briefing-v1', teamName: teamId, memberName: memberId, runId, laneId, prompt })
+      members.push({ memberId, laneId, originalSessionId: sessionID, native, profile,
+        // An untitled native root session generates its title with another model request.
+        ...(probe ? { title: 'Agent Teams model verification' } : {}),
+        bootstrap: { key: 'agent-teams.context', value, contextHash: await hashText(value), briefingHash },
+        controllerMcpName: 'agent-teams', advertisedTools: [] })
     }
-  }
-  if (delivery.runtimeMode === 'source') {
-    await walk(path.join(delivery.root, 'src'))
-    // Match the installed-graph reader's bounded concurrency. Each source file
-    // still receives the same stable-handle byte and identity verification.
-    for (let offset = 0; offset < sourceFiles.length; offset += 16)
-      files.push(...await Promise.all(sourceFiles.slice(offset, offset + 16)
-        .map(async file => ({ path: file, sha256: await hashOpenCodeFile(file) }))))
-  }
-  else {
-    // Bun emits self-contained JS entries. Official packages are independently graph-bound.
-    const baseEntry = selectedDeliveries.get(selection)?.baseEntryPath
-    executionAssert(baseEntry && await realpath(baseEntry) === baseEntry, 'run_source_incomplete')
-    files.push({ path: baseEntry, sha256: await hashOpenCodeFile(baseEntry) })
-    for (const name of ['opencodeV2RunOwner.js', 'opencodeV2ExecutionServer.js']) {
-      const file = await realpath(path.join(delivery.root, name))
-      executionAssert(path.dirname(file) === delivery.root, 'run_source_symlink')
-      files.push({ path: file, sha256: await hashOpenCodeFile(file) })
+    const files: { path: string; sha256: string }[] = []
+    const sourceFiles: string[] = []
+    async function walk(directory: string): Promise<void> {
+      assertReadBudget(budget)
+      for (const row of await readdir(directory, { withFileTypes: true })) {
+        executionAssert(!row.isSymbolicLink(), 'run_source_symlink')
+        const file = path.join(directory, row.name)
+        if (row.isDirectory()) await walk(file)
+        else { executionAssert(row.isFile() && sourceFiles.length < 20_000, 'run_source_budget'); sourceFiles.push(file) }
+      }
     }
-  }
-  files.sort((a, b) => a.path.localeCompare(b.path))
-  const entryPath = delivery.entryPath
-  const env = createOpenCodeV2SupervisorEnvironment()
-  env.CLAUDE_MULTIMODEL_DATA_HOME = dataRoot
-  if (selection.controller.type === 'local' && selection.controller.environment?.AGENT_TEAMS_MCP_CLAUDE_DIR)
-    env.AGENT_TEAMS_MCP_CLAUDE_DIR = selection.controller.environment.AGENT_TEAMS_MCP_CLAUDE_DIR
-  return { dataRoot, binding: { teamId, runId, controllerInstanceId: controllerInstanceId, ownerId: randomUUID() },
-    deadline: Date.now() + (probe ? 300_000 : 24 * 60 * 60 * 1000 - 1000), members,
-    ...(probe && probePrepared ? { executionProbe: { memberId: 'probe', intent: probe.intent, expectedText: probe.expectedText,
-      prepared: probePrepared, capabilitySnapshotId: selection.capabilitySnapshotId } } : {}),
-    source: { entryPath, entrySha256: await hashOpenCodeFile(entryPath), bunPath: native.bun.path,
-      bunSha256: native.bun.sha256, files, env, ...(native.graph.delivery ? { delivery: native.graph.delivery } : {}) } }
+    if (delivery.runtimeMode === 'source') {
+      await walk(path.join(delivery.root, 'src'))
+      // Match the installed-graph reader's bounded concurrency. Each source file
+      // still receives the same stable-handle byte and identity verification.
+      for (let offset = 0; offset < sourceFiles.length; offset += 16) {
+        assertReadBudget(budget)
+        // Join every opened stable-handle read before throwing or removing profiles.
+        const batch = await Promise.allSettled(sourceFiles.slice(offset, offset + 16)
+          .map(async file => ({ path: file, sha256: await hashOpenCodeFile(file, budget.signal) })))
+        for (const item of batch) {
+          if (item.status === 'rejected') throw item.reason
+          files.push(item.value)
+        }
+      }
+    }
+    else {
+      // Bun emits self-contained JS entries. Official packages are independently graph-bound.
+      const baseEntry = selectedDeliveries.get(selection)?.baseEntryPath
+      executionAssert(baseEntry && await realpath(baseEntry) === baseEntry, 'run_source_incomplete')
+      files.push({ path: baseEntry, sha256: await hashOpenCodeFile(baseEntry, budget.signal) })
+      for (const name of ['opencodeV2RunOwner.js', 'opencodeV2ExecutionServer.js']) {
+        const file = await realpath(path.join(delivery.root, name))
+        executionAssert(path.dirname(file) === delivery.root, 'run_source_symlink')
+        assertReadBudget(budget)
+        files.push({ path: file, sha256: await hashOpenCodeFile(file, budget.signal) })
+      }
+    }
+    assertReadBudget(budget)
+    files.sort((a, b) => a.path.localeCompare(b.path))
+    const entryPath = delivery.entryPath
+    const env = createOpenCodeV2SupervisorEnvironment()
+    env.CLAUDE_MULTIMODEL_DATA_HOME = dataRoot
+    if (selection.controller.type === 'local' && selection.controller.environment?.AGENT_TEAMS_MCP_CLAUDE_DIR)
+      env.AGENT_TEAMS_MCP_CLAUDE_DIR = selection.controller.environment.AGENT_TEAMS_MCP_CLAUDE_DIR
+    return { dataRoot, binding: { teamId, runId, controllerInstanceId: controllerInstanceId, ownerId: randomUUID() },
+      deadline: Date.now() + (probe ? 300_000 : 24 * 60 * 60 * 1000 - 1000), members,
+      ...(probe && probePrepared ? { executionProbe: { memberId: 'probe', intent: probe.intent, expectedText: probe.expectedText,
+        prepared: probePrepared, capabilitySnapshotId: selection.capabilitySnapshotId } } : {}),
+      source: { entryPath, entrySha256: await hashOpenCodeFile(entryPath, budget.signal), bunPath: native.bun.path,
+        bunSha256: native.bun.sha256, files, env, ...(native.graph.delivery ? { delivery: native.graph.delivery } : {}) } }
+  } catch (error) { return cleanupPreparedProfileRoots(preparedRoots, error) }
 }
 async function hashText(value: string): Promise<string> { const { createHash } = await import('node:crypto'); return createHash('sha256').update(value).digest('hex') }
 
+/** These roots were created by this preparation and have not been handed to an owner. */
+async function removePreparedProfileRoots(roots: readonly string[], original?: unknown): Promise<void> {
+  const removed = await Promise.allSettled(roots.map(root => rm(root, { recursive: true, force: true })))
+  const failed = removed.filter((item): item is PromiseRejectedResult => item.status === 'rejected')
+  if (failed.length) throw new AggregateError([original, ...failed.map(item => item.reason)], 'run_profile_cleanup_unknown')
+}
+async function cleanupPreparedProfileRoots(roots: readonly string[], original: unknown): Promise<never> {
+  await removePreparedProfileRoots(roots, original)
+  throw original
+}
+/** Internal producers call this only after proving their factory-built plan was never started. */
+export function removeOpenCodeV2UnstartedPlanProfiles(plan: RunLaunchPlan): Promise<void> {
+  return removePreparedProfileRoots(plan.members.map(member => member.profile.root))
+}
+
 export async function createOpenCodeV2PreparedMember(selection: Awaited<ReturnType<typeof inspectOpenCodeV2LaunchSelection>>,
-  native: ValidatedExecutionNative, profileParent: string, input: { teamId: string; runId: string; memberId: string; variant?: string; unattendedTeam?: boolean; modelVerification?: boolean }) {
+  native: ValidatedExecutionNative, profileParent: string, input: { teamId: string; runId: string; memberId: string; variant?: string; unattendedTeam?: boolean; modelVerification?: boolean; signal?: AbortSignal }) {
+  input.signal?.throwIfAborted()
   const { teamId, runId, memberId, variant } = input
-    const prefix = `${executionHash({ teamId, runId, memberId }).slice(0, 16)}-`
-    const root = await realpath(await mkdtemp(path.join(profileParent, prefix)))
+  const prefix = `${executionHash({ teamId, runId, memberId }).slice(0, 16)}-`
+  const createdRoot = await mkdtemp(path.join(profileParent, prefix))
+  try {
+    const root = await realpath(createdRoot)
     const directories = ['home', 'config', 'data', 'cache', 'state', 'tmp', 'appdata', 'localappdata'].map(name => path.join(root, name))
     const configDirectory = path.join(root, 'config', 'opencode'), nativeData = path.join(root, 'data', 'opencode')
     for (const directory of directories) await mkdir(directory, { mode: 0o700 })
@@ -321,8 +365,8 @@ export async function createOpenCodeV2PreparedMember(selection: Awaited<ReturnTy
     let managedAuthFingerprint: string
     {
       const provider = await materializeOpenCodeSelectedScopeAuth(selection.scope, selection.project, managedAuthPath,
-        selection.model.id, undefined, undefined)
-      managedAuthFingerprint = await hashOpenCodeFile(managedAuthPath)
+        selection.model.id, input.signal, undefined)
+      managedAuthFingerprint = await hashOpenCodeFile(managedAuthPath, input.signal)
       // An empty sealed store binds the normal proof without pretending the native
       // public marker is a credential. The host's read-only catalog guard must still
       // qualify this exact free model before admitting any native session.
@@ -341,25 +385,27 @@ export async function createOpenCodeV2PreparedMember(selection: Awaited<ReturnTy
     const profile: SelectedExecutionProfile = { epoch: randomUUID(), root, directory: selection.project,
       databasePath: path.join(nativeData, 'opencode.db'), ...(anonymous ? {} : { authSha256: managedAuthFingerprint }), env, envSha256: executionHash(env),
       config: { directory: configDirectory, content: config.content, sha256: config.sha256 }, selection: selected }
-  const metadata = await readOpenCodeSelectedScopeMetadata(selection.scope, selection.project)
-  executionAssert(metadata.selectedAuthIdentity === selection.scope.selectedAuthIdentity &&
-    await hashOpenCodeFile(managedAuthPath) === managedAuthFingerprint, 'run_selected_auth_changed')
-  const prepared: OpenCodePreparedProfile = {
-    projectPath: selection.project, canonicalProjectPath: selection.project, workingDirectoryPath: selection.project,
-    scopeToken: selection.scope.scopeToken, profileRootKey: executionHash({ project: selection.project,
-      scope: selection.scope.configFingerprint, selectedAuth: selection.scope.selectedAuthIdentity, config: config.sha256 }),
-    profileRootPath: root, profileScope: selection.scope,
-    projectBehaviorFingerprint: metadata.projectBehaviorFingerprint, behaviorSources: metadata.behaviorSources,
-    managedConfig: executionRecord(JSON.parse(config.content)), managedConfigFingerprint: config.sha256,
-    homePath: env.HOME!, tmpPath: env.TMPDIR!, xdgConfigHome: env.XDG_CONFIG_HOME!,
-    xdgDataHome: env.XDG_DATA_HOME!, xdgCacheHome: env.XDG_CACHE_HOME!,
-    managedAuthPath, sourceAuthPath: null, sourceAuthFingerprint: metadata.selectedAuthIdentity.startsWith('known:')
-      ? metadata.selectedAuthIdentity.slice(6) : null, managedAuthFingerprint,
-    selectedSourceAuthIdentity: metadata.selectedAuthIdentity, selectedManagedAuthIdentity: metadata.selectedAuthIdentity,
-    authoritySourceFingerprint: metadata.authoritySourceFingerprint,
-    authState: metadata.selectedAuthIdentity === 'absent' ? 'missing' : 'ok', env,
-  }
-  return { profile, prepared }
+    input.signal?.throwIfAborted()
+    const metadata = await readOpenCodeSelectedScopeMetadata(selection.scope, selection.project)
+    executionAssert(metadata.selectedAuthIdentity === selection.scope.selectedAuthIdentity &&
+      await hashOpenCodeFile(managedAuthPath, input.signal) === managedAuthFingerprint, 'run_selected_auth_changed')
+    const prepared: OpenCodePreparedProfile = {
+      projectPath: selection.project, canonicalProjectPath: selection.project, workingDirectoryPath: selection.project,
+      scopeToken: selection.scope.scopeToken, profileRootKey: executionHash({ project: selection.project,
+        scope: selection.scope.configFingerprint, selectedAuth: selection.scope.selectedAuthIdentity, config: config.sha256 }),
+      profileRootPath: root, profileScope: selection.scope,
+      projectBehaviorFingerprint: metadata.projectBehaviorFingerprint, behaviorSources: metadata.behaviorSources,
+      managedConfig: executionRecord(JSON.parse(config.content)), managedConfigFingerprint: config.sha256,
+      homePath: env.HOME!, tmpPath: env.TMPDIR!, xdgConfigHome: env.XDG_CONFIG_HOME!,
+      xdgDataHome: env.XDG_DATA_HOME!, xdgCacheHome: env.XDG_CACHE_HOME!,
+      managedAuthPath, sourceAuthPath: null, sourceAuthFingerprint: metadata.selectedAuthIdentity.startsWith('known:')
+        ? metadata.selectedAuthIdentity.slice(6) : null, managedAuthFingerprint,
+      selectedSourceAuthIdentity: metadata.selectedAuthIdentity, selectedManagedAuthIdentity: metadata.selectedAuthIdentity,
+      authoritySourceFingerprint: metadata.authoritySourceFingerprint,
+      authState: metadata.selectedAuthIdentity === 'absent' ? 'missing' : 'ok', env,
+    }
+    return { profile, prepared }
+  } catch (error) { return cleanupPreparedProfileRoots([createdRoot], error) }
 }
 
 /** Native-owned profiles follow the planner's fixed loader environment fence. */

@@ -1,6 +1,8 @@
 import { claimOpenCodeV2FreshProofRequest } from './OpenCodeV2FreshProofRequest.js'
 import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test'
 import { spawn, type ChildProcess } from 'node:child_process'
+import * as childProcesses from 'node:child_process'
+import * as filesystem from 'node:fs/promises'
 import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises'
@@ -17,6 +19,7 @@ import * as mcp from '../OpenCodeMcpManager.js'
 import * as probes from './OpenCodeV2ExecutionProbe.js'
 import * as launchPlans from './OpenCodeV2LaunchPlan.js'
 import * as runOwners from './OpenCodeV2RunOwner.js'
+import * as delivery from '../host/OpenCodeV2ExecutionDelivery.js'
 import * as controls from './OpenCodeV2RunControl.js'
 import type { RunBinding, RunControlResult } from './OpenCodeV2RunTypes.js'
 import * as projectIdentity from '../OpenCodeProjectIdentity.js'
@@ -270,6 +273,8 @@ for (const version of ['2.0.0', '2.0.32'] as const) test(`${version} team launch
   expect(nativeReceiptCalls).toBe(2) // Each command still verifies its own current graph.
   expect(nextPlan.members[0]?.native.graph).toEqual(plan.members[0]?.native.graph)
   expect(plan.members[0]?.profile.config.sha256).toBe(samePolicyProof.managedConfigFingerprint)
+  const profilesParent = path.join(root, 'app-data/opencode/v2/profiles')
+  let retainedProfiles = (await readdir(profilesParent)).sort()
   const platform = Object.getOwnPropertyDescriptor(process, 'platform')!
   const arch = Object.getOwnPropertyDescriptor(process, 'arch')!
   try {
@@ -287,6 +292,7 @@ for (const version of ['2.0.0', '2.0.32'] as const) test(`${version} team launch
   await expect(createOpenCodeV2LaunchPlan({ ...launch, body: { ...launch.body, executionProof: changedPolicyProof,
     preconditions: { ...preconditions, expectedBehaviorFingerprint: changedPolicyProof.expectedBehaviorEvidence.expectedBehaviorFingerprint } } }))
     .rejects.toThrow('run_launch_config_variant_changed')
+  expect((await readdir(profilesParent)).sort()).toEqual(retainedProfiles)
   probe.mockImplementation(async () => ({ state: 'available', proof: samePolicyProof, reason: null }))
   const originalHash = nativeIdentity.hashOpenCodeFile
   let active = 0, maximum = 0, sourceReads = 0, expireDuringSourceRead = false
@@ -301,17 +307,21 @@ for (const version of ['2.0.0', '2.0.32'] as const) test(`${version} team launch
     try { return await originalHash(file) } finally { active-- }
   })
   restores.push(clock, hashes)
-  await createOpenCodeV2LaunchPlan(launch)
+  const concurrentPlan = await createOpenCodeV2LaunchPlan(launch)
+  retainedProfiles = (await readdir(profilesParent)).sort()
   expect(sourceReads).toBeGreaterThan(1)
   expect(maximum).toBeGreaterThan(1)
   expect(maximum).toBeLessThanOrEqual(16)
   expireDuringSourceRead = true
   await expect(createOpenCodeV2LaunchPlan(launch)).rejects.toThrow('run_launch_project_behavior_or_proof_changed')
+  expect((await readdir(profilesParent)).sort()).toEqual(retainedProfiles)
   now = beforeExpiry; expireDuringSourceRead = false
   const behaviorRead = spyOn(profiles, 'collectProjectBehaviorMetadata')
     .mockImplementation(async () => ({ projectBehaviorFingerprint: 'e'.repeat(64), behaviorSources: ['AGENTS.md'] }))
   restores.push(behaviorRead)
   await expect(createOpenCodeV2LaunchPlan(launch)).rejects.toThrow('run_launch_project_behavior_or_proof_changed')
+  expect((await readdir(profilesParent)).sort()).toEqual(retainedProfiles)
+  for (const returned of [plan, nextPlan, concurrentPlan]) expect((await lstat(returned.members[0]!.profile.root)).isDirectory()).toBe(true)
 }, 30_000)
 
 for (const platform of ['win32', 'linux'] as const) test(`${platform} cached probe and launch compare the issuer's project identity without replay`, async () => {
@@ -469,6 +479,7 @@ test('same-command readiness probe plan consumes its validated receipt without r
   const plan = await launchPlans.buildOpenCodeV2InternalRunPlan(selection, request.body, 'TEST-controller')
   expect(nativeReceiptCalls).toBe(1)
   expect(plan.members[0]?.native.graph.sha256).toBe(selection.installedGraphSHA256)
+  expect((await lstat(plan.members[0]!.profile.root)).isDirectory()).toBe(true)
   // Serialization cannot carry this private preparation to another command.
   await launchPlans.buildOpenCodeV2InternalRunPlan(JSON.parse(JSON.stringify(selection)), request.body, 'TEST-next-controller')
   expect(nativeReceiptCalls).toBe(2)
@@ -733,7 +744,7 @@ test.skipIf(!posix)('an unsubmitted probe with a live starting owner stays pendi
   const counter = countLaunches()
   try {
     expect(await probes.resolveOpenCodeV2ExecutionProbe(f.request, f.selection, true))
-      .toEqual({ state: 'pending', proof: null, reason: 'Original native member is not ready; no input was submitted.' })
+      .toEqual({ state: 'pending', proof: null, reason: 'execution_timeout:owner_readiness; Original native member is not ready; no input was submitted.' })
     expect(await readFile(f.file, 'utf8')).toBe(f.saved)
     expect(counter.launches).toBe(0)
   } finally { await control.close() }
@@ -758,3 +769,262 @@ test.skipIf(!posix)('a fresh request keeps its own settled owner failure while a
   expect(counter.launches).toBe(1)
   expect(JSON.parse(await readFile(f.file, 'utf8'))).toMatchObject({ freshExecutionProofRequestId: 'TEST-fresh-B', submitted: false, failure: null })
 }, 120_000)
+
+
+test('a successful original probe re-arms automatic recovery only after physical retirement', async () => {
+  const f = await freshProbeFixture()
+  await writeFile(f.file, JSON.stringify({ ...f.record, proof: null, retired: false, automaticReplacementUsed: true }), { mode: 0o600 })
+  const operations: string[] = []
+  restores.push(spyOn(controls, 'discoverOpenCodeV2Run').mockImplementation(async () => ({ binding: f.record.binding }) as never),
+    spyOn(controls, 'requestOpenCodeV2Run').mockImplementation(async (_owner, request): Promise<RunControlResult> => {
+      operations.push(request.operation)
+      if (request.operation === 'permissions') return { kind: 'permissions', requests: [] }
+      if (request.operation === 'probeEvidence') return { kind: 'probeEvidence', proof: f.record.proof, failure: null }
+      expect(request.operation).toBe('stop')
+      // A terminal proof alone cannot re-arm owner replacement.
+      expect(JSON.parse(await readFile(f.file, 'utf8')).automaticReplacementUsed).toBe(true)
+      return { kind: 'stop', state: 'stopped', ownerRetired: true, members: [{ memberId: 'probe', errors: [],
+        cleanup: { scopeClosed: true, processRetired: true, descendantsRetired: true, pid: 101,
+          birth: { format: 'linux-start-ticks', value: 'TEST-birth', bootId: 'TEST-boot' } } }] }
+    }))
+  expect(await probes.resolveOpenCodeV2ExecutionProbe(f.request, f.selection, true, { unattendedTeam: true }))
+    .toEqual({ state: 'available', proof: f.record.proof, reason: null })
+  const completed = JSON.parse(await readFile(f.file, 'utf8'))
+  expect(completed).toMatchObject({ retired: true, submitted: true, proof: f.record.proof })
+  expect(completed).not.toHaveProperty('automaticReplacementUsed')
+  expect(operations).toEqual(['permissions', 'probeEvidence', 'stop'])
+  // Passive repeated reads do not allocate another owner or submit input.
+  expect((await probes.resolveOpenCodeV2ExecutionProbe(f.request, f.selection, false, { unattendedTeam: true })).state).toBe('available')
+  expect(operations).toEqual(['permissions', 'probeEvidence', 'stop'])
+})
+
+for (const cleanup of [false, true]) test(`deadline during ${cleanup ? 'retirement preserves cleanup uncertainty' : 'observation names its phase without another input'}`, async () => {
+  const f = await originalProbe(true, { automaticReplacementUsed: true })
+  const operations: string[] = []
+  let clock = Date.now()
+  const deadline = clock + 10000
+  restores.push(spyOn(Date, 'now').mockImplementation(() => clock))
+  restores.push(spyOn(controls, 'discoverOpenCodeV2Run').mockImplementation(async () => ({ binding: f.binding }) as never),
+    spyOn(controls, 'requestOpenCodeV2Run').mockImplementation(async (_owner, request): Promise<RunControlResult> => {
+      operations.push(request.operation)
+      if (cleanup && request.operation === 'permissions') return { kind: 'permissions', requests: [{}] } as RunControlResult
+      clock = deadline + 1
+      if (cleanup) return { kind: 'stop', state: 'cleanup_unknown', ownerRetired: false, members: [] } as RunControlResult
+      throw Error('run_control_timeout')
+    }))
+  const options = { deadline }
+  if (cleanup) {
+    expect(await probes.resolveOpenCodeV2ExecutionProbe(f.request, f.selection, true, options))
+      .toEqual({ state: 'failed', proof: null, reason: 'native_execution_cancelled; probe_physical_cleanup_unknown' })
+    expect(JSON.parse(await readFile(f.file, 'utf8'))).toMatchObject({ retired: false, automaticReplacementUsed: true })
+  } else {
+    await expect(probes.resolveOpenCodeV2ExecutionProbe(f.request, f.selection, true, options))
+      .rejects.toThrow('execution_timeout:model_observe')
+    expect(await readFile(f.file, 'utf8')).toBe(f.saved)
+  }
+  expect(operations).toEqual(cleanup ? ['permissions', 'stop'] : ['permissions'])
+})
+
+test('cached missing-provider failure names the selected provider and passive reads cannot replace it', async () => {
+  const failure = { category: 'selected_provider_not_in_v2_catalog', operation: { operation: 'provider-read', stage: 'decode', status: 404 } }
+  const f = await originalProbe(false, { failure: 'native_owner_retired', retired: true, ownerFailure: failure, automaticReplacementUsed: true })
+  const counter = countLaunches()
+  for (const run of [false, true]) expect(await probes.resolveOpenCodeV2ExecutionProbe(f.request, f.selection, run))
+    .toEqual({ state: 'failed', proof: null, reason: 'native_owner_retired:selected_provider_not_in_v2_catalog:provider-read:decode:404; provider provider is not part of this OpenCode V2 catalog' })
+  expect(counter.launches).toBe(0)
+  expect(await readFile(f.file, 'utf8')).toBe(f.saved)
+})
+
+
+test('probe planning aborts during real source hashing without launching an owner', async () => {
+  const request = envelope(), selection = await inspectOpenCodeV2SourceAvailability(request)
+  const parent = path.join(root, 'app-data/opencode/v2/profiles'), unrelated = path.join(parent, 'keep-existing-profile')
+  await mkdir(unrelated, { recursive: true, mode: 0o700 })
+  await writeFile(path.join(unrelated, 'marker'), 'TEST-keep')
+  const abort = new AbortController(), hash = nativeIdentity.hashOpenCodeFile
+  let sourceReads = 0, active = 0
+  restores.push(spyOn(nativeIdentity, 'hashOpenCodeFile').mockImplementation(async (file, signal) => {
+    if (!file.includes(path.sep + 'src' + path.sep)) return hash(file, signal)
+    const order = ++sourceReads; active++
+    try {
+      const result = await hash(file, signal)
+      if (order === 1) { abort.abort(Error('TEST-plan-expired')); throw abort.signal.reason }
+      return result
+    } finally {
+      // A sibling still owns its read until its asynchronous finalizer has settled.
+      if (order !== 1) await Bun.sleep(20)
+      active--
+    }
+  }))
+  await expect(launchPlans.buildOpenCodeV2InternalRunPlan(selection, request.body, 'TEST-controller', undefined,
+    { signal: abort.signal, deadlineMs: Date.now() + 10000 })).rejects.toThrow('TEST-plan-expired')
+  expect(sourceReads).toBeGreaterThan(1)
+  expect(active).toBe(0)
+  expect(await readdir(parent)).toEqual(['keep-existing-profile'])
+  expect(await readFile(path.join(unrelated, 'marker'), 'utf8')).toBe('TEST-keep')
+  expect(await readdir(path.join(root, 'app-data/opencode/v2'))).not.toContain('runs')
+})
+
+
+test('owner startup refuses a deadline spent in source validation before reserving or spawning', async () => {
+  const request = envelope(), selection = await inspectOpenCodeV2SourceAvailability(request)
+  const preparedPlan = await launchPlans.buildOpenCodeV2InternalRunPlan(selection, request.body, 'TEST-controller')
+  const bunPath = await realpath(process.execPath), bunSha256 = await nativeIdentity.hashOpenCodeFile(bunPath)
+  let clock = Date.now(), reservations = 0
+  const plan = { ...preparedPlan, deadline: clock + 10000, source: { ...preparedPlan.source, bunPath, bunSha256 },
+    members: preparedPlan.members.map(member => ({ ...member, native: { ...member.native, bun: { path: bunPath, sha256: bunSha256 } } })) }
+  const resolve = delivery.resolveOpenCodeV2ExecutionDelivery
+  restores.push(spyOn(Date, 'now').mockImplementation(() => clock),
+    spyOn(delivery, 'resolveOpenCodeV2ExecutionDelivery').mockImplementation(async (...args) => {
+      const result = await resolve(...args); clock = plan.deadline + 1; return result
+    }),
+    spyOn(controls, 'reserveRunControlDirectory').mockImplementation(async () => { reservations++; throw Error('TEST-late-effect-forbidden') }))
+  const error = await runOwners.launchExplicitOpenCodeV2Run(plan).catch(error => error)
+  expect(error.message).toBe('execution_timeout:owner_start')
+  expect(runOwners.readOpenCodeV2RunNotStartedFailure(error)).toEqual({ bindingHash: executionHash(plan.binding) })
+  expect(reservations).toBe(0)
+}, 30000)
+
+
+test.skipIf(!posix)('a proven no-spawn probe deadline settles after reservation and only an explicit retry can recover', async () => {
+  const request = { ...envelope(), timeoutMs: 60000 }, selection = await inspectOpenCodeV2SourceAvailability(request)
+  const bunPath = await realpath(process.execPath), bunSha256 = await nativeIdentity.hashOpenCodeFile(bunPath)
+  const build = launchPlans.buildOpenCodeV2InternalRunPlan, launch = runOwners.launchExplicitOpenCodeV2Run
+  const reserve = controls.reserveRunControlDirectory
+  let clock = Date.now(), launches = 0, reservations = 0, spawns = 0, file = '', originalDirectory = ''
+  const builtRoots: string[][] = []
+  const parent = path.join(root, 'app-data/opencode/v2/profiles')
+  await mkdir(path.join(parent, 'keep-existing-profile'), { recursive: true, mode: 0o700 })
+  restores.push(spyOn(Date, 'now').mockImplementation(() => clock),
+    spyOn(launchPlans, 'buildOpenCodeV2InternalRunPlan').mockImplementation(async (...args) => {
+      const plan = await build(...args)
+      builtRoots.push(plan.members.map(member => member.profile.root))
+      return { ...plan, source: { ...plan.source, bunPath, bunSha256,
+        files: plan.source.files.filter(file => file.path === plan.source.entryPath) },
+        members: plan.members.map(member => ({ ...member, native: { ...member.native, bun: { path: bunPath, sha256: bunSha256 } } })) }
+    }),
+    spyOn(controls, 'reserveRunControlDirectory').mockImplementation(async (...args) => {
+      reservations++; originalDirectory = await reserve(...args)
+      clock += 60000 // Spend the command budget only after its real private launch fence exists.
+      return originalDirectory
+    }),
+    spyOn(childProcesses, 'spawn').mockImplementation(() => { spawns++; throw Error('TEST-native-spawn-forbidden') }),
+    spyOn(runOwners, 'launchExplicitOpenCodeV2Run').mockImplementation(async plan => {
+      launches++
+      if (launches === 1) return launch(plan)
+      // A caller-shaped timeout after launch entry has no positive no-spawn receipt.
+      throw Object.assign(Error('execution_timeout:owner_start'), { bindingHash: executionHash(plan.binding) })
+    }))
+  const options = { unattendedTeam: true, onPrepared: async (sourceKey: string) => {
+    file = path.join(root, 'app-data/opencode/v2/execution-probes', sourceKey, 'probe.json')
+  } }
+  await expect(probes.resolveOpenCodeV2ExecutionProbe(request, selection, true, options)).rejects.toThrow('execution_timeout:owner_start')
+  const settledBytes = await readFile(file, 'utf8'), settled = JSON.parse(settledBytes)
+  expect(settled).toMatchObject({ submitted: false, retired: true, proof: null, failure: 'native_owner_not_started' })
+  expect(await readdir(parent)).toEqual(['keep-existing-profile'])
+  for (const created of builtRoots[0]!) await expect(lstat(created)).rejects.toMatchObject({ code: 'ENOENT' })
+  expect({ launches, reservations, spawns }).toEqual({ launches: 1, reservations: 1, spawns: 0 })
+  const original = { sourceKey: settled.sourceKey, binding: settled.binding, sessionID: settled.sessionID, intentHash: executionHash(settled.intent) }
+  for (const followup of [{ ...options, run: false }, { ...options, run: true, requireExisting: original }]) {
+    expect(await probes.resolveOpenCodeV2ExecutionProbe(request, selection, followup.run, followup))
+      .toEqual({ state: 'failed', proof: null, reason: 'native_owner_not_started' })
+  }
+  expect(await readFile(file, 'utf8')).toBe(settledBytes)
+  expect(launches).toBe(1)
+  await lstat(path.join(originalDirectory, 'start.json')) // The old custody fence is preserved.
+  await expect(probes.resolveOpenCodeV2ExecutionProbe(request, selection, true, options)).rejects.toThrow('execution_timeout:owner_start')
+  const unknownBytes = await readFile(file, 'utf8'), unknown = JSON.parse(unknownBytes)
+  expect(unknown.binding).not.toEqual(settled.binding)
+  expect(unknown).toMatchObject({ submitted: false, retired: false, failure: null })
+  for (const created of builtRoots[1]!) expect((await lstat(path.join(created, 'data/opencode/auth.json'))).isFile()).toBe(true)
+  for (const run of [false, true]) {
+    expect(await probes.resolveOpenCodeV2ExecutionProbe(request, selection, run, options)).toMatchObject({ state: 'pending', proof: null })
+    expect(await readFile(file, 'utf8')).toBe(unknownBytes)
+  }
+  await writeFile(file, JSON.stringify({ ...unknown, submitted: true }), { mode: 0o600 })
+  expect(await probes.resolveOpenCodeV2ExecutionProbe(request, selection, true, options)).toMatchObject({ state: 'pending', proof: null })
+  expect({ launches, reservations, spawns }).toEqual({ launches: 2, reservations: 1, spawns: 0 })
+}, 30000)
+
+
+test('failed member preparation removes its exact root after sealing while retaining successful and unrelated profiles', async () => {
+  const request = envelope(), selection = await inspectOpenCodeV2SourceAvailability(request)
+  const parent = path.join(root, 'member-profiles'), unrelated = path.join(parent, 'keep-existing-profile')
+  await mkdir(unrelated, { recursive: true, mode: 0o700 })
+  metadataAuthIdentity = 'error'
+  await expect(createOpenCodeV2PreparedMember(selection, native(), parent,
+    { teamId: 'TEST-team', runId: 'TEST-run', memberId: 'failed' })).rejects.toThrow('run_selected_auth_changed')
+  expect(await readdir(parent)).toEqual(['keep-existing-profile'])
+  metadataAuthIdentity = 'absent'
+  const kept = await createOpenCodeV2PreparedMember(selection, native(), parent,
+    { teamId: 'TEST-team', runId: 'TEST-run', memberId: 'successful' })
+  expect((await lstat(kept.profile.root)).isDirectory()).toBe(true)
+  expect((await lstat(unrelated)).isDirectory()).toBe(true)
+})
+
+test('a later member failure removes every root from only the failed plan', async () => {
+  const request = envelope(), selection = await inspectOpenCodeV2SourceAvailability(request)
+  request.body.members = [{ name: 'first' }, { name: 'second' }]
+  const parent = path.join(root, 'app-data/opencode/v2/profiles'), unrelated = path.join(parent, 'keep-existing-profile')
+  await mkdir(unrelated, { recursive: true, mode: 0o700 })
+  let sealed = 0
+  restores.push(spyOn(profiles, 'materializeOpenCodeSelectedScopeAuth').mockImplementation(async (_scope, _project, authPath) => {
+    await writeFile(authPath, '{}', { mode: 0o600 })
+    if (++sealed === 2) throw Error('TEST-later-member-failed')
+    return {}
+  }))
+  await expect(launchPlans.buildOpenCodeV2InternalRunPlan(selection, request.body, 'TEST-controller')).rejects.toThrow('TEST-later-member-failed')
+  expect(sealed).toBe(2)
+  expect(await readdir(parent)).toEqual(['keep-existing-profile'])
+})
+
+
+for (const expiry of ['post-build', 'branded-launch'] as const) test(`failed ${expiry} profile cleanup retains the original probe without a retry`, async () => {
+  const request = { ...envelope(), timeoutMs: 60000 }, selection = await inspectOpenCodeV2SourceAvailability(request)
+  const build = launchPlans.buildOpenCodeV2InternalRunPlan, launch = runOwners.launchExplicitOpenCodeV2Run, remove = filesystem.rm
+  let clock = Date.now(), file = '', created = '', launches = 0, removals = 0
+  restores.push(spyOn(Date, 'now').mockImplementation(() => clock),
+    spyOn(launchPlans, 'buildOpenCodeV2InternalRunPlan').mockImplementation(async (...args) => {
+      const plan = await build(...args); created = plan.members[0]!.profile.root
+      if (expiry === 'post-build') clock += 60000
+      return plan
+    }),
+    spyOn(runOwners, 'launchExplicitOpenCodeV2Run').mockImplementation(async plan => {
+      launches++; return launch({ ...plan, deadline: clock - 1 })
+    }),
+    spyOn(filesystem, 'rm').mockImplementation(async (target, options) => {
+      if (target === created) { removals++; throw Error('TEST-profile-remove-failed') }
+      return remove(target, options)
+    }))
+  const options = { unattendedTeam: true, onPrepared: async (sourceKey: string) => {
+    file = path.join(root, 'app-data/opencode/v2/execution-probes', sourceKey, 'probe.json')
+  } }
+  await expect(probes.resolveOpenCodeV2ExecutionProbe(request, selection, true, options)).rejects.toThrow('probe_physical_cleanup_unknown')
+  const pinned = await readFile(file, 'utf8')
+  expect(JSON.parse(pinned)).toMatchObject({ submitted: false, retired: false, failure: null, proof: null })
+  expect((await lstat(path.join(created, 'data/opencode/auth.json'))).isFile()).toBe(true)
+  for (const run of [false, true]) {
+    expect(await probes.resolveOpenCodeV2ExecutionProbe(request, selection, run, options)).toMatchObject({ state: 'pending', proof: null })
+    expect(await readFile(file, 'utf8')).toBe(pinned)
+  }
+  expect({ launches, removals }).toEqual({ launches: expiry === 'post-build' ? 0 : 1, removals: 1 })
+})
+
+test('a pre-launch callback failure removes its private profiles without granting a replacement', async () => {
+  const request = envelope(), selection = await inspectOpenCodeV2SourceAvailability(request)
+  let file = '', launches = 0
+  restores.push(spyOn(runOwners, 'launchExplicitOpenCodeV2Run').mockImplementation(async () => {
+    launches++; throw Error('TEST-launch-forbidden')
+  }))
+  const options = { unattendedTeam: true, onPrepared: async (sourceKey: string) => {
+    file = path.join(root, 'app-data/opencode/v2/execution-probes', sourceKey, 'probe.json')
+  } }
+  await expect(probes.resolveOpenCodeV2ExecutionProbe(request, selection, true, { ...options,
+    onIntentPersisted: async () => { throw Error('TEST-intent-marker-failed') } })).rejects.toThrow('TEST-intent-marker-failed')
+  expect(await readdir(path.join(root, 'app-data/opencode/v2/profiles'))).toEqual([])
+  const pinned = await readFile(file, 'utf8')
+  expect(JSON.parse(pinned)).toMatchObject({ submitted: false, retired: false, failure: null })
+  expect(await probes.resolveOpenCodeV2ExecutionProbe(request, selection, true, options)).toMatchObject({ state: 'pending', proof: null })
+  expect(await readFile(file, 'utf8')).toBe(pinned)
+  expect(launches).toBe(0)
+})

@@ -320,7 +320,7 @@ const providerFailureCodes = ['provider_missing', 'provider_key_method_unsupport
   'execution_selected_auth_required', 'execution_selected_auth_unbound', 'execution_selected_auth_changed',
   'execution_selected_auth_missing', 'execution_selected_auth_unsupported', 'execution_selected_auth_location_changed',
   'execution_selected_auth_provider_unknown', 'execution_selected_auth_existing_or_unsupported',
-  'execution_selected_auth_readback_unknown', 'execution_selected_auth_profile_changed',
+  'execution_selected_auth_readback_unknown', 'execution_selected_auth_profile_changed', 'selected_provider_not_in_v2_catalog',
   'execution_selected_oauth_readback_unknown', 'execution_selected_oauth_recovery_required', 'execution_selected_oauth_windows_unqualified',
   'execution_selected_oauth_provider_unknown', 'execution_selected_oauth_integration_unknown',
   'execution_selected_oauth_connection_unknown', 'execution_selected_oauth_model_unknown',

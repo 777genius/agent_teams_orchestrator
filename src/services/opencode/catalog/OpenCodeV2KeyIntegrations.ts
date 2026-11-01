@@ -15,6 +15,16 @@ const KEY_INTEGRATIONS: readonly Readonly<{ providerId: string; displayName: str
   Object.freeze({ providerId: 'kimi-code-plan-cn', displayName: 'Kimi For Coding (kimi.com)' }),
 ])
 
+/** V1 extension providers that a V2 launch refuses before any native work. */
+export const OPENCODE_V2_UNSUPPORTED_EXTENSION_PROVIDER_IDS: readonly string[] = Object.freeze(['kiro', 'cursor-acp'])
+/** Provider ids that exist only for V1: the V1 Kimi plan, which the V2 catalog serves through
+ * the native integrations above under their own ids, and the V1 extension providers. A V2
+ * provider list never offers them; selection still never maps one id onto another. */
+const V1_ONLY_PROVIDER_IDS: ReadonlySet<string> = new Set(['kimi-for-coding', ...OPENCODE_V2_UNSUPPORTED_EXTENSION_PROVIDER_IDS])
+export function isOpenCodeV1OnlyProviderId(providerId: string): boolean {
+  return V1_ONLY_PROVIDER_IDS.has(providerId)
+}
+
 /** The setup form's single option; V2 connect admits exactly this id or none. */
 export const OPENCODE_V2_NATIVE_KEY_OPTION_ID = 'api:native'
 

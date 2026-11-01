@@ -2049,6 +2049,33 @@ describe('OpenCodeProviderManagementAdapter', () => {
     expect(paged.ok && paged.value.totalCount).toBe(result.value.totalCount)
   })
 
+  test('V2 summary offers native Kimi integrations and excludes V1-only IDs without starting a host', async () => {
+    for (const generation of ['v1', 'v2'] as const) {
+      const adapter = new OpenCodeProviderManagementAdapter({
+        inventoryService: { probe: async () => inventory({ readGeneration: generation,
+          availableProviders: ['kimi-code-plan-global', 'kimi-code-plan-cn'],
+          connectedProviders: [{ id: 'kimi-for-coding', source: 'credentials', authHint: 'api' }],
+          models: [], modelMetadata: [] }) },
+        hostManager: { ensureHost: async () => { throw Error('TEST summary must not start a host') }, releaseHost: async () => {} },
+        clientFactory: { create: () => { throw Error('TEST summary must not read a live catalog') } },
+      })
+      const result = await adapter.loadDirectory({ runtimeId: 'opencode', summary: true, limit: 100 })
+      expect(result.ok).toBe(true)
+      if (!result.ok) continue
+      const entry = (id: string) => result.value.entries.find(value => value.providerId === id)
+      if (generation === 'v2') {
+        for (const [id, name] of [['kimi-code-plan-global', 'Kimi For Coding (kimi.ai)'], ['kimi-code-plan-cn', 'Kimi For Coding (kimi.com)']]) {
+          expect(entry(id)).toMatchObject({ displayName: name, state: 'not-connected', authMethods: ['api'], setupKind: 'connect-api-key' })
+        }
+        for (const id of ['kimi-for-coding', 'kiro', 'cursor-acp']) expect(entry(id)).toBeUndefined()
+      } else {
+        expect(entry('kimi-for-coding')).toMatchObject({ state: 'connected' })
+        expect(entry('kimi-code-plan-global')).toBeUndefined()
+        expect(entry('kiro')).toBeDefined()
+      }
+    }
+  })
+
   test('allows slow summary profile preparation without starting a host or losing connections', async () => {
     let hostStarts = 0
     const projectPath = '/tmp/summary-slow-profile-sandbox'
