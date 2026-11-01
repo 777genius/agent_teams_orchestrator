@@ -1707,6 +1707,7 @@ function getRuntimeState(input: {
   launchableRouteCount: number
   diagnostics: readonly string[]
 }): ProviderRuntimeState {
+  if (isOpenCodeInventoryTimeoutSnapshot(input.inventory)) return 'degraded'
   if (!input.inventory.detected) return 'needs-setup'
   if (input.hostStartError) return 'degraded'
   if (input.host && input.host.state !== 'healthy') return 'degraded'
