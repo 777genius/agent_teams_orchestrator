@@ -272,6 +272,8 @@ for (const version of ['2.0.0', '2.0.32'] as const) test(`${version} team launch
   expect(nativeReceiptCalls).toBe(2) // Each command still verifies its own current graph.
   expect(nextPlan.members[0]?.native.graph).toEqual(plan.members[0]?.native.graph)
   expect(plan.members[0]?.profile.config.sha256).toBe(samePolicyProof.managedConfigFingerprint)
+  const profilesParent = path.join(root, 'app-data/opencode/v2/profiles')
+  let retainedProfiles = (await readdir(profilesParent)).sort()
   const platform = Object.getOwnPropertyDescriptor(process, 'platform')!
   const arch = Object.getOwnPropertyDescriptor(process, 'arch')!
   try {
@@ -289,6 +291,7 @@ for (const version of ['2.0.0', '2.0.32'] as const) test(`${version} team launch
   await expect(createOpenCodeV2LaunchPlan({ ...launch, body: { ...launch.body, executionProof: changedPolicyProof,
     preconditions: { ...preconditions, expectedBehaviorFingerprint: changedPolicyProof.expectedBehaviorEvidence.expectedBehaviorFingerprint } } }))
     .rejects.toThrow('run_launch_config_variant_changed')
+  expect((await readdir(profilesParent)).sort()).toEqual(retainedProfiles)
   probe.mockImplementation(async () => ({ state: 'available', proof: samePolicyProof, reason: null }))
   const originalHash = nativeIdentity.hashOpenCodeFile
   let active = 0, maximum = 0, sourceReads = 0, expireDuringSourceRead = false
@@ -303,17 +306,21 @@ for (const version of ['2.0.0', '2.0.32'] as const) test(`${version} team launch
     try { return await originalHash(file) } finally { active-- }
   })
   restores.push(clock, hashes)
-  await createOpenCodeV2LaunchPlan(launch)
+  const concurrentPlan = await createOpenCodeV2LaunchPlan(launch)
+  retainedProfiles = (await readdir(profilesParent)).sort()
   expect(sourceReads).toBeGreaterThan(1)
   expect(maximum).toBeGreaterThan(1)
   expect(maximum).toBeLessThanOrEqual(16)
   expireDuringSourceRead = true
   await expect(createOpenCodeV2LaunchPlan(launch)).rejects.toThrow('run_launch_project_behavior_or_proof_changed')
+  expect((await readdir(profilesParent)).sort()).toEqual(retainedProfiles)
   now = beforeExpiry; expireDuringSourceRead = false
   const behaviorRead = spyOn(profiles, 'collectProjectBehaviorMetadata')
     .mockImplementation(async () => ({ projectBehaviorFingerprint: 'e'.repeat(64), behaviorSources: ['AGENTS.md'] }))
   restores.push(behaviorRead)
   await expect(createOpenCodeV2LaunchPlan(launch)).rejects.toThrow('run_launch_project_behavior_or_proof_changed')
+  expect((await readdir(profilesParent)).sort()).toEqual(retainedProfiles)
+  for (const returned of [plan, nextPlan, concurrentPlan]) expect((await lstat(returned.members[0]!.profile.root)).isDirectory()).toBe(true)
 }, 30_000)
 
 for (const platform of ['win32', 'linux'] as const) test(`${platform} cached probe and launch compare the issuer's project identity without replay`, async () => {
@@ -471,6 +478,7 @@ test('same-command readiness probe plan consumes its validated receipt without r
   const plan = await launchPlans.buildOpenCodeV2InternalRunPlan(selection, request.body, 'TEST-controller')
   expect(nativeReceiptCalls).toBe(1)
   expect(plan.members[0]?.native.graph.sha256).toBe(selection.installedGraphSHA256)
+  expect((await lstat(plan.members[0]!.profile.root)).isDirectory()).toBe(true)
   // Serialization cannot carry this private preparation to another command.
   await launchPlans.buildOpenCodeV2InternalRunPlan(JSON.parse(JSON.stringify(selection)), request.body, 'TEST-next-controller')
   expect(nativeReceiptCalls).toBe(2)
@@ -829,18 +837,33 @@ test('cached missing-provider failure names the selected provider and passive re
 
 test('probe planning aborts during real source hashing without launching an owner', async () => {
   const request = envelope(), selection = await inspectOpenCodeV2SourceAvailability(request)
+  const parent = path.join(root, 'app-data/opencode/v2/profiles'), unrelated = path.join(parent, 'keep-existing-profile')
+  await mkdir(unrelated, { recursive: true, mode: 0o700 })
+  await writeFile(path.join(unrelated, 'marker'), 'TEST-keep')
   const abort = new AbortController(), hash = nativeIdentity.hashOpenCodeFile
-  let sourceReads = 0
+  let sourceReads = 0, active = 0
   restores.push(spyOn(nativeIdentity, 'hashOpenCodeFile').mockImplementation(async (file, signal) => {
-    const result = await hash(file, signal)
-    if (file.includes(path.sep + 'src' + path.sep)) { sourceReads++; abort.abort(Error('TEST-plan-expired')) }
-    return result
+    if (!file.includes(path.sep + 'src' + path.sep)) return hash(file, signal)
+    const order = ++sourceReads; active++
+    try {
+      const result = await hash(file, signal)
+      if (order === 1) { abort.abort(Error('TEST-plan-expired')); throw abort.signal.reason }
+      return result
+    } finally {
+      // A sibling still owns its read until its asynchronous finalizer has settled.
+      if (order !== 1) await Bun.sleep(20)
+      active--
+    }
   }))
   await expect(launchPlans.buildOpenCodeV2InternalRunPlan(selection, request.body, 'TEST-controller', undefined,
     { signal: abort.signal, deadlineMs: Date.now() + 10000 })).rejects.toThrow('TEST-plan-expired')
-  expect(sourceReads).toBeGreaterThan(0)
+  expect(sourceReads).toBeGreaterThan(1)
+  expect(active).toBe(0)
+  expect(await readdir(parent)).toEqual(['keep-existing-profile'])
+  expect(await readFile(path.join(unrelated, 'marker'), 'utf8')).toBe('TEST-keep')
   expect(await readdir(path.join(root, 'app-data/opencode/v2'))).not.toContain('runs')
 })
+
 
 test('owner startup refuses a deadline spent in source validation before reserving or spawning', async () => {
   const request = envelope(), selection = await inspectOpenCodeV2SourceAvailability(request)
@@ -917,3 +940,35 @@ test.skipIf(!posix)('a proven no-spawn probe deadline settles after reservation 
   expect(await probes.resolveOpenCodeV2ExecutionProbe(request, selection, true, options)).toMatchObject({ state: 'pending', proof: null })
   expect({ launches, reservations, spawns }).toEqual({ launches: 2, reservations: 1, spawns: 0 })
 }, 30000)
+
+
+test('failed member preparation removes its exact root after sealing while retaining successful and unrelated profiles', async () => {
+  const request = envelope(), selection = await inspectOpenCodeV2SourceAvailability(request)
+  const parent = path.join(root, 'member-profiles'), unrelated = path.join(parent, 'keep-existing-profile')
+  await mkdir(unrelated, { recursive: true, mode: 0o700 })
+  metadataAuthIdentity = 'error'
+  await expect(createOpenCodeV2PreparedMember(selection, native(), parent,
+    { teamId: 'TEST-team', runId: 'TEST-run', memberId: 'failed' })).rejects.toThrow('run_selected_auth_changed')
+  expect(await readdir(parent)).toEqual(['keep-existing-profile'])
+  metadataAuthIdentity = 'absent'
+  const kept = await createOpenCodeV2PreparedMember(selection, native(), parent,
+    { teamId: 'TEST-team', runId: 'TEST-run', memberId: 'successful' })
+  expect((await lstat(kept.profile.root)).isDirectory()).toBe(true)
+  expect((await lstat(unrelated)).isDirectory()).toBe(true)
+})
+
+test('a later member failure removes every root from only the failed plan', async () => {
+  const request = envelope(), selection = await inspectOpenCodeV2SourceAvailability(request)
+  request.body.members = [{ name: 'first' }, { name: 'second' }]
+  const parent = path.join(root, 'app-data/opencode/v2/profiles'), unrelated = path.join(parent, 'keep-existing-profile')
+  await mkdir(unrelated, { recursive: true, mode: 0o700 })
+  let sealed = 0
+  restores.push(spyOn(profiles, 'materializeOpenCodeSelectedScopeAuth').mockImplementation(async (_scope, _project, authPath) => {
+    await writeFile(authPath, '{}', { mode: 0o600 })
+    if (++sealed === 2) throw Error('TEST-later-member-failed')
+    return {}
+  }))
+  await expect(launchPlans.buildOpenCodeV2InternalRunPlan(selection, request.body, 'TEST-controller')).rejects.toThrow('TEST-later-member-failed')
+  expect(sealed).toBe(2)
+  expect(await readdir(parent)).toEqual(['keep-existing-profile'])
+})
