@@ -6,6 +6,7 @@ import { discoverOpenCodeV2Run, parseRunBinding, parseRunControlRequest, request
 import { writeRunControlFile } from '../OpenCodeV2RunControl.js'
 import { executionAssert, type ExecutionAuthority } from '../../execution/OpenCodeV2ExecutionContracts.js'
 import { OpenCodeV2ExecutionFetch } from '../../transport/OpenCodeV2ExecutionFetch.js'
+import { OpenCodeV2ProviderWire } from '../../transport/OpenCodeV2ProviderWire.js'
 import type { ExecutionBridgeClient, ExecutionInbox } from '../../transport/OpenCodeV2ExecutionClientFactory.js'
 import { OpenCodeV2RunOwner } from '../OpenCodeV2RunOwner.js'
 import { OpenCodeV2TeamBridge } from '../OpenCodeV2TeamBridge.js'
@@ -15,7 +16,8 @@ import { createHash } from 'node:crypto'
 // The real owner/session/admission composition runs in this separate process.
 // Only its native and lease ports are synthetic. No accepted AdmissionRecord
 // is fabricated by the control fixture and no kernel cleanup proof is minted.
-function syntheticOwner(dataRoot: string, binding: RunBinding, directory: string, deadline: number, delayed = false): OpenCodeV2RunOwner {
+function syntheticOwner(dataRoot: string, binding: RunBinding, directory: string, deadline: number, delayed = false,
+  acquisitionFailure?: string): OpenCodeV2RunOwner {
   const authority: ExecutionAuthority = { generation: 'v2', pin: '2.0.32', dialect: 'v2-2.0.32', graphSha256: 'a'.repeat(64),
     selectedCli: { path: '/TEST-native', sha256: 'b'.repeat(64), version: '2.0.32' },
     child: { pid: process.pid, birth: { format: 'linux-start-ticks', value: '1', bootId: 'TEST' },
@@ -74,6 +76,16 @@ function syntheticOwner(dataRoot: string, binding: RunBinding, directory: string
         catch (error) { if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error }
         await new Promise(resolve => setTimeout(resolve, 20))
       }
+      // A real provider read through the wire (needs OpenCodeV2ProviderEndpointPreload.ts),
+      // which fails at its decode stage with 404 like the selected-auth provider lookup.
+      if (acquisitionFailure === 'TEST-provider-read-404') {
+        const wire = new OpenCodeV2ProviderWire(authority, Date.now() + 5000)
+        try { await wire.fetch(`http://127.0.0.1:1/api/provider/TEST?location%5Bdirectory%5D=${encodeURIComponent(authority.directory)}`) }
+        finally { await wire.dispose() }
+        throw new Error('TEST_provider_read_not_refused')
+      }
+      // Otherwise the owner's own initialization failure, as an exact code.
+      if (acquisitionFailure !== undefined) throw new Error(acquisitionFailure)
       return { authority, signal: new AbortController().signal, close: async () => {
       effects.closed++; await writeRunControlFile(directory, 'synthetic-effects.json', effects)
       throw new Error('TEST_no_kernel_cleanup_receipt')
@@ -111,12 +123,15 @@ if (mode === 'sentinel') {
     const result = await requestOpenCodeV2Run(record, request, 5000)
     process.stdout.write(JSON.stringify(result) + '\n')
   } else {
-    executionAssert(mode === 'serve' || mode === 'serve-delayed' || mode.startsWith('serve-drop-'), 'TEST_mode_invalid')
+    executionAssert(mode === 'serve' || mode === 'serve-delayed' || mode === 'serve-fail' || mode.startsWith('serve-drop-'), 'TEST_mode_invalid')
     const drop = mode.startsWith('serve-drop-') ? mode.slice('serve-drop-'.length) : null
+    // serve-fail: the released acquisition throws rawRequest; the owner then retires itself.
+    const failing = mode === 'serve-fail'
     let control: Awaited<ReturnType<typeof serveOpenCodeV2RunControl>> | undefined
     const directory = runControlDirectory(dataRoot, binding.teamId, binding.runId)
     const deadline = Date.now() + 20_000
-    const owner = syntheticOwner(dataRoot, binding, directory, deadline, mode === 'serve-delayed')
+    const owner = syntheticOwner(dataRoot, binding, directory, deadline, mode === 'serve-delayed' || failing,
+      failing ? rawRequest ?? 'TEST_owner_failure' : undefined)
     control = await serveOpenCodeV2RunControl(directory, binding, deadline, 'a'.repeat(64),
       async (request, operationDeadline) => {
         // A lost stop reply: retire without answering. The durable receipt (or
@@ -143,8 +158,10 @@ if (mode === 'sentinel') {
     const retire = () => retiring ??= (async () => { await owner.stop(); await owner.awaitCleanupTerminal(); await control?.close() })()
     process.once('SIGTERM', () => { void retire().finally(() => process.exit(0)) })
     void owner.stopped.then(() => { setTimeout(() => { void retire().finally(() => process.exit(0)) }, 100) })
-    if (mode === 'serve-delayed') process.stdout.write('ready\n')
-    await owner.ready()
-    if (mode !== 'serve-delayed') process.stdout.write('ready\n')
+    if (mode === 'serve-delayed' || failing) process.stdout.write('ready\n')
+    // Like the production entry, a failed initialization exits through owner.stopped.
+    if (failing) await owner.ready().catch(() => undefined)
+    else await owner.ready()
+    if (mode !== 'serve-delayed' && !failing) process.stdout.write('ready\n')
   }
 }

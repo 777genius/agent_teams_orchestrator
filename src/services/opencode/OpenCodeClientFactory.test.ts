@@ -60,7 +60,7 @@ describe('OpenCodeClientFactory permissions API', () => {
       await client.getConfigProviders()
       await factory.create('http://127.0.0.1:4096', { remainingMs: () => 5_000 })
         .getConfigProviders({ initializeInstance: true })
-      expect(timers.mock.calls.map(call => call[1])).toEqual([30_000, 15_000, 15_000, 5_000])
+      expect(timers.mock.calls.map(call => call[1])).toEqual([180_000, 15_000, 15_000, 5_000])
       expect(requests).toEqual([
         'http://127.0.0.1:4096/config/providers',
         'http://127.0.0.1:4096/provider',

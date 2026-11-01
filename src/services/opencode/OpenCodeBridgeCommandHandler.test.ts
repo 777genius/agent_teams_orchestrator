@@ -1,5 +1,5 @@
 import { effectiveAgentsFixture } from './OpenCodeEffectiveAgents.test-support.js'
-import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test'
 import { createHash } from 'node:crypto'
 import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
@@ -18,7 +18,13 @@ import { OpenCodeRuntimeDeadlineError, type OpenCodeProvisioningStage } from './
 import { resolveClaudeMultimodelPaths } from './OpenCodeManagedPaths.js'
 import { openCodeCommandOutcomeStore } from './OpenCodeCommandOutcomeStore.js'
 import { openCodeExecutionProbe } from './OpenCodeExecutionProbe.js'
-import { OpenCodeHostProcessGoneError, openCodeHostManager } from './OpenCodeHostManager.js'
+import {
+  isOpenCodeUnregisteredHostProcessGoneError,
+  OpenCodeHostManager,
+  OpenCodeHostProcessGoneError,
+  openCodeHostManager,
+} from './OpenCodeHostManager.js'
+import { resolveOpenCodeAppMcpLaunchConfig } from './OpenCodeMcpManager.js'
 import {
   computeOpenCodeExpectedBehaviorFingerprint,
   OPEN_CODE_KNOWN_ABSENT_AUTH_FINGERPRINT,
@@ -30,7 +36,7 @@ import { resolveProcessAttributionDirectory } from './OpenCodeProcessAttribution
 import { buildManagedConfig, buildManagedConfigFingerprint } from './OpenCodeProfileManager.js'
 import { refreshSelectedProfileAuthority } from './OpenCodeSelectedProfileAuthority.js'
 import { normalizeOpenCodeProjectIdentity } from './OpenCodeProjectIdentity.js'
-import { openCodeProvisioningProbe } from './OpenCodeProvisioningProbe.js'
+import { OpenCodeProvisioningProbe, openCodeProvisioningProbe } from './OpenCodeProvisioningProbe.js'
 import { RUNTIME_TURN_SETTLED_SPOOL_ROOT_ENV } from './OpenCodeRuntimeTurnSettledEmitter.js'
 import { openCodeSessionBridge } from './OpenCodeSessionBridge.js'
 import { OpenCodeSessionStore, openCodeSessionStore } from './OpenCodeSessionStore.js'
@@ -487,6 +493,7 @@ const originalReconcilePersistentHosts = openCodeHostManager.reconcilePersistent
 const originalRefreshResolvedConfigFingerprint = openCodeHostManager.refreshResolvedConfigFingerprint
 const originalEnsureSession = openCodeSessionBridge.ensureSession
 const originalMaterializeSessionOnHost = openCodeSessionBridge.materializeSessionOnHost
+const originalOwnedOAuthObservation = openCodeSessionBridge.withOwnedOAuthSessionObservation
 const originalEnsureSessionAppMcpReady = openCodeSessionBridge.ensureSessionAppMcpReady
 const originalInjectAppManagedBootstrapContext = openCodeSessionBridge.injectAppManagedBootstrapContext
 const originalRefreshSessionEnvironment = openCodeSessionBridge.refreshSessionEnvironment
@@ -842,6 +849,7 @@ afterEach(async () => {
   openCodeHostManager.refreshResolvedConfigFingerprint = originalRefreshResolvedConfigFingerprint
   openCodeSessionBridge.ensureSession = originalEnsureSession
   openCodeSessionBridge.materializeSessionOnHost = originalMaterializeSessionOnHost
+  openCodeSessionBridge.withOwnedOAuthSessionObservation = originalOwnedOAuthObservation
   openCodeSessionBridge.ensureSessionAppMcpReady = originalEnsureSessionAppMcpReady
   openCodeSessionBridge.injectAppManagedBootstrapContext = originalInjectAppManagedBootstrapContext
   openCodeSessionBridge.refreshSessionEnvironment = originalRefreshSessionEnvironment
@@ -1187,6 +1195,188 @@ describe('OpenCodeBridgeCommandHandler', () => {
       expect((await handshake()).runtime.groupChatRunProof).toBeUndefined()
     } finally { host.stop(true) }
   })
+  test('owned xAI OAuth proves and delivers a named-group message without re-preparing credentials', async () => {
+    const previousBoundControlUrl = process.env.AGENT_TEAMS_BOUND_CONTROL_URL
+    const previousBoundControlContext = process.env.AGENT_TEAMS_BOUND_CONTEXT_JSON
+    const previousManagedDataHome = process.env.CLAUDE_MULTIMODEL_DATA_HOME
+    const previousManagedCacheHome = process.env.CLAUDE_MULTIMODEL_CACHE_HOME
+    // Reproduce the normal bridge: only profile preparation supplies these
+    // root values, not the caller's original launch environment.
+    delete process.env.CLAUDE_MULTIMODEL_DATA_HOME
+    delete process.env.CLAUDE_MULTIMODEL_CACHE_HOME
+    const groupContext = JSON.stringify({
+      appInstanceId: 'owned-xai-test', dataRootFingerprint: 'owned-xai-root', connectionGeneration: 1,
+    })
+    const requests: string[] = []
+    let connected = true
+    let sessionAvailable = true
+    let liveConfig: Record<string, unknown> = {}
+    let prompts: string[] = []
+    const host = Bun.serve({
+      hostname: '127.0.0.1', port: 0,
+      async fetch(request) {
+        const pathname = new URL(request.url).pathname
+        requests.push(pathname)
+        if (pathname === '/config') return Response.json({ mcp: { 'agent-teams': liveConfig } })
+        if (pathname === '/mcp') return Response.json({ 'agent-teams': { status: connected ? 'connected' : 'disconnected' } })
+        if (pathname === '/session/session-1') {
+          return sessionAvailable ? Response.json({ id: 'session-1' }) : new Response('Session gone', { status: 404 })
+        }
+        if (pathname === '/api/teams/team-a/group-chats/list') {
+          if (request.headers.get('x-agent-teams-app-context') !== groupContext) return new Response('Wrong owner', { status: 409 })
+          return Response.json([{ id: '3695a573-5ad2-469a-91f2-427f90792e11', name: 'Design', archivedAt: null }])
+        }
+        return new Response('Not found', { status: 404 })
+      },
+    })
+    try {
+      process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND = process.execPath
+      process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENTRY =
+        fileURLToPath(new URL('./fixtures/group-chat-mcp.ts', import.meta.url))
+      const env = {
+        AGENT_TEAMS_BOUND_CONTROL_URL: host.url.origin,
+        AGENT_TEAMS_BOUND_CONTEXT_JSON: groupContext,
+        SYNTHETIC_MCP_TOOL_NAMES: JSON.stringify(REQUIRED_MOCK_MCP_TOOL_NAMES),
+        SYNTHETIC_GROUP_TOOLS: '1',
+      }
+      process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENV_JSON = JSON.stringify(env)
+      process.env.AGENT_TEAMS_BOUND_CONTROL_URL = env.AGENT_TEAMS_BOUND_CONTROL_URL
+      process.env.AGENT_TEAMS_BOUND_CONTEXT_JSON = env.AGENT_TEAMS_BOUND_CONTEXT_JSON
+      // Model the actual host's profile-preparation mutation independently of
+      // the production comparison helper. If the reader compares raw launch
+      // environment, this fixture rejects an otherwise valid live xAI group.
+      const managedMcp = async () => {
+        const { config } = await resolveOpenCodeAppMcpLaunchConfig()
+        const managedPaths = resolveClaudeMultimodelPaths()
+        return config.type === 'remote' ? config : {
+          ...config,
+          environment: {
+            ...config.environment,
+            CLAUDE_MULTIMODEL_DATA_HOME: managedPaths.data,
+            CLAUDE_MULTIMODEL_CACHE_HOME: managedPaths.cache,
+          },
+        }
+      }
+      liveConfig = await managedMcp()
+      expect((liveConfig.environment as Record<string, string>).CLAUDE_MULTIMODEL_DATA_HOME)
+        .toBe(resolveClaudeMultimodelPaths().data)
+      expect((liveConfig.environment as Record<string, string>).CLAUDE_MULTIMODEL_CACHE_HOME)
+        .toBe(resolveClaudeMultimodelPaths().cache)
+      const record = buildRecord({
+        selectedModel: 'xai/grok-4.5', toolApprovalMode: 'auto', runtimePid: process.pid,
+        profileScope: { purpose: 'launch_runtime', providerId: 'xai', scopeToken: 'xai-group',
+          configFingerprint: 'config', selectedAuthIdentity: 'absent' },
+        resolvedBehaviorFingerprint: 'owned-xai-config',
+        managedConfigFingerprint: 'owned-xai-config',
+        expectedBehaviorFingerprint: expectedFingerprintForModel('xai/grok-4.5'),
+        opencodeVersion: '1.4.0',
+        appManagedBootstrap: {
+          schemaVersion: 1, messageID: 'msg_owned_xai', contextHash: 'a'.repeat(64),
+          briefingHash: 'b'.repeat(64), injectionVerifiedAt: '2026-10-31T00:00:00Z',
+        },
+      })
+      openCodeSessionStore.list = async () => [record]
+      openCodeSessionStore.get = async () => record
+      openCodeProvisioningProbe.probe = async () => { throw new Error('broad discovery forbidden') }
+      openCodeProvisioningProbe.probeRetainingHost = async () => { throw new Error('auth scope preparation forbidden') }
+      let ownerChecks = 0
+      openCodeSessionBridge.withOwnedOAuthSessionObservation = (async (target, operation) => {
+        expect(target.runId).toBe(record.runId)
+        expect(target.opencodeSessionId).toBe(record.opencodeSessionId)
+        return operation({ baseUrl: host.url.origin, runtimePid: process.pid }, async () => { ownerChecks++ })
+      }) as typeof openCodeSessionBridge.withOwnedOAuthSessionObservation
+      openCodeSessionBridge.promptAsync = (async (_target, input) => { prompts.push(input.text) }) as typeof openCodeSessionBridge.promptAsync
+      Client.prototype.connect = originalClientConnect
+      Client.prototype.listTools = originalClientListTools
+      Client.prototype.close = originalClientClose
+
+      // The selected-lane handshake checks the *real* persisted launch
+      // capability, not an arbitrary marker. Keep the synthetic fixture's
+      // stable identity aligned with the host-less OAuth observation snapshot.
+      const expectedCapabilitySnapshotId = `opencode:${hash(JSON.stringify({
+        managedConfigFingerprint: record.managedConfigFingerprint,
+        mcpServers: ['agent-teams'],
+        projectBehaviorFingerprint: record.projectBehaviorFingerprint,
+        projectPath: normalizeOpenCodeProjectIdentity(record.projectPath),
+        providers: [],
+        version: record.opencodeVersion,
+      })).slice(0, 32)}`
+      const request = {
+        teamName: record.teamId, teamId: record.teamId, laneId: record.laneId, runId: record.runId,
+        memberName: record.memberName, requiredCommand: 'opencode.sendMessage',
+        expectedCapabilitySnapshotId,
+      }
+      const handshake = async () => {
+        const result = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.handshake', request))
+        if (!result.ok) throw new Error(`xAI group handshake failed: ${result.error.message}`)
+        if (!('server' in result.data)) throw new Error('Expected xAI handshake server')
+        return result.data.server
+      }
+      const admitted = await handshake()
+      expect(admitted.bridgeProtocol.groupChatProtocolVersion).toBe(1)
+      expect(admitted.runtime.groupChatRunProof).toEqual({
+        teamName: record.teamId, memberName: record.memberName, runId: record.runId, runKey: record.runId,
+        laneId: record.laneId, runtimePid: process.pid, runtimeSessionId: record.opencodeSessionId,
+        processorReady: true, groupReactionProtocolVersion: 1,
+      })
+      expect(requests).toContain('/config')
+      expect(requests).toContain('/mcp')
+      expect(requests).toContain('/session/session-1')
+      expect(ownerChecks).toBeGreaterThan(0)
+
+      const message = {
+        teamId: record.teamId, teamName: record.teamId, laneId: record.laneId, runId: record.runId,
+        memberName: record.memberName, text: 'Please review this design',
+        expectedCapabilitySnapshotId: admitted.runtime.capabilitySnapshotId,
+        expectedBehaviorFingerprint: record.expectedBehaviorFingerprint,
+        groupChatProtocolVersion: 1, groupRunKey: record.runId,
+        groupChatId: '3695a573-5ad2-469a-91f2-427f90792e11', groupChatName: 'Design',
+        groupMessageId: 'b8192a4c-97c8-4f67-bccd-7b29d8131286',
+        messageId: '0bdf10f0-3fd3-4494-a974-b394de06c181',
+        from: 'user', timestamp: '2026-10-31T00:00:00Z', settlementMode: 'acceptance',
+      }
+      const delivered = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.sendMessage', message))
+      expect(delivered.ok).toBe(true)
+      if (!delivered.ok || !('accepted' in delivered.data)) throw new Error('Expected owned xAI group acceptance')
+      expect(delivered.data.accepted).toBe(true)
+      expect(prompts).toHaveLength(1)
+      expect(prompts[0]).toContain('Group name: "Design"')
+      expect(prompts[0]).toContain('Fresh group catalog:')
+
+      connected = false
+      expect((await handshake()).runtime.groupChatRunProof).toBeUndefined()
+      connected = true
+      sessionAvailable = false
+      expect((await handshake()).runtime.groupChatRunProof).toBeUndefined()
+      sessionAvailable = true
+      liveConfig = { type: 'local', command: ['foreign-agent'], environment: env }
+      expect((await handshake()).runtime.groupChatRunProof).toBeUndefined()
+      liveConfig = await managedMcp()
+      // Never normalize away a forged managed root or any other MCP identity.
+      const correct = await managedMcp()
+      liveConfig = { ...correct, environment: {
+        ...correct.environment, CLAUDE_MULTIMODEL_DATA_HOME: '/foreign-data-root',
+      } }
+      expect((await handshake()).runtime.groupChatRunProof).toBeUndefined()
+      liveConfig = correct
+      process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ENV_JSON =
+        JSON.stringify({ ...env, SYNTHETIC_GROUP_TOOLS: '0' })
+      liveConfig = await managedMcp()
+      expect((await handshake()).runtime.groupChatRunProof).toBeUndefined()
+      expect(prompts).toHaveLength(1)
+    } finally {
+      host.stop(true)
+      if (previousBoundControlUrl === undefined) delete process.env.AGENT_TEAMS_BOUND_CONTROL_URL
+      else process.env.AGENT_TEAMS_BOUND_CONTROL_URL = previousBoundControlUrl
+      if (previousBoundControlContext === undefined) delete process.env.AGENT_TEAMS_BOUND_CONTEXT_JSON
+      else process.env.AGENT_TEAMS_BOUND_CONTEXT_JSON = previousBoundControlContext
+      if (previousManagedDataHome === undefined) delete process.env.CLAUDE_MULTIMODEL_DATA_HOME
+      else process.env.CLAUDE_MULTIMODEL_DATA_HOME = previousManagedDataHome
+      if (previousManagedCacheHome === undefined) delete process.env.CLAUDE_MULTIMODEL_CACHE_HOME
+      else process.env.CLAUDE_MULTIMODEL_CACHE_HOME = previousManagedCacheHome
+    }
+  })
+
   test('exposes the OpenCode task ledger evidence contract version in handshake', async () => {
     openCodeProvisioningProbe.probe = async () => snapshot
 
@@ -2222,6 +2412,253 @@ describe('OpenCodeBridgeCommandHandler', () => {
         expect(terminal?.stopAuthority).toBeUndefined()
       }
     })
+  })
+
+  // After a crash, startup cleanup deletes the dead host's registry record.
+  // These cases run the real probe forwarding, host manager decision and fenced
+  // close; only the kernel answer to kill(pid, 0) is simulated per pid.
+  type UnregisteredHostStopCase = {
+    alicePid?: number
+    bobPid?: number
+    registry?: 'absent' | 'foreign-record' | 'exact-record'
+    signalZero: Record<number, 'alive' | 'ESRCH' | 'EPERM'>
+    xai?: boolean
+    // Simulates a host registered for the same key between probe and close.
+    registerBeforeClose?: { pid: number }
+    // Simulates bob's session being pinned to another pid after the Stop probe.
+    repinBobAfterStopProbe?: { pid: number }
+    // Simulates a host start for the same key that is still in flight.
+    pendingStart?: boolean
+  }
+  type UnregisteredHostStopOutcome = {
+    handshakeOk: boolean
+    stop: Awaited<ReturnType<typeof executeOpenCodeBridgeCommandEnvelope>>
+    stopped: Record<string, boolean>
+    stopAuthorities: unknown[]
+    registryChanged: boolean
+    fatalSignals: string[]
+    strictReleases: string[]
+    cleanups: number
+    probeErrors: unknown[]
+  }
+
+  async function stopAfterHostRecordCleanup(
+    input: UnregisteredHostStopCase,
+  ): Promise<UnregisteredHostStopOutcome> {
+    let outcome: UnregisteredHostStopOutcome | undefined
+    const xaiScope = { purpose: 'launch_runtime' as const, providerId: 'xai', scopeToken: 'lane-scope',
+      configFingerprint: 'config', selectedAuthIdentity: 'absent' as const }
+    await withGoneHostLane({
+      ...(input.alicePid === undefined ? {} : { runtimePid: input.alicePid }),
+      ...(input.xai ? { selectedModel: 'xai/grok-4', profileScope: xaiScope } : {}),
+    }, async ({ store, record, body }) => {
+      const { runtimePid: _alicePid, ...bob } = { ...record, memberName: 'bob', opencodeSessionId: 'session-bob' }
+      await store.upsert(input.bobPid === undefined ? bob : { ...bob, runtimePid: input.bobPid })
+      const projectPath = String(body.projectPath)
+      const registryPath = path.join(projectPath, 'TEST-host-registry.json')
+      const profile = { ...snapshot.profile!, projectPath, canonicalProjectPath: projectPath,
+        workingDirectoryPath: projectPath }
+      const hostRecord = (pid: number) => ({ hostKey: record.hostKey, profileRootKey: profile.profileRootKey,
+        projectPath, projectBehaviorFingerprint: profile.projectBehaviorFingerprint,
+        baseUrl: 'http://127.0.0.1:4096', port: 4096, pid, processStartedAtMs: 1000, version: '1.4.0',
+        managedConfigFingerprint: profile.managedConfigFingerprint,
+        resolvedConfigFingerprint: profile.managedConfigFingerprint, updatedAt: '2026-04-22T12:00:00.000Z' })
+      const writeRegistry = (hosts: Record<string, unknown>) => writeFile(registryPath, JSON.stringify({
+        schemaVersion: 1, processIdentityFormat: 'platform-native-v2', hosts }))
+      await writeRegistry(input.registry === 'exact-record'
+        ? { [record.hostKey]: hostRecord(input.alicePid ?? 123) }
+        : input.registry === 'foreign-record'
+          ? { [record.hostKey]: { ...hostRecord(input.alicePid ?? 123), managedConfigFingerprint: 'foreign' } }
+          : {})
+      let registryBefore = await readFile(registryPath, 'utf8')
+      const fatalSignals: string[] = []
+      const manager = new OpenCodeHostManager({
+        persistentRegistryPath: registryPath,
+        spawnHostProcess: () => { throw new Error('must not spawn') },
+        killProcess: (pid, signal) => { fatalSignals.push(`${pid}:${signal}`) },
+        readProcessStartTimeMs: async () => 1000,
+        fetchJson: async () => { throw new Error('must not probe a gone host') },
+      })
+      if (input.pendingStart) {
+        // Same fixture shape as dead-run recovery: no runtime is launched.
+        (manager as unknown as { pendingHosts: Map<string, unknown> })
+          .pendingHosts.set(record.hostKey, new Promise(() => {}))
+      }
+      const realKill = process.kill.bind(process)
+      const kill = spyOn(process, 'kill').mockImplementation(((pid: number, signal?: string | number) => {
+        const answer = input.signalZero[pid]
+        if (answer === undefined) return realKill(pid, signal)
+        if (signal !== 0) {
+          fatalSignals.push(`${pid}:${String(signal)}`)
+          return true
+        }
+        if (answer === 'alive') return true
+        throw Object.assign(new Error(answer), { code: answer })
+      }) as typeof process.kill)
+      const originalAbsentAuthority = openCodeHostManager.withConfirmedAbsentHostAuthority
+      openCodeHostManager.withConfirmedAbsentHostAuthority = async (...args) => {
+        if (input.registerBeforeClose) {
+          await writeRegistry({ [record.hostKey]: hostRecord(input.registerBeforeClose.pid) })
+          registryBefore = await readFile(registryPath, 'utf8')
+        }
+        return manager.withConfirmedAbsentHostAuthority(...args)
+      }
+      let cleanups = 0
+      openCodeHostManager.reconcilePersistentHosts = (async () => {
+        cleanups += 1
+        return { cleaned: 0, remaining: 0, hosts: [], diagnostics: [] }
+      }) as typeof openCodeHostManager.reconcilePersistentHosts
+      const strictReleases: string[] = []
+      openCodeSessionBridge.releaseSession = async (target, options) => {
+        if (options?.strictLeaseRelease) strictReleases.push(target.memberName)
+      }
+      const probeErrors: unknown[] = []
+      let probes = 0
+      openCodeProvisioningProbe.probeRetainingHost = (async (probePath, options) => {
+        probes += 1
+        try {
+          return await new OpenCodeProvisioningProbe({
+            inventoryService: { probe: async () => ({ detected: true, projectPath: probePath, profile,
+              models: [], diagnostics: [] }) as never },
+            hostManager: manager,
+          }).probeRetainingHost(probePath, { ...options, selectedModel: undefined })
+        } catch (error) {
+          probeErrors.push(error)
+          // The second probe belongs to Stop; the lane snapshot is already taken.
+          if (probes === 2 && input.repinBobAfterStopProbe) {
+            await store.upsert({ ...bob, runtimePid: input.repinBobAfterStopProbe.pid })
+          }
+          throw error
+        }
+      }) as typeof openCodeProvisioningProbe.probeRetainingHost
+      try {
+        const handshake = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.handshake', {
+          ...body, requiredCommand: 'opencode.stopTeam',
+        }))
+        const stop = await executeOpenCodeBridgeCommandEnvelope(buildEnvelope('opencode.stopTeam', body))
+        const members = await Promise.all(['alice', 'bob'].map(memberName =>
+          store.get(record.teamId, record.laneId ?? 'primary', memberName)))
+        outcome = {
+          handshakeOk: handshake.ok,
+          stop,
+          stopped: Object.fromEntries(members.map(member => [member!.memberName, Boolean(member!.stoppedAt)])),
+          stopAuthorities: members.map(member => member!.stopAuthority),
+          registryChanged: await readFile(registryPath, 'utf8') !== registryBefore,
+          fatalSignals,
+          strictReleases,
+          cleanups,
+          probeErrors,
+        }
+      } finally {
+        kill.mockRestore()
+        openCodeHostManager.withConfirmedAbsentHostAuthority = originalAbsentAuthority
+      }
+    })
+    return outcome!
+  }
+
+  function expectLaneUntouched(outcome: UnregisteredHostStopOutcome): void {
+    expect(outcome.handshakeOk).toBe(false)
+    expect(outcome.stop.ok).toBe(false)
+    expect(outcome.stopped).toEqual({ alice: false, bob: false })
+    expect(outcome.registryChanged).toBe(false)
+    expect(outcome.fatalSignals).toEqual([])
+    expect(outcome.strictReleases).toEqual([])
+  }
+
+  test('stop closes a lane whose host record is gone and whose single pinned pid is ESRCH-gone', async () => {
+    const outcome = await stopAfterHostRecordCleanup({ alicePid: 123, bobPid: 123, signalZero: { 123: 'ESRCH' } })
+    expect(outcome.handshakeOk).toBe(true)
+    expect(outcome.stop.ok).toBe(true)
+    if (!('data' in outcome.stop) || !('stopped' in outcome.stop.data)) throw new Error('missing stop result')
+    expect(outcome.stop.data.stopped).toBe(true)
+    expect(outcome.stopped).toEqual({ alice: true, bob: true })
+    // Process absence closes the sessions; it never mints a Stop receipt.
+    expect(outcome.stopAuthorities).toEqual([undefined, undefined])
+    // Nothing is killed, no lease is released and the registry is not written.
+    expect(outcome.fatalSignals).toEqual([])
+    expect(outcome.strictReleases).toEqual([])
+    expect(outcome.registryChanged).toBe(false)
+    expect(outcome.cleanups).toBe(1)
+  })
+
+  test('stop keeps a lane open when its unregistered host pid is alive', async () => {
+    expectLaneUntouched(await stopAfterHostRecordCleanup({ alicePid: 123, bobPid: 123, signalZero: { 123: 'alive' } }))
+  })
+
+  test('stop keeps a lane open when its sessions name different pids', async () => {
+    expectLaneUntouched(await stopAfterHostRecordCleanup({ alicePid: 123, bobPid: 456,
+      signalZero: { 123: 'ESRCH', 456: 'alive' } }))
+  })
+
+  test('stop keeps a lane open when a session has no recorded pid', async () => {
+    expectLaneUntouched(await stopAfterHostRecordCleanup({ alicePid: 123, signalZero: { 123: 'ESRCH' } }))
+    expectLaneUntouched(await stopAfterHostRecordCleanup({ signalZero: { 123: 'ESRCH' } }))
+  })
+
+  test('stop keeps a lane open when kill(pid, 0) answers EPERM', async () => {
+    expectLaneUntouched(await stopAfterHostRecordCleanup({ alicePid: 123, bobPid: 123, signalZero: { 123: 'EPERM' } }))
+  })
+
+  test('stop keeps OAuth lanes on the strict path when their host record is gone', async () => {
+    expectLaneUntouched(await stopAfterHostRecordCleanup({ alicePid: 123, bobPid: 123, xai: true,
+      signalZero: { 123: 'ESRCH' } }))
+  })
+
+  test('stop keeps the previous rules while a host record exists', async () => {
+    // A record that no longer matches the lane stays fail-closed even if the
+    // pid is gone.
+    expectLaneUntouched(await stopAfterHostRecordCleanup({ alicePid: 123, bobPid: 123,
+      registry: 'foreign-record', signalZero: { 123: 'ESRCH' } }))
+    // An exact dead record still uses the registered path: strict lease release
+    // through the session bridge, never the unregistered close.
+    const registered = await stopAfterHostRecordCleanup({ alicePid: 123, bobPid: 123,
+      registry: 'exact-record', signalZero: { 123: 'ESRCH' } })
+    expect(registered.stop.ok).toBe(true)
+    expect(registered.stopped).toEqual({ alice: true, bob: true })
+    expect([...registered.strictReleases].sort()).toEqual(['alice', 'bob'])
+    expect(registered.fatalSignals).toEqual([])
+  })
+
+  test('stop does not close when a host record for the key appears before closure', async () => {
+    // Same key and even the same (reused) pid: the fenced close must refuse
+    // instead of treating the new record as the dead one and deleting it.
+    const outcome = await stopAfterHostRecordCleanup({ alicePid: 123, bobPid: 123,
+      signalZero: { 123: 'ESRCH' }, registerBeforeClose: { pid: 123 } })
+    expect(outcome.stop.ok).toBe(true)
+    if (!('data' in outcome.stop) || !('stopped' in outcome.stop.data)) throw new Error('missing stop result')
+    expect(outcome.stop.data.stopped).toBe(false)
+    expect(outcome.stop.data.members.alice?.diagnostics)
+      .toContain('OpenCode host closure requires no registry record, but one exists')
+    expect(outcome.stopped).toEqual({ alice: false, bob: false })
+    expect(outcome.registryChanged).toBe(false)
+    expect(outcome.fatalSignals).toEqual([])
+    expect(outcome.strictReleases).toEqual([])
+  })
+
+  test('stop keeps a member open when its session is pinned to another pid before closure', async () => {
+    const outcome = await stopAfterHostRecordCleanup({ alicePid: 123, bobPid: 123,
+      signalZero: { 123: 'ESRCH', 456: 'alive' }, repinBobAfterStopProbe: { pid: 456 } })
+    expect(outcome.stop.ok).toBe(true)
+    if (!('data' in outcome.stop) || !('stopped' in outcome.stop.data)) throw new Error('missing stop result')
+    expect(outcome.stop.data.stopped).toBe(false)
+    expect(outcome.stop.data.members.bob?.diagnostics).toContain('identity changed before dead-host closure')
+    expect(outcome.stopped).toEqual({ alice: true, bob: false })
+    expect(outcome.registryChanged).toBe(false)
+    expect(outcome.fatalSignals).toEqual([])
+    expect(outcome.strictReleases).toEqual([])
+  })
+
+  test('stop keeps a lane open while a host start for its key is in flight', async () => {
+    const outcome = await stopAfterHostRecordCleanup({ alicePid: 123, bobPid: 123,
+      signalZero: { 123: 'ESRCH' }, pendingStart: true })
+    expectLaneUntouched(outcome)
+    // The handshake and Stop probes both see the generic error, never the new type.
+    expect(outcome.probeErrors).toHaveLength(2)
+    for (const error of outcome.probeErrors) {
+      expect(isOpenCodeUnregisteredHostProcessGoneError(error)).toBe(false)
+      expect((error as Error).message).toBe('OpenCode existing host authority is unavailable or changed')
+    }
   })
 
   for (const failure of ['abort', 'release', 'cas'] as const) {

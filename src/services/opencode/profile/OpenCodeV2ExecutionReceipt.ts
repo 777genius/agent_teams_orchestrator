@@ -16,11 +16,14 @@ import type { ValidatedExecutionNative } from '../host/OpenCodeV2ExecutionBindin
 
 type PeExecutableFailure = 'native_selection_changed' | 'controller_runtime_invalid'
 
-/** Qualify one canonical x64 PE executable from a bounded, stable byte snapshot. */
+/** Qualify a native PE executable from a bounded, stable byte snapshot; no emulation fallback. */
 async function inspectOpenCodeV2WindowsPeExecutable(file: string, expectedName: string,
-  failure: PeExecutableFailure): Promise<Readonly<{ path: string; sha256: string }>> {
+  failure: PeExecutableFailure, signal?: AbortSignal): Promise<Readonly<{ path: string; sha256: string }>> {
+  signal?.throwIfAborted()
   const invalid = failure === 'controller_runtime_invalid' ? 'controller_runtime_pe_invalid' : failure
   const architecture = failure === 'controller_runtime_invalid' ? 'controller_runtime_architecture_invalid' : failure
+  const expectedMachine = process.arch === 'x64' ? 0x8664 : process.arch === 'arm64' ? 0xaa64 : null
+  executionAssert(expectedMachine !== null, architecture)
   executionAssert(path.isAbsolute(file) && path.basename(file) === expectedName && await realpath(file) === file, invalid)
   const leaf = await lstat(file)
   executionAssert(leaf.isFile() && !leaf.isSymbolicLink(), invalid)
@@ -32,6 +35,7 @@ async function inspectOpenCodeV2WindowsPeExecutable(file: string, expectedName: 
     const captured = Buffer.alloc(Math.min(before.size, 1024 * 1024))
     const chunk = Buffer.alloc(64 * 1024), hash = createHash('sha256')
     for (let offset = 0; offset < before.size;) {
+      signal?.throwIfAborted()
       const { bytesRead } = await handle.read(chunk, 0, Math.min(chunk.length, before.size - offset), offset)
       executionAssert(bytesRead > 0, invalid)
       if (offset < captured.length)
@@ -55,7 +59,7 @@ async function inspectOpenCodeV2WindowsPeExecutable(file: string, expectedName: 
     executionAssert(sectionTableEnd <= captured.length && sectionTableEnd <= before.size, invalid)
     executionAssert(captured.readUInt16LE(optional) === 0x20b, invalid)
     executionAssert((characteristics & 0x0002) !== 0 && (characteristics & 0x2000) === 0, invalid)
-    executionAssert(machine === 0x8664, architecture)
+    executionAssert(machine === expectedMachine, architecture)
     return Object.freeze({ path: file, sha256: hash.digest('hex') })
   } finally {
     await handle.close()
@@ -63,32 +67,33 @@ async function inspectOpenCodeV2WindowsPeExecutable(file: string, expectedName: 
 }
 
 /** Read-only installed graph receipt; no server import, CLI execution, or output file. */
-export async function createOpenCodeV2ExecutionReceipt(_sourceRoot: string, identity: import('../compatibility/OpenCodeNativeIdentity.js').OpenCodeV2NativeIdentity, controller?: ExecutionMcpConfig, binding?: OpenCodeV2DeliveryBinding): Promise<ValidatedExecutionNative> {
+export async function createOpenCodeV2ExecutionReceipt(_sourceRoot: string, identity: import('../compatibility/OpenCodeNativeIdentity.js').OpenCodeV2NativeIdentity, controller?: ExecutionMcpConfig, binding?: OpenCodeV2DeliveryBinding, signal?: AbortSignal): Promise<ValidatedExecutionNative> {
+signal?.throwIfAborted()
 assertExecutionPlatformAvailable()
 executionAssert(process.versions.bun === openCodeBunVersion() && identity.generation === 'v2', 'source_bun_required')
 const cli = await realpath(identity.executablePath), bun = await realpath(process.execPath), pin = openCodeV2EngineVersion(identity)
-const sha = async (file: string) => createHash('sha256').update(await readFile(file)).digest('hex')
+const sha = async (file: string) => createHash('sha256').update(await readFile(file, { signal })).digest('hex')
 const cliSha256 = process.platform === 'win32'
-  ? (await inspectOpenCodeV2WindowsPeExecutable(cli, 'opencode.exe', 'native_selection_changed')).sha256
+  ? (await inspectOpenCodeV2WindowsPeExecutable(cli, 'opencode.exe', 'native_selection_changed', signal)).sha256
   : await sha(cli)
 executionAssert(cliSha256 === identity.executableSha256, 'native_selection_changed')
 const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'execution', binding)
 // Legacy callers supply a source root; delivery is derived from this module, never that hint.
 const resolutionRoot = delivery.runtimeMode === 'source' ? path.join(delivery.root, 'src/services/opencode/host') : delivery.root
-const { files, visit } = await collectOpenCodeV2GraphFiles(pin, resolutionRoot, delivery.binding)
+const { files, visit } = await collectOpenCodeV2GraphFiles(pin, resolutionRoot, delivery.binding, signal)
 if (controller?.type === 'local') {
   executionAssert(controller.command.length >= 2 && path.isAbsolute(controller.command[0]!), 'controller_runtime_missing')
   const runtime = await realpath(controller.command[0]!)
   executionAssert(runtime === controller.command[0] && (await lstat(runtime)).isFile(), 'controller_runtime_invalid')
   let runtimeFiles: readonly Readonly<{ path: string; sha256: string }>[]
   if (process.platform === 'win32')
-    runtimeFiles = [await inspectOpenCodeV2WindowsPeExecutable(runtime, 'node.exe', 'controller_runtime_invalid')]
+    runtimeFiles = [await inspectOpenCodeV2WindowsPeExecutable(runtime, 'node.exe', 'controller_runtime_invalid', signal)]
   else {
-    const magic = (await readFile(runtime)).subarray(0, 4).toString('hex')
+    const magic = (await readFile(runtime, { signal })).subarray(0, 4).toString('hex')
     executionAssert(process.platform === 'linux' ? magic === '7f454c46' :
       ['cffaedfe', 'cefaedfe', 'feedfacf', 'feedface', 'cafebabe', 'bebafeca', 'cafebabf', 'bfbafeca'].includes(magic), 'controller_runtime_invalid')
     runtimeFiles = process.platform === 'darwin'
-      ? (await resolveOpenCodeV2DarwinControllerRuntimeClosure(runtime)).files
+      ? (await resolveOpenCodeV2DarwinControllerRuntimeClosure(runtime, signal)).files
       : [{ path: runtime, sha256: await sha(runtime) }]
   }
   for (const row of runtimeFiles) {
@@ -123,7 +128,7 @@ async function qualifyOptionalTaskNode(): Promise<OptionalTaskNodeAdmission | un
     throw error
   }
   try {
-    const closure = await resolveOpenCodeV2DarwinControllerRuntimeClosure(runtime)
+    const closure = await resolveOpenCodeV2DarwinControllerRuntimeClosure(runtime, signal)
     const node = closure.files.find(row => row.path === runtime)
     executionAssert(node, 'controller_runtime_dependency_missing')
     executionAssert(node.sha256 === await sha(runtime), 'controller_runtime_changed')
@@ -165,7 +170,8 @@ const native = { generation: 'v2', version: identity.version, engineVersion: pin
   bun: { path: bun, sha256: await sha(bun) }, graph: { sha256: executionHash(files), files, ...(delivery.binding ? { delivery: delivery.binding } : {}) },
   ...(taskNode ? { taskNode } : {}) } satisfies ValidatedExecutionNative
 executionAssert(native.executableSha256 === identity.executableSha256 && native.packageName === identity.packageName, 'native_selection_changed')
-await validateExecutionNative(native)
+await validateExecutionNative(native, signal)
+signal?.throwIfAborted()
 return native
 }
 
@@ -205,7 +211,8 @@ function isOptionalNodeClosureFailure(error: unknown): boolean {
 
 /** Bind the selected Mach-O runtime's load commands and their exact file aliases.
  * System shared-cache images retain the existing Darwin system-policy scope. */
-export async function resolveOpenCodeV2DarwinControllerRuntimeClosure(runtime: string): Promise<DarwinControllerRuntimeClosure> {
+export async function resolveOpenCodeV2DarwinControllerRuntimeClosure(runtime: string, signal?: AbortSignal): Promise<DarwinControllerRuntimeClosure> {
+  signal?.throwIfAborted()
   executionAssert(process.platform === 'darwin' && path.isAbsolute(runtime) && await realpath(runtime) === runtime,
     'controller_runtime_invalid')
   const files = new Map<string, Readonly<{ path: string; sha256: string }>>()
@@ -272,6 +279,7 @@ export async function resolveOpenCodeV2DarwinControllerRuntimeClosure(runtime: s
     return { dependencies, rpaths }
   }
   async function visit(target: string, inheritedRpaths: readonly string[]): Promise<void> {
+    signal?.throwIfAborted()
     const source = await realpath(target)
     if (source !== target) aliases.set(target, Object.freeze({ source, target }))
     if (files.has(source)) return
@@ -280,7 +288,7 @@ export async function resolveOpenCodeV2DarwinControllerRuntimeClosure(runtime: s
       'controller_runtime_dependency_budget')
     totalBytes += stat.size
     executionAssert(totalBytes <= 512 * 1024 * 1024, 'controller_runtime_dependency_budget')
-    const bytes = await readFile(source), parsed = commands(bytes)
+    const bytes = await readFile(source, { signal }), parsed = commands(bytes)
     files.set(source, Object.freeze({ path: source, sha256: createHash('sha256').update(bytes).digest('hex') }))
     const rpaths = [...new Set([...parsed.rpaths.map(name => expand(name, target)), ...inheritedRpaths])]
     for (const name of parsed.dependencies) {

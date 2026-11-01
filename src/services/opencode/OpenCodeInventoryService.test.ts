@@ -10,6 +10,7 @@ import {
   execOpenCodePortableCommand,
   filterOpenCodeConnectedProvidersForRuntime,
   getOpenCodeInventoryCommandTimeoutMs,
+  getOpenCodeRemainingInventoryCommandTimeoutMs,
   getOpenCodeRefreshModelsArgs,
   getOpenCodeVerboseModelsArgs,
   OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS,
@@ -88,6 +89,21 @@ function inventorySnapshot(
 }
 
 describe('OpenCodeInventoryService parsers', () => {
+  test('verbose and fallback model commands consume the same remaining full-inventory budget', () => {
+    let remaining = OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS
+    const timeRemaining = () => remaining
+    expect(getOpenCodeRemainingInventoryCommandTimeoutMs(['models', '--verbose'], timeRemaining))
+      .toBe(OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS)
+    remaining = 28_000
+    expect(getOpenCodeRemainingInventoryCommandTimeoutMs(['models'], timeRemaining)).toBe(28_000)
+    remaining = 8_000
+    expect(getOpenCodeRemainingInventoryCommandTimeoutMs(['version'], timeRemaining)).toBe(8_000)
+    remaining = 0
+    expect(() => getOpenCodeRemainingInventoryCommandTimeoutMs(['models'], timeRemaining))
+      .toThrow('OpenCode inventory probe timed out')
+  })
+
+
   test('requires an OpenCode version with native SuperGrok OAuth support', () => {
     expect(supportsOpenCodeSuperGrokOAuth('1.15.6')).toBe(false)
     expect(supportsOpenCodeSuperGrokOAuth('v1.15.7')).toBe(true)
@@ -135,7 +151,7 @@ describe('OpenCodeInventoryService parsers', () => {
     expect(OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS).toBe(180_000)
     expect(OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS).toBe(30_000)
     expect(OPEN_CODE_PROBE_TIMEOUT_MS).toBe(10_000)
-    expect(OPEN_CODE_MODEL_LIST_TIMEOUT_MS).toBe(30_000)
+    expect(OPEN_CODE_MODEL_LIST_TIMEOUT_MS).toBe(180_000)
   })
 
   test('queries the full OpenCode model inventory, not only the opencode provider', () => {

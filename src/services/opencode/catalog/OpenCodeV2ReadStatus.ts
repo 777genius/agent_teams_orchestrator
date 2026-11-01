@@ -1,7 +1,10 @@
 import { createHash } from 'node:crypto'
+import { isOpenCodeV2AnonymousProvider, isOpenCodeV2ModelFree } from './OpenCodeV2ModelPricing.js'
 import { openCodeReadAssert } from '../transport/OpenCodeBoundedFetch.js'
 import type { OpenCodeV2NativeIdentity } from '../compatibility/OpenCodeNativeIdentity.js'
-import { openCodeV2EngineVersion, type OpenCodeV2Dialect, type OpenCodeV2Pin } from '../compatibility/OpenCodeV2Registry.js'
+import { openCodeV2EngineVersion, openCodeV2Wire, type OpenCodeV2Dialect, type OpenCodeV2Pin } from '../compatibility/OpenCodeV2Registry.js'
+
+export type OpenCodeV2ReadIntegration = { id: string; name: string; plainKey: boolean }
 
 /** Serialized SDK contract for the later product reader. No generated native types. */
 export type OpenCodeV2ReadStatus = {
@@ -20,10 +23,11 @@ export type OpenCodeV2ReadStatus = {
   supportState: 'capabilities_pending'
   teamLaunch: false
   oneShot: false
-  providers: Array<{ id: string; integrationId: string | null; activation: 'auto' | 'enabled' | 'disabled' }>
+  integrations: OpenCodeV2ReadIntegration[]
+  providers: Array<{ id: string; integrationId: string | null; activation: 'auto' | 'enabled' | 'disabled'; anonymous?: boolean }>
   models: Array<{ providerId: string; catalogId: string; upstreamModelId: string; variants: string[];
     enabled: boolean; status: 'active' | 'alpha' | 'beta' | 'deprecated';
-    tools: boolean; input: string[]; output: string[]; context: number; outputTokens: number }>
+    tools: boolean; input: string[]; output: string[]; context: number; outputTokens: number; free?: boolean }>
   agents: Array<{ id: string; mode: 'primary' | 'subagent' | 'all' }>
   defaultModel: { providerId: string; catalogId: string } | null
 }
@@ -36,7 +40,7 @@ export function emptyOpenCodeV2ReadStatus(native: OpenCodeV2NativeIdentity, dire
     selectionKey: readStatusKey(`${native.executablePath}\0${native.executableSha256}\0${native.dialect}${openCodeV2EngineVersion(native) === native.version ? '' : `\0${native.version}`}${native.origin === 'standalone' ? '\0standalone' : ''}`),
     locationKey: readStatusKey(directory), projectId: null, catalog: 'unavailable', configuration: null,
     authentication: 'unknown', supportState: 'capabilities_pending', teamLaunch: false, oneShot: false,
-    providers: [], models: [], agents: [], defaultModel: null,
+    integrations: [], providers: [], models: [], agents: [], defaultModel: null,
   }
 }
 export function readRecord(value: unknown): Record<string, unknown> {
@@ -70,7 +74,16 @@ export function readWrapped(value: unknown, directory: string, projectId: string
 export function readProvider(value: unknown): OpenCodeV2ReadStatus['providers'][number] {
   const row = readRecord(value), activation = row.activation
   openCodeReadAssert(activation === 'auto' || activation === 'enabled' || activation === 'disabled')
-  return { id: readToken(row.id), integrationId: row.integrationID === undefined ? null : readToken(row.integrationID), activation }
+  return { id: readToken(row.id), integrationId: row.integrationID === undefined ? null : readToken(row.integrationID), activation,
+    anonymous: isOpenCodeV2AnonymousProvider(row) }
+}
+/** Discovery retains only public identity and the key method we can actually submit.
+ * Connection records, metadata, environment names and provider forms never leave this boundary. */
+export function readIntegration(value: unknown): OpenCodeV2ReadIntegration {
+  const row = readRecord(value), methods = readArray(row.methods).map(readRecord)
+  readArray(row.connections)
+  return { id: readToken(row.id), name: readToken(row.name),
+    plainKey: methods.some(method => method.type === 'key' && method.form === undefined) }
 }
 export function readModel(value: unknown): OpenCodeV2ReadStatus['models'][number] {
   const row = readRecord(value), status = row.status, capabilities = readRecord(row.capabilities), limit = readRecord(row.limit)
@@ -81,19 +94,22 @@ export function readModel(value: unknown): OpenCodeV2ReadStatus['models'][number
   return { providerId: readToken(row.providerID), catalogId: readToken(row.id), upstreamModelId: readToken(row.modelID),
     variants: readArray(row.variants).map(item => readToken(readRecord(item).id)), enabled: row.enabled, status,
     tools: capabilities.tools, input: readArray(capabilities.input).map(readToken), output: readArray(capabilities.output).map(readToken),
-    context: limit.context, outputTokens: limit.output }
+    context: limit.context, outputTokens: limit.output, free: isOpenCodeV2ModelFree(readToken(row.providerID), row.cost) }
 }
 export function readAgent(value: unknown): OpenCodeV2ReadStatus['agents'][number] {
   const row = readRecord(value), mode = row.mode
   openCodeReadAssert(mode === 'primary' || mode === 'subagent' || mode === 'all')
   return { id: readToken(row.id), mode }
 }
-export function readConfiguration(value: unknown): NonNullable<OpenCodeV2ReadStatus['configuration']> {
+export function readConfiguration(value: unknown, version?: OpenCodeV2Pin): NonNullable<OpenCodeV2ReadStatus['configuration']> {
   let documents = 0, directories = 0
   for (const entry of readArray(value)) {
     const row = readRecord(entry)
     if (row.type === 'document') { readRecord(row.info); documents++ }
-    else if (row.type === 'directory') { openCodeReadAssert(typeof row.path === 'string'); directories++ }
+    // @opencode/schema@2.0.0 also exposes AgentsDirectory and ClaudeDirectory.
+    // Later dialects removed those tags; they are not a generic unknown-entry fallback.
+    else if (row.type === 'directory' || version !== undefined && openCodeV2Wire(version) === 'floor' &&
+      (row.type === 'agents' || row.type === 'claude')) { openCodeReadAssert(typeof row.path === 'string'); directories++ }
     else throw new Error('invalid_response')
   }
   return { documents, directories }
