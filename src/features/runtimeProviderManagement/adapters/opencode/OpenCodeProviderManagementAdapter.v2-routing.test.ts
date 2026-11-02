@@ -37,7 +37,20 @@ mock.module('./OpenCodeV2ProviderManagement.js', () => ({
 }))
 const { OpenCodeProviderManagementAdapter } = await import('./OpenCodeProviderManagementAdapter.js')
 let legacyReads = 0
-const adapter = new OpenCodeProviderManagementAdapter({ inventoryService: { probe: async () => { legacyReads++; throw new Error('TEST legacy inventory must not execute for V2') } } })
+const legacyCredentialWrites: string[] = [], legacyPreferenceWrites: string[] = []
+const adapter = new OpenCodeProviderManagementAdapter({
+  inventoryService: { probe: async () => { legacyReads++; throw new Error('TEST legacy inventory must not execute for V2') } },
+  clientFactory: { create: () => ({
+    getConfigProviders: async () => { throw new Error('TEST V1 config read forbidden') },
+    getProviders: async () => { throw new Error('TEST V1 provider read forbidden') },
+    getProviderAuth: async () => { throw new Error('TEST V1 auth read forbidden') },
+    setProviderAuth: async (providerId) => { legacyCredentialWrites.push(providerId); return true },
+  }) },
+  managedPreferences: {
+    setDefaultModel: async (_profile, model) => { legacyPreferenceWrites.push(model) },
+    clearProjectDefaultModel: async (profile) => { legacyPreferenceWrites.push(profile) },
+  },
+})
 
 test('first-time and curated V2 setup use the native reader before every V1 setup fallback', async () => {
   selectedV2 = true
@@ -129,6 +142,8 @@ test('missing and mismatched V2 identities never enter V1 setup, credentials or 
   const readsBefore = legacyReads
   const beforeSetup = setupCalls.length, beforeModels = modelCalls.length
   const beforeConnect = connectCalls.length, beforeTests = testCalls.length
+  const beforeLegacyCredentialWrites = legacyCredentialWrites.length
+  const beforeLegacyPreferenceWrites = legacyPreferenceWrites.length
   try {
     for (const scenario of ['v2-missing-native', 'unsupported', 'v2-version-mismatch'] as const) {
       overrideSelection = scenario
@@ -138,6 +153,8 @@ test('missing and mismatched V2 identities never enter V1 setup, credentials or 
         adapter.connectProvider({ ...input, method: 'api', apiKey: 'TEST-key' }),
         adapter.connectProvider({ ...input, method: 'oauth' }),
         adapter.testModel({ ...input, modelId: 'c41-upstream' }),
+        adapter.setDefaultModel({ ...input, modelId: 'c41-upstream', probe: false }),
+        adapter.clearProjectDefaultModel({ ...input, projectPath: '/TEST/project' }),
       ])
       for (const outcome of outcomes) {
         expect(outcome.ok).toBe(false)
@@ -150,6 +167,8 @@ test('missing and mismatched V2 identities never enter V1 setup, credentials or 
   expect(modelCalls.length).toBe(beforeModels)
   expect(connectCalls.length).toBe(beforeConnect)
   expect(testCalls.length).toBe(beforeTests)
+  expect(legacyCredentialWrites.length).toBe(beforeLegacyCredentialWrites)
+  expect(legacyPreferenceWrites.length).toBe(beforeLegacyPreferenceWrites)
 })
 
 test('V1 to V2 to V1 retains the native generation boundary across calls', async () => {
