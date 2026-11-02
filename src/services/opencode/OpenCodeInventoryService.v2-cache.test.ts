@@ -16,15 +16,17 @@ await mkdir(other)
 const original: OpenCodeV2NativeIdentity = { generation: 'v2', version: '2.1.4', engineVersion: '2.1.4',
   dialect: 'v2-2.1.4', executablePath: '/TEST/opencode', executableSha256: 'a'.repeat(64),
   origin: 'npm', packageName: '@opencode/cli-linux-x64' }
-let native = { ...original }, catalogReads = 0, failure = false
+let native = { ...original }, catalogReads = 0, failure = false, missingNativeBinary = false
 let receiptRows: OpenCodeConnectedProvider[] = []
 let finishRead: (() => void) | undefined
 let finishReceiptRead: (() => void) | undefined
 let pauseRead: (() => Promise<void>) | undefined
 let catalogName = 'OpenCode Go'
 mock.module('./compatibility/OpenCodeNativeIdentity.js', () => ({ ...identityModule,
-  inspectOpenCodeReadSelection: async () => ({ path: native.executablePath, native: { ...native },
-    policy: { generation: 'v2', version: native.version }, fingerprint: native.executableSha256 }),
+  inspectOpenCodeReadSelection: async () => missingNativeBinary
+    ? { path: null, native: null, policy: { generation: 'unsupported', version: null }, fingerprint: null }
+    : { path: native.executablePath, native: { ...native },
+      policy: { generation: 'v2', version: native.version }, fingerprint: native.executableSha256 },
 }))
 mock.module('./catalog/OpenCodeV2KeyIntegrations.js', () => ({ ...keyModule,
   readOpenCodeV2ConnectedProviders: async () => { finishReceiptRead?.(); return [...receiptRows] },
@@ -43,7 +45,7 @@ mock.module('./catalog/OpenCodeV2InventoryService.js', () => ({ ...inventoryModu
   },
 }))
 const { OpenCodeInventoryService } = await import('./OpenCodeInventoryService.js')
-beforeEach(() => { native = { ...original }; catalogReads = 0; failure = false; receiptRows = []; finishRead = undefined; finishReceiptRead = undefined;
+beforeEach(() => { native = { ...original }; catalogReads = 0; failure = false; missingNativeBinary = false; receiptRows = []; finishRead = undefined; finishReceiptRead = undefined;
   pauseRead = undefined; catalogName = 'OpenCode Go' })
 afterAll(() => rm(root, { recursive: true, force: true }))
 
@@ -54,6 +56,18 @@ function holdNextRead() {
   pauseRead = () => { begin(); return held }
   return { started, resume }
 }
+
+test('no selected executable never falls through to V1 profile/plugin preparation', async () => {
+  const service = new OpenCodeInventoryService()
+  missingNativeBinary = true
+  const snapshot = await service.probe(root, { mode: 'full' })
+  expect(snapshot.detected).toBe(false)
+  expect(snapshot.readGeneration).toBe('unsupported')
+  expect(snapshot.binaryPath).toBeNull()
+  expect(snapshot.profile).toBeNull()
+  expect(snapshot.connectedProviders).toEqual([])
+  expect(catalogReads).toBe(0)
+})
 
 test('successful V2 full reads reuse the catalog but reread completed connection receipts', async () => {
   const service = new OpenCodeInventoryService()
