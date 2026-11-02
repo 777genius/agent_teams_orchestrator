@@ -15,7 +15,6 @@ const setupCalls: LoadProviderSetupFormInput[] = [], setupSelections: unknown[] 
 const connectCalls: ConnectProviderInput[] = [], modelCalls: LoadProviderModelsInput[] = [], testCalls: TestProviderModelInput[] = []
 const boundaryFailure = { ok: false as const, error: { code: 'runtime-unhealthy' as const, message: 'TEST owned V2 boundary reached', recoverable: true } }
 mock.module('./OpenCodeV2ProviderManagement.js', () => ({
-  selectedOpenCodeV2Version: async () => selectedV2 ? '2.1.4' : null,
   buildOpenCodeV2KeySetupForm: () => null,
   inspectOpenCodeReadSelection: async () => {
     selectionReads++
@@ -31,7 +30,6 @@ mock.module('./OpenCodeV2ProviderManagement.js', () => ({
             : { policy: { generation: 'v1', version: '1.19.4' }, native: null }
     return lastReadSelection
   },
-  selectedProviderUsesOpenCodeV2: async () => { if (selectedIdentityError !== undefined) throw selectedIdentityError; return selectedV2 },
   connectOpenCodeV2Provider: async (input: ConnectProviderInput) => { connectCalls.push(input); return boundaryFailure },
   loadOpenCodeV2ProviderModels: async (input: LoadProviderModelsInput, selection?: unknown) => { modelCalls.push(input); modelSelections.push(selection); return boundaryFailure },
   loadOpenCodeV2ProviderSetupForm: async (input: LoadProviderSetupFormInput, selection?: unknown) => { setupCalls.push(input); setupSelections.push(selection); return boundaryFailure },
@@ -120,6 +118,8 @@ test('the selected native identity is the only V1/V2 routing authority', () => {
   expect(requireOpenCodeProviderRoute({ policy: { generation: 'v1', version: '1.19.4' }, native: null })).toBe('v1')
   expect(() => requireOpenCodeProviderRoute({ policy: v2Policy, native: null })).toThrow('opencode_provider_generation_unavailable')
   expect(() => requireOpenCodeProviderRoute({ policy: { generation: 'unsupported', version: null }, native: null })).toThrow('opencode_provider_generation_unavailable')
+  // OpenCode V1 below the selected-authority minimum (1.16) is unsupported, not a V1 plugin fallback.
+  expect(() => requireOpenCodeProviderRoute({ policy: { generation: 'unsupported', version: '1.15.7' }, native: null })).toThrow('opencode_provider_generation_unavailable')
   expect(() => requireOpenCodeProviderRoute({ policy: { generation: 'v1', version: '1.19.4' }, native })).toThrow('opencode_provider_generation_unavailable')
   expect(() => requireOpenCodeProviderRoute({ policy: v2Policy, native: { ...native, version: '2.0.32' } })).toThrow('opencode_provider_generation_unavailable')
 })

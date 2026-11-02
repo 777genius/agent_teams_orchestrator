@@ -1,4 +1,3 @@
-import { openCodeV2EngineVersion } from '../../../../services/opencode/compatibility/OpenCodeV2Registry.js'
 import { recordOpenCodeV2ProviderFailure } from '../../../../services/opencode/execution/OpenCodeV2Diagnostics.js'
 import { openCodeV2Refusal } from '../../../../services/opencode/execution/OpenCodeV2RefusalReason.js'
 export { recordOpenCodeV2ProviderFailure } from '../../../../services/opencode/execution/OpenCodeV2Diagnostics.js'
@@ -13,7 +12,6 @@ import { getOpenCodeV2DeclaredInputModalities } from '../../../../services/openc
 import { readIntegration } from '../../../../services/opencode/catalog/OpenCodeV2ReadStatus.js'
 import { isOpenCodeV2AnonymousProvider, isOpenCodeV2ModelFree } from '../../../../services/opencode/catalog/OpenCodeV2ModelPricing.js'
 import { inspectOpenCodeReadSelection } from '../../../../services/opencode/compatibility/OpenCodeNativeIdentity.js'
-import { requireOpenCodeProviderRoute } from './OpenCodeProviderRoute.js'
 export { inspectOpenCodeReadSelection } from '../../../../services/opencode/compatibility/OpenCodeNativeIdentity.js'
 import { canonicalizeOpenCodeProjectPath, resolveOpenCodeV2CatalogProfileScope, materializeOpenCodeV2CatalogScope } from '../../../../services/opencode/OpenCodeProfileManager.js'
 import { resolveClaudeMultimodelPaths } from '../../../../services/opencode/OpenCodeManagedPaths.js'
@@ -47,18 +45,6 @@ export function isOwnedProviderIntentMarker(stat: Pick<Stats, 'isFile' | 'isSymb
   platform: NodeJS.Platform = process.platform): boolean {
   return stat.isFile() && !stat.isSymbolicLink() && stat.size < 64 * 1024 &&
     (platform === 'win32' || stat.uid === process.getuid?.() && (stat.mode & 0o077) === 0)
-}
-
-export async function selectedProviderUsesOpenCodeV2(): Promise<boolean> {
-  return (await selectedOpenCodeV2Version()) !== null
-}
-export async function selectedOpenCodeV2Version(): Promise<OpenCodeV2Pin | null> {
-  const selected = await inspectOpenCodeReadSelection()
-  if (requireOpenCodeProviderRoute(selected) === 'v1') return null
-  // The route guard rejects unsupported generations, missing native V2 identity
-  // and mismatched engine versions before any V1 plugin or credential fallback.
-  if (!selected.native) throw new Error('opencode_provider_generation_unavailable')
-  return openCodeV2EngineVersion(selected.native)
 }
 
 
