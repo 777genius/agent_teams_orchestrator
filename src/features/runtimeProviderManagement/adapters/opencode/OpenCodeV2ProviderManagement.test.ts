@@ -3,6 +3,7 @@ import path from 'node:path'
 import { tmpdir } from 'node:os'
 import { test, expect } from 'bun:test'
 import { openCodeV2ModelTestMessage, openCodeV2ConnectProofFailureCode, openCodeV2ConnectFailureMessage, buildOpenCodeV2RuntimeProviderModel, openCodeV2ConnectionIDs, assertOpenCodeV2NativeV1AuthUnoccupied, assertOpenCodeV2SharedAuthMirrorSafe, requireOpenCodeV2OwnedConnection, rollbackOpenCodeV2OwnedConnection, retireOpenCodeV2CatalogOwner, recordOpenCodeV2ProviderFailure } from './OpenCodeV2ProviderManagement.js'
+import { readOpenCodeV2ConnectIntent, removeOpenCodeV2ConnectIntentIfUnchanged, writeOpenCodeV2ConnectIntent } from './OpenCodeV2ProviderConnectIntent.js'
 import type { OpenCodeAuthCredential } from '../../../../services/opencode/OpenCodeAuthStore.js'
 const empty = { id: 'groq', methods: [{ type: 'key' }], connections: [] }
 const connection = { ...empty, connections: [{ type: 'credential', id: 'cred_original', label: 'Groq' }] }
@@ -88,6 +89,35 @@ function ports() {
       readConnections: async () => native, remove: async (id: string) => { removed.push(id); native = empty },
       readMirror: async () => mirror, restoreMirror: async (prior: OpenCodeAuthCredential | null) => { restores++; mirror = prior } } }
 }
+test('prepublication rollback removes the owned native ID without modifying V1 auth', async () => {
+  const p = ports(); p.setMirror(null)
+  await rollbackOpenCodeV2OwnedConnection({ ...p.input, expectedMirror: null })
+  expect(p.removed).toEqual(['cred_original'])
+  expect(p.restores).toBe(0)
+  expect(await p.input.readMirror()).toBeNull()
+})
+test('peer drift prevents prepublication native rollback', async () => {
+  const p = ports(); p.setMirror(null)
+  p.setNative({ ...connection, connections: [...connection.connections, { type: 'credential', id: 'cred_peer', label: 'Peer' }] })
+  await expect(rollbackOpenCodeV2OwnedConnection({ ...p.input, expectedMirror: null })).rejects.toThrow('provider_rollback_peer_changed')
+  expect(p.removed).toEqual([])
+  expect(p.restores).toBe(0)
+})
+test('owned pending marker is removed only with exact unchanged identity', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'TEST-v2-connect-intent-'))
+  const file = path.join(dir, 'owned.json')
+  const pending = { schemaVersion: 2 as const, state: 'pending' as const, phase: 'credential-intent' as const,
+    providerId: 'groq', project: '/TEST/project', profileRoot: '/TEST/private', integrationID: 'groq' }
+  try {
+    await writeOpenCodeV2ConnectIntent(file, pending, true)
+    await expect(removeOpenCodeV2ConnectIntentIfUnchanged(file, { ...pending, providerId: 'foreign' }))
+      .rejects.toThrow('provider_original_intent_changed')
+    expect(await readOpenCodeV2ConnectIntent(file)).toMatchObject(pending)
+    await removeOpenCodeV2ConnectIntentIfUnchanged(file, pending)
+    expect(await readOpenCodeV2ConnectIntent(file)).toBeUndefined()
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
 test('owned empty-store rollback removes only the returned ID and restores the original absent mirror', async () => {
   const p = ports(); await rollbackOpenCodeV2OwnedConnection(p.input)
   expect(p.removed).toEqual(['cred_original']); expect(p.restores).toBe(1); expect(await p.input.readMirror()).toBeNull()

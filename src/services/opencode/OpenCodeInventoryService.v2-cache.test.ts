@@ -64,6 +64,8 @@ test('no selected executable never falls through to V1 profile/plugin preparatio
   expect(snapshot.detected).toBe(false)
   expect(snapshot.readGeneration).toBe('unsupported')
   expect(snapshot.binaryPath).toBeNull()
+  expect(snapshot.probeError).toBeNull()
+  expect(snapshot.diagnostics).toEqual(['OpenCode CLI not detected on PATH'])
   expect(snapshot.profile).toBeNull()
   expect(snapshot.connectedProviders).toEqual([])
   expect(catalogReads).toBe(0)

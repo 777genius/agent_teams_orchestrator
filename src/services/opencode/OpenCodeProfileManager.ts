@@ -3085,11 +3085,9 @@ export class OpenCodeProfileManager {
     return resolveClaudeMultimodelPaths()
   }
 
-  private getSourceAuthPaths(
-    env: NodeJS.ProcessEnv = process.env,
-    homePath = env.HOME?.trim() || env.USERPROFILE?.trim() || os.homedir(),
-  ): string[] {
-    return resolveOpenCodeUserAuthSourcePaths(env, homePath)
+  private getSourceAuthPaths(env: NodeJS.ProcessEnv = process.env): string[] {
+    // Apply persisted scoped HOME before choosing a V1 credential source.
+    return resolveOpenCodeUserAuthSourcePaths(env)
   }
 
   getGlobalAuthPath(dataPath = this.paths.data): string {
@@ -3409,7 +3407,6 @@ export class OpenCodeProfileManager {
     const snapshot = openCodeEffectiveConfigSnapshots.get(policy.scope.scopeToken)
     const managedPaths = snapshot?.managedPaths ?? this.paths
     const runtimeEnv = snapshot?.runtimeEnv ?? process.env
-    const snapshotHome = runtimeEnv.HOME?.trim() || runtimeEnv.USERPROFILE?.trim() || os.homedir()
     const profileRootKey = buildScopedProfileRootKey(projectPath, policy.scope)
     const managedAuthPath = path.join(
       managedPaths.data,
@@ -3422,7 +3419,7 @@ export class OpenCodeProfileManager {
     )
     const sourcePaths = Array.from(new Set([
       this.getGlobalAuthPath(managedPaths.data),
-      ...this.getSourceAuthPaths(runtimeEnv, snapshotHome),
+      ...this.getSourceAuthPaths(runtimeEnv),
     ]))
     const [source, managed, preferences] = await Promise.all([
       readSelectedAuthFromSources({
@@ -3545,7 +3542,6 @@ export class OpenCodeProfileManager {
     if (configSnapshot && attachmentRoot !== (runtimeEnv.CLAUDE_AGENT_TEAMS_ATTACHMENT_ROOT ?? null)) {
       throw new Error('OpenCode scoped profile canonical attachment root changed')
     }
-    const snapshotHome = runtimeEnv.HOME?.trim() || runtimeEnv.USERPROFILE?.trim() || os.homedir()
     // Verified staging is the only switch that turns on the managed Cursor path.
     // Anything unavailable keeps the upstream plugin and today's launch behaviour.
     const wantsCursorManagedAssets = options.profileScope
@@ -3723,7 +3719,7 @@ export class OpenCodeProfileManager {
     const globalAuthPath = this.getGlobalAuthPath(managedPaths.data)
     enterStep('fingerprint auth sources')
     const sourceAuthSources = await Promise.all(
-      this.getSourceAuthPaths(runtimeEnv, snapshotHome).map(async sourceAuthPath => {
+      this.getSourceAuthPaths(runtimeEnv).map(async sourceAuthPath => {
         const exists = await fileExists(sourceAuthPath)
         return {
           path: sourceAuthPath,

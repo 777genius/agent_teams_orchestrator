@@ -1205,8 +1205,11 @@ export class OpenCodeInventoryService {
         detected: selection.path !== null, binaryPath: selection.path, version: selection.policy.version, projectPath: resolvedProjectPath,
         profile: null, connectedProviders, availableProviders: v2 ? openCodeV2KeyIntegrations(v2).map(entry => entry.providerId) : [],
         models: [], agents: [], authStorePath: null,
-        probeError: 'This selected generation requires an explicit qualified V2 full catalog read.',
-        diagnostics: ['capabilities_pending'], readGeneration: selection.policy.generation,
+        probeError: selection.path
+          ? 'This selected generation requires an explicit qualified V2 full catalog read.'
+          : null,
+        diagnostics: [selection.path ? 'capabilities_pending' : 'OpenCode CLI not detected on PATH'],
+        readGeneration: selection.policy.generation,
       }
     }
     // Preserve the selected V2 full read above; only V1 settings avoids CLI sweeps.
