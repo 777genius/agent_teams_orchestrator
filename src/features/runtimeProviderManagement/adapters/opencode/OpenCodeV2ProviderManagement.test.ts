@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, realpath, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { tmpdir } from 'node:os'
 import { test, expect } from 'bun:test'
@@ -104,7 +104,8 @@ test('peer drift prevents prepublication native rollback', async () => {
   expect(p.restores).toBe(0)
 })
 test('owned pending marker is removed only with exact unchanged identity', async () => {
-  const dir = await mkdtemp(path.join(tmpdir(), 'TEST-v2-connect-intent-'))
+  // Tests must use the canonical temp directory, including on Windows ARM64.
+  const dir = await realpath(await mkdtemp(path.join(tmpdir(), 'TEST-v2-connect-intent-')))
   const file = path.join(dir, 'owned.json')
   const pending = { schemaVersion: 2 as const, state: 'pending' as const, phase: 'credential-intent' as const,
     providerId: 'groq', project: '/TEST/project', profileRoot: '/TEST/private', integrationID: 'groq' }
