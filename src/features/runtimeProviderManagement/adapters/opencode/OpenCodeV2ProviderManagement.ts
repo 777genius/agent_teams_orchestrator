@@ -231,6 +231,7 @@ export async function connectOpenCodeV2Provider(input: ConnectProviderInput): Pr
     input.authOptionId && input.authOptionId !== OPENCODE_V2_NATIVE_KEY_OPTION_ID)
     return resultError('unsupported-auth-method', 'This V2 source path requires the native key method without an additional setup form.')
   let retainUnknown = false, marker: string | undefined, acceptedProof: OpenCodeExecutionProof | undefined
+  let fullyRolledBackConflict: Error | undefined
   let pendingIntent: OpenCodeV2ConnectIntent | undefined, originalIntent: Record<string, unknown> | undefined
   let phase = 'catalog-acquisition'
   try {
@@ -329,10 +330,9 @@ export async function connectOpenCodeV2Provider(input: ConnectProviderInput): Pr
             readMirror: () => readOpenCodeAuthCredential(mirror),
             restoreMirror: restore => restoreOpenCodeAuthCredentialIfUnchanged({ ...mirror, expected: expectedMirror, restore }),
           })
-          // Retire the pending intent only after the native ID and mirror are
-          // both proven restored; otherwise keep evidence and refuse retries.
-          await removeOpenCodeV2ConnectIntentIfUnchanged(marker!, pendingIntent!)
-          retainUnknown = false
+          // Keep the pending marker until the original catalog owner has also
+          // physically retired. A finally/retirement failure must retain it.
+          fullyRolledBackConflict = error
           throw error
         }
       }
@@ -354,6 +354,18 @@ export async function connectOpenCodeV2Provider(input: ConnectProviderInput): Pr
     await writeOpenCodeV2ConnectIntent(marker, { ...originalIntent, ...pendingIntent, state: 'complete', connection: connected, proof: acceptedProof })
     return { ok: true, value: connected }
   } catch (error) {
+    if (error === fullyRolledBackConflict && marker && pendingIntent) {
+      // The exact error can escape catalog() only when its finally path
+      // successfully retired the original native owner. A retirement error
+      // replaces it and keeps the original pending marker for safe recovery.
+      try {
+        await removeOpenCodeV2ConnectIntentIfUnchanged(marker, pendingIntent)
+        retainUnknown = false
+      } catch (cleanupError) {
+        phase = 'v1-native-auth-conflict-marker-retirement'
+        error = cleanupError
+      }
+    }
     await recordOpenCodeV2ProviderFailure(phase, error, retainUnknown)
     // A refusal the user can act on (platform qualification, the Linux sandbox) is not an
     // authentication failure; name it instead of the generic text.
