@@ -48,6 +48,14 @@ test('V2 key connect cannot shadow native V1 API or OAuth auth stored outside th
     await expect(assertOpenCodeV2NativeV1AuthUnoccupied(input)).rejects.toThrow('provider_shared_credential_conflict')
     await rm(homeAuth)
     await assertOpenCodeV2NativeV1AuthUnoccupied(input)
+    // A retained generation-specific scope environment must select the same
+    // user stores used by real V1 profile resolution, not ambient HOME.
+    await store(xdgAuth, { type: 'api', key: 'TEST-scoped-xdg-v1' })
+    const scoped = { ...input, env: {
+      HOME: path.join(root, 'foreign-home'), XDG_DATA_HOME: path.join(root, 'foreign-xdg'),
+      CLAUDE_MULTIMODEL_OPENCODE_SCOPE_ENVIRONMENT: JSON.stringify({ HOME: home, XDG_DATA_HOME: xdg }),
+    } }
+    await expect(assertOpenCodeV2NativeV1AuthUnoccupied(scoped)).rejects.toThrow('provider_shared_credential_conflict')
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 

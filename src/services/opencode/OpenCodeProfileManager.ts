@@ -2403,6 +2403,20 @@ function scopeSourceEnvironment(inputEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv 
   return envSnapshot
 }
 
+/** The same V1 native credential sources for scoped profile reads and V2
+ * compatibility admission. Scoped env overrides are applied consistently. */
+export function resolveOpenCodeUserAuthSourcePaths(
+  inputEnv: NodeJS.ProcessEnv = process.env, homeOverride?: string,
+): string[] {
+  const env = scopeSourceEnvironment(inputEnv)
+  const home = homeOverride ?? (env.HOME?.trim() || env.USERPROFILE?.trim() || os.homedir())
+  const xdgDataHome = env.XDG_DATA_HOME?.trim() || path.join(home, '.local', 'share')
+  return Array.from(new Set([
+    path.join(xdgDataHome, 'opencode', 'auth.json'),
+    path.join(home, '.local', 'share', 'opencode', 'auth.json'),
+  ]))
+}
+
 export async function resolveOpenCodeProfileScope(input: OpenCodeScopeResolutionInput): Promise<OpenCodeProfileScope> {
   if (input.abortSignal?.aborted) throwOpenCodeAbortReason(input.abortSignal)
   await recoverOpenCodeScopedOAuth(input)
@@ -3075,16 +3089,7 @@ export class OpenCodeProfileManager {
     env: NodeJS.ProcessEnv = process.env,
     homePath = env.HOME?.trim() || env.USERPROFILE?.trim() || os.homedir(),
   ): string[] {
-    const xdgDataHome =
-      env.XDG_DATA_HOME?.trim() || path.join(homePath, '.local', 'share')
-    return Array.from(new Set([
-      path.join(xdgDataHome, 'opencode', 'auth.json'),
-      // Bridge/live-test processes can intentionally set XDG_DATA_HOME to an
-      // isolated runtime directory. Always include the canonical user OpenCode
-      // auth store as the highest-priority source so a fresh `opencode auth`
-      // login can override stale app-global OAuth credentials.
-      path.join(homePath, '.local', 'share', 'opencode', 'auth.json'),
-    ]))
+    return resolveOpenCodeUserAuthSourcePaths(env, homePath)
   }
 
   getGlobalAuthPath(dataPath = this.paths.data): string {

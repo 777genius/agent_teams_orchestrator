@@ -2,7 +2,6 @@ import { recordOpenCodeV2ProviderFailure } from '../../../../services/opencode/e
 import { openCodeV2Refusal } from '../../../../services/opencode/execution/OpenCodeV2RefusalReason.js'
 export { recordOpenCodeV2ProviderFailure } from '../../../../services/opencode/execution/OpenCodeV2Diagnostics.js'
 import path from 'node:path'
-import os from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { createHash, randomUUID } from 'node:crypto'
 import { mkdir, mkdtemp, realpath, rm, writeFile, lstat } from 'node:fs/promises'
@@ -14,7 +13,7 @@ import { readIntegration } from '../../../../services/opencode/catalog/OpenCodeV
 import { isOpenCodeV2AnonymousProvider, isOpenCodeV2ModelFree } from '../../../../services/opencode/catalog/OpenCodeV2ModelPricing.js'
 import { inspectOpenCodeReadSelection } from '../../../../services/opencode/compatibility/OpenCodeNativeIdentity.js'
 export { inspectOpenCodeReadSelection } from '../../../../services/opencode/compatibility/OpenCodeNativeIdentity.js'
-import { canonicalizeOpenCodeProjectPath, resolveOpenCodeV2CatalogProfileScope, materializeOpenCodeV2CatalogScope } from '../../../../services/opencode/OpenCodeProfileManager.js'
+import { canonicalizeOpenCodeProjectPath, resolveOpenCodeV2CatalogProfileScope, materializeOpenCodeV2CatalogScope, resolveOpenCodeUserAuthSourcePaths } from '../../../../services/opencode/OpenCodeProfileManager.js'
 import { resolveClaudeMultimodelPaths } from '../../../../services/opencode/OpenCodeManagedPaths.js'
 import { createOpenCodeV2ExecutionReceipt } from '../../../../services/opencode/profile/OpenCodeV2ExecutionReceipt.js'
 import { acquireOpenCodeV2CatalogLease, requireExecutionEndpoint, registerExecutionDisposer } from '../../../../services/opencode/host/OpenCodeV2ExecutionHost.js'
@@ -172,13 +171,7 @@ export async function assertOpenCodeV2NativeV1AuthUnoccupied(input: {
   providerId: string
   env?: NodeJS.ProcessEnv
 }): Promise<void> {
-  const env = input.env ?? process.env
-  const home = env.HOME?.trim() || env.USERPROFILE?.trim() || os.homedir()
-  const xdgHome = env.XDG_DATA_HOME?.trim() || path.join(home, '.local', 'share')
-  const sourcePaths = new Set([
-    path.join(xdgHome, 'opencode', 'auth.json'),
-    path.join(home, '.local', 'share', 'opencode', 'auth.json'),
-  ])
+  const sourcePaths = new Set(resolveOpenCodeUserAuthSourcePaths(input.env))
   sourcePaths.delete(input.authPath)
   for (const authPath of sourcePaths) {
     const existing = await readOpenCodeAuthCredential({ authPath, providerId: input.providerId })
