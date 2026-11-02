@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, mock, test } from 'bun:test'
 import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { realpathSync } from 'node:fs'
 import { EventEmitter } from 'node:events'
@@ -6,7 +6,22 @@ import type { ChildProcess } from 'node:child_process'
 import os from 'node:os'
 import path from 'node:path'
 
-import { OpenCodeProviderManagementAdapter } from './OpenCodeProviderManagementAdapter.js'
+// These legacy adapter fixtures supply their own inventory, auth and host doubles.
+// Their OpenCode CLI selection is a *valid selected V1*, not a missing binary.
+// The actual native-generation fail-closed boundary is exercised separately in
+// OpenCodeProviderManagementAdapter.v2-routing.test.ts (isolated test process).
+// Do not weaken production generation admission for these test-only stubs.
+const v2ProviderModule = await import('./OpenCodeV2ProviderManagement.js')
+mock.module('./OpenCodeV2ProviderManagement.js', () => ({
+  ...v2ProviderModule,
+  inspectOpenCodeReadSelection: async () => ({
+    path: '/TEST/opencode-v1',
+    policy: { generation: 'v1' as const, version: '1.19.5' },
+    native: null,
+    fingerprint: 'TEST-SELECTED-V1',
+  }),
+}))
+const { OpenCodeProviderManagementAdapter } = await import('./OpenCodeProviderManagementAdapter.js')
 import { planOpenCodeProfilePolicy } from '../../../../services/opencode/OpenCodeProfilePolicy.js'
 import { OpenCodeHostManager } from '../../../../services/opencode/OpenCodeHostManager.js'
 
