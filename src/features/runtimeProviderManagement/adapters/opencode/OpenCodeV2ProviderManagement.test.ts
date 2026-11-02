@@ -1,8 +1,8 @@
-import { mkdtemp, readdir, readFile, rm, stat } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { tmpdir } from 'node:os'
 import { test, expect } from 'bun:test'
-import { openCodeV2ModelTestMessage, openCodeV2ConnectProofFailureCode, openCodeV2ConnectFailureMessage, buildOpenCodeV2RuntimeProviderModel, openCodeV2ConnectionIDs, assertOpenCodeV2SharedAuthMirrorSafe, requireOpenCodeV2OwnedConnection, rollbackOpenCodeV2OwnedConnection, retireOpenCodeV2CatalogOwner, recordOpenCodeV2ProviderFailure } from './OpenCodeV2ProviderManagement.js'
+import { openCodeV2ModelTestMessage, openCodeV2ConnectProofFailureCode, openCodeV2ConnectFailureMessage, buildOpenCodeV2RuntimeProviderModel, openCodeV2ConnectionIDs, assertOpenCodeV2NativeV1AuthUnoccupied, assertOpenCodeV2SharedAuthMirrorSafe, requireOpenCodeV2OwnedConnection, rollbackOpenCodeV2OwnedConnection, retireOpenCodeV2CatalogOwner, recordOpenCodeV2ProviderFailure } from './OpenCodeV2ProviderManagement.js'
 import type { OpenCodeAuthCredential } from '../../../../services/opencode/OpenCodeAuthStore.js'
 const empty = { id: 'groq', methods: [{ type: 'key' }], connections: [] }
 const connection = { ...empty, connections: [{ type: 'credential', id: 'cred_original', label: 'Groq' }] }
@@ -20,6 +20,35 @@ test('V2 API-key admission preserves V1 OAuth and differing API credentials in t
   }
   expect(openCodeV2ConnectFailureMessage(new Error('provider_shared_credential_conflict'), false))
     .toContain('Existing V1 authentication was preserved')
+})
+
+test('V2 key connect cannot shadow native V1 API or OAuth auth stored outside the app mirror', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'TEST-v1-native-auth-'))
+  const home = path.join(root, 'home'), xdg = path.join(root, 'xdg')
+  const homeAuth = path.join(home, '.local', 'share', 'opencode', 'auth.json')
+  const xdgAuth = path.join(xdg, 'opencode', 'auth.json')
+  const input = { authPath: path.join(root, 'managed', 'opencode', 'auth.json'),
+    providerId: 'groq', env: { HOME: home, XDG_DATA_HOME: xdg } }
+  const store = async (target: string, credential: Record<string, unknown>) => {
+    await mkdir(path.dirname(target), { recursive: true })
+    await writeFile(target, JSON.stringify({ groq: credential }))
+  }
+  try {
+    await assertOpenCodeV2NativeV1AuthUnoccupied(input)
+    await store(homeAuth, { type: 'api', key: 'TEST-v1-user-key' })
+    await expect(assertOpenCodeV2NativeV1AuthUnoccupied(input)).rejects.toThrow('provider_shared_credential_conflict')
+    expect(JSON.parse(await readFile(homeAuth, 'utf8'))).toEqual({ groq: { type: 'api', key: 'TEST-v1-user-key' } })
+    await rm(homeAuth)
+    await store(xdgAuth, { type: 'oauth', access: 'TEST-v1-access', refresh: 'TEST-v1-refresh' })
+    await expect(assertOpenCodeV2NativeV1AuthUnoccupied(input)).rejects.toThrow('provider_shared_credential_conflict')
+    await rm(xdgAuth)
+    // Even identical keys must not be newly mirrored: a future native V1 login
+    // would otherwise be hidden by the stale app-mirror key.
+    await store(homeAuth, { type: 'api', key: 'TEST-new' })
+    await expect(assertOpenCodeV2NativeV1AuthUnoccupied(input)).rejects.toThrow('provider_shared_credential_conflict')
+    await rm(homeAuth)
+    await assertOpenCodeV2NativeV1AuthUnoccupied(input)
+  } finally { await rm(root, { recursive: true, force: true }) }
 })
 
 test('V2 native model mapping carries array declarations without the legacy record interpretation or text fallback', () => {

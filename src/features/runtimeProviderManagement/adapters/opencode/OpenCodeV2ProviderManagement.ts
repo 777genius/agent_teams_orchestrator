@@ -2,6 +2,7 @@ import { recordOpenCodeV2ProviderFailure } from '../../../../services/opencode/e
 import { openCodeV2Refusal } from '../../../../services/opencode/execution/OpenCodeV2RefusalReason.js'
 export { recordOpenCodeV2ProviderFailure } from '../../../../services/opencode/execution/OpenCodeV2Diagnostics.js'
 import path from 'node:path'
+import os from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { createHash, randomUUID } from 'node:crypto'
 import { mkdir, mkdtemp, realpath, rm, writeFile, lstat } from 'node:fs/promises'
@@ -158,6 +159,33 @@ export function assertOpenCodeV2SharedAuthMirrorSafe(
   executionAssert(existing === null || isDeepStrictEqual(existing, requested), 'provider_shared_credential_conflict')
 }
 
+/** V1 also reads credentials from external OpenCode stores. A V2 key in the app
+ * mirror would take precedence over those stores, even if the keys happen to
+ * match now (a later V1 login could then be shadowed). Refuse V2 publication
+ * while any same-provider V1 native credential exists in either source.
+ *
+ * This probe is deliberately read-only; the caller repeats it just before
+ * shared auth publication because native logins do not acquire our app lock.
+ */
+export async function assertOpenCodeV2NativeV1AuthUnoccupied(input: {
+  authPath: string
+  providerId: string
+  env?: NodeJS.ProcessEnv
+}): Promise<void> {
+  const env = input.env ?? process.env
+  const home = env.HOME?.trim() || env.USERPROFILE?.trim() || os.homedir()
+  const xdgHome = env.XDG_DATA_HOME?.trim() || path.join(home, '.local', 'share')
+  const sourcePaths = new Set([
+    path.join(xdgHome, 'opencode', 'auth.json'),
+    path.join(home, '.local', 'share', 'opencode', 'auth.json'),
+  ])
+  sourcePaths.delete(input.authPath)
+  for (const authPath of sourcePaths) {
+    const existing = await readOpenCodeAuthCredential({ authPath, providerId: input.providerId })
+    executionAssert(existing === null, 'provider_shared_credential_conflict')
+  }
+}
+
 export function requireOpenCodeV2OwnedConnection(before: Record<string, unknown>, after: Record<string, unknown>, integrationID: string): string {
   executionAssert(before.id === integrationID && after.id === integrationID && Array.isArray(before.connections) && before.connections.length === 0, 'provider_existing_credentials_unsupported')
   const ids = openCodeV2ConnectionIDs(after)
@@ -223,6 +251,7 @@ export async function connectOpenCodeV2Provider(input: ConnectProviderInput): Pr
       const published = { type: 'api' as const, key: apiKey }
       // Guard before any native connection, durable intent or shared auth publication.
       assertOpenCodeV2SharedAuthMirrorSafe(previous, published)
+      await assertOpenCodeV2NativeV1AuthUnoccupied({ authPath: owner.authPath, providerId: input.providerId })
       const requestedDirectory = openCodeV2ProviderConnectionsDirectory(); await mkdir(requestedDirectory, { recursive: true, mode: 0o700 })
       const directory = await realpath(requestedDirectory), intentDirectory = await lstat(requestedDirectory)
       executionAssert(intentDirectory.isDirectory() && !intentDirectory.isSymbolicLink() &&
@@ -295,6 +324,7 @@ export async function connectOpenCodeV2Provider(input: ConnectProviderInput): Pr
       const credentialID = requireOpenCodeV2OwnedConnection(before, after, integrationID)
       const mirror = { authPath: owner.authPath, providerId: input.providerId }
       executionAssert(isDeepStrictEqual(await readOpenCodeAuthCredential(mirror), previous), 'provider_auth_publication_changed')
+      await assertOpenCodeV2NativeV1AuthUnoccupied(mirror)
       executionAssert((await resolveOpenCodeV2CatalogProfileScope({ projectPath: owner.authority.directory, providerId: input.providerId })).scopeToken === owner.scopeToken, 'provider_catalog_scope_changed')
       phase = 'selected-auth-publication'
       await upsertOpenCodeApiAuthCredential({ ...mirror, apiKey })
