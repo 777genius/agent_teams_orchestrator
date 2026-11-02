@@ -6,6 +6,8 @@ import type { ChildProcess } from 'node:child_process'
 import os from 'node:os'
 import path from 'node:path'
 
+// Run this suite alone: Bun mock.module can modify native-selection re-export
+// bindings within a process. The CI policy test enforces process isolation.
 // These legacy adapter fixtures supply their own inventory, auth and host doubles.
 // Their OpenCode CLI selection is a *valid selected V1*, not a missing binary.
 // The actual native-generation fail-closed boundary is exercised separately in
