@@ -1,4 +1,5 @@
-import { inspectOpenCodeReadSelection, selectedProviderUsesOpenCodeV2, connectOpenCodeV2Provider, loadOpenCodeV2ProviderModels, testOpenCodeV2ProviderModel, loadOpenCodeV2ProviderSetupForm } from './OpenCodeV2ProviderManagement.js'
+import { inspectOpenCodeReadSelection, connectOpenCodeV2Provider, loadOpenCodeV2ProviderModels, testOpenCodeV2ProviderModel, loadOpenCodeV2ProviderSetupForm } from './OpenCodeV2ProviderManagement.js'
+import { requireOpenCodeProviderRoute } from './OpenCodeProviderRoute.js'
 import { buildOpenCodeV2ProviderDirectoryEntries } from './OpenCodeV2ProviderDirectory.js'
 import { applyOpenCodeV2DefaultSelection, applyOpenCodeV2DirectoryDefaultSelection, clearOpenCodeV2ProjectDefaultModel, setOpenCodeV2DefaultModel } from './OpenCodeV2DefaultModels.js'
 import { isOpenCodeV1OnlyProviderId, openCodeV2KeyIntegration } from '../../../../services/opencode/catalog/OpenCodeV2KeyIntegrations.js'
@@ -4381,9 +4382,10 @@ export class OpenCodeProviderManagementAdapter
       )
     }
     let selected: Awaited<ReturnType<typeof inspectOpenCodeReadSelection>>
-    try { selected = await inspectOpenCodeReadSelection() }
+    let route: 'v1' | 'v2'
+    try { selected = await inspectOpenCodeReadSelection(); route = requireOpenCodeProviderRoute(selected) }
     catch { return providerManagementError('runtime-unhealthy', 'Selected OpenCode identity is unavailable') }
-    if (selected.policy.generation === 'v2') {
+    if (route === 'v2') {
       return loadOpenCodeV2ProviderSetupForm({ ...input, providerId }, selected)
     }
     if (FAST_CURATED_SETUP_PROVIDER_IDS.has(providerId)) {
@@ -4476,9 +4478,14 @@ export class OpenCodeProviderManagementAdapter
     input: LoadProviderModelsInput,
   ): Promise<ProviderManagementResult<RuntimeProviderModelsView>> {
     let selectedRead: Awaited<ReturnType<typeof inspectOpenCodeReadSelection>> | undefined
-    try { if (input.runtimeId === 'opencode') selectedRead = await inspectOpenCodeReadSelection() }
-    catch (error) { return providerManagementError('runtime-unhealthy', selectedIdentityFailureMessage(error)) }
-    if (selectedRead?.policy.generation === 'v2' && selectedRead.native) {
+    let route: 'v1' | 'v2' | null = null
+    try {
+      if (input.runtimeId === 'opencode') {
+        selectedRead = await inspectOpenCodeReadSelection()
+        route = requireOpenCodeProviderRoute(selectedRead)
+      }
+    } catch (error) { return providerManagementError('runtime-unhealthy', selectedIdentityFailureMessage(error)) }
+    if (route === 'v2' && selectedRead) {
       const providerId = normalizeProviderId(canonicalizeOpenCodeProviderId(input.providerId))
       if (!providerId) return providerManagementError('provider-missing', 'Provider id is invalid')
       return loadOpenCodeV2ProviderModels({ ...input, providerId }, selectedRead)
@@ -5316,8 +5323,11 @@ export class OpenCodeProviderManagementAdapter
     }
 
     let selectedV2 = false
-    try { selectedV2 = input.runtimeId === 'opencode' && await selectedProviderUsesOpenCodeV2() }
-    catch { return providerManagementError('runtime-unhealthy', 'Selected OpenCode identity is unavailable') }
+    try {
+      if (input.runtimeId === 'opencode') {
+        selectedV2 = requireOpenCodeProviderRoute(await inspectOpenCodeReadSelection()) === 'v2'
+      }
+    } catch { return providerManagementError('runtime-unhealthy', 'Selected OpenCode identity is unavailable') }
     if (input.method === 'oauth') {
       if (selectedV2) return connectOpenCodeV2Provider({ ...input, providerId })
       return this.connectProviderWithOAuth(input, observer)
@@ -5712,9 +5722,14 @@ export class OpenCodeProviderManagementAdapter
     const scope = input.scope === 'all_projects' ? 'all_projects' : 'project'
 
     let selectedRead: Awaited<ReturnType<typeof inspectOpenCodeReadSelection>> | undefined
-    try { if (input.runtimeId === 'opencode') selectedRead = await inspectOpenCodeReadSelection() }
-    catch (error) { return providerManagementError('runtime-unhealthy', selectedIdentityFailureMessage(error)) }
-    if (selectedRead?.policy.generation === 'v2' && selectedRead.native) {
+    let route: 'v1' | 'v2' | null = null
+    try {
+      if (input.runtimeId === 'opencode') {
+        selectedRead = await inspectOpenCodeReadSelection()
+        route = requireOpenCodeProviderRoute(selectedRead)
+      }
+    } catch (error) { return providerManagementError('runtime-unhealthy', selectedIdentityFailureMessage(error)) }
+    if (route === 'v2' && selectedRead) {
       return setOpenCodeV2DefaultModel({ ...input, providerId, modelId, scope },
         () => this.loadView({ runtimeId: input.runtimeId, projectPath: input.projectPath }), selectedRead)
     }
@@ -5852,7 +5867,8 @@ export class OpenCodeProviderManagementAdapter
       )
     }
     try {
-      if (input.runtimeId === 'opencode' && await selectedProviderUsesOpenCodeV2()) {
+      if (input.runtimeId === 'opencode' &&
+        requireOpenCodeProviderRoute(await inspectOpenCodeReadSelection()) === 'v2') {
         return clearOpenCodeV2ProjectDefaultModel({ ...input, projectPath },
           () => this.loadView({ runtimeId: input.runtimeId, projectPath }))
       }
@@ -5921,8 +5937,11 @@ export class OpenCodeProviderManagementAdapter
     }
 
     let selectedV2 = false
-    try { selectedV2 = input.runtimeId === 'opencode' && await selectedProviderUsesOpenCodeV2() }
-    catch { return providerManagementError('runtime-unhealthy', 'Selected OpenCode identity is unavailable') }
+    try {
+      if (input.runtimeId === 'opencode') {
+        selectedV2 = requireOpenCodeProviderRoute(await inspectOpenCodeReadSelection()) === 'v2'
+      }
+    } catch { return providerManagementError('runtime-unhealthy', 'Selected OpenCode identity is unavailable') }
     if (selectedV2) return testOpenCodeV2ProviderModel({ ...input, providerId, modelId })
 
     return this.withManagedOpenCodeClient(
