@@ -2,10 +2,26 @@ import { mkdtemp, readdir, readFile, rm, stat } from 'node:fs/promises'
 import path from 'node:path'
 import { tmpdir } from 'node:os'
 import { test, expect } from 'bun:test'
-import { openCodeV2ModelTestMessage, openCodeV2ConnectProofFailureCode, openCodeV2ConnectFailureMessage, buildOpenCodeV2RuntimeProviderModel, openCodeV2ConnectionIDs, requireOpenCodeV2OwnedConnection, rollbackOpenCodeV2OwnedConnection, retireOpenCodeV2CatalogOwner, recordOpenCodeV2ProviderFailure } from './OpenCodeV2ProviderManagement.js'
+import { openCodeV2ModelTestMessage, openCodeV2ConnectProofFailureCode, openCodeV2ConnectFailureMessage, buildOpenCodeV2RuntimeProviderModel, openCodeV2ConnectionIDs, assertOpenCodeV2SharedAuthMirrorSafe, requireOpenCodeV2OwnedConnection, rollbackOpenCodeV2OwnedConnection, retireOpenCodeV2CatalogOwner, recordOpenCodeV2ProviderFailure } from './OpenCodeV2ProviderManagement.js'
 import type { OpenCodeAuthCredential } from '../../../../services/opencode/OpenCodeAuthStore.js'
 const empty = { id: 'groq', methods: [{ type: 'key' }], connections: [] }
 const connection = { ...empty, connections: [{ type: 'credential', id: 'cred_original', label: 'Groq' }] }
+test('V2 API-key admission preserves V1 OAuth and differing API credentials in the shared mirror', () => {
+  const next = { type: 'api' as const, key: 'TEST-new' }
+  expect(() => assertOpenCodeV2SharedAuthMirrorSafe(null, next)).not.toThrow()
+  expect(() => assertOpenCodeV2SharedAuthMirrorSafe({ ...next }, next)).not.toThrow()
+  for (const existing of [
+    { type: 'oauth', access: 'TEST-v1-access', refresh: 'TEST-v1-refresh', expires: 10 },
+    { type: 'api', key: 'TEST-original' },
+    { type: 'api', key: 'TEST-new', metadata: { region: 'us' } },
+  ]) {
+    expect(() => assertOpenCodeV2SharedAuthMirrorSafe(existing, next))
+      .toThrow('provider_shared_credential_conflict')
+  }
+  expect(openCodeV2ConnectFailureMessage(new Error('provider_shared_credential_conflict'), false))
+    .toContain('Existing V1 authentication was preserved')
+})
+
 test('V2 native model mapping carries array declarations without the legacy record interpretation or text fallback', () => {
   const row = { id: 'Novel/ExactCase', name: 'Novel model', limit: { context: 32000, output: 4000 } }
   const map = (capabilities?: unknown) => buildOpenCodeV2RuntimeProviderModel({ ...row, capabilities }, 'novel-provider', 'novel-provider/Novel/ExactCase')

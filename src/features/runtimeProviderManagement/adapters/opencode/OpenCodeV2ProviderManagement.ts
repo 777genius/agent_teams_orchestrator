@@ -148,6 +148,16 @@ export function openCodeV2ConnectionIDs(info: Record<string, unknown>): string[]
   executionAssert(new Set(ids).size === ids.length && ids.every(id => /^cred_[A-Za-z0-9]+$/.test(id)), 'provider_credential_identity_changed')
   return ids
 }
+/** The V1-managed auth.json is a shared compatibility mirror. Never overwrite
+ * its existing provider credential from the V2 native key-connect path.
+ * Until a version-owned credential store exists, differing keys must be refused. */
+export function assertOpenCodeV2SharedAuthMirrorSafe(
+  existing: OpenCodeAuthCredential | null,
+  requested: Readonly<{ type: 'api'; key: string }>,
+): void {
+  executionAssert(existing === null || isDeepStrictEqual(existing, requested), 'provider_shared_credential_conflict')
+}
+
 export function requireOpenCodeV2OwnedConnection(before: Record<string, unknown>, after: Record<string, unknown>, integrationID: string): string {
   executionAssert(before.id === integrationID && after.id === integrationID && Array.isArray(before.connections) && before.connections.length === 0, 'provider_existing_credentials_unsupported')
   const ids = openCodeV2ConnectionIDs(after)
@@ -181,6 +191,9 @@ export function openCodeV2ConnectProofFailureCode(state: string, reason: string 
 }
 
 export function openCodeV2ConnectFailureMessage(error: unknown, retainedOriginal: boolean): string {
+  if (!retainedOriginal && error instanceof Error && error.message === 'provider_shared_credential_conflict') {
+    return 'V2 connection cannot replace an existing OpenCode credential. Existing V1 authentication was preserved; use the existing connection or a separately isolated credential profile.'
+  }
   if (retainedOriginal && error instanceof Error && error.message === 'provider_original_execution_failed') {
     return 'The selected-model verification failed. Check provider access, limits and connection diagnostics. The original attempt was retained; no automatic reconnect or prompt retry was performed.'
   }
@@ -208,6 +221,8 @@ export async function connectOpenCodeV2Provider(input: ConnectProviderInput): Pr
       executionAssert(Array.isArray(before.methods) && before.methods.some(value => executionRecord(value).type === 'key' && executionRecord(value).form === undefined), 'provider_key_method_unsupported')
       const previous = await readOpenCodeAuthCredential({ authPath: owner.authPath, providerId: input.providerId })
       const published = { type: 'api' as const, key: apiKey }
+      // Guard before any native connection, durable intent or shared auth publication.
+      assertOpenCodeV2SharedAuthMirrorSafe(previous, published)
       const requestedDirectory = openCodeV2ProviderConnectionsDirectory(); await mkdir(requestedDirectory, { recursive: true, mode: 0o700 })
       const directory = await realpath(requestedDirectory), intentDirectory = await lstat(requestedDirectory)
       executionAssert(intentDirectory.isDirectory() && !intentDirectory.isSymbolicLink() &&
