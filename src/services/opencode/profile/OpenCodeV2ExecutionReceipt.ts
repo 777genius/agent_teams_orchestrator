@@ -80,7 +80,10 @@ executionAssert(cliSha256 === identity.executableSha256, 'native_selection_chang
 const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'execution', binding)
 // Legacy callers supply a source root; delivery is derived from this module, never that hint.
 const resolutionRoot = delivery.runtimeMode === 'source' ? path.join(delivery.root, 'src/services/opencode/host') : delivery.root
-const { files, visit } = await collectOpenCodeV2GraphFiles(pin, resolutionRoot, delivery.binding, signal)
+// Candidate construction is not verification: the acquiring owner and its
+// child still independently hash every row before any official runtime import.
+const { files, visit } = await collectOpenCodeV2GraphFiles(pin, resolutionRoot, delivery.binding, signal,
+  delivery.runtimeMode === 'packaged' ? 'expected' : 'actual')
 if (controller?.type === 'local') {
   executionAssert(controller.command.length >= 2 && path.isAbsolute(controller.command[0]!), 'controller_runtime_missing')
   const runtime = await realpath(controller.command[0]!)

@@ -4,7 +4,7 @@ import { executionAssert, executionRecord } from '../execution/OpenCodeV2Executi
 import { hashOpenCodeFile, readOpenCodePackageManifest } from '../compatibility/OpenCodeNativeIdentity.js'
 import type { OpenCodeV2Pin } from '../compatibility/OpenCodeV2Registry.js'
 import { resolveOpenCodeV2GraphEntry } from './OpenCodeV2ServerGraph.js'
-import { resolveOpenCodeV2Delivery, verifyOpenCodeV2DeliveryFile, type OpenCodeV2DeliveryBinding } from './OpenCodeV2DeliveryManifest.js'
+import { resolveOpenCodeV2Delivery, verifyOpenCodeV2DeliveryFile, readOpenCodeV2ExpectedDeliveryFileHash, type OpenCodeV2DeliveryBinding } from './OpenCodeV2DeliveryManifest.js'
 
 /** A nested module-scope manifest is not the named/versioned installed package root. */
 export async function resolveOpenCodeV2ReceiptPackageRoot(file: string): Promise<string> {
@@ -22,7 +22,7 @@ export async function resolveOpenCodeV2ReceiptPackageRoot(file: string): Promise
 
 /** One complete selected closure, shared by execution receipts and finite catalog acquisition. */
 export async function collectOpenCodeV2GraphFiles(pin: OpenCodeV2Pin, resolutionRoot: string,
-  binding?: OpenCodeV2DeliveryBinding, signal?: AbortSignal) {
+  binding?: OpenCodeV2DeliveryBinding, signal?: AbortSignal, packagedPayloadHashes: 'actual' | 'expected' = 'actual') {
   const delivery = binding ? await resolveOpenCodeV2Delivery(binding) : undefined
   const server = await resolveOpenCodeV2GraphEntry(pin, 'server', 'process', resolutionRoot, binding)
   const client = await resolveOpenCodeV2GraphEntry(pin, 'client', undefined, resolutionRoot, binding)
@@ -61,8 +61,13 @@ export async function collectOpenCodeV2GraphFiles(pin: OpenCodeV2Pin, resolution
       executionAssert(files.length + pending.length <= 65_536, 'graph_file_budget')
       for (let offset = 0; offset < pending.length; offset += 16) {
         const outcomes = await Promise.allSettled(pending.slice(offset, offset + 16).map(async file => {
-          const sha256 = await hashOpenCodeFile(file, signal)
-          if (payload && delivery) await verifyOpenCodeV2DeliveryFile(delivery, file, sha256)
+          signal?.throwIfAborted()
+          // Only receipt candidates may use pinned expectations. Catalog callers
+          // keep actual hashing, as do source and local controller package rows.
+          const expected = payload && delivery && packagedPayloadHashes === 'expected'
+          const sha256 = expected ? await readOpenCodeV2ExpectedDeliveryFileHash(delivery, file) : await hashOpenCodeFile(file, signal)
+          if (payload && delivery && !expected) await verifyOpenCodeV2DeliveryFile(delivery, file, sha256)
+          signal?.throwIfAborted()
           return { path: file, sha256 }
         }))
         const failed = outcomes.find(row => row.status === 'rejected')

@@ -104,7 +104,7 @@ export function assertOpenCodeV2DeliveryFileRow(snapshot: OpenCodeV2DeliverySnap
   assert(path.isAbsolute(file) && row && !relative.startsWith('../') && !path.isAbsolute(relative) && row.sha256 === sha256)
 }
 
-export async function verifyOpenCodeV2DeliveryFile(snapshot: OpenCodeV2DeliverySnapshot, file: string, sha256?: string): Promise<string> {
+async function inspectDeliveryFileMetadata(snapshot: OpenCodeV2DeliverySnapshot, file: string) {
   assert(path.isAbsolute(file) && await realpath(file) === file)
   const relative = path.relative(snapshot.binding.root, file).split(path.sep).join('/')
   const row = inventories.get(snapshot)?.get(relative)
@@ -112,6 +112,17 @@ export async function verifyOpenCodeV2DeliveryFile(snapshot: OpenCodeV2DeliveryS
   const info = await lstat(file)
   assert(info.isFile() && !info.isSymbolicLink() && info.size === row.bytes &&
     (process.platform === 'win32' || ((info.mode & 0o111) !== 0) === row.executable))
+  return row
+}
+
+/** Candidate expectation only, never evidence that the actual bytes were hashed.
+ * Receipt preparation still precedes independent full owner and child validation. */
+export async function readOpenCodeV2ExpectedDeliveryFileHash(snapshot: OpenCodeV2DeliverySnapshot, file: string): Promise<string> {
+  return (await inspectDeliveryFileMetadata(snapshot, file)).sha256
+}
+
+export async function verifyOpenCodeV2DeliveryFile(snapshot: OpenCodeV2DeliverySnapshot, file: string, sha256?: string): Promise<string> {
+  await inspectDeliveryFileMetadata(snapshot, file)
   const actual = sha256 ?? await hashOpenCodeFile(file)
   assertOpenCodeV2DeliveryFileRow(snapshot, file, actual)
   return actual
