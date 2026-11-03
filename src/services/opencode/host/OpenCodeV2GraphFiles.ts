@@ -48,9 +48,9 @@ export async function collectOpenCodeV2GraphFiles(pin: OpenCodeV2Pin, resolution
     if (/^@opencode\//.test(metadata.name)) executionAssert(metadata.version === pin, 'package_pin_mismatch')
     if (metadata.name === 'effect' || metadata.name === '@effect/platform-node' || metadata.name === '@effect/platform-node-shared')
       executionAssert(metadata.version === effectVersion, 'effect_pin_mismatch')
+    const pending: string[] = []
     async function walk(directory: string): Promise<void> {
       signal?.throwIfAborted()
-      const pending: string[] = []
       for (const item of await readdir(directory, { withFileTypes: true })) {
         if (item.name === 'node_modules') continue
         const file = path.join(directory, item.name)
@@ -59,23 +59,25 @@ export async function collectOpenCodeV2GraphFiles(pin: OpenCodeV2Pin, resolution
         else { executionAssert(item.isFile(), 'graph_file_budget'); pending.push(file) }
       }
       executionAssert(files.length + pending.length <= 65_536, 'graph_file_budget')
-      for (let offset = 0; offset < pending.length; offset += 16) {
-        const outcomes = await Promise.allSettled(pending.slice(offset, offset + 16).map(async file => {
-          signal?.throwIfAborted()
-          // Only receipt candidates may use pinned expectations. Catalog callers
-          // keep actual hashing, as do source and local controller package rows.
-          const expected = payload && delivery && packagedPayloadHashes === 'expected'
-          const sha256 = expected ? await readOpenCodeV2ExpectedDeliveryFileHash(delivery, file) : await hashOpenCodeFile(file, signal)
-          if (payload && delivery && !expected) await verifyOpenCodeV2DeliveryFile(delivery, file, sha256)
-          signal?.throwIfAborted()
-          return { path: file, sha256 }
-        }))
-        const failed = outcomes.find(row => row.status === 'rejected')
-        if (failed?.status === 'rejected') throw failed.reason
-        files.push(...outcomes.flatMap(row => row.status === 'fulfilled' ? [row.value] : []))
-      }
     }
     await walk(root)
+    // Batch across small directories as well as large ones; every row retains
+    // its canonical path, metadata and byte checks before owner acquisition.
+    for (let offset = 0; offset < pending.length; offset += 16) {
+      const outcomes = await Promise.allSettled(pending.slice(offset, offset + 16).map(async file => {
+        signal?.throwIfAborted()
+        // Only receipt candidates may use pinned expectations. Catalog callers
+        // keep actual hashing, as do source and local controller package rows.
+        const expected = payload && delivery && packagedPayloadHashes === 'expected'
+        const sha256 = expected ? await readOpenCodeV2ExpectedDeliveryFileHash(delivery, file) : await hashOpenCodeFile(file, signal)
+        if (payload && delivery && !expected) await verifyOpenCodeV2DeliveryFile(delivery, file, sha256)
+        signal?.throwIfAborted()
+        return { path: file, sha256 }
+      }))
+      const failed = outcomes.find(row => row.status === 'rejected')
+      if (failed?.status === 'rejected') throw failed.reason
+      files.push(...outcomes.flatMap(row => row.status === 'fulfilled' ? [row.value] : []))
+    }
     for (const optional of [false, true]) {
       const raw = metadata[optional ? 'optionalDependencies' : 'dependencies']
       if (raw === undefined) continue

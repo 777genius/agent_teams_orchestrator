@@ -25,7 +25,7 @@ afterAll(() => { observeOpens = false; afterLstat = undefined; openedPaths.lengt
 const sha = (value: string) => createHash('sha256').update(value).digest('hex')
 const pin = '2.0.32'
 const enabled = process.versions.bun === openCodeBunVersion() && openCodeV2LaunchRefusal(pin) === null
-async function fixture() {
+async function fixture(nestedBatch = false) {
   const platform = process.platform, arch = process.arch
   if ((platform !== 'linux' && platform !== 'darwin' && platform !== 'win32') || (arch !== 'arm64' && arch !== 'x64')) throw new Error('TEST unsupported platform')
   const root = await realpath(await mkdtemp(path.join(tmpdir(), 'TEST-sdk-candidates-'))), sdk = path.join(root, 'sdk')
@@ -45,7 +45,7 @@ async function fixture() {
   const effect = await pkg('effect', 'effect', 'index.js', '4.0.1')
   const mcp = await pkg('mcp', '@modelcontextprotocol/sdk', 'client/index.js')
   const payload = await put('local-cli/packages/server/payload.bin', 'TEST expected payload')
-  for (let index = 0; index < 32; index++) await put(`local-cli/packages/server/batch/${String(index).padStart(2, '0')}.bin`, 'TEST')
+  for (let index = 0; index < 32; index++) await put(`local-cli/packages/server/batch/${String(index).padStart(2, '0')}${nestedBatch ? '/entry' : ''}.bin`, 'TEST')
   for (const name of ['opencode-v2-graphs.json', 'opencodeV2ExecutionServer.js', 'opencodeV2RunOwner.js', 'opencodeV2Server.js']) await put(`local-cli/${name}`, 'TEST')
   files.sort((a, b) => Buffer.compare(Buffer.from(a.path), Buffer.from(b.path)))
   const manifest: OpenCodeV2DeliveryManifest = { schemaVersion: 1, runtimeVersion: '0.0.999', sourceCommit: 'a'.repeat(40),
@@ -81,8 +81,8 @@ test.skipIf(!enabled)('packaged receipt candidates equal full hashes for valid S
   } finally { observeOpens = false; openedPaths.length = 0; await f.close() }
 })
 
-test.skipIf(!enabled)('candidate cancellation joins the claimed metadata batch and does not start later batches', async () => {
-  const f = await fixture(), controller = new AbortController(), reason = new Error('TEST-candidate-cancelled')
+test.skipIf(!enabled)('candidate checks batch across small directories and cancellation joins only claimed reads', async () => {
+  const f = await fixture(true), controller = new AbortController(), reason = new Error('TEST-candidate-cancelled')
   let release!: () => void, claimed!: () => void, started = 0, completed = 0, settled = false
   const gate = new Promise<void>(resolve => { release = resolve }), firstBatch = new Promise<void>(resolve => { claimed = resolve })
   afterLstat = async file => {
