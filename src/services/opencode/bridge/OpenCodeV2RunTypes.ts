@@ -64,7 +64,7 @@ export type RunMemberStatus = Readonly<{
   controllerTools?: ControllerToolProof
 }>
 export type RunStopMember = Readonly<{ memberId: string; cleanup: ExecutionCleanupReceipt | null; errors: readonly string[] }>
-export type RunProbeFailure = 'native_execution_failed' | 'native_execution_cancelled'
+export type RunProbeFailure = 'native_execution_failed' | 'native_execution_cancelled' | 'provider_free_quota_exhausted'
 /** Closed facts of an owner's own initialization failure: a fixed category and the
  * provider wire stage. Never a message, body, path or credential. */
 export type RunOwnerFailure = Readonly<{ category: OpenCodeV2ProviderFailureCategory; operation?: OpenCodeV2ProviderWireFailure }>

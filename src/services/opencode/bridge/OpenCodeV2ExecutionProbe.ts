@@ -32,7 +32,7 @@ type ProbeRecord = { sourceKey: string; binding: RunBinding; sessionID: string; 
   automaticReplacementUsed?: true }
 function parseProbeFailure(value: unknown): RunProbeFailure | null {
   if (value === null || value === undefined) return null // Existing records predate this field.
-  executionAssert(value === 'native_execution_failed' || value === 'native_execution_cancelled', 'probe_failure_invalid')
+  executionAssert(value === 'native_execution_failed' || value === 'native_execution_cancelled' || value === 'provider_free_quota_exhausted', 'probe_failure_invalid')
   return value
 }
 function parseStoredProbeFailure(value: unknown): ProbeFailure | null {

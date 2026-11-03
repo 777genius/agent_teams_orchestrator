@@ -215,7 +215,7 @@ async function executionProof(project: string, selectedModel: string, run = true
 
 /** Only the probe's exact settled terminal reasons distinguish failure from cleanup uncertainty. */
 export function openCodeV2ConnectProofFailureCode(state: string, reason: string | null): string {
-  return state === 'failed' && (reason === 'native_execution_failed' || reason === 'native_execution_cancelled')
+  return state === 'failed' && (reason === 'native_execution_failed' || reason === 'native_execution_cancelled' || reason === 'provider_free_quota_exhausted')
     ? 'provider_original_execution_failed' : 'provider_original_execution_pending'
 }
 
@@ -424,8 +424,10 @@ export async function loadOpenCodeV2ProviderSetupForm(input: LoadProviderSetupFo
 }
 
 /** Terminal failures must not be presented as an execution still in progress. */
-export function openCodeV2ModelTestMessage(ok: boolean, state: string): string {
-  if (ok) return 'Selected V2 model execution and physical retirement verified.'
+export function openCodeV2ModelTestMessage(ok: boolean, state: string, reason?: string | null): string {
+  if (ok) return 'The model responded successfully.'
+  if (state === 'failed' && reason === 'provider_free_quota_exhausted')
+    return 'OpenRouter’s daily limit for free models has been reached. Wait for the limit to reset, or choose a paid model and try again. Your API key is still connected.'
   if (state === 'failed') return 'The original selected-model execution failed. No alternate input was submitted. Check provider limits and connection diagnostics.'
   return 'Original selected-model execution is pending or unverified; no alternate input was submitted.'
 }
@@ -437,7 +439,8 @@ export async function testOpenCodeV2ProviderModel(input: TestProviderModelInput)
     const proof = await executionProof(project, input.modelId)
     const ok = proof.state === 'available' && proof.proof?.modelId === input.modelId && proof.proof.projectPath === normalizeOpenCodeProjectIdentity(project)
     return { ok: true, value: { providerId: input.providerId, modelId: input.modelId, ok,
-      availability: ok ? 'available' : 'unknown', message: openCodeV2ModelTestMessage(ok, proof.state), diagnostics: [] } }
+      availability: ok ? 'available' : 'unknown', message: openCodeV2ModelTestMessage(ok, proof.state, proof.reason),
+      diagnostics: proof.reason === 'provider_free_quota_exhausted' ? [proof.reason] : [] } }
   } catch (error) { return resultError('runtime-unhealthy', openCodeV2Refusal(error)?.message ?? 'V2 selected-model execution could not be qualified. No alternate model was tried.') }
 }
 
