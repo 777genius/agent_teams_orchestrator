@@ -1,4 +1,4 @@
-import { expect, test } from 'bun:test'
+import { expect, spyOn, test } from 'bun:test'
 import { OpenCodeV2CatalogReadBudget, OpenCodeV2CatalogReadTimeout } from './OpenCodeV2CatalogReadBudget.js'
 
 const waitForAbort = (signal: AbortSignal) => new Promise<never>((_resolve, reject) => {
@@ -52,4 +52,19 @@ test('unknown cleanup remains attached to timeout and never becomes success', as
     expect((error as Error).cause).toBe(retainedCustody)
     expect((error as Error).message).toContain('during models')
   }
+})
+
+for (const transition of ['next phase', 'retirement'] as const) test(`elapsed work keeps its timeout phase before ${transition}`, async () => {
+  const clock = spyOn(performance, 'now').mockReturnValue(0)
+  const budget = new OpenCodeV2CatalogReadBudget(30)
+  try {
+    await expect(budget.run(async current => {
+      current.enter('receipt')
+      // Synchronous work or a microtask chain can consume the budget before
+      // its timer runs; the following phase did not consume that time.
+      clock.mockReturnValue(31)
+      if (transition === 'retirement') current.retiring()
+      else current.enter('acquisition')
+    })).rejects.toThrow(/catalog timed out during receipt/)
+  } finally { clock.mockRestore() }
 })

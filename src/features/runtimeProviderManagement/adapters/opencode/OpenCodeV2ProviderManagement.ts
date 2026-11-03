@@ -63,7 +63,7 @@ async function catalog<T>(input: { providerId: string; projectPath?: string | nu
   const selected = selectedRead ?? await inspectOpenCodeReadSelection(budget?.signal, undefined, budget ? Date.now() + budget.remainingMs() : undefined); executionAssert(selected.native && selected.policy.generation === 'v2', 'provider_v2_required')
   budget?.enter('profile')
   const project = await canonicalizeOpenCodeProjectPath(input.projectPath)
-  const scope = await resolveOpenCodeV2CatalogProfileScope({ projectPath: project, providerId: input.providerId })
+  const scope = await resolveOpenCodeV2CatalogProfileScope({ projectPath: project, providerId: input.providerId, abortSignal: budget?.signal })
   const parent = path.join(resolveClaudeMultimodelPaths().data, 'opencode/v2/provider-profiles'); await mkdir(parent, { recursive: true, mode: 0o700 })
   const root = await realpath(await mkdtemp(path.join(parent, 'catalog-')))
   let imported: Awaited<ReturnType<typeof materializeOpenCodeV2CatalogScope>>
@@ -72,7 +72,7 @@ async function catalog<T>(input: { providerId: string; projectPath?: string | nu
   try {
     for (const name of ['home', 'config', 'data', 'cache', 'state', 'tmp', 'appdata', 'localappdata']) await mkdir(path.join(root, name), { mode: 0o700 })
     const directory = path.join(root, 'config/opencode'), data = path.join(root, 'data/opencode'); await mkdir(directory, { mode: 0o700 }); await mkdir(data, { mode: 0o700 })
-    imported = await materializeOpenCodeV2CatalogScope(scope, project, path.join(data, 'auth.json'), { includeSelectedApiKey: options?.includeSelectedApiKey })
+    imported = await materializeOpenCodeV2CatalogScope(scope, project, path.join(data, 'auth.json'), { includeSelectedApiKey: options?.includeSelectedApiKey, signal: budget?.signal })
     const provider = { ...(imported.provider.package ? { package: imported.provider.package } : {}),
       ...(imported.provider.baseURL || imported.provider.apiKey ? { settings: {
         ...(imported.provider.baseURL ? { baseURL: imported.provider.baseURL } : {}),

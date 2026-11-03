@@ -22,10 +22,10 @@ export class OpenCodeV2CatalogReadBudget {
   }
   get signal(): AbortSignal { return this.deadline.signal }
   remainingMs(): number { return this.deadline.remainingMs() }
-  enter(phase: OpenCodeV2CatalogReadPhase): void { this.phase = phase; this.check() }
+  enter(phase: OpenCodeV2CatalogReadPhase): void { this.check(); this.phase = phase }
   check(): void { this.deadline.throwIfExpired() }
   /** Retirement runs even when the read budget is already exhausted. */
-  retiring(): void { this.phase = 'retirement' }
+  retiring(): void { if (this.remainingMs() > 0) this.phase = 'retirement' }
   async run<T>(operation: (budget: OpenCodeV2CatalogReadBudget) => Promise<T>): Promise<T> {
     try {
       const value = await operation(this)
