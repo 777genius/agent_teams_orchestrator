@@ -1,3 +1,4 @@
+import { OpenCodeV2CatalogReadBudget, OpenCodeV2CatalogReadTimeout } from './OpenCodeV2CatalogReadBudget.js'
 import { recordOpenCodeV2ProviderFailure } from '../../../../services/opencode/execution/OpenCodeV2Diagnostics.js'
 import { openCodeV2Refusal } from '../../../../services/opencode/execution/OpenCodeV2RefusalReason.js'
 export { recordOpenCodeV2ProviderFailure } from '../../../../services/opencode/execution/OpenCodeV2Diagnostics.js'
@@ -55,9 +56,12 @@ type CatalogOwner = {
   connect(id: string, key: string): Promise<void>; remove(id: string): Promise<void>
 }
 async function catalog<T>(input: { providerId: string; projectPath?: string | null }, use: (value: CatalogOwner) => Promise<T>,
-  selectedRead?: Awaited<ReturnType<typeof inspectOpenCodeReadSelection>>, options?: { includeSelectedApiKey?: boolean }): Promise<T> {
+  selectedRead?: Awaited<ReturnType<typeof inspectOpenCodeReadSelection>>, options?: { includeSelectedApiKey?: boolean; budget?: OpenCodeV2CatalogReadBudget }): Promise<T> {
   // Reuse this request's generation decision; receipt/owner/child checks still revalidate the bytes.
-  const selected = selectedRead ?? await inspectOpenCodeReadSelection(); executionAssert(selected.native && selected.policy.generation === 'v2', 'provider_v2_required')
+  const budget = options?.budget
+  budget?.enter('selection')
+  const selected = selectedRead ?? await inspectOpenCodeReadSelection(budget?.signal, undefined, budget ? Date.now() + budget.remainingMs() : undefined); executionAssert(selected.native && selected.policy.generation === 'v2', 'provider_v2_required')
+  budget?.enter('profile')
   const project = await canonicalizeOpenCodeProjectPath(input.projectPath)
   const scope = await resolveOpenCodeV2CatalogProfileScope({ projectPath: project, providerId: input.providerId })
   const parent = path.join(resolveClaudeMultimodelPaths().data, 'opencode/v2/provider-profiles'); await mkdir(parent, { recursive: true, mode: 0o700 })
@@ -68,7 +72,7 @@ async function catalog<T>(input: { providerId: string; projectPath?: string | nu
   try {
     for (const name of ['home', 'config', 'data', 'cache', 'state', 'tmp', 'appdata', 'localappdata']) await mkdir(path.join(root, name), { mode: 0o700 })
     const directory = path.join(root, 'config/opencode'), data = path.join(root, 'data/opencode'); await mkdir(directory, { mode: 0o700 }); await mkdir(data, { mode: 0o700 })
-    imported = await materializeOpenCodeV2CatalogScope(scope, project, path.join(data, 'auth.json'), options)
+    imported = await materializeOpenCodeV2CatalogScope(scope, project, path.join(data, 'auth.json'), { includeSelectedApiKey: options?.includeSelectedApiKey })
     const provider = { ...(imported.provider.package ? { package: imported.provider.package } : {}),
       ...(imported.provider.baseURL || imported.provider.apiKey ? { settings: {
         ...(imported.provider.baseURL ? { baseURL: imported.provider.baseURL } : {}),
@@ -80,7 +84,9 @@ async function catalog<T>(input: { providerId: string; projectPath?: string | nu
     env.OPENCODE_CONFIG_DIR = directory
     profile = { epoch: randomUUID(), root, directory: project, databasePath: path.join(data, 'opencode.db'), env,
       envSha256: executionHash(env), config: { directory, content, sha256: createHash('sha256').update(content).digest('hex') }, selection: { purpose: 'catalog' } }
-    native = await createOpenCodeV2ExecutionReceipt(sourceRoot, selected.native)
+    budget?.enter('receipt')
+    native = await createOpenCodeV2ExecutionReceipt(sourceRoot, selected.native, undefined, undefined, budget?.signal)
+    budget?.enter('acquisition')
   } catch (error) {
     // No lease acquisition has begun, so no native owner can use these sealed
     // key/config files. Once acquisition starts, its failure path retains custody.
@@ -90,22 +96,24 @@ async function catalog<T>(input: { providerId: string; projectPath?: string | nu
     }
     throw error
   }
-  const nonce = randomUUID(), deadline = Date.now() + 240_000
-  const lease = await acquireOpenCodeV2CatalogLease(native, profile, { teamId: `catalog-${nonce}`, runId: nonce, laneId: 'provider-catalog', memberId: input.providerId, deadline })
+  const nonce = randomUUID(), deadline = Date.now() + (budget?.remainingMs() ?? 240_000)
+  const lease = await acquireOpenCodeV2CatalogLease(native, profile, { teamId: `catalog-${nonce}`, runId: nonce, laneId: 'provider-catalog', memberId: input.providerId, deadline, signal: budget?.signal })
   const wire = new ProviderWire(lease.authority, deadline), endpoint = requireExecutionEndpoint(lease.authority)
   const unregister = registerExecutionDisposer(lease.authority, () => wire.dispose())
   try {
+    budget?.enter('sdk')
     const location = { directory: project }
     const selected = await importOpenCodeV2ClientModule(lease.authority.pin, await resolveOpenCodeV2ClientEntry(lease.authority.pin, undefined, native.graph.delivery))
     const sdk = selected.wire === 'floor' ? selected.module.OpenCode.make({ baseUrl: endpoint.baseUrl, fetch: wire.fetch })
       : selected.module.OpenCode.make({ baseUrl: endpoint.baseUrl, fetch: wire.fetch })
+    budget?.enter('models')
     return await use({ native, authority: lease.authority, profile, authPath: imported.authPath, preferredModel: imported.preferredModel, scopeToken: scope.scopeToken,
       providers: () => sdk.provider.list({ location }), models: () => sdk.model.list({ location }), integration: integrationID => sdk.integration.get({ location, integrationID }),
       connect: (integrationID, key) => sdk.integration.connect.key({ location, integrationID, key }),
       remove: credentialID => selected.wire === 'floor'
         ? selected.module.OpenCode.make({ baseUrl: endpoint.baseUrl, fetch: wire.fetch }).credential.remove({ location, credentialID })
         : selected.module.OpenCode.make({ baseUrl: endpoint.baseUrl, fetch: wire.fetch }).credential.remove({ credentialID }) })
-  } finally { await retireOpenCodeV2CatalogOwner(wire, lease, unregister) }
+  } finally { budget?.retiring(); await retireOpenCodeV2CatalogOwner(wire, lease, unregister) }
 }
 
 /** Reopen only the retired original catalog for GET readback, never key connect/remove. */
@@ -434,7 +442,9 @@ export async function testOpenCodeV2ProviderModel(input: TestProviderModelInput)
 }
 
 export async function loadOpenCodeV2ProviderModels(input: LoadProviderModelsInput,
-  selectedRead?: Awaited<ReturnType<typeof inspectOpenCodeReadSelection>>): Promise<ProviderManagementResult<RuntimeProviderModelsView>> {
+  selectedRead?: Awaited<ReturnType<typeof inspectOpenCodeReadSelection>>, budget?: OpenCodeV2CatalogReadBudget): Promise<ProviderManagementResult<RuntimeProviderModelsView>> {
+  if (!budget) return new OpenCodeV2CatalogReadBudget().run(owned => loadOpenCodeV2ProviderModels(input, selectedRead, owned)).catch(error =>
+    resultError('runtime-unhealthy', error instanceof OpenCodeV2CatalogReadTimeout ? error.message : 'V2 native provider catalog is unavailable.'))
   try {
     const value = await catalog(input, async owner => {
       const query = input.query?.trim().toLowerCase() ?? ''
@@ -463,7 +473,7 @@ export async function loadOpenCodeV2ProviderModels(input: LoadProviderModelsInpu
       return { runtimeId: 'opencode' as const, providerId: input.providerId,
         ...pageOpenCodeV2ProviderModels(models, { ...input, projectPath: owner.authority.directory }),
         defaultModelId: owner.preferredModel, diagnostics: [], catalogState: 'fresh' as const }
-    }, selectedRead, { includeSelectedApiKey: true })
+    }, selectedRead, { includeSelectedApiKey: true, budget })
     return { ok: true, value }
   } catch (error) { return resultError('runtime-unhealthy', error instanceof Error && error.message === 'provider_catalog_page_changed'
     ? 'The OpenCode model catalog changed while loading more models. Refresh models and try again.'
