@@ -11,16 +11,18 @@ import { openCodeBunVersion } from '../../../constants/openCodeBunVersion.js'
 // Install before production imports: Bun captures named fs imports at load time.
 // Every observed open still delegates to the real filesystem with unchanged args.
 const actualFs = { ...filesystem }, openedPaths: unknown[] = []
+let afterReaddir: ((file: unknown) => Promise<void>) | undefined
 let observeOpens = false, afterLstat: ((file: unknown) => Promise<void>) | undefined
 const observedOpen: typeof filesystem.open = async (...args) => { if (observeOpens) openedPaths.push(args[0]); return actualFs.open(...args) }
 const observedLstat = async (...args: Parameters<typeof filesystem.lstat>) => { const result = await actualFs.lstat(...args); await afterLstat?.(args[0]); return result }
-mock.module('node:fs/promises', () => ({ ...actualFs, open: observedOpen, lstat: observedLstat, default: { ...actualFs, open: observedOpen, lstat: observedLstat } }))
+const observedReaddir = async (...args: Parameters<typeof filesystem.readdir>) => { const result = await actualFs.readdir(...args); await afterReaddir?.(args[0]); return result }
+mock.module('node:fs/promises', () => ({ ...actualFs, open: observedOpen, lstat: observedLstat, readdir: observedReaddir, default: { ...actualFs, open: observedOpen, lstat: observedLstat, readdir: observedReaddir } }))
 const { collectOpenCodeV2GraphFiles } = await import('./OpenCodeV2GraphFiles.js')
 const delivery = await import('./OpenCodeV2DeliveryManifest.js')
 const { canonicalOpenCodeV2DeliveryManifest } = await import('./OpenCodeV2DeliveryContract.js')
 const { validateExecutionGraph } = await import('./OpenCodeV2ExecutionBinding.js')
 const { executionHash } = await import('../execution/OpenCodeV2ExecutionContracts.js')
-afterAll(() => { observeOpens = false; afterLstat = undefined; openedPaths.length = 0; mock.module('node:fs/promises', () => ({ ...actualFs })); mock.restore() })
+afterAll(() => { observeOpens = false; afterLstat = undefined; afterReaddir = undefined; openedPaths.length = 0; mock.module('node:fs/promises', () => ({ ...actualFs })); mock.restore() })
 
 const sha = (value: string) => createHash('sha256').update(value).digest('hex')
 const pin = '2.0.32'
@@ -100,6 +102,25 @@ test.skipIf(!enabled)('candidate checks batch across small directories and cance
     await expect(work).rejects.toBe(reason)
     expect(started).toBe(16); expect(completed).toBe(16)
   } finally { release(); await work.catch(() => undefined); afterLstat = undefined; await f.close() }
+})
+
+test.skipIf(!enabled)('directory discovery batches sibling directories and joins cancellation', async () => {
+  const f = await fixture(true), controller = new AbortController(), reason = new Error('TEST-directory-cancelled')
+  let release!: () => void, claimed!: () => void, started = 0, completed = 0, settled = false
+  const gate = new Promise<void>(resolve => { release = resolve }), firstBatch = new Promise<void>(resolve => { claimed = resolve })
+  afterReaddir = async file => {
+    if (typeof file !== 'string' || !/[/\\]server[/\\]batch[/\\]\d{2}$/.test(file)) return
+    if (++started === 16) claimed()
+    await gate; completed++
+  }
+  const work = f.collect('expected', controller.signal)
+  void work.then(() => { settled = true }, () => { settled = true })
+  try {
+    await firstBatch; controller.abort(reason)
+    await Promise.resolve(); expect(settled).toBe(false)
+    release(); await expect(work).rejects.toBe(reason)
+    expect(started).toBe(16); expect(completed).toBe(16)
+  } finally { release(); await work.catch(() => undefined); afterReaddir = undefined; await f.close() }
 })
 
 test.skipIf(!enabled)('expected receipt rows never rebless tampered payload; fresh full checks and catalog hashing reject it', async () => {
