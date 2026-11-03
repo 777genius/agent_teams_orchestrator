@@ -1,5 +1,42 @@
 import { expect, test } from 'bun:test'
 
+test('expired shared budget refuses V1 before starting catalog work', async () => {
+  const script = `
+    import { mock, spyOn } from 'bun:test'
+    import assert from 'node:assert/strict'
+    const identityPath = ${JSON.stringify(import.meta.resolve('../../../../services/opencode/compatibility/OpenCodeNativeIdentity.ts'))}
+    const identity = await import(identityPath)
+    mock.module(identityPath, () => ({ ...identity, inspectOpenCodeReadSelection: async () => ({
+      policy: { generation: 'v1', version: '1.2.27' }, native: null,
+    }) }))
+    const { OpenCodeProviderManagementAdapter } = await import(${JSON.stringify(import.meta.resolve('./OpenCodeProviderManagementAdapter.ts'))})
+    const { OpenCodeV2CatalogReadBudget } = await import(${JSON.stringify(import.meta.resolve('./OpenCodeV2CatalogReadBudget.ts'))})
+    const clock = spyOn(performance, 'now').mockReturnValue(0)
+    const run = OpenCodeV2CatalogReadBudget.prototype.run
+    spyOn(OpenCodeV2CatalogReadBudget.prototype, 'run').mockImplementation(async function (operation) {
+      const value = await run.call(this, operation)
+      // A scheduling pause may consume the final remainder between selection's
+      // last check and the caller resuming to start the V1 path.
+      clock.mockReturnValue(101)
+      return value
+    })
+    let started = 0
+    const adapter = new OpenCodeProviderManagementAdapter({ catalogOverallTimeoutMs: 100 })
+    adapter.loadModelsWithinDeadline = async () => { started++; return { ok: true, value: { models: [] } } }
+    try {
+      const result = await adapter.loadModels({ runtimeId: 'opencode', providerId: 'local', projectPath: '/tmp/TEST-expired-selection' })
+      assert.equal(started, 0)
+      assert.equal(result.ok, false)
+      assert.equal(result.error.code, 'runtime-unhealthy')
+      assert.match(result.error.message, /overall deadline exceeded after 100ms/)
+    } finally { mock.restore() }
+  `
+  const child = Bun.spawn([process.execPath, '-e', script], { stdout: 'pipe', stderr: 'pipe', env: { ...process.env, NODE_ENV: 'test' } })
+  const [code, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()])
+  expect(stderr).toBe('')
+  expect(code).toBe(0)
+}, 20_000)
+
 for (const phase of ['selection', 'profile-scope', 'profile-auth', 'receipt'] as const) test(`V2 model catalog cancels stalled ${phase} before any native acquisition`, async () => {
   const script = `
     import { mock } from 'bun:test'

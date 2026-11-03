@@ -4496,10 +4496,14 @@ export class OpenCodeProviderManagementAdapter
       return providerManagementError('runtime-unhealthy', error instanceof OpenCodeV2CatalogReadTimeout
         ? error.message : selectedIdentityFailureMessage(error))
     }
-    const deadline = new OpenCodeRuntimeDeadline(
-      Math.max(1, Math.min(readBudget.remainingMs(), this.deps.catalogOverallTimeoutMs ?? OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS)),
-    )
     const progress = createOpenCodeInventoryProbeProgressTracker()
+    const remainingMs = readBudget.remainingMs()
+    if (remainingMs <= 0) return providerManagementError('runtime-unhealthy', catalogTimeoutDiagnostic(
+      `OpenCode catalog overall deadline exceeded after ${readBudget.deadline.commandBudgetMs}ms`, progress,
+    ))
+    const deadline = new OpenCodeRuntimeDeadline(
+      Math.min(remainingMs, this.deps.catalogOverallTimeoutMs ?? OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS),
+    )
     try {
       return await raceOpenCodeAbortSignal(this.loadModelsWithinDeadline(input, deadline, progress), deadline.signal)
     } catch {
