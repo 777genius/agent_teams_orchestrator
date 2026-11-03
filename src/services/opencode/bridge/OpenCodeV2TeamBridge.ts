@@ -48,6 +48,19 @@ const required = (value: unknown, name: string): string => {
   const result = text(value); executionAssert(result, `missing_${name}`); return result
 }
 
+function resolveActiveMember(status: RunControlResult, memberId: string, laneId: string | null,
+  expectedSessionId: string | null) {
+  executionAssert(status.kind === 'status' && status.qualification !== undefined && status.state === 'active' && status.deadline > Date.now(), 'run_stopped_or_unknown')
+  const matches = status.members.filter(member => member.memberId === memberId && (!laneId || member.laneId === laneId))
+  executionAssert(matches.length === 1, 'member_authority_ambiguous')
+  const member = matches[0]
+  executionAssert(member && member.state === 'accepted' && (!expectedSessionId || expectedSessionId === member.originalSessionId),
+    'original_session_changed')
+  executionAssert(member.opencodeSessionId === member.originalSessionId && member.runtimeSessionId === member.originalSessionId,
+    'original_session_changed')
+  return member
+}
+
 /** A CLI holds only run control identity. Lease/client/native endpoint objects stay in their owning process. */
 export class OpenCodeV2TeamBridge {
   private readonly journal: OpenCodeV2DeliveryJournal
@@ -145,16 +158,9 @@ export class OpenCodeV2TeamBridge {
   }
   async resolveMember(memberId: string, laneId: string | null, expectedSessionId: string | null, timeoutMs: number) {
     const status = await this.call({ operation: 'status' }, timeoutMs)
-    executionAssert(status.kind === 'status' && status.qualification !== undefined && status.state === 'active' && status.deadline > Date.now(), 'run_stopped_or_unknown')
-    const matches = status.members.filter(member => member.memberId === memberId && (!laneId || member.laneId === laneId))
-    executionAssert(matches.length === 1, 'member_authority_ambiguous')
-    const member = matches[0]
-    executionAssert(member && member.state === 'accepted' && (!expectedSessionId || expectedSessionId === member.originalSessionId),
-      'original_session_changed')
-    executionAssert(member.opencodeSessionId === member.originalSessionId && member.runtimeSessionId === member.originalSessionId,
-      'original_session_changed')
-    return member
+    return resolveActiveMember(status, memberId, laneId, expectedSessionId)
   }
+
   async send(request: Extract<RunControlRequest, { operation: 'send' }>,
     base: SendMessageOutcomeBase, timeoutMs: number): Promise<SendMessageCommandData> {
     request = structuredClone(request); base = structuredClone(base)
@@ -492,10 +498,11 @@ async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: O
         request = { operation: 'stop' }; break
       }
       case 'opencode.sendMessage': {
-        const status = await bridge.call({ operation: 'status' }, remaining())
-        executionAssert(status.kind === 'status' && openCodeV2SupportedSourcePredicate(status), 'run_source_unqualified')
+        const status = originalStatus
+        executionAssert(status && openCodeV2SupportedSourcePredicate(status), 'run_source_unqualified')
         const memberId = required(body.memberName, 'memberName')
-        const member = await bridge.resolveMember(memberId, text(body.laneId), text(body.runtimeSessionId ?? body.sessionId), remaining())
+        remaining()
+        const member = resolveActiveMember(status, memberId, text(body.laneId), text(body.runtimeSessionId ?? body.sessionId))
         const originalSessionId = member.originalSessionId
         const group = parseOpenCodeV2GroupDelivery(body, required(body.messageId, 'messageId'))
         let groupProof: OpenCodeGroupChatRunProof | undefined

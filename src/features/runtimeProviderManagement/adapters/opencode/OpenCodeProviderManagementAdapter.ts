@@ -1,3 +1,4 @@
+import { OpenCodeV2CatalogReadBudget, OpenCodeV2CatalogReadTimeout } from './OpenCodeV2CatalogReadBudget.js'
 import { inspectOpenCodeReadSelection, connectOpenCodeV2Provider, loadOpenCodeV2ProviderModels, testOpenCodeV2ProviderModel, loadOpenCodeV2ProviderSetupForm } from './OpenCodeV2ProviderManagement.js'
 import { requireOpenCodeProviderRoute } from './OpenCodeProviderRoute.js'
 import { buildOpenCodeV2ProviderDirectoryEntries } from './OpenCodeV2ProviderDirectory.js'
@@ -4477,23 +4478,32 @@ export class OpenCodeProviderManagementAdapter
   async loadModels(
     input: LoadProviderModelsInput,
   ): Promise<ProviderManagementResult<RuntimeProviderModelsView>> {
-    let selectedRead: Awaited<ReturnType<typeof inspectOpenCodeReadSelection>> | undefined
-    let route: 'v1' | 'v2' | null = null
+    const readBudget = new OpenCodeV2CatalogReadBudget(this.deps.catalogOverallTimeoutMs)
     try {
-      if (input.runtimeId === 'opencode') {
-        selectedRead = await inspectOpenCodeReadSelection()
-        route = requireOpenCodeProviderRoute(selectedRead)
-      }
-    } catch (error) { return providerManagementError('runtime-unhealthy', selectedIdentityFailureMessage(error)) }
-    if (route === 'v2' && selectedRead) {
-      const providerId = normalizeProviderId(canonicalizeOpenCodeProviderId(input.providerId))
-      if (!providerId) return providerManagementError('provider-missing', 'Provider id is invalid')
-      return loadOpenCodeV2ProviderModels({ ...input, providerId }, selectedRead)
+      const nativeResult = await readBudget.run(async budget => {
+        const selectedRead = input.runtimeId === 'opencode'
+          ? await inspectOpenCodeReadSelection(budget.signal, undefined, Date.now() + budget.remainingMs())
+          : undefined
+        budget.check()
+        const route = selectedRead ? requireOpenCodeProviderRoute(selectedRead) : null
+        if (route !== 'v2' || !selectedRead) return null
+        const providerId = normalizeProviderId(canonicalizeOpenCodeProviderId(input.providerId))
+        if (!providerId) return providerManagementError('provider-missing', 'Provider id is invalid')
+        return loadOpenCodeV2ProviderModels({ ...input, providerId }, selectedRead, budget)
+      })
+      if (nativeResult) return nativeResult
+    } catch (error) {
+      return providerManagementError('runtime-unhealthy', error instanceof OpenCodeV2CatalogReadTimeout
+        ? error.message : selectedIdentityFailureMessage(error))
     }
-    const deadline = new OpenCodeRuntimeDeadline(
-      this.deps.catalogOverallTimeoutMs ?? OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS,
-    )
     const progress = createOpenCodeInventoryProbeProgressTracker()
+    const remainingMs = readBudget.remainingMs()
+    if (remainingMs <= 0) return providerManagementError('runtime-unhealthy', catalogTimeoutDiagnostic(
+      `OpenCode catalog overall deadline exceeded after ${readBudget.deadline.commandBudgetMs}ms`, progress,
+    ))
+    const deadline = new OpenCodeRuntimeDeadline(
+      Math.min(remainingMs, this.deps.catalogOverallTimeoutMs ?? OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS),
+    )
     try {
       return await raceOpenCodeAbortSignal(this.loadModelsWithinDeadline(input, deadline, progress), deadline.signal)
     } catch {
