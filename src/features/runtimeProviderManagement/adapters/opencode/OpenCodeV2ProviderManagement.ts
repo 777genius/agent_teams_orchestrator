@@ -1,4 +1,3 @@
-import { openCodeV2EngineVersion } from '../../../../services/opencode/compatibility/OpenCodeV2Registry.js'
 import { recordOpenCodeV2ProviderFailure } from '../../../../services/opencode/execution/OpenCodeV2Diagnostics.js'
 import { openCodeV2Refusal } from '../../../../services/opencode/execution/OpenCodeV2RefusalReason.js'
 export { recordOpenCodeV2ProviderFailure } from '../../../../services/opencode/execution/OpenCodeV2Diagnostics.js'
@@ -14,20 +13,20 @@ import { readIntegration } from '../../../../services/opencode/catalog/OpenCodeV
 import { isOpenCodeV2AnonymousProvider, isOpenCodeV2ModelFree } from '../../../../services/opencode/catalog/OpenCodeV2ModelPricing.js'
 import { inspectOpenCodeReadSelection } from '../../../../services/opencode/compatibility/OpenCodeNativeIdentity.js'
 export { inspectOpenCodeReadSelection } from '../../../../services/opencode/compatibility/OpenCodeNativeIdentity.js'
-import { canonicalizeOpenCodeProjectPath, resolveOpenCodeV2CatalogProfileScope, materializeOpenCodeV2CatalogScope } from '../../../../services/opencode/OpenCodeProfileManager.js'
+import { canonicalizeOpenCodeProjectPath, resolveOpenCodeV2CatalogProfileScope, materializeOpenCodeV2CatalogScope, resolveOpenCodeUserAuthSourcePaths } from '../../../../services/opencode/OpenCodeProfileManager.js'
 import { resolveClaudeMultimodelPaths } from '../../../../services/opencode/OpenCodeManagedPaths.js'
 import { createOpenCodeV2ExecutionReceipt } from '../../../../services/opencode/profile/OpenCodeV2ExecutionReceipt.js'
 import { acquireOpenCodeV2CatalogLease, requireExecutionEndpoint, registerExecutionDisposer } from '../../../../services/opencode/host/OpenCodeV2ExecutionHost.js'
 import type { CatalogExecutionProfile, ValidatedExecutionNative } from '../../../../services/opencode/host/OpenCodeV2ExecutionBinding.js'
 import { executionAssert, executionHash, executionRecord, openCodeV2RunInitializationMs, type ExecutionAuthority } from '../../../../services/opencode/execution/OpenCodeV2ExecutionContracts.js'
 import { OpenCodeV2ProviderWire as ProviderWire } from '../../../../services/opencode/transport/OpenCodeV2ProviderWire.js'
-import { type OpenCodeAuthCredential, readOpenCodeAuthCredential, upsertOpenCodeApiAuthCredential } from '../../../../services/opencode/OpenCodeAuthStore.js'
+import { type OpenCodeAuthCredential, readOpenCodeAuthCredential, restoreOpenCodeAuthCredentialIfUnchanged, upsertOpenCodeApiAuthCredential } from '../../../../services/opencode/OpenCodeAuthStore.js'
 import { withOpenCodeAuthCoordinationLock } from '../../../../services/opencode/OpenCodeAuthCoordinationLock.js'
 import { inspectOpenCodeV2SourceAvailability, createOpenCodeV2OwnedProfileEnvironment } from '../../../../services/opencode/bridge/OpenCodeV2LaunchPlan.js'
 import { resolveOpenCodeV2ExecutionProbe, type OpenCodeV2ProbeIntent } from '../../../../services/opencode/bridge/OpenCodeV2ExecutionProbe.js'
 import { assertLegacyOpenCodeV2ProbePreEffect, ensureOpenCodeV2ProbeStore } from '../../../../services/opencode/bridge/OpenCodeV2ProbeStore.js'
 import { prepareOpenCodeV2ConnectVerification, readRetiredOpenCodeV2CatalogProfile,
-  readOpenCodeV2ConnectIntent, writeOpenCodeV2ConnectIntent, type OpenCodeV2ConnectIntent } from './OpenCodeV2ProviderConnectIntent.js'
+  readOpenCodeV2ConnectIntent, writeOpenCodeV2ConnectIntent, removeOpenCodeV2ConnectIntentIfUnchanged, type OpenCodeV2ConnectIntent } from './OpenCodeV2ProviderConnectIntent.js'
 import { parseOpenCodeExecutionProof } from '../../../../services/opencode/OpenCodeExecutionProof.js'
 import { normalizeOpenCodeProjectIdentity } from '../../../../services/opencode/OpenCodeProjectIdentity.js'
 import { matchesOpenCodeV2ModelQuery, pageOpenCodeV2ProviderModels } from './OpenCodeV2ModelPagination.js'
@@ -46,14 +45,6 @@ export function isOwnedProviderIntentMarker(stat: Pick<Stats, 'isFile' | 'isSymb
   platform: NodeJS.Platform = process.platform): boolean {
   return stat.isFile() && !stat.isSymbolicLink() && stat.size < 64 * 1024 &&
     (platform === 'win32' || stat.uid === process.getuid?.() && (stat.mode & 0o077) === 0)
-}
-
-export async function selectedProviderUsesOpenCodeV2(): Promise<boolean> {
-  return (await selectedOpenCodeV2Version()) !== null
-}
-export async function selectedOpenCodeV2Version(): Promise<OpenCodeV2Pin | null> {
-  const { policy, native } = await inspectOpenCodeReadSelection()
-  return policy.generation === 'v2' && native ? openCodeV2EngineVersion(native) : null
 }
 
 
@@ -157,6 +148,37 @@ export function openCodeV2ConnectionIDs(info: Record<string, unknown>): string[]
   executionAssert(new Set(ids).size === ids.length && ids.every(id => /^cred_[A-Za-z0-9]+$/.test(id)), 'provider_credential_identity_changed')
   return ids
 }
+/** The V1-managed auth.json is a shared compatibility mirror. Never overwrite
+ * its existing provider credential from the V2 native key-connect path.
+ * Until a version-owned credential store exists, differing keys must be refused. */
+export function assertOpenCodeV2SharedAuthMirrorSafe(
+  existing: OpenCodeAuthCredential | null,
+  requested: Readonly<{ type: 'api'; key: string }>,
+): void {
+  executionAssert(existing === null || isDeepStrictEqual(existing, requested), 'provider_shared_credential_conflict')
+}
+
+/** V1 also reads credentials from external OpenCode stores. A V2 key in the app
+ * mirror would take precedence over those stores, even if the keys happen to
+ * match now (a later V1 login could then be shadowed). Refuse V2 publication
+ * while any same-provider V1 native credential exists in either source.
+ *
+ * This probe is deliberately read-only; the caller repeats it just before
+ * shared auth publication because native logins do not acquire our app lock.
+ */
+export async function assertOpenCodeV2NativeV1AuthUnoccupied(input: {
+  authPath: string
+  providerId: string
+  env?: NodeJS.ProcessEnv
+}): Promise<void> {
+  const sourcePaths = new Set(resolveOpenCodeUserAuthSourcePaths(input.env))
+  sourcePaths.delete(input.authPath)
+  for (const authPath of sourcePaths) {
+    const existing = await readOpenCodeAuthCredential({ authPath, providerId: input.providerId })
+    executionAssert(existing === null, 'provider_shared_credential_conflict')
+  }
+}
+
 export function requireOpenCodeV2OwnedConnection(before: Record<string, unknown>, after: Record<string, unknown>, integrationID: string): string {
   executionAssert(before.id === integrationID && after.id === integrationID && Array.isArray(before.connections) && before.connections.length === 0, 'provider_existing_credentials_unsupported')
   const ids = openCodeV2ConnectionIDs(after)
@@ -190,6 +212,9 @@ export function openCodeV2ConnectProofFailureCode(state: string, reason: string 
 }
 
 export function openCodeV2ConnectFailureMessage(error: unknown, retainedOriginal: boolean): string {
+  if (!retainedOriginal && error instanceof Error && error.message === 'provider_shared_credential_conflict') {
+    return 'V2 connection cannot replace an existing OpenCode credential. Existing V1 authentication was preserved; use the existing connection or a separately isolated credential profile.'
+  }
   if (retainedOriginal && error instanceof Error && error.message === 'provider_original_execution_failed') {
     return 'The selected-model verification failed. Check provider access, limits and connection diagnostics. The original attempt was retained; no automatic reconnect or prompt retry was performed.'
   }
@@ -206,6 +231,7 @@ export async function connectOpenCodeV2Provider(input: ConnectProviderInput): Pr
     input.authOptionId && input.authOptionId !== OPENCODE_V2_NATIVE_KEY_OPTION_ID)
     return resultError('unsupported-auth-method', 'This V2 source path requires the native key method without an additional setup form.')
   let retainUnknown = false, marker: string | undefined, acceptedProof: OpenCodeExecutionProof | undefined
+  let fullyRolledBackConflict: Error | undefined
   let pendingIntent: OpenCodeV2ConnectIntent | undefined, originalIntent: Record<string, unknown> | undefined
   let phase = 'catalog-acquisition'
   try {
@@ -217,6 +243,9 @@ export async function connectOpenCodeV2Provider(input: ConnectProviderInput): Pr
       executionAssert(Array.isArray(before.methods) && before.methods.some(value => executionRecord(value).type === 'key' && executionRecord(value).form === undefined), 'provider_key_method_unsupported')
       const previous = await readOpenCodeAuthCredential({ authPath: owner.authPath, providerId: input.providerId })
       const published = { type: 'api' as const, key: apiKey }
+      // Guard before any native connection, durable intent or shared auth publication.
+      assertOpenCodeV2SharedAuthMirrorSafe(previous, published)
+      await assertOpenCodeV2NativeV1AuthUnoccupied({ authPath: owner.authPath, providerId: input.providerId })
       const requestedDirectory = openCodeV2ProviderConnectionsDirectory(); await mkdir(requestedDirectory, { recursive: true, mode: 0o700 })
       const directory = await realpath(requestedDirectory), intentDirectory = await lstat(requestedDirectory)
       executionAssert(intentDirectory.isDirectory() && !intentDirectory.isSymbolicLink() &&
@@ -288,11 +317,33 @@ export async function connectOpenCodeV2Provider(input: ConnectProviderInput): Pr
       const after = scopedIntegration(await owner.integration(integrationID), owner.authority.directory, integrationID)
       const credentialID = requireOpenCodeV2OwnedConnection(before, after, integrationID)
       const mirror = { authPath: owner.authPath, providerId: input.providerId }
+      const checkV1AndRollbackOnConflict = async (expectedMirror: OpenCodeAuthCredential | null) => {
+        try { await assertOpenCodeV2NativeV1AuthUnoccupied(mirror) } catch (error) {
+          if (!(error instanceof Error) || error.message !== 'provider_shared_credential_conflict') throw error
+          // The native POST returned a single ID from an empty store. Do not
+          // remove it if a peer changed integration state in the meantime.
+          phase = 'v1-native-auth-conflict-rollback'
+          await rollbackOpenCodeV2OwnedConnection({
+            integrationID, credentialID, published, predecessor: previous, expectedMirror,
+            readConnections: async () => scopedIntegration(await owner.integration(integrationID), owner.authority.directory, integrationID),
+            remove: id => owner.remove(id),
+            readMirror: () => readOpenCodeAuthCredential(mirror),
+            restoreMirror: restore => restoreOpenCodeAuthCredentialIfUnchanged({ ...mirror, expected: expectedMirror, restore }),
+          })
+          // Keep the pending marker until the original catalog owner has also
+          // physically retired. A finally/retirement failure must retain it.
+          fullyRolledBackConflict = error
+          throw error
+        }
+      }
       executionAssert(isDeepStrictEqual(await readOpenCodeAuthCredential(mirror), previous), 'provider_auth_publication_changed')
+      await checkV1AndRollbackOnConflict(previous)
       executionAssert((await resolveOpenCodeV2CatalogProfileScope({ projectPath: owner.authority.directory, providerId: input.providerId })).scopeToken === owner.scopeToken, 'provider_catalog_scope_changed')
       phase = 'selected-auth-publication'
       await upsertOpenCodeApiAuthCredential({ ...mirror, apiKey })
       executionAssert(isDeepStrictEqual(await readOpenCodeAuthCredential(mirror), published), 'provider_auth_publication_unknown')
+      // External native V1 logins do not participate in our app-owned lock.
+      await checkV1AndRollbackOnConflict(published)
       pendingIntent = { ...pendingIntent, phase: 'credential-published', credentialID, mirrorIdentity: executionHash(published) }
       await writeOpenCodeV2ConnectIntent(marker, pendingIntent)
       return await finishVerification(pendingIntent, async () => ({ credentialID }))
@@ -303,6 +354,18 @@ export async function connectOpenCodeV2Provider(input: ConnectProviderInput): Pr
     await writeOpenCodeV2ConnectIntent(marker, { ...originalIntent, ...pendingIntent, state: 'complete', connection: connected, proof: acceptedProof })
     return { ok: true, value: connected }
   } catch (error) {
+    if (error === fullyRolledBackConflict && marker && pendingIntent) {
+      // The exact error can escape catalog() only when its finally path
+      // successfully retired the original native owner. A retirement error
+      // replaces it and keeps the original pending marker for safe recovery.
+      try {
+        await removeOpenCodeV2ConnectIntentIfUnchanged(marker, pendingIntent)
+        retainUnknown = false
+      } catch (cleanupError) {
+        phase = 'v1-native-auth-conflict-marker-retirement'
+        error = cleanupError
+      }
+    }
     await recordOpenCodeV2ProviderFailure(phase, error, retainUnknown)
     // A refusal the user can act on (platform qualification, the Linux sandbox) is not an
     // authentication failure; name it instead of the generic text.
@@ -436,17 +499,20 @@ function parseSavedConnection(value: unknown): ProviderConnection {
 /** One owned ID in an initially empty private store; never provider-wide deletion. */
 export async function rollbackOpenCodeV2OwnedConnection(input: {
   integrationID: string; credentialID: string; published: OpenCodeAuthCredential; predecessor: OpenCodeAuthCredential | null;
+  /** Before publication the original mirror still owns its previous value. */
+  expectedMirror?: OpenCodeAuthCredential | null;
   readConnections(): Promise<Record<string, unknown>>; remove(id: string): Promise<void>;
   readMirror(): Promise<OpenCodeAuthCredential | null>; restoreMirror(predecessor: OpenCodeAuthCredential | null): Promise<void>
 }): Promise<void> {
+  const expectedMirror = input.expectedMirror === undefined ? input.published : input.expectedMirror
   const current = await input.readConnections()
   executionAssert(current.id === input.integrationID && isDeepStrictEqual(openCodeV2ConnectionIDs(current), [input.credentialID]), 'provider_rollback_peer_changed')
-  executionAssert(isDeepStrictEqual(await input.readMirror(), input.published), 'provider_rollback_publication_changed')
+  executionAssert(isDeepStrictEqual(await input.readMirror(), expectedMirror), 'provider_rollback_publication_changed')
   await input.remove(input.credentialID)
   const after = await input.readConnections()
   executionAssert(after.id === input.integrationID && openCodeV2ConnectionIDs(after).length === 0, 'provider_rollback_unknown')
-  executionAssert(isDeepStrictEqual(await input.readMirror(), input.published), 'provider_rollback_publication_changed')
-  await input.restoreMirror(input.predecessor)
+  executionAssert(isDeepStrictEqual(await input.readMirror(), expectedMirror), 'provider_rollback_publication_changed')
+  if (!isDeepStrictEqual(expectedMirror, input.predecessor)) await input.restoreMirror(input.predecessor)
   executionAssert(isDeepStrictEqual(await input.readMirror(), input.predecessor), 'provider_rollback_publication_unknown')
 }
 

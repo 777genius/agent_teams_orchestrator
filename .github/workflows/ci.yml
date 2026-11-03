@@ -255,8 +255,13 @@ jobs:
         # child startups per test; the default 5s can expire during valid work.
         # Production operation deadlines remain enforced inside the tests.
         run: bun run test:opencode-authority --timeout ${{ runner.os == 'Windows' && '30000' || '5000' }}
-      - name: Test provider settings and HTTP body deadlines
-        run: bun test src/features/runtimeProviderManagement/adapters/opencode/OpenCodeProviderManagementAdapter.test.ts src/services/opencode/OpenCodeProviderIdentity.test.ts src/services/opencode/OpenCodeInventoryService.test.ts src/services/opencode/OpenCodeProviderLabelRegression.test.ts src/services/opencode/OpenCodeClientFactory.test.ts --timeout 30000
+      # Legacy adapter fixtures mock their selected V1 identity via Bun mock.module.
+      # Run in a separate Bun process: the mocked re-export must not alter native
+      # identity/selection contract tests elsewhere in the same process.
+      - name: Test V1 provider settings in isolated process
+        run: bun test src/features/runtimeProviderManagement/adapters/opencode/OpenCodeProviderManagementAdapter.test.ts --timeout 30000
+      - name: Test provider identity, inventory, labels and HTTP deadlines
+        run: bun test src/services/opencode/OpenCodeProviderIdentity.test.ts src/services/opencode/OpenCodeInventoryService.test.ts src/services/opencode/OpenCodeProviderLabelRegression.test.ts src/services/opencode/OpenCodeClientFactory.test.ts --timeout 30000
       - name: Test V2 provider catalogs, defaults and project identity
         run: >-
           bun test

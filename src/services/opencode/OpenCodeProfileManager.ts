@@ -2403,6 +2403,20 @@ function scopeSourceEnvironment(inputEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv 
   return envSnapshot
 }
 
+/** The same V1 native credential sources for scoped profile reads and V2
+ * compatibility admission. Scoped env overrides are applied consistently. */
+export function resolveOpenCodeUserAuthSourcePaths(
+  inputEnv: NodeJS.ProcessEnv = process.env, homeOverride?: string,
+): string[] {
+  const env = scopeSourceEnvironment(inputEnv)
+  const home = homeOverride ?? (env.HOME?.trim() || env.USERPROFILE?.trim() || os.homedir())
+  const xdgDataHome = env.XDG_DATA_HOME?.trim() || path.join(home, '.local', 'share')
+  return Array.from(new Set([
+    path.join(xdgDataHome, 'opencode', 'auth.json'),
+    path.join(home, '.local', 'share', 'opencode', 'auth.json'),
+  ]))
+}
+
 export async function resolveOpenCodeProfileScope(input: OpenCodeScopeResolutionInput): Promise<OpenCodeProfileScope> {
   if (input.abortSignal?.aborted) throwOpenCodeAbortReason(input.abortSignal)
   await recoverOpenCodeScopedOAuth(input)
@@ -3071,20 +3085,9 @@ export class OpenCodeProfileManager {
     return resolveClaudeMultimodelPaths()
   }
 
-  private getSourceAuthPaths(
-    env: NodeJS.ProcessEnv = process.env,
-    homePath = env.HOME?.trim() || env.USERPROFILE?.trim() || os.homedir(),
-  ): string[] {
-    const xdgDataHome =
-      env.XDG_DATA_HOME?.trim() || path.join(homePath, '.local', 'share')
-    return Array.from(new Set([
-      path.join(xdgDataHome, 'opencode', 'auth.json'),
-      // Bridge/live-test processes can intentionally set XDG_DATA_HOME to an
-      // isolated runtime directory. Always include the canonical user OpenCode
-      // auth store as the highest-priority source so a fresh `opencode auth`
-      // login can override stale app-global OAuth credentials.
-      path.join(homePath, '.local', 'share', 'opencode', 'auth.json'),
-    ]))
+  private getSourceAuthPaths(env: NodeJS.ProcessEnv = process.env): string[] {
+    // Apply persisted scoped HOME before choosing a V1 credential source.
+    return resolveOpenCodeUserAuthSourcePaths(env)
   }
 
   getGlobalAuthPath(dataPath = this.paths.data): string {
@@ -3404,7 +3407,6 @@ export class OpenCodeProfileManager {
     const snapshot = openCodeEffectiveConfigSnapshots.get(policy.scope.scopeToken)
     const managedPaths = snapshot?.managedPaths ?? this.paths
     const runtimeEnv = snapshot?.runtimeEnv ?? process.env
-    const snapshotHome = runtimeEnv.HOME?.trim() || runtimeEnv.USERPROFILE?.trim() || os.homedir()
     const profileRootKey = buildScopedProfileRootKey(projectPath, policy.scope)
     const managedAuthPath = path.join(
       managedPaths.data,
@@ -3417,7 +3419,7 @@ export class OpenCodeProfileManager {
     )
     const sourcePaths = Array.from(new Set([
       this.getGlobalAuthPath(managedPaths.data),
-      ...this.getSourceAuthPaths(runtimeEnv, snapshotHome),
+      ...this.getSourceAuthPaths(runtimeEnv),
     ]))
     const [source, managed, preferences] = await Promise.all([
       readSelectedAuthFromSources({
@@ -3540,7 +3542,6 @@ export class OpenCodeProfileManager {
     if (configSnapshot && attachmentRoot !== (runtimeEnv.CLAUDE_AGENT_TEAMS_ATTACHMENT_ROOT ?? null)) {
       throw new Error('OpenCode scoped profile canonical attachment root changed')
     }
-    const snapshotHome = runtimeEnv.HOME?.trim() || runtimeEnv.USERPROFILE?.trim() || os.homedir()
     // Verified staging is the only switch that turns on the managed Cursor path.
     // Anything unavailable keeps the upstream plugin and today's launch behaviour.
     const wantsCursorManagedAssets = options.profileScope
@@ -3718,7 +3719,7 @@ export class OpenCodeProfileManager {
     const globalAuthPath = this.getGlobalAuthPath(managedPaths.data)
     enterStep('fingerprint auth sources')
     const sourceAuthSources = await Promise.all(
-      this.getSourceAuthPaths(runtimeEnv, snapshotHome).map(async sourceAuthPath => {
+      this.getSourceAuthPaths(runtimeEnv).map(async sourceAuthPath => {
         const exists = await fileExists(sourceAuthPath)
         return {
           path: sourceAuthPath,
